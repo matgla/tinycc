@@ -33,6 +33,10 @@
 #include "i386-gen.c"
 #include "i386-link.c"
 #include "i386-asm.c"
+#elif defined(TCC_TARGET_ARM_THUMB)
+#include "arm-link.c"
+#include "arm-thumb-gen.c"
+#include "arm-thumb-asm.c"
 #elif defined(TCC_TARGET_ARM)
 #include "arm-gen.c"
 #include "arm-link.c"
@@ -837,7 +841,7 @@ LIBTCCAPI TCCState *tcc_new(void)
 #if defined TCC_TARGET_MACHO /* || defined TCC_TARGET_PE */
     s->leading_underscore = 1;
 #endif
-#ifdef TCC_TARGET_ARM
+#if defined (TCC_TARGET_ARM) || defined (TCC_TARGET_ARM_THUMB)
     s->float_abi = ARM_FLOAT_ABI;
 #endif
 #ifdef CONFIG_NEW_DTAGS
@@ -884,10 +888,6 @@ LIBTCCAPI void tcc_delete(TCCState *s1)
     cstr_free(&s1->cmdline_incl);
     cstr_free(&s1->linker_arg);
     tcc_free(s1->dState);
-#ifdef TCC_IS_NATIVE
-    /* free runtime memory */
-    tcc_run_free(s1);
-#endif
     /* free loaded dlls array */
     dynarray_reset(&s1->loaded_dlls, &s1->nb_loaded_dlls);
     tcc_free(s1);

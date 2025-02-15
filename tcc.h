@@ -142,6 +142,7 @@ extern long double strtold (const char *__nptr, char **__endptr);
 /* #define TCC_TARGET_I386   *//* i386 code generator */
 /* #define TCC_TARGET_X86_64 *//* x86-64 code generator */
 /* #define TCC_TARGET_ARM    *//* ARMv4 code generator */
+/* #define TCC_TARGET_ARM_THUMB *//* ARMvX-m code generator */
 /* #define TCC_TARGET_ARM64  *//* ARMv8 code generator */
 /* #define TCC_TARGET_C67    *//* TMS320C67xx code generator */
 /* #define TCC_TARGET_RISCV64 *//* risc-v code generator */
@@ -149,7 +150,8 @@ extern long double strtold (const char *__nptr, char **__endptr);
 /* default target is I386 */
 #if !defined(TCC_TARGET_I386) && !defined(TCC_TARGET_ARM) && \
     !defined(TCC_TARGET_ARM64) && !defined(TCC_TARGET_C67) && \
-    !defined(TCC_TARGET_X86_64) && !defined(TCC_TARGET_RISCV64)
+    !defined(TCC_TARGET_X86_64) && !defined(TCC_TARGET_RISCV64) && \
+    !defined(TCC_TARGET_ARM_THUMB)
 # if defined __x86_64__
 #  define TCC_TARGET_X86_64
 # elif defined __arm__
@@ -372,6 +374,10 @@ extern long double strtold (const char *__nptr, char **__endptr);
 #elif defined TCC_TARGET_X86_64
 # include "x86_64-gen.c"
 # include "x86_64-link.c"
+#elif defined TCC_TARGET_ARM_THUMB
+# include "arm-thumb-gen.c"
+# include "arm-link.c"
+# include "arm-thumb-asm.c"
 #elif defined TCC_TARGET_ARM
 # include "arm-gen.c"
 # include "arm-link.c"
@@ -720,7 +726,7 @@ struct sym_attr {
     unsigned plt_offset;
     int plt_sym;
     int dyn_index;
-#ifdef TCC_TARGET_ARM
+#if defined(TCC_TARGET_ARM) || defined(TCC_TARGET_ARM_THUMB)
     unsigned char plt_thumb_stub:1;
 #endif
 };
@@ -788,7 +794,7 @@ struct TCCState {
 #ifdef TCC_TARGET_X86_64
     unsigned char nosse; /* For -mno-sse support. */
 #endif
-#ifdef TCC_TARGET_ARM
+#if defined(TCC_TARGET_ARM) || defined(TCC_TARGET_ARM_THUMB)
     unsigned char float_abi; /* float ABI of the generated code*/
 #endif
 
@@ -1467,7 +1473,7 @@ ST_FUNC void vpop(void);
 #if PTR_SIZE == 4
 ST_FUNC void lexpand(void);
 #endif
-#ifdef TCC_TARGET_ARM
+#if defined (TCC_TARGET_ARM) || defined (TCC_TARGET_ARM_THUMB)
 ST_FUNC int get_reg_ex(int rc, int rc2);
 #endif
 ST_FUNC void save_reg(int r);
@@ -1698,7 +1704,7 @@ dwarf_read_sleb128(unsigned char **ln, unsigned char *end)
 
 
 /* ------------ i386-gen.c ------------ */
-#if defined TCC_TARGET_I386 || defined TCC_TARGET_X86_64 || defined TCC_TARGET_ARM
+#if defined TCC_TARGET_I386 || defined TCC_TARGET_X86_64 || defined TCC_TARGET_ARM || TCC_TARGET_ARM_THUMB
 ST_FUNC void g(int c);
 ST_FUNC void gen_le16(int c);
 ST_FUNC void gen_le32(int c);
@@ -1722,13 +1728,14 @@ ST_FUNC void gen_cvt_csti(int t);
 #endif
 
 /* ------------ arm-gen.c ------------ */
-#ifdef TCC_TARGET_ARM
+#if defined (TCC_TARGET_ARM) || defined(TCC_TARGET_ARM_THUMB)
 #if defined(TCC_ARM_EABI) && !defined(CONFIG_TCC_ELFINTERP)
 PUB_FUNC const char *default_elfinterp(struct TCCState *s);
 #endif
 ST_FUNC void arm_init(struct TCCState *s);
 ST_FUNC void gen_increment_tcov (SValue *sv);
 #endif
+
 
 /* ------------ arm64-gen.c ------------ */
 #ifdef TCC_TARGET_ARM64
@@ -1858,7 +1865,7 @@ ST_FUNC void tcc_debug_typedef(TCCState *s1, Sym *sym);
 ST_FUNC void tcc_debug_stabn(TCCState *s1, int type, int value);
 ST_FUNC void tcc_debug_fix_anon(TCCState *s1, CType *t);
 
-#if !(defined ELF_OBJ_ONLY || defined TCC_TARGET_ARM || defined TARGETOS_BSD)
+#if !(defined ELF_OBJ_ONLY || defined TCC_TARGET_ARM || defined TARGETOS_BSD || defined TCC_TARGET_ARM_THUMB)
 ST_FUNC void tcc_eh_frame_start(TCCState *s1);
 ST_FUNC void tcc_eh_frame_end(TCCState *s1);
 ST_FUNC void tcc_eh_frame_hdr(TCCState *s1, int final);

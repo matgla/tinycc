@@ -176,6 +176,8 @@ static const char version[] =
         "C67"
 #elif defined TCC_TARGET_ARM
         "ARM"
+#elif defined TCC_TARGET_ARM_THUMB 
+        "ARM Thumb"
 # ifdef TCC_ARM_EABI
         " eabi"
 #  ifdef TCC_ARM_HARDFLOAT
@@ -391,9 +393,6 @@ redo:
         ;
     } else if (0 == ret) {
         if (s->output_type == TCC_OUTPUT_MEMORY) {
-#ifdef TCC_IS_NATIVE
-            ret = tcc_run(s, argc, argv);
-#endif
         } else {
             if (!s->outfile)
                 s->outfile = default_outputfile(s, first_file);

@@ -1,4 +1,15 @@
 /*
+ *  ARMvX-m code generator for TCC 
+ *  Uses thumb instruction set
+ * 
+ *  Based on: 
+ *  ARM Thumb 2 instruction functions for TCC
+ *  Copyright (c) 2020 Erlend J. Sveen  
+ *  from: https://git.erlendjs.no/erlendjs/tinycc/-/blob/arm-thumb/arm-thumb-gen.c
+ *        https://git.erlendjs.no/erlendjs/tinycc/-/blob/arm-thumb/arm-thumb-instructions.c
+ *  
+ *  And
+ * 
  *  ARMv4 code generator for TCC
  *
  *  Copyright (c) 2003 Daniel Glöckner
@@ -247,7 +258,25 @@ const char *default_elfinterp(struct TCCState *s)
 }
 #endif
 
-void o(unsigned int i)
+// output 16-bit thumb instruction
+void ot(uint16_t i)
+{
+  int ind1;
+  if (nocode_wanted)
+    return;
+  ind1 = ind + 2;
+  if (!cur_text_section)
+    tcc_error("compiler error! This happens f.ex. if the compiler\n"
+         "can't evaluate constant expressions outside of a function.");
+  if (ind1 > cur_text_section->data_allocated)
+    section_realloc(cur_text_section, ind1);
+  cur_text_section->data[ind++] = i&255;
+  i>>=8;
+  cur_text_section->data[ind++] = i&255;   
+}
+
+// output 32-bit thumb/arm instruction
+void o(uint32_t i)
 {
   /* this is a good place to start adding big-endian support*/
   int ind1;
@@ -265,155 +294,123 @@ void o(unsigned int i)
   i>>=8;
   cur_text_section->data[ind++] = i&255;
   i>>=8;
-  cur_text_section->data[ind++] = i;
+  cur_text_section->data[ind++] = i&255;
 }
 
-static uint32_t stuff_const(uint32_t op, uint32_t c)
+static void th_b_t1(uint16_t cond, uint16_t imm8)
 {
-  int try_neg=0;
-  uint32_t nc = 0, negop = 0;
+    const uint16_t masked_cond = cond & 0xf;
+    const uint16_t masked_imm8 = imm8 & 0xff;
+    ot(0xd000 | masked_cond | masked_imm8);
+}
 
-  switch(op&0x1F00000)
+static void th_b_t2(uint16_t imm11)
+{
+    const uint16_t masked_imm11 = 0x7f;
+    ot(0xe000 | masked_imm11);
+}
+
+#define ARM_THUMB16_B_T1_MASK(a) (a & 0xf000)
+#define ARM_THUMB16_B_T2_MASK(a) (a & 0xf800)
+
+#define ARM_THUMB16_B_T1_OPCODE 0xd000
+#define ARM_THUMB16_B_T2_OPCODE 0xe000
+#define ARM_THUMB16_B_NOP_OPCODE 0xbf00
+
+// Disassemble branch instruction at address
+int disassemble_branch(int pos)
+{
+  int a = *(uint16_t *)(cur_text_section->data + pos);
+  
+  // TODO matgla: add support for armv7-m+ 32-bit branches 
+  
+  if (ARM_THUMB16_B_T1_MASK(a) == ARM_THUMB16_B_T1_OPCODE)
   {
-    case 0x800000: //add
-    case 0x400000: //sub
-      try_neg=1;
-      negop=op^0xC00000;
-      nc=-c;
-      break;
-    case 0x1A00000: //mov
-    case 0x1E00000: //mvn
-      try_neg=1;
-      negop=op^0x400000;
-      nc=~c;
-      break;
-    case 0x200000: //xor
-      if(c==~0)
-	return (op&0xF010F000)|((op>>16)&0xF)|0x1E00000;
-      break;
-    case 0x0: //and
-      if(c==~0)
-	return (op&0xF010F000)|((op>>16)&0xF)|0x1A00000;
-    case 0x1C00000: //bic
-      try_neg=1;
-      negop=op^0x1C00000;
-      nc=~c;
-      break;
-    case 0x1800000: //orr
-      if(c==~0)
-	return (op&0xFFF0FFFF)|0x1E00000;
-      break;
-  }
-  do {
-    uint32_t m;
-    int i;
-    if(c<256) /* catch undefined <<32 */
-      return op|c;
-    for(i=2;i<32;i+=2) {
-      m=(0xff>>i)|(0xff<<(32-i));
-      if(!(c&~m))
-	return op|(i<<7)|(c<<i)|(c>>(32-i));
+    // B T1, conditional + imm8
+    // address in instruction is right-shifted to enforce 2-byte alignment
+    // address range: -256:254
+    // if bit 8 is 1 then value is negative
+    a &= 0x00ff; // extract imm8 
+    if (a & (1 << 7)) 
+    {
+      a -= 256;
     }
-    op=negop;
-    c=nc;
-  } while(try_neg--);
-  return 0;
-}
-
-
-//only add,sub
-void stuff_const_harder(uint32_t op, uint32_t v) {
-  uint32_t x;
-  x=stuff_const(op,v);
-  if(x)
-    o(x);
-  else {
-    uint32_t a[16], nv, no, o2, n2;
-    int i,j,k;
-    a[0]=0xff;
-    o2=(op&0xfff0ffff)|((op&0xf000)<<4);;
-    for(i=1;i<16;i++)
-      a[i]=(a[i-1]>>2)|(a[i-1]<<30);
-    for(i=0;i<12;i++)
-      for(j=i<4?i+12:15;j>=i+4;j--)
-	if((v&(a[i]|a[j]))==v) {
-	  o(stuff_const(op,v&a[i]));
-	  o(stuff_const(o2,v&a[j]));
-	  return;
-	}
-    no=op^0xC00000;
-    n2=o2^0xC00000;
-    nv=-v;
-    for(i=0;i<12;i++)
-      for(j=i<4?i+12:15;j>=i+4;j--)
-	if((nv&(a[i]|a[j]))==nv) {
-	  o(stuff_const(no,nv&a[i]));
-	  o(stuff_const(n2,nv&a[j]));
-	  return;
-	}
-    for(i=0;i<8;i++)
-      for(j=i+4;j<12;j++)
-	for(k=i<4?i+12:15;k>=j+4;k--)
-	  if((v&(a[i]|a[j]|a[k]))==v) {
-	    o(stuff_const(op,v&a[i]));
-	    o(stuff_const(o2,v&a[j]));
-	    o(stuff_const(o2,v&a[k]));
-	    return;
-	  }
-    no=op^0xC00000;
-    nv=-v;
-    for(i=0;i<8;i++)
-      for(j=i+4;j<12;j++)
-	for(k=i<4?i+12:15;k>=j+4;k--)
-	  if((nv&(a[i]|a[j]|a[k]))==nv) {
-	    o(stuff_const(no,nv&a[i]));
-	    o(stuff_const(n2,nv&a[j]));
-	    o(stuff_const(n2,nv&a[k]));
-	    return;
-	  }
-    o(stuff_const(op,v&a[0]));
-    o(stuff_const(o2,v&a[4]));
-    o(stuff_const(o2,v&a[8]));
-    o(stuff_const(o2,v&a[12]));
+    a = (a << 1) + pos + 4; // address based on PC, offseted by 4
   }
-}
-
-uint32_t encbranch(int pos, int addr, int fail)
-{
-  addr-=pos+8;
-  addr/=4;
-  if(addr>=0x1000000 || addr<-0x1000000) {
-    if(fail)
-      tcc_error("FIXME: function bigger than 32MB");
-    return 0;
+  else if (ARM_THUMB16_B_T2_MASK(a) == ARM_THUMB16_B_T2_OPCODE)
+  {
+    // B T2, unconditional imm11
+    // address in instruction is right-shifted to enforce 2-byte alignment
+    // address range: -2048:2046
+    a &= 0x07ff; // extract imm11
+    if (a & (1 << 10))
+    {
+      a -= 2048;
+    }
+    a = (a << 1) + pos + 4;
   }
-  return 0x0A000000|(addr&0xffffff);
+  else 
+  {
+    tcc_error("internal error: disassemble_branch for unknown encoding at position 0x%x\n", pos);
+    return -1;
+  }
+
+  return a;
 }
 
-int decbranch(int pos)
+uint16_t th_encode_branch_imm8(int position, int address)
 {
-  int x;
-  x=*(uint32_t *)(cur_text_section->data + pos);
-  x&=0x00ffffff;
-  if(x&0x800000)
-    x-=0x1000000;
-  return x*4+pos+8;
+    address = (address - position - 4);
+    if (address < -256 || address > 254) 
+    {
+        tcc_error("internal_error: th_encode_branch_imm8 called for too far branch: 0x%x\n", address);
+        return 0;
+    }
+    return address >> 1;
+}
+
+uint16_t th_encode_branch_imm11(int position, int address)
+{   
+    address = (address - position - 4);
+    if (address < -2048 || address > 2046)
+    {
+        tcc_error("internal_error: th_encode_branch_imm11 called for too far branch: 0x%x\n", address);
+        return 0;
+    }
+    return address >> 1;
+}
+
+int th_patch_call(int t, int a)
+{
+  uint16_t *x = (uint16_t *)(cur_text_section->data + 1);
+  int original_address = t;
+  t = disassemble_branch(t);
+  // if branch to next instruction
+  if (a == original_address + 2)
+  {
+    // then just do nop
+    *x = ARM_THUMB16_B_NOP_OPCODE;
+  }
+  else if (ARM_THUMB16_B_T1_MASK(x) == ARM_THUMB16_B_T1_OPCODE)
+  {
+    *x = (x & 0xff00) | th_encode_branch_imm8(original_address, a);
+  }
+  else if (ARM_THUMB16_B_T2_MASK(x) == ARM_THUMB16_B_T2_OPCODE)
+  {
+    *x = (x & 0xf800) | th_encode_branch_imm11(original_address, a);
+  }
+  else 
+  {
+    tcc_error("internal error: unsupported branch instruction for th_patch_call\n");
+  }
+  return t;
 }
 
 /* output a symbol and patch all calls to it */
 void gsym_addr(int t, int a)
 {
-  uint32_t *x;
-  int lt;
-  while(t) {
-    x=(uint32_t *)(cur_text_section->data + t);
-    t=decbranch(lt=t);
-    if(a==lt+4)
-      *x=0xE1A00000; // nop
-    else {
-      *x &= 0xff000000;
-      *x |= encbranch(lt,a,1);
-    }
+  while (t) {
+    t = th_patch_call(t, a);
   }
 }
 
@@ -433,6 +430,7 @@ static uint32_t fpr(int r)
 }
 #endif
 
+// note: DONE
 static uint32_t intr(int r)
 {
   if(r == TREG_R12)
@@ -476,32 +474,32 @@ static uint32_t mapcc(int cc)
   switch(cc)
   {
     case TOK_ULT:
-      return 0x3; /* CC/LO */
+      return 0x30000000; /* CC/LO */
     case TOK_UGE:
-      return 0x2; /* CS/HS */
+      return 0x20000000; /* CS/HS */
     case TOK_EQ:
-      return 0x0; /* EQ */
+      return 0x00000000; /* EQ */
     case TOK_NE:
-      return 0x1; /* NE */
+      return 0x10000000; /* NE */
     case TOK_ULE:
-      return 0x9; /* LS */
+      return 0x90000000; /* LS */
     case TOK_UGT:
-      return 0x8; /* HI */
+      return 0x80000000; /* HI */
     case TOK_Nset:
-      return 0x4; /* MI */
+      return 0x40000000; /* MI */
     case TOK_Nclear:
-      return 0x5; /* PL */
+      return 0x50000000; /* PL */
     case TOK_LT:
-      return 0xB; /* LT */
+      return 0xB0000000; /* LT */
     case TOK_GE:
-      return 0xA; /* GE */
+      return 0xA0000000; /* GE */
     case TOK_LE:
-      return 0xD; /* LE */
+      return 0xD0000000; /* LE */
     case TOK_GT:
-      return 0xC; /* GT */
+      return 0xC0000000; /* GT */
   }
   tcc_error("unexpected condition code");
-  return 0xE; /* AL */
+  return 0xE0000000; /* AL */
 }
 
 static int negcc(int cc)
@@ -569,14 +567,193 @@ static void load_value(SValue *sv, int r)
 #endif
 }
 
-/* load 'r' from value 'sv' */
+// TODO: implement me
+void load_vt_lval_vt_local_float(int r, SValue *sv, int ft, int fc, int sign, uint32_t base)
+{
+  calcaddr(&base, &fc, &sign, 1020, 2);
+  #ifdef TCC_ARM_VFP
+
+  #else 
+  #endif
+}
+
+uint16_t th_ldrsh_imm(uint32_t rt, uint32_t rn, uint32_t imm12, uint32_t puw)
+{
+  // armv6-m can't manipulate rt/rn > 7 and imm12 really, only imm5m so let's build non-existing ones
+}
+
+void load_vt_lval_vt_local(int r, SValue *sv, int ft, int fc, int sign, uint32_t base)
+{
+  int ok = 0;
+  int btype = ft & VT_BTYPE;
+  int ir = intr(r);
+  if (is_float(ft)) 
+  {
+    return load_vt_lval_vt_local_float(r, sv, ft, fc, sign, base);
+  }
+
+  else if (btype == VT_SHORT)
+  {
+    if (!(ft & VT_UNSIGNED))
+    {
+      ok = th_ldrsh_imm(ir, base, fc, sign ? 4 : 6);
+    }
+    else 
+    {
+      ok = th_ldrh_imm(ir, base, fc, sign ? 4 : 6);
+    }
+  }
+
+}
+
+uint32_t th_pack_const(uint32_t imm)
+{
+  // 00000000 00000000 00000000 abcdefgh
+  if (!(imm & 0xffffff00))
+  {
+    return imm;
+  }
+  // 00000000 abcdefgh 00000000 abcdefgh 
+  else if (!(imm & 0xff00ff00) && (imm >> 16) == (imm & 0xff))
+  {
+    return (1 << 12) | (imm & 0xff);
+  }
+  // abcdefgh 00000000 abcdefgh 00000000
+  else if (!(imm & 0x00ff00ff) && ((imm >> 16) & 0xff00) == (imm & 0xff00))
+  {
+    return (2 << 12) | ((imm >> 8) & 0xff);
+  }
+  // abcdefgh abcdefgh abcdefgh abcdefgh
+  else if ((imm & 0xffff) == ((imm >> 16) & 0xffff) && ((imm >> 8) & 0xff) == (imm & 0xff))
+  {
+    return (3 << 12) || (imm & 0xff);
+  }
+  else 
+  {
+    for (uint32_t j = 0; j < 24; i++, j++)
+    {
+      const uint32_t mask = 0xff000000 >> j;
+      const uint32_t firstbit = 0x80000000 >> j;
+      if ((imm & firstbit) == firstbit && (imm & ~mask) == 0)
+      {
+        const uint32_t imm5 = (j + 8);
+        const uint32_t i = imm5 >> 4;
+        const uint32_t imm3 = (imm5 >> 1) & 0x7;
+        const uint32_t a = imm5 & 1;
+        const uint32_t bcdefgh = (imm >> (24 - j)) & 0x7f;
+        return (i << 26) | (imm3 << 12) | (a << 7) | bcdefgh;
+      }
+    }
+  }
+  tcc_error("compiler_error: unable to pack constant 0x%x for immediate thumb constats\n", imm);
+  return 0;
+}
+
+// setflags 
+// 0 - disable setting flags 
+// 1 - enforce setting flags 
+// 2 - doesn't matter
+uint16_t th_mov_imm(uint32_t rd, uint32_t imm, uint32_t setflags)
+{
+
+  if (rd <= 7 && imm <= 0xff && setflags) 
+  {
+    // movs rd,#imm8
+    // for armv6-m only this one is available
+    return ot(0x2000 | (rd << 8) | imm & 0xff);
+  } 
+  #if defined(TCC_ARM_THUMB_ARCHV7M) || defined (TCC_ARM_THUMB_ARCHV8M)
+  else if (rd != 13 && rd != 15 && imm <= 0xffff && (!setflags || setflags == 2)) 
+  {
+    // armv7-m and armv8-m T3 encoding
+    // MOVW<c> <Rd>,#<imm16>
+    const uint32_t imm4 = (imm >> 12) & 0xf;
+    const uint32_t i = (imm >> 11) & 1;
+    const uint32_t imm3 = (imm >> 8) & 0x7;
+    ot(0xf240 | (i << 10) | imm4);
+    ot((imm3 << 12) | ((rd & 0xf) << 8) & (imm & 0xff));
+    return 4;
+  }
+  else if (rd != 13 && rd != 15 && imm <= 0xfff)
+  {
+    const uint32_t S = !!setflags;
+    const uint32_t packed_constant = th_pack_const(imm);
+    ot(0xf04f | (S << 4) | (packed_constant >> 16));
+    ot(((rd & 0xf) << 8) | (packed_constant & 0xffff));
+    return 4;
+  }
+  #endif
+  tcc_error("compiler_error: unsupported 'th_mov_imm' instruction: rd: %d, imm: 0x%x, setflags: %d\n", rd, imm, setflags);
+  return 0;
+}
+
+uint16_t th_mov_reg_t1(uint32_t rd, uint32_t rm) 
+{
+  if (rd > 0xf || rm > 0xf) {
+    tcc_error("compiler_error: trying to mov not existing reg in 'th_mov_reg_t1' rd: %d, rm: %d\n", rd, rm);
+  } 
+  const uint32_t D = (rd >> 3) & 1;
+  return (0x4600 | (D << 7) | (rm << 3) | rd & 0x7);
+}
+
+// VT_JMP: jmp true
+// VT_JMPI: jmp false
+void load_vt_jmp_jmpi(int r, SValue *sv)
+{
+  th_mov_imm(intr(r), sv->r & 1, 2);
+  th_b_t2(2); // branch over one instruction 
+  // constant value of branch address
+  gsym(sv->c.i);
+  th_mov_imm(intr(r), (sv->r^1) & 1, 2);
+}
+
+void load_vt_cmp(int r, SValue *sv)
+{
+  int reg = intr(r);
+  if (reg == 13 || reg == 15)
+  {
+    tcc_error("compiler_error: trying to encode ")
+  }
+  // armv6-m doesn't support IT blocks 
+  #if defined (TCC_ARM_THUMB_ARCHV6M)
+  
+  
+  #elif defined (TCC_ARM_THUMB_ARCHV7M) || defined (TCC_ARM_THUMB_ARCHV8M)
+  const uint32_t firstcond = mapcc(sv->c.i);
+  // IT block
+  ot(0xbf00 | (firstcond << 4) | 0x4 | ((~firstcond & 1) << 3));
+  th_mov_imm(reg, 1, 2);
+  th_mov_imm(reg, 0, 2);
+  #endif
+}
+
+
+// load lvalue saved on the stack
+void load_vt_lval_vt_llocal(uint64_t value)
+{
+  SValue v;
+  v.type.t = VT_PTR;
+  v.r = VT_LOCAL | VT_LVAL;
+  v.c.i = value;
+  load(TREG_LR, &v) 
+}
+
+// load lvalue from compiler stack
+void load_vt_lval(int value_type, uint64_t value)
+{
+  if (value_type & VT_LLOCAL)
+  {
+    load_vt_lval_vt_llocal(value);
+  }
+}
+
+// load stack value into register
 void load(int r, SValue *sv)
 {
-  int v, ft, fc, fr, sign;
+  int v, ft, fc, sign;
   uint32_t op;
   SValue v1;
 
-  fr = sv->r;
   ft = sv->type.t;
   fc = sv->c.i;
 
@@ -587,119 +764,79 @@ void load(int r, SValue *sv)
     fc=-fc;
   }
 
-  v = fr & VT_VALMASK;
-  if (fr & VT_LVAL) {
-    uint32_t base = 0xB; // fp
-    if(v == VT_LLOCAL) {
+  v = sv->r & VT_VALMASK;
+
+  if (sv->r & VT_LVAL) 
+  {
+    uint32_t base = 0xB; // frame pointer
+    // load lvalue from lvalue on the stack
+    if(v == VT_LLOCAL) 
+    {
       v1.type.t = VT_PTR;
       v1.r = VT_LOCAL | VT_LVAL;
       v1.c.i = sv->c.i;
+      // load lvalue from local pointer  to link register
       load(TREG_LR, &v1);
+      // now value is stored inside lr
       base = 14; /* lr */
       fc=sign=0;
       v=VT_LOCAL;
-    } else if(v == VT_CONST) {
+    } 
+    // load lvalue from const
+    else if (v == VT_CONST) 
+    {
       v1.type.t = VT_PTR;
-      v1.r = fr&~VT_LVAL;
+      v1.r = (sv->r)&~VT_LVAL;
       v1.c.i = sv->c.i;
       v1.sym=sv->sym;
+      // load const symbol from sv->sym to register
       load(TREG_LR, &v1);
+      // now value is stored inside lr 
       base = 14; /* lr */
       fc=sign=0;
       v=VT_LOCAL;
-    } else if(v < VT_CONST) {
+    }
+    // load lvalue from register 
+    else if (v < VT_CONST) 
+    {
       base=intr(v);
       fc=sign=0;
       v=VT_LOCAL;
     }
-    if(v == VT_LOCAL) {
-      if(is_float(ft)) {
-	calcaddr(&base,&fc,&sign,1020,2);
-#ifdef TCC_ARM_VFP
-        op=0xED100A00; /* flds */
-        if(!sign)
-          op|=0x800000;
-        if ((ft & VT_BTYPE) != VT_FLOAT)
-          op|=0x100;   /* flds -> fldd */
-        o(op|(vfpr(r)<<12)|(fc>>2)|(base<<16));
-#else
-	op=0xED100100;
-	if(!sign)
-	  op|=0x800000;
-#if LDOUBLE_SIZE == 8
-	if ((ft & VT_BTYPE) != VT_FLOAT)
-	  op|=0x8000;
-#else
-	if ((ft & VT_BTYPE) == VT_DOUBLE)
-	  op|=0x8000;
-	else if ((ft & VT_BTYPE) == VT_LDOUBLE)
-	  op|=0x400000;
-#endif
-	o(op|(fpr(r)<<12)|(fc>>2)|(base<<16));
-#endif
-      } else if((ft & (VT_BTYPE|VT_UNSIGNED)) == VT_BYTE
-                || (ft & VT_BTYPE) == VT_SHORT) {
-	calcaddr(&base,&fc,&sign,255,0);
-	op=0xE1500090;
-	if ((ft & VT_BTYPE) == VT_SHORT)
-	  op|=0x20;
-	if ((ft & VT_UNSIGNED) == 0)
-	  op|=0x40;
-	if(!sign)
-	  op|=0x800000;
-	o(op|(intr(r)<<12)|(base<<16)|((fc&0xf0)<<4)|(fc&0xf));
-      } else {
-	calcaddr(&base,&fc,&sign,4095,0);
-	op=0xE5100000;
-	if(!sign)
-	  op|=0x800000;
-        if ((ft & VT_BTYPE) == VT_BYTE || (ft & VT_BTYPE) == VT_BOOL)
-          op|=0x400000;
-        o(op|(intr(r)<<12)|fc|(base<<16));
-      }
-      return;
-    }
-  } else {
-    if (v == VT_CONST) {
-      op=stuff_const(0xE3A00000|(intr(r)<<12),sv->c.i);
-      if (fr & VT_SYM || !op)
-	load_value(sv, r);
-      else
-        o(op);
-      return;
-    } else if (v == VT_LOCAL) {
-      op=stuff_const(0xE28B0000|(intr(r)<<12),sv->c.i);
-      if (fr & VT_SYM || !op) {
-	load_value(sv, r);
-	o(0xE08B0000|(intr(r)<<12)|intr(r));
-      } else
-	o(op);
-      return;
-    } else if(v == VT_CMP) {
-      o(mapcc(sv->c.i)|0x3A00001|(intr(r)<<12));
-      o(mapcc(negcc(sv->c.i))|0x3A00000|(intr(r)<<12));
-      return;
-    } else if (v == VT_JMP || v == VT_JMPI) {
-      int t;
-      t = v & 1;
-      o(0xE3A00000|(intr(r)<<12)|t);
-      o(0xEA000000);
-      gsym(sv->c.i);
-      o(0xE3A00000|(intr(r)<<12)|(t^1));
-      return;
-    } else if (v < VT_CONST) {
-      if(is_float(ft))
-#ifdef TCC_ARM_VFP
-        o(0xEEB00A40|(vfpr(r)<<12)|vfpr(v)|T2CPR(ft)); /* fcpyX */
-#else
-	o(0xEE008180|(fpr(r)<<12)|fpr(v));
-#endif
-      else
-	o(0xE1A00000|(intr(r)<<12)|intr(v));
+    // load lvalue from local pointer
+    if (v == VT_LOCAL) 
+    {
+      // perform actual loading from local variable pointer
+      return load_vt_lval_vt_local(r, sv, ft, fc, sign, base);
+    } 
+  } 
+  // rest 
+  else if (v == VT_CONST) 
+  {
+    load_vt_const(r, sv);
+  } 
+  else if (v == VT_LOCAL) 
+  {
+    load_vt_local();
+  } 
+  else if (v == VT_CMP) 
+  {
+    return load_vt_cmp(r, sv);
+  } 
+  else if (v == VT_JMP || v == VT_JMPI) 
+  {
+    return load_vt_jmp_jmpi(r, sv);
+  } 
+  else if (v < VT_CONST) /* those are register values, so just move registers */ 
+  {
+    if (is_float(ft)) {
+      tcc_error("implement float support in load\n");
+    } else {
+      th_mov_reg(r, v);
       return;
     }
   }
-  tcc_error("load unimplemented!");
+  tcc_error("internal_error: unknown load occured!");
 }
 
 /* store register 'r' in lvalue 'v' */
@@ -792,39 +929,16 @@ static void gadd_sp(int val)
 /* 'is_jmp' is '1' if it is a jump */
 static void gcall_or_jmp(int is_jmp)
 {
-  int r;
-  uint32_t x;
-  if ((vtop->r & (VT_VALMASK | VT_LVAL)) == VT_CONST) {
-    /* constant case */
-    if(vtop->r & VT_SYM){
-	x=encbranch(ind,ind+vtop->c.i,0);
-	if(x) {
-	    /* relocation case */
-	    greloc(cur_text_section, vtop->sym, ind, R_ARM_PC24);
-	    o(x|(is_jmp?0xE0000000:0xE1000000));
-	} else {
-	    r = TREG_LR;
-	    load_value(vtop, r);
-	    if(is_jmp)
-	        o(0xE1A0F000 | intr(r)); // mov pc, r
-	    else
-		o(0xe12fff30 | intr(r)); // blx r
-	}
-     }else{
-	if(!is_jmp)
-	    o(0xE28FE004); // add lr,pc,#4
-	o(0xE51FF004);   // ldr pc,[pc,#-4]
-	o(vtop->c.i);
-     }
-  } else {
-    /* otherwise, indirect call */
-#ifdef CONFIG_TCC_BCHECK
-    vtop->r &= ~VT_MUSTBOUND;
-#endif
-    r = gv(RC_INT);
-    if(!is_jmp)
-      o(0xE1A0E00F);       // mov lr,pc
-    o(0xE1A0F000|intr(r)); // mov pc,r
+  if ((vtop->r & (VT_VALMASK | VT_LVAL)) == VT_CONST)
+  {
+    uint32_t x = th_encbranch(ind, ind + vtop->c.i);
+    if (x)
+    {
+      if (vtop->r & VT_SYM)
+        greloc(cur_text_section, vtop->sym, ind, R_ARM_THM_JUMP24);
+      else 
+        th_bl_t1(x);
+    }
   }
 }
 
@@ -1561,9 +1675,10 @@ ST_FUNC void gen_fill_nops(int bytes)
 /* generate a jump to a label */
 ST_FUNC int gjmp(int t)
 {
-  int r;
+  int r = ind;
   if (nocode_wanted)
     return t;
+  int val = ((t - r))
   r=ind;
   o(0xE0000000|encbranch(r,t,1));
   return r;
@@ -2358,6 +2473,7 @@ ST_FUNC void gen_vla_alloc(CType *type, int align) {
 #if defined(CONFIG_TCC_BCHECK)
     if (tcc_state->do_bounds_check)
         o(0xe2800001 | (r<<16)|(r<<12)); /* add r,r,#1 */
+        ot()
 #endif
     o(0xE04D0000|(r<<12)|r); /* sub r, sp, r */
 #ifdef TCC_ARM_EABI

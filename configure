@@ -314,18 +314,25 @@ case "$cpu" in
     case "$cpu" in
       arm|armv4l)
 	cpuver=4
+  cpu="arm"
       ;;
       armv5tel|armv5tejl)
 	cpuver=5
+  cpu="arm"
       ;;
       armv6j|armv6l)
 	cpuver=6
+  cpu="arm"
       ;;
       armv7|armv7a|armv7l)
 	cpuver=7
+  cpu="arm"
+      ;;
+      armv8m)
+  cpuver=8
+  cpu="armv8m"
       ;;
     esac
-    cpu="arm"
   ;;
   alpha)
     cpu="alpha"
@@ -625,7 +632,7 @@ cat >$TMPH <<EOF
 #define GCC_MINOR $gcc_minor
 
 #if !(TCC_TARGET_I386 || TCC_TARGET_X86_64 || TCC_TARGET_ARM\
- || TCC_TARGET_ARM64 || TCC_TARGET_RISCV64 || TCC_TARGET_C67)
+ || TCC_TARGET_ARM64 || TCC_TARGET_RISCV64 || TCC_TARGET_C67 || TCC_TARGET_ARM_THUMB)
 EOF
 
 predefs=1
@@ -641,6 +648,8 @@ for v in $cpu $confvars ; do
     CONFIG_i386=yes)        print_num TCC_TARGET_I386 1 ;;
     CONFIG_x86_64=yes)      print_num TCC_TARGET_X86_64 1 ;;
     CONFIG_arm64=yes)       print_num TCC_TARGET_ARM64 1 ;;
+    CONFIG_armv8m=yes)      print_num TCC_TARGET_ARM_THUMB 1
+                            print_num TCC_TARGET_ARM_ARCHV8M 1;;
     CONFIG_riscv64=yes)     print_num TCC_TARGET_RISCV64 1 ;;
     CONFIG_arm=yes)         print_num TCC_TARGET_ARM 1
                             print_num CONFIG_TCC_CPUVER "$cpuver" ;;
