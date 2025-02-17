@@ -227,6 +227,40 @@ ST_DATA const int reg_classes[NB_REGS] = {
 #endif
 };
 
+
+static uint32_t mapcc(int cc)
+{
+  switch(cc)
+  {
+    case TOK_ULT:
+      return 0x3; /* CC/LO */
+    case TOK_UGE:
+      return 0x2; /* CS/HS */
+    case TOK_EQ:
+      return 0x0; /* EQ */
+    case TOK_NE:
+      return 0x1; /* NE */
+    case TOK_ULE:
+      return 0x9; /* LS */
+    case TOK_UGT:
+      return 0x8; /* HI */
+    case TOK_Nset:
+      return 0x4; /* MI */
+    case TOK_Nclear:
+      return 0x5; /* PL */
+    case TOK_LT:
+      return 0xB; /* LT */
+    case TOK_GE:
+      return 0xA; /* GE */
+    case TOK_LE:
+      return 0xD; /* LE */
+    case TOK_GT:
+      return 0xC; /* GT */
+  }
+  tcc_error("unexpected condition code");
+  return 0xE; /* AL */
+}
+
 static int func_nregs = 0; // number of registers stored in function prologue
 static int func_sub_sp_offset = 0; 
 static int leaffunc = 0; // function is leaf
@@ -494,6 +528,11 @@ static void th_bx_reg(uint16_t rm)
   o(0x4700 | ((rm & 0xf) << 3));
 }
 
+static void th_b_t1(uint16_t cond, uint16_t imm8)
+{
+  o(0xd000 | ((cond & 0xf) << 8) | (imm8 & 0xff));
+}
+
 static void th_b_t2(uint16_t imm11)
 {
   o(0xe000 | (imm11 & 0x7ff));
@@ -563,23 +602,44 @@ static void th_add_reg(uint16_t rd, uint16_t rn, uint16_t rm)
   }
 }
 
-// TODO: add armv7-m and boolean if succeeded
-static void th_sub_imm(uint16_t rd, uint16_t rn, uint16_t imm)
+static int th_sub_imm(uint16_t rd, uint16_t rn, uint16_t imm)
 {
   if (rd == rn && imm <= 255 && rd < 8)
   {
     // T2
     o(0x3800 | (rd << 8) | imm);
+    return 1;
   }
   else if (rd < 8 && rn < 8 && imm <= 7)
   {
     // T1 
     o(0x1e00 | (imm << 6) | (rn << 3) | rd);
+    return 1;
   }
-  else 
+#ifndef TCC_TARGET_ARM_ARCHV6M
+  else if (rd != R_SP && rd != R_PC && imm <= 0xfff)
   {
-    tcc_error("compiler_error: 'th_add_reg', cannot encode for rd: %d, rn: %d\n", rd, rn);
+    // T4
+    const uint16_t i = imm >> 11;
+    const uint16_t imm3 = (imm >> 8) & 0x7;
+    o(0xf2a0 | (i << 10) | (rn & 0xf));
+    o((imm3 << 12) | ((rd & 0xf) << 8) | (imm & 0xff));
+    return 1;
   }
+  else if (rd != 13 && rd != 15)
+  {
+    const uint32_t enc = th_pack_const(imm);
+    if (enc || imm == 0)
+    {
+      const uint16_t a = enc >> 16;
+      const uint16_t b = enc & 0xffff;
+      o(0xf1a0 | (rn & 0xf) | a);
+      o(b | (rd & 0xf) << 8);
+      return 1;
+    }
+  }
+#endif
+  return 0;
 }
 
 
@@ -1986,7 +2046,66 @@ void load_vt_const(int r, SValue *sv)
 
 void load_vt_local(int r, SValue *sv)
 {
-  if (sv->r & VT_SYM || (-sv->c.i) >= 0x) 
+  TRACE("'load_vt_local' r: %d, off: %d\n", r, sv->c.i);
+  if (!(sv->r & VT_SYM)) 
+  {
+    if (th_sub_imm(r, R_FP, -sv->c.i)) 
+    {
+      return;
+    }
+  }
+  load_full_const(r, sv->c.i, sv->r & VT_SYM ? sv->sym : 0);
+  th_add_reg(r, R_FP, r);
+}
+
+void load_vt_cmp(int r, SValue *sv)
+{
+  const uint32_t firstcond = mapcc(sv->c.i);
+  uint32_t rr = intr(r);
+  TRACE("'load_vt_cmp' to reg: %d, op: 0x%x\n", r, sv->c.i);
+  if (rr == R_SP || rr == R_PC)
+  {
+    tcc_error("compiler_error: load_vt_cmp can't be used for pc or sp\n");
+  }
+
+#ifdef TCC_TARGET_ARM_ARCHV6M
+  // TODO: verify and optimize
+  if (rr < 8)
+  {
+    th_b_t1(firstcond, 4);
+    th_mov_imm(rr, 1);
+    th_mov_imm(rr, 0);
+  }
+  else 
+  {
+    th_push(R_R1);
+    th_b_t1(firstcond, 4);
+    th_mov_imm(R_R1, 1);
+    th_mov_imm(R_R1, 0);
+    th_mov_reg(rr, R_R1);
+    th_pop(R_R1);
+
+  }
+#else 
+  // it block 
+  o(0xbf00 | (firstcond << 4) | 0x4 | ((~firstcond & 1) << 3));
+  th_mov_imm(rr, 1);
+  th_mov_imm(rr, 0);
+#endif 
+}
+
+void load_vt_jmp_jmpi(int r, SValue *sv)
+{
+#ifdef TCC_TARGET_ARM_ARCHV6M
+  if (intr(r) > 7)
+  {
+    tcc_error("compiler_error: implement load_vt_jmp_jmpi for armv6m\n");
+  }
+#endif
+  th_mov_imm(intr(r), sv->r & 1);
+  th_b_t2(2);
+  gsym(sv->c.i);
+  th_mov_imm(intr(r), (sv->r^1) & 1);
 }
 
 // load value from stack to register
@@ -2101,4 +2220,6 @@ ST_FUNC void gen_increment_tcov(SValue *sv)
   TRACE("'gen_increment_tcov'");
 }
 
-#endif // TARGET_DEFS_ONLY
+#endif // TARGET_DEFS_ONLYa
+
+/* vim: set ts=2 sw=2 sts=2 tw=110 :*/

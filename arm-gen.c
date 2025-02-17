@@ -195,6 +195,7 @@ ST_FUNC void arm_init(struct TCCState *s)
     func_float_type.ref = sym_push(SYM_FIELD, &float_type, FUNC_CDECL, FUNC_OLD);
     func_double_type.t = VT_FUNC;
     func_double_type.ref = sym_push(SYM_FIELD, &double_type, FUNC_CDECL, FUNC_OLD);
+
     float_abi = s->float_abi;
 #ifndef TCC_ARM_HARDFLOAT
 // XXX: Works on OpenBSD
@@ -246,7 +247,7 @@ const char *default_elfinterp(struct TCCState *s)
 }
 #endif
 
-void o(unsigned int i)
+void o(uint32_t i)
 {
   /* this is a good place to start adding big-endian support*/
   int ind1;
@@ -475,32 +476,32 @@ static uint32_t mapcc(int cc)
   switch(cc)
   {
     case TOK_ULT:
-      return 0x3; /* CC/LO */
+      return 0x30000000; /* CC/LO */
     case TOK_UGE:
-      return 0x2; /* CS/HS */
+      return 0x20000000; /* CS/HS */
     case TOK_EQ:
-      return 0x0; /* EQ */
+      return 0x00000000; /* EQ */
     case TOK_NE:
-      return 0x1; /* NE */
+      return 0x10000000; /* NE */
     case TOK_ULE:
-      return 0x9; /* LS */
+      return 0x90000000; /* LS */
     case TOK_UGT:
-      return 0x8; /* HI */
+      return 0x80000000; /* HI */
     case TOK_Nset:
-      return 0x4; /* MI */
+      return 0x40000000; /* MI */
     case TOK_Nclear:
-      return 0x5; /* PL */
+      return 0x50000000; /* PL */
     case TOK_LT:
-      return 0xB; /* LT */
+      return 0xB0000000; /* LT */
     case TOK_GE:
-      return 0xA; /* GE */
+      return 0xA0000000; /* GE */
     case TOK_LE:
-      return 0xD; /* LE */
+      return 0xD0000000; /* LE */
     case TOK_GT:
-      return 0xC; /* GT */
+      return 0xC0000000; /* GT */
   }
   tcc_error("unexpected condition code");
-  return 0xE; /* AL */
+  return 0xE0000000; /* AL */
 }
 
 static int negcc(int cc)
