@@ -336,9 +336,9 @@ ST_FUNC void test_lvalue(void)
 
 ST_FUNC void check_vstack(void)
 {
-    // if (vtop != vstack - 1)
-    //     tcc_error("internal compiler error: vstack leak (%d)",
-    //               (int)(vtop - vstack + 1));
+    if (vtop != vstack - 1)
+        tcc_error("internal compiler error: vstack leak (%d)",
+                  (int)(vtop - vstack + 1));
 }
 
 /* vstack debugging aid */

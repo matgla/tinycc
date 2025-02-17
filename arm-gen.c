@@ -195,7 +195,6 @@ ST_FUNC void arm_init(struct TCCState *s)
     func_float_type.ref = sym_push(SYM_FIELD, &float_type, FUNC_CDECL, FUNC_OLD);
     func_double_type.t = VT_FUNC;
     func_double_type.ref = sym_push(SYM_FIELD, &double_type, FUNC_CDECL, FUNC_OLD);
-
     float_abi = s->float_abi;
 #ifndef TCC_ARM_HARDFLOAT
 // XXX: Works on OpenBSD
