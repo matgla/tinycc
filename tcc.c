@@ -82,6 +82,11 @@ static const char help[] =
 #if defined(TCC_TARGET_I386) || defined(TCC_TARGET_X86_64)
     "  -m32/64      defer to i386/x86_64 cross compiler\n"
 #endif
+#if defined(TCC_TARGET_ARM) || defined(TCC_TARGET_ARM_THUMB)
+    "ARM. options:\n"
+    "  -mfloat-abi                       specify ABI for floating point unit\n"
+    "  -mno-pic-data-is-text-relative    separate .text and .data with base register addressing instead of PC-relative\n"
+#endif
     "Tools:\n"
     "  create library  : tcc -ar [crstvx] lib [files]\n"
 #ifdef TCC_TARGET_PE

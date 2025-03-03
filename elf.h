@@ -2496,7 +2496,7 @@ typedef Elf32_Addr Elf32_Conflict;
 #define R_ARM_RELATIVE		23	/* Adjust by program base */
 #define R_ARM_GOTOFF		24	/* 32 bit offset to GOT */
 #define R_ARM_GOTPC		25	/* 32 bit PC relative offset to GOT */
-#define R_ARM_GOT32		26	/* 32 bit GOT entry */
+#define R_ARM_GOT32		26	/* 32 bit GOT entry, same as R_ARM_GOT_BREL */
 #define R_ARM_PLT32		27	/* 32 bit PLT address */
 #define R_ARM_CALL		28
 #define R_ARM_JUMP24		29

@@ -1161,6 +1161,7 @@ static void merge_symattr(struct SymAttr *sa, struct SymAttr *sa1)
     sa->dllexport |= sa1->dllexport;
     sa->nodecorate |= sa1->nodecorate;
     sa->dllimport |= sa1->dllimport;
+    sa->naked |= sa1->naked;
 }
 
 /* Merge function attributes.  */
@@ -3940,6 +3941,9 @@ redo:
         case TOK_WEAK1:
         case TOK_WEAK2:
             ad->a.weak = 1;
+            break;
+        case TOK_NAKED1:
+            ad->a.naked = 1;
             break;
         case TOK_NODEBUG1:
         case TOK_NODEBUG2:
@@ -8374,7 +8378,13 @@ static void gen_function(Sym *sym)
     func_var = sym->type.ref->f.func_type == FUNC_ELLIPSIS;
 
     /* NOTE: we patch the symbol size later */
+    #ifdef TCC_TARGET_ARM_THUMB
+
+    put_extern_sym(sym, cur_text_section, ind + 1, 0);
+    #else
+
     put_extern_sym(sym, cur_text_section, ind, 0);
+    #endif
 
     if (sym->type.ref->f.func_ctor)
         add_array (tcc_state, ".init_array", sym->c);
@@ -8388,8 +8398,11 @@ static void gen_function(Sym *sym)
     sym_push2(&local_stack, SYM_FIELD, 0, 0);
     local_scope = 1; /* for function parameters */
     nb_temp_local_vars = 0;
-    gfunc_prolog(sym);
-    tcc_debug_prolog_epilog(tcc_state, 0);
+    if (!sym->a.naked)
+    {
+        gfunc_prolog(sym);
+        tcc_debug_prolog_epilog(tcc_state, 0);
+    }
 
     local_scope = 0;
     rsym = 0;
@@ -8400,8 +8413,12 @@ static void gen_function(Sym *sym)
     nocode_wanted = 0;
     /* reset local stack */
     pop_local_syms(NULL, 0);
-    tcc_debug_prolog_epilog(tcc_state, 1);
-    gfunc_epilog();
+
+    if (!sym->a.naked)
+    {
+        tcc_debug_prolog_epilog(tcc_state, 1);
+        gfunc_epilog();
+    }
 
     /* end of function */
     tcc_debug_funcend(tcc_state, ind - func_ind);

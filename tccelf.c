@@ -47,9 +47,12 @@ struct sym_version {
 /* section is dynsymtab_section */
 #define SHF_DYNSYM 0x40000000
 
-#ifdef TCC_TARGET_PE
+#if defined(TCC_TARGET_PE) 
 #define shf_RELRO SHF_ALLOC
 static const char rdata[] = ".rdata";
+#elif defined(TCC_TARGET_ARM_THUMB)
+#define shf_RELRO SHF_ALLOC
+static const char rdata[] = ".rodata";
 #else
 #define shf_RELRO SHF_ALLOC /* eventually made SHF_WRITE in sort_sections() */
 static const char rdata[] = ".data.ro";
@@ -2167,10 +2170,6 @@ static int sort_sections(TCCState *s1, int *sec_order, struct dyn_inf *d)
             j = 0x900; /* no sh_name: won't go to file */
         } else if (s->sh_flags & SHF_ALLOC) {
             j = 0x100;
-            if (s->sh_flags & SHF_WRITE)
-                j = 0x200;
-            if (s->sh_flags & SHF_TLS)
-                j += 0x200;
         } else {
             j = 0x700;
         }
@@ -2178,23 +2177,27 @@ static int sort_sections(TCCState *s1, int *sec_order, struct dyn_inf *d)
             s->sh_size = 0, j = 0x900;
 
         if (s->sh_type == SHT_SYMTAB || s->sh_type == SHT_DYNSYM) {
-            k = 0x10;
+            k = 0xff;
         } else if (s->sh_type == SHT_STRTAB && strcmp(s->name, ".stabstr")) {
-            k = 0x11;
+            k = 0xff;
             if (i == nb_sections - 1) /* ".shstrtab" assumed to stay last */
                 k = 0xff;
         } else if (s->sh_type == SHT_HASH || s->sh_type == SHT_GNU_HASH) {
-            k = 0x12;
+            k = 0xff;
         } else if (s->sh_type == SHT_GNU_verdef
                   || s->sh_type == SHT_GNU_verneed
                   || s->sh_type == SHT_GNU_versym) {
             k = 0x13;
         } else if (s->sh_type == SHT_RELX) {
-            k = 0x20;
+            k = 0x80;
             if (s1->plt && s == s1->plt->reloc)
-                k = 0x21;
+                k = 0x81;
         } else if (s->sh_flags & SHF_EXECINSTR) {
             k = 0x30;
+            if (s == s1->plt)
+            {
+                k=0x32;
+            }
         /* RELRO sections --> */
         } else if (s->sh_type == SHT_PREINIT_ARRAY) {
             k = 0x41;
@@ -2205,7 +2208,7 @@ static int sort_sections(TCCState *s1, int *sec_order, struct dyn_inf *d)
         } else if (s->sh_type == SHT_DYNAMIC) {
             k = 0x46;
         } else if (s == s1->got) {
-            k = 0x47; /* .got as RELRO needs BIND_NOW in DT_FLAGS */
+            k = 0x70; /* .got as RELRO needs BIND_NOW in DT_FLAGS */
         } else if (s->reloc && (s->reloc->sh_flags & SHF_ALLOC) && j == 0x100) {
             k = 0x44;
         /* <-- */
@@ -2214,7 +2217,9 @@ static int sort_sections(TCCState *s1, int *sec_order, struct dyn_inf *d)
         } else if (s->sh_type == SHT_NOBITS) {
             k = 0x70; /* bss */
         } else if (s == d->interp) {
-            k = 0x00;
+            k = 0xff;
+        } else if (s == rodata_section) {
+            k = 0x31; /* rodata */
         } else {
             k = 0x50; /* data */
         }
@@ -2255,7 +2260,7 @@ static int sort_sections(TCCState *s1, int *sec_order, struct dyn_inf *d)
                 f0 = f, ++n, f |= 1<<8;
         }
         sec_cls[i] = f;
-        //printf("ph %d sec %02d : %3X %3X  %8.2X  %04X  %s\n", (f>0) * n, i, f, k, s->sh_type, (int)s->sh_size, s->name);
+        printf("ph %d sec %02d : %3X %3X  %8.2X  %04X  %s\n", (f>0) * n, i, f, k, s->sh_type, (int)s->sh_size, s->name);
     }
     return n;
 }
@@ -2284,6 +2289,7 @@ static int layout_sections(TCCState *s1, int *sec_order, struct dyn_inf *d)
     ElfW(Phdr) *ph = NULL;
     int i, f, n, phnum, phfill;
     int file_offset;
+    int elf_header_offset = 0;
 
     /* compute number of program headers */
     phnum = sort_sections(s1, sec_order, d);
@@ -2331,8 +2337,8 @@ static int layout_sections(TCCState *s1, int *sec_order, struct dyn_inf *d)
     }
     base = addr;
     /* compute address after headers */
-    addr += file_offset;
-
+    // addr += file_offset;
+    elf_header_offset = file_offset;
     n = 0;
     for(i = 1; i < s1->nb_sections; i++) {
         s = s1->sections[sec_order[i]];
@@ -2363,6 +2369,7 @@ static int layout_sections(TCCState *s1, int *sec_order, struct dyn_inf *d)
         addr = (addr + align) & ~align;
         file_offset += (int)(addr - tmp);
         s->sh_offset = file_offset;
+        printf("Writing address at: %x\n", addr);
         s->sh_addr = addr;
 
         if (f & 1<<8) {
@@ -2401,6 +2408,7 @@ static int layout_sections(TCCState *s1, int *sec_order, struct dyn_inf *d)
                 roinf->sh_addr = s->sh_addr;
                 roinf->sh_addralign = 1;
 	    }
+            printf("2406: shsize: 0x%x, addr: %x, roinf_sh_addr: %x\n", s->sh_size, addr, roinf->sh_addr);
             roinf->sh_size = (addr - roinf->sh_addr) + s->sh_size;
         }
 
@@ -2408,8 +2416,14 @@ static int layout_sections(TCCState *s1, int *sec_order, struct dyn_inf *d)
         if (s->sh_type != SHT_NOBITS)
             file_offset += s->sh_size;
 
-        ph->p_filesz = file_offset - ph->p_offset;
-        ph->p_memsz = addr - ph->p_vaddr;
+        if (ph) {
+            ph->p_filesz = file_offset - ph->p_offset;
+            ph->p_memsz = addr - ph->p_vaddr;
+            if (n == 1) {
+                ph->p_memsz += elf_header_offset;
+            }
+            printf("filesz: 0x%x, memsz: 0x%x, addr: 0x%x, n: 0x%x\n", ph->p_filesz, ph->p_memsz, addr, n);
+        }
     }
 
     /* Fill other headers */
@@ -2576,7 +2590,7 @@ static int tcc_output_elf(TCCState *s1, FILE *f, int phnum, ElfW(Phdr) *phdr)
 
 #if TARGETOS_FreeBSD || TARGETOS_FreeBSD_kernel
     ehdr.e_ident[EI_OSABI] = ELFOSABI_FREEBSD;
-#elif (defined (TCC_TARGET_ARM) || defined(TCC_TARGET_ARM_THUMB)) && defined TCC_ARM_EABI
+#elif defined TCC_TARGET_ARM && defined TCC_ARM_EABI
     ehdr.e_flags = EF_ARM_EABI_VER5;
     ehdr.e_flags |= s1->float_abi == ARM_HARD_FLOAT
         ? EF_ARM_VFP_FLOAT : EF_ARM_SOFT_FLOAT;

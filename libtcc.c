@@ -841,8 +841,10 @@ LIBTCCAPI TCCState *tcc_new(void)
 #if defined TCC_TARGET_MACHO /* || defined TCC_TARGET_PE */
     s->leading_underscore = 1;
 #endif
+    s->pic = 0;
 #if defined (TCC_TARGET_ARM) || defined (TCC_TARGET_ARM_THUMB)
     s->float_abi = ARM_FLOAT_ABI;
+    s->text_and_data_separation = 0;
 #endif
 #ifdef CONFIG_NEW_DTAGS
     s->enable_new_dtags = 1;
@@ -1565,6 +1567,9 @@ enum {
     TCC_OPTION_install_name,
     TCC_OPTION_compatibility_version ,
     TCC_OPTION_current_version,
+    TCC_OPTION_mno_pic_data_is_text_relative,
+    TCC_OPTION_fpic,
+    TCC_OPTION_fpie,
 };
 
 #define TCC_OPTION_HAS_ARG 0x0001
@@ -1616,8 +1621,11 @@ static const TCCOption tcc_options[] = {
     { "Wp,", TCC_OPTION_Wp, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP },
     { "W", TCC_OPTION_W, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP },
     { "O", TCC_OPTION_O, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP },
-#ifdef TCC_TARGET_ARM
+    { "fpie", TCC_OPTION_fpie, 0 },
+    { "fpic", TCC_OPTION_fpic, 0 },
+#if defined(TCC_TARGET_ARM) || defined(TCC_TARGET_ARM_THUMB)
     { "mfloat-abi", TCC_OPTION_mfloat_abi, TCC_OPTION_HAS_ARG },
+    { "mno-pic-data-is-text-relative", TCC_OPTION_mno_pic_data_is_text_relative, 0},
 #endif
     { "m", TCC_OPTION_m, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP },
 #ifdef TCC_TARGET_MACHO
@@ -2045,7 +2053,11 @@ dorun:
             if (set_flag(s, options_f, optarg) < 0)
                 goto unsupported_option;
             break;
-#ifdef TCC_TARGET_ARM
+        case TCC_OPTION_fpic:
+        case TCC_OPTION_fpie:
+            s->pic = 1;
+            break;
+#if defined(TCC_TARGET_ARM) || defined(TCC_TARGET_ARM_THUMB)
         case TCC_OPTION_mfloat_abi:
             /* tcc doesn't support soft float yet */
             if (!strcmp(optarg, "softfp")) {
@@ -2054,6 +2066,9 @@ dorun:
                 s->float_abi = ARM_HARD_FLOAT;
             else
                 return tcc_error_noabort("unsupported float abi '%s'", optarg);
+            break;
+        case TCC_OPTION_mno_pic_data_is_text_relative:
+            s->text_and_data_separation = 1;
             break;
 #endif
         case TCC_OPTION_m:

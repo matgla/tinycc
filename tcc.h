@@ -512,7 +512,8 @@ struct SymAttr {
     dllimport   : 1,
     addrtaken   : 1,
     nodebug     : 1,
-    xxxx        : 2; /* not used */
+    naked       : 1,
+    xxxx        : 1; /* not used */
 };
 
 /* function attributes or temporary attributes for parsing */
@@ -791,11 +792,13 @@ struct TCCState {
     unsigned char dflag; /* -dX value */
     unsigned char Pflag; /* -P switch (LINE_MACRO_OUTPUT_FORMAT) */
 
+    unsigned char pic; /* enable position independent code */
 #ifdef TCC_TARGET_X86_64
     unsigned char nosse; /* For -mno-sse support. */
 #endif
 #if defined(TCC_TARGET_ARM) || defined(TCC_TARGET_ARM_THUMB)
     unsigned char float_abi; /* float ABI of the generated code*/
+    unsigned char text_and_data_separation; /* support for GCC -mno-pic-data-is-text-relative */
 #endif
 
     unsigned char has_text_addr;

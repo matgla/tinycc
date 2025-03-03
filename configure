@@ -712,7 +712,10 @@ echo "#endif" >> $TMPH && echo >> $TMPH
 print_str CONFIG_SYSROOT "$sysroot" x
 test "$tccdir_auto" = "yes" || print_str CONFIG_TCCDIR "$tccdir" x
 print_num CONFIG_TCC_PREDEFS "$predefs"
+test "$CONFIG_pic" = "yes" || print_num CONFIG_TCC_PIC 1 x
+test "$CONFIG_pie" = "yes" || print_num CONFIG_TCC_PIE 1 x
 
+ 
 diff $TMPH config.h >/dev/null 2>&1
 if test $? -ne 0 ; then
     mv -f $TMPH config.h

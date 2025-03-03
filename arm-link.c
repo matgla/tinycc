@@ -13,7 +13,12 @@
 #define R_NUM       R_ARM_NUM
 
 #define ELF_START_ADDR 0x00010000
+
+#ifdef TCC_TARGET_ARM_THUMB
+#define ELF_PAGE_SIZE  0x1000
+#else 
 #define ELF_PAGE_SIZE  0x10000
+#endif
 
 #define PCRELATIVE_DLLPLT 1
 #define RELOCATE_DLLPLT 1
@@ -121,20 +126,15 @@ ST_FUNC unsigned create_plt_entry(TCCState *s1, unsigned got_offset, struct sym_
        jump to ld.so resolution routine (GOT + 8) */
     if (plt->data_offset == 0) {
         p = section_ptr_add(plt, 20);
-        write32le(p,    0xe52de004); /* push {lr}         */
-        write32le(p+4,  0xe59fe004); /* ldr lr, [pc, #4] */
-        write32le(p+8,  0xe08fe00e); /* add lr, pc, lr    */
-        write32le(p+12, 0xe5bef008); /* ldr pc, [lr, #8]! */
-        /* p+16 is set in relocate_plt */
+        // write32le(p,    0xe52de004); /* push {lr}         */
+        write16le(p,    0xb410); // push {lr}
+        write32le(p+2,  0xe004f8df); // ldr lr, [pc, #4]
+        write16le(p+6,  0x44fe); /* add lr, pc  */
+        write32le(p+8,  0xff08f85e); 
+        /* p+12 is set in relocate_plt */
     }
     plt_offset = plt->data_offset;
-
-    if (attr->plt_thumb_stub) {
-        p = section_ptr_add(plt, 4);
-        write32le(p,   0x4778); /* bx pc */
-        write32le(p+2, 0x46c0); /* nop   */
-    }
-    p = section_ptr_add(plt, 16);
+    p = section_ptr_add(plt, 12);
     /* save GOT offset for relocate_plt */
     write32le(p + 4, got_offset);
     return plt_offset;
@@ -154,16 +154,17 @@ ST_FUNC void relocate_plt(TCCState *s1)
 
     if (p < p_end) {
         int x = s1->got->sh_addr - s1->plt->sh_addr - 12;
-        write32le(s1->plt->data + 16, x - 4);
+        write32le(s1->plt->data + 12, x - 4);
         p += 20;
         while (p < p_end) {
 	    unsigned off = x  + read32le(p + 4) + (s1->plt->data - p) + 4;
-            if (read32le(p) == 0x46c04778) /* PLT Thumb stub present */
-                p += 4;
-            write32le(p, 0xe28fc200 | ((off >> 28) & 0xf));      // add ip, pc, #0xN0000000
-            write32le(p + 4, 0xe28cc600 | ((off >> 20) & 0xff)); // add ip, pc, #0xNN00000
-            write32le(p + 8, 0xe28cca00 | ((off >> 12) & 0xff)); // add ip, ip, #0xNN000
-            write32le(p + 12, 0xe5bcf000 | (off & 0xfff));	 // ldr pc, [ip, #0xNNN]!
+            // if (read32le(p) == 0x46c04778) /* PLT Thumb stub present */
+                // p += 4;
+            // write32le(p, 0xf20f);
+            // write32le(p, 0xe28fc200 | ((off >> 28) & 0xf));      // add ip, pc, #0xN0000000
+            // write32le(p + 4, 0xe28cc600 | ((off >> 20) & 0xff)); // add ip, pc, #0xNN00000
+            // write32le(p + 8, 0xe28cca00 | ((off >> 12) & 0xff)); // add ip, ip, #0xNN000
+            // write32le(p + 12, 0xe5bcf000 | (off & 0xfff));	 // ldr pc, [ip, #0xNNN]!
             p += 16;
         }
     }
