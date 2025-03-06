@@ -34,6 +34,7 @@
 #include "i386-link.c"
 #include "i386-asm.c"
 #elif defined(TCC_TARGET_ARM_THUMB)
+#include "arm-thumb-opcodes.c"
 #include "arm-link.c"
 #include "arm-thumb-gen.c"
 #include "arm-thumb-asm.c"

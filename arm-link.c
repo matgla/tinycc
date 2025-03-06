@@ -31,6 +31,7 @@ enum float_abi {
 #else /* !TARGET_DEFS_ONLY */
 
 #include "tcc.h"
+#include "arm-thumb-opcodes.h"
 
 #ifdef NEED_RELOC_TYPE
 /* Returns 1 for a code relocation, 0 for a data relocation. For unknown
@@ -112,6 +113,20 @@ ST_FUNC int gotplt_entry_type (int reloc_type)
     return -1;
 }
 
+void write_thumb_instruction(uint8_t *p, thumb_opcode op)
+{
+    if (op.size != 2 && op.size != 4)
+    {
+        return;
+    }
+    if (op.size == 4)
+    {
+        write16le(p, op.opcode >> 16);
+        p += 2;
+    }
+    write16le(p, op.opcode);
+}
+
 #ifdef NEED_BUILD_GOT
 ST_FUNC unsigned create_plt_entry(TCCState *s1, unsigned got_offset, struct sym_attr *attr)
 {
@@ -127,16 +142,18 @@ ST_FUNC unsigned create_plt_entry(TCCState *s1, unsigned got_offset, struct sym_
     if (plt->data_offset == 0) {
         p = section_ptr_add(plt, 20);
         // write32le(p,    0xe52de004); /* push {lr}         */
-        write16le(p,    0xb410); // push {lr}
-        write32le(p+2,  0xe004f8df); // ldr lr, [pc, #4]
-        write16le(p+6,  0x44fe); /* add lr, pc  */
-        write32le(p+8,  0xff08f85e); 
-        /* p+12 is set in relocate_plt */
+        // write16le(p,    0xb500); // push {lr}
+        write_thumb_instruction(p, th_push(1 << R_LR));
+        write_thumb_instruction(p+2, th_ldr_literal(R_LR, 8, 1));
+        write_thumb_instruction(p+6, th_add_reg(R_LR, R_LR, R_PC));
+        write_thumb_instruction(p+8, th_ldr_imm(R_PC, R_LR, 8, 7));
+        write_thumb_instruction(p+12, th_pop(1 << R_PC));
+        /* p+16 is set in relocate_plt */
     }
     plt_offset = plt->data_offset;
-    p = section_ptr_add(plt, 12);
     /* save GOT offset for relocate_plt */
-    write32le(p + 4, got_offset);
+    write32le(p + 16, got_offset);
+    p = section_ptr_add(plt, 20);
     return plt_offset;
 }
 
@@ -153,19 +170,18 @@ ST_FUNC void relocate_plt(TCCState *s1)
     p_end = p + s1->plt->data_offset;
 
     if (p < p_end) {
-        int x = s1->got->sh_addr - s1->plt->sh_addr - 12;
-        write32le(s1->plt->data + 12, x - 4);
+        int x = s1->got->sh_addr - s1->plt->sh_addr;
         p += 20;
+        write32le(p + 16, x - 4);
         while (p < p_end) {
-	    unsigned off = x  + read32le(p + 4) + (s1->plt->data - p) + 4;
-            // if (read32le(p) == 0x46c04778) /* PLT Thumb stub present */
-                // p += 4;
-            // write32le(p, 0xf20f);
-            // write32le(p, 0xe28fc200 | ((off >> 28) & 0xf));      // add ip, pc, #0xN0000000
-            // write32le(p + 4, 0xe28cc600 | ((off >> 20) & 0xff)); // add ip, pc, #0xNN00000
-            // write32le(p + 8, 0xe28cca00 | ((off >> 12) & 0xff)); // add ip, ip, #0xNN000
-            // write32le(p + 12, 0xe5bcf000 | (off & 0xfff));	 // ldr pc, [ip, #0xNNN]!
-            p += 16;
+            write_thumb_instruction(p, th_ldr_imm(R_IP, R_PC, 8, 6));
+            write_thumb_instruction(p + 4, th_add_reg(R_IP, R_IP, R_PC));
+            write_thumb_instruction(p + 6, th_cmp_imm(R_IP, 0));
+            write_thumb_instruction(p + 10, th_b_t1(1, 2)); 
+            // write_thumb_instruction(p + 12, th_)
+            // write_thumb_instruction(p + 6, th_ldr_imm(R_PC, R_IP, 0,  6));
+
+            p += 20;
         }
     }
 
@@ -187,7 +203,8 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
 
     sym_index = ELFW(R_SYM)(rel->r_info);
     sym = &((ElfW(Sym) *)symtab_section->data)[sym_index];
-
+    fprintf(stdout," handle reloc type %d at %x [%p] to %x\n",
+            type, (unsigned)addr, ptr, (unsigned)val);
     switch(type) {
         case R_ARM_PC24:
         case R_ARM_CALL:
@@ -233,7 +250,7 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
         case R_ARM_THM_JUMP24:
             {
                 int x, hi, lo, s, j1, j2, i1, i2, imm10, imm11;
-                int to_thumb, is_call, to_plt, blx_bit = 1 << 12;
+                int is_call, to_plt, blx_bit = 1 << 12;
                 Section *plt;
 
                 /* weak reference */
@@ -257,13 +274,15 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
                     x -= 0x02000000;
 
                 /* Relocation infos */
-                to_thumb = val & 1;
-                plt = s1->plt;
-                to_plt = (val >= plt->sh_addr) &&
+				if (s1->plt) {
+	                plt = s1->plt;
+  	                to_plt = (val >= plt->sh_addr) &&
                          (val < plt->sh_addr + plt->data_offset);
-                is_call = (type == R_ARM_THM_PC22);
+ 
+								}
+               is_call = (type == R_ARM_THM_PC22);
 
-                if (!to_thumb && !to_plt && !is_call) {
+                if (!to_plt && !is_call) {
                     int index;
                     uint8_t *p;
                     char *name, buf[1024];
@@ -272,18 +291,9 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
                     name = (char *) symtab_section->link->data + sym->st_name;
                     text = s1->sections[sym->st_shndx];
                     /* Modify reloc to target a thumb stub to switch to ARM */
-                    snprintf(buf, sizeof(buf), "%s_from_thumb", name);
-                    index = put_elf_sym(symtab_section,
-                                        text->data_offset + 1,
-                                        sym->st_size, sym->st_info, 0,
-                                        sym->st_shndx, buf);
-                    to_thumb = 1;
                     val = text->data_offset + 1;
                     rel->r_info = ELFW(R_INFO)(index, type);
                     /* Create a thumb stub function to switch to ARM mode */
-                    put_elf_reloc(symtab_section, text,
-                                  text->data_offset + 4, R_ARM_JUMP24,
-                                  sym_index);
                     p = section_ptr_add(text, 8);
                     write32le(p,   0x4778); /* bx pc */
                     write32le(p+2, 0x46c0); /* nop   */
@@ -292,7 +302,7 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
 
                 /* Compute final offset */
                 x += val - addr;
-                if (!to_thumb && is_call) {
+                if (is_call) {
                     blx_bit = 0; /* bl -> blx */
                     x = (x + 3) & -4; /* Compute offset from aligned PC */
                 }
@@ -302,8 +312,8 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
                    * if target is to be entered in arm mode:
                      - bit 1 must not set
                      - instruction must be a call (bl) or a jump to PLT */
-                if (!to_thumb || x >= 0x1000000 || x < -0x1000000)
-                    if (to_thumb || (val & 2) || (!is_call && !to_plt))
+                if (x >= 0x1000000 || x < -0x1000000)
+                    if ((val & 2) || (!is_call && !to_plt))
                         tcc_error_noabort("can't relocate value at %x,%d",addr, type);
 
                 /* Compute and store final offset */

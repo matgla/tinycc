@@ -151,44 +151,10 @@ enum {
 
 #else // TARGET_DEFS_ONLY
 
-#define R0 0
-#define R1 1
-#define R2 2
-#define R3 3 
-#define R4 4
-#define R5 5 
-#define R6 6
-#define R7 7 
-#define R8 8 
-#define R9 9 
-#define R10 10 
-#define R_FP 11
-#define R_IP 12 
-#define R_SP 13 
-#define R_LR 14 
-#define R_PC 15
-
-#ifndef TCC_DEBUG
-#define TCC_DEBUG 0 
-#endif 
-
-#define TRACE(...) 
-#define LOG(...)
-
-#if TCC_DEBUG == 1 || TCC_DEBUG == 2
-#undef LOG
-#define LOG(...) printf("[INF]: ");printf(__VA_ARGS__);printf("\n")
-#endif 
-
-#if TCC_DEBUG == 2
-#undef TRACE
-#define TRACE(...) printf("[TRC]: ");printf(__VA_ARGS__);printf("\n")
-#endif 
-
-#define ceil_div(x, d) ((x + (d - 1)) / d)
-
 #define USING_GLOBALS
 #include "tcc.h"
+
+#include "arm-thumb-opcodes.h"
 
 ST_DATA const char * const target_machine_defs = 
     "__arm__\0"
@@ -210,12 +176,6 @@ ST_DATA const char * const target_machine_defs =
 enum float_abi float_abi;
 unsigned char text_and_data_separation;
 unsigned char pic;
-
-typedef enum {
-    FLAGS_BEHAVIOUR_NOT_IMPORANT = 0,
-    FLAGS_BEHAVIOUR_SET = 1,
-    FLAGS_BEHAVIOUR_BLOCK = 2,
-} flags_behaviour;
 
 flags_behaviour g_setflags = FLAGS_BEHAVIOUR_SET; 
 
@@ -315,7 +275,7 @@ struct avail_regs {
   int last_hole; /* last available hole (none if equal to first_hole) */
   int first_free_reg; /* next free register in the sequence, hole excluded */
 };
-
+#define AVAIL_REGS_INITIALIZER (struct avail_regs) { { 0, 0, 0}, 0, 0, 0 }
 /* Find suitable registers for a VFP Co-Processor Register Candidate (VFP CPRC
    param) according to the rules described in the procedure call standard for
    the ARM architecture (AAPCS). If found, the registers are assigned to this
@@ -411,7 +371,7 @@ static int assign_regs(int nb_args, int float_abi, struct plan *plan, int *todo)
 {
   int i, size, align;
   int ncrn /* next core register number */, nsaa /* next stacked argument address*/;
-  struct avail_regs avregs = {{0}};
+  struct avail_regs avregs = AVAIL_REGS_INITIALIZER;
 
   ncrn = nsaa = 0;
   *todo = 0;
@@ -528,1278 +488,28 @@ void o(unsigned int i)
   cur_text_section->data[ind++] = i >> 8;
 }
 
+int is_valid_opcode(thumb_opcode op)
+{
+  return (op.size == 2 || op.size == 4);
+  
+}
+
+void ot(thumb_opcode op)
+{
+  if (!is_valid_opcode(op))
+  {
+    tcc_error("compiler_error: unsuccessfuly encoded instruction: 0x%x, size: %d", op.opcode, op.size);
+  }
+  if (op.size == 4) 
+  {
+    o(op.opcode >> 16);
+  }
+  o(op.opcode & 0xffff);
+}
+
 static void load_full_const(int r, uint32_t imm, struct Sym *sym);
 
-// Thumb instruction set 
-static int th_offset_to_reg(int off, int sign);
-static uint32_t th_pack_const(uint32_t imm);
-
-
-static void th_nop()
-{
-  o(0xbf00);
-}
-
-static uint32_t th_packimm_10_11_0(uint32_t imm)
-{
-  const uint32_t imm11 = (imm >> 1) & 0x7ff;
-  const uint32_t imm10 = (imm >> 12) & 0x3ff;
-  const uint32_t s = (imm >> 24) & 1;
-  const uint32_t j1 = ~((imm >> 23) ^ s) & 1;
-  const uint32_t j2 = ~((imm >> 22) ^ s) & 1;
-  return (s << 26) | (imm10 << 16) | (j1 << 13) | (j2 << 11) | imm11;
-}
-
-static void th_bx_reg(uint16_t rm)
-{
-  o(0x4700 | ((rm & 0xf) << 3));
-}
-
-static void th_bl_t1(uint32_t imm)
-{
-  const uint32_t packed = th_packimm_10_11_0(imm) | 0xF000D000;
-  o(packed >> 16);
-  o(packed & 0xffff);
-}
-
-static void th_blx_reg(uint16_t rm)
-{
-  o(0x4780 | (rm << 3));
-}
-
-static void th_b_t1(uint16_t cond, uint16_t imm8)
-{
-  o(0xd000 | ((cond & 0xf) << 8) | (imm8 & 0xff));
-}
-
-static void th_b_t2(uint16_t imm11)
-{
-  o(0xe000 | (imm11 & 0x7ff));
-}
-
-static uint32_t th_encbranch_b_t3(uint32_t imm)
-{
-  const uint32_t s = (imm >> 19) & 1;
-  const uint32_t imm6 = (imm >> 11) & 0x3f;
-  const uint32_t imm11 = imm & 0x7ff;
-  const uint32_t j2 = (imm >> 18) & 1;
-  const uint32_t j1 = (imm >> 17) & 1;
-  const uint32_t a = (s << 10) | imm6;
-  const uint32_t b = (j1 << 13) | (j2 << 11) | imm11;
-  return (a << 16) | b;
-}
-
-static void th_b_t3(uint16_t op, uint16_t imm)
-{
-  const uint32_t enc = th_encbranch_b_t3(imm);
-  o(0xf000 | (op << 6) | (enc >> 16));
-  o(0x8000 | enc);
-}
-
-
-static void th_b_t4(int32_t imm)
-{
-  uint32_t packed = 0;
-  if (imm > 16777215 || imm < -16777215)
-    tcc_error("compiler_error: th_b_t4 too far address: 0x%x\n", imm);
-
-  packed = th_packimm_10_11_0(imm) | 0xf0009000;
-  o(packed >> 16);
-  o(packed & 0xffff);
-}
-
-// all t32 arch 
-static void th_mov_reg(uint16_t rd, uint16_t rm)
-{
-  const uint16_t D = (rd >> 3) & 1;
-  o(0x4600 | (D << 7) | (rm << 3) | (rd & 0x7));
-}
-
-// 1 - if mov can be used 
-// 0 - if mov is not available for provided arguments
-static int th_mov_imm(uint16_t rd, uint16_t imm)
-{
-  if (rd <= 7 && imm <= 255)
-  {
-    o(0x2000 | (rd << 8) | imm);
-    return 1;
-  }
-#ifndef TCC_TARGET_ARM_ARCHV6M 
-  else if (imm <= 0xffff && rd != R_SP && rd != R_PC)
-  {
-    const uint16_t i = (imm >> 11) & 1;
-    const uint16_t imm4 = (imm >> 12) & 0xf;
-    const uint16_t imm3 = (imm >> 8) & 0x7;
-    o(0xf240 | (i << 10) | imm4);
-    o((imm3 << 12) | (rd << 8) | (imm & 0xff));
-    return 1;
-  }
-  else if (imm <= 0xffff && rd != R_SP && rd != R_PC)
-  {
-    const uint32_t enc = th_pack_const(imm);
-    const uint32_t a = enc >> 16;
-    const uint32_t b = enc & 0xffff;
-
-    o(0xf04f | a);
-    o(b | ((rd & 0xf) << 8));
-    return 1;
-  }
-#endif
-  return 0;
-}
-
-static int th_generic_op_imm_with_status(uint16_t op, uint16_t rd, uint16_t rn, uint16_t imm, flags_behaviour setflags)
-{
-#ifndef TCC_TARGET_ARM_ARCHV6M 
-  const uint32_t packed = th_pack_const(imm);
-  if (packed || imm == 0)
-  {
-    const uint32_t A = packed >> 16;
-    const uint32_t B = packed & 0xffff;
-    o(op | ((setflags == FLAGS_BEHAVIOUR_SET) << 4) | rn | A);
-    o(rd << 8 | B);
-    return 1;
-  }
-#endif
-  return 0;
-}
-
-static int th_generic_op_imm(uint16_t op, uint16_t rd, uint16_t rn, uint16_t imm)
-{
-  return th_generic_op_imm_with_status(op, rd, rn, imm, FLAGS_BEHAVIOUR_NOT_IMPORANT);
-}
-
-static void th_add_reg(uint16_t rd, uint16_t rn, uint16_t rm)
-{
-  if ((rd == R_PC) && (rm == R_PC))
-  {
-    tcc_error("compiler_error: 'th_add_reg', PC can't be used as rdn and rm\n");
-  }
-  if (rd == rn)
-  {
-    // T2
-    const uint16_t DN = (rd >> 3) & 1;
-    o(0x4400 | (DN << 7) | ((rm & 0xf) << 3) | (rd & 0x7));
-  }
-  else if (rm < 8 && rd < 8 && rn < 8)
-  {
-    // T1 
-    o(0x1800 | (rm << 6) | (rn << 3) | (rd));
-  }
-  #ifndef TCC_TARGET_ARM_ARCHV6M 
-  else 
-  {
-    o(0xeb00 | rn);
-    o((rd << 8) | rm);
-  }
-  #else 
-  else 
-  {
-    tcc_error("compiler_error: 'th_add_reg', cannot encode for rd: %d, rn: %d, rm: %d\n", rd, rn, rm);
-  }
-  #endif  
-}
-
-static int th_add_imm(uint16_t rd, uint16_t rn, uint16_t imm)
-{
-  if (rd == rn && rd < 8 && imm <= 255)
-  {
-    o(0x3000 | (rd << 8) | imm);
-    return 1;
-  }
-#ifndef TCC_TARGET_ARM_ARCHV6M
-  else if (rn != R_SP && rn != R_PC && rd != R_PC && rd != R_SP && imm <= 4095)
-  {
-    const uint16_t i = (imm >> 11) & 1;
-    const uint16_t imm3 = (imm >> 8) & 7;
-    o(0xf200 | (i << 10) | rn);
-    o((imm3 << 12) | (rd << 8) | (imm & 0xff));
-    return 1;
-  }
-  else if (rd != R_SP && rn != R_PC)
-  {
-    return th_generic_op_imm(0xf100, rd, rn, imm);
-  }
-#endif
-  return 0;
-}
-
-static int th_bic_imm(uint16_t rd, uint16_t rn, uint16_t imm)
-{
- #ifndef TCC_TARGET_ARM_ARCHV6M 
-  if (rd != R_SP && rd != R_PC && rn != R_SP && rd != R_PC)
-  {
-    const uint32_t packed = th_pack_const(imm);
-    if (packed || imm == 0)
-    {
-      const uint32_t A = packed >> 16;
-      const uint32_t B = packed & 0xffff;
-      o(0xf020 | rn | A);
-      o(rd << 8 | B);
-      return 1;
-    }
-  }
- #endif
-  return 0;
-}
-
-static int th_and_imm(uint16_t rd, uint16_t rn, uint16_t imm)
-{
-  if (!th_generic_op_imm(0xf000, rd, rn, imm))
-  {
-    return th_bic_imm(rd, rn, ~imm);
-  }
-  return 0;
-}
-
-static void th_and_reg(uint16_t rd, uint16_t rn, uint16_t rm)
-{
-  if (rd == rn && rm < 8 && rn < 8) 
-  {
-    o(0x4000 | (rm << 3) | rd);
-  }
-#ifndef TCC_TARGET_ARM_ARCHV6M 
-  else if (rd != R_SP && rn != R_SP && rn != R_PC && rm != R_SP && rm != R_PC)
-  {
-    o(0xea00 | rn);
-    o((rd << 8) | rm);
-  }
-#endif 
-  else tcc_error("compiler_error: unsupported 'th_and_reg' rd: %d, rn: %d, rm: %d", rd, rn, rm);
-}
-
-
-
-
-static int th_xor_reg(uint16_t rd, uint16_t rn, uint16_t rm)
-{
-  if (rd != rn && rm < 8 && rn < 8) o(0x4040 | (rm << 3) | rd);
-#ifndef TCC_TARGET_ARM_ARCHV6M
-  else if (rd != R_SP && rd != R_PC && rn != R_SP && rn != R_PC)
-  {
-    o(0xea80 | rn);
-    o((rd << 8) | rm);
-    return 1;
-  }
-#endif
-  return 0;
-}
-
-static int th_xor_imm(uint16_t rd, uint16_t rn, uint16_t imm)
-{
-  return th_generic_op_imm(0xf080, rd, rn, imm); 
-}
-
-static void th_rsb_reg(uint16_t rd, uint16_t rn, uint16_t rm)
-{
-#ifndef TCC_TARGET_ARM_ARCHV6M
-  if (rd != R_SP && rd != R_PC && rn != R_SP && rn != R_PC && rm != R_SP && rn != R_SP)
-  {
-    o(0xebc0 | rn);
-    o((rd << 8) | rm);
-  }
-#endif
-  else tcc_error("compiler_error: unsupported 'th_rsb_reg' rd: %d, rn: %d, rm: %d", rd, rn, rm);
-}
-
-
-
-static void th_sub_reg(uint16_t rd, uint16_t rn, uint16_t rm)
-{
-  if (rd < 8 && rm < 8 && rn < 8) o(0x1a00 | (rm << 6) | (rn << 3) | rd);
-#ifndef TCC_TARGET_ARM_ARCHV6M
-  else if (rd != R_SP && rd != R_PC && rn != R_SP && rn != R_PC)
-  {
-    o(0xeba0 | rn);
-    o((rd << 8) | rm);
-  }
-#endif
-  else tcc_error("compiler_error: unsupported 'th_sub_reg' rd: %d, rn: %d, rm: %d", rd, rn, rm);
-}
-
-static void th_adc_reg(uint16_t rd, uint16_t rn, uint16_t rm)
-{
-  if (rd == rn && rm < 8 && rn < 8) o(0x4140 | (rm << 3) | rd);
-#ifndef TCC_TARGET_ARM_ARCHV6M
-  else if (rd != R_SP && rd != R_PC && rn != R_SP && rn != R_PC && rm != R_SP && rm != R_PC)
-  {
-    o(0xeb40 | rn);
-    o((rd << 8) | rm);
-  }
-#endif
-  else tcc_error("compiler_error: unsupported 'th_adc_reg' rd: %d, rn: %d, rm: %d", rd, rn, rm);
-}
-
-static int th_adc_imm(uint16_t rd, uint16_t rn, uint16_t imm)
-{
-  if (rn != R_SP && rn != R_PC && rd != R_SP && rn != R_PC)
-  {
-    return th_generic_op_imm(0xf140, rd, rn, imm);
-  }
-  return 0;
-}
-
-static int th_sbc_imm(uint16_t rd, uint16_t rn, uint16_t imm)
-{
-  if (rn != R_SP && rn != R_PC && rd != R_SP && rn != R_PC)
-  {
-    return th_generic_op_imm(0xf160, rd, rn, imm);
-  }
-  return 0;
-}
-
-static int th_orr_imm(uint16_t rd, uint16_t rn, uint16_t imm)
-{
-  if (rn != R_SP && rd != R_SP && rn != R_PC)
-  {
-    return th_generic_op_imm(0xf040, rd, rn, imm);
-  }
-  return 0;
-}
-
-static void th_sbc_reg(uint16_t rd, uint16_t rn, uint16_t rm)
-{
-  if (rd == rn && rm < 8 && rn < 8) o(0x4180 | (rm << 3) | rd);
-#ifndef TCC_TARGET_ARM_ARCHV6M
-  else if (rd != R_SP && rd != R_PC && rn != R_SP && rn != R_PC && rm != R_SP && rm != R_PC)
-  {
-    o(0xeb70 | rn);
-    o((rd << 8) | rm);
-  }
-#endif
-  else tcc_error("compiler_error: unsupported 'th_sbc_reg' rd: %d, rn: %d, rm: %d", rd, rn, rm);
-}
-
-static void th_cmp_reg(uint16_t rn, uint16_t rm)
-{
-  if (rm < 8 && rn < 8) o(0x4280 | (rm << 3) | rn);
-#ifndef TCC_TARGET_ARM_ARCHV6M
-  else if (!(rm < 8 && rn < 8) && rm != R_PC && rn != R_PC)
-  {
-    const uint16_t N = (rn >> 3) & 0x1;
-    o(0x4500 | (N << 7) | (rm << 3) | (rn & 0x7));
-  }
-#endif
-  else tcc_error("compiler_error: unsupported 'th_cmp_reg' rn: %d, rm: %d", rn, rm);
-}
-
-static void th_orr_reg(uint16_t rd, uint16_t rn, uint16_t rm)
-{
-  if (rd == rn && rm < 8 && rn < 8) o(0x4300 | (rm << 3) | rd);
-#ifndef TCC_TARGET_ARM_ARCHV6M
-  else if (rd != R_SP && rd != R_PC && rn != R_PC && rm != R_SP && rm != R_PC)
-  {
-    o(0xea40 | rn);
-    o((rd << 8) | rm);
-  }
-#endif
-  else tcc_error("compiler_error: unsupported 'th_orr_reg' rd: %d, rn: %d, rm: %d", rd, rn, rm);
-}
-
-
-
-static int th_sub_imm(uint16_t rd, uint16_t rn, uint16_t imm)
-{
-  if (rd == rn && imm <= 255 && rd < 8)
-  {
-    // T2
-    o(0x3800 | (rd << 8) | imm);
-    return 1;
-  }
-  else if (rd < 8 && rn < 8 && imm <= 7)
-  {
-    // T1 
-    o(0x1e00 | (imm << 6) | (rn << 3) | rd);
-    return 1;
-  }
-#ifndef TCC_TARGET_ARM_ARCHV6M
-  else if (rd != R_SP && rd != R_PC && imm <= 0xfff)
-  {
-    // T4
-    const uint16_t i = imm >> 11;
-    const uint16_t imm3 = (imm >> 8) & 0x7;
-    o(0xf2a0 | (i << 10) | (rn & 0xf));
-    o((imm3 << 12) | ((rd & 0xf) << 8) | (imm & 0xff));
-    return 1;
-  }
-  else if (rd != 13 && rd != 15)
-  {
-    const uint32_t enc = th_pack_const(imm);
-    if (enc || imm == 0)
-    {
-      const uint16_t a = enc >> 16;
-      const uint16_t b = enc & 0xffff;
-      o(0xf1a0 | (rn & 0xf) | a);
-      o(b | (rd & 0xf) << 8);
-      return 1;
-    }
-  }
-#endif
-  return 0;
-}
-
-
-static void th_push(uint16_t regs)
-{
-  // T1 encoding R0-R7 + LR only, all armv-m
-  // (T2 in armv8-m - inconsistent naming in reference manual)
-  if (!(regs & 0xdf00))
-  {
-    const uint16_t lr = (regs >> 14) & 1;
-    o(0xb400 | (lr << 8) | (regs & 0xff));
-    return; 
-  }
-  // T2 encoding R0-R12 + LR only, > armv7-m
-  // (T1 in armv8-m - inconsistent naming in reference manual)
-  #if defined(TCC_TARGET_ARM_ARCHV8M) || defined(TCC_TARGET_ARM_ARCHV7M)
-  if (!(regs & 0xa000))
-  {
-    o(0xe92d);
-    o(regs);
-    return;
-  }
-  #endif
-  tcc_error("compiler_error: 'th_push' contains illegal registers: 0x%x\n", regs);
-}
-
-static void th_ldrsh_imm(uint32_t rt, uint32_t rn, uint32_t imm, uint32_t puw)
-{
-  #ifndef TCC_TARGET_ARM_ARCHV6M
-  // puw == 6 means positive offset on rn, so T1 encoding can be used
-  if (rt != R_SP && imm <= 4095 && puw == 6)
-  {
-    o(0xf9b0 | ((rn & 0xf)));
-    o(((rt & 0xf) << 12) | imm);
-    return;
-  }
-  else if (rt != R_SP && imm <= 255)
-  {
-    o(0xf930 | (rn & 0xf));
-    o(0x0800 | ((rt & 0xf) << 12) | (puw << 8) | imm);
-    return;
-  } 
-  #endif
-  tcc_error("compiler_error: 'th_ldrsh_imm' can't be used with rt: %d, rn: %d, imm: 0x%x, puw: 0x%x\n", rt, rn, imm, puw);
-}
-
-static void th_ldrsh_reg(uint32_t rt, uint32_t rn, uint32_t rm)
-{
-  // puw == 6 means positive offset on rn, so T1 encoding can be used
-  if (rm < 8 && rt < 8 && rn < 8)
-  {
-    o(0x5e00 | (rm << 6) | (rn << 3) | rt);
-  }
-#ifndef TCC_TARGET_ARM_ARCHV6M
-  else if (rt != R_SP && rm != R_SP && rn != R_SP)
-  {
-    o(0xf930 | (rn & 0x0f));
-    o(((rt & 0xf) << 12) | (rm & 0xf));
-  }
-#endif
-  else 
-  {
-    tcc_error("compiler_error: 'th_ldrsh_reg' can't be used with rt: %d, rn: %d, rm: %d\n", rt, rn, rm);
-  }
-}
-
-static void th_ldrh_imm(uint16_t rt, uint16_t rn, uint16_t imm, uint16_t puw)
-{
-  // T1 encoding, on armv6-m this one is the only one available
-  if (puw == 6 && rn < 8 && rt < 8 && imm <= 62 && !(imm & 1))
-  {
-    // imm[0] is enforced to be 0, and sould be divided by 2, thus offset is 5
-    o(0x8800 | (imm << 5) | (rn << 3) | rt); 
-  }
-#ifndef TCC_TARGET_ARM_ARCHV6M
-  else if (puw == 6 && rt != R_SP && imm <= 4095)
-  {
-    o(0xf8b0 | (rn & 0xf));
-    o((rt & 0xf) << 12 | imm);
-  }
-  else if (rt != R_SP && imm <= 255)
-  {
-    o(0xf830 | (rn & 0xf));
-    o(0x0800 | ((rt & 0xf) << 12) | ((puw & 0x7) << 8) | imm);
-  }
-#endif 
-  else 
-  {
-    tcc_error("compiler_error: 'th_ldsh_imm' can't be used with rt: %d, rn: %d, imm: 0x%x, puw: 0x%x\n", rt, rn, imm, puw);
-  }
-}
-
-static void th_ldrh_reg(uint32_t rt, uint32_t rn, uint32_t rm)
-{
-  // puw == 6 means positive offset on rn, so T1 encoding can be used
-  if (rm < 8 && rt < 8 && rn < 8)
-  {
-    o(0x5a00 | (rm << 6) | (rn << 3) | rt);
-  }
-#ifndef TCC_TARGET_ARM_ARCHV6M
-  else if (rt != R_SP && rm != R_SP && rm != R_PC)
-  {
-    o(0xf830 | (rn & 0xf));
-    o(((rt & 0xf) << 12) | (rm & 0xf));
-  }
-#endif
-  else 
-  {
-    tcc_error("compiler_error: 'th_ldrh_reg' can't be used with rt: %d, rn: %d, rm: %d\n", rt, rn, rm);
-  }
-}
-
-static void th_ldrsb_imm(uint32_t rt, uint32_t rn, uint32_t imm, uint32_t puw)
-{
-#ifndef TCC_TARGET_ARM_ARCHV6M
-  // puw == 6 means positive offset on rn, so T1 encoding can be used
-  if (rt != R_SP && imm <= 4095 && puw == 6)
-  {
-    o(0xf990 | ((rn & 0xf)));
-    o(((rt & 0xf) << 12) | imm);
-    return;
-  }
-  else if (rt != R_SP && imm <= 255)
-  {
-    o(0xf910 | (rn & 0xf));
-    o(0x0800 | ((rt & 0xf) << 12) | (puw << 8) | imm);
-    return;
-  }
-#endif
-  tcc_error("compiler_error: 'th_ldrsb_imm' can't be used with rt: %d, rn: %d, imm: 0x%x, puw: 0x%x\n", rt, rn, imm, puw);
-}
-
-
-static void th_ldrsb_reg(uint32_t rt, uint32_t rn, uint32_t rm)
-{
-  // puw == 6 means positive offset on rn, so T1 encoding can be used
-  if (rm < 8 && rt < 8 && rn < 8)
-  {
-    o(0x5600 | (rm << 6) | (rn << 3) | rt);
-  }
-#ifndef TCC_TARGET_ARM_ARCHV6M
-  else if (rt != R_SP && rn != R_SP && rm != R_SP)
-  {
-    o(0xf910 | (rn & 0xf));
-    o(((rt & 0xf) << 12) | (rm & 0xf));
-  }
-#endif
-  else 
-  {
-    tcc_error("compiler_error: 'th_ldrsb_reg' can't be used with rt: %d, rn: %d, rm: %d\n", rt, rn, rm);
-  }
-}
-
-static void th_ldrb_imm(uint16_t rt, uint16_t rn, uint16_t imm, uint16_t puw)
-{
-  // T1 encoding, on armv6-m this one is the only one available
-  if (puw == 6 && rn < 8 && rt < 8 && imm <= 62 && !(imm & 1))
-  {
-    // imm[0] is enforced to be 0, and sould be divided by 2, thus offset is 5
-    o(0x7800 | (imm << 5) | (rn << 3) | rt); 
-  }
-#ifndef TCC_TARGET_ARM_ARCHV6M
-  else if (puw == 6 && rt != R_SP && imm <= 4095)
-  {
-    o(0xf890 | (rn & 0xf));
-    o((rt & 0xf) << 12 | imm);
-  }
-  else if (rt != R_SP && imm <= 255)
-  {
-    o(0xf810 | (rn & 0xf));
-    o(0x0800 | ((rt & 0xf) << 12) | ((puw & 0x7) << 8) | imm);
-  }
-#endif 
-  else 
-  {
-    tcc_error("compiler_error: 'th_ldsb_imm' can't be used with rt: %d, rn: %d, imm: 0x%x, puw: 0x%x\n", rt, rn, imm, puw);
-  }
-}
-
-static void th_ldrb_reg(uint32_t rt, uint32_t rn, uint32_t rm)
-{
-  // puw == 6 means positive offset on rn, so T1 encoding can be used
-  if (rm < 8 && rt < 8 && rn < 8)
-  {
-    o(0x5c00 | (rm << 6) | (rn << 3) | rt);
-  }
-#ifndef TCC_TARGET_ARM_ARCHV6M 
-  else if (rt != R_SP && rm != R_SP && rm != R_PC)
-  {
-    o(0xf810 | (rn & 0xf));
-    o(((rt & 0xf) << 12) | (rm & 0xf));
-  }
-#endif
-  else 
-  {
-    tcc_error("compiler_error: 'th_ldrh_reg' can't be used with rt: %d, rn: %d, rm: %d\n", rt, rn, rm);
-  }
-}
-
-static void th_ldr_imm(uint32_t rt, uint32_t rn, uint32_t imm, uint32_t puw)
-{
-  // puw == 6 means positive offset on rn, so T1 encoding can be used
-  if (puw == 6 && rn < 8 && rt < 8 && imm <= 124 && !(imm & 3))
-  {
-    // imm[0] is enforced to be 0, and sould be divided by 4, thus offset is 4
-    o(0x6800 | (imm << 4) | (rn << 3) | rt); 
-  }
-  else if (puw == 6 && rn == R_SP && rt < 8 && imm <= 1020)
-  {
-    o(0x9800 | (rt << 8) | (imm >> 2));
-  }
-#ifndef TCC_TARGET_ARM_ARCHV6M
-  else if (puw == 6 && imm <= 4095)
-  {
-    o(0xf8d0 | (rn & 0xf));
-    o((rt & 0xf) << 12 | imm);
-  }
-  else if (imm <= 255)
-  {
-    o(0xf850 | (rn & 0xf));
-    o(0x0800 | ((rt & 0xf) << 12) | ((puw & 0x7) << 8) | imm);
-  }
-#endif 
-  else 
-  {
-    tcc_error("compiler_error: 'th_ldr_imm' can't be used with rt: %d, rn: %d, imm: 0x%x, puw: 0x%x\n", rt, rn, imm, puw);
-  }
-}
-
-static void th_ldr_reg(uint32_t rt, uint32_t rn, uint32_t rm)
-{
-  if (rm < 8 && rt < 8 && rn < 8)
-  {
-    o(0x5800 | (rm << 6) | (rn << 3) | rt);
-  }
-#ifndef TCC_TARGET_ARM_ARCHV6M 
-  else if (rt != R_SP && rm != R_SP && rm != R_PC)
-  {
-    o(0xf850 | (rn & 0xf));
-    o(((rt & 0xf) << 12) | (rm & 0xf));
-  }
-#endif
-  else 
-  {
-    tcc_error("compiler_error: 'th_ldr_reg' can't be used with rt: %d, rn: %d, rm: %d\n", rt, rn, rm);
-  }
-}
-
-static void th_ldr_literal(uint16_t rt, uint16_t imm, uint16_t add)
-{
-  if (rt < 8 && imm <= 1020) 
-  {
-    o(0x4800 | (rt << 8) | imm >> 2);
-  }
-#ifndef TCC_TARGET_ARM_ARCHV6M 
-  else if (rt != R_PC && imm <= 0xffff) 
-  {
-
-    o(0xf85f | ((add & 1) << 7));
-    o(((rt & 0xf) << 12) | imm);
-  }
-#endif
-  else 
-  {
-    tcc_error("compiler_error: can't generate for rt: %d, imm: 0x%x\n", rt, imm);
-  }
-}
-
-
-// STR 
-
-static int th_strh_imm(uint16_t rt, uint16_t rn, uint16_t imm, uint16_t puw)
-{
-  // T1 encoding, on armv6-m this one is the only one available
-  if (puw == 6 && rn < 8 && rt < 8 && imm <= 62 && !(imm & 1))
-  {
-    // imm[0] is enforced to be 0, and sould be divided by 2, thus offset is 5
-    o(0x8000 | (imm << 5) | (rn << 3) | rt); 
-    return 1;
-  }
-#ifndef TCC_TARGET_ARM_ARCHV6M
-  else if (puw == 6 && rt != R_SP && imm <= 4095)
-  {
-    o(0xf8a0 | (rn & 0xf));
-    o((rt & 0xf) << 12 | imm);
-    return 1;
-  }
-  else if (rt != R_SP && imm <= 255)
-  {
-    o(0xf820 | (rn & 0xf));
-    o(0x0800 | ((rt & 0xf) << 12) | ((puw & 0x7) << 8) | imm);
-    return 1;
-  }
-#endif 
-  return 0;
-}
-
-static void th_strh_reg(uint32_t rt, uint32_t rn, uint32_t rm)
-{
-  // puw == 6 means positive offset on rn, so T1 encoding can be used
-  if (rm < 8 && rt < 8 && rn < 8)
-  {
-    o(0x5200 | (rm << 6) | (rn << 3) | rt);
-  }
-#ifndef TCC_TARGET_ARM_ARCHV6M
-  else if (rt != R_SP && rm != R_SP && rm != R_PC)
-  {
-    o(0xf820 | (rn & 0xf));
-    o(((rt & 0xf) << 12) | (rm & 0xf));
-  }
-#endif
-  else 
-  {
-    tcc_error("compiler_error: 'th_strh_reg' can't be used with rt: %d, rn: %d, rm: %d\n", rt, rn, rm);
-  }
-}
-
-static int th_strb_imm(uint16_t rt, uint16_t rn, uint16_t imm, uint16_t puw)
-{
-  // T1 encoding, on armv6-m this one is the only one available
-  if (puw == 6 && rn < 8 && rt < 8 && imm <= 62 && !(imm & 1))
-  {
-    // imm[0] is enforced to be 0, and sould be divided by 2, thus offset is 5
-    o(0x7000 | (imm << 5) | (rn << 3) | rt); 
-    return 1;
-  }
-#ifndef TCC_TARGET_ARM_ARCHV6M
-  else if (puw == 6 && rt != R_SP && imm <= 4095)
-  {
-    o(0xf880 | (rn & 0xf));
-    o((rt & 0xf) << 12 | imm);
-    return 1;
-  }
-  else if (rt != R_SP && imm <= 255)
-  {
-    o(0xf800 | (rn & 0xf));
-    o(0x0800 | ((rt & 0xf) << 12) | ((puw & 0x7) << 8) | imm);
-    return 1;
-  }
-#endif 
-  return 0;
-}
-
-static void th_strb_reg(uint32_t rt, uint32_t rn, uint32_t rm)
-{
-  // puw == 6 means positive offset on rn, so T1 encoding can be used
-  if (rm < 8 && rt < 8 && rn < 8)
-  {
-    o(0x5400 | (rm << 6) | (rn << 3) | rt);
-  }
-#ifndef TCC_TARGET_ARM_ARCHV6M 
-  else if (rt != R_SP && rm != R_SP && rm != R_PC)
-  {
-    o(0xf800 | (rn & 0xf));
-    o(((rt & 0xf) << 12) | (rm & 0xf));
-  }
-#endif
-  else 
-  {
-    tcc_error("compiler_error: 'th_strb_reg' can't be used with rt: %d, rn: %d, rm: %d\n", rt, rn, rm);
-  }
-}
-
-static int th_str_imm(uint32_t rt, uint32_t rn, uint32_t imm, uint32_t puw)
-{
-  // puw == 6 means positive offset on rn, so T1 encoding can be used
-  if (puw == 6 && rn < 8 && rt < 8 && imm <= 124 && !(imm & 3))
-  {
-    // imm[0] is enforced to be 0, and sould be divided by 4, thus offset is 4
-    o(0x6000 | (imm << 4) | (rn << 3) | rt); 
-    return 1;
-  }
-  else if (puw == 6 && rn == R_SP && rt < 8 && imm <= 1020)
-  {
-    o(0x9000 | (rt << 8) | (imm >> 2));
-    return 1;
-  }
-#ifndef TCC_TARGET_ARM_ARCHV6M
-  else if (puw == 6 && imm <= 4095)
-  {
-    o(0xf8c0 | (rn & 0xf));
-    o((rt & 0xf) << 12 | imm);
-    return 1;
-  }
-  else if (imm <= 255)
-  {
-    o(0xf840 | (rn & 0xf));
-    o(0x0800 | ((rt & 0xf) << 12) | ((puw & 0x7) << 8) | imm);
-    return 1;
-  }
-#endif 
-  return 0;
-}
-
-static void th_str_reg(uint32_t rt, uint32_t rn, uint32_t rm)
-{
-  if (rm < 8 && rt < 8 && rn < 8)
-  {
-    o(0x5000 | (rm << 6) | (rn << 3) | rt);
-  }
-#ifndef TCC_TARGET_ARM_ARCHV6M 
-  else if (rt != R_SP && rm != R_SP && rm != R_PC)
-  {
-    o(0xf840 | (rn & 0xf));
-    o(((rt & 0xf) << 12) | (rm & 0xf));
-  }
-#endif
-  else 
-  {
-    tcc_error("compiler_error: 'th_str_reg' can't be used with rt: %d, rn: %d, rm: %d\n", rt, rn, rm);
-  }
-}
-
-static void th_mul(uint16_t rd, uint16_t rn, uint16_t rm)
-{
-  if (rd == rm && rd < 8 && rn < 8)
-  {
-    o(0x4340 | (rn << 3) | rm);
-  }
-#ifndef TCC_TARGET_ARM_ARCHV6M
-  else 
-  {
-    o(0xfb00 | rn);
-    o(0xf000 | (rd << 8) | rm);
-  }
-#endif
-}
-
-static void th_umull(uint32_t rdlo, uint16_t rdhi, uint16_t rn, uint16_t rm)
-{
-#ifndef TCC_TARGET_ARM_ARCHV6M
-  o(0xfba0 | rn);
-  o((rdlo << 12) | (rdhi << 8) | rm);
-#endif
-}
-
-static void th_udiv(uint16_t rd, uint16_t rn, uint16_t rm)
-{
-#ifndef TCC_TARGET_ARM_ARCHV6M
-  o(0xfbb0 | rn);
-  o(0xf0f0 | (rd << 8) | rm);
-#endif
-}
-
-static void th_sdiv(uint16_t rd, uint16_t rn, uint16_t rm)
-{
-#ifndef TCC_TARGET_ARM_ARCHV6M
-  o(0xfb90 | rn);
-  o(0xf0f0 | (rd << 8) | rm);
-#endif
-}
-
-
-
-static int th_ldr_literal_estimate(uint16_t rt, uint16_t imm)
-{
-  if (rt < 8 && !(imm & 3) && imm <= 0x3ff) return 2;
-#ifndef TCC_TARGET_ARM_ARCHV6M 
-  else if (imm <= 0xfff) return 4;
-#endif
-  return 0;
-}
-
-static uint32_t th_pack_const(uint32_t imm)
-{
-  // 00000000 00000000 00000000 abcdefgh
-  if (!(imm & 0xffffff00))
-  {
-    return imm;
-  }
-  // 00000000 abcdefgh 00000000 abcdefgh 
-  else if (!(imm & 0xff00ff00) && (imm >> 16) == (imm & 0xff))
-  {
-    return (1 << 12) | (imm & 0xff);
-  }
-  // abcdefgh 00000000 abcdefgh 00000000
-  else if (!(imm & 0x00ff00ff) && ((imm >> 16) & 0xff00) == (imm & 0xff00))
-  {
-    return (2 << 12) | ((imm >> 8) & 0xff);
-  }
-  // abcdefgh abcdefgh abcdefgh abcdefgh
-  else if ((imm & 0xffff) == ((imm >> 16) & 0xffff) && ((imm >> 8) & 0xff) == (imm & 0xff))
-  {
-    return (3 << 12) | (imm & 0xff);
-  }
-  else 
-  {
-    for (uint32_t j = 0; j < 24; j++)
-    {
-      const uint32_t mask = 0xff000000 >> j;
-      const uint32_t firstbit = 0x80000000 >> j;
-      if ((imm & firstbit) == firstbit && (imm & ~mask) == 0)
-      {
-        const uint32_t imm5 = (j + 8);
-        const uint32_t i = imm5 >> 4;
-        const uint32_t imm3 = (imm5 >> 1) & 0x7;
-        const uint32_t a = imm5 & 1;
-        const uint32_t bcdefgh = (imm >> (24 - j)) & 0x7f;
-        return (i << 26) | (imm3 << 12) | (a << 7) | bcdefgh;
-      }
-    }
-  }
-  tcc_error("compiler_error: unable to pack constant 0x%x for immediate thumb constats\n", imm);
-  return 0;
-}
-
-
-static void th_pop(uint16_t regs)
-{
-  // T1 encoding R0-R7 + PC only, all armv-m
-  // (T2 in armv8-m - inconsistent naming in reference manual)
-  if (!(regs & 0x8f00))
-  {
-    const uint16_t pc = (regs >> 15) & 1;
-    o(0xbc00 | (pc << 8) | (regs & 0xff));
-    return; 
-  }
-  // T2 encoding R0-R12 + PC + LR, > armv7-m
-  // (T1 in armv8-m - inconsistent naming in reference manual)
-  #if defined(TCC_TARGET_ARM_ARCHV8M) || defined(TCC_TARGET_ARM_ARCHV7M)
-  if (!(regs & 0x2000))
-  {
-    o(0xe8bd);
-    o(regs);
-    return;
-  }
-  #endif
-  tcc_error("compiler_error: 'th_pop' contains illegal registers: 0x%x\n", regs);
-}
-
-static void th_add_sp_imm(uint16_t rd, uint16_t imm)
-{
-  // T1 on all armv-m
-  if (rd < 8 && imm <= 1020 && !(imm & 0x3))
-  {
-    o(0xa800 | (rd << 8) | (imm >> 2));
-  }
-  // T2 on all armv-m
-  else if (rd == R_SP && imm <= 508 && !(imm & 0x3))
-  {
-    o(0xb000 | (imm >> 2));
-  }
-#if !defined(TCC_TARGET_ARM_ARCHV6M)
-  // T3
-  else if (rd != R_PC && imm <= 4095)
-  {
-    const uint16_t i = (imm >> 11) & 1;
-    const uint16_t imm3 = (imm >> 8) & 7;
-    o(0xf20d | (i << 10));
-    o((imm3 << 12) | ((rd & 0xf) << 8) | (imm & 0xff));
-  }
-  else if (rd != R_PC)
-  {
-    const uint32_t enc = th_pack_const(imm);
-    if (enc || imm == 0) 
-    {
-      const uint16_t a = enc >> 16;
-      const uint16_t b = enc & 0xffff;
-      o(0xf10d | a);
-      o(b | ((rd & 0xf) << 8));
-    }
-    else 
-    {
-      tcc_error("compiler_error: 'th_add_sp_imm' cannot pack const: %d or imm: 0x%x\n", rd, imm);
-    }
-  }
-#endif
-  else 
-  {
-    tcc_error("compiler_error: 'th_add_sp_imm' invalid register: %d or imm: 0x%x\n", rd, imm);
-  }
-}
-
-static int th_rsb_imm(uint16_t rd, uint16_t rn, uint16_t imm, flags_behaviour setflags)
-{
-  if (rd < 8 && rn < 8 && imm == 0 && setflags == FLAGS_BEHAVIOUR_SET)
-  {
-    o(0x4240 | (rn << 3) | rd);
-    return 1;
-  }
-  else if (rd != R_SP && rd != R_PC && rn != R_SP && rn != R_PC)
-  {
-    return th_generic_op_imm_with_status(0xf1c0, rd, rn, imm, setflags);
-  }
-  return 0;
-}
-
-static int th_shift_armv7m(uint16_t rd, uint16_t rm, uint16_t imm, uint16_t type)
-{
-  const uint16_t imm3 = (imm >> 2) & 7;
-  const uint16_t imm2 = imm & 0x3;
-  o(0xea4f);
-  o((imm3 << 12) | (rd << 8) | (imm2 << 6) | (type << 4) | rm);
-}
-
-static int th_lsl_reg(uint16_t rd, uint16_t rn, uint16_t rm)
-{
-  if (rd == rn && rm < 8 && rn < 8)
-  {
-    o(0x4080 | (rm << 3) | rd);
-    return 1;
-  }
-#ifndef TCC_TARGET_ARM_ARCHV6M
-  else if (rd != R_SP && rd != R_PC && rn != R_SP && rn != R_PC && rm != R_SP && rm != R_PC)
-  {
-    o(0xfa00 | rn);
-    o(0xf000 | (rd << 8) | rm);
-    return 1;
-  }
-#endif 
-  return 0;
-}
-
-static int th_lsl_imm(uint16_t rd, uint16_t rm, uint16_t imm)
-{
-  if (rm < 8 && rd < 8) 
-  {
-    o(0x0000 | (imm << 6) | (rm << 3) | rd);
-    return 1; 
-  }
-#ifndef TCC_TARGET_ARM_ARCHV6M 
-  else if (imm >= 1 && imm <= 31)
-  {
-    return th_shift_armv7m(rd, rm, imm, 0);
-  }
-#endif
-  return 0;
-}
-
-static int th_lsr_imm(uint16_t rd, uint16_t rm, uint16_t imm)
-{
-  if (rm < 8 && rd < 8) 
-  {
-    o(0x0800 | (imm << 6) | (rm << 3) | rd);
-    return 1; 
-  }
-#ifndef TCC_TARGET_ARM_ARCHV6M 
-  else if (imm >= 1 && imm <= 31)
-  {
-    return th_shift_armv7m(rd, rm, imm, 1);
-  }
-#endif
-  return 0;
-}
-
-static int th_asr_reg(uint16_t rd, uint16_t rn, uint16_t rm)
-{
-  if (rd == rn && rm < 8 && rn < 8)
-  {
-    o(0x4100 | (rm << 3) | rd);
-    return 1;
-  }
-#ifndef TCC_TARGET_ARM_ARCHV6M
-  else if (rd != R_SP && rd != R_PC && rn != R_SP && rn != R_PC && rm != R_SP && rm != R_PC)
-  {
-    o(0xfa40 | rn);
-    o(0xf000 | (rd << 8) | rm);
-    return 1;
-  }
-#endif 
-  return 0;
-}
-
-static int th_asr_imm(uint16_t rd, uint16_t rm, uint16_t imm)
-{
-  if (rm < 8 && rd < 8) 
-  {
-    o(0x1000 | (imm << 6) | (rm << 3) | rd);
-    return 1; 
-  }
-#ifndef TCC_TARGET_ARM_ARCHV6M 
-  else if (imm >= 1 && imm <= 31)
-  {
-    return th_shift_armv7m(rd, rm, imm, 2);
-  }
-#endif
-  return 0;
-}
-
-static int th_offset_to_reg(int off, int sign)
-{
-  int rr = get_reg(RC_INT);
-  
-  // if mov is not possible then load from data
-  if (!th_mov_imm(rr, off))
-  {
-    load_full_const(rr, sign ? -off : off, NULL);
-    return rr;
-  }
-
-  if (sign) th_rsb_imm(rr, rr, 0, FLAGS_BEHAVIOUR_NOT_IMPORANT);
-  return rr;
-}
-
-// VFP instructions
-
-static void th_vpush(uint32_t regs)
-{
-  // single precision floating point registers for now 
-  // TODO: add support for hardfloat config 
-  o(0xed2d);
-  o(0x0a00 | (regs & 0xffff));
-}
-
-static void th_vpop(uint32_t regs)
-{
-  o(0xecbd | (regs >> 16));
-  o(0x0a00 | (regs & 0xffff));
-}
-
-static void th_vmov_register(uint16_t vd, uint16_t vm)
-{
-  if (vd <= 0x1f && vm <= 0x1f)
-  {
-    const uint16_t d = vd & 1;
-    const uint16_t m = vm & 1;
-    vd >>= 1;
-    vm >>= 1;
-    o(0xeeb0 | (d << 6));
-    o(0x0a40 | (vd << 12) | (m << 5) | vm);
-  }
-  else 
-  {
-    tcc_error("compiler_error: can't encode 'th_vmov_register' for vd: %d, vm: %d\n", vd, vm);
-  }
-}
-
-static void th_vldr(uint32_t rn, uint32_t vd, uint32_t add, uint32_t is_doubleword, uint32_t imm)
-{
-  const uint32_t D = (vd >> 4) & 1;
-  if (imm > 1020 || (imm & 0x3))
-  {
-    tcc_error("compiler_error: 'th_vldr' imm is outside of range: 0x%x, max value: 0xff\n", imm);
-    return;
-  }
-  if (is_doubleword)
-  {
-    o(0xed10 | (D << 6) | ((add & 1) << 7) | rn & 0xf);
-    o(0x0b00 | ((vd & 0xf) << 12) | (imm > 2));
-  }
-  else 
-  {
-    o(0xed10 | (D << 6) | ((add & 1) << 7) | rn & 0xf);
-    o(0x0a00 | ((vd & 0xf) << 12) | (imm > 2));
-  }
-}
-
-static void th_vstr(uint32_t rn, uint32_t vd, uint32_t add, uint32_t is_doubleword, uint32_t imm)
-{
-  const uint32_t D = (vd >> 4) & 1;
-  if (imm > 1020 || (imm & 0x3))
-  {
-    tcc_error("compiler_error: 'th_vstr' imm is outside of range: 0x%x, max value: 0xff\n", imm);
-  }
-  if (is_doubleword)
-  {
-    o(0xed00 | (D << 6) | ((add & 1) << 7) | rn & 0xf);
-    o(0x0b00 | ((vd & 0xf) << 12) | (imm > 2));
-  }
-  else 
-  {
-    o(0xed00 | (D << 6) | ((add & 1) << 7) | rn & 0xf);
-    o(0x0a00 | ((vd & 0xf) << 12) | (imm > 2));
-  }
-}
-
-// move between core general purpose register and single precision floating point register
-static void th_vmov_gp_sp(uint16_t rt, uint16_t sn, uint16_t to_arm_register)
-{
-  const uint16_t N = (sn >> 4) & 1;
-  o(0xee00 | ((to_arm_register & 1) << 4) | (sn & 0xf));
-  o(0x0a10 | ((rt & 0xf) << 12) | (N << 7));
-}
-
-// move between two general purpose registers and one doubleword register 
-static void th_vmov_2gp_dp(uint16_t rt, uint16_t rt2, uint16_t dm, uint16_t to_arm_register)
-{
-  const uint16_t M = (dm >> 4) & 1;
-  o(0xec40 | ((to_arm_register & 1) << 4) | (rt2 & 0xf));
-  o(0x0b10 | ((rt & 0xf) << 12) | (M << 5) | (dm & 0xf));
-}
-
-static uint32_t gen_th_sub_sp_imm(uint16_t rd, uint32_t imm)
-{
-  uint32_t x = 0;
-  // T1 encoding
-  if (rd == R_SP && imm <= 508 && !(imm & 0x3))
-  {
-    x = 0xb080 | (imm >> 2);
-  }
-  #ifndef TCC_TARGET_ARM_ARCHV6M
-  // T3 encoding
-  else if (imm <= 4095 && rd != R_PC)
-  {
-    const uint32_t i = (imm >> 11) & 1;
-    const uint32_t imm3 = (imm >> 8) & 0x7;
-    x = (0xf2ad | (i << 10)) << 16;
-    x |= ((imm3 << 12) | ((rd & 0xf) << 8) | (imm & 0xff));
-  }
-  else if (rd != R_PC)
-  {
-    const uint32_t enc = th_pack_const(imm);
-    if (enc || imm == 0)
-    {
-      const uint32_t a = enc >> 16;
-      const uint32_t b = enc & 0xffff;
-      x = (0xf1ad | a) << 16;
-      x |= (((rd & 0xf) << 8) | b);
-    }
-    else 
-    {
-      tcc_error("compiler_error: 'gen_th_sub_sp_imm' cannot pack const: %d or imm: 0x%x\n", rd, imm);
-    }
-  }
-  #endif
-  else 
-  {
-    tcc_error("compiler_error: 'gen_th_sub_imm' can't generate for rd: %d, imm: 0x%x\n", rd, imm);
-  }
-  return x;
-}
-
-static uint32_t th_sub_sp_imm_estimate(uint16_t rd, uint32_t imm)
-{
-  // T1 encoding
-  if (rd == R_SP && imm <= 508 && !(imm & 0x3))
-  {
-    return 2;
-  }
-  #ifndef TCC_TARGET_ARM_ARCHV6M
-  // T3 encoding
-  else if (imm <= 4095 && rd != R_PC)
-  {
-    return 4;
-  }
-  else if (rd != R_PC)
-  {
-    return 4;
-  }
-  #endif
-  return 0;
-}
-
-static void th_sub_sp_imm(uint16_t rd, uint16_t imm)
-{
-  const uint32_t x = gen_th_sub_sp_imm(rd, imm);
-  const uint32_t x_size = th_sub_sp_imm_estimate(rd, imm); 
-  if (x_size == 2)
-  {
-    o(x);  
-  }
-  else if (x_size == 4)
-  {
-    o(x >> 16);
-    o(x & 0xffff);
-  }
-  else 
-  {
-    tcc_error("compiler_error: can't generate th_sub_sp_imm for rd: %d, imm: 0x%x\n", rd, imm);
-  }
-}
-
 // Thumb ELF management 
-
 // Start of T32 instructions
 void th_sym_t()
 {
@@ -1825,50 +535,69 @@ void th_sym_d()
 int decbranch(int pos)
 {
   int xa = *(uint16_t *)(cur_text_section->data + pos);
-  int xb = *(uint16_t *)(cur_text_section->data + pos + 2);
+	int xb = *(uint16_t *)(cur_text_section->data + pos + 2);
 
-  if ((xa & 0xf000) != 0xd000)
-  {
-    xa &= 0x00ff;
-    if (xa & 0x0080) xa -= 0x100;
-    xa = (xa * 2) + pos + 4;
-  }
-  else if ((xa & 0xf800) == 0xe000)
-  {
-    xa &= 0x7ff;
-    if (xa & 0x400) xa -= 0x800;
-    xa = (xa * 2) + pos + 4;
-  }
-  else if ((xa & 0xf800) == 0xf000 && (xb & 0xd000) == 0x8000)
-  {
-    const uint32_t s = (xa >> 10) & 1;
-    const uint32_t imm6 = (xa & 0x3f);
-    const uint32_t j1 = (xb >> 13) & 1;
-    const uint32_t j2 = (xb >> 11) & 1;
-    const uint32_t imm11 = xb & 0x7ff;
-    uint32_t ret = (j2 << 19) | (j1 << 18) | (imm6 << 12) | (imm11 << 1);
-    if (s) ret |= 0xfff00000;
-    xa = ret + pos + 4;
-  }
-  else if ((xa & 0xf800) == 0xf000 && (xb & 0xd000) == 0x9000)
-  {
-    const uint32_t s = (xa >> 10) & 1;
-    const uint32_t imm10 = (xa & 0x3ff);
-    const uint32_t j1 = (xb >> 13) & 1;
-    const uint32_t j2 = (xb >> 11) & 1;
-    const uint32_t imm11 = xb & 0x7ff;
-    const uint32_t i1 = ~(j1 ^ s) & 1;
-    const uint32_t i2 = ~(j2 ^ s) & 1;
-    uint32_t ret = (i2 << 23) | (i1 << 22) | (imm10 << 12) | (imm11 << 1);
-    if (s) ret |= 0xff000000;
-    xa = ret + pos + 4;
-  }
-  else 
-  {
-    tcc_error("compiler_error: decbranch unknown encoding pos: 0x%x\n", pos);
-    return 0;
-  }
-  return xa;
+	TRACE("  decbranch ins at pos 0x%.8x, target inst 0x%x", pos, xa);
+
+	if ((xa & 0xf000) == 0xd000)
+	{
+		// Branch encoding t1
+		xa &= 0x00ff;
+		if (xa & 0x0080) xa -= 0x100;
+		xa = (xa*2) + pos + 4;
+	}
+	else if ((xa & 0xf800) == 0xe000)
+	{
+		// Branch encoding t2
+		xa &= 0x7ff;
+		if(xa & 0x400) xa -= 0x800;
+		xa = (xa*2) + pos + 4;
+    printf("BT2: xa: %x\n", xa);
+	}
+	else if ((xa & 0xf800) == 0xf000 && (xb & 0xd000) == 0x8000)
+	{
+		// Branch encoding t3
+		uint32_t s = (xa >> 10) & 1;
+		uint32_t imm6 = (xa & 0x3f);
+		uint32_t j1 = (xb >> 13) & 1;
+		uint32_t j2 = (xb >> 11) & 1;
+		uint32_t imm11 = xb & 0x7ff;
+
+		//      10 9876543210 9876543210 9876543210
+		// IMM:             s 21bbbbbbaa aaaaaaaaa0
+		// IMM:               s21bbbbbba aaaaaaaaaa
+		uint32_t ret = (j2 << 19) | (j1 << 18) | (imm6 << 12) | (imm11 << 1);
+		if (s) ret |= 0xfff00000;
+
+		xa = ret + pos + 4;
+	}
+	else if ((xa & 0xf800) == 0xf000 && (xb & 0xd000) == 0x9000)
+	{
+		// Branch encoding t4
+		uint32_t s = (xa >> 10) & 1;
+		uint32_t imm10 = (xa & 0x3ff);
+		uint32_t j1 = (xb >> 13) & 1;
+		uint32_t j2 = (xb >> 11) & 1;
+		uint32_t imm11 = xb & 0x7ff;
+
+		uint32_t i1 = ~(j1 ^ s) & 1;
+		uint32_t i2 = ~(j2 ^ s) & 1;
+
+		//      10 9876543210 9876543210 9876543210
+		// IMM:         s21bb bbbbbbbbaa aaaaaaaaa0
+		uint32_t ret = (i2 << 23) | (i1 << 22) | (imm10 << 12) | (imm11 << 1);
+		if (s) ret |= 0xff000000;
+
+		xa = ret + pos + 4;
+	}
+	else
+	{
+		tcc_error ("internal error: decbranch unknown encoding pos 0x%x\n", pos);
+		return 0;
+	}
+
+	TRACE("  decbranch ins at pos 0x%.8x, target 0x%x", pos, xa);
+	return xa;
 }
 
 
@@ -1902,7 +631,23 @@ static uint32_t th_encbranch_11(int pos, int addr)
 
 static uint32_t th_encbranch_20(int pos, int addr)
 {
+  TRACE("th_encbranch_20 pos %x addr %x\n", pos, addr);
   return (addr - pos - 4) / 2;
+}
+
+int th_offset_to_reg(int off, int sign)
+{
+  int rr = get_reg(RC_INT);
+  
+  // if mov is not possible then load from data
+  if (!th_mov_imm(rr, off))
+  {
+    load_full_const(rr, sign ? -off : off, NULL);
+    return rr;
+  }
+
+  if (sign) th_rsb_imm(rr, rr, 0, FLAGS_BEHAVIOUR_NOT_IMPORANT);
+  return rr;
 }
 
 int th_patch_call(int t, int a)
@@ -1913,6 +658,7 @@ int th_patch_call(int t, int a)
   TRACE("'th_patch_call' t: %.8x, a: %.8x\n", t, a); 
 
   t = decbranch(t);
+  TRACE("t: %.8x\n", t);
   if (a == lt + 2) *x = 0xbf00;
   else if ((*x & 0xf000) == 0xd000)
   {
@@ -1926,22 +672,23 @@ int th_patch_call(int t, int a)
   }
   else if ((x[0] & 0xf800) == 0xf000 && (x[1] & 0xd000) == 0x8000)
   {
-    const uint32_t enc = th_encbranch_b_t3(th_encbranch_20(lt, a));
+    uint32_t enc = 0;
     x[0] &= 0xfbc0;
     x[1] &= 0xd000;
+    enc = th_encbranch_b_t3(th_encbranch_20(lt, a));
     x[0] |= enc >> 16;
-    x[1] |= enc & 0xffff;
+    x[1] |= enc;
   }
   else if ((x[0] & 0xf800) == 0xf000 && (x[1] & 0xd000) == 0x9000)
   {
-    const uint32_t enc = th_packimm_10_11_0(th_encbranch_20(lt, a) << 1);
+    uint32_t enc = 0;   
     x[0] &= 0xf800;
     x[1] &= 0xd000;
+    enc = th_packimm_10_11_0(th_encbranch_20(lt, a) << 1);
     x[0] |= enc >> 16;
-    x[1] |= enc & 0xffff;
+    x[1] |= enc;
   }
-  else return 0;
-  //else tcc_error("compiler_error: unhandled branch type in th_patch_call for: t: 0x%x, a: 0x%x, x: 0x%x 0x%x\n", t, a, x[0], x[1]);
+  else tcc_error("compiler_error: unhandled branch type in th_patch_call for: t: 0x%x, a: 0x%x, x: 0x%x 0x%x\n", t, a, x[0], x[1]);
 
   return t;
 }
@@ -1961,10 +708,11 @@ static void gadd_sp(int val)
 
 static void gcall_or_jmp(int is_jmp)
 {
-  TRACE("gcall_or_jmp: %d, ind: 0x%x, vtop: 0x%x", is_jmp, ind, vtop->c.i);
   if ((vtop->r & (VT_VALMASK | VT_LVAL)) == VT_CONST)
   {
     uint32_t x = th_encbranch(ind, ind + vtop->c.i);
+  
+    TRACE("gcall_or_jmp: %d, ind: 0x%x, vtop: 0x%x, 0x%x", is_jmp, ind, vtop->c.i, x);
     if (x)
     {
       if (vtop->r & VT_SYM) greloc(cur_text_section, vtop->sym, ind, R_ARM_THM_JUMP24);
@@ -1974,8 +722,10 @@ static void gcall_or_jmp(int is_jmp)
   else 
   {
     int r = gv(RC_INT);
-    if (is_jmp) th_bx_reg(intr(r));
-    else th_blx_reg(intr(r));
+    TRACE("gcall_or_jmp indirect call"); 
+    th_orr_imm(r, r, 1);
+    if (!is_jmp) th_blx_reg(intr(r));
+    else th_bx_reg(intr(r));
 
   }
 }
@@ -2097,11 +847,11 @@ again:
                 lexpand();
                 size = 8;
                 r = gv(RC_INT);
-                th_push(1 << intr(r));
+                ot(th_push(1 << intr(r)));
                 vtop--;
               }
               r = gv(RC_INT);
-              th_push(1 << intr(r));
+              ot(th_push(1 << intr(r)));
             }
             if (i == STACK_CLASS && pplan->prev)
               gadd_sp(pplan->prev->end - pplan->start); /* Add padding if any */
@@ -2143,7 +893,7 @@ again:
   save_regs(nb_args);
 
   if(todo) {
-    th_pop(todo);
+    ot(th_pop(todo));
     for(pplan = plan->clsplans[CORE_STRUCT_CLASS]; pplan; pplan = pplan->prev) {
       int r;
       pplan->sval->r = pplan->start;
@@ -2182,130 +932,108 @@ ST_FUNC void gen_fill_nops(int bytes)
 // generate function prolog
 void gfunc_prolog(Sym *func_sym)
 {
-  const CType *func_type = &func_sym->type; 
-  Sym *sym = func_type->ref; 
-  int n = 0, nf = 0;
-  int pn = 0; // core 
-  int sn = 0; // stack
-  CType ret_type = {};
-  int align = 0;
-  int regsize = 0;
-  int return_struct = 0;
-  int size = 0;
-  int addr = 0;
+  CType *func_type = &func_sym->type;
+  Sym *sym,*sym2;
+  int n, nf, size, align, rs, struct_ret = 0;
+  int addr, pn, sn; /* pn=core, sn=stack */
+  CType ret_type;
 
-#ifdef TCC_ARM_EABI
-  struct avail_regs avregs = {{0}};
-#endif
-  // current function return type
+  struct avail_regs avregs = AVAIL_REGS_INITIALIZER;
+
+  TRACE("########## gfunc_prolog ##########");
+
+  sym = func_type->ref;
   func_vt = sym->type;
-  // true if function is variadic 
   func_var = (func_type->ref->f.func_type == FUNC_ELLIPSIS);
-  func_nregs = 0;
 
-  TRACE("'gfunc_prolog'");
-  th_mov_reg(R_IP, R_SP);
-
-  if ((func_vt.t & VT_BTYPE) == VT_STRUCT && !gfunc_sret(&func_vt, func_var, &ret_type, &align, &regsize))
+  n = 0;
+  nf = 0;
+  if ((func_vt.t & VT_BTYPE) == VT_STRUCT &&
+      !gfunc_sret(&func_vt, func_var, &ret_type, &align, &rs))
   {
     n++;
-    return_struct = 1;
-    func_vc = 12;
+    struct_ret = 1;
+    func_vc = 12; /* Offset from fp of the place to store the result */
   }
-
-  for (Sym *s = sym->next; s && (n < 4 || nf < 16); s = s->next)
-  {
-    size = type_size(&s->type, &align); 
-#ifdef TCC_ARM_EABI
-    if (float_abi == ARM_HARD_FLOAT && !func_var && (is_float(s->type.t) || is_hgen_float_aggr(&s->type))) {
+  for(sym2 = sym->next; sym2 && (n < 4 || nf < 16); sym2 = sym2->next) {
+    size = type_size(&sym2->type, &align);
+    if (float_abi == ARM_HARD_FLOAT && !func_var &&
+        (is_float(sym2->type.t) || is_hgen_float_aggr(&sym2->type))) {
       int tmpnf = assign_vfpreg(&avregs, align, size);
-      tmpnf += ceil_div(size, 4);
+      tmpnf += (size + 3) / 4;
       nf = (tmpnf > nf) ? tmpnf : nf;
-    } else 
-#endif 
+    } else
     if (n < 4)
-    {
-      n += ceil_div(size, 4);
-    }
+      n += (size + 3) / 4;
   }
-  th_sym_t();
-  if (func_var) n = 4;
-  if (n)
-  {
-    if (n > 4) n = 4;
-#ifdef TCC_ARM_EABI 
-    n=(n + 1) & -2;
-#endif
+  th_sym_t ();
+  if (func_var)
+    n=4;
+
+  if (n) {
+    if(n>4)
+      n=4;
+    n=(n+1)&-2;
     func_nregs = n;
-    th_push((1 << n) - 1);
+    TRACE("  save r0-r4 on stack, n %i", n);
+    th_push ((1<<n)-1);
   }
-  
-  if (nf)
-  {
-    if (nf > 16) nf = 16;
+  else
+    func_nregs = 0;
+
+  if (nf) {
+    if (nf>16)
+      nf=16;
     nf=(nf+1)&-2; /* nf => HARDFLOAT => EABI */
-    th_vpush(nf); // save used s0-s15 on stack 
+    TRACE("  save s0-s15 on stack if needed");
+    th_vpush (nf);
     func_nregs += nf;
   }
-  // save fp, ip, lr 
-  // R0 - just to keep 8 byte aligment of stack pointer
-  th_push((1 << R_FP) | (1 << R_IP) | (1 << R_LR));
-  th_mov_reg(R_FP, R_SP);
+
+  th_push (0x5800);    // push {fp, ip, lr} (r11, r12, r14)
+  th_mov_reg (11, 13); // mov fp, sp
   func_sub_sp_offset = ind;
-  // space for stack adjustment in epilog 
-  th_nop();
+  th_nop();   /* leave space for stack adjustment in epilog */
   th_nop();
 
-#ifdef TCC_ARM_EABI
-  if (float_abi == ARM_HARD_FLOAT) 
-  {
+  if (float_abi == ARM_HARD_FLOAT) {
     func_vc += nf * 4;
-    memset(&avregs, 0, sizeof(avregs));
+    avregs = AVAIL_REGS_INITIALIZER;
   }
-#endif
-  pn = return_struct;
-  sn = 0;
-  while ((sym = sym->next)) 
-  {
+
+  pn = struct_ret, sn = 0;
+  while ((sym = sym->next)) {
     CType *type;
     type = &sym->type;
-    size = ceil_div(type_size(type, &align), 4);
+    size = type_size(type, &align);
+    size = (size + 3) >> 2;
     align = (align + 3) & ~3;
-#ifdef TCC_ARM_EABI 
-    if (float_abi == ARM_HARD_FLOAT && !func_var && (is_float(sym->type.t) 
-          || is_hgen_float_aggr(&sym->type)))
-    {
-      const int fpn = assign_vfpreg(&avregs, align, size << 2);
-      if (fpn >= 0) addr = fpn * 4;
-      else goto from_stack;
-    } 
-    else 
-#endif 
-    if (pn < 4) 
-    {
-#ifdef TCC_ARM_EABI 
-      pn = (pn + (align - 1) / 4) & ~(align / 4);
-#endif
+
+    if (float_abi == ARM_HARD_FLOAT && !func_var && (is_float(sym->type.t)
+        || is_hgen_float_aggr(&sym->type))) {
+      int fpn = assign_vfpreg(&avregs, align, size << 2);
+      if (fpn >= 0)
+        addr = fpn * 4;
+      else
+        goto from_stack;
+    } else if (pn < 4) {
+      pn = (pn + (align-1)/4) & -(align/4);
       addr = (nf + pn) * 4;
       pn += size;
-      if (!sn && pn > 4) sn = (pn - 4);
-      else 
-      {
-#ifdef TCC_ARM_EABI 
-from_stack: 
-        sn = (sn + (align - 1) / 4) & ~(align / 4);
-#endif
-        addr = (n + nf + sn) * 4;
-        sn += addr;
-      }
-      sym_push(sym->v & ~SYM_FIELD, type, VT_LOCAL | VT_LVAL, addr + 12);
+      if (!sn && pn > 4)
+        sn = (pn - 4);
+    } else {
+from_stack:
+        sn = (sn + (align-1)/4) & -(align/4);
+      addr = (n + nf + sn) * 4;
+      sn += size;
     }
-    leaffunc = 1;
-    loc = 0;
+    sym_push(sym->v & ~SYM_FIELD, type, VT_LOCAL | VT_LVAL,
+             addr + 12);
   }
+  leaffunc = 1;
+  loc = 0;
 }
-
-
 
 // all params needs to be passed in core registers or not
 static int floats_in_core_regs(const SValue *sval)
@@ -2376,6 +1104,7 @@ void gfunc_call(int nb_args)
 
 void gfunc_epilog(void)
 {
+  uint32_t x;
   int diff = 0;
   TRACE("'gfunc_epilog'");
   // copy float return value to core register if base standard is used 
@@ -2395,11 +1124,11 @@ void gfunc_epilog(void)
   diff = (-loc + 3) & -4;
   if (!leaffunc) diff = ((diff + 11) & -8) -4;
   if (diff > 0) th_add_sp_imm(R_SP, diff);
-  th_pop((1 << R_FP) | (1 << R_IP) | (1 << R_LR));
+  ot(th_pop((1 << R_FP) | (1 << R_IP) | (1 << R_LR)));
 
   if (diff > 0)
   {
-    const uint32_t x = gen_th_sub_sp_imm(R_SP, diff);
+    x = gen_th_sub_sp_imm(R_SP, diff);
     if (x) *(uint32_t *)(cur_text_section->data + func_sub_sp_offset) = x; 
     else tcc_error("compiler_error: failed to generate stack adjustment\n");
   }
@@ -2424,7 +1153,7 @@ ST_FUNC int gjmp(int t)
 {
   int r = ind;
   int val = ((t-r) >> 1) - 2;
-  TRACE("'gjump'");
+  TRACE("gjump t: 0x%x, r: %d, val: %d", t, r, val);
   if (nocode_wanted) return t;
 
   if (val < -1024 || val > 1023) th_b_t4(val << 1);
@@ -2441,7 +1170,7 @@ ST_FUNC void gjmp_addr(int a)
 ST_FUNC int gjmp_append(int n, int t)
 {
   int p, lp;
-  TRACE("'gjmp_append'");
+  TRACE("gjmp_append n: 0x%x, t: 0x%x", n, t);
   if (n)
   {
     p = n;
@@ -2480,17 +1209,17 @@ void gsym_addr(int t, int a)
 
 ST_FUNC void gen_vla_alloc(CType *type, int align)
 {
-  TRACE("'gen_vla_alloc'");
+  tcc_error("'gen_vla_alloc'");
 }
 
 ST_FUNC void gen_vla_sp_save(int addr)
 {
-  TRACE("'gen_vla_sp_save'");
+  tcc_error("'gen_vla_sp_save'");
 }
 
 ST_FUNC void gen_vla_sp_restore(int addr)
 {
-  TRACE("'gen_vla_sp_restore'");
+  tcc_error("'gen_vla_sp_restore'");
 }
 
 static int unalias_ldbl(int btype)
@@ -2588,10 +1317,6 @@ static uint32_t intr(int r)
   {
     return r - TREG_R0;
   }
-  if (!(r >= TREG_SP && r <= TREG_LR))
-  {
-    tcc_error("compiler_error: register: %d is not int register\n", r);
-  }
   return r + (13 - TREG_SP);
 }
 
@@ -2601,7 +1326,7 @@ void store(int r, SValue *sv)
   TRACE("'store' reg: %d", r);
   
   fr = sv->r;
-  ft - sv->type.t;
+  ft = sv->type.t;
   fc = sv->c.i;
 
   if (fc >= 0) sign = 0;
@@ -2660,6 +1385,7 @@ void store(int r, SValue *sv)
       }
       else
       {
+        TRACE("store: sign: %x, r: %x, base: %x, fc: %x", sign, r, base, fc);
         if (!th_str_imm(r, base, fc, sign ? 4 : 6))
         {
           int rr = th_offset_to_reg(fc, sign);
@@ -2689,22 +1415,22 @@ static void load_full_const(int r, uint32_t imm, struct Sym *sym)
   int est = 0;
   TRACE("'load_full_const' to register: %d, with imm: %d\n", r, imm);
   est = th_ldr_literal_estimate(r, 4);
-  est += 2; // branch instruction size
+  est += 4; // branch instruction size
   est += ind;
   // 4-byte alignment
   if (est & 3) th_nop(); 
-  th_ldr_literal(r, 4, 1);
-  th_b_t2(4);
+  ot(th_ldr_literal(r, 4, 1));
+  th_b_t4(4);
   if (!pic) {
-    TRACE("Loading from there");
     if (sym) greloc(cur_text_section, sym, ind, R_ARM_ABS32);
   }
   else { 
     if (sym) {
-      if (sym->type.t & VT_STATIC) greloc(cur_text_section, sym, ind, R_ARM_REL32);
-      else {
-        if (!text_and_data_separation) greloc(cur_text_section, sym, ind, R_ARM_GOT_PREL);
-        else greloc(cur_text_section, sym, ind, R_ARM_GOT32);
+      if (sym->type.t & VT_STATIC) {
+        greloc(cur_text_section, sym, ind, R_ARM_REL32);
+        imm -= 12;
+      } else {
+        greloc(cur_text_section, sym, ind, R_ARM_GOT_PREL);
       }
     }
   }
@@ -2719,100 +1445,64 @@ static void load_full_const(int r, uint32_t imm, struct Sym *sym)
       if (sym->type.t & VT_STATIC) {
         th_add_reg(r, R_PC, r);
       } else {
-        if (!text_and_data_separation) {
-          tcc_error("implement GOT reloc 1");
-        }
-        else {
-          
-        }
+        th_add_reg(r, r, R_PC);
+        th_ldr_imm(r, r, 0, 6);
       }
     }
   }
 }
 
-void load_short_from_base(int ir, int base, int fc, int sign)
+int load_opcode(thumb_opcode opcode)
 {
-#ifndef TCC_TARGET_ARM_ARCHV6M
-  // ldrsh imm is not available on armv6-m
-  th_ldrsh_imm(ir, base, fc, sign ? 4 : 6);
-#else 
-  // so instead address must be calculated and placed in register
-  int rr = th_offset_to_reg(fc, sign);
-  th_ldrsh_reg(ir, base, rr);
-#endif
+  if (is_valid_opcode(opcode)) 
+  {
+    ot(opcode);
+    return 1;
+  } 
+  return 0;
 }
 
-void load_ushort_from_base(int ir, int base, int fc, int sign)
+int load_short_from_base(int ir, int base, int fc, int sign)
 {
-// the same, but for unsigned short 
-#ifndef TCC_TARGET_ARM_ARCHV6M
-  th_ldrh_imm(ir, base, fc, sign ? 4 : 6);
-#else 
-  if (!sign && fc <= 255)
-  {
-    th_ldrh_imm(ir, base, fc, sign ? 4 : 6); 
-  }
-  else 
-  {
-    int rr = th_offset_to_reg(fc, sign);
-    th_ldrh_reg(ir, base, rr);
-  }
-#endif
+  const thumb_opcode ins = th_ldrsh_imm(ir, base, fc, sign ? 4 : 6);
+  TRACE("Load short sign: %d, r %d, base: %d, fc: %d\n", sign, ir, base, fc);
+  return load_opcode(ins);
 }
 
-void load_byte_from_base(int ir, int base, int fc, int sign)
+int load_ushort_from_base(int ir, int base, int fc, int sign)
 {
-#ifndef TCC_TARGET_ARM_ARCHV6M
-  // ldrsh imm is not available on armv6-m
-  th_ldrsb_imm(ir, base, fc, sign ? 4 : 6);
-#else 
-  // so instead address must be calculated and placed in register
-  int rr = th_offset_to_reg(fc, sign);
-  th_ldrsb_reg(ir, base, rr);
-#endif
+  const thumb_opcode ins = th_ldrh_imm(ir, base, fc, sign ? 4 : 6);
+  TRACE("Load ushort sign: %d, r %d, base: %d, fc: %d\n", sign, ir, base, fc);
+  return load_opcode(ins);
 }
 
-void load_ubyte_from_base(int ir, int base, int fc, int sign)
+int load_byte_from_base(int ir, int base, int fc, int sign)
 {
-// the same, but for unsigned byte
-#ifndef TCC_TARGET_ARM_ARCHV6M
-  th_ldrh_imm(ir, base, fc, sign ? 4 : 6);
-#else 
-  if (!sign && fc <= 255)
-  {
-    th_ldrb_imm(ir, base, fc, sign ? 4 : 6); 
-  }
-  else 
-  {
-    int rr = th_offset_to_reg(fc, sign);
-    th_ldrb_reg(ir, base, rr);
-  }
-#endif
+  const thumb_opcode ins = th_ldrsb_imm(ir, base, fc, sign ? 4 : 6);
+  TRACE("Load byte sign: %d, r %d, base: %d, fc: %d\n", sign, ir, base, fc);
+  return load_opcode(ins);
 }
 
-void load_word_from_base(int ir, int base, int fc, int sign)
+int load_ubyte_from_base(int ir, int base, int fc, int sign)
+{
+  const thumb_opcode ins = th_ldrb_imm(ir, base, fc, sign ? 4 : 6);
+  TRACE("Load ubyte sign: %d, r %d, base: %d, fc: %d\n", sign, ir, base, fc);
+  return load_opcode(ins);
+}
+
+int load_word_from_base(int ir, int base, int fc, int sign)
 { 
-#ifndef TCC_TARGET_ARM_ARCHV6M
-  th_ldr_imm(ir, base, fc, sign ? 4 : 6);
-#else 
-  if (!sign && fc <= 255)
-  {
-    th_ldr_imm(ir, base, fc, sign ? 4 : 6); 
-  }
-  else 
-  {
-    int rr = th_offset_to_reg(fc, sign);
-    th_ldr_reg(ir, base, rr);
-  }
-#endif
+  const thumb_opcode ins = th_ldr_imm(ir, base, fc, sign ? 4 : 6);
+  TRACE("Load word sign: %d, r %d, base: %d, fc: %d\n", sign, ir, base, fc);
+  return load_opcode(ins);
 }
 
 void load_vt_lval_vt_local(int r, SValue *sv, int ft, int fc, int sign, uint32_t base)
 {
   int success = 0;
-  int rr = 0;
   const int btype = ft & VT_BTYPE;
   int ir = intr(r);
+  TRACE("load_vt_lval_vt_local: fc: %i", fc); 
 
   if (is_float(ft))
   {
@@ -2824,30 +1514,33 @@ void load_vt_lval_vt_local(int r, SValue *sv, int ft, int fc, int sign, uint32_t
     TRACE("load short to r: %d, base: %d, fc: %d, sign: %d\n", ir, base, fc, sign);
     if (!(ft & VT_UNSIGNED))
     {
-      load_short_from_base(ir, base, fc, sign);
+      success = load_short_from_base(ir, base, fc, sign);
     }
     else 
     {
-      load_ushort_from_base(ir, base, fc, sign);
+      success = load_ushort_from_base(ir, base, fc, sign);
     }
   }
   else if (btype == VT_BYTE || btype == VT_BOOL)
   {
     if (!(ft & VT_UNSIGNED))
     {
-      load_byte_from_base(ir, base, fc, sign);
+      success = load_byte_from_base(ir, base, fc, sign);
     }
     else 
     {
-      load_ubyte_from_base(ir, base, fc, sign);
+      success = load_ubyte_from_base(ir, base, fc, sign);
     }
   }
   else 
   {
-    load_word_from_base(ir, base, fc, sign);
+    success = load_word_from_base(ir, base, fc, sign);
   }
+  if (!success)
+  {
+
   // now load from dereferenced value
-  rr = th_offset_to_reg(fc, sign);
+  int rr = th_offset_to_reg(fc, sign);
   if (btype == VT_SHORT)
   {
     if (ft & VT_UNSIGNED) th_ldrh_reg(ir, base, rr);
@@ -2860,19 +1553,21 @@ void load_vt_lval_vt_local(int r, SValue *sv, int ft, int fc, int sign, uint32_t
   }
   else th_ldr_reg(ir, base, rr);
 }
+}
 
 void load_vt_const(int r, SValue *sv)
 {
+  TRACE("'load_vt_const' r: %i, const: %i, sym: %i", r, (int)sv->c.i, (sv->r & VT_SYM) == VT_SYM);
   r = intr(r);
   if (sv->r & VT_SYM)
   {
     load_full_const(r, sv->c.i, sv->sym);
-    return;
   }
-  // if (!th_mov_imm(r, sv->c.i))
-  // {
-  //   load_full_const(r, sv->c.i, 0);
-  // }
+  else 
+  {
+    int ok = th_mov_imm(r, sv->c.i);
+    if (!ok) load_full_const(r, sv->c.i, 0);
+  }
 }
 
 void load_vt_local(int r, SValue *sv)
@@ -2904,18 +1599,18 @@ void load_vt_cmp(int r, SValue *sv)
   // TODO: verify and optimize
   if (rr < 8)
   {
-    th_b_t1(firstcond, 4);
+    ot(th_b_t1(firstcond, 4));
     th_mov_imm(rr, 1);
     th_mov_imm(rr, 0);
   }
   else 
   {
-    th_push(R_R1);
-    th_b_t1(firstcond, 4);
+    ot(th_push(R_R1));
+    ot(th_b_t1(firstcond, 4));
     th_mov_imm(R_R1, 1);
     th_mov_imm(R_R1, 0);
     th_mov_reg(rr, R_R1);
-    th_pop(R_R1);
+    ot(th_pop(R_R1));
 
   }
 #else 
@@ -2957,6 +1652,8 @@ void load(int r, SValue *sv)
   }
 
   v = fr & VT_VALMASK;
+
+  printf("FC: %d, v: %d, fr: %d\n", fc, v, fr);
   // load lvalue from 
   if (fr & VT_LVAL)
   {
@@ -2969,8 +1666,9 @@ void load(int r, SValue *sv)
       v1.type.t = VT_PTR;
       v1.r = VT_LOCAL | VT_LVAL;
       v1.c.i = sv->c.i;
-      load(TREG_LR, &v1);
-      base = 14;
+
+      TRACE("l1");
+      load(base = 14, &v1);
       fc = sign=0;
       v = VT_LOCAL;
     }
@@ -2980,8 +1678,8 @@ void load(int r, SValue *sv)
       v1.r = fr&~VT_LVAL;
       v1.c.i = sv->c.i;
       v1.sym = sv->sym;
-      load(TREG_LR, &v1);
-      base = 14;
+      TRACE("l2");
+      load(base = 14, &v1);
       fc = sign=0;
       v = VT_LOCAL;
     }
@@ -3006,6 +1704,7 @@ void load(int r, SValue *sv)
     if (is_float(ft)) tcc_error("compiler_error: unknown load mode\n");
     else 
     {
+      TRACE("mov r %i v %i", r, v);
       th_mov_reg(r, v);
       return;
     }
@@ -3014,31 +1713,207 @@ void load(int r, SValue *sv)
 
 }
 
+
+static int is_zero_on_stack(int pos)
+{
+  if ((vtop[pos].r & (VT_VALMASK | VT_LVAL | VT_SYM)) != VT_CONST)
+    return 0;
+  if (vtop[pos].type.t == VT_FLOAT)
+    return vtop[pos].c.f == 0.f;
+  if (vtop[pos].type.t == VT_DOUBLE)
+    return vtop[pos].c.d == 0.0;
+  return vtop[pos].c.ld = 0.l;
+}
+
+
+
+static void gen_opf_regular(uint32_t opc, int fneg)
+{
+  uint32_t inst = 0;
+  int r = gv(RC_FLOAT);
+  opc |= 0xee000a00 | vfpr(r);
+  r = regmask(r);
+  if (!fneg) {
+    int r2;
+    vswap();
+    r2 = gv(RC_FLOAT);
+    opc |= vfpr(r2) << 16;
+    r |= regmask(r2);
+  }
+  vtop->r = get_reg_ex(RC_FLOAT, r);
+  if (!fneg) --vtop;
+  inst = opc | (vfpr(vtop->r) << 12);
+  o(inst >> 16);
+  o(inst);
+}
+
+static void gen_opf_cmp(uint32_t opc, uint32_t op) 
+{
+  uint32_t inst = 0;
+  opc |= 0xeeb40a40;
+  if (op != TOK_EQ && op != TOK_NE) opc |= 0x80;
+
+  if (is_zero_on_stack(0)) {
+    --vtop;
+    inst = opc | 0x10000 | (vfpr(gv(RC_FLOAT)) << 12);
+  } else {
+    opc |= vfpr(gv(RC_FLOAT));
+    vswap();
+    inst = opc | (vfpr(gv(RC_FLOAT)) << 12);
+    --vtop;
+  }
+
+  o(inst >> 16);
+  o(inst);
+  th_vmrs(15);
+}
+
 ST_FUNC void gen_cvt_itof(int t)
 {
-  TRACE("'gen_cvt_itof'");
+  const int bt = vtop->type.t & VT_BTYPE;
+  TRACE("gen_cvt_itof, t: 0x%x", t);
 
+  if (bt == VT_INT || bt == VT_SHORT || bt == VT_BYTE) {
+    uint32_t r = intr(gv(RC_INT));
+    uint32_t r2 = vfpr(vtop->r = get_reg(RC_FLOAT));
+    uint32_t op = (vtop->type.t & VT_UNSIGNED) ? 0 : 1;
+    th_vmov_gp_sp(r, r2, 0);
+    th_vcvt_fp_int(r2, r2, 0, (t & VT_BYTE) != VT_FLOAT, op);
+    return;
+  } else if (bt == VT_LLONG) {
+    int func;
+    CType *func_type = 0;
+    if ((t & VT_BTYPE) == VT_FLOAT) {
+      func_type = &func_float_type;
+      if (vtop->type.t & VT_UNSIGNED)
+        func=TOK___floatundisf;
+      else 
+        func=TOK___floatdisf;
+    } else if ((t & VT_BTYPE) == VT_DOUBLE || (t & VT_BTYPE) == VT_LDOUBLE) {
+      func_type = &func_double_type;
+      if (vtop->type.t & VT_UNSIGNED)
+        func = TOK___floatundidf;
+      else 
+        func = TOK___floatdidf;
+    }
 
+    if (func_type) {
+      vpush_helper_func(func);
+      vswap();
+      gfunc_call(1);
+      vpushi(0);
+      vtop->r=TREG_F0;
+      return;
+    }
+  }
 }
 
 /* convert fp to int 't' type */
 void gen_cvt_ftoi(int t)
 {
-  TRACE("'gen_cvt_ftoi'");
+  uint32_t r2 = vtop->type.t & VT_BTYPE;
+  int u = t & VT_UNSIGNED;
+  TRACE("gen_cvt_ftoi t: 0x%x", t);
+  
+  t &= VT_BTYPE;
 
-
+  if (t == VT_INT) {
+    uint32_t opc = u ? 0x4 : 0x5;
+    uint32_t r = vfpr(gv(RC_FLOAT));
+    uint32_t rr = intr(vtop->r = get_reg(RC_INT));
+    th_vcvt_fp_int(rr, r, opc, (r2 & VT_BTYPE) != VT_FLOAT, 1);
+    th_vmov_gp_sp(rr, rr, 1);
+    return;
+  } else if (t == VT_LLONG) {
+    int func = 0;
+    if (r2 == VT_FLOAT) 
+      func = TOK___fixsfdi;
+    else if (r2 == VT_LDOUBLE || r2 == VT_DOUBLE)
+      func = TOK___fixdfdi;
+    
+    if (func) {
+      vpush_helper_func(func);
+      vswap();
+      gfunc_call(1);
+      vpushi(0);
+      if (t == VT_LLONG)
+        vtop->r2 = REG_IRE2;
+      vtop->r = REG_IRET;
+      return;
+    }
+  }
+  tcc_error("compiler_error: unimplemented float to integer");
 }
 
 void gen_cvt_ftof(int t)
 {
-  TRACE("'gen_cvt_ftof'");
-
+  TRACE("gen_cvt_ftof t: 0x%x", t);
+  if (((vtop->type.t & VT_BYTE) == VT_FLOAT) != ((t & VT_BTYPE) == VT_FLOAT))
+  {
+    uint32_t r = vfpr(gv(RC_FLOAT));
+    if ((t & VT_BTYPE) != VT_FLOAT)
+      th_vcvt_float_to_double(r, r);
+    else 
+      th_vcvt_double_to_float(r, r);
+  }
 }
+
 
 void gen_opf(int op)
 {
-  TRACE("'gen_opf'");
+  const uint32_t is_double = ((vtop->type.t & VT_BYTE) != VT_FLOAT) ? 0x100 : 0;
 
+  TRACE("gen_opf op: 0x%x(%c)", op, op);
+  switch (op)
+  {
+    case '+': {
+      if (is_zero_on_stack(-1)) vswap();
+      if (is_zero_on_stack(0)) {
+        --vtop;
+        return;
+      }
+      return gen_opf_regular(is_double | 0x00300000, 0);
+    }
+    case '-': {
+      if (is_zero_on_stack(0)) {
+        --vtop;
+        return;
+      }
+      if (is_zero_on_stack(-1)) {
+        vswap();
+        --vtop;
+        return gen_opf_regular(is_double | 0x00b10040, 1);
+      }
+      else 
+        return gen_opf_regular(is_double | 0x00300040, 0);
+    }
+    case '*': 
+      return gen_opf_regular(is_double | 0x002000000, 0);
+    case '/':
+      return gen_opf_regular(is_double | 0x008000000, 0);
+    default: {
+      if (op < TOK_ULT || op > TOK_GT) 
+        tcc_error("compiler_error: unknown floating-point operation: 0x%x", op);
+      if (is_zero_on_stack(-1)) {
+        vswap();
+        switch (op) {
+          case TOK_LT: op = TOK_GT; break;
+          case TOK_GE: op = TOK_ULE; break;
+          case TOK_LE: op = TOK_GE; break;
+          case TOK_GT: op = TOK_ULT; break;
+        }
+      } 
+      gen_opf_cmp(is_double, op);
+
+      switch (op) {
+        case TOK_LE: op = TOK_ULE; break;
+        case TOK_LT: op = TOK_ULT; break;
+        case TOK_UGE: op = TOK_GE; break;
+        case TOK_UGT: op = TOK_GT; break;
+      }
+      vset_VT_CMP(op);
+    }
+  }
 }
 
 // operation on two registers
@@ -3062,7 +1937,7 @@ void gen_opi_regs(int opc, int c)
     case 9: th_add_reg(r, c, fr); return;
     case 10: th_adc_reg(r, c, fr); return;
     case 12: th_sbc_reg(r, c, fr); return;
-    case 15: th_sbc_reg(r, fr, c); return;
+    case 14: th_sbc_reg(r, fr, c); return;
     case 21: th_cmp_reg(c, fr); return;
     case 24: th_orr_reg(r, c, fr); return;
     default: tcc_error("compiler_error: 'gen_opi_regs' unhandled case opc: %d, c: %d, r: %d, fr: %d\n", opc, c, r, fr);
@@ -3091,6 +1966,12 @@ void gen_opi_regular(int opc, int c)
       case 9: ok = th_add_imm(r, r, vtop->c.i); break;
       case 10: ok = th_adc_imm(r, r, vtop->c.i); break;
       case 12: ok = th_sbc_imm(r, r, vtop->c.i); break;
+      case 14: ok = 0; break;
+      case 21: {
+        const thumb_opcode ins = th_cmp_imm(c, vtop->c.i); 
+        ok = is_valid_opcode(ins);
+        if (ok) ot(ins);
+      } break;
       case 24: ok = th_orr_imm(r, r, vtop->c.i); break;
       default: tcc_error("compiler_error: 'gen_opi_regular' unhandled case opc: %d, c: %d, r: %d\n", opc, c, r);
     }
@@ -3121,6 +2002,7 @@ void gen_opi_notshift(int op, int opc)
   c = intr(gv(RC_INT));
   vswap();
 
+  gen_opi_regular(opc, c);
   --vtop;
 
   if (op >= TOK_ULT && op <= TOK_GT) vset_VT_CMP(op);
@@ -3163,7 +2045,7 @@ void gen_opi_shift(int opc)
 void gen_opi(int op)
 {
   uint32_t r, fr;
-  TRACE("'gen_opi'");
+  TRACE("'gen_opi', op: 0x%x, %c", op, op);
   switch (op) {
     case '+': return gen_opi_notshift(op, 0x08);
     case TOK_ADDC1: return gen_opi_notshift(op, 0x09);
@@ -3220,11 +2102,11 @@ void gen_opi(int op)
         else break;
       }
 
-      th_push(1 << rr);
+      ot(th_push(1 << rr));
       th_sdiv(rr, r, fr);
       th_mul(fr, fr, rr);
       th_sub_reg(r, r, fr);
-      th_pop(1 << rr);
+      ot(th_pop(1 << rr));
       return;
     }
     case TOK_UMOD:
@@ -3242,11 +2124,11 @@ void gen_opi(int op)
         else break;
       }
 
-      th_push(1 << rr);
+      ot(th_push(1 << rr));
       th_udiv(rr, r, fr);
       th_mul(fr, fr, rr);
       th_sub_reg(r, r, fr);
-      th_pop(1 << rr);
+      ot(th_pop(1 << rr));
       return;
     }
     case TOK_UMULL:

@@ -21,7 +21,7 @@
 #include "tcc.h"
 
 /* Define this to get some debug output during relocation processing.  */
-#undef DEBUG_RELOC
+#define DEBUG_RELOC
 
 /********************************************************/
 /* global variables */
@@ -1111,8 +1111,9 @@ static void relocate_section(TCCState *s1, Section *s, Section *sr)
     unsigned char *ptr;
     addr_t tgt, addr;
     int is_dwarf = s->sh_num >= s1->dwlo && s->sh_num < s1->dwhi;
-
+    int id = 0;
     qrel = (ElfW_Rel *)sr->data;
+
     for_each_elem(sr, 0, rel, ElfW_Rel) {
         ptr = s->data + rel->r_offset;
         sym_index = ELFW(R_SYM)(rel->r_info);
@@ -2369,7 +2370,6 @@ static int layout_sections(TCCState *s1, int *sec_order, struct dyn_inf *d)
         addr = (addr + align) & ~align;
         file_offset += (int)(addr - tmp);
         s->sh_offset = file_offset;
-        printf("Writing address at: %x\n", addr);
         s->sh_addr = addr;
 
         if (f & 1<<8) {
@@ -2407,8 +2407,7 @@ static int layout_sections(TCCState *s1, int *sec_order, struct dyn_inf *d)
                 roinf->sh_offset = s->sh_offset;
                 roinf->sh_addr = s->sh_addr;
                 roinf->sh_addralign = 1;
-	    }
-            printf("2406: shsize: 0x%x, addr: %x, roinf_sh_addr: %x\n", s->sh_size, addr, roinf->sh_addr);
+	        }
             roinf->sh_size = (addr - roinf->sh_addr) + s->sh_size;
         }
 
@@ -2422,7 +2421,6 @@ static int layout_sections(TCCState *s1, int *sec_order, struct dyn_inf *d)
             if (n == 1) {
                 ph->p_memsz += elf_header_offset;
             }
-            printf("filesz: 0x%x, memsz: 0x%x, addr: 0x%x, n: 0x%x\n", ph->p_filesz, ph->p_memsz, addr, n);
         }
     }
 

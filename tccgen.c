@@ -8378,13 +8378,7 @@ static void gen_function(Sym *sym)
     func_var = sym->type.ref->f.func_type == FUNC_ELLIPSIS;
 
     /* NOTE: we patch the symbol size later */
-    #ifdef TCC_TARGET_ARM_THUMB
-
-    put_extern_sym(sym, cur_text_section, ind + 1, 0);
-    #else
-
     put_extern_sym(sym, cur_text_section, ind, 0);
-    #endif
 
     if (sym->type.ref->f.func_ctor)
         add_array (tcc_state, ".init_array", sym->c);
