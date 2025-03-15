@@ -234,13 +234,13 @@ ST_FUNC Section *new_section(TCCState *s1, const char *name, int sh_type, int sh
     case SHT_DYNAMIC:
     case SHT_GNU_verneed:
     case SHT_GNU_verdef:
-        sec->sh_addralign = PTR_SIZE;
+        sec->sh_addralign = 8;//PTR_SIZE;
         break;
     case SHT_STRTAB:
         sec->sh_addralign = 1;
         break;
     default:
-        sec->sh_addralign =  PTR_SIZE; /* gcc/pcc default alignment */
+        sec->sh_addralign =  8;//PTR_SIZE; /* gcc/pcc default alignment */
         break;
     }
 
@@ -2371,7 +2371,9 @@ static int layout_sections(TCCState *s1, int *sec_order, struct dyn_inf *d)
         file_offset += (int)(addr - tmp);
         s->sh_offset = file_offset;
         s->sh_addr = addr;
-
+        s->sh_size = (s->sh_size + align) & ~align;
+        printf("sh addr: 0x%lx, size: 0x%lx, align: 0x%lx\n", s->sh_addr, s->sh_size, s->sh_addralign);
+ 
         if (f & 1<<8) {
             /* set new program header */
             ph = &d->phdr[phfill + n];

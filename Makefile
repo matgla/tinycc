@@ -108,7 +108,7 @@ DEF-arm-eabihf     = $(DEF-arm-eabi) -DTCC_ARM_HARDFLOAT
 DEF-arm            = $(DEF-arm-eabihf)
 DEF-arm-NetBSD     = $(DEF-arm-eabihf) -DTARGETOS_NetBSD
 DEF-arm-wince      = $(DEF-arm-eabihf) -DTCC_TARGET_PE
-DEF-armv8m        = $(DEF-arm-eabihf) -DTCC_TARGET_ARM_THUMB -DTCC_TARGET_ARM_ARCHV8M
+DEF-armv8m         = $(DEF-arm-eabihf) -DTCC_TARGET_ARM_THUMB -DTCC_TARGET_ARM_ARCHV8M
 DEF-arm64          = -DTCC_TARGET_ARM64
 DEF-arm64-osx      = $(DEF-arm64) -DTCC_TARGET_MACHO
 DEF-arm64-FreeBSD  = $(DEF-arm64) -DTARGETOS_FreeBSD
@@ -139,9 +139,11 @@ TCC_X = armv8m
 # cross libtcc1.a targets to build
 LIBTCC1_X = $(filter-out c67,$(TCC_X))
 
+
 PROGS_CROSS = $(foreach X,$(TCC_X),$X-tcc$(EXESUF))
 LIBTCC1_CROSS = $(foreach X,$(LIBTCC1_X),$X-libtcc1.a)
 
+$(info $(LIBTCC1_CROSS))
 # build cross compilers & libs
 cross: $(LIBTCC1_CROSS) $(PROGS_CROSS)
 
