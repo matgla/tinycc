@@ -2261,7 +2261,9 @@ static int sort_sections(TCCState *s1, int *sec_order, struct dyn_inf *d)
                 f0 = f, ++n, f |= 1<<8;
         }
         sec_cls[i] = f;
+#ifdef DEBUG_RELOC
         printf("ph %d sec %02d : %3X %3X  %8.2X  %04X  %s\n", (f>0) * n, i, f, k, s->sh_type, (int)s->sh_size, s->name);
+#endif
     }
     return n;
 }
@@ -2372,7 +2374,6 @@ static int layout_sections(TCCState *s1, int *sec_order, struct dyn_inf *d)
         s->sh_offset = file_offset;
         s->sh_addr = addr;
         s->sh_size = (s->sh_size + align) & ~align;
-        printf("sh addr: 0x%lx, size: 0x%lx, align: 0x%lx\n", s->sh_addr, s->sh_size, s->sh_addralign);
  
         if (f & 1<<8) {
             /* set new program header */

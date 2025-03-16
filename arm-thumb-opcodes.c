@@ -149,7 +149,7 @@ thumb_opcode th_b_t3(uint16_t op, uint32_t imm) {
   const uint32_t enc = th_encbranch_b_t3(imm);
   return (thumb_opcode){
       .size = 4,
-      .opcode = (0xf0008000 | (op << 20) | enc),
+      .opcode = (0xf0008000 | (op << 22) | enc),
   };
 }
 
@@ -312,7 +312,7 @@ thumb_opcode th_bic_imm(uint16_t rd, uint16_t rn, uint32_t imm) {
 
 thumb_opcode th_and_imm(uint16_t rd, uint16_t rn, uint32_t imm) {
   thumb_opcode op = th_generic_op_imm(0xf000, rd, rn, imm);
-  return op.size != 0 ? op : th_bic_imm(rd, rn, -imm);
+  return op.size != 0 ? op : th_bic_imm(rd, rn, ~imm);
 }
 
 thumb_opcode th_and_reg(uint16_t rd, uint16_t rn, uint16_t rm) {
@@ -525,17 +525,18 @@ thumb_opcode th_orr_reg(uint16_t rd, uint16_t rn, uint16_t rm) {
 }
 
 thumb_opcode th_sub_imm(uint16_t rd, uint16_t rn, uint32_t imm) {
-  if (rd == rn && imm <= 255 && rd < 8) {
-    // T2
-    return (thumb_opcode){
-        .size = 2,
-        .opcode = (0x3800 | (rd << 8) | imm),
-    };
-  } else if (rd < 8 && rn < 8 && imm <= 7) {
+
+  if (rd < 8 && rn < 8 && imm <= 7) {
     // T1
     return (thumb_opcode){
         .size = 2,
         .opcode = (0x1e00 | (imm << 6) | (rn << 3) | rd),
+    };
+  } else if (rd == rn && imm <= 255 && rd < 8) {
+    // T2
+    return (thumb_opcode){
+        .size = 2,
+        .opcode = (0x3800 | (rd << 8) | imm),
     };
   }
 #ifndef TCC_TARGET_ARM_ARCHV6M

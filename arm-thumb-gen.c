@@ -562,7 +562,9 @@ int decbranch(int pos) {
 
     xa = ret + pos + 4;
   } else {
-    tcc_error("internal error: decbranch unknown encoding pos 0x%x, inst: 0x%x\n", pos, xa);
+    tcc_error(
+        "internal error: decbranch unknown encoding pos 0x%x, inst: 0x%x\n",
+        pos, xa);
     return 0;
   }
 
@@ -887,7 +889,6 @@ void gfunc_prolog(Sym *func_sym) {
   sym = func_type->ref;
   func_vt = sym->type;
   func_var = (func_type->ref->f.func_type == FUNC_ELLIPSIS);
-
   n = 0;
   nf = 0;
   if ((func_vt.t & VT_BTYPE) == VT_STRUCT &&
@@ -929,8 +930,8 @@ void gfunc_prolog(Sym *func_sym) {
     func_nregs += nf;
   }
 
-  ot_check(th_push(0x5800)); // push {fp, ip, lr} (r11, r12, r14)
-  ot_check(th_mov_reg(11, 13));  // mov fp, sp
+  ot_check(th_push(0x5800));    // push {fp, ip, lr} (r11, r12, r14)
+  ot_check(th_mov_reg(11, 13)); // mov fp, sp
   func_sub_sp_offset = ind;
   ot_check(th_nop()); /* leave space for stack adjustment in epilog */
   ot_check(th_nop());
@@ -1020,7 +1021,7 @@ void gfunc_call(int nb_args) {
   if (args_size & 7) // stack must be 8-byte aligned according to AAPCS for EABI
   {
     args_size = (args_size + 7) & ~7;
-    ot_check(th_sub_sp_imm(R_SP, args_size % 8));
+    ot_check(th_sub_sp_imm(R_SP, 4));
   }
   nb_args += copy_params(nb_args, &plan, todo);
   tcc_free(plan.pplans);
@@ -1276,7 +1277,7 @@ void store(int r, SValue *sv) {
           int rr = th_offset_to_reg(fc, sign);
           ot_check(th_strh_reg(r, base, rr));
         }
-      } else if ((ft & VT_BTYPE) == VT_BOOL) {
+      } else if ((ft & VT_BTYPE) == VT_BYTE) {
         if (!ot(th_strb_imm(r, base, fc, sign ? 4 : 6))) {
           int rr = th_offset_to_reg(fc, sign);
           ot_check(th_strb_reg(r, base, rr));
@@ -1325,10 +1326,9 @@ static void load_full_const(int r, int32_t imm, struct Sym *sym) {
       }
     }
   }
-  printf("0x%x\n", imm);
   th_sym_d();
-  o(imm >> 16);
   o(imm & 0xffff);
+  o(imm >> 16);
   th_sym_t();
 
   if (pic) {
@@ -1464,7 +1464,7 @@ void load_vt_jmp_jmpi(int r, SValue *sv) {
   }
 #endif
   ot_check(th_mov_imm(intr(r), sv->r & 1));
-  ot_check(th_b_t2(2));
+  ot_check(th_b_t4(2));
   gsym(sv->c.i);
   ot_check(th_mov_imm(intr(r), (sv->r ^ 1) & 1));
 }
@@ -1486,7 +1486,6 @@ void load(int r, SValue *sv) {
 
   v = fr & VT_VALMASK;
 
-  printf("FC: %d, v: %d, fr: %d\n", fc, v, fr);
   // load lvalue from
   if (fr & VT_LVAL) {
     uint32_t base = R_FP;
@@ -1862,7 +1861,7 @@ void gen_opi_notshift(int op, int opc) {
 
   if ((vtop->r & VT_VALMASK) == VT_CMP ||
       (vtop->r & (VT_VALMASK & ~1)) == VT_JMP) {
-    tcc_error("compiler_error: unknown\n");
+    gv(RC_INT);
   }
 
   vswap();

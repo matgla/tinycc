@@ -33,6 +33,8 @@ enum float_abi {
 #include "arm-thumb-opcodes.h"
 #include "tcc.h"
 
+#define DEBUG_RELOC
+
 #ifdef NEED_RELOC_TYPE
 /* Returns 1 for a code relocation, 0 for a data relocation. For unknown
    relocations, returns -1. */
@@ -149,7 +151,6 @@ ST_FUNC unsigned create_plt_entry(TCCState *s1, unsigned got_offset,
   /* save GOT offset for relocate_plt */
   p = section_ptr_add(plt, 24);
   write32le(p + 4, got_offset);
-  printf("got offset at: 0x%x\n", got_offset);
   return plt_offset;
 }
 
@@ -201,8 +202,7 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
 
   sym_index = ELFW(R_SYM)(rel->r_info);
   sym = &((ElfW(Sym) *)symtab_section->data)[sym_index];
-  fprintf(stdout, " handle reloc type %d at %x [%p] to %x\n", type,
-          (unsigned)addr, ptr, (unsigned)val);
+  printf("relocate type: %d\n", type);
   switch (type) {
   case R_ARM_PC24:
   case R_ARM_CALL:
@@ -273,23 +273,28 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
       to_plt = (val >= plt->sh_addr) && (val < plt->sh_addr + plt->data_offset);
     }
     is_call = (type == R_ARM_THM_PC22);
+    Section *text;
+    char *name = (char *)symtab_section->link->data + sym->st_name;
+    text = s1->sections[sym->st_shndx];
+    printf("Text %s, 0x%x\n", name, (uint16_t)(ptr - text->data));
 
     if (!to_plt && !is_call) {
-      int index;
-      uint8_t *p;
-      char *name, buf[1024];
-      Section *text;
+      // int index;
+      // uint8_t *p;
+      // char *name, buf[1024];
+      // Section *text;
 
-      name = (char *)symtab_section->link->data + sym->st_name;
-      text = s1->sections[sym->st_shndx];
+      // name = (char *)symtab_section->link->data + sym->st_name;
+      // text = s1->sections[sym->st_shndx];
+
       /* Modify reloc to target a thumb stub to switch to ARM */
-      val = text->data_offset + 1;
-      rel->r_info = ELFW(R_INFO)(index, type);
+      // val += 1;
+      // rel->r_info = ELFW(R_INFO)(index, type);
       /* Create a thumb stub function to switch to ARM mode */
-      p = section_ptr_add(text, 8);
-      write32le(p, 0x4778);         /* bx pc */
-      write32le(p + 2, 0x46c0);     /* nop   */
-      write32le(p + 4, 0xeafffffe); /* b $sym */
+      // p = section_ptr_add(text, 8);
+      // write32le(p, 0x4778);         /* bx pc */
+      // write32le(p + 2, 0x46c0);     /* nop   */
+      // write32le(p + 4, 0xeafffffe); /* b $sym */
     }
 
     /* Compute final offset */
@@ -308,6 +313,7 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
       if ((val & 2) || (!is_call && !to_plt))
         tcc_error_noabort("can't relocate value at %x,%d", addr, type);
 
+    printf("Final offset: 0x%x\n", x);
     /* Compute and store final offset */
     s = (x >> 24) & 1;
     i1 = (x >> 23) & 1;
@@ -316,6 +322,7 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
     j2 = s ^ (i2 ^ 1);
     imm10 = (x >> 12) & 0x3ff;
     imm11 = (x >> 1) & 0x7ff;
+    printf("Original: 0x%x\n", *(uint16_t *)ptr);
     (*(uint16_t *)ptr) = (uint16_t)((hi & 0xf800) | (s << 10) | imm10);
     (*(uint16_t *)(ptr + 2)) =
         (uint16_t)((lo & 0xc000) | (j1 << 13) | blx_bit | (j2 << 11) | imm11);
@@ -388,6 +395,9 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
         qrel++;
       }
     }
+
+    printf("R_ARM_ABS32: value: 0x%lx, orig: 0x%x, addr: 0x%lx\n", val,
+           *(int *)ptr, addr);
     *(int *)ptr += val;
     return;
   case R_ARM_REL32:
