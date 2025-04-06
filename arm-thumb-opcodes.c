@@ -173,15 +173,15 @@ thumb_opcode th_mov_reg(uint16_t rd, uint16_t rm) {
   };
 }
 
-thumb_opcode th_mov_imm(uint16_t rd, uint16_t imm) {
-  if (rd <= 7 && imm <= 255) {
+thumb_opcode th_mov_imm(uint16_t rd, uint32_t imm) {
+  if (rd <= 7 && imm >= 0 && imm <= 255) {
     return (thumb_opcode){
         .size = 2,
         .opcode = 0x2000 | (rd << 8) | imm,
     };
   }
 #ifndef TCC_TARGET_ARM_ARCHV6M
-  else if (imm <= 0xffff && rd != R_SP && rd != R_PC) {
+  else if (imm >= 0 && imm <= 0xffff && rd != R_SP && rd != R_PC) {
     const uint16_t i = (imm >> 11) & 1;
     const uint16_t imm4 = (imm >> 12) & 0xf;
     const uint16_t imm3 = (imm >> 8) & 0x7;
@@ -190,12 +190,13 @@ thumb_opcode th_mov_imm(uint16_t rd, uint16_t imm) {
         .opcode = 0xf2400000 | (i << 18) | (imm4 << 16) | (imm3 << 12) |
                   (rd << 8) | (imm & 0xff),
     };
-  } else if (imm <= 0xffff && rd != R_SP && rd != R_PC) {
+  } else if (rd != R_SP && rd != R_PC) {
     const uint32_t enc = th_pack_const(imm);
-    return (thumb_opcode){
-        .size = 4,
-        .opcode = 0xf04f0000 | enc | ((rd & 0xf) << 8),
-    };
+    if (enc)
+      return (thumb_opcode){
+          .size = 4,
+          .opcode = 0xf04f0000 | enc | ((rd & 0xf) << 8),
+      };
   }
 #endif
   return (thumb_opcode){

@@ -202,7 +202,6 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
 
   sym_index = ELFW(R_SYM)(rel->r_info);
   sym = &((ElfW(Sym) *)symtab_section->data)[sym_index];
-  printf("relocate type: %d\n", type);
   switch (type) {
   case R_ARM_PC24:
   case R_ARM_CALL:
@@ -276,7 +275,6 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
     Section *text;
     char *name = (char *)symtab_section->link->data + sym->st_name;
     text = s1->sections[sym->st_shndx];
-    printf("Text %s, 0x%x\n", name, (uint16_t)(ptr - text->data));
 
     if (!to_plt && !is_call) {
       // int index;
@@ -313,7 +311,6 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
       if ((val & 2) || (!is_call && !to_plt))
         tcc_error_noabort("can't relocate value at %x,%d", addr, type);
 
-    printf("Final offset: 0x%x\n", x);
     /* Compute and store final offset */
     s = (x >> 24) & 1;
     i1 = (x >> 23) & 1;
@@ -322,7 +319,6 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
     j2 = s ^ (i2 ^ 1);
     imm10 = (x >> 12) & 0x3ff;
     imm11 = (x >> 1) & 0x7ff;
-    printf("Original: 0x%x\n", *(uint16_t *)ptr);
     (*(uint16_t *)ptr) = (uint16_t)((hi & 0xf800) | (s << 10) | imm10);
     (*(uint16_t *)(ptr + 2)) =
         (uint16_t)((lo & 0xc000) | (j1 << 13) | blx_bit | (j2 << 11) | imm11);
@@ -396,8 +392,6 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
       }
     }
 
-    printf("R_ARM_ABS32: value: 0x%lx, orig: 0x%x, addr: 0x%lx\n", val,
-           *(int *)ptr, addr);
     *(int *)ptr += val;
     return;
   case R_ARM_REL32:
@@ -415,8 +409,8 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
     return;
   case R_ARM_GOT_PREL:
     /* we load the pc relative got offset */
-    *(int *)ptr +=
-        s1->got->sh_addr + get_sym_attr(s1, sym_index, 0)->got_offset - addr;
+    *(int *)ptr += s1->got->sh_addr +
+                   get_sym_attr(s1, sym_index, 0)->got_offset - addr - 8;
     return;
   case R_ARM_COPY:
     return;

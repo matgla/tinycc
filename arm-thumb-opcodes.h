@@ -107,7 +107,7 @@ thumb_opcode th_b_t3(uint16_t op, uint32_t imm);
 thumb_opcode th_b_t4(int32_t imm);
 
 thumb_opcode th_mov_reg(uint16_t rd, uint16_t rm);
-thumb_opcode th_mov_imm(uint16_t rd, uint16_t imm);
+thumb_opcode th_mov_imm(uint16_t rd, uint32_t imm);
 
 thumb_opcode th_generic_op_imm_with_status(uint16_t op, uint16_t rd,
                                            uint16_t rn, uint32_t imm,
