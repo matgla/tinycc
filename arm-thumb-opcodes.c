@@ -346,8 +346,6 @@ thumb_opcode th_xor_reg(uint16_t rd, uint16_t rn, uint16_t rm) {
   }
 #ifndef TCC_TARGET_ARM_ARCHV6M
   else if (rd != R_SP && rd != R_PC && rn != R_SP && rn != R_PC) {
-    o(0xea80 | rn);
-    o((rd << 8) | rm);
     return (thumb_opcode){
         .size = 4,
         .opcode = 0xea800000 | (rn << 16) | (rd << 8) | rm,
@@ -368,8 +366,6 @@ thumb_opcode th_rsb_reg(uint16_t rd, uint16_t rn, uint16_t rm) {
 #ifndef TCC_TARGET_ARM_ARCHV6M
   if (rd != R_SP && rd != R_PC && rn != R_SP && rn != R_PC && rm != R_SP &&
       rn != R_SP) {
-    o(0xebc0 | rn);
-    o((rd << 8) | rm);
     return (thumb_opcode){
         .size = 4,
         .opcode = 0xebc00000 | (rn << 16) | (rd << 8) | rm,
@@ -391,8 +387,6 @@ thumb_opcode th_sub_reg(uint16_t rd, uint16_t rn, uint16_t rm) {
   }
 #ifndef TCC_TARGET_ARM_ARCHV6M
   else if (rd != R_SP && rd != R_PC && rn != R_SP && rn != R_PC) {
-    o(0xeba0 | rn);
-    o((rd << 8) | rm);
     return (thumb_opcode){
         .size = 4,
         .opcode = 0xeba00000 | (rn << 16) | (rd << 8) | rm,
@@ -415,8 +409,6 @@ thumb_opcode th_adc_reg(uint16_t rd, uint16_t rn, uint16_t rm) {
 #ifndef TCC_TARGET_ARM_ARCHV6M
   else if (rd != R_SP && rd != R_PC && rn != R_SP && rn != R_PC && rm != R_SP &&
            rm != R_PC) {
-    o(0xeb40 | rn);
-    o((rd << 8) | rm);
     return (thumb_opcode){
         .size = 4,
         .opcode = 0xeb400000 | (rn << 16) | (rd << 8) | rm,
@@ -461,7 +453,6 @@ thumb_opcode th_orr_imm(uint16_t rd, uint16_t rn, uint32_t imm) {
 
 thumb_opcode th_sbc_reg(uint16_t rd, uint16_t rn, uint16_t rm) {
   if (rd == rn && rm < 8 && rn < 8) {
-    o(0x4180 | (rm << 3) | rd);
     return (thumb_opcode){
         .size = 2,
         .opcode = 0x4180 | (rm << 3) | rd,
@@ -639,8 +630,6 @@ thumb_opcode th_ldrsh_reg(uint32_t rt, uint32_t rn, uint32_t rm) {
   }
 #ifndef TCC_TARGET_ARM_ARCHV6M
   else if (rt != R_SP && rm != R_SP && rn != R_SP) {
-    o(0xf930 | (rn & 0x0f));
-    o(((rt & 0xf) << 12) | (rm & 0xf));
     return (thumb_opcode){
         .size = 4,
         .opcode = 0xf9300000 | (rn << 16) | (rt << 12) | rm,
@@ -684,7 +673,6 @@ thumb_opcode th_ldrh_imm(uint16_t rt, uint16_t rn, uint16_t imm, uint16_t puw) {
 thumb_opcode th_ldrh_reg(uint32_t rt, uint32_t rn, uint32_t rm) {
   // puw == 6 means positive offset on rn, so T1 encoding can be used
   if (rm < 8 && rt < 8 && rn < 8) {
-    o(0x5a00 | (rm << 6) | (rn << 3) | rt);
     return (thumb_opcode){
         .size = 2,
         .opcode = 0x5a00 | (rm << 6) | (rn << 3) | rt,
@@ -786,8 +774,6 @@ thumb_opcode th_ldrb_reg(uint32_t rt, uint32_t rn, uint32_t rm) {
   }
 #ifndef TCC_TARGET_ARM_ARCHV6M
   else if (rt != R_SP && rm != R_SP && rm != R_PC) {
-    o(0xf810 | (rn & 0xf));
-    o(((rt & 0xf) << 12) | (rm & 0xf));
     return (thumb_opcode){
         .size = 4,
         .opcode = 0xf8100000 | (rn << 16) | (rt << 12) | rm,
@@ -839,7 +825,6 @@ thumb_opcode th_ldr_imm(uint32_t rt, uint32_t rn, uint32_t imm, uint32_t puw) {
 
 thumb_opcode th_ldr_reg(uint32_t rt, uint32_t rn, uint32_t rm) {
   if (rm < 8 && rt < 8 && rn < 8) {
-    o(0x5800 | (rm << 6) | (rn << 3) | rt);
     return (thumb_opcode){
         .size = 2,
         .opcode = (0x5800 | (rm << 6) | (rn << 3) | rt),
@@ -847,8 +832,6 @@ thumb_opcode th_ldr_reg(uint32_t rt, uint32_t rn, uint32_t rm) {
   }
 #ifndef TCC_TARGET_ARM_ARCHV6M
   else if (rt != R_SP && rm != R_SP && rm != R_PC) {
-    o(0xf850 | (rn & 0xf));
-    o(((rt & 0xf) << 12) | (rm & 0xf));
     return (thumb_opcode){
         .size = 4,
         .opcode = 0xf8500000 | (rn << 16) | (rt << 12) | rm,
@@ -1056,8 +1039,6 @@ thumb_opcode th_str_reg(uint32_t rt, uint32_t rn, uint32_t rm) {
   }
 #ifndef TCC_TARGET_ARM_ARCHV6M
   else if (rt != R_SP && rm != R_SP && rm != R_PC) {
-    o(0xf840 | (rn & 0xf));
-    o(((rt & 0xf) << 12) | (rm & 0xf));
     return (thumb_opcode){
         .size = 4,
         .opcode = (0xf8400000 | (rn << 16) | (rt << 12) | rm),
@@ -1366,8 +1347,6 @@ thumb_opcode th_vmov_register(uint16_t vd, uint16_t vm) {
     const uint16_t m = vm & 1;
     vd >>= 1;
     vm >>= 1;
-    o(0xeeb0 | (d << 6));
-    o(0x0a40 | (vd << 12) | (m << 5) | vm);
     return (thumb_opcode){
         .size = 4,
         .opcode = 0xeeb00a40 | (d << 22) | (vd << 12) | (m << 5) | vm,

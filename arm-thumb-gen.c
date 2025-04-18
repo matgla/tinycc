@@ -883,7 +883,7 @@ void gfunc_prolog(Sym *func_sym) {
 
   struct avail_regs avregs = AVAIL_REGS_INITIALIZER;
 
-  TRACE("########## gfunc_prolog ########## func_vt.t %d ",
+  TRACE("########## gfunc_prolog ########## func_vt.t %d",
         func_vt.t & VT_BTYPE);
 
   sym = func_type->ref;
@@ -1066,9 +1066,15 @@ void gfunc_epilog(void) {
 
   if (diff > 0) {
     x = gen_th_sub_sp_imm(R_SP, diff);
-    if (x.size != 0)
-      *(uint32_t *)(cur_text_section->data + func_sub_sp_offset) = x.opcode;
-    else
+    if (x.size == 2)
+      *(uint16_t *)(cur_text_section->data + func_sub_sp_offset) =
+          x.opcode & 0xffff;
+    else if (x.size == 4) {
+      *(uint16_t *)(cur_text_section->data + func_sub_sp_offset) =
+          x.opcode >> 16;
+      *(uint16_t *)(cur_text_section->data + func_sub_sp_offset + 2) =
+          x.opcode & 0xffff;
+    } else
       tcc_error("compiler_error: failed to generate stack adjustment\n");
   }
 
@@ -1285,9 +1291,12 @@ void store(int r, SValue *sv) {
       } else {
         TRACE("store: sign: %x, r: %x, base: %x, fc: %x", sign, r, base, fc);
         if (!ot(th_str_imm(r, base, fc, sign ? 4 : 6))) {
+          TRACE("th_offset");
           int rr = th_offset_to_reg(fc, sign);
+          TRACE("RR: %d", rr);
           ot_check(th_str_reg(r, base, rr));
         }
+        TRACE("done");
       }
     }
   }
