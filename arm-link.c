@@ -33,8 +33,6 @@ enum float_abi {
 #include "arm-thumb-opcodes.h"
 #include "tcc.h"
 
-#define DEBUG_RELOC 1
-
 #ifdef NEED_RELOC_TYPE
 /* Returns 1 for a code relocation, 0 for a data relocation. For unknown
    relocations, returns -1. */

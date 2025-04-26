@@ -16,7 +16,7 @@ XCC = $(XTCC)
 XAR = $(XTCC) -ar
 XFLAGS-unx = -B$(TOPSRC)
 XFLAGS-win = -B$(TOPSRC)/win32 -I$(TOPSRC)/include
-XFLAGS = $(XFLAGS$(XCFG))
+XFLAGS = $(XFLAGS$(XCFG)) $(CROSS_FLAGS)
 BFLAGS = -bt
 
 # in order to use gcc, type: make <target>-libtcc1-usegcc=yes

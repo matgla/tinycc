@@ -21,7 +21,7 @@
 #include "tcc.h"
 
 /* Define this to get some debug output during relocation processing.  */
-#define DEBUG_RELOC
+// #define DEBUG_RELOC
 
 /********************************************************/
 /* global variables */
@@ -1300,18 +1300,13 @@ static struct sym_attr *put_got_entry(TCCState *s1, int dyn_reloc_type,
                                       sym->st_info, 0, sym->st_shndx, name);
       put_elf_reloc(s1->dynsym, s_rel, got_offset, dyn_reloc_type,
                     attr->dyn_index);
-      printf("put_got_entry: %s -> 0x%lx, got_offset: 0x%x\n", name,
-             sym->st_value, got_offset);
     }
   } else {
     put_elf_reloc(symtab_section, s1->got, got_offset, dyn_reloc_type,
                   sym_index);
-    printf("put_got_entry: %s -> 0x%lx, got_offset: 0x%x\n", name,
-           sym->st_value, got_offset);
   }
 
   if (need_plt_entry) {
-    printf("Need PLT entry for %s\n", name);
     attr->plt_offset = create_plt_entry(s1, got_offset, attr);
 
     /* create a symbol 'sym@plt' for the PLT jump vector */
@@ -2160,9 +2155,6 @@ static int sort_sections(TCCState *s1, int *sec_order, struct dyn_inf *d) {
     }
 
     k += j;
-    printf("Section: i: %02d name: %s k: %3X j: %3X  sh_type: %8.2X sh_size: "
-           "%04X\n",
-           i, s->name, k, j, s->sh_type, (int)s->sh_size);
 
     if ((k & 0xfff0) == 0x140) {
       /* make RELRO section writable */

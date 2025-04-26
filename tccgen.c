@@ -8206,7 +8206,6 @@ static void gen_function(Sym *sym) {
   }
 
   funcname = get_tok_str(sym->v, NULL);
-  printf("------- GENFUNC '%s' --------\n", funcname);
   func_ind = ind;
   func_vt = sym->type.ref->type;
   func_var = sym->type.ref->f.func_type == FUNC_ELLIPSIS;
@@ -8290,7 +8289,6 @@ static void gen_inline_functions(TCCState *s) {
         tccpp_putfile(fn->filename);
         begin_macro(fn->func_str, 1);
         next();
-        printf("fn name: %s\n", funcname);
         cur_text_section = text_section;
         gen_function(sym);
         end_macro();
@@ -8494,7 +8492,6 @@ static int decl(int l) {
             cur_text_section = text_section;
           else if (cur_text_section->sh_num > bss_section->sh_num)
             cur_text_section->sh_flags = text_section->sh_flags;
-          printf("Generate: '%s'\n", funcname);
           gen_function(sym);
         }
         break;
