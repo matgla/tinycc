@@ -1348,6 +1348,7 @@ static void load_full_const(int r, int32_t imm, struct Sym *sym) {
       } else {
         ot_check(th_add_reg(r, r, R_PC));
         ot_check(th_ldr_imm(r, r, 0, 6));
+        ot_check(th_add_imm(r, r, imm));
       }
     }
   }

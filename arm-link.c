@@ -407,8 +407,10 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
     return;
   case R_ARM_GOT_PREL:
     /* we load the pc relative got offset */
-    *(int *)ptr += s1->got->sh_addr +
-                   get_sym_attr(s1, sym_index, 0)->got_offset - addr - 8;
+    printf("R_ARM_GOT_PREL: sh_addr: %x, got_offset: %x\n", s1->got->sh_addr,
+           get_sym_attr(s1, sym_index, 0)->got_offset);
+    *(int *)ptr = s1->got->sh_addr +
+                  get_sym_attr(s1, sym_index, 0)->got_offset - addr - 8;
     return;
   case R_ARM_COPY:
     return;
