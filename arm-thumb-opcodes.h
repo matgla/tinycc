@@ -161,6 +161,7 @@ thumb_opcode th_udiv(uint16_t rd, uint16_t rn, uint16_t rm);
 thumb_opcode th_sdiv(uint16_t rd, uint16_t rn, uint16_t rm);
 
 thumb_opcode th_add_sp_imm(uint16_t rd, uint16_t imm);
+thumb_opcode th_add_sp_reg(uint16_t rdm);
 thumb_opcode th_rsb_imm(uint16_t rd, uint16_t rn, uint16_t imm,
                         flags_behaviour setflags);
 thumb_opcode th_shift_armv7m(uint16_t rd, uint16_t rm, uint16_t imm,

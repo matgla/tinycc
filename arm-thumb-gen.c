@@ -196,6 +196,16 @@ ST_DATA const int reg_classes[NB_REGS] = {
 
 #define CHECK_R(r) ((r) >= TREG_R0 && (r) <= TREG_LR)
 
+int is_valid_opcode(thumb_opcode op);
+int ot(thumb_opcode op);
+
+int ot_check(thumb_opcode op) {
+  if (!is_valid_opcode(op)) {
+    tcc_error("compiler_error: received invalid opcode: 0x%x\n", op.opcode);
+  }
+  return ot(op);
+}
+
 static int two2mask(int a, int b) {
   if (!CHECK_R(a) || !CHECK_R(b))
     tcc_error("compiler error! registers %i,%i is not valid", a, b);
@@ -360,7 +370,7 @@ static int assign_regs(int nb_args, int float_abi, struct plan *plan,
   int i, size, align;
   int ncrn /* next core register number */,
       nsaa /* next stacked argument address*/;
-  struct avail_regs avregs = AVAIL_REGS_INITIALIZER;
+  struct avail_regs avregs = {{0}};
 
   ncrn = nsaa = 0;
   *todo = 0;
@@ -413,7 +423,6 @@ static int assign_regs(int nb_args, int float_abi, struct plan *plan,
     default:
       if (ncrn < 4) {
         int is_long = (vtop[-i].type.t & VT_BTYPE) == VT_LLONG;
-
         if (is_long) {
           ncrn = (ncrn + 1) & -2;
           if (ncrn == 4)
@@ -471,20 +480,13 @@ void o(unsigned int i) {
 int is_valid_opcode(thumb_opcode op) { return (op.size == 2 || op.size == 4); }
 
 int ot(thumb_opcode op) {
-  if (op.size == 0)
-    return op.size;
+  // if (op.size == 0)
+  //    return op.size;
 
   if (op.size == 4)
     o(op.opcode >> 16);
   o(op.opcode & 0xffff);
   return op.size;
-}
-
-int ot_check(thumb_opcode op) {
-  if (!is_valid_opcode(op)) {
-    tcc_error("compiler_error: received invalid opcode: 0x%x\n", op.opcode);
-  }
-  return ot(op);
 }
 
 static void load_full_const(int r, int32_t imm, struct Sym *sym);
@@ -601,7 +603,10 @@ static uint32_t th_encbranch_20(int pos, int addr) {
 }
 
 int th_offset_to_reg(int off, int sign) {
-  int rr = get_reg(RC_INT);
+  // we will crash if there is no reg available
+  // int rr = get_reg(RC_INT);
+  int rr =
+      R_LR; // can I use R_LR here? lr should be already saved in proluge right?
 
   // if mov is not possible then load from data
   if (!ot(th_mov_imm(rr, off))) {
@@ -739,9 +744,9 @@ again:
           ot_check(th_add_sp_imm(intr(r), padding));
           vset(&vtop->type, r | VT_LVAL, 0);
           vswap();
-          vstore();
           /* XXX: optimize. Save all register because memcpy can use them */
           ot_check(th_vpush(0xffff));
+          // wait haven't we just stored? in 746
           vstore(); /* memcpy to current sp + potential padding */
           ot_check(th_vpop(0xffff));
 
@@ -793,6 +798,7 @@ again:
               r = gv(RC_INT);
               ot_check(th_push(1 << intr(r)));
               vtop--;
+              print_vstack("copy_params(1)");
             }
             r = gv(RC_INT);
             ot_check(th_push(1 << intr(r)));
@@ -817,6 +823,7 @@ again:
           gv(regmask(pplan->end));
           pplan->sval->r2 = vtop->r;
           vtop--;
+          print_vstack("copy_params(CORE_CLASS)");
         }
         gv(regmask(pplan->start));
         /* Mark register as used so that gcall_or_jmp use another one
@@ -824,7 +831,9 @@ again:
         pplan->sval->r = vtop->r;
         break;
       }
+
       vtop--;
+      print_vstack("copy_params(ALL)");
     }
   }
 
@@ -881,10 +890,10 @@ void gfunc_prolog(Sym *func_sym) {
   int addr, pn, sn; /* pn=core, sn=stack */
   CType ret_type;
 
-  struct avail_regs avregs = AVAIL_REGS_INITIALIZER;
+  struct avail_regs avregs = {{0}}; // AVAIL_REGS_INITIALIZER;
 
-  TRACE("########## gfunc_prolog ########## func_vt.t %d",
-        func_vt.t & VT_BTYPE);
+  TRACE("########## gfunc_prolog ########## func_vt.t %d, name: %s",
+        func_vt.t & VT_BTYPE, get_tok_str(func_sym->v, NULL));
 
   sym = func_type->ref;
   func_vt = sym->type;
@@ -932,13 +941,37 @@ void gfunc_prolog(Sym *func_sym) {
 
   ot_check(th_push(0x5800));    // push {fp, ip, lr} (r11, r12, r14)
   ot_check(th_mov_reg(11, 13)); // mov fp, sp
+  // nop has 2 bytes
+  // I need 4 bytes for address and 4 bytes for instruction in the worst case
+  // scenario
+
+  // nooo there must be a better way to do this
+  // maybe in case of full loading use branch to epilogue code?
+  // ind + branch instruction + ldr is 4 bytes
+  int est = th_ldr_literal_estimate(R_LR, 4);
+  est += 2; // 2 bytes for the branch instruction
+  est += 2; // 2 bytes for the sub instruction
+  est += ind;
+  // align to 4 bytes for memory access
+  if (est & 3) {
+    ot_check(th_nop());
+  }
+  ot_check(th_ldr_literal(R_LR, 4, 1));
+  ot_check(th_add_sp_reg(R_LR));
+  ot_check(th_b_t2(2));
+
   func_sub_sp_offset = ind;
-  ot_check(th_nop()); /* leave space for stack adjustment in epilog */
-  ot_check(th_nop());
+  // ot_check(th_nop()); /* leave space for stack adjustment in epilog */
+  // ot_check(th_nop());
+  ot((thumb_opcode){
+      .size = 4,
+      .opcode = 0x00000000,
+  });
 
   if (float_abi == ARM_HARD_FLOAT) {
     func_vc += nf * 4;
-    avregs = AVAIL_REGS_INITIALIZER;
+    memset(&avregs, 0, sizeof(avregs));
+    // avregs = AVAIL_REGS_INITIALIZER;
   }
 
   pn = struct_ret, sn = 0;
@@ -1003,7 +1036,7 @@ void gfunc_call(int nb_args) {
   struct plan plan;
   int variadic;
 
-  TRACE("'gfunc_call'");
+  TRACE("'gfunc_call: nb_args: %d, float_abi: %d'", nb_args, float_abi);
   if (float_abi == ARM_HARD_FLOAT) {
     variadic = (vtop[-nb_args].type.ref->f.func_type == FUNC_ELLIPSIS);
     if (variadic || floats_in_core_regs(&vtop[-nb_args]))
@@ -1023,7 +1056,8 @@ void gfunc_call(int nb_args) {
     args_size = (args_size + 7) & ~7;
     ot_check(th_sub_sp_imm(R_SP, 4));
   }
-  nb_args += copy_params(nb_args, &plan, todo);
+  int x = copy_params(nb_args, &plan, todo);
+  nb_args += x;
   tcc_free(plan.pplans);
 
   vrotb(nb_args + 1);
@@ -1037,7 +1071,8 @@ void gfunc_call(int nb_args) {
     else
       ot_check(th_vmov_2gp_dp(0, 1, 0, 0));
   }
-  vtop -= nb_args + 1;
+  vtop -= nb_args + 1; // +1 is function address
+  print_vstack("gfunc_call(0)");
   leaffunc = 0;
   float_abi = def_float_abi;
 }
@@ -1060,22 +1095,19 @@ void gfunc_epilog(void) {
   diff = (-loc + 3) & -4;
   if (!leaffunc)
     diff = ((diff + 11) & -8) - 4;
-  if (diff > 0)
-    ot_check(th_add_sp_imm(R_SP, diff));
+  if (diff > 0) {
+    if (!ot(th_add_sp_imm(R_SP, diff))) {
+      int rr = th_offset_to_reg(diff, 0);
+      ot_check(th_add_sp_reg(rr));
+      ot_check(th_mov_reg(R_SP, rr));
+    }
+  }
+
   ot_check(th_pop((1 << R_FP) | (1 << R_IP) | (1 << R_LR)));
 
+  // what if diff is too far for sub sp imm?
   if (diff > 0) {
-    x = gen_th_sub_sp_imm(R_SP, diff);
-    if (x.size == 2)
-      *(uint16_t *)(cur_text_section->data + func_sub_sp_offset) =
-          x.opcode & 0xffff;
-    else if (x.size == 4) {
-      *(uint16_t *)(cur_text_section->data + func_sub_sp_offset) =
-          x.opcode >> 16;
-      *(uint16_t *)(cur_text_section->data + func_sub_sp_offset + 2) =
-          x.opcode & 0xffff;
-    } else
-      tcc_error("compiler_error: failed to generate stack adjustment\n");
+    *(uint32_t *)(cur_text_section->data + func_sub_sp_offset) = -diff;
   }
 
   if (func_nregs) {
@@ -1090,7 +1122,9 @@ void gfunc_epilog(void) {
 void ggoto(void) {
   TRACE("'ggoto'");
   gcall_or_jmp(1);
+
   vtop--;
+  print_vstack("ggoto");
 }
 
 ST_FUNC int gjmp(int t) {
@@ -1100,10 +1134,11 @@ ST_FUNC int gjmp(int t) {
   if (nocode_wanted)
     return t;
 
-  if (val < -1024 || val > 1023)
-    ot_check(th_b_t4(val << 1));
-  else
-    ot_check(th_b_t2(val << 1));
+  // disable T16 instruction until root cause is found
+  // if (val < -1024 || val > 1023)
+  ot_check(th_b_t4(val << 1));
+  // else
+  // ot_check(th_b_t2(val << 1));
   return r;
 }
 
@@ -1240,6 +1275,7 @@ static uint32_t intr(int r) {
 }
 
 void store(int r, SValue *sv) {
+  print_vstack("store begin");
   int v, vt, fc, ft, fr, sign;
   TRACE("'store' reg: %d", r);
 
@@ -1572,8 +1608,10 @@ static void gen_opf_regular(uint32_t opc, int fneg) {
     r |= regmask(r2);
   }
   vtop->r = get_reg_ex(RC_FLOAT, r);
-  if (!fneg)
+  if (!fneg) {
     --vtop;
+    print_vstack("gen_opf_regular");
+  }
   inst = opc | (vfpr(vtop->r) << 12);
   o(inst >> 16);
   o(inst);
@@ -1587,12 +1625,14 @@ static void gen_opf_cmp(uint32_t opc, uint32_t op) {
 
   if (is_zero_on_stack(0)) {
     --vtop;
+    print_vstack("gen_opf_cmp(1)");
     inst = opc | 0x10000 | (vfpr(gv(RC_FLOAT)) << 12);
   } else {
     opc |= vfpr(gv(RC_FLOAT));
     vswap();
     inst = opc | (vfpr(gv(RC_FLOAT)) << 12);
     --vtop;
+    print_vstack("gen_opf_cmp(2)");
   }
 
   o(inst >> 16);
@@ -1696,6 +1736,7 @@ void gen_opf(int op) {
       vswap();
     if (is_zero_on_stack(0)) {
       --vtop;
+      print_vstack("gen_opf(+)");
       return;
     }
     return gen_opf_regular(is_double | 0x00300000, 0);
@@ -1703,11 +1744,13 @@ void gen_opf(int op) {
   case '-': {
     if (is_zero_on_stack(0)) {
       --vtop;
+      print_vstack("gen_opf(- 1)");
       return;
     }
     if (is_zero_on_stack(-1)) {
       vswap();
       --vtop;
+      print_vstack("gen_opf(- 2)");
       return gen_opf_regular(is_double | 0x00b10040, 1);
     } else
       return gen_opf_regular(is_double | 0x00300040, 0);
@@ -1880,7 +1923,7 @@ void gen_opi_notshift(int op, int opc) {
 
   gen_opi_regular(opc, c);
   --vtop;
-
+  print_vstack("gen_opi_notshift");
   if (op >= TOK_ULT && op <= TOK_GT)
     vset_VT_CMP(op);
 }
@@ -1922,6 +1965,7 @@ void gen_opi_shift(int opc) {
                 opc);
   }
   vtop--;
+  print_vstack("gen_opi_shift");
 }
 
 /* generate an integer binary operation */
@@ -1952,6 +1996,7 @@ void gen_opi(int op) {
     r = vtop[-1].r;
     fr = vtop[0].r;
     vtop--;
+    print_vstack("gen_opi(*)");
     ot_check(th_mul(intr(r), intr(fr), intr(r)));
     return;
   }
@@ -1968,6 +2013,7 @@ void gen_opi(int op) {
     fr = vtop[0].r;
     ot_check(th_sdiv(intr(r), intr(r), intr(fr)));
     vtop--;
+    print_vstack("gen_opi(/)");
     return;
   }
   case TOK_UDIV: {
@@ -1976,6 +2022,7 @@ void gen_opi(int op) {
     fr = vtop[0].r;
     ot_check(th_udiv(intr(r), intr(r), intr(fr)));
     vtop--;
+    print_vstack("gen_opi(UDIV)");
     return;
   }
   case '%': {
@@ -1984,6 +2031,7 @@ void gen_opi(int op) {
     r = vtop[-1].r;
     fr = vtop[0].r;
     vtop--;
+    print_vstack("gen_opi(%%)");
     r = intr(r);
     fr = intr(fr);
     for (int i = 0; i < 5; ++i) {
@@ -2006,6 +2054,7 @@ void gen_opi(int op) {
     r = vtop[-1].r;
     fr = vtop[0].r;
     vtop--;
+    print_vstack("gen_opi(UMOD)");
     r = intr(r);
     fr = intr(fr);
     for (int i = 0; i < 5; ++i) {
@@ -2028,6 +2077,7 @@ void gen_opi(int op) {
     fr = vtop[-1].r;
     vtop[-1].r = get_reg_ex(RC_INT, regmask(fr));
     vtop--;
+    print_vstack("gen_opi(UMULL)");
     ot_check(th_umull(intr(vtop->r), r, intr(vtop[1].r), intr(fr)));
     return;
   }

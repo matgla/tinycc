@@ -2140,7 +2140,11 @@ static int sort_sections(TCCState *s1, int *sec_order, struct dyn_inf *d) {
     } else if (s == s1->got) {
       k = 0x70; /* .got as RELRO needs BIND_NOW in DT_FLAGS */
     } else if (s->reloc && (s->reloc->sh_flags & SHF_ALLOC) && j == 0x100) {
-      k = 0x44;
+      if (s == rodata_section) {
+        k = 0x43;
+      } else {
+        k = 0x44;
+      }
       /* <-- */
     } else if (s->sh_type == SHT_NOTE) {
       k = 0x60;

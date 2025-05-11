@@ -1152,6 +1152,13 @@ thumb_opcode th_add_sp_imm(uint16_t rd, uint16_t imm) {
   };
 }
 
+thumb_opcode th_add_sp_reg(uint16_t rdm) {
+  return (thumb_opcode){
+      .size = 2,
+      .opcode = 0x4485 | (rdm << 3),
+  };
+}
+
 thumb_opcode th_rsb_imm(uint16_t rd, uint16_t rn, uint16_t imm,
                         flags_behaviour setflags) {
   if (rd < 8 && rn < 8 && imm == 0 && setflags == FLAGS_BEHAVIOUR_SET) {

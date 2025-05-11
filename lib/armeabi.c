@@ -421,10 +421,6 @@ void __aeabi_uldivmod(unsigned long long num, unsigned long long den) {
   ulldiv_t_return(aeabi_uldivmod(num, den));
 }
 
-void __aeabi_ldivmod(long long num, long long den) {
-  ulldiv_t_return(aeabi_ldivmod(num, den));
-}
-
 void __aeabi_llsl(double_unsigned_struct val, int shift) {
   double_unsigned_struct ret;
 

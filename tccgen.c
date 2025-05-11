@@ -339,16 +339,21 @@ ST_FUNC void check_vstack(void) {
 
 /* vstack debugging aid */
 #if 0
-void pv (const char *lbl, int a, int b)
-{
-    int i;
-    for (i = a; i < a + b; ++i) {
-        SValue *p = &vtop[-i];
-        printf("%s vtop[-%d] : type.t:%04x  r:%04x  r2:%04x  c.i:%d\n",
-            lbl, i, p->type.t, p->r, p->r2, (int)p->c.i);
-    }
+void pv(const char *lbl, int a, int b) {
+  int i;
+  for (i = a; i < a + b; ++i) {
+    SValue *p = &vtop[-i];
+    printf("%s vtop[-%d] : type.t:%04x  r:%04x  r2:%04x  c.i:%d\n", lbl, i,
+           p->type.t, p->r, p->r2, (int)p->c.i);
+  }
 }
 #endif
+
+// debugging aid when stack is corrupted
+void dbg_print_vstack(const char *msg, const char *file, int line) {
+  printf("print_vstack '%s' vtop: %p, elements: %d, at: %s:%d\n", msg, vtop,
+         (vtop - vstack) + 1, file, line);
+}
 
 /* ------------------------------------------------------------------------- */
 /* initialize vstack and types.  This must be done also for tcc -E */
@@ -831,6 +836,7 @@ static void vsetc(CType *type, int r, CValue *vc) {
     tcc_error("memory full (vstack)");
   vcheck_cmp();
   vtop++;
+  print_vstack("vsetc");
   vtop->type = *type;
   vtop->r = r;
   vtop->r2 = VT_CONST;
@@ -863,6 +869,7 @@ ST_FUNC void vpop(void) {
     gsym(vtop->jfalse);
   }
   vtop--;
+  print_vstack("vpop");
 }
 
 /* push constant of type "type" with useless value */
@@ -904,6 +911,7 @@ ST_FUNC void vpushv(SValue *v) {
   if (vtop >= vstack + (VSTACK_SIZE - 1))
     tcc_error("memory full (vstack)");
   vtop++;
+  print_vstack("vpushv");
   *vtop = *v;
 }
 
@@ -1005,6 +1013,7 @@ static int gvtst(int inv, int t) {
   gsym(u);
 
   vtop--;
+  print_vstack("gvtst");
   return t;
 }
 
@@ -1566,15 +1575,15 @@ ST_FUNC void gbound_args(int nb_args) {
       vpush_helper_func(TOK___bound_setjmp);
       vpushv(sv + 1);
       gfunc_call(1);
-      func_bound_add_epilog = 1;
+      // func_bound_add_epilog = 1;
     }
 #if defined TCC_TARGET_I386 || defined TCC_TARGET_X86_64
     if (v == TOK_alloca)
-      func_bound_add_epilog = 1;
+    // func_bound_add_epilog = 1;
 #endif
 #if TARGETOS_NetBSD
-    if (v == TOK_longjmp) /* undo rename to __longjmp14 */
-      sv->sym->asm_label = TOK___bound_longjmp;
+      if (v == TOK_longjmp) /* undo rename to __longjmp14 */
+        sv->sym->asm_label = TOK___bound_longjmp;
 #endif
   }
 }
@@ -1991,7 +2000,7 @@ static void gen_opl(int op) {
   case '*':
   case '+':
   case '-':
-    // pv("gen_opl A",0,2);
+    // pv("gen_opl A", 0, 2);
     t = vtop->type.t;
     vswap();
     lexpand();
@@ -2006,7 +2015,7 @@ static void gen_opl(int op) {
     vtop[-3] = tmp;
     vswap();
     /* stack: H1 H2 L1 L2 */
-    // pv("gen_opl B",0,4);
+    // pv("gen_opl B", 0, 4);
     if (op == '*') {
       vpushv(vtop - 1);
       vpushv(vtop - 1);
@@ -2318,6 +2327,7 @@ static void gen_opic(int op) {
     v1->c.i = value64(l1, v1->type.t);
     v1->r |= v2->r & VT_NONCONST;
     vtop--;
+    print_vstack("gen_opic(0)");
   } else {
     /* if commutative ops, put c2 as constant */
     if (c1 && (op == '+' || op == '&' || op == '^' || op == '|' || op == '*' ||
@@ -2339,6 +2349,7 @@ static void gen_opic(int op) {
         vtop->c.i = 0;
       vswap();
       vtop--;
+      print_vstack("gen_opic(1)");
     } else if (c2 &&
                (((op == '*' || op == '/' || op == TOK_UDIV || op == TOK_PDIV) &&
                  l2 == 1) ||
@@ -2349,6 +2360,7 @@ static void gen_opic(int op) {
                  (l2 == -1 || (l2 == 0xFFFFFFFF && t2 != VT_LLONG))))) {
       /* filter out NOP operations like x*1, x-0, x&-1... */
       vtop--;
+      print_vstack("gen_opic(2)");
     } else if (c2 && (op == '*' || op == TOK_PDIV || op == TOK_UDIV)) {
       /* try to use shifts instead of muls or divs */
       if (l2 > 0 && (l2 & (l2 - 1)) == 0) {
@@ -2378,6 +2390,7 @@ static void gen_opic(int op) {
       if ((int)l2 != l2)
         goto general_case;
       vtop--;
+      print_vstack("gen_opic(3)");
       vtop->c.i = l2;
     } else {
     general_case:
@@ -2499,6 +2512,7 @@ static void gen_opif(int op) {
       i = f1 == f2;
     make_int:
       vtop -= 2;
+      print_vstack("gen_opif(0)");
       vpushi(i);
       return;
     case TOK_NE:
@@ -2520,6 +2534,7 @@ static void gen_opif(int op) {
       goto general_case;
     }
     vtop--;
+    print_vstack("gen_opif(1)");
   unary_result:
     /* XXX: overflow test ? */
     if (bt == VT_FLOAT) {
@@ -3649,6 +3664,7 @@ ST_FUNC void vstore(void) {
     }
   } else if (dbt == VT_VOID) {
     --vtop;
+    print_vstack("vstore: void");
   } else {
     /* optimize char/short casts */
     delayed_cast = 0;
@@ -3705,6 +3721,7 @@ ST_FUNC void vstore(void) {
     }
     vswap();
     vtop--; /* NOT vpop() because on x86 it would flush the fp stack */
+    print_vstack("vstore: store");
   }
 }
 
@@ -5587,6 +5604,7 @@ tok_next:
     vtop[0].type.t &= ~(VT_CONSTANT | VT_VOLATILE);
     n = is_compatible_types(&vtop[-1].type, &vtop[0].type);
     vtop -= 2;
+    print_vstack("unary, builtin_types_compatible_p");
     vpushi(n);
     break;
   case TOK_builtin_choose_expr: {
@@ -5621,6 +5639,7 @@ tok_next:
         ((vtop->r & VT_SYM) && vtop->sym->a.addrtaken))
       n = 0;
     vtop--;
+    print_vstack("unary, builtin_constant_p");
     vpushi(n);
     break;
   case TOK_builtin_unreachable:
@@ -6010,9 +6029,10 @@ tok_next:
             --loc;
 #endif
           ret.c = vtop->c;
-          if (ret_nregs < 0)
+          if (ret_nregs < 0) {
             vtop--;
-          else
+            print_vstack("unary, function call");
+          } else
             nb_args++;
         }
       } else {
@@ -6106,6 +6126,7 @@ tok_next:
             vswap();
             vstore();
             vtop--;
+            print_vstack("unary, function call(2)");
             if (--ret_nregs == 0)
               break;
             offset += regsize;
@@ -6390,6 +6411,7 @@ static void expr_cond(void) {
       mk_pointer(&vtop->type);
     sv = *vtop; /* save value to handle it later */
     vtop--;     /* no vpop so that FP stack is not flushed */
+    print_vstack("expr_cond");
 
     if (g) {
       u = tt;
@@ -6612,6 +6634,7 @@ static void gfunc_return(CType *func_type) {
     gv(RC_RET(func_type->t));
   }
   vtop--; /* NOT vpop() because on x86 it would flush the fp stack */
+  print_vstack("gfunc_return");
 }
 #endif
 
@@ -6962,6 +6985,7 @@ again:
         if (vtop->type.t != VT_VOID)
           tcc_warning("void function returns a value");
         vtop--;
+        print_vstack("block(1)");
       }
     } else if (b) {
       tcc_warning("'return' with no value");
@@ -7065,6 +7089,7 @@ again:
     if (!is_integer_btype(vtop->type.t & VT_BTYPE))
       tcc_error("switch value not an integer");
     sw->sv = *vtop--; /* save switch value */
+    print_vstack("block(2)");
     a = 0;
     b = gjmp(0); /* jump to first case */
     lblock(&a, NULL);
@@ -7307,7 +7332,7 @@ static void init_putz(init_params *p, unsigned long c, int size) {
     vseti(VT_LOCAL, c);
     vpushi(0);
     vpushs(size);
-#if defined TCC_TARGET_ARM && defined TCC_ARM_EABI
+#if defined(TCC_TARGET_ARM) && defined TCC_ARM_EABI
     vswap(); /* using __aeabi_memset(void*, size_t, int) */
 #endif
     gfunc_call(3);
@@ -7509,6 +7534,7 @@ static void init_putv(init_params *p, CType *type, unsigned long c) {
 
     if (NODATA_WANTED) {
       vtop--;
+      print_vstack("init_putv");
       return;
     }
 
@@ -7654,6 +7680,7 @@ static void init_putv(init_params *p, CType *type, unsigned long c) {
         }
     }
     vtop--;
+    print_vstack("init_putv(2)");
   } else {
     vset(&dtype, VT_LOCAL | VT_LVAL, c);
     vswap();
