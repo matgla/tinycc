@@ -480,8 +480,8 @@ void o(unsigned int i) {
 int is_valid_opcode(thumb_opcode op) { return (op.size == 2 || op.size == 4); }
 
 int ot(thumb_opcode op) {
-  // if (op.size == 0)
-  //    return op.size;
+  if (op.size == 0)
+    return op.size;
 
   if (op.size == 4)
     o(op.opcode >> 16);
@@ -660,7 +660,7 @@ int th_patch_call(int t, int a) {
 static void gadd_sp(int val) {
   if (val > 0) {
     ot_check(th_add_sp_imm(R_SP, val));
-  } else {
+  } else if (val < 0) {
     ot_check(th_sub_sp_imm(R_SP, -val));
   }
 }
@@ -745,10 +745,10 @@ again:
           vset(&vtop->type, r | VT_LVAL, 0);
           vswap();
           /* XXX: optimize. Save all register because memcpy can use them */
-          ot_check(th_vpush(0xffff));
+          ot_check(th_vpush((0 & 1) << 22 | (0 >> 1) << 12 | 16));
           // wait haven't we just stored? in 746
           vstore(); /* memcpy to current sp + potential padding */
-          ot_check(th_vpop(0xffff));
+          ot_check(th_vpop((0 & 1) << 22 | (0 >> 1) << 12 | 16));
 
           /* Homogeneous float aggregate are loaded to VFP registers
              immediately since there is no way of loading data in multiple
@@ -1056,7 +1056,9 @@ void gfunc_call(int nb_args) {
     args_size = (args_size + 7) & ~7;
     ot_check(th_sub_sp_imm(R_SP, 4));
   }
+  TRACE("Copy params\n");
   int x = copy_params(nb_args, &plan, todo);
+  TRACE("Copy params done\n");
   nb_args += x;
   tcc_free(plan.pplans);
 
@@ -1074,6 +1076,7 @@ void gfunc_call(int nb_args) {
   vtop -= nb_args + 1; // +1 is function address
   print_vstack("gfunc_call(0)");
   leaffunc = 0;
+  TRACE("gfunc_call finished");
   float_abi = def_float_abi;
 }
 
@@ -1850,12 +1853,13 @@ void gen_opi_regs(int opc, int c) {
 }
 
 void gen_opi_regular(int opc, int c) {
+  TRACE("gen_opi_regular opc: 0x%x, c: 0x%x", opc, c);
   if ((vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST) {
     int ok = 0;
     int r = intr(vtop[-1].r = get_reg_ex(RC_INT, regmask(vtop[-1].r)));
     if (opc != 0x15 && r != c) {
       tcc_error(
-          "compiler_error: 'gen_opi_regular' incorrect order of r and c\n");
+          "compiler_error: '2en_opi_regular' incorrect order of r and c\n");
     }
     switch (opc) {
     case 0:
@@ -1924,8 +1928,10 @@ void gen_opi_notshift(int op, int opc) {
   gen_opi_regular(opc, c);
   --vtop;
   print_vstack("gen_opi_notshift");
-  if (op >= TOK_ULT && op <= TOK_GT)
+  if (op >= TOK_ULT && op <= TOK_GT) {
+    TRACE("gen_opi_notshift vset_VT_CMP");
     vset_VT_CMP(op);
+  }
 }
 
 void gen_opi_shift(int opc) {

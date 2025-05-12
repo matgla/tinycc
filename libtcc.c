@@ -1834,7 +1834,6 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv,
       const char *r1 = r + 1;
       if (p1 == NULL)
         return tcc_error_noabort("invalid option -- '%s'", r);
-      printf("'%s' == '%s'\n", p1, r1);
       if (!strstart(p1, &r1))
         continue;
       optarg = r1;

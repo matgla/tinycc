@@ -303,11 +303,6 @@ redo:
 #ifdef CONFIG_TCC_SWITCHES /* predefined options */
   tcc_set_options(s, CONFIG_TCC_SWITCHES);
 #endif
-  printf("TCC ARGS:\n");
-  for (int i = 0; i < argc; i++) {
-    printf("'%s', ", argv[i]);
-  }
-  printf("\n");
   opt = tcc_parse_args(s, &argc, &argv, 1);
   if (opt < 0)
     return 1;

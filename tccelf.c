@@ -2979,6 +2979,8 @@ ST_FUNC ssize_t full_read(int fd, void *buf, size_t count) {
   size_t rnum = 0;
   while (1) {
     ssize_t num = read(fd, cbuf, count - rnum);
+    int i = 0;
+
     if (num < 0)
       return num;
     if (num == 0)
@@ -3040,9 +3042,12 @@ ST_FUNC int tcc_load_object_file(TCCState *s1, int fd,
   Section *s;
 
   lseek(fd, file_offset, SEEK_SET);
-  if (tcc_object_type(fd, &ehdr) != AFF_BINTYPE_REL)
+
+  if (tcc_object_type(fd, &ehdr) != AFF_BINTYPE_REL) {
     goto invalid;
+  }
   /* test CPU specific stuff */
+
   if (ehdr.e_ident[5] != ELFDATA2LSB || ehdr.e_machine != EM_TCC_TARGET) {
   invalid:
     return tcc_error_noabort("invalid object file");
