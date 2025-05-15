@@ -470,6 +470,7 @@ ST_FUNC int find_elf_sym(Section *s, const char *name) {
   nbuckets = ((int *)hs->data)[0];
   h = elf_hash((unsigned char *)name) % nbuckets;
   sym_index = ((int *)hs->data)[2 + h];
+
   while (sym_index != 0) {
     sym = &((ElfW(Sym) *)s->data)[sym_index];
     name1 = (char *)s->link->data + sym->st_name;
@@ -1031,7 +1032,8 @@ ST_FUNC void relocate_syms(TCCState *s1, Section *symtab, int do_resolve) {
 #if defined TCC_IS_NATIVE && !defined TCC_TARGET_PE
         /* dlsym() needs the undecorated name.  */
         void *addr = dlsym(RTLD_DEFAULT, &name[s1->leading_underscore]);
-#if TARGETOS_OpenBSD || TARGETOS_FreeBSD || TARGETOS_NetBSD || TARGETOS_ANDROID
+#if TARGETOS_OpenBSD || TARGETOS_FreeBSD || TARGETOS_NetBSD ||                 \
+    TARGETOS_ANDROID || TARGETOS_YasOS
         if (addr == NULL) {
           int i;
           for (i = 0; i < s1->nb_loaded_dlls; i++)
@@ -1219,9 +1221,9 @@ static int prepare_dynamic_rel(TCCState *s1, Section *sr) {
 static int build_got(TCCState *s1) {
   /* if no got, then create it */
   s1->got = new_section(s1, ".got", SHT_PROGBITS, SHF_ALLOC | SHF_WRITE);
-  s1->got->sh_entsize = 4;
+  s1->got->sh_entsize = 8;
   /* keep space for _DYNAMIC pointer and two dummy got entries */
-  section_ptr_add(s1->got, 3 * PTR_SIZE);
+  section_ptr_add(s1->got, 3 * PTR_SIZE * 2);
   return set_elf_sym(symtab_section, 0, 0,
                      ELFW(ST_INFO)(STB_GLOBAL, STT_OBJECT), 0, s1->got->sh_num,
                      "_GLOBAL_OFFSET_TABLE_");
@@ -1263,7 +1265,7 @@ static struct sym_attr *put_got_entry(TCCState *s1, int dyn_reloc_type,
 
   /* create the GOT entry */
   got_offset = s1->got->data_offset;
-  section_ptr_add(s1->got, PTR_SIZE);
+  section_ptr_add(s1->got, PTR_SIZE * 2);
 
   /* Create the GOT relocation that will insert the address of the object or
      function of interest in the GOT entry. This is a static relocation for
@@ -2196,7 +2198,7 @@ static int sort_sections(TCCState *s1, int *sec_order, struct dyn_inf *d) {
     }
     sec_cls[i] = f;
 #ifdef DEBUG_RELOC
-    printf("ph %d sec %02d : %3X %3X  %8.2X  %04X  %s\n", (f > 0) * n, i, f, k,
+    printf("ph %d sec %02d : %3X %3X  %x  %04X  %s\n", (f > 0) * n, i, f, k,
            s->sh_type, (int)s->sh_size, s->name);
 #endif
   }
@@ -3021,6 +3023,10 @@ ST_FUNC int tcc_object_type(int fd, ElfW(Ehdr) * h) {
       return AFF_BINTYPE_C67;
 #endif
   }
+  if (0 == memcmp(h, YAFFMAG, 4)) {
+    return AFF_BINTYPE_YAFF;
+  }
+
   return 0;
 }
 
@@ -3561,7 +3567,6 @@ static void store_version(TCCState *s1, struct versym_info *v, char *dynstr) {
   }
 #endif
 }
-
 /* load a library / DLL
    'level = 0' means that the DLL is referenced by the user
    (so it should be added as DT_NEEDED in the generated ELF file) */

@@ -29,6 +29,7 @@
 #include "tccgen.c"
 #include "tccpp.c"
 #include "tccrun.c"
+#include "tccyaff.c"
 #ifdef TCC_TARGET_I386
 #include "i386-asm.c"
 #include "i386-gen.c"
@@ -799,6 +800,7 @@ LIBTCCAPI TCCState *tcc_new(void) {
   s->pic = 0;
 #if defined(TCC_TARGET_ARM) || defined(TCC_TARGET_ARM_THUMB)
   s->float_abi = ARM_FLOAT_ABI;
+  printf("Setting text and data separation to 0\n");
   s->text_and_data_separation = 0;
 #endif
 #ifdef CONFIG_NEW_DTAGS
@@ -995,13 +997,15 @@ ST_FUNC int tcc_add_file_internal(TCCState *s1, const char *filename,
     lseek(fd, 0, SEEK_SET);
 
     switch (obj_type) {
-
     case AFF_BINTYPE_REL:
       ret = tcc_load_object_file(s1, fd, 0);
       break;
 
     case AFF_BINTYPE_AR:
       ret = tcc_load_archive(s1, fd, !(flags & AFF_WHOLE_ARCHIVE));
+      break;
+    case AFF_BINTYPE_YAFF:
+      ret = tcc_load_yaff(s1, fd, filename, (flags & AFF_REFERENCED_DLL) != 0);
       break;
 
 #ifdef TCC_TARGET_PE
@@ -2004,6 +2008,7 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv,
         return tcc_error_noabort("unsupported float abi '%s'", optarg);
       break;
     case TCC_OPTION_mno_pic_data_is_text_relative:
+      printf("Setting text and data separation to: 1\n");
       s->text_and_data_separation = 1;
       break;
 #endif

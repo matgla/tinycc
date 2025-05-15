@@ -255,7 +255,8 @@ thumb_opcode th_add_reg(uint16_t rd, uint16_t rn, uint16_t rm) {
   else {
     return (thumb_opcode){
         .size = 4,
-        .opcode = (0xeb00 | rn) << 16 | (rd << 8) | rm,
+        .opcode = (0xeb00 | rn) << 16 | (rd << 8) | (1 << 20) | rm,
+
     };
   }
 #endif

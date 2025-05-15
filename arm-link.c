@@ -135,23 +135,26 @@ ST_FUNC unsigned create_plt_entry(TCCState *s1, unsigned got_offset,
   /* empty PLT: create PLT0 entry that push address of call site and
      jump to ld.so resolution routine (GOT + 8) */
   if (plt->data_offset == 0) {
-    p = section_ptr_add(plt, 20);
-    // write32le(p,    0xe52de004); /* push {lr}         */
-    // write16le(p,    0xb500); // push {lr}
-    // write_thumb_instruction(p, th_push(1 << R_LR));
-    // write_thumb_instruction(p+2, th_ldr_literal(R_LR, 8, 1));
-    // write_thumb_instruction(p+6, th_add_reg(R_LR, R_LR, R_PC));
-    // write_thumb_instruction(p+8, th_ldr_imm(R_PC, R_LR, 8, 7));
-    // write_thumb_instruction(p+12, th_pop(1 << R_PC));
-    /* p+16 is set in relocate_plt */
+    p = section_ptr_add(plt, 52);
   }
+  // write32le(p,    0xe52de004); /* push {lr}         */
+  // write16le(p,    0xb500); // push {lr}
+  // write_thumb_instruction(p, th_push(1 << R_LR));
+  // write_thumb_instruction(p+2, th_ldr_literal(R_LR, 8, 1));
+  // write_thumb_instruction(p+6, th_add_reg(R_LR, R_LR, R_PC));
+  // write_thumb_instruction(p+8, th_ldr_imm(R_PC, R_LR, 8, 7));
+  // write_thumb_instruction(p+12, th_pop(1 << R_PC));
+  /* p+16 is set in relocate_plt */
+  // }
   plt_offset = plt->data_offset;
   /* save GOT offset for relocate_plt */
-  p = section_ptr_add(plt, 24);
+  // I can't know if library will use text_and_data separation or not
+  // so I have to implement r9 loading in both cases
+  p = section_ptr_add(plt, 52);
+  printf("Placing got offset: %x, at: %p\n", got_offset, p);
   write32le(p + 4, got_offset);
   return plt_offset;
 }
-
 /* relocate the PLT: compute addresses and offsets in the PLT now that final
    address for PLT and GOT are known (see fill_program_header) */
 ST_FUNC void relocate_plt(TCCState *s1) {
@@ -162,23 +165,59 @@ ST_FUNC void relocate_plt(TCCState *s1) {
 
   p = s1->plt->data;
   p_end = p + s1->plt->data_offset;
+  p += 52;
 
   if (p < p_end) {
-    int x = s1->got->sh_addr - s1->plt->sh_addr - 12;
-    write32le(p + 16, x - 4);
-    p += 20;
+    // int x = s1->got->sh_addr - s1->plt->sh_addr - 12;
+    int x = 0;
+    if (s1->text_and_data_separation) {
+      // p += 48;
+    } else {
+      // p += 20;
+      // write32le(p + 16, x - 4);
+    }
     while (p < p_end) {
-      unsigned off = x + read32le(p + 4) + (s1->plt->data - p) + 4;
-      write32le(p + 20, off);
-      write_thumb_instruction(p, th_ldr_imm(R_IP, R_PC, 16, 6));
-      write_thumb_instruction(p + 4, th_add_reg(R_IP, R_IP, R_PC));
-      write_thumb_instruction(p + 6, th_ldr_imm(R_IP, R_IP, 0, 6));
-      write_thumb_instruction(p + 10, th_cmp_imm(R_IP, 0));
-      // if 0 then call resolver, else move one instruction further
-      write_thumb_instruction(p + 14, th_b_t1(1, 0));
-      write_thumb_instruction(p + 18, th_bx_reg(R_IP));
+      unsigned off = read32le(p + 4);
+      if (s1->text_and_data_separation != 1) {
+        // calculate PC relative offset to the got start from p + 4 instruction
+        printf("S1->got->sh_addr: %x, s1->plt->sh_addr: %x\n", s1->got->sh_addr,
+               s1->plt->sh_addr);
+        printf("Current p offset: %x\n", p - s1->plt->data);
+        printf("Got offset: %x\n", off);
+        // entries from 0 to 2 inclusive are reserved for the dynamic linker
+        off += s1->got->sh_addr - s1->plt->sh_addr - (p - s1->plt->data) - 12 +
+               0x8 * 3;
+        // calculate address of got entry
+      }
+      printf("Writing offset to got: %x\n", off);
+      write32le(p + 48, off);
+      // when mno-pic-data-is-text relative GOT entries have 8 bytes, to keep
+      // the base register and offset to the symbol
+      // push R9 to restore it when getting back to the caller
+      write_thumb_instruction(p, th_push(1 << R9 | 1 << R0));
+      // get offet in GOT table
+      write_thumb_instruction(p + 4, th_ldr_imm(R9, R_PC, 40, 6));
 
-      p += 24;
+      if (s1->text_and_data_separation) {
+        // calculate address relative to the base
+        write_thumb_instruction(p + 8, th_add_reg(R9, R_IP, R9));
+      } else {
+        // calculate address relative to the PC
+        write_thumb_instruction(p + 8, th_add_reg(R_IP, R_IP, R_PC));
+      }
+      // load R9 value from first got entry
+      write_thumb_instruction(p + 12, th_ldr_imm(R9, R_IP, 0, 6));
+      // update R9
+      // get address of the symbol
+      write_thumb_instruction(p + 14, th_add_imm(R_IP, R_IP, 4));
+      // load the address of the symbol
+      write_thumb_instruction(p + 18, th_ldr_imm(R_IP, R_IP, 0, 6));
+      write_thumb_instruction(p + 22, th_cmp_imm(R_IP, 0));
+      // if 0 then call resolver, else move one instruction further
+      write_thumb_instruction(p + 26, th_b_t1(1, 0));
+      write_thumb_instruction(p + 30, th_bx_reg(R_IP));
+      write_thumb_instruction(p + 34, th_pop(1 << R9 | 1 << R0));
+      p += 52;
     }
   }
 

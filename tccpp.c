@@ -3561,6 +3561,11 @@ static const char *const target_os_defs =
 #if TARGETOS_ANDROID
     "__ANDROID__\0"
 #endif
+
+#if TARGETOS_YasOS
+    "__yasos__\0"
+#endif
+
 #endif
     "__unix__\0"
     "__unix\0"

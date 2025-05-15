@@ -1304,6 +1304,7 @@ ST_FUNC int tcc_add_file_internal(TCCState *s1, const char *filename,
 #define AFF_BINTYPE_DYN 2
 #define AFF_BINTYPE_AR 3
 #define AFF_BINTYPE_C67 4
+#define AFF_BINTYPE_YAFF 5
 
 /* return value of tcc_add_file_internal(): 0, -1, or FILE_NOT_FOUND */
 #define FILE_NOT_FOUND -2
@@ -1547,6 +1548,7 @@ ST_DATA int func_bound_add_epilog;
 #define TCC_OUTPUT_DYN TCC_OUTPUT_DLL
 
 #define ARMAG "!<arch>\n" /* For COFF and a.out archives */
+#define YAFFMAG "YAFF"
 
 typedef struct {
   unsigned int n_strx;   /* index into string table of name */
@@ -1611,6 +1613,8 @@ ST_FUNC int set_global_sym(TCCState *s1, const char *name, Section *sec,
 
 #ifndef ELF_OBJ_ONLY
 ST_FUNC int tcc_load_dll(TCCState *s1, int fd, const char *filename, int level);
+ST_FUNC int tcc_load_yaff(TCCState *s1, int fd, const char *filename,
+                          int level);
 ST_FUNC int tcc_load_ldscript(TCCState *s1, int fd);
 ST_FUNC void tccelf_add_crtbegin(TCCState *s1);
 ST_FUNC void tccelf_add_crtend(TCCState *s1);

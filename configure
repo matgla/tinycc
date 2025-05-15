@@ -661,6 +661,7 @@ for v in $cpu $confvars ; do
     CONFIG_WIN32=yes)       print_num TCC_TARGET_PE 1 ;;
     CONFIG_OSX=yes)         print_num TCC_TARGET_MACHO 1 ;;
     CONFIG_Android=yes)     print_num TARGETOS_ANDROID 1 ;;
+    CONFIG_Yasos=yes)       print_num TARGETOS_YasOS 1 ;;
     CONFIG_BSD=yes)         print_num TARGETOS_$targetos 1
       case "$targetos" in
         FreeBSD)    default tcc_elfinterp "/libexec/ld-elf.so.1";;
