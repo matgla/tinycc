@@ -1037,6 +1037,9 @@ void gfunc_call(int nb_args) {
   int variadic;
 
   TRACE("'gfunc_call: nb_args: %d, float_abi: %d'", nb_args, float_abi);
+  // we will be calling a function, R9 must be saved for Yasos.zig
+  ot_check(th_push(1 << R9 | 1 << R_IP));
+
   if (float_abi == ARM_HARD_FLOAT) {
     variadic = (vtop[-nb_args].type.ref->f.func_type == FUNC_ELLIPSIS);
     if (variadic || floats_in_core_regs(&vtop[-nb_args]))
@@ -1076,6 +1079,7 @@ void gfunc_call(int nb_args) {
   vtop -= nb_args + 1; // +1 is function address
   print_vstack("gfunc_call(0)");
   leaffunc = 0;
+  ot_check(th_pop(1 << R9 | 1 << R_IP));
   TRACE("gfunc_call finished");
   float_abi = def_float_abi;
 }
@@ -1386,7 +1390,7 @@ static void load_full_const(int r, int32_t imm, struct Sym *sym) {
         ot_check(th_sub_imm(r, r, 8));
       } else {
         ot_check(th_add_reg(r, r, R_PC));
-        ot_check(th_ldr_imm(r, r, 0, 6));
+        ot_check(th_ldr_imm(r, r, 4, 6));
         ot_check(th_add_imm(r, r, imm));
       }
     }

@@ -180,6 +180,10 @@ extern long double strtold(const char *__nptr, char **__endptr);
 #endif
 #endif
 
+#ifdef TARGETOS_YasOS
+#define TCC_TARGET_YASOS 1
+#endif
+
 /* only native compiler supports -run */
 #if defined _WIN32 == defined TCC_TARGET_PE &&                                 \
     defined __APPLE__ == defined TCC_TARGET_MACHO
