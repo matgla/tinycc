@@ -200,16 +200,15 @@ ST_FUNC void relocate_plt(TCCState *s1) {
         write_thumb_instruction(p + 4, th_add_reg(R_IP, R_IP, R_PC));
       }
       // load R9 value from first got entry
-      write_thumb_instruction(p + 6, th_ldr_imm(R9, R_IP, 0, 6));
+      write_thumb_instruction(p + 6, th_ldr_imm(R9, R_IP, 4, 6));
       // update R9
       // get address of the symbol
-      write_thumb_instruction(p + 10, th_add_imm(R_IP, R_IP, 4));
       // load the address of the symbol
-      write_thumb_instruction(p + 14, th_ldr_imm(R_IP, R_IP, 0, 6));
-      write_thumb_instruction(p + 18, th_cmp_imm(R_IP, 0));
+      write_thumb_instruction(p + 10, th_ldr_imm(R_IP, R_IP, 0, 6));
+      write_thumb_instruction(p + 14, th_cmp_imm(R_IP, 0));
       // if 0 then call resolver, else move one instruction further
-      write_thumb_instruction(p + 22, th_b_t1(1, 0));
-      write_thumb_instruction(p + 26, th_bx_reg(R_IP));
+      write_thumb_instruction(p + 18, th_b_t1(1, 0));
+      write_thumb_instruction(p + 22, th_bx_reg(R_IP));
       // write_thumb_instruction(p + 34, th_pop(1 << R9 | 1 << R_LR));
 
       p += 32;
@@ -437,7 +436,7 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
     return;
   case R_ARM_GOT32:
     /* we load the got offset */
-    *(int *)ptr += get_sym_attr(s1, sym_index, 0)->got_offset;
+    *(int *)ptr = get_sym_attr(s1, sym_index, 0)->got_offset;
     return;
   case R_ARM_GOT_PREL:
     /* we load the pc relative got offset */

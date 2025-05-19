@@ -2155,7 +2155,7 @@ static int sort_sections(TCCState *s1, int *sec_order, struct dyn_inf *d) {
     } else if (s == d->interp) {
       k = 0xff;
     } else if (s == rodata_section) {
-      k = 0x31; /* rodata */
+      k = 0x40; /* rodata */
     } else {
       k = 0x50; /* data */
     }
