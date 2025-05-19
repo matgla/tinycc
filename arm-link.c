@@ -135,7 +135,7 @@ ST_FUNC unsigned create_plt_entry(TCCState *s1, unsigned got_offset,
   /* empty PLT: create PLT0 entry that push address of call site and
      jump to ld.so resolution routine (GOT + 8) */
   if (plt->data_offset == 0) {
-    p = section_ptr_add(plt, 52);
+    p = section_ptr_add(plt, 32);
   }
   // write32le(p,    0xe52de004); /* push {lr}         */
   // write16le(p,    0xb500); // push {lr}
@@ -164,7 +164,7 @@ ST_FUNC void relocate_plt(TCCState *s1) {
 
   p = s1->plt->data;
   p_end = p + s1->plt->data_offset;
-  p += 52;
+  p += 32;
 
   if (p < p_end) {
     // int x = s1->got->sh_addr - s1->plt->sh_addr - 12;

@@ -800,8 +800,11 @@ LIBTCCAPI TCCState *tcc_new(void) {
   s->pic = 0;
 #if defined(TCC_TARGET_ARM) || defined(TCC_TARGET_ARM_THUMB)
   s->float_abi = ARM_FLOAT_ABI;
-  printf("Setting text and data separation to 0\n");
+  #if defined(TCC_TARGET_YASOS)
+  s->text_and_data_separation = 1;
+  #else 
   s->text_and_data_separation = 0;
+  #endif
 #endif
 #ifdef CONFIG_NEW_DTAGS
   s->enable_new_dtags = 1;
@@ -1506,7 +1509,7 @@ enum {
   TCC_OPTION_install_name,
   TCC_OPTION_compatibility_version,
   TCC_OPTION_current_version,
-  TCC_OPTION_mno_pic_data_is_text_relative,
+  TCC_OPTION_mpic_data_is_text_relative,
   TCC_OPTION_fpic,
   TCC_OPTION_fpie,
 };
@@ -1565,7 +1568,7 @@ static const TCCOption tcc_options[] = {
     {"fpic", TCC_OPTION_fpic, 0},
 #if defined(TCC_TARGET_ARM) || defined(TCC_TARGET_ARM_THUMB)
     {"mfloat-abi", TCC_OPTION_mfloat_abi, TCC_OPTION_HAS_ARG},
-    {"mno-pic-data-is-text-relative", TCC_OPTION_mno_pic_data_is_text_relative,
+    {"mpic-data-is-text-relative", TCC_OPTION_mpic_data_is_text_relative,
      0},
 #endif
     {"m", TCC_OPTION_m, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP},
@@ -2007,7 +2010,7 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv,
       else
         return tcc_error_noabort("unsupported float abi '%s'", optarg);
       break;
-    case TCC_OPTION_mno_pic_data_is_text_relative:
+    case TCC_OPTION_mpic_data_is_text_relative:
       printf("Setting text and data separation to: 1\n");
       s->text_and_data_separation = 1;
       break;

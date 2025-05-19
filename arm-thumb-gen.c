@@ -1371,10 +1371,20 @@ static void load_full_const(int r, int32_t imm, struct Sym *sym) {
       greloc(cur_text_section, sym, ind, R_ARM_ABS32);
   } else {
     if (sym) {
-      if (sym->type.t & VT_STATIC) {
-        greloc(cur_text_section, sym, ind, R_ARM_REL32);
+      if (text_and_data_separation) {
+        // all data except constants in .ro section, how can I distinguish that situation?
+        if (sym->type.t & VT_STATIC) {
+          greloc(cur_text_section, sym, ind, R_ARM_GOT32);
+        } else {
+          greloc(cur_text_section, sym, ind, R_ARM_GOT_PREL);
+        }
+ 
       } else {
-        greloc(cur_text_section, sym, ind, R_ARM_GOT_PREL);
+        if (sym->type.t & VT_STATIC) {
+          greloc(cur_text_section, sym, ind, R_ARM_REL32);
+        } else {
+          greloc(cur_text_section, sym, ind, R_ARM_GOT_PREL);
+        }
       }
     }
   }
@@ -1385,13 +1395,21 @@ static void load_full_const(int r, int32_t imm, struct Sym *sym) {
 
   if (pic) {
     if (sym) {
-      if (sym->type.t & VT_STATIC) {
-        ot_check(th_add_reg(r, r, R_PC));
-        ot_check(th_sub_imm(r, r, 8));
-      } else {
-        ot_check(th_add_reg(r, r, R_PC));
+      if (text_and_data_separation) {
+        // ot_check(th_mov_reg(R9, R9));
+        ot_check(th_add_reg(r, r, R9));
         ot_check(th_ldr_imm(r, r, 4, 6));
-        ot_check(th_add_imm(r, r, imm));
+ 
+        // ot_check(th_sub_imm(r, r, 8));
+      } else {
+        if (sym->type.t & VT_STATIC) {
+          ot_check(th_add_reg(r, r, R_PC));
+          ot_check(th_sub_imm(r, r, 8));
+        } else {
+          ot_check(th_add_reg(r, r, R_PC));
+          ot_check(th_ldr_imm(r, r, 4, 6));
+          ot_check(th_add_imm(r, r, imm));
+        }
       }
     }
   }

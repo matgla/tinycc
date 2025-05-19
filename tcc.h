@@ -1617,8 +1617,6 @@ ST_FUNC int set_global_sym(TCCState *s1, const char *name, Section *sec,
 
 #ifndef ELF_OBJ_ONLY
 ST_FUNC int tcc_load_dll(TCCState *s1, int fd, const char *filename, int level);
-ST_FUNC int tcc_load_yaff(TCCState *s1, int fd, const char *filename,
-                          int level);
 ST_FUNC int tcc_load_ldscript(TCCState *s1, int fd);
 ST_FUNC void tccelf_add_crtbegin(TCCState *s1);
 ST_FUNC void tccelf_add_crtend(TCCState *s1);
@@ -1626,6 +1624,8 @@ ST_FUNC void tccelf_add_crtend(TCCState *s1);
 #ifndef TCC_TARGET_PE
 ST_FUNC void tcc_add_runtime(TCCState *s1);
 #endif
+ST_FUNC int tcc_load_yaff(TCCState *s1, int fd, const char *filename,
+                          int level);
 
 /* ------------ xxx-link.c ------------ */
 
