@@ -395,6 +395,49 @@ static int run_safe_no_external_use(TCCIRState *ir, int base, int P, int N)
   return !unsafe;
 }
 
+/* True if the k=1 rename map binds every internal-defined vreg to itself.
+ * In that case the canonical body and iteration N-1 use the same vregs, so
+ * the rerolled loop produces the same final vreg values as the original
+ * unrolled run — external uses of those vregs see identical values, and
+ * the strict run_safe_no_external_use check is unnecessary. */
+static int run_has_identity_rename(TCCIRState *ir, int base, int P,
+                                   const VregSet *internal_defs)
+{
+  VregRenameMap map;
+  vrmap_init(&map);
+  if (!block_matches(ir, base, P, 1, &map, internal_defs)) {
+    vrmap_free(&map);
+    return 0;
+  }
+  /* For every internal vreg V that appears in the map, require V->V. */
+  for (int i = 0; i < map.count; i++) {
+    if (vrset_contains(internal_defs, map.src[i]) && map.src[i] != map.dst[i]) {
+      vrmap_free(&map);
+      return 0;
+    }
+  }
+  vrmap_free(&map);
+  return 1;
+}
+
+/* Reroll is safe iff either:
+ *   - no vreg defined in the run is referenced outside it (the classic
+ *     macro-unrolling case where each iteration uses fresh vregs), OR
+ *   - the iteration mapping is the identity for every internal vreg (the
+ *     self-feedback case: each iteration reads and writes the same vregs,
+ *     so the rerolled loop ends with the same vreg values as the unrolled
+ *     code would have produced). */
+static int reroll_is_safe(TCCIRState *ir, int base, int P, int N)
+{
+  VregSet defs;
+  vrset_init(&defs);
+  collect_body_defs(ir, base, P, &defs);
+  int ok = run_has_identity_rename(ir, base, P, &defs)
+        || run_safe_no_external_use(ir, base, P, N);
+  vrset_free(&defs);
+  return ok;
+}
+
 /* ============================================================================
  * Rewrite: replace the run with counter + canonical body + back-edge
  * ============================================================================ */
@@ -495,7 +538,7 @@ int tcc_ir_opt_reroll(TCCIRState *ir)
       }
     }
 
-    if (best_P > 0 && run_safe_no_external_use(ir, i, best_P, best_N)) {
+    if (best_P > 0 && reroll_is_safe(ir, i, best_P, best_N)) {
       reroll_rewrite(ir, i, best_P, best_N);
       rerolled++;
       /* Advance past the rerolled region.  The rewrite inserted 4 new

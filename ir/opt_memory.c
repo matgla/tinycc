@@ -3461,6 +3461,156 @@ static int irop_btype_byte_width(int btype)
   }
 }
 
+/* Resolve a single-def TEMP vreg to its base address (sym, byte_offset).
+ *
+ * The TEMP must have exactly one def anywhere in the function.  Recursion
+ * through an ASSIGN/LEA/ADD chain whose src1 is itself a single-def TEMP is
+ * supported up to a bounded depth, so chains like
+ *   T1 = &local
+ *   T2 = T1 + imm
+ *   *T2 = v
+ * resolve to (NULL, stack_off + imm). */
+static int rse_resolve_temp_addr_impl(TCCIRState *ir, int32_t vr,
+                                      const Sym **out_sym, int64_t *out_off,
+                                      int depth)
+{
+  if (depth <= 0)
+    return 0;
+  if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
+    return 0;
+
+  int def_idx = -1;
+  int def_count = 0;
+  for (int j = 0; j < ir->next_instruction_index; j++)
+  {
+    IRQuadCompact *dq = &ir->compact_instructions[j];
+    if (dq->op == TCCIR_OP_NOP)
+      continue;
+    if (dq->op == TCCIR_OP_STORE_INDEXED || dq->op == TCCIR_OP_STORE_POSTINC)
+      continue;
+    if (!irop_config[dq->op].has_dest)
+      continue;
+    IROperand d = tcc_ir_op_get_dest(ir, dq);
+    if (d.is_lval)
+      continue;
+    if (irop_get_vreg(d) == vr &&
+        TCCIR_DECODE_VREG_TYPE(irop_get_vreg(d)) == TCCIR_VREG_TYPE_TEMP)
+    {
+      def_idx = j;
+      if (++def_count > 1)
+        return 0;
+    }
+  }
+  if (def_idx < 0 || def_count != 1)
+    return 0;
+
+  IRQuadCompact *dq = &ir->compact_instructions[def_idx];
+  if (dq->op != TCCIR_OP_ADD && dq->op != TCCIR_OP_LEA && dq->op != TCCIR_OP_ASSIGN)
+    return 0;
+  IROperand s1 = tcc_ir_op_get_src1(ir, dq);
+
+  int64_t base_off = 0;
+  const Sym *base_sym = NULL;
+  int resolved = 0;
+
+  /* Case A: src1 is a SYMREF (&global + addend). */
+  if (s1.is_sym && !s1.is_lval)
+  {
+    IRPoolSymref *sr = irop_get_symref_ex(ir, s1);
+    if (!sr || !sr->sym)
+      return 0;
+    base_sym = sr->sym;
+    base_off = (int64_t)sr->addend;
+    resolved = 1;
+  }
+  /* Case B: src1 is a stack-local STACKOFF (Addr[StackLoc[off]]). */
+  else if (s1.is_local && !s1.is_lval && !s1.is_llocal && irop_get_tag(s1) == IROP_TAG_STACKOFF)
+  {
+    base_sym = NULL;
+    base_off = irop_get_stack_offset(s1);
+    resolved = 1;
+  }
+  /* Case C: src1 is itself a TEMP — recurse. */
+  else if (!s1.is_lval && irop_get_tag(s1) == IROP_TAG_VREG)
+  {
+    int32_t inner_vr = irop_get_vreg(s1);
+    if (!rse_resolve_temp_addr_impl(ir, inner_vr, &base_sym, &base_off, depth - 1))
+      return 0;
+    resolved = 1;
+  }
+
+  if (!resolved)
+    return 0;
+
+  if (dq->op == TCCIR_OP_ADD)
+  {
+    IROperand s2 = tcc_ir_op_get_src2(ir, dq);
+    if (!irop_is_immediate(s2))
+      return 0;
+    base_off += irop_get_imm64_ex(ir, s2);
+  }
+
+  *out_sym = base_sym;
+  *out_off = base_off;
+  return 1;
+}
+
+static int rse_resolve_temp_addr(TCCIRState *ir, int32_t vr,
+                                 const Sym **out_sym, int64_t *out_off)
+{
+  return rse_resolve_temp_addr_impl(ir, vr, out_sym, out_off, 4);
+}
+
+/* Resolve a store's destination to a (sym, byte_offset) pair.
+ * Handles direct SYMREF dest, TEMP-DEREF plain STORE, and STORE_INDEXED
+ * with TEMP base.  Returns 1 on success. */
+static int rse_resolve_store_addr(TCCIRState *ir, IRQuadCompact *q,
+                                  const Sym **out_sym, int64_t *out_off)
+{
+  IROperand dest = tcc_ir_op_get_dest(ir, q);
+  int op = q->op;
+  if (op != TCCIR_OP_STORE && op != TCCIR_OP_STORE_INDEXED)
+    return 0;
+
+  int64_t extra = 0;
+  if (op == TCCIR_OP_STORE_INDEXED)
+  {
+    IROperand idx = tcc_ir_op_get_src2(ir, q);
+    if (!irop_is_immediate(idx))
+      return 0;
+    int64_t scale = 0;
+    IROperand sc = tcc_ir_op_get_scale(ir, q);
+    if (irop_is_immediate(sc))
+      scale = irop_get_imm64_ex(ir, sc);
+    extra = irop_get_imm64_ex(ir, idx) << scale;
+  }
+
+  /* Direct SYMREF dest. For plain STORE the dest must be an lval; for
+   * STORE_INDEXED the base may have been stripped of is_lval by disp_fusion. */
+  if (dest.is_sym)
+  {
+    if (op == TCCIR_OP_STORE && !dest.is_lval)
+      return 0;
+    IRPoolSymref *sr = irop_get_symref_ex(ir, dest);
+    if (!sr || !sr->sym)
+      return 0;
+    *out_sym = sr->sym;
+    *out_off = (int64_t)sr->addend + extra;
+    return 1;
+  }
+
+  /* TEMP base form: dest is the TEMP holding the address. */
+  if (op == TCCIR_OP_STORE && !dest.is_lval)
+    return 0;
+  if (op == TCCIR_OP_STORE_INDEXED && dest.is_lval)
+    return 0;
+  int32_t vr = irop_get_vreg(dest);
+  if (!rse_resolve_temp_addr(ir, vr, out_sym, out_off))
+    return 0;
+  *out_off += extra;
+  return 1;
+}
+
 /* Redundant Store Elimination
  * Phase 4: Remove stores to memory locations that are overwritten before being read
  * (dead stores to memory)
@@ -3478,14 +3628,20 @@ int tcc_ir_opt_store_redundant(TCCIRState *ir)
    *
    * If the table fills up (> RSE_MAX_ACTIVE distinct live stores in one block)
    * the excess stores are simply not tracked — conservative, never wrong. */
-#define RSE_MAX_ACTIVE 16
+#define RSE_MAX_ACTIVE 64
   typedef struct
   {
     int64_t offset;
     const Sym *sym;
     int store_idx;
     int btype;     /* VT_BYTE / VT_INT / etc. — width of the store */
-    int is_global; /* 1 = global symref entry, 0 = local stack slot */
+    int is_global;     /* 1 = global symref entry, 0 = local stack slot */
+    int via_temp_base; /* 1 = entry was tracked via a single-def TEMP base
+                        * (rse_resolve_store_addr).  For such entries, src
+                        * operands carrying the same address-of-local with
+                        * is_lval=0 are not reads — only true lval accesses
+                        * (is_lval=1) evict.  Unknown-pointer STORE and CALL
+                        * still flush them. */
   } RseSlot;
 
   int n = ir->next_instruction_index;
@@ -3515,71 +3671,131 @@ int tcc_ir_opt_store_redundant(TCCIRState *ir)
     }
 
     /* READ check: any instruction that uses a local OR global address as
-     * src1 or src2 keeps the corresponding pending store alive. */
+     * src1 or src2 keeps the corresponding pending store alive.
+     *
+     * For an entry tracked via TEMP-base resolution, an address-of-local
+     * src (is_local && !is_lval) is NOT a read — it's just computing the
+     * address into a register.  Only an actual lvalue read (is_lval=1)
+     * evicts those entries.  Escape risks (the address being PARAMmed or
+     * stored to memory) are caught by the CALL flush and the unknown-pointer
+     * STORE flush below.
+     *
+     * Additionally, a TEMP-DEREF src (vreg with is_lval=1) is a read through
+     * the TEMP's address — resolve the TEMP to (sym, off) and evict any
+     * matching entry.  This is required for soundness of via_temp_base
+     * tracking: e.g. `T = &local; *T &= mask; *T |= bits; ...` does a
+     * read of *local at each `*T` use. */
+#define RSE_EVICT_FOR_SRC(SRC_OP)                                                                                       \
+  do                                                                                                                    \
+  {                                                                                                                     \
+    IROperand _src = (SRC_OP);                                                                                          \
+    if (_src.is_local || (_src.is_sym && _src.is_lval))                                                                 \
+    {                                                                                                                   \
+      int64_t _off;                                                                                                     \
+      const Sym *_sym;                                                                                                  \
+      if (_src.is_sym)                                                                                                  \
+      {                                                                                                                 \
+        IRPoolSymref *_sr = irop_get_symref_ex(ir, _src);                                                               \
+        _sym = _sr ? _sr->sym : NULL;                                                                                   \
+        _off = _sr ? _sr->addend : 0;                                                                                   \
+      }                                                                                                                 \
+      else                                                                                                              \
+      {                                                                                                                 \
+        _off = irop_get_imm64_ex(ir, _src);                                                                             \
+        _sym = irop_get_sym_ex(ir, _src);                                                                               \
+      }                                                                                                                \
+      for (int _k = 0; _k < active_count; _k++)                                                                         \
+      {                                                                                                                 \
+        if (active[_k].sym == _sym && active[_k].offset == _off)                                                        \
+        {                                                                                                               \
+          if (active[_k].via_temp_base && !_src.is_lval)                                                                \
+            break; /* not a read of this TEMP-resolved entry — keep alive */                                            \
+          active[_k] = active[--active_count];                                                                          \
+          break;                                                                                                        \
+        }                                                                                                               \
+      }                                                                                                                 \
+    }                                                                                                                   \
+    else if (_src.is_lval && irop_get_tag(_src) == IROP_TAG_VREG)                                                       \
+    {                                                                                                                   \
+      /* TEMP-DEREF read: try to resolve the TEMP to a (sym, off). */                                                   \
+      const Sym *_sym;                                                                                                  \
+      int64_t _off;                                                                                                     \
+      if (rse_resolve_temp_addr(ir, irop_get_vreg(_src), &_sym, &_off))                                                 \
+      {                                                                                                                 \
+        for (int _k = 0; _k < active_count; _k++)                                                                       \
+        {                                                                                                               \
+          if (active[_k].sym == _sym && active[_k].offset == _off)                                                      \
+          {                                                                                                             \
+            active[_k] = active[--active_count];                                                                        \
+            break;                                                                                                      \
+          }                                                                                                             \
+        }                                                                                                               \
+      }                                                                                                                 \
+    }                                                                                                                   \
+  } while (0)
     if (irop_config[q->op].has_src1)
-    {
-      IROperand src1 = tcc_ir_op_get_src1(ir, q);
-      if (src1.is_local || (src1.is_sym && src1.is_lval))
-      {
-        int64_t off;
-        const Sym *sym;
-        if (src1.is_sym)
-        {
-          IRPoolSymref *sr = irop_get_symref_ex(ir, src1);
-          sym = sr ? sr->sym : NULL;
-          off = sr ? sr->addend : 0;
-        }
-        else
-        {
-          off = irop_get_imm64_ex(ir, src1);
-          sym = irop_get_sym_ex(ir, src1);
-        }
-        for (int k = 0; k < active_count; k++)
-        {
-          if (active[k].sym == sym && active[k].offset == off)
-          {
-            active[k] = active[--active_count]; /* evict (swap-remove) */
-            break;
-          }
-        }
-      }
-    }
+      RSE_EVICT_FOR_SRC(tcc_ir_op_get_src1(ir, q));
     if (irop_config[q->op].has_src2)
-    {
-      IROperand src2 = tcc_ir_op_get_src2(ir, q);
-      if (src2.is_local || (src2.is_sym && src2.is_lval))
-      {
-        int64_t off;
-        const Sym *sym;
-        if (src2.is_sym)
-        {
-          IRPoolSymref *sr = irop_get_symref_ex(ir, src2);
-          sym = sr ? sr->sym : NULL;
-          off = sr ? sr->addend : 0;
-        }
-        else
-        {
-          off = irop_get_imm64_ex(ir, src2);
-          sym = irop_get_sym_ex(ir, src2);
-        }
-        for (int k = 0; k < active_count; k++)
-        {
-          if (active[k].sym == sym && active[k].offset == off)
-          {
-            active[k] = active[--active_count];
-            break;
-          }
-        }
-      }
-    }
+      RSE_EVICT_FOR_SRC(tcc_ir_op_get_src2(ir, q));
+#undef RSE_EVICT_FOR_SRC
 
-    /* STORE to a local non-addr-taken address, or to a global symref. */
-    if (q->op == TCCIR_OP_STORE)
+    /* STORE / STORE_INDEXED to a local non-addr-taken address, or to a
+     * global/anon SYMREF (directly, or via a single-def TEMP base that traces
+     * to one). */
+    if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED)
     {
       IROperand dest = tcc_ir_op_get_dest(ir, q);
-      int dest_is_global = (dest.is_sym && dest.is_lval);
-      if (!dest.is_local && !dest_is_global)
+      int dest_is_global = (dest.is_sym && (dest.is_lval || q->op == TCCIR_OP_STORE_INDEXED));
+      int dest_is_local = (q->op == TCCIR_OP_STORE) && dest.is_local;
+      if (!dest_is_local && !dest_is_global)
       {
+        /* Try resolving a TEMP base through its single def. */
+        const Sym *resolved_sym = NULL;
+        int64_t resolved_off = 0;
+        if (rse_resolve_store_addr(ir, q, &resolved_sym, &resolved_off))
+        {
+          /* For STORE_INDEXED, access width is from src1 (the stored value),
+           * not dest (which is the base address). */
+          int store_btype;
+          if (q->op == TCCIR_OP_STORE_INDEXED)
+            store_btype = tcc_ir_op_get_src1(ir, q).btype;
+          else
+            store_btype = dest.btype;
+          int found = -1;
+          for (int k = 0; k < active_count; k++)
+          {
+            if (active[k].sym == resolved_sym && active[k].offset == resolved_off)
+            {
+              found = k;
+              break;
+            }
+          }
+          if (found >= 0 && irop_btype_byte_width(store_btype) >= irop_btype_byte_width(active[found].btype))
+          {
+            LOG_IR_GEN("OPTIMIZE: Redundant store at i=%d (overwritten without read, indirect)",
+                       active[found].store_idx);
+            ir->compact_instructions[active[found].store_idx].op = TCCIR_OP_NOP;
+            changes++;
+            active[found].store_idx = i;
+            active[found].btype = store_btype;
+          }
+          else if (found >= 0)
+          {
+            active[found] = active[--active_count];
+          }
+          else if (active_count < RSE_MAX_ACTIVE)
+          {
+            active[active_count].sym = resolved_sym;
+            active[active_count].offset = resolved_off;
+            active[active_count].store_idx = i;
+            active[active_count].btype = store_btype;
+            active[active_count].is_global = 1;
+            active[active_count].via_temp_base = 1;
+            active_count++;
+          }
+          continue;
+        }
+
         /* STORE through unknown pointer — could alias any tracked global.
          * Local entries are safe (non-addrtaken locals can't be aliased). */
         for (int k = 0; k < active_count;)
@@ -3614,6 +3830,17 @@ int tcc_ir_opt_store_redundant(TCCIRState *ir)
         IRPoolSymref *dr = irop_get_symref_ex(ir, dest);
         sym = dr ? dr->sym : NULL;
         off = dr ? dr->addend : 0;
+        if (q->op == TCCIR_OP_STORE_INDEXED)
+        {
+          IROperand idx = tcc_ir_op_get_src2(ir, q);
+          if (!irop_is_immediate(idx))
+            continue;
+          int64_t scale = 0;
+          IROperand sc = tcc_ir_op_get_scale(ir, q);
+          if (irop_is_immediate(sc))
+            scale = irop_get_imm64_ex(ir, sc);
+          off += irop_get_imm64_ex(ir, idx) << scale;
+        }
       }
       else
       {
@@ -3621,7 +3848,13 @@ int tcc_ir_opt_store_redundant(TCCIRState *ir)
         sym = irop_get_sym_ex(ir, dest);
       }
 
-      int store_btype = dest.btype;
+      /* For STORE_INDEXED, access width is from src1 (the stored value),
+       * not dest (which is the base address). */
+      int store_btype;
+      if (q->op == TCCIR_OP_STORE_INDEXED)
+        store_btype = tcc_ir_op_get_src1(ir, q).btype;
+      else
+        store_btype = dest.btype;
 
       /* Look for a previous pending store to the same address. */
       int found = -1;
@@ -3659,6 +3892,7 @@ int tcc_ir_opt_store_redundant(TCCIRState *ir)
         active[active_count].store_idx = i;
         active[active_count].btype = store_btype;
         active[active_count].is_global = dest_is_global;
+        active[active_count].via_temp_base = 0;
         active_count++;
       }
       /* else: table full — skip this store conservatively */
@@ -5102,7 +5336,10 @@ int tcc_ir_opt_global_sl_fwd(TCCIRState *ir)
     Sym *sym;
     int64_t addend;
     int btype;
-    int32_t value_vr; /* vreg holding the stored value */
+    int32_t value_vr;   /* vreg holding the stored value, or -1 if immediate */
+    int64_t value_imm;  /* immediate value when value_vr == -1 */
+    int     imm_is_i32; /* 1 if value_imm fits in int32 (build imm32 operand);
+                           0 means build a fresh i64 pool entry on each use */
   } entries[GSLFWD_MAX_ENTRIES];
   int entry_count = 0;
 
@@ -5112,9 +5349,20 @@ int tcc_ir_opt_global_sl_fwd(TCCIRState *ir)
     if (q->op == TCCIR_OP_NOP)
       continue;
 
-    /* BB boundaries clear everything. */
-    if (q->is_jump_target || q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF || q->op == TCCIR_OP_IJUMP ||
-        q->op == TCCIR_OP_RETURNVALUE || q->op == TCCIR_OP_RETURNVOID || q->op == TCCIR_OP_SWITCH_TABLE)
+    /* Multi-predecessor join points clear everything — we can't know which
+     * path's tracked state holds.  Clearing is for the state going *into*
+     * this instruction; the instruction itself (e.g. a STORE that is also
+     * the target of a forward JUMP) should still be processed below to seed
+     * tracking for subsequent ops.  JUMP/JUMPIF themselves don't write
+     * memory, so we don't clear there; the fall-through after a JUMPIF (or
+     * any sequential successor that's not is_jump_target) safely inherits
+     * state.  RETURN / SWITCH_TABLE / IJUMP transfer control without writing,
+     * but their successors are unreachable as fall-through, so clearing is
+     * just defensive. */
+    if (q->is_jump_target)
+      entry_count = 0;
+    if (q->op == TCCIR_OP_IJUMP || q->op == TCCIR_OP_RETURNVALUE ||
+        q->op == TCCIR_OP_RETURNVOID || q->op == TCCIR_OP_SWITCH_TABLE)
     {
       entry_count = 0;
       continue;
@@ -5148,7 +5396,20 @@ int tcc_ir_opt_global_sl_fwd(TCCIRState *ir)
           if (entries[k].sym != uref->sym || entries[k].addend != uref->addend ||
               entries[k].btype != btype)
             continue;
-          IROperand newop = irop_make_vreg(entries[k].value_vr, btype);
+          IROperand newop;
+          if (entries[k].value_vr >= 0)
+          {
+            newop = irop_make_vreg(entries[k].value_vr, btype);
+          }
+          else if (entries[k].imm_is_i32)
+          {
+            newop = irop_make_imm32(-1, (int32_t)entries[k].value_imm, btype);
+          }
+          else
+          {
+            uint32_t pool_idx = tcc_ir_pool_add_i64(ir, entries[k].value_imm);
+            newop = irop_make_i64(-1, pool_idx, btype);
+          }
           newop.is_unsigned = u.is_unsigned;
           if (s == 0)
             tcc_ir_set_src1(ir, i, newop);
@@ -5173,12 +5434,15 @@ int tcc_ir_opt_global_sl_fwd(TCCIRState *ir)
         if (!dref || !dref->sym)
           continue;
         int dbtype = irop_get_btype(dest);
+        /* Two trackable forms:
+         *   (a) plain value vreg with no lval/sym flag — substitute with vreg
+         *   (b) immediate constant — substitute as imm32/i64
+         * Anything else (e.g. another lval, address-of) we conservatively
+         * invalidate.  Keep the INT32 restriction to match addrof_var_fwd. */
         int32_t val_vr = irop_get_vreg(src1);
-        /* Only track when the source is a plain value vreg with no lval/sym
-         * flag (so the value is directly usable as a substitution).  And
-         * skip non-INT32 to match the conservative scope of the addrof_var
-         * pass — wider/FP types need more careful interval reasoning. */
-        if (val_vr < 0 || src1.is_lval || src1.is_sym || dbtype != IROP_BTYPE_INT32)
+        int store_is_plain_vreg = (val_vr >= 0 && !src1.is_lval && !src1.is_sym);
+        int store_is_imm = irop_is_immediate(src1);
+        if (dbtype != IROP_BTYPE_INT32 || (!store_is_plain_vreg && !store_is_imm))
         {
           /* still invalidate any existing entry for this sym/addend */
           for (int k = 0; k < entry_count;)
@@ -5197,7 +5461,19 @@ int tcc_ir_opt_global_sl_fwd(TCCIRState *ir)
           if (entries[k].sym == dref->sym && entries[k].addend == dref->addend)
           {
             entries[k].btype = dbtype;
-            entries[k].value_vr = val_vr;
+            if (store_is_plain_vreg)
+            {
+              entries[k].value_vr = val_vr;
+              entries[k].value_imm = 0;
+              entries[k].imm_is_i32 = 0;
+            }
+            else
+            {
+              int64_t v = irop_get_imm64_ex(ir, src1);
+              entries[k].value_vr = -1;
+              entries[k].value_imm = v;
+              entries[k].imm_is_i32 = (v == (int32_t)v);
+            }
             found = 1;
             break;
           }
@@ -5207,7 +5483,19 @@ int tcc_ir_opt_global_sl_fwd(TCCIRState *ir)
           entries[entry_count].sym = dref->sym;
           entries[entry_count].addend = dref->addend;
           entries[entry_count].btype = dbtype;
-          entries[entry_count].value_vr = val_vr;
+          if (store_is_plain_vreg)
+          {
+            entries[entry_count].value_vr = val_vr;
+            entries[entry_count].value_imm = 0;
+            entries[entry_count].imm_is_i32 = 0;
+          }
+          else
+          {
+            int64_t v = irop_get_imm64_ex(ir, src1);
+            entries[entry_count].value_vr = -1;
+            entries[entry_count].value_imm = v;
+            entries[entry_count].imm_is_i32 = (v == (int32_t)v);
+          }
           entry_count++;
         }
         continue;
@@ -5228,7 +5516,9 @@ int tcc_ir_opt_global_sl_fwd(TCCIRState *ir)
       continue;
     }
 
-    /* If this op redefines a tracked value vreg, drop the entry. */
+    /* If this op redefines a tracked value vreg, drop the entry.
+     * Immediate-valued entries (value_vr == -1) are independent of any
+     * specific vreg and need no invalidation here. */
     if (irop_config[q->op].has_dest)
     {
       IROperand d = tcc_ir_op_get_dest(ir, q);
@@ -5237,7 +5527,7 @@ int tcc_ir_opt_global_sl_fwd(TCCIRState *ir)
       {
         for (int k = 0; k < entry_count;)
         {
-          if (entries[k].value_vr == d_vr)
+          if (entries[k].value_vr >= 0 && entries[k].value_vr == d_vr)
             entries[k] = entries[--entry_count];
           else
             k++;
@@ -5258,3 +5548,145 @@ int tcc_ir_opt_dead_local_slot_elim_ex(IROptCtx *ctx) { return tcc_ir_opt_dead_l
 int tcc_ir_opt_dead_temp_local_elim_ex(IROptCtx *ctx) { return tcc_ir_opt_dead_temp_local_elim(ctx->ir); }
 int tcc_ir_opt_addrof_var_fwd_ex(IROptCtx *ctx) { return tcc_ir_opt_addrof_var_fwd(ctx->ir); }
 int tcc_ir_opt_global_sl_fwd_ex(IROptCtx *ctx) { return tcc_ir_opt_global_sl_fwd(ctx->ir); }
+
+/* ============================================================================
+ * Dead Static Store Elimination (tcc_ir_opt_dead_static_store_elim)
+ * ----------------------------------------------------------------------------
+ * Eliminate STORE / STORE_INDEXED / STORE_POSTINC operations whose destination
+ * is a SYMREF to a file-scope static global that the end-of-TU read-set
+ * analysis marked as tu_no_readers (no reachable function in the TU reads it,
+ * and its address has not escaped).
+ *
+ * Runs only during the late_reopt phase — sym->a.tu_no_readers is set only
+ * after the entire TU has been parsed and the call-graph reachability /
+ * read-set analysis has completed.  During the initial per-function compile
+ * we have no TU-wide information yet, so this pass is a no-op.
+ *
+ * Stores to such globals would never be observed by program execution, so
+ * NOPing them is safe.  Cascade with DCE removes the materialization
+ * sequence that fed the now-dead store (RHS computation, LEA for the
+ * symbol's address, etc.).
+ * ============================================================================ */
+/* Helper: extract a SYMREF Sym* from a STORE's destination, accounting for
+ * pre-fusion forms.  Direct shapes:
+ *
+ *   - dest = SYMREF (lval or, for STORE_INDEXED/POSTINC, possibly cleared lval)
+ *
+ * Indirect shape (pre-fusion):
+ *
+ *   - dest = TEMP (lval, "deref through pointer")
+ *     where TEMP is defined exactly once by ADD/LEA/ASSIGN whose src1 is a
+ *     SYMREF — i.e. `T = &sym + idx_scaled; *T = value`
+ *
+ * Returns the underlying Sym* on success, NULL otherwise. */
+static Sym *dss_resolve_store_dest_sym(TCCIRState *ir, IRQuadCompact *q,
+                                       int store_idx)
+{
+  IROperand dest = tcc_ir_op_get_dest(ir, q);
+
+  if (dest.is_sym)
+  {
+    /* For STORE the dest must be the lval; STORE_INDEXED/POSTINC may have
+     * had is_lval cleared on the base by disp_fusion. */
+    if (!dest.is_lval && q->op == TCCIR_OP_STORE)
+      return NULL;
+    IRPoolSymref *ref = irop_get_symref_ex(ir, dest);
+    return ref ? ref->sym : NULL;
+  }
+
+  /* Indirect TEMP-DEREF form: only meaningful for plain STORE. */
+  if (q->op != TCCIR_OP_STORE || !dest.is_lval)
+    return NULL;
+  int32_t vr = irop_get_vreg(dest);
+  if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
+    return NULL;
+
+  /* Find the single def of this TEMP.  Bail if multiply defined or if
+   * any other op between the def and store could re-bind a SYMREF into
+   * the chain (very conservative — we only accept a single-def TEMP). */
+  int def_idx = -1;
+  int def_count = 0;
+  for (int j = 0; j < ir->next_instruction_index; j++)
+  {
+    IRQuadCompact *dq = &ir->compact_instructions[j];
+    if (dq->op == TCCIR_OP_NOP)
+      continue;
+    if (!irop_config[dq->op].has_dest)
+      continue;
+    IROperand d = tcc_ir_op_get_dest(ir, dq);
+    if (d.is_lval)
+      continue; /* address-use, not a def */
+    if (irop_get_vreg(d) == vr &&
+        TCCIR_DECODE_VREG_TYPE(irop_get_vreg(d)) == TCCIR_VREG_TYPE_TEMP)
+    {
+      def_idx = j;
+      def_count++;
+      if (def_count > 1)
+        return NULL;
+    }
+  }
+  if (def_idx < 0 || def_count != 1)
+    return NULL;
+
+  IRQuadCompact *dq = &ir->compact_instructions[def_idx];
+  if (dq->op != TCCIR_OP_ADD && dq->op != TCCIR_OP_LEA &&
+      dq->op != TCCIR_OP_ASSIGN)
+    return NULL;
+  IROperand s1 = tcc_ir_op_get_src1(ir, dq);
+  if (!s1.is_sym)
+    return NULL;
+  /* Reject lval src1 — that would be a load through the symbol, not the
+   * symbol's address.  For an ADD/LEA, src1 holds the base address as a
+   * non-lval SYMREF operand. */
+  if (s1.is_lval)
+    return NULL;
+  IRPoolSymref *ref = irop_get_symref_ex(ir, s1);
+  return ref ? ref->sym : NULL;
+}
+
+int tcc_ir_opt_dead_static_store_elim(TCCIRState *ir)
+{
+  if (!ir || !tcc_state)
+    return 0;
+  /* Only fires during the end-of-TU re-optimization pass: tu_no_readers is
+   * set only then, so running this pass during the first-pass compile would
+   * always be a no-op anyway.  Gating keeps it cheap. */
+  if (!tcc_state->ir_late_reopt_phase)
+    return 0;
+
+  const int n = ir->next_instruction_index;
+  int changes = 0;
+
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_STORE && q->op != TCCIR_OP_STORE_INDEXED &&
+        q->op != TCCIR_OP_STORE_POSTINC)
+      continue;
+
+    Sym *sym = dss_resolve_store_dest_sym(ir, q, i);
+    if (!sym)
+      continue;
+    if (!sym->a.tu_no_readers)
+      continue;
+    if (sym->a.addrtaken)
+      continue;
+    /* Volatile stores must remain observable even if no C-level reader
+     * exists (hardware register access). */
+    if (sym->type.t & VT_VOLATILE)
+      continue;
+
+    LOG_IR_GEN("DEAD_STATIC_STORE: NOPed STORE at i=%d -> %s", i,
+               get_tok_str(sym->v & ~SYM_FIELD, NULL));
+
+    q->op = TCCIR_OP_NOP;
+    changes++;
+  }
+
+  return changes;
+}
+
+int tcc_ir_opt_dead_static_store_elim_ex(IROptCtx *ctx)
+{
+  return tcc_ir_opt_dead_static_store_elim(ctx->ir);
+}

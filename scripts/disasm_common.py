@@ -18,6 +18,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 TCC_DIR = SCRIPT_DIR.parent
 DEFAULT_TCC = TCC_DIR / "armv8m-tcc"
 CACHE_FILE = SCRIPT_DIR / ".disasm_cache.json"
+PENDING_CACHE_FILE = SCRIPT_DIR / ".disasm_cache.pending.json"
 
 _HEADER_RE = re.compile(r'^[0-9a-f]+ <.*>:$')
 _HEADER_NAME_RE = re.compile(r'<(.+)>:')
@@ -234,8 +235,9 @@ def compare_functions(tcc_dump, gcc_dump, common_funcs):
 # ── Cache ──
 
 class DisasmCache:
-    def __init__(self, path=None):
+    def __init__(self, path=None, pending_path=None):
         self.path = Path(path) if path else CACHE_FILE
+        self.pending_path = Path(pending_path) if pending_path else PENDING_CACHE_FILE
         self.data = {}
         self._load()
 
@@ -249,30 +251,57 @@ class DisasmCache:
     def save(self):
         self.path.write_text(json.dumps(self.data, indent=2, sort_keys=True) + "\n")
 
+    def save_pending(self):
+        """Stage the current data to the pending file.  The main cache is
+        not touched; promote later via DisasmCache.promote_pending()."""
+        self.pending_path.write_text(json.dumps(self.data, indent=2, sort_keys=True) + "\n")
+
+    @staticmethod
+    def promote_pending(main_path=None, pending_path=None):
+        """Atomically replace the main cache file with the pending file.
+        Returns True if a pending file existed and was promoted, False otherwise."""
+        main = Path(main_path) if main_path else CACHE_FILE
+        pending = Path(pending_path) if pending_path else PENDING_CACHE_FILE
+        if not pending.exists():
+            return False
+        pending.replace(main)  # atomic on POSIX
+        return True
+
+    @staticmethod
+    def discard_pending(pending_path=None):
+        """Remove the pending file if present.  Returns True if removed."""
+        pending = Path(pending_path) if pending_path else PENDING_CACHE_FILE
+        if not pending.exists():
+            return False
+        pending.unlink()
+        return True
+
     def get(self, key):
         return self.data.get(key)
 
-    def update_if_better(self, key, tcc_count, gcc_count):
+    def update_if_better(self, key, tcc_count, gcc_count, mutate=True):
         entry = self.data.get(key)
         if entry is None or tcc_count < entry["tcc"]:
-            self.data[key] = {
-                "tcc": tcc_count,
-                "gcc": gcc_count,
-                "updated": datetime.now(timezone.utc).isoformat(),
-            }
-            return "improved"
-        elif tcc_count > entry["tcc"]:
-            if tcc_count <= gcc_count:
+            if mutate:
                 self.data[key] = {
                     "tcc": tcc_count,
                     "gcc": gcc_count,
                     "updated": datetime.now(timezone.utc).isoformat(),
                 }
+            return "improved"
+        elif tcc_count > entry["tcc"]:
+            if tcc_count <= gcc_count:
+                if mutate:
+                    self.data[key] = {
+                        "tcc": tcc_count,
+                        "gcc": gcc_count,
+                        "updated": datetime.now(timezone.utc).isoformat(),
+                    }
                 return "overwritten"
             return "regression"
         return "unchanged"
 
-    def check_regressions(self, func_results, key_prefix=""):
+    def check_regressions(self, func_results, key_prefix="", mutate=True):
         regressions = []
         improvements = []
         overwritten = []
@@ -306,7 +335,7 @@ class DisasmCache:
                         suite_stats[suite]["bad"] += 1
             entry = self.data.get(key)
             old_tcc = entry["tcc"] if entry else None
-            status = self.update_if_better(key, tcc_count, gcc_count)
+            status = self.update_if_better(key, tcc_count, gcc_count, mutate=mutate)
             if status == "regression":
                 cached = self.data[key]
                 regressions.append((key, cached["tcc"], tcc_count))

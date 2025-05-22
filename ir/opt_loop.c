@@ -1050,3 +1050,391 @@ int tcc_ir_opt_decrement_to_zero(TCCIRState *ir)
   tcc_ir_free_loops(loops);
   return total_changes;
 }
+
+/* ============================================================================
+ * Pointer-IV Exit-Value Substitution
+ * ============================================================================
+ *
+ * For loops with constant trip count, replace post-loop uses of pointer
+ * induction variables with their closed-form exit value.
+ *
+ * Pattern recognized:
+ *   preheader: V = Addr[StackLoc[X]]    (pointer IV init)
+ *   loop body: V = V + step             (pure linear step)
+ *              (or copy-through: T = V; V = T + step)
+ *   exit:      ...CMP V, Addr[StackLoc[Y]]...    (post-loop use)
+ *
+ * If trip_count is statically known to be N (from a counter IV with constant
+ * bounds in the same loop), V's exit value is `Addr[StackLoc[X + step*N]]`.
+ * Substitute that operand directly in post-loop instructions; cmp_stack_addr_fold
+ * (run immediately after) collapses the comparison when it becomes
+ * `CMP Addr[StackLoc[K]], Addr[StackLoc[K]]`.
+ *
+ * Why this matters: idiomatic post-loop checks like `if (p != &a[N]) abort();`
+ * (e.g. pr49644.c) become dead, exposing the abort() branch as unreachable and
+ * eventually letting DCE/dead-store kill the loop body.
+ *
+ * Conservative scope:
+ *   - Trip count must be statically known > 0 (so the IV is actually stepped).
+ *   - V must have a unique self-add inside the loop (no other defs).
+ *   - The preheader-side def of V must be `V = Addr[StackLoc[X]]` reachable
+ *     from preheader_idx without an intervening def of V or jump_target merge.
+ *   - V's btype must be 32-bit (where stack offsets live).
+ *   - Substitute only into instructions reachable from the loop's exit_target
+ *     and dominated by it (we approximate: walk forward from exit_target, stop
+ *     at any redefinition of V, any jump backward, or any jump target reached
+ *     from an external source — for safety we bail on any is_jump_target seen
+ *     after the first instruction).
+ */
+
+typedef struct PtrIV
+{
+  int32_t vreg;       /* the pointer VAR */
+  int32_t init_off;   /* StackLoc offset at preheader */
+  int     step;       /* increment per iteration */
+  int     init_idx;   /* index of the init ASSIGN */
+  int     def_idx;    /* index of the in-loop self-add */
+  int     is_llocal;  /* preserve llocal flag from init */
+  int     is_param;   /* preserve param flag from init */
+  int     btype;
+} PtrIV;
+
+#define PTRIV_MAX 8
+
+/* Try to recognize an instruction range inside `loop` as a pointer-IV self-add
+ * pattern; if so, populate `*out` and return 1.  Handles both shapes:
+ *   direct:        V = V + #step
+ *   copy-through:  T = V;  V = T + #step
+ */
+static int ptr_iv_find_loop_step(TCCIRState *ir, IRLoop *loop, int instr_idx,
+                                 int32_t *out_vreg, int *out_step)
+{
+  IRQuadCompact *q = &ir->compact_instructions[instr_idx];
+  if (q->op != TCCIR_OP_ADD)
+    return 0;
+  IROperand dest = tcc_ir_op_get_dest(ir, q);
+  IROperand src1 = tcc_ir_op_get_src1(ir, q);
+  IROperand src2 = tcc_ir_op_get_src2(ir, q);
+  int32_t d_vr = irop_get_vreg(dest);
+  int32_t s1_vr = irop_get_vreg(src1);
+  if (d_vr < 0 || TCCIR_DECODE_VREG_TYPE(d_vr) != TCCIR_VREG_TYPE_VAR)
+    return 0;
+  if (!irop_is_immediate(src2))
+    return 0;
+  int step = (int)irop_get_imm64_ex(ir, src2);
+  if (step == 0)
+    return 0;
+
+  /* Direct pattern: dest_vr == src1_vr */
+  if (s1_vr == d_vr) {
+    *out_vreg = d_vr;
+    *out_step = step;
+    return 1;
+  }
+
+  /* Copy-through: scan back a few NOP-skipped instructions for `T = V`. */
+  for (int k = instr_idx - 1; k >= loop->start_idx && k >= instr_idx - 3; k--) {
+    IRQuadCompact *aq = &ir->compact_instructions[k];
+    if (aq->op == TCCIR_OP_NOP)
+      continue;
+    if (aq->op != TCCIR_OP_ASSIGN)
+      return 0;
+    IROperand adest = tcc_ir_op_get_dest(ir, aq);
+    IROperand asrc = tcc_ir_op_get_src1(ir, aq);
+    if (irop_get_vreg(adest) == s1_vr && irop_get_vreg(asrc) == d_vr) {
+      *out_vreg = d_vr;
+      *out_step = step;
+      return 1;
+    }
+    return 0;
+  }
+  return 0;
+}
+
+/* Walk back from preheader_idx looking for an unconditional def of `vreg`
+ * of the form `vreg <- Addr[StackLoc[X]]`.  Returns 1 on success and writes
+ * the offset/flags/init index. */
+static int ptr_iv_find_init(TCCIRState *ir, int vreg, int preheader_idx,
+                            int *out_off, int *out_is_llocal, int *out_is_param,
+                            int *out_init_idx, int *out_btype)
+{
+  for (int j = preheader_idx; j >= 0; j--) {
+    IRQuadCompact *q = &ir->compact_instructions[j];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    /* Stop at any jump target / merge point before the preheader. */
+    if (j < preheader_idx && q->is_jump_target)
+      return 0;
+    /* Stop at any other def of vreg (we want the most recent). */
+    if (!irop_config[q->op].has_dest)
+      continue;
+    IROperand dest = tcc_ir_op_get_dest(ir, q);
+    if (irop_get_vreg(dest) != vreg)
+      continue;
+    /* STOREs through a vreg-deref do not redefine vreg itself. */
+    if (q->op == TCCIR_OP_STORE && dest.is_lval && !dest.is_local)
+      continue;
+    if (q->op != TCCIR_OP_ASSIGN)
+      return 0;
+    IROperand src1 = tcc_ir_op_get_src1(ir, q);
+    if (irop_get_tag(src1) != IROP_TAG_STACKOFF || src1.is_lval || !src1.is_local)
+      return 0;
+    *out_off = (int)irop_get_imm64_ex(ir, src1);
+    *out_is_llocal = src1.is_llocal;
+    *out_is_param = src1.is_param;
+    *out_init_idx = j;
+    *out_btype = irop_get_btype(src1);
+    return 1;
+  }
+  return 0;
+}
+
+/* Verify vreg has exactly one def in [loop.start..loop.end] (the self-add at
+ * def_idx) and no other write that could perturb its value. */
+static int ptr_iv_unique_loop_def(TCCIRState *ir, IRLoop *loop, int vreg, int def_idx)
+{
+  for (int j = loop->start_idx; j <= loop->end_idx; j++) {
+    IRQuadCompact *q = &ir->compact_instructions[j];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    if (!irop_config[q->op].has_dest)
+      continue;
+    IROperand dest = tcc_ir_op_get_dest(ir, q);
+    if (irop_get_vreg(dest) != vreg)
+      continue;
+    /* STORE through V's deref doesn't redefine V. */
+    if (q->op == TCCIR_OP_STORE && dest.is_lval && !dest.is_local)
+      continue;
+    if (j != def_idx)
+      return 0;
+  }
+  return 1;
+}
+
+/* Replace reads of VAR `vreg`'s value with `repl` in the instruction at
+ * `idx`.  Returns the number of substitutions performed (0, 1, or 2).
+ *
+ * A VAR value-read encodes as `tag=STACKOFF, vreg=V, is_lval=1, is_local=1`
+ * — the is_lval bit here means "load V from its spill home", not "deref
+ * through V" (that form uses tag=VREG instead).  Only the STACKOFF form is
+ * a true VAR value-read; we restrict substitution to it. */
+static int ptr_iv_subst_uses_in_instr(TCCIRState *ir, int idx, int vreg, IROperand repl)
+{
+  IRQuadCompact *q = &ir->compact_instructions[idx];
+  int subs = 0;
+  if (irop_config[q->op].has_src1) {
+    IROperand s = tcc_ir_op_get_src1(ir, q);
+    if (irop_get_vreg(s) == vreg && irop_get_tag(s) == IROP_TAG_STACKOFF) {
+      tcc_ir_op_set_src1(ir, q, repl);
+      subs++;
+    }
+  }
+  if (irop_config[q->op].has_src2) {
+    IROperand s = tcc_ir_op_get_src2(ir, q);
+    if (irop_get_vreg(s) == vreg && irop_get_tag(s) == IROP_TAG_STACKOFF) {
+      tcc_ir_op_set_src2(ir, q, repl);
+      subs++;
+    }
+  }
+  return subs;
+}
+
+int tcc_ir_opt_loop_ptr_iv_exit_subst(TCCIRState *ir)
+{
+  if (!ir || ir->next_instruction_index == 0)
+    return 0;
+
+  IRLoops *loops = tcc_ir_detect_loops(ir);
+  if (!loops || loops->num_loops == 0) {
+    tcc_ir_free_loops(loops);
+    return 0;
+  }
+
+  int total = 0;
+  LOG_LOOP_OPT("[PTR_IV_SUBST] entered, %d loop(s)", loops->num_loops);
+
+  for (int li = 0; li < loops->num_loops; li++) {
+    IRLoop *loop = &loops->loops[li];
+    if (loop->start_idx < 0)
+      continue;
+
+    /* Need a counter IV with known trip count to anchor exit-value computation. */
+    InductionVar ivs[MAX_IV];
+    int num_ivs = find_induction_vars_ex(ir, loop, ivs, MAX_IV, 1);
+    int cmp_idx, jmpif_idx, limit, cond, exit_target;
+    InductionVar *primary = NULL;
+    for (int k = 0; k < num_ivs; k++) {
+      if (find_loop_exit_condition(ir, loop, ivs[k].vreg, &cmp_idx, &jmpif_idx,
+                                   &limit, &cond, &exit_target)) {
+        primary = &ivs[k];
+        break;
+      }
+    }
+    if (!primary)
+      continue;
+    int trip_count = compute_trip_count(primary->init_val, limit, primary->step, cond);
+    if (trip_count <= 0)
+      continue;
+
+    /* Scan loop body for pointer IVs. */
+    PtrIV pivs[PTRIV_MAX];
+    int n_pivs = 0;
+    for (int j = loop->start_idx; j <= loop->end_idx && n_pivs < PTRIV_MAX; j++) {
+      int32_t v_vr;
+      int v_step;
+      if (!ptr_iv_find_loop_step(ir, loop, j, &v_vr, &v_step))
+        continue;
+      /* Skip the counter IV — it's an integer IV, not a pointer one. */
+      int is_counter = 0;
+      for (int k = 0; k < num_ivs; k++) {
+        if (ivs[k].vreg == v_vr) { is_counter = 1; break; }
+      }
+      if (is_counter)
+        continue;
+
+      /* Must have exactly one def in the loop (the self-add at j). */
+      if (!ptr_iv_unique_loop_def(ir, loop, v_vr, j))
+        continue;
+
+      /* Find preheader init `V = Addr[StackLoc[off]]`. */
+      int init_off, is_llocal, is_param, init_idx, btype;
+      if (!ptr_iv_find_init(ir, v_vr, loop->preheader_idx,
+                            &init_off, &is_llocal, &is_param, &init_idx, &btype))
+        continue;
+
+      /* Stack offsets are 32-bit; reject anything that won't fit. */
+      int64_t final_off64 = (int64_t)init_off + (int64_t)v_step * (int64_t)trip_count;
+      if (final_off64 != (int32_t)final_off64)
+        continue;
+
+      pivs[n_pivs].vreg      = v_vr;
+      pivs[n_pivs].init_off  = init_off;
+      pivs[n_pivs].step      = v_step;
+      pivs[n_pivs].init_idx  = init_idx;
+      pivs[n_pivs].def_idx   = j;
+      pivs[n_pivs].is_llocal = is_llocal;
+      pivs[n_pivs].is_param  = is_param;
+      pivs[n_pivs].btype     = btype;
+      n_pivs++;
+    }
+
+    if (n_pivs == 0)
+      continue;
+
+    /* NOP the pre-loop entry guard if present.  In rotated loop layout, the
+     * guard is `CMP iv, #limit; JUMPIF skip_loop` between the primary IV
+     * init and loop->start_idx.  Since trip_count > 0, the guard never
+     * fires, so dropping it removes the stale is_jump_target on exit_target
+     * — letting our forward-walk substitute V freely.  Mirror the NOP logic
+     * in try_eliminate_loop (opt_loop_utils.c).
+     *
+     * Only run this when we have at least one pointer IV to substitute, so
+     * the side effect is proportional to the gain. */
+    for (int g = primary->init_idx + 1; g < loop->start_idx; g++) {
+      IRQuadCompact *gq = &ir->compact_instructions[g];
+      if (gq->op != TCCIR_OP_CMP)
+        continue;
+      IROperand gs1 = tcc_ir_op_get_src1(ir, gq);
+      if (irop_get_vreg(gs1) != primary->vreg)
+        continue;
+      if (g + 1 >= loop->start_idx)
+        break;
+      IRQuadCompact *gjq = &ir->compact_instructions[g + 1];
+      if (gjq->op != TCCIR_OP_JUMPIF)
+        continue;
+      IROperand gjd = tcc_ir_op_get_dest(ir, gjq);
+      int gjt = (int)irop_get_imm64_ex(ir, gjd);
+      /* Only NOP a guard whose JUMPIF target is past the loop body —
+       * matches the rotated-loop entry-guard shape. */
+      if (gjt < loop->end_idx)
+        continue;
+      gq->op = TCCIR_OP_NOP;
+      gjq->op = TCCIR_OP_NOP;
+      /* The guard was the only outside edge into its target; clear the
+       * stale is_jump_target so our forward-walk doesn't bail thinking the
+       * target receives V via an alternate path. */
+      if (gjt >= 0 && gjt < ir->next_instruction_index) {
+        int has_other_in_edge = 0;
+        for (int s = 0; s < ir->next_instruction_index && !has_other_in_edge; s++) {
+          if (s == g + 1) continue;
+          IRQuadCompact *sq = &ir->compact_instructions[s];
+          if (sq->op != TCCIR_OP_JUMP && sq->op != TCCIR_OP_JUMPIF)
+            continue;
+          IROperand sd = tcc_ir_op_get_dest(ir, sq);
+          int st = (int)irop_get_imm64_ex(ir, sd);
+          if (st == gjt)
+            has_other_in_edge = 1;
+        }
+        if (!has_other_in_edge)
+          ir->compact_instructions[gjt].is_jump_target = 0;
+      }
+    }
+
+    /* Walk forward from exit_target, substituting V → Addr[StackLoc[final_off]]
+     * in non-lval uses.  Stop scanning V on:
+     *   - any redef of V (subsequent uses see a different value)
+     *   - reaching the function end
+     *   - a backward jump (would loop us back into V's old domain)
+     * Conservatively stop ALL substitutions for a vreg at any is_jump_target
+     * reached after the exit_target, since the merge could see a different V
+     * via an alternate path. */
+    int live[PTRIV_MAX];
+    for (int p = 0; p < n_pivs; p++) live[p] = 1;
+
+    int n = ir->next_instruction_index;
+    for (int j = exit_target; j < n; j++) {
+      IRQuadCompact *q = &ir->compact_instructions[j];
+      if (q->op == TCCIR_OP_NOP)
+        continue;
+
+      /* On merge points after exit_target, conservatively retire any IV that
+       * could be reached via an alternate edge. */
+      if (j > exit_target && q->is_jump_target) {
+        for (int p = 0; p < n_pivs; p++) live[p] = 0;
+      }
+
+      int any_live = 0;
+      for (int p = 0; p < n_pivs; p++) if (live[p]) { any_live = 1; break; }
+      if (!any_live)
+        break;
+
+      /* Substitute uses first (reads), then check for redef. */
+      for (int p = 0; p < n_pivs; p++) {
+        if (!live[p]) continue;
+        int32_t final_off = (int32_t)((int64_t)pivs[p].init_off +
+                                      (int64_t)pivs[p].step * (int64_t)trip_count);
+        IROperand repl = irop_make_stackoff(-1, final_off, /*is_lval*/ 0,
+                                            pivs[p].is_llocal, pivs[p].is_param,
+                                            pivs[p].btype);
+        total += ptr_iv_subst_uses_in_instr(ir, j, pivs[p].vreg, repl);
+      }
+
+      /* Now check whether this instruction redefines any tracked V. */
+      if (irop_config[q->op].has_dest) {
+        IROperand dest = tcc_ir_op_get_dest(ir, q);
+        /* STOREs through a vreg-deref don't redefine the vreg itself. */
+        if (!(q->op == TCCIR_OP_STORE && dest.is_lval && !dest.is_local)) {
+          int32_t dvr = irop_get_vreg(dest);
+          if (dvr >= 0) {
+            for (int p = 0; p < n_pivs; p++) {
+              if (live[p] && pivs[p].vreg == dvr)
+                live[p] = 0;
+            }
+          }
+        }
+      }
+
+      /* Backward JUMP: bail on all remaining tracked IVs. */
+      if (q->op == TCCIR_OP_JUMP) {
+        IROperand jd = tcc_ir_op_get_dest(ir, q);
+        int t = (int)irop_get_imm64_ex(ir, jd);
+        if (t <= j) {
+          for (int p = 0; p < n_pivs; p++) live[p] = 0;
+        }
+      }
+    }
+  }
+
+  tcc_ir_free_loops(loops);
+  return total;
+}

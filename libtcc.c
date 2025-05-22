@@ -20,6 +20,7 @@
 
 #include "tcc.h"
 #include "tccld.h"
+#include "ir/opt.h"
 
 /********************************************************/
 /* global variables */
@@ -847,6 +848,9 @@ LIBTCCAPI void tcc_delete(TCCState *s1)
 #if defined(TCC_TARGET_ARM) || defined(TCC_TARGET_ARM_THUMB)
   arm_deinit(s1);
 #endif
+
+  /* free IR-level interprocedural caches */
+  tcc_ir_free_switch_func_cache(s1);
 
   /* free lazy object files (Phase 2 GC) */
   tcc_free_lazy_objfiles(s1);

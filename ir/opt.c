@@ -678,6 +678,374 @@ void tcc_ir_compute_func_write_summary(TCCIRState *ir, Sym *func_sym)
 }
 
 /* ============================================================================
+ * TU-wide Read Summary — per-function record of:
+ *   - reads of static globals (load or address-of)
+ *   - writes to static globals
+ *   - calls to other functions (callee Sym*)
+ *
+ * Collected from the optimized IR at end-of-IR-opts (same timing as
+ * tcc_ir_compute_func_write_summary).  Consumed at end-of-TU by
+ * tcc_ir_tu_analyze_dead_statics, which builds the call graph reachability
+ * closure from non-static / addr-taken roots and marks each static global
+ * with sym->a.tu_no_readers when no reachable function reads it.  Functions
+ * that write to such statics are then marked func_late_reopt; the new DSE
+ * pass eliminates those stores when the function is re-compiled.
+ * ============================================================================ */
+
+typedef struct TuSymSet
+{
+  Sym **items;
+  int count;
+  int capacity;
+} TuSymSet;
+
+static void tu_symset_add(TuSymSet *s, Sym *sym)
+{
+  if (!sym)
+    return;
+  for (int i = 0; i < s->count; i++)
+    if (s->items[i] == sym)
+      return;
+  if (s->count >= s->capacity)
+  {
+    int new_cap = s->capacity ? s->capacity * 2 : 4;
+    s->items = tcc_realloc(s->items, sizeof(Sym *) * new_cap);
+    s->capacity = new_cap;
+  }
+  s->items[s->count++] = sym;
+}
+
+static void tu_symset_free(TuSymSet *s)
+{
+  if (s->items)
+    tcc_free(s->items);
+  s->items = NULL;
+  s->count = s->capacity = 0;
+}
+
+typedef struct TuFuncSummary
+{
+  Sym *func_sym;
+  TuSymSet calls;          /* static (intra-TU) functions called */
+  TuSymSet static_reads;   /* static globals read or address-taken */
+  TuSymSet static_writes;  /* static globals written */
+  struct TuFuncSummary *next;
+} TuFuncSummary;
+
+static TuFuncSummary *tu_summary_head = NULL;
+
+static TuFuncSummary *tu_summary_lookup(Sym *func_sym)
+{
+  for (TuFuncSummary *e = tu_summary_head; e; e = e->next)
+    if (e->func_sym == func_sym)
+      return e;
+  return NULL;
+}
+
+void tcc_ir_tu_func_summary_clear_all(void)
+{
+  while (tu_summary_head)
+  {
+    TuFuncSummary *n = tu_summary_head->next;
+    tu_symset_free(&tu_summary_head->calls);
+    tu_symset_free(&tu_summary_head->static_reads);
+    tu_symset_free(&tu_summary_head->static_writes);
+    tcc_free(tu_summary_head);
+    tu_summary_head = n;
+  }
+}
+
+/* Helper: extract Sym* from a SYMREF operand. */
+static Sym *tu_extract_sym(TCCIRState *ir, IROperand op)
+{
+  if (!op.is_sym)
+    return NULL;
+  IRPoolSymref *ref = irop_get_symref_ex(ir, op);
+  return ref ? ref->sym : NULL;
+}
+
+/* A static global candidate is a file-scope (or local) static *data* symbol
+ * defined in this TU.  Excludes functions, externs, weaks, and dllimports. */
+static int tu_is_static_global_candidate(const Sym *sym)
+{
+  if (!sym)
+    return 0;
+  if ((sym->type.t & VT_BTYPE) == VT_FUNC)
+    return 0;
+  if (sym->a.weak || sym->a.dllimport)
+    return 0;
+  /* VT_STATIC marks both file-scope and function-scope statics — both have
+   * internal linkage and storage in this TU.  A symbol can still carry
+   * VT_EXTERN at this point for tentative definitions or other internal
+   * marker uses, but VT_STATIC implies the symbol's storage lives here. */
+  if (!(sym->type.t & VT_STATIC))
+    return 0;
+  /* VT_CONSTANT (qualified const) globals are not writeable in well-formed
+   * C, so they cannot be dead-store candidates anyway. */
+  if (sym->type.t & VT_CONSTANT)
+    return 0;
+  /* Volatile statics must observe stores (hardware registers etc). */
+  if (sym->type.t & VT_VOLATILE)
+    return 0;
+  return 1;
+}
+
+void tcc_ir_collect_tu_func_summary(TCCIRState *ir, Sym *func_sym)
+{
+  if (!ir || !func_sym)
+    return;
+  if (tu_summary_lookup(func_sym))
+    return; /* Already collected for this Sym. */
+
+  TuFuncSummary *s = tcc_mallocz(sizeof(*s));
+  s->func_sym = func_sym;
+
+  const int n = ir->next_instruction_index;
+  int writes_any_static = 0;
+
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+
+    /* Direct calls: record callee Sym so the call graph is captured. */
+    if (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID)
+    {
+      Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+      if (callee)
+        tu_symset_add(&s->calls, callee);
+      /* fall through so the call's operands are still examined for sym refs
+       * (e.g. struct arg passed by value) */
+    }
+
+    /* STORE: dest may be a SYMREF address (static global write).
+     * For STORE_INDEXED / STORE_POSTINC, disp_fusion may clear is_lval on
+     * the base operand even though the op semantically writes through that
+     * base — treat the dest as a write for any SYMREF regardless of
+     * is_lval for these indexed/postinc forms. */
+    if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
+        q->op == TCCIR_OP_STORE_POSTINC)
+    {
+      IROperand dest = tcc_ir_op_get_dest(ir, q);
+      int dest_is_write_target =
+          dest.is_sym &&
+          (dest.is_lval || q->op == TCCIR_OP_STORE_INDEXED ||
+           q->op == TCCIR_OP_STORE_POSTINC);
+      if (dest_is_write_target)
+      {
+        Sym *sym = tu_extract_sym(ir, dest);
+        if (sym && tu_is_static_global_candidate(sym))
+        {
+          tu_symset_add(&s->static_writes, sym);
+          writes_any_static = 1;
+        }
+      }
+    }
+
+    /* Read-side operand scan: any SYMREF appearing in src1/src2 counts as a
+     * read.  Both lval-derefs (LOAD-like) and bare-symref address-of forms
+     * are conservatively treated as reads — the address-of case may escape
+     * via a call/struct and let the symbol be read indirectly. */
+    if (irop_config[q->op].has_src1)
+    {
+      IROperand s1 = tcc_ir_op_get_src1(ir, q);
+      Sym *sym = tu_extract_sym(ir, s1);
+      if (sym && tu_is_static_global_candidate(sym))
+        tu_symset_add(&s->static_reads, sym);
+    }
+    if (irop_config[q->op].has_src2)
+    {
+      IROperand s2 = tcc_ir_op_get_src2(ir, q);
+      Sym *sym = tu_extract_sym(ir, s2);
+      if (sym && tu_is_static_global_candidate(sym))
+        tu_symset_add(&s->static_reads, sym);
+    }
+    /* LEA: dest holds an address derived from src1.  If src1 was a SYMREF
+     * we've already counted it as a read above.  STOREs that put the
+     * SYMREF in src1 (the stored value) for "p = &g" are likewise covered. */
+
+    /* Conservative escape: if any operand is an inline-asm or unknown op,
+     * give up by marking every static this function touches as read so we
+     * don't kill a store the asm reads.  Add a coarse switch list if more
+     * unsafe ops show up. */
+    if (q->op == TCCIR_OP_INLINE_ASM || q->op == TCCIR_OP_TRAP ||
+        q->op == TCCIR_OP_SETJMP)
+    {
+      /* Promote all writes to also-read so DSE never fires for this func. */
+      for (int k = 0; k < s->static_writes.count; k++)
+        tu_symset_add(&s->static_reads, s->static_writes.items[k]);
+    }
+  }
+
+  if (writes_any_static && func_sym->type.ref)
+    func_sym->type.ref->f.tu_static_writer = 1;
+
+  s->next = tu_summary_head;
+  tu_summary_head = s;
+}
+
+/* End-of-TU noreturn propagation.
+ *
+ * The trigger in gen_function speculatively saved tokens (via
+ * func_keep_tokens_for_noreturn) for any caller making a FUNCCALL to a
+ * not-yet-compiled callee — at first-pass-compile time we can't tell
+ * forward-decl-defined-later from extern-defined-in-another-TU apart.
+ *
+ * Now that every function in the TU has been compiled, the noreturn flag
+ * on each callee is final.  Set func_late_reopt = 1 on any caller whose
+ * callee is now func_noreturn — gen_late_reopt_functions will then re-
+ * emit them so the DCE extension (FUNCCALL-to-noreturn as terminator)
+ * eliminates the unreachable post-call body.  Callers whose callees did
+ * NOT end up noreturn keep their tokens but are not re-emitted (the
+ * existing token-cleanup paths cover this — they're harmless leakage). */
+void tcc_ir_tu_propagate_noreturn_to_callers(void)
+{
+  for (TuFuncSummary *e = tu_summary_head; e; e = e->next)
+  {
+    Sym *fs = e->func_sym;
+    if (!fs || !fs->type.ref)
+      continue;
+    if (!fs->type.ref->f.func_keep_tokens_for_noreturn)
+      continue;
+    if (fs->type.ref->f.func_late_reopt)
+      continue;
+    for (int i = 0; i < e->calls.count; i++)
+    {
+      Sym *callee = e->calls.items[i];
+      if (callee && callee->type.ref && callee->type.ref->f.func_noreturn)
+      {
+        fs->type.ref->f.func_late_reopt = 1;
+        break;
+      }
+    }
+  }
+}
+
+/* End-of-TU analysis: starting from non-static / addr-taken functions,
+ * compute the transitive callee closure and the set of static globals read
+ * by reachable functions.  Statics that are written but not read by any
+ * reachable function, and whose address has not been taken, are marked
+ * tu_no_readers.  Their writer functions are flagged func_late_reopt so the
+ * end-of-TU re-compile pass can run the new DSE pass on them. */
+void tcc_ir_tu_analyze_dead_statics(void)
+{
+  /* Phase 1: collect all function summaries and pick roots.
+   * A "root" is a function whose body is reachable from outside this TU:
+   *   - non-static / extern-visible functions
+   *   - functions whose address has been taken (escape via function pointer) */
+  int total = 0;
+  for (TuFuncSummary *e = tu_summary_head; e; e = e->next)
+    total++;
+  if (total == 0)
+    return;
+
+  /* Mark reachable: BFS over the call graph. */
+  for (TuFuncSummary *e = tu_summary_head; e; e = e->next)
+  {
+    Sym *fs = e->func_sym;
+    int is_root = 0;
+    if (!fs)
+      continue;
+    if (!(fs->type.t & VT_STATIC))
+      is_root = 1;
+    if (fs->a.addrtaken)
+      is_root = 1;
+    /* Constructors / destructors are entry points called by the runtime. */
+    if (fs->type.ref && (fs->type.ref->f.func_ctor || fs->type.ref->f.func_dtor))
+      is_root = 1;
+    if (is_root && fs->type.ref)
+      fs->type.ref->f.tu_reachable = 1;
+  }
+
+  /* Simple worklist BFS.  Bounded by total^2 in the pathological case;
+   * fine for typical TUs (tens to hundreds of functions). */
+  int changed = 1;
+  while (changed)
+  {
+    changed = 0;
+    for (TuFuncSummary *e = tu_summary_head; e; e = e->next)
+    {
+      if (!e->func_sym || !e->func_sym->type.ref)
+        continue;
+      if (!e->func_sym->type.ref->f.tu_reachable)
+        continue;
+      for (int i = 0; i < e->calls.count; i++)
+      {
+        Sym *callee = e->calls.items[i];
+        if (!callee || !callee->type.ref)
+          continue;
+        if (!callee->type.ref->f.tu_reachable)
+        {
+          callee->type.ref->f.tu_reachable = 1;
+          changed = 1;
+        }
+      }
+    }
+  }
+
+  /* Phase 2: for each static global written somewhere, decide if it has any
+   * reachable readers.  Collect the union of static writes across the TU
+   * first so we know which symbols to evaluate. */
+  TuSymSet candidates = {0};
+  for (TuFuncSummary *e = tu_summary_head; e; e = e->next)
+  {
+    for (int i = 0; i < e->static_writes.count; i++)
+      tu_symset_add(&candidates, e->static_writes.items[i]);
+  }
+
+  for (int c = 0; c < candidates.count; c++)
+  {
+    Sym *g = candidates.items[c];
+    if (!g)
+      continue;
+    if (g->a.addrtaken)
+      continue; /* address escaped; cannot prove no readers */
+    int read_by_reachable = 0;
+    for (TuFuncSummary *e = tu_summary_head; e && !read_by_reachable; e = e->next)
+    {
+      if (!e->func_sym || !e->func_sym->type.ref)
+        continue;
+      if (!e->func_sym->type.ref->f.tu_reachable)
+        continue;
+      for (int i = 0; i < e->static_reads.count; i++)
+      {
+        if (e->static_reads.items[i] == g)
+        {
+          read_by_reachable = 1;
+          break;
+        }
+      }
+    }
+    if (!read_by_reachable)
+    {
+      g->a.tu_no_readers = 1;
+      /* Mark reachable writer functions for late_reopt.  Unreachable writers
+       * don't need re-compilation — their stores never execute.  Only those
+       * already kept alive via the inline_fns token-preservation path can
+       * actually be re-compiled, but setting the flag is harmless otherwise. */
+      for (TuFuncSummary *e = tu_summary_head; e; e = e->next)
+      {
+        if (!e->func_sym || !e->func_sym->type.ref)
+          continue;
+        if (!e->func_sym->type.ref->f.tu_reachable)
+          continue;
+        for (int i = 0; i < e->static_writes.count; i++)
+        {
+          if (e->static_writes.items[i] == g)
+          {
+            e->func_sym->type.ref->f.func_late_reopt = 1;
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  tu_symset_free(&candidates);
+}
+
+/* ============================================================================
  * Dead Init Via Call — kill stack-slot stores fully overwritten by a
  * subsequent CALL whose callee summary covers the stored bytes.
  * ============================================================================ */
@@ -1247,6 +1615,333 @@ int tcc_ir_opt_block_copy_init(TCCIRState *ir)
     q->op = TCCIR_OP_NOP;
 
     changes++;
+  }
+
+  return changes;
+}
+
+/* Replace `memset(&stack[off], N, 0)` with one or two direct STORE #0
+ * instructions when N is small (<= 8 bytes).  Covers the case
+ * tcc_ir_opt_block_copy_init misses: a trivial zero-initialized local
+ * (`unsigned char x1[1] = {0}`) where no follow-up stores feed the rodata
+ * materialization heuristic.  Without this, a 1-byte zero-init becomes a
+ * full __aeabi_memset call. */
+int tcc_ir_opt_small_memset_to_store(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  int changes = 0;
+
+  if (n == 0)
+    return 0;
+
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_FUNCCALLVOID)
+      continue;
+
+    Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+    if (!callee)
+      continue;
+    const char *name = get_tok_str(callee->v, NULL);
+    if (!name)
+      continue;
+    if (strcmp(name, "__aeabi_memset") != 0 && strcmp(name, "memset") != 0)
+      continue;
+
+    IROperand p_dst, p_size, p_fill;
+    if (!ir_opt_get_call_param_operand(ir, i, 0, &p_dst))
+      continue;
+    if (!ir_opt_get_call_param_operand(ir, i, 1, &p_size))
+      continue;
+    if (!ir_opt_get_call_param_operand(ir, i, 2, &p_fill))
+      continue;
+
+    /* Fill must be 0 */
+    if (irop_get_tag(p_fill) != IROP_TAG_IMM32)
+      continue;
+    if ((int)irop_get_imm64_ex(ir, p_fill) != 0)
+      continue;
+
+    /* Size must be a known small positive constant */
+    if (irop_get_tag(p_size) != IROP_TAG_IMM32)
+      continue;
+    int total_size = (int)irop_get_imm64_ex(ir, p_size);
+    if (total_size <= 0 || total_size > 8)
+      continue;
+
+    /* Dest must be a stack address (LEA form: is_lval=0, is_local=1) */
+    if (irop_get_tag(p_dst) != IROP_TAG_STACKOFF || !p_dst.is_local || p_dst.is_lval)
+      continue;
+    int base_offset = (int)irop_get_imm64_ex(ir, p_dst);
+
+    /* Decompose total_size into 1-2 power-of-2 stores: 8,4,2,1.  Sizes 3/5/6/7
+     * use two stores (4+2, 4+1, 4+2 etc); size 7 would need three so we skip. */
+    int chunk_btype[2] = {0, 0};
+    int chunk_off[2] = {0, 0};
+    int nchunks = 0;
+    int remaining = total_size;
+    int cur_off = 0;
+    while (remaining > 0 && nchunks < 2)
+    {
+      int sz;
+      int bt;
+      if (remaining >= 8)
+      {
+        sz = 8;
+        bt = IROP_BTYPE_INT64;
+      }
+      else if (remaining >= 4)
+      {
+        sz = 4;
+        bt = IROP_BTYPE_INT32;
+      }
+      else if (remaining >= 2)
+      {
+        sz = 2;
+        bt = IROP_BTYPE_INT16;
+      }
+      else
+      {
+        sz = 1;
+        bt = IROP_BTYPE_INT8;
+      }
+      chunk_btype[nchunks] = bt;
+      chunk_off[nchunks] = base_offset + cur_off;
+      nchunks++;
+      cur_off += sz;
+      remaining -= sz;
+    }
+    if (remaining != 0)
+      continue; /* would need >2 stores, skip */
+
+    /* For 2-chunk case we also need to allocate a NOP slot for the second
+     * store.  Look for the closest preceding NOP slot we can repurpose: a
+     * PARAM* belonging to this call. */
+    int extra_store_idx = -1;
+    if (nchunks == 2)
+    {
+      int call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q)));
+      for (int j = i - 1; j >= 0; j--)
+      {
+        IRQuadCompact *pq = &ir->compact_instructions[j];
+        if (pq->op != TCCIR_OP_FUNCPARAMVAL && pq->op != TCCIR_OP_FUNCPARAMVOID)
+          continue;
+        IROperand enc = tcc_ir_op_get_src2(ir, pq);
+        if (TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, enc)) != call_id)
+          continue;
+        extra_store_idx = j;
+        break;
+      }
+      if (extra_store_idx < 0)
+        continue;
+    }
+
+    /* NOP all params BEFORE rewriting the call slot — ir_opt_nop_call_params
+     * needs q to still be a CALL to read its call_id from src2.  If the
+     * second-chunk case repurposes one of those slots, we'll un-NOP it
+     * by writing the new STORE on top. */
+    ir_opt_nop_call_params(ir, i);
+
+    /* Rewrite the call slot as the first STORE.  STORE pool layout is
+     * [dest, src1] (has_dest=1, has_src1=1, has_src2=0). */
+    IROperand st_dest0 = irop_make_stackoff(-1, chunk_off[0], /*is_lval*/ 1, /*is_llocal*/ 0, /*is_param*/ 0,
+                                            chunk_btype[0]);
+    IROperand st_src0 = irop_make_imm32(-1, 0, chunk_btype[0]);
+    int pool_base0 = tcc_ir_iroperand_pool_add(ir, st_dest0);
+    tcc_ir_iroperand_pool_add(ir, st_src0);
+    q->op = TCCIR_OP_STORE;
+    q->operand_base = pool_base0;
+
+    if (nchunks == 2)
+    {
+      IROperand st_dest1 = irop_make_stackoff(-1, chunk_off[1], /*is_lval*/ 1, /*is_llocal*/ 0, /*is_param*/ 0,
+                                              chunk_btype[1]);
+      IROperand st_src1 = irop_make_imm32(-1, 0, chunk_btype[1]);
+      int pool_base1 = tcc_ir_iroperand_pool_add(ir, st_dest1);
+      tcc_ir_iroperand_pool_add(ir, st_src1);
+      IRQuadCompact *eq = &ir->compact_instructions[extra_store_idx];
+      eq->op = TCCIR_OP_STORE;
+      eq->operand_base = pool_base1;
+    }
+
+    changes++;
+  }
+
+  return changes;
+}
+
+/* Returns 1 if an instruction may clobber a value used by a CMP/SETIF
+ * we want to CSE across.  Used by tcc_ir_opt_cmp_setif_cse to bail when
+ * any intervening op could change the comparison's result. */
+static int cse_cmp_op_may_clobber(IRQuadCompact *q)
+{
+  switch (q->op)
+  {
+  case TCCIR_OP_NOP:
+  case TCCIR_OP_PREFETCH:
+  case TCCIR_OP_RETURNVOID:
+  case TCCIR_OP_RETURNVALUE: /* terminates BB but doesn't reach CMP@j */
+    return 0;
+  /* Anything that writes memory or branches is a hard stop.  Calls
+   * may write through pointers; jumps cross basic-block boundaries. */
+  case TCCIR_OP_STORE:
+  case TCCIR_OP_STORE_INDEXED:
+  case TCCIR_OP_STORE_POSTINC:
+  case TCCIR_OP_BLOCK_COPY:
+  case TCCIR_OP_FUNCCALLVOID:
+  case TCCIR_OP_FUNCCALLVAL:
+  case TCCIR_OP_JUMP:
+  case TCCIR_OP_JUMPIF:
+  case TCCIR_OP_IJUMP:
+  case TCCIR_OP_SWITCH_TABLE:
+  case TCCIR_OP_SET_CHAIN:
+  case TCCIR_OP_TRAP:
+  case TCCIR_OP_SETJMP:
+  case TCCIR_OP_LONGJMP:
+  case TCCIR_OP_NL_SETJMP:
+  case TCCIR_OP_NL_LONGJMP:
+  case TCCIR_OP_VLA_ALLOC:
+  case TCCIR_OP_VLA_SP_SAVE:
+  case TCCIR_OP_VLA_SP_RESTORE:
+  case TCCIR_OP_INLINE_ASM:
+    return 1;
+  default:
+    return 0;
+  }
+}
+
+/* Returns 1 if a CMP operand depends on a memory location that any
+ * STORE could alias.  STACKOFF lvals do; everything else is safe under
+ * the caller's existing "no STOREs between" guard. */
+static int cse_cmp_operand_reads_memory(IROperand op)
+{
+  if (irop_get_tag(op) == IROP_TAG_STACKOFF && op.is_lval)
+    return 1;
+  if (op.is_lval && irop_get_tag(op) == IROP_TAG_VREG)
+    return 1;
+  if (op.is_lval && irop_get_tag(op) == IROP_TAG_SYMREF)
+    return 1;
+  return 0;
+}
+
+/* CMP+SETIF CSE pass.  Detects pattern:
+ *   i:   CMP A, B
+ *   i+1: V1 <-- (cond=C)             [SETIF]
+ *   ...intervening ops with no clobber...
+ *   j:   CMP A', B'   (structurally equal to A, B)
+ *   j+1: V2 <-- (cond=C)             [SETIF]
+ * And rewrites the second pair to:
+ *   j:   NOP
+ *   j+1: V2 <-- V1                   [ASSIGN]
+ *
+ * Subsequent copy-propagation eliminates V2 entirely.  Scoped to a single
+ * basic block (no jump-target or terminator between i and j) and bails on
+ * any intervening op that could clobber memory or vregs read by the CMPs. */
+int tcc_ir_opt_cmp_setif_cse(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  int changes = 0;
+  if (n < 4)
+    return 0;
+
+  for (int i = 0; i + 2 < n; i++)
+  {
+    IRQuadCompact *cmp1 = &ir->compact_instructions[i];
+    if (cmp1->op != TCCIR_OP_CMP)
+      continue;
+    IRQuadCompact *setif1 = &ir->compact_instructions[i + 1];
+    if (setif1->op != TCCIR_OP_SETIF)
+      continue;
+
+    IROperand setif1_dest = tcc_ir_op_get_dest(ir, setif1);
+    int32_t setif1_dest_vr = irop_get_vreg(setif1_dest);
+    if (setif1_dest_vr < 0 || setif1_dest.is_lval)
+      continue;
+    /* Require the SETIF result vreg to be single-def — otherwise later
+     * redefinitions could carry the wrong value past our CSE point. */
+    if (!tcc_ir_vreg_has_single_def(ir, setif1_dest_vr))
+      continue;
+
+    IROperand cmp1_s1 = tcc_ir_op_get_src1(ir, cmp1);
+    IROperand cmp1_s2 = tcc_ir_op_get_src2(ir, cmp1);
+    IROperand cond1_op = tcc_ir_op_get_src1(ir, setif1);
+    int cond1 = (int)irop_get_imm64_ex(ir, cond1_op);
+    int s1_btype = irop_get_btype(cmp1_s1);
+    int s2_btype = irop_get_btype(cmp1_s2);
+    int setif1_btype = irop_get_btype(setif1_dest);
+
+    /* Whether either CMP operand could be invalidated by an intervening
+     * STORE — if yes, we'd need stricter aliasing checks beyond the
+     * cse_cmp_op_may_clobber guard (which already bails on any STORE). */
+    (void)cse_cmp_operand_reads_memory;
+
+    /* Forward scan for a duplicate CMP+SETIF pair. */
+    for (int j = i + 2; j + 1 < n; j++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[j];
+      if (q->op == TCCIR_OP_NOP)
+        continue;
+      if (q->is_jump_target)
+        break; /* BB boundary */
+      if (cse_cmp_op_may_clobber(q))
+        break;
+
+      /* If this op writes a vreg used by cmp1, or overwrites setif1's
+       * result, bail. */
+      if (irop_config[q->op].has_dest)
+      {
+        IROperand d = tcc_ir_op_get_dest(ir, q);
+        if (!d.is_lval)
+        {
+          int32_t dvr = irop_get_vreg(d);
+          if (dvr >= 0)
+          {
+            if (dvr == setif1_dest_vr)
+              break;
+            if (irop_get_tag(cmp1_s1) == IROP_TAG_VREG && !cmp1_s1.is_lval &&
+                irop_get_vreg(cmp1_s1) == dvr)
+              break;
+            if (irop_get_tag(cmp1_s2) == IROP_TAG_VREG && !cmp1_s2.is_lval &&
+                irop_get_vreg(cmp1_s2) == dvr)
+              break;
+          }
+        }
+      }
+
+      if (q->op != TCCIR_OP_CMP)
+        continue;
+      IRQuadCompact *setif2 = &ir->compact_instructions[j + 1];
+      if (setif2->op != TCCIR_OP_SETIF)
+        continue;
+
+      IROperand cmp2_s1 = tcc_ir_op_get_src1(ir, q);
+      IROperand cmp2_s2 = tcc_ir_op_get_src2(ir, q);
+      IROperand cond2_op = tcc_ir_op_get_src1(ir, setif2);
+      int cond2 = (int)irop_get_imm64_ex(ir, cond2_op);
+
+      if (cond1 != cond2)
+        continue;
+      if (irop_get_btype(cmp2_s1) != s1_btype || irop_get_btype(cmp2_s2) != s2_btype)
+        continue;
+
+      /* Structural equality of operands.  Use the public helper that
+       * handles vregs, immediates, stack offsets, and symrefs. */
+      if (!ir_opt_pure_expr_equal(ir, cmp1_s1, i, cmp2_s1, j, 0))
+        continue;
+      if (!ir_opt_pure_expr_equal(ir, cmp1_s2, i, cmp2_s2, j, 0))
+        continue;
+
+      /* Rewrite: CMP@j becomes NOP, SETIF@j+1 becomes ASSIGN of setif1's
+       * vreg.  The destination vreg of SETIF@j+1 is preserved. */
+      q->op = TCCIR_OP_NOP;
+      setif2->op = TCCIR_OP_ASSIGN;
+      IROperand src_vreg = irop_make_vreg(setif1_dest_vr, setif1_btype);
+      tcc_ir_set_src1(ir, j + 1, src_vreg);
+      tcc_ir_set_src2(ir, j + 1, IROP_NONE);
+      changes++;
+      break;
+    }
   }
 
   return changes;

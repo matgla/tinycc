@@ -15,6 +15,7 @@ struct TCCIRState;
 struct TCCState;
 struct IRLoops;
 struct IROptCtx;
+struct Sym;
 
 /* ============================================================================
  * Optimization Pass Functions
@@ -44,6 +45,24 @@ int tcc_ir_opt_useless_function_body_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_noreturn_collapse(struct TCCIRState *ir);
 int tcc_ir_opt_noreturn_collapse_ex(struct IROptCtx *ctx);
 
+/* Zero-Size VLA Elimination - convert VLA_ALLOC ops whose size operand is
+ * compile-time 0 (e.g. `T a[n][0]`) into NOPs and remove the matching
+ * VLA_SP_SAVE/VLA_SP_RESTORE pair when nothing else changes SP between them. */
+int tcc_ir_opt_zero_vla_elim(struct TCCIRState *ir);
+int tcc_ir_opt_zero_vla_elim_ex(struct IROptCtx *ctx);
+
+/* Infinite Self-Recursion Collapse - if the function unconditionally calls
+ * itself before any return path, by induction it never returns.  Collapse
+ * the body to `b .`.  Matches GCC -O2 on patterns like
+ * gcc.c-torture/compile/pr10153-1.c. */
+int tcc_ir_opt_infinite_self_recursion(struct TCCIRState *ir, struct Sym *func_sym);
+
+/* Noreturn-Call Epilogue Suppress - after DCE has eliminated everything past
+ * a call to a noreturn callee, the function itself never returns from that
+ * path.  If every RETURN op in the function has been DCE'd / removed, set
+ * ir->noreturn = 1 so codegen omits the unreachable epilogue. */
+int tcc_ir_opt_noreturn_call_epilogue_suppress(struct TCCIRState *ir);
+
 /* Dead Store Elimination - remove stores to dead variables */
 int tcc_ir_opt_dse(struct TCCIRState *ir);
 int tcc_ir_opt_dse_ex(struct IROptCtx *ctx);
@@ -60,6 +79,15 @@ int tcc_ir_opt_const_prop(struct TCCIRState *ir);
 
 /* Constant Propagation (temporary variables only) */
 int tcc_ir_opt_const_prop_tmp(struct TCCIRState *ir);
+
+/* Known-Bits Propagation — tracks per-TMP known_zero/known_one bit masks
+ * to fold bitfield insert/extract chains that const_prop misses. */
+int tcc_ir_opt_known_bits(struct TCCIRState *ir);
+
+/* DSE for STOREs through a LEA-temp deref (e.g. T = Addr[StackLoc[X]];
+ * STORE T***DEREF***).  Complements dead_local_slot_elim, which only NOPs
+ * STOREs whose dest is a direct StackLoc[X] operand. */
+int tcc_ir_opt_dead_lea_store_elim(struct TCCIRState *ir);
 
 /* Constant fold string builtin calls such as `strcmp` and `strncmp` */
 int tcc_ir_opt_const_string_calls(struct TCCIRState *ir);
@@ -130,6 +158,10 @@ int tcc_ir_opt_cmp_stack_addr_fold(struct TCCIRState *ir);
 /* CMP Expression-Equality Fold - fold CMP when both operands are provably equal */
 int tcc_ir_opt_cmp_expr_fold(struct TCCIRState *ir);
 
+/* CMP Constant-Offset Fold - fold CMP when one operand is the other plus a
+ * known constant (e.g. `(x + 1) >= x` → always true under signed-overflow UB) */
+int tcc_ir_opt_cmp_const_offset_fold(struct TCCIRState *ir);
+
 /* Copy Propagation - replace copies with originals */
 int tcc_ir_opt_copy_prop(struct TCCIRState *ir);
 
@@ -198,6 +230,12 @@ int tcc_ir_opt_const_var_prop(struct TCCIRState *ir);
  * constant value. */
 int tcc_ir_opt_global_init_prop(struct TCCIRState *ir);
 
+/* Symref-constant propagation - propagate ASSIGN T = symref(S, +A) into
+ * subsequent uses of T within the same straight-line block, so that
+ * `T***DEREF***` becomes `symref(S,+A)***DEREF***` for the global-init
+ * pass to fold against the section data. */
+int tcc_ir_opt_symref_const_prop(struct TCCIRState *ir);
+
 /* Complex Constant Param Folding - pack a _Complex float local that is
  * initialized to constants and only used as one FUNCPARAMVAL into a packed
  * 64-bit complex immediate, eliminating the stack round-trip at the call. */
@@ -219,6 +257,31 @@ void tcc_ir_analyze_pure_via_sret(struct TCCIRState *ir, struct Sym *func_sym);
  * side table keyed by Sym*.  Consulted by tcc_ir_opt_dead_init_via_call. */
 void tcc_ir_compute_func_write_summary(struct TCCIRState *ir, struct Sym *func_sym);
 void tcc_ir_func_write_summary_clear_all(void);
+
+/* TU-wide read/call summary - per-function record of:
+ *   - which static globals are read or address-taken
+ *   - which static globals are written
+ *   - which functions (Sym*) are statically called
+ * Computed at end-of-IR-opts (from optimized IR).  Consumed at end-of-TU by
+ * tcc_ir_tu_analyze_dead_statics to mark static globals with no reachable
+ * readers — their stores can then be eliminated during late_reopt. */
+void tcc_ir_collect_tu_func_summary(struct TCCIRState *ir, struct Sym *func_sym);
+void tcc_ir_tu_func_summary_clear_all(void);
+/* TU end-of-parse analysis: build call graph reachability, compute live
+ * static-global read set, and mark dead statics + their writer functions. */
+void tcc_ir_tu_analyze_dead_statics(void);
+
+/* TU end-of-parse propagation: for any caller that preserved its tokens
+ * via func_keep_tokens_for_noreturn (set by the gen_function trigger),
+ * check if any callee turned out to be func_noreturn; if so, set
+ * func_late_reopt on the caller so gen_late_reopt_functions re-emits it
+ * with the noreturn-call-DCE optimization applied. */
+void tcc_ir_tu_propagate_noreturn_to_callers(void);
+
+/* Dead-static-global store elimination - NOP stores to statics that the
+ * end-of-TU analysis confirmed have no reachable readers. */
+int tcc_ir_opt_dead_static_store_elim(struct TCCIRState *ir);
+int tcc_ir_opt_dead_static_store_elim_ex(struct IROptCtx *ctx);
 
 /* Dead Init Via Call - kill stack-slot stores whose bytes are fully
  * overwritten by a subsequent CALL whose callee summary covers them. */
@@ -328,6 +391,15 @@ int tcc_ir_opt_jump_threading(struct TCCIRState *ir);
 /* Block Copy Init - replace memset(0)+stores pattern with BLOCK_COPY from rodata */
 int tcc_ir_opt_block_copy_init(struct TCCIRState *ir);
 
+/* Small zero-memset to direct STORE - replace memset(stack, N<=8, 0) with one or
+ * two direct STORE #0 instructions when block_copy_init didn't fire. */
+int tcc_ir_opt_small_memset_to_store(struct TCCIRState *ir);
+
+/* CMP+SETIF CSE - within a basic block, replace a second CMP+SETIF whose
+ * operands and cond match an earlier one with ASSIGN-from-prior-vreg.
+ * Cuts a redundant compare-and-set when the same boolean is computed twice. */
+int tcc_ir_opt_cmp_setif_cse(struct TCCIRState *ir);
+
 /* Post-Increment Assign Folding - fold T=V[lval]; V=T OP x into V=V OP x */
 int tcc_ir_opt_postinc_assign_fold(struct TCCIRState *ir);
 
@@ -362,13 +434,17 @@ int tcc_ir_opt_post_ra_forward_diamond(struct TCCIRState *ir);
  * ============================================================================ */
 int tcc_ir_opt_const_prop_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_const_prop_tmp_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_known_bits_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_dead_lea_store_elim_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_const_var_prop_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_global_init_prop_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_symref_const_prop_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_value_tracking_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_add_reassoc_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_var_self_add_chain_fold_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_cmp_stack_addr_fold_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_cmp_expr_fold_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_cmp_const_offset_fold_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_const_string_calls_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_self_copy_elim_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_copy_prop_ex(struct IROptCtx *ctx);
@@ -390,6 +466,8 @@ int tcc_ir_opt_var_to_tmp_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_var_tmp_fwd_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_switch_to_data_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_switch_to_data(struct TCCIRState *ir);
+int tcc_ir_opt_switch_collapse_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_switch_collapse(struct TCCIRState *ir);
 int tcc_ir_opt_redundant_loop_check_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_vrp_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_nonneg_branch_fold_ex(struct IROptCtx *ctx);
@@ -399,6 +477,8 @@ int tcc_ir_opt_eliminate_fallthrough_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_dead_loop_elim_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_uninit_local_ub(struct TCCIRState *ir);
 int tcc_ir_opt_uninit_local_ub_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_uninit_dominates_return(struct TCCIRState *ir);
+int tcc_ir_opt_uninit_dominates_return_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_ub_only_body_elide(struct TCCIRState *ir);
 int tcc_ir_opt_ub_only_body_elide_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_local_only_body_elide(struct TCCIRState *ir);
@@ -411,6 +491,8 @@ int tcc_ir_opt_dead_addrvar_elim_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_store_redundant_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_addrof_var_fwd_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_global_sl_fwd_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_loop_const_sim(struct TCCIRState *ir);
+int tcc_ir_opt_loop_const_sim_ex(struct IROptCtx *ctx);
 
 /* ============================================================================
  * Optimization Statistics
@@ -502,6 +584,12 @@ int tcc_ir_opt_loop_unroll(struct TCCIRState *ir);
  * Eliminates 2 branches per iteration. Returns number of loops rotated. */
 int tcc_ir_opt_loop_rotation(struct TCCIRState *ir);
 
+/* Pointer-IV exit-value substitution - for loops with a constant trip count,
+ * replace post-loop uses of pointer induction variables with their closed-form
+ * exit value `Addr[StackLoc[init_off + step * trip_count]]`.  Pairs with
+ * cmp_stack_addr_fold to collapse post-loop `if (p != &a[N])` checks. */
+int tcc_ir_opt_loop_ptr_iv_exit_subst(struct TCCIRState *ir);
+
 /* Dead Loop Elimination - remove loops whose body has no side effects and
  * whose result VARs have constant values. Returns number of loops eliminated. */
 int tcc_ir_opt_dead_loop_elim(struct TCCIRState *ir);
@@ -517,5 +605,51 @@ int tcc_ir_lookup_const_result(struct TCCState *s, int func_token, int64_t *valu
 /* Replace calls to known-constant functions with their return value.
  * Returns number of calls replaced. */
 int tcc_ir_opt_const_call_replace(struct TCCIRState *ir);
+
+/* "Switch-value function" snapshot: a static, side-effect-free function with
+ * one scalar parameter whose body lowers to ASSIGN/CMP/JUMP/JUMPIF/RETURNVALUE.
+ * The snapshot holds a compact replay of the body so callers can evaluate the
+ * return value for any constant argument via simulation.  Opaque to callers
+ * outside opt_constfold.c. */
+struct TCCFuncSwitchSnapshot;
+typedef struct TCCFuncSwitchSnapshot TCCFuncSwitchSnapshot;
+
+/* Try to classify `ir` as a switch-value function and snapshot it.
+ * On success, returns 1 and stores an owned snapshot in *out.
+ * On failure, returns 0 and leaves *out unchanged. */
+int tcc_ir_detect_switch_func(struct TCCIRState *ir, TCCFuncSwitchSnapshot **out);
+
+/* Free a snapshot previously returned by tcc_ir_detect_switch_func. */
+void tcc_ir_switch_func_snapshot_free(TCCFuncSwitchSnapshot *snap);
+
+/* Cache a snapshot under `func_token`.  Takes ownership of `snap` even on
+ * failure (it will be freed if the cache is full or already has an entry). */
+void tcc_ir_cache_switch_func(struct TCCState *s, int func_token, TCCFuncSwitchSnapshot *snap);
+
+/* Look up a previously cached switch-value snapshot.  Returns NULL if not found. */
+const TCCFuncSwitchSnapshot *tcc_ir_lookup_switch_func(struct TCCState *s, int func_token);
+
+/* Simulate the snapshot with `arg_value` for its single parameter.
+ * On success, returns 1 and stores the return value in *out_value (and *out_btype if non-NULL).
+ * On failure (unsupported op, unknown vreg, step limit), returns 0. */
+int tcc_ir_simulate_switch_func(const TCCFuncSwitchSnapshot *snap, int64_t arg_value,
+                                int64_t *out_value, int *out_btype);
+
+/* Extended simulate: also collects an in-order list of snapshot-op indices the
+ * caller must replay to preserve side effects (loads/stores/arithmetic on
+ * constant-symref globals).  Pass `replay_indices`=NULL to reject any function
+ * whose execution would require replay (matches the pure-folding contract).
+ * `replay_count` receives the number of recorded indices. */
+int tcc_ir_simulate_switch_func_ex(const TCCFuncSwitchSnapshot *snap, int64_t arg_value,
+                                   int64_t *out_value, int *out_btype,
+                                   int *replay_indices, int *replay_count);
+
+/* Release all cached switch-value snapshots in `s`.  Called from tcc_delete. */
+void tcc_ir_free_switch_func_cache(struct TCCState *s);
+
+/* Replace FUNCCALLVAL to a cached switch-value function with the constant
+ * return value when the single argument is a constant.  Sister of
+ * tcc_ir_opt_const_call_replace; counts call sites it rewrote. */
+int tcc_ir_opt_switch_call_replace(struct TCCIRState *ir);
 
 #endif /* TCC_IR_OPT_H */

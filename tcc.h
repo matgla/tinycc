@@ -462,11 +462,16 @@ struct SymAttr
       naked : 1, nested_func : 1, /* nested function flag */
       sso_be : 1,                 /* scalar_storage_order("big-endian") */
       transparent_union : 1,      /* __attribute__((transparent_union)) */
-      possibly_written : 1;       /* global may have been written after its
+      possibly_written : 1,       /* global may have been written after its
                                      initializer (a store was emitted, or its
                                      address escaped to a non-const pointer).
                                      Used by inline-eval to decide whether
                                      `*&g` can fold to the initializer. */
+      tu_no_readers : 1;          /* end-of-TU analysis confirmed no reachable
+                                     function reads this static global.  Set
+                                     by tcc_ir_tu_analyze_dead_statics; read
+                                     by dead-static-store-elim during the
+                                     end-of-TU late_reopt phase. */
 };
 
 /* function attributes or temporary attributes for parsing */
@@ -490,7 +495,14 @@ struct FuncAttr
       func_eval_only_inline : 1,        /* body saved for const-fold only, not regular inlining */
       func_pure_via_sret : 1,           /* inferred: only observable side effect is *sret_arg writes */
       func_late_reopt : 1,              /* body kept for end-of-TU re-optimization (non-const static global fold) */
-      xxxx : 4;
+      tu_static_writer : 1,             /* function writes >=1 non-const static global (set during summary collection) */
+      tu_reachable : 1,                 /* function is reachable from a TU root (non-static or addr-taken) per call graph */
+      func_compiled : 1,                /* gen_function has completed for this sym at least once — distinguishes
+                                           forward-declared-not-yet-defined functions from already-emitted ones,
+                                           used by late_reopt triggering for inter-procedural noreturn propagation */
+      func_keep_tokens_for_noreturn : 1; /* tokens preserved so end-of-TU noreturn propagation can decide whether to
+                                            re-emit — separate from func_late_reopt so we don't trigger unnecessary
+                                            re-emit before we know if any callee turned out to be noreturn */
 };
 
 /* symbol management */
@@ -1186,6 +1198,14 @@ struct TCCState
     int btype;      /* IROP_BTYPE_* of return value */
   } func_const_result_cache[FUNC_CONST_RESULT_CACHE_SIZE];
   int func_const_result_cache_count;
+
+  /* Switch-value function snapshot cache: holds replayable bodies of
+   * side-effect-free single-parameter functions whose return value depends on
+   * the argument (e.g. `static int f(int x) { switch (x) { case K: return C; } }`).
+   * Callers with a constant argument simulate the snapshot to fold the call. */
+#define FUNC_SWITCH_CACHE_SIZE 64
+  struct TCCFuncSwitchSnapshot *func_switch_cache[FUNC_SWITCH_CACHE_SIZE];
+  int func_switch_cache_count;
 
 #ifdef CONFIG_TCC_DEBUG
   /* Debug-only runtime features */

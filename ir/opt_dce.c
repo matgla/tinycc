@@ -17,6 +17,7 @@
 #include "opt_utils.h"
 #include "opt_du.h"
 #include "opt_loop_utils.h"
+#include "cfg.h"
 
 /* Dead Code Elimination pass
  * Removes unreachable instructions by following control flow from entry.
@@ -104,6 +105,19 @@ int tcc_ir_opt_dce(TCCIRState *ir)
     case TCCIR_OP_TRAP:
       /* Return/trap - no successor (epilogue is implicit, trap never returns) */
       break;
+    case TCCIR_OP_FUNCCALLVAL:
+    case TCCIR_OP_FUNCCALLVOID:
+    {
+      /* If the callee is provably noreturn (either attributed or inferred by
+       * the inter-procedural noreturn_collapse / infinite_self_recursion /
+       * uninit_dom_return passes — they set sym->f.func_noreturn at end of
+       * gen_function), the call never returns and code after it is dead. */
+      Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+      if (callee && callee->type.ref && callee->type.ref->f.func_noreturn)
+        break; /* terminator: no fall-through */
+      MARK_REACHABLE(i + 1);
+      break;
+    }
     default:
       /* All other instructions fall through to the next */
       MARK_REACHABLE(i + 1);
@@ -327,11 +341,15 @@ int tcc_ir_opt_noreturn_collapse(TCCIRState *ir)
     return 0;
 
   int has_jump = 0;
+  int has_store = 0; /* observable work — gate for publishing func_noreturn */
   for (int i = 0; i < n; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP)
       continue;
+    if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
+        q->op == TCCIR_OP_STORE_POSTINC || q->op == TCCIR_OP_BLOCK_COPY)
+      has_store = 1;
 
     switch (q->op)
     {
@@ -439,6 +457,23 @@ int tcc_ir_opt_noreturn_collapse(TCCIRState *ir)
   if (ir->compact_instructions[last_idx].op != TCCIR_OP_JUMP)
     return 0;
 
+  /* If the final JUMP targets past-end (n) or any NOP at/after last_idx, the
+   * function actually returns implicitly — the backend will emit `bx lr` at
+   * the epilogue.  Only collapse when the JUMP demonstrably loops back to a
+   * live earlier instruction. */
+  {
+    IROperand jdest = tcc_ir_op_get_dest(ir, &ir->compact_instructions[last_idx]);
+    int jt = (int)irop_get_imm64_ex(ir, jdest);
+    if (jt < 0 || jt >= n || jt > last_idx)
+      return 0;
+    /* Target could also land on a NOP that compaction would push past the end. */
+    int t = jt;
+    while (t < n && ir->compact_instructions[t].op == TCCIR_OP_NOP)
+      t++;
+    if (t >= n || t > last_idx)
+      return 0;
+  }
+
   LOG_IR_GEN("NORETURN-COLLAPSE: collapsing function body to infinite loop "
              "(no RETURN, no calls/asm/volatile — side effects unobservable)");
 
@@ -464,6 +499,17 @@ int tcc_ir_opt_noreturn_collapse(TCCIRState *ir)
   /* Suppress the unreachable `bx lr` after the self-jump: control never
    * reaches the epilogue, so emitting it just wastes 2 bytes. */
   ir->noreturn = 1;
+  /* Publish func_noreturn to callers ONLY when the body had at least one
+   * STORE — that's our heuristic for "this function was doing genuine work
+   * in an infinite loop" (e.g. gcc.c-torture pc44485.c::func_21).  Without
+   * the gate we also publish for bodies that were effectively no-ops the
+   * other opts NOP'd down to a trailing self-JUMP (e.g. string-opt-18's
+   * test1, where memcpy(p,p,8) self-copy folds away, leaving nothing).
+   * Publishing for those mislabels regular helpers as noreturn and breaks
+   * downstream purity/LICM/inlining analyses. */
+  if (has_store && tcc_state && tcc_state->cur_func_sym &&
+      tcc_state->cur_func_sym->type.ref)
+    tcc_state->cur_func_sym->type.ref->f.func_noreturn = 1;
 
   return 1;
 }
@@ -471,6 +517,457 @@ int tcc_ir_opt_noreturn_collapse(TCCIRState *ir)
 int tcc_ir_opt_noreturn_collapse_ex(IROptCtx *ctx)
 {
   return tcc_ir_opt_noreturn_collapse(ctx->ir);
+}
+
+/* Zero-Size VLA Elimination
+ *
+ * A VLA_ALLOC whose size operand resolves to a compile-time 0 (e.g. an array
+ * with a zero-length inner dimension: `T a[n][0]`) doesn't actually change
+ * SP — the runtime size expression has already been folded to `0` and stored
+ * into the VLA size slot.  We turn such VLA_ALLOC ops into ASSIGN(dest <- #0)
+ * so that:
+ *   (a) downstream DCE sees the result as a constant rather than a side-
+ *       effecting allocation, and
+ *   (b) `dead_lea_store_elim` (which bails on any VLA_ALLOC) can now run and
+ *       clean up the dead local stores around the eliminated allocation.
+ *
+ * After eliminating zero-size VLA_ALLOCs, the surrounding VLA_SP_SAVE /
+ * VLA_SP_RESTORE pair becomes redundant when no remaining op between them
+ * changes SP — we NOP those too.
+ *
+ * Conservative bails: any IJUMP / SETJMP / LONGJMP / INLINE_ASM in the
+ * function (control flow we don't reason about cleanly).  The size-source
+ * scan is straight-line — it stops at the first prior write to the slot
+ * and bails on intervening calls or indirect stores that could clobber it.
+ */
+int tcc_ir_opt_zero_vla_elim(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  if (n == 0)
+    return 0;
+
+  for (int i = 0; i < n; i++)
+  {
+    TccIrOp op = ir->compact_instructions[i].op;
+    if (op == TCCIR_OP_IJUMP || op == TCCIR_OP_SETJMP || op == TCCIR_OP_LONGJMP ||
+        op == TCCIR_OP_INLINE_ASM)
+      return 0;
+  }
+
+  int changed = 0;
+  int eliminated_any = 0;
+
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_VLA_ALLOC)
+      continue;
+
+    IROperand size_op = tcc_ir_op_get_src1(ir, q);
+    int size_is_zero = 0;
+
+    if (irop_is_immediate(size_op) && irop_get_imm64_ex(ir, size_op) == 0)
+    {
+      size_is_zero = 1;
+    }
+    else if (irop_get_tag(size_op) == IROP_TAG_STACKOFF)
+    {
+      int32_t slot = irop_get_stack_offset(size_op);
+      for (int j = i - 1; j >= 0; j--)
+      {
+        IRQuadCompact *qj = &ir->compact_instructions[j];
+        TccIrOp jop = qj->op;
+        if (jop == TCCIR_OP_NOP)
+          continue;
+
+        if (jop == TCCIR_OP_STORE)
+        {
+          IROperand dest = tcc_ir_op_get_dest(ir, qj);
+          if (irop_get_tag(dest) == IROP_TAG_STACKOFF &&
+              irop_get_stack_offset(dest) == slot)
+          {
+            IROperand src = tcc_ir_op_get_src1(ir, qj);
+            if (irop_is_immediate(src) && irop_get_imm64_ex(ir, src) == 0)
+              size_is_zero = 1;
+            break;
+          }
+        }
+
+        /* Calls / indirect stores / block ops could clobber the slot via
+         * aliasing — stop the backward scan conservatively. */
+        if (jop == TCCIR_OP_FUNCCALLVOID || jop == TCCIR_OP_FUNCCALLVAL ||
+            jop == TCCIR_OP_STORE_INDEXED || jop == TCCIR_OP_BLOCK_COPY)
+          break;
+      }
+    }
+
+    if (!size_is_zero)
+      continue;
+
+    /* Convert VLA_ALLOC to ASSIGN(#0).  VLA_ALLOC has no dest in its op
+     * config — converting to ASSIGN (which has dest, src1) requires the
+     * operand pool to provide a dest slot.  We rely on the pool layout to
+     * have an entry at operand_base[0]; for VLA_ALLOC that slot is unused.
+     *
+     * To stay safe, just NOP the VLA_ALLOC.  The codegen will then skip
+     * any SP adjustment for it.  Consumers that store its (now-undefined)
+     * result are dead-store-eliminated downstream since their dest slots
+     * are never read in the zero-size case. */
+    q->op = TCCIR_OP_NOP;
+    changed = 1;
+    eliminated_any = 1;
+  }
+
+  /* The SP_SAVE/RESTORE cleanup below is safe to run independently of whether
+   * we just eliminated a VLA_ALLOC: after a previous pass call NOPed the
+   * VLA_ALLOC, later passes (e.g. dead_lea_store) may have cleaned up the
+   * LEAs that read the VLA's address slot, leaving a now-dead lone SP_SAVE
+   * we couldn't see on the first call. */
+  (void)eliminated_any;
+
+  /* Helper: does any op in the function read the slot at `slot`? */
+#define SLOT_USED_BY(_op, _is_read)                                                                                    \
+  ({                                                                                                                   \
+    IROperand _s1 = tcc_ir_op_get_src1(ir, (_op));                                                                      \
+    IROperand _s2 = tcc_ir_op_get_src2(ir, (_op));                                                                      \
+    int _used = 0;                                                                                                     \
+    if (irop_get_tag(_s1) == IROP_TAG_STACKOFF && irop_get_stack_offset(_s1) == slot)                                  \
+      _used = 1;                                                                                                       \
+    if (irop_get_tag(_s2) == IROP_TAG_STACKOFF && irop_get_stack_offset(_s2) == slot)                                  \
+      _used = 1;                                                                                                       \
+    if (!(_is_read))                                                                                                   \
+    {                                                                                                                  \
+      IROperand _d = tcc_ir_op_get_dest(ir, (_op));                                                                    \
+      if (irop_get_tag(_d) == IROP_TAG_STACKOFF && irop_get_stack_offset(_d) == slot)                                  \
+        _used = 1;                                                                                                     \
+    }                                                                                                                  \
+    _used;                                                                                                             \
+  })
+
+  /* NOP redundant VLA_SP_SAVE / VLA_SP_RESTORE pairs whose enclosed region
+   * no longer contains any SP-changing op.  Also NOP lone VLA_SP_SAVEs whose
+   * dest slot is never read anywhere (the captured SP isn't used). */
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_VLA_SP_SAVE)
+      continue;
+
+    IROperand dest = tcc_ir_op_get_dest(ir, q);
+    if (irop_get_tag(dest) != IROP_TAG_STACKOFF)
+      continue;
+    int32_t slot = irop_get_stack_offset(dest);
+
+    /* Scan the whole function for uses of this slot. */
+    int restore_idx = -1;
+    int other_reader = 0;
+    int other_writer = 0;
+    for (int j = 0; j < n; j++)
+    {
+      if (j == i)
+        continue;
+      IRQuadCompact *qj = &ir->compact_instructions[j];
+      if (qj->op == TCCIR_OP_NOP)
+        continue;
+
+      if (qj->op == TCCIR_OP_VLA_SP_RESTORE)
+      {
+        IROperand src = tcc_ir_op_get_src1(ir, qj);
+        if (irop_get_tag(src) == IROP_TAG_STACKOFF &&
+            irop_get_stack_offset(src) == slot)
+        {
+          if (restore_idx >= 0)
+          {
+            other_reader = 1;
+            break;
+          }
+          restore_idx = j;
+        }
+      }
+      else if (qj->op == TCCIR_OP_VLA_SP_SAVE)
+      {
+        IROperand d = tcc_ir_op_get_dest(ir, qj);
+        if (irop_get_tag(d) == IROP_TAG_STACKOFF &&
+            irop_get_stack_offset(d) == slot)
+          other_writer = 1;
+      }
+      else
+      {
+        IROperand s1 = tcc_ir_op_get_src1(ir, qj);
+        IROperand s2 = tcc_ir_op_get_src2(ir, qj);
+        IROperand d = tcc_ir_op_get_dest(ir, qj);
+        if ((irop_get_tag(s1) == IROP_TAG_STACKOFF &&
+             irop_get_stack_offset(s1) == slot) ||
+            (irop_get_tag(s2) == IROP_TAG_STACKOFF &&
+             irop_get_stack_offset(s2) == slot))
+          other_reader = 1;
+        if (irop_get_tag(d) == IROP_TAG_STACKOFF &&
+            irop_get_stack_offset(d) == slot)
+          other_writer = 1;
+      }
+    }
+
+    if (other_reader || other_writer)
+      continue;
+
+    if (restore_idx < 0)
+    {
+      /* Lone SP_SAVE with no reader anywhere — pure dead store. */
+      ir->compact_instructions[i].op = TCCIR_OP_NOP;
+      changed = 1;
+      continue;
+    }
+
+    /* Paired SAVE/RESTORE — require no SP-changing op between them. */
+    int sp_changed = 0;
+    for (int j = i + 1; j < restore_idx; j++)
+    {
+      TccIrOp jop = ir->compact_instructions[j].op;
+      if (jop == TCCIR_OP_VLA_ALLOC)
+      {
+        sp_changed = 1;
+        break;
+      }
+    }
+    if (sp_changed)
+      continue;
+
+    ir->compact_instructions[i].op = TCCIR_OP_NOP;
+    ir->compact_instructions[restore_idx].op = TCCIR_OP_NOP;
+    changed = 1;
+  }
+
+#undef SLOT_USED_BY
+
+  return changed;
+}
+
+int tcc_ir_opt_zero_vla_elim_ex(IROptCtx *ctx)
+{
+  return tcc_ir_opt_zero_vla_elim(ctx->ir);
+}
+
+/* Infinite Self-Recursion Collapse
+ *
+ * If a function unconditionally calls itself before any return path is
+ * reachable, every invocation must call itself before returning — by
+ * induction the function can never return.  Caller-visible side effects
+ * after such a call are unreachable; side effects before it are
+ * unobservable (the caller never resumes).  Collapse the body to `b .`,
+ * matching GCC -O2 on patterns like gcc.c-torture/compile/pr10153-1.c
+ * (`V foo(void) { V v = {}; return v - foo(); }`).
+ *
+ * Conservative dominance: walk the IR from entry; require the first
+ * FUNCCALL{VAL,VOID} encountered to be a self-call, and require nothing
+ * preceding it to be able to exit the function (RETURN, JUMP/JUMPIF,
+ * SWITCH, IJUMP, asm, setjmp, trap, VLA juggling) or perform an
+ * observable volatile access.  This handles linear bodies cleanly; richer
+ * dominance can be layered on later.
+ */
+int tcc_ir_opt_infinite_self_recursion(TCCIRState *ir, Sym *func_sym)
+{
+  int n = ir->next_instruction_index;
+  if (n == 0 || !func_sym)
+    return 0;
+  if (!tcc_state || tcc_state->optimize < 2)
+    return 0;
+
+  int self_call_idx = -1;
+  for (int i = 0; i < n && self_call_idx < 0; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+
+    switch (q->op)
+    {
+    case TCCIR_OP_FUNCCALLVAL:
+    case TCCIR_OP_FUNCCALLVOID:
+    {
+      Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+      if (callee == func_sym)
+      {
+        self_call_idx = i;
+        break;
+      }
+      /* Non-self call reached before any self-call: it may return,
+       * after which control could fall through to a RETURN.  We can no
+       * longer prove non-return — bail. */
+      return 0;
+    }
+    /* Any early exit or branch before the self-call breaks the
+     * "unconditionally reached" guarantee. */
+    case TCCIR_OP_RETURNVALUE:
+    case TCCIR_OP_RETURNVOID:
+    case TCCIR_OP_JUMP:
+    case TCCIR_OP_JUMPIF:
+    case TCCIR_OP_SWITCH_TABLE:
+    case TCCIR_OP_SWITCH_LOAD:
+    case TCCIR_OP_IJUMP:
+    case TCCIR_OP_INLINE_ASM:
+    case TCCIR_OP_ASM_INPUT:
+    case TCCIR_OP_ASM_OUTPUT:
+    case TCCIR_OP_SETJMP:
+    case TCCIR_OP_LONGJMP:
+    case TCCIR_OP_NL_SETJMP:
+    case TCCIR_OP_NL_LONGJMP:
+    case TCCIR_OP_BUILTIN_APPLY_ARGS:
+    case TCCIR_OP_BUILTIN_APPLY:
+    case TCCIR_OP_BUILTIN_RETURN:
+    case TCCIR_OP_TRAP:
+    case TCCIR_OP_VLA_ALLOC:
+    case TCCIR_OP_VLA_SP_SAVE:
+    case TCCIR_OP_VLA_SP_RESTORE:
+      return 0;
+    default:
+      break;
+    }
+
+    /* Volatile sym access is observable regardless of return — preserve. */
+    for (int k = 0; k <= 2; k++)
+    {
+      IROperand op;
+      if (k == 0)
+      {
+        if (!irop_config[q->op].has_dest)
+          continue;
+        op = tcc_ir_op_get_dest(ir, q);
+      }
+      else if (k == 1)
+      {
+        if (!irop_config[q->op].has_src1)
+          continue;
+        op = tcc_ir_op_get_src1(ir, q);
+      }
+      else
+      {
+        if (!irop_config[q->op].has_src2)
+          continue;
+        op = tcc_ir_op_get_src2(ir, q);
+      }
+      if (op.is_sym)
+      {
+        Sym *sym = irop_get_sym_ex(ir, op);
+        if (sym && (sym->type.t & VT_VOLATILE))
+          return 0;
+      }
+    }
+  }
+
+  if (self_call_idx < 0)
+    return 0;
+
+  LOG_IR_GEN("INFINITE-RECURSION-COLLAPSE: function unconditionally self-calls "
+             "at i=%d; collapsing body to `b .`", self_call_idx);
+
+  for (int i = 0; i < n; i++)
+  {
+    ir->compact_instructions[i].op = TCCIR_OP_NOP;
+    ir->compact_instructions[i].is_jump_target = 0;
+  }
+
+  ir->compact_instructions[0].op = TCCIR_OP_JUMP;
+  ir->compact_instructions[0].is_jump_target = 1;
+  IROperand self = irop_make_imm32(-1, 0, IROP_BTYPE_INT32);
+  tcc_ir_set_dest(ir, 0, self);
+  tcc_ir_set_src1(ir, 0, IROP_NONE);
+  tcc_ir_set_src2(ir, 0, IROP_NONE);
+
+  ir->ls.dirty_registers = 0;
+  ir->ls.dirty_float_registers = 0;
+  if (ir->ls.live_regs_by_instruction && ir->ls.live_regs_by_instruction_size > 0)
+    memset(ir->ls.live_regs_by_instruction, 0,
+           ir->ls.live_regs_by_instruction_size * sizeof(ir->ls.live_regs_by_instruction[0]));
+  ir->leaffunc = 1;
+  ir->noreturn = 1;
+  if (func_sym && func_sym->type.ref)
+    func_sym->type.ref->f.func_noreturn = 1;
+
+  return 1;
+}
+
+/* Noreturn-Call Epilogue Suppress
+ *
+ * Companion to the DCE extension that treats FUNCCALL-to-noreturn as a
+ * terminator (no fall-through).  After that DCE runs, every RETURN op in
+ * the function may be unreachable.  When the surviving (non-NOP) IR ends
+ * at a FUNCCALL-to-noreturn (i.e., the last live instruction is the call,
+ * or only NOP/CALLSEQ_END follow it), the function itself can never
+ * return — set ir->noreturn = 1 so codegen omits the dead epilogue.
+ *
+ * This does NOT publish caller-side noreturn-ness (we'd need to also prove
+ * the surviving pre-call body has no observable side effects, which is a
+ * stronger check than this pass performs).  It only suppresses the unused
+ * `bx lr` / `pop {pc}` tail.
+ */
+int tcc_ir_opt_noreturn_call_epilogue_suppress(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  if (n == 0)
+    return 0;
+  if (!tcc_state || tcc_state->optimize < 2)
+    return 0;
+  if (ir->noreturn)
+    return 0; /* already set by a stronger pass */
+
+  /* Scan the function: every non-NOP RETURN must be unreachable (was NOP'd
+   * by DCE) for us to declare the function noreturn from codegen's POV.
+   * A single surviving RETURNVALUE/RETURNVOID anywhere means at least one
+   * path exits cleanly.
+   *
+   * We additionally require at least one FUNCCALL-to-noreturn op to exist
+   * (otherwise the function with no RETURN and no noreturn call is either
+   * empty, already handled by noreturn_collapse, or has implicit
+   * fall-through which the prologue MUST emit `bx lr` for). */
+  int has_return = 0;
+  int has_noreturn_call = 0;
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_RETURNVALUE || q->op == TCCIR_OP_RETURNVOID)
+    {
+      has_return = 1;
+      break;
+    }
+    if (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID)
+    {
+      Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+      if (callee && callee->type.ref && callee->type.ref->f.func_noreturn)
+        has_noreturn_call = 1;
+    }
+  }
+  if (has_return || !has_noreturn_call)
+    return 0;
+
+  /* Find the last non-NOP op.  If it's a FUNCCALL-to-noreturn (possibly
+   * followed only by CALLSEQ_END), the function ends there and never
+   * returns; the epilogue is dead. */
+  int last_idx = -1;
+  for (int i = n - 1; i >= 0; i--)
+  {
+    int op = ir->compact_instructions[i].op;
+    if (op == TCCIR_OP_NOP)
+      continue;
+    if (op == TCCIR_OP_CALLSEQ_END)
+      continue; /* harmless trailing frame cleanup */
+    last_idx = i;
+    break;
+  }
+  if (last_idx < 0)
+    return 0;
+
+  int last_op = ir->compact_instructions[last_idx].op;
+  if (last_op != TCCIR_OP_FUNCCALLVAL && last_op != TCCIR_OP_FUNCCALLVOID)
+    return 0;
+
+  Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, &ir->compact_instructions[last_idx]));
+  if (!callee || !callee->type.ref || !callee->type.ref->f.func_noreturn)
+    return 0;
+
+  LOG_IR_GEN("NORETURN-CALL-EPILOGUE-SUPPRESS: function ends at noreturn call "
+             "(i=%d) — setting ir->noreturn to skip dead epilogue", last_idx);
+  ir->noreturn = 1;
+  return 1;
 }
 
 /* ============================================================================
@@ -2979,6 +3476,7 @@ int tcc_ir_opt_dead_loop_elim(TCCIRState *ir)
     int has_side_effects = 0;
     int num_const_assigns = 0; (void)num_const_assigns;
     int has_loop_counter = 0;
+    int has_self_stores = 0;
 
     /* Track which VARs get constant assignments inside the loop body */
     typedef struct
@@ -3008,8 +3506,68 @@ int tcc_ir_opt_dead_loop_elim(TCCIRState *ir)
         break;
       }
 
-      /* Stores to memory (non-local) are side effects */
-      if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED)
+      /* Stores to memory are side effects, with one exception: a local stack
+       * STORE that copies a value back to the slot it was just loaded from
+       * (`T = *p; *p = T;`) is observably a no-op.  This pattern appears in
+       * inlined struct copies (e.g. CCID's `a = x` after CPOW's body has been
+       * DCE'd) — the alias-conservative DSE passes won't kill it on their
+       * own, so handle it here. */
+      if (q->op == TCCIR_OP_STORE)
+      {
+        IROperand sdest = tcc_ir_op_get_dest(ir, q);
+        IROperand ssrc = tcc_ir_op_get_src1(ir, q);
+        int is_self_store = 0;
+        if (sdest.is_local && sdest.is_lval && irop_get_tag(ssrc) == IROP_TAG_VREG && !ssrc.is_lval)
+        {
+          int32_t src_temp = irop_get_vreg(ssrc);
+          if (src_temp >= 0 && TCCIR_DECODE_VREG_TYPE(src_temp) == TCCIR_VREG_TYPE_TEMP)
+          {
+            int dest_off = (int)irop_get_imm64_ex(ir, sdest);
+            for (int j = idx - 1; j >= loop->start_idx; j--)
+            {
+              IRQuadCompact *p = &ir->compact_instructions[j];
+              if (p->op == TCCIR_OP_NOP)
+                continue;
+              if (p->op == TCCIR_OP_JUMP || p->op == TCCIR_OP_JUMPIF)
+                break;
+              if (p->op == TCCIR_OP_FUNCCALLVAL || p->op == TCCIR_OP_FUNCCALLVOID)
+                break;
+              if (p->op == TCCIR_OP_STORE || p->op == TCCIR_OP_STORE_INDEXED)
+              {
+                IROperand pd = tcc_ir_op_get_dest(ir, p);
+                if (!pd.is_local)
+                  break;
+                int po = (int)irop_get_imm64_ex(ir, pd);
+                if (po == dest_off)
+                  break;
+                continue;
+              }
+              if (p->op == TCCIR_OP_LOAD)
+              {
+                IROperand pd = tcc_ir_op_get_dest(ir, p);
+                IROperand ps = tcc_ir_op_get_src1(ir, p);
+                if (irop_get_vreg(pd) == src_temp && ps.is_local && ps.is_lval)
+                {
+                  int po = (int)irop_get_imm64_ex(ir, ps);
+                  if (po == dest_off)
+                  {
+                    is_self_store = 1;
+                    break;
+                  }
+                }
+              }
+            }
+          }
+        }
+        if (is_self_store)
+        {
+          has_self_stores = 1;
+          continue;
+        }
+        has_side_effects = 1;
+        break;
+      }
+      if (q->op == TCCIR_OP_STORE_INDEXED)
       {
         has_side_effects = 1;
         break;
@@ -3127,11 +3685,19 @@ int tcc_ir_opt_dead_loop_elim(TCCIRState *ir)
       break;
     }
 
-    if (has_side_effects || num_const_vars == 0 || !has_loop_counter)
+    /* Require either a constant VAR assignment in the body OR at least one
+     * self-store (load-then-store-back of the same slot, no observable effect).
+     * A bare loop with only a counter and forward jumps doesn't qualify — it
+     * may be a switch-bounds-check loop or other non-loop CFG quirk that
+     * happens to look like a back-edge to the loop detector. */
+    if (has_side_effects || !has_loop_counter)
+      continue;
+    if (num_const_vars == 0 && !has_self_stores)
       continue;
 
-    /* The loop body only contains constant VAR assignments and counter updates.
-     * NOP all body instructions and place constant assignments in the preheader. */
+    /* The loop body only contains constant VAR assignments, counter updates,
+     * and/or self-stores (`*p = *p`).  NOP all body instructions and place
+     * any constant assignments in the preheader. */
     LOG_IR_GEN("OPTIMIZE: Dead loop elimination at header=%d (%d const vars)", loop->header_idx, num_const_vars);
 
     /* NOP loop body instructions within [start_idx, end_idx] only.
@@ -3373,6 +3939,229 @@ int tcc_ir_opt_uninit_local_ub(TCCIRState *ir)
 }
 
 int tcc_ir_opt_uninit_local_ub_ex(IROptCtx *ctx) { return tcc_ir_opt_uninit_local_ub(ctx->ir); }
+
+/* Uninit-Read Dominates Return — extended UB exploit
+ *
+ * Generalises uninit_local_ub from "entry block" to "any read of an uninit
+ * local that dominates every RETURN op".  If such a read exists, every
+ * execution that reaches a return first executes the UB read; per C11 we may
+ * legally choose any behaviour, including non-termination.  Collapse to
+ * `b .`, matching GCC -O2 on patterns like gcc.c-torture/compile/pc44485.c
+ * `func_21` (20→1): the only RETURN is past a TEST of an uninitialised
+ * `unsigned short l_53`, so GCC treats the whole function as noreturn.
+ *
+ * "Uninit at the read" is approximated by a linear-order pre-scan: a VAR
+ * whose first read in IR linear order precedes any write of that VAR.  This
+ * misses conditional-uninit patterns (where a path with a prior write also
+ * exists) but is sound — we never claim uninit where the variable has been
+ * written.  Address-taken VARs are excluded since pointer writes may
+ * initialize them invisibly.
+ */
+int tcc_ir_opt_uninit_dominates_return(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  if (n == 0)
+    return 0;
+  if (!tcc_state || tcc_state->optimize < 2)
+    return 0;
+
+  /* Inline asm / computed goto: same conservative bail as uninit_local_ub. */
+  for (int i = 0; i < n; i++)
+  {
+    TccIrOp op = ir->compact_instructions[i].op;
+    if (op == TCCIR_OP_ASM_INPUT || op == TCCIR_OP_ASM_OUTPUT || op == TCCIR_OP_INLINE_ASM || op == TCCIR_OP_IJUMP)
+      return 0;
+  }
+
+  /* Must have at least one RETURN — otherwise noreturn_collapse handles it. */
+  int has_return = 0;
+  for (int i = 0; i < n; i++)
+  {
+    TccIrOp op = ir->compact_instructions[i].op;
+    if (op == TCCIR_OP_RETURNVALUE || op == TCCIR_OP_RETURNVOID)
+    {
+      has_return = 1;
+      break;
+    }
+  }
+  if (!has_return)
+    return 0;
+
+#define UDR_MAX_VAR_POS 1024
+  uint8_t written[(UDR_MAX_VAR_POS + 7) / 8] = {0};
+  uint8_t addr_taken[(UDR_MAX_VAR_POS + 7) / 8] = {0};
+
+  /* Pre-scan address-taken VARs. */
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    for (int k = 0; k <= 2; k++)
+    {
+      IROperand op;
+      if (k == 0)
+      {
+        if (!irop_config[q->op].has_dest)
+          continue;
+        op = tcc_ir_op_get_dest(ir, q);
+      }
+      else if (k == 1)
+      {
+        if (!irop_config[q->op].has_src1)
+          continue;
+        op = tcc_ir_op_get_src1(ir, q);
+      }
+      else
+      {
+        if (!irop_config[q->op].has_src2)
+          continue;
+        op = tcc_ir_op_get_src2(ir, q);
+      }
+      int32_t vr = irop_get_vreg(op);
+      if (vr < 0)
+        continue;
+      if (TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_VAR)
+        continue;
+      if (op.is_local && !op.is_lval)
+      {
+        int pos = TCCIR_DECODE_VREG_POSITION(vr);
+        if (pos >= 0 && pos < UDR_MAX_VAR_POS)
+          addr_taken[pos >> 3] |= (uint8_t)(1u << (pos & 7));
+      }
+    }
+    if (q->op == TCCIR_OP_LEA && irop_config[q->op].has_src1)
+    {
+      IROperand op = tcc_ir_op_get_src1(ir, q);
+      int32_t vr = irop_get_vreg(op);
+      if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR)
+      {
+        int pos = TCCIR_DECODE_VREG_POSITION(vr);
+        if (pos >= 0 && pos < UDR_MAX_VAR_POS)
+          addr_taken[pos >> 3] |= (uint8_t)(1u << (pos & 7));
+      }
+    }
+  }
+
+  /* Linear scan: find the FIRST instruction that reads a VAR not yet written
+   * (in IR order).  Track only one candidate — the earliest qualifying read.
+   * This is conservative (we only catch reads where no prior linear-order
+   * write exists), but matches what the entry-block pass already does on
+   * straight-line code. */
+  int uninit_read_idx = -1;
+  for (int i = 0; i < n && uninit_read_idx < 0; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+
+    for (int k = 1; k <= 2; k++)
+    {
+      if (k == 1 && !irop_config[q->op].has_src1)
+        continue;
+      if (k == 2 && !irop_config[q->op].has_src2)
+        continue;
+      IROperand sop = (k == 1) ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_src2(ir, q);
+      int32_t svr = irop_get_vreg(sop);
+      if (svr < 0)
+        continue;
+      if (TCCIR_DECODE_VREG_TYPE(svr) != TCCIR_VREG_TYPE_VAR)
+        continue;
+      if (sop.is_local && !sop.is_lval)
+        continue;
+      int pos = TCCIR_DECODE_VREG_POSITION(svr);
+      if (pos < 0 || pos >= UDR_MAX_VAR_POS)
+        continue;
+      if (addr_taken[pos >> 3] & (uint8_t)(1u << (pos & 7)))
+        continue;
+      if (!(written[pos >> 3] & (uint8_t)(1u << (pos & 7))))
+      {
+        uninit_read_idx = i;
+        break;
+      }
+    }
+
+    if (irop_config[q->op].has_dest)
+    {
+      IROperand dop = tcc_ir_op_get_dest(ir, q);
+      int32_t dvr = irop_get_vreg(dop);
+      if (dvr >= 0 && TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_VAR)
+      {
+        int pos = TCCIR_DECODE_VREG_POSITION(dvr);
+        if (pos >= 0 && pos < UDR_MAX_VAR_POS)
+          written[pos >> 3] |= (uint8_t)(1u << (pos & 7));
+      }
+    }
+  }
+#undef UDR_MAX_VAR_POS
+
+  if (uninit_read_idx < 0)
+    return 0;
+
+  /* Build CFG + dominators and verify the uninit read dominates every RETURN. */
+  IRCFG *cfg = tcc_ir_cfg_build(ir);
+  if (!cfg || cfg->num_blocks == 0)
+  {
+    if (cfg)
+      tcc_ir_cfg_free(cfg);
+    return 0;
+  }
+  tcc_ir_cfg_compute_dominators(cfg);
+
+  int read_block = cfg->instr_to_block[uninit_read_idx];
+  int ok = 1;
+  for (int i = 0; i < n && ok; i++)
+  {
+    TccIrOp op = ir->compact_instructions[i].op;
+    if (op != TCCIR_OP_RETURNVALUE && op != TCCIR_OP_RETURNVOID)
+      continue;
+    int ret_block = cfg->instr_to_block[i];
+    if (read_block == ret_block)
+    {
+      /* Same block: read must come before the RETURN in linear order. */
+      if (uninit_read_idx >= i)
+        ok = 0;
+    }
+    else if (!tcc_ir_cfg_dominates(cfg, read_block, ret_block))
+    {
+      ok = 0;
+    }
+  }
+  tcc_ir_cfg_free(cfg);
+
+  if (!ok)
+    return 0;
+
+  LOG_IR_GEN("UNINIT-DOM-RETURN: collapsing function body to infinite loop "
+             "(uninit VAR read at i=%d dominates all RETURNs)", uninit_read_idx);
+
+  for (int i = 0; i < n; i++)
+  {
+    ir->compact_instructions[i].op = TCCIR_OP_NOP;
+    ir->compact_instructions[i].is_jump_target = 0;
+  }
+
+  ir->compact_instructions[0].op = TCCIR_OP_JUMP;
+  ir->compact_instructions[0].is_jump_target = 1;
+  IROperand self = irop_make_imm32(-1, 0, IROP_BTYPE_INT32);
+  tcc_ir_set_dest(ir, 0, self);
+  tcc_ir_set_src1(ir, 0, IROP_NONE);
+  tcc_ir_set_src2(ir, 0, IROP_NONE);
+
+  ir->ls.dirty_registers = 0;
+  ir->ls.dirty_float_registers = 0;
+  if (ir->ls.live_regs_by_instruction && ir->ls.live_regs_by_instruction_size > 0)
+    memset(ir->ls.live_regs_by_instruction, 0,
+           ir->ls.live_regs_by_instruction_size * sizeof(ir->ls.live_regs_by_instruction[0]));
+  ir->leaffunc = 1;
+  ir->noreturn = 1;
+  if (tcc_state && tcc_state->cur_func_sym && tcc_state->cur_func_sym->type.ref)
+    tcc_state->cur_func_sym->type.ref->f.func_noreturn = 1;
+
+  return 1;
+}
+
+int tcc_ir_opt_uninit_dominates_return_ex(IROptCtx *ctx) { return tcc_ir_opt_uninit_dominates_return(ctx->ir); }
 
 /* UB-Only Function Body Elide
  *
@@ -3723,6 +4512,8 @@ int tcc_ir_opt_ub_only_body_elide_ex(IROptCtx *ctx) { return tcc_ir_opt_ub_only_
  *   - STOREs to local-pointer TEMPs (LEA of stack-local, propagated via
  *     ASSIGN/ADD/SUB)
  *   - calls to tcc_ir_is_pure_aeabi() helpers
+ *   - calls to __aeabi_cdcmple / __aeabi_cfcmple (flag-cmp helpers: they
+ *     only side-effect CPSR, which dies on return alongside the body)
  *   - calls to memmove/memcpy/memset family iff the destination arg
  *     (FUNCPARAMVAL/FUNCPARAMVOID param_idx 0) is also a local-pointer TEMP
  *   - everything else useless_function_body allows
@@ -3809,6 +4600,15 @@ int tcc_ir_opt_local_only_body_elide(TCCIRState *ir)
         return 0;
       has_observable_op = 1;
       if (tcc_ir_is_pure_aeabi(name))
+        break;
+      /* Flag-cmp helpers (__aeabi_cdcmple / __aeabi_cfcmple): functionally
+       * pure — they read both operands, set CPSR, return nothing.  The CPSR
+       * flags are caller-invisible on function return, so a call whose only
+       * "side effect" is flag-setting is as elidable as any pure aeabi
+       * helper.  Without this, an empty-body `if (a < b) {}` over doubles
+       * keeps the cdcmple call and its dadd-fed comparand alive (see
+       * gcc.c-torture compile/pr45969-1.c). */
+      if (ir_opt_is_flag_cmp_helper_name(name))
         break;
       /* memmove/memcpy/memset family: writes through their first arg only.
        * If that destination points into our own stack frame, the writes

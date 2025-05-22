@@ -882,6 +882,45 @@ ST_FUNC int tccgen_compile(TCCState *s1)
   parse_flags = PARSE_FLAG_PREPROCESS | PARSE_FLAG_TOK_NUM | PARSE_FLAG_TOK_STR;
   next();
   decl(VT_CONST);
+  /* End-of-TU analysis: compute call-graph reachability and the set of
+   * static globals with no reachable readers.  Must run before
+   * gen_late_reopt_functions so newly-flagged writer functions get picked
+   * up by the existing late_reopt loop. */
+  if (s1->opt_dead_store)
+    tcc_ir_tu_analyze_dead_statics();
+  /* Propagate noreturn from callees to callers: for any function whose
+   * tokens were preserved by the gen_function noreturn-trigger AND whose
+   * call graph now includes a func_noreturn callee, set func_late_reopt
+   * so gen_late_reopt_functions re-emits it with noreturn-call DCE.
+   *
+   * Then orphan the InlineFunc entries for callers whose tokens were
+   * preserved speculatively but whose callees did NOT turn out to be
+   * noreturn — otherwise gen_inline_functions would later re-compile
+   * them (via the sym->c truthy branch at line ~28553), producing
+   * duplicated/conflicting code in .text. */
+  if (s1->opt_dce && s1->optimize >= 2)
+  {
+    tcc_ir_tu_propagate_noreturn_to_callers();
+    for (int fi = 0; fi < s1->nb_inline_fns; fi++)
+    {
+      struct InlineFunc *ifn = s1->inline_fns[fi];
+      if (!ifn || !ifn->sym || !ifn->sym->type.ref)
+        continue;
+      if (!ifn->sym->type.ref->f.func_keep_tokens_for_noreturn)
+        continue;
+      if (ifn->sym->type.ref->f.func_late_reopt)
+        continue; /* re-emit pending — leave alone */
+      /* Speculative token-keep is no longer needed.  Free tokens and
+       * orphan sym so gen_inline_functions doesn't re-emit. */
+      ifn->sym->type.ref->f.func_keep_tokens_for_noreturn = 0;
+      if (ifn->func_str)
+      {
+        tok_str_free(ifn->func_str);
+        ifn->func_str = NULL;
+      }
+      ifn->sym = NULL;
+    }
+  }
   gen_late_reopt_functions(s1);
   gen_inline_functions(s1);
   resolve_pending_aliases();
@@ -912,6 +951,8 @@ ST_FUNC void tccgen_finish(TCCState *s1)
   /* Release per-TU function write summaries (Sym* keys are about to become
    * invalid as global_stack is popped). */
   tcc_ir_func_write_summary_clear_all();
+  /* Same for the TU-wide read/call summary used by dead-static-store elim. */
+  tcc_ir_tu_func_summary_clear_all();
 
   tcc_free(pending_aliases);
   pending_aliases = NULL;
@@ -7476,6 +7517,37 @@ static int inline_body_has_shadowed_ident(TokenString *func_str)
   return 0;
 }
 
+/* Smarter variant for nested inlining.  At the top level (not inside another
+ * inline expansion), defer to the strict check — it catches the genuine bug
+ * of a caller's local shadowing a global that the callee references.
+ *
+ * When called from inside a nested inline expansion, the outer-inlined
+ * function's parameter/local symbols are already in scope and shadow their
+ * file-scope counterparts.  The strict check would always trip on those,
+ * blocking nested expansion for any non-trivial body — even when the inner
+ * callee's identifiers are purely self-bound (its own params/locals, re-
+ * resolved during its own replay).  In that case the shadowing is harmless,
+ * so we relax the check to allow nested expansion.
+ *
+ * The residual risk is: callee references a free global identifier whose
+ * name happens to match one of the outer-inlined function's locals.  This
+ * is rare in practice and the gain (full collapse of helper-chain calls in
+ * the c5p/CPOW/CCID style) is substantial.  If a real regression surfaces,
+ * the check can be tightened by exempting only the outer expansion's
+ * known-pushed symbols. */
+static int inline_body_has_unsafe_shadowed_ident(TokenString *func_str, Sym *call_func_sym)
+{
+  (void)call_func_sym;
+  if (!func_str)
+    return 0;
+  /* In nested inline expansion: the outer expansion's locals are in scope
+   * and would always shadow globals matching the callee's params/locals.
+   * Skip the strict check in that case. */
+  if (tcc_state->in_inline_expansion)
+    return 0;
+  return inline_body_has_shadowed_ident(func_str);
+}
+
 /* Return 1 if the function body contains tokens that are unsafe for
  * token-replay inline expansion:
  * - TOK_STATIC: creates a new copy of each static variable per inline site
@@ -7508,7 +7580,9 @@ static int inline_body_has_static_local(TokenString *func_str)
 /* Return 1 if the function body contains any loop statement (for/while/do).
  * Token-replay inline expansion does not correctly handle backward jumps in
  * some expression contexts (e.g. for-loop condition), so we decline to
- * always_inline such functions. */
+ * always_inline such functions.  Strict: kept conservative for the
+ * always_inline call-site check (line ~15200), which can't see the caller's
+ * expression-context state. */
 static int inline_body_has_loops(TokenString *func_str)
 {
   const int *tp;
@@ -7527,6 +7601,80 @@ static int inline_body_has_loops(TokenString *func_str)
       return 1;
     if (tv == TOK_EOF || tv == 0)
       break;
+  }
+
+  return 0;
+}
+
+/* Looser variant for auto-inline candidate registration: accept bodies that
+ * contain only `while` / `do` loops at statement level.  The conservative
+ * `inline_body_has_loops` rejects every loop because token-replay into an
+ * expression-context call site (e.g. a for-loop condition) misbinds the
+ * inlined loop's break/continue.  At registration time we don't know the
+ * caller's context, but auto-inlined helpers are typically tiny and called
+ * from statement-level call sites.  CPOW-style `while(--y > 0)` is the
+ * motivating case: once the helper inlines, the IR loop unroller can fold
+ * the loop when the trip-count parameter is a compile-time constant.
+ *
+ * Rejects:
+ *  - any `for` loop (the three-part header interacts badly with token replay)
+ *  - any loop appearing inside `(`/`[` (expression context — the original
+ *    correctness concern, which `({...})` statement-expressions do NOT
+ *    trigger because the inner `{` re-enters statement context). */
+static int inline_body_has_unsafe_loops(TokenString *func_str)
+{
+  const int *tp;
+  /* Stack of open bracket contexts: 0='{' (statement), 1='(', 2='['. */
+  unsigned char stack[64];
+  int sp = 0;
+
+  if (!func_str)
+    return 0;
+
+  tp = tok_str_buf(func_str);
+  while (*tp)
+  {
+    int tv;
+    CValue tcv;
+
+    tok_get(&tv, &tp, &tcv);
+    if (tv == TOK_EOF || tv == 0)
+      break;
+    if (tv == TOK_LINENUM)
+      continue;
+
+    switch (tv)
+    {
+    case '(':
+      if (sp < (int)sizeof(stack)) stack[sp] = 1;
+      sp++;
+      break;
+    case '[':
+      if (sp < (int)sizeof(stack)) stack[sp] = 2;
+      sp++;
+      break;
+    case '{':
+      if (sp < (int)sizeof(stack)) stack[sp] = 0;
+      sp++;
+      break;
+    case ')':
+    case ']':
+    case '}':
+      if (sp > 0) sp--;
+      break;
+    case TOK_FOR:
+      return 1;
+    case TOK_WHILE:
+    case TOK_DO:
+    {
+      int innermost = (sp == 0) ? 0
+                    : (sp <= (int)sizeof(stack)) ? stack[sp - 1]
+                    : 1;
+      if (innermost != 0)
+        return 1;
+    }
+    break;
+    }
   }
 
   return 0;
@@ -9621,6 +9769,85 @@ static void vpush_type_size(CType *type, int *a)
 static inline CType *pointed_type(CType *type)
 {
   return &type->ref->type;
+}
+
+/* Recursively mark value (non-padding) bytes of TYPE at BASE offset into MAP.
+ * MAP is a byte array of MAP_SIZE bytes; map[i]=1 means "value byte", 0 means
+ * "padding".  Caller pre-zeroes MAP.  Returns 0 on success, -1 if the type
+ * contains a VLA member or other structure we can't statically analyze (in
+ * which case the caller should not emit any clear-padding stores). */
+static int mark_value_bytes(CType *type, int base, unsigned char *map, int map_size)
+{
+  int align, size;
+  int bt = type->t & VT_BTYPE;
+
+  /* VLA member inside a struct: layout can't be statically determined.
+   * The top-level VLA pointer case is handled by the caller (size<=0). */
+  if (type->t & VT_VLA)
+    return -1;
+
+  /* Bitfield: mark the storage-unit bytes the field touches as value bytes.
+   * Bits not used by this bitfield but inside the same byte may be used by
+   * an adjacent bitfield, so we conservatively never clear those bytes. */
+  if (type->t & VT_BITFIELD)
+  {
+    int bpos = BIT_POS(type->t);
+    int bsize_bits = BIT_SIZE(type->t);
+    int span = (bpos + bsize_bits + 7) / 8;
+    for (int i = 0; i < span; i++)
+    {
+      int idx = base + i;
+      if (idx >= 0 && idx < map_size)
+        map[idx] = 1;
+    }
+    return 0;
+  }
+
+  size = type_size(type, &align);
+  if (size <= 0)
+    return 0;
+
+  if (bt == VT_STRUCT)
+  {
+    Sym *sref = type->ref;
+    if (!sref)
+      return -1;
+    for (Sym *f = sref->next; f; f = f->next)
+    {
+      int rc = mark_value_bytes(&f->type, base + f->c, map, map_size);
+      if (rc < 0)
+        return rc;
+    }
+    return 0;
+  }
+
+  if ((type->t & VT_ARRAY) && bt == VT_PTR)
+  {
+    Sym *sref = type->ref;
+    int nelem = sref->c;
+    if (nelem <= 0)
+      return 0;
+    int eal;
+    int esize = type_size(&sref->type, &eal);
+    if (esize <= 0)
+      return 0;
+    for (int i = 0; i < nelem; i++)
+    {
+      int rc = mark_value_bytes(&sref->type, base + i * esize, map, map_size);
+      if (rc < 0)
+        return rc;
+    }
+    return 0;
+  }
+
+  /* Scalar, pointer, function pointer, etc.: every byte is a value byte. */
+  for (int i = 0; i < size; i++)
+  {
+    int idx = base + i;
+    if (idx >= 0 && idx < map_size)
+      map[idx] = 1;
+  }
+  return 0;
 }
 
 /* modify type so that its it is a pointer to type. */
@@ -15047,17 +15274,23 @@ va_arg_pack_done:
     /* Already handled above */
   }
   else if (can_inline_eval && !NOEVAL_WANTED && call_func_sym && saved_arg_count == nb_real_args && tcc_state->ir &&
-           /* Allow one level of nested inlining (a call to a small function
-            * from inside an already-inlined body) only when the called
-            * function returns void.
-            * - Void return avoids the store-then-load-through-return-slot
-            *   phi pattern that some optimizer passes mis-fold (930725-1).
+           /* Allow nested inlining (a call to a small function from inside
+            * an already-inlined body) under controlled conditions:
+            * - Void return: safe; no return-slot phi pattern.
+            * - Struct return: also safe because the return slot is a caller-
+            *   supplied address (sret) rather than a phi between constant/
+            *   non-constant branches — the mis-fold pattern from 930725-1
+            *   (pointer return) cannot arise.  Allow up to depth 3 so that
+            *   helper chains like c5p→CPOW→CCID collapse fully (20030613-1).
+            * - Pointer/scalar return: still gated to depth<1 to avoid the
+            *   store-then-load-through-return-slot phi pattern.
             * - Depth cap prevents mutual-recursion expansion (pr22379). */
            (!tcc_state->in_inline_expansion ||
             call_func_sym->a.nested_func ||
-            (tcc_state->inline_expansion_depth < 2 &&
+            (tcc_state->inline_expansion_depth < 3 &&
              call_func_sym->type.ref &&
-             (call_func_sym->type.ref->type.t & VT_BTYPE) == VT_VOID)))
+             ((call_func_sym->type.ref->type.t & VT_BTYPE) == VT_VOID ||
+              (call_func_sym->type.ref->type.t & VT_BTYPE) == VT_STRUCT))))
   {
     /* ---- Token-level inline expansion ----
      * Expand inline functions at the call site in these cases:
@@ -15191,7 +15424,8 @@ va_arg_pack_done:
       int *_fsb = tok_str_buf(inline_fn->func_str);
       int _fsl = inline_fn->func_str->len;
       if ((!macro_ptr || macro_ptr < _fsb || macro_ptr >= _fsb + _fsl) &&
-          !inline_body_has_shadowed_ident(inline_fn->func_str) && !inline_body_has_static_local(inline_fn->func_str) &&
+          !inline_body_has_unsafe_shadowed_ident(inline_fn->func_str, call_func_sym) &&
+          !inline_body_has_static_local(inline_fn->func_str) &&
           !inline_body_has_apply_args(inline_fn->func_str))
       {
         if (TCC_LOG_INLINE_STRUCT)
@@ -15204,10 +15438,14 @@ va_arg_pack_done:
       }
       else if (TCC_LOG_INLINE_STRUCT)
       {
+        int macro_in = !(!macro_ptr || macro_ptr < _fsb || macro_ptr >= _fsb + _fsl);
+        int sh = inline_body_has_unsafe_shadowed_ident(inline_fn->func_str, call_func_sym);
+        int sl = inline_body_has_static_local(inline_fn->func_str);
+        int aa = inline_body_has_apply_args(inline_fn->func_str);
         fprintf(stderr,
                 "[auto-inline] callsite: skipping inline of %s "
-                "(outer macro reads from its own func_str)\n",
-                get_tok_str(call_func_sym->v & ~SYM_FIELD, NULL));
+                "(macro_in=%d shadow=%d static_local=%d apply_args=%d)\n",
+                get_tok_str(call_func_sym->v & ~SYM_FIELD, NULL), macro_in, sh, sl, aa);
       }
     }
     else if (!force_always_inline && !has_addr_of_label && call_func_sym->type.ref &&
@@ -19904,6 +20142,134 @@ tok_next:
     type.t = VT_VOID;
     vpush(&type);
     break;
+  case TOK_builtin_clear_padding:
+  {
+    /* __builtin_clear_padding(ptr) — zero the padding bytes of *ptr while
+     * preserving value bytes.  We walk the target type to compute the
+     * padding-byte ranges, then emit byte stores of 0 for each padding byte.
+     * For zero-size or padding-free targets we emit nothing — matching GCC's
+     * behavior of folding the call away when there's no padding to clear. */
+    parse_builtin_params(0, "e");
+    if ((vtop->type.t & VT_BTYPE) != VT_PTR)
+      tcc_error("__builtin_clear_padding requires a pointer argument");
+
+    CType target = *pointed_type(&vtop->type);
+    int t_align, t_size;
+    t_size = type_size(&target, &t_align);
+
+    /* Zero/negative (e.g. unknown VLA): nothing to clear. */
+    if (t_size <= 0)
+    {
+      vpop();
+      type.t = VT_VOID;
+      vpush(&type);
+      break;
+    }
+
+    /* Sanity cap: refuse to scan absurdly large types. */
+    const int MAX_CLEAR_PADDING_SIZE = 4096;
+    if (t_size > MAX_CLEAR_PADDING_SIZE)
+    {
+      tcc_warning("__builtin_clear_padding: object too large (%d bytes), "
+                  "treated as no-op",
+                  t_size);
+      vpop();
+      type.t = VT_VOID;
+      vpush(&type);
+      break;
+    }
+
+    unsigned char *vmap = tcc_mallocz(t_size);
+    int rc = mark_value_bytes(&target, 0, vmap, t_size);
+    if (rc < 0)
+    {
+      /* Type contains a VLA member or other unsupported shape — emit no
+       * stores rather than risk clobbering live bytes. */
+      tcc_free(vmap);
+      vpop();
+      type.t = VT_VOID;
+      vpush(&type);
+      break;
+    }
+
+    int padding_count = 0;
+    for (int i = 0; i < t_size; i++)
+      if (!vmap[i])
+        padding_count++;
+
+    if (padding_count == 0)
+    {
+      tcc_free(vmap);
+      vpop();
+      type.t = VT_VOID;
+      vpush(&type);
+      break;
+    }
+
+    /* Save the pointer SValue so we can reuse it for each store, then
+     * remove it from vtop. */
+    SValue ptr_sv = *vtop;
+    vpop();
+
+    /* For each contiguous padding range, emit zero-stores using the widest
+     * naturally-aligned store at each offset (1-, 2-, or 4-byte).  This
+     * keeps the store count low for typical trailing-padding ranges. */
+    int off = 0;
+    while (off < t_size)
+    {
+      if (vmap[off])
+      {
+        off++;
+        continue;
+      }
+      int run_start = off;
+      while (off < t_size && !vmap[off])
+        off++;
+      int run_end = off;
+
+      int p = run_start;
+      while (p < run_end)
+      {
+        int remaining = run_end - p;
+        int sz;
+        if ((p & 3) == 0 && remaining >= 4)
+          sz = 4;
+        else if ((p & 1) == 0 && remaining >= 2)
+          sz = 2;
+        else
+          sz = 1;
+
+        /* Build (T*)((char*)ptr_sv + p), then *result = 0. */
+        vpushv(&ptr_sv);
+        vtop->type = char_pointer_type;
+        vpushi(p);
+        gen_op('+');
+
+        CType store_type, store_ptr_type;
+        store_type.ref = NULL;
+        switch (sz)
+        {
+        case 1: store_type.t = VT_BYTE | VT_UNSIGNED; break;
+        case 2: store_type.t = VT_SHORT | VT_UNSIGNED; break;
+        default: store_type.t = VT_INT; break;
+        }
+        store_ptr_type = store_type;
+        mk_pointer(&store_ptr_type);
+        gen_cast(&store_ptr_type);
+        indir();
+        vpushi(0);
+        vstore();
+        vpop();
+
+        p += sz;
+      }
+    }
+
+    tcc_free(vmap);
+    type.t = VT_VOID;
+    vpush(&type);
+    break;
+  }
   case TOK_builtin_setjmp:
   {
     /* __builtin_setjmp(void **buf) - returns 0 on initial call, 1 on longjmp return */
@@ -22156,8 +22522,10 @@ static void check_func_return(void)
     gen_assign_cast(&func_vt);
     gfunc_return(&func_vt);
   }
-  else
+  else if (!tcc_state->ir_late_reopt_phase)
   {
+    /* Skip during the end-of-TU re-compile: the warning was already emitted
+     * during the first-pass compile, and re-emitting would double-report. */
     tcc_warning("function might return no value: '%s'", funcname);
   }
 }
@@ -26521,6 +26889,16 @@ static void gen_function(Sym *sym)
   dump_ir_after_pass(tcc_state, ir, "block_copy_init");
 #endif
 
+  /* Small zero-memset to direct STORE: for the leftover memset(stack, N<=8, 0)
+   * cases that block_copy_init didn't touch (no follow-up stores, or size
+   * not a multiple of 4).  Removes the runtime memset call for trivial
+   * zero-initialized locals so downstream store-load forwarding can fold
+   * subsequent reads to #0. */
+  tcc_ir_opt_small_memset_to_store(ir);
+#ifdef CONFIG_TCC_DEBUG
+  dump_ir_after_pass(tcc_state, ir, "small_memset_to_store");
+#endif
+
   /* Fold memmove(dst_ptr, &local_tmp, N) into direct STORE_INDEXED ops on
    * dst_ptr when the temp is only used to feed this single memmove.  Cuts
    * a function call (and its temp materialization) out of complex/struct
@@ -26548,6 +26926,10 @@ static void gen_function(Sym *sym)
   if (tcc_state->opt_ipc)
   {
     tcc_ir_opt_const_call_replace(ir);
+    /* Switch-value IPCP: fold calls to single-arg pure dispatchers whose arg
+     * is a constant (e.g. parse_btype-style `switch (tok) { case K: return C; }`).
+     * Runs alongside const_call_replace so the cascade picks up the constant. */
+    tcc_ir_opt_switch_call_replace(ir);
 #ifdef CONFIG_TCC_DEBUG
     dump_ir_after_pass(tcc_state, ir, "const_call_replace");
 #endif
@@ -26569,6 +26951,11 @@ static void gen_function(Sym *sym)
   /* Narrow CSE: deduplicate PARAM/VAR + #constant expressions. */
   if (tcc_state->optimize >= 1)
     tcc_ir_opt_cse_param_add(ir);
+
+  /* CMP+SETIF CSE: replace a second CMP+SETIF whose operands and cond
+   * match an earlier one in the same BB with ASSIGN-from-prior-vreg. */
+  if (tcc_state->optimize >= 1)
+    tcc_ir_opt_cmp_setif_cse(ir);
 
   /* GlobalSym CSE: hoist repeated global symbol addresses to TEMPs.
    * Must run before compact_nops since it reuses NOP slots. */
@@ -26767,10 +27154,38 @@ static void gen_function(Sym *sym)
       {
         tcc_ir_opt_const_prop(ir);
         tcc_ir_opt_const_prop_tmp(ir);
+        /* gslfwd may have introduced `CMP #C, #C` patterns by substituting
+         * stored constants into reads.  Fold those conditional jumps so the
+         * downstream DCE can eliminate now-unreachable branches. */
+        tcc_ir_opt_branch_folding(ir);
       }
       if (tcc_state->opt_dce)
         tcc_ir_opt_dce(ir);
+      /* Second wave: branch_folding+DCE may have killed the only other defs
+       * of a VAR (e.g. `pass = 0` writes on now-dead FAIL paths), leaving it
+       * single-def + constant.  Re-run const_var_prop so the surviving uses
+       * (`TEST_ZERO pass`) fold, then branch_folding+DCE again to clear the
+       * resulting trivial branches. */
+      if (tcc_state->opt_const_prop)
+      {
+        if (tcc_ir_opt_const_var_prop(ir) > 0)
+        {
+          tcc_ir_opt_branch_folding(ir);
+          if (tcc_state->opt_dce)
+            tcc_ir_opt_dce(ir);
+        }
+      }
       tcc_ir_opt_compact_nops(ir);
+      /* After branch_folding/DCE, many unconditional JUMPs end up pointing at
+       * the very next non-NOP instruction.  Drop them so store_redundant (and
+       * later passes) see a clean straight-line BB across what used to be a
+       * jump-target boundary. */
+      tcc_ir_opt_eliminate_fallthrough(ir);
+      /* Redundant-store elimination: kill back-to-back stores to the same
+       * address with no intervening read (e.g. three resets of a global
+       * counter exposed by the prior switch-IPCP fold). */
+      if (tcc_state->opt_redundant_store)
+        tcc_ir_opt_store_redundant(ir);
     }
   }
 
@@ -26850,6 +27265,24 @@ static void gen_function(Sym *sym)
   if (tcc_state->opt_loop_rotation)
     tcc_ir_opt_loop_rotation(ir);
 
+  /* Pointer-IV exit-value substitution: while V0/V1 (pointer IVs) are still
+   * VARs, replace post-loop uses with the closed-form exit value
+   * `Addr[StackLoc[init_off + step*trip_count]]`.  Later passes promote
+   * VARs to TEMPs and rename the IV, so this must run early.  Follow with
+   * branch-folding + DCE so the now-trivially-equal CMPs disappear, allowing
+   * subsequent passes to see the abort() branches as dead. */
+  if (tcc_state->opt_const_prop)
+  {
+    if (tcc_ir_opt_loop_ptr_iv_exit_subst(ir) > 0)
+    {
+      tcc_ir_opt_cmp_stack_addr_fold(ir);
+      tcc_ir_opt_branch_folding(ir);
+      if (tcc_state->opt_dce)
+        tcc_ir_opt_dce(ir);
+      tcc_ir_opt_compact_nops(ir);
+    }
+  }
+
 #ifdef CONFIG_TCC_DEBUG
   if (tcc_state->dump_ir) {
     printf("=== IR AFTER LOOP ROTATION ===\n");
@@ -26857,6 +27290,28 @@ static void gen_function(Sym *sym)
     printf("=== END IR AFTER LOOP ROTATION ===\n");
   }
 #endif
+
+  /* Phase 4e: Loop Constant Simulation — collapse small constant-trip-count
+   * loops whose body has no observable side effects (pure integer/FP math,
+   * known soft-float helper calls, branches whose conditions are statically
+   * determinable).  Runs before unrolling so unrolling sees fewer candidates
+   * to expand. */
+  if (tcc_state->opt_loop_unroll)
+  {
+    int lcs_changes = tcc_ir_opt_loop_const_sim(ir);
+    if (lcs_changes > 0)
+    {
+      tcc_ir_opt_compact_nops(ir);
+      if (tcc_state->opt_dce)
+        tcc_ir_opt_dce(ir);
+      if (tcc_state->opt_const_prop)
+      {
+        tcc_ir_opt_const_prop(ir);
+        tcc_ir_opt_branch_folding(ir);
+      }
+      tcc_ir_opt_compact_nops(ir);
+    }
+  }
 
   /* Phase 5a: Loop Unrolling - fully unroll small constant-trip-count loops.
    * After unrolling, re-run iterative constant propagation + DCE to collapse
@@ -27055,6 +27510,27 @@ static void gen_function(Sym *sym)
   }
 
   tcc_ir_opt_dce(ir); /* Final pass to mark unreachable code as NOP */
+
+  /* Re-run dead loop elimination after final DCE: earlier loops may now have
+   * fully-NOPped bodies (e.g., empty CPOW/CCID loops post-inline) that the
+   * first DLE pass couldn't see because their STORE ops hadn't been killed
+   * yet.  Run DSE first to drop dead-stack-slot stores left behind by inline
+   * struct copies, then re-attempt DLE. */
+  if (tcc_state->opt_dce)
+  {
+    if (tcc_state->opt_dead_store)
+    {
+      tcc_ir_opt_dead_var_store_elim(ir);
+      tcc_ir_opt_dse(ir);
+    }
+    int dle_changes = tcc_ir_opt_dead_loop_elim(ir);
+    if (dle_changes > 0)
+    {
+      tcc_ir_opt_branch_folding(ir);
+      tcc_ir_opt_dce(ir);
+      tcc_ir_opt_compact_nops(ir);
+    }
+  }
 
   tcc_ir_opt_compact_nops(ir);
 
@@ -27868,6 +28344,15 @@ static void gen_function(Sym *sym)
   if (tcc_state->opt_dead_store)
     tcc_ir_compute_func_write_summary(ir, sym);
 
+  /* TU-wide read/call summary: record (1) static globals read by this
+   * function, (2) static globals written, (3) functions called.  Consumed
+   * at end-of-TU by tcc_ir_tu_analyze_dead_statics to identify static
+   * globals with no reachable readers — their stores are then eliminated
+   * during the end-of-TU late_reopt re-compile.  Only collect during the
+   * first compile; the late_reopt re-compile already has the summary. */
+  if (tcc_state->opt_dead_store && !tcc_state->ir_late_reopt_phase)
+    tcc_ir_collect_tu_func_summary(ir, sym);
+
   /* Before codegen, create placeholder ELF symbols for addr-taken labels
    * (&&label) that are still on global_label_stack with c == -3.
    * During codegen, the backend will emit relocations referencing these
@@ -27898,6 +28383,26 @@ static void gen_function(Sym *sym)
   {
     if (tcc_ir_opt_noreturn_collapse(ir))
       loc = 0;
+    /* Infinite self-recursion collapse: companion to noreturn_collapse for
+     * the case where the function exits the noreturn check via a self-call
+     * that dominates every return path.  Closes gcc.c-torture
+     * compile/pr10153-1.c (39→1). */
+    else if (tcc_ir_opt_infinite_self_recursion(ir, sym))
+      loc = 0;
+    /* Companion when the function makes a known-noreturn call and DCE has
+     * already eliminated post-call code (DCE treats FUNCCALL-to-noreturn
+     * as a terminator).  We can't collapse the whole body — the call
+     * itself may have observable side effects in the callee — but we can
+     * suppress the unreachable epilogue.
+     *
+     * DISABLED for now: setting ir->noreturn on a regular function (one
+     * that still has a literal pool) interacts badly with the literal-pool
+     * emit path — the pool gets misplaced and LDR offsets wind up pointing
+     * into code as data.  The win here (2 bytes of dropped `bx lr`) isn't
+     * worth the risk; once the literal-pool interaction is fixed we can
+     * re-enable. */
+    /* else
+      tcc_ir_opt_noreturn_call_epilogue_suppress(ir); */
   }
 
   /* UB-only body elide: every STORE in the function goes through an address
@@ -27951,6 +28456,82 @@ static void gen_function(Sym *sym)
    * having multiple distinct return sites. */
   tcc_ir_opt_returnvalue_merge(ir);
 
+  /* Inter-procedural noreturn propagation: if the function makes a call to
+   * another function whose body hasn't been compiled yet (forward decl
+   * defined later in the same TU), mark the caller for late_reopt.  At
+   * end-of-TU, gen_late_reopt_functions will re-compile the caller — by
+   * which point the callee has been compiled and may have been marked
+   * func_noreturn (by noreturn_collapse/infinite_self_recursion/
+   * uninit_dom_return).  The DCE extension that treats FUNCCALL-to-
+   * noreturn as a terminator will then eliminate the unreachable post-
+   * call body of the caller.  Skip when we are already in the late_reopt
+   * re-compile phase — at that point all callees are compiled.
+   *
+   * Only fires under -O2 (matches the gating of the noreturn collapse
+   * passes themselves) and when opt_dce is on (DCE is what consumes the
+   * propagated fact).  We deliberately skip checking whether the callee
+   * is intra-TU vs extern — extern callees won't get func_noreturn set
+   * later anyway, so the worst case is a wasted re-compile.  We bound by
+   * already-set flags to avoid double-flagging. */
+  if (tcc_state->opt_dce && tcc_state->optimize >= 2 && !tcc_state->ir_late_reopt_phase &&
+      sym && sym->type.ref && !sym->type.ref->f.func_keep_tokens_for_noreturn)
+  {
+    for (int i = 0; i < ir->next_instruction_index; i++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      if (q->op != TCCIR_OP_FUNCCALLVAL && q->op != TCCIR_OP_FUNCCALLVOID)
+        continue;
+      Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+      if (!callee || !callee->type.ref)
+        continue;
+      /* Callee already marked noreturn → DCE already fired this round. */
+      if (callee->type.ref->f.func_noreturn)
+        continue;
+      /* Callee already compiled → noreturn status is final. */
+      if (callee->type.ref->f.func_compiled)
+        continue;
+      /* Self-recursion is handled by infinite_self_recursion. */
+      if (callee == sym)
+        continue;
+      /* The callee is either (a) defined later in this TU and may yet be
+       * marked func_noreturn, or (b) declared extern and defined in
+       * another TU.  We can't tell here, so PRESERVE TOKENS now (via the
+       * post-gen-function check that honors func_keep_tokens_for_noreturn).
+       * Do NOT set func_late_reopt yet — that would force a re-emit even
+       * when no callee turns out to be noreturn, and our late_reopt re-
+       * emit path is fragile when the second compile produces materially
+       * different code (e.g. exposes pre-existing miscompiles of inferred-
+       * noreturn helpers).  Instead, the end-of-TU
+       * tu_propagate_noreturn_to_callers pass walks the call graph and
+       * sets func_late_reopt=1 ONLY for callers of a known-noreturn
+       * callee. */
+      sym->type.ref->f.func_keep_tokens_for_noreturn = 1;
+      break;
+    }
+  }
+
+  /* Final leafness recompute: the body-elide passes above
+   * (noreturn_collapse, ub_only_body_elide, local_only_body_elide,
+   * const_return_uninit_elide, useless_function_body) can NOP every CALL
+   * in the IR.  The earlier recompute happened before them, so without
+   * this second pass the prolog would still save LR and the codegen
+   * scratch path would treat the function as non-leaf. */
+  if (!ir->leaffunc)
+  {
+    int still_has_call = 0;
+    for (int i = 0; i < ir->next_instruction_index; ++i)
+    {
+      int op = ir->compact_instructions[i].op;
+      if (op == TCCIR_OP_FUNCCALLVAL || op == TCCIR_OP_FUNCCALLVOID || op == TCCIR_OP_BUILTIN_APPLY)
+      {
+        still_has_call = 1;
+        break;
+      }
+    }
+    if (!still_has_call)
+      ir->leaffunc = 1;
+  }
+
   tcc_ir_codegen_generate(ir);
 
   if (ir->barrel_shifts) {
@@ -27997,8 +28578,21 @@ static void gen_function(Sym *sym)
   {
     int64_t const_val;
     int const_btype;
+    int const_cached = 0;
     if (tcc_ir_detect_const_result(ir, &const_val, &const_btype))
+    {
       tcc_ir_cache_const_result(tcc_state, sym->v, const_val, const_btype);
+      const_cached = 1;
+    }
+    /* If the function isn't a plain const-returning function but is a pure
+     * single-parameter dispatcher (switch / if-chain over the arg returning
+     * constants), snapshot it so callers passing a constant can fold the call. */
+    if (!const_cached)
+    {
+      TCCFuncSwitchSnapshot *snap = NULL;
+      if (tcc_ir_detect_switch_func(ir, &snap))
+        tcc_ir_cache_switch_func(tcc_state, sym->v, snap);
+    }
   }
 
   /* Post-optimization re-inlining: if the optimized IR is trivial,
@@ -28032,9 +28626,26 @@ static void gen_function(Sym *sym)
       if (op == TCCIR_OP_FUNCCALLVAL || op == TCCIR_OP_FUNCCALLVOID)
         call_ops++;
     }
+    /* Naturally-small functions (short token body) whose post-opt IR grew
+     * mainly because their callees were inlined into them shouldn't be
+     * demoted on IR size alone — the bloat is from in-body inlining, not
+     * intrinsic complexity.  At a call site, the same inline expansion can
+     * happen for the caller; const-prop + DCE will collapse it when args
+     * are constant.  Look up the original token body length via inline_fns. */
+    int natural_body_len = 0;
+    for (int fi = 0; fi < tcc_state->nb_inline_fns; fi++)
+    {
+      if (tcc_state->inline_fns[fi]->sym == sym && tcc_state->inline_fns[fi]->func_str)
+      {
+        natural_body_len = tcc_state->inline_fns[fi]->func_str->len;
+        break;
+      }
+    }
     /* Threshold: >=3 calls or IR larger than ~24 ops marks the body as
-     * "too expensive to inline".  These functions remain regular calls. */
-    if (call_ops >= 3 || ir->next_instruction_index > 24)
+     * "too expensive to inline".  Naturally-small bodies (≤60 tokens) skip
+     * the IR-size gate and only get demoted for call-heavy patterns. */
+    int naturally_small = (natural_body_len > 0 && natural_body_len <= 60);
+    if (call_ops >= 3 || (!naturally_small && ir->next_instruction_index > 24))
     {
       sym->type.ref->f.func_auto_inline = 0;
     }
@@ -28101,6 +28712,12 @@ static void gen_function(Sym *sym)
     tcc_ir_free(ir);
   }
   tcc_state->ir = NULL;
+
+  /* Publish the fact that this function's body has been compiled in this
+   * TU.  Read by gen_function's late_reopt trigger on later-compiled
+   * callers (and by the inter-procedural noreturn propagation in general). */
+  if (sym && sym->type.ref)
+    sym->type.ref->f.func_compiled = 1;
 }
 
 /* Phase 0 inliner stash: keep optimized IR of eligible `static` functions
@@ -28715,7 +29332,7 @@ static int decl(int l)
             int threshold = tcc_state->opt_inline_limit > 0 ? tcc_state->opt_inline_limit
                                                             : (tcc_state->opt_inline_functions ? 60 : 30);
             if (body_len <= threshold && !inline_body_has_apply_args(nf->func_str) &&
-                !inline_body_has_static_local(nf->func_str) && !inline_body_has_loops(nf->func_str))
+                !inline_body_has_static_local(nf->func_str) && !inline_body_has_unsafe_loops(nf->func_str))
             {
               nf->sym->type.ref->f.func_auto_inline = 1;
               struct InlineFunc *fn = tcc_malloc(sizeof *fn + strlen(file->filename));
@@ -29033,7 +29650,7 @@ static int decl(int l)
            * coalescing bug with narrowed locals. */
           int void_llong_limit = (auto_inline_sig_ok(sym) == 2) ? 15 : threshold;
           if (fn->func_str && body_len <= void_llong_limit && !inline_body_has_apply_args(fn->func_str) &&
-              !inline_body_has_loops(fn->func_str))
+              !inline_body_has_unsafe_loops(fn->func_str))
           {
             if (TCC_LOG_INLINE_STRUCT)
               fprintf(stderr, "[auto-inline] SMALL: registering %s as inline candidate\n",
@@ -29117,9 +29734,17 @@ static int decl(int l)
                 /* VT_INLINE already set above for static; keep it set so
                  * gen_inline_functions' eval-only skip branch catches us. */
               }
-              else if (sym->type.ref->f.func_late_reopt)
+              else if (sym->type.ref->f.func_late_reopt ||
+                       sym->type.ref->f.func_keep_tokens_for_noreturn)
               {
-                /* Keep tokens — end-of-TU late_reopt will re-compile. */
+                /* Keep tokens — end-of-TU late_reopt may re-compile (either
+                 * already flagged, or pending noreturn-propagation decision). */
+              }
+              else if (sym->type.ref->f.tu_static_writer)
+              {
+                /* Keep tokens — function writes >=1 non-const static global;
+                 * end-of-TU TU-wide DSE analysis may decide to re-compile via
+                 * late_reopt to eliminate dead static stores. */
               }
               else
               {
@@ -29205,8 +29830,11 @@ static int decl(int l)
                    * The original body is too large for unconditional inlining. */
                   sym->type.ref->f.func_auto_inline = 0;
                   sym->type.ref->f.func_eval_only_inline = 1;
-                } else if (sym->type.ref->f.func_late_reopt) {
-                  /* Keep tokens — end-of-TU late_reopt will re-compile. */
+                } else if (sym->type.ref->f.func_late_reopt ||
+                           sym->type.ref->f.func_keep_tokens_for_noreturn) {
+                  /* Keep tokens — end-of-TU late_reopt may re-compile. */
+                } else if (sym->type.ref->f.tu_static_writer) {
+                  /* Keep tokens — TU-wide DSE may flag this for re-compile. */
                 } else {
                   /* Not promoted: prevent gen_inline_functions re-compilation. */
                   tok_str_free(fn->func_str);
@@ -29216,13 +29844,39 @@ static int decl(int l)
               }
               else
               {
-                TokenString *ts = fn->func_str;
-                fn->func_str = NULL;
-                begin_macro(ts, 1);
-                next();
-                gen_function(sym);
-                end_macro();
-                tcc_free(fn);
+                /* Body exceeds post_opt_inline_cap.  If the function writes a
+                 * non-const static, we still need its tokens for end-of-TU
+                 * re-compilation; preserve them by going through the same
+                 * inline_fns path used for the smaller-body case. */
+                if (tcc_state->opt_dead_store) {
+                  TokenString *compile_ts = tok_str_alloc();
+                  int *buf = tcc_malloc(body_len * sizeof(int));
+                  memcpy(buf, tok_str_buf(fn->func_str), body_len * sizeof(int));
+                  compile_ts->data.str = buf;
+                  compile_ts->allocated_len = body_len;
+                  compile_ts->len = body_len;
+                  dynarray_add(&tcc_state->inline_fns, &tcc_state->nb_inline_fns, fn);
+                  begin_macro(compile_ts, 1);
+                  next();
+                  gen_function(sym);
+                  end_macro();
+                  if (!sym->type.ref->f.tu_static_writer &&
+                      !sym->type.ref->f.func_late_reopt &&
+                      !sym->type.ref->f.func_keep_tokens_for_noreturn) {
+                    /* Not a static writer — discard tokens to save memory. */
+                    tok_str_free(fn->func_str);
+                    fn->func_str = NULL;
+                    fn->sym = NULL;
+                  }
+                } else {
+                  TokenString *ts = fn->func_str;
+                  fn->func_str = NULL;
+                  begin_macro(ts, 1);
+                  next();
+                  gen_function(sym);
+                  end_macro();
+                  tcc_free(fn);
+                }
               }
               tok = saved_outer_tok;
               tokc = saved_outer_tokc;
@@ -29254,7 +29908,81 @@ static int decl(int l)
           }
           else if (cur_text_section->sh_num > bss_section->sh_num)
             cur_text_section->sh_flags = text_section->sh_flags;
-          gen_function(sym);
+          /* When -fdead-store-elimination is enabled, save the body as a
+           * token stream so the end-of-TU late_reopt pass can re-compile
+           * this function if TU-wide analysis flags it as a writer of a
+           * static global with no reachable readers.  This path covers
+           * functions that auto_inline_sig_ok rejects (e.g., double/long
+           * double params), which would otherwise never reach gen_late_reopt
+           * because they are not in inline_fns.  Bound the saved body
+           * length so very large functions don't pin extra memory. */
+          const int late_reopt_cap = 512;
+          if (tcc_state->opt_dead_store)
+          {
+            struct InlineFunc *fn = tcc_malloc(sizeof *fn + strlen(file->filename));
+            strcpy(fn->filename, file->filename);
+            fn->sym = sym;
+            fn->func_str = NULL;
+            skip_or_save_block(&fn->func_str);
+            int body_len = fn->func_str ? fn->func_str->len : 0;
+            if (fn->func_str && body_len > 0 && body_len <= late_reopt_cap)
+            {
+              dynarray_add(&tcc_state->inline_fns, &tcc_state->nb_inline_fns, fn);
+              TokenString *compile_ts = tok_str_alloc();
+              int *buf = tcc_malloc(body_len * sizeof(int));
+              memcpy(buf, tok_str_buf(fn->func_str), body_len * sizeof(int));
+              compile_ts->data.str = buf;
+              compile_ts->allocated_len = body_len;
+              compile_ts->len = body_len;
+              int saved_outer_tok = tok;
+              CValue saved_outer_tokc = tokc;
+              tcc_state->had_nested_funcs = 0;
+              begin_macro(compile_ts, 1);
+              next();
+              gen_function(sym);
+              end_macro();
+              tok = saved_outer_tok;
+              tokc = saved_outer_tokc;
+              /* Token-replay cannot reproduce nested function closure
+               * semantics during re-compile; drop tokens in that case.
+               * Also drop when the function doesn't write any static
+               * global — late_reopt would have nothing to eliminate. */
+              if (tcc_state->had_nested_funcs ||
+                  !sym->type.ref->f.tu_static_writer)
+              {
+                tok_str_free(fn->func_str);
+                fn->func_str = NULL;
+                fn->sym = NULL;
+              }
+            }
+            else
+            {
+              /* Body empty or exceeds the cap: compile via replay (if we
+               * have a saved stream) without inline_fns preservation. */
+              if (fn->func_str)
+              {
+                int saved_outer_tok2 = tok;
+                CValue saved_outer_tokc2 = tokc;
+                TokenString *ts = fn->func_str;
+                fn->func_str = NULL;
+                begin_macro(ts, 1);
+                next();
+                gen_function(sym);
+                end_macro();
+                tok = saved_outer_tok2;
+                tokc = saved_outer_tokc2;
+              }
+              else
+              {
+                gen_function(sym);
+              }
+              tcc_free(fn);
+            }
+          }
+          else
+          {
+            gen_function(sym);
+          }
           /* Nested functions are now compiled inside gen_function,
            * before pop_local_syms, so parent locals are still accessible. */
         }

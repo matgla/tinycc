@@ -8,6 +8,13 @@ Usage:
 Options (must come before positional args):
   -O0 / -O1 / -O2 / -O3   GCC optimization level (default: -O2)
   --no-cache               disable cache updates
+  --update-cache           promote pending cache to main, no rerun
+  --discard-pending        delete pending cache file, no rerun
+
+Two-phase cache workflow:
+  Each measurement run stages the would-be cache to .disasm_cache.pending.json.
+  The main cache (.disasm_cache.json) is only replaced when you later invoke
+  with --update-cache, which renames the pending file without re-measuring.
 """
 
 import sys
@@ -97,6 +104,8 @@ def parse_args():
     raw = sys.argv[1:]
     gcc_opt = "-O2"
     no_cache = False
+    update_cache = False
+    discard_pending = False
     positional = []
 
     for arg in raw:
@@ -104,13 +113,17 @@ def parse_args():
             gcc_opt = arg
         elif arg == "--no-cache":
             no_cache = True
+        elif arg == "--update-cache":
+            update_cache = True
+        elif arg == "--discard-pending":
+            discard_pending = True
         else:
             positional.append(arg)
 
     test_file = positional[0] if positional else None
     func_filter = positional[1] if len(positional) > 1 else None
 
-    return gcc_opt, test_file, func_filter, no_cache
+    return gcc_opt, test_file, func_filter, no_cache, update_cache, discard_pending
 
 
 def prepare_test_file(test_arg):
@@ -144,6 +157,8 @@ def print_usage():
     print("Options:")
     print("  -O0 / -O1 / -O2 / -O3   GCC optimization level (default: -O2)")
     print("  --no-cache               disable cache updates")
+    print("  --update-cache           promote pending cache to main, no rerun")
+    print("  --discard-pending        delete pending cache file, no rerun")
     print()
     print("Examples:")
     print("  compare_disasm.py                          # Use default test file")
@@ -197,7 +212,21 @@ def print_side_by_side(tcc_dump, gcc_dump, func_name, gcc_opt):
 
 
 def main():
-    gcc_opt, test_arg, func_filter, no_cache = parse_args()
+    gcc_opt, test_arg, func_filter, no_cache, update_cache, discard_pending = parse_args()
+
+    if update_cache:
+        if DisasmCache.promote_pending():
+            eprint(f"Promoted {DisasmCache().pending_path.name} -> {DisasmCache().path.name}")
+            sys.exit(0)
+        eprint(f"No pending cache file to promote (expected at {DisasmCache().pending_path}).")
+        sys.exit(1)
+
+    if discard_pending:
+        if DisasmCache.discard_pending():
+            eprint(f"Discarded {DisasmCache().pending_path.name}")
+        else:
+            eprint(f"No pending cache file to discard.")
+        sys.exit(0)
 
     if test_arg is None:
         print_usage()
@@ -267,8 +296,9 @@ def main():
             cache = DisasmCache()
             key_prefix = test_file.stem if hasattr(test_file, 'stem') else Path(test_file).stem
             report = cache.check_regressions(func_results, key_prefix)
-            cache.save()
+            cache.save_pending()
             cache.print_report(report)
+            print(f"  Staged cache to {cache.pending_path.name} — promote with --update-cache")
 
         for func, tcc_count, gcc_count in func_results:
             print("========================================")

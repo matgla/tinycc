@@ -293,3 +293,121 @@ int tcc_ir_opt_switch_to_data(TCCIRState *ir)
 }
 
 int tcc_ir_opt_switch_to_data_ex(IROptCtx *ctx) { return tcc_ir_opt_switch_to_data(ctx->ir); }
+
+/* Follow a chain of NOPs and unconditional JUMPs starting at `start` and
+ * return the index of the first real (non-NOP, non-JUMP) instruction the
+ * chain settles on. Returns -1 on cycle or out-of-range. */
+static int sc_resolve_chain(TCCIRState *ir, int start, uint8_t *visited)
+{
+  int n = ir->next_instruction_index;
+  int cur = start;
+  while (cur >= 0 && cur < n) {
+    if (visited[cur])
+      return -1;
+    visited[cur] = 1;
+    IRQuadCompact *q = &ir->compact_instructions[cur];
+    if (q->op == TCCIR_OP_NOP) {
+      cur++;
+      continue;
+    }
+    if (q->op == TCCIR_OP_JUMP) {
+      IROperand d = tcc_ir_op_get_dest(ir, q);
+      cur = (int)irop_get_imm64_ex(ir, d);
+      continue;
+    }
+    return cur;
+  }
+  return -1;
+}
+
+/* Compare two endpoint instructions for "control-flow equivalence" — they
+ * produce the same observable effect on exit. Equal indices match trivially.
+ * Distinct indices match when both are RETURNVOID, or both are RETURNVALUE
+ * with the same IMM32/IMM64 source. */
+static int sc_endpoints_equiv(TCCIRState *ir, int a, int b)
+{
+  int n = ir->next_instruction_index;
+  if (a == b)
+    return 1;
+  if (a < 0 || a >= n || b < 0 || b >= n)
+    return 0;
+  IRQuadCompact *qa = &ir->compact_instructions[a];
+  IRQuadCompact *qb = &ir->compact_instructions[b];
+  if (qa->op != qb->op)
+    return 0;
+  if (qa->op == TCCIR_OP_RETURNVOID)
+    return 1;
+  if (qa->op != TCCIR_OP_RETURNVALUE)
+    return 0;
+  IROperand sa = tcc_ir_op_get_src1(ir, qa);
+  IROperand sb = tcc_ir_op_get_src1(ir, qb);
+  if (sa.tag != sb.tag)
+    return 0;
+  if (sa.tag == IROP_TAG_IMM32)
+    return sa.u.imm32 == sb.u.imm32;
+  return 0;
+}
+
+/* When every case target AND the default target of a SWITCH_TABLE resolve
+ * (after following NOPs and unconditional JUMPs) to the same merge point,
+ * the entire dispatch is a no-op — every input value produces the same
+ * control flow. Convert the SWITCH_TABLE to NOP so the surrounding
+ * bounds-check (CMP + JUMPIF) collapses through branch folding to a single
+ * jump to that merge point.
+ *
+ * Triggered by patterns like the gcc-torture 20030323-1.c test, where each
+ * `case N: return __builtin_return_address(N+1);` lowers to "JMP merge"
+ * (ARM Thumb returns 0 for non-zero levels), so all 100 cases plus the
+ * default funnel into the same final RETURNVALUE. */
+int tcc_ir_opt_switch_collapse(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  if (n < 2 || ir->num_switch_tables == 0)
+    return 0;
+
+  int changes = 0;
+  uint8_t *visited = tcc_mallocz(n);
+
+  for (int i = 0; i < n; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_SWITCH_TABLE)
+      continue;
+
+    IROperand tid_op = tcc_ir_op_get_src2(ir, q);
+    int table_id = (int)irop_get_imm64_ex(ir, tid_op);
+    if (table_id < 0 || table_id >= ir->num_switch_tables)
+      continue;
+    TCCIRSwitchTable *table = &ir->switch_tables[table_id];
+    if (!table || table->num_entries <= 0 || !table->targets)
+      continue;
+
+    memset(visited, 0, n);
+    int common = sc_resolve_chain(ir, table->default_target, visited);
+    if (common < 0)
+      continue;
+
+    int uniform = 1;
+    for (int k = 0; k < table->num_entries; k++) {
+      memset(visited, 0, n);
+      int r = sc_resolve_chain(ir, table->targets[k], visited);
+      if (r < 0 || !sc_endpoints_equiv(ir, r, common)) {
+        uniform = 0;
+        break;
+      }
+    }
+    if (!uniform)
+      continue;
+
+    /* Collapse: NOP the SWITCH_TABLE; the preceding CMP+JUMPIF bounds
+     * check now has both edges (taken / fall-through) reaching the same
+     * point, and branch_folding will drop it. */
+    q->op = TCCIR_OP_NOP;
+    LOG_IR_GEN("switch_collapse: SWITCH_TABLE at %d -> NOP (all targets resolve to %d)", i, common);
+    changes++;
+  }
+
+  tcc_free(visited);
+  return changes;
+}
+
+int tcc_ir_opt_switch_collapse_ex(IROptCtx *ctx) { return tcc_ir_opt_switch_collapse(ctx->ir); }

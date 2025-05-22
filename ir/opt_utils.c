@@ -154,6 +154,29 @@ int ir_opt_eval_const_u64(TCCIRState *ir, IROperand op, int use_idx, uint64_t *o
     }
     return 1;
   }
+  case TCCIR_OP_ZEXT:
+  {
+    /* Zero-extend src1 to the destination width.  Mask the recursively
+     * evaluated source value by its declared narrower width.  Used by
+     * the CMP+SETIF folder so trace chains that flow through a sign-/
+     * zero-extension idiom (often produced by signed→unsigned casts)
+     * remain evaluable instead of bailing at this opcode. */
+    uint64_t v;
+    if (!ir_opt_eval_const_u64(ir, tcc_ir_op_get_src1(ir, q), def_idx, &v, depth + 1))
+      return 0;
+    IROperand sop = tcc_ir_op_get_src1(ir, q);
+    int sb = irop_get_btype(sop);
+    uint64_t mask;
+    switch (sb)
+    {
+    case IROP_BTYPE_INT8:  mask = 0xFFULL; break;
+    case IROP_BTYPE_INT16: mask = 0xFFFFULL; break;
+    case IROP_BTYPE_INT32: mask = 0xFFFFFFFFULL; break;
+    default:               mask = ~0ULL; break;
+    }
+    *out = v & mask;
+    return 1;
+  }
   default:
     return 0;
   }
@@ -636,6 +659,40 @@ int ir_opt_nonvreg_expr_equal(TCCIRState *ir, IROperand a, IROperand b)
   }
 }
 
+/* Helper for the SETIF case of ir_opt_pure_def_equal: decide whether two CMP
+ * operands evaluate to the same value at their respective CMP sites.  The
+ * caller has already verified there are no memory-changing or jump-target
+ * instructions between the two CMPs, so we can treat structurally-identical
+ * STACKOFF loads as equal.  Falls back to constant-value evaluation when
+ * pure_expr_equal_impl bails out due to asymmetric folding (e.g. one side
+ * was inlined to an immediate while the other still references a VAR). */
+static int ir_opt_setif_cmp_operand_equal(TCCIRState *ir, IROperand a, IROperand b,
+                                          int a_use_idx, int b_use_idx, int depth)
+{
+  if (ir_opt_pure_expr_equal_impl(ir, a, a_use_idx, b, b_use_idx, depth + 1))
+    return 1;
+
+  int a_tag = irop_get_tag(a);
+  int b_tag = irop_get_tag(b);
+  if (a_tag == IROP_TAG_STACKOFF && b_tag == IROP_TAG_STACKOFF)
+  {
+    int32_t a_vr = irop_get_vreg(a);
+    int32_t b_vr = irop_get_vreg(b);
+    if (a_vr == b_vr && a.u.imm32 == b.u.imm32 && a.is_lval == b.is_lval && a.is_local == b.is_local &&
+        a.is_llocal == b.is_llocal && a.is_param == b.is_param && irop_get_btype(a) == irop_get_btype(b))
+      return 1;
+  }
+
+  {
+    uint64_t va, vb;
+    if (ir_opt_eval_const_u64(ir, a, a_use_idx, &va, 0) &&
+        ir_opt_eval_const_u64(ir, b, b_use_idx, &vb, 0) && va == vb)
+      return 1;
+  }
+
+  return 0;
+}
+
 int ir_opt_pure_def_equal(TCCIRState *ir, int a_def_idx, int b_def_idx, int depth)
 {
   IRQuadCompact *qa;
@@ -720,6 +777,59 @@ int ir_opt_pure_def_equal(TCCIRState *ir, int a_def_idx, int b_def_idx, int dept
     }
 
     return 1;
+  }
+  case TCCIR_OP_SETIF:
+  {
+    /* Two SETIFs are equal when:
+     *   - Their condition codes match
+     *   - The immediately-preceding CMPs have equal operands (in order)
+     *   - No memory-changing op appears between the two CMPs (otherwise a
+     *     memory operand might read different values).
+     * The flag-producing CMP must sit at (def_idx - 1) modulo NOPs since
+     * SETIF reads flags right after the CMP that set them. */
+    IROperand cond_a = tcc_ir_op_get_src1(ir, qa);
+    IROperand cond_b = tcc_ir_op_get_src1(ir, qb);
+    if (!irop_is_immediate(cond_a) || !irop_is_immediate(cond_b))
+      return 0;
+    if (irop_get_imm64_ex(ir, cond_a) != irop_get_imm64_ex(ir, cond_b))
+      return 0;
+
+    int cmp_a_idx = a_def_idx - 1;
+    while (cmp_a_idx >= 0 && ir->compact_instructions[cmp_a_idx].op == TCCIR_OP_NOP)
+      cmp_a_idx--;
+    int cmp_b_idx = b_def_idx - 1;
+    while (cmp_b_idx >= 0 && ir->compact_instructions[cmp_b_idx].op == TCCIR_OP_NOP)
+      cmp_b_idx--;
+    if (cmp_a_idx < 0 || cmp_b_idx < 0)
+      return 0;
+    if (cmp_a_idx == cmp_b_idx)
+      return 1;
+
+    IRQuadCompact *cmp_a = &ir->compact_instructions[cmp_a_idx];
+    IRQuadCompact *cmp_b = &ir->compact_instructions[cmp_b_idx];
+    if (cmp_a->op != TCCIR_OP_CMP || cmp_b->op != TCCIR_OP_CMP)
+      return 0;
+
+    int lo = cmp_a_idx < cmp_b_idx ? cmp_a_idx : cmp_b_idx;
+    int hi = cmp_a_idx < cmp_b_idx ? cmp_b_idx : cmp_a_idx;
+    for (int k = lo + 1; k < hi; k++)
+    {
+      int kop = ir->compact_instructions[k].op;
+      if (kop == TCCIR_OP_STORE || kop == TCCIR_OP_STORE_INDEXED ||
+          kop == TCCIR_OP_BLOCK_COPY || kop == TCCIR_OP_FUNCCALLVOID ||
+          kop == TCCIR_OP_FUNCCALLVAL || kop == TCCIR_OP_INLINE_ASM ||
+          kop == TCCIR_OP_VLA_ALLOC)
+        return 0;
+      if (ir->compact_instructions[k].is_jump_target)
+        return 0;
+    }
+
+    IROperand a1 = tcc_ir_op_get_src1(ir, cmp_a);
+    IROperand a2 = tcc_ir_op_get_src2(ir, cmp_a);
+    IROperand b1 = tcc_ir_op_get_src1(ir, cmp_b);
+    IROperand b2 = tcc_ir_op_get_src2(ir, cmp_b);
+    return ir_opt_setif_cmp_operand_equal(ir, a1, b1, cmp_a_idx, cmp_b_idx, depth) &&
+           ir_opt_setif_cmp_operand_equal(ir, a2, b2, cmp_a_idx, cmp_b_idx, depth);
   }
   default:
     return 0;

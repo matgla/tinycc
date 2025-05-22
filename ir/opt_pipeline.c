@@ -145,6 +145,30 @@ int tcc_ir_opt_gen_pass_adapter(IROptCtx *ctx, const IROptGenPassData *data)
  * Compound passes (replicate original nested sub-loops)
  * ============================================================================ */
 
+/* Loops known_bits with the other propagation/cleanup passes so the cascade
+ * (known_bits → fold IMOD/CMP/JMP → DCE → sl_forward → next stack-load
+ * becomes known) converges within a single pipeline invocation, regardless
+ * of how many outer memory-group iterations the trigger drives. */
+static int tcc_ir_opt_known_bits_cascade_ex(IROptCtx *ctx)
+{
+  TCCIRState *ir = ctx->ir;
+  int total = 0;
+  for (int i = 0; i < 8; i++) {
+    int ch = 0;
+    ch += tcc_ir_opt_known_bits(ir);
+    ch += tcc_ir_opt_const_prop_tmp(ir);
+    ch += tcc_ir_opt_branch_folding(ir);
+    tcc_ir_opt_dce(ir);
+    ch += tcc_ir_opt_eliminate_fallthrough(ir);
+    tcc_ir_opt_compact_nops(ir);
+    ch += tcc_ir_opt_sl_forward(ir);
+    if (!ch)
+      break;
+    total += ch;
+  }
+  return total;
+}
+
 static int tcc_ir_opt_const_prop_cascade_ex(IROptCtx *ctx)
 {
   TCCIRState *ir = ctx->ir;
@@ -180,17 +204,22 @@ static const IROptPass propagation_passes[] = {
   /* uninit_ub: O2-only UB-exploit fold; runs first so subsequent passes don't
    * waste work on a body we're about to collapse. */
   PASS_GATED("uninit_ub",        tcc_ir_opt_uninit_local_ub_ex,  0, IR_PASS_INVALIDATES_ALL, FLAG(opt_dce)),
+  PASS_GATED("uninit_dom_ret",   tcc_ir_opt_uninit_dominates_return_ex, 0, IR_PASS_INVALIDATES_ALL, FLAG(opt_dce)),
   PASS_GATED("dce",              tcc_ir_opt_dce_ex,              0, IR_PASS_INVALIDATES_DU, FLAG(opt_dce)),
   PASS_GATED("const_prop",      tcc_ir_opt_const_prop_ex,       0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("global_init",     tcc_ir_opt_global_init_prop_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
+  PASS_GATED("symref_prop",     tcc_ir_opt_symref_const_prop_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("const_prop_tmp",  tcc_ir_opt_const_prop_tmp_ex,   0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
+  PASS_GATED("known_bits",      tcc_ir_opt_known_bits_ex,        0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("add_reassoc",     tcc_ir_opt_add_reassoc_ex,      0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("redundant_assign", tcc_ir_opt_redundant_var_assign_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("string_calls",    tcc_ir_opt_const_string_calls_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("self_copy_elim",  tcc_ir_opt_self_copy_elim_ex,    0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("value_tracking",  tcc_ir_opt_value_tracking_ex,   0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("cmp_expr_fold",   tcc_ir_opt_cmp_expr_fold_ex,    0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
+  PASS_GATED("cmp_offset_fold", tcc_ir_opt_cmp_const_offset_fold_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("branch_fold",     tcc_ir_opt_branch_folding_ex,   0, IR_PASS_INVALIDATES_ALL, FLAG(opt_const_prop)),
+  PASS_GATED("switch_collapse", tcc_ir_opt_switch_collapse_ex,  0, IR_PASS_INVALIDATES_ALL, FLAG(opt_const_prop)),
   PASS_GATED("stack_nonnull",   tcc_ir_opt_stack_addr_nonnull_fold_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("setif_fuse",      tcc_ir_opt_setif_branch_fuse_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("stack_bool",      tcc_ir_opt_stack_bool_diamond_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
@@ -228,14 +257,28 @@ static const IROptPass memory_passes[] = {
   PASS_GATED("dce",             tcc_ir_opt_dce_ex,               0, IR_PASS_INVALIDATES_DU, FLAG(opt_dce)),
   PASS_GATED("jump_thread",     tcc_ir_opt_jump_threading_ex,    0, IR_PASS_INVALIDATES_ALL, FLAG(opt_jump_threading)),
   PASS_GATED("elim_fallthru",   tcc_ir_opt_eliminate_fallthrough_ex, 0, IR_PASS_INVALIDATES_ALL, FLAG(opt_jump_threading)),
+  /* Internal-loop cascade: drives known_bits → const_prop → branch_fold →
+   * dce → elim_fallthru → sl_forward to a fixpoint within one pipeline
+   * step, since the outer memory loop's trigger (sl_forward) can stall
+   * mid-cascade and skip later iterations. */
+  PASS_GATED("kb_cascade",      tcc_ir_opt_known_bits_cascade_ex, 0, IR_PASS_INVALIDATES_ALL, FLAG(opt_const_prop)),
 };
 
 static const IROptPass late_cleanup_passes[] = {
+  /* zero_vla: turn VLA_ALLOC(size=0) into NOPs so dead_lea_store (which bails
+   * on any VLA_ALLOC) can clean up the surrounding stack scaffolding. */
+  PASS_GATED("zero_vla",         tcc_ir_opt_zero_vla_elim_ex,    0, IR_PASS_INVALIDATES_ALL, FLAG(opt_dead_store)),
   PASS_GATED("store_redundant",  tcc_ir_opt_store_redundant_ex,  0, IR_PASS_INVALIDATES_DU, FLAG(opt_redundant_store)),
   PASS_GATED("dse",              tcc_ir_opt_dse_ex,              0, IR_PASS_INVALIDATES_DU, FLAG(opt_dead_store)),
+  /* dead_static_store: end-of-TU pass — only fires when ir_late_reopt_phase is
+   * set and the global has sym->a.tu_no_readers from the TU-wide analysis.
+   * Ordering: run before the dead-local / DCE-cascade passes so the now-NOPed
+   * store frees up the RHS / address computations that feed it. */
+  PASS_GATED("dead_static_store", tcc_ir_opt_dead_static_store_elim_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_dead_store)),
   PASS_GATED("dead_var_store",   tcc_ir_opt_dead_var_store_elim_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_dead_store)),
   PASS_GATED("dead_addrvar",     tcc_ir_opt_dead_addrvar_elim_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_dead_store)),
   PASS_GATED("dead_local_slot",  tcc_ir_opt_dead_local_slot_elim_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_dead_store)),
+  PASS_GATED("dead_lea_store",   tcc_ir_opt_dead_lea_store_elim_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_dead_store)),
   PASS_GATED("dead_temp_local",  tcc_ir_opt_dead_temp_local_elim_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_dead_store)),
   PASS_GATED("redundant_assign", tcc_ir_opt_redundant_var_assign_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_dead_store)),
   PASS_GATED("inplace_arith",    tcc_ir_opt_store_inplace_arith_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_redundant_store)),
