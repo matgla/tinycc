@@ -800,11 +800,14 @@ LIBTCCAPI TCCState *tcc_new(void) {
   s->pic = 0;
 #if defined(TCC_TARGET_ARM) || defined(TCC_TARGET_ARM_THUMB)
   s->float_abi = ARM_FLOAT_ABI;
-  #if defined(TCC_TARGET_YASOS)
+#if defined(TCC_TARGET_YASOS)
   s->text_and_data_separation = 1;
-  #else 
+  s->pic = 1;
+  s->section_align = 4;
+  s->text_addr = 0;
+#else
   s->text_and_data_separation = 0;
-  #endif
+#endif
 #endif
 #ifdef CONFIG_NEW_DTAGS
   s->enable_new_dtags = 1;
@@ -1359,6 +1362,10 @@ static int tcc_set_linker(TCCState *s, const char *option) {
       } else if (link_arg("coff", p)) {
         s->output_format = TCC_OUTPUT_FORMAT_COFF;
 #endif
+#ifdef TCC_TARGET_YAFF
+      } else if (link_arg("yaff", p)) {
+        s->output_format = TCC_OUTPUT_FORMAT_YAFF;
+#endif
       } else
         goto err;
 
@@ -1568,8 +1575,7 @@ static const TCCOption tcc_options[] = {
     {"fpic", TCC_OPTION_fpic, 0},
 #if defined(TCC_TARGET_ARM) || defined(TCC_TARGET_ARM_THUMB)
     {"mfloat-abi", TCC_OPTION_mfloat_abi, TCC_OPTION_HAS_ARG},
-    {"mpic-data-is-text-relative", TCC_OPTION_mpic_data_is_text_relative,
-     0},
+    {"mpic-data-is-text-relative", TCC_OPTION_mpic_data_is_text_relative, 0},
 #endif
     {"m", TCC_OPTION_m, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP},
 #ifdef TCC_TARGET_MACHO

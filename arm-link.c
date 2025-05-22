@@ -342,6 +342,7 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
       if ((val & 2) || (!is_call && !to_plt))
         tcc_error_noabort("can't relocate value at %x,%d", addr, type);
 
+    printf("X: %x\n", x);
     /* Compute and store final offset */
     s = (x >> 24) & 1;
     i1 = (x >> 23) & 1;
@@ -350,9 +351,15 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
     j2 = s ^ (i2 ^ 1);
     imm10 = (x >> 12) & 0x3ff;
     imm11 = (x >> 1) & 0x7ff;
+    printf("hi: %x, lo: %x, s: %x, i1: %x, i2: %x, j1: %x, j2: %x, imm10: %x, "
+           "imm11: %x\n",
+           hi, lo, s, i1, i2, j1, j2, imm10, imm11);
+    printf("Before jump24 patch: %x, %x\n", *(int *)ptr, *(int *)(ptr + 2));
     (*(uint16_t *)ptr) = (uint16_t)((hi & 0xf800) | (s << 10) | imm10);
     (*(uint16_t *)(ptr + 2)) =
         (uint16_t)((lo & 0xc000) | (j1 << 13) | blx_bit | (j2 << 11) | imm11);
+
+    printf("After jump24 patch: %x, %x\n", *(int *)ptr, *(int *)(ptr + 2));
   }
     return;
   case R_ARM_MOVT_ABS:
@@ -424,6 +431,7 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
     }
 
     *(int *)ptr += val;
+
     return;
   case R_ARM_REL32:
     *(int *)ptr += val - addr;

@@ -462,7 +462,7 @@ static int regmask(int r) { return reg_classes[r] & ~(RC_INT | RC_FLOAT); }
 void o(unsigned int i) {
   const uint16_t instruction = i & 0xffff;
   const int ind1 = ind + 2;
-  TRACE("  o: 0x%.4x pc: 0x%x", i, ind);
+  TRACE("  o: 0x%03x pc: 0x%x", i, ind);
   if (nocode_wanted) {
     return;
   }
@@ -1371,9 +1371,6 @@ static void load_full_const(int r, int32_t imm, struct Sym *sym) {
   int sym_off = 0;
   if (esym) {
     sym_off = esym->st_shndx;
-    printf("sym_off: %x\n", sym_off);
-    //   exit(-1);
-    // }
   }
 
   if (!pic) {
@@ -1411,14 +1408,11 @@ static void load_full_const(int r, int32_t imm, struct Sym *sym) {
       if (text_and_data_separation) {
         if (sym->type.t & VT_STATIC && sym_off != cur_text_section->sh_num) {
           ot_check(th_add_reg(r, r, R9));
-          // ot_check(th_add_imm(r, r, imm));
         } else {
           ot_check(th_add_reg(r, r, R9));
           ot_check(th_ldr_imm(r, r, 0, 6));
           ot_check(th_add_imm(r, r, imm));
         }
-        // ot_check(th_mov_reg(R9, R9));
-        // ot_check(th_sub_imm(r, r, 8));
       } else {
         if (sym->type.t & VT_STATIC) {
           ot_check(th_add_reg(r, r, R_PC));

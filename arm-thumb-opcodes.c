@@ -110,10 +110,12 @@ thumb_opcode th_bx_reg(uint16_t rm) {
 }
 
 thumb_opcode th_bl_t1(uint32_t imm) {
+  printf("th_bl_t1: %x\n", imm);
   const uint32_t packed = th_packimm_10_11_0(imm) | 0xF000D000;
+  printf("after packing: %x\n", packed);
   return (thumb_opcode){
       .size = 4,
-      .opcode = th_packimm_10_11_0(imm) | 0xF000D000,
+      .opcode = packed,
   };
 }
 
@@ -124,15 +126,15 @@ thumb_opcode th_blx_reg(uint16_t rm) {
   };
 }
 
-thumb_opcode th_b_t1(uint16_t cond, uint32_t imm8) {
+thumb_opcode th_b_t1(uint32_t cond, uint32_t imm8) {
   return (thumb_opcode){
       .size = 2,
       .opcode = 0xd000 | ((cond & 0xf) << 8) | (imm8 & 0xff),
   };
 }
 
-thumb_opcode th_b_t2(int16_t imm11) {
-  const int16_t i = imm11 >> 1;
+thumb_opcode th_b_t2(int32_t imm11) {
+  const int32_t i = imm11 >> 1;
   if (i < 1023 && i > -1024 && !(imm11 & 1)) {
     return (thumb_opcode){
         .size = 2,
@@ -145,7 +147,7 @@ thumb_opcode th_b_t2(int16_t imm11) {
   };
 }
 
-thumb_opcode th_b_t3(uint16_t op, uint32_t imm) {
+thumb_opcode th_b_t3(uint32_t op, uint32_t imm) {
   const uint32_t enc = th_encbranch_b_t3(imm);
   return (thumb_opcode){
       .size = 4,
@@ -643,7 +645,7 @@ thumb_opcode th_ldrsh_reg(uint32_t rt, uint32_t rn, uint32_t rm) {
   };
 }
 
-thumb_opcode th_ldrh_imm(uint16_t rt, uint16_t rn, uint32_t imm, uint16_t puw) {
+thumb_opcode th_ldrh_imm(uint16_t rt, uint16_t rn, uint32_t imm, uint32_t puw) {
   // T1 encoding, on armv6-m this one is the only one available
   if (puw == 6 && rn < 8 && rt < 8 && imm <= 62 && !(imm & 1)) {
     // imm[0] is enforced to be 0, and sould be divided by 2, thus offset is 5
@@ -737,7 +739,7 @@ thumb_opcode th_ldrsb_reg(uint32_t rt, uint32_t rn, uint32_t rm) {
   };
 }
 
-thumb_opcode th_ldrb_imm(uint16_t rt, uint16_t rn, uint32_t imm, uint16_t puw) {
+thumb_opcode th_ldrb_imm(uint16_t rt, uint16_t rn, uint32_t imm, uint32_t puw) {
   // T1 encoding, on armv6-m this one is the only one available
   if (puw == 6 && rn < 8 && rt < 8 && imm <= 62 && !(imm & 1)) {
     // imm[0] is enforced to be 0, and sould be divided by 2, thus offset is 5
@@ -845,7 +847,7 @@ thumb_opcode th_ldr_reg(uint32_t rt, uint32_t rn, uint32_t rm) {
   };
 }
 
-thumb_opcode th_ldr_literal(uint16_t rt, uint32_t imm, uint16_t add) {
+thumb_opcode th_ldr_literal(uint16_t rt, uint32_t imm, uint32_t add) {
   if (rt < 8 && imm <= 1020) {
     return (thumb_opcode){
         .size = 2,
@@ -1073,7 +1075,7 @@ thumb_opcode th_mul(uint16_t rd, uint16_t rn, uint16_t rm) {
   };
 }
 
-thumb_opcode th_umull(uint32_t rdlo, uint16_t rdhi, uint16_t rn, uint16_t rm) {
+thumb_opcode th_umull(uint32_t rdlo, uint32_t rdhi, uint16_t rn, uint16_t rm) {
 #ifndef TCC_TARGET_ARM_ARCHV6M
   return (thumb_opcode){
       .size = 4,
@@ -1177,7 +1179,7 @@ thumb_opcode th_rsb_imm(uint16_t rd, uint16_t rn, uint32_t imm,
 }
 
 thumb_opcode th_shift_armv7m(uint16_t rd, uint16_t rm, uint32_t imm,
-                             uint16_t type) {
+                             uint32_t type) {
   const uint32_t imm3 = (imm >> 2) & 7;
   const uint32_t imm2 = imm & 0x3;
   return (thumb_opcode){

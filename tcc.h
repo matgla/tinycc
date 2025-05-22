@@ -182,6 +182,7 @@ extern long double strtold(const char *__nptr, char **__endptr);
 
 #ifdef TARGETOS_YasOS
 #define TCC_TARGET_YASOS 1
+#define TCC_TARGET_YAFF 1
 #endif
 
 /* only native compiler supports -run */
@@ -808,10 +809,10 @@ struct TCCState {
   unsigned char nosse; /* For -mno-sse support. */
 #endif
 #if defined(TCC_TARGET_ARM) || defined(TCC_TARGET_ARM_THUMB)
-  unsigned char float_abi;                /* float ABI of the generated code*/
+  unsigned char float_abi; /* float ABI of the generated code*/
+#endif
   unsigned char text_and_data_separation; /* support for GCC
                                              -mno-pic-data-is-text-relative */
-#endif
 
   unsigned char has_text_addr;
   addr_t text_addr;       /* address of text section */
@@ -1549,6 +1550,7 @@ ST_DATA int func_bound_add_epilog;
 #define TCC_OUTPUT_FORMAT_ELF 0    /* default output format: ELF */
 #define TCC_OUTPUT_FORMAT_BINARY 1 /* binary image output */
 #define TCC_OUTPUT_FORMAT_COFF 2   /* COFF */
+#define TCC_OUTPUT_FORMAT_YAFF 3   /* YAFF */
 #define TCC_OUTPUT_DYN TCC_OUTPUT_DLL
 
 #define ARMAG "!<arch>\n" /* For COFF and a.out archives */
@@ -1626,6 +1628,7 @@ ST_FUNC void tcc_add_runtime(TCCState *s1);
 #endif
 ST_FUNC int tcc_load_yaff(TCCState *s1, int fd, const char *filename,
                           int level);
+ST_FUNC void tcc_elf_sort_syms(TCCState *s1, Section *s);
 
 /* ------------ xxx-link.c ------------ */
 
@@ -1646,6 +1649,7 @@ enum gotplt_entry {
 ST_FUNC unsigned create_plt_entry(TCCState *s1, unsigned got_offset,
                                   struct sym_attr *attr);
 ST_FUNC void relocate_plt(TCCState *s1);
+ST_FUNC int build_got(TCCState *s1);                       /* in tccelf.c */
 ST_FUNC void build_got_entries(TCCState *s1, int got_sym); /* in tccelf.c */
 #define NEED_BUILD_GOT
 
@@ -1878,6 +1882,11 @@ ST_FUNC int macho_load_tbd(TCCState *s1, int fd, const char *filename, int lev);
 ST_FUNC void tcc_add_macos_sdkpath(TCCState *s);
 ST_FUNC const char *macho_tbd_soname(const char *filename);
 #endif
+#endif
+
+/* ------------ tccyaff.c ------------ */
+#ifdef TCC_TARGET_YAFF
+ST_FUNC int tcc_output_yaff(TCCState *s1, FILE *f, const char *filename);
 #endif
 /* ------------ tccrun.c ----------------- */
 #ifdef TCC_IS_NATIVE2

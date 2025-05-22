@@ -19,6 +19,7 @@
  */
 
 #include "tcc.h"
+#include "tccyaff.h"
 
 /* Define this to get some debug output during relocation processing.  */
 #define DEBUG_RELOC
@@ -810,7 +811,7 @@ static void update_relocs(TCCState *s1, Section *s, int *old_to_new_syms,
    the global and weak ones. Since TCC cannot sort it while generating
    the code, we must do it after. All the relocation tables are also
    modified to take into account the symbol table sorting */
-static void sort_syms(TCCState *s1, Section *s) {
+ST_FUNC void tcc_elf_sort_syms(TCCState *s1, Section *s) {
   int *old_to_new_syms;
   ElfW(Sym) * new_syms;
   int nb_syms, i;
@@ -1218,7 +1219,7 @@ static int prepare_dynamic_rel(TCCState *s1, Section *sr) {
 #endif
 
 #ifdef NEED_BUILD_GOT
-static int build_got(TCCState *s1) {
+int build_got(TCCState *s1) {
   /* if no got, then create it */
   s1->got = new_section(s1, ".got", SHT_PROGBITS, SHF_ALLOC | SHF_WRITE);
   s1->got->sh_entsize = 8;
@@ -2551,7 +2552,7 @@ static int tcc_output_elf(TCCState *s1, FILE *f, int phnum, ElfW(Phdr) * phdr) {
       return -1;
   }
 
-  sort_syms(s1, s1->symtab);
+  tcc_elf_sort_syms(s1, s1->symtab);
 
   ehdr.e_machine = EM_TCC_TARGET;
   ehdr.e_version = EV_CURRENT;
@@ -2648,6 +2649,11 @@ static int tcc_write_elf_file(TCCState *s1, const char *filename, int phnum,
 #ifdef TCC_TARGET_COFF
   if (s1->output_format == TCC_OUTPUT_FORMAT_COFF)
     tcc_output_coff(s1, f);
+  else
+#endif
+#ifdef TCC_TARGET_YAFF
+      if (s1->output_format == TCC_OUTPUT_FORMAT_YAFF)
+    ret = tcc_output_yaff(s1, f, filename);
   else
 #endif
       if (s1->output_format == TCC_OUTPUT_FORMAT_ELF)

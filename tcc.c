@@ -211,6 +211,8 @@ static const char version[] = "tcc version " TCC_VERSION
                               " OpenBSD"
 #elif TARGETOS_NetBSD
                               " NetBSD"
+#elif TARGETOS_YasOS
+                              " YasOS"
 #else
                               " Linux"
 #endif
@@ -302,6 +304,9 @@ redo:
   s = s1 = tcc_new();
 #ifdef CONFIG_TCC_SWITCHES /* predefined options */
   tcc_set_options(s, CONFIG_TCC_SWITCHES);
+#endif
+#ifdef TCC_TARGET_YASOS
+  s->output_format = TCC_OUTPUT_FORMAT_YAFF;
 #endif
   opt = tcc_parse_args(s, &argc, &argv, 1);
   if (opt < 0)

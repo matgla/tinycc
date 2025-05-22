@@ -101,9 +101,9 @@ thumb_opcode th_nop();
 thumb_opcode th_bx_reg(uint16_t rm);
 thumb_opcode th_bl_t1(uint32_t imm);
 thumb_opcode th_blx_reg(uint16_t rm);
-thumb_opcode th_b_t1(uint16_t cond, uint32_t imm8);
-thumb_opcode th_b_t2(int16_t imm11);
-thumb_opcode th_b_t3(uint16_t op, uint32_t imm);
+thumb_opcode th_b_t1(uint32_t cond, uint32_t imm8);
+thumb_opcode th_b_t2(int32_t imm11);
+thumb_opcode th_b_t3(uint32_t op, uint32_t imm);
 thumb_opcode th_b_t4(int32_t imm);
 
 thumb_opcode th_mov_reg(uint16_t rd, uint16_t rm);
@@ -137,15 +137,15 @@ thumb_opcode th_push(uint16_t regs);
 int th_ldr_literal_estimate(uint16_t rt, uint32_t imm);
 thumb_opcode th_ldrsh_imm(uint32_t rt, uint32_t rn, uint32_t imm, uint32_t puw);
 thumb_opcode th_ldrsh_reg(uint32_t rt, uint32_t rn, uint32_t rm);
-thumb_opcode th_ldrh_imm(uint16_t rt, uint16_t rn, uint32_t imm, uint16_t puw);
+thumb_opcode th_ldrh_imm(uint16_t rt, uint16_t rn, uint32_t imm, uint32_t puw);
 thumb_opcode th_ldrh_reg(uint32_t rt, uint32_t rn, uint32_t rm);
 thumb_opcode th_ldrsb_imm(uint32_t rt, uint32_t rn, uint32_t imm, uint32_t puw);
 thumb_opcode th_ldrsb_reg(uint32_t rt, uint32_t rn, uint32_t rm);
-thumb_opcode th_ldrb_imm(uint16_t rt, uint16_t rn, uint32_t imm, uint16_t puw);
+thumb_opcode th_ldrb_imm(uint16_t rt, uint16_t rn, uint32_t imm, uint32_t puw);
 thumb_opcode th_ldrb_reg(uint32_t rt, uint32_t rn, uint32_t rm);
 thumb_opcode th_ldr_imm(uint32_t rt, uint32_t rn, uint32_t imm, uint32_t puw);
 thumb_opcode th_ldr_reg(uint32_t rt, uint32_t rn, uint32_t rm);
-thumb_opcode th_ldr_literal(uint16_t rt, uint32_t imm, uint16_t add);
+thumb_opcode th_ldr_literal(uint16_t rt, uint32_t imm, uint32_t add);
 
 thumb_opcode th_pop(uint16_t regs);
 thumb_opcode th_strh_imm(uint16_t rt, uint16_t rn, uint32_t imm, uint16_t puw);
@@ -156,7 +156,7 @@ thumb_opcode th_str_imm(uint32_t rt, uint32_t rn, uint32_t imm, uint32_t puw);
 thumb_opcode th_str_reg(uint32_t rt, uint32_t rn, uint32_t rm);
 
 thumb_opcode th_mul(uint16_t rd, uint16_t rn, uint16_t rm);
-thumb_opcode th_umull(uint32_t rdlo, uint16_t rdhi, uint16_t rn, uint16_t rm);
+thumb_opcode th_umull(uint32_t rdlo, uint32_t rdhi, uint16_t rn, uint16_t rm);
 thumb_opcode th_udiv(uint16_t rd, uint16_t rn, uint16_t rm);
 thumb_opcode th_sdiv(uint16_t rd, uint16_t rn, uint16_t rm);
 
@@ -165,7 +165,7 @@ thumb_opcode th_add_sp_reg(uint16_t rdm);
 thumb_opcode th_rsb_imm(uint16_t rd, uint16_t rn, uint32_t imm,
                         flags_behaviour setflags);
 thumb_opcode th_shift_armv7m(uint16_t rd, uint16_t rm, uint32_t imm,
-                             uint16_t type);
+                             uint32_t type);
 thumb_opcode th_lsl_reg(uint16_t rd, uint16_t rn, uint16_t rm);
 thumb_opcode th_lsl_imm(uint16_t rd, uint16_t rm, uint32_t imm);
 thumb_opcode th_lsr_reg(uint16_t rd, uint16_t rn, uint16_t rm);
