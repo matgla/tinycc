@@ -262,8 +262,6 @@ static int tcc_yaff_write_symbol_table_relocations(TCCState *s1, FILE *f) {
               symbol_table_index =
                   symbol_index - 1 - number_of_imported_symbols;
             }
-            printf("symbol table index: %d, for: %s\n", symbol_table_index,
-                   (char *)s1->dynsym->link->data + sym->st_name);
             YaffSymbolTableRelocationEntry entry = {
                 .is_exported_symbol = is_exported,
                 .index = (rel->r_offset - s1->got->sh_addr) / 8,
@@ -384,7 +382,6 @@ ST_FUNC int tcc_output_yaff(TCCState *s1, FILE *f, const char *filename) {
   Section *s;
   ElfW(Ehdr) ehdr;
   ElfW(Shdr) shdr, *sh;
-  printf("Writing YAFF file: %s\n", filename);
   fflush(stdout);
   YaffHeader header = {};
   char *name;
@@ -397,7 +394,6 @@ ST_FUNC int tcc_output_yaff(TCCState *s1, FILE *f, const char *filename) {
 
   memcpy(header.magic, YAFFMAG, sizeof(YAFFMAG) - 1);
   header.module_type = file_type == TCC_OUTPUT_DYN ? 2 : 1;
-  printf("Getting entry\n");
   if (s1->elf_entryname) {
     header.entry = get_sym_addr(s1, s1->elf_entryname, 1, 0);
   } else {
@@ -423,7 +419,7 @@ ST_FUNC int tcc_output_yaff(TCCState *s1, FILE *f, const char *filename) {
   header.version_minor = 0;
   header.external_libraries_amount = s1->nb_loaded_dlls;
   if (s1->text_and_data_separation) {
-    // header.text_and_data_separation = 1;
+    header.text_and_data_separation = 1;
   } else {
     header.text_and_data_separation = 0;
   }
@@ -438,9 +434,7 @@ ST_FUNC int tcc_output_yaff(TCCState *s1, FILE *f, const char *filename) {
 
   header.arch_section_offset = 0; // ftell(f);
   header.imported_libraries_offset = ftell(f);
-  printf("number of loaded dlls: %d\n", s1->nb_loaded_dlls);
   for (i = 0; i < s1->nb_loaded_dlls; ++i) {
-    printf("Processing DLL: %s\n", s1->loaded_dlls[i]->name);
     DLLReference *dll = s1->loaded_dlls[i];
     aligned_name_len = strlen(dll->name) + 1;
     aligned_name_len = tcc_yaff_align(&header, aligned_name_len);
@@ -478,10 +472,7 @@ ST_FUNC int tcc_output_yaff(TCCState *s1, FILE *f, const char *filename) {
   fwrite(rodata_section->data, 1, rodata_section->sh_size, f);
   fwrite(data_section->data, 1, data_section->sh_size, f);
   int foff = ftell(f);
-  printf("Writing at: %x, size of got: %d\n", foff, s1->got->sh_size);
   fwrite(s1->got->data, 1, s1->got->sh_size, f);
-
-  printf("Writing sr: %d\n", header.symbol_table_relocations_amount);
   fseek(f, 0, SEEK_SET);
   fwrite(&header, 1, sizeof(YaffHeader), f);
   fflush(f);

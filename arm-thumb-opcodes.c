@@ -110,9 +110,7 @@ thumb_opcode th_bx_reg(uint16_t rm) {
 }
 
 thumb_opcode th_bl_t1(uint32_t imm) {
-  printf("th_bl_t1: %x\n", imm);
   const uint32_t packed = th_packimm_10_11_0(imm) | 0xF000D000;
-  printf("after packing: %x\n", packed);
   return (thumb_opcode){
       .size = 4,
       .opcode = packed,
