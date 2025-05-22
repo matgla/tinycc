@@ -477,7 +477,10 @@ ST_FUNC int tcc_output_yaff(TCCState *s1, FILE *f, const char *filename) {
   }
   fwrite(rodata_section->data, 1, rodata_section->sh_size, f);
   fwrite(data_section->data, 1, data_section->sh_size, f);
+  int foff = ftell(f);
+  printf("Writing at: %x, size of got: %d\n", foff, s1->got->sh_size);
   fwrite(s1->got->data, 1, s1->got->sh_size, f);
+
   printf("Writing sr: %d\n", header.symbol_table_relocations_amount);
   fseek(f, 0, SEEK_SET);
   fwrite(&header, 1, sizeof(YaffHeader), f);

@@ -341,7 +341,7 @@ thumb_opcode th_and_reg(uint16_t rd, uint16_t rn, uint16_t rm) {
 }
 
 thumb_opcode th_xor_reg(uint16_t rd, uint16_t rn, uint16_t rm) {
-  if (rd != rn && rm < 8 && rn < 8) {
+  if (rd == rn && rm < 8 && rn < 8) {
     return (thumb_opcode){
         .size = 2,
         .opcode = 0x4040 | (rm << 3) | rd,
