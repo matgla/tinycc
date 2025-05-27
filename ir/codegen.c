@@ -2795,6 +2795,60 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
           }
         }
 
+        /* STRD peephole (deref-through-vreg form): pair a plain STORE
+         * through a register-deref destination (offset 0 implicit) with an
+         * immediately-following STORE_INDEXED through the same base vreg
+         * at offset +4.  Mirrors the spill-slot STRD peephole above; the
+         * disp-fusion turns "ADD base+N; STORE *(...) <- v" into
+         * STORE_INDEXED, but the off=0 store stays plain STORE — so the
+         * existing STORE_INDEXED-only peephole misses the pair. */
+        if (a.dest.kind == MACH_OP_REG && a.dest.needs_deref &&
+            a.src1.kind == MACH_OP_REG && !a.src1.is_64bit &&
+            (a.dest.btype == IROP_BTYPE_INT32 || a.dest.btype == IROP_BTYPE_FLOAT32))
+        {
+          int next_i = -1;
+          for (int j = i + 1; j < ir->next_instruction_index; j++)
+          {
+            if (ir->compact_instructions[j].op != TCCIR_OP_NOP)
+            {
+              next_i = j;
+              break;
+            }
+          }
+          if (next_i >= 0 && ir->compact_instructions[next_i].op == TCCIR_OP_STORE_INDEXED &&
+              !ir->compact_instructions[next_i].is_jump_target)
+          {
+            IRQuadCompact *nq = &ir->compact_instructions[next_i];
+            IROperand n_src1_ir = tcc_ir_op_get_src1(ir, nq);
+            IROperand n_src2_ir = tcc_ir_op_get_src2(ir, nq);
+            IROperand n_dest_ir = tcc_ir_op_get_dest(ir, nq);
+            MopArgs b = ir_decode_cached(is_dry_run, 0, NULL, next_i, ir, nq, &n_src1_ir, &n_src2_ir, &n_dest_ir,
+                                         (MopSpec){.dest = 1, .src1 = 1, .src2 = 1, .scale = 1});
+
+            if (!b.src1.is_64bit && b.src1.kind == MACH_OP_REG &&
+                b.scale.kind == MACH_OP_IMM && b.scale.u.imm.val == 0 &&
+                b.src2.kind == MACH_OP_IMM &&
+                b.dest.kind == MACH_OP_REG && !b.dest.needs_deref &&
+                (b.src1.btype == IROP_BTYPE_INT32 || b.src1.btype == IROP_BTYPE_FLOAT32) &&
+                a.dest.u.reg.r0 == b.dest.u.reg.r0)
+            {
+              int reg1 = a.src1.u.reg.r0;
+              int reg2 = b.src1.u.reg.r0;
+              int base_reg = a.dest.u.reg.r0;
+              int32_t off2 = (int32_t)b.src2.u.imm.val;
+
+              if (reg1 != reg2 && off2 == 4)
+              {
+                if (tcc_gen_machine_try_strd_base(reg1, reg2, base_reg, 0))
+                {
+                  i = next_i;
+                  break;
+                }
+              }
+            }
+          }
+        }
+
         SCRATCH_WRAP(tcc_gen_machine_store_mop(a.dest, a.src1, cq->op));
         break;
       }

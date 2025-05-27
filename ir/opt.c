@@ -729,6 +729,7 @@ typedef struct TuFuncSummary
   TuSymSet calls;          /* static (intra-TU) functions called */
   TuSymSet static_reads;   /* static globals read or address-taken */
   TuSymSet static_writes;  /* static globals written */
+  int body_elide_blocker;  /* obvious non-call side effect in the body */
   struct TuFuncSummary *next;
 } TuFuncSummary;
 
@@ -808,6 +809,34 @@ void tcc_ir_collect_tu_func_summary(TCCIRState *ir, Sym *func_sym)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP)
       continue;
+
+    switch (q->op)
+    {
+    case TCCIR_OP_STORE:
+    case TCCIR_OP_STORE_INDEXED:
+    case TCCIR_OP_STORE_POSTINC:
+    case TCCIR_OP_BLOCK_COPY:
+    case TCCIR_OP_INLINE_ASM:
+    case TCCIR_OP_ASM_INPUT:
+    case TCCIR_OP_ASM_OUTPUT:
+    case TCCIR_OP_SETJMP:
+    case TCCIR_OP_LONGJMP:
+    case TCCIR_OP_NL_SETJMP:
+    case TCCIR_OP_NL_LONGJMP:
+    case TCCIR_OP_BUILTIN_APPLY_ARGS:
+    case TCCIR_OP_BUILTIN_APPLY:
+    case TCCIR_OP_VLA_ALLOC:
+    case TCCIR_OP_VLA_SP_SAVE:
+    case TCCIR_OP_VLA_SP_RESTORE:
+    case TCCIR_OP_SET_CHAIN:
+    case TCCIR_OP_INIT_CHAIN_SLOT:
+    case TCCIR_OP_IJUMP:
+    case TCCIR_OP_TRAP:
+      s->body_elide_blocker = 1;
+      break;
+    default:
+      break;
+    }
 
     /* Direct calls: record callee Sym so the call graph is captured. */
     if (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID)
@@ -892,13 +921,10 @@ void tcc_ir_collect_tu_func_summary(TCCIRState *ir, Sym *func_sym)
  * not-yet-compiled callee — at first-pass-compile time we can't tell
  * forward-decl-defined-later from extern-defined-in-another-TU apart.
  *
- * Now that every function in the TU has been compiled, the noreturn flag
- * on each callee is final.  Set func_late_reopt = 1 on any caller whose
- * callee is now func_noreturn — gen_late_reopt_functions will then re-
- * emit them so the DCE extension (FUNCCALL-to-noreturn as terminator)
- * eliminates the unreachable post-call body.  Callers whose callees did
- * NOT end up noreturn keep their tokens but are not re-emitted (the
- * existing token-cleanup paths cover this — they're harmless leakage). */
+ * Now that every function in the TU has been compiled, callee facts are
+ * final.  Set func_late_reopt = 1 on any caller whose callee is now known
+ * noreturn, or whose callee is now known pure and may let whole-body DCE
+ * prove the caller observationally empty. */
 void tcc_ir_tu_propagate_noreturn_to_callers(void)
 {
   for (TuFuncSummary *e = tu_summary_head; e; e = e->next)
@@ -913,10 +939,32 @@ void tcc_ir_tu_propagate_noreturn_to_callers(void)
     for (int i = 0; i < e->calls.count; i++)
     {
       Sym *callee = e->calls.items[i];
-      if (callee && callee->type.ref && callee->type.ref->f.func_noreturn)
+      if (!callee || !callee->type.ref)
+        continue;
+      int inferred_purity = tcc_ir_lookup_func_purity(tcc_state, callee->v);
+      if (callee->type.ref->f.func_noreturn)
       {
         fs->type.ref->f.func_late_reopt = 1;
         break;
+      }
+      if (inferred_purity >= TCC_FUNC_PURITY_PURE && !e->body_elide_blocker &&
+          ((fs->type.ref->type.t & VT_BTYPE) == VT_VOID))
+      {
+        int all_calls_elidable = 1;
+        for (int j = 0; j < e->calls.count; j++)
+        {
+          Sym *other = e->calls.items[j];
+          if (!other || tcc_ir_lookup_func_purity(tcc_state, other->v) < TCC_FUNC_PURITY_PURE)
+          {
+            all_calls_elidable = 0;
+            break;
+          }
+        }
+        if (all_calls_elidable)
+        {
+          fs->type.ref->f.func_late_reopt = 1;
+          break;
+        }
       }
     }
   }
@@ -2128,6 +2176,43 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
       dst_vr = irop_get_vreg(p_dst);
       if (dst_vr < 0)
         continue;
+
+      /* If dst_vr is uniquely defined by `LEA dst_vr <- Addr[StackLoc[X]]`
+       * in the same BB, treat the memmove dst as that stack offset directly.
+       * Without this, the rewrite would emit STORE_INDEXED on dst_vr at
+       * positions BEFORE the LEA (because the explicit stores can precede
+       * the LEA in source order), which would reference an undefined vreg.
+       * Switching to the direct-stackoff form sidesteps the dependency. */
+      for (int j = i - 1; j >= 0; j--)
+      {
+        IRQuadCompact *lq = &ir->compact_instructions[j];
+        if (lq->op == TCCIR_OP_NOP)
+          continue;
+        if (lq->is_jump_target)
+          break;
+        if (lq->op == TCCIR_OP_JUMP || lq->op == TCCIR_OP_JUMPIF || lq->op == TCCIR_OP_IJUMP)
+          break;
+        if (!irop_config[lq->op].has_dest)
+          continue;
+        IROperand ld = tcc_ir_op_get_dest(ir, lq);
+        if (!irop_has_vreg(ld) || irop_get_vreg(ld) != dst_vr || ld.is_lval)
+          continue;
+        if (lq->op != TCCIR_OP_LEA && lq->op != TCCIR_OP_ASSIGN)
+          break;
+        IROperand ls = tcc_ir_op_get_src1(ir, lq);
+        if (irop_get_tag(ls) != IROP_TAG_STACKOFF || !ls.is_local || ls.is_lval)
+          break;
+        /* Found a LEA producing dst_vr as &StackLoc[X].  Switch to direct
+         * stackoff form. */
+        dst_is_stackoff = 1;
+        dst_base = (int)irop_get_imm64_ex(ir, ls);
+        dst_vr = -1;
+        if (dst_base + total_size > tmp_base && dst_base < tmp_base + total_size) {
+          dst_is_stackoff = 0;
+          dst_vr = irop_get_vreg(p_dst);
+        }
+        break;
+      }
     }
     else
     {
@@ -2501,6 +2586,16 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
               TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, call_src2)))
             continue;
         }
+        /* A LEA that produces an alias into dst's range is "memory-neutral":
+         * it computes an address but doesn't read or write memory.  The
+         * pointer it produces is checked separately (we already required
+         * dst_vr's only consumer to be this memcpy's PARAM0 when we
+         * resolved dst from a vreg LEA).  Without skipping LEAs here, the
+         * dst-resolution path that converts `vreg = &StackLoc[X]` + memmove
+         * to a direct-stackoff rewrite would trip its own LEA in the safety
+         * scan. */
+        if (sq->op == TCCIR_OP_LEA)
+          continue;
         for (int si = 0; si < 3; si++)
         {
           IROperand op;

@@ -1141,6 +1141,10 @@ int tcc_ir_opt_stack_addr_nonnull_fold(TCCIRState *ir)
    * always safe). Also build a flow-sensitive bitmap for VAR vregs. */
   int32_t sa_vregs[MAX_STACKADDR_VREGS];
   int64_t sa_offsets[MAX_STACKADDR_VREGS];
+  /* Parallel: the VAR position this TEMP points at (-1 if unknown, e.g. when
+   * the TEMP holds a SP-after-alloca address that isn't &V for any V).  Used
+   * to propagate non-null status through STORE through a LEA pointer. */
+  int32_t sa_target_var[MAX_STACKADDR_VREGS];
   int sa_count = 0;
 
   /* Flow-sensitive VAR tracking: var_holds_stackaddr[pos] is 1 if the VAR
@@ -1149,7 +1153,13 @@ int tcc_ir_opt_stack_addr_nonnull_fold(TCCIRState *ir)
 #define MAX_TRACKED_VARS 256
   uint8_t var_holds_stackaddr[MAX_TRACKED_VARS];
   int64_t var_stackaddr_offset[MAX_TRACKED_VARS];
+  /* var_target_var[pos] is the VAR position this VAR's value points AT, when
+   * known (e.g. after `V = &W`).  -1 if the address is non-null but doesn't
+   * resolve to a known VAR (e.g. SP-after-alloca). */
+  int32_t var_target_var[MAX_TRACKED_VARS];
   memset(var_holds_stackaddr, 0, sizeof(var_holds_stackaddr));
+  for (int k = 0; k < MAX_TRACKED_VARS; k++)
+    var_target_var[k] = -1;
 
   /* Single forward pass: track TEMPs and VARs, fold CMP+JUMPIF inline. */
   for (int i = 0; i < n - 1; i++)
@@ -1162,24 +1172,189 @@ int tcc_ir_opt_stack_addr_nonnull_fold(TCCIRState *ir)
      * A jump target is a merge point where different paths may have
      * assigned different values to the same VAR. */
     if (q->is_jump_target)
+    {
       memset(var_holds_stackaddr, 0, sizeof(var_holds_stackaddr));
+      for (int k = 0; k < MAX_TRACKED_VARS; k++)
+        var_target_var[k] = -1;
+    }
+
+    /* Function calls may rewrite any address-taken VAR through pointers passed
+     * by reference.  Invalidate all VAR stack-addr tracking before processing
+     * the call body so the post-call CMPs don't assume stale stack-addr state. */
+    if (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID)
+    {
+      memset(var_holds_stackaddr, 0, sizeof(var_holds_stackaddr));
+      for (int k = 0; k < MAX_TRACKED_VARS; k++)
+        var_target_var[k] = -1;
+    }
 
     /* Track TEMPs assigned stack addresses */
-    if (q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_LEA)
+    if (q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_LEA || q->op == TCCIR_OP_LOAD)
     {
       IROperand src1 = tcc_ir_op_get_src1(ir, q);
+      IROperand dest = tcc_ir_op_get_dest(ir, q);
+      int32_t dvr = irop_get_vreg(dest);
       if (is_stack_address_operand(src1))
       {
-        IROperand dest = tcc_ir_op_get_dest(ir, q);
-        int32_t vreg = irop_get_vreg(dest);
-        if (vreg >= 0)
+        if (dvr >= 0 && TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_TEMP &&
+            sa_count < MAX_STACKADDR_VREGS)
         {
-          if (TCCIR_DECODE_VREG_TYPE(vreg) == TCCIR_VREG_TYPE_TEMP && sa_count < MAX_STACKADDR_VREGS)
+          int32_t src_vr = irop_get_vreg(src1);
+          int32_t tgt_var = -1;
+          if (src_vr >= 0 && TCCIR_DECODE_VREG_TYPE(src_vr) == TCCIR_VREG_TYPE_VAR)
+            tgt_var = TCCIR_DECODE_VREG_POSITION(src_vr);
+          sa_offsets[sa_count] = irop_get_stack_offset(src1);
+          sa_target_var[sa_count] = tgt_var;
+          sa_vregs[sa_count++] = dvr;
+          LOG_IR_GEN("STACKADDR: TEMP 0x%x = &VAR (target=%d) at i=%d", dvr, tgt_var, i);
+        }
+      }
+      else if (dvr >= 0 && TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_TEMP &&
+               sa_count < MAX_STACKADDR_VREGS)
+      {
+        /* TEMP-dest copy: propagate from src if it's a tracked VAR or TEMP. */
+        int32_t svr = irop_get_vreg(src1);
+        if (svr >= 0)
+        {
+          int skind = TCCIR_DECODE_VREG_TYPE(svr);
+          if (skind == TCCIR_VREG_TYPE_VAR)
           {
-            sa_offsets[sa_count] = irop_get_stack_offset(src1);
-            sa_vregs[sa_count++] = vreg;
+            int spos = TCCIR_DECODE_VREG_POSITION(svr);
+            if (spos < MAX_TRACKED_VARS && var_holds_stackaddr[spos])
+            {
+              sa_offsets[sa_count] = var_stackaddr_offset[spos];
+              sa_target_var[sa_count] = var_target_var[spos];
+              sa_vregs[sa_count++] = dvr;
+              LOG_IR_GEN("STACKADDR: TEMP 0x%x inherits from VAR V%d (target=%d) at i=%d",
+                         dvr, spos, var_target_var[spos], i);
+            }
           }
-          LOG_IR_GEN("STACKADDR: vreg 0x%x holds stack address at i=%d", vreg, i);
+          else if (skind == TCCIR_VREG_TYPE_TEMP && !src1.is_lval)
+          {
+            for (int k = 0; k < sa_count; k++)
+            {
+              if (sa_vregs[k] == svr)
+              {
+                sa_offsets[sa_count] = sa_offsets[k];
+                sa_target_var[sa_count] = sa_target_var[k];
+                sa_vregs[sa_count++] = dvr;
+                LOG_IR_GEN("STACKADDR: TEMP 0x%x inherits from TEMP at i=%d", dvr, i);
+                break;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    /* VLA_SP_SAVE writes the current SP to its destination.  After the
+     * alloca-load-fwd pass, the destination may be a vreg (rather than a
+     * stack slot).  The current SP is by construction a stack address —
+     * track it as non-null so subsequent users of the alloca pointer can
+     * fold null checks. */
+    if (q->op == TCCIR_OP_VLA_SP_SAVE)
+    {
+      IROperand dest = tcc_ir_op_get_dest(ir, q);
+      int32_t dvr = irop_get_vreg(dest);
+      if (dvr >= 0 && sa_count < MAX_STACKADDR_VREGS)
+      {
+        int dkind = TCCIR_DECODE_VREG_TYPE(dvr);
+        if (dkind == TCCIR_VREG_TYPE_TEMP)
+        {
+          sa_offsets[sa_count] = 0; /* dynamic offset */
+          sa_target_var[sa_count] = -1;
+          sa_vregs[sa_count++] = dvr;
+          LOG_IR_GEN("STACKADDR: VLA_SP_SAVE -> TEMP 0x%x at i=%d", dvr, i);
+        }
+        else if (dkind == TCCIR_VREG_TYPE_VAR)
+        {
+          int dpos = TCCIR_DECODE_VREG_POSITION(dvr);
+          if (dpos < MAX_TRACKED_VARS)
+          {
+            var_holds_stackaddr[dpos] = 1;
+            var_stackaddr_offset[dpos] = 0;
+            LOG_IR_GEN("STACKADDR: VLA_SP_SAVE -> VAR V%d at i=%d", dpos, i);
+          }
+        }
+      }
+    }
+
+    /* STORE through a LEA pointer: *T = src where T is in sa_vregs with a
+     * known target VAR, and src is itself a stack address.  Propagate the
+     * stack-address property into the target VAR's slot — this captures
+     * the `*p = n` pattern (writing an alloca result through a known
+     * pointer-to-local) so the subsequent null check on the local folds. */
+    if (q->op == TCCIR_OP_STORE)
+    {
+      IROperand dest = tcc_ir_op_get_dest(ir, q);
+      int32_t dvr = irop_get_vreg(dest);
+      if (dvr >= 0 && TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_TEMP && dest.is_lval)
+      {
+        int32_t tgt_var = -1;
+        int64_t base_off = 0;
+        int dest_is_sa = 0;
+        for (int k = 0; k < sa_count; k++)
+        {
+          if (sa_vregs[k] == dvr)
+          {
+            tgt_var = sa_target_var[k];
+            base_off = sa_offsets[k];
+            dest_is_sa = 1;
+            break;
+          }
+        }
+        if (tgt_var >= 0 && tgt_var < MAX_TRACKED_VARS)
+        {
+          IROperand src1 = tcc_ir_op_get_src1(ir, q);
+          int src_is_sa = is_stack_address_operand(src1);
+          int64_t src_off = src_is_sa ? irop_get_stack_offset(src1) : 0;
+          if (!src_is_sa)
+          {
+            int32_t svr = irop_get_vreg(src1);
+            if (svr >= 0)
+            {
+              if (TCCIR_DECODE_VREG_TYPE(svr) == TCCIR_VREG_TYPE_TEMP && !src1.is_lval)
+              {
+                for (int k = 0; k < sa_count; k++)
+                {
+                  if (sa_vregs[k] == svr)
+                  {
+                    src_is_sa = 1;
+                    src_off = sa_offsets[k];
+                    break;
+                  }
+                }
+              }
+              else if (TCCIR_DECODE_VREG_TYPE(svr) == TCCIR_VREG_TYPE_VAR)
+              {
+                int sp = TCCIR_DECODE_VREG_POSITION(svr);
+                if (sp < MAX_TRACKED_VARS && var_holds_stackaddr[sp])
+                {
+                  src_is_sa = 1;
+                  src_off = var_stackaddr_offset[sp];
+                }
+              }
+            }
+          }
+          if (src_is_sa)
+          {
+            var_holds_stackaddr[tgt_var] = 1;
+            var_stackaddr_offset[tgt_var] = src_off;
+            LOG_IR_GEN("STACKADDR: indirect STORE *T(0x%x) at i=%d marks V%d non-null", dvr, i, tgt_var);
+            (void)base_off;
+          }
+        }
+        else if (!dest_is_sa)
+        {
+          /* STORE through a TEMP we couldn't resolve at all (not in sa_vregs)
+           * — the pointer is unknown and might alias any address-taken local,
+           * so invalidate VAR stack-addr tracking conservatively.  When the
+           * TEMP IS in sa_vregs but with target_var=-1 (e.g. alloca result),
+           * the destination is a known stack region that doesn't alias any
+           * local VAR's slot, so no invalidation is required. */
+          memset(var_holds_stackaddr, 0, sizeof(var_holds_stackaddr));
+          for (int k = 0; k < MAX_TRACKED_VARS; k++)
+            var_target_var[k] = -1;
         }
       }
     }
@@ -1259,13 +1434,21 @@ int tcc_ir_opt_stack_addr_nonnull_fold(TCCIRState *ir)
       }
     }
 
-    /* Flow-sensitive VAR tracking through STORE, ASSIGN, and LOAD.
+    /* Flow-sensitive VAR tracking through STORE, ASSIGN, LOAD, and LEA.
      * After SL-FWD, a LOAD V=StackLoc may become ASSIGN V=T (forwarded). */
-    if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_LOAD)
+    if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_LOAD ||
+        q->op == TCCIR_OP_LEA)
     {
       IROperand dest = tcc_ir_op_get_dest(ir, q);
       int32_t dvreg = irop_get_vreg(dest);
-      if (dvreg >= 0 && TCCIR_DECODE_VREG_TYPE(dvreg) == TCCIR_VREG_TYPE_VAR)
+      /* `STORE V***DEREF*** = src` with VREG-tagged dest is a deref-store
+       * (writing through V's pointer value), not a slot-write to V.  The
+       * VAR's value is unchanged, so don't touch its tracking; the STORE
+       * may still alias other addrtaken VARs, handled elsewhere. */
+      int skip_var_track = (q->op == TCCIR_OP_STORE && dest.is_lval &&
+                            irop_get_tag(dest) == IROP_TAG_VREG &&
+                            dvreg >= 0 && TCCIR_DECODE_VREG_TYPE(dvreg) == TCCIR_VREG_TYPE_VAR);
+      if (!skip_var_track && dvreg >= 0 && TCCIR_DECODE_VREG_TYPE(dvreg) == TCCIR_VREG_TYPE_VAR)
       {
         int pos = TCCIR_DECODE_VREG_POSITION(dvreg);
         if (pos < MAX_TRACKED_VARS)
@@ -1273,24 +1456,32 @@ int tcc_ir_opt_stack_addr_nonnull_fold(TCCIRState *ir)
           IROperand src1 = tcc_ir_op_get_src1(ir, q);
           int src_is_stackaddr = 0;
           int64_t src_offset = 0;
+          int32_t src_target_var = -1;
           if (is_stack_address_operand(src1))
           {
             src_is_stackaddr = 1;
             src_offset = irop_get_stack_offset(src1);
+            int32_t src1_vr = irop_get_vreg(src1);
+            if (src1_vr >= 0 && TCCIR_DECODE_VREG_TYPE(src1_vr) == TCCIR_VREG_TYPE_VAR)
+              src_target_var = TCCIR_DECODE_VREG_POSITION(src1_vr);
           }
           else
           {
             int32_t svreg = irop_get_vreg(src1);
             if (svreg >= 0)
             {
-              if (TCCIR_DECODE_VREG_TYPE(svreg) == TCCIR_VREG_TYPE_TEMP)
+              if (TCCIR_DECODE_VREG_TYPE(svreg) == TCCIR_VREG_TYPE_TEMP && !src1.is_lval)
               {
+                /* TEMP with is_lval=0: src1's value IS the TEMP's value.
+                 * TEMP with is_lval=1 is `*T` — a memory load that does NOT
+                 * yield the TEMP's value, so it doesn't inherit stack-addr. */
                 for (int k = 0; k < sa_count; k++)
                 {
                   if (sa_vregs[k] == svreg)
                   {
                     src_is_stackaddr = 1;
                     src_offset = sa_offsets[k];
+                    src_target_var = sa_target_var[k];
                     break;
                   }
                 }
@@ -1302,12 +1493,14 @@ int tcc_ir_opt_stack_addr_nonnull_fold(TCCIRState *ir)
                 {
                   src_is_stackaddr = 1;
                   src_offset = var_stackaddr_offset[spos];
+                  src_target_var = var_target_var[spos];
                 }
               }
             }
           }
           var_holds_stackaddr[pos] = src_is_stackaddr;
           var_stackaddr_offset[pos] = src_offset;
+          var_target_var[pos] = src_is_stackaddr ? src_target_var : -1;
         }
       }
     }
@@ -1483,6 +1676,11 @@ int tcc_ir_opt_stack_addr_nonnull_fold(TCCIRState *ir)
       }
       if (sa1_valid && sa2_valid && off1 == off2)
         matched = 2;
+      /* Different stack addresses are provably distinct: distinct VARs each
+       * occupy their own slot, so EQ/NE can be folded.  Only safe for EQ/NE
+       * (relative orderings on pointers from different objects are UB in C). */
+      else if (sa1_valid && sa2_valid && off1 != off2)
+        matched = 3;
     }
 
     if (!matched)
@@ -1507,6 +1705,14 @@ int tcc_ir_opt_stack_addr_nonnull_fold(TCCIRState *ir)
     if (matched == 2)
     {
       fold_result = evaluate_compare_condition(0, 0, tok);
+    }
+    else if (matched == 3)
+    {
+      /* Distinct stack addresses: EQ→0, NE→1.  Skip ordering tokens. */
+      if (tok == 0x94)
+        fold_result = 0;
+      else if (tok == 0x95)
+        fold_result = 1;
     }
     else
     {

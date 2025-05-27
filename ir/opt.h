@@ -67,6 +67,22 @@ int tcc_ir_opt_zero_vla_elim_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_dead_vla_struct_elim(struct TCCIRState *ir);
 int tcc_ir_opt_dead_vla_struct_elim_ex(struct IROptCtx *ctx);
 
+/* alloca-load forwarding: when a VLA_SP_SAVE is immediately followed by a
+ * LOAD that reads back the same slot (and nothing else touches that slot),
+ * retarget the VLA_SP_SAVE's destination from the slot to the LOAD's vreg
+ * and NOP the LOAD.  The backend's VLA_SP_SAVE handler then emits a single
+ * `mov vreg_reg, sp` instead of the `mov scratch, sp; str scratch, [slot];
+ * ldr vreg, [slot]` three-op sequence.  Targets the __builtin_alloca
+ * lowering. */
+int tcc_ir_opt_alloca_load_fwd(struct TCCIRState *ir);
+int tcc_ir_opt_alloca_load_fwd_ex(struct IROptCtx *ctx);
+
+/* Dead-alloca elimination for VREG-target VLA_SP_SAVE — companion to
+ * dead_vla_struct_elim that handles the shape produced by alloca_load_fwd
+ * (VLA_SP_SAVE writes a vreg instead of a stack slot). */
+int tcc_ir_opt_dead_alloca_vreg_elim(struct TCCIRState *ir);
+int tcc_ir_opt_dead_alloca_vreg_elim_ex(struct IROptCtx *ctx);
+
 /* Infinite Self-Recursion Collapse - if the function unconditionally calls
  * itself before any return path, by induction it never returns.  Collapse
  * the body to `b .`.  Matches GCC -O2 on patterns like
@@ -83,9 +99,19 @@ int tcc_ir_opt_noreturn_call_epilogue_suppress(struct TCCIRState *ir);
 int tcc_ir_opt_dse(struct TCCIRState *ir);
 int tcc_ir_opt_dse_ex(struct IROptCtx *ctx);
 
+/* Orphan CMP/TEST_ZERO elimination - remove flag-setting ops whose flags
+ * are not consumed by any SETIF/JUMPIF before the next clobber or BB end. */
+int tcc_ir_opt_orphan_cmp_elim(struct TCCIRState *ir);
+int tcc_ir_opt_orphan_cmp_elim_ex(struct IROptCtx *ctx);
+
 /* Dead address-taken VAR elimination - remove writes to VARs with no live reads */
 int tcc_ir_opt_dead_addrvar_elim(struct TCCIRState *ir);
 int tcc_ir_opt_dead_var_store_elim(struct TCCIRState *ir);
+
+/* Trailing-dead-store elimination for addr-taken VARs — picks up writes
+ * that follow the LAST read of the VAR (which addrvar misses because the
+ * VAR appears live overall). */
+int tcc_ir_opt_dead_trailing_addrvar_store_elim(struct TCCIRState *ir);
 
 /* Redundant VAR ASSIGN elimination - kill assigns overwritten before next read */
 int tcc_ir_opt_redundant_var_assign(struct TCCIRState *ir);
@@ -137,6 +163,10 @@ int tcc_ir_opt_stack_bool_diamond(struct TCCIRState *ir);
 /* OR-bool-diamond — fold `acc |= (cond ? 1 : 0)` into a conditional OR. */
 int tcc_ir_opt_or_bool_diamond(struct TCCIRState *ir);
 
+/* SETIF OR-chain tautology fold — fold OR chains of CMP+SETIF results whose
+ * conditions together cover every LT/EQ/GT outcome into ASSIGN #1. */
+int tcc_ir_opt_setif_or_tautology(struct TCCIRState *ir);
+
 /* VAR → TMP local forwarding. After STORE V ← T, rewrite subsequent reads of
  * V within the same BB to use T directly, avoiding the spill/reload round-trip. */
 int tcc_ir_opt_var_tmp_fwd(struct TCCIRState *ir);
@@ -171,6 +201,10 @@ int tcc_ir_opt_var_self_add_chain_fold(struct TCCIRState *ir);
  * with X+N == Y. */
 int tcc_ir_opt_cmp_stack_addr_fold(struct TCCIRState *ir);
 
+/* Stack-address simplification: rewrite derefs through known stack-address
+ * temps to direct StackLoc accesses and fold stack-address differences. */
+int tcc_ir_opt_stack_addr_simplify(struct TCCIRState *ir);
+
 /* CMP Expression-Equality Fold - fold CMP when both operands are provably equal */
 int tcc_ir_opt_cmp_expr_fold(struct TCCIRState *ir);
 
@@ -187,8 +221,21 @@ int tcc_ir_copy_propagation(struct TCCIRState *ir);
 /* PACK64 peephole - collapse ZEXT + SHL #32 + ZEXT + OR -> PACK64 */
 int tcc_ir_opt_pack64(struct TCCIRState *ir);
 
+/* PACK64 peephole (implicit-ZEXT variant) - collapse `(X_hi SHL #32) OR X_lo`
+ * -> PACK64 when both halves are 32-bit values relying on implicit
+ * zero-extension into the i64 OR. */
+int tcc_ir_opt_pack64_implicit(struct TCCIRState *ir);
+
 /* PACK64 tautology fold - collapse PACK64(low(X), X>>32) -> ASSIGN X */
 int tcc_ir_opt_pack64_tautology(struct TCCIRState *ir);
+
+/* PACK64 from adjacent narrow stack stores - rewrite a 64-bit LOAD from
+ * StackLoc[A] as PACK64(val_lo, val_hi) when the LOAD is preceded by two
+ * 32-bit STOREs to StackLoc[A] (lo) and StackLoc[A+4] (hi).  Eliminates
+ * the spill+ldrd that ARM param prologues emit when a function takes a
+ * pair-passed argument and returns it directly as a long long / 8-byte
+ * scalar (e.g. `long long f(V2SI x) { return (long long)x; }`). */
+int tcc_ir_opt_pack64_from_stack_stores(struct TCCIRState *ir);
 
 /* SHL32-OR chain fold - collapse `((X SHL 32) OR Y) SHL 32` -> `Y SHL 32`
  * and `((X SHL 32) OR Y) AND #0xFFFFFFFF` -> `Y AND #0xFFFFFFFF`.  Cuts
@@ -382,6 +429,12 @@ int tcc_ir_opt_call_chain_rename(struct TCCIRState *ir);
  * unique offset, exposing SHL+ADD indexed-memory fusion. */
 int tcc_ir_opt_stackoff_addr_cse(struct TCCIRState *ir);
 
+/* LEA CSE — within a basic block, collapse repeated LEAs of the same stack
+ * address into a single canonical LEA + ASSIGN copies, exposing copy_prop +
+ * DCE follow-up.  Targets the per-element address-of pattern emitted for
+ * unrolled vector temp writes. */
+int tcc_ir_opt_lea_cse(struct TCCIRState *ir);
+
 /* LEA + deref fold - collapse `LEA Addr[StackLoc[-N]] + [ADD #K] + deref-use`
  * into a direct StackLoc access, eliminating the address-materialization op. */
 int tcc_ir_opt_lea_fold(struct TCCIRState *ir);
@@ -503,9 +556,11 @@ int tcc_ir_opt_stack_addr_nonnull_fold_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_setif_branch_fuse_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_stack_bool_diamond_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_or_bool_diamond_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_setif_or_tautology_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_float_narrowing_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_pack64_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_pack64_tautology_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_pack64_from_stack_stores_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_cmp_narrow_64_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_sl_forward_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_deref_fwd_ex(struct IROptCtx *ctx);
@@ -540,6 +595,7 @@ int tcc_ir_opt_null_store_dom_return_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_redundant_var_assign_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_dead_var_store_elim_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_dead_addrvar_elim_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_dead_trailing_addrvar_store_elim_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_store_redundant_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_addrof_var_fwd_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_global_sl_fwd_ex(struct IROptCtx *ctx);
@@ -635,6 +691,12 @@ int tcc_ir_opt_loop_unroll(struct TCCIRState *ir);
 /* Loop Rotation - convert top-tested (while) loops to bottom-tested (do-while).
  * Eliminates 2 branches per iteration. Returns number of loops rotated. */
 int tcc_ir_opt_loop_rotation(struct TCCIRState *ir);
+
+/* First-iteration-exit loop peeling.  When a top-tested loop's exit test is
+ * provably true on entry from the preheader, rewrite its conditional JUMPIF
+ * into an unconditional JUMP to the exit target; subsequent DCE removes the
+ * unreachable body.  Returns number of loops eliminated. */
+int tcc_ir_opt_loop_dead_first_iter(struct TCCIRState *ir);
 
 /* Pointer-IV exit-value substitution - for loops with a constant trip count,
  * replace post-loop uses of pointer induction variables with their closed-form

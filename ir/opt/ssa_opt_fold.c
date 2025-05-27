@@ -139,6 +139,8 @@ static int fold_binary(IRSSAOptCtx *ctx, int idx)
       break;
     case TCCIR_OP_DIV:
       if (val2 == 0) return 0;
+      /* INT_MIN / -1 overflows and traps on hardware divide. */
+      if (val2 == -1 && (int32_t)val1 == INT32_MIN) return 0;
       result = val1 / val2;
       break;
     case TCCIR_OP_UDIV:
@@ -147,6 +149,7 @@ static int fold_binary(IRSSAOptCtx *ctx, int idx)
       break;
     case TCCIR_OP_IMOD:
       if (val2 == 0) return 0;
+      if (val2 == -1 && (int32_t)val1 == INT32_MIN) return 0;
       result = val1 % val2;
       break;
     case TCCIR_OP_UMOD:

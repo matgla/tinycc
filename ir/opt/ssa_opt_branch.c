@@ -385,6 +385,34 @@ static int ssa_fold_test_zero(IRSSAOptCtx *ctx, int tz_idx)
   } else {
     tz_q->op = TCCIR_OP_NOP;
     next_q->op = TCCIR_OP_NOP;
+    /* Fold a fall-through SETIF that reads the same (now-NOPed) flag
+     * state.  Without this, codegen would lower the SETIF consuming
+     * garbage flags.  See the matching fold in ir_gen_branch_fold_test_zero. */
+    int k = j + 1;
+    while (k < n && ir->compact_instructions[k].op == TCCIR_OP_NOP)
+      k++;
+    if (k < n)
+    {
+      IRQuadCompact *setif_q = &ir->compact_instructions[k];
+      if (setif_q->op == TCCIR_OP_SETIF && !setif_q->is_jump_target)
+      {
+        IROperand setif_cond = tcc_ir_op_get_src1(ir, setif_q);
+        int setif_tok = (int)irop_get_imm64_ex(ir, setif_cond);
+        int setif_result = -1;
+        if (setif_tok == 0x95)
+          setif_result = (val != 0) ? 1 : 0;
+        else if (setif_tok == 0x94)
+          setif_result = (val == 0) ? 1 : 0;
+        if (setif_result >= 0)
+        {
+          IROperand dest = tcc_ir_op_get_dest(ir, setif_q);
+          IROperand imm = irop_make_imm32(-1, setif_result, irop_get_btype(dest));
+          setif_q->op = TCCIR_OP_ASSIGN;
+          tcc_ir_set_src1(ir, k, imm);
+          tcc_ir_set_src2(ir, k, IROP_NONE);
+        }
+      }
+    }
   }
   return 1;
 }

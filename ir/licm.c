@@ -1296,12 +1296,13 @@ TCCFuncPurity tcc_ir_infer_func_purity(TCCIRState *ir, Sym *func_sym)
     {
     case TCCIR_OP_STORE:
     case TCCIR_OP_STORE_INDEXED:
+    case TCCIR_OP_STORE_POSTINC:
       /* Store to non-stack memory → IMPURE */
       {
         IROperand dest = tcc_ir_op_get_dest(ir, q);
         if (!is_stack_or_param_addr(ir, dest))
         {
-          LOG_LICM("PURITY: Function '%s' is IMPURE: stores to non-stack memory", funcname);
+          LOG_LICM("PURITY: Function '%s' is IMPURE: stores to non-stack memory", func_name);
           return TCC_FUNC_PURITY_IMPURE;
         }
       }
@@ -1309,6 +1310,7 @@ TCCFuncPurity tcc_ir_infer_func_purity(TCCIRState *ir, Sym *func_sym)
 
     case TCCIR_OP_LOAD:
     case TCCIR_OP_LOAD_INDEXED:
+    case TCCIR_OP_LOAD_POSTINC:
       /* Load from non-stack/param → not CONST (could still be PURE) */
       {
         IROperand src = tcc_ir_op_get_src1(ir, q);
@@ -1374,6 +1376,25 @@ TCCFuncPurity tcc_ir_infer_func_purity(TCCIRState *ir, Sym *func_sym)
         }
       }
       break;
+
+    case TCCIR_OP_INLINE_ASM:
+    case TCCIR_OP_ASM_INPUT:
+    case TCCIR_OP_ASM_OUTPUT:
+    case TCCIR_OP_SET_CHAIN:
+    case TCCIR_OP_INIT_CHAIN_SLOT:
+    case TCCIR_OP_SETJMP:
+    case TCCIR_OP_LONGJMP:
+    case TCCIR_OP_NL_SETJMP:
+    case TCCIR_OP_NL_LONGJMP:
+    case TCCIR_OP_BUILTIN_APPLY_ARGS:
+    case TCCIR_OP_BUILTIN_APPLY:
+    case TCCIR_OP_BLOCK_COPY:
+    case TCCIR_OP_VLA_SP_SAVE:
+    case TCCIR_OP_VLA_SP_RESTORE:
+    case TCCIR_OP_TRAP:
+    case TCCIR_OP_IJUMP:
+      LOG_LICM("PURITY: Function '%s' is IMPURE: opaque side-effecting op %d", func_name, q->op);
+      return TCC_FUNC_PURITY_IMPURE;
 
     case TCCIR_OP_VLA_ALLOC:
       /* VLA allocation modifies stack in non-trivial way */

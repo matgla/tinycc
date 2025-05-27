@@ -2613,6 +2613,55 @@ int is_valid_opcode(thumb_opcode op)
  * Returns the destination register number if it can be decoded, or -1.
  * Only checks data-processing / move / load instructions, NOT push/pop/stm/ldm
  * (those legitimately reference R9 for save/restore around calls). */
+/* Detect instructions that set flags only and write no GPR — CMP, CMN, TST,
+ * TEQ in all their common Thumb-1 / Thumb-2 encodings.  thumb_decode_dest_reg
+ * returns -1 for these, which would otherwise trigger the conservative
+ * full-cache reset in ot().  Recognising them keeps the mov-equiv and
+ * imm-in-reg caches alive across a CMP, which lets a follow-up redundant
+ * load_immediate elide. */
+static int thumb_op_is_pure_flag_setter(thumb_opcode op)
+{
+  uint32_t w = op.opcode;
+  if (op.size == 2)
+  {
+    uint16_t hw = (uint16_t)(w & 0xFFFF);
+    /* T1 16-bit CMP imm8 (low regs):       00101 Rd3 iiii iiii  (0x28-0x2F) */
+    if ((hw & 0xF800) == 0x2800)
+      return 1;
+    /* T1 16-bit CMP reg (low regs):        0100 0010 10Rm3 Rn3  (0x4280) */
+    if ((hw & 0xFFC0) == 0x4280)
+      return 1;
+    /* T1 16-bit TST reg (low regs):        0100 0010 00Rm3 Rn3  (0x4200) */
+    if ((hw & 0xFFC0) == 0x4200)
+      return 1;
+    /* T2 16-bit CMP/CMN reg (high regs):   0100 0101 D Rm4 Rn3  (0x4500) */
+    if ((hw & 0xFF00) == 0x4500)
+      return 1;
+    return 0;
+  }
+  if (op.size == 4)
+  {
+    uint16_t hi = (uint16_t)(w >> 16);
+    uint16_t lo = (uint16_t)(w & 0xFFFF);
+    /* Thumb-2 data-processing (modified immediate), Rd=PC encodes CMP/CMN/
+     * TST/TEQ.  hi encoding: 1111 0i01 0xxx nnnn (op bits [24:21] = 0x4=TST,
+     * 0x8=CMN, 0xD=CMP, 0x0=TST/AND-S — table varies; the canonical "no-write"
+     * marker is lo[11:8] == 0xF (Rd = PC). */
+    if ((hi & 0xFA00) == 0xF000 && (lo & 0x8000) == 0 && ((lo >> 8) & 0xF) == 0xF)
+      return 1;
+    /* Thumb-2 data-processing (plain binary immediate): same Rd=PC marker. */
+    if ((hi & 0xFA00) == 0xF200 && (lo & 0x8000) == 0 && ((lo >> 8) & 0xF) == 0xF)
+      return 1;
+    /* Thumb-2 data-processing (shifted register): hi pattern 1110 101x xxxx
+     * nnnn, lo[15] == 0, lo[11:8] == 0xF (Rd = PC) marks the flag-setter
+     * variant (CMP.W reg, CMN.W reg, TST.W reg, TEQ.W reg). */
+    if ((hi & 0xFE00) == 0xEA00 && (lo & 0x8000) == 0 && ((lo >> 8) & 0xF) == 0xF)
+      return 1;
+    return 0;
+  }
+  return 0;
+}
+
 static int thumb_decode_dest_reg(thumb_opcode op)
 {
   uint32_t w = op.opcode;
@@ -2705,6 +2754,10 @@ int ot(thumb_opcode op)
         mov_equiv_invalidate_reg(mv_rd);
         strldr_cache_invalidate_reg(mv_rd);
       }
+      else if (thumb_op_is_pure_flag_setter(op))
+      {
+        /* CMP/CMN/TST/TEQ — no GPR clobber even under predication. */
+      }
       else
       {
         int dest = thumb_decode_dest_reg(op);
@@ -2782,6 +2835,11 @@ int ot(thumb_opcode op)
             strldr_cache_invalidate_reg(rt2);
           }
           /* STRD: no GPR write, leave the mov_equiv cache alone. */
+        }
+        else if (thumb_op_is_pure_flag_setter(op))
+        {
+          /* CMP/CMN/TST/TEQ write only the flags — no GPR clobber, no
+           * cache invalidation needed. */
         }
         else
         {
@@ -4660,8 +4718,45 @@ static void thumb_emit_data_processing_mop64(const MachineOperand *src1, const M
   {
     const uint32_t imm_lo = (uint32_t)((uint64_t)src2->u.imm.val & 0xffffffffu);
     const uint32_t imm_hi = (uint32_t)((uint64_t)src2->u.imm.val >> 32);
-    thumb_emit_op_imm_fallback(rd_lo, rn_lo, imm_lo, lo_flags, regular);
-    thumb_emit_op_imm_fallback(rd_hi, rn_hi, imm_hi, hi_flags, carry_h);
+    /* Per-half peephole: when the immediate half makes the op a constant
+     * answer (OR/XOR with 0 → copy src; AND with 0 → load 0; AND with -1 →
+     * copy src), skip the data-processing op.  Cuts dead `orr r, r, #0` and
+     * `and r, r, #0` halves left behind by 64-bit ops on 32-bit values. */
+    const bool is_or = (op == TCCIR_OP_OR);
+    const bool is_xor = (op == TCCIR_OP_XOR);
+    const bool is_and = (op == TCCIR_OP_AND);
+    const bool can_simplify_lo = lo_flags == flags_safe();
+    const bool can_simplify_hi = hi_flags == flags_safe();
+    for (int half = 0; half < 2; half++)
+    {
+      const uint32_t imm = (half == 0) ? imm_lo : imm_hi;
+      const int rd = (half == 0) ? rd_lo : rd_hi;
+      const int rn = (half == 0) ? rn_lo : rn_hi;
+      const thumb_flags_behaviour fb = (half == 0) ? lo_flags : hi_flags;
+      const bool can_simplify = (half == 0) ? can_simplify_lo : can_simplify_hi;
+      const ThumbDataProcessingHandler *h = (half == 0) ? &regular : &carry_h;
+
+      if (can_simplify && (is_or || is_xor) && imm == 0)
+      {
+        if (rd != rn)
+          ot_check_mov_reg((uint32_t)rd, (uint32_t)rn, flags_safe(),
+                           THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
+      }
+      else if (can_simplify && is_and && imm == 0)
+      {
+        ot_check(th_mov_imm((uint32_t)rd, 0, flags_safe(), ENFORCE_ENCODING_NONE));
+      }
+      else if (can_simplify && is_and && imm == 0xFFFFFFFFu)
+      {
+        if (rd != rn)
+          ot_check_mov_reg((uint32_t)rd, (uint32_t)rn, flags_safe(),
+                           THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
+      }
+      else
+      {
+        thumb_emit_op_imm_fallback(rd, rn, imm, fb, *h);
+      }
+    }
   }
   else
   {
@@ -7264,6 +7359,26 @@ ST_FUNC void tcc_gen_machine_load_indexed_mop(MachineOperand dest, MachineOperan
   if (shift_amount < 0 || shift_amount > 31)
     shift_amount = 2;
 
+  /* Fast path: base is &local + constant index — fold into SP/FP-relative load.
+   * Mirrors the store_indexed FRAME_ADDR fast path. */
+  if (!dest.is_64bit && shift_amount == 0 && index.kind == MACH_OP_IMM &&
+      base.kind == MACH_OP_FRAME_ADDR && !base.needs_deref)
+  {
+    int combined = base.u.frame.offset + (int)index.u.imm.val;
+    int adjusted = fp_adjust_local_offset(combined, 0);
+    int sign = (adjusted < 0);
+    int abs_off = sign ? -adjusted : adjusted;
+    if (abs_off <= 4095)
+    {
+      const int dest_reg = mach_get_dest_reg(&ctx, &dest, 0);
+      const int base_reg = tcc_state->need_frame_pointer ? R_FP : R_SP;
+      load_from_base(dest_reg, PREG_REG_NONE, dest.btype, (int)dest.is_unsigned, abs_off, sign, (uint32_t)base_reg);
+      mach_writeback_dest(&dest, dest_reg);
+      mach_release_all(&ctx);
+      return;
+    }
+  }
+
   /* Fast path: constant-displacement load (scale == 0 and index is an immediate).
    * Generated by the displacement-fusion pass when folding `ADD base,#imm; LOAD *`
    * into a single `LDR dest,[base,#imm]`, matching GCC's addressing-mode output. */
@@ -7428,6 +7543,33 @@ ST_FUNC void tcc_gen_machine_store_indexed_mop(MachineOperand base, MachineOpera
   int shift_amount = (scale.kind == MACH_OP_IMM) ? (int)scale.u.imm.val : 2;
   if (shift_amount < 0 || shift_amount > 31)
     shift_amount = 2;
+
+  /* Fast path: base is &local + constant index — fold into SP/FP-relative store.
+   * Avoids emitting a separate `ADD base, sp, #frame_off` LEA before the STR,
+   * cutting one instruction per access in dense local-array initialization. */
+  if (!value.is_64bit && shift_amount == 0 && index.kind == MACH_OP_IMM &&
+      base.kind == MACH_OP_FRAME_ADDR && !base.needs_deref)
+  {
+    int combined = base.u.frame.offset + (int)index.u.imm.val;
+    int adjusted = fp_adjust_local_offset(combined, 0);
+    int sign = (adjusted < 0);
+    int abs_off = sign ? -adjusted : adjusted;
+    if (abs_off <= 4095)
+    {
+      const int btype = value.btype;
+      const int base_reg = tcc_state->need_frame_pointer ? R_FP : R_SP;
+      int value_reg = mach_ensure_in_reg(&ctx, &value, 0);
+      if (btype == IROP_BTYPE_INT8)
+        th_store8_imm_or_reg(value_reg, (uint32_t)base_reg, abs_off, sign);
+      else if (btype == IROP_BTYPE_INT16)
+        th_store16_imm_or_reg(value_reg, (uint32_t)base_reg, abs_off, sign);
+      else
+        th_store32_imm_or_reg_ex(value_reg, (uint32_t)base_reg, abs_off, sign,
+                                 (1u << (uint32_t)value_reg) | (1u << (uint32_t)base_reg));
+      mach_release_all(&ctx);
+      return;
+    }
+  }
 
   /* Fast path: constant-displacement store (scale == 0 and index is an immediate).
    * Mirrors the load_indexed fast path; emits `STR value,[base,#imm]`. */
@@ -9715,6 +9857,32 @@ static void thumb_emit_arg_move(const ThumbArgMove *m)
     int word_count = m->struct_word_count;
     int base_dst = m->dst_reg;
 
+    /* LDRD fast path for the common 2-word (8-byte) aggregate case sourced
+     * directly from a stack-backed location.  Mirrors the LDRD path used by
+     * THUMB_ARG_MOVE_MOP for 64-bit scalars — Thumb-2 LDRD requires natural
+     * 4-byte alignment, which spill slots and the caller param stack both
+     * provide.  Skips the scratch + per-word loads that would otherwise
+     * emit `add.w ip, sp, #N; ldr lo, [ip]; ldr hi, [ip, #4]` (3 insts).
+     *
+     * LDRD writes Rt before Rt2, so Rt2 (dst+1) must not equal the base
+     * register, otherwise the 2nd half reads from a clobbered base. */
+    if (word_count == 2 && !m->mop.needs_deref &&
+        (m->mop.kind == MACH_OP_SPILL || m->mop.kind == MACH_OP_PARAM_STACK))
+    {
+      int raw_off =
+          (m->mop.kind == MACH_OP_SPILL) ? m->mop.u.spill.offset : m->mop.u.param.offset + offset_to_args;
+      int adjusted = (m->mop.kind == MACH_OP_SPILL) ? fp_adjust_local_offset(raw_off, 0) : raw_off;
+      int ldrd_base = tcc_state->need_frame_pointer ? R_FP : R_SP;
+      int ldrd_sign = (adjusted < 0);
+      int ldrd_abs_off = ldrd_sign ? -adjusted : adjusted;
+      int dst_hi = base_dst + 1;
+      if (dst_hi != ldrd_base && base_dst != ldrd_base &&
+          try_ldrd_pair(base_dst, dst_hi, ldrd_base, ldrd_abs_off, ldrd_sign))
+      {
+        return;
+      }
+    }
+
     /* Get the struct base address into a scratch register */
     ScratchRegAlloc struct_scratch = get_scratch_reg_with_save(0);
     int base_addr_reg = get_struct_base_addr_mop(&m->mop, struct_scratch.reg);
@@ -11147,6 +11315,18 @@ ST_FUNC void tcc_gen_machine_vla_mop(MachineOperand dest, MachineOperand src1, M
   }
   case TCCIR_OP_VLA_SP_SAVE:
   {
+    /* Fast path: when dest is a register-allocated vreg, copy SP directly into
+     * its register — saves the scratch-mov + writeback-mov pair that the
+     * generic path would emit.  Triggered by the alloca-load-fwd IR pass
+     * which rewrites a `VLA_SP_SAVE slot; LOAD vreg <- slot` pair into a
+     * single `VLA_SP_SAVE vreg`. */
+    if (dest.kind == MACH_OP_REG && !dest.needs_deref &&
+        dest.u.reg.r0 != (int)PREG_REG_NONE)
+    {
+      ot_check_mov_reg((uint32_t)dest.u.reg.r0, R_SP, flags_safe(),
+                       THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
+      break;
+    }
     /* Save current SP to the destination save slot via a scratch register. */
     ScratchRegAlloc sp_scratch = get_scratch_reg_with_save(0);
     ot_check_mov_reg(sp_scratch.reg, R_SP, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE,

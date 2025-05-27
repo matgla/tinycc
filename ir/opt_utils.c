@@ -575,6 +575,29 @@ int ir_opt_is_pure_helper_name(const char *name)
          strcmp(name, "__aeabi_f2d") == 0 || strcmp(name, "__aeabi_d2f") == 0;
 }
 
+/* Read-only libc string helpers emitted by the front end for __builtin_str*
+ * calls (see redirect_call_to_tcc_helper in tccgen.c).  These return their
+ * result by value in a register and only *read* memory through their pointer
+ * arguments — they have no observable side effect — so a call whose result is
+ * unused is dead and can be removed.
+ *
+ * Unlike ir_opt_is_pure_helper_name these are "pure" (read memory) rather than
+ * "const" (touch no memory): two calls with identical pointer arguments are
+ * NOT interchangeable if memory changed between them.  They must therefore
+ * only be used to justify dead-result elimination, never value-numbering /
+ * CSE of two separate calls. */
+int ir_opt_is_readonly_str_helper_name(const char *name)
+{
+  if (!name)
+    return 0;
+
+  return strcmp(name, "__tcc_strcmp") == 0 || strcmp(name, "__tcc_strncmp") == 0 ||
+         strcmp(name, "__tcc_strlen") == 0 || strcmp(name, "__tcc_strnlen") == 0 ||
+         strcmp(name, "__tcc_strchr") == 0 || strcmp(name, "__tcc_strrchr") == 0 ||
+         strcmp(name, "__tcc_strpbrk") == 0 || strcmp(name, "__tcc_strstr") == 0 ||
+         strcmp(name, "__tcc_strcspn") == 0;
+}
+
 int ir_opt_is_flag_cmp_helper_name(const char *name)
 {
   if (!name)
@@ -632,7 +655,10 @@ int ir_opt_nonvreg_expr_equal(TCCIRState *ir, IROperand a, IROperand b)
   {
     int32_t a_vr = irop_get_vreg(a);
     int32_t b_vr = irop_get_vreg(b);
-    if (a_vr >= 0 && a_vr == b_vr && a.u.imm32 == b.u.imm32 && a.is_lval == b.is_lval && a.is_local == b.is_local &&
+    /* Two STACKOFF operands refer to the same slot when they share the same
+     * vreg identity (a_vr == b_vr, including both being anonymous at -1) AND
+     * the same offset/access attributes. */
+    if (a_vr == b_vr && a.u.imm32 == b.u.imm32 && a.is_lval == b.is_lval && a.is_local == b.is_local &&
         a.is_llocal == b.is_llocal && a.is_param == b.is_param && irop_get_btype(a) == irop_get_btype(b))
       return 1;
     return 0;
@@ -758,6 +784,13 @@ int ir_opt_pure_def_equal(TCCIRState *ir, int a_def_idx, int b_def_idx, int dept
   switch (qa->op)
   {
   case TCCIR_OP_ASSIGN:
+    return ir_opt_pure_expr_equal_impl(ir, tcc_ir_op_get_src1(ir, qa), a_def_idx, tcc_ir_op_get_src1(ir, qb), b_def_idx,
+                                  depth + 1);
+  case TCCIR_OP_LOAD:
+    /* Two LOADs are value-equal when they read the same address with the
+     * same access width.  Memory stability between the two defs has already
+     * been verified above (LOAD has lval src1 -> has_memory_read is true),
+     * so no intervening store/call could have changed the value. */
     return ir_opt_pure_expr_equal_impl(ir, tcc_ir_op_get_src1(ir, qa), a_def_idx, tcc_ir_op_get_src1(ir, qb), b_def_idx,
                                   depth + 1);
   case TCCIR_OP_ADD:

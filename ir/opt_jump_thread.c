@@ -11,6 +11,7 @@
 #define USING_GLOBALS
 #include "ir.h"
 #include "opt_engine.h"
+#include "opt_utils.h"
 
 /* ============================================================================
  * Jump Threading Optimization (Phase 2c)
@@ -82,8 +83,12 @@ static int follow_jump_chain(TCCIRState *ir, int target_idx, uint8_t *visited)
       IROperand dest = tcc_ir_op_get_dest(ir, q);
       int next_target = (int)irop_get_imm64_ex(ir, dest);
 
-      /* Validate target */
-      if (next_target < 0 || next_target >= n)
+      /* Validate target.  target == n is the epilogue (one past the last
+       * instruction): a valid terminal, so follow the chain into it — this
+       * lets a conditional branch whose arms both reach the epilogue (e.g.
+       * `cond ? f() : 0;` with the result discarded) be threaded to a single
+       * common target and then collapsed. */
+      if (next_target < 0 || next_target > n)
         break;
 
       current = next_target;
@@ -162,8 +167,12 @@ int tcc_ir_opt_jump_threading(TCCIRState *ir)
  * Eliminate Fall-Through Jumps
  * ============================================================================
  *
- * Remove unconditional jumps that target the next instruction.
- * These jumps are redundant since execution would fall through anyway.
+ * Remove jumps that target the next instruction.  Covers both:
+ *   - Unconditional JUMP whose target equals the fallthrough — pure no-op.
+ *   - Conditional JUMPIF whose target equals the fallthrough — both branches
+ *     go to the same place, so the test (and the flag-setter that feeds it)
+ *     is dead.  The flag-setter is cleaned up by orphan_cmp_elim in the next
+ *     cascade iteration.
  */
 int tcc_ir_opt_eliminate_fallthrough(TCCIRState *ir)
 {
@@ -175,27 +184,90 @@ int tcc_ir_opt_eliminate_fallthrough(TCCIRState *ir)
 
   LOG_IR_GEN("=== ELIMINATE FALL-THROUGH START ===");
 
-  for (int i = 0; i < n - 1; i++)
+  /* Iterate over every instruction including the last (i < n, not n - 1): a
+   * trailing JUMP/JUMPIF to the epilogue (target == n) at the final slot is a
+   * fall-through no-op too, and find_first_non_nop(n) returns n so it matches. */
+  for (int i = 0; i < n; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
 
-    if (q->op != TCCIR_OP_JUMP)
+    if (q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF)
       continue;
 
     IROperand dest = tcc_ir_op_get_dest(ir, q);
     int target = (int)irop_get_imm64_ex(ir, dest);
 
-    /* Find the next non-NOP instruction after this one */
+    /* Find the next non-NOP instruction after this one (n == epilogue) */
     int next_real = find_first_non_nop(ir, i + 1);
 
     /* If jump target equals the next real instruction, eliminate it */
-    if (target == next_real)
-    {
-      q->op = TCCIR_OP_NOP;
+    if (target != next_real)
+      continue;
 
-      LOG_IR_GEN("FALLTHROUGH: Eliminated JUMP at %d (target %d)", i, target);
-      changes++;
+    /* For JUMPIF (conditional), avoid the case that exposes TCC's
+     * non-aliasing-aware constant prop: removing a JUMPIF whose flag-setter
+     * chain involves a user CALL would orphan the CMP, demote the user
+     * FUNCCALLVAL → FUNCCALLVOID, and let constant prop incorrectly fold a
+     * subsequent memory-CMP whose value depends on the call's pointer-arg
+     * side effects.  Safe to eliminate when EITHER:
+     *   (a) Fallthrough/target is itself an unconditional control transfer
+     *       (JUMP/RETURN/TRAP) — no following CMP-on-memory to misfold.
+     *   (b) Every CALL in the JUMPIF's basic block (scanning back from the
+     *       JUMPIF to the nearest jump_target / function start) is a known-
+     *       pure helper (aeabi soft-float helpers, isnan, etc.) — pure
+     *       means no memory side effects to mis-track. */
+    if (q->op == TCCIR_OP_JUMPIF)
+    {
+      int safe = 0;
+      if (next_real >= n)
+      {
+        /* Both arms reach the epilogue (target == fall-through == past-end).
+         * There is no following instruction whose constant prop could be
+         * misled by an orphaned CMP, so this is always safe regardless of any
+         * impure call in the block. */
+        safe = 1;
+      }
+      else if (next_real >= 0 && next_real < n)
+      {
+        int nop = ir->compact_instructions[next_real].op;
+        if (nop == TCCIR_OP_JUMP || nop == TCCIR_OP_RETURNVALUE ||
+            nop == TCCIR_OP_RETURNVOID || nop == TCCIR_OP_TRAP)
+          safe = 1;
+      }
+      if (!safe)
+      {
+        safe = 1;
+        for (int j = i - 1; j >= 0; j--)
+        {
+          IRQuadCompact *pq = &ir->compact_instructions[j];
+          if (pq->op == TCCIR_OP_NOP)
+            continue;
+          /* Stop at the basic-block boundary: a jump_target is the head of
+           * the BB, and we shouldn't reason across it. */
+          if (pq->is_jump_target)
+            break;
+          if (pq->op == TCCIR_OP_FUNCCALLVAL || pq->op == TCCIR_OP_FUNCCALLVOID)
+          {
+            Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, pq));
+            const char *name = callee ? get_tok_str(callee->v, NULL) : NULL;
+            if (!name || (!tcc_ir_is_pure_aeabi(name) &&
+                          !ir_opt_is_pure_helper_name(name) &&
+                          !ir_opt_is_flag_cmp_helper_name(name)))
+            {
+              safe = 0;
+              break;
+            }
+          }
+        }
+      }
+      if (!safe)
+        continue;
     }
+
+    LOG_IR_GEN("FALLTHROUGH: Eliminated %s at %d (target %d)",
+               q->op == TCCIR_OP_JUMP ? "JUMP" : "JUMPIF", i, target);
+    q->op = TCCIR_OP_NOP;
+    changes++;
   }
 
   LOG_IR_GEN("=== ELIMINATE FALL-THROUGH END: %d jumps eliminated ===", changes);

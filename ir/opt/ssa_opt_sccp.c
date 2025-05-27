@@ -343,6 +343,88 @@ static int sccp_scan_block_for_stack_store(SCCPState *s, IRBasicBlock *bb,
   return SCCP_TOP;
 }
 
+/* Resolve a STORE_INDEXED's base operand to a stack offset (the offset of
+ * the array's first element), even when the index isn't an immediate.
+ * Returns INT_MIN when the base doesn't LEA-resolve to a local stack
+ * address.  Used by sccp_no_aliasing_between to bound the byte range that
+ * an indexed write might touch — only writes whose base is the same array
+ * (or whose array overlaps our load's offset) need to invalidate. */
+static int sccp_store_indexed_base_off(IRSSAOptCtx *ctx, IRQuadCompact *q)
+{
+  if (q->op != TCCIR_OP_STORE_INDEXED && q->op != TCCIR_OP_STORE_POSTINC)
+    return INT_MIN;
+  TCCIRState *ir = ctx->ir;
+  IROperand base = tcc_ir_op_get_dest(ir, q);
+  if (base.tag != IROP_TAG_VREG || base.is_local)
+    return INT_MIN;
+  int32_t bvr = irop_get_vreg(base);
+  if (bvr < 0 || TCCIR_DECODE_VREG_TYPE(bvr) != TCCIR_VREG_TYPE_TEMP)
+    return INT_MIN;
+  return ssa_opt_resolve_lea_stackloc(ctx, bvr);
+}
+
+/* Scan the linear IR range (store_idx, load_idx) for any potentially-aliasing
+ * memory write that the dominator-tree walk in sccp_resolve_stack_load might
+ * otherwise skip.  Returns 1 if the load can be safely forwarded from
+ * `store_idx`, 0 if a possible aliasing write is found.
+ *
+ * Safe to scan the raw IR range because we only need to disprove aliasing:
+ * any code path that flows from store to load is a subset of the IR range
+ * [store_idx+1 .. load_idx-1], so checking that range is conservative. */
+static int sccp_no_aliasing_between(SCCPState *s, int store_idx, int load_idx,
+                                    int soff, int load_btype)
+{
+  TCCIRState *ir = s->ctx->ir;
+  int load_size = sccp_btype_bytes(load_btype);
+  int load_lo = soff;
+  int load_hi = soff + load_size;
+  /* Maximum stack-array size to assume when an indexed write resolves to a
+   * known base but unresolved index.  Real arrays declared on a small
+   * function's stack rarely exceed this; sized so a write to base [A] with
+   * unknown index might touch [A, A+1024).  Conservative — too small and
+   * we lose alias info on big arrays; too large and we bail unnecessarily
+   * on small arrays that don't reach the load's offset. */
+  const int LCS_INDEXED_MAX_ARRAY = 64;
+  for (int i = store_idx + 1; i < load_idx; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    TccIrOp op = q->op;
+    if (op == TCCIR_OP_NOP)
+      continue;
+    if (op == TCCIR_OP_FUNCCALLVOID || op == TCCIR_OP_FUNCCALLVAL)
+      return 0;
+    if (op == TCCIR_OP_BLOCK_COPY)
+      return 0;
+    if (op != TCCIR_OP_STORE && op != TCCIR_OP_STORE_INDEXED &&
+        op != TCCIR_OP_STORE_POSTINC)
+      continue;
+    int store_btype = 0;
+    int target = sccp_store_target_off(s->ctx, q, &store_btype);
+    if (target != INT_MIN) {
+      /* Fully resolved write: bail only on actual byte-range overlap. */
+      int store_size = sccp_btype_bytes(store_btype);
+      int store_lo = target;
+      int store_hi = target + store_size;
+      if (store_hi > load_lo && load_hi > store_lo)
+        return 0;
+      continue;
+    }
+    /* Unresolved offset.  For STORE_INDEXED / STORE_POSTINC try to recover
+     * the base LEA — if the base resolves to a stack array whose plausible
+     * extent doesn't overlap our load, treat as non-aliasing. */
+    int base_off = sccp_store_indexed_base_off(s->ctx, q);
+    if (base_off != INT_MIN) {
+      int extent_lo = base_off;
+      int extent_hi = base_off + LCS_INDEXED_MAX_ARRAY;
+      if (extent_hi <= load_lo || extent_lo >= load_hi)
+        continue; /* base array is far from our load — no aliasing */
+      return 0;
+    }
+    /* Truly unknown memory write — could touch any stack slot. */
+    return 0;
+  }
+  return 1;
+}
+
 static int sccp_resolve_stack_load(SCCPState *s, int soff, int load_btype,
                                    int instr_idx, int64_t *out, int *dep_pos)
 {
@@ -355,12 +437,58 @@ static int sccp_resolve_stack_load(SCCPState *s, int soff, int load_btype,
   if (st != SCCP_TOP)
     return st;
 
-  /* Walk up dominator tree if not found in current block. */
+  /* Walk up dominator tree if not found in current block.  When a match is
+   * found in a dominator block, also verify no aliasing memory write sits
+   * between the matching STORE and our load — the dominator-tree walk skips
+   * intervening sibling blocks (e.g. loop bodies between an entry-block
+   * residual STORE and a post-loop LOAD), and those blocks may contain
+   * STORE_INDEXED / STORE_POSTINC / unresolved memory writes that would
+   * invalidate the value. */
   int dom = bb->idom;
   while (dom >= 0 && dom != block) {
     IRBasicBlock *db = &cfg->blocks[dom];
+    int saved_dep = dep_pos ? *dep_pos : -1;
+    int64_t saved_out = *out;
     int dst = sccp_scan_block_for_stack_store(s, db, db->end_idx - 1, soff,
                                                load_btype, out, dep_pos);
+    if (dst == SCCP_CONST) {
+      /* Find the store index inside `db` that matched, so we can check the
+       * IR range between it and our load for aliasing.  sccp_scan_block_for_stack_store
+       * doesn't expose this directly, so we re-scan the dominator block to
+       * pinpoint the matching STORE's IR index. */
+      int matched_idx = -1;
+      for (int si = db->end_idx - 1; si >= db->start_idx; si--) {
+        IRQuadCompact *sq = &s->ctx->ir->compact_instructions[si];
+        if (sq->op != TCCIR_OP_STORE && sq->op != TCCIR_OP_STORE_INDEXED)
+          continue;
+        int sb = 0;
+        int target = sccp_store_target_off(s->ctx, sq, &sb);
+        if (target == soff && sb == load_btype) {
+          matched_idx = si;
+          break;
+        }
+      }
+      /* Only run the cross-block alias check when the matched STORE is NOT
+       * in the entry basic block.  Entry-block stores are direct array
+       * initializers that the broader pipeline has always treated as
+       * dominating subsequent code; tightening that here regresses common
+       * vector/struct-init patterns (e.g. scal-to-vec1) without catching
+       * any real aliasing bug.  Mid-function stores — including LCS's
+       * residual STOREs that replace a folded loop's memory writes — are
+       * the ones that need the alias check, because intervening loop
+       * bodies can contain STORE_INDEXED writes through the same array. */
+      int entry_block = (cfg->num_blocks > 0) ? 0 : -1;
+      int store_block = cfg->instr_to_block[matched_idx];
+      int needs_alias_check = (matched_idx >= 0 && store_block != entry_block);
+      if (needs_alias_check &&
+          !sccp_no_aliasing_between(s, matched_idx, instr_idx, soff, load_btype)) {
+        /* Aliasing write in between — restore state and treat as unknown. */
+        *out = saved_out;
+        if (dep_pos) *dep_pos = saved_dep;
+        return SCCP_BOTTOM;
+      }
+      return SCCP_CONST;
+    }
     if (dst != SCCP_TOP)
       return dst;
     if (dom == db->idom)
@@ -616,7 +744,21 @@ static int sccp_eval_binary(int op, int64_t v1, int64_t v2, int64_t *result,
   }
   case TCCIR_OP_DIV:
     if (v2 == 0) return 0;
-    *result = v1 / v2; break;
+    /* INT_MIN / -1 is UB and traps on hardware divide.  Avoid folding so
+     * the divisor's constant value doesn't propagate the trap into the
+     * compiler itself. */
+    if (v2 == -1) {
+      if (is_64) {
+        if (v1 == INT64_MIN) return 0;
+      } else if ((int32_t)v1 == INT32_MIN) {
+        return 0;
+      }
+    }
+    if (is_64)
+      *result = v1 / v2;
+    else
+      *result = (int64_t)((int32_t)v1 / (int32_t)v2);
+    break;
   case TCCIR_OP_UDIV:
     if (v2 == 0) return 0;
     if (is_64)
@@ -626,7 +768,18 @@ static int sccp_eval_binary(int op, int64_t v1, int64_t v2, int64_t *result,
     break;
   case TCCIR_OP_IMOD:
     if (v2 == 0) return 0;
-    *result = v1 % v2; break;
+    if (v2 == -1) {
+      if (is_64) {
+        if (v1 == INT64_MIN) return 0;
+      } else if ((int32_t)v1 == INT32_MIN) {
+        return 0;
+      }
+    }
+    if (is_64)
+      *result = v1 % v2;
+    else
+      *result = (int64_t)((int32_t)v1 % (int32_t)v2);
+    break;
   case TCCIR_OP_UMOD:
     if (v2 == 0) return 0;
     if (is_64)

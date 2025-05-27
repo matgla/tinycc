@@ -66,6 +66,7 @@ int ir_has_other_jump_to_fast(struct TCCIRState *ir, const int *jt_cnt,
 
 int tcc_ir_is_pure_aeabi(const char *name);
 int ir_opt_is_pure_helper_name(const char *name);
+int ir_opt_is_readonly_str_helper_name(const char *name);
 int ir_opt_is_flag_cmp_helper_name(const char *name);
 int ir_opt_is_pure_fallthrough_instruction(struct TCCIRState *ir, int idx);
 

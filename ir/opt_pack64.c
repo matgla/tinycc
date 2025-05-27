@@ -101,6 +101,403 @@ int tcc_ir_opt_pack64(TCCIRState *ir)
   return changes;
 }
 
+/* tcc_ir_opt_pack64_from_stack_stores:
+ *
+ * Recognise the pattern produced by ARM param prologues for long long /
+ * 8-byte aggregate returns:
+ *
+ *   StackLoc[A]   <-- val_lo    [INT32 STORE]   ; param prologue spill (lo)
+ *   StackLoc[A+4] <-- val_hi    [INT32 STORE]   ; param prologue spill (hi)
+ *   ...   (no intervening writes/reads to [A,A+8) and no redef of val_lo/hi)
+ *   T (INT64)     <-- StackLoc[A] [LOAD]         ; e.g. `return x;` in test2
+ *
+ * Rewrite the LOAD as:
+ *
+ *   T (INT64)     <-- PACK64(val_lo, val_hi)
+ *
+ * If T is the destination of an immediately-following RETURNVALUE (or any
+ * other consumer that can take the register pair), the PACK64 codegen
+ * degrades to register-aligned no-op MOVs, eliminating the spill+ldrd.
+ *
+ * Safety: scans linearly within the LOAD's owning straight-line region
+ * (stops at any jump target / control-flow op).  Conservative — bail on
+ * any unrecognised op between the stores and the LOAD. */
+int tcc_ir_opt_pack64_from_stack_stores(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  int changes = 0;
+
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_LOAD)
+      continue;
+
+    IROperand dest = tcc_ir_op_get_dest(ir, q);
+    if (irop_get_btype(dest) != IROP_BTYPE_INT64)
+      continue;
+    if (dest.is_lval)
+      continue;
+
+    IROperand src = tcc_ir_op_get_src1(ir, q);
+    if (src.tag != IROP_TAG_STACKOFF || !src.is_local || !src.is_lval)
+      continue;
+    /* The LOAD source must be a plain stack slot read (not a deref through
+     * a vreg / sym).  Bail if the operand has any kind of indirection. */
+    if (src.is_llocal || src.is_sym)
+      continue;
+
+    int64_t addr_lo = irop_get_imm64_ex(ir, src);
+    int64_t addr_hi = addr_lo + 4;
+
+    /* Search backwards in the same straight-line region for the two
+     * adjacent narrow STOREs that cover the 8-byte LOAD. */
+    int lo_idx = -1, hi_idx = -1;
+    IROperand lo_val = IROP_NONE, hi_val = IROP_NONE;
+
+    for (int j = i - 1; j >= 0; j--)
+    {
+      IRQuadCompact *jq = &ir->compact_instructions[j];
+      if (jq->op == TCCIR_OP_NOP)
+        continue;
+      if (jq->is_jump_target)
+        break;
+      if (jq->op == TCCIR_OP_JUMP || jq->op == TCCIR_OP_JUMPIF || jq->op == TCCIR_OP_IJUMP ||
+          jq->op == TCCIR_OP_SWITCH_TABLE)
+        break;
+      /* Calls and inline asm can clobber arbitrary memory — bail. */
+      if (jq->op == TCCIR_OP_FUNCCALLVAL || jq->op == TCCIR_OP_FUNCCALLVOID ||
+          jq->op == TCCIR_OP_INLINE_ASM || jq->op == TCCIR_OP_ASM_INPUT ||
+          jq->op == TCCIR_OP_ASM_OUTPUT || jq->op == TCCIR_OP_VLA_ALLOC ||
+          jq->op == TCCIR_OP_SETJMP || jq->op == TCCIR_OP_LONGJMP ||
+          jq->op == TCCIR_OP_NL_SETJMP || jq->op == TCCIR_OP_NL_LONGJMP)
+        break;
+
+      /* Watch for any STORE to a stack slot overlapping [addr_lo, addr_lo+8). */
+      if (jq->op == TCCIR_OP_STORE || jq->op == TCCIR_OP_STORE_INDEXED ||
+          jq->op == TCCIR_OP_STORE_POSTINC || jq->op == TCCIR_OP_BLOCK_COPY)
+      {
+        IROperand jdst = tcc_ir_op_get_dest(ir, jq);
+        if (jq->op == TCCIR_OP_STORE && jdst.tag == IROP_TAG_STACKOFF && jdst.is_local && jdst.is_lval &&
+            !jdst.is_llocal && !jdst.is_sym && irop_get_btype(jdst) == IROP_BTYPE_INT32)
+        {
+          int64_t joff = irop_get_imm64_ex(ir, jdst);
+          IROperand jsrc = tcc_ir_op_get_src1(ir, jq);
+          if (joff == addr_lo && lo_idx < 0)
+          {
+            lo_idx = j;
+            lo_val = jsrc;
+            if (hi_idx >= 0) break;
+            continue;
+          }
+          if (joff == addr_hi && hi_idx < 0)
+          {
+            hi_idx = j;
+            hi_val = jsrc;
+            if (lo_idx >= 0) break;
+            continue;
+          }
+          /* STORE to some unrelated stack slot — fine to look past. */
+          continue;
+        }
+        /* Indirect / wider / cross-form store — could alias [addr_lo,+8); bail. */
+        break;
+      }
+    }
+
+    if (lo_idx < 0 || hi_idx < 0)
+      continue;
+
+    /* The two stored values must be 32-bit vregs (not lvalues, not constants
+     * that const-fold would have already merged).  Allow IMM32 too — PACK64
+     * is happy with either.  Reject lvalues. */
+    if (lo_val.is_lval || hi_val.is_lval)
+      continue;
+    if (irop_get_btype(lo_val) != IROP_BTYPE_INT32 || irop_get_btype(hi_val) != IROP_BTYPE_INT32)
+      continue;
+
+    /* If lo_val or hi_val is a vreg, ensure it's not redefined between its
+     * STORE and the LOAD (i.e. the vreg's value at the STORE is still
+     * available at the LOAD).  Sub-i values not generated here. */
+    int latest_store = lo_idx > hi_idx ? lo_idx : hi_idx;
+    int redef = 0;
+    int32_t lo_vr = irop_has_vreg(lo_val) ? irop_get_vreg(lo_val) : -1;
+    int32_t hi_vr = irop_has_vreg(hi_val) ? irop_get_vreg(hi_val) : -1;
+    if (lo_vr >= 0 || hi_vr >= 0)
+    {
+      for (int k = latest_store + 1; k < i; k++)
+      {
+        IRQuadCompact *kq = &ir->compact_instructions[k];
+        if (kq->op == TCCIR_OP_NOP)
+          continue;
+        if (!irop_config[kq->op].has_dest)
+          continue;
+        if (kq->op == TCCIR_OP_STORE || kq->op == TCCIR_OP_STORE_INDEXED ||
+            kq->op == TCCIR_OP_STORE_POSTINC)
+          continue; /* memory store, doesn't redefine vregs */
+        IROperand kd = tcc_ir_op_get_dest(ir, kq);
+        if (kd.is_lval)
+          continue;
+        int32_t kdvr = irop_get_vreg(kd);
+        if (kdvr < 0)
+          continue;
+        if (kdvr == lo_vr || kdvr == hi_vr)
+        {
+          redef = 1;
+          break;
+        }
+      }
+    }
+    if (redef)
+      continue;
+
+    LOG_IR_GEN("OPTIMIZE: PACK64-FROM-STORES @i=%d (lo@%d, hi@%d, addr=%lld)", i, lo_idx, hi_idx, (long long)addr_lo);
+
+    /* LOAD has 2 operand slots (dest, src1); PACK64 needs 3 (dest, src1,
+     * src2).  Reusing the existing operand_base would let the src2 write
+     * overflow into the next instruction's dest slot.  Allocate fresh
+     * slots at the pool tail and re-point operand_base. */
+    tcc_ir_pool_ensure(ir, 3);
+    int new_base = ir->iroperand_pool_count;
+    if (new_base + 3 > ir->iroperand_pool_capacity)
+      continue;
+    tcc_ir_pool_add(ir, IROP_NONE);
+    tcc_ir_pool_add(ir, IROP_NONE);
+    tcc_ir_pool_add(ir, IROP_NONE);
+    ir->iroperand_pool[new_base + 0] = dest;
+    ir->iroperand_pool[new_base + 1] = lo_val;
+    ir->iroperand_pool[new_base + 2] = hi_val;
+    q->operand_base = new_base;
+    q->op = TCCIR_OP_PACK64;
+    changes++;
+  }
+
+  return changes;
+}
+
+int tcc_ir_opt_pack64_from_stack_stores_ex(IROptCtx *ctx) { return tcc_ir_opt_pack64_from_stack_stores(ctx->ir); }
+
+/* Look at all STOREs/ASSIGNs that write the given VAR-vreg and return their
+ * common immediate value, or fail.  All writers must agree on the same
+ * literal value for the LOAD's result to be statically known. */
+static int pack64_find_var_const_value(TCCIRState *ir, int n, int before_idx,
+                                       int32_t var_vr, int64_t *out_imm)
+{
+  int have_value = 0;
+  int64_t value = 0;
+  for (int i = 0; i < before_idx; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_ASSIGN && q->op != TCCIR_OP_STORE)
+      continue;
+    IROperand d = tcc_ir_op_get_dest(ir, q);
+    if (irop_get_vreg(d) != var_vr)
+      continue;
+    IROperand s = tcc_ir_op_get_src1(ir, q);
+    if (!irop_is_immediate(s))
+      return 0;
+    int64_t v = irop_get_imm64_ex(ir, s);
+    if (have_value && v != value)
+      return 0;
+    value = v;
+    have_value = 1;
+  }
+  if (!have_value)
+    return 0;
+  *out_imm = value;
+  return 1;
+}
+
+/* Walk the def-chain backwards looking for a compile-time constant.  Handles
+ * ASSIGN/LOAD copies, plus SHL/SAR/SHR with immediate shift amounts so the
+ * frequent `(int8_t)x; ((int64_t)int_var)` cast chain folds.  When the chain
+ * hits a VAR vreg (a local variable read via the spill slot), check if every
+ * store to that VAR writes the same literal — if so, that's the value.
+ *
+ * Returns 1 with *out set on success; 0 otherwise.  Used as a *guard* in
+ * pack64_implicit: if both halves of the OR resolve to constants, the
+ * pre-PACK64 chain would const-fold to a literal, but PACK64 itself is
+ * opaque to const_prop and the conversion forfeits that fold (this
+ * regressed gcc.c-torture/compile/20040304-2.c from 1 to ~100 instructions).
+ *
+ * Used only as a guard — over-approximation (false negatives) only costs
+ * missed pack64_implicit applications, never miscompiles.  Bug-tolerant by
+ * design: if the walker incorrectly concludes "yes constant", we skip a
+ * legitimate fold but the SHL+OR stays semantically equivalent.
+ */
+static int pack64_operand_resolves_const(TCCIRState *ir, IROptDU *du, int n,
+                                         IROperand op, int boundary_idx,
+                                         int budget, int64_t *out)
+{
+  for (int hop = 0; hop < 16 && budget > 0; hop++, budget--)
+  {
+    if (irop_is_immediate(op))
+    {
+      *out = irop_get_imm64_ex(ir, op);
+      return 1;
+    }
+    int32_t vr = irop_get_vreg(op);
+    if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
+      return 0;
+    if (!ir_opt_du_is_single_def(du, vr))
+      return 0;
+    int def_idx = ir_opt_du_def(du, vr, n);
+    if (def_idx < 0)
+      return 0;
+    IRQuadCompact *dq = &ir->compact_instructions[def_idx];
+    if (dq->op == TCCIR_OP_SHL || dq->op == TCCIR_OP_SAR || dq->op == TCCIR_OP_SHR)
+    {
+      IROperand sh_amt = tcc_ir_op_get_src2(ir, dq);
+      if (!irop_is_immediate(sh_amt))
+        return 0;
+      int64_t amt = irop_get_imm64_ex(ir, sh_amt);
+      int64_t v;
+      if (!pack64_operand_resolves_const(ir, du, n, tcc_ir_op_get_src1(ir, dq),
+                                         boundary_idx, budget - 1, &v))
+        return 0;
+      int is_64 = (irop_get_btype(tcc_ir_op_get_dest(ir, dq)) == IROP_BTYPE_INT64);
+      int mask = is_64 ? 63 : 31;
+      int64_t r;
+      if (dq->op == TCCIR_OP_SHL)
+        r = (int64_t)((uint64_t)v << (amt & mask));
+      else if (dq->op == TCCIR_OP_SHR)
+        r = is_64 ? (int64_t)((uint64_t)v >> (amt & 63)) : (int64_t)((uint32_t)v >> (amt & 31));
+      else
+        r = is_64 ? v >> (amt & 63) : (int64_t)((int32_t)v >> (amt & 31));
+      if (!is_64)
+        r = (int64_t)(int32_t)(uint32_t)r;
+      *out = r;
+      return 1;
+    }
+    if (dq->op != TCCIR_OP_ASSIGN && dq->op != TCCIR_OP_LOAD)
+      return 0;
+    IROperand ds = tcc_ir_op_get_src1(ir, dq);
+    int32_t ds_vr = irop_get_vreg(ds);
+    if (ds_vr >= 0 && TCCIR_DECODE_VREG_TYPE(ds_vr) == TCCIR_VREG_TYPE_VAR)
+    {
+      /* Bound the write scan by the LOAD's own index — writes after it
+       * have no bearing on the value it observed. */
+      int64_t var_imm = 0;
+      if (!pack64_find_var_const_value(ir, n, def_idx, ds_vr, &var_imm))
+        return 0;
+      *out = var_imm;
+      return 1;
+    }
+    if (ds.is_lval || ds.is_local || ds.is_llocal)
+      return 0;
+    op = ds;
+  }
+  return 0;
+}
+
+/* tcc_ir_opt_pack64_implicit: fold the C-level signed/unsigned widening idiom
+ * that lacks explicit ZEXT operations.
+ *
+ *   T_sh = X_hi SHL #32       ; i64 — X_hi is i32 (e.g. result of `X SAR #31`)
+ *   T_or = T_sh OR X_lo       ; i64 — X_lo is i32 (the original low value)
+ *
+ * The OR's i32 operand is implicitly zero-extended to i64, so its high
+ * contribution is 0.  T_sh contributes hi=X_hi, lo=0.  Combined: lo=X_lo,
+ * hi=X_hi — exactly what PACK64 represents.
+ *
+ * Sister of [[tcc_ir_opt_pack64]]: that pass requires explicit ZEXT defs on
+ * both halves; this one catches the same idiom when the frontend emitted the
+ * SAR/SHL/OR chain without intermediate ZEXTs (the typical shape for
+ * `arr[N] = (long long)int_var`).
+ */
+int tcc_ir_opt_pack64_implicit(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  int changes = 0;
+  if (n < 2)
+    return 0;
+
+  IROptDU du;
+  ir_opt_du_build_mode(ir, &du, IR_DU_MODE_TMP_ONLY);
+
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_OR)
+      continue;
+    IROperand or_dest = tcc_ir_op_get_dest(ir, q);
+    if (irop_get_btype(or_dest) != IROP_BTYPE_INT64)
+      continue;
+    if (or_dest.is_lval)
+      continue;
+
+    IROperand or_src1 = tcc_ir_op_get_src1(ir, q);
+    IROperand or_src2 = tcc_ir_op_get_src2(ir, q);
+
+    for (int swap = 0; swap < 2; swap++)
+    {
+      IROperand shl_op = swap ? or_src2 : or_src1;
+      IROperand lo_op = swap ? or_src1 : or_src2;
+
+      /* The SHL operand must be a single-use TEMP. */
+      int32_t shl_vr = irop_get_vreg(shl_op);
+      if (TCCIR_DECODE_VREG_TYPE(shl_vr) != TCCIR_VREG_TYPE_TEMP)
+        continue;
+      if (shl_op.is_lval || shl_op.is_sym)
+        continue;
+      if (ir_opt_du_uses(&du, shl_vr) != 1 || !ir_opt_du_is_single_def(&du, shl_vr))
+        continue;
+      int shl_def = ir_opt_du_def(&du, shl_vr, n);
+      if (shl_def < 0)
+        continue;
+
+      IRQuadCompact *shl_q = &ir->compact_instructions[shl_def];
+      if (shl_q->op != TCCIR_OP_SHL)
+        continue;
+      IROperand shl_amt = tcc_ir_op_get_src2(ir, shl_q);
+      if (!irop_is_immediate(shl_amt) || irop_get_imm64_ex(ir, shl_amt) != 32)
+        continue;
+      IROperand shl_dest = tcc_ir_op_get_dest(ir, shl_q);
+      if (irop_get_btype(shl_dest) != IROP_BTYPE_INT64)
+        continue;
+
+      /* The SHL's input becomes PACK64's hi operand.  It must be a 32-bit
+       * value (otherwise the bits above bit 31 would survive the implicit
+       * truncation that PACK64 performs on the hi half). */
+      IROperand shl_input = tcc_ir_op_get_src1(ir, shl_q);
+      if (irop_get_btype(shl_input) == IROP_BTYPE_INT64)
+        continue;
+
+      /* The other OR operand becomes PACK64's lo. It must also be 32-bit so
+       * its implicit zero-extension into the i64 OR is hi=0 — otherwise the
+       * non-zero hi bits would corrupt the packed high half. */
+      if (irop_get_btype(lo_op) == IROP_BTYPE_INT64)
+        continue;
+
+      /* Skip when both halves trace to compile-time constants — const_prop
+       * folds the original SHL+OR chain to a literal in that case, but
+       * PACK64 is opaque to const_prop and the conversion forfeits that
+       * fold (regresses gcc.c-torture/compile/20040304-2.c from 1 to
+       * ~100 instructions, where ternary chains over a 0 tempA/tempB
+       * resolve to a no-op function). */
+      {
+        int64_t dummy;
+        if (pack64_operand_resolves_const(ir, &du, n, shl_input, i, 32, &dummy) &&
+            pack64_operand_resolves_const(ir, &du, n, lo_op, i, 32, &dummy))
+          continue;
+      }
+
+      LOG_IR_GEN("OPTIMIZE: PACK64_IMPLICIT fold at i=%d (shl_def=%d)", i, shl_def);
+
+      q->op = TCCIR_OP_PACK64;
+      tcc_ir_set_src1(ir, i, lo_op);
+      tcc_ir_set_src2(ir, i, shl_input);
+
+      ir->compact_instructions[shl_def].op = TCCIR_OP_NOP;
+      changes++;
+      break;
+    }
+  }
+
+  tcc_free(du.def);
+  return changes;
+}
+
 /* tcc_ir_opt_pack64_tautology: fold `PACK64(low_half(X), X SHR #32)` into
  * `ASSIGN X`.  Recognises the case where C source code packs a 64-bit value
  * back together from its own halves — e.g.

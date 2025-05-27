@@ -58,6 +58,37 @@ static int ir_gen_branch_fold_test_zero(IROptCtx *ctx, int i)
   } else {
     test_q->op = TCCIR_OP_NOP;
     jump_q->op = TCCIR_OP_NOP;
+    /* The JUMPIF wasn't taken — control falls through.  If the next op
+     * is a SETIF that reads the same flag state we just NOPed, codegen
+     * would lower it consuming garbage flags.  Fold it to a constant
+     * based on the known value comparison.
+     *
+     * NE (0x95): set iff value != 0  → fold to (val != 0 ? 1 : 0)
+     * EQ (0x94): set iff value == 0  → fold to (val == 0 ? 1 : 0)
+     */
+    int k = ir_skip_nops_forward(ir, j + 1, ir->next_instruction_index);
+    if (k < ir->next_instruction_index)
+    {
+      IRQuadCompact *setif_q = &ir->compact_instructions[k];
+      if (setif_q->op == TCCIR_OP_SETIF && !setif_q->is_jump_target)
+      {
+        IROperand setif_cond = tcc_ir_op_get_src1(ir, setif_q);
+        int setif_tok = (int)irop_get_imm64_ex(ir, setif_cond);
+        int setif_result = -1;
+        if (setif_tok == 0x95)        /* NE */
+          setif_result = (val != 0) ? 1 : 0;
+        else if (setif_tok == 0x94)   /* EQ */
+          setif_result = (val == 0) ? 1 : 0;
+        if (setif_result >= 0)
+        {
+          IROperand dest = tcc_ir_op_get_dest(ir, setif_q);
+          IROperand imm = irop_make_imm32(-1, setif_result, irop_get_btype(dest));
+          setif_q->op = TCCIR_OP_ASSIGN;
+          tcc_ir_set_src1(ir, k, imm);
+          tcc_ir_set_src2(ir, k, IROP_NONE);
+        }
+      }
+    }
   }
 
   LOG_IR_GEN("BRANCH FOLD: TEST_ZERO #%lld with cond 0x%x -> %s at i=%d",

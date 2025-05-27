@@ -510,3 +510,455 @@ int tcc_ir_opt_dead_vla_struct_elim_ex(IROptCtx *ctx)
 {
   return tcc_ir_opt_dead_vla_struct_elim(ctx->ir);
 }
+
+/* alloca-load forwarding
+ *
+ * The TCC frontend lowers `__builtin_alloca(N)` (and `n = alloca(N)` patterns)
+ * to a three-op sequence:
+ *
+ *   VLA_ALLOC #N, #align          ; adjusts SP
+ *   VLA_SP_SAVE -> StackLoc[S]    ; spills the new SP to slot S
+ *   LOAD vreg <- StackLoc[S]      ; reads the alloca pointer back
+ *
+ * which lowers to `mov scratch, sp; str scratch, [S]; ldr vreg, [S]` — 3
+ * machine instructions even though `mov vreg, sp` is what we really want.
+ *
+ * When the slot is otherwise dead (no second writer, no other readers, no
+ * VLA_SP_RESTORE) and the LOAD is the *immediately* next non-NOP op, we
+ * retarget the VLA_SP_SAVE's destination to the LOAD's vreg and NOP the
+ * LOAD.  The backend's VLA_SP_SAVE handler recognises the REG dest and
+ * emits a single `mov dest_reg, sp`, collapsing the three-op dance to one
+ * instruction. */
+int tcc_ir_opt_alloca_load_fwd(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  if (n == 0)
+    return 0;
+
+  int changes = 0;
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *save = &ir->compact_instructions[i];
+    if (save->op != TCCIR_OP_VLA_SP_SAVE)
+      continue;
+
+    IROperand save_dest = tcc_ir_op_get_dest(ir, save);
+    if (irop_get_tag(save_dest) != IROP_TAG_STACKOFF || !save_dest.is_local ||
+        irop_get_vreg(save_dest) != -1)
+      continue;
+    int32_t slot = irop_get_stack_offset(save_dest);
+
+    /* Find immediately-next non-NOP instruction. */
+    int j = i + 1;
+    while (j < n && ir->compact_instructions[j].op == TCCIR_OP_NOP)
+      j++;
+    if (j >= n)
+      continue;
+
+    IRQuadCompact *ld = &ir->compact_instructions[j];
+    if (ld->op != TCCIR_OP_LOAD)
+      continue;
+    if (ld->is_jump_target)
+      continue;
+
+    IROperand ld_src = tcc_ir_op_get_src1(ir, ld);
+    IROperand ld_dest = tcc_ir_op_get_dest(ir, ld);
+
+    /* LOAD must read exactly the slot we just wrote. */
+    if (irop_get_tag(ld_src) != IROP_TAG_STACKOFF || !ld_src.is_local ||
+        irop_get_vreg(ld_src) != -1 || irop_get_stack_offset(ld_src) != slot)
+      continue;
+    /* LOAD must not dereference through an intermediate pointer (llocal). */
+    if (ld_src.is_llocal)
+      continue;
+    /* LOAD's btype must match a 32-bit pointer-sized value — VLA_SP_SAVE
+     * stores SP, which is always 32 bits on this target.  Skip 64-bit pairs
+     * and sub-word loads which would require sign/zero-extension. */
+    if (irop_needs_pair(ld_dest))
+      continue;
+    if (ld_dest.btype != IROP_BTYPE_INT32 && ld_dest.btype != 0)
+      continue;
+
+    /* LOAD's dest must be a plain vreg (TEMP or VAR) — not a deref/spill
+     * target that the backend would still spill to memory. */
+    if (irop_get_tag(ld_dest) != IROP_TAG_VREG || ld_dest.is_lval)
+      continue;
+    int32_t ld_dest_vr = irop_get_vreg(ld_dest);
+    if (ld_dest_vr < 0)
+      continue;
+
+    /* Verify the slot has no other writers and no other readers anywhere in
+     * the function.  Any STORE / second VLA_SP_SAVE / VLA_SP_RESTORE / LOAD
+     * touching the slot disqualifies the rewrite — the slot's value would
+     * then need to remain readable from memory. */
+    int slot_is_isolated = 1;
+    for (int k = 0; k < n && slot_is_isolated; k++)
+    {
+      if (k == i || k == j)
+        continue;
+      IRQuadCompact *q = &ir->compact_instructions[k];
+      if (q->op == TCCIR_OP_NOP)
+        continue;
+
+      /* Check destination: any write to the same slot disqualifies. */
+      if (irop_config[q->op].has_dest)
+      {
+        IROperand d = tcc_ir_op_get_dest(ir, q);
+        if (irop_get_tag(d) == IROP_TAG_STACKOFF && d.is_local &&
+            irop_get_vreg(d) == -1 && irop_get_stack_offset(d) == slot)
+        {
+          slot_is_isolated = 0;
+          break;
+        }
+      }
+      /* Check sources: any read from the same slot disqualifies. */
+      if (irop_config[q->op].has_src1)
+      {
+        IROperand s = tcc_ir_op_get_src1(ir, q);
+        if (operand_reads_slot(s, slot))
+        {
+          slot_is_isolated = 0;
+          break;
+        }
+      }
+      if (irop_config[q->op].has_src2)
+      {
+        IROperand s = tcc_ir_op_get_src2(ir, q);
+        if (operand_reads_slot(s, slot))
+        {
+          slot_is_isolated = 0;
+          break;
+        }
+      }
+    }
+    if (!slot_is_isolated)
+      continue;
+
+    /* Rewrite VLA_SP_SAVE's dest from STACKOFF to the LOAD's vreg, and NOP
+     * the LOAD.  Preserve dest btype as INT32 (pointer-sized SP). */
+    IROperand new_dest = irop_make_vreg(ld_dest_vr, IROP_BTYPE_INT32);
+    tcc_ir_set_dest(ir, i, new_dest);
+    ld->op = TCCIR_OP_NOP;
+
+    LOG_IR_GEN("ALLOCA-FWD: VLA_SP_SAVE@%d slot=%d redirected to vreg=%d "
+               "(LOAD@%d folded)",
+               i, slot, ld_dest_vr, j);
+    changes++;
+  }
+
+  return changes;
+}
+
+int tcc_ir_opt_alloca_load_fwd_ex(IROptCtx *ctx)
+{
+  return tcc_ir_opt_alloca_load_fwd(ctx->ir);
+}
+
+/* Dead-alloca elimination for VREG-target VLA_SP_SAVE.
+ *
+ * Companion to `dead_vla_struct_elim`, which only handles VLA_SP_SAVE writing
+ * to a STACK SLOT (the original pre-`alloca_load_fwd` shape).  After
+ * `alloca_load_fwd` rewrites the SP_SAVE's dest to a VREG, the resulting
+ * pattern slips past `dead_vla_struct_elim`'s slot-based analysis.  This pass
+ * handles the VREG-dest case directly.
+ *
+ * Pattern:
+ *
+ *   VLA_ALLOC #N, #align
+ *   VLA_SP_SAVE -> V_seed (TEMP or VAR vreg)
+ *   ... uses of V_seed (and transitively-propagated copies) only as STORE
+ *       destinations, with no LOAD of memory through any tainted vreg, and
+ *       no escape of V_seed's value to memory / calls / returns / globals.
+ *
+ * Bails (function-wide): same as `dead_vla_struct_elim`.  No CALL with
+ * tainted-arg checks here because we already bail on CALL via the
+ * dead_vla_struct_elim path; the late_cleanup loop ensures both passes see
+ * the same IR snapshot.  We re-check the bail set defensively. */
+int tcc_ir_opt_dead_alloca_vreg_elim(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  if (n == 0)
+    return 0;
+
+  if (ir->captured_count > 0 || ir->has_static_chain || ir->nb_nested_funcs > 0)
+    return 0;
+
+  for (int i = 0; i < n; i++)
+  {
+    int op = ir->compact_instructions[i].op;
+    if (op == TCCIR_OP_IJUMP || op == TCCIR_OP_SETJMP || op == TCCIR_OP_LONGJMP ||
+        op == TCCIR_OP_NL_SETJMP || op == TCCIR_OP_NL_LONGJMP ||
+        op == TCCIR_OP_INLINE_ASM || op == TCCIR_OP_SET_CHAIN ||
+        op == TCCIR_OP_INIT_CHAIN_SLOT)
+      return 0;
+  }
+
+  int max_tmp = 0, max_var = 0;
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    IROperand ops[3];
+    ops[0] = tcc_ir_op_get_dest(ir, q);
+    ops[1] = tcc_ir_op_get_src1(ir, q);
+    ops[2] = tcc_ir_op_get_src2(ir, q);
+    for (int k = 0; k < 3; k++)
+    {
+      int32_t vr = irop_get_vreg(ops[k]);
+      if (vr < 0)
+        continue;
+      int t = TCCIR_DECODE_VREG_TYPE(vr);
+      int p = TCCIR_DECODE_VREG_POSITION(vr);
+      if (t == TCCIR_VREG_TYPE_TEMP && p > max_tmp) max_tmp = p;
+      else if (t == TCCIR_VREG_TYPE_VAR && p > max_var) max_var = p;
+    }
+  }
+
+  uint8_t *tainted_tmp = tcc_malloc((max_tmp + 1));
+  uint8_t *tainted_var = (max_var > 0) ? tcc_malloc((max_var + 1)) : NULL;
+  int *kill_idx = tcc_malloc(sizeof(int) * n);
+
+  int total_changes = 0;
+  int any_dead = 0;
+
+  for (int i = 0; i < n; i++)
+  {
+    if (ir->compact_instructions[i].op != TCCIR_OP_VLA_ALLOC)
+      continue;
+
+    int save_idx = -1;
+    for (int j = i + 1; j < n; j++)
+    {
+      TccIrOp op = ir->compact_instructions[j].op;
+      if (op == TCCIR_OP_NOP)
+        continue;
+      if (op == TCCIR_OP_VLA_SP_SAVE)
+        save_idx = j;
+      break;
+    }
+    if (save_idx < 0)
+      continue;
+
+    IROperand save_dest = tcc_ir_op_get_dest(ir, &ir->compact_instructions[save_idx]);
+    int32_t seed_vr = irop_get_vreg(save_dest);
+    if (seed_vr < 0)
+      continue; /* slot-dest case → handled by dead_vla_struct_elim */
+    int seed_type = TCCIR_DECODE_VREG_TYPE(seed_vr);
+    int seed_pos = TCCIR_DECODE_VREG_POSITION(seed_vr);
+
+    memset(tainted_tmp, 0, max_tmp + 1);
+    if (tainted_var)
+      memset(tainted_var, 0, max_var + 1);
+
+    if (seed_type == TCCIR_VREG_TYPE_TEMP && seed_pos <= max_tmp)
+      tainted_tmp[seed_pos] = 1;
+    else if (seed_type == TCCIR_VREG_TYPE_VAR && tainted_var && seed_pos <= max_var)
+      tainted_var[seed_pos] = 1;
+    else
+      continue;
+
+    int kill_count = 0;
+    int bail = 0;
+
+    for (int j = save_idx + 1; j < n && !bail; j++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[j];
+      if (q->op == TCCIR_OP_NOP)
+        continue;
+
+      if (q->op == TCCIR_OP_VLA_SP_RESTORE)
+        continue;
+      if (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID ||
+          q->op == TCCIR_OP_FUNCPARAMVAL || q->op == TCCIR_OP_FUNCPARAMVOID)
+      {
+        bail = 1;
+        break;
+      }
+
+      int has_d = irop_config[q->op].has_dest;
+      int has_s1 = irop_config[q->op].has_src1;
+      int has_s2 = irop_config[q->op].has_src2;
+      IROperand d = {0}, s1 = {0}, s2 = {0};
+      if (has_d) d = tcc_ir_op_get_dest(ir, q);
+      if (has_s1) s1 = tcc_ir_op_get_src1(ir, q);
+      if (has_s2) s2 = tcc_ir_op_get_src2(ir, q);
+
+      /* Classify each source operand wrt taint.
+       *   tainted_val   = operand yields a tainted VALUE (the alloca pointer or
+       *                   something derived from it).  Propagation candidate.
+       *   tainted_deref = operand is a memory READ through a tainted TEMP
+       *                   pointer (lval-deref).  Bail — observer of alloca mem.
+       *
+       * VAR-src semantics: is_lval=1 is the normal "fetch from slot" form
+       * (the VAR itself holds the alloca ptr), counts as tainted_val.
+       * TEMP-src with is_lval=1 IS a deref of a pointer-typed TEMP, counts as
+       * tainted_deref.  TEMP-src with is_lval=0 is value-use → tainted_val. */
+#define CLASSIFY(_op, _val_out, _deref_out)                                      \
+  do                                                                             \
+  {                                                                              \
+    int32_t _vr = irop_get_vreg(_op);                                            \
+    if (_vr >= 0)                                                                \
+    {                                                                            \
+      int _vt = TCCIR_DECODE_VREG_TYPE(_vr);                                     \
+      int _vp = TCCIR_DECODE_VREG_POSITION(_vr);                                 \
+      if (_vt == TCCIR_VREG_TYPE_TEMP && _vp <= max_tmp && tainted_tmp[_vp])     \
+      {                                                                          \
+        if ((_op).is_lval) _deref_out = 1;                                       \
+        else _val_out = 1;                                                       \
+      }                                                                          \
+      else if (_vt == TCCIR_VREG_TYPE_VAR && tainted_var && _vp <= max_var &&    \
+               tainted_var[_vp])                                                 \
+      {                                                                          \
+        _val_out = 1;                                                            \
+      }                                                                          \
+    }                                                                            \
+  } while (0)
+
+      int s1_val = 0, s1_deref = 0, s2_val = 0, s2_deref = 0;
+      if (has_s1) CLASSIFY(s1, s1_val, s1_deref);
+      if (has_s2) CLASSIFY(s2, s2_val, s2_deref);
+
+      if (s1_deref || s2_deref)
+      {
+        bail = 1;
+        break;
+      }
+
+      /* STORE family: dest as tainted-TEMP pointer → kill candidate.
+       * src1 (stored value) being tainted_val and dest NOT in tainted region
+       * → escape (alloca ptr leaks into non-alloca memory). */
+      if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
+          q->op == TCCIR_OP_STORE_POSTINC)
+      {
+        int dest_is_tainted_addr = 0;
+        if (has_d)
+        {
+          int32_t _vr = irop_get_vreg(d);
+          if (_vr >= 0)
+          {
+            int _vt = TCCIR_DECODE_VREG_TYPE(_vr);
+            int _vp = TCCIR_DECODE_VREG_POSITION(_vr);
+            if (_vt == TCCIR_VREG_TYPE_TEMP && _vp <= max_tmp && tainted_tmp[_vp])
+              dest_is_tainted_addr = 1;
+          }
+        }
+        if (s1_val && !dest_is_tainted_addr)
+        {
+          bail = 1;
+          break;
+        }
+        if (dest_is_tainted_addr)
+          kill_idx[kill_count++] = j;
+        continue;
+      }
+
+      /* No tainted input — instruction doesn't propagate or kill anything.
+       * Special case: if dest is a tainted VAR being overwritten with a
+       * non-tainted value, the VAR loses its taint. */
+      if (!s1_val && !s2_val)
+      {
+        if (has_d)
+        {
+          int32_t _vr = irop_get_vreg(d);
+          if (_vr >= 0)
+          {
+            int _vt = TCCIR_DECODE_VREG_TYPE(_vr);
+            int _vp = TCCIR_DECODE_VREG_POSITION(_vr);
+            if (_vt == TCCIR_VREG_TYPE_VAR && tainted_var && _vp <= max_var &&
+                tainted_var[_vp])
+              tainted_var[_vp] = 0;
+          }
+        }
+        continue;
+      }
+
+      /* Tainted input: must be a propagator op.  Include LOAD because the
+       * frontend sometimes emits `T = V [LOAD]` for a VAR fetch where ASSIGN
+       * would have done equally — once we've ruled out TEMP-deref above
+       * (tainted_deref bail), LOAD here is just a slot read. */
+      int is_prop = (q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_LEA ||
+                     q->op == TCCIR_OP_LOAD || q->op == TCCIR_OP_ADD ||
+                     q->op == TCCIR_OP_SUB || q->op == TCCIR_OP_AND ||
+                     q->op == TCCIR_OP_OR || q->op == TCCIR_OP_XOR);
+      if (!is_prop || !has_d)
+      {
+        bail = 1;
+        break;
+      }
+      int32_t d_vr = irop_get_vreg(d);
+      if (d_vr < 0)
+      {
+        bail = 1;
+        break;
+      }
+      int d_vt = TCCIR_DECODE_VREG_TYPE(d_vr);
+      int d_vp = TCCIR_DECODE_VREG_POSITION(d_vr);
+      if (d_vt == TCCIR_VREG_TYPE_TEMP && d_vp <= max_tmp)
+      {
+        tainted_tmp[d_vp] = 1;
+        kill_idx[kill_count++] = j;
+      }
+      else if (d_vt == TCCIR_VREG_TYPE_VAR && tainted_var && d_vp <= max_var)
+      {
+        tainted_var[d_vp] = 1;
+        kill_idx[kill_count++] = j;
+      }
+      else
+      {
+        bail = 1;
+        break;
+      }
+
+#undef CLASSIFY
+    }
+
+    if (bail)
+      continue;
+
+    LOG_IR_GEN("DEAD-ALLOCA-VREG: NOP VLA_ALLOC@%d + VLA_SP_SAVE@%d + %d "
+               "dependent ops",
+               i, save_idx, kill_count);
+    ir->compact_instructions[i].op = TCCIR_OP_NOP;
+    ir->compact_instructions[save_idx].op = TCCIR_OP_NOP;
+    for (int k = 0; k < kill_count; k++)
+      ir->compact_instructions[kill_idx[k]].op = TCCIR_OP_NOP;
+    total_changes += 2 + kill_count;
+    any_dead = 1;
+  }
+
+  tcc_free(kill_idx);
+  if (tainted_var)
+    tcc_free(tainted_var);
+  tcc_free(tainted_tmp);
+
+  if (any_dead)
+    total_changes += sweep_orphan_tmp_defs(ir, max_tmp);
+
+  if (any_dead)
+  {
+    int has_vla_or_apply = 0;
+    for (int i = 0; i < n; i++)
+    {
+      int op = ir->compact_instructions[i].op;
+      if (op == TCCIR_OP_VLA_ALLOC || op == TCCIR_OP_BUILTIN_APPLY_ARGS ||
+          op == TCCIR_OP_BUILTIN_APPLY || op == TCCIR_OP_SET_CHAIN)
+      {
+        has_vla_or_apply = 1;
+        break;
+      }
+    }
+    if (!has_vla_or_apply && tcc_state)
+    {
+      tcc_state->force_frame_pointer = 0;
+      tcc_state->need_frame_pointer = 0;
+    }
+  }
+
+  return total_changes;
+}
+
+int tcc_ir_opt_dead_alloca_vreg_elim_ex(IROptCtx *ctx)
+{
+  return tcc_ir_opt_dead_alloca_vreg_elim(ctx->ir);
+}

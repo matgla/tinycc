@@ -297,6 +297,7 @@ typedef struct IRLiveInterval
   uint8_t is_complex : 1;      // Phase 3: whether this is a complex type
   uint8_t use_vfp : 1;         // whether to use VFP registers (hard float)
   uint8_t is_lvalue : 1;
+  uint8_t is_volatile : 1;  // whether the source object has volatile-qualified type
   uint8_t crosses_call : 1; // whether interval spans a function call
   uint8_t phi_pinned : 1;   // register relied upon by identity phi — do not reassign
   uint32_t start;           // start instruction index

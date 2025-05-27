@@ -1774,6 +1774,254 @@ int tcc_ir_opt_stackoff_addr_cse(TCCIRState *ir)
 }
 
 /* ============================================================================
+ * LEA CSE — collapse multiple LEAs of the same stack address
+ * ============================================================================
+ *
+ * Pattern (emerges from per-element vector access into the same temp local
+ * after macro-unrolling, e.g. `V v = ...; v[0] = ...; v[1] = ...`):
+ *   i0:  T1 = LEA &?N              (anonymous local at offset O)
+ *   i1:  T1***DEREF*** <- val      (or STORE_INDEXED [T1+#k] <- val)
+ *   i2:  T3 = LEA &?N              ; same source — redundant LEA
+ *   i3:  T4 = T3 ADD #4
+ *   i4:  T4***DEREF*** <- val2
+ *   ...
+ *
+ * Each subsequent LEA materializes the same `add rX, sp, #off` on ARM,
+ * costing one instruction per access.  GCC keeps the address in a register
+ * once and reuses it.
+ *
+ * Transform: within a basic block, the first LEA whose source operand
+ * (STACKOFF + vreg + flags) matches a later LEA becomes the canonical
+ * definition.  The later LEA is rewritten to `ASSIGN later_dest <-
+ * first_dest`.  Copy propagation then forwards `first_dest` into all
+ * downstream uses, and DCE removes the dead ASSIGN.
+ *
+ * Why not lea_fold?  That pass substitutes the LEA's source operand into
+ * every deref use, which works for unique stack addresses (vreg=-1) but
+ * breaks for vreg-backed anonymous locals: the stack-layout pass tracks
+ * temp-local slot allocation by counting vreg references, so erasing every
+ * reference makes the slot disappear from the frame while remaining LEAs
+ * still target its original offset.  CSE preserves one canonical reference
+ * to the vreg, so the slot stays allocated.
+ *
+ * Safety constraints:
+ *   - Same basic block only (control flow may take a different path that
+ *     reaches the second LEA without executing the first)
+ *   - Source operand must compare equal under operand-by-operand match
+ *     (tag, vreg, imm32, flag bits)
+ *   - LEA dest must be a TEMP vreg with no other definition (SSA-like
+ *     property — the rewrite produces an ASSIGN that copies from the
+ *     canonical TEMP, so the dest must hold the same value through its
+ *     entire lifetime)
+ */
+static int lea_cse_operand_equal(IROperand a, IROperand b)
+{
+  /* Strict on everything *except* ctype_idx for STRUCT operands: two LEAs
+   * at the same stack offset with different ctype_idxes are still the same
+   * numerical address — the type-view metadata doesn't affect what address
+   * the LEA produces.  Comparing via irop_get_stack_offset masks the
+   * ctype_idx half of u.s for STRUCT operands while keeping u.imm32 exact
+   * for scalars. */
+  if (irop_get_tag(a) != irop_get_tag(b))
+    return 0;
+  if (a.vr != b.vr)
+    return 0;
+  if (irop_get_stack_offset(a) != irop_get_stack_offset(b))
+    return 0;
+  /* For non-STRUCT operands, irop_get_stack_offset already covers u.imm32.
+   * For STRUCT, also check the raw u.imm32 is otherwise consistent (e.g. we
+   * still want to reject if the *non-offset* half varies in a way that
+   * matters — but in practice ctype_idx is the only varying piece). */
+  if (a.btype != IROP_BTYPE_STRUCT && a.u.imm32 != b.u.imm32)
+    return 0;
+  if (((const uint8_t *)&a)[8] != ((const uint8_t *)&b)[8])
+    return 0;
+  return 1;
+}
+
+int tcc_ir_opt_lea_cse(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  if (n < 2)
+    return 0;
+
+#define LEA_CSE_MAX_ACTIVE 32
+  struct {
+    IROperand src;
+    int32_t dest_vr;
+    int def_idx;
+  } active[LEA_CSE_MAX_ACTIVE];
+  int n_active = 0;
+  int changes = 0;
+
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+
+    /* Basic-block boundary: reset the active map.  Any control transfer
+     * (jump in or out) means the canonical LEA's dest vreg may not be
+     * live on the other side. */
+    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF ||
+        q->op == TCCIR_OP_IJUMP || q->op == TCCIR_OP_SWITCH_TABLE)
+    {
+      n_active = 0;
+      continue;
+    }
+
+    /* CALLs end the live range of caller-saved registers — be conservative
+     * and reset.  (We could be smarter if the canonical LEA's dest is in a
+     * callee-saved register, but that's a regalloc-time fact unavailable here.) */
+    if (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID)
+    {
+      n_active = 0;
+      continue;
+    }
+
+    /* Only LEA operations enter the table or hit it. */
+    if (q->op != TCCIR_OP_LEA)
+    {
+      /* If this instruction redefines an active LEA's dest vreg (non-LEA
+       * write), drop it from the active map.
+       *
+       * STORE/STORE_INDEXED/STORE_POSTINC are special: the IR keeps the
+       * destination pointer/base in the dest slot, but semantically that
+       * slot is a USE of the pointer — the op doesn't write to the dest
+       * vreg, it writes through it.  Skip the redef bookkeeping for these
+       * forms so the canonical LEA stays live across stores into the
+       * region it points at. */
+      int is_ptr_store = (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
+                          q->op == TCCIR_OP_STORE_POSTINC);
+      if (irop_config[q->op].has_dest && !is_ptr_store)
+      {
+        IROperand d = tcc_ir_op_get_dest(ir, q);
+        if (irop_has_vreg(d) && !d.is_lval)
+        {
+          int32_t dvr = irop_get_vreg(d);
+          for (int j = 0; j < n_active; j++)
+          {
+            if (active[j].dest_vr == dvr)
+            {
+              active[j] = active[--n_active];
+              break;
+            }
+          }
+        }
+      }
+
+      /* Also invalidate any active entry whose source vreg appears
+       * directly in this op's operands (not through the LEA's dest
+       * vreg).  This catches cases like `T5 <-- ?131070 [LOAD]` —
+       * a direct read/write of the slot's anonymous vreg that bypasses
+       * the LEA chain.  Extending the canonical LEA's live range across
+       * such uses would extend register pressure unpredictably (the
+       * regalloc didn't see the LEA's vreg as live across the direct
+       * op), surfacing as overlapping register assignments in the final
+       * MOP. */
+      const IRRegistersConfig *cfg = &irop_config[q->op];
+      IROperand check_ops[3];
+      int ncheck = 0;
+      if (cfg->has_src1) check_ops[ncheck++] = tcc_ir_op_get_src1(ir, q);
+      if (cfg->has_src2) check_ops[ncheck++] = tcc_ir_op_get_src2(ir, q);
+      if (cfg->has_dest) check_ops[ncheck++] = tcc_ir_op_get_dest(ir, q);
+      for (int oi = 0; oi < ncheck; oi++)
+      {
+        if (irop_get_tag(check_ops[oi]) != IROP_TAG_STACKOFF)
+          continue;
+        int32_t ovr = irop_get_vreg(check_ops[oi]);
+        if (ovr >= -1) /* only negative-vreg STACKOFFs are CSE-tracked */
+          continue;
+        for (int j = 0; j < n_active; j++)
+        {
+          if (irop_get_vreg(active[j].src) == ovr)
+          {
+            active[j] = active[--n_active];
+            break;
+          }
+        }
+      }
+      continue;
+    }
+
+    IROperand src = tcc_ir_op_get_src1(ir, q);
+    IROperand dest = tcc_ir_op_get_dest(ir, q);
+
+    /* Only operate on TEMP destination — VAR/PARAM destinations have
+     * multi-block liveness that we can't reason about here. */
+    int32_t dest_vr = irop_get_vreg(dest);
+    if (dest_vr < 0 || TCCIR_DECODE_VREG_TYPE(dest_vr) != TCCIR_VREG_TYPE_TEMP)
+      continue;
+
+    /* Source must be a STACKOFF — we're targeting stack-address LEAs only. */
+    if (irop_get_tag(src) != IROP_TAG_STACKOFF)
+      continue;
+    if (src.is_lval) /* &<lvalue> wouldn't be a STACKOFF address-of */
+      continue;
+
+    /* Restrict to STACKOFFs with a *negative* vreg encoding — those are
+     * anonymous temp locals where the offset lives in u.imm32 and the vreg
+     * id is the only handle the stack-layout pass has on the slot.  Three
+     * other shapes share the STACKOFF tag and must be skipped:
+     *   - vreg == -1 (no vreg): plain `Addr[StackLoc[-N]]`.  lea_fold
+     *     already folds each LEA+deref pair into a direct stack access;
+     *     CSE'ing here would give the canonical LEA multiple uses and
+     *     disable lea_fold's single-use precondition.
+     *   - VAR/PARAM/TEMP positive vregs (`&V1`, `&P4`, `&T7`): the address
+     *     itself is the same regardless of sign, but a downstream
+     *     local-load CSE pass merges LOADs through the unified base vreg
+     *     without consulting their sign/btype — merging the LEAs unmasks
+     *     that bug (e.g. signed-vs-unsigned-short reads of a union slot in
+     *     pr84071 / 20180131-1.c).  Stay clear until that CSE distinguishes
+     *     load width/sign. */
+    {
+      int32_t src_vr = irop_get_vreg(src);
+      if (src_vr >= -1)
+        continue;
+    }
+
+    /* Search for an existing canonical entry with the same source. */
+    int hit = -1;
+    for (int j = 0; j < n_active; j++)
+    {
+      if (lea_cse_operand_equal(active[j].src, src))
+      {
+        hit = j;
+        break;
+      }
+    }
+
+    if (hit >= 0)
+    {
+      /* Rewrite this LEA as `ASSIGN dest <- canonical_dest`.  Subsequent
+       * copy propagation will forward the canonical dest into the deref
+       * consumers and DCE will reclaim this ASSIGN. */
+      IROperand canon = irop_make_vreg(active[hit].dest_vr, dest.btype);
+      canon.is_unsigned = dest.is_unsigned;
+      q->op = TCCIR_OP_ASSIGN;
+      tcc_ir_set_src1(ir, i, canon);
+      tcc_ir_set_src2(ir, i, IROP_NONE);
+      changes++;
+      LOG_IR_GEN("LEA CSE: i=%d redundant LEA -> ASSIGN from i=%d", i, active[hit].def_idx);
+      continue;
+    }
+
+    /* Record this LEA as the canonical definition. */
+    if (n_active < LEA_CSE_MAX_ACTIVE)
+    {
+      active[n_active].src = src;
+      active[n_active].dest_vr = dest_vr;
+      active[n_active].def_idx = i;
+      n_active++;
+    }
+  }
+
+  LOG_IR_GEN("=== LEA CSE END: %d redundant LEAs collapsed ===", changes);
+  return changes;
+#undef LEA_CSE_MAX_ACTIVE
+}
+
+/* ============================================================================
  * LEA + deref fold
  * ============================================================================
  *

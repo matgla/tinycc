@@ -169,6 +169,19 @@ def print_usage():
     print()
 
 
+def resolve_cache_key_prefix(cache, basename):
+    """Return the cache prefix matching <basename>, mirroring regression_disasm's
+    '<suite>/<basename>::<func>' layout. Falls back to the bare basename when no
+    matching prefix is present in the cache."""
+    for key in cache.data:
+        if "::" not in key:
+            continue
+        prefix = key.split("::", 1)[0]
+        if prefix == basename or prefix.endswith(f"/{basename}"):
+            return prefix
+    return basename
+
+
 def print_summary_table(func_results, gcc_opt):
     print("========================================")
     print(f"  Summary: TCC -O2 vs GCC {gcc_opt}")
@@ -294,10 +307,11 @@ def main():
 
         if not no_cache:
             cache = DisasmCache()
-            key_prefix = test_file.stem if hasattr(test_file, 'stem') else Path(test_file).stem
+            key_prefix = resolve_cache_key_prefix(cache, test_file.stem)
             report = cache.check_regressions(func_results, key_prefix)
             cache.save_pending()
             cache.print_report(report)
+            print(f"  Cache key prefix: {key_prefix}")
             print(f"  Staged cache to {cache.pending_path.name} — promote with --update-cache")
 
         for func, tcc_count, gcc_count in func_results:

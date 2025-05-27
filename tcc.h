@@ -467,11 +467,14 @@ struct SymAttr
                                      address escaped to a non-const pointer).
                                      Used by inline-eval to decide whether
                                      `*&g` can fold to the initializer. */
-      tu_no_readers : 1;          /* end-of-TU analysis confirmed no reachable
+      tu_no_readers : 1,          /* end-of-TU analysis confirmed no reachable
                                      function reads this static global.  Set
                                      by tcc_ir_tu_analyze_dead_statics; read
                                      by dead-static-store-elim during the
                                      end-of-TU late_reopt phase. */
+      param_volatile : 1;         /* original parameter declaration was volatile
+                                     before function-type normalization stripped
+                                     top-level qualifiers. */
 };
 
 /* function attributes or temporary attributes for parsing */
@@ -1607,6 +1610,7 @@ enum StrBuiltinId
   STRBI_STRPBRK,
   STRBI_STRCSPN,
   STRBI_MEMCMP,
+  STRBI_MEMCMP_EQ,
   STRBI_MEMCHR,
   STRBI_MEMMOVE,
   STRBI_BCOPY,
@@ -1877,6 +1881,8 @@ static inline int resolve_str_builtin_by_tok(int tok)
     return STRBI_STRCSPN;
   case TOK_builtin_memcmp:
     return STRBI_MEMCMP;
+  case TOK_builtin_memcmp_eq:
+    return STRBI_MEMCMP_EQ;
   case TOK_builtin_memchr:
     return STRBI_MEMCHR;
   case TOK_builtin_memmove:
@@ -1909,6 +1915,7 @@ static inline int resolve_str_builtin_id(int tok, const char *name)
              {"__tcc_strstr", STRBI_STRSTR},     {"strpbrk", STRBI_STRPBRK},
              {"__tcc_strpbrk", STRBI_STRPBRK},   {"strcspn", STRBI_STRCSPN},
              {"__tcc_strcspn", STRBI_STRCSPN},   {"memcmp", STRBI_MEMCMP},
+             {"__builtin_memcmp_eq", STRBI_MEMCMP_EQ},
              {"memchr", STRBI_MEMCHR},           {"memmove", STRBI_MEMMOVE},
              {"__tcc_memmove", STRBI_MEMMOVE},   {"bcopy", STRBI_BCOPY},
              {"__tcc_bcopy", STRBI_BCOPY},       {"mempcpy", STRBI_MEMPCPY},

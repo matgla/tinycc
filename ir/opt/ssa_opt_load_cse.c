@@ -756,8 +756,18 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState state, int b)
        * with op=STORE rather than ASSIGN/LEA); semantically it is a copy.
        *
        * Forget any tracking keyed by this dest vreg, but keep the rest of
-       * the forward state intact. */
-      if (!dest.is_lval) {
+       * the forward state intact.
+       *
+       * Gated to q->op == TCCIR_OP_STORE: STORE_INDEXED / STORE_POSTINC
+       * with a non-lval dest are real memory writes through a vreg-held
+       * base (the indexed form's dest IS the base pointer).  Those must
+       * NOT be treated as register-copy assignments — fall through to the
+       * generic invalidate-all path below so subsequent loads can't
+       * forward stale stack/global values across the indexed write.
+       * (Earlier branches already handled the cases where eff_off resolves
+       * to a specific stack slot; reaching here means the index didn't
+       * resolve, so the write could touch arbitrary memory.) */
+      if (!dest.is_lval && q->op == TCCIR_OP_STORE) {
         int32_t dvr = irop_get_vreg(dest);
         int dtype = (dvr >= 0) ? TCCIR_DECODE_VREG_TYPE(dvr) : -1;
         if (dtype == TCCIR_VREG_TYPE_VAR || dtype == TCCIR_VREG_TYPE_TEMP) {

@@ -995,6 +995,10 @@ void tcc_ir_params_process_scalar(TCCIRState *ir, Sym *sym, CType *type, TCCAbiA
 {
   int flags = 0, addr = 0;
   int variadic = (sym->f.func_type == FUNC_ELLIPSIS);
+  CType pushed_type = *type;
+
+  if (sym->a.param_volatile)
+    pushed_type.t |= VT_VOLATILE;
 
   if (loc_info->kind == TCC_ABI_LOC_REG)
   {
@@ -1020,7 +1024,7 @@ void tcc_ir_params_process_scalar(TCCIRState *ir, Sym *sym, CType *type, TCCAbiA
   int v = sym->v & ~SYM_FIELD;
   if (!v)
     v = anon_sym++;
-  sym_push(v, type, flags, addr);
+  sym_push(v, &pushed_type, flags, addr);
 }
 
 int tcc_ir_local_add(TCCIRState *ir, Sym *sym, int stack_offset)

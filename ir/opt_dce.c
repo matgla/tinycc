@@ -18,6 +18,7 @@
 #include "opt_du.h"
 #include "opt_loop_utils.h"
 #include "cfg.h"
+#include "licm.h"
 
 static int tcc_ir_callee_is_noreturn(Sym *callee)
 {
@@ -165,6 +166,129 @@ int tcc_ir_opt_dce_ex(IROptCtx *ctx)
   return tcc_ir_opt_dce(ctx->ir);
 }
 
+/* Orphan CMP elimination - NOP CMP/TEST_ZERO (and FUNCCALLVOID to flag-setting
+ * soft-float compare helpers __aeabi_cfcmple / __aeabi_cdcmple) whose flag
+ * result is not consumed by a SETIF or JUMPIF before the next flag-clobbering
+ * op or basic-block boundary.  Various folding passes can leave orphan flag
+ * setters behind when their SETIF/JUMPIF consumers get folded into constants
+ * or get NOPed by degenerate-branch elimination — the flag setter itself
+ * looks "essential" to plain DCE (it sets flags as a side effect) but is
+ * observably dead.
+ *
+ * Flag semantics on ARM (and modeled in this IR): JUMP does not clobber
+ * flags; an unconditional JUMP after a CMP propagates the flags to the
+ * target block, where they may be consumed by a SETIF.  We follow JUMPs
+ * (with a visited bitmap to bound work) but stop at JUMPIF on the safe
+ * side — it consumes our flags so the CMP is live anyway. */
+static int orphan_cmp_scan(TCCIRState *ir, int from_idx, uint8_t *visited)
+{
+  int n = ir->next_instruction_index;
+  int j = from_idx;
+  while (j < n)
+  {
+    if (visited[j / 8] & (1 << (j % 8)))
+      return 0; /* loop — conservatively LIVE */
+    visited[j / 8] |= (1 << (j % 8));
+
+    IRQuadCompact *nq = &ir->compact_instructions[j];
+    if (nq->op == TCCIR_OP_NOP)
+    {
+      j++;
+      continue;
+    }
+    /* A join point (jump_target) is reached by alternate predecessors that
+     * may not have executed our flag setter.  We still continue scanning:
+     * if no SETIF/JUMPIF consumer is found before the next flag clobber or
+     * function exit, our flag setter is observably dead.  (Finding a
+     * consumer downstream means our setter IS read on our path, regardless
+     * of what alternate predecessors did.) */
+
+    switch (nq->op)
+    {
+    case TCCIR_OP_SETIF:
+    case TCCIR_OP_JUMPIF:
+      /* Consumer of our flags - CMP is live. */
+      return 0;
+    case TCCIR_OP_JUMP:
+    {
+      /* Flags propagate across unconditional JUMPs.  Follow the target. */
+      IROperand dest = tcc_ir_op_get_dest(ir, nq);
+      int target = (int)dest.u.imm32;
+      if (target < 0)
+        return 0; /* defensive: malformed JUMP — keep CMP */
+      if (target >= n)
+        return 1; /* JUMP past end (implicit return) — no consumer */
+      j = target;
+      continue;
+    }
+    case TCCIR_OP_CMP:
+    case TCCIR_OP_TEST_ZERO:
+    case TCCIR_OP_RETURNVALUE:
+    case TCCIR_OP_RETURNVOID:
+    case TCCIR_OP_TRAP:
+    case TCCIR_OP_IJUMP:
+    case TCCIR_OP_SWITCH_TABLE:
+    case TCCIR_OP_FUNCCALLVAL:
+    case TCCIR_OP_FUNCCALLVOID:
+      /* Flag-clobbering or terminator before any consumer. */
+      return 1;
+    default:
+      break;
+    }
+    j++;
+  }
+  /* End of function with no consumer found. */
+  return 1;
+}
+
+int tcc_ir_opt_orphan_cmp_elim(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  if (n == 0)
+    return 0;
+
+  int changes = 0;
+  int bytes = (n + 7) / 8;
+  uint8_t *visited = tcc_mallocz(bytes);
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    int is_flag_cmp_call = 0;
+
+    if (q->op == TCCIR_OP_FUNCCALLVOID)
+    {
+      Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+      const char *name = callee ? get_tok_str(callee->v, NULL) : NULL;
+      if (!ir_opt_is_flag_cmp_helper_name(name))
+        continue;
+      is_flag_cmp_call = 1;
+    }
+    else if (q->op != TCCIR_OP_CMP && q->op != TCCIR_OP_TEST_ZERO)
+      continue;
+
+    if (q->is_jump_target)
+      continue;
+
+    for (int b = 0; b < bytes; b++)
+      visited[b] = 0;
+
+    if (orphan_cmp_scan(ir, i + 1, visited))
+    {
+      if (is_flag_cmp_call)
+        ir_opt_nop_call_params(ir, i);
+      q->op = TCCIR_OP_NOP;
+      changes++;
+    }
+  }
+  tcc_free(visited);
+  return changes;
+}
+
+int tcc_ir_opt_orphan_cmp_elim_ex(IROptCtx *ctx)
+{
+  return tcc_ir_opt_orphan_cmp_elim(ctx->ir);
+}
+
 /* ============================================================================
  * Useless Function Body - if no instruction in the function has an observable
  * side effect, NOP the entire body.
@@ -186,9 +310,10 @@ int tcc_ir_opt_dce_ex(IROptCtx *ctx)
  * cast-folded zeros and conditionally storing into a dead path.
  *
  * Essential ops (function has observable behavior; skip the pass):
- *   - STORE / STORE_INDEXED / STORE_POSTINC (memory write)
- *   - FUNCCALLVAL / FUNCCALLVOID (call — may have side effects)
- *   - FUNCPARAMVAL / FUNCPARAMVOID (call argument plumbing — kept with calls)
+ *   - STORE / STORE_INDEXED / STORE_POSTINC, except late-reopt direct writes
+ *     to non-volatile PARAM vregs after their caller-visible consumers died
+ *   - FUNCCALLVAL / FUNCCALLVOID unless the callee is a curated pure aeabi helper
+ *   - FUNCPARAMVAL / FUNCPARAMVOID unless it belongs to such a pure call
  *   - RETURNVALUE / TRAP / IJUMP
  *   - INLINE_ASM / ASM_INPUT / ASM_OUTPUT
  *   - CALLSEQ_BEGIN / CALLARG_REG / CALLARG_STACK / CALLSEQ_END
@@ -205,7 +330,120 @@ int tcc_ir_opt_dce_ex(IROptCtx *ctx)
  * loads from non-volatile memory, etc.  When the entire body is non-essential,
  * the function is observationally a no-op and we NOP everything.
  */
-static int ir_opt_op_is_essential(TCCIRState *ir, IRQuadCompact *q, int idx)
+static int ir_opt_pure_call_id_test(const uint8_t *pure_call_ids, int pure_call_id_bytes, int call_id)
+{
+  return call_id >= 0 && call_id / 8 < pure_call_id_bytes &&
+         (pure_call_ids[call_id / 8] & (uint8_t)(1u << (call_id & 7)));
+}
+
+static void ir_opt_pure_call_id_mark(uint8_t **pure_call_ids, int *pure_call_id_bytes, int call_id)
+{
+  if (call_id < 0)
+    return;
+
+  int needed_bytes = call_id / 8 + 1;
+  if (needed_bytes > *pure_call_id_bytes)
+  {
+    int old_bytes = *pure_call_id_bytes;
+    int new_bytes = old_bytes ? old_bytes * 2 : 32;
+    while (new_bytes < needed_bytes)
+      new_bytes *= 2;
+    *pure_call_ids = tcc_realloc(*pure_call_ids, new_bytes);
+    memset(*pure_call_ids + old_bytes, 0, new_bytes - old_bytes);
+    *pure_call_id_bytes = new_bytes;
+  }
+
+  (*pure_call_ids)[call_id / 8] |= (uint8_t)(1u << (call_id & 7));
+}
+
+static int ir_opt_callee_is_body_elidable(TCCIRState *ir, Sym *callee)
+{
+  if (!callee)
+    return 0;
+
+  const char *name = get_tok_str(callee->v, NULL);
+  if (name && tcc_ir_is_pure_aeabi(name))
+    return 1;
+
+  /* Flag-setting soft-float compares (__aeabi_cfcmple / __aeabi_cdcmple) and
+   * float negation helpers (__aeabi_fneg / __aeabi_dneg) have no observable
+   * side effects beyond their result (CPSR flags or return value), so they
+   * are elidable when the surrounding body is otherwise side-effect-free. */
+  if (name && ir_opt_is_flag_cmp_helper_name(name))
+    return 1;
+  if (name && (strcmp(name, "__aeabi_fneg") == 0 || strcmp(name, "__aeabi_dneg") == 0))
+    return 1;
+
+  return tcc_ir_get_func_purity(ir, callee) >= TCC_FUNC_PURITY_PURE;
+}
+
+static int ir_opt_param_vreg_is_volatile(int param_pos)
+{
+  int32_t param_vreg = TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_PARAM, param_pos);
+  if (tcc_state && tcc_state->ir && tcc_ir_vreg_is_valid(tcc_state->ir, param_vreg))
+  {
+    IRLiveInterval *iv = tcc_ir_vreg_live_interval(tcc_state->ir, param_vreg);
+    if (iv)
+      return iv->is_volatile != 0;
+  }
+
+  for (Sym *sym = local_stack; sym; sym = sym->prev)
+  {
+    if (sym->vreg == param_vreg)
+      return (sym->type.t & VT_VOLATILE) != 0;
+  }
+
+  if (!tcc_state || !tcc_state->cur_func_sym || !tcc_state->cur_func_sym->type.ref)
+    return 1;
+
+  Sym *param = tcc_state->cur_func_sym->type.ref->next;
+  for (int i = 0; param && i < param_pos; i++)
+    param = param->next;
+
+  if (!param)
+    return 1;
+  return (param->type.t & VT_VOLATILE) != 0;
+}
+
+static int ir_opt_vreg_sym_is_volatile(int32_t vr)
+{
+  if (tcc_state && tcc_state->ir && tcc_ir_vreg_is_valid(tcc_state->ir, vr))
+  {
+    IRLiveInterval *iv = tcc_ir_vreg_live_interval(tcc_state->ir, vr);
+    if (iv)
+      return iv->is_volatile != 0;
+  }
+
+  for (Sym *sym = local_stack; sym; sym = sym->prev)
+  {
+    if (sym->vreg == vr)
+      return (sym->type.t & VT_VOLATILE) != 0;
+  }
+  return 0;
+}
+
+static int ir_opt_direct_auto_vreg_store_is_local(IROperand op)
+{
+  int32_t vr;
+  int vt;
+
+  if (op.is_lval || op.is_sym || op.is_llocal)
+    return 0;
+
+  vr = irop_get_vreg(op);
+  if (vr < 0)
+    return 0;
+
+  vt = TCCIR_DECODE_VREG_TYPE(vr);
+  if (vt == TCCIR_VREG_TYPE_VAR)
+    return !ir_opt_vreg_sym_is_volatile(vr);
+  if (vt == TCCIR_VREG_TYPE_PARAM)
+    return !ir_opt_param_vreg_is_volatile(TCCIR_DECODE_VREG_POSITION(vr));
+  return 0;
+}
+
+static int ir_opt_op_is_essential(TCCIRState *ir, IRQuadCompact *q, int idx,
+                                  const uint8_t *pure_call_ids, int pure_call_id_bytes)
 {
   switch (q->op)
   {
@@ -222,13 +460,6 @@ static int ir_opt_op_is_essential(TCCIRState *ir, IRQuadCompact *q, int idx)
       return 1;
     return 0;
   }
-  case TCCIR_OP_STORE:
-  case TCCIR_OP_STORE_INDEXED:
-  case TCCIR_OP_STORE_POSTINC:
-  case TCCIR_OP_FUNCCALLVAL:
-  case TCCIR_OP_FUNCCALLVOID:
-  case TCCIR_OP_FUNCPARAMVAL:
-  case TCCIR_OP_FUNCPARAMVOID:
   case TCCIR_OP_RETURNVALUE:
   case TCCIR_OP_TRAP:
   case TCCIR_OP_IJUMP:
@@ -255,6 +486,37 @@ static int ir_opt_op_is_essential(TCCIRState *ir, IRQuadCompact *q, int idx)
   case TCCIR_OP_SWITCH_TABLE:
   case TCCIR_OP_SWITCH_LOAD:
     return 1;
+  case TCCIR_OP_STORE:
+  {
+    IROperand dest = tcc_ir_op_get_dest(ir, q);
+    int32_t dest_vr = irop_get_vreg(dest);
+    int dest_vt = TCCIR_DECODE_VREG_TYPE(dest_vr);
+    /* A direct write to a non-volatile parameter is not observable once the
+     * whole body is otherwise side-effect-free.  Pointer writes, volatile
+     * parameter writes, and parent-frame writes remain essential. */
+    if (tcc_state && tcc_state->ir_late_reopt_phase &&
+        !dest.is_lval && !dest.is_sym && !dest.is_llocal &&
+        dest_vt == TCCIR_VREG_TYPE_PARAM &&
+        !ir_opt_param_vreg_is_volatile(TCCIR_DECODE_VREG_POSITION(dest_vr)))
+      return 0;
+    return 1;
+  }
+  case TCCIR_OP_STORE_INDEXED:
+  case TCCIR_OP_STORE_POSTINC:
+    return 1;
+  case TCCIR_OP_FUNCCALLVAL:
+  case TCCIR_OP_FUNCCALLVOID:
+  {
+    Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+    return !ir_opt_callee_is_body_elidable(ir, callee);
+  }
+  case TCCIR_OP_FUNCPARAMVAL:
+  case TCCIR_OP_FUNCPARAMVOID:
+  {
+    IROperand src2 = tcc_ir_op_get_src2(ir, q);
+    int call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, src2));
+    return !ir_opt_pure_call_id_test(pure_call_ids, pure_call_id_bytes, call_id);
+  }
   default:
     break;
   }
@@ -336,7 +598,8 @@ static int ir_opt_vreg_has_iv_update_in_range(TCCIRState *ir, int32_t vreg, int 
 
 static int ir_opt_jumpif_uses_iv_update(TCCIRState *ir, int jif_idx, int start, int end)
 {
-  for (int i = jif_idx - 1; i >= start; i--)
+  int scan_floor = start < jif_idx ? start : 0;
+  for (int i = jif_idx - 1; i >= scan_floor; i--)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP)
@@ -364,12 +627,57 @@ static int ir_opt_jumpif_uses_iv_update(TCCIRState *ir, int jif_idx, int start, 
   return 0;
 }
 
+static int ir_opt_range_has_iv_update(TCCIRState *ir, int start, int end)
+{
+  for (int i = start; i <= end; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
+      continue;
+    if (q->op != TCCIR_OP_ADD && q->op != TCCIR_OP_SUB)
+      continue;
+    if (!irop_config[q->op].has_src2 || !irop_is_immediate(tcc_ir_op_get_src2(ir, q)))
+      continue;
+
+    IROperand dest = tcc_ir_op_get_dest(ir, q);
+    if (dest.is_lval)
+      continue;
+
+    int32_t dest_vr = irop_get_vreg(dest);
+    int dest_vt = TCCIR_DECODE_VREG_TYPE(dest_vr);
+    if (dest_vt != TCCIR_VREG_TYPE_TEMP && dest_vt != TCCIR_VREG_TYPE_VAR)
+      continue;
+
+    int32_t src_vr = irop_get_vreg(tcc_ir_op_get_src1(ir, q));
+    if (ir_opt_vreg_has_def_in_range(ir, src_vr, start, end))
+      return 1;
+  }
+  return 0;
+}
+
+static int ir_opt_successor_enters_range(TCCIRState *ir, int succ, int start, int end)
+{
+  int n = ir->next_instruction_index;
+  if (succ >= start && succ <= end)
+    return 1;
+  while (succ >= 0 && succ < n && ir->compact_instructions[succ].op == TCCIR_OP_NOP)
+    succ++;
+  if (succ >= start && succ <= end)
+    return 1;
+  if (succ >= 0 && succ < n && ir->compact_instructions[succ].op == TCCIR_OP_JUMP)
+  {
+    IROperand dest = tcc_ir_op_get_dest(ir, &ir->compact_instructions[succ]);
+    int target = (int)irop_get_imm64_ex(ir, dest);
+    return target >= start && target <= end;
+  }
+  return 0;
+}
+
 static int ir_opt_backward_jump_has_cond_exit(TCCIRState *ir, int idx)
 {
   IRQuadCompact *q = &ir->compact_instructions[idx];
   IROperand dest = tcc_ir_op_get_dest(ir, q);
   int target = (int)irop_get_imm64_ex(ir, dest);
-  int n = ir->next_instruction_index;
 
   if (target < 0 || target > idx)
     return 0;
@@ -380,12 +688,19 @@ static int ir_opt_backward_jump_has_cond_exit(TCCIRState *ir, int idx)
    * jump), and loops whose only exit depends on an unchanged parameter/load,
    * remain essential. */
   if (q->op == TCCIR_OP_JUMPIF)
-    return ir_opt_jumpif_uses_iv_update(ir, idx, target, idx);
+  {
+    if (ir_opt_jumpif_uses_iv_update(ir, idx, target, idx))
+      return 1;
+    /* Secondary conditional back-edges can be driven by pure work inside
+     * an otherwise finite IV loop.  Once the whole function is proven
+     * non-observable, those edges should not keep the body alive. */
+    return ir_opt_range_has_iv_update(ir, target, idx);
+  }
 
   if (q->op != TCCIR_OP_JUMP)
     return 0;
 
-  for (int i = target; i <= idx; i++)
+  for (int i = 0; i <= idx; i++)
   {
     IRQuadCompact *iq = &ir->compact_instructions[i];
     if (iq->op != TCCIR_OP_JUMPIF)
@@ -393,21 +708,14 @@ static int ir_opt_backward_jump_has_cond_exit(TCCIRState *ir, int idx)
 
     IROperand idest = tcc_ir_op_get_dest(ir, iq);
     int itarget = (int)irop_get_imm64_ex(ir, idest);
-    if ((itarget < target || itarget > idx) &&
+    int target_enters = ir_opt_successor_enters_range(ir, itarget, target, idx);
+    int fallthrough_enters = ir_opt_successor_enters_range(ir, i + 1, target, idx);
+    if (!target_enters && fallthrough_enters &&
         ir_opt_jumpif_uses_iv_update(ir, i, target, idx))
       return 1;
-    if ((i + 1 < target || i + 1 > idx) &&
+    if (target_enters && !fallthrough_enters &&
         ir_opt_jumpif_uses_iv_update(ir, i, target, idx))
       return 1;
-    if (itarget >= 0 && itarget < n && ir->compact_instructions[itarget].op == TCCIR_OP_NOP)
-    {
-      int t = itarget;
-      while (t < n && ir->compact_instructions[t].op == TCCIR_OP_NOP)
-        t++;
-      if ((t < target || t > idx) &&
-          ir_opt_jumpif_uses_iv_update(ir, i, target, idx))
-        return 1;
-    }
   }
 
   return 0;
@@ -419,19 +727,42 @@ int tcc_ir_opt_useless_function_body(TCCIRState *ir)
   if (n == 0)
     return 0;
 
+  uint8_t *pure_call_ids = NULL;
+  int pure_call_id_bytes = 0;
+
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_FUNCCALLVAL && q->op != TCCIR_OP_FUNCCALLVOID)
+      continue;
+
+    Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+    if (!ir_opt_callee_is_body_elidable(ir, callee))
+      continue;
+
+    IROperand src2 = tcc_ir_op_get_src2(ir, q);
+    int call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, src2));
+    ir_opt_pure_call_id_mark(&pure_call_ids, &pure_call_id_bytes, call_id);
+  }
+
   for (int i = 0; i < n; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP)
       continue;
-    if (ir_opt_op_is_essential(ir, q, i))
+    if (ir_opt_op_is_essential(ir, q, i, pure_call_ids, pure_call_id_bytes))
     {
       if ((q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF) &&
           ir_opt_backward_jump_has_cond_exit(ir, i))
         continue;
+      if (pure_call_ids)
+        tcc_free(pure_call_ids);
       return 0;
     }
   }
+
+  if (pure_call_ids)
+    tcc_free(pure_call_ids);
 
   int changes = 0;
   for (int i = 0; i < n; i++)
@@ -455,6 +786,13 @@ int tcc_ir_opt_useless_function_body(TCCIRState *ir)
     memset(ir->ls.live_regs_by_instruction, 0,
            ir->ls.live_regs_by_instruction_size * sizeof(ir->ls.live_regs_by_instruction[0]));
   ir->leaffunc = 1;
+  for (int p = 0; p < ir->next_parameter; p++)
+  {
+    IRLiveInterval *iv = &ir->parameters_live_intervals[p];
+    iv->allocation.r0 = PREG_NONE;
+    iv->allocation.r1 = PREG_NONE;
+    iv->allocation.offset = 0;
+  }
   /* The body had every essential-op already NOPed away (e.g. dead_vla_struct
    * removed the VLA dance for a never-read local).  Drop the frame-pointer
    * forcing so the prologue collapses to a single `bx lr` rather than the
@@ -1535,7 +1873,16 @@ int tcc_ir_opt_dse(TCCIRState *ir)
      * pointer arg; the sret target may still be live.  Those cases are
      * the dedicated dead_sret_call pass's job. */
     const char *name = get_tok_str(callee->v, NULL);
-    if (!name || !tcc_ir_is_pure_aeabi(name))
+    /* Pure aeabi soft-float/long-int helpers + the curated set of
+     * side-effect-free libc helpers (isnan, etc.) — see
+     * ir_opt_is_pure_helper_name.  Both classes return by value (in regs)
+     * with no observable side effects, so an unused-result FUNCCALLVOID
+     * is safely dead.  The read-only __tcc_str* helpers (strcmp, strlen,
+     * ...) only read memory through their pointer args, so an unused-result
+     * call is likewise dead — safe here because we are removing the call
+     * entirely, not value-numbering it against another call. */
+    if (!name || (!tcc_ir_is_pure_aeabi(name) && !ir_opt_is_pure_helper_name(name) &&
+                  !ir_opt_is_readonly_str_helper_name(name)))
       continue;
     LOG_IR_GEN("DCE PURE-CALL: nop FUNCCALLVOID at i=%d (callee=%s)", i,
                get_tok_str(callee->v, NULL) ? get_tok_str(callee->v, NULL) : "?");
@@ -3372,6 +3719,328 @@ int tcc_ir_opt_dead_addrvar_elim(TCCIRState *ir)
   return changes;
 }
 
+/* Trailing-dead-store elimination for addr-taken VARs.
+ *
+ * `dead_addrvar_elim` only fires when a VAR has *zero* reads anywhere.  This
+ * misses the common pattern of a final write that happens after the last
+ * read — e.g. `*p = n` at function tail where `*p` is never re-read.
+ *
+ * For each addr-taken VAR V, computes last_read_pos[V] = max position of a
+ * read of V (direct VAR-src use, or LOAD/CMP/... via a TEMP T where T = &V).
+ * Then NOPs any write to V (direct ASSIGN/STORE V=x, or STORE through a LEA
+ * TEMP T where lea_map[T] = V) at position > last_read_pos[V].
+ *
+ * Conservative function-wide bails:
+ *   - any CALL / PARAM: callee may dereference a leaked &V.
+ *   - any IJUMP / SETJMP / LONGJMP / NL_SETJMP / NL_LONGJMP / INLINE_ASM /
+ *     SET_CHAIN / INIT_CHAIN_SLOT / SWITCH_TABLE.
+ *   - any back-edge JUMP/JUMPIF (target <= origin): a write past last_read
+ *     could be re-executed via a loop before V is re-read.
+ *
+ * Per-VAR bails:
+ *   - LEA temp escapes via STORE-as-value / VAR-dest / etc. (var_escaped).
+ */
+int tcc_ir_opt_dead_trailing_addrvar_store_elim(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  if (n == 0)
+    return 0;
+
+  for (int i = 0; i < n; i++)
+  {
+    int op = ir->compact_instructions[i].op;
+    if (op == TCCIR_OP_FUNCCALLVAL || op == TCCIR_OP_FUNCCALLVOID ||
+        op == TCCIR_OP_FUNCPARAMVAL || op == TCCIR_OP_FUNCPARAMVOID ||
+        op == TCCIR_OP_IJUMP || op == TCCIR_OP_SETJMP || op == TCCIR_OP_LONGJMP ||
+        op == TCCIR_OP_NL_SETJMP || op == TCCIR_OP_NL_LONGJMP ||
+        op == TCCIR_OP_INLINE_ASM || op == TCCIR_OP_SET_CHAIN ||
+        op == TCCIR_OP_INIT_CHAIN_SLOT || op == TCCIR_OP_SWITCH_TABLE)
+      return 0;
+  }
+
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF)
+      continue;
+    IROperand dest = tcc_ir_op_get_dest(ir, q);
+    int target = (int)irop_get_imm64_ex(ir, dest);
+    if (target <= i)
+      return 0;
+  }
+
+  int max_var = 0, max_tmp = 0;
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    IROperand ops[3];
+    ops[0] = tcc_ir_op_get_dest(ir, q);
+    ops[1] = tcc_ir_op_get_src1(ir, q);
+    ops[2] = tcc_ir_op_get_src2(ir, q);
+    for (int k = 0; k < 3; k++)
+    {
+      int32_t vr = irop_get_vreg(ops[k]);
+      if (vr < 0)
+        continue;
+      int t = TCCIR_DECODE_VREG_TYPE(vr);
+      int p = TCCIR_DECODE_VREG_POSITION(vr);
+      if (t == TCCIR_VREG_TYPE_VAR && p > max_var) max_var = p;
+      else if (t == TCCIR_VREG_TYPE_TEMP && p > max_tmp) max_tmp = p;
+    }
+  }
+  if (max_var == 0)
+    return 0;
+
+  int *lea_map = tcc_malloc(sizeof(int) * (max_tmp + 1));
+  for (int i = 0; i <= max_tmp; i++) lea_map[i] = -1;
+  int *var_lea = tcc_malloc(sizeof(int) * (max_var + 1));
+  for (int i = 0; i <= max_var; i++) var_lea[i] = -1;
+  uint8_t *var_escaped = tcc_mallocz((max_var + 8) / 8);
+  int *var_last_read = tcc_malloc(sizeof(int) * (max_var + 1));
+  for (int i = 0; i <= max_var; i++) var_last_read[i] = -1;
+
+  /* Pass 1: build lea_map (T = &V → lea_map[T] = V) and var_lea (V' = &V →
+   * var_lea[V'] = V).  Also propagate through TEMP↔VAR copies (STORE V=T,
+   * ASSIGN/LOAD T=V). */
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+
+    if (q->op == TCCIR_OP_LEA)
+    {
+      IROperand src1 = tcc_ir_op_get_src1(ir, q);
+      IROperand dest = tcc_ir_op_get_dest(ir, q);
+      int32_t s_vr = irop_get_vreg(src1);
+      int32_t d_vr = irop_get_vreg(dest);
+      if (s_vr >= 0 && TCCIR_DECODE_VREG_TYPE(s_vr) == TCCIR_VREG_TYPE_VAR && d_vr >= 0)
+      {
+        int v = TCCIR_DECODE_VREG_POSITION(s_vr);
+        if (v <= max_var)
+        {
+          if (TCCIR_DECODE_VREG_TYPE(d_vr) == TCCIR_VREG_TYPE_TEMP)
+          {
+            int t = TCCIR_DECODE_VREG_POSITION(d_vr);
+            if (t <= max_tmp)
+            {
+              if (lea_map[t] >= 0 && lea_map[t] != v)
+                var_escaped[v / 8] |= (1 << (v % 8));
+              lea_map[t] = v;
+            }
+          }
+          else if (TCCIR_DECODE_VREG_TYPE(d_vr) == TCCIR_VREG_TYPE_VAR)
+          {
+            int d_pos = TCCIR_DECODE_VREG_POSITION(d_vr);
+            if (d_pos <= max_var)
+            {
+              if (var_lea[d_pos] >= 0 && var_lea[d_pos] != v)
+                var_escaped[v / 8] |= (1 << (v % 8));
+              var_lea[d_pos] = v;
+            }
+          }
+        }
+      }
+      continue;
+    }
+
+    /* STORE V = T (TEMP src holding LEA) → propagate lea_map → var_lea.
+     * (mirrors dead_addrvar_elim's STORE V=T-from-LEA-result propagation;
+     * is_lval flags are intentionally not checked — see same pass for
+     * rationale: the ASSIGN/STORE/LOAD ops use is_lval to indicate fetch
+     * semantics, not pointer/value distinction.) */
+    if (q->op == TCCIR_OP_STORE)
+    {
+      IROperand dest = tcc_ir_op_get_dest(ir, q);
+      IROperand src1 = tcc_ir_op_get_src1(ir, q);
+      int32_t d_vr = irop_get_vreg(dest);
+      int32_t s_vr = irop_get_vreg(src1);
+      if (d_vr >= 0 && TCCIR_DECODE_VREG_TYPE(d_vr) == TCCIR_VREG_TYPE_VAR &&
+          s_vr >= 0 && TCCIR_DECODE_VREG_TYPE(s_vr) == TCCIR_VREG_TYPE_TEMP)
+      {
+        int d_pos = TCCIR_DECODE_VREG_POSITION(d_vr);
+        int s_tmp = TCCIR_DECODE_VREG_POSITION(s_vr);
+        if (d_pos <= max_var && s_tmp <= max_tmp && lea_map[s_tmp] >= 0)
+        {
+          if (var_lea[d_pos] >= 0 && var_lea[d_pos] != lea_map[s_tmp])
+            var_escaped[lea_map[s_tmp] / 8] |= (1 << (lea_map[s_tmp] % 8));
+          var_lea[d_pos] = lea_map[s_tmp];
+        }
+      }
+    }
+
+    /* ASSIGN/LOAD T = V (VAR src holding LEA) → propagate var_lea → lea_map. */
+    if (q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_LOAD)
+    {
+      IROperand dest = tcc_ir_op_get_dest(ir, q);
+      IROperand src1 = tcc_ir_op_get_src1(ir, q);
+      int32_t d_vr = irop_get_vreg(dest);
+      int32_t s_vr = irop_get_vreg(src1);
+      if (d_vr >= 0 && TCCIR_DECODE_VREG_TYPE(d_vr) == TCCIR_VREG_TYPE_TEMP &&
+          s_vr >= 0 && TCCIR_DECODE_VREG_TYPE(s_vr) == TCCIR_VREG_TYPE_VAR)
+      {
+        int d_tmp = TCCIR_DECODE_VREG_POSITION(d_vr);
+        int s_pos = TCCIR_DECODE_VREG_POSITION(s_vr);
+        if (d_tmp <= max_tmp && s_pos <= max_var && var_lea[s_pos] >= 0)
+        {
+          if (lea_map[d_tmp] >= 0 && lea_map[d_tmp] != var_lea[s_pos])
+            var_escaped[var_lea[s_pos] / 8] |= (1 << (var_lea[s_pos] % 8));
+          lea_map[d_tmp] = var_lea[s_pos];
+        }
+      }
+    }
+  }
+
+  /* Pass 2: scan uses of LEA TEMPs to detect non-tracked escapes.
+   * Allowed uses of a TEMP T with lea_map[T] = V:
+   *   - STORE/STORE_INDEXED/STORE_POSTINC dest = T-deref  (write to V)
+   *   - LOAD src1 = T-deref                                (read of V)
+   *   - CMP/TEST_ZERO src1/src2 with T or T-deref          (read of V)
+   *   - ASSIGN-into-TEMP/LEA-into-TEMP propagation         (handled later)
+   * Anything else (STORE src1 = T as value, ASSIGN-into-VAR src1 = T, etc.)
+   * is an escape. */
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+
+    /* STORE: src1 = T (non-lval) where T is a LEA temp → escape (storing
+     * the pointer value). */
+    if ((q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
+         q->op == TCCIR_OP_STORE_POSTINC) && irop_config[q->op].has_src1)
+    {
+      IROperand src1 = tcc_ir_op_get_src1(ir, q);
+      if (!src1.is_lval)
+      {
+        int32_t vr = irop_get_vreg(src1);
+        if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP)
+        {
+          int t = TCCIR_DECODE_VREG_POSITION(vr);
+          if (t <= max_tmp && lea_map[t] >= 0)
+            var_escaped[lea_map[t] / 8] |= (1 << (lea_map[t] % 8));
+        }
+      }
+    }
+    /* RETURNVALUE src1 = T → escape (returning pointer to local) */
+    if (q->op == TCCIR_OP_RETURNVALUE)
+    {
+      IROperand src1 = tcc_ir_op_get_src1(ir, q);
+      int32_t vr = irop_get_vreg(src1);
+      if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP)
+      {
+        int t = TCCIR_DECODE_VREG_POSITION(vr);
+        if (t <= max_tmp && lea_map[t] >= 0)
+          var_escaped[lea_map[t] / 8] |= (1 << (lea_map[t] % 8));
+      }
+    }
+  }
+
+  /* Pass 3: record last_read[V].  Direct VAR src reads, and LOADs/CMPs
+   * via a known LEA TEMP, both count. */
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+
+    for (int k = 0; k < 2; k++)
+    {
+      int has = (k == 0) ? irop_config[q->op].has_src1 : irop_config[q->op].has_src2;
+      if (!has)
+        continue;
+      IROperand s = (k == 0) ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_src2(ir, q);
+      int32_t vr = irop_get_vreg(s);
+      if (vr < 0)
+        continue;
+      int vt = TCCIR_DECODE_VREG_TYPE(vr);
+      int vp = TCCIR_DECODE_VREG_POSITION(vr);
+      if (vt == TCCIR_VREG_TYPE_VAR && vp <= max_var)
+      {
+        /* Direct VAR read. Even STORE src1 of `STORE dest <- V` reads V. */
+        if (i > var_last_read[vp])
+          var_last_read[vp] = i;
+      }
+      else if (vt == TCCIR_VREG_TYPE_TEMP && vp <= max_tmp && lea_map[vp] >= 0 && s.is_lval)
+      {
+        /* lval deref of LEA TEMP → read of V's memory. */
+        int v = lea_map[vp];
+        if (v <= max_var && i > var_last_read[v])
+          var_last_read[v] = i;
+      }
+    }
+  }
+
+  /* Pass 4: NOP writes to V at position > last_read[V].
+   * Two forms:
+   *   - direct write: dest = V (non-lval), op pure (ASSIGN, etc.)
+   *   - STORE dest = T-deref where T is a LEA TEMP, lea_map[T] = V */
+  int changes = 0;
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+
+    int written_var = -1;
+    if (irop_config[q->op].has_dest)
+    {
+      IROperand dest = tcc_ir_op_get_dest(ir, q);
+      int32_t vr = irop_get_vreg(dest);
+      if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR && !dest.is_lval)
+      {
+        /* Direct write. Conservative: only ASSIGN/STORE shapes — skip ops
+         * with possible side effects. */
+        if (q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_LEA || q->op == TCCIR_OP_STORE ||
+            q->op == TCCIR_OP_STORE_INDEXED || q->op == TCCIR_OP_LOAD || q->op == TCCIR_OP_ADD ||
+            q->op == TCCIR_OP_SUB || q->op == TCCIR_OP_AND || q->op == TCCIR_OP_OR ||
+            q->op == TCCIR_OP_XOR || q->op == TCCIR_OP_MUL || q->op == TCCIR_OP_SHL ||
+            q->op == TCCIR_OP_SHR || q->op == TCCIR_OP_SAR || q->op == TCCIR_OP_ZEXT)
+          written_var = TCCIR_DECODE_VREG_POSITION(vr);
+      }
+      else if ((q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
+                q->op == TCCIR_OP_STORE_POSTINC) &&
+               vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP)
+      {
+        /* STORE always has dest.is_lval=1.  STORE_INDEXED/POSTINC may have
+         * is_lval cleared by disp_fusion — the op itself implies a memory
+         * write so treat the dest as a write address regardless. */
+        int t = TCCIR_DECODE_VREG_POSITION(vr);
+        if (t <= max_tmp && lea_map[t] >= 0)
+          written_var = lea_map[t];
+      }
+    }
+
+    if (written_var < 0 || written_var > max_var)
+      continue;
+    if (var_escaped[written_var / 8] & (1 << (written_var % 8)))
+      continue;
+    int last_read = var_last_read[written_var];
+    if (last_read < 0)
+      continue; /* never read — dead_addrvar handles full elimination */
+    if (i <= last_read)
+      continue;
+
+    LOG_IR_GEN("=== DEAD TRAILING ADDRVAR STORE: NOP i=%d (V=%d, last_read=%d) ===", i,
+               written_var, last_read);
+    q->op = TCCIR_OP_NOP;
+    changes++;
+  }
+
+  tcc_free(var_last_read);
+  tcc_free(var_escaped);
+  tcc_free(var_lea);
+  tcc_free(lea_map);
+  return changes;
+}
+
+int tcc_ir_opt_dead_trailing_addrvar_store_elim_ex(IROptCtx *ctx)
+{
+  return tcc_ir_opt_dead_trailing_addrvar_store_elim(ctx->ir);
+}
+
 /* Redundant VAR ASSIGN elimination.
  * Forward scan within basic blocks: if a VAR is assigned and then assigned
  * again without being read in between, the first assign is dead → NOP it.
@@ -4521,9 +5190,18 @@ int tcc_ir_opt_ub_only_body_elide(TCCIRState *ir)
 
 #define UB_ELIDE_MAX_VAR_POS 1024
 #define UB_ELIDE_MAX_TEMPS 8192
+#define UB_ELIDE_MAX_STACK_OFFS 256
   uint8_t var_written[(UB_ELIDE_MAX_VAR_POS + 7) / 8] = {0};
   uint8_t var_addr_taken[(UB_ELIDE_MAX_VAR_POS + 7) / 8] = {0};
   uint8_t temp_tainted[(UB_ELIDE_MAX_TEMPS + 7) / 8] = {0};
+  /* Bare stack slots (STACKOFF with vreg=-1, is_local) that are either
+   * directly written (dest with is_lval) or have their address taken
+   * (Addr[StackLoc[X]], is_lval=0).  Reads of any slot NOT in this set yield
+   * uninitialised values — bumping any TEMP defined from such a read into the
+   * tainted set so STOREs through it are recognised as UB. */
+  int32_t stack_blocked_offs[UB_ELIDE_MAX_STACK_OFFS];
+  int stack_blocked_count = 0;
+  int stack_blocked_overflow = 0;
 
   /* Inventory VAR writes and address-takes (same logic as uninit_local_ub). */
   for (int i = 0; i < n; i++)
@@ -4551,6 +5229,36 @@ int tcc_ir_opt_ub_only_body_elide(TCCIRState *ir)
         if (!irop_config[q->op].has_src2)
           continue;
         op = tcc_ir_op_get_src2(ir, q);
+      }
+      /* Stack-slot blocking: a bare STACKOFF operand (vreg=-1, is_local) is
+       * either a direct memory location or an address-of.  Either way, if
+       * the slot is touched in any way other than a pure read, treat its
+       * contents as potentially initialised. */
+      if (!stack_blocked_overflow && irop_get_tag(op) == IROP_TAG_STACKOFF && op.is_local && irop_get_vreg(op) == -1)
+      {
+        int block = 0;
+        if (!op.is_lval)
+          block = 1; /* Addr[StackLoc[X]] — pointer could be used to write */
+        else if (k == 0)
+          block = 1; /* dest with is_lval=1 — direct write to slot */
+        if (block)
+        {
+          int32_t off = irop_get_stack_offset(op);
+          int found = 0;
+          for (int s = 0; s < stack_blocked_count; s++)
+            if (stack_blocked_offs[s] == off)
+            {
+              found = 1;
+              break;
+            }
+          if (!found)
+          {
+            if (stack_blocked_count >= UB_ELIDE_MAX_STACK_OFFS)
+              stack_blocked_overflow = 1;
+            else
+              stack_blocked_offs[stack_blocked_count++] = off;
+          }
+        }
       }
       int32_t vr = irop_get_vreg(op);
       if (vr < 0)
@@ -4592,7 +5300,8 @@ int tcc_ir_opt_ub_only_body_elide(TCCIRState *ir)
     }
   }
 
-  /* Helper: classify a source operand as "tainted by reading uninit VAR". */
+  /* Helper: classify a source operand as "tainted by reading uninit VAR or
+   * uninit stack slot". */
 #define SRC_IS_UNINIT_READ(sop) ({                                                                                     \
     int _t = 0;                                                                                                        \
     int32_t _vr = irop_get_vreg(sop);                                                                                  \
@@ -4602,6 +5311,21 @@ int tcc_ir_opt_ub_only_body_elide(TCCIRState *ir)
       if (_p >= 0 && _p < UB_ELIDE_MAX_VAR_POS &&                                                                      \
           !(var_written[_p >> 3] & (uint8_t)(1u << (_p & 7))) &&                                                       \
           !(var_addr_taken[_p >> 3] & (uint8_t)(1u << (_p & 7))))                                                      \
+        _t = 1;                                                                                                        \
+    }                                                                                                                  \
+    /* Bare stack-slot read (StackLoc[X] as a value source, vreg=-1). */                                               \
+    if (!_t && !stack_blocked_overflow && irop_get_tag(sop) == IROP_TAG_STACKOFF &&                                    \
+        (sop).is_local && (sop).is_lval && irop_get_vreg(sop) == -1)                                                   \
+    {                                                                                                                  \
+      int32_t _off = irop_get_stack_offset(sop);                                                                       \
+      int _blocked = 0;                                                                                                \
+      for (int _s = 0; _s < stack_blocked_count; _s++)                                                                 \
+        if (stack_blocked_offs[_s] == _off)                                                                            \
+        {                                                                                                              \
+          _blocked = 1;                                                                                                \
+          break;                                                                                                       \
+        }                                                                                                              \
+      if (!_blocked)                                                                                                   \
         _t = 1;                                                                                                        \
     }                                                                                                                  \
     _t;                                                                                                                \
@@ -4709,6 +5433,7 @@ int tcc_ir_opt_ub_only_body_elide(TCCIRState *ir)
 #undef TEMP_IS_TAINTED
 #undef UB_ELIDE_MAX_VAR_POS
 #undef UB_ELIDE_MAX_TEMPS
+#undef UB_ELIDE_MAX_STACK_OFFS
 
   LOG_IR_GEN("UB-ELIDE: collapsing function body to empty "
              "(every STORE goes through uninit-pointer address — whole-function UB)");
@@ -4756,6 +5481,10 @@ int tcc_ir_opt_ub_only_body_elide_ex(IROptCtx *ctx) { return tcc_ir_opt_ub_only_
  *     only side-effect CPSR, which dies on return alongside the body)
  *   - calls to memmove/memcpy/memset family iff the destination arg
  *     (FUNCPARAMVAL/FUNCPARAMVOID param_idx 0) is also a local-pointer TEMP
+ *   - calls to __tcc_va_arg / __tcc_va_start iff the va_list arg (param 0)
+ *     is a local-pointer TEMP — the helper only mutates *ap_ptr, which on
+ *     ARM is a local char* whose state dies with the frame.  Closes the
+ *     gcc.c-torture compile/20001123-1 gap (15 → 1)
  *   - everything else useless_function_body allows
  *
  * What we bail on (same conservative gating as ub_only_body_elide plus the
@@ -4771,6 +5500,7 @@ int tcc_ir_opt_local_only_body_elide(TCCIRState *ir)
     return 0;
   if (!tcc_state || tcc_state->optimize < 2)
     return 0;
+
 
   /* Static-chain functions are off-limits in both directions:
    *   - has_static_chain=1: this is a nested function.  Its `StackLoc[N]`
@@ -4795,6 +5525,10 @@ int tcc_ir_opt_local_only_body_elide(TCCIRState *ir)
   int memmove_call_ids[LOCAL_ONLY_MAX_MEMMOVE_CALLS];
   int n_memmove_calls = 0;
   int has_observable_op = 0;
+  IROperand return_src = IROP_NONE;
+  int return_count = 0;
+  int return_void_count = 0;
+  int first_return_idx = -1;
 
   for (int i = 0; i < n; i++)
   {
@@ -4806,7 +5540,6 @@ int tcc_ir_opt_local_only_body_elide(TCCIRState *ir)
     {
     /* Hard bails: same set as ub_only_body_elide; these can publish state
      * or do non-local control flow we cannot reason about. */
-    case TCCIR_OP_RETURNVALUE:
     case TCCIR_OP_INLINE_ASM:
     case TCCIR_OP_ASM_INPUT:
     case TCCIR_OP_ASM_OUTPUT:
@@ -4829,6 +5562,28 @@ int tcc_ir_opt_local_only_body_elide(TCCIRState *ir)
     case TCCIR_OP_SWITCH_TABLE:
     case TCCIR_OP_SWITCH_LOAD:
       return 0;
+    case TCCIR_OP_RETURNVALUE:
+    {
+      IROperand s = tcc_ir_op_get_src1(ir, q);
+      int tag = irop_get_tag(s);
+      if (tag != IROP_TAG_IMM32 && tag != IROP_TAG_I64)
+        return 0;
+      if (return_count == 0)
+      {
+        return_src = s;
+        first_return_idx = i;
+      }
+      else if (tag != irop_get_tag(return_src) || s.btype != return_src.btype ||
+               irop_get_imm64_ex(ir, s) != irop_get_imm64_ex(ir, return_src))
+      {
+        return 0;
+      }
+      return_count++;
+      break;
+    }
+    case TCCIR_OP_RETURNVOID:
+      return_void_count++;
+      break;
     case TCCIR_OP_FUNCCALLVAL:
     case TCCIR_OP_FUNCCALLVOID:
     {
@@ -4850,16 +5605,21 @@ int tcc_ir_opt_local_only_body_elide(TCCIRState *ir)
        * gcc.c-torture compile/pr45969-1.c). */
       if (ir_opt_is_flag_cmp_helper_name(name))
         break;
-      /* memmove/memcpy/memset family: writes through their first arg only.
-       * If that destination points into our own stack frame, the writes
-       * are unobservable; we'll verify later. */
+      /* memmove/memcpy/memset family, and the va_list helpers: each writes
+       * through its first arg only.  If that destination points into our
+       * own stack frame, the writes are unobservable; we'll verify later.
+       * __tcc_va_arg also reads from the caller's va arg area, but that's
+       * caller-supplied state we cannot affect — the only write is to
+       * *ap_ptr (the local va_list). */
       int is_memlike = strcmp(name, "__aeabi_memmove4") == 0 || strcmp(name, "__aeabi_memmove8") == 0 ||
                        strcmp(name, "__aeabi_memmove") == 0 || strcmp(name, "__aeabi_memcpy4") == 0 ||
                        strcmp(name, "__aeabi_memcpy8") == 0 || strcmp(name, "__aeabi_memcpy") == 0 ||
                        strcmp(name, "__aeabi_memset") == 0 || strcmp(name, "__aeabi_memset4") == 0 ||
                        strcmp(name, "__aeabi_memset8") == 0 || strcmp(name, "__aeabi_memclr") == 0 ||
                        strcmp(name, "__aeabi_memclr4") == 0 || strcmp(name, "__aeabi_memclr8") == 0 ||
-                       strcmp(name, "memmove") == 0 || strcmp(name, "memcpy") == 0 || strcmp(name, "memset") == 0;
+                       strcmp(name, "memmove") == 0 || strcmp(name, "memcpy") == 0 ||
+                       strcmp(name, "memset") == 0 || strcmp(name, "__tcc_va_arg") == 0 ||
+                       strcmp(name, "__tcc_va_start") == 0;
       if (!is_memlike)
         return 0;
       if (n_memmove_calls >= LOCAL_ONLY_MAX_MEMMOVE_CALLS)
@@ -4913,6 +5673,8 @@ int tcc_ir_opt_local_only_body_elide(TCCIRState *ir)
    * runs after us — leave it alone to avoid double-counting. */
   if (!has_observable_op)
     return 0;
+  if (return_count > 0 && return_void_count > 0)
+    return 0;
 
   /* Pass 1: forward fixpoint marking TEMPs that hold a local-stack-frame
    * pointer.  Seed from LEA of any stack-local; propagate through ASSIGN,
@@ -4931,6 +5693,9 @@ int tcc_ir_opt_local_only_body_elide(TCCIRState *ir)
   ({                                                                                                                   \
     int _r = 0;                                                                                                        \
     int32_t _vr = irop_get_vreg(sop);                                                                                  \
+    int _tag = irop_get_tag(sop);                                                                                      \
+    if (_tag == IROP_TAG_STACKOFF && (sop).is_local && !(sop).is_lval && !(sop).is_llocal && !(sop).is_param)          \
+      _r = 1;                                                                                                          \
     if (_vr >= 0 && TCCIR_DECODE_VREG_TYPE(_vr) == TCCIR_VREG_TYPE_TEMP)                                               \
     {                                                                                                                  \
       int _p = TCCIR_DECODE_VREG_POSITION(_vr);                                                                        \
@@ -4969,11 +5734,11 @@ int tcc_ir_opt_local_only_body_elide(TCCIRState *ir)
       {
         /* Address of a stack-local (anonymous offset or local VAR) — its
          * lifetime is bounded by the function, so the resulting pointer
-         * is local-only.  Reject parameter-area addresses (is_param):
-         * those are caller-owned, and writes there can be observed by
-         * the caller. */
+         * is local-only.  Non-volatile parameters are automatic objects too:
+         * taking &P0 materializes the callee's parameter slot, not caller
+         * state. */
         IROperand s = tcc_ir_op_get_src1(ir, q);
-        if (s.is_param)
+        if (s.is_llocal)
           break;
         int tag = irop_get_tag(s);
         if (tag == IROP_TAG_STACKOFF && s.is_local)
@@ -4983,11 +5748,19 @@ int tcc_ir_opt_local_only_body_elide(TCCIRState *ir)
           int32_t svr = irop_get_vreg(s);
           if (svr >= 0 && TCCIR_DECODE_VREG_TYPE(svr) == TCCIR_VREG_TYPE_VAR && s.is_local)
             set = 1;
+          else if (svr >= 0 && TCCIR_DECODE_VREG_TYPE(svr) == TCCIR_VREG_TYPE_PARAM &&
+                   !ir_opt_param_vreg_is_volatile(TCCIR_DECODE_VREG_POSITION(svr)))
+            set = 1;
         }
         break;
       }
       case TCCIR_OP_ASSIGN:
+      case TCCIR_OP_STORE:
       {
+        /* ASSIGN, or — after var-to-tmp promotion — a STORE with non-lval
+         * TEMP dest, which is semantically a TEMP definition (the `is_lval`
+         * check above already filtered out STORE-through-pointer).  Propagate
+         * local-pointer status from the source. */
         IROperand s = tcc_ir_op_get_src1(ir, q);
         if (IS_LOCAL_PTR_OP(s))
           set = 1;
@@ -5003,6 +5776,17 @@ int tcc_ir_opt_local_only_body_elide(TCCIRState *ir)
         IROperand s1 = tcc_ir_op_get_src1(ir, q);
         IROperand s2 = tcc_ir_op_get_src2(ir, q);
         if (IS_LOCAL_PTR_OP(s1) || IS_LOCAL_PTR_OP(s2))
+          set = 1;
+        break;
+      }
+      case TCCIR_OP_MLA:
+      {
+        /* MLA dest = src1 * src2 + accum.  If accum is a local-pointer,
+         * the result is local-pointer + scaled-non-pointer-offset.  Closes
+         * the pr41181 pattern: fusion merged `n*250` and `&best_paths + ...`
+         * into one MLA, hiding the underlying pointer-plus-offset shape. */
+        IROperand accum = tcc_ir_op_get_accum(ir, q);
+        if (IS_LOCAL_PTR_OP(accum))
           set = 1;
         break;
       }
@@ -5032,15 +5816,39 @@ int tcc_ir_opt_local_only_body_elide(TCCIRState *ir)
     int ok = 0;
     if (dvr >= 0 && TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_TEMP)
     {
-      if (IS_LOCAL_PTR_OP(dop))
+      /* After var-to-tmp promotion, a STORE with non-lval TEMP dest is just
+       * a TEMP definition (no memory write).  Pass 1 already propagated
+       * local-pointer status into the TEMP if applicable; for accepting the
+       * STORE itself, a TEMP def is unconditionally local-only. */
+      if (q->op == TCCIR_OP_STORE && !dop.is_lval)
+        ok = 1;
+      else if (IS_LOCAL_PTR_OP(dop))
+        ok = 1;
+    }
+    else if (q->op == TCCIR_OP_STORE)
+    {
+      /* Direct automatic-object stores and STACKOFF/local dests are local-only. */
+      int tag = irop_get_tag(dop);
+      if (ir_opt_direct_auto_vreg_store_is_local(dop))
+        ok = 1;
+      else if (tag == IROP_TAG_STACKOFF && dop.is_local && !dop.is_param)
+        ok = 1;
+    }
+    else if (q->op == TCCIR_OP_STORE_INDEXED)
+    {
+      /* Direct indexed writes into a local stack object, e.g.
+       * Addr[StackLoc[-N]] <-- val STORE_INDEXED idx, are still confined to
+       * this frame.  Require the address-of form; an lvalue stack slot here
+       * would mean "load a pointer from the stack, then store through it". */
+      int tag = irop_get_tag(dop);
+      if (tag == IROP_TAG_STACKOFF && dop.is_local && !dop.is_lval && !dop.is_llocal && !dop.is_param)
         ok = 1;
     }
     else
     {
-      /* STACKOFF/local dest (direct stack write) is local-only. */
-      int tag = irop_get_tag(dop);
-      if (tag == IROP_TAG_STACKOFF && dop.is_local && !dop.is_param)
-        ok = 1;
+      /* STORE_INDEXED/STORE_POSTINC write through the destination pointer.
+       * A PARAM/VAR vreg in that slot is the pointer value, not the automatic
+       * object itself, so only proven local-pointer TEMPs are accepted. */
     }
     if (!ok)
       return 0;
@@ -5083,7 +5891,15 @@ int tcc_ir_opt_local_only_body_elide(TCCIRState *ir)
 
   for (int i = 0; i < n; i++)
   {
-    ir->compact_instructions[i].op = TCCIR_OP_NOP;
+    if (return_count > 0 && i == first_return_idx)
+    {
+      ir->compact_instructions[i].op = TCCIR_OP_RETURNVALUE;
+      tcc_ir_set_src1(ir, i, return_src);
+    }
+    else
+    {
+      ir->compact_instructions[i].op = TCCIR_OP_NOP;
+    }
     ir->compact_instructions[i].is_jump_target = 0;
   }
 

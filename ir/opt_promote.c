@@ -1158,6 +1158,84 @@ int tcc_ir_opt_select(TCCIRState *ir)
     }
 
     /* ----------------------------------------------------------------
+     * Pattern: SETIF + ASSIGN(0) diamond collapse to bare SETIF
+     * ----------------------------------------------------------------
+     * then: T = SETIF setif_tok    (uses CPU flags from prior CMP/TEST_ZERO)
+     * JUMP to merge
+     * else: T = #0 [ASSIGN]
+     * merge: ...
+     *
+     * When `setif_tok == ~branch_cond` (i.e. SETIF returns 1 exactly when the
+     * fall-through path was taken), the diamond's result is identical to
+     * SETIF alone: the SETIF's 0/1 already encodes the branch outcome, so the
+     * explicit `T = 0` else branch is redundant.  Collapses the entire
+     * diamond to a single SETIF, eliminating the JUMPIF / JUMP / else-ASSIGN.
+     *
+     * Safety: SETIF reads CPU flags set by the most recent CMP/TEST_ZERO; the
+     * intervening JUMPIF doesn't modify flags, so removing it keeps the
+     * SETIF's flag-source intact. */
+    if (then_q1->op == TCCIR_OP_SETIF)
+    {
+      IROperand then_dest = tcc_ir_op_get_dest(ir, then_q1);
+      IROperand setif_cond = tcc_ir_op_get_src1(ir, then_q1);
+      int32_t dest_vreg = irop_get_vreg(then_dest);
+
+      /* SETIF's condition must equal `then_cond` (the negation of the
+       * JUMPIF's branch condition) so SETIF returns 1 precisely along the
+       * fall-through (then) path and 0 along the taken (else) path. */
+      if (!irop_is_immediate(setif_cond) || setif_cond.is_sym)
+        goto setif_diamond_done;
+      int setif_tok = (int)irop_get_imm64_ex(ir, setif_cond);
+      if (setif_tok != then_cond)
+        goto setif_diamond_done;
+
+      /* Next should be unconditional JUMP to merge */
+      int jump_idx = ir_skip_nops_forward(ir, then_start + 1, n);
+      if (jump_idx >= n)
+        goto setif_diamond_done;
+      IRQuadCompact *jump_q = &ir->compact_instructions[jump_idx];
+      if (jump_q->op != TCCIR_OP_JUMP)
+        goto setif_diamond_done;
+      int merge_target = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, jump_q));
+
+      /* Find else block (same vreg, ASSIGN of constant 0) */
+      int else_start = ir_skip_nops_forward(ir, else_target, n);
+      if (else_start >= n)
+        goto setif_diamond_done;
+      IRQuadCompact *else_q = &ir->compact_instructions[else_start];
+      if (else_q->op != TCCIR_OP_ASSIGN)
+        goto setif_diamond_done;
+      IROperand else_dest = tcc_ir_op_get_dest(ir, else_q);
+      IROperand else_val = tcc_ir_op_get_src1(ir, else_q);
+      if (irop_get_vreg(else_dest) != dest_vreg)
+        goto setif_diamond_done;
+      if (!irop_is_immediate(else_val) || else_val.is_sym ||
+          irop_get_imm64_ex(ir, else_val) != 0)
+        goto setif_diamond_done;
+
+      /* Merge must be the next real instruction after the else ASSIGN */
+      int after_else = ir_skip_nops_forward(ir, else_start + 1, n);
+      if (after_else != merge_target)
+        goto setif_diamond_done;
+
+      /* Collapse: NOP the JUMPIF, the JUMP, and the else ASSIGN.  SETIF
+       * remains in place and now produces the same 0/1 result the diamond
+       * would have produced. */
+      JT_NOP_JUMP(i);                  /* the JUMPIF */
+      JT_NOP_JUMP(jump_idx);           /* the unconditional JUMP */
+      ir->compact_instructions[else_start].op = TCCIR_OP_NOP;
+
+      if (!JT_HAS_OTHER(else_target, -1))
+        ir->compact_instructions[else_target].is_jump_target = 0;
+      if (merge_target >= 0 && merge_target < n && !JT_HAS_OTHER(merge_target, -1))
+        ir->compact_instructions[merge_target].is_jump_target = 0;
+
+      changes++;
+      continue;
+    setif_diamond_done:;
+    }
+
+    /* ----------------------------------------------------------------
      * Pattern: Return diamond
      * ----------------------------------------------------------------
      * then: RETURNVALUE val_then [const]

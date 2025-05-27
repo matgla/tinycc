@@ -149,6 +149,155 @@ static int ir_opt_fold_memchr_offset(const char *s, unsigned char c, uint64_t n,
   return 1;
 }
 
+static int ir_opt_btype_size(int btype)
+{
+  switch (btype)
+  {
+  case IROP_BTYPE_INT8:
+    return 1;
+  case IROP_BTYPE_INT16:
+    return 2;
+  case IROP_BTYPE_INT64:
+  case IROP_BTYPE_FLOAT64:
+    return 8;
+  case IROP_BTYPE_STRUCT:
+    return 0;
+  default:
+    return 4;
+  }
+}
+
+static int ir_opt_stack_addr_offset(IROperand op, int *out_off)
+{
+  if (irop_get_tag(op) != IROP_TAG_STACKOFF || irop_get_vreg(op) != -1 || op.is_lval || !op.is_local)
+    return 0;
+  *out_off = (int)irop_get_stack_offset(op);
+  return 1;
+}
+
+static int ir_opt_is_memcpy_like_name(const char *name)
+{
+  return name &&
+         (strcmp(name, "memcpy") == 0 || strcmp(name, "memmove") == 0 ||
+          strcmp(name, "__aeabi_memcpy") == 0 || strcmp(name, "__aeabi_memcpy4") == 0 ||
+          strcmp(name, "__aeabi_memcpy8") == 0);
+}
+
+static int ir_opt_eval_stack_strlen(TCCIRState *ir, IROperand arg, int call_idx, int *out_len)
+{
+  enum { MAX_TRACK = 256 };
+  uint8_t bytes[MAX_TRACK];
+  uint8_t known[MAX_TRACK];
+  int base_off;
+
+  if (!ir || !out_len || !ir_opt_stack_addr_offset(arg, &base_off))
+    return 0;
+
+  memset(bytes, 0, sizeof(bytes));
+  memset(known, 0, sizeof(known));
+
+  for (int i = 0; i < call_idx; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP || q->op == TCCIR_OP_FUNCPARAMVAL || q->op == TCCIR_OP_FUNCPARAMVOID)
+      continue;
+    if (q->is_jump_target || q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF || q->op == TCCIR_OP_IJUMP)
+      return 0;
+
+    if (q->op == TCCIR_OP_STORE)
+    {
+      IROperand dst = tcc_ir_op_get_dest(ir, q);
+      IROperand src = tcc_ir_op_get_src1(ir, q);
+      int dst_off;
+      int size;
+      int rel;
+      uint64_t val;
+
+      if (irop_get_tag(dst) != IROP_TAG_STACKOFF || !dst.is_lval || !dst.is_local || dst.is_llocal)
+        return 0;
+
+      dst_off = (int)irop_get_stack_offset(dst);
+      size = ir_opt_btype_size(irop_get_btype(dst));
+      if (size <= 0)
+        return 0;
+      rel = dst_off - base_off;
+      if (rel + size <= 0 || rel >= MAX_TRACK)
+        continue;
+
+      if (!irop_is_immediate(src))
+      {
+        for (int b = 0; b < size; b++)
+          if (rel + b >= 0 && rel + b < MAX_TRACK)
+            known[rel + b] = 0;
+        continue;
+      }
+
+      val = (uint64_t)irop_get_imm64_ex(ir, src);
+      for (int b = 0; b < size; b++)
+      {
+        if (rel + b < 0 || rel + b >= MAX_TRACK)
+          continue;
+        bytes[rel + b] = (uint8_t)(val >> (b * 8));
+        known[rel + b] = 1;
+      }
+      continue;
+    }
+
+    if (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID)
+    {
+      Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+      const char *name = callee ? get_tok_str(callee->v, NULL) : NULL;
+      IROperand dst;
+      IROperand src;
+      IROperand len_op;
+      const char *str;
+      uint64_t n;
+      int dst_off;
+      int rel;
+
+      if (!ir_opt_is_memcpy_like_name(name))
+        return 0;
+      if (!ir_opt_get_call_param_operand(ir, i, 0, &dst) ||
+          !ir_opt_get_call_param_operand(ir, i, 1, &src) ||
+          !ir_opt_get_call_param_operand(ir, i, 2, &len_op))
+        return 0;
+      if (!ir_opt_stack_addr_offset(dst, &dst_off) ||
+          !ir_opt_eval_const_string(ir, src, i, &str, 0) ||
+          !ir_opt_eval_const_u64(ir, len_op, i, &n, 0))
+        return 0;
+      if (n > (uint64_t)strlen(str) + 1)
+        return 0;
+
+      rel = dst_off - base_off;
+      for (uint64_t b = 0; b < n; b++)
+      {
+        int pos = rel + (int)b;
+        if (pos < 0 || pos >= MAX_TRACK)
+          continue;
+        bytes[pos] = (uint8_t)str[b];
+        known[pos] = 1;
+      }
+      continue;
+    }
+
+    if (q->op == TCCIR_OP_STORE_INDEXED || q->op == TCCIR_OP_STORE_POSTINC || q->op == TCCIR_OP_BLOCK_COPY)
+      return 0;
+  }
+
+  for (int i = 0; i < MAX_TRACK; i++)
+  {
+    if (!known[i])
+      return 0;
+    if (bytes[i] == 0)
+    {
+      *out_len = i;
+      return 1;
+    }
+  }
+
+  return 0;
+}
+
 int tcc_ir_opt_const_string_calls(TCCIRState *ir)
 {
   int changes = 0;
@@ -184,12 +333,22 @@ int tcc_ir_opt_const_string_calls(TCCIRState *ir)
     /* --- strlen: fold if arg is constant string, otherwise redirect --- */
     if (id == STRBI_STRLEN)
     {
+      int stack_len;
       if (q->op == TCCIR_OP_FUNCCALLVAL && ir_opt_get_call_param_operand(ir, i, 0, &arg0) &&
           ir_opt_eval_const_string(ir, arg0, i, &s1, 0))
       {
         ir_opt_nop_call_params(ir, i);
         q->op = TCCIR_OP_ASSIGN;
         tcc_ir_set_src1(ir, i, irop_make_imm32(-1, (int)strlen(s1), VT_INT));
+        tcc_ir_set_src2(ir, i, IROP_NONE);
+        changes++;
+      }
+      else if (q->op == TCCIR_OP_FUNCCALLVAL && ir_opt_get_call_param_operand(ir, i, 0, &arg0) &&
+               ir_opt_eval_stack_strlen(ir, arg0, i, &stack_len))
+      {
+        ir_opt_nop_call_params(ir, i);
+        q->op = TCCIR_OP_ASSIGN;
+        tcc_ir_set_src1(ir, i, irop_make_imm32(-1, stack_len, VT_INT));
         tcc_ir_set_src2(ir, i, IROP_NONE);
         changes++;
       }
