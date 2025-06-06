@@ -541,6 +541,7 @@ static LcsStep lcs_exec(TCCIRState *ir, LcsState *st, IRQuadCompact *q, int pc,
     /* For register-promotable VARs, update the VAR slot directly so that
      * subsequent reads via the vreg see the stored value. */
     int32_t dvr = irop_get_vreg(dest);
+    int recorded_in_var = 0;
     if (dvr >= 0 && dest.is_lval) {
       int dtype = TCCIR_DECODE_VREG_TYPE(dvr);
       int dpos  = TCCIR_DECODE_VREG_POSITION(dvr);
@@ -549,6 +550,7 @@ static LcsStep lcs_exec(TCCIRState *ir, LcsState *st, IRQuadCompact *q, int pc,
         st->vars[dpos].value = store_val;
         st->vars[dpos].btype = dbt;
         st->vars[dpos].is_addr = 0;
+        recorded_in_var = 1;
       }
     }
 
@@ -568,7 +570,21 @@ static LcsStep lcs_exec(TCCIRState *ir, LcsState *st, IRQuadCompact *q, int pc,
       const LcsSlot *slot = NULL;
       if (type == TCCIR_VREG_TYPE_VAR && pos < st->n_vars) slot = &st->vars[pos];
       else if (type == TCCIR_VREG_TYPE_TEMP && pos < st->n_tmps) slot = &st->tmps[pos];
-      if (!slot || !slot->known || !slot->is_addr) return r;
+      if (!slot || !slot->known || !slot->is_addr)
+      {
+        /* The destination address does not resolve to a tracked stack slot.
+         * If the value was just recorded into a register-promotable VAR slot
+         * above, the store is fully modeled — continue.  Otherwise this STORE
+         * writes memory the simulator cannot track — most importantly a deref
+         * through a PARAM pointer (`*y = …` for a parameter `int *y`), which
+         * targets caller-visible memory.  Such a store is OBSERVABLE; folding
+         * the loop would silently drop it (compiling `for(i…) *y=i;` to a bare
+         * `bx lr`).  Bail so the loop is left intact. */
+        if (recorded_in_var)
+          return r;
+        r.action = 0;
+        return r;
+      }
       off = (int32_t)slot->value;
     }
     else

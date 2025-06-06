@@ -71,6 +71,7 @@ TEST_FILES = [
     ("bug_ll_mul10_switch_min.c", 0),
     ("bug_parse_number_64bit.c", 0),
     ("bug_ull_mul_int_accum.c", 0),
+    ("bug_struct_slot_reuse.c", 0),
     # ("bug_ternary_string.c", 0),  # Nested ternary with string literals
     # ("bug_return_else_string.c", 0),  # Return string from else block
     ("test_cleanup_double.c", 0),
@@ -379,6 +380,17 @@ TEST_FILES = [
     ("mibench_stringsearch.c", 0),
     ("mibench_sha.c", 0),
     ("mibench_rijndael.c", 0),
+    ("172_const_agg_fold.c", 245),
+    ("173_const_memcpy_fwd.c", 0),
+    ("174_bitfield_extract_fold.c", 0),
+    ("175_shift_pair_ubfx.c", 0),
+    ("176_init_copy_global_fwd.c", 0),
+    ("177_bfi_insert.c", 0),
+    ("178_dead_store_sroa.c", 0),
+    ("179_loop_carried_store.c", 0),
+    ("180_loop_rotation_condbody.c", 0),
+    ("181_loop_const_sim_extern_store.c", 0),
+    ("182_init_copy_global_fwd_alu.c", 0),
 ]
 
 # Per-test compiler defines (e.g. for missing platform macros)

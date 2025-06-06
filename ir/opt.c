@@ -2426,6 +2426,84 @@ int tcc_ir_opt_cmp_setif_cse(TCCIRState *ir)
   return changes;
 }
 
+/* A vreg is provably in {0,1} when its single definition is a SETIF (which
+ * always materialises 0 or 1), a boolean AND/OR (idempotent boolean ops), or
+ * a prior boolean-normalisation ASSIGN of another such vreg.  Used to drop the
+ * redundant `!!bool` that the frontend emits when a comparison result is
+ * assigned to a `_Bool` (or otherwise re-normalised). */
+static int ir_vreg_is_bool01(TCCIRState *ir, int32_t vr, int before_idx)
+{
+  if (vr < 0)
+    return 0;
+  if (!tcc_ir_vreg_has_single_def(ir, vr))
+    return 0;
+  int d = tcc_ir_find_defining_instruction(ir, vr, before_idx);
+  if (d < 0)
+    return 0;
+  int op = ir->compact_instructions[d].op;
+  return op == TCCIR_OP_SETIF || op == TCCIR_OP_BOOL_AND ||
+         op == TCCIR_OP_BOOL_OR;
+}
+
+/* Redundant boolean-normalisation elimination.  Detects:
+ *   i:   CMP X, #0
+ *   i+1: V <-- (cond=NE)   [SETIF]
+ * where X is a vreg already proven to be in {0,1}.  Then `(X != 0) == X`, so
+ * the pair is rewritten to:
+ *   i:   NOP
+ *   i+1: V <-- X           [ASSIGN]
+ * and copy-propagation/DCE clean up the rest.  This is the `!!bool` idiom the
+ * frontend emits when a comparison is stored into a `_Bool` local and then
+ * read back (see gcc.c-torture/execute/pr107881-1.c).  Scoped to the exact
+ * adjacent CMP/SETIF pair so the CMP's flags have a single consumer. */
+int tcc_ir_opt_bool_norm_elim(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  int changes = 0;
+  if (n < 2)
+    return 0;
+
+  for (int i = 0; i + 1 < n; i++)
+  {
+    IRQuadCompact *cmp = &ir->compact_instructions[i];
+    if (cmp->op != TCCIR_OP_CMP)
+      continue;
+    IRQuadCompact *setif = &ir->compact_instructions[i + 1];
+    if (setif->op != TCCIR_OP_SETIF)
+      continue;
+
+    /* SETIF cond must be NE (X != 0 == X). */
+    IROperand cond_op = tcc_ir_op_get_src1(ir, setif);
+    if ((int)irop_get_imm64_ex(ir, cond_op) != 0x95 /* TOK_NE */)
+      continue;
+
+    /* Second CMP operand must be immediate 0. */
+    IROperand cmp_s2 = tcc_ir_op_get_src2(ir, cmp);
+    if (!irop_is_immediate(cmp_s2) || cmp_s2.is_sym || cmp_s2.is_lval)
+      continue;
+    if (irop_get_imm64_ex(ir, cmp_s2) != 0)
+      continue;
+
+    /* First CMP operand must be a plain vreg proven to be a boolean. */
+    IROperand cmp_s1 = tcc_ir_op_get_src1(ir, cmp);
+    int32_t vr = irop_get_vreg(cmp_s1);
+    if (vr < 0 || cmp_s1.is_lval || cmp_s1.is_sym)
+      continue;
+    if (!ir_vreg_is_bool01(ir, vr, i))
+      continue;
+
+    /* Rewrite to NOP + ASSIGN. */
+    cmp->op = TCCIR_OP_NOP;
+    setif->op = TCCIR_OP_ASSIGN;
+    IROperand src_vreg = irop_make_vreg(vr, irop_get_btype(cmp_s1));
+    tcc_ir_set_src1(ir, i + 1, src_vreg);
+    tcc_ir_set_src2(ir, i + 1, IROP_NONE);
+    changes++;
+  }
+
+  return changes;
+}
+
 /* Eliminate `memmove/memcpy(dst_ptr, &stack_tmp, N)` when the only writes to
  * stack_tmp[0..N) are local STOREs that precede the call in the same basic
  * block.  Each contributing STORE is rewritten to a STORE_INDEXED targeting

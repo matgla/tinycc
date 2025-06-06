@@ -2022,6 +2022,7 @@ const IRRegistersConfig irop_config[] = {
     [TCCIR_OP_STORE_POSTINC] = {1, 1, 0},  /* *ptr = src; ptr += offset */
     [TCCIR_OP_TEST_ZERO] = {0, 1, 0},
     [TCCIR_OP_UBFX] = {1, 1, 1},  /* dest = (src1 >> lsb) & ((1<<width)-1); src2 = lsb|(width<<5) */
+    [TCCIR_OP_BFI] = {1, 1, 1},   /* dest = src1 w/ field[lsb,width] := src2; lsb/width in bfi_params[] */
     /* Floating point operations */
     [TCCIR_OP_FADD] = {1, 1, 1}, [TCCIR_OP_FSUB] = {1, 1, 1}, [TCCIR_OP_FMUL] = {1, 1, 1}, [TCCIR_OP_FDIV] = {1, 1, 1},
     [TCCIR_OP_FNEG] = {1, 1, 0}, /* unary: src1=input, dest */

@@ -482,6 +482,101 @@ static int sccp_loop_clobbers_slot(SCCPState *s, int load_idx, int soff, int loa
   return 0;
 }
 
+/* Companion to sccp_loop_clobbers_slot for a store->load FORWARD across the
+ * dominator tree: returns 1 if a loop lying strictly BETWEEN the (dominating)
+ * store at `from_idx` and the load at `to_idx` writes the slot.  The dominator
+ * walk can forward an entry-block init store to a post-loop load while the
+ * intervening linear alias scan is skipped (entry-block exemption), but the
+ * loop body's store clobbers the value on every iteration — the post-loop load
+ * is loop-carried, not the init constant.  Fixes the -O1 miscompile of
+ * `struct{int x;}a; a.x=0; for(i=1;i<=k;i++) a.x+=i; return a.x;` (returned 0). */
+static int sccp_loop_writes_slot_between(SCCPState *s, int from_idx, int to_idx,
+                                         int soff, int load_btype)
+{
+  if (!s->loops_done) {
+    s->loops = tcc_ir_detect_loops(s->ctx->ir);
+    s->loops_done = 1;
+  }
+  if (!s->loops || s->loops->num_loops == 0)
+    return 0;
+  int load_size = sccp_btype_bytes(load_btype);
+  int load_lo = soff, load_hi = soff + load_size;
+  TCCIRState *ir = s->ctx->ir;
+  for (int li = 0; li < s->loops->num_loops; li++) {
+    IRLoop *loop = &s->loops->loops[li];
+    /* Only loops whose body runs on the path from the store to the load. */
+    if (!(loop->start_idx > from_idx && loop->end_idx < to_idx))
+      continue;
+    for (int i = loop->start_idx; i <= loop->end_idx; i++) {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      TccIrOp op = q->op;
+      if (op == TCCIR_OP_NOP)
+        continue;
+      /* A call passing the load slot's ADDRESS by-reference may write it on
+       * every iteration (e.g. `for(..) g(&s); return s.f;`).  Bail when a loop
+       * FUNCPARAM hands a callee a non-lval stack address pointing at the object
+       * containing the load slot.  Params that pass a VALUE (`*p`, an lval
+       * deref) do NOT escape the slot's address — that is the scal-to-vec
+       * vector-lowering shape, which must keep forwarding.  SCCP_OBJ_BOUND caps
+       * how far one object can extend past the passed base. */
+      if (op == TCCIR_OP_FUNCPARAMVAL || op == TCCIR_OP_FUNCPARAMVOID) {
+        IROperand p = tcc_ir_op_get_src1(ir, q);
+        if (!p.is_lval) {
+          int aoff = INT_MIN;
+          if (irop_get_tag(p) == IROP_TAG_STACKOFF && p.is_local && irop_get_vreg(p) == -1)
+            aoff = irop_get_stack_offset(p);
+          else {
+            int32_t pvr = irop_get_vreg(p);
+            if (pvr >= 0)
+              aoff = ssa_opt_resolve_lea_stackloc(s->ctx, pvr);
+          }
+          const int SCCP_OBJ_BOUND = 4096;
+          if (aoff != INT_MIN && aoff <= load_lo && load_lo - aoff < SCCP_OBJ_BOUND)
+            return 1; /* slot's address escapes to a callee that may write it */
+        }
+        continue;
+      }
+      /* A plain call (no by-ref slot arg) or block-copy that doesn't resolve to
+       * the load slot is left to the resolved-store check below; blanket-bailing
+       * here regressed scal-to-vec (element-loop copies that miss the load). */
+      if (op == TCCIR_OP_FUNCCALLVOID || op == TCCIR_OP_FUNCCALLVAL || op == TCCIR_OP_BLOCK_COPY)
+        continue;
+      if (op != TCCIR_OP_STORE && op != TCCIR_OP_STORE_INDEXED && op != TCCIR_OP_STORE_POSTINC)
+        continue;
+      int store_btype = 0;
+      int target = sccp_store_target_off(s->ctx, q, &store_btype);
+      if (target != INT_MIN) {
+        int store_lo = target, store_hi = target + sccp_btype_bytes(store_btype);
+        if (store_hi > load_lo && load_hi > store_lo)
+          return 1; /* resolved write to the load's slot — genuine clobber */
+        continue;
+      }
+      /* Unresolved store offset.  Two very different shapes land here:
+       *
+       *  - STORE_INDEXED with a variable index (scal-to-vec-style vector
+       *    lowering): the writes provably hit distinct element positions and
+       *    miss the scalar load slot.  Conservatively clobbering here would
+       *    defeat the legitimate entry-block forward for those patterns, so
+       *    keep forwarding.  The linear alias scan (sccp_no_aliasing_between)
+       *    handles unresolved writes precisely for non-entry-block stores.
+       *
+       *  - A plain pointer-deref STORE (`*p = ...`) whose pointer provenance
+       *    we cannot pin to a stack offset.  This is exactly the inlined-call
+       *    accumulate shape: `for(..) gs(&s);` where gs is inlined to
+       *    `*p = *p + 2` and `p` flows through the inlined param V-register
+       *    that ssa_opt_resolve_lea_stackloc won't chase.  The pointer may
+       *    well alias the load slot's object, so we must NOT forward the
+       *    entry store across this loop.  STORE_POSTINC is likewise an opaque
+       *    memory write (scan_block_for_stack_store already treats it as a
+       *    full barrier). */
+      if (op == TCCIR_OP_STORE || op == TCCIR_OP_STORE_POSTINC)
+        return 1; /* opaque pointer-deref write may alias the load slot */
+      continue;
+    }
+  }
+  return 0;
+}
+
 static int sccp_resolve_stack_load(SCCPState *s, int soff, int load_btype,
                                    int instr_idx, int64_t *out, int *dep_pos)
 {
@@ -539,6 +634,17 @@ static int sccp_resolve_stack_load(SCCPState *s, int soff, int load_btype,
        * residual STOREs that replace a folded loop's memory writes — are
        * the ones that need the alias check, because intervening loop
        * bodies can contain STORE_INDEXED writes through the same array. */
+      /* A loop between the (dominating) store and the load whose body writes
+       * the slot makes the loaded value loop-carried, not the stored constant.
+       * The linear alias scan below is skipped for entry-block stores, so this
+       * back-edge-aware check runs UNCONDITIONALLY — otherwise an entry-block
+       * init store forwards across an intervening accumulate loop (miscompile). */
+      if (matched_idx >= 0 &&
+          sccp_loop_writes_slot_between(s, matched_idx, instr_idx, soff, load_btype)) {
+        *out = saved_out;
+        if (dep_pos) *dep_pos = saved_dep;
+        return SCCP_BOTTOM;
+      }
       int entry_block = (cfg->num_blocks > 0) ? 0 : -1;
       int store_block = cfg->instr_to_block[matched_idx];
       int needs_alias_check = (matched_idx >= 0 && store_block != entry_block);

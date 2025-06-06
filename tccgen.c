@@ -599,6 +599,54 @@ static struct temp_local_variable
 } arr_temp_local_vars[MAX_TEMP_LOCAL_VARIABLE_NUMBER];
 static int nb_temp_local_vars;
 
+/* Reusable stack slots for by-value struct arguments passed to variadic
+ * functions (the invisible-copy the AAPCS requires for structs > 16 bytes).
+ * Unlike get_temp_local_var()'s vstack-based tracking, these slots must stay
+ * reserved until the whole call is emitted — each argument is lowered to a
+ * FUNCPARAMVAL and popped off the vstack before the next argument is built,
+ * so the vstack can no longer witness that the slot is in use.
+ *
+ * Instead a busy bitmask tracks live slots, and block() saves/restores it
+ * around every statement.  Two struct-arg copies that are live at the same
+ * time (e.g. f(a, b, a) — three copies, all read by the one call) therefore
+ * get distinct slots, while copies from statements that have fully completed
+ * are reclaimed.  GNU statement-expressions used as arguments enter a nested
+ * block() whose save/restore leaves the enclosing call's reserved slots
+ * untouched, so they cannot be aliased. */
+#define MAX_ARG_STRUCT_TEMPS 64
+static struct arg_struct_temp
+{
+  int location;
+  int size;
+  int align;
+} arg_struct_temps[MAX_ARG_STRUCT_TEMPS];
+static int nb_arg_struct_temps;
+static uint64_t arg_struct_temp_busy;
+
+static int get_arg_struct_temp(int size, int align)
+{
+  for (int i = 0; i < nb_arg_struct_temps; i++)
+  {
+    if (!(arg_struct_temp_busy & ((uint64_t)1 << i)) &&
+        arg_struct_temps[i].size >= size && arg_struct_temps[i].align >= align)
+    {
+      arg_struct_temp_busy |= (uint64_t)1 << i;
+      return arg_struct_temps[i].location;
+    }
+  }
+  loc = (loc - size) & -align;
+  if (nb_arg_struct_temps < MAX_ARG_STRUCT_TEMPS)
+  {
+    int i = nb_arg_struct_temps++;
+    arg_struct_temps[i].location = loc;
+    arg_struct_temps[i].size = size;
+    arg_struct_temps[i].align = align;
+    arg_struct_temp_busy |= (uint64_t)1 << i;
+  }
+  /* Pool exhausted: a fresh never-reused slot is always correct. */
+  return loc;
+}
+
 static struct scope
 {
   struct scope *prev;
@@ -626,6 +674,20 @@ typedef struct
    * element along the way clears const_init_valid on the sym. */
   Sym *const_init_sym;
   int const_init_base;
+  /* Probe mode: when const_probe is set, init_putv captures each scalar into
+   * const_probe_data (a host-side template buffer of const_probe_size bytes,
+   * indexed by element offset minus const_probe_base) and emits nothing.  Any
+   * element that is not a plain load-time-constant integer/pointer sets
+   * const_probe_failed.  The whole probe runs under nocode_wanted so runtime
+   * initializer expressions emit no code, letting the caller fall back to the
+   * normal per-element path cleanly.  Used to lower a large constant local
+   * array as a single memcpy from a .rodata template (matching GCC) instead of
+   * memset + a store per non-zero element. */
+  int const_probe;
+  int const_probe_failed;
+  unsigned char *const_probe_data;
+  int const_probe_base;
+  int const_probe_size;
 } init_params;
 
 #if 1
@@ -1058,6 +1120,8 @@ ST_FUNC void tccgen_finish(TCCState *s1)
   all_cleanups = NULL;
   pending_gotos = NULL;
   nb_temp_local_vars = 0;
+  nb_arg_struct_temps = 0;
+  arg_struct_temp_busy = 0;
   global_label_stack = NULL;
   local_label_stack = NULL;
   cur_text_section = NULL;
@@ -4935,6 +4999,16 @@ static void gen_opif(int op)
     }
     else
     {
+      /* Canonicalize commutative float/double ops to keep the constant as the
+       * second helper argument (r2:r3), mirroring gen_opic's integer
+       * "put c2 as constant" rule.  The non-constant operand is far more
+       * likely to already be live in the return pair r0:r1 (it is typically a
+       * previous __aeabi_d* result), so making it the first argument lets it
+       * stay in r0:r1 instead of being shuffled into r2:r3 while the constant
+       * is loaded into r0:r1.  Saves a 64-bit register move per op in chained
+       * soft-float expressions (e.g. pr58574 Horner polynomials). */
+      if (c1 && !c2 && (op == '+' || op == '*'))
+        vswap();
       // gen_opf(op);
       tcc_ir_gen_f(tcc_state->ir, op);
     }
@@ -7365,6 +7439,27 @@ static int try_inline_builtin_call(const char *func_name, SValue *args, int nb_a
   return 1;
 }
 
+/* Returns 1 if `type` is a struct/union with at least one pointer member
+ * (searched recursively through nested aggregates).  Such structs, when passed
+ * by value to a non-static function, are the aliasing hazard that makes
+ * inlining unsafe (a pointer member may alias another parameter).  Pure scalar/
+ * bitfield structs (the common bitfield-struct idiom) carry no such hazard. */
+static int struct_has_pointer_member(const CType *type)
+{
+  Sym *f;
+  if ((type->t & VT_BTYPE) != VT_STRUCT || !type->ref)
+    return 0;
+  for (f = type->ref->next; f; f = f->next)
+  {
+    int bt = f->type.t & VT_BTYPE;
+    if (bt == VT_PTR)
+      return 1;
+    if (bt == VT_STRUCT && struct_has_pointer_member(&f->type))
+      return 1;
+  }
+  return 0;
+}
+
 /* Returns 1 if the type is safe for auto-inline parameter passing (TCCIR_OP_STORE)
  * and return value storage.  Single-register scalars and VT_LLONG are accepted
  * (the IR STORE handles 64-bit integer values natively).  VT_DOUBLE / VT_LDOUBLE
@@ -7419,10 +7514,12 @@ static int auto_inline_sig_ok(Sym *func_sym)
       return 0;
     if (p->type.t & VT_COMPLEX)
       return 0;
-    /* Only inline small plain structs (≤16 bytes) for static functions.
-     * Non-static functions with struct params can have complex aliasing
-     * (pointer members aliasing other params) that the optimizer mishandles
-     * after inlining.  Vector types and large structs are always rejected. */
+    /* Only inline small plain structs (≤16 bytes).  Non-static functions with
+     * struct params carrying pointer members can have complex aliasing (a
+     * pointer member aliasing another param) that the optimizer mishandles
+     * after inlining — so for non-static functions require the struct to be
+     * pure scalar/bitfield data.  Vector types and large structs are always
+     * rejected. */
     if ((p->type.t & VT_BTYPE) == VT_STRUCT)
     {
       if (p->type.t & VT_VECTOR)
@@ -7431,7 +7528,7 @@ static int auto_inline_sig_ok(Sym *func_sym)
       sz = type_size(&p->type, &al);
       if (sz > 16)
         return 0;
-      if (!(func_sym->type.t & VT_STATIC))
+      if (!(func_sym->type.t & VT_STATIC) && struct_has_pointer_member(&p->type))
         return 0;
     }
     /* Unnamed parameters (v == 0) crash sym_push during inline expansion
@@ -7446,6 +7543,34 @@ static int auto_inline_sig_ok(Sym *func_sym)
   LOG_INLINE_STRUCT("[auto-inline-sig] ACCEPT %s (ret_btype=%d)", get_tok_str(func_sym->v & ~SYM_FIELD, NULL),
                     ret_btype);
   return 1;
+}
+
+/* Guard for the relaxed non-static struct-by-value inline path (see
+ * auto_inline_sig_ok): inlining a non-static function that takes a struct by
+ * value is only a win for trivial bodies — the by-value marshalling a normal
+ * call performs is what the inline avoids, but a larger callee body re-expanded
+ * at every site bloats past the call it replaced (e.g. gcc.c-torture structs.c).
+ * Tiny identity/forwarding helpers (the `retme`-style bitfield idiom, 8 tokens)
+ * are the safe, profitable case.  Static functions and non-struct-param
+ * functions keep their existing (size-unrestricted) eligibility. */
+#define AUTO_INLINE_NONSTATIC_STRUCT_MAX_TOKENS 12
+static int auto_inline_nonstatic_struct_body_ok(Sym *func_sym, TokenString *func_str)
+{
+  Sym *p;
+  int has_struct_param = 0;
+  if (func_sym->type.t & VT_STATIC)
+    return 1;
+  if (!func_sym->type.ref)
+    return 1;
+  for (p = func_sym->type.ref->next; p; p = p->next)
+    if ((p->type.t & VT_BTYPE) == VT_STRUCT)
+    {
+      has_struct_param = 1;
+      break;
+    }
+  if (!has_struct_param)
+    return 1;
+  return func_str && func_str->len <= AUTO_INLINE_NONSTATIC_STRUCT_MAX_TOKENS;
 }
 
 /* Count the number of non-void parameters in a function's type.
@@ -9804,6 +9929,34 @@ static unsigned char *find_sv_const_init(const SValue *sv, int min_size)
   return NULL;
 }
 
+/* Like find_sv_const_init, but only returns data backed by an ANONYMOUS sym
+ * (a compound literal or a const-folded vector temp).  A *named* local can
+ * carry a stale const_init buffer: when it is initialised from a non-constant
+ * expression (e.g. `v4si t = ~a;`) the buffer stays zero-filled yet
+ * const_init_valid is left set — init_putv (which clears validity when a
+ * non-constant value is stored) only runs for brace-list initialisers, and
+ * const_init_in_progress suppresses the store-based invalidation during the
+ * initialiser.  Existing callers tolerate this because they only fold when
+ * BOTH operands are constant (a named expression-init operand pairs with a
+ * non-constant one, so no fold fires).  A single-operand substitution has no
+ * such guard, so it must reject named locals.  Anonymous compound literals can
+ * only ever be brace lists, so a valid buffer always reflects genuine
+ * constants. */
+static unsigned char *find_sv_vec_literal_init(const SValue *sv, int min_size)
+{
+  if ((sv->r & (VT_VALMASK | VT_LVAL | VT_SYM)) != (VT_LOCAL | VT_LVAL))
+    return NULL;
+  int addr = (int)sv->c.i;
+  Sym *s;
+  for (s = local_stack; s; s = s->prev)
+  {
+    if (s->const_init_data && s->const_init_valid && s->v >= SYM_FIRST_ANOM && (int)s->c == addr &&
+        s->const_init_size >= min_size)
+      return s->const_init_data;
+  }
+  return NULL;
+}
+
 static int64_t read_vec_const_elem(const unsigned char *data, int elem_size, int idx, int is_unsigned)
 {
   unsigned char *p = (unsigned char *)data + idx * elem_size;
@@ -10091,6 +10244,41 @@ static void gen_op_vector(int op)
   /* Allocate a temp stack slot for the result vector */
   res_loc = get_temp_local_var(vec_size, vec_size > 8 ? 8 : vec_size, &res_vr);
 
+  /* Constant-operand immediate substitution: for a commutative bitwise op
+   * (&, |, ^) where one operand is a vector compound-literal constant (e.g.
+   * `*p & (V){1,1,...}`), push each constant element as a scalar immediate
+   * rather than dereferencing the in-memory copy.  This turns the per-element
+   * `ldr const; and r,r,const` into `and r,r,#imm`, and (when nothing else
+   * reads it) lets the compound-literal's materialising memcpy be eliminated —
+   * which in turn avoids spilling/reloading the base pointer around that call.
+   *
+   * Scoped TIGHTLY to bitwise commutative ops on integer elements: for &/|/^
+   * the operands are necessarily integer (no float-mask case) and commutative
+   * (so substituting either side is value-identical), and the result's low
+   * elem_size bytes match the in-memory load regardless of how the immediate is
+   * sign-/zero-extended.  Shifts (non-commutative; a const LHS would need
+   * mov+lsl) and comparisons (signedness affects codegen) are deliberately
+   * excluded — those are exactly the cases an earlier, broader attempt
+   * miscompiled. */
+  int subst_left = 0, subst_right = 0;
+  unsigned char *imm_left_data = NULL, *imm_right_data = NULL;
+  int imm_is_unsigned = (elem_type.t & VT_UNSIGNED) != 0;
+  if ((op == '&' || op == '|' || op == '^') && !is_cmp && !is_float(elem_type.t))
+  {
+    if (!scalar_right)
+    {
+      imm_right_data = find_sv_vec_literal_init(&right_sv, vec_size);
+      if (imm_right_data)
+        subst_right = 1;
+    }
+    if (!subst_right && !scalar_left)
+    {
+      imm_left_data = find_sv_vec_literal_init(&left_sv, vec_size);
+      if (imm_left_data)
+        subst_left = 1;
+    }
+  }
+
   /* Emit element-wise operations (unrolled: elem_count is compile-time constant) */
   for (i = 0; i < elem_count; i++)
   {
@@ -10102,6 +10290,11 @@ static void gen_op_vector(int op)
     {
       /* Scalar: broadcast — push the same scalar value every iteration */
       vpushv(&left_sv);
+    }
+    else if (subst_left)
+    {
+      vpush64(elem_type.t & VT_BTYPE,
+              (unsigned long long)read_vec_const_elem(imm_left_data, elem_size, i, imm_is_unsigned));
     }
     else
     {
@@ -10119,6 +10312,11 @@ static void gen_op_vector(int op)
     if (scalar_right)
     {
       vpushv(&right_sv);
+    }
+    else if (subst_right)
+    {
+      vpush64(elem_type.t & VT_BTYPE,
+              (unsigned long long)read_vec_const_elem(imm_right_data, elem_size, i, imm_is_unsigned));
     }
     else
     {
@@ -10225,6 +10423,23 @@ static int struct_has_vla_member(const CType *type)
   return 0;
 }
 
+/* True if the struct has at least one (top-level) bitfield member.  Such
+ * structs are usually copied to a local only to poke one field and read it
+ * back (the gcc.c-torture/execute/20040709-1.c idiom), so expanding the copy
+ * to scalar LOAD/STOREs lets store-forwarding + the bitfield insert/extract
+ * fold collapse it.  Plain (non-bitfield) struct copies are more often used
+ * whole, where an inline expansion just bloats vs. a single memmove. */
+static int struct_has_bitfield_member(const CType *type)
+{
+  Sym *f;
+  if ((type->t & VT_BTYPE) != VT_STRUCT || !type->ref)
+    return 0;
+  for (f = type->ref->next; f; f = f->next)
+    if (f->type.t & VT_BITFIELD)
+      return 1;
+  return 0;
+}
+
 static int struct_is_single_2byte_scalar_member(const CType *type)
 {
   int align;
@@ -10237,6 +10452,179 @@ static int struct_is_single_2byte_scalar_member(const CType *type)
   if (f->type.t & VT_BITFIELD)
     return 0;
   return type_size(&f->type, &align) == 2;
+}
+
+/* A small struct whose members are *all* bitfields (the packed
+ * poke-one-field idiom, e.g. `struct { unsigned short i:1,j:3,k:11; }` or
+ * `struct { unsigned int k:6,l:1,j:10,i:15; }`).  When the whole aggregate
+ * fits in a single 1/2/4-byte storage unit it can be copied as one
+ * byte/halfword/word LOAD/STORE whose access width matches how the bitfields
+ * are later read — exposing the value to store-load forwarding (which only
+ * narrows a wider store for *immediate* values, so a width-matched copy is
+ * what lets the downstream bitfield insert/extract fold collapse the copy).
+ * Packed bitfield structs have align 1, which keeps them out of the
+ * word-aligned scalar-expansion path, so they would otherwise memmove. */
+static int struct_is_small_bitfield_word(const CType *type)
+{
+  int align, sz, saw = 0;
+  Sym *f;
+  if ((type->t & VT_BTYPE) != VT_STRUCT || !type->ref)
+    return 0;
+  sz = type_size(type, &align);
+  if (sz != 1 && sz != 2 && sz != 4)
+    return 0;
+  for (f = type->ref->next; f; f = f->next)
+  {
+    if (!(f->type.t & VT_BITFIELD))
+      return 0;
+    saw = 1;
+  }
+  return saw;
+}
+
+/* Width (1/2/4/8) of the storage unit through which a bitfield field `f` is
+ * accessed (mirrors adjust_bf): auxtype names the access type, -1 means the
+ * field's own declared base type, VT_STRUCT means byte-wise (0 here). */
+static int bitfield_unit_width(const Sym *f)
+{
+  int align, aux = f->type.ref ? f->type.ref->auxtype : -1;
+  CType t;
+  t.ref = NULL;
+  if (aux == VT_STRUCT)
+    return 0;
+  if (aux != -1)
+    t.t = aux;
+  else
+    t.t = f->type.t & ~VT_STRUCT_MASK; /* strip bitfield pos/size, keep base */
+  return type_size(&t, &align);
+}
+
+/* True if a small struct is safe and worthwhile to copy member-wise via
+ * ir_emit_struct_unit_copy: it has at least one bitfield (the poke-one-field
+ * idiom that benefits from width-matched forwarding) AND *every* member is
+ * accessed in a single 1/2/4-byte unit.
+ *
+ * The all-accesses-<=4 requirement is a correctness guard, not just a tuning
+ * knob.  ir_emit_struct_unit_copy tiles the aggregate with <=4-byte chunks; if
+ * any member is read with a WIDER access that overlaps several of those chunks
+ * — a `long long`/`double` scalar, or a bitfield that straddles the 32-bit
+ * boundary and is therefore read as a 64-bit unit (e.g. pr57344's `int b:22`
+ * crossing bit 32) — store-load forwarding partial-forwards that wide load
+ * from the narrow stores and corrupts the value.  Keeping every access <=4
+ * bytes means each read width-matches (or is narrower than, hence reads memory
+ * from) exactly one chunk, which is always sound. */
+static int struct_member_copy_safe(const CType *type)
+{
+  Sym *f;
+  int align, saw_bf = 0;
+  if ((type->t & VT_BTYPE) != VT_STRUCT || !type->ref)
+    return 0;
+  for (f = type->ref->next; f; f = f->next)
+  {
+    if (f->type.t & VT_BITFIELD)
+    {
+      int w = bitfield_unit_width(f);
+      if (w != 1 && w != 2 && w != 4)
+        return 0; /* byte-wise (0) or 64-bit straddle: unsafe */
+      saw_bf = 1;
+    }
+    else
+    {
+      int w = type_size(&f->type, &align);
+      if (w != 1 && w != 2 && w != 4)
+        return 0; /* ull/double/long double/nested aggregate: unsafe */
+    }
+  }
+  return saw_bf;
+}
+
+/* Emit a byte-exact copy of a small struct as a sequence of width-aligned
+ * LOAD/STORE pairs, choosing each chunk's width to match the access width of
+ * the bitfield storage unit (or scalar member) starting there.  Width-matched
+ * chunks let store-load forwarding feed a copied bitfield word straight into a
+ * later read (the forwarder only narrows a *wider* store for immediates), so
+ * the downstream bitfield insert/extract fold can collapse packed-struct
+ * copies that would otherwise be an opaque memmove.  `src`/`dst` are LOCAL or
+ * GLOBAL lvalues whose c.i is the base byte offset; caller has popped src. */
+static void ir_emit_struct_unit_copy(const SValue *src, const SValue *dst,
+                                     const CType *stype, int size)
+{
+  unsigned char cut[16]; /* preferred chunk width starting at each byte */
+  Sym *f;
+  int p;
+
+  if (size <= 0 || size > (int)sizeof(cut))
+    return; /* caller gates size <= 16; defensive against overflow */
+  memset(cut, 0, sizeof(cut));
+  for (f = stype->ref->next; f; f = f->next)
+  {
+    int off = f->c, w, align;
+    if (f->type.t & VT_BITFIELD)
+      w = bitfield_unit_width(f);
+    else
+      w = type_size(&f->type, &align);
+    if ((w != 1 && w != 2 && w != 4) || off < 0 || off + w > size || (off % w))
+      continue; /* >4 (ull/long double) or misaligned: leave to greedy cover */
+    if (cut[off] < w)
+      cut[off] = (unsigned char)w;
+  }
+
+  for (p = 0; p < size;)
+  {
+    int w = 0, cand;
+    if (cut[p] && (p % cut[p]) == 0 && p + cut[p] <= size)
+      w = cut[p];
+    else
+      for (cand = 4; cand >= 1; cand >>= 1)
+      {
+        int k, crosses = 0;
+        if ((p % cand) != 0 || p + cand > size)
+          continue;
+        for (k = p + 1; k < p + cand; k++)
+          if (cut[k])
+          {
+            crosses = 1;
+            break;
+          }
+        if (!crosses)
+        {
+          w = cand;
+          break;
+        }
+      }
+    if (w == 0)
+      w = 1;
+
+    {
+      SValue s, d, tmp;
+      CType ct;
+      ct.ref = NULL;
+      ct.t = (w == 1 ? (VT_BYTE | VT_UNSIGNED)
+                     : w == 2 ? (VT_SHORT | VT_UNSIGNED) : VT_INT);
+
+      svalue_init(&s);
+      s.type = ct;
+      s.r = src->r;
+      s.vr = src->vr;
+      s.sym = src->sym;
+      s.c.i = src->c.i + p;
+
+      svalue_init(&tmp);
+      tmp.type = ct;
+      tmp.r = 0;
+      tmp.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_LOAD, &s, NULL, &tmp);
+
+      svalue_init(&d);
+      d.type = ct;
+      d.r = dst->r;
+      d.vr = dst->vr;
+      d.sym = dst->sym;
+      d.c.i = dst->c.i + p;
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_STORE, &tmp, NULL, &d);
+    }
+    p += w;
+  }
 }
 
 static int struct_is_single_1byte_scalar_member(const CType *type)
@@ -11039,6 +11427,24 @@ ST_FUNC void vstore(void)
     CType saved_struct_type = vtop->type; /* save before gaddrof destroys it */
     size = type_size(&vtop->type, &align);
 
+    /* Self-copy elision: source and destination are the same register-deref
+     * lvalue (same address vreg, same offset).  This is the post-call copy of
+     * a register-deref NRVO claim (`local.field = sret_call(...)`), where the
+     * call already wrote its result directly through the destination address —
+     * making the copy a no-op.  Also catches genuine struct self-assignment.
+     * Placed before the size-gated inline-copy paths so it applies to any
+     * struct size. */
+    if (tcc_state->ir && !NOEVAL_WANTED &&
+        (vtop[0].r & VT_LVAL) && (vtop[0].r & VT_VALMASK) < VT_CONST &&
+        (vtop[-1].r & VT_LVAL) && (vtop[-1].r & VT_VALMASK) < VT_CONST &&
+        vtop[0].vr >= 0 && vtop[0].vr == vtop[-1].vr &&
+        vtop[0].c.i == vtop[-1].c.i)
+    {
+      vtop--; /* pop src; vtop = dst (kept as result lvalue) */
+      vtop->type = saved_struct_type;
+      goto vstore_done;
+    }
+
     /* For small struct copies between stack locals/globals, expand to scalar
      * LOAD/STORE pairs in the IR.  This makes the stores visible to the
      * optimizer (store-load forwarding, constant propagation, DCE) instead of
@@ -11062,17 +11468,49 @@ ST_FUNC void vstore(void)
     int is_local_copy = (IS_LOCAL_LVAL(vtop[0].r) || src_is_vec_rvalue) &&
                          IS_LOCAL_LVAL(vtop[-1].r);
     int is_global_copy = IS_GLOBAL_LVAL(vtop[0].r) && IS_GLOBAL_LVAL(vtop[-1].r);
-    int size_limit = is_local_copy ? 64 : 32;
+    /* Mixed global<->local word copies (`struct y = global;` and the reverse)
+     * are the dominant struct-init idiom.  Expanding them to scalar LOAD/STORE
+     * (instead of an opaque memmove) exposes the bytes to store-load forwarding
+     * and DSE, which lets the optimizer fold a copied-then-field-read aggregate
+     * directly into the field access.  Restricted to the word-aligned path
+     * below (the size==1/2 narrow paths stay local-only). */
+    int is_mixed_copy =
+        (IS_GLOBAL_LVAL(vtop[0].r) && IS_LOCAL_LVAL(vtop[-1].r)) ||
+        (IS_LOCAL_LVAL(vtop[0].r) && IS_GLOBAL_LVAL(vtop[-1].r));
+    /* Mixed copies are only a win when the inline LOAD/STOREs are no larger
+     * than the memmove call they replace (~4 insns) AND/OR the optimizer can
+     * forward+DCE them.  Beyond two words the inline form just bloats code
+     * that a memmove handled in one call (e.g. structret's 24-byte structs),
+     * so cap mixed copies at 8 bytes.  Local/global copies keep their
+     * previously-tuned wider limits. */
+    int mixed_limit = struct_has_bitfield_member(&vtop->type) ? 16 : 4;
+    int size_limit = is_local_copy ? 64 : (is_mixed_copy ? mixed_limit : 32);
     if (tcc_state->ir && !has_vla && size > 0 && size <= size_limit &&
         ((!(size & 3) && !(align & 3)) ||
          (size == 2 && (align == 1 || is_vec_small) &&
           (struct_is_single_2byte_scalar_member(&vtop->type) || is_vec_small) &&
           !((vtop[0].c.i | vtop[-1].c.i) & 1) &&
           is_local_copy) ||
+         /* Packed all-bitfield struct that fits one 2- or 4-byte storage unit:
+          * copy as a single (possibly unaligned) halfword/word whose width
+          * matches how the bitfields are read back.  Allow mixed global<->local
+          * (the `struct y = global;` init and the identity-`retme` round-trip
+          * in the 20040709 bitfield idiom): exposing the value to store-load
+          * forwarding is what lets the downstream bitfield insert/extract fold
+          * collapse the whole copy.  Offsets must be aligned to the access
+          * width so the half/word access stays in-bounds of its slot. */
+         (size == 2 && align == 1 &&
+          struct_is_small_bitfield_word(&vtop->type) &&
+          !((vtop[0].c.i | vtop[-1].c.i) & 1) &&
+          (is_local_copy || is_mixed_copy)) ||
+         (size == 4 && align == 1 &&
+          struct_is_small_bitfield_word(&vtop->type) &&
+          !((vtop[0].c.i | vtop[-1].c.i) & 3) &&
+          (is_local_copy || is_mixed_copy)) ||
          (size == 1 && align == 1 &&
           (struct_is_single_1byte_scalar_member(&vtop->type) || is_vec_small) &&
           is_local_copy)) &&
-        (is_local_copy || is_global_copy) &&
+        (is_local_copy || is_global_copy || is_mixed_copy) &&
         !NOEVAL_WANTED)
     {
       SValue src = vtop[0];
@@ -11344,6 +11782,39 @@ ST_FUNC void vstore(void)
         tcc_ir_put(tcc_state->ir, TCCIR_OP_STORE, &tmp, NULL, &store_dst);
       }
 
+      vtop->type = saved_struct_type;
+      goto vstore_done;
+    }
+
+    /* Member-wise copy for a small packed struct that holds a bitfield in a
+     * 1/2/4-byte storage unit (the 20040709 idiom: `struct y = global;` and the
+     * identity-`retme` round-trip).  Packed structs have align 1, so they miss
+     * every word-aligned scalar-expansion path above and would memmove — which
+     * hides the value from store-load forwarding.  Copy each storage unit at
+     * its natural access width instead, so the copied bitfield word forwards
+     * into the later read and the insert/extract fold collapses the copy.
+     * Restricted to local<->local and mixed global<->local copies with a
+     * word-aligned base offset (so each chunk lands naturally aligned), and to
+     * structs where every member access fits a single <=4-byte unit
+     * (struct_member_copy_safe — a correctness guard against partial-forwarding
+     * a wider read; pure 64-bit-unit/straddling-bitfield structs stay memmove). */
+    if (tcc_state->ir && !has_vla && !NOEVAL_WANTED && size > 0 && size <= 16 &&
+        (align & 3) && struct_member_copy_safe(&saved_struct_type) &&
+        (is_local_copy || is_mixed_copy) &&
+        !((vtop[0].c.i | vtop[-1].c.i) & 3))
+    {
+      SValue src = vtop[0];
+      SValue dst = vtop[-1];
+      vtop--; /* pop src; vtop = dst (kept as result lvalue) */
+
+      if ((src.r & VT_VALMASK) == VT_LOCAL && (dst.r & VT_VALMASK) == VT_LOCAL &&
+          src.c.i == dst.c.i)
+      {
+        vtop->type = saved_struct_type;
+        goto vstore_done;
+      }
+
+      ir_emit_struct_unit_copy(&src, &dst, &saved_struct_type, size);
       vtop->type = saved_struct_type;
       goto vstore_done;
     }
@@ -13835,14 +14306,31 @@ static void gfunc_param_typed(Sym *func, Sym *arg)
           tcc_error("cannot pass large struct by value");
         }
 
-        /* Always allocate a fresh stack slot for the struct copy.
-         * Do NOT use get_temp_local_var() here: after gaddrof() converts
-         * the lvalue to a pointer, the VR_TEMP_LOCAL marker is lost from
-         * vstack, causing get_temp_local_var() to reuse the same slot for
-         * a subsequent struct argument in the same call.  This would make
-         * both struct copies alias the same memory.  (See GCC PR 67226.) */
-        loc = (loc - size) & -align;
-        int tmp_loc = loc;
+        /* Allocate a stack slot for the struct copy.
+         *
+         * For a non-variadic argument the slot is converted to a pointer by
+         * the gaddrof() below, which drops the VR_TEMP_LOCAL marker from the
+         * vstack — so get_temp_local_var() could reuse the same slot for a
+         * sibling struct argument in the same call, aliasing the two copies
+         * (GCC PR 67226).  Those keep a fresh, never-reused slot.
+         *
+         * A variadic anonymous argument instead stays a struct lvalue (no
+         * gaddrof — see the FUNC_ELLIPSIS return below), so it is safe to draw
+         * its copy from the call-scoped arg-struct temp pool: that pool keeps
+         * concurrently-live copies in distinct slots while reclaiming slots
+         * from completed statements, collapsing the one-copy-per-call-site
+         * stack growth seen when marshaling many large by-value variadic
+         * structs. */
+        int tmp_loc;
+        if (func_type == FUNC_ELLIPSIS)
+        {
+          tmp_loc = get_arg_struct_temp(size, align);
+        }
+        else
+        {
+          loc = (loc - size) & -align;
+          tmp_loc = loc;
+        }
 
         /* Store the source struct into the temporary destination.
          * vstore() will emit a memmove() for struct types. */
@@ -14878,6 +15366,9 @@ static void unary_funcall(void)
    * lets the IR see the call's effect and the later use as a single
    * variable (otherwise DCE may misanalyse the dependency). */
   int nrvo_call_vreg = -1;
+  /* When NRVO claims a register-deref destination, this holds the address
+     vreg so the post-call result is pushed as a deref through it. */
+  int nrvo_call_ptr_vreg = -1;
   if (!NOEVAL_WANTED && tcc_state->ir)
     call_id = tcc_state->ir->next_call_id++;
 
@@ -14920,16 +15411,28 @@ static void unary_funcall(void)
        * local struct field offset coincides with the caller's other
        * locals (much more likely once NRVO eliminates the temp). */
       int nrvo_claimed = 0;
+      int nrvo_ptr_claimed = 0;
       int nrvo_vreg = -1;
-      int sret_loc;
+      int nrvo_ptr_vreg = -1;
+      int sret_loc = 0;
       int callee_is_nested = (call_func_sym && call_func_sym->a.nested_func);
       if (ret_nregs == 0 && tcc_state->nrvo_target_active &&
           tcc_state->nrvo_target_size == size &&
           tcc_state->nrvo_target_align == align &&
           !callee_is_nested)
       {
-        sret_loc = tcc_state->nrvo_target_loc;
-        nrvo_vreg = tcc_state->nrvo_target_vreg;
+        if (tcc_state->nrvo_target_ptr_vreg >= 0)
+        {
+          /* Register-deref destination: write the sret directly through the
+           * destination's address vreg. */
+          nrvo_ptr_vreg = tcc_state->nrvo_target_ptr_vreg;
+          nrvo_ptr_claimed = 1;
+        }
+        else
+        {
+          sret_loc = tcc_state->nrvo_target_loc;
+          nrvo_vreg = tcc_state->nrvo_target_vreg;
+        }
         nrvo_claimed = 1;
         /* Consume the hint: nested calls inside this expression must not
          * try to claim the same slot. */
@@ -14941,14 +15444,31 @@ static void unary_funcall(void)
         sret_loc = loc;
       }
       ret.type = s->type;
-      ret.r = VT_LOCAL | VT_LVAL;
-      /* pass it as 'int' to avoid structure arg passing
-         problems */
-      vseti(VT_LOCAL, sret_loc);
-      if (nrvo_claimed)
+      if (nrvo_ptr_claimed)
       {
-        vtop->vr = nrvo_vreg;
-        nrvo_call_vreg = nrvo_vreg;
+        /* Push the destination address (held in nrvo_ptr_vreg) as the sret
+         * pointer param.  The post-call result is a deref through it. */
+        SValue ptr;
+        svalue_init(&ptr);
+        ptr.type.t = VT_PTR;
+        ptr.type.ref = s->type.ref;
+        ptr.r = 0; /* value in vreg */
+        ptr.vr = nrvo_ptr_vreg;
+        vpushv(&ptr);
+        ret.r = VT_LVAL; /* register-deref lvalue (valmask 0) */
+        nrvo_call_ptr_vreg = nrvo_ptr_vreg;
+      }
+      else
+      {
+        ret.r = VT_LOCAL | VT_LVAL;
+        /* pass it as 'int' to avoid structure arg passing
+           problems */
+        vseti(VT_LOCAL, sret_loc);
+        if (nrvo_claimed)
+        {
+          vtop->vr = nrvo_vreg;
+          nrvo_call_vreg = nrvo_vreg;
+        }
       }
 #ifdef CONFIG_TCC_BCHECK
       /* Skip bcheck padding when NRVO reused a caller-owned slot — that
@@ -16297,7 +16817,8 @@ va_arg_pack_done:
       if ((!macro_ptr || macro_ptr < _fsb || macro_ptr >= _fsb + _fsl) &&
           !inline_body_has_unsafe_shadowed_ident(inline_fn->func_str, call_func_sym) &&
           !inline_body_has_static_local(inline_fn->func_str) &&
-          !inline_body_has_apply_args(inline_fn->func_str))
+          !inline_body_has_apply_args(inline_fn->func_str) &&
+          auto_inline_nonstatic_struct_body_ok(call_func_sym, inline_fn->func_str))
       {
         if (TCC_LOG_INLINE_STRUCT)
           fprintf(stderr, "[auto-inline] callsite: inlining %s\n", get_tok_str(call_func_sym->v & ~SYM_FIELD, NULL));
@@ -16700,6 +17221,12 @@ va_arg_pack_done:
        * later reads as belonging to the same variable. */
       if (nrvo_call_vreg != -1)
         vtop->vr = nrvo_call_vreg;
+      /* Register-deref NRVO: the result is a deref through the destination
+       * address vreg.  ret.r was set to VT_LVAL (valmask 0); tag the vreg so
+       * the following vstore sees src and dst sharing the same address vreg
+       * and elides the copy. */
+      else if (nrvo_call_ptr_vreg != -1)
+        vtop->vr = nrvo_call_ptr_vreg;
     }
     else
     {
@@ -23318,7 +23845,60 @@ static void expr_eq(void)
     next();
     if (t == '=')
     {
+      /* NRVO for plain assignment `dest = sret_call(...)`: hint that the
+       * first composite-returning call in the RHS may write its result
+       * directly into the destination, eliminating the temp buffer plus the
+       * temp->dst copy (a memmove for big structs).  Mirror the
+       * local-declaration NRVO path (see decl initializer handling).  Two
+       * destination shapes qualify, both of a non-volatile struct/complex
+       * type:
+       *   - a plain stack-local lvalue (`v = f()`): targeted by stack offset.
+       *   - a register-deref lvalue (`v.field = f()`, where this fork's
+       *     gaddrof materialized the field address into a vreg via LEA):
+       *     targeted by that address vreg.
+       * The call-site claim (gfunc_call) re-checks an exact size/align match
+       * before reusing the destination. */
+      int saved_nrvo_active = tcc_state->nrvo_target_active;
+      int saved_nrvo_loc = tcc_state->nrvo_target_loc;
+      int saved_nrvo_vreg = tcc_state->nrvo_target_vreg;
+      int saved_nrvo_size = tcc_state->nrvo_target_size;
+      int saved_nrvo_align = tcc_state->nrvo_target_align;
+      int saved_nrvo_ptr_vreg = tcc_state->nrvo_target_ptr_vreg;
+      int lhs_bt = vtop->type.t & VT_BTYPE;
+      int lhs_is_local =
+          (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == (VT_LOCAL | VT_LVAL);
+      int lhs_is_reg_deref =
+          (vtop->r & VT_LVAL) && (vtop->r & VT_VALMASK) < VT_CONST &&
+          vtop->vr >= 0;
+      if (tcc_state->ir && !nocode_wanted &&
+          (lhs_bt == VT_STRUCT || (vtop->type.t & VT_COMPLEX)) &&
+          !(vtop->type.t & VT_VECTOR) &&
+          (lhs_is_local || lhs_is_reg_deref) &&
+          !(vtop->type.t & VT_VOLATILE))
+      {
+        int nrvo_align;
+        int nrvo_size = type_size(&vtop->type, &nrvo_align);
+        tcc_state->nrvo_target_active = 1;
+        tcc_state->nrvo_target_size = nrvo_size;
+        tcc_state->nrvo_target_align = nrvo_align;
+        if (lhs_is_local)
+        {
+          tcc_state->nrvo_target_loc = vtop->c.i;
+          tcc_state->nrvo_target_vreg = vtop->vr;
+          tcc_state->nrvo_target_ptr_vreg = -1;
+        }
+        else
+        {
+          tcc_state->nrvo_target_ptr_vreg = vtop->vr;
+        }
+      }
       expr_eq();
+      tcc_state->nrvo_target_active = saved_nrvo_active;
+      tcc_state->nrvo_target_loc = saved_nrvo_loc;
+      tcc_state->nrvo_target_vreg = saved_nrvo_vreg;
+      tcc_state->nrvo_target_size = saved_nrvo_size;
+      tcc_state->nrvo_target_align = saved_nrvo_align;
+      tcc_state->nrvo_target_ptr_vreg = saved_nrvo_ptr_vreg;
     }
     else
     {
@@ -24513,7 +25093,22 @@ static void lblock(int *bsym, int *csym)
   }
 }
 
+static void block_1(int flags);
+
+/* Wrapper that scopes the variadic struct-argument temp pool to one
+ * statement.  Slots reserved while parsing this statement (and its
+ * sub-expressions) are released on exit so sibling statements reuse them,
+ * but a nested block() — e.g. a GNU statement-expression used as a call
+ * argument — saves/restores the mask and so cannot recycle a slot the
+ * enclosing call still has in flight. */
 static void block(int flags)
+{
+  uint64_t saved_arg_struct_busy = arg_struct_temp_busy;
+  block_1(flags);
+  arg_struct_temp_busy = saved_arg_struct_busy;
+}
+
+static void block_1(int flags)
 {
   int a, b, c, d, e, t;
   struct scope o;
@@ -25661,6 +26256,48 @@ static void init_putv(init_params *p, CType *type, unsigned long c, int vreg)
   if (type->t & VT_BITFIELD)
     size = (BIT_POS(type->t) + BIT_SIZE(type->t) + 7) / 8;
   init_assert(p, c + size);
+
+  if (p->const_probe)
+  {
+    /* Template probe (see init_params): capture a plain load-time-constant
+     * integer/pointer scalar into the host-side template buffer, emit nothing.
+     * Anything else (runtime value, symbol/relocation, bitfield, float/struct,
+     * out-of-range offset) aborts the templating attempt. */
+    int pbt = type->t & VT_BTYPE;
+    int rel = (int)c - p->const_probe_base;
+    if ((vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST && !(type->t & VT_BITFIELD) &&
+        !(type->t & VT_COMPLEX) &&
+        (pbt == VT_BOOL || pbt == VT_BYTE || pbt == VT_SHORT || pbt == VT_INT || pbt == VT_LLONG || pbt == VT_PTR) &&
+        rel >= 0 && rel + size <= p->const_probe_size)
+    {
+      uint64_t cval = (uint64_t)vtop->c.i;
+      unsigned char *d = p->const_probe_data + rel;
+      switch (size)
+      {
+      case 1:
+        d[0] = (unsigned char)cval;
+        break;
+      case 2:
+        write16le(d, (uint16_t)cval);
+        break;
+      case 4:
+        write32le(d, (uint32_t)cval);
+        break;
+      case 8:
+        write64le(d, cval);
+        break;
+      default:
+        p->const_probe_failed = 1;
+        break;
+      }
+    }
+    else
+    {
+      p->const_probe_failed = 1;
+    }
+    vtop--;
+    return;
+  }
 
   if (sec)
   {
@@ -26899,6 +27536,7 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has
     int saved_nrvo_vreg = tcc_state->nrvo_target_vreg;
     int saved_nrvo_size = tcc_state->nrvo_target_size;
     int saved_nrvo_align = tcc_state->nrvo_target_align;
+    int saved_nrvo_ptr_vreg = tcc_state->nrvo_target_ptr_vreg;
     if (!sec && tcc_state->ir &&
         ((type->t & VT_BTYPE) == VT_STRUCT || (type->t & VT_COMPLEX)))
     {
@@ -26909,13 +27547,108 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has
       tcc_state->nrvo_target_vreg = vreg;
       tcc_state->nrvo_target_size = nrvo_size;
       tcc_state->nrvo_target_align = nrvo_align;
+      tcc_state->nrvo_target_ptr_vreg = -1;
     }
 
-    decl_initializer(&p, type, addr, DIF_FIRST, vreg);
+    /* Large constant local array: lower as a single memcpy from a .rodata
+     * template (matching GCC) instead of memset + a store per non-zero
+     * element.  Probe the initializer into a throwaway template; only if it
+     * is entirely load-time-constant do we emit the memcpy and skip the
+     * per-element path.  Otherwise rewind and fall through to normal init. */
+    int templated = 0;
+    if (!sec && tcc_state->ir && has_init && !NODATA_WANTED && (type->t & VT_ARRAY) && !(type->t & VT_VLA) &&
+        !(type->t & VT_COMPLEX) && size > 256)
+    {
+      /* Both paths leave the live token at the start of the initializer:
+       * the unknown-size path has reset the macro to its start, and the
+       * known-size path is reading the live stream.  Only divert brace
+       * initializers (strings are already bulk-copied elsewhere). */
+      if (tok == '{')
+      {
+        TokenString *saved = init_str;
+        if (!saved)
+        {
+          skip_or_save_block(&saved);
+          unget_tok(0);
+          begin_macro(saved, 1);
+          next();
+          init_str = saved; /* so the no_alloc cleanup pops the macro */
+        }
+        /* Probe the initializer into a host-side template buffer under
+         * nocode_wanted (so runtime initializer expressions emit no code and
+         * the fall-back reparse stays clean).  const_probe_failed is set if any
+         * element is not a plain load-time-constant integer/pointer. */
+        unsigned char *tmpl_buf = tcc_mallocz(size);
+        init_params pp = {0};
+        pp.const_probe = 1;
+        pp.const_probe_data = tmpl_buf;
+        pp.const_probe_base = addr;
+        pp.const_probe_size = size;
+        pp.flex_array_ref = p.flex_array_ref;
+        nocode_wanted++;
+        decl_initializer(&pp, type, addr, DIF_FIRST, -1);
+        nocode_wanted--;
+        /* Density gate: the per-element path costs ~memset + a store per
+         * non-zero element, while the template costs a fixed memcpy plus the
+         * full initializer in .rodata.  Only template when enough of the array
+         * is non-zero — otherwise a sparse initializer (e.g. `int t[1025] =
+         * { 1024 }`) would bloat code and defeat dead-store elimination. */
+        int nz = 0;
+        if (!pp.const_probe_failed)
+        {
+          for (int bi = 0; bi < size; bi++)
+            if (tmpl_buf[bi])
+              nz++;
+        }
+        if (!pp.const_probe_failed && nz >= 16 && nz * 4 >= size)
+        {
+          /* Commit the template to .rodata and emit memcpy(&local, &tmpl, size). */
+          int tmpl_off = section_add(rodata_section, size, align);
+          if (!NODATA_WANTED)
+            memcpy(rodata_section->data + tmpl_off, tmpl_buf, size);
+          Sym *tmpl_sym = get_sym_ref(&char_type, rodata_section, tmpl_off, size);
+          SValue cargs[3];
+
+          svalue_init(&cargs[0]);
+          cargs[0].type = char_pointer_type;
+          cargs[0].r = VT_LOCAL;
+          cargs[0].c.i = addr;
+          cargs[0].vr = -1;
+
+          svalue_init(&cargs[1]);
+          cargs[1].type = char_pointer_type;
+          cargs[1].r = VT_CONST | VT_SYM;
+          cargs[1].sym = tmpl_sym;
+          cargs[1].c.i = 0;
+          cargs[1].vr = -1;
+
+          svalue_init(&cargs[2]);
+          cargs[2].type.t = VT_INT;
+          cargs[2].type.ref = NULL;
+          cargs[2].r = VT_CONST;
+          cargs[2].c.i = size;
+          cargs[2].vr = -1;
+
+          gen_ir_void_call_args(cargs, 3, TOK_memcpy);
+          templated = 1;
+        }
+        else
+        {
+          /* Not all-constant: rewind the macro for a normal per-element pass. */
+          macro_ptr = tok_str_buf(saved);
+          next();
+        }
+        tcc_free(tmpl_buf);
+      }
+    }
+
+    if (!templated)
+      decl_initializer(&p, type, addr, DIF_FIRST, vreg);
 
     if (p.const_init_sym)
       p.const_init_sym->const_init_in_progress = 0;
 
+    tcc_state->nrvo_target_ptr_vreg = saved_nrvo_ptr_vreg;
     tcc_state->nrvo_target_active = saved_nrvo_active;
     tcc_state->nrvo_target_loc = saved_nrvo_loc;
     tcc_state->nrvo_target_vreg = saved_nrvo_vreg;
@@ -28051,6 +28784,8 @@ static void gen_function(Sym *sym)
   if (ir->has_static_chain)
     loc -= 4;
   nb_temp_local_vars = 0;
+  nb_arg_struct_temps = 0;
+  arg_struct_temp_busy = 0;
   if (!sym->a.naked)
   {
     // gfunc_prolog(sym);
@@ -28306,6 +29041,12 @@ static void gen_function(Sym *sym)
   if (tcc_state->optimize >= 1)
     tcc_ir_opt_cse_param_add(ir);
 
+  /* Redundant boolean-normalisation: rewrite `CMP X,#0; SETIF NE` to a plain
+   * copy of X when X is already a {0,1} boolean (the `!!bool` idiom).  Runs
+   * before CMP+SETIF CSE so the freed copies expose duplicate compares. */
+  if (tcc_state->optimize >= 1)
+    tcc_ir_opt_bool_norm_elim(ir);
+
   /* CMP+SETIF CSE: replace a second CMP+SETIF whose operands and cond
    * match an earlier one in the same BB with ASSIGN-from-prior-vreg. */
   if (tcc_state->optimize >= 1)
@@ -28441,6 +29182,12 @@ static void gen_function(Sym *sym)
   if (tcc_state->opt_lea_fold)
     tcc_ir_opt_lea_fold(ir);
 
+  /* LEA read-modify-write fold — collapse a stack-slot LEA whose every use is
+   * a deref (load + store of `u.field++`) into direct StackLoc accesses, which
+   * lea_fold's single-use guard cannot do. */
+  if (tcc_state->opt_lea_fold)
+    tcc_ir_opt_lea_rmw_fold(ir);
+
   /* Post-Increment Load/Store Fusion - fuse LOAD/STORE + ADD
    * Pattern: *ptr++; -> ARM LDR/STR with post-increment */
   if (tcc_state->opt_postinc_fusion)
@@ -28474,6 +29221,21 @@ static void gen_function(Sym *sym)
 #ifdef CONFIG_TCC_DEBUG
   dump_ir_after_pass(tcc_state, ir, "entry_store_group");
 #endif
+
+  /* Struct-copy round-trip elimination: drop the `memmove(B,A); memmove(A,B)`
+   * pair left by an inlined identity `y = retme(y)` struct-by-value helper, so
+   * the field poke/re-extract around it sits in one straight-line block and the
+   * memory group's sl_forward + bf_insert_extract cascade can collapse it. */
+  if (tcc_state->opt_redundant_store)
+  {
+    if (tcc_ir_opt_struct_copy_roundtrip_elim(ir) > 0)
+    {
+      if (tcc_state->opt_dce)
+        tcc_ir_opt_dce(ir);
+      tcc_ir_opt_compact_nops(ir);
+    }
+  }
+
 
   /* Phase 4: Store-Load Forwarding — trigger-based iterative group.
    * sl_forward is the trigger (idx 0): if it returns 0, the group exits.
@@ -29315,6 +30077,25 @@ static void gen_function(Sym *sym)
     }
   }
 
+  /* Redundant zero-trip entry-guard elimination.  Sequential counted loops
+   * sharing a counter (memclr's 3 loops over i) keep a pre-loop guard on the
+   * 2nd/3rd loops because the IV's entry value is the previous loop's exit
+   * value, invisible to immediate-init IV detection / value tracking.  Carry
+   * each loop's constant exit value forward and drop the provably-dead guards.
+   * Run LAST among loop passes (after all rotation/unroll/IV-SR) so removing a
+   * guard cannot perturb a downstream loop transform — only RA follows. */
+  if (tcc_state->opt_const_prop && !getenv("TCC_NO_GUARD_ELIM"))
+  {
+    if (tcc_ir_opt_loop_guard_elim(ir) > 0)
+    {
+      if (tcc_state->opt_dce)
+        tcc_ir_opt_dce(ir);
+      tcc_ir_opt_compact_nops(ir);
+      if (tcc_state->opt_jump_threading)
+        tcc_ir_opt_eliminate_fallthrough(ir);
+    }
+  }
+
   /* CMP narrowing — `CMP T_u64, u64_const_with_hi_0` → 32-bit CMP when
    * T's hi is provably zero (from SHR≥32 or ZEXT).  Eliminates the hi
    * half setup and compare. */
@@ -29330,6 +30111,12 @@ static void gen_function(Sym *sym)
    * Must run late, after all other optimizations have simplified the IR,
    * so we see the cleanest diamond patterns. */
   tcc_ir_opt_select(ir);
+
+  /* Fold the `(a CMP b) ? -1 : 0` mask idiom (SETIF + #0 SUB) into a single
+   * SELECT(#-1, #0, cond).  Shares opt_select's late placement so the new
+   * SELECT's flag-setting CMP is not deleted by a downstream orphan-CMP pass. */
+  if (tcc_state->optimize > 0)
+    tcc_ir_opt_setif_neg_to_select(ir);
 
   /* Recompute leafness after IR optimizations.
    * IR construction marks the function non-leaf as soon as a call op is
@@ -29445,6 +30232,79 @@ static void gen_function(Sym *sym)
 
   nocode_wanted = 0;
 
+  /* Capture whether the body still contains an aggregate (memmove/memcpy) copy
+   * BEFORE the late forwarding pass below collapses it away.  The end-of-function
+   * inline promote/demote uses this as the "is a struct-copier" signal: once
+   * memmove_global_load_fwd turns `struct y=g; y.f+=x; return y.f;` into a bare
+   * global load, re-scanning the final IR would wrongly see a tiny inline-worthy
+   * body and duplicate it into every caller (20040709-2 test*).  Capturing here
+   * preserves the pre-collapse classification. */
+  /* Inline classification captured BEFORE the late forwarding pass collapses a
+   * `struct y=g; y.f+=x; return y.f;` helper (fn1/fn2) into a tiny global load.
+   * A NON-static helper that (a) copies an aggregate, (b) reads a GLOBAL, and
+   * (c) takes a parameter is kept out of line: inlined at a runtime call site it
+   * just duplicates code (the global read doesn't fold and the standalone copy
+   * stays), as GCC does.  The three conditions together exclude the cases that
+   * SHOULD inline: identity forwarders `retme(x){return x;}` copy a PARAM not a
+   * global (no reads_global); `ini(void){g2=g1;...}` has no parameter (folds when
+   * inlined); pure-computation const-folders (960311, pr93744) have no aggregate
+   * copy.  Captured here because forwarding removes the memmove the demote keys on. */
+  int had_aggr_copy = 0;
+  int reads_global = 0;
+  int has_params = ir && ir->parameters_count > 0;
+  if (ir)
+  {
+    for (int ii = 0; ii < ir->next_instruction_index; ii++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[ii];
+      if (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID)
+      {
+        Sym *cs = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+        const char *cn = cs ? get_tok_str(cs->v, NULL) : NULL;
+        if (cn && (strstr(cn, "memmove") || strstr(cn, "memcpy")))
+          had_aggr_copy = 1;
+      }
+      /* Global DATA reference — NOT a call target (src1 of FUNCCALL is the callee
+       * symbol, global but not a data read). */
+      if (!reads_global &&
+          (irop_config[q->op].has_dest || irop_config[q->op].has_src1 || irop_config[q->op].has_src2))
+      {
+        int call_callee = (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID);
+        IROperand gops[3];
+        gops[0] = tcc_ir_op_get_dest(ir, q);
+        gops[1] = call_callee ? IROP_NONE : tcc_ir_get_src1(ir, ii);
+        gops[2] = tcc_ir_get_src2(ir, ii);
+        for (int j = 0; j < 3; j++)
+          if (gops[j].is_sym && !gops[j].is_local)
+          {
+            reads_global = 1;
+            break;
+          }
+      }
+    }
+  }
+  int nonstatic_global_copier =
+      had_aggr_copy && reads_global && has_params && sym && !(sym->type.t & VT_STATIC);
+
+  /* Init-copy-from-global load forwarding: `struct y = global; ... return y.f`
+   * reads the global directly (like GCC) and drops the dead memmove + stack
+   * slot.  Runs at the END of the SSA pipeline — once the identity-retme round
+   * trip and the bitfield write-back have been eliminated, the copied slot is
+   * reduced to read-only loads (the precondition the pass checks) — and BEFORE
+   * the stack-compaction below, so the freed slot shrinks the frame.  The
+   * straight-line no-call/no-store window gate keeps it off the
+   * `x=s; r=fn(a); compare x,s` snapshot idiom (a call separates the copy from
+   * the reads there), whose copy must be preserved. */
+  if (tcc_state->optimize > 0 && tcc_state->opt_redundant_store)
+  {
+    if (tcc_ir_opt_memmove_global_load_fwd(ir) > 0)
+    {
+      if (tcc_state->opt_dce)
+        tcc_ir_opt_dce(ir);
+      tcc_ir_opt_compact_nops(ir);
+    }
+  }
+
   /* reset local stack */
   pop_local_syms(NULL, 0);
 
@@ -29516,11 +30376,37 @@ static void gen_function(Sym *sym)
   if (tcc_state->optimize < 1 && tcc_state->registers_for_allocator > 12)
     tcc_state->registers_for_allocator = 12;
 
+  /* Bitfield insert -> ARM BFI: lower the observed-insert idiom
+   * `(W & ~field) | (V << lsb)` to a single BFI.  Must run BEFORE barrel-shift
+   * fusion (which would otherwise fold the field-value SHL into the OR).
+   * Provably non-increasing; lsb/width recorded in ir->bfi_params[]. */
+  if (tcc_state->optimize > 0)
+    tcc_ir_opt_bitfield_insert_to_bfi(ir);
+
   /* Barrel shift fusion: fold single-use SHL/SHR/SAR/ROR into consuming ALU op.
    * Runs just before regalloc so the register allocator sees updated live ranges.
    * Results stored in ir->barrel_shifts[] keyed by orig_index. */
   if (tcc_state->optimize > 0)
     tcc_ir_barrel_shift_fusion(ir);
+
+  /* Two-shift bitfield extract `(x<<a)>>b` → UBFX, for pairs the barrel-shift
+   * fusion above could NOT fold into a consumer (it NOPs the ones it folds, so
+   * a surviving SHL+SHR is a genuine two-instruction extract feeding a store /
+   * multiply / call / multi-use that can't take a shifted operand).  Strictly
+   * reduces instruction count; runs here, before regalloc, so RA sees the
+   * UBFX and the now-dead SHL is dropped. */
+  if (tcc_state->optimize > 0)
+    tcc_ir_opt_shift_pair_to_ubfx(ir);
+
+  /* Annotate 64-bit shifts with provably-dead result halves so codegen can
+   * skip the dead half-write (the 64-bit bitfield-extract idiom: SHL #a; SHR
+   * #b, b>=32, sub-32-bit field spanning a unit word boundary).  Runs after
+   * all IR transforms (so def-use is final) and just before RA; reads the
+   * pre-RA narrowed operand btypes.  RA spills of a flagged value store/reload
+   * the dead half as never-read garbage, so the annotation stays valid.
+   * Keyed by orig_index like barrel_shifts; consumed in codegen. */
+  if (tcc_state->optimize > 0)
+    tcc_ir_opt_shift64_dead_half(ir);
 
   /* Register allocation (SSA-based linear scan) */
   {
@@ -29538,6 +30424,13 @@ static void gen_function(Sym *sym)
    * merge directly and drop the bridging unconditional JUMP. */
   if (tcc_state->optimize > 0)
     tcc_ir_opt_post_ra_forward_diamond(ir);
+
+  /* Abort tail-merge + body-invert: per distinct noreturn callee, keep the
+   * first guarded call inline as a shared sink and invert+retarget every later
+   * guard to it, NOPing the duplicate calls.  Runs here so the jump-threading /
+   * eliminate-fallthrough / DCE cleanup below tidies the resulting NOPs. */
+  if (tcc_state->optimize > 0)
+    tcc_ir_opt_abort_tail_merge(ir);
 
   /* SSA optimization may NOP instructions, creating stale JMP targets
    * and fall-through JMPs.  Thread targets through NOPs first, then
@@ -30269,6 +31162,14 @@ static void gen_function(Sym *sym)
     tcc_free(ir->barrel_shifts);
     ir->barrel_shifts = NULL;
   }
+  if (ir->shift64_dead_half) {
+    tcc_free(ir->shift64_dead_half);
+    ir->shift64_dead_half = NULL;
+  }
+  if (ir->bfi_params) {
+    tcc_free(ir->bfi_params);
+    ir->bfi_params = NULL;
+  }
 
   if (!sym->a.naked)
   {
@@ -30333,9 +31234,21 @@ static void gen_function(Sym *sym)
    * to omit the frame pointer, breaking static chain access. */
   if (ir && sym && !sym->type.ref->f.func_auto_inline &&
       !sym->a.nested_func &&
+      !nonstatic_global_copier &&
       ir->next_instruction_index <= 8)
   {
     sym->type.ref->f.func_auto_inline = 1;
+  }
+
+  /* Keep a non-static global-aggregate-copier with a parameter (the fn1/fn2
+   * shape) out of line even after the late collapse shrank it below the
+   * trivial-inline tier — the IR>12 demote below would miss the now-tiny body.
+   * See nonstatic_global_copier above for why this set excludes retme/ini/960311. */
+  if (ir && sym && sym->type.ref->f.func_auto_inline &&
+      !sym->a.nested_func && !sym->type.ref->f.func_alwinl &&
+      nonstatic_global_copier)
+  {
+    sym->type.ref->f.func_auto_inline = 0;
   }
 
   /* Post-optimization revoke: a function tagged auto_inline at registration
@@ -30351,11 +31264,18 @@ static void gen_function(Sym *sym)
       ir->next_instruction_index > 12)
   {
     int call_ops = 0;
+    int has_aggr_copy = 0;
     for (int ii = 0; ii < ir->next_instruction_index; ii++)
     {
       int op = ir->compact_instructions[ii].op;
       if (op == TCCIR_OP_FUNCCALLVAL || op == TCCIR_OP_FUNCCALLVOID)
+      {
         call_ops++;
+        Sym *cs = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, &ir->compact_instructions[ii]));
+        const char *cn = cs ? get_tok_str(cs->v, NULL) : NULL;
+        if (cn && (strstr(cn, "memmove") || strstr(cn, "memcpy")))
+          has_aggr_copy = 1;
+      }
     }
     /* Naturally-small functions (short token body) whose post-opt IR grew
      * mainly because their callees were inlined into them shouldn't be
@@ -30376,7 +31296,17 @@ static void gen_function(Sym *sym)
      * "too expensive to inline".  Naturally-small bodies (≤60 tokens) skip
      * the IR-size gate and only get demoted for call-heavy patterns. */
     int naturally_small = (natural_body_len > 0 && natural_body_len <= 60);
-    if (call_ops >= 3 || (!naturally_small && ir->next_instruction_index > 24))
+    /* A non-static function is always emitted standalone (its definition must
+     * stay globally visible), so inlining a non-trivial body merely duplicates
+     * it at every call site without dropping the out-of-line copy — pure bloat,
+     * which GCC avoids by keeping such helpers out of line.  Only the ≤8-IR
+     * "trivial" promote tier (handled above) is worth inlining for a non-static
+     * function; demote anything larger here.  (Static functions can still be
+     * inlined and have their standalone copy dropped by --gc-sections.) */
+    int nonstatic_bloat =
+        !(sym->type.t & VT_STATIC) && has_aggr_copy && ir->next_instruction_index > 8;
+    if (call_ops >= 3 || (!naturally_small && ir->next_instruction_index > 24) ||
+        nonstatic_bloat)
     {
       sym->type.ref->f.func_auto_inline = 0;
     }

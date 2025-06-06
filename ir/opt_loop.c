@@ -1438,3 +1438,307 @@ int tcc_ir_opt_loop_ptr_iv_exit_subst(TCCIRState *ir)
   tcc_ir_free_loops(loops);
   return total;
 }
+
+/* ------------------------------------------------------------------------
+ * Redundant zero-trip entry-guard elimination via loop-exit-value carry.
+ *
+ * memclr-style code chains sequential counted loops over a shared counter i:
+ *   for (i = 0; i < A; i++) ...        // immediate init i = 0
+ *   for (;      i < B; i++) ...        // i carries in = A  (loop1 exit value)
+ *   for (;      i < C; i++) ...        // i carries in = B  (loop2 exit value)
+ * After loop rotation every loop gets a pre-loop zero-trip guard
+ *   CMP i,#lim ; JUMPIF (i >= lim) skip_loop
+ * The first guard folds (i = 0 is an immediate init), but the 2nd/3rd survive:
+ * find_induction_vars_ex only sees an IV whose preheader init is an immediate,
+ * so it never learns that i equals the *previous loop's exit value* — the trip
+ * count is uncomputable and the guard stays, costing ~2 insns/loop vs GCC.
+ *
+ * This pass walks loops in program order, tracking the IV vreg's known
+ * constant value.  For a loop whose entry value (immediate init OR carried
+ * exit value of the preceding loop) and guard limit are constants and whose
+ * guard is provably never taken, it NOPs the guard.  When the loop is a
+ * single-exit counted loop it records the constant exit value
+ * (entry + trip_count*step) for the next loop reusing the same vreg.
+ *
+ * Soundness: removing the guard depends ONLY on the entry value at the guard
+ * (a value established *before* the loop body) making the guard predicate
+ * false — independent of the loop body.  A carried value is consumed only when
+ * (a) the source loop has a single exit (so completion implies i == final),
+ * (b) the source loop's own guard was absent/removed (so its exit_target is
+ * reached only via completion, never via a guard-skip with i == entry), and
+ * (c) nothing redefines i and no foreign edge merges in between (clean check).
+ * Gated off whole-function on un-enumerable control flow (IJUMP/SWITCH_*).
+ * Default-ON at -O1+; disable with TCC_NO_GUARD_ELIM=1.
+ * ---------------------------------------------------------------------- */
+
+/* Evaluate "a <cond> b" for a JUMPIF condition token.  1 = taken, 0 = not
+ * taken, -1 = condition not understood. */
+static int guard_eval_cond(int a, int cond, int b)
+{
+  switch (cond)
+  {
+  case TOK_EQ:  return a == b;
+  case TOK_NE:  return a != b;
+  case TOK_LT:  return a < b;
+  case TOK_LE:  return a <= b;
+  case TOK_GT:  return a > b;
+  case TOK_GE:  return a >= b;
+  case TOK_ULT: return (unsigned)a <  (unsigned)b;
+  case TOK_ULE: return (unsigned)a <= (unsigned)b;
+  case TOK_UGT: return (unsigned)a >  (unsigned)b;
+  case TOK_UGE: return (unsigned)a >= (unsigned)b;
+  default:      return -1;
+  }
+}
+
+/* Verify iv has exactly one in-loop definition and it is a step-by-constant
+ * update (`iv <- iv + #s` or copy-through `T <- iv; iv <- T + #s`).  Returns
+ * the positive step, or 0 if iv is not a simple additive counter. */
+static int guard_iv_step(TCCIRState *ir, IRLoop *loop, int iv)
+{
+  int def_idx = -1, defs = 0;
+  for (int i = loop->start_idx; i <= loop->end_idx; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
+      continue;
+    if (irop_get_vreg(tcc_ir_op_get_dest(ir, q)) != iv)
+      continue;
+    def_idx = i;
+    defs++;
+  }
+  if (defs != 1)
+    return 0;
+  IRQuadCompact *dq = &ir->compact_instructions[def_idx];
+  if (dq->op != TCCIR_OP_ADD)
+    return 0;
+  IROperand b = tcc_ir_op_get_src2(ir, dq);
+  if (!irop_is_immediate(b))
+    return 0;
+  int step = (int)irop_get_imm64_ex(ir, b);
+  if (step <= 0)
+    return 0;
+  int32_t av = irop_get_vreg(tcc_ir_op_get_src1(ir, dq));
+  if (av == iv)
+    return step;
+  if (av < 0)
+    return 0;
+  /* copy-through: av must have a single in-loop def `av <- iv [ASSIGN]`. */
+  int copy_idx = -1, copies = 0;
+  for (int i = loop->start_idx; i <= loop->end_idx; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
+      continue;
+    if (irop_get_vreg(tcc_ir_op_get_dest(ir, q)) != av)
+      continue;
+    copy_idx = i;
+    copies++;
+  }
+  if (copies != 1)
+    return 0;
+  IRQuadCompact *cq = &ir->compact_instructions[copy_idx];
+  if (cq->op != TCCIR_OP_ASSIGN || irop_get_vreg(tcc_ir_op_get_src1(ir, cq)) != iv)
+    return 0;
+  return step;
+}
+
+/* True if [start_idx,end_idx] has no jump leaving the loop range other than
+ * the back-edge (i.e. the only loop exit is fall-through past the latch). */
+static int guard_loop_single_exit(TCCIRState *ir, IRLoop *loop)
+{
+  for (int i = loop->start_idx; i <= loop->end_idx; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF)
+      continue;
+    int t = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+    if (t < loop->start_idx || t > loop->end_idx)
+      return 0; /* an edge leaves the loop body -> extra exit */
+  }
+  return 1;
+}
+
+int tcc_ir_opt_loop_guard_elim(TCCIRState *ir)
+{
+  if (!ir || ir->next_instruction_index == 0)
+    return 0;
+
+  /* Bail on un-enumerable control flow: the program-order exit-value carry
+   * assumes straight-line fall-through between sequential loops. */
+  for (int i = 0; i < ir->next_instruction_index; i++)
+  {
+    TccIrOp op = ir->compact_instructions[i].op;
+    if (op == TCCIR_OP_IJUMP || op == TCCIR_OP_SWITCH_TABLE || op == TCCIR_OP_SWITCH_LOAD)
+      return 0;
+  }
+
+  IRLoops *loops = tcc_ir_detect_loops(ir);
+  if (!loops || loops->num_loops == 0)
+  {
+    tcc_ir_free_loops(loops);
+    return 0;
+  }
+
+  int total = 0;
+  int carry_vreg = -1;  /* IV vreg whose constant value is known after a loop */
+  long carry_val = 0;   /* that constant value */
+  int carry_from = -1;  /* program index at which carry_val first holds */
+
+  for (int li = 0; li < loops->num_loops; li++)
+  {
+    IRLoop *loop = &loops->loops[li];
+    if (loop->start_idx < 0)
+      continue;
+
+    /* Identify the counted IV + its (normalized) exit condition.  The latch
+     * is the CMP closest to the back-edge whose exit target is past the loop. */
+    int iv = -1, limit = 0, cond = 0, exit_target = -1;
+    {
+      int lo = loop->end_idx - 4;
+      if (lo < loop->start_idx)
+        lo = loop->start_idx;
+      for (int i = loop->end_idx; i >= lo && iv < 0; i--)
+      {
+        IRQuadCompact *cq = &ir->compact_instructions[i];
+        if (cq->op != TCCIR_OP_CMP)
+          continue;
+        if (!irop_is_immediate(tcc_ir_op_get_src2(ir, cq)))
+          continue;
+        int32_t cand = irop_get_vreg(tcc_ir_op_get_src1(ir, cq));
+        if (cand < 0)
+          continue;
+        int ci, ji, lim, cnd, et;
+        if (find_loop_exit_condition(ir, loop, cand, &ci, &ji, &lim, &cnd, &et) && et > loop->end_idx)
+        {
+          iv = cand;
+          limit = lim;
+          cond = cnd;
+          exit_target = et;
+        }
+      }
+    }
+    if (iv < 0)
+    {
+      carry_vreg = -1; /* unknown loop shape invalidates any pending carry */
+      continue;
+    }
+
+    /* Determine the IV's constant value on entry to this loop. */
+    int have_entry = 0;
+    long entry = 0;
+    for (int j = loop->preheader_idx; j >= 0 && j >= loop->preheader_idx - 6; j--)
+    {
+      IRQuadCompact *pq = &ir->compact_instructions[j];
+      if (pq->op == TCCIR_OP_NOP)
+        continue;
+      if (!irop_config[pq->op].has_dest)
+        continue;
+      if (irop_get_vreg(tcc_ir_op_get_dest(ir, pq)) != iv)
+        continue;
+      /* Closest preheader def of iv decides: an immediate ASSIGN gives a known
+       * entry; anything else (e.g. a prior loop's increment) does not. */
+      if (pq->op == TCCIR_OP_ASSIGN && irop_is_immediate(tcc_ir_op_get_src1(ir, pq)))
+      {
+        entry = (long)irop_get_imm64_ex(ir, tcc_ir_op_get_src1(ir, pq));
+        have_entry = 1;
+      }
+      break;
+    }
+    if (!have_entry && carry_vreg == iv && carry_from >= 0)
+    {
+      /* Consume the carried exit value of the previous loop only if i is not
+       * redefined and no foreign edge merges in between its source and here. */
+      int clean = 1;
+      for (int j = carry_from; j < loop->start_idx && clean; j++)
+      {
+        IRQuadCompact *q = &ir->compact_instructions[j];
+        if (q->op == TCCIR_OP_NOP)
+          continue;
+        if (j > carry_from && q->is_jump_target)
+          clean = 0;
+        else if (irop_config[q->op].has_dest && irop_get_vreg(tcc_ir_op_get_dest(ir, q)) == iv)
+          clean = 0;
+      }
+      if (clean)
+      {
+        entry = carry_val;
+        have_entry = 1;
+      }
+    }
+
+    /* Remove the pre-loop entry guard if it is provably never taken. */
+    int guard_removed = 0, guard_found = 0;
+    if (have_entry)
+    {
+      int glo = loop->start_idx - 6;
+      if (glo < 0)
+        glo = 0;
+      if (carry_from >= 0 && glo < carry_from)
+        glo = carry_from;
+      for (int g = glo; g + 1 < loop->start_idx; g++)
+      {
+        IRQuadCompact *gq = &ir->compact_instructions[g];
+        if (gq->op != TCCIR_OP_CMP)
+          continue;
+        if (irop_get_vreg(tcc_ir_op_get_src1(ir, gq)) != iv)
+          continue;
+        IROperand gs2 = tcc_ir_op_get_src2(ir, gq);
+        if (!irop_is_immediate(gs2))
+          continue;
+        IRQuadCompact *gjq = &ir->compact_instructions[g + 1];
+        if (gjq->op != TCCIR_OP_JUMPIF)
+          continue;
+        int gtarget = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, gjq));
+        if (gtarget <= loop->end_idx)
+          continue; /* not a skip-past-the-loop guard */
+        guard_found = 1;
+        int gcond = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src1(ir, gjq));
+        long glim = (long)irop_get_imm64_ex(ir, gs2);
+        if (guard_eval_cond((int)entry, gcond, (int)glim) != 0)
+          break; /* taken or unknown: do not remove */
+        gq->op = TCCIR_OP_NOP;
+        gjq->op = TCCIR_OP_NOP;
+        guard_removed = 1;
+        total++;
+        /* Clear stale is_jump_target on the skip target if the guard was its
+         * only jump in-edge (so the carried-value clean check stays valid). */
+        if (gtarget >= 0 && gtarget < ir->next_instruction_index)
+        {
+          int other_edge = 0;
+          for (int s = 0; s < ir->next_instruction_index && !other_edge; s++)
+          {
+            if (s == g + 1)
+              continue;
+            IRQuadCompact *sq = &ir->compact_instructions[s];
+            if (sq->op != TCCIR_OP_JUMP && sq->op != TCCIR_OP_JUMPIF)
+              continue;
+            if ((int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, sq)) == gtarget)
+              other_edge = 1;
+          }
+          if (!other_edge)
+            ir->compact_instructions[gtarget].is_jump_target = 0;
+        }
+        break;
+      }
+    }
+
+    /* Record the constant exit value for the next loop reusing this IV. */
+    int step = guard_iv_step(ir, loop, iv);
+    if (have_entry && step > 0 && (guard_removed || !guard_found) && guard_loop_single_exit(ir, loop))
+    {
+      int trip = compute_trip_count((int)entry, limit, step, cond);
+      if (trip > 0)
+      {
+        carry_vreg = iv;
+        carry_val = entry + (long)trip * step;
+        carry_from = exit_target;
+        continue;
+      }
+    }
+    carry_vreg = -1; /* cannot prove a clean constant exit value */
+  }
+
+  tcc_ir_free_loops(loops);
+  return total;
+}

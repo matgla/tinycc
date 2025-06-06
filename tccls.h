@@ -50,6 +50,7 @@ typedef struct LSLiveInterval
   uint8_t addrtaken;
   uint8_t reg_type;
   uint8_t lvalue;
+  uint8_t co_member; /* part of a graph-coalesced class — post-RA move coalescing must not reassign it */
   uint64_t sort_key;
 } LSLiveInterval;
 

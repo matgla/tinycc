@@ -102,6 +102,8 @@ const char *tcc_ir_get_op_name(TccIrOp op)
     return "TEST_ZERO";
   case TCCIR_OP_UBFX:
     return "UBFX";
+  case TCCIR_OP_BFI:
+    return "BFI";
   case TCCIR_OP_FADD:
     return "FADD";
   case TCCIR_OP_FSUB:

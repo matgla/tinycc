@@ -12,6 +12,7 @@
 
 #include "ir.h"
 #include "licm.h"
+#include "opt.h"
 #include "opt_du.h"
 #include "opt_xform.h"
 #include "opt_utils.h"
@@ -3226,7 +3227,32 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
   int body_end_jmp = -1;
   int body_latch_target = -1;
   int body_end_is_implicit = 0;
-  for (int i = body_start; i < n && i < body_start + 100; i++)
+  int cond_body = 0;
+  /* break_invert: the body ends in a deciding JUMPIF-to-latch whose
+   * fall-through is the loop exit (an `if (cond) break;` after jump-threading
+   * collapsed the explicit break JUMP into a fall-through).  Rotating naively
+   * would turn the break into a continue, so the transform inverts the deciding
+   * JUMPIF to target the exit instead, letting the continue path fall into the
+   * latch. */
+  int break_invert = 0;
+  int break_decide_idx = -1;
+  /* Bound body scans to the loop's own exit target so a *sibling* loop's
+   * back-edge is not misread as this loop's inner loop (which blocks rotation
+   * of every non-last loop in a sequence — e.g. memclr's three loops).  Only
+   * enabled alongside graph coalescing (TCC_COALESCE), since rotating the
+   * earlier loops creates a merge-phi only the graph coalescer can handle. */
+  int body_scan_limit = body_start + 100;
+  /* Bound to the loop's own exit target so a sibling loop's back-edge is not
+   * misread as an inner loop, enabling rotation of every loop in a sequence
+   * (e.g. memclr's three loops).  Coupled to graph coalescing (on by default,
+   * off under TCC_NO_COALESCE): rotating the earlier loops creates a merge-phi
+   * that only the coalescer can collapse back to one register. */
+  if (!getenv("TCC_NO_COALESCE")) {
+    if (exit_target > body_start && exit_target < body_scan_limit)
+      body_scan_limit = exit_target;
+  }
+  if (body_scan_limit > n) body_scan_limit = n;
+  for (int i = body_start; i < body_scan_limit; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_JUMP)
@@ -3250,7 +3276,7 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
   if (body_end_jmp < 0)
   {
     int has_inner_loop = 0;
-    for (int i = body_start; i < n && i < body_start + 100; i++)
+    for (int i = body_start; i < body_scan_limit; i++)
     {
       IRQuadCompact *q = &ir->compact_instructions[i];
       if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
@@ -3266,7 +3292,7 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
     }
     if (has_inner_loop)
     {
-      for (int i = body_start; i < n && i < body_start + 100; i++)
+      for (int i = body_start; i < body_scan_limit; i++)
       {
         IRQuadCompact *q = &ir->compact_instructions[i];
         if (q->op == TCCIR_OP_JUMPIF)
@@ -3281,6 +3307,113 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
             break;
           }
         }
+      }
+    }
+  }
+  /* Conditional-body loop (no inner loop): the body reaches the latch via a
+   * single forward JUMPIF — the `if (cond) <cold>;` skip — followed by a cold
+   * tail (e.g. a call to abort) that originally fell through to the loop exit.
+   * Treat the deciding JUMPIF as the body→latch edge and keep the cold tail in
+   * the relocated body.  Post-rotation the cold tail falls through to the
+   * latch, i.e. the loop continues — exactly what the C `if`-statement
+   * semantics require ("after the if, run the loop increment").  The original
+   * top-tested layout instead fell through to the loop exit, which is only
+   * equivalent when the cold path does not return (e.g. abort); the rotated
+   * form is correct in both cases. */
+  if (body_end_jmp < 0 && exit_target > body_start && exit_target <= n)
+  {
+    int decide = -1, decide_target = -1, branches = 0, bad = 0;
+    for (int i = body_start; i < exit_target; i++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      if (q->op == TCCIR_OP_IJUMP || q->op == TCCIR_OP_JUMP)
+      {
+        bad = 1;
+        break;
+      }
+      if (q->op == TCCIR_OP_JUMPIF)
+      {
+        IROperand jd = tcc_ir_op_get_dest(ir, q);
+        int jt = (int)irop_get_imm64_ex(ir, jd);
+        branches++;
+        if (jt >= latch_start && jt <= backedge_idx && decide < 0)
+        {
+          decide = i;
+          decide_target = jt;
+        }
+        else
+        {
+          bad = 1;
+          break;
+        }
+      }
+    }
+    /* The cold tail (decide+1 .. exit_target-1) originally fell through to the
+     * loop exit.  After rotation the latch is placed immediately after it, so
+     * the cold tail would instead fall through to the latch (= loop continue).
+     * That is only correct if the cold tail has NO live fall-through — i.e. it
+     * ends in a terminator with no successor: a return/trap, or a call to a
+     * noreturn function (e.g. abort).  A cold tail that does fall through (a
+     * plain assignment like `off=b;` followed by an eliminated `break` jump to
+     * the exit) must NOT be rotated — doing so turns the break into a continue.
+     * Find the last real cold-tail instruction and require it to be such a
+     * terminator. */
+    int cold_terminates = 0;
+    if (!bad && decide >= 0 && branches == 1 && decide < exit_target - 1)
+    {
+      int last = exit_target - 1;
+      while (last > decide && ir->compact_instructions[last].op == TCCIR_OP_NOP)
+        last--;
+      IRQuadCompact *lq = &ir->compact_instructions[last];
+      if (lq->op == TCCIR_OP_RETURNVALUE || lq->op == TCCIR_OP_RETURNVOID || lq->op == TCCIR_OP_TRAP)
+        cold_terminates = 1;
+      else if (lq->op == TCCIR_OP_FUNCCALLVOID || lq->op == TCCIR_OP_FUNCCALLVAL)
+      {
+        Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, lq));
+        if (tcc_ir_callee_is_noreturn(callee))
+          cold_terminates = 1;
+      }
+    }
+    if (!bad && decide >= 0 && branches == 1 && decide < exit_target - 1 && cold_terminates)
+    {
+      cond_body = 1;
+      body_latch_target = decide_target;
+      body_end_jmp = exit_target - 1;
+      body_end_is_implicit = 1;
+      LOG_LOOP_OPT("Rotation: conditional-body shape, decide JUMPIF@%d -> latch %d, cold tail [%d..%d] (terminating)",
+                   decide, decide_target, decide + 1, exit_target - 1);
+    }
+    /* break-via-fall-through shape: the deciding JUMPIF (continue→latch) is the
+     * last body instruction and its fall-through is the loop exit (an early
+     * `if (cond) break;` like ctz/clz/clrsb).  No cold tail.  Rotation inverts
+     * the deciding JUMPIF to target the exit so the continue path falls into the
+     * relocated latch — see break_invert handling in the transform below. */
+    else if (!bad && decide >= 0 && branches == 1 && decide == exit_target - 1)
+    {
+      /* Skip when the body contains a call: rotating splits the loop's
+       * result (`return i`) across the break-exit and the loop-exhausted
+       * exit, and a call's clobbered live ranges defeat the coalescer that
+       * would otherwise merge those copies — netting a small regression
+       * (e.g. the 64-bit __aeabi_llsl variants of ctz/clz). */
+      int body_has_call = 0;
+      for (int i = body_start; i <= decide; i++)
+      {
+        int bop = ir->compact_instructions[i].op;
+        if (bop == TCCIR_OP_FUNCCALLVAL || bop == TCCIR_OP_FUNCCALLVOID)
+        {
+          body_has_call = 1;
+          break;
+        }
+      }
+      if (!body_has_call)
+      {
+        break_invert = 1;
+        break_decide_idx = decide;
+        body_latch_target = decide_target;
+        body_end_jmp = decide;
+        body_end_is_implicit = 1;
+        LOG_LOOP_OPT("Rotation: break-fall-through shape, decide JUMPIF@%d -> latch %d, invert to exit %d", decide,
+                     decide_target, exit_target);
       }
     }
   }
@@ -3306,8 +3439,9 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
    * label).  After rotation, the latch is placed right after the body, so the
    * fall-through would go to the latch instead — a miscompilation.
    * Reject if the last non-NOP body instruction is a JUMPIF whose fall-through
-   * reaches the exit target. */
-  if (body_end_is_implicit)
+   * reaches the exit target.  (break_invert deliberately has this shape and
+   * fixes it by inverting the deciding JUMPIF in the transform — exempt it.) */
+  if (body_end_is_implicit && !break_invert)
   {
     int last_real = body_end;
     while (last_real >= body_start && ir->compact_instructions[last_real].op == TCCIR_OP_NOP)
@@ -3389,11 +3523,13 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
         return 0;
       if (q->op == TCCIR_OP_JUMPIF || q->op == TCCIR_OP_JUMP)
       {
-        if (!has_inner_loop)
-          return 0;
         IROperand jd = tcc_ir_op_get_dest(ir, q);
         int jt = (int)irop_get_imm64_ex(ir, jd);
-        /* Internal body branches (inner loops etc.) - will be remapped */
+        /* Internal body branches (inner loops, and the `if (cond) stmt;`
+         * diamond skip whose join sits at body_end_jmp) are always safe:
+         * Step 9 remaps their targets to the relocated body.  This is what
+         * lets a counted loop with a conditional body — popcount/parity/ffs
+         * style — rotate without an inner loop or a terminating cold tail. */
         if (jt >= body_start && jt <= body_end_jmp)
         {
           body_has_branches = 1;
@@ -3405,6 +3541,16 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
           body_has_branches = 1;
           continue;
         }
+        /* A branch that leaves the rotated region (e.g. a `break` to the loop
+         * exit) keeps its target after relocation, so it is safe as long as the
+         * body ends with an explicit JUMP to the latch (body_end_is_implicit==0):
+         * then every intermediate fall-through stays inside the contiguous
+         * relocated body and only the final fall-through changes from
+         * "JUMP latch" to "fall into latch" — equivalent.  The implicit-end
+         * shapes (no trailing JUMP) still require the inner-loop / cond-body
+         * validation performed above, which guards their fall-through-to-exit. */
+        if (!has_inner_loop && !cond_body && !break_invert && body_end_is_implicit)
+          return 0;
         /* Branch outside modified region - no remap needed */
         if (jt < region_start_5 || jt > body_end_jmp)
         {
@@ -3467,6 +3613,23 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
   {
     LOG_LOOP_OPT("Rotation: reject — cannot invert cond 0x%x", cond);
     return 0;
+  }
+
+  /* break_invert needs the deciding JUMPIF's condition inverted too — verify it
+   * is invertible BEFORE the destructive rewrite below so we can still bail. */
+  int break_decide_inv_cond = -1;
+  if (break_invert)
+  {
+    IRQuadCompact *dq = &ir->compact_instructions[break_decide_idx];
+    if (dq->op != TCCIR_OP_JUMPIF)
+      return 0;
+    IROperand dcond = tcc_ir_op_get_src1(ir, dq);
+    break_decide_inv_cond = invert_condition((int)irop_get_imm64_ex(ir, dcond));
+    if (break_decide_inv_cond < 0)
+    {
+      LOG_LOOP_OPT("Rotation: reject — cannot invert break decide cond");
+      return 0;
+    }
   }
   LOG_LOOP_OPT("Rotation: all checks passed, rotating!");
 
@@ -3583,6 +3746,28 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
             ir->compact_instructions[new_target].is_jump_target = 1;
         }
       }
+    }
+  }
+
+  /* break_invert: the deciding JUMPIF is the last relocated body instruction.
+   * In the original it was "JUMPIF latch if continue", with its fall-through
+   * being the loop exit (the break).  After relocation the latch sits directly
+   * after it, so leaving it pointing at the latch would make BOTH the taken and
+   * fall-through paths continue — losing the break.  Invert it to "JUMPIF exit
+   * if !continue": the taken path now exits (break) and the fall-through enters
+   * the latch (continue). */
+  if (break_invert)
+  {
+    int decide_pos = body_target + body_count - 1;
+    IRQuadCompact *dq = &ir->compact_instructions[decide_pos];
+    if (dq->op == TCCIR_OP_JUMPIF)
+    {
+      IROperand *ddest = &ir->iroperand_pool[dq->operand_base];
+      IROperand *dcond = &ir->iroperand_pool[dq->operand_base + 1];
+      ddest->u.imm32 = exit_target;
+      dcond->u.imm32 = break_decide_inv_cond;
+      if (exit_target < n)
+        ir->compact_instructions[exit_target].is_jump_target = 1;
     }
   }
 

@@ -834,6 +834,112 @@ int tcc_ir_opt_var_to_tmp(TCCIRState *ir)
  * Uses forward dataflow: from the init, follow all control flow paths.
  * If every path reaches a redef of V before any use of V, the init is dead.
  */
+/* ============================================================================
+ * SETIF + negate → SELECT mask
+ *
+ * The element-wise vector compare idiom `(a CMP b) ? -1 : 0` (e.g. the lowered
+ * `*p = (*p ^ *q) == *q` in gcc.c-torture/compile/pr54713-3.c) emits, per
+ * element:
+ *     CMP a, b
+ *     t <- SETIF(cond)     ; ITE cond; mov dst,#1; mov dst,#0     (3 insns)
+ *     r <- #0 SUB t        ; rsb r, t, #0                          (1 insn)
+ * Folding the negate into a SELECT(#-1, #0, cond) and dropping the now-dead
+ * SETIF yields:
+ *     CMP a, b
+ *     r <- SELECT(#-1, #0, cond)  ; ITE cond; mvn r,#0; mov r,#0   (3 insns)
+ * one instruction shorter per mask.  `0 - (cond ? 1 : 0)` equals
+ * `cond ? -1 : 0` for every condition, so the rewrite is value-identical
+ * regardless of which comparison cond encodes.
+ *
+ * Runs LATE (right after tcc_ir_opt_select, past the whole optimization
+ * pipeline) for the same reason opt_promote's diamond→SELECT does: no
+ * orphan-CMP pass runs afterward to mistake the flag-setting CMP — which the
+ * new SELECT consumes only via flags, with no vreg link — for dead code, and
+ * no value-tracking pass remains to mis-fold `(SELECT result) == const`.  The
+ * resulting CMP+SELECT shape is exactly the one tcc_ir_opt_select already
+ * produces here and that survives regalloc → codegen unchanged.
+ *
+ * Gates (all required):
+ *   - the SETIF result feeds exactly one instruction;
+ *   - that instruction is the immediately-following `r <- #0 SUB t`
+ *     (src1 a literal 0, src2 the SETIF dest);
+ *   - a flag-setting CMP/TEST_ZERO is the instruction immediately before the
+ *     SETIF, so the CMP's flags reach the SELECT with nothing clobbering them
+ *     in between (only the NOPed SETIF, plus NOPs, sit between).
+ * ============================================================================ */
+int tcc_ir_opt_setif_neg_to_select(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  int changes = 0;
+
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *sif = &ir->compact_instructions[i];
+    if (sif->op != TCCIR_OP_SETIF)
+      continue;
+
+    IROperand sif_dest = tcc_ir_op_get_dest(ir, sif);
+    int32_t t = irop_get_vreg(sif_dest);
+    if (t < 0)
+      continue;
+
+    /* The negate must be the next non-NOP instruction. */
+    int j = ir_skip_nops_forward(ir, i + 1, n);
+    if (j >= n)
+      continue;
+    IRQuadCompact *sub = &ir->compact_instructions[j];
+    if (sub->op != TCCIR_OP_SUB)
+      continue;
+
+    IROperand sub_s1 = tcc_ir_op_get_src1(ir, sub);
+    IROperand sub_s2 = tcc_ir_op_get_src2(ir, sub);
+    if (!irop_is_immediate(sub_s1) || sub_s1.is_sym || irop_get_imm64_ex(ir, sub_s1) != 0)
+      continue;
+    if (irop_get_vreg(sub_s2) != t)
+      continue;
+
+    /* The SETIF result must feed only the negate, so NOPing it is safe. */
+    if (!tcc_ir_vreg_has_single_use(ir, t, -1))
+      continue;
+
+    /* A flag setter must immediately precede the SETIF: with the SETIF NOPed
+     * the SELECT inherits those flags, and nothing between clobbers them. */
+    int k = i - 1;
+    while (k >= 0 && ir->compact_instructions[k].op == TCCIR_OP_NOP)
+      k--;
+    if (k < 0)
+      continue;
+    int prev_op = ir->compact_instructions[k].op;
+    if (prev_op != TCCIR_OP_CMP && prev_op != TCCIR_OP_TEST_ZERO)
+      continue;
+
+    IROperand sif_cond = tcc_ir_op_get_src1(ir, sif);
+    if (!irop_is_immediate(sif_cond) || sif_cond.is_sym)
+      continue;
+    int cond = (int)irop_get_imm64_ex(ir, sif_cond);
+
+    /* Rewrite the negate in place as SELECT(#-1, #0, cond), reusing its dest. */
+    IROperand sub_dest = tcc_ir_op_get_dest(ir, sub);
+    int dest_btype = irop_get_btype(sub_dest);
+    IROperand then_v = irop_make_imm32(-1, -1, dest_btype);
+    IROperand else_v = irop_make_imm32(-1, 0, dest_btype);
+    IROperand cond_op = irop_make_imm32(-1, cond, VT_INT);
+
+    int pool_base = tcc_ir_iroperand_pool_add(ir, sub_dest);
+    tcc_ir_iroperand_pool_add(ir, then_v);
+    tcc_ir_iroperand_pool_add(ir, else_v);
+    tcc_ir_iroperand_pool_add(ir, cond_op);
+
+    sub->op = TCCIR_OP_SELECT;
+    sub->operand_base = pool_base;
+
+    sif->op = TCCIR_OP_NOP;
+    changes++;
+  }
+
+  return changes;
+}
+
 int tcc_ir_opt_select(TCCIRState *ir)
 {
   int n = ir->next_instruction_index;
@@ -1841,6 +1947,263 @@ int tcc_ir_opt_post_ra_forward_diamond(TCCIRState *ir)
 
     changes++;
   }
+
+  return changes;
+}
+
+/* Detect a guarded noreturn-call site whose guard JUMPIF is at index `i`:
+ *
+ *   i:        JUMPIF cond -> CONT      ; cond is the "good" test; jumps OVER
+ *   i+1..j-1: FUNCPARAMVOID*           ;   the call (0+ void params; abort()
+ *   j:        FUNCCALL* callee         ;   has none real, argc == 0, noreturn;
+ *                                          void or value form (dead return))
+ *   CONT=j+1: <continue>
+ *
+ * On a match, fills *call_idx (= j), *cond, *callee and *is_zero (the inline
+ * form fuses into cbz/cbnz: the preceding flag-setter is a compare-against-zero
+ * and the guard is EQ/NE), and returns the guard's entry index (i+1, i.e. the
+ * first param, or the call when there is no param).  Returns -1 on no match.
+ *
+ * The CONT == j+1 check makes this a clean guarded diamond and excludes loop
+ * latch / entry-guard JUMPIFs (not followed by a noreturn call).  The region
+ * must have no other predecessor so redirecting/NOPing it loses no edge. */
+static int ir_abort_guard_site(TCCIRState *ir, int i, int n, int *call_idx, int *cond_out,
+                               Sym **callee_out, int *is_zero)
+{
+  IRQuadCompact *jif = &ir->compact_instructions[i];
+  if (jif->op != TCCIR_OP_JUMPIF)
+    return -1;
+
+  int cont = (int)irop_get_imm32(tcc_ir_op_get_dest(ir, jif));
+  int cond = (int)tcc_ir_op_get_src1(ir, jif).u.imm32;
+
+  int j = i + 1;
+  while (j < n && ir->compact_instructions[j].op == TCCIR_OP_FUNCPARAMVOID)
+    j++;
+  if (j >= n)
+    return -1;
+  /* Accept both call forms: a void call, or a value call whose return is dead
+   * (a noreturn callee never returns, so its FUNCCALLVAL dest vreg is dead —
+   * __builtin_abort lowers to FUNCCALLVAL).  The operand accessors are
+   * config-aware (they offset src1/src2 past the dest), so callee/argc read
+   * correctly for either form. */
+  TccIrOp callop = ir->compact_instructions[j].op;
+  if (callop != TCCIR_OP_FUNCCALLVOID && callop != TCCIR_OP_FUNCCALLVAL)
+    return -1;
+
+  IRQuadCompact *call = &ir->compact_instructions[j];
+  Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, call));
+  if (!tcc_ir_callee_is_noreturn(callee))
+    return -1;
+  if (TCCIR_DECODE_CALL_ARGC((uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, call))) != 0)
+    return -1;
+  if (cont != j + 1)
+    return -1;
+  /* A jump landing INSIDE the param/call sequence (i+2..j) can't be redirected
+   * safely, so reject it.  The abort ENTRY (i+1) itself MAY be a jump target:
+   * in `if (A || B) abort()` the A-branch jumps straight to the abort.  The
+   * merge retargets such predecessors to the shared sink — every edge into an
+   * argc==0 noreturn site is interchangeable with an edge into another site for
+   * the same callee (both just execute `<no args>; call noreturn`). */
+  for (int k = i + 2; k <= j; k++)
+    if (ir->compact_instructions[k].is_jump_target)
+      return -1;
+
+  /* cbz/cbnz-eligible inline form: preceding flag-setter compares against 0
+   * and the guard is EQ/NE.  Such a site is cheap inline (one fused cbz) but
+   * loses the fusion if inverted to a (often backward) branch — so it makes the
+   * best shared sink to keep inline. */
+  int zero = 0;
+  if (i >= 1 && (cond == TOK_EQ || cond == TOK_NE))
+  {
+    IRQuadCompact *prev = &ir->compact_instructions[i - 1];
+    if (prev->op == TCCIR_OP_TEST_ZERO)
+      zero = 1;
+    else if (prev->op == TCCIR_OP_CMP)
+    {
+      IROperand s2 = tcc_ir_op_get_src2(ir, prev);
+      if (s2.tag == IROP_TAG_IMM32 && s2.u.imm32 == 0)
+        zero = 1;
+    }
+  }
+
+  *call_idx = j;
+  *cond_out = cond;
+  *callee_out = callee;
+  *is_zero = zero;
+  return i + 1;
+}
+
+/* Abort tail-merge + body-invert (post-regalloc).
+ *
+ * memclr-style check loops each guard a noreturn call (abort): good path
+ * `beq.w CONT` jumps over an inline `bl abort`, bad path falls into it.  GCC
+ * instead keeps ONE shared abort and makes each check `cmp; bne SHARED` with
+ * the good path falling straight through.
+ *
+ * We reach static parity by choosing, per distinct noreturn callee, ONE site as
+ * the shared sink and leaving it inline.  Every OTHER site for that callee is
+ * inverted (cond -> !cond), retargeted to the sink's entry, and its local
+ * param+call NOPed.  The good path then falls through the NOPs to CONT; the bad
+ * path branches to the one shared `bl abort`.
+ *
+ * Sink choice: prefer a cbz/cbnz-eligible (compare-against-zero) site.  Inline
+ * it costs one fused cbz; inverting it would cost cmp+bne (cbz/cbnz are
+ * forward-only, so a backward branch to the sink cannot fuse) — net zero saving.
+ * A non-zero site, by contrast, is cmp+beq+bl_abort inline vs cmp+bne inverted,
+ * saving one `bl abort`.  So keeping a zero site inline and inverting the
+ * non-zero ones maximises the merge (memclr's three loops are nonzero/zero/
+ * nonzero: keep the middle, invert the outer two -> two `bl abort` removed).
+ *
+ * Why a kept-inline site is a safe sink: it retains its original
+ * fall-through-into-call layout, so nothing else falls through *into* the sink;
+ * other sites reach it solely via their inverted conditional branch.  abort is
+ * argc==0, so no register/stack arg setup differs between sites — branching into
+ * the sink's param->call sequence is sound regardless of the source edge.
+ *
+ * Runs post-regalloc (operands already physical; the sink references no vregs so
+ * coalescing is irrelevant to it) and BEFORE the jump-threading / eliminate-
+ * fallthrough / reachability-DCE cleanup that tidies the NOPs.  Like the
+ * neighbouring post-RA peepholes we do NOT compact_nops — renumbering would
+ * perturb downstream index-keyed peepholes.
+ *
+ * Disabled by TCC_NO_ABORT_MERGE.  Bails on IJUMP / SWITCH_TABLE / SWITCH_LOAD:
+ * their edges are not statically enumerable and could reach into a guarded
+ * region we assume is entered only via fall-through from its JUMPIF. */
+int tcc_ir_opt_abort_tail_merge(TCCIRState *ir)
+{
+  if (getenv("TCC_NO_ABORT_MERGE"))
+    return 0;
+
+  int n = ir->next_instruction_index;
+  if (n < 3)
+    return 0;
+
+  /* Gate: un-enumerable control flow could branch into a guarded region. */
+  for (int i = 0; i < n; i++)
+  {
+    TccIrOp op = ir->compact_instructions[i].op;
+    if (op == TCCIR_OP_IJUMP || op == TCCIR_OP_SWITCH_TABLE || op == TCCIR_OP_SWITCH_LOAD)
+      return 0;
+  }
+
+  /* Per-distinct-callee sink choice.  Few functions have more than one noreturn
+   * callee; cap the table and just skip merging beyond it. */
+  enum { MAX_SINKS = 8 };
+  Sym *cal[MAX_SINKS];
+  int first_entry[MAX_SINKS]; /* entry of the first site (fallback sink) */
+  int zero_entry[MAX_SINKS];  /* entry of the first cbz-eligible site, or -1 */
+  int num = 0;
+
+  int j, cond, is_zero;
+  Sym *callee;
+
+  /* Pass 1: discover sites and, per callee, remember the first site and the
+   * first cbz-eligible site. */
+  for (int i = 0; i + 1 < n; i++)
+  {
+    if (ir_abort_guard_site(ir, i, n, &j, &cond, &callee, &is_zero) < 0)
+      continue;
+    int s = -1;
+    for (int t = 0; t < num; t++)
+      if (cal[t] == callee)
+      {
+        s = t;
+        break;
+      }
+    if (s < 0)
+    {
+      if (num >= MAX_SINKS)
+        continue;
+      s = num++;
+      cal[s] = callee;
+      first_entry[s] = i + 1;
+      zero_entry[s] = -1;
+    }
+    if (is_zero && zero_entry[s] < 0)
+      zero_entry[s] = i + 1;
+  }
+  if (num == 0)
+    return 0;
+
+  /* Pass 2: invert + retarget every non-sink site to its callee's chosen sink,
+   * NOPing the duplicate param+call.  Mark touched sinks for pass 3. */
+  int sink_used[MAX_SINKS] = {0};
+  int changes = 0;
+  for (int i = 0; i + 1 < n; i++)
+  {
+    int entry = ir_abort_guard_site(ir, i, n, &j, &cond, &callee, &is_zero);
+    if (entry < 0)
+      continue;
+    int s = -1;
+    for (int t = 0; t < num; t++)
+      if (cal[t] == callee)
+      {
+        s = t;
+        break;
+      }
+    if (s < 0)
+      continue; /* callee overflowed MAX_SINKS */
+
+    int sink = (zero_entry[s] >= 0) ? zero_entry[s] : first_entry[s];
+    if (entry == sink)
+      continue; /* this IS the sink — leave it inline */
+
+    int inv = invert_condition(cond);
+    if (inv < 0)
+      continue;
+
+    /* `if (A || B) abort()`: the A-branch jumps straight to this site's abort
+     * entry.  Redirect every such predecessor to the shared sink before NOPing
+     * the local call (otherwise A-true would fall through the NOPs to CONT and
+     * skip the abort).  Safe because both entries run the same argc==0 noreturn
+     * callee.  Then clear the (now-unreferenced) entry's jump-target flag. */
+    if (ir->compact_instructions[entry].is_jump_target)
+    {
+      for (int p = 0; p < n; p++)
+      {
+        IRQuadCompact *pq = &ir->compact_instructions[p];
+        if (pq->op != TCCIR_OP_JUMP && pq->op != TCCIR_OP_JUMPIF)
+          continue;
+        IROperand pd = tcc_ir_op_get_dest(ir, pq);
+        if (pd.tag != IROP_TAG_IMM32 || pd.u.imm32 != entry)
+          continue;
+        IROperand sink_dest = {0};
+        sink_dest.tag = IROP_TAG_IMM32;
+        sink_dest.u.imm32 = sink;
+        tcc_ir_op_set_dest(ir, pq, sink_dest);
+      }
+      ir->compact_instructions[entry].is_jump_target = 0;
+    }
+
+    IRQuadCompact *jif = &ir->compact_instructions[i];
+    IROperand new_cond = {0};
+    new_cond.tag = IROP_TAG_IMM32;
+    new_cond.u.imm32 = inv;
+    tcc_ir_op_set_src1(ir, jif, new_cond);
+
+    IROperand new_dest = {0};
+    new_dest.tag = IROP_TAG_IMM32;
+    new_dest.u.imm32 = sink;
+    tcc_ir_op_set_dest(ir, jif, new_dest);
+
+    for (int k = i + 1; k <= j; k++)
+      ir->compact_instructions[k].op = TCCIR_OP_NOP;
+
+    sink_used[s] = 1;
+    changes++;
+  }
+
+  /* Pass 3: flag the entry of each sink that actually received a branch.  We
+   * defer this so the pass-2 re-detection of sites stays clean (marking a sink
+   * mid-scan would make ir_abort_guard_site reject it via its no-other-pred
+   * check before the entry==sink test could leave it inline). */
+  for (int s = 0; s < num; s++)
+    if (sink_used[s])
+    {
+      int sink = (zero_entry[s] >= 0) ? zero_entry[s] : first_entry[s];
+      ir->compact_instructions[sink].is_jump_target = 1;
+    }
 
   return changes;
 }

@@ -104,6 +104,7 @@ void tcc_ls_add_live_interval(LSLiveIntervalState *ls, int vreg, int start, int 
   interval->addrtaken = addrtaken;
   interval->reg_type = reg_type;
   interval->lvalue = lvalue;
+  interval->co_member = 0;
   {
     const int is_param = (TCCIR_DECODE_VREG_TYPE(vreg) == TCCIR_VREG_TYPE_PARAM);
     interval->sort_key = ((uint64_t)(!is_param) << 33) | ((uint64_t)(uint32_t)end << 1) | (lvalue ? 0u : 1u);

@@ -86,13 +86,15 @@ int tcc_ir_opt_dead_lea_store_elim(TCCIRState *ir)
   if (ir->captured_count > 0 || ir->has_static_chain)
     return 0;
 
-  /* Bail on opcodes whose memory effects we don't model. */
+  /* Bail on opcodes whose memory effects / control flow we don't model.
+   * SWITCH_TABLE has indirect targets we can't range-check for back-edges. */
   for (int i = 0; i < n; i++)
   {
     int op = ir->compact_instructions[i].op;
     if (op == TCCIR_OP_IJUMP || op == TCCIR_OP_SETJMP || op == TCCIR_OP_LONGJMP ||
         op == TCCIR_OP_INLINE_ASM || op == TCCIR_OP_VLA_ALLOC ||
-        op == TCCIR_OP_SET_CHAIN || op == TCCIR_OP_INIT_CHAIN_SLOT)
+        op == TCCIR_OP_SET_CHAIN || op == TCCIR_OP_INIT_CHAIN_SLOT ||
+        op == TCCIR_OP_SWITCH_TABLE)
       return 0;
   }
 
@@ -127,6 +129,34 @@ int tcc_ir_opt_dead_lea_store_elim(TCCIRState *ir)
     return 0;
 
   TmpAddr *tmp_addr = tcc_mallocz(sizeof(TmpAddr) * (max_tmp + 1));
+
+  /* Collect loop back-edges (a JUMP/JUMPIF to an earlier-or-equal position).
+   * Pass 3's liveness is position-based (`read.pos > store.pos`), which is only
+   * sound in straight-line code: inside a loop, a store whose slot is read
+   * elsewhere in the same loop body is loop-carried-live even when every read
+   * is at an EARLIER position (it re-executes next iteration via the back-edge).
+   * Without this, the `c.v--` write-back in `while (c.v-- > 0)` was wrongly
+   * dropped (miscompile).  Freed at `done` with the other buffers. */
+  int be_cap = 8, be_n = 0;
+  struct DlsBackEdge { int t, b; } *backedges = tcc_malloc(sizeof(struct DlsBackEdge) * be_cap);
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF)
+      continue;
+    int tg = (int)tcc_ir_op_get_dest(ir, q).u.imm32;
+    if (tg >= 0 && tg <= i)
+    {
+      if (be_n >= be_cap)
+      {
+        be_cap *= 2;
+        backedges = tcc_realloc(backedges, sizeof(struct DlsBackEdge) * be_cap);
+      }
+      backedges[be_n].t = tg;
+      backedges[be_n].b = i;
+      be_n++;
+    }
+  }
 
   /* Pass 1: identify single-def TEMPs holding Addr[StackLoc[off]].
    * STOREs and other lval-dest ops use the dest as the memory address —
@@ -320,6 +350,15 @@ int tcc_ir_opt_dead_lea_store_elim(TCCIRState *ir)
       }
       if (got_off)
         ADD_READ(off, read_size, call_pos);
+      else if (!s1.is_local && !s1.is_lval && irop_get_tag(s1) == IROP_TAG_SYMREF)
+      {
+        /* mem* source is a global/static symbol address — it reads that
+         * object, never one of our stack slots, so it is not a read of any
+         * tracked local.  (PARAM0, the destination, is what writes a local.)
+         * This is the `local = global_struct;` init copy: without this the
+         * pass bailed on the whole function and left a poke-store to a
+         * since-dead local alive. */
+      }
       else
       {
         /* PARAM1 to a mem* call from an unknown source: bail — could read
@@ -490,17 +529,28 @@ int tcc_ir_opt_dead_lea_store_elim(TCCIRState *ir)
     int alive = 0;
     for (int r = 0; r < reads_n; r++)
     {
-      if (reads[r].pos <= i)
-        continue;
       /* Byte-range overlap: [reads[r].off, reads[r].off+width) vs
        * [store_off, store_off+dest_w).  Only stores whose bytes are
        * never read later may be eliminated. */
-      if (store_off < reads[r].off + reads[r].width &&
-          reads[r].off < store_off + dest_w)
+      if (!(store_off < reads[r].off + reads[r].width &&
+            reads[r].off < store_off + dest_w))
+        continue;
+      if (reads[r].pos > i)
       {
-        alive = 1;
+        alive = 1; /* straight-line later read */
         break;
       }
+      /* Loop-carried: a read at an earlier-or-equal position re-executes after
+       * this store if both sit inside the body of the same back-edge loop. */
+      for (int e = 0; e < be_n; e++)
+        if (backedges[e].t <= reads[r].pos && reads[r].pos <= backedges[e].b &&
+            backedges[e].t <= i && i <= backedges[e].b)
+        {
+          alive = 1;
+          break;
+        }
+      if (alive)
+        break;
     }
     if (alive)
       continue;
@@ -511,6 +561,7 @@ int tcc_ir_opt_dead_lea_store_elim(TCCIRState *ir)
   }
 
 done:
+  tcc_free(backedges);
   tcc_free(reads);
   tcc_free(tmp_addr);
   return changes;

@@ -1470,6 +1470,124 @@ void tcc_ir_barrel_shift_fusion(TCCIRState *ir)
   tcc_free(du.def);
 }
 
+/* ============================================================================
+ * Two-shift extract → UBFX  (tcc_ir_opt_shift_pair_to_ubfx)
+ * ============================================================================
+ *
+ * The canonical unsigned bitfield extract `(x << a) >> b` (b >= a, both
+ * logical) isolates the (32-b)-bit field at bit offset (b-a) of x.  ARM
+ * Thumb-2 does this in one instruction: `UBFX Rd, Rx, #(b-a), #(32-b)`.
+ *
+ * MUST run AFTER tcc_ir_barrel_shift_fusion: that pass folds a single-use shift
+ * into its consuming ALU op (ADD/SUB/AND/OR/XOR/CMP) for free via the barrel
+ * shifter and NOPs the shift.  So a SHL+SHR pair that SURVIVES as real ops was
+ * NOT foldable — its SHR feeds something that can't take a shifted operand (a
+ * store, multiply, call arg, return value, or a value used more than once).
+ * There the pair costs two instructions (`lsls`+`lsrs`) and UBFX is one — a
+ * strict win.  A pair the barrel pass DID fold no longer has a real SHR for us
+ * to match, so we never undo that (equal-cost) fusion and never grow code.
+ *
+ * Gate — each clause keeps the rewrite provably non-increasing:
+ *   - inner is SHL #a, outer is SHR #b (both logical), 1<=a<=b<=31, both
+ *     32-bit (the 64-bit shift-extract idiom is handled by shift64_dead_half);
+ *   - the SHL result is single-use (only the SHR), so NOPing the SHL drops
+ *     exactly one instruction;
+ *   - the SHL source is a plain (non-lval) register value, not redefined
+ *     between the SHL and the SHR (UBFX reads it at the SHR's position) and
+ *     with no control-flow edge between the two (same basic block).
+ */
+int tcc_ir_opt_shift_pair_to_ubfx(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  int changes = 0;
+
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *shr_q = &ir->compact_instructions[i];
+    if (shr_q->op != TCCIR_OP_SHR)
+      continue;
+    if (tcc_ir_op_get_dest(ir, shr_q).btype == IROP_BTYPE_INT64)
+      continue;
+    IROperand shr_n = tcc_ir_op_get_src2(ir, shr_q);
+    if (!irop_is_immediate(shr_n) || shr_n.is_sym)
+      continue;
+    int b = (int)irop_get_imm64_ex(ir, shr_n);
+    if (b < 1 || b > 31)
+      continue;
+
+    IROperand shr_src1 = tcc_ir_op_get_src1(ir, shr_q);
+    if (shr_src1.is_lval || !irop_has_vreg(shr_src1))
+      continue;
+    int32_t t1 = irop_get_vreg(shr_src1);
+    if (t1 < 0 || TCCIR_DECODE_VREG_TYPE(t1) != TCCIR_VREG_TYPE_TEMP)
+      continue;
+
+    int shl_idx = tcc_ir_find_defining_instruction(ir, t1, i);
+    if (shl_idx < 0)
+      continue;
+    IRQuadCompact *shl_q = &ir->compact_instructions[shl_idx];
+    if (shl_q->op != TCCIR_OP_SHL)
+      continue;
+    if (tcc_ir_op_get_dest(ir, shl_q).btype == IROP_BTYPE_INT64)
+      continue;
+    IROperand shl_n = tcc_ir_op_get_src2(ir, shl_q);
+    if (!irop_is_immediate(shl_n) || shl_n.is_sym)
+      continue;
+    int a = (int)irop_get_imm64_ex(ir, shl_n);
+    if (a < 1 || a > b)
+      continue;
+
+    /* SHL result must feed only this SHR, so NOPing it is safe. */
+    if (!tcc_ir_vreg_has_single_use(ir, t1, shl_idx))
+      continue;
+
+    IROperand t0 = tcc_ir_op_get_src1(ir, shl_q);
+    if (t0.is_lval || !irop_has_vreg(t0))
+      continue;
+    int32_t t0_vr = irop_get_vreg(t0);
+
+    /* T0 must be unchanged between the SHL and the SHR, and no control-flow
+     * edge may separate them (UBFX recomputes from T0 at the SHR's site). */
+    int safe = 1;
+    for (int j = shl_idx + 1; j < i && safe; j++)
+    {
+      IRQuadCompact *jq = &ir->compact_instructions[j];
+      if (jq->op == TCCIR_OP_NOP)
+        continue;
+      if (jq->op == TCCIR_OP_JUMP || jq->op == TCCIR_OP_JUMPIF ||
+          jq->op == TCCIR_OP_IJUMP || jq->op == TCCIR_OP_SWITCH_TABLE || jq->is_jump_target)
+      {
+        safe = 0;
+        break;
+      }
+      if (irop_config[jq->op].has_dest)
+      {
+        IROperand jd = tcc_ir_op_get_dest(ir, jq);
+        if (irop_has_vreg(jd) && irop_get_vreg(jd) == t0_vr)
+        {
+          safe = 0;
+          break;
+        }
+      }
+    }
+    if (!safe || shr_q->is_jump_target)
+      continue;
+
+    int lsb = b - a;
+    int width = 32 - b;
+    int32_t param = lsb | (width << 5);
+    shr_q->op = TCCIR_OP_UBFX;
+    tcc_ir_set_src1(ir, i, t0);
+    tcc_ir_set_src2(ir, i, irop_make_imm32(-1, param, IROP_BTYPE_INT32));
+    shl_q->op = TCCIR_OP_NOP;
+    changes++;
+    LOG_IR_GEN("SHIFT-PAIR->UBFX @%d: (x<<%d)>>%d -> UBFX lsb=%d width=%d (SHL@%d NOP)", i, a, b, lsb, width,
+               shl_idx);
+  }
+
+  return changes;
+}
+
 
 /* ============================================================================
  * Call-chain result rename
@@ -2481,6 +2599,290 @@ int tcc_ir_opt_lea_fold(TCCIRState *ir)
   LOG_IR_GEN("=== LEA FOLD END: %d folds ===", changes);
 
   tcc_free(du.def);
+  return changes;
+}
+
+/* ============================================================================
+ * LEA read-modify-write fold
+ * ============================================================================
+ *
+ * Generalizes tcc_ir_opt_lea_fold's single-use case to a plain
+ * `Addr[StackLoc[X]]` LEA whose *every* use is a same-block stack-slot
+ * dereference.  The canonical shape is `u.field++` / `u.field--`, which
+ * materializes the field address once and dereferences it twice (load +
+ * store):
+ *
+ *   T  = Addr[StackLoc[X]]            ; LEA / ASSIGN
+ *   v  = T***DEREF***                 ; load  u.field
+ *   v' = v <op> #k
+ *   T***DEREF*** = v'  [STORE]        ; store u.field
+ *
+ * The single-use pass requires the LEA result to have exactly one use, so it
+ * leaves these untouched.  Both derefs target the same slot, so each can be
+ * rewritten to a direct StackLoc[X] access and the LEA dropped — exactly the
+ * substitution the single-use path performs, just applied to every deref.  An
+ * optional single `T2 = T ADD #K` interposer (for a field at a non-zero
+ * struct offset) folds K into the offset.
+ *
+ * Safety: every use of the LEA result (and of any interposer result) within
+ * the function must be a same-block deref — an is_lval load operand or a plain
+ * STORE base at the folded offset.  Any non-deref use (the address escaping
+ * into a PARAM/call/non-lval op, a STORE_INDEXED/LOAD_INDEXED base, a struct
+ * read, or a use past a control-flow edge) disables the fold for that LEA.  No
+ * instruction is moved; only operand forms change from pointer-deref to
+ * direct-slot, so program order and aliasing are preserved.
+ *
+ * Two further restrictions keep the *direct StackLoc* form (which the
+ * downstream DSE chain reasons about more precisely than an opaque LEA-deref)
+ * from exposing partial-overwrite hazards — see the inline comments at the
+ * deref-site classification:
+ *   - accesses must be 8 bytes wide (long long / double), so a folded store is
+ *     never a strict sub-range of a wider store to the same slot; and
+ *   - a STORE whose value is a masked bit-merge (OR/AND of a load of the same
+ *     slot — the bitfield write-back idiom) is left as an LEA-deref, since the
+ *     initializing store stays semantically live under it.
+ */
+
+#define LEA_RMW_MAX_SITES 32
+
+int tcc_ir_opt_lea_rmw_fold(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  int changes = 0;
+  if (n == 0)
+    return 0;
+
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *lea_q = &ir->compact_instructions[i];
+
+    /* Entry shape: plain LEA / ASSIGN of Addr[StackLoc[X]] (no vreg base,
+     * no double-indirect) into a TEMP. */
+    if (lea_q->op == TCCIR_OP_ASSIGN)
+    {
+      IROperand s2 = tcc_ir_op_get_src2(ir, lea_q);
+      if (!irop_is_none(s2))
+        continue;
+    }
+    else if (lea_q->op != TCCIR_OP_LEA)
+      continue;
+
+    IROperand lea_src = tcc_ir_op_get_src1(ir, lea_q);
+    if (irop_get_tag(lea_src) != IROP_TAG_STACKOFF)
+      continue;
+    if (lea_src.is_lval || lea_src.is_llocal)
+      continue;
+    if (irop_get_vreg(lea_src) != -1) /* vreg-backed spill slot — see lea_fold */
+      continue;
+
+    IROperand lea_dest = tcc_ir_op_get_dest(ir, lea_q);
+    int32_t lea_vr = irop_get_vreg(lea_dest);
+    if (lea_vr < 0 || TCCIR_DECODE_VREG_TYPE(lea_vr) != TCCIR_VREG_TYPE_TEMP)
+      continue;
+
+    int32_t base_offset = irop_get_stack_offset(lea_src);
+
+    /* Block end: first control-flow edge after the LEA.  Any use of the LEA
+     * result at or beyond this point crosses a basic-block boundary. */
+    int bb_end = n;
+    for (int k = i + 1; k < n; k++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[k];
+      if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
+      {
+        bb_end = k;
+        break;
+      }
+    }
+
+    /* Worklist of address vregs derived from the LEA, tagged with their
+     * offset from the slot base and their defining index (skipped on scan).
+     * Entry 0 is the LEA result itself at offset 0. */
+    int32_t wl_vr[LEA_RMW_MAX_SITES];
+    int32_t wl_off[LEA_RMW_MAX_SITES];
+    int wl_def[LEA_RMW_MAX_SITES];
+    int wl_n = 1;
+    wl_vr[0] = lea_vr;
+    wl_off[0] = 0;
+    wl_def[0] = i;
+
+    /* Deref sites to redirect at a direct StackLoc. */
+    int rw_idx[LEA_RMW_MAX_SITES];
+    int rw_which[LEA_RMW_MAX_SITES];
+    int32_t rw_off[LEA_RMW_MAX_SITES];
+    int rw_n = 0;
+
+    int ok = 1;
+    for (int w = 0; w < wl_n && ok; w++)
+    {
+      int32_t av = wl_vr[w];
+      int32_t aoff = wl_off[w];
+      int adef = wl_def[w];
+
+      for (int k = i + 1; k < n && ok; k++)
+      {
+        if (k == adef)
+          continue;
+        IRQuadCompact *q = &ir->compact_instructions[k];
+        if (q->op == TCCIR_OP_NOP)
+          continue;
+        const IRRegistersConfig *cfg = &irop_config[q->op];
+
+        IROperand s1 = cfg->has_src1 ? tcc_ir_op_get_src1(ir, q) : IROP_NONE;
+        IROperand s2 = cfg->has_src2 ? tcc_ir_op_get_src2(ir, q) : IROP_NONE;
+        IROperand d = cfg->has_dest ? tcc_ir_op_get_dest(ir, q) : IROP_NONE;
+
+        int ref_lval = 0, ref_nonlval = 0, which_lval = -1;
+        if (cfg->has_src1 && irop_has_vreg(s1) && irop_get_vreg(s1) == av)
+        {
+          if (s1.is_lval) { ref_lval++; which_lval = 1; }
+          else ref_nonlval++;
+        }
+        if (cfg->has_src2 && irop_has_vreg(s2) && irop_get_vreg(s2) == av)
+        {
+          if (s2.is_lval) { ref_lval++; which_lval = 2; }
+          else ref_nonlval++;
+        }
+        if (cfg->has_dest && irop_has_vreg(d) && irop_get_vreg(d) == av)
+        {
+          if (d.is_lval) { ref_lval++; which_lval = 0; }
+          else ref_nonlval++;
+        }
+
+        if (ref_lval == 0 && ref_nonlval == 0)
+          continue; /* instruction does not touch av */
+
+        if (k >= bb_end)
+        {
+          ok = 0;
+          break;
+        }
+
+        /* Interposer `new = av + #K` (av as a plain pointer value). */
+        if (q->op == TCCIR_OP_ADD && ref_lval == 0 && ref_nonlval == 1)
+        {
+          int32_t kk;
+          if (irop_has_vreg(s1) && irop_get_vreg(s1) == av && !s1.is_lval &&
+              irop_get_tag(s2) == IROP_TAG_IMM32)
+            kk = (int32_t)s2.u.imm32;
+          else if (irop_has_vreg(s2) && irop_get_vreg(s2) == av && !s2.is_lval &&
+                   irop_get_tag(s1) == IROP_TAG_IMM32)
+            kk = (int32_t)s1.u.imm32;
+          else
+          {
+            ok = 0;
+            break;
+          }
+          int32_t nvr = irop_get_vreg(d);
+          if (nvr < 0 || TCCIR_DECODE_VREG_TYPE(nvr) != TCCIR_VREG_TYPE_TEMP || d.is_lval ||
+              wl_n >= LEA_RMW_MAX_SITES)
+          {
+            ok = 0;
+            break;
+          }
+          wl_vr[wl_n] = nvr;
+          wl_off[wl_n] = aoff + kk;
+          wl_def[wl_n] = k;
+          wl_n++;
+          continue;
+        }
+
+        /* Otherwise must be a single clean deref (load operand or STORE base)
+         * of a non-struct width. */
+        if (ref_lval != 1 || ref_nonlval != 0 || rw_n >= LEA_RMW_MAX_SITES)
+        {
+          ok = 0;
+          break;
+        }
+        IROperand dref = (which_lval == 1) ? s1 : (which_lval == 2) ? s2 : d;
+        /* Restrict to 8-byte (long long / double) accesses — the pr92904
+         * struct-field RMW this pass targets.  Converting an LEA-deref store
+         * into a *direct* StackLoc store changes how the downstream DSE chain
+         * reasons about it, and narrower stores are unsafe to fold: a
+         * byte/halfword field store lands at a sub-offset of a wider store to
+         * the same slot (e.g. a 4-byte param store spanning a `char` field),
+         * and DSE then drops the wider store once its only exact-offset reader
+         * — the now-dead narrow RMW load — is DCE'd.  8-byte field RMW is
+         * naturally aligned and never a strict sub-range of another store, so
+         * the sub-offset hazard cannot arise; narrower accesses stay as
+         * LEA-derefs, which the DSE chain treats opaquely and handles
+         * correctly. */
+        if (dref.btype != IROP_BTYPE_INT64 && dref.btype != IROP_BTYPE_FLOAT64)
+        {
+          ok = 0;
+          break;
+        }
+        /* Reject *bitfield* write-backs even at 8-byte width.  A bitfield store
+         * is a partial-bits update — its value is a masked merge of the slot's
+         * prior content (`(load & ~mask) | bits`), so the initializing store
+         * stays semantically live.  As a direct StackLoc store, however, the
+         * DSE/loop passes treat it as a clean full-word overwrite and drop the
+         * write-back (or the init), miscompiling e.g. `unsigned long long b:1`
+         * decremented in a loop.  The merge always tops out in an OR/AND that
+         * consumes a load of this same slot, so a STORE whose value is defined
+         * by OR/AND is conservatively left as an LEA-deref.  Plain arithmetic
+         * RMW (`a++`, `a += k`, `a -= k`) — the pr92904 case — feeds the store
+         * from ADD/SUB/FADD/FSUB and is unaffected. */
+        if (which_lval == 0 && q->op == TCCIR_OP_STORE && irop_has_vreg(s1) && !s1.is_lval)
+        {
+          int32_t vvr = irop_get_vreg(s1);
+          for (int d2 = k - 1; d2 >= 0; d2--)
+          {
+            IRQuadCompact *dq = &ir->compact_instructions[d2];
+            if (dq->op == TCCIR_OP_NOP)
+              continue;
+            if (!irop_config[dq->op].has_dest)
+              continue;
+            if (irop_get_vreg(tcc_ir_op_get_dest(ir, dq)) != vvr)
+              continue;
+            if (dq->op == TCCIR_OP_OR || dq->op == TCCIR_OP_AND)
+              ok = 0;
+            break; /* found the def */
+          }
+          if (!ok)
+            break;
+        }
+        rw_idx[rw_n] = k;
+        rw_which[rw_n] = which_lval;
+        rw_off[rw_n] = aoff;
+        rw_n++;
+      }
+    }
+
+    if (!ok || rw_n == 0)
+      continue;
+
+    /* Apply: redirect every deref operand at a direct StackLoc, then NOP the
+     * LEA and every interposer ADD. */
+    for (int r = 0; r < rw_n; r++)
+    {
+      IRQuadCompact *cq = &ir->compact_instructions[rw_idx[r]];
+      int which = rw_which[r];
+      IROperand old_op = (which == 1)   ? tcc_ir_op_get_src1(ir, cq)
+                         : (which == 2) ? tcc_ir_op_get_src2(ir, cq)
+                                        : tcc_ir_op_get_dest(ir, cq);
+      int32_t folded_off = base_offset + rw_off[r];
+      IROperand new_op = irop_make_stackoff(-1, folded_off, /*is_lval*/ 1, /*is_llocal*/ 0,
+                                            /*is_param_flag*/ (int)lea_src.is_param, old_op.btype);
+      new_op.is_unsigned = old_op.is_unsigned;
+      new_op.is_static = lea_src.is_static;
+      if (which == 1)
+        tcc_ir_op_set_src1(ir, cq, new_op);
+      else if (which == 2)
+        tcc_ir_op_set_src2(ir, cq, new_op);
+      else
+        tcc_ir_op_set_dest(ir, cq, new_op);
+    }
+
+    lea_q->op = TCCIR_OP_NOP;
+    for (int w = 1; w < wl_n; w++)
+      ir->compact_instructions[wl_def[w]].op = TCCIR_OP_NOP;
+
+    changes++;
+    LOG_IR_GEN("LEA RMW FOLD: LEA@%d base=%d -> %d deref sites, %d interposers", i, base_offset, rw_n,
+               wl_n - 1);
+  }
+
   return changes;
 }
 

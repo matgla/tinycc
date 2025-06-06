@@ -151,8 +151,26 @@ static int ir_gen_setif_branch_fuse(IROptCtx *ctx, int i)
 
   if (setif_q->op != TCCIR_OP_SETIF)
     return 0;
-  if (test_q->op != TCCIR_OP_TEST_ZERO)
+  /* The "test against zero" op may be either TEST_ZERO T or the equivalent
+   * CMP T,#0 — both set the Z flag from whether T is zero, so a following
+   * JUMPIF NE/EQ branches on the SETIF condition (or its inverse) identically.
+   * 64-bit EQ/NE comparisons emit the CMP T,#0 form, so handling it here is
+   * what lets them fuse to a direct conditional branch instead of the
+   * `ite/movne/moveq/cb(n)z` boolean materialization. */
+  if (test_q->op == TCCIR_OP_TEST_ZERO)
+  {
+    /* tested value is src1 (no src2 to validate) */
+  }
+  else if (test_q->op == TCCIR_OP_CMP)
+  {
+    IROperand test_src2 = tcc_ir_op_get_src2(ir, test_q);
+    if (!irop_is_immediate(test_src2) || irop_get_imm64_ex(ir, test_src2) != 0)
+      return 0;
+  }
+  else
+  {
     return 0;
+  }
   if (jump_q->op != TCCIR_OP_JUMPIF)
     return 0;
 

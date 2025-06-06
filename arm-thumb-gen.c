@@ -288,6 +288,7 @@ ST_FUNC void tcc_gen_machine_imm_cache_reset(void);
 static void thumb_require_materialized_reg(const char *ctx, const char *operand, int reg);
 static bool thumb_is_hw_reg(int reg);
 static int get_struct_base_addr_mop(const MachineOperand *mop, int default_reg);
+static int find_call_scratch(uint32_t extra_exclude, uint32_t arg_move_dst_mask);
 int th_has_immediate_value(int r);
 int load_word_from_base(int ir, int base, int fc, int sign);
 int th_patch_call(int t, int a);
@@ -1221,6 +1222,22 @@ ST_FUNC void tcc_gen_machine_mov_coalesce_reset(void)
 {
   mov_equiv_reset_all();
   tcc_gen_machine_strldr_cache_reset();
+}
+
+/* Reset only the MOV-coalescing register-equivalence cache.  Unlike the
+ * STR->LDR memory cache, the GPR value-equivalence cache stays sound across
+ * straight-line IR-op boundaries: every instruction the backend emits passes
+ * through the ot() updater, which invalidates the destination register (and
+ * a `bl`/unknown opcode triggers a full reset, covering call clobbers).  So
+ * the only place a reset is genuinely required is a real control-flow merge:
+ * arriving at a branch target, the emission-order equivalences from the
+ * fall-through predecessor do not describe the register state on the
+ * jumped-from path.  codegen.c therefore calls this only at jump targets,
+ * letting cross-IR `mov` chains (e.g. a soft-float call result copied to its
+ * home pair and then to the next call's argument pair) coalesce away. */
+ST_FUNC void tcc_gen_machine_mov_equiv_reset(void)
+{
+  mov_equiv_reset_all();
 }
 
 /* Public interface for dry-run code generation */
@@ -3292,6 +3309,23 @@ ST_FUNC int tcc_gen_machine_switch_table_dry_run_size(int num_entries)
   return 14 + num_entries * 4;
 }
 
+/* Force any pending literal pool to be flushed before a region of
+ * `upcoming_bytes` is emitted, if leaving the pool pending that long would
+ * push its load out of range.  Public wrapper so codegen.c can reserve
+ * space symmetrically in both the dry-run and real-run passes.
+ *
+ * The SWITCH_TABLE dispatch needs this: its preamble (LSL/ADD/LDR/ADD/BX)
+ * must be emitted atomically — a literal-pool flush in the middle relocates
+ * the terminal `ADD Rt, PC; BX Rt` past the pool (bridged by a B.W), which
+ * invalidates the `ref_point == table_start` assumption that the switch-
+ * table offset backpatch in codegen.c relies on, producing a wild jump.
+ * Flushing the pool up front (in both passes, so dry-run size estimates and
+ * real-run addresses stay consistent) keeps the preamble + table contiguous. */
+ST_FUNC void tcc_gen_machine_reserve_pool_bytes(int upcoming_bytes)
+{
+  th_literal_pool_reserve_upcoming_bytes(upcoming_bytes);
+}
+
 /* MOP variant: accepts a MachineOperand for the index register. */
 ST_FUNC void tcc_gen_machine_switch_table_mop(MachineOperand src, TCCIRSwitchTable *table, TCCIRState *ir, int ir_idx)
 {
@@ -5056,7 +5090,7 @@ static void thumb_emit_data_processing_mop64(const MachineOperand *src1, const M
  * extracted from MachineOperand rather than IROperand fields.
  */
 static void thumb_emit_shift64_mop(const MachineOperand *src1, const MachineOperand *src2, const MachineOperand *dest,
-                                   TccIrOp op)
+                                   TccIrOp op, bool skip_lo, bool skip_hi)
 {
   if (src2->kind != MACH_OP_IMM)
   {
@@ -5182,8 +5216,9 @@ static void thumb_emit_shift64_mop(const MachineOperand *src1, const MachineOper
       if (dst_hi == src_lo)
       {
         /* dst_hi aliases src_lo — compute dst_lo first (needs src_lo). */
-        ot_check(
-            dst_lo_shift((uint32_t)dst_lo, (uint32_t)src_lo, sh, flags_safe(), ENFORCE_ENCODING_NONE));
+        if (!skip_lo)
+          ot_check(
+              dst_lo_shift((uint32_t)dst_lo, (uint32_t)src_lo, sh, flags_safe(), ENFORCE_ENCODING_NONE));
         ot_check(
             dst_hi_shift((uint32_t)dst_hi, (uint32_t)src_hi, sh, flags_safe(), ENFORCE_ENCODING_NONE));
       }
@@ -5192,8 +5227,9 @@ static void thumb_emit_shift64_mop(const MachineOperand *src1, const MachineOper
         /* Default order: dst_hi first to avoid clobbering src_hi via dst_lo. */
         ot_check(
             dst_hi_shift((uint32_t)dst_hi, (uint32_t)src_hi, sh, flags_safe(), ENFORCE_ENCODING_NONE));
-        ot_check(
-            dst_lo_shift((uint32_t)dst_lo, (uint32_t)src_lo, sh, flags_safe(), ENFORCE_ENCODING_NONE));
+        if (!skip_lo)
+          ot_check(
+              dst_lo_shift((uint32_t)dst_lo, (uint32_t)src_lo, sh, flags_safe(), ENFORCE_ENCODING_NONE));
       }
       ot_check(th_orr_reg((uint32_t)dst_hi, (uint32_t)dst_hi, (uint32_t)tmp.reg, flags_safe(),
                           THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
@@ -5232,18 +5268,22 @@ static void thumb_emit_shift64_mop(const MachineOperand *src1, const MachineOper
       /* Emit MOV dst_hi first: dst_lo may alias src_lo. */
       ot_check_mov_reg((uint32_t)dst_hi, (uint32_t)src_lo, flags_safe(), THUMB_SHIFT_DEFAULT,
                        ENFORCE_ENCODING_NONE, false);
-      ot_check(th_mov_imm((uint32_t)dst_lo, 0, flags_safe(), ENFORCE_ENCODING_NONE));
+      if (!skip_lo)
+        ot_check(th_mov_imm((uint32_t)dst_lo, 0, flags_safe(), ENFORCE_ENCODING_NONE));
     }
     else
     {
       /* Emit MOV dst_lo first: dst_hi may alias src_hi. */
       ot_check_mov_reg((uint32_t)dst_lo, (uint32_t)src_hi, flags_safe(), THUMB_SHIFT_DEFAULT,
                        ENFORCE_ENCODING_NONE, false);
-      if (arith_right)
-        ot_check(
-            th_asr_imm((uint32_t)dst_hi, (uint32_t)src_hi, 31, flags_safe(), ENFORCE_ENCODING_NONE));
-      else
-        ot_check(th_mov_imm((uint32_t)dst_hi, 0, flags_safe(), ENFORCE_ENCODING_NONE));
+      if (!skip_hi)
+      {
+        if (arith_right)
+          ot_check(
+              th_asr_imm((uint32_t)dst_hi, (uint32_t)src_hi, 31, flags_safe(), ENFORCE_ENCODING_NONE));
+        else
+          ot_check(th_mov_imm((uint32_t)dst_hi, 0, flags_safe(), ENFORCE_ENCODING_NONE));
+      }
     }
   }
   else if (sh < 64)
@@ -5253,7 +5293,8 @@ static void thumb_emit_shift64_mop(const MachineOperand *src1, const MachineOper
       /* Emit shift into dst_hi first: dst_lo may alias src_lo. */
       ot_check(dst_hi_shift((uint32_t)dst_hi, (uint32_t)src_lo, sh - 32, flags_safe(),
                             ENFORCE_ENCODING_NONE));
-      ot_check(th_mov_imm((uint32_t)dst_lo, 0, flags_safe(), ENFORCE_ENCODING_NONE));
+      if (!skip_lo)
+        ot_check(th_mov_imm((uint32_t)dst_lo, 0, flags_safe(), ENFORCE_ENCODING_NONE));
     }
     else
     {
@@ -5261,8 +5302,9 @@ static void thumb_emit_shift64_mop(const MachineOperand *src1, const MachineOper
       {
         /* dst_lo aliases src_hi — compute dst_hi (sign extension) first
          * while src_hi is still intact, then shift into dst_lo. */
-        ot_check(
-            th_asr_imm((uint32_t)dst_hi, (uint32_t)src_hi, 31, flags_safe(), ENFORCE_ENCODING_NONE));
+        if (!skip_hi)
+          ot_check(
+              th_asr_imm((uint32_t)dst_hi, (uint32_t)src_hi, 31, flags_safe(), ENFORCE_ENCODING_NONE));
         ot_check(dst_hi_shift((uint32_t)dst_lo, (uint32_t)src_hi, sh - 32, flags_safe(),
                               ENFORCE_ENCODING_NONE));
       }
@@ -5270,11 +5312,14 @@ static void thumb_emit_shift64_mop(const MachineOperand *src1, const MachineOper
       {
         ot_check(dst_hi_shift((uint32_t)dst_lo, (uint32_t)src_hi, sh - 32, flags_safe(),
                               ENFORCE_ENCODING_NONE));
-        if (arith_right)
-          ot_check(
-              th_asr_imm((uint32_t)dst_hi, (uint32_t)src_hi, 31, flags_safe(), ENFORCE_ENCODING_NONE));
-        else
-          ot_check(th_mov_imm((uint32_t)dst_hi, 0, flags_safe(), ENFORCE_ENCODING_NONE));
+        if (!skip_hi)
+        {
+          if (arith_right)
+            ot_check(
+                th_asr_imm((uint32_t)dst_hi, (uint32_t)src_hi, 31, flags_safe(), ENFORCE_ENCODING_NONE));
+          else
+            ot_check(th_mov_imm((uint32_t)dst_hi, 0, flags_safe(), ENFORCE_ENCODING_NONE));
+        }
       }
     }
   }
@@ -5282,11 +5327,15 @@ static void thumb_emit_shift64_mop(const MachineOperand *src1, const MachineOper
   {
     if (is_left)
     {
-      ot_check(th_mov_imm((uint32_t)dst_lo, 0, flags_safe(), ENFORCE_ENCODING_NONE));
-      ot_check(th_mov_imm((uint32_t)dst_hi, 0, flags_safe(), ENFORCE_ENCODING_NONE));
+      if (!skip_lo)
+        ot_check(th_mov_imm((uint32_t)dst_lo, 0, flags_safe(), ENFORCE_ENCODING_NONE));
+      if (!skip_hi)
+        ot_check(th_mov_imm((uint32_t)dst_hi, 0, flags_safe(), ENFORCE_ENCODING_NONE));
     }
     else if (arith_right)
     {
+      /* Both halves are the sign of src_hi; dst_lo copies dst_hi, so leave
+       * this degenerate path intact rather than risk the inter-half dep. */
       ot_check(
           th_asr_imm((uint32_t)dst_hi, (uint32_t)src_hi, 31, flags_safe(), ENFORCE_ENCODING_NONE));
       ot_check_mov_reg((uint32_t)dst_lo, (uint32_t)dst_hi, flags_safe(), THUMB_SHIFT_DEFAULT,
@@ -5294,19 +5343,21 @@ static void thumb_emit_shift64_mop(const MachineOperand *src1, const MachineOper
     }
     else
     {
-      ot_check(th_mov_imm((uint32_t)dst_lo, 0, flags_safe(), ENFORCE_ENCODING_NONE));
-      ot_check(th_mov_imm((uint32_t)dst_hi, 0, flags_safe(), ENFORCE_ENCODING_NONE));
+      if (!skip_lo)
+        ot_check(th_mov_imm((uint32_t)dst_lo, 0, flags_safe(), ENFORCE_ENCODING_NONE));
+      if (!skip_hi)
+        ot_check(th_mov_imm((uint32_t)dst_hi, 0, flags_safe(), ENFORCE_ENCODING_NONE));
     }
   }
 
-  /* Write back. */
-  if (store_lo)
+  /* Write back.  A dead half was never materialized, so skip its store. */
+  if (store_lo && !skip_lo)
   {
     MachineOperand dst_lo_op = mach_make_lo_half(dest);
     dst_lo_op.btype = IROP_BTYPE_INT32;
     mach_writeback_dest(&dst_lo_op, dst_lo);
   }
-  if (store_hi)
+  if (store_hi && !skip_hi)
   {
     MachineOperand dst_hi_op = mach_make_hi_half(dest);
     dst_hi_op.btype = IROP_BTYPE_INT32;
@@ -5372,6 +5423,44 @@ static void thumb_emit_data_processing_mop32(const MachineOperand *src1, const M
         ot_check(th_uxtb((uint32_t)dest_reg, (uint32_t)src1_reg, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
       else
         ot_check(th_uxth((uint32_t)dest_reg, (uint32_t)src1_reg, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+      if (dest->kind != MACH_OP_NONE)
+      {
+        const bool needs_wb = dest->kind == MACH_OP_SPILL || dest->kind == MACH_OP_PARAM_STACK ||
+                              (dest->kind == MACH_OP_REG && (dest->needs_deref || dest->u.reg.r0 == (int)PREG_REG_NONE));
+        if (needs_wb)
+          mach_writeback_dest(dest, dest_reg);
+      }
+      mach_release_all(&mctx);
+      return;
+    }
+  }
+
+  /* UBFX fast path: AND with a low-contiguous mask #((1<<W)-1) that is NOT
+   * encodable as a Thumb-2 modified immediate → UBFX Rd, Rn, #0, #W.  Without
+   * this the mask needs a separate movw to materialize (e.g. 0x7ff for an
+   * 11-bit bitfield), so AND becomes two instructions; UBFX #0,#W is one and
+   * semantically identical for the unsigned low-bits mask.  W==8/16 are handled
+   * by the UXTB/UXTH path above, and any encodable mask stays a 1-instruction
+   * AND (no win), so this only fires when it strictly removes the movw. */
+  if (op == TCCIR_OP_AND && !dest_sets_flags && barrel_shift == 0 &&
+      src2->kind == MACH_OP_IMM && !src2->needs_deref && !src2->is_64bit &&
+      flags != FLAGS_BEHAVIOUR_SET)
+  {
+    uint32_t mask = (uint32_t)src2->u.imm.val;
+    if (mask != 0 && mask != 0xFFFFFFFFu && (mask & (mask + 1)) == 0 && th_pack_const(mask) == 0)
+    {
+      int width = 0;
+      while ((mask >> width) & 1u)
+        width++;
+      int dest_reg = mach_get_dest_reg(&mctx, dest, 0);
+      uint32_t excl = thumb_is_hw_reg(dest_reg) ? (1u << (uint32_t)dest_reg) : 0;
+      int src1_reg = mach_ensure_in_reg(&mctx, src1, excl);
+      int widthm1 = width - 1;
+      thumb_opcode ubfx_op;
+      ubfx_op.size = 4;
+      ubfx_op.opcode =
+          0xF3C00000 | ((uint32_t)src1_reg << 16) | ((uint32_t)dest_reg << 8) | (uint32_t)widthm1;
+      ot(ubfx_op);
       if (dest->kind != MACH_OP_NONE)
       {
         const bool needs_wb = dest->kind == MACH_OP_SPILL || dest->kind == MACH_OP_PARAM_STACK ||
@@ -5552,13 +5641,17 @@ static void data_processing_mop_impl(MachineOperand src1, MachineOperand src2, M
   if (dest.is_64bit || (op == TCCIR_OP_CMP && src1.is_64bit))
   {
     if (op == TCCIR_OP_SHL || op == TCCIR_OP_SHR || op == TCCIR_OP_SAR)
-      thumb_emit_shift64_mop(&src1, &src2, &dest, op);
+    {
+      bool skip_lo = (barrel_shift >> 16) & 1;
+      bool skip_hi = (barrel_shift >> 17) & 1;
+      thumb_emit_shift64_mop(&src1, &src2, &dest, op, skip_lo, skip_hi);
+    }
     else
       thumb_emit_data_processing_mop64(&src1, &src2, &dest, op, handler, carry_handler, uses_carry);
     return;
   }
 
-  thumb_emit_data_processing_mop32(&src1, &src2, &dest, op, handler, flags, barrel_shift);
+  thumb_emit_data_processing_mop32(&src1, &src2, &dest, op, handler, flags, barrel_shift & 0xFFFFu);
 }
 
 /* tcc_gen_machine_ubfx_mop: emit UBFX Rd, Rn, #lsb, #width.
@@ -5581,6 +5674,46 @@ void tcc_gen_machine_ubfx_mop(MachineOperand src1, MachineOperand src2, MachineO
   thumb_opcode op;
   op.size = 4;
   op.opcode = 0xF3C00000 | ((uint32_t)rn << 16) | ((uint32_t)imm3 << 12) | ((uint32_t)rd << 8) | ((uint32_t)imm2 << 6) | (uint32_t)widthm1;
+  ot(op);
+  mach_writeback_dest(&dest, rd);
+  mach_release_all(&ctx);
+}
+
+/* tcc_gen_machine_bfi_mop: emit BFI Rd, Rn, #lsb, #width.
+ * src1 = host word (moved into Rd, the BFI base, if not already there),
+ * src2 = value supplying the field bits (only its low `width` bits are used),
+ * dest = result.  params packs lsb (bits 0-7) and width (bits 8-15). */
+void tcc_gen_machine_bfi_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest, uint32_t params)
+{
+  MachineCodegenContext ctx = {0};
+  int rd = mach_get_dest_reg(&ctx, &dest, 0);
+  int rn = mach_ensure_in_reg(&ctx, &src2, 0);                            /* value (Rn) */
+  int rword = mach_ensure_in_reg(&ctx, &src1, (1u << (uint32_t)rn));      /* host word */
+  /* Establish Rd = host word.  If the value happens to live in Rd (RA coalesced
+   * the result onto src2), preserve it in a scratch before clobbering Rd. */
+  if (rd != rword)
+  {
+    if (rd == rn)
+    {
+      int tmp = mach_alloc_scratch(&ctx, (1u << (uint32_t)rd) | (1u << (uint32_t)rword));
+      ot_check_mov_reg((uint32_t)tmp, (uint32_t)rd, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
+      rn = tmp;
+    }
+    ot_check_mov_reg((uint32_t)rd, (uint32_t)rword, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
+  }
+  int lsb = (int)(params & 0xFF);
+  int width = (int)((params >> 8) & 0xFF);
+  if (width < 1)
+    width = 1;
+  int msb = lsb + width - 1;
+  if (msb > 31)
+    msb = 31;
+  int imm3 = (lsb >> 2) & 0x7;
+  int imm2 = lsb & 0x3;
+  /* Thumb-2 BFI: 11110 0 11 0110 Rn | 0 imm3 Rd imm2 0 msb */
+  thumb_opcode op;
+  op.size = 4;
+  op.opcode = 0xF3600000 | ((uint32_t)rn << 16) | ((uint32_t)imm3 << 12) | ((uint32_t)rd << 8) | ((uint32_t)imm2 << 6) | (uint32_t)msb;
   ot(op);
   mach_writeback_dest(&dest, rd);
   mach_release_all(&ctx);
@@ -7647,7 +7780,11 @@ ST_FUNC void tcc_gen_machine_load_indexed_mop(MachineOperand dest, MachineOperan
     }
   }
 
-  thumb_shift shift = {.type = THUMB_SHIFT_LSL, .value = (uint32_t)shift_amount, .mode = THUMB_SHIFT_IMMEDIATE};
+  /* scale 0 → no shift: use THUMB_SHIFT_NONE so the 16-bit T1 register-offset
+   * encoding (all-low regs) can be selected instead of the wide T32 form. */
+  thumb_shift shift = (shift_amount == 0)
+                          ? (thumb_shift){.type = THUMB_SHIFT_NONE, .value = 0, .mode = THUMB_SHIFT_IMMEDIATE}
+                          : (thumb_shift){.type = THUMB_SHIFT_LSL, .value = (uint32_t)shift_amount, .mode = THUMB_SHIFT_IMMEDIATE};
 
   /* Fast path: 64-bit constant-displacement load using LDRD [base, #imm].
    * LDRD supports word-aligned offsets in range [-1020, 1020]. */
@@ -7844,7 +7981,11 @@ ST_FUNC void tcc_gen_machine_store_indexed_mop(MachineOperand base, MachineOpera
     }
   }
 
-  thumb_shift shift = {.type = THUMB_SHIFT_LSL, .value = (uint32_t)shift_amount, .mode = THUMB_SHIFT_IMMEDIATE};
+  /* scale 0 → no shift: use THUMB_SHIFT_NONE so the 16-bit T1 register-offset
+   * encoding (all-low regs) can be selected instead of the wide T32 form. */
+  thumb_shift shift = (shift_amount == 0)
+                          ? (thumb_shift){.type = THUMB_SHIFT_NONE, .value = 0, .mode = THUMB_SHIFT_IMMEDIATE}
+                          : (thumb_shift){.type = THUMB_SHIFT_LSL, .value = (uint32_t)shift_amount, .mode = THUMB_SHIFT_IMMEDIATE};
 
   /* Fast path: 64-bit constant-displacement store using STRD [base, #imm]. */
   if (value.is_64bit && shift_amount == 0 && index.kind == MACH_OP_IMM)
@@ -10063,6 +10204,7 @@ typedef struct ThumbArgMove
   int local_offset;      /* valid when kind==THUMB_ARG_MOVE_LOCAL_ADDR */
   int local_is_param;    /* valid when kind==THUMB_ARG_MOVE_LOCAL_ADDR - if true, add offset_to_args */
   int struct_word_count; /* valid when kind==THUMB_ARG_MOVE_STRUCT */
+  int struct_src_align;  /* struct natural alignment (bytes); gates source LDRD */
   MachineOperand mop;    /* valid when kind==THUMB_ARG_MOVE_MOP */
 } ThumbArgMove;
 
@@ -10135,14 +10277,41 @@ static void thumb_emit_arg_move(const ThumbArgMove *m)
     ScratchRegAlloc struct_scratch = get_scratch_reg_with_save(0);
     int base_addr_reg = get_struct_base_addr_mop(&m->mop, struct_scratch.reg);
 
-    /* Load each word from the struct into consecutive target registers */
-    for (int w = 0; w < word_count; ++w)
+    /* Load each word from the struct into consecutive target registers.
+     * Adjacent word pairs use LDRD when the struct's natural alignment is >= 4
+     * (so the source address is 4-byte aligned — LDRD faults otherwise) and
+     * neither destination register aliases the base (LDRD writes Rt then Rt2;
+     * an alias would read a clobbered base on the fallback path / be unsafe). */
+    bool src_aligned = (m->struct_src_align >= 4);
+    int w = 0;
+    for (; w + 1 < word_count; )
+    {
+      int dst = base_dst + w;
+      int dst_hi = base_dst + w + 1;
+      int offset = w * 4;
+      if (src_aligned && dst != base_addr_reg && dst_hi != base_addr_reg &&
+          tcc_gen_machine_try_ldrd_base(dst, dst_hi, base_addr_reg, offset))
+      {
+        w += 2;
+        continue;
+      }
+      /* Single-word load of this word; the next iteration handles w+1. */
+      if (!load_word_from_base(dst, base_addr_reg, offset, 0))
+      {
+        ScratchRegAlloc off_scratch = get_scratch_reg_with_save((1u << base_addr_reg) | (1u << dst));
+        load_immediate(off_scratch.reg, offset, NULL, false);
+        ot_check(th_ldr_reg(dst, base_addr_reg, off_scratch.reg, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+        restore_scratch_reg(&off_scratch);
+      }
+      w += 1;
+    }
+    /* Trailing odd word. */
+    for (; w < word_count; ++w)
     {
       int dst = base_dst + w;
       int offset = w * 4;
       if (!load_word_from_base(dst, base_addr_reg, offset, 0))
       {
-        /* Large offset - need a second scratch for the offset */
         ScratchRegAlloc off_scratch = get_scratch_reg_with_save((1u << base_addr_reg) | (1u << dst));
         load_immediate(off_scratch.reg, offset, NULL, false);
         ot_check(th_ldr_reg(dst, base_addr_reg, off_scratch.reg, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
@@ -10572,7 +10741,8 @@ static int get_struct_base_addr_mop(const MachineOperand *mop, int default_reg)
 
 /* Build register move for a struct argument (MOP path) */
 static int build_reg_move_struct(ThumbArgMove *moves, int move_count, const MachineOperand *mop,
-                                 const TCCAbiArgLoc *loc, int base_reg, ThumbGenCallSite *call_site)
+                                 const TCCAbiArgLoc *loc, int base_reg, ThumbGenCallSite *call_site,
+                                 int src_align)
 {
   int words = loc->reg_count;
   if (words > 0 && words <= 4)
@@ -10582,6 +10752,7 @@ static int build_reg_move_struct(ThumbArgMove *moves, int move_count, const Mach
         .dst_reg = base_reg,
         .mop = *mop,
         .struct_word_count = words,
+        .struct_src_align = src_align,
     };
   }
   for (int w = 0; w < words && w < loc->reg_count; w++)
@@ -10677,7 +10848,28 @@ static int build_reg_move_32bit(ThumbArgMove *moves, int move_count, const Machi
 }
 
 /* Place a struct argument on stack (MOP path) */
-static void place_stack_arg_struct(const MachineOperand *mop, const TCCAbiArgLoc *loc, int stack_offset)
+/* Load one struct word at [base_addr_reg + off] into `reg`, falling back to a
+ * register-offset load when `off` exceeds the LDR immediate range. */
+static void load_struct_word_into(int reg, int base_addr_reg, int off)
+{
+  if (!load_word_from_base(reg, base_addr_reg, off, 0))
+  {
+    load_immediate(reg, off, NULL, false);
+    ot_check(th_ldr_reg(reg, base_addr_reg, reg, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+  }
+}
+
+/* Copy a (possibly split) struct argument's stack portion into the outgoing
+ * argument area.  `src_align` is the struct's natural alignment in bytes.
+ *
+ * Adjacent word pairs are copied with LDRD/STRD instead of two LDR/STR.  The
+ * destination is the outgoing arg area — SP-relative with a word-multiple
+ * offset and SP 8-byte aligned at the call boundary — so STRD is always
+ * alignment-safe.  LDRD additionally requires the *source* address to be
+ * 4-byte aligned, which holds exactly when the struct's natural alignment is
+ * >= 4 (the stack portion starts at base + words_in_regs*4, a word multiple). */
+static void place_stack_arg_struct(const MachineOperand *mop, const TCCAbiArgLoc *loc, int stack_offset,
+                                   int src_align)
 {
   int words_in_regs = (loc->kind == TCC_ABI_LOC_REG_STACK) ? loc->reg_count : 0;
   int struct_src_offset = words_in_regs * 4;
@@ -10687,18 +10879,42 @@ static void place_stack_arg_struct(const MachineOperand *mop, const TCCAbiArgLoc
   ScratchRegAlloc struct_sc = get_scratch_reg_with_save(0);
   int base_addr_reg = get_struct_base_addr_mop(mop, struct_sc.reg);
 
-  for (int w = 0; w < words; ++w)
+  /* Second data register (besides LR) for paired LDRD/STRD.  find_call_scratch
+   * never pushes (SP-relative store offsets must stay valid) and we exclude LR
+   * and the struct base; an R_IP last-resort result is a permanent scratch and
+   * safe to clobber. */
+  int data2 = find_call_scratch((1u << ARM_LR) | (1u << (uint32_t)base_addr_reg), 0);
+  bool can_pair = (words >= 2 && data2 != ARM_LR && data2 != base_addr_reg && data2 >= 0 &&
+                   data2 <= R_LR && data2 != R_SP);
+  bool src_aligned = (src_align >= 4);
+
+  int w = 0;
+  if (can_pair)
+  {
+    for (; w + 1 < words; w += 2)
+    {
+      int src_off = struct_src_offset + w * 4;
+      int dst_off = stack_offset + w * 4;
+
+      if (!(src_aligned && tcc_gen_machine_try_ldrd_base(ARM_LR, data2, base_addr_reg, src_off)))
+      {
+        load_struct_word_into(ARM_LR, base_addr_reg, src_off);
+        load_struct_word_into(data2, base_addr_reg, src_off + 4);
+      }
+      if (!tcc_gen_machine_try_strd_base(ARM_LR, data2, ARM_SP, dst_off))
+      {
+        store_word_to_stack_safe(ARM_LR, dst_off, base_addr_reg);
+        store_word_to_stack_safe(data2, dst_off + 4, base_addr_reg);
+      }
+    }
+  }
+
+  /* Trailing odd word, or every word when pairing was unavailable. */
+  for (; w < words; ++w)
   {
     int src_off = struct_src_offset + w * 4;
     int dst_off = stack_offset + w * 4;
-
-    /* Load word from struct into LR */
-    if (!load_word_from_base(ARM_LR, base_addr_reg, src_off, 0))
-    {
-      load_immediate(ARM_LR, src_off, NULL, false);
-      ot_check(th_ldr_reg(ARM_LR, base_addr_reg, ARM_LR, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-    }
-
+    load_struct_word_into(ARM_LR, base_addr_reg, src_off);
     store_word_to_stack_safe(ARM_LR, dst_off, base_addr_reg);
   }
   restore_scratch_reg(&struct_sc);
@@ -10962,7 +11178,9 @@ static int build_register_arg_moves(CallGenContext *ctx, ThumbArgMove *reg_moves
       }
       else
       {
-        move_count = build_reg_move_struct(reg_moves, move_count, mop, loc, base_reg, ctx->call_site);
+        int src_align = 0;
+        irop_type_size_align(*arg, &src_align);
+        move_count = build_reg_move_struct(reg_moves, move_count, mop, loc, base_reg, ctx->call_site, src_align);
       }
     }
     else if (is_64bit)
@@ -11023,8 +11241,101 @@ static void presave_stack_args_from_arg_regs(CallGenContext *ctx)
   }
 }
 
-/* Place all stack arguments */
-static void place_stack_arguments(CallGenContext *ctx)
+/* True for a plain 32-bit immediate argument destined for a stack slot. */
+static int is_simple_imm_stack_arg(const TCCAbiArgLoc *loc, const MachineOperand *mop)
+{
+  return loc->kind != TCC_ABI_LOC_REG && mop->kind == MACH_OP_IMM && !mop->is_64bit &&
+         mop->btype != IROP_BTYPE_STRUCT && !mop->is_complex;
+}
+
+/* One collected immediate stack store, for the grouped/windowed emission path. */
+typedef struct StackImmArg
+{
+  int off;
+  uint32_t val;
+} StackImmArg;
+
+/* Order by 4 KB window, then value, then offset.  Grouping equal values within a
+ * window lets each distinct value be materialized once per window instead of once
+ * per argument; the window ordering bounds base-register re-materialization. */
+static int stack_imm_arg_cmp(const void *a, const void *b)
+{
+  const StackImmArg *x = (const StackImmArg *)a;
+  const StackImmArg *y = (const StackImmArg *)b;
+  int wx = x->off & ~0xFFF, wy = y->off & ~0xFFF;
+  if (wx != wy)
+    return wx < wy ? -1 : 1;
+  if (x->val != y->val)
+    return x->val < y->val ? -1 : 1;
+  if (x->off != y->off)
+    return x->off < y->off ? -1 : 1;
+  return 0;
+}
+
+/* Emit a single non-simple-immediate stack argument (struct/complex/64-bit, or a
+ * non-immediate 32-bit source).  Extracted from place_stack_arguments so both the
+ * inline and the grouped emission paths share identical handling. */
+static void place_one_stack_arg(CallGenContext *ctx, const TCCAbiArgLoc *loc, const MachineOperand *mop,
+                                int stack_offset, int arg_index)
+{
+  if (mop->btype == IROP_BTYPE_STRUCT || mop->is_complex)
+  {
+    /* Complex values in a register pair: store the stack portion directly
+     * from registers instead of treating the pair as a memory pointer. */
+    if (mop->is_complex && mop->kind == MACH_OP_REG && !mop->needs_deref && mop->is_64bit)
+    {
+      int words_in_regs = (loc->kind == TCC_ABI_LOC_REG_STACK) ? loc->reg_count : 0;
+      int stack_bytes = (loc->kind == TCC_ABI_LOC_REG_STACK) ? loc->stack_size : loc->size;
+      int stack_words = (stack_bytes + 3) / 4;
+      int pair_regs[2] = {mop->u.reg.r0, mop->u.reg.r1};
+      for (int w = 0; w < stack_words; w++)
+      {
+        int reg_idx = words_in_regs + w;
+        if (reg_idx < 2)
+          store_word_to_stack(pair_regs[reg_idx], stack_offset + w * 4);
+      }
+    }
+    else if (mop->is_complex && mop->kind == MACH_OP_IMM)
+    {
+      /* Complex immediate on stack: split 64-bit packed value into words. */
+      const uint64_t imm64 = (uint64_t)mop->u.imm.val;
+      int words_in_regs = (loc->kind == TCC_ABI_LOC_REG_STACK) ? loc->reg_count : 0;
+      int stack_bytes = (loc->kind == TCC_ABI_LOC_REG_STACK) ? loc->stack_size : loc->size;
+      int stack_words = (stack_bytes + 3) / 4;
+      int scr = find_call_scratch(0, ctx->arg_move_dst_mask);
+      for (int w = 0; w < stack_words; w++)
+      {
+        int word_idx = words_in_regs + w;
+        uint32_t word_val = (uint32_t)(imm64 >> (word_idx * 32));
+        load_immediate(scr, word_val, NULL, false);
+        store_word_to_stack(scr, stack_offset + w * 4);
+      }
+    }
+    else
+    {
+      /* Struct's natural alignment gates source-side LDRD (see
+       * place_stack_arg_struct).  Default conservatively to 1 (no LDRD) when
+       * the originating IR operand is unavailable. */
+      int src_align = 1;
+      if (ctx->args && arg_index >= 0 && arg_index < ctx->argc)
+      {
+        int a = 0;
+        irop_type_size_align(ctx->args[arg_index], &a);
+        if (a > 0)
+          src_align = a;
+      }
+      place_stack_arg_struct(mop, loc, stack_offset, src_align);
+    }
+  }
+  else if (mop->is_64bit)
+    place_stack_arg_64bit(mop, stack_offset, tcc_state->ir, ctx->arg_move_dst_mask);
+  else
+    place_stack_arg_32bit(mop, stack_offset, ctx);
+}
+
+/* Inline (original-order) emission of every stack argument.  Used for the common
+ * case where stack args stay within the immediate-offset store range. */
+static void place_stack_arguments_inline(CallGenContext *ctx)
 {
   int cached_imm_reg = -1;
   uint32_t cached_imm_val = 0;
@@ -11039,7 +11350,7 @@ static void place_stack_arguments(CallGenContext *ctx)
 
     int stack_offset = loc->stack_off;
 
-    if (mop->kind == MACH_OP_IMM && !mop->is_64bit && mop->btype != IROP_BTYPE_STRUCT && !mop->is_complex)
+    if (is_simple_imm_stack_arg(loc, mop))
     {
       uint32_t val = (uint32_t)mop->u.imm.val;
       int scr = find_call_scratch(0, ctx->arg_move_dst_mask);
@@ -11054,50 +11365,166 @@ static void place_stack_arguments(CallGenContext *ctx)
     }
 
     cached_imm_reg = -1;
-
-    if (mop->btype == IROP_BTYPE_STRUCT || mop->is_complex)
-    {
-      /* Complex values in a register pair: store the stack portion directly
-       * from registers instead of treating the pair as a memory pointer. */
-      if (mop->is_complex && mop->kind == MACH_OP_REG && !mop->needs_deref && mop->is_64bit)
-      {
-        int words_in_regs = (loc->kind == TCC_ABI_LOC_REG_STACK) ? loc->reg_count : 0;
-        int stack_bytes = (loc->kind == TCC_ABI_LOC_REG_STACK) ? loc->stack_size : loc->size;
-        int stack_words = (stack_bytes + 3) / 4;
-        int pair_regs[2] = {mop->u.reg.r0, mop->u.reg.r1};
-        for (int w = 0; w < stack_words; w++)
-        {
-          int reg_idx = words_in_regs + w;
-          if (reg_idx < 2)
-            store_word_to_stack(pair_regs[reg_idx], stack_offset + w * 4);
-        }
-      }
-      else if (mop->is_complex && mop->kind == MACH_OP_IMM)
-      {
-        /* Complex immediate on stack: split 64-bit packed value into words. */
-        const uint64_t imm64 = (uint64_t)mop->u.imm.val;
-        int words_in_regs = (loc->kind == TCC_ABI_LOC_REG_STACK) ? loc->reg_count : 0;
-        int stack_bytes = (loc->kind == TCC_ABI_LOC_REG_STACK) ? loc->stack_size : loc->size;
-        int stack_words = (stack_bytes + 3) / 4;
-        int scr = find_call_scratch(0, ctx->arg_move_dst_mask);
-        for (int w = 0; w < stack_words; w++)
-        {
-          int word_idx = words_in_regs + w;
-          uint32_t word_val = (uint32_t)(imm64 >> (word_idx * 32));
-          load_immediate(scr, word_val, NULL, false);
-          store_word_to_stack(scr, stack_offset + w * 4);
-        }
-      }
-      else
-      {
-        place_stack_arg_struct(mop, loc, stack_offset);
-      }
-    }
-    else if (mop->is_64bit)
-      place_stack_arg_64bit(mop, stack_offset, tcc_state->ir, ctx->arg_move_dst_mask);
-    else
-      place_stack_arg_32bit(mop, stack_offset, ctx);
+    place_one_stack_arg(ctx, loc, mop, stack_offset, i);
   }
+}
+
+/* Place all stack arguments.
+ *
+ * For the common case the inline path is byte-identical to before.  When simple
+ * 32-bit immediate stack args spill beyond the immediate-offset store range
+ * (offset > 4092) — exactly where the naive path emits movw+indexed (3 instr/arg)
+ * — a windowed/grouped path is used instead:
+ *   - a base register holds sp+window so each store is a single str.w [rb,#disp]
+ *     (re-materialized only when crossing a 4 KB window, ~once / 1024 stores);
+ *   - the immediate stores are reordered by (window, value) so each distinct
+ *     value is loaded once per window rather than once per argument.
+ * Reordering pure-immediate stores to distinct, non-aliasing stack slots leaves
+ * the pre-call stack image unchanged, so it is observationally identical. */
+static void place_stack_arguments(CallGenContext *ctx)
+{
+  int max_imm_off = -1;
+  int imm_count = 0;
+  for (int i = 0; i < ctx->argc; ++i)
+  {
+    const TCCAbiArgLoc *loc = &ctx->layout->locs[i];
+    const MachineOperand *mop = &ctx->mops[i];
+    if (is_simple_imm_stack_arg(loc, mop))
+    {
+      imm_count++;
+      if (loc->stack_off > max_imm_off)
+        max_imm_off = loc->stack_off;
+    }
+  }
+
+  if (!(max_imm_off > 4092 && imm_count >= 2) || getenv("TCC_NO_STACK_ARG_GROUP"))
+  {
+    place_stack_arguments_inline(ctx);
+    return;
+  }
+
+  /* --- Windowed/grouped path --- */
+
+  /* Pass 1: emit every non-simple-immediate stack arg first, in original order. */
+  for (int i = 0; i < ctx->argc; ++i)
+  {
+    const TCCAbiArgLoc *loc = &ctx->layout->locs[i];
+    const MachineOperand *mop = &ctx->mops[i];
+    if (loc->kind == TCC_ABI_LOC_REG || is_simple_imm_stack_arg(loc, mop))
+      continue;
+    place_one_stack_arg(ctx, loc, mop, loc->stack_off, i);
+  }
+
+  /* Reserve two stable scratch registers: rv (holds the value) and rb (base
+   * address).  Both are free across the whole argument-setup region — the call's
+   * register args are moved in afterwards, and find_call_scratch only returns
+   * registers that are dead here or are arg-move destinations (overwritten
+   * later).  Prefer the lower-numbered register for rv so value materialization
+   * can use the 16-bit MOVS encoding. */
+  int s0 = find_call_scratch(0, ctx->arg_move_dst_mask);
+  int s1 = find_call_scratch(1u << s0, ctx->arg_move_dst_mask);
+  if (s1 < s0)
+  {
+    int t = s0;
+    s0 = s1;
+    s1 = t;
+  }
+  int rv = s0, rb = s1;
+  int regs_ok = (rv != rb && rv >= 0 && rv < 16 && rb >= 0 && rb < 16 && rv != ARM_SP && rv != ARM_PC &&
+                 rb != ARM_SP && rb != ARM_PC);
+
+  StackImmArg *items = regs_ok ? tcc_malloc(sizeof(StackImmArg) * imm_count) : NULL;
+  if (!items)
+  {
+    /* Out of stable registers (or alloc failure): emit the immediate args inline. */
+    int cached_imm_reg = -1;
+    uint32_t cached_imm_val = 0;
+    for (int i = 0; i < ctx->argc; ++i)
+    {
+      const TCCAbiArgLoc *loc = &ctx->layout->locs[i];
+      const MachineOperand *mop = &ctx->mops[i];
+      if (!is_simple_imm_stack_arg(loc, mop))
+        continue;
+      uint32_t val = (uint32_t)mop->u.imm.val;
+      int scr = find_call_scratch(0, ctx->arg_move_dst_mask);
+      if (cached_imm_reg != scr || cached_imm_val != val)
+      {
+        load_immediate(scr, val, NULL, false);
+        cached_imm_reg = scr;
+        cached_imm_val = val;
+      }
+      store_word_to_stack(scr, loc->stack_off);
+    }
+    return;
+  }
+
+  int n = 0;
+  for (int i = 0; i < ctx->argc; ++i)
+  {
+    const TCCAbiArgLoc *loc = &ctx->layout->locs[i];
+    const MachineOperand *mop = &ctx->mops[i];
+    if (!is_simple_imm_stack_arg(loc, mop))
+      continue;
+    items[n].off = loc->stack_off;
+    items[n].val = (uint32_t)mop->u.imm.val;
+    n++;
+  }
+  qsort(items, n, sizeof(StackImmArg), stack_imm_arg_cmp);
+
+  uint32_t saved_excl = scratch_global_exclude;
+  scratch_global_exclude |= (1u << rv) | (1u << rb);
+
+  int cur_window = -1; /* base offset of the window currently in rb */
+  int have_val = 0;
+  uint32_t cur_val = 0;
+  for (int k = 0; k < n; ++k)
+  {
+    int off = items[k].off;
+    uint32_t val = items[k].val;
+    int window = off & ~0xFFF;
+    int disp = off & 0xFFF;
+    int base_reg;
+
+    if (window == 0)
+    {
+      base_reg = ARM_SP; /* sp+0 — store directly off sp, no base register needed */
+    }
+    else
+    {
+      if (window != cur_window)
+      {
+        thumb_opcode op = th_add_imm(rb, ARM_SP, (uint32_t)window, flags_safe(), ENFORCE_ENCODING_NONE);
+        if (is_valid_opcode(op))
+          ot(op);
+        else
+        {
+          load_full_const(rb, PREG_NONE, (uint32_t)window, 0);
+          ot_check(th_add_reg(rb, ARM_SP, rb, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+        }
+      }
+      base_reg = rb;
+    }
+    cur_window = window;
+
+    if (!have_val || cur_val != val)
+    {
+      load_immediate(rv, val, NULL, false);
+      have_val = 1;
+      cur_val = val;
+    }
+
+    if (!store_word_to_base(rv, base_reg, disp, 0))
+    {
+      /* disp <= 4092 always encodes via str.w; keep a correct fallback regardless. */
+      ScratchRegAlloc sc = get_scratch_reg_with_save((1u << rv) | (1u << base_reg));
+      load_immediate(sc.reg, (uint32_t)off, NULL, false);
+      ot_check(th_str_reg(rv, ARM_SP, sc.reg, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+      restore_scratch_reg(&sc);
+    }
+  }
+
+  scratch_global_exclude = saved_excl;
+  tcc_free(items);
 }
 
 /* Handle return value after call (MOP path).

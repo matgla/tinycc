@@ -305,8 +305,10 @@ static int ir_gen_indexed_memory_fusion(IROptCtx *ctx, int i)
   IROperand add_src2 = tcc_ir_op_get_src2(ir, add_q);
   int32_t offset_vr = -1;
   IROperand base_op = IROP_NONE;
+  IROperand index_op = IROP_NONE;
   int shl_idx = -1;
   IRQuadCompact *shl_q = NULL;
+  int shift_amount = 0;
 
   if (irop_has_vreg(add_src1)) {
     int32_t vr1 = irop_get_vreg(add_src1);
@@ -328,30 +330,76 @@ static int ir_gen_indexed_memory_fusion(IROptCtx *ctx, int i)
       shl_q = &ir->compact_instructions[shl_idx];
     }
   }
-  if (shl_idx < 0)
-    return 0;
 
-  if (ir_opt_du_uses(du, offset_vr) != 1)
-    return 0;
-
-  IROperand shl_src2 = tcc_ir_op_get_src2(ir, shl_q);
-  if (!shl_src2.is_const)
-    return 0;
-
-  int shift_amount = shl_src2.u.imm32;
-  if (shift_amount < 1 || shift_amount > 3)
-    return 0;
-
-  IROperand index_op = tcc_ir_op_get_src1(ir, shl_q);
-  if (index_op.is_local || index_op.is_llocal)
-    return 0;
-  if (base_op.is_llocal || base_op.is_lval)
-    return 0;
-
-  for (int j = shl_idx + 1; j < i; j++) {
-    TccIrOp bop = ir->compact_instructions[j].op;
-    if (bop == TCCIR_OP_JUMP || bop == TCCIR_OP_JUMPIF || bop == TCCIR_OP_NOP)
+  if (shl_idx >= 0) {
+    /* Scaled index: base + (index << scale), scale in 1..3 (int/short/long). */
+    if (ir_opt_du_uses(du, offset_vr) != 1)
       return 0;
+
+    IROperand shl_src2 = tcc_ir_op_get_src2(ir, shl_q);
+    if (!shl_src2.is_const)
+      return 0;
+
+    shift_amount = shl_src2.u.imm32;
+    if (shift_amount < 1 || shift_amount > 3)
+      return 0;
+
+    index_op = tcc_ir_op_get_src1(ir, shl_q);
+    if (index_op.is_local || index_op.is_llocal)
+      return 0;
+    if (base_op.is_llocal || base_op.is_lval)
+      return 0;
+
+    for (int j = shl_idx + 1; j < i; j++) {
+      TccIrOp bop = ir->compact_instructions[j].op;
+      if (bop == TCCIR_OP_JUMP || bop == TCCIR_OP_JUMPIF || bop == TCCIR_OP_NOP)
+        return 0;
+    }
+  } else {
+    /* Unscaled register index: base + index (scale 0).  Matches byte-array
+     * accesses `arr[i]` (and any element type where no SHL is generated):
+     * ARM encodes these as LDRB/STRB/LDR Rt,[Rn,Rm], folding the separate
+     * `ADD addr,base,index` into the load/store's addressing mode.  Both ADD
+     * operands must be plain registers — a constant operand is the
+     * displacement case handled by the disp-fusion pass. */
+    if (add_idx >= i)
+      return 0;
+    if (!irop_has_vreg(add_src1) || !irop_has_vreg(add_src2))
+      return 0;
+    if (add_src1.is_const || add_src2.is_const)
+      return 0;
+
+    base_op = add_src1;
+    index_op = add_src2;
+    shift_amount = 0;
+
+    /* The index may be a plain register value or a stack-local lvalue (the
+     * register allocator promotes a VT_LOCAL|VT_LVAL operand to a register, or
+     * the backend loads it via mach_ensure_in_reg).  Reject double-indirection
+     * (is_llocal) and bare pointer lvalues (is_lval without is_local), which
+     * would need an extra dereference the index slot cannot express.  The base
+     * must be a plain pointer register. */
+    if (index_op.is_llocal || (index_op.is_lval && !index_op.is_local))
+      return 0;
+    if (base_op.is_local || base_op.is_llocal || base_op.is_lval)
+      return 0;
+
+    /* The ADD must reach the memory op with no intervening control flow and
+     * no redefinition of either address component, so the fused load/store
+     * recomputes the same effective address. */
+    int32_t base_vr = irop_get_vreg(base_op);
+    int32_t index_vr = irop_get_vreg(index_op);
+    for (int j = add_idx + 1; j < i; j++) {
+      IRQuadCompact *bq = &ir->compact_instructions[j];
+      if (bq->op == TCCIR_OP_JUMP || bq->op == TCCIR_OP_JUMPIF || bq->op == TCCIR_OP_NOP)
+        return 0;
+      IROperand bd = tcc_ir_op_get_dest(ir, bq);
+      if (irop_has_vreg(bd)) {
+        int32_t dvr = irop_get_vreg(bd);
+        if (dvr == base_vr || dvr == index_vr)
+          return 0;
+      }
+    }
   }
 
   IROperand orig_dest = tcc_ir_op_get_dest(ir, q);
@@ -388,7 +436,8 @@ static int ir_gen_indexed_memory_fusion(IROptCtx *ctx, int i)
     ir->iroperand_pool[new_base_idx + 3] = scale_imm;
   }
 
-  shl_q->op = TCCIR_OP_NOP;
+  if (shl_idx >= 0)
+    shl_q->op = TCCIR_OP_NOP;
   add_q->op = TCCIR_OP_NOP;
   return 1;
 }
@@ -412,6 +461,11 @@ static int ir_gen_deref_indexed_fusion(IROptCtx *ctx, int i)
 
   IRQuadCompact *q = &ir->compact_instructions[i];
 
+  /* CMP is intentionally excluded: folding a deref operand into a CMP rewrites
+   * the read as a LOAD_INDEXED that a downstream dead-store/alias pass fails to
+   * recognize as a use, which can delete the producing stores (miscompiles
+   * gcc-torture loop-11).  Safe folding here would need an intervening-store
+   * guard + alias-aware DSE — left as a future lever. */
   if (q->op == TCCIR_OP_LOAD || q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_LOAD_INDEXED ||
       q->op == TCCIR_OP_STORE_INDEXED || q->op == TCCIR_OP_LOAD_POSTINC || q->op == TCCIR_OP_STORE_POSTINC ||
       q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_CMP || q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF ||
@@ -422,14 +476,19 @@ static int ir_gen_deref_indexed_fusion(IROptCtx *ctx, int i)
   int operand_positions[2] = {0, 0};
   int num_deref = 0;
 
+  /* Only a genuine pointer dereference (address held in a register/temp) can be
+   * folded into a load's addressing mode.  An is_local/is_llocal lvalue is a
+   * stack-variable access whose def assigns the variable's *value*, not its
+   * address (e.g. `q = p + 4; r = q - i` — the `+4` is q's value, not an
+   * address to load), so folding it would corrupt the variable read. */
   if (irop_config[q->op].has_src1) {
     IROperand s1 = tcc_ir_op_get_src1(ir, q);
-    if (s1.is_lval && irop_has_vreg(s1))
+    if (s1.is_lval && !s1.is_local && !s1.is_llocal && irop_has_vreg(s1))
       operand_positions[num_deref++] = 1;
   }
   if (irop_config[q->op].has_src2) {
     IROperand s2 = tcc_ir_op_get_src2(ir, q);
-    if (s2.is_lval && irop_has_vreg(s2))
+    if (s2.is_lval && !s2.is_local && !s2.is_llocal && irop_has_vreg(s2))
       operand_positions[num_deref++] = 2;
   }
 
@@ -478,33 +537,96 @@ static int ir_gen_deref_indexed_fusion(IROptCtx *ctx, int i)
         shl_q = &ir->compact_instructions[shl_idx];
       }
     }
-    if (shl_idx < 0)
-      continue;
+    IROperand index_op;
+    int scale_amount;
 
-    if (ir_opt_du_uses(du, offset_vr) != 1)
-      continue;
+    if (shl_idx >= 0) {
+      /* Scaled register index: base + (index << scale), scale 1..3. */
+      if (ir_opt_du_uses(du, offset_vr) != 1)
+        continue;
 
-    IROperand shl_src2 = tcc_ir_op_get_src2(ir, shl_q);
-    if (!shl_src2.is_const)
-      continue;
-    int shift_amount = shl_src2.u.imm32;
-    if (shift_amount < 1 || shift_amount > 3)
-      continue;
+      IROperand shl_src2 = tcc_ir_op_get_src2(ir, shl_q);
+      if (!shl_src2.is_const)
+        continue;
+      scale_amount = shl_src2.u.imm32;
+      if (scale_amount < 1 || scale_amount > 3)
+        continue;
 
-    IROperand index_op = tcc_ir_op_get_src1(ir, shl_q);
-    if (index_op.is_llocal)
-      continue;
-    if (base_op.is_llocal || base_op.is_lval)
-      continue;
+      index_op = tcc_ir_op_get_src1(ir, shl_q);
+      if (index_op.is_llocal)
+        continue;
+      if (base_op.is_llocal || base_op.is_lval)
+        continue;
 
-    if (!ir_xform_same_block(ir, shl_idx, i))
-      continue;
+      if (!ir_xform_same_block(ir, shl_idx, i))
+        continue;
+    } else {
+      /* Constant displacement: base + #imm  ->  LOAD_INDEXED [base, #imm] (scale 0).
+       * Mirrors the standalone disp-fusion pass, but here the load is a deref
+       * embedded as an arithmetic operand (e.g. `t <- *(p + 4) & 1`), so no
+       * explicit LOAD op exists for that pass to rewrite.  Folds the address
+       * ADD into the load's addressing mode.  This is the dominant cost in
+       * unrolled element-wise code (GCC `vector_size` ops, struct copies). */
+      if (!tcc_state->opt_disp_fusion)
+        continue;
+
+      int imm_disp;
+      if (irop_get_tag(add_src2) == IROP_TAG_IMM32 && irop_get_tag(add_src1) == IROP_TAG_VREG &&
+          irop_has_vreg(add_src1)) {
+        base_op = add_src1;
+        imm_disp = (int)add_src2.u.imm32;
+      } else if (irop_get_tag(add_src1) == IROP_TAG_IMM32 && irop_get_tag(add_src2) == IROP_TAG_VREG &&
+                 irop_has_vreg(add_src2)) {
+        base_op = add_src2;
+        imm_disp = (int)add_src1.u.imm32;
+      } else {
+        continue;
+      }
+
+      /* Thumb-2 ldr/str displacement range (positive imm12 / negative imm8). */
+      if (imm_disp > 4095 || imm_disp < -255)
+        continue;
+      if (base_op.is_local || base_op.is_llocal || base_op.is_lval)
+        continue;
+
+      {
+        int access_btype = deref_op.btype;
+        if (access_btype == IROP_BTYPE_INT64 || access_btype == IROP_BTYPE_FLOAT64 ||
+            access_btype == IROP_BTYPE_STRUCT)
+          continue;
+      }
+
+      if (!ir_xform_same_block(ir, add_idx, i))
+        continue;
+
+      /* base must not be redefined between the ADD and this use, else the fused
+       * [base, #imm] would recompute from a stale base. */
+      {
+        int32_t base_vr = irop_get_vreg(base_op);
+        int redef = 0;
+        for (int j = add_idx + 1; j < i; j++) {
+          IRQuadCompact *bq = &ir->compact_instructions[j];
+          IROperand bd = tcc_ir_op_get_dest(ir, bq);
+          if (irop_has_vreg(bd) && irop_get_vreg(bd) == base_vr) {
+            redef = 1;
+            break;
+          }
+        }
+        if (redef)
+          continue;
+      }
+
+      index_op = irop_make_imm32(0, imm_disp, IROP_BTYPE_INT32);
+      scale_amount = 0;
+    }
 
     int32_t loaded_vr = tcc_ir_vreg_alloc_temp(ir);
     if (loaded_vr < 0)
       continue;
-    if (ir->iroperand_pool_count + 4 > ir->iroperand_pool_capacity)
-      continue;
+    /* Grow the operand pool rather than bailing when full: large unrolled
+     * element-wise code (GCC vector_size ops) folds dozens of derefs and would
+     * otherwise leave the later ones as `add;ldr` once the pool hit capacity. */
+    tcc_ir_pool_ensure(ir, 4);
 
     int new_base_idx = ir->iroperand_pool_count;
     tcc_ir_pool_add(ir, IROP_NONE);
@@ -513,9 +635,11 @@ static int ir_gen_deref_indexed_fusion(IROptCtx *ctx, int i)
     tcc_ir_pool_add(ir, IROP_NONE);
 
     IROperand loaded_op = irop_make_vreg(loaded_vr, deref_op.btype ? deref_op.btype : IROP_BTYPE_INT32);
+    if (shl_idx < 0)
+      loaded_op.is_unsigned = deref_op.is_unsigned;
     IROperand base_clean = base_op;
     base_clean.is_lval = 0;
-    IROperand scale_imm = irop_make_imm32(0, shift_amount, IROP_BTYPE_INT32);
+    IROperand scale_imm = irop_make_imm32(0, scale_amount, IROP_BTYPE_INT32);
 
     ir->iroperand_pool[new_base_idx + 0] = loaded_op;
     ir->iroperand_pool[new_base_idx + 1] = base_clean;
@@ -524,7 +648,8 @@ static int ir_gen_deref_indexed_fusion(IROptCtx *ctx, int i)
 
     add_q->op = TCCIR_OP_LOAD_INDEXED;
     add_q->operand_base = new_base_idx;
-    shl_q->op = TCCIR_OP_NOP;
+    if (shl_q)
+      shl_q->op = TCCIR_OP_NOP;
 
     IROperand clean_op = loaded_op;
     q = &ir->compact_instructions[i];

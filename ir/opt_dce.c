@@ -20,7 +20,7 @@
 #include "cfg.h"
 #include "licm.h"
 
-static int tcc_ir_callee_is_noreturn(Sym *callee)
+int tcc_ir_callee_is_noreturn(Sym *callee)
 {
   if (!callee)
     return 0;
@@ -207,7 +207,9 @@ static int orphan_cmp_scan(TCCIRState *ir, int from_idx, uint8_t *visited)
     {
     case TCCIR_OP_SETIF:
     case TCCIR_OP_JUMPIF:
-      /* Consumer of our flags - CMP is live. */
+    case TCCIR_OP_SELECT:
+      /* Consumer of our flags - CMP is live.  (SELECT reads the CMP flags via
+       * its ITE block, exactly like SETIF/JUMPIF.) */
       return 0;
     case TCCIR_OP_JUMP:
     {

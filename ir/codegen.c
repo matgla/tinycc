@@ -2294,11 +2294,21 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
 
       ir_to_code_mapping[i] = ind;
 
-      /* Reset both MOV-equivalence and STR→LDR caches at every IR
-       * instruction boundary.  Physical registers may be reassigned to
-       * different virtual registers between IR instructions, so cached
-       * equivalences from one instruction are not valid in the next. */
-      tcc_gen_machine_mov_coalesce_reset();
+      /* Reset the STR→LDR memory-reload cache at every IR instruction
+       * boundary (it tracks memory state, which an aliasing store on a
+       * jumped-from path could invalidate without an emit the tracker sees).
+       *
+       * The MOV-equivalence (GPR value) cache, by contrast, stays sound
+       * across straight-line IR-op boundaries: every emitted instruction
+       * updates it (invalidating its dest reg, with calls/unknown opcodes
+       * forcing a full reset), so register equivalences only become invalid
+       * at a real control-flow merge.  Reset it only at jump targets; this
+       * lets cross-IR `mov` chains — e.g. a soft-float double result copied
+       * to its callee-saved home pair and then back to the next call's
+       * argument pair — coalesce away. */
+      tcc_gen_machine_strldr_cache_reset();
+      if (cq->is_jump_target)
+        tcc_gen_machine_mov_equiv_reset();
 
       /* Invalidate imm_cache for registers assigned to live vregs.
        * Free (dead) registers retain cached constants across IR boundaries.
@@ -2776,6 +2786,11 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
         MopArgs a = DECODE(.dest = 1, .src1 = 1, .src2 = 1);
         {
           uint32_t bs = ir->barrel_shifts ? ir->barrel_shifts[cq->orig_index] : 0;
+          /* For 64-bit shifts, pass dead-half annotations in bits 16-17 so the
+           * emitter can skip the dead low/high word write. */
+          if ((cq->op == TCCIR_OP_SHL || cq->op == TCCIR_OP_SHR || cq->op == TCCIR_OP_SAR) &&
+              ir->shift64_dead_half)
+            bs |= (uint32_t)ir->shift64_dead_half[cq->orig_index] << 16;
           SCRATCH_WRAP(tcc_gen_machine_data_processing_mop(a.src1, a.src2, a.dest, cq->op, bs));
         }
         break;
@@ -2784,6 +2799,13 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
       {
         MopArgs a = DECODE(.dest = 1, .src1 = 1, .src2 = 1);
         SCRATCH_WRAP(tcc_gen_machine_ubfx_mop(a.src1, a.src2, a.dest));
+        break;
+      }
+      case TCCIR_OP_BFI:
+      {
+        MopArgs a = DECODE(.dest = 1, .src1 = 1, .src2 = 1);
+        uint32_t params = ir->bfi_params ? ir->bfi_params[cq->orig_index] : 0;
+        SCRATCH_WRAP(tcc_gen_machine_bfi_mop(a.src1, a.src2, a.dest, params));
         break;
       }
       case TCCIR_OP_FADD:
@@ -3787,6 +3809,12 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
         int table_id = (int)irop_get_imm64_ex(ir, src2_ir);
         TCCIRSwitchTable *table = &ir->switch_tables[table_id];
         MopArgs a = DECODE(.src1 = 1);
+        /* Flush any pending literal pool before the dispatch+table block so it
+         * cannot be flushed in the middle of the preamble (which would relocate
+         * the terminal `ADD Rt,PC; BX Rt` past the pool and break the switch-
+         * table offset backpatch).  Done in both passes — with the same byte
+         * count — so dry-run size estimates and real-run addresses agree. */
+        tcc_gen_machine_reserve_pool_bytes(tcc_gen_machine_switch_table_dry_run_size(table->num_entries));
         if (is_dry_run)
         {
           ind += tcc_gen_machine_switch_table_dry_run_size(table->num_entries);

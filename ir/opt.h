@@ -28,6 +28,10 @@ struct Sym;
 int tcc_ir_opt_dce(struct TCCIRState *ir);
 int tcc_ir_opt_dce_ex(struct IROptCtx *ctx);
 
+/* Returns 1 if the callee never returns (noreturn attribute or known
+ * noreturn libc names: abort/exit/_Exit/quick_exit). */
+int tcc_ir_callee_is_noreturn(struct Sym *callee);
+
 /* NOP Compaction - remove NOP instructions, shrink array, fix jump targets.
  * Returns number of NOPs removed. */
 int tcc_ir_opt_compact_nops(struct TCCIRState *ir);
@@ -150,6 +154,11 @@ int tcc_ir_opt_known_bits(struct TCCIRState *ir);
  * STORE T***DEREF***).  Complements dead_local_slot_elim, which only NOPs
  * STOREs whose dest is a direct StackLoc[X] operand. */
 int tcc_ir_opt_dead_lea_store_elim(struct TCCIRState *ir);
+
+/* Constant-fold read-modify-write chains (e.g. `u.e.a++` -> __aeabi_dadd) on
+ * non-escaping local aggregates by propagating the slot's constant value
+ * across calls and folding the dadd/dsub.  See ir/opt_const_aggregate.c. */
+int tcc_ir_opt_const_aggregate_fold(struct TCCIRState *ir);
 
 /* Constant fold string builtin calls such as `strcmp` and `strncmp` */
 int tcc_ir_opt_const_string_calls(struct TCCIRState *ir);
@@ -274,6 +283,10 @@ int tcc_ir_opt_assign_fuse(struct TCCIRState *ir);
  * when T's hi half is provably zero (SHR>=32 or ZEXT). */
 int tcc_ir_opt_cmp_narrow_64(struct TCCIRState *ir);
 
+/* Dead-half annotation for 64-bit shifts: flags SHL/SHR/SAR results whose low
+ * or high word is provably unread, so codegen skips the dead half-write. */
+int tcc_ir_opt_shift64_dead_half(struct TCCIRState *ir);
+
 /* Global LOAD value CSE - deduplicate loads from the same global within a BB */
 int tcc_ir_opt_cse_global_load(struct TCCIRState *ir);
 
@@ -290,6 +303,25 @@ int tcc_ir_opt_reroll(struct TCCIRState *ir);
  * Targets goto-chain idioms like gcc.c-torture/compile/961126-1.c. */
 int tcc_ir_opt_neg_chain_cse(struct TCCIRState *ir);
 int tcc_ir_opt_neg_chain_cse_ex(struct IROptCtx *ctx);
+
+/* Redundant bitfield insert/extract elimination: `((V<<n) | low) >> n` -> V
+ * (when low < 2^n and V < 2^(32-n)).  Collapses the read-back of a just-poked
+ * bitfield in a dead local struct (gcc.c-torture/execute/20040709-1.c). */
+int tcc_ir_opt_bitfield_insert_extract(struct TCCIRState *ir);
+int tcc_ir_opt_bitfield_insert_extract_ex(struct IROptCtx *ctx);
+
+/* Bitfield insert -> ARM BFI: (W & ~field) | (V << lsb) for a contiguous field
+ * (V < 2^width) becomes BFI Rd, V, #lsb, #width.  Lowers the observed-insert
+ * idiom (`s.k += x` global-bitfield RMW, fn3* in 20040709-2.c) that the extract
+ * fold above cannot reach.  Must run before barrel_shift_fusion.  Records
+ * lsb/width in ir->bfi_params[orig_index]. */
+int tcc_ir_opt_bitfield_insert_to_bfi(struct TCCIRState *ir);
+
+/* Aggregate field-compare fusion: a run of `a.fi != b.fi` bitfield compares
+ * all branching to the same label -> one masked word XOR compare.  Runs in
+ * propagation (before shift-into-CMP fusion makes the two sides asymmetric). */
+int tcc_ir_opt_cmp_field_fuse(struct TCCIRState *ir);
+int tcc_ir_opt_cmp_field_fuse_ex(struct IROptCtx *ctx);
 
 /* Narrow CSE: deduplicate PARAM/VAR + #constant expressions */
 int tcc_ir_opt_cse_param_add(struct TCCIRState *ir);
@@ -474,6 +506,10 @@ int tcc_ir_opt_lea_cse(struct TCCIRState *ir);
 /* LEA + deref fold - collapse `LEA Addr[StackLoc[-N]] + [ADD #K] + deref-use`
  * into a direct StackLoc access, eliminating the address-materialization op. */
 int tcc_ir_opt_lea_fold(struct TCCIRState *ir);
+/* LEA read-modify-write fold — like lea_fold but for a stack-slot LEA whose
+ * every use is a deref (the `u.field++` load+store shape the single-use
+ * lea_fold leaves behind). */
+int tcc_ir_opt_lea_rmw_fold(struct TCCIRState *ir);
 int tcc_ir_opt_add_deref_fold(struct TCCIRState *ir);
 
 /* Combined fusion pass: mla_fusion + indexed_memory_fusion in one loop (shared IROptDU) */
@@ -485,6 +521,11 @@ int tcc_ir_opt_add_deref_fold(struct TCCIRState *ir);
 /* Late barrel shift fusion: populates ir->barrel_shifts[] side-table.
  * Must run immediately before codegen — no passes may run between. */
 void tcc_ir_barrel_shift_fusion(struct TCCIRState *ir);
+
+/* Two-shift extract → UBFX.  Must run AFTER tcc_ir_barrel_shift_fusion (a
+ * SHL+SHR pair surviving as real ops there was not shift-foldable) and before
+ * register allocation.  Returns the number of pairs rewritten. */
+int tcc_ir_opt_shift_pair_to_ubfx(struct TCCIRState *ir);
 
 
 /* Deref-in-ALU indexed fusion: extract deref operands into LOAD_INDEXED when
@@ -544,6 +585,10 @@ int tcc_ir_opt_small_global_memset_to_store(struct TCCIRState *ir);
  * Cuts a redundant compare-and-set when the same boolean is computed twice. */
 int tcc_ir_opt_cmp_setif_cse(struct TCCIRState *ir);
 
+/* Redundant boolean-normalisation elimination: rewrite `CMP X,#0; V<--SETIF NE`
+ * to `V <-- X` when X is already proven to be in {0,1} (the `!!bool` idiom). */
+int tcc_ir_opt_bool_norm_elim(struct TCCIRState *ir);
+
 /* Post-Increment Assign Folding - fold T=V[lval]; V=T OP x into V=V OP x */
 int tcc_ir_opt_postinc_assign_fold(struct TCCIRState *ir);
 
@@ -554,6 +599,9 @@ int tcc_ir_opt_returnvalue_merge(struct TCCIRState *ir);
 
 /* Conditional Select - replace if/else diamond with SELECT (ITE on ARM) */
 int tcc_ir_opt_select(struct TCCIRState *ir);
+
+/* Fold `SETIF(cond); r <- #0 SUB t` mask idiom into SELECT(#-1, #0, cond) */
+int tcc_ir_opt_setif_neg_to_select(struct TCCIRState *ir);
 
 /* Eliminate Fall-Through Jumps - remove redundant unconditional jumps */
 int tcc_ir_opt_eliminate_fallthrough(struct TCCIRState *ir);
@@ -573,6 +621,12 @@ int tcc_ir_opt_backedge_phi_hoist(struct TCCIRState *ir);
  * redundant bridging unconditional JUMP. */
 int tcc_ir_opt_post_ra_forward_diamond(struct TCCIRState *ir);
 
+/* Abort tail-merge + body-invert (post-regalloc): per distinct noreturn callee,
+ * keep the first guarded call inline as a shared sink and invert+retarget every
+ * later guard to branch to it, NOPing the duplicate calls.  Matches GCC's single
+ * shared `bl abort` shape.  Disabled by TCC_NO_ABORT_MERGE. */
+int tcc_ir_opt_abort_tail_merge(struct TCCIRState *ir);
+
 /* ============================================================================
  * Pipeline-ready _ex variants (accept IROptCtx* for pass manager integration)
  * ============================================================================ */
@@ -581,6 +635,7 @@ int tcc_ir_opt_const_prop_tmp_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_single_value_tmp_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_known_bits_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_dead_lea_store_elim_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_const_aggregate_fold_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_const_var_prop_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_global_init_prop_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_symref_const_prop_ex(struct IROptCtx *ctx);
@@ -644,8 +699,18 @@ int tcc_ir_opt_store_redundant_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_rmw_byte_clear(struct TCCIRState *ir);
 int tcc_ir_opt_byte_store_merge(struct TCCIRState *ir);
 int tcc_ir_opt_byte_store_merge_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_const_memcpy_to_dest(struct TCCIRState *ir);
+int tcc_ir_opt_const_memcpy_to_dest_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_local_copy_prop(struct TCCIRState *ir);
 int tcc_ir_opt_local_copy_prop_ex(struct IROptCtx *ctx);
+/* Struct-copy round-trip elimination — drop a `memmove(B,A,N); memmove(A,B,N)`
+ * pair (the inlined identity `y = retme(y)` shape) where B is a pure dead
+ * round-trip temp and A is unmodified between the two copies. */
+int tcc_ir_opt_struct_copy_roundtrip_elim(struct TCCIRState *ir);
+/* Init-copy-from-global load forwarding — when a `memmove(local, &global, N)`
+ * fills a private read-only stack slot, rewrite the slot's loads to read the
+ * global directly and drop the copy (the `struct y = global; return y.f` idiom). */
+int tcc_ir_opt_memmove_global_load_fwd(struct TCCIRState *ir);
 int tcc_ir_opt_addrof_var_fwd_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_global_sl_fwd_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_loop_const_sim(struct TCCIRState *ir);
@@ -752,6 +817,13 @@ int tcc_ir_opt_loop_dead_first_iter(struct TCCIRState *ir);
  * exit value `Addr[StackLoc[init_off + step * trip_count]]`.  Pairs with
  * cmp_stack_addr_fold to collapse post-loop `if (p != &a[N])` checks. */
 int tcc_ir_opt_loop_ptr_iv_exit_subst(struct TCCIRState *ir);
+
+/* Redundant zero-trip entry-guard elimination - walk sequential counted loops
+ * in program order, carrying each loop's constant exit value into the next, and
+ * NOP the pre-loop guard of any loop whose entry value makes the guard provably
+ * never taken (e.g. the 2nd/3rd loops of memclr that share counter i).  Returns
+ * the number of guards removed.  Disable with TCC_NO_GUARD_ELIM=1. */
+int tcc_ir_opt_loop_guard_elim(struct TCCIRState *ir);
 
 /* Dead Loop Elimination - remove loops whose body has no side effects and
  * whose result VARs have constant values. Returns number of loops eliminated. */

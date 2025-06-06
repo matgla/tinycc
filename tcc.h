@@ -1562,6 +1562,11 @@ struct TCCState
   int nrvo_target_vreg;  /* vreg of destination variable */
   int nrvo_target_size;  /* size in bytes — must match function return size */
   int nrvo_target_align; /* alignment — must match */
+  /* Alternate destination form: when >= 0, the destination is addressed
+     through this vreg (a register-deref lvalue, e.g. the LHS of
+     `local.field = sret_call(...)` whose address was materialized by an
+     LEA).  Takes precedence over nrvo_target_loc when set. */
+  int nrvo_target_ptr_vreg;
   struct
   {
     int vreg;
@@ -2686,6 +2691,7 @@ ST_FUNC void tcc_gen_machine_cmp_eq64_mop(MachineOperand src1, MachineOperand sr
  * be encoded and the caller should fall back to the regular CMP+SELECT. */
 ST_FUNC int tcc_gen_machine_subs_eq_select_01(MachineOperand src1, MachineOperand src2, MachineOperand dest);
 ST_FUNC void tcc_gen_machine_ubfx_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest);
+ST_FUNC void tcc_gen_machine_bfi_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest, uint32_t params);
 ST_FUNC void tcc_gen_machine_assign_mop(MachineOperand src, MachineOperand dest, TccIrOp op);
 ST_FUNC void tcc_gen_machine_pack64_mop(MachineOperand src_lo, MachineOperand src_hi, MachineOperand dest);
 ST_FUNC void tcc_gen_machine_setif_mop(MachineOperand src, MachineOperand dest, TccIrOp op);
@@ -2780,6 +2786,8 @@ ST_FUNC int tcc_gen_machine_branch_opt_get_encoding(int ir_index); /* Returns 16
  * boundaries (any IR op may be a branch target, so cross-IR equivalences
  * cannot be trusted). */
 ST_FUNC void tcc_gen_machine_mov_coalesce_reset(void);
+ST_FUNC void tcc_gen_machine_mov_equiv_reset(void);
+ST_FUNC void tcc_gen_machine_reserve_pool_bytes(int upcoming_bytes);
 ST_FUNC void tcc_gen_machine_strldr_cache_reset(void);
 ST_FUNC void tcc_gen_machine_imm_cache_reset(void);
 ST_FUNC void tcc_gen_machine_imm_cache_invalidate_live(uint32_t live_mask);

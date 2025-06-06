@@ -84,6 +84,13 @@ typedef enum TccIrOp
    * ARM: UBFX Rd, Rn, #lsb, #width */
   TCCIR_OP_UBFX,
 
+  /* Bitfield insert: dest = (src1 with bits [lsb..lsb+width-1] replaced by the
+   * low `width` bits of src2).  Algebraically == (src1 & ~field) | (src2 << lsb)
+   * for field = ((1<<width)-1)<<lsb when src2 < 2^width.  lsb/width are carried
+   * in ir->bfi_params[orig_index], not the operands (src1=host word, src2=value).
+   * ARM: BFI Rd, Rn, #lsb, #width (Rd preset to the host word). */
+  TCCIR_OP_BFI,
+
   /* Floating point operations */
   TCCIR_OP_FADD, /* float/double addition */
   TCCIR_OP_FSUB, /* float/double subtraction */
@@ -600,6 +607,19 @@ typedef struct TCCIRState
    * barrel_shifts[i] encodes an optional barrel shift on src2 of instruction i:
    * 0 = none, else (type<<5)|amount. type: 1=SHL, 2=SHR, 3=SAR, 4=ROR. */
   uint8_t *barrel_shifts;
+
+  /* Dead-half annotations for 64-bit shift ops, keyed by orig_index.
+   * Populated just before codegen, freed after.  bit0 = the result's low
+   * word is dead (no consumer reads it); bit1 = the result's high word is
+   * dead.  Lets thumb_emit_shift64_mop skip the dead half-write in the
+   * 64-bit bitfield-extract idiom (SHL #a; SHR #b, b>=32). */
+  uint8_t *shift64_dead_half;
+
+  /* BFI insert parameters, keyed by orig_index.  Populated by
+   * tcc_ir_opt_bitfield_insert_to_bfi just before codegen, freed after.
+   * Entry = lsb (bits 0-7) | (width << 8); width >= 1 so a real BFI entry is
+   * never 0.  Consumed by tcc_gen_machine_bfi_mop. */
+  uint16_t *bfi_params;
 } TCCIRState;
 
 TCCIRState *tcc_ir_allocate_block();

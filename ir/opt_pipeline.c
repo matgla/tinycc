@@ -256,6 +256,10 @@ static const IROptPass propagation_passes[] = {
   PASS_GATED("symref_prop",     tcc_ir_opt_symref_const_prop_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("global_sl_fwd",  tcc_ir_opt_global_sl_fwd_ex,    0, IR_PASS_INVALIDATES_DU, FLAG(opt_store_load_fwd)),
   PASS_GATED("const_prop_tmp",  tcc_ir_opt_const_prop_tmp_ex,   0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
+  /* Fold deterministic RMW chains (u.e.a++ -> __aeabi_dadd) on non-escaping
+   * local aggregates by forwarding the slot constant across calls.  Runs once
+   * here; it converges arbitrary chain depth in a single forward pass. */
+  PASS_GATED("const_agg_fold",  tcc_ir_opt_const_aggregate_fold_ex, 0, IR_PASS_INVALIDATES_ALL, FLAG(opt_const_prop)),
   PASS_GATED("known_bits",      tcc_ir_opt_known_bits_ex,        0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("neg_chain_cse",   tcc_ir_opt_neg_chain_cse_ex,    0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("add_reassoc",     tcc_ir_opt_add_reassoc_ex,      0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
@@ -297,6 +301,15 @@ static const IROptPass fusion_passes[] = {
 
 static const IROptPass memory_passes[] = {
   PASS_GATED("sl_forward",      tcc_ir_opt_sl_forward_ex,        0, IR_PASS_INVALIDATES_ALL, FLAG(opt_store_load_fwd)),
+  /* After sl_forward collapses a copied-then-poked local struct into register
+   * OR/SHL/AND ops, fold the redundant bitfield insert+re-extract.  Runs here
+   * (memory group) because the pattern only exists post-forwarding, and before
+   * the fusion group merges the SHL into the OR operand. */
+  PASS_GATED("bf_insert_extract", tcc_ir_opt_bitfield_insert_extract_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
+  /* Field-compare fusion: needs the post-forwarding symmetric register form
+   * (both compared sides as full-word values), and must precede the fusion
+   * group that folds a side's trailing shift into the CMP. */
+  PASS_GATED("cmp_field_fuse",  tcc_ir_opt_cmp_field_fuse_ex,   0, IR_PASS_INVALIDATES_ALL, FLAG(opt_const_prop)),
   PASS_GATED("const_cascade",   tcc_ir_opt_const_prop_cascade_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("branch_fold_2x",  tcc_ir_opt_branch_folding_2x_ex, 0, IR_PASS_INVALIDATES_ALL, FLAG(opt_const_prop)),
   PASS_GATED("stack_nonnull",   tcc_ir_opt_stack_addr_nonnull_fold_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
