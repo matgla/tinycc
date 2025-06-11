@@ -145,6 +145,20 @@ int tcc_ir_opt_jump_threading(TCCIRState *ir)
     /* Also skip NOPs at the new target itself */
     new_target = find_first_non_nop(ir, new_target);
 
+    /* A CONDITIONAL branch (JUMPIF) must not have its taken edge retargeted
+     * BACKWARD by chain-following.  Although chasing an unconditional-JUMP
+     * chain is locally value-preserving, retargeting a conditional edge onto
+     * an EARLIER instruction lands it inside an enclosing loop body, where the
+     * not-taken (fall-through) edge also reaches it via the loop back-edge; the
+     * downstream branch-cleanup cascade then sees both arms "converge" and
+     * collapses what is actually a live loop-exit test.  That dropped the
+     * `i < cfg->num_blocks` guard of tcc_ir_opt_licm_ex's fixed-point loop,
+     * letting the index walk cfg->blocks[] out of bounds (the 02..08 self-host
+     * HardFault).  Forward conditional threading (real if/else diamonds) and
+     * all unconditional-JUMP threading stay enabled. */
+    if (q->op == TCCIR_OP_JUMPIF && new_target < target)
+      new_target = target;
+
     if (new_target != target)
     {
       IROperand new_dest = dest;

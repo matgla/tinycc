@@ -3185,10 +3185,6 @@ static void ra_resolve_phis(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa)
                                      copy_records, &copy_record_count, &phi_spill_cursor);
         tcc_free(copies);
 
-        skip_dest = ir->iroperand_pool[skip_dest_pool_idx];
-        skip_dest.u.imm32 = -(wp + 2);
-        ir->iroperand_pool[skip_dest_pool_idx] = skip_dest;
-
         ir->iroperand_pool[pool_wp] = old_dest;
         new_instrs[wp].op = TCCIR_OP_JUMP;
         new_instrs[wp].operand_base = pool_wp;
@@ -3196,6 +3192,19 @@ static void ra_resolve_phis(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa)
         new_instrs[wp].is_jump_target = 0;
         wp++;
         pool_wp++;
+
+        /* The inverted JUMPIF skips over the phi copies AND this back-edge JUMP,
+         * landing on the instruction right after the JUMP we just wrote (== wp
+         * now).  Compute the skip target HERE, after the JUMP write, using the
+         * current wp — NOT before emitting the copies/JUMP.  Reading wp earlier
+         * (the old `-(wp + 2)` before the copy emit) is fragile: the value used
+         * must reflect the copies just emitted via ra_emit_scheduled_phi_copies
+         * (which advances wp through &wp).  Encode as the negative sentinel the
+         * "Fix jump targets" pass below decodes with `-old_target - 1`, so a
+         * target of `wp` is stored as `-(wp + 1)`. */
+        skip_dest = ir->iroperand_pool[skip_dest_pool_idx];
+        skip_dest.u.imm32 = -(wp + 1);
+        ir->iroperand_pool[skip_dest_pool_idx] = skip_dest;
       } else {
         new_instrs[wp++] = *term;
       }
@@ -4224,7 +4233,14 @@ int tcc_ir_move_coalescing(TCCIRState *ir)
         if (tsv >= 0 && tcc_ir_vreg_is_valid(ir, tsv)) {
           for (int j = 0; j < ls->next_interval_index; ++j) {
             if (ls->intervals[j].vreg == (uint32_t)tsv) {
-              if (ls->intervals[j].r0 >= 0 && ls->intervals[j].stack_location == 0)
+              /* Only a source in a REAL register is a register copy.  PREG_NONE
+               * (0x1F) is >= 0 but means "not allocated" — e.g. a stack-passed
+               * parameter that lives in the caller's frame, not a register.
+               * Coalescing the LOAD result into such a source would make it
+               * inherit PREG_NONE and be mis-lowered as a spill at frame offset
+               * 0 (clobbering the saved frame pointer). */
+              if (ls->intervals[j].r0 >= 0 && ls->intervals[j].r0 < PREG_NONE &&
+                  ls->intervals[j].stack_location == 0)
                 is_copy_load = 1;
               break;
             }
@@ -4255,7 +4271,13 @@ int tcc_ir_move_coalescing(TCCIRState *ir)
       if (src_iv && dst_iv) break;
     }
     if (!src_iv || !dst_iv) continue;
-    if (src_iv->r0 < 0 || dst_iv->r0 < 0) continue;
+    /* Both endpoints must live in a REAL register.  PREG_NONE (0x1F) and
+     * PREG_SPILLED (0x20) are >= 0 but are NOT registers (e.g. a stack-passed
+     * parameter resident in the caller's frame).  Coalescing onto such an
+     * endpoint propagates PREG_NONE into a live value, which is then mis-lowered
+     * as a spill at frame offset 0 — clobbering a saved register at [FP,#0]. */
+    if (src_iv->r0 < 0 || src_iv->r0 >= PREG_NONE ||
+        dst_iv->r0 < 0 || dst_iv->r0 >= PREG_NONE) continue;
     if (src_iv->stack_location != 0 || dst_iv->stack_location != 0) continue;
     if (src_iv->r0 == dst_iv->r0) continue;
     /* Never reassign a graph-coalesced interval: it shares one register with
@@ -4393,6 +4415,26 @@ try_reverse:;
       }
       if (!conflict && qk->op == TCCIR_OP_MLA) {
         if (irop_get_vreg(tcc_ir_op_get_accum(ir, qk)) == dv) { conflict = 1; break; }
+      }
+    }
+    if (conflict) goto rev_check_done;
+
+    /* Check no control-flow escape between src's def and the ASSIGN.
+     * src's def overwrites dest_reg; the ASSIGN re-establishes dest's value
+     * only on the path that reaches it.  A JUMP/JUMPIF in (def, ASSIGN) that
+     * targets outside [def, ASSIGN] lets control reach later uses of dest
+     * with dest_reg clobbered and the restoring copy skipped — e.g. a
+     * top-tested pointer-chase loop (`while (p->next) p = p->next;`) whose
+     * exit edge branches past the back-edge copy while `p` is still live. */
+    for (int k = (int)src_iv->start; k < i && k < n; ++k)
+    {
+      IRQuadCompact *qk = &ir->compact_instructions[k];
+      if (qk->op == TCCIR_OP_NOP) continue;
+      if (qk->op == TCCIR_OP_IJUMP || qk->op == TCCIR_OP_SWITCH_TABLE ||
+          qk->op == TCCIR_OP_SWITCH_LOAD) { conflict = 1; break; }
+      if (qk->op == TCCIR_OP_JUMP || qk->op == TCCIR_OP_JUMPIF) {
+        int jt = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, qk));
+        if (jt < (int)src_iv->start || jt > i) { conflict = 1; break; }
       }
     }
 rev_check_done:

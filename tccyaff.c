@@ -90,6 +90,33 @@ uint32_t tcc_yaff_align(YaffHeader *header, uint32_t size)
   return (size + header->alignment - 1) & ~(header->alignment - 1);
 }
 
+/* Predicate: is `sym` an exported (defined, externally-visible) symbol?
+ *
+ * Deliberately written as a sequence of early returns rather than one folded
+ * boolean expression.  The inline `st_shndx==UNDEF || (bind!=...) || (vis!=...)`
+ * form is miscompiled by the self-hosting armv8m cross: at -O1 it tail-merges
+ * the short-circuit skip branches onto the final `vis != PROTECTED` compare's
+ * conditional branch, so the UNDEF case reaches that branch with stale flags
+ * (Z=1) and falls through to "keep" instead of skipping.  That kept imported
+ * (UNDEF) symbols in tcc_yaff_write_exported_symbols_lookup, computing the
+ * exported-symbol lookup offsets from the wrong (imported) name lengths and
+ * corrupting symbol resolution at load time (see tests2/104_inline).  Each
+ * `return 0` materializes the result and branches unconditionally, so even if
+ * the cross merges them the shared block carries no flag dependency. */
+static int tcc_yaff_sym_is_exported(ElfW(Sym) *sym)
+{
+  unsigned vis, bind;
+  if (sym->st_shndx == SHN_UNDEF)
+    return 0;
+  bind = ELFW(ST_BIND)(sym->st_info);
+  if (bind != STB_GLOBAL && bind != STB_WEAK)
+    return 0;
+  vis = ELFW(ST_VISIBILITY)(sym->st_other);
+  if (vis != STV_DEFAULT && vis != STV_PROTECTED)
+    return 0;
+  return 1;
+}
+
 const char *tcc_parse_object_name(YaffHeader *header)
 {
   return (const char *)(header) + sizeof(YaffHeader);
@@ -242,12 +269,20 @@ static int tcc_yaff_write_local_relocations(TCCState *s1, FILE *f)
     LOG_YAFF("-> section=%s, index=%u, target_offset=0x%x", section == YAFF_SECTION_CODE ? "CODE" : "DATA",
                got_offset / 8, target_offset);
 
-    YaffLocalRelocationEntry entry = {
-        .section = section,
-        .index = got_offset / 8,
-        .target_offset = target_offset,
-    };
-    fwrite(&entry, 1, sizeof(entry), f);
+    /* Pack the (section:2, index:30) word manually rather than via a packed
+       bitfield designated initializer.  The native (self-hosted) armv8m-tcc
+       miscompiles the bitfield insert here: because `index` derives from a
+       shift (`got_offset / 8`), the field's positional `<< 2` shift is dropped
+       and the stored word becomes `(got_offset >> 3) | section` instead of
+       `section | (index << 2)` — i.e. section reads back as garbage (3 =
+       YAFF_SECTION_UNKNOWN) and the loader rejects the module with
+       UnknownSection.  Manual packing into a plain uint32_t compiles
+       correctly. */
+    uint32_t reloc_index = got_offset / 8;
+    uint32_t reloc_words[2];
+    reloc_words[0] = ((uint32_t)section & 0x3u) | (reloc_index << 2);
+    reloc_words[1] = target_offset;
+    fwrite(reloc_words, 1, sizeof(reloc_words), f);
     ++count;
   }
 
@@ -490,14 +525,9 @@ static int tcc_yaff_write_symbol_table_relocations(TCCState *s1, FILE *f)
       {
         imported_idx[idx] = ++imp_count;
       }
-      else
+      else if (tcc_yaff_sym_is_exported(ds))
       {
-        unsigned vis = ELFW(ST_VISIBILITY)(ds->st_other);
-        unsigned bind = ELFW(ST_BIND)(ds->st_info);
-        if ((bind == STB_GLOBAL || bind == STB_WEAK) && (vis == STV_DEFAULT || vis == STV_PROTECTED))
-        {
-          exported_idx[idx] = ++exp_count;
-        }
+        exported_idx[idx] = ++exp_count;
       }
     }
   }
@@ -682,10 +712,8 @@ static int tcc_yaff_write_exported_symbols(TCCState *s1, FILE *f, YaffHeader *h)
     int name_len = 0, aligned_name_len = 0;
     char *name = NULL;
     uint32_t offset = 0;
-    unsigned vis = ELFW(ST_VISIBILITY)(sym->st_other);
     unsigned bind = ELFW(ST_BIND)(sym->st_info);
-    if (sym->st_shndx == SHN_UNDEF || (bind != STB_GLOBAL && bind != STB_WEAK) ||
-        (vis != STV_DEFAULT && vis != STV_PROTECTED))
+    if (!tcc_yaff_sym_is_exported(sym))
     {
       continue;
     }
@@ -759,6 +787,17 @@ static void tcc_yaff_write_imported_symbols_lookup(TCCState *s1, FILE *f, YaffHe
     {
       continue;
     }
+    /* The symbol table, hashtable and header.imported_symbols_amount were all
+     * sized from tcc_yaff_write_imported_symbols' count.  This lookup pass
+     * re-filters s1->dynsym independently; if the two passes ever disagree on
+     * the matching-symbol count (they should be identical, but a self-host
+     * codegen miscompile of one loop can make them differ), adding more than
+     * `amount` entries overflows the nchain-sized chain[]/bucket[] arrays
+     * (tcc_add_hash_entry writes chain[idx]=i for idx==amount), corrupting the
+     * heap and faulting the chain walk.  Never reference a symbol the symbol
+     * table doesn't contain. */
+    if (i >= (int)h->imported_symbols_amount)
+      break;
     name = (char *)s1->dynsym->link->data + sym->st_name;
     tcc_add_hash_entry(hashtable, name, i++);
     name_len = strlen(name) + 1;
@@ -783,15 +822,18 @@ static void tcc_yaff_write_exported_symbols_lookup(TCCState *s1, FILE *f, YaffHe
   {
     int name_len = 0, aligned_name_len = 0;
     char *name = NULL;
-    unsigned vis = ELFW(ST_VISIBILITY)(sym->st_other);
-    unsigned bind = ELFW(ST_BIND)(sym->st_info);
-    if (sym->st_shndx == SHN_UNDEF || (bind != STB_GLOBAL && bind != STB_WEAK) ||
-        (vis != STV_DEFAULT && vis != STV_PROTECTED))
+    if (!tcc_yaff_sym_is_exported(sym))
     {
       continue;
     }
 
     entry.symbol_offset = current_offset;
+    /* See tcc_yaff_write_imported_symbols_lookup: bound entries to the count the
+     * sizing pass produced so the hashtable can never reference a symbol the
+     * exported symbol table doesn't contain (prevents the chain[]/bucket[]
+     * overflow + heap corruption when the two filter passes disagree). */
+    if (i >= (int)h->exported_symbols_amount)
+      break;
     name = (char *)s1->dynsym->link->data + sym->st_name;
     tcc_add_hash_entry(hashtable, name, i++);
     name_len = strlen(name) + 1;

@@ -5616,6 +5616,84 @@ int tcc_ir_opt_dead_loop_elim(TCCIRState *ir)
     if (num_const_vars == 0 && !has_self_stores)
       continue;
 
+    /* Soundness vetoes — the back-edge detector can match non-loop CFG
+     * shapes.  A switch's jump-table dispatch is the canonical trap:
+     *   <default-case body>            ; textually BEFORE the check
+     *   T_idx = T_val SUB #case_min    ; "counter"
+     *   CMP T_idx, #range; JUMPIF >U <default>   ; backward branch = "latch"
+     *   SWITCH_TABLE T_idx
+     * The range [start_idx, end_idx] then contains the default body and the
+     * whole bounds check, with no real loop anywhere.  NOPing the range is
+     * only sound when it is a self-contained single-entry region:
+     * (1) no TEMP defined inside may be read outside (here T_idx feeds the
+     *     SWITCH_TABLE just after end_idx);
+     * (2) no jump from outside may target an instruction inside other than
+     *     the header (case stubs jump into the middle of the range). */
+    int leaks_value = 0;
+    for (int idx = loop->start_idx; idx <= loop->end_idx && idx < n && !leaks_value; idx++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[idx];
+      if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
+        continue;
+      /* STORE-style dests are reads of the vreg, not defs. */
+      if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED || q->op == TCCIR_OP_FUNCPARAMVAL)
+        continue;
+      IROperand d = tcc_ir_op_get_dest(ir, q);
+      if (!irop_has_vreg(d))
+        continue;
+      int32_t dv = irop_get_vreg(d);
+      if (TCCIR_DECODE_VREG_TYPE(dv) != TCCIR_VREG_TYPE_TEMP)
+        continue; /* VARs are covered by const remat + var_used_after checks */
+      for (int j = 0; j < n && !leaks_value; j++)
+      {
+        if (j >= loop->start_idx && j <= loop->end_idx)
+          continue;
+        IRQuadCompact *u = &ir->compact_instructions[j];
+        if (u->op == TCCIR_OP_NOP)
+          continue;
+        if (irop_config[u->op].has_src1 && irop_get_vreg(tcc_ir_op_get_src1(ir, u)) == dv)
+          leaks_value = 1;
+        else if (irop_config[u->op].has_src2 && irop_get_vreg(tcc_ir_op_get_src2(ir, u)) == dv)
+          leaks_value = 1;
+        else if ((u->op == TCCIR_OP_STORE || u->op == TCCIR_OP_STORE_INDEXED || u->op == TCCIR_OP_FUNCPARAMVAL) &&
+                 irop_get_vreg(tcc_ir_op_get_dest(ir, u)) == dv)
+          leaks_value = 1;
+      }
+    }
+    if (leaks_value)
+      continue;
+
+    int side_entry = 0;
+    for (int j = 0; j < n && !side_entry; j++)
+    {
+      if (j >= loop->start_idx && j <= loop->end_idx)
+        continue;
+      IRQuadCompact *u = &ir->compact_instructions[j];
+      if (u->op == TCCIR_OP_JUMP || u->op == TCCIR_OP_JUMPIF)
+      {
+        int t = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, u));
+        if (t >= loop->start_idx && t <= loop->end_idx && t != loop->header_idx)
+          side_entry = 1;
+      }
+      else if (u->op == TCCIR_OP_SWITCH_TABLE)
+      {
+        IROperand s2 = tcc_ir_op_get_src2(ir, u);
+        int table_id = (int)irop_get_imm64_ex(ir, s2);
+        if (table_id >= 0 && table_id < ir->num_switch_tables)
+        {
+          TCCIRSwitchTable *st = &ir->switch_tables[table_id];
+          for (int k = 0; k <= st->num_entries && !side_entry; k++)
+          {
+            int t = (k < st->num_entries) ? st->targets[k] : st->default_target;
+            if (t >= loop->start_idx && t <= loop->end_idx && t != loop->header_idx)
+              side_entry = 1;
+          }
+        }
+      }
+    }
+    if (side_entry)
+      continue;
+
     /* The loop body only contains constant VAR assignments, counter updates,
      * and/or self-stores (`*p = *p`).  NOP all body instructions and place
      * any constant assignments in the preheader. */
@@ -5647,17 +5725,29 @@ int tcc_ir_opt_dead_loop_elim(TCCIRState *ir)
         continue;
 
       int32_t dest_vr = TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_VAR, const_vars[vi].var_pos);
-      ir->compact_instructions[slot].op = TCCIR_OP_ASSIGN;
       IROperand dest_op = irop_make_vreg(dest_vr, const_vars[vi].btype);
-      tcc_ir_set_dest(ir, slot, dest_op);
+      IROperand src1_op;
       if (const_vars[vi].value == (int32_t)const_vars[vi].value)
-        tcc_ir_set_src1(ir, slot, irop_make_imm32(-1, (int32_t)const_vars[vi].value, const_vars[vi].btype));
+        src1_op = irop_make_imm32(-1, (int32_t)const_vars[vi].value, const_vars[vi].btype);
       else
       {
         uint32_t pool_idx = tcc_ir_pool_add_i64(ir, const_vars[vi].value);
-        tcc_ir_set_src1(ir, slot, irop_make_i64(-1, pool_idx, const_vars[vi].btype));
+        src1_op = irop_make_i64(-1, pool_idx, const_vars[vi].btype);
       }
-      tcc_ir_set_src2(ir, slot, IROP_NONE);
+
+      /* Allocate fresh operand slots for the new ASSIGN instead of reusing the
+       * NOP slot's stale operand_base.  The instruction that was NOP'd here may
+       * have owned fewer than two operand pool slots (e.g. a JUMP, RETURNVALUE,
+       * or TEST_ZERO with a single operand).  Writing dest+src1 in place via
+       * its old operand_base would overflow into the *next* instruction's
+       * operand slots, corrupting an unrelated instruction (its dest could be
+       * clobbered into an immediate, later crashing codegen in
+       * mach_get_dest_reg).  Appending two fresh slots and repointing
+       * operand_base guarantees the ASSIGN owns a disjoint operand range. */
+      int new_base = tcc_ir_iroperand_pool_add(ir, dest_op);
+      tcc_ir_iroperand_pool_add(ir, src1_op);
+      ir->compact_instructions[slot].op = TCCIR_OP_ASSIGN;
+      ir->compact_instructions[slot].operand_base = new_base;
     }
 
     changes++;

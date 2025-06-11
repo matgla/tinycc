@@ -26,6 +26,7 @@
 #include "ir/core.h"
 #include "ir/licm.h"
 #include "ir/opt.h"
+#include "ir/opt_utils.h"
 #include "ir/opt_engine.h"
 #include "ir/opt_pipeline.h"
 #include "ir/opt_gens_fusion.h"
@@ -4607,16 +4608,19 @@ static void gen_opic(int op)
     }
     else if (c2 && (op == '*' || op == TOK_PDIV || op == TOK_UDIV))
     {
-      /* try to use shifts instead of muls or divs */
-      if (l2 > 0 && (l2 & (l2 - 1)) == 0)
+      /* Try to use shifts instead of muls or divs.  The power-of-2 test is
+       * delegated to is_power_of_2() (a standalone function) rather than an
+       * inline `(l2 & (l2 - 1)) == 0`: the armv8m self-host cross miscompiles
+       * that 64-bit AND/compare *in this function's register context*, judging
+       * non-powers-of-2 (e.g. 10) to be powers of 2 and rewriting `x * 10` to
+       * `x << 3` (= x * 8).  is_power_of_2() compiles correctly as its own TU
+       * symbol, sidestepping the context-specific miscompile.  (Multipliers
+       * with bit 63 set fall through as a plain MUL — correct, just unoptimised.)
+       */
+      int shn = is_power_of_2((int64_t)l2);
+      if (shn >= 0)
       {
-        int n = -1;
-        while (l2)
-        {
-          l2 >>= 1;
-          n++;
-        }
-        vtop->c.i = n;
+        vtop->c.i = shn;
         if (op == '*')
           op = TOK_SHL;
         else if (op == TOK_PDIV)
@@ -6443,7 +6447,11 @@ static void gen_complex_conjugate(void)
 
 static void gen_complex_float_arith(int op)
 {
-  int bt = vtop[-1].type.t & VT_BTYPE;
+  /* Either side may be a plain scalar (mixed scalar+complex arithmetic);
+   * take the element type from the complex operand. */
+  int l_complex = (vtop[-1].type.t & VT_COMPLEX) != 0;
+  int r_complex = (vtop[0].type.t & VT_COMPLEX) != 0;
+  int bt = (l_complex ? vtop[-1].type.t : vtop[0].type.t) & VT_BTYPE;
   int elem_size = (bt == VT_DOUBLE || bt == VT_LDOUBLE) ? 8 : 4;
   int complex_size = elem_size * 2;
 
@@ -6561,8 +6569,10 @@ static void gen_complex_float_arith(int op)
     vpop();
   }
 
-  /* --- Compute imaginary parts --- */
-  if (l_const)
+  /* --- Compute imaginary parts ---
+   * A runtime scalar operand has no imaginary half in memory — its imag is
+   * the constant 0 (l_imag_cv/r_imag_cv are already zeroed). */
+  if (l_const || !l_complex)
   {
     CType ct = {0};
     ct.t = bt;
@@ -6574,7 +6584,7 @@ static void gen_complex_float_arith(int op)
     vtop->type.t &= ~VT_COMPLEX;
     incr_offset(elem_size);
   }
-  if (r_const)
+  if (r_const || !r_complex)
   {
     CType ct = {0};
     ct.t = bt;
@@ -6657,7 +6667,11 @@ static void gen_complex_float_mul(int op)
   (void)res_vr;
 
 /* Push the real (comp=0) or imag (comp=1) component of sv onto the vstack.
- * If sv is scalar (was_cplx=0), real is the scalar itself; imag is 0.0. */
+ * If sv is scalar (was_cplx=0), real is the scalar itself; imag is 0.0.
+ * A VT_CONST complex carries both components packed in its CValue (floats
+ * in the lo/hi words of c.i, doubles at byte offsets 0 and 8) — extract
+ * from there; incr_offset() is only meaningful for lvalues and previously
+ * turned `s * (1.0+1.0i)` into `s * 1.0` (constant's imag was lost). */
 #define PUSH_FCOMP(sv, was_cplx, comp)                                                                                 \
   do                                                                                                                   \
   {                                                                                                                    \
@@ -6679,6 +6693,22 @@ static void gen_complex_float_mul(int op)
           _z.ld = 0.0;                                                                                                 \
         vsetc(&scalar_type, VT_CONST, &_z);                                                                            \
       }                                                                                                                \
+    }                                                                                                                  \
+    else if (((sv).r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST)                                                   \
+    {                                                                                                                  \
+      CValue _c;                                                                                                       \
+      memset(&_c, 0, sizeof(_c));                                                                                      \
+      if (bt == VT_FLOAT)                                                                                              \
+      {                                                                                                                \
+        union { float f; uint32_t u; } _x;                                                                             \
+        _x.u = (comp) == 0 ? (uint32_t)((sv).c.i & 0xFFFFFFFF) : (uint32_t)((sv).c.i >> 32);                           \
+        _c.f = _x.f;                                                                                                   \
+      }                                                                                                                \
+      else                                                                                                             \
+      {                                                                                                                \
+        memcpy(&_c.d, (char *)&(sv).c + ((comp) ? 8 : 0), 8);                                                          \
+      }                                                                                                                \
+      vsetc(&scalar_type, VT_CONST, &_c);                                                                              \
     }                                                                                                                  \
     else                                                                                                               \
     {                                                                                                                  \
@@ -6833,8 +6863,12 @@ redo:
   /* Complex float/double +/- : decompose into per-component scalar operations.
    * Complex double (128 bits) does not fit in a register pair (64 bits max),
    * so we decompose at the front-end level. Complex float also uses this
-   * path for consistency. Skip when both are constant (gen_opif folds). */
-  if ((op == '+' || op == '-') && (t1 & VT_COMPLEX) && (t2 & VT_COMPLEX) && (is_float(bt1) || is_float(bt2)))
+   * path for consistency. Skip when both are constant (gen_opif folds).
+   * Mixed scalar+complex takes this path too (the scalar's imaginary part
+   * is 0) — letting it fall through to the generic conversions reduces the
+   * complex operand to its real half and silently drops the result's
+   * imaginary part (`x + 1.0i` lost the `i`). */
+  if ((op == '+' || op == '-') && ((t1 | t2) & VT_COMPLEX) && (is_float(bt1) || is_float(bt2)))
   {
     int l_c = (vtop[-1].r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST;
     int r_c = (vtop[0].r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST;
@@ -6863,6 +6897,29 @@ redo:
       gen_complex_float_mul(op);
       return;
     }
+  }
+
+  /* Mixed scalar/complex float division: promote the scalar operand to the
+   * complex type, then fall through — the both-complex path reaches the
+   * backend's IEEE-correct __divdc3/__divsc3 helpers.  Without this the
+   * generic conversions reduce the complex operand to its real half. */
+  if (op == '/' && (((t1 ^ t2) & VT_COMPLEX) != 0) && (is_float(bt1) || is_float(bt2)))
+  {
+    int scalar_below = (t2 & VT_COMPLEX) != 0; /* scalar is vtop[-1] */
+    CType cplx_type = scalar_below ? vtop[0].type : vtop[-1].type;
+    CType scalar_ct;
+    scalar_ct.t = cplx_type.t & ~VT_COMPLEX;
+    scalar_ct.ref = NULL;
+    if (scalar_below)
+      vswap();
+    gen_cast(&scalar_ct); /* align base type (no-op when equal) */
+    gen_cast(&cplx_type); /* scalar → (scalar, 0) complex temp */
+    if (scalar_below)
+      vswap();
+    t1 = vtop[-1].type.t;
+    t2 = vtop[0].type.t;
+    bt1 = t1 & VT_BTYPE;
+    bt2 = t2 & VT_BTYPE;
   }
 
   /* Complex integer +, -, *, / : decompose into component-wise scalar operations.
@@ -9234,6 +9291,110 @@ static void gen_cast(CType *type)
       vtop->type = *type;
       return;
     }
+  }
+
+  /* Complex → complex with a different float base (_Complex float ↔
+   * _Complex double): convert component-wise through a temp local.  Without
+   * this the generic scalar machinery below reinterprets the complex pair
+   * as one scalar — `(_Complex double)a_complex_float` produced garbage. */
+  if ((vtop->type.t & VT_COMPLEX) && (type->t & VT_COMPLEX) && (sbt & VT_BTYPE) != (dbt & VT_BTYPE) &&
+      is_float(sbt & VT_BTYPE) && is_float(dbt & VT_BTYPE))
+  {
+    int src_bt2 = sbt & VT_BTYPE;
+    int dst_bt2 = dbt & VT_BTYPE;
+    int src_sz = (src_bt2 == VT_FLOAT) ? 4 : 8;
+    int dst_sz = (dst_bt2 == VT_FLOAT) ? 4 : 8;
+
+    if ((vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST)
+    {
+      /* Constant: extract both components from the packed CValue, convert
+       * in the compiler, repack for the destination base type. */
+      double re, im;
+      if (src_bt2 == VT_FLOAT)
+      {
+        union { float f; uint32_t u; } a, b;
+        a.u = (uint32_t)(vtop->c.i & 0xFFFFFFFF);
+        b.u = (uint32_t)(vtop->c.i >> 32);
+        re = a.f;
+        im = b.f;
+      }
+      else
+      {
+        memcpy(&re, &vtop->c, 8);
+        memcpy(&im, (char *)&vtop->c + 8, 8);
+      }
+      CValue cv;
+      memset(&cv, 0, sizeof(cv));
+      if (dst_bt2 == VT_FLOAT)
+      {
+        union { float f; uint32_t u; } a, b;
+        a.f = (float)re;
+        b.f = (float)im;
+        cv.i = ((uint64_t)b.u << 32) | a.u;
+      }
+      else
+      {
+        double dre = re, dim = im;
+        memcpy(&cv, &dre, 8);
+        memcpy((char *)&cv + 8, &dim, 8);
+      }
+      vtop->type = *type;
+      vtop->c = cv;
+      return;
+    }
+
+    /* Runtime: the source must be addressable; complex arithmetic results
+     * and variables are lvalues already.  Spill a bare rvalue first. */
+    if (!(vtop->r & VT_LVAL))
+    {
+      int sp_vr;
+      int sp_loc = get_temp_local_var(2 * src_sz, src_sz, &sp_vr);
+      SValue sp;
+      memset(&sp, 0, sizeof(sp));
+      sp.type = vtop->type;
+      sp.r = VT_LOCAL | VT_LVAL;
+      sp.vr = sp_vr;
+      sp.c.i = sp_loc;
+      vpushv(&sp);
+      vswap();
+      vstore();
+      vpop();
+      vpushv(&sp);
+    }
+
+    SValue src_sv = *vtop;
+    vpop();
+
+    int res_vr;
+    int res_loc = get_temp_local_var(2 * dst_sz, dst_sz, &res_vr);
+    for (int comp = 0; comp < 2; comp++)
+    {
+      SValue comp_sv = src_sv;
+      comp_sv.type.t = src_bt2;
+      vpushv(&comp_sv);
+      if (comp)
+        incr_offset(src_sz);
+      gen_cast_s(dst_bt2);
+      SValue dst;
+      memset(&dst, 0, sizeof(dst));
+      dst.type.t = dst_bt2;
+      dst.r = VT_LOCAL | VT_LVAL;
+      dst.vr = res_vr;
+      dst.c.i = res_loc + comp * dst_sz;
+      vpushv(&dst);
+      vswap();
+      vstore();
+      vpop();
+    }
+
+    SValue result;
+    memset(&result, 0, sizeof(result));
+    result.type = *type;
+    result.r = VT_LOCAL | VT_LVAL;
+    result.vr = res_vr;
+    result.c.i = res_loc;
+    vpushv(&result);
+    return;
   }
 
 again:
@@ -24080,12 +24241,48 @@ static void gfunc_return(CType *func_type)
           word_type.t = VT_INT;
           word_type.ref = NULL;
 
+          /* c.i on a register-deref lvalue (e.g. `return *p;`) is not a
+           * frame offset and is ignored by the codegen — compute src + off
+           * explicitly via ADD, like the vstore() inline copy does. */
+          int src_is_reg_deref = ((src_mem.r & VT_VALMASK) < VT_CONST);
           for (int off = 0; off < complex_size; off += 4)
           {
             /* Load word from src_mem + off */
             SValue src_word = src_mem;
             src_word.type = word_type;
-            src_word.c.i += off;
+
+            if (src_is_reg_deref && off != 0)
+            {
+              SValue off_imm;
+              svalue_init(&off_imm);
+              off_imm.type.t = VT_INT;
+              off_imm.r = VT_CONST;
+              off_imm.vr = -1;
+              off_imm.c.i = off;
+
+              SValue src_base;
+              memset(&src_base, 0, sizeof(src_base));
+              src_base.type.t = VT_PTR;
+              src_base.vr = src_mem.vr;
+              src_base.r = 0;
+
+              SValue src_ptr;
+              svalue_init(&src_ptr);
+              src_ptr.type.t = VT_PTR;
+              src_ptr.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+              src_ptr.r = 0;
+
+              tcc_ir_put(tcc_state->ir, TCCIR_OP_ADD, &src_base, &off_imm, &src_ptr);
+
+              src_word.r = VT_LVAL;
+              src_word.vr = src_ptr.vr;
+              src_word.sym = NULL;
+              src_word.c.i = 0;
+            }
+            else
+            {
+              src_word.c.i += off;
+            }
 
             SValue tmp_word;
             svalue_init(&tmp_word);
@@ -24230,12 +24427,48 @@ static void gfunc_return(CType *func_type)
            * a later LOAD from the source (e.g. parameter spill slot). */
           int n_words = s_size / 4;
           int tmp_vregs[32 / 4];
+          /* c.i on a register-deref lvalue (e.g. `return *p;`) is not a
+           * frame offset and is ignored by the codegen — compute src + off
+           * explicitly via ADD, like the vstore() inline copy does. */
+          int src_is_reg_deref = ((src_mem.r & VT_VALMASK) < VT_CONST);
           for (int i = 0; i < n_words; ++i)
           {
             int off = i * 4;
             SValue src_word = src_mem;
             src_word.type = word_type;
-            src_word.c.i += off;
+
+            if (src_is_reg_deref && off != 0)
+            {
+              SValue off_imm;
+              svalue_init(&off_imm);
+              off_imm.type.t = VT_INT;
+              off_imm.r = VT_CONST;
+              off_imm.vr = -1;
+              off_imm.c.i = off;
+
+              SValue src_base;
+              memset(&src_base, 0, sizeof(src_base));
+              src_base.type.t = VT_PTR;
+              src_base.vr = src_mem.vr;
+              src_base.r = 0;
+
+              SValue src_ptr;
+              svalue_init(&src_ptr);
+              src_ptr.type.t = VT_PTR;
+              src_ptr.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+              src_ptr.r = 0;
+
+              tcc_ir_put(tcc_state->ir, TCCIR_OP_ADD, &src_base, &off_imm, &src_ptr);
+
+              src_word.r = VT_LVAL;
+              src_word.vr = src_ptr.vr;
+              src_word.sym = NULL;
+              src_word.c.i = 0;
+            }
+            else
+            {
+              src_word.c.i += off;
+            }
 
             SValue tmp_word;
             svalue_init(&tmp_word);

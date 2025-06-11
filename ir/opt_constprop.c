@@ -1615,7 +1615,14 @@ int tcc_ir_opt_const_prop(TCCIRState *ir)
        * Guarded: find_defining_instruction is O(n) per CMP. */
       int identity_def1 = -1, identity_def2 = -1;
       int identity_via_setif = 0;
+      /* Operand value-identity requires matching lval-ness: `*(p)` (a memory
+       * load through p) and `p` (the address itself) are NOT the same value
+       * even when p's defining expression is identical on both sides.  The
+       * same-vreg path above checks this; the def-equality and copy paths
+       * must too, or e.g. `ptr >= base + N` where `&base[N]` aliases `&ptr`
+       * gets mis-folded to a constant. */
       if (!is_identity && n <= 4000 && vr1 >= 0 && vr2 >= 0 && vr1 != vr2 &&
+          cmp_src1.is_lval == cmp_src2.is_lval &&
           DC_IS_SINGLE_DEF(dc, dc_stride, vr1) && DC_IS_SINGLE_DEF(dc, dc_stride, vr2))
       {
         int def1 = tcc_ir_find_defining_instruction(ir, vr1, i);
@@ -1643,6 +1650,7 @@ int tcc_ir_opt_const_prop(TCCIRState *ir)
        *   - no jump target appears between the ASSIGN and the CMP, so every
        *     control-flow path that reaches the CMP went through the copy. */
       if (!is_identity && n <= 4000 && dc && vr1 >= 0 && vr2 >= 0 && vr1 != vr2 &&
+          cmp_src1.is_lval == cmp_src2.is_lval &&
           !cmp_src1.is_sym && !cmp_src2.is_sym)
       {
         for (int dir = 0; dir < 2 && !is_identity; dir++)
@@ -3130,8 +3138,15 @@ int tcc_ir_opt_value_tracking(TCCIRState *ir)
           pred_count[table->default_target]++;
       }
     }
-    /* Fall-through predecessor (SWITCH_TABLE is a terminator — no fall-through) */
-    if (i + 1 < n && q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_NOP && q->op != TCCIR_OP_RETURNVALUE &&
+    /* Fall-through predecessor (SWITCH_TABLE is a terminator — no fall-through).
+     * NOP is NOT a terminator: it falls through to the next instruction.  A
+     * block whose last real instruction is followed by NOP padding (left by DCE
+     * before compaction) still flows into the following merge, so the NOP must
+     * contribute the fall-through edge — otherwise the merge's pred_count stays
+     * 1, is_merge is not set, and stale VAR const state survives the merge
+     * (e.g. a conditionally-incremented counter folded to a constant past the
+     * join). */
+    if (i + 1 < n && q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_RETURNVALUE &&
         q->op != TCCIR_OP_RETURNVOID && q->op != TCCIR_OP_SWITCH_TABLE)
     {
       pred_count[i + 1]++;
@@ -3368,8 +3383,14 @@ int tcc_ir_opt_value_tracking(TCCIRState *ir)
           }
         }
       }
-      /* Direct VAR store: V = T — propagate LEA if src is a LEA result */
-      else if (dest_pos >= 0)
+      /* Direct VAR store: V = T — propagate LEA if src is a LEA result.
+       * Only when the dest is the variable's OWN storage, not a store *through*
+       * a pointer variable.  `*Vptr = value` carries dest.is_lval as a real
+       * memory deref (is_lval && !is_local && !is_llocal); it writes through
+       * Vptr and does NOT define Vptr, so recording `Vptr = value` here would
+       * miscompile a later use of the pointer into the stored constant.  Route
+       * such stores to the aliasing-invalidation branch below instead. */
+      else if (dest_pos >= 0 && !(dest.is_lval && !dest.is_local && !dest.is_llocal))
       {
         int lea_propagated = 0;
         int32_t src_vr = irop_get_vreg(src1);
@@ -6192,6 +6213,13 @@ int tcc_ir_opt_cmp_expr_fold(TCCIRState *ir)
     else
     {
       if (vr1 < 0 || vr2 < 0 || vr1 == vr2)
+        continue;
+
+      /* Operand value-identity requires matching lval-ness: `*(p)` (a load
+       * through p) and `p` (the address) are different values even when p's
+       * defining expression is identical.  Without this, `ptr >= base + N`
+       * (where &base[N] aliases &ptr) mis-folds to a constant. */
+      if (src1.is_lval != src2.is_lval)
         continue;
 
       /* Both operands must have a single reaching definition */

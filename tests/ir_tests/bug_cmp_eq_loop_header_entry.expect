@@ -1,0 +1,5 @@
+eq=1
+ne=1
+ci=1
+df=1
+[returns 0]

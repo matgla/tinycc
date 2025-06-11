@@ -273,8 +273,26 @@ int tcc_ir_opt_switch_to_data(TCCIRState *ir)
 
     /* NOP each case body's ASSIGN + JMP using exact indices recorded
      * during probing. Indices may repeat across cases (fall-through paths
-     * after DCE share a single surviving ASSIGN); repeated NOPs are safe. */
+     * after DCE share a single surviving ASSIGN); repeated NOPs are safe.
+     *
+     * Exception: a body that is ALSO the bounds-check default target (a
+     * `case N: default:` label sharing) must survive — the out-of-range
+     * JUMPIF still branches to it.  NOPing it would leave that branch
+     * pointing at whatever the NOP compaction settles on (in practice the
+     * dispatch itself → infinite loop for out-of-range values).  In-range
+     * values read the table; the preserved body serves only the default
+     * path. */
     for (int k = 0; k < table->num_entries; k++) {
+      int preserved = 0;
+      for (int m = 0; m < table->num_entries; m++) {
+        if (table->targets[m] == table->default_target &&
+            (probe_assign[m] == probe_assign[k] || probe_jump[m] == probe_jump[k])) {
+          preserved = 1;
+          break;
+        }
+      }
+      if (preserved)
+        continue;
       ir->compact_instructions[probe_assign[k]].op = TCCIR_OP_NOP;
       ir->compact_instructions[probe_jump[k]].op = TCCIR_OP_NOP;
     }

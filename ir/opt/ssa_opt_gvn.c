@@ -198,6 +198,20 @@ static int gvn_process_block(IRSSAOptCtx *ctx, IRCFG *cfg, GVNEntry **table, int
     if (!irop_config[q->op].has_src1 || !irop_config[q->op].has_src2)
       continue;
 
+    /* A barrel-shift side-table annotation (ir->barrel_shifts[orig_index],
+     * set by tcc_ir_barrel_shift_fusion just before regalloc) folds a
+     * single-use shift into this ALU op's src2 *without* changing the IR
+     * operands — e.g. `t = crc SAR 8; r = t & 0xff` becomes `r = crc & 0xff`
+     * with barrel_shifts[r]=SAR8.  GVN keys only on (op, operands), so such an
+     * op looks identical to a genuinely-unshifted `crc & 0xff` and would be
+     * wrongly merged with it (both CRC bytes end up the high byte).  The
+     * annotation is part of the op's identity but not visible to the GVN key,
+     * so exclude any shift-annotated op from value numbering. */
+    if (ir->barrel_shifts && q->orig_index >= 0 &&
+        q->orig_index <= ir->max_orig_index &&
+        ir->barrel_shifts[q->orig_index])
+      continue;
+
     IROperand dest = tcc_ir_op_get_dest(ir, q);
     int32_t dest_vr = irop_get_vreg(dest);
     if (dest_vr < 0 || TCCIR_DECODE_VREG_TYPE(dest_vr) != TCCIR_VREG_TYPE_TEMP)

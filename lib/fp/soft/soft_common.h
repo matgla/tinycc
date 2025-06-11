@@ -36,29 +36,28 @@ typedef union
   } w;
 } u64_words;
 
-/* Extract sign from double bits */
+/* Extract sign from double bits.
+ * NB: operate directly on the 64-bit value rather than via a u64_words union
+ * local.  The armv8m cross/self-hosted codegen can drop the store of an
+ * address-taken local across the function body (the parameter never reaches
+ * the stack slot, so v.w.hi reads uninitialised memory), which silently
+ * corrupts every soft-double operation.  Pure shifts avoid the address-taken
+ * local entirely. */
 static inline int double_sign(uint64_t bits)
 {
-  u64_words v;
-  v.u = bits;
-  return (v.w.hi >> 31) & 1;
+  return (int)((bits >> 63) & 1);
 }
 
 /* Extract exponent from double bits */
 static inline int double_exp(uint64_t bits)
 {
-  u64_words v;
-  v.u = bits;
-  return (v.w.hi >> 20) & 0x7FF;
+  return (int)((bits >> 52) & 0x7FF);
 }
 
 /* Extract mantissa from double bits */
 static inline uint64_t double_mant(uint64_t bits)
 {
-  u64_words v;
-  v.u = bits;
-  v.w.hi &= 0xFFFFF;
-  return v.u;
+  return bits & DOUBLE_MANT_MASK;
 }
 
 /* Check if double bits represent NaN */
@@ -82,12 +81,8 @@ static inline int is_zero_bits(uint64_t bits)
 /* Build double from components */
 static inline uint64_t make_double(int sign, int exp, uint64_t mant)
 {
-  u64_words v;
-  u64_words m;
-  m.u = mant;
-  v.w.lo = m.w.lo;
-  v.w.hi = ((uint32_t)sign << 31) | ((uint32_t)exp << 20) | (m.w.hi & 0xFFFFF);
-  return v.u;
+  /* Direct bit assembly (no address-taken union local — see double_sign). */
+  return ((uint64_t)(sign & 1) << 63) | ((uint64_t)(exp & 0x7FF) << 52) | (mant & DOUBLE_MANT_MASK);
 }
 
 /* Count leading zeros in 32-bit value */
@@ -126,11 +121,10 @@ static inline int clz32(uint32_t x)
 /* Count leading zeros in 64-bit value */
 static inline int clz64(uint64_t x)
 {
-  u64_words v;
-  v.u = x;
-  if (v.w.hi != 0)
-    return clz32(v.w.hi);
-  return 32 + clz32(v.w.lo);
+  uint32_t hi = (uint32_t)(x >> 32);
+  if (hi != 0)
+    return clz32(hi);
+  return 32 + clz32((uint32_t)x);
 }
 
 /* ===== SINGLE PRECISION (32-bit) ===== */

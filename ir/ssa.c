@@ -326,12 +326,23 @@ static int ssa_rename_use(IROperand *op, int num_vars, const uint8_t *is_promota
   int32_t cur = vstack_top(&stacks[pos]);
   if (cur < 0)
     return 0;
+  /* A use that dereferences the variable's *value* (is_lval set, is_local
+   * clear) is a pointer dereference — e.g. `*vv` / `vv->m` after the address
+   * fold collapsed `&vv->m` (offset 0) to vv itself, leaving the var operand
+   * as the pointer being stored/loaded through.  Promoting vv to an SSA
+   * register must KEEP the dereference: the pointer now lives in `cur`, so
+   * `*cur` still loads/stores through it.  Only a var-SLOT access (is_local)
+   * collapses to a plain register value.  Without this, `(vv=call())->m0=c`
+   * lowered `*vv=c` to `vv=c`, dropping the store and clobbering the pointer. */
+  int deref_through_value = op->is_lval && !op->is_local;
   irop_set_vreg(op, cur);
   op->tag = IROP_TAG_VREG;
-  op->is_lval = 0;
-  op->is_local = 0;
+  if (!deref_through_value) {
+    op->is_lval = 0;
+    op->is_local = 0;
+  }
   op->u.imm32 = 0;
-  return 1;
+  return deref_through_value ? 2 : 1;
 }
 
 static void ssa_rename_phi_defs(IRSSAState *ssa, int b, VRegStack *stacks, int num_vars)
@@ -356,9 +367,12 @@ static void ssa_rename_block_instrs(TCCIRState *ir, IRSSAState *ssa, IRBasicBloc
 
     if (irop_config[q->op].has_src1) {
       IROperand s = tcc_ir_op_get_src1(ir, q);
-      if (ssa_rename_use(&s, num_vars, ssa->is_promotable, stacks)) {
+      int r = ssa_rename_use(&s, num_vars, ssa->is_promotable, stacks);
+      if (r) {
         tcc_ir_op_set_src1(ir, q, s);
-        if (q->op == TCCIR_OP_LOAD)
+        /* A var-slot LOAD becomes a register copy (ASSIGN); a LOAD that
+         * dereferences the var's pointer value (r==2) stays a real LOAD. */
+        if (r == 1 && q->op == TCCIR_OP_LOAD)
           q->op = TCCIR_OP_ASSIGN;
       }
     }

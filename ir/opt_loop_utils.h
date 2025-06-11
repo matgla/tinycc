@@ -51,7 +51,8 @@ int find_derived_ivs(struct TCCIRState *ir, struct IRLoop *loop,
 int transform_derived_iv(struct TCCIRState *ir, struct IRLoop *loop,
                          InductionVar *iv, DerivedIV *div,
                          int *out_ptr_vreg, int *out_idx_shift,
-                         int *out_postnop_origpos, int shared_ptr_vreg);
+                         int *out_postnop_origpos, int *out_stride_pos,
+                         int shared_ptr_vreg);
 
 int iv_strength_reduction_core(struct TCCIRState *ir, struct IRLoops *loops);
 

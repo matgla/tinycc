@@ -1753,9 +1753,20 @@ int tcc_ir_opt_backedge_phi_hoist(TCCIRState *ir)
           if (irop_get_vreg(tcc_ir_op_get_accum(ir, eq)) == adst_vr)
             safe = 0;
         }
-        if (safe && irop_config[eq->op].has_dest) {
-          if (irop_get_vreg(tcc_ir_op_get_dest(ir, eq)) == adst_vr)
-            break; /* redefined before use — safe */
+        if (safe && irop_config[eq->op].has_dest &&
+            irop_get_vreg(tcc_ir_op_get_dest(ir, eq)) == adst_vr) {
+          /* STORE-family ops carry the store ADDRESS in their dest slot, so a
+           * matching dest is a USE of the pointer vreg (the exit path stores
+           * through it), not a redefinition.  Hoisting the ASSIGN over the
+           * branch would clobber the pointer it stores through, so this is a
+           * live use — not safe.  Same for an is_lval (deref) dest.  Only a
+           * genuine value def of the vreg makes the prior value dead. */
+          if (eq->op == TCCIR_OP_STORE || eq->op == TCCIR_OP_STORE_INDEXED ||
+              eq->op == TCCIR_OP_STORE_POSTINC ||
+              tcc_ir_op_get_dest(ir, eq).is_lval)
+            safe = 0;
+          else
+            break; /* genuine redefinition before use — safe */
         }
       }
     }

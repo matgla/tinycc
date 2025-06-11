@@ -472,12 +472,22 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState state, int b)
 
   /* If this block has any predecessor that is NOT its immediate dominator,
    * a non-dominator path (loop back-edge or cross-edge) can modify tracked
-   * stack slots or global stores.  Conservatively drop forwarding state. */
+   * memory.  Conservatively drop ALL forwarding state — not just the store
+   * trackers but also the available-LOAD caches: a load made available in a
+   * dominator is NOT valid here if the loop body (reached via the back-edge)
+   * contains a store or CALL that modifies that memory between iterations.
+   * Dropping only the store trackers left e.g. a global `tok` load CSE'd
+   * across a loop whose body calls functions that modify `tok` (the C
+   * expression parser's `while(...) { next(); unary(); ...; t = tok; }` —
+   * the loop-end reload of `t` was eliminated, so the loop spun on a stale
+   * operator token and tcc rejected `#if A >= B` with "expression expected"). */
   for (int pi = 0; pi < bb->num_preds; pi++) {
     if (bb->preds[pi] != bb->idom) {
+      state.count = 0;
       state.scount = 0;
       state.gscount = 0;
       state.tvcount = 0;
+      state.ilcount = 0;
       break;
     }
   }

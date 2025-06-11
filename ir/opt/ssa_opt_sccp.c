@@ -734,7 +734,17 @@ static int sccp_resolve_var(SCCPState *s, int32_t var_vreg, int instr_idx,
       IROperand dest = tcc_ir_op_get_dest(ir, q);
       if (dest.tag == IROP_TAG_STACKOFF && dest.is_local && dest.is_lval) {
         IRLiveInterval *vi = tcc_ir_vreg_live_interval(ir, var_vreg);
-        if (vi && vi->original_offset == irop_get_stack_offset(dest))
+        /* This matches `*(&V) <- val` (a store through V's address, which
+         * lea_fold collapsed to a direct StackLoc[Voff] store) by offset.
+         * But a VAR's slot offset and an *anonymous* local's offset live in
+         * different namespaces and can collide numerically: lea_fold also
+         * folds an unrelated anon aggregate `m` at the same offset into a
+         * direct StackLoc store, which would then be mis-read as a write to V
+         * (e.g. `m.kind=4` forwarded into a `stack_off` load).  A StackLoc
+         * store can only be writing V's slot if V's address was actually
+         * taken; otherwise V is register-resident and this is a foreign anon
+         * local.  Require addrtaken to keep the offset-match sound. */
+        if (vi && vi->addrtaken && vi->original_offset == irop_get_stack_offset(dest))
           return sccp_get_store_src_value(s, tcc_ir_op_get_src1(ir, q), out,
                                           dep_src_pos);
         continue;
@@ -1293,19 +1303,29 @@ static void sccp_process_cfg_edge(SCCPState *s, int pred, int succ)
     for (int i = bb->start_idx; i < bb->end_idx; i++)
       sccp_visit_instr(s, i);
 
-    /* Mark fallthrough edge (if block doesn't end with jump) */
-    if (bb->end_idx > bb->start_idx) {
+    /* Mark fallthrough edge unless the block ends in an explicit control-flow
+     * terminator.  Scan back past trailing NOPs to find the last real
+     * instruction.  Crucially, a block that is EMPTY or consists only of NOPs
+     * (e.g. its sole jump-to-the-next-block was elided to a NOP by an earlier
+     * pass such as jump-threading / fallthrough elimination) still falls
+     * through to its successor at runtime, so its CFG successor edges must be
+     * marked executable.  Failing to do so leaves the successor (and any loop
+     * latch / back-edge reached through it) unreachable, which would let an
+     * induction-variable phi optimistically fold to its loop-entry constant. */
+    {
       int li = bb->end_idx - 1;
       while (li >= bb->start_idx && s->ctx->ir->compact_instructions[li].op == TCCIR_OP_NOP)
         li--;
+      int ends_with_terminator = 0;
       if (li >= bb->start_idx) {
-        IRQuadCompact *last = &s->ctx->ir->compact_instructions[li];
-        if (last->op != TCCIR_OP_JUMP && last->op != TCCIR_OP_JUMPIF &&
-            last->op != TCCIR_OP_IJUMP && last->op != TCCIR_OP_RETURNVALUE &&
-            last->op != TCCIR_OP_RETURNVOID && last->op != TCCIR_OP_SWITCH_TABLE) {
-          for (int si = 0; si < bb->num_succs; si++)
-            sccp_add_cfg_edge(s, succ, bb->succs[si]);
-        }
+        int lop = s->ctx->ir->compact_instructions[li].op;
+        ends_with_terminator = (lop == TCCIR_OP_JUMP || lop == TCCIR_OP_JUMPIF ||
+                                lop == TCCIR_OP_IJUMP || lop == TCCIR_OP_RETURNVALUE ||
+                                lop == TCCIR_OP_RETURNVOID || lop == TCCIR_OP_SWITCH_TABLE);
+      }
+      if (!ends_with_terminator) {
+        for (int si = 0; si < bb->num_succs; si++)
+          sccp_add_cfg_edge(s, succ, bb->succs[si]);
       }
     }
   }
@@ -1616,56 +1636,85 @@ int ssa_opt_sccp(IRSSAOptCtx *ctx)
   }
 
   /* Main loop: process both worklists until empty.
-   * Guard against non-convergence (e.g., memory dependency cycles). */
-  while (s.cfg_wl_count > 0 || s.ssa_wl_count > 0) {
-    while (s.cfg_wl_count > 0) {
-      int edge = s.cfg_wl[--s.cfg_wl_count];
-      int pred = edge / nb;
-      int succ = edge % nb;
-      sccp_process_cfg_edge(&s, pred, succ);
-    }
+   * Guard against non-convergence (e.g., memory dependency cycles).
+   *
+   * Soundness re-sweep: the use-def worklist propagation has gaps (e.g. a
+   * loop-header phi first folds to its preheader entry constant, that CONST
+   * is consumed by a dependent instruction, and when the phi later widens to
+   * BOTTOM the dependent's cell is not always re-evaluated — seen with
+   * `T = n SHR #32` keeping a stale CONST 0 after `n` went BOTTOM, which
+   * truncated 64-bit switch-case constants in parse_number).  Rather than
+   * chase every missing edge, re-visit ALL reachable phis and instructions
+   * after the worklists drain; any change re-seeds the worklists and we run
+   * another round.  sccp_visit_* is monotone (cells only descend
+   * TOP→CONST→BOTTOM, edges only become executable), so this converges. */
+  for (;;) {
+    while (s.cfg_wl_count > 0 || s.ssa_wl_count > 0) {
+      while (s.cfg_wl_count > 0) {
+        int edge = s.cfg_wl[--s.cfg_wl_count];
+        int pred = edge / nb;
+        int succ = edge % nb;
+        sccp_process_cfg_edge(&s, pred, succ);
+      }
 
-    while (s.ssa_wl_count > 0) {
-      int pos = s.ssa_wl[--s.ssa_wl_count];
-      int32_t vreg = TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_TEMP, pos);
-      IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, vreg);
-      if (!vi)
-        continue;
+      while (s.ssa_wl_count > 0) {
+        int pos = s.ssa_wl[--s.ssa_wl_count];
+        int32_t vreg = TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_TEMP, pos);
+        IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, vreg);
+        if (!vi)
+          continue;
 
-      for (int u = 0; u < vi->use_count; u++) {
-        IRSSAUse *use = &vi->uses[u];
-        if (use->kind == SSA_USE_INSTR) {
-          int blk = cfg->instr_to_block[use->idx];
-          if (s.block_reachable[blk])
-            sccp_visit_instr(&s, use->idx);
-        } else {
-          int blk = use->idx;
-          if (s.block_reachable[blk] && ssa->block_phis) {
-            for (IRPhiNode *phi = ssa->block_phis[blk]; phi; phi = phi->next) {
-              for (int pi = 0; pi < phi->num_operands; pi++) {
-                if (phi->operands[pi].vreg == vreg) {
-                  sccp_visit_phi(&s, phi, blk);
-                  break;
+        for (int u = 0; u < vi->use_count; u++) {
+          IRSSAUse *use = &vi->uses[u];
+          if (use->kind == SSA_USE_INSTR) {
+            int blk = cfg->instr_to_block[use->idx];
+            if (s.block_reachable[blk])
+              sccp_visit_instr(&s, use->idx);
+          } else {
+            int blk = use->idx;
+            if (s.block_reachable[blk] && ssa->block_phis) {
+              for (IRPhiNode *phi = ssa->block_phis[blk]; phi; phi = phi->next) {
+                for (int pi = 0; pi < phi->num_operands; pi++) {
+                  if (phi->operands[pi].vreg == vreg) {
+                    sccp_visit_phi(&s, phi, blk);
+                    break;
+                  }
                 }
               }
             }
           }
         }
-      }
 
-      /* Re-evaluate LOADs that depend on this TEMP through STORE→LOAD
-       * memory chains. Without this, a LOAD whose value was resolved
-       * via a STORE source TEMP would stay at CONST even after the
-       * source TEMP moves to BOTTOM. */
-      for (int m = 0; m < s.mem_dep_count; m++) {
-        if (s.mem_deps[m].src_pos == pos) {
-          int li = s.mem_deps[m].load_idx;
-          int blk = cfg->instr_to_block[li];
-          if (s.block_reachable[blk])
-            sccp_visit_instr(&s, li);
+        /* Re-evaluate LOADs that depend on this TEMP through STORE→LOAD
+         * memory chains. Without this, a LOAD whose value was resolved
+         * via a STORE source TEMP would stay at CONST even after the
+         * source TEMP moves to BOTTOM. */
+        for (int m = 0; m < s.mem_dep_count; m++) {
+          if (s.mem_deps[m].src_pos == pos) {
+            int li = s.mem_deps[m].load_idx;
+            int blk = cfg->instr_to_block[li];
+            if (s.block_reachable[blk])
+              sccp_visit_instr(&s, li);
+          }
         }
       }
     }
+
+    /* Re-sweep all reachable code; if nothing changed the worklists stay
+     * empty and the result is a sound fixpoint. */
+    for (int blk = 0; blk < nb; blk++) {
+      if (!s.block_reachable[blk])
+        continue;
+      if (ssa->block_phis) {
+        for (IRPhiNode *phi = ssa->block_phis[blk]; phi; phi = phi->next)
+          sccp_visit_phi(&s, phi, blk);
+      }
+      IRBasicBlock *bb = &cfg->blocks[blk];
+      for (int i = bb->start_idx; i < bb->end_idx; i++)
+        sccp_visit_instr(&s, i);
+    }
+    if (s.cfg_wl_count == 0 && s.ssa_wl_count == 0)
+      break;
   }
 
   int changes = sccp_apply(&s);

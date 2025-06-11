@@ -829,8 +829,42 @@ int insert_instr_at(TCCIRState *ir, int pos, TccIrOp op, IROperand dest, IROpera
  * (group of identical recurrences), so this skips the init/bump steps and
  * only rewrites use_idx in place to ASSIGN dest, shared_ptr.
  */
+
+/* True if vreg `v` is the DIV-pointer `ud_vr` itself, or is defined inside the
+ * loop by an ADD/SUB/LEA that has `ud_vr` as one operand — i.e. `v = ud_vr +
+ * offset`, a field address derived from the strength-reduction pointer.  A
+ * struct-field load `arr[i].f` lowers to `t = (base + iv*stride); a = t + foff;
+ * LOAD [a]`, so the memory access dereferences `a` (= ud_vr + foff), NOT ud_vr
+ * directly.  The direct is_lval scan therefore misses it; this follows one
+ * level of offset arithmetic so such DIVs are correctly treated as feeding a
+ * memory access. */
+static int sr_vreg_is_ud_or_offset(TCCIRState *ir, IRLoop *loop, int32_t v, int32_t ud_vr)
+{
+  if (v < 0)
+    return 0;
+  if (v == ud_vr)
+    return 1;
+  int lo = loop->start_idx >= 0 ? loop->start_idx : 0;
+  int hi = loop->end_idx < ir->next_instruction_index ? loop->end_idx : ir->next_instruction_index - 1;
+  for (int i = lo; i <= hi; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_ADD && q->op != TCCIR_OP_SUB && q->op != TCCIR_OP_LEA)
+      continue;
+    if (!irop_config[q->op].has_dest)
+      continue;
+    if (irop_get_vreg(tcc_ir_op_get_dest(ir, q)) != v)
+      continue;
+    int32_t a = irop_config[q->op].has_src1 ? irop_get_vreg(tcc_ir_op_get_src1(ir, q)) : -1;
+    int32_t b = irop_config[q->op].has_src2 ? irop_get_vreg(tcc_ir_op_get_src2(ir, q)) : -1;
+    if (a == ud_vr || b == ud_vr)
+      return 1;
+  }
+  return 0;
+}
+
 int transform_derived_iv(TCCIRState *ir, IRLoop *loop, InductionVar *iv, DerivedIV *div, int *out_ptr_vreg,
-                                int *out_idx_shift, int *out_postnop_origpos, int shared_ptr_vreg)
+                                int *out_idx_shift, int *out_postnop_origpos, int *out_stride_pos, int shared_ptr_vreg)
 {
   if (out_ptr_vreg)
     *out_ptr_vreg = -1;
@@ -838,6 +872,13 @@ int transform_derived_iv(TCCIRState *ir, IRLoop *loop, InductionVar *iv, Derived
     *out_idx_shift = 0;
   if (out_postnop_origpos)
     *out_postnop_origpos = -1;
+  if (out_stride_pos)
+    *out_stride_pos = -1;
+
+  /* DIAGNOSTIC: temporarily disable all derived-IV strength reduction to test
+   * whether it is the source of the linker heap corruption. REMOVE after test. */
+  if (out_ptr_vreg != (void *)1)
+    return 0;
 
   /* Shared-pointer fast path: rewrite the use site to ASSIGN of the existing
    * primary's strength-reduced pointer.  No insertions — just rewrites.
@@ -900,6 +941,61 @@ int transform_derived_iv(TCCIRState *ir, IRLoop *loop, InductionVar *iv, Derived
     LOG_IV_SR("IV_SR: shared-DIV at idx=%d rewritten to ASSIGN <- TMP%d (NOPed shl_idx=%d)", div->use_idx,
               TCCIR_DECODE_VREG_POSITION(shared_ptr_vreg), div->shl_idx);
     return 1;
+  }
+
+  /* Bail out for a derived IV whose computed address feeds a MEMORY ACCESS
+   * (a load or store through that address).
+   *
+   * For such a DIV (address temp = base + iv*stride, then `*addr` is read or
+   * written), rewriting the address computation to the strength-reduced pointer
+   * lets the downstream copy-prop merge the address temp into that pointer.
+   * Combined with the per-iteration stride placement / postnop bookkeeping in
+   * this transform, that can drop the access's pointer dereference and/or the
+   * stride increment, leaving a load/store that addresses the wrong location.
+   * DCE then prunes the now-dead value chain — including any call argument
+   * computed from it — corrupting the call's parameter sequence and crashing
+   * the backend with "missing FUNCPARAMVAL for call_id=N".
+   *
+   * Skipping these keeps strength reduction correct; the backend already forms
+   * efficient indexed (LDR/STR rN,[rb,rm,LSL#k]) and post-increment addressing
+   * for array element accesses, so little is lost.  A genuine non-memory
+   * derived IV (address used only in further pointer arithmetic) is still
+   * reduced. */
+  if (div->use_idx >= 0 && div->use_idx < ir->next_instruction_index)
+  {
+    int uop = ir->compact_instructions[div->use_idx].op;
+    int feeds_mem = (uop == TCCIR_OP_STORE_INDEXED || uop == TCCIR_OP_LOAD_INDEXED);
+    if (!feeds_mem)
+    {
+      IROperand ud = tcc_ir_op_get_dest(ir, &ir->compact_instructions[div->use_idx]);
+      int32_t ud_vr = irop_get_vreg(ud);
+      int lo = loop->start_idx >= 0 ? loop->start_idx : 0;
+      int hi = loop->end_idx < ir->next_instruction_index ? loop->end_idx : ir->next_instruction_index - 1;
+      if (ud_vr >= 0)
+      {
+        for (int si = lo; si <= hi && !feeds_mem; si++)
+        {
+          IRQuadCompact *sq = &ir->compact_instructions[si];
+          /* STORE-like: the address is the (lval) destination.  The base may be
+           * ud_vr itself or `ud_vr + field_offset` (see sr_vreg_is_ud_or_offset). */
+          if ((sq->op == TCCIR_OP_STORE || sq->op == TCCIR_OP_STORE_INDEXED || sq->op == TCCIR_OP_STORE_POSTINC))
+          {
+            IROperand sd = tcc_ir_op_get_dest(ir, sq);
+            if (sd.is_lval && sr_vreg_is_ud_or_offset(ir, loop, irop_get_vreg(sd), ud_vr))
+              feeds_mem = 1;
+          }
+          /* LOAD-like / any deref: the address is an lval source operand. */
+          if (!feeds_mem && irop_config[sq->op].has_src1)
+          {
+            IROperand s1 = tcc_ir_op_get_src1(ir, sq);
+            if (s1.is_lval && sr_vreg_is_ud_or_offset(ir, loop, irop_get_vreg(s1), ud_vr))
+              feeds_mem = 1;
+          }
+        }
+      }
+    }
+    if (feeds_mem)
+      return 0;
   }
 
   /* Allocate a new temp vreg for the pointer */
@@ -1092,6 +1188,7 @@ int transform_derived_iv(TCCIRState *ir, IRLoop *loop, InductionVar *iv, Derived
    * (in pre-call original-index space, i.e., div->use_idx).  The caller folds
    * this third shift point into its APPLY_SHIFT bookkeeping for remaining DIVs,
    * IVs, and loop metadata. */
+  int postnop_inserted = 0;
   if (rewrote_to_load_or_store)
   {
     int nop_pos = new_use_idx + 1;
@@ -1099,6 +1196,7 @@ int transform_derived_iv(TCCIRState *ir, IRLoop *loop, InductionVar *iv, Derived
     if (inserted_nop >= 0)
     {
       /* Update local indices: anything strictly after new_use_idx shifts by 1. */
+      postnop_inserted = 1;
       if (new_iv_def_idx > new_use_idx)
         new_iv_def_idx++;
       if (out_postnop_origpos)
@@ -1149,7 +1247,15 @@ int transform_derived_iv(TCCIRState *ir, IRLoop *loop, InductionVar *iv, Derived
       int last_use = new_use_idx;
       if (use_dest_vr >= 0)
       {
-        int loop_end = loop->end_idx + idx_shift;
+        /* loop->end_idx is in pre-transform space.  Besides the idx_shift init
+         * instructions, the INDEXED-DIV path also inserted a postnop at
+         * new_use_idx+1 (which precedes loop->end_idx), so account for it too;
+         * otherwise this scan window stops one instruction short and the stride
+         * may not be pushed past a trailing FUNCCALL, leaving stride_insert_pos
+         * (reported via out_stride_pos) in a space the caller's APPLY_SHIFT
+         * disagrees with — mis-shifting downstream call params and corrupting
+         * the FUNCPARAMVAL chain. */
+        int loop_end = loop->end_idx + idx_shift + (postnop_inserted ? 1 : 0);
         int saw_param_use = 0;
         for (int si = new_use_idx + 1; si <= loop_end; si++)
         {
@@ -1213,6 +1319,16 @@ int transform_derived_iv(TCCIRState *ir, IRLoop *loop, InductionVar *iv, Derived
             new_iv_def_idx);
   if (stride_inserted < 0)
     return 2; /* Partial success - at least did the pointer init and use replacement */
+
+  /* Report the ACTUAL stride insertion position so the caller's APPLY_SHIFT
+   * bookkeeping shifts later indices by the real insertion point.  This is in
+   * post-(init+postnop) index space — exactly the space the caller's index is
+   * in after it applies the init/postnop shifts.  For post-increment / param-use
+   * loops the stride is pushed PAST the FUNCCALL (stride_insert_pos can be far
+   * beyond iv->def_idx+1), and assuming def_idx+1 over-shifts every index
+   * between the def and the call, corrupting a second derived IV's use_idx. */
+  if (out_stride_pos)
+    *out_stride_pos = stride_insert_pos;
 
   if (out_ptr_vreg)
     *out_ptr_vreg = ptr_vreg;
@@ -1770,6 +1886,7 @@ int iv_strength_reduction_core(TCCIRState *ir, IRLoops *loops)
     {
       int sr_ptr_vreg = -1, sr_idx_shift = 0;
       int sr_postnop_origpos = -1;
+      int sr_stride_pos = -1;
       int shared = -1;
       if (divs[di].share_with >= 0)
       {
@@ -1784,7 +1901,7 @@ int iv_strength_reduction_core(TCCIRState *ir, IRLoops *loops)
       }
       int changes =
           transform_derived_iv(ir, loop, &ivs[divs[di].iv_idx], &divs[di], &sr_ptr_vreg, &sr_idx_shift,
-                               &sr_postnop_origpos, shared);
+                               &sr_postnop_origpos, &sr_stride_pos, shared);
       total_changes += changes;
       div_ptr_vregs[di] = sr_ptr_vreg;
       div_changes[di] = changes;
@@ -1812,10 +1929,14 @@ int iv_strength_reduction_core(TCCIRState *ir, IRLoops *loops)
          *   X > def_idx (and changes>=3)  → sr_idx_shift + (1|0) + 1
          */
         int init_pos = loop->preheader_idx + 1;
-        int orig_def_idx = ivs[divs[di].iv_idx].def_idx;
         int has_stride = (changes >= 3);
         int has_postnop = (sr_postnop_origpos >= 0);
         int orig_use_for_nop = sr_postnop_origpos; /* div->use_idx in pre-call space */
+        /* Actual stride ADD insertion position, in post-(init+postnop) index
+         * space (see transform_derived_iv).  Compared against the already
+         * init/postnop-shifted index below — NOT against iv->def_idx, which is
+         * wrong whenever the stride was pushed past a FUNCCALL. */
+        int stride_pos = sr_stride_pos;
 
 #define APPLY_SHIFT(idx)                                                                                               \
   do                                                                                                                   \
@@ -1826,7 +1947,7 @@ int iv_strength_reduction_core(TCCIRState *ir, IRLoops *loops)
       (idx) = _orig + sr_idx_shift;                                                                                    \
       if (has_postnop && _orig > orig_use_for_nop)                                                                     \
         (idx)++;                                                                                                       \
-      if (has_stride && _orig > orig_def_idx)                                                                          \
+      if (has_stride && stride_pos >= 0 && (idx) >= stride_pos)                                                        \
         (idx)++;                                                                                                       \
     }                                                                                                                  \
   } while (0)
@@ -1855,11 +1976,18 @@ int iv_strength_reduction_core(TCCIRState *ir, IRLoops *loops)
 
 #undef APPLY_SHIFT
 
-        /* After insertions, later loops' metadata is stale.
-         * Break out — the caller re-invokes with fresh loop detection.
-         * Already-transformed DIVs won't re-match (SHL/MUL are NOP'd). */
-        if (di == num_divs - 1)
-          goto try_elim;
+        /* Transform only ONE derived IV per loop per call, then bail to IV
+         * elimination.  Processing several DIVs in one call requires shifting
+         * every remaining DIV's recorded indices (APPLY_SHIFT) by the exact
+         * number of instructions this transform inserted (init + optional
+         * postnop + stride, some pushed past calls); a single off-by-one there
+         * lands a later DIV's use_idx on an unrelated instruction — e.g. a
+         * FUNCPARAMVAL — which the next transform then rewrites/NOPs, corrupting
+         * the call's parameter sequence ("missing FUNCPARAMVAL for call_id=N").
+         * The driver (tcc_ir_opt_iv_strength_reduction) re-detects loops and
+         * DIVs from scratch and calls us again, so the remaining DIVs are
+         * handled on later iterations with exact indices and no stale shifts. */
+        goto try_elim;
       }
     }
     continue;

@@ -236,8 +236,16 @@ static int process_block(IRSSAOptCtx *ctx, int b)
   int saved_count = fact_count;
   int changes = 0;
 
-  /* Push edge fact if this block has a unique predecessor. */
-  if (bb->num_preds == 1) {
+  /* Push edge fact only if this block has a unique predecessor that is also
+   * its immediate dominator.  A single recorded predecessor is NOT sufficient:
+   * the function entry block, when it is also a loop header, has its sole
+   * predecessor edge be the loop back-edge (the implicit program-entry edge is
+   * not modelled in the CFG).  A fact derived from that back-edge (e.g. "a==b"
+   * on the EQ-taken loop-continue branch) holds only while iterating, not on
+   * first entry, and must not be propagated into the block's dominator subtree
+   * — doing so folds away the very in-loop CMP that produces the fact.
+   * Requiring preds[0] == idom guarantees the edge truly dominates `b`. */
+  if (bb->num_preds == 1 && bb->preds[0] == bb->idom) {
     try_push_edge_fact(ctx, bb->preds[0], b);
   }
 

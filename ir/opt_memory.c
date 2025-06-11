@@ -86,9 +86,12 @@ int tcc_ir_opt_deref_fwd(TCCIRState *ir)
    *   =>   CMP Rx, Vdest                    (use already-loaded value)
    *
    * Only fires when i and j are adjacent (or separated only by NOPs)
-   * so no aliasing or clobber analysis is needed. */
+   * so no aliasing or clobber analysis is needed.  Adjacency in the
+   * instruction stream is not enough: j must not start a basic block,
+   * otherwise a branch can reach the CMP without executing the load. */
   int n = ir->next_instruction_index;
   int changes = 0;
+  uint8_t *block_starts = NULL;
 
   for (int i = 0; i < n - 1; i++)
   {
@@ -122,6 +125,24 @@ int tcc_ir_opt_deref_fwd(TCCIRState *ir)
     if (next->op != TCCIR_OP_CMP)
       continue;
 
+    /* The load must dominate the CMP: reject when any instruction after
+     * the load up to and including the CMP is a jump target. */
+    if (!block_starts)
+      block_starts = ir_opt_build_block_starts_bitmap(ir, n);
+    {
+      int crosses_block = 0;
+      for (int k = i + 1; k <= j; k++)
+      {
+        if (IR_IS_BLOCK_START(block_starts, k))
+        {
+          crosses_block = 1;
+          break;
+        }
+      }
+      if (crosses_block)
+        continue;
+    }
+
     /* Check src2 of CMP for matching deref. */
     if (irop_config[next->op].has_src2)
     {
@@ -147,6 +168,7 @@ int tcc_ir_opt_deref_fwd(TCCIRState *ir)
     }
   }
 
+  tcc_free(block_starts);
   return changes;
 }
 
@@ -2070,6 +2092,15 @@ int tcc_ir_opt_sl_forward(TCCIRState *ir)
       }
 
     resolved_local_load:
+      /* VAR-backed locals use a stack offset that can numerically collide with
+       * an anonymous StackLoc offset.  The STORE side disambiguates by stamping
+       * VAR slots with a sentinel sym (see resolved_local_store); mirror that
+       * here for direct VAR loads so a VAR load never alias-matches an anonymous
+       * StackLoc store at the same offset.  LEA-resolved loads keep their real
+       * sym (addr_vr is the TEMP holding the address, not a VAR). */
+      if (!load_via_lea && addr_vr >= 0 && TCCIR_DECODE_VREG_TYPE(addr_vr) == TCCIR_VREG_TYPE_VAR)
+        addr_sym = (const Sym *)(uintptr_t)1; /* sentinel: VAR namespace */
+
       /* For VT_LOCAL, hash on symbol pointer and offset */
       h = ((uintptr_t)addr_sym * 31 + (uint32_t)addr_offset * 17) % 128;
 

@@ -240,6 +240,18 @@ static int ir_gen_mla_fusion(IROptCtx *ctx, int i)
       }
     }
   }
+  /* A 64-bit MLA is lowered only to SMLAL/UMLAL, which accumulate in place:
+   * the destination register pair must equal the accumulator pair.  We only
+   * reach that form when the result is stored straight back to the
+   * accumulator's own slot (store_idx >= 0, so final_dest's vreg == accum_vr).
+   * Without such a store-back, final_dest is a fresh temp distinct from the
+   * accumulator and tcc_gen_machine_mlal_accum_mop cannot lower it, which used
+   * to abort codegen with "unable to lower 64-bit MLA".  Leave those cases as
+   * SMULL/UMULL + 64-bit ADD; the SMULL/UMULL codegen path still applies its
+   * own SMLAL peephole (with a safe fallback) for the genuinely in-place ones. */
+  if (long_mla && store_idx < 0)
+    return 0;
+
   if (long_mla)
     final_dest.is_unsigned = (old_mul_op == TCCIR_OP_UMULL);
 
@@ -750,7 +762,11 @@ static int ir_gen_disp_fusion(IROptCtx *ctx, int i)
 
   if (imm > 4095 || imm < -255)
     return 0;
-  if (base_op.is_local || base_op.is_llocal)
+  /* A deref'd base (`*ptr + imm`) cannot be folded: STORE_INDEXED/LOAD_INDEXED
+   * use the base register's value, so stripping is_lval would drop the
+   * pointer load (e.g. `s1->ifdef_stack_ptr[-1] = c` storing into the
+   * struct field address instead of through the pointer). */
+  if (base_op.is_local || base_op.is_llocal || base_op.is_lval)
     return 0;
   if (!ir_xform_same_block(ir, add_idx, i))
     return 0;

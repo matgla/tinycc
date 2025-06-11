@@ -87,6 +87,17 @@ int ir_opt_eval_const_u64(TCCIRState *ir, IROperand op, int use_idx, uint64_t *o
   if (ir_opt_vreg_address_taken_between(ir, vr, 0, use_idx))
     return 0;
 
+  /* Only trace vregs with exactly one definition.  tcc_ir_find_defining_instruction
+   * returns the linearly-preceding def, but a multi-def vreg (e.g. a loop-carried
+   * value `m = m << 1` whose other def `m = a - b` precedes the use) can be reached
+   * at `use_idx` by a DIFFERENT definition via a control-flow/back-edge that the
+   * linear scan never sees.  Evaluating the one preceding def as if it were the only
+   * reaching value is unsound — it folded `(result_mant & (1ULL<<52))` in a soft-float
+   * normalize loop to 0, deleting the loop's exit test.  Mirror the same single-def
+   * guard ir_opt_eval_const_string already uses. */
+  if (!tcc_ir_vreg_has_single_def(ir, vr))
+    return 0;
+
   def_idx = tcc_ir_find_defining_instruction(ir, vr, use_idx);
   if (def_idx < 0)
     return 0;
@@ -435,8 +446,13 @@ uint8_t *ir_opt_build_merge_bitmap(TCCIRState *ir, int n)
           is_merge[target / 8] |= (1 << (target % 8));
       }
     }
-    if (i + 1 < n && q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_NOP && q->op != TCCIR_OP_RETURNVALUE &&
-        q->op != TCCIR_OP_RETURNVOID)
+    /* NOP is NOT a terminator — it falls through.  Counting its fall-through
+     * edge is required so a merge whose preceding block ends in DCE-left NOP
+     * padding is still detected (pred_count >= 2).  Omitting it leaves stale
+     * per-block state alive across the merge in the passes that consume this
+     * bitmap (matches the value_tracking fix in opt_constprop.c). */
+    if (i + 1 < n && q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_RETURNVALUE &&
+        q->op != TCCIR_OP_RETURNVOID && q->op != TCCIR_OP_SWITCH_TABLE)
     {
       pred_count[i + 1]++;
     }

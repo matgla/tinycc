@@ -786,11 +786,6 @@ int tcc_ir_opt_known_bits(TCCIRState *ir)
         stack_addr_escaped = 1;
       stack_dirty_since_split = 1;
 
-      /* Only handle 32-bit/narrower stores; skip wide types. */
-      if (dest_btype == IROP_BTYPE_INT64 || dest_btype == IROP_BTYPE_FLOAT32 ||
-          dest_btype == IROP_BTYPE_FLOAT64 || dest_btype == IROP_BTYPE_STRUCT)
-        goto post_op;
-
       int32_t stack_off = INT32_MIN;
       int have_off = 0;
 
@@ -799,6 +794,29 @@ int tcc_ir_opt_known_bits(TCCIRState *ir)
        * real stack reference). */
       have_off = kb_lval_stack_off(ir, dest, tmp_kb, max_tmp_pos, var_addr,
                                    max_var_pos, current_gen, &stack_off);
+
+      /* Wide / non-integer stores: no kb is recorded for them, but they still
+       * overwrite the slot — a value tracked from an earlier narrow store
+       * (e.g. a union initializer's zero-fill) must not survive them.
+       * FLOAT32 clobbers 4 bytes, INT64/FLOAT64 8; STRUCT has unknown width,
+       * and an unknown destination may alias any slot. */
+      if (dest_btype == IROP_BTYPE_INT64 || dest_btype == IROP_BTYPE_FLOAT32 ||
+          dest_btype == IROP_BTYPE_FLOAT64 || dest_btype == IROP_BTYPE_STRUCT)
+      {
+        if (have_off && dest_btype != IROP_BTYPE_STRUCT)
+        {
+          int32_t width = (dest_btype == IROP_BTYPE_FLOAT32) ? 4 : 8;
+          for (int s = 0; s < n_stack_slots; s++)
+            if (stack_slots[s].off + 4 > stack_off &&
+                stack_slots[s].off < stack_off + width)
+              stack_slots[s].gen = 0;
+        }
+        else
+        {
+          stack_kb_invalidate_all(stack_slots, n_stack_slots);
+        }
+        goto post_op;
+      }
 
       if (have_off)
       {

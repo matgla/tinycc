@@ -1083,6 +1083,33 @@ void tcc_ir_collect_tu_func_summary(TCCIRState *ir, Sym *func_sym)
       }
     }
 
+    /* LOAD read detection with a direct SYMREF base.  After indexed-load
+     * folding (slfwd/memory_group), an indexed read of a static lowers to
+     *   T5 <-- GlobalSym(g) LOAD_INDEXED T0
+     * with the static's SYMREF directly as the (non-lval) address base.
+     * The generic operand scan below files a non-lval SYMREF under
+     * addr_only_syms, and the phase-1 escape scans only trace vreg-held
+     * addresses, so the static would be wrongly classified tu_no_readers
+     * and its stores killed.  (This dropped libc's atexit_func[]
+     * registration stores: the only read is a LOAD_INDEXED in
+     * __libc_finalize_and_exit feeding an indirect call.)  A LOAD whose
+     * address operand is a static's SYMREF is a value read — record it,
+     * symmetric with the STORE write detection above. */
+    if (q->op == TCCIR_OP_LOAD || q->op == TCCIR_OP_LOAD_INDEXED ||
+        q->op == TCCIR_OP_LOAD_POSTINC)
+    {
+      if (irop_config[q->op].has_src1)
+      {
+        IROperand s1 = tcc_ir_op_get_src1(ir, q);
+        if (s1.is_sym)
+        {
+          Sym *sym = tu_extract_sym(ir, s1);
+          if (sym && tu_is_static_global_candidate(sym))
+            tu_symset_add(&s->static_reads, sym);
+        }
+      }
+    }
+
     /* Read-side operand scan — refined.
      * Lval SYMREFs (dereferences) are always value reads.
      * Non-lval SYMREFs (address-of) are only reads if the address escapes
@@ -1130,6 +1157,38 @@ void tcc_ir_collect_tu_func_summary(TCCIRState *ir, Sym *func_sym)
           tu_symset_add(&s->static_reads, sym);
         else
           tu_symset_add(&addr_only_syms, sym);
+      }
+    }
+
+    /* Reads through a temp that holds a static's address.  An indexed load of
+     * a static (e.g. `static_array[i].field`) lowers to a deref operand on a
+     * vreg derived from the static's SYMREF (T = &g + idx; use *T), and that
+     * deref may be folded directly into a CMP / arithmetic op rather than a
+     * LOAD.  The SYMREF-only scan above misses it (the operand is a vreg, not a
+     * SYMREF) and the LOAD-escape scan misses it (the op is not a LOAD), so the
+     * static would be wrongly classified tu_no_readers and its stores killed.
+     * Treat any lval (deref) source operand whose vreg traces to a static as a
+     * read — symmetric with STORE_INDEXED write detection. */
+    {
+      IROperand rops[3];
+      int nrops = 0;
+      if (irop_config[q->op].has_src1)
+        rops[nrops++] = tcc_ir_op_get_src1(ir, q);
+      if (irop_config[q->op].has_src2)
+        rops[nrops++] = tcc_ir_op_get_src2(ir, q);
+      if (q->op == TCCIR_OP_MLA)
+        rops[nrops++] = tcc_ir_op_get_accum(ir, q);
+      for (int oi = 0; oi < nrops; oi++)
+      {
+        IROperand op = rops[oi];
+        if (!op.is_lval || op.is_sym)
+          continue;
+        int32_t vr = irop_get_vreg(op);
+        if (vr < 0)
+          continue;
+        Sym *rsym = tu_vreg_map_lookup(vreg_map, vreg_map_count, vr);
+        if (rsym && tu_is_static_global_candidate(rsym))
+          tu_symset_add(&s->static_reads, rsym);
       }
     }
 

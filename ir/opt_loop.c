@@ -415,19 +415,33 @@ int tcc_ir_opt_loop_bound_remat(TCCIRState *ir)
         if (i == candidates[ci].assign_idx || i == candidates[ci].add_idx)
           continue;
 
-        /* Check if this instruction uses the vreg */
-        int uses_vr = 0;
+        /* Check if this instruction uses the vreg.  Track whether the use
+         * dereferences it (is_lval operand = `*vr`): rematerialization only
+         * reproduces the pointer VALUE, so redirecting a `*vr` operand to the
+         * remat vreg silently drops the load and compares the address instead
+         * of the pointed-to value (turns `*ptr` into `ptr`).  Such uses are not
+         * the end-pointer pattern this pass targets, so they disqualify the
+         * candidate. */
+        int uses_vr = 0, deref_use = 0;
         if (irop_config[q->op].has_src1)
         {
           IROperand s1 = tcc_ir_op_get_src1(ir, q);
           if (irop_get_vreg(s1) == vr)
+          {
             uses_vr = 1;
+            if (s1.is_lval)
+              deref_use = 1;
+          }
         }
         if (irop_config[q->op].has_src2)
         {
           IROperand s2 = tcc_ir_op_get_src2(ir, q);
           if (irop_get_vreg(s2) == vr)
+          {
             uses_vr = 1;
+            if (s2.is_lval)
+              deref_use = 1;
+          }
         }
 
         if (!uses_vr)
@@ -435,8 +449,8 @@ int tcc_ir_opt_loop_bound_remat(TCCIRState *ir)
 
         use_count++;
 
-        /* Must be a CMP instruction within or near the loop */
-        if (q->op != TCCIR_OP_CMP)
+        /* Must be a CMP that uses the pointer value directly (no deref). */
+        if (q->op != TCCIR_OP_CMP || deref_use)
         {
           bad_use = 1;
           break;

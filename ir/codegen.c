@@ -1614,6 +1614,43 @@ static int ir_codegen_count_vreg_uses(TCCIRState *ir, int32_t vreg)
   return uses;
 }
 
+/* True if `vreg` is referenced by any instruction OTHER than its def at
+ * `def_idx` and a single consumer at `use_idx`.  Gates the MUL-const+ADD
+ * fusion, which leaves the MUL result holding only the PARTIAL product (the
+ * trailing <<b is folded into the ADD dest, not the MUL dest), so the fusion
+ * is correct ONLY when the ADD at `use_idx` is the sole consumer — any other
+ * reader would pick up the unscaled value.  We scan the IR directly, and over
+ * ALL operand slots including the (lval) dest of a STORE, because the
+ * live-interval `end` can under-approximate cross-block / loop-back-edge uses
+ * and let the fusion fire on a strided struct store (base+idx*odd instead of
+ * base+idx*C) — a misaligned store that smashes the heap (00_assignment
+ * auto-PCH fault; 02-08 self-host cfg->blocks smash). */
+static int ir_codegen_vreg_used_elsewhere(TCCIRState *ir, int32_t vreg, int def_idx, int use_idx)
+{
+  if (vreg < 0)
+    return 0;
+
+  for (int i = 0; i < ir->next_instruction_index; i++)
+  {
+    if (i == def_idx || i == use_idx)
+      continue;
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+
+    if (irop_config[q->op].has_dest && irop_get_vreg(tcc_ir_op_get_dest(ir, q)) == vreg)
+      return 1;
+    if (irop_config[q->op].has_src1 && irop_get_vreg(tcc_ir_op_get_src1(ir, q)) == vreg)
+      return 1;
+    if (irop_config[q->op].has_src2 && irop_get_vreg(tcc_ir_op_get_src2(ir, q)) == vreg)
+      return 1;
+    if (q->op == TCCIR_OP_MLA && q->operand_base + 3 < ir->iroperand_pool_count &&
+        irop_get_vreg(ir->iroperand_pool[q->operand_base + 3]) == vreg)
+      return 1;
+  }
+  return 0;
+}
+
 #ifdef TCC_REGALLOC_DEBUG
 static void tcc_ir_debug_codegen_generate_entry(TCCIRState *ir)
 {
@@ -2250,9 +2287,27 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
     int codegen_skip_select = -1; /* SUBS+IT peephole: skip this SELECT (CMP already emitted SUBS+IT+MOVNE in its slot). */
     int codegen_cbz_reg = -1;    /* pending CBZ: physical register for compare */
     int codegen_cbz_nonzero = 0; /* pending CBZ: 0=CBZ (EQ), 1=CBNZ (NE) */
-    /* CBZ/CBNZ: in real pass with dry-run mapping, or with conservative
-     * IR-count heuristic when the dry-run was skipped. */
-    const int cbz_enabled = !is_dry_run && (cbz_dry_mapping || can_skip_dry_run);
+    /* CBZ/CBNZ peephole: fuse `CMP rN,#0; JUMPIF EQ/NE` into a single 16-bit
+     * CBZ/CBNZ.  DISABLED — it is unsound and crashes the backend.
+     *
+     * CBZ/CBNZ are forward-only with a 0..126-byte range, and the peephole
+     * commits the 2-byte encoding irrevocably while only ESTIMATING the forward
+     * distance (the target is not yet emitted in the single forward real pass).
+     * Both estimators are unsound:
+     *   - can_skip_dry_run path: `ir_gap*10 + pending_pool_size <= 126` assumes
+     *     ~10 bytes/IR-op, but a single op can emit far more (64-bit arithmetic,
+     *     literal-pool loads, block copies), so the real distance overflows 126
+     *     (e.g. offset=166).
+     *   - dry-mapping path: distances from a NO-CBZ dry run diverge from the
+     *     real layout once literal-pool flush points shift between the passes,
+     *     producing wildly wrong (even negative) final offsets (e.g. -1192).
+     * When the real offset does not fit, th_patch_call() has no way to widen a
+     * committed 2-byte CBZ in place and aborts with
+     * "CBZ/CBNZ target out of range".  Falling back to the always-correct
+     * CMP rN,#0 + B<cond>.W (full +/-1MB range) costs only 4 bytes/branch and
+     * never crashes.  Re-enable only behind a proper iterative branch-
+     * relaxation pass that re-emits out-of-range CBZ candidates as wide. */
+    const int cbz_enabled = 0;
 
     /* ---- Pass-specific initialisation ---- */
     if (is_dry_run)
@@ -2400,6 +2455,25 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
                   add_base = &b.src1;
                 else if (b.src1.vreg == mul_dest_vreg && b.src1.kind == MACH_OP_REG && !b.src1.needs_deref)
                   add_base = &b.src2;
+              }
+
+              /* Only safe when the ADD at next_j is the SOLE consumer of the MUL
+               * result: the fused helper leaves mul_dest holding the PARTIAL
+               * product (var*odd for a (2^a+1)*2^b or (2^a-1)*2^b constant), not
+               * the full var*C — the trailing <<b is folded only into add_dest.
+               * Any other use of the MUL result would then read an unscaled
+               * value.  (This miscompiled tcc_pch_auto_add_entry:
+               * auto_pch_entries[idx].pch_name/.disabled addresses came out as
+               * base+idx*3 instead of base+idx*12, a wild misaligned store that
+               * corrupted the heap -> deferred free() HardFault; the same shape
+               * smashed cfg->blocks in the 02-08 self-host crashes.)  Scan the IR
+               * directly rather than trust the live-interval `end`, which can
+               * under-approximate cross-block / loop-back-edge uses and let the
+               * fusion fire when mul_dest is in fact still live. */
+              if (add_base && mul_dest_vreg >= 0)
+              {
+                if (ir_codegen_vreg_used_elsewhere(ir, mul_dest_vreg, i, next_j))
+                  add_base = NULL;
               }
 
               if (add_base)

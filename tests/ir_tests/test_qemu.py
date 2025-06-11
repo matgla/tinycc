@@ -509,6 +509,52 @@ TCC_BUG_TEST_FILES = [
     # "same file" error.  Workaround: expand to explicit `tt ? tt : fallback`.
     ("bug_gnu_ternary_elvis.c", 0),
 
+    # Self-host codegen bugs found compiling tinycc for YasOS (build_rootfs.sh).
+    # Bug: dead-loop elimination reused a NOP slot's stale operand_base when
+    # widening it to ASSIGN, overflowing into the next instruction's dest and
+    # corrupting it into an immediate -> "mach_get_dest_reg: unexpected kind 3".
+    ("bug_dead_loop_assign_overlap.c", 0),
+    # Bug: ssa_opt_cmp_eq_prop pushed an equality fact from a loop back-edge into
+    # the loop header's dominator subtree when the header is also the function
+    # entry (its only CFG predecessor is the back-edge), folding the in-loop
+    # `if (c1 != c2) return ...;` to "always equal".  Broke strncasecmp at -O1,
+    # which made toybox `ps` print help instead of the process table.
+    ("bug_cmp_eq_loop_header_entry.c", 0),
+    # Bug: a switch-of-constants rewritten to SWITCH_LOAD spilled its dest under
+    # register pressure -> "SWITCH_LOAD dest must be in a hardware register".
+    ("bug_switch_load_spill.c", 0),
+    # Bug: mla-fusion formed a 64-bit MLA for a non-in-place accumulate (dest !=
+    # accumulator), which SMLAL/UMLAL cannot lower -> "unable to lower 64-bit MLA".
+    ("bug_mla64_non_inplace.c", 0),
+    # Bug: SSA rename cleared is_lval on a deref store/load through a promoted
+    # pointer var -> `(v=call())->m0=c` (member offset 0) lowered `*v=c` to `v=c`,
+    # dropping the store and clobbering the pointer (HardFault in toybox sh).
+    ("bug_chained_assign_store_off0.c", 0),
+    # Bug: loading a stack-passed parameter into an "unresolved" transient
+    # (PREG_NONE, frame offset 0) lowered an offset-0 spill as `str rX,[FP,#0]`,
+    # clobbering the saved frame record (r7) under the FP prologue -> caller's
+    # frame pointer corrupted on return (HardFault/STKOF in tinycc new_symtab).
+    ("bug_param_spill_fp_off0.c", 0),
+    # Bug: the CBZ/CBNZ peephole committed a 2-byte forward branch from a wrong
+    # distance estimate -> "CBZ/CBNZ target out of range" when the body > 126 bytes.
+    ("bug_cbz_far_zero_branch.c", 0),
+    # Bug: IV strength-reduction mis-shifted instructions for derived-IV address
+    # expressions feeding a struct-copy call, deleting a PARAM and crashing with
+    # "missing FUNCPARAMVAL for call_id=N" (in-place struct-array compaction).
+    ("bug_ivsr_struct_compact.c", 0),
+    # Bug: the post-increment lowering (LOAD_POSTINC/STORE_POSTINC) wrote back
+    # only the loaded/stored value, not the post-incremented pointer.  A SPILLED
+    # loop-carried pointer never advanced (the `ldrb [rN],#1` bumped only a
+    # scratch reg) -> `*q++` re-read the same byte forever.  tcc hung in
+    # parse_number() compiling ANY integer literal (self-hosted compiler froze).
+    ("bug_postinc_spilled_ptr.c", 0),
+    # Bug: CMP identity-folding ignored operand lval-ness, folding the
+    # `ptr >= array + N` bounds check (where the pointer field aliases
+    # &array[N]) to always-true and dropping the guard.  This is tcc's own
+    # ifdef_stack overflow check -> the first `#if` in the predefs reported
+    # "memory full (ifdef)" and the self-hosted compiler couldn't preprocess.
+    ("bug_cmp_ptr_array_alias.c", 0),
+
 
 ]
 
@@ -736,7 +782,10 @@ def _run_tagged_qemu_test(test_file, tag, expected_lines, expected_exit_code, op
 
 
 # Optimization levels to test
-OPT_LEVELS = ["-O0", "-O1", "-O2"]
+# -Os is the level toybox/yasos apps build at; several miscompiles (e.g. the
+# value-tracking store-through-pointer-var bug) only surface under -Os, so it
+# must be in the matrix even though -O0/-O1/-O2 pass.
+OPT_LEVELS = ["-O0", "-O1", "-O2", "-Os"]
 
 
 def _generate_matrix_params(test_list):

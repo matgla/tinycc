@@ -440,6 +440,13 @@ typedef union CValue
     int size;
   } str;
   int tab[LDOUBLE_SIZE / 4];
+  /* _Complex double constants pack {real, imag} as two doubles at offsets
+   * 0 and 8 (see TOK_CDOUBLE_I in unary() and the many `(char *)&...c + 8`
+   * accesses).  On 64-bit hosts `ld` already makes the union 16 bytes, but
+   * on a 32-bit host (long double == double) the union would otherwise be
+   * 8 bytes and every imag access would be out of bounds — complex double
+   * constants silently lost their imaginary half when tcc ran on-target. */
+  double cplx[2];
 } CValue;
 
 /* value on stack */
@@ -1210,14 +1217,18 @@ struct TCCState
   struct TCCFuncSwitchSnapshot *func_switch_cache[FUNC_SWITCH_CACHE_SIZE];
   int func_switch_cache_count;
 
-#ifdef CONFIG_TCC_DEBUG
-  /* Debug-only runtime features */
+  /* Debug-only runtime features.  These fields are kept UNCONDITIONALLY (not
+   * under #ifdef CONFIG_TCC_DEBUG) so that the TCCState layout is identical in
+   * debug and release builds.  CONFIG_TCC_DEBUG lives in config.mak's CFLAGS,
+   * not config.h, and object files don't depend on config.mak — so flipping
+   * --debug while reusing stale objects (e.g. the FORCE-rebuilt arch lib vs.
+   * unchanged core objects) would otherwise shift every field after this one,
+   * making symtab_section read as common_section and crashing th_sym_t. */
   unsigned char dump_ir; /* -dump-ir: print IR (pre/post opts) to stdout */
   /* -dump-ir-passes=name[,name...] (or "all"): after each named optimization
    * pass in the optimize loop, print "=== AFTER <name> ===" + IR.  Used to
    * bisect which pass corrupts the IR.  NULL = disabled. */
   char *dump_ir_passes;
-#endif
 
   /* use GNU C extensions */
   unsigned char gnu_ext;

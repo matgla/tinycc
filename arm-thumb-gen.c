@@ -359,6 +359,48 @@ typedef struct ScratchRegAllocs
 typedef thumb_opcode (*thumb_imm_handler_t)(uint32_t rd, uint32_t rn, uint32_t imm,
                                             thumb_flags_behaviour flags_behaviour,
                                             thumb_enforce_encoding enforce_encoding);
+
+/* Dispatch an imm_handler call through a direct call instead of an indirect
+ * (function pointer) call.  Same workaround as thumb_call_reg_handler: the
+ * cross-compiler miscompiles indirect calls that combine an sret return
+ * (thumb_opcode is 8 bytes) with stack-passed arguments — the callee reads
+ * garbage for the 5th/6th parameters (flags/enc), so e.g. the high-half SBCS
+ * of a 64-bit CMP silently loses its S bit.  Comparing the pointer and
+ * branching to a direct call makes the cross emit correct argument passing. */
+static thumb_opcode thumb_call_imm_handler(thumb_imm_handler_t fn, uint32_t rd, uint32_t rn, uint32_t imm,
+                                           thumb_flags_behaviour flags, thumb_enforce_encoding encoding)
+{
+  if (fn == th_add_imm)
+    return th_add_imm(rd, rn, imm, flags, encoding);
+  if (fn == th_sub_imm)
+    return th_sub_imm(rd, rn, imm, flags, encoding);
+  if (fn == th_adc_imm)
+    return th_adc_imm(rd, rn, imm, flags, encoding);
+  if (fn == th_sbc_imm)
+    return th_sbc_imm(rd, rn, imm, flags, encoding);
+  if (fn == th_cmp_imm_handler)
+    return th_cmp_imm_handler(rd, rn, imm, flags, encoding);
+  if (fn == th_lsl_imm)
+    return th_lsl_imm(rd, rn, imm, flags, encoding);
+  if (fn == th_lsr_imm)
+    return th_lsr_imm(rd, rn, imm, flags, encoding);
+  if (fn == th_asr_imm)
+    return th_asr_imm(rd, rn, imm, flags, encoding);
+  if (fn == th_ror_imm)
+    return th_ror_imm(rd, rn, imm, flags, encoding);
+  if (fn == th_orr_imm)
+    return th_orr_imm(rd, rn, imm, flags, encoding);
+  if (fn == th_and_imm)
+    return th_and_imm(rd, rn, imm, flags, encoding);
+  if (fn == th_eor_imm)
+    return th_eor_imm(rd, rn, imm, flags, encoding);
+  if (fn == th_bic_imm)
+    return th_bic_imm(rd, rn, imm, flags, encoding);
+  if (fn == th_orn_imm)
+    return th_orn_imm(rd, rn, imm, flags, encoding);
+  /* Unreachable for known handlers — fallback to direct call. */
+  return fn(rd, rn, imm, flags, encoding);
+}
 int store_word_to_base(int ir, int base, int fc, int sign);
 static ScratchRegAlloc th_offset_to_reg_ex(int off, int sign, uint32_t exclude_regs);
 
@@ -546,7 +588,8 @@ static int mach_ensure_imm_or_reg(MachineCodegenContext *ctx, const MachineOpera
   if (op->kind == MACH_OP_IMM && imm_handler)
   {
     const uint32_t imm_val = (uint32_t)op->u.imm.val;
-    if (ot(imm_handler((uint32_t)dest_reg, (uint32_t)src1_reg, imm_val, flags, ENFORCE_ENCODING_NONE)))
+    if (ot(thumb_call_imm_handler(imm_handler, (uint32_t)dest_reg, (uint32_t)src1_reg, imm_val, flags,
+                                  ENFORCE_ENCODING_NONE)))
     {
       *imm_emitted = true;
       return PREG_REG_NONE;
@@ -3404,15 +3447,19 @@ ST_FUNC void tcc_gen_machine_switch_load_mop(MachineOperand src, MachineOperand 
     tcc_error("internal error: SWITCH_LOAD table has no rodata symbol (switch_to_data should have allocated it)");
 
   MachineCodegenContext ctx = {0};
-  int index_reg = mach_ensure_in_reg(&ctx, &src, 0);
+  /* Keep the index out of R_IP, which we clobber with the table base below. */
+  int index_reg = mach_ensure_in_reg(&ctx, &src, (1u << (uint32_t)R_IP));
   if (!thumb_is_hw_reg(index_reg))
     tcc_error("internal error: SWITCH_LOAD index not in a hardware register");
 
-  int dest_is_spilled = (dest.kind != MACH_OP_REG);
-  if (dest_is_spilled)
-    tcc_error("internal error: SWITCH_LOAD dest must be in a hardware register");
-
-  int dest_reg = dest.u.reg.r0;
+  /* Resolve the destination register.  The switch_to_data optimization tries to
+   * keep the SWITCH_LOAD dest in a hardware register, but under high register
+   * pressure the allocator can spill it (or it may be an lvalue store).  Rather
+   * than bail out, allocate a scratch via mach_get_dest_reg() and store it back
+   * with mach_writeback_dest() afterwards.  Exclude index_reg and R_IP — both
+   * are read by the indexed load below. */
+  uint32_t dest_excl = (1u << (uint32_t)index_reg) | (1u << (uint32_t)R_IP);
+  int dest_reg = mach_get_dest_reg(&ctx, &dest, dest_excl);
 
   /* Load the table's base address from the literal pool into IP. */
   _lfc_sym = vtab->rodata_sym;
@@ -3421,6 +3468,9 @@ ST_FUNC void tcc_gen_machine_switch_load_mop(MachineOperand src, MachineOperand 
   /* dest = table[index] via LDR.W dest, [ip, index, LSL #2]. */
   thumb_shift shift = {THUMB_SHIFT_LSL, 2, THUMB_SHIFT_IMMEDIATE};
   ot_check(th_ldr_reg((uint32_t)dest_reg, (uint32_t)R_IP, (uint32_t)index_reg, shift, ENFORCE_ENCODING_32BIT));
+
+  /* If the dest was a spill slot or lvalue, write the loaded value back. */
+  mach_writeback_dest(&dest, dest_reg);
 
   mach_release_all(&ctx);
 }
@@ -4741,7 +4791,7 @@ static bool thumb_is_hw_reg(int reg)
 static void thumb_emit_op_imm_fallback(int rd, int rn, uint32_t imm, thumb_flags_behaviour flags,
                                        ThumbDataProcessingHandler handler)
 {
-  thumb_opcode sub_low = handler.imm_handler(rd, rn, imm, flags, ENFORCE_ENCODING_NONE);
+  thumb_opcode sub_low = thumb_call_imm_handler(handler.imm_handler, rd, rn, imm, flags, ENFORCE_ENCODING_NONE);
   if (sub_low.size == 0)
   {
     uint32_t exclude = 0;
@@ -5211,25 +5261,25 @@ static void thumb_emit_shift64_mop(const MachineOperand *src1, const MachineOper
     {
       /* Compute the cross-shift into tmp BEFORE any destination is written,
        * because dst_lo/dst_hi may alias src_lo/src_hi. */
-      ot_check(cross_shift((uint32_t)tmp.reg, (uint32_t)src_lo, 32 - sh, flags_safe(),
+      ot_check(thumb_call_imm_handler(cross_shift, (uint32_t)tmp.reg, (uint32_t)src_lo, 32 - sh, flags_safe(),
                            ENFORCE_ENCODING_NONE));
       if (dst_hi == src_lo)
       {
         /* dst_hi aliases src_lo — compute dst_lo first (needs src_lo). */
         if (!skip_lo)
           ot_check(
-              dst_lo_shift((uint32_t)dst_lo, (uint32_t)src_lo, sh, flags_safe(), ENFORCE_ENCODING_NONE));
+              thumb_call_imm_handler(dst_lo_shift, (uint32_t)dst_lo, (uint32_t)src_lo, sh, flags_safe(), ENFORCE_ENCODING_NONE));
         ot_check(
-            dst_hi_shift((uint32_t)dst_hi, (uint32_t)src_hi, sh, flags_safe(), ENFORCE_ENCODING_NONE));
+            thumb_call_imm_handler(dst_hi_shift, (uint32_t)dst_hi, (uint32_t)src_hi, sh, flags_safe(), ENFORCE_ENCODING_NONE));
       }
       else
       {
         /* Default order: dst_hi first to avoid clobbering src_hi via dst_lo. */
         ot_check(
-            dst_hi_shift((uint32_t)dst_hi, (uint32_t)src_hi, sh, flags_safe(), ENFORCE_ENCODING_NONE));
+            thumb_call_imm_handler(dst_hi_shift, (uint32_t)dst_hi, (uint32_t)src_hi, sh, flags_safe(), ENFORCE_ENCODING_NONE));
         if (!skip_lo)
           ot_check(
-              dst_lo_shift((uint32_t)dst_lo, (uint32_t)src_lo, sh, flags_safe(), ENFORCE_ENCODING_NONE));
+              thumb_call_imm_handler(dst_lo_shift, (uint32_t)dst_lo, (uint32_t)src_lo, sh, flags_safe(), ENFORCE_ENCODING_NONE));
       }
       ot_check(th_orr_reg((uint32_t)dst_hi, (uint32_t)dst_hi, (uint32_t)tmp.reg, flags_safe(),
                           THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
@@ -5238,13 +5288,13 @@ static void thumb_emit_shift64_mop(const MachineOperand *src1, const MachineOper
     {
       /* Compute the cross-shift into tmp BEFORE any destination is written,
        * because dst_lo/dst_hi may alias src_lo/src_hi. */
-      ot_check(cross_shift((uint32_t)tmp.reg, (uint32_t)src_hi, 32 - sh, flags_safe(),
+      ot_check(thumb_call_imm_handler(cross_shift, (uint32_t)tmp.reg, (uint32_t)src_hi, 32 - sh, flags_safe(),
                            ENFORCE_ENCODING_NONE));
       if (dst_lo == src_hi)
       {
         /* dst_lo aliases src_hi — compute dst_hi first (needs src_hi). */
         ot_check(
-            dst_hi_shift((uint32_t)dst_hi, (uint32_t)src_hi, sh, flags_safe(), ENFORCE_ENCODING_NONE));
+            thumb_call_imm_handler(dst_hi_shift, (uint32_t)dst_hi, (uint32_t)src_hi, sh, flags_safe(), ENFORCE_ENCODING_NONE));
         ot_check(
             th_lsr_imm((uint32_t)dst_lo, (uint32_t)src_lo, sh, flags_safe(), ENFORCE_ENCODING_NONE));
       }
@@ -5254,7 +5304,7 @@ static void thumb_emit_shift64_mop(const MachineOperand *src1, const MachineOper
         ot_check(
             th_lsr_imm((uint32_t)dst_lo, (uint32_t)src_lo, sh, flags_safe(), ENFORCE_ENCODING_NONE));
         ot_check(
-            dst_hi_shift((uint32_t)dst_hi, (uint32_t)src_hi, sh, flags_safe(), ENFORCE_ENCODING_NONE));
+            thumb_call_imm_handler(dst_hi_shift, (uint32_t)dst_hi, (uint32_t)src_hi, sh, flags_safe(), ENFORCE_ENCODING_NONE));
       }
       ot_check(th_orr_reg((uint32_t)dst_lo, (uint32_t)dst_lo, (uint32_t)tmp.reg, flags_safe(),
                           THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
@@ -5291,7 +5341,7 @@ static void thumb_emit_shift64_mop(const MachineOperand *src1, const MachineOper
     if (is_left)
     {
       /* Emit shift into dst_hi first: dst_lo may alias src_lo. */
-      ot_check(dst_hi_shift((uint32_t)dst_hi, (uint32_t)src_lo, sh - 32, flags_safe(),
+      ot_check(thumb_call_imm_handler(dst_hi_shift, (uint32_t)dst_hi, (uint32_t)src_lo, sh - 32, flags_safe(),
                             ENFORCE_ENCODING_NONE));
       if (!skip_lo)
         ot_check(th_mov_imm((uint32_t)dst_lo, 0, flags_safe(), ENFORCE_ENCODING_NONE));
@@ -5305,12 +5355,12 @@ static void thumb_emit_shift64_mop(const MachineOperand *src1, const MachineOper
         if (!skip_hi)
           ot_check(
               th_asr_imm((uint32_t)dst_hi, (uint32_t)src_hi, 31, flags_safe(), ENFORCE_ENCODING_NONE));
-        ot_check(dst_hi_shift((uint32_t)dst_lo, (uint32_t)src_hi, sh - 32, flags_safe(),
+        ot_check(thumb_call_imm_handler(dst_hi_shift, (uint32_t)dst_lo, (uint32_t)src_hi, sh - 32, flags_safe(),
                               ENFORCE_ENCODING_NONE));
       }
       else
       {
-        ot_check(dst_hi_shift((uint32_t)dst_lo, (uint32_t)src_hi, sh - 32, flags_safe(),
+        ot_check(thumb_call_imm_handler(dst_hi_shift, (uint32_t)dst_lo, (uint32_t)src_hi, sh - 32, flags_safe(),
                               ENFORCE_ENCODING_NONE));
         if (!skip_hi)
         {
@@ -12073,7 +12123,14 @@ static int select_can_inline(const MachineOperand *op)
   case MACH_OP_REG:
     return !op->needs_deref; /* MOV reg is 1 instr; deref needs LDR too */
   case MACH_OP_SYMBOL:
-    return !op->needs_deref; /* LDR from literal pool is 1 instr; deref needs 2 */
+    /* A symbol address is a single literal-pool LDR only in the plain,
+     * non-PIC, non-separated layout.  Under PIC/PIE or text+data separation it
+     * expands to a multi-instruction GOT/GOTOFF sequence (ldr GOT-slot; add r9;
+     * ldr; ...).  Emitting that "inline" inside an IT block predicates only the
+     * FIRST instruction and lets the remaining ones run unconditionally, which
+     * clobbers the select result with the else-operand's address.  Force
+     * pre-materialization into a scratch register in those modes. */
+    return !op->needs_deref && !pic && !text_and_data_separation;
   case MACH_OP_SPILL:
     return !op->needs_deref; /* LDR from stack is 1 instr; deref (VT_LLOCAL) needs 2 */
   case MACH_OP_FRAME_ADDR:

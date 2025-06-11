@@ -2287,7 +2287,14 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
         s->opt_indexed_memory = 1; /* Fuse SHL+ADD+LOAD/STORE into indexed ops */
         s->opt_disp_fusion = 1;    /* Fuse ADD+imm+LOAD/STORE into displacement-addressed ops */
         s->opt_lea_fold = 1;       /* Fold LEA Addr[StackLoc]+deref into direct stack slot access */
-        s->opt_postinc_fusion = 1; /* Fuse LOAD/STORE + ADD into post-increment ops */
+        s->opt_postinc_fusion = 0; /* DISABLED: fusing LOAD/STORE + ADD into a single
+                                    * LOAD_POSTINC/STORE_POSTINC is unsound when the
+                                    * pointer SPILLS — the ARM post-indexed writeback
+                                    * (ldr/str [rN],#imm) updates rN in place but the IR
+                                    * can't model it, so the spilled base never advances
+                                    * (tcc froze in parse_number on every integer literal).
+                                    * Without the fusion `*p++` lowers to an explicit
+                                    * LOAD + ADD whose result is written back correctly. */
         s->opt_mla_fusion = 1;     /* Fuse MUL+ADD into MLA */
         /* fp-offset-cache disabled: miscompiles loops when combined with
            iv-strength-red (e.g. SHA-1 sha_transform).  Can still be
