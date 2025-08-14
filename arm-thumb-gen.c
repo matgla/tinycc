@@ -1190,12 +1190,33 @@ void gsym_addr(int t, int a) {
 }
 
 ST_FUNC void gen_vla_alloc(CType *type, int align) {
-  tcc_error("'gen_vla_alloc'");
+  int r = intr(gv(RC_INT));
+  th_sub_reg(r, 13, r);
+  if (align < 8)
+    align = 8;
+  if (align & (align - 1))
+    tcc_error("alignment is not a power of 2: %i", align);
+  /* bic sp, r, #align-1 */
+  ot_check(th_bic_imm(r, r, align - 1));
+  ot_check(th_mov_reg(13, r));
+  vpop();
 }
 
-ST_FUNC void gen_vla_sp_save(int addr) { tcc_error("'gen_vla_sp_save'"); }
+ST_FUNC void gen_vla_sp_save(int addr) {
+  SValue v;
+  v.type.t = VT_PTR;
+  v.r = VT_LOCAL | VT_LVAL;
+  v.c.i = addr;
+  store(TREG_SP, &v);
+}
 
-ST_FUNC void gen_vla_sp_restore(int addr) { tcc_error("'gen_vla_sp_restore'"); }
+ST_FUNC void gen_vla_sp_restore(int addr) {
+  SValue v;
+  v.type.t = VT_PTR;
+  v.r = VT_LOCAL | VT_LVAL;
+  v.c.i = addr;
+  load(TREG_SP, &v);
+}
 
 static int unalias_ldbl(int btype) {
 #if LDOUBLE_SIZE == 8
