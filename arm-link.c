@@ -65,6 +65,10 @@ ST_FUNC int code_reloc(int reloc_type) {
   case R_ARM_PREL31:
   case R_ARM_V4BX:
   case R_ARM_JUMP_SLOT:
+  case R_ARM_THM_ALU_PREL_11_0:
+  case R_ARM_THM_JUMP6:
+  case R_ARM_THM_PC12:
+  case R_ARM_THM_PC8:
     return 1;
   }
   return -1;
@@ -86,6 +90,8 @@ ST_FUNC int gotplt_entry_type(int reloc_type) {
   case R_ARM_JUMP24:
   case R_ARM_PLT32:
   case R_ARM_THM_PC22:
+  case R_ARM_THM_ALU_PREL_11_0:
+  case R_ARM_THM_JUMP6:
   case R_ARM_THM_JUMP24:
   case R_ARM_MOVT_ABS:
   case R_ARM_MOVW_ABS_NC:
@@ -98,6 +104,8 @@ ST_FUNC int gotplt_entry_type(int reloc_type) {
   case R_ARM_TARGET1:
   case R_ARM_MOVT_PREL:
   case R_ARM_MOVW_PREL_NC:
+  case R_ARM_THM_PC12:
+  case R_ARM_THM_PC8:
     return AUTO_GOTPLT_ENTRY;
 
   case R_ARM_GOTPC:
@@ -190,22 +198,30 @@ ST_FUNC void relocate_plt(TCCState *s1) {
       // I can't modify stack in this function, so how can I restore R9?
       // write_thumb_instruction(p, th_push(1 << R9 | 1 << R_LR));
       // get offet in GOT table
-      write_thumb_instruction(p, th_ldr_imm(R_IP, R_PC, 24, 6));
+      write_thumb_instruction(
+          p, th_ldr_imm(R_IP, R_PC, 24, 6, ENFORCE_ENCODING_NONE));
 
       if (s1->text_and_data_separation) {
         // calculate address relative to the base
-        write_thumb_instruction(p + 4, th_add_reg(R_IP, R_IP, R9));
+        write_thumb_instruction(
+            p + 4, th_add_reg(R_IP, R_IP, R9, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                              THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
       } else {
         // calculate address relative to the PC
-        write_thumb_instruction(p + 4, th_add_reg(R_IP, R_IP, R_PC));
+        write_thumb_instruction(
+            p + 4, th_add_reg(R_IP, R_IP, R_PC, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                              THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
       }
       // load R9 value from first got entry
-      write_thumb_instruction(p + 6, th_ldr_imm(R9, R_IP, 4, 6));
+      write_thumb_instruction(
+          p + 6, th_ldr_imm(R9, R_IP, 4, 6, ENFORCE_ENCODING_NONE));
       // update R9
       // get address of the symbol
       // load the address of the symbol
-      write_thumb_instruction(p + 10, th_ldr_imm(R_IP, R_IP, 0, 6));
-      write_thumb_instruction(p + 14, th_cmp_imm(R_IP, 0));
+      write_thumb_instruction(
+          p + 10, th_ldr_imm(R_IP, R_IP, 0, 6, ENFORCE_ENCODING_NONE));
+      write_thumb_instruction(p + 14,
+                              th_cmp_imm(R_IP, 0, ENFORCE_ENCODING_32BIT));
       // if 0 then call resolver, else move one instruction further
       write_thumb_instruction(p + 18, th_b_t1(1, 0));
       write_thumb_instruction(p + 22, th_bx_reg(R_IP));
@@ -270,7 +286,113 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
     (*(int *)ptr) |= x;
   }
     return;
-  /* Since these relocations only concern Thumb-2 and blx instruction was
+  case R_ARM_THM_JUMP6: {
+    int x, orig, i, imm5;
+    Section *plt;
+    /* weak reference */
+    if (sym->st_shndx == SHN_UNDEF && ELFW(ST_BIND)(sym->st_info) == STB_WEAK)
+      return;
+
+    /* Get initial offset */
+    orig = (*(uint16_t *)ptr);
+    x = (val - addr - 4);
+    if (x < 0) {
+      (*(uint16_t *)ptr) = 0xbf00;
+      return;
+    } else {
+      x = (x >> 1);
+    }
+    /* Compute and store final offset */
+    i = (x >> 5) & 1;
+    imm5 = x & 0x1f;
+    (*(uint16_t *)ptr) = orig | (i << 9) | (imm5 << 3);
+    return;
+  }
+  case R_ARM_THM_ALU_PREL_11_0: {
+    int x, hi, lo, s, i, imm3, imm8;
+    Section *plt;
+    /* weak reference */
+    if (sym->st_shndx == SHN_UNDEF && ELFW(ST_BIND)(sym->st_info) == STB_WEAK)
+      return;
+
+    /* Get initial offset */
+    hi = (*(uint16_t *)ptr);
+    lo = (*(uint16_t *)(ptr + 2));
+    i = (hi >> 10) & 1;
+    imm3 = (lo >> 12) & 0x7;
+    imm8 = lo & 0xff;
+    x = i << 11 | imm3 << 8 | imm8;
+
+    if (hi & 0x00a0) {
+      x = -x;
+    }
+
+    addr &= -4;
+    if (val < addr) {
+      x = val - addr - 4;
+    } else {
+      s = 0;
+      x = val - (addr + 4);
+    }
+
+    if (x < 0) {
+      s = 0xa;
+      x = -x;
+    }
+
+    /* Compute and store final offset */
+    i = (x >> 11) & 1;
+    imm3 = (x >> 12) & 0x3;
+    imm8 = x & 0xff;
+    (*(uint16_t *)ptr) = (uint16_t)((hi & 0xfb0f) | (i << 10)) | (s << 4);
+    (*(uint16_t *)(ptr + 2)) = (uint16_t)((lo & 0x8f00) | (imm3 << 12) | imm8);
+  }
+    return;
+  case R_ARM_THM_PC12: {
+    int x, orig, i, imm12;
+    Section *plt;
+    /* weak reference */
+    if (sym->st_shndx == SHN_UNDEF && ELFW(ST_BIND)(sym->st_info) == STB_WEAK)
+      return;
+
+    /* Get initial offset */
+    orig = (*(uint16_t *)(ptr + 2));
+    addr &= -4;
+    if (val > addr) {
+      x = val - addr - 4;
+    } else {
+      uint32_t original_instruction = (*(uint16_t *)ptr);
+      (*(uint16_t *)ptr) = original_instruction & 0xff7f;
+      x = addr + 4 - val;
+    }
+    /* Compute and store final offset */
+    (*(uint16_t *)(ptr + 2)) = orig | (x & 0xfff);
+  }
+    return;
+  case R_ARM_THM_PC8: {
+    int x, orig, i, imm8;
+    Section *plt;
+    /* weak reference */
+    if (sym->st_shndx == SHN_UNDEF && ELFW(ST_BIND)(sym->st_info) == STB_WEAK)
+      return;
+
+    /* Get initial offset */
+    orig = (*(uint16_t *)(ptr + 2));
+    addr &= -4;
+    if (val > addr) {
+      x = val - addr - 4;
+    } else {
+      uint32_t original_instruction = (*(uint16_t *)ptr);
+      (*(uint16_t *)ptr) = original_instruction & 0xff7f;
+      x = addr + 4 - val;
+    }
+    x >>= 2;
+    /* Compute and store final offset */
+    (*(uint16_t *)(ptr + 2)) = orig | (x & 0xff);
+  }
+    return;
+
+    /* Since these relocations only concern Thumb-2 and blx instruction was
      introduced before Thumb-2, we can assume blx is available and not
      guard its use */
   case R_ARM_THM_PC22:
@@ -278,7 +400,6 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
     int x, hi, lo, s, j1, j2, i1, i2, imm10, imm11;
     int is_call, to_plt, blx_bit = 1 << 12;
     Section *plt;
-
     /* weak reference */
     if (sym->st_shndx == SHN_UNDEF && ELFW(ST_BIND)(sym->st_info) == STB_WEAK)
       return;
@@ -327,10 +448,11 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
     }
 
     /* Compute final offset */
+
     x += val - addr;
     if (is_call) {
-      blx_bit = 0;      /* bl -> blx */
-      x = (x + 3) & -4; /* Compute offset from aligned PC */
+      blx_bit = 0; /* bl -> blx */
+      // x = (x + 3) & -4; /* Compute offset from aligned PC */
     }
 
     /* Check that relocation is possible
@@ -341,7 +463,6 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
     if (x >= 0x1000000 || x < -0x1000000)
       if ((val & 2) || (!is_call && !to_plt))
         tcc_error_noabort("can't relocate value at %x,%d", addr, type);
-
     /* Compute and store final offset */
     s = (x >> 24) & 1;
     i1 = (x >> 23) & 1;
@@ -352,7 +473,7 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
     imm11 = (x >> 1) & 0x7ff;
     (*(uint16_t *)ptr) = (uint16_t)((hi & 0xf800) | (s << 10) | imm10);
     (*(uint16_t *)(ptr + 2)) =
-        (uint16_t)((lo & 0xc000) | (j1 << 13) | blx_bit | (j2 << 11) | imm11);
+        (uint16_t)((lo & 0xd000) | (j1 << 13) | blx_bit | (j2 << 11) | imm11);
   }
     return;
   case R_ARM_MOVT_ABS:
