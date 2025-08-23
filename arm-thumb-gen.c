@@ -634,7 +634,8 @@ int th_patch_call(int t, int a) {
 
 static void gadd_sp(int val) {
   if (val > 0) {
-    ot_check(th_add_sp_imm(R_SP, val));
+    ot_check(th_add_sp_imm(R_SP, val, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                           ENFORCE_ENCODING_NONE));
   } else if (val < 0) {
     ot_check(th_sub_sp_imm(R_SP, -val));
   }
@@ -716,7 +717,9 @@ again:
           gadd_sp(-size);
           /* generate structure store */
           r = get_reg(RC_INT);
-          ot_check(th_add_sp_imm(intr(r), padding));
+          ot_check(th_add_sp_imm(intr(r), padding,
+                                 FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                                 ENFORCE_ENCODING_NONE));
           vset(&vtop->type, r | VT_LVAL, 0);
           vswap();
           /* XXX: optimize. Save all register because memcpy can use them */
@@ -1078,7 +1081,8 @@ void gfunc_epilog(void) {
   if (!leaffunc)
     diff = ((diff + 11) & -8) - 4;
   if (diff > 0) {
-    if (!ot(th_add_sp_imm(R_SP, diff))) {
+    if (!ot(th_add_sp_imm(R_SP, diff, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                          ENFORCE_ENCODING_NONE))) {
       int rr = th_offset_to_reg(diff, 0);
       ot_check(th_add_sp_reg(rr));
       ot_check(th_mov_reg(R_SP, rr));
@@ -1093,7 +1097,8 @@ void gfunc_epilog(void) {
   }
 
   if (func_nregs) {
-    ot_check(th_add_sp_imm(R_SP, func_nregs << 2));
+    ot_check(th_add_sp_imm(R_SP, func_nregs << 2, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                           ENFORCE_ENCODING_NONE));
   }
   ot_check(th_bx_reg(R_LR));
 

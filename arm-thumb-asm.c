@@ -295,7 +295,6 @@ static void parse_operand(TCCState *s1, Operand *op) {
 
 static uint8_t thumb_build_it_mask(const char *pattern, uint16_t condition) {
   uint8_t mask = 0x0;
-  printf("pattenr: %s, condition: %x\n", pattern, condition);
   for (size_t i = 2; i < 6; ++i) {
     if (pattern[i] == 0) {
       mask |= (1 << (5 - i));
@@ -308,7 +307,6 @@ static uint8_t thumb_build_it_mask(const char *pattern, uint16_t condition) {
       mask |= ((!condition) << (5 - i));
     }
   }
-  printf("Generated IT mask: 0x%x\n", mask);
   return mask;
 }
 
@@ -399,7 +397,6 @@ static void thumb_conditional_opcode(TCCState *s1, int token) {
   }
 
   condition = thumb_parse_condition_str(token_str);
-  printf("Taking condition for: %s, %d\n", token_str, condition);
   mask = thumb_build_it_mask(it_str, condition & 1);
   thumb_emit_opcode(th_it(condition, mask));
   next();
@@ -434,17 +431,15 @@ static flags_behaviour thumb_determine_flags_behaviour(int token,
   return FLAGS_BEHAVIOUR_BLOCK;
 }
 
-static bool thumb_confirm_op_is_imm(int type) {
+static bool thumb_operand_is_immediate(int type) {
   if (type != OP_IM32 && type != OP_IM8 && type != OP_IM8N) {
-    tcc_error("Operand must be immediate");
     return false;
   }
   return true;
 }
 
-static bool thumb_confirm_op_is_reg(int type) {
+static bool thumb_operand_is_register(int type) {
   if (type != OP_REG && type != OP_REG32) {
-    tcc_error("Operand must be register");
     return false;
   }
   return true;
@@ -484,14 +479,11 @@ static void thumb_data_processing_opcode(TCCState *s1, int token) {
   case TOK_ASM_adcseq:
   case TOK_ASM_adceq: {
     setflags = thumb_determine_flags_behaviour(token, TOK_ASM_adcseq, true);
-    switch (ops[2].type) {
-    case OP_IM32:
-    case OP_IM8:
-    case OP_IM8N:
+    if (thumb_operand_is_immediate(ops[2].type))
       return thumb_emit_opcode(
           th_adc_imm(ops[0].reg, ops[1].reg, ops[2].e.v, setflags));
-    case OP_REG32:
-    case OP_REG:
+
+    if (thumb_operand_is_register(ops[2].type)) {
       if ((THUMB_INSTRUCTION_GROUP(token) == TOK_ASM_adceq &&
            thumb_conditional_scope == 0) ||
           THUMB_HAS_WIDE_QUALIFIER(token)) {
@@ -499,8 +491,28 @@ static void thumb_data_processing_opcode(TCCState *s1, int token) {
       }
       return thumb_emit_opcode(th_adc_reg(ops[0].reg, ops[1].reg, ops[2].reg,
                                           setflags, shift_info, encoding));
-    default:
-      tcc_error("got unsupported operand type");
+    }
+  }
+  case TOK_ASM_addseq:
+  case TOK_ASM_addeq:
+  case TOK_ASM_addweq: {
+    setflags = thumb_determine_flags_behaviour(token, TOK_ASM_addseq, true);
+    if (THUMB_HAS_WIDE_QUALIFIER(token)) {
+      encoding = ENFORCE_ENCODING_32BIT;
+    }
+
+    if (thumb_operand_is_immediate(ops[2].type)) {
+      if (ops[1].reg == R_SP) {
+        if (THUMB_INSTRUCTION_GROUP(token) == TOK_ASM_addweq) {
+          return thumb_emit_opcode(
+              th_add_sp_imm_t4(ops[0].reg, ops[2].e.v, setflags, encoding));
+        }
+        return thumb_emit_opcode(
+            th_add_sp_imm(ops[0].reg, ops[2].e.v, setflags, encoding));
+      }
+    }
+
+    if (thumb_operand_is_register(ops[2].type)) {
     }
   }
   case TOK_ASM_cmpeq: {
@@ -531,9 +543,8 @@ static void thumb_data_processing_opcode(TCCState *s1, int token) {
     }
     break;
   }
-  default:
-    tcc_error("unimplemented instruction: %s", get_tok_str(token, NULL));
   }
+  tcc_error("Unhandled operation for: %s", get_tok_str(token, NULL));
 }
 
 static void thumb_process_svc(TCCState *s1, int token) {
@@ -663,6 +674,9 @@ ST_FUNC void asm_opcode(TCCState *s1, int token) {
     return thumb_branch(s1, token);
   case TOK_ASM_adceq:
   case TOK_ASM_adcseq:
+  case TOK_ASM_addeq:
+  case TOK_ASM_addseq:
+  case TOK_ASM_addweq:
   case TOK_ASM_movseq:
   case TOK_ASM_movweq:
   case TOK_ASM_moveq:

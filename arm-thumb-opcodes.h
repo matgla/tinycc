@@ -191,7 +191,10 @@ thumb_opcode th_umull(uint32_t rdlo, uint32_t rdhi, uint16_t rn, uint16_t rm);
 thumb_opcode th_udiv(uint16_t rd, uint16_t rn, uint16_t rm);
 thumb_opcode th_sdiv(uint16_t rd, uint16_t rn, uint16_t rm);
 
-thumb_opcode th_add_sp_imm(uint16_t rd, uint32_t imm);
+thumb_opcode th_add_sp_imm_t4(uint32_t rd, uint32_t imm, flags_behaviour flags,
+                              enforce_encoding encoding);
+thumb_opcode th_add_sp_imm(uint16_t rd, uint32_t imm, flags_behaviour flags,
+                           enforce_encoding encoding);
 thumb_opcode th_add_sp_reg(uint16_t rdm);
 thumb_opcode th_rsb_imm(uint16_t rd, uint16_t rn, uint32_t imm,
                         flags_behaviour setflags);

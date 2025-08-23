@@ -3,6 +3,36 @@ import os
 import re
 from pathlib import Path
 
+def prepare_expect(filepath):
+    """
+    Compiles the assembly code at the given filepath using the ARM toolchain.
+    """
+    try:
+        compiler = os.getenv("TEST_COMPARE_CC", None)
+        output_dir = (Path(filepath).parent / "expected").resolve()
+        output_file = output_dir / (Path(filepath).stem + ".o")
+        output_file_gcc = output_dir / (Path(filepath).stem + "_gcc.o")
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        assert compiler is not None, "TEST_COMPARE_CC environment variable must be set to the ARM compiler path."
+        _ = subprocess.run(
+            [compiler, "-c", filepath, "-mcpu=cortex-m33", "-o", output_file_gcc],
+            check=True,
+            capture_output=True,
+            text=True
+        )
+        
+        objcopy = os.getenv("TEST_OBJCOPY", None)
+        _ = subprocess.run(
+            [objcopy, "--only-section=.text", output_file_gcc, output_file]
+        )
+
+        return output_file
+    except subprocess.CalledProcessError as e:
+        print(f"Compilation failed: {e.stderr}")
+        raise e
+ 
+
 def compile_code(filepath):
     """
     Compiles the assembly code at the given filepath using the ARM toolchain.
@@ -65,7 +95,7 @@ def cleanup_dissambly(disassembly):
 def perform_test_for_file(file):
     output_file = compile_code(file)
     disassembly_sut = disassemble_code(output_file).splitlines()
-    expected_file = output_file.parent.parent / "expected" / output_file.name
+    expected_file = prepare_expect(file)
     disassembly_expected = disassemble_code(expected_file).splitlines()
     verify_disassembly(disassembly_sut, disassembly_expected)    
 

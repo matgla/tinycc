@@ -57,7 +57,6 @@ uint32_t th_packimm_10_11_0(uint32_t imm) {
 }
 
 uint32_t th_pack_const(uint32_t imm) {
-  printf("th_pack_const imm: 0x%x\n", imm);
   // 00000000 00000000 00000000 abcdefgh
   if ((imm & 0xffffff00) == 0) {
     return imm;
@@ -1183,24 +1182,10 @@ thumb_opcode th_sdiv(uint16_t rd, uint16_t rn, uint16_t rm) {
   };
 }
 
-thumb_opcode th_add_sp_imm(uint16_t rd, uint32_t imm) {
-  // T1 on all armv-m
-  if (rd < 8 && imm <= 1020 && !(imm & 0x3)) {
-    return (thumb_opcode){
-        .size = 2,
-        .opcode = (0xa800 | (rd << 8) | (imm >> 2)),
-    };
-  }
-  // T2 on all armv-m
-  else if (rd == R_SP && imm <= 508 && !(imm & 0x3)) {
-    return (thumb_opcode){
-        .size = 2,
-        .opcode = 0xb000 | (imm >> 2),
-    };
-  }
-#if !defined(TCC_TARGET_ARM_ARCHV6M)
-  // T3
-  else if (rd != R_PC && imm <= 4095) {
+thumb_opcode th_add_sp_imm_t4(uint32_t rd, uint32_t imm, flags_behaviour flags,
+                              enforce_encoding encoding) {
+  if (rd != R_PC && imm <= 4095 && (encoding != ENFORCE_ENCODING_16BIT) &&
+      (flags != FLAGS_BEHAVIOUR_SET)) {
     const uint16_t i = (imm >> 11) & 1;
     const uint32_t imm3 = (imm >> 8) & 7;
     return (thumb_opcode){
@@ -1208,20 +1193,53 @@ thumb_opcode th_add_sp_imm(uint16_t rd, uint32_t imm) {
         .opcode =
             0xf20d0000 | (i << 26) | (imm3 << 12) | (rd << 8) | (imm & 0xff),
     };
-  } else if (rd != R_PC) {
-    const uint32_t enc = th_pack_const(imm);
-    if (enc || imm == 0) {
-      return (thumb_opcode){
-          .size = 4,
-          .opcode = 0xf10d0000 | enc | (rd << 8),
-      };
-    }
   }
-#endif
   return (thumb_opcode){
       .size = 0,
       .opcode = 0,
   };
+}
+
+thumb_opcode th_add_sp_imm(uint16_t rd, uint32_t imm, flags_behaviour flags,
+                           enforce_encoding encoding) {
+  printf("rd: %d, imm: %d, flags: %d, encoding: %d\n", rd, imm, flags,
+         encoding);
+  // T1 on all armv-m
+  if (rd < 8 && imm <= 1020 && !(imm & 0x3) && (flags != FLAGS_BEHAVIOUR_SET) &&
+      (encoding != ENFORCE_ENCODING_32BIT)) {
+    return (thumb_opcode){
+        .size = 2,
+        .opcode = (0xa800 | (rd << 8) | (imm >> 2)),
+    };
+  }
+  // T2 on all armv-m
+  else if (rd == R_SP && imm <= 508 && !(imm & 0x3) &&
+           (flags != FLAGS_BEHAVIOUR_SET) &&
+           (encoding != ENFORCE_ENCODING_32BIT)) {
+    return (thumb_opcode){
+        .size = 2,
+        .opcode = 0xb000 | (imm >> 2),
+    };
+  }
+#if !defined(TCC_TARGET_ARM_ARCHV6M)
+  // T3
+  else if (rd != R_PC && (encoding != ENFORCE_ENCODING_16BIT)) {
+    const uint32_t enc = th_pack_const(imm);
+    const uint32_t s = (flags == FLAGS_BEHAVIOUR_SET) ? 1 : 0;
+    if (enc || imm == 0) {
+      return (thumb_opcode){
+          .size = 4,
+          .opcode = 0xf10d0000 | enc | (rd << 8) | (s << 20),
+      };
+    }
+  }
+  return th_add_sp_imm_t4(rd, imm, flags, encoding);
+#else
+  return (thumb_opcode){
+      .size = 0,
+      .opcode = 0,
+  };
+#endif
 }
 
 thumb_opcode th_add_sp_reg(uint16_t rdm) {
@@ -1589,7 +1607,6 @@ thumb_opcode th_vcvt_fp_int(uint32_t vd, uint32_t vm, uint32_t opc, uint32_t sz,
 }
 
 thumb_opcode th_it(uint16_t cond, uint16_t mask) {
-  printf("Generating IT instruction: cond=%u, mask=0x%x\n", cond, mask);
   return (thumb_opcode){
       .size = 2,
       .opcode = 0xbf00 | (cond << 4) | (mask & 0xf),
