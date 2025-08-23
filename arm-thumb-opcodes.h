@@ -195,7 +195,9 @@ thumb_opcode th_add_sp_imm_t4(uint32_t rd, uint32_t imm, flags_behaviour flags,
                               enforce_encoding encoding);
 thumb_opcode th_add_sp_imm(uint16_t rd, uint32_t imm, flags_behaviour flags,
                            enforce_encoding encoding);
-thumb_opcode th_add_sp_reg(uint16_t rdm);
+thumb_opcode th_add_sp_reg(uint32_t rd, uint32_t rm, flags_behaviour flags,
+                           enforce_encoding encoding, thumb_shift shift);
+
 thumb_opcode th_rsb_imm(uint16_t rd, uint16_t rn, uint32_t imm,
                         flags_behaviour setflags);
 thumb_opcode th_shift_armv7m(uint16_t rd, uint16_t rm, uint32_t imm,

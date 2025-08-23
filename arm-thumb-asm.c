@@ -513,6 +513,8 @@ static void thumb_data_processing_opcode(TCCState *s1, int token) {
     }
 
     if (thumb_operand_is_register(ops[2].type)) {
+      return thumb_emit_opcode(
+          th_add_sp_reg(ops[0].reg, ops[1].reg, ops[2].reg));
     }
   }
   case TOK_ASM_cmpeq: {

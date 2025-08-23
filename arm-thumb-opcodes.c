@@ -1242,11 +1242,15 @@ thumb_opcode th_add_sp_imm(uint16_t rd, uint32_t imm, flags_behaviour flags,
 #endif
 }
 
-thumb_opcode th_add_sp_reg(uint16_t rdm) {
-  return (thumb_opcode){
-      .size = 2,
-      .opcode = 0x4485 | (rdm << 3),
-  };
+thumb_opcode th_add_sp_reg(uint32_t rd, uint32_t rm, flags_behaviour flags,
+                           enforce_encoding encoding, thumb_shift shift) {
+  if (rd == rm && flags != FLAGS_BEHAVIOUR_SET &&
+      encoding != ENFORCE_ENCODING_32BIT) {
+    return (thumb_opcode){
+        .size = 2,
+        .opcode = 0x4485 | (rd << 3),
+    };
+  }
 }
 
 thumb_opcode th_rsb_imm(uint16_t rd, uint16_t rn, uint32_t imm,
