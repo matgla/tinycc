@@ -347,6 +347,44 @@ static int thumb_parse_condition_str(const char *condition_str) {
   return 0xe;
 }
 
+static thumb_shift asm_parse_optional_shift(TCCState *s1) {
+  Operand op;
+  thumb_shift shift = {0, 0};
+  if (tok == TOK_ASM_rrx) {
+    next();
+    return (thumb_shift){
+        .type = THUMB_SHIFT_RRX,
+        .value = 0,
+    };
+  }
+
+  switch (tok) {
+  case TOK_ASM_asl:
+  case TOK_ASM_lsl:
+    shift.type = THUMB_SHIFT_LSL;
+    break;
+  case TOK_ASM_asr:
+    shift.type = THUMB_SHIFT_ASR;
+    break;
+  case TOK_ASM_lsr:
+    shift.type = THUMB_SHIFT_LSR;
+    break;
+  case TOK_ASM_ror:
+    shift.type = THUMB_SHIFT_ROR;
+    break;
+  default:
+    return shift;
+  }
+
+  next();
+  parse_operand(s1, &op);
+  if (op.type != OP_IM32 && op.type != OP_IM8 && op.type != OP_IM8N) {
+    tcc_error("shift operand must be immediate value");
+  }
+  shift.value = op.e.v;
+  return shift;
+}
+
 static void thumb_conditional_opcode(TCCState *s1, int token) {
   int condition = 0;
   int mask = 0;
@@ -381,19 +419,56 @@ static int process_operands(TCCState *s1, int max_operands, Operand *ops) {
   return nb_ops;
 }
 
+static flags_behaviour thumb_determine_flags_behaviour(int token,
+                                                       int token_svariant,
+                                                       bool allow_in_it) {
+  if (THUMB_INSTRUCTION_GROUP(token) == token_svariant) {
+    if (thumb_conditional_scope > 0 && !allow_in_it) {
+      tcc_error("cannot use '%s' in IT block", get_tok_str(token, NULL));
+    }
+    return FLAGS_BEHAVIOUR_SET;
+  }
+  if (thumb_conditional_scope > 0) {
+    return FLAGS_BEHAVIOUR_NOT_IMPORTANT;
+  }
+  return FLAGS_BEHAVIOUR_BLOCK;
+}
+
+static bool thumb_confirm_op_is_imm(int type) {
+  if (type != OP_IM32 && type != OP_IM8 && type != OP_IM8N) {
+    tcc_error("Operand must be immediate");
+    return false;
+  }
+  return true;
+}
+
+static bool thumb_confirm_op_is_reg(int type) {
+  if (type != OP_REG && type != OP_REG32) {
+    tcc_error("Operand must be register");
+    return false;
+  }
+  return true;
+}
+
 static void thumb_data_processing_opcode(TCCState *s1, int token) {
   Operand ops[3];
   int nb_ops;
-  Operand shift = {0};
-  int nb_shift = 0;
   uint32_t operands = 0;
+  thumb_shift shift_info = {0, 0};
 
   nb_ops = process_operands(s1, sizeof(ops) / sizeof(ops[0]), ops);
 
   if (nb_ops < 2) {
     expect("at least two operands");
     return;
+  } else if (nb_ops == 2) {
+    memcpy(&ops[2], &ops[1], sizeof(ops[1]));
+    memcpy(&ops[1], &ops[0],
+           sizeof(ops[0])); // most instructions may have implicit destination
+                            // register
+    nb_ops = 3;
   }
+  shift_info = asm_parse_optional_shift(s1);
 
   if (ops[0].type != OP_REG32) {
     expect("first operand must be a register");
@@ -406,12 +481,34 @@ static void thumb_data_processing_opcode(TCCState *s1, int token) {
   }
 
   switch (THUMB_INSTRUCTION_GROUP(token)) {
+  case TOK_ASM_adcseq:
+  case TOK_ASM_adceq: {
+    setflags = thumb_determine_flags_behaviour(token, TOK_ASM_adcseq, true);
+    switch (ops[2].type) {
+    case OP_IM32:
+    case OP_IM8:
+    case OP_IM8N:
+      return thumb_emit_opcode(
+          th_adc_imm(ops[0].reg, ops[1].reg, ops[2].e.v, setflags));
+    case OP_REG32:
+    case OP_REG:
+      if ((THUMB_INSTRUCTION_GROUP(token) == TOK_ASM_adceq &&
+           thumb_conditional_scope == 0) ||
+          THUMB_HAS_WIDE_QUALIFIER(token)) {
+        encoding = ENFORCE_ENCODING_32BIT;
+      }
+      return thumb_emit_opcode(th_adc_reg(ops[0].reg, ops[1].reg, ops[2].reg,
+                                          setflags, shift_info, encoding));
+    default:
+      tcc_error("got unsupported operand type");
+    }
+  }
   case TOK_ASM_cmpeq: {
-    switch (ops[1].type) {
+    switch (ops[2].type) {
     case OP_IM8:
     case OP_IM32:
     case OP_IM8N:
-      return thumb_emit_opcode(th_cmp_imm(ops[0].reg, ops[1].e.v, encoding));
+      return thumb_emit_opcode(th_cmp_imm(ops[1].reg, ops[2].e.v, encoding));
     default:
       expect("second operand must be an immediate");
     }
@@ -419,33 +516,23 @@ static void thumb_data_processing_opcode(TCCState *s1, int token) {
   case TOK_ASM_movseq:
   case TOK_ASM_movweq:
   case TOK_ASM_moveq: {
-    if (THUMB_INSTRUCTION_GROUP(token) == TOK_ASM_movseq) {
-      if (thumb_conditional_scope > 0) {
-        tcc_error("cannot use 'movs' in IT block");
-      }
-      setflags = FLAGS_BEHAVIOUR_SET;
-    } else {
-      if (thumb_conditional_scope > 0) {
-        setflags = FLAGS_BEHAVIOUR_NOT_IMPORTANT;
-      } else {
-        setflags = FLAGS_BEHAVIOUR_BLOCK;
-      }
-    }
-
+    setflags = thumb_determine_flags_behaviour(token, TOK_ASM_movseq, false);
     if (THUMB_INSTRUCTION_GROUP(token) == TOK_ASM_movweq)
       encoding = ENFORCE_ENCODING_32BIT;
 
-    switch (ops[1].type) {
+    switch (ops[2].type) {
     case OP_IM8:
     case OP_IM32:
     case OP_IM8N:
       return thumb_emit_opcode(
-          th_mov_imm(ops[0].reg, ops[1].e.v, setflags, encoding));
+          th_mov_imm(ops[1].reg, ops[2].e.v, setflags, encoding));
     case OP_REG32:
-      return thumb_emit_opcode(th_mov_reg(ops[0].reg, ops[1].e.v));
+      return thumb_emit_opcode(th_mov_reg(ops[1].reg, ops[2].e.v));
     }
     break;
   }
+  default:
+    tcc_error("unimplemented instruction: %s", get_tok_str(token, NULL));
   }
 }
 
@@ -574,6 +661,8 @@ ST_FUNC void asm_opcode(TCCState *s1, int token) {
   case TOK_ASM_blxeq:
   case TOK_ASM_beq:
     return thumb_branch(s1, token);
+  case TOK_ASM_adceq:
+  case TOK_ASM_adcseq:
   case TOK_ASM_movseq:
   case TOK_ASM_movweq:
   case TOK_ASM_moveq:

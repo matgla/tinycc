@@ -98,6 +98,20 @@ typedef struct thumb_opcode {
   uint32_t opcode;
 } thumb_opcode;
 
+typedef enum thumb_shift_type {
+  THUMB_SHIFT_NONE,
+  THUMB_SHIFT_RRX,
+  THUMB_SHIFT_LSL,
+  THUMB_SHIFT_LSR,
+  THUMB_SHIFT_ASR,
+  THUMB_SHIFT_ROR,
+} thumb_shift_type;
+
+typedef struct thumb_shift {
+  thumb_shift_type type;
+  uint32_t value;
+} thumb_shift;
+
 uint32_t th_packimm_10_11_0(uint32_t imm);
 uint32_t th_pack_const(uint32_t imm);
 uint32_t th_encbranch_b_t3(uint32_t imm);
@@ -138,8 +152,11 @@ thumb_opcode th_xor_reg(uint16_t rd, uint16_t rn, uint16_t rm);
 thumb_opcode th_xor_imm(uint16_t rd, uint16_t rn, uint32_t imm);
 thumb_opcode th_rsb_reg(uint16_t rd, uint16_t rn, uint16_t rm);
 thumb_opcode th_sub_reg(uint16_t rd, uint16_t rn, uint16_t rm);
-thumb_opcode th_adc_reg(uint16_t rd, uint16_t rn, uint16_t rm);
-thumb_opcode th_adc_imm(uint16_t rd, uint16_t rn, uint32_t imm);
+thumb_opcode th_adc_reg(uint16_t rd, uint16_t rn, uint16_t rm,
+                        flags_behaviour flags, thumb_shift shift,
+                        enforce_encoding encoding);
+thumb_opcode th_adc_imm(uint16_t rd, uint16_t rn, uint32_t imm,
+                        flags_behaviour setflags);
 thumb_opcode th_sbc_imm(uint16_t rd, uint16_t rn, uint32_t imm);
 thumb_opcode th_orr_imm(uint16_t rd, uint16_t rn, uint32_t imm);
 thumb_opcode th_sbc_reg(uint16_t rd, uint16_t rn, uint16_t rm);

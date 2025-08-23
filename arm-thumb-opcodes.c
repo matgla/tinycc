@@ -445,8 +445,11 @@ thumb_opcode th_sub_reg(uint16_t rd, uint16_t rn, uint16_t rm) {
   };
 }
 
-thumb_opcode th_adc_reg(uint16_t rd, uint16_t rn, uint16_t rm) {
-  if (rd == rn && rm < 8 && rn < 8) {
+thumb_opcode th_adc_reg(uint16_t rd, uint16_t rn, uint16_t rm,
+                        flags_behaviour flags, thumb_shift shift,
+                        enforce_encoding encoding) {
+  if (rd == rn && rm < 8 && rn < 8 && shift.type == THUMB_SHIFT_NONE &&
+      encoding != ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
         .size = 2,
         .opcode = 0x4140 | (rm << 3) | rd,
@@ -455,9 +458,31 @@ thumb_opcode th_adc_reg(uint16_t rd, uint16_t rn, uint16_t rm) {
 #ifndef TCC_TARGET_ARM_ARCHV6M
   else if (rd != R_SP && rd != R_PC && rn != R_SP && rn != R_PC && rm != R_SP &&
            rm != R_PC) {
+    int s = 0;
+    if (flags == FLAGS_BEHAVIOUR_SET)
+      s = 1;
+    int sr = 0;
+    int imm2 = shift.value & 0x3;
+    int imm3 = (shift.value >> 2) & 0x7;
+    switch (shift.type) {
+    case THUMB_SHIFT_LSL:
+      sr = 0;
+      break;
+    case THUMB_SHIFT_LSR:
+      sr = 1;
+      break;
+    case THUMB_SHIFT_ASR:
+      sr = 2;
+      break;
+    case THUMB_SHIFT_ROR:
+    case THUMB_SHIFT_RRX:
+      sr = 3;
+      break;
+    }
     return (thumb_opcode){
         .size = 4,
-        .opcode = 0xeb400000 | (rn << 16) | (rd << 8) | rm,
+        .opcode = 0xeb400000 | (rn << 16) | (rd << 8) | rm | (sr << 4) |
+                  (imm2 << 6) | (imm3 << 12) | (s << 20),
     };
   }
 #endif
@@ -467,9 +492,10 @@ thumb_opcode th_adc_reg(uint16_t rd, uint16_t rn, uint16_t rm) {
   };
 }
 
-thumb_opcode th_adc_imm(uint16_t rd, uint16_t rn, uint32_t imm) {
+thumb_opcode th_adc_imm(uint16_t rd, uint16_t rn, uint32_t imm,
+                        flags_behaviour setflags) {
   if (rn != R_SP && rn != R_PC && rd != R_SP && rn != R_PC) {
-    return th_generic_op_imm(0xf140, rd, rn, imm);
+    return th_generic_op_imm_with_status(0xf140, rd, rn, imm, setflags);
   }
   return (thumb_opcode){
       .size = 0,

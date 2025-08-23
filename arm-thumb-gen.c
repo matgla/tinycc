@@ -1861,7 +1861,9 @@ void gen_opi_regs(int opc, int c) {
     ot_check(th_add_reg(r, c, fr));
     return;
   case 10:
-    ot_check(th_adc_reg(r, c, fr));
+    ot_check(th_adc_reg(r, c, fr, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                        (thumb_shift){.type = THUMB_SHIFT_NONE},
+                        ENFORCE_ENCODING_NONE));
     return;
   case 12:
     ot_check(th_sbc_reg(r, c, fr));
@@ -1911,7 +1913,7 @@ void gen_opi_regular(int opc, int c) {
       ok = ot(th_add_imm(r, r, vtop->c.i));
       break;
     case 10:
-      ok = ot(th_adc_imm(r, r, vtop->c.i));
+      ok = ot(th_adc_imm(r, r, vtop->c.i, FLAGS_BEHAVIOUR_NOT_IMPORTANT));
       break;
     case 12:
       ok = ot(th_sbc_imm(r, r, vtop->c.i));
