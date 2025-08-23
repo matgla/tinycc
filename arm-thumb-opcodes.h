@@ -7,7 +7,7 @@
  *  Copyright (c) 2020 Erlend J. Sveen
  *  from:
  * https://git.erlendjs.no/erlendjs/tinycc/-/blob/arm-thumb/arm-thumb-gen.c
- *        https://git.erlendjs.no/erlendjs/tinycc/-/blob/arm-thumb/arm-thumb-instructions.c
+ *       https://git.erlendjs.no/erlendjs/tinycc/-/blob/arm-thumb/arm-thumb-instructions.c
  *
  *  And
  *
@@ -82,10 +82,16 @@
 #define R_PC 15
 
 typedef enum {
-  FLAGS_BEHAVIOUR_NOT_IMPORANT = 0,
+  FLAGS_BEHAVIOUR_NOT_IMPORTANT = 0,
   FLAGS_BEHAVIOUR_SET = 1,
   FLAGS_BEHAVIOUR_BLOCK = 2,
 } flags_behaviour;
+
+typedef enum {
+  ENFORCE_ENCODING_NONE = 0,
+  ENFORCE_ENCODING_16BIT = 1,
+  ENFORCE_ENCODING_32BIT = 2,
+} enforce_encoding;
 
 typedef struct thumb_opcode {
   uint8_t size;
@@ -95,6 +101,12 @@ typedef struct thumb_opcode {
 uint32_t th_packimm_10_11_0(uint32_t imm);
 uint32_t th_pack_const(uint32_t imm);
 uint32_t th_encbranch_b_t3(uint32_t imm);
+
+uint32_t th_encbranch(int pos, int addr);
+uint32_t th_encbranch_8(int pos, int addr);
+uint32_t th_encbranch_11(int pos, int addr);
+uint32_t th_encbranch_20(int pos, int addr);
+uint32_t th_encbranch_24(int pos, int addr);
 
 thumb_opcode th_nop();
 
@@ -107,7 +119,9 @@ thumb_opcode th_b_t3(uint32_t op, uint32_t imm);
 thumb_opcode th_b_t4(int32_t imm);
 
 thumb_opcode th_mov_reg(uint16_t rd, uint16_t rm);
-thumb_opcode th_mov_imm(uint16_t rd, uint32_t imm);
+
+thumb_opcode th_mov_imm(uint16_t rd, uint32_t imm, flags_behaviour setflags,
+                        enforce_encoding encoding);
 
 thumb_opcode th_generic_op_imm_with_status(uint16_t op, uint16_t rd,
                                            uint16_t rn, uint32_t imm,
@@ -173,7 +187,7 @@ thumb_opcode th_lsr_imm(uint16_t rd, uint16_t rm, uint32_t imm);
 thumb_opcode th_asr_reg(uint16_t rd, uint16_t rn, uint16_t rm);
 thumb_opcode th_asr_imm(uint16_t rd, uint16_t rm, uint32_t imm);
 
-thumb_opcode th_cmp_imm(uint16_t rm, uint32_t imm);
+thumb_opcode th_cmp_imm(uint16_t rm, uint32_t imm, enforce_encoding encoding);
 
 thumb_opcode th_vpush(uint32_t regs);
 thumb_opcode th_vpop(uint32_t regs);
@@ -193,3 +207,7 @@ thumb_opcode th_vcvt_float_to_double(uint32_t vd, uint32_t vm);
 thumb_opcode th_vcvt_double_to_float(uint32_t vd, uint32_t vm);
 thumb_opcode th_vcvt_fp_int(uint32_t vd, uint32_t vm, uint32_t opc, uint32_t sz,
                             uint32_t op);
+
+thumb_opcode th_it(uint16_t condition, uint16_t mask);
+
+thumb_opcode th_svc(uint32_t imm);

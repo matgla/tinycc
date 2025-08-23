@@ -28,44 +28,6 @@ DEF_ASM(sp) /* alias for r13 */
 DEF_ASM(lr) /* alias for r14 */
 DEF_ASM(pc) /* alias for r15 */
 
-/* coprocessors */
-
-DEF_ASM(p0)
-DEF_ASM(p1)
-DEF_ASM(p2)
-DEF_ASM(p3)
-DEF_ASM(p4)
-DEF_ASM(p5)
-DEF_ASM(p6)
-DEF_ASM(p7)
-DEF_ASM(p8)
-DEF_ASM(p9)
-DEF_ASM(p10)
-DEF_ASM(p11)
-DEF_ASM(p12)
-DEF_ASM(p13)
-DEF_ASM(p14)
-DEF_ASM(p15)
-
-/* coprocessor registers */
-
-DEF_ASM(c0)
-DEF_ASM(c1)
-DEF_ASM(c2)
-DEF_ASM(c3)
-DEF_ASM(c4)
-DEF_ASM(c5)
-DEF_ASM(c6)
-DEF_ASM(c7)
-DEF_ASM(c8)
-DEF_ASM(c9)
-DEF_ASM(c10)
-DEF_ASM(c11)
-DEF_ASM(c12)
-DEF_ASM(c13)
-DEF_ASM(c14)
-DEF_ASM(c15)
-
 /* single-precision VFP registers */
 
 DEF_ASM(s0)
@@ -136,14 +98,39 @@ DEF_ASM(asl)
 
 /* instructions that have no condition code */
 
-DEF_ASM(cdp2)
-DEF_ASM(ldc2)
-DEF_ASM(ldc2l)
-DEF_ASM(stc2)
-DEF_ASM(stc2l)
+/* thumb conditional tokens */
+DEF_ASM(it) // must be first
+DEF_ASM(itt)
+DEF_ASM(ite)
+DEF_ASM(ittt)
+DEF_ASM(itte)
+DEF_ASM(itet)
+DEF_ASM(itee)
+DEF_ASM(itttt)
+DEF_ASM(ittte)
+DEF_ASM(ittet)
+DEF_ASM(ittee)
+DEF_ASM(itett)
+DEF_ASM(itete)
+DEF_ASM(iteet)
+DEF_ASM(iteee) // must be last
 
-#define ARM_INSTRUCTION_GROUP(tok)                                             \
-  ((((tok) - TOK_ASM_nopeq) & 0xFFFFFFF0) + TOK_ASM_nopeq)
+#define THUMB_INSTRUCTION_GROUP(tok)                                           \
+  ((((tok) - TOK_ASM_nopeq) & 0xFFFFFFC0) + TOK_ASM_nopeq)
+
+#define THUMB_HAS_WIDE_QUALIFIER(tok)                                          \
+  ((tok - THUMB_INSTRUCTION_GROUP(tok)) > 0x0f &&                              \
+   (tok - THUMB_INSTRUCTION_GROUP(tok)) <= 0x1f)
+
+#define THUMB_HAS_NARROW_QUALIFIER(tok)                                        \
+  ((tok - THUMB_INSTRUCTION_GROUP(tok)) >= 0x1f &&                             \
+   (tok - THUMB_INSTRUCTION_GROUP(tok)) <= 0x2f)
+
+#define THUMB_IS_CONDITIONAL(tok)                                              \
+  ((tok - THUMB_INSTRUCTION_GROUP(tok)) >= 0x01 &&                             \
+   (tok - THUMB_INSTRUCTION_GROUP(tok)) <= 0x0e)
+
+#define THUMB_GET_CONDITION(tok) ((tok - THUMB_INSTRUCTION_GROUP(tok)) % 16)
 
 /* Note: condition code is 4 bits */
 #define DEF_ASM_CONDED(x)                                                      \
@@ -207,179 +194,27 @@ DEF_ASM(stc2l)
 
 /* Note: add new tokens after nop (MUST always use DEF_ASM_CONDED) */
 
-DEF_ASM_CONDED(nop)
-DEF_ASM_CONDED(wfe)
-DEF_ASM_CONDED(wfi)
-DEF_ASM_CONDED(swi)
-DEF_ASM_CONDED(svc)
+#define DEF_ASM_CONDED_WITH_QUALIFIER(x)                                       \
+  DEF_ASM_CONDED(x)                                                            \ 
+  DEF_ASM_CONDED_WITH_SUFFIX(x, w) DEF_ASM_CONDED_WITH_SUFFIX(x, n)            \
+      DEF_ASM_CONDED_WITH_SUFFIX(x, _) // last just to align to the 6 bits
 
-/* misc */
-DEF_ASM_CONDED(clz)
+DEF_ASM_CONDED_WITH_QUALIFIER(nop)
 
-/* size conversion */
+DEF_ASM_CONDED_WITH_QUALIFIER(mov)
+DEF_ASM_CONDED_WITH_QUALIFIER(movs)
+DEF_ASM_CONDED_WITH_QUALIFIER(movt)
+DEF_ASM_CONDED_WITH_QUALIFIER(movw)
 
-DEF_ASM_CONDED(sxtb)
-DEF_ASM_CONDED(sxth)
-DEF_ASM_CONDED(uxtb)
-DEF_ASM_CONDED(uxth)
-DEF_ASM_CONDED(movt)
-DEF_ASM_CONDED(movw)
+DEF_ASM_CONDED_WITH_QUALIFIER(cmp)
+
+DEF_ASM_CONDED_WITH_QUALIFIER(push)
+DEF_ASM_CONDED_WITH_QUALIFIER(pop)
+DEF_ASM_CONDED_WITH_QUALIFIER(svc)
+
+DEF_ASM_CONDED_WITH_QUALIFIER(b)
+DEF_ASM_CONDED_WITH_QUALIFIER(bl)
+DEF_ASM_CONDED_WITH_QUALIFIER(bx)
+DEF_ASM_CONDED_WITH_QUALIFIER(blx)
 
 /* multiplication */
-
-DEF_ASM_CONDED(mul)
-DEF_ASM_CONDED(muls)
-DEF_ASM_CONDED(mla)
-DEF_ASM_CONDED(mlas)
-DEF_ASM_CONDED(smull)
-DEF_ASM_CONDED(smulls)
-DEF_ASM_CONDED(umull)
-DEF_ASM_CONDED(umulls)
-DEF_ASM_CONDED(smlal)
-DEF_ASM_CONDED(smlals)
-DEF_ASM_CONDED(umlal)
-DEF_ASM_CONDED(umlals)
-
-/* load/store */
-
-DEF_ASM_CONDED(ldr)
-DEF_ASM_CONDED(ldrb)
-DEF_ASM_CONDED(str)
-DEF_ASM_CONDED(strb)
-DEF_ASM_CONDED(ldrex)
-DEF_ASM_CONDED(ldrexb)
-DEF_ASM_CONDED(strex)
-DEF_ASM_CONDED(strexb)
-DEF_ASM_CONDED(ldrh)
-DEF_ASM_CONDED(ldrsh)
-DEF_ASM_CONDED(ldrsb)
-DEF_ASM_CONDED(strh)
-
-DEF_ASM_CONDED(stmda)
-DEF_ASM_CONDED(ldmda)
-DEF_ASM_CONDED(stm)
-DEF_ASM_CONDED(ldm)
-DEF_ASM_CONDED(stmia)
-DEF_ASM_CONDED(ldmia)
-DEF_ASM_CONDED(stmdb)
-DEF_ASM_CONDED(ldmdb)
-DEF_ASM_CONDED(stmib)
-DEF_ASM_CONDED(ldmib)
-
-DEF_ASM_CONDED(ldc)
-DEF_ASM_CONDED(ldcl)
-DEF_ASM_CONDED(stc)
-DEF_ASM_CONDED(stcl)
-
-/* instruction macros */
-
-DEF_ASM_CONDED(push)
-DEF_ASM_CONDED(pop)
-
-/* branches */
-
-DEF_ASM_CONDED(b)
-DEF_ASM_CONDED(bl)
-DEF_ASM_CONDED(bx)
-DEF_ASM_CONDED(blx)
-
-/* data processing instructions; order is important */
-
-DEF_ASM_CONDED(and)
-DEF_ASM_CONDED(ands)
-DEF_ASM_CONDED(eor)
-DEF_ASM_CONDED(eors)
-DEF_ASM_CONDED(sub)
-DEF_ASM_CONDED(subs)
-DEF_ASM_CONDED(rsb)
-DEF_ASM_CONDED(rsbs)
-DEF_ASM_CONDED(add)
-DEF_ASM_CONDED(adds)
-DEF_ASM_CONDED(adc)
-DEF_ASM_CONDED(adcs)
-DEF_ASM_CONDED(sbc)
-DEF_ASM_CONDED(sbcs)
-DEF_ASM_CONDED(rsc)
-DEF_ASM_CONDED(rscs)
-DEF_ASM_CONDED(tst)
-DEF_ASM_CONDED(tsts) // necessary here--but not useful to the user
-DEF_ASM_CONDED(teq)
-DEF_ASM_CONDED(teqs) // necessary here--but not useful to the user
-DEF_ASM_CONDED(cmp)
-DEF_ASM_CONDED(cmps) // necessary here--but not useful to the user
-DEF_ASM_CONDED(cmn)
-DEF_ASM_CONDED(cmns) // necessary here--but not useful to the user
-DEF_ASM_CONDED(orr)
-DEF_ASM_CONDED(orrs)
-DEF_ASM_CONDED(mov)
-DEF_ASM_CONDED(movm)
-DEF_ASM_CONDED(movs)
-DEF_ASM_CONDED(bic)
-DEF_ASM_CONDED(bics)
-DEF_ASM_CONDED(mvn)
-DEF_ASM_CONDED(mvns)
-
-DEF_ASM_CONDED(lsl)
-DEF_ASM_CONDED(lsls)
-DEF_ASM_CONDED(lsr)
-DEF_ASM_CONDED(lsrs)
-DEF_ASM_CONDED(asr)
-DEF_ASM_CONDED(asrs)
-DEF_ASM_CONDED(ror)
-DEF_ASM_CONDED(rors)
-DEF_ASM_CONDED(rrx)
-DEF_ASM_CONDED(rrxs)
-
-DEF_ASM_CONDED(cdp)
-DEF_ASM_CONDED(mcr)
-DEF_ASM_CONDED(mrc)
-
-// Floating point high-level instructions
-
-DEF_ASM_CONDED(vldr)
-DEF_ASM_CONDED(vstr)
-
-DEF_ASM_CONDED_VFP_F32_F64(vmla)
-DEF_ASM_CONDED_VFP_F32_F64(vmls)
-DEF_ASM_CONDED_VFP_F32_F64(vnmls)
-DEF_ASM_CONDED_VFP_F32_F64(vnmla)
-DEF_ASM_CONDED_VFP_F32_F64(vmul)
-DEF_ASM_CONDED_VFP_F32_F64(vnmul)
-DEF_ASM_CONDED_VFP_F32_F64(vadd)
-DEF_ASM_CONDED_VFP_F32_F64(vsub)
-DEF_ASM_CONDED_VFP_F32_F64(vdiv)
-DEF_ASM_CONDED_VFP_F32_F64(vneg)
-DEF_ASM_CONDED_VFP_F32_F64(vabs)
-DEF_ASM_CONDED_VFP_F32_F64(vsqrt)
-DEF_ASM_CONDED_VFP_F32_F64(vcmp)
-DEF_ASM_CONDED_VFP_F32_F64(vcmpe)
-DEF_ASM_CONDED_VFP_F32_F64(vmov)
-
-DEF_ASM_CONDED_WITH_TWO_SUFFIXES(vcvtr, s32, f64)
-DEF_ASM_CONDED_WITH_TWO_SUFFIXES(vcvtr, s32, f32)
-DEF_ASM_CONDED_WITH_TWO_SUFFIXES(vcvtr, u32, f64)
-DEF_ASM_CONDED_WITH_TWO_SUFFIXES(vcvtr, u32, f32)
-
-DEF_ASM_CONDED_WITH_TWO_SUFFIXES(vcvt, s32, f64)
-DEF_ASM_CONDED_WITH_TWO_SUFFIXES(vcvt, s32, f32)
-DEF_ASM_CONDED_WITH_TWO_SUFFIXES(vcvt, u32, f64)
-DEF_ASM_CONDED_WITH_TWO_SUFFIXES(vcvt, u32, f32)
-
-DEF_ASM_CONDED_WITH_TWO_SUFFIXES(vcvt, f64, s32)
-DEF_ASM_CONDED_WITH_TWO_SUFFIXES(vcvt, f32, s32)
-DEF_ASM_CONDED_WITH_TWO_SUFFIXES(vcvt, f64, u32)
-DEF_ASM_CONDED_WITH_TWO_SUFFIXES(vcvt, f32, u32)
-
-DEF_ASM_CONDED_WITH_TWO_SUFFIXES(vcvt, f64, f32)
-DEF_ASM_CONDED_WITH_TWO_SUFFIXES(vcvt, f32, f64)
-
-DEF_ASM_CONDED(vpush)
-DEF_ASM_CONDED(vpop)
-DEF_ASM_CONDED(vldm)
-DEF_ASM_CONDED(vldmia)
-DEF_ASM_CONDED(vldmdb)
-DEF_ASM_CONDED(vstm)
-DEF_ASM_CONDED(vstmia)
-DEF_ASM_CONDED(vstmdb)
-DEF_ASM_CONDED(vmsr)
-DEF_ASM_CONDED(vmrs)

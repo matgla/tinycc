@@ -389,6 +389,7 @@ extern long double strtold(const char *__nptr, char **__endptr);
 #include "arm-thumb-asm.c"
 #include "arm-thumb-gen.c"
 #elif defined TCC_TARGET_ARM
+#error "dupa"
 #include "arm-asm.c"
 #include "arm-gen.c"
 #include "arm-link.c"

@@ -573,35 +573,10 @@ int decbranch(int pos) {
   return xa;
 }
 
-static uint32_t th_encbranch(int pos, int addr) {
-  TRACE("th_encbranch pos: 0x%x, addr: 0x%x", pos, addr);
-  return addr - pos - 4;
+static thumb_opcode th_generic_mov_imm(uint32_t r, uint32_t imm) {
+  return th_mov_imm(r, imm, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                    ENFORCE_ENCODING_NONE);
 }
-
-static uint32_t th_encbranch_8(int pos, int addr) {
-  addr = (addr - pos - 4) / 2;
-  if (addr >= 127 || addr < -128) {
-    tcc_error("compiler_error: th_encbranch_8 too far address: %i\n", addr);
-    return 0;
-  }
-  return addr & 0xff;
-}
-
-static uint32_t th_encbranch_11(int pos, int addr) {
-  addr = (addr - pos - 4) / 2;
-  if (addr >= 1023 || addr < -1024) {
-    tcc_error("compiler_error: th_encbranch_11 too far address: %i\n", addr);
-    return 0;
-  }
-  return addr & 0x7ff;
-}
-
-static uint32_t th_encbranch_20(int pos, int addr) {
-  addr = (addr - pos - 4) / 2;
-  TRACE("th_encbranch_20 pos %x addr %x\n", pos, addr);
-  return addr;
-}
-
 int th_offset_to_reg(int off, int sign) {
   // we will crash if there is no reg available
   // int rr = get_reg(RC_INT);
@@ -609,13 +584,13 @@ int th_offset_to_reg(int off, int sign) {
       R_LR; // can I use R_LR here? lr should be already saved in proluge right?
 
   // if mov is not possible then load from data
-  if (!ot(th_mov_imm(rr, off))) {
+  if (!ot(th_generic_mov_imm(rr, off))) {
     load_full_const(rr, sign ? -off : off, NULL);
     return rr;
   }
 
   if (sign)
-    ot_check(th_rsb_imm(rr, rr, 0, FLAGS_BEHAVIOUR_NOT_IMPORANT));
+    ot_check(th_rsb_imm(rr, rr, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT));
   return rr;
 }
 
@@ -1532,7 +1507,7 @@ void load_vt_const(int r, SValue *sv) {
   if (sv->r & VT_SYM) {
     load_full_const(r, sv->c.i, sv->sym);
   } else {
-    if (!ot(th_mov_imm(r, sv->c.i)))
+    if (!ot(th_generic_mov_imm(r, sv->c.i)))
       load_full_const(r, sv->c.i, 0);
   }
 }
@@ -1557,8 +1532,8 @@ void load_vt_cmp(int r, SValue *sv) {
 
   // it block
   o(0xbf00 | (firstcond << 4) | 0x4 | ((~firstcond & 1) << 3));
-  ot_check(th_mov_imm(rr, 1));
-  ot_check(th_mov_imm(rr, 0));
+  ot_check(th_generic_mov_imm(rr, 1));
+  ot_check(th_generic_mov_imm(rr, 0));
 }
 
 void load_vt_jmp_jmpi(int r, SValue *sv) {
@@ -1567,10 +1542,10 @@ void load_vt_jmp_jmpi(int r, SValue *sv) {
     tcc_error("compiler_error: implement load_vt_jmp_jmpi for armv6m\n");
   }
 #endif
-  ot_check(th_mov_imm(intr(r), sv->r & 1));
+  ot_check(th_generic_mov_imm(intr(r), sv->r & 1));
   ot_check(th_b_t4(2));
   gsym(sv->c.i);
-  ot_check(th_mov_imm(intr(r), (sv->r ^ 1) & 1));
+  ot_check(th_generic_mov_imm(intr(r), (sv->r ^ 1) & 1));
 }
 
 // load value from stack to register
@@ -1945,7 +1920,7 @@ void gen_opi_regular(int opc, int c) {
       ok = 0;
       break;
     case 21:
-      ok = ot(th_cmp_imm(c, vtop->c.i));
+      ok = ot(th_cmp_imm(c, vtop->c.i, ENFORCE_ENCODING_NONE));
       break;
     case 24:
       ok = ot(th_orr_imm(r, r, vtop->c.i));
