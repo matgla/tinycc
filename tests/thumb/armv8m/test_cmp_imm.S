@@ -1,6 +1,9 @@
 .syntax unified
 .thumb
 
+.global _start 
+_start:
+
 .global test_cmp_imm
 test_cmp_imm:
     cmp r0, #10

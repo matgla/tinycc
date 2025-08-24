@@ -56,6 +56,13 @@ uint32_t th_packimm_10_11_0(uint32_t imm) {
   return (s << 26) | (imm10 << 16) | (j1 << 13) | (j2 << 11) | imm11;
 }
 
+uint32_t th_packimm_3_8_1(uint32_t imm) {
+  const uint32_t imm8 = imm & 0xff;
+  const uint32_t imm3 = (imm >> 8) & 0x7;
+  const uint32_t i = (imm >> 9) & 1;
+  return (i << 26) | (imm3 << 12) | imm8;
+}
+
 uint32_t th_pack_const(uint32_t imm) {
   // 00000000 00000000 00000000 abcdefgh
   if ((imm & 0xffffff00) == 0) {
@@ -293,49 +300,36 @@ thumb_opcode th_generic_op_imm(uint16_t op, uint16_t rd, uint16_t rn,
                                        FLAGS_BEHAVIOUR_NOT_IMPORTANT);
 }
 
-thumb_opcode th_add_reg(uint16_t rd, uint16_t rn, uint16_t rm) {
+thumb_opcode th_add_reg(uint16_t rd, uint16_t rn, uint16_t rm,
+                        flags_behaviour flags, thumb_shift shift,
+                        enforce_encoding encoding) {
   if ((rd == R_PC) && (rm == R_PC)) {
     tcc_error("compiler_error: 'th_add_reg', PC can't be used as rdn and rm\n");
   }
-  if (rd == rn) {
-    // T2
-    const uint16_t DN = (rd >> 3) & 1;
-    return (thumb_opcode){
-        .size = 2,
-        .opcode = 0x4400 | (DN << 7) | ((rm & 0xf) << 3) | (rd & 0x7),
-    };
-  } else if (rm < 8 && rd < 8 && rn < 8) {
+  if (rm < 8 && rd < 8 && rn < 8 && encoding != ENFORCE_ENCODING_32BIT &&
+      shift.type == THUMB_SHIFT_NONE) {
     // T1
     return (thumb_opcode){
         .size = 2,
         .opcode = 0x1800 | (rm << 6) | (rn << 3) | (rd),
     };
   }
-#ifndef TCC_TARGET_ARM_ARCHV6M
-  else {
-    return (thumb_opcode){
-        .size = 4,
-        .opcode = (0xeb00 | rn) << 16 | (rd << 8) | (1 << 20) | rm,
 
-    };
-  }
-#endif
-  return (thumb_opcode){
-      .size = 0,
-      .opcode = 0,
-  };
-}
-
-thumb_opcode th_add_imm(uint16_t rd, uint16_t rn, uint32_t imm) {
-  if (rd == rn && rd < 8 && imm <= 255) {
+  if (rd == rn && flags != FLAGS_BEHAVIOUR_SET &&
+      encoding != ENFORCE_ENCODING_32BIT && shift.type == THUMB_SHIFT_NONE) {
+    // T2
+    const uint16_t DN = (rd >> 3) & 1;
     return (thumb_opcode){
         .size = 2,
-        .opcode = (0x3000 | (rd << 8) | imm),
+        .opcode = 0x4400 | (DN << 7) | ((rm & 0xf) << 3) | (rd & 0x7),
     };
   }
-#ifndef TCC_TARGET_ARM_ARCHV6M
-  else if (rn != R_SP && rn != R_PC && rd != R_PC && rd != R_SP &&
-           imm <= 4095) {
+
+  return th_generic_op_reg_shift_with_status(0xeb00, rd, rn, rm, flags, shift);
+}
+
+thumb_opcode th_add_imm_t4(uint32_t rd, uint32_t rn, uint32_t imm) {
+  if (imm <= 4095) {
     const uint16_t i = (imm >> 11) & 1;
     const uint32_t imm3 = (imm >> 8) & 7;
     uint32_t op = (0xf200 | (i << 10) | rn) << 16;
@@ -344,16 +338,70 @@ thumb_opcode th_add_imm(uint16_t rd, uint16_t rn, uint32_t imm) {
         .size = 4,
         .opcode = op,
     };
-  } else if (rd != R_SP && rn != R_PC) {
-    return th_generic_op_imm(0xf100, rd, rn, imm);
   }
-#endif
   return (thumb_opcode){
       .size = 0,
       .opcode = 0,
   };
 }
 
+thumb_opcode th_add_imm(uint16_t rd, uint16_t rn, uint32_t imm,
+                        flags_behaviour flags, enforce_encoding encoding) {
+  thumb_opcode op = {0, 0};
+  if (rd == rn && rd < 8 && imm <= 255 && encoding != ENFORCE_ENCODING_32BIT) {
+    return (thumb_opcode){
+        .size = 2,
+        .opcode = (0x3000 | (rd << 8) | imm),
+    };
+  }
+
+  if (imm <= 7 && encoding != ENFORCE_ENCODING_32BIT) {
+    return (thumb_opcode){
+        .size = 2,
+        .opcode = (0x1c00 | (imm << 6) | (rn << 3) | rd),
+    };
+  }
+
+  op = th_generic_op_imm_with_status(0xf100, rd, rn, imm, flags);
+  if (op.size != 0)
+    return op;
+  if (imm <= 4095 && encoding != ENFORCE_ENCODING_16BIT &&
+      flags != FLAGS_BEHAVIOUR_SET) {
+    return th_add_imm_t4(rd, rn, imm);
+  }
+  return op;
+}
+
+thumb_opcode th_adr_imm(uint32_t rd, int imm, enforce_encoding encoding) {
+  printf("th_adr_imm rd: %u imm: %d encoding: %d\n", rd, imm, encoding);
+  if (imm <= 1020 && imm >= 0 && encoding != ENFORCE_ENCODING_32BIT &&
+      imm % 4 == 0) {
+    return (thumb_opcode){
+        .size = 2,
+        .opcode = 0xA000 | (rd << 8) | (imm >> 2),
+    };
+  }
+
+  if (imm >= 0 && imm <= 4095) {
+    return (thumb_opcode){
+        .size = 4,
+        .opcode = 0xf20f0000 | (rd << 8) | th_packimm_3_8_1(imm),
+    };
+  }
+
+  if (imm < 0 && imm >= -4096) {
+    imm = -imm;
+    return (thumb_opcode){
+        .size = 4,
+        .opcode = 0xf2af0000 | (rd << 8) | th_packimm_3_8_1(imm),
+    };
+  }
+
+  return (thumb_opcode){
+      .size = 0,
+      .opcode = 0,
+  };
+}
 thumb_opcode th_bic_imm(uint16_t rd, uint16_t rn, uint32_t imm) {
 #ifndef TCC_TARGET_ARM_ARCHV6M
   if (rd != R_SP && rd != R_PC && rn != R_SP && rd != R_PC) {
@@ -460,6 +508,24 @@ thumb_opcode th_sub_reg(uint16_t rd, uint16_t rn, uint16_t rm) {
   };
 }
 
+thumb_opcode th_generic_op_reg_shift_with_status(uint32_t op, uint32_t rd,
+                                                 uint32_t rn, uint32_t rm,
+                                                 flags_behaviour flags,
+                                                 thumb_shift shift) {
+  int s = 0;
+  if (flags == FLAGS_BEHAVIOUR_SET)
+    s = 1;
+  int sr = thumb_get_sr_value(shift.type);
+  int imm2 = shift.value & 0x3;
+  int imm3 = (shift.value >> 2) & 0x7;
+
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = (op << 16) | (rn << 16) | (rd << 8) | rm | (sr << 4) |
+                (imm2 << 6) | (imm3 << 12) | (s << 20),
+  };
+}
+
 thumb_opcode th_adc_reg(uint16_t rd, uint16_t rn, uint16_t rm,
                         flags_behaviour flags, thumb_shift shift,
                         enforce_encoding encoding) {
@@ -470,27 +536,8 @@ thumb_opcode th_adc_reg(uint16_t rd, uint16_t rn, uint16_t rm,
         .opcode = 0x4140 | (rm << 3) | rd,
     };
   }
-#ifndef TCC_TARGET_ARM_ARCHV6M
-  else if (rd != R_SP && rd != R_PC && rn != R_SP && rn != R_PC && rm != R_SP &&
-           rm != R_PC) {
-    int s = 0;
-    if (flags == FLAGS_BEHAVIOUR_SET)
-      s = 1;
-    int sr = thumb_get_sr_value(shift.type);
-    int imm2 = shift.value & 0x3;
-    int imm3 = (shift.value >> 2) & 0x7;
 
-    return (thumb_opcode){
-        .size = 4,
-        .opcode = 0xeb400000 | (rn << 16) | (rd << 8) | rm | (sr << 4) |
-                  (imm2 << 6) | (imm3 << 12) | (s << 20),
-    };
-  }
-#endif
-  return (thumb_opcode){
-      .size = 0,
-      .opcode = 0,
-  };
+  return th_generic_op_reg_shift_with_status(0xeb40, rd, rn, rm, flags, shift);
 }
 
 thumb_opcode th_adc_imm(uint16_t rd, uint16_t rn, uint32_t imm,

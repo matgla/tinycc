@@ -11,6 +11,15 @@ def test_add_sp_imm():
 
 def test_add_sp_reg():
     utils.perform_test_for_file("test_add_sp_reg.S")
+    
+def test_add_reg():
+    utils.perform_test_for_file("test_add_reg.S")
+
+def test_add_imm():
+    utils.perform_test_for_file("test_add_imm.S")
+    
+def test_adr():
+    utils.perform_test_for_file("test_adr.S")
 
 def test_mov_imm():
     utils.perform_test_for_file("test_mov_imm.S")

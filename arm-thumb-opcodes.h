@@ -115,6 +115,8 @@ typedef struct thumb_shift {
 #define THUMB_SHIFT_DEFAULT (thumb_shift){.type = THUMB_SHIFT_NONE, .value = 0}
 
 uint32_t th_packimm_10_11_0(uint32_t imm);
+uint32_t th_packimm_3_8_1(uint32_t imm);
+
 uint32_t th_pack_const(uint32_t imm);
 uint32_t th_encbranch_b_t3(uint32_t imm);
 
@@ -145,8 +147,22 @@ thumb_opcode th_generic_op_imm_with_status(uint16_t op, uint16_t rd,
 thumb_opcode th_generic_op_imm(uint16_t op, uint16_t rd, uint16_t rn,
                                uint32_t imm);
 
-thumb_opcode th_add_reg(uint16_t rd, uint16_t rn, uint16_t rm);
-thumb_opcode th_add_imm(uint16_t rd, uint16_t rn, uint32_t imm);
+thumb_opcode th_generic_op_reg_shift_with_status(uint32_t op, uint32_t rd,
+                                                 uint32_t rn, uint32_t rm,
+                                                 flags_behaviour setflags,
+                                                 thumb_shift shift);
+
+thumb_opcode th_add_reg(uint16_t rd, uint16_t rn, uint16_t rm,
+                        flags_behaviour flags, thumb_shift shift,
+                        enforce_encoding encoding);
+
+thumb_opcode th_add_imm_t4(uint32_t rd, uint32_t rn, uint32_t imm);
+
+thumb_opcode th_add_imm(uint16_t rd, uint16_t rn, uint32_t imm,
+                        flags_behaviour flags, enforce_encoding encoding);
+
+thumb_opcode th_adr_imm(uint32_t rd, int imm, enforce_encoding encoding);
+
 thumb_opcode th_bic_imm(uint16_t rd, uint16_t rn, uint32_t imm);
 thumb_opcode th_and_imm(uint16_t rd, uint16_t rn, uint32_t imm);
 thumb_opcode th_and_reg(uint16_t rd, uint16_t rn, uint16_t rm);

@@ -200,13 +200,11 @@ static void asm_expr_unary(TCCState *s1, ExprValue *pe) {
       sym = get_asm_sym(tok, NULL);
       esym = elfsym(sym);
       if (esym && esym->st_shndx == SHN_ABS) {
-        printf("SNH_ABS symbol in asm expression\n");
         /* if absolute symbol, no need to put a symbol value */
         pe->v = esym->st_value;
         pe->sym = NULL;
         pe->pcrel = 0;
       } else {
-        printf("non SNH_ABS symbol in asm expression\n");
         pe->v = 0;
         pe->sym = sym;
         pe->pcrel = 0;

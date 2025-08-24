@@ -1094,6 +1094,11 @@ static void relocate_section(TCCState *s1, Section *s, Section *sr) {
 #if SHT_RELX == SHT_RELA
     tgt += rel->r_addend;
 #endif
+    printf("relocate_section: sym_index=%d type=%d sym_name=%s sym_value=0x%lx "
+           "shndx=%d section=%s r_offset=0x%lx\n",
+           sym_index, type, (char *)symtab_section->link->data + sym->st_name,
+           (unsigned long)tgt, sym->st_shndx, s->name,
+           (unsigned long)rel->r_offset);
     if (is_dwarf && type == R_DATA_32DW && sym->st_shndx >= s1->dwlo &&
         sym->st_shndx < s1->dwhi) {
       /* dwarf section relocation to each other */

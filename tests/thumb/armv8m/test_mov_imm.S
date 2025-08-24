@@ -1,6 +1,9 @@
 .syntax unified
 .thumb
 
+.global _start 
+_start:
+
 .global test_mov_imm
 test_mov_imm:
 // T1: movs Rd, #imm8 (16-bit)

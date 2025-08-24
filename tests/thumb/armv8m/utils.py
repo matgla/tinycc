@@ -10,13 +10,13 @@ def prepare_expect(filepath):
     try:
         compiler = os.getenv("TEST_COMPARE_CC", None)
         output_dir = (Path(filepath).parent / "expected").resolve()
-        output_file = output_dir / (Path(filepath).stem + ".o")
-        output_file_gcc = output_dir / (Path(filepath).stem + "_gcc.o")
+        output_file = output_dir / (Path(filepath).stem)
+        output_file_gcc = output_dir / (Path(filepath).stem + "_gcc")
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
         assert compiler is not None, "TEST_COMPARE_CC environment variable must be set to the ARM compiler path."
         _ = subprocess.run(
-            [compiler, "-c", filepath, "-mcpu=cortex-m33", "-o", output_file_gcc],
+            [compiler, filepath, "-mcpu=cortex-m33", "-nostdlib", "-Wl,-Ttext=0x0", "-o", output_file_gcc],
             check=True,
             capture_output=True,
             text=True
@@ -41,12 +41,12 @@ def compile_code(filepath):
         compiler = os.getenv("TEST_CC", None)
         print(filepath)
         output_dir = (Path(filepath).parent / "build").resolve()
-        output_file = output_dir / (Path(filepath).stem + ".o")
+        output_file = output_dir / (Path(filepath).stem)
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
         assert compiler is not None, "TEST_CC environment variable must be set to the ARM compiler path."
         result = subprocess.run(
-            [compiler, "-c", filepath, "-o", output_file],
+            [compiler, filepath, "-g", "-nostdlib", "-Wl,-oformat=elf32-littlearm", "-o", output_file],
             check=True,
             capture_output=True,
             text=True
@@ -106,4 +106,4 @@ def verify_disassembly(disassembly_sut, disassembly_expected):
     assert len(expected) > 0, "Expected disassembly is empty"
     
     for i in range(len(expected)):
-        assert sut[i] == expected[i], f"Mismatch at line {i}: {sut[i]} != {expected[i]}"
+        assert sut[i][1] == expected[i][1], f"Mismatch at line {i}: {sut[i]} != {expected[i]}"

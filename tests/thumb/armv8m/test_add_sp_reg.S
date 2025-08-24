@@ -1,6 +1,9 @@
 .syntax unified
 .thumb
 
+.global _start 
+_start:
+
 .global test_add_sp_reg
 test_add_sp_reg:
    add r0, sp, r0

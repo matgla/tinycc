@@ -1410,20 +1410,26 @@ static void load_full_const(int r, int32_t imm, struct Sym *sym) {
     if (sym) {
       if (text_and_data_separation) {
         if (sym->type.t & VT_STATIC && sym_off != cur_text_section->sh_num) {
-          ot_check(th_add_reg(r, r, R9));
+          ot_check(th_add_reg(r, r, R9, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                              THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
         } else {
-          ot_check(th_add_reg(r, r, R9));
+          ot_check(th_add_reg(r, r, R9, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                              THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
           ot_check(th_ldr_imm(r, r, 0, 6));
-          ot_check(th_add_imm(r, r, imm));
+          ot_check(th_add_imm(r, r, imm, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                              ENFORCE_ENCODING_NONE));
         }
       } else {
         if (sym->type.t & VT_STATIC) {
-          ot_check(th_add_reg(r, r, R_PC));
+          ot_check(th_add_reg(r, r, R_PC, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                              THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
           ot_check(th_sub_imm(r, r, 8));
         } else {
-          ot_check(th_add_reg(r, r, R_PC));
+          ot_check(th_add_reg(r, r, R_PC, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                              THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
           ot_check(th_ldr_imm(r, r, 4, 6));
-          ot_check(th_add_imm(r, r, imm));
+          ot_check(th_add_imm(r, r, imm, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                              ENFORCE_ENCODING_NONE));
         }
       }
     }
@@ -1523,7 +1529,8 @@ void load_vt_local(int r, SValue *sv) {
   TRACE("'load_vt_local' r: %d, off: %x", r, sv->c.i);
   if (sv->r & VT_SYM || (-sv->c.i) >= 0xfff) {
     load_full_const(r, sv->c.i, sv->r & VT_SYM ? sv->sym : 0);
-    ot_check(th_add_reg(r, R_FP, r));
+    ot_check(th_add_reg(r, R_FP, r, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                        THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
   } else {
     ot_check(th_sub_imm(r, R_FP, -sv->c.i));
   }
@@ -1865,12 +1872,12 @@ void gen_opi_regs(int opc, int c) {
     return;
   case 8:
   case 9:
-    ot_check(th_add_reg(r, c, fr));
+    ot_check(th_add_reg(r, c, fr, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                        THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     return;
   case 10:
     ot_check(th_adc_reg(r, c, fr, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                        (thumb_shift){.type = THUMB_SHIFT_NONE},
-                        ENFORCE_ENCODING_NONE));
+                        THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     return;
   case 12:
     ot_check(th_sbc_reg(r, c, fr));
@@ -1917,7 +1924,8 @@ void gen_opi_regular(int opc, int c) {
       break;
     case 8:
     case 9:
-      ok = ot(th_add_imm(r, r, vtop->c.i));
+      ok = ot(th_add_imm(r, r, vtop->c.i, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                         ENFORCE_ENCODING_NONE));
       break;
     case 10:
       ok = ot(th_adc_imm(r, r, vtop->c.i, FLAGS_BEHAVIOUR_NOT_IMPORTANT));
