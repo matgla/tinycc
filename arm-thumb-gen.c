@@ -935,7 +935,8 @@ void gfunc_prolog(Sym *func_sym) {
     ot_check(th_nop());
   }
   ot_check(th_ldr_literal(R_LR, 4, 1));
-  ot_check(th_add_sp_reg(R_LR));
+  ot_check(th_add_sp_reg(R_LR, R_LR, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                         ENFORCE_ENCODING_NONE, THUMB_SHIFT_DEFAULT));
   ot_check(th_b_t2(2));
 
   func_sub_sp_offset = ind;
@@ -1084,7 +1085,8 @@ void gfunc_epilog(void) {
     if (!ot(th_add_sp_imm(R_SP, diff, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
                           ENFORCE_ENCODING_NONE))) {
       int rr = th_offset_to_reg(diff, 0);
-      ot_check(th_add_sp_reg(rr));
+      ot_check(th_add_sp_reg(rr, rr, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                             ENFORCE_ENCODING_NONE, THUMB_SHIFT_DEFAULT));
       ot_check(th_mov_reg(R_SP, rr));
     }
   }

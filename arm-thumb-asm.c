@@ -449,7 +449,7 @@ static void thumb_data_processing_opcode(TCCState *s1, int token) {
   Operand ops[3];
   int nb_ops;
   uint32_t operands = 0;
-  thumb_shift shift_info = {0, 0};
+  thumb_shift shift = {0, 0};
 
   nb_ops = process_operands(s1, sizeof(ops) / sizeof(ops[0]), ops);
 
@@ -457,13 +457,14 @@ static void thumb_data_processing_opcode(TCCState *s1, int token) {
     expect("at least two operands");
     return;
   } else if (nb_ops == 2) {
+    printf("r[0]=%u, r[1]=%u\n", ops[0].reg, ops[1].reg);
     memcpy(&ops[2], &ops[1], sizeof(ops[1]));
     memcpy(&ops[1], &ops[0],
            sizeof(ops[0])); // most instructions may have implicit destination
                             // register
     nb_ops = 3;
   }
-  shift_info = asm_parse_optional_shift(s1);
+  shift = asm_parse_optional_shift(s1);
 
   if (ops[0].type != OP_REG32) {
     expect("first operand must be a register");
@@ -490,8 +491,9 @@ static void thumb_data_processing_opcode(TCCState *s1, int token) {
         encoding = ENFORCE_ENCODING_32BIT;
       }
       return thumb_emit_opcode(th_adc_reg(ops[0].reg, ops[1].reg, ops[2].reg,
-                                          setflags, shift_info, encoding));
+                                          setflags, shift, encoding));
     }
+    break;
   }
   case TOK_ASM_addseq:
   case TOK_ASM_addeq:
@@ -513,9 +515,14 @@ static void thumb_data_processing_opcode(TCCState *s1, int token) {
     }
 
     if (thumb_operand_is_register(ops[2].type)) {
-      return thumb_emit_opcode(
-          th_add_sp_reg(ops[0].reg, ops[1].reg, ops[2].reg));
+      if (ops[1].reg == R_SP) {
+        printf("r[0]=%u, r[1]=%u, r[2]=%u\n", ops[0].reg, ops[1].reg,
+               ops[2].reg);
+        return thumb_emit_opcode(
+            th_add_sp_reg(ops[0].reg, ops[2].reg, setflags, encoding, shift));
+      }
     }
+    break;
   }
   case TOK_ASM_cmpeq: {
     switch (ops[2].type) {

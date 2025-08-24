@@ -112,6 +112,8 @@ typedef struct thumb_shift {
   uint32_t value;
 } thumb_shift;
 
+#define THUMB_SHIFT_DEFAULT (thumb_shift){.type = THUMB_SHIFT_NONE, .value = 0}
+
 uint32_t th_packimm_10_11_0(uint32_t imm);
 uint32_t th_pack_const(uint32_t imm);
 uint32_t th_encbranch_b_t3(uint32_t imm);

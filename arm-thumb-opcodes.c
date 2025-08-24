@@ -91,6 +91,22 @@ uint32_t th_pack_const(uint32_t imm) {
   return 0;
 }
 
+uint32_t thumb_get_sr_value(int type) {
+  switch (type) {
+  case THUMB_SHIFT_LSL:
+    return 0;
+  case THUMB_SHIFT_LSR:
+    return 1;
+  case THUMB_SHIFT_ASR:
+    return 2;
+    break;
+  case THUMB_SHIFT_ROR:
+  case THUMB_SHIFT_RRX:
+    return 3;
+  }
+  return 0;
+}
+
 uint32_t th_encbranch_b_t3(uint32_t imm) {
   const uint32_t s = (imm >> 19) & 1;
   const uint32_t imm6 = (imm >> 11) & 0x3f;
@@ -460,24 +476,10 @@ thumb_opcode th_adc_reg(uint16_t rd, uint16_t rn, uint16_t rm,
     int s = 0;
     if (flags == FLAGS_BEHAVIOUR_SET)
       s = 1;
-    int sr = 0;
+    int sr = thumb_get_sr_value(shift.type);
     int imm2 = shift.value & 0x3;
     int imm3 = (shift.value >> 2) & 0x7;
-    switch (shift.type) {
-    case THUMB_SHIFT_LSL:
-      sr = 0;
-      break;
-    case THUMB_SHIFT_LSR:
-      sr = 1;
-      break;
-    case THUMB_SHIFT_ASR:
-      sr = 2;
-      break;
-    case THUMB_SHIFT_ROR:
-    case THUMB_SHIFT_RRX:
-      sr = 3;
-      break;
-    }
+
     return (thumb_opcode){
         .size = 4,
         .opcode = 0xeb400000 | (rn << 16) | (rd << 8) | rm | (sr << 4) |
@@ -1202,8 +1204,6 @@ thumb_opcode th_add_sp_imm_t4(uint32_t rd, uint32_t imm, flags_behaviour flags,
 
 thumb_opcode th_add_sp_imm(uint16_t rd, uint32_t imm, flags_behaviour flags,
                            enforce_encoding encoding) {
-  printf("rd: %d, imm: %d, flags: %d, encoding: %d\n", rd, imm, flags,
-         encoding);
   // T1 on all armv-m
   if (rd < 8 && imm <= 1020 && !(imm & 0x3) && (flags != FLAGS_BEHAVIOUR_SET) &&
       (encoding != ENFORCE_ENCODING_32BIT)) {
@@ -1244,11 +1244,36 @@ thumb_opcode th_add_sp_imm(uint16_t rd, uint32_t imm, flags_behaviour flags,
 
 thumb_opcode th_add_sp_reg(uint32_t rd, uint32_t rm, flags_behaviour flags,
                            enforce_encoding encoding, thumb_shift shift) {
+  printf("th_add_sp_reg: rd=%u, rm=%u, flags=%d, encoding=%d, shift.type=%d\n",
+         rd, rm, flags, encoding, shift.type);
+
   if (rd == rm && flags != FLAGS_BEHAVIOUR_SET &&
-      encoding != ENFORCE_ENCODING_32BIT) {
+      encoding != ENFORCE_ENCODING_32BIT && shift.type == THUMB_SHIFT_NONE) {
+    const uint16_t rdm = rd & 7;
+    const uint16_t dm = rd >> 3;
     return (thumb_opcode){
         .size = 2,
-        .opcode = 0x4485 | (rd << 3),
+        .opcode = 0x4468 | (dm << 7) | rdm,
+    };
+  }
+
+  if (rd == R_SP && flags != FLAGS_BEHAVIOUR_SET &&
+      encoding != ENFORCE_ENCODING_32BIT && shift.type == THUMB_SHIFT_NONE) {
+    return (thumb_opcode){
+        .size = 2,
+        .opcode = 0x4485 | (rm << 3),
+    };
+  }
+
+  if (encoding != ENFORCE_ENCODING_16BIT) {
+    const uint32_t s = flags == FLAGS_BEHAVIOUR_SET;
+    const uint32_t imm2 = shift.value & 0x3;
+    const uint32_t imm3 = (shift.value >> 2) & 0x7;
+    const uint32_t sr = thumb_get_sr_value(shift.type);
+    return (thumb_opcode){
+        .size = 4,
+        .opcode = 0xeb0d0000 | (s << 20) | (imm3 << 12) | (rd << 8) |
+                  (imm2 << 6) | (sr << 4) | rm,
     };
   }
 }

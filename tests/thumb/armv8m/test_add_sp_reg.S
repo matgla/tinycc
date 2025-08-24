@@ -8,7 +8,7 @@ test_add_sp_reg:
    
    ite eq
    addeq r1, sp, r1 
-   addne sp, r9
+   addne.n sp, r9
 
    add sp, sp, r2
    add sp, sp
