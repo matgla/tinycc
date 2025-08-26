@@ -229,12 +229,17 @@ ST_FUNC int asm_parse_regvar(int t) {
 }
 
 /* Parse a text containing operand and store the result in OP */
-static void parse_operand(TCCState *s1, Operand *op) {
+static bool parse_operand(TCCState *s1, Operand *op) {
   ExprValue e;
   int8_t reg;
   uint16_t regset = 0;
 
   op->type = 0;
+
+  if (tok == TOK_ASM_rrx || tok == TOK_ASM_asl || tok == TOK_ASM_lsl ||
+      tok == TOK_ASM_asr || tok == TOK_ASM_lsr || tok == TOK_ASM_ror) {
+    return false;
+  }
 
   if (tok == '{') { // regset literal
     next();         // skip '{'
@@ -261,22 +266,22 @@ static void parse_operand(TCCState *s1, Operand *op) {
       op->type = OP_REGSET32;
       op->regset = regset;
     }
-    return;
+    return true;
   } else if ((reg = asm_parse_regvar(tok)) != -1) {
     next(); // skip register name
     op->type = OP_REG32;
     op->reg = (uint8_t)reg;
-    return;
+    return true;
   } else if ((reg = asm_parse_vfp_regvar(tok, 0)) != -1) {
     next(); // skip register name
     op->type = OP_VREG32;
     op->reg = (uint8_t)reg;
-    return;
+    return true;
   } else if ((reg = asm_parse_vfp_regvar(tok, 1)) != -1) {
     next(); // skip register name
     op->type = OP_VREG64;
     op->reg = (uint8_t)reg;
-    return;
+    return true;
   } else if (tok == '#' || tok == '$') {
     /* constant value */
     next(); // skip '#' or '$'
@@ -291,6 +296,7 @@ static void parse_operand(TCCState *s1, Operand *op) {
       op->type = OP_IM8;
   } else
     expect("operand");
+  return true;
 }
 
 static uint8_t thumb_build_it_mask(const char *pattern, uint16_t condition) {
@@ -348,6 +354,8 @@ static int thumb_parse_condition_str(const char *condition_str) {
 static thumb_shift asm_parse_optional_shift(TCCState *s1) {
   Operand op;
   thumb_shift shift = {0, 0};
+  printf("asm_parse_optional_shift: parsing optional shift: %s\n",
+         get_tok_str(tok, NULL));
   if (tok == TOK_ASM_rrx) {
     next();
     return (thumb_shift){
@@ -380,6 +388,8 @@ static thumb_shift asm_parse_optional_shift(TCCState *s1) {
     tcc_error("shift operand must be immediate value");
   }
   shift.value = op.e.v;
+  printf("asm_parse_optional_shift: parsed shift type %d value %d\n",
+         shift.type, shift.value);
   return shift;
 }
 
@@ -405,7 +415,9 @@ static void thumb_conditional_opcode(TCCState *s1, int token) {
 static int process_operands(TCCState *s1, int max_operands, Operand *ops) {
   int nb_ops = 0;
   for (nb_ops = 0; nb_ops < max_operands;) {
-    parse_operand(s1, &ops[nb_ops]);
+    if (!parse_operand(s1, &ops[nb_ops])) {
+      break;
+    }
     ++nb_ops;
     if (tok != ',')
       break;
@@ -445,6 +457,40 @@ static bool thumb_operand_is_register(int type) {
   return true;
 }
 
+typedef thumb_opcode (*thumb_generate_generic_imm_opcode)(
+    uint16_t rd, uint16_t rn, uint32_t rm, flags_behaviour flags);
+
+typedef thumb_opcode (*thumb_generate_generic_reg_opcode)(
+    uint16_t rd, uint16_t rn, uint16_t imm, flags_behaviour flags,
+    thumb_shift shift, enforce_encoding encoding);
+
+typedef struct th_generic_op_data {
+  thumb_generate_generic_imm_opcode generate_imm_opcode;
+  thumb_generate_generic_reg_opcode generate_reg_opcode;
+  int regular_variant_token;
+  int flags_variant_token;
+} th_generic_op_data;
+
+thumb_opcode thumb_process_generic_data_op(th_generic_op_data data, int token,
+                                           thumb_shift shift, Operand *ops) {
+  flags_behaviour setflags =
+      thumb_determine_flags_behaviour(token, data.flags_variant_token, true);
+  enforce_encoding encoding = ENFORCE_ENCODING_NONE;
+  if (thumb_operand_is_immediate(ops[2].type))
+    return data.generate_imm_opcode(ops[0].reg, ops[1].reg, ops[2].e.v,
+                                    setflags);
+
+  if (thumb_operand_is_register(ops[2].type)) {
+    if ((THUMB_INSTRUCTION_GROUP(token) == data.regular_variant_token &&
+         thumb_conditional_scope == 0) ||
+        THUMB_HAS_WIDE_QUALIFIER(token)) {
+      encoding = ENFORCE_ENCODING_32BIT;
+    }
+    return data.generate_reg_opcode(ops[0].reg, ops[1].reg, ops[2].reg,
+                                    setflags, shift, encoding);
+  }
+}
+
 static void thumb_adr_opcode(TCCState *s1, int token) {
   int jump_addr = 0;
   Operand op;
@@ -477,18 +523,173 @@ static void thumb_adr_opcode(TCCState *s1, int token) {
   return thumb_emit_opcode(th_adr_imm(op.reg, jump_addr, encoding));
 }
 
+thumb_opcode thumb_generate_opcode_for_data_processing(int token,
+                                                       thumb_shift shift,
+                                                       Operand *ops) {
+  enforce_encoding encoding = ENFORCE_ENCODING_NONE;
+  if (THUMB_HAS_WIDE_QUALIFIER(token)) {
+    encoding = ENFORCE_ENCODING_32BIT;
+  }
+
+  switch (THUMB_INSTRUCTION_GROUP(token)) {
+  case TOK_ASM_adcseq:
+  case TOK_ASM_adceq: {
+    return thumb_process_generic_data_op(
+        (th_generic_op_data){
+            .generate_imm_opcode = th_adc_imm,
+            .generate_reg_opcode = th_adc_reg,
+            .regular_variant_token = TOK_ASM_adceq,
+            .flags_variant_token = TOK_ASM_adcseq,
+        },
+        token, shift, ops);
+  }
+  case TOK_ASM_andseq:
+  case TOK_ASM_andeq:
+    return thumb_process_generic_data_op(
+        (th_generic_op_data){
+            .generate_imm_opcode = th_and_imm,
+            .generate_reg_opcode = th_and_reg,
+            .regular_variant_token = TOK_ASM_andeq,
+            .flags_variant_token = TOK_ASM_andseq,
+        },
+        token, shift, ops);
+  case TOK_ASM_addseq:
+  case TOK_ASM_addeq:
+  case TOK_ASM_addweq: {
+    flags_behaviour setflags =
+        thumb_determine_flags_behaviour(token, TOK_ASM_addseq, true);
+
+    if (thumb_operand_is_immediate(ops[2].type)) {
+      if (ops[1].reg == R_SP) {
+        if (THUMB_INSTRUCTION_GROUP(token) == TOK_ASM_addweq) {
+          return th_add_sp_imm_t4(ops[0].reg, ops[2].e.v, setflags, encoding);
+        }
+        return th_add_sp_imm(ops[0].reg, ops[2].e.v, setflags, encoding);
+      }
+      if (THUMB_INSTRUCTION_GROUP(token) == TOK_ASM_addweq) {
+        return th_add_imm_t4(ops[0].reg, ops[1].reg, ops[2].e.v);
+      }
+
+      if (THUMB_INSTRUCTION_GROUP(token) == TOK_ASM_addeq &&
+          thumb_conditional_scope == 0) {
+        encoding = ENFORCE_ENCODING_32BIT;
+      }
+      if (THUMB_INSTRUCTION_GROUP(token) == TOK_ASM_addseq &&
+          thumb_conditional_scope > 0)
+        encoding = ENFORCE_ENCODING_32BIT;
+      return th_add_imm(ops[0].reg, ops[1].reg, ops[2].e.v, setflags, encoding);
+      break;
+    }
+
+    if (thumb_operand_is_register(ops[2].type)) {
+      if (ops[1].reg == R_SP) {
+        return th_add_sp_reg(ops[0].reg, ops[2].reg, setflags, encoding, shift);
+      }
+      return th_add_reg(ops[0].reg, ops[1].reg, ops[2].reg, setflags, shift,
+                        encoding);
+    }
+  }
+  case TOK_ASM_bicseq:
+  case TOK_ASM_biceq: {
+    return thumb_process_generic_data_op(
+        (th_generic_op_data){
+            .generate_imm_opcode = th_bic_imm,
+            .generate_reg_opcode = th_bic_reg,
+            .regular_variant_token = TOK_ASM_biceq,
+            .flags_variant_token = TOK_ASM_bicseq,
+        },
+        token, shift, ops);
+  }
+  case TOK_ASM_clzeq: {
+    if (!thumb_operand_is_register(ops[1].type) ||
+        !(thumb_operand_is_register(ops[0].type))) {
+      expect("operands must be registers");
+    }
+    return th_clz(ops[1].reg, ops[2].reg);
+  }
+  case TOK_ASM_cmpeq: {
+    if (!thumb_operand_is_immediate(ops[2].type)) {
+      expect("second operand must be an immediate");
+    }
+    return th_cmp_imm(ops[1].reg, ops[2].e.v, encoding);
+  }
+  case TOK_ASM_cmneq: {
+    flags_behaviour setflags = FLAGS_BEHAVIOUR_NOT_IMPORTANT;
+    enforce_encoding encoding = ENFORCE_ENCODING_NONE;
+
+    printf("shift.type: %d, %d, %d\n", shift.type, shift.value, ops[2].type);
+    if (thumb_operand_is_immediate(ops[2].type)) {
+      printf("shift.type: %d, %d, %d\n", shift.type, shift.value, ops[2].type);
+      return th_cmn_imm(ops[1].reg, ops[2].e.v);
+    }
+
+    if (thumb_operand_is_register(ops[2].type)) {
+      if (THUMB_HAS_WIDE_QUALIFIER(token)) {
+        encoding = ENFORCE_ENCODING_32BIT;
+      }
+      return th_cmn_reg(ops[1].reg, ops[2].reg, shift, encoding);
+    }
+  }
+  case TOK_ASM_movseq:
+  case TOK_ASM_movweq:
+  case TOK_ASM_moveq: {
+    flags_behaviour setflags =
+        thumb_determine_flags_behaviour(token, TOK_ASM_movseq, false);
+    if (THUMB_INSTRUCTION_GROUP(token) == TOK_ASM_movweq)
+      encoding = ENFORCE_ENCODING_32BIT;
+    if (thumb_operand_is_immediate(ops[2].type)) {
+      return th_mov_imm(ops[1].reg, ops[2].e.v, setflags, encoding);
+    }
+    return th_mov_reg(ops[1].reg, ops[2].e.v);
+  }
+  case TOK_ASM_bfceq: {
+    if (!thumb_operand_is_immediate(ops[1].type) &&
+        !thumb_operand_is_immediate(ops[2].type)) {
+      expect("second/third operand must be an immediate");
+    }
+    return th_bfc(ops[0].reg, ops[1].e.v, ops[2].e.v);
+  }
+  }
+  return (thumb_opcode){0, 0};
+}
+
+static void thumb_bfi_opcode(TCCState *s1, int token) {
+  Operand ops[4];
+  int nb_ops;
+  nb_ops = process_operands(s1, sizeof(ops) / sizeof(ops[0]), ops);
+
+  if (nb_ops < 4) {
+    expect("four operands");
+    return;
+  }
+
+  if (!thumb_operand_is_register(ops[0].type) ||
+      !thumb_operand_is_register(ops[1].type)) {
+    expect("first two operands must be registers");
+  }
+
+  if (!thumb_operand_is_immediate(ops[2].type) ||
+      !thumb_operand_is_immediate(ops[3].type)) {
+    expect("last two operands must be immediates");
+  }
+
+  thumb_emit_opcode(th_bfi(ops[0].reg, ops[1].reg, ops[2].e.v, ops[3].e.v));
+}
+
 static void thumb_data_processing_opcode(TCCState *s1, int token) {
   Operand ops[3];
   int nb_ops;
   uint32_t operands = 0;
   thumb_shift shift = {0, 0};
+  thumb_opcode opcode;
 
   nb_ops = process_operands(s1, sizeof(ops) / sizeof(ops[0]), ops);
-
   if (nb_ops < 2) {
     expect("at least two operands");
     return;
   } else if (nb_ops == 2) {
+    printf("thumb_data_processing_opcode: only two operands, assuming "
+           "implicit destination register\n");
     memcpy(&ops[2], &ops[1], sizeof(ops[1]));
     memcpy(&ops[1], &ops[0],
            sizeof(ops[0])); // most instructions may have implicit destination
@@ -502,127 +703,97 @@ static void thumb_data_processing_opcode(TCCState *s1, int token) {
   }
 
   flags_behaviour setflags = FLAGS_BEHAVIOUR_NOT_IMPORTANT;
+  // alias for adr
+  if (THUMB_INSTRUCTION_GROUP(token) == TOK_ASM_addeq && ops[1].reg == R_PC) {
+    if (!thumb_operand_is_immediate(ops[2].type)) {
+      expect("second operand must be an immediate for adr");
+    }
+    enforce_encoding encoding = ENFORCE_ENCODING_NONE;
+    if (THUMB_HAS_WIDE_QUALIFIER(token)) {
+      encoding = ENFORCE_ENCODING_32BIT;
+    }
+    return thumb_emit_opcode(th_adr_imm(ops[0].reg, ops[2].e.v, encoding));
+  };
+
+  opcode = thumb_generate_opcode_for_data_processing(token, shift, ops);
+  if (opcode.opcode == 0) {
+    tcc_error("failed to encode instruction for: %s", get_tok_str(token, NULL));
+  }
+  thumb_emit_opcode(opcode);
+}
+
+static void thumb_data_shift_opcode(TCCState *s1, int token) {
+  Operand ops[3];
+  int nb_ops;
+  thumb_opcode opcode;
+
+  nb_ops = process_operands(s1, sizeof(ops) / sizeof(ops[0]), ops);
+
+  if (nb_ops < 2) {
+    expect("at least two operands");
+    return;
+  } else if (nb_ops == 2) {
+    memcpy(&ops[2], &ops[1], sizeof(ops[1]));
+    memcpy(&ops[1], &ops[0],
+           sizeof(ops[0])); // most instructions may have implicit destination
+                            // register
+    nb_ops = 3;
+  }
+
+  if (!thumb_operand_is_register(ops[0].type) ||
+      !thumb_operand_is_register(ops[1].type)) {
+    expect("First two operands must be registers for shift instructions");
+  }
   enforce_encoding encoding = ENFORCE_ENCODING_NONE;
   if (THUMB_HAS_WIDE_QUALIFIER(token)) {
     encoding = ENFORCE_ENCODING_32BIT;
   }
 
-  if (THUMB_INSTRUCTION_GROUP(token) == TOK_ASM_addeq && ops[1].reg == R_PC) {
-    token = TOK_ASM_adr;
-  };
-
   switch (THUMB_INSTRUCTION_GROUP(token)) {
-  case TOK_ASM_adcseq:
-  case TOK_ASM_adceq: {
-    setflags = thumb_determine_flags_behaviour(token, TOK_ASM_adcseq, true);
-    if (thumb_operand_is_immediate(ops[2].type))
-      return thumb_emit_opcode(
-          th_adc_imm(ops[0].reg, ops[1].reg, ops[2].e.v, setflags));
-
-    if (thumb_operand_is_register(ops[2].type)) {
-      if ((THUMB_INSTRUCTION_GROUP(token) == TOK_ASM_adceq &&
-           thumb_conditional_scope == 0) ||
-          THUMB_HAS_WIDE_QUALIFIER(token)) {
-        encoding = ENFORCE_ENCODING_32BIT;
-      }
-      return thumb_emit_opcode(th_adc_reg(ops[0].reg, ops[1].reg, ops[2].reg,
-                                          setflags, shift, encoding));
-    }
-    break;
-  }
-  case TOK_ASM_addseq:
-  case TOK_ASM_addeq:
-  case TOK_ASM_addweq: {
-    setflags = thumb_determine_flags_behaviour(token, TOK_ASM_addseq, true);
-
-    if (thumb_operand_is_immediate(ops[2].type)) {
-      if (ops[1].reg == R_SP) {
-        if (THUMB_INSTRUCTION_GROUP(token) == TOK_ASM_addweq) {
-          return thumb_emit_opcode(
-              th_add_sp_imm_t4(ops[0].reg, ops[2].e.v, setflags, encoding));
-        }
-
-        return thumb_emit_opcode(
-            th_add_sp_imm(ops[0].reg, ops[2].e.v, setflags, encoding));
-      }
-      if (THUMB_INSTRUCTION_GROUP(token) == TOK_ASM_addweq) {
-        return thumb_emit_opcode(
-            th_add_imm_t4(ops[0].reg, ops[1].reg, ops[2].e.v));
-      }
-
-      if (THUMB_INSTRUCTION_GROUP(token) == TOK_ASM_addeq &&
-          thumb_conditional_scope == 0) {
-        encoding = ENFORCE_ENCODING_32BIT;
-      }
-      if (THUMB_INSTRUCTION_GROUP(token) == TOK_ASM_addseq &&
-          thumb_conditional_scope > 0)
-        encoding = ENFORCE_ENCODING_32BIT;
-      return thumb_emit_opcode(
-          th_add_imm(ops[0].reg, ops[1].reg, ops[2].e.v, setflags, encoding));
-    }
-
-    if (thumb_operand_is_register(ops[2].type)) {
-      if (ops[1].reg == R_SP) {
-        return thumb_emit_opcode(
-            th_add_sp_reg(ops[0].reg, ops[2].reg, setflags, encoding, shift));
-      }
-      return thumb_emit_opcode(th_add_reg(ops[0].reg, ops[1].reg, ops[2].reg,
-                                          setflags, shift, encoding));
-    }
-    break;
-  }
-  case TOK_ASM_cmpeq: {
-    switch (ops[2].type) {
-    case OP_IM8:
-    case OP_IM32:
-    case OP_IM8N:
-      return thumb_emit_opcode(th_cmp_imm(ops[1].reg, ops[2].e.v, encoding));
-    default:
-      expect("second operand must be an immediate");
-    }
-  }
-  case TOK_ASM_movseq:
-  case TOK_ASM_movweq:
-  case TOK_ASM_moveq: {
-    setflags = thumb_determine_flags_behaviour(token, TOK_ASM_movseq, false);
-    if (THUMB_INSTRUCTION_GROUP(token) == TOK_ASM_movweq)
+  case TOK_ASM_asrseq:
+  case TOK_ASM_asreq:
+    flags_behaviour flags =
+        thumb_determine_flags_behaviour(token, TOK_ASM_asrseq, false);
+    if (THUMB_INSTRUCTION_GROUP(token) == TOK_ASM_asreq &&
+        thumb_conditional_scope == 0) {
       encoding = ENFORCE_ENCODING_32BIT;
-
-    switch (ops[2].type) {
-    case OP_IM8:
-    case OP_IM32:
-    case OP_IM8N:
-      return thumb_emit_opcode(
-          th_mov_imm(ops[1].reg, ops[2].e.v, setflags, encoding));
-    case OP_REG32:
-      return thumb_emit_opcode(th_mov_reg(ops[1].reg, ops[2].e.v));
+    }
+    if (thumb_operand_is_immediate(ops[2].type)) {
+      opcode = th_asr_imm(ops[0].reg, ops[1].reg, ops[2].e.v, flags, encoding);
+    } else {
+      opcode = th_asr_reg(ops[0].reg, ops[1].reg, ops[2].reg, flags, encoding);
     }
     break;
   }
-  case TOK_ASM_adreq: {
-    if (!thumb_operand_is_immediate(ops[2].type)) {
-      expect("second operand must be an immediate for adr");
-    }
-    printf("encoding register %d with immediate %d\n", ops[0].reg, ops[2].e.v);
-    return thumb_emit_opcode(th_adr_imm(ops[0].reg, ops[2].e.v, encoding));
+  if (opcode.opcode == 0) {
+    tcc_error("failed to encode instruction for: %s", get_tok_str(token, NULL));
   }
-  }
-  tcc_error("Unhandled operation for: %s", get_tok_str(token, NULL));
+  thumb_emit_opcode(opcode);
 }
 
-static void thumb_process_svc(TCCState *s1, int token) {
+static void thumb_process_control(TCCState *s1, int token) {
   Operand op;
+  thumb_opcode opcode;
   int nb_ops = process_operands(s1, 1, &op);
   if (nb_ops > 1 || nb_ops == 0) {
-    expect("SVC takes one operand");
+    expect("one operand");
     return;
   }
   if (op.type != OP_IM8 && op.type != OP_IM32 && op.type != OP_IM8N) {
-    expect("SVC operand must be an immediate");
+    expect("operand must be an immediate");
     return;
   }
 
-  thumb_emit_opcode(th_svc(op.e.v));
+  switch (THUMB_INSTRUCTION_GROUP(token)) {
+  case TOK_ASM_svceq:
+    opcode = th_svc(op.e.v);
+    break;
+  case TOK_ASM_bkpteq:
+    opcode = th_bkpt(op.e.v);
+    break;
+  }
+
+  thumb_emit_opcode(opcode);
 }
 
 static void thumb_bx(TCCState *s1, int token) {
@@ -649,21 +820,32 @@ static void thumb_branch(TCCState *s1, int token) {
   int condition = 0xe;
   bool must_use_t4 = false;
   bool must_use_32bit = false;
+  int sign = 0;
   if (THUMB_HAS_WIDE_QUALIFIER(token)) {
     must_use_32bit = true;
   }
 
+  if (THUMB_INSTRUCTION_GROUP(token) == TOK_ASM_cbzeq ||
+      THUMB_INSTRUCTION_GROUP(token) == TOK_ASM_cbnzeq) {
+    process_operands(s1, 1, &op);
+  }
+
   if (THUMB_INSTRUCTION_GROUP(token) == TOK_ASM_beq ||
-      THUMB_INSTRUCTION_GROUP(token) == TOK_ASM_bleq) {
+      THUMB_INSTRUCTION_GROUP(token) == TOK_ASM_bleq ||
+      THUMB_INSTRUCTION_GROUP(token) == TOK_ASM_cbzeq ||
+      THUMB_INSTRUCTION_GROUP(token) == TOK_ASM_cbnzeq) {
     asm_expr(s1, &e);
     if (e.sym) {
       esym = elfsym(e.sym);
       if (esym && esym->st_shndx == cur_text_section->sh_num) {
         jump_addr = th_encbranch(ind, e.v + esym->st_value);
       } else {
-        greloca(cur_text_section, e.sym, ind, R_ARM_THM_PC22, 0);
-        printf("relocating branch to symbol %s, ind: %d\n",
-               get_tok_str(e.sym->v, NULL), ind);
+        if (THUMB_INSTRUCTION_GROUP(token) == TOK_ASM_cbzeq ||
+            THUMB_INSTRUCTION_GROUP(token) == TOK_ASM_cbnzeq) {
+          greloca(cur_text_section, e.sym, ind, R_ARM_THM_JUMP6, 0);
+        } else {
+          greloca(cur_text_section, e.sym, ind, R_ARM_THM_PC22, 0);
+        }
         must_use_t4 = true;
         jump_addr = th_encbranch(ind, ind + e.v);
       }
@@ -676,14 +858,14 @@ static void thumb_branch(TCCState *s1, int token) {
 
   switch (THUMB_INSTRUCTION_GROUP(token)) {
   case TOK_ASM_bxeq: {
-    if (op.type != OP_REG32) {
-      expect("BX operand must be a register");
+    if (!thumb_operand_is_register(op.type)) {
+      expect("first operand must be a register");
     }
     return thumb_emit_opcode(th_bx_reg(op.reg));
   }
   case TOK_ASM_blxeq: {
-    if (op.type != OP_REG32) {
-      expect("BLX operand must be a register");
+    if (!thumb_operand_is_register(op.type)) {
+      expect("first operand must be a register");
     }
     return thumb_emit_opcode(th_blx_reg(op.reg));
   }
@@ -710,6 +892,14 @@ static void thumb_branch(TCCState *s1, int token) {
       tcc_error("branch target out of range: %d", jump_addr);
     }
   }
+  case TOK_ASM_cbnzeq:
+    sign = 1;
+  case TOK_ASM_cbzeq: {
+    if (!thumb_operand_is_register(op.type)) {
+      expect("first operand must be a register");
+    }
+    return thumb_emit_opcode(th_cbz(op.reg, 0, sign));
+  }
   default:
     tcc_error("unknown branch instruction: %s", get_tok_str(token, NULL));
   }
@@ -735,21 +925,38 @@ ST_FUNC void asm_opcode(TCCState *s1, int token) {
   case TOK_ASM_bleq:
   case TOK_ASM_blxeq:
   case TOK_ASM_beq:
+  case TOK_ASM_cbzeq:
+  case TOK_ASM_cbnzeq:
     return thumb_branch(s1, token);
   case TOK_ASM_adceq:
   case TOK_ASM_adcseq:
   case TOK_ASM_addeq:
   case TOK_ASM_addseq:
   case TOK_ASM_addweq:
+  case TOK_ASM_andeq:
+  case TOK_ASM_andseq:
   case TOK_ASM_movseq:
   case TOK_ASM_movweq:
   case TOK_ASM_moveq:
   case TOK_ASM_cmpeq:
+  case TOK_ASM_bfceq:
+  case TOK_ASM_biceq:
+  case TOK_ASM_bicseq:
+  case TOK_ASM_clzeq:
+  case TOK_ASM_cmneq:
     return thumb_data_processing_opcode(s1, token);
   case TOK_ASM_adreq:
     return thumb_adr_opcode(s1, token);
   case TOK_ASM_svceq:
-    return thumb_process_svc(s1, token);
+  case TOK_ASM_bkpteq:
+    return thumb_process_control(s1, token);
+  case TOK_ASM_asreq:
+  case TOK_ASM_asrseq:
+    return thumb_data_shift_opcode(s1, token);
+  case TOK_ASM_bfieq:
+    return thumb_bfi_opcode(s1, token);
+  case TOK_ASM_clrexeq:
+    return thumb_emit_opcode(th_clrex());
   default:
     printf("asm_opcode: unknown token %s\n", get_tok_str(token, NULL));
     expect("known instruction");

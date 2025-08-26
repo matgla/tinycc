@@ -1179,7 +1179,7 @@ ST_FUNC void gen_vla_alloc(CType *type, int align) {
   if (align & (align - 1))
     tcc_error("alignment is not a power of 2: %i", align);
   /* bic sp, r, #align-1 */
-  ot_check(th_bic_imm(r, r, align - 1));
+  ot_check(th_bic_imm(r, r, align - 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT));
   ot_check(th_mov_reg(13, r));
   vpop();
 }
@@ -1857,7 +1857,8 @@ void gen_opi_regs(int opc, int c) {
 
   switch (opc) {
   case 0:
-    ot_check(th_and_reg(r, c, fr));
+    ot_check(th_and_reg(r, c, fr, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                        THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     return;
   case 2:
     ot_check(th_xor_reg(r, c, fr));
@@ -1909,7 +1910,8 @@ void gen_opi_regular(int opc, int c) {
     }
     switch (opc) {
     case 0:
-      ok = ot(th_and_imm(r, r, vtop->c.i));
+      ok = ot(th_and_imm(r, r, vtop->c.i, FLAGS_BEHAVIOUR_NOT_IMPORTANT));
+
       break;
     case 2:
       ok = ot(th_xor_imm(r, r, vtop->c.i));
@@ -1997,22 +1999,28 @@ void gen_opi_shift(int opc) {
     int c = vtop->c.i & 0x1f;
 
     if (opc == 0)
-      ot_check(th_lsl_imm(r, fr, c));
+      ot_check(th_lsl_imm(r, fr, c, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                          ENFORCE_ENCODING_NONE));
     else if (opc == 1)
-      ot_check(th_lsr_imm(r, fr, c));
+      ot_check(th_lsr_imm(r, fr, c, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                          ENFORCE_ENCODING_NONE));
     else if (opc == 2)
-      ot_check(th_asr_imm(r, fr, c));
+      ot_check(th_asr_imm(r, fr, c, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                          ENFORCE_ENCODING_NONE));
   } else {
     int fr = intr(gv(RC_INT));
     int c =
         intr(vtop[-1].r = get_reg_ex(RC_INT, two2mask(vtop->r, vtop[-1].r)));
 
     if (opc == 0)
-      ot_check(th_lsl_reg(c, r, fr));
+      ot_check(th_lsl_reg(c, r, fr, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                          ENFORCE_ENCODING_NONE));
     else if (opc == 1)
-      ot_check(th_lsr_reg(c, r, fr));
+      ot_check(th_lsr_reg(c, r, fr, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                          ENFORCE_ENCODING_NONE));
     else if (opc == 2)
-      ot_check(th_asr_reg(c, r, fr));
+      ot_check(th_asr_reg(c, r, fr, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                          ENFORCE_ENCODING_NONE));
     else
       tcc_error("compiler_error: 'gen_opi_shift' not implemented case: %d\n",
                 opc);

@@ -40,3 +40,7 @@ def test_blx():
 def test_b():
     branch_set = ["b", "b.n", "b.w", "bgt.w", "bgt.n"]
     perform_test_for_branches("test_b.S", branch_set)
+    
+def test_cbz():
+    branch_set = ["cbz", "cbnz"]
+    perform_test_for_branches("test_cbz.S", branch_set)

@@ -37,7 +37,6 @@ enum float_abi {
 /* Returns 1 for a code relocation, 0 for a data relocation. For unknown
    relocations, returns -1. */
 ST_FUNC int code_reloc(int reloc_type) {
-  printf("code_reloc: reloc_type=%d\n", reloc_type);
   switch (reloc_type) {
   case R_ARM_MOVT_ABS:
   case R_ARM_MOVW_ABS_NC:
@@ -67,6 +66,7 @@ ST_FUNC int code_reloc(int reloc_type) {
   case R_ARM_V4BX:
   case R_ARM_JUMP_SLOT:
   case R_ARM_THM_ALU_PREL_11_0:
+  case R_ARM_THM_JUMP6:
     return 1;
   }
   return -1;
@@ -76,7 +76,6 @@ ST_FUNC int code_reloc(int reloc_type) {
    GOT and/or PLT entry to be created. See tcc.h for a description of the
    different values. */
 ST_FUNC int gotplt_entry_type(int reloc_type) {
-  printf("gotplt_entry_type: reloc_type=%d\n", reloc_type);
   switch (reloc_type) {
   case R_ARM_NONE:
   case R_ARM_COPY:
@@ -90,6 +89,7 @@ ST_FUNC int gotplt_entry_type(int reloc_type) {
   case R_ARM_PLT32:
   case R_ARM_THM_PC22:
   case R_ARM_THM_ALU_PREL_11_0:
+  case R_ARM_THM_JUMP6:
   case R_ARM_THM_JUMP24:
   case R_ARM_MOVT_ABS:
   case R_ARM_MOVW_ABS_NC:
@@ -237,8 +237,6 @@ ST_FUNC void relocate_plt(TCCState *s1) {
 
 ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
                       addr_t addr, addr_t val) {
-  printf("relocate: type=%d addr=0x%lx val=0x%lx\n", type, (unsigned long)addr,
-         (unsigned long)val);
   ElfW(Sym) * sym;
   int sym_index, esym_index;
 
@@ -249,7 +247,6 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
   case R_ARM_CALL:
   case R_ARM_JUMP24:
   case R_ARM_PLT32: {
-    printf("R_ARM_*24: x initial: val: %d, addr: %d\n", val, addr);
     int x, is_thumb, is_call, h, blx_avail, is_bl, th_ko;
     x = (*(int *)ptr) & 0xffffff;
 #ifdef DEBUG_RELOC
@@ -282,7 +279,28 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
     (*(int *)ptr) |= x;
   }
     return;
+  case R_ARM_THM_JUMP6: {
+    int x, orig, i, imm5;
+    Section *plt;
+    /* weak reference */
+    if (sym->st_shndx == SHN_UNDEF && ELFW(ST_BIND)(sym->st_info) == STB_WEAK)
+      return;
 
+    /* Get initial offset */
+    orig = (*(uint16_t *)ptr);
+    x = (val - addr - 4);
+    if (x < 0) {
+      (*(uint16_t *)ptr) = 0xbf00;
+      return;
+    } else {
+      x = (x >> 1);
+    }
+    /* Compute and store final offset */
+    i = (x >> 5) & 1;
+    imm5 = x & 0x1f;
+    (*(uint16_t *)ptr) = orig | (i << 9) | (imm5 << 3);
+    return;
+  }
   case R_ARM_THM_ALU_PREL_11_0: {
     int x, hi, lo, s, i, imm3, imm8;
     Section *plt;
@@ -333,8 +351,6 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
     int x, hi, lo, s, j1, j2, i1, i2, imm10, imm11;
     int is_call, to_plt, blx_bit = 1 << 12;
     Section *plt;
-    printf("R_ARM_THM_jUMP: x initial: 0x%d, val: %d, addr: %d\n", x, val,
-           addr);
     /* weak reference */
     if (sym->st_shndx == SHN_UNDEF && ELFW(ST_BIND)(sym->st_info) == STB_WEAK)
       return;
@@ -353,7 +369,6 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
     if (x & 0x01000000)
       x -= 0x02000000;
 
-    printf("Original address: %d\n", x);
     /* Relocation infos */
     if (s1->plt) {
       plt = s1->plt;
@@ -386,7 +401,6 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
     /* Compute final offset */
 
     x += val - addr;
-    printf("After patch address: %x, %x, %x\n", x, val, addr);
     if (is_call) {
       blx_bit = 0; /* bl -> blx */
       // x = (x + 3) & -4; /* Compute offset from aligned PC */
@@ -400,7 +414,6 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
     if (x >= 0x1000000 || x < -0x1000000)
       if ((val & 2) || (!is_call && !to_plt))
         tcc_error_noabort("can't relocate value at %x,%d", addr, type);
-    printf("packing address: %x\n", x);
     /* Compute and store final offset */
     s = (x >> 24) & 1;
     i1 = (x >> 23) & 1;
@@ -409,13 +422,9 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
     j2 = s ^ (i2 ^ 1);
     imm10 = (x >> 12) & 0x3ff;
     imm11 = (x >> 1) & 0x7ff;
-    printf("hi: 0x%x, lo: 0x%x\n", hi, lo);
     (*(uint16_t *)ptr) = (uint16_t)((hi & 0xf800) | (s << 10) | imm10);
     (*(uint16_t *)(ptr + 2)) =
         (uint16_t)((lo & 0xd000) | (j1 << 13) | blx_bit | (j2 << 11) | imm11);
-
-    printf("After patch hi: 0x%x, lo: 0x%x\n", (*(uint16_t *)ptr),
-           (*(uint16_t *)(ptr + 2)));
   }
     return;
   case R_ARM_MOVT_ABS:

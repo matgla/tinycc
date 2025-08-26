@@ -169,7 +169,6 @@ thumb_opcode th_bx_reg(uint16_t rm) {
 
 thumb_opcode th_bl_t1(uint32_t imm) {
   const uint32_t packed = th_packimm_10_11_0(imm) | 0xF000D000;
-  printf("th_bl_t1 imm: 0x%x packed: 0x%x\n", imm, packed);
   return (thumb_opcode){
       .size = 4,
       .opcode = packed,
@@ -223,6 +222,16 @@ thumb_opcode th_b_t4(int32_t imm) {
   };
 }
 
+thumb_opcode th_cbz(uint16_t rn, uint32_t imm, uint32_t nonzero) {
+  const uint32_t imm5 = imm & 0x1f;
+  const uint32_t i = (imm >> 5) & 0x1;
+
+  return (thumb_opcode){
+      .size = 2,
+      .opcode = 0xb100 | nonzero << 11 | i << 9 | imm5 << 3 | rn,
+  };
+}
+
 // all t32 arch
 thumb_opcode th_mov_reg(uint16_t rd, uint16_t rm) {
   const uint16_t D = (rd >> 3) & 1;
@@ -245,7 +254,6 @@ thumb_opcode th_mov_imm(uint16_t rd, uint32_t imm, flags_behaviour setflags,
 
   if (rd != R_SP && rd != R_PC && encoding != ENFORCE_ENCODING_16BIT) {
     const uint32_t enc = th_pack_const(imm);
-    printf("th_mov_imm: enc: 0x%x\n", enc);
     const uint32_t s = (setflags == FLAGS_BEHAVIOUR_SET) ? 1 : 0;
     if (enc)
       return (thumb_opcode){
@@ -373,7 +381,6 @@ thumb_opcode th_add_imm(uint16_t rd, uint16_t rn, uint32_t imm,
 }
 
 thumb_opcode th_adr_imm(uint32_t rd, int imm, enforce_encoding encoding) {
-  printf("th_adr_imm rd: %u imm: %d encoding: %d\n", rd, imm, encoding);
   if (imm <= 1020 && imm >= 0 && encoding != ENFORCE_ENCODING_32BIT &&
       imm % 4 == 0) {
     return (thumb_opcode){
@@ -402,14 +409,16 @@ thumb_opcode th_adr_imm(uint32_t rd, int imm, enforce_encoding encoding) {
       .opcode = 0,
   };
 }
-thumb_opcode th_bic_imm(uint16_t rd, uint16_t rn, uint32_t imm) {
+thumb_opcode th_bic_imm(uint16_t rd, uint16_t rn, uint32_t imm,
+                        flags_behaviour flags) {
 #ifndef TCC_TARGET_ARM_ARCHV6M
   if (rd != R_SP && rd != R_PC && rn != R_SP && rd != R_PC) {
     const uint32_t packed = th_pack_const(imm);
+    const uint32_t s = (flags == FLAGS_BEHAVIOUR_SET);
     if (packed || imm == 0) {
       return (thumb_opcode){
           .size = 4,
-          .opcode = 0xf0200000 | packed | (rn << 16) | (rd << 8),
+          .opcode = 0xf0200000 | packed | (rn << 16) | (rd << 8) | (s << 20),
       };
     }
   }
@@ -420,30 +429,37 @@ thumb_opcode th_bic_imm(uint16_t rd, uint16_t rn, uint32_t imm) {
   };
 }
 
-thumb_opcode th_and_imm(uint16_t rd, uint16_t rn, uint32_t imm) {
-  thumb_opcode op = th_generic_op_imm(0xf000, rd, rn, imm);
-  return op.size != 0 ? op : th_bic_imm(rd, rn, ~imm);
+thumb_opcode th_bic_reg(uint16_t rd, uint16_t rn, uint16_t rm,
+                        flags_behaviour flags, thumb_shift shift,
+                        enforce_encoding encoding) {
+  if (rm < 8 && rd < 8 && rn < 8 && shift.type == THUMB_SHIFT_NONE &&
+      encoding != ENFORCE_ENCODING_32BIT) {
+    return (thumb_opcode){
+        .size = 2,
+        .opcode = 0x4380 | (rm << 3) | rd,
+    };
+  }
+  return th_generic_op_reg_shift_with_status(0xea20, rd, rn, rm, flags, shift);
 }
 
-thumb_opcode th_and_reg(uint16_t rd, uint16_t rn, uint16_t rm) {
-  if (rd == rn && rm < 8 && rn < 8) {
+thumb_opcode th_and_imm(uint16_t rd, uint16_t rn, uint32_t imm,
+                        flags_behaviour setflags) {
+  thumb_opcode op =
+      th_generic_op_imm_with_status(0xf000, rd, rn, imm, setflags);
+  return op.size != 0 ? op : th_bic_imm(rd, rn, ~imm, setflags);
+}
+
+thumb_opcode th_and_reg(uint16_t rd, uint16_t rn, uint16_t rm,
+                        flags_behaviour flags, thumb_shift shift,
+                        enforce_encoding encoding) {
+  if (rd == rn && rm < 8 && rn < 8 && shift.type == THUMB_SHIFT_NONE &&
+      encoding != ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
         .size = 2,
         .opcode = 0x4000 | (rm << 3) | rd,
     };
   }
-#ifndef TCC_TARGET_ARM_ARCHV6M
-  else if (rd != R_SP && rn != R_SP && rn != R_PC && rm != R_SP && rm != R_PC) {
-    return (thumb_opcode){
-        .size = 4,
-        .opcode = 0xea000000 | (rn << 16) | (rd << 8) | rm,
-    };
-  }
-#endif
-  return (thumb_opcode){
-      .size = 0,
-      .opcode = 0,
-  };
+  return th_generic_op_reg_shift_with_status(0xea00, rd, rn, rm, flags, shift);
 }
 
 thumb_opcode th_xor_reg(uint16_t rd, uint16_t rn, uint16_t rm) {
@@ -637,7 +653,6 @@ thumb_opcode th_orr_reg(uint16_t rd, uint16_t rn, uint16_t rm) {
 }
 
 thumb_opcode th_sub_imm(uint16_t rd, uint16_t rn, uint32_t imm) {
-
   if (rd < 8 && rn < 8 && imm <= 7) {
     // T1
     return (thumb_opcode){
@@ -1291,9 +1306,6 @@ thumb_opcode th_add_sp_imm(uint16_t rd, uint32_t imm, flags_behaviour flags,
 
 thumb_opcode th_add_sp_reg(uint32_t rd, uint32_t rm, flags_behaviour flags,
                            enforce_encoding encoding, thumb_shift shift) {
-  printf("th_add_sp_reg: rd=%u, rm=%u, flags=%d, encoding=%d, shift.type=%d\n",
-         rd, rm, flags, encoding, shift.type);
-
   if (rd == rm && flags != FLAGS_BEHAVIOUR_SET &&
       encoding != ENFORCE_ENCODING_32BIT && shift.type == THUMB_SHIFT_NONE) {
     const uint16_t rdm = rd & 7;
@@ -1342,18 +1354,20 @@ thumb_opcode th_rsb_imm(uint16_t rd, uint16_t rn, uint32_t imm,
 }
 
 thumb_opcode th_shift_armv7m(uint16_t rd, uint16_t rm, uint32_t imm,
-                             uint32_t type) {
+                             uint32_t type, flags_behaviour setflags) {
   const uint32_t imm3 = (imm >> 2) & 7;
   const uint32_t imm2 = imm & 0x3;
+  const uint32_t s = setflags == FLAGS_BEHAVIOUR_SET;
   return (thumb_opcode){
       .size = 4,
       .opcode = 0xea4f0000 | (imm3 << 12) | (rd << 8) | (imm2 << 6) |
-                (type << 4) | rm,
+                (type << 4) | rm | s << 20,
   };
 }
 
-thumb_opcode th_lsl_reg(uint16_t rd, uint16_t rn, uint16_t rm) {
-  if (rd == rn && rm < 8 && rn < 8) {
+thumb_opcode th_lsl_reg(uint16_t rd, uint16_t rn, uint16_t rm,
+                        flags_behaviour flags, enforce_encoding encoding) {
+  if (rd == rn && rm < 8 && rn < 8 && encoding != ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
         .size = 2,
         .opcode = 0x4080 | (rm << 3) | rd,
@@ -1362,9 +1376,10 @@ thumb_opcode th_lsl_reg(uint16_t rd, uint16_t rn, uint16_t rm) {
 #ifndef TCC_TARGET_ARM_ARCHV6M
   else if (rd != R_SP && rd != R_PC && rn != R_SP && rn != R_PC && rm != R_SP &&
            rm != R_PC) {
+    const uint32_t s = flags == FLAGS_BEHAVIOUR_SET;
     return (thumb_opcode){
         .size = 4,
-        .opcode = 0xfa00f000 | (rn << 16) | (rd << 8) | rm,
+        .opcode = 0xfa00f000 | (rn << 16) | (rd << 8) | rm | s << 20,
     };
   }
 #endif
@@ -1374,8 +1389,9 @@ thumb_opcode th_lsl_reg(uint16_t rd, uint16_t rn, uint16_t rm) {
   };
 }
 
-thumb_opcode th_lsl_imm(uint16_t rd, uint16_t rm, uint32_t imm) {
-  if (rm < 8 && rd < 8) {
+thumb_opcode th_lsl_imm(uint16_t rd, uint16_t rm, uint32_t imm,
+                        flags_behaviour flags, enforce_encoding encoding) {
+  if (rm < 8 && rd < 8 && encoding != ENFORCE_ENCODING_16BIT) {
     return (thumb_opcode){
         .size = 2,
         .opcode = ((imm << 6) | (rm << 3) | rd),
@@ -1383,7 +1399,7 @@ thumb_opcode th_lsl_imm(uint16_t rd, uint16_t rm, uint32_t imm) {
   }
 #ifndef TCC_TARGET_ARM_ARCHV6M
   else if (imm >= 1 && imm <= 31) {
-    return th_shift_armv7m(rd, rm, imm, 0);
+    return th_shift_armv7m(rd, rm, imm, 0, flags);
   }
 #endif
   return (thumb_opcode){
@@ -1392,8 +1408,9 @@ thumb_opcode th_lsl_imm(uint16_t rd, uint16_t rm, uint32_t imm) {
   };
 }
 
-thumb_opcode th_lsr_reg(uint16_t rd, uint16_t rn, uint16_t rm) {
-  if (rd == rn && rm < 8 && rn < 8) {
+thumb_opcode th_lsr_reg(uint16_t rd, uint16_t rn, uint16_t rm,
+                        flags_behaviour flags, enforce_encoding encoding) {
+  if (rd == rn && rm < 8 && rn < 8 && encoding != ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
         .size = 2,
         .opcode = 0x40c0 | (rm << 3) | rd,
@@ -1402,9 +1419,10 @@ thumb_opcode th_lsr_reg(uint16_t rd, uint16_t rn, uint16_t rm) {
 #ifndef TCC_TARGET_ARM_ARCHV6M
   else if (rd != R_SP && rd != R_PC && rn != R_SP && rn != R_PC && rm != R_SP &&
            rm != R_PC) {
+    const uint32_t s = flags == FLAGS_BEHAVIOUR_SET;
     return (thumb_opcode){
         .size = 4,
-        .opcode = 0xfa20f000 | (rn << 16) | (rd << 8) | rm,
+        .opcode = 0xfa20f000 | (rn << 16) | (rd << 8) | rm | s << 20,
     };
   }
 #endif
@@ -1414,8 +1432,9 @@ thumb_opcode th_lsr_reg(uint16_t rd, uint16_t rn, uint16_t rm) {
   };
 }
 
-thumb_opcode th_lsr_imm(uint16_t rd, uint16_t rm, uint32_t imm) {
-  if (rm < 8 && rd < 8) {
+thumb_opcode th_lsr_imm(uint16_t rd, uint16_t rm, uint32_t imm,
+                        flags_behaviour flags, enforce_encoding encoding) {
+  if (rm < 8 && rd < 8 && encoding != ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
         .size = 2,
         .opcode = (0x0800 | (imm << 6) | (rm << 3) | rd),
@@ -1423,7 +1442,7 @@ thumb_opcode th_lsr_imm(uint16_t rd, uint16_t rm, uint32_t imm) {
   }
 #ifndef TCC_TARGET_ARM_ARCHV6M
   else if (imm >= 1 && imm <= 31) {
-    return th_shift_armv7m(rd, rm, imm, 1);
+    return th_shift_armv7m(rd, rm, imm, 1, flags);
   }
 #endif
   return (thumb_opcode){
@@ -1432,8 +1451,9 @@ thumb_opcode th_lsr_imm(uint16_t rd, uint16_t rm, uint32_t imm) {
   };
 }
 
-thumb_opcode th_asr_reg(uint16_t rd, uint16_t rn, uint16_t rm) {
-  if (rd == rn && rm < 8 && rn < 8) {
+thumb_opcode th_asr_reg(uint16_t rd, uint16_t rn, uint16_t rm,
+                        flags_behaviour flags, enforce_encoding encoding) {
+  if (rd == rn && rm < 8 && rn < 8 && encoding != ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
         .size = 2,
         .opcode = (0x4100 | (rm << 3) | rd),
@@ -1442,9 +1462,10 @@ thumb_opcode th_asr_reg(uint16_t rd, uint16_t rn, uint16_t rm) {
 #ifndef TCC_TARGET_ARM_ARCHV6M
   else if (rd != R_SP && rd != R_PC && rn != R_SP && rn != R_PC && rm != R_SP &&
            rm != R_PC) {
+    const uint32_t s = flags == FLAGS_BEHAVIOUR_SET;
     return (thumb_opcode){
         .size = 4,
-        .opcode = 0xfa40f000 | (rn << 16) | (rd << 8) | rm,
+        .opcode = 0xfa40f000 | (rn << 16) | (rd << 8) | rm | s << 20,
     };
   }
 #endif
@@ -1454,8 +1475,9 @@ thumb_opcode th_asr_reg(uint16_t rd, uint16_t rn, uint16_t rm) {
   };
 }
 
-thumb_opcode th_asr_imm(uint16_t rd, uint16_t rm, uint32_t imm) {
-  if (rm < 8 && rd < 8) {
+thumb_opcode th_asr_imm(uint16_t rd, uint16_t rm, uint32_t imm,
+                        flags_behaviour flags, enforce_encoding encoding) {
+  if (rm < 8 && rd < 8 && encoding != ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
         .size = 2,
         .opcode = 0x1000 | (imm << 6) | (rm << 3) | rd,
@@ -1463,7 +1485,7 @@ thumb_opcode th_asr_imm(uint16_t rd, uint16_t rm, uint32_t imm) {
   }
 #ifndef TCC_TARGET_ARM_ARCHV6M
   else if (imm >= 1 && imm <= 31) {
-    return th_shift_armv7m(rd, rm, imm, 2);
+    return th_shift_armv7m(rd, rm, imm, 2, flags);
   }
 #endif
   return (thumb_opcode){
@@ -1689,6 +1711,13 @@ thumb_opcode th_it(uint16_t cond, uint16_t mask) {
   };
 }
 
+thumb_opcode th_clrex() {
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xf3bf8f2f,
+  };
+}
+
 thumb_opcode th_svc(uint32_t imm) {
   if (imm <= 0xff) {
     return (thumb_opcode){
@@ -1700,6 +1729,79 @@ thumb_opcode th_svc(uint32_t imm) {
       .size = 0,
       .opcode = 0,
   };
+}
+
+thumb_opcode th_bkpt(uint32_t imm) {
+  if (imm <= 0xff) {
+    return (thumb_opcode){
+        .size = 2,
+        .opcode = 0xbe00 | imm,
+    };
+  }
+  return (thumb_opcode){
+      .size = 0,
+      .opcode = 0,
+  };
+}
+
+thumb_opcode th_bfc(uint32_t rd, uint32_t lsb, uint32_t width) {
+  const uint32_t imm2 = lsb & 0x3;
+  const uint32_t imm3 = (lsb >> 2) & 0x7;
+  const uint32_t msb = lsb + width - 1;
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xf36f0000 | (rd << 8) | (imm3 << 12) | (imm2 << 6) | msb,
+  };
+}
+
+thumb_opcode th_bfi(uint32_t rd, uint32_t rn, uint32_t lsb, uint32_t width) {
+  const uint32_t imm2 = lsb & 0x3;
+  const uint32_t imm3 = (lsb >> 2) & 0x7;
+  const uint32_t msb = lsb + width - 1;
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xf3600000 | (rn << 16) | (rd << 8) | (imm3 << 12) |
+                (imm2 << 6) | msb,
+  };
+}
+
+thumb_opcode th_clz(uint32_t rd, uint32_t rm) {
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xfab0f080 | rm << 16 | rd << 8 | rm,
+  };
+}
+
+thumb_opcode th_cmn_imm(uint32_t rn, uint32_t imm) {
+#ifndef TCC_TARGET_ARM_ARCHV6M
+  if (rn != R_PC) {
+    const uint32_t packed = th_pack_const(imm);
+    if (packed || imm == 0) {
+      return (thumb_opcode){
+          .size = 4,
+          .opcode = 0xf1100f00 | packed | (rn << 16),
+      };
+    }
+  }
+#endif
+  return (thumb_opcode){
+      .size = 0,
+      .opcode = 0,
+  };
+}
+
+thumb_opcode th_cmn_reg(uint32_t rn, uint32_t rm, thumb_shift shift,
+                        enforce_encoding encoding) {
+  if (rn < 8 && rm < 8 && shift.type == THUMB_SHIFT_NONE &&
+      encoding != ENFORCE_ENCODING_32BIT) {
+    return (thumb_opcode){
+        .size = 2,
+        .opcode = 0x42c0 | (rm << 3) | rn,
+    };
+  }
+  printf("cmn with flags and shift: %x\n", ind);
+  return th_generic_op_reg_shift_with_status(0xeb10, 0xf, rn, rm,
+                                             FLAGS_BEHAVIOUR_SET, shift);
 }
 
 #endif // TARGET_DEFS_ONLY

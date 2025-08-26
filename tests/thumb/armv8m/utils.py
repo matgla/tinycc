@@ -16,7 +16,7 @@ def prepare_expect(filepath):
             os.makedirs(output_dir)
         assert compiler is not None, "TEST_COMPARE_CC environment variable must be set to the ARM compiler path."
         _ = subprocess.run(
-            [compiler, filepath, "-mcpu=cortex-m33", "-nostdlib", "-Wl,-Ttext=0x0", "-o", output_file_gcc],
+            [compiler, filepath, "-march=armv8-m.main", "-nostdlib", "-Wl,-Ttext=0x0", "-o", output_file_gcc],
             check=True,
             capture_output=True,
             text=True
@@ -65,7 +65,7 @@ def disassemble_code(filepath):
         disassembler = os.getenv("TEST_OBJDUMP", None)
         assert disassembler is not None, "TEST_OBJDUMP environment variable must be set to the ARM disassembler path."
         result = subprocess.run(
-            [disassembler, "-D", "-marm", "-marmv8-m.base", "-Mforce-thumb", filepath],
+            [disassembler, "-D", "-marm", "-marmv8-m.main", "-Mforce-thumb", filepath],
             check=True,
             capture_output=True,
             text=True
