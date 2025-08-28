@@ -50,6 +50,9 @@ def test_mov_imm():
 
 def test_cmp_imm():
     utils.perform_test_for_file("test_cmp_imm.S") 
+   
+def test_cmp_reg():
+    utils.perform_test_for_file("test_cmp_reg.S") 
     
 def test_clz():
     utils.perform_test_for_file("test_clz.S")
@@ -59,4 +62,10 @@ def test_cmn_imm():
     
 def test_cmn_reg():
     utils.perform_test_for_file("test_cmn_reg.S")
+    
+def test_eor_imm():
+    utils.perform_test_for_file("test_eor_imm.S")
+    
+def test_eor_reg():
+    utils.perform_test_for_file("test_eor_reg.S")
     

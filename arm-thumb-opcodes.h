@@ -187,7 +187,8 @@ thumb_opcode th_adc_imm(uint16_t rd, uint16_t rn, uint32_t imm,
 thumb_opcode th_sbc_imm(uint16_t rd, uint16_t rn, uint32_t imm);
 thumb_opcode th_orr_imm(uint16_t rd, uint16_t rn, uint32_t imm);
 thumb_opcode th_sbc_reg(uint16_t rd, uint16_t rn, uint16_t rm);
-thumb_opcode th_cmp_reg(uint16_t rn, uint16_t rm);
+thumb_opcode th_cmp_reg(uint16_t rn, uint16_t rm, thumb_shift shift,
+                        enforce_encoding encoding);
 thumb_opcode th_orr_reg(uint16_t rd, uint16_t rn, uint16_t rm);
 thumb_opcode th_sub_imm(uint16_t rd, uint16_t rn, uint32_t imm);
 
@@ -278,3 +279,25 @@ thumb_opcode th_clz(uint32_t rd, uint32_t rm);
 thumb_opcode th_cmn_imm(uint32_t rn, uint32_t imm);
 thumb_opcode th_cmn_reg(uint32_t rn, uint32_t rm, thumb_shift shift,
                         enforce_encoding encoding);
+
+thumb_opcode th_cps(uint32_t enable, uint32_t i, uint32_t f);
+thumb_opcode th_csdb();
+thumb_opcode th_dmb(uint32_t option);
+thumb_opcode th_dsb(uint32_t option);
+thumb_opcode th_isb(uint32_t option);
+
+thumb_opcode th_eor_reg(uint16_t rd, uint16_t rn, uint16_t rm,
+                        flags_behaviour flags, thumb_shift shift,
+                        enforce_encoding encoding);
+thumb_opcode th_eor_imm(uint16_t rd, uint16_t rm, uint32_t imm,
+                        flags_behaviour flags);
+
+thumb_opcode th_lda(uint32_t rd, uint32_t rn);
+thumb_opcode th_ldab(uint32_t rd, uint32_t rn);
+thumb_opcode th_ldaex(uint32_t rd, uint32_t rn);
+thumb_opcode th_ldaexb(uint32_t rd, uint32_t rn);
+thumb_opcode th_ldaexh(uint32_t rd, uint32_t rn);
+thumb_opcode th_ldah(uint32_t rd, uint32_t rn);
+
+thumb_opcode th_ldm(uint32_t rn, uint32_t regset, uint32_t writeback,
+                    enforce_encoding encoding);

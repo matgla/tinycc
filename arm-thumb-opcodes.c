@@ -609,26 +609,26 @@ thumb_opcode th_sbc_reg(uint16_t rd, uint16_t rn, uint16_t rm) {
   };
 }
 
-thumb_opcode th_cmp_reg(uint16_t rn, uint16_t rm) {
-  if (rm < 8 && rn < 8) {
+thumb_opcode th_cmp_reg(uint16_t rn, uint16_t rm, thumb_shift shift,
+                        enforce_encoding encoding) {
+  if (rm < 8 && rn < 8 && shift.type == THUMB_SHIFT_NONE &&
+      encoding != ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
         .size = 2,
         .opcode = (0x4280 | (rm << 3) | rn),
     };
-  }
-#ifndef TCC_TARGET_ARM_ARCHV6M
-  else if (!(rm < 8 && rn < 8) && rm != R_PC && rn != R_PC) {
+  } else if (!(rm < 8 && rn < 8) && rm != R_PC && rn != R_PC &&
+             encoding != ENFORCE_ENCODING_32BIT &&
+             shift.type == THUMB_SHIFT_NONE) {
     const uint16_t N = (rn >> 3) & 0x1;
     return (thumb_opcode){
         .size = 2,
         .opcode = (0x4500 | (N << 7) | (rm << 3) | (rn & 0x7)),
     };
   }
-#endif
-  return (thumb_opcode){
-      .size = 0,
-      .opcode = 0,
-  };
+
+  return th_generic_op_reg_shift_with_status(0xebb0, 0xf, rn, rm,
+                                             FLAGS_BEHAVIOUR_SET, shift);
 }
 
 thumb_opcode th_orr_reg(uint16_t rd, uint16_t rn, uint16_t rm) {
@@ -1802,6 +1802,146 @@ thumb_opcode th_cmn_reg(uint32_t rn, uint32_t rm, thumb_shift shift,
   printf("cmn with flags and shift: %x\n", ind);
   return th_generic_op_reg_shift_with_status(0xeb10, 0xf, rn, rm,
                                              FLAGS_BEHAVIOUR_SET, shift);
+}
+
+thumb_opcode th_cps(uint32_t enable, uint32_t i, uint32_t f) {
+  return (thumb_opcode){
+      .size = 2,
+      .opcode = 0xb660 | (enable << 4) | (i << 1) | f,
+  };
+}
+
+thumb_opcode th_csdb() {
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xf3af8014,
+  };
+}
+
+thumb_opcode th_dmb(uint32_t option) {
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xf3bf8f50 | option,
+  };
+}
+
+thumb_opcode th_dsb(uint32_t option) {
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xf3bf8f40 | option,
+  };
+}
+
+thumb_opcode th_isb(uint32_t option) {
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xf3bf8f60 | option,
+  };
+}
+
+thumb_opcode th_eor_imm(uint16_t rd, uint16_t rn, uint32_t imm,
+                        flags_behaviour flags) {
+
+  uint32_t S = (flags == FLAGS_BEHAVIOUR_SET) ? 1 : 0;
+  uint32_t packed = th_pack_const(imm);
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xf0800000 | (S << 20) | (rd << 8) | (rn << 16) | packed,
+  };
+}
+
+thumb_opcode th_eor_reg(uint16_t rd, uint16_t rn, uint16_t rm,
+                        flags_behaviour flags, thumb_shift shift,
+                        enforce_encoding encoding) {
+  if (rd == rn && rm < 8 && rn < 8 && encoding != ENFORCE_ENCODING_32BIT &&
+      shift.type == THUMB_SHIFT_NONE) {
+    return (thumb_opcode){
+        .size = 2,
+        .opcode = (0x4040 | (rm << 3) | rd),
+    };
+  }
+  return th_generic_op_reg_shift_with_status(0xea80, rd, rn, rm, flags, shift);
+}
+
+thumb_opcode th_lda(uint32_t rt, uint32_t rn) {
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xe8d00faf | (rn << 16) | (rt << 12),
+  };
+}
+
+thumb_opcode th_ldab(uint32_t rt, uint32_t rn) {
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xe8d00f8f | (rn << 16) | (rt << 12),
+  };
+}
+
+thumb_opcode th_ldaex(uint32_t rt, uint32_t rn) {
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xe8d00fef | (rn << 16) | (rt << 12),
+  };
+}
+
+thumb_opcode th_ldaexb(uint32_t rt, uint32_t rn) {
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xe8d00fcf | (rn << 16) | (rt << 12),
+  };
+}
+
+thumb_opcode th_ldaexh(uint32_t rt, uint32_t rn) {
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xe8d00fdf | (rn << 16) | (rt << 12),
+  };
+}
+
+thumb_opcode th_ldah(uint32_t rt, uint32_t rn) {
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xe8d00f9f | (rn << 16) | (rt << 12),
+  };
+}
+
+thumb_opcode th_ldm(uint32_t rn, uint32_t regset, uint32_t writeback,
+                    enforce_encoding encoding) {
+  printf("ldm: rn=%u, regset=0x%x, wb=%u, enc=%u\n", rn, regset, writeback,
+         encoding);
+  if (rn < 8 && regset <= 0xff && encoding != ENFORCE_ENCODING_32BIT &&
+      writeback == 1) {
+    if (writeback) {
+      regset &= ~(1 << rn);
+    } else {
+      regset |= 1 << rn;
+    }
+    return (thumb_opcode){
+        .size = 2,
+        .opcode = 0xc800 | rn << 8 | regset,
+    };
+  };
+  if (rn == R_SP && ((regset & 0x7f00) == 0) &&
+      encoding != ENFORCE_ENCODING_32BIT && writeback == 1) {
+    const uint8_t p = (regset >> R_PC) & 1;
+    regset &= 0x00ff;
+    return (thumb_opcode){
+        .size = 2,
+        .opcode = 0xbc00 | regset | (p << 8),
+    };
+  }
+
+  if (!(writeback && (regset & (1 << rn)))) {
+    return (thumb_opcode){
+        .size = 4,
+        .opcode = 0xe8900000 | (writeback << 21) | (rn << 16) | regset,
+    };
+  }
+
+  return (thumb_opcode){
+      .size = 0,
+      .opcode = 0,
+  };
 }
 
 #endif // TARGET_DEFS_ONLY

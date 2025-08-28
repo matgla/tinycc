@@ -1887,7 +1887,7 @@ void gen_opi_regs(int opc, int c) {
     ot_check(th_sbc_reg(r, fr, c));
     return;
   case 21:
-    ot_check(th_cmp_reg(c, fr));
+    ot_check(th_cmp_reg(c, fr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     return;
   case 24:
     ot_check(th_orr_reg(r, c, fr));
