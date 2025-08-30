@@ -1415,7 +1415,7 @@ static void load_full_const(int r, int32_t imm, struct Sym *sym) {
         } else {
           ot_check(th_add_reg(r, r, R9, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
                               THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-          ot_check(th_ldr_imm(r, r, 0, 6));
+          ot_check(th_ldr_imm(r, r, 0, 6, ENFORCE_ENCODING_NONE));
           ot_check(th_add_imm(r, r, imm, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
                               ENFORCE_ENCODING_NONE));
         }
@@ -1427,7 +1427,7 @@ static void load_full_const(int r, int32_t imm, struct Sym *sym) {
         } else {
           ot_check(th_add_reg(r, r, R_PC, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
                               THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-          ot_check(th_ldr_imm(r, r, 4, 6));
+          ot_check(th_ldr_imm(r, r, 4, 6, ENFORCE_ENCODING_NONE));
           ot_check(th_add_imm(r, r, imm, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
                               ENFORCE_ENCODING_NONE));
         }
@@ -1461,7 +1461,8 @@ int load_ubyte_from_base(int ir, int base, int fc, int sign) {
 }
 
 int load_word_from_base(int ir, int base, int fc, int sign) {
-  const thumb_opcode ins = th_ldr_imm(ir, base, fc, sign ? 4 : 6);
+  const thumb_opcode ins =
+      th_ldr_imm(ir, base, fc, sign ? 4 : 6, ENFORCE_ENCODING_NONE);
   TRACE("Load word sign: %d, r %d, base: %d, fc: %d\n", sign, ir, base, fc);
   return ot(ins);
 }

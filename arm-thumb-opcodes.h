@@ -202,7 +202,8 @@ thumb_opcode th_ldrsb_imm(uint32_t rt, uint32_t rn, uint32_t imm, uint32_t puw);
 thumb_opcode th_ldrsb_reg(uint32_t rt, uint32_t rn, uint32_t rm);
 thumb_opcode th_ldrb_imm(uint16_t rt, uint16_t rn, uint32_t imm, uint32_t puw);
 thumb_opcode th_ldrb_reg(uint32_t rt, uint32_t rn, uint32_t rm);
-thumb_opcode th_ldr_imm(uint32_t rt, uint32_t rn, uint32_t imm, uint32_t puw);
+thumb_opcode th_ldr_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw,
+                        enforce_encoding encoding);
 thumb_opcode th_ldr_reg(uint32_t rt, uint32_t rn, uint32_t rm);
 thumb_opcode th_ldr_literal(uint16_t rt, uint32_t imm, uint32_t add);
 
@@ -301,3 +302,4 @@ thumb_opcode th_ldah(uint32_t rd, uint32_t rn);
 
 thumb_opcode th_ldm(uint32_t rn, uint32_t regset, uint32_t writeback,
                     enforce_encoding encoding);
+thumb_opcode th_ldmdb(uint32_t rn, uint32_t regset, uint32_t writeback);

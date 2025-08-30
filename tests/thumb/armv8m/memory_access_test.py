@@ -20,3 +20,12 @@ def test_ldah():
 
 def test_ldm():
     utils.perform_test_for_file("test_ldm.S") 
+    
+def test_ldmdb():
+    utils.perform_test_for_file("test_ldmdb.S")
+    
+def test_ldr():
+    utils.perform_test_for_file("test_ldr.S")
+
+def test_ldr_literal():
+    utils.perform_test_for_file("test_ldr_literal.S")

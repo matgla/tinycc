@@ -723,6 +723,40 @@ thumb_opcode thumb_generate_opcode_for_data_processing(int token,
   return (thumb_opcode){0, 0};
 }
 
+static void thumb_single_memory_transfer_literal_opcode(TCCState *s1, int token,
+                                                        Operand op0) {
+  ExprValue e;
+  ElfSym *esym;
+  int jump_addr = 0;
+  int puw = 0x2;
+  enforce_encoding encoding = ENFORCE_ENCODING_NONE;
+  if (THUMB_HAS_WIDE_QUALIFIER(token)) {
+    encoding = ENFORCE_ENCODING_32BIT;
+  }
+
+  asm_expr(s1, &e);
+  if (e.sym) {
+    esym = elfsym(e.sym);
+    if (esym && esym->st_shndx == cur_text_section->sh_num) {
+      int aligned_ind = ind & -4;
+      jump_addr = esym->st_value - aligned_ind - 4;
+    } else {
+      greloca(cur_text_section, e.sym, ind, R_ARM_THM_PC12, 0);
+      jump_addr = e.v;
+      encoding = ENFORCE_ENCODING_32BIT;
+    }
+  }
+  if (jump_addr < 0) {
+    puw &= ~(0x2);
+    jump_addr = -jump_addr;
+  }
+  switch (THUMB_INSTRUCTION_GROUP(token)) {
+  case TOK_ASM_ldreq:
+    return thumb_emit_opcode(
+        th_ldr_imm(op0.reg, R_PC, jump_addr, puw, encoding));
+  };
+}
+
 static void thumb_single_memory_transfer_opcode(TCCState *s1, int token) {
   Operand ops[3];
   bool closed_bracket = false;
@@ -730,6 +764,11 @@ static void thumb_single_memory_transfer_opcode(TCCState *s1, int token) {
   int nb_ops;
   int excalm = 0;
   thumb_shift shift = {0, 0};
+  ops[2] = (Operand){0};
+  enforce_encoding encoding = ENFORCE_ENCODING_NONE;
+  if (THUMB_HAS_WIDE_QUALIFIER(token)) {
+    encoding = ENFORCE_ENCODING_32BIT;
+  }
   parse_operand(s1, &ops[0]);
   if (!thumb_operand_is_register(ops[0].type)) {
     expect("destination operand must be a register");
@@ -739,6 +778,10 @@ static void thumb_single_memory_transfer_opcode(TCCState *s1, int token) {
   }
   next();
 
+  if (tok != '[') {
+    // we have literal addressing mode
+    return thumb_single_memory_transfer_literal_opcode(s1, token, ops[0]);
+  }
   skip('[');
   parse_operand(s1, &ops[1]);
   if (!thumb_operand_is_register(ops[1].type)) {
@@ -794,6 +837,24 @@ static void thumb_single_memory_transfer_opcode(TCCState *s1, int token) {
   case TOK_ASM_ldaheq:
     thumb_emit_opcode(th_ldah(ops[0].reg, ops[1].reg));
     break;
+  case TOK_ASM_ldreq:
+    uint32_t puw = 0x6;
+    int imm = ops[2].e.v;
+    if (excalm) {
+      puw = 0x5;
+    }
+
+    if (closed_bracket && imm != 0) {
+      puw = 0x3;
+    }
+
+    if (op2_minus || imm < 0) {
+      puw &= ~(0x2);
+      imm = -imm;
+    }
+
+    thumb_emit_opcode(th_ldr_imm(ops[0].reg, ops[1].reg, imm, puw, encoding));
+    break;
   };
 }
 
@@ -830,6 +891,10 @@ static void thumb_block_memory_transfer_opcode(TCCState *s1, int token) {
   case TOK_ASM_ldmfdeq:
   case TOK_ASM_ldmiaeq:
     thumb_emit_opcode(th_ldm(ops[0].reg, ops[1].regset, op0_exclam, encoding));
+    break;
+  case TOK_ASM_ldmdbeq:
+  case TOK_ASM_ldmeaeq:
+    thumb_emit_opcode(th_ldmdb(ops[0].reg, ops[1].regset, op0_exclam));
     break;
   };
 }
@@ -1155,10 +1220,13 @@ ST_FUNC void asm_opcode(TCCState *s1, int token) {
   case TOK_ASM_ldaexbeq:
   case TOK_ASM_ldaexheq:
   case TOK_ASM_ldaheq:
+  case TOK_ASM_ldreq:
     return thumb_single_memory_transfer_opcode(s1, token);
   case TOK_ASM_ldmeq:
   case TOK_ASM_ldmfdeq:
   case TOK_ASM_ldmiaeq:
+  case TOK_ASM_ldmdbeq:
+  case TOK_ASM_ldmeaeq:
     return thumb_block_memory_transfer_opcode(s1, token);
 
   default:

@@ -921,28 +921,38 @@ thumb_opcode th_ldrb_reg(uint32_t rt, uint32_t rn, uint32_t rm) {
   };
 }
 
-thumb_opcode th_ldr_imm(uint32_t rt, uint32_t rn, uint32_t imm, uint32_t puw) {
+thumb_opcode th_ldr_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw,
+                        enforce_encoding encoding) {
   // puw == 6 means positive offset on rn, so T1 encoding can be used
-  if (puw == 6 && rn < 8 && rt < 8 && imm <= 124 && !(imm & 3)) {
+  if (puw == 6 && rn < 8 && rt < 8 && imm <= 124 && !(imm & 3) &&
+      encoding != ENFORCE_ENCODING_32BIT) {
     // imm[0] is enforced to be 0, and sould be divided by 4, thus offset is 4
     return (thumb_opcode){
         .size = 2,
         .opcode = 0x6800 | (imm << 4) | (rn << 3) | rt,
     };
-  } else if (puw == 6 && rn == R_SP && rt < 8 && imm <= 1020) {
+  } else if (puw == 6 && rn == R_SP && rt < 8 && imm <= 1020 &&
+             encoding != ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
         .size = 2,
         .opcode = 0x9800 | (rt << 8) | (imm >> 2),
     };
   }
 #ifndef TCC_TARGET_ARM_ARCHV6M
-  else if (puw == 6 && imm <= 4095) {
+  else if (puw == 6 && imm <= 4095 && rn != R_PC) {
     uint32_t ins = (0xf8d0 | (rn & 0xf)) << 16;
     ins |= (rt << 12) | imm;
     return (thumb_opcode){
         .size = 4,
         .opcode = ins,
     };
+  } else if (imm >= 0 && imm <= 4095 && rn == R_PC) {
+    uint32_t u = (puw & 0x2) >> 1;
+    return (thumb_opcode){
+        .size = 4,
+        .opcode = 0xf85f0000 | (u << 23) | (rt << 12) | imm,
+    };
+
   } else if (imm <= 255) {
     uint32_t ins = (0xf850 | (rn & 0xf)) << 16;
     ins |= (0x0800 | ((rt & 0xf) << 12) | ((puw & 0x7) << 8) | imm);
@@ -1799,7 +1809,6 @@ thumb_opcode th_cmn_reg(uint32_t rn, uint32_t rm, thumb_shift shift,
         .opcode = 0x42c0 | (rm << 3) | rn,
     };
   }
-  printf("cmn with flags and shift: %x\n", ind);
   return th_generic_op_reg_shift_with_status(0xeb10, 0xf, rn, rm,
                                              FLAGS_BEHAVIOUR_SET, shift);
 }
@@ -1907,8 +1916,6 @@ thumb_opcode th_ldah(uint32_t rt, uint32_t rn) {
 
 thumb_opcode th_ldm(uint32_t rn, uint32_t regset, uint32_t writeback,
                     enforce_encoding encoding) {
-  printf("ldm: rn=%u, regset=0x%x, wb=%u, enc=%u\n", rn, regset, writeback,
-         encoding);
   if (rn < 8 && regset <= 0xff && encoding != ENFORCE_ENCODING_32BIT &&
       writeback == 1) {
     if (writeback) {
@@ -1941,6 +1948,13 @@ thumb_opcode th_ldm(uint32_t rn, uint32_t regset, uint32_t writeback,
   return (thumb_opcode){
       .size = 0,
       .opcode = 0,
+  };
+}
+
+thumb_opcode th_ldmdb(uint32_t rn, uint32_t regset, uint32_t writeback) {
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xe9100000 | (writeback << 21) | (rn << 16) | regset,
   };
 }
 

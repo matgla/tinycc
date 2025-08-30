@@ -67,6 +67,7 @@ ST_FUNC int code_reloc(int reloc_type) {
   case R_ARM_JUMP_SLOT:
   case R_ARM_THM_ALU_PREL_11_0:
   case R_ARM_THM_JUMP6:
+  case R_ARM_THM_PC12:
     return 1;
   }
   return -1;
@@ -102,6 +103,7 @@ ST_FUNC int gotplt_entry_type(int reloc_type) {
   case R_ARM_TARGET1:
   case R_ARM_MOVT_PREL:
   case R_ARM_MOVW_PREL_NC:
+  case R_ARM_THM_PC12:
     return AUTO_GOTPLT_ENTRY;
 
   case R_ARM_GOTPC:
@@ -194,7 +196,8 @@ ST_FUNC void relocate_plt(TCCState *s1) {
       // I can't modify stack in this function, so how can I restore R9?
       // write_thumb_instruction(p, th_push(1 << R9 | 1 << R_LR));
       // get offet in GOT table
-      write_thumb_instruction(p, th_ldr_imm(R_IP, R_PC, 24, 6));
+      write_thumb_instruction(
+          p, th_ldr_imm(R_IP, R_PC, 24, 6, ENFORCE_ENCODING_NONE));
 
       if (s1->text_and_data_separation) {
         // calculate address relative to the base
@@ -208,11 +211,13 @@ ST_FUNC void relocate_plt(TCCState *s1) {
                               THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
       }
       // load R9 value from first got entry
-      write_thumb_instruction(p + 6, th_ldr_imm(R9, R_IP, 4, 6));
+      write_thumb_instruction(
+          p + 6, th_ldr_imm(R9, R_IP, 4, 6, ENFORCE_ENCODING_NONE));
       // update R9
       // get address of the symbol
       // load the address of the symbol
-      write_thumb_instruction(p + 10, th_ldr_imm(R_IP, R_IP, 0, 6));
+      write_thumb_instruction(
+          p + 10, th_ldr_imm(R_IP, R_IP, 0, 6, ENFORCE_ENCODING_NONE));
       write_thumb_instruction(p + 14,
                               th_cmp_imm(R_IP, 0, ENFORCE_ENCODING_32BIT));
       // if 0 then call resolver, else move one instruction further
@@ -340,6 +345,24 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
     imm8 = x & 0xff;
     (*(uint16_t *)ptr) = (uint16_t)((hi & 0xfb0f) | (i << 10)) | (s << 4);
     (*(uint16_t *)(ptr + 2)) = (uint16_t)((lo & 0x8f00) | (imm3 << 12) | imm8);
+  }
+    return;
+  case R_ARM_THM_PC12: {
+    int x, orig, i, imm12;
+    Section *plt;
+    /* weak reference */
+    if (sym->st_shndx == SHN_UNDEF && ELFW(ST_BIND)(sym->st_info) == STB_WEAK)
+      return;
+
+    /* Get initial offset */
+    orig = (*(uint16_t *)(ptr + 2));
+    x = (val - addr - 4);
+    if (x < 0) {
+      tcc_error_noabort("Implement me: negative R_ARM_THM_PC22");
+    }
+    /* Compute and store final offset */
+    (*(uint16_t *)(ptr + 2)) = orig | (x & 0xfff);
+    return;
   }
     return;
 
