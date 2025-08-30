@@ -1437,25 +1437,29 @@ static void load_full_const(int r, int32_t imm, struct Sym *sym) {
 }
 
 int load_short_from_base(int ir, int base, int fc, int sign) {
-  const thumb_opcode ins = th_ldrsh_imm(ir, base, fc, sign ? 4 : 6);
+  const thumb_opcode ins =
+      th_ldrsh_imm(ir, base, fc, sign ? 4 : 6, ENFORCE_ENCODING_NONE);
   TRACE("Load short sign: %d, r %d, base: %d, fc: %d\n", sign, ir, base, fc);
   return ot(ins);
 }
 
 int load_ushort_from_base(int ir, int base, int fc, int sign) {
-  const thumb_opcode ins = th_ldrh_imm(ir, base, fc, sign ? 4 : 6);
+  const thumb_opcode ins =
+      th_ldrh_imm(ir, base, fc, sign ? 4 : 6, ENFORCE_ENCODING_NONE);
   TRACE("Load ushort sign: %d, r %d, base: %d, fc: %d\n", sign, ir, base, fc);
   return ot(ins);
 }
 
 int load_byte_from_base(int ir, int base, int fc, int sign) {
-  const thumb_opcode ins = th_ldrsb_imm(ir, base, fc, sign ? 4 : 6);
+  const thumb_opcode ins =
+      th_ldrsb_imm(ir, base, fc, sign ? 4 : 6, ENFORCE_ENCODING_NONE);
   TRACE("Load byte sign: %d, r %d, base: %d, fc: %d\n", sign, ir, base, fc);
   return ot(ins);
 }
 
 int load_ubyte_from_base(int ir, int base, int fc, int sign) {
-  const thumb_opcode ins = th_ldrb_imm(ir, base, fc, sign ? 4 : 6);
+  const thumb_opcode ins =
+      th_ldrb_imm(ir, base, fc, sign ? 4 : 6, ENFORCE_ENCODING_NONE);
   TRACE("Load ubyte sign: %d, r %d, base: %d, fc: %d\n", sign, ir, base, fc);
   return ot(ins);
 }
@@ -1501,16 +1505,21 @@ void load_vt_lval_vt_local(int r, SValue *sv, int ft, int fc, int sign,
     int rr = th_offset_to_reg(fc, sign);
     if (btype == VT_SHORT) {
       if (ft & VT_UNSIGNED)
-        ot_check(th_ldrh_reg(ir, base, rr));
+        ot_check(th_ldrh_reg(ir, base, rr, THUMB_SHIFT_DEFAULT,
+                             ENFORCE_ENCODING_NONE));
       else
-        ot_check(th_ldrsh_reg(ir, base, rr));
+        ot_check(th_ldrsh_reg(ir, base, rr, THUMB_SHIFT_DEFAULT,
+                              ENFORCE_ENCODING_NONE));
     } else if (btype == VT_BYTE || btype == VT_BOOL) {
       if (ft & VT_UNSIGNED)
-        ot_check(th_ldrb_reg(ir, base, rr));
+        ot_check(th_ldrb_reg(ir, base, rr, THUMB_SHIFT_DEFAULT,
+                             ENFORCE_ENCODING_NONE));
       else
-        ot_check(th_ldrsb_reg(ir, base, rr));
+        ot_check(th_ldrsb_reg(ir, base, rr, THUMB_SHIFT_DEFAULT,
+                              ENFORCE_ENCODING_NONE));
     } else
-      ot_check(th_ldr_reg(ir, base, rr));
+      ot_check(
+          th_ldr_reg(ir, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
   }
 }
 

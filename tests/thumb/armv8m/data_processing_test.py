@@ -69,3 +69,15 @@ def test_eor_imm():
 def test_eor_reg():
     utils.perform_test_for_file("test_eor_reg.S")
     
+def test_lsl_imm():
+    utils.perform_test_for_file("test_lsl_imm.S")
+    
+def test_lsl_reg():
+    utils.perform_test_for_file("test_lsl_reg.S")
+    
+def test_lsr_imm():
+    utils.perform_test_for_file("test_lsr_imm.S")
+    
+def test_lsr_reg():
+    utils.perform_test_for_file("test_lsr_reg.S")
+    

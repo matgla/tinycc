@@ -723,12 +723,14 @@ thumb_opcode thumb_generate_opcode_for_data_processing(int token,
   return (thumb_opcode){0, 0};
 }
 
-static void thumb_single_memory_transfer_literal_opcode(TCCState *s1, int token,
-                                                        Operand op0) {
+static thumb_opcode thumb_single_memory_transfer_literal_opcode(TCCState *s1,
+                                                                int token,
+                                                                Operand op0,
+                                                                Operand op1) {
   ExprValue e;
   ElfSym *esym;
   int jump_addr = 0;
-  int puw = 0x2;
+  int puw = 0x6;
   enforce_encoding encoding = ENFORCE_ENCODING_NONE;
   if (THUMB_HAS_WIDE_QUALIFIER(token)) {
     encoding = ENFORCE_ENCODING_32BIT;
@@ -741,7 +743,11 @@ static void thumb_single_memory_transfer_literal_opcode(TCCState *s1, int token,
       int aligned_ind = ind & -4;
       jump_addr = esym->st_value - aligned_ind - 4;
     } else {
-      greloca(cur_text_section, e.sym, ind, R_ARM_THM_PC12, 0);
+      if (THUMB_INSTRUCTION_GROUP(token) == TOK_ASM_ldrdeq) {
+        greloca(cur_text_section, e.sym, ind, R_ARM_THM_PC8, 0);
+      } else {
+        greloca(cur_text_section, e.sym, ind, R_ARM_THM_PC12, 0);
+      }
       jump_addr = e.v;
       encoding = ENFORCE_ENCODING_32BIT;
     }
@@ -752,19 +758,39 @@ static void thumb_single_memory_transfer_literal_opcode(TCCState *s1, int token,
   }
   switch (THUMB_INSTRUCTION_GROUP(token)) {
   case TOK_ASM_ldreq:
-    return thumb_emit_opcode(
-        th_ldr_imm(op0.reg, R_PC, jump_addr, puw, encoding));
+    return th_ldr_imm(op0.reg, R_PC, jump_addr, puw, encoding);
+
+  case TOK_ASM_ldrbeq:
+    return th_ldrb_imm(op0.reg, R_PC, jump_addr, puw, encoding);
+  case TOK_ASM_ldrdeq:
+    return th_ldrd_imm(op0.reg, op1.reg, R_PC, jump_addr, puw, encoding);
+  case TOK_ASM_ldrheq:
+    return th_ldrh_imm(op0.reg, R_PC, jump_addr, puw, encoding);
+  case TOK_ASM_ldrsbeq:
+    return th_ldrsb_imm(op0.reg, R_PC, jump_addr, puw, encoding);
+  case TOK_ASM_ldrsheq:
+    return th_ldrsh_imm(op0.reg, R_PC, jump_addr, puw, encoding);
   };
+  return (thumb_opcode){0, 0};
 }
 
-static void thumb_single_memory_transfer_opcode(TCCState *s1, int token) {
+static thumb_opcode thumb_single_memory_transfer_opcode(TCCState *s1,
+                                                        int token) {
   Operand ops[3];
+  Operand op2reg;
   bool closed_bracket = false;
   bool op2_minus = false;
   int nb_ops;
   int excalm = 0;
   thumb_shift shift = {0, 0};
-  ops[2] = (Operand){0};
+  ops[2] = (Operand){
+      .type = OP_IM32,
+      .e =
+          {
+              .v = 0,
+              .sym = NULL,
+          },
+  };
   enforce_encoding encoding = ENFORCE_ENCODING_NONE;
   if (THUMB_HAS_WIDE_QUALIFIER(token)) {
     encoding = ENFORCE_ENCODING_32BIT;
@@ -777,10 +803,14 @@ static void thumb_single_memory_transfer_opcode(TCCState *s1, int token) {
     expect("at least two operands");
   }
   next();
-
+  if (THUMB_INSTRUCTION_GROUP(token) == TOK_ASM_ldrdeq) {
+    parse_operand(s1, &op2reg);
+    next();
+  }
   if (tok != '[') {
     // we have literal addressing mode
-    return thumb_single_memory_transfer_literal_opcode(s1, token, ops[0]);
+    return thumb_single_memory_transfer_literal_opcode(s1, token, ops[0],
+                                                       op2reg);
   }
   skip('[');
   parse_operand(s1, &ops[1]);
@@ -818,44 +848,114 @@ static void thumb_single_memory_transfer_opcode(TCCState *s1, int token) {
     }
   }
 
+  if (THUMB_INSTRUCTION_GROUP(token) == TOK_ASM_ldrdeq) {
+    if (tok == '!') {
+      excalm = 1;
+      next();
+    }
+  }
+
   switch (THUMB_INSTRUCTION_GROUP(token)) {
   case TOK_ASM_ldaeq:
-    thumb_emit_opcode(th_lda(ops[0].reg, ops[1].reg));
-    break;
+    return th_lda(ops[0].reg, ops[1].reg);
   case TOK_ASM_ldabeq:
-    thumb_emit_opcode(th_ldab(ops[0].reg, ops[1].reg));
-    break;
+    return th_ldab(ops[0].reg, ops[1].reg);
   case TOK_ASM_ldaexeq:
-    thumb_emit_opcode(th_ldaex(ops[0].reg, ops[1].reg));
-    break;
+    return th_ldaex(ops[0].reg, ops[1].reg);
   case TOK_ASM_ldaexbeq:
-    thumb_emit_opcode(th_ldaexb(ops[0].reg, ops[1].reg));
-    break;
+    return th_ldaexb(ops[0].reg, ops[1].reg);
   case TOK_ASM_ldaexheq:
-    thumb_emit_opcode(th_ldaexh(ops[0].reg, ops[1].reg));
-    break;
+    return th_ldaexh(ops[0].reg, ops[1].reg);
   case TOK_ASM_ldaheq:
-    thumb_emit_opcode(th_ldah(ops[0].reg, ops[1].reg));
-    break;
+    return th_ldah(ops[0].reg, ops[1].reg);
   case TOK_ASM_ldreq:
-    uint32_t puw = 0x6;
-    int imm = ops[2].e.v;
-    if (excalm) {
-      puw = 0x5;
-    }
+  case TOK_ASM_ldrbeq:
+  case TOK_ASM_ldrdeq:
+  case TOK_ASM_ldrexeq:
+  case TOK_ASM_ldrexbeq:
+  case TOK_ASM_ldrexheq:
+  case TOK_ASM_ldrheq:
+  case TOK_ASM_ldrsbeq:
+  case TOK_ASM_ldrsheq:
+    if (thumb_operand_is_immediate(ops[2].type)) {
+      uint32_t puw = 0x6;
+      int imm = ops[2].e.v;
+      if (excalm) {
+        puw = 0x7;
+      }
 
-    if (closed_bracket && imm != 0) {
-      puw = 0x3;
-    }
+      if (closed_bracket && imm != 0) {
+        puw = 0x3;
+      }
 
-    if (op2_minus || imm < 0) {
-      puw &= ~(0x2);
-      imm = -imm;
+      if (op2_minus || imm < 0) {
+        puw &= ~(0x2);
+        imm = -imm;
+      }
+      switch (THUMB_INSTRUCTION_GROUP(token)) {
+      case TOK_ASM_ldreq:
+        return th_ldr_imm(ops[0].reg, ops[1].reg, imm, puw, encoding);
+      case TOK_ASM_ldrbeq:
+        return th_ldrb_imm(ops[0].reg, ops[1].reg, imm, puw, encoding);
+      case TOK_ASM_ldrdeq:
+        return th_ldrd_imm(ops[0].reg, op2reg.reg, ops[1].reg, imm, puw,
+                           encoding);
+      case TOK_ASM_ldrexeq:
+        return th_ldrex(ops[0].reg, ops[1].reg, imm);
+      case TOK_ASM_ldrexbeq:
+        return th_ldrexb(ops[0].reg, ops[1].reg);
+      case TOK_ASM_ldrexheq:
+        return th_ldrexh(ops[0].reg, ops[1].reg);
+      case TOK_ASM_ldrheq:
+        return th_ldrh_imm(ops[0].reg, ops[1].reg, imm, puw, encoding);
+      case TOK_ASM_ldrsbeq:
+        return th_ldrsb_imm(ops[0].reg, ops[1].reg, imm, puw, encoding);
+      case TOK_ASM_ldrsheq:
+        return th_ldrsh_imm(ops[0].reg, ops[1].reg, imm, puw, encoding);
+      };
+    } else {
+      switch (THUMB_INSTRUCTION_GROUP(token)) {
+      case TOK_ASM_ldreq:
+        return th_ldr_reg(ops[0].reg, ops[1].reg, ops[2].reg, shift, encoding);
+      case TOK_ASM_ldrbeq:
+        return th_ldrb_reg(ops[0].reg, ops[1].reg, ops[2].reg, shift, encoding);
+      case TOK_ASM_ldrheq:
+        return th_ldrh_reg(ops[0].reg, ops[1].reg, ops[2].reg, shift, encoding);
+      case TOK_ASM_ldrsbeq:
+        return th_ldrsb_reg(ops[0].reg, ops[1].reg, ops[2].reg, shift,
+                            encoding);
+      case TOK_ASM_ldrsheq:
+        return th_ldrsh_reg(ops[0].reg, ops[1].reg, ops[2].reg, shift,
+                            encoding);
+      }
     }
-
-    thumb_emit_opcode(th_ldr_imm(ops[0].reg, ops[1].reg, imm, puw, encoding));
-    break;
+  case TOK_ASM_ldrbteq:
+    if (!thumb_operand_is_immediate(ops[2].type)) {
+      expect("third operand must be an immediate");
+    }
+    return th_ldrbt(ops[0].reg, ops[1].reg, ops[2].e.v);
+  case TOK_ASM_ldrhteq:
+    if (!thumb_operand_is_immediate(ops[2].type)) {
+      expect("third operand must be an immediate");
+    }
+    return th_ldrht(ops[0].reg, ops[1].reg, ops[2].e.v);
+  case TOK_ASM_ldrsbteq:
+    if (!thumb_operand_is_immediate(ops[2].type)) {
+      expect("third operand must be an immediate");
+    }
+    return th_ldrsbt(ops[0].reg, ops[1].reg, ops[2].e.v);
+  case TOK_ASM_ldrshteq:
+    if (!thumb_operand_is_immediate(ops[2].type)) {
+      expect("third operand must be an immediate");
+    }
+    return th_ldrsht(ops[0].reg, ops[1].reg, ops[2].e.v);
+  case TOK_ASM_ldrteq:
+    if (!thumb_operand_is_immediate(ops[2].type)) {
+      expect("third operand must be an immediate");
+    }
+    return th_ldrt(ops[0].reg, ops[1].reg, ops[2].e.v);
   };
+  return (thumb_opcode){0, 0};
 }
 
 static void thumb_block_memory_transfer_opcode(TCCState *s1, int token) {
@@ -995,7 +1095,7 @@ static void thumb_data_shift_opcode(TCCState *s1, int token) {
 
   switch (THUMB_INSTRUCTION_GROUP(token)) {
   case TOK_ASM_asrseq:
-  case TOK_ASM_asreq:
+  case TOK_ASM_asreq: {
     flags_behaviour flags =
         thumb_determine_flags_behaviour(token, TOK_ASM_asrseq, false);
     if (THUMB_INSTRUCTION_GROUP(token) == TOK_ASM_asreq &&
@@ -1007,7 +1107,35 @@ static void thumb_data_shift_opcode(TCCState *s1, int token) {
     } else {
       opcode = th_asr_reg(ops[0].reg, ops[1].reg, ops[2].reg, flags, encoding);
     }
-    break;
+  } break;
+  case TOK_ASM_lslseq:
+  case TOK_ASM_lsleq: {
+    flags_behaviour flags =
+        thumb_determine_flags_behaviour(token, TOK_ASM_lslseq, false);
+    if (THUMB_INSTRUCTION_GROUP(token) == TOK_ASM_lsleq &&
+        thumb_conditional_scope == 0) {
+      encoding = ENFORCE_ENCODING_32BIT;
+    }
+    if (thumb_operand_is_immediate(ops[2].type)) {
+      opcode = th_lsl_imm(ops[0].reg, ops[1].reg, ops[2].e.v, flags, encoding);
+    } else {
+      opcode = th_lsl_reg(ops[0].reg, ops[1].reg, ops[2].reg, flags, encoding);
+    }
+  } break;
+  case TOK_ASM_lsrseq:
+  case TOK_ASM_lsreq: {
+    flags_behaviour flags =
+        thumb_determine_flags_behaviour(token, TOK_ASM_lsrseq, false);
+    if (THUMB_INSTRUCTION_GROUP(token) == TOK_ASM_lsreq &&
+        thumb_conditional_scope == 0) {
+      encoding = ENFORCE_ENCODING_32BIT;
+    }
+    if (thumb_operand_is_immediate(ops[2].type)) {
+      opcode = th_lsr_imm(ops[0].reg, ops[1].reg, ops[2].e.v, flags, encoding);
+    } else {
+      opcode = th_lsr_reg(ops[0].reg, ops[1].reg, ops[2].reg, flags, encoding);
+    }
+  } break;
   }
   if (opcode.opcode == 0) {
     tcc_error("failed to encode instruction for: %s", get_tok_str(token, NULL));
@@ -1198,6 +1326,10 @@ ST_FUNC void asm_opcode(TCCState *s1, int token) {
     return thumb_process_control(s1, token);
   case TOK_ASM_asreq:
   case TOK_ASM_asrseq:
+  case TOK_ASM_lsleq:
+  case TOK_ASM_lslseq:
+  case TOK_ASM_lsreq:
+  case TOK_ASM_lsrseq:
     return thumb_data_shift_opcode(s1, token);
   case TOK_ASM_bfieq:
     return thumb_bfi_opcode(s1, token);
@@ -1221,7 +1353,20 @@ ST_FUNC void asm_opcode(TCCState *s1, int token) {
   case TOK_ASM_ldaexheq:
   case TOK_ASM_ldaheq:
   case TOK_ASM_ldreq:
-    return thumb_single_memory_transfer_opcode(s1, token);
+  case TOK_ASM_ldrbeq:
+  case TOK_ASM_ldrbteq:
+  case TOK_ASM_ldrdeq:
+  case TOK_ASM_ldrexeq:
+  case TOK_ASM_ldrexbeq:
+  case TOK_ASM_ldrexheq:
+  case TOK_ASM_ldrheq:
+  case TOK_ASM_ldrhteq:
+  case TOK_ASM_ldrsbeq:
+  case TOK_ASM_ldrsbteq:
+  case TOK_ASM_ldrsheq:
+  case TOK_ASM_ldrshteq:
+  case TOK_ASM_ldrteq:
+    return thumb_emit_opcode(thumb_single_memory_transfer_opcode(s1, token));
   case TOK_ASM_ldmeq:
   case TOK_ASM_ldmfdeq:
   case TOK_ASM_ldmiaeq:

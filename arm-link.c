@@ -68,6 +68,7 @@ ST_FUNC int code_reloc(int reloc_type) {
   case R_ARM_THM_ALU_PREL_11_0:
   case R_ARM_THM_JUMP6:
   case R_ARM_THM_PC12:
+  case R_ARM_THM_PC8:
     return 1;
   }
   return -1;
@@ -104,6 +105,7 @@ ST_FUNC int gotplt_entry_type(int reloc_type) {
   case R_ARM_MOVT_PREL:
   case R_ARM_MOVW_PREL_NC:
   case R_ARM_THM_PC12:
+  case R_ARM_THM_PC8:
     return AUTO_GOTPLT_ENTRY;
 
   case R_ARM_GOTPC:
@@ -325,12 +327,11 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
       x = -x;
     }
 
+    addr &= -4;
     if (val < addr) {
-      addr &= -4;
       x = val - addr - 4;
     } else {
       s = 0;
-      addr &= -4;
       x = val - (addr + 4);
     }
 
@@ -356,13 +357,38 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
 
     /* Get initial offset */
     orig = (*(uint16_t *)(ptr + 2));
-    x = (val - addr - 4);
-    if (x < 0) {
-      tcc_error_noabort("Implement me: negative R_ARM_THM_PC22");
+    addr &= -4;
+    if (val > addr) {
+      x = val - addr - 4;
+    } else {
+      uint32_t original_instruction = (*(uint16_t *)ptr);
+      (*(uint16_t *)ptr) = original_instruction & 0xff7f;
+      x = addr + 4 - val;
     }
     /* Compute and store final offset */
     (*(uint16_t *)(ptr + 2)) = orig | (x & 0xfff);
+  }
     return;
+  case R_ARM_THM_PC8: {
+    int x, orig, i, imm8;
+    Section *plt;
+    /* weak reference */
+    if (sym->st_shndx == SHN_UNDEF && ELFW(ST_BIND)(sym->st_info) == STB_WEAK)
+      return;
+
+    /* Get initial offset */
+    orig = (*(uint16_t *)(ptr + 2));
+    addr &= -4;
+    if (val > addr) {
+      x = val - addr - 4;
+    } else {
+      uint32_t original_instruction = (*(uint16_t *)ptr);
+      (*(uint16_t *)ptr) = original_instruction & 0xff7f;
+      x = addr + 4 - val;
+    }
+    x >>= 2;
+    /* Compute and store final offset */
+    (*(uint16_t *)(ptr + 2)) = orig | (x & 0xff);
   }
     return;
 

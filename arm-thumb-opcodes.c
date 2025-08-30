@@ -728,16 +728,22 @@ int th_ldr_literal_estimate(uint16_t rt, uint32_t imm) {
   return 0;
 }
 
-thumb_opcode th_ldrsh_imm(uint32_t rt, uint32_t rn, uint32_t imm,
-                          uint32_t puw) {
+thumb_opcode th_ldrsh_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw,
+                          enforce_encoding encoding) {
 #ifndef TCC_TARGET_ARM_ARCHV6M
   // puw == 6 means positive offset on rn, so T1 encoding can be used
-  if (rt != R_SP && imm <= 4095 && puw == 6) {
+  if (rt != R_SP && imm <= 4095 && puw == 6 && rn != R_PC) {
     uint32_t ins = (0xf9b0 | ((rn & 0xf))) << 16;
     ins |= (((rt & 0xf) << 12) | imm);
     return (thumb_opcode){
         .size = 4,
         .opcode = ins,
+    };
+  } else if (imm <= 4095 && rn == R_PC) {
+    const uint32_t u = (puw & 0x2) >> 1;
+    return (thumb_opcode){
+        .size = 4,
+        .opcode = 0xf93f0000 | (rn << 16) | (rt << 12) | (u << 23) | imm,
     };
   } else if (rt != R_SP && imm <= 255) {
     uint32_t ins = (0xf930 | (rn & 0xf)) << 16;
@@ -755,19 +761,24 @@ thumb_opcode th_ldrsh_imm(uint32_t rt, uint32_t rn, uint32_t imm,
   };
 }
 
-thumb_opcode th_ldrsh_reg(uint32_t rt, uint32_t rn, uint32_t rm) {
+thumb_opcode th_ldrsh_reg(uint32_t rt, uint32_t rn, uint32_t rm,
+                          thumb_shift shift, enforce_encoding encoding) {
+  if (shift.type != THUMB_SHIFT_NONE && shift.type != THUMB_SHIFT_LSL) {
+    tcc_error("compiler_error: 'th_ldrsh_reg', only LSL shift supported\n");
+  }
   // puw == 6 means positive offset on rn, so T1 encoding can be used
-  if (rm < 8 && rt < 8 && rn < 8) {
+  if (rm < 8 && rt < 8 && rn < 8 && shift.type == THUMB_SHIFT_NONE &&
+      encoding != ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
         .size = 2,
         .opcode = 0x5e00 | (rm << 6) | (rn << 3) | rt,
     };
   }
 #ifndef TCC_TARGET_ARM_ARCHV6M
-  else if (rt != R_SP && rm != R_SP && rn != R_SP) {
+  else if (rt != R_SP && rm != R_SP && rm != R_SP) {
     return (thumb_opcode){
         .size = 4,
-        .opcode = 0xf9300000 | (rn << 16) | (rt << 12) | rm,
+        .opcode = 0xf9300000 | (rn << 16) | (rt << 12) | rm | shift.value << 4,
     };
   }
 #endif
@@ -777,20 +788,31 @@ thumb_opcode th_ldrsh_reg(uint32_t rt, uint32_t rn, uint32_t rm) {
   };
 }
 
-thumb_opcode th_ldrh_imm(uint16_t rt, uint16_t rn, uint32_t imm, uint32_t puw) {
+thumb_opcode th_ldrh_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw,
+                         enforce_encoding encoding) {
+  printf("th_ldrh_imm rt %u rn %u imm %d puw %u enc %d at %x\n", rt, rn, imm,
+         puw, encoding, ind);
   // T1 encoding, on armv6-m this one is the only one available
-  if (puw == 6 && rn < 8 && rt < 8 && imm <= 62 && !(imm & 1)) {
+  if (puw == 6 && rn < 8 && rt < 8 && imm <= 62 &&
+      encoding != ENFORCE_ENCODING_32BIT && !(imm & 1)) {
+    imm = imm >> 1;
     // imm[0] is enforced to be 0, and sould be divided by 2, thus offset is 5
     return (thumb_opcode){
         .size = 2,
-        .opcode = (0x8800 | (imm << 5) | (rn << 3) | rt),
+        .opcode = (0x8800 | (imm << 6) | (rn << 3) | rt),
     };
   }
 #ifndef TCC_TARGET_ARM_ARCHV6M
-  else if (puw == 6 && rt != R_SP && imm <= 4095) {
+  else if (puw == 6 && rt != R_SP && imm >= 0 && imm <= 4095 && rn != R_PC) {
     return (thumb_opcode){
         .size = 4,
         .opcode = 0xf8b00000 | (rn << 16) | (rt << 12) | imm,
+    };
+  } else if (imm >= 0 && imm <= 4095 && rn == R_PC) {
+    const uint32_t u = (puw & 0x2) >> 1;
+    return (thumb_opcode){
+        .size = 4,
+        .opcode = 0xf83f0000 | (u << 23) | (rn << 16) | (rt << 12) | imm,
     };
   } else if (rt != R_SP && imm <= 255) {
     return (thumb_opcode){
@@ -805,9 +827,15 @@ thumb_opcode th_ldrh_imm(uint16_t rt, uint16_t rn, uint32_t imm, uint32_t puw) {
   };
 }
 
-thumb_opcode th_ldrh_reg(uint32_t rt, uint32_t rn, uint32_t rm) {
+thumb_opcode th_ldrh_reg(uint32_t rt, uint32_t rn, uint32_t rm,
+                         thumb_shift shift, enforce_encoding encoding) {
+
+  if (shift.type != THUMB_SHIFT_NONE && shift.type != THUMB_SHIFT_LSL) {
+    tcc_error("compiler_error: 'th_ldr_reg', only LSL shift supported\n");
+  }
   // puw == 6 means positive offset on rn, so T1 encoding can be used
-  if (rm < 8 && rt < 8 && rn < 8) {
+  if (rm < 8 && rt < 8 && rn < 8 && shift.type == THUMB_SHIFT_NONE &&
+      encoding != ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
         .size = 2,
         .opcode = 0x5a00 | (rm << 6) | (rn << 3) | rt,
@@ -817,7 +845,7 @@ thumb_opcode th_ldrh_reg(uint32_t rt, uint32_t rn, uint32_t rm) {
   else if (rt != R_SP && rm != R_SP && rm != R_PC) {
     return (thumb_opcode){
         .size = 4,
-        .opcode = 0xf8300000 | (rn << 16) | (rt << 12) | rm,
+        .opcode = 0xf8300000 | (rn << 16) | (rt << 12) | rm | shift.value << 4,
     };
   }
 #endif
@@ -827,15 +855,22 @@ thumb_opcode th_ldrh_reg(uint32_t rt, uint32_t rn, uint32_t rm) {
   };
 }
 
-thumb_opcode th_ldrsb_imm(uint32_t rt, uint32_t rn, uint32_t imm,
-                          uint32_t puw) {
+thumb_opcode th_ldrsb_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw,
+                          enforce_encoding encoding) {
 #ifndef TCC_TARGET_ARM_ARCHV6M
   // puw == 6 means positive offset on rn, so T1 encoding can be used
-  if (rt != R_SP && imm <= 4095 && puw == 6) {
+  if (rt != R_SP && imm <= 4095 && puw == 6 && rn != R_PC) {
     return (thumb_opcode){
         .size = 4,
         .opcode = 0xf9900000 | (rn << 16) | (rt << 12) | imm,
     };
+  } else if (imm <= 4095 && rn == R_PC) {
+    const uint32_t u = (puw & 0x2) >> 1;
+    return (thumb_opcode){
+        .size = 4,
+        .opcode = 0xf91f0000 | (rn << 16) | (rt << 12) | (u << 23) | imm,
+    };
+
   } else if (rt != R_SP && imm <= 255) {
     return (thumb_opcode){
         .size = 4,
@@ -849,19 +884,25 @@ thumb_opcode th_ldrsb_imm(uint32_t rt, uint32_t rn, uint32_t imm,
   };
 }
 
-thumb_opcode th_ldrsb_reg(uint32_t rt, uint32_t rn, uint32_t rm) {
+thumb_opcode th_ldrsb_reg(uint32_t rt, uint32_t rn, uint32_t rm,
+                          thumb_shift shift, enforce_encoding encoding) {
+  if (shift.type != THUMB_SHIFT_NONE && shift.type != THUMB_SHIFT_LSL) {
+    tcc_error("compiler_error: 'th_ldr_reg', only LSL shift supported\n");
+  }
+
   // puw == 6 means positive offset on rn, so T1 encoding can be used
-  if (rm < 8 && rt < 8 && rn < 8) {
+  if (rm < 8 && rt < 8 && rn < 8 && encoding != ENFORCE_ENCODING_32BIT &&
+      shift.type == THUMB_SHIFT_NONE) {
     return (thumb_opcode){
         .size = 2,
         .opcode = 0x5600 | (rm << 6) | (rn << 3) | rt,
     };
   }
 #ifndef TCC_TARGET_ARM_ARCHV6M
-  else if (rt != R_SP && rn != R_SP && rm != R_SP) {
+  else if (rt != R_SP && rm != R_SP && rm != R_SP) {
     return (thumb_opcode){
         .size = 4,
-        .opcode = 0xf9100000 | (rn << 16) | (rt << 12) | rm,
+        .opcode = 0xf9100000 | (rn << 16) | (rt << 12) | rm | shift.value << 4,
     };
   }
 #endif
@@ -871,20 +912,28 @@ thumb_opcode th_ldrsb_reg(uint32_t rt, uint32_t rn, uint32_t rm) {
   };
 }
 
-thumb_opcode th_ldrb_imm(uint16_t rt, uint16_t rn, uint32_t imm, uint32_t puw) {
+thumb_opcode th_ldrb_imm(uint16_t rt, uint16_t rn, int imm, uint32_t puw,
+                         enforce_encoding encoding) {
   // T1 encoding, on armv6-m this one is the only one available
-  if (puw == 6 && rn < 8 && rt < 8 && imm <= 62 && !(imm & 1)) {
+  if (puw == 6 && rn < 8 && rt < 8 && imm <= 31 &&
+      encoding != ENFORCE_ENCODING_32BIT) {
     // imm[0] is enforced to be 0, and sould be divided by 2, thus offset is 5
     return (thumb_opcode){
         .size = 2,
-        .opcode = 0x7800 | (imm << 5) | (rn << 3) | rt,
+        .opcode = 0x7800 | (imm << 6) | (rn << 3) | rt,
     };
   }
 #ifndef TCC_TARGET_ARM_ARCHV6M
-  else if (puw == 6 && rt != R_SP && imm <= 4095) {
+  else if (puw == 6 && rt != R_SP && imm >= 0 && imm <= 4095 && rn != R_PC) {
     return (thumb_opcode){
         .size = 4,
         .opcode = 0xf8900000 | (rn << 16) | (rt << 12) | imm,
+    };
+  } else if (imm >= 0 && imm <= 4095 && rn == R_PC) {
+    uint32_t u = (puw & 0x2) >> 1;
+    return (thumb_opcode){
+        .size = 4,
+        .opcode = 0xf81f0000 | (u << 23) | (rt << 12) | imm,
     };
   } else if (rt != R_SP && imm <= 255) {
     return (thumb_opcode){
@@ -899,9 +948,14 @@ thumb_opcode th_ldrb_imm(uint16_t rt, uint16_t rn, uint32_t imm, uint32_t puw) {
   };
 }
 
-thumb_opcode th_ldrb_reg(uint32_t rt, uint32_t rn, uint32_t rm) {
+thumb_opcode th_ldrb_reg(uint32_t rt, uint32_t rn, uint32_t rm,
+                         thumb_shift shift, enforce_encoding encoding) {
   // puw == 6 means positive offset on rn, so T1 encoding can be used
-  if (rm < 8 && rt < 8 && rn < 8) {
+  if (shift.type != THUMB_SHIFT_NONE && shift.type != THUMB_SHIFT_LSL) {
+    tcc_error("compiler_error: 'th_ldr_reg', only LSL shift supported\n");
+  }
+  if (rm < 8 && rt < 8 && rn < 8 && shift.type == THUMB_SHIFT_NONE &&
+      encoding != ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
         .size = 2,
         .opcode = 0x5c00 | (rm << 6) | (rn << 3) | rt,
@@ -911,7 +965,7 @@ thumb_opcode th_ldrb_reg(uint32_t rt, uint32_t rn, uint32_t rm) {
   else if (rt != R_SP && rm != R_SP && rm != R_PC) {
     return (thumb_opcode){
         .size = 4,
-        .opcode = 0xf8100000 | (rn << 16) | (rt << 12) | rm,
+        .opcode = 0xf8100000 | (rn << 16) | (rt << 12) | rm | shift.value << 4,
     };
   }
 #endif
@@ -968,8 +1022,13 @@ thumb_opcode th_ldr_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw,
   };
 }
 
-thumb_opcode th_ldr_reg(uint32_t rt, uint32_t rn, uint32_t rm) {
-  if (rm < 8 && rt < 8 && rn < 8) {
+thumb_opcode th_ldr_reg(uint32_t rt, uint32_t rn, uint32_t rm,
+                        thumb_shift shift, enforce_encoding encoding) {
+  if (shift.type != THUMB_SHIFT_NONE && shift.type != THUMB_SHIFT_LSL) {
+    tcc_error("compiler_error: 'th_ldr_reg', only LSL shift supported\n");
+  }
+  if (rm < 8 && rt < 8 && rn < 8 && shift.type == THUMB_SHIFT_NONE &&
+      encoding != ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
         .size = 2,
         .opcode = (0x5800 | (rm << 6) | (rn << 3) | rt),
@@ -979,7 +1038,7 @@ thumb_opcode th_ldr_reg(uint32_t rt, uint32_t rn, uint32_t rm) {
   else if (rt != R_SP && rm != R_SP && rm != R_PC) {
     return (thumb_opcode){
         .size = 4,
-        .opcode = 0xf8500000 | (rn << 16) | (rt << 12) | rm,
+        .opcode = 0xf8500000 | (rn << 16) | (rt << 12) | rm | shift.value << 4,
     };
   }
 #endif
@@ -1401,7 +1460,7 @@ thumb_opcode th_lsl_reg(uint16_t rd, uint16_t rn, uint16_t rm,
 
 thumb_opcode th_lsl_imm(uint16_t rd, uint16_t rm, uint32_t imm,
                         flags_behaviour flags, enforce_encoding encoding) {
-  if (rm < 8 && rd < 8 && encoding != ENFORCE_ENCODING_16BIT) {
+  if (rm < 8 && rd < 8 && encoding != ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
         .size = 2,
         .opcode = ((imm << 6) | (rm << 3) | rd),
@@ -1955,6 +2014,78 @@ thumb_opcode th_ldmdb(uint32_t rn, uint32_t regset, uint32_t writeback) {
   return (thumb_opcode){
       .size = 4,
       .opcode = 0xe9100000 | (writeback << 21) | (rn << 16) | regset,
+  };
+}
+
+thumb_opcode th_ldrbt(uint32_t rt, uint32_t rn, int imm) {
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xf8100e00 | (rn << 16) | (rt << 12) | (imm & 0xff),
+  };
+}
+
+thumb_opcode th_ldrd_imm(uint32_t rt, uint32_t rt2, uint32_t rn, int imm,
+                         uint32_t puw, enforce_encoding encoding) {
+  const uint32_t pu = (puw >> 1) & 0x3;
+  const uint32_t w = puw & 0x1;
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xe8500000 | (pu << 23) | w << 21 | rn << 16 | rt << 12 |
+                rt2 << 8 | (imm >> 2),
+  };
+}
+
+thumb_opcode th_ldrex(uint32_t rt, uint32_t rn, int imm) {
+  if (imm < 0 || imm > 1020) {
+    tcc_error("compiler_error: 'th_ldrex' imm is outside of range: 0x%x, max "
+              "value: 0x3fc\n",
+              imm);
+  }
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xe8500f00 | (rn << 16) | (rt << 12) | (imm >> 2),
+  };
+}
+
+thumb_opcode th_ldrexb(uint32_t rt, uint32_t rn) {
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xe8d00f4f | (rn << 16) | (rt << 12),
+  };
+}
+
+thumb_opcode th_ldrexh(uint32_t rt, uint32_t rn) {
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xe8d00f5f | (rn << 16) | (rt << 12),
+  };
+}
+
+thumb_opcode th_ldrht(uint32_t rt, uint32_t rn, int imm) {
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xf8300e00 | (rn << 16) | (rt << 12) | (imm & 0xff),
+  };
+}
+
+thumb_opcode th_ldrsbt(uint32_t rt, uint32_t rn, int imm) {
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xf9100e00 | (rn << 16) | (rt << 12) | (imm & 0xff),
+  };
+}
+
+thumb_opcode th_ldrsht(uint32_t rt, uint32_t rn, int imm) {
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xf9300e00 | (rn << 16) | (rt << 12) | (imm & 0xff),
+  };
+}
+
+thumb_opcode th_ldrt(uint32_t rt, uint32_t rn, int imm) {
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xf8500e00 | (rn << 16) | (rt << 12) | (imm & 0xff),
   };
 }
 
