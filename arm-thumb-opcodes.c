@@ -2229,7 +2229,7 @@ thumb_opcode th_pkhbt(uint32_t rd, uint32_t rn, uint32_t rm,
   const uint32_t imm2 = shift.value & 0x3;
   const uint32_t imm3 = (shift.value >> 2) & 0x7;
   uint32_t tb = 0;
-  if (shift.type == THUMB_SHIFT_LSL) {
+  if (shift.type == THUMB_SHIFT_LSL || shift.value == 0) {
     tb = 0;
   } else if (shift.type == THUMB_SHIFT_ASR) {
     tb = 1;
@@ -2238,11 +2238,90 @@ thumb_opcode th_pkhbt(uint32_t rd, uint32_t rn, uint32_t rm,
     return (thumb_opcode){0, 0};
   }
 
-  shift.type == THUMB_SHIFT_LSL ? 0 : 1;
   return (thumb_opcode){
       .size = 4,
       .opcode = 0xeac00000 | rn << 16 | imm3 << 12 | rd << 8 | imm2 << 6 |
                 tb << 5 | rm,
+  };
+}
+
+thumb_opcode th_pld_literal(int imm) {
+  int u = 1;
+  if (imm < 0) {
+    u = 0;
+    imm = -imm;
+  }
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xf81ff000 | u << 23 | imm,
+  };
+}
+
+thumb_opcode th_pld_imm(uint32_t rn, uint32_t w, int imm) {
+  if (imm >= 0) {
+    return (thumb_opcode){
+        .size = 4,
+        .opcode = 0xf890f000 | w << 22 | rn << 16 | imm,
+    };
+  }
+  imm = -imm;
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xf810fc00 | w << 22 | rn << 16 | imm,
+  };
+}
+
+thumb_opcode th_pld_reg(uint32_t rn, uint32_t rm, uint32_t w,
+                        thumb_shift shift) {
+  if (shift.type == THUMB_SHIFT_NONE) {
+    shift.type = THUMB_SHIFT_LSL;
+  }
+  if (shift.type != THUMB_SHIFT_LSL || shift.value > 3 || shift.value < 0) {
+    tcc_error("compiler_error: 'th_pld_reg', invalid shift type\n");
+  }
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xf810f000 | w << 22 | rn << 16 | rm | shift.value << 4,
+  };
+}
+
+thumb_opcode th_pli_literal(int imm) {
+  int u = 1;
+  if (imm < 0) {
+    u = 0;
+    imm = -imm;
+  }
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xf91ff000 | u << 23 | imm,
+  };
+}
+
+thumb_opcode th_pli_imm(uint32_t rn, uint32_t w, int imm) {
+  if (imm >= 0) {
+    return (thumb_opcode){
+        .size = 4,
+        .opcode = 0xf990f000 | w << 22 | rn << 16 | imm,
+    };
+  }
+  imm = -imm;
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xf910fc00 | w << 22 | rn << 16 | imm,
+  };
+}
+
+thumb_opcode th_pli_reg(uint32_t rn, uint32_t rm, uint32_t w,
+                        thumb_shift shift) {
+  if (shift.type == THUMB_SHIFT_NONE) {
+    shift.type = THUMB_SHIFT_LSL;
+  }
+  if (shift.type != THUMB_SHIFT_LSL || shift.value > 3 || shift.value < 0) {
+    tcc_error("compiler_error: 'th_pli_reg', invalid shift type\n");
+  }
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xf910f000 | w << 22 | rn << 16 | rm | shift.value << 4,
   };
 }
 

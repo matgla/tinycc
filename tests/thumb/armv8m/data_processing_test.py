@@ -122,3 +122,24 @@ def test_orr_reg():
 
 def test_pkhbt_imm():
     utils.perform_test_for_file("test_pkhbt.S")
+
+def test_pld_literal():
+    utils.perform_test_for_file("test_pld_literal.S")
+
+def test_pld_imm():
+    utils.perform_test_for_file("test_pld_imm.S")
+
+def test_pld_reg():
+    utils.perform_test_for_file("test_pld_reg.S")
+
+def test_pli_literal():
+    utils.perform_test_for_file("test_pli_literal.S")
+
+def test_pli_imm():
+    utils.perform_test_for_file("test_pli_imm.S")
+
+def test_pli_reg():
+    utils.perform_test_for_file("test_pli_reg.S")
+
+def test_pop():
+    utils.perform_test_for_file("test_pop.S")

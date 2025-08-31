@@ -347,3 +347,12 @@ thumb_opcode th_orn_imm(uint16_t rd, uint16_t rm, uint32_t imm,
                         flags_behaviour flags);
 
 thumb_opcode th_pkhbt(uint32_t rd, uint32_t rn, uint32_t rm, thumb_shift shift);
+
+thumb_opcode th_pld_literal(int imm);
+thumb_opcode th_pld_imm(uint32_t rn, uint32_t w, int imm);
+thumb_opcode th_pld_reg(uint32_t rn, uint32_t rm, uint32_t w,
+                        thumb_shift shift);
+thumb_opcode th_pli_literal(int imm);
+thumb_opcode th_pli_imm(uint32_t rn, uint32_t w, int imm);
+thumb_opcode th_pli_reg(uint32_t rn, uint32_t rm, uint32_t w,
+                        thumb_shift shift);

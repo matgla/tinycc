@@ -309,7 +309,7 @@ static bool parse_operand(TCCState *s1, Operand *op) {
     else if (op->e.v == (uint8_t)op->e.v)
       op->type = OP_IM8;
   } else
-    expect("operand");
+    return false;
   return true;
 }
 
@@ -817,6 +817,72 @@ static thumb_opcode thumb_single_memory_transfer_literal_opcode(TCCState *s1,
   return (thumb_opcode){0, 0};
 }
 
+static thumb_opcode thumb_cache_preload_opcode(TCCState *s1, int token) {
+  enforce_encoding encoding = ENFORCE_ENCODING_NONE;
+  ExprValue e;
+  ElfSym *esym;
+  bool is_literal = true;
+  thumb_shift shift = {0, 0};
+  Operand ops[2] = {
+      {0, 0},
+      {0, 0},
+  };
+  int jump_addr = 0;
+  if (THUMB_HAS_WIDE_QUALIFIER(token)) {
+    encoding = ENFORCE_ENCODING_32BIT;
+  }
+
+  if (tok == '[') {
+    is_literal = false;
+    skip('[');
+    parse_operand(s1, &ops[0]);
+    if (tok == ',') {
+      skip(',');
+      parse_operand(s1, &ops[1]);
+    }
+    if (tok == ',') {
+      skip(',');
+      if (thumb_operand_is_register(ops[1].type)) {
+        shift = asm_parse_optional_shift(s1);
+      }
+    }
+    skip(']');
+  } else {
+    asm_expr(s1, &e);
+    if (e.sym) {
+      esym = elfsym(e.sym);
+      if (esym && esym->st_shndx == cur_text_section->sh_num) {
+        int aligned_ind = ind & -4;
+        jump_addr = esym->st_value - aligned_ind - 4;
+      } else {
+        greloca(cur_text_section, e.sym, ind, R_ARM_THM_PC12, 0);
+        jump_addr = e.v;
+        encoding = ENFORCE_ENCODING_32BIT;
+      }
+    }
+  }
+  printf("literal: %d\n", is_literal);
+  switch (THUMB_INSTRUCTION_GROUP(token)) {
+  case TOK_ASM_pldeq: {
+    if (is_literal)
+      return th_pld_literal(jump_addr);
+    if (thumb_operand_is_register(ops[1].type)) {
+      return th_pld_reg(ops[0].reg, ops[1].reg, 0, shift);
+    }
+    return th_pld_imm(ops[0].reg, 0, ops[1].e.v);
+  }
+  case TOK_ASM_plieq: {
+    if (is_literal)
+      return th_pli_literal(jump_addr);
+    if (thumb_operand_is_register(ops[1].type)) {
+      return th_pli_reg(ops[0].reg, ops[1].reg, 0, shift);
+    }
+    return th_pli_imm(ops[0].reg, 0, ops[1].e.v);
+  }
+  }
+  return (thumb_opcode){0, 0};
+}
+
 static thumb_opcode thumb_single_memory_transfer_opcode(TCCState *s1,
                                                         int token) {
   Operand ops[3];
@@ -1042,6 +1108,21 @@ static void thumb_block_memory_transfer_opcode(TCCState *s1, int token) {
   };
 }
 
+static thumb_opcode thumb_pushpop_opcode(TCCState *s1, int token) {
+  Operand op;
+  enforce_encoding encoding;
+  parse_operand(s1, &op);
+  if (THUMB_HAS_WIDE_QUALIFIER(token)) {
+    encoding = ENFORCE_ENCODING_32BIT;
+  }
+
+  switch (THUMB_INSTRUCTION_GROUP(token)) {
+  case TOK_ASM_popeq:
+    return th_pop(op.regset);
+  }
+  return (thumb_opcode){0, 0};
+}
+
 static void thumb_bfi_opcode(TCCState *s1, int token) {
   Operand ops[4];
   int nb_ops;
@@ -1069,8 +1150,7 @@ static thumb_opcode thumb_pkhbt_opcode(TCCState *s1, int token) {
   Operand ops[3];
   int nb_ops;
   nb_ops = process_operands(s1, sizeof(ops) / sizeof(ops[0]), ops);
-  thumb_shift shift = arm_parse_optional_shift(s1);
-
+  thumb_shift shift = asm_parse_optional_shift(s1);
   switch (THUMB_INSTRUCTION_GROUP(token)) {
   case TOK_ASM_pkhbteq:
     if (shift.type == THUMB_SHIFT_NONE) {
@@ -1081,7 +1161,6 @@ static thumb_opcode thumb_pkhbt_opcode(TCCState *s1, int token) {
     if (shift.type != THUMB_SHIFT_LSL) {
       expect("shift must be LSL");
     }
-    shift.value = ops[3].e.v;
     break;
   case TOK_ASM_pkhtbeq:
     if (shift.type == THUMB_SHIFT_NONE) {
@@ -1092,10 +1171,8 @@ static thumb_opcode thumb_pkhbt_opcode(TCCState *s1, int token) {
     if (shift.type != THUMB_SHIFT_ASR) {
       expect("shift must be ASR");
     }
-    shift.value = ops[3].e.v;
     break;
   };
-
   return th_pkhbt(ops[0].reg, ops[1].reg, ops[2].reg, shift);
 }
 
@@ -1587,6 +1664,11 @@ ST_FUNC void asm_opcode(TCCState *s1, int token) {
   case TOK_ASM_ldrshteq:
   case TOK_ASM_ldrteq:
     return thumb_emit_opcode(thumb_single_memory_transfer_opcode(s1, token));
+  case TOK_ASM_pldeq:
+  case TOK_ASM_pldweq:
+  case TOK_ASM_plieq:
+  case TOK_ASM_pliweq:
+    return thumb_emit_opcode(thumb_cache_preload_opcode(s1, token));
   case TOK_ASM_ldmeq:
   case TOK_ASM_ldmfdeq:
   case TOK_ASM_ldmiaeq:
@@ -1608,6 +1690,8 @@ ST_FUNC void asm_opcode(TCCState *s1, int token) {
   case TOK_ASM_pkhbteq:
   case TOK_ASM_pkhtbeq:
     return thumb_emit_opcode(thumb_pkhbt_opcode(s1, token));
+  case TOK_ASM_popeq:
+    return thumb_emit_opcode(thumb_pushpop_opcode(s1, token));
   default:
     printf("asm_opcode: unknown token %s\n", get_tok_str(token, NULL));
     expect("known instruction");
