@@ -40,7 +40,13 @@
 
 #include "arm-thumb-opcodes.h"
 
-thumb_opcode th_nop() {
+thumb_opcode th_nop(enforce_encoding encoding) {
+  if (encoding == ENFORCE_ENCODING_32BIT) {
+    return (thumb_opcode){
+        .size = 4,
+        .opcode = 0xf3af8000,
+    };
+  }
   return (thumb_opcode){
       .size = 2,
       .opcode = 0xbf00,
@@ -233,12 +239,37 @@ thumb_opcode th_cbz(uint16_t rn, uint32_t imm, uint32_t nonzero) {
 }
 
 // all t32 arch
-thumb_opcode th_mov_reg(uint16_t rd, uint16_t rm) {
-  const uint16_t D = (rd >> 3) & 1;
-  return (thumb_opcode){
-      .size = 2,
-      .opcode = (0x4600 | (D << 7) | (rm << 3) | (rd & 0x7)),
-  };
+thumb_opcode th_mov_reg(uint32_t rd, uint32_t rm, flags_behaviour flags,
+                        thumb_shift shift, enforce_encoding encoding) {
+  if (shift.type == THUMB_SHIFT_LSL && flags == FLAGS_BEHAVIOUR_SET) {
+    thumb_opcode op = th_lsl_imm(rd, rm, shift.value, flags, encoding);
+    if (op.size == 2)
+      return op;
+  } else if (shift.type == THUMB_SHIFT_ASR && flags == FLAGS_BEHAVIOUR_SET) {
+    thumb_opcode op = th_asr_imm(rd, rm, shift.value, flags, encoding);
+    if (op.size == 2)
+      return op;
+  }
+  if (flags != FLAGS_BEHAVIOUR_SET && encoding != ENFORCE_ENCODING_32BIT &&
+      shift.type == THUMB_SHIFT_NONE) {
+    const uint16_t D = (rd >> 3) & 1;
+    return (thumb_opcode){
+        .size = 2,
+        .opcode = (0x4600 | (D << 7) | (rm << 3) | (rd & 0x7)),
+    };
+  }
+  if (encoding != ENFORCE_ENCODING_32BIT && rd < 8 && rm < 8 &&
+      shift.type == THUMB_SHIFT_NONE) {
+    return (thumb_opcode){
+        .size = 2,
+        .opcode =
+            (0x0000 | (shift.type << 11) | (shift.value << 6) | (rm << 3) | rd),
+    };
+  }
+  if (encoding != ENFORCE_ENCODING_16BIT) {
+    return th_generic_op_reg_shift_with_status(0xea4f, rd, 0xf, rm, flags,
+                                               shift);
+  }
 }
 
 thumb_opcode th_mov_imm(uint16_t rd, uint32_t imm, flags_behaviour setflags,
@@ -277,6 +308,22 @@ thumb_opcode th_mov_imm(uint16_t rd, uint32_t imm, flags_behaviour setflags,
   return (thumb_opcode){
       .size = 0,
       .opcode = 0,
+  };
+}
+
+thumb_opcode th_movt(uint32_t rd, uint32_t imm16) {
+  if (rd == R_SP || rd == R_PC || imm16 > 0xffff) {
+    tcc_error("compiler_error: 'th_movt', SP or PC can't be used as rd\n");
+    return (thumb_opcode){0, 0};
+  }
+  const uint32_t imm8 = imm16 & 0xff;
+  const uint32_t imm3 = (imm16 >> 8) & 0x7;
+  const uint32_t i = (imm16 >> 11) & 0x1;
+  const uint32_t imm4 = (imm16 >> 12) & 0xf;
+
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xf2c00000 | i << 26 | imm4 << 16 | imm3 << 12 | rd << 8 | imm8,
   };
 }
 
@@ -577,9 +624,10 @@ thumb_opcode th_sbc_imm(uint16_t rd, uint16_t rn, uint32_t imm) {
   };
 }
 
-thumb_opcode th_orr_imm(uint16_t rd, uint16_t rn, uint32_t imm) {
+thumb_opcode th_orr_imm(uint16_t rd, uint16_t rn, uint32_t imm,
+                        flags_behaviour setflags) {
   if (rn != R_SP && rd != R_SP && rn != R_PC) {
-    return th_generic_op_imm(0xf040, rd, rn, imm);
+    return th_generic_op_imm_with_status(0xf040, rd, rn, imm, setflags);
   }
   return (thumb_opcode){
       .size = 0,
@@ -631,25 +679,17 @@ thumb_opcode th_cmp_reg(uint16_t rn, uint16_t rm, thumb_shift shift,
                                              FLAGS_BEHAVIOUR_SET, shift);
 }
 
-thumb_opcode th_orr_reg(uint16_t rd, uint16_t rn, uint16_t rm) {
-  if (rd == rn && rm < 8 && rn < 8) {
+thumb_opcode th_orr_reg(uint16_t rd, uint16_t rn, uint16_t rm,
+                        flags_behaviour flags, thumb_shift shift,
+                        enforce_encoding encoding) {
+  if (rd == rn && rm < 8 && rn < 8 && shift.type == THUMB_SHIFT_NONE &&
+      encoding != ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
         .size = 2,
         .opcode = (0x4300 | (rm << 3) | rd),
     };
   }
-#ifndef TCC_TARGET_ARM_ARCHV6M
-  else if (rd != R_SP && rd != R_PC && rn != R_PC && rm != R_SP && rm != R_PC) {
-    return (thumb_opcode){
-        .size = 4,
-        .opcode = 0xea400000 | (rn << 16) | (rd << 8) | rm,
-    };
-  }
-#endif
-  return (thumb_opcode){
-      .size = 0,
-      .opcode = 0,
-  };
+  return th_generic_op_reg_shift_with_status(0xea40, rd, rn, rm, flags, shift);
 }
 
 thumb_opcode th_sub_imm(uint16_t rd, uint16_t rn, uint32_t imm) {
@@ -1255,8 +1295,9 @@ thumb_opcode th_str_reg(uint32_t rt, uint32_t rn, uint32_t rm) {
   };
 }
 
-thumb_opcode th_mul(uint16_t rd, uint16_t rn, uint16_t rm) {
-  if (rd == rm && rd < 8 && rn < 8) {
+thumb_opcode th_mul(uint32_t rd, uint32_t rn, uint32_t rm,
+                    flags_behaviour flags, enforce_encoding encoding) {
+  if (rd == rm && rd < 8 && rn < 8 && encoding != ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
         .size = 2,
         .opcode = (0x4340 | (rn << 3) | rm),
@@ -1436,6 +1477,7 @@ thumb_opcode th_shift_armv7m(uint16_t rd, uint16_t rm, uint32_t imm,
 
 thumb_opcode th_lsl_reg(uint16_t rd, uint16_t rn, uint16_t rm,
                         flags_behaviour flags, enforce_encoding encoding) {
+
   if (rd == rn && rm < 8 && rn < 8 && encoding != ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
         .size = 2,
@@ -1460,6 +1502,13 @@ thumb_opcode th_lsl_reg(uint16_t rd, uint16_t rn, uint16_t rm,
 
 thumb_opcode th_lsl_imm(uint16_t rd, uint16_t rm, uint32_t imm,
                         flags_behaviour flags, enforce_encoding encoding) {
+  if (rm < 8 && rd < 8 && encoding != ENFORCE_ENCODING_32BIT &&
+      flags == FLAGS_BEHAVIOUR_SET && imm != 0) {
+    return (thumb_opcode){
+        .size = 2,
+        .opcode = 0x0000 | (imm << 6) | (rm << 3) | rd,
+    };
+  }
   if (rm < 8 && rd < 8 && encoding != ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
         .size = 2,
@@ -1546,6 +1595,14 @@ thumb_opcode th_asr_reg(uint16_t rd, uint16_t rn, uint16_t rm,
 
 thumb_opcode th_asr_imm(uint16_t rd, uint16_t rm, uint32_t imm,
                         flags_behaviour flags, enforce_encoding encoding) {
+  if (rm < 8 && rd < 8 && encoding != ENFORCE_ENCODING_32BIT &&
+      flags == FLAGS_BEHAVIOUR_SET && imm != 0) {
+    return (thumb_opcode){
+        .size = 2,
+        .opcode = 0x1000 | (imm << 6) | (rm << 3) | rd,
+    };
+  }
+
   if (rm < 8 && rd < 8 && encoding != ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
         .size = 2,
@@ -2086,6 +2143,106 @@ thumb_opcode th_ldrt(uint32_t rt, uint32_t rn, int imm) {
   return (thumb_opcode){
       .size = 4,
       .opcode = 0xf8500e00 | (rn << 16) | (rt << 12) | (imm & 0xff),
+  };
+}
+
+thumb_opcode th_mla(uint32_t rd, uint32_t rn, uint32_t rm, uint32_t ra) {
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xfb000000 | (rn << 16) | (ra << 12) | (rd << 8) | rm,
+  };
+}
+
+thumb_opcode th_mls(uint32_t rd, uint32_t rn, uint32_t rm, uint32_t ra) {
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xfb000010 | (rn << 16) | (ra << 12) | (rd << 8) | rm,
+  };
+}
+
+thumb_opcode th_mrs(uint32_t rd, uint32_t specreg) {
+  if (rd == R_SP || rd == R_PC) {
+    tcc_error("compiler_error: 'th_msr', SP or PC can't be used as rd\n");
+    return (thumb_opcode){0, 0};
+  }
+  if (specreg > 0xff) {
+    tcc_error("compiler_error: 'th_msr', invalid special register\n");
+    return (thumb_opcode){0, 0};
+  }
+
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xf3ef8000 | (rd << 8) | specreg,
+  };
+}
+
+thumb_opcode th_msr(uint32_t specreg, uint32_t rn, uint32_t mask) {
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xf3808000 | (mask << 10) | (rn << 16) | specreg,
+  };
+}
+
+thumb_opcode th_mvn_imm(uint16_t rd, uint16_t rn, uint32_t imm,
+                        flags_behaviour flags) {
+
+  uint32_t S = (flags == FLAGS_BEHAVIOUR_SET) ? 1 : 0;
+  uint32_t packed = th_pack_const(imm);
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xf06f0000 | (S << 20) | (rd << 8) | (rn << 16) | packed,
+  };
+}
+
+thumb_opcode th_mvn_reg(uint16_t rd, uint16_t rn, uint16_t rm,
+                        flags_behaviour flags, thumb_shift shift,
+                        enforce_encoding encoding) {
+  if (rd == rn && rm < 8 && rn < 8 && encoding != ENFORCE_ENCODING_32BIT &&
+      shift.type == THUMB_SHIFT_NONE) {
+    return (thumb_opcode){
+        .size = 2,
+        .opcode = (0x43c0 | (rm << 3) | rd),
+    };
+  }
+  return th_generic_op_reg_shift_with_status(0xea6f, rd, rn, rm, flags, shift);
+}
+
+thumb_opcode th_orn_imm(uint16_t rd, uint16_t rn, uint32_t imm,
+                        flags_behaviour flags) {
+
+  uint32_t S = (flags == FLAGS_BEHAVIOUR_SET) ? 1 : 0;
+  uint32_t packed = th_pack_const(imm);
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xf0600000 | (S << 20) | (rd << 8) | (rn << 16) | packed,
+  };
+}
+
+thumb_opcode th_orn_reg(uint16_t rd, uint16_t rn, uint16_t rm,
+                        flags_behaviour flags, thumb_shift shift,
+                        enforce_encoding encoding) {
+  return th_generic_op_reg_shift_with_status(0xea60, rd, rn, rm, flags, shift);
+}
+
+thumb_opcode th_pkhbt(uint32_t rd, uint32_t rn, uint32_t rm,
+                      thumb_shift shift) {
+  const uint32_t imm2 = shift.value & 0x3;
+  const uint32_t imm3 = (shift.value >> 2) & 0x7;
+  uint32_t tb = 0;
+  if (shift.type == THUMB_SHIFT_LSL) {
+    tb = 0;
+  } else if (shift.type == THUMB_SHIFT_ASR) {
+    tb = 1;
+  } else {
+    tcc_error("compiler_error: 'th_pkhbt', invalid shift type\n");
+    return (thumb_opcode){0, 0};
+  }
+
+  shift.type == THUMB_SHIFT_LSL ? 0 : 1;
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xeac00000 | rn << 16 | imm3 << 12 | rd << 8 | imm2 << 6 |
+                tb << 5 | rm,
   };
 }
 

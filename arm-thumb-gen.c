@@ -655,7 +655,7 @@ static void gcall_or_jmp(int is_jmp) {
   } else {
     int r = gv(RC_INT);
     TRACE("gcall_or_jmp indirect call");
-    ot_check(th_orr_imm(r, r, 1));
+    ot_check(th_orr_imm(r, r, 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT));
     if (!is_jmp)
       ot_check(th_blx_reg(intr(r)));
     else
@@ -855,7 +855,7 @@ ST_FUNC void gen_fill_nops(int bytes) {
     return;
   }
   while (bytes > 0) {
-    ot_check(th_nop());
+    ot_check(th_nop(ENFORCE_ENCODING_16BIT));
     bytes -= 2;
   }
 }
@@ -917,8 +917,10 @@ void gfunc_prolog(Sym *func_sym) {
     func_nregs += nf;
   }
 
-  ot_check(th_push(0x5800));    // push {fp, ip, lr} (r11, r12, r14)
-  ot_check(th_mov_reg(11, 13)); // mov fp, sp
+  ot_check(th_push(0x5800)); // push {fp, ip, lr} (r11, r12, r14)
+  ot_check(th_mov_reg(11, 13, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                      THUMB_SHIFT_DEFAULT,
+                      ENFORCE_ENCODING_NONE)); // mov fp, sp
   // nop has 2 bytes
   // I need 4 bytes for address and 4 bytes for instruction in the worst case
   // scenario
@@ -932,7 +934,7 @@ void gfunc_prolog(Sym *func_sym) {
   est += ind;
   // align to 4 bytes for memory access
   if (est & 3) {
-    ot_check(th_nop());
+    ot_check(th_nop(ENFORCE_ENCODING_16BIT));
   }
   ot_check(th_ldr_literal(R_LR, 4, 1));
   ot_check(th_add_sp_reg(R_LR, R_LR, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
@@ -1087,7 +1089,8 @@ void gfunc_epilog(void) {
       int rr = th_offset_to_reg(diff, 0);
       ot_check(th_add_sp_reg(rr, rr, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
                              ENFORCE_ENCODING_NONE, THUMB_SHIFT_DEFAULT));
-      ot_check(th_mov_reg(R_SP, rr));
+      ot_check(th_mov_reg(R_SP, rr, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                          THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     }
   }
 
@@ -1105,7 +1108,7 @@ void gfunc_epilog(void) {
   ot_check(th_bx_reg(R_LR));
 
   if (ind & 3)
-    ot_check(th_nop());
+    ot_check(th_nop(ENFORCE_ENCODING_16BIT));
 }
 
 void ggoto(void) {
@@ -1180,7 +1183,8 @@ ST_FUNC void gen_vla_alloc(CType *type, int align) {
     tcc_error("alignment is not a power of 2: %i", align);
   /* bic sp, r, #align-1 */
   ot_check(th_bic_imm(r, r, align - 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT));
-  ot_check(th_mov_reg(13, r));
+  ot_check(th_mov_reg(13, r, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                      ENFORCE_ENCODING_NONE));
   vpop();
 }
 
@@ -1366,7 +1370,7 @@ static void load_full_const(int r, int32_t imm, struct Sym *sym) {
   est += ind;
   // 4-byte alignment
   if (est & 3)
-    ot_check(th_nop());
+    ot_check(th_nop(ENFORCE_ENCODING_16BIT));
   ot_check(th_ldr_literal(r, 4, 1));
   ot_check(th_b_t4(4));
 
@@ -1635,7 +1639,8 @@ void load(int r, SValue *sv) {
       tcc_error("compiler_error: unknown load mode\n");
     else {
       TRACE("mov r %i v %i", r, v);
-      ot_check(th_mov_reg(r, v));
+      ot_check(th_mov_reg(r, v, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                          THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
       return;
     }
   }
@@ -1900,7 +1905,8 @@ void gen_opi_regs(int opc, int c) {
     ot_check(th_cmp_reg(c, fr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     return;
   case 24:
-    ot_check(th_orr_reg(r, c, fr));
+    ot_check(th_orr_reg(r, c, fr, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                        THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     return;
   default:
     tcc_error("compiler_error: 'gen_opi_regs' unhandled case opc: %d, c: %d, "
@@ -1952,7 +1958,7 @@ void gen_opi_regular(int opc, int c) {
       ok = ot(th_cmp_imm(c, vtop->c.i, ENFORCE_ENCODING_NONE));
       break;
     case 24:
-      ok = ot(th_orr_imm(r, r, vtop->c.i));
+      ok = ot(th_orr_imm(r, r, vtop->c.i, FLAGS_BEHAVIOUR_NOT_IMPORTANT));
       break;
     default:
       tcc_error("compiler_error: 'gen_opi_regular' unhandled case opc: %d, c: "
@@ -2068,7 +2074,8 @@ void gen_opi(int op) {
     fr = vtop[0].r;
     vtop--;
     print_vstack("gen_opi(*)");
-    ot_check(th_mul(intr(r), intr(fr), intr(r)));
+    ot_check(th_mul(intr(r), intr(fr), intr(r), FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                    ENFORCE_ENCODING_NONE));
     return;
   }
   case TOK_SHL:
@@ -2114,7 +2121,8 @@ void gen_opi(int op) {
 
     ot_check(th_push(1 << rr));
     ot_check(th_sdiv(rr, r, fr));
-    ot_check(th_mul(fr, fr, rr));
+    ot_check(th_mul(fr, fr, rr, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                    ENFORCE_ENCODING_NONE));
     ot_check(th_sub_reg(r, r, fr));
     ot_check(th_pop(1 << rr));
     return;
@@ -2137,7 +2145,8 @@ void gen_opi(int op) {
 
     ot_check(th_push(1 << rr));
     ot_check(th_udiv(rr, r, fr));
-    ot_check(th_mul(fr, fr, rr));
+    ot_check(th_mul(fr, fr, rr, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                    ENFORCE_ENCODING_NONE));
     ot_check(th_sub_reg(r, r, fr));
     ot_check(th_pop(1 << rr));
     return;

@@ -16,12 +16,12 @@ def prepare_expect(filepath):
             os.makedirs(output_dir)
         assert compiler is not None, "TEST_COMPARE_CC environment variable must be set to the ARM compiler path."
         _ = subprocess.run(
-            [compiler, filepath, "-march=armv8-m.main", "-nostdlib", "-Wl,-Ttext=0x0", "-o", output_file_gcc],
+            [compiler, filepath, "-march=armv8-m.main+dsp", "-nostdlib", "-Wl,-Ttext=0x0", "-o", output_file_gcc],
             check=True,
             capture_output=True,
             text=True
         )
-        
+
         objcopy = os.getenv("TEST_OBJCOPY", None)
         _ = subprocess.run(
             [objcopy, "--only-section=.text", output_file_gcc, output_file]
@@ -31,7 +31,7 @@ def prepare_expect(filepath):
     except subprocess.CalledProcessError as e:
         print(f"Compilation failed: {e.stderr}")
         raise e
- 
+
 
 def compile_code(filepath):
     """
@@ -56,7 +56,7 @@ def compile_code(filepath):
     except subprocess.CalledProcessError as e:
         print(f"Compilation failed: {e.stderr}")
         raise e
-    
+
 def disassemble_code(filepath):
     """
     Disassembles the compiled object file using the ARM toolchain.
@@ -74,9 +74,9 @@ def disassemble_code(filepath):
     except subprocess.CalledProcessError as e:
         print(f"Disassembly failed: {e.stderr}")
         raise e
-    
+
 def cleanup_dissambly(disassembly):
-    tmp = [] 
+    tmp = []
     for line in disassembly:
         line = line.strip()
         if re.match(r'^[0-9A-Fa-f]+:', line):
@@ -86,10 +86,10 @@ def cleanup_dissambly(disassembly):
     output = []
     for line in tmp:
         if len(line) == 0:
-            return output 
+            return output
 
         output.append(line)
-    
+
     return output
 
 def perform_test_for_file(file):
@@ -97,13 +97,13 @@ def perform_test_for_file(file):
     disassembly_sut = disassemble_code(output_file).splitlines()
     expected_file = prepare_expect(file)
     disassembly_expected = disassemble_code(expected_file).splitlines()
-    verify_disassembly(disassembly_sut, disassembly_expected)    
+    verify_disassembly(disassembly_sut, disassembly_expected)
 
 def verify_disassembly(disassembly_sut, disassembly_expected):
     sut = cleanup_dissambly(disassembly_sut)
     expected = cleanup_dissambly(disassembly_expected)
-  
+
     assert len(expected) > 0, "Expected disassembly is empty"
-    
+
     for i in range(len(expected)):
         assert sut[i][1] == expected[i][1], f"Mismatch at line {i}: {sut[i]} != {expected[i]}"
