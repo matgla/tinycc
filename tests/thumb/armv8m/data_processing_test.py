@@ -93,6 +93,9 @@ def test_mov_reg():
 def test_movt():
     utils.perform_test_for_file("test_movt.S")
 
+def test_mov_reg_shift():
+    utils.perform_test_for_file("test_mov_shift.S")
+
 def test_mrs():
     utils.perform_test_for_file("test_mrs.S")
 
@@ -143,3 +146,82 @@ def test_pli_reg():
 
 def test_pop():
     utils.perform_test_for_file("test_pop.S")
+
+def test_push():
+    utils.perform_test_for_file("test_push.S")
+
+def test_rbit():
+    utils.perform_test_for_file("test_rbit.S")
+
+def test_rev():
+    utils.perform_test_for_file("test_rev.S")
+
+def test_rev16():
+    utils.perform_test_for_file("test_rev16.S")
+
+def test_revsh():
+    utils.perform_test_for_file("test_revsh.S")
+
+def test_ror_imm():
+    utils.perform_test_for_file("test_ror_imm.S")
+
+def test_ror_reg():
+    utils.perform_test_for_file("test_ror_reg.S")
+
+def test_rrx():
+    utils.perform_test_for_file("test_rrx.S")
+
+def test_rsb_imm():
+    utils.perform_test_for_file("test_rsb_imm.S")
+
+def test_rsb_reg():
+    utils.perform_test_for_file("test_rsb_reg.S")
+
+def test_sbc_imm():
+    utils.perform_test_for_file("test_sbc_imm.S")
+
+def test_sbc_reg():
+    utils.perform_test_for_file("test_sbc_reg.S")
+
+def test_sbfx():
+    utils.perform_test_for_file("test_sbfx.S")
+
+def test_sdiv():
+    utils.perform_test_for_file("test_sdiv.S")
+
+def test_smlal():
+    utils.perform_test_for_file("test_smlal.S")
+
+def test_smull():
+    utils.perform_test_for_file("test_smull.S")
+
+def test_ssat():
+    utils.perform_test_for_file("test_ssat.S")
+
+def test_stl():
+    utils.perform_test_for_file("test_stl.S")
+
+def test_stlb():
+    utils.perform_test_for_file("test_stlb.S")
+
+def test_stlex():
+    utils.perform_test_for_file("test_stlex.S")
+
+def test_stlexb():
+    utils.perform_test_for_file("test_stlexb.S")
+
+def test_stlexh():
+    utils.perform_test_for_file("test_stlexh.S")
+
+def test_stm():
+    utils.perform_test_for_file("test_stm.S")
+
+def test_stmdb():
+    utils.perform_test_for_file("test_stmdb.S")
+
+def test_str_imm():
+    utils.perform_test_for_file("test_str_imm.S")
+
+def test_str_reg():
+    utils.perform_test_for_file("test_str_reg.S")
+

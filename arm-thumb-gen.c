@@ -919,8 +919,8 @@ void gfunc_prolog(Sym *func_sym) {
 
   ot_check(th_push(0x5800)); // push {fp, ip, lr} (r11, r12, r14)
   ot_check(th_mov_reg(11, 13, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                      THUMB_SHIFT_DEFAULT,
-                      ENFORCE_ENCODING_NONE)); // mov fp, sp
+                      THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE,
+                      false)); // mov fp, sp
   // nop has 2 bytes
   // I need 4 bytes for address and 4 bytes for instruction in the worst case
   // scenario
@@ -1090,7 +1090,7 @@ void gfunc_epilog(void) {
       ot_check(th_add_sp_reg(rr, rr, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
                              ENFORCE_ENCODING_NONE, THUMB_SHIFT_DEFAULT));
       ot_check(th_mov_reg(R_SP, rr, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                          THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+                          THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
     }
   }
 
@@ -1184,7 +1184,7 @@ ST_FUNC void gen_vla_alloc(CType *type, int align) {
   /* bic sp, r, #align-1 */
   ot_check(th_bic_imm(r, r, align - 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT));
   ot_check(th_mov_reg(13, r, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                      ENFORCE_ENCODING_NONE));
+                      ENFORCE_ENCODING_NONE, false));
   vpop();
 }
 
@@ -1340,11 +1340,12 @@ void store(int r, SValue *sv) {
         }
       } else {
         TRACE("store: sign: %x, r: %x, base: %x, fc: %x", sign, r, base, fc);
-        if (!ot(th_str_imm(r, base, fc, sign ? 4 : 6))) {
+        if (!ot(th_str_imm(r, base, fc, sign ? 4 : 6, ENFORCE_ENCODING_NONE))) {
           TRACE("th_offset");
           int rr = th_offset_to_reg(fc, sign);
           TRACE("RR: %d", rr);
-          ot_check(th_str_reg(r, base, rr));
+          ot_check(th_str_reg(r, base, rr, THUMB_SHIFT_DEFAULT,
+                              ENFORCE_ENCODING_NONE));
         }
         TRACE("done");
       }
@@ -1640,7 +1641,7 @@ void load(int r, SValue *sv) {
     else {
       TRACE("mov r %i v %i", r, v);
       ot_check(th_mov_reg(r, v, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                          THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+                          THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
       return;
     }
   }
@@ -1884,7 +1885,8 @@ void gen_opi_regs(int opc, int c) {
     return;
   case 6:
   case 7:
-    ot_check(th_rsb_reg(r, c, fr));
+    ot_check(th_rsb_reg(r, c, fr, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                        THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     return;
   case 8:
   case 9:
@@ -1896,10 +1898,12 @@ void gen_opi_regs(int opc, int c) {
                         THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     return;
   case 12:
-    ot_check(th_sbc_reg(r, c, fr));
+    ot_check(th_sbc_reg(r, c, fr, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                        THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     return;
   case 14:
-    ot_check(th_sbc_reg(r, fr, c));
+    ot_check(th_sbc_reg(r, fr, c, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                        THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     return;
   case 21:
     ot_check(th_cmp_reg(c, fr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
@@ -1949,7 +1953,7 @@ void gen_opi_regular(int opc, int c) {
       ok = ot(th_adc_imm(r, r, vtop->c.i, FLAGS_BEHAVIOUR_NOT_IMPORTANT));
       break;
     case 12:
-      ok = ot(th_sbc_imm(r, r, vtop->c.i));
+      ok = ot(th_sbc_imm(r, r, vtop->c.i, FLAGS_BEHAVIOUR_NOT_IMPORTANT));
       break;
     case 14:
       ok = 0;

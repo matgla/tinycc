@@ -26,3 +26,9 @@ def test_bkpt():
 
 def test_nop():
     utils.perform_test_for_file("test_nop.S")
+
+def test_sev():
+    utils.perform_test_for_file("test_sev.S")
+
+def test_ssbb():
+    utils.perform_test_for_file("test_ssbb.S")

@@ -1,7 +1,7 @@
 .syntax unified
 .thumb
 
-.global _start 
+.global _start
 _start:
 
 .global test_pop
