@@ -1,6 +1,9 @@
 .syntax unified
 .thumb
 
+.global _start 
+_start:
+
 .global test_adc_reg
 test_adc_reg:
     // T1 

@@ -29,7 +29,9 @@ fi
 
 cd $SCRIPT_DIR
 export TEST_CC="$SCRIPT_DIR/../../../bin/armv8m-tcc"
+export TEST_COMPARE_CC="arm-none-eabi-gcc"
 export TEST_OBJDUMP="arm-none-eabi-objdump"
+export TEST_OBJCOPY="arm-none-eabi-objcopy"
 pytest
 if [ $? -ne 0 ]; then
   echo "Tests failed"

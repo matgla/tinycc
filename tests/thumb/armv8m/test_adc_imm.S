@@ -1,6 +1,9 @@
 .syntax unified
 .thumb
 
+.global _start 
+_start:
+
 .global test_adc_imm
 test_adc_imm:
     adc r2, #0xde 

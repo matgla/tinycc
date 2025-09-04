@@ -1,6 +1,9 @@
 .syntax unified
 .thumb
 
+.global _start 
+_start:
+
 .global test_blx
 test_blx:
     blx r0 

@@ -1,6 +1,9 @@
 .syntax unified
 .thumb
 
+.global _start 
+_start:
+
 .global test_svc
 test_svc:
     svc #0
