@@ -10,13 +10,15 @@ X = $(if $(CROSS_TARGET),$(CROSS_TARGET)-)
 XCFG = $(or $(findstring -win,$T),-unx)
 S = $(if $(findstring yes,$(SILENT)),@$(info * $@))
 
+$(info CROSS_TARGET='$(CROSS_TARGET)')
+
 TCC = $(TOP)/$(X)tcc$(EXESUF)
 XTCC ?= $(TOP)/$(X)tcc$(EXESUF)
 XCC = $(XTCC)
 XAR = $(XTCC) -ar
 XFLAGS-unx = -B$(TOPSRC)
 XFLAGS-win = -B$(TOPSRC)/win32 -I$(TOPSRC)/include
-XFLAGS = $(XFLAGS$(XCFG))
+XFLAGS = $(XFLAGS$(XCFG)) $(CROSS_FLAGS)
 BFLAGS = -bt
 
 # in order to use gcc, type: make <target>-libtcc1-usegcc=yes
@@ -48,8 +50,7 @@ Nat = $(if $X,no,)
 Cbt = $(Nat)$(subst yes,,$(CONFIG_backtrace))
 Cbc = $(Cbt)$(subst yes,,$(CONFIG_bcheck))
 
-$(Nat)COMMON_O += runmain.o tcov.o
-$(Cbt)COMMON_O += bt-exe.o bt-log.o
+$(Nat)COMMON_O += runmain.o 
 $(Cbt)WIN_O += bt-dll.o
 $(Cbc)COMMON_O += bcheck.o
 
@@ -70,6 +71,7 @@ OBJ-arm-vfp = $(OBJ-arm)
 OBJ-arm-eabi = $(OBJ-arm)
 OBJ-arm-eabihf = $(OBJ-arm)
 OBJ-arm-wince = $(ARM_O) $(WIN_O)
+OBJ-armv8m = armeabi.o thumbflush.o
 OBJ-riscv64 = $(RISCV64_O) $(LIN_O)
 
 OBJ-extra = $(filter $(EXTRA_O),$(OBJ-$T))
@@ -79,8 +81,9 @@ ALL = $(addprefix $(TOP)/,$(X)libtcc1.a $(OBJ-extra))
 
 all: $(ALL)
 
+$(info $(TCC))
 $(TOP)/$(X)libtcc1.a : $(OBJ-libtcc1) $(TCC)
-	$S$(XAR) rcs $@ $(OBJ-libtcc1)
+	$S$(XAR) rcs $@ $(OBJ-libtcc1) 
 
 $(X)%.o : %.c $(TCC)
 	$S$(XCC) -c $< -o $@ $(XFLAGS)

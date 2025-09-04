@@ -21,7 +21,7 @@
 #include "tcc.h"
 
 /* only native compiler supports -run */
-#ifdef TCC_IS_NATIVE
+#ifdef TCC_IS_NATIVE2
 
 #ifdef CONFIG_TCC_BACKTRACE
 /* runtime debug info block */

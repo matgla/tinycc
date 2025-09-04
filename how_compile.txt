@@ -1,0 +1,5 @@
+./configure --cross-prefix=arm-none-eabi- --prefix=/home/mateusz/tcc_m33 --cpu=armv4l --extra-cflags="-I/home/mateusz/repos/yasos.zig/rootfs/usr/include -fPIE  -nostartfiles" --extra-ldflags="-L/home/mateusz/re
+pos/yasos.zig/rootfs/lib -fPIE -nostartfiles -T/home/mateusz/repos/yasos.zig/dynamic_loader/elftoyaff/arch/arm-m/linker_script.ld -l:libc.so" --triplet=arm-linux-eabi
+
+
+./configure --cross-prefix=arm-none-eabi- --prefix=/home/mateusz/tcc_m33 --cpu=armv8m --extra-cflags="-I/home/mateusz/repos/yasos.zig/rootfs/usr/include -fPIE  -nostartfiles -mcpu=cortex-m33" --extra-ldflags="-L/home/mateusz/repos/yasos.zig/rootfs/lib -fPIE -nostartfiles -T/home/mateusz/repos/yasos.zig/dynamic_loader/elftoyaff/arch/arm-m/linker_script.ld -l:libc.so -mcpu=cortex-m33" --triplet=arm-linux-eabi --config-bcheck=no

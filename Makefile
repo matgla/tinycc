@@ -108,6 +108,7 @@ DEF-arm-eabihf     = $(DEF-arm-eabi) -DTCC_ARM_HARDFLOAT
 DEF-arm            = $(DEF-arm-eabihf)
 DEF-arm-NetBSD     = $(DEF-arm-eabihf) -DTARGETOS_NetBSD
 DEF-arm-wince      = $(DEF-arm-eabihf) -DTCC_TARGET_PE
+DEF-armv8m         = $(DEF-arm-eabihf) -DTCC_TARGET_ARM_THUMB -DTCC_TARGET_ARM_ARCHV8M
 DEF-arm64          = -DTCC_TARGET_ARM64
 DEF-arm64-osx      = $(DEF-arm64) -DTCC_TARGET_MACHO
 DEF-arm64-FreeBSD  = $(DEF-arm64) -DTARGETOS_FreeBSD
@@ -130,16 +131,19 @@ TCCDOCS = tcc.1 tcc-doc.html tcc-doc.info
 all: $(PROGS) $(TCCLIBS) $(TCCDOCS)
 
 # cross compiler targets to build
-TCC_X = i386 x86_64 i386-win32 x86_64-win32 x86_64-osx arm arm64 arm-wince c67
-TCC_X += riscv64 arm64-osx
+#TCC_X = i386 x86_64 i386-win32 x86_64-win32 x86_64-osx arm arm64 arm-wince c67
+# TCC_X += riscv64 arm64-osx
+TCC_X = armv8m
 # TCC_X += arm-fpa arm-fpa-ld arm-vfp arm-eabi
 
 # cross libtcc1.a targets to build
 LIBTCC1_X = $(filter-out c67,$(TCC_X))
 
+
 PROGS_CROSS = $(foreach X,$(TCC_X),$X-tcc$(EXESUF))
 LIBTCC1_CROSS = $(foreach X,$(LIBTCC1_X),$X-libtcc1.a)
 
+$(info $(LIBTCC1_CROSS))
 # build cross compilers & libs
 cross: $(LIBTCC1_CROSS) $(PROGS_CROSS)
 
@@ -197,7 +201,7 @@ LIB-$(TR) ?= {B}:/usr/$(TRIPLET-$T)/lib:/usr/lib/$(MARCH-$T)
 INC-$(TR) ?= {B}/include:/usr/$(TRIPLET-$T)/include:/usr/include
 endif
 
-CORE_FILES = tcc.c tcctools.c libtcc.c tccpp.c tccgen.c tccdbg.c tccelf.c tccasm.c tccrun.c
+CORE_FILES = tcc.c tcctools.c libtcc.c tccpp.c tccgen.c tccdbg.c tccelf.c tccasm.c tccyaff.c
 CORE_FILES += tcc.h config.h libtcc.h tcctok.h
 i386_FILES = $(CORE_FILES) i386-gen.c i386-link.c i386-asm.c i386-asm.h i386-tok.h
 i386-win32_FILES = $(i386_FILES) tccpe.c
@@ -205,6 +209,7 @@ x86_64_FILES = $(CORE_FILES) x86_64-gen.c x86_64-link.c i386-asm.c x86_64-asm.h
 x86_64-win32_FILES = $(x86_64_FILES) tccpe.c
 x86_64-osx_FILES = $(x86_64_FILES) tccmacho.c
 arm_FILES = $(CORE_FILES) arm-gen.c arm-link.c arm-asm.c arm-tok.h
+armv8m_FILES = $(CORE_FILES) arm-thumb-opcodes.c arm-thumb-gen.c arm-link.c arm-thumb-asm.c thumb-tok.h 
 arm-wince_FILES = $(arm_FILES) tccpe.c
 arm-eabihf_FILES = $(arm_FILES)
 arm-fpa_FILES     = $(arm_FILES)
@@ -253,7 +258,8 @@ endif
 
 # convert "include/tccdefs.h" to "tccdefs_.h"
 %_.h : include/%.h conftest.c
-	$S$(CC) -DC2STR $(filter %.c,$^) -o c2str.exe && ./c2str.exe $< $@
+	# todo: how to pass host CC there?
+	gcc -DC2STR $(filter %.c,$^) -o c2str.exe && ./c2str.exe $< $@
 
 # target specific object rule
 $(X)%.o : %.c $(LIBTCC_INC)
