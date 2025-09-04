@@ -202,7 +202,9 @@ thumb_opcode th_rsb_reg(uint16_t rd, uint16_t rn, uint16_t rm,
                         flags_behaviour flags, thumb_shift shift,
                         enforce_encoding encoding);
 
-thumb_opcode th_sub_reg(uint16_t rd, uint16_t rn, uint16_t rm);
+thumb_opcode th_sub_reg(uint32_t rd, uint32_t rn, uint32_t rm,
+                        flags_behaviour flags, thumb_shift shift,
+                        enforce_encoding encoding);
 thumb_opcode th_adc_reg(uint16_t rd, uint16_t rn, uint16_t rm,
                         flags_behaviour flags, thumb_shift shift,
                         enforce_encoding encoding);
@@ -222,7 +224,9 @@ thumb_opcode th_cmp_reg(uint16_t rn, uint16_t rm, thumb_shift shift,
 thumb_opcode th_orr_reg(uint16_t rd, uint16_t rn, uint16_t rm,
                         flags_behaviour flags, thumb_shift shift,
                         enforce_encoding encoding);
-thumb_opcode th_sub_imm(uint16_t rd, uint16_t rn, uint32_t imm);
+thumb_opcode th_sub_imm(uint32_t rd, uint32_t rn, uint32_t imm,
+                        flags_behaviour flags, enforce_encoding encoding);
+thumb_opcode th_sub_imm_t4(uint32_t rd, uint32_t rn, uint32_t imm);
 
 thumb_opcode th_push(uint16_t regs);
 int th_ldr_literal_estimate(uint16_t rt, uint32_t imm);
@@ -249,10 +253,14 @@ thumb_opcode th_ldr_reg(uint32_t rt, uint32_t rn, uint32_t rm,
 thumb_opcode th_ldr_literal(uint16_t rt, uint32_t imm, uint32_t add);
 
 thumb_opcode th_pop(uint16_t regs);
-thumb_opcode th_strh_imm(uint16_t rt, uint16_t rn, uint32_t imm, uint16_t puw);
-thumb_opcode th_strh_reg(uint32_t rt, uint32_t rn, uint32_t rm);
-thumb_opcode th_strb_imm(uint16_t rt, uint16_t rn, uint32_t imm, uint16_t puw);
-thumb_opcode th_strb_reg(uint32_t rt, uint32_t rn, uint32_t rm);
+thumb_opcode th_strh_imm(uint16_t rt, uint16_t rn, int imm, uint16_t puw,
+                         enforce_encoding encoding);
+thumb_opcode th_strh_reg(uint32_t rt, uint32_t rn, uint32_t rm,
+                         thumb_shift shift, enforce_encoding encoding);
+thumb_opcode th_strb_imm(uint16_t rt, uint16_t rn, int imm, uint16_t puw,
+                         enforce_encoding encoding);
+thumb_opcode th_strb_reg(uint32_t rt, uint32_t rn, uint32_t rm,
+                         thumb_shift shift, enforce_encoding encoding);
 thumb_opcode th_str_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw,
                         enforce_encoding encoding);
 thumb_opcode th_str_reg(uint32_t rt, uint32_t rn, uint32_t rm,
@@ -303,9 +311,16 @@ thumb_opcode th_vstr(uint32_t rn, uint32_t vd, uint32_t add,
 thumb_opcode th_vmov_gp_sp(uint16_t rt, uint16_t sn, uint16_t to_arm_register);
 thumb_opcode th_vmov_2gp_dp(uint16_t rt, uint16_t rt2, uint16_t dm,
                             uint16_t to_arm_register);
-thumb_opcode gen_th_sub_sp_imm(uint16_t rd, uint32_t imm);
-uint32_t th_sub_sp_imm_estimate(uint16_t rd, uint32_t imm);
-thumb_opcode th_sub_sp_imm(uint16_t rd, uint32_t imm);
+
+thumb_opcode th_sub_sp_imm(uint32_t rd, uint32_t imm, flags_behaviour flags,
+                           enforce_encoding encoding);
+
+thumb_opcode th_sub_sp_imm_t3(uint32_t rd, uint32_t imm, flags_behaviour flags,
+                              enforce_encoding encoding);
+
+thumb_opcode th_sub_sp_reg(uint32_t rd, uint32_t rm, flags_behaviour flags,
+                           thumb_shift shift, enforce_encoding encoding);
+
 thumb_opcode th_vmrs(uint16_t rt);
 thumb_opcode th_vcvt_float_to_double(uint32_t vd, uint32_t vm);
 thumb_opcode th_vcvt_double_to_float(uint32_t vd, uint32_t vm);
@@ -411,3 +426,11 @@ thumb_opcode th_stm(uint32_t rn, uint32_t regset, uint32_t writeback,
                     enforce_encoding encoding);
 thumb_opcode th_stmdb(uint32_t rn, uint32_t regset, uint32_t writeback,
                       enforce_encoding encoding);
+thumb_opcode th_strbt(uint32_t rt, uint32_t rn, int imm);
+thumb_opcode th_strd_imm(uint32_t rt, uint32_t rt2, uint32_t rn, int imm,
+                         uint32_t puw, enforce_encoding encoding);
+thumb_opcode th_strex(uint32_t rd, uint32_t rt, uint32_t rn, int imm);
+thumb_opcode th_strexb(uint32_t rd, uint32_t rt, uint32_t rn);
+thumb_opcode th_strexh(uint32_t rd, uint32_t rt, uint32_t rn);
+thumb_opcode th_strht(uint32_t rt, uint32_t rn, int imm);
+thumb_opcode th_strt(uint32_t rt, uint32_t rn, int imm);

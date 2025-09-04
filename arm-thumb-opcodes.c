@@ -567,8 +567,11 @@ thumb_opcode th_rsb_reg(uint16_t rd, uint16_t rn, uint16_t rm,
   return th_generic_op_reg_shift_with_status(0xebc0, rd, rn, rm, flags, shift);
 }
 
-thumb_opcode th_sub_reg(uint16_t rd, uint16_t rn, uint16_t rm) {
-  if (rd < 8 && rm < 8 && rn < 8) {
+thumb_opcode th_sub_reg(uint32_t rd, uint32_t rn, uint32_t rm,
+                        flags_behaviour flags, thumb_shift shift,
+                        enforce_encoding encoding) {
+  if (rd < 8 && rm < 8 && rn < 8 && shift.type == THUMB_SHIFT_NONE &&
+      encoding != ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
         .size = 2,
         .opcode = 0x1a00 | (rm << 6) | (rn << 3) | rd,
@@ -576,9 +579,14 @@ thumb_opcode th_sub_reg(uint16_t rd, uint16_t rn, uint16_t rm) {
   }
 #ifndef TCC_TARGET_ARM_ARCHV6M
   else if (rd != R_SP && rd != R_PC && rn != R_SP && rn != R_PC) {
+    const uint32_t imm3 = (shift.value >> 2) & 0x7;
+    const uint32_t imm2 = shift.value & 0x3;
+    const uint32_t s = (flags == FLAGS_BEHAVIOUR_SET) ? 1 : 0;
     return (thumb_opcode){
         .size = 4,
-        .opcode = 0xeba00000 | (rn << 16) | (rd << 8) | rm,
+        .opcode = 0xeba00000 | (s << 20) | (rn << 16) | (rd << 8) | rm |
+                  imm3 << 12 | imm2 << 6 |
+                  th_shift_value_to_sr_type(shift) << 4,
     };
   }
 #endif
@@ -586,6 +594,12 @@ thumb_opcode th_sub_reg(uint16_t rd, uint16_t rn, uint16_t rm) {
       .size = 0,
       .opcode = 0,
   };
+}
+
+thumb_opcode th_sub_sp_reg(uint32_t rd, uint32_t rm, flags_behaviour flags,
+                           thumb_shift shift, enforce_encoding encoding) {
+  return th_generic_op_reg_shift_with_status(0xeba0, rd, R_SP, rm, flags,
+                                             shift);
 }
 
 thumb_opcode th_generic_op_reg_shift_with_status(uint32_t op, uint32_t rd,
@@ -689,22 +703,8 @@ thumb_opcode th_orr_reg(uint16_t rd, uint16_t rn, uint16_t rm,
   return th_generic_op_reg_shift_with_status(0xea40, rd, rn, rm, flags, shift);
 }
 
-thumb_opcode th_sub_imm(uint16_t rd, uint16_t rn, uint32_t imm) {
-  if (rd < 8 && rn < 8 && imm <= 7) {
-    // T1
-    return (thumb_opcode){
-        .size = 2,
-        .opcode = (0x1e00 | (imm << 6) | (rn << 3) | rd),
-    };
-  } else if (rd == rn && imm <= 255 && rd < 8) {
-    // T2
-    return (thumb_opcode){
-        .size = 2,
-        .opcode = (0x3800 | (rd << 8) | imm),
-    };
-  }
-#ifndef TCC_TARGET_ARM_ARCHV6M
-  else if (rd != R_SP && rd != R_PC && imm <= 0xfff) {
+thumb_opcode th_sub_imm_t4(uint32_t rd, uint32_t rn, uint32_t imm) {
+  if (rd != R_SP && rd != R_PC && imm <= 0xfff) {
     // T4
     const uint16_t i = imm >> 11;
     const uint32_t imm3 = (imm >> 8) & 0x7;
@@ -713,20 +713,45 @@ thumb_opcode th_sub_imm(uint16_t rd, uint16_t rn, uint32_t imm) {
         .opcode = 0xf2a00000 | (i << 26) | (rn << 16) | (imm3 << 12) |
                   (rd << 8) | (imm & 0xff),
     };
-  } else if (rd != 13 && rd != 15) {
-    const uint32_t enc = th_pack_const(imm);
-    if (enc || imm == 0) {
-      return (thumb_opcode){
-          .size = 4,
-          .opcode = 0xf1a00000 | (rn << 16) | (rd << 8) | enc,
-      };
-    }
   }
-#endif
+
   return (thumb_opcode){
       .size = 0,
       .opcode = 0,
   };
+}
+
+thumb_opcode th_sub_imm(uint32_t rd, uint32_t rn, uint32_t imm,
+                        flags_behaviour flags, enforce_encoding encoding) {
+
+  if (rd == rn && imm <= 255 && rd < 8 && encoding != ENFORCE_ENCODING_32BIT) {
+    // T2
+    return (thumb_opcode){
+        .size = 2,
+        .opcode = (0x3800 | (rd << 8) | imm),
+    };
+  }
+
+  if (rd < 8 && rn < 8 && imm <= 7 && encoding != ENFORCE_ENCODING_32BIT) {
+    // T1
+    return (thumb_opcode){
+        .size = 2,
+        .opcode = (0x1e00 | (imm << 6) | (rn << 3) | rd),
+    };
+  }
+
+  if (rd != 13 && rd != 15) {
+    const uint32_t enc = th_pack_const(imm);
+    const uint32_t s = (flags == FLAGS_BEHAVIOUR_SET) ? 1 : 0;
+    if (enc || imm == 0) {
+      return (thumb_opcode){
+          .size = 4,
+          .opcode = 0xf1a00000 | s << 20 | (rn << 16) | (rd << 8) | enc,
+      };
+    }
+  }
+
+  return th_sub_imm_t4(rd, rn, imm);
 }
 
 thumb_opcode th_push(uint16_t regs) {
@@ -1135,13 +1160,16 @@ thumb_opcode th_pop(uint16_t regs) {
 }
 
 // STR
-thumb_opcode th_strh_imm(uint16_t rt, uint16_t rn, uint32_t imm, uint16_t puw) {
+thumb_opcode th_strh_imm(uint16_t rt, uint16_t rn, int imm, uint16_t puw,
+                         enforce_encoding encoding) {
   // T1 encoding, on armv6-m this one is the only one available
-  if (puw == 6 && rn < 8 && rt < 8 && imm <= 62 && !(imm & 1)) {
+  if (puw == 6 && rn < 8 && rt < 8 && imm <= 62 &&
+      encoding != ENFORCE_ENCODING_32BIT && !(imm & 1)) {
     // imm[0] is enforced to be 0, and sould be divided by 2, thus offset is 5
+    imm >>= 1;
     return (thumb_opcode){
         .size = 2,
-        .opcode = (0x8000 | (imm << 5) | (rn << 3) | rt),
+        .opcode = (0x8000 | (imm << 6) | (rn << 3) | rt),
     };
   }
 #ifndef TCC_TARGET_ARM_ARCHV6M
@@ -1164,9 +1192,11 @@ thumb_opcode th_strh_imm(uint16_t rt, uint16_t rn, uint32_t imm, uint16_t puw) {
   };
 }
 
-thumb_opcode th_strh_reg(uint32_t rt, uint32_t rn, uint32_t rm) {
+thumb_opcode th_strh_reg(uint32_t rt, uint32_t rn, uint32_t rm,
+                         thumb_shift shift, enforce_encoding encoding) {
   // puw == 6 means positive offset on rn, so T1 encoding can be used
-  if (rm < 8 && rt < 8 && rn < 8) {
+  if (rm < 8 && rt < 8 && rn < 8 && encoding != ENFORCE_ENCODING_32BIT &&
+      shift.type == THUMB_SHIFT_NONE) {
     return (thumb_opcode){
         .size = 2,
         .opcode = 0x5200 | (rm << 6) | (rn << 3) | rt,
@@ -1176,7 +1206,7 @@ thumb_opcode th_strh_reg(uint32_t rt, uint32_t rn, uint32_t rm) {
   else if (rt != R_SP && rm != R_SP && rm != R_PC) {
     return (thumb_opcode){
         .size = 4,
-        .opcode = 0xf8200000 | (rn << 16) | (rt << 12) | rm,
+        .opcode = 0xf8200000 | (rn << 16) | (rt << 12) | rm | shift.value << 4,
     };
   }
 #endif
@@ -1186,13 +1216,15 @@ thumb_opcode th_strh_reg(uint32_t rt, uint32_t rn, uint32_t rm) {
   };
 }
 
-thumb_opcode th_strb_imm(uint16_t rt, uint16_t rn, uint32_t imm, uint16_t puw) {
+thumb_opcode th_strb_imm(uint16_t rt, uint16_t rn, int imm, uint16_t puw,
+                         enforce_encoding encoding) {
   // T1 encoding, on armv6-m this one is the only one available
-  if (puw == 6 && rn < 8 && rt < 8 && imm <= 62 && !(imm & 1)) {
+  if (puw == 6 && rn < 8 && rt < 8 && imm <= 31 &&
+      encoding != ENFORCE_ENCODING_32BIT) {
     // imm[0] is enforced to be 0, and sould be divided by 2, thus offset is 5
     return (thumb_opcode){
         .size = 2,
-        .opcode = 0x7000 | (imm << 5) | (rn << 3) | rt,
+        .opcode = 0x7000 | (imm << 6) | (rn << 3) | rt,
     };
   }
 #ifndef TCC_TARGET_ARM_ARCHV6M
@@ -1215,9 +1247,11 @@ thumb_opcode th_strb_imm(uint16_t rt, uint16_t rn, uint32_t imm, uint16_t puw) {
   };
 }
 
-thumb_opcode th_strb_reg(uint32_t rt, uint32_t rn, uint32_t rm) {
+thumb_opcode th_strb_reg(uint32_t rt, uint32_t rn, uint32_t rm,
+                         thumb_shift shift, enforce_encoding encoding) {
   // puw == 6 means positive offset on rn, so T1 encoding can be used
-  if (rm < 8 && rt < 8 && rn < 8) {
+  if (rm < 8 && rt < 8 && rn < 8 && shift.type == THUMB_SHIFT_NONE &&
+      encoding != ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
         .size = 2,
         .opcode = (0x5400 | (rm << 6) | (rn << 3) | rt),
@@ -1227,7 +1261,7 @@ thumb_opcode th_strb_reg(uint32_t rt, uint32_t rn, uint32_t rm) {
   else if (rt != R_SP && rm != R_SP && rm != R_PC) {
     return (thumb_opcode){
         .size = 4,
-        .opcode = 0xf8000000 | (rn << 16) | (rt << 12) | rm,
+        .opcode = 0xf8000000 | (rn << 16) | (rt << 12) | rm | shift.value << 4,
     };
   }
 #endif
@@ -1745,17 +1779,10 @@ thumb_opcode th_vmov_2gp_dp(uint16_t rt, uint16_t rt2, uint16_t dm,
   };
 }
 
-thumb_opcode gen_th_sub_sp_imm(uint16_t rd, uint32_t imm) {
-  // T1 encoding
-  if (rd == R_SP && imm <= 508 && !(imm & 0x3)) {
-    return (thumb_opcode){
-        .size = 2,
-        .opcode = 0xb080 | (imm >> 2),
-    };
-  }
-#ifndef TCC_TARGET_ARM_ARCHV6M
-  // T3 encoding
-  else if (imm <= 4095 && rd != R_PC) {
+thumb_opcode th_sub_sp_imm_t3(uint32_t rd, uint32_t imm, flags_behaviour flags,
+                              enforce_encoding encoding) {
+  if (rd != R_PC && imm <= 4095 && encoding != ENFORCE_ENCODING_16BIT &&
+      flags != FLAGS_BEHAVIOUR_SET) {
     const uint32_t i = (imm >> 11) & 1;
     const uint32_t imm3 = (imm >> 8) & 0x7;
     return (thumb_opcode){
@@ -1763,40 +1790,37 @@ thumb_opcode gen_th_sub_sp_imm(uint16_t rd, uint32_t imm) {
         .opcode =
             0xf2ad0000 | (i << 26) | (imm3 << 12) | (rd << 8) | (imm & 0xff),
     };
-  } else if (rd != R_PC) {
-    const uint32_t enc = th_pack_const(imm);
-    if (enc || imm == 0) {
-      return (thumb_opcode){
-          .size = 4,
-          .opcode = 0xf1ad0000 | (rd << 8) | enc,
-      };
-    }
   }
-#endif
   return (thumb_opcode){
       .size = 0,
       .opcode = 0,
   };
 }
 
-uint32_t th_sub_sp_imm_estimate(uint16_t rd, uint32_t imm) {
+thumb_opcode th_sub_sp_imm(uint32_t rd, uint32_t imm, flags_behaviour flags,
+                           enforce_encoding encoding) {
+  thumb_opcode op = {0, 0};
   // T1 encoding
-  if (rd == R_SP && imm <= 508 && !(imm & 0x3)) {
-    return 2;
+  if (rd == R_SP && imm <= 508 && !(imm & 0x3) &&
+      encoding != ENFORCE_ENCODING_32BIT && flags != FLAGS_BEHAVIOUR_SET) {
+    return (thumb_opcode){
+        .size = 2,
+        .opcode = 0xb080 | (imm >> 2),
+    };
   }
-#ifndef TCC_TARGET_ARM_ARCHV6M
-  // T3 encoding
-  else if (imm <= 4095 && rd != R_PC) {
-    return 4;
-  } else if (rd != R_PC) {
-    return 4;
-  }
-#endif
-  return 0;
-}
 
-thumb_opcode th_sub_sp_imm(uint16_t rd, uint32_t imm) {
-  return gen_th_sub_sp_imm(rd, imm);
+  if (rd != R_PC) {
+    const uint32_t enc = th_pack_const(imm);
+    const uint32_t s = flags == FLAGS_BEHAVIOUR_SET ? 1 : 0;
+    if (enc || imm == 0) {
+      return (thumb_opcode){
+          .size = 4,
+          .opcode = 0xf1ad0000 | s << 20 | (rd << 8) | enc,
+      };
+    }
+  }
+
+  return th_sub_sp_imm_t3(rd, imm, flags, encoding);
 }
 
 thumb_opcode th_vmrs(uint16_t rt) {
@@ -2544,6 +2568,64 @@ thumb_opcode th_str_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw,
   return (thumb_opcode){
       .size = 0,
       .opcode = 0,
+  };
+}
+
+thumb_opcode th_strbt(uint32_t rt, uint32_t rn, int imm) {
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xf8000e00 | (rn << 16) | (rt << 12) | (imm & 0xff),
+  };
+}
+
+thumb_opcode th_strd_imm(uint32_t rt, uint32_t rt2, uint32_t rn, int imm,
+                         uint32_t puw, enforce_encoding encoding) {
+  const uint32_t pu = (puw >> 1) & 0x3;
+  const uint32_t w = puw & 0x1;
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xe8400000 | (pu << 23) | w << 21 | rn << 16 | rt << 12 |
+                rt2 << 8 | (imm >> 2),
+  };
+}
+
+thumb_opcode th_strex(uint32_t rd, uint32_t rt, uint32_t rn, int imm) {
+  if (imm < 0 || imm > 1020) {
+    tcc_error("compiler_error: 'th_strex' imm is outside of range: 0x%x, max "
+              "value: 0x3fc\n",
+              imm);
+  }
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xe8400000 | (rn << 16) | (rt << 12) | (rd << 8) | (imm >> 2),
+  };
+}
+
+thumb_opcode th_strexb(uint32_t rd, uint32_t rt, uint32_t rn) {
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xe8c00f40 | (rn << 16) | (rt << 12) | rd,
+  };
+}
+
+thumb_opcode th_strexh(uint32_t rd, uint32_t rt, uint32_t rn) {
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xe8c00f50 | (rn << 16) | (rt << 12) | rd,
+  };
+}
+
+thumb_opcode th_strht(uint32_t rt, uint32_t rn, int imm) {
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xf8200e00 | (rn << 16) | (rt << 12) | (imm & 0xff),
+  };
+}
+
+thumb_opcode th_strt(uint32_t rt, uint32_t rn, int imm) {
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xf8400e00 | (rn << 16) | (rt << 12) | (imm & 0xff),
   };
 }
 

@@ -225,3 +225,47 @@ def test_str_imm():
 def test_str_reg():
     utils.perform_test_for_file("test_str_reg.S")
 
+def test_strb_imm():
+    utils.perform_test_for_file("test_strb_imm.S")
+
+def test_strb_reg():
+    utils.perform_test_for_file("test_strb_reg.S")
+
+def test_strbt():
+    utils.perform_test_for_file("test_strbt.S")
+
+def test_strd():
+    utils.perform_test_for_file("test_strd.S")
+
+def test_strex():
+    utils.perform_test_for_file("test_strex.S")
+
+def test_strexb():
+    utils.perform_test_for_file("test_strexb.S")
+
+def test_strexh():
+    utils.perform_test_for_file("test_strexh.S")
+
+def test_strh_imm():
+    utils.perform_test_for_file("test_strh_imm.S")
+
+def test_strh_reg():
+    utils.perform_test_for_file("test_strh_reg.S")
+
+def test_strht():
+    utils.perform_test_for_file("test_strht.S")
+
+def test_strt():
+    utils.perform_test_for_file("test_strt.S")
+
+def test_sub_imm():
+    utils.perform_test_for_file("test_sub_imm.S")
+
+def test_sub_reg():
+    utils.perform_test_for_file("test_sub_reg.S")
+
+def test_sub_sp_imm():
+    utils.perform_test_for_file("test_sub_sp_imm.S")
+
+def test_sub_sp_reg():
+    utils.perform_test_for_file("test_sub_sp_reg.S")
