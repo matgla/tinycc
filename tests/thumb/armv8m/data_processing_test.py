@@ -269,3 +269,36 @@ def test_sub_sp_imm():
 
 def test_sub_sp_reg():
     utils.perform_test_for_file("test_sub_sp_reg.S")
+
+def test_sxtb():
+    utils.perform_test_for_file("test_sxtb.S")
+
+def test_sxth():
+    utils.perform_test_for_file("test_sxth.S")
+
+def test_tbb():
+    utils.perform_test_for_file("test_tbb.S")
+
+def test_teq():
+    utils.perform_test_for_file("test_teq.S")
+
+def test_tst_imm():
+    utils.perform_test_for_file("test_tst_imm.S")
+
+def test_tst_reg():
+    utils.perform_test_for_file("test_tst_reg.S")
+
+def test_udiv():
+    utils.perform_test_for_file("test_udiv.S")
+
+def test_umlal():
+    utils.perform_test_for_file("test_umlal.S")
+
+def test_usat():
+    utils.perform_test_for_file("test_usat.S")
+
+def test_uxtb():
+    utils.perform_test_for_file("test_uxtb.S")
+
+def test_uxth():
+    utils.perform_test_for_file("test_uxth.S")

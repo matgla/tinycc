@@ -48,3 +48,7 @@ test_sub_sp_reg:
    subsne r1, sp, r2, asr #3
    subsne r6, sp, r8, ror #4
 
+
+   sub r1, pc, 1234
+   sub r3, pc, #0xfac
+

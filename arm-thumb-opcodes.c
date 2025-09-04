@@ -2431,6 +2431,19 @@ thumb_opcode th_ssat(uint32_t rd, uint32_t imm, uint32_t rn,
   };
 }
 
+thumb_opcode th_usat(uint32_t rd, uint32_t imm, uint32_t rn,
+                     thumb_shift shift) {
+  const uint32_t sh = (shift.type == THUMB_SHIFT_LSL) ? 0 : 1;
+  const uint32_t imm2 = shift.value & 0x3;
+  const uint32_t imm3 = (shift.value >> 2) & 0x7;
+
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xf3800000 | (sh << 21) | (rn << 16) | (imm3 << 12) |
+                (rd << 8) | (imm2 << 6) | imm,
+  };
+}
+
 thumb_opcode th_ssbb() {
   return (thumb_opcode){
       .size = 4,
@@ -2626,6 +2639,218 @@ thumb_opcode th_strt(uint32_t rt, uint32_t rn, int imm) {
   return (thumb_opcode){
       .size = 4,
       .opcode = 0xf8400e00 | (rn << 16) | (rt << 12) | (imm & 0xff),
+  };
+}
+
+thumb_opcode th_sxtb(uint32_t rd, uint32_t rm, thumb_shift shift,
+                     enforce_encoding encoding) {
+  if (shift.type != THUMB_SHIFT_NONE && shift.type != THUMB_SHIFT_ROR) {
+    tcc_error("compiler_error: 'th_sxtb', invalid shift type\n");
+    return (thumb_opcode){0, 0};
+  }
+
+  if (shift.value != 0 && shift.value != 8 && shift.value != 16 &&
+      shift.value != 24) {
+    tcc_error("compiler_error: 'th_sxtb', invalid shift value\n");
+    return (thumb_opcode){0, 0};
+  }
+
+  if (rd < 8 && rm < 8 && encoding != ENFORCE_ENCODING_32BIT &&
+      (shift.type == THUMB_SHIFT_NONE || shift.value == 0)) {
+    return (thumb_opcode){
+        .size = 2,
+        .opcode = 0xb240 | (rm << 3) | rd,
+    };
+  }
+  const uint32_t rotate = shift.value >> 3;
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xfa4ff080 | rd << 8 | rm | rotate << 4,
+  };
+}
+
+thumb_opcode th_sxth(uint32_t rd, uint32_t rm, thumb_shift shift,
+                     enforce_encoding encoding) {
+  if (shift.type != THUMB_SHIFT_NONE && shift.type != THUMB_SHIFT_ROR) {
+    tcc_error("compiler_error: 'th_sxth', invalid shift type\n");
+    return (thumb_opcode){0, 0};
+  }
+
+  if (shift.value != 0 && shift.value != 8 && shift.value != 16 &&
+      shift.value != 24) {
+    tcc_error("compiler_error: 'th_sxth', invalid shift value\n");
+    return (thumb_opcode){0, 0};
+  }
+
+  if (rd < 8 && rm < 8 && encoding != ENFORCE_ENCODING_32BIT &&
+      (shift.type == THUMB_SHIFT_NONE || shift.value == 0)) {
+    return (thumb_opcode){
+        .size = 2,
+        .opcode = 0xb200 | (rm << 3) | rd,
+    };
+  }
+  const uint32_t rotate = shift.value >> 3;
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xfa0ff080 | rd << 8 | rm | rotate << 4,
+  };
+}
+
+thumb_opcode th_tbb(uint32_t rn, uint32_t rm, uint32_t h) {
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xe8d0f000 | (rn << 16) | rm | h << 4,
+  };
+}
+
+thumb_opcode th_teq(uint32_t rn, uint32_t imm) {
+  const uint32_t packed = th_pack_const(imm);
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xf0900f00 | (rn << 16) | packed,
+  };
+}
+
+thumb_opcode th_tst_imm(uint32_t rn, uint32_t imm) {
+  const uint32_t packed = th_pack_const(imm);
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xf0100f00 | (rn << 16) | packed,
+  };
+}
+
+thumb_opcode th_tst_reg(uint32_t rn, uint32_t rm, thumb_shift shift,
+                        enforce_encoding encoding) {
+  if (rn < 8 && rm < 8 && encoding != ENFORCE_ENCODING_32BIT &&
+      shift.type == THUMB_SHIFT_NONE) {
+    return (thumb_opcode){
+        .size = 2,
+        .opcode = 0x4200 | (rm << 3) | rn,
+    };
+  }
+  return th_generic_op_reg_shift_with_status(
+      0xea10, 0xf, rn, rm, FLAGS_BEHAVIOUR_NOT_IMPORTANT, shift);
+}
+
+thumb_opcode th_tt(uint32_t rd, uint32_t rn, uint32_t a, uint32_t t) {
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xe840f000 | rn << 16 | rd << 8 | a << 7 | t << 6,
+  };
+}
+
+thumb_opcode th_udf(uint32_t imm, enforce_encoding encoding) {
+  if (encoding != ENFORCE_ENCODING_32BIT && imm <= 0xff) {
+    return (thumb_opcode){
+        .size = 2,
+        .opcode = 0xde00 | imm,
+    };
+  }
+  const uint32_t imm4 = (imm >> 12) & 0xf;
+  const uint32_t imm12 = imm & 0xfff;
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xf7f0a000 | imm4 << 16 | imm12,
+  };
+}
+
+thumb_opcode th_umlal(uint32_t rdlo, uint32_t rdhi, uint32_t rn, uint32_t rm) {
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xfbe00000 | (rn << 16) | (rdlo << 12) | (rdhi << 8) | rm,
+  };
+}
+
+thumb_opcode th_uxtb(uint32_t rd, uint32_t rm, thumb_shift shift,
+                     enforce_encoding encoding) {
+  if (shift.type != THUMB_SHIFT_NONE && shift.type != THUMB_SHIFT_ROR) {
+    tcc_error("compiler_error: 'th_uxtb', invalid shift type\n");
+    return (thumb_opcode){0, 0};
+  }
+
+  if (shift.value != 0 && shift.value != 8 && shift.value != 16 &&
+      shift.value != 24) {
+    tcc_error("compiler_error: 'th_uxtb', invalid shift value\n");
+    return (thumb_opcode){0, 0};
+  }
+
+  if (rd < 8 && rm < 8 && encoding != ENFORCE_ENCODING_32BIT &&
+      (shift.type == THUMB_SHIFT_NONE || shift.value == 0)) {
+    return (thumb_opcode){
+        .size = 2,
+        .opcode = 0xb2c0 | (rm << 3) | rd,
+    };
+  }
+  const uint32_t rotate = shift.value >> 3;
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xfa5ff080 | rd << 8 | rm | rotate << 4,
+  };
+}
+
+thumb_opcode th_uxth(uint32_t rd, uint32_t rm, thumb_shift shift,
+                     enforce_encoding encoding) {
+  if (shift.type != THUMB_SHIFT_NONE && shift.type != THUMB_SHIFT_ROR) {
+    tcc_error("compiler_error: 'th_uxth', invalid shift type\n");
+    return (thumb_opcode){0, 0};
+  }
+
+  if (shift.value != 0 && shift.value != 8 && shift.value != 16 &&
+      shift.value != 24) {
+    tcc_error("compiler_error: 'th_uxth', invalid shift value\n");
+    return (thumb_opcode){0, 0};
+  }
+
+  if (rd < 8 && rm < 8 && encoding != ENFORCE_ENCODING_32BIT &&
+      (shift.type == THUMB_SHIFT_NONE || shift.value == 0)) {
+    return (thumb_opcode){
+        .size = 2,
+        .opcode = 0xb280 | (rm << 3) | rd,
+    };
+  }
+  const uint32_t rotate = shift.value >> 3;
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xfa1ff080 | rd << 8 | rm | rotate << 4,
+  };
+}
+
+thumb_opcode th_wfe(enforce_encoding encoding) {
+  if (encoding != ENFORCE_ENCODING_32BIT) {
+    return (thumb_opcode){
+        .size = 2,
+        .opcode = 0xbf20,
+    };
+  }
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xf3af8002,
+  };
+}
+
+thumb_opcode th_wfi(enforce_encoding encoding) {
+  if (encoding != ENFORCE_ENCODING_32BIT) {
+    return (thumb_opcode){
+        .size = 2,
+        .opcode = 0xbf30,
+    };
+  }
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xf3af8003,
+  };
+}
+
+thumb_opcode th_yield(enforce_encoding encoding) {
+  if (encoding != ENFORCE_ENCODING_32BIT) {
+    return (thumb_opcode){
+        .size = 2,
+        .opcode = 0xbf10,
+    };
+  }
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xf3af8001,
   };
 }
 

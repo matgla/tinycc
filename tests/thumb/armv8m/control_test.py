@@ -32,3 +32,18 @@ def test_sev():
 
 def test_ssbb():
     utils.perform_test_for_file("test_ssbb.S")
+
+def test_tt():
+    utils.perform_test_for_file("test_tt.S")
+
+def test_udf():
+    utils.perform_test_for_file("test_udf.S")
+
+def test_wfe():
+    utils.perform_test_for_file("test_wfe.S")
+
+def test_wfi():
+    utils.perform_test_for_file("test_wfi.S")
+
+def test_yield():
+    utils.perform_test_for_file("test_yield.S")
