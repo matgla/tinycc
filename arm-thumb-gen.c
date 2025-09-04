@@ -938,7 +938,7 @@ void gfunc_prolog(Sym *func_sym) {
     ot_check(th_nop(ENFORCE_ENCODING_16BIT));
   }
   ot_check(th_ldr_literal(R_LR, 4, 1));
-  ot_check(th_add_sp_reg(R_LR, R_LR, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+  ot_check(th_add_sp_reg(R_SP, R_LR, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
                          ENFORCE_ENCODING_NONE, THUMB_SHIFT_DEFAULT));
   ot_check(th_b_t2(2));
 
