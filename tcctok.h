@@ -416,6 +416,7 @@ DEF_ASMDIR(symver)
 DEF_ASMDIR(syntax)
 DEF_ASMDIR(arch)
 DEF_ASMDIR(thumb)
+DEF_ASMDIR(thumb_func)
 DEF_ASMDIR(section) /* must be last directive */
 
 #if defined TCC_TARGET_I386 || defined TCC_TARGET_X86_64

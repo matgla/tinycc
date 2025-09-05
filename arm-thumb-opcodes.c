@@ -437,7 +437,7 @@ thumb_opcode th_add_imm(uint16_t rd, uint16_t rn, uint32_t imm,
     };
   }
 
-  if (imm <= 7 && encoding != ENFORCE_ENCODING_32BIT) {
+  if (imm <= 7 && rd < 8 && rn < 8 && encoding != ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
         .size = 2,
         .opcode = (0x1c00 | (imm << 6) | (rn << 3) | rd),
@@ -2852,6 +2852,25 @@ thumb_opcode th_yield(enforce_encoding encoding) {
       .size = 4,
       .opcode = 0xf3af8001,
   };
+}
+
+// Thumb ELF management
+// Start of T32 instructions
+void th_sym_t() {
+  const int info = ELFW(ST_INFO)(STB_LOCAL, STT_NOTYPE);
+  set_elf_sym(symtab_section, ind, 0, info, 0, 1, "$t");
+}
+
+// Start of A32 instructions
+void th_sym_a() {
+  const int info = ELFW(ST_INFO)(STB_LOCAL, STT_NOTYPE);
+  set_elf_sym(symtab_section, ind, 0, info, 0, 1, "$a");
+}
+
+// Start of data
+void th_sym_d() {
+  const int info = ELFW(ST_INFO)(STB_LOCAL, STT_NOTYPE);
+  set_elf_sym(symtab_section, ind, 0, info, 0, 1, "$d");
 }
 
 #endif // TARGET_DEFS_ONLY

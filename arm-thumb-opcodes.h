@@ -462,3 +462,7 @@ thumb_opcode th_uxth(uint32_t rd, uint32_t rm, thumb_shift shift,
 thumb_opcode th_wfe(enforce_encoding encoding);
 thumb_opcode th_wfi(enforce_encoding encoding);
 thumb_opcode th_yield(enforce_encoding encoding);
+
+void th_sym_t();
+void th_sym_a();
+void th_sym_d();

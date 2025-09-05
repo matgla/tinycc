@@ -1030,6 +1030,7 @@ struct TCCState {
   int argc;
   char **argv;
   CString linker_arg; /* collect -Wl options */
+  int thumb_func;
 };
 
 struct filespec {

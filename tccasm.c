@@ -413,8 +413,14 @@ static Sym *asm_new_label1(TCCState *s1, int label, int is_local, int sh_num,
   if (!sym->c)
     put_extern_sym2(sym, SHN_UNDEF, 0, 0, 1);
   esym = elfsym(sym);
+
   esym->st_shndx = sh_num;
   esym->st_value = value;
+  if (s1->thumb_func) {
+    esym->st_info |= STT_FUNC;
+    s1->thumb_func = 0;
+    esym->st_value += 1;
+  }
   if (is_local != 2)
     sym->type.t &= ~VT_EXTERN;
   return sym;
@@ -938,6 +944,10 @@ static void asm_parse_directive(TCCState *s1, int global) {
     break;
   case TOK_ASMDIR_thumb:
     next();
+    break;
+  case TOK_ASMDIR_thumb_func:
+    next();
+    s1->thumb_func = 1;
     break;
   default:
     tcc_error("unknown assembler directive '.%s'", get_tok_str(tok, NULL));

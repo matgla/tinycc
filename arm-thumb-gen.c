@@ -491,25 +491,6 @@ int ot(thumb_opcode op) {
 
 static void load_full_const(int r, int32_t imm, struct Sym *sym);
 
-// Thumb ELF management
-// Start of T32 instructions
-void th_sym_t() {
-  const int info = ELFW(ST_INFO)(STB_LOCAL, STT_NOTYPE);
-  set_elf_sym(symtab_section, ind, 0, info, 0, 1, "$t");
-}
-
-// Start of A32 instructions
-void th_sym_a() {
-  const int info = ELFW(ST_INFO)(STB_LOCAL, STT_NOTYPE);
-  set_elf_sym(symtab_section, ind, 0, info, 0, 1, "$a");
-}
-
-// Start of data
-void th_sym_d() {
-  const int info = ELFW(ST_INFO)(STB_LOCAL, STT_NOTYPE);
-  set_elf_sym(symtab_section, ind, 0, info, 0, 1, "$d");
-}
-
 // TODO: this is armv7-m code
 int decbranch(int pos) {
   int xa = *(uint16_t *)(cur_text_section->data + pos);
