@@ -39,9 +39,9 @@
 #include <stdint.h>
 #include <stdio.h>
 
-#ifndef TCC_DEBUG
-#define TCC_DEBUG 0
-#endif
+// #ifndef TCC_DEBUG
+#define TCC_DEBUG 2
+// #endif
 
 #define TRACE(...)
 #define LOG(...)

@@ -2817,7 +2817,6 @@ static int elf_output_file(TCCState *s1, const char *filename) {
     dynamic->link = dynstr;
     dynamic->sh_entsize = sizeof(ElfW(Dyn));
 
-    got_sym = build_got(s1);
     if (file_type & TCC_OUTPUT_EXE) {
       bind_exe_dynsyms(s1, file_type & TCC_OUTPUT_DYN);
       if (s1->nb_errors)
@@ -2826,6 +2825,7 @@ static int elf_output_file(TCCState *s1, const char *filename) {
     build_got_entries(s1, got_sym);
     if (file_type & TCC_OUTPUT_EXE) {
       bind_libs_dynsyms(s1);
+export_global_syms(s1);
     } else {
       /* shared library case: simply export all global symbols */
       export_global_syms(s1);

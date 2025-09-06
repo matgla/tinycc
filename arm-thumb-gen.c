@@ -382,6 +382,28 @@ static int assign_regs(int nb_args, int float_abi, struct plan *plan,
     size = type_size(&type, &align);
     size = (size + 3) & ~3;
     align = (align + 3) & ~3;
+    printf("added with type: %x\n", vtop[-i].type.t);
+    if (vtop[-i].type.ref != NULL) {
+      ElfSym *esym = NULL;
+      // if function or pointer to a function
+      if ((vtop[-i].type.t & VT_BTYPE) == VT_FUNC)
+      {
+        esym = elfsym(vtop[-i].sym);
+      } else if ((vtop[-i].type.t & VT_BTYPE) == VT_PTR) {
+        if ((vtop[-i].type.ref->type.t & VT_BTYPE) == VT_FUNC) {
+          esym = elfsym(vtop[-i].sym);
+        }
+        // pointer to function
+      }
+      printf("esym is: %p\n", esym);
+      // ElfSym *esym = elfsym(vtop[-i].type.ref);
+      // printf("esym is: %p\n", esym);
+      if (esym != NULL) {
+         printf("esym->st_name is: %d\n", esym->st_name);
+         const char *name = symtab_section->link->data + esym->st_name;
+         printf("reference name: %s\n", name);
+      }
+    }
     switch (vtop[-i].type.t & VT_BTYPE) {
     case VT_STRUCT:
     case VT_FLOAT:
@@ -751,6 +773,7 @@ again:
           } else {
             /* simple type (currently always same size) */
             /* XXX: implicit cast ? */
+            printf("Are we here\n");
             size = 4;
             if ((pplan->sval->type.t & VT_BTYPE) == VT_LLONG) {
               lexpand();
@@ -1530,7 +1553,9 @@ void load_vt_const(int r, SValue *sv) {
 }
 
 void load_vt_local(int r, SValue *sv) {
-  TRACE("'load_vt_local' r: %d, off: %x", r, sv->c.i);
+  printf("loading type %x\n", sv->type.t);
+  TRACE("'load_vt_local' r: %d, off: %x, sv->sym: %p, offint: %d", r, sv->c.i, sv->sym, sv->c.i);
+
   if (sv->r & VT_SYM || (-sv->c.i) >= 0xfff) {
     load_full_const(r, sv->c.i, sv->r & VT_SYM ? sv->sym : 0);
     ot_check(th_add_reg(r, R_FP, r, FLAGS_BEHAVIOUR_NOT_IMPORTANT,

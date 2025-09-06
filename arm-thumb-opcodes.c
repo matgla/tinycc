@@ -852,8 +852,6 @@ thumb_opcode th_ldrsh_reg(uint32_t rt, uint32_t rn, uint32_t rm,
 
 thumb_opcode th_ldrh_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw,
                          enforce_encoding encoding) {
-  printf("th_ldrh_imm rt %u rn %u imm %d puw %u enc %d at %x\n", rt, rn, imm,
-         puw, encoding, ind);
   // T1 encoding, on armv6-m this one is the only one available
   if (puw == 6 && rn < 8 && rt < 8 && imm <= 62 &&
       encoding != ENFORCE_ENCODING_32BIT && !(imm & 1)) {
