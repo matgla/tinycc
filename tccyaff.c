@@ -71,7 +71,8 @@ typedef enum YaffSectionCode {
 typedef struct __attribute__((packed)) YaffSymbolTableRelocationEntry {
   uint32_t is_exported_symbol : 1;
   uint32_t index : 31;
-  uint32_t symbol_index;
+  uint32_t function_pointer: 1;
+  uint32_t symbol_index : 31;
 } YaffSymbolTableRelocationEntry;
 
 typedef struct __attribute__((packed)) YaffDataRelocationEntry {
@@ -258,6 +259,10 @@ static int tcc_yaff_write_symbol_table_relocations(TCCState *s1, FILE *f) {
             // this is exported symbol
             int is_exported = (sym->st_shndx != SHN_UNDEF);
             int symbol_table_index = symbol_index - 1;
+            int is_function_pointer = 0;
+            if (type == R_ARM_GLOB_DAT && ((sym->st_info & STT_FUNC) != 0)) {
+              is_function_pointer = 1;
+            }
             if (is_exported) {
               symbol_table_index =
                   symbol_index - 1 - number_of_imported_symbols;
@@ -265,6 +270,7 @@ static int tcc_yaff_write_symbol_table_relocations(TCCState *s1, FILE *f) {
             YaffSymbolTableRelocationEntry entry = {
                 .is_exported_symbol = is_exported,
                 .index = (rel->r_offset - s1->got->sh_addr) / 8,
+                .function_pointer = is_function_pointer,
                 .symbol_index = symbol_table_index,
             };
             fwrite(&entry, 1, sizeof(entry), f);

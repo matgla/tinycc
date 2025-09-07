@@ -378,10 +378,25 @@ static int assign_regs(int nb_args, int float_abi, struct plan *plan,
   for (i = nb_args; i--;) {
     int j, start_vfpreg = 0;
     CType type = vtop[-i].type;
+    bool is_function_pointer = false;
+    ElfSym *sym = NULL;
     type.t &= ~VT_ARRAY;
     size = type_size(&type, &align);
     size = (size + 3) & ~3;
     align = (align + 3) & ~3;
+    // if argument is a function pointer, then symbol must be exported
+    SValue *top = &vtop[-i];
+    if (vtop[-i].r & VT_SYM) {
+      if (((type.t & VT_BTYPE) == VT_FUNC) ||
+          ((type.t & VT_BTYPE) == VT_PTR && type.ref &&
+           (type.ref->type.t & VT_BTYPE) == VT_FUNC)) {
+        sym = elfsym(vtop[-i].sym);
+      }
+    }
+    if (sym != NULL) {
+      sym->st_info |= (STB_GLOBAL << 4);
+    }
+
     switch (vtop[-i].type.t & VT_BTYPE) {
     case VT_STRUCT:
     case VT_FLOAT:
