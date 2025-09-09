@@ -28,70 +28,53 @@
 
 #define SHF_DYNSYM 0x40000000
 
-typedef struct __attribute__((packed)) YaffHeader {
-  uint8_t magic[4];
-  uint8_t module_type;
-  uint16_t arch;
-  uint8_t yaff_version;
-  uint32_t code_length;
-  uint32_t init_length;
-  uint32_t data_length;
-  uint32_t bss_length;
-  uint32_t entry;
-  uint16_t external_libraries_amount;
-  uint8_t alignment;
-  uint8_t text_and_data_separation;
-  uint16_t version_major;
-  uint16_t version_minor;
-  uint16_t symbol_table_relocations_amount;
-  uint16_t local_relocations_amount;
-  uint16_t data_relocations_amount;
-  uint16_t _reserved2;
-  uint16_t exported_symbols_amount;
-  uint16_t imported_symbols_amount;
-  uint32_t got_length;
-  uint32_t got_plt_length;
-  uint32_t plt_length;
-  // TODO: remove or move to the arch section
-  uint16_t arch_section_offset;
-  uint16_t imported_libraries_offset;
-  uint16_t relocations_offset;
-  uint16_t imported_symbols_offset;
-  uint16_t exported_symbols_offset;
-  uint16_t text_offset;
-} YaffHeader;
+// This implementation is based on elf hashing function
+uint32_t tcc_yaff_hash(const char *name) {
+  uint32_t h = 0, g;
+  while (*name) {
+    h = (h << 4) + *name++;
+    if ((g = h & 0xf0000000)) {
+      h ^= g >> 24;
+      h &= ~g;
+    }
+  }
+  return h;
+}
 
-typedef enum YaffSectionCode {
-  YAFF_SECTION_CODE = 0,
-  YAFF_SECTION_DATA = 1,
-  YAFF_SECTION_INIT = 2,
-  YAFF_SECTION_UNKNOWN = 3,
-} YaffSectionCode;
+void tcc_allocate_hash_table(YaffHashTable *ht, uint32_t number_of_buckets,
+                             uint32_t count) {
+  ht->nbucket = number_of_buckets;
+  ht->nchain = count;
+  ht->bucket = tcc_malloc(ht->nbucket * sizeof(uint32_t));
+  ht->chain = tcc_malloc(ht->nchain * sizeof(uint32_t));
+  memset(ht->bucket, 0, ht->nbucket * sizeof(uint32_t));
+  memset(ht->chain, 0, ht->nchain * sizeof(uint32_t));
+}
 
-typedef struct __attribute__((packed)) YaffSymbolTableRelocationEntry {
-  uint32_t is_exported_symbol : 1;
-  uint32_t index : 31;
-  uint32_t function_pointer: 1;
-  uint32_t symbol_index : 31;
-} YaffSymbolTableRelocationEntry;
+void tcc_add_hash_entry(YaffHashTable *ht, const char *name, uint32_t i) {
+  uint32_t h = tcc_yaff_hash(name);
+  uint32_t b = h % ht->nbucket;
+  if (ht->bucket[b] == 0) {
+    ht->bucket[b] = i;
+  } else {
+    uint32_t idx = ht->bucket[b];
+    while (ht->chain[idx] != 0)
+      idx = ht->chain[idx];
+    ht->chain[idx] = i;
+  }
+}
 
-typedef struct __attribute__((packed)) YaffDataRelocationEntry {
-  uint32_t to;
-  uint32_t section : 2;
-  uint32_t from : 30;
-} YaffDataRelocationEntry;
+void tcc_free_hash_table(YaffHashTable *ht) {
+  tcc_free(ht->bucket);
+  tcc_free(ht->chain);
+}
 
-typedef struct __attribute__((packed)) YaffLocalRelocationEntry {
-  uint32_t section : 2;
-  uint32_t index : 30;
-  uint32_t target_offset;
-} YaffLocalRelocationEntry;
-
-typedef struct __attribute__((packed)) YaffSymbolEntry {
-  uint32_t section : 2;
-  uint32_t offset : 30;
-  char name[0];
-} YaffSymbolEntry;
+void tcc_write_hash_table(YaffHashTable *ht, FILE *f) {
+  fwrite(&ht->nbucket, 1, sizeof(uint32_t), f);
+  fwrite(&ht->nchain, 1, sizeof(uint32_t), f);
+  fwrite(ht->bucket, sizeof(uint32_t), ht->nbucket, f);
+  fwrite(ht->chain, sizeof(uint32_t), ht->nchain, f);
+}
 
 uint32_t tcc_yaff_align(YaffHeader *header, uint32_t size) {
   return (size + header->alignment - 1) & ~(header->alignment - 1);
@@ -111,20 +94,21 @@ ST_FUNC int tcc_load_yaff(TCCState *s1, int fd, const char *filename,
   int ret = 0;
   const char *soname = tcc_basename(filename);
   YaffHeader header;
+  char buffer[TCC_YAFF_MAX_SYMBOL_ENTRY_SIZE];
+  uint32_t offset = 0;
   full_read(fd, &header, sizeof(YaffHeader));
   if (memcmp(header.magic, "YAFF", 4) != 0) {
     return tcc_error_noabort("not a valid YAFF file");
   }
 
-  char buffer[TCC_YAFF_MAX_SYMBOL_ENTRY_SIZE];
-  uint32_t offset = header.exported_symbols_offset;
+  offset = header.exported_symbols_offset;
 
   for (int i = 0; i < header.exported_symbols_amount; ++i) {
+    YaffSymbolEntry *entry = (YaffSymbolEntry *)buffer;
+    size_t len = 0;
     lseek(fd, offset, SEEK_SET);
     full_read(fd, buffer, sizeof(buffer));
-
-    YaffSymbolEntry *entry = (YaffSymbolEntry *)buffer;
-    size_t len = strnlen(entry->name, sizeof(buffer));
+    len = strnlen(entry->name, sizeof(buffer) - sizeof(YaffSymbolEntry));
     if (len == sizeof(buffer)) {
       return tcc_error_noabort("symbol entry too long");
     }
@@ -150,7 +134,6 @@ static int tcc_yaff_write_data_relocations(TCCState *s1, FILE *f) {
       if (s->sh_type == SHT_REL) {
         ElfW_Rel *rel;
         for_each_elem(s, 0, rel, ElfW_Rel) {
-          int symbol_index = ELFW(R_SYM)(rel->r_info);
           int type = ELFW(R_TYPE)(rel->r_info);
           switch (type) {
           // same as R_ARM_GOT_BREL
@@ -159,8 +142,8 @@ static int tcc_yaff_write_data_relocations(TCCState *s1, FILE *f) {
             // first data section is rodata
             uint32_t from_address = rel->r_offset;
             uint32_t original_offset = 0;
-            uint32_t sections_size_sum = 0;
             bool towards_code = false;
+            YaffDataRelocationEntry entry;
             if (from_address < rodata_section->sh_addr) {
               tcc_error_noabort(
                   "R_ARM_ABS32 relocation outside of data sections");
@@ -192,7 +175,7 @@ static int tcc_yaff_write_data_relocations(TCCState *s1, FILE *f) {
               original_offset -= rodata_section->sh_addr;
             }
 
-            YaffDataRelocationEntry entry = {
+            entry = (YaffDataRelocationEntry){
                 .to = from_address,
                 .section = towards_code ? YAFF_SECTION_CODE : YAFF_SECTION_DATA,
                 .from = original_offset,
@@ -250,7 +233,7 @@ static int tcc_yaff_write_symbol_table_relocations(TCCState *s1, FILE *f) {
           // index is not necessarily the same in the symtab and imported
           // symbols table
           ElfW(Sym) *sym = &((ElfW(Sym) *)s1->dynsym->data)[symbol_index];
-          int visibility = ELFW(ST_VISIBILITY)(sym->st_other);
+          YaffSymbolTableRelocationEntry entry;
           switch (type) {
           // same as R_ARM_GOT_BREL
           case R_ARM_GLOB_DAT:
@@ -267,11 +250,11 @@ static int tcc_yaff_write_symbol_table_relocations(TCCState *s1, FILE *f) {
               symbol_table_index =
                   symbol_index - 1 - number_of_imported_symbols;
             }
-            YaffSymbolTableRelocationEntry entry = {
+            entry = (YaffSymbolTableRelocationEntry){
                 .is_exported_symbol = is_exported,
                 .index = (rel->r_offset - s1->got->sh_addr) / 8,
                 .function_pointer = is_function_pointer,
-                .symbol_index = symbol_table_index,
+                .symbol_index = symbol_table_index + 1,
             };
             fwrite(&entry, 1, sizeof(entry), f);
             ++number_of_symbol_table_relocations;
@@ -303,17 +286,21 @@ static int tcc_yaff_write_symbol_table_relocations(TCCState *s1, FILE *f) {
 
 static int tcc_yaff_write_imported_symbols(TCCState *s1, FILE *f,
                                            YaffHeader *h) {
-  int i;
   ElfW(Sym) * sym;
-  int number_of_imported_symbols = 0;
+  int number_of_imported_symbols = 1;
   /* Allocate common symbols in BSS.  */
+  YaffSymbolEntry entry = {
+      0,
+      0,
+  };
+  fwrite(&entry, 1, sizeof(entry), f);
+  for (int j = 0; j < 4; ++j) {
+    fputc(0, f);
+  }
   for_each_elem(s1->dynsym, 1, sym, ElfW(Sym)) {
-    int section_code = 0;
     YaffSymbolEntry entry = {};
     int name_len = 0, aligned_name_len = 0;
     char *name = NULL;
-    unsigned vis = ELFW(ST_VISIBILITY)(sym->st_other);
-    unsigned bind = ELFW(ST_BIND)(sym->st_info);
     if (sym->st_shndx != SHN_UNDEF) {
       continue;
     }
@@ -321,6 +308,7 @@ static int tcc_yaff_write_imported_symbols(TCCState *s1, FILE *f,
         .section = 0,
         .offset = sym->st_value,
     };
+
     number_of_imported_symbols++;
     fwrite(&entry, 1, sizeof(entry), f);
     name = (char *)s1->dynsym->link->data + sym->st_name;
@@ -337,9 +325,16 @@ static int tcc_yaff_write_imported_symbols(TCCState *s1, FILE *f,
 
 static int tcc_yaff_write_exported_symbols(TCCState *s1, FILE *f,
                                            YaffHeader *h) {
-  int i;
   ElfW(Sym) * sym;
-  int number_of_exported_symbols = 0;
+  int number_of_exported_symbols = 1;
+  YaffSymbolEntry entry = {
+      0,
+      0,
+  };
+  fwrite(&entry, 1, sizeof(entry), f);
+  for (int j = 0; j < 4; ++j) {
+    fputc(0, f);
+  }
   for_each_elem(s1->dynsym, 1, sym, ElfW(Sym)) {
     int section_code = 0;
     YaffSymbolEntry entry = {};
@@ -383,20 +378,81 @@ static int tcc_yaff_write_exported_symbols(TCCState *s1, FILE *f,
   return number_of_exported_symbols;
 }
 
+static void tcc_yaff_write_imported_symbols_lookup(TCCState *s1, FILE *f,
+                                                   YaffHeader *h,
+                                                   YaffHashTable *hashtable) {
+  int i = 0;
+  ElfW(Sym) * sym;
+  int current_offset = 0;
+  YaffLookupEntry entry = {
+      .symbol_offset = current_offset,
+  };
+
+  tcc_add_hash_entry(hashtable, "", i++);
+  fwrite(&entry, sizeof(entry), 1, f);
+  current_offset += sizeof(uint32_t) + 4;
+  /* Allocate common symbols in BSS.  */
+  for_each_elem(s1->dynsym, 1, sym, ElfW(Sym)) {
+    int name_len = 0, aligned_name_len = 0;
+    char *name = NULL;
+    entry.symbol_offset = current_offset;
+    if (sym->st_shndx != SHN_UNDEF) {
+      continue;
+    }
+    name = (char *)s1->dynsym->link->data + sym->st_name;
+    tcc_add_hash_entry(hashtable, name, i++);
+    name_len = strlen(name) + 1;
+    aligned_name_len = tcc_yaff_align(h, name_len);
+    current_offset += sizeof(uint32_t) + aligned_name_len;
+    fwrite(&entry, sizeof(entry), 1, f);
+  }
+}
+
+static void tcc_yaff_write_exported_symbols_lookup(TCCState *s1, FILE *f,
+                                                   YaffHeader *h,
+                                                   YaffHashTable *hashtable) {
+  int i = 0;
+  ElfW(Sym) * sym;
+  int current_offset = 0; // sizeof(uint32_t) + 4;
+  YaffLookupEntry entry = {
+      .symbol_offset = current_offset,
+  };
+  tcc_add_hash_entry(hashtable, "", i++);
+  fwrite(&entry, sizeof(entry), 1, f);
+  current_offset += sizeof(uint32_t) + 4;
+  for_each_elem(s1->dynsym, 1, sym, ElfW(Sym)) {
+    int name_len = 0, aligned_name_len = 0;
+    char *name = NULL;
+    unsigned vis = ELFW(ST_VISIBILITY)(sym->st_other);
+    unsigned bind = ELFW(ST_BIND)(sym->st_info);
+    if (sym->st_shndx == SHN_UNDEF ||
+        (bind != STB_GLOBAL && bind != STB_WEAK) ||
+        (vis != STV_DEFAULT && vis != STV_PROTECTED)) {
+      continue;
+    }
+
+    entry.symbol_offset = current_offset;
+    name = (char *)s1->dynsym->link->data + sym->st_name;
+    tcc_add_hash_entry(hashtable, name, i++);
+    name_len = strlen(name) + 1;
+    aligned_name_len = tcc_yaff_align(h, name_len);
+    current_offset += sizeof(uint32_t) + aligned_name_len;
+    fwrite(&entry, sizeof(entry), 1, f);
+  }
+}
+
 ST_FUNC int tcc_output_yaff(TCCState *s1, FILE *f, const char *filename) {
-  int i, shnum, offset, size, file_type;
-  Section *s;
-  ElfW(Ehdr) ehdr;
-  ElfW(Shdr) shdr, *sh;
-  fflush(stdout);
+  int i, file_type;
   YaffHeader header = {};
   char *name;
   uint32_t aligned_name_len = 0;
   uint32_t text_offset = 0, aligned_text_offset = 0;
+  YaffHashTable imported_symbols_hashtable;
+  YaffHashTable exported_symbols_hashtable;
+  fflush(stdout);
   name = tcc_basename(filename);
 
   file_type = s1->output_type;
-  shnum = s1->nb_sections;
 
   memcpy(header.magic, YAFFMAG, sizeof(YAFFMAG) - 1);
   header.module_type = file_type == TCC_OUTPUT_DYN ? 2 : 1;
@@ -462,6 +518,26 @@ ST_FUNC int tcc_output_yaff(TCCState *s1, FILE *f, const char *filename) {
   header.exported_symbols_offset = ftell(f);
   header.exported_symbols_amount =
       tcc_yaff_write_exported_symbols(s1, f, &header);
+  header.imported_symbols_lookup_offset = ftell(f);
+
+  tcc_allocate_hash_table(&imported_symbols_hashtable,
+                          header.imported_symbols_amount + 1,
+                          header.imported_symbols_amount);
+  tcc_yaff_write_imported_symbols_lookup(s1, f, &header,
+                                         &imported_symbols_hashtable);
+  header.exported_symbols_lookup_offset = ftell(f);
+
+  tcc_allocate_hash_table(&exported_symbols_hashtable,
+                          header.exported_symbols_amount + 1,
+                          header.exported_symbols_amount);
+  tcc_yaff_write_exported_symbols_lookup(s1, f, &header,
+                                         &exported_symbols_hashtable);
+
+  header.imported_symbols_hash_table_offset = ftell(f);
+  tcc_write_hash_table(&imported_symbols_hashtable, f);
+  header.exported_symbols_hash_table_offset = ftell(f);
+  tcc_write_hash_table(&exported_symbols_hashtable, f);
+
   header.got_length = s1->got->sh_size;
   text_offset = ftell(f);
   aligned_text_offset = (text_offset + 15) & ~15;
@@ -477,7 +553,6 @@ ST_FUNC int tcc_output_yaff(TCCState *s1, FILE *f, const char *filename) {
   }
   fwrite(rodata_section->data, 1, rodata_section->sh_size, f);
   fwrite(data_section->data, 1, data_section->sh_size, f);
-  int foff = ftell(f);
   fwrite(s1->got->data, 1, s1->got->sh_size, f);
   fseek(f, 0, SEEK_SET);
   fwrite(&header, 1, sizeof(YaffHeader), f);

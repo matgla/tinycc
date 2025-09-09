@@ -350,10 +350,12 @@ void pv(const char *lbl, int a, int b) {
 #endif
 
 // debugging aid when stack is corrupted
+#if 0
 void dbg_print_vstack(const char *msg, const char *file, int line) {
   printf("print_vstack '%s' vtop: %p, elements: %d, at: %s:%d\n", msg, vtop,
          (vtop - vstack) + 1, file, line);
 }
+#endif
 
 /* ------------------------------------------------------------------------- */
 /* initialize vstack and types.  This must be done also for tcc -E */
@@ -1548,43 +1550,6 @@ static void gbound(void) {
     }
     /* then check for dereferencing */
     gen_bounded_ptr_deref();
-  }
-}
-
-/* we need to call __bound_ptr_add before we start to load function
-   args into registers */
-ST_FUNC void gbound_args(int nb_args) {
-  int i, v;
-  SValue *sv;
-
-  for (i = 1; i <= nb_args; ++i)
-    if (vtop[1 - i].r & VT_MUSTBOUND) {
-      vrotb(i);
-      gbound();
-      vrott(i);
-    }
-
-  sv = vtop - nb_args;
-  if (sv->r & VT_SYM) {
-    v = sv->sym->v;
-    if (v == TOK_setjmp || v == TOK__setjmp
-#ifndef TCC_TARGET_PE
-        || v == TOK_sigsetjmp || v == TOK___sigsetjmp
-#endif
-    ) {
-      vpush_helper_func(TOK___bound_setjmp);
-      vpushv(sv + 1);
-      gfunc_call(1);
-      // func_bound_add_epilog = 1;
-    }
-#if defined TCC_TARGET_I386 || defined TCC_TARGET_X86_64
-    if (v == TOK_alloca)
-    // func_bound_add_epilog = 1;
-#endif
-#if TARGETOS_NetBSD
-      if (v == TOK_longjmp) /* undo rename to __longjmp14 */
-        sv->sym->asm_label = TOK___bound_longjmp;
-#endif
   }
 }
 

@@ -22,6 +22,8 @@
 #include "tcc.h"
 #ifdef CONFIG_TCC_ASM
 
+#include <stdlib.h>
+
 static Section *last_text_section; /* to handle .previous asm directive */
 static int asmgoto_n;
 
