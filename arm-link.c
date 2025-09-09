@@ -176,7 +176,6 @@ ST_FUNC void relocate_plt(TCCState *s1) {
 
   if (p < p_end) {
     // int x = s1->got->sh_addr - s1->plt->sh_addr - 12;
-    int x = 0;
     if (s1->text_and_data_separation) {
       // p += 48;
     } else {
@@ -288,7 +287,6 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
     return;
   case R_ARM_THM_JUMP6: {
     int x, orig, i, imm5;
-    Section *plt;
     /* weak reference */
     if (sym->st_shndx == SHN_UNDEF && ELFW(ST_BIND)(sym->st_info) == STB_WEAK)
       return;
@@ -310,7 +308,6 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
   }
   case R_ARM_THM_ALU_PREL_11_0: {
     int x, hi, lo, s, i, imm3, imm8;
-    Section *plt;
     /* weak reference */
     if (sym->st_shndx == SHN_UNDEF && ELFW(ST_BIND)(sym->st_info) == STB_WEAK)
       return;
@@ -349,8 +346,7 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
   }
     return;
   case R_ARM_THM_PC12: {
-    int x, orig, i, imm12;
-    Section *plt;
+    int x, orig;
     /* weak reference */
     if (sym->st_shndx == SHN_UNDEF && ELFW(ST_BIND)(sym->st_info) == STB_WEAK)
       return;
@@ -370,8 +366,7 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
   }
     return;
   case R_ARM_THM_PC8: {
-    int x, orig, i, imm8;
-    Section *plt;
+    int x, orig;
     /* weak reference */
     if (sym->st_shndx == SHN_UNDEF && ELFW(ST_BIND)(sym->st_info) == STB_WEAK)
       return;
@@ -424,10 +419,6 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
       to_plt = (val >= plt->sh_addr) && (val < plt->sh_addr + plt->data_offset);
     }
     is_call = (type == R_ARM_THM_PC22);
-    Section *text;
-    char *name = (char *)symtab_section->link->data + sym->st_name;
-    text = s1->sections[sym->st_shndx];
-
     if (!to_plt && !is_call) {
       // int index;
       // uint8_t *p;

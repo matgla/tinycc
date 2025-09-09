@@ -1082,7 +1082,6 @@ static void relocate_section(TCCState *s1, Section *s, Section *sr) {
   unsigned char *ptr;
   addr_t tgt, addr;
   int is_dwarf = s->sh_num >= s1->dwlo && s->sh_num < s1->dwhi;
-  int id = 0;
   qrel = (ElfW_Rel *)sr->data;
 
   for_each_elem(sr, 0, rel, ElfW_Rel) {
@@ -2987,8 +2986,6 @@ ST_FUNC ssize_t full_read(int fd, void *buf, size_t count) {
   size_t rnum = 0;
   while (1) {
     ssize_t num = read(fd, cbuf, count - rnum);
-    int i = 0;
-
     if (num < 0)
       return num;
     if (num == 0)

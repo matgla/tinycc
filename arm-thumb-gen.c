@@ -378,14 +378,12 @@ static int assign_regs(int nb_args, int float_abi, struct plan *plan,
   for (i = nb_args; i--;) {
     int j, start_vfpreg = 0;
     CType type = vtop[-i].type;
-    bool is_function_pointer = false;
     ElfSym *sym = NULL;
     type.t &= ~VT_ARRAY;
     size = type_size(&type, &align);
     size = (size + 3) & ~3;
     align = (align + 3) & ~3;
     // if argument is a function pointer, then symbol must be exported
-    SValue *top = &vtop[-i];
     if (vtop[-i].r & VT_SYM) {
       if (((type.t & VT_BTYPE) == VT_FUNC) ||
           ((type.t & VT_BTYPE) == VT_PTR && type.ref &&
@@ -475,7 +473,6 @@ static int regmask(int r) { return reg_classes[r] & ~(RC_INT | RC_FLOAT); }
  * current write position must be 16-bit aligned
  */
 void o(unsigned int i) {
-  const uint16_t instruction = i & 0xffff;
   const int ind1 = ind + 2;
   TRACE("  o: 0x%03x pc: 0x%x", i, ind);
   if (nocode_wanted) {
@@ -864,6 +861,7 @@ void gfunc_prolog(Sym *func_sym) {
   int n, nf, size, align, rs, struct_ret = 0;
   int addr, pn, sn; /* pn=core, sn=stack */
   CType ret_type;
+  int est;
 
   struct avail_regs avregs = {{0}}; // AVAIL_REGS_INITIALIZER;
 
@@ -925,7 +923,7 @@ void gfunc_prolog(Sym *func_sym) {
   // nooo there must be a better way to do this
   // maybe in case of full loading use branch to epilogue code?
   // ind + branch instruction + ldr is 4 bytes
-  int est = th_ldr_literal_estimate(R_LR, 4);
+  est = th_ldr_literal_estimate(R_LR, 4);
   est += 2; // 2 bytes for the branch instruction
   est += 2; // 2 bytes for the sub instruction
   est += ind;
@@ -1013,6 +1011,7 @@ void gfunc_call(int nb_args) {
   int todo;
   struct plan plan;
   int variadic;
+  int x;
 
   TRACE("'gfunc_call: nb_args: %d, float_abi: %d'", nb_args, float_abi);
   // we will be calling a function, R9 must be saved for Yasos.zig
@@ -1038,9 +1037,7 @@ void gfunc_call(int nb_args) {
     ot_check(th_sub_sp_imm(R_SP, 4, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
                            ENFORCE_ENCODING_NONE));
   }
-  TRACE("Copy params\n");
-  int x = copy_params(nb_args, &plan, todo);
-  TRACE("Copy params done\n");
+  x = copy_params(nb_args, &plan, todo);
   nb_args += x;
   tcc_free(plan.pplans);
 
@@ -1064,7 +1061,6 @@ void gfunc_call(int nb_args) {
 }
 
 void gfunc_epilog(void) {
-  thumb_opcode x;
   int diff = 0;
   TRACE("'gfunc_epilog'");
   // copy float return value to core register if base standard is used
@@ -1288,8 +1284,7 @@ static uint32_t intr(int r) {
 }
 
 void store(int r, SValue *sv) {
-  print_vstack("store begin");
-  int v, vt, fc, ft, fr, sign;
+  int v, fc, ft, fr, sign;
   TRACE("'store' reg: %d", r);
 
   fr = sv->r;
@@ -1344,9 +1339,7 @@ void store(int r, SValue *sv) {
       } else {
         TRACE("store: sign: %x, r: %x, base: %x, fc: %x", sign, r, base, fc);
         if (!ot(th_str_imm(r, base, fc, sign ? 4 : 6, ENFORCE_ENCODING_NONE))) {
-          TRACE("th_offset");
           int rr = th_offset_to_reg(fc, sign);
-          TRACE("RR: %d", rr);
           ot_check(th_str_reg(r, base, rr, THUMB_SHIFT_DEFAULT,
                               ENFORCE_ENCODING_NONE));
         }
@@ -1368,6 +1361,8 @@ static void load_vt_lval_vt_local_float(int r, SValue *sv, int ft, int fc,
 
 static void load_full_const(int r, int32_t imm, struct Sym *sym) {
   int est = 0;
+  ElfSym *esym = elfsym(sym);
+  int sym_off = 0;
   TRACE("'load_full_const' to register: %d, with imm: %d\n", r, imm);
   est = th_ldr_literal_estimate(r, 4);
   est += 4; // branch instruction size
@@ -1378,8 +1373,6 @@ static void load_full_const(int r, int32_t imm, struct Sym *sym) {
   ot_check(th_ldr_literal(r, 4, 1));
   ot_check(th_b_t4(4));
 
-  ElfSym *esym = elfsym(sym);
-  int sym_off = 0;
   if (esym) {
     sym_off = esym->st_shndx;
   }
@@ -1717,7 +1710,7 @@ ST_FUNC void gen_cvt_itof(int t) {
     uint32_t r2 = vfpr(vtop->r = get_reg(RC_FLOAT));
     uint32_t op = (vtop->type.t & VT_UNSIGNED) ? 0 : 1;
     ot_check(th_vmov_gp_sp(r, r2, 0));
-    ot_check(th_vcvt_fp_int(r2, r2, 0, (t & VT_BYTE) != VT_FLOAT, op));
+    ot_check(th_vcvt_fp_int(r2, r2, 0, (t & VT_BTYPE) != VT_FLOAT, op));
     return;
   } else if (bt == VT_LLONG) {
     int func;
@@ -1785,7 +1778,7 @@ void gen_cvt_ftoi(int t) {
 
 void gen_cvt_ftof(int t) {
   TRACE("gen_cvt_ftof t: 0x%x", t);
-  if (((vtop->type.t & VT_BYTE) == VT_FLOAT) != ((t & VT_BTYPE) == VT_FLOAT)) {
+  if (((vtop->type.t & VT_BTYPE) == VT_FLOAT) != ((t & VT_BTYPE) == VT_FLOAT)) {
     uint32_t r = vfpr(gv(RC_FLOAT));
     if ((t & VT_BTYPE) != VT_FLOAT)
       ot_check(th_vcvt_float_to_double(r, r));
@@ -1795,7 +1788,8 @@ void gen_cvt_ftof(int t) {
 }
 
 void gen_opf(int op) {
-  const uint32_t is_double = ((vtop->type.t & VT_BYTE) != VT_FLOAT) ? 0x100 : 0;
+  const uint32_t is_double =
+      ((vtop->type.t & VT_BTYPE) != VT_FLOAT) ? 0x100 : 0;
 
   TRACE("gen_opf op: 0x%x(%c)", op, op);
   switch (op) {

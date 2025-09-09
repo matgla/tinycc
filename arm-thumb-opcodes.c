@@ -215,7 +215,6 @@ thumb_opcode th_b_t3(uint32_t op, uint32_t imm) {
 }
 
 thumb_opcode th_b_t4(int32_t imm) {
-  uint32_t packed = 0;
   if (imm > 16777215 || imm < -16777215)
     tcc_error("compiler_error: th_b_t4 too far address: 0x%x\n", imm);
 
@@ -254,6 +253,7 @@ uint32_t th_shift_type_to_op(thumb_shift shift) {
 
 uint32_t th_shift_value_to_sr_type(thumb_shift shift) {
   switch (shift.type) {
+  case THUMB_SHIFT_NONE:
   case THUMB_SHIFT_LSL:
     return 0;
   case THUMB_SHIFT_LSR:
@@ -297,6 +297,10 @@ thumb_opcode th_mov_reg(uint32_t rd, uint32_t rm, flags_behaviour flags,
     return th_generic_op_reg_shift_with_status(0xea4f, rd, 0xf, rm, flags,
                                                shift);
   }
+  return (thumb_opcode){
+      .size = 0,
+      .opcode = 0,
+  };
 }
 
 thumb_opcode th_mov_imm(uint16_t rd, uint32_t imm, flags_behaviour setflags,
@@ -339,14 +343,15 @@ thumb_opcode th_mov_imm(uint16_t rd, uint32_t imm, flags_behaviour setflags,
 }
 
 thumb_opcode th_movt(uint32_t rd, uint32_t imm16) {
-  if (rd == R_SP || rd == R_PC || imm16 > 0xffff) {
-    tcc_error("compiler_error: 'th_movt', SP or PC can't be used as rd\n");
-    return (thumb_opcode){0, 0};
-  }
   const uint32_t imm8 = imm16 & 0xff;
   const uint32_t imm3 = (imm16 >> 8) & 0x7;
   const uint32_t i = (imm16 >> 11) & 0x1;
   const uint32_t imm4 = (imm16 >> 12) & 0xf;
+
+  if (rd == R_SP || rd == R_PC || imm16 > 0xffff) {
+    tcc_error("compiler_error: 'th_movt', SP or PC can't be used as rd\n");
+    return (thumb_opcode){0, 0};
+  }
 
   return (thumb_opcode){
       .size = 4,
@@ -607,11 +612,11 @@ thumb_opcode th_generic_op_reg_shift_with_status(uint32_t op, uint32_t rd,
                                                  flags_behaviour flags,
                                                  thumb_shift shift) {
   int s = 0;
+  const int sr = th_shift_value_to_sr_type(shift);
+  const int imm2 = shift.value & 0x3;
+  const int imm3 = (shift.value >> 2) & 0x7;
   if (flags == FLAGS_BEHAVIOUR_SET)
     s = 1;
-  int sr = th_shift_value_to_sr_type(shift);
-  int imm2 = shift.value & 0x3;
-  int imm3 = (shift.value >> 2) & 0x7;
 
   return (thumb_opcode){
       .size = 4,
@@ -1447,6 +1452,10 @@ thumb_opcode th_add_sp_reg(uint32_t rd, uint32_t rm, flags_behaviour flags,
                   (imm2 << 6) | (sr << 4) | rm,
     };
   }
+  return (thumb_opcode){
+      .size = 0,
+      .opcode = 0,
+  };
 }
 
 thumb_opcode th_rsb_imm(uint16_t rd, uint16_t rn, uint32_t imm,
@@ -1609,7 +1618,7 @@ thumb_opcode th_asr_imm(uint16_t rd, uint16_t rm, uint32_t imm,
 thumb_opcode th_mov_reg_shift(uint32_t rd, uint32_t rm, uint32_t rs,
                               flags_behaviour flags, thumb_shift shift,
                               enforce_encoding encoding) {
-
+  const uint32_t s = flags == FLAGS_BEHAVIOUR_SET;
   if (rd == rm && rd < 8 && rs < 8 && encoding != ENFORCE_ENCODING_32BIT &&
       shift.type != THUMB_SHIFT_RRX) {
     return (thumb_opcode){
@@ -1617,7 +1626,6 @@ thumb_opcode th_mov_reg_shift(uint32_t rd, uint32_t rm, uint32_t rs,
         .opcode = 0x4000 | (rs << 3) | th_shift_type_to_op(shift) << 6 | rd,
     };
   }
-  const uint32_t s = flags == FLAGS_BEHAVIOUR_SET;
   return (thumb_opcode){
       .size = 4,
       .opcode = 0xfa00f000 | th_shift_value_to_sr_type(shift) << 21 | s << 20 |
@@ -1797,7 +1805,6 @@ thumb_opcode th_sub_sp_imm_t3(uint32_t rd, uint32_t imm, flags_behaviour flags,
 
 thumb_opcode th_sub_sp_imm(uint32_t rd, uint32_t imm, flags_behaviour flags,
                            enforce_encoding encoding) {
-  thumb_opcode op = {0, 0};
   // T1 encoding
   if (rd == R_SP && imm <= 508 && !(imm & 0x3) &&
       encoding != ENFORCE_ENCODING_32BIT && flags != FLAGS_BEHAVIOUR_SET) {
@@ -2398,7 +2405,7 @@ thumb_opcode th_sbfx(uint32_t rd, uint32_t rn, uint32_t lsb, uint32_t width) {
   return (thumb_opcode){
       .size = 4,
       .opcode = 0xf3400000 | (rn << 16) | (rd << 8) | (imm3 << 12) |
-                (imm2 << 6) | width - 1,
+                (imm2 << 6) | (width - 1),
   };
 }
 
@@ -2642,6 +2649,8 @@ thumb_opcode th_strt(uint32_t rt, uint32_t rn, int imm) {
 
 thumb_opcode th_sxtb(uint32_t rd, uint32_t rm, thumb_shift shift,
                      enforce_encoding encoding) {
+
+  const uint32_t rotate = shift.value >> 3;
   if (shift.type != THUMB_SHIFT_NONE && shift.type != THUMB_SHIFT_ROR) {
     tcc_error("compiler_error: 'th_sxtb', invalid shift type\n");
     return (thumb_opcode){0, 0};
@@ -2660,7 +2669,6 @@ thumb_opcode th_sxtb(uint32_t rd, uint32_t rm, thumb_shift shift,
         .opcode = 0xb240 | (rm << 3) | rd,
     };
   }
-  const uint32_t rotate = shift.value >> 3;
   return (thumb_opcode){
       .size = 4,
       .opcode = 0xfa4ff080 | rd << 8 | rm | rotate << 4,
@@ -2669,6 +2677,8 @@ thumb_opcode th_sxtb(uint32_t rd, uint32_t rm, thumb_shift shift,
 
 thumb_opcode th_sxth(uint32_t rd, uint32_t rm, thumb_shift shift,
                      enforce_encoding encoding) {
+
+  const uint32_t rotate = shift.value >> 3;
   if (shift.type != THUMB_SHIFT_NONE && shift.type != THUMB_SHIFT_ROR) {
     tcc_error("compiler_error: 'th_sxth', invalid shift type\n");
     return (thumb_opcode){0, 0};
@@ -2687,7 +2697,6 @@ thumb_opcode th_sxth(uint32_t rd, uint32_t rm, thumb_shift shift,
         .opcode = 0xb200 | (rm << 3) | rd,
     };
   }
-  const uint32_t rotate = shift.value >> 3;
   return (thumb_opcode){
       .size = 4,
       .opcode = 0xfa0ff080 | rd << 8 | rm | rotate << 4,
@@ -2738,14 +2747,15 @@ thumb_opcode th_tt(uint32_t rd, uint32_t rn, uint32_t a, uint32_t t) {
 }
 
 thumb_opcode th_udf(uint32_t imm, enforce_encoding encoding) {
+  const uint32_t imm4 = (imm >> 12) & 0xf;
+  const uint32_t imm12 = imm & 0xfff;
+
   if (encoding != ENFORCE_ENCODING_32BIT && imm <= 0xff) {
     return (thumb_opcode){
         .size = 2,
         .opcode = 0xde00 | imm,
     };
   }
-  const uint32_t imm4 = (imm >> 12) & 0xf;
-  const uint32_t imm12 = imm & 0xfff;
   return (thumb_opcode){
       .size = 4,
       .opcode = 0xf7f0a000 | imm4 << 16 | imm12,
@@ -2761,6 +2771,8 @@ thumb_opcode th_umlal(uint32_t rdlo, uint32_t rdhi, uint32_t rn, uint32_t rm) {
 
 thumb_opcode th_uxtb(uint32_t rd, uint32_t rm, thumb_shift shift,
                      enforce_encoding encoding) {
+
+  const uint32_t rotate = shift.value >> 3;
   if (shift.type != THUMB_SHIFT_NONE && shift.type != THUMB_SHIFT_ROR) {
     tcc_error("compiler_error: 'th_uxtb', invalid shift type\n");
     return (thumb_opcode){0, 0};
@@ -2779,7 +2791,6 @@ thumb_opcode th_uxtb(uint32_t rd, uint32_t rm, thumb_shift shift,
         .opcode = 0xb2c0 | (rm << 3) | rd,
     };
   }
-  const uint32_t rotate = shift.value >> 3;
   return (thumb_opcode){
       .size = 4,
       .opcode = 0xfa5ff080 | rd << 8 | rm | rotate << 4,
@@ -2788,6 +2799,8 @@ thumb_opcode th_uxtb(uint32_t rd, uint32_t rm, thumb_shift shift,
 
 thumb_opcode th_uxth(uint32_t rd, uint32_t rm, thumb_shift shift,
                      enforce_encoding encoding) {
+
+  const uint32_t rotate = shift.value >> 3;
   if (shift.type != THUMB_SHIFT_NONE && shift.type != THUMB_SHIFT_ROR) {
     tcc_error("compiler_error: 'th_uxth', invalid shift type\n");
     return (thumb_opcode){0, 0};
@@ -2806,7 +2819,6 @@ thumb_opcode th_uxth(uint32_t rd, uint32_t rm, thumb_shift shift,
         .opcode = 0xb280 | (rm << 3) | rd,
     };
   }
-  const uint32_t rotate = shift.value >> 3;
   return (thumb_opcode){
       .size = 4,
       .opcode = 0xfa1ff080 | rd << 8 | rm | rotate << 4,

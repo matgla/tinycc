@@ -188,15 +188,16 @@ extern long double strtold(const char *__nptr, char **__endptr);
 /* only native compiler supports -run */
 #if defined _WIN32 == defined TCC_TARGET_PE &&                                 \
     defined __APPLE__ == defined TCC_TARGET_MACHO
-#if defined __i386__ && defined TCC_TARGET_I386
+#if defined __i386__ && defined TCC_TARGET_I386 && !defined TCC_IS_NATIVE
 #define TCC_IS_NATIVE
-#elif defined __x86_64__ && defined TCC_TARGET_X86_64
+#elif defined __x86_64__ && defined TCC_TARGET_X86_64 && !defined TCC_IS_NATIVE
 #define TCC_IS_NATIVE
-#elif defined __arm__ && defined TCC_TARGET_ARM
+#elif defined __arm__ && defined TCC_TARGET_ARM && !defined TCC_IS_NATIVE
 #define TCC_IS_NATIVE
-#elif defined __aarch64__ && defined TCC_TARGET_ARM64
+#elif defined __aarch64__ && defined TCC_TARGET_ARM64 && !defined TCC_IS_NATIVE
 #define TCC_IS_NATIVE
-#elif defined __riscv && defined __LP64__ && defined TCC_TARGET_RISCV64
+#elif defined __riscv && defined __LP64__ && defined TCC_TARGET_RISCV64 &&     \
+    !defined TCC_IS_NATIVE
 #define TCC_IS_NATIVE
 #endif
 #endif
@@ -1540,10 +1541,6 @@ ST_FUNC Sym *get_sym_ref(CType *type, Section *sec, unsigned long offset,
 #endif
 #if defined TCC_TARGET_X86_64 && !defined TCC_TARGET_PE
 ST_FUNC int classify_x86_64_va_arg(CType *ty);
-#endif
-#ifdef CONFIG_TCC_BCHECK
-ST_FUNC void gbound_args(int nb_args);
-ST_DATA int func_bound_add_epilog;
 #endif
 
 /* ------------ tccelf.c ------------ */
