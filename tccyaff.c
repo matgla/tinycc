@@ -534,8 +534,27 @@ ST_FUNC int tcc_output_yaff(TCCState *s1, FILE *f, const char *filename) {
                                          &exported_symbols_hashtable);
 
   header.imported_symbols_hash_table_offset = ftell(f);
+  if (header.imported_symbols_hash_table_offset % header.alignment != 0) {
+    for (i = 0;
+         i < header.alignment -
+                 (header.imported_symbols_hash_table_offset % header.alignment);
+         ++i) {
+      fputc(0, f);
+    }
+    header.imported_symbols_hash_table_offset = ftell(f); // align after padding
+  }
   tcc_write_hash_table(&imported_symbols_hashtable, f);
   header.exported_symbols_hash_table_offset = ftell(f);
+  if (header.exported_symbols_hash_table_offset % header.alignment != 0) {
+    for (i = 0;
+         i < header.alignment -
+                 (header.exported_symbols_hash_table_offset % header.alignment);
+         ++i) {
+      fputc(0, f);
+    }
+    header.exported_symbols_hash_table_offset = ftell(f); // align after padding
+  }
+
   tcc_write_hash_table(&exported_symbols_hashtable, f);
 
   header.got_length = s1->got->sh_size;
