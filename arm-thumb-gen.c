@@ -639,8 +639,7 @@ static void gcall_or_jmp(int is_jmp) {
   if ((vtop->r & (VT_VALMASK | VT_LVAL)) == VT_CONST) {
     uint32_t x = th_encbranch(ind, ind + vtop->c.i);
 
-    TRACE("gcall_or_jmp: %d, ind: 0x%x, vtop: 0x%x, 0x%x", is_jmp, ind,
-          vtop->c.i, x);
+    TRACE("gcall_or_jmp: %d, ind: 0x%x, 0x%x", is_jmp, ind, x);
     if (x) {
       if (vtop->r & VT_SYM)
         greloc(cur_text_section, vtop->sym, ind, R_ARM_THM_JUMP24);
@@ -1414,11 +1413,26 @@ static void load_full_const(int r, int32_t imm, struct Sym *sym) {
           ot_check(th_add_reg(r, r, R9, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
                               THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
         } else {
-          ot_check(th_add_reg(r, r, R9, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                              THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-          ot_check(th_ldr_imm(r, r, 0, 6, ENFORCE_ENCODING_NONE));
-          ot_check(th_add_imm(r, r, imm, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                              ENFORCE_ENCODING_NONE));
+          int size = 0;
+          thumb_opcode o;
+          o = th_add_reg(r, r, R9, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                              THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE);
+          size += o.size;
+          ot_check(o);
+          
+          o = th_ldr_imm(r, r, 0, 6, ENFORCE_ENCODING_NONE);
+          size += o.size;
+          ot_check(o);
+          
+          o = th_add_imm(r, r, imm, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                              ENFORCE_ENCODING_NONE);
+          if (o.size != 0) {
+            ot_check(o);
+          } else {
+            ot_check(th_ldr_imm(R_LR, R_PC, size + 8, 4, ENFORCE_ENCODING_NONE));
+            ot_check(th_add_reg(r, r, R_LR, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                                THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+          }
         }
       } else {
         if (sym->type.t & VT_STATIC) {
@@ -1427,11 +1441,24 @@ static void load_full_const(int r, int32_t imm, struct Sym *sym) {
           ot_check(th_sub_imm(r, r, 8, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
                               ENFORCE_ENCODING_NONE));
         } else {
-          ot_check(th_add_reg(r, r, R_PC, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                              THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-          ot_check(th_ldr_imm(r, r, 4, 6, ENFORCE_ENCODING_NONE));
-          ot_check(th_add_imm(r, r, imm, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                              ENFORCE_ENCODING_NONE));
+          int size = 0;
+          thumb_opcode o = th_add_reg(r, r, R_PC, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                              THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE);
+          ot_check(o);
+          size += o.size;
+          o = th_ldr_imm(r, r, 4, 6, ENFORCE_ENCODING_NONE);
+          ot_check(o);
+          size += o.size;
+
+          o = th_add_imm(r, r, imm, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                              ENFORCE_ENCODING_NONE);
+          if (o.size != 0) {
+            ot_check(o);
+          } else {
+            ot_check(th_ldr_imm(R_LR, R_PC, size + 8, 4, ENFORCE_ENCODING_NONE));
+            ot_check(th_add_reg(r, r, R_LR, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                                THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+          }
         }
       }
     }
@@ -1538,7 +1565,7 @@ void load_vt_const(int r, SValue *sv) {
 }
 
 void load_vt_local(int r, SValue *sv) {
-  TRACE("'load_vt_local' r: %d, off: %x", r, sv->c.i);
+  TRACE("'load_vt_local' r: %d, off: %x", r, (uint32_t)sv->c.i);
   if (sv->r & VT_SYM || (-sv->c.i) >= 0xfff) {
     load_full_const(r, sv->c.i, sv->r & VT_SYM ? sv->sym : 0);
     ot_check(th_add_reg(r, R_FP, r, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
@@ -1552,7 +1579,7 @@ void load_vt_local(int r, SValue *sv) {
 void load_vt_cmp(int r, SValue *sv) {
   const uint32_t firstcond = mapcc(sv->c.i);
   uint32_t rr = intr(r);
-  TRACE("'load_vt_cmp' to reg: %d, op: 0x%x\n", r, sv->c.i);
+  TRACE("'load_vt_cmp' to reg: %d, op: 0x%x\n", r, (uint32_t)sv->c.i);
   if (rr == R_SP || rr == R_PC) {
     tcc_error("compiler_error: load_vt_cmp can't be used for pc or sp\n");
   }
