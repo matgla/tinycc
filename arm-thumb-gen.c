@@ -1429,9 +1429,13 @@ static void load_full_const(int r, int32_t imm, struct Sym *sym) {
           if (o.size != 0) {
             ot_check(o);
           } else {
+            // size += o.size;
+            // ot_check(o);
             ot_check(th_ldr_imm(R_LR, R_PC, size + 8, 4, ENFORCE_ENCODING_NONE));
             ot_check(th_add_reg(r, r, R_LR, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
                                 THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+            
+            // ot_check(th_bkpt(1));
           }
         }
       } else {
