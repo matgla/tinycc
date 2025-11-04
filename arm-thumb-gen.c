@@ -1402,6 +1402,7 @@ static void load_full_const(int r, int32_t imm, struct Sym *sym) {
     }
   }
   th_sym_d();
+  // this immediate value will be relocated by the linker
   o(imm & 0xffff);
   o(imm >> 16);
   th_sym_t();
@@ -1413,28 +1414,28 @@ static void load_full_const(int r, int32_t imm, struct Sym *sym) {
           ot_check(th_add_reg(r, r, R9, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
                               THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
         } else {
-          int size = 0;
-          thumb_opcode o;
-          o = th_add_reg(r, r, R9, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                              THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE);
-          size += o.size;
-          ot_check(o);
-          
-          o = th_ldr_imm(r, r, 0, 6, ENFORCE_ENCODING_NONE);
-          size += o.size;
-          ot_check(o);
-          
-          o = th_add_imm(r, r, imm, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                              ENFORCE_ENCODING_NONE);
-          if (o.size != 0) {
-            ot_check(o);
+          thumb_opcode ot;
+          ot_check(th_add_reg(r, r, R9, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                              THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+
+          ot_check(th_ldr_imm(r, r, 0, 6, ENFORCE_ENCODING_NONE));
+          ot = th_add_imm(r, r, imm, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                          ENFORCE_ENCODING_NONE);
+          if (ot.size != 0) {
+            ot_check(ot);
           } else {
             // size += o.size;
             // ot_check(o);
-            ot_check(th_ldr_imm(R_LR, R_PC, size + 8, 4, ENFORCE_ENCODING_NONE));
+            ot_check(th_b_t4(4));
+            th_sym_d();
+            // thus that immediate value must be preserved without linker touch
+            o(imm & 0xffff);
+            o(imm >> 16);
+            th_sym_t();
+            ot_check(th_ldr_imm(R_LR, R_PC, 8, 4, ENFORCE_ENCODING_NONE));
             ot_check(th_add_reg(r, r, R_LR, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
                                 THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-            
+
             // ot_check(th_bkpt(1));
           }
         }
@@ -1445,21 +1446,21 @@ static void load_full_const(int r, int32_t imm, struct Sym *sym) {
           ot_check(th_sub_imm(r, r, 8, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
                               ENFORCE_ENCODING_NONE));
         } else {
-          int size = 0;
-          thumb_opcode o = th_add_reg(r, r, R_PC, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                              THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE);
-          ot_check(o);
-          size += o.size;
-          o = th_ldr_imm(r, r, 4, 6, ENFORCE_ENCODING_NONE);
-          ot_check(o);
-          size += o.size;
-
-          o = th_add_imm(r, r, imm, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                              ENFORCE_ENCODING_NONE);
-          if (o.size != 0) {
-            ot_check(o);
+          thumb_opcode ot;
+          ot_check(th_add_reg(r, r, R_PC, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                              THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+          ot_check(th_ldr_imm(r, r, 4, 6, ENFORCE_ENCODING_NONE));
+          ot = th_add_imm(r, r, imm, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                          ENFORCE_ENCODING_NONE);
+          if (ot.size != 0) {
+            ot_check(ot);
           } else {
-            ot_check(th_ldr_imm(R_LR, R_PC, size + 8, 4, ENFORCE_ENCODING_NONE));
+            ot_check(th_b_t4(4));
+            th_sym_d();
+            o(imm & 0xffff);
+            o(imm >> 16);
+            th_sym_t();
+            ot_check(th_ldr_imm(R_LR, R_PC, 8, 4, ENFORCE_ENCODING_NONE));
             ot_check(th_add_reg(r, r, R_LR, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
                                 THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
           }
