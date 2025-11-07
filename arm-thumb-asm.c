@@ -1641,6 +1641,7 @@ static void thumb_block_memory_transfer_opcode(TCCState *s1, int token) {
 
 static thumb_opcode thumb_pushpop_opcode(TCCState *s1, int token) {
   Operand op = {};
+  parse_operand(s1, &op);
 
   switch (THUMB_INSTRUCTION_GROUP(token)) {
   case TOK_ASM_popeq:
