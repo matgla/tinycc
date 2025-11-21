@@ -75,9 +75,11 @@ p3:
 	.global	alloca
 	.type	alloca, %function
 alloca:
-	rsb	sp, r0, sp
-	bic	sp, sp, #7
-	mov	r0, sp
+    mov r1, sp
+	rsb r0, r0, r1
+    bic r1, r1, #7
+    mov sp, r1
+    movs r0, r1
 	mov	pc, lr
 	.size	alloca, .-alloca
 

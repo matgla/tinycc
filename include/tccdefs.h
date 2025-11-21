@@ -115,6 +115,10 @@
     #define __GNUC__ 4
     #define _ANSI_LIBRARY 1
 
+#elif defined __YasOS__
+    #define __GNUC__ 4
+    #define __linux__ 1
+
 #elif defined __APPLE__
     /* emulate APPLE-GCC to make libc's headerfiles compile: */
     #define __GNUC__ 4   /* darwin emits warning on GCC<4 */

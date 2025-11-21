@@ -782,7 +782,7 @@ again:
       case VFP_CLASS:
         gv(regmask(TREG_F0 + (pplan->start >> 1)));
         if (pplan->start & 1) { /* Must be in upper part of double register */
-          ot_check(th_vmov_register(pplan->start, pplan->start - 1));
+          ot_check(th_vmov_register(pplan->start, pplan->start - 1, 0));
           vtop->r =
               VT_CONST; /* avoid being saved on stack by gv for next float */
         }
@@ -1667,7 +1667,13 @@ void load(int r, SValue *sv) {
     return load_vt_jmp_jmpi(r, sv);
   else if (v < VT_CONST) {
     if (is_float(ft))
-      tcc_error("compiler_error: unknown load mode\n");
+    {
+      if ((ft & VT_BTYPE) == VT_FLOAT)
+        ot_check(th_vmov_register(vfpr(r), vfpr(v), 0));
+      else
+        ot_check(th_vmov_register(vfpr(r), vfpr(v), 1));
+      return;
+    }
     else {
       TRACE("mov r %i v %i", r, v);
       ot_check(th_mov_reg(r, v, FLAGS_BEHAVIOUR_NOT_IMPORTANT,

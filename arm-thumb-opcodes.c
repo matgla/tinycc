@@ -1701,7 +1701,7 @@ thumb_opcode th_vpop(uint32_t regs) {
   };
 }
 
-thumb_opcode th_vmov_register(uint16_t vd, uint16_t vm) {
+thumb_opcode th_vmov_register(uint16_t vd, uint16_t vm, uint32_t sz) {
   if (vd <= 0x1f && vm <= 0x1f) {
     const uint16_t d = vd & 1;
     const uint16_t m = vm & 1;
@@ -1709,7 +1709,7 @@ thumb_opcode th_vmov_register(uint16_t vd, uint16_t vm) {
     vm >>= 1;
     return (thumb_opcode){
         .size = 4,
-        .opcode = 0xeeb00a40 | (d << 22) | (vd << 12) | (m << 5) | vm,
+        .opcode = 0xeeb00a40 | (d << 22) | (vd << 12) | (m << 5) | vm | (sz << 8),
     };
   }
   return (thumb_opcode){
