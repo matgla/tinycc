@@ -16,6 +16,8 @@
       check tccdefs_.h.
 */
 
+#pragma once
+
 #if __SIZEOF_POINTER__ == 4
     /* 32bit systems. */
 #if defined  __OpenBSD__
