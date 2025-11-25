@@ -57,6 +57,8 @@ enum {
 #define OP_IM8 (1 << OPT_IM8)
 #define OP_IM8N (1 << OPT_IM8N)
 #define OP_REGSET32 (1 << OPT_REGSET32)
+#define OP_VREGSETS32 (OP_VREG32 | OP_REGSET32)
+#define OP_VREGSETD32 (OP_VREG64 | OP_REGSET32)
 
 static bool thumb_operand_is_immediate(int type) {
   if (type != OP_IM32 && type != OP_IM8 && type != OP_IM8N) {
@@ -83,7 +85,7 @@ typedef struct Operand {
   uint32_t type;
   union {
     uint8_t reg;
-    uint16_t regset;
+    uint32_t regset;
     ExprValue e;
   };
 } Operand;
@@ -618,16 +620,20 @@ ST_FUNC int asm_parse_regvar(int t) {
     default:
       return t - TOK_ASM_r0;
     }
-  } else
-    return -1;
+  } else if (t >= TOK_ASM_s0 && t <= TOK_ASM_s31) {
+    return t - TOK_ASM_s0;
+  } else if (t >= TOK_ASM_d0 && t <= TOK_ASM_d15) {
+    return t - TOK_ASM_d0;
+  }
+  return -1;
 }
 
 /* Parse a text containing operand and store the result in OP */
 static bool parse_operand(TCCState *s1, Operand *op) {
   ExprValue e;
-  int8_t reg;
-  uint16_t regset = 0;
-  int8_t reg_start = -1;
+  int reg;
+  uint64_t regset = 0;
+  int reg_start = -1;
 
   op->type = 0;
 
@@ -637,13 +643,30 @@ static bool parse_operand(TCCState *s1, Operand *op) {
   }
 
   if (tok == '{') { // regset literal
+    int regset_type = 0;
     next();         // skip '{'
     while (tok != '}' && tok != TOK_EOF) {
+      int new_regset = 0;
+
+      if (tok >= TOK_ASM_s0 && tok <= TOK_ASM_s31) {
+        new_regset = OP_VREGSETS32;
+      } else if (tok >= TOK_ASM_d0 && tok <= TOK_ASM_d15) {
+        new_regset = OP_VREGSETD32;
+      } else {
+        new_regset = OP_REGSET32;
+      }
+
       reg = asm_parse_regvar(tok);
       if (reg == -1) {
         expect("register");
       } else
         next(); // skip register name
+
+      if (regset_type == 0) {
+        regset_type = new_regset;
+      } else if (regset_type != new_regset) {
+        tcc_error("mixed register types in register set");
+      }
 
       if ((1 << reg) < regset)
         tcc_warning("registers will be processed in ascending order by "
@@ -671,7 +694,7 @@ static bool parse_operand(TCCState *s1, Operand *op) {
       // ARM instructions don't support empty regset.
       tcc_error("empty register list is not supported");
     } else {
-      op->type = OP_REGSET32;
+      op->type = regset_type;
       op->regset = regset;
     }
     return true;
@@ -1652,6 +1675,21 @@ static thumb_opcode thumb_pushpop_opcode(TCCState *s1, int token) {
   return (thumb_opcode){0, 0};
 }
 
+static thumb_opcode thumb_vpushvpop_opcode(TCCState *s1, int token) {
+  int is_doubleword = 0;
+  Operand op = {};
+  parse_operand(s1, &op);
+  is_doubleword = op.type == OP_VREGSETD32;
+
+  switch (THUMB_INSTRUCTION_GROUP(token)) {
+  case TOK_ASM_vpopeq:
+    return th_vpop(op.regset, is_doubleword);
+  case TOK_ASM_vpusheq:
+    return th_vpush(op.regset, is_doubleword);
+  }
+  return (thumb_opcode){0, 0};
+}
+
 static thumb_opcode thumb_ssat_opcode(TCCState *s1, int token) {
   Operand ops[3];
   thumb_shift shift = {0, 0};
@@ -2372,6 +2410,9 @@ ST_FUNC void asm_opcode(TCCState *s1, int token) {
   case TOK_ASM_ttaeq:
   case TOK_ASM_ttateq:
     return thumb_emit_opcode(thumb_tt(s1, token));
+  case TOK_ASM_vpusheq:
+  case TOK_ASM_vpopeq:
+    return thumb_emit_opcode(thumb_vpushvpop_opcode(s1, token));
   default:
     printf("asm_opcode: unknown token %s\n", get_tok_str(token, NULL));
     expect("known instruction");

@@ -1685,19 +1685,73 @@ thumb_opcode th_cmp_imm(uint16_t rn, uint32_t imm, enforce_encoding encoding) {
 
 // VFP instructions
 
-thumb_opcode th_vpush(uint32_t regs) {
-  // single precision floating point registers for now
-  // TODO: add support for hardfloat config
+thumb_opcode th_vpush(uint32_t regs, uint32_t is_doubleword) {
+  int first_register = 0;
+  int register_count = 0;
+  uint32_t D = 0;
+  uint32_t Vd = 0;
+  for (int i = 0; i < 32; i++) {
+    if (regs & (1 << i)) {
+      first_register = i;
+      break;
+    }
+  }
+
+  register_count = 0;
+  for (int i = 0; i < 32; i++) {
+    if (regs & (1 << i)) {
+      register_count++;
+    }
+  }
+
+  if (is_doubleword) {
+    D = first_register >> 4;
+    Vd = first_register & 0xf;
+    register_count <<= 1;
+  } else {
+    D = first_register & 1;
+    Vd = first_register >> 1;
+  }
+
   return (thumb_opcode){
       .size = 4,
-      .opcode = 0xed2d0a00 | regs,
+      .opcode = 0xed2d0a00 | D << 22 | (Vd << 12) | (register_count & 0xff) | (is_doubleword << 8),
   };
 }
 
-thumb_opcode th_vpop(uint32_t regs) {
+thumb_opcode th_vpop(uint32_t regs, uint32_t is_doubleword) {
+  int first_register = 0;
+  int register_count = 0;
+  uint32_t D = 0;
+  uint32_t Vd = 0;
+  for (int i = 0; i < 32; i++) {
+    if (regs & (1 << i)) {
+      first_register = i;
+      break;
+    }
+  }
+
+  register_count = 0;
+  for (int i = 0; i < 32; i++) {
+    if (regs & (1 << i)) {
+      register_count++;
+    }
+  }
+
+  if (is_doubleword) {
+    D = first_register >> 4;
+    Vd = first_register & 0xf;
+    register_count <<= 1;
+  } else {
+    D = first_register & 1;
+    Vd = first_register >> 1;
+  }
+
+
+
   return (thumb_opcode){
       .size = 4,
-      .opcode = 0xecbd0a00 | regs,
+      .opcode = 0xecbd0a00 | D << 22 | (Vd << 12) | (register_count & 0xff) | (is_doubleword << 8),
   };
 }
 

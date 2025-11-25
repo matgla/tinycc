@@ -16,7 +16,7 @@ def prepare_expect(filepath):
             os.makedirs(output_dir)
         assert compiler is not None, "TEST_COMPARE_CC environment variable must be set to the ARM compiler path."
         _ = subprocess.run(
-            [compiler, filepath, "-march=armv8-m.main+dsp", "-nostdlib", "-Wl,-Ttext=0x0", "-o", output_file_gcc],
+            [compiler, filepath, "-march=armv8-m.main+dsp", "-mfpu=fpv5-sp-d16", "-mfloat-abi=hard", "-nostdlib", "-Wl,-Ttext=0x0", "-o", output_file_gcc],
             check=True,
             capture_output=True,
             text=True

@@ -301,8 +301,8 @@ thumb_opcode th_ror_imm(uint16_t rd, uint16_t rm, uint32_t imm,
 
 thumb_opcode th_cmp_imm(uint16_t rm, uint32_t imm, enforce_encoding encoding);
 
-thumb_opcode th_vpush(uint32_t regs);
-thumb_opcode th_vpop(uint32_t regs);
+thumb_opcode th_vpush(uint32_t regs, uint32_t is_doubleword);
+thumb_opcode th_vpop(uint32_t regs, uint32_t is_doubleword);
 thumb_opcode th_vmov_register(uint16_t vd, uint16_t vm, uint32_t sz);
 thumb_opcode th_vldr(uint32_t rn, uint32_t vd, uint32_t add,
                      uint32_t is_doubleword, uint32_t imm);

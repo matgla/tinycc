@@ -95,7 +95,7 @@ static void parse_operand(TCCState *s1, Operand *op) {
 
       if ((1 << reg) < regset)
         tcc_warning("registers will be processed in ascending order by "
-                    "hardware--but are not specified in ascending order here");
+                    "hardware--but are not specified in ascending order here: %x, regset: %x", (1 << reg), regset);
       regset |= 1 << reg;
       if (tok != ',')
         break;

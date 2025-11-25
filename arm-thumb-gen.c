@@ -716,10 +716,10 @@ again:
           vset(&vtop->type, r | VT_LVAL, 0);
           vswap();
           /* XXX: optimize. Save all register because memcpy can use them */
-          ot_check(th_vpush((0 & 1) << 22 | (0 >> 1) << 12 | 16));
+          ot_check(th_vpush(0xffffffff, false));
           // wait haven't we just stored? in 746
           vstore(); /* memcpy to current sp + potential padding */
-          ot_check(th_vpop((0 & 1) << 22 | (0 >> 1) << 12 | 16));
+          ot_check(th_vpop(0xffffffff, false));
 
           /* Homogeneous float aggregate are loaded to VFP registers
              immediately since there is no way of loading data in multiple
@@ -728,21 +728,24 @@ again:
           if (i == VFP_STRUCT_CLASS) {
             int first = pplan->start, nb = pplan->end - first + 1;
             /* vpop.32 {pplan->start, ..., pplan->end} */
-            ot_check(th_vpop((first & 1) << 22 | (first >> 1) << 12 | nb));
+            int regs = 0;
+            for (int j = 0; j < nb; j++)
+              regs |= 1 << (first + j);
+            ot_check(th_vpop(regs, false));
             /* No need to write the register used to a SValue since VFP regs
                cannot be used for gcall_or_jmp */
           }
         } else {
           if (is_float(pplan->sval->type.t)) {
 #ifdef TCC_ARM_VFP
-            r = vfpr(gv(RC_FLOAT)) << 12;
+            r = vfpr(gv(RC_FLOAT));
+            int is_doubleword = 0;
             if ((pplan->sval->type.t & VT_BTYPE) == VT_FLOAT)
-              size = 4;
+              is_doubleword = 0;
             else {
-              size = 8;
-              r |= 0x101; /* vpush.32 -> vpush.64 */
+              is_doubleword = 1;
             }
-            ot_check(th_vpush(r + 1));
+            ot_check(th_vpush(r, is_doubleword));
 #else
             r = fpr(gv(RC_FLOAT)) << 12;
             if ((pplan->sval->type.t & VT_BTYPE) == VT_FLOAT)
@@ -903,11 +906,14 @@ void gfunc_prolog(Sym *func_sym) {
     func_nregs = 0;
 
   if (nf) {
+    int regs = 0;
     if (nf > 16)
       nf = 16;
     nf = (nf + 1) & -2; /* nf => HARDFLOAT => EABI */
+    for (int i = 0; i < nf; i++)
+      regs |= 1 << i;
     TRACE("  save s0-s15 on stack if needed");
-    ot_check(th_vpush(nf));
+    ot_check(th_vpush(regs, false));
     func_nregs += nf;
   }
 
