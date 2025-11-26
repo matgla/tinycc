@@ -738,8 +738,8 @@ again:
         } else {
           if (is_float(pplan->sval->type.t)) {
 #ifdef TCC_ARM_VFP
-            r = vfpr(gv(RC_FLOAT));
             int is_doubleword = 0;
+            r = vfpr(gv(RC_FLOAT));
             if ((pplan->sval->type.t & VT_BTYPE) == VT_FLOAT)
               is_doubleword = 0;
             else {
