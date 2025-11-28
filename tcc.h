@@ -673,7 +673,7 @@ typedef struct TokenString {
   struct TokenString *prev;
   const int *prev_ptr;
   char alloc;
-} TokenString;
+} __attribute__((packed)) TokenString;
 
 /* GNUC attribute definition */
 typedef struct AttributeDef {
@@ -721,11 +721,11 @@ typedef struct ASMOperand {
   int input_index;  /* if >= 0, gives reference to an input constraint */
   int priority;     /* priority, used to assign registers */
   int reg;          /* if >= 0, register number used for this operand */
-  int is_llong;     /* true if double register value */
-  int is_memory;    /* true if memory operand */
-  int is_rw;        /* for '+' modifier */
-  int is_label;     /* for asm goto */
-} ASMOperand;
+  int is_llong : 1;     /* true if double register value */
+  int is_memory : 1;    /* true if memory operand */
+  int is_rw : 1;        /* for '+' modifier */
+  int is_label : 1;     /* for asm goto */
+} __attribute__((packed)) ASMOperand;
 #endif
 
 /* extra symbol attributes (not in symbol table) */

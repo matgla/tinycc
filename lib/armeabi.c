@@ -462,6 +462,7 @@ void __aeabi_lasr(unsigned_int_struct val, int shift) {
   aeabi_lsr(val, shift, val.high >> 31, unsigned_int);
 }
 
+
 /* Integer division functions */
 
 AEABI_UXDIVMOD(uidivmod, unsigned, uidiv_t, UINT)

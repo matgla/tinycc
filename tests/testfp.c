@@ -500,11 +500,6 @@ void tests(void)
 
 int main()
 {
-#ifdef __aarch64__
     tests();
-#else
-    printf("This test program is intended for a little-endian architecture\n"
-           "with an IEEE-standard 128-bit long double.\n");
-#endif
     return 0;
 }

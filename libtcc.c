@@ -256,6 +256,10 @@ PUB_FUNC void *tcc_realloc(void *ptr, unsigned long size) {
 PUB_FUNC void *tcc_mallocz(unsigned long size) {
   void *ptr;
   ptr = tcc_malloc(size);
+  if (ptr == NULL) {
+    fprintf(stderr, "Out of memory\n");
+    exit(-1);
+  }
   if (size)
     memset(ptr, 0, size);
   return ptr;
@@ -264,6 +268,10 @@ PUB_FUNC void *tcc_mallocz(unsigned long size) {
 PUB_FUNC char *tcc_strdup(const char *str) {
   char *ptr;
   ptr = tcc_malloc(strlen(str) + 1);
+  if (ptr == NULL) {
+    fprintf(stderr, "Out of memory\n");
+    exit(-1);
+  }
   strcpy(ptr, str);
   return ptr;
 }

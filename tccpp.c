@@ -1051,8 +1051,9 @@ static void tok_str_add2(TokenString *s, int t, CValue *cv) {
   str = s->str;
 
   /* allocate space for worst case */
-  if (len + TOK_MAX_SIZE >= s->allocated_len)
+  if (len + TOK_MAX_SIZE >= s->allocated_len) {
     str = tok_str_realloc(s, len + TOK_MAX_SIZE + 1);
+  }
   str[len++] = t;
   switch (t) {
   case TOK_CINT:
