@@ -16,6 +16,8 @@
       check tccdefs_.h.
 */
 
+#pragma once
+
 #if __SIZEOF_POINTER__ == 4
     /* 32bit systems. */
 #if defined  __OpenBSD__
@@ -114,6 +116,10 @@
 #elif defined __OpenBSD__
     #define __GNUC__ 4
     #define _ANSI_LIBRARY 1
+
+#elif defined __YasOS__
+    #define __GNUC__ 4
+    #define __linux__ 1
 
 #elif defined __APPLE__
     /* emulate APPLE-GCC to make libc's headerfiles compile: */
