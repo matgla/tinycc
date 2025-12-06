@@ -282,15 +282,6 @@ static int RC_RET(int t) {
 static int RC_TYPE(int t) {
   if (!is_float(t))
     return RC_INT;
-#ifdef TCC_TARGET_X86_64
-  if ((t & VT_BTYPE) == VT_LDOUBLE)
-    return RC_ST0;
-  if ((t & VT_BTYPE) == VT_QFLOAT)
-    return RC_FRET;
-#elif defined TCC_TARGET_RISCV64
-  if ((t & VT_BTYPE) == VT_LDOUBLE)
-    return RC_INT;
-#endif
   return RC_FLOAT;
 }
 

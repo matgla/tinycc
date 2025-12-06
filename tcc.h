@@ -77,9 +77,9 @@ extern long double strtold(const char *__nptr, char **__endptr);
                                 // loss of data
 #pragma warning(disable : 4267) // conversion from 'size_t' to 'int', possible
                                 // loss of data
-#pragma warning(                                                               \
-    disable : 4996) // The POSIX name for this item is deprecated. Instead, use
-                    // the ISO C and C++ conformant name
+#pragma warning(disable                                                        \
+                : 4996) // The POSIX name for this item is deprecated. Instead,
+                        // use the ISO C and C++ conformant name
 #pragma warning(disable : 4018) // signed/unsigned mismatch
 #pragma warning(disable : 4146) // unary minus operator applied to unsigned
                                 // type, result still unsigned
@@ -130,6 +130,8 @@ extern long double strtold(const char *__nptr, char **__endptr);
 #define PATHCMP strcmp
 #define PATHSEP ":"
 #endif
+
+#define LDOUBLE_SIZE 8
 
 /* -------------------------------------------- */
 
@@ -379,36 +381,9 @@ extern long double strtold(const char *__nptr, char **__endptr);
 /* include the target specific definitions */
 
 #define TARGET_DEFS_ONLY
-#ifdef TCC_TARGET_I386
-#include "i386-gen.c"
-#include "i386-link.c"
-#elif defined TCC_TARGET_X86_64
-#include "x86_64-gen.c"
-#include "x86_64-link.c"
-#elif defined TCC_TARGET_ARM_THUMB
 #include "arm-link.c"
 #include "arm-thumb-asm.c"
 #include "arm-thumb-gen.c"
-#elif defined TCC_TARGET_ARM
-#include "arm-asm.c"
-#include "arm-gen.c"
-#include "arm-link.c"
-#elif defined TCC_TARGET_ARM64
-#include "arm-asm.c"
-#include "arm64-gen.c"
-#include "arm64-link.c"
-#elif defined TCC_TARGET_C67
-#define TCC_TARGET_COFF
-#include "c67-gen.c"
-#include "c67-link.c"
-#include "coff.h"
-#elif defined(TCC_TARGET_RISCV64)
-#include "riscv64-asm.c"
-#include "riscv64-gen.c"
-#include "riscv64-link.c"
-#else
-#error unknown target
-#endif
 #undef TARGET_DEFS_ONLY
 
 /* -------------------------------------------- */
