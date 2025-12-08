@@ -57,6 +57,16 @@ typedef struct SValue SValue;
 
 typedef struct TACQuadruple TACQuadruple;
 
+typedef struct IRLiveInterval {
+  uint8_t r;                 // first register
+  uint8_t r2;                // second register (for pairs)
+  uint16_t virtual_register; // virtual register number
+  uint32_t stack_location;   // stack location if spilled
+  uint32_t start;            // start instruction index
+  uint32_t end;              // end instruction index
+  struct IRLiveInterval *next;
+} IRLiveInterval;
+
 typedef struct TCCIRState {
   // number of function parameters
   int8_t parameters_count;
@@ -65,6 +75,9 @@ typedef struct TCCIRState {
   int32_t loc;
 
   TACQuadruple *instructions;
+  IRLiveInterval *live_intervals;
+  int next_live_interval_index;
+  IRLiveInterval **active_set;
   int instructions_size;
   int next_instruction_index;
   uint16_t next_temp_vr;

@@ -29,6 +29,8 @@
 
 #define QUADRUPLE_INIT_SIZE 128
 
+#define IR_LIVE_INTERVAL_INIT_SIZE 64
+
 typedef struct IRRegistersConfig {
   uint8_t has_dest : 1;
   uint8_t has_src1 : 1;
@@ -84,6 +86,9 @@ TCCIRState *tcc_ir_allocate_block() {
   block->instructions_size = QUADRUPLE_INIT_SIZE;
   block->instructions =
       (TACQuadruple *)tcc_mallocz(sizeof(TACQuadruple) * QUADRUPLE_INIT_SIZE);
+
+  block->active_set = (IRLiveInterval **)tcc_mallocz(
+      sizeof(IRLiveInterval *) * tcc_gen_machine_number_of_registers());
   block->next_instruction_index = 0;
   block->next_temp_vr = IR_MAX_VARS;
   if (!block->instructions) {
@@ -91,6 +96,12 @@ TCCIRState *tcc_ir_allocate_block() {
     exit(1);
   }
   return block;
+}
+
+static void tcc_ir_clear_live_intervals(TCCIRState *ir) {
+  ir->live_intervals = (IRLiveInterval *)tcc_mallocz(
+      sizeof(IRLiveInterval) * IR_LIVE_INTERVAL_INIT_SIZE);
+  ir->next_live_interval_index = 0;
 }
 
 void tcc_ir_release_block(TCCIRState *ir) {
@@ -371,7 +382,9 @@ uint16_t tcc_ir_get_vreg_temp(TCCIRState *ir) {
   return next_temp_vr;
 }
 
-void tcc_ir_liveness_analysis(TCCIRState *ir) {}
+void tcc_ir_liveness_analysis(TCCIRState *ir) {
+  tcc_ir_clear_live_intervals(ir);
+}
 void tcc_ir_register_allocation(TCCIRState *ir) {}
 void tcc_ir_register_allocation_params(TCCIRState *ir) {}
 

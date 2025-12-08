@@ -1825,6 +1825,7 @@ typedef struct TACQuadruple {
 } TACQuadruple;
 
 ST_FUNC void tcc_gen_machine_data_processing_op(TACQuadruple *q);
+ST_FUNC int tcc_gen_machine_number_of_registers(void);
 
 #define stab_section s1->stab_section
 #define stabstr_section stab_section->link

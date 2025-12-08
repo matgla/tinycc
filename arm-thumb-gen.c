@@ -2251,4 +2251,19 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op) {
   }
 }
 
+// r0 - function
+// r1 - function
+// r2 - function
+// r3 - function
+
+// r4 - lrsa
+// r5 - lrsa
+// r6 - lrsa
+// r7 - lrsa
+// r8 - lrsa
+// r9 - PIC
+// r10 - lrsa
+
+ST_FUNC int tcc_gen_machine_number_of_registers(void) { return 11; }
+
 #endif // TARGET_DEFS_ONLY
