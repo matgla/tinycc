@@ -1,0 +1,1 @@
+int simple(int x) { return 42 + x * x; }

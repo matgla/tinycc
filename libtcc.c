@@ -27,9 +27,11 @@
 #include "tccdbg.c"
 #include "tccelf.c"
 #include "tccgen.c"
+#include "tccir.c"
 #include "tccpp.c"
 #include "tccyaff.c"
 #if defined(TCC_TARGET_ARM_THUMB)
+#include "arch/armv8m.c"
 #include "arm-link.c"
 #include "arm-thumb-asm.c"
 #include "arm-thumb-gen.c"
@@ -50,7 +52,6 @@ TCC_SEM(static tcc_compile_sem);
 /* an array of pointers to memory to be free'd after errors */
 ST_DATA void **stk_data;
 ST_DATA int nb_stk_data;
-
 
 /********************************************************/
 
@@ -1372,8 +1373,7 @@ static const FlagDef options_f[] = {
     {0, 0, NULL}};
 
 static const FlagDef options_m[] = {
-    {offsetof(TCCState, ms_bitfields), 0, "ms-bitfields"},
-    {0, 0, NULL}};
+    {offsetof(TCCState, ms_bitfields), 0, "ms-bitfields"}, {0, 0, NULL}};
 
 static int set_flag(TCCState *s, const FlagDef *flags, const char *name) {
   int value, mask, ret;

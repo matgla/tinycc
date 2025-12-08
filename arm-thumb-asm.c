@@ -644,7 +644,7 @@ static bool parse_operand(TCCState *s1, Operand *op) {
 
   if (tok == '{') { // regset literal
     int regset_type = 0;
-    next();         // skip '{'
+    next(); // skip '{'
     while (tok != '}' && tok != TOK_EOF) {
       int new_regset = 0;
 

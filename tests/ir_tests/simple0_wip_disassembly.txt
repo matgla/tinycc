@@ -1,0 +1,9 @@
+
+simple0_wip.o:     file format elf32-littlearm
+
+
+Disassembly of section .text:
+
+00000000 <simple>:
+   0:	fb0f ff0f 	mul.w	pc, pc, pc
+   4:	44ff      	add	pc, pc

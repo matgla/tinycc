@@ -50,51 +50,7 @@ extern float strtof(const char *__nptr, char **__endptr);
 extern long double strtold(const char *__nptr, char **__endptr);
 #endif
 
-#ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN 1
-#include <direct.h> /* getcwd */
-#include <io.h>     /* open, close etc. */
-#include <malloc.h> /* alloca */
-#include <windows.h>
-#ifdef __GNUC__
-#include <stdint.h>
-#endif
-#define inline __inline
-#define snprintf _snprintf
-#define vsnprintf _vsnprintf
-#ifndef __GNUC__
-#define strtold (long double)strtod
-#define strtof (float)strtod
-#define strtoll _strtoi64
-#define strtoull _strtoui64
-#endif
-#ifdef LIBTCC_AS_DLL
-#define LIBTCCAPI __declspec(dllexport)
-#define PUB_FUNC LIBTCCAPI
-#endif
-#ifdef _MSC_VER
-#pragma warning(disable : 4244) // conversion from 'uint64_t' to 'int', possible
-                                // loss of data
-#pragma warning(disable : 4267) // conversion from 'size_t' to 'int', possible
-                                // loss of data
-#pragma warning(disable                                                        \
-                : 4996) // The POSIX name for this item is deprecated. Instead,
-                        // use the ISO C and C++ conformant name
-#pragma warning(disable : 4018) // signed/unsigned mismatch
-#pragma warning(disable : 4146) // unary minus operator applied to unsigned
-                                // type, result still unsigned
-#define ssize_t intptr_t
-#ifdef _X86_
-#define __i386__ 1
-#endif
-#ifdef _AMD64_
-#define __x86_64__ 1
-#endif
-#endif
-#ifndef va_copy
-#define va_copy(a, b) a = b
-#endif
-#endif
+#include "tccir.h"
 
 #ifndef O_BINARY
 #define O_BINARY 0
@@ -475,6 +431,9 @@ typedef struct SValue {
   unsigned short r;  /* register + flags */
   unsigned short r2; /* second register, used for 'long long'
                         type. If not used, set to VT_CONST */
+  uint16_t vr;       /* virtual register for IR */
+  uint16_t vr2;      /* second virtual register for IR */
+
   union {
     struct {
       int jtrue, jfalse;
@@ -927,33 +886,6 @@ struct TCCState {
   ElfW_Rel *qrel;
 #define qrel s1->qrel
 
-#ifdef TCC_TARGET_RISCV64
-  struct pcrel_hi {
-    addr_t addr, val;
-  } last_hi;
-#define last_hi s1->last_hi
-#endif
-
-#ifdef TCC_TARGET_PE
-  /* PE info */
-  int pe_subsystem;
-  unsigned pe_characteristics;
-  unsigned pe_file_align;
-  unsigned pe_stack_size;
-  addr_t pe_imagebase;
-#ifdef TCC_TARGET_X86_64
-  Section *uw_pdata;
-  int uw_sym;
-  unsigned uw_offs;
-#endif
-#endif
-
-#if defined TCC_TARGET_MACHO
-  char *install_name;
-  uint32_t compatibility_version;
-  uint32_t current_version;
-#endif
-
 #ifndef ELF_OBJ_ONLY
   int nb_sym_versions;
   struct sym_version *sym_versions;
@@ -962,24 +894,6 @@ struct TCCState {
   int dt_verneednum;
   Section *versym_section;
   Section *verneed_section;
-#endif
-
-#ifdef TCC_IS_NATIVE
-  const char *run_main; /* entry for tcc_run() */
-  void *run_ptr;        /* runtime_memory */
-  unsigned run_size;    /* size of runtime_memory  */
-#ifdef _WIN64
-  void *run_function_table; /* unwind data */
-#endif
-  struct TCCState *next;
-  struct rt_context *rc; /* pointer to backtrace info block */
-  void *run_lj, *run_jb; /* sj/lj for tcc_setjmp()/tcc_run() */
-  TCCBtFunc *bt_func;
-  void *bt_data;
-#endif
-
-#ifdef CONFIG_TCC_BACKTRACE
-  int rt_num_callers;
 #endif
 
   /* benchmark info */
@@ -1007,6 +921,8 @@ struct TCCState {
   char **argv;
   CString linker_arg; /* collect -Wl options */
   int thumb_func;
+  TCCIRState *ir_func_block;
+  int rt_num_callers;
 };
 
 struct filespec {
@@ -1759,6 +1675,16 @@ ST_FUNC void gen_cvt_sxtw(void);
 ST_FUNC void gen_cvt_csti(int t);
 #endif
 
+typedef struct ArchitectureConfig {
+  int8_t pointer_size;
+  int8_t stack_align;
+  int8_t reg_size;
+  int8_t parameter_registers;
+  int8_t has_fpu : 1;
+} ArchitectureConfig;
+
+extern const ArchitectureConfig architecture_config;
+
 /* ------------ arm-gen.c ------------ */
 #if defined(TCC_TARGET_ARM) || defined(TCC_TARGET_ARM_THUMB)
 #if defined(TCC_ARM_EABI) && !defined(CONFIG_TCC_ELFINTERP)
@@ -1766,38 +1692,6 @@ PUB_FUNC const char *default_elfinterp(struct TCCState *s);
 #endif
 ST_FUNC void arm_init(struct TCCState *s);
 ST_FUNC void gen_increment_tcov(SValue *sv);
-#endif
-
-/* ------------ arm64-gen.c ------------ */
-#ifdef TCC_TARGET_ARM64
-ST_FUNC void gen_opl(int op);
-ST_FUNC void gfunc_return(CType *func_type);
-ST_FUNC void gen_va_start(void);
-ST_FUNC void gen_va_arg(CType *t);
-ST_FUNC void gen_clear_cache(void);
-ST_FUNC void gen_cvt_sxtw(void);
-ST_FUNC void gen_cvt_csti(int t);
-ST_FUNC void gen_increment_tcov(SValue *sv);
-#endif
-
-/* ------------ riscv64-gen.c ------------ */
-#ifdef TCC_TARGET_RISCV64
-ST_FUNC void gen_opl(int op);
-// ST_FUNC void gfunc_return(CType *func_type);
-ST_FUNC void gen_va_start(void);
-ST_FUNC void arch_transfer_ret_regs(int);
-ST_FUNC void gen_cvt_sxtw(void);
-ST_FUNC void gen_increment_tcov(SValue *sv);
-#endif
-
-/* ------------ c67-gen.c ------------ */
-#ifdef TCC_TARGET_C67
-#endif
-
-/* ------------ tcccoff.c ------------ */
-#ifdef TCC_TARGET_COFF
-ST_FUNC int tcc_output_coff(TCCState *s1, FILE *f);
-ST_FUNC int tcc_load_coff(TCCState *s1, int fd);
 #endif
 
 /* ------------ tccasm.c ------------ */
@@ -1922,6 +1816,15 @@ ST_FUNC void tcc_tcov_check_line(TCCState *s1, int start);
 ST_FUNC void tcc_tcov_block_end(TCCState *s1, int line);
 ST_FUNC void tcc_tcov_block_begin(TCCState *s1);
 ST_FUNC void tcc_tcov_reset_ind(TCCState *s1);
+
+typedef struct TACQuadruple {
+  TccIrOp op;
+  SValue src1;
+  SValue src2;
+  SValue dest;
+} TACQuadruple;
+
+ST_FUNC void tcc_gen_machine_data_processing_op(TACQuadruple *q);
 
 #define stab_section s1->stab_section
 #define stabstr_section stab_section->link
@@ -2057,6 +1960,9 @@ PUB_FUNC void tcc_exit_state(TCCState *s1);
 #endif
 
 void dbg_print_vstack(const char *msg, const char *file, int line);
+
+#define CEIL_DIV(x, y) (((x) + (y) - 1) / (y))
+#define ALIGN(x, alignment) (((x) + (alignment) - 1) & ~((alignment) - 1))
 
 // debug helper
 #if 0

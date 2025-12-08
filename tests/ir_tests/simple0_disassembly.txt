@@ -1,0 +1,18 @@
+
+simple0.o:     file format elf32-littlearm
+
+
+Disassembly of section .text:
+
+00000000 <simple>:
+   0:	e92d 5800 	stmdb	sp!, {fp, ip, lr}
+   4:	46eb      	mov	fp, sp
+   6:	bf00      	nop
+   8:	f8df e004 	ldr.w	lr, [pc, #4]	@ 10 <simple+0x10>
+   c:	44f5      	add	sp, lr
+   e:	e001      	b.n	14 <simple+0x14>
+  10:	0000      	movs	r0, r0
+  12:	0000      	movs	r0, r0
+  14:	202a      	movs	r0, #42	@ 0x2a
+  16:	e8bd 5800 	ldmia.w	sp!, {fp, ip, lr}
+  1a:	4770      	bx	lr

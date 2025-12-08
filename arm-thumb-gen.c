@@ -1183,7 +1183,8 @@ ST_FUNC void gen_vla_alloc(CType *type, int align) {
   //   tcc_error("alignment is not a power of 2: %i", align);
   // /* bic sp, r, #align-1 */
   // ot_check(th_bic_imm(r, r, align - 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT));
-  // ot_check(th_mov_reg(13, r, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+  // ot_check(th_mov_reg(13, r, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+  // THUMB_SHIFT_DEFAULT,
   //                     ENFORCE_ENCODING_NONE, false));
   // vpop();
   tcc_error("gen_vla_alloc not implemented yet");
@@ -1675,15 +1676,13 @@ void load(int r, SValue *sv) {
   else if (v == VT_JMP || v == VT_JMPI)
     return load_vt_jmp_jmpi(r, sv);
   else if (v < VT_CONST) {
-    if (is_float(ft))
-    {
+    if (is_float(ft)) {
       if ((ft & VT_BTYPE) == VT_FLOAT)
         ot_check(th_vmov_register(vfpr(r), vfpr(v), 0));
       else
         ot_check(th_vmov_register(vfpr(r), vfpr(v), 1));
       return;
-    }
-    else {
+    } else {
       TRACE("mov r %i v %i", r, v);
       ot_check(th_mov_reg(r, v, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
                           THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
@@ -1909,320 +1908,347 @@ void gen_opf(int op) {
   }
 }
 
-// operation on two registers
-void gen_opi_regs(int opc, int c) {
-  int fr = 0;
-  int r = 0;
+// // operation on two registers
+// void gen_opi_regs(int opc, int c) {
+//   int fr = 0;
+//   int r = 0;
 
-  fr = intr(gv(RC_INT));
-  r = intr(vtop[-1].r = get_reg_ex(RC_INT, two2mask(vtop->r, vtop[-1].r)));
+//   fr = intr(gv(RC_INT));
+//   r = intr(vtop[-1].r = get_reg_ex(RC_INT, two2mask(vtop->r, vtop[-1].r)));
 
-  switch (opc) {
-  case 0:
-    ot_check(th_and_reg(r, c, fr, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                        THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-    return;
-  case 2:
-    ot_check(th_xor_reg(r, c, fr));
-    return;
-  case 4:
-  case 5:
-    ot_check(th_sub_reg(r, c, fr, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                        THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-    return;
-  case 6:
-  case 7:
-    ot_check(th_rsb_reg(r, c, fr, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                        THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-    return;
-  case 8:
-  case 9:
-    ot_check(th_add_reg(r, c, fr, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                        THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-    return;
-  case 10:
-    ot_check(th_adc_reg(r, c, fr, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                        THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-    return;
-  case 12:
-    ot_check(th_sbc_reg(r, c, fr, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                        THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-    return;
-  case 14:
-    ot_check(th_sbc_reg(r, fr, c, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                        THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-    return;
-  case 21:
-    ot_check(th_cmp_reg(c, fr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-    return;
-  case 24:
-    ot_check(th_orr_reg(r, c, fr, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                        THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-    return;
-  default:
-    tcc_error("compiler_error: 'gen_opi_regs' unhandled case opc: %d, c: %d, "
-              "r: %d, fr: %d\n",
-              opc, c, r, fr);
-  }
-}
+//   switch (opc) {
+//   case 0:
+//     ot_check(th_and_reg(r, c, fr, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+//                         THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+//     return;
+//   case 2:
+//     ot_check(th_xor_reg(r, c, fr));
+//     return;
+//   case 4:
+//   case 5:
+//     ot_check(th_sub_reg(r, c, fr, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+//                         THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+//     return;
+//   case 6:
+//   case 7:
+//     ot_check(th_rsb_reg(r, c, fr, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+//                         THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+//     return;
+//   case 8:
+//   case 9:
+//     ot_check(th_add_reg(r, c, fr, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+//                         THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+//     return;
+//   case 10:
+//     ot_check(th_adc_reg(r, c, fr, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+//                         THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+//     return;
+//   case 12:
+//     ot_check(th_sbc_reg(r, c, fr, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+//                         THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+//     return;
+//   case 14:
+//     ot_check(th_sbc_reg(r, fr, c, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+//                         THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+//     return;
+//   case 21:
+//     ot_check(th_cmp_reg(c, fr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+//     return;
+//   case 24:
+//     ot_check(th_orr_reg(r, c, fr, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+//                         THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+//     return;
+//   default:
+//     tcc_error("compiler_error: 'gen_opi_regs' unhandled case opc: %d, c: %d,
+//     "
+//               "r: %d, fr: %d\n",
+//               opc, c, r, fr);
+//   }
+// }
 
-void gen_opi_regular(int opc, int c) {
-  TRACE("gen_opi_regular opc: 0x%x, c: 0x%x", opc, c);
-  if ((vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST) {
-    int ok = 0;
-    int r = intr(vtop[-1].r = get_reg_ex(RC_INT, regmask(vtop[-1].r)));
-    if (opc != 0x15 && r != c) {
-      tcc_error(
-          "compiler_error: '2en_opi_regular' incorrect order of r and c\n");
-    }
-    switch (opc) {
-    case 0:
-      ok = ot(th_and_imm(r, r, vtop->c.i, FLAGS_BEHAVIOUR_NOT_IMPORTANT));
+// void gen_opi_regular(int opc, int c) {
+//   TRACE("gen_opi_regular opc: 0x%x, c: 0x%x", opc, c);
+//   if ((vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST) {
+//     int ok = 0;
+//     int r = intr(vtop[-1].r = get_reg_ex(RC_INT, regmask(vtop[-1].r)));
+//     if (opc != 0x15 && r != c) {
+//       tcc_error(
+//           "compiler_error: '2en_opi_regular' incorrect order of r and c\n");
+//     }
+//     switch (opc) {
+//     case 0:
+//       ok = ot(th_and_imm(r, r, vtop->c.i, FLAGS_BEHAVIOUR_NOT_IMPORTANT));
 
-      break;
-    case 2:
-      ok = ot(th_xor_imm(r, r, vtop->c.i));
-      break;
-    case 4:
-    case 5:
-      ok = ot(th_sub_imm(r, r, vtop->c.i, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                         ENFORCE_ENCODING_NONE));
-      break;
-    case 6:
-    case 7:
-      ok = ot(th_rsb_imm(r, r, vtop->c.i, FLAGS_BEHAVIOUR_SET));
-      break;
-    case 8:
-    case 9:
-      ok = ot(th_add_imm(r, r, vtop->c.i, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                         ENFORCE_ENCODING_NONE));
-      break;
-    case 10:
-      ok = ot(th_adc_imm(r, r, vtop->c.i, FLAGS_BEHAVIOUR_NOT_IMPORTANT));
-      break;
-    case 12:
-      ok = ot(th_sbc_imm(r, r, vtop->c.i, FLAGS_BEHAVIOUR_NOT_IMPORTANT));
-      break;
-    case 14:
-      ok = 0;
-      break;
-    case 21:
-      ok = ot(th_cmp_imm(c, vtop->c.i, ENFORCE_ENCODING_NONE));
-      break;
-    case 24:
-      ok = ot(th_orr_imm(r, r, vtop->c.i, FLAGS_BEHAVIOUR_NOT_IMPORTANT));
-      break;
-    default:
-      tcc_error("compiler_error: 'gen_opi_regular' unhandled case opc: %d, c: "
-                "%d, r: %d\n",
-                opc, c, r);
-    }
+//       break;
+//     case 2:
+//       ok = ot(th_xor_imm(r, r, vtop->c.i));
+//       break;
+//     case 4:
+//     case 5:
+//       ok = ot(th_sub_imm(r, r, vtop->c.i, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+//                          ENFORCE_ENCODING_NONE));
+//       break;
+//     case 6:
+//     case 7:
+//       ok = ot(th_rsb_imm(r, r, vtop->c.i, FLAGS_BEHAVIOUR_SET));
+//       break;
+//     case 8:
+//     case 9:
+//       ok = ot(th_add_imm(r, r, vtop->c.i, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+//                          ENFORCE_ENCODING_NONE));
+//       break;
+//     case 10:
+//       ok = ot(th_adc_imm(r, r, vtop->c.i, FLAGS_BEHAVIOUR_NOT_IMPORTANT));
+//       break;
+//     case 12:
+//       ok = ot(th_sbc_imm(r, r, vtop->c.i, FLAGS_BEHAVIOUR_NOT_IMPORTANT));
+//       break;
+//     case 14:
+//       ok = 0;
+//       break;
+//     case 21:
+//       ok = ot(th_cmp_imm(c, vtop->c.i, ENFORCE_ENCODING_NONE));
+//       break;
+//     case 24:
+//       ok = ot(th_orr_imm(r, r, vtop->c.i, FLAGS_BEHAVIOUR_NOT_IMPORTANT));
+//       break;
+//     default:
+//       tcc_error("compiler_error: 'gen_opi_regular' unhandled case opc: %d, c:
+//       "
+//                 "%d, r: %d\n",
+//                 opc, c, r);
+//     }
 
-    if (ok)
-      return;
-  }
-  return gen_opi_regs(opc, c);
-}
+//     if (ok)
+//       return;
+//   }
+//   return gen_opi_regs(opc, c);
+// }
 
-void gen_opi_notshift(int op, int opc) {
-  int c = 0;
-  if ((vtop[-1].r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST) {
-    if (opc == 4 || opc == 5 || opc == 0xc) {
-      vswap();
-      opc |= 2;
-    }
-  }
+// void gen_opi_notshift(int op, int opc) {
+//   int c = 0;
+//   if ((vtop[-1].r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST) {
+//     if (opc == 4 || opc == 5 || opc == 0xc) {
+//       vswap();
+//       opc |= 2;
+//     }
+//   }
 
-  if ((vtop->r & VT_VALMASK) == VT_CMP ||
-      (vtop->r & (VT_VALMASK & ~1)) == VT_JMP) {
-    gv(RC_INT);
-  }
+//   if ((vtop->r & VT_VALMASK) == VT_CMP ||
+//       (vtop->r & (VT_VALMASK & ~1)) == VT_JMP) {
+//     gv(RC_INT);
+//   }
 
-  vswap();
-  c = intr(gv(RC_INT));
-  vswap();
+//   vswap();
+//   c = intr(gv(RC_INT));
+//   vswap();
 
-  gen_opi_regular(opc, c);
-  --vtop;
-  print_vstack("gen_opi_notshift");
-  if (op >= TOK_ULT && op <= TOK_GT) {
-    TRACE("gen_opi_notshift vset_VT_CMP");
-    vset_VT_CMP(op);
-  }
-}
+//   gen_opi_regular(opc, c);
+//   --vtop;
+//   print_vstack("gen_opi_notshift");
+//   if (op >= TOK_ULT && op <= TOK_GT) {
+//     TRACE("gen_opi_notshift vset_VT_CMP");
+//     vset_VT_CMP(op);
+//   }
+// }
 
-void gen_opi_shift(int opc) {
-  int r = 0;
+// static void gen_opi_shift(int opc) {
+//   int r = 0;
 
-  if ((vtop->r & VT_VALMASK) == VT_CMP ||
-      (vtop->r & (VT_VALMASK & ~1)) == VT_JMP)
-    gv(RC_INT);
+//   if ((vtop->r & VT_VALMASK) == VT_CMP ||
+//       (vtop->r & (VT_VALMASK & ~1)) == VT_JMP)
+//     gv(RC_INT);
 
-  vswap();
-  r = intr(gv(RC_INT));
-  vswap();
+//   vswap();
+//   r = intr(gv(RC_INT));
+//   vswap();
 
-  if ((vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST) {
-    int fr = intr(vtop[-1].r = get_reg_ex(RC_INT, regmask(vtop[-1].r)));
-    int c = vtop->c.i & 0x1f;
+//   if ((vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST) {
+//     int fr = intr(vtop[-1].r = get_reg_ex(RC_INT, regmask(vtop[-1].r)));
+//     int c = vtop->c.i & 0x1f;
 
-    if (opc == 0)
-      ot_check(th_lsl_imm(r, fr, c, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                          ENFORCE_ENCODING_NONE));
-    else if (opc == 1)
-      ot_check(th_lsr_imm(r, fr, c, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                          ENFORCE_ENCODING_NONE));
-    else if (opc == 2)
-      ot_check(th_asr_imm(r, fr, c, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                          ENFORCE_ENCODING_NONE));
-  } else {
-    int fr = intr(gv(RC_INT));
-    int c =
-        intr(vtop[-1].r = get_reg_ex(RC_INT, two2mask(vtop->r, vtop[-1].r)));
+//     if (opc == 0)
+//       ot_check(th_lsl_imm(r, fr, c, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+//                           ENFORCE_ENCODING_NONE));
+//     else if (opc == 1)
+//       ot_check(th_lsr_imm(r, fr, c, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+//                           ENFORCE_ENCODING_NONE));
+//     else if (opc == 2)
+//       ot_check(th_asr_imm(r, fr, c, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+//                           ENFORCE_ENCODING_NONE));
+//   } else {
+//     int fr = intr(gv(RC_INT));
+//     int c =
+//         intr(vtop[-1].r = get_reg_ex(RC_INT, two2mask(vtop->r, vtop[-1].r)));
 
-    if (opc == 0)
-      ot_check(th_lsl_reg(c, r, fr, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                          ENFORCE_ENCODING_NONE));
-    else if (opc == 1)
-      ot_check(th_lsr_reg(c, r, fr, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                          ENFORCE_ENCODING_NONE));
-    else if (opc == 2)
-      ot_check(th_asr_reg(c, r, fr, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                          ENFORCE_ENCODING_NONE));
-    else
-      tcc_error("compiler_error: 'gen_opi_shift' not implemented case: %d\n",
-                opc);
-  }
-  vtop--;
-  print_vstack("gen_opi_shift");
-}
+//     if (opc == 0)
+//       ot_check(th_lsl_reg(c, r, fr, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+//                           ENFORCE_ENCODING_NONE));
+//     else if (opc == 1)
+//       ot_check(th_lsr_reg(c, r, fr, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+//                           ENFORCE_ENCODING_NONE));
+//     else if (opc == 2)
+//       ot_check(th_asr_reg(c, r, fr, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+//                           ENFORCE_ENCODING_NONE));
+//     else
+//       tcc_error("compiler_error: 'gen_opi_shift' not implemented case: %d\n",
+//                 opc);
+//   }
+//   vtop--;
+//   print_vstack("gen_opi_shift");
+// }
 
-/* generate an integer binary operation */
-void gen_opi(int op) {
-  uint32_t r, fr;
-  TRACE("'gen_opi', op: 0x%x, %c", op, op);
-  switch (op) {
-  case '+':
-    return gen_opi_notshift(op, 0x08);
-  case TOK_ADDC1:
-    return gen_opi_notshift(op, 0x09);
-  case '-':
-    return gen_opi_notshift(op, 0x04);
-  case TOK_SUBC1:
-    return gen_opi_notshift(op, 0x05);
-  case TOK_ADDC2:
-    return gen_opi_notshift(op, 0x0a);
-  case TOK_SUBC2:
-    return gen_opi_notshift(op, 0x0c);
-  case '&':
-    return gen_opi_notshift(op, 0x00);
-  case '^':
-    return gen_opi_notshift(op, 0x02);
-  case '|':
-    return gen_opi_notshift(op, 0x18);
-  case '*': {
-    gv2(RC_INT, RC_INT);
-    r = vtop[-1].r;
-    fr = vtop[0].r;
-    vtop--;
-    print_vstack("gen_opi(*)");
-    ot_check(th_mul(intr(r), intr(fr), intr(r), FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                    ENFORCE_ENCODING_NONE));
-    return;
-  }
-  case TOK_SHL:
-    return gen_opi_shift(0);
-  case TOK_SHR:
-    return gen_opi_shift(1);
-  case TOK_SAR:
-    return gen_opi_shift(2);
-  case '/':
-  case TOK_PDIV: {
-    gv2(RC_INT, RC_INT);
-    r = vtop[-1].r;
-    fr = vtop[0].r;
-    ot_check(th_sdiv(intr(r), intr(r), intr(fr)));
-    vtop--;
-    print_vstack("gen_opi(/)");
-    return;
-  }
-  case TOK_UDIV: {
-    gv2(RC_INT, RC_INT);
-    r = vtop[-1].r;
-    fr = vtop[0].r;
-    ot_check(th_udiv(intr(r), intr(r), intr(fr)));
-    vtop--;
-    print_vstack("gen_opi(UDIV)");
-    return;
-  }
-  case '%': {
-    uint32_t rr = 0;
-    gv2(RC_INT, RC_INT);
-    r = vtop[-1].r;
-    fr = vtop[0].r;
-    vtop--;
-    print_vstack("gen_opi(%%)");
-    r = intr(r);
-    fr = intr(fr);
-    for (int i = 0; i < 5; ++i) {
-      if (rr == r || rr == fr)
-        ++rr;
-      else
-        break;
-    }
+// /* generate an integer binary operation */
+// void gen_opi(int op) {
+//   uint32_t r, fr;
+//   TRACE("'gen_opi', op: 0x%x, %c", op, op);
+//   switch (op) {
+//   case '+':
+//     return gen_opi_notshift(op, 0x08);
+//   case TOK_ADDC1:
+//     return gen_opi_notshift(op, 0x09);
+//   case '-':
+//     return gen_opi_notshift(op, 0x04);
+//   case TOK_SUBC1:
+//     return gen_opi_notshift(op, 0x05);
+//   case TOK_ADDC2:
+//     return gen_opi_notshift(op, 0x0a);
+//   case TOK_SUBC2:
+//     return gen_opi_notshift(op, 0x0c);
+//   case '&':
+//     return gen_opi_notshift(op, 0x00);
+//   case '^':
+//     return gen_opi_notshift(op, 0x02);
+//   case '|':
+//     return gen_opi_notshift(op, 0x18);
+//   case '*': {
+//     gv2(RC_INT, RC_INT);
+//     r = vtop[-1].r;
+//     fr = vtop[0].r;
+//     vtop--;
+//     print_vstack("gen_opi(*)");
+//     ot_check(th_mul(intr(r), intr(fr), intr(r),
+//     FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+//                     ENFORCE_ENCODING_NONE));
+//     return;
+//   }
+//   case TOK_SHL:
+//     return gen_opi_shift(0);
+//   case TOK_SHR:
+//     return gen_opi_shift(1);
+//   case TOK_SAR:
+//     return gen_opi_shift(2);
+//   case '/':
+//   case TOK_PDIV: {
+//     gv2(RC_INT, RC_INT);
+//     r = vtop[-1].r;
+//     fr = vtop[0].r;
+//     ot_check(th_sdiv(intr(r), intr(r), intr(fr)));
+//     vtop--;
+//     print_vstack("gen_opi(/)");
+//     return;
+//   }
+//   case TOK_UDIV: {
+//     gv2(RC_INT, RC_INT);
+//     r = vtop[-1].r;
+//     fr = vtop[0].r;
+//     ot_check(th_udiv(intr(r), intr(r), intr(fr)));
+//     vtop--;
+//     print_vstack("gen_opi(UDIV)");
+//     return;
+//   }
+//   case '%': {
+//     uint32_t rr = 0;
+//     gv2(RC_INT, RC_INT);
+//     r = vtop[-1].r;
+//     fr = vtop[0].r;
+//     vtop--;
+//     print_vstack("gen_opi(%%)");
+//     r = intr(r);
+//     fr = intr(fr);
+//     for (int i = 0; i < 5; ++i) {
+//       if (rr == r || rr == fr)
+//         ++rr;
+//       else
+//         break;
+//     }
 
-    ot_check(th_push(1 << rr));
-    ot_check(th_sdiv(rr, r, fr));
-    ot_check(th_mul(fr, fr, rr, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                    ENFORCE_ENCODING_NONE));
-    ot_check(th_sub_reg(r, r, fr, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                        THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-    ot_check(th_pop(1 << rr));
-    return;
-  }
-  case TOK_UMOD: {
-    uint32_t rr = 0;
-    gv2(RC_INT, RC_INT);
-    r = vtop[-1].r;
-    fr = vtop[0].r;
-    vtop--;
-    print_vstack("gen_opi(UMOD)");
-    r = intr(r);
-    fr = intr(fr);
-    for (int i = 0; i < 5; ++i) {
-      if (rr == r || rr == fr)
-        ++rr;
-      else
-        break;
-    }
+//     ot_check(th_push(1 << rr));
+//     ot_check(th_sdiv(rr, r, fr));
+//     ot_check(th_mul(fr, fr, rr, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+//                     ENFORCE_ENCODING_NONE));
+//     ot_check(th_sub_reg(r, r, fr, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+//                         THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+//     ot_check(th_pop(1 << rr));
+//     return;
+//   }
+//   case TOK_UMOD: {
+//     uint32_t rr = 0;
+//     gv2(RC_INT, RC_INT);
+//     r = vtop[-1].r;
+//     fr = vtop[0].r;
+//     vtop--;
+//     print_vstack("gen_opi(UMOD)");
+//     r = intr(r);
+//     fr = intr(fr);
+//     for (int i = 0; i < 5; ++i) {
+//       if (rr == r || rr == fr)
+//         ++rr;
+//       else
+//         break;
+//     }
 
-    ot_check(th_push(1 << rr));
-    ot_check(th_udiv(rr, r, fr));
-    ot_check(th_mul(fr, fr, rr, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                    ENFORCE_ENCODING_NONE));
-    ot_check(th_sub_reg(r, r, fr, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                        THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-    ot_check(th_pop(1 << rr));
-    return;
-  }
-  case TOK_UMULL: {
-    gv2(RC_INT, RC_INT);
-    r = intr(vtop[-1].r2 = get_reg(RC_INT));
-    fr = vtop[-1].r;
-    vtop[-1].r = get_reg_ex(RC_INT, regmask(fr));
-    vtop--;
-    print_vstack("gen_opi(UMULL)");
-    ot_check(th_umull(intr(vtop->r), r, intr(vtop[1].r), intr(fr)));
-    return;
-  }
-  default: {
-    return gen_opi_notshift(op, 0x15);
-  }
-  }
-}
+//     ot_check(th_push(1 << rr));
+//     ot_check(th_udiv(rr, r, fr));
+//     ot_check(th_mul(fr, fr, rr, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+//                     ENFORCE_ENCODING_NONE));
+//     ot_check(th_sub_reg(r, r, fr, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+//                         THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+//     ot_check(th_pop(1 << rr));
+//     return;
+//   }
+//   case TOK_UMULL: {
+//     gv2(RC_INT, RC_INT);
+//     r = intr(vtop[-1].r2 = get_reg(RC_INT));
+//     fr = vtop[-1].r;
+//     vtop[-1].r = get_reg_ex(RC_INT, regmask(fr));
+//     vtop--;
+//     print_vstack("gen_opi(UMULL)");
+//     ot_check(th_umull(intr(vtop->r), r, intr(vtop[1].r), intr(fr)));
+//     return;
+//   }
+//   default: {
+//     return gen_opi_notshift(op, 0x15);
+//   }
+//   }
+// }
 
 ST_FUNC void gen_increment_tcov(SValue *sv) { TRACE("'gen_increment_tcov'"); }
 
-#endif // TARGET_DEFS_ONLYa
+void tcc_gen_machine_data_processing_op(TACQuadruple *op) {
+  switch (op->op) {
+  case TCCIR_OP_ADD:
+    ot_check(th_add_reg(op->dest.r, op->src1.r, op->src2.r,
+                        FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                        ENFORCE_ENCODING_NONE));
+    break;
+  case TCCIR_OP_MUL:
+    ot_check(th_mul(op->dest.r, op->src1.r, op->src2.r,
+                    FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    break;
+  case TCCIR_OP_ADC_USE:
+    // return ot_check(th_adc_reg(intr(op->res), intr(op->arg1), intr(op->arg2),
+    //  FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+    //  THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+  case TCCIR_OP_ADC_GEN:
+    // return ot_check(th_add_reg(op->dest->r, , intr(op->arg1),
+    //                            FLAGS_BEHAVIOUR_SET, THUMB_SHIFT_DEFAULT,
+    //                            ENFORCE_ENCODING_NONE));
+  default: {
+    printf("compiler_error: unhandled data processing op: %s\n",
+           tcc_ir_get_op_name(op->op));
+  }
+  }
+}
 
-/* vim: set ts=2 sw=2 sts=2 tw=110 :*/
+#endif // TARGET_DEFS_ONLY

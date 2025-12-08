@@ -21,6 +21,8 @@
 #define USING_GLOBALS
 #include "tcc.h"
 
+#include "tccir.h"
+
 /********************************************************/
 /* global variables */
 
@@ -2354,8 +2356,10 @@ static void gen_opic(int op) {
       if (t1 == VT_LLONG || t2 == VT_LLONG ||
           (PTR_SIZE == 8 && (t1 == VT_PTR || t2 == VT_PTR)))
         gen_opl(op);
-      else
-        gen_opi(op);
+      else {
+        // gen_opi(op);
+        tcc_ir_gen_opi(tcc_state->ir_func_block, op);
+      }
     }
     if (vtop->r == VT_CONST)
       vtop->r |= VT_NONCONST; /* is const, but only by optimization */
@@ -2505,7 +2509,8 @@ static void gen_opif(int op) {
     if (op == TOK_NEG) {
       gen_negf(op);
     } else {
-      gen_opf(op);
+      // gen_opf(op);
+      tcc_ir_gen_opf(tcc_state->ir_func_block, op);
     }
   }
 }
@@ -8179,6 +8184,7 @@ static void func_vla_arg(Sym *sym) {
    'cur_text_section' */
 static void gen_function(Sym *sym) {
   struct scope f = {0};
+  TCCIRState *ir;
   cur_scope = root_scope = &f;
   nocode_wanted = 0;
 
@@ -8206,16 +8212,20 @@ static void gen_function(Sym *sym) {
 
   /* push a dummy symbol to enable local sym storage */
   sym_push2(&local_stack, SYM_FIELD, 0, 0);
+  ir = tcc_ir_allocate_block();
+  tcc_ir_add_function_parameters(ir, &sym->type);
   local_scope = 1; /* for function parameters */
   nb_temp_local_vars = 0;
   if (!sym->a.naked) {
-    gfunc_prolog(sym);
+    printf("Generate prolog for function %s\n", funcname);
+    // gfunc_prolog(sym);
     tcc_debug_prolog_epilog(tcc_state, 0);
   }
 
   local_scope = 0;
   rsym = 0;
   func_vla_arg(sym);
+  tcc_state->ir_func_block = ir;
   block(0);
   gsym(rsym);
 
@@ -8223,9 +8233,13 @@ static void gen_function(Sym *sym) {
   /* reset local stack */
   pop_local_syms(NULL, 0);
 
+  tcc_ir_liveness_analysis(ir);
+  tcc_ir_register_allocation(ir);
+  tcc_ir_register_allocation_params(ir);
+  tcc_ir_generate_code(ir);
   if (!sym->a.naked) {
     tcc_debug_prolog_epilog(tcc_state, 1);
-    gfunc_epilog();
+    // gfunc_epilog();
   }
 
   /* end of function */
@@ -8251,6 +8265,7 @@ static void gen_function(Sym *sym) {
 
   /* do this after funcend debug info */
   next();
+  tcc_ir_release_block(ir);
 }
 
 static void gen_inline_functions(TCCState *s) {

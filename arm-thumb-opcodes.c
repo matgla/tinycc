@@ -1307,14 +1307,15 @@ thumb_opcode th_mul(uint32_t rd, uint32_t rn, uint32_t rm,
   if (rd == rm && rd < 8 && rn < 8 && encoding != ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
         .size = 2,
-        .opcode = (0x4340 | (rn << 3) | rm),
+        .opcode = (0x4340 | ((rn & 0x7) << 3) | (rm & 0x7)),
     };
   }
 #ifndef TCC_TARGET_ARM_ARCHV6M
   else {
     return (thumb_opcode){
         .size = 4,
-        .opcode = (0xfb00f000 | (rn << 16) | (rd << 8) | rm),
+        .opcode =
+            (0xfb00f000 | ((rn & 0xf) << 16) | ((rd & 0xf) << 8) | (rm & 0xf)),
     };
   }
 #endif
@@ -1715,7 +1716,8 @@ thumb_opcode th_vpush(uint32_t regs, uint32_t is_doubleword) {
 
   return (thumb_opcode){
       .size = 4,
-      .opcode = 0xed2d0a00 | D << 22 | (Vd << 12) | (register_count & 0xff) | (is_doubleword << 8),
+      .opcode = 0xed2d0a00 | D << 22 | (Vd << 12) | (register_count & 0xff) |
+                (is_doubleword << 8),
   };
 }
 
@@ -1747,11 +1749,10 @@ thumb_opcode th_vpop(uint32_t regs, uint32_t is_doubleword) {
     Vd = first_register >> 1;
   }
 
-
-
   return (thumb_opcode){
       .size = 4,
-      .opcode = 0xecbd0a00 | D << 22 | (Vd << 12) | (register_count & 0xff) | (is_doubleword << 8),
+      .opcode = 0xecbd0a00 | D << 22 | (Vd << 12) | (register_count & 0xff) |
+                (is_doubleword << 8),
   };
 }
 
@@ -1763,7 +1764,8 @@ thumb_opcode th_vmov_register(uint16_t vd, uint16_t vm, uint32_t sz) {
     vm >>= 1;
     return (thumb_opcode){
         .size = 4,
-        .opcode = 0xeeb00a40 | (d << 22) | (vd << 12) | (m << 5) | vm | (sz << 8),
+        .opcode =
+            0xeeb00a40 | (d << 22) | (vd << 12) | (m << 5) | vm | (sz << 8),
     };
   }
   return (thumb_opcode){
