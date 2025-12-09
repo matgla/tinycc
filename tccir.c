@@ -416,6 +416,8 @@ void tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2,
       exit(1);
     }
     q->src1 = *src1;
+    printf("  src1 vr: %d, id: %d, src1->r: %d, src1->c.i: %ld\n", src1->vr,
+           pos, src1->r, src1->c.i);
     if (tcc_is_vreg_valid(ir, src1->vr)) {
       tcc_ir_set_base_interval_end(ir, src1->vr);
     }
@@ -430,6 +432,9 @@ void tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2,
       exit(1);
     }
     q->src2 = *src2;
+    printf("  src2 vr: %d, id: %d, src2->r: %d, src2->c.i: %ld\n", src2->vr,
+           pos, src2->r, src2->c.i);
+
     if (tcc_is_vreg_valid(ir, src2->vr)) {
       tcc_ir_set_base_interval_end(ir, src2->vr);
     }
@@ -445,6 +450,9 @@ void tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2,
       exit(1);
     }
     q->dest = *dest;
+    printf("  dest vr: %d, id: %d, dest->r: %d, dest->c.i: %ld\n", dest->vr,
+           pos, src2->r, src2->c.i);
+
     dest_interval = tcc_ir_get_live_interval(ir, dest->vr);
     if (tcc_is_vreg_valid(ir, dest->vr)) {
       if (dest_interval->start == 0) {
@@ -475,16 +483,41 @@ void tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2,
   ++ir->next_instruction_index;
 }
 
-uint16_t tcc_ir_get_vreg_temp(TCCIRState *ir) {
-  // const uint16_t next_temp_vr = ir->next_temporary_variable_vreg;
-  // if (next_temp_vr >= ir->next_temporary_variable_vreg)
-  // if (next_temp_vr >= IR_MAX_TEMPS) {
-  //   fprintf(stderr,
-  //           "tcc_ir_get_vreg_temp: out of temporary virtual registers\n");
-  //   exit(1);
-  // }
-  // ++ir->next_temp_vr;
-  return 0; // next_temp_vr;
+int tcc_ir_get_vreg_temp(TCCIRState *ir) {
+  if (ir->next_temporary_variable >=
+      ir->temporary_variables_live_intervals_size) {
+    ir->temporary_variables_live_intervals_size <<= 1;
+    ir->temporary_variables_live_intervals = (IRLiveInterval *)tcc_realloc(
+        ir->temporary_variables_live_intervals,
+        sizeof(IRLiveInterval) * ir->temporary_variables_live_intervals_size);
+  }
+  const int next_temp_vr = ir->next_temporary_variable;
+  ++ir->next_temporary_variable;
+  return (TCCIR_VREG_TYPE_TEMP << 28) | next_temp_vr;
+}
+
+int tcc_ir_get_vreg_var(TCCIRState *ir) {
+  if (ir->next_local_variable >= ir->variables_live_intervals_size) {
+    ir->variables_live_intervals_size <<= 1;
+    ir->variables_live_intervals = (IRLiveInterval *)tcc_realloc(
+        ir->variables_live_intervals,
+        sizeof(IRLiveInterval) * ir->variables_live_intervals_size);
+  }
+  const int next_var_vr = ir->next_local_variable;
+  ++ir->next_local_variable;
+  return (TCCIR_VREG_TYPE_VAR << 28) | next_var_vr;
+}
+
+int tcc_ir_get_vreg_param(TCCIRState *ir) {
+  if (ir->next_parameter >= ir->parameters_live_intervals_size) {
+    ir->parameters_live_intervals_size <<= 1;
+    ir->parameters_live_intervals = (IRLiveInterval *)tcc_realloc(
+        ir->parameters_live_intervals,
+        sizeof(IRLiveInterval) * ir->parameters_live_intervals_size);
+  }
+  const int next_param_vr = ir->next_parameter;
+  ++ir->next_parameter;
+  return (TCCIR_VREG_TYPE_PARAM << 28) | next_param_vr;
 }
 
 // 3 bits per vreg position: bit 0 = local_variable, bit 1 = temp, bit 2 =
@@ -600,7 +633,8 @@ void tcc_ir_liveness_analysis(TCCIRState *ir) {
   }
 }
 
-void tcc_ir_replace_vreg(TCCIRState *ir, int vreg, int offset, int r0, int r1) {
+void tcc_ir_assign_physical_register(TCCIRState *ir, int vreg, int offset,
+                                     int r0, int r1) {
   IRLiveInterval *interval = tcc_ir_get_live_interval(ir, vreg);
   interval->allocation.r0 = r0;
   interval->allocation.r1 = r1;
@@ -617,7 +651,7 @@ void tcc_ir_register_allocation_params(TCCIRState *ir) {
     for (int vreg = 0; vreg < ir->next_parameter; ++vreg) {
       if (argno <= 3) {
         printf("Patching param vreg %d to r%d\n", vreg, argno);
-        tcc_ir_replace_vreg(ir, vreg, 0, argno, -1);
+        tcc_ir_assign_physical_register(ir, vreg, 0, argno, -1);
       }
       ++argno;
     }

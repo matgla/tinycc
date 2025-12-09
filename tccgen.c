@@ -675,6 +675,20 @@ static int sym_scope(Sym *s) {
 ST_FUNC Sym *sym_push(int v, CType *type, int r, int c) {
   Sym *s, **ps;
   TokenSym *ts;
+  int vreg = -1;
+  /* register local variable at IR code generator, get Vreg number */
+  /* XXX: no vreg assignment for params so far */
+  printf("sym_push() called, name \"%s\", valmask=%d, type=%d\n",
+         get_tok_str(v, NULL), r & VT_VALMASK, type->t);
+  if (((r & VT_VALMASK) == VT_LOCAL) && (r & VT_LVAL) &&
+      ((type->t & VT_BTYPE) != VT_STRUCT)) {
+    if (r & VT_PARAM) {
+      vreg = tcc_ir_get_vreg_param(tcc_state->ir);
+      tcc_ir_assign_physical_register(tcc_state->ir, vreg, c, -1, -1);
+      printf("**** VReg%d <-- parameter \"%s\"\n", vreg, get_tok_str(v, NULL));
+    }
+  }
+  r &= ~VT_PARAM;
 
   if (local_stack)
     ps = &local_stack;
@@ -2358,7 +2372,7 @@ static void gen_opic(int op) {
         gen_opl(op);
       else {
         // gen_opi(op);
-        tcc_ir_gen_opi(tcc_state->ir_func_block, op);
+        tcc_ir_gen_opi(tcc_state->ir, op);
       }
     }
     if (vtop->r == VT_CONST)
@@ -2510,7 +2524,7 @@ static void gen_opif(int op) {
       gen_negf(op);
     } else {
       // gen_opf(op);
-      tcc_ir_gen_opf(tcc_state->ir_func_block, op);
+      tcc_ir_gen_opf(tcc_state->ir, op);
     }
   }
 }
@@ -8225,7 +8239,7 @@ static void gen_function(Sym *sym) {
   local_scope = 0;
   rsym = 0;
   func_vla_arg(sym);
-  tcc_state->ir_func_block = ir;
+  tcc_state->ir = ir;
   block(0);
   gsym(rsym);
 

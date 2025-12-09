@@ -119,12 +119,15 @@ void tcc_ir_gen_opf(TCCIRState *ir, int op);
 void tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2,
                 SValue *dest);
 
-uint16_t tcc_ir_get_vreg_temp(TCCIRState *ir);
+int tcc_ir_get_vreg_temp(TCCIRState *ir);
+int tcc_ir_get_vreg_var(TCCIRState *ir);
+int tcc_ir_get_vreg_param(TCCIRState *ir);
 
 void tcc_ir_liveness_analysis(TCCIRState *ir);
 void tcc_ir_register_allocation_params(TCCIRState *ir);
 void tcc_ir_generate_code(TCCIRState *ir);
 
-void tcc_ir_add_local_variable(TCCIRState *ir, Sym *sym, int stack_offset);
-
+int tcc_ir_add_local_variable(TCCIRState *ir, Sym *sym, int stack_offset);
+void tcc_ir_assign_physical_register(TCCIRState *ir, int vreg, int offset,
+                                     int r0, int r1);
 const char *tcc_ir_get_op_name(TccIrOp op);

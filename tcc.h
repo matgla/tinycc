@@ -920,7 +920,7 @@ struct TCCState {
   char **argv;
   CString linker_arg; /* collect -Wl options */
   int thumb_func;
-  TCCIRState *ir_func_block;
+  TCCIRState *ir;
   int rt_num_callers;
 };
 
@@ -954,6 +954,7 @@ struct filespec {
   0x8000 /* value is bounded. The address of the                               \
             bounding function call point is in vc */
 /* types */
+#define VT_PARAM 0x0080 /* register allocation */
 #define VT_BTYPE 0x000f /* mask for basic type */
 #define VT_VOID 0       /* void type */
 #define VT_BYTE 1       /* signed byte type */
