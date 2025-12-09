@@ -8234,7 +8234,7 @@ static void gen_function(Sym *sym) {
   pop_local_syms(NULL, 0);
 
   tcc_ir_liveness_analysis(ir);
-  tcc_ir_register_allocation(ir);
+  tcc_ls_allocate_registers(&ir->ls);
   tcc_ir_register_allocation_params(ir);
   tcc_ir_generate_code(ir);
   if (!sym->a.naked) {

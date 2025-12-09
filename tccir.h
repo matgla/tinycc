@@ -22,6 +22,8 @@
 
 #include <stdint.h>
 
+#include "tccls.h"
+
 typedef enum TccIrOp {
   TCCIR_OP_ADD,
   TCCIR_OP_ADC_USE,
@@ -56,31 +58,53 @@ typedef struct CType CType;
 typedef struct SValue SValue;
 
 typedef struct TACQuadruple TACQuadruple;
+typedef struct Sym Sym;
+
+typedef struct IRVregReplacement {
+  uint16_t r0; // first physical register
+  uint16_t r1; // second physical register (for long long)
+  int offset;  // stack offset if spilled
+} IRVregReplacement;
 
 typedef struct IRLiveInterval {
-  uint8_t r;                 // first register
-  uint8_t r2;                // second register (for pairs)
-  uint16_t virtual_register; // virtual register number
-  uint32_t stack_location;   // stack location if spilled
-  uint32_t start;            // start instruction index
-  uint32_t end;              // end instruction index
-  struct IRLiveInterval *next;
+  uint8_t start_within_if : 1; // whether the interval starts within an if block
+  uint32_t start;              // start instruction index
+  uint32_t end;                // end instruction index
+  IRVregReplacement allocation;
 } IRLiveInterval;
 
 typedef struct TCCIRState {
   // number of function parameters
   int8_t parameters_count;
 
-  int8_t leaffunc : 1;
+  uint8_t leaffunc : 1;
+  uint8_t processing_if : 1;
+  uint8_t check_for_backwards_jumps : 1;
   int32_t loc;
 
   TACQuadruple *instructions;
-  IRLiveInterval *live_intervals;
-  int next_live_interval_index;
   IRLiveInterval **active_set;
+
+  IRLiveInterval *variables_live_intervals;
+  int variables_live_intervals_size;
+  int next_local_variable;
+
+  IRLiveInterval *temporary_variables_live_intervals;
+  int temporary_variables_live_intervals_size;
+  int next_temporary_variable;
+
+  IRLiveInterval *parameters_live_intervals;
+  int parameters_live_intervals_size;
+  int next_parameter;
+
+  int next_live_interval_index;
   int instructions_size;
   int next_instruction_index;
-  uint16_t next_temp_vr;
+
+  uint32_t *ignored_vregs;
+  int ignored_vregs_size;
+
+  LSLiveIntervalState ls;
 } TCCIRState;
 
 TCCIRState *tcc_ir_allocate_block();
@@ -98,8 +122,9 @@ void tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2,
 uint16_t tcc_ir_get_vreg_temp(TCCIRState *ir);
 
 void tcc_ir_liveness_analysis(TCCIRState *ir);
-void tcc_ir_register_allocation(TCCIRState *ir);
 void tcc_ir_register_allocation_params(TCCIRState *ir);
 void tcc_ir_generate_code(TCCIRState *ir);
+
+void tcc_ir_add_local_variable(TCCIRState *ir, Sym *sym, int stack_offset);
 
 const char *tcc_ir_get_op_name(TccIrOp op);

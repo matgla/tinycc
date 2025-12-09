@@ -28,6 +28,7 @@
 #include "tccelf.c"
 #include "tccgen.c"
 #include "tccir.c"
+#include "tccls.c"
 #include "tccpp.c"
 #include "tccyaff.c"
 #if defined(TCC_TARGET_ARM_THUMB)

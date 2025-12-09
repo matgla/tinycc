@@ -2228,9 +2228,8 @@ ST_FUNC void gen_increment_tcov(SValue *sv) { TRACE("'gen_increment_tcov'"); }
 void tcc_gen_machine_data_processing_op(TACQuadruple *op) {
   switch (op->op) {
   case TCCIR_OP_ADD:
-    ot_check(th_add_reg(op->dest.r, op->src1.r, op->src2.r,
-                        FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                        ENFORCE_ENCODING_NONE));
+    ot_check(th_add_imm(op->dest.r, op->src1.r, op->src2.c.i,
+                        FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
     break;
   case TCCIR_OP_MUL:
     ot_check(th_mul(op->dest.r, op->src1.r, op->src2.r,

@@ -172,7 +172,7 @@ LIB-$(TR) ?= {B}:/usr/$(TRIPLET-$T)/lib:/usr/lib/$(MARCH-$T)
 INC-$(TR) ?= {B}/include:/usr/$(TRIPLET-$T)/include:/usr/include
 endif
 
-CORE_FILES = tccir.c tcc.c tcctools.c libtcc.c tccpp.c tccgen.c tccdbg.c tccelf.c tccasm.c tccyaff.c
+CORE_FILES = tccir.c tccls.c tcc.c tcctools.c libtcc.c tccpp.c tccgen.c tccdbg.c tccelf.c tccasm.c tccyaff.c
 CORE_FILES += tcc.h config.h libtcc.h tcctok.h tccir.h
 armv8m_FILES = $(CORE_FILES) arm-thumb-opcodes.c arm-thumb-gen.c arm-link.c arm-thumb-asm.c thumb-tok.h
 
