@@ -678,14 +678,14 @@ ST_FUNC Sym *sym_push(int v, CType *type, int r, int c) {
   int vreg = -1;
   /* register local variable at IR code generator, get Vreg number */
   /* XXX: no vreg assignment for params so far */
-  printf("sym_push() called, name \"%s\", valmask=%d, type=%d\n",
-         get_tok_str(v, NULL), r & VT_VALMASK, type->t);
   if (((r & VT_VALMASK) == VT_LOCAL) && (r & VT_LVAL) &&
       ((type->t & VT_BTYPE) != VT_STRUCT)) {
     if (r & VT_PARAM) {
       vreg = tcc_ir_get_vreg_param(tcc_state->ir);
       tcc_ir_assign_physical_register(tcc_state->ir, vreg, c, -1, -1);
-      printf("**** VReg%d <-- parameter \"%s\"\n", vreg, get_tok_str(v, NULL));
+      printf("**** VReg <-- parameter \"%s\", got vreg type: %d, value: %d\n",
+             get_tok_str(v, NULL), TCCIR_DECODE_VREG_TYPE(vreg),
+             TCCIR_DECODE_VREG_POSITION(vreg));
     }
   }
   r &= ~VT_PARAM;
@@ -697,6 +697,7 @@ ST_FUNC Sym *sym_push(int v, CType *type, int r, int c) {
   s = sym_push2(ps, v, type->t, c);
   s->type.ref = type->ref;
   s->r = r;
+  s->vreg = vreg;
   /* don't record fields or anonymous symbols */
   /* XXX: simplify */
   if (!(v & SYM_FIELD) && (v & ~SYM_STRUCT) < SYM_FIRST_ANOM) {
@@ -1687,8 +1688,10 @@ static int adjust_bf(SValue *sv, int bit_pos, int bit_size) {
    converted to values. Cannot be used if cannot be converted to
    register value (such as structures). */
 ST_FUNC int gv(int rc) {
+  printf("gv(%d) called\n", rc);
   int r, r2, r_ok, r2_ok, rc2, bt;
   int bit_pos, bit_size, size, align;
+  int vreg;
 
   /* NOTE: get_reg can modify vstack[] */
   if (vtop->type.t & VT_BITFIELD) {
@@ -1723,6 +1726,7 @@ ST_FUNC int gv(int rc) {
       vpushi(bits - bit_size);
       /* NOTE: transformed to SHR if unsigned */
       gen_op(TOK_SAR);
+      vreg = gv(rc);
     }
     r = gv(rc);
   } else {
@@ -1748,11 +1752,6 @@ ST_FUNC int gv(int rc) {
 
     bt = vtop->type.t & VT_BTYPE;
 
-#ifdef TCC_TARGET_RISCV64
-    /* XXX mega hack */
-    if (bt == VT_LDOUBLE && rc == RC_FLOAT)
-      rc = RC_INT;
-#endif
     rc2 = RC2_TYPE(bt, rc);
 
     /* need to reload if:
@@ -1823,7 +1822,7 @@ ST_FUNC int gv(int rc) {
         load(r, vtop);
       }
     }
-    vtop->r = r;
+    vtop->vr = vreg;
 #ifdef TCC_TARGET_C67
     /* uses register pairs for doubles */
     if (bt == VT_DOUBLE)
@@ -1896,6 +1895,7 @@ static void lbuild(int t) {
 /* convert stack entry to register and duplicate its value in another
    register */
 static void gv_dup(void) {
+  printf("gv_dup() called\n");
   int t, rc, r;
 
   t = vtop->type.t;
@@ -5895,6 +5895,7 @@ tok_next:
        Will be used by at least the x86 inline asm parser for
        regvars.  */
     vtop->sym = s;
+    vtop->vr = s->vreg;
 
     if (r & VT_SYM) {
       vtop->c.i = 0;
@@ -8227,6 +8228,7 @@ static void gen_function(Sym *sym) {
   /* push a dummy symbol to enable local sym storage */
   sym_push2(&local_stack, SYM_FIELD, 0, 0);
   ir = tcc_ir_allocate_block();
+  tcc_state->ir = ir;
   tcc_ir_add_function_parameters(ir, &sym->type);
   local_scope = 1; /* for function parameters */
   nb_temp_local_vars = 0;
@@ -8239,7 +8241,6 @@ static void gen_function(Sym *sym) {
   local_scope = 0;
   rsym = 0;
   func_vla_arg(sym);
-  tcc_state->ir = ir;
   block(0);
   gsym(rsym);
 
@@ -8249,6 +8250,7 @@ static void gen_function(Sym *sym) {
 
   tcc_ir_liveness_analysis(ir);
   tcc_ls_allocate_registers(&ir->ls);
+  tcc_ir_patch_live_intervals_registers(ir);
   tcc_ir_register_allocation_params(ir);
   tcc_ir_generate_code(ir);
   if (!sym->a.naked) {

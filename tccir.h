@@ -131,3 +131,7 @@ int tcc_ir_add_local_variable(TCCIRState *ir, Sym *sym, int stack_offset);
 void tcc_ir_assign_physical_register(TCCIRState *ir, int vreg, int offset,
                                      int r0, int r1);
 const char *tcc_ir_get_op_name(TccIrOp op);
+void tcc_ir_patch_live_intervals_registers(TCCIRState *ir);
+
+#define TCCIR_DECODE_VREG_POSITION(vr) (vr & 0xFFFFFFF)
+#define TCCIR_DECODE_VREG_TYPE(vr) (vr >> 28)

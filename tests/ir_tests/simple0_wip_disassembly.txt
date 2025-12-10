@@ -4,6 +4,16 @@ simple0_wip.o:     file format elf32-littlearm
 
 Disassembly of section .text:
 
-00000000 <simple>:
-   0:	4340      	muls	r0, r0
-   2:	3000      	adds	r0, #0
+00000000 <simple0>:
+   0:	f243 0018 	movw	r0, #12312	@ 0x3018
+
+00000004 <simple1>:
+   4:	fb00 f200 	mul.w	r2, r0, r0
+   8:	322a      	adds	r2, #42	@ 0x2a
+
+0000000a <simple2>:
+   a:	1c02      	adds	r2, r0, #0
+
+0000000c <simple3>:
+   c:	fb00 f201 	mul.w	r2, r0, r1
+  10:	3200      	adds	r2, #0

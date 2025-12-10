@@ -74,12 +74,10 @@ const IRRegistersConfig irop_config[] = {
 #define IR_MAX_TEMPS 10000
 #define IR_MAX_PARAMS 10000
 
-#define TCCIR_DECODE_VREG_POSITION(vr) (vr & 0xFFFFFFF)
-#define TCCIR_DECODE_VREG_TYPE(vr) (vr >> 28)
 typedef enum TCCIR_VREG_TYPE {
-  TCCIR_VREG_TYPE_VAR = 0,
-  TCCIR_VREG_TYPE_TEMP = 1,
-  TCCIR_VREG_TYPE_PARAM = 2,
+  TCCIR_VREG_TYPE_VAR = 1,
+  TCCIR_VREG_TYPE_TEMP = 2,
+  TCCIR_VREG_TYPE_PARAM = 3,
 } TCCIR_VREG_TYPE;
 
 static int tcc_is_vreg_valid(TCCIRState *ir, int vr) {
@@ -129,14 +127,17 @@ static IRLiveInterval *tcc_ir_get_live_interval(TCCIRState *ir, int vreg) {
     return &ir->parameters_live_intervals[decoded_vreg_position];
   }
   default:
-    fprintf(stderr, "tcc_ir_get_live_interval: unknown vreg type %d\n",
-            TCCIR_DECODE_VREG_TYPE(vreg));
+    fprintf(stderr,
+            "tcc_ir_get_live_interval: unknown vreg type %d, for vreg: %d\n",
+            TCCIR_DECODE_VREG_TYPE(vreg), vreg);
     exit(1);
   }
   return NULL;
 }
 
 static void tcc_ir_set_base_interval_end(TCCIRState *ir, int vreg) {
+  printf("Setting base interval end for vreg %d at instruction %d\n", vreg,
+         ir->next_instruction_index);
   IRLiveInterval *interval = tcc_ir_get_live_interval(ir, vreg);
   interval->end = ir->next_instruction_index;
 }
@@ -245,7 +246,8 @@ void tcc_ir_add_function_parameters(TCCIRState *ir, CType *func_type) {
       addr = (n + sn) * architecture_config.reg_size;
       sn += size;
     }
-    sym_push(sym->v & ~SYM_FIELD, type, VT_LOCAL | VT_LVAL, addr + 12);
+    sym_push(sym->v & ~SYM_FIELD, type, VT_LOCAL | VT_LVAL | VT_PARAM,
+             addr + 12);
   }
   ir->leaffunc = 1;
   ir->loc = 0;
@@ -320,7 +322,7 @@ void tcc_ir_gen_opi(TCCIRState *ir, int op) {
   if (ir_op == TCCIR_OP_CMP) {
     tcc_ir_put(ir, ir_op, &vtop[-1], &vtop[0], NULL);
     --vtop;
-    // vtop->r = VT_CMP;
+    vtop->r = VT_CMP;
     vtop->c.i = op;
     return;
   }
@@ -589,6 +591,7 @@ static void tcc_set_vreg_ignored(TCCIRState *ir, int vreg) {
 static int tcc_ir_find_live_interval(TCCIRState *ir, int vreg, int *start,
                                      int *end, int check_for_backwards_jumps) {
   int retval = 0;
+  printf("Finding live interval for vreg %d\n", vreg);
   IRLiveInterval *interval = tcc_ir_get_live_interval(ir, vreg);
 
   *start = interval->start;
@@ -609,32 +612,50 @@ static int tcc_ir_find_live_interval(TCCIRState *ir, int vreg, int *start,
 
 void tcc_ir_liveness_analysis(TCCIRState *ir) {
   int start, end;
-  tcc_ir_clear_live_intervals(ir);
+  tcc_ls_clear_live_intervals(&ir->ls);
   for (int vreg = 0; vreg < ir->next_local_variable; ++vreg) {
+    const int encoded_vreg = (TCCIR_VREG_TYPE_VAR << 28) | vreg;
+    printf("Analyzing live interval for local variable vreg %d\n", vreg);
     if (tcc_is_vreg_ignored(ir, vreg)) {
       continue;
     }
     start = 0;
     end = ~0;
-    if (tcc_ir_find_live_interval(ir, vreg, &start, &end, 1)) {
-      tcc_ls_add_live_interval(&ir->ls, vreg, start, end);
+    if (tcc_ir_find_live_interval(ir, encoded_vreg, &start, &end, 1)) {
+      tcc_ls_add_live_interval(&ir->ls, encoded_vreg, start, end);
     }
   }
 
   for (int vreg = 0; vreg < ir->next_temporary_variable; ++vreg) {
+    const int vreg_encoded = (TCCIR_VREG_TYPE_TEMP << 28) | vreg;
+    printf("Analyzing live interval for temporary variable vreg %d\n", vreg);
     if (tcc_is_vreg_ignored(ir, vreg)) {
       continue;
     }
     start = 0;
     end = ~0;
-    if (tcc_ir_find_live_interval(ir, vreg, &start, &end, 1)) {
-      tcc_ls_add_live_interval(&ir->ls, vreg, start, end);
+    if (tcc_ir_find_live_interval(ir, vreg_encoded, &start, &end, 1)) {
+      tcc_ls_add_live_interval(&ir->ls, vreg_encoded, start, end);
     }
+  }
+}
+
+void tcc_ir_patch_live_intervals_registers(TCCIRState *ir) {
+  for (int i = 0; i < ir->ls.next_interval_index; ++i) {
+    LSLiveInterval *interval = &ir->ls.intervals[i];
+    printf("Patching live interval for vreg %d: r0=%d, r1=%d, offset=%d\n",
+           interval->vreg, interval->r0, interval->r1,
+           interval->stack_location);
+    tcc_ir_assign_physical_register(ir, interval->vreg,
+                                    interval->stack_location, interval->r0,
+                                    interval->r1);
   }
 }
 
 void tcc_ir_assign_physical_register(TCCIRState *ir, int vreg, int offset,
                                      int r0, int r1) {
+  printf("Assigning physical registers to vreg %d: r0=%d, r1=%d, offset=%d\n",
+         vreg, r0, r1, offset);
   IRLiveInterval *interval = tcc_ir_get_live_interval(ir, vreg);
   interval->allocation.r0 = r0;
   interval->allocation.r1 = r1;
@@ -649,9 +670,10 @@ void tcc_ir_register_allocation_params(TCCIRState *ir) {
     int argno = 0; // pass argument size for double registers
     printf("param count: %d\n", ir->next_parameter);
     for (int vreg = 0; vreg < ir->next_parameter; ++vreg) {
+      const int encoded_vreg = (TCCIR_VREG_TYPE_PARAM << 28) | vreg;
       if (argno <= 3) {
         printf("Patching param vreg %d to r%d\n", vreg, argno);
-        tcc_ir_assign_physical_register(ir, vreg, 0, argno, -1);
+        tcc_ir_assign_physical_register(ir, encoded_vreg, 0, argno, -1);
       }
       ++argno;
     }
@@ -661,9 +683,11 @@ void tcc_ir_register_allocation_params(TCCIRState *ir) {
 void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv) {
   if (tcc_is_vreg_valid(ir, sv->vr)) {
     IRLiveInterval *interval = tcc_ir_get_live_interval(ir, sv->vr);
-    printf("Patching vreg %d from sv: r=%d, r2=%d, c.i=%d to r0: %d, r1: %d, "
+    printf("Patching vreg %d, type: %d from sv: r=%d, r2=%d, c.i=%d to r0: %d, "
+           "r1: %d, "
            "c.i: %d\n",
-           sv->vr, sv->r, sv->r2, sv->c.i, interval->allocation.r0,
+           TCCIR_DECODE_VREG_POSITION(sv->vr), TCCIR_DECODE_VREG_TYPE(sv->vr),
+           sv->r, sv->r2, sv->c.i, interval->allocation.r0,
            interval->allocation.r1, interval->allocation.offset);
     sv->r = interval->allocation.r0;
     sv->r2 = interval->allocation.r1;

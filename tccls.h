@@ -44,6 +44,7 @@ typedef struct LSLiveIntervalState {
 } LSLiveIntervalState;
 
 void tcc_ls_initialize(LSLiveIntervalState *ls);
+void tcc_ls_clear_live_intervals(LSLiveIntervalState *ls);
 
 void tcc_ls_add_live_interval(LSLiveIntervalState *ls, int vreg, int start,
                               int end);

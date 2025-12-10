@@ -431,7 +431,7 @@ typedef struct SValue {
   unsigned short r;  /* register + flags */
   unsigned short r2; /* second register, used for 'long long'
                         type. If not used, set to VT_CONST */
-  uint16_t vr;       /* virtual register for IR */
+  int vr;            /* virtual register for IR */
 
   union {
     struct {
@@ -473,6 +473,7 @@ typedef struct Sym {
   int v;            /* symbol token */
   unsigned short r; /* associated register or VT_CONST/VT_LOCAL and LVAL type */
   struct SymAttr a; /* symbol attributes */
+  int vreg;
   union {
     struct {
       int c; /* associated number or Elf symbol index */

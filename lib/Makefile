@@ -37,7 +37,7 @@ endif
 
 I386_O = libtcc1.o alloca.o alloca-bt.o $(COMMON_O)
 X86_64_O = libtcc1.o alloca.o alloca-bt.o $(COMMON_O)
-ARM_O = libtcc1.o armeabi.o alloca.o armflush.o $(COMMON_O)
+ARM_O = libtcc1.o alloca.o armflush.o $(COMMON_O)
 ARM64_O = lib-arm64.o $(COMMON_O)
 RISCV64_O = lib-arm64.o $(COMMON_O)
 COMMON_O = stdatomic.o atomic.o builtin.o
@@ -71,7 +71,7 @@ OBJ-arm-vfp = $(OBJ-arm)
 OBJ-arm-eabi = $(OBJ-arm)
 OBJ-arm-eabihf = $(OBJ-arm)
 OBJ-arm-wince = $(ARM_O) $(WIN_O)
-OBJ-armv8m = armeabi.o thumbflush.o alloca.o
+OBJ-armv8m = alloca.o
 OBJ-riscv64 = $(RISCV64_O) $(LIN_O)
 
 OBJ-extra = $(filter $(EXTRA_O),$(OBJ-$T))

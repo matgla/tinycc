@@ -40,9 +40,16 @@ void tcc_ls_initialize(LSLiveIntervalState *ls) {
   ls->next_active_index = 0;
 }
 
+void tcc_ls_clear_live_intervals(LSLiveIntervalState *ls) {
+  ls->next_interval_index = 0;
+  ls->next_active_index = 0;
+}
+
 void tcc_ls_add_live_interval(LSLiveIntervalState *ls, int vreg, int start,
                               int end) {
   LSLiveInterval *interval;
+  printf("Adding live interval for vreg %d: start=%d, end=%d\n", vreg, start,
+         end);
 
   if (ls->next_interval_index >= ls->intervals_size) {
     ls->intervals_size <<= 1;
@@ -120,5 +127,11 @@ void tcc_ls_allocate_registers(LSLiveIntervalState *ls) {
         sort_startpoints);
   for (int i = 0; i < ls->next_interval_index; ++i) {
     tcc_ls_expire_old_intervals(ls, i);
+
+    // add splling
+    ls->intervals[i].r0 = 2;
+    ls->active_set[ls->next_active_index++] = &ls->intervals[i];
+    qsort(ls->active_set, ls->next_active_index, sizeof(LSLiveInterval *),
+          sort_endpoints);
   }
 }
