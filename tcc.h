@@ -1836,6 +1836,7 @@ ST_FUNC void tcc_gen_machine_data_processing_op(TACQuadruple *q);
 ST_FUNC void tcc_gen_machine_load_op(TACQuadruple *q);
 ST_FUNC int tcc_gen_machine_number_of_registers(void);
 ST_FUNC void tcc_gen_machine_return_value_op(TACQuadruple *q);
+ST_FUNC void tcc_gen_machine_epilog(int leaffunc);
 
 #define stab_section s1->stab_section
 #define stabstr_section stab_section->link

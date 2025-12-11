@@ -732,4 +732,6 @@ void tcc_ir_generate_code(TCCIRState *ir) {
     }
     };
   }
+
+  tcc_gen_machine_epilog(ir->leaffunc);
 }

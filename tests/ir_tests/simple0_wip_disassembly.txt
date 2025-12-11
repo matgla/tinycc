@@ -1,10 +1,48 @@
 
-simple0_wip.o:     file format elf32-littlearm
+simple0.o:     file format elf32-littlearm
 
 
 Disassembly of section .text:
 
-00000000 <simple1>:
-   0:	4340      	muls	r0, r0
-   2:	f100 012a 	add.w	r1, r0, #42	@ 0x2a
-   6:	4608      	mov	r0, r1
+00000000 <simple0>:
+   0:	f243 0018 	movw	r0, #12312	@ 0x3018
+   4:	4770      	bx	lr
+
+00000006 <simple1>:
+   6:	4340      	muls	r0, r0
+   8:	f100 012a 	add.w	r1, r0, #42	@ 0x2a
+   c:	4608      	mov	r0, r1
+   e:	4770      	bx	lr
+
+00000010 <simple2>:
+  10:	1840      	adds	r0, r0, r1
+  12:	4600      	mov	r0, r0
+  14:	4770      	bx	lr
+
+00000016 <simple3>:
+  16:	fb00 f001 	mul.w	r0, r0, r1
+  1a:	1881      	adds	r1, r0, r2
+  1c:	4608      	mov	r0, r1
+  1e:	4770      	bx	lr
+
+00000020 <simple4>:
+  20:	1840      	adds	r0, r0, r1
+  22:	1881      	adds	r1, r0, r2
+  24:	18c8      	adds	r0, r1, r3
+  26:	4600      	mov	r0, r0
+  28:	4770      	bx	lr
+
+0000002a <simple5>:
+  2a:	fb00 f001 	mul.w	r0, r0, r1
+  2e:	fb02 f103 	mul.w	r1, r2, r3
+  32:	1842      	adds	r2, r0, r1
+  34:	eb02 00ff 	add.w	r0, r2, pc, ror #3
+  38:	4600      	mov	r0, r0
+  3a:	4770      	bx	lr
+
+0000003c <simple01>:
+  3c:	bf00      	nop
+  3e:	4801      	ldr	r0, [pc, #4]	@ (44 <simple01+0x8>)
+  40:	f000 b802 	b.w	48 <simple01+0xc>
+  44:	deadbeef 	cdple	14, 10, cr11, cr13, cr15, {7}
+  48:	4770      	bx	lr

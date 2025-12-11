@@ -6,7 +6,6 @@
     "configurations": [
         {
             "name": "Launch",
-            "type": "lldb",
             "request": "launch",
             "program": "armv8m-tcc",
             "args": [

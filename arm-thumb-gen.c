@@ -2302,6 +2302,11 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op) {
 
 ST_FUNC void tcc_gen_machine_return_value_op(TACQuadruple *q) {
   print_svalue(&q->src1);
+
+  if ((q->src1.r & VT_VALMASK) == VT_CONST) {
+    load(R0, &q->src1);
+    return;
+  }
   if (q->src1.pr0 >= 0) {
     ot_check(th_mov_reg(R0, q->src1.pr0, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
                         THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
@@ -2313,6 +2318,17 @@ ST_FUNC void tcc_gen_machine_return_value_op(TACQuadruple *q) {
 void tcc_gen_machine_load_op(TACQuadruple *op) {
   TRACE("'tcc_gen_machine_load_op'");
   load(op->dest.pr0, &op->src1);
+}
+
+ST_FUNC void tcc_gen_machine_epilog(int leaffunc) {
+  if (leaffunc) {
+    // leaf function epilog
+    ot_check(th_bx_reg(R_LR));
+    return;
+  }
+  TRACE("'tcc_gen_machine_epilog'");
+  // function epilog
+  ot_check(th_bx_reg(R_LR));
 }
 
 // r0 - function
