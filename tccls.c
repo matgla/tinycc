@@ -26,9 +26,6 @@
 
 #define LS_LIVE_INTERVAL_INIT_SIZE 64
 
-#define REGISTER_POOL_SIZE 11
-uint8_t register_pool[REGISTER_POOL_SIZE];
-
 void tcc_ls_initialize(LSLiveIntervalState *ls) {
   ls->intervals_size = LS_LIVE_INTERVAL_INIT_SIZE;
   ls->intervals =
@@ -87,10 +84,25 @@ static int sort_endpoints(const void *a, const void *b) {
   return 0;
 }
 
-void tcc_ls_register_pool_add(int reg) {
-  if (reg >= 0 && reg < REGISTER_POOL_SIZE) {
-    register_pool[reg] = 1;
+void tcc_ls_release_register(LSLiveIntervalState *ls, int reg) {
+  if (tcc_state->registers_map_for_allocator & ((uint64_t)1 << reg)) {
+    ls->registers_map |= ((uint64_t)1 << reg);
+    return;
   }
+  fprintf(stderr, "Error: trying to release unallocatable register %d\n", reg);
+  exit(1);
+}
+
+int tcc_ls_assign_register(LSLiveIntervalState *ls) {
+  for (int reg = 0; reg < tcc_state->registers_for_allocator; ++reg) {
+    if (tcc_state->registers_map_for_allocator & ((uint64_t)1 << reg)) {
+      if (ls->registers_map & ((uint64_t)1 << reg)) {
+        ls->registers_map &= ~((uint64_t)1 << reg);
+        return reg;
+      }
+    }
+  }
+  return -1;
 }
 
 void tcc_ls_expire_old_intervals(LSLiveIntervalState *ls, int current_index) {
@@ -108,9 +120,9 @@ void tcc_ls_expire_old_intervals(LSLiveIntervalState *ls, int current_index) {
     if (ls->active_set[i]->end >= current->start) {
       break;
     }
-    tcc_ls_register_pool_add(ls->active_set[i]->r0);
+    tcc_ls_release_register(ls, ls->active_set[i]->r0);
     if (ls->active_set[i]->r1 != 0) {
-      tcc_ls_register_pool_add(ls->active_set[i]->r1);
+      tcc_ls_release_register(ls, ls->active_set[i]->r1);
     }
     ls->active_set[i] = &dirty; // mark as removed
   }
@@ -122,14 +134,21 @@ void tcc_ls_expire_old_intervals(LSLiveIntervalState *ls, int current_index) {
 void tcc_ls_allocate_registers(LSLiveIntervalState *ls) {
   printf("Performing linear scan register allocation for %d intervals\n",
          ls->next_interval_index);
-  memset(register_pool, 0, REGISTER_POOL_SIZE);
+  // make all registers available at start
+  ls->registers_map = tcc_state->registers_map_for_allocator;
   qsort(ls->intervals, ls->next_interval_index, sizeof(LSLiveInterval),
         sort_startpoints);
   for (int i = 0; i < ls->next_interval_index; ++i) {
     tcc_ls_expire_old_intervals(ls, i);
 
-    // add splling
-    ls->intervals[i].r0 = 2;
+    ls->intervals[i].r0 = tcc_ls_assign_register(ls);
+    if (ls->intervals[i].r0 == -1) {
+
+      // add splling
+      fprintf(stderr, "Error: unable to allocate register for vreg %d\n",
+              ls->intervals[i].vreg);
+      exit(1);
+    }
     ls->active_set[ls->next_active_index++] = &ls->intervals[i];
     qsort(ls->active_set, ls->next_active_index, sizeof(LSLiveInterval *),
           sort_endpoints);

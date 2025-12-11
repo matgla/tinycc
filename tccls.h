@@ -41,6 +41,7 @@ typedef struct LSLiveIntervalState {
   int next_interval_index;
   LSLiveInterval **active_set;
   int next_active_index;
+  uint64_t registers_map;
 } LSLiveIntervalState;
 
 void tcc_ls_initialize(LSLiveIntervalState *ls);

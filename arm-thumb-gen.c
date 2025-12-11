@@ -74,6 +74,25 @@
 #define RC_IRE2 RC_R1 /* function return: second integer register */
 #define RC_FRET RC_F0 /* function return: float register */
 
+enum Armv8mRegisters {
+  ARM_R0 = 0,
+  ARM_R1 = 1,
+  ARM_R2 = 2,
+  ARM_R3 = 3,
+  ARM_R4 = 4,
+  ARM_R5 = 5,
+  ARM_R6 = 6,
+  ARM_R7 = 7,
+  ARM_R8 = 8,
+  ARM_R9 = 9,
+  ARM_R10 = 10,
+  ARM_R11 = 11,
+  ARM_R12 = 12,
+  ARM_SP = 13,
+  ARM_LR = 14,
+  ARM_PC = 15
+};
+
 /* pretty names for the registers */
 enum {
   TREG_R0 = 0,
@@ -464,6 +483,23 @@ ST_FUNC void arm_init(struct TCCState *s) {
   float_abi = s->float_abi;
   text_and_data_separation = s->text_and_data_separation;
   pic = s->pic;
+  s->parameters_registers = 4;
+  s->registers_map_for_allocator =
+      (1 << ARM_R0) | (1 << ARM_R1) | (1 << ARM_R2) | (1 << ARM_R3) |
+      (1 << ARM_R4) | (1 << ARM_R5) | (1 << ARM_R6) | (1 << ARM_R8) |
+      (1 << ARM_R10) | (1 << ARM_R11) | (1 << ARM_R12);
+
+  s->registers_for_allocator = 11;
+
+  if (!s->pic) {
+    s->registers_map_for_allocator |= (1 << ARM_R9);
+    s->registers_for_allocator += 1;
+  }
+
+  if (s->omit_frame_pointer) {
+    s->registers_map_for_allocator |= (1 << ARM_R7);
+    s->registers_for_allocator += 1;
+  }
 }
 
 static int regmask(int r) { return reg_classes[r] & ~(RC_INT | RC_FLOAT); }
@@ -2228,11 +2264,25 @@ ST_FUNC void gen_increment_tcov(SValue *sv) { TRACE("'gen_increment_tcov'"); }
 void tcc_gen_machine_data_processing_op(TACQuadruple *op) {
   switch (op->op) {
   case TCCIR_OP_ADD:
-    ot_check(th_add_imm(op->dest.r, op->src1.r, op->src2.c.i,
-                        FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    printf("gen_machine_data_processing_op: TCCIR_OP_ADD, type: 0x%x\n",
+           op->src2.r);
+    if ((op->src2.r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST) {
+      printf("gen_machine_data_processing_op: TCCIR_OP_ADD imm: %d, reg0: %d, "
+             "reg1: %d\n",
+             (int)op->src2.c.i, op->dest.pr0, op->src1.pr0);
+      ot_check(th_add_imm(op->dest.pr0, op->src1.pr0, op->src2.c.i,
+                          FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                          ENFORCE_ENCODING_NONE));
+    } else {
+      printf("gen_machine_data_processing_op: TCCIR_OP_ADD reg\n");
+      ot_check(th_add_reg(op->dest.pr0, op->src1.pr0, op->src2.pr0,
+                          FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                          ENFORCE_ENCODING_NONE));
+    }
+
     break;
   case TCCIR_OP_MUL:
-    ot_check(th_mul(op->dest.r, op->src1.r, op->src2.r,
+    ot_check(th_mul(op->dest.pr0, op->src1.pr0, op->src2.pr0,
                     FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
     break;
   case TCCIR_OP_ADC_USE:
@@ -2248,6 +2298,21 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op) {
            tcc_ir_get_op_name(op->op));
   }
   }
+}
+
+ST_FUNC void tcc_gen_machine_return_value_op(TACQuadruple *q) {
+  print_svalue(&q->src1);
+  if (q->src1.pr0 >= 0) {
+    ot_check(th_mov_reg(R0, q->src1.pr0, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                        THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
+  } // else {
+    //  load(R0, &q->src1);
+  //}
+}
+
+void tcc_gen_machine_load_op(TACQuadruple *op) {
+  TRACE("'tcc_gen_machine_load_op'");
+  load(op->dest.pr0, &op->src1);
 }
 
 // r0 - function

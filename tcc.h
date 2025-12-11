@@ -432,6 +432,8 @@ typedef struct SValue {
   unsigned short r2; /* second register, used for 'long long'
                         type. If not used, set to VT_CONST */
   int vr;            /* virtual register for IR */
+  uint8_t pr0;
+  uint8_t pr1;
 
   union {
     struct {
@@ -923,12 +925,18 @@ struct TCCState {
   int thumb_func;
   TCCIRState *ir;
   int rt_num_callers;
+  int parameters_registers;
+  int registers_for_allocator;
+  uint64_t registers_map_for_allocator;
+  uint8_t omit_frame_pointer;
 };
 
 struct filespec {
   char type;
   char name[1];
 };
+
+void print_svalue(SValue *v);
 
 /* The current value can be: */
 #define VT_VALMASK 0x003f /* mask for value location, register or: */
@@ -940,6 +948,7 @@ struct filespec {
 #define VT_CMP 0x0033    /* the value is stored in processor flags (in vc) */
 #define VT_JMP 0x0034    /* value is the consequence of jmp true (even) */
 #define VT_JMPI 0x0035   /* value is the consequence of jmp false (odd) */
+#define VT_PARAM 0x0080  /* register allocation */
 #define VT_LVAL 0x0100   /* var is an lvalue */
 #define VT_SYM 0x0200    /* a symbol value is added */
 #define VT_MUSTCAST                                                            \
@@ -955,7 +964,6 @@ struct filespec {
   0x8000 /* value is bounded. The address of the                               \
             bounding function call point is in vc */
 /* types */
-#define VT_PARAM 0x0080 /* register allocation */
 #define VT_BTYPE 0x000f /* mask for basic type */
 #define VT_VOID 0       /* void type */
 #define VT_BYTE 1       /* signed byte type */
@@ -980,7 +988,6 @@ struct filespec {
 #define VT_VOLATILE 0x0200 /* volatile modifier */
 #define VT_VLA 0x0400      /* VLA type (also has VT_PTR and VT_ARRAY) */
 #define VT_LONG 0x0800     /* long type (also has VT_INT rsp. VT_LLONG) */
-
 /* storage */
 #define VT_EXTERN 0x00001000  /* extern definition */
 #define VT_STATIC 0x00002000  /* static variable */
@@ -1826,7 +1833,9 @@ typedef struct TACQuadruple {
 } TACQuadruple;
 
 ST_FUNC void tcc_gen_machine_data_processing_op(TACQuadruple *q);
+ST_FUNC void tcc_gen_machine_load_op(TACQuadruple *q);
 ST_FUNC int tcc_gen_machine_number_of_registers(void);
+ST_FUNC void tcc_gen_machine_return_value_op(TACQuadruple *q);
 
 #define stab_section s1->stab_section
 #define stabstr_section stab_section->link

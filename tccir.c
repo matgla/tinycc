@@ -61,6 +61,7 @@ const IRRegistersConfig irop_config[] = {
     [TCCIR_OP_UDIV] = {1, 1, 1},
     [TCCIR_OP_CMP] = {0, 1, 1},
     [TCCIR_OP_RETURNVOID] = {0, 0, 0},
+    [TCCIR_OP_RETURNVALUE] = {0, 1, 0},
     [TCCIR_OP_JUMP] = {0, 0, 0},
     [TCCIR_OP_FUNCPARAMVOID] = {0, 0, 0},
     [TCCIR_OP_FUNCCALLVOID] = {0, 1, 0},
@@ -330,9 +331,12 @@ void tcc_ir_gen_opi(TCCIRState *ir, int op) {
   memset(&dest, 0, sizeof(SValue));
   dest.vr = tcc_ir_get_vreg_temp(ir);
   dest.type.t = vtop[-1].type.t;
+  print_svalue(&vtop[-1]);
+  print_svalue(&vtop[0]);
   tcc_ir_put(ir, ir_op, &vtop[-1], &vtop[0], &dest);
   vtop[-1].vr = dest.vr;
-  vtop[-1].r = 0;
+  vtop[-1].pr0 = 0;
+  vtop[-1].pr1 = 0;
   --vtop;
 }
 
@@ -380,6 +384,8 @@ const char *tcc_ir_get_op_name(TccIrOp op) {
     return "CMP";
   case TCCIR_OP_RETURNVOID:
     return "RETURNVOID";
+  case TCCIR_OP_RETURNVALUE:
+    return "RETURNVALUE";
   case TCCIR_OP_JUMP:
     return "JUMP";
   case TCCIR_OP_FUNCPARAMVOID:
@@ -388,6 +394,10 @@ const char *tcc_ir_get_op_name(TccIrOp op) {
     return "FUNCCALLVAL";
   case TCCIR_OP_FUNCCALLVOID:
     return "FUNCCALLVOID";
+  case TCCIR_OP_LOAD:
+    return "LOAD";
+  case TCCIR_OP_STORE:
+    return "STORE";
   default:
     return "UNKNOWN_OP";
   }
@@ -419,7 +429,7 @@ void tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2,
     }
     q->src1 = *src1;
     printf("  src1 vr: %d, id: %d, src1->r: %d, src1->c.i: %ld\n", src1->vr,
-           pos, src1->r, src1->c.i);
+           pos, src1->pr0, src1->pr1);
     if (tcc_is_vreg_valid(ir, src1->vr)) {
       tcc_ir_set_base_interval_end(ir, src1->vr);
     }
@@ -435,7 +445,7 @@ void tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2,
     }
     q->src2 = *src2;
     printf("  src2 vr: %d, id: %d, src2->r: %d, src2->c.i: %ld\n", src2->vr,
-           pos, src2->r, src2->c.i);
+           pos, src2->pr0, src2->pr1);
 
     if (tcc_is_vreg_valid(ir, src2->vr)) {
       tcc_ir_set_base_interval_end(ir, src2->vr);
@@ -452,8 +462,8 @@ void tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2,
       exit(1);
     }
     q->dest = *dest;
-    printf("  dest vr: %d, id: %d, dest->r: %d, dest->c.i: %ld\n", dest->vr,
-           pos, src2->r, src2->c.i);
+    printf("  dest vr: %d, id: %d, dest->r0: %d, dest->r1: %ld\n", dest->vr,
+           pos, dest->pr0, dest->pr1);
 
     dest_interval = tcc_ir_get_live_interval(ir, dest->vr);
     if (tcc_is_vreg_valid(ir, dest->vr)) {
@@ -475,12 +485,12 @@ void tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2,
   }
 
   // physical registers were not assigned yet
-  q->src1.r = -1;
-  q->src1.r2 = -1;
-  q->src2.r = -1;
-  q->src2.r2 = -1;
-  q->dest.r = -1;
-  q->dest.r2 = -1;
+  q->src1.pr0 = -1;
+  q->src1.pr1 = -1;
+  q->src2.pr0 = -1;
+  q->src2.pr1 = -1;
+  q->dest.pr0 = -1;
+  q->dest.pr1 = -1;
 
   ++ir->next_instruction_index;
 }
@@ -687,10 +697,10 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv) {
            "r1: %d, "
            "c.i: %d\n",
            TCCIR_DECODE_VREG_POSITION(sv->vr), TCCIR_DECODE_VREG_TYPE(sv->vr),
-           sv->r, sv->r2, sv->c.i, interval->allocation.r0,
+           sv->pr0, sv->pr1, sv->c.i, interval->allocation.r0,
            interval->allocation.r1, interval->allocation.offset);
-    sv->r = interval->allocation.r0;
-    sv->r2 = interval->allocation.r1;
+    sv->pr0 = interval->allocation.r0;
+    sv->pr1 = interval->allocation.r1;
     sv->c.i = interval->allocation.offset;
   }
 }
@@ -709,6 +719,12 @@ void tcc_ir_generate_code(TCCIRState *ir) {
     case TCCIR_OP_MUL:
     case TCCIR_OP_ADD:
       tcc_gen_machine_data_processing_op(q);
+      break;
+    case TCCIR_OP_LOAD:
+      tcc_gen_machine_load_op(q);
+      break;
+    case TCCIR_OP_RETURNVALUE:
+      tcc_gen_machine_return_value_op(q);
       break;
     default: {
       printf("Unsupported operation in tcc_generate_code: %s\n",

@@ -97,6 +97,36 @@ static CString initstr;
 #define VT_PTRDIFF_T (VT_LONG | VT_LLONG)
 #endif
 
+const char *get_value_type(int r) {}
+void print_svalue(SValue *sv) {
+  printf("SValue: type=");
+  printf(" r=0x%x r2=0x%x vr=%d ", sv->r, sv->r2, sv->vr);
+  if (sv->r & VT_CONST) {
+    printf(" constant=");
+    switch (sv->type.t & VT_BTYPE) {
+    case VT_INT:
+    case VT_LONG:
+    case VT_LLONG:
+      printf("%lld", (long long)sv->c.i);
+      break;
+    case VT_FLOAT:
+      printf("%f", sv->c.f);
+      break;
+    case VT_DOUBLE:
+      printf("%f", sv->c.d);
+      break;
+    case VT_LDOUBLE:
+      printf("%Lf", sv->c.ld);
+      break;
+    default:
+      printf("?");
+      break;
+    }
+  }
+
+  printf("\n");
+}
+
 static struct switch_t {
   struct case_t {
     int64_t v1, v2;
@@ -851,6 +881,7 @@ static void vsetc(CType *type, int r, CValue *vc) {
   vtop->r = r;
   vtop->r2 = VT_CONST;
   vtop->c = *vc;
+  vtop->vr = -1;
   vtop->sym = NULL;
 }
 
@@ -1691,7 +1722,7 @@ ST_FUNC int gv(int rc) {
   printf("gv(%d) called\n", rc);
   int r, r2, r_ok, r2_ok, rc2, bt;
   int bit_pos, bit_size, size, align;
-  int vreg;
+  int vreg = -1;
 
   /* NOTE: get_reg can modify vstack[] */
   if (vtop->type.t & VT_BITFIELD) {
@@ -1816,10 +1847,17 @@ ST_FUNC int gv(int rc) {
       done:
         vtop->type.t = original_type;
       } else {
+        if (vreg == -1) {
+          vreg = tcc_ir_get_vreg_temp(tcc_state->ir);
+        }
         if (vtop->r == VT_CMP)
           vset_VT_JMP();
         /* one register type load */
-        load(r, vtop);
+        // load(r, vtop);
+        SValue dest;
+        dest.type.t = vtop->type.t;
+        dest.vr = vreg;
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_LOAD, vtop, NULL, &dest);
       }
     }
     vtop->vr = vreg;
@@ -3034,8 +3072,8 @@ redo:
     }
   }
   // Make sure that we have converted to an rvalue:
-  if (vtop->r & VT_LVAL)
-    gv(is_float(vtop->type.t & VT_BTYPE) ? RC_FLOAT : RC_INT);
+  // if (vtop->r & VT_LVAL)
+  //   gv(is_float(vtop->type.t & VT_BTYPE) ? RC_FLOAT : RC_INT);
 }
 
 #if defined TCC_TARGET_ARM64 || defined TCC_TARGET_RISCV64 ||                  \
@@ -6080,6 +6118,7 @@ tok_next:
             if (reg_classes[r] & rc)
               break;
           vsetc(&ret.type, r, &ret.c);
+          vtop->vr = -1;
         }
         vsetc(&ret.type, ret.r, &ret.c);
         vtop->r2 = ret.r2;
@@ -6551,9 +6590,9 @@ ST_FUNC int expr_const(void) {
 
 /* ------------------------------------------------------------------------- */
 /* return from function */
-
 #ifndef TCC_TARGET_ARM64
 static void gfunc_return(CType *func_type) {
+
   if ((func_type->t & VT_BTYPE) == VT_STRUCT) {
     CType type, ret_type;
     int ret_align, ret_nregs, regsize;
@@ -6607,7 +6646,9 @@ static void gfunc_return(CType *func_type) {
       vtop -= ret_nregs - 1;
     }
   } else {
-    gv(RC_RET(func_type->t));
+    // function returns scalar value, but how to get it's value from IR?
+    // gv(RC_RET(func_type->t));
+    tcc_ir_put(tcc_state->ir, TCCIR_OP_RETURNVALUE, vtop, NULL, NULL);
   }
   vtop--; /* NOT vpop() because on x86 it would flush the fp stack */
   print_vstack("gfunc_return");
