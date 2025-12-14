@@ -2366,7 +2366,7 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers) {
     registers_to_push |= (1 << R12);
     registers_count++;
   }
-
+  th_sym_t();
   offset_to_args = registers_count * 4;
   if (registers_count > 0) {
     ot_check(th_push(registers_to_push));
@@ -2458,15 +2458,37 @@ static void gcall_or_jump(int is_jmp, SValue *dest) {
   }
 }
 
-ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q) {
+ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result) {
+  int registers_to_push = 0;
+  int registers_count = 0;
+
   for (int i = 0; i < function_argument_count; ++i) {
     TACQuadruple *q = &function_arguments[i];
     if (i < 4) {
-      load(q->src2.c.i - 1, &q->src1);
+      if (q->src1.pr0 != -1) {
+        ot_check(th_mov_reg(R0 + i, q->src1.pr0, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                            THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
+      } else {
+        load(R0 + i, &q->src1);
+      }
     }
   }
   function_argument_count = 0;
+  if (tcc_state->text_and_data_separation) {
+    // PIC handling
+    registers_to_push |= (1 << R9);
+    registers_count++;
+  }
+  if (registers_count % 2 != 0) {
+    registers_to_push |= (1 << R12);
+    registers_count++;
+  }
+  ot_check(th_push(registers_to_push));
   gcall_or_jump(0, &q->src1);
+  ot_check(th_pop(registers_to_push));
+  if (drop_result) {
+    return;
+  }
   if (q->dest.pr0 != R0) {
     ot_check(th_mov_reg(q->dest.pr0, R0, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
                         THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));

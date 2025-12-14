@@ -741,7 +741,7 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv) {
 
 void tcc_ir_generate_code(TCCIRState *ir) {
   TACQuadruple *q;
-
+  int drop_return_value = 0;
   // generate prolog
   tcc_gen_machine_prolog(ir->leaffunc, ir->ls.dirty_registers);
 
@@ -749,7 +749,8 @@ void tcc_ir_generate_code(TCCIRState *ir) {
     q = &ir->instructions[i];
     if (irop_config[q->op].has_src1 == 1) {
       tcc_ir_fill_registers(ir, &q->src1);
-      if (q->op != TCCIR_OP_FUNCCALLVAL && q->op != TCCIR_OP_FUNCCALLVOID) {
+      if (q->op != TCCIR_OP_FUNCCALLVAL && q->op != TCCIR_OP_FUNCCALLVOID &&
+          q->op != TCCIR_OP_FUNCPARAMVAL && q->op != TCCIR_OP_FUNCPARAMVOID) {
         if (tcc_ir_operand_in_memory(&q->src1)) {
           q->src1.pr0 = architecture_config.scratch_register;
           tcc_gen_machine_load_register(&q->src1);
@@ -790,14 +791,20 @@ void tcc_ir_generate_code(TCCIRState *ir) {
     case TCCIR_OP_FUNCPARAMVAL:
       tcc_gen_machine_func_param_op(q);
       break;
-    case TCCIR_OP_FUNCCALLVAL:
     case TCCIR_OP_FUNCCALLVOID:
+      drop_return_value = 1;
+    case TCCIR_OP_FUNCCALLVAL:
       // if return follows call then we can optimize away move
-      if (ir->instructions[i + 1].op == TCCIR_OP_RETURNVALUE) {
+      const TACQuadruple *ir_next = (i + 1 < ir->next_instruction_index)
+                                        ? &ir->instructions[i + 1]
+                                        : NULL;
+      if (ir_next && ir_next->op == TCCIR_OP_RETURNVALUE &&
+          ir_next->src1.vr == q->dest.vr) {
         q->dest.pr0 = REG_IRET;
         ++i; // skip next instruction
       }
-      tcc_gen_machine_func_call_op(q);
+
+      tcc_gen_machine_func_call_op(q, drop_return_value);
       break;
     default: {
       printf("Unsupported operation in tcc_generate_code: %s\n",
@@ -1037,5 +1044,21 @@ void tcc_print_quadruple(TACQuadruple *q, int pc) {
 void tcc_ir_show(TCCIRState *ir) {
   for (int i = 0; i < ir->next_instruction_index; i++) {
     tcc_print_quadruple(&ir->instructions[i], i);
+  }
+}
+
+void tcc_ir_drop_return_value(TCCIRState *ir) {
+  if (ir->next_instruction_index == 0) {
+    return;
+  }
+  TACQuadruple *last_instr = &ir->instructions[ir->next_instruction_index - 1];
+  if (last_instr->op == TCCIR_OP_FUNCCALLVAL) {
+    IRLiveInterval *interval =
+        tcc_ir_get_live_interval(ir, last_instr->dest.vr);
+    last_instr->op = TCCIR_OP_FUNCCALLVOID;
+    interval->start = 0;
+    interval->end = 0;
+    last_instr->dest.vr = -1;
+    last_instr->src1.vr = -1;
   }
 }

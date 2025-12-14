@@ -7259,6 +7259,7 @@ again:
           gexpr();
         } else {
           gexpr();
+          tcc_ir_drop_return_value(tcc_state->ir);
           vpop();
         }
         skip(';');

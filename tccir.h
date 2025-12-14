@@ -140,7 +140,7 @@ void tcc_ir_assign_physical_register(TCCIRState *ir, int vreg, int offset,
 const char *tcc_ir_get_op_name(TccIrOp op);
 void tcc_ir_patch_live_intervals_registers(TCCIRState *ir);
 void tcc_ir_show(TCCIRState *ir);
-
+void tcc_ir_drop_return_value(TCCIRState *ir);
 typedef enum TCCIR_VREG_TYPE {
   TCCIR_VREG_TYPE_VAR = 1,
   TCCIR_VREG_TYPE_TEMP = 2,

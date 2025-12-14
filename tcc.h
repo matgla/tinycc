@@ -1841,7 +1841,7 @@ ST_FUNC void tcc_gen_machine_return_value_op(TACQuadruple *q);
 ST_FUNC void tcc_gen_machine_epilog(int leaffunc);
 ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers);
 ST_FUNC void tcc_gen_machine_func_param_op(TACQuadruple *q);
-ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q);
+ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_value);
 
 #define stab_section s1->stab_section
 #define stabstr_section stab_section->link
