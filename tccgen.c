@@ -23,6 +23,8 @@
 
 #include "tccir.h"
 
+#define DEBUG_IR_GEN
+
 /********************************************************/
 /* global variables */
 
@@ -98,34 +100,6 @@ static CString initstr;
 #endif
 
 const char *get_value_type(int r) {}
-void print_svalue(SValue *sv) {
-  printf("SValue: type=");
-  printf(" r=0x%x r2=0x%x vr=%d ", sv->r, sv->r2, sv->vr);
-  if (sv->r & VT_CONST) {
-    printf(" constant=");
-    switch (sv->type.t & VT_BTYPE) {
-    case VT_INT:
-    case VT_LONG:
-    case VT_LLONG:
-      printf("%lld", (long long)sv->c.i);
-      break;
-    case VT_FLOAT:
-      printf("%f", sv->c.f);
-      break;
-    case VT_DOUBLE:
-      printf("%f", sv->c.d);
-      break;
-    case VT_LDOUBLE:
-      printf("%Lf", sv->c.ld);
-      break;
-    default:
-      printf("?");
-      break;
-    }
-  }
-
-  printf("\n");
-}
 
 static struct switch_t {
   struct case_t {
@@ -713,12 +687,11 @@ ST_FUNC Sym *sym_push(int v, CType *type, int r, int c) {
     if (r & VT_PARAM) {
       vreg = tcc_ir_get_vreg_param(tcc_state->ir);
       tcc_ir_assign_physical_register(tcc_state->ir, vreg, c, -1, -1);
-      printf("**** VReg <-- parameter \"%s\", got vreg type: %d, value: %d\n",
-             get_tok_str(v, NULL), TCCIR_DECODE_VREG_TYPE(vreg),
-             TCCIR_DECODE_VREG_POSITION(vreg));
+    } else {
+      vreg = tcc_ir_get_vreg_var(tcc_state->ir);
     }
   }
-  r &= ~VT_PARAM;
+  // r &= ~VT_PARAM;
 
   if (local_stack)
     ps = &local_stack;
@@ -1722,7 +1695,7 @@ ST_FUNC int gv(int rc) {
   printf("gv(%d) called\n", rc);
   int r, r2, r_ok, r2_ok, rc2, bt;
   int bit_pos, bit_size, size, align;
-  int vreg = -1;
+  int vreg = 0;
 
   /* NOTE: get_reg can modify vstack[] */
   if (vtop->type.t & VT_BITFIELD) {
@@ -1847,9 +1820,7 @@ ST_FUNC int gv(int rc) {
       done:
         vtop->type.t = original_type;
       } else {
-        if (vreg == -1) {
-          vreg = tcc_ir_get_vreg_temp(tcc_state->ir);
-        }
+        vreg = tcc_ir_get_vreg_temp(tcc_state->ir);
         if (vtop->r == VT_CMP)
           vset_VT_JMP();
         /* one register type load */
@@ -1935,6 +1906,7 @@ static void lbuild(int t) {
 static void gv_dup(void) {
   printf("gv_dup() called\n");
   int t, rc, r;
+  SValue sv;
 
   t = vtop->type.t;
 #if PTR_SIZE == 4
@@ -1959,13 +1931,14 @@ static void gv_dup(void) {
     return;
   }
 #endif
-  /* duplicate value */
-  rc = RC_TYPE(t);
-  gv(rc);
-  r = get_reg(rc);
+  sv.type.t = VT_INT;
+  sv.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+  sv.r = 0;
+  sv.c.i = 0;
+  tcc_ir_put(tcc_state->ir, TCCIR_OP_ASSIGN, vtop, NULL, &sv);
+  vtop->vr = sv.vr;
+  vtop->r = 0;
   vdup();
-  load(r, vtop);
-  vtop->r = r;
 }
 
 #if PTR_SIZE == 4
@@ -3689,15 +3662,7 @@ ST_FUNC void vstore(void) {
       gen_cast(&vtop[-1].type);
     }
 
-#ifdef CONFIG_TCC_BCHECK
-    /* bound check case */
-    if (vtop[-1].r & VT_MUSTBOUND) {
-      vswap();
-      gbound();
-      vswap();
-    }
-#endif
-    gv(RC_TYPE(dbt)); /* generate value */
+    // gv(RC_TYPE(dbt)); /* generate value */
 
     if (delayed_cast) {
       vtop->r |= BFVAL(VT_MUSTCAST, (sbt == VT_LLONG) + 1);
@@ -3730,7 +3695,12 @@ ST_FUNC void vstore(void) {
       store(vtop->r2, vtop - 1);
     } else {
       /* single word */
-      store(r, vtop - 1);
+      // store(r, vtop - 1);
+      int op = TCCIR_OP_STORE;
+      if ((vtop[-1].r & VT_VALMASK) == VT_LOCAL) {
+        op = TCCIR_OP_ASSIGN;
+      }
+      tcc_ir_put(tcc_state->ir, op, vtop, NULL, &vtop[-1]);
     }
     vswap();
     vtop--; /* NOT vpop() because on x86 it would flush the fp stack */
@@ -6063,13 +6033,22 @@ tok_next:
       p = NULL;
       if (tok != ')') {
         r = tcc_state->reverse_funcargs;
+        SValue num;
+        memset(&num, 0, sizeof(SValue));
+        num.vr = -1;
         for (;;) {
           if (r) {
             skip_or_save_block(&p2);
             p2->prev = p, p = p2;
           } else {
+            num.c.i = nb_args + 1;
             expr_eq();
             gfunc_param_typed(s, sa);
+            if (nb_args < 4) {
+              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num,
+                         NULL);
+              vtop--;
+            }
           }
           nb_args++;
           if (sa)
@@ -6098,7 +6077,34 @@ tok_next:
       }
 
       next();
-      gfunc_call(nb_args);
+      // gfunc_call(nb_args);
+      SValue num;
+      num.vr = -1;
+      if (nb_args > 4) {
+        for (int j = 0; n < nb_args - 4; j++) {
+          num.c.i = nb_args - j;
+          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL);
+          vtop--;
+        }
+      }
+
+      int return_vreg = -1;
+      if (vtop->type.t == VT_VOID) {
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, vtop, NULL, NULL);
+      } else {
+        SValue dest;
+        memset(&dest, 0, sizeof(SValue));
+        if (nb_args == 0) {
+          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVOID, NULL, NULL, NULL);
+        }
+        // perhaps this should be a correct type :(
+        dest.type.t = VT_INT;
+        dest.r = 0;
+        dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+        return_vreg = dest.vr;
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, vtop, NULL, &dest);
+      }
+      --vtop;
 
       if (ret_nregs < 0) {
         vsetc(&ret.type, ret.r, &ret.c);
@@ -6118,9 +6124,10 @@ tok_next:
             if (reg_classes[r] & rc)
               break;
           vsetc(&ret.type, r, &ret.c);
-          vtop->vr = -1;
+          vtop->vr = return_vreg;
         }
         vsetc(&ret.type, ret.r, &ret.c);
+        vtop->vr = return_vreg;
         vtop->r2 = ret.r2;
 
         /* handle packed struct return */
@@ -7700,6 +7707,7 @@ static void init_putv(init_params *p, CType *type, unsigned long c) {
     print_vstack("init_putv(2)");
   } else {
     vset(&dtype, VT_LOCAL | VT_LVAL, c);
+    vtop->vr = TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_VAR, c);
     vswap();
     vstore();
     vpop();
@@ -8042,7 +8050,11 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r,
       loc -= align;
     }
 #endif
-    loc = (loc - size) & -align;
+    if (!((r & VT_LVAL) && ((type->t & VT_BTYPE) != VT_STRUCT))) {
+      // allocate stack for variables that are not register allocation
+      // candidates
+      loc = (loc - size) & -align;
+    }
     addr = loc;
     p.local_offset = addr + size;
 #ifdef CONFIG_TCC_BCHECK
@@ -8268,13 +8280,15 @@ static void gen_function(Sym *sym) {
 
   /* push a dummy symbol to enable local sym storage */
   sym_push2(&local_stack, SYM_FIELD, 0, 0);
+#ifdef DEBUG_IR_GEN
+  printf("Generating IR for function %s\n", funcname);
+#endif
   ir = tcc_ir_allocate_block();
   tcc_state->ir = ir;
   tcc_ir_add_function_parameters(ir, &sym->type);
   local_scope = 1; /* for function parameters */
   nb_temp_local_vars = 0;
   if (!sym->a.naked) {
-    printf("Generate prolog for function %s\n", funcname);
     // gfunc_prolog(sym);
     tcc_debug_prolog_epilog(tcc_state, 0);
   }
@@ -8289,8 +8303,11 @@ static void gen_function(Sym *sym) {
   /* reset local stack */
   pop_local_syms(NULL, 0);
 
+#ifdef DEBUG_IR_GEN
+  tcc_ir_show(ir);
+#endif
   tcc_ir_liveness_analysis(ir);
-  tcc_ls_allocate_registers(&ir->ls);
+  tcc_ls_allocate_registers(&ir->ls, ir->parameters_count);
   tcc_ir_patch_live_intervals_registers(ir);
   tcc_ir_register_allocation_params(ir);
   tcc_ir_generate_code(ir);

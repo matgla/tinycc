@@ -432,8 +432,8 @@ typedef struct SValue {
   unsigned short r2; /* second register, used for 'long long'
                         type. If not used, set to VT_CONST */
   int vr;            /* virtual register for IR */
-  uint8_t pr0;
-  uint8_t pr1;
+  int8_t pr0;
+  int8_t pr1;
 
   union {
     struct {
@@ -929,14 +929,13 @@ struct TCCState {
   int registers_for_allocator;
   uint64_t registers_map_for_allocator;
   uint8_t omit_frame_pointer;
+  uint8_t need_frame_pointer;
 };
 
 struct filespec {
   char type;
   char name[1];
 };
-
-void print_svalue(SValue *v);
 
 /* The current value can be: */
 #define VT_VALMASK 0x003f /* mask for value location, register or: */
@@ -1687,6 +1686,7 @@ typedef struct ArchitectureConfig {
   int8_t pointer_size;
   int8_t stack_align;
   int8_t reg_size;
+  int8_t scratch_register;
   int8_t parameter_registers;
   int8_t has_fpu : 1;
 } ArchitectureConfig;
@@ -1834,9 +1834,14 @@ typedef struct TACQuadruple {
 
 ST_FUNC void tcc_gen_machine_data_processing_op(TACQuadruple *q);
 ST_FUNC void tcc_gen_machine_load_op(TACQuadruple *q);
+ST_FUNC void tcc_gen_machine_load_register(SValue *value);
+ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *q);
 ST_FUNC int tcc_gen_machine_number_of_registers(void);
 ST_FUNC void tcc_gen_machine_return_value_op(TACQuadruple *q);
 ST_FUNC void tcc_gen_machine_epilog(int leaffunc);
+ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers);
+ST_FUNC void tcc_gen_machine_func_param_op(TACQuadruple *q);
+ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q);
 
 #define stab_section s1->stab_section
 #define stabstr_section stab_section->link

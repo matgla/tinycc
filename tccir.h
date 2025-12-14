@@ -24,6 +24,8 @@
 
 #include "tccls.h"
 
+#define PREG_SPILLED 0x80
+
 typedef enum TccIrOp {
   TCCIR_OP_ADD,
   TCCIR_OP_ADC_USE,
@@ -49,10 +51,12 @@ typedef enum TccIrOp {
   TCCIR_OP_RETURNVALUE,
   TCCIR_OP_JUMP,
   TCCIR_OP_FUNCPARAMVOID,
+  TCCIR_OP_FUNCPARAMVAL,
   TCCIR_OP_FUNCCALLVOID,
   TCCIR_OP_FUNCCALLVAL,
   TCCIR_OP_LOAD,
   TCCIR_OP_STORE,
+  TCCIR_OP_ASSIGN,
 } TccIrOp;
 
 typedef struct CType CType;
@@ -81,6 +85,8 @@ typedef struct TCCIRState {
   uint8_t leaffunc : 1;
   uint8_t processing_if : 1;
   uint8_t check_for_backwards_jumps : 1;
+  uint8_t basic_block_start : 1;
+  uint8_t prevent_coalescing;
   int32_t loc;
 
   TACQuadruple *instructions;
@@ -133,6 +139,14 @@ void tcc_ir_assign_physical_register(TCCIRState *ir, int vreg, int offset,
                                      int r0, int r1);
 const char *tcc_ir_get_op_name(TccIrOp op);
 void tcc_ir_patch_live_intervals_registers(TCCIRState *ir);
+void tcc_ir_show(TCCIRState *ir);
+
+typedef enum TCCIR_VREG_TYPE {
+  TCCIR_VREG_TYPE_VAR = 1,
+  TCCIR_VREG_TYPE_TEMP = 2,
+  TCCIR_VREG_TYPE_PARAM = 3,
+} TCCIR_VREG_TYPE;
 
 #define TCCIR_DECODE_VREG_POSITION(vr) (vr & 0xFFFFFFF)
 #define TCCIR_DECODE_VREG_TYPE(vr) (vr >> 28)
+#define TCCIR_ENCODE_VREG(type, position) (((type) << 28) | (position))

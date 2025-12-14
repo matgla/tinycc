@@ -27,8 +27,8 @@
 // linear scan implementation for register allocation
 
 typedef struct LSLiveInterval {
-  uint16_t r0;             // physical register assigned
-  uint16_t r1;             // second physical register assigned (for long long)
+  int16_t r0;              // physical register assigned
+  int16_t r1;              // second physical register assigned (for long long)
   uint32_t vreg;           // virtual register number
   uint32_t stack_location; // stack location if spilled
   uint32_t start;          // start instruction index
@@ -42,6 +42,7 @@ typedef struct LSLiveIntervalState {
   LSLiveInterval **active_set;
   int next_active_index;
   uint64_t registers_map;
+  uint64_t dirty_registers;
 } LSLiveIntervalState;
 
 void tcc_ls_initialize(LSLiveIntervalState *ls);
@@ -49,4 +50,5 @@ void tcc_ls_clear_live_intervals(LSLiveIntervalState *ls);
 
 void tcc_ls_add_live_interval(LSLiveIntervalState *ls, int vreg, int start,
                               int end);
-void tcc_ls_allocate_registers(LSLiveIntervalState *ls);
+void tcc_ls_allocate_registers(LSLiveIntervalState *ls,
+                               int used_parameters_registers);

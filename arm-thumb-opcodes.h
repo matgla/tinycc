@@ -75,11 +75,15 @@
 #define R8 8
 #define R9 9
 #define R10 10
-#define R_FP 11
-#define R_IP 12
+#define R11 11
+#define R12 12
+#define R_IP R12
 #define R_SP 13
 #define R_LR 14
 #define R_PC 15
+
+#define R_IP R12
+#define R_FP R7
 
 typedef enum {
   FLAGS_BEHAVIOUR_NOT_IMPORTANT = 0,

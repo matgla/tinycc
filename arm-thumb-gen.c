@@ -193,7 +193,15 @@ enum float_abi float_abi;
 unsigned char text_and_data_separation;
 unsigned char pic;
 
+int offset_to_args = 0;
+
 flags_behaviour g_setflags = FLAGS_BEHAVIOUR_SET;
+
+uint32_t caller_saved_registers;
+uint32_t pushed_registers;
+
+TACQuadruple function_arguments[4];
+int function_argument_count = 0;
 
 ST_DATA const int reg_classes[NB_REGS] = {
     /* r0 */ RC_INT | RC_R0,
@@ -490,6 +498,8 @@ ST_FUNC void arm_init(struct TCCState *s) {
       (1 << ARM_R10) | (1 << ARM_R11) | (1 << ARM_R12);
 
   s->registers_for_allocator = 11;
+  caller_saved_registers =
+      (1 << ARM_R0) | (1 << ARM_R1) | (1 << ARM_R2) | (1 << ARM_R3);
 
   if (!s->pic) {
     s->registers_map_for_allocator |= (1 << ARM_R9);
@@ -1668,6 +1678,10 @@ void load(int r, SValue *sv) {
     fc = -fc;
   }
 
+  if (sv->r & VT_PARAM) {
+    fc += offset_to_args;
+  }
+
   v = fr & VT_VALMASK;
 
   // load lvalue from
@@ -2301,12 +2315,14 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op) {
 }
 
 ST_FUNC void tcc_gen_machine_return_value_op(TACQuadruple *q) {
-  print_svalue(&q->src1);
-
   if ((q->src1.r & VT_VALMASK) == VT_CONST) {
     load(R0, &q->src1);
     return;
   }
+
+  if (q->src1.pr0 == R0)
+    return;
+
   if (q->src1.pr0 >= 0) {
     ot_check(th_mov_reg(R0, q->src1.pr0, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
                         THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
@@ -2320,15 +2336,81 @@ void tcc_gen_machine_load_op(TACQuadruple *op) {
   load(op->dest.pr0, &op->src1);
 }
 
+ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers) {
+  printf("'tcc_gen_machine_prolog' leaffunc: %d, used_registers: 0x%llx\n",
+         leaffunc, used_registers);
+  memset(function_arguments, 0, sizeof(function_arguments));
+  uint16_t registers_to_push = 0;
+  int registers_count = 0;
+  if (!leaffunc) {
+    registers_to_push |= (1 << R_LR);
+    registers_count++;
+  }
+
+  if (tcc_state->need_frame_pointer) {
+    registers_to_push |= (1 << R_FP);
+    registers_count++;
+  }
+
+  for (int i = R4; i <= R11; ++i) {
+    if (tcc_state->text_and_data_separation && i == R9)
+      continue;
+    if (!tcc_state->omit_frame_pointer && i == R_FP)
+      continue;
+    if (used_registers & (1ULL << i)) {
+      registers_to_push |= (1 << i);
+      registers_count++;
+    }
+  }
+  if (registers_count % 2 != 0) {
+    registers_to_push |= (1 << R12);
+    registers_count++;
+  }
+
+  offset_to_args = registers_count * 4;
+  if (registers_count > 0) {
+    ot_check(th_push(registers_to_push));
+  }
+  pushed_registers = registers_to_push;
+
+  if (tcc_state->need_frame_pointer) {
+    if (!ot(th_add_imm(R_FP, R_SP, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                       ENFORCE_ENCODING_NONE))) {
+      // todo mov fp, sp
+      // load r12 immediate
+      // add fp, sp, r12
+      fprintf(stderr, "compiler_error: prolog frame pointer setup failed\n");
+      exit(1);
+    }
+  }
+}
+
 ST_FUNC void tcc_gen_machine_epilog(int leaffunc) {
-  if (leaffunc) {
-    // leaf function epilog
-    ot_check(th_bx_reg(R_LR));
+  TRACE("'tcc_gen_machine_epilog'");
+  int lr_saved = pushed_registers & (1 << R_LR);
+
+  if (lr_saved) {
+    pushed_registers |= 1 << R_PC;
+    pushed_registers &= ~(1 << R_LR);
+    ot_check(th_pop(pushed_registers));
     return;
   }
-  TRACE("'tcc_gen_machine_epilog'");
-  // function epilog
+  if (pushed_registers > 0) {
+    ot_check(th_pop(pushed_registers));
+  }
   ot_check(th_bx_reg(R_LR));
+}
+
+ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *op) {
+  if ((op->src1.r & VT_VALMASK) == VT_CONST) {
+    load(op->dest.pr0, &op->src1);
+    return;
+  }
+  if (op->dest.pr0 == op->src1.pr0)
+    return;
+
+  ot_check(th_mov_reg(op->dest.pr0, op->src1.pr0, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                      THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
 }
 
 // r0 - function
@@ -2345,5 +2427,50 @@ ST_FUNC void tcc_gen_machine_epilog(int leaffunc) {
 // r10 - lrsa
 
 ST_FUNC int tcc_gen_machine_number_of_registers(void) { return 11; }
+
+ST_FUNC void tcc_gen_machine_load_register(SValue *sv) { load(sv->pr0, sv); }
+
+ST_FUNC void tcc_gen_machine_func_param_op(TACQuadruple *q) {
+  // cache argument for register passing
+  function_arguments[function_argument_count++] = *q;
+}
+
+static void gcall_or_jump(int is_jmp, SValue *dest) {
+  if ((dest->r & (VT_VALMASK | VT_LVAL)) == VT_CONST) {
+    uint32_t x = th_encbranch(ind, ind + dest->c.i);
+
+    TRACE("gcall_or_jmp: %d, ind: 0x%x, 0x%x", is_jmp, ind, x);
+    if (x) {
+      if (dest->r & VT_SYM)
+        greloc(cur_text_section, dest->sym, ind, R_ARM_THM_JUMP24);
+      ot_check(th_bl_t1(x));
+    }
+  } else {
+    fprintf(stderr, "compiler_error: implement gcall_or_jmp for non-const\n");
+    exit(1);
+    // int r = gv(RC_INT);
+    // TRACE("gcall_or_jmp indirect call");
+    // ot_check(th_orr_imm(r, r, 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT));
+    // if (!is_jmp)
+    // ot_check(th_blx_reg(intr(r)));
+    // else
+    // ot_check(th_bx_reg(intr(r)));
+  }
+}
+
+ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q) {
+  for (int i = 0; i < function_argument_count; ++i) {
+    TACQuadruple *q = &function_arguments[i];
+    if (i < 4) {
+      load(q->src2.c.i - 1, &q->src1);
+    }
+  }
+  function_argument_count = 0;
+  gcall_or_jump(0, &q->src1);
+  if (q->dest.pr0 != R0) {
+    ot_check(th_mov_reg(q->dest.pr0, R0, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                        THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
+  }
+}
 
 #endif // TARGET_DEFS_ONLY

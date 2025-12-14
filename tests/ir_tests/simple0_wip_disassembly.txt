@@ -1,48 +1,50 @@
 
-simple0.o:     file format elf32-littlearm
+simple0_wip.o:     file format elf32-littlearm
 
 
 Disassembly of section .text:
 
-00000000 <simple0>:
-   0:	f243 0018 	movw	r0, #12312	@ 0x3018
+00000000 <sum>:
+   0:	1842      	adds	r2, r0, r1
+   2:	4610      	mov	r0, r2
    4:	4770      	bx	lr
 
-00000006 <simple1>:
-   6:	4340      	muls	r0, r0
-   8:	f100 012a 	add.w	r1, r0, #42	@ 0x2a
-   c:	4608      	mov	r0, r1
-   e:	4770      	bx	lr
+00000006 <main>:
+   6:	e92d 5000 	stmdb	sp!, {ip, lr}
+   a:	bf00      	nop
+   c:	f8df c004 	ldr.w	ip, [pc, #4]	@ 14 <main+0xe>
+  10:	f000 b802 	b.w	18 <main+0x12>
+  14:	00000000 	andeq	r0, r0, r0
+  18:	bf00      	nop
+  1a:	4801      	ldr	r0, [pc, #4]	@ (20 <main+0x1a>)
+  1c:	f000 b802 	b.w	24 <main+0x1e>
+  20:	00000000 	andeq	r0, r0, r0
+  24:	f7ff fffe 	bl	0 <printf>
+  28:	4602      	mov	r2, r0
+  2a:	2001      	movs	r0, #1
+  2c:	2102      	movs	r1, #2
+  2e:	f7ff fffe 	bl	0 <sum>
+  32:	4602      	mov	r2, r0
+  34:	f8df c004 	ldr.w	ip, [pc, #4]	@ 3c <main+0x36>
+  38:	f000 b802 	b.w	40 <main+0x3a>
+  3c:	00000000 	andeq	r0, r0, r0
+  40:	bf00      	nop
+  42:	4801      	ldr	r0, [pc, #4]	@ (48 <main+0x42>)
+  44:	f000 b802 	b.w	4c <main+0x46>
+  48:	00000000 	andeq	r0, r0, r0
+  4c:	6839      	ldr	r1, [r7, #0]
+  4e:	f7ff fffe 	bl	0 <printf>
+  52:	e8bd 9000 	ldmia.w	sp!, {ip, pc}
 
-00000010 <simple2>:
-  10:	1840      	adds	r0, r0, r1
-  12:	4600      	mov	r0, r0
-  14:	4770      	bx	lr
+Disassembly of section .rodata:
 
-00000016 <simple3>:
-  16:	fb00 f001 	mul.w	r0, r0, r1
-  1a:	1881      	adds	r1, r0, r2
-  1c:	4608      	mov	r0, r1
-  1e:	4770      	bx	lr
+00000000 <L.3>:
+   0:	6c6c6548 	stclvs	5, cr6, [ip], #-288	@ 0xfffffee0
+   4:	6f77206f 	svcvs	0x0077206f
+   8:	0a646c72 	beq	191b1d8 <L.4+0x191b1cb>
+	...
 
-00000020 <simple4>:
-  20:	1840      	adds	r0, r0, r1
-  22:	1881      	adds	r1, r0, r2
-  24:	18c8      	adds	r0, r1, r3
-  26:	4600      	mov	r0, r0
-  28:	4770      	bx	lr
-
-0000002a <simple5>:
-  2a:	fb00 f001 	mul.w	r0, r0, r1
-  2e:	fb02 f103 	mul.w	r1, r2, r3
-  32:	1842      	adds	r2, r0, r1
-  34:	eb02 00ff 	add.w	r0, r2, pc, ror #3
-  38:	4600      	mov	r0, r0
-  3a:	4770      	bx	lr
-
-0000003c <simple01>:
-  3c:	bf00      	nop
-  3e:	4801      	ldr	r0, [pc, #4]	@ (44 <simple01+0x8>)
-  40:	f000 b802 	b.w	48 <simple01+0xc>
-  44:	deadbeef 	cdple	14, 10, cr11, cr13, cr15, {7}
-  48:	4770      	bx	lr
+0000000d <L.4>:
+   d:	3a6d7553 	bcc	1b5d561 <L.4+0x1b5d554>
+  11:	0a642520 	beq	1909499 <L.4+0x190948c>
+	...

@@ -5,16 +5,33 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Launch",
+            "name": "(gdb) Launch",
+            "type": "cppdbg",
             "request": "launch",
-            "program": "armv8m-tcc",
+            "program": "${workspaceFolder}/armv8m-tcc",
             "args": [
                 "-c",
-                "tests/ir_tests/simple0.c",
+                "${workspaceFolder}/tests/ir_tests/simple0.c",
                 "-o",
-                "tests/ir_tests/simple0.o"
+                "${workspaceFolder}/tests/ir_tests/simple0.o",
             ],
-            "cwd": "${workspaceRoot}"
+            "stopAtEntry": false,
+            "cwd": "${fileDirname}",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Set Disassembly Flavor to Intel",
+                    "text": "-gdb-set disassembly-flavor intel",
+                    "ignoreFailures": true
+                }
+            ]
         }
     ]
 }

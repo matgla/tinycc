@@ -1,14 +1,10 @@
+#include <stdio.h>
 
-int simple0() { return 12312; }
+int sum(int a, int b) { return a + b; }
 
-int simple1(int x) { return 42 + x * x; }
-
-int simple2(int x, int y) { return x + y; }
-
-int simple3(int x, int y, int z) { return x * y + z; }
-
-int simple4(int x, int y, int z, int w) { return x + y + z + w; }
-
-int simple5(int x, int y, int z, int w, int u) { return x * y + z * w + u; }
-
-int simple01() { return 0xdeadbeef; }
+int main(int argc, char *argv[]) {
+  printf("Hello world\n");
+  int x = sum(1, 2);
+  printf("Sum: %d\n", x);
+  return 0;
+}

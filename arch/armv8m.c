@@ -20,10 +20,13 @@
 
 #include "tcc.h"
 
+#include "arm-thumb-opcodes.h"
+
 const ArchitectureConfig architecture_config = {
     .pointer_size = 4,
     .stack_align = 8,
     .reg_size = 4,
+    .scratch_register = R_IP,
     .parameter_registers = 4,
     .has_fpu = 0,
 };
