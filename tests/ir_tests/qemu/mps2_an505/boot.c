@@ -21,9 +21,6 @@ const unsigned long vectors[] __attribute__((section(".text"))) = {
 
 #include <stdint.h>
 
-uint32_t stack[16 * 1024];
-extern uint32_t __StackTop = (uint32_t)&stack[16 * 1024];
-
 extern void _mainCRTStartup(int);
 
 void Reset_Handler(void) {

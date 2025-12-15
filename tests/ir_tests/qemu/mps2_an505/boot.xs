@@ -4,6 +4,7 @@
 .text
 .align 2
 .thumb_func
+.section .isr_vector
 .global __isr_vector
 __isr_vector:
     .long __StackTop            /* 0: Initial Stack Pointer */
@@ -117,3 +118,94 @@ HardFault_Handler:
     bkpt #0
 label:
     b label
+
+/* Default handler for all other interrupts */
+.macro def_irq_handler handler_name
+.weak \handler_name
+.type \handler_name, %function
+.thumb_func
+\handler_name:
+    b \handler_name
+.size \handler_name, . - \handler_name
+.endm
+
+/* Core Exception Handlers */
+def_irq_handler NMI_Handler
+def_irq_handler MemManage_Handler
+def_irq_handler BusFault_Handler
+def_irq_handler UsageFault_Handler
+def_irq_handler SecureFault_Handler
+def_irq_handler SVC_Handler
+def_irq_handler DebugMon_Handler
+def_irq_handler PendSV_Handler
+def_irq_handler SysTick_Handler
+
+/* External Interrupt Handlers */
+def_irq_handler NONSEC_WATCHDOG_Handler
+def_irq_handler S32K_TIMER_Handler
+def_irq_handler TIMER0_Handler
+def_irq_handler TIMER1_Handler
+def_irq_handler DUALTIMER_Handler
+def_irq_handler MHU0_Handler
+def_irq_handler MHU1_Handler
+def_irq_handler CRYPTOCELL_Handler
+def_irq_handler MPC_Handler
+def_irq_handler PPC_Handler
+def_irq_handler MSC_Handler
+def_irq_handler BRIDGE_ERROR_Handler
+def_irq_handler INVALID_INSTR_CACHE_Handler
+def_irq_handler SYS_PPU_Handler
+def_irq_handler CPU0_PPU_Handler
+def_irq_handler CPU1_PPU_Handler
+def_irq_handler CPU0_DBG_PPU_Handler
+def_irq_handler CPU1_DBG_PPU_Handler
+def_irq_handler CRYPT_PPU_Handler
+def_irq_handler RAM0_PPU_Handler
+def_irq_handler RAM1_PPU_Handler
+def_irq_handler RAM2_PPU_Handler
+def_irq_handler RAM3_PPU_Handler
+def_irq_handler DEBUG_PPU_Handler
+def_irq_handler CPU0_CTI_Handler
+def_irq_handler CPU1_CTI_Handler
+
+/* GPIO Interrupt Handlers */
+def_irq_handler GPIO0_0_Handler
+def_irq_handler GPIO0_1_Handler
+def_irq_handler GPIO0_2_Handler
+def_irq_handler GPIO0_3_Handler
+def_irq_handler GPIO0_4_Handler
+def_irq_handler GPIO0_5_Handler
+def_irq_handler GPIO0_6_Handler
+def_irq_handler GPIO0_7_Handler
+def_irq_handler GPIO0_8_Handler
+def_irq_handler GPIO0_9_Handler
+def_irq_handler GPIO0_10_Handler
+def_irq_handler GPIO0_11_Handler
+def_irq_handler GPIO0_12_Handler
+def_irq_handler GPIO0_13_Handler
+def_irq_handler GPIO0_14_Handler
+def_irq_handler GPIO0_15_Handler
+def_irq_handler GPIO1_0_Handler
+def_irq_handler GPIO1_1_Handler
+def_irq_handler GPIO1_2_Handler
+def_irq_handler GPIO1_3_Handler
+def_irq_handler GPIO1_4_Handler
+def_irq_handler GPIO1_5_Handler
+def_irq_handler GPIO1_6_Handler
+def_irq_handler GPIO1_7_Handler
+def_irq_handler GPIO1_8_Handler
+def_irq_handler GPIO1_9_Handler
+def_irq_handler GPIO1_10_Handler
+def_irq_handler GPIO1_11_Handler
+def_irq_handler GPIO1_12_Handler
+def_irq_handler GPIO1_13_Handler
+def_irq_handler GPIO1_14_Handler
+def_irq_handler GPIO1_15_Handler
+
+/* UART Interrupt Handlers */
+def_irq_handler UART0_RX_Handler
+def_irq_handler UART0_TX_Handler
+def_irq_handler UART0_Combined_Handler
+def_irq_handler UART1_RX_Handler
+def_irq_handler UART1_TX_Handler
+def_irq_handler UART1_Combined_Handler

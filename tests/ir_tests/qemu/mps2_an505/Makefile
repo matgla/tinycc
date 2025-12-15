@@ -1,21 +1,27 @@
-CC := arm-none-eabi-gcc
-#../../../../armv8m-tcc
+CC := ../../../../armv8m-tcc
 
-CFLAGS = -g -fvisibility=hidden -nostdlib -mcpu=cortex-m33
-LDFLAGS = -g -fvisibility=hidden -nostdlib \
-		  -L/usr/arm-none-eabi/lib/thumb/v8-m.main+dp/softfp $(LIBS) -Wl,-Ttext=0x10000000
+ARM_SYSROOT = $(shell arm-none-eabi-gcc --print-sysroot)
+SYSROOT = $(shell realpath $(ARM_SYSROOT)/lib/thumb/v8-m.base/nofp)
+CRT_GCC = $(ARM_SYSROOT)/../lib/gcc/arm-none-eabi/14.2.1/thumb/v8-m.base/nofp
+
+CFLAGS = -nostdlib -g -fvisibility=hidden -mcpu=cortex-m33
+LDFLAGS = $(CFLAGS) -g -fvisibility=hidden 
 
 ifeq ($(CC),../../../../armv8m-tcc)
-LIBS = -llibc.a -llibrdimon.a -Wl,-oformat=elf32-littlearm
+CFLAGS += -I$(ARM_SYSROOT)/include -I../../../../include
+LDFLAGS += -L$(SYSROOT) -llibc.a -llibrdimon.a -Wl,-oformat=elf32-littlearm -Wl,-Ttext=0x10000000
 else
-LIBS = -lc -specs=rdimon.specs -Tlinker_script.ld
+LDFLAGS += -Wl,--start-group -lrdimon -lc_nano -lgcc -Wl,--end-group --specs=rdimon.specs -Tlinker_script.ld
 endif
 
 SRCS = $(wildcard *.c)
-OBJS = $(patsubst %.c, build/%.o, $(SRCS))
+ASMS = $(wildcard *.s)
+OBJS = $(patsubst %.c, build/%.o, $(SRCS)) 
+OBJS += $(patsubst %.s, build/%.o, $(ASMS))
+
+CRT_LIBS =  $(CRT_GCC)/crti.o $(CRT_GCC)/crtbegin.o $(SYSROOT)/rdimon-crt0.o $(CRT_GCC)/crtend.o $(CRT_GCC)/crtn.o
 
 TARGET = build/test
-
 
 # Rules
 all: $(TARGET)
@@ -24,8 +30,12 @@ build/%.o: %.c
 	mkdir -p build
 	$(CC) $(CFLAGS) -c $< -o $@
 
+build/%.o: %.s
+	mkdir -p build
+	$(CC) $(CFLAGS) -c $< -o $@
+
 $(TARGET): $(OBJS)
-	$(CC)  $^ /usr/arm-none-eabi/lib/thumb/v8-m.main+dp/softfp/rdimon-crt0.o -o $@ $(LDFLAGS)
+	$(CC) $^ $(CRT_LIBS) -o $@ $(LDFLAGS)
 
 clean:
 	rm -rf build
