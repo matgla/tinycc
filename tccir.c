@@ -777,6 +777,7 @@ void tcc_ir_generate_code(TCCIRState *ir) {
     switch (q->op) {
     case TCCIR_OP_MUL:
     case TCCIR_OP_ADD:
+    case TCCIR_OP_SUB:
       tcc_gen_machine_data_processing_op(q);
       break;
     case TCCIR_OP_LOAD:

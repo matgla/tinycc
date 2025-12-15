@@ -22,7 +22,7 @@
 #include "tccyaff.h"
 
 /* Define this to get some debug output during relocation processing.  */
-// #define DEBUG_RELOC
+#define DEBUG_RELOC
 
 /********************************************************/
 /* global variables */
@@ -2209,6 +2209,9 @@ static ElfW(Phdr) * fill_phdr(ElfW(Phdr) * ph, int type, Section *s) {
   if (s) {
     ph->p_offset = s->sh_offset;
     ph->p_vaddr = s->sh_addr;
+    printf("fill_phdr: section %s offset %lx addr %lx size %lx\n", s->name,
+           (unsigned long)ph->p_offset, (unsigned long)ph->p_vaddr,
+           (unsigned long)s->sh_size);
     ph->p_filesz = s->sh_size;
     ph->p_align = s->sh_addralign;
   }
@@ -2327,12 +2330,13 @@ static int layout_sections(TCCState *s1, int *sec_order, struct dyn_inf *d) {
 
       ph->p_offset = file_offset;
       ph->p_vaddr = addr;
+
       if (n == 0) {
         /* Make the first PT_LOAD segment include the program
            headers itself (and the ELF header as well), it'll
            come out with same memory use but will make various
            tools like binutils strip work better.  */
-        ph->p_offset = 0;
+        // ph->p_offset = 0;
         ph->p_vaddr = base;
       }
       ph->p_paddr = ph->p_vaddr;
@@ -2798,10 +2802,10 @@ static int elf_output_file(TCCState *s1, const char *filename) {
       if (elfint == NULL)
         elfint = DEFAULT_ELFINTERP(s1);
       /* add interpreter section only if executable */
-      interp = new_section(s1, ".interp", SHT_PROGBITS, SHF_ALLOC);
-      interp->sh_addralign = 1;
-      ptr = section_ptr_add(interp, 1 + strlen(elfint));
-      strcpy(ptr, elfint);
+      // interp = new_section(s1, ".interp", SHT_PROGBITS, SHF_ALLOC);
+      // interp->sh_addralign = 1;
+      // ptr = section_ptr_add(interp, 1 + strlen(elfint));
+      // strcpy(ptr, elfint);
       dyninf.interp = interp;
     }
 

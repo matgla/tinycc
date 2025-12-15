@@ -1,10 +1,17 @@
 #include <stdio.h>
 
-int sum(int a, int b) { return a + b; }
+int main() {
+  int a;
+  a = 42;
+  printf("%d\n", a);
 
-int main(int argc, char *argv[]) {
-  printf("Hello world\n");
-  int x = sum(1, 2);
-  printf("Sum: %d\n", x);
+  int b = 64;
+  printf("%d\n", b);
+
+  int c = 12, d = 34;
+  printf("%d, %d\n", c, d);
+
   return 0;
 }
+
+// vim: set expandtab ts=4 sw=3 sts=3 tw=80 :

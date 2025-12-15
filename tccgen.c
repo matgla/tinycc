@@ -159,9 +159,9 @@ static int is_compatible_types(CType *type1, CType *type2);
 static int parse_btype(CType *type, AttributeDef *ad, int ignore_label);
 static CType *type_decl(CType *type, AttributeDef *ad, int *v, int td);
 static void parse_expr_type(CType *type);
-static void init_putv(init_params *p, CType *type, unsigned long c);
+static void init_putv(init_params *p, CType *type, unsigned long c, int vreg);
 static void decl_initializer(init_params *p, CType *type, unsigned long c,
-                             int flags);
+                             int flags, int vreg);
 static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r,
                                    int has_init, int v, int scope);
 static int decl(int l);
@@ -1746,7 +1746,7 @@ ST_FUNC int gv(int rc) {
       offset = section_add(p.sec, size, align);
       vpush_ref(&vtop->type, p.sec, offset, size);
       vswap();
-      init_putv(&p, &vtop->type, offset);
+      init_putv(&p, &vtop->type, offset, -1);
       vtop->r |= VT_LVAL;
     }
 #ifdef CONFIG_TCC_BCHECK
@@ -7499,7 +7499,7 @@ static int decl_designator(init_params *p, CType *type, unsigned long c,
     flags &= ~DIF_CLEAR; /* mark stack dirty too */
   }
 
-  decl_initializer(p, type, c, flags & ~DIF_FIRST);
+  decl_initializer(p, type, c, flags & ~DIF_FIRST, -1);
 
   if (!(flags & DIF_SIZE_ONLY) && nb_elems > 1) {
     Sym aref = {0};
@@ -7517,7 +7517,7 @@ static int decl_designator(init_params *p, CType *type, unsigned long c,
       vset(type, VT_LOCAL | VT_LVAL, c);
     for (i = 1; i < nb_elems; i++) {
       vdup();
-      init_putv(p, type, c + elem_size * i);
+      init_putv(p, type, c + elem_size * i, -1);
     }
     vpop();
   }
@@ -7529,7 +7529,7 @@ static int decl_designator(init_params *p, CType *type, unsigned long c,
 }
 
 /* store a value or an expression directly in global data or in local array */
-static void init_putv(init_params *p, CType *type, unsigned long c) {
+static void init_putv(init_params *p, CType *type, unsigned long c, int vreg) {
   int bt;
   void *ptr;
   CType dtype;
@@ -7708,7 +7708,13 @@ static void init_putv(init_params *p, CType *type, unsigned long c) {
     print_vstack("init_putv(2)");
   } else {
     vset(&dtype, VT_LOCAL | VT_LVAL, c);
-    vtop->vr = TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_VAR, c);
+    if (vreg == -1) {
+      vtop->vr = tcc_ir_get_vreg_var(
+          tcc_state->ir); // TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_VAR, c);
+
+    } else {
+      vtop->vr = vreg;
+    }
     vswap();
     vstore();
     vpop();
@@ -7721,7 +7727,7 @@ static void init_putv(init_params *p, CType *type, unsigned long c) {
    dimension implicit array init handling). 'flags & DIF_SIZE_ONLY' is true if
    size only evaluation is wanted (only for arrays). */
 static void decl_initializer(init_params *p, CType *type, unsigned long c,
-                             int flags) {
+                             int flags, int vreg) {
   int len, n, no_oblock, i;
   int size1, align1;
   Sym *s, *f;
@@ -7829,7 +7835,7 @@ static void decl_initializer(init_params *p, CType *type, unsigned long c,
             else
               ch = ((nwchar_t *)initstr.data)[i];
             vpushi(ch);
-            init_putv(p, t1, c + i * size1);
+            init_putv(p, t1, c + i * size1, vreg);
           }
         }
       }
@@ -7901,7 +7907,7 @@ static void decl_initializer(init_params *p, CType *type, unsigned long c,
     if (flags & DIF_HAVE_ELEM)
       skip(';');
     next();
-    decl_initializer(p, type, c, flags & ~DIF_HAVE_ELEM);
+    decl_initializer(p, type, c, flags & ~DIF_HAVE_ELEM, vreg);
     skip('}');
 
   } else
@@ -7935,7 +7941,7 @@ static void decl_initializer(init_params *p, CType *type, unsigned long c,
       )
         vpop();
       else
-        init_putv(p, type, c);
+        init_putv(p, type, c, vreg);
     }
 }
 
@@ -7950,7 +7956,7 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r,
                                    int has_init, int v, int global) {
   int size, align, addr;
   TokenString *init_str = NULL;
-
+  int vreg = -1;
   Section *sec;
   Sym *flexible_array;
   Sym *sym;
@@ -8015,7 +8021,7 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r,
     /* compute size */
     begin_macro(init_str, 1);
     next();
-    decl_initializer(&p, type, 0, DIF_FIRST | DIF_SIZE_ONLY);
+    decl_initializer(&p, type, 0, DIF_FIRST | DIF_SIZE_ONLY, vreg);
     /* prepare second initializer parsing */
     macro_ptr = init_str->str;
     next();
@@ -8074,6 +8080,7 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r,
       }
 #endif
       sym = sym_push(v, type, r, addr);
+      vreg = sym->vreg;
       if (ad->cleanup_func) {
         Sym *cls =
             sym_push2(&all_cleanups, SYM_FIELD | ++cur_scope->cl.n, 0, 0);
@@ -8140,6 +8147,7 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r,
     if (v) {
       if (!sym) {
         sym = sym_push(v, type, r | VT_SYM, 0);
+        vreg = sym->vreg;
         patch_storage(sym, ad, NULL);
       }
       /* update symbol definition */
@@ -8194,7 +8202,7 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r,
     cur_scope->vla.num++;
   } else if (has_init) {
     p.sec = sec;
-    decl_initializer(&p, type, addr, DIF_FIRST);
+    decl_initializer(&p, type, addr, DIF_FIRST, vreg);
     /* patch flexible array member size back to -1, */
     /* for possible subsequent similar declarations */
     if (flexible_array)

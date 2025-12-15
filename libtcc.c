@@ -715,6 +715,7 @@ LIBTCCAPI TCCState *tcc_new(void) {
 #if defined(TCC_TARGET_ARM) || defined(TCC_TARGET_ARM_THUMB)
   s->float_abi = ARM_FLOAT_ABI;
 #if defined(TCC_TARGET_YASOS)
+  printf("Yasos ABI\n");
   s->text_and_data_separation = 1;
   s->pic = 1;
   s->section_align = 4;

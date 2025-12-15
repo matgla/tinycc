@@ -74,6 +74,23 @@
 #define RC_IRE2 RC_R1 /* function return: second integer register */
 #define RC_FRET RC_F0 /* function return: float register */
 
+typedef struct ThumbLiteralPoolEntry {
+  Sym *sym;
+  int relocation;
+  int patch_position;
+  int32_t imm;
+} ThumbLiteralPoolEntry;
+
+typedef struct ThumbGeneratorState {
+  uint8_t generating_function : 1;
+  int code_size;
+  ThumbLiteralPoolEntry *literal_pool;
+  int literal_pool_size;
+  int literal_pool_count;
+} ThumbGeneratorState;
+
+ThumbGeneratorState thumb_gen_state;
+
 enum Armv8mRegisters {
   ARM_R0 = 0,
   ARM_R1 = 1,
@@ -480,6 +497,15 @@ static int assign_regs(int nb_args, int float_abi, struct plan *plan,
   return nsaa;
 }
 
+static void th_literal_pool_init() {
+  thumb_gen_state.literal_pool_size = 64;
+  thumb_gen_state.literal_pool_count = 0;
+  thumb_gen_state.literal_pool = tcc_malloc(sizeof(ThumbLiteralPoolEntry) *
+                                            thumb_gen_state.literal_pool_size);
+  thumb_gen_state.generating_function = 0;
+  thumb_gen_state.code_size = 0;
+}
+
 ST_FUNC void arm_init(struct TCCState *s) {
   float_type.t = VT_FLOAT;
   double_type.t = VT_DOUBLE;
@@ -510,6 +536,8 @@ ST_FUNC void arm_init(struct TCCState *s) {
     s->registers_map_for_allocator |= (1 << ARM_R7);
     s->registers_for_allocator += 1;
   }
+
+  th_literal_pool_init();
 }
 
 static int regmask(int r) { return reg_classes[r] & ~(RC_INT | RC_FLOAT); }
@@ -535,11 +563,56 @@ void o(unsigned int i) {
   cur_text_section->data[ind++] = i >> 8;
 }
 
+static void th_literal_pool_generate(void) {
+  if (thumb_gen_state.literal_pool_count == 0) {
+    thumb_gen_state.code_size = 0;
+    return;
+  }
+  if (ind & 2) {
+    // align to 4 bytes
+    ot_check(th_mov_reg(R0, R0, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                        THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
+  }
+
+  th_sym_d();
+  for (int i = 0; i < thumb_gen_state.literal_pool_count; i++) {
+    ThumbLiteralPoolEntry *entry = &thumb_gen_state.literal_pool[i];
+    int value = entry->imm;
+
+    // patch the instruction that references this literal
+    // encode new imm8
+    uint16_t *patch_ins =
+        (uint16_t *)(cur_text_section->data + entry->patch_position);
+
+    printf("patching at pos 0x%x, old ins: 0x%x, new offset: %d, ind: %x\n",
+           entry->patch_position, *patch_ins, ind - entry->patch_position, ind);
+    *patch_ins |= (((ind - entry->patch_position - 4) >> 2) & 0x000f);
+
+    if (entry->relocation != -1) {
+      greloc(cur_text_section, entry->sym, ind, entry->relocation);
+    }
+    // write the literal value
+    o(value & 0xffff);
+    o((value >> 16) & 0xffff);
+  }
+  th_sym_t();
+}
+
 int is_valid_opcode(thumb_opcode op) { return (op.size == 2 || op.size == 4); }
 
 int ot(thumb_opcode op) {
   if (op.size == 0)
     return op.size;
+
+  if (thumb_gen_state.generating_function) {
+    thumb_gen_state.code_size += op.size;
+    // 16-bit encoding for ldr should be efficient
+    const int max_offset =
+        thumb_gen_state.code_size + thumb_gen_state.literal_pool_count * 4;
+    if (max_offset >= 1020) {
+      th_literal_pool_generate();
+    }
+  }
 
   if (op.size == 4)
     o(op.opcode >> 16);
@@ -1414,54 +1487,58 @@ static void load_vt_lval_vt_local_float(int r, SValue *sv, int ft, int fc,
   }
 }
 
+static ThumbLiteralPoolEntry *th_literal_pool_allocate() {
+  if (thumb_gen_state.literal_pool_count >= thumb_gen_state.literal_pool_size) {
+    const int new_size = thumb_gen_state.literal_pool_size << 1;
+    thumb_gen_state.literal_pool = tcc_realloc(
+        thumb_gen_state.literal_pool, new_size * sizeof(ThumbLiteralPoolEntry));
+    thumb_gen_state.literal_pool_size = new_size;
+  }
+  return &thumb_gen_state.literal_pool[thumb_gen_state.literal_pool_count++];
+}
+
 static void load_full_const(int r, int32_t imm, struct Sym *sym) {
   int est = 0;
   ElfSym *esym = elfsym(sym);
+  ThumbLiteralPoolEntry *entry = th_literal_pool_allocate();
   int sym_off = 0;
+
+  entry->sym = sym;
+  entry->imm = imm;
+  entry->patch_position = ind;
+
   TRACE("'load_full_const' to register: %d, with imm: %d\n", r, imm);
-  est = th_ldr_literal_estimate(r, 4);
-  est += 4; // branch instruction size
-  est += ind;
-  // 4-byte alignment
-  if (est & 3)
-    ot_check(th_nop(ENFORCE_ENCODING_16BIT));
-  ot_check(th_ldr_literal(r, 4, 1));
-  ot_check(th_b_t4(4));
+  // allocate space for T1 encoding
+  est = th_ldr_literal_estimate(r, 1020);
+  ot_check(th_ldr_literal(r, 0, 1));
 
   if (esym) {
     sym_off = esym->st_shndx;
   }
-
   if (!pic) {
-    if (sym)
-      greloc(cur_text_section, sym, ind, R_ARM_ABS32);
+    if (sym) {
+      entry->relocation = R_ARM_ABS32;
+    }
   } else {
     if (sym) {
       if (text_and_data_separation) {
         // all data except constants in .ro section can be addressed relative to
         // .got, how can I distinguish that situation?
         //
-
         if (sym->type.t & VT_STATIC && sym_off != cur_text_section->sh_num) {
-          greloc(cur_text_section, sym, ind, R_ARM_GOTOFF);
+          entry->relocation = R_ARM_GOTOFF;
         } else {
-          greloc(cur_text_section, sym, ind, R_ARM_GOT32);
+          entry->relocation = R_ARM_GOT32;
         }
-
       } else {
         if (sym->type.t & VT_STATIC) {
-          greloc(cur_text_section, sym, ind, R_ARM_REL32);
+          entry->relocation = R_ARM_REL32;
         } else {
-          greloc(cur_text_section, sym, ind, R_ARM_GOT_PREL);
+          entry->relocation = R_ARM_GOT_PREL;
         }
       }
     }
   }
-  th_sym_d();
-  // this immediate value will be relocated by the linker
-  o(imm & 0xffff);
-  o(imm >> 16);
-  th_sym_t();
 
   if (pic) {
     if (sym) {
@@ -1482,17 +1559,20 @@ static void load_full_const(int r, int32_t imm, struct Sym *sym) {
           } else {
             // size += o.size;
             // ot_check(o);
-            ot_check(th_b_t4(4));
-            th_sym_d();
+            // ot_check(th_b_t4(4));
+            // th_sym_d();
             // thus that immediate value must be preserved without linker touch
-            o(imm & 0xffff);
-            o(imm >> 16);
-            th_sym_t();
-            ot_check(th_ldr_imm(R_LR, R_PC, 8, 4, ENFORCE_ENCODING_NONE));
+            // o(imm & 0xffff);
+            // o(imm >> 16);
+            // th_sym_t();
+            ThumbLiteralPoolEntry *entry2 = th_literal_pool_allocate();
+            entry2->sym = NULL;
+            entry2->imm = imm;
+            entry2->patch_position = ind;
+            entry2->relocation = -1;
+            ot_check(th_ldr_literal(R_LR, 0, 1));
             ot_check(th_add_reg(r, r, R_LR, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
                                 THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-
-            // ot_check(th_bkpt(1));
           }
         }
       } else {
@@ -1511,12 +1591,12 @@ static void load_full_const(int r, int32_t imm, struct Sym *sym) {
           if (ot.size != 0) {
             ot_check(ot);
           } else {
-            ot_check(th_b_t4(4));
-            th_sym_d();
-            o(imm & 0xffff);
-            o(imm >> 16);
-            th_sym_t();
-            ot_check(th_ldr_imm(R_LR, R_PC, 8, 4, ENFORCE_ENCODING_NONE));
+            ThumbLiteralPoolEntry *entry2 = th_literal_pool_allocate();
+            entry2->sym = NULL;
+            entry2->imm = imm;
+            entry2->patch_position = ind;
+            entry2->relocation = -1;
+            ot_check(th_ldr_literal(R_LR, 0, 1));
             ot_check(th_add_reg(r, r, R_LR, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
                                 THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
           }
@@ -2223,7 +2303,7 @@ void gen_opf(int op) {
 //         break;
 //     }
 
-//     ot_check(th_push(1 << rr));
+//     ot_checr(th_push(1 << rr));
 //     ot_check(th_sdiv(rr, r, fr));
 //     ot_check(th_mul(fr, fr, rr, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
 //                     ENFORCE_ENCODING_NONE));
@@ -2275,25 +2355,33 @@ void gen_opf(int op) {
 
 ST_FUNC void gen_increment_tcov(SValue *sv) { TRACE("'gen_increment_tcov'"); }
 
+static int th_has_immediate_value(int r) {
+  return (r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST;
+}
+
 void tcc_gen_machine_data_processing_op(TACQuadruple *op) {
   switch (op->op) {
   case TCCIR_OP_ADD:
-    printf("gen_machine_data_processing_op: TCCIR_OP_ADD, type: 0x%x\n",
-           op->src2.r);
-    if ((op->src2.r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST) {
-      printf("gen_machine_data_processing_op: TCCIR_OP_ADD imm: %d, reg0: %d, "
-             "reg1: %d\n",
-             (int)op->src2.c.i, op->dest.pr0, op->src1.pr0);
+    if (th_has_immediate_value(op->src2.r)) {
       ot_check(th_add_imm(op->dest.pr0, op->src1.pr0, op->src2.c.i,
                           FLAGS_BEHAVIOUR_NOT_IMPORTANT,
                           ENFORCE_ENCODING_NONE));
     } else {
-      printf("gen_machine_data_processing_op: TCCIR_OP_ADD reg\n");
       ot_check(th_add_reg(op->dest.pr0, op->src1.pr0, op->src2.pr0,
                           FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
                           ENFORCE_ENCODING_NONE));
     }
-
+    break;
+  case TCCIR_OP_SUB:
+    if (th_has_immediate_value(op->src2.r)) {
+      ot_check(th_sub_imm(op->dest.pr0, op->src1.pr0, op->src2.c.i,
+                          FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                          ENFORCE_ENCODING_NONE));
+    } else {
+      ot_check(th_sub_reg(op->dest.pr0, op->src1.pr0, op->src2.pr0,
+                          FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                          ENFORCE_ENCODING_NONE));
+    }
     break;
   case TCCIR_OP_MUL:
     ot_check(th_mul(op->dest.pr0, op->src1.pr0, op->src2.pr0,
@@ -2342,6 +2430,10 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers) {
   memset(function_arguments, 0, sizeof(function_arguments));
   uint16_t registers_to_push = 0;
   int registers_count = 0;
+
+  thumb_gen_state.generating_function = 1;
+  thumb_gen_state.code_size = 0;
+
   if (!leaffunc) {
     registers_to_push |= (1 << R_LR);
     registers_count++;
@@ -2393,12 +2485,17 @@ ST_FUNC void tcc_gen_machine_epilog(int leaffunc) {
     pushed_registers |= 1 << R_PC;
     pushed_registers &= ~(1 << R_LR);
     ot_check(th_pop(pushed_registers));
+    th_literal_pool_generate();
+    thumb_gen_state.generating_function = 0;
+
     return;
   }
   if (pushed_registers > 0) {
     ot_check(th_pop(pushed_registers));
   }
   ot_check(th_bx_reg(R_LR));
+  th_literal_pool_generate();
+  thumb_gen_state.generating_function = 0;
 }
 
 ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *op) {
@@ -2474,7 +2571,7 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result) {
     }
   }
   function_argument_count = 0;
-  if (tcc_state->text_and_data_separation) {
+  if (tcc_state->text_and_data_separation && q->src1.type.t & VT_EXTERN) {
     // PIC handling
     registers_to_push |= (1 << R9);
     registers_count++;
@@ -2483,9 +2580,11 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result) {
     registers_to_push |= (1 << R12);
     registers_count++;
   }
-  ot_check(th_push(registers_to_push));
+  if (registers_count > 0)
+    ot_check(th_push(registers_to_push));
   gcall_or_jump(0, &q->src1);
-  ot_check(th_pop(registers_to_push));
+  if (registers_count > 0)
+    ot_check(th_pop(registers_to_push));
   if (drop_result) {
     return;
   }
