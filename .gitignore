@@ -70,3 +70,4 @@ tests/tests2/fred.txt
 libtcc.dylib
 build/
 rootfs/
+__pycache__/
