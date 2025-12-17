@@ -28,7 +28,7 @@ def prepare_test(machine, kernel_file):
     qemu_command = build_qemu_command(machine, kernel_file)
     return pexpect.spawn(qemu_command)
 
-def run_test(test_file, machine, timeout=1):
+def run_test(test_file, machine):
     test_name = Path(test_file).stem
     output_file = compile_testcase(CURRENT_DIR / test_file, machine)
     sut = prepare_test(machine, output_file)

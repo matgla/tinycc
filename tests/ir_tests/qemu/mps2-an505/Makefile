@@ -15,9 +15,12 @@ CRT_GCC = $(dir $(LIBGCC_PATH))/thumb/v8-m.base/nofp
 CFLAGS += -nostdlib -g -fvisibility=hidden -mcpu=cortex-m33
 LDFLAGS = $(CFLAGS) -g -fvisibility=hidden
 
+TCC_PATH = $(shell realpath $(MAKEFILE_DIR)../../../../)
+LIBC_INCLUDES = $(shell realpath $(MAKEFILE_DIR)../../libc_includes)
+
 ifneq (,$(findstring armv8m-tcc,$(CC)))
-CFLAGS += -I$(MAKEFILE_DIR)/../../libc_includes -I$(ARM_SYSROOT)/include -I$(MAKEFILE_DIR)../../../../include
-LDFLAGS += -L$(MAKEFILE_DIR)/../../../.. -L$(SYSROOT) -llibc.a -llibrdimon.a -larmv8m-libtcc1.a -Wl,-oformat=elf32-littlearm -Wl,-Ttext=0x10000000
+CFLAGS += -I$(LIBC_INCLUDES) -I$(ARM_SYSROOT)/include -I$(TCC_PATH)/include
+LDFLAGS += -L$(TCC_PATH) -L$(SYSROOT) -llibc.a -llibrdimon.a -larmv8m-libtcc1.a -Wl,-oformat=elf32-littlearm -Wl,-Ttext=0x10000000
 else
 LDFLAGS += -Wl,--start-group -lrdimon -lc_nano -lgcc -Wl,--end-group --specs=rdimon.specs -T$(MAKEFILE_DIR)linker_script.ld
 endif
