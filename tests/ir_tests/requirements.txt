@@ -1,0 +1,2 @@
+pexpect==4.9.0
+qemu.qmp==0.0.5

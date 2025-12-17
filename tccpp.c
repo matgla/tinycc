@@ -1640,8 +1640,6 @@ static int pragma_parse(TCCState *s1) {
         }
     }
     if (s) {
-      printf("pragma parse at[]: %d, s: %p, s->d: %p\n", v - TOK_IDENT, s,
-             s->d);
       table_ident[v - TOK_IDENT]->sym_define = s->d ? s : NULL;
     } else
       tcc_warning("unbalanced #pragma pop_macro");

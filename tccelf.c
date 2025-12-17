@@ -22,7 +22,7 @@
 #include "tccyaff.h"
 
 /* Define this to get some debug output during relocation processing.  */
-#define DEBUG_RELOC
+// #define DEBUG_RELOC
 
 /********************************************************/
 /* global variables */

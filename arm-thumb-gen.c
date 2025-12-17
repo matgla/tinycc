@@ -586,7 +586,7 @@ static void th_literal_pool_generate(void) {
 
     printf("patching at pos 0x%x, old ins: 0x%x, new offset: %d, ind: %x\n",
            entry->patch_position, *patch_ins, ind - entry->patch_position, ind);
-    *patch_ins |= (((ind - entry->patch_position - 4) >> 2) & 0x000f);
+    *patch_ins |= (((ind - entry->patch_position - 4 + i * 4) >> 2) & 0x000f);
 
     if (entry->relocation != -1) {
       greloc(cur_text_section, entry->sym, ind, entry->relocation);

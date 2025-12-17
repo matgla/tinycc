@@ -21,6 +21,18 @@ const unsigned long vectors[] __attribute__((section(".text"))) = {
 
 #include <stdint.h>
 
+// extern int __libc_init_array = 0;
+extern int __bss_start__ = 0;
+extern int __bss_end__ = 0;
+// extern int __libc_fini_array = 0;
+
+unsigned long heap[1024 * 32];
+
+unsigned long __end__ = (unsigned long)&heap[0] + sizeof(heap);
+unsigned long end = (unsigned long)&heap[0] + sizeof(heap);
+
+// extern int __errno = 0;
+
 extern void _mainCRTStartup(int);
 
 void Reset_Handler(void) {
