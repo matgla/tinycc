@@ -584,8 +584,6 @@ static void th_literal_pool_generate(void) {
     uint16_t *patch_ins =
         (uint16_t *)(cur_text_section->data + entry->patch_position);
 
-    printf("patching at pos 0x%x, old ins: 0x%x, new offset: %d, ind: %x\n",
-           entry->patch_position, *patch_ins, ind - entry->patch_position, ind);
     *patch_ins |= (((ind - entry->patch_position - 4 + i * 4) >> 2) & 0x000f);
 
     if (entry->relocation != -1) {
@@ -1488,13 +1486,17 @@ static void load_vt_lval_vt_local_float(int r, SValue *sv, int ft, int fc,
 }
 
 static ThumbLiteralPoolEntry *th_literal_pool_allocate() {
+  ThumbLiteralPoolEntry *entry;
   if (thumb_gen_state.literal_pool_count >= thumb_gen_state.literal_pool_size) {
     const int new_size = thumb_gen_state.literal_pool_size << 1;
     thumb_gen_state.literal_pool = tcc_realloc(
         thumb_gen_state.literal_pool, new_size * sizeof(ThumbLiteralPoolEntry));
     thumb_gen_state.literal_pool_size = new_size;
   }
-  return &thumb_gen_state.literal_pool[thumb_gen_state.literal_pool_count++];
+  entry = &thumb_gen_state.literal_pool[thumb_gen_state.literal_pool_count++];
+  memset(entry, 0, sizeof(ThumbLiteralPoolEntry));
+  entry->relocation = -1;
+  return entry;
 }
 
 static void load_full_const(int r, int32_t imm, struct Sym *sym) {
@@ -2387,6 +2389,14 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op) {
     ot_check(th_mul(op->dest.pr0, op->src1.pr0, op->src2.pr0,
                     FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
     break;
+  case TCCIR_OP_CMP:
+    if (th_has_immediate_value(op->src2.r)) {
+      ot_check(th_cmp_imm(op->src1.pr0, op->src2.c.i, ENFORCE_ENCODING_NONE));
+    } else {
+      ot_check(th_cmp_reg(op->src1.pr0, op->src2.pr0, THUMB_SHIFT_DEFAULT,
+                          ENFORCE_ENCODING_NONE));
+    }
+    break;
   case TCCIR_OP_ADC_USE:
     // return ot_check(th_adc_reg(intr(op->res), intr(op->arg1), intr(op->arg2),
     //  FLAGS_BEHAVIOUR_NOT_IMPORTANT,
@@ -2425,8 +2435,6 @@ void tcc_gen_machine_load_op(TACQuadruple *op) {
 }
 
 ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers) {
-  printf("'tcc_gen_machine_prolog' leaffunc: %d, used_registers: 0x%llx\n",
-         leaffunc, used_registers);
   memset(function_arguments, 0, sizeof(function_arguments));
   uint16_t registers_to_push = 0;
   int registers_count = 0;
@@ -2529,7 +2537,10 @@ ST_FUNC void tcc_gen_machine_load_register(SValue *sv) { load(sv->pr0, sv); }
 
 ST_FUNC void tcc_gen_machine_func_param_op(TACQuadruple *q) {
   // cache argument for register passing
-  function_arguments[function_argument_count++] = *q;
+  if (function_argument_count < 4) {
+    function_arguments[function_argument_count++] = *q;
+    return;
+  }
 }
 
 static void gcall_or_jump(int is_jmp, SValue *dest) {
@@ -2592,6 +2603,15 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result) {
     ot_check(th_mov_reg(q->dest.pr0, R0, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
                         THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
   }
+}
+
+ST_FUNC void tcc_gen_machine_jump_op(TACQuadruple *q) {
+  ot_check(th_b_t4(0)); // patch me later
+}
+
+ST_FUNC void tcc_gen_machine_conditional_jump_op(TACQuadruple *q) {
+  int op = mapcc(q->src1.c.i);
+  ot_check(th_b_t3(op, 0)); // patch me later
 }
 
 #endif // TARGET_DEFS_ONLY

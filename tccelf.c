@@ -738,7 +738,6 @@ ST_FUNC void put_elf_reloca(Section *symtab, Section *s, unsigned long offset,
   char buf[256];
   Section *sr;
   ElfW_Rel *rel;
-
   sr = s->reloc;
   if (!sr) {
     /* if no relocation section, create it */
@@ -2604,8 +2603,11 @@ static int tcc_output_elf(TCCState *s1, FILE *f, int phnum, ElfW(Phdr) * phdr) {
         offset++;
       }
       size = s->sh_size;
-      if (size)
-        offset += fwrite(s->data, 1, size, f);
+      if (size) {
+        const int to_write =
+            size < s->data_allocated ? size : s->data_allocated;
+        offset += fwrite(s->data, 1, to_write, f);
+      }
     }
   }
   return 0;

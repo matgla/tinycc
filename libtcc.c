@@ -983,6 +983,8 @@ ST_FUNC int tcc_add_crt(TCCState *s1, const char *filename) {
 /* the library name is the same as the argument of the '-l' option */
 LIBTCCAPI int tcc_add_library(TCCState *s, const char *libraryname) {
   static const char *const libs[] = {"%s/lib%s.so", "%s/lib%s.a", NULL};
+  printf("tcc_add_library: %s, with linking: %d\n", libraryname,
+         s->static_link);
   const char *const *pp = s->static_link ? libs + 1 : libs;
   int flags = s->filetype & AFF_WHOLE_ARCHIVE;
   while (*pp) {

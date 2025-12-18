@@ -50,6 +50,8 @@ typedef enum TccIrOp {
   TCCIR_OP_RETURNVOID,
   TCCIR_OP_RETURNVALUE,
   TCCIR_OP_JUMP,
+  TCCIR_OP_JUMPIF,
+  TCCIR_OP_TEST_ZERO,
   TCCIR_OP_FUNCPARAMVOID,
   TCCIR_OP_FUNCPARAMVAL,
   TCCIR_OP_FUNCCALLVOID,
@@ -123,8 +125,8 @@ int tcc_ir_gvtst(TCCIRState *ir, int inv, int t);
 
 void tcc_ir_gen_opi(TCCIRState *ir, int op);
 void tcc_ir_gen_opf(TCCIRState *ir, int op);
-void tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2,
-                SValue *dest);
+int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2,
+               SValue *dest);
 
 int tcc_ir_get_vreg_temp(TCCIRState *ir);
 int tcc_ir_get_vreg_var(TCCIRState *ir);
@@ -138,9 +140,14 @@ int tcc_ir_add_local_variable(TCCIRState *ir, Sym *sym, int stack_offset);
 void tcc_ir_assign_physical_register(TCCIRState *ir, int vreg, int offset,
                                      int r0, int r1);
 const char *tcc_ir_get_op_name(TccIrOp op);
-void tcc_ir_patch_live_intervals_registers(TCCIRState *ir);
 void tcc_ir_show(TCCIRState *ir);
 void tcc_ir_drop_return_value(TCCIRState *ir);
+
+void tcc_ir_patch_live_intervals_registers(TCCIRState *ir);
+void tcc_ir_backpatch(TCCIRState *ir, int t, int target_address);
+void tcc_ir_backpatch_to_here(TCCIRState *ir, int t);
+int tcc_ir_generate_test(TCCIRState *ir, int inv, int t);
+
 typedef enum TCCIR_VREG_TYPE {
   TCCIR_VREG_TYPE_VAR = 1,
   TCCIR_VREG_TYPE_TEMP = 2,

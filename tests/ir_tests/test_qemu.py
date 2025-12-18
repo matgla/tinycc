@@ -10,17 +10,21 @@ TEST_FILES = [
     "01_hello_world.c",
     "20_op_add.c",
     "30_function_call.c",
+    "40_if.c",
+    "../tests2/00_assignment.c",
+    "../tests2/01_comment.c",
 ]
 
 def load_expect_file(test_name):
     """Load and return lines from .expect file and expected exit code"""
-    expect_file = CURRENT_DIR / f"{Path(test_name).stem}.expect"
+    test_file = Path(test_name)
+    expect_file = CURRENT_DIR / f"{test_file.parent}/{test_file.stem}.expect"
     if not expect_file.exists():
         raise FileNotFoundError(f"Expect file not found: {expect_file}")
-    
+
     lines = []
     exit_code = None
-    
+
     with open(expect_file, "r") as f:
         for line in f:
             stripped = line.rstrip('\n')
@@ -29,7 +33,7 @@ def load_expect_file(test_name):
                 exit_code = int(stripped.split(":", 1)[1].strip())
             elif stripped.strip():  # Non-empty lines
                 lines.append(stripped)
-    
+
     return lines, exit_code
 
 @pytest.fixture
@@ -55,7 +59,7 @@ def test_qemu_execution(test_file, qemu_runner):
     try:
         for line in expected_lines:
             sut.expect(line, timeout=1)
-        
+
         if expected_exit_code is not None:
             sut.expect(f"Exit code: {expected_exit_code}", timeout=1)
         sut.logfile.close()

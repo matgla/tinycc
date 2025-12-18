@@ -930,6 +930,7 @@ struct TCCState {
   uint64_t registers_map_for_allocator;
   uint8_t omit_frame_pointer;
   uint8_t need_frame_pointer;
+  int stack_location;
 };
 
 struct filespec {
@@ -1842,6 +1843,8 @@ ST_FUNC void tcc_gen_machine_epilog(int leaffunc);
 ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers);
 ST_FUNC void tcc_gen_machine_func_param_op(TACQuadruple *q);
 ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_value);
+ST_FUNC void tcc_gen_machine_jump_op(TACQuadruple *q);
+ST_FUNC void tcc_gen_machine_conditional_jump_op(TACQuadruple *q);
 
 #define stab_section s1->stab_section
 #define stabstr_section stab_section->link

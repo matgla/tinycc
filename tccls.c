@@ -38,6 +38,11 @@ void tcc_ls_initialize(LSLiveIntervalState *ls) {
   ls->dirty_registers = 0;
 }
 
+void tcc_ls_deinitialize(LSLiveIntervalState *ls) {
+  tcc_free(ls->intervals);
+  tcc_free(ls->active_set);
+}
+
 void tcc_ls_clear_live_intervals(LSLiveIntervalState *ls) {
   ls->next_interval_index = 0;
   ls->next_active_index = 0;
@@ -56,6 +61,8 @@ void tcc_ls_add_live_interval(LSLiveIntervalState *ls, int vreg, int start,
   interval = &ls->intervals[ls->next_interval_index];
   interval->vreg = vreg;
   interval->start = start;
+  printf("Adding live interval for vreg %d: start=%d end=%d\n", vreg, start,
+         end);
   interval->end = end;
   interval->r0 = -1;
   interval->r1 = -1;
@@ -156,6 +163,27 @@ void tcc_ls_mark_register_as_used(LSLiveIntervalState *ls, int reg) {
   exit(1);
 }
 
+int tcc_ls_next_stack_location() {
+  tcc_state->stack_location = (loc - 4) & -4;
+  return loc;
+}
+
+void tcc_ls_spill_interval(LSLiveIntervalState *ls, int interval_index) {
+  static uint32_t next_stack_location = 0;
+  LSLiveInterval *interval = &ls->intervals[interval_index];
+  LSLiveInterval *spill = ls->active_set[ls->next_active_index - 1];
+  if (spill->end > interval->end) {
+    interval->r0 = spill->r0;
+    interval->r1 = spill->r1;
+    spill->stack_location = tcc_ls_next_stack_location();
+    ls->active_set[ls->next_active_index - 1] = interval;
+    qsort(ls->active_set, ls->next_active_index, sizeof(LSLiveInterval *),
+          sort_endpoints);
+  } else {
+    interval->stack_location = tcc_ls_next_stack_location();
+  }
+}
+
 void tcc_ls_allocate_registers(LSLiveIntervalState *ls,
                                int used_parameters_registers) {
   // make all registers available at start
@@ -177,12 +205,24 @@ void tcc_ls_allocate_registers(LSLiveIntervalState *ls,
 
     if (ls->intervals[i].r0 == -1) {
       // add splling
-      fprintf(stderr, "Error: unable to allocate register for vreg %d\n",
-              ls->intervals[i].vreg);
-      exit(1);
+      tcc_ls_spill_interval(ls, i);
     }
     ls->active_set[ls->next_active_index++] = &ls->intervals[i];
     qsort(ls->active_set, ls->next_active_index, sizeof(LSLiveInterval *),
           sort_endpoints);
+  }
+
+  for (int i = 0; i < ls->next_interval_index; ++i) {
+    printf("Interval %d (%d,%d), VReg%d --> ", i, ls->intervals[i].start,
+           ls->intervals[i].end, ls->intervals[i].vreg);
+    if (ls->intervals[i].stack_location) {
+      printf("spilled to stack at %d\n", ls->intervals[i].stack_location);
+    } else {
+      printf("R0%d", ls->intervals[i].r0);
+      if (ls->intervals[i].r1 >= 0) {
+        printf(", R1%d", ls->intervals[i].r1);
+      }
+      printf("\n");
+    }
   }
 }

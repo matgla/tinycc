@@ -994,6 +994,7 @@ static void vset_VT_JMP(void) {
 /* Set CPU Flags, doesn't yet jump */
 static void gvtst_set(int inv, int t) {
   int *p;
+  // SValue dest;
 
   if (vtop->r != VT_CMP) {
     vpushi(0);
@@ -1002,8 +1003,13 @@ static void gvtst_set(int inv, int t) {
       vset_VT_CMP(vtop->c.i != 0);
   }
 
-  p = inv ? &vtop->jfalse : &vtop->jtrue;
-  *p = gjmp_append(*p, t);
+  // p = inv ? &vtop->jfalse : &vtop->jtrue;
+  // memset(&dest, 0, sizeof(dest));
+  // dest.vr = -1;
+  // dest.c.i = *p;
+  // tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
+  // tcc_ir_backpatch(tcc_state->ir, *p, t);
+  // *p = gjmp_append(*p, t);
 }
 
 /* Generate value test
@@ -1011,20 +1017,33 @@ static void gvtst_set(int inv, int t) {
  * Generate a test for any value (jump, comparison and integers) */
 static int gvtst(int inv, int t) {
   int op, x, u;
-
+  SValue dest;
   gvtst_set(inv, t);
   t = vtop->jtrue, u = vtop->jfalse;
   if (inv)
     x = u, u = t, t = x;
-  op = vtop->cmp_op;
-
+  op = vtop->c.i;
+  memset(&dest, 0, sizeof(dest));
+  dest.c.i = t;
+  dest.vr = -1;
   /* jump to the wanted target */
-  if (op > 1)
-    t = gjmp_cond(op ^ inv, t);
-  else if (op != inv)
-    t = gjmp(t);
+  if (op > 1) {
+    SValue condition;
+    memset(&condition, 0, sizeof(condition));
+    condition.vr = -1;
+    condition.c.i = op ^ inv;
+    tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMPIF, &condition, NULL, &dest);
+    //  t = gjmp_cond(op ^ inv, t);
+  } else if (op != inv) {
+    SValue condition;
+    memset(&condition, 0, sizeof(condition));
+    condition.vr = -1;
+    condition.c.i = op ^ inv;
+    tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
+  }
   /* resolve complementary jumps to here */
-  gsym(u);
+  // gsym(u);
+  tcc_ir_backpatch_to_here(tcc_state->ir, u);
 
   vtop--;
   print_vstack("gvtst");
@@ -6081,8 +6100,9 @@ tok_next:
       SValue num;
       num.vr = -1;
       if (nb_args > 4) {
-        for (int j = 0; n < nb_args - 4; j++) {
+        for (int j = 0; j < nb_args - 4; j++) {
           num.c.i = nb_args - j;
+          printf("PASS STACK ARG %d\n", num.c.i);
           tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL);
           vtop--;
         }
@@ -6555,6 +6575,7 @@ ST_FUNC void gexpr(void) {
       vpop();
       next();
       expr_eq();
+      tcc_ir_drop_return_value(tcc_state->ir);
     } while (tok == ',');
 
     /* convert array & function to pointer */
@@ -6938,16 +6959,16 @@ again:
     skip('(');
     gexpr();
     skip(')');
-    a = gvtst(1, 0);
+    a = tcc_ir_generate_test(tcc_state->ir, 1, 0);
     block(0);
     if (tok == TOK_ELSE) {
-      d = gjmp(0);
-      gsym(a);
+      // d = gjmp(0);
+      // gsym(a);
       next();
       block(0);
-      gsym(d); /* patch else jmp */
+      // gsym(d); /* patch else jmp */
     } else {
-      gsym(a);
+      // gsym(a);
     }
     prev_scope_s(&o);
 
@@ -8349,6 +8370,7 @@ static void gen_function(Sym *sym) {
   /* do this after funcend debug info */
   next();
   tcc_ir_release_block(ir);
+  tcc_state->ir = NULL;
 }
 
 static void gen_inline_functions(TCCState *s) {
