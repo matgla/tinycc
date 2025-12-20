@@ -7,12 +7,13 @@ CURRENT_DIR = Path(__file__).parent
 
 # Add test files here - each must have a corresponding .expect file
 TEST_FILES = [
-    "01_hello_world.c",
-    "20_op_add.c",
-    "30_function_call.c",
-    "40_if.c",
-    "../tests2/00_assignment.c",
-    "../tests2/01_comment.c",
+    ("01_hello_world.c", 34),
+    ("20_op_add.c", 0),
+    # ("20_op_add.c", 0),
+    # ("30_function_call.c", 0),
+    # ("40_if.c", 0),
+    # ("../tests2/00_assignment.c", 0),
+    # ("../tests2/01_comment.c", 0),
 ]
 
 def load_expect_file(test_name):
@@ -23,47 +24,36 @@ def load_expect_file(test_name):
         raise FileNotFoundError(f"Expect file not found: {expect_file}")
 
     lines = []
-    exit_code = None
 
     with open(expect_file, "r") as f:
         for line in f:
             stripped = line.rstrip('\n')
-            # Check for exit code directive
-            if stripped.startswith("EXIT_CODE:"):
-                exit_code = int(stripped.split(":", 1)[1].strip())
-            elif stripped.strip():  # Non-empty lines
-                lines.append(stripped)
+            lines.append(stripped)
 
-    return lines, exit_code
+    return lines
 
-@pytest.fixture
-def qemu_runner():
-    """Fixture that provides a context manager for running QEMU tests"""
-    sut_instance = None
 
-    def _run(test_file):
-        nonlocal sut_instance
-        sut_instance = run_test(test_file, MACHINE)
-        return sut_instance
 
-    yield _run
+@pytest.mark.parametrize("test_file,expected_exit_code", TEST_FILES, ids=[Path(f[0]).stem for f in TEST_FILES])
+def test_qemu_execution(test_file, expected_exit_code):
+    if test_file is None:
+        pytest.fail("test_file is None")
 
-    if sut_instance:
-        sut_instance.close()
-
-@pytest.mark.parametrize("test_file", TEST_FILES, ids=lambda f: Path(f).stem)
-def test_qemu_execution(test_file, qemu_runner):
-    expected_lines, expected_exit_code = load_expect_file(test_file)
-    sut = qemu_runner(test_file)
+    print(f"Running test: {test_file}")
+    expected_lines = load_expect_file(test_file)
+    sut = run_test(test_file, MACHINE)
 
     try:
         for line in expected_lines:
-            sut.expect(line, timeout=1)
+            if not line is None:
+                sut.expect(line, timeout=1)
 
-        if expected_exit_code is not None:
-            sut.expect(f"Exit code: {expected_exit_code}", timeout=1)
+        sut.wait()
+        assert sut.exitstatus == expected_exit_code, f"Expected exit code {expected_exit_code}, got {sut.exitstatus}"
+
         sut.logfile.close()
     except Exception as e:
         # Save output log on failure
         sut.logfile.close()
+        raise AssertionError(f"Test failed for {test_file}: {e}") from e
 

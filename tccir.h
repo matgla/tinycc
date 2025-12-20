@@ -147,6 +147,7 @@ void tcc_ir_patch_live_intervals_registers(TCCIRState *ir);
 void tcc_ir_backpatch(TCCIRState *ir, int t, int target_address);
 void tcc_ir_backpatch_to_here(TCCIRState *ir, int t);
 int tcc_ir_generate_test(TCCIRState *ir, int inv, int t);
+void tcc_ir_print_vreg(int vreg);
 
 typedef enum TCCIR_VREG_TYPE {
   TCCIR_VREG_TYPE_VAR = 1,

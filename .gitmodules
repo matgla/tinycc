@@ -1,3 +1,6 @@
 [submodule "tests/externals/c-testsuite"]
 	path = tests/externals/c-testsuite
 	url = https://github.com/c-testsuite/c-testsuite.git
+[submodule "tests/ir_tests/qemu/mps2-an505/libs/newlib"]
+	path = tests/ir_tests/qemu/mps2-an505/libs/newlib
+	url = https://github.com/bminor/newlib.git

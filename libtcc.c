@@ -28,6 +28,7 @@
 #include "tccelf.c"
 #include "tccgen.c"
 #include "tccir.c"
+#include "tccld.c"
 #include "tccls.c"
 #include "tccpp.c"
 #include "tccyaff.c"
@@ -756,6 +757,8 @@ LIBTCCAPI void tcc_delete(TCCState *s1) {
   tcc_free(s1->mapfile);
   tcc_free(s1->outfile);
   tcc_free(s1->deps_outfile);
+  tcc_free(s1->linker_script);
+  tcc_free(s1->ld_script);
   dynarray_reset(&s1->files, &s1->nb_files);
   dynarray_reset(&s1->target_deps, &s1->nb_target_deps);
   dynarray_reset(&s1->pragma_libs, &s1->nb_pragma_libs);
@@ -1271,6 +1274,7 @@ enum {
   TCC_OPTION_mpic_data_is_text_relative,
   TCC_OPTION_fpic,
   TCC_OPTION_fpie,
+  TCC_OPTION_T,
 };
 
 #define TCC_OPTION_HAS_ARG 0x0001
@@ -1331,6 +1335,7 @@ static const TCCOption tcc_options[] = {
     {"MMD", TCC_OPTION_MMD, 0},
     {"MP", TCC_OPTION_MP, 0},
     {"x", TCC_OPTION_x, TCC_OPTION_HAS_ARG},
+    {"T", TCC_OPTION_T, TCC_OPTION_HAS_ARG},
     {"ar", TCC_OPTION_ar, 0},
     /* ignored (silently, except after -Wunsupported) */
     {"arch", 0, TCC_OPTION_HAS_ARG},
@@ -1756,6 +1761,13 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv,
       break;
     case TCC_OPTION_O:
       s->optimize = atoi(optarg);
+      break;
+    case TCC_OPTION_T:
+      if (s->linker_script) {
+        tcc_warning("multiple -T option");
+        tcc_free(s->linker_script);
+      }
+      s->linker_script = tcc_strdup(optarg);
       break;
     case TCC_OPTION_print_search_dirs:
       x = OPT_PRINT_DIRS;

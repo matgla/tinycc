@@ -10,6 +10,8 @@
             "request": "launch",
             "program": "${workspaceFolder}/armv8m-tcc",
             "args": [
+                "-g",
+                "-gdwarf",
                 "${workspaceFolder}/tests/ir_tests/simple0.c",
                 "-o",
                 "${workspaceFolder}/tests/ir_tests/simple0.o",

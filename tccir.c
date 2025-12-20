@@ -526,6 +526,9 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2,
   q->dest.pr0 = -1;
   q->dest.pr1 = -1;
 
+  // store current source line number for debug info
+  q->line_num = file ? file->line_num : 0;
+
   if (ir->basic_block_start) {
     ir->basic_block_start = 0;
   } else if ((!ir->prevent_coalescing) && (op == TCCIR_OP_ASSIGN) &&
@@ -678,7 +681,7 @@ static int tcc_ir_find_live_interval(TCCIRState *ir, int vreg, int *start,
   *start = interval->start;
   *end = interval->end;
 
-  if (interval->start > 0 && interval->end > 0) {
+  if (interval->start > 0 || interval->end > 0) {
     retval = 1;
   }
 
@@ -691,8 +694,23 @@ static int tcc_ir_find_live_interval(TCCIRState *ir, int vreg, int *start,
   return retval;
 }
 
+/* Check if there's a function call between start and end instruction indices
+ * A call at the start position is where the value is defined, so it doesn't
+ * count. A call at the end position is where the value is last used, so it
+ * doesn't count. We only care about calls strictly between start and end. */
+static int tcc_ir_has_call_in_range(TCCIRState *ir, int start, int end) {
+  for (int i = start + 1; i < end && i < ir->next_instruction_index; ++i) {
+    TccIrOp op = ir->instructions[i].op;
+    if (op == TCCIR_OP_FUNCCALLVOID || op == TCCIR_OP_FUNCCALLVAL) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 void tcc_ir_liveness_analysis(TCCIRState *ir) {
   int start, end;
+  int crosses_call;
   tcc_ls_clear_live_intervals(&ir->ls);
   for (int vreg = 0; vreg < ir->next_local_variable; ++vreg) {
     const int encoded_vreg = (TCCIR_VREG_TYPE_VAR << 28) | vreg;
@@ -702,7 +720,8 @@ void tcc_ir_liveness_analysis(TCCIRState *ir) {
     start = 0;
     end = ~0;
     if (tcc_ir_find_live_interval(ir, encoded_vreg, &start, &end, 1)) {
-      tcc_ls_add_live_interval(&ir->ls, encoded_vreg, start, end);
+      crosses_call = tcc_ir_has_call_in_range(ir, start, end);
+      tcc_ls_add_live_interval(&ir->ls, encoded_vreg, start, end, crosses_call);
     }
   }
 
@@ -714,7 +733,8 @@ void tcc_ir_liveness_analysis(TCCIRState *ir) {
     start = 0;
     end = ~0;
     if (tcc_ir_find_live_interval(ir, vreg_encoded, &start, &end, 1)) {
-      tcc_ls_add_live_interval(&ir->ls, vreg_encoded, start, end);
+      crosses_call = tcc_ir_has_call_in_range(ir, start, end);
+      tcc_ls_add_live_interval(&ir->ls, vreg_encoded, start, end, crosses_call);
     }
   }
 }
@@ -771,14 +791,35 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv) {
   }
 }
 
+static void tcc_ir_backpatch_jumps(TCCIRState *ir,
+                                   uint32_t *ir_to_code_mapping) {
+  TACQuadruple *q;
+  for (int i = 0; i < ir->next_instruction_index; i++) {
+    q = &ir->instructions[i];
+    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF) {
+      const int instruction_address = ir_to_code_mapping[i];
+      const int target_address = ir_to_code_mapping[q->dest.c.i];
+      tcc_gen_machine_backpatch_jump(instruction_address, target_address);
+    }
+  }
+}
+
 void tcc_ir_generate_code(TCCIRState *ir) {
   TACQuadruple *q;
   int drop_return_value = 0;
+  uint32_t *ir_to_code_mapping =
+      tcc_mallocz(sizeof(uint32_t) * ir->next_instruction_index);
   // generate prolog
   tcc_gen_machine_prolog(ir->leaffunc, ir->ls.dirty_registers);
 
   for (int i = 0; i < ir->next_instruction_index; i++) {
+    drop_return_value = 0;
     q = &ir->instructions[i];
+
+    // emit debug line info for this IR instruction
+    tcc_debug_line_num(tcc_state, q->line_num);
+
+    ir_to_code_mapping[i] = ind;
     if (irop_config[q->op].has_src1 == 1) {
       tcc_ir_fill_registers(ir, &q->src1);
       if (q->op != TCCIR_OP_FUNCCALLVAL && q->op != TCCIR_OP_FUNCCALLVOID &&
@@ -841,22 +882,27 @@ void tcc_ir_generate_code(TCCIRState *ir) {
                                         ? &ir->instructions[i + 1]
                                         : NULL;
       if (ir_next && ir_next->op == TCCIR_OP_RETURNVALUE &&
-          ir_next->src1.vr == q->dest.vr) {
+          ir_next->src1.vr == q->dest.vr && q->src1.vr != -1) {
         q->dest.pr0 = REG_IRET;
         ++i; // skip next instruction
       }
 
       tcc_gen_machine_func_call_op(q, drop_return_value);
+      ir_to_code_mapping[i] = ind;
       break;
     default: {
       printf("Unsupported operation in tcc_generate_code: %s\n",
              tcc_ir_get_op_name(q->op));
+      tcc_free(ir_to_code_mapping);
       exit(1);
     }
     };
   }
 
+  tcc_ir_backpatch_jumps(ir, ir_to_code_mapping);
   tcc_gen_machine_epilog(ir->leaffunc);
+
+  tcc_free(ir_to_code_mapping);
 }
 
 void tcc_ir_print_vreg(int vreg) {
@@ -986,7 +1032,9 @@ void tcc_print_quadruple(TACQuadruple *q, int pc) {
   }
 
   if (irop_config[op].has_src1) {
-    print_svalue_short(&q->src1);
+    if (op != TCCIR_OP_JUMPIF) {
+      print_svalue_short(&q->src1);
+    }
   }
 
   if (irop_config[op].has_src2) {
@@ -1144,7 +1192,13 @@ void tcc_ir_drop_return_value(TCCIRState *ir) {
 }
 
 void tcc_ir_backpatch(TCCIRState *ir, int t, int target_address) {
+  SValue *cur;
   printf("Backpatching jump at %d to target %d\n", t, target_address);
+  while (t) {
+    cur = &ir->instructions[t].dest;
+    t = cur->c.i;
+    cur->c.i = target_address;
+  }
 }
 
 void tcc_ir_backpatch_to_here(TCCIRState *ir, int t) {

@@ -71,3 +71,4 @@ libtcc.dylib
 build/
 rootfs/
 __pycache__/
+tests/ir_tests/qemu/mps2-an505/newlib_build/

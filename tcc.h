@@ -931,7 +931,14 @@ struct TCCState {
   uint8_t omit_frame_pointer;
   uint8_t need_frame_pointer;
   int stack_location;
+
+  /* linker script support */
+  char *linker_script;        /* path to linker script file (-T option) */
+  struct LDScript *ld_script; /* parsed linker script */
 };
+
+/* Forward declaration for linker script */
+struct LDScript;
 
 struct filespec {
   char type;
@@ -1517,6 +1524,7 @@ ST_FUNC int set_global_sym(TCCState *s1, const char *name, Section *sec,
 #ifndef ELF_OBJ_ONLY
 ST_FUNC int tcc_load_dll(TCCState *s1, int fd, const char *filename, int level);
 ST_FUNC int tcc_load_ldscript(TCCState *s1, int fd);
+ST_FUNC int tcc_load_linker_script(TCCState *s1, const char *filename);
 ST_FUNC void tccelf_add_crtbegin(TCCState *s1);
 ST_FUNC void tccelf_add_crtend(TCCState *s1);
 #endif
@@ -1801,6 +1809,7 @@ ST_FUNC void tcc_debug_eincl(TCCState *s1);
 ST_FUNC void tcc_debug_newfile(TCCState *s1);
 
 ST_FUNC void tcc_debug_line(TCCState *s1);
+ST_FUNC void tcc_debug_line_num(TCCState *s1, int line_num);
 ST_FUNC void tcc_add_debug_info(TCCState *s1, int param, Sym *s, Sym *e);
 ST_FUNC void tcc_debug_funcstart(TCCState *s1, Sym *sym);
 ST_FUNC void tcc_debug_prolog_epilog(TCCState *s1, int value);
@@ -1831,6 +1840,7 @@ typedef struct TACQuadruple {
   SValue src1;
   SValue src2;
   SValue dest;
+  int line_num; /* source line number for debug info */
 } TACQuadruple;
 
 ST_FUNC void tcc_gen_machine_data_processing_op(TACQuadruple *q);
@@ -1845,6 +1855,7 @@ ST_FUNC void tcc_gen_machine_func_param_op(TACQuadruple *q);
 ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_value);
 ST_FUNC void tcc_gen_machine_jump_op(TACQuadruple *q);
 ST_FUNC void tcc_gen_machine_conditional_jump_op(TACQuadruple *q);
+ST_FUNC void tcc_gen_machine_backpatch_jump(int address, int offset);
 
 #define stab_section s1->stab_section
 #define stabstr_section stab_section->link

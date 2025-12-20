@@ -1515,6 +1515,10 @@ ST_FUNC void tcc_debug_line(TCCState *s1) {
 
   if (!s1->do_debug)
     return;
+  /* In IR mode, line info is emitted during code generation via
+   * tcc_debug_line_num */
+  if (s1->ir)
+    return;
   if (cur_text_section != text_section || nocode_wanted)
     return;
   f = put_new_file(s1);
@@ -1571,6 +1575,61 @@ ST_FUNC void tcc_debug_line(TCCState *s1) {
       /* from tcc_assemble */
       put_stabs_r(s1, NULL, N_SLINE, 0, f->line_num, ind, text_section,
                   section_sym);
+    }
+  }
+}
+
+/* generate line number info with explicit line number (for IR codegen) */
+ST_FUNC void tcc_debug_line_num(TCCState *s1, int line_num) {
+  if (!s1->do_debug)
+    return;
+  if (cur_text_section != text_section || nocode_wanted)
+    return;
+  if (line_num == 0)
+    return;
+  if (last_line_num == line_num)
+    return;
+  last_line_num = line_num;
+
+  if (s1->dwarf) {
+    /* DWARF line info - same as tcc_debug_line but with explicit line_num */
+    int len_pc = (ind - dwarf_line.last_pc) / DWARF_MIN_INSTR_LEN;
+    int len_line = line_num - dwarf_line.last_line;
+    int n = len_pc * DWARF_LINE_RANGE + len_line + DWARF_OPCODE_BASE -
+            DWARF_LINE_BASE;
+
+    if (len_pc && len_line >= DWARF_LINE_BASE &&
+        len_line <= (DWARF_OPCODE_BASE + DWARF_LINE_BASE) &&
+        n >= DWARF_OPCODE_BASE && n <= 255)
+      dwarf_line_op(s1, n);
+    else {
+      if (len_pc) {
+        n = len_pc * DWARF_LINE_RANGE + 0 + DWARF_OPCODE_BASE - DWARF_LINE_BASE;
+        if (n >= DWARF_OPCODE_BASE && n <= 255)
+          dwarf_line_op(s1, n);
+        else {
+          dwarf_line_op(s1, DW_LNS_advance_pc);
+          dwarf_uleb128_op(s1, len_pc);
+        }
+      }
+      if (len_line) {
+        n = 0 * DWARF_LINE_RANGE + len_line + DWARF_OPCODE_BASE -
+            DWARF_LINE_BASE;
+        if (len_line >= DWARF_LINE_BASE &&
+            len_line <= (DWARF_OPCODE_BASE + DWARF_LINE_BASE) &&
+            n >= DWARF_OPCODE_BASE && n <= 255)
+          dwarf_line_op(s1, n);
+        else {
+          dwarf_line_op(s1, DW_LNS_advance_line);
+          dwarf_sleb128_op(s1, len_line);
+        }
+      }
+    }
+    dwarf_line.last_pc = ind;
+    dwarf_line.last_line = line_num;
+  } else {
+    if (func_ind != -1) {
+      put_stabn(s1, N_SLINE, 0, line_num, ind - func_ind);
     }
   }
 }

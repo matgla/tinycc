@@ -49,7 +49,7 @@ void tcc_ls_clear_live_intervals(LSLiveIntervalState *ls) {
 }
 
 void tcc_ls_add_live_interval(LSLiveIntervalState *ls, int vreg, int start,
-                              int end) {
+                              int end, int crosses_call) {
   LSLiveInterval *interval;
 
   if (ls->next_interval_index >= ls->intervals_size) {
@@ -61,12 +61,14 @@ void tcc_ls_add_live_interval(LSLiveIntervalState *ls, int vreg, int start,
   interval = &ls->intervals[ls->next_interval_index];
   interval->vreg = vreg;
   interval->start = start;
-  printf("Adding live interval for vreg %d: start=%d end=%d\n", vreg, start,
-         end);
+  printf("Adding live interval for ");
+  tcc_ir_print_vreg(vreg);
+  printf(", start=%d end=%d crosses_call=%d\n", start, end, crosses_call);
   interval->end = end;
   interval->r0 = -1;
   interval->r1 = -1;
   interval->stack_location = 0;
+  interval->crosses_call = crosses_call;
   ls->next_interval_index++;
 }
 
@@ -118,6 +120,18 @@ int tcc_ls_assign_register(LSLiveIntervalState *ls, int reg) {
 
 int tcc_ls_assign_any_register(LSLiveIntervalState *ls) {
   for (int reg = 0; reg < tcc_state->registers_for_allocator; ++reg) {
+    int assigned_reg = tcc_ls_assign_register(ls, reg);
+    if (assigned_reg != -1) {
+      return assigned_reg;
+    }
+  }
+  return -1;
+}
+
+/* Assign a callee-saved register (R4-R12) for intervals that cross calls */
+int tcc_ls_assign_callee_saved_register(LSLiveIntervalState *ls) {
+  /* Callee-saved registers start at R4 */
+  for (int reg = 4; reg < tcc_state->registers_for_allocator; ++reg) {
     int assigned_reg = tcc_ls_assign_register(ls, reg);
     if (assigned_reg != -1) {
       return assigned_reg;
@@ -198,13 +212,18 @@ void tcc_ls_allocate_registers(LSLiveIntervalState *ls,
     tcc_ls_expire_old_intervals(ls, i);
 
     if (ls->intervals[i].r0 == -1) {
-      ls->intervals[i].r0 = tcc_ls_assign_any_register(ls);
+      /* If interval crosses a function call, use callee-saved registers only */
+      if (ls->intervals[i].crosses_call) {
+        ls->intervals[i].r0 = tcc_ls_assign_callee_saved_register(ls);
+      } else {
+        ls->intervals[i].r0 = tcc_ls_assign_any_register(ls);
+      }
     } else {
       ls->intervals[i].r0 = tcc_ls_assign_register(ls, ls->intervals[i].r0);
     }
 
     if (ls->intervals[i].r0 == -1) {
-      // add splling
+      // add spilling
       tcc_ls_spill_interval(ls, i);
     }
     ls->active_set[ls->next_active_index++] = &ls->intervals[i];
@@ -213,8 +232,10 @@ void tcc_ls_allocate_registers(LSLiveIntervalState *ls,
   }
 
   for (int i = 0; i < ls->next_interval_index; ++i) {
-    printf("Interval %d (%d,%d), VReg%d --> ", i, ls->intervals[i].start,
-           ls->intervals[i].end, ls->intervals[i].vreg);
+    printf("Interval %d (%d,%d), ", i, ls->intervals[i].start,
+           ls->intervals[i].end);
+    tcc_ir_print_vreg(ls->intervals[i].vreg);
+    printf(" --> ");
     if (ls->intervals[i].stack_location) {
       printf("spilled to stack at %d\n", ls->intervals[i].stack_location);
     } else {

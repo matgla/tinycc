@@ -6962,10 +6962,15 @@ again:
     a = tcc_ir_generate_test(tcc_state->ir, 1, 0);
     block(0);
     if (tok == TOK_ELSE) {
-      // d = gjmp(0);
-      // gsym(a);
+      SValue dest;
+      memset(&dest, 0, sizeof(SValue));
+      dest.vr = -1;
+      dest.c.i = 0;
+      d = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
+      tcc_ir_backpatch_to_here(tcc_state->ir, a);
       next();
       block(0);
+      tcc_ir_backpatch_to_here(tcc_state->ir, d);
       // gsym(d); /* patch else jmp */
     } else {
       // gsym(a);

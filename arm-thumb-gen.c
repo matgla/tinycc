@@ -578,13 +578,13 @@ static void th_literal_pool_generate(void) {
   for (int i = 0; i < thumb_gen_state.literal_pool_count; i++) {
     ThumbLiteralPoolEntry *entry = &thumb_gen_state.literal_pool[i];
     int value = entry->imm;
-
+    int aligned_position = ((ind - entry->patch_position) + 3) & ~3;
     // patch the instruction that references this literal
     // encode new imm8
     uint16_t *patch_ins =
         (uint16_t *)(cur_text_section->data + entry->patch_position);
 
-    *patch_ins |= (((ind - entry->patch_position - 4 + i * 4) >> 2) & 0x000f);
+    *patch_ins |= (((aligned_position - 4) >> 2) & 0x00ff);
 
     if (entry->relocation != -1) {
       greloc(cur_text_section, entry->sym, ind, entry->relocation);
@@ -594,6 +594,8 @@ static void th_literal_pool_generate(void) {
     o((value >> 16) & 0xffff);
   }
   th_sym_t();
+  thumb_gen_state.literal_pool_count = 0;
+  thumb_gen_state.code_size = 0;
 }
 
 int is_valid_opcode(thumb_opcode op) { return (op.size == 2 || op.size == 4); }
@@ -2612,6 +2614,10 @@ ST_FUNC void tcc_gen_machine_jump_op(TACQuadruple *q) {
 ST_FUNC void tcc_gen_machine_conditional_jump_op(TACQuadruple *q) {
   int op = mapcc(q->src1.c.i);
   ot_check(th_b_t3(op, 0)); // patch me later
+}
+
+ST_FUNC void tcc_gen_machine_backpatch_jump(int address, int offset) {
+  th_patch_call(address, offset);
 }
 
 #endif // TARGET_DEFS_ONLY

@@ -19,6 +19,7 @@
  */
 
 #include "tcc.h"
+#include "tccld.h"
 #include "tccyaff.h"
 
 /* Define this to get some debug output during relocation processing.  */
@@ -2262,6 +2263,11 @@ static int layout_sections(TCCState *s1, int *sec_order, struct dyn_inf *d) {
   if (s1->output_type & TCC_OUTPUT_DYN)
     addr = 0;
 
+  /* Use linker script MEMORY origin if available */
+  if (s1->ld_script && s1->ld_script->nb_memory_regions > 0) {
+    addr = s1->ld_script->memory_regions[0].origin;
+  }
+
   if (s1->has_text_addr) {
     addr = s1->text_addr;
     if (0) {
@@ -2761,6 +2767,9 @@ static Section *create_bsd_note_section(TCCState *s1, const char *name,
 #endif
 
 static void alloc_sec_names(TCCState *s1, int is_obj);
+static void ld_apply_symbols(TCCState *s1, LDScript *ld);
+static void ld_update_symbol_values(TCCState *s1, LDScript *ld);
+ST_FUNC void ld_export_standard_symbols(TCCState *s1);
 
 /* Output an elf, coff or binary file */
 /* XXX: suppress unneeded sections */
@@ -2776,6 +2785,14 @@ static int elf_output_file(TCCState *s1, const char *filename) {
   interp = dynstr = dynamic = NULL;
   sec_order = NULL;
   dyninf.roinf = &dyninf._roinf;
+
+  /* Load linker script if specified */
+  if (s1->linker_script) {
+    if (tcc_load_linker_script(s1, s1->linker_script) < 0)
+      return -1;
+    /* Apply linker script symbols early so they're available for resolution */
+    ld_apply_symbols(s1, s1->ld_script);
+  }
 
 #ifdef TCC_TARGET_ARM
   create_arm_attribute_section(s1);
@@ -2890,6 +2907,18 @@ static int elf_output_file(TCCState *s1, const char *filename) {
   sec_order = tcc_malloc(sizeof(int) * 2 * s1->nb_sections);
   /* compute section to program header mapping */
   layout_sections(s1, sec_order, &dyninf);
+
+  /* Export standard linker symbols after layout (addresses now known) */
+  /* Skip if linker script is loaded - it provides its own symbol definitions */
+  if (!s1->ld_script) {
+    ld_export_standard_symbols(s1);
+  }
+
+  /* Update and apply linker script symbols with final addresses */
+  if (s1->ld_script) {
+    ld_update_symbol_values(s1, s1->ld_script);
+    ld_apply_symbols(s1, s1->ld_script);
+  }
 
   if (dynamic) {
     /* put in GOT the dynamic section address and relocate PLT */
@@ -3962,4 +3991,228 @@ ST_FUNC int tcc_load_ldscript(TCCState *s1, int fd) {
   }
   return 0;
 }
+
+/* Load and parse a linker script file */
+ST_FUNC int tcc_load_linker_script(TCCState *s1, const char *filename) {
+  int fd;
+  int ret;
+
+  fd = open(filename, O_RDONLY | O_BINARY);
+  if (fd < 0) {
+    return tcc_error_noabort("linker script '%s' not found", filename);
+  }
+
+  /* Allocate linker script structure if not already done */
+  if (!s1->ld_script) {
+    s1->ld_script = tcc_mallocz(sizeof(LDScript));
+    ld_script_init(s1->ld_script);
+  }
+
+  ret = ld_script_parse(s1, s1->ld_script, fd);
+  close(fd);
+
+  if (ret == 0 && s1->verbose) {
+    printf("Loaded linker script: %s\n", filename);
+    ld_script_dump(s1->ld_script);
+  }
+
+  /* Add standard symbols */
+  if (ret == 0) {
+    ld_script_add_standard_symbols(s1, s1->ld_script);
+  }
+
+  return ret;
+}
+
+/* Apply linker script symbols to the ELF symbol table */
+static void ld_apply_symbols(TCCState *s1, LDScript *ld) {
+  int i;
+  for (i = 0; i < ld->nb_symbols; i++) {
+    LDSymbol *sym = &ld->symbols[i];
+    if (sym->defined) {
+      int sym_idx;
+      int vis = (sym->visibility == LD_SYM_HIDDEN ||
+                 sym->visibility == LD_SYM_PROVIDE_HIDDEN)
+                    ? STV_HIDDEN
+                    : STV_DEFAULT;
+
+      /* For PROVIDE symbols, only define if not already defined */
+      if (sym->visibility == LD_SYM_PROVIDE ||
+          sym->visibility == LD_SYM_PROVIDE_HIDDEN) {
+        sym_idx = find_elf_sym(s1->symtab, sym->name);
+        if (sym_idx) {
+          ElfW(Sym) *esym = &((ElfW(Sym) *)s1->symtab->data)[sym_idx];
+          if (esym->st_shndx != SHN_UNDEF)
+            continue; /* Already defined, skip */
+        }
+      }
+
+      /* Check if symbol already exists - if so, update it */
+      sym_idx = find_elf_sym(s1->symtab, sym->name);
+      if (sym_idx) {
+        ElfW(Sym) *esym = &((ElfW(Sym) *)s1->symtab->data)[sym_idx];
+        esym->st_value = sym->value;
+        esym->st_shndx = SHN_ABS;
+      } else {
+        /* Use set_elf_sym directly with SHN_ABS to ensure symbols with value 0
+         * are still defined as absolute (set_global_sym treats value 0 as
+         * UNDEF)
+         */
+        set_elf_sym(s1->symtab, sym->value, 0,
+                    ELFW(ST_INFO)(STB_GLOBAL, STT_NOTYPE), vis, SHN_ABS,
+                    sym->name);
+      }
+    }
+  }
+}
+
+/* Update linker script symbol values based on actual section layout */
+static void ld_update_symbol_values(TCCState *s1, LDScript *ld) {
+  Section *s;
+  addr_t bss_start = 0, bss_end = 0;
+  addr_t data_start = 0, data_end = 0;
+  addr_t text_start = 0, text_end = 0;
+  addr_t rodata_start = 0, rodata_end = 0;
+  addr_t end_addr = 0;
+  addr_t sec_end;
+  int i, j;
+
+  /* Find section addresses */
+  for (i = 1; i < s1->nb_sections; i++) {
+    s = s1->sections[i];
+    if (!s->sh_addr)
+      continue;
+
+    sec_end = s->sh_addr + s->sh_size;
+    if (sec_end > end_addr)
+      end_addr = sec_end;
+
+    if (!strcmp(s->name, ".bss")) {
+      bss_start = s->sh_addr;
+      bss_end = sec_end;
+    } else if (!strcmp(s->name, ".data")) {
+      data_start = s->sh_addr;
+      data_end = sec_end;
+    } else if (!strcmp(s->name, ".text")) {
+      text_start = s->sh_addr;
+      text_end = sec_end;
+    } else if (!strcmp(s->name, ".rodata")) {
+      rodata_start = s->sh_addr;
+      rodata_end = sec_end;
+    }
+  }
+
+  /* Update symbol values in linker script */
+  for (j = 0; j < ld->nb_symbols; j++) {
+    LDSymbol *sym = &ld->symbols[j];
+
+    /* Update standard section symbols */
+    if (!strcmp(sym->name, "__bss_start__") ||
+        !strcmp(sym->name, "__bss_start")) {
+      sym->value = bss_start;
+      sym->defined = 1;
+    } else if (!strcmp(sym->name, "__bss_end__") ||
+               !strcmp(sym->name, "_bss_end__")) {
+      sym->value = bss_end;
+      sym->defined = 1;
+    } else if (!strcmp(sym->name, "__data_start__")) {
+      sym->value = data_start;
+      sym->defined = 1;
+    } else if (!strcmp(sym->name, "__data_end__") ||
+               !strcmp(sym->name, "_edata")) {
+      sym->value = data_end;
+      sym->defined = 1;
+    } else if (!strcmp(sym->name, "__text_start__") ||
+               !strcmp(sym->name, "_stext")) {
+      sym->value = text_start;
+      sym->defined = 1;
+    } else if (!strcmp(sym->name, "__text_end__") ||
+               !strcmp(sym->name, "_etext")) {
+      sym->value = text_end;
+      sym->defined = 1;
+    } else if (!strcmp(sym->name, "__rodata_start__")) {
+      sym->value = rodata_start;
+      sym->defined = 1;
+    } else if (!strcmp(sym->name, "__rodata_end__")) {
+      sym->value = rodata_end;
+      sym->defined = 1;
+    } else if (!strcmp(sym->name, "__end__") || !strcmp(sym->name, "_end") ||
+               !strcmp(sym->name, "end")) {
+      sym->value = end_addr;
+      sym->defined = 1;
+    } else if (!strcmp(sym->name, "__heap_start__")) {
+      sym->value = end_addr;
+      sym->defined = 1;
+    }
+    /* Note: __heap_end__, __stack_start__, __stack_end__, __StackTop,
+     * __StackLimit are typically computed from __heap_size__ and __stack_size__
+     * which should already be set from the linker script */
+  }
+}
+
+/* Export standard end/heap symbols based on section layout */
+ST_FUNC void ld_export_standard_symbols(TCCState *s1) {
+  Section *s;
+  addr_t bss_start = 0, bss_end = 0;
+  addr_t data_start = 0, data_end = 0;
+  addr_t text_start = 0, text_end = 0;
+  addr_t end_addr = 0;
+  addr_t sec_end;
+  int i;
+
+  /* Find section addresses */
+  for (i = 1; i < s1->nb_sections; i++) {
+    s = s1->sections[i];
+    if (!s->sh_addr)
+      continue;
+
+    sec_end = s->sh_addr + s->sh_size;
+    if (sec_end > end_addr)
+      end_addr = sec_end;
+
+    if (!strcmp(s->name, ".bss")) {
+      bss_start = s->sh_addr;
+      bss_end = sec_end;
+    } else if (!strcmp(s->name, ".data")) {
+      data_start = s->sh_addr;
+      data_end = sec_end;
+    } else if (!strcmp(s->name, ".text")) {
+      text_start = s->sh_addr;
+      text_end = sec_end;
+    }
+  }
+
+  /* Set standard symbols if not already defined */
+  if (bss_start) {
+    set_global_sym(s1, "__bss_start__", NULL, bss_start);
+    set_global_sym(s1, "__bss_start", NULL, bss_start);
+  }
+  if (bss_end) {
+    set_global_sym(s1, "__bss_end__", NULL, bss_end);
+    set_global_sym(s1, "_bss_end__", NULL, bss_end);
+  }
+  if (data_start) {
+    set_global_sym(s1, "__data_start__", NULL, data_start);
+  }
+  if (data_end) {
+    set_global_sym(s1, "_edata", NULL, data_end);
+    set_global_sym(s1, "__data_end__", NULL, data_end);
+  }
+  if (text_start) {
+    set_global_sym(s1, "__text_start__", NULL, text_start);
+    set_global_sym(s1, "_stext", NULL, text_start);
+  }
+  if (text_end) {
+    set_global_sym(s1, "_etext", NULL, text_end);
+    set_global_sym(s1, "__text_end__", NULL, text_end);
+  }
+  if (end_addr) {
+    set_global_sym(s1, "__end__", NULL, end_addr);
+    set_global_sym(s1, "_end", NULL, end_addr);
+    set_global_sym(s1, "end", NULL, end_addr);
+    /* Heap typically starts at end */
+    set_global_sym(s1, "__heap_start__", NULL, end_addr);
+  }
+}
+
 #endif /* !ELF_OBJ_ONLY */
