@@ -9,11 +9,11 @@ CURRENT_DIR = Path(__file__).parent
 TEST_FILES = [
     ("01_hello_world.c", 34),
     ("20_op_add.c", 0),
-    # ("20_op_add.c", 0),
-    # ("30_function_call.c", 0),
-    # ("40_if.c", 0),
-    # ("../tests2/00_assignment.c", 0),
-    # ("../tests2/01_comment.c", 0),
+    ("30_function_call.c", 30),
+    ("40_if.c", 0),
+    ("../tests2/00_assignment.c", 0),
+    ("../tests2/01_comment.c", 0),
+    ("../tests2/02_printf.c", 0),
 ]
 
 def load_expect_file(test_name):

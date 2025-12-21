@@ -758,7 +758,9 @@ ST_FUNC void sym_pop(Sym **ptop, Sym *b, int keep) {
         ps = &ts->sym_identifier;
       *ps = s->prev_tok;
     }
-    if (!keep)
+    /* Don't free symbols that have been exported to ELF (sym->c != 0)
+       as they may still be referenced by IR instructions */
+    if (!keep && s->c == 0)
       sym_free(s);
     s = ss;
   }
@@ -7085,25 +7087,43 @@ again:
     }
     skip(';');
     a = b = 0;
-    c = d = gind();
+    c = d = tcc_state->ir->next_instruction_index;
     if (tok != ';') {
       gexpr();
-      a = gvtst(1, 0);
+      a = tcc_ir_generate_test(tcc_state->ir, 1, 0);
     }
     skip(';');
     if (tok != ')') {
-      e = gjmp(0);
-      d = gind();
+      // e = gjmp(0);
+      SValue dest;
+      memset(&dest, 0, sizeof(SValue));
+      dest.vr = -1;
+      dest.c.i = 0;
+      e = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
+      // d = gind();
+      c = tcc_state->ir->next_instruction_index;
       gexpr();
       vpop();
-      gjmp_addr(c);
-      gsym(e);
+      // gjmp_addr(c);
+      memset(&dest, 0, sizeof(SValue));
+      dest.vr = -1;
+      dest.c.i = d;
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
+      tcc_ir_backpatch_to_here(tcc_state->ir, e);
+      // gsym(e);
     }
     skip(')');
     lblock(&a, &b);
-    gjmp_addr(d);
-    gsym_addr(b, d);
-    gsym(a);
+    // gjmp_addr(d);
+    SValue dest;
+    memset(&dest, 0, sizeof(SValue));
+    dest.vr = -1;
+    dest.c.i = c;
+    tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
+    tcc_ir_backpatch_to_here(tcc_state->ir, a);
+    tcc_ir_backpatch(tcc_state->ir, b, c);
+    // gsym_addr(b, d);
+    // gsym(a);
     prev_scope(&o, 0);
 
   } else if (t == TOK_DO) {

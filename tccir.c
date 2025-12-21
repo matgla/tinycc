@@ -470,6 +470,11 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2,
       exit(1);
     }
     q->src1 = *src1;
+    if (op == TCCIR_OP_FUNCPARAMVAL && (src1->r & VT_SYM)) {
+      fprintf(stderr, "DEBUG FUNCPARAMVAL: sym=%p, sym->v=%d, sym->c=%lld\n",
+              (void *)src1->sym, src1->sym ? src1->sym->v : -1,
+              src1->sym ? (long long)src1->sym->c : -1);
+    }
     if (tcc_is_vreg_valid(ir, src1->vr)) {
       tcc_ir_set_base_interval_end(ir, src1->vr);
     }
@@ -701,7 +706,8 @@ static int tcc_ir_find_live_interval(TCCIRState *ir, int vreg, int *start,
 static int tcc_ir_has_call_in_range(TCCIRState *ir, int start, int end) {
   for (int i = start + 1; i < end && i < ir->next_instruction_index; ++i) {
     TccIrOp op = ir->instructions[i].op;
-    if (op == TCCIR_OP_FUNCCALLVOID || op == TCCIR_OP_FUNCCALLVAL) {
+    if (op == TCCIR_OP_FUNCCALLVOID || op == TCCIR_OP_FUNCCALLVAL ||
+        op == TCCIR_OP_FUNCPARAMVOID || op == TCCIR_OP_FUNCPARAMVAL) {
       return 1;
     }
   }

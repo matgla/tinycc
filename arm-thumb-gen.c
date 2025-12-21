@@ -78,6 +78,7 @@ typedef struct ThumbLiteralPoolEntry {
   Sym *sym;
   int relocation;
   int patch_position;
+  int short_instruction;
   int32_t imm;
 } ThumbLiteralPoolEntry;
 
@@ -581,10 +582,15 @@ static void th_literal_pool_generate(void) {
     int aligned_position = ((ind - entry->patch_position) + 3) & ~3;
     // patch the instruction that references this literal
     // encode new imm8
-    uint16_t *patch_ins =
-        (uint16_t *)(cur_text_section->data + entry->patch_position);
-
-    *patch_ins |= (((aligned_position - 4) >> 2) & 0x00ff);
+    if (entry->short_instruction) {
+      uint16_t *patch_ins =
+          (uint16_t *)(cur_text_section->data + entry->patch_position);
+      *patch_ins |= (((aligned_position - 4) >> 2) & 0x00ff);
+    } else {
+      uint16_t *patch_ins =
+          (uint16_t *)(cur_text_section->data + entry->patch_position + 2);
+      *patch_ins |= (((aligned_position - 4)) & 0x0fff);
+    }
 
     if (entry->relocation != -1) {
       greloc(cur_text_section, entry->sym, ind, entry->relocation);
@@ -685,7 +691,10 @@ int decbranch(int pos) {
   return xa;
 }
 
-static thumb_opcode th_generic_mov_imm(uint32_t r, uint32_t imm) {
+static thumb_opcode th_generic_mov_imm(uint32_t r, int imm) {
+  if (imm < 0) {
+    return th_mvn_imm(r, 0, -imm + 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT);
+  }
   return th_mov_imm(r, imm, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
                     ENFORCE_ENCODING_NONE);
 }
@@ -1514,6 +1523,7 @@ static void load_full_const(int r, int32_t imm, struct Sym *sym) {
   TRACE("'load_full_const' to register: %d, with imm: %d\n", r, imm);
   // allocate space for T1 encoding
   est = th_ldr_literal_estimate(r, 1020);
+  entry->short_instruction = est == 2 ? 1 : 0;
   ot_check(th_ldr_literal(r, 0, 1));
 
   if (esym) {
@@ -1574,6 +1584,7 @@ static void load_full_const(int r, int32_t imm, struct Sym *sym) {
             entry2->imm = imm;
             entry2->patch_position = ind;
             entry2->relocation = -1;
+            entry2->short_instruction = false;
             ot_check(th_ldr_literal(R_LR, 0, 1));
             ot_check(th_add_reg(r, r, R_LR, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
                                 THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
@@ -1600,6 +1611,7 @@ static void load_full_const(int r, int32_t imm, struct Sym *sym) {
             entry2->imm = imm;
             entry2->patch_position = ind;
             entry2->relocation = -1;
+            entry2->short_instruction = false;
             ot_check(th_ldr_literal(R_LR, 0, 1));
             ot_check(th_add_reg(r, r, R_LR, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
                                 THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
@@ -2367,9 +2379,15 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op) {
   switch (op->op) {
   case TCCIR_OP_ADD:
     if (th_has_immediate_value(op->src2.r)) {
-      ot_check(th_add_imm(op->dest.pr0, op->src1.pr0, op->src2.c.i,
-                          FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                          ENFORCE_ENCODING_NONE));
+      if (!ot(th_add_imm(op->dest.pr0, op->src1.pr0, op->src2.c.i,
+                         FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                         ENFORCE_ENCODING_NONE))) {
+        // load immediate to temp register and add
+        load(R12, &op->src2);
+        ot_check(th_add_reg(op->dest.pr0, op->src1.pr0, R12,
+                            FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                            ENFORCE_ENCODING_NONE));
+      }
     } else {
       ot_check(th_add_reg(op->dest.pr0, op->src1.pr0, op->src2.pr0,
                           FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
@@ -2572,7 +2590,10 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result) {
   int registers_to_push = 0;
   int registers_count = 0;
 
-  for (int i = 0; i < function_argument_count; ++i) {
+  /* Load arguments in reverse order to avoid clobbering registers
+     that will be used for later (lower-numbered) arguments.
+     E.g., loading arg1 to R1 might use R0 as scratch, so load R1 first. */
+  for (int i = function_argument_count - 1; i >= 0; --i) {
     TACQuadruple *q = &function_arguments[i];
     if (i < 4) {
       if (q->src1.pr0 != -1) {

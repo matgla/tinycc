@@ -9,7 +9,7 @@ int simple02(int x) {
   return x + y;
 }
 
-// int simple022(int x) { return 0xdeadbeef + x; }
+int simple022(int x) { return 0xdeadbeef + x; }
 
 int simple1(int x) { return 42 + x * x; }
 
@@ -42,9 +42,9 @@ int main(int argc, char *argv[]) {
   printf("Result simple02: %d\n", res);
   sum += res;
 
-  // res = simple022(10);
-  // printf("Result simple022: %d\n", res);
-  // sum += res;
+  res = simple022(10);
+  printf("Result simple022: %d\n", res);
+  sum += res;
 
   res = simple1(2);
   printf("Result simple1: %d\n", res);

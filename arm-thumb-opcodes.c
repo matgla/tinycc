@@ -2267,21 +2267,27 @@ thumb_opcode th_msr(uint32_t specreg, uint32_t rn, uint32_t mask) {
   };
 }
 
-thumb_opcode th_mvn_imm(uint16_t rd, uint16_t rn, uint32_t imm,
+thumb_opcode th_mvn_imm(uint16_t rd, uint16_t, uint32_t imm,
                         flags_behaviour flags) {
 
   uint32_t S = (flags == FLAGS_BEHAVIOUR_SET) ? 1 : 0;
   uint32_t packed = th_pack_const(imm);
+  if (packed == 0) {
+    return (thumb_opcode){
+        .size = 0,
+        .opcode = 0,
+    };
+  }
   return (thumb_opcode){
       .size = 4,
-      .opcode = 0xf06f0000 | (S << 20) | (rd << 8) | (rn << 16) | packed,
+      .opcode = 0xf06f0000 | (S << 20) | (rd << 8) | packed,
   };
 }
 
 thumb_opcode th_mvn_reg(uint16_t rd, uint16_t rn, uint16_t rm,
                         flags_behaviour flags, thumb_shift shift,
                         enforce_encoding encoding) {
-  if (rd == rn && rm < 8 && rn < 8 && encoding != ENFORCE_ENCODING_32BIT &&
+  if (rd == rn && rm < 8 && encoding != ENFORCE_ENCODING_32BIT &&
       shift.type == THUMB_SHIFT_NONE) {
     return (thumb_opcode){
         .size = 2,
