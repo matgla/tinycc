@@ -73,6 +73,7 @@ typedef struct LDOutputSection {
   addr_t address;        /* explicit address if set, otherwise 0 */
   addr_t align;          /* alignment requirement */
   addr_t current_offset; /* current offset within section */
+  addr_t start_lc; /* location counter at section entry (for offset calc) */
   int memory_region_idx; /* index into memory_regions, -1 if none */
   int phdr_idx;          /* index into phdrs, -1 if none */
   int has_address;       /* 1 if address explicitly set */
@@ -85,6 +86,7 @@ typedef struct LDOutputSection {
 typedef struct LDSymbol {
   char name[128];
   addr_t value;
+  addr_t section_offset;   /* offset from section start when defined */
   int visibility;          /* LD_SYM_GLOBAL, LD_SYM_HIDDEN, etc */
   int defined;             /* 1 if value is defined */
   int is_location_counter; /* 1 if value is current location counter */

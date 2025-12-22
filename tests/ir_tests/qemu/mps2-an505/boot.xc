@@ -1,7 +1,9 @@
 void Reset_Handler(void);
 
+const extern unsigned long __StackTop;
+
 const unsigned long vectors[] __attribute__((section(".text"))) = {
-    (const unsigned long)0x20001000,     // Initial Stack Pointer
+    __StackTop,                          // Initial Stack Pointer
     (const unsigned long)&Reset_Handler, // Reset Handler
     0,                                   // NMI Handler
     0,                                   // Hard Fault Handler

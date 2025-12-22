@@ -813,10 +813,12 @@ static void tcc_ir_backpatch_jumps(TCCIRState *ir,
 void tcc_ir_generate_code(TCCIRState *ir) {
   TACQuadruple *q;
   int drop_return_value = 0;
+  // +1 to include epilogue when needed
   uint32_t *ir_to_code_mapping =
-      tcc_mallocz(sizeof(uint32_t) * ir->next_instruction_index);
+      tcc_mallocz(sizeof(uint32_t) * (ir->next_instruction_index + 1));
   // generate prolog
-  tcc_gen_machine_prolog(ir->leaffunc, ir->ls.dirty_registers);
+  int stack_size = (-loc + 7) & ~7; // align to 8 bytes
+  tcc_gen_machine_prolog(ir->leaffunc, ir->ls.dirty_registers, stack_size);
 
   for (int i = 0; i < ir->next_instruction_index; i++) {
     drop_return_value = 0;
@@ -847,7 +849,7 @@ void tcc_ir_generate_code(TCCIRState *ir) {
 
     if (irop_config[q->op].has_dest == 1) {
       tcc_ir_fill_registers(ir, &q->dest);
-      if (tcc_ir_operand_in_memory(&q->dest)) {
+      if (tcc_ir_operand_in_memory(&q->dest) && (q->op != TCCIR_OP_ASSIGN)) {
         q->dest.pr0 = architecture_config.scratch_register;
         tcc_gen_machine_load_register(&q->dest);
       }
@@ -858,10 +860,15 @@ void tcc_ir_generate_code(TCCIRState *ir) {
     case TCCIR_OP_ADD:
     case TCCIR_OP_SUB:
     case TCCIR_OP_CMP:
+    case TCCIR_OP_SHL:
+    case TCCIR_OP_SHR:
       tcc_gen_machine_data_processing_op(q);
       break;
     case TCCIR_OP_LOAD:
       tcc_gen_machine_load_op(q);
+      break;
+    case TCCIR_OP_STORE:
+      tcc_gen_machine_store_op(q);
       break;
     case TCCIR_OP_RETURNVALUE:
       tcc_gen_machine_return_value_op(q);
@@ -905,8 +912,9 @@ void tcc_ir_generate_code(TCCIRState *ir) {
     };
   }
 
-  tcc_ir_backpatch_jumps(ir, ir_to_code_mapping);
+  ir_to_code_mapping[ir->next_instruction_index] = ind;
   tcc_gen_machine_epilog(ir->leaffunc);
+  tcc_ir_backpatch_jumps(ir, ir_to_code_mapping);
 
   tcc_free(ir_to_code_mapping);
 }

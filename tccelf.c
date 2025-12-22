@@ -2088,13 +2088,52 @@ struct dyn_inf {
   Section _roinf, *roinf;
 };
 
+/* Find the linker script output section index and pattern index for a given
+   section name. Returns output section index via return value (-1 if not
+   found), and sets *pat_idx to the pattern index within that output section.
+   Patterns are checked first (in order) since they define the ordering within
+   the output section. If no pattern matches but the section name exactly
+   matches an output section name, pat_idx is set to a value after all patterns
+   to indicate it should come last within that output section. */
+static int ld_find_output_section_idx(TCCState *s1, const char *name,
+                                      int *pat_idx) {
+  LDScript *ld = s1->ld_script;
+  int i, j;
+
+  if (pat_idx)
+    *pat_idx = -1;
+
+  if (!ld || ld->nb_output_sections == 0)
+    return -1;
+
+  for (i = 0; i < ld->nb_output_sections; i++) {
+    LDOutputSection *os = &ld->output_sections[i];
+    /* Check patterns first - they define the ordering within the output section
+     */
+    for (j = 0; j < os->nb_patterns; j++) {
+      if (ld_section_matches_pattern(name, os->patterns[j].pattern)) {
+        if (pat_idx)
+          *pat_idx = j;
+        return i;
+      }
+    }
+    /* Check exact name match - comes after all patterns */
+    if (!strcmp(name, os->name)) {
+      if (pat_idx)
+        *pat_idx = os->nb_patterns; /* after all patterns */
+      return i;
+    }
+  }
+  return -1;
+}
+
 /* Decide the layout of sections loaded in memory. This must be done before
    program headers are filled since they contain info about the layout.
    We do the following ordering: interp, symbol tables, relocations, progbits,
    nobits */
 static int sort_sections(TCCState *s1, int *sec_order, struct dyn_inf *d) {
   Section *s;
-  int i, j, k, f, f0, n;
+  int i, j, k, f, f0, n, ld_idx;
   int nb_sections = s1->nb_sections;
   int *sec_cls = sec_order + nb_sections;
 
@@ -2162,10 +2201,58 @@ static int sort_sections(TCCState *s1, int *sec_order, struct dyn_inf *d) {
 
     k += j;
 
+    /* Check for RELRO sections before potentially modifying k for linker
+       script ordering. RELRO sections are in range 0x141-0x14f. */
     if ((k & 0xfff0) == 0x140) {
       /* make RELRO section writable */
       s->sh_flags |= SHF_WRITE;
     }
+
+    /* If linker script has output sections defined, use linker script order
+       for ALLOC program sections (not relocation, symbol, or other special
+       sections). The linker script output section index becomes the primary
+       sort key, with the pattern index within the output section as the
+       secondary key. This ensures sections are ordered according to the
+       pattern order in the linker script (e.g., KEEP(*(.isr_vector)) before
+       *(.text)).
+       Sections not in the linker script are placed after all linker script
+       sections.
+
+       Classification encoding for linker script sections (within 0x100-0x6ff):
+       - Upper nibble (0x100-0x600): output section index (up to 6 sections)
+       - Lower byte: pattern index * 2 (to leave room for sub-classes)
+
+       For sections not in linker script, we use 0x6xx range.
+
+       Skip relocation sections (SHT_RELX), symbol tables, string tables,
+       hash tables, and other special sections - they should keep their
+       default ordering. */
+    if (j == 0x100 && s1->ld_script && s1->ld_script->nb_output_sections > 0 &&
+        s->sh_type != SHT_RELX && s->sh_type != SHT_SYMTAB &&
+        s->sh_type != SHT_DYNSYM && s->sh_type != SHT_STRTAB &&
+        s->sh_type != SHT_HASH && s->sh_type != SHT_GNU_HASH &&
+        s->sh_type != SHT_DYNAMIC) {
+      int pat_idx = 0;
+      ld_idx = ld_find_output_section_idx(s1, s->name, &pat_idx);
+      if (ld_idx >= 0) {
+        /* Section is in linker script: use ld_idx as primary key,
+           pattern index as secondary key.
+           pat_idx is the index of the matching pattern (0+), or nb_patterns
+           for exact name match (comes after all patterns).
+           Keep values in 0x100-0x5ff range to ensure proper handling. */
+        /* Limit ld_idx to fit in 5 bits (0-31 output sections) */
+        if (ld_idx > 31)
+          ld_idx = 31;
+        /* pat_idx in lower bits, ld_idx in upper bits, all within 0x100-0x6ff
+         */
+        k = 0x100 + (ld_idx << 4) + (pat_idx & 0x0f);
+      } else {
+        /* Section not in linker script: place after all linker script sections
+           but still within ALLOC range. Use 0x6xx + original sub-class. */
+        k = 0x600 + ((k & 0x7f) >> 4);
+      }
+    }
+
     for (n = i; n > 1 && k < (f = sec_cls[n - 1]); --n)
       sec_cls[n] = f, sec_order[n] = sec_order[n - 1];
     sec_cls[n] = k, sec_order[n] = i;
@@ -2790,7 +2877,8 @@ static int elf_output_file(TCCState *s1, const char *filename) {
   if (s1->linker_script) {
     if (tcc_load_linker_script(s1, s1->linker_script) < 0)
       return -1;
-    /* Apply linker script symbols early so they're available for resolution */
+    /* Apply linker script symbols early so they're available for resolution.
+     * Values for symbols in NOLOAD sections will be updated after layout. */
     ld_apply_symbols(s1, s1->ld_script);
   }
 
@@ -4011,10 +4099,12 @@ ST_FUNC int tcc_load_linker_script(TCCState *s1, const char *filename) {
   ret = ld_script_parse(s1, s1->ld_script, fd);
   close(fd);
 
+#if TCCELF_DUMP_LD_SCRIPT
   if (ret == 0 && s1->verbose) {
     printf("Loaded linker script: %s\n", filename);
     ld_script_dump(s1->ld_script);
   }
+#endif
 
   /* Add standard symbols */
   if (ret == 0) {
@@ -4047,7 +4137,7 @@ static void ld_apply_symbols(TCCState *s1, LDScript *ld) {
         }
       }
 
-      /* Check if symbol already exists - if so, update it */
+      /* Check if symbol already exists in symtab - if so, update it */
       sym_idx = find_elf_sym(s1->symtab, sym->name);
       if (sym_idx) {
         ElfW(Sym) *esym = &((ElfW(Sym) *)s1->symtab->data)[sym_idx];
@@ -4061,6 +4151,16 @@ static void ld_apply_symbols(TCCState *s1, LDScript *ld) {
         set_elf_sym(s1->symtab, sym->value, 0,
                     ELFW(ST_INFO)(STB_GLOBAL, STT_NOTYPE), vis, SHN_ABS,
                     sym->name);
+      }
+
+      /* Also update in dynsym if it exists there */
+      if (s1->dynsym) {
+        sym_idx = find_elf_sym(s1->dynsym, sym->name);
+        if (sym_idx) {
+          ElfW(Sym) *esym = &((ElfW(Sym) *)s1->dynsym->data)[sym_idx];
+          esym->st_value = sym->value;
+          esym->st_shndx = SHN_ABS;
+        }
       }
     }
   }
@@ -4076,8 +4176,9 @@ static void ld_update_symbol_values(TCCState *s1, LDScript *ld) {
   addr_t end_addr = 0;
   addr_t sec_end;
   int i, j;
+  addr_t output_section_addrs[LD_MAX_OUTPUT_SECTIONS] = {0};
 
-  /* Find section addresses */
+  /* Find section addresses and map output sections to actual addresses */
   for (i = 1; i < s1->nb_sections; i++) {
     s = s1->sections[i];
     if (!s->sh_addr)
@@ -4100,13 +4201,55 @@ static void ld_update_symbol_values(TCCState *s1, LDScript *ld) {
       rodata_start = s->sh_addr;
       rodata_end = sec_end;
     }
+
+    /* Map output section names to addresses */
+    for (j = 0; j < ld->nb_output_sections; j++) {
+      if (!strcmp(s->name, ld->output_sections[j].name)) {
+        output_section_addrs[j] = s->sh_addr;
+        break;
+      }
+    }
   }
 
-  /* Update symbol values in linker script */
+  /* For NOLOAD sections (like .heap, .stack) that don't have actual ELF
+   * sections, compute their addresses based on end_addr and their position
+   * in the linker script. These sections are placed sequentially. */
+  addr_t noload_addr = end_addr;
+  for (j = 0; j < ld->nb_output_sections; j++) {
+    if (output_section_addrs[j] == 0) {
+      /* This output section has no matching ELF section (NOLOAD) */
+      /* Use end_addr + accumulated offsets from previous NOLOAD sections */
+      output_section_addrs[j] = noload_addr;
+      /* Advance by the section's size (tracked via current_offset) */
+      noload_addr += ld->output_sections[j].current_offset;
+    }
+  }
+
+  /* First pass: update symbols that are defined in output sections using
+   * section_offset. This handles all symbols generically. */
+  for (j = 0; j < ld->nb_symbols; j++) {
+    LDSymbol *sym = &ld->symbols[j];
+    if (sym->defined && sym->section_idx >= 0 &&
+        sym->section_idx < ld->nb_output_sections) {
+      addr_t section_addr = output_section_addrs[sym->section_idx];
+      if (section_addr > 0) {
+        /* Symbol value = section base address + offset within section */
+        sym->value = section_addr + sym->section_offset;
+      }
+    }
+  }
+
+  /* Second pass: update standard section boundary symbols ONLY if not already
+   * defined in the linker script. This provides defaults for scripts that
+   * don't define these symbols explicitly. */
   for (j = 0; j < ld->nb_symbols; j++) {
     LDSymbol *sym = &ld->symbols[j];
 
-    /* Update standard section symbols */
+    /* Skip symbols already defined with a section_idx (from linker script) */
+    if (sym->defined && sym->section_idx >= 0)
+      continue;
+
+    /* Update standard section symbols only if not defined */
     if (!strcmp(sym->name, "__bss_start__") ||
         !strcmp(sym->name, "__bss_start")) {
       sym->value = bss_start;
@@ -4140,13 +4283,7 @@ static void ld_update_symbol_values(TCCState *s1, LDScript *ld) {
                !strcmp(sym->name, "end")) {
       sym->value = end_addr;
       sym->defined = 1;
-    } else if (!strcmp(sym->name, "__heap_start__")) {
-      sym->value = end_addr;
-      sym->defined = 1;
     }
-    /* Note: __heap_end__, __stack_start__, __stack_end__, __StackTop,
-     * __StackLimit are typically computed from __heap_size__ and __stack_size__
-     * which should already be set from the linker script */
   }
 }
 

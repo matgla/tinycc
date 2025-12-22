@@ -48,7 +48,13 @@ double __aeabi_i2d(int a) { return 0; }
 int __aeabi_dcmpgt(double a, double b) { return 0; }
 double __aeabi_idivmod(int a, int b) { return 0; }
 double __aeabi_ui2d(unsigned int a) { return 0; }
-void __aeabi_memset(void *dest, int n, int c) {}
+
+void __aeabi_memset(void *dest, int n, int c) {
+  // for (int i = 0; i < n; i++) {
+  //   ((unsigned char *)dest)[i] = (unsigned char)c;
+  // }
+}
+
 void __aeabi_memmove8(void *dest, int n, int c) {}
 
 // #ifdef __TINYC__

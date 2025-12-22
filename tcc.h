@@ -1845,12 +1845,16 @@ typedef struct TACQuadruple {
 
 ST_FUNC void tcc_gen_machine_data_processing_op(TACQuadruple *q);
 ST_FUNC void tcc_gen_machine_load_op(TACQuadruple *q);
+ST_FUNC void tcc_gen_machine_store_op(TACQuadruple *q);
 ST_FUNC void tcc_gen_machine_load_register(SValue *value);
+ST_FUNC void tcc_gen_machine_store_register(SValue *value);
+
 ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *q);
 ST_FUNC int tcc_gen_machine_number_of_registers(void);
 ST_FUNC void tcc_gen_machine_return_value_op(TACQuadruple *q);
 ST_FUNC void tcc_gen_machine_epilog(int leaffunc);
-ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers);
+ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers,
+                                    int stack_size);
 ST_FUNC void tcc_gen_machine_func_param_op(TACQuadruple *q);
 ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_value);
 ST_FUNC void tcc_gen_machine_jump_op(TACQuadruple *q);

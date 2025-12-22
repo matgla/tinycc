@@ -119,7 +119,15 @@ ST_FUNC void gen_le32(int i) {
   cur_text_section->data[ind++] = (i >> 24) & 0xFF;
 }
 
-ST_FUNC void gen_expr32(ExprValue *pe) { gen_le32(pe->v); }
+ST_FUNC void gen_expr32(ExprValue *pe) {
+  if (pe->sym) {
+    /* Emit relocation for symbol reference */
+    greloca(cur_text_section, pe->sym, ind, R_ARM_ABS32, pe->v);
+    gen_le32(0); /* Placeholder, will be filled by relocation */
+  } else {
+    gen_le32(pe->v);
+  }
+}
 
 int is_valid_opcode(thumb_opcode op);
 
@@ -2151,7 +2159,9 @@ static void thumb_branch(TCCState *s1, int token) {
     if (e.sym) {
       esym = elfsym(e.sym);
       if (esym && esym->st_shndx == cur_text_section->sh_num) {
-        jump_addr = th_encbranch(ind, e.v + esym->st_value);
+        /* strip thumb bit from symbol value for branch calculation */
+        int target = e.v + (esym->st_value & ~1);
+        jump_addr = th_encbranch(ind, target);
       } else {
         if (THUMB_INSTRUCTION_GROUP(token) == TOK_ASM_cbzeq ||
             THUMB_INSTRUCTION_GROUP(token) == TOK_ASM_cbnzeq) {

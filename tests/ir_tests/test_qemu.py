@@ -11,9 +11,13 @@ TEST_FILES = [
     ("20_op_add.c", 0),
     ("30_function_call.c", 30),
     ("40_if.c", 0),
+    ("50_simple_struct.c", 0),
     ("../tests2/00_assignment.c", 0),
     ("../tests2/01_comment.c", 0),
     ("../tests2/02_printf.c", 0),
+    ("../tests2/03_struct.c", 0),
+    ("../tests2/04_for.c", 0),
+    ("../tests2/05_array.c", 0),
 ]
 
 def load_expect_file(test_name):
@@ -39,9 +43,19 @@ def test_qemu_execution(test_file, expected_exit_code):
     if test_file is None:
         pytest.fail("test_file is None")
 
-    print(f"Running test: {test_file}")
     expected_lines = load_expect_file(test_file)
-    sut = run_test(test_file, MACHINE)
+    sut, loglines = run_test(test_file, MACHINE)
+    # remove expected compiler output
+    compiler_verified = False
+    for line in expected_lines:
+        if compiler_verified:
+            break
+        for logline in loglines:
+            if line in logline:
+                expected_lines = [l for l in expected_lines if l != line]
+                compiler_verified = True
+                break
+
 
     try:
         for line in expected_lines:

@@ -27,6 +27,27 @@
 static Section *last_text_section; /* to handle .previous asm directive */
 static int asmgoto_n;
 
+/* Assembler macro support */
+#define ASM_MACRO_MAX_ARGS 16
+typedef struct AsmMacro {
+  int name;                     /* token for macro name */
+  int nb_args;                  /* number of arguments */
+  int args[ASM_MACRO_MAX_ARGS]; /* argument tokens */
+  TokenString *body;            /* macro body tokens */
+  struct AsmMacro *next;
+} AsmMacro;
+
+static AsmMacro *asm_macros = NULL;
+
+static AsmMacro *asm_macro_find(int name) {
+  AsmMacro *m;
+  for (m = asm_macros; m; m = m->next) {
+    if (m->name == name)
+      return m;
+  }
+  return NULL;
+}
+
 static int asm_get_prefix_name(TCCState *s1, const char *prefix,
                                unsigned int n) {
   char buf[64];
@@ -655,6 +676,79 @@ static void asm_parse_directive(TCCState *s1, int global) {
     next();
     break;
   }
+  case TOK_ASMDIR_macro: {
+    /* .macro name [arg1[, arg2, ...]] */
+    AsmMacro *m;
+    int macro_name;
+    next();
+    if (tok < TOK_IDENT)
+      expect("macro name");
+    macro_name = tok;
+    m = tcc_mallocz(sizeof(AsmMacro));
+    m->name = macro_name;
+    m->nb_args = 0;
+    next();
+    /* parse optional arguments */
+    while (tok != TOK_LINEFEED && tok != ';' && tok != CH_EOF) {
+      if (m->nb_args >= ASM_MACRO_MAX_ARGS)
+        tcc_error("too many macro arguments");
+      if (tok < TOK_IDENT)
+        expect("argument name");
+      m->args[m->nb_args++] = tok;
+      next();
+      if (tok == ',')
+        next();
+    }
+    /* collect macro body until .endm */
+    m->body = tok_str_alloc();
+    {
+      int saved_parse_flags = parse_flags;
+      parse_flags |= PARSE_FLAG_ACCEPT_STRAYS; /* allow \arg syntax */
+      while (next(), tok != TOK_ASMDIR_endm) {
+        if (tok == CH_EOF)
+          tcc_error("unexpected end of file in .macro");
+        if (tok == '\\') {
+          /* GAS-style \arg - peek next token */
+          next();
+          if (tok >= TOK_IDENT) {
+            /* check if it's a macro argument */
+            int i, found = 0;
+            for (i = 0; i < m->nb_args; i++) {
+              if (tok == m->args[i]) {
+                found = 1;
+                break;
+              }
+            }
+            if (found) {
+              /* store argument reference (just the arg token, substitution
+               * handles it) */
+              tok_str_add_tok(m->body);
+            } else {
+              /* not an argument, store backslash and token */
+              tok_str_add(m->body, '\\');
+              tok_str_add_tok(m->body);
+            }
+          } else {
+            /* backslash followed by non-identifier */
+            tok_str_add(m->body, '\\');
+            tok_str_add_tok(m->body);
+          }
+        } else {
+          tok_str_add_tok(m->body);
+        }
+      }
+      parse_flags = saved_parse_flags;
+    }
+    tok_str_add(m->body, TOK_EOF);
+    /* add macro to list */
+    m->next = asm_macros;
+    asm_macros = m;
+    next();
+    break;
+  }
+  case TOK_ASMDIR_endm:
+    tcc_error(".endm without .macro");
+    break;
   case TOK_ASMDIR_org: {
     unsigned long n;
     ExprValue e;
@@ -1004,7 +1098,115 @@ static int tcc_assemble_internal(TCCState *s1, int do_preprocess, int global) {
         set_symbol(s1, opcode);
         goto redo;
       } else {
-        asm_opcode(s1, opcode);
+        /* check for macro expansion */
+        AsmMacro *m = asm_macro_find(opcode);
+        if (m) {
+          /* expand macro */
+          TokenString *arg_strs[ASM_MACRO_MAX_ARGS];
+          TokenString *expanded;
+          const int *body_ptr;
+          int arg_count = 0;
+          int i, t;
+          CValue cv;
+
+          /* initialize arg_strs */
+          for (i = 0; i < ASM_MACRO_MAX_ARGS; i++)
+            arg_strs[i] = NULL;
+
+          /* collect arguments - each argument can be multiple tokens */
+          while (tok != TOK_LINEFEED && tok != ';' && tok != CH_EOF) {
+            if (arg_count >= m->nb_args)
+              tcc_error("too many arguments for macro '%s'",
+                        get_tok_str(m->name, NULL));
+            arg_strs[arg_count] = tok_str_alloc();
+            /* collect tokens until comma or end of line */
+            while (tok != ',' && tok != TOK_LINEFEED && tok != ';' &&
+                   tok != CH_EOF) {
+              tok_str_add_tok(arg_strs[arg_count]);
+              next();
+            }
+            tok_str_add(arg_strs[arg_count], TOK_EOF);
+            arg_count++;
+            if (tok == ',')
+              next();
+          }
+          if (arg_count < m->nb_args)
+            tcc_error("not enough arguments for macro '%s'",
+                      get_tok_str(m->name, NULL));
+
+          /* build expanded token string with argument substitution */
+          expanded = tok_str_alloc();
+          body_ptr = m->body->str;
+          for (;;) {
+            t = *body_ptr++;
+            if (t == TOK_EOF)
+              break;
+            /* skip line number tokens */
+            if (t == TOK_LINENUM) {
+              body_ptr++; /* skip line number value */
+              continue;
+            }
+            /* check if this token is a macro argument */
+            for (i = 0; i < m->nb_args; i++) {
+              if (t == m->args[i]) {
+                /* substitute with argument tokens */
+                const int *arg_ptr = arg_strs[i]->str;
+                int at;
+                while ((at = *arg_ptr++) != TOK_EOF) {
+                  if (at == TOK_LINENUM) {
+                    arg_ptr++; /* skip line number */
+                    continue;
+                  }
+                  tok_str_add(expanded, at);
+                  /* handle tokens with values */
+                  if (at >= TOK_CCHAR && at <= TOK_LINENUM) {
+                    tok_str_add(expanded, *arg_ptr++);
+                  } else if (at == TOK_STR || at == TOK_LSTR ||
+                             at == TOK_PPNUM || at == TOK_PPSTR) {
+                    int size = *arg_ptr++;
+                    int nb_words = 1 + (size + sizeof(int) - 1) / sizeof(int);
+                    tok_str_add(expanded, size);
+                    for (int j = 1; j < nb_words; j++)
+                      tok_str_add(expanded, *arg_ptr++);
+                  }
+                }
+                goto next_body_tok;
+              }
+            }
+            /* not an argument, copy token as-is */
+            tok_str_add(expanded, t);
+            /* handle tokens with values */
+            if (t >= TOK_CCHAR && t <= TOK_LINENUM) {
+              tok_str_add(expanded, *body_ptr++);
+            } else if (t == TOK_STR || t == TOK_LSTR || t == TOK_PPNUM ||
+                       t == TOK_PPSTR) {
+              int size = *body_ptr++;
+              int nb_words = 1 + (size + sizeof(int) - 1) / sizeof(int);
+              tok_str_add(expanded, size);
+              for (int j = 1; j < nb_words; j++)
+                tok_str_add(expanded, *body_ptr++);
+            }
+          next_body_tok:;
+          }
+          tok_str_add(expanded, TOK_EOF);
+
+          /* execute expanded macro */
+          begin_macro(expanded, 1);
+          tcc_assemble_internal(s1, (parse_flags & PARSE_FLAG_PREPROCESS),
+                                global);
+          end_macro();
+
+          /* free arg strings */
+          for (i = 0; i < arg_count; i++) {
+            if (arg_strs[i])
+              tok_str_free(arg_strs[i]);
+          }
+          /* skip end-of-line check, continue to next iteration */
+          parse_flags &= ~PARSE_FLAG_LINEFEED;
+          continue;
+        } else {
+          asm_opcode(s1, opcode);
+        }
       }
     }
     /* end of line */

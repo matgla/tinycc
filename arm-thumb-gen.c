@@ -217,6 +217,7 @@ flags_behaviour g_setflags = FLAGS_BEHAVIOUR_SET;
 
 uint32_t caller_saved_registers;
 uint32_t pushed_registers;
+int allocated_stack_size;
 
 TACQuadruple function_arguments[4];
 int function_argument_count = 0;
@@ -762,28 +763,6 @@ static void gadd_sp(int val) {
                            ENFORCE_ENCODING_NONE));
   }
 }
-
-static void gcall_or_jmp(int is_jmp) {
-  if ((vtop->r & (VT_VALMASK | VT_LVAL)) == VT_CONST) {
-    uint32_t x = th_encbranch(ind, ind + vtop->c.i);
-
-    TRACE("gcall_or_jmp: %d, ind: 0x%x, 0x%x", is_jmp, ind, x);
-    if (x) {
-      if (vtop->r & VT_SYM)
-        greloc(cur_text_section, vtop->sym, ind, R_ARM_THM_JUMP24);
-      ot_check(th_bl_t1(x));
-    }
-  } else {
-    int r = gv(RC_INT);
-    TRACE("gcall_or_jmp indirect call");
-    ot_check(th_orr_imm(r, r, 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT));
-    if (!is_jmp)
-      ot_check(th_blx_reg(intr(r)));
-    else
-      ot_check(th_bx_reg(intr(r)));
-  }
-}
-
 /* Copy parameters to their final destination (core reg, VFP reg or stack) for
    function call.
 
@@ -1175,7 +1154,7 @@ void gfunc_call(int nb_args) {
   tcc_free(plan.pplans);
 
   vrotb(nb_args + 1);
-  gcall_or_jmp(0);
+  // gcall_or_jmp(0);
 
   if (args_size)
     gadd_sp(args_size);
@@ -1240,7 +1219,7 @@ void gfunc_epilog(void) {
 
 void ggoto(void) {
   TRACE("'ggoto'");
-  gcall_or_jmp(1);
+  // gcall_or_jmp(1);
 
   vtop--;
   print_vstack("ggoto");
@@ -1438,7 +1417,7 @@ void store(int r, SValue *sv) {
   v = fr & VT_VALMASK;
 
   if (fr & VT_LVAL || fr == VT_LOCAL) {
-    uint32_t base = 11;
+    uint32_t base = R_FP;
     if (v < VT_CONST) {
       base = intr(v);
       v = VT_LOCAL;
@@ -2417,6 +2396,18 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op) {
                           ENFORCE_ENCODING_NONE));
     }
     break;
+  case TCCIR_OP_SHL: {
+    if (th_has_immediate_value(op->src2.r)) {
+      ot_check(th_lsl_imm(op->dest.pr0, op->src1.pr0, op->src2.c.i,
+                          FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                          ENFORCE_ENCODING_NONE));
+    } else {
+      ot_check(th_lsl_reg(op->dest.pr0, op->src1.pr0, op->src2.pr0,
+                          FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                          ENFORCE_ENCODING_NONE));
+    }
+    break;
+  }
   case TCCIR_OP_ADC_USE:
     // return ot_check(th_adc_reg(intr(op->res), intr(op->arg1), intr(op->arg2),
     //  FLAGS_BEHAVIOUR_NOT_IMPORTANT,
@@ -2454,7 +2445,13 @@ void tcc_gen_machine_load_op(TACQuadruple *op) {
   load(op->dest.pr0, &op->src1);
 }
 
-ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers) {
+ST_FUNC void tcc_gen_machine_store_op(TACQuadruple *op) {
+  TRACE("'tcc_gen_machine_store_op'");
+  store(op->src1.pr0, &op->dest);
+}
+
+ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers,
+                                    int stack_size) {
   memset(function_arguments, 0, sizeof(function_arguments));
   uint16_t registers_to_push = 0;
   int registers_count = 0;
@@ -2467,9 +2464,12 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers) {
     registers_count++;
   }
 
-  if (tcc_state->need_frame_pointer) {
+  if (stack_size > 0 && !tcc_state->omit_frame_pointer) {
+    tcc_state->need_frame_pointer = 1;
     registers_to_push |= (1 << R_FP);
     registers_count++;
+  } else {
+    tcc_state->need_frame_pointer = 0;
   }
 
   for (int i = R4; i <= R11; ++i) {
@@ -2493,6 +2493,8 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers) {
   }
   pushed_registers = registers_to_push;
 
+  // allocate stack space for local variables
+  allocated_stack_size = stack_size;
   if (tcc_state->need_frame_pointer) {
     if (!ot(th_add_imm(R_FP, R_SP, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
                        ENFORCE_ENCODING_NONE))) {
@@ -2503,11 +2505,27 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers) {
       exit(1);
     }
   }
+  if (stack_size > 0) {
+    ot_check(th_sub_sp_imm(R_SP, stack_size, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                           ENFORCE_ENCODING_NONE));
+  }
 }
 
 ST_FUNC void tcc_gen_machine_epilog(int leaffunc) {
   TRACE("'tcc_gen_machine_epilog'");
   int lr_saved = pushed_registers & (1 << R_LR);
+
+  // restore stack pointer
+  if (tcc_state->need_frame_pointer) {
+    // restore SP from frame pointer
+    ot_check(th_mov_reg(R_SP, R_FP, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                        THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
+  } else if (allocated_stack_size > 0) {
+    // deallocate stack space for local variables
+    ot_check(th_add_sp_imm(R_SP, allocated_stack_size,
+                           FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                           ENFORCE_ENCODING_NONE));
+  }
 
   if (lr_saved) {
     pushed_registers |= 1 << R_PC;
@@ -2527,6 +2545,19 @@ ST_FUNC void tcc_gen_machine_epilog(int leaffunc) {
 }
 
 ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *op) {
+  if (op->dest.pr0 == -1) {
+    load(R12, &op->src1);
+    store(R12, &op->dest);
+    return;
+  }
+  // if ((op->dest.r & VT_LVAL)) {
+  //   if (op->dest.pr0 == -1) {
+  //     load(R12, &op->dest);
+  //     store(R12, &op->src1);
+  //     return;
+  //   }
+  //   load(op->dest.pr0, &op->src1);
+  // } else {
   if ((op->src1.r & VT_VALMASK) == VT_CONST) {
     load(op->dest.pr0, &op->src1);
     return;
@@ -2536,6 +2567,7 @@ ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *op) {
 
   ot_check(th_mov_reg(op->dest.pr0, op->src1.pr0, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
                       THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
+  // }
 }
 
 // r0 - function
@@ -2554,6 +2586,8 @@ ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *op) {
 ST_FUNC int tcc_gen_machine_number_of_registers(void) { return 11; }
 
 ST_FUNC void tcc_gen_machine_load_register(SValue *sv) { load(sv->pr0, sv); }
+
+ST_FUNC void tcc_gen_machine_store_register(SValue *sv) { store(sv->pr0, sv); }
 
 ST_FUNC void tcc_gen_machine_func_param_op(TACQuadruple *q) {
   // cache argument for register passing
@@ -2574,15 +2608,14 @@ static void gcall_or_jump(int is_jmp, SValue *dest) {
       ot_check(th_bl_t1(x));
     }
   } else {
-    fprintf(stderr, "compiler_error: implement gcall_or_jmp for non-const\n");
-    exit(1);
+    load(R12, dest);
     // int r = gv(RC_INT);
     // TRACE("gcall_or_jmp indirect call");
     // ot_check(th_orr_imm(r, r, 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT));
-    // if (!is_jmp)
-    // ot_check(th_blx_reg(intr(r)));
-    // else
-    // ot_check(th_bx_reg(intr(r)));
+    if (!is_jmp)
+      ot_check(th_blx_reg(intr(R12)));
+    else
+      ot_check(th_bx_reg(intr(R12)));
   }
 }
 
@@ -2597,8 +2630,18 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result) {
     TACQuadruple *q = &function_arguments[i];
     if (i < 4) {
       if (q->src1.pr0 != -1) {
-        ot_check(th_mov_reg(R0 + i, q->src1.pr0, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                            THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
+        const int val_loc = q->src1.r & VT_VALMASK;
+        if (val_loc != VT_CONST && val_loc != VT_LVAL && val_loc != VT_LOCAL) {
+          if (q->src1.r & VT_LVAL) {
+            load(R0 + i, &q->src1);
+            return;
+          }
+        }
+        if (q->src1.pr0 != R0 + i) {
+          ot_check(
+              th_mov_reg(R0 + i, q->src1.pr0, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                         THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
+        }
       } else {
         load(R0 + i, &q->src1);
       }
@@ -2623,6 +2666,7 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result) {
     return;
   }
   if (q->dest.pr0 != R0) {
+
     ot_check(th_mov_reg(q->dest.pr0, R0, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
                         THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
   }

@@ -24,12 +24,15 @@ def compile_testcase(test_file, machine):
         if result.returncode != 0:
             raise RuntimeError(f"Clean failed with exit code {result.returncode}")
         was_cleaned = True
-    result = subprocess.run(make_command, shell=True)
+    result = subprocess.run(make_command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if result.returncode != 0:
+        print(result.stdout.decode())
+        print(result.stderr.decode())
         raise RuntimeError(f"Build failed with exit code {result.returncode}")
+    output_lines = result.stdout.decode().splitlines() if result.stdout else []
+    output_lines += result.stderr.decode().splitlines() if result.stderr else []
     result = get_test_output_file(test_file)
-    print(f"Compiled test case to {result}")
-    return result
+    return result, output_lines
 
 def prepare_test(machine, kernel_file):
     qemu_command = build_qemu_command(machine, kernel_file)
@@ -37,11 +40,11 @@ def prepare_test(machine, kernel_file):
 
 def run_test(test_file, machine):
     test_name = Path(test_file).stem
-    output_file = compile_testcase(CURRENT_DIR / test_file, machine)
+    output_file, loglines = compile_testcase(CURRENT_DIR / test_file, machine)
     sut = prepare_test(machine, output_file)
 
     # Enable logging to file using test name
     log_file = open(f"{CURRENT_DIR}/build/{test_name}_output.log", "wb")
     sut.logfile = log_file
-    return sut
+    return sut, loglines
 

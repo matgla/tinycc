@@ -581,6 +581,9 @@ static int ld_parse_section_pattern(LDParser *p, LDOutputSection *os,
 }
 
 static int ld_parse_output_section_contents(LDParser *p, LDOutputSection *os) {
+  /* Save the location counter at section entry to compute relative offsets */
+  os->start_lc = p->ld->location_counter;
+
   while (p->tok != '}' && p->tok != LDTOK_EOF) {
     if (p->tok == '.') {
       /* Location counter assignment: . = expr */
@@ -588,7 +591,8 @@ static int ld_parse_output_section_contents(LDParser *p, LDOutputSection *os) {
       if (p->tok == '=') {
         ld_next_token(p);
         p->ld->location_counter = ld_parse_expr(p);
-        os->current_offset = p->ld->location_counter;
+        /* Track relative offset from section start */
+        os->current_offset = p->ld->location_counter - os->start_lc;
         if (p->tok == ';')
           ld_next_token(p);
       }
@@ -611,7 +615,11 @@ static int ld_parse_output_section_contents(LDParser *p, LDOutputSection *os) {
             ld_next_token(p);
             if (p->tok == '=') {
               ld_next_token(p);
-              p->ld->symbols[idx].value = ld_parse_expr(p);
+              addr_t val = ld_parse_expr(p);
+              p->ld->symbols[idx].value = val;
+              /* Compute offset from the evaluated value, not stale
+               * current_offset */
+              p->ld->symbols[idx].section_offset = val - os->start_lc;
               p->ld->symbols[idx].defined = 1;
               p->ld->symbols[idx].section_idx = p->ld->current_section_idx;
             }
@@ -632,7 +640,11 @@ static int ld_parse_output_section_contents(LDParser *p, LDOutputSection *os) {
           int idx = ld_script_find_or_create_symbol(p->ld, name);
           if (idx >= 0) {
             ld_next_token(p);
-            p->ld->symbols[idx].value = ld_parse_expr(p);
+            addr_t val = ld_parse_expr(p);
+            p->ld->symbols[idx].value = val;
+            /* Compute offset from the evaluated value, not stale current_offset
+             */
+            p->ld->symbols[idx].section_offset = val - os->start_lc;
             p->ld->symbols[idx].defined = 1;
             p->ld->symbols[idx].section_idx = p->ld->current_section_idx;
             if (p->tok == ';')
@@ -693,10 +705,22 @@ static int ld_parse_sections(LDParser *p) {
         ld_next_token(p);
       }
 
+      /* Skip section type flags like (NOLOAD), (COPY), etc. */
+      if (p->tok == '(') {
+        while (p->tok != ')' && p->tok != LDTOK_EOF)
+          ld_next_token(p);
+        if (p->tok == ')')
+          ld_next_token(p);
+      }
+
       /* Section content in braces */
       if (p->tok == ':') {
         ld_next_token(p);
       }
+
+      /* Track section start for relative offset calculation */
+      os->current_offset = 0;
+      os->start_lc = p->ld->location_counter;
 
       if (p->tok == '{') {
         ld_next_token(p);
@@ -746,7 +770,8 @@ static int ld_parse_sections(LDParser *p) {
           if (p->tok == ';')
             ld_next_token(p);
         }
-      } else if (p->tok == ':' || p->tok == '{' || p->tok == LDTOK_NUM) {
+      } else if (p->tok == ':' || p->tok == '{' || p->tok == LDTOK_NUM ||
+                 p->tok == '(') {
         /* Output section */
         if (p->ld->nb_output_sections >= LD_MAX_OUTPUT_SECTIONS) {
           return tcc_error_noabort("too many output sections");
@@ -755,6 +780,7 @@ static int ld_parse_sections(LDParser *p) {
         strncpy(os->name, name, sizeof(os->name) - 1);
         os->memory_region_idx = -1;
         os->phdr_idx = -1;
+        os->current_offset = 0;
         p->ld->current_section_idx = p->ld->nb_output_sections;
 
         if (p->tok == LDTOK_NUM) {
@@ -763,8 +789,18 @@ static int ld_parse_sections(LDParser *p) {
           ld_next_token(p);
         }
 
+        /* Skip section type flags like (NOLOAD), (COPY), etc. */
+        if (p->tok == '(') {
+          while (p->tok != ')' && p->tok != LDTOK_EOF)
+            ld_next_token(p);
+          if (p->tok == ')')
+            ld_next_token(p);
+        }
+
         if (p->tok == ':')
           ld_next_token(p);
+
+        os->start_lc = p->ld->location_counter;
 
         if (p->tok == '{') {
           ld_next_token(p);

@@ -9,11 +9,12 @@ ENTRY (Reset_Handler)
 __stack_size__ = 0x2000;  /* 8KB stack */
 __heap_size__  = 0x10000; /* 64KB heap */
 
+
 SECTIONS
 {
     .text :
     {
-        KEEP(*(.text.isr_vector))
+        KEEP(*(.isr_vector))
         *(.text)
         *(.text*)
         *(.rodata)
@@ -53,6 +54,7 @@ SECTIONS
         . = ALIGN(8);
         __stack_start__ = .;
         . = . + __stack_size__;
+        __stack = .;
         __stack_end__ = .;
         __StackTop = .;
     } > FLASH

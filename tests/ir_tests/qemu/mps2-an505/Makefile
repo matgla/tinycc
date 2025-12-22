@@ -26,10 +26,10 @@ LDFLAGS += -Wl,--start-group -lrdimon -lc_nano -lgcc -Wl,--end-group --specs=rdi
 endif
 
 
-SRCS = $(MAKEFILE_DIR)boot.c $(TEST_FILES)
-ASMS =
+SRCS = $(TEST_FILES)
+ASMS = $(MAKEFILE_DIR)boot.S
 OBJS = $(patsubst $(MAKEFILE_DIR)%.c, $(OUTPUT)/%.o, $(SRCS))
-OBJS += $(patsubst $(MAKEFILE_DIR)%.s, $(OUTPUT)/%.o, $(ASMS))
+OBJS += $(patsubst $(MAKEFILE_DIR)%.S, $(OUTPUT)/%.o, $(ASMS))
 
 CRT_LIBS =  $(CRT_GCC)/crti.o $(CRT_GCC)/crtbegin.o $(SYSROOT)/rdimon-crt0.o $(CRT_GCC)/crtend.o $(CRT_GCC)/crtn.o
 
@@ -37,12 +37,13 @@ CRT_LIBS =  $(CRT_GCC)/crti.o $(CRT_GCC)/crtbegin.o $(SYSROOT)/rdimon-crt0.o $(C
 all: $(TARGET)
 	@echo "Build complete: $(TARGET)"
 
-$(OUTPUT)/%.o: $(MAKEFILE_DIR)%.c
+$(OUTPUT):
 	mkdir -p $(OUTPUT)
+
+$(OUTPUT)/%.o: $(MAKEFILE_DIR)%.c | $(OUTPUT)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(OUTPUT)/%.o: $(MAKEFILE_DIR)%.s
-	mkdir -p $(OUTPUT)
+$(OUTPUT)/%.o: $(MAKEFILE_DIR)%.S | $(OUTPUT)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(TARGET): $(OBJS)

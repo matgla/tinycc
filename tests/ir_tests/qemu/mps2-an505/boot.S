@@ -8,7 +8,7 @@
 .global __isr_vector
 __isr_vector:
     .long __StackTop            /* 0: Initial Stack Pointer */
-    .word Reset_Handler         /* 1: Reset Handler */
+    .long Reset_Handler         /* 1: Reset Handler */
     .long NMI_Handler           /* 2: NMI Handler */
     .long HardFault_Handler     /* 3: Hard Fault Handler */
     .long MemManage_Handler     /* 4: MPU Fault Handler */

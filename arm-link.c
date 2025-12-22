@@ -528,7 +528,10 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
       if (esym_index) {
         qrel->r_info = ELFW(R_INFO)(esym_index, R_ARM_ABS32);
         qrel++;
-        return;
+        /* For absolute symbols, still apply the value now */
+        if (sym->st_shndx != SHN_ABS) {
+          return;
+        }
       } else {
         qrel->r_info = ELFW(R_INFO)(0, R_ARM_RELATIVE);
         qrel++;

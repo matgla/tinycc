@@ -6780,6 +6780,9 @@ static void end_switch(void) {
 static void try_call_scope_cleanup(Sym *stop) {
   Sym *cls = cur_scope->cl.s;
 
+  if (nocode_wanted)
+    return;
+
   for (; cls != stop; cls = cls->next) {
     Sym *fs = cls->cleanup_func;
     Sym *vs = cls->prev_tok;
@@ -6789,7 +6792,14 @@ static void try_call_scope_cleanup(Sym *stop) {
     vtop->sym = vs;
     mk_pointer(&vtop->type);
     gaddrof();
-    gfunc_call(1);
+    // gfunc_call(1);
+    SValue src1;
+    memset(&src1, 0, sizeof(SValue));
+    src1.vr = -1;
+    src1.c.i = 1;
+    tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &src1, NULL);
+    tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[-1], NULL, NULL);
+    vtop -= 2;
   }
 }
 
@@ -7119,7 +7129,7 @@ again:
     memset(&dest, 0, sizeof(SValue));
     dest.vr = -1;
     dest.c.i = c;
-    tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
+    d = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
     tcc_ir_backpatch_to_here(tcc_state->ir, a);
     tcc_ir_backpatch(tcc_state->ir, b, c);
     // gsym_addr(b, d);
@@ -7399,14 +7409,40 @@ static void init_putz(init_params *p, unsigned long c, int size) {
   if (p->sec) {
     /* nothing to do because globals are already set to zero */
   } else {
-    vpush_helper_func(TOK_memset);
+    SValue src1;
+    SValue dest;
+
     vseti(VT_LOCAL, c);
     vpushi(0);
     vpushs(size);
+
+    memset(&src1, 0, sizeof(SValue));
+    src1.vr = -1;
+    src1.c.i = 1;
+    tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-2], &src1, NULL);
+    src1.c.i = 3;
+    tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &src1, NULL);
+    src1.c.i = 2;
+    tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[0], &src1, NULL);
+
+    vpush_helper_func(TOK_memset);
+    memset(&dest, 0, sizeof(SValue));
+    dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+    dest.type.t = vtop[-3].type.t;
+    dest.r = 0;
+    tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[0], NULL, &dest);
+    vtop -= 4;
+
+    // vtop -= 4;
+    // vtop->r = 0;
+    // vtop->vr = dest.vr;
+    // vtop->r = 0;
+    // vtop->vr = dest.vr;
+
 #if defined(TCC_TARGET_ARM) && defined TCC_ARM_EABI
-    vswap(); /* using __aeabi_memset(void*, size_t, int) */
+    // vswap(); /* using __aeabi_memset(void*, size_t, int) */
 #endif
-    gfunc_call(3);
+    // gfunc_call(3);
   }
 }
 
