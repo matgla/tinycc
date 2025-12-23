@@ -17,10 +17,11 @@ LDFLAGS = $(CFLAGS) -g -fvisibility=hidden
 
 TCC_PATH = $(shell realpath $(MAKEFILE_DIR)../../../../)
 LIBC_INCLUDES = $(shell realpath $(MAKEFILE_DIR)../../libc_includes)
+LIBGLOSS_PATH = $(shell realpath $(MAKEFILE_DIR)/newlib_build/arm-none-eabi/libgloss/arm)
 
 ifneq (,$(findstring armv8m-tcc,$(CC)))
 CFLAGS += -I$(LIBC_INCLUDES) -I$(ARM_SYSROOT)/include -I$(TCC_PATH)/include
-LDFLAGS += -L$(TCC_PATH) -L$(MAKEFILE_DIR)/newlib_build/arm-none-eabi/newlib -L$(MAKEFILE_DIR)/newlib_build/arm-none-eabi/libgloss/arm -llibc.a -llibrdimon.a -larmv8m-libtcc1.a -llibc.a -Wl,-oformat=elf32-littlearm -T$(MAKEFILE_DIR)linker_script.ld -v
+LDFLAGS += -L$(TCC_PATH) -L$(MAKEFILE_DIR)/newlib_build/arm-none-eabi/newlib -L$(LIBGLOSS_PATH) -llibc.a -llibrdimon.a -larmv8m-libtcc1.a -llibc.a -Wl,-oformat=elf32-littlearm -T$(MAKEFILE_DIR)linker_script.ld -v
 else
 LDFLAGS += -Wl,--start-group -lrdimon -lc_nano -lgcc -Wl,--end-group --specs=rdimon.specs -T$(MAKEFILE_DIR)linker_script.ld
 endif
@@ -31,7 +32,7 @@ ASMS = $(MAKEFILE_DIR)boot.S
 OBJS = $(patsubst $(MAKEFILE_DIR)%.c, $(OUTPUT)/%.o, $(SRCS))
 OBJS += $(patsubst $(MAKEFILE_DIR)%.S, $(OUTPUT)/%.o, $(ASMS))
 
-CRT_LIBS =  $(CRT_GCC)/crti.o $(CRT_GCC)/crtbegin.o $(SYSROOT)/rdimon-crt0.o $(CRT_GCC)/crtend.o $(CRT_GCC)/crtn.o
+CRT_LIBS = $(CRT_GCC)/crti.o $(LIBGLOSS_PATH)/rdimon-crt0.o $(CRT_GCC)/crtend.o $(CRT_GCC)/crtn.o
 
 # Rules
 all: $(TARGET)

@@ -2333,6 +2333,9 @@ static int layout_sections(TCCState *s1, int *sec_order, struct dyn_inf *d) {
     ++phnum;
   if (d->roinf)
     ++phnum;
+  /* Add extra segments for memory regions (each region may need new PT_LOAD) */
+  if (s1->ld_script && s1->ld_script->nb_memory_regions > 1)
+    phnum += s1->ld_script->nb_memory_regions - 1;
   d->phnum = phnum;
   d->phdr = tcc_mallocz(phnum * sizeof(ElfW(Phdr)));
 
@@ -2372,6 +2375,19 @@ static int layout_sections(TCCState *s1, int *sec_order, struct dyn_inf *d) {
   /* compute address after headers */
   // addr += file_offset;
   elf_header_offset = file_offset;
+
+  /* Track per-memory-region address counters for linker script placement */
+  addr_t mr_addr[LD_MAX_MEMORY_REGIONS];
+  int cur_mr = 0;
+  if (s1->ld_script && s1->ld_script->nb_memory_regions > 0) {
+    for (int mr = 0; mr < s1->ld_script->nb_memory_regions; mr++) {
+      mr_addr[mr] = s1->ld_script->memory_regions[mr].origin;
+    }
+    addr = mr_addr[0];
+  } else {
+    mr_addr[0] = addr;
+  }
+
   n = 0;
   for (i = 1; i < s1->nb_sections; i++) {
     s = s1->sections[sec_order[i]];
@@ -2384,6 +2400,34 @@ static int layout_sections(TCCState *s1, int *sec_order, struct dyn_inf *d) {
       if (s->sh_type != SHT_NOBITS)
         file_offset += s->sh_size;
       continue;
+    }
+
+    /* Check if this section should be placed in a different memory region */
+    if (s1->ld_script && s1->ld_script->nb_memory_regions > 0 &&
+        s1->ld_script->nb_output_sections > 0) {
+      int pat_idx = -1;
+      int ld_idx = ld_find_output_section_idx(s1, s->name, &pat_idx);
+      if (ld_idx >= 0) {
+        int new_mr = s1->ld_script->output_sections[ld_idx].memory_region_idx;
+        printf(
+            "layout: section %s -> output section %d (%s) memory_region=%d\n",
+            s->name, ld_idx, s1->ld_script->output_sections[ld_idx].name,
+            new_mr);
+        if (new_mr >= 0 && new_mr < s1->ld_script->nb_memory_regions) {
+          if (new_mr != cur_mr) {
+            /* Save current region's address and switch to new region */
+            printf("  switching from region %d (addr=%lx) to region %d "
+                   "(addr=%lx)\n",
+                   cur_mr, (unsigned long)addr, new_mr,
+                   (unsigned long)mr_addr[new_mr]);
+            mr_addr[cur_mr] = addr;
+            cur_mr = new_mr;
+            addr = mr_addr[cur_mr];
+            /* Force new program header when changing memory regions */
+            f |= 1 << 8;
+          }
+        }
+      }
     }
 
     if ((f & 1 << 8) && n) {
@@ -4212,16 +4256,42 @@ static void ld_update_symbol_values(TCCState *s1, LDScript *ld) {
   }
 
   /* For NOLOAD sections (like .heap, .stack) that don't have actual ELF
-   * sections, compute their addresses based on end_addr and their position
-   * in the linker script. These sections are placed sequentially. */
-  addr_t noload_addr = end_addr;
+   * sections, compute their addresses based on the memory region they're
+   * assigned to in the linker script. Track per-region end addresses. */
+  addr_t mr_end[LD_MAX_MEMORY_REGIONS] = {0};
+
+  /* Initialize memory region end addresses from laid-out sections */
+  for (j = 0; j < ld->nb_output_sections; j++) {
+    if (output_section_addrs[j] != 0) {
+      int mr = ld->output_sections[j].memory_region_idx;
+      if (mr < 0)
+        mr = 0;
+      if (mr >= 0 && mr < ld->nb_memory_regions) {
+        addr_t sec_end_addr =
+            output_section_addrs[j] + ld->output_sections[j].current_offset;
+        if (sec_end_addr > mr_end[mr])
+          mr_end[mr] = sec_end_addr;
+      }
+    }
+  }
+
+  /* For regions with no sections, start from their origin */
+  for (i = 0; i < ld->nb_memory_regions; i++) {
+    if (mr_end[i] == 0)
+      mr_end[i] = ld->memory_regions[i].origin;
+  }
+
+  /* Place NOLOAD sections in their assigned memory regions */
   for (j = 0; j < ld->nb_output_sections; j++) {
     if (output_section_addrs[j] == 0) {
       /* This output section has no matching ELF section (NOLOAD) */
-      /* Use end_addr + accumulated offsets from previous NOLOAD sections */
-      output_section_addrs[j] = noload_addr;
-      /* Advance by the section's size (tracked via current_offset) */
-      noload_addr += ld->output_sections[j].current_offset;
+      int mr = ld->output_sections[j].memory_region_idx;
+      if (mr < 0)
+        mr = 0;
+      if (mr >= 0 && mr < ld->nb_memory_regions) {
+        output_section_addrs[j] = mr_end[mr];
+        mr_end[mr] += ld->output_sections[j].current_offset;
+      }
     }
   }
 

@@ -19,6 +19,8 @@ SECTIONS
         *(.text*)
         *(.rodata)
         *(.rodata*)
+        *(.init)
+        *(.fini)
     } > FLASH
 
     .data :
@@ -27,16 +29,16 @@ SECTIONS
         *(.data)
         *(.data*)
         __data_end__ = .;
-    } > FLASH
+    } > RAM
 
-    .bss :
+    .bss (NOLOAD) :
     {
         __bss_start__ = .;
         *(.bss)
         *(.bss*)
         *(COMMON)
         __bss_end__ = .;
-    } > FLASH
+    } > RAM
 
     .heap (NOLOAD) :
     {
@@ -47,17 +49,16 @@ SECTIONS
         . = . + __heap_size__;
         __heap_end__ = .;
         __HeapLimit = .;
-    } > FLASH
+    } > RAM
 
     .stack (NOLOAD) :
     {
         . = ALIGN(8);
         __stack_start__ = .;
+        __StackLimit = .;
         . = . + __stack_size__;
         __stack = .;
         __stack_end__ = .;
         __StackTop = .;
-    } > FLASH
-
-    __StackLimit = __stack_start__;
+    } > RAM
 }
