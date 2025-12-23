@@ -824,10 +824,11 @@ void tcc_ir_generate_code(TCCIRState *ir) {
     drop_return_value = 0;
     q = &ir->instructions[i];
 
-    // emit debug line info for this IR instruction
+    ir_to_code_mapping[i] = ind;
+
+    // emit debug line info for this IR instruction AFTER recording ind
     tcc_debug_line_num(tcc_state, q->line_num);
 
-    ir_to_code_mapping[i] = ind;
     if (irop_config[q->op].has_src1 == 1) {
       tcc_ir_fill_registers(ir, &q->src1);
       if (q->op != TCCIR_OP_FUNCCALLVAL && q->op != TCCIR_OP_FUNCCALLVOID &&

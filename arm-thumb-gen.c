@@ -1784,7 +1784,7 @@ void load(int r, SValue *sv) {
       fc = sign = 0;
       v = VT_LOCAL;
     } else if (v < VT_CONST) {
-      base = intr(v);
+      base = sv->pr0;
       fc = sign = 0;
       v = VT_LOCAL;
     }
@@ -2634,7 +2634,7 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result) {
         if (val_loc != VT_CONST && val_loc != VT_LVAL && val_loc != VT_LOCAL) {
           if (q->src1.r & VT_LVAL) {
             load(R0 + i, &q->src1);
-            return;
+            continue;
           }
         }
         if (q->src1.pr0 != R0 + i) {

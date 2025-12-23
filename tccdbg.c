@@ -1539,31 +1539,28 @@ ST_FUNC void tcc_debug_line(TCCState *s1) {
       dwarf_line_op(s1, DW_LNS_set_file);
       dwarf_uleb128_op(s1, dwarf_line.cur_file);
     }
-    if (len_pc && len_line >= DWARF_LINE_BASE &&
-        len_line <= (DWARF_OPCODE_BASE + DWARF_LINE_BASE) &&
-        n >= DWARF_OPCODE_BASE && n <= 255)
+
+    /* Handle the case where both PC and line advance */
+    if (len_pc > 0 && len_line >= DWARF_LINE_BASE &&
+        len_line < (DWARF_LINE_BASE + DWARF_LINE_RANGE) &&
+        n >= DWARF_OPCODE_BASE && n <= 255) {
       dwarf_line_op(s1, n);
+    }
+    /* Handle cases where we need separate operations */
     else {
-      if (len_pc) {
-        n = len_pc * DWARF_LINE_RANGE + 0 + DWARF_OPCODE_BASE - DWARF_LINE_BASE;
-        if (n >= DWARF_OPCODE_BASE && n <= 255)
-          dwarf_line_op(s1, n);
-        else {
-          dwarf_line_op(s1, DW_LNS_advance_pc);
-          dwarf_uleb128_op(s1, len_pc);
-        }
+      /* Advance PC first if needed */
+      if (len_pc > 0) {
+        dwarf_line_op(s1, DW_LNS_advance_pc);
+        dwarf_uleb128_op(s1, len_pc);
       }
-      if (len_line) {
-        n = 0 * DWARF_LINE_RANGE + len_line + DWARF_OPCODE_BASE -
-            DWARF_LINE_BASE;
-        if (len_line >= DWARF_LINE_BASE &&
-            len_line <= (DWARF_OPCODE_BASE + DWARF_LINE_BASE) &&
-            n >= DWARF_OPCODE_BASE && n <= 255)
-          dwarf_line_op(s1, n);
-        else {
-          dwarf_line_op(s1, DW_LNS_advance_line);
-          dwarf_sleb128_op(s1, len_line);
-        }
+      /* Then advance line if needed */
+      if (len_line != 0) {
+        dwarf_line_op(s1, DW_LNS_advance_line);
+        dwarf_sleb128_op(s1, len_line);
+      }
+      /* Always emit copy to create a new line table entry */
+      if (len_pc > 0 || len_line != 0) {
+        dwarf_line_op(s1, DW_LNS_copy);
       }
     }
     dwarf_line.last_pc = ind;
@@ -1598,31 +1595,27 @@ ST_FUNC void tcc_debug_line_num(TCCState *s1, int line_num) {
     int n = len_pc * DWARF_LINE_RANGE + len_line + DWARF_OPCODE_BASE -
             DWARF_LINE_BASE;
 
-    if (len_pc && len_line >= DWARF_LINE_BASE &&
-        len_line <= (DWARF_OPCODE_BASE + DWARF_LINE_BASE) &&
-        n >= DWARF_OPCODE_BASE && n <= 255)
+    /* Handle the case where both PC and line advance */
+    if (len_pc > 0 && len_line >= DWARF_LINE_BASE &&
+        len_line < (DWARF_LINE_BASE + DWARF_LINE_RANGE) &&
+        n >= DWARF_OPCODE_BASE && n <= 255) {
       dwarf_line_op(s1, n);
+    }
+    /* Handle cases where we need separate operations */
     else {
-      if (len_pc) {
-        n = len_pc * DWARF_LINE_RANGE + 0 + DWARF_OPCODE_BASE - DWARF_LINE_BASE;
-        if (n >= DWARF_OPCODE_BASE && n <= 255)
-          dwarf_line_op(s1, n);
-        else {
-          dwarf_line_op(s1, DW_LNS_advance_pc);
-          dwarf_uleb128_op(s1, len_pc);
-        }
+      /* Advance PC first if needed */
+      if (len_pc > 0) {
+        dwarf_line_op(s1, DW_LNS_advance_pc);
+        dwarf_uleb128_op(s1, len_pc);
       }
-      if (len_line) {
-        n = 0 * DWARF_LINE_RANGE + len_line + DWARF_OPCODE_BASE -
-            DWARF_LINE_BASE;
-        if (len_line >= DWARF_LINE_BASE &&
-            len_line <= (DWARF_OPCODE_BASE + DWARF_LINE_BASE) &&
-            n >= DWARF_OPCODE_BASE && n <= 255)
-          dwarf_line_op(s1, n);
-        else {
-          dwarf_line_op(s1, DW_LNS_advance_line);
-          dwarf_sleb128_op(s1, len_line);
-        }
+      /* Then advance line if needed */
+      if (len_line != 0) {
+        dwarf_line_op(s1, DW_LNS_advance_line);
+        dwarf_sleb128_op(s1, len_line);
+      }
+      /* Always emit copy to create a new line table entry */
+      if (len_pc > 0 || len_line != 0) {
+        dwarf_line_op(s1, DW_LNS_copy);
       }
     }
     dwarf_line.last_pc = ind;

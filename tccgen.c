@@ -7084,6 +7084,7 @@ again:
     skip(';');
 
   } else if (t == TOK_FOR) {
+    int saved_line_num;
     new_scope(&o);
 
     skip('(');
@@ -7123,13 +7124,21 @@ again:
       // gsym(e);
     }
     skip(')');
+    /* Save line number before loop body for backward jump */
+    saved_line_num = file->line_num;
     lblock(&a, &b);
     // gjmp_addr(d);
     SValue dest;
     memset(&dest, 0, sizeof(SValue));
     dest.vr = -1;
     dest.c.i = c;
-    d = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
+    /* Temporarily restore line number for backward jump instruction */
+    {
+      int cur_line = file->line_num;
+      file->line_num = saved_line_num;
+      d = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
+      file->line_num = cur_line;
+    }
     tcc_ir_backpatch_to_here(tcc_state->ir, a);
     tcc_ir_backpatch(tcc_state->ir, b, c);
     // gsym_addr(b, d);
