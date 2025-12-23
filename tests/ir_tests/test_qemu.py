@@ -18,6 +18,7 @@ TEST_FILES = [
     ("../tests2/03_struct.c", 0),
     ("../tests2/04_for.c", 0),
     ("../tests2/05_array.c", 0),
+    ("../tests2/06_case.c", 0),
 ]
 
 def load_expect_file(test_name):

@@ -194,7 +194,7 @@ ST_FUNC void gsym(int t) {
 
 /* Clear 'nocode_wanted' if current pc is a label */
 static int gind() {
-  int t = ind;
+  int t = tcc_state->ir->next_instruction_index;
   CODE_ON();
   if (debug_modes)
     tcc_tcov_block_begin(tcc_state);
@@ -6735,6 +6735,7 @@ static void case_sort(struct switch_t *sw) {
 
 static int gcase(struct case_t **base, int len, int dsym) {
   struct case_t *p;
+  SValue dest;
   int t, l2, e;
 
   t = vtop->type.t & VT_BTYPE;
@@ -6746,25 +6747,40 @@ static int gcase(struct case_t **base, int len, int dsym) {
     p = base[l2];
     vdup(), vpush64(t, p->v2);
     if (l2 == 0 && p->v1 == p->v2) {
+      int pos = 0;
       gen_op(TOK_EQ); /* jmp to case when equal */
-      gsym_addr(gvtst(0, 0), p->ind);
+      pos = tcc_ir_generate_test(tcc_state->ir, 0, 0);
+      tcc_ir_backpatch(tcc_state->ir, pos, p->ind);
+      // gsym_addr(gvtst(0, 0), p->ind);
     } else {
+      int pos = 0;
       /* case v1 ... v2 */
       gen_op(TOK_GT); /* jmp over when > V2 */
-      if (len == 1)   /* last case test jumps to default when false */
-        dsym = gvtst(0, dsym), e = 0;
-      else
-        e = gvtst(0, 0);
+      if (len == 1) /* last case test jumps to default when false */ {
+        // dsym = gvtst(0, dsym);
+        dsym = tcc_ir_generate_test(tcc_state->ir, 0, dsym);
+        e = 0;
+      } else {
+        e = tcc_ir_generate_test(tcc_state->ir, 0, 0);
+        // e = gvtst(0, 0);
+      }
       vdup(), vpush64(t, p->v1);
       gen_op(TOK_GE); /* jmp to case when >= V1 */
-      gsym_addr(gvtst(0, 0), p->ind);
+      pos = tcc_ir_generate_test(tcc_state->ir, 0, p->ind);
+      tcc_ir_backpatch(tcc_state->ir, pos, p->ind);
+      // gsym_addr(gvtst(0, 0), p->ind);
       dsym = gcase(base, l2, dsym);
-      gsym(e);
+      // gsym(e);s
+      tcc_ir_backpatch_to_here(tcc_state->ir, e);
     }
     ++l2, base += l2, len -= l2;
   }
   /* jump automagically will suppress more jumps */
-  return gjmp(dsym);
+  // return gjmp(dsym);
+  memset(&dest, 0, sizeof(SValue));
+  dest.vr = -1;
+  dest.c.i = dsym;
+  return tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
 }
 
 static void end_switch(void) {
@@ -7066,21 +7082,33 @@ again:
 
   } else if (t == TOK_BREAK) {
     /* compute jump */
+    SValue dest;
     if (!cur_scope->bsym)
       tcc_error("cannot break");
     if (cur_switch && cur_scope->bsym == cur_switch->bsym)
       leave_scope(cur_switch->scope);
     else
       leave_scope(loop_scope);
-    *cur_scope->bsym = gjmp(*cur_scope->bsym);
+    memset(&dest, 0, sizeof(SValue));
+    dest.vr = -1;
+    dest.c.i = *cur_scope->bsym;
+    *cur_scope->bsym =
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
+    // *cur_scope->bsym = gjmp(*cur_scope->bsym);
     skip(';');
 
   } else if (t == TOK_CONTINUE) {
     /* compute jump */
+    SValue dest;
     if (!cur_scope->csym)
       tcc_error("cannot continue");
     leave_scope(loop_scope);
-    *cur_scope->csym = gjmp(*cur_scope->csym);
+    memset(&dest, 0, sizeof(SValue));
+    dest.vr = -1;
+    dest.c.i = *cur_scope->csym;
+    // *cur_scope->csym = gjmp(*cur_scope->csym);
+    *cur_scope->csym =
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
     skip(';');
 
   } else if (t == TOK_FOR) {
@@ -7163,6 +7191,7 @@ again:
 
   } else if (t == TOK_SWITCH) {
     struct switch_t *sw;
+    SValue dest;
 
     sw = tcc_mallocz(sizeof *sw);
     sw->bsym = &a;
@@ -7180,27 +7209,49 @@ again:
     sw->sv = *vtop--; /* save switch value */
     print_vstack("block(2)");
     a = 0;
-    b = gjmp(0); /* jump to first case */
+    memset(&dest, 0, sizeof(SValue));
+    dest.vr = -1;
+    dest.c.i = 0;
+    b = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
+    // b = gjmp(0); /* jump to first case */
     lblock(&a, NULL);
-    a = gjmp(a); /* add implicit break */
+    dest.c.i = a;
+    a = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
+    // a = gjmp(a); /* add implicit break */
     /* case lookup */
-    gsym(b);
+    // gsym(b);
+
     prev_scope_s(&o);
     if (sw->nocode_wanted)
       goto skip_switch;
     case_sort(sw);
     sw->bsym = NULL; /* marker for 32bit:gen_opl() */
     vpushv(&sw->sv);
-    gv(RC_INT);
+    // gv(RC_INT);
+    memset(&dest, 0, sizeof(SValue));
+    dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+    c = tcc_state->ir
+            ->next_instruction_index; /* save start of case comparisons */
+    tcc_ir_put(tcc_state->ir, TCCIR_OP_ASSIGN, vtop, NULL, &dest);
+    vtop->vr = dest.vr;
+    vtop->r = 0;
     d = gcase(sw->p, sw->n, 0);
     vpop();
-    if (sw->def_sym)
-      gsym_addr(d, sw->def_sym);
-    else
-      gsym(d);
+
+    if (sw->def_sym) {
+      tcc_ir_backpatch(tcc_state->ir, b, c);
+      tcc_ir_backpatch(tcc_state->ir, d, sw->def_sym);
+    }
+    // gsym_addr(d, sw->def_sym);
+    else {
+      tcc_ir_backpatch(tcc_state->ir, b, c);
+      tcc_ir_backpatch_to_here(tcc_state->ir, d);
+    }
+    // gsym(d);
   skip_switch:
     /* break label */
-    gsym(a);
+    // gsym(a);
+    tcc_ir_backpatch_to_here(tcc_state->ir, a);
     end_switch();
 
   } else if (t == TOK_CASE) {
