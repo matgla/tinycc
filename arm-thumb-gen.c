@@ -88,6 +88,9 @@ typedef struct ThumbGeneratorState {
   ThumbLiteralPoolEntry *literal_pool;
   int literal_pool_size;
   int literal_pool_count;
+  /* Cache for global symbol base address to avoid redundant loads */
+  Sym *cached_global_sym; /* Last loaded global symbol */
+  int cached_global_reg;  /* Register holding its base address */
 } ThumbGeneratorState;
 
 ThumbGeneratorState thumb_gen_state;
@@ -532,6 +535,8 @@ static void th_literal_pool_init() {
                                             thumb_gen_state.literal_pool_size);
   thumb_gen_state.generating_function = 0;
   thumb_gen_state.code_size = 0;
+  thumb_gen_state.cached_global_sym = NULL;
+  thumb_gen_state.cached_global_reg = -1;
 }
 
 ST_FUNC void arm_init(struct TCCState *s) {
@@ -1454,13 +1459,26 @@ void store(int r, SValue *sv) {
       v = VT_LOCAL;
       fc = sign = 0;
     } else if (v == VT_CONST) {
-      SValue v1;
-      v1.type.t = ft;
-      v1.r = fr & ~VT_LVAL;
-      v1.c.i = sv->c.i;
-      v1.sym = sv->sym;
-      load(base = 14, &v1);
-      fc = sign = 0;
+      /* Check if we already have this global symbol's base address cached */
+      if (sv->sym && sv->sym == thumb_gen_state.cached_global_sym &&
+          thumb_gen_state.cached_global_reg >= 0) {
+        /* Reuse cached base address, keep the offset */
+        base = thumb_gen_state.cached_global_reg;
+        /* fc already has the field offset from sv->c.i */
+      } else {
+        /* Load the base address of the global symbol (without offset) */
+        SValue v1;
+        v1.type.t = ft;
+        v1.r = fr & ~VT_LVAL;
+        v1.c.i = 0; /* Load base address, not base+offset */
+        v1.sym = sv->sym;
+        load(base = 14, &v1);
+        /* Cache this for subsequent accesses to same symbol */
+        thumb_gen_state.cached_global_sym = sv->sym;
+        thumb_gen_state.cached_global_reg = base;
+        /* fc already has the field offset from sv->c.i */
+      }
+      sign = 0;
       v = VT_LOCAL;
     }
     if (v == VT_LOCAL) {
@@ -1806,13 +1824,25 @@ void load(int r, SValue *sv) {
       fc = sign = 0;
       v = VT_LOCAL;
     } else if (v == VT_CONST) {
-      v1.type.t = VT_PTR;
-      v1.r = fr & ~VT_LVAL;
-      v1.c.i = sv->c.i;
-      v1.sym = sv->sym;
-      TRACE("l2");
-      load(base = 14, &v1);
-      fc = sign = 0;
+      /* Check if we already have this global symbol's base address cached */
+      if (sv->sym && sv->sym == thumb_gen_state.cached_global_sym &&
+          thumb_gen_state.cached_global_reg >= 0) {
+        /* Reuse cached base address, keep the offset */
+        base = thumb_gen_state.cached_global_reg;
+        /* fc already has the field offset from sv->c.i */
+      } else {
+        v1.type.t = VT_PTR;
+        v1.r = fr & ~VT_LVAL;
+        v1.c.i = 0; /* Load base address, not base+offset */
+        v1.sym = sv->sym;
+        TRACE("l2");
+        load(base = 14, &v1);
+        /* Cache this for subsequent accesses to same symbol */
+        thumb_gen_state.cached_global_sym = sv->sym;
+        thumb_gen_state.cached_global_reg = base;
+        /* fc already has the field offset from sv->c.i */
+      }
+      sign = 0;
       v = VT_LOCAL;
     } else if (v < VT_CONST) {
       base = sv->pr0;
@@ -2497,6 +2527,9 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers,
 
   thumb_gen_state.generating_function = 1;
   thumb_gen_state.code_size = 0;
+  /* Clear global symbol cache at function start */
+  thumb_gen_state.cached_global_sym = NULL;
+  thumb_gen_state.cached_global_reg = -1;
 
   if (!leaffunc) {
     registers_to_push |= (1 << R_LR);
@@ -2710,6 +2743,9 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result) {
   gcall_or_jump(0, &q->src1);
   if (registers_count > 0)
     ot_check(th_pop(registers_to_push));
+  /* Invalidate global symbol cache - LR was clobbered by call */
+  thumb_gen_state.cached_global_sym = NULL;
+  thumb_gen_state.cached_global_reg = -1;
   if (drop_result) {
     return;
   }
