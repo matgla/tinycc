@@ -49,7 +49,7 @@ void tcc_ls_clear_live_intervals(LSLiveIntervalState *ls) {
 }
 
 void tcc_ls_add_live_interval(LSLiveIntervalState *ls, int vreg, int start,
-                              int end, int crosses_call) {
+                              int end, int crosses_call, int addrtaken) {
   LSLiveInterval *interval;
 
   if (ls->next_interval_index >= ls->intervals_size) {
@@ -63,12 +63,14 @@ void tcc_ls_add_live_interval(LSLiveIntervalState *ls, int vreg, int start,
   interval->start = start;
   printf("Adding live interval for ");
   tcc_ir_print_vreg(vreg);
-  printf(", start=%d end=%d crosses_call=%d\n", start, end, crosses_call);
+  printf(", start=%d end=%d crosses_call=%d addrtaken=%d\n", start, end,
+         crosses_call, addrtaken);
   interval->end = end;
   interval->r0 = -1;
   interval->r1 = -1;
   interval->stack_location = 0;
   interval->crosses_call = crosses_call;
+  interval->addrtaken = addrtaken;
   ls->next_interval_index++;
 }
 
@@ -178,7 +180,7 @@ void tcc_ls_mark_register_as_used(LSLiveIntervalState *ls, int reg) {
 }
 
 int tcc_ls_next_stack_location() {
-  tcc_state->stack_location = (loc - 4) & -4;
+  loc = (loc - 4) & -4;
   return loc;
 }
 
@@ -211,6 +213,15 @@ void tcc_ls_allocate_registers(LSLiveIntervalState *ls,
   for (int i = 0; i < ls->next_interval_index; ++i) {
     tcc_ls_expire_old_intervals(ls, i);
 
+    /* Variables whose address is taken must be on the stack */
+    if (ls->intervals[i].addrtaken) {
+      ls->intervals[i].stack_location = tcc_ls_next_stack_location();
+      ls->active_set[ls->next_active_index++] = &ls->intervals[i];
+      qsort(ls->active_set, ls->next_active_index, sizeof(LSLiveInterval *),
+            sort_endpoints);
+      continue;
+    }
+
     if (ls->intervals[i].r0 == -1) {
       /* If interval crosses a function call, use callee-saved registers only */
       if (ls->intervals[i].crosses_call) {
@@ -236,8 +247,8 @@ void tcc_ls_allocate_registers(LSLiveIntervalState *ls,
            ls->intervals[i].end);
     tcc_ir_print_vreg(ls->intervals[i].vreg);
     printf(" --> ");
-    if (ls->intervals[i].stack_location) {
-      printf("spilled to stack at %d\n", ls->intervals[i].stack_location);
+    if (ls->intervals[i].stack_location != 0 || ls->intervals[i].addrtaken) {
+      printf("spilled to stack at %d\n", (int)ls->intervals[i].stack_location);
     } else {
       printf("R0%d", ls->intervals[i].r0);
       if (ls->intervals[i].r1 >= 0) {

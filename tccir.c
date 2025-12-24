@@ -627,6 +627,15 @@ int tcc_ir_get_vreg_param(TCCIRState *ir) {
   return (TCCIR_VREG_TYPE_PARAM << 28) | next_param_vr;
 }
 
+void tcc_ir_set_addrtaken(TCCIRState *ir, int vreg) {
+  if (vreg < 0)
+    return;
+  IRLiveInterval *interval = tcc_ir_get_live_interval(ir, vreg);
+  if (interval) {
+    interval->addrtaken = 1;
+  }
+}
+
 // 3 bits per vreg position: bit 0 = local_variable, bit 1 = temp, bit 2 =
 // parameter
 #define IGNORED_VREG_BITS_PER_ENTRY 3
@@ -751,6 +760,8 @@ static int tcc_ir_has_call_in_range(TCCIRState *ir, int start, int end) {
 void tcc_ir_liveness_analysis(TCCIRState *ir) {
   int start, end;
   int crosses_call;
+  int addrtaken;
+  IRLiveInterval *interval;
   tcc_ls_clear_live_intervals(&ir->ls);
   for (int vreg = 0; vreg < ir->next_local_variable; ++vreg) {
     const int encoded_vreg = (TCCIR_VREG_TYPE_VAR << 28) | vreg;
@@ -761,7 +772,10 @@ void tcc_ir_liveness_analysis(TCCIRState *ir) {
     end = ~0;
     if (tcc_ir_find_live_interval(ir, encoded_vreg, &start, &end, 1)) {
       crosses_call = tcc_ir_has_call_in_range(ir, start, end);
-      tcc_ls_add_live_interval(&ir->ls, encoded_vreg, start, end, crosses_call);
+      interval = tcc_ir_get_live_interval(ir, encoded_vreg);
+      addrtaken = interval ? interval->addrtaken : 0;
+      tcc_ls_add_live_interval(&ir->ls, encoded_vreg, start, end, crosses_call,
+                               addrtaken);
     }
   }
 
@@ -774,7 +788,10 @@ void tcc_ir_liveness_analysis(TCCIRState *ir) {
     end = ~0;
     if (tcc_ir_find_live_interval(ir, vreg_encoded, &start, &end, 1)) {
       crosses_call = tcc_ir_has_call_in_range(ir, start, end);
-      tcc_ls_add_live_interval(&ir->ls, vreg_encoded, start, end, crosses_call);
+      interval = tcc_ir_get_live_interval(ir, vreg_encoded);
+      addrtaken = interval ? interval->addrtaken : 0;
+      tcc_ls_add_live_interval(&ir->ls, vreg_encoded, start, end, crosses_call,
+                               addrtaken);
     }
   }
 
@@ -801,8 +818,9 @@ void tcc_ir_liveness_analysis(TCCIRState *ir) {
           }
         }
         crosses_call = tcc_ir_has_call_in_range(ir, start, end);
+        addrtaken = interval->addrtaken;
         tcc_ls_add_live_interval(&ir->ls, vreg_encoded, start, end,
-                                 crosses_call);
+                                 crosses_call, addrtaken);
       }
     }
   }
@@ -913,7 +931,8 @@ void tcc_ir_generate_code(TCCIRState *ir) {
     if (irop_config[q->op].has_src1 == 1) {
       tcc_ir_fill_registers(ir, &q->src1);
       if (q->op != TCCIR_OP_FUNCCALLVAL && q->op != TCCIR_OP_FUNCCALLVOID &&
-          q->op != TCCIR_OP_FUNCPARAMVAL && q->op != TCCIR_OP_FUNCPARAMVOID) {
+          q->op != TCCIR_OP_FUNCPARAMVAL && q->op != TCCIR_OP_FUNCPARAMVOID &&
+          q->op != TCCIR_OP_ASSIGN) {
         if (tcc_ir_operand_in_memory(&q->src1)) {
           q->src1.pr0 = architecture_config.scratch_register;
           tcc_gen_machine_load_register(&q->src1);
@@ -931,7 +950,8 @@ void tcc_ir_generate_code(TCCIRState *ir) {
 
     if (irop_config[q->op].has_dest == 1) {
       tcc_ir_fill_registers(ir, &q->dest);
-      if (tcc_ir_operand_in_memory(&q->dest) && (q->op != TCCIR_OP_ASSIGN)) {
+      if (tcc_ir_operand_in_memory(&q->dest) && (q->op != TCCIR_OP_ASSIGN) &&
+          (q->op != TCCIR_OP_STORE)) {
         q->dest.pr0 = architecture_config.scratch_register;
         tcc_gen_machine_load_register(&q->dest);
       }
@@ -1023,9 +1043,11 @@ void print_svalue_short(SValue *sv) {
   /* XXX: probably show ignored vregs in a special way */
   switch (val_loc) {
   case VT_CONST:
-    if (sv->r & VT_SYM)
+    if (sv->r & VT_SYM) {
       printf("GlobalSym(%d)", sv->sym->v);
-    else
+      if (sv->c.i != 0)
+        printf("+%d", sv->c.i);
+    } else
       printf("#%d", sv->c.i);
     break;
   case VT_LLOCAL:

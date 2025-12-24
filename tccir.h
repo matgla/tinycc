@@ -79,6 +79,7 @@ typedef struct IRVregReplacement {
 
 typedef struct IRLiveInterval {
   uint8_t start_within_if : 1; // whether the interval starts within an if block
+  uint8_t addrtaken : 1;       // whether the variable's address is taken
   uint32_t start;              // start instruction index
   uint32_t end;                // end instruction index
   IRVregReplacement allocation;
@@ -146,6 +147,7 @@ void tcc_ir_assign_physical_register(TCCIRState *ir, int vreg, int offset,
 const char *tcc_ir_get_op_name(TccIrOp op);
 void tcc_ir_show(TCCIRState *ir);
 void tcc_ir_drop_return_value(TCCIRState *ir);
+void tcc_ir_set_addrtaken(TCCIRState *ir, int vreg);
 
 void tcc_ir_patch_live_intervals_registers(TCCIRState *ir);
 void tcc_ir_backpatch(TCCIRState *ir, int t, int target_address);

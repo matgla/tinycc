@@ -34,6 +34,7 @@ typedef struct LSLiveInterval {
   uint32_t start;          // start instruction index
   uint32_t end;            // end instruction index
   uint8_t crosses_call;    // 1 if interval spans a function call
+  uint8_t addrtaken; // 1 if variable's address is taken (must be on stack)
 } LSLiveInterval;
 
 typedef struct LSLiveIntervalState {
@@ -52,6 +53,6 @@ void tcc_ls_deinitialize(LSLiveIntervalState *ls);
 void tcc_ls_clear_live_intervals(LSLiveIntervalState *ls);
 
 void tcc_ls_add_live_interval(LSLiveIntervalState *ls, int vreg, int start,
-                              int end, int crosses_call);
+                              int end, int crosses_call, int addrtaken);
 void tcc_ls_allocate_registers(LSLiveIntervalState *ls,
                                int used_parameters_registers);

@@ -5129,8 +5129,16 @@ ST_FUNC void indir(void) {
       return;
     expect("pointer");
   }
-  if (vtop->r & VT_LVAL)
-    gv(RC_INT);
+  if (vtop->r & VT_LVAL) {
+    SValue dest;
+    memset(&dest, 0, sizeof(SValue));
+    dest.type = *pointed_type(&vtop->type);
+    dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+    tcc_ir_put(tcc_state->ir, TCCIR_OP_ASSIGN, vtop, NULL, &dest);
+    vtop->vr = dest.vr;
+    vtop->r = 0;
+    // gv(RC_INT);
+  }
   vtop->type = *pointed_type(&vtop->type);
   /* Arrays and functions are never lvalues */
   if (!(vtop->type.t & (VT_ARRAY | VT_VLA)) &&
@@ -5545,8 +5553,11 @@ tok_next:
     if ((vtop->type.t & VT_BTYPE) != VT_FUNC &&
         !(vtop->type.t & (VT_ARRAY | VT_VLA)))
       test_lvalue();
-    if (vtop->sym)
+    if (vtop->sym) {
       vtop->sym->a.addrtaken = 1;
+      /* Mark vreg as address-taken in IR so it gets spilled to stack */
+      tcc_ir_set_addrtaken(tcc_state->ir, vtop->sym->vreg);
+    }
     mk_pointer(&vtop->type);
     gaddrof();
     break;

@@ -2478,7 +2478,15 @@ void tcc_gen_machine_load_op(TACQuadruple *op) {
 
 ST_FUNC void tcc_gen_machine_store_op(TACQuadruple *op) {
   TRACE("'tcc_gen_machine_store_op'");
-  store(op->src1.pr0, &op->dest);
+  int src_reg;
+  /* If source has no allocated register (e.g., constant), load it into R12 */
+  if (op->src1.pr0 == -1 || (op->src1.pr0 & PREG_SPILLED)) {
+    load(R12, &op->src1);
+    src_reg = R12;
+  } else {
+    src_reg = op->src1.pr0;
+  }
+  store(src_reg, &op->dest);
 }
 
 ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers,
@@ -2581,14 +2589,13 @@ ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *op) {
     store(R12, &op->dest);
     return;
   }
-  // if ((op->dest.r & VT_LVAL)) {
-  //   if (op->dest.pr0 == -1) {
-  //     load(R12, &op->dest);
-  //     store(R12, &op->src1);
-  //     return;
-  //   }
-  //   load(op->dest.pr0, &op->src1);
-  // } else {
+
+  /* Handle spilled source (e.g., address-taken variable) */
+  if (op->src1.pr0 & PREG_SPILLED) {
+    load(op->dest.pr0, &op->src1);
+    return;
+  }
+
   if ((op->src1.r & VT_VALMASK) == VT_CONST) {
     load(op->dest.pr0, &op->src1);
     return;
@@ -2598,7 +2605,6 @@ ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *op) {
 
   ot_check(th_mov_reg(op->dest.pr0, op->src1.pr0, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
                       THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
-  // }
 }
 
 // r0 - function
