@@ -67,6 +67,10 @@ typedef struct SValue SValue;
 typedef struct TACQuadruple TACQuadruple;
 typedef struct Sym Sym;
 
+/* Sentinel value indicating an interval hasn't started yet.
+ * Using 0xFFFFFFFF since instruction indices are non-negative. */
+#define INTERVAL_NOT_STARTED 0xFFFFFFFF
+
 typedef struct IRVregReplacement {
   uint16_t r0; // first physical register
   uint16_t r1; // second physical register (for long long)

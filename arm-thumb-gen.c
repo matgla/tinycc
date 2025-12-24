@@ -1419,7 +1419,12 @@ void store(int r, SValue *sv) {
   if (fr & VT_LVAL || fr == VT_LOCAL) {
     uint32_t base = R_FP;
     if (v < VT_CONST) {
-      base = intr(v);
+      /* Use pr0 if allocated, otherwise fall back to v */
+      if (sv->pr0 != -1 && !(sv->pr0 & PREG_SPILLED)) {
+        base = sv->pr0;
+      } else {
+        base = intr(v);
+      }
       v = VT_LOCAL;
       fc = sign = 0;
     } else if (v == VT_CONST) {

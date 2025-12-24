@@ -19,6 +19,10 @@ TEST_FILES = [
     ("../tests2/04_for.c", 0),
     ("../tests2/05_array.c", 0),
     ("../tests2/06_case.c", 0),
+    ("../tests2/07_function.c", 0),
+    ("../tests2/08_while.c", 0),
+    ("../tests2/09_do_while.c", 0),
+    ("../tests2/10_pointer.c", 0),
 ]
 
 def load_expect_file(test_name):

@@ -7006,17 +7006,25 @@ again:
     prev_scope_s(&o);
 
   } else if (t == TOK_WHILE) {
+    SValue dest;
     new_scope_s(&o);
     d = gind();
     skip('(');
     gexpr();
     skip(')');
-    a = gvtst(1, 0);
+    // a = gvtst(1, 0);
+    a = tcc_ir_generate_test(tcc_state->ir, 1, 0);
     b = 0;
     lblock(&a, &b);
-    gjmp_addr(d);
-    gsym_addr(b, d);
-    gsym(a);
+    // gjmp_addr(d);
+    memset(&dest, 0, sizeof(SValue));
+    dest.vr = -1;
+    dest.c.i = d;
+    d = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
+    // gsym_addr(b, d);
+    tcc_ir_backpatch_to_here(tcc_state->ir, a);
+    tcc_ir_backpatch(tcc_state->ir, b, d);
+    // gsym(a);
     prev_scope_s(&o);
 
   } else if (t == '{') {
@@ -7178,15 +7186,20 @@ again:
     a = b = 0;
     d = gind();
     lblock(&a, &b);
-    gsym(b);
+    // gsym(b);
+    tcc_ir_backpatch_to_here(tcc_state->ir, a);
     skip(TOK_WHILE);
     skip('(');
     gexpr();
     skip(')');
     skip(';');
-    c = gvtst(0, 0);
-    gsym_addr(c, d);
-    gsym(a);
+    // c = gvtst(0, 0);
+    c = tcc_ir_generate_test(tcc_state->ir, 0, 0);
+
+    // gsym_addr(c, d);
+    tcc_ir_backpatch(tcc_state->ir, c, d);
+    // gsym(a);
+    tcc_ir_backpatch_to_here(tcc_state->ir, a);
     prev_scope_s(&o);
 
   } else if (t == TOK_SWITCH) {
