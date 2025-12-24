@@ -1,24 +1,36 @@
 #include <stdio.h>
 
+struct ziggy {
+  int a;
+  int b;
+  int c;
+} bolshevic;
+
 int main() {
-  int Count;
+  int a;
+  int *b;
+  int c;
 
-  for (Count = 0; Count < 4; Count++) {
-    printf("%d\n", Count);
-    switch (Count) {
-    case 1:
-      printf("%d\n", 1);
-      break;
+  a = 42;
+  b = &a;
+  printf("a = %d\n", *b);
 
-    case 2:
-      printf("%d\n", 2);
-      break;
+  bolshevic.a = 12;
+  bolshevic.b = 34;
+  bolshevic.c = 56;
 
-    default:
-      printf("%d\n", 0);
-      break;
-    }
-  }
+  printf("bolshevic.a = %d\n", bolshevic.a);
+  printf("bolshevic.b = %d\n", bolshevic.b);
+  printf("bolshevic.c = %d\n", bolshevic.c);
+
+  struct ziggy *tsar = &bolshevic;
+
+  printf("tsar->a = %d\n", tsar->a);
+  printf("tsar->b = %d\n", tsar->b);
+  printf("tsar->c = %d\n", tsar->c);
+
+  b = &(bolshevic.b);
+  printf("bolshevic.b = %d\n", *b);
 
   return 0;
 }

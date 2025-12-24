@@ -1855,8 +1855,11 @@ ST_FUNC void tcc_gen_machine_return_value_op(TACQuadruple *q);
 ST_FUNC void tcc_gen_machine_epilog(int leaffunc);
 ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers,
                                     int stack_size);
-ST_FUNC void tcc_gen_machine_func_param_op(TACQuadruple *q);
+ST_FUNC void tcc_gen_machine_func_param_op(TACQuadruple *q, int param_num);
 ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_value);
+ST_FUNC void tcc_gen_machine_save_call_context(void);
+ST_FUNC void tcc_gen_machine_restore_call_context(void);
+ST_FUNC void tcc_gen_machine_move_reg(int dest, int src);
 ST_FUNC void tcc_gen_machine_jump_op(TACQuadruple *q);
 ST_FUNC void tcc_gen_machine_conditional_jump_op(TACQuadruple *q);
 ST_FUNC void tcc_gen_machine_backpatch_jump(int address, int offset);

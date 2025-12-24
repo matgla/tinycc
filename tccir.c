@@ -777,6 +777,35 @@ void tcc_ir_liveness_analysis(TCCIRState *ir) {
       tcc_ls_add_live_interval(&ir->ls, vreg_encoded, start, end, crosses_call);
     }
   }
+
+  /* For non-leaf functions, include parameters in liveness analysis
+   * so they get allocated to callee-saved registers if they cross calls.
+   * Parameters are live from instruction 0 (function entry). */
+  if (!ir->leaffunc) {
+    for (int vreg = 0; vreg < ir->next_parameter; ++vreg) {
+      const int vreg_encoded = (TCCIR_VREG_TYPE_PARAM << 28) | vreg;
+      IRLiveInterval *interval = tcc_ir_get_live_interval(ir, vreg_encoded);
+      /* Parameters start at instruction 0 and end at their last use */
+      start = 0;
+      end = interval->end;
+      if (end > 0) {
+        /* Check for backward jumps that would extend end */
+        for (int i = 0; i < ir->next_instruction_index; ++i) {
+          TACQuadruple *q = &ir->instructions[i];
+          if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF) {
+            int jump_target = q->dest.c.i;
+            if (jump_target < i && start <= jump_target && end >= jump_target) {
+              if (i > end)
+                end = i;
+            }
+          }
+        }
+        crosses_call = tcc_ir_has_call_in_range(ir, start, end);
+        tcc_ls_add_live_interval(&ir->ls, vreg_encoded, start, end,
+                                 crosses_call);
+      }
+    }
+  }
 }
 
 void tcc_ir_patch_live_intervals_registers(TCCIRState *ir) {
@@ -854,6 +883,24 @@ void tcc_ir_generate_code(TCCIRState *ir) {
   int stack_size = (-loc + 7) & ~7; // align to 8 bytes
   tcc_gen_machine_prolog(ir->leaffunc, ir->ls.dirty_registers, stack_size);
 
+  /* For non-leaf functions, move parameters from incoming registers (R0-R3)
+   * to their allocated registers. Only do this for parameters that were
+   * actually used (have end > 0 from liveness tracking). */
+  if (!ir->leaffunc) {
+    for (int vreg = 0; vreg < ir->next_parameter && vreg < 4; ++vreg) {
+      const int encoded_vreg = (TCCIR_VREG_TYPE_PARAM << 28) | vreg;
+      IRLiveInterval *interval = tcc_ir_get_live_interval(ir, encoded_vreg);
+      /* Only emit move if parameter was actually used (end > 0) and
+       * destination differs from source */
+      if (interval->end > 0) {
+        int dest_reg = interval->allocation.r0;
+        if (dest_reg != vreg && dest_reg < 16) {
+          tcc_gen_machine_move_reg(dest_reg, vreg);
+        }
+      }
+    }
+  }
+
   for (int i = 0; i < ir->next_instruction_index; i++) {
     drop_return_value = 0;
     q = &ir->instructions[i];
@@ -911,9 +958,14 @@ void tcc_ir_generate_code(TCCIRState *ir) {
     case TCCIR_OP_ASSIGN:
       tcc_gen_machine_assign_op(q);
       break;
-    case TCCIR_OP_FUNCPARAMVAL:
-      tcc_gen_machine_func_param_op(q);
+    case TCCIR_OP_FUNCPARAMVAL: {
+      /* Detect nested function call: if this param number is less than or equal
+       * to the number of params we've already collected, we're starting a new
+       * inner call. Save the outer call's context. */
+      int param_num = q->src2.c.i; /* 1-based param number */
+      tcc_gen_machine_func_param_op(q, param_num);
       break;
+    }
     case TCCIR_OP_JUMP:
       tcc_gen_machine_jump_op(q);
       break;
@@ -924,7 +976,8 @@ void tcc_ir_generate_code(TCCIRState *ir) {
       break;
     case TCCIR_OP_FUNCCALLVOID:
       drop_return_value = 1;
-    case TCCIR_OP_FUNCCALLVAL:
+      /* fall through */
+    case TCCIR_OP_FUNCCALLVAL: {
       // if return follows call then we can optimize away move
       const TACQuadruple *ir_next = (i + 1 < ir->next_instruction_index)
                                         ? &ir->instructions[i + 1]
@@ -936,8 +989,11 @@ void tcc_ir_generate_code(TCCIRState *ir) {
       }
 
       tcc_gen_machine_func_call_op(q, drop_return_value);
+      /* Restore outer call's arguments if this was a nested call */
+      tcc_gen_machine_restore_call_context();
       ir_to_code_mapping[i] = ind;
       break;
+    }
     default: {
       printf("Unsupported operation in tcc_generate_code: %s\n",
              tcc_ir_get_op_name(q->op));

@@ -222,6 +222,32 @@ int allocated_stack_size;
 TACQuadruple function_arguments[4];
 int function_argument_count = 0;
 
+/* Stack for nested function calls - save outer call's arguments */
+#define MAX_NESTED_CALLS 8
+static TACQuadruple saved_function_arguments[MAX_NESTED_CALLS][4];
+static int saved_function_argument_counts[MAX_NESTED_CALLS];
+static int nested_call_depth = 0;
+
+ST_FUNC void tcc_gen_machine_save_call_context(void) {
+  if (nested_call_depth >= MAX_NESTED_CALLS) {
+    tcc_error("too many nested function calls");
+  }
+  memcpy(saved_function_arguments[nested_call_depth], function_arguments,
+         sizeof(function_arguments));
+  saved_function_argument_counts[nested_call_depth] = function_argument_count;
+  nested_call_depth++;
+  function_argument_count = 0;
+}
+
+ST_FUNC void tcc_gen_machine_restore_call_context(void) {
+  if (nested_call_depth > 0) {
+    nested_call_depth--;
+    memcpy(function_arguments, saved_function_arguments[nested_call_depth],
+           sizeof(function_arguments));
+    function_argument_count = saved_function_argument_counts[nested_call_depth];
+  }
+}
+
 ST_DATA const int reg_classes[NB_REGS] = {
     /* r0 */ RC_INT | RC_R0,
     /* r1 */ RC_INT | RC_R1,
@@ -2594,7 +2620,18 @@ ST_FUNC void tcc_gen_machine_load_register(SValue *sv) { load(sv->pr0, sv); }
 
 ST_FUNC void tcc_gen_machine_store_register(SValue *sv) { store(sv->pr0, sv); }
 
-ST_FUNC void tcc_gen_machine_func_param_op(TACQuadruple *q) {
+ST_FUNC void tcc_gen_machine_move_reg(int dest, int src) {
+  ot_check(th_mov_reg(dest, src, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                      THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
+}
+
+ST_FUNC void tcc_gen_machine_func_param_op(TACQuadruple *q, int param_num) {
+  /* Detect nested function call: if we see PARAM1 while we already have
+   * arguments collected, we're starting a new inner call.
+   * Save the outer call's context. */
+  if (param_num == 1 && function_argument_count > 0) {
+    tcc_gen_machine_save_call_context();
+  }
   // cache argument for register passing
   if (function_argument_count < 4) {
     function_arguments[function_argument_count++] = *q;
