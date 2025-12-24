@@ -4232,18 +4232,33 @@ static void ld_update_symbol_values(TCCState *s1, LDScript *ld) {
     if (sec_end > end_addr)
       end_addr = sec_end;
 
-    if (!strcmp(s->name, ".bss")) {
-      bss_start = s->sh_addr;
-      bss_end = sec_end;
-    } else if (!strcmp(s->name, ".data")) {
-      data_start = s->sh_addr;
-      data_end = sec_end;
-    } else if (!strcmp(s->name, ".text")) {
-      text_start = s->sh_addr;
-      text_end = sec_end;
-    } else if (!strcmp(s->name, ".rodata")) {
-      rodata_start = s->sh_addr;
-      rodata_end = sec_end;
+    /* Match .bss and .bss.* sections */
+    if (!strcmp(s->name, ".bss") || !strncmp(s->name, ".bss.", 5)) {
+      if (bss_start == 0 || s->sh_addr < bss_start)
+        bss_start = s->sh_addr;
+      if (sec_end > bss_end)
+        bss_end = sec_end;
+    }
+    /* Match .data and .data.* sections */
+    else if (!strcmp(s->name, ".data") || !strncmp(s->name, ".data.", 6)) {
+      if (data_start == 0 || s->sh_addr < data_start)
+        data_start = s->sh_addr;
+      if (sec_end > data_end)
+        data_end = sec_end;
+    }
+    /* Match .text and .text.* sections */
+    else if (!strcmp(s->name, ".text") || !strncmp(s->name, ".text.", 6)) {
+      if (text_start == 0 || s->sh_addr < text_start)
+        text_start = s->sh_addr;
+      if (sec_end > text_end)
+        text_end = sec_end;
+    }
+    /* Match .rodata and .rodata.* sections */
+    else if (!strcmp(s->name, ".rodata") || !strncmp(s->name, ".rodata.", 8)) {
+      if (rodata_start == 0 || s->sh_addr < rodata_start)
+        rodata_start = s->sh_addr;
+      if (sec_end > rodata_end)
+        rodata_end = sec_end;
     }
 
     /* Map output section names to addresses */
@@ -4299,27 +4314,39 @@ static void ld_update_symbol_values(TCCState *s1, LDScript *ld) {
    * section_offset. This handles all symbols generically. */
   for (j = 0; j < ld->nb_symbols; j++) {
     LDSymbol *sym = &ld->symbols[j];
+    if (!strcmp(sym->name, "__data_start__") ||
+        !strcmp(sym->name, "__data_end__")) {
+      printf("DEBUG: %s: defined=%d, section_idx=%d, section_offset=%ld, "
+             "value=%lx\n",
+             sym->name, sym->defined, sym->section_idx,
+             (long)sym->section_offset, (unsigned long)sym->value);
+    }
     if (sym->defined && sym->section_idx >= 0 &&
         sym->section_idx < ld->nb_output_sections) {
       addr_t section_addr = output_section_addrs[sym->section_idx];
       if (section_addr > 0) {
         /* Symbol value = section base address + offset within section */
         sym->value = section_addr + sym->section_offset;
+        if (!strcmp(sym->name, "__data_start__") ||
+            !strcmp(sym->name, "__data_end__")) {
+          printf("DEBUG after update: %s: value=%lx (section_addr=%lx + "
+                 "offset=%ld)\n",
+                 sym->name, (unsigned long)sym->value,
+                 (unsigned long)section_addr, (long)sym->section_offset);
+        }
       }
     }
   }
 
-  /* Second pass: update standard section boundary symbols ONLY if not already
-   * defined in the linker script. This provides defaults for scripts that
-   * don't define these symbols explicitly. */
+  /* Second pass: update standard section boundary symbols.
+   * For boundary symbols like __data_start__/__data_end__, always use
+   * the computed values based on actual section layout, because the
+   * linker script values are only relative offsets that don't account
+   * for all input sections. */
   for (j = 0; j < ld->nb_symbols; j++) {
     LDSymbol *sym = &ld->symbols[j];
 
-    /* Skip symbols already defined with a section_idx (from linker script) */
-    if (sym->defined && sym->section_idx >= 0)
-      continue;
-
-    /* Update standard section symbols only if not defined */
+    /* Update standard section symbols - these ALWAYS use computed values */
     if (!strcmp(sym->name, "__bss_start__") ||
         !strcmp(sym->name, "__bss_start")) {
       sym->value = bss_start;
@@ -4377,15 +4404,26 @@ ST_FUNC void ld_export_standard_symbols(TCCState *s1) {
     if (sec_end > end_addr)
       end_addr = sec_end;
 
-    if (!strcmp(s->name, ".bss")) {
-      bss_start = s->sh_addr;
-      bss_end = sec_end;
-    } else if (!strcmp(s->name, ".data")) {
-      data_start = s->sh_addr;
-      data_end = sec_end;
-    } else if (!strcmp(s->name, ".text")) {
-      text_start = s->sh_addr;
-      text_end = sec_end;
+    /* Match .bss and .bss.* sections */
+    if (!strcmp(s->name, ".bss") || !strncmp(s->name, ".bss.", 5)) {
+      if (bss_start == 0 || s->sh_addr < bss_start)
+        bss_start = s->sh_addr;
+      if (sec_end > bss_end)
+        bss_end = sec_end;
+    }
+    /* Match .data and .data.* sections */
+    else if (!strcmp(s->name, ".data") || !strncmp(s->name, ".data.", 6)) {
+      if (data_start == 0 || s->sh_addr < data_start)
+        data_start = s->sh_addr;
+      if (sec_end > data_end)
+        data_end = sec_end;
+    }
+    /* Match .text and .text.* sections */
+    else if (!strcmp(s->name, ".text") || !strncmp(s->name, ".text.", 6)) {
+      if (text_start == 0 || s->sh_addr < text_start)
+        text_start = s->sh_addr;
+      if (sec_end > text_end)
+        text_end = sec_end;
     }
   }
 

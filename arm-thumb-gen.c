@@ -80,6 +80,8 @@ typedef struct ThumbLiteralPoolEntry {
   int patch_position;
   int short_instruction;
   int32_t imm;
+  int shared_index; /* Index of earlier entry with same value, or -1 if unique
+                     */
 } ThumbLiteralPoolEntry;
 
 typedef struct ThumbGeneratorState {
@@ -607,13 +609,37 @@ static void th_literal_pool_generate(void) {
                         THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
   }
 
+  /* Array to store the output position of each unique literal */
+  int *literal_positions =
+      tcc_malloc(thumb_gen_state.literal_pool_count * sizeof(int));
+
   th_sym_d();
+
+  /* First pass: emit unique literals and record their positions */
   for (int i = 0; i < thumb_gen_state.literal_pool_count; i++) {
     ThumbLiteralPoolEntry *entry = &thumb_gen_state.literal_pool[i];
-    int value = entry->imm;
-    int aligned_position = ((ind - entry->patch_position) + 3) & ~3;
+    if (entry->shared_index == -1) {
+      /* This is a unique entry - emit the literal value */
+      literal_positions[i] = ind;
+      if (entry->relocation != -1) {
+        greloc(cur_text_section, entry->sym, ind, entry->relocation);
+      }
+      // write the literal value
+      o(entry->imm & 0xffff);
+      o((entry->imm >> 16) & 0xffff);
+    } else {
+      /* Shared entry - will use position of the original */
+      literal_positions[i] = literal_positions[entry->shared_index];
+    }
+  }
+
+  /* Second pass: patch all instructions to point to correct literal position */
+  for (int i = 0; i < thumb_gen_state.literal_pool_count; i++) {
+    ThumbLiteralPoolEntry *entry = &thumb_gen_state.literal_pool[i];
+    int literal_pos = literal_positions[i];
+    int aligned_position = ((literal_pos - entry->patch_position) + 3) & ~3;
+
     // patch the instruction that references this literal
-    // encode new imm8
     if (entry->short_instruction) {
       uint16_t *patch_ins =
           (uint16_t *)(cur_text_section->data + entry->patch_position);
@@ -623,14 +649,9 @@ static void th_literal_pool_generate(void) {
           (uint16_t *)(cur_text_section->data + entry->patch_position + 2);
       *patch_ins |= (((aligned_position - 4)) & 0x0fff);
     }
-
-    if (entry->relocation != -1) {
-      greloc(cur_text_section, entry->sym, ind, entry->relocation);
-    }
-    // write the literal value
-    o(value & 0xffff);
-    o((value >> 16) & 0xffff);
   }
+
+  tcc_free(literal_positions);
   th_sym_t();
   thumb_gen_state.literal_pool_count = 0;
   thumb_gen_state.code_size = 0;
@@ -1535,13 +1556,37 @@ static ThumbLiteralPoolEntry *th_literal_pool_allocate() {
   entry = &thumb_gen_state.literal_pool[thumb_gen_state.literal_pool_count++];
   memset(entry, 0, sizeof(ThumbLiteralPoolEntry));
   entry->relocation = -1;
+  entry->shared_index = -1;
+  return entry;
+}
+
+/* Find existing literal pool entry with same sym and imm, and allocate new
+   entry that shares its literal value */
+static ThumbLiteralPoolEntry *th_literal_pool_find_or_allocate(Sym *sym,
+                                                               int32_t imm) {
+  int found_index = -1;
+  /* Search existing entries for a match */
+  for (int i = 0; i < thumb_gen_state.literal_pool_count; i++) {
+    ThumbLiteralPoolEntry *e = &thumb_gen_state.literal_pool[i];
+    /* Match on sym and imm, and it must be a primary entry (not shared) */
+    if (e->sym == sym && e->imm == imm && e->shared_index == -1) {
+      found_index = i;
+      break;
+    }
+  }
+  /* Allocate new entry */
+  ThumbLiteralPoolEntry *entry = th_literal_pool_allocate();
+  if (found_index >= 0) {
+    /* Mark as sharing with the found entry */
+    entry->shared_index = found_index;
+  }
   return entry;
 }
 
 static void load_full_const(int r, int32_t imm, struct Sym *sym) {
   int est = 0;
   ElfSym *esym = elfsym(sym);
-  ThumbLiteralPoolEntry *entry = th_literal_pool_allocate();
+  ThumbLiteralPoolEntry *entry = th_literal_pool_find_or_allocate(sym, imm);
   int sym_off = 0;
 
   entry->sym = sym;
