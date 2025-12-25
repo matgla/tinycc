@@ -1005,7 +1005,7 @@ static void gvtst_set(int inv, int t) {
       vset_VT_CMP(vtop->c.i != 0);
   }
 
-  // p = inv ? &vtop->jfalse : &vtop->jtrue;
+  p = inv ? &vtop->jfalse : &vtop->jtrue;
   // memset(&dest, 0, sizeof(dest));
   // dest.vr = -1;
   // dest.c.i = *p;
@@ -6405,9 +6405,10 @@ static void expr_landor(int op) {
       nocode_wanted++, f = 1;
     if (tok != op)
       break;
-    if (c < 0)
-      t = gvtst(i, t);
-    else
+    if (c < 0) {
+      // t = gvtst(i, t);
+      t = tcc_ir_generate_test(tcc_state->ir, i, t);
+    } else
       vpop();
     next();
     expr_landor_next(op);
@@ -6415,7 +6416,8 @@ static void expr_landor(int op) {
   if (cc || f) {
     vpop();
     vpushi(i ^ f);
-    gsym(t);
+    // gsym(t);
+    tcc_ir_backpatch_to_here(tcc_state->ir, t);
     nocode_wanted -= f;
   } else {
     gvtst_set(i, t);

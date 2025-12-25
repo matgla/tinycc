@@ -23,6 +23,7 @@ TEST_FILES = [
     ("../tests2/08_while.c", 0),
     ("../tests2/09_do_while.c", 0),
     ("../tests2/10_pointer.c", 0),
+    ("../tests2/11_precedence.c", 0),
 ]
 
 def load_expect_file(test_name):
