@@ -12,6 +12,8 @@ TEST_FILES = [
     ("30_function_call.c", 30),
     ("40_if.c", 0),
     ("50_simple_struct.c", 0),
+    ("60_landor.c", 0),
+    ("61_simple_or.c", 0),
     ("../tests2/00_assignment.c", 0),
     ("../tests2/01_comment.c", 0),
     ("../tests2/02_printf.c", 0),
@@ -24,6 +26,7 @@ TEST_FILES = [
     ("../tests2/09_do_while.c", 0),
     ("../tests2/10_pointer.c", 0),
     ("../tests2/11_precedence.c", 0),
+
 ]
 
 def load_expect_file(test_name):
