@@ -866,9 +866,9 @@ static int process_operands(TCCState *s1, int max_operands, Operand *ops) {
   return nb_ops;
 }
 
-static flags_behaviour thumb_determine_flags_behaviour(int token,
-                                                       int token_svariant,
-                                                       bool allow_in_it) {
+static thumb_flags_behaviour thumb_determine_flags_behaviour(int token,
+                                                             int token_svariant,
+                                                             bool allow_in_it) {
   if (THUMB_INSTRUCTION_GROUP(token) == token_svariant) {
     if (thumb_conditional_scope > 0 && !allow_in_it) {
       tcc_error("cannot use '%s' in IT block", get_tok_str(token, NULL));
@@ -882,11 +882,12 @@ static flags_behaviour thumb_determine_flags_behaviour(int token,
 }
 
 typedef thumb_opcode (*thumb_generate_generic_imm_opcode)(
-    uint16_t rd, uint16_t rn, uint32_t rm, flags_behaviour flags);
+    uint32_t rd, uint32_t rn, uint32_t imm, thumb_flags_behaviour flags,
+    thumb_enforce_encoding encoding);
 
 typedef thumb_opcode (*thumb_generate_generic_reg_opcode)(
-    uint16_t rd, uint16_t rn, uint16_t imm, flags_behaviour flags,
-    thumb_shift shift, enforce_encoding encoding);
+    uint32_t rd, uint32_t rn, uint32_t rm, thumb_flags_behaviour flags,
+    thumb_shift shift, thumb_enforce_encoding encoding);
 
 typedef struct th_generic_op_data {
   thumb_generate_generic_imm_opcode generate_imm_opcode;
@@ -897,12 +898,12 @@ typedef struct th_generic_op_data {
 
 thumb_opcode thumb_process_generic_data_op(th_generic_op_data data, int token,
                                            thumb_shift shift, Operand *ops) {
-  flags_behaviour setflags =
+  thumb_flags_behaviour setflags =
       thumb_determine_flags_behaviour(token, data.flags_variant_token, true);
-  enforce_encoding encoding = ENFORCE_ENCODING_NONE;
+  thumb_enforce_encoding encoding = ENFORCE_ENCODING_NONE;
   if (thumb_operand_is_immediate(ops[2].type))
     return data.generate_imm_opcode(ops[0].reg, ops[1].reg, ops[2].e.v,
-                                    setflags);
+                                    setflags, encoding);
 
   if (thumb_operand_is_register(ops[2].type)) {
     if ((THUMB_INSTRUCTION_GROUP(token) == data.regular_variant_token &&
@@ -965,7 +966,7 @@ static void thumb_adr_opcode(TCCState *s1, int token) {
   Operand op;
   ExprValue e;
   ElfSym *esym;
-  enforce_encoding encoding = ENFORCE_ENCODING_NONE;
+  thumb_enforce_encoding encoding = ENFORCE_ENCODING_NONE;
   if (THUMB_HAS_WIDE_QUALIFIER(token)) {
     encoding = ENFORCE_ENCODING_32BIT;
   }
@@ -994,7 +995,7 @@ static void thumb_adr_opcode(TCCState *s1, int token) {
 thumb_opcode thumb_generate_opcode_for_data_processing(int token,
                                                        thumb_shift shift,
                                                        Operand *ops) {
-  enforce_encoding encoding = ENFORCE_ENCODING_NONE;
+  thumb_enforce_encoding encoding = ENFORCE_ENCODING_NONE;
   if (THUMB_HAS_WIDE_QUALIFIER(token)) {
     encoding = ENFORCE_ENCODING_32BIT;
   }
@@ -1044,7 +1045,7 @@ thumb_opcode thumb_generate_opcode_for_data_processing(int token,
   case TOK_ASM_addseq:
   case TOK_ASM_addeq:
   case TOK_ASM_addweq: {
-    flags_behaviour setflags =
+    thumb_flags_behaviour setflags =
         thumb_determine_flags_behaviour(token, TOK_ASM_addseq, true);
 
     if (thumb_operand_is_immediate(ops[2].type)) {
@@ -1097,12 +1098,14 @@ thumb_opcode thumb_generate_opcode_for_data_processing(int token,
   }
   case TOK_ASM_cmpeq: {
     if (thumb_operand_is_immediate(ops[2].type)) {
-      return th_cmp_imm(ops[1].reg, ops[2].e.v, encoding);
+      return th_cmp_imm(0, ops[1].reg, ops[2].e.v, FLAGS_BEHAVIOUR_SET,
+                        encoding);
     }
-    return th_cmp_reg(ops[1].reg, ops[2].reg, shift, encoding);
+    return th_cmp_reg(0, ops[1].reg, ops[2].reg, FLAGS_BEHAVIOUR_SET, shift,
+                      encoding);
   }
   case TOK_ASM_cmneq: {
-    enforce_encoding encoding = ENFORCE_ENCODING_NONE;
+    thumb_enforce_encoding encoding = ENFORCE_ENCODING_NONE;
 
     if (thumb_operand_is_immediate(ops[2].type)) {
       return th_cmn_imm(ops[1].reg, ops[2].e.v);
@@ -1151,7 +1154,7 @@ thumb_opcode thumb_generate_opcode_for_data_processing(int token,
   case TOK_ASM_movseq:
   case TOK_ASM_movweq:
   case TOK_ASM_moveq: {
-    flags_behaviour setflags =
+    thumb_flags_behaviour setflags =
         thumb_determine_flags_behaviour(token, TOK_ASM_movseq, false);
     if (THUMB_INSTRUCTION_GROUP(token) == TOK_ASM_movweq)
       encoding = ENFORCE_ENCODING_32BIT;
@@ -1171,7 +1174,7 @@ thumb_opcode thumb_generate_opcode_for_data_processing(int token,
   }
   case TOK_ASM_mulseq:
   case TOK_ASM_muleq: {
-    flags_behaviour setflags =
+    thumb_flags_behaviour setflags =
         thumb_determine_flags_behaviour(token, TOK_ASM_mulseq, false);
     uint32_t rm = ops[2].reg;
     uint32_t rn = ops[1].reg;
@@ -1205,7 +1208,7 @@ thumb_opcode thumb_generate_opcode_for_data_processing(int token,
   case TOK_ASM_subseq:
   case TOK_ASM_subeq:
   case TOK_ASM_subweq: {
-    flags_behaviour setflags =
+    thumb_flags_behaviour setflags =
         thumb_determine_flags_behaviour(token, TOK_ASM_subseq, true);
 
     if (thumb_operand_is_immediate(ops[2].type)) {
@@ -1266,7 +1269,7 @@ static thumb_opcode thumb_single_memory_transfer_literal_opcode(TCCState *s1,
   ElfSym *esym;
   int jump_addr = 0;
   int puw = 0x6;
-  enforce_encoding encoding = ENFORCE_ENCODING_NONE;
+  thumb_enforce_encoding encoding = ENFORCE_ENCODING_NONE;
   if (THUMB_HAS_WIDE_QUALIFIER(token)) {
     encoding = ENFORCE_ENCODING_32BIT;
   }
@@ -1382,7 +1385,7 @@ static thumb_opcode thumb_single_memory_transfer_opcode(TCCState *s1,
   bool op2_minus = false;
   int excalm = 0;
   thumb_shift shift = {0, 0};
-  enforce_encoding encoding = ENFORCE_ENCODING_NONE;
+  thumb_enforce_encoding encoding = ENFORCE_ENCODING_NONE;
 
   ops[2] = (Operand){
       .type = OP_IM32,
@@ -1623,7 +1626,7 @@ static thumb_opcode thumb_single_memory_transfer_opcode(TCCState *s1,
 static void thumb_block_memory_transfer_opcode(TCCState *s1, int token) {
   bool op0_exclam = false;
   Operand ops[2];
-  enforce_encoding encoding = ENFORCE_ENCODING_NONE;
+  thumb_enforce_encoding encoding = ENFORCE_ENCODING_NONE;
   parse_operand(s1, &ops[0]);
 
   if (tok == '!') {
@@ -1946,7 +1949,7 @@ static thumb_opcode thumb_msr_opcode(TCCState *s1, int token) {
 }
 
 static thumb_opcode thumb_control_opcode(TCCState *s1, int token) {
-  enforce_encoding encoding = ENFORCE_ENCODING_NONE;
+  thumb_enforce_encoding encoding = ENFORCE_ENCODING_NONE;
   if (THUMB_HAS_WIDE_QUALIFIER(token)) {
     encoding = ENFORCE_ENCODING_32BIT;
   }
@@ -1990,7 +1993,7 @@ static void thumb_data_processing_opcode(TCCState *s1, int token) {
 
   // alias for adr
   if (THUMB_INSTRUCTION_GROUP(token) == TOK_ASM_addeq && ops[1].reg == R_PC) {
-    enforce_encoding encoding = ENFORCE_ENCODING_NONE;
+    thumb_enforce_encoding encoding = ENFORCE_ENCODING_NONE;
     if (!thumb_operand_is_immediate(ops[2].type)) {
       expect("second operand must be an immediate for adr");
     }
@@ -2007,8 +2010,8 @@ static void thumb_data_processing_opcode(TCCState *s1, int token) {
 static thumb_opcode thumb_data_shift_opcode(TCCState *s1, int token) {
   Operand ops[3];
   int nb_ops;
-  flags_behaviour flags = FLAGS_BEHAVIOUR_BLOCK;
-  enforce_encoding encoding = ENFORCE_ENCODING_NONE;
+  thumb_flags_behaviour flags = FLAGS_BEHAVIOUR_BLOCK;
+  thumb_enforce_encoding encoding = ENFORCE_ENCODING_NONE;
   const bool in_it_block = thumb_conditional_scope > 0;
   thumb_shift shift = {0, 0, 0};
   bool token_svariant = false;
@@ -2104,7 +2107,7 @@ static thumb_opcode thumb_data_shift_opcode(TCCState *s1, int token) {
 static void thumb_process_control(TCCState *s1, int token) {
   Operand op;
   thumb_opcode opcode;
-  enforce_encoding encoding = ENFORCE_ENCODING_NONE;
+  thumb_enforce_encoding encoding = ENFORCE_ENCODING_NONE;
   int nb_ops = process_operands(s1, 1, &op);
   if (nb_ops > 1 || nb_ops == 0) {
     expect("one operand");

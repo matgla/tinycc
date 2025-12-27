@@ -51,6 +51,7 @@ typedef enum TccIrOp {
   TCCIR_OP_RETURNVALUE,
   TCCIR_OP_JUMP,
   TCCIR_OP_JUMPIF,
+  TCCIR_OP_SETIF,
   TCCIR_OP_TEST_ZERO,
   TCCIR_OP_FUNCPARAMVOID,
   TCCIR_OP_FUNCPARAMVAL,
@@ -152,8 +153,12 @@ void tcc_ir_set_addrtaken(TCCIRState *ir, int vreg);
 void tcc_ir_patch_live_intervals_registers(TCCIRState *ir);
 void tcc_ir_backpatch(TCCIRState *ir, int t, int target_address);
 void tcc_ir_backpatch_to_here(TCCIRState *ir, int t);
+void tcc_ir_backpatch_first(TCCIRState *ir, int t, int target_address);
+int tcc_ir_gjmp_append(TCCIRState *ir, int n, int t);
 int tcc_ir_generate_test(TCCIRState *ir, int inv, int t);
 void tcc_ir_print_vreg(int vreg);
+void tcc_ir_generate_cmp_jmp_set(TCCIRState *ir);
+void tcc_ir_start_basic_block(TCCIRState *ir);
 
 typedef enum TCCIR_VREG_TYPE {
   TCCIR_VREG_TYPE_VAR = 1,

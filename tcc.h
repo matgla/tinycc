@@ -1862,6 +1862,7 @@ ST_FUNC void tcc_gen_machine_restore_call_context(void);
 ST_FUNC void tcc_gen_machine_move_reg(int dest, int src);
 ST_FUNC void tcc_gen_machine_jump_op(TACQuadruple *q);
 ST_FUNC void tcc_gen_machine_conditional_jump_op(TACQuadruple *q);
+ST_FUNC void tcc_gen_machine_setif_op(TACQuadruple *q);
 ST_FUNC void tcc_gen_machine_backpatch_jump(int address, int offset);
 
 #define stab_section s1->stab_section

@@ -218,7 +218,7 @@ unsigned char pic;
 
 int offset_to_args = 0;
 
-flags_behaviour g_setflags = FLAGS_BEHAVIOUR_SET;
+thumb_flags_behaviour g_setflags = FLAGS_BEHAVIOUR_SET;
 
 uint32_t caller_saved_registers;
 uint32_t pushed_registers;
@@ -746,7 +746,8 @@ int decbranch(int pos) {
 
 static thumb_opcode th_generic_mov_imm(uint32_t r, int imm) {
   if (imm < 0) {
-    return th_mvn_imm(r, 0, -imm + 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT);
+    return th_mvn_imm(r, 0, -imm + 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                      ENFORCE_ENCODING_NONE);
   }
   return th_mov_imm(r, imm, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
                     ENFORCE_ENCODING_NONE);
@@ -764,7 +765,8 @@ int th_offset_to_reg(int off, int sign) {
   }
 
   if (sign)
-    ot_check(th_rsb_imm(rr, rr, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT));
+    ot_check(th_rsb_imm(rr, rr, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                        ENFORCE_ENCODING_NONE));
   return rr;
 }
 
@@ -2460,72 +2462,98 @@ static int th_has_immediate_value(int r) {
   return (r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST;
 }
 
+typedef struct ThumbDataProcessingHandler {
+  thumb_opcode (*imm_handler)(uint32_t rd, uint32_t rn, uint32_t imm,
+                              thumb_flags_behaviour flags_behaviour,
+                              thumb_enforce_encoding enforce_encoding);
+  thumb_opcode (*reg_handler)(uint32_t rd, uint32_t rn, uint32_t rm,
+                              thumb_flags_behaviour flags_behaviour,
+                              thumb_shift shift_type,
+                              thumb_enforce_encoding enforce_encoding);
+} ThumbDataProcessingHandler;
+
 void tcc_gen_machine_data_processing_op(TACQuadruple *op) {
+  ThumbDataProcessingHandler handler;
   switch (op->op) {
   case TCCIR_OP_ADD:
-    if (th_has_immediate_value(op->src2.r)) {
-      if (!ot(th_add_imm(op->dest.pr0, op->src1.pr0, op->src2.c.i,
-                         FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                         ENFORCE_ENCODING_NONE))) {
-        // load immediate to temp register and add
-        load(R12, &op->src2);
-        ot_check(th_add_reg(op->dest.pr0, op->src1.pr0, R12,
-                            FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                            ENFORCE_ENCODING_NONE));
-      }
-    } else {
-      ot_check(th_add_reg(op->dest.pr0, op->src1.pr0, op->src2.pr0,
-                          FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                          ENFORCE_ENCODING_NONE));
-    }
+    handler.imm_handler = th_add_imm;
+    handler.reg_handler = th_add_reg;
     break;
   case TCCIR_OP_SUB:
-    if (th_has_immediate_value(op->src2.r)) {
-      ot_check(th_sub_imm(op->dest.pr0, op->src1.pr0, op->src2.c.i,
-                          FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                          ENFORCE_ENCODING_NONE));
-    } else {
-      ot_check(th_sub_reg(op->dest.pr0, op->src1.pr0, op->src2.pr0,
-                          FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                          ENFORCE_ENCODING_NONE));
-    }
+    handler.imm_handler = th_sub_imm;
+    handler.reg_handler = th_sub_reg;
     break;
   case TCCIR_OP_MUL:
     ot_check(th_mul(op->dest.pr0, op->src1.pr0, op->src2.pr0,
                     FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
-    break;
+    return;
   case TCCIR_OP_CMP:
-    if (th_has_immediate_value(op->src2.r)) {
-      ot_check(th_cmp_imm(op->src1.pr0, op->src2.c.i, ENFORCE_ENCODING_NONE));
-    } else {
-      ot_check(th_cmp_reg(op->src1.pr0, op->src2.pr0, THUMB_SHIFT_DEFAULT,
-                          ENFORCE_ENCODING_NONE));
-    }
+    handler.imm_handler = th_cmp_imm;
+    handler.reg_handler = th_cmp_reg;
     break;
   case TCCIR_OP_SHL: {
-    if (th_has_immediate_value(op->src2.r)) {
-      ot_check(th_lsl_imm(op->dest.pr0, op->src1.pr0, op->src2.c.i,
-                          FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                          ENFORCE_ENCODING_NONE));
-    } else {
-      ot_check(th_lsl_reg(op->dest.pr0, op->src1.pr0, op->src2.pr0,
-                          FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                          ENFORCE_ENCODING_NONE));
-    }
+    handler.imm_handler = th_lsl_imm;
+    handler.reg_handler = th_lsl_reg;
     break;
   }
+  case TCCIR_OP_OR: {
+    handler.imm_handler = th_orr_imm;
+    handler.reg_handler = th_orr_reg;
+    break;
+  }
+  case TCCIR_OP_AND: {
+    handler.imm_handler = th_and_imm;
+    handler.reg_handler = th_and_reg;
+    break;
+  }
+  case TCCIR_OP_XOR: {
+    handler.imm_handler = th_eor_imm;
+    handler.reg_handler = th_eor_reg;
+    break;
+  }
+  case TCCIR_OP_DIV: {
+    ot_check(th_sdiv(op->dest.pr0, op->src1.pr0, op->src2.pr0));
+    return;
+  }
+  case TCCIR_OP_UDIV: {
+    ot_check(th_udiv(op->dest.pr0, op->src1.pr0, op->src2.pr0));
+    return;
+  }
   case TCCIR_OP_ADC_USE:
-    // return ot_check(th_adc_reg(intr(op->res), intr(op->arg1), intr(op->arg2),
-    //  FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-    //  THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+    fprintf(stderr, "compiler_error: TCCIR_OP_ADC_USE not implemented\n");
+    exit(1);
   case TCCIR_OP_ADC_GEN:
-    // return ot_check(th_add_reg(op->dest->r, , intr(op->arg1),
-    //                            FLAGS_BEHAVIOUR_SET, THUMB_SHIFT_DEFAULT,
-    //                            ENFORCE_ENCODING_NONE));
+    fprintf(stderr, "compiler_error: TCCIR_OP_ADC_GEN not implemented\n");
+    exit(1);
+  case TCCIR_OP_TEST_ZERO:
+    ot_check(th_cmp_imm(0, intr(op->src1.pr0), 0, FLAGS_BEHAVIOUR_SET,
+                        ENFORCE_ENCODING_NONE));
+    return;
   default: {
     printf("compiler_error: unhandled data processing op: %s\n",
            tcc_ir_get_op_name(op->op));
   }
+  }
+
+  if (op->op == TCCIR_OP_CMP) {
+    printf("DEBUG CMP: src1.pr0=R%d, src2.c.i=%d, src2.r=0x%x\n", op->src1.pr0,
+           op->src2.c.i, op->src2.r);
+  }
+
+  if (th_has_immediate_value(op->src2.r)) {
+    if (!ot(handler.imm_handler(op->dest.pr0, op->src1.pr0, op->src2.c.i,
+                                FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                                ENFORCE_ENCODING_NONE))) {
+      // load immediate to temp register and add
+      load(R12, &op->src2);
+      ot_check(handler.reg_handler(op->dest.pr0, op->src1.pr0, R12,
+                                   FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                                   THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+    }
+  } else {
+    ot_check(handler.reg_handler(op->dest.pr0, op->src1.pr0, op->src2.pr0,
+                                 FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                                 THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
   }
 }
 
@@ -2808,6 +2836,28 @@ ST_FUNC void tcc_gen_machine_jump_op(TACQuadruple *q) {
 ST_FUNC void tcc_gen_machine_conditional_jump_op(TACQuadruple *q) {
   int op = mapcc(q->src1.c.i);
   ot_check(th_b_t3(op, 0)); // patch me later
+}
+
+ST_FUNC void tcc_gen_machine_setif_op(TACQuadruple *q) {
+  /* Convert comparison flags to 0/1 value in destination register
+   * Using IT (If-Then) block:
+   *   MOV Rd, #0          ; default to 0 (must NOT set flags!)
+   *   IT <cond>           ; If-Then for condition
+   *   MOV<cond> Rd, #1    ; set to 1 if condition true
+   */
+  int op = mapcc(q->src1.c.i);
+  int dest = q->dest.pr0;
+
+  /* First set dest to 0 - must use FLAGS_BEHAVIOUR_BLOCK to avoid clobbering
+   * the condition flags from the preceding CMP instruction */
+  ot_check(th_mov_imm(dest, 0, FLAGS_BEHAVIOUR_BLOCK, ENFORCE_ENCODING_NONE));
+
+  /* IT instruction with single Then (mask = 0x8) */
+  ot_check(th_it(op, 0x8));
+
+  /* Conditional MOV to 1 - let encoder choose best size */
+  ot_check(th_mov_imm(dest, 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                      ENFORCE_ENCODING_NONE));
 }
 
 ST_FUNC void tcc_gen_machine_backpatch_jump(int address, int offset) {

@@ -40,7 +40,7 @@
 
 #include "arm-thumb-opcodes.h"
 
-thumb_opcode th_nop(enforce_encoding encoding) {
+thumb_opcode th_nop(thumb_enforce_encoding encoding) {
   if (encoding == ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
         .size = 4,
@@ -53,7 +53,7 @@ thumb_opcode th_nop(enforce_encoding encoding) {
   };
 }
 
-thumb_opcode th_sev(enforce_encoding encoding) {
+thumb_opcode th_sev(thumb_enforce_encoding encoding) {
   if (encoding == ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
         .size = 4,
@@ -268,8 +268,8 @@ uint32_t th_shift_value_to_sr_type(thumb_shift shift) {
 }
 
 // all t32 arch
-thumb_opcode th_mov_reg(uint32_t rd, uint32_t rm, flags_behaviour flags,
-                        thumb_shift shift, enforce_encoding encoding,
+thumb_opcode th_mov_reg(uint32_t rd, uint32_t rm, thumb_flags_behaviour flags,
+                        thumb_shift shift, thumb_enforce_encoding encoding,
                         bool in_it) {
   if (shift.mode == THUMB_SHIFT_REGISTER && shift.type != THUMB_SHIFT_NONE) {
     return th_mov_reg_shift(rd, rm, shift.value, flags, shift, encoding);
@@ -303,8 +303,9 @@ thumb_opcode th_mov_reg(uint32_t rd, uint32_t rm, flags_behaviour flags,
   };
 }
 
-thumb_opcode th_mov_imm(uint16_t rd, uint32_t imm, flags_behaviour setflags,
-                        enforce_encoding encoding) {
+thumb_opcode th_mov_imm(uint16_t rd, uint32_t imm,
+                        thumb_flags_behaviour setflags,
+                        thumb_enforce_encoding encoding) {
   if (rd <= 7 && imm >= 0 && imm <= 255 && setflags != FLAGS_BEHAVIOUR_BLOCK &&
       encoding != ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
@@ -361,7 +362,7 @@ thumb_opcode th_movt(uint32_t rd, uint32_t imm16) {
 
 thumb_opcode th_generic_op_imm_with_status(uint16_t op, uint16_t rd,
                                            uint16_t rn, uint32_t imm,
-                                           flags_behaviour setflags) {
+                                           thumb_flags_behaviour setflags) {
 #ifndef TCC_TARGET_ARM_ARCHV6M
   const uint32_t packed = th_pack_const(imm);
   if (packed || imm == 0) {
@@ -387,9 +388,9 @@ thumb_opcode th_generic_op_imm(uint16_t op, uint16_t rd, uint16_t rn,
                                        FLAGS_BEHAVIOUR_NOT_IMPORTANT);
 }
 
-thumb_opcode th_add_reg(uint16_t rd, uint16_t rn, uint16_t rm,
-                        flags_behaviour flags, thumb_shift shift,
-                        enforce_encoding encoding) {
+thumb_opcode th_add_reg(uint32_t rd, uint32_t rn, uint32_t rm,
+                        thumb_flags_behaviour flags, thumb_shift shift,
+                        thumb_enforce_encoding encoding) {
   if ((rd == R_PC) && (rm == R_PC)) {
     tcc_error("compiler_error: 'th_add_reg', PC can't be used as rdn and rm\n");
   }
@@ -432,8 +433,9 @@ thumb_opcode th_add_imm_t4(uint32_t rd, uint32_t rn, uint32_t imm) {
   };
 }
 
-thumb_opcode th_add_imm(uint16_t rd, uint16_t rn, uint32_t imm,
-                        flags_behaviour flags, enforce_encoding encoding) {
+thumb_opcode th_add_imm(uint32_t rd, uint32_t rn, uint32_t imm,
+                        thumb_flags_behaviour flags,
+                        thumb_enforce_encoding encoding) {
   thumb_opcode op = {0, 0};
   if (rd == rn && rd < 8 && imm <= 255 && encoding != ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
@@ -459,7 +461,7 @@ thumb_opcode th_add_imm(uint16_t rd, uint16_t rn, uint32_t imm,
   return op;
 }
 
-thumb_opcode th_adr_imm(uint32_t rd, int imm, enforce_encoding encoding) {
+thumb_opcode th_adr_imm(uint32_t rd, int imm, thumb_enforce_encoding encoding) {
   if (imm <= 1020 && imm >= 0 && encoding != ENFORCE_ENCODING_32BIT &&
       imm % 4 == 0) {
     return (thumb_opcode){
@@ -488,8 +490,9 @@ thumb_opcode th_adr_imm(uint32_t rd, int imm, enforce_encoding encoding) {
       .opcode = 0,
   };
 }
-thumb_opcode th_bic_imm(uint16_t rd, uint16_t rn, uint32_t imm,
-                        flags_behaviour flags) {
+thumb_opcode th_bic_imm(uint32_t rd, uint32_t rn, uint32_t imm,
+                        thumb_flags_behaviour flags,
+                        thumb_enforce_encoding encoding) {
 #ifndef TCC_TARGET_ARM_ARCHV6M
   if (rd != R_SP && rd != R_PC && rn != R_SP && rd != R_PC) {
     const uint32_t packed = th_pack_const(imm);
@@ -508,9 +511,9 @@ thumb_opcode th_bic_imm(uint16_t rd, uint16_t rn, uint32_t imm,
   };
 }
 
-thumb_opcode th_bic_reg(uint16_t rd, uint16_t rn, uint16_t rm,
-                        flags_behaviour flags, thumb_shift shift,
-                        enforce_encoding encoding) {
+thumb_opcode th_bic_reg(uint32_t rd, uint32_t rn, uint32_t rm,
+                        thumb_flags_behaviour flags, thumb_shift shift,
+                        thumb_enforce_encoding encoding) {
   if (rm < 8 && rd < 8 && rn < 8 && shift.type == THUMB_SHIFT_NONE &&
       encoding != ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
@@ -521,16 +524,17 @@ thumb_opcode th_bic_reg(uint16_t rd, uint16_t rn, uint16_t rm,
   return th_generic_op_reg_shift_with_status(0xea20, rd, rn, rm, flags, shift);
 }
 
-thumb_opcode th_and_imm(uint16_t rd, uint16_t rn, uint32_t imm,
-                        flags_behaviour setflags) {
+thumb_opcode th_and_imm(uint32_t rd, uint32_t rn, uint32_t imm,
+                        thumb_flags_behaviour setflags,
+                        thumb_enforce_encoding encoding) {
   thumb_opcode op =
       th_generic_op_imm_with_status(0xf000, rd, rn, imm, setflags);
-  return op.size != 0 ? op : th_bic_imm(rd, rn, ~imm, setflags);
+  return op.size != 0 ? op : th_bic_imm(rd, rn, ~imm, setflags, encoding);
 }
 
-thumb_opcode th_and_reg(uint16_t rd, uint16_t rn, uint16_t rm,
-                        flags_behaviour flags, thumb_shift shift,
-                        enforce_encoding encoding) {
+thumb_opcode th_and_reg(uint32_t rd, uint32_t rn, uint32_t rm,
+                        thumb_flags_behaviour flags, thumb_shift shift,
+                        thumb_enforce_encoding encoding) {
   if (rd == rn && rm < 8 && rn < 8 && shift.type == THUMB_SHIFT_NONE &&
       encoding != ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
@@ -566,15 +570,15 @@ thumb_opcode th_xor_imm(uint16_t rd, uint16_t rn, uint32_t imm) {
   return th_generic_op_imm(0xf080, rd, rn, imm);
 }
 
-thumb_opcode th_rsb_reg(uint16_t rd, uint16_t rn, uint16_t rm,
-                        flags_behaviour flags, thumb_shift shift,
-                        enforce_encoding encoding) {
+thumb_opcode th_rsb_reg(uint32_t rd, uint32_t rn, uint32_t rm,
+                        thumb_flags_behaviour flags, thumb_shift shift,
+                        thumb_enforce_encoding encoding) {
   return th_generic_op_reg_shift_with_status(0xebc0, rd, rn, rm, flags, shift);
 }
 
 thumb_opcode th_sub_reg(uint32_t rd, uint32_t rn, uint32_t rm,
-                        flags_behaviour flags, thumb_shift shift,
-                        enforce_encoding encoding) {
+                        thumb_flags_behaviour flags, thumb_shift shift,
+                        thumb_enforce_encoding encoding) {
   if (rd < 8 && rm < 8 && rn < 8 && shift.type == THUMB_SHIFT_NONE &&
       encoding != ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
@@ -601,15 +605,16 @@ thumb_opcode th_sub_reg(uint32_t rd, uint32_t rn, uint32_t rm,
   };
 }
 
-thumb_opcode th_sub_sp_reg(uint32_t rd, uint32_t rm, flags_behaviour flags,
-                           thumb_shift shift, enforce_encoding encoding) {
+thumb_opcode th_sub_sp_reg(uint32_t rd, uint32_t rm,
+                           thumb_flags_behaviour flags, thumb_shift shift,
+                           thumb_enforce_encoding encoding) {
   return th_generic_op_reg_shift_with_status(0xeba0, rd, R_SP, rm, flags,
                                              shift);
 }
 
 thumb_opcode th_generic_op_reg_shift_with_status(uint32_t op, uint32_t rd,
                                                  uint32_t rn, uint32_t rm,
-                                                 flags_behaviour flags,
+                                                 thumb_flags_behaviour flags,
                                                  thumb_shift shift) {
   int s = 0;
   const int sr = th_shift_value_to_sr_type(shift);
@@ -625,9 +630,9 @@ thumb_opcode th_generic_op_reg_shift_with_status(uint32_t op, uint32_t rd,
   };
 }
 
-thumb_opcode th_adc_reg(uint16_t rd, uint16_t rn, uint16_t rm,
-                        flags_behaviour flags, thumb_shift shift,
-                        enforce_encoding encoding) {
+thumb_opcode th_adc_reg(uint32_t rd, uint32_t rn, uint32_t rm,
+                        thumb_flags_behaviour flags, thumb_shift shift,
+                        thumb_enforce_encoding encoding) {
   if (rd == rn && rm < 8 && rn < 8 && shift.type == THUMB_SHIFT_NONE &&
       encoding != ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
@@ -639,19 +644,21 @@ thumb_opcode th_adc_reg(uint16_t rd, uint16_t rn, uint16_t rm,
   return th_generic_op_reg_shift_with_status(0xeb40, rd, rn, rm, flags, shift);
 }
 
-thumb_opcode th_adc_imm(uint16_t rd, uint16_t rn, uint32_t imm,
-                        flags_behaviour setflags) {
+thumb_opcode th_adc_imm(uint32_t rd, uint32_t rn, uint32_t imm,
+                        thumb_flags_behaviour setflags,
+                        thumb_enforce_encoding encoding) {
   return th_generic_op_imm_with_status(0xf140, rd, rn, imm, setflags);
 }
 
-thumb_opcode th_sbc_imm(uint16_t rd, uint16_t rn, uint32_t imm,
-                        flags_behaviour flags) {
+thumb_opcode th_sbc_imm(uint32_t rd, uint32_t rn, uint32_t imm,
+                        thumb_flags_behaviour flags,
+                        thumb_enforce_encoding encoding) {
   return th_generic_op_imm_with_status(0xf160, rd, rn, imm, flags);
 }
 
-thumb_opcode th_sbc_reg(uint16_t rd, uint16_t rn, uint16_t rm,
-                        flags_behaviour flags, thumb_shift shift,
-                        enforce_encoding encoding) {
+thumb_opcode th_sbc_reg(uint32_t rd, uint32_t rn, uint32_t rm,
+                        thumb_flags_behaviour flags, thumb_shift shift,
+                        thumb_enforce_encoding encoding) {
   if (rd == rn && rm < 8 && rn < 8 && shift.type == THUMB_SHIFT_NONE &&
       encoding != ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
@@ -662,8 +669,10 @@ thumb_opcode th_sbc_reg(uint16_t rd, uint16_t rn, uint16_t rm,
   return th_generic_op_reg_shift_with_status(0xeb60, rd, rn, rm, flags, shift);
 }
 
-thumb_opcode th_orr_imm(uint16_t rd, uint16_t rn, uint32_t imm,
-                        flags_behaviour setflags) {
+thumb_opcode th_orr_imm(uint32_t rd, uint32_t rn, uint32_t imm,
+                        thumb_flags_behaviour setflags,
+                        thumb_enforce_encoding encoding) {
+  (void)encoding; /* currently unused */
   if (rn != R_SP && rd != R_SP && rn != R_PC) {
     return th_generic_op_imm_with_status(0xf040, rd, rn, imm, setflags);
   }
@@ -673,8 +682,11 @@ thumb_opcode th_orr_imm(uint16_t rd, uint16_t rn, uint32_t imm,
   };
 }
 
-thumb_opcode th_cmp_reg(uint16_t rn, uint16_t rm, thumb_shift shift,
-                        enforce_encoding encoding) {
+thumb_opcode th_cmp_reg(uint32_t rd, uint32_t rn, uint32_t rm,
+                        thumb_flags_behaviour flags, thumb_shift shift,
+                        thumb_enforce_encoding encoding) {
+  (void)rd;    /* CMP doesn't use rd - result goes to flags */
+  (void)flags; /* CMP always sets flags */
   if (rm < 8 && rn < 8 && shift.type == THUMB_SHIFT_NONE &&
       encoding != ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
@@ -695,9 +707,9 @@ thumb_opcode th_cmp_reg(uint16_t rn, uint16_t rm, thumb_shift shift,
                                              FLAGS_BEHAVIOUR_SET, shift);
 }
 
-thumb_opcode th_orr_reg(uint16_t rd, uint16_t rn, uint16_t rm,
-                        flags_behaviour flags, thumb_shift shift,
-                        enforce_encoding encoding) {
+thumb_opcode th_orr_reg(uint32_t rd, uint32_t rn, uint32_t rm,
+                        thumb_flags_behaviour flags, thumb_shift shift,
+                        thumb_enforce_encoding encoding) {
   if (rd == rn && rm < 8 && rn < 8 && shift.type == THUMB_SHIFT_NONE &&
       encoding != ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
@@ -727,7 +739,8 @@ thumb_opcode th_sub_imm_t4(uint32_t rd, uint32_t rn, uint32_t imm) {
 }
 
 thumb_opcode th_sub_imm(uint32_t rd, uint32_t rn, uint32_t imm,
-                        flags_behaviour flags, enforce_encoding encoding) {
+                        thumb_flags_behaviour flags,
+                        thumb_enforce_encoding encoding) {
 
   if (rd == rn && imm <= 255 && rd < 8 && encoding != ENFORCE_ENCODING_32BIT) {
     // T2
@@ -796,7 +809,7 @@ int th_ldr_literal_estimate(uint16_t rt, uint32_t imm) {
 }
 
 thumb_opcode th_ldrsh_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw,
-                          enforce_encoding encoding) {
+                          thumb_enforce_encoding encoding) {
 #ifndef TCC_TARGET_ARM_ARCHV6M
   // puw == 6 means positive offset on rn, so T1 encoding can be used
   if (rt != R_SP && imm <= 4095 && puw == 6 && rn != R_PC) {
@@ -829,7 +842,7 @@ thumb_opcode th_ldrsh_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw,
 }
 
 thumb_opcode th_ldrsh_reg(uint32_t rt, uint32_t rn, uint32_t rm,
-                          thumb_shift shift, enforce_encoding encoding) {
+                          thumb_shift shift, thumb_enforce_encoding encoding) {
   if (shift.type != THUMB_SHIFT_NONE && shift.type != THUMB_SHIFT_LSL) {
     tcc_error("compiler_error: 'th_ldrsh_reg', only LSL shift supported\n");
   }
@@ -856,7 +869,7 @@ thumb_opcode th_ldrsh_reg(uint32_t rt, uint32_t rn, uint32_t rm,
 }
 
 thumb_opcode th_ldrh_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw,
-                         enforce_encoding encoding) {
+                         thumb_enforce_encoding encoding) {
   // T1 encoding, on armv6-m this one is the only one available
   if (puw == 6 && rn < 8 && rt < 8 && imm <= 62 &&
       encoding != ENFORCE_ENCODING_32BIT && !(imm & 1)) {
@@ -893,7 +906,7 @@ thumb_opcode th_ldrh_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw,
 }
 
 thumb_opcode th_ldrh_reg(uint32_t rt, uint32_t rn, uint32_t rm,
-                         thumb_shift shift, enforce_encoding encoding) {
+                         thumb_shift shift, thumb_enforce_encoding encoding) {
 
   if (shift.type != THUMB_SHIFT_NONE && shift.type != THUMB_SHIFT_LSL) {
     tcc_error("compiler_error: 'th_ldr_reg', only LSL shift supported\n");
@@ -921,7 +934,7 @@ thumb_opcode th_ldrh_reg(uint32_t rt, uint32_t rn, uint32_t rm,
 }
 
 thumb_opcode th_ldrsb_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw,
-                          enforce_encoding encoding) {
+                          thumb_enforce_encoding encoding) {
 #ifndef TCC_TARGET_ARM_ARCHV6M
   // puw == 6 means positive offset on rn, so T1 encoding can be used
   if (rt != R_SP && imm <= 4095 && puw == 6 && rn != R_PC) {
@@ -950,7 +963,7 @@ thumb_opcode th_ldrsb_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw,
 }
 
 thumb_opcode th_ldrsb_reg(uint32_t rt, uint32_t rn, uint32_t rm,
-                          thumb_shift shift, enforce_encoding encoding) {
+                          thumb_shift shift, thumb_enforce_encoding encoding) {
   if (shift.type != THUMB_SHIFT_NONE && shift.type != THUMB_SHIFT_LSL) {
     tcc_error("compiler_error: 'th_ldr_reg', only LSL shift supported\n");
   }
@@ -978,7 +991,7 @@ thumb_opcode th_ldrsb_reg(uint32_t rt, uint32_t rn, uint32_t rm,
 }
 
 thumb_opcode th_ldrb_imm(uint16_t rt, uint16_t rn, int imm, uint32_t puw,
-                         enforce_encoding encoding) {
+                         thumb_enforce_encoding encoding) {
   // T1 encoding, on armv6-m this one is the only one available
   if (puw == 6 && rn < 8 && rt < 8 && imm <= 31 &&
       encoding != ENFORCE_ENCODING_32BIT) {
@@ -1014,7 +1027,7 @@ thumb_opcode th_ldrb_imm(uint16_t rt, uint16_t rn, int imm, uint32_t puw,
 }
 
 thumb_opcode th_ldrb_reg(uint32_t rt, uint32_t rn, uint32_t rm,
-                         thumb_shift shift, enforce_encoding encoding) {
+                         thumb_shift shift, thumb_enforce_encoding encoding) {
   // puw == 6 means positive offset on rn, so T1 encoding can be used
   if (shift.type != THUMB_SHIFT_NONE && shift.type != THUMB_SHIFT_LSL) {
     tcc_error("compiler_error: 'th_ldr_reg', only LSL shift supported\n");
@@ -1041,7 +1054,7 @@ thumb_opcode th_ldrb_reg(uint32_t rt, uint32_t rn, uint32_t rm,
 }
 
 thumb_opcode th_ldr_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw,
-                        enforce_encoding encoding) {
+                        thumb_enforce_encoding encoding) {
   // puw == 6 means positive offset on rn, so T1 encoding can be used
   if (puw == 6 && rn < 8 && rt < 8 && imm <= 124 && !(imm & 3) &&
       encoding != ENFORCE_ENCODING_32BIT) {
@@ -1088,7 +1101,7 @@ thumb_opcode th_ldr_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw,
 }
 
 thumb_opcode th_ldr_reg(uint32_t rt, uint32_t rn, uint32_t rm,
-                        thumb_shift shift, enforce_encoding encoding) {
+                        thumb_shift shift, thumb_enforce_encoding encoding) {
   if (shift.type != THUMB_SHIFT_NONE && shift.type != THUMB_SHIFT_LSL) {
     tcc_error("compiler_error: 'th_ldr_reg', only LSL shift supported\n");
   }
@@ -1164,7 +1177,7 @@ thumb_opcode th_pop(uint16_t regs) {
 
 // STR
 thumb_opcode th_strh_imm(uint16_t rt, uint16_t rn, int imm, uint16_t puw,
-                         enforce_encoding encoding) {
+                         thumb_enforce_encoding encoding) {
   // T1 encoding, on armv6-m this one is the only one available
   if (puw == 6 && rn < 8 && rt < 8 && imm <= 62 &&
       encoding != ENFORCE_ENCODING_32BIT && !(imm & 1)) {
@@ -1196,7 +1209,7 @@ thumb_opcode th_strh_imm(uint16_t rt, uint16_t rn, int imm, uint16_t puw,
 }
 
 thumb_opcode th_strh_reg(uint32_t rt, uint32_t rn, uint32_t rm,
-                         thumb_shift shift, enforce_encoding encoding) {
+                         thumb_shift shift, thumb_enforce_encoding encoding) {
   // puw == 6 means positive offset on rn, so T1 encoding can be used
   if (rm < 8 && rt < 8 && rn < 8 && encoding != ENFORCE_ENCODING_32BIT &&
       shift.type == THUMB_SHIFT_NONE) {
@@ -1220,7 +1233,7 @@ thumb_opcode th_strh_reg(uint32_t rt, uint32_t rn, uint32_t rm,
 }
 
 thumb_opcode th_strb_imm(uint16_t rt, uint16_t rn, int imm, uint16_t puw,
-                         enforce_encoding encoding) {
+                         thumb_enforce_encoding encoding) {
   // T1 encoding, on armv6-m this one is the only one available
   if (puw == 6 && rn < 8 && rt < 8 && imm <= 31 &&
       encoding != ENFORCE_ENCODING_32BIT) {
@@ -1251,7 +1264,7 @@ thumb_opcode th_strb_imm(uint16_t rt, uint16_t rn, int imm, uint16_t puw,
 }
 
 thumb_opcode th_strb_reg(uint32_t rt, uint32_t rn, uint32_t rm,
-                         thumb_shift shift, enforce_encoding encoding) {
+                         thumb_shift shift, thumb_enforce_encoding encoding) {
   // puw == 6 means positive offset on rn, so T1 encoding can be used
   if (rm < 8 && rt < 8 && rn < 8 && shift.type == THUMB_SHIFT_NONE &&
       encoding != ENFORCE_ENCODING_32BIT) {
@@ -1275,7 +1288,7 @@ thumb_opcode th_strb_reg(uint32_t rt, uint32_t rn, uint32_t rm,
 }
 
 thumb_opcode th_str_reg(uint32_t rt, uint32_t rn, uint32_t rm,
-                        thumb_shift shift, enforce_encoding encoding) {
+                        thumb_shift shift, thumb_enforce_encoding encoding) {
   if (shift.type != THUMB_SHIFT_NONE && shift.type != THUMB_SHIFT_LSL) {
     tcc_error("compiler_error: 'th_str_reg', only LSL shift supported\n");
   }
@@ -1303,7 +1316,8 @@ thumb_opcode th_str_reg(uint32_t rt, uint32_t rn, uint32_t rm,
 }
 
 thumb_opcode th_mul(uint32_t rd, uint32_t rn, uint32_t rm,
-                    flags_behaviour flags, enforce_encoding encoding) {
+                    thumb_flags_behaviour flags,
+                    thumb_enforce_encoding encoding) {
   if (rd == rm && rd < 8 && rn < 8 && encoding != ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
         .size = 2,
@@ -1364,8 +1378,9 @@ thumb_opcode th_sdiv(uint16_t rd, uint16_t rn, uint16_t rm) {
   };
 }
 
-thumb_opcode th_add_sp_imm_t4(uint32_t rd, uint32_t imm, flags_behaviour flags,
-                              enforce_encoding encoding) {
+thumb_opcode th_add_sp_imm_t4(uint32_t rd, uint32_t imm,
+                              thumb_flags_behaviour flags,
+                              thumb_enforce_encoding encoding) {
   if (rd != R_PC && imm <= 4095 && (encoding != ENFORCE_ENCODING_16BIT) &&
       (flags != FLAGS_BEHAVIOUR_SET)) {
     const uint16_t i = (imm >> 11) & 1;
@@ -1382,8 +1397,9 @@ thumb_opcode th_add_sp_imm_t4(uint32_t rd, uint32_t imm, flags_behaviour flags,
   };
 }
 
-thumb_opcode th_add_sp_imm(uint16_t rd, uint32_t imm, flags_behaviour flags,
-                           enforce_encoding encoding) {
+thumb_opcode th_add_sp_imm(uint16_t rd, uint32_t imm,
+                           thumb_flags_behaviour flags,
+                           thumb_enforce_encoding encoding) {
   // T1 on all armv-m
   if (rd < 8 && imm <= 1020 && !(imm & 0x3) && (flags != FLAGS_BEHAVIOUR_SET) &&
       (encoding != ENFORCE_ENCODING_32BIT)) {
@@ -1422,8 +1438,9 @@ thumb_opcode th_add_sp_imm(uint16_t rd, uint32_t imm, flags_behaviour flags,
 #endif
 }
 
-thumb_opcode th_add_sp_reg(uint32_t rd, uint32_t rm, flags_behaviour flags,
-                           enforce_encoding encoding, thumb_shift shift) {
+thumb_opcode th_add_sp_reg(uint32_t rd, uint32_t rm,
+                           thumb_flags_behaviour flags,
+                           thumb_enforce_encoding encoding, thumb_shift shift) {
   if (rd == rm && flags != FLAGS_BEHAVIOUR_SET &&
       encoding != ENFORCE_ENCODING_32BIT && shift.type == THUMB_SHIFT_NONE) {
     const uint16_t rdm = rd & 7;
@@ -1459,8 +1476,9 @@ thumb_opcode th_add_sp_reg(uint32_t rd, uint32_t rm, flags_behaviour flags,
   };
 }
 
-thumb_opcode th_rsb_imm(uint16_t rd, uint16_t rn, uint32_t imm,
-                        flags_behaviour setflags) {
+thumb_opcode th_rsb_imm(uint32_t rd, uint32_t rn, uint32_t imm,
+                        thumb_flags_behaviour setflags,
+                        thumb_enforce_encoding encoding) {
   if (rd < 8 && rn < 8 && imm == 0 && setflags == FLAGS_BEHAVIOUR_SET) {
     return (thumb_opcode){
         .size = 2,
@@ -1476,7 +1494,7 @@ thumb_opcode th_rsb_imm(uint16_t rd, uint16_t rn, uint32_t imm,
 }
 
 thumb_opcode th_shift_armv7m(uint16_t rd, uint16_t rm, uint32_t imm,
-                             uint32_t type, flags_behaviour setflags) {
+                             uint32_t type, thumb_flags_behaviour setflags) {
   const uint32_t imm3 = (imm >> 2) & 7;
   const uint32_t imm2 = imm & 0x3;
   const uint32_t s = setflags == FLAGS_BEHAVIOUR_SET;
@@ -1487,9 +1505,10 @@ thumb_opcode th_shift_armv7m(uint16_t rd, uint16_t rm, uint32_t imm,
   };
 }
 
-thumb_opcode th_lsl_reg(uint16_t rd, uint16_t rn, uint16_t rm,
-                        flags_behaviour flags, enforce_encoding encoding) {
-
+thumb_opcode th_lsl_reg(uint32_t rd, uint32_t rn, uint32_t rm,
+                        thumb_flags_behaviour flags, thumb_shift shift,
+                        thumb_enforce_encoding encoding) {
+  (void)shift; /* shift parameter unused for LSL_reg - shift amount is in rm */
   if (rd == rn && rm < 8 && rn < 8 && encoding != ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
         .size = 2,
@@ -1512,18 +1531,20 @@ thumb_opcode th_lsl_reg(uint16_t rd, uint16_t rn, uint16_t rm,
   };
 }
 
-thumb_opcode th_lsl_imm(uint16_t rd, uint16_t rm, uint32_t imm,
-                        flags_behaviour flags, enforce_encoding encoding) {
+thumb_opcode th_lsl_imm(uint32_t rd, uint32_t rn, uint32_t imm,
+                        thumb_flags_behaviour flags,
+                        thumb_enforce_encoding encoding) {
   thumb_shift shift = {
       .type = THUMB_SHIFT_LSL,
       .value = imm,
       .mode = THUMB_SHIFT_IMMEDIATE,
   };
-  return th_mov_reg(rd, rm, flags, shift, encoding, false);
+  return th_mov_reg(rd, rn, flags, shift, encoding, false);
 }
 
 thumb_opcode th_lsr_reg(uint16_t rd, uint16_t rn, uint16_t rm,
-                        flags_behaviour flags, enforce_encoding encoding) {
+                        thumb_flags_behaviour flags,
+                        thumb_enforce_encoding encoding) {
   if (rd == rn && rm < 8 && rn < 8 && encoding != ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
         .size = 2,
@@ -1547,7 +1568,8 @@ thumb_opcode th_lsr_reg(uint16_t rd, uint16_t rn, uint16_t rm,
 }
 
 thumb_opcode th_lsr_imm(uint16_t rd, uint16_t rm, uint32_t imm,
-                        flags_behaviour flags, enforce_encoding encoding) {
+                        thumb_flags_behaviour flags,
+                        thumb_enforce_encoding encoding) {
   if (rm < 8 && rd < 8 && encoding != ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
         .size = 2,
@@ -1566,7 +1588,8 @@ thumb_opcode th_lsr_imm(uint16_t rd, uint16_t rm, uint32_t imm,
 }
 
 thumb_opcode th_asr_reg(uint16_t rd, uint16_t rn, uint16_t rm,
-                        flags_behaviour flags, enforce_encoding encoding) {
+                        thumb_flags_behaviour flags,
+                        thumb_enforce_encoding encoding) {
   if (rd == rn && rm < 8 && rn < 8 && encoding != ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
         .size = 2,
@@ -1590,7 +1613,8 @@ thumb_opcode th_asr_reg(uint16_t rd, uint16_t rn, uint16_t rm,
 }
 
 thumb_opcode th_asr_imm(uint16_t rd, uint16_t rm, uint32_t imm,
-                        flags_behaviour flags, enforce_encoding encoding) {
+                        thumb_flags_behaviour flags,
+                        thumb_enforce_encoding encoding) {
   if (rm < 8 && rd < 8 && encoding != ENFORCE_ENCODING_32BIT &&
       flags == FLAGS_BEHAVIOUR_SET && imm != 0) {
     return (thumb_opcode){
@@ -1617,8 +1641,8 @@ thumb_opcode th_asr_imm(uint16_t rd, uint16_t rm, uint32_t imm,
 }
 
 thumb_opcode th_mov_reg_shift(uint32_t rd, uint32_t rm, uint32_t rs,
-                              flags_behaviour flags, thumb_shift shift,
-                              enforce_encoding encoding) {
+                              thumb_flags_behaviour flags, thumb_shift shift,
+                              thumb_enforce_encoding encoding) {
   const uint32_t s = flags == FLAGS_BEHAVIOUR_SET;
   if (rd == rm && rd < 8 && rs < 8 && encoding != ENFORCE_ENCODING_32BIT &&
       shift.type != THUMB_SHIFT_RRX) {
@@ -1635,7 +1659,8 @@ thumb_opcode th_mov_reg_shift(uint32_t rd, uint32_t rm, uint32_t rs,
 }
 
 thumb_opcode th_ror_imm(uint16_t rd, uint16_t rm, uint32_t imm,
-                        flags_behaviour flags, enforce_encoding encoding) {
+                        thumb_flags_behaviour flags,
+                        thumb_enforce_encoding encoding) {
   if (rm < 8 && rd < 8 && encoding != ENFORCE_ENCODING_32BIT &&
       flags == FLAGS_BEHAVIOUR_SET && imm != 0) {
     return (thumb_opcode){
@@ -1660,7 +1685,11 @@ thumb_opcode th_ror_imm(uint16_t rd, uint16_t rm, uint32_t imm,
   };
 }
 
-thumb_opcode th_cmp_imm(uint16_t rn, uint32_t imm, enforce_encoding encoding) {
+thumb_opcode th_cmp_imm(uint32_t rd, uint32_t rn, uint32_t imm,
+                        thumb_flags_behaviour flags,
+                        thumb_enforce_encoding encoding) {
+  (void)rd;    /* CMP doesn't use rd - result goes to flags */
+  (void)flags; /* CMP always sets flags */
   if (rn < 8 && imm <= 255 && encoding != ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
         .size = 2,
@@ -1841,8 +1870,9 @@ thumb_opcode th_vmov_2gp_dp(uint16_t rt, uint16_t rt2, uint16_t dm,
   };
 }
 
-thumb_opcode th_sub_sp_imm_t3(uint32_t rd, uint32_t imm, flags_behaviour flags,
-                              enforce_encoding encoding) {
+thumb_opcode th_sub_sp_imm_t3(uint32_t rd, uint32_t imm,
+                              thumb_flags_behaviour flags,
+                              thumb_enforce_encoding encoding) {
   if (rd != R_PC && imm <= 4095 && encoding != ENFORCE_ENCODING_16BIT &&
       flags != FLAGS_BEHAVIOUR_SET) {
     const uint32_t i = (imm >> 11) & 1;
@@ -1859,8 +1889,9 @@ thumb_opcode th_sub_sp_imm_t3(uint32_t rd, uint32_t imm, flags_behaviour flags,
   };
 }
 
-thumb_opcode th_sub_sp_imm(uint32_t rd, uint32_t imm, flags_behaviour flags,
-                           enforce_encoding encoding) {
+thumb_opcode th_sub_sp_imm(uint32_t rd, uint32_t imm,
+                           thumb_flags_behaviour flags,
+                           thumb_enforce_encoding encoding) {
   // T1 encoding
   if (rd == R_SP && imm <= 508 && !(imm & 0x3) &&
       encoding != ENFORCE_ENCODING_32BIT && flags != FLAGS_BEHAVIOUR_SET) {
@@ -2001,7 +2032,7 @@ thumb_opcode th_cmn_imm(uint32_t rn, uint32_t imm) {
 }
 
 thumb_opcode th_cmn_reg(uint32_t rn, uint32_t rm, thumb_shift shift,
-                        enforce_encoding encoding) {
+                        thumb_enforce_encoding encoding) {
   if (rn < 8 && rm < 8 && shift.type == THUMB_SHIFT_NONE &&
       encoding != ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
@@ -2048,8 +2079,9 @@ thumb_opcode th_isb(uint32_t option) {
   };
 }
 
-thumb_opcode th_eor_imm(uint16_t rd, uint16_t rn, uint32_t imm,
-                        flags_behaviour flags) {
+thumb_opcode th_eor_imm(uint32_t rd, uint32_t rn, uint32_t imm,
+                        thumb_flags_behaviour flags,
+                        thumb_enforce_encoding encoding) {
 
   uint32_t S = (flags == FLAGS_BEHAVIOUR_SET) ? 1 : 0;
   uint32_t packed = th_pack_const(imm);
@@ -2059,9 +2091,9 @@ thumb_opcode th_eor_imm(uint16_t rd, uint16_t rn, uint32_t imm,
   };
 }
 
-thumb_opcode th_eor_reg(uint16_t rd, uint16_t rn, uint16_t rm,
-                        flags_behaviour flags, thumb_shift shift,
-                        enforce_encoding encoding) {
+thumb_opcode th_eor_reg(uint32_t rd, uint32_t rn, uint32_t rm,
+                        thumb_flags_behaviour flags, thumb_shift shift,
+                        thumb_enforce_encoding encoding) {
   if (rd == rn && rm < 8 && rn < 8 && encoding != ENFORCE_ENCODING_32BIT &&
       shift.type == THUMB_SHIFT_NONE) {
     return (thumb_opcode){
@@ -2115,7 +2147,7 @@ thumb_opcode th_ldah(uint32_t rt, uint32_t rn) {
 }
 
 thumb_opcode th_ldm(uint32_t rn, uint32_t regset, uint32_t writeback,
-                    enforce_encoding encoding) {
+                    thumb_enforce_encoding encoding) {
   if (rn < 8 && regset <= 0xff && encoding != ENFORCE_ENCODING_32BIT &&
       writeback == 1) {
     if (writeback) {
@@ -2166,7 +2198,7 @@ thumb_opcode th_ldrbt(uint32_t rt, uint32_t rn, int imm) {
 }
 
 thumb_opcode th_ldrd_imm(uint32_t rt, uint32_t rt2, uint32_t rn, int imm,
-                         uint32_t puw, enforce_encoding encoding) {
+                         uint32_t puw, thumb_enforce_encoding encoding) {
   const uint32_t pu = (puw >> 1) & 0x3;
   const uint32_t w = puw & 0x1;
   return (thumb_opcode){
@@ -2267,8 +2299,9 @@ thumb_opcode th_msr(uint32_t specreg, uint32_t rn, uint32_t mask) {
   };
 }
 
-thumb_opcode th_mvn_imm(uint16_t rd, uint16_t, uint32_t imm,
-                        flags_behaviour flags) {
+thumb_opcode th_mvn_imm(uint32_t rd, uint32_t rm, uint32_t imm,
+                        thumb_flags_behaviour flags,
+                        thumb_enforce_encoding encoding) {
 
   uint32_t S = (flags == FLAGS_BEHAVIOUR_SET) ? 1 : 0;
   uint32_t packed = th_pack_const(imm);
@@ -2284,9 +2317,9 @@ thumb_opcode th_mvn_imm(uint16_t rd, uint16_t, uint32_t imm,
   };
 }
 
-thumb_opcode th_mvn_reg(uint16_t rd, uint16_t rn, uint16_t rm,
-                        flags_behaviour flags, thumb_shift shift,
-                        enforce_encoding encoding) {
+thumb_opcode th_mvn_reg(uint32_t rd, uint32_t rn, uint32_t rm,
+                        thumb_flags_behaviour flags, thumb_shift shift,
+                        thumb_enforce_encoding encoding) {
   if (rd == rn && rm < 8 && encoding != ENFORCE_ENCODING_32BIT &&
       shift.type == THUMB_SHIFT_NONE) {
     return (thumb_opcode){
@@ -2297,8 +2330,9 @@ thumb_opcode th_mvn_reg(uint16_t rd, uint16_t rn, uint16_t rm,
   return th_generic_op_reg_shift_with_status(0xea6f, rd, rn, rm, flags, shift);
 }
 
-thumb_opcode th_orn_imm(uint16_t rd, uint16_t rn, uint32_t imm,
-                        flags_behaviour flags) {
+thumb_opcode th_orn_imm(uint32_t rd, uint32_t rn, uint32_t imm,
+                        thumb_flags_behaviour flags,
+                        thumb_enforce_encoding encoding) {
 
   uint32_t S = (flags == FLAGS_BEHAVIOUR_SET) ? 1 : 0;
   uint32_t packed = th_pack_const(imm);
@@ -2308,9 +2342,9 @@ thumb_opcode th_orn_imm(uint16_t rd, uint16_t rn, uint32_t imm,
   };
 }
 
-thumb_opcode th_orn_reg(uint16_t rd, uint16_t rn, uint16_t rm,
-                        flags_behaviour flags, thumb_shift shift,
-                        enforce_encoding encoding) {
+thumb_opcode th_orn_reg(uint32_t rd, uint32_t rn, uint32_t rm,
+                        thumb_flags_behaviour flags, thumb_shift shift,
+                        thumb_enforce_encoding encoding) {
   return th_generic_op_reg_shift_with_status(0xea60, rd, rn, rm, flags, shift);
 }
 
@@ -2422,7 +2456,7 @@ thumb_opcode th_rbit(uint32_t rd, uint32_t rm) {
   };
 }
 
-thumb_opcode th_rev(uint32_t rd, uint32_t rm, enforce_encoding encoding) {
+thumb_opcode th_rev(uint32_t rd, uint32_t rm, thumb_enforce_encoding encoding) {
   if (rd < 8 && rm < 8 && encoding != ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
         .size = 2,
@@ -2435,7 +2469,8 @@ thumb_opcode th_rev(uint32_t rd, uint32_t rm, enforce_encoding encoding) {
   };
 }
 
-thumb_opcode th_rev16(uint32_t rd, uint32_t rm, enforce_encoding encoding) {
+thumb_opcode th_rev16(uint32_t rd, uint32_t rm,
+                      thumb_enforce_encoding encoding) {
   if (rd < 8 && rm < 8 && encoding != ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
         .size = 2,
@@ -2448,7 +2483,8 @@ thumb_opcode th_rev16(uint32_t rd, uint32_t rm, enforce_encoding encoding) {
   };
 }
 
-thumb_opcode th_revsh(uint32_t rd, uint32_t rm, enforce_encoding encoding) {
+thumb_opcode th_revsh(uint32_t rd, uint32_t rm,
+                      thumb_enforce_encoding encoding) {
   if (rd < 8 && rm < 8 && encoding != ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
         .size = 2,
@@ -2561,7 +2597,7 @@ thumb_opcode th_stlh(uint32_t rt, uint32_t rn) {
 }
 
 thumb_opcode th_stm(uint32_t rn, uint32_t regset, uint32_t writeback,
-                    enforce_encoding encoding) {
+                    thumb_enforce_encoding encoding) {
   if (rn < 8 && regset <= 0xff && encoding != ENFORCE_ENCODING_32BIT &&
       writeback == 1) {
     if (writeback) {
@@ -2589,7 +2625,7 @@ thumb_opcode th_stm(uint32_t rn, uint32_t regset, uint32_t writeback,
 }
 
 thumb_opcode th_stmdb(uint32_t rn, uint32_t regset, uint32_t writeback,
-                      enforce_encoding encoding) {
+                      thumb_enforce_encoding encoding) {
 
   if (rn == R_SP && encoding != ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
@@ -2605,7 +2641,7 @@ thumb_opcode th_stmdb(uint32_t rn, uint32_t regset, uint32_t writeback,
 }
 
 thumb_opcode th_str_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw,
-                        enforce_encoding encoding) {
+                        thumb_enforce_encoding encoding) {
   // puw == 6 means positive offset on rn, so T1 encoding can be used
   if (puw == 6 && rn < 8 && rt < 8 && imm <= 124 && !(imm & 3) &&
       encoding != ENFORCE_ENCODING_32BIT) {
@@ -2659,7 +2695,7 @@ thumb_opcode th_strbt(uint32_t rt, uint32_t rn, int imm) {
 }
 
 thumb_opcode th_strd_imm(uint32_t rt, uint32_t rt2, uint32_t rn, int imm,
-                         uint32_t puw, enforce_encoding encoding) {
+                         uint32_t puw, thumb_enforce_encoding encoding) {
   const uint32_t pu = (puw >> 1) & 0x3;
   const uint32_t w = puw & 0x1;
   return (thumb_opcode){
@@ -2710,7 +2746,7 @@ thumb_opcode th_strt(uint32_t rt, uint32_t rn, int imm) {
 }
 
 thumb_opcode th_sxtb(uint32_t rd, uint32_t rm, thumb_shift shift,
-                     enforce_encoding encoding) {
+                     thumb_enforce_encoding encoding) {
 
   const uint32_t rotate = shift.value >> 3;
   if (shift.type != THUMB_SHIFT_NONE && shift.type != THUMB_SHIFT_ROR) {
@@ -2738,7 +2774,7 @@ thumb_opcode th_sxtb(uint32_t rd, uint32_t rm, thumb_shift shift,
 }
 
 thumb_opcode th_sxth(uint32_t rd, uint32_t rm, thumb_shift shift,
-                     enforce_encoding encoding) {
+                     thumb_enforce_encoding encoding) {
 
   const uint32_t rotate = shift.value >> 3;
   if (shift.type != THUMB_SHIFT_NONE && shift.type != THUMB_SHIFT_ROR) {
@@ -2789,7 +2825,7 @@ thumb_opcode th_tst_imm(uint32_t rn, uint32_t imm) {
 }
 
 thumb_opcode th_tst_reg(uint32_t rn, uint32_t rm, thumb_shift shift,
-                        enforce_encoding encoding) {
+                        thumb_enforce_encoding encoding) {
   if (rn < 8 && rm < 8 && encoding != ENFORCE_ENCODING_32BIT &&
       shift.type == THUMB_SHIFT_NONE) {
     return (thumb_opcode){
@@ -2808,7 +2844,7 @@ thumb_opcode th_tt(uint32_t rd, uint32_t rn, uint32_t a, uint32_t t) {
   };
 }
 
-thumb_opcode th_udf(uint32_t imm, enforce_encoding encoding) {
+thumb_opcode th_udf(uint32_t imm, thumb_enforce_encoding encoding) {
   const uint32_t imm4 = (imm >> 12) & 0xf;
   const uint32_t imm12 = imm & 0xfff;
 
@@ -2832,7 +2868,7 @@ thumb_opcode th_umlal(uint32_t rdlo, uint32_t rdhi, uint32_t rn, uint32_t rm) {
 }
 
 thumb_opcode th_uxtb(uint32_t rd, uint32_t rm, thumb_shift shift,
-                     enforce_encoding encoding) {
+                     thumb_enforce_encoding encoding) {
 
   const uint32_t rotate = shift.value >> 3;
   if (shift.type != THUMB_SHIFT_NONE && shift.type != THUMB_SHIFT_ROR) {
@@ -2860,7 +2896,7 @@ thumb_opcode th_uxtb(uint32_t rd, uint32_t rm, thumb_shift shift,
 }
 
 thumb_opcode th_uxth(uint32_t rd, uint32_t rm, thumb_shift shift,
-                     enforce_encoding encoding) {
+                     thumb_enforce_encoding encoding) {
 
   const uint32_t rotate = shift.value >> 3;
   if (shift.type != THUMB_SHIFT_NONE && shift.type != THUMB_SHIFT_ROR) {
@@ -2887,7 +2923,7 @@ thumb_opcode th_uxth(uint32_t rd, uint32_t rm, thumb_shift shift,
   };
 }
 
-thumb_opcode th_wfe(enforce_encoding encoding) {
+thumb_opcode th_wfe(thumb_enforce_encoding encoding) {
   if (encoding != ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
         .size = 2,
@@ -2900,7 +2936,7 @@ thumb_opcode th_wfe(enforce_encoding encoding) {
   };
 }
 
-thumb_opcode th_wfi(enforce_encoding encoding) {
+thumb_opcode th_wfi(thumb_enforce_encoding encoding) {
   if (encoding != ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
         .size = 2,
@@ -2913,7 +2949,7 @@ thumb_opcode th_wfi(enforce_encoding encoding) {
   };
 }
 
-thumb_opcode th_yield(enforce_encoding encoding) {
+thumb_opcode th_yield(thumb_enforce_encoding encoding) {
   if (encoding != ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
         .size = 2,

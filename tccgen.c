@@ -180,7 +180,7 @@ static int get_temp_local_var(int size, int align, int *r2);
 static void cast_error(CType *st, CType *dt);
 static void end_switch(void);
 static void do_Static_assert(void);
-
+static void vset_VT_JMP(void);
 /* ------------------------------------------------------------------------- */
 /* Automagical code suppression */
 
@@ -842,13 +842,20 @@ static void vcheck_cmp(void) {
      actually clear it at the gsym() in load()/VT_JMP in the
      generator backends */
 
-  if (vtop->r == VT_CMP && 0 == (nocode_wanted & ~CODE_OFF_BIT))
-    gv(RC_INT);
+  // if (vtop->r == VT_CMP && 0 == (nocode_wanted & ~CODE_OFF_BIT))
+  // gv(RC_INT);
+  if (vtop >= vstack && (0 == (nocode_wanted & ~CODE_OFF_BIT))) {
+    // if (vtop->r == VT_CMP) {
+    // vset_VT_JMP();
+    // }
+    tcc_ir_generate_cmp_jmp_set(tcc_state->ir);
+  }
 }
 
 static void vsetc(CType *type, int r, CValue *vc) {
   if (vtop >= vstack + (VSTACK_SIZE - 1))
     tcc_error("memory full (vstack)");
+
   vcheck_cmp();
   vtop++;
   print_vstack("vsetc");
@@ -977,20 +984,24 @@ ST_FUNC void vset_VT_CMP(int op) {
 
 /* called once before asking generators to load VT_CMP to a register */
 static void vset_VT_JMP(void) {
+  if (vtop->r != VT_CMP)
+    return;
+
   int op = vtop->cmp_op;
 
-  if (vtop->jtrue || vtop->jfalse) {
-    int origt = vtop->type.t;
-    /* we need to jump to 'mov $0,%R' or 'mov $1,%R' */
-    int inv = op & (op < 2); /* small optimization */
-    vseti(VT_JMP + inv, gvtst(inv, 0));
-    vtop->type.t |= origt & (VT_UNSIGNED | VT_DEFSIGN);
-  } else {
-    /* otherwise convert flags (rsp. 0/1) to register */
-    vtop->c.i = op;
-    if (op < 2) /* doesn't seem to happen */
-      vtop->r = VT_CONST;
-  }
+  // if (vtop->jtrue || vtop->jfalse) {
+  int origt = vtop->type.t;
+  /* we need to jump to 'mov $0,%R' or 'mov $1,%R' */
+  int inv = op & (op < 2); /* small optimization */
+  int test = tcc_ir_generate_test(tcc_state->ir, inv, 0);
+  vseti(VT_JMP + inv, test);
+  vtop->type.t |= origt & (VT_UNSIGNED | VT_DEFSIGN);
+  // } else {
+  /* otherwise convert flags (rsp. 0/1) to register */
+  // vtop->c.i = op;
+  // if (op < 2) /* doesn't seem to happen */
+  // vtop->r = VT_CONST;
+  // }
 }
 
 /* Set CPU Flags, doesn't yet jump */
@@ -1006,12 +1017,11 @@ static void gvtst_set(int inv, int t) {
   }
 
   p = inv ? &vtop->jfalse : &vtop->jtrue;
-  // memset(&dest, 0, sizeof(dest));
-  // dest.vr = -1;
-  // dest.c.i = *p;
-  // tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
-  // tcc_ir_backpatch(tcc_state->ir, *p, t);
-  // *p = gjmp_append(*p, t);
+  *p = tcc_ir_gjmp_append(tcc_state->ir, *p, t);
+  // tcc_ir_generate_test(tcc_state->ir, inv, t);
+  // if (vtop->)
+  // *p = tcc_ir_gjmp_append(tcc_state->ir, *p, t);
+  // tcc_ir_generate_cmp_jmp_set(tcc_state->ir);
 }
 
 /* Generate value test
@@ -1842,8 +1852,7 @@ ST_FUNC int gv(int rc) {
         vtop->type.t = original_type;
       } else {
         vreg = tcc_ir_get_vreg_temp(tcc_state->ir);
-        if (vtop->r == VT_CMP)
-          vset_VT_JMP();
+        vset_VT_JMP();
         /* one register type load */
         // load(r, vtop);
         SValue dest;
@@ -3721,6 +3730,7 @@ ST_FUNC void vstore(void) {
       if ((vtop[-1].r & VT_VALMASK) == VT_LOCAL) {
         op = TCCIR_OP_ASSIGN;
       }
+      // tcc_ir_generate_cmp_jmp_set(tcc_state->ir);
       tcc_ir_put(tcc_state->ir, op, vtop, NULL, &vtop[-1]);
     }
     vswap();
@@ -6075,6 +6085,9 @@ tok_next:
           } else {
             num.c.i = nb_args + 1;
             expr_eq();
+            /* Convert VT_CMP/VT_JMP to actual 0/1 value before passing as
+             * parameter */
+            tcc_ir_generate_cmp_jmp_set(tcc_state->ir);
             gfunc_param_typed(s, sa);
             if (nb_args < 4) {
               tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num,
@@ -6399,8 +6412,10 @@ static void expr_landor(int op) {
   int t = 0, cc = 1, f = 0, i = op == TOK_LAND, c;
   for (;;) {
     c = f ? i : condition_3way();
-    if (c < 0)
-      save_regs(1), cc = 0;
+    if (c < 0) {
+      cc = 0;
+    }
+    // save_regs(1), cc = 0;
     else if (c != i)
       nocode_wanted++, f = 1;
     if (tok != op)
@@ -6416,11 +6431,15 @@ static void expr_landor(int op) {
   if (cc || f) {
     vpop();
     vpushi(i ^ f);
-    // gsym(t);
-    tcc_ir_backpatch_to_here(tcc_state->ir, t);
+    if (tcc_state->ir == NULL) {
+      gsym(t);
+    } else {
+      tcc_ir_backpatch_to_here(tcc_state->ir, t);
+    }
     nocode_wanted -= f;
   } else {
     gvtst_set(i, t);
+    // vset_VT_JMP();
   }
 }
 
@@ -6691,6 +6710,7 @@ static void gfunc_return(CType *func_type) {
   } else {
     // function returns scalar value, but how to get it's value from IR?
     // gv(RC_RET(func_type->t));
+    // tcc_ir_generate_cmp_jmp_set(tcc_state->ir);
     tcc_ir_put(tcc_state->ir, TCCIR_OP_RETURNVALUE, vtop, NULL, NULL);
   }
   vtop--; /* NOT vpop() because on x86 it would flush the fp stack */
@@ -7012,9 +7032,8 @@ again:
       next();
       block(0);
       tcc_ir_backpatch_to_here(tcc_state->ir, d);
-      // gsym(d); /* patch else jmp */
     } else {
-      // gsym(a);
+      tcc_ir_backpatch_to_here(tcc_state->ir, a);
     }
     prev_scope_s(&o);
 
