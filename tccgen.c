@@ -6128,7 +6128,6 @@ tok_next:
       if (nb_args > 4) {
         for (int j = 0; j < nb_args - 4; j++) {
           num.c.i = nb_args - j;
-          printf("PASS STACK ARG %d\n", num.c.i);
           tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL);
           vtop--;
         }
@@ -7118,7 +7117,7 @@ again:
       SValue dest;
       memset(&dest, 0, sizeof(SValue));
       dest.vr = -1;
-      dest.c.i = rsym;  /* Chain return jumps: point to previous rsym */
+      dest.c.i = rsym; /* Chain return jumps: point to previous rsym */
       rsym = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
       // rsym = gjmp(rsym);
     }
@@ -8501,6 +8500,9 @@ static void gen_function(Sym *sym) {
   block(0);
   /* Backpatch all return jumps to point to the epilogue (past the end of IR) */
   tcc_ir_backpatch_to_here(ir, rsym);
+
+  /* Dead code elimination - remove unreachable instructions */
+  tcc_ir_dead_code_elimination(ir);
 
   nocode_wanted = 0;
   /* reset local stack */

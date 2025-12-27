@@ -84,6 +84,13 @@ typedef struct ThumbLiteralPoolEntry {
                      */
 } ThumbLiteralPoolEntry;
 
+/* Saved call context for nested function calls */
+typedef struct SavedCallContext {
+  TACQuadruple *arguments;
+  int argument_count;
+  int arguments_capacity;
+} SavedCallContext;
+
 typedef struct ThumbGeneratorState {
   uint8_t generating_function : 1;
   int code_size;
@@ -93,6 +100,14 @@ typedef struct ThumbGeneratorState {
   /* Cache for global symbol base address to avoid redundant loads */
   Sym *cached_global_sym; /* Last loaded global symbol */
   int cached_global_reg;  /* Register holding its base address */
+  /* Function call arguments */
+  TACQuadruple *function_arguments;
+  int function_argument_count;
+  int function_arguments_capacity;
+  /* Stack for nested function calls */
+  SavedCallContext *saved_call_contexts;
+  int nested_call_depth;
+  int saved_call_contexts_capacity;
 } ThumbGeneratorState;
 
 ThumbGeneratorState thumb_gen_state;
@@ -224,32 +239,73 @@ uint32_t caller_saved_registers;
 uint32_t pushed_registers;
 int allocated_stack_size;
 
-TACQuadruple function_arguments[4];
-int function_argument_count = 0;
+static void ensure_function_arguments_capacity(int needed) {
+  if (needed > thumb_gen_state.function_arguments_capacity) {
+    int new_capacity = thumb_gen_state.function_arguments_capacity * 2;
+    if (new_capacity < needed)
+      new_capacity = needed;
+    if (new_capacity < 8)
+      new_capacity = 8;
+    thumb_gen_state.function_arguments =
+        tcc_realloc(thumb_gen_state.function_arguments,
+                    new_capacity * sizeof(TACQuadruple));
+    thumb_gen_state.function_arguments_capacity = new_capacity;
+  }
+}
 
-/* Stack for nested function calls - save outer call's arguments */
-#define MAX_NESTED_CALLS 8
-static TACQuadruple saved_function_arguments[MAX_NESTED_CALLS][4];
-static int saved_function_argument_counts[MAX_NESTED_CALLS];
-static int nested_call_depth = 0;
+static void ensure_saved_contexts_capacity(int needed) {
+  if (needed > thumb_gen_state.saved_call_contexts_capacity) {
+    int new_capacity = thumb_gen_state.saved_call_contexts_capacity * 2;
+    if (new_capacity < needed)
+      new_capacity = needed;
+    if (new_capacity < 4)
+      new_capacity = 4;
+    thumb_gen_state.saved_call_contexts =
+        tcc_realloc(thumb_gen_state.saved_call_contexts,
+                    new_capacity * sizeof(SavedCallContext));
+    /* Initialize new entries */
+    for (int i = thumb_gen_state.saved_call_contexts_capacity; i < new_capacity;
+         i++) {
+      thumb_gen_state.saved_call_contexts[i].arguments = NULL;
+      thumb_gen_state.saved_call_contexts[i].argument_count = 0;
+      thumb_gen_state.saved_call_contexts[i].arguments_capacity = 0;
+    }
+    thumb_gen_state.saved_call_contexts_capacity = new_capacity;
+  }
+}
 
 ST_FUNC void tcc_gen_machine_save_call_context(void) {
-  if (nested_call_depth >= MAX_NESTED_CALLS) {
-    tcc_error("too many nested function calls");
+  ensure_saved_contexts_capacity(thumb_gen_state.nested_call_depth + 1);
+  SavedCallContext *ctx =
+      &thumb_gen_state.saved_call_contexts[thumb_gen_state.nested_call_depth];
+
+  /* Ensure saved context has enough capacity */
+  if (thumb_gen_state.function_argument_count > ctx->arguments_capacity) {
+    int new_cap = thumb_gen_state.function_argument_count;
+    if (new_cap < 8)
+      new_cap = 8;
+    ctx->arguments =
+        tcc_realloc(ctx->arguments, new_cap * sizeof(TACQuadruple));
+    ctx->arguments_capacity = new_cap;
   }
-  memcpy(saved_function_arguments[nested_call_depth], function_arguments,
-         sizeof(function_arguments));
-  saved_function_argument_counts[nested_call_depth] = function_argument_count;
-  nested_call_depth++;
-  function_argument_count = 0;
+
+  memcpy(ctx->arguments, thumb_gen_state.function_arguments,
+         thumb_gen_state.function_argument_count * sizeof(TACQuadruple));
+  ctx->argument_count = thumb_gen_state.function_argument_count;
+  thumb_gen_state.nested_call_depth++;
+  thumb_gen_state.function_argument_count = 0;
 }
 
 ST_FUNC void tcc_gen_machine_restore_call_context(void) {
-  if (nested_call_depth > 0) {
-    nested_call_depth--;
-    memcpy(function_arguments, saved_function_arguments[nested_call_depth],
-           sizeof(function_arguments));
-    function_argument_count = saved_function_argument_counts[nested_call_depth];
+  if (thumb_gen_state.nested_call_depth > 0) {
+    thumb_gen_state.nested_call_depth--;
+    SavedCallContext *ctx =
+        &thumb_gen_state.saved_call_contexts[thumb_gen_state.nested_call_depth];
+
+    ensure_function_arguments_capacity(ctx->argument_count);
+    memcpy(thumb_gen_state.function_arguments, ctx->arguments,
+           ctx->argument_count * sizeof(TACQuadruple));
+    thumb_gen_state.function_argument_count = ctx->argument_count;
   }
 }
 
@@ -539,6 +595,16 @@ static void th_literal_pool_init() {
   thumb_gen_state.code_size = 0;
   thumb_gen_state.cached_global_sym = NULL;
   thumb_gen_state.cached_global_reg = -1;
+
+  /* Initialize function arguments dynamic arrays */
+  thumb_gen_state.function_arguments = NULL;
+  thumb_gen_state.function_argument_count = 0;
+  thumb_gen_state.function_arguments_capacity = 0;
+
+  /* Initialize saved call contexts for nested calls */
+  thumb_gen_state.saved_call_contexts = NULL;
+  thumb_gen_state.nested_call_depth = 0;
+  thumb_gen_state.saved_call_contexts_capacity = 0;
 }
 
 ST_FUNC void arm_init(struct TCCState *s) {
@@ -2563,15 +2629,24 @@ ST_FUNC void tcc_gen_machine_return_value_op(TACQuadruple *q) {
     return;
   }
 
-  if (q->src1.pr0 == R0)
+  /* If we have a valid physical register, use it */
+  if (q->src1.pr0 >= 0 && q->src1.pr0 < 16) {
+    /* If VT_LVAL is set and the register contains an address (not the value),
+     * we need to dereference it */
+    if ((q->src1.r & VT_LVAL) && (q->src1.r & VT_VALMASK) != VT_LOCAL) {
+      load(R0, &q->src1);
+      return;
+    }
+    /* Otherwise just move the register value to R0 */
+    if (q->src1.pr0 != R0) {
+      ot_check(th_mov_reg(R0, q->src1.pr0, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                          THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
+    }
     return;
+  }
 
-  if (q->src1.pr0 >= 0) {
-    ot_check(th_mov_reg(R0, q->src1.pr0, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                        THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
-  } // else {
-    //  load(R0, &q->src1);
-  //}
+  /* Fallback: use load for anything else (spilled values, etc.) */
+  load(R0, &q->src1);
 }
 
 void tcc_gen_machine_load_op(TACQuadruple *op) {
@@ -2594,7 +2669,7 @@ ST_FUNC void tcc_gen_machine_store_op(TACQuadruple *op) {
 
 ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers,
                                     int stack_size) {
-  memset(function_arguments, 0, sizeof(function_arguments));
+  thumb_gen_state.function_argument_count = 0;
   uint16_t registers_to_push = 0;
   int registers_count = 0;
 
@@ -2741,14 +2816,14 @@ ST_FUNC void tcc_gen_machine_func_param_op(TACQuadruple *q, int param_num) {
   /* Detect nested function call: if we see PARAM1 while we already have
    * arguments collected, we're starting a new inner call.
    * Save the outer call's context. */
-  if (param_num == 1 && function_argument_count > 0) {
+  if (param_num == 1 && thumb_gen_state.function_argument_count > 0) {
     tcc_gen_machine_save_call_context();
   }
-  // cache argument for register passing
-  if (function_argument_count < 4) {
-    function_arguments[function_argument_count++] = *q;
-    return;
-  }
+  /* Cache argument - first 4 go in registers, rest go on stack */
+  ensure_function_arguments_capacity(thumb_gen_state.function_argument_count +
+                                     1);
+  thumb_gen_state
+      .function_arguments[thumb_gen_state.function_argument_count++] = *q;
 }
 
 static void gcall_or_jump(int is_jmp, SValue *dest) {
@@ -2777,31 +2852,62 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result) {
   int registers_to_push = 0;
   int registers_count = 0;
 
+  /* Calculate stack space needed for arguments beyond R0-R3 */
+  int stack_args = thumb_gen_state.function_argument_count > 4
+                       ? thumb_gen_state.function_argument_count - 4
+                       : 0;
+  int stack_size = stack_args * 4;
+  /* Align stack to 8 bytes as required by AAPCS */
+  int aligned_stack_size = (stack_size + 7) & ~7;
+
+  /* Reserve stack space for arguments if needed */
+  if (aligned_stack_size > 0) {
+    ot_check(th_sub_sp_imm(R_SP, aligned_stack_size,
+                           FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                           ENFORCE_ENCODING_NONE));
+  }
+
+  /* Push stack arguments (args 5+) - they go at increasing offsets from SP
+   * based on their parameter number, not their position in the array */
+  for (int i = 4; i < thumb_gen_state.function_argument_count; i++) {
+    TACQuadruple *arg = &thumb_gen_state.function_arguments[i];
+    /* param_num is 1-based (PARAM1=1, PARAM2=2, etc.)
+     * Stack args start at PARAM5, so offset = (param_num - 5) * 4 */
+    int param_num = arg->src2.c.i;
+    int offset = (param_num - 5) * 4;
+    /* Load argument value into R12 (scratch register) */
+    load(R12, &arg->src1);
+    /* Store to stack at [SP + offset] with puw=6 (positive offset, writeback)
+     */
+    ot_check(th_str_imm(R12, R_SP, offset, 6, ENFORCE_ENCODING_NONE));
+  }
+
   /* Load arguments in reverse order to avoid clobbering registers
      that will be used for later (lower-numbered) arguments.
      E.g., loading arg1 to R1 might use R0 as scratch, so load R1 first. */
-  for (int i = function_argument_count - 1; i >= 0; --i) {
-    TACQuadruple *q = &function_arguments[i];
-    if (i < 4) {
-      if (q->src1.pr0 != -1) {
-        const int val_loc = q->src1.r & VT_VALMASK;
-        if (val_loc != VT_CONST && val_loc != VT_LVAL && val_loc != VT_LOCAL) {
-          if (q->src1.r & VT_LVAL) {
-            load(R0 + i, &q->src1);
-            continue;
-          }
+  for (int i = (thumb_gen_state.function_argument_count > 4
+                    ? 3
+                    : thumb_gen_state.function_argument_count - 1);
+       i >= 0; --i) {
+    TACQuadruple *arg = &thumb_gen_state.function_arguments[i];
+    if (arg->src1.pr0 != -1) {
+      const int val_loc = arg->src1.r & VT_VALMASK;
+      if (val_loc != VT_CONST && val_loc != VT_LVAL && val_loc != VT_LOCAL) {
+        if (arg->src1.r & VT_LVAL) {
+          load(R0 + i, &arg->src1);
+          continue;
         }
-        if (q->src1.pr0 != R0 + i) {
-          ot_check(
-              th_mov_reg(R0 + i, q->src1.pr0, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                         THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
-        }
-      } else {
-        load(R0 + i, &q->src1);
       }
+      if (arg->src1.pr0 != R0 + i) {
+        ot_check(th_mov_reg(R0 + i, arg->src1.pr0,
+                            FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                            ENFORCE_ENCODING_NONE, false));
+      }
+    } else {
+      load(R0 + i, &arg->src1);
     }
   }
-  function_argument_count = 0;
+  thumb_gen_state.function_argument_count = 0;
   if (tcc_state->text_and_data_separation && q->src1.type.t & VT_EXTERN) {
     // PIC handling
     registers_to_push |= (1 << R9);
@@ -2816,6 +2922,14 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result) {
   gcall_or_jump(0, &q->src1);
   if (registers_count > 0)
     ot_check(th_pop(registers_to_push));
+
+  /* Clean up stack space used for arguments */
+  if (aligned_stack_size > 0) {
+    ot_check(th_add_sp_imm(R_SP, aligned_stack_size,
+                           FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                           ENFORCE_ENCODING_NONE));
+  }
+
   /* Invalidate global symbol cache - LR was clobbered by call */
   thumb_gen_state.cached_global_sym = NULL;
   thumb_gen_state.cached_global_reg = -1;

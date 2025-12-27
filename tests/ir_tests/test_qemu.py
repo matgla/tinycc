@@ -30,7 +30,12 @@ TEST_FILES = [
     ("../tests2/13_integer_literals.c", 0),
     ("../tests2/14_if.c", 0),
     ("../tests2/15_recursion.c", 0),
-
+    ("../tests2/16_nesting.c", 0),
+    ("../tests2/17_enum.c", 0),
+    ("../tests2/18_include.c", 0),
+    ("../tests2/19_pointer_arithmetic.c", 0),
+    ("../tests2/20_pointer_comparison.c", 0),
+    ("../tests2/21_char_array.c", 0),
 ]
 
 def load_expect_file(test_name):

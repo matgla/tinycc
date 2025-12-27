@@ -156,6 +156,7 @@ void tcc_ir_backpatch_to_here(TCCIRState *ir, int t);
 void tcc_ir_backpatch_first(TCCIRState *ir, int t, int target_address);
 int tcc_ir_gjmp_append(TCCIRState *ir, int n, int t);
 int tcc_ir_generate_test(TCCIRState *ir, int inv, int t);
+int tcc_ir_dead_code_elimination(TCCIRState *ir);
 void tcc_ir_print_vreg(int vreg);
 void tcc_ir_generate_cmp_jmp_set(TCCIRState *ir);
 void tcc_ir_start_basic_block(TCCIRState *ir);

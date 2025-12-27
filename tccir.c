@@ -930,6 +930,115 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv) {
   }
 }
 
+/* Dead Code Elimination pass
+ * Removes unreachable instructions by following control flow from entry.
+ * Returns 1 if any instructions were eliminated, 0 otherwise.
+ */
+int tcc_ir_dead_code_elimination(TCCIRState *ir) {
+  int n = ir->next_instruction_index;
+  if (n == 0)
+    return 0;
+
+  /* Allocate reachability bitmap and old->new index mapping */
+  uint8_t *reachable = tcc_mallocz((n + 7) / 8);
+  int *new_index = tcc_malloc(sizeof(int) * n);
+
+  /* Mark reachable instructions using a worklist algorithm */
+  int *worklist = tcc_malloc(sizeof(int) * n);
+  int worklist_head = 0, worklist_tail = 0;
+
+#define MARK_REACHABLE(idx)                                                    \
+  do {                                                                         \
+    if ((idx) >= 0 && (idx) < n &&                                             \
+        !(reachable[(idx) / 8] & (1 << ((idx) % 8)))) {                        \
+      reachable[(idx) / 8] |= (1 << ((idx) % 8));                              \
+      worklist[worklist_tail++] = (idx);                                       \
+    }                                                                          \
+  } while (0)
+
+  /* Start from instruction 0 */
+  MARK_REACHABLE(0);
+
+  while (worklist_head < worklist_tail) {
+    int i = worklist[worklist_head++];
+    TACQuadruple *q = &ir->instructions[i];
+
+    switch (q->op) {
+    case TCCIR_OP_JUMP:
+      /* Unconditional jump - only the target is reachable */
+      MARK_REACHABLE(q->dest.c.i);
+      break;
+    case TCCIR_OP_JUMPIF:
+      /* Conditional jump - both target and fall-through are reachable */
+      MARK_REACHABLE(q->dest.c.i);
+      MARK_REACHABLE(i + 1);
+      break;
+    case TCCIR_OP_RETURNVALUE:
+    case TCCIR_OP_RETURNVOID:
+      /* Return - no successor (epilogue is implicit) */
+      break;
+    default:
+      /* All other instructions fall through to the next */
+      MARK_REACHABLE(i + 1);
+      break;
+    }
+  }
+
+#undef MARK_REACHABLE
+
+  /* Count reachable instructions and build index mapping */
+  int new_count = 0;
+  for (int i = 0; i < n; i++) {
+    if (reachable[i / 8] & (1 << (i % 8))) {
+      new_index[i] = new_count++;
+    } else {
+      new_index[i] = -1; /* Dead instruction */
+    }
+  }
+
+  /* If nothing was eliminated, clean up and return */
+  if (new_count == n) {
+    tcc_free(reachable);
+    tcc_free(new_index);
+    tcc_free(worklist);
+    return 0;
+  }
+
+  /* Compact instructions and update jump targets */
+  int write_pos = 0;
+  for (int i = 0; i < n; i++) {
+    if (new_index[i] >= 0) {
+      TACQuadruple *q = &ir->instructions[i];
+
+      /* Update jump targets */
+      if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF) {
+        int old_target = q->dest.c.i;
+        if (old_target < n) {
+          q->dest.c.i = new_index[old_target];
+        } else {
+          /* Target is past the end (epilogue) - adjust for removed instructions
+           */
+          q->dest.c.i = new_count;
+        }
+      }
+
+      /* Move instruction to new position if needed */
+      if (write_pos != i) {
+        ir->instructions[write_pos] = *q;
+      }
+      write_pos++;
+    }
+  }
+
+  ir->next_instruction_index = new_count;
+
+  tcc_free(reachable);
+  tcc_free(new_index);
+  tcc_free(worklist);
+
+  return 1;
+}
+
 static void tcc_ir_backpatch_jumps(TCCIRState *ir,
                                    uint32_t *ir_to_code_mapping) {
   TACQuadruple *q;
@@ -949,6 +1058,11 @@ void tcc_ir_generate_code(TCCIRState *ir) {
   // +1 to include epilogue when needed
   uint32_t *ir_to_code_mapping =
       tcc_mallocz(sizeof(uint32_t) * (ir->next_instruction_index + 1));
+
+  /* Track addresses of return jumps for later backpatching to epilogue */
+  int *return_jump_addrs = tcc_malloc(sizeof(int) * ir->next_instruction_index);
+  int num_return_jumps = 0;
+
   // generate prolog
   int stack_size = (-loc + 7) & ~7; // align to 8 bytes
   tcc_gen_machine_prolog(ir->leaffunc, ir->ls.dirty_registers, stack_size);
@@ -1032,6 +1146,14 @@ void tcc_ir_generate_code(TCCIRState *ir) {
       break;
     case TCCIR_OP_RETURNVALUE:
       tcc_gen_machine_return_value_op(q);
+      /* Emit jump to epilogue (will be backpatched later) */
+      return_jump_addrs[num_return_jumps++] = ind;
+      tcc_gen_machine_jump_op(q); /* Emits a placeholder jump */
+      break;
+    case TCCIR_OP_RETURNVOID:
+      /* Emit jump to epilogue (will be backpatched later) */
+      return_jump_addrs[num_return_jumps++] = ind;
+      tcc_gen_machine_jump_op(q); /* Emits a placeholder jump */
       break;
     case TCCIR_OP_ASSIGN:
       tcc_gen_machine_assign_op(q);
@@ -1079,6 +1201,7 @@ void tcc_ir_generate_code(TCCIRState *ir) {
       printf("Unsupported operation in tcc_generate_code: %s\n",
              tcc_ir_get_op_name(q->op));
       tcc_free(ir_to_code_mapping);
+      tcc_free(return_jump_addrs);
       exit(1);
     }
     };
@@ -1088,7 +1211,14 @@ void tcc_ir_generate_code(TCCIRState *ir) {
   tcc_gen_machine_epilog(ir->leaffunc);
   tcc_ir_backpatch_jumps(ir, ir_to_code_mapping);
 
+  /* Backpatch return jumps to point to epilogue */
+  int epilogue_addr = ir_to_code_mapping[ir->next_instruction_index];
+  for (int i = 0; i < num_return_jumps; i++) {
+    tcc_gen_machine_backpatch_jump(return_jump_addrs[i], epilogue_addr);
+  }
+
   tcc_free(ir_to_code_mapping);
+  tcc_free(return_jump_addrs);
 }
 
 void tcc_ir_print_vreg(int vreg) {
