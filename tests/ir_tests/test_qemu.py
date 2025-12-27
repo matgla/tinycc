@@ -26,6 +26,10 @@ TEST_FILES = [
     ("../tests2/09_do_while.c", 0),
     ("../tests2/10_pointer.c", 0),
     ("../tests2/11_precedence.c", 0),
+    ("../tests2/12_hashdefine.c", 0),
+    ("../tests2/13_integer_literals.c", 0),
+    ("../tests2/14_if.c", 0),
+    ("../tests2/15_recursion.c", 0),
 
 ]
 

@@ -7114,8 +7114,14 @@ again:
       gfunc_return(&func_vt);
     skip(';');
     /* jump unless last stmt in top-level block */
-    if (tok != '}' || local_scope != 1)
-      rsym = gjmp(rsym);
+    if (tok != '}' || local_scope != 1) {
+      SValue dest;
+      memset(&dest, 0, sizeof(SValue));
+      dest.vr = -1;
+      dest.c.i = rsym;  /* Chain return jumps: point to previous rsym */
+      rsym = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
+      // rsym = gjmp(rsym);
+    }
     if (debug_modes)
       tcc_tcov_block_end(tcc_state, -1);
     CODE_OFF();
@@ -8493,7 +8499,8 @@ static void gen_function(Sym *sym) {
   rsym = 0;
   func_vla_arg(sym);
   block(0);
-  gsym(rsym);
+  /* Backpatch all return jumps to point to the epilogue (past the end of IR) */
+  tcc_ir_backpatch_to_here(ir, rsym);
 
   nocode_wanted = 0;
   /* reset local stack */

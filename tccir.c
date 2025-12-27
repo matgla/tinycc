@@ -1289,42 +1289,42 @@ void tcc_print_quadruple(TACQuadruple *q, int pc) {
     printf("\"");
   }
 
-  // else if (op == IR_OP_SETIF) {
-  //   printf("1 if \"");
-  //   switch (quad->src1.c.i) {
-  //   case TOK_EQ:
-  //     printf("==");
-  //     break;
-  //   case TOK_NE:
-  //     printf("!=");
-  //     break;
-  //   case TOK_LT:
-  //     printf("<S");
-  //     break;
-  //   case TOK_GT:
-  //     printf(">S");
-  //     break;
-  //   case TOK_LE:
-  //     printf("<=S");
-  //     break;
-  //   case TOK_GE:
-  //     printf(">=S");
-  //     break;
-  //   case TOK_ULT:
-  //     printf("<U");
-  //     break;
-  //   case TOK_UGT:
-  //     printf(">U");
-  //     break;
-  //   case TOK_ULE:
-  //     printf("<=U");
-  //     break;
-  //   case TOK_UGE:
-  //     printf(">=U");
-  //     break;
-  //   }
-  //   printf("\"");
-  // } // else if (op == TCCIR_OP_) {
+  else if (op == TCCIR_OP_SETIF) {
+    printf("1 if \"");
+    switch (q->src1.c.i) {
+    case TOK_EQ:
+      printf("==");
+      break;
+    case TOK_NE:
+      printf("!=");
+      break;
+    case TOK_LT:
+      printf("<S");
+      break;
+    case TOK_GT:
+      printf(">S");
+      break;
+    case TOK_LE:
+      printf("<=S");
+      break;
+    case TOK_GE:
+      printf(">=S");
+      break;
+    case TOK_ULT:
+      printf("<U");
+      break;
+    case TOK_UGT:
+      printf(">U");
+      break;
+    case TOK_ULE:
+      printf("<=U");
+      break;
+    case TOK_UGE:
+      printf(">=U");
+      break;
+    }
+    printf("\"");
+  } // else if (op == TCCIR_OP_) {
   // printf("if \"");
   // switch (quad->src1.c.i) {
   // case TOK_EQ:
