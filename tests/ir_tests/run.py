@@ -9,12 +9,17 @@ args.add_argument("--file", "-f", type=str, help="Path to the firmware file.")
 args.add_argument("--compile", "-c", type=str, help="Compile the test file before running.")
 args.add_argument("--machine", "-m", default="mps2-an505", type=str, help="QEMU machine type.")
 args.add_argument("--gdb", action="store_true", help="Enable GDB debugging.")
+args.add_argument("--gcc", "-g", type=str, help="Path to the GCC compiler to use.")
 args, _ = args.parse_known_args()
 
 def main():
     file = None
     if args.compile:
-        file, _ = compile_testcase(Path(args.compile).resolve(), args.machine)
+        if args.gcc:
+            print(f"Using custom compiler: {args.gcc}")
+            file, _ = compile_testcase(Path(args.compile).resolve(), args.machine, compiler=args.gcc)
+        else:
+            file, _ = compile_testcase(Path(args.compile).resolve(), args.machine, )
     if file is None:
         file = args.file
     print(f"Running QEMU with file: {file}")

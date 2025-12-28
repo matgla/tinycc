@@ -88,6 +88,7 @@ static const char help[] =
 #if defined(TCC_TARGET_ARM) || defined(TCC_TARGET_ARM_THUMB)
     "ARM. options:\n"
     "  -mfloat-abi                       specify ABI for floating point unit\n"
+    "  -mfpu=type                        specify FPU type for ARM hard float\n"
     "  -mno-pic-data-is-text-relative    separate .text and .data with base "
     "register addressing instead of PC-relative\n"
 #endif

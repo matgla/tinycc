@@ -715,6 +715,7 @@ LIBTCCAPI TCCState *tcc_new(void) {
   s->pic = 0;
 #if defined(TCC_TARGET_ARM) || defined(TCC_TARGET_ARM_THUMB)
   s->float_abi = ARM_FLOAT_ABI;
+  s->fpu_type = ARM_FPU_AUTO; /* default to auto-detect */
 #if defined(TCC_TARGET_YASOS)
   printf("Yasos ABI\n");
   s->text_and_data_separation = 1;
@@ -1178,6 +1179,10 @@ static int tcc_set_linker(TCCState *s, const char *option) {
       copy_linker_arg(&s->rpath, p, ':');
     } else if (link_option(option, "enable-new-dtags", &p)) {
       s->enable_new_dtags = 1;
+    } else if (link_option(option, "gc-sections", &p)) {
+      s->gc_sections = 1;
+    } else if (link_option(option, "no-gc-sections", &p)) {
+      s->gc_sections = 0;
     } else if (link_option(option, "section-alignment=", &p)) {
       s->section_align = strtoul(p, &end, 16);
     } else if (link_option(option, "soname=", &p)) {
@@ -1242,6 +1247,7 @@ enum {
   TCC_OPTION_W,
   TCC_OPTION_O,
   TCC_OPTION_mfloat_abi,
+  TCC_OPTION_mfpu,
   TCC_OPTION_m,
   TCC_OPTION_f,
   TCC_OPTION_isystem,
@@ -1316,7 +1322,11 @@ static const TCCOption tcc_options[] = {
     {"fpie", TCC_OPTION_fpie, 0},
     {"fpic", TCC_OPTION_fpic, 0},
 #if defined(TCC_TARGET_ARM) || defined(TCC_TARGET_ARM_THUMB)
+    {"mfloat-abi=", TCC_OPTION_mfloat_abi,
+     TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP},
     {"mfloat-abi", TCC_OPTION_mfloat_abi, TCC_OPTION_HAS_ARG},
+    {"mfpu=", TCC_OPTION_mfpu, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP},
+    {"mfpu", TCC_OPTION_mfpu, TCC_OPTION_HAS_ARG},
     {"mpic-data-is-text-relative", TCC_OPTION_mpic_data_is_text_relative, 0},
 #endif
     {"m", TCC_OPTION_m, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP},
@@ -1379,6 +1389,8 @@ static const FlagDef options_f[] = {
     {offsetof(TCCState, reverse_funcargs), 0, "reverse-funcargs"},
     {offsetof(TCCState, gnu89_inline), 0, "gnu89-inline"},
     {offsetof(TCCState, unwind_tables), 0, "asynchronous-unwind-tables"},
+    {offsetof(TCCState, function_sections), 0, "function-sections"},
+    {offsetof(TCCState, data_sections), 0, "data-sections"},
     {0, 0, NULL}};
 
 static const FlagDef options_m[] = {
@@ -1666,13 +1678,42 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv,
       break;
 #if defined(TCC_TARGET_ARM) || defined(TCC_TARGET_ARM_THUMB)
     case TCC_OPTION_mfloat_abi:
-      /* tcc doesn't support soft float yet */
-      if (!strcmp(optarg, "softfp")) {
+      if (!strcmp(optarg, "soft")) {
+        s->float_abi = ARM_SOFT_FLOAT;
+      } else if (!strcmp(optarg, "softfp")) {
         s->float_abi = ARM_SOFTFP_FLOAT;
       } else if (!strcmp(optarg, "hard"))
         s->float_abi = ARM_HARD_FLOAT;
       else
         return tcc_error_noabort("unsupported float abi '%s'", optarg);
+      break;
+    case TCC_OPTION_mfpu:
+      if (!strcmp(optarg, "vfp") || !strcmp(optarg, "vfpv2")) {
+        s->fpu_type = ARM_FPU_VFP;
+      } else if (!strcmp(optarg, "vfpv3") || !strcmp(optarg, "vfpv3-d16")) {
+        s->fpu_type = ARM_FPU_VFPV3;
+      } else if (!strcmp(optarg, "vfpv4") || !strcmp(optarg, "vfpv4-d16")) {
+        s->fpu_type = ARM_FPU_VFPV4;
+      } else if (!strcmp(optarg, "fpv4-sp-d16")) {
+        s->fpu_type = ARM_FPU_FPV4_SP_D16;
+      } else if (!strcmp(optarg, "fpv5-sp-d16")) {
+        s->fpu_type = ARM_FPU_FPV5_SP_D16;
+      } else if (!strcmp(optarg, "fpv5-d16")) {
+        s->fpu_type = ARM_FPU_FPV5_D16;
+      } else if (!strcmp(optarg, "neon") || !strcmp(optarg, "neon-vfpv3")) {
+        s->fpu_type = ARM_FPU_NEON;
+      } else if (!strcmp(optarg, "neon-vfpv4")) {
+        s->fpu_type = ARM_FPU_NEON_VFPV4;
+      } else if (!strcmp(optarg, "neon-fp-armv8") ||
+                 !strcmp(optarg, "crypto-neon-fp-armv8")) {
+        s->fpu_type = ARM_FPU_NEON_FP_ARMV8;
+      } else if (!strcmp(optarg, "auto")) {
+        s->fpu_type = ARM_FPU_AUTO;
+      } else if (!strcmp(optarg, "none")) {
+        s->fpu_type = ARM_FPU_NONE;
+      } else {
+        return tcc_error_noabort("unsupported FPU type '%s'", optarg);
+      }
       break;
     case TCC_OPTION_mpic_data_is_text_relative:
       printf("Setting text and data separation to: 1\n");

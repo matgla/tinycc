@@ -687,8 +687,28 @@ ST_FUNC Sym *sym_push(int v, CType *type, int r, int c) {
     if (r & VT_PARAM) {
       vreg = tcc_ir_get_vreg_param(tcc_state->ir);
       tcc_ir_assign_physical_register(tcc_state->ir, vreg, c, -1, -1);
+      /* Mark float/double parameters */
+      if (is_float(type->t)) {
+        int is_double = (type->t & VT_BTYPE) == VT_DOUBLE ||
+                        (type->t & VT_BTYPE) == VT_LDOUBLE;
+        tcc_ir_set_float_type(tcc_state->ir, vreg, 1, is_double);
+      }
+      /* Mark long long parameters */
+      if ((type->t & VT_BTYPE) == VT_LLONG) {
+        tcc_ir_set_llong_type(tcc_state->ir, vreg);
+      }
     } else {
       vreg = tcc_ir_get_vreg_var(tcc_state->ir);
+      /* Mark float/double variables */
+      if (is_float(type->t)) {
+        int is_double = (type->t & VT_BTYPE) == VT_DOUBLE ||
+                        (type->t & VT_BTYPE) == VT_LDOUBLE;
+        tcc_ir_set_float_type(tcc_state->ir, vreg, 1, is_double);
+      }
+      /* Mark long long variables */
+      if ((type->t & VT_BTYPE) == VT_LLONG) {
+        tcc_ir_set_llong_type(tcc_state->ir, vreg);
+      }
     }
   }
   // r &= ~VT_PARAM;
@@ -1852,6 +1872,14 @@ ST_FUNC int gv(int rc) {
         vtop->type.t = original_type;
       } else {
         vreg = tcc_ir_get_vreg_temp(tcc_state->ir);
+        /* Mark temp vreg with correct type for register allocation */
+        if (is_float(vtop->type.t)) {
+          int is_double = (vtop->type.t & VT_BTYPE) == VT_DOUBLE ||
+                          (vtop->type.t & VT_BTYPE) == VT_LDOUBLE;
+          tcc_ir_set_float_type(tcc_state->ir, vreg, 1, is_double);
+        } else if ((vtop->type.t & VT_BTYPE) == VT_LLONG) {
+          tcc_ir_set_llong_type(tcc_state->ir, vreg);
+        }
         vset_VT_JMP();
         /* one register type load */
         // load(r, vtop);
@@ -3265,17 +3293,47 @@ again:
 
     if (sf || df) {
       if (sf && df) {
-        /* convert from fp to fp */
-        gen_cvt_ftof(dbt);
+        /* convert from fp to fp - emit IR operation */
+        SValue dest;
+        int dst_is_double = (dbt == VT_DOUBLE || dbt == VT_LDOUBLE);
+        dest.type.t = dbt;
+        dest.type.ref = NULL;
+        dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+        dest.r = 0;
+        dest.c.i = 0;
+        /* Mark the temp vreg as float/double for register allocation */
+        tcc_ir_set_float_type(tcc_state->ir, dest.vr, 1, dst_is_double);
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_CVT_FTOF, vtop, NULL, &dest);
+        vtop->vr = dest.vr;
+        vtop->r = 0;
       } else if (df) {
-        /* convert int to fp */
-        gen_cvt_itof1(dbt);
+        /* convert int to fp - emit IR operation */
+        SValue dest;
+        int dst_is_double = (dbt == VT_DOUBLE || dbt == VT_LDOUBLE);
+        dest.type.t = dbt;
+        dest.type.ref = NULL;
+        dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+        /* Mark the temp vreg as float/double for register allocation */
+        tcc_ir_set_float_type(tcc_state->ir, dest.vr, 1, dst_is_double);
+        dest.r = 0;
+        dest.c.i = 0;
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_CVT_ITOF, vtop, NULL, &dest);
+        vtop->vr = dest.vr;
+        vtop->r = 0;
       } else {
-        /* convert fp to int */
+        /* convert fp to int - emit IR operation */
+        SValue dest;
         sbt = dbt;
         if (dbt_bt != VT_LLONG && dbt_bt != VT_INT)
           sbt = VT_INT;
-        gen_cvt_ftoi1(sbt);
+        dest.type.t = sbt;
+        dest.type.ref = NULL;
+        dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+        dest.r = 0;
+        dest.c.i = 0;
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_CVT_FTOI, vtop, NULL, &dest);
+        vtop->vr = dest.vr;
+        vtop->r = 0;
         goto again; /* may need char/short cast */
       }
       goto done;
@@ -8512,7 +8570,8 @@ static void gen_function(Sym *sym) {
   tcc_ir_show(ir);
 #endif
   tcc_ir_liveness_analysis(ir);
-  tcc_ls_allocate_registers(&ir->ls, ir->parameters_count);
+  /* TODO: track float_parameters_count separately for hard float ABI */
+  tcc_ls_allocate_registers(&ir->ls, ir->parameters_count, 0);
   tcc_ir_patch_live_intervals_registers(ir);
   tcc_ir_register_allocation_params(ir);
   tcc_ir_generate_code(ir);
@@ -8567,7 +8626,16 @@ static void gen_inline_functions(TCCState *s) {
         tccpp_putfile(fn->filename);
         begin_macro(fn->func_str, 1);
         next();
-        cur_text_section = text_section;
+        if (s->function_sections) {
+          /* -ffunction-sections: create .text.funcname section */
+          char sec_name[256];
+          const char *func_name = get_tok_str(sym->v, NULL);
+          snprintf(sec_name, sizeof(sec_name), ".text.%s", func_name);
+          cur_text_section =
+              new_section(s, sec_name, SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR);
+        } else {
+          cur_text_section = text_section;
+        }
         gen_function(sym);
         end_macro();
 
@@ -8766,9 +8834,18 @@ static int decl(int l) {
         } else {
           /* compute text section */
           cur_text_section = ad.section;
-          if (!cur_text_section)
-            cur_text_section = text_section;
-          else if (cur_text_section->sh_num > bss_section->sh_num)
+          if (!cur_text_section) {
+            if (tcc_state->function_sections) {
+              /* -ffunction-sections: create .text.funcname section */
+              char sec_name[256];
+              const char *func_name = get_tok_str(v, NULL);
+              snprintf(sec_name, sizeof(sec_name), ".text.%s", func_name);
+              cur_text_section = new_section(tcc_state, sec_name, SHT_PROGBITS,
+                                             SHF_ALLOC | SHF_EXECINSTR);
+            } else {
+              cur_text_section = text_section;
+            }
+          } else if (cur_text_section->sh_num > bss_section->sh_num)
             cur_text_section->sh_flags = text_section->sh_flags;
           gen_function(sym);
         }

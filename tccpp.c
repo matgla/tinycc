@@ -3586,9 +3586,36 @@ static void tcc_predefs(TCCState *s1, CString *cs, int is_asm) {
   putdefs(cs, target_machine_defs);
   putdefs(cs, target_os_defs);
 
-#ifdef TCC_TARGET_ARM
+#if defined(TCC_TARGET_ARM) || defined(TCC_TARGET_ARM_THUMB)
   if (s1->float_abi == ARM_HARD_FLOAT)
     putdef(cs, "__ARM_PCS_VFP");
+  /* Define __ARM_FP based on FPU type for library compatibility */
+  if (s1->float_abi != ARM_SOFT_FLOAT && s1->fpu_type != ARM_FPU_NONE) {
+    int arm_fp = 0;
+    switch (s1->fpu_type) {
+    case ARM_FPU_FPV4_SP_D16:
+    case ARM_FPU_FPV5_SP_D16:
+      arm_fp = 0x04; /* Single precision only */
+      break;
+    case ARM_FPU_VFP:
+    case ARM_FPU_VFPV3:
+    case ARM_FPU_VFPV4:
+    case ARM_FPU_FPV5_D16:
+    case ARM_FPU_NEON:
+    case ARM_FPU_NEON_VFPV4:
+    case ARM_FPU_NEON_FP_ARMV8:
+    case ARM_FPU_AUTO:
+    default:
+      arm_fp = 0x0C; /* Single + Double precision */
+      break;
+    case ARM_FPU_NONE:
+      arm_fp = 0;
+      break;
+    }
+    if (arm_fp)
+      cstr_printf(cs, "#define __ARM_FP %d\n", arm_fp);
+    putdef(cs, "__VFP_FP__");
+  }
 #endif
   if (is_asm)
     putdef(cs, "__ASSEMBLER__");

@@ -4,7 +4,7 @@ TARGET=arm-none-eabi
 
 mkdir newlib_build
 cd newlib_build
-export CFLAGS_FOR_TARGET='-g -Os -ffunction-sections -fdata-sections -mcpu=cortex-m33'
+export CFLAGS_FOR_TARGET='-g -Os -mfloat-abi=hard -mfpu=fpv5-sp-d16 -ffunction-sections -fdata-sections -mcpu=cortex-m33'
 ../libs/newlib/configure \
     --target=$TARGET \
     --prefix=$PWD/newlib_install \
@@ -18,8 +18,11 @@ export CFLAGS_FOR_TARGET='-g -Os -ffunction-sections -fdata-sections -mcpu=corte
     --disable-newlib-unbuf-stream-opt \
     --enable-lite-exit \
     --enable-newlib-global-atexit \
-    --enable-newlib-nano-formatted-io \
+    --disable-newlib-nano-formatted-io \
     --disable-multilib \
-    --disable-nls
+    --disable-nls \
+    --enable-newlib-io-long-long \
+    --enable-newlib-io-long-double \
+    --enable-newlib-io-float \
 
-# make -j8
+make -j8

@@ -1120,6 +1120,10 @@ thumb_opcode th_ldr_reg(uint32_t rt, uint32_t rn, uint32_t rm,
     };
   }
 #endif
+  fprintf(
+      stderr,
+      "DEBUG th_ldr_reg: returning invalid - rt=%d rn=%d rm=%d shift.type=%d\n",
+      rt, rn, rm, shift.type);
   return (thumb_opcode){
       .size = 0,
       .opcode = 0,
@@ -1542,8 +1546,8 @@ thumb_opcode th_lsl_imm(uint32_t rd, uint32_t rn, uint32_t imm,
   return th_mov_reg(rd, rn, flags, shift, encoding, false);
 }
 
-thumb_opcode th_lsr_reg(uint16_t rd, uint16_t rn, uint16_t rm,
-                        thumb_flags_behaviour flags,
+thumb_opcode th_lsr_reg(uint32_t rd, uint32_t rn, uint32_t rm,
+                        thumb_flags_behaviour flags, thumb_shift shift,
                         thumb_enforce_encoding encoding) {
   if (rd == rn && rm < 8 && rn < 8 && encoding != ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
@@ -1567,7 +1571,7 @@ thumb_opcode th_lsr_reg(uint16_t rd, uint16_t rn, uint16_t rm,
   };
 }
 
-thumb_opcode th_lsr_imm(uint16_t rd, uint16_t rm, uint32_t imm,
+thumb_opcode th_lsr_imm(uint32_t rd, uint32_t rm, uint32_t imm,
                         thumb_flags_behaviour flags,
                         thumb_enforce_encoding encoding) {
   if (rm < 8 && rd < 8 && encoding != ENFORCE_ENCODING_32BIT) {
@@ -1587,8 +1591,8 @@ thumb_opcode th_lsr_imm(uint16_t rd, uint16_t rm, uint32_t imm,
   };
 }
 
-thumb_opcode th_asr_reg(uint16_t rd, uint16_t rn, uint16_t rm,
-                        thumb_flags_behaviour flags,
+thumb_opcode th_asr_reg(uint32_t rd, uint32_t rn, uint32_t rm,
+                        thumb_flags_behaviour flags, thumb_shift shift,
                         thumb_enforce_encoding encoding) {
   if (rd == rn && rm < 8 && rn < 8 && encoding != ENFORCE_ENCODING_32BIT) {
     return (thumb_opcode){
@@ -1612,7 +1616,7 @@ thumb_opcode th_asr_reg(uint16_t rd, uint16_t rn, uint16_t rm,
   };
 }
 
-thumb_opcode th_asr_imm(uint16_t rd, uint16_t rm, uint32_t imm,
+thumb_opcode th_asr_imm(uint32_t rd, uint32_t rm, uint32_t imm,
                         thumb_flags_behaviour flags,
                         thumb_enforce_encoding encoding) {
   if (rm < 8 && rd < 8 && encoding != ENFORCE_ENCODING_32BIT &&
@@ -1715,6 +1719,183 @@ thumb_opcode th_cmp_imm(uint32_t rd, uint32_t rn, uint32_t imm,
 
 // VFP instructions
 
+/* VFP arithmetic instructions - single and double precision */
+
+/* VADD.F32 Sd, Sn, Sm  or  VADD.F64 Dd, Dn, Dm
+ * sz=0 for single (F32), sz=1 for double (F64)
+ */
+thumb_opcode th_vadd_f(uint32_t vd, uint32_t vn, uint32_t vm, uint32_t sz) {
+  uint32_t D, N, M, Vd, Vn, Vm;
+  if (sz) {
+    /* Double precision: D:Vd, N:Vn, M:Vm where D/N/M are bit 4 */
+    D = (vd >> 4) & 1;
+    Vd = vd & 0xf;
+    N = (vn >> 4) & 1;
+    Vn = vn & 0xf;
+    M = (vm >> 4) & 1;
+    Vm = vm & 0xf;
+  } else {
+    /* Single precision: Vd:D, Vn:N, Vm:M where D/N/M are bit 0 */
+    D = vd & 1;
+    Vd = (vd >> 1) & 0xf;
+    N = vn & 1;
+    Vn = (vn >> 1) & 0xf;
+    M = vm & 1;
+    Vm = (vm >> 1) & 0xf;
+  }
+  /* VADD: 1110 1110 0D11 nnnn dddd 101s N0M0 mmmm */
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xee300a00 | (D << 22) | (Vn << 16) | (Vd << 12) | (sz << 8) |
+                (N << 7) | (M << 5) | Vm,
+  };
+}
+
+/* VSUB.F32 Sd, Sn, Sm  or  VSUB.F64 Dd, Dn, Dm */
+thumb_opcode th_vsub_f(uint32_t vd, uint32_t vn, uint32_t vm, uint32_t sz) {
+  uint32_t D, N, M, Vd, Vn, Vm;
+  if (sz) {
+    D = (vd >> 4) & 1;
+    Vd = vd & 0xf;
+    N = (vn >> 4) & 1;
+    Vn = vn & 0xf;
+    M = (vm >> 4) & 1;
+    Vm = vm & 0xf;
+  } else {
+    D = vd & 1;
+    Vd = (vd >> 1) & 0xf;
+    N = vn & 1;
+    Vn = (vn >> 1) & 0xf;
+    M = vm & 1;
+    Vm = (vm >> 1) & 0xf;
+  }
+  /* VSUB: 1110 1110 0D11 nnnn dddd 101s N1M0 mmmm */
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xee300a40 | (D << 22) | (Vn << 16) | (Vd << 12) | (sz << 8) |
+                (N << 7) | (M << 5) | Vm,
+  };
+}
+
+/* VMUL.F32 Sd, Sn, Sm  or  VMUL.F64 Dd, Dn, Dm */
+thumb_opcode th_vmul_f(uint32_t vd, uint32_t vn, uint32_t vm, uint32_t sz) {
+  uint32_t D, N, M, Vd, Vn, Vm;
+  if (sz) {
+    D = (vd >> 4) & 1;
+    Vd = vd & 0xf;
+    N = (vn >> 4) & 1;
+    Vn = vn & 0xf;
+    M = (vm >> 4) & 1;
+    Vm = vm & 0xf;
+  } else {
+    D = vd & 1;
+    Vd = (vd >> 1) & 0xf;
+    N = vn & 1;
+    Vn = (vn >> 1) & 0xf;
+    M = vm & 1;
+    Vm = (vm >> 1) & 0xf;
+  }
+  /* VMUL: 1110 1110 0D10 nnnn dddd 101s N0M0 mmmm */
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xee200a00 | (D << 22) | (Vn << 16) | (Vd << 12) | (sz << 8) |
+                (N << 7) | (M << 5) | Vm,
+  };
+}
+
+/* VDIV.F32 Sd, Sn, Sm  or  VDIV.F64 Dd, Dn, Dm */
+thumb_opcode th_vdiv_f(uint32_t vd, uint32_t vn, uint32_t vm, uint32_t sz) {
+  uint32_t D, N, M, Vd, Vn, Vm;
+  if (sz) {
+    D = (vd >> 4) & 1;
+    Vd = vd & 0xf;
+    N = (vn >> 4) & 1;
+    Vn = vn & 0xf;
+    M = (vm >> 4) & 1;
+    Vm = vm & 0xf;
+  } else {
+    D = vd & 1;
+    Vd = (vd >> 1) & 0xf;
+    N = vn & 1;
+    Vn = (vn >> 1) & 0xf;
+    M = vm & 1;
+    Vm = (vm >> 1) & 0xf;
+  }
+  /* VDIV: 1110 1110 1D00 nnnn dddd 101s N0M0 mmmm */
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xee800a00 | (D << 22) | (Vn << 16) | (Vd << 12) | (sz << 8) |
+                (N << 7) | (M << 5) | Vm,
+  };
+}
+
+/* VNEG.F32 Sd, Sm  or  VNEG.F64 Dd, Dm */
+thumb_opcode th_vneg_f(uint32_t vd, uint32_t vm, uint32_t sz) {
+  uint32_t D, M, Vd, Vm;
+  if (sz) {
+    D = (vd >> 4) & 1;
+    Vd = vd & 0xf;
+    M = (vm >> 4) & 1;
+    Vm = vm & 0xf;
+  } else {
+    D = vd & 1;
+    Vd = (vd >> 1) & 0xf;
+    M = vm & 1;
+    Vm = (vm >> 1) & 0xf;
+  }
+  /* VNEG: 1110 1110 1D11 0001 dddd 101s 01M0 mmmm */
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xeeb10a40 | (D << 22) | (Vd << 12) | (sz << 8) | (M << 5) | Vm,
+  };
+}
+
+/* VCMP.F32 Sd, Sm  or  VCMP.F64 Dd, Dm
+ * Compares and sets FPSCR flags
+ */
+thumb_opcode th_vcmp_f(uint32_t vd, uint32_t vm, uint32_t sz) {
+  uint32_t D, M, Vd, Vm;
+  if (sz) {
+    D = (vd >> 4) & 1;
+    Vd = vd & 0xf;
+    M = (vm >> 4) & 1;
+    Vm = vm & 0xf;
+  } else {
+    D = vd & 1;
+    Vd = (vd >> 1) & 0xf;
+    M = vm & 1;
+    Vm = (vm >> 1) & 0xf;
+  }
+  /* VCMP: 1110 1110 1D11 0100 dddd 101s E1M0 mmmm (E=0 for quiet compare) */
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xeeb40a40 | (D << 22) | (Vd << 12) | (sz << 8) | (M << 5) | Vm,
+  };
+}
+
+/* VCMPE.F32 Sd, Sm  or  VCMPE.F64 Dd, Dm
+ * Compares and sets FPSCR flags, signals exception on any NaN
+ */
+thumb_opcode th_vcmpe_f(uint32_t vd, uint32_t vm, uint32_t sz) {
+  uint32_t D, M, Vd, Vm;
+  if (sz) {
+    D = (vd >> 4) & 1;
+    Vd = vd & 0xf;
+    M = (vm >> 4) & 1;
+    Vm = vm & 0xf;
+  } else {
+    D = vd & 1;
+    Vd = (vd >> 1) & 0xf;
+    M = vm & 1;
+    Vm = (vm >> 1) & 0xf;
+  }
+  /* VCMPE: 1110 1110 1D11 0100 dddd 101s E1M0 mmmm (E=1) */
+  return (thumb_opcode){
+      .size = 4,
+      .opcode = 0xeeb40ac0 | (D << 22) | (Vd << 12) | (sz << 8) | (M << 5) | Vm,
+  };
+}
+
 thumb_opcode th_vpush(uint32_t regs, uint32_t is_doubleword) {
   int first_register = 0;
   int register_count = 0;
@@ -1786,16 +1967,27 @@ thumb_opcode th_vpop(uint32_t regs, uint32_t is_doubleword) {
 }
 
 thumb_opcode th_vmov_register(uint16_t vd, uint16_t vm, uint32_t sz) {
-  if (vd <= 0x1f && vm <= 0x1f) {
-    const uint16_t d = vd & 1;
-    const uint16_t m = vm & 1;
-    vd >>= 1;
-    vm >>= 1;
-    return (thumb_opcode){
-        .size = 4,
-        .opcode =
-            0xeeb00a40 | (d << 22) | (vd << 12) | (m << 5) | vm | (sz << 8),
-    };
+  if (sz == 0) {
+    /* Single precision: S-register number 0-31, D bit is bit 0 */
+    if (vd <= 0x1f && vm <= 0x1f) {
+      const uint16_t d = vd & 1;
+      const uint16_t m = vm & 1;
+      vd >>= 1;
+      vm >>= 1;
+      return (thumb_opcode){
+          .size = 4,
+          .opcode =
+              0xeeb00a40 | (d << 22) | (vd << 12) | (m << 5) | vm | (sz << 8),
+      };
+    }
+  } else {
+    /* Double precision: D-register number 0-15, no bit splitting needed */
+    if (vd <= 0x0f && vm <= 0x0f) {
+      return (thumb_opcode){
+          .size = 4,
+          .opcode = 0xeeb00b40 | (vd << 12) | vm, /* sz=1 -> bit 8 set -> 0xb */
+      };
+    }
   }
   return (thumb_opcode){
       .size = 0,
@@ -1815,13 +2007,13 @@ thumb_opcode th_vldr(uint32_t rn, uint32_t vd, uint32_t add,
     return (thumb_opcode){
         .size = 4,
         .opcode = 0xed100b00 | (D << 22) | ((add & 1) << 23) | (rn << 16) |
-                  (vd << 12) | (imm > 2),
+                  (vd << 12) | (imm >> 2),
     };
   }
   return (thumb_opcode){
       .size = 4,
       .opcode = 0xed100a00 | ((add & 1) << 23) | (D << 22) | (rn << 16) |
-                (vd << 12) | (imm > 2),
+                (vd << 12) | (imm >> 2),
   };
 }
 
@@ -1837,24 +2029,26 @@ thumb_opcode th_vstr(uint32_t rn, uint32_t vd, uint32_t add,
     return (thumb_opcode){
         .size = 4,
         .opcode = 0xed000b00 | (D << 22) | ((add & 1) << 23) | (rn << 16) |
-                  (vd << 12) | (imm > 2),
+                  (vd << 12) | (imm >> 2),
 
     };
   }
   return (thumb_opcode){
       .size = 4,
       .opcode = 0xed000a00 | (D << 22) | ((add & 1) << 23) | (rn << 16) |
-                (vd << 12) | (imm > 2),
+                (vd << 12) | (imm >> 2),
   };
 }
 
 // move between core general purpose register and single precision floating
 // point register
 thumb_opcode th_vmov_gp_sp(uint16_t rt, uint16_t sn, uint16_t to_arm_register) {
-  const uint16_t N = (sn >> 4) & 1;
+  /* Sn encoding: Vn (bits 19:16) = Sn[4:1], N (bit 7) = Sn[0] */
+  const uint16_t Vn = (sn >> 1) & 0xf;
+  const uint16_t N = sn & 1;
   return (thumb_opcode){
       .size = 4,
-      .opcode = 0xee000a10 | (to_arm_register << 20) | (sn << 16) | (rt << 12) |
+      .opcode = 0xee000a10 | (to_arm_register << 20) | (Vn << 16) | (rt << 12) |
                 (N << 7),
   };
 }
@@ -1923,25 +2117,53 @@ thumb_opcode th_vmrs(uint16_t rt) {
 }
 
 thumb_opcode th_vcvt_float_to_double(uint32_t vd, uint32_t vm) {
+  /* VCVT.F64.F32 Dd, Sm
+   * vd = destination Dd index (0-15), vm = source Sm index (0-31)
+   * Sm encoding: M = Sm[0] (bit 5), Vm = Sm[4:1] (bits 3:0)
+   */
+  uint32_t M = vm & 1;
+  uint32_t Vm = (vm >> 1) & 0xf;
   return (thumb_opcode){
       .size = 4,
-      .opcode = (0xeeb70ac0 | (vd << 12) | vm),
+      .opcode = (0xeeb70ac0 | (vd << 12) | (M << 5) | Vm),
   };
 }
 
 thumb_opcode th_vcvt_double_to_float(uint32_t vd, uint32_t vm) {
+  /* VCVT.F32.F64 Sd, Dm
+   * vd = destination Sd index (0-31), vm = source Dm index (0-15)
+   * Sd encoding: D = Sd[0] (bit 22), Vd = Sd[4:1] (bits 15:12)
+   */
+  uint32_t D = vd & 1;
+  uint32_t Vd = (vd >> 1) & 0xf;
   return (thumb_opcode){
       .size = 4,
-      .opcode = 0xeeb70bc0 | (vd << 12) | vm,
+      .opcode = 0xeeb70bc0 | (D << 22) | (Vd << 12) | vm,
   };
 }
 
-thumb_opcode th_vcvt_fp_int(uint32_t vd, uint32_t vm, uint32_t opc, uint32_t sz,
-                            uint32_t op) {
+thumb_opcode th_vcvt_fp_int(uint32_t vd, uint32_t vm, uint32_t opc,
+                            uint32_t is_double, uint32_t op) {
+  /* VCVT.S32.F32 or VCVT.S32.F64 - floating-point to integer
+   * vd = destination Sd (single register index 0-31)
+   * vm = source Sm for single, Dm for double
+   * opc = operation: 4=unsigned, 5=signed (round toward zero)
+   * is_double = 0 for F32 source, 1 for F64 source
+   * op = 1 for fp-to-int, 0 for int-to-fp
+   */
+  uint32_t D = (vd >> 4) & 1;      /* Sd[4] */
+  uint32_t Vd = vd & 0xf;          /* Sd[3:0] */
+  uint32_t sz = is_double ? 1 : 0; /* bit 8: 0=F32, 1=F64 source */
+  uint32_t M, Vm;
+
+  /* Both single and double use Sm/Dm = Vm:M encoding */
+  M = vm & 1;
+  Vm = (vm >> 1) & 0xf;
+
   return (thumb_opcode){
       .size = 4,
-      .opcode =
-          0xeeb80a40 | (opc << 16) | (vd << 12) | (sz << 8) | (op << 7) | vm,
+      .opcode = 0xeeb80a40 | (D << 22) | (opc << 16) | (Vd << 12) | (sz << 8) |
+                (op << 7) | (M << 5) | Vm,
   };
 }
 

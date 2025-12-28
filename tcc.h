@@ -689,6 +689,12 @@ struct TCCState {
   unsigned char optimize;         /* only to #define __OPTIMIZE__ */
   unsigned char option_pthread;   /* -pthread option */
   unsigned char enable_new_dtags; /* -Wl,--enable-new-dtags */
+  unsigned char
+      gc_sections; /* -Wl,--gc-sections: garbage collect unused sections */
+  unsigned char function_sections; /* -ffunction-sections: place each function
+                                      in its own section */
+  unsigned char data_sections; /* -fdata-sections: place each data item in its
+                                  own section */
   unsigned int
       cversion; /* supported C ISO version, 199901 (the default), 201112, ... */
 
@@ -747,6 +753,7 @@ struct TCCState {
 #endif
 #if defined(TCC_TARGET_ARM) || defined(TCC_TARGET_ARM_THUMB)
   unsigned char float_abi; /* float ABI of the generated code*/
+  unsigned char fpu_type;  /* FPU type for ARM hardfp */
 #endif
   unsigned char text_and_data_separation; /* support for GCC
                                              -mno-pic-data-is-text-relative */
@@ -928,6 +935,8 @@ struct TCCState {
   int parameters_registers;
   int registers_for_allocator;
   uint64_t registers_map_for_allocator;
+  int float_registers_for_allocator;
+  uint64_t float_registers_map_for_allocator;
   uint8_t omit_frame_pointer;
   uint8_t need_frame_pointer;
   int stack_location;
@@ -1844,10 +1853,12 @@ typedef struct TACQuadruple {
 } TACQuadruple;
 
 ST_FUNC void tcc_gen_machine_data_processing_op(TACQuadruple *q);
+ST_FUNC void tcc_gen_machine_fp_op(TACQuadruple *q);
 ST_FUNC void tcc_gen_machine_load_op(TACQuadruple *q);
 ST_FUNC void tcc_gen_machine_store_op(TACQuadruple *q);
 ST_FUNC void tcc_gen_machine_load_register(SValue *value);
 ST_FUNC void tcc_gen_machine_store_register(SValue *value);
+ST_FUNC void tcc_gen_machine_store_to_stack(int reg, int offset);
 
 ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *q);
 ST_FUNC int tcc_gen_machine_number_of_registers(void);

@@ -36,6 +36,7 @@ TEST_FILES = [
     ("../tests2/19_pointer_arithmetic.c", 0),
     ("../tests2/20_pointer_comparison.c", 0),
     ("../tests2/21_char_array.c", 0),
+    ("../tests2/22_floating_point.c", 0),
 ]
 
 def load_expect_file(test_name):

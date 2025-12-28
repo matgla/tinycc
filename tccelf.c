@@ -2902,6 +2902,154 @@ static void ld_apply_symbols(TCCState *s1, LDScript *ld);
 static void ld_update_symbol_values(TCCState *s1, LDScript *ld);
 ST_FUNC void ld_export_standard_symbols(TCCState *s1);
 
+/* --gc-sections implementation: remove unused sections */
+static void gc_sections(TCCState *s1) {
+  int i, sym_index, changed;
+  Section *s, *sr;
+  ElfW(Sym) * sym, *symtab;
+  ElfW_Rel *rel;
+  unsigned char *sec_used;
+  int nb_syms;
+  const char *name;
+
+  /* Allocate array to track which sections are used */
+  sec_used = tcc_mallocz(s1->nb_sections);
+
+  /* Always keep certain essential sections */
+  for (i = 1; i < s1->nb_sections; i++) {
+    s = s1->sections[i];
+    if (!s || !s->name)
+      continue;
+    /* Keep symtab, strtab, shstrtab, and relocation sections */
+    if (s->sh_type == SHT_SYMTAB || s->sh_type == SHT_STRTAB ||
+        s->sh_type == SHT_HASH || s->sh_type == SHT_DYNSYM ||
+        s->sh_type == SHT_GNU_HASH || s->sh_type == SHT_GNU_versym ||
+        s->sh_type == SHT_GNU_verneed || s->sh_type == SHT_GNU_verdef ||
+        s->sh_type == SHT_RELX || s->sh_type == SHT_DYNAMIC ||
+        s->sh_type == SHT_NOTE) {
+      sec_used[i] = 1;
+      continue;
+    }
+    /* Keep init/fini arrays and special sections */
+    if (!strcmp(s->name, ".init") || !strcmp(s->name, ".fini") ||
+        !strcmp(s->name, ".init_array") || !strcmp(s->name, ".fini_array") ||
+        !strcmp(s->name, ".preinit_array") || !strcmp(s->name, ".ctors") ||
+        !strcmp(s->name, ".dtors") || !strcmp(s->name, ".got") ||
+        !strcmp(s->name, ".got.plt") || !strcmp(s->name, ".plt") ||
+        !strcmp(s->name, ".interp") || !strcmp(s->name, ".eh_frame") ||
+        !strcmp(s->name, ".eh_frame_hdr") ||
+        !strcmp(s->name, ".ARM.attributes") || !strcmp(s->name, ".ARM.exidx")) {
+      sec_used[i] = 1;
+      continue;
+    }
+    /* Keep sections marked with KEEP() in linker script */
+    if (s1->ld_script && ld_section_should_keep(s1->ld_script, s->name)) {
+      sec_used[i] = 1;
+      continue;
+    }
+    /* Keep debug sections if debugging enabled */
+    if (s1->do_debug && !strncmp(s->name, ".debug", 6)) {
+      sec_used[i] = 1;
+      continue;
+    }
+    /* Keep sections that are not SHF_ALLOC (like comments) if not allocatable
+     */
+    if (!(s->sh_flags & SHF_ALLOC)) {
+      sec_used[i] = 1;
+      continue;
+    }
+  }
+
+  /* Mark sections containing entry point and other root symbols */
+  symtab = (ElfW(Sym) *)symtab_section->data;
+  nb_syms = symtab_section->data_offset / sizeof(ElfW(Sym));
+
+  for (sym_index = 1; sym_index < nb_syms; sym_index++) {
+    sym = &symtab[sym_index];
+    if (sym->st_shndx == SHN_UNDEF || sym->st_shndx >= SHN_LORESERVE)
+      continue;
+    if (sym->st_shndx >= s1->nb_sections)
+      continue;
+
+    name = (char *)symtab_section->link->data + sym->st_name;
+
+    /* Mark entry point section */
+    if (s1->elf_entryname && !strcmp(name, s1->elf_entryname)) {
+      sec_used[sym->st_shndx] = 1;
+      continue;
+    }
+    if (!strcmp(name, "_start") || !strcmp(name, "main") ||
+        !strcmp(name, "_main") || !strcmp(name, "__start")) {
+      sec_used[sym->st_shndx] = 1;
+      continue;
+    }
+    /* Mark global/weak symbols that are exported */
+    if (s1->rdynamic && ELFW(ST_BIND)(sym->st_info) != STB_LOCAL) {
+      sec_used[sym->st_shndx] = 1;
+      continue;
+    }
+  }
+
+  /* Iteratively mark sections referenced by relocations from used sections */
+  do {
+    changed = 0;
+    for (i = 1; i < s1->nb_sections; i++) {
+      sr = s1->sections[i];
+      if (sr->sh_type != SHT_RELX)
+        continue;
+      /* Get the section this relocation applies to */
+      s = s1->sections[sr->sh_info];
+      if (!s || !sec_used[sr->sh_info])
+        continue;
+
+      /* Iterate through relocations */
+      for_each_elem(sr, 0, rel, ElfW_Rel) {
+        sym_index = ELFW(R_SYM)(rel->r_info);
+        if (sym_index == 0 || sym_index >= nb_syms)
+          continue;
+        sym = &symtab[sym_index];
+        if (sym->st_shndx == SHN_UNDEF || sym->st_shndx >= SHN_LORESERVE)
+          continue;
+        if (sym->st_shndx >= s1->nb_sections)
+          continue;
+        if (!sec_used[sym->st_shndx]) {
+          sec_used[sym->st_shndx] = 1;
+          changed = 1;
+        }
+      }
+    }
+  } while (changed);
+
+  /* Also mark relocation sections for used sections */
+  for (i = 1; i < s1->nb_sections; i++) {
+    s = s1->sections[i];
+    if (s && s->reloc && sec_used[i]) {
+      sec_used[s->reloc->sh_num] = 1;
+    }
+  }
+
+  /* Remove unused sections by zeroing their data */
+  for (i = 1; i < s1->nb_sections; i++) {
+    s = s1->sections[i];
+    if (!s)
+      continue;
+    if (!sec_used[i] && (s->sh_flags & SHF_ALLOC) && s->data_offset > 0) {
+      if (s1->verbose)
+        printf("GC: removing unused section '%s' (%d bytes)\n", s->name,
+               (int)s->data_offset);
+      /* Zero the section - it will be skipped in output */
+      s->data_offset = 0;
+      s->sh_size = 0;
+      if (s->reloc) {
+        s->reloc->data_offset = 0;
+        s->reloc->sh_size = 0;
+      }
+    }
+  }
+
+  tcc_free(sec_used);
+}
+
 /* Output an elf, coff or binary file */
 /* XXX: suppress unneeded sections */
 static int elf_output_file(TCCState *s1, const char *filename) {
@@ -2944,6 +3092,11 @@ static int elf_output_file(TCCState *s1, const char *filename) {
   /* if linking, also link in runtime libraries (libc, libgcc, etc.) */
   tcc_add_runtime(s1);
   resolve_common_syms(s1);
+
+  /* Garbage collect unused sections if requested */
+  if (s1->gc_sections) {
+    gc_sections(s1);
+  }
 
   if (!s1->static_link) {
     if (file_type & TCC_OUTPUT_EXE) {

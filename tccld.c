@@ -1000,6 +1000,23 @@ int ld_script_find_or_create_symbol(LDScript *ld, const char *name) {
   return idx;
 }
 
+/* Check if a section should be kept (not garbage collected) based on linker
+ * script KEEP directives */
+int ld_section_should_keep(LDScript *ld, const char *section_name) {
+  if (!ld)
+    return 0;
+  for (int i = 0; i < ld->nb_output_sections; i++) {
+    LDOutputSection *os = &ld->output_sections[i];
+    for (int j = 0; j < os->nb_patterns; j++) {
+      LDSectionPattern *pat = &os->patterns[j];
+      if (pat->keep && ld_section_matches_pattern(section_name, pat->pattern)) {
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
+
 /* Simple glob matching */
 int ld_section_matches_pattern(const char *section_name, const char *pattern) {
   const char *s = section_name;

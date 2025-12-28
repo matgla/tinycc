@@ -31,7 +31,7 @@ arm-libtcc1-usegcc ?= no
 ifeq "$($(T)-libtcc1-usegcc)" "yes"
  XCC = $(CC)
  XAR = $(AR)
- XFLAGS = $(CFLAGS) -fPIC -fno-omit-frame-pointer -Wno-unused-function -Wno-unused-variable
+ XFLAGS = $(CFLAGS) -fPIC -fno-omit-frame-pointer -Wno-unused-function -Wno-unused-variable -mfloat-abi=hard -mfpu=fpv4-sp-d16
  BFLAGS = $(if $(CONFIG_dwarf),-gdwarf,-gstabs)
 endif
 

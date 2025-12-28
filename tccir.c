@@ -22,6 +22,7 @@
 
 #include "tccir.h"
 
+#define USING_GLOBALS
 #include "tcc.h"
 
 #include <stdio.h>
@@ -76,6 +77,17 @@ const IRRegistersConfig irop_config[] = {
     [TCCIR_OP_STORE] = {1, 1, 0},
     [TCCIR_OP_ASSIGN] = {1, 1, 0},
     [TCCIR_OP_TEST_ZERO] = {0, 1, 0},
+    /* Floating point operations */
+    [TCCIR_OP_FADD] = {1, 1, 1},
+    [TCCIR_OP_FSUB] = {1, 1, 1},
+    [TCCIR_OP_FMUL] = {1, 1, 1},
+    [TCCIR_OP_FDIV] = {1, 1, 1},
+    [TCCIR_OP_FNEG] = {1, 1, 0},  /* unary: src1=input, dest */
+    [TCCIR_OP_FCMP] = {0, 1, 1},
+    /* Floating point conversion operations */
+    [TCCIR_OP_CVT_FTOF] = {1, 1, 0},  /* dest=result, src1=input */
+    [TCCIR_OP_CVT_ITOF] = {1, 1, 0},  /* dest=result, src1=input */
+    [TCCIR_OP_CVT_FTOI] = {1, 1, 0},  /* dest=result, src1=input */
 };
 // clang-format on
 
@@ -100,6 +112,10 @@ static int tcc_is_vreg_valid(TCCIRState *ir, int vr) {
 }
 
 static IRLiveInterval *tcc_ir_get_live_interval(TCCIRState *ir, int vreg) {
+  if (vreg < 0) {
+    fprintf(stderr, "tcc_ir_get_live_interval: invalid vreg: %d\n", vreg);
+    exit(1);
+  }
   int decoded_vreg_position = TCCIR_DECODE_VREG_POSITION(vreg);
   switch (TCCIR_DECODE_VREG_TYPE(vreg)) {
   case TCCIR_VREG_TYPE_VAR: {
@@ -140,10 +156,13 @@ static void tcc_ir_set_base_interval_end(TCCIRState *ir, int vreg) {
   interval->end = ir->next_instruction_index;
 }
 
-/* Initialize all interval start fields to INTERVAL_NOT_STARTED */
+/* Initialize all interval start fields to INTERVAL_NOT_STARTED and incoming_reg
+ * to -1 */
 static void tcc_ir_init_interval_starts(IRLiveInterval *intervals, int count) {
   for (int i = 0; i < count; ++i) {
     intervals[i].start = INTERVAL_NOT_STARTED;
+    intervals[i].incoming_reg0 = -1;
+    intervals[i].incoming_reg1 = -1;
   }
 }
 
@@ -312,9 +331,72 @@ void tcc_ir_add_function_parameters(TCCIRState *ir, CType *func_type) {
 }
 
 void tcc_ir_gen_opf(TCCIRState *ir, int op) {
-  fprintf(stderr,
-          "tcc_ir_gen_opf: floating point operations not implemented\n");
-  exit(1);
+  TccIrOp ir_op;
+  SValue dest;
+  int is_double;
+
+  /* Determine the IR operation based on token */
+  switch (op) {
+  case '+':
+    ir_op = TCCIR_OP_FADD;
+    break;
+  case '-':
+    ir_op = TCCIR_OP_FSUB;
+    break;
+  case '*':
+    ir_op = TCCIR_OP_FMUL;
+    break;
+  case '/':
+    ir_op = TCCIR_OP_FDIV;
+    break;
+  case TOK_NEG:
+    ir_op = TCCIR_OP_FNEG;
+    break;
+  default:
+    /* Comparison operations */
+    if (op >= TOK_ULT && op <= TOK_GT) {
+      ir_op = TCCIR_OP_FCMP;
+      tcc_ir_put(ir, ir_op, &vtop[-1], &vtop[0], NULL);
+      --vtop;
+      vtop->r = VT_CMP;
+      vtop->cmp_op = op;
+      vtop->jfalse = 0;
+      vtop->jtrue = 0;
+      return;
+    }
+    tcc_error("tcc_ir_gen_opf: unknown floating point operation: 0x%x", op);
+    return;
+  }
+
+  /* Handle negation (unary) */
+  if (ir_op == TCCIR_OP_FNEG) {
+    memset(&dest, 0, sizeof(SValue));
+    dest.vr = tcc_ir_get_vreg_temp(ir);
+    dest.r = 0;
+    dest.type = vtop->type;
+    /* Mark temp as float/double */
+    is_double = (vtop->type.t & VT_BTYPE) == VT_DOUBLE ||
+                (vtop->type.t & VT_BTYPE) == VT_LDOUBLE;
+    tcc_ir_set_float_type(ir, dest.vr, 1, is_double);
+    tcc_ir_put(ir, ir_op, &vtop[0], NULL, &dest);
+    vtop->vr = dest.vr;
+    vtop->r = 0;
+    return;
+  }
+
+  /* Binary FP operations */
+  memset(&dest, 0, sizeof(SValue));
+  dest.vr = tcc_ir_get_vreg_temp(ir);
+  dest.r = 0;
+  dest.type = vtop[-1].type;
+  /* Mark temp as float/double */
+  is_double = (vtop[-1].type.t & VT_BTYPE) == VT_DOUBLE ||
+              (vtop[-1].type.t & VT_BTYPE) == VT_LDOUBLE;
+  tcc_ir_set_float_type(ir, dest.vr, 1, is_double);
+  tcc_ir_put(ir, ir_op, &vtop[-1], &vtop[0], &dest);
+  vtop[-1].vr = dest.vr;
+  vtop[-1].r = 0;
+  --vtop;
 }
 
 TccIrOp tcc_irop_from_token(int token) {
@@ -464,6 +546,24 @@ const char *tcc_ir_get_op_name(TccIrOp op) {
     return "ASSIGN";
   case TCCIR_OP_TEST_ZERO:
     return "TEST_ZERO";
+  case TCCIR_OP_FADD:
+    return "FADD";
+  case TCCIR_OP_FSUB:
+    return "FSUB";
+  case TCCIR_OP_FMUL:
+    return "FMUL";
+  case TCCIR_OP_FDIV:
+    return "FDIV";
+  case TCCIR_OP_FNEG:
+    return "FNEG";
+  case TCCIR_OP_FCMP:
+    return "FCMP";
+  case TCCIR_OP_CVT_FTOF:
+    return "CVT_FTOF";
+  case TCCIR_OP_CVT_ITOF:
+    return "CVT_ITOF";
+  case TCCIR_OP_CVT_FTOI:
+    return "CVT_FTOI";
   default:
     return "UNKNOWN_OP";
   }
@@ -566,11 +666,12 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2,
     interval->start = INTERVAL_NOT_STARTED;
     interval->end = 0;
     printf("Setting interval of vreg %d to invalid, %p\n", src1->vr, interval);
-    IRLiveInterval *dest_interval =
-        tcc_ir_get_live_interval(ir, ir->instructions[pos].dest.vr);
-    if (tcc_is_vreg_valid(ir, ir->instructions[pos].dest.vr) &&
-        dest_interval->start == pos) {
-      dest_interval->start = pos - 1;
+    if (tcc_is_vreg_valid(ir, ir->instructions[pos].dest.vr)) {
+      IRLiveInterval *dest_interval =
+          tcc_ir_get_live_interval(ir, ir->instructions[pos].dest.vr);
+      if (dest_interval->start == pos) {
+        dest_interval->start = pos - 1;
+      }
     }
     // Mark the src1 vreg as ignored
     return ir->next_instruction_index;
@@ -644,6 +745,48 @@ void tcc_ir_set_addrtaken(TCCIRState *ir, int vreg) {
   if (interval) {
     interval->addrtaken = 1;
   }
+}
+
+void tcc_ir_set_float_type(TCCIRState *ir, int vreg, int is_float,
+                           int is_double) {
+  if (vreg < 0)
+    return;
+  IRLiveInterval *interval = tcc_ir_get_live_interval(ir, vreg);
+  if (interval) {
+    interval->is_float = is_float;
+    interval->is_double = is_double;
+    /* For now, assume soft-float for ARM Thumb (no VFP for doubles) */
+    /* TODO: make this configurable based on target */
+    interval->use_vfp = 0;
+  }
+}
+
+void tcc_ir_set_llong_type(TCCIRState *ir, int vreg) {
+  if (vreg < 0)
+    return;
+  IRLiveInterval *interval = tcc_ir_get_live_interval(ir, vreg);
+  if (interval) {
+    interval->is_llong = 1;
+  }
+}
+
+int tcc_ir_get_reg_type(TCCIRState *ir, int vreg) {
+  if (vreg < 0)
+    return LS_REG_TYPE_INT;
+  IRLiveInterval *interval = tcc_ir_get_live_interval(ir, vreg);
+  if (interval) {
+    if (interval->is_llong) {
+      return LS_REG_TYPE_LLONG;
+    }
+    if (interval->is_float) {
+      if (interval->is_double) {
+        /* For soft-float, doubles use two integer registers */
+        return interval->use_vfp ? LS_REG_TYPE_DOUBLE : LS_REG_TYPE_DOUBLE_SOFT;
+      }
+      return LS_REG_TYPE_FLOAT;
+    }
+  }
+  return LS_REG_TYPE_INT;
 }
 
 // 3 bits per vreg position: bit 0 = local_variable, bit 1 = temp, bit 2 =
@@ -809,6 +952,7 @@ void tcc_ir_liveness_analysis(TCCIRState *ir) {
   int start, end;
   int crosses_call;
   int addrtaken;
+  int reg_type;
   IRLiveInterval *interval;
   tcc_ls_clear_live_intervals(&ir->ls);
 
@@ -826,8 +970,9 @@ void tcc_ir_liveness_analysis(TCCIRState *ir) {
       crosses_call = tcc_ir_has_call_in_range(ir, start, end);
       interval = tcc_ir_get_live_interval(ir, encoded_vreg);
       addrtaken = interval ? interval->addrtaken : 0;
+      reg_type = tcc_ir_get_reg_type(ir, encoded_vreg);
       tcc_ls_add_live_interval(&ir->ls, encoded_vreg, start, end, crosses_call,
-                               addrtaken);
+                               addrtaken, reg_type);
     }
   }
 
@@ -842,38 +987,49 @@ void tcc_ir_liveness_analysis(TCCIRState *ir) {
       crosses_call = tcc_ir_has_call_in_range(ir, start, end);
       interval = tcc_ir_get_live_interval(ir, vreg_encoded);
       addrtaken = interval ? interval->addrtaken : 0;
+      reg_type = tcc_ir_get_reg_type(ir, vreg_encoded);
       tcc_ls_add_live_interval(&ir->ls, vreg_encoded, start, end, crosses_call,
-                               addrtaken);
+                               addrtaken, reg_type);
     }
   }
 
   /* For non-leaf functions, include parameters in liveness analysis
    * so they get allocated to callee-saved registers if they cross calls.
-   * Parameters are live from instruction 0 (function entry). */
+   * Parameters are live from instruction 0 (function entry).
+   * Include ALL parameters that arrived in registers - they need stack slots
+   * even if unused, because we save them in the prolog. */
   if (!ir->leaffunc) {
     for (int vreg = 0; vreg < ir->next_parameter; ++vreg) {
       const int vreg_encoded = (TCCIR_VREG_TYPE_PARAM << 28) | vreg;
       IRLiveInterval *interval = tcc_ir_get_live_interval(ir, vreg_encoded);
-      /* Parameters start at instruction 0 and end at their last use */
+      /* Parameters start at instruction 0 and end at their last use.
+       * If end==0 and param is used at instruction 0, that's valid.
+       * If end==0 and param is unused, we still allocate a slot for it. */
       start = 0;
       end = interval->end;
-      if (end > 0) {
-        /* Check for backward jumps that would extend end */
-        for (int i = 0; i < ir->next_instruction_index; ++i) {
-          TACQuadruple *q = &ir->instructions[i];
-          if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF) {
-            int jump_target = q->dest.c.i;
-            if (jump_target < i && start <= jump_target && end >= jump_target) {
-              if (i > end)
-                end = i;
-            }
+      /* If param never used (end would be 0 from memset), set minimal end */
+      if (end == 0)
+        end = 1; /* Ensure at least one instruction range for allocation */
+      /* Check for backward jumps that would extend end */
+      for (int i = 0; i < ir->next_instruction_index; ++i) {
+        TACQuadruple *q = &ir->instructions[i];
+        if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF) {
+          int jump_target = q->dest.c.i;
+          if (jump_target < i && start <= jump_target && end >= jump_target) {
+            if (i > end)
+              end = i;
           }
         }
-        crosses_call = tcc_ir_has_call_in_range(ir, start, end);
-        addrtaken = interval->addrtaken;
-        tcc_ls_add_live_interval(&ir->ls, vreg_encoded, start, end,
-                                 crosses_call, addrtaken);
       }
+      crosses_call = tcc_ir_has_call_in_range(ir, start, end);
+      addrtaken = interval->addrtaken;
+      reg_type = tcc_ir_get_reg_type(ir, vreg_encoded);
+      printf("DEBUG liveness: vreg=%d is_float=%d is_double=%d is_llong=%d -> "
+             "reg_type=%d\n",
+             vreg_encoded, interval->is_float, interval->is_double,
+             interval->is_llong, reg_type);
+      tcc_ls_add_live_interval(&ir->ls, vreg_encoded, start, end, crosses_call,
+                               addrtaken, reg_type);
     }
   }
 }
@@ -881,6 +1037,9 @@ void tcc_ir_liveness_analysis(TCCIRState *ir) {
 void tcc_ir_patch_live_intervals_registers(TCCIRState *ir) {
   for (int i = 0; i < ir->ls.next_interval_index; ++i) {
     LSLiveInterval *interval = &ir->ls.intervals[i];
+    printf("DEBUG tcc_ir_patch: vreg=%d stack_loc=%d r0=%d r1=%d\n",
+           interval->vreg, (int)interval->stack_location, interval->r0,
+           interval->r1);
     tcc_ir_assign_physical_register(ir, interval->vreg,
                                     interval->stack_location, interval->r0,
                                     interval->r1);
@@ -890,8 +1049,15 @@ void tcc_ir_patch_live_intervals_registers(TCCIRState *ir) {
 void tcc_ir_assign_physical_register(TCCIRState *ir, int vreg, int offset,
                                      int r0, int r1) {
   IRLiveInterval *interval = tcc_ir_get_live_interval(ir, vreg);
-  interval->allocation.r0 = r0;
-  interval->allocation.r1 = r1;
+  /* If variable is spilled (offset != 0), mark r0 with PREG_SPILLED flag */
+  if (offset != 0) {
+    printf("DEBUG assign_phys_reg: vreg=%d offset=%d -> setting PREG_SPILLED\n",
+           vreg, offset);
+    interval->allocation.r0 = PREG_SPILLED;
+  } else {
+    interval->allocation.r0 = r0;
+    interval->allocation.r1 = r1;
+  }
   interval->allocation.offset = offset;
 }
 
@@ -909,14 +1075,63 @@ const char *tcc_ir_get_vreg_type_string(int vreg) {
 }
 
 void tcc_ir_register_allocation_params(TCCIRState *ir) {
-  if (ir->leaffunc) {
-    int argno = 0; // pass argument size for double registers
-    for (int vreg = 0; vreg < ir->next_parameter; ++vreg) {
-      const int encoded_vreg = (TCCIR_VREG_TYPE_PARAM << 28) | vreg;
-      if (argno <= 3) {
-        tcc_ir_assign_physical_register(ir, encoded_vreg, 0, argno, -1);
+  /* For leaf functions: parameters can stay in registers r0-r3.
+   * For non-leaf functions: parameters arrive in registers but must be
+   * stored to stack since r0-r3 are caller-saved.
+   * In both cases, we need to track which register each parameter arrives in.
+   */
+  int argno = 0; // current register number (r0-r3)
+  for (int vreg = 0; vreg < ir->next_parameter; ++vreg) {
+    const int encoded_vreg = (TCCIR_VREG_TYPE_PARAM << 28) | vreg;
+    IRLiveInterval *interval = tcc_ir_get_live_interval(ir, encoded_vreg);
+    int is_double = interval && interval->is_double;
+
+    /* AAPCS: doubles must be aligned to even register pairs */
+    if (is_double && (argno & 1)) {
+      argno++; /* skip odd register to align to even */
+    }
+
+    if (is_double) {
+      /* Double takes r0+r1 or r2+r3 */
+      if (argno <= 2) {
+        /* For leaf functions: keep in registers.
+         * For non-leaf: also set incoming_reg so prolog can save to stack */
+        interval->incoming_reg0 = argno;
+        interval->incoming_reg1 = argno + 1;
+        if (ir->leaffunc) {
+          tcc_ir_assign_physical_register(ir, encoded_vreg, 0, argno,
+                                          argno + 1);
+        }
+        /* For non-leaf, allocation was already set by liveness analysis
+         * (spilled to stack), but we need to mark incoming registers
+         * so prolog knows to store r0:r1 or r2:r3 to stack location */
+      } else {
+        /* Spilled to caller's stack frame - parameter passed on stack */
+        interval->incoming_reg0 = -1;
+        interval->incoming_reg1 = -1;
+        if (ir->leaffunc) {
+          tcc_ir_assign_physical_register(ir, encoded_vreg, (argno - 4) * 4 + 8,
+                                          -1, -1);
+        }
       }
-      ++argno;
+      argno += 2;
+    } else {
+      if (argno <= 3) {
+        interval->incoming_reg0 = argno;
+        interval->incoming_reg1 = -1;
+        if (ir->leaffunc) {
+          tcc_ir_assign_physical_register(ir, encoded_vreg, 0, argno, -1);
+        }
+      } else {
+        /* Spilled to caller's stack frame - parameter passed on stack */
+        interval->incoming_reg0 = -1;
+        interval->incoming_reg1 = -1;
+        if (ir->leaffunc) {
+          tcc_ir_assign_physical_register(ir, encoded_vreg, (argno - 4) * 4 + 8,
+                                          -1, -1);
+        }
+      }
+      argno++;
     }
   }
 }
@@ -924,6 +1139,10 @@ void tcc_ir_register_allocation_params(TCCIRState *ir) {
 void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv) {
   if (tcc_is_vreg_valid(ir, sv->vr)) {
     IRLiveInterval *interval = tcc_ir_get_live_interval(ir, sv->vr);
+    printf("DEBUG fill_registers: vr=%d allocation.r0=%d, allocation.r1=%d "
+           "allocation.offset=%d\n",
+           sv->vr, interval->allocation.r0, interval->allocation.r1,
+           (int)interval->allocation.offset);
     sv->pr0 = interval->allocation.r0;
     sv->pr1 = interval->allocation.r1;
     sv->c.i = interval->allocation.offset;
@@ -1067,21 +1286,43 @@ void tcc_ir_generate_code(TCCIRState *ir) {
   int stack_size = (-loc + 7) & ~7; // align to 8 bytes
   tcc_gen_machine_prolog(ir->leaffunc, ir->ls.dirty_registers, stack_size);
 
-  /* For non-leaf functions, move parameters from incoming registers (R0-R3)
-   * to their allocated registers. Only do this for parameters that were
-   * actually used (have end > 0 from liveness tracking). */
+  /* For non-leaf functions, save parameters from incoming registers (r0-r3)
+   * to their allocated stack locations. Parameters are spilled because
+   * r0-r3 are caller-saved and get clobbered by calls.
+   * For leaf functions, parameters stay in r0-r3 via register allocation. */
+  printf("DEBUG tcc_ir_generate_code: leaffunc=%d next_parameter=%d\n",
+         ir->leaffunc, ir->next_parameter);
   if (!ir->leaffunc) {
-    for (int vreg = 0; vreg < ir->next_parameter && vreg < 4; ++vreg) {
+    for (int vreg = 0; vreg < ir->next_parameter; ++vreg) {
       const int encoded_vreg = (TCCIR_VREG_TYPE_PARAM << 28) | vreg;
       IRLiveInterval *interval = tcc_ir_get_live_interval(ir, encoded_vreg);
-      /* Only emit move if parameter was actually used (end > 0) and
-       * destination differs from source */
-      if (interval->end > 0) {
-        int dest_reg = interval->allocation.r0;
-        if (dest_reg != vreg && dest_reg < 16) {
-          tcc_gen_machine_move_reg(dest_reg, vreg);
+
+      int incoming_r0 = interval->incoming_reg0;
+      int incoming_r1 = interval->incoming_reg1;
+
+      printf("DEBUG prolog param %d: incoming_r0=%d incoming_r1=%d "
+             "alloc.offset=%d is_double=%d\n",
+             vreg, incoming_r0, incoming_r1, (int)interval->allocation.offset,
+             interval->is_double);
+
+      /* If parameter arrived in registers (not on caller's stack) */
+      if (incoming_r0 >= 0) {
+        /* Parameter needs to be saved to stack (spilled by register allocator)
+         */
+        int stack_offset = interval->allocation.offset;
+        if (interval->is_double && incoming_r1 >= 0) {
+          /* Double parameter: save both registers */
+          /* Store r0/r2 (low word) to [FP + offset] */
+          tcc_gen_machine_store_to_stack(incoming_r0, stack_offset);
+          /* Store r1/r3 (high word) to [FP + offset + 4] */
+          tcc_gen_machine_store_to_stack(incoming_r1, stack_offset + 4);
+        } else {
+          /* Single 32-bit parameter */
+          tcc_gen_machine_store_to_stack(incoming_r0, stack_offset);
         }
       }
+      /* Parameters that arrived on stack stay where they are (accessed via
+       * offset_to_args) */
     }
   }
 
@@ -1116,8 +1357,12 @@ void tcc_ir_generate_code(TCCIRState *ir) {
 
     if (irop_config[q->op].has_dest == 1) {
       tcc_ir_fill_registers(ir, &q->dest);
+      /* Don't pre-load destination to scratch register for operations that
+       * handle their own destination storage (e.g., float conversions that
+       * may need to store to spilled stack locations) */
       if (tcc_ir_operand_in_memory(&q->dest) && (q->op != TCCIR_OP_ASSIGN) &&
-          (q->op != TCCIR_OP_STORE)) {
+          (q->op != TCCIR_OP_STORE) && (q->op != TCCIR_OP_CVT_FTOF) &&
+          (q->op != TCCIR_OP_CVT_ITOF) && (q->op != TCCIR_OP_CVT_FTOI)) {
         q->dest.pr0 = architecture_config.scratch_register;
         tcc_gen_machine_load_register(&q->dest);
       }
@@ -1136,7 +1381,19 @@ void tcc_ir_generate_code(TCCIRState *ir) {
     case TCCIR_OP_XOR:
     case TCCIR_OP_DIV:
     case TCCIR_OP_UDIV:
+    case TCCIR_OP_SAR:
       tcc_gen_machine_data_processing_op(q);
+      break;
+    case TCCIR_OP_FADD:
+    case TCCIR_OP_FSUB:
+    case TCCIR_OP_FMUL:
+    case TCCIR_OP_FDIV:
+    case TCCIR_OP_FNEG:
+    case TCCIR_OP_FCMP:
+    case TCCIR_OP_CVT_FTOF:
+    case TCCIR_OP_CVT_ITOF:
+    case TCCIR_OP_CVT_FTOI:
+      tcc_gen_machine_fp_op(q);
       break;
     case TCCIR_OP_LOAD:
       tcc_gen_machine_load_op(q);
@@ -1506,11 +1763,13 @@ void tcc_ir_drop_return_value(TCCIRState *ir) {
   }
   TACQuadruple *last_instr = &ir->instructions[ir->next_instruction_index - 1];
   if (last_instr->op == TCCIR_OP_FUNCCALLVAL) {
-    IRLiveInterval *interval =
-        tcc_ir_get_live_interval(ir, last_instr->dest.vr);
+    if (tcc_is_vreg_valid(ir, last_instr->dest.vr)) {
+      IRLiveInterval *interval =
+          tcc_ir_get_live_interval(ir, last_instr->dest.vr);
+      interval->start = INTERVAL_NOT_STARTED;
+      interval->end = 0;
+    }
     last_instr->op = TCCIR_OP_FUNCCALLVOID;
-    interval->start = INTERVAL_NOT_STARTED;
-    interval->end = 0;
     last_instr->dest.vr = -1;
     last_instr->src1.vr = -1;
   }

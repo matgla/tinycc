@@ -12,8 +12,8 @@ SYSROOT = $(shell realpath $(ARM_SYSROOT)/lib/thumb/v8-m.base/nofp)
 LIBGCC_PATH = $(shell arm-none-eabi-gcc -print-libgcc-file-name)
 CRT_GCC = $(dir $(LIBGCC_PATH))/thumb/v8-m.base/nofp
 
-CFLAGS += -nostdlib -g -fvisibility=hidden -mcpu=cortex-m33 -gdwarf
-LDFLAGS = $(CFLAGS) -g -fvisibility=hidden
+CFLAGS += -nostdlib -g -fvisibility=hidden -mcpu=cortex-m33 -gdwarf -mfloat-abi=hard -mfpu=fpv5-sp-d16 -ffunction-sections
+LDFLAGS = $(CFLAGS) -g -fvisibility=hidden -Wl,--gc-sections
 
 TCC_PATH = $(shell realpath $(MAKEFILE_DIR)../../../../)
 LIBC_INCLUDES = $(shell realpath $(MAKEFILE_DIR)../../libc_includes)
@@ -21,9 +21,9 @@ LIBGLOSS_PATH = $(shell realpath $(MAKEFILE_DIR)/newlib_build/arm-none-eabi/libg
 
 ifneq (,$(findstring armv8m-tcc,$(CC)))
 CFLAGS += -I$(LIBC_INCLUDES) -I$(ARM_SYSROOT)/include -I$(TCC_PATH)/include
-LDFLAGS += -L$(TCC_PATH) -L$(MAKEFILE_DIR)/newlib_build/arm-none-eabi/newlib -L$(LIBGLOSS_PATH) -llibc.a -llibrdimon.a -larmv8m-libtcc1.a -llibc.a -Wl,-oformat=elf32-littlearm -T$(MAKEFILE_DIR)linker_script.ld -v
+LDFLAGS += -L$(TCC_PATH) -L$(MAKEFILE_DIR)/newlib_build/arm-none-eabi/newlib -L$(LIBGLOSS_PATH) -llibc.a -llibrdimon.a -larmv8m-libtcc1.a -llibm.a -llibc.a -Wl,-oformat=elf32-littlearm -T$(MAKEFILE_DIR)linker_script.ld -v
 else
-LDFLAGS += -Wl,--start-group -lrdimon -lc_nano -lgcc -Wl,--end-group --specs=rdimon.specs -T$(MAKEFILE_DIR)linker_script.ld
+LDFLAGS += -Wl,--start-group -lrdimon -lc -lgcc -Wl,--end-group --specs=rdimon.specs -T$(MAKEFILE_DIR)linker_script.ld
 endif
 
 

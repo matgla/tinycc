@@ -10,21 +10,21 @@ was_cleaned = False
 def get_test_output_file(test_name):
     return f"{CURRENT_DIR}/build/{Path(test_name).stem}.elf"
 
-def build_make_command(test_file, machine):
-    return f'make -C qemu/{machine} OUTPUT={CURRENT_DIR}/build TEST_FILES={test_file} CC={CURRENT_DIR}/../../armv8m-tcc TARGET={get_test_output_file(test_file)}'
+def build_make_command(test_file, machine, compiler):
+    return f'make -C qemu/{machine} OUTPUT={CURRENT_DIR}/build TEST_FILES={test_file} CC={compiler} TARGET={get_test_output_file(test_file)}'
 
 def build_qemu_command(machine, kernel_file):
     return f'qemu-system-arm -machine {machine} -nographic -semihosting -kernel {kernel_file}'
 
-def compile_testcase(test_file, machine):
+def compile_testcase(test_file, machine, compiler=f"{CURRENT_DIR}/../../armv8m-tcc"):
     global was_cleaned
-    make_command = build_make_command(test_file, machine)
+    make_command = build_make_command(test_file, machine, compiler)
     if not was_cleaned:
         result = subprocess.run(make_command + " clean", shell=True)
         if result.returncode != 0:
             raise RuntimeError(f"Clean failed with exit code {result.returncode}")
         was_cleaned = True
-    result = subprocess.run(make_command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    result = subprocess.run(make_command, shell=True)#, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if result.returncode != 0:
         print(result.stdout.decode())
         print(result.stderr.decode())

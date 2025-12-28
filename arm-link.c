@@ -24,8 +24,24 @@
 #define RELOCATE_DLLPLT 1
 
 enum float_abi {
-  ARM_SOFTFP_FLOAT,
-  ARM_HARD_FLOAT,
+  ARM_SOFT_FLOAT,   /* Pure software FP - no FPU instructions, soft ABI */
+  ARM_SOFTFP_FLOAT, /* Software FP calling convention, but can use FPU */
+  ARM_HARD_FLOAT,   /* Hardware FP calling convention with FPU */
+};
+
+/* ARM FPU types for -mfpu option */
+enum arm_fpu_type {
+  ARM_FPU_AUTO = 0,    /* Auto-detect or use default */
+  ARM_FPU_NONE,        /* No FPU */
+  ARM_FPU_VFP,         /* VFPv2 (ARM1136JF-S, etc.) */
+  ARM_FPU_VFPV3,       /* VFPv3 or VFPv3-D16 */
+  ARM_FPU_VFPV4,       /* VFPv4 or VFPv4-D16 */
+  ARM_FPU_FPV4_SP_D16, /* FPv4-SP-D16 (Cortex-M4) - single precision only */
+  ARM_FPU_FPV5_SP_D16, /* FPv5-SP-D16 (Cortex-M7, ARMv8-M) - single precision */
+  ARM_FPU_FPV5_D16,    /* FPv5-D16 (Cortex-M7, ARMv8-M) - single+double */
+  ARM_FPU_NEON,        /* NEON with VFPv3 */
+  ARM_FPU_NEON_VFPV4,  /* NEON with VFPv4 */
+  ARM_FPU_NEON_FP_ARMV8, /* NEON with ARMv8 FP */
 };
 
 #else /* !TARGET_DEFS_ONLY */

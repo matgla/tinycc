@@ -306,16 +306,16 @@ thumb_opcode th_lsl_reg(uint32_t rd, uint32_t rn, uint32_t rm,
 thumb_opcode th_lsl_imm(uint32_t rd, uint32_t rn, uint32_t imm,
                         thumb_flags_behaviour flags,
                         thumb_enforce_encoding encoding);
-thumb_opcode th_lsr_reg(uint16_t rd, uint16_t rn, uint16_t rm,
+thumb_opcode th_lsr_reg(uint32_t rd, uint32_t rn, uint32_t rm,
+                        thumb_flags_behaviour flags, thumb_shift shift,
+                        thumb_enforce_encoding encoding);
+thumb_opcode th_lsr_imm(uint32_t rd, uint32_t rm, uint32_t imm,
                         thumb_flags_behaviour flags,
                         thumb_enforce_encoding encoding);
-thumb_opcode th_lsr_imm(uint16_t rd, uint16_t rm, uint32_t imm,
-                        thumb_flags_behaviour flags,
+thumb_opcode th_asr_reg(uint32_t rd, uint32_t rn, uint32_t rm,
+                        thumb_flags_behaviour flags, thumb_shift shift,
                         thumb_enforce_encoding encoding);
-thumb_opcode th_asr_reg(uint16_t rd, uint16_t rn, uint16_t rm,
-                        thumb_flags_behaviour flags,
-                        thumb_enforce_encoding encoding);
-thumb_opcode th_asr_imm(uint16_t rd, uint16_t rm, uint32_t imm,
+thumb_opcode th_asr_imm(uint32_t rd, uint32_t rm, uint32_t imm,
                         thumb_flags_behaviour flags,
                         thumb_enforce_encoding encoding);
 thumb_opcode th_ror_reg(uint16_t rd, uint16_t rn, uint16_t rm,
@@ -328,6 +328,15 @@ thumb_opcode th_ror_imm(uint16_t rd, uint16_t rm, uint32_t imm,
 thumb_opcode th_cmp_imm(uint32_t rd, uint32_t rn, uint32_t imm,
                         thumb_flags_behaviour flags,
                         thumb_enforce_encoding encoding);
+
+/* VFP arithmetic instructions */
+thumb_opcode th_vadd_f(uint32_t vd, uint32_t vn, uint32_t vm, uint32_t sz);
+thumb_opcode th_vsub_f(uint32_t vd, uint32_t vn, uint32_t vm, uint32_t sz);
+thumb_opcode th_vmul_f(uint32_t vd, uint32_t vn, uint32_t vm, uint32_t sz);
+thumb_opcode th_vdiv_f(uint32_t vd, uint32_t vn, uint32_t vm, uint32_t sz);
+thumb_opcode th_vneg_f(uint32_t vd, uint32_t vm, uint32_t sz);
+thumb_opcode th_vcmp_f(uint32_t vd, uint32_t vm, uint32_t sz);
+thumb_opcode th_vcmpe_f(uint32_t vd, uint32_t vm, uint32_t sz);
 
 thumb_opcode th_vpush(uint32_t regs, uint32_t is_doubleword);
 thumb_opcode th_vpop(uint32_t regs, uint32_t is_doubleword);

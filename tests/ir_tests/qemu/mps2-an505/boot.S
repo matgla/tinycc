@@ -106,6 +106,15 @@ __isr_vector:
 .type Reset_Handler, %function
 .thumb_func
 Reset_Handler:
+    /* Enable FPU: set CP10 and CP11 to full access in CPACR */
+    movw r0, #0xED88            /* CPACR address low */
+    movt r0, #0xE000            /* CPACR address high */
+    ldr r1, [r0]
+    orr r1, r1, #(0xF << 20)    /* Set CP10 and CP11 to full access */
+    str r1, [r0]
+    dsb                         /* Data Synchronization Barrier */
+    isb                         /* Instruction Synchronization Barrier */
+
     bl _mainCRTStartup
     /* If main returns, loop forever */
 .Lloop_forever:

@@ -151,6 +151,9 @@ int ld_script_find_or_create_symbol(LDScript *ld, const char *name);
 /* Check if section matches a pattern */
 int ld_section_matches_pattern(const char *section_name, const char *pattern);
 
+/* Check if section should be kept based on KEEP() directives */
+int ld_section_should_keep(LDScript *ld, const char *section_name);
+
 /* Debug: print linker script contents */
 void ld_script_dump(LDScript *ld);
 

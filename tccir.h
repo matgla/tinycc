@@ -60,6 +60,17 @@ typedef enum TccIrOp {
   TCCIR_OP_LOAD,
   TCCIR_OP_STORE,
   TCCIR_OP_ASSIGN,
+  /* Floating point operations */
+  TCCIR_OP_FADD, /* float/double addition */
+  TCCIR_OP_FSUB, /* float/double subtraction */
+  TCCIR_OP_FMUL, /* float/double multiplication */
+  TCCIR_OP_FDIV, /* float/double division */
+  TCCIR_OP_FNEG, /* float/double negation */
+  TCCIR_OP_FCMP, /* float/double comparison */
+  /* Floating point conversion operations */
+  TCCIR_OP_CVT_FTOF, /* float to double or double to float */
+  TCCIR_OP_CVT_ITOF, /* int to float/double */
+  TCCIR_OP_CVT_FTOI, /* float/double to int */
 } TccIrOp;
 
 typedef struct CType CType;
@@ -81,9 +92,17 @@ typedef struct IRVregReplacement {
 typedef struct IRLiveInterval {
   uint8_t start_within_if : 1; // whether the interval starts within an if block
   uint8_t addrtaken : 1;       // whether the variable's address is taken
+  uint8_t is_float : 1;        // whether this is a float/double variable
+  uint8_t is_double : 1;       // whether this is a double (vs float)
+  uint8_t is_llong : 1;        // whether this is a long long (64-bit int)
+  uint8_t use_vfp : 1;         // whether to use VFP registers (hard float)
   uint32_t start;              // start instruction index
   uint32_t end;                // end instruction index
   IRVregReplacement allocation;
+  int8_t
+      incoming_reg0; // for params: which register arg arrives in (-1 if stack)
+  int8_t
+      incoming_reg1; // for doubles: second register (-1 if not double or stack)
 } IRLiveInterval;
 
 typedef struct TCCIRState {
@@ -137,6 +156,11 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2,
 int tcc_ir_get_vreg_temp(TCCIRState *ir);
 int tcc_ir_get_vreg_var(TCCIRState *ir);
 int tcc_ir_get_vreg_param(TCCIRState *ir);
+
+void tcc_ir_set_float_type(TCCIRState *ir, int vreg, int is_float,
+                           int is_double);
+void tcc_ir_set_llong_type(TCCIRState *ir, int vreg);
+int tcc_ir_get_reg_type(TCCIRState *ir, int vreg);
 
 void tcc_ir_liveness_analysis(TCCIRState *ir);
 void tcc_ir_register_allocation_params(TCCIRState *ir);
