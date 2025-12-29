@@ -2409,17 +2409,9 @@ static int layout_sections(TCCState *s1, int *sec_order, struct dyn_inf *d) {
       int ld_idx = ld_find_output_section_idx(s1, s->name, &pat_idx);
       if (ld_idx >= 0) {
         int new_mr = s1->ld_script->output_sections[ld_idx].memory_region_idx;
-        printf(
-            "layout: section %s -> output section %d (%s) memory_region=%d\n",
-            s->name, ld_idx, s1->ld_script->output_sections[ld_idx].name,
-            new_mr);
         if (new_mr >= 0 && new_mr < s1->ld_script->nb_memory_regions) {
           if (new_mr != cur_mr) {
             /* Save current region's address and switch to new region */
-            printf("  switching from region %d (addr=%lx) to region %d "
-                   "(addr=%lx)\n",
-                   cur_mr, (unsigned long)addr, new_mr,
-                   (unsigned long)mr_addr[new_mr]);
             mr_addr[cur_mr] = addr;
             cur_mr = new_mr;
             addr = mr_addr[cur_mr];

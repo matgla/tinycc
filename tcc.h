@@ -935,7 +935,7 @@ struct TCCState {
   int parameters_registers;
   int registers_for_allocator;
   uint64_t registers_map_for_allocator;
-  int float_registers_for_allocator;
+  uint8_t float_registers_for_allocator;
   uint64_t float_registers_map_for_allocator;
   uint8_t omit_frame_pointer;
   uint8_t need_frame_pointer;
@@ -1700,6 +1700,35 @@ ST_FUNC void gen_cvt_sxtw(void);
 ST_FUNC void gen_cvt_csti(int t);
 #endif
 
+typedef struct FloatingPointConfig {
+  int8_t reg_size;
+  int8_t reg_count;
+  int8_t stack_align;
+  int32_t has_fadd : 1;
+  int32_t has_fsub : 1;
+  int32_t has_fmul : 1;
+  int32_t has_fdiv : 1;
+  int32_t has_fcmp : 1;
+  int32_t has_ftof : 1;
+  int32_t has_itof : 1;
+  int32_t has_ftod : 1;
+  int32_t has_ftoi : 1;
+  int32_t has_dadd : 1;
+  int32_t has_dsub : 1;
+  int32_t has_dmul : 1;
+  int32_t has_ddiv : 1;
+  int32_t has_dcmp : 1;
+  int32_t has_dtof : 1;
+  int32_t has_itod : 1;
+  int32_t has_dtoi : 1;
+  int32_t has_ltod : 1;
+  int32_t has_ltof : 1;
+  int32_t has_dtol : 1;
+  int32_t has_ftol : 1;
+  int32_t has_fneg : 1;
+  int32_t has_dneg : 1;
+} FloatingPointConfig;
+
 typedef struct ArchitectureConfig {
   int8_t pointer_size;
   int8_t stack_align;
@@ -1707,9 +1736,10 @@ typedef struct ArchitectureConfig {
   int8_t scratch_register;
   int8_t parameter_registers;
   int8_t has_fpu : 1;
+  const FloatingPointConfig *fpu;
 } ArchitectureConfig;
 
-extern const ArchitectureConfig architecture_config;
+extern ArchitectureConfig architecture_config;
 
 /* ------------ arm-gen.c ------------ */
 #if defined(TCC_TARGET_ARM) || defined(TCC_TARGET_ARM_THUMB)
@@ -1866,15 +1896,20 @@ ST_FUNC void tcc_gen_machine_return_value_op(TACQuadruple *q);
 ST_FUNC void tcc_gen_machine_epilog(int leaffunc);
 ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers,
                                     int stack_size);
-ST_FUNC void tcc_gen_machine_func_param_op(TACQuadruple *q, int param_num);
+ST_FUNC void tcc_gen_machine_func_param_op(TACQuadruple *q, int param_num,
+                                           int instruction_index);
 ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_value);
 ST_FUNC void tcc_gen_machine_save_call_context(void);
 ST_FUNC void tcc_gen_machine_restore_call_context(void);
-ST_FUNC void tcc_gen_machine_move_reg(int dest, int src);
 ST_FUNC void tcc_gen_machine_jump_op(TACQuadruple *q);
 ST_FUNC void tcc_gen_machine_conditional_jump_op(TACQuadruple *q);
 ST_FUNC void tcc_gen_machine_setif_op(TACQuadruple *q);
 ST_FUNC void tcc_gen_machine_backpatch_jump(int address, int offset);
+
+ST_FUNC const char *tcc_get_abi_softcall_name(TACQuadruple *q);
+
+ST_FUNC int tcc_is_64bit_operand(SValue *sv);
+ST_FUNC int tcc_has_quadruple_64bit_operand(TACQuadruple *q);
 
 #define stab_section s1->stab_section
 #define stabstr_section stab_section->link
@@ -2012,7 +2047,8 @@ PUB_FUNC void tcc_exit_state(TCCState *s1);
 void dbg_print_vstack(const char *msg, const char *file, int line);
 
 #define CEIL_DIV(x, y) (((x) + (y) - 1) / (y))
-#define ALIGN(x, alignment) (((x) + (alignment) - 1) & ~((alignment) - 1))
+#define TCC_ALIGN(x, alignment) (((x) + (alignment) - 1) & ~((alignment) - 1))
+#define ALIGN TCC_ALIGN
 
 // debug helper
 #if 0

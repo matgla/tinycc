@@ -436,3 +436,15 @@ redo:
     fclose(ppfp);
   return ret;
 }
+
+ST_FUNC int tcc_is_64bit_operand(SValue *sv) {
+  const int vt = sv->type.t & VT_BTYPE;
+  if (sv == NULL) {
+    return 0;
+  }
+
+  if ((vt == VT_LLONG) || (vt == VT_DOUBLE)) {
+    return 1;
+  }
+  return 0;
+}

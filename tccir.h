@@ -26,7 +26,8 @@
 
 #define PREG_SPILLED 0x80
 
-typedef enum TccIrOp {
+typedef enum TccIrOp
+{
   TCCIR_OP_ADD,
   TCCIR_OP_ADC_USE,
   TCCIR_OP_ADC_GEN,
@@ -83,29 +84,32 @@ typedef struct Sym Sym;
  * Using 0xFFFFFFFF since instruction indices are non-negative. */
 #define INTERVAL_NOT_STARTED 0xFFFFFFFF
 
-typedef struct IRVregReplacement {
+typedef struct IRVregReplacement
+{
   uint16_t r0; // first physical register
   uint16_t r1; // second physical register (for long long)
   int offset;  // stack offset if spilled
 } IRVregReplacement;
 
-typedef struct IRLiveInterval {
+typedef struct IRLiveInterval
+{
   uint8_t start_within_if : 1; // whether the interval starts within an if block
   uint8_t addrtaken : 1;       // whether the variable's address is taken
   uint8_t is_float : 1;        // whether this is a float/double variable
   uint8_t is_double : 1;       // whether this is a double (vs float)
   uint8_t is_llong : 1;        // whether this is a long long (64-bit int)
   uint8_t use_vfp : 1;         // whether to use VFP registers (hard float)
-  uint32_t start;              // start instruction index
-  uint32_t end;                // end instruction index
+  uint8_t is_lvalue : 1;
+  uint32_t start; // start instruction index
+  uint32_t end;   // end instruction index
   IRVregReplacement allocation;
-  int8_t
-      incoming_reg0; // for params: which register arg arrives in (-1 if stack)
-  int8_t
-      incoming_reg1; // for doubles: second register (-1 if not double or stack)
+  int8_t incoming_reg0;    // for params: which register arg arrives in (-1 if stack)
+  int8_t incoming_reg1;    // for doubles: second register (-1 if not double or stack)
+  int16_t original_offset; // for params: original offset from function entry point
 } IRLiveInterval;
 
-typedef struct TCCIRState {
+typedef struct TCCIRState
+{
   // number of function parameters
   int8_t parameters_count;
 
@@ -150,16 +154,15 @@ int tcc_ir_gvtst(TCCIRState *ir, int inv, int t);
 
 void tcc_ir_gen_opi(TCCIRState *ir, int op);
 void tcc_ir_gen_opf(TCCIRState *ir, int op);
-int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2,
-               SValue *dest);
+int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *dest);
 
 int tcc_ir_get_vreg_temp(TCCIRState *ir);
 int tcc_ir_get_vreg_var(TCCIRState *ir);
 int tcc_ir_get_vreg_param(TCCIRState *ir);
 
-void tcc_ir_set_float_type(TCCIRState *ir, int vreg, int is_float,
-                           int is_double);
+void tcc_ir_set_float_type(TCCIRState *ir, int vreg, int is_float, int is_double);
 void tcc_ir_set_llong_type(TCCIRState *ir, int vreg);
+void tcc_ir_set_original_offset(TCCIRState *ir, int vreg, int offset);
 int tcc_ir_get_reg_type(TCCIRState *ir, int vreg);
 
 void tcc_ir_liveness_analysis(TCCIRState *ir);
@@ -167,8 +170,7 @@ void tcc_ir_register_allocation_params(TCCIRState *ir);
 void tcc_ir_generate_code(TCCIRState *ir);
 
 int tcc_ir_add_local_variable(TCCIRState *ir, Sym *sym, int stack_offset);
-void tcc_ir_assign_physical_register(TCCIRState *ir, int vreg, int offset,
-                                     int r0, int r1);
+void tcc_ir_assign_physical_register(TCCIRState *ir, int vreg, int offset, int r0, int r1);
 const char *tcc_ir_get_op_name(TccIrOp op);
 void tcc_ir_show(TCCIRState *ir);
 void tcc_ir_drop_return_value(TCCIRState *ir);
@@ -185,7 +187,11 @@ void tcc_ir_print_vreg(int vreg);
 void tcc_ir_generate_cmp_jmp_set(TCCIRState *ir);
 void tcc_ir_start_basic_block(TCCIRState *ir);
 
-typedef enum TCCIR_VREG_TYPE {
+/* Check if FPU supports double precision (defined in arm-thumb-gen.c) */
+int arm_fpu_supports_double(int fpu_type);
+
+typedef enum TCCIR_VREG_TYPE
+{
   TCCIR_VREG_TYPE_VAR = 1,
   TCCIR_VREG_TYPE_TEMP = 2,
   TCCIR_VREG_TYPE_PARAM = 3,

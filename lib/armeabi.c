@@ -22,158 +22,163 @@ THE SOFTWARE.*/
 #include <stddef.h>
 
 /* Helper union for accessing double bits */
-typedef union {
-  double d;
-  unsigned long long ull;
-  struct {
-    unsigned int low;
-    unsigned int high;
-  } parts;
-} double_bits;
+// typedef union {
+//   double d;
+//   unsigned long long ull;
+//   struct {
+//     unsigned int low;
+//     unsigned int high;
+//   } parts;
+// } double_bits;
 
-/* Check if double is NaN - using 32-bit parts only */
-static int is_nan_d_parts(unsigned int high, unsigned int low) {
-  unsigned int exp = (high >> 20) & 0x7FF;
-  unsigned int frac_high = high & 0xFFFFF;
-  if (exp != 0x7FF)
-    return 0;
-  if (frac_high != 0)
-    return 1;
-  if (low != 0)
-    return 1;
-  return 0;
-}
+// /* Check if double is NaN - using 32-bit parts only */
+// static int is_nan_d_parts(unsigned int high, unsigned int low) {
+//   unsigned int exp = (high >> 20) & 0x7FF;
+//   unsigned int frac_high = high & 0xFFFFF;
+//   if (exp != 0x7FF)
+//     return 0;
+//   if (frac_high != 0)
+//     return 1;
+//   if (low != 0)
+//     return 1;
+//   return 0;
+// }
 
-/* Bit-level double comparison using 32-bit parts only
-   returns -1 if a<b, 0 if a==b, 1 if a>b */
-static int dcmp_bits_parts(unsigned int a_high, unsigned int a_low,
-                           unsigned int b_high, unsigned int b_low) {
-  int sign_a = (a_high >> 31) & 1;
-  int sign_b = (b_high >> 31) & 1;
+// /* Bit-level double comparison using 32-bit parts only
+//    returns -1 if a<b, 0 if a==b, 1 if a>b */
+// static int dcmp_bits_parts(unsigned int a_high, unsigned int a_low,
+//                            unsigned int b_high, unsigned int b_low) {
+//   int sign_a = (a_high >> 31) & 1;
+//   int sign_b = (b_high >> 31) & 1;
 
-  /* Handle zero cases - both +0.0 and -0.0 are equal */
-  unsigned int a_high_abs = a_high & 0x7FFFFFFF;
-  unsigned int b_high_abs = b_high & 0x7FFFFFFF;
-  if (a_high_abs == 0 && a_low == 0 && b_high_abs == 0 && b_low == 0) {
-    return 0;
-  }
+//   /* Handle zero cases - both +0.0 and -0.0 are equal */
+//   unsigned int a_high_abs = a_high & 0x7FFFFFFF;
+//   unsigned int b_high_abs = b_high & 0x7FFFFFFF;
+//   if (a_high_abs == 0 && a_low == 0 && b_high_abs == 0 && b_low == 0) {
+//     return 0;
+//   }
 
-  /* Different signs */
-  if (sign_a != sign_b) {
-    if (sign_a)
-      return -1;
-    return 1;
-  }
+//   /* Different signs */
+//   if (sign_a != sign_b) {
+//     if (sign_a)
+//       return -1;
+//     return 1;
+//   }
 
-  /* Same sign - compare magnitude */
-  if (sign_a == 0) {
-    /* Both positive */
-    if (a_high > b_high)
-      return 1;
-    if (a_high < b_high)
-      return -1;
-    if (a_low > b_low)
-      return 1;
-    if (a_low < b_low)
-      return -1;
-    return 0;
-  }
-  /* Both negative - reverse comparison */
-  if (a_high > b_high)
-    return -1;
-  if (a_high < b_high)
-    return 1;
-  if (a_low > b_low)
-    return -1;
-  if (a_low < b_low)
-    return 1;
-  return 0;
-}
+//   /* Same sign - compare magnitude */
+//   if (sign_a == 0) {
+//     /* Both positive */
+//     if (a_high > b_high)
+//       return 1;
+//     if (a_high < b_high)
+//       return -1;
+//     if (a_low > b_low)
+//       return 1;
+//     if (a_low < b_low)
+//       return -1;
+//     return 0;
+//   }
+//   /* Both negative - reverse comparison */
+//   if (a_high > b_high)
+//     return -1;
+//   if (a_high < b_high)
+//     return 1;
+//   if (a_low > b_low)
+//     return -1;
+//   if (a_low < b_low)
+//     return 1;
+//   return 0;
+// }
 
 /* Double precision comparison functions */
 int __aeabi_dcmpun(double a, double b) {
-  double_bits ba, bb;
-  ba.d = a;
-  bb.d = b;
-  if (is_nan_d_parts(ba.parts.high, ba.parts.low))
-    return 1;
-  if (is_nan_d_parts(bb.parts.high, bb.parts.low))
-    return 1;
+  // double_bits ba, bb;
+  // ba.d = a;
+  // bb.d = b;
+  // if (is_nan_d_parts(ba.parts.high, ba.parts.low))
+  //   return 1;
+  // if (is_nan_d_parts(bb.parts.high, bb.parts.low))
+  //   return 1;
   return 0;
 }
 
 int __aeabi_dcmple(double a, double b) {
-  double_bits ba, bb;
-  ba.d = a;
-  bb.d = b;
-  if (is_nan_d_parts(ba.parts.high, ba.parts.low))
-    return 0;
-  if (is_nan_d_parts(bb.parts.high, bb.parts.low))
-    return 0;
-  int cmp =
-      dcmp_bits_parts(ba.parts.high, ba.parts.low, bb.parts.high, bb.parts.low);
-  if (cmp <= 0)
-    return 1;
+  // double_bits ba, bb;
+  // ba.d = a;
+  // bb.d = b;
+  // if (is_nan_d_parts(ba.parts.high, ba.parts.low))
+  //   return 0;
+  // if (is_nan_d_parts(bb.parts.high, bb.parts.low))
+  //   return 0;
+  // int cmp =
+  //     dcmp_bits_parts(ba.parts.high, ba.parts.low, bb.parts.high,
+  //     bb.parts.low);
+  // if (cmp <= 0)
+  //   return 1;
   return 0;
 }
 
 int __aeabi_dcmplt(double a, double b) {
-  double_bits ba, bb;
-  ba.d = a;
-  bb.d = b;
-  if (is_nan_d_parts(ba.parts.high, ba.parts.low))
-    return 0;
-  if (is_nan_d_parts(bb.parts.high, bb.parts.low))
-    return 0;
-  int cmp =
-      dcmp_bits_parts(ba.parts.high, ba.parts.low, bb.parts.high, bb.parts.low);
-  if (cmp < 0)
-    return 1;
+  // double_bits ba, bb;
+  // ba.d = a;
+  // bb.d = b;
+  // if (is_nan_d_parts(ba.parts.high, ba.parts.low))
+  //   return 0;
+  // if (is_nan_d_parts(bb.parts.high, bb.parts.low))
+  //   return 0;
+  // int cmp =
+  //     dcmp_bits_parts(ba.parts.high, ba.parts.low, bb.parts.high,
+  //     bb.parts.low);
+  // if (cmp < 0)
+  //   return 1;
   return 0;
 }
 
 int __aeabi_dcmpeq(double a, double b) {
-  double_bits ba, bb;
-  ba.d = a;
-  bb.d = b;
-  if (is_nan_d_parts(ba.parts.high, ba.parts.low))
-    return 0;
-  if (is_nan_d_parts(bb.parts.high, bb.parts.low))
-    return 0;
-  int cmp =
-      dcmp_bits_parts(ba.parts.high, ba.parts.low, bb.parts.high, bb.parts.low);
-  if (cmp == 0)
-    return 1;
+  // double_bits ba, bb;
+  // ba.d = a;
+  // bb.d = b;
+  // if (is_nan_d_parts(ba.parts.high, ba.parts.low))
+  //   return 0;
+  // if (is_nan_d_parts(bb.parts.high, bb.parts.low))
+  //   return 0;
+  // int cmp =
+  //     dcmp_bits_parts(ba.parts.high, ba.parts.low, bb.parts.high,
+  //     bb.parts.low);
+  // if (cmp == 0)
+  //   return 1;
   return 0;
 }
 
 int __aeabi_dcmpge(double a, double b) {
-  double_bits ba, bb;
-  ba.d = a;
-  bb.d = b;
-  if (is_nan_d_parts(ba.parts.high, ba.parts.low))
-    return 0;
-  if (is_nan_d_parts(bb.parts.high, bb.parts.low))
-    return 0;
-  int cmp =
-      dcmp_bits_parts(ba.parts.high, ba.parts.low, bb.parts.high, bb.parts.low);
-  if (cmp >= 0)
-    return 1;
+  // double_bits ba, bb;
+  // ba.d = a;
+  // bb.d = b;
+  // if (is_nan_d_parts(ba.parts.high, ba.parts.low))
+  //   return 0;
+  // if (is_nan_d_parts(bb.parts.high, bb.parts.low))
+  //   return 0;
+  // int cmp =
+  //     dcmp_bits_parts(ba.parts.high, ba.parts.low, bb.parts.high,
+  //     bb.parts.low);
+  // if (cmp >= 0)
+  //   return 1;
   return 0;
 }
 
 int __aeabi_dcmpgt(double a, double b) {
-  double_bits ba, bb;
-  ba.d = a;
-  bb.d = b;
-  if (is_nan_d_parts(ba.parts.high, ba.parts.low))
-    return 0;
-  if (is_nan_d_parts(bb.parts.high, bb.parts.low))
-    return 0;
-  int cmp =
-      dcmp_bits_parts(ba.parts.high, ba.parts.low, bb.parts.high, bb.parts.low);
-  if (cmp > 0)
-    return 1;
+  // double_bits ba, bb;
+  // ba.d = a;
+  // bb.d = b;
+  // if (is_nan_d_parts(ba.parts.high, ba.parts.low))
+  //   return 0;
+  // if (is_nan_d_parts(bb.parts.high, bb.parts.low))
+  //   return 0;
+  // int cmp =
+  //     dcmp_bits_parts(ba.parts.high, ba.parts.low, bb.parts.high,
+  //     bb.parts.low);
+  // if (cmp > 0)
+  //   return 1;
   return 0;
 }
 
@@ -228,338 +233,346 @@ typedef union {
 
 /* Double to int conversion */
 int __aeabi_d2iz(double a) {
-  double_bits da;
-  da.d = a;
+  // double_bits da;
+  // da.d = a;
 
-  /* Extract sign, exponent, mantissa */
-  int sign = (da.parts.high >> 31) & 1;
-  int exp = (da.parts.high >> 20) & 0x7FF;
+  // /* Extract sign, exponent, mantissa */
+  // int sign = (da.parts.high >> 31) & 1;
+  // int exp = (da.parts.high >> 20) & 0x7FF;
 
-  /* Handle special cases */
-  if (exp == 0)
-    return 0; /* Zero or denormal */
-  if (exp == 0x7FF)
-    return 0; /* NaN or infinity */
+  // /* Handle special cases */
+  // if (exp == 0)
+  //   return 0; /* Zero or denormal */
+  // if (exp == 0x7FF)
+  //   return 0; /* NaN or infinity */
 
-  /* Compute actual exponent */
-  int actual_exp = exp - 1023;
+  // /* Compute actual exponent */
+  // int actual_exp = exp - 1023;
 
-  /* If exponent is negative, result is 0 */
-  if (actual_exp < 0)
-    return 0;
+  // /* If exponent is negative, result is 0 */
+  // if (actual_exp < 0)
+  //   return 0;
 
-  /* If exponent is too large, overflow */
-  if (actual_exp > 30)
-    return sign ? 0x80000000 : 0x7FFFFFFF;
+  // /* If exponent is too large, overflow */
+  // if (actual_exp > 30)
+  //   return sign ? 0x80000000 : 0x7FFFFFFF;
 
-  /* Extract mantissa (52 bits) and add implicit 1 */
-  unsigned long long mantissa =
-      ((unsigned long long)(da.parts.high & 0xFFFFF) << 32) | da.parts.low;
-  mantissa |= (1ULL << 52); /* Add implicit leading 1 */
+  // /* Extract mantissa (52 bits) and add implicit 1 */
+  // unsigned long long mantissa =
+  //     ((unsigned long long)(da.parts.high & 0xFFFFF) << 32) | da.parts.low;
+  // mantissa |= (1ULL << 52); /* Add implicit leading 1 */
 
-  /* Shift mantissa based on exponent */
-  int result;
-  if (actual_exp >= 52) {
-    result = mantissa << (actual_exp - 52);
-  } else {
-    result = mantissa >> (52 - actual_exp);
-  }
+  // /* Shift mantissa based on exponent */
+  // int result;
+  // if (actual_exp >= 52) {
+  //   result = mantissa << (actual_exp - 52);
+  // } else {
+  //   result = mantissa >> (52 - actual_exp);
+  // }
 
-  return sign ? -result : result;
+  // return sign ? -result : result;
+  return 0;
 }
 
 /* Int to double conversion */
 double __aeabi_i2d(int a) {
-  double_bits result;
+  // double_bits result;
 
-  if (a == 0) {
-    result.parts.high = 0;
-    result.parts.low = 0;
-    return result.d;
-  }
+  // if (a == 0) {
+  //   result.parts.high = 0;
+  //   result.parts.low = 0;
+  //   return result.d;
+  // }
 
-  /* Handle sign */
-  int sign = 0;
-  unsigned int abs_val = a;
-  if (a < 0) {
-    sign = 1;
-    abs_val = -a;
-  }
+  // /* Handle sign */
+  // int sign = 0;
+  // unsigned int abs_val = a;
+  // if (a < 0) {
+  //   sign = 1;
+  //   abs_val = -a;
+  // }
 
-  /* Find the highest set bit */
-  int shift = 0;
-  unsigned int temp = abs_val;
-  while (temp > 1) {
-    temp >>= 1;
-    shift++;
-  }
+  // /* Find the highest set bit */
+  // int shift = 0;
+  // unsigned int temp = abs_val;
+  // while (temp > 1) {
+  //   temp >>= 1;
+  //   shift++;
+  // }
 
-  /* Compute exponent (biased by 1023) */
-  int exp = shift + 1023;
+  // /* Compute exponent (biased by 1023) */
+  // int exp = shift + 1023;
 
-  /* Compute mantissa (52 bits, without implicit 1) */
-  unsigned long long mantissa;
-  if (shift >= 52) {
-    mantissa =
-        ((unsigned long long)abs_val >> (shift - 52)) & 0xFFFFFFFFFFFFFULL;
-  } else {
-    mantissa =
-        ((unsigned long long)abs_val << (52 - shift)) & 0xFFFFFFFFFFFFFULL;
-  }
+  // /* Compute mantissa (52 bits, without implicit 1) */
+  // unsigned long long mantissa;
+  // if (shift >= 52) {
+  //   mantissa =
+  //       ((unsigned long long)abs_val >> (shift - 52)) & 0xFFFFFFFFFFFFFULL;
+  // } else {
+  //   mantissa =
+  //       ((unsigned long long)abs_val << (52 - shift)) & 0xFFFFFFFFFFFFFULL;
+  // }
 
-  /* Pack into double */
-  result.parts.high = (sign << 31) | (exp << 20) | ((mantissa >> 32) & 0xFFFFF);
-  result.parts.low = mantissa & 0xFFFFFFFF;
+  // /* Pack into double */
+  // result.parts.high = (sign << 31) | (exp << 20) | ((mantissa >> 32) &
+  // 0xFFFFF); result.parts.low = mantissa & 0xFFFFFFFF;
 
-  return result.d;
+  // return result.d;
+  return 0;
 }
 
 /* Unsigned int to double conversion */
 double __aeabi_ui2d(unsigned int a) {
-  double_bits result;
+  // double_bits result;
 
-  if (a == 0) {
-    result.parts.high = 0;
-    result.parts.low = 0;
-    return result.d;
-  }
+  // if (a == 0) {
+  //   result.parts.high = 0;
+  //   result.parts.low = 0;
+  //   return result.d;
+  // }
 
-  /* Find the highest set bit */
-  int shift = 0;
-  unsigned int temp = a;
-  while (temp > 1) {
-    temp >>= 1;
-    shift++;
-  }
+  // /* Find the highest set bit */
+  // int shift = 0;
+  // unsigned int temp = a;
+  // while (temp > 1) {
+  //   temp >>= 1;
+  //   shift++;
+  // }
 
-  /* Compute exponent (biased by 1023) */
-  int exp = shift + 1023;
+  // /* Compute exponent (biased by 1023) */
+  // int exp = shift + 1023;
 
-  /* Compute mantissa (52 bits, without implicit 1) */
-  unsigned long long mantissa;
-  if (shift >= 52) {
-    mantissa = ((unsigned long long)a >> (shift - 52)) & 0xFFFFFFFFFFFFFULL;
-  } else {
-    mantissa = ((unsigned long long)a << (52 - shift)) & 0xFFFFFFFFFFFFFULL;
-  }
+  // /* Compute mantissa (52 bits, without implicit 1) */
+  // unsigned long long mantissa;
+  // if (shift >= 52) {
+  //   mantissa = ((unsigned long long)a >> (shift - 52)) & 0xFFFFFFFFFFFFFULL;
+  // } else {
+  //   mantissa = ((unsigned long long)a << (52 - shift)) & 0xFFFFFFFFFFFFFULL;
+  // }
 
-  /* Pack into double */
-  result.parts.high = (exp << 20) | ((mantissa >> 32) & 0xFFFFF);
-  result.parts.low = mantissa & 0xFFFFFFFF;
+  // /* Pack into double */
+  // result.parts.high = (exp << 20) | ((mantissa >> 32) & 0xFFFFF);
+  // result.parts.low = mantissa & 0xFFFFFFFF;
 
-  return result.d;
+  // return result.d;
+  return 0;
 }
 
 /* Float to int conversion */
 int __aeabi_f2iz(float a) {
-  float_bits fa;
-  fa.f = a;
+  // float_bits fa;
+  // fa.f = a;
 
-  /* Extract sign, exponent, mantissa */
-  int sign = (fa.ui >> 31) & 1;
-  int exp = (fa.ui >> 23) & 0xFF;
+  // /* Extract sign, exponent, mantissa */
+  // int sign = (fa.ui >> 31) & 1;
+  // int exp = (fa.ui >> 23) & 0xFF;
 
-  /* Handle special cases */
-  if (exp == 0)
-    return 0; /* Zero or denormal */
-  if (exp == 0xFF)
-    return 0; /* NaN or infinity */
+  // /* Handle special cases */
+  // if (exp == 0)
+  //   return 0; /* Zero or denormal */
+  // if (exp == 0xFF)
+  //   return 0; /* NaN or infinity */
 
-  /* Compute actual exponent */
-  int actual_exp = exp - 127;
+  // /* Compute actual exponent */
+  // int actual_exp = exp - 127;
 
-  /* If exponent is negative, result is 0 */
-  if (actual_exp < 0)
-    return 0;
+  // /* If exponent is negative, result is 0 */
+  // if (actual_exp < 0)
+  //   return 0;
 
-  /* If exponent is too large, overflow */
-  if (actual_exp > 30)
-    return sign ? 0x80000000 : 0x7FFFFFFF;
+  // /* If exponent is too large, overflow */
+  // if (actual_exp > 30)
+  //   return sign ? 0x80000000 : 0x7FFFFFFF;
 
-  /* Extract mantissa (23 bits) and add implicit 1 */
-  unsigned int mantissa = (fa.ui & 0x7FFFFF) | 0x800000;
+  // /* Extract mantissa (23 bits) and add implicit 1 */
+  // unsigned int mantissa = (fa.ui & 0x7FFFFF) | 0x800000;
 
-  /* Shift mantissa based on exponent */
-  int result;
-  if (actual_exp >= 23) {
-    result = mantissa << (actual_exp - 23);
-  } else {
-    result = mantissa >> (23 - actual_exp);
-  }
+  // /* Shift mantissa based on exponent */
+  // int result;
+  // if (actual_exp >= 23) {
+  //   result = mantissa << (actual_exp - 23);
+  // } else {
+  //   result = mantissa >> (23 - actual_exp);
+  // }
 
-  return sign ? -result : result;
+  // return sign ? -result : result;
+  return 0;
 }
 
 /* Int to float conversion */
 float __aeabi_i2f(int a) {
-  float_bits result;
+  // float_bits result;
 
-  if (a == 0) {
-    result.ui = 0;
-    return result.f;
-  }
+  // if (a == 0) {
+  //   result.ui = 0;
+  //   return result.f;
+  // }
 
-  /* Handle sign */
-  int sign = 0;
-  unsigned int abs_val = a;
-  if (a < 0) {
-    sign = 1;
-    abs_val = -a;
-  }
+  // /* Handle sign */
+  // int sign = 0;
+  // unsigned int abs_val = a;
+  // if (a < 0) {
+  //   sign = 1;
+  //   abs_val = -a;
+  // }
 
-  /* Find the highest set bit */
-  int shift = 0;
-  unsigned int temp = abs_val;
-  while (temp > 1) {
-    temp >>= 1;
-    shift++;
-  }
+  // /* Find the highest set bit */
+  // int shift = 0;
+  // unsigned int temp = abs_val;
+  // while (temp > 1) {
+  //   temp >>= 1;
+  //   shift++;
+  // }
 
-  /* Compute exponent (biased by 127) */
-  int exp = shift + 127;
+  // /* Compute exponent (biased by 127) */
+  // int exp = shift + 127;
 
-  /* Compute mantissa (23 bits, without implicit 1) */
-  unsigned int mantissa;
-  if (shift >= 23) {
-    mantissa = (abs_val >> (shift - 23)) & 0x7FFFFF;
-  } else {
-    mantissa = (abs_val << (23 - shift)) & 0x7FFFFF;
-  }
+  // /* Compute mantissa (23 bits, without implicit 1) */
+  // unsigned int mantissa;
+  // if (shift >= 23) {
+  //   mantissa = (abs_val >> (shift - 23)) & 0x7FFFFF;
+  // } else {
+  //   mantissa = (abs_val << (23 - shift)) & 0x7FFFFF;
+  // }
 
-  /* Pack into float */
-  result.ui = (sign << 31) | (exp << 23) | mantissa;
+  // /* Pack into float */
+  // result.ui = (sign << 31) | (exp << 23) | mantissa;
 
-  return result.f;
+  // return result.f;
+  return 0;
 }
 
 /* Unsigned int to float conversion */
 float __aeabi_ui2f(unsigned int a) {
-  float_bits result;
+  // float_bits result;
 
-  if (a == 0) {
-    result.ui = 0;
-    return result.f;
-  }
+  // if (a == 0) {
+  //   result.ui = 0;
+  //   return result.f;
+  // }
 
-  /* Find the highest set bit */
-  int shift = 0;
-  unsigned int temp = a;
-  while (temp > 1) {
-    temp >>= 1;
-    shift++;
-  }
+  // /* Find the highest set bit */
+  // int shift = 0;
+  // unsigned int temp = a;
+  // while (temp > 1) {
+  //   temp >>= 1;
+  //   shift++;
+  // }
 
-  /* Compute exponent (biased by 127) */
-  int exp = shift + 127;
+  // /* Compute exponent (biased by 127) */
+  // int exp = shift + 127;
 
-  /* Compute mantissa (23 bits, without implicit 1) */
-  unsigned int mantissa;
-  if (shift >= 23) {
-    mantissa = (a >> (shift - 23)) & 0x7FFFFF;
-  } else {
-    mantissa = (a << (23 - shift)) & 0x7FFFFF;
-  }
+  // /* Compute mantissa (23 bits, without implicit 1) */
+  // unsigned int mantissa;
+  // if (shift >= 23) {
+  //   mantissa = (a >> (shift - 23)) & 0x7FFFFF;
+  // } else {
+  //   mantissa = (a << (23 - shift)) & 0x7FFFFF;
+  // }
 
-  /* Pack into float */
-  result.ui = (exp << 23) | mantissa;
+  // /* Pack into float */
+  // result.ui = (exp << 23) | mantissa;
 
-  return result.f;
+  // return result.f;s
+  return 0;
 }
 
 /* Double to float conversion */
 float __aeabi_d2f(double a) {
-  double_bits da;
-  float_bits result;
-  da.d = a;
+  // double_bits da;
+  // float_bits result;
+  // da.d = a;
 
-  /* Extract sign, exponent, mantissa from double */
-  int sign = (da.parts.high >> 31) & 1;
-  int exp = (da.parts.high >> 20) & 0x7FF;
-  unsigned long long mantissa =
-      ((unsigned long long)(da.parts.high & 0xFFFFF) << 32) | da.parts.low;
+  // /* Extract sign, exponent, mantissa from double */
+  // int sign = (da.parts.high >> 31) & 1;
+  // int exp = (da.parts.high >> 20) & 0x7FF;
+  // unsigned long long mantissa =
+  //     ((unsigned long long)(da.parts.high & 0xFFFFF) << 32) | da.parts.low;
 
-  /* Handle special cases */
-  if (exp == 0) {
-    /* Zero or denormal */
-    result.ui = sign << 31;
-    return result.f;
-  }
-  if (exp == 0x7FF) {
-    /* NaN or infinity */
-    if (mantissa != 0) {
-      result.ui = (sign << 31) | 0x7FC00000; /* NaN */
-    } else {
-      result.ui = (sign << 31) | 0x7F800000; /* Infinity */
-    }
-    return result.f;
-  }
+  // /* Handle special cases */
+  // if (exp == 0) {
+  //   /* Zero or denormal */
+  //   result.ui = sign << 31;
+  //   return result.f;
+  // }
+  // if (exp == 0x7FF) {
+  //   /* NaN or infinity */
+  //   if (mantissa != 0) {
+  //     result.ui = (sign << 31) | 0x7FC00000; /* NaN */
+  //   } else {
+  //     result.ui = (sign << 31) | 0x7F800000; /* Infinity */
+  //   }
+  //   return result.f;
+  // }
 
-  /* Convert exponent from double (bias 1023) to float (bias 127) */
-  int new_exp = exp - 1023 + 127;
+  // /* Convert exponent from double (bias 1023) to float (bias 127) */
+  // int new_exp = exp - 1023 + 127;
 
-  /* Check for overflow/underflow */
-  if (new_exp >= 0xFF) {
-    /* Overflow to infinity */
-    result.ui = (sign << 31) | 0x7F800000;
-    return result.f;
-  }
-  if (new_exp <= 0) {
-    /* Underflow to zero */
-    result.ui = sign << 31;
-    return result.f;
-  }
+  // /* Check for overflow/underflow */
+  // if (new_exp >= 0xFF) {
+  //   /* Overflow to infinity */
+  //   result.ui = (sign << 31) | 0x7F800000;
+  //   return result.f;
+  // }
+  // if (new_exp <= 0) {
+  //   /* Underflow to zero */
+  //   result.ui = sign << 31;
+  //   return result.f;
+  // }
 
-  /* Convert mantissa from 52 bits to 23 bits */
-  unsigned int new_mantissa = (mantissa >> 29) & 0x7FFFFF;
+  // /* Convert mantissa from 52 bits to 23 bits */
+  // unsigned int new_mantissa = (mantissa >> 29) & 0x7FFFFF;
 
-  /* Pack into float */
-  result.ui = (sign << 31) | (new_exp << 23) | new_mantissa;
+  // /* Pack into float */
+  // result.ui = (sign << 31) | (new_exp << 23) | new_mantissa;
 
-  return result.f;
+  // return result.f;
+  return 0;
 }
 
 /* Float to double conversion */
 double __aeabi_f2d(float a) {
-  float_bits fa;
-  double_bits result;
-  fa.f = a;
+  // float_bits fa;
+  // double_bits result;
+  // fa.f = a;
 
-  /* Extract sign, exponent, mantissa from float */
-  int sign = (fa.ui >> 31) & 1;
-  int exp = (fa.ui >> 23) & 0xFF;
-  unsigned int mantissa = fa.ui & 0x7FFFFF;
+  // /* Extract sign, exponent, mantissa from float */
+  // int sign = (fa.ui >> 31) & 1;
+  // int exp = (fa.ui >> 23) & 0xFF;
+  // unsigned int mantissa = fa.ui & 0x7FFFFF;
 
-  /* Handle special cases */
-  if (exp == 0) {
-    /* Zero or denormal */
-    result.parts.high = sign << 31;
-    result.parts.low = 0;
-    return result.d;
-  }
-  if (exp == 0xFF) {
-    /* NaN or infinity */
-    result.parts.high = (sign << 31) | (0x7FF << 20);
-    if (mantissa != 0) {
-      result.parts.high |= 0x80000; /* NaN */
-      result.parts.low = 0;
-    } else {
-      result.parts.low = 0; /* Infinity */
-    }
-    return result.d;
-  }
+  // /* Handle special cases */
+  // if (exp == 0) {
+  //   /* Zero or denormal */
+  //   result.parts.high = sign << 31;
+  //   result.parts.low = 0;
+  //   return result.d;
+  // }
+  // if (exp == 0xFF) {
+  //   /* NaN or infinity */
+  //   result.parts.high = (sign << 31) | (0x7FF << 20);
+  //   if (mantissa != 0) {
+  //     result.parts.high |= 0x80000; /* NaN */
+  //     result.parts.low = 0;
+  //   } else {
+  //     result.parts.low = 0; /* Infinity */
+  //   }
+  //   return result.d;
+  // }
 
-  /* Convert exponent from float (bias 127) to double (bias 1023) */
-  int new_exp = exp - 127 + 1023;
+  // /* Convert exponent from float (bias 127) to double (bias 1023) */
+  // int new_exp = exp - 127 + 1023;
 
-  /* Convert mantissa from 23 bits to 52 bits */
-  unsigned long long new_mantissa = ((unsigned long long)mantissa) << 29;
+  // /* Convert mantissa from 23 bits to 52 bits */
+  // unsigned long long new_mantissa = ((unsigned long long)mantissa) << 29;
 
-  /* Pack into double */
-  result.parts.high =
-      (sign << 31) | (new_exp << 20) | ((new_mantissa >> 32) & 0xFFFFF);
-  result.parts.low = new_mantissa & 0xFFFFFFFF;
+  // /* Pack into double */
+  // result.parts.high =
+  //     (sign << 31) | (new_exp << 20) | ((new_mantissa >> 32) & 0xFFFFF);
+  // result.parts.low = new_mantissa & 0xFFFFFFFF;
 
-  return result.d;
+  // return result.d;
+  return 0;
 }
 
 double __aeabi_idivmod(int a, int b) { return 0; }

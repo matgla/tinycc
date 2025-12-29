@@ -1120,10 +1120,6 @@ thumb_opcode th_ldr_reg(uint32_t rt, uint32_t rn, uint32_t rm,
     };
   }
 #endif
-  fprintf(
-      stderr,
-      "DEBUG th_ldr_reg: returning invalid - rt=%d rn=%d rm=%d shift.type=%d\n",
-      rt, rn, rm, shift.type);
   return (thumb_opcode){
       .size = 0,
       .opcode = 0,

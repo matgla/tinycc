@@ -687,6 +687,8 @@ ST_FUNC Sym *sym_push(int v, CType *type, int r, int c) {
     if (r & VT_PARAM) {
       vreg = tcc_ir_get_vreg_param(tcc_state->ir);
       tcc_ir_assign_physical_register(tcc_state->ir, vreg, c, -1, -1);
+      /* Store original parameter offset for prolog code generation */
+      tcc_ir_set_original_offset(tcc_state->ir, vreg, c);
       /* Mark float/double parameters */
       if (is_float(type->t)) {
         int is_double = (type->t & VT_BTYPE) == VT_DOUBLE ||
@@ -1538,7 +1540,8 @@ static void gen_bounded_ptr_add(void) {
   }
   vpush_helper_func(TOK___bound_ptr_add);
   vrott(3);
-  gfunc_call(2);
+  // gfunc_call(2);
+  tcc_error("implement me");
   vtop -= save;
   vpushi(0);
   /* returned pointer is in REG_IRET */
@@ -2030,7 +2033,8 @@ static void gen_opl(int op) {
     /* call generic long long function */
     vpush_helper_func(func);
     vrott(3);
-    gfunc_call(2);
+    // gfunc_call(2);
+    tcc_error("implement me");
     vpushi(0);
     vtop->r = reg_iret;
     vtop->r2 = reg_lret;
@@ -3124,7 +3128,8 @@ static void gen_cvt_itof1(int t) {
     else
       vpush_helper_func(TOK___floatundidf);
     vrott(2);
-    gfunc_call(1);
+    // gfunc_call(1);
+    tcc_error("implement me");
     vpushi(0);
     PUT_R_RET(vtop, t);
   } else {
@@ -3151,11 +3156,13 @@ static void gen_cvt_ftoi1(int t) {
     else
       vpush_helper_func(TOK___fixunsdfdi);
     vrott(2);
-    gfunc_call(1);
+    // gfunc_call(1);
+    tcc_error("implement me");
     vpushi(0);
     PUT_R_RET(vtop, t);
   } else {
-    gen_cvt_ftoi(t);
+    // gen_cvt_ftoi(t);
+    tcc_error("implement me");
   }
 }
 #endif
@@ -3682,7 +3689,8 @@ ST_FUNC void vstore(void) {
 #endif
         vpush_helper_func(TOK_memmove);
       vrott(4);
-      gfunc_call(3);
+      // gfunc_call(3);
+      tcc_error("implement me");
     }
 
   } else if (ft & VT_BITFIELD) {
@@ -5440,8 +5448,8 @@ static void parse_atomic(int atok) {
   sprintf(buf, "%s_%d", get_tok_str(atok, 0), size);
   vpush_helper_func(tok_alloc_const(buf));
   vrott(arg - save + 1);
-  gfunc_call(arg - save);
-
+  // gfunc_call(arg - save);
+  tcc_error("implement me");
   vpush(&ct);
   PUT_R_RET(vtop, ct.t);
   t = ct.t & VT_BTYPE;

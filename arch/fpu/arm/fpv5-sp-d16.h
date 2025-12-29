@@ -18,15 +18,9 @@
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
+#pragma once
+
+#define USING_GLOBALS
 #include "tcc.h"
 
-#include "arm-thumb-opcodes.h"
-
-ArchitectureConfig architecture_config = {
-    .pointer_size = 4,
-    .stack_align = 8,
-    .reg_size = 4,
-    .scratch_register = R_IP,
-    .parameter_registers = 4,
-    .has_fpu = 0,
-};
+const FloatingPointConfig arm_fpv5_sp_d16_fpu_config;

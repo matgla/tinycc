@@ -20,13 +20,34 @@
 
 #include "tcc.h"
 
-#include "arm-thumb-opcodes.h"
+#include "arch/fpu/arm/fpv5-sp-d16.h"
+#include "tccir.h"
 
-ArchitectureConfig architecture_config = {
-    .pointer_size = 4,
+const FloatingPointConfig arm_fpv5_sp_d16_fpu_config = {
+    .reg_size = 8,
+    .reg_count = 16,
     .stack_align = 8,
-    .reg_size = 4,
-    .scratch_register = R_IP,
-    .parameter_registers = 4,
-    .has_fpu = 0,
+    .has_fadd = 1,
+    .has_fsub = 1,
+    .has_fmul = 1,
+    .has_fdiv = 1,
+    .has_fcmp = 1,
+    .has_ftof = 1,
+    .has_itof = 1,
+    .has_ftod = 0,
+    .has_ftoi = 1,
+    .has_dadd = 0,
+    .has_dsub = 0,
+    .has_dmul = 0,
+    .has_ddiv = 0,
+    .has_dcmp = 0,
+    .has_dtof = 0,
+    .has_itod = 0,
+    .has_dtoi = 0,
+    .has_ltod = 0,
+    .has_ltof = 0,
+    .has_dtol = 0,
+    .has_ftol = 0,
+    .has_fneg = 1,
+    .has_dneg = 0,
 };

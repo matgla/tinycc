@@ -30,10 +30,12 @@
 #define LS_REG_TYPE_INT 0
 #define LS_REG_TYPE_FLOAT 1
 #define LS_REG_TYPE_DOUBLE 2
-#define LS_REG_TYPE_LLONG 3 /* 64-bit integer (long long) - needs 2 int regs   \
-                             */
-#define LS_REG_TYPE_DOUBLE_SOFT 4 /* double in soft-float - needs 2 int regs   \
-                                   */
+#define LS_REG_TYPE_LLONG                                                                                              \
+  3 /* 64-bit integer (long long) - needs 2 int regs                                                                   \
+     */
+#define LS_REG_TYPE_DOUBLE_SOFT                                                                                        \
+  4 /* double in soft-float - needs 2 int regs                                                                         \
+     */
 
 /* VFP register marker - add to VFP register number to distinguish from integer
  * registers */
@@ -41,7 +43,8 @@
 #define LS_IS_VFP_REG(r) ((r) >= LS_VFP_REG_BASE && (r) < LS_VFP_REG_BASE + 32)
 #define LS_VFP_REG_NUM(r) ((r) - LS_VFP_REG_BASE) /* Extract Sn number */
 
-typedef struct LSLiveInterval {
+typedef struct LSLiveInterval
+{
   int16_t r0;              // physical register assigned
   int16_t r1;              // second physical register assigned (for long long)
   uint32_t vreg;           // virtual register number
@@ -49,11 +52,13 @@ typedef struct LSLiveInterval {
   uint32_t start;          // start instruction index
   uint32_t end;            // end instruction index
   uint8_t crosses_call;    // 1 if interval spans a function call
-  uint8_t addrtaken; // 1 if variable's address is taken (must be on stack)
-  uint8_t reg_type; // LS_REG_TYPE_INT, LS_REG_TYPE_FLOAT, or LS_REG_TYPE_DOUBLE
+  uint8_t addrtaken;       // 1 if variable's address is taken (must be on stack)
+  uint8_t reg_type;        // LS_REG_TYPE_INT, LS_REG_TYPE_FLOAT, or LS_REG_TYPE_DOUBLE
+  uint8_t lvalue;          // 1 if interval represents an lvalue
 } LSLiveInterval;
 
-typedef struct LSLiveIntervalState {
+typedef struct LSLiveIntervalState
+{
   LSLiveInterval *intervals;
   int intervals_size;
   int next_interval_index;
@@ -70,9 +75,7 @@ void tcc_ls_deinitialize(LSLiveIntervalState *ls);
 
 void tcc_ls_clear_live_intervals(LSLiveIntervalState *ls);
 
-void tcc_ls_add_live_interval(LSLiveIntervalState *ls, int vreg, int start,
-                              int end, int crosses_call, int addrtaken,
-                              int reg_type);
-void tcc_ls_allocate_registers(LSLiveIntervalState *ls,
-                               int used_parameters_registers,
+void tcc_ls_add_live_interval(LSLiveIntervalState *ls, int vreg, int start, int end, int crosses_call, int addrtaken,
+                              int reg_type, int lvalue);
+void tcc_ls_allocate_registers(LSLiveIntervalState *ls, int used_parameters_registers,
                                int used_float_parameters_registers);

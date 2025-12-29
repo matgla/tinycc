@@ -24,7 +24,7 @@ def compile_testcase(test_file, machine, compiler=f"{CURRENT_DIR}/../../armv8m-t
         if result.returncode != 0:
             raise RuntimeError(f"Clean failed with exit code {result.returncode}")
         was_cleaned = True
-    result = subprocess.run(make_command, shell=True)#, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    result = subprocess.run(make_command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if result.returncode != 0:
         print(result.stdout.decode())
         print(result.stderr.decode())
