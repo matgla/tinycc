@@ -96,7 +96,8 @@ typedef struct ThumbGeneratorState
   /* Cache for global symbol base address to avoid redundant loads */
   Sym *cached_global_sym; /* Last loaded global symbol */
   int cached_global_reg;  /* Register holding its base address */
-  int first_function_argument_index;
+  int *function_argument_list;
+  int function_argument_list_size;
   int function_argument_count;
 } ThumbGeneratorState;
 
@@ -3469,11 +3470,11 @@ ST_FUNC void tcc_gen_machine_store_to_stack(int reg, int offset)
 
 ST_FUNC void tcc_gen_machine_func_param_op(TACQuadruple *q, int param_num, int instruction_index)
 {
-  if (thumb_gen_state.function_argument_count == 0)
-  {
-    thumb_gen_state.first_function_argument_index = instruction_index;
-  }
-  ++thumb_gen_state.function_argument_count;
+  /* Params are now collected at CALL time via backward scan.
+   * This function is kept for compatibility but does nothing. */
+  (void)q;
+  (void)param_num;
+  (void)instruction_index;
 }
 
 static void gcall_or_jump(int is_jmp, SValue *dest)
@@ -3523,9 +3524,78 @@ static void load_to_register(int reg, int reg_from, SValue *src)
   }
 }
 
-ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result)
+ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCIRState *ir, int call_idx)
 {
-  int registers_to_push = 0;
+  /* Scan backward from the CALL to find its params.
+   * This handles nested calls naturally: inner calls consume their params
+   * before outer calls see them.
+   */
+  int param_indices_size = 4; /* Initial size, grows as needed */
+  int *param_indices = tcc_malloc(sizeof(int) * param_indices_size);
+  int param_count = 0;
+  uint32_t params_found = 0; /* Bitmask of which param numbers we've claimed */
+  int nested_call_depth = 0; /* Track nested calls to skip their params */
+
+  printf("DEBUG func_call_op: call_idx=%d, scanning backward for params\n", call_idx);
+
+  /* Backward scan to find params for THIS call */
+  for (int i = call_idx - 1; i >= 0; i--)
+  {
+    TACQuadruple *instr = &ir->instructions[i];
+    printf("DEBUG func_call_op: i=%d, op=%d (%s)\n", i, instr->op, tcc_ir_get_op_name(instr->op));
+
+    if (instr->op == TCCIR_OP_FUNCCALLVAL || instr->op == TCCIR_OP_FUNCCALLVOID)
+    {
+      /* Hit another call - its params are between it and the previous call */
+      nested_call_depth++;
+    }
+    else if (instr->op == TCCIR_OP_FUNCPARAMVAL)
+    {
+      if (nested_call_depth > 0)
+      {
+        /* This param belongs to a nested (inner) call, not us */
+        int param_num = instr->src2.c.i;
+        if (param_num == 1)
+          nested_call_depth--; /* Inner call got all its params */
+      }
+      else
+      {
+        /* This param might belong to us */
+        int param_num = instr->src2.c.i;
+        if (!(params_found & (1 << param_num)))
+        {
+          /* We haven't claimed this param number yet */
+          params_found |= (1 << param_num);
+
+          /* Grow array if needed */
+          if (param_count >= param_indices_size)
+          {
+            param_indices_size *= 2;
+            param_indices = tcc_realloc(param_indices, sizeof(int) * param_indices_size);
+          }
+          param_indices[param_count++] = i;
+
+          if (param_num == 1)
+            break; /* Param 1 is the first, we're done */
+        }
+      }
+    }
+    else if (instr->op == TCCIR_OP_FUNCPARAMVOID)
+    {
+      if (nested_call_depth > 0)
+        nested_call_depth--;
+      else
+        break; /* No-arg call marker for us, done */
+    }
+  }
+
+  /* Reverse param_indices so they're in correct order (param 1, 2, 3...) */
+  for (int i = 0; i < param_count / 2; i++)
+  {
+    int tmp = param_indices[i];
+    param_indices[i] = param_indices[param_count - 1 - i];
+    param_indices[param_count - 1 - i] = tmp;
+  }
 
   /* First pass: calculate register and stack slot assignments for each argument
    * following AAPCS rules:
@@ -3540,9 +3610,10 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result)
   int stack_offset = 0;
 
   // only r0-r3 for arguments, rest arguments go to stack
-  for (int i = 0; i < thumb_gen_state.function_argument_count; ++i)
+  for (int i = 0; i < param_count; ++i)
   {
-    TACQuadruple *arg = &tcc_state->ir->instructions[thumb_gen_state.first_function_argument_index + i];
+    const int argument_index = param_indices[i];
+    TACQuadruple *arg = &ir->instructions[argument_index];
     const int is_64bit = is_64bit_type(arg->src1.type.t);
     if (is_64bit)
     {
@@ -3590,12 +3661,13 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result)
   }
 
   /* Push stack arguments first */
-  for (int i = 0; i < thumb_gen_state.function_argument_count; ++i)
+  for (int i = 0; i < param_count; ++i)
   {
     // check if argument goes to register
     int assigned_register = -1;
     int is_64bit = 0;
-    TACQuadruple *arg = NULL;
+    const int argument_index = param_indices[i];
+    TACQuadruple *arg = &ir->instructions[argument_index];
 
     for (int j = 0; j < 4; j++)
     {
@@ -3612,7 +3684,6 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result)
       continue;
     }
 
-    arg = &tcc_state->ir->instructions[thumb_gen_state.first_function_argument_index + i];
     is_64bit = is_64bit_type(arg->src1.type.t);
     if (is_64bit)
     {
@@ -3628,63 +3699,22 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result)
       }
       ot_check(th_str_imm(reg, R_SP, stack_offset, 6, ENFORCE_ENCODING_NONE));
       stack_offset += 4;
-      // store(R_SP, &arg->src1);
     }
-    //   if (is_64bit) {
-    //     /* Load 64-bit value and store both words */
-    //     /* For doubles in VFP, move to R0:R1 first */
-    //     if (arg->src1.pr0 >= 0 && LS_IS_VFP_REG(arg->src1.pr0)) {
-    //       int dreg = LS_VFP_REG_NUM(arg->src1.pr0) / 2;
-    //       ot_check(th_vmov_2gp_dp(R0, R1, dreg, 1 /* to ARM */));
-    //       ot_check(th_str_imm(R0, R_SP, offset, 6, ENFORCE_ENCODING_NONE));
-    //       ot_check(th_str_imm(R1, R_SP, offset + 4, 6,
-    //       ENFORCE_ENCODING_NONE));
-    //     } else {
-    //       /* Load 64-bit value from memory to R0:R1 (can't use R12 for
-    //       64-bit!)
-    //       */ SValue src = arg->src1; if (src.pr0 != -1 && (src.pr0 &
-    //       PREG_SPILLED)) {
-    //         /* For spilled values, set up proper VT_LOCAL | VT_LVAL
-    //         addressing
-    //         */ src.r = VT_LOCAL | VT_LVAL;
-    //       }
-    //       /* Tell load() where to put the high word (R1) */
-    //       src.pr1 = R1;
-    //       load(R0, &src);
-    //       ot_check(th_str_imm(R0, R_SP, offset, 6, ENFORCE_ENCODING_NONE));
-    //       ot_check(th_str_imm(R1, R_SP, offset + 4, 6,
-    //       ENFORCE_ENCODING_NONE));
-    //     }
-    //   } else {
-    //     SValue src = arg->src1;
-    //     if (src.pr0 != -1 && (src.pr0 & PREG_SPILLED)) {
-    //       /* Spilled to stack - set up VT_LOCAL addressing */
-    //       src.r = VT_LOCAL | VT_LVAL;
-    //       load(R12, &src);
-    //     } else if (src.pr0 != -1 && !(src.pr0 & PREG_SPILLED)) {
-    //       /* Already in a register - just move it */
-    //       if (src.pr0 != R12) {
-    //         ot_check(th_mov_reg(R12, src.pr0, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-    //                             THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE,
-    //                             false));
-    //       }
-    //     } else {
-    //       /* Not allocated - load from memory/const */
-    //       load(R12, &src);
-    //     }
-    //     ot_check(th_str_imm(R12, R_SP, offset, 6, ENFORCE_ENCODING_NONE));
-    //   }
   }
 
   /* Load register arguments in reverse order to avoid clobbering */
+  int registers_to_push = 0;
   for (int i = 3; i >= 0; --i)
   {
     if (op_to_reg[i] == -1)
       continue;
     printf("DEBUG func_call_op: arg %d assigned_register=%d, accessing "
-           "instruction: %d\n",
-           op_to_reg[i], i, thumb_gen_state.first_function_argument_index + op_to_reg[i]);
-    TACQuadruple *arg = &tcc_state->ir->instructions[thumb_gen_state.first_function_argument_index + op_to_reg[i]];
+           "instruction: %d, vreg: ",
+           op_to_reg[i], i, param_indices[op_to_reg[i]]);
+    TACQuadruple *arg = &ir->instructions[param_indices[op_to_reg[i]]];
+
+    tcc_ir_print_vreg(arg->src1.vr);
+    printf("\n");
     const int is_64bit = is_64bit_type(arg->src1.type.t);
     const int dest_reg = i;
     if (is_64bit)
@@ -3710,15 +3740,12 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result)
       continue;
     }
   }
-  thumb_gen_state.function_argument_count = 0;
+
   if (tcc_state->text_and_data_separation && q->src1.type.t & VT_EXTERN)
   {
     registers_to_push |= (1 << R9 || 1 << R8);
   }
 
-  // if (registers_count % 2 != 0) {
-  // registers_to_push |= (1 << R12);
-  // }
   if (registers_to_push != 0)
   {
     ot_check(th_push(registers_to_push));
@@ -3735,11 +3762,9 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result)
     ot_check(th_add_sp_imm(R_SP, stack_size, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
   }
 
-  // /* Invalidate global symbol cache - LR was clobbered by call */
-  // thumb_gen_state.cached_global_sym = NULL;
-  // thumb_gen_state.cached_global_reg = -1;
   if (drop_result)
   {
+    tcc_free(param_indices);
     return;
   }
 
@@ -3754,6 +3779,8 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result)
     ot_check(
         th_mov_reg(q->dest.pr0, R0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
   }
+
+  tcc_free(param_indices);
 }
 
 ST_FUNC void tcc_gen_machine_jump_op(TACQuadruple *q)

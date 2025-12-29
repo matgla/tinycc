@@ -1759,6 +1759,7 @@ void tcc_ir_generate_code(TCCIRState *ir)
 {
   TACQuadruple *q;
   int drop_return_value = 0;
+
   // +1 to include epilogue when needed
   uint32_t *ir_to_code_mapping = tcc_mallocz(sizeof(uint32_t) * (ir->next_instruction_index + 1));
 
@@ -1967,6 +1968,8 @@ void tcc_ir_generate_code(TCCIRState *ir)
       /* fall through */
     case TCCIR_OP_FUNCCALLVAL:
     {
+      // Save the call instruction index before potentially incrementing i
+      int call_idx = i;
       // if return follows call then we can optimize away move
       const TACQuadruple *ir_next = (i + 1 < ir->next_instruction_index) ? &ir->instructions[i + 1] : NULL;
       if (ir_next && ir_next->op == TCCIR_OP_RETURNVALUE && ir_next->src1.vr == q->dest.vr && q->src1.vr != -1)
@@ -1975,7 +1978,7 @@ void tcc_ir_generate_code(TCCIRState *ir)
         ++i; // skip next instruction
       }
 
-      tcc_gen_machine_func_call_op(q, drop_return_value);
+      tcc_gen_machine_func_call_op(q, drop_return_value, ir, call_idx);
       /* Restore outer call's arguments if this was a nested call */
       ir_to_code_mapping[i] = ind;
       break;
@@ -2497,6 +2500,8 @@ void tcc_ir_generate_cmp_jmp_set(TCCIRState *ir)
     memset(&dest, 0, sizeof(SValue));
     dest.vr = tcc_ir_get_vreg_temp(ir);
     dest.type.t = VT_INT;
+    dest.pr0 = -1;
+    dest.pr1 = -1;
 
     if (jtrue || jfalse)
     {
@@ -2520,6 +2525,8 @@ void tcc_ir_generate_cmp_jmp_set(TCCIRState *ir)
         tcc_ir_backpatch_to_here(ir, jtrue);
         src.r = VT_CONST;
         src.c.i = 1;
+        src.pr0 = -1;
+        src.pr1 = -1;
         tcc_ir_put(ir, TCCIR_OP_ASSIGN, &src, NULL, &dest);
         if (jfalse)
         {
