@@ -91,7 +91,8 @@ THE SOFTWARE.*/
 // }
 
 /* Double precision comparison functions */
-int __aeabi_dcmpun(double a, double b) {
+int __aeabi_dcmpun(double a, double b)
+{
   // double_bits ba, bb;
   // ba.d = a;
   // bb.d = b;
@@ -102,7 +103,8 @@ int __aeabi_dcmpun(double a, double b) {
   return 0;
 }
 
-int __aeabi_dcmple(double a, double b) {
+int __aeabi_dcmple(double a, double b)
+{
   // double_bits ba, bb;
   // ba.d = a;
   // bb.d = b;
@@ -118,7 +120,8 @@ int __aeabi_dcmple(double a, double b) {
   return 0;
 }
 
-int __aeabi_dcmplt(double a, double b) {
+int __aeabi_dcmplt(double a, double b)
+{
   // double_bits ba, bb;
   // ba.d = a;
   // bb.d = b;
@@ -134,7 +137,8 @@ int __aeabi_dcmplt(double a, double b) {
   return 0;
 }
 
-int __aeabi_dcmpeq(double a, double b) {
+int __aeabi_dcmpeq(double a, double b)
+{
   // double_bits ba, bb;
   // ba.d = a;
   // bb.d = b;
@@ -150,7 +154,8 @@ int __aeabi_dcmpeq(double a, double b) {
   return 0;
 }
 
-int __aeabi_dcmpge(double a, double b) {
+int __aeabi_dcmpge(double a, double b)
+{
   // double_bits ba, bb;
   // ba.d = a;
   // bb.d = b;
@@ -166,7 +171,8 @@ int __aeabi_dcmpge(double a, double b) {
   return 0;
 }
 
-int __aeabi_dcmpgt(double a, double b) {
+int __aeabi_dcmpgt(double a, double b)
+{
   // double_bits ba, bb;
   // ba.d = a;
   // bb.d = b;
@@ -183,25 +189,52 @@ int __aeabi_dcmpgt(double a, double b) {
 }
 
 /* Single precision comparison stubs */
-int __aeabi_fcmpun(float a, float b) { return 0; }
-int __aeabi_fcmple(float a, float b) { return 0; }
-int __aeabi_fcmplt(float a, float b) { return 0; }
-int __aeabi_fcmpeq(float a, float b) { return 0; }
-int __aeabi_fcmpge(float a, float b) { return 0; }
-int __aeabi_fcmpgt(float a, float b) { return 0; }
+int __aeabi_fcmpun(float a, float b)
+{
+  return 0;
+}
+int __aeabi_fcmple(float a, float b)
+{
+  return 0;
+}
+int __aeabi_fcmplt(float a, float b)
+{
+  return 0;
+}
+int __aeabi_fcmpeq(float a, float b)
+{
+  return 0;
+}
+int __aeabi_fcmpge(float a, float b)
+{
+  return 0;
+}
+int __aeabi_fcmpgt(float a, float b)
+{
+  return 0;
+}
 
 /* These set CPSR flags directly (used by soft-float code) */
-void __aeabi_cfcmple(float a, float b) {}
-void __aeabi_cfcmpeq(float a, float b) {}
-void __aeabi_cdcmple(double a, double b) {}
-void __aeabi_cdcmpeq(double a, double b) {}
+void __aeabi_cfcmple(float a, float b)
+{
+}
+void __aeabi_cfcmpeq(float a, float b)
+{
+}
+void __aeabi_cdcmple(double a, double b)
+{
+}
+void __aeabi_cdcmpeq(double a, double b)
+{
+}
 
 // typedef struct {
 //   unsigned long long quot;
 //   unsigned long long rem;
 // } ulldiv_t;
 
-int __aeabi_uldivmod(unsigned long long n, unsigned long long d) {
+int __aeabi_uldivmod(unsigned long long n, unsigned long long d)
+{
   // return (ulldiv_t){
   // .quot = 0,
   // .rem = 0,
@@ -210,21 +243,52 @@ int __aeabi_uldivmod(unsigned long long n, unsigned long long d) {
 }
 
 /* Double precision arithmetic stubs */
-double __aeabi_dmul(double a, double b) { return 0; }
-double __aeabi_dadd(double a, double b) { return 0; }
-double __aeabi_dsub(double a, double b) { return 0; }
-double __aeabi_ddiv(double a, double b) { return 0; }
-double __aeabi_dneg(double a) { return 0; }
+double __aeabi_dmul(double a, double b)
+{
+  return 0;
+}
+double __aeabi_dadd(double a, double b)
+{
+  return 0;
+}
+double __aeabi_dsub(double a, double b)
+{
+  return 0;
+}
+double __aeabi_ddiv(double a, double b)
+{
+  return 0;
+}
+double __aeabi_dneg(double a)
+{
+  return 0;
+}
 
 /* Single precision arithmetic stubs */
-float __aeabi_fmul(float a, float b) { return 0; }
-float __aeabi_fadd(float a, float b) { return 0; }
-float __aeabi_fsub(float a, float b) { return 0; }
-float __aeabi_fdiv(float a, float b) { return 0; }
-float __aeabi_fneg(float a) { return 0; }
+float __aeabi_fmul(float a, float b)
+{
+  return 0;
+}
+float __aeabi_fadd(float a, float b)
+{
+  return 0;
+}
+float __aeabi_fsub(float a, float b)
+{
+  return 0;
+}
+float __aeabi_fdiv(float a, float b)
+{
+  return 0;
+}
+float __aeabi_fneg(float a)
+{
+  return 0;
+}
 
 /* Helper union for accessing float bits */
-typedef union {
+typedef union
+{
   float f;
   unsigned int ui;
 } float_bits;
@@ -232,7 +296,8 @@ typedef union {
 /* Conversion functions */
 
 /* Double to int conversion */
-int __aeabi_d2iz(double a) {
+int __aeabi_d2iz(double a)
+{
   // double_bits da;
   // da.d = a;
 
@@ -275,7 +340,8 @@ int __aeabi_d2iz(double a) {
 }
 
 /* Int to double conversion */
-double __aeabi_i2d(int a) {
+double __aeabi_i2d(int a)
+{
   // double_bits result;
 
   // if (a == 0) {
@@ -322,7 +388,8 @@ double __aeabi_i2d(int a) {
 }
 
 /* Unsigned int to double conversion */
-double __aeabi_ui2d(unsigned int a) {
+double __aeabi_ui2d(unsigned int a)
+{
   // double_bits result;
 
   // if (a == 0) {
@@ -359,7 +426,8 @@ double __aeabi_ui2d(unsigned int a) {
 }
 
 /* Float to int conversion */
-int __aeabi_f2iz(float a) {
+int __aeabi_f2iz(float a)
+{
   // float_bits fa;
   // fa.f = a;
 
@@ -400,7 +468,8 @@ int __aeabi_f2iz(float a) {
 }
 
 /* Int to float conversion */
-float __aeabi_i2f(int a) {
+float __aeabi_i2f(int a)
+{
   // float_bits result;
 
   // if (a == 0) {
@@ -443,7 +512,8 @@ float __aeabi_i2f(int a) {
 }
 
 /* Unsigned int to float conversion */
-float __aeabi_ui2f(unsigned int a) {
+float __aeabi_ui2f(unsigned int a)
+{
   // float_bits result;
 
   // if (a == 0) {
@@ -478,7 +548,8 @@ float __aeabi_ui2f(unsigned int a) {
 }
 
 /* Double to float conversion */
-float __aeabi_d2f(double a) {
+float __aeabi_d2f(double a)
+{
   // double_bits da;
   // float_bits result;
   // da.d = a;
@@ -531,7 +602,8 @@ float __aeabi_d2f(double a) {
 }
 
 /* Float to double conversion */
-double __aeabi_f2d(float a) {
+double __aeabi_f2d(float a)
+{
   // float_bits fa;
   // double_bits result;
   // fa.f = a;
@@ -575,15 +647,22 @@ double __aeabi_f2d(float a) {
   return 0;
 }
 
-double __aeabi_idivmod(int a, int b) { return 0; }
+double __aeabi_idivmod(int a, int b)
+{
+  return 0;
+}
 
-void __aeabi_memset(void *dest, int n, int c) {
-  for (int i = 0; i < n; i++) {
+void __aeabi_memset(void *dest, int n, int c)
+{
+  for (int i = 0; i < n; i++)
+  {
     ((unsigned char *)dest)[i] = (unsigned char)c;
   }
 }
 
-void __aeabi_memmove8(void *dest, int n, int c) {}
+void __aeabi_memmove8(void *dest, int n, int c)
+{
+}
 
 // #ifdef __TINYC__
 // #define INT_MIN (-2147483647 - 1)
@@ -1069,9 +1148,10 @@ void __aeabi_memmove8(void *dest, int n, int c) {}
 // extern void *memmove(void *dest, const void *src, size_t n);
 // extern void *memset(void *s, int c, size_t n);
 
-// void *__aeabi_memcpy(void *dest, const void *src, size_t n) {
-//   return memcpy(dest, src, n);
-// }
+void *__aeabi_memcpy(void *dest, const void *src, size_t n)
+{
+  return memcpy(dest, src, n);
+}
 
 // void *__aeabi_memmove(void *dest, const void *src, size_t n) {
 //   return memmove(dest, src, n);

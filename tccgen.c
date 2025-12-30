@@ -7218,9 +7218,148 @@ static int condition_3way(void)
   return c;
 }
 
+/* Check if SValue is a comparison result that can be safely converted to 0/1
+   without side effects. This enables bitwise optimization of && and ||. */
+static int is_safe_bool_operand(SValue *sv)
+{
+  /* VT_CMP means it's a pending comparison - safe and already boolean */
+  if ((sv->r & VT_VALMASK) == VT_CMP)
+  {
+    printf("DEBUG is_safe_bool_operand: VT_CMP detected, returning 1\n");
+    return 1;
+  }
+  /* Constant 0 or 1 */
+  if ((sv->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST && (sv->type.t & VT_BTYPE) == VT_INT &&
+      (unsigned)sv->c.i < 2)
+  {
+    printf("DEBUG is_safe_bool_operand: CONST 0/1 detected, returning 1\n");
+    return 1;
+  }
+  /* Simple integer variable (local or in register) - can be converted to bool with != 0 */
+  if (((sv->type.t & VT_BTYPE) == VT_INT || (sv->type.t & VT_BTYPE) == VT_LLONG || (sv->type.t & VT_BTYPE) == VT_PTR) &&
+      !(sv->r & VT_SYM)) /* no symbol/function calls that might have side effects */
+  {
+    printf("DEBUG is_safe_bool_operand: integer variable detected, r=0x%x, returning 2 (needs != 0)\n", sv->r);
+    return 2; /* return 2 to indicate it needs conversion to bool */
+  }
+  printf("DEBUG is_safe_bool_operand: NOT safe, r=0x%x, type.t=0x%x, vr=%d\n", sv->r, sv->type.t, sv->vr);
+  return 0;
+}
+
+/* Convert VT_CMP or a variable to an actual 0/1 value in a register/vreg.
+   This is needed before we can use bitwise operations.
+   safe_type: 1 = VT_CMP (already bool), 2 = variable (needs != 0 conversion) */
+static void materialize_bool(int safe_type)
+{
+  if ((vtop->r & VT_VALMASK) == VT_CMP)
+  {
+    printf("DEBUG materialize_bool: converting VT_CMP to 0/1\n");
+    /* Generate code to convert comparison flags to 0/1 */
+    tcc_ir_generate_cmp_jmp_set(tcc_state->ir);
+  }
+  else if (safe_type == 2)
+  {
+    printf("DEBUG materialize_bool: converting variable to bool with != 0, r=0x%x\n", vtop->r);
+    /* Variable needs to be compared with 0 to become a boolean */
+    vpushi(0);
+    gen_op(TOK_NE);
+    /* Now vtop should be VT_CMP, convert it to 0/1 */
+    if ((vtop->r & VT_VALMASK) == VT_CMP)
+    {
+      tcc_ir_generate_cmp_jmp_set(tcc_state->ir);
+    }
+  }
+  else
+  {
+    printf("DEBUG materialize_bool: already a value, r=0x%x\n", vtop->r);
+  }
+}
+
 static void expr_landor(int op)
 {
   int t = 0, cc = 1, f = 0, i = op == TOK_LAND, c;
+  int first_safe_type, second_safe_type;
+
+  /* Check if we can use bitwise optimization:
+   * For && we can use &, for || we can use |
+   * This is valid when both operands are known boolean (0/1) values
+   * and we're in IR mode. */
+  if (tcc_state->ir != NULL)
+  {
+    /* Save current state to check the second operand */
+    SValue first_op = *vtop;
+    int first_c = condition_3way();
+
+    first_safe_type = is_safe_bool_operand(&first_op);
+    /* Only try optimization if first operand is not compile-time constant
+       and is a safe bool operand (comparison result or variable) */
+    if (first_c < 0 && first_safe_type && tok == op)
+    {
+      /* Peek ahead: parse next operand without generating code yet */
+      int saved_tok = tok;
+      next(); /* consume && or || */
+
+      /* Parse the second operand */
+      int saved_nocode = nocode_wanted;
+      expr_landor_next(op);
+      nocode_wanted = saved_nocode;
+
+      /* Check if second operand is also a safe bool */
+      second_safe_type = is_safe_bool_operand(vtop);
+      if (second_safe_type && tok != op)
+      {
+        /* Both operands are safe bools - use optimized operation!
+         * If both are type 2 (variables), use BOOL_OR/BOOL_AND directly.
+         * Otherwise, materialize to 0/1 and use bitwise op. */
+
+        if (first_safe_type == 2 && second_safe_type == 2)
+        {
+          /* Both are variables - use optimized BOOL_OR/BOOL_AND IR operation
+           * This generates: ORRS + ITE for ||, or CMP+IT+CMP+ITE for && */
+          SValue dest;
+          TccIrOp ir_op = (op == TOK_LAND) ? TCCIR_OP_BOOL_AND : TCCIR_OP_BOOL_OR;
+
+          memset(&dest, 0, sizeof(dest));
+          dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+          dest.r = 0;
+          dest.type.t = VT_INT;
+
+          tcc_ir_put(tcc_state->ir, ir_op, &vtop[-1], &vtop[0], &dest);
+
+          vtop--;
+          vtop->vr = dest.vr;
+          vtop->r = 0;
+          vtop->type.t = VT_INT;
+        }
+        else
+        {
+          /* At least one is VT_CMP - materialize both and use bitwise op */
+          materialize_bool(second_safe_type); /* second operand (top of stack) */
+          vswap();
+          materialize_bool(first_safe_type); /* first operand */
+          vswap();
+
+          /* Generate bitwise operation */
+          gen_op(op == TOK_LAND ? '&' : '|');
+        }
+
+        /* Result is already 0 or 1, which is correct for && and || */
+        return;
+      }
+
+      /* Optimization not applicable for chained operators or non-bool second operand.
+       * We need to fall back to branch-based evaluation.
+       * Generate test for first operand now. */
+      vswap(); /* put first operand on top */
+      t = tcc_ir_generate_test(tcc_state->ir, i, t);
+      vswap(); /* restore second operand on top */
+
+      /* Continue with normal processing - the second operand is already parsed */
+      goto continue_landor;
+    }
+  }
+
+  /* Standard branch-based evaluation */
   for (;;)
   {
     c = f ? i : condition_3way();
@@ -7245,6 +7384,8 @@ static void expr_landor(int op)
     expr_landor_next(op);
     nocode_wanted = saved_nocode;
   }
+
+continue_landor:
   if (cc || f)
   {
     vpop();
@@ -9581,6 +9722,21 @@ static void gen_function(Sym *sym)
 
   /* Dead code elimination - remove unreachable instructions */
   tcc_ir_dead_code_elimination(ir);
+
+  /* Common subexpression elimination for commutative boolean ops */
+  if (tcc_ir_bool_cse(ir))
+    tcc_ir_dead_code_elimination(ir); /* Clean up unused ops */
+
+  /* Idempotent boolean simplification: BOOL_OP(x, x) -> x */
+  if (tcc_ir_bool_idempotent(ir))
+    tcc_ir_dead_code_elimination(ir); /* Clean up unused ops */
+
+  /* Boolean expression simplification - eliminate redundant BOOL_OR/BOOL_AND */
+  if (tcc_ir_bool_simplification(ir))
+    tcc_ir_dead_code_elimination(ir); /* Clean up unused ops */
+
+  /* Dead store elimination - remove unused ASSIGN instructions */
+  tcc_ir_dead_store_elimination(ir);
 
   nocode_wanted = 0;
   /* reset local stack */

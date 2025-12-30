@@ -110,6 +110,9 @@ const IRRegistersConfig irop_config[] = {
     [TCCIR_OP_CVT_FTOF] = {1, 1, 0},  /* dest=result, src1=input */
     [TCCIR_OP_CVT_ITOF] = {1, 1, 0},  /* dest=result, src1=input */
     [TCCIR_OP_CVT_FTOI] = {1, 1, 0},  /* dest=result, src1=input */
+    /* Logical boolean operations */
+    [TCCIR_OP_BOOL_OR] = {1, 1, 1},   /* dest = (src1 || src2) */
+    [TCCIR_OP_BOOL_AND] = {1, 1, 1},  /* dest = (src1 && src2) */
 };
 // clang-format on
 
@@ -630,6 +633,10 @@ const char *tcc_ir_get_op_name(TccIrOp op)
     return "CVT_ITOF";
   case TCCIR_OP_CVT_FTOI:
     return "CVT_FTOI";
+  case TCCIR_OP_BOOL_OR:
+    return "BOOL_OR";
+  case TCCIR_OP_BOOL_AND:
+    return "BOOL_AND";
   default:
     return "UNKNOWN_OP";
   }
@@ -1466,6 +1473,420 @@ int tcc_ir_dead_code_elimination(TCCIRState *ir)
   return 1;
 }
 
+/* Dead Store Elimination - remove ASSIGN instructions where the destination
+ * vreg is never used. This eliminates redundant copies after CSE/idempotent
+ * optimizations.
+ */
+int tcc_ir_dead_store_elimination(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  if (n == 0)
+    return 0;
+
+  /* Track which TMP vregs are used as sources */
+  int max_tmp_pos = 0;
+  for (int i = 0; i < n; i++)
+  {
+    TACQuadruple *q = &ir->instructions[i];
+    if (irop_config[q->op].has_dest && TCCIR_DECODE_VREG_TYPE(q->dest.vr) == TCCIR_VREG_TYPE_TEMP)
+    {
+      int pos = TCCIR_DECODE_VREG_POSITION(q->dest.vr);
+      if (pos > max_tmp_pos)
+        max_tmp_pos = pos;
+    }
+  }
+
+  if (max_tmp_pos == 0)
+    return 0;
+
+  uint8_t *used = tcc_mallocz((max_tmp_pos + 8) / 8);
+
+  /* Mark all TMP vregs that are used as sources */
+  for (int i = 0; i < n; i++)
+  {
+    TACQuadruple *q = &ir->instructions[i];
+
+    /* Check src1 */
+    if (irop_config[q->op].has_src1 && TCCIR_DECODE_VREG_TYPE(q->src1.vr) == TCCIR_VREG_TYPE_TEMP)
+    {
+      int pos = TCCIR_DECODE_VREG_POSITION(q->src1.vr);
+      if (pos <= max_tmp_pos)
+        used[pos / 8] |= (1 << (pos % 8));
+    }
+
+    /* Check src2 */
+    if (irop_config[q->op].has_src2 && TCCIR_DECODE_VREG_TYPE(q->src2.vr) == TCCIR_VREG_TYPE_TEMP)
+    {
+      int pos = TCCIR_DECODE_VREG_POSITION(q->src2.vr);
+      if (pos <= max_tmp_pos)
+        used[pos / 8] |= (1 << (pos % 8));
+    }
+  }
+
+  /* Remove ASSIGN instructions where dest is an unused TMP vreg */
+  int changes = 0;
+  int write_pos = 0;
+  int *new_index = tcc_malloc(sizeof(int) * n);
+
+  for (int i = 0; i < n; i++)
+  {
+    TACQuadruple *q = &ir->instructions[i];
+    int keep = 1;
+
+    /* Only consider removing ASSIGN instructions */
+    if (q->op == TCCIR_OP_ASSIGN && TCCIR_DECODE_VREG_TYPE(q->dest.vr) == TCCIR_VREG_TYPE_TEMP)
+    {
+      int pos = TCCIR_DECODE_VREG_POSITION(q->dest.vr);
+      if (pos <= max_tmp_pos && !(used[pos / 8] & (1 << (pos % 8))))
+      {
+        /* This ASSIGN's destination is never used - remove it */
+        keep = 0;
+        changes++;
+      }
+    }
+
+    new_index[i] = keep ? write_pos : -1;
+
+    if (keep)
+    {
+      if (write_pos != i)
+        ir->instructions[write_pos] = *q;
+      write_pos++;
+    }
+  }
+
+  /* Update jump targets */
+  for (int i = 0; i < write_pos; i++)
+  {
+    TACQuadruple *q = &ir->instructions[i];
+    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
+    {
+      int old_target = q->dest.c.i;
+      if (old_target < n && new_index[old_target] >= 0)
+        q->dest.c.i = new_index[old_target];
+      else if (old_target >= n)
+        q->dest.c.i = write_pos; /* Past end */
+    }
+  }
+
+  ir->next_instruction_index = write_pos;
+
+  tcc_free(used);
+  tcc_free(new_index);
+
+  return changes;
+}
+
+/* Helper: check if two SValues refer to the same virtual register */
+static int same_vreg(SValue *a, SValue *b)
+{
+  /* Both must be vregs (not constants) */
+  if ((a->r & VT_VALMASK) == VT_CONST || (b->r & VT_VALMASK) == VT_CONST)
+    return 0;
+  return a->vr == b->vr;
+}
+
+/* Helper: check if two BOOL_OR/BOOL_AND ops have same operands (in any order) */
+static int same_bool_operands(TACQuadruple *q1, TACQuadruple *q2)
+{
+  /* Same order: (a,b) == (a,b) */
+  if (same_vreg(&q1->src1, &q2->src1) && same_vreg(&q1->src2, &q2->src2))
+    return 1;
+  /* Swapped order: (a,b) == (b,a) - only valid for commutative ops */
+  if (same_vreg(&q1->src1, &q2->src2) && same_vreg(&q1->src2, &q2->src1))
+    return 1;
+  return 0;
+}
+
+/* Hash table entry for CSE */
+typedef struct CSEHashEntry
+{
+  uint32_t key;        /* hash of (op, min(vr1,vr2), max(vr1,vr2)) */
+  int instruction_idx; /* index of instruction that computes this */
+  struct CSEHashEntry *next;
+} CSEHashEntry;
+
+#define CSE_HASH_SIZE 256
+
+/* Compute hash for a commutative boolean op */
+static uint32_t cse_hash(TccIrOp op, int vr1, int vr2)
+{
+  /* Normalize order for commutative ops */
+  int min_vr = (vr1 < vr2) ? vr1 : vr2;
+  int max_vr = (vr1 < vr2) ? vr2 : vr1;
+  /* Simple hash combining op and both vregs */
+  return ((uint32_t)op * 31 + (uint32_t)min_vr * 17 + (uint32_t)max_vr) % CSE_HASH_SIZE;
+}
+
+/* Common Subexpression Elimination for commutative boolean ops
+ * Pattern: If we see BOOL_OR(a,b) followed by BOOL_OR(b,a),
+ *          the second is redundant since OR is commutative.
+ * Same applies to BOOL_AND.
+ * Optimized with hash table for O(n) average case.
+ */
+int tcc_ir_bool_cse(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  int changes = 0;
+
+  if (n == 0)
+    return 0;
+
+  /* Hash table for seen boolean ops */
+  CSEHashEntry *hash_table[CSE_HASH_SIZE] = {0};
+  CSEHashEntry *entries = tcc_malloc(sizeof(CSEHashEntry) * n); /* Pool for entries */
+  int entry_count = 0;
+
+  for (int i = 0; i < n; i++)
+  {
+    TACQuadruple *q = &ir->instructions[i];
+
+    /* Only handle BOOL_OR and BOOL_AND - they are commutative */
+    if (q->op != TCCIR_OP_BOOL_OR && q->op != TCCIR_OP_BOOL_AND)
+      continue;
+
+    uint32_t h = cse_hash(q->op, q->src1.vr, q->src2.vr);
+
+    /* Search hash bucket for match */
+    int found = 0;
+    for (CSEHashEntry *e = hash_table[h]; e != NULL; e = e->next)
+    {
+      TACQuadruple *prev = &ir->instructions[e->instruction_idx];
+      if (prev->op == q->op && same_bool_operands(prev, q))
+      {
+        /* Found duplicate! Replace with ASSIGN from previous result */
+#ifdef DEBUG_IR_GEN
+        printf("OPTIMIZE: CSE %s at %d same as %d -> ASSIGN\n", q->op == TCCIR_OP_BOOL_OR ? "BOOL_OR" : "BOOL_AND", i,
+               e->instruction_idx);
+#endif
+        q->op = TCCIR_OP_ASSIGN;
+        q->src1 = prev->dest;
+        memset(&q->src2, 0, sizeof(q->src2));
+        changes++;
+        found = 1;
+        break;
+      }
+    }
+
+    /* If not found, add to hash table */
+    if (!found)
+    {
+      CSEHashEntry *new_entry = &entries[entry_count++];
+      new_entry->key = h;
+      new_entry->instruction_idx = i;
+      new_entry->next = hash_table[h];
+      hash_table[h] = new_entry;
+    }
+  }
+
+  tcc_free(entries);
+
+  return changes;
+}
+
+/* Idempotent boolean simplification - eliminate redundant operations with same operands
+ * Patterns optimized:
+ *   BOOL_AND(x, x) -> x  (idempotent: x && x == x)
+ *   BOOL_OR(x, x) -> x   (idempotent: x || x == x)
+ * Also handles ASSIGN chains: BOOL_AND(x, y) where y = x -> x
+ */
+int tcc_ir_bool_idempotent(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  int changes = 0;
+
+  if (n == 0)
+    return 0;
+
+  /* Build a map from TMP vreg position -> instruction index that defines it.
+   * Only track TMP vregs since they have small indices.
+   * VAR/PARAM vregs don't need tracking for ASSIGN chain resolution. */
+  int max_tmp_pos = 0;
+  for (int i = 0; i < n; i++)
+  {
+    TACQuadruple *q = &ir->instructions[i];
+    if (irop_config[q->op].has_dest && TCCIR_DECODE_VREG_TYPE(q->dest.vr) == TCCIR_VREG_TYPE_TEMP)
+    {
+      int pos = TCCIR_DECODE_VREG_POSITION(q->dest.vr);
+      if (pos > max_tmp_pos)
+        max_tmp_pos = pos;
+    }
+  }
+
+  int *vreg_def = tcc_mallocz(sizeof(int) * (max_tmp_pos + 1));
+  for (int i = 0; i <= max_tmp_pos; i++)
+    vreg_def[i] = -1;
+
+  for (int i = 0; i < n; i++)
+  {
+    TACQuadruple *q = &ir->instructions[i];
+    if (irop_config[q->op].has_dest && TCCIR_DECODE_VREG_TYPE(q->dest.vr) == TCCIR_VREG_TYPE_TEMP)
+    {
+      int pos = TCCIR_DECODE_VREG_POSITION(q->dest.vr);
+      vreg_def[pos] = i;
+    }
+  }
+
+  for (int i = 0; i < n; i++)
+  {
+    TACQuadruple *q = &ir->instructions[i];
+
+    /* Only handle BOOL_OR and BOOL_AND */
+    if (q->op != TCCIR_OP_BOOL_OR && q->op != TCCIR_OP_BOOL_AND)
+      continue;
+
+    /* Resolve both operands through ASSIGN chains (only for TMP vregs) */
+    int vr1 = q->src1.vr;
+    int vr2 = q->src2.vr;
+
+    /* Follow ASSIGN chains for TMP vregs */
+    while (TCCIR_DECODE_VREG_TYPE(vr1) == TCCIR_VREG_TYPE_TEMP)
+    {
+      int pos = TCCIR_DECODE_VREG_POSITION(vr1);
+      if (pos > max_tmp_pos || vreg_def[pos] < 0)
+        break;
+      TACQuadruple *def = &ir->instructions[vreg_def[pos]];
+      if (def->op != TCCIR_OP_ASSIGN)
+        break;
+      vr1 = def->src1.vr;
+    }
+
+    while (TCCIR_DECODE_VREG_TYPE(vr2) == TCCIR_VREG_TYPE_TEMP)
+    {
+      int pos = TCCIR_DECODE_VREG_POSITION(vr2);
+      if (pos > max_tmp_pos || vreg_def[pos] < 0)
+        break;
+      TACQuadruple *def = &ir->instructions[vreg_def[pos]];
+      if (def->op != TCCIR_OP_ASSIGN)
+        break;
+      vr2 = def->src1.vr;
+    }
+
+    /* Check if both operands resolve to the same vreg */
+    if (vr1 == vr2)
+    {
+      /* Pattern matched: BOOL_OP(x, x) -> x */
+#ifdef DEBUG_IR_GEN
+      printf("OPTIMIZE: %s(x, x) -> ASSIGN at i=%d (idempotent, resolved vr=%d)\n",
+             q->op == TCCIR_OP_BOOL_OR ? "BOOL_OR" : "BOOL_AND", i, vr1);
+#endif
+      q->op = TCCIR_OP_ASSIGN;
+      /* src1 already has the right value, just clear src2 */
+      memset(&q->src2, 0, sizeof(q->src2));
+      changes++;
+    }
+  }
+
+  tcc_free(vreg_def);
+
+  return changes;
+}
+
+/* Boolean expression simplification - eliminate redundant BOOL_OR/BOOL_AND
+ * Patterns optimized:
+ *   BOOL_AND(BOOL_OR(a,b), BOOL_OR(b,a)) -> BOOL_OR(a,b)
+ *   BOOL_OR(BOOL_AND(a,b), BOOL_AND(b,a)) -> BOOL_AND(a,b)
+ */
+int tcc_ir_bool_simplification(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  int changes = 0;
+
+  if (n == 0)
+    return 0;
+
+  /* Build a map from TMP vreg position -> instruction index that defines it */
+  int max_tmp_pos = 0;
+  for (int i = 0; i < n; i++)
+  {
+    TACQuadruple *q = &ir->instructions[i];
+    if (irop_config[q->op].has_dest && TCCIR_DECODE_VREG_TYPE(q->dest.vr) == TCCIR_VREG_TYPE_TEMP)
+    {
+      int pos = TCCIR_DECODE_VREG_POSITION(q->dest.vr);
+      if (pos > max_tmp_pos)
+        max_tmp_pos = pos;
+    }
+  }
+
+  int *vreg_def = tcc_mallocz(sizeof(int) * (max_tmp_pos + 1));
+  for (int i = 0; i <= max_tmp_pos; i++)
+    vreg_def[i] = -1;
+
+  for (int i = 0; i < n; i++)
+  {
+    TACQuadruple *q = &ir->instructions[i];
+    if (irop_config[q->op].has_dest && TCCIR_DECODE_VREG_TYPE(q->dest.vr) == TCCIR_VREG_TYPE_TEMP)
+    {
+      int pos = TCCIR_DECODE_VREG_POSITION(q->dest.vr);
+      vreg_def[pos] = i;
+    }
+  }
+
+  /* Look for BOOL_AND(BOOL_OR(a,b), BOOL_OR(b,a)) patterns
+   * and BOOL_OR(BOOL_AND(a,b), BOOL_AND(b,a)) patterns */
+  for (int i = 0; i < n; i++)
+  {
+    TACQuadruple *q = &ir->instructions[i];
+
+    /* Must be BOOL_AND or BOOL_OR */
+    if (q->op != TCCIR_OP_BOOL_AND && q->op != TCCIR_OP_BOOL_OR)
+      continue;
+
+    /* Get the defining instructions for both operands (only TMP vregs) */
+    int def1 = -1, def2 = -1;
+    if (TCCIR_DECODE_VREG_TYPE(q->src1.vr) == TCCIR_VREG_TYPE_TEMP)
+    {
+      int pos = TCCIR_DECODE_VREG_POSITION(q->src1.vr);
+      if (pos <= max_tmp_pos)
+        def1 = vreg_def[pos];
+    }
+    if (TCCIR_DECODE_VREG_TYPE(q->src2.vr) == TCCIR_VREG_TYPE_TEMP)
+    {
+      int pos = TCCIR_DECODE_VREG_POSITION(q->src2.vr);
+      if (pos <= max_tmp_pos)
+        def2 = vreg_def[pos];
+    }
+
+    if (def1 < 0 || def2 < 0)
+      continue;
+
+    TACQuadruple *q1 = &ir->instructions[def1];
+    TACQuadruple *q2 = &ir->instructions[def2];
+
+    /* For BOOL_AND, both inputs should be BOOL_OR (and vice versa) */
+    TccIrOp expected_inner = (q->op == TCCIR_OP_BOOL_AND) ? TCCIR_OP_BOOL_OR : TCCIR_OP_BOOL_AND;
+
+    if (q1->op != expected_inner || q2->op != expected_inner)
+      continue;
+
+    if (!same_bool_operands(q1, q2))
+      continue;
+
+    /* Pattern matched!
+     * BOOL_AND(BOOL_OR(a,b), BOOL_OR(b,a)) -> BOOL_OR(a,b)
+     * BOOL_OR(BOOL_AND(a,b), BOOL_AND(b,a)) -> BOOL_AND(a,b)
+     */
+#ifdef DEBUG_IR_GEN
+    printf("OPTIMIZE: %s(%s, %s) with same operands -> single %s at i=%d\n",
+           q->op == TCCIR_OP_BOOL_AND ? "BOOL_AND" : "BOOL_OR",
+           expected_inner == TCCIR_OP_BOOL_OR ? "BOOL_OR" : "BOOL_AND",
+           expected_inner == TCCIR_OP_BOOL_OR ? "BOOL_OR" : "BOOL_AND",
+           expected_inner == TCCIR_OP_BOOL_OR ? "BOOL_OR" : "BOOL_AND", i);
+#endif
+    /* Replace outer op with ASSIGN from first inner op result */
+    q->op = TCCIR_OP_ASSIGN;
+    q->src1 = q1->dest; /* Copy the result of first BOOL_OR/BOOL_AND */
+    memset(&q->src2, 0, sizeof(q->src2));
+
+    /* The second inner op will be eliminated by DCE if unused */
+    changes++;
+  }
+
+  tcc_free(vreg_def);
+
+  return changes;
+}
+
 static void tcc_ir_backpatch_jumps(TCCIRState *ir, uint32_t *ir_to_code_mapping)
 {
   TACQuadruple *q;
@@ -1960,6 +2381,10 @@ void tcc_ir_generate_code(TCCIRState *ir)
       break;
     case TCCIR_OP_SETIF:
       tcc_gen_machine_setif_op(q);
+      break;
+    case TCCIR_OP_BOOL_OR:
+    case TCCIR_OP_BOOL_AND:
+      tcc_gen_machine_bool_op(q);
       break;
     case TCCIR_OP_FUNCPARAMVOID:
       break;

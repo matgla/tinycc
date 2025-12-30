@@ -260,6 +260,14 @@ ST_DATA const int reg_classes[NB_REGS] = {
 int is_valid_opcode(thumb_opcode op);
 int ot(thumb_opcode op);
 static void load_to_register(int reg, int reg_from, SValue *src);
+static int th_is_caller_saved_register(int reg)
+{
+  if (tcc_state->text_and_data_separation && reg == R9)
+  {
+    return 1;
+  }
+  return (reg >= R0 && reg <= R3) || reg == R_LR || reg == R_IP;
+}
 
 int ot_check(thumb_opcode op)
 {
@@ -1244,59 +1252,9 @@ void store(int r, SValue *sv)
     uint32_t base = R_FP;
     if (v < VT_CONST)
     {
-      /* Use pr0 if allocated and not spilled - do register-to-register move */
-      if (sv->pr0 >= 0 && !(sv->pr0 & PREG_SPILLED))
-      {
-        /* Destination is in a register - do register move, not memory store */
-        if (is_float(ft))
-        {
-          /* For soft-float doubles/floats in integer registers */
-          if (r != sv->pr0)
-          {
-            ot_check(th_mov_reg(sv->pr0, r, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE,
-                                false));
-          }
-          if ((ft & VT_BTYPE) == VT_DOUBLE || (ft & VT_BTYPE) == VT_LDOUBLE)
-          {
-            /* Store high word: r+1 -> pr1 */
-            int r_high = r + 1; /* Source high (e.g., R1 for R0) */
-            if (sv->pr1 >= 0 && r_high != sv->pr1)
-            {
-              ot_check(th_mov_reg(sv->pr1, r_high, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                                  ENFORCE_ENCODING_NONE, false));
-            }
-          }
-        }
-        else
-        {
-          /* Integer register move */
-          if (r != sv->pr0)
-          {
-            ot_check(th_mov_reg(sv->pr0, r, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE,
-                                false));
-          }
-        }
-        return;
-      }
-      else if (sv->pr0 & PREG_SPILLED)
-      {
-        /* Spilled to stack - use FP-relative addressing with offset from c.i */
-        base = R_FP;
-        v = VT_LOCAL;
-        /* fc and sign already set from sv->c.i above */
-      }
-      else
-      {
-        base = intr(v);
-        v = VT_LOCAL;
-        fc = sign = 0;
-      }
-    }
-    else if (v == VT_LOCAL)
-    {
-      /* Direct VT_LOCAL - use FP-relative addressing with offset from c.i */
-      base = R_FP;
-      /* fc and sign already set from sv->c.i above */
+      base = sv->pr0;
+      v = VT_LOCAL;
+      fc = sign = 0;
     }
     else if (v == VT_CONST)
     {
@@ -1906,10 +1864,12 @@ void load_to_dest(SValue *dest, SValue *sv)
     uint32_t base = R_FP;
     SValue v1;
 
-    /* First check if this is a register-allocated parameter/variable.
+    /* First check if this is a register-allocated LOCAL variable.
      * In this case pr0 contains the allocated register, and we should
-     * do a register move instead of loading from memory. */
-    if ((v == VT_LOCAL || v < VT_CONST) && sv->pr0 >= 0 && !(sv->pr0 & PREG_SPILLED))
+     * do a register move instead of loading from memory.
+     * NOTE: This only applies to VT_LOCAL, NOT to v < VT_CONST which means
+     * the address is in a register and needs dereferencing. */
+    if (v == VT_LOCAL && sv->pr0 >= 0 && !(sv->pr0 & PREG_SPILLED))
     {
       /* Allocated to register - do register move, not memory load. */
       /* For doubles in integer registers (soft float) */
@@ -1975,9 +1935,7 @@ void load_to_dest(SValue *dest, SValue *sv)
       }
       else
       {
-        /* Not spilled and not allocated to register - use base register
-         * directly */
-        base = intr(v);
+        base = sv->pr0;
         fc = sign = 0;
         v = VT_LOCAL;
       }
@@ -2135,9 +2093,7 @@ void load(int r, SValue *sv)
       }
       else
       {
-        /* Not spilled and not allocated to register - use base register
-         * directly */
-        base = intr(v);
+        base = sv->pr0;
         fc = sign = 0;
         v = VT_LOCAL;
       }
@@ -3098,15 +3054,23 @@ ST_FUNC void tcc_gen_machine_store_op(TACQuadruple *op)
   printf("DEBUG store_op: src1.pr0=%d, src1.r=0x%x, is_64bit=%d, src_btype=0x%x\n", op->src1.pr0, op->src1.r, is_64bit,
          src_btype);
 
-  /* If source has a valid, non-spilled register allocation, use it directly.
-   * Otherwise, load the value (for spilled values, constants, or globals). */
-  if (op->src1.pr0 >= 0 && !(op->src1.pr0 & PREG_SPILLED))
+  /* Check if source is an lvalue that needs dereferencing FIRST.
+   * Even if pr0 is valid, if VT_LVAL is set, pr0 contains the ADDRESS
+   * and we need to load the value from that address. */
+  if (op->src1.r & VT_LVAL)
   {
-    /* Have a valid register allocation - use it directly */
+    /* Source is an lvalue - need to load the value from the address */
+    load(R12, &op->src1);
+    src_reg = R12;
+    store(src_reg, &op->dest);
+  }
+  else if (op->src1.pr0 >= 0 && !(op->src1.pr0 & PREG_SPILLED))
+  {
+    /* Have a valid register allocation with actual value - use it directly */
     src_reg = op->src1.pr0;
     store(src_reg, &op->dest);
   }
-  else if (op->src1.pr0 == -1 || (op->src1.pr0 & PREG_SPILLED) || (op->src1.r & VT_LVAL))
+  else if (op->src1.pr0 == -1 || (op->src1.pr0 & PREG_SPILLED))
   {
     /* Need to load: no register, spilled, or lvalue that needs dereferencing */
     if (is_64bit)
@@ -3230,6 +3194,70 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
   if (stack_size > 0)
   {
     ot_check(th_sub_sp_imm(R_SP, stack_size, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+  }
+
+  /* Move parameters from incoming registers to their allocated locations.
+   * For non-leaf functions or parameters that cross calls:
+   * - If allocated to callee-saved register: move from R0-R3 to allocated reg
+   * - If spilled: store from R0-R3 to stack location
+   * For leaf functions with params staying in R0-R3: no move needed */
+  TCCIRState *ir = tcc_state->ir;
+  if (ir)
+  {
+    for (int vreg = 0; vreg < ir->next_parameter; ++vreg)
+    {
+      const int encoded_vreg = (TCCIR_VREG_TYPE_PARAM << 28) | vreg;
+      IRLiveInterval *interval = tcc_ir_get_live_interval(ir, encoded_vreg);
+
+      if (!interval)
+        continue;
+
+      int incoming_r0 = interval->incoming_reg0;
+      int alloc_r0 = interval->allocation.r0;
+      int alloc_r1 = interval->allocation.r1;
+      int is_64bit = interval->is_double || interval->is_llong;
+
+      /* Skip if parameter came from stack (not in registers) */
+      if (incoming_r0 < 0)
+        continue;
+
+      /* Check if we need to move/store the parameter */
+      if (alloc_r0 == PREG_SPILLED || interval->allocation.offset != 0)
+      {
+        /* Parameter is spilled - store to stack */
+        int stack_offset = interval->allocation.offset;
+        if (is_64bit && interval->incoming_reg1 >= 0)
+        {
+          /* 64-bit: store both registers */
+          tcc_gen_machine_store_to_stack(incoming_r0, stack_offset);
+          tcc_gen_machine_store_to_stack(interval->incoming_reg1, stack_offset + 4);
+        }
+        else
+        {
+          /* 32-bit: store single register */
+          tcc_gen_machine_store_to_stack(incoming_r0, stack_offset);
+        }
+      }
+      else if (alloc_r0 >= 0 && alloc_r0 != incoming_r0)
+      {
+        /* Parameter allocated to different register - move it */
+        if (is_64bit && interval->incoming_reg1 >= 0 && alloc_r1 >= 0)
+        {
+          /* 64-bit: move both registers */
+          ot_check(th_mov_reg(alloc_r0, incoming_r0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                              ENFORCE_ENCODING_NONE, false));
+          ot_check(th_mov_reg(alloc_r1, interval->incoming_reg1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                              ENFORCE_ENCODING_NONE, false));
+        }
+        else
+        {
+          /* 32-bit: move single register */
+          ot_check(th_mov_reg(alloc_r0, incoming_r0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                              ENFORCE_ENCODING_NONE, false));
+        }
+      }
+      /* If alloc_r0 == incoming_r0, parameter stays where it is - no move needed */
+    }
   }
 }
 
@@ -3391,6 +3419,21 @@ ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *op)
     return;
   }
 
+  if (op->src1.pr0 & PREG_SPILLED)
+  {
+    if (op->dest.pr0 >= 0 && !(op->dest.pr0 & PREG_SPILLED))
+    {
+      load_to_register(op->dest.pr0, -1, &op->src1);
+      return;
+    }
+    else if (op->dest.pr0 & PREG_SPILLED)
+    {
+      load(R12, &op->src1);
+      store(R12, &op->dest);
+      return;
+    }
+  }
+
   if (op->dest.pr0 == op->src1.pr0)
     return;
 
@@ -3508,19 +3551,46 @@ static int is_64bit_type(int t)
   return (bt == VT_DOUBLE || bt == VT_LDOUBLE || bt == VT_LLONG);
 }
 
-static void load_to_register(int reg, int reg_from, SValue *src)
+static void load_to_register(int reg, int reg_from, SValue *sv)
 {
-  if (src->pr0 == -1)
+  if ((sv->r & VT_VALMASK) == VT_LOCAL)
   {
-    load(reg, src);
-  }
-  else
-  {
-    if (reg != reg_from)
+    if (sv->pr0 >= 0 && !(sv->pr0 & PREG_SPILLED))
     {
-      ot_check(
-          th_mov_reg(reg, reg_from, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
+      // load local variable from register
+      if (reg != reg_from)
+      {
+        ot_check(th_mov_reg(reg, reg_from, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE,
+                            false));
+      }
+      return;
     }
+    if (sv->pr0 == -1 || (sv->pr0 & PREG_SPILLED))
+    {
+      /* Spilled local variable - load from stack */
+      load(reg, sv);
+      return;
+    }
+    if (sv->r & VT_LVAL)
+    {
+      /* Lvalue: need to load from memory */
+      load(reg, sv);
+      return;
+    }
+  }
+
+  if ((sv->r & VT_LVAL) || sv->pr0 == -1 || (sv->pr0 & PREG_SPILLED))
+  {
+    /* Lvalue: need to load from memory */
+    load(reg, sv);
+    return;
+  }
+
+  /* Value is in a valid register - move it */
+  if (reg != sv->pr0)
+  {
+    ot_check(
+        th_mov_reg(reg, sv->pr0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
   }
 }
 
@@ -3589,12 +3659,23 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
     }
   }
 
-  /* Reverse param_indices so they're in correct order (param 1, 2, 3...) */
-  for (int i = 0; i < param_count / 2; i++)
+  /* Sort param_indices by their actual parameter number (src2.c.i).
+   * The backward scan collects them in arbitrary order, but we need them
+   * in ascending parameter order (1, 2, 3, ...) for correct argument passing. */
+  for (int i = 0; i < param_count - 1; i++)
   {
-    int tmp = param_indices[i];
-    param_indices[i] = param_indices[param_count - 1 - i];
-    param_indices[param_count - 1 - i] = tmp;
+    for (int j = i + 1; j < param_count; j++)
+    {
+      int param_num_i = ir->instructions[param_indices[i]].src2.c.i;
+      int param_num_j = ir->instructions[param_indices[j]].src2.c.i;
+      if (param_num_i > param_num_j)
+      {
+        /* Swap to put lower param number first */
+        int tmp = param_indices[i];
+        param_indices[i] = param_indices[j];
+        param_indices[j] = tmp;
+      }
+    }
   }
 
   /* First pass: calculate register and stack slot assignments for each argument
@@ -3751,6 +3832,15 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
     ot_check(th_push(registers_to_push));
   }
   gcall_or_jump(0, &q->src1);
+
+  /* Invalidate global symbol cache after function call.
+   * All caller-saved registers (R0-R3, R12, LR) are clobbered by the call,
+   * so any cached global address in those registers is now invalid. */
+  if (th_is_caller_saved_register(thumb_gen_state.cached_global_reg))
+  {
+    thumb_gen_state.cached_global_sym = NULL;
+    thumb_gen_state.cached_global_reg = -1;
+  }
   if (registers_to_push != 0)
   {
     ot_check(th_pop(registers_to_push));
@@ -3797,23 +3887,94 @@ ST_FUNC void tcc_gen_machine_conditional_jump_op(TACQuadruple *q)
 ST_FUNC void tcc_gen_machine_setif_op(TACQuadruple *q)
 {
   /* Convert comparison flags to 0/1 value in destination register
-   * Using IT (If-Then) block:
-   *   MOV Rd, #0          ; default to 0 (must NOT set flags!)
-   *   IT <cond>           ; If-Then for condition
+   * Using ITE (If-Then-Else) block for smaller code:
+   *   ITE <cond>          ; If-Then-Else for condition
    *   MOV<cond> Rd, #1    ; set to 1 if condition true
+   *   MOV<!cond> Rd, #0   ; set to 0 if condition false
    */
   int op = mapcc(q->src1.c.i);
   int dest = q->dest.pr0;
 
-  /* First set dest to 0 - must use FLAGS_BEHAVIOUR_BLOCK to avoid clobbering
-   * the condition flags from the preceding CMP instruction */
-  ot_check(th_mov_imm(dest, 0, FLAGS_BEHAVIOUR_BLOCK, ENFORCE_ENCODING_NONE));
+  /* ITE instruction: mask = 0x4 for ITE pattern (Then followed by Else)
+   * The mask encoding: bit 3 = first instr matches cond (1=T)
+   *                    bit 2 = second instr matches cond (0=E)
+   *                    bit 1 = 0 (end of block)
+   * For ITE: mask = 0b0100 = 0x4  (T, then E, then end)
+   * Actually for 2-instruction block: mask should be 0xC (1100) for IT, 0x4 (0100) for IE
+   * Wait, let me recalculate:
+   * mask[3] = 1 if last instruction matches firstcond, 0 otherwise
+   * mask[3:0] with trailing 1 marks end
+   * IT (1 instr): mask = 0x8 (1000)
+   * ITE (2 instr): mask = 0x4 (0100) - first is T, second is E
+   */
+  /* For EQ the mask 0x4 encodes ITT (both Then). Use 0xC to get ITE. */
+  uint16_t it_mask = (op == 0 /* EQ */) ? 0xC : 0x4;
+  ot_check(th_it(op, it_mask)); /* ITE: Then, Else */
 
-  /* IT instruction with single Then (mask = 0x8) */
-  ot_check(th_it(op, 0x8));
-
-  /* Conditional MOV to 1 - let encoder choose best size */
+  /* Conditional MOV to 1 if condition true */
   ot_check(th_mov_imm(dest, 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+
+  /* Conditional MOV to 0 if condition false (the Else part) */
+  ot_check(th_mov_imm(dest, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+}
+
+ST_FUNC void tcc_gen_machine_bool_op(TACQuadruple *q)
+{
+  /* Optimized boolean OR/AND operations:
+   * For BOOL_OR (x || y):
+   *   ORRS Rd, Rsrc1, Rsrc2   ; Rd = src1 | src2, sets Z flag
+   *   ITE ne
+   *   MOVNE Rd, #1            ; if result non-zero, set to 1
+   *   MOVEQ Rd, #0            ; if result zero, set to 0
+   *
+   * For BOOL_AND (x && y):
+   *   CMP Rsrc1, #0           ; check if src1 is zero
+   *   IT eq
+   *   CMPEQ Rsrc2, #0         ; if src1 == 0, force EQ (compare 0 with anything)
+   *   Actually... use CBZ or simpler approach:
+   *
+   *   Better for AND:
+   *   SUBS temp, src1, #0    ; temp = src1, sets Z if src1==0, preserves NE if src1!=0
+   *   IT ne
+   *   SUBSNE temp, src2, #0  ; if src1!=0, check src2 - sets NE if src2!=0
+   *   ITE ne
+   *   MOVNE dest, #1
+   *   MOVEQ dest, #0
+   */
+  int dest = q->dest.pr0;
+  int src1 = q->src1.pr0;
+  int src2 = q->src2.pr0;
+
+  if (q->op == TCCIR_OP_BOOL_OR)
+  {
+    /* ORRS sets flags based on result */
+    ot_check(th_orr_reg(dest, src1, src2, FLAGS_BEHAVIOUR_SET, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+
+    /* ITE ne: if result != 0, dest = 1, else dest = 0 */
+    ot_check(th_it(0x1, 0x4)); /* ITE NE (condition code 0x1 = NE) */
+    ot_check(th_mov_imm(dest, 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    ot_check(th_mov_imm(dest, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+  }
+  else /* TCCIR_OP_BOOL_AND */
+  {
+    /* For AND: (src1 != 0) && (src2 != 0)
+     * Use: CMP + IT + CMP sequence
+     *   CMP src1, #0           ; Z=1 if src1==0
+     *   IT ne                  ; only execute next if src1 != 0
+     *   CMPNE src2, #0         ; Z=1 if src2==0 (only if src1!=0)
+     *   ; Now: Z=0 (NE) only if both src1!=0 AND src2!=0
+     *   ITE ne
+     *   MOVNE dest, #1
+     *   MOVEQ dest, #0
+     */
+    ot_check(th_cmp_imm(0, src1, 0, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE));
+    ot_check(th_it(0x1, 0x8)); /* IT NE (single instruction) */
+    ot_check(th_cmp_imm(0, src2, 0, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE));
+    /* Now flags reflect: NE if both non-zero, EQ if either zero */
+    ot_check(th_it(0x1, 0x4)); /* ITE NE */
+    ot_check(th_mov_imm(dest, 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    ot_check(th_mov_imm(dest, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+  }
 }
 
 ST_FUNC void tcc_gen_machine_backpatch_jump(int address, int offset)

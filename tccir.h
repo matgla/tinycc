@@ -72,6 +72,9 @@ typedef enum TccIrOp
   TCCIR_OP_CVT_FTOF, /* float to double or double to float */
   TCCIR_OP_CVT_ITOF, /* int to float/double */
   TCCIR_OP_CVT_FTOI, /* float/double to int */
+  /* Logical boolean operations - produce 0/1 result */
+  TCCIR_OP_BOOL_OR,  /* (src1 != 0) || (src2 != 0) -> 0/1 */
+  TCCIR_OP_BOOL_AND, /* (src1 != 0) && (src2 != 0) -> 0/1 */
 } TccIrOp;
 
 typedef struct CType CType;
@@ -183,6 +186,10 @@ void tcc_ir_backpatch_first(TCCIRState *ir, int t, int target_address);
 int tcc_ir_gjmp_append(TCCIRState *ir, int n, int t);
 int tcc_ir_generate_test(TCCIRState *ir, int inv, int t);
 int tcc_ir_dead_code_elimination(TCCIRState *ir);
+int tcc_ir_dead_store_elimination(TCCIRState *ir);
+int tcc_ir_bool_cse(TCCIRState *ir);
+int tcc_ir_bool_idempotent(TCCIRState *ir);
+int tcc_ir_bool_simplification(TCCIRState *ir);
 void tcc_ir_print_vreg(int vreg);
 void tcc_ir_generate_cmp_jmp_set(TCCIRState *ir);
 void tcc_ir_start_basic_block(TCCIRState *ir);

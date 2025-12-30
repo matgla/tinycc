@@ -1902,6 +1902,7 @@ ST_FUNC void tcc_gen_machine_restore_call_context(void);
 ST_FUNC void tcc_gen_machine_jump_op(TACQuadruple *q);
 ST_FUNC void tcc_gen_machine_conditional_jump_op(TACQuadruple *q);
 ST_FUNC void tcc_gen_machine_setif_op(TACQuadruple *q);
+ST_FUNC void tcc_gen_machine_bool_op(TACQuadruple *q);
 ST_FUNC void tcc_gen_machine_backpatch_jump(int address, int offset);
 
 ST_FUNC const char *tcc_get_abi_softcall_name(TACQuadruple *q);
