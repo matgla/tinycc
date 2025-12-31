@@ -191,12 +191,6 @@ enum
 
 #define CHAR_IS_UNSIGNED
 
-#ifdef TCC_ARM_HARDFLOAT
-#define ARM_FLOAT_ABI ARM_HARD_FLOAT
-#else
-#define ARM_FLOAT_ABI ARM_SOFTFP_FLOAT
-#endif
-
 #else // TARGET_DEFS_ONLY
 
 #define USING_GLOBALS
@@ -366,209 +360,209 @@ static uint32_t intr(int r);
 static uint32_t vfpr(int r);
 #endif
 
-struct avail_regs
-{
-  signed char avail[3]; /* 3 holes max with only float and double alignments */
-  int first_hole;       /* first available hole */
-  int last_hole;        /* last available hole (none if equal to first_hole) */
-  int first_free_reg;   /* next free register in the sequence, hole excluded */
-};
-#define AVAIL_REGS_INITIALIZER (struct avail_regs){{0, 0, 0}, 0, 0, 0}
-/* Find suitable registers for a VFP Co-Processor Register Candidate (VFP CPRC
-   param) according to the rules described in the procedure call standard for
-   the ARM architecture (AAPCS). If found, the registers are assigned to this
-   VFP CPRC parameter. Registers are allocated in sequence unless a hole exists
-   and the parameter is a single float.
+// struct avail_regs
+// {
+//   signed char avail[3]; /* 3 holes max with only float and double alignments */
+//   int first_hole;       /* first available hole */
+//   int last_hole;        /* last available hole (none if equal to first_hole) */
+//   int first_free_reg;   /* next free register in the sequence, hole excluded */
+// };
+// #define AVAIL_REGS_INITIALIZER (struct avail_regs){{0, 0, 0}, 0, 0, 0}
+// /* Find suitable registers for a VFP Co-Processor Register Candidate (VFP CPRC
+//    param) according to the rules described in the procedure call standard for
+//    the ARM architecture (AAPCS). If found, the registers are assigned to this
+//    VFP CPRC parameter. Registers are allocated in sequence unless a hole exists
+//    and the parameter is a single float.
 
-   avregs: opaque structure to keep track of available VFP co-processor regs
-   align: alignment constraints for the param, as returned by type_size()
-   size: size of the parameter, as returned by type_size() */
-int assign_vfpreg(struct avail_regs *avregs, int align, int size)
-{
-  int first_reg = 0;
+//    avregs: opaque structure to keep track of available VFP co-processor regs
+//    align: alignment constraints for the param, as returned by type_size()
+//    size: size of the parameter, as returned by type_size() */
+// int assign_vfpreg(struct avail_regs *avregs, int align, int size)
+// {
+//   int first_reg = 0;
 
-  if (avregs->first_free_reg == -1)
-    return -1;
-  if (align >> 3)
-  { /* double alignment */
-    first_reg = avregs->first_free_reg;
-    /* alignment constraint not respected so use next reg and record hole */
-    if (first_reg & 1)
-      avregs->avail[avregs->last_hole++] = first_reg++;
-  }
-  else
-  { /* no special alignment (float or array of float) */
-    /* if single float and a hole is available, assign the param to it */
-    if (size == 4 && avregs->first_hole != avregs->last_hole)
-      return avregs->avail[avregs->first_hole++];
-    else
-      first_reg = avregs->first_free_reg;
-  }
-  if (first_reg + size / 4 <= 16)
-  {
-    avregs->first_free_reg = first_reg + size / 4;
-    return first_reg;
-  }
-  avregs->first_free_reg = -1;
-  return -1;
-}
+//   if (avregs->first_free_reg == -1)
+//     return -1;
+//   if (align >> 3)
+//   { /* double alignment */
+//     first_reg = avregs->first_free_reg;
+//     /* alignment constraint not respected so use next reg and record hole */
+//     if (first_reg & 1)
+//       avregs->avail[avregs->last_hole++] = first_reg++;
+//   }
+//   else
+//   { /* no special alignment (float or array of float) */
+//     /* if single float and a hole is available, assign the param to it */
+//     if (size == 4 && avregs->first_hole != avregs->last_hole)
+//       return avregs->avail[avregs->first_hole++];
+//     else
+//       first_reg = avregs->first_free_reg;
+//   }
+//   if (first_reg + size / 4 <= 16)
+//   {
+//     avregs->first_free_reg = first_reg + size / 4;
+//     return first_reg;
+//   }
+//   avregs->first_free_reg = -1;
+//   return -1;
+// }
 
-/* Parameters are classified according to how they are copied to their final
-   destination for the function call. Because the copying is performed class
-   after class according to the order in the union below, it is important that
-   some constraints about the order of the members of this union are respected:
-   - CORE_STRUCT_CLASS must come after STACK_CLASS;
-   - CORE_CLASS must come after STACK_CLASS, CORE_STRUCT_CLASS and
-     VFP_STRUCT_CLASS;
-   - VFP_STRUCT_CLASS must come after VFP_CLASS.
-   See the comment for the main loop in copy_params() for the reason. */
-enum reg_class
-{
-  STACK_CLASS = 0,
-  CORE_STRUCT_CLASS,
-  VFP_CLASS,
-  VFP_STRUCT_CLASS,
-  CORE_CLASS,
-  NB_CLASSES
-};
+// /* Parameters are classified according to how they are copied to their final
+//    destination for the function call. Because the copying is performed class
+//    after class according to the order in the union below, it is important that
+//    some constraints about the order of the members of this union are respected:
+//    - CORE_STRUCT_CLASS must come after STACK_CLASS;
+//    - CORE_CLASS must come after STACK_CLASS, CORE_STRUCT_CLASS and
+//      VFP_STRUCT_CLASS;
+//    - VFP_STRUCT_CLASS must come after VFP_CLASS.
+//    See the comment for the main loop in copy_params() for the reason. */
+// enum reg_class
+// {
+//   STACK_CLASS = 0,
+//   CORE_STRUCT_CLASS,
+//   VFP_CLASS,
+//   VFP_STRUCT_CLASS,
+//   CORE_CLASS,
+//   NB_CLASSES
+// };
 
-struct param_plan
-{
-  int start;               /* first reg or addr used depending on the class */
-  int end;                 /* last reg used or next free addr depending on the class */
-  SValue *sval;            /* pointer to SValue on the value stack */
-  struct param_plan *prev; /*  previous element in this class */
-};
+// struct param_plan
+// {
+//   int start;               /* first reg or addr used depending on the class */
+//   int end;                 /* last reg used or next free addr depending on the class */
+//   SValue *sval;            /* pointer to SValue on the value stack */
+//   struct param_plan *prev; /*  previous element in this class */
+// };
 
-struct plan
-{
-  struct param_plan *pplans;               /* array of all the param plans */
-  struct param_plan *clsplans[NB_CLASSES]; /* per class lists of param plans */
-  int nb_plans;
-};
+// struct plan
+// {
+//   struct param_plan *pplans;               /* array of all the param plans */
+//   struct param_plan *clsplans[NB_CLASSES]; /* per class lists of param plans */
+//   int nb_plans;
+// };
 
-static void add_param_plan(struct plan *plan, int cls, int start, int end, SValue *v)
-{
-  struct param_plan *p = &plan->pplans[plan->nb_plans++];
-  p->prev = plan->clsplans[cls];
-  plan->clsplans[cls] = p;
-  p->start = start, p->end = end, p->sval = v;
-}
+// static void add_param_plan(struct plan *plan, int cls, int start, int end, SValue *v)
+// {
+//   struct param_plan *p = &plan->pplans[plan->nb_plans++];
+//   p->prev = plan->clsplans[cls];
+//   plan->clsplans[cls] = p;
+//   p->start = start, p->end = end, p->sval = v;
+// }
 
-/* Assign parameters to registers and stack with alignment according to the
-   rules in the procedure call standard for the ARM architecture (AAPCS).
-   The overall assignment is recorded in an array of per parameter structures
-   called parameter plans. The parameter plans are also further organized in a
-   number of linked lists, one per class of parameter (see the comment for the
-   definition of union reg_class).
+// /* Assign parameters to registers and stack with alignment according to the
+//    rules in the procedure call standard for the ARM architecture (AAPCS).
+//    The overall assignment is recorded in an array of per parameter structures
+//    called parameter plans. The parameter plans are also further organized in a
+//    number of linked lists, one per class of parameter (see the comment for the
+//    definition of union reg_class).
 
-   nb_args: number of parameters of the function for which a call is generated
-   float_abi: float ABI in use for this function call
-   plan: the structure where the overall assignment is recorded
-   todo: a bitmap that record which core registers hold a parameter
+//    nb_args: number of parameters of the function for which a call is generated
+//    float_abi: float ABI in use for this function call
+//    plan: the structure where the overall assignment is recorded
+//    todo: a bitmap that record which core registers hold a parameter
 
-   Returns the amount of stack space needed for parameter passing
+//    Returns the amount of stack space needed for parameter passing
 
-   Note: this function allocated an array in plan->pplans with tcc_malloc. It
-   is the responsibility of the caller to free this array once used (ie not
-   before copy_params). */
-static int assign_regs(int nb_args, int float_abi, struct plan *plan, int *todo)
-{
-  int i, size, align;
-  int ncrn /* next core register number */, nsaa /* next stacked argument address*/;
-  struct avail_regs avregs = {{0}};
+//    Note: this function allocated an array in plan->pplans with tcc_malloc. It
+//    is the responsibility of the caller to free this array once used (ie not
+//    before copy_params). */
+// static int assign_regs(int nb_args, int float_abi, struct plan *plan, int *todo)
+// {
+//   int i, size, align;
+//   int ncrn /* next core register number */, nsaa /* next stacked argument address*/;
+//   struct avail_regs avregs = {{0}};
 
-  ncrn = nsaa = 0;
-  *todo = 0;
+//   ncrn = nsaa = 0;
+//   *todo = 0;
 
-  for (i = nb_args; i--;)
-  {
-    int j, start_vfpreg = 0;
-    CType type = vtop[-i].type;
-    ElfSym *sym = NULL;
-    type.t &= ~VT_ARRAY;
-    size = type_size(&type, &align);
-    size = (size + 3) & ~3;
-    align = (align + 3) & ~3;
-    // if argument is a function pointer, then symbol must be exported
-    if (vtop[-i].r & VT_SYM)
-    {
-      if (((type.t & VT_BTYPE) == VT_FUNC) ||
-          ((type.t & VT_BTYPE) == VT_PTR && type.ref && (type.ref->type.t & VT_BTYPE) == VT_FUNC))
-      {
-        sym = elfsym(vtop[-i].sym);
-      }
-    }
-    if (sym != NULL)
-    {
-      sym->st_info |= (STB_GLOBAL << 4);
-    }
+//   for (i = nb_args; i--;)
+//   {
+//     int j, start_vfpreg = 0;
+//     CType type = vtop[-i].type;
+//     ElfSym *sym = NULL;
+//     type.t &= ~VT_ARRAY;
+//     size = type_size(&type, &align);
+//     size = (size + 3) & ~3;
+//     align = (align + 3) & ~3;
+//     // if argument is a function pointer, then symbol must be exported
+//     if (vtop[-i].r & VT_SYM)
+//     {
+//       if (((type.t & VT_BTYPE) == VT_FUNC) ||
+//           ((type.t & VT_BTYPE) == VT_PTR && type.ref && (type.ref->type.t & VT_BTYPE) == VT_FUNC))
+//       {
+//         sym = elfsym(vtop[-i].sym);
+//       }
+//     }
+//     if (sym != NULL)
+//     {
+//       sym->st_info |= (STB_GLOBAL << 4);
+//     }
 
-    switch (vtop[-i].type.t & VT_BTYPE)
-    {
-    case VT_STRUCT:
-    case VT_FLOAT:
-    case VT_DOUBLE:
-    case VT_LDOUBLE:
-      if (float_abi == ARM_HARD_FLOAT)
-      {
-        int is_hfa = 0; /* Homogeneous float aggregate */
+//     switch (vtop[-i].type.t & VT_BTYPE)
+//     {
+//     case VT_STRUCT:
+//     case VT_FLOAT:
+//     case VT_DOUBLE:
+//     case VT_LDOUBLE:
+//       if (float_abi == ARM_HARD_FLOAT)
+//       {
+//         int is_hfa = 0; /* Homogeneous float aggregate */
 
-        if (is_float(vtop[-i].type.t) || (is_hfa = is_hgen_float_aggr(&vtop[-i].type)))
-        {
-          int end_vfpreg;
+//         if (is_float(vtop[-i].type.t) || (is_hfa = is_hgen_float_aggr(&vtop[-i].type)))
+//         {
+//           int end_vfpreg;
 
-          start_vfpreg = assign_vfpreg(&avregs, align, size);
-          end_vfpreg = start_vfpreg + ((size - 1) >> 2);
-          if (start_vfpreg >= 0)
-          {
-            add_param_plan(plan, is_hfa ? VFP_STRUCT_CLASS : VFP_CLASS, start_vfpreg, end_vfpreg, &vtop[-i]);
-            continue;
-          }
-          else
-            break;
-        }
-      }
-      ncrn = (ncrn + (align - 1) / 4) & ~((align / 4) - 1);
-      if (ncrn + size / 4 <= 4 || (ncrn < 4 && start_vfpreg != -1))
-      {
-        /* The parameter is allocated both in core register and on stack. As
-         * such, it can be of either class: it would either be the last of
-         * CORE_STRUCT_CLASS or the first of STACK_CLASS. */
-        for (j = ncrn; j < 4 && j < ncrn + size / 4; j++)
-          *todo |= (1 << j);
-        add_param_plan(plan, CORE_STRUCT_CLASS, ncrn, j, &vtop[-i]);
-        ncrn += size / 4;
-        if (ncrn > 4)
-          nsaa = (ncrn - 4) * 4;
-      }
-      else
-      {
-        ncrn = 4;
-        break;
-      }
-      continue;
-    default:
-      if (ncrn < 4)
-      {
-        int is_long = (vtop[-i].type.t & VT_BTYPE) == VT_LLONG;
-        if (is_long)
-        {
-          ncrn = (ncrn + 1) & -2;
-          if (ncrn == 4)
-            break;
-        }
-        add_param_plan(plan, CORE_CLASS, ncrn, ncrn + is_long, &vtop[-i]);
-        ncrn += 1 + is_long;
-        continue;
-      }
-    }
-    nsaa = (nsaa + (align - 1)) & ~(align - 1);
-    add_param_plan(plan, STACK_CLASS, nsaa, nsaa + size, &vtop[-i]);
-    nsaa += size; /* size already rounded up before */
-  }
-  return nsaa;
-}
+//           start_vfpreg = assign_vfpreg(&avregs, align, size);
+//           end_vfpreg = start_vfpreg + ((size - 1) >> 2);
+//           if (start_vfpreg >= 0)
+//           {
+//             add_param_plan(plan, is_hfa ? VFP_STRUCT_CLASS : VFP_CLASS, start_vfpreg, end_vfpreg, &vtop[-i]);
+//             continue;
+//           }
+//           else
+//             break;
+//         }
+//       }
+//       ncrn = (ncrn + (align - 1) / 4) & ~((align / 4) - 1);
+//       if (ncrn + size / 4 <= 4 || (ncrn < 4 && start_vfpreg != -1))
+//       {
+//         /* The parameter is allocated both in core register and on stack. As
+//          * such, it can be of either class: it would either be the last of
+//          * CORE_STRUCT_CLASS or the first of STACK_CLASS. */
+//         for (j = ncrn; j < 4 && j < ncrn + size / 4; j++)
+//           *todo |= (1 << j);
+//         add_param_plan(plan, CORE_STRUCT_CLASS, ncrn, j, &vtop[-i]);
+//         ncrn += size / 4;
+//         if (ncrn > 4)
+//           nsaa = (ncrn - 4) * 4;
+//       }
+//       else
+//       {
+//         ncrn = 4;
+//         break;
+//       }
+//       continue;
+//     default:
+//       if (ncrn < 4)
+//       {
+//         int is_long = (vtop[-i].type.t & VT_BTYPE) == VT_LLONG;
+//         if (is_long)
+//         {
+//           ncrn = (ncrn + 1) & -2;
+//           if (ncrn == 4)
+//             break;
+//         }
+//         add_param_plan(plan, CORE_CLASS, ncrn, ncrn + is_long, &vtop[-i]);
+//         ncrn += 1 + is_long;
+//         continue;
+//       }
+//     }
+//     nsaa = (nsaa + (align - 1)) & ~(align - 1);
+//     add_param_plan(plan, STACK_CLASS, nsaa, nsaa + size, &vtop[-i]);
+//     nsaa += size; /* size already rounded up before */
+//   }
+//   return nsaa;
+// }
 
 static void th_literal_pool_init()
 {
@@ -998,98 +992,102 @@ static void gadd_sp(int val)
   }
 }
 
-// all params needs to be passed in core registers or not
-static int floats_in_core_regs(const SValue *sval)
-{
-  if (!sval->sym)
-  {
-    return 0;
-  }
+// // all params needs to be passed in core registers or not
+// static int floats_in_core_regs(const SValue *sval)
+// {
+//   if (!sval->sym)
+//   {
+//     return 0;
+//   }
 
-  switch (sval->sym->v)
-  {
-  case TOK___floatundidf:
-  case TOK___floatundisf:
-  case TOK___fixunsdfdi:
-  case TOK___fixunssfdi:
-  case TOK___floatdisf:
-  case TOK___floatdidf:
-  case TOK___fixsfdi:
-  case TOK___fixdfdi:
-    return 1;
-  default:
-    return 0;
-  }
-}
+//   switch (sval->sym->v)
+//   {
+//   case TOK___floatundidf:
+//   case TOK___floatundisf:
+//   case TOK___fixunsdfdi:
+//   case TOK___fixunssfdi:
+//   case TOK___floatdisf:
+//   case TOK___floatdidf:
+//   case TOK___fixsfdi:
+//   case TOK___fixdfdi:
+//     return 1;
+//   default:
+//     return 0;
+//   }
+// }
 
 void ggoto(void)
 {
   TRACE("'ggoto'");
-  // gcall_or_jmp(1);
-
+  // Computed goto - vtop contains the target address (pointer)
+  // Emit an IR jump instruction with the target from vtop
+  SValue dest;
+  memset(&dest, 0, sizeof(SValue));
+  dest = *vtop; // Copy vtop as the jump destination (indirect jump)
+  tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
   vtop--;
   print_vstack("ggoto");
 }
 
-ST_FUNC int gjmp(int t)
-{
-  int r = ind;
-  int val = ((t - r) >> 1) - 2;
-  TRACE("gjump t: 0x%x, r: %d, val: %d", t, r, val);
-  if (nocode_wanted)
-    return t;
+// ST_FUNC int gjmp(int t)
+// {
+//   int r = ind;
+//   int val = ((t - r) >> 1) - 2;
+//   TRACE("gjump t: 0x%x, r: %d, val: %d", t, r, val);
+//   if (nocode_wanted)
+//     return t;
 
-  // disable T16 instruction until root cause is found
-  // if (val < -1024 || val > 1023)
-  ot_check(th_b_t4(val << 1));
-  // else
-  // ot_check(th_b_t2(val << 1));
-  return r;
-}
+//   // disable T16 instruction until root cause is found
+//   // if (val < -1024 || val > 1023)
+//   ot_check(th_b_t4(val << 1));
+//   // else
+//   // ot_check(th_b_t2(val << 1));
+//   return r;
+// }
 
-ST_FUNC void gjmp_addr(int a)
-{
-  TRACE("'gjump_addr'");
-  gjmp(a);
-}
+// ST_FUNC void gjmp_addr(int a)
+// {
+//   TRACE("'gjump_addr'");
+//   gjmp(a);
+// }
 
-ST_FUNC int gjmp_append(int n, int t)
-{
-  int p, lp;
-  TRACE("gjmp_append n: 0x%x, t: 0x%x", n, t);
-  if (n)
-  {
-    p = n;
-    do
-    {
-      p = decbranch(lp = p);
-    } while (p);
-    th_patch_call(lp, t);
-    t = n;
-  }
-  return t;
-}
+// ST_FUNC int gjmp_append(int n, int t)
+// {
+//   int p, lp;
+//   TRACE("gjmp_append n: 0x%x, t: 0x%x", n, t);
+//   if (n)
+//   {
+//     p = n;
+//     do
+//     {
+//       p = decbranch(lp = p);
+//     } while (p);
+//     th_patch_call(lp, t);
+//     t = n;
+//   }
+//   return t;
+// }
 
-ST_FUNC int gjmp_cond(int op, int t)
-{
-  int r = ind;
+// ST_FUNC int gjmp_cond(int op, int t)
+// {
+//   int r = ind;
 
-  TRACE("'gjmp_cond' op: 0x%x, target 0x%x", op, t);
+//   TRACE("'gjmp_cond' op: 0x%x, target 0x%x", op, t);
 
-  if (nocode_wanted)
-    return t;
+//   if (nocode_wanted)
+//     return t;
 
-  op = mapcc(op);
+//   op = mapcc(op);
 
-  ot_check(th_b_t3(op, th_encbranch_20(r, t)));
-  return r;
-}
+//   ot_check(th_b_t3(op, th_encbranch_20(r, t)));
+//   return r;
+// }
 
 void gsym_addr(int t, int a)
 {
   TRACE("'gsym_addr' %.8x branch target: %.8x\n", t, a);
 
-  while (t)
+  while (t > 0) /* -1 or 0 means end of chain / no chain */
     t = th_patch_call(t, a);
 }
 
@@ -1286,8 +1284,9 @@ void store(int r, SValue *sv)
     {
       if (is_float(ft))
       {
-        /* Check if source is VFP or integer register */
-        if (r >= TREG_F0 && r <= TREG_F7)
+        /* Check if source is VFP or integer register.
+         * Only use VFP instructions if hard float ABI is enabled. */
+        if (tcc_state->float_abi == ARM_HARD_FLOAT && r >= TREG_F0 && r <= TREG_F7)
         {
           /* Source is VFP register - use VSTR */
           if ((ft & VT_BTYPE) != VT_FLOAT)
@@ -1632,8 +1631,9 @@ void load_vt_lval_vt_local(int r, SValue *sv, int ft, int fc, int sign, uint32_t
      * r values 5-12 could be TREG_F0-F7 OR physical R5-R12.
      * We use a heuristic: if r is a known scratch register (R12=12), use
      * integer path. Also check sv->pr0 - if it's PREG_SPILLED, we're loading
-     * from stack to temp register for copy, which should use integer path. */
-    int use_vfp = (r >= TREG_F0 && r <= TREG_F7);
+     * from stack to temp register for copy, which should use integer path.
+     * Only use VFP if hard float ABI is enabled. */
+    int use_vfp = (tcc_state->float_abi == ARM_HARD_FLOAT) && (r >= TREG_F0 && r <= TREG_F7);
     /* Override: if r is physical R12 (12), always use integer path */
     if (r == 12 || r == 14)
     {
@@ -2114,10 +2114,25 @@ void load(int r, SValue *sv)
     return load_vt_jmp_jmpi(r, sv);
   else if (v < VT_CONST)
   {
+    /* Check if spilled - load from stack instead of register move */
+    if (sv->pr0 & PREG_SPILLED)
+    {
+      /* Value is spilled to stack at sv->c.i offset from FP */
+      int src_offset = sv->c.i;
+      int src_sign = (src_offset < 0);
+      int src_abs = src_sign ? -src_offset : src_offset;
+      if (!load_word_from_base(r, R_FP, src_abs, src_sign))
+      {
+        int rr = th_offset_to_reg(src_abs, src_sign);
+        ot_check(th_ldr_reg(r, R_FP, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+      }
+      return;
+    }
     if (is_float(ft))
     {
-      /* Check if we're moving between VFP registers or integer registers */
-      if (r >= TREG_F0 && r <= TREG_F7 && v >= TREG_F0 && v <= TREG_F7)
+      /* Check if we're moving between VFP registers or integer registers.
+       * Only use VFP if hard float ABI is enabled. */
+      if (tcc_state->float_abi == ARM_HARD_FLOAT && r >= TREG_F0 && r <= TREG_F7 && v >= TREG_F0 && v <= TREG_F7)
       {
         /* VFP to VFP move */
         if ((ft & VT_BTYPE) == VT_FLOAT)
@@ -2174,143 +2189,143 @@ static int is_zero_on_stack(int pos)
   return vtop[pos].c.ld = 0.l;
 }
 
-static void gen_opf_regular(uint32_t opc, int fneg)
-{
-  uint32_t inst = 0;
-  int r = gv(RC_FLOAT);
-  opc |= 0xee000a00 | vfpr(r);
-  r = regmask(r);
-  if (!fneg)
-  {
-    int r2;
-    vswap();
-    r2 = gv(RC_FLOAT);
-    opc |= vfpr(r2) << 16;
-    r |= regmask(r2);
-  }
-  vtop->r = get_reg_ex(RC_FLOAT, r);
-  if (!fneg)
-  {
-    --vtop;
-    print_vstack("gen_opf_regular");
-  }
-  inst = opc | (vfpr(vtop->r) << 12);
-  o(inst >> 16);
-  o(inst);
-}
+// static void gen_opf_regular(uint32_t opc, int fneg)
+// {
+//   uint32_t inst = 0;
+//   int r = gv(RC_FLOAT);
+//   opc |= 0xee000a00 | vfpr(r);
+//   r = regmask(r);
+//   if (!fneg)
+//   {
+//     int r2;
+//     vswap();
+//     r2 = gv(RC_FLOAT);
+//     opc |= vfpr(r2) << 16;
+//     r |= regmask(r2);
+//   }
+//   vtop->r = get_reg_ex(RC_FLOAT, r);
+//   if (!fneg)
+//   {
+//     --vtop;
+//     print_vstack("gen_opf_regular");
+//   }
+//   inst = opc | (vfpr(vtop->r) << 12);
+//   o(inst >> 16);
+//   o(inst);
+// }
 
-static void gen_opf_cmp(uint32_t opc, uint32_t op)
-{
-  uint32_t inst = 0;
-  opc |= 0xeeb40a40;
-  if (op != TOK_EQ && op != TOK_NE)
-    opc |= 0x80;
+// static void gen_opf_cmp(uint32_t opc, uint32_t op)
+// {
+//   uint32_t inst = 0;
+//   opc |= 0xeeb40a40;
+//   if (op != TOK_EQ && op != TOK_NE)
+//     opc |= 0x80;
 
-  if (is_zero_on_stack(0))
-  {
-    --vtop;
-    print_vstack("gen_opf_cmp(1)");
-    inst = opc | 0x10000 | (vfpr(gv(RC_FLOAT)) << 12);
-  }
-  else
-  {
-    opc |= vfpr(gv(RC_FLOAT));
-    vswap();
-    inst = opc | (vfpr(gv(RC_FLOAT)) << 12);
-    --vtop;
-    print_vstack("gen_opf_cmp(2)");
-  }
+//   if (is_zero_on_stack(0))
+//   {
+//     --vtop;
+//     print_vstack("gen_opf_cmp(1)");
+//     inst = opc | 0x10000 | (vfpr(gv(RC_FLOAT)) << 12);
+//   }
+//   else
+//   {
+//     opc |= vfpr(gv(RC_FLOAT));
+//     vswap();
+//     inst = opc | (vfpr(gv(RC_FLOAT)) << 12);
+//     --vtop;
+//     print_vstack("gen_opf_cmp(2)");
+//   }
 
-  o(inst >> 16);
-  o(inst);
-  ot_check(th_vmrs(15));
-}
+//   o(inst >> 16);
+//   o(inst);
+//   ot_check(th_vmrs(15));
+// }
 
-void gen_opf(int op)
-{
-  const uint32_t is_double = ((vtop->type.t & VT_BTYPE) != VT_FLOAT) ? 0x100 : 0;
+// void gen_opf(int op)
+// {
+//   const uint32_t is_double = ((vtop->type.t & VT_BTYPE) != VT_FLOAT) ? 0x100 : 0;
 
-  TRACE("gen_opf op: 0x%x(%c)", op, op);
-  switch (op)
-  {
-  case '+':
-  {
-    if (is_zero_on_stack(-1))
-      vswap();
-    if (is_zero_on_stack(0))
-    {
-      --vtop;
-      print_vstack("gen_opf(+)");
-      return;
-    }
-    return gen_opf_regular(is_double | 0x00300000, 0);
-  }
-  case '-':
-  {
-    if (is_zero_on_stack(0))
-    {
-      --vtop;
-      print_vstack("gen_opf(- 1)");
-      return;
-    }
-    if (is_zero_on_stack(-1))
-    {
-      vswap();
-      --vtop;
-      print_vstack("gen_opf(- 2)");
-      return gen_opf_regular(is_double | 0x00b10040, 1);
-    }
-    else
-      return gen_opf_regular(is_double | 0x00300040, 0);
-  }
-  case '*':
-    return gen_opf_regular(is_double | 0x002000000, 0);
-  case '/':
-    return gen_opf_regular(is_double | 0x008000000, 0);
-  default:
-  {
-    if (op < TOK_ULT || op > TOK_GT)
-      tcc_error("compiler_error: unknown floating-point operation: 0x%x", op);
-    if (is_zero_on_stack(-1))
-    {
-      vswap();
-      switch (op)
-      {
-      case TOK_LT:
-        op = TOK_GT;
-        break;
-      case TOK_GE:
-        op = TOK_ULE;
-        break;
-      case TOK_LE:
-        op = TOK_GE;
-        break;
-      case TOK_GT:
-        op = TOK_ULT;
-        break;
-      }
-    }
-    gen_opf_cmp(is_double, op);
+//   TRACE("gen_opf op: 0x%x(%c)", op, op);
+//   switch (op)
+//   {
+//   case '+':
+//   {
+//     if (is_zero_on_stack(-1))
+//       vswap();
+//     if (is_zero_on_stack(0))
+//     {
+//       --vtop;
+//       print_vstack("gen_opf(+)");
+//       return;
+//     }
+//     return gen_opf_regular(is_double | 0x00300000, 0);
+//   }
+//   case '-':
+//   {
+//     if (is_zero_on_stack(0))
+//     {
+//       --vtop;
+//       print_vstack("gen_opf(- 1)");
+//       return;
+//     }
+//     if (is_zero_on_stack(-1))
+//     {
+//       vswap();
+//       --vtop;
+//       print_vstack("gen_opf(- 2)");
+//       return gen_opf_regular(is_double | 0x00b10040, 1);
+//     }
+//     else
+//       return gen_opf_regular(is_double | 0x00300040, 0);
+//   }
+//   case '*':
+//     return gen_opf_regular(is_double | 0x002000000, 0);
+//   case '/':
+//     return gen_opf_regular(is_double | 0x008000000, 0);
+//   default:
+//   {
+//     if (op < TOK_ULT || op > TOK_GT)
+//       tcc_error("compiler_error: unknown floating-point operation: 0x%x", op);
+//     if (is_zero_on_stack(-1))
+//     {
+//       vswap();
+//       switch (op)
+//       {
+//       case TOK_LT:
+//         op = TOK_GT;
+//         break;
+//       case TOK_GE:
+//         op = TOK_ULE;
+//         break;
+//       case TOK_LE:
+//         op = TOK_GE;
+//         break;
+//       case TOK_GT:
+//         op = TOK_ULT;
+//         break;
+//       }
+//     }
+//     gen_opf_cmp(is_double, op);
 
-    switch (op)
-    {
-    case TOK_LE:
-      op = TOK_ULE;
-      break;
-    case TOK_LT:
-      op = TOK_ULT;
-      break;
-    case TOK_UGE:
-      op = TOK_GE;
-      break;
-    case TOK_UGT:
-      op = TOK_GT;
-      break;
-    }
-    vset_VT_CMP(op);
-  }
-  }
-}
+//     switch (op)
+//     {
+//     case TOK_LE:
+//       op = TOK_ULE;
+//       break;
+//     case TOK_LT:
+//       op = TOK_ULT;
+//       break;
+//     case TOK_UGE:
+//       op = TOK_GE;
+//       break;
+//     case TOK_UGT:
+//       op = TOK_GT;
+//       break;
+//     }
+//     vset_VT_CMP(op);
+//   }
+//   }
+// }
 
 ST_FUNC void gen_increment_tcov(SValue *sv)
 {
@@ -2333,6 +2348,7 @@ typedef struct ThumbDataProcessingHandler
 void tcc_gen_machine_data_processing_op(TACQuadruple *op)
 {
   ThumbDataProcessingHandler handler;
+  thumb_flags_behaviour flags = FLAGS_BEHAVIOUR_NOT_IMPORTANT;
   switch (op->op)
   {
   case TCCIR_OP_ADD:
@@ -2345,6 +2361,11 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
     break;
   case TCCIR_OP_MUL:
     ot_check(th_mul(op->dest.pr0, op->src1.pr0, op->src2.pr0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    return;
+  case TCCIR_OP_UMULL:
+    /* UMULL: Unsigned 32x32 multiplication producing 64-bit result
+     * RdLo (dest.pr0), RdHi (dest.pr1) = Rn (src1.pr0) * Rm (src2.pr0) */
+    ot_check(th_umull(op->dest.pr0, op->dest.pr1, op->src1.pr0, op->src2.pr0));
     return;
   case TCCIR_OP_CMP:
     handler.imm_handler = th_cmp_imm;
@@ -2397,11 +2418,18 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
     return;
   }
   case TCCIR_OP_ADC_USE:
-    fprintf(stderr, "compiler_error: TCCIR_OP_ADC_USE not implemented\n");
-    exit(1);
+  {
+    handler.imm_handler = th_adc_imm;
+    handler.reg_handler = th_adc_reg;
+    break;
+  }
   case TCCIR_OP_ADC_GEN:
-    fprintf(stderr, "compiler_error: TCCIR_OP_ADC_GEN not implemented\n");
-    exit(1);
+  {
+    handler.imm_handler = th_adc_imm;
+    handler.reg_handler = th_adc_reg;
+    flags = FLAGS_BEHAVIOUR_SET;
+    break;
+  }
   case TCCIR_OP_TEST_ZERO:
     ot_check(th_cmp_imm(0, intr(op->src1.pr0), 0, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE));
     return;
@@ -2418,19 +2446,17 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
 
   if (th_has_immediate_value(op->src2.r))
   {
-    if (!ot(handler.imm_handler(op->dest.pr0, op->src1.pr0, op->src2.c.i, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                                ENFORCE_ENCODING_NONE)))
+    if (!ot(handler.imm_handler(op->dest.pr0, op->src1.pr0, op->src2.c.i, flags, ENFORCE_ENCODING_NONE)))
     {
       // load immediate to temp register and add
       load(R12, &op->src2);
-      ot_check(handler.reg_handler(op->dest.pr0, op->src1.pr0, R12, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                                   ENFORCE_ENCODING_NONE));
+      ot_check(handler.reg_handler(op->dest.pr0, op->src1.pr0, R12, flags, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     }
   }
   else
   {
-    ot_check(handler.reg_handler(op->dest.pr0, op->src1.pr0, op->src2.pr0, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                                 THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+    ot_check(handler.reg_handler(op->dest.pr0, op->src1.pr0, op->src2.pr0, flags, THUMB_SHIFT_DEFAULT,
+                                 ENFORCE_ENCODING_NONE));
   }
 }
 
@@ -3299,8 +3325,10 @@ ST_FUNC void tcc_gen_machine_epilog(int leaffunc)
 
 ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *op)
 {
-  int dest_is_vfp = LS_IS_VFP_REG(op->dest.pr0);
-  int src_is_vfp = LS_IS_VFP_REG(op->src1.pr0);
+  /* Only consider VFP registers if hard float ABI is enabled */
+  int use_vfp_regs = (tcc_state->float_abi == ARM_HARD_FLOAT);
+  int dest_is_vfp = use_vfp_regs && LS_IS_VFP_REG(op->dest.pr0);
+  int src_is_vfp = use_vfp_regs && LS_IS_VFP_REG(op->src1.pr0);
   /* Check both dest and src1 types for 64-bit detection - includes double,
    * ldouble, and llong. Dest may not have proper type info when assigning
    * from a 64-bit source */
@@ -3645,8 +3673,8 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
           }
           param_indices[param_count++] = i;
 
-          if (param_num == 1)
-            break; /* Param 1 is the first, we're done */
+          if (param_num == 0)
+            break; /* Param 0 is the first, we're done */
         }
       }
     }
@@ -3858,16 +3886,50 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
     return;
   }
 
-  if (tcc_is_64bit_operand(&q->dest) && q->dest.pr1 != R1)
-  {
-    ot_check(
-        th_mov_reg(q->dest.pr1, R1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
-  }
+  /* Handle the return value - move from R0 (and R1 for 64-bit) to destination */
+  int dest_spilled = (q->dest.pr0 == -1) || (q->dest.pr0 & PREG_SPILLED);
 
-  if (q->dest.pr0 != R0)
+  if (dest_spilled)
   {
-    ot_check(
-        th_mov_reg(q->dest.pr0, R0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
+    /* Result goes to stack */
+    int offset = q->dest.c.i;
+    int puw = (offset >= 0) ? 6 : 4; /* puw=6 for positive, puw=4 for negative */
+    int abs_offset = (offset >= 0) ? offset : -offset;
+
+    if (tcc_is_64bit_operand(&q->dest))
+    {
+      /* Store 64-bit result: R0 to low word, R1 to high word */
+      ot_check(th_str_imm(R0, R_FP, abs_offset, puw, ENFORCE_ENCODING_NONE));
+      /* High word is at offset+4 for positive, offset-4 (closer to FP) for negative */
+      int high_offset = (offset >= 0) ? abs_offset + 4 : abs_offset - 4;
+      int high_puw = (offset >= 0) ? 6 : 4;
+      if (high_offset < 0)
+      {
+        high_offset = -high_offset;
+        high_puw = 6;
+      }
+      ot_check(th_str_imm(R1, R_FP, high_offset, high_puw, ENFORCE_ENCODING_NONE));
+    }
+    else
+    {
+      /* Store 32-bit result */
+      ot_check(th_str_imm(R0, R_FP, abs_offset, puw, ENFORCE_ENCODING_NONE));
+    }
+  }
+  else
+  {
+    /* Result goes to register(s) */
+    if (tcc_is_64bit_operand(&q->dest) && q->dest.pr1 != R1)
+    {
+      ot_check(th_mov_reg(q->dest.pr1, R1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE,
+                          false));
+    }
+
+    if (q->dest.pr0 != R0)
+    {
+      ot_check(th_mov_reg(q->dest.pr0, R0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE,
+                          false));
+    }
   }
 
   tcc_free(param_indices);
@@ -4059,61 +4121,70 @@ ST_FUNC const char *tcc_get_abi_softcall_name(TACQuadruple *q)
     {
       return "__aeabi_d2f";
     }
+    /* Same size conversion is a no-op, no function needed */
+    return NULL;
   }
   break;
   case TCCIR_OP_CVT_FTOI:
   {
-    if ((q->src1.type.t & VT_BTYPE) == VT_FLOAT)
+    int is_float = ((q->src1.type.t & VT_BTYPE) == VT_FLOAT);
+    switch (q->dest.type.t & VT_BTYPE)
     {
-      printf("DEBUG CVT_FTOI: dest type=0x%x\n", q->dest.type.t);
-      switch (q->dest.type.t & VT_BTYPE)
-      {
-      case VT_SHORT:
-        return "__aeabi_f2h";
-      case VT_INT:
-      {
-        if (q->dest.type.t & VT_UNSIGNED)
-        {
-          return "__aeabi_f2uiz";
-        }
-        return "__aeabi_f2iz";
-      }
-      case VT_LONG:
-      {
-        if (q->dest.type.t & VT_UNSIGNED)
-        {
-          return "__aeabi_f2ulz";
-        }
-        return "__aeabi_f2lz";
-      }
-      }
+    case VT_SHORT:
+      return is_float ? "__aeabi_f2h" : "__aeabi_d2h";
+    case VT_INT:
+      if (q->dest.type.t & VT_UNSIGNED)
+        return is_float ? "__aeabi_f2uiz" : "__aeabi_d2uiz";
+    case VT_LONG:
+    {
+      if (q->dest.type.t & VT_UNSIGNED)
+        return is_float ? "__aeabi_f2ulz" : "__aeabi_d2ulz";
+      return is_float ? "__aeabi_f2lz" : "__aeabi_d2lz";
     }
-    else if ((q->src1.type.t & VT_BTYPE) == VT_DOUBLE)
-    {
-      printf("DEBUG CVT_DTOI: dest type=0x%x\n", q->dest.type.t);
-      switch (q->dest.type.t & VT_BTYPE)
-      {
-      case VT_SHORT:
-        return "__aeabi_d2h";
-      case VT_INT:
-      {
-        if (q->dest.type.t & VT_UNSIGNED)
-        {
-          return "__aeabi_d2uiz";
-        }
-        return "__aeabi_d2iz";
-      }
-      case VT_LONG:
-      {
-        if (q->dest.type.t & VT_UNSIGNED)
-        {
-          return "__aeabi_d2ulz";
-        }
-        return "__aeabi_d2lz";
-      }
-      }
     }
   }
+  break;
+  case TCCIR_OP_FCMP:
+  {
+    /* Get comparison operation from src2.c.i (stored during IR generation) */
+    int cmp_op = q->src2.c.i;
+    int is_float = (src1_size == 4);
+
+    printf("DEBUG FCMP: src type=0x%x, cmp_op=0x%x\n", q->src1.type.t, cmp_op);
+
+    switch (cmp_op)
+    {
+    case TOK_EQ:
+      return is_float ? "__aeabi_fcmpeq" : "__aeabi_dcmpeq";
+    case TOK_NE:
+      /* NE uses cmpeq and inverts the result */
+      return is_float ? "__aeabi_fcmpeq" : "__aeabi_dcmpeq";
+    case TOK_LT:
+    case TOK_ULT:
+      return is_float ? "__aeabi_fcmplt" : "__aeabi_dcmplt";
+    case TOK_LE:
+    case TOK_ULE:
+      return is_float ? "__aeabi_fcmple" : "__aeabi_dcmple";
+    case TOK_GT:
+    case TOK_UGT:
+      return is_float ? "__aeabi_fcmpgt" : "__aeabi_dcmpgt";
+    case TOK_GE:
+    case TOK_UGE:
+      return is_float ? "__aeabi_fcmpge" : "__aeabi_dcmpge";
+    default:
+      /* Fallback to cfcmple/cdcmple which sets flags */
+      return is_float ? "__aeabi_cfcmple" : "__aeabi_cdcmple";
+    }
+  }
+  break;
+  case TCCIR_OP_CVT_ITOF:
+  {
+    /* Integer to double */
+    if (q->src1.type.t & VT_UNSIGNED)
+      return dest_64bit ? "__aeabi_ui2d" : "__aeabi_ui2f";
+    return dest_64bit ? "__aeabi_i2d" : "__aeabi_i2f";
+  }
+  break;
   }
 
   return NULL;

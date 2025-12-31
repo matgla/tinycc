@@ -115,6 +115,7 @@ TCC_X = armv8m
 
 # cross libtcc1.a targets to build
 LIBTCC1_X = $(filter-out c67,$(TCC_X))
+FP_LIBS_CROSS = $(foreach X,$(TCC_X),$X-fp-libs)
 
 
 PROGS_CROSS = $(foreach X,$(TCC_X),$X-tcc$(EXESUF))
@@ -122,10 +123,15 @@ LIBTCC1_CROSS = $(foreach X,$(LIBTCC1_X),$X-libtcc1.a)
 
 $(info $(LIBTCC1_CROSS))
 # build cross compilers & libs
-cross: $(LIBTCC1_CROSS) $(PROGS_CROSS)
+cross: $(LIBTCC1_CROSS) $(PROGS_CROSS) $(FP_LIBS_CROSS)
 
 # build specific cross compiler & lib
 cross-%: %-tcc$(EXESUF) %-libtcc1.a ;
+
+fp-libs: $(FP_LIBS_CROSS)
+
+%-fp-libs: %-tcc$(EXESUF) FORCE
+	@$(MAKE) --no-print-directory -C lib CROSS_TARGET=$* fp-libs
 
 install: ; @$(MAKE) --no-print-directory  install$(CFG)
 install-strip: ; @$(MAKE) --no-print-directory  install$(CFG) CONFIG_strip=yes
@@ -371,7 +377,7 @@ distclean: clean
 	@rm -vf config.h config.mak config.texi
 	@rm -vf $(TCCDOCS)
 
-.PHONY: all clean test tar tags ETAGS doc distclean install uninstall FORCE
+.PHONY: all fp-libs clean test tar tags ETAGS doc distclean install uninstall FORCE
 
 help:
 	@echo "make"

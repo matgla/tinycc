@@ -425,8 +425,8 @@ void tcc_ir_gen_opf(TCCIRState *ir, int op)
       --vtop;
       vtop->r = VT_CMP;
       vtop->cmp_op = op;
-      vtop->jfalse = 0;
-      vtop->jtrue = 0;
+      vtop->jfalse = -1; /* -1 = no chain */
+      vtop->jtrue = -1;  /* -1 = no chain */
       return;
     }
     tcc_error("tcc_ir_gen_opf: unknown floating point operation: 0x%x", op);
@@ -531,8 +531,8 @@ void tcc_ir_gen_opi(TCCIRState *ir, int op)
     --vtop;
     vtop->r = VT_CMP;
     vtop->cmp_op = op;
-    vtop->jfalse = 0;
-    vtop->jtrue = 0;
+    vtop->jfalse = -1; /* -1 = no chain */
+    vtop->jtrue = -1;  /* -1 = no chain */
     return;
   }
 
@@ -767,27 +767,33 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
   {
     ir->basic_block_start = 0;
   }
-  else if ((!ir->prevent_coalescing) && (op == TCCIR_OP_ASSIGN) &&
-           (TCCIR_DECODE_VREG_TYPE(src1->vr) == TCCIR_VREG_TYPE_TEMP) && ((src1->r & VT_LVAL) == 0) &&
-           (src1->vr == ir->instructions[pos - 1].dest.vr) && (ir->instructions[pos - 1].op != TCCIR_OP_FUNCCALLVAL))
+  else if (op == TCCIR_OP_ASSIGN && pos > 0)
   {
-    ir->instructions[pos - 1].dest = ir->instructions[pos].dest;
-    printf("[PATCHED] ");
-    tcc_print_quadruple(&ir->instructions[pos - 1], pos - 1);
-    IRLiveInterval *interval = tcc_ir_get_live_interval(ir, src1->vr);
-    interval->start = INTERVAL_NOT_STARTED;
-    interval->end = 0;
-    printf("Setting interval of vreg %d to invalid, %p\n", src1->vr, interval);
-    if (tcc_is_vreg_valid(ir, ir->instructions[pos].dest.vr))
+    /* Try to coalesce: if assigning from a TEMP that was the dest of the previous instruction,
+     * redirect that instruction's dest to our dest and skip this ASSIGN. */
+    int can_coalesce = (!ir->prevent_coalescing) && (TCCIR_DECODE_VREG_TYPE(src1->vr) == TCCIR_VREG_TYPE_TEMP) &&
+                       ((src1->r & VT_LVAL) == 0) && (src1->vr == ir->instructions[pos - 1].dest.vr);
+    if (can_coalesce)
     {
-      IRLiveInterval *dest_interval = tcc_ir_get_live_interval(ir, ir->instructions[pos].dest.vr);
-      if (dest_interval->start == pos)
+      printf("[COALESCE] Redirecting instr %d dest from TMP to VAR\n", pos - 1);
+      ir->instructions[pos - 1].dest = ir->instructions[pos].dest;
+      printf("[PATCHED] ");
+      tcc_print_quadruple(&ir->instructions[pos - 1], pos - 1);
+      IRLiveInterval *interval = tcc_ir_get_live_interval(ir, src1->vr);
+      interval->start = INTERVAL_NOT_STARTED;
+      interval->end = 0;
+      printf("Setting interval of vreg %d to invalid, %p\n", src1->vr, interval);
+      if (tcc_is_vreg_valid(ir, ir->instructions[pos].dest.vr))
       {
-        dest_interval->start = pos - 1;
+        IRLiveInterval *dest_interval = tcc_ir_get_live_interval(ir, ir->instructions[pos].dest.vr);
+        if (dest_interval->start == pos)
+        {
+          dest_interval->start = pos - 1;
+        }
       }
+      // Mark the src1 vreg as ignored
+      return ir->next_instruction_index;
     }
-    // Mark the src1 vreg as ignored
-    return ir->next_instruction_index;
   }
 
   return ir->next_instruction_index++;
@@ -1123,11 +1129,14 @@ void tcc_ir_liveness_analysis(TCCIRState *ir)
     const int encoded_vreg = (TCCIR_VREG_TYPE_VAR << 28) | vreg;
     if (tcc_is_vreg_ignored(ir, vreg))
     {
+      printf("DEBUG: VAR:%d is ignored\n", vreg);
       continue;
     }
     start = 0;
     end = ~0;
-    if (tcc_ir_find_live_interval(ir, encoded_vreg, &start, &end, 1))
+    int found = tcc_ir_find_live_interval(ir, encoded_vreg, &start, &end, 1);
+    printf("DEBUG: VAR:%d find_live_interval returned %d, start=%d, end=%d\n", vreg, found, start, end);
+    if (found)
     {
       crosses_call = tcc_ir_has_call_in_range(ir, start, end);
       interval = tcc_ir_get_live_interval(ir, encoded_vreg);
@@ -1443,16 +1452,17 @@ int tcc_ir_dead_code_elimination(TCCIRState *ir)
       if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
       {
         int old_target = q->dest.c.i;
-        if (old_target < n)
+        if (old_target >= 0 && old_target < n)
         {
           q->dest.c.i = new_index[old_target];
         }
-        else
+        else if (old_target >= n)
         {
           /* Target is past the end (epilogue) - adjust for removed instructions
            */
           q->dest.c.i = new_count;
         }
+        /* else: old_target < 0 means unpatched jump, leave as -1 */
       }
 
       /* Move instruction to new position if needed */
@@ -1562,10 +1572,11 @@ int tcc_ir_dead_store_elimination(TCCIRState *ir)
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
     {
       int old_target = q->dest.c.i;
-      if (old_target < n && new_index[old_target] >= 0)
+      if (old_target >= 0 && old_target < n && new_index[old_target] >= 0)
         q->dest.c.i = new_index[old_target];
       else if (old_target >= n)
         q->dest.c.i = write_pos; /* Past end */
+      /* else: old_target < 0 means unpatched, leave as -1 */
     }
   }
 
@@ -1895,8 +1906,12 @@ static void tcc_ir_backpatch_jumps(TCCIRState *ir, uint32_t *ir_to_code_mapping)
     q = &ir->instructions[i];
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
     {
+      int target_ir = q->dest.c.i;
+      /* Skip unpatched jumps (target is -1) */
+      if (target_ir < 0 || target_ir >= ir->next_instruction_index)
+        continue;
       const int instruction_address = ir_to_code_mapping[i];
-      const int target_address = ir_to_code_mapping[q->dest.c.i];
+      const int target_address = ir_to_code_mapping[target_ir];
       tcc_gen_machine_backpatch_jump(instruction_address, target_address);
     }
   }
@@ -2308,7 +2323,8 @@ void tcc_ir_generate_code(TCCIRState *ir)
        * handle their own destination storage (e.g., float conversions that
        * may need to store to spilled stack locations) */
       if (tcc_ir_operand_in_memory(&q->dest) && (q->op != TCCIR_OP_ASSIGN) && (q->op != TCCIR_OP_STORE) &&
-          (q->op != TCCIR_OP_CVT_FTOF) && (q->op != TCCIR_OP_CVT_ITOF) && (q->op != TCCIR_OP_CVT_FTOI))
+          (q->op != TCCIR_OP_CVT_FTOF) && (q->op != TCCIR_OP_CVT_ITOF) && (q->op != TCCIR_OP_CVT_FTOI) &&
+          (q->op != TCCIR_OP_FUNCCALLVAL))
       {
         /* Skip 64-bit types - need special handling */
         if (!tcc_ir_is_64bit_type(q->dest.type.t))
@@ -2334,6 +2350,9 @@ void tcc_ir_generate_code(TCCIRState *ir)
     case TCCIR_OP_DIV:
     case TCCIR_OP_UDIV:
     case TCCIR_OP_SAR:
+    case TCCIR_OP_UMULL:
+    case TCCIR_OP_ADC_GEN:
+    case TCCIR_OP_ADC_USE:
       tcc_gen_machine_data_processing_op(q);
       break;
     case TCCIR_OP_FADD:
@@ -2369,7 +2388,7 @@ void tcc_ir_generate_code(TCCIRState *ir)
       break;
     case TCCIR_OP_FUNCPARAMVAL:
     {
-      const int param_num = q->src2.c.i; /* 1-based param number */
+      const int param_num = q->src2.c.i; /* 0-based param number */
       tcc_gen_machine_func_param_op(q, param_num, i);
       break;
     }
@@ -2452,10 +2471,16 @@ void print_svalue_short(SValue *sv)
     {
       printf("GlobalSym(%d)", sv->sym->v);
       if (sv->c.i != 0)
-        printf("+%d", sv->c.i);
+        printf("+%d", (int)sv->c.i);
     }
     else
-      printf("#%d", sv->c.i);
+    {
+      /* Check if this is a long long constant */
+      if ((sv->type.t & VT_BTYPE) == VT_LLONG)
+        printf("#%lld", (long long)sv->c.i);
+      else
+        printf("#%d", (int)sv->c.i);
+    }
     break;
   case VT_LLOCAL:
     printf("VT_LLOCAL (cval=%d)", sv->c.i);
@@ -2750,32 +2775,52 @@ void tcc_ir_drop_return_value(TCCIRState *ir)
   TACQuadruple *last_instr = &ir->instructions[ir->next_instruction_index - 1];
   if (last_instr->op == TCCIR_OP_FUNCCALLVAL)
   {
-    if (tcc_is_vreg_valid(ir, last_instr->dest.vr))
+    /* Only drop return values that are assigned to temporaries.
+     * If coalescing redirected the dest to a VAR, the value IS used
+     * and should not be dropped. */
+    if (TCCIR_DECODE_VREG_TYPE(last_instr->dest.vr) == TCCIR_VREG_TYPE_TEMP)
     {
-      IRLiveInterval *interval = tcc_ir_get_live_interval(ir, last_instr->dest.vr);
-      interval->start = INTERVAL_NOT_STARTED;
-      interval->end = 0;
+      printf("DEBUG drop_return_value: dropping TMP vreg %d\n", last_instr->dest.vr);
+      if (tcc_is_vreg_valid(ir, last_instr->dest.vr))
+      {
+        IRLiveInterval *interval = tcc_ir_get_live_interval(ir, last_instr->dest.vr);
+        interval->start = INTERVAL_NOT_STARTED;
+        interval->end = 0;
+      }
+      last_instr->op = TCCIR_OP_FUNCCALLVOID;
+      last_instr->dest.vr = -1;
+      last_instr->src1.vr = -1;
     }
-    last_instr->op = TCCIR_OP_FUNCCALLVOID;
-    last_instr->dest.vr = -1;
-    last_instr->src1.vr = -1;
+    else
+    {
+      printf("DEBUG drop_return_value: NOT dropping VAR/PARAM vreg %d (type=%d)\n", last_instr->dest.vr,
+             TCCIR_DECODE_VREG_TYPE(last_instr->dest.vr));
+    }
   }
 }
 
 void tcc_ir_backpatch(TCCIRState *ir, int t, int target_address)
 {
   SValue *cur;
-  printf("Backpatching jump at %d to target %d\n", t, target_address);
-  while (t)
+  int next;
+  if (t < 0)
+    return; /* -1 means no chain */
+  while (t >= 0 && t < ir->next_instruction_index)
   {
     cur = &ir->instructions[t].dest;
-    t = cur->c.i;
+    next = cur->c.i;
     cur->c.i = target_address;
+    /* Chain ends when next is -1 (sentinel), out of range, or already patched */
+    if (next < 0 || next >= ir->next_instruction_index || next == target_address)
+      break;
+    t = next;
   }
 }
 
 void tcc_ir_backpatch_to_here(TCCIRState *ir, int t)
 {
+  if (!ir)
+    return;
   tcc_ir_backpatch(ir, t, ir->next_instruction_index);
 }
 
@@ -2808,12 +2853,12 @@ int tcc_ir_generate_test(TCCIRState *ir, int inv, int t)
       /* jtrue chain should be merged with t (jump on false) */
       /* jfalse chain should be backpatched to here (they also represent false)
        */
-      if (jtrue)
+      if (jtrue >= 0)
       {
         tcc_ir_backpatch_first(ir, jtrue, t);
         t = jtrue;
       }
-      if (jfalse)
+      if (jfalse >= 0)
       {
         tcc_ir_backpatch_to_here(ir, jfalse);
       }
@@ -2823,12 +2868,12 @@ int tcc_ir_generate_test(TCCIRState *ir, int inv, int t)
       /* inv=0: we want to jump when condition is true */
       /* jfalse chain should be merged with t (jump on true - inverted sense) */
       /* jtrue chain should be backpatched to here */
-      if (jfalse)
+      if (jfalse >= 0)
       {
         tcc_ir_backpatch_first(ir, jfalse, t);
         t = jfalse;
       }
-      if (jtrue)
+      if (jtrue >= 0)
       {
         tcc_ir_backpatch_to_here(ir, jtrue);
       }
@@ -2879,8 +2924,8 @@ int tcc_ir_generate_test(TCCIRState *ir, int inv, int t)
       tcc_ir_put(ir, TCCIR_OP_TEST_ZERO, &vtop[0], NULL, NULL);
       vtop->r = VT_CMP;
       vtop->cmp_op = TOK_NE;
-      vtop->jtrue = 0;
-      vtop->jfalse = 0;
+      vtop->jtrue = -1;  /* -1 = no chain */
+      vtop->jfalse = -1; /* -1 = no chain */
       return tcc_ir_generate_test(ir, inv, t);
     }
   }
@@ -2890,19 +2935,25 @@ int tcc_ir_generate_test(TCCIRState *ir, int inv, int t)
 
 void tcc_ir_backpatch_first(TCCIRState *ir, int t, int target_address)
 {
-  int lp;
+  int lp, next;
+  if (t < 0)
+    return; /* -1 means no chain */
   do
   {
     lp = t;
-    t = ir->instructions[t].dest.c.i;
-  } while (t);
+    next = ir->instructions[t].dest.c.i;
+    /* Stop if we hit end of chain or go out of bounds */
+    if (next < 0 || next >= ir->next_instruction_index)
+      break;
+    t = next;
+  } while (1);
   ir->instructions[lp].dest.c.i = target_address;
 }
 
 /* Append target t to end of jump chain n, return head of chain */
 int tcc_ir_gjmp_append(TCCIRState *ir, int n, int t)
 {
-  if (n && n < ir->next_instruction_index)
+  if (n >= 0 && n < ir->next_instruction_index)
   {
     tcc_ir_backpatch_first(ir, n, t);
     return n;
@@ -2928,7 +2979,7 @@ void tcc_ir_generate_cmp_jmp_set(TCCIRState *ir)
     dest.pr0 = -1;
     dest.pr1 = -1;
 
-    if (jtrue || jfalse)
+    if (jtrue >= 0 || jfalse >= 0)
     {
       /* We have pending jump chains - need to merge them with the comparison */
       SValue jump_dest;
@@ -2941,11 +2992,11 @@ void tcc_ir_generate_cmp_jmp_set(TCCIRState *ir)
       tcc_ir_put(ir, TCCIR_OP_SETIF, &src, NULL, &dest);
 
       /* Jump to end */
-      jump_dest.c.i = 0;
+      jump_dest.c.i = -1; /* will be patched */
       int end_jump = tcc_ir_put(ir, TCCIR_OP_JUMP, NULL, NULL, &jump_dest);
 
       /* Patch jtrue chain to here - set dest = 1 */
-      if (jtrue)
+      if (jtrue >= 0)
       {
         tcc_ir_backpatch_to_here(ir, jtrue);
         src.r = VT_CONST;
@@ -2953,10 +3004,10 @@ void tcc_ir_generate_cmp_jmp_set(TCCIRState *ir)
         src.pr0 = -1;
         src.pr1 = -1;
         tcc_ir_put(ir, TCCIR_OP_ASSIGN, &src, NULL, &dest);
-        if (jfalse)
+        if (jfalse >= 0)
         {
           /* Jump over the jfalse handler */
-          jump_dest.c.i = 0;
+          jump_dest.c.i = -1; /* will be patched */
           int skip_jump = tcc_ir_put(ir, TCCIR_OP_JUMP, NULL, NULL, &jump_dest);
           /* Patch jfalse chain to here - set dest = 0 */
           tcc_ir_backpatch_to_here(ir, jfalse);
@@ -2967,7 +3018,7 @@ void tcc_ir_generate_cmp_jmp_set(TCCIRState *ir)
           ir->instructions[skip_jump].dest.c.i = ir->next_instruction_index;
         }
       }
-      else if (jfalse)
+      else if (jfalse >= 0)
       {
         tcc_ir_backpatch_to_here(ir, jfalse);
         src.r = VT_CONST;

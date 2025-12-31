@@ -191,7 +191,7 @@ static void vset_VT_JMP(void);
 /* Clear 'nocode_wanted' at forward label if it was used */
 ST_FUNC void gsym(int t)
 {
-  if (t)
+  if (t > 0) /* -1 = no chain, 0 = instruction 0 (but gsym is for machine code, not IR) */
   {
     gsym_addr(t, ind);
     CODE_ON();
@@ -211,14 +211,25 @@ static int gind()
 /* Set 'nocode_wanted' after unconditional (backwards) jump */
 static void gjmp_addr_acs(int t)
 {
-  gjmp_addr(t);
+  SValue dest;
+  memset(&dest, 0, sizeof(SValue));
+  dest.vr = -1;
+  dest.c.i = t;
+  tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
+  // gjmp_addr(t);
   CODE_OFF();
 }
 
 /* Set 'nocode_wanted' after unconditional (forwards) jump */
 static int gjmp_acs(int t)
 {
-  t = gjmp(t);
+  // t = gjmp(t);
+  SValue dest;
+  memset(&dest, 0, sizeof(SValue));
+  dest.vr = -1;
+  dest.c.i = t;
+  t = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
+
   CODE_OFF();
   return t;
 }
@@ -957,6 +968,8 @@ static void vsetc(CType *type, int r, CValue *vc)
   vtop->c = *vc;
   vtop->vr = -1;
   vtop->sym = NULL;
+  /* Note: jtrue/jfalse are in a union with c, so we DON'T initialize them here.
+     They should only be used when r == VT_CMP, and c is used otherwise. */
 }
 
 ST_FUNC void vswap(void)
@@ -985,8 +998,11 @@ ST_FUNC void vpop(void)
       if (v == VT_CMP)
   {
     /* need to put correct jump if && or || without test */
-    gsym(vtop->jtrue);
-    gsym(vtop->jfalse);
+    /* Use IR backpatching - jtrue/jfalse use -1 as "no chain" sentinel */
+    if (vtop->jtrue >= 0)
+      tcc_ir_backpatch_to_here(tcc_state->ir, vtop->jtrue);
+    if (vtop->jfalse >= 0)
+      tcc_ir_backpatch_to_here(tcc_state->ir, vtop->jfalse);
   }
   vtop--;
   print_vstack("vpop");
@@ -1098,8 +1114,8 @@ ST_FUNC void vset_VT_CMP(int op)
 {
   vtop->r = VT_CMP;
   vtop->cmp_op = op;
-  vtop->jfalse = 0;
-  vtop->jtrue = 0;
+  vtop->jfalse = -1; /* -1 = no chain */
+  vtop->jtrue = -1;  /* -1 = no chain */
 }
 
 /* called once before asking generators to load VT_CMP to a register */
@@ -1711,7 +1727,7 @@ static void gen_bounded_ptr_add(void)
   vpush_helper_func(TOK___bound_ptr_add);
   vrott(3);
   // gfunc_call(2);
-  tcc_error("implement me");
+  tcc_error("1 implement me");
   vtop -= save;
   vpushi(0);
   /* returned pointer is in REG_IRET */
@@ -2258,11 +2274,32 @@ static void gen_opl(int op)
     /* call generic long long function */
     vpush_helper_func(func);
     vrott(3);
-    // gfunc_call(2);
-    tcc_error("implement me");
-    vpushi(0);
-    vtop->r = reg_iret;
-    vtop->r2 = reg_lret;
+    /* Stack after vrott(3): arg1, arg2, func (func is at vtop) */
+    {
+      SValue param_num;
+      SValue dest;
+      memset(&param_num, 0, sizeof(SValue));
+      param_num.vr = -1;
+      /* Generate FUNCPARAMVAL for arg1 (param 1) */
+      param_num.c.i = 1;
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-2], &param_num, NULL);
+      /* Generate FUNCPARAMVAL for arg2 (param 2) */
+      param_num.c.i = 2;
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &param_num, NULL);
+      /* Generate FUNCCALLVAL for the function call (returns long long) */
+      memset(&dest, 0, sizeof(SValue));
+      dest.type.t = VT_LLONG;
+      dest.r = 0;
+      dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, vtop, NULL, &dest);
+      /* Pop all 3 values (arg1, arg2, func) and push result */
+      vtop -= 3;
+      vpushi(0);
+      vtop->type.t = VT_LLONG;
+      vtop->vr = dest.vr;
+      vtop->r = reg_iret;
+      vtop->r2 = reg_lret;
+    }
     break;
   case '^':
   case '&':
@@ -2445,22 +2482,22 @@ static void gen_opl(int op)
       op1 = TOK_ULE;
     else if (op1 == TOK_UGT)
       op1 = TOK_UGE;
-    a = 0;
-    b = 0;
+    a = -1; /* -1 = no chain */
+    b = -1; /* -1 = no chain */
     gen_op(op1);
     if (op == TOK_NE)
     {
-      b = gvtst(0, 0);
+      b = gvtst(0, -1);
     }
     else
     {
-      a = gvtst(1, 0);
+      a = gvtst(1, -1);
       if (op != TOK_EQ)
       {
         /* generate non equal test */
         vpushi(0);
         vset_VT_CMP(TOK_NE);
-        b = gvtst(0, 0);
+        b = gvtst(0, -1);
       }
     }
     /* compare low. Always unsigned */
@@ -3469,7 +3506,7 @@ static void gen_cvt_itof1(int t)
       vpush_helper_func(TOK___floatundidf);
     vrott(2);
     // gfunc_call(1);
-    tcc_error("implement me");
+    tcc_error("3 implement me");
     vpushi(0);
     PUT_R_RET(vtop, t);
   }
@@ -3501,14 +3538,14 @@ static void gen_cvt_ftoi1(int t)
       vpush_helper_func(TOK___fixunsdfdi);
     vrott(2);
     // gfunc_call(1);
-    tcc_error("implement me");
+    tcc_error("4 implement me");
     vpushi(0);
     PUT_R_RET(vtop, t);
   }
   else
   {
     // gen_cvt_ftoi(t);
-    tcc_error("implement me");
+    tcc_error("5 implement me");
   }
 }
 #endif
@@ -4123,7 +4160,7 @@ ST_FUNC void vstore(void)
         vpush_helper_func(TOK_memmove);
       vrott(4);
       // gfunc_call(3);
-      tcc_error("implement me");
+      tcc_error("6 implement me");
     }
   }
   else if (ft & VT_BITFIELD)
@@ -4249,6 +4286,8 @@ ST_FUNC void vstore(void)
       {
         op = TCCIR_OP_ASSIGN;
       }
+      printf("DEBUG vstore: op=%d, dest.r=0x%x, dest.c.i=%d, src.r=0x%x, src.c.i=%d\n", op, vtop[-1].r,
+             (int)vtop[-1].c.i, vtop->r, (int)vtop->c.i);
       // tcc_ir_generate_cmp_jmp_set(tcc_state->ir);
       tcc_ir_put(tcc_state->ir, op, vtop, NULL, &vtop[-1]);
     }
@@ -6071,7 +6110,7 @@ static void parse_atomic(int atok)
   vpush_helper_func(tok_alloc_const(buf));
   vrott(arg - save + 1);
   // gfunc_call(arg - save);
-  tcc_error("implement me");
+  tcc_error("7 implement me");
   vpush(&ct);
   PUT_R_RET(vtop, ct.t);
   t = ct.t & VT_BTYPE;
@@ -7428,13 +7467,13 @@ static void expr_cond(void)
     next();
     c = condition_3way();
     g = (tok == ':' && gnu_ext);
-    tt = 0;
+    tt = -1; /* -1 = no chain */
     if (!g)
     {
       if (c < 0)
       {
         save_regs(1);
-        tt = gvtst(1, 0);
+        tt = gvtst(1, -1);
       }
       else
       {
@@ -7447,7 +7486,7 @@ static void expr_cond(void)
          each branch */
       save_regs(1);
       gv_dup();
-      tt = gvtst(0, 0);
+      tt = gvtst(0, -1);
     }
 
     if (c == 0)
@@ -7467,11 +7506,11 @@ static void expr_cond(void)
     }
     else if (c < 0)
     {
-      u = gjmp(0);
-      gsym(tt);
+      u = gjmp(-1); /* -1 = no chain */
+      tcc_ir_backpatch_to_here(tcc_state->ir, tt);
     }
     else
-      u = 0;
+      u = -1; /* -1 = no chain */
 
     if (c == 0)
       nocode_wanted--;
@@ -7492,9 +7531,9 @@ static void expr_cond(void)
       /* optimize "if (f ? a > b : c || d) ..." for example, where normally
          "a < b" and "c || d" would be forced to "(int)0/1" first, whereas
          this code jumps directly to the if's then/else branches. */
-      t1 = gvtst(0, 0);
-      t2 = gjmp(0);
-      gsym(u);
+      t1 = gvtst(0, -1);
+      t2 = gjmp(-1); /* -1 = no chain */
+      tcc_ir_backpatch_to_here(tcc_state->ir, u);
       vpushv(&sv);
       /* combine jump targets of 2nd op with VT_CMP of 1st op */
       gvtst_set(0, t1);
@@ -7532,9 +7571,9 @@ static void expr_cond(void)
     if (c < 0)
     {
       r2 = gv(rc);
-      tt = gjmp(0);
+      tt = gjmp(-1); /* -1 = no chain */
     }
-    gsym(u);
+    tcc_ir_backpatch_to_here(tcc_state->ir, u);
     if (c == 1)
       nocode_wanted--;
 
@@ -7558,7 +7597,7 @@ static void expr_cond(void)
       r1 = gv(rc);
       move_reg(r2, r1, islv ? VT_PTR : type.t);
       vtop->r = r2;
-      gsym(tt);
+      tcc_ir_backpatch_to_here(tcc_state->ir, tt);
     }
 
     if (islv)
@@ -7900,7 +7939,7 @@ static void try_call_cleanup_goto(Sym *cleanupstate)
 /* call 'func' for each __attribute__((cleanup(func))) */
 static void block_cleanup(struct scope *o)
 {
-  int jmp = 0;
+  int jmp = -1; /* -1 = no pending jump */
   Sym *g, **pg;
   for (pg = &pending_gotos; (g = *pg) && g->c > o->cl.n;)
   {
@@ -7908,10 +7947,10 @@ static void block_cleanup(struct scope *o)
     {
       Sym *pcl = g->next;
       if (!jmp)
-        jmp = gjmp(0);
-      gsym(pcl->jnext);
+        jmp = gjmp(-1); /* -1 = no chain */
+      tcc_ir_backpatch_to_here(tcc_state->ir, pcl->jnext);
       try_call_scope_cleanup(o->cl.s);
-      pcl->jnext = gjmp(0);
+      pcl->jnext = gjmp(-1); /* -1 = no chain */
       if (!o->cl.n)
         goto remove_pending;
       g->c = o->cl.n;
@@ -7924,7 +7963,7 @@ static void block_cleanup(struct scope *o)
       sym_free(g);
     }
   }
-  gsym(jmp);
+  tcc_ir_backpatch_to_here(tcc_state->ir, jmp);
   try_call_scope_cleanup(o->cl.s);
 }
 
@@ -8063,14 +8102,14 @@ again:
     skip('(');
     gexpr();
     skip(')');
-    a = tcc_ir_generate_test(tcc_state->ir, 1, 0);
+    a = tcc_ir_generate_test(tcc_state->ir, 1, -1);
     block(0);
     if (tok == TOK_ELSE)
     {
       SValue dest;
       memset(&dest, 0, sizeof(SValue));
       dest.vr = -1;
-      dest.c.i = 0;
+      dest.c.i = -1; /* Will be patched to end of else block */
       d = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
       tcc_ir_backpatch_to_here(tcc_state->ir, a);
       next();
@@ -8092,8 +8131,8 @@ again:
     gexpr();
     skip(')');
     // a = gvtst(1, 0);
-    a = tcc_ir_generate_test(tcc_state->ir, 1, 0);
-    b = 0;
+    a = tcc_ir_generate_test(tcc_state->ir, 1, -1);
+    b = -1; /* Initialize continue chain with -1 sentinel */
     lblock(&a, &b);
     // gjmp_addr(d);
     memset(&dest, 0, sizeof(SValue));
@@ -8234,12 +8273,12 @@ again:
       }
     }
     skip(';');
-    a = b = 0;
+    a = b = -1; /* Initialize break/continue chains with -1 sentinel */
     c = d = tcc_state->ir->next_instruction_index;
     if (tok != ';')
     {
       gexpr();
-      a = tcc_ir_generate_test(tcc_state->ir, 1, 0);
+      a = tcc_ir_generate_test(tcc_state->ir, 1, -1);
     }
     skip(';');
     if (tok != ')')
@@ -8287,7 +8326,7 @@ again:
   else if (t == TOK_DO)
   {
     new_scope_s(&o);
-    a = b = 0;
+    a = b = -1; /* Initialize break/continue chains with -1 sentinel */
     d = gind();
     lblock(&a, &b);
     // gsym(b);
@@ -8298,7 +8337,7 @@ again:
     skip(')');
     skip(';');
     // c = gvtst(0, 0);
-    c = tcc_ir_generate_test(tcc_state->ir, 0, 0);
+    c = tcc_ir_generate_test(tcc_state->ir, 0, -1);
 
     // gsym_addr(c, d);
     tcc_ir_backpatch(tcc_state->ir, c, d);
@@ -8326,10 +8365,10 @@ again:
       tcc_error("switch value not an integer");
     sw->sv = *vtop--; /* save switch value */
     print_vstack("block(2)");
-    a = 0;
+    a = -1; /* Initialize break chain with -1 sentinel */
     memset(&dest, 0, sizeof(SValue));
     dest.vr = -1;
-    dest.c.i = 0;
+    dest.c.i = -1; /* Initial jump target, will be patched */
     b = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
     // b = gjmp(0); /* jump to first case */
     lblock(&a, NULL);
@@ -8441,8 +8480,13 @@ again:
       }
       else
       {
+        SValue dest;
+        memset(&dest, 0, sizeof(SValue));
         try_call_cleanup_goto(s->cleanupstate);
-        gjmp_addr(s->jind);
+        dest.vr = -1;
+        dest.c.i = s->jind;
+        // gjmp_addr(s->jind);
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
       }
       next();
     }
@@ -8472,11 +8516,11 @@ again:
         {
           Sym *pcl; /* pending cleanup goto */
           for (pcl = s->next; pcl; pcl = pcl->prev)
-            gsym(pcl->jnext);
+            tcc_ir_backpatch_to_here(tcc_state->ir, pcl->jnext);
           sym_pop(&s->next, NULL, 0);
         }
         else
-          gsym(s->jnext);
+          tcc_ir_backpatch_to_here(tcc_state->ir, s->jnext);
       }
       else
       {
@@ -9714,11 +9758,17 @@ static void gen_function(Sym *sym)
   }
 
   local_scope = 0;
-  rsym = 0;
+  rsym = -1; /* Initialize return symbol chain with -1 sentinel */
   func_vla_arg(sym);
   block(0);
   /* Backpatch all return jumps to point to the epilogue (past the end of IR) */
   tcc_ir_backpatch_to_here(ir, rsym);
+
+#ifdef DEBUG_IR_GEN
+  printf("=== IR BEFORE OPTIMIZATIONS ===\n");
+  tcc_ir_show(ir);
+  printf("=== END IR BEFORE OPTIMIZATIONS ===\n");
+#endif
 
   /* Dead code elimination - remove unreachable instructions */
   tcc_ir_dead_code_elimination(ir);

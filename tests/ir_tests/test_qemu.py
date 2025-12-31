@@ -14,6 +14,7 @@ TEST_FILES = [
     ("50_simple_struct.c", 0),
     ("60_landor.c", 0),
     ("61_simple_or.c", 0),
+
     ("../tests2/00_assignment.c", 0),
     ("../tests2/01_comment.c", 0),
     ("../tests2/02_printf.c", 0),
@@ -36,6 +37,7 @@ TEST_FILES = [
     ("../tests2/19_pointer_arithmetic.c", 0),
     ("../tests2/20_pointer_comparison.c", 0),
     ("../tests2/21_char_array.c", 0),
+    # ("../tests2/72_long_long_constant.c", 0),
     # ("../tests2/22_floating_point.c", 0),
 ]
 

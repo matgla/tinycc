@@ -1535,6 +1535,9 @@ ST_FUNC int tcc_load_ldscript(TCCState *s1, int fd);
 ST_FUNC int tcc_load_linker_script(TCCState *s1, const char *filename);
 ST_FUNC void tccelf_add_crtbegin(TCCState *s1);
 ST_FUNC void tccelf_add_crtend(TCCState *s1);
+#if defined TCC_TARGET_ARM
+ST_FUNC void tccelf_add_arm_fp_lib(TCCState *s1);
+#endif
 #endif
 #ifndef TCC_TARGET_PE
 ST_FUNC void tcc_add_runtime(TCCState *s1);

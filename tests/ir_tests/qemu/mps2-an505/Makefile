@@ -6,7 +6,7 @@ TEST_FILES ?= $(MAKEFILE_DIR)main.c
 OUTPUT ?= $(MAKEFILE_DIR)build/
 TARGET ?= $(OUTPUT)/hello.elf
 
-GCC_ABI_FLAGS = -mcpu=cortex-m33 -mthumb -mfloat-abi=hard -mfpu=fpv5-sp-d16
+GCC_ABI_FLAGS = -mcpu=cortex-m33 -mthumb -mfloat-abi=soft #-mfloat-abi=hard -mfpu=fpv5-sp-d16
 
 ARM_SYSROOT = $(shell arm-none-eabi-gcc $(GCC_ABI_FLAGS) --print-sysroot)
 MULTI_DIR = $(shell arm-none-eabi-gcc $(GCC_ABI_FLAGS) -print-multi-directory)
@@ -30,13 +30,12 @@ LDFLAGS = $(CFLAGS) -g -fvisibility=hidden #-Wl,--gc-sections
 TCC_PATH = $(shell realpath $(MAKEFILE_DIR)../../../../)
 LIBC_INCLUDES = $(shell realpath $(MAKEFILE_DIR)../../libc_includes)
 LIBGLOSS_PATH = $(shell realpath $(MAKEFILE_DIR)/newlib_build/arm-none-eabi/libgloss/arm)
-
 ifneq (,$(findstring armv8m-tcc,$(CC)))
 CFLAGS += -I$(LIBC_INCLUDES) -I$(ARM_SYSROOT)/include -I$(TCC_PATH)/include
 ifeq ($(USE_NEWLIB_BUILD),1)
-LDFLAGS += -L$(TCC_PATH) -L$(MAKEFILE_DIR)/newlib_build/arm-none-eabi/newlib -L$(LIBGLOSS_PATH) -llibc.a -llibrdimon.a -larmv8m-libtcc1.a -llibm.a -llibc.a -Wl,-oformat=elf32-littlearm -T$(MAKEFILE_DIR)linker_script.ld -v
+LDFLAGS += -L$(TCC_PATH)/lib/fp -L$(TCC_PATH) -L$(MAKEFILE_DIR)/newlib_build/arm-none-eabi/newlib -L$(LIBGLOSS_PATH) -larmv8m-libtcc1.a  -llibtcc1-fp-soft-armv8m.a -llibc.a -llibrdimon.a -llibm.a -Wl,-oformat=elf32-littlearm -T$(MAKEFILE_DIR)linker_script.ld -v
 else
-LDFLAGS += -L$(TCC_PATH) $(LIBC_PATH) $(LIBRDIMON_PATH) -larmv8m-libtcc1.a $(LIBM_PATH) $(LIBC_PATH) -Wl,-oformat=elf32-littlearm -T$(MAKEFILE_DIR)linker_script.ld -v
+LDFLAGS += -L$(TCC_PATH)/lib/fp -L$(TCC_PATH) $(LIBC_PATH) $(LIBRDIMON_PATH) -llibtcc1-fp-soft-armv8m.a -larmv8m-libtcc1.a $(LIBM_PATH) $(LIBC_PATH) -Wl,-oformat=elf32-littlearm -T$(MAKEFILE_DIR)linker_script.ld -v
 endif
 else
 LDFLAGS += -Wl,--start-group -lrdimon -lc -lgcc -Wl,--end-group --specs=rdimon.specs -T$(MAKEFILE_DIR)linker_script.ld

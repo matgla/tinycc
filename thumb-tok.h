@@ -118,91 +118,87 @@ DEF_ASM(iteee) // must be last
 #define THUMB_REGULAR_VARIANT(tok) #tok "eq"
 #define THUMB_SETFLAGS_VARIANT(tok) #tok "seq"
 
-#define THUMB_INSTRUCTION_GROUP(tok)                                           \
-  ((((tok) - TOK_ASM_nopeq) & 0xFFFFFFC0) + TOK_ASM_nopeq)
+#define THUMB_INSTRUCTION_GROUP(tok) ((((tok) - TOK_ASM_nopeq) & 0xFFFFFFC0) + TOK_ASM_nopeq)
 
-#define THUMB_HAS_WIDE_QUALIFIER(tok)                                          \
-  ((tok - THUMB_INSTRUCTION_GROUP(tok)) > 0x0f &&                              \
-   (tok - THUMB_INSTRUCTION_GROUP(tok)) <= 0x1f)
+#define THUMB_HAS_WIDE_QUALIFIER(tok)                                                                                  \
+  ((tok - THUMB_INSTRUCTION_GROUP(tok)) > 0x0f && (tok - THUMB_INSTRUCTION_GROUP(tok)) <= 0x1f)
 
-#define THUMB_HAS_NARROW_QUALIFIER(tok)                                        \
-  ((tok - THUMB_INSTRUCTION_GROUP(tok)) >= 0x1f &&                             \
-   (tok - THUMB_INSTRUCTION_GROUP(tok)) <= 0x2f)
+#define THUMB_HAS_NARROW_QUALIFIER(tok)                                                                                \
+  ((tok - THUMB_INSTRUCTION_GROUP(tok)) >= 0x1f && (tok - THUMB_INSTRUCTION_GROUP(tok)) <= 0x2f)
 
-#define THUMB_IS_CONDITIONAL(tok)                                              \
-  ((tok - THUMB_INSTRUCTION_GROUP(tok)) >= 0x01 &&                             \
-   (tok - THUMB_INSTRUCTION_GROUP(tok)) <= 0x0e)
+#define THUMB_IS_CONDITIONAL(tok)                                                                                      \
+  ((tok - THUMB_INSTRUCTION_GROUP(tok)) >= 0x01 && (tok - THUMB_INSTRUCTION_GROUP(tok)) <= 0x0e)
 
 #define THUMB_GET_CONDITION(tok) ((tok - THUMB_INSTRUCTION_GROUP(tok)) % 16)
 
 #define THUMB_IS_SETFLAGS(group, tok) ((tok - group) == 0x40)
 
 /* Note: condition code is 4 bits */
-#define DEF_ASM_CONDED(x)                                                      \
-  DEF(TOK_ASM_##x##eq, #x "eq")                                                \
-  DEF(TOK_ASM_##x##ne, #x "ne")                                                \
-  DEF(TOK_ASM_##x##cs, #x "cs")                                                \
-  DEF(TOK_ASM_##x##cc, #x "cc")                                                \
-  DEF(TOK_ASM_##x##mi, #x "mi")                                                \
-  DEF(TOK_ASM_##x##pl, #x "pl")                                                \
-  DEF(TOK_ASM_##x##vs, #x "vs")                                                \
-  DEF(TOK_ASM_##x##vc, #x "vc")                                                \
-  DEF(TOK_ASM_##x##hi, #x "hi")                                                \
-  DEF(TOK_ASM_##x##ls, #x "ls")                                                \
-  DEF(TOK_ASM_##x##ge, #x "ge")                                                \
-  DEF(TOK_ASM_##x##lt, #x "lt")                                                \
-  DEF(TOK_ASM_##x##gt, #x "gt")                                                \
-  DEF(TOK_ASM_##x##le, #x "le")                                                \
-  DEF(TOK_ASM_##x, #x)                                                         \
+#define DEF_ASM_CONDED(x)                                                                                              \
+  DEF(TOK_ASM_##x##eq, #x "eq")                                                                                        \
+  DEF(TOK_ASM_##x##ne, #x "ne")                                                                                        \
+  DEF(TOK_ASM_##x##cs, #x "cs")                                                                                        \
+  DEF(TOK_ASM_##x##cc, #x "cc")                                                                                        \
+  DEF(TOK_ASM_##x##mi, #x "mi")                                                                                        \
+  DEF(TOK_ASM_##x##pl, #x "pl")                                                                                        \
+  DEF(TOK_ASM_##x##vs, #x "vs")                                                                                        \
+  DEF(TOK_ASM_##x##vc, #x "vc")                                                                                        \
+  DEF(TOK_ASM_##x##hi, #x "hi")                                                                                        \
+  DEF(TOK_ASM_##x##ls, #x "ls")                                                                                        \
+  DEF(TOK_ASM_##x##ge, #x "ge")                                                                                        \
+  DEF(TOK_ASM_##x##lt, #x "lt")                                                                                        \
+  DEF(TOK_ASM_##x##gt, #x "gt")                                                                                        \
+  DEF(TOK_ASM_##x##le, #x "le")                                                                                        \
+  DEF(TOK_ASM_##x, #x)                                                                                                 \
   DEF(TOK_ASM_##x##rsvd, #x "rsvd")
 
 /* Note: condition code is 4 bits */
-#define DEF_ASM_CONDED_WITH_SUFFIX(x, y)                                       \
-  DEF(TOK_ASM_##x##eq##_##y, #x "eq." #y)                                      \
-  DEF(TOK_ASM_##x##ne##_##y, #x "ne." #y)                                      \
-  DEF(TOK_ASM_##x##cs##_##y, #x "cs." #y)                                      \
-  DEF(TOK_ASM_##x##cc##_##y, #x "cc." #y)                                      \
-  DEF(TOK_ASM_##x##mi##_##y, #x "mi." #y)                                      \
-  DEF(TOK_ASM_##x##pl##_##y, #x "pl." #y)                                      \
-  DEF(TOK_ASM_##x##vs##_##y, #x "vs." #y)                                      \
-  DEF(TOK_ASM_##x##vc##_##y, #x "vc." #y)                                      \
-  DEF(TOK_ASM_##x##hi##_##y, #x "hi." #y)                                      \
-  DEF(TOK_ASM_##x##ls##_##y, #x "ls." #y)                                      \
-  DEF(TOK_ASM_##x##ge##_##y, #x "ge." #y)                                      \
-  DEF(TOK_ASM_##x##lt##_##y, #x "lt." #y)                                      \
-  DEF(TOK_ASM_##x##gt##_##y, #x "gt." #y)                                      \
-  DEF(TOK_ASM_##x##le##_##y, #x "le." #y)                                      \
-  DEF(TOK_ASM_##x##_##y, #x "." #y)                                            \
+#define DEF_ASM_CONDED_WITH_SUFFIX(x, y)                                                                               \
+  DEF(TOK_ASM_##x##eq##_##y, #x "eq." #y)                                                                              \
+  DEF(TOK_ASM_##x##ne##_##y, #x "ne." #y)                                                                              \
+  DEF(TOK_ASM_##x##cs##_##y, #x "cs." #y)                                                                              \
+  DEF(TOK_ASM_##x##cc##_##y, #x "cc." #y)                                                                              \
+  DEF(TOK_ASM_##x##mi##_##y, #x "mi." #y)                                                                              \
+  DEF(TOK_ASM_##x##pl##_##y, #x "pl." #y)                                                                              \
+  DEF(TOK_ASM_##x##vs##_##y, #x "vs." #y)                                                                              \
+  DEF(TOK_ASM_##x##vc##_##y, #x "vc." #y)                                                                              \
+  DEF(TOK_ASM_##x##hi##_##y, #x "hi." #y)                                                                              \
+  DEF(TOK_ASM_##x##ls##_##y, #x "ls." #y)                                                                              \
+  DEF(TOK_ASM_##x##ge##_##y, #x "ge." #y)                                                                              \
+  DEF(TOK_ASM_##x##lt##_##y, #x "lt." #y)                                                                              \
+  DEF(TOK_ASM_##x##gt##_##y, #x "gt." #y)                                                                              \
+  DEF(TOK_ASM_##x##le##_##y, #x "le." #y)                                                                              \
+  DEF(TOK_ASM_##x##_##y, #x "." #y)                                                                                    \
   DEF(TOK_ASM_##x##rsvd##_##y, #x "rsvd." #y)
 
-#define DEF_ASM_CONDED_VFP_F32_F64(x)                                          \
-  DEF_ASM_CONDED_WITH_SUFFIX(x, f32)                                           \
+#define DEF_ASM_CONDED_VFP_F32_F64(x)                                                                                  \
+  DEF_ASM_CONDED_WITH_SUFFIX(x, f32)                                                                                   \
   DEF_ASM_CONDED_WITH_SUFFIX(x, f64)
 
-#define DEF_ASM_CONDED_WITH_TWO_SUFFIXES(x, y, z)                              \
-  DEF(TOK_ASM_##x##eq##_##y##_##z, #x "eq." #y "." #z)                         \
-  DEF(TOK_ASM_##x##ne##_##y##_##z, #x "ne." #y "." #z)                         \
-  DEF(TOK_ASM_##x##cs##_##y##_##z, #x "cs." #y "." #z)                         \
-  DEF(TOK_ASM_##x##cc##_##y##_##z, #x "cc." #y "." #z)                         \
-  DEF(TOK_ASM_##x##mi##_##y##_##z, #x "mi." #y "." #z)                         \
-  DEF(TOK_ASM_##x##pl##_##y##_##z, #x "pl." #y "." #z)                         \
-  DEF(TOK_ASM_##x##vs##_##y##_##z, #x "vs." #y "." #z)                         \
-  DEF(TOK_ASM_##x##vc##_##y##_##z, #x "vc." #y "." #z)                         \
-  DEF(TOK_ASM_##x##hi##_##y##_##z, #x "hi." #y "." #z)                         \
-  DEF(TOK_ASM_##x##ls##_##y##_##z, #x "ls." #y "." #z)                         \
-  DEF(TOK_ASM_##x##ge##_##y##_##z, #x "ge." #y "." #z)                         \
-  DEF(TOK_ASM_##x##lt##_##y##_##z, #x "lt." #y "." #z)                         \
-  DEF(TOK_ASM_##x##gt##_##y##_##z, #x "gt." #y "." #z)                         \
-  DEF(TOK_ASM_##x##le##_##y##_##z, #x "le." #y "." #z)                         \
-  DEF(TOK_ASM_##x##_##y##_##z, #x "." #y "." #z)                               \
+#define DEF_ASM_CONDED_WITH_TWO_SUFFIXES(x, y, z)                                                                      \
+  DEF(TOK_ASM_##x##eq##_##y##_##z, #x "eq." #y "." #z)                                                                 \
+  DEF(TOK_ASM_##x##ne##_##y##_##z, #x "ne." #y "." #z)                                                                 \
+  DEF(TOK_ASM_##x##cs##_##y##_##z, #x "cs." #y "." #z)                                                                 \
+  DEF(TOK_ASM_##x##cc##_##y##_##z, #x "cc." #y "." #z)                                                                 \
+  DEF(TOK_ASM_##x##mi##_##y##_##z, #x "mi." #y "." #z)                                                                 \
+  DEF(TOK_ASM_##x##pl##_##y##_##z, #x "pl." #y "." #z)                                                                 \
+  DEF(TOK_ASM_##x##vs##_##y##_##z, #x "vs." #y "." #z)                                                                 \
+  DEF(TOK_ASM_##x##vc##_##y##_##z, #x "vc." #y "." #z)                                                                 \
+  DEF(TOK_ASM_##x##hi##_##y##_##z, #x "hi." #y "." #z)                                                                 \
+  DEF(TOK_ASM_##x##ls##_##y##_##z, #x "ls." #y "." #z)                                                                 \
+  DEF(TOK_ASM_##x##ge##_##y##_##z, #x "ge." #y "." #z)                                                                 \
+  DEF(TOK_ASM_##x##lt##_##y##_##z, #x "lt." #y "." #z)                                                                 \
+  DEF(TOK_ASM_##x##gt##_##y##_##z, #x "gt." #y "." #z)                                                                 \
+  DEF(TOK_ASM_##x##le##_##y##_##z, #x "le." #y "." #z)                                                                 \
+  DEF(TOK_ASM_##x##_##y##_##z, #x "." #y "." #z)                                                                       \
   DEF(TOK_ASM_##x##rsvd##_##y##_##z, #x "rsvd." #y "." #z)
 
 /* Note: add new tokens after nop (MUST always use DEF_ASM_CONDED) */
 
-#define DEF_ASM_CONDED_WITH_QUALIFIER(x)                                       \
-  DEF_ASM_CONDED(x)                                                            \
-  DEF_ASM_CONDED_WITH_SUFFIX(x, w)                                             \
-  DEF_ASM_CONDED_WITH_SUFFIX(x, n)                                             \
+#define DEF_ASM_CONDED_WITH_QUALIFIER(x)                                                                               \
+  DEF_ASM_CONDED(x)                                                                                                    \
+  DEF_ASM_CONDED_WITH_SUFFIX(x, w)                                                                                     \
+  DEF_ASM_CONDED_WITH_SUFFIX(x, n)                                                                                     \
   DEF_ASM_CONDED_WITH_SUFFIX(x, _) // last just to align to the 6 bits
 
 DEF_ASM_CONDED_WITH_QUALIFIER(nop)
@@ -396,5 +392,13 @@ DEF_ASM_CONDED_WITH_QUALIFIER(usat)
 /* floating point */
 DEF_ASM_CONDED_WITH_QUALIFIER(vpush)
 DEF_ASM_CONDED_WITH_QUALIFIER(vpop)
+DEF_ASM_CONDED_VFP_F32_F64(vadd)
+DEF_ASM_CONDED_VFP_F32_F64(vsub)
+DEF_ASM_CONDED_VFP_F32_F64(vmul)
+DEF_ASM_CONDED_VFP_F32_F64(vdiv)
+DEF_ASM_CONDED_VFP_F32_F64(vneg)
+DEF_ASM_CONDED_VFP_F32_F64(vcmp)
+DEF_ASM_CONDED(vmov)
+DEF_ASM_CONDED(vmrs)
 
 /* multiplication */

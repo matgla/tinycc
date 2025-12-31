@@ -14,6 +14,7 @@ $(info CROSS_TARGET='$(CROSS_TARGET)')
 
 TCC = $(TOP)/$(X)tcc$(EXESUF)
 XTCC ?= $(TOP)/$(X)tcc$(EXESUF)
+FP_CC := $(abspath $(TOP)/$(X)tcc$(EXESUF))
 XCC = $(XTCC)
 XAR = $(XTCC) -ar
 XFLAGS-unx = -B$(TOPSRC)
@@ -37,13 +38,17 @@ endif
 
 I386_O = libtcc1.o alloca.o alloca-bt.o $(COMMON_O)
 X86_64_O = libtcc1.o alloca.o alloca-bt.o $(COMMON_O)
-ARM_O = armeabi.o libtcc1.o alloca.o armflush.o $(COMMON_O)
+ARM_O = libtcc1.o alloca.o armflush.o $(COMMON_O) $(ARM_FP_O)
 ARM64_O = lib-arm64.o $(COMMON_O)
 RISCV64_O = lib-arm64.o $(COMMON_O)
 COMMON_O = stdatomic.o atomic.o builtin.o
 WIN_O = crt1.o crt1w.o wincrt1.o wincrt1w.o dllcrt1.o dllmain.o
 LIN_O = dsohandle.o
 OSX_O =
+
+# ARM Floating Point Library Objects
+# Built from lib/fp/ directory for different FPU configurations
+ARM_FP_O = armeabi.o
 
 # backtrace/bcheck/run only for native compiler
 Nat = $(if $X,no,)
@@ -101,8 +106,21 @@ $(TOP)/bt-exe.o : XFLAGS += -I$(TOP)
 $(X)crt1w.o : crt1.c
 $(X)wincrt1w.o : wincrt1.c
 
+# Build FP libraries for ARM targets
+.PHONY: fp-libs
+fp-libs:
+	$(MAKE) -C fp FPU=soft TARGET=$(T) CC="$(FP_CC)" AR="$(FP_CC) -ar" CFLAGS="$(XFLAGS)"
+	$(MAKE) -C fp FPU=vfpv4-sp TARGET=$(T) CC="$(FP_CC)" AR="$(FP_CC) -ar" CFLAGS="$(XFLAGS)"
+	$(MAKE) -C fp FPU=vfpv5-dp TARGET=$(T) CC="$(FP_CC)" AR="$(FP_CC) -ar" CFLAGS="$(XFLAGS)"
+	$(MAKE) -C fp FPU=rp2350 TARGET=$(T) CC="$(FP_CC)" AR="$(FP_CC) -ar" CFLAGS="$(XFLAGS)"
+
+# Build armeabi.o which dispatches to correct FP library
+$(X)armeabi.o : armeabi.c $(TCC)
+	$S$(XCC) -c $< -o $@ $(XFLAGS)
+
 # don't try to make it
 $(TCC) : ;
 
 clean :
 	rm -f *.o $(addprefix $(TOP)/,*libtcc1.a $(EXTRA_O))
+	$(MAKE) -C fp clean
