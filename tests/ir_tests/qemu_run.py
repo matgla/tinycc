@@ -26,8 +26,10 @@ def compile_testcase(test_file, machine, compiler=f"{CURRENT_DIR}/../../armv8m-t
         was_cleaned = True
     result = subprocess.run(make_command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if result.returncode != 0:
-        print(result.stdout.decode())
-        print(result.stderr.decode())
+        if result.stdout != None:
+            print(result.stdout.decode())
+        if result.stderr != None:
+            print(result.stderr.decode())
         raise RuntimeError(f"Build failed with exit code {result.returncode}")
     output_lines = result.stdout.decode().splitlines() if result.stdout else []
     output_lines += result.stderr.decode().splitlines() if result.stderr else []

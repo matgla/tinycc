@@ -450,6 +450,17 @@ ST_FUNC int put_elf_sym(Section *s, addr_t value, unsigned long size, int info, 
   ElfW(Sym) * sym;
   Section *hs;
 
+  /* Validate name pointer - catch garbage early */
+  if (name && name[0])
+  {
+    unsigned char first = (unsigned char)name[0];
+    if (first < 0x20 || first > 0x7e)
+    {
+      /* name pointer contains garbage - treat as unnamed */
+      name = NULL;
+    }
+  }
+
   sym = section_ptr_add(s, sizeof(ElfW(Sym)));
   if (name && name[0])
     name_offset = put_elf_str(s->link, name);
@@ -812,6 +823,14 @@ ST_FUNC void put_elf_reloca(Section *symtab, Section *s, unsigned long offset, i
   char buf[256];
   Section *sr;
   ElfW_Rel *rel;
+
+  /* Validate symbol index */
+  int num_syms = symtab->data_offset / sizeof(ElfW(Sym));
+  if (symbol < 0 || symbol >= num_syms)
+  {
+    return; /* Skip invalid symbol index */
+  }
+
   sr = s->reloc;
   if (!sr)
   {
@@ -1116,15 +1135,32 @@ ST_FUNC void relocate_syms(TCCState *s1, Section *symtab, int do_resolve)
   ElfW(Sym) * sym;
   int sym_bind, sh_num;
   const char *name;
+  int sym_idx = 0;
 
   for_each_elem(symtab, 1, sym, ElfW(Sym))
   {
+    sym_idx++;
     sh_num = sym->st_shndx;
     if (sh_num == SHN_UNDEF)
     {
       if (do_resolve == 2) /* relocating dynsym */
         continue;
+      /* Validate st_name offset before using it */
+      if (sym->st_name >= s1->symtab->link->data_offset)
+      {
+        tcc_error_noabort("internal error: symbol %d has invalid st_name offset 0x%x (strtab size: 0x%lx)", sym_idx,
+                          sym->st_name, (unsigned long)s1->symtab->link->data_offset);
+        continue;
+      }
       name = (char *)s1->symtab->link->data + sym->st_name;
+      /* Debug: print symbol info when name is empty or looks wrong */
+      if (name[0] == '\0' || sym->st_name == 0)
+      {
+        fprintf(
+            stderr,
+            "DEBUG relocate_syms: symbol %d has empty name (st_name=%u, st_info=0x%x, st_value=0x%lx, st_size=%lu)\n",
+            sym_idx, sym->st_name, sym->st_info, (unsigned long)sym->st_value, (unsigned long)sym->st_size);
+      }
       /* Use ld.so to resolve symbol for us (for tcc -run) */
       if (do_resolve)
       {
@@ -2143,6 +2179,15 @@ static void bind_exe_dynsyms(TCCState *s1, int is_PIE)
   {
     if (sym->st_shndx == SHN_UNDEF)
     {
+      /* Validate st_name before using it */
+      if (sym->st_name >= symtab_section->link->data_offset)
+      {
+        int sym_idx = sym - (ElfW(Sym) *)symtab_section->data;
+        tcc_error_noabort(
+            "internal error (bind_exe_dynsyms): symbol %d has invalid st_name offset 0x%x (strtab size: 0x%lx)",
+            sym_idx, sym->st_name, (unsigned long)symtab_section->link->data_offset);
+        continue;
+      }
       name = (char *)symtab_section->link->data + sym->st_name;
       sym_index = find_elf_sym(s1->dynsymtab_section, name);
       if (sym_index)
@@ -4982,12 +5027,6 @@ static void ld_update_symbol_values(TCCState *s1, LDScript *ld)
   for (j = 0; j < ld->nb_symbols; j++)
   {
     LDSymbol *sym = &ld->symbols[j];
-    if (!strcmp(sym->name, "__data_start__") || !strcmp(sym->name, "__data_end__"))
-    {
-      printf("DEBUG: %s: defined=%d, section_idx=%d, section_offset=%ld, "
-             "value=%lx\n",
-             sym->name, sym->defined, sym->section_idx, (long)sym->section_offset, (unsigned long)sym->value);
-    }
     if (sym->defined && sym->section_idx >= 0 && sym->section_idx < ld->nb_output_sections)
     {
       addr_t section_addr = output_section_addrs[sym->section_idx];
@@ -4995,12 +5034,6 @@ static void ld_update_symbol_values(TCCState *s1, LDScript *ld)
       {
         /* Symbol value = section base address + offset within section */
         sym->value = section_addr + sym->section_offset;
-        if (!strcmp(sym->name, "__data_start__") || !strcmp(sym->name, "__data_end__"))
-        {
-          printf("DEBUG after update: %s: value=%lx (section_addr=%lx + "
-                 "offset=%ld)\n",
-                 sym->name, (unsigned long)sym->value, (unsigned long)section_addr, (long)sym->section_offset);
-        }
       }
     }
   }

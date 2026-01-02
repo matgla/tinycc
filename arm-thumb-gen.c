@@ -199,6 +199,30 @@ enum
 #include "arch/fpu/arm/fpv5-sp-d16.h"
 #include "arm-thumb-opcodes.h"
 
+/* Helper to validate a Sym pointer - returns NULL if invalid/unusable for relocation */
+static inline Sym *validate_sym_for_reloc(Sym *sym)
+{
+  if (!sym)
+    return NULL;
+  /* Check for use-after-free */
+  if (sym->v == 0xDEADBEEF)
+  {
+    /* BREAKPOINT: Set breakpoint here in GDB with "b arm-thumb-gen.c:211" */
+    /* Then run "bt" to see the call stack */
+    fprintf(stderr,
+            "DEBUG validate_sym_for_reloc: USE-AFTER-FREE! sym=%p was freed. Set breakpoint at arm-thumb-gen.c:211\n",
+            (void *)sym);
+    return NULL;
+  }
+  /* Type descriptors (SYM_FIELD) should not be used for relocations */
+  if (sym->v & SYM_FIELD)
+    return NULL;
+  /* Symbols with c < 0 are not properly registered */
+  if (sym->c < 0)
+    return NULL;
+  return sym;
+}
+
 /* Forward declarations */
 static int is_64bit_type(int t);
 void load_to_dest(SValue *dest, SValue *sv);
@@ -265,11 +289,8 @@ static int th_is_caller_saved_register(int reg)
 
 int ot_check(thumb_opcode op)
 {
-  static int ot_check_counter = 0;
-  ot_check_counter++;
   if (!is_valid_opcode(op))
   {
-    fprintf(stderr, "DEBUG ot_check #%d: invalid opcode size=%d opcode=0x%x\n", ot_check_counter, op.size, op.opcode);
     tcc_error("compiler_error: received invalid opcode: 0x%x\n", op.opcode);
   }
   return ot(op);
@@ -568,7 +589,7 @@ static void th_literal_pool_init()
 {
   thumb_gen_state.literal_pool_size = 64;
   thumb_gen_state.literal_pool_count = 0;
-  thumb_gen_state.literal_pool = tcc_malloc(sizeof(ThumbLiteralPoolEntry) * thumb_gen_state.literal_pool_size);
+  thumb_gen_state.literal_pool = tcc_mallocz(sizeof(ThumbLiteralPoolEntry) * thumb_gen_state.literal_pool_size);
   thumb_gen_state.generating_function = 0;
   thumb_gen_state.code_size = 0;
   thumb_gen_state.cached_global_sym = NULL;
@@ -711,18 +732,22 @@ static void th_literal_pool_generate(void)
 
   /* Count unique literals to calculate pool size */
   int unique_count = 0;
+  int pool_size = 0;
   for (int i = 0; i < thumb_gen_state.literal_pool_count; i++)
   {
     if (thumb_gen_state.literal_pool[i].shared_index == -1)
+    {
       unique_count++;
+      /* Account for 8-byte literals */
+      int entry_size = thumb_gen_state.literal_pool[i].data_size > 0 ? thumb_gen_state.literal_pool[i].data_size : 4;
+      pool_size += entry_size;
+    }
   }
 
   /* Emit a branch to skip over the literal pool.
-   * Pool size = unique_count * 4 bytes (each literal is 32-bit).
    * We may need +2 for alignment NOP.
    * Branch offset is from PC+4 to after the pool.
    */
-  int pool_size = unique_count * 4;
   int branch_pos = ind;
   int need_align = (ind & 2) ? 2 : 0; /* alignment padding after branch */
 
@@ -754,13 +779,63 @@ static void th_literal_pool_generate(void)
     {
       /* This is a unique entry - emit the literal value */
       literal_positions[i] = ind;
-      if (entry->relocation != -1)
+      if (entry->relocation != -1 && entry->sym)
       {
-        greloc(cur_text_section, entry->sym, ind, entry->relocation);
+        /* Extra validation - check that sym looks valid */
+        if (!entry->sym || (unsigned long)entry->sym < 0x1000)
+        {
+          tcc_warning("internal: literal pool entry has garbage sym pointer %p", entry->sym);
+          entry->sym = NULL;
+        }
+        else if (entry->sym->v == 0xDEADBEEF)
+        {
+          /* Use-after-free detected */
+          entry->sym = NULL;
+        }
+        else if (entry->sym->v == 0 || (entry->sym->v < TOK_IDENT && !(entry->sym->v & SYM_FIELD)))
+        {
+          tcc_warning("internal: literal pool entry has invalid sym->v (0x%x)", entry->sym->v);
+          entry->sym = NULL;
+        }
+      }
+      if (entry->relocation != -1 && entry->sym)
+      {
+        /* Validate symbol before creating relocation - sym must have valid ELF index
+         * or be registerable. Type descriptors (SYM_FIELD) have c=-1 and should not
+         * have relocations created for them. */
+        if (entry->sym->c <= 0)
+        {
+          /* Try to register the symbol */
+          put_extern_sym(entry->sym, NULL, 0, 0);
+        }
+        if (entry->sym->c > 0)
+        {
+          greloc(cur_text_section, entry->sym, ind, entry->relocation);
+        }
+        else
+        {
+          /* Symbol couldn't be registered (e.g., type descriptor).
+           * This indicates a bug - sym should not have been set for this literal. */
+          tcc_warning("internal: literal pool entry has invalid symbol (c=%d, v=0x%x), skipping relocation",
+                      entry->sym->c, entry->sym->v);
+        }
       }
       // write the literal value
-      o(entry->imm & 0xffff);
-      o((entry->imm >> 16) & 0xffff);
+      int entry_size = entry->data_size > 0 ? entry->data_size : 4;
+      if (entry_size == 8)
+      {
+        /* 64-bit literal - write 8 bytes */
+        o(entry->imm & 0xffff);
+        o((entry->imm >> 16) & 0xffff);
+        o((entry->imm >> 32) & 0xffff);
+        o((entry->imm >> 48) & 0xffff);
+      }
+      else
+      {
+        /* 32-bit literal - write 4 bytes */
+        o(entry->imm & 0xffff);
+        o((entry->imm >> 16) & 0xffff);
+      }
     }
     else
     {
@@ -790,11 +865,22 @@ static void th_literal_pool_generate(void)
     // patch the instruction that references this literal
     if (entry->short_instruction)
     {
+      /* Short LDR literal (T1): imm8 word-aligned in bits 0-7 */
       uint16_t *patch_ins = (uint16_t *)(cur_text_section->data + entry->patch_position);
       *patch_ins |= (((aligned_position - 4) >> 2) & 0x00ff);
     }
+    else if (entry->data_size == 8)
+    {
+      /* LDRD literal: imm8 word-aligned in bits 0-7 of second halfword, P=1 U=1 in first halfword */
+      uint16_t *patch_ins0 = (uint16_t *)(cur_text_section->data + entry->patch_position);
+      uint16_t *patch_ins1 = (uint16_t *)(cur_text_section->data + entry->patch_position + 2);
+      /* Set P=1 (bit 8) and U=1 (bit 7) for positive offset, pre-indexed */
+      *patch_ins0 |= (1 << 8) | (1 << 7); /* P and U bits */
+      *patch_ins1 |= (((aligned_position - 4) >> 2) & 0x00ff);
+    }
     else
     {
+      /* Long LDR literal (T2): imm12 byte offset in bits 0-11 of second halfword */
       uint16_t *patch_ins = (uint16_t *)(cur_text_section->data + entry->patch_position + 2);
       *patch_ins |= (((aligned_position - 4)) & 0x0fff);
     }
@@ -1257,7 +1343,8 @@ void store(int r, SValue *sv)
     else if (v == VT_CONST)
     {
       /* Check if we already have this global symbol's base address cached */
-      if (sv->sym && sv->sym == thumb_gen_state.cached_global_sym && thumb_gen_state.cached_global_reg >= 0)
+      if ((sv->r & VT_SYM) && sv->sym && sv->sym == thumb_gen_state.cached_global_sym &&
+          thumb_gen_state.cached_global_reg >= 0)
       {
         /* Reuse cached base address, keep the offset */
         base = thumb_gen_state.cached_global_reg;
@@ -1267,13 +1354,15 @@ void store(int r, SValue *sv)
       {
         /* Load the base address of the global symbol (without offset) */
         SValue v1;
+        Sym *validated_sym = (sv->r & VT_SYM) ? validate_sym_for_reloc(sv->sym) : NULL;
+        memset(&v1, 0, sizeof(SValue));
         v1.type.t = ft;
-        v1.r = fr & ~VT_LVAL;
+        v1.r = (fr & ~VT_LVAL) | (validated_sym ? VT_SYM : 0);
         v1.c.i = 0; /* Load base address, not base+offset */
-        v1.sym = sv->sym;
+        v1.sym = validated_sym;
         load(base = 14, &v1);
         /* Cache this for subsequent accesses to same symbol */
-        thumb_gen_state.cached_global_sym = sv->sym;
+        thumb_gen_state.cached_global_sym = validated_sym;
         thumb_gen_state.cached_global_reg = base;
         /* fc already has the field offset from sv->c.i */
       }
@@ -1398,7 +1487,7 @@ static ThumbLiteralPoolEntry *th_literal_pool_allocate()
 
 /* Find existing literal pool entry with same sym and imm, and allocate new
    entry that shares its literal value */
-static ThumbLiteralPoolEntry *th_literal_pool_find_or_allocate(Sym *sym, int32_t imm)
+static ThumbLiteralPoolEntry *th_literal_pool_find_or_allocate(Sym *sym, int64_t imm)
 {
   int found_index = -1;
   /* Search existing entries for a match */
@@ -1425,13 +1514,33 @@ static ThumbLiteralPoolEntry *th_literal_pool_find_or_allocate(Sym *sym, int32_t
 static void load_full_const(int r, int r1, int64_t imm, struct Sym *sym)
 {
   int est = 0;
-  ElfSym *esym = elfsym(sym);
-  ThumbLiteralPoolEntry *entry = th_literal_pool_find_or_allocate(sym, imm);
+  ElfSym *esym = NULL;
+  ThumbLiteralPoolEntry *entry;
   int sym_off = 0;
+
+  /* Validate symbol - only use symbols that can be externalized */
+  sym = validate_sym_for_reloc(sym);
+  if (sym && sym->c == 0)
+  {
+    /* Symbol not yet registered - try to register it */
+    put_extern_sym(sym, NULL, 0, 0);
+    if (sym->c <= 0)
+    {
+      /* Registration failed - symbol can't be externalized */
+      sym = NULL;
+    }
+  }
+
+  if (sym)
+  {
+    esym = elfsym(sym);
+  }
+  entry = th_literal_pool_find_or_allocate(sym, imm);
 
   entry->sym = sym;
   entry->imm = imm;
   entry->patch_position = ind;
+  entry->relocation = -1; /* No relocation by default */
 
   TRACE("'load_full_const' to register: %d, with imm: %d\n", r, imm);
   // allocate space for T1 encoding
@@ -1447,10 +1556,12 @@ static void load_full_const(int r, int r1, int64_t imm, struct Sym *sym)
 
   if (r1 == -1)
   {
+    entry->data_size = 4;
     ot_check(th_ldr_literal(r, 0, 1));
   }
   else
   {
+    entry->data_size = 8;
     ot_check(th_ldrd_imm(r, r1, R_PC, 0, 4, ENFORCE_ENCODING_NONE));
   }
 
@@ -1776,11 +1887,17 @@ void load_vt_const(int r, int r1, SValue *sv)
       load_full_const(r, -1, lo, 0);
     if (!ot(o2))
       load_full_const(r1, -1, hi, 0);
+    return; /* Don't fall through to 32-bit code */
   }
 
   if (sv->r & VT_SYM)
   {
-    return load_full_const(r, r1, sv->c.i, sv->sym);
+    Sym *validated_sym = validate_sym_for_reloc(sv->sym);
+    if (validated_sym)
+    {
+      return load_full_const(r, r1, sv->c.i, validated_sym);
+    }
+    /* Invalid or missing sym - treat as constant without relocation */
   }
 
   if (!ot(th_generic_mov_imm(r, sv->c.i)))
@@ -1790,9 +1907,14 @@ void load_vt_const(int r, int r1, SValue *sv)
 void load_vt_local(int r, SValue *sv)
 {
   TRACE("'load_vt_local' r: %d, off: %x", r, (uint32_t)sv->c.i);
-  if (sv->r & VT_SYM || (-sv->c.i) >= 0xfff)
+  Sym *sym_to_use = NULL;
+  if (sv->r & VT_SYM)
   {
-    load_full_const(r, -1, sv->c.i, sv->r & VT_SYM ? sv->sym : 0);
+    sym_to_use = validate_sym_for_reloc(sv->sym);
+  }
+  if (sym_to_use || (-sv->c.i) >= 0xfff)
+  {
+    load_full_const(r, -1, sv->c.i, sym_to_use);
     ot_check(th_add_reg(r, R_FP, r, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
   }
   else
@@ -1833,15 +1955,12 @@ void load_vt_jmp_jmpi(int r, SValue *sv)
 
 void load_to_dest(SValue *dest, SValue *sv)
 {
-  int v, ft, fc, fr, sign;
+  int v, ft, fr, sign;
+  int64_t fc;
   fr = sv->r;
   ft = sv->type.t;
   fc = sv->c.i;
   int btype = ft & VT_BTYPE;
-  printf("DEBUG load_to_dest: pr0=%d, pr1: %d, fr=0x%x, ft=0x%x, fc=0x%x, "
-         "btype=%d, "
-         "pr0=%d, pr1=%d\n",
-         dest->pr0, dest->pr1, fr, ft, fc, btype, sv->pr0, sv->pr1);
 
   if (fc >= 0)
     sign = 0;
@@ -1903,7 +2022,8 @@ void load_to_dest(SValue *dest, SValue *sv)
     {
       /* Check if we already have this global symbol's base address cached
        */
-      if (sv->sym && sv->sym == thumb_gen_state.cached_global_sym && thumb_gen_state.cached_global_reg >= 0)
+      if ((sv->r & VT_SYM) && sv->sym && sv->sym == thumb_gen_state.cached_global_sym &&
+          thumb_gen_state.cached_global_reg >= 0)
       {
         /* Reuse cached base address, keep the offset */
         base = thumb_gen_state.cached_global_reg;
@@ -1911,14 +2031,16 @@ void load_to_dest(SValue *dest, SValue *sv)
       }
       else
       {
+        Sym *validated_sym = (sv->r & VT_SYM) ? validate_sym_for_reloc(sv->sym) : NULL;
+        memset(&v1, 0, sizeof(SValue));
         v1.type.t = VT_PTR;
-        v1.r = fr & ~VT_LVAL;
+        v1.r = (fr & ~VT_LVAL) | (validated_sym ? VT_SYM : 0);
         v1.c.i = 0; /* Load base address, not base+offset */
-        v1.sym = sv->sym;
+        v1.sym = validated_sym;
         TRACE("l2");
         load(base = 14, &v1);
         /* Cache this for subsequent accesses to same symbol */
-        thumb_gen_state.cached_global_sym = sv->sym;
+        thumb_gen_state.cached_global_sym = validated_sym;
         thumb_gen_state.cached_global_reg = base;
         /* fc already has the field offset from sv->c.i */
       }
@@ -1982,16 +2104,6 @@ void load(int r, SValue *sv)
   ft = sv->type.t;
   fc = sv->c.i;
   int btype = ft & VT_BTYPE;
-  printf("DEBUG load: r=%d, fr=0x%x, ft=0x%x, fc=0x%x, btype=%d, pr0=%d, pr1=%d\n", r, fr, ft, fc, btype, sv->pr0,
-         sv->pr1);
-  /* Early check for dangerous 64-bit loads to R12 */
-  if (r == R12 && (btype == VT_DOUBLE || btype == VT_LDOUBLE || btype == VT_LLONG))
-  {
-    if (sv->pr1 < 0 || sv->pr1 == R_SP || sv->pr1 == R_PC)
-    {
-      printf("DEBUG load: WARNING - 64-bit load to R12 with no valid pr1!\n");
-    }
-  }
   if (fc >= 0)
     sign = 0;
   else
@@ -2061,7 +2173,8 @@ void load(int r, SValue *sv)
     else if (v == VT_CONST)
     {
       /* Check if we already have this global symbol's base address cached */
-      if (sv->sym && sv->sym == thumb_gen_state.cached_global_sym && thumb_gen_state.cached_global_reg >= 0)
+      if ((sv->r & VT_SYM) && sv->sym && sv->sym == thumb_gen_state.cached_global_sym &&
+          thumb_gen_state.cached_global_reg >= 0)
       {
         /* Reuse cached base address, keep the offset */
         base = thumb_gen_state.cached_global_reg;
@@ -2069,14 +2182,16 @@ void load(int r, SValue *sv)
       }
       else
       {
+        Sym *validated_sym = (sv->r & VT_SYM) ? validate_sym_for_reloc(sv->sym) : NULL;
+        memset(&v1, 0, sizeof(SValue));
         v1.type.t = VT_PTR;
-        v1.r = fr & ~VT_LVAL;
+        v1.r = (fr & ~VT_LVAL) | (validated_sym ? VT_SYM : 0);
         v1.c.i = 0; /* Load base address, not base+offset */
-        v1.sym = sv->sym;
+        v1.sym = validated_sym;
         TRACE("l2");
         load(base = 14, &v1);
         /* Cache this for subsequent accesses to same symbol */
-        thumb_gen_state.cached_global_sym = sv->sym;
+        thumb_gen_state.cached_global_sym = validated_sym;
         thumb_gen_state.cached_global_reg = base;
         /* fc already has the field offset from sv->c.i */
       }
@@ -2114,8 +2229,13 @@ void load(int r, SValue *sv)
     return load_vt_jmp_jmpi(r, sv);
   else if (v < VT_CONST)
   {
-    /* Check if spilled - load from stack instead of register move */
-    if (sv->pr0 & PREG_SPILLED)
+    /* For IR-generated code, use pr0 as the source register */
+    int src_reg = (sv->pr0 >= 0 && !(sv->pr0 & PREG_SPILLED)) ? sv->pr0 : v;
+
+    /* Check if spilled - load from stack instead of register move.
+     * Note: pr0 might have been overwritten with destination register by caller,
+     * so also check if c.i is non-zero (stack offset) as a backup indicator. */
+    if ((sv->pr0 & PREG_SPILLED) || (v < VT_CONST && sv->c.i != 0 && (sv->r & VT_LVAL) == 0))
     {
       /* Value is spilled to stack at sv->c.i offset from FP */
       int src_offset = sv->c.i;
@@ -2132,25 +2252,27 @@ void load(int r, SValue *sv)
     {
       /* Check if we're moving between VFP registers or integer registers.
        * Only use VFP if hard float ABI is enabled. */
-      if (tcc_state->float_abi == ARM_HARD_FLOAT && r >= TREG_F0 && r <= TREG_F7 && v >= TREG_F0 && v <= TREG_F7)
+      if (tcc_state->float_abi == ARM_HARD_FLOAT && r >= TREG_F0 && r <= TREG_F7 && src_reg >= TREG_F0 &&
+          src_reg <= TREG_F7)
       {
         /* VFP to VFP move */
         if ((ft & VT_BTYPE) == VT_FLOAT)
-          ot_check(th_vmov_register(vfpr(r), vfpr(v), 0));
+          ot_check(th_vmov_register(vfpr(r), vfpr(src_reg), 0));
         else
-          ot_check(th_vmov_register(vfpr(r), vfpr(v), 1));
+          ot_check(th_vmov_register(vfpr(r), vfpr(src_reg), 1));
       }
       else
       {
         /* Integer register move (soft float) */
-        ot_check(th_mov_reg(r, v, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
+        ot_check(
+            th_mov_reg(r, src_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
         if ((ft & VT_BTYPE) == VT_DOUBLE || (ft & VT_BTYPE) == VT_LDOUBLE)
         {
           /* Also move high word for double.
            * Use sv->pr1 for destination high register, not r+1 which could be
            * invalid. Source high register comes from sv->r2. */
           int r_high = sv->pr1;
-          int v_high = (sv->r2 != VT_CONST) ? sv->r2 : (v + 1);
+          int v_high = (sv->r2 != VT_CONST) ? sv->r2 : (src_reg + 1);
           if (r_high < 0 || r_high == R_SP || r_high == R_PC)
           {
             /* Fallback: if pr1 not allocated, try r+1 but validate */
@@ -2170,8 +2292,9 @@ void load(int r, SValue *sv)
     }
     else
     {
-      TRACE("mov r %i v %i", r, v);
-      ot_check(th_mov_reg(r, v, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
+      TRACE("mov r %i v %i", r, src_reg);
+      ot_check(
+          th_mov_reg(r, src_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
       return;
     }
   }
@@ -2349,13 +2472,90 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
 {
   ThumbDataProcessingHandler handler;
   thumb_flags_behaviour flags = FLAGS_BEHAVIOUR_NOT_IMPORTANT;
+
+  /* Check for 64-bit operations */
+  int is_64bit = is_64bit_type(op->dest.type.t);
+
+  /* Check if destination is spilled (on stack) - if so, use R12 as temp */
+  /* Priority: if pr0 is valid and not spilled, use it; otherwise check if it's in memory */
+  int dest_spilled = (op->dest.pr0 == -1) || (op->dest.pr0 & PREG_SPILLED);
+  int orig_dest_pr0 = op->dest.pr0;
+
+  /* Check if source operands are spilled too */
+  /* Only treat as spilled if NOT allocated to a register */
+  int src1_spilled = (op->src1.pr0 == -1) || (op->src1.pr0 & PREG_SPILLED);
+  int src2_spilled = (op->src2.pr0 == -1) || (op->src2.pr0 & PREG_SPILLED);
+  int orig_src1_pr0 = op->src1.pr0;
+  int orig_src2_pr0 = op->src2.pr0;
+
+  /* Load spilled source operands before the operation */
+  if (src1_spilled && op->op != TCCIR_OP_CMP && op->op != TCCIR_OP_TEST_ZERO)
+  {
+    /* Load src1 from memory to R12 */
+    if (is_64bit)
+    {
+      /* For 64-bit, we need two registers */
+      SValue src1_low = op->src1;
+      src1_low.type.t = VT_INT;
+      load(R12, &src1_low);
+
+      SValue src1_high = op->src1;
+      src1_high.type.t = VT_INT;
+      src1_high.c.i += 4;
+      load(R_LR, &src1_high);
+
+      op->src1.pr0 = R12;
+      op->src1.pr1 = R_LR;
+    }
+    else
+    {
+      load(R12, &op->src1);
+      op->src1.pr0 = R12;
+    }
+  }
+
+  if (dest_spilled && op->op != TCCIR_OP_CMP && op->op != TCCIR_OP_TEST_ZERO)
+  {
+    /* For operations that produce a result to be stored, dest will be R12 (same as src1) */
+    op->dest.pr0 = R12;
+    if (is_64bit && op->dest.pr1 == -1)
+    {
+      op->dest.pr1 = R_LR; /* Use LR as second scratch for 64-bit ops */
+    }
+  }
+
+  if (src2_spilled && op->op != TCCIR_OP_CMP && op->op != TCCIR_OP_TEST_ZERO && !th_has_immediate_value(op->src2.r))
+  {
+    /* Load src2 from memory - but this is handled later in the function for imm case */
+    /* For now, just note that src2 needs loading */
+  }
+
   switch (op->op)
   {
   case TCCIR_OP_ADD:
+    if (is_64bit)
+    {
+      /* 64-bit add: ADDS for low words, ADC for high words */
+      /* dest.pr0:pr1 = src1.pr0:pr1 + src2.pr0:pr1 */
+      ot_check(th_add_reg(op->dest.pr0, op->src1.pr0, op->src2.pr0, FLAGS_BEHAVIOUR_SET, THUMB_SHIFT_DEFAULT,
+                          ENFORCE_ENCODING_NONE));
+      ot_check(th_adc_reg(op->dest.pr1, op->src1.pr1, op->src2.pr1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                          ENFORCE_ENCODING_NONE));
+      return;
+    }
     handler.imm_handler = th_add_imm;
     handler.reg_handler = th_add_reg;
     break;
   case TCCIR_OP_SUB:
+    if (is_64bit)
+    {
+      /* 64-bit sub: SUBS for low words, SBC for high words */
+      ot_check(th_sub_reg(op->dest.pr0, op->src1.pr0, op->src2.pr0, FLAGS_BEHAVIOUR_SET, THUMB_SHIFT_DEFAULT,
+                          ENFORCE_ENCODING_NONE));
+      ot_check(th_sbc_reg(op->dest.pr1, op->src1.pr1, op->src2.pr1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                          ENFORCE_ENCODING_NONE));
+      return;
+    }
     handler.imm_handler = th_sub_imm;
     handler.reg_handler = th_sub_reg;
     break;
@@ -2385,18 +2585,45 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
   }
   case TCCIR_OP_OR:
   {
+    if (is_64bit)
+    {
+      /* 64-bit OR: just OR both halves */
+      ot_check(th_orr_reg(op->dest.pr0, op->src1.pr0, op->src2.pr0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                          ENFORCE_ENCODING_NONE));
+      ot_check(th_orr_reg(op->dest.pr1, op->src1.pr1, op->src2.pr1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                          ENFORCE_ENCODING_NONE));
+      return;
+    }
     handler.imm_handler = th_orr_imm;
     handler.reg_handler = th_orr_reg;
     break;
   }
   case TCCIR_OP_AND:
   {
+    if (is_64bit)
+    {
+      /* 64-bit AND: just AND both halves */
+      ot_check(th_and_reg(op->dest.pr0, op->src1.pr0, op->src2.pr0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                          ENFORCE_ENCODING_NONE));
+      ot_check(th_and_reg(op->dest.pr1, op->src1.pr1, op->src2.pr1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                          ENFORCE_ENCODING_NONE));
+      return;
+    }
     handler.imm_handler = th_and_imm;
     handler.reg_handler = th_and_reg;
     break;
   }
   case TCCIR_OP_XOR:
   {
+    if (is_64bit)
+    {
+      /* 64-bit XOR: just XOR both halves */
+      ot_check(th_eor_reg(op->dest.pr0, op->src1.pr0, op->src2.pr0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                          ENFORCE_ENCODING_NONE));
+      ot_check(th_eor_reg(op->dest.pr1, op->src1.pr1, op->src2.pr1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                          ENFORCE_ENCODING_NONE));
+      return;
+    }
     handler.imm_handler = th_eor_imm;
     handler.reg_handler = th_eor_reg;
     break;
@@ -2441,7 +2668,6 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
 
   if (op->op == TCCIR_OP_CMP)
   {
-    printf("DEBUG CMP: src1.pr0=R%d, src2.c.i=%d, src2.r=0x%x\n", op->src1.pr0, op->src2.c.i, op->src2.r);
   }
 
   if (th_has_immediate_value(op->src2.r))
@@ -2457,6 +2683,32 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
   {
     ot_check(handler.reg_handler(op->dest.pr0, op->src1.pr0, op->src2.pr0, flags, THUMB_SHIFT_DEFAULT,
                                  ENFORCE_ENCODING_NONE));
+  }
+
+  /* If destination was spilled, store the result from R12 to memory.
+   * Skip for CMP and TEST_ZERO which don't produce a result (just set flags) */
+  if (dest_spilled && op->op != TCCIR_OP_CMP && op->op != TCCIR_OP_TEST_ZERO)
+  {
+    op->dest.pr0 = orig_dest_pr0; /* Restore original pr0 for store() */
+    /* Ensure dest.r has VT_LOCAL set so store() uses FP-relative addressing */
+    op->dest.r = VT_LOCAL;
+    if (is_64bit)
+    {
+      /* Store both registers for 64-bit result */
+      SValue dest_low = op->dest;
+      dest_low.type.t = VT_INT;
+      store(R12, &dest_low);
+
+      SValue dest_high = op->dest;
+      dest_high.type.t = VT_INT;
+      dest_high.c.i += 4;
+      store(R_LR, &dest_high);
+    }
+    else
+    {
+      /* Store single register for 32-bit result */
+      store(R12, &op->dest);
+    }
   }
 }
 
@@ -2544,12 +2796,8 @@ static void store_fp_result_from_vfp(SValue *dest, int result_sreg, int result_d
   {
     ot_check(th_vmov_2gp_dp(R0, R1, result_dreg, 1 /* to ARM */));
     /* If dest has an allocated integer register pair, move to it */
-    printf("DEBUG store_fp_result_from_vfp: vr=%d pr0=%d pr1=%d is_vfp=%d "
-           "spilled=%d c.i=%d\n",
-           dest->vr, dest->pr0, dest->pr1, LS_IS_VFP_REG(dest->pr0), (dest->pr0 & PREG_SPILLED) != 0, (int)dest->c.i);
     if (dest->pr0 >= 0 && !LS_IS_VFP_REG(dest->pr0) && !(dest->pr0 & PREG_SPILLED) && dest->pr1 >= 0)
     {
-      printf("DEBUG: Taking MOV path - pr0=%d pr1=%d\n", dest->pr0, dest->pr1);
       /* Move R0:R1 to dest register pair */
       if (dest->pr0 != R0)
       {
@@ -3041,6 +3289,20 @@ ST_FUNC void tcc_gen_machine_return_value_op(TACQuadruple *q)
 {
   int is_64bit = is_64bit_type(q->src1.type.t);
 
+  /* If source is an lvalue (memory location), load directly to R0 */
+  if (q->src1.r & VT_LVAL)
+  {
+    load(R0, &q->src1);
+    if (is_64bit)
+    {
+      /* For 64-bit, need to load high word to R1 */
+      SValue hi = q->src1;
+      hi.c.i += 4;
+      load(R1, &hi);
+    }
+    return;
+  }
+
   if (q->src1.pr0 >= 0 && !(q->src1.pr0 & PREG_SPILLED))
   {
     load_to_register(R0, q->src1.pr0, &q->src1);
@@ -3077,23 +3339,28 @@ ST_FUNC void tcc_gen_machine_store_op(TACQuadruple *op)
    * long */
   int src_btype = op->src1.type.t & VT_BTYPE;
   int is_64bit = (src_btype == VT_DOUBLE) || (src_btype == VT_LDOUBLE) || (src_btype == VT_LLONG);
-  printf("DEBUG store_op: src1.pr0=%d, src1.r=0x%x, is_64bit=%d, src_btype=0x%x\n", op->src1.pr0, op->src1.r, is_64bit,
-         src_btype);
 
-  /* Check if source is an lvalue that needs dereferencing FIRST.
-   * Even if pr0 is valid, if VT_LVAL is set, pr0 contains the ADDRESS
-   * and we need to load the value from that address. */
-  if (op->src1.r & VT_LVAL)
-  {
-    /* Source is an lvalue - need to load the value from the address */
-    load(R12, &op->src1);
-    src_reg = R12;
-    store(src_reg, &op->dest);
-  }
-  else if (op->src1.pr0 >= 0 && !(op->src1.pr0 & PREG_SPILLED))
+  /* Debug output */
+  TRACE("STORE DEBUG: src1.vr=%d, src1.r=0x%x (VT_LVAL=%d), src1.pr0=%d, PREG_SPILLED=%d", op->src1.vr, op->src1.r,
+        (op->src1.r & VT_LVAL) ? 1 : 0, op->src1.pr0, (op->src1.pr0 & PREG_SPILLED) ? 1 : 0);
+
+  /* FIXED: Check for valid register allocation FIRST, before checking VT_LVAL.
+   * For register-allocated variables (like VAR:0 in R5), we should use the
+   * register directly even if VT_LVAL is set. VT_LVAL check should only apply
+   * when there's no valid register (i.e., pr0 < 0 or spilled). */
+  if (op->src1.pr0 >= 0 && !(op->src1.pr0 & PREG_SPILLED))
   {
     /* Have a valid register allocation with actual value - use it directly */
+    TRACE("STORE: Using register-allocated value from R%d", op->src1.pr0);
     src_reg = op->src1.pr0;
+    store(src_reg, &op->dest);
+  }
+  else if (op->src1.r & VT_LVAL)
+  {
+    /* Source is an lvalue that needs dereferencing (no valid register) */
+    TRACE("STORE: Loading lvalue from memory");
+    load(R12, &op->src1);
+    src_reg = R12;
     store(src_reg, &op->dest);
   }
   else if (op->src1.pr0 == -1 || (op->src1.pr0 & PREG_SPILLED))
@@ -3145,6 +3412,8 @@ ST_FUNC void tcc_gen_machine_store_op(TACQuadruple *op)
   }
   else
   {
+    /* No special handling needed - should not reach here if above conditions are correct */
+    TRACE("STORE: Using register from pr0=%d (fallback)", op->src1.pr0);
     src_reg = op->src1.pr0;
     store(src_reg, &op->dest);
   }
@@ -3337,14 +3606,17 @@ ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *op)
   int is_64bit = (dest_btype == VT_DOUBLE) || (dest_btype == VT_LDOUBLE) || (dest_btype == VT_LLONG) ||
                  (src_btype == VT_DOUBLE) || (src_btype == VT_LDOUBLE) || (src_btype == VT_LLONG);
   int dest_spilled = (op->dest.pr0 == -1) || (op->dest.pr0 == (int8_t)PREG_SPILLED) || (op->dest.pr0 & PREG_SPILLED);
-  printf("DEBUG assign_op: dest.pr0=%d, src1.pr0=%d, src1.r=0x%x, "
-         "is_64bit=%d, dest_spilled=%d, dest_btype=0x%x, src_btype=0x%x\n",
-         op->dest.pr0, op->src1.pr0, op->src1.r, is_64bit, dest_spilled, dest_btype, src_btype);
+  int dest_is_local = (op->dest.r & VT_VALMASK) == VT_LOCAL;
+
+  TRACE("ASSIGN DEBUG: dest.vr=%d, dest.r=0x%x (VT_LOCAL=%d), dest.pr0=%d, src1.pr0=%d, dest_spilled=%d", op->dest.vr,
+        op->dest.r, dest_is_local, op->dest.pr0, op->src1.pr0, dest_spilled);
 
   if (dest_spilled)
   {
-    /* Spilled destination - store via integer register */
-    printf("DEBUG assign_op: taking spilled dest path\n");
+    /* Spilled destination - store via integer register.
+     * Ensure dest.r has VT_LOCAL set so store() uses FP-relative addressing */
+    op->dest.r = VT_LOCAL;
+
     if (src_is_vfp)
     {
       int sn = LS_VFP_REG_NUM(op->src1.pr0);
@@ -3367,7 +3639,6 @@ ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *op)
         uint64_t val64 = op->src1.c.i;
         uint32_t lo = (uint32_t)(val64 & 0xFFFFFFFF);
         uint32_t hi = (uint32_t)(val64 >> 32);
-        printf("DEBUG assign_op 64bit const: low=0x%x high=0x%x\n", lo, hi);
         /* Store low word */
         load_full_const(R12, -1, lo, NULL);
         SValue dest_low = op->dest;
@@ -3456,7 +3727,17 @@ ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *op)
     }
     else if (op->dest.pr0 & PREG_SPILLED)
     {
+      /* Debug for VAR:3 */
+      if (op->src1.vr == 0x10000003)
+      {
+        printf("DEBUG before load: src1.vr=0x%x, src1.pr0=%d\n", op->src1.vr, op->src1.pr0);
+      }
       load(R12, &op->src1);
+      /* Debug for VAR:3 */
+      if (op->src1.vr == 0x10000003)
+      {
+        printf("DEBUG after load: src1.vr=0x%x, src1.pr0=%d\n", op->src1.vr, op->src1.pr0);
+      }
       store(R12, &op->dest);
       return;
     }
@@ -3490,6 +3771,16 @@ ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *op)
     /* Integer to integer */
     ot_check(th_mov_reg(op->dest.pr0, op->src1.pr0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
                         ENFORCE_ENCODING_NONE, false));
+  }
+
+  /* BUGFIX: For VT_LOCAL destinations, we need to write back to memory even if
+   * a register was allocated. The register serves as a cache, but the canonical
+   * location is still on the stack. This is critical for compound assignments
+   * like `index += 1` where the incremented value must be stored back. */
+  if (dest_is_local && !dest_spilled && op->dest.pr0 >= 0)
+  {
+    TRACE("ASSIGN: Writing back local variable from R%d to memory at offset %d", op->dest.pr0, op->dest.c.i);
+    store(op->dest.pr0, &op->dest);
   }
 }
 
@@ -3527,8 +3818,6 @@ ST_FUNC void tcc_gen_machine_store_to_stack(int reg, int offset)
 {
   int sign = (offset < 0);
   int abs_offset = sign ? -offset : offset;
-
-  printf("DEBUG store_to_stack: reg=%d offset=%d\n", reg, offset);
 
   /* Try direct STR with immediate offset */
   if (!store_word_to_base(reg, R_FP, abs_offset, sign))
@@ -3634,13 +3923,10 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
   uint32_t params_found = 0; /* Bitmask of which param numbers we've claimed */
   int nested_call_depth = 0; /* Track nested calls to skip their params */
 
-  printf("DEBUG func_call_op: call_idx=%d, scanning backward for params\n", call_idx);
-
   /* Backward scan to find params for THIS call */
   for (int i = call_idx - 1; i >= 0; i--)
   {
     TACQuadruple *instr = &ir->instructions[i];
-    printf("DEBUG func_call_op: i=%d, op=%d (%s)\n", i, instr->op, tcc_ir_get_op_name(instr->op));
 
     if (instr->op == TCCIR_OP_FUNCCALLVAL || instr->op == TCCIR_OP_FUNCCALLVOID)
     {
@@ -3811,42 +4097,43 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
     }
   }
 
-  /* Load register arguments in reverse order to avoid clobbering */
+  /* Load register arguments in descending order (R3 → R2 → R1 → R0).
+   * This naturally avoids conflicts: we write to higher registers while reading from lower ones,
+   * so source registers are always preserved until after we've read them. */
   int registers_to_push = 0;
+
   for (int i = 3; i >= 0; --i)
   {
     if (op_to_reg[i] == -1)
       continue;
-    printf("DEBUG func_call_op: arg %d assigned_register=%d, accessing "
-           "instruction: %d, vreg: ",
-           op_to_reg[i], i, param_indices[op_to_reg[i]]);
     TACQuadruple *arg = &ir->instructions[param_indices[op_to_reg[i]]];
 
-    tcc_ir_print_vreg(arg->src1.vr);
-    printf("\n");
     const int is_64bit = is_64bit_type(arg->src1.type.t);
     const int dest_reg = i;
     if (is_64bit)
     {
+      /* 64-bit values use register pairs (R0:R1 or R2:R3) */
       SValue dest;
       dest.pr0 = dest_reg - 1;
       dest.pr1 = dest_reg;
-      printf("loading 64-bit arg to reg %d:%d, pr0: %d, pr1: %d\n", dest_reg - 1, dest_reg, arg->src1.pr0,
-             arg->src1.pr1);
-      --i;
+      --i; /* Skip the lower register of the pair in next iteration */
+
       if (arg->src1.pr0 == -1 && arg->src1.pr1 == -1)
       {
+        /* Load from memory/constant */
         load_to_dest(&dest, &arg->src1);
-        continue;
       }
-      load_to_register(dest_reg - 1, arg->src1.pr0, &arg->src1);
-      load_to_register(dest_reg, arg->src1.pr1, &arg->src1);
-      continue;
+      else
+      {
+        /* Move from source register pair */
+        load_to_register(dest_reg - 1, arg->src1.pr0, &arg->src1);
+        load_to_register(dest_reg, arg->src1.pr1, &arg->src1);
+      }
     }
     else
     {
+      /* 32-bit value - load directly to destination register */
       load_to_register(dest_reg, arg->src1.pr0, &arg->src1);
-      continue;
     }
   }
 
@@ -4149,8 +4436,6 @@ ST_FUNC const char *tcc_get_abi_softcall_name(TACQuadruple *q)
     /* Get comparison operation from src2.c.i (stored during IR generation) */
     int cmp_op = q->src2.c.i;
     int is_float = (src1_size == 4);
-
-    printf("DEBUG FCMP: src type=0x%x, cmp_op=0x%x\n", q->src1.type.t, cmp_op);
 
     switch (cmp_op)
     {

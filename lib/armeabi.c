@@ -208,6 +208,44 @@ long long __aeabi_lmod(long long a, long long b)
 #endif
 }
 
+/* 64-bit comparison functions */
+
+/* Signed 64-bit comparison
+ * Returns: <0 if a < b, 0 if a == b, >0 if a > b
+ * Uses only 32-bit operations to avoid recursive long long comparison */
+int __aeabi_lcmp(unsigned int a_lo, int a_hi, unsigned int b_lo, int b_hi)
+{
+  /* Compare high words first (signed) */
+  if (a_hi < b_hi)
+    return -1;
+  if (a_hi > b_hi)
+    return 1;
+  /* High words equal, compare low words (unsigned) */
+  if (a_lo < b_lo)
+    return -1;
+  if (a_lo > b_lo)
+    return 1;
+  return 0;
+}
+
+/* Unsigned 64-bit comparison
+ * Returns: <0 if a < b, 0 if a == b, >0 if a > b
+ * Uses only 32-bit operations to avoid recursive long long comparison */
+int __aeabi_ulcmp(unsigned int a_lo, unsigned int a_hi, unsigned int b_lo, unsigned int b_hi)
+{
+  /* Compare high words first (unsigned) */
+  if (a_hi < b_hi)
+    return -1;
+  if (a_hi > b_hi)
+    return 1;
+  /* High words equal, compare low words (unsigned) */
+  if (a_lo < b_lo)
+    return -1;
+  if (a_lo > b_lo)
+    return 1;
+  return 0;
+}
+
 /* Bit manipulation */
 
 /* Count leading zeros */

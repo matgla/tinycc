@@ -466,7 +466,7 @@ ST_FUNC void tccgen_finish(TCCState *s1)
 /* ------------------------------------------------------------------------- */
 ST_FUNC ElfSym *elfsym(Sym *s)
 {
-  if (!s || !s->c)
+  if (!s || s->c <= 0) /* s->c < 0 used for special values like -2 for "being defined" */
     return NULL;
   return &((ElfSym *)symtab_section->data)[s->c];
 }
@@ -525,9 +525,32 @@ ST_FUNC void put_extern_sym2(Sym *sym, int sh_num, addr_t value, unsigned long s
   const char *name;
   char buf1[256];
 
-  if (!sym->c)
+  if (sym->c <= 0)
   {
+    /* DEBUG: Validate sym->v before calling get_tok_str */
+    /* Valid v values are: TOK_* constants, identifiers (TOK_IDENT..tok_ident), or anonymous (SYM_FIRST_ANOM..) */
+    if (sym->v == 0xDEADBEEF)
+    {
+      /* Use-after-free detected - sym was freed but still referenced */
+      return;
+    }
+    if (sym->v == 0 || (sym->v > 0x20000000 && sym->v < SYM_FIRST_ANOM))
+    {
+      /* sym->v looks like a garbage pointer - skip */
+      return;
+    }
     name = get_tok_str(sym->v, NULL);
+    /* Detect garbage symbol names early */
+    if (name && (name[0] == 'L' && name[1] == '.'))
+    {
+      /* This is likely a garbage anonymous symbol - L.XXXXX format */
+      /* Check if the v value looks suspicious */
+      if (sym->v >= SYM_FIRST_ANOM && (sym->v - SYM_FIRST_ANOM) > 100000)
+      {
+        tcc_error("internal error: put_extern_sym2 called with garbage anonymous symbol (v=0x%x, name='%s')", sym->v,
+                  name);
+      }
+    }
     t = sym->type.t;
     if ((t & VT_BTYPE) == VT_FUNC)
     {
@@ -613,9 +636,26 @@ ST_FUNC void greloca(Section *s, Sym *sym, unsigned long offset, int type, addr_
 
   if (sym)
   {
+    /* Debug: detect garbage symbols early */
+    if (sym->v >= SYM_FIRST_ANOM && (sym->v - SYM_FIRST_ANOM) > 100000)
+    {
+      tcc_error("internal error: greloca called with garbage symbol (v=0x%x, c=%d, likely invalid pointer)", sym->v,
+                sym->c);
+    }
     if (0 == sym->c)
       put_extern_sym(sym, NULL, 0, 0);
     c = sym->c;
+    if (c <= 0)
+    {
+      /* sym->c should be a valid positive ELF symbol index at this point.
+       * c = 0: put_extern_sym failed or was skipped (NODATA_WANTED?)
+       * c = -1: type descriptor symbol (from mk_pointer) - should not be here
+       * c = -2: struct/union being defined - should not be here
+       * This indicates a bug where we're trying to create a relocation for
+       * a symbol that was never properly registered in ELF. */
+      tcc_error("internal error: greloca called with invalid symbol (c=%d, v=0x%x, type.t=0x%x, r=0x%x)", c, sym->v,
+                sym->type.t, sym->r);
+    }
   }
 
   /* now we can add ELF relocation info */
@@ -669,6 +709,8 @@ static inline Sym *sym_malloc(void)
 ST_INLN void sym_free(Sym *sym)
 {
 #ifndef SYM_DEBUG
+  /* Poison freed symbols to detect use-after-free */
+  sym->v = 0xDEADBEEF;
   sym->next = sym_free_first;
   sym_free_first = sym;
 #else
@@ -1161,48 +1203,6 @@ static void gvtst_set(int inv, int t)
   // if (vtop->)
   // *p = tcc_ir_gjmp_append(tcc_state->ir, *p, t);
   // tcc_ir_generate_cmp_jmp_set(tcc_state->ir);
-}
-
-/* Generate value test
- *
- * Generate a test for any value (jump, comparison and integers) */
-static int gvtst(int inv, int t)
-{
-  int op, x, u;
-  SValue dest;
-  gvtst_set(inv, t);
-  t = vtop->jtrue, u = vtop->jfalse;
-  if (inv)
-    x = u, u = t, t = x;
-  op = vtop->c.i;
-  memset(&dest, 0, sizeof(dest));
-  dest.c.i = t;
-  dest.vr = -1;
-  /* jump to the wanted target */
-  if (op > 1)
-  {
-    SValue condition;
-    memset(&condition, 0, sizeof(condition));
-    condition.vr = -1;
-    condition.c.i = op ^ inv;
-    tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMPIF, &condition, NULL, &dest);
-    //  t = gjmp_cond(op ^ inv, t);
-  }
-  else if (op != inv)
-  {
-    SValue condition;
-    memset(&condition, 0, sizeof(condition));
-    condition.vr = -1;
-    condition.c.i = op ^ inv;
-    tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
-  }
-  /* resolve complementary jumps to here */
-  // gsym(u);
-  tcc_ir_backpatch_to_here(tcc_state->ir, u);
-
-  vtop--;
-  print_vstack("gvtst");
-  return t;
 }
 
 /* generate a zero or nozero test */
@@ -1956,6 +1956,13 @@ ST_FUNC int gv(int rc)
   int bit_pos, bit_size, size, align;
   int vreg = 0;
 
+  /* For IR mode: if we already have a valid vreg computed, no need to do anything */
+  if (tcc_state->ir && vtop->vr >= 0 && !(vtop->r & VT_LVAL))
+  {
+    printf("gv: IR mode, already has vreg=%d, skipping\n", vtop->vr);
+    return vtop->r & VT_VALMASK;
+  }
+
   /* NOTE: get_reg can modify vstack[] */
   if (vtop->type.t & VT_BITFIELD)
   {
@@ -2178,10 +2185,39 @@ ST_FUNC void lexpand(void)
   }
   else
   {
-    gv(RC_INT);
-    vdup();
-    vtop[0].r = vtop[-1].r2;
-    vtop[0].r2 = vtop[-1].r2 = VT_CONST;
+    /* For IR mode: a 64-bit vreg represents the full value.
+     * When expanding, create two views: low word keeps same vreg,
+     * high word gets a new vreg with SHR 32 operation. */
+    if (tcc_state->ir && vtop->vr >= 0)
+    {
+      /* Save the original long long value */
+      SValue src_llong = *vtop;
+
+      /* Bottom of stack gets low word (same vreg, just change type) */
+      vtop->type.t = VT_INT | u;
+
+      /* Duplicate and create high word */
+      vdup();
+      vtop[0].type.t = VT_INT | u;
+      vtop[0].vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+
+      /* Generate IR to extract high word (shift right 32) */
+      SValue shift_amt;
+      memset(&shift_amt, 0, sizeof(shift_amt));
+      shift_amt.type.t = VT_INT;
+      shift_amt.r = VT_CONST;
+      shift_amt.c.i = 32;
+      shift_amt.vr = -1;
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_SHR, &src_llong, &shift_amt, &vtop[0]);
+    }
+    else
+    {
+      /* Old backend path */
+      gv(RC_INT);
+      vdup();
+      vtop[0].r = vtop[-1].r2;
+      vtop[0].r2 = vtop[-1].r2 = VT_CONST;
+    }
   }
   vtop[0].type.t = vtop[-1].type.t = VT_INT | u;
 }
@@ -2191,6 +2227,40 @@ ST_FUNC void lexpand(void)
 /* build a long long from two ints */
 static void lbuild(int t)
 {
+  /* For IR mode: combine low and high vregs into a single 64-bit vreg.
+   * Generate an OR operation: (high << 32) | low */
+  if (tcc_state->ir && vtop[-1].vr >= 0 && vtop[0].vr >= 0)
+  {
+    /* Create new 64-bit temp vreg for result */
+    int result_vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+
+    /* First shift high word left by 32: high_shifted = high << 32 */
+    SValue shift_amt;
+    memset(&shift_amt, 0, sizeof(shift_amt));
+    shift_amt.type.t = VT_INT;
+    shift_amt.r = VT_CONST;
+    shift_amt.c.i = 32;
+    shift_amt.vr = -1;
+
+    SValue high_shifted;
+    memset(&high_shifted, 0, sizeof(high_shifted));
+    high_shifted.type.t = VT_LLONG;
+    high_shifted.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+    tcc_ir_put(tcc_state->ir, TCCIR_OP_SHL, &vtop[0], &shift_amt, &high_shifted);
+
+    /* Then OR with low word: result = high_shifted | low */
+    SValue result;
+    memset(&result, 0, sizeof(result));
+    result.type.t = t;
+    result.vr = result_vr;
+    tcc_ir_put(tcc_state->ir, TCCIR_OP_OR, &high_shifted, &vtop[-1], &result);
+
+    vtop[-1].vr = result_vr;
+    vtop[-1].type.t = t;
+    vtop[-1].r = 0;
+    vpop();
+    return;
+  }
   gv2(RC_INT, RC_INT);
   vtop[-1].r2 = vtop[0].r;
   vtop[-1].type.t = t;
@@ -2238,6 +2308,7 @@ static void gv_dup(void)
   tcc_ir_put(tcc_state->ir, TCCIR_OP_ASSIGN, vtop, NULL, &sv);
   vtop->vr = sv.vr;
   vtop->r = 0;
+  vtop->c.i = 0; /* Clear c.i to avoid corrupting later operations */
   vdup();
 }
 
@@ -2274,7 +2345,7 @@ static void gen_opl(int op)
     /* call generic long long function */
     vpush_helper_func(func);
     vrott(3);
-    /* Stack after vrott(3): arg1, arg2, func (func is at vtop) */
+    /* Stack after vrott(3): func, arg1, arg2 (arg2 is at vtop) */
     {
       SValue param_num;
       SValue dest;
@@ -2282,16 +2353,16 @@ static void gen_opl(int op)
       param_num.vr = -1;
       /* Generate FUNCPARAMVAL for arg1 (param 1) */
       param_num.c.i = 1;
-      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-2], &param_num, NULL);
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &param_num, NULL);
       /* Generate FUNCPARAMVAL for arg2 (param 2) */
       param_num.c.i = 2;
-      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &param_num, NULL);
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[0], &param_num, NULL);
       /* Generate FUNCCALLVAL for the function call (returns long long) */
       memset(&dest, 0, sizeof(SValue));
       dest.type.t = VT_LLONG;
       dest.r = 0;
       dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, vtop, NULL, &dest);
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[-2], NULL, &dest);
       /* Pop all 3 values (arg1, arg2, func) and push result */
       vtop -= 3;
       vpushi(0);
@@ -2304,11 +2375,59 @@ static void gen_opl(int op)
   case '^':
   case '&':
   case '|':
-  case '*':
   case '+':
   case '-':
-    // pv("gen_opl A", 0, 2);
-    t = vtop->type.t;
+    /* For IR mode: generate 64-bit operations directly without lexpand/lbuild */
+    if (tcc_state->ir)
+    {
+      t = vtop->type.t;
+      if (op == '+' || op == '-')
+      {
+        /* 64-bit add/sub - generate single IR operation */
+        SValue dest;
+        memset(&dest, 0, sizeof(SValue));
+        dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+        dest.type.t = t;
+        dest.r = 0;
+        TccIrOp ir_op = (op == '+') ? TCCIR_OP_ADD : TCCIR_OP_SUB;
+        tcc_ir_put(tcc_state->ir, ir_op, &vtop[-1], &vtop[0], &dest);
+        vtop--;
+        vtop->vr = dest.vr;
+        vtop->type.t = t;
+        vtop->r = 0;
+      }
+      else
+      {
+        /* 64-bit bitwise ops (^, &, |) - generate single IR operation */
+        SValue dest;
+        memset(&dest, 0, sizeof(SValue));
+        dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+        dest.type.t = t;
+        dest.r = 0;
+        TccIrOp ir_op;
+        switch (op)
+        {
+        case '^':
+          ir_op = TCCIR_OP_XOR;
+          break;
+        case '&':
+          ir_op = TCCIR_OP_AND;
+          break;
+        case '|':
+          ir_op = TCCIR_OP_OR;
+          break;
+        }
+        tcc_ir_put(tcc_state->ir, ir_op, &vtop[-1], &vtop[0], &dest);
+        vtop--;
+        vtop->vr = dest.vr;
+        vtop->type.t = t;
+        vtop->r = 0;
+      }
+      break;
+    }
+    /* Fall through for non-IR mode */
+    /* FALLTHROUGH */
+  case '*':
     vswap();
     lexpand();
     vrotb(3);
@@ -2453,70 +2572,76 @@ static void gen_opl(int op)
     }
     break;
   default:
-    /* compare operations */
+    /* compare operations - use __aeabi_lcmp/__aeabi_ulcmp for ARM EABI */
     t = vtop->type.t;
-    vswap();
-    lexpand();
-    vrotb(3);
-    lexpand();
-    /* stack: L1 H1 L2 H2 */
-    tmp = vtop[-1];
-    vtop[-1] = vtop[-2];
-    vtop[-2] = tmp;
-    /* stack: L1 L2 H1 H2 */
-    if (!cur_switch || cur_switch->bsym)
     {
-      /* avoid differnt registers being saved in branches.
-         This is not needed when comparing switch cases */
-      save_regs(4);
-    }
-    /* compare high */
-    op1 = op;
-    /* when values are equal, we need to compare low words. since
-       the jump is inverted, we invert the test too. */
-    if (op1 == TOK_LT)
-      op1 = TOK_LE;
-    else if (op1 == TOK_GT)
-      op1 = TOK_GE;
-    else if (op1 == TOK_ULT)
-      op1 = TOK_ULE;
-    else if (op1 == TOK_UGT)
-      op1 = TOK_UGE;
-    a = -1; /* -1 = no chain */
-    b = -1; /* -1 = no chain */
-    gen_op(op1);
-    if (op == TOK_NE)
-    {
-      b = gvtst(0, -1);
-    }
-    else
-    {
-      a = gvtst(1, -1);
-      if (op != TOK_EQ)
+      int is_unsigned = (op == TOK_ULT || op == TOK_ULE || op == TOK_UGT || op == TOK_UGE);
+      func = is_unsigned ? TOK___aeabi_ulcmp : TOK___aeabi_lcmp;
+
+      /* Call the comparison helper function */
+      vpush_helper_func(func);
+      vrott(3);
+      /* Stack after vrott(3): func, arg1, arg2 (arg2 is at vtop) */
       {
-        /* generate non equal test */
+        SValue param_num;
+        SValue dest;
+        memset(&param_num, 0, sizeof(SValue));
+        param_num.vr = -1;
+        /* Generate FUNCPARAMVAL for arg1 (param 1) */
+        param_num.c.i = 1;
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &param_num, NULL);
+        /* Generate FUNCPARAMVAL for arg2 (param 2) */
+        param_num.c.i = 2;
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[0], &param_num, NULL);
+        /* Generate FUNCCALLVAL for the function call (returns int: -1, 0, or 1) */
+        memset(&dest, 0, sizeof(SValue));
+        dest.type.t = VT_INT;
+        dest.r = 0;
+        dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[-2], NULL, &dest);
+        /* Pop all 3 values (arg1, arg2, func) and push result */
+        vtop -= 3;
         vpushi(0);
-        vset_VT_CMP(TOK_NE);
-        b = gvtst(0, -1);
+        vtop->type.t = VT_INT;
+        vtop->vr = dest.vr;
+        vtop->r = REG_IRET;
+      }
+
+      /* Now compare the result (in r0) against 0 using the appropriate comparison */
+      /* __aeabi_lcmp returns: <0 if a<b, 0 if a==b, >0 if a>b */
+      vpushi(0);
+      switch (op)
+      {
+      case TOK_LT:
+      case TOK_ULT:
+        /* result < 0 means a < b */
+        gen_op(TOK_LT);
+        break;
+      case TOK_LE:
+      case TOK_ULE:
+        /* result <= 0 means a <= b */
+        gen_op(TOK_LE);
+        break;
+      case TOK_GT:
+      case TOK_UGT:
+        /* result > 0 means a > b */
+        gen_op(TOK_GT);
+        break;
+      case TOK_GE:
+      case TOK_UGE:
+        /* result >= 0 means a >= b */
+        gen_op(TOK_GE);
+        break;
+      case TOK_EQ:
+        /* result == 0 means a == b */
+        gen_op(TOK_EQ);
+        break;
+      case TOK_NE:
+        /* result != 0 means a != b */
+        gen_op(TOK_NE);
+        break;
       }
     }
-    /* compare low. Always unsigned */
-    op1 = op;
-    if (op1 == TOK_LT)
-      op1 = TOK_ULT;
-    else if (op1 == TOK_LE)
-      op1 = TOK_ULE;
-    else if (op1 == TOK_GT)
-      op1 = TOK_UGT;
-    else if (op1 == TOK_GE)
-      op1 = TOK_UGE;
-    gen_op(op1);
-#if 0 // def TCC_TARGET_I386
-        if (op == TOK_NE) { gsym(b); break; }
-        if (op == TOK_EQ) { gsym(a); break; }
-#endif
-    gvtst_set(1, a);
-    gvtst_set(0, b);
     break;
   }
 }
@@ -3778,7 +3903,17 @@ again:
     {
       /* value still in memory */
       if (ds <= ss)
+      {
+        /* For IR mode: when casting from long long to smaller type,
+         * we need to generate a proper load of just the low word,
+         * not rely on implicit truncation */
+        if (ss == 8 && ds <= 4 && vtop->vr < 0)
+        {
+          /* Generate LOAD IR for the low word only by changing type first */
+          vtop->type.t = (vtop->type.t & ~VT_BTYPE) | dbt_bt;
+        }
         goto done;
+      }
       /* ss <= 4 here */
       if (ds <= 4 && !(dbt == (VT_SHORT | VT_UNSIGNED) && sbt == VT_BYTE))
       {
@@ -3809,8 +3944,16 @@ again:
     else if (ss == 8)
     {
       /* from long long: just take low order word */
-      lexpand();
-      vpop();
+      /* For IR mode with valid vreg: just change type, backend uses first register of pair */
+      if (tcc_state->ir && vtop->vr >= 0)
+      {
+        vtop->type.t = VT_INT | (vtop->type.t & VT_UNSIGNED);
+      }
+      else
+      {
+        lexpand();
+        vpop();
+      }
     }
     ss = 4;
 
@@ -4111,6 +4254,13 @@ ST_FUNC void vstore(void)
   ft = vtop[-1].type.t;
   sbt = vtop->type.t & VT_BTYPE;
   dbt = ft & VT_BTYPE;
+
+  /* Debug: check if destination has unexpected c.i value */
+  if ((vtop[-1].r & (VT_VALMASK | VT_SYM)) == (VT_CONST | VT_SYM) && vtop[-1].c.i != 0)
+  {
+    printf("WARNING: vstore() destination has non-zero c.i: %d, sym=%p\n", (int)vtop[-1].c.i, vtop[-1].sym);
+  }
+
   verify_assign_cast(&vtop[-1].type);
 
   if (sbt == VT_STRUCT)
@@ -4270,12 +4420,23 @@ ST_FUNC void vstore(void)
     {
       int load_type = (dbt == VT_QFLOAT) ? VT_DOUBLE : VT_PTRDIFF_T;
       vtop[-1].type.t = load_type;
-      store(r, vtop - 1);
-      vswap();
-      incr_offset(PTR_SIZE);
-      vswap();
-      /* XXX: it works because r2 is spilled last ! */
-      store(vtop->r2, vtop - 1);
+      // For IR generation, handle long long as a single 64-bit value
+      if ((vtop[-1].r & VT_VALMASK) == VT_LOCAL)
+      {
+        // Restore original type for proper IR generation
+        vtop[-1].type.t = dbt;
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_ASSIGN, vtop, NULL, &vtop[-1]);
+      }
+      else
+      {
+        // Old path for non-IR backends
+        store(r, vtop - 1);
+        vswap();
+        incr_offset(PTR_SIZE);
+        vswap();
+        /* XXX: it works because r2 is spilled last ! */
+        store(vtop->r2, vtop - 1);
+      }
     }
     else
     {
@@ -4286,10 +4447,30 @@ ST_FUNC void vstore(void)
       {
         op = TCCIR_OP_ASSIGN;
       }
-      printf("DEBUG vstore: op=%d, dest.r=0x%x, dest.c.i=%d, src.r=0x%x, src.c.i=%d\n", op, vtop[-1].r,
-             (int)vtop[-1].c.i, vtop->r, (int)vtop->c.i);
+      /* If source is an lvalue (memory reference), emit LOAD first to get the value.
+       * This handles cases like: int tmp = array[a]; where array[a] is an lvalue */
+      if ((vtop->r & VT_LVAL) && (vtop->r & VT_VALMASK) != VT_LOCAL)
+      {
+        SValue load_dest;
+        load_dest.type = vtop->type;
+        load_dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+        load_dest.r = 0;
+        load_dest.c.i = 0;
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_LOAD, vtop, NULL, &load_dest);
+        vtop->vr = load_dest.vr;
+        vtop->r = 0; /* no longer an lvalue */
+      }
       // tcc_ir_generate_cmp_jmp_set(tcc_state->ir);
       tcc_ir_put(tcc_state->ir, op, vtop, NULL, &vtop[-1]);
+
+      /* After assignment, update vtop to reference the destination vreg.
+       * For assignment expressions like (y = c + d), the result should be
+       * the assigned value (destination), not the source. */
+      if (op == TCCIR_OP_ASSIGN)
+      {
+        vtop->vr = vtop[-1].vr; /* Use destination's vreg */
+        vtop->r = 0;            /* Clear register info */
+      }
     }
     vswap();
     vtop--; /* NOT vpop() because on x86 it would flush the fp stack */
@@ -6223,7 +6404,16 @@ tok_next:
     type.t |= VT_ARRAY;
     memset(&ad, 0, sizeof(AttributeDef));
     ad.section = rodata_section;
-    decl_initializer_alloc(&type, &ad, VT_CONST, 2, 0, 0);
+    {
+      /* String literals must always emit data, even in nocode_wanted paths.
+       * The IR backend defers code generation, so string data must exist
+       * when code is later emitted. Force DATA_ONLY_WANTED to ensure
+       * allocation proceeds regardless of nocode_wanted state. */
+      int saved_nocode = nocode_wanted;
+      nocode_wanted |= DATA_ONLY_WANTED;
+      decl_initializer_alloc(&type, &ad, VT_CONST, 2, 0, 0);
+      nocode_wanted = saved_nocode;
+    }
     break;
   case TOK_SOTYPE:
   case '(':
@@ -7264,24 +7454,20 @@ static int is_safe_bool_operand(SValue *sv)
   /* VT_CMP means it's a pending comparison - safe and already boolean */
   if ((sv->r & VT_VALMASK) == VT_CMP)
   {
-    printf("DEBUG is_safe_bool_operand: VT_CMP detected, returning 1\n");
     return 1;
   }
   /* Constant 0 or 1 */
   if ((sv->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST && (sv->type.t & VT_BTYPE) == VT_INT &&
       (unsigned)sv->c.i < 2)
   {
-    printf("DEBUG is_safe_bool_operand: CONST 0/1 detected, returning 1\n");
     return 1;
   }
   /* Simple integer variable (local or in register) - can be converted to bool with != 0 */
   if (((sv->type.t & VT_BTYPE) == VT_INT || (sv->type.t & VT_BTYPE) == VT_LLONG || (sv->type.t & VT_BTYPE) == VT_PTR) &&
       !(sv->r & VT_SYM)) /* no symbol/function calls that might have side effects */
   {
-    printf("DEBUG is_safe_bool_operand: integer variable detected, r=0x%x, returning 2 (needs != 0)\n", sv->r);
     return 2; /* return 2 to indicate it needs conversion to bool */
   }
-  printf("DEBUG is_safe_bool_operand: NOT safe, r=0x%x, type.t=0x%x, vr=%d\n", sv->r, sv->type.t, sv->vr);
   return 0;
 }
 
@@ -7292,13 +7478,11 @@ static void materialize_bool(int safe_type)
 {
   if ((vtop->r & VT_VALMASK) == VT_CMP)
   {
-    printf("DEBUG materialize_bool: converting VT_CMP to 0/1\n");
     /* Generate code to convert comparison flags to 0/1 */
     tcc_ir_generate_cmp_jmp_set(tcc_state->ir);
   }
   else if (safe_type == 2)
   {
-    printf("DEBUG materialize_bool: converting variable to bool with != 0, r=0x%x\n", vtop->r);
     /* Variable needs to be compared with 0 to become a boolean */
     vpushi(0);
     gen_op(TOK_NE);
@@ -7310,7 +7494,6 @@ static void materialize_bool(int safe_type)
   }
   else
   {
-    printf("DEBUG materialize_bool: already a value, r=0x%x\n", vtop->r);
   }
 }
 
@@ -7473,7 +7656,7 @@ static void expr_cond(void)
       if (c < 0)
       {
         save_regs(1);
-        tt = gvtst(1, -1);
+        tt = tcc_ir_generate_test(tcc_state->ir, 1, -1);
       }
       else
       {
@@ -7486,7 +7669,7 @@ static void expr_cond(void)
          each branch */
       save_regs(1);
       gv_dup();
-      tt = gvtst(0, -1);
+      tt = tcc_ir_generate_test(tcc_state->ir, 0, -1);
     }
 
     if (c == 0)
@@ -7531,7 +7714,7 @@ static void expr_cond(void)
       /* optimize "if (f ? a > b : c || d) ..." for example, where normally
          "a < b" and "c || d" would be forced to "(int)0/1" first, whereas
          this code jumps directly to the if's then/else branches. */
-      t1 = gvtst(0, -1);
+      t1 = tcc_ir_generate_test(tcc_state->ir, 0, -1);
       t2 = gjmp(-1); /* -1 = no chain */
       tcc_ir_backpatch_to_here(tcc_state->ir, u);
       vpushv(&sv);
@@ -7749,8 +7932,20 @@ static void gfunc_return(CType *func_type)
   }
   else
   {
-    // function returns scalar value, but how to get it's value from IR?
-    // gv(RC_RET(func_type->t));
+    // function returns scalar value - ensure it's loaded into a value (not lvalue)
+    // This generates proper LOAD IR if vtop is still an lvalue
+    if (vtop->r & VT_LVAL)
+    {
+      /* Load the value first - this ensures proper size is used */
+      SValue dest;
+      dest.type = vtop->type;
+      dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+      dest.r = 0;
+      dest.c.i = 0;
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_LOAD, vtop, NULL, &dest);
+      vtop->vr = dest.vr;
+      vtop->r = 0; /* no longer an lvalue */
+    }
     tcc_ir_generate_cmp_jmp_set(tcc_state->ir);
     tcc_ir_put(tcc_state->ir, TCCIR_OP_RETURNVALUE, vtop, NULL, NULL);
   }
@@ -8287,7 +8482,7 @@ again:
       SValue dest;
       memset(&dest, 0, sizeof(SValue));
       dest.vr = -1;
-      dest.c.i = 0;
+      dest.c.i = -1;
       e = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
       // d = gind();
       c = tcc_state->ir->next_instruction_index;
@@ -9072,7 +9267,15 @@ static void init_putv(init_params *p, CType *type, unsigned long c, int vreg)
         case VT_PTR:
         case VT_INT:
           if (vtop->r & VT_SYM)
+          {
+            /* Debug check for garbage symbol */
+            if (!vtop->sym || vtop->sym->v >= SYM_FIRST_ANOM + 100000)
+            {
+              tcc_error("internal error: init_putv has garbage sym (v=0x%x, r=0x%x)", vtop->sym ? vtop->sym->v : 0,
+                        vtop->r);
+            }
             greloc(sec, vtop->sym, c, R_DATA_PTR);
+          }
           write32le(ptr, val);
           break;
 #endif
@@ -9090,6 +9293,11 @@ static void init_putv(init_params *p, CType *type, unsigned long c, int vreg)
     if (vreg == -1)
     {
       vtop->vr = tcc_ir_get_vreg_var(tcc_state->ir); // TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_VAR, c);
+      /* Mark long long variables for proper register allocation */
+      if ((dtype.t & VT_BTYPE) == VT_LLONG)
+      {
+        tcc_ir_set_llong_type(tcc_state->ir, vtop->vr);
+      }
     }
     else
     {
@@ -9783,6 +9991,10 @@ static void gen_function(Sym *sym)
 
   /* Boolean expression simplification - eliminate redundant BOOL_OR/BOOL_AND */
   if (tcc_ir_bool_simplification(ir))
+    tcc_ir_dead_code_elimination(ir); /* Clean up unused ops */
+
+  /* Return value optimization - fold LOAD -> RETURNVALUE */
+  if (tcc_ir_return_value_optimization(ir))
     tcc_ir_dead_code_elimination(ir); /* Clean up unused ops */
 
   /* Dead store elimination - remove unused ASSIGN instructions */

@@ -521,10 +521,33 @@ TccIrOp tcc_irop_from_token(int token)
   exit(1);
 }
 
+/* Helper: if sv is an lvalue (memory reference) that's not a local variable,
+ * emit a LOAD and update sv to reference the loaded value */
+static void tcc_ir_load_if_lvalue(TCCIRState *ir, SValue *sv)
+{
+  if ((sv->r & VT_LVAL) && (sv->r & VT_VALMASK) != VT_LOCAL)
+  {
+    SValue load_dest;
+    load_dest.type = sv->type;
+    load_dest.vr = tcc_ir_get_vreg_temp(ir);
+    load_dest.r = 0;
+    load_dest.c.i = 0;
+    tcc_ir_put(ir, TCCIR_OP_LOAD, sv, NULL, &load_dest);
+    sv->vr = load_dest.vr;
+    sv->r = 0; /* no longer an lvalue */
+  }
+}
+
 void tcc_ir_gen_opi(TCCIRState *ir, int op)
 {
   const TccIrOp ir_op = tcc_irop_from_token(op);
   SValue dest;
+
+  /* Load operands from memory if they are lvalues (e.g., array[i]).
+   * This ensures we compare/operate on values, not addresses. */
+  tcc_ir_load_if_lvalue(ir, &vtop[-1]);
+  tcc_ir_load_if_lvalue(ir, &vtop[0]);
+
   if (ir_op == TCCIR_OP_CMP)
   {
     tcc_ir_put(ir, ir_op, &vtop[-1], &vtop[0], NULL);
@@ -642,11 +665,42 @@ const char *tcc_ir_get_op_name(TccIrOp op)
   }
 }
 
+/* Ensure that anonymous symbols referenced by SValues are registered in the ELF
+ * symbol table before being stored in IR instructions. This prevents use-after-free
+ * when the local scope is popped (sym_pop) before the IR is processed.
+ *
+ * Anonymous symbols (v >= SYM_FIRST_ANOM) with c == 0 are local to the current scope
+ * and will be freed when the scope ends. By registering them (put_extern_sym), we
+ * set c > 0 which prevents them from being freed in sym_pop.
+ */
+static void tcc_ir_ensure_sym_registered(SValue *sv)
+{
+  if (sv && (sv->r & VT_SYM) && sv->sym)
+  {
+    Sym *sym = sv->sym;
+    /* Check if this is an anonymous symbol that hasn't been registered yet */
+    if ((sym->v & ~0x0FFFFFFF) == SYM_FIRST_ANOM && sym->c == 0)
+    {
+      /* Use put_extern_sym2 directly to bypass nocode_wanted check.
+       * We need the symbol registered in ELF even if we're in a "nocode" section
+       * because the IR instruction we're about to create will reference it later. */
+      put_extern_sym2(sym, SHN_UNDEF, 0, 0, 1);
+    }
+  }
+}
+
 int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *dest)
 {
   // resize array if needed
   const int pos = ir->next_instruction_index;
   TACQuadruple *q;
+
+  /* Ensure any anonymous symbols in the operands are registered before
+   * storing them in the IR instruction. This prevents use-after-free when
+   * local scopes are popped before the IR is processed. */
+  tcc_ir_ensure_sym_registered(src1);
+  tcc_ir_ensure_sym_registered(src2);
+  tcc_ir_ensure_sym_registered(dest);
 
   if (tcc_ir_is_fpu_operation(op))
   {
@@ -667,6 +721,7 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
     }
   }
   q = &ir->instructions[pos];
+  memset(q, 0, sizeof(TACQuadruple)); /* Zero-initialize to avoid garbage in unused fields */
   q->op = op;
 
   if (irop_config[op].has_src1 == 1)
@@ -713,7 +768,9 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
       fprintf(stderr, "tcc_ir_put: dest is NULL for op %s\n", tcc_ir_get_op_name(op));
       exit(1);
     }
+
     q->dest = *dest;
+
     if (tcc_is_vreg_valid(ir, dest->vr))
     {
       /* Ensure the vreg is tagged with the correct type for register
@@ -775,32 +832,47 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
                        ((src1->r & VT_LVAL) == 0) && (src1->vr == ir->instructions[pos - 1].dest.vr);
     if (can_coalesce)
     {
-      printf("[COALESCE] Redirecting instr %d dest from TMP to VAR\n", pos - 1);
+      /* When coalescing, preserve the original c.i offset for global symbols.
+       * For STORE operations, the dest.c.i contains the offset into the global symbol
+       * and should not be overwritten by the local variable's stack offset. */
+      int prev_c_i = ir->instructions[pos - 1].dest.c.i;
+      int preserve_offset = ((ir->instructions[pos - 1].dest.r & (VT_VALMASK | VT_SYM)) == (VT_CONST | VT_SYM)) &&
+                            (ir->instructions[pos - 1].op == TCCIR_OP_STORE);
+
       ir->instructions[pos - 1].dest = ir->instructions[pos].dest;
-      printf("[PATCHED] ");
-      tcc_print_quadruple(&ir->instructions[pos - 1], pos - 1);
-      IRLiveInterval *interval = tcc_ir_get_live_interval(ir, src1->vr);
-      interval->start = INTERVAL_NOT_STARTED;
-      interval->end = 0;
-      printf("Setting interval of vreg %d to invalid, %p\n", src1->vr, interval);
-      if (tcc_is_vreg_valid(ir, ir->instructions[pos].dest.vr))
+
+      if (preserve_offset)
       {
-        IRLiveInterval *dest_interval = tcc_ir_get_live_interval(ir, ir->instructions[pos].dest.vr);
-        if (dest_interval->start == pos)
-        {
-          dest_interval->start = pos - 1;
-        }
+        /* Restore the original offset for global symbols */
+        ir->instructions[pos - 1].dest.c.i = prev_c_i;
       }
-      // Mark the src1 vreg as ignored
-      return ir->next_instruction_index;
+
+      /* Don't increment - the ASSIGN at pos should be overwritten by the next instruction */
+      return pos - 1; /* Return the coalesced instruction's position */
     }
   }
 
-  return ir->next_instruction_index++;
+  ir->next_instruction_index++;
+
+  /* Debug: track corruption of instruction 0 */
+  if (pos > 0 && ir->instructions[0].op == TCCIR_OP_STORE)
+  {
+    int ci = ir->instructions[0].dest.c.i;
+    if (ci != 0)
+    {
+      printf("DEBUG CORRUPTION: After adding instr %d (op=%d), instr[0].dest.c.i became %d!\n", pos, op, ci);
+    }
+  }
+
+  return pos;
 }
 
 int tcc_ir_get_vreg_temp(TCCIRState *ir)
 {
+  if (ir == NULL)
+  {
+    return -1;
+  }
   if (ir->next_temporary_variable >= ir->temporary_variables_live_intervals_size)
   {
     const int used = ir->temporary_variables_live_intervals_size;
@@ -1129,13 +1201,11 @@ void tcc_ir_liveness_analysis(TCCIRState *ir)
     const int encoded_vreg = (TCCIR_VREG_TYPE_VAR << 28) | vreg;
     if (tcc_is_vreg_ignored(ir, vreg))
     {
-      printf("DEBUG: VAR:%d is ignored\n", vreg);
       continue;
     }
     start = 0;
     end = ~0;
     int found = tcc_ir_find_live_interval(ir, encoded_vreg, &start, &end, 1);
-    printf("DEBUG: VAR:%d find_live_interval returned %d, start=%d, end=%d\n", vreg, found, start, end);
     if (found)
     {
       crosses_call = tcc_ir_has_call_in_range(ir, start, end);
@@ -1208,9 +1278,6 @@ void tcc_ir_liveness_analysis(TCCIRState *ir)
     crosses_call = tcc_ir_has_call_in_range(ir, start, end);
     addrtaken = interval->addrtaken;
     reg_type = tcc_ir_get_reg_type(ir, vreg_encoded);
-    printf("DEBUG liveness: vreg=%d is_float=%d is_double=%d is_llong=%d -> "
-           "reg_type=%d, lvalue: %d\n",
-           vreg_encoded, interval->is_float, interval->is_double, interval->is_llong, reg_type, interval->is_lvalue);
     tcc_ls_add_live_interval(&ir->ls, vreg_encoded, start, end, crosses_call, addrtaken, reg_type, interval->is_lvalue);
   }
 }
@@ -1220,8 +1287,11 @@ void tcc_ir_patch_live_intervals_registers(TCCIRState *ir)
   for (int i = 0; i < ir->ls.next_interval_index; ++i)
   {
     LSLiveInterval *interval = &ir->ls.intervals[i];
-    printf("DEBUG tcc_ir_patch: vreg=%d stack_loc=%d r0=%d r1=%d\n", interval->vreg, (int)interval->stack_location,
-           interval->r0, interval->r1);
+    if (interval->vreg == 0x20000004) /* Debug TMP:4 */
+    {
+      printf("DEBUG patch_intervals: Interval %d, vreg=TMP:4, stack_location=%d, r0=%d\n", i,
+             (int)interval->stack_location, (int)interval->r0);
+    }
     tcc_ir_assign_physical_register(ir, interval->vreg, interval->stack_location, interval->r0, interval->r1);
   }
 }
@@ -1229,10 +1299,14 @@ void tcc_ir_patch_live_intervals_registers(TCCIRState *ir)
 void tcc_ir_assign_physical_register(TCCIRState *ir, int vreg, int offset, int r0, int r1)
 {
   IRLiveInterval *interval = tcc_ir_get_live_interval(ir, vreg);
+  if (vreg == 0x20000004) /* Debug TMP:4 */
+  {
+    printf("DEBUG assign_physical_register: vreg=TMP:4, offset=%d, r0=%d, setting pr0 to %d\n", offset, r0,
+           (offset != 0) ? PREG_SPILLED : r0);
+  }
   /* If variable is spilled (offset != 0), mark r0 with PREG_SPILLED flag */
   if (offset != 0)
   {
-    printf("DEBUG assign_phys_reg: vreg=%d offset=%d -> setting PREG_SPILLED\n", vreg, offset);
     interval->allocation.r0 = PREG_SPILLED;
   }
   else
@@ -1274,10 +1348,6 @@ void tcc_ir_register_allocation_params(TCCIRState *ir)
     /* is_double for soft-float (LS_REG_TYPE_DOUBLE_SOFT) or is_llong for 64-bit
      */
     int is_64bit = interval && (interval->is_double || interval->is_llong);
-
-    printf("DEBUG reg_alloc_params: vreg=%d is_double=%d is_llong=%d "
-           "is_64bit=%d argno=%d\n",
-           vreg, interval ? interval->is_double : -1, interval ? interval->is_llong : -1, is_64bit, argno);
 
     /* AAPCS: 64-bit values must be aligned to even register pairs */
     if (is_64bit && (argno & 1))
@@ -1348,9 +1418,6 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
   if (tcc_is_vreg_valid(ir, sv->vr))
   {
     IRLiveInterval *interval = tcc_ir_get_live_interval(ir, sv->vr);
-    printf("DEBUG fill_registers: vr=%d allocation.r0=%d, allocation.r1=%d "
-           "allocation.offset=%d\n",
-           sv->vr, interval->allocation.r0, interval->allocation.r1, (int)interval->allocation.offset);
     sv->pr0 = interval->allocation.r0;
     sv->pr1 = interval->allocation.r1;
     sv->c.i = interval->allocation.offset;
@@ -1793,6 +1860,124 @@ int tcc_ir_bool_idempotent(TCCIRState *ir)
   return changes;
 }
 
+/* Return value optimization - fold LOAD -> RETURNVALUE patterns
+ * When a temp vreg is loaded and only used by RETURNVALUE,
+ * propagate the load source directly to RETURNVALUE.
+ * This avoids allocating an intermediate register.
+ *
+ * Pattern: temp = LOAD [addr]; RETURNVALUE temp
+ * Becomes: RETURNVALUE [addr]
+ *
+ * Only applies when the source is a memory location that has been stored to.
+ * Does not apply to register-only local variables.
+ *
+ * NOTE: Currently disabled - requires more complex analysis to ensure
+ * the source variable is actually in memory (not just in registers from
+ * constant initialization).
+ */
+int tcc_ir_return_value_optimization(TCCIRState *ir)
+{
+  /* Disabled for now - the optimization incorrectly handles cases where
+   * a local variable is initialized from a constant (loaded to registers)
+   * but never stored to memory. The RETURNVALUE then tries to load from
+   * a memory location that doesn't contain the value.
+   *
+   * TODO: Enable this optimization only when we can prove the source
+   * variable has been stored to memory (has a STORE instruction to it).
+   */
+  return 0;
+
+#if 0 /* Original implementation - kept for reference */
+  int n = ir->next_instruction_index;
+  int changes = 0;
+
+  if (n < 2)
+    return 0;
+
+  /* For each RETURNVALUE, check if its source is a temp vreg
+   * that was just loaded and used only by this RETURNVALUE */
+  for (int i = 0; i < n; i++)
+  {
+    TACQuadruple *ret = &ir->instructions[i];
+    if (ret->op != TCCIR_OP_RETURNVALUE)
+      continue;
+
+    /* src1 must be a temp vreg */
+    if (TCCIR_DECODE_VREG_TYPE(ret->src1.vr) != TCCIR_VREG_TYPE_TEMP)
+      continue;
+
+    int ret_vreg = ret->src1.vr;
+
+    /* Find the instruction that defines this temp vreg */
+    int def_idx = -1;
+    for (int j = i - 1; j >= 0; j--)
+    {
+      TACQuadruple *q = &ir->instructions[j];
+      if (irop_config[q->op].has_dest && q->dest.vr == ret_vreg)
+      {
+        def_idx = j;
+        break;
+      }
+    }
+
+    if (def_idx < 0)
+      continue;
+
+    TACQuadruple *def = &ir->instructions[def_idx];
+
+    /* Must be a LOAD instruction */
+    if (def->op != TCCIR_OP_LOAD)
+      continue;
+
+    /* The LOAD source must be the same type as LOAD destination (no cast involved).
+     * If there's a type mismatch (e.g., loading int from long long local),
+     * we can't optimize because we'd need to do a proper truncating load. */
+    int src_btype = def->src1.type.t & VT_BTYPE;
+    int dst_btype = def->dest.type.t & VT_BTYPE;
+#ifdef DEBUG_IR_GEN
+#endif
+    if (src_btype != dst_btype)
+      continue; /* Type cast involved, don't optimize */
+
+    /* Check that the temp vreg is only used by this RETURNVALUE */
+    int use_count = 0;
+    for (int j = def_idx + 1; j < n; j++)
+    {
+      TACQuadruple *q = &ir->instructions[j];
+      if (irop_config[q->op].has_src1 && q->src1.vr == ret_vreg)
+        use_count++;
+      if (irop_config[q->op].has_src2 && q->src2.vr == ret_vreg)
+        use_count++;
+    }
+
+    if (use_count != 1)
+      continue;
+
+    /* Optimization: propagate LOAD source to RETURNVALUE, but keep the return type */
+#ifdef DEBUG_IR_GEN
+    printf("OPTIMIZE: LOAD vr%d -> RETURNVALUE vr%d => RETURNVALUE from mem\n", ret_vreg, ret_vreg);
+#endif
+
+    /* Save the return type (from the LOAD destination, which has the cast type) */
+    CType ret_type = def->dest.type;
+
+    /* Copy the LOAD source to RETURNVALUE */
+    ret->src1 = def->src1;
+    /* Preserve the return type (may be different from source type due to cast) */
+    ret->src1.type = ret_type;
+
+    /* Mark the LOAD for elimination by converting to no-op
+     * (DCE will clean it up) */
+    def->op = TCCIR_OP_ASSIGN;
+    def->src1 = def->dest; /* Self-assign becomes no-op */
+
+    changes++;
+  }
+
+  return changes;
+#endif
+}
+
 /* Boolean expression simplification - eliminate redundant BOOL_OR/BOOL_AND
  * Patterns optimized:
  *   BOOL_AND(BOOL_OR(a,b), BOOL_OR(b,a)) -> BOOL_OR(a,b)
@@ -1907,8 +2092,9 @@ static void tcc_ir_backpatch_jumps(TCCIRState *ir, uint32_t *ir_to_code_mapping)
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
     {
       int target_ir = q->dest.c.i;
-      /* Skip unpatched jumps (target is -1) */
-      if (target_ir < 0 || target_ir >= ir->next_instruction_index)
+      /* Skip unpatched jumps (target is -1 or truly out of range)
+       * Note: target_ir == ir->next_instruction_index is valid (epilogue) */
+      if (target_ir < 0 || target_ir > ir->next_instruction_index)
         continue;
       const int instruction_address = ir_to_code_mapping[i];
       const int target_address = ir_to_code_mapping[target_ir];
@@ -1925,8 +2111,6 @@ void tcc_ir_put_soft_call(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2
       .op = op,
   };
   const char *func_name = NULL;
-
-  printf("DEBUG tcc_ir_generate_soft_call: op=%s\n", tcc_ir_get_op_name(op));
 
   if (irop_config[q.op].has_src1)
   {
@@ -1946,7 +2130,6 @@ void tcc_ir_put_soft_call(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2
     tcc_error("No soft-float ABI function for operation %s\n", tcc_ir_get_op_name(op));
     return;
   }
-  printf("DEBUG tcc_ir_generate_soft_call: calling %s\n", func_name);
   memset(&param, 0, sizeof(SValue));
   if (irop_config[q.op].has_src1)
   {
@@ -1975,7 +2158,6 @@ void tcc_ir_put_soft_call(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2
 
 static bool tcc_ir_put_soft_call_fpu_if_needed(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *dest)
 {
-  printf("DEBUG tcc_ir_generate_fpu_operation: op=%s\n", tcc_ir_get_op_name(op));
   const int is64bit = tcc_is_64bit_operand(src1) || tcc_is_64bit_operand(src2) || tcc_is_64bit_operand(dest);
   const FloatingPointConfig *fpu = architecture_config.fpu;
 
@@ -2213,7 +2395,6 @@ void tcc_ir_generate_code(TCCIRState *ir)
   //  * - Leaf functions with spilled params: register pressure forced a spill
   //  * For leaf functions with register-allocated params, they stay in r0-r3.
   //  */
-  // printf("DEBUG tcc_ir_generate_code: leaffunc=%d next_parameter=%d\n",
   //        ir->leaffunc, ir->next_parameter);
   // for (int vreg = 0; vreg < ir->next_parameter; ++vreg) {
   //   const int encoded_vreg = (TCCIR_VREG_TYPE_PARAM << 28) | vreg;
@@ -2233,7 +2414,6 @@ void tcc_ir_generate_code(TCCIRState *ir)
   //   int alloc_r0 = interval->allocation.r0;
   //   int alloc_r1 = interval->allocation.r1;
 
-  //   printf("DEBUG prolog param %d: incoming_r0=%d incoming_r1=%d "
   //          "alloc.r0=%d alloc.r1=%d alloc.offset=%d is_double=%d is_llong=%d
   //          " "is_64bit=%d is_spilled=%d\n", vreg, incoming_r0, incoming_r1,
   //          alloc_r0, alloc_r1, (int)interval->allocation.offset,
@@ -2295,8 +2475,14 @@ void tcc_ir_generate_code(TCCIRState *ir)
            * doesn't work because R12+1 = R13 = SP. */
           if (!tcc_ir_is_64bit_type(q->src1.type.t))
           {
+            /* For spilled variables, the load() function needs pr0 to have
+             * PREG_SPILLED flag to know to load from stack. So we temporarily
+             * change pr0 to destination register only for the actual load call. */
+            int8_t orig_pr0 = q->src1.pr0;
             q->src1.pr0 = architecture_config.scratch_register;
             tcc_gen_machine_load_register(&q->src1);
+            /* Keep pr0 as scratch register after loading (don't restore orig_pr0)
+             * because the value is now in the scratch register. */
           }
         }
       }
@@ -2321,10 +2507,15 @@ void tcc_ir_generate_code(TCCIRState *ir)
       tcc_ir_fill_registers(ir, &q->dest);
       /* Don't pre-load destination to scratch register for operations that
        * handle their own destination storage (e.g., float conversions that
-       * may need to store to spilled stack locations) */
+       * may need to store to spilled stack locations, or arithmetic ops
+       * that handle spilled dest in tcc_gen_machine_data_processing_op) */
       if (tcc_ir_operand_in_memory(&q->dest) && (q->op != TCCIR_OP_ASSIGN) && (q->op != TCCIR_OP_STORE) &&
           (q->op != TCCIR_OP_CVT_FTOF) && (q->op != TCCIR_OP_CVT_ITOF) && (q->op != TCCIR_OP_CVT_FTOI) &&
-          (q->op != TCCIR_OP_FUNCCALLVAL))
+          (q->op != TCCIR_OP_FUNCCALLVAL) &&
+          /* Data processing ops handle spilled dest themselves */
+          (q->op != TCCIR_OP_ADD) && (q->op != TCCIR_OP_SUB) && (q->op != TCCIR_OP_MUL) && (q->op != TCCIR_OP_AND) &&
+          (q->op != TCCIR_OP_OR) && (q->op != TCCIR_OP_XOR) && (q->op != TCCIR_OP_SHL) && (q->op != TCCIR_OP_SHR) &&
+          (q->op != TCCIR_OP_SAR))
       {
         /* Skip 64-bit types - need special handling */
         if (!tcc_ir_is_64bit_type(q->dest.type.t))
@@ -2367,13 +2558,41 @@ void tcc_ir_generate_code(TCCIRState *ir)
       tcc_gen_machine_fp_op(q);
       break;
     case TCCIR_OP_LOAD:
+    {
+      /* Peephole: if next instruction is RETURNVALUE using this LOAD's result,
+       * load directly to R0 instead of the allocated register */
+      const TACQuadruple *ir_next = (i + 1 < ir->next_instruction_index) ? &ir->instructions[i + 1] : NULL;
+      if (ir_next && ir_next->op == TCCIR_OP_RETURNVALUE && ir_next->src1.vr == q->dest.vr)
+      {
+        /* Override the destination to use R0 directly */
+        q->dest.pr0 = REG_IRET; /* R0 */
+        if (tcc_ir_is_64bit_type(q->dest.type.t))
+        {
+          q->dest.pr1 = REG_IRE2; /* R1 */
+        }
+      }
       tcc_gen_machine_load_op(q);
       break;
+    }
     case TCCIR_OP_STORE:
       tcc_gen_machine_store_op(q);
       break;
     case TCCIR_OP_RETURNVALUE:
-      tcc_gen_machine_return_value_op(q);
+    {
+      /* Peephole: if previous instruction was LOAD/ASSIGN that already loaded to R0,
+       * skip the return value copy */
+      const TACQuadruple *ir_prev = (i > 0) ? &ir->instructions[i - 1] : NULL;
+      if (ir_prev && (ir_prev->op == TCCIR_OP_LOAD || ir_prev->op == TCCIR_OP_ASSIGN) &&
+          ir_prev->dest.vr == q->src1.vr && ir_prev->dest.pr0 == REG_IRET /* R0 */)
+      {
+        /* Value is already in R0, no need to generate return value op */
+        /* Just fall through to RETURNVOID which handles the jump */
+      }
+      else
+      {
+        tcc_gen_machine_return_value_op(q);
+      }
+    }
     case TCCIR_OP_RETURNVOID:
       /* Emit jump to epilogue (will be backpatched later) */
       /* if return is last instruction, then jump is not needed */
@@ -2384,8 +2603,19 @@ void tcc_ir_generate_code(TCCIRState *ir)
       }
       break;
     case TCCIR_OP_ASSIGN:
+    {
+      /* Peephole: if next instruction is RETURNVALUE using this ASSIGN's dest,
+       * assign directly to R0 to avoid an extra move */
+      const TACQuadruple *ir_next = (i + 1 < ir->next_instruction_index) ? &ir->instructions[i + 1] : NULL;
+      if (ir_next && ir_next->op == TCCIR_OP_RETURNVALUE && ir_next->src1.vr == q->dest.vr)
+      {
+        q->dest.pr0 = REG_IRET; /* R0 */
+        if (tcc_ir_is_64bit_type(q->dest.type.t))
+          q->dest.pr1 = REG_IRE2; /* R1 */
+      }
       tcc_gen_machine_assign_op(q);
       break;
+    }
     case TCCIR_OP_FUNCPARAMVAL:
     {
       const int param_num = q->src2.c.i; /* 0-based param number */
@@ -2780,7 +3010,6 @@ void tcc_ir_drop_return_value(TCCIRState *ir)
      * and should not be dropped. */
     if (TCCIR_DECODE_VREG_TYPE(last_instr->dest.vr) == TCCIR_VREG_TYPE_TEMP)
     {
-      printf("DEBUG drop_return_value: dropping TMP vreg %d\n", last_instr->dest.vr);
       if (tcc_is_vreg_valid(ir, last_instr->dest.vr))
       {
         IRLiveInterval *interval = tcc_ir_get_live_interval(ir, last_instr->dest.vr);
@@ -2791,11 +3020,6 @@ void tcc_ir_drop_return_value(TCCIRState *ir)
       last_instr->dest.vr = -1;
       last_instr->src1.vr = -1;
     }
-    else
-    {
-      printf("DEBUG drop_return_value: NOT dropping VAR/PARAM vreg %d (type=%d)\n", last_instr->dest.vr,
-             TCCIR_DECODE_VREG_TYPE(last_instr->dest.vr));
-    }
   }
 }
 
@@ -2805,16 +3029,37 @@ void tcc_ir_backpatch(TCCIRState *ir, int t, int target_address)
   int next;
   if (t < 0)
     return; /* -1 means no chain */
+
+  printf("\n=== BACKPATCH CALLED: t=%d target=%d ===\n", t, target_address);
+
   while (t >= 0 && t < ir->next_instruction_index)
   {
+    TccIrOp op = ir->instructions[t].op;
+    printf("  Patching instr[%d]: op=%d", t, op);
+
+    /* Check if this instruction is actually a jump */
+    if (op != TCCIR_OP_JUMP && op != TCCIR_OP_JUMPIF)
+    {
+      printf(" ERROR: Not a jump instruction!\n");
+      printf("  Dumping first 10 instructions:\n");
+      for (int i = 0; i < 10 && i < ir->next_instruction_index; i++)
+      {
+        printf("    [%d] op=%d dest.c.i=%d\n", i, ir->instructions[i].op, (int)ir->instructions[i].dest.c.i);
+      }
+      break; /* Don't corrupt non-jump instructions */
+    }
+
     cur = &ir->instructions[t].dest;
     next = cur->c.i;
+    printf(" (next=%d) -> setting to %d\n", next, target_address);
     cur->c.i = target_address;
+
     /* Chain ends when next is -1 (sentinel), out of range, or already patched */
     if (next < 0 || next >= ir->next_instruction_index || next == target_address)
       break;
     t = next;
   }
+  printf("=== BACKPATCH DONE ===\n\n");
 }
 
 void tcc_ir_backpatch_to_here(TCCIRState *ir, int t)
@@ -2840,7 +3085,6 @@ int tcc_ir_generate_test(TCCIRState *ir, int inv, int t)
     /* Use cmp_op and invert if needed. In TCC, comparison tokens are designed
      * so that XORing with 1 inverts them (e.g., TOK_EQ ^ 1 = TOK_NE) */
     int cond = vtop->cmp_op ^ inv;
-    printf("DEBUG: cmp_op=0x%x, inv=%d, result=0x%x, jtrue=%d, jfalse=%d\n", vtop->cmp_op, inv, cond, jtrue, jfalse);
     src.c.i = cond;
     dest.vr = -1;
     dest.c.i = t;
@@ -2964,9 +3208,6 @@ int tcc_ir_gjmp_append(TCCIRState *ir, int n, int t)
 void tcc_ir_generate_cmp_jmp_set(TCCIRState *ir)
 {
   int v = vtop->r & VT_VALMASK;
-  printf("DEBUG cmp_jmp_set: v=%d, vtop->r=0x%x, cmp_op=0x%x, jtrue=%d, "
-         "jfalse=%d\n",
-         v, vtop->r, vtop->cmp_op, vtop->jtrue, vtop->jfalse);
   if (v == VT_CMP)
   {
     SValue src, dest;
