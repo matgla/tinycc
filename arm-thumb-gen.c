@@ -3911,6 +3911,33 @@ static void load_to_register(int reg, int reg_from, SValue *sv)
   }
 }
 
+/* Returns true when a register value can be used directly as a source (not spilled, not lvalue). */
+static bool is_valid_src_reg(const SValue *sv, int reg)
+{
+  return reg >= 0 && !(reg & PREG_SPILLED) && !(sv->r & VT_LVAL);
+}
+
+static int lowest_set_bit(uint32_t mask)
+{
+  return __builtin_ctz(mask);
+}
+
+/* Preserve a register that will be clobbered by later parameter writes. We try to remap it to R12. */
+static void remap_future_param_sources(int current_dest, int reg_to_save, int remap_reg, int *param_src0,
+                                       int *param_src1, int *op_to_reg)
+{
+  /* Walk future params (those with lower destination registers) and rewrite their sources. */
+  for (int dest = current_dest - 1; dest >= 0; --dest)
+  {
+    if (op_to_reg[dest] == -1)
+      continue;
+    if (param_src0[dest] == reg_to_save)
+      param_src0[dest] = remap_reg;
+    if (param_src1[dest] == reg_to_save)
+      param_src1[dest] = remap_reg;
+  }
+}
+
 ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCIRState *ir, int call_idx)
 {
   /* Scan backward from the CALL to find its params.
@@ -4097,19 +4124,86 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
     }
   }
 
-  /* Load register arguments in descending order (R3 → R2 → R1 → R0).
-   * This naturally avoids conflicts: we write to higher registers while reading from lower ones,
-   * so source registers are always preserved until after we've read them. */
+  /* Pre-compute register sources for each register-assigned argument so we can spot conflicts. */
+  int param_src0[4] = {-1, -1, -1, -1};
+  int param_src1[4] = {-1, -1, -1, -1};
+  uint32_t future_src_mask = 0;
+  for (int dest = 0; dest < 4; ++dest)
+  {
+    if (op_to_reg[dest] == -1)
+      continue;
+    TACQuadruple *arg = &ir->instructions[param_indices[op_to_reg[dest]]];
+    const int is_64bit = is_64bit_type(arg->src1.type.t);
+    if (is_valid_src_reg(&arg->src1, arg->src1.pr0))
+    {
+      param_src0[dest] = arg->src1.pr0;
+      /* Don't add to conflict mask if src==dest (no real conflict, just loading from self) */
+      if (arg->src1.pr0 != dest)
+        future_src_mask |= (1u << arg->src1.pr0);
+    }
+    if (is_64bit && is_valid_src_reg(&arg->src1, arg->src1.pr1))
+    {
+      param_src1[dest] = arg->src1.pr1;
+      /* Don't add to conflict mask if src==dest */
+      if (arg->src1.pr1 != dest)
+        future_src_mask |= (1u << arg->src1.pr1);
+    }
+  }
+
+  /* Load register arguments in descending order (R3 → R2 → R1 → R0),
+   * but detect when writing to a destination register would clobber a still-needed source.
+   * Since we load R3→R2→R1→R0, we need to check if a destination will clobber a source
+   * needed by LOWER-numbered registers (which haven't been loaded yet). */
   int registers_to_push = 0;
+
+  /* Compute sources needed by each lower register before we start loading */
+  uint32_t sources_needed_by_lower[4] = {0, 0, 0, 0};
+  for (int dest = 0; dest < 4; ++dest)
+  {
+    for (int lower = 0; lower < dest; ++lower)
+    {
+      if (param_src0[lower] != -1)
+        sources_needed_by_lower[dest] |= (1u << param_src0[lower]);
+      if (param_src1[lower] != -1)
+        sources_needed_by_lower[dest] |= (1u << param_src1[lower]);
+    }
+  }
 
   for (int i = 3; i >= 0; --i)
   {
     if (op_to_reg[i] == -1)
       continue;
     TACQuadruple *arg = &ir->instructions[param_indices[op_to_reg[i]]];
+    SValue arg_copy = arg->src1; /* We may rewrite pr0/pr1 if we remap sources. */
 
-    const int is_64bit = is_64bit_type(arg->src1.type.t);
+    const int is_64bit = is_64bit_type(arg_copy.type.t);
     const int dest_reg = i;
+    const uint32_t dest_mask = is_64bit ? ((1u << dest_reg) | (1u << (dest_reg - 1))) : (1u << dest_reg);
+
+    /* Check if writing to dest_reg would clobber a source needed by lower registers */
+    const uint32_t conflict_mask = dest_mask & sources_needed_by_lower[dest_reg];
+    if (conflict_mask)
+    {
+      const int reg_to_save = lowest_set_bit(conflict_mask); /* pick lowest conflicting register */
+      const bool r12_busy = sources_needed_by_lower[dest_reg] & (1u << R_IP);
+      if (!r12_busy && !(dest_mask & (1u << R_IP)))
+      {
+        ot_check(th_mov_reg(R_IP, reg_to_save, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                            ENFORCE_ENCODING_NONE, false));
+        remap_future_param_sources(dest_reg, reg_to_save, R_IP, param_src0, param_src1, op_to_reg);
+      }
+      else
+      {
+        /* No safe scratch register; skip remapping (rare). */
+      }
+    }
+
+    /* Apply any remapping for this argument. */
+    if (param_src0[dest_reg] != -1)
+      arg_copy.pr0 = param_src0[dest_reg];
+    if (is_64bit && param_src1[dest_reg] != -1)
+      arg_copy.pr1 = param_src1[dest_reg];
+
     if (is_64bit)
     {
       /* 64-bit values use register pairs (R0:R1 or R2:R3) */
@@ -4118,22 +4212,22 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
       dest.pr1 = dest_reg;
       --i; /* Skip the lower register of the pair in next iteration */
 
-      if (arg->src1.pr0 == -1 && arg->src1.pr1 == -1)
+      if (arg_copy.pr0 == -1 && arg_copy.pr1 == -1)
       {
         /* Load from memory/constant */
-        load_to_dest(&dest, &arg->src1);
+        load_to_dest(&dest, &arg_copy);
       }
       else
       {
         /* Move from source register pair */
-        load_to_register(dest_reg - 1, arg->src1.pr0, &arg->src1);
-        load_to_register(dest_reg, arg->src1.pr1, &arg->src1);
+        load_to_register(dest_reg - 1, arg_copy.pr0, &arg_copy);
+        load_to_register(dest_reg, arg_copy.pr1, &arg_copy);
       }
     }
     else
     {
       /* 32-bit value - load directly to destination register */
-      load_to_register(dest_reg, arg->src1.pr0, &arg->src1);
+      load_to_register(dest_reg, arg_copy.pr0, &arg_copy);
     }
   }
 
