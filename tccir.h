@@ -200,6 +200,7 @@ int tcc_ir_gjmp_append(TCCIRState *ir, int n, int t);
 int tcc_ir_generate_test(TCCIRState *ir, int inv, int t);
 int tcc_ir_dead_code_elimination(TCCIRState *ir);
 int tcc_ir_dead_store_elimination(TCCIRState *ir);
+int tcc_ir_constant_propagation(TCCIRState *ir);
 int tcc_ir_bool_cse(TCCIRState *ir);
 int tcc_ir_bool_idempotent(TCCIRState *ir);
 int tcc_ir_bool_simplification(TCCIRState *ir);

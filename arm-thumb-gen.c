@@ -2044,27 +2044,27 @@ void load_to_dest(SValue *dest, SValue *sv)
     }
     SValue v1;
 
-    /* First check if this is a register-allocated LOCAL variable.
-     * In this case pr0 contains the allocated register, and we should
-     * do a register move instead of loading from memory.
-     * NOTE: This only applies to VT_LOCAL, NOT to v < VT_CONST which means
-     * the address is in a register and needs dereferencing. */
-    if (v == VT_LOCAL && sv->pr0 >= 0 && !(sv->pr0 & PREG_SPILLED))
-    {
-      /* Allocated to register - do register move, not memory load. */
-      /* For doubles in integer registers (soft float) */
-      if (dest->pr0 != sv->pr0)
-      {
-        ot_check(th_mov_reg(dest->pr0, sv->pr0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                            ENFORCE_ENCODING_NONE, false));
-      }
-      if (tcc_is_64bit_operand(dest) && dest->pr1 != sv->pr1)
-      {
-        ot_check(th_mov_reg(dest->pr1, sv->pr1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                            ENFORCE_ENCODING_NONE, false));
-      }
-      return;
-    }
+    // /* First check if this is a register-allocated LOCAL variable.
+    //  * In this case pr0 contains the allocated register, and we should
+    //  * do a register move instead of loading from memory.
+    //  * NOTE: This only applies to VT_LOCAL, NOT to v < VT_CONST which means
+    //  * the address is in a register and needs dereferencing. */
+    // if (v == VT_LOCAL && sv->pr0 >= 0 && !(sv->pr0 & PREG_SPILLED))
+    // {
+    //   /* Allocated to register - do register move, not memory load. */
+    //   /* For doubles in integer registers (soft float) */
+    //   if (dest->pr0 != sv->pr0)
+    //   {
+    //     ot_check(th_mov_reg(dest->pr0, sv->pr0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+    //                         ENFORCE_ENCODING_NONE, false));
+    //   }
+    //   if (tcc_is_64bit_operand(dest) && dest->pr1 != sv->pr1)
+    //   {
+    //     ot_check(th_mov_reg(dest->pr1, sv->pr1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+    //                         ENFORCE_ENCODING_NONE, false));
+    //   }
+    //   return;
+    // }
 
     // load value from stack
     // prepare for new load after pointer dereference
@@ -3196,9 +3196,13 @@ ST_FUNC void tcc_gen_machine_store_op(TACQuadruple *op)
   int src_btype = op->src1.type.t & VT_BTYPE;
   int is_64bit = (src_btype == VT_DOUBLE) || (src_btype == VT_LDOUBLE) || (src_btype == VT_LLONG);
 
-  /* NOTE: src1 is preloaded to a valid register by generate_code if it was spilled.
-   * Just use pr0 directly. */
   src_reg = op->src1.pr0;
+  // if src_reg is -1 then immediate value must be loaded
+  if (src_reg < 0)
+  {
+    load_to_reg(R12, is_64bit ? R11 : -1, &op->src1);
+    src_reg = R12;
+  }
   store(src_reg, &op->dest);
 }
 

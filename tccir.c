@@ -35,6 +35,8 @@
 
 static int tcc_ir_is_fpu_operation(TccIrOp op);
 static bool tcc_ir_put_soft_call_fpu_if_needed(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *dest);
+static bool tcc_ir_operand_needs_dereference(SValue *sv);
+
 static inline int tcc_ir_is_float_type(int t)
 {
   int bt = t & VT_BTYPE;
@@ -82,7 +84,8 @@ SpillContext tcc_ir_preload_spills(TACQuadruple *q, int preload_src1, int preloa
   ctx.orig_dest_pr0 = q->dest.pr0;
 
   /* Preload src1 if needed */
-  if (preload_src1 && tcc_ir_is_spilled(&q->src1) && !tcc_ir_is_64bit_type(q->src1.type.t))
+  if (preload_src1 && tcc_ir_is_spilled(&q->src1) && !th_has_immediate_value(q->src1.r) &&
+      !tcc_ir_is_64bit_type(q->src1.type.t))
   {
     ctx.src1_spilled = 1;
     ctx.src1_offset = q->src1.c.i;
@@ -2444,69 +2447,6 @@ void tcc_ir_generate_code(TCCIRState *ir)
   int stack_size = (-loc + 7) & ~7; // align to 8 bytes
   tcc_gen_machine_prolog(ir->leaffunc, ir->ls.dirty_registers, stack_size);
 
-  // /* Save parameters from incoming registers (r0-r3) to their stack locations
-  //  * when they are spilled. This is needed for:
-  //  * - Non-leaf functions: r0-r3 are caller-saved and get clobbered by calls
-  //  * - Leaf functions with spilled params: register pressure forced a spill
-  //  * For leaf functions with register-allocated params, they stay in r0-r3.
-  //  */
-  //        ir->leaffunc, ir->next_parameter);
-  // for (int vreg = 0; vreg < ir->next_parameter; ++vreg) {
-  //   const int encoded_vreg = (TCCIR_VREG_TYPE_PARAM << 28) | vreg;
-  //   IRLiveInterval *interval = tcc_ir_get_live_interval(ir, encoded_vreg);
-
-  //   int incoming_r0 = interval->incoming_reg0;
-  //   int incoming_r1 = interval->incoming_reg1;
-
-  //   /* Check if parameter is spilled to stack */
-  //   int is_spilled = (interval->allocation.r0 == PREG_SPILLED ||
-  //                     interval->allocation.offset != 0);
-
-  //   /* 64-bit parameters (double or long long) need both registers saved */
-  //   int is_64bit = interval->is_double || interval->is_llong;
-
-  //   /* Get allocated registers (if not spilled) */
-  //   int alloc_r0 = interval->allocation.r0;
-  //   int alloc_r1 = interval->allocation.r1;
-
-  //          "alloc.r0=%d alloc.r1=%d alloc.offset=%d is_double=%d is_llong=%d
-  //          " "is_64bit=%d is_spilled=%d\n", vreg, incoming_r0, incoming_r1,
-  //          alloc_r0, alloc_r1, (int)interval->allocation.offset,
-  //          interval->is_double, interval->is_llong, is_64bit, is_spilled);
-
-  //   /* If parameter arrived in registers, we need to either:
-  //    * 1. Copy to allocated callee-saved registers (non-leaf, not spilled),
-  //    OR
-  //    * 2. Store to stack (spilled) */
-  //   if (incoming_r0 >= 0) {
-  //     if (is_spilled) {
-  //       /* Parameter needs to be saved to stack at its allocated offset.
-  //        * Use allocation.offset which is where loads will read from. */
-  //       int stack_offset = interval->allocation.offset;
-  //       if (is_64bit && incoming_r1 >= 0) {
-  //         /* 64-bit parameter: save both registers */
-  //         tcc_gen_machine_store_to_stack(incoming_r0, stack_offset);
-  //         tcc_gen_machine_store_to_stack(incoming_r1, stack_offset + 4);
-  //       } else {
-  //         /* Single 32-bit parameter */
-  //         tcc_gen_machine_store_to_stack(incoming_r0, stack_offset);
-  //       }
-  //     } else if (!ir->leaffunc && alloc_r0 != incoming_r0) {
-  //       /* Non-leaf function: copy from incoming to callee-saved register */
-  //       /* For 64-bit: copy both registers */
-  //       if (is_64bit && incoming_r1 >= 0 && alloc_r1 >= 0) {
-  //         tcc_gen_machine_move_reg(alloc_r0, incoming_r0);
-  //         tcc_gen_machine_move_reg(alloc_r1, incoming_r1);
-  //       } else {
-  //         tcc_gen_machine_move_reg(alloc_r0, incoming_r0);
-  //       }
-  //     }
-  //     /* For leaf functions where alloc == incoming, no action needed */
-  //   }
-  //   /* Parameters that arrived on stack stay where they are (accessed via
-  //    * offset_to_args) */
-  // }
-
   for (int i = 0; i < ir->next_instruction_index; i++)
   {
     drop_return_value = 0;
@@ -2585,7 +2525,7 @@ void tcc_ir_generate_code(TCCIRState *ir)
 
     /* Load/Store operations */
     case TCCIR_OP_LOAD:
-      preload_src1 = 0; /* src1 is address, not data */
+      preload_src1 = 1; /* src1 is address, not data */
       preload_src2 = 0;
       setup_dest = 1;
       break;
@@ -2684,16 +2624,22 @@ void tcc_ir_generate_code(TCCIRState *ir)
       const TACQuadruple *ir_next = (i + 1 < ir->next_instruction_index) ? &ir->instructions[i + 1] : NULL;
       if (ir_next && ir_next->op == TCCIR_OP_RETURNVALUE && ir_next->src1.vr == q->dest.vr)
       {
-        /* Override the destination to use R0 directly */
         q->dest.pr0 = REG_IRET; /* R0 */
         if (tcc_ir_is_64bit_type(q->dest.type.t))
         {
           q->dest.pr1 = REG_IRE2; /* R1 */
         }
       }
-      tcc_gen_machine_load_op(q);
-      /* Store back spilled dest */
+      if (tcc_ir_operand_needs_dereference(&q->src1))
+      {
+        tcc_gen_machine_load_op(q);
+      }
+      else
+      {
+        tcc_gen_machine_assign_op(q);
+      }
       tcc_ir_storeback_spill(q, &spill_ctx);
+      /* Store back spilled dest */
       break;
     }
     case TCCIR_OP_STORE:
@@ -3451,4 +3397,21 @@ ST_FUNC int tcc_has_quadruple_64bit_operand(TACQuadruple *q)
     return 1;
   }
   return 0;
+}
+
+static bool tcc_ir_operand_needs_dereference(SValue *sv)
+{
+  const int val_loc = sv->r & VT_VALMASK;
+  switch (val_loc)
+  {
+  case VT_CONST:
+  case VT_LLOCAL:
+  case VT_LOCAL:
+  case VT_CMP:
+  case VT_JMP:
+  case VT_JMPI:
+    return false;
+  default: /* must be temporary vreg */
+    return (sv->r & VT_LVAL) != 0;
+  }
 }
