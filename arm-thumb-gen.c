@@ -1753,7 +1753,7 @@ int store_word_to_base(int ir, int base, int fc, int sign)
   return ot(ins);
 }
 
-void load_vt_lval_vt_local(int r, SValue *sv, int ft, int fc, int sign, uint32_t base)
+void load_vt_lval_vt_local(int r, int r1, SValue *sv, int ft, int fc, int sign, uint32_t base)
 {
   int success = 0;
   const int btype = ft & VT_BTYPE;
@@ -1789,18 +1789,18 @@ void load_vt_lval_vt_local(int r, SValue *sv, int ft, int fc, int sign, uint32_t
       if (btype == VT_DOUBLE || btype == VT_LDOUBLE)
       {
         /* Double: load 64 bits to pre-allocated register pair.
-         * Use sv->pr0 (low) and sv->pr1 (high) from register allocator,
-         * NOT ir+1 which could be SP/PC or already in use. */
-        int ir_high = sv->pr1;
-        if (ir_high < 0 || ir_high == R_SP || ir_high == R_PC)
+         * Use r1 parameter (high register) from caller.
+         * Fallback to ir+1 for backward compatibility if r1 is not provided (-1). */
+        int ir_high = r1;
+        if (ir_high < 0)
         {
-          /* Fallback: if pr1 not allocated, try ir+1 but validate */
+          /* Fallback: try ir+1 but validate */
           ir_high = ir + 1;
           if (ir_high == R_SP || ir_high == R_PC)
           {
             tcc_error("compiler_error: cannot load double - no valid high register "
-                      "(pr1=%d, ir+1=%d would be SP/PC)\n",
-                      sv->pr1, ir + 1);
+                      "(r1=%d, ir+1=%d would be SP/PC)\n",
+                      r1, ir + 1);
           }
         }
         /* Load low word first */
@@ -1842,6 +1842,37 @@ void load_vt_lval_vt_local(int r, SValue *sv, int ft, int fc, int sign, uint32_t
       }
       return;
     }
+  }
+  else if (btype == VT_LLONG || btype == VT_PTR)
+  {
+    /* 64-bit integer type - load to register pair if r1 is provided */
+    if (r1 >= 0 && (btype == VT_LLONG))
+    {
+      TRACE("load 64-bit int to r:%d:r1:%d, base: %d, fc: %d, sign: %d\n", ir, r1, base, fc, sign);
+      /* Load low word */
+      success = load_word_from_base(ir, base, fc, sign);
+      if (!success)
+      {
+        int rr = th_offset_to_reg(fc, sign);
+        ot_check(th_ldr_reg(ir, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+      }
+      /* Load high word at offset+4 */
+      int fc_high = sign ? (fc - 4) : (fc + 4);
+      int sign_high = sign;
+      if (sign && fc_high < 0)
+      {
+        fc_high = -fc_high;
+        sign_high = 0;
+      }
+      success = load_word_from_base(r1, base, fc_high, sign_high);
+      if (!success)
+      {
+        int rr = th_offset_to_reg(fc_high, sign_high);
+        ot_check(th_ldr_reg(r1, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+      }
+      return;
+    }
+    /* Fall through to 32-bit load for pointers or if r1 not provided */
   }
   else if (btype == VT_SHORT)
   {
@@ -2007,6 +2038,10 @@ void load_to_dest(SValue *dest, SValue *sv)
   if (fr & VT_LVAL)
   {
     uint32_t base = R_FP;
+    if (tcc_state->ir->leaffunc)
+    {
+      base = R_SP;
+    }
     SValue v1;
 
     /* First check if this is a register-allocated LOCAL variable.
@@ -2102,7 +2137,7 @@ void load_to_dest(SValue *dest, SValue *sv)
 
     if (v == VT_LOCAL)
     {
-      return load_vt_lval_vt_local(dest->pr0, sv, ft, fc, sign, base);
+      return load_vt_lval_vt_local(dest->pr0, dest->pr1, sv, ft, fc, sign, base);
     }
   }
   else if (v == VT_CONST)
@@ -2113,167 +2148,6 @@ void load_to_dest(SValue *dest, SValue *sv)
     return load_vt_cmp(dest->pr0, sv);
   else if (v == VT_JMP || v == VT_JMPI)
     return load_vt_jmp_jmpi(dest->pr0, sv);
-  else if (v < VT_CONST)
-  {
-    // add float
-    if (dest->pr0 != v)
-    {
-      ot_check(
-          th_mov_reg(dest->pr0, v, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
-    }
-    if (dest->pr1 != -1 && tcc_is_64bit_operand(sv))
-    {
-      ot_check(th_mov_reg(dest->pr1, v + 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE,
-                          false));
-    }
-    return;
-  }
-  tcc_error("compiler_error: unknown load not implemented\n");
-}
-
-// load value from stack to register
-void load(int r, SValue *sv)
-{
-  int v, ft, fc, fr, sign;
-
-  // TRACE("'load'");
-  fr = sv->r;
-  ft = sv->type.t;
-  fc = sv->c.i;
-  int btype = ft & VT_BTYPE;
-  if (fc >= 0)
-    sign = 0;
-  else
-  {
-    sign = 1;
-    fc = -fc;
-  }
-
-  if (sv->r & VT_PARAM)
-  {
-    fc += offset_to_args;
-  }
-
-  v = fr & VT_VALMASK;
-
-  // load lvalue from
-  if (fr & VT_LVAL)
-  {
-    uint32_t base = R_FP;
-    if (tcc_state->ir->leaffunc)
-    {
-      base = R_SP;
-    }
-    SValue v1;
-
-    // /* First check if this is a register-allocated parameter/variable.
-    //  * In this case pr0 contains the allocated register, and we should
-    //  * do a register move instead of loading from memory. */
-    // if ((v == VT_LOCAL || v < VT_CONST) && sv->pr0 >= 0 && !(sv->pr0 & PREG_SPILLED))
-    // {
-    //   /* Allocated to register - do register move, not memory load. */
-    //   if (is_float(ft))
-    //   {
-    //     /* For doubles in integer registers (soft float) */
-    //     ot_check(
-    //         th_mov_reg(r, sv->pr0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE,
-    //         false));
-    //     if ((ft & VT_BTYPE) == VT_DOUBLE || (ft & VT_BTYPE) == VT_LDOUBLE)
-    //     {
-    //       int r_high = (r == R0) ? R1 : (r == R2) ? R3 : r + 1;
-    //       ot_check(th_mov_reg(r_high, sv->pr1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-    //                           ENFORCE_ENCODING_NONE, false));
-    //     }
-    //   }
-    //   else
-    //   {
-    //     ot_check(
-    //         th_mov_reg(r, sv->pr0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE,
-    //         false));
-    //   }
-    //   return;
-    // }
-
-    // load value from stack
-    // prepare for new load after pointer dereference
-    if (v == VT_LLOCAL)
-    {
-      v1.type.t = VT_PTR;
-      v1.r = VT_LOCAL | VT_LVAL;
-      v1.c.i = sv->c.i;
-
-      TRACE("l1");
-      load(base = 14, &v1);
-      fc = sign = 0;
-      v = VT_LOCAL;
-    }
-    else if (v == VT_CONST)
-    {
-      /* Check if we already have this global symbol's base address cached */
-      if ((sv->r & VT_SYM) && sv->sym && sv->sym == thumb_gen_state.cached_global_sym &&
-          thumb_gen_state.cached_global_reg >= 0)
-      {
-        /* Reuse cached base address, keep the offset */
-        base = thumb_gen_state.cached_global_reg;
-        /* fc already has the field offset from sv->c.i */
-      }
-      else
-      {
-        Sym *validated_sym = (sv->r & VT_SYM) ? validate_sym_for_reloc(sv->sym) : NULL;
-        memset(&v1, 0, sizeof(SValue));
-        v1.type.t = VT_PTR;
-        v1.r = (fr & ~VT_LVAL) | (validated_sym ? VT_SYM : 0);
-        v1.c.i = 0; /* Load base address, not base+offset */
-        v1.sym = validated_sym;
-        TRACE("l2");
-        load(base = 14, &v1);
-        /* Cache this for subsequent accesses to same symbol */
-        thumb_gen_state.cached_global_sym = validated_sym;
-        thumb_gen_state.cached_global_reg = base;
-        /* fc already has the field offset from sv->c.i */
-      }
-      sign = 0;
-      v = VT_LOCAL;
-    }
-    else if (v < VT_CONST)
-    {
-      /* For spilled lvalues, we need two-level indirection:
-       * 1. Load the pointer from spill location [FP + spill_offset]
-       * 2. Dereference that pointer to get the final value
-       * For non-spilled, the pointer is already in a register (pr0). */
-      if (sv->pr0 & PREG_SPILLED)
-      {
-        SValue v1;
-        memset(&v1, 0, sizeof(SValue));
-        v1.type.t = VT_PTR;
-        v1.r = VT_LOCAL | VT_LVAL;
-        v1.c.i = sv->c.i;
-
-        load(base = 14, &v1); /* Load pointer into R14 first */
-        fc = sign = 0;        /* Dereference with offset 0 from loaded pointer */
-        v = VT_LOCAL;
-      }
-      else
-      {
-        base = sv->pr0;
-        fc = sign = 0;
-        v = VT_LOCAL;
-      }
-    }
-
-    if (v == VT_LOCAL)
-    {
-      return load_vt_lval_vt_local(r, sv, ft, fc, sign, base);
-    }
-  }
-  else if (v == VT_CONST)
-    return load_vt_const(r, -1, sv);
-  else if (v == VT_LOCAL)
-    return load_vt_local(r, sv);
-  else if (v == VT_CMP)
-    return load_vt_cmp(r, sv);
-  else if (v == VT_JMP || v == VT_JMPI)
-    return load_vt_jmp_jmpi(r, sv);
   else if (v < VT_CONST)
   {
     /* For IR-generated code, use pr0 as the source register */
@@ -2288,64 +2162,90 @@ void load(int r, SValue *sv)
       int src_offset = sv->c.i;
       int src_sign = (src_offset < 0);
       int src_abs = src_sign ? -src_offset : src_offset;
-      if (!load_word_from_base(r, R_FP, src_abs, src_sign))
+      if (!load_word_from_base(dest->pr0, R_FP, src_abs, src_sign))
       {
         int rr = th_offset_to_reg(src_abs, src_sign);
-        ot_check(th_ldr_reg(r, R_FP, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+        ot_check(th_ldr_reg(dest->pr0, R_FP, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
       }
       return;
     }
+
     if (is_float(ft))
     {
       /* Check if we're moving between VFP registers or integer registers.
        * Only use VFP if hard float ABI is enabled. */
-      if (tcc_state->float_abi == ARM_HARD_FLOAT && r >= TREG_F0 && r <= TREG_F7 && src_reg >= TREG_F0 &&
-          src_reg <= TREG_F7)
+      if (tcc_state->float_abi == ARM_HARD_FLOAT && dest->pr0 >= TREG_F0 && dest->pr0 <= TREG_F7 &&
+          src_reg >= TREG_F0 && src_reg <= TREG_F7)
       {
         /* VFP to VFP move */
         if ((ft & VT_BTYPE) == VT_FLOAT)
-          ot_check(th_vmov_register(vfpr(r), vfpr(src_reg), 0));
+          ot_check(th_vmov_register(vfpr(dest->pr0), vfpr(src_reg), 0));
         else
-          ot_check(th_vmov_register(vfpr(r), vfpr(src_reg), 1));
+          ot_check(th_vmov_register(vfpr(dest->pr0), vfpr(src_reg), 1));
       }
       else
       {
         /* Integer register move (soft float) */
-        ot_check(
-            th_mov_reg(r, src_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
+        if (dest->pr0 != src_reg)
+        {
+          ot_check(th_mov_reg(dest->pr0, src_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                              ENFORCE_ENCODING_NONE, false));
+        }
         if ((ft & VT_BTYPE) == VT_DOUBLE || (ft & VT_BTYPE) == VT_LDOUBLE)
         {
           /* Also move high word for double.
-           * Use sv->pr1 for destination high register, not r+1 which could be
-           * invalid. Source high register comes from sv->r2. */
-          int r_high = sv->pr1;
-          int v_high = (sv->r2 != VT_CONST) ? sv->r2 : (src_reg + 1);
-          if (r_high < 0 || r_high == R_SP || r_high == R_PC)
+           * Use dest->pr1 for destination high register.
+           * Source high register comes from sv->r2 if available, otherwise src_reg+1. */
+          if (dest->pr1 >= 0)
           {
-            /* Fallback: if pr1 not allocated, try r+1 but validate */
-            r_high = r + 1;
-            if (r_high == R_SP || r_high == R_PC)
+            int v_high = (sv->r2 != VT_CONST) ? sv->r2 : (src_reg + 1);
+            if (dest->pr1 != v_high)
             {
-              tcc_error("compiler_error: cannot move double - no valid high "
-                        "dest register (pr1=%d, r+1=%d would be SP/PC)\n",
-                        sv->pr1, r + 1);
+              ot_check(th_mov_reg(dest->pr1, v_high, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                                  ENFORCE_ENCODING_NONE, false));
             }
           }
-          ot_check(th_mov_reg(r_high, v_high, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE,
-                              false));
         }
       }
-      return;
     }
     else
     {
-      TRACE("mov r %i v %i", r, src_reg);
-      ot_check(
-          th_mov_reg(r, src_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
-      return;
+      /* Non-float register move */
+      if (dest->pr0 != src_reg)
+      {
+        ot_check(th_mov_reg(dest->pr0, src_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                            ENFORCE_ENCODING_NONE, false));
+      }
+      if (dest->pr1 != -1 && tcc_is_64bit_operand(sv))
+      {
+        int v_high = (sv->r2 != VT_CONST) ? sv->r2 : (src_reg + 1);
+        if (dest->pr1 != v_high)
+        {
+          ot_check(th_mov_reg(dest->pr1, v_high, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                              ENFORCE_ENCODING_NONE, false));
+        }
+      }
     }
+    return;
   }
   tcc_error("compiler_error: unknown load not implemented\n");
+}
+
+/* Wrapper for legacy load() calls - creates temporary dest SValue */
+static void load_to_reg(int r, int r1, SValue *sv)
+{
+  SValue dest;
+  memset(&dest, 0, sizeof(dest));
+  dest.pr0 = r;
+  dest.pr1 = r1; /* -1 for 32-bit, actual register for 64-bit */
+  dest.type = sv->type;
+  load_to_dest(&dest, sv);
+}
+
+// Simplified load() - now just calls load_to_reg()
+void load(int r, SValue *sv)
+{
+  load_to_reg(r, -1, sv);
 }
 
 static int is_zero_on_stack(int pos)
@@ -2671,7 +2571,7 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
     if (!ot(handler.imm_handler(op->dest.pr0, op->src1.pr0, op->src2.c.i, flags, ENFORCE_ENCODING_NONE)))
     {
       // load immediate to temp register and add
-      load(R12, &op->src2);
+      load_to_reg(R12, -1, &op->src2);
       ot_check(handler.reg_handler(op->dest.pr0, op->src1.pr0, R12, flags, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     }
   }
@@ -2717,7 +2617,7 @@ static int load_fp_operand_to_vfp(SValue *sv, int scratch_sreg, int scratch_dreg
   }
 
   /* Not in VFP reg - load to integer reg and move to VFP scratch */
-  load(R0, sv);
+  load_to_reg(R0, is_double ? R1 : -1, sv);
   if (is_double)
   {
     ot_check(th_vmov_2gp_dp(R0, R1, scratch_dreg, 0 /* to VFP */));
@@ -2967,7 +2867,7 @@ static void gen_hardfp_cvt_itof(TACQuadruple *q)
   }
 
   /* Load integer to R0, then to S0 */
-  load(R0, &q->src1);
+  load_to_reg(R0, -1, &q->src1);
   ot_check(th_vmov_gp_sp(R0, 0 /* S0 */, 0 /* to VFP */));
 
   /* VCVT: convert int in S0 to float/double in S0/D0
@@ -3092,7 +2992,7 @@ ST_FUNC void tcc_gen_machine_fp_op(TACQuadruple *q)
     /* Negation: XOR the sign bit */
     /* For float: XOR R0 with 0x80000000 */
     /* For double: XOR R1 with 0x80000000 (high word has sign) */
-    load(R0, &q->src1);
+    load_to_reg(R0, is_double ? R1 : -1, &q->src1);
     /* Load 0x80000000 to R12 using literal pool */
     load_full_const(R12, -1, 0x80000000, NULL);
     if (is_double)
@@ -3126,14 +3026,14 @@ ST_FUNC void tcc_gen_machine_fp_op(TACQuadruple *q)
     if (is_double)
     {
       /* Double: src1 in R0:R1, src2 in R2:R3 */
-      load(R0, &q->src1);
-      load(R2, &q->src2);
+      load_to_reg(R0, R1, &q->src1);
+      load_to_reg(R2, R3, &q->src2);
     }
     else
     {
       /* Float: src1 in R0, src2 in R1 */
-      load(R0, &q->src1);
-      load(R1, &q->src2);
+      load_to_reg(R0, -1, &q->src1);
+      load_to_reg(R1, -1, &q->src2);
     }
 
     /* Get or create the external symbol for the comparison function */
@@ -3170,7 +3070,7 @@ ST_FUNC void tcc_gen_machine_fp_op(TACQuadruple *q)
     else
     {
       /* Same type, no conversion needed - just copy */
-      load(R0, &q->src1);
+      load_to_reg(R0, src_is_double ? R1 : -1, &q->src1);
       store(R0, &q->dest);
       return;
     }
@@ -3502,7 +3402,7 @@ ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *op)
     {
       int dn = LS_VFP_REG_NUM(op->dest.pr0);
       /* Load constant to integer register, then move to VFP */
-      load(R12, &op->src1);
+      load_to_reg(R12, -1, &op->src1);
       ot_check(th_vmov_gp_sp(R12, dn, 0)); /* VMOV Sn, r12 */
     }
     else
@@ -3622,7 +3522,7 @@ static void gcall_or_jump(int is_jmp, SValue *dest)
   }
   else
   {
-    load(R12, dest);
+    load_to_reg(R12, -1, dest);
     if (!is_jmp)
       ot_check(th_blx_reg(intr(R12)));
     else
@@ -3654,13 +3554,15 @@ static void load_to_register(int reg, int reg_from, SValue *sv)
     if (sv->pr0 == -1 || (sv->pr0 & PREG_SPILLED))
     {
       /* Spilled local variable - load from stack */
-      load(reg, sv);
+      int r1 = (sv->pr1 >= 0 && is_64bit_type(sv->type.t)) ? sv->pr1 : -1;
+      load_to_reg(reg, r1, sv);
       return;
     }
     if (sv->r & VT_LVAL)
     {
       /* Lvalue: need to load from memory */
-      load(reg, sv);
+      int r1 = (sv->pr1 >= 0 && is_64bit_type(sv->type.t)) ? sv->pr1 : -1;
+      load_to_reg(reg, r1, sv);
       return;
     }
   }
@@ -3668,7 +3570,8 @@ static void load_to_register(int reg, int reg_from, SValue *sv)
   if ((sv->r & VT_LVAL) || sv->pr0 == -1 || (sv->pr0 & PREG_SPILLED))
   {
     /* Lvalue: need to load from memory */
-    load(reg, sv);
+    int r1 = (sv->pr1 >= 0 && is_64bit_type(sv->type.t)) ? sv->pr1 : -1;
+    load_to_reg(reg, r1, sv);
     return;
   }
 
@@ -3885,7 +3788,7 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
       int reg = arg->src1.pr0;
       if (reg == -1 || (reg & PREG_SPILLED) || (arg->src1.r & VT_LVAL))
       {
-        load(R12, &arg->src1);
+        load_to_reg(R12, -1, &arg->src1);
         reg = R12;
       }
       ot_check(th_str_imm(reg, R_SP, stack_offset, 6, ENFORCE_ENCODING_NONE));
