@@ -77,6 +77,8 @@ SpillContext tcc_ir_preload_spills(TACQuadruple *q, int preload_src1, int preloa
 {
   SpillContext ctx = {0};
   ctx.is_64bit = tcc_ir_is_64bit_type(q->dest.type.t);
+  ctx.dest_scratch_reg = -1;
+  uint32_t exclude_regs = 0;
 
   /* Save original register allocations */
   ctx.orig_src1_pr0 = q->src1.pr0;
@@ -89,8 +91,33 @@ SpillContext tcc_ir_preload_spills(TACQuadruple *q, int preload_src1, int preloa
   {
     ctx.src1_spilled = 1;
     ctx.src1_offset = q->src1.c.i;
-    q->src1.pr0 = architecture_config.scratch_register;
-    tcc_gen_machine_load_register(&q->src1);
+
+    /* Find a free scratch register using liveness info */
+    TCCIRState *ir = tcc_state->ir;
+    int scratch = (ir) ? tcc_ls_find_free_scratch_reg(&ir->ls, ir->codegen_instruction_idx, exclude_regs, ir->leaffunc)
+                       : architecture_config.scratch_register;
+    if (scratch < 0)
+      scratch = architecture_config.scratch_register;
+
+    /* Call load BEFORE modifying pr0 - load() uses pr0 to detect spilled values.
+     * The first argument to load() specifies the destination register.
+     *
+     * IMPORTANT: If src1 has VT_LVAL but is NOT VT_LOCAL (i.e., it's a temporary
+     * holding a pointer address), we need to strip VT_LVAL - we want to load the
+     * ADDRESS from the spill slot, not dereference it. The actual LOAD operation
+     * will do the dereference.
+     * But for VT_LOCAL variables, VT_LVAL means "load value from stack", so we
+     * must keep it. */
+    int saved_r = q->src1.r;
+    int v = q->src1.r & VT_VALMASK;
+    if (v != VT_LOCAL && v != VT_LLOCAL)
+    {
+      q->src1.r &= ~VT_LVAL; /* Load raw value (the pointer), don't dereference */
+    }
+    load(scratch, &q->src1);
+    q->src1.r = saved_r; /* Restore original r for the actual operation */
+    q->src1.pr0 = scratch;
+    exclude_regs |= (1 << scratch);
   }
 
   /* Preload src2 if needed */
@@ -99,11 +126,26 @@ SpillContext tcc_ir_preload_spills(TACQuadruple *q, int preload_src1, int preloa
   {
     ctx.src2_spilled = 1;
     ctx.src2_offset = q->src2.c.i;
-    /* Use second_scratch if src1 also uses first scratch, otherwise use first scratch */
-    int src2_scratch =
-        ctx.src1_spilled ? architecture_config.second_scratch_register : architecture_config.scratch_register;
-    q->src2.pr0 = src2_scratch;
-    tcc_gen_machine_load_register(&q->src2);
+
+    /* Find a different free scratch register */
+    TCCIRState *ir = tcc_state->ir;
+    int scratch = (ir) ? tcc_ls_find_free_scratch_reg(&ir->ls, ir->codegen_instruction_idx, exclude_regs, ir->leaffunc)
+                       : architecture_config.scratch_register;
+    if (scratch < 0)
+      scratch = architecture_config.scratch_register;
+
+    /* Call load BEFORE modifying pr0 - load() uses pr0 to detect spilled values.
+     * Same VT_LVAL handling as src1. */
+    int saved_r = q->src2.r;
+    int v = q->src2.r & VT_VALMASK;
+    if (v != VT_LOCAL && v != VT_LLOCAL)
+    {
+      q->src2.r &= ~VT_LVAL;
+    }
+    load(scratch, &q->src2);
+    q->src2.r = saved_r;
+    q->src2.pr0 = scratch;
+    exclude_regs |= (1 << scratch);
   }
 
   /* Setup dest if needed */
@@ -111,7 +153,16 @@ SpillContext tcc_ir_preload_spills(TACQuadruple *q, int preload_src1, int preloa
   {
     ctx.dest_spilled = 1;
     ctx.dest_offset = q->dest.c.i;
-    q->dest.pr0 = architecture_config.scratch_register;
+
+    /* Find a free scratch register for dest */
+    TCCIRState *ir = tcc_state->ir;
+    int scratch = (ir) ? tcc_ls_find_free_scratch_reg(&ir->ls, ir->codegen_instruction_idx, exclude_regs, ir->leaffunc)
+                       : architecture_config.scratch_register;
+    if (scratch < 0)
+      scratch = architecture_config.scratch_register;
+
+    q->dest.pr0 = scratch;
+    ctx.dest_scratch_reg = scratch; /* Save the scratch register used for storing back */
   }
 
   return ctx;
@@ -125,7 +176,21 @@ void tcc_ir_storeback_spill(TACQuadruple *q, SpillContext *ctx)
     q->dest.pr0 = ctx->orig_dest_pr0;
     q->dest.r = VT_LOCAL;
     q->dest.c.i = ctx->dest_offset;
-    store(architecture_config.scratch_register, &q->dest);
+
+    /* Use the scratch register that was assigned during preload and contains the result */
+    int scratch = ctx->dest_scratch_reg;
+    if (scratch < 0)
+    {
+      /* Fallback: should not happen if preload was called correctly */
+      TCCIRState *ir = tcc_state->ir;
+      uint32_t exclude_regs = 0;
+      scratch = (ir) ? tcc_ls_find_free_scratch_reg(&ir->ls, ir->codegen_instruction_idx, exclude_regs, ir->leaffunc)
+                     : architecture_config.scratch_register;
+      if (scratch < 0)
+        scratch = architecture_config.scratch_register;
+    }
+
+    store(scratch, &q->dest);
   }
 }
 
@@ -2371,8 +2436,11 @@ int tcc_ir_constant_propagation(TCCIRState *ir)
         skip_bool_prop = 1;
     }
 
-    /* Propagate constant VAR vregs to immediate values */
-    if (!skip_bool_prop && irop_config[q->op].has_src1 && TCCIR_DECODE_VREG_TYPE(q->src1.vr) == TCCIR_VREG_TYPE_VAR)
+    /* Propagate constant VAR vregs to immediate values.
+     * IMPORTANT: Don't propagate if src1 is VT_LOCAL without VT_LVAL - that means
+     * "address of local variable", not its value. The address must be computed at runtime. */
+    if (!skip_bool_prop && irop_config[q->op].has_src1 && TCCIR_DECODE_VREG_TYPE(q->src1.vr) == TCCIR_VREG_TYPE_VAR &&
+        !((q->src1.r & VT_VALMASK) == VT_LOCAL && !(q->src1.r & VT_LVAL)))
     {
       int pos = TCCIR_DECODE_VREG_POSITION(q->src1.vr);
       if (pos <= max_var_pos && var_info[pos].is_constant)
@@ -2384,7 +2452,8 @@ int tcc_ir_constant_propagation(TCCIRState *ir)
       }
     }
 
-    if (!skip_bool_prop && irop_config[q->op].has_src2 && TCCIR_DECODE_VREG_TYPE(q->src2.vr) == TCCIR_VREG_TYPE_VAR)
+    if (!skip_bool_prop && irop_config[q->op].has_src2 && TCCIR_DECODE_VREG_TYPE(q->src2.vr) == TCCIR_VREG_TYPE_VAR &&
+        !((q->src2.r & VT_VALMASK) == VT_LOCAL && !(q->src2.r & VT_LVAL)))
     {
       int pos = TCCIR_DECODE_VREG_POSITION(q->src2.vr);
       if (pos <= max_var_pos && var_info[pos].is_constant)
@@ -3679,31 +3748,17 @@ void print_svalue_short(SValue *sv)
       if (sv->pr0 & PREG_SPILLED)
         printf(SPILL_MARK_BEGIN "SpillLoc[%d]" SPILL_MARK_END, sv->c.i);
       else
+      {
+        if (!(sv->r & VT_LVAL))
+          printf("&"); /* address-of */
         printf("R%d", sv->pr0);
+      }
     }
     else if (sv->vr != -1)
     { /* not reg-alloced, but vreg'ed? */
+      if (!(sv->r & VT_LVAL))
+        printf("&"); /* address-of: we want the address, not the value */
       tcc_ir_print_vreg(sv->vr);
-#if 0
-      printf("VReg%d[", sv->vreg);
-      int bt = sv->type.t & VT_BTYPE;
-      switch (bt) {
-      case VT_INT: printf("INT"); break;
-      case VT_BYTE: printf("BYTE"); break;
-      case VT_SHORT: printf("SHORT"); break;
-      case VT_VOID: printf("VOID"); break;
-      case VT_PTR: printf("PTR"); break;
-      case VT_ENUM: printf("ENUM"); break;
-      case VT_FUNC: printf("FUNC"); break;
-      case VT_STRUCT: printf("STRUCT"); break;
-      case VT_BOOL: printf("BOOL"); break;
-      default:
-         printf("OTHER=%d", bt);
-      }
-      if (sv->r & VT_LVAL) printf(",LVAL");
-      if ((sv->r & VT_VALMASK) == VT_LOCAL) printf(",VT_LOCAL");
-      printf("]");
-#endif
     }
     else if (!(sv->r & VT_LVAL))
     { /* no LVAL, is just an address */

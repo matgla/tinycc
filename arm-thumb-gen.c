@@ -145,10 +145,6 @@ enum
   TREG_LR,
 };
 
-#ifdef TCC_ARM_VFP
-#define T2CPR(t) (((t) & VT_BTYPE) != VT_FLOAT ? 0x100 : 0)
-#endif
-
 /* return registers for function */
 #define REG_IRET TREG_R0 /* single word int return register */
 #define REG_IRE2 TREG_R1 /* second word return register (for long long) */
@@ -257,26 +253,6 @@ uint32_t caller_saved_registers;
 uint32_t pushed_registers;
 int allocated_stack_size;
 
-ST_DATA const int reg_classes[NB_REGS] = {
-    /* r0 */ RC_INT | RC_R0,
-    /* r1 */ RC_INT | RC_R1,
-    /* r2 */ RC_INT | RC_R2,
-    /* r3 */ RC_INT | RC_R3,
-    /* r12 */ RC_INT | RC_R12,
-    /* f0 */ RC_FLOAT | RC_F0,
-    /* f1 */ RC_FLOAT | RC_F1,
-    /* f2 */ RC_FLOAT | RC_F2,
-    /* f3 */ RC_FLOAT | RC_F3,
-#ifdef TCC_ARM_VFP
-    /* d4/s8 */ RC_FLOAT | RC_F4,
-    /* d5/s10 */ RC_FLOAT | RC_F5,
-    /* d6/s12 */ RC_FLOAT | RC_F6,
-    /* d7/s14 */ RC_FLOAT | RC_F7,
-#endif
-};
-
-#define CHECK_R(r) ((r) >= TREG_R0 && (r) <= TREG_LR)
-
 int is_valid_opcode(thumb_opcode op);
 int ot(thumb_opcode op);
 static void load_to_register(int reg, int reg_from, SValue *src);
@@ -338,13 +314,6 @@ ST_FUNC void gen_fill_nops(int bytes)
   }
 }
 
-static int two2mask(int a, int b)
-{
-  if (!CHECK_R(a) || !CHECK_R(b))
-    tcc_error("compiler error! registers %i,%i is not valid", a, b);
-  return (reg_classes[a] | reg_classes[b]) & ~(RC_INT | RC_FLOAT);
-}
-
 static uint32_t mapcc(int cc)
 {
   switch (cc)
@@ -401,215 +370,6 @@ static CType float_type, double_type, func_float_type, func_double_type;
 
 static int unalias_ldbl(int btype);
 static int is_hgen_float_aggr(CType *type);
-static uint32_t intr(int r);
-
-#ifdef TCC_ARM_VFP
-static uint32_t vfpr(int r);
-#endif
-
-// struct avail_regs
-// {
-//   signed char avail[3]; /* 3 holes max with only float and double alignments */
-//   int first_hole;       /* first available hole */
-//   int last_hole;        /* last available hole (none if equal to first_hole) */
-//   int first_free_reg;   /* next free register in the sequence, hole excluded */
-// };
-// #define AVAIL_REGS_INITIALIZER (struct avail_regs){{0, 0, 0}, 0, 0, 0}
-// /* Find suitable registers for a VFP Co-Processor Register Candidate (VFP CPRC
-//    param) according to the rules described in the procedure call standard for
-//    the ARM architecture (AAPCS). If found, the registers are assigned to this
-//    VFP CPRC parameter. Registers are allocated in sequence unless a hole exists
-//    and the parameter is a single float.
-
-//    avregs: opaque structure to keep track of available VFP co-processor regs
-//    align: alignment constraints for the param, as returned by type_size()
-//    size: size of the parameter, as returned by type_size() */
-// int assign_vfpreg(struct avail_regs *avregs, int align, int size)
-// {
-//   int first_reg = 0;
-
-//   if (avregs->first_free_reg == -1)
-//     return -1;
-//   if (align >> 3)
-//   { /* double alignment */
-//     first_reg = avregs->first_free_reg;
-//     /* alignment constraint not respected so use next reg and record hole */
-//     if (first_reg & 1)
-//       avregs->avail[avregs->last_hole++] = first_reg++;
-//   }
-//   else
-//   { /* no special alignment (float or array of float) */
-//     /* if single float and a hole is available, assign the param to it */
-//     if (size == 4 && avregs->first_hole != avregs->last_hole)
-//       return avregs->avail[avregs->first_hole++];
-//     else
-//       first_reg = avregs->first_free_reg;
-//   }
-//   if (first_reg + size / 4 <= 16)
-//   {
-//     avregs->first_free_reg = first_reg + size / 4;
-//     return first_reg;
-//   }
-//   avregs->first_free_reg = -1;
-//   return -1;
-// }
-
-// /* Parameters are classified according to how they are copied to their final
-//    destination for the function call. Because the copying is performed class
-//    after class according to the order in the union below, it is important that
-//    some constraints about the order of the members of this union are respected:
-//    - CORE_STRUCT_CLASS must come after STACK_CLASS;
-//    - CORE_CLASS must come after STACK_CLASS, CORE_STRUCT_CLASS and
-//      VFP_STRUCT_CLASS;
-//    - VFP_STRUCT_CLASS must come after VFP_CLASS.
-//    See the comment for the main loop in copy_params() for the reason. */
-// enum reg_class
-// {
-//   STACK_CLASS = 0,
-//   CORE_STRUCT_CLASS,
-//   VFP_CLASS,
-//   VFP_STRUCT_CLASS,
-//   CORE_CLASS,
-//   NB_CLASSES
-// };
-
-// struct param_plan
-// {
-//   int start;               /* first reg or addr used depending on the class */
-//   int end;                 /* last reg used or next free addr depending on the class */
-//   SValue *sval;            /* pointer to SValue on the value stack */
-//   struct param_plan *prev; /*  previous element in this class */
-// };
-
-// struct plan
-// {
-//   struct param_plan *pplans;               /* array of all the param plans */
-//   struct param_plan *clsplans[NB_CLASSES]; /* per class lists of param plans */
-//   int nb_plans;
-// };
-
-// static void add_param_plan(struct plan *plan, int cls, int start, int end, SValue *v)
-// {
-//   struct param_plan *p = &plan->pplans[plan->nb_plans++];
-//   p->prev = plan->clsplans[cls];
-//   plan->clsplans[cls] = p;
-//   p->start = start, p->end = end, p->sval = v;
-// }
-
-// /* Assign parameters to registers and stack with alignment according to the
-//    rules in the procedure call standard for the ARM architecture (AAPCS).
-//    The overall assignment is recorded in an array of per parameter structures
-//    called parameter plans. The parameter plans are also further organized in a
-//    number of linked lists, one per class of parameter (see the comment for the
-//    definition of union reg_class).
-
-//    nb_args: number of parameters of the function for which a call is generated
-//    float_abi: float ABI in use for this function call
-//    plan: the structure where the overall assignment is recorded
-//    todo: a bitmap that record which core registers hold a parameter
-
-//    Returns the amount of stack space needed for parameter passing
-
-//    Note: this function allocated an array in plan->pplans with tcc_malloc. It
-//    is the responsibility of the caller to free this array once used (ie not
-//    before copy_params). */
-// static int assign_regs(int nb_args, int float_abi, struct plan *plan, int *todo)
-// {
-//   int i, size, align;
-//   int ncrn /* next core register number */, nsaa /* next stacked argument address*/;
-//   struct avail_regs avregs = {{0}};
-
-//   ncrn = nsaa = 0;
-//   *todo = 0;
-
-//   for (i = nb_args; i--;)
-//   {
-//     int j, start_vfpreg = 0;
-//     CType type = vtop[-i].type;
-//     ElfSym *sym = NULL;
-//     type.t &= ~VT_ARRAY;
-//     size = type_size(&type, &align);
-//     size = (size + 3) & ~3;
-//     align = (align + 3) & ~3;
-//     // if argument is a function pointer, then symbol must be exported
-//     if (vtop[-i].r & VT_SYM)
-//     {
-//       if (((type.t & VT_BTYPE) == VT_FUNC) ||
-//           ((type.t & VT_BTYPE) == VT_PTR && type.ref && (type.ref->type.t & VT_BTYPE) == VT_FUNC))
-//       {
-//         sym = elfsym(vtop[-i].sym);
-//       }
-//     }
-//     if (sym != NULL)
-//     {
-//       sym->st_info |= (STB_GLOBAL << 4);
-//     }
-
-//     switch (vtop[-i].type.t & VT_BTYPE)
-//     {
-//     case VT_STRUCT:
-//     case VT_FLOAT:
-//     case VT_DOUBLE:
-//     case VT_LDOUBLE:
-//       if (float_abi == ARM_HARD_FLOAT)
-//       {
-//         int is_hfa = 0; /* Homogeneous float aggregate */
-
-//         if (is_float(vtop[-i].type.t) || (is_hfa = is_hgen_float_aggr(&vtop[-i].type)))
-//         {
-//           int end_vfpreg;
-
-//           start_vfpreg = assign_vfpreg(&avregs, align, size);
-//           end_vfpreg = start_vfpreg + ((size - 1) >> 2);
-//           if (start_vfpreg >= 0)
-//           {
-//             add_param_plan(plan, is_hfa ? VFP_STRUCT_CLASS : VFP_CLASS, start_vfpreg, end_vfpreg, &vtop[-i]);
-//             continue;
-//           }
-//           else
-//             break;
-//         }
-//       }
-//       ncrn = (ncrn + (align - 1) / 4) & ~((align / 4) - 1);
-//       if (ncrn + size / 4 <= 4 || (ncrn < 4 && start_vfpreg != -1))
-//       {
-//         /* The parameter is allocated both in core register and on stack. As
-//          * such, it can be of either class: it would either be the last of
-//          * CORE_STRUCT_CLASS or the first of STACK_CLASS. */
-//         for (j = ncrn; j < 4 && j < ncrn + size / 4; j++)
-//           *todo |= (1 << j);
-//         add_param_plan(plan, CORE_STRUCT_CLASS, ncrn, j, &vtop[-i]);
-//         ncrn += size / 4;
-//         if (ncrn > 4)
-//           nsaa = (ncrn - 4) * 4;
-//       }
-//       else
-//       {
-//         ncrn = 4;
-//         break;
-//       }
-//       continue;
-//     default:
-//       if (ncrn < 4)
-//       {
-//         int is_long = (vtop[-i].type.t & VT_BTYPE) == VT_LLONG;
-//         if (is_long)
-//         {
-//           ncrn = (ncrn + 1) & -2;
-//           if (ncrn == 4)
-//             break;
-//         }
-//         add_param_plan(plan, CORE_CLASS, ncrn, ncrn + is_long, &vtop[-i]);
-//         ncrn += 1 + is_long;
-//         continue;
-//       }
-//     }
-//     nsaa = (nsaa + (align - 1)) & ~(align - 1);
-//     add_param_plan(plan, STACK_CLASS, nsaa, nsaa + size, &vtop[-i]);
-//     nsaa += size; /* size already rounded up before */
-//   }
-//   return nsaa;
-// }
 
 static void th_literal_pool_init()
 {
@@ -1029,11 +789,15 @@ static thumb_opcode th_generic_mov_imm(uint32_t r, int imm)
 }
 int th_offset_to_reg(int off, int sign)
 {
-  // we will crash if there is no reg available
-  // int rr = get_reg(RC_INT);
-  int rr = R_LR; // can I use R_LR here? lr should be already saved in proluge right?
+  /* Find a free scratch register - prefer R_IP (R12) over LR */
+  uint32_t exclude_regs = 0;
+  TCCIRState *ir = tcc_state->ir;
+  int rr = (ir) ? tcc_ls_find_free_scratch_reg(&ir->ls, ir->codegen_instruction_idx, exclude_regs, ir->leaffunc) : R_IP;
 
-  // if mov is not possible then load from data
+  if (rr < 0)
+    rr = R_IP;
+
+  /* if mov is not possible then load from data */
   if (!ot(th_generic_mov_imm(rr, off)))
   {
     load_full_const(rr, -1, sign ? -off : off, NULL);
@@ -1304,39 +1068,8 @@ ST_FUNC int gfunc_sret(CType *vt, int variadic, CType *ret, int *ret_align, int 
   return 0;
 }
 
-#ifdef TCC_ARM_VFP
-static uint32_t vfpr(int r)
-{
-  if (r < TREG_F0 || r > TREG_F7)
-  {
-    tcc_error("compiler_error: register: %d is not vfp register\n", r);
-  }
-  return r - TREG_F0;
-}
-#else
-static uint32_t fpr(int r)
-{
-  if (r < TREG_F0 || r > TREG_F3)
-  {
-    tcc_error("compiler_error: register: %d is not fp register\n", r);
-  }
-  return r - TREF_F0;
-}
-#endif
 // are those offsets to allow TREG_R0 start from other register than r0?
 // not sure
-static uint32_t intr(int r)
-{
-  if (r == TREG_R12)
-  {
-    return r;
-  }
-  if (r >= TREG_R0 && r <= TREG_R3)
-  {
-    return r - TREG_R0;
-  }
-  return r + (13 - TREG_SP);
-}
 
 void store(int r, SValue *sv)
 {
@@ -1375,13 +1108,22 @@ void store(int r, SValue *sv)
         int addr_sign = (addr_offset < 0);
         if (addr_sign)
           addr_offset = -addr_offset;
-        /* Load the address into R_LR (use LR as scratch since R12 may be used for value) */
-        if (!load_word_from_base(R_LR, R_FP, addr_offset, addr_sign))
+        /* Load the address into a free scratch register.
+         * Exclude the source register 'r' to avoid overwriting the value we want to store. */
+        uint32_t exclude_regs = (1 << r);
+        TCCIRState *ir = tcc_state->ir;
+        int base_reg =
+            (ir) ? tcc_ls_find_free_scratch_reg(&ir->ls, ir->codegen_instruction_idx, exclude_regs, ir->leaffunc)
+                 : R_IP;
+        if (base_reg < 0)
+          base_reg = R_IP;
+
+        if (!load_word_from_base(base_reg, R_FP, addr_offset, addr_sign))
         {
           int rr = th_offset_to_reg(addr_offset, addr_sign);
-          ot_check(th_ldr_reg(R_LR, R_FP, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+          ot_check(th_ldr_reg(base_reg, R_FP, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
         }
-        base = R_LR;
+        base = base_reg;
       }
       v = VT_LOCAL;
       fc = sign = 0;
@@ -1406,7 +1148,17 @@ void store(int r, SValue *sv)
         v1.r = (fr & ~VT_LVAL) | (validated_sym ? VT_SYM : 0);
         v1.c.i = 0; /* Load base address, not base+offset */
         v1.sym = validated_sym;
-        load(base = 14, &v1);
+
+        /* Find a free scratch register for loading global symbol address.
+         * Exclude the source register 'r' to avoid overwriting the value we want to store. */
+        uint32_t exclude_regs = (1 << r);
+        TCCIRState *ir = tcc_state->ir;
+        base = (ir) ? tcc_ls_find_free_scratch_reg(&ir->ls, ir->codegen_instruction_idx, exclude_regs, ir->leaffunc)
+                    : R_IP;
+        if (base < 0)
+          base = R_IP;
+
+        load(base, &v1);
         /* Cache this for subsequent accesses to same symbol */
         thumb_gen_state.cached_global_sym = validated_sym;
         thumb_gen_state.cached_global_reg = base;
@@ -1425,9 +1177,9 @@ void store(int r, SValue *sv)
         {
           /* Source is VFP register - use VSTR */
           if ((ft & VT_BTYPE) != VT_FLOAT)
-            ot_check(th_vstr(base, vfpr(r), !sign, 1, fc));
+            ot_check(th_vstr(base, r, !sign, 1, fc));
           else
-            ot_check(th_vstr(base, vfpr(r), !sign, 0, fc));
+            ot_check(th_vstr(base, r, !sign, 0, fc));
         }
         else
         {
@@ -1507,11 +1259,11 @@ static void load_vt_lval_vt_local_float(int r, SValue *sv, int ft, int fc, int s
   if ((ft & VT_BTYPE) != VT_FLOAT)
   {
     // load double
-    ot_check(th_vldr(base, vfpr(r), !sign, 1, fc));
+    ot_check(th_vldr(base, r, !sign, 1, fc));
   }
   else
   {
-    ot_check(th_vldr(base, vfpr(r), !sign, 0, fc));
+    ot_check(th_vldr(base, r, !sign, 0, fc));
   }
 }
 
@@ -1692,8 +1444,19 @@ static void load_full_const(int r, int r1, int64_t imm, struct Sym *sym)
             entry2->relocation = -1;
             entry2->data_size = r1 != -1 ? 8 : 4;
             entry2->short_instruction = false;
-            ot_check(th_ldr_literal(R_LR, 0, 1));
-            ot_check(th_add_reg(r, r, R_LR, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+
+            /* Find a free scratch register for literal pool entry */
+            uint32_t exclude_regs = (1 << r); /* Exclude destination register */
+            TCCIRState *ir = tcc_state->ir;
+            int scratch =
+                (ir) ? tcc_ls_find_free_scratch_reg(&ir->ls, ir->codegen_instruction_idx, exclude_regs, ir->leaffunc)
+                     : R_IP;
+            if (scratch < 0)
+              scratch = R_IP;
+
+            ot_check(th_ldr_literal(scratch, 0, 1));
+            ot_check(
+                th_add_reg(r, r, scratch, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
           }
         }
       }
@@ -1722,8 +1485,19 @@ static void load_full_const(int r, int r1, int64_t imm, struct Sym *sym)
             entry2->patch_position = ind;
             entry2->relocation = -1;
             entry2->short_instruction = false;
-            ot_check(th_ldr_literal(R_LR, 0, 1));
-            ot_check(th_add_reg(r, r, R_LR, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+
+            /* Find a free scratch register for literal pool entry */
+            uint32_t exclude_regs = (1 << r); /* Exclude destination register */
+            TCCIRState *ir = tcc_state->ir;
+            int scratch =
+                (ir) ? tcc_ls_find_free_scratch_reg(&ir->ls, ir->codegen_instruction_idx, exclude_regs, ir->leaffunc)
+                     : R_IP;
+            if (scratch < 0)
+              scratch = R_IP;
+
+            ot_check(th_ldr_literal(scratch, 0, 1));
+            ot_check(
+                th_add_reg(r, r, scratch, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
           }
         }
       }
@@ -1777,7 +1551,6 @@ void load_vt_lval_vt_local(int r, int r1, SValue *sv, int ft, int fc, int sign, 
 {
   int success = 0;
   const int btype = ft & VT_BTYPE;
-  int ir = intr(r);
   TRACE("load_vt_lval_vt_local: fc: %i", fc);
 
   if (is_float(ft))
@@ -1799,13 +1572,13 @@ void load_vt_lval_vt_local(int r, int r1, SValue *sv, int ft, int fc, int sign, 
     if (use_vfp)
     {
       /* VFP register - use VFP load instructions */
-      TRACE("load float to VFP r: %d, base: %d, fc: %d, sign: %d\n", ir, base, fc, sign);
+      TRACE("load float to VFP r: %d, base: %d, fc: %d, sign: %d\n", r, base, fc, sign);
       return load_vt_lval_vt_local_float(r, sv, ft, fc, sign, base);
     }
     else
     {
       /* Integer register - load float as raw bits (soft float) */
-      TRACE("load float to INT r: %d, base: %d, fc: %d, sign: %d\n", ir, base, fc, sign);
+      TRACE("load float to INT r: %d, base: %d, fc: %d, sign: %d\n", r, base, fc, sign);
       if (btype == VT_DOUBLE || btype == VT_LDOUBLE)
       {
         /* Double: load 64 bits to pre-allocated register pair.
@@ -1814,21 +1587,21 @@ void load_vt_lval_vt_local(int r, int r1, SValue *sv, int ft, int fc, int sign, 
         int ir_high = r1;
         if (ir_high < 0)
         {
-          /* Fallback: try ir+1 but validate */
-          ir_high = ir + 1;
+          /* Fallback: try r+1 but validate */
+          ir_high = r + 1;
           if (ir_high == R_SP || ir_high == R_PC)
           {
             tcc_error("compiler_error: cannot load double - no valid high register "
-                      "(r1=%d, ir+1=%d would be SP/PC)\n",
-                      r1, ir + 1);
+                      "(r1=%d, r+1=%d would be SP/PC)\n",
+                      r1, r + 1);
           }
         }
         /* Load low word first */
-        success = load_word_from_base(ir, base, fc, sign);
+        success = load_word_from_base(r, base, fc, sign);
         if (!success)
         {
           int rr = th_offset_to_reg(fc, sign);
-          ot_check(th_ldr_reg(ir, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+          ot_check(th_ldr_reg(r, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
         }
         /* Load high word.
          * For negative offsets (sign=1), high word is at fc-4 (closer to base).
@@ -1853,11 +1626,11 @@ void load_vt_lval_vt_local(int r, int r1, SValue *sv, int ft, int fc, int sign, 
       else
       {
         /* Float: load 32 bits to single integer register */
-        success = load_word_from_base(ir, base, fc, sign);
+        success = load_word_from_base(r, base, fc, sign);
         if (!success)
         {
           int rr = th_offset_to_reg(fc, sign);
-          ot_check(th_ldr_reg(ir, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+          ot_check(th_ldr_reg(r, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
         }
       }
       return;
@@ -1868,13 +1641,13 @@ void load_vt_lval_vt_local(int r, int r1, SValue *sv, int ft, int fc, int sign, 
     /* 64-bit integer type - load to register pair if r1 is provided */
     if (r1 >= 0 && (btype == VT_LLONG))
     {
-      TRACE("load 64-bit int to r:%d:r1:%d, base: %d, fc: %d, sign: %d\n", ir, r1, base, fc, sign);
+      TRACE("load 64-bit int to r:%d:r1:%d, base: %d, fc: %d, sign: %d\n", r, r1, base, fc, sign);
       /* Load low word */
-      success = load_word_from_base(ir, base, fc, sign);
+      success = load_word_from_base(r, base, fc, sign);
       if (!success)
       {
         int rr = th_offset_to_reg(fc, sign);
-        ot_check(th_ldr_reg(ir, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+        ot_check(th_ldr_reg(r, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
       }
       /* Load high word at offset+4 */
       int fc_high = sign ? (fc - 4) : (fc + 4);
@@ -1896,30 +1669,30 @@ void load_vt_lval_vt_local(int r, int r1, SValue *sv, int ft, int fc, int sign, 
   }
   else if (btype == VT_SHORT)
   {
-    TRACE("load short to r: %d, base: %d, fc: %d, sign: %d\n", ir, base, fc, sign);
+    TRACE("load short to r: %d, base: %d, fc: %d, sign: %d\n", r, base, fc, sign);
     if (!(ft & VT_UNSIGNED))
     {
-      success = load_short_from_base(ir, base, fc, sign);
+      success = load_short_from_base(r, base, fc, sign);
     }
     else
     {
-      success = load_ushort_from_base(ir, base, fc, sign);
+      success = load_ushort_from_base(r, base, fc, sign);
     }
   }
   else if (btype == VT_BYTE || btype == VT_BOOL)
   {
     if (!(ft & VT_UNSIGNED))
     {
-      success = load_byte_from_base(ir, base, fc, sign);
+      success = load_byte_from_base(r, base, fc, sign);
     }
     else
     {
-      success = load_ubyte_from_base(ir, base, fc, sign);
+      success = load_ubyte_from_base(r, base, fc, sign);
     }
   }
   else
   {
-    success = load_word_from_base(ir, base, fc, sign);
+    success = load_word_from_base(r, base, fc, sign);
   }
   if (!success)
   {
@@ -1929,19 +1702,19 @@ void load_vt_lval_vt_local(int r, int r1, SValue *sv, int ft, int fc, int sign, 
     if (btype == VT_SHORT)
     {
       if (ft & VT_UNSIGNED)
-        ot_check(th_ldrh_reg(ir, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+        ot_check(th_ldrh_reg(r, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
       else
-        ot_check(th_ldrsh_reg(ir, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+        ot_check(th_ldrsh_reg(r, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     }
     else if (btype == VT_BYTE || btype == VT_BOOL)
     {
       if (ft & VT_UNSIGNED)
-        ot_check(th_ldrb_reg(ir, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+        ot_check(th_ldrb_reg(r, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
       else
-        ot_check(th_ldrsb_reg(ir, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+        ot_check(th_ldrsb_reg(r, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     }
     else
-      ot_check(th_ldr_reg(ir, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+      ot_check(th_ldr_reg(r, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
   }
 }
 
@@ -2003,31 +1776,30 @@ void load_vt_local(int r, SValue *sv)
 void load_vt_cmp(int r, SValue *sv)
 {
   const uint32_t firstcond = mapcc(sv->c.i);
-  uint32_t rr = intr(r);
   TRACE("'load_vt_cmp' to reg: %d, op: 0x%x\n", r, (uint32_t)sv->c.i);
-  if (rr == R_SP || rr == R_PC)
+  if (r == R_SP || r == R_PC)
   {
     tcc_error("compiler_error: load_vt_cmp can't be used for pc or sp\n");
   }
 
   // it block
   o(0xbf00 | (firstcond << 4) | 0x4 | ((~firstcond & 1) << 3));
-  ot_check(th_generic_mov_imm(rr, 1));
-  ot_check(th_generic_mov_imm(rr, 0));
+  ot_check(th_generic_mov_imm(r, 1));
+  ot_check(th_generic_mov_imm(r, 0));
 }
 
 void load_vt_jmp_jmpi(int r, SValue *sv)
 {
 #ifdef TCC_TARGET_ARM_ARCHV6M
-  if (intr(r) > 7)
+  if (r > 7)
   {
     tcc_error("compiler_error: implement load_vt_jmp_jmpi for armv6m\n");
   }
 #endif
-  ot_check(th_generic_mov_imm(intr(r), sv->r & 1));
+  ot_check(th_generic_mov_imm(r, sv->r & 1));
   ot_check(th_b_t4(2));
   gsym(sv->c.i);
-  ot_check(th_generic_mov_imm(intr(r), (sv->r ^ 1) & 1));
+  ot_check(th_generic_mov_imm(r, (sv->r ^ 1) & 1));
 }
 
 void load_to_dest(SValue *dest, SValue *sv)
@@ -2095,7 +1867,8 @@ void load_to_dest(SValue *dest, SValue *sv)
       v1.c.i = sv->c.i;
 
       TRACE("l1");
-      load(base = 14, &v1);
+      base = get_free_scratch_reg(0);
+      load(base, &v1);
       fc = sign = 0;
       v = VT_LOCAL;
     }
@@ -2119,7 +1892,8 @@ void load_to_dest(SValue *dest, SValue *sv)
         v1.c.i = 0; /* Load base address, not base+offset */
         v1.sym = validated_sym;
         TRACE("l2");
-        load(base = 14, &v1);
+        base = get_free_scratch_reg(0);
+        load(base, &v1);
         /* Cache this for subsequent accesses to same symbol */
         thumb_gen_state.cached_global_sym = validated_sym;
         thumb_gen_state.cached_global_reg = base;
@@ -2143,8 +1917,9 @@ void load_to_dest(SValue *dest, SValue *sv)
         v1.c.i = sv->c.i;
 
         TRACE("load_to_dest: loading spilled lvalue address from [FP%+lld]", (long long)fc);
-        load(base = 14, &v1); /* Load pointer into R14 first */
-        fc = sign = 0;        /* Dereference with offset 0 from loaded pointer */
+        base = get_free_scratch_reg(0);
+        load(base, &v1); /* Load pointer into free scratch register first */
+        fc = sign = 0;   /* Dereference with offset 0 from loaded pointer */
         v = VT_LOCAL;
       }
       else
@@ -2157,6 +1932,12 @@ void load_to_dest(SValue *dest, SValue *sv)
 
     if (v == VT_LOCAL)
     {
+      /* Invalidate global symbol cache if we're writing to the cached register */
+      if (dest->pr0 == thumb_gen_state.cached_global_reg || dest->pr1 == thumb_gen_state.cached_global_reg)
+      {
+        thumb_gen_state.cached_global_sym = NULL;
+        thumb_gen_state.cached_global_reg = -1;
+      }
       return load_vt_lval_vt_local(dest->pr0, dest->pr1, sv, ft, fc, sign, base);
     }
   }
@@ -2199,9 +1980,9 @@ void load_to_dest(SValue *dest, SValue *sv)
       {
         /* VFP to VFP move */
         if ((ft & VT_BTYPE) == VT_FLOAT)
-          ot_check(th_vmov_register(vfpr(dest->pr0), vfpr(src_reg), 0));
+          ot_check(th_vmov_register(dest->pr0, src_reg, 0));
         else
-          ot_check(th_vmov_register(vfpr(dest->pr0), vfpr(src_reg), 1));
+          ot_check(th_vmov_register(dest->pr0, src_reg, 1));
       }
       else
       {
@@ -2612,8 +2393,17 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
     break;
   }
   case TCCIR_OP_TEST_ZERO:
-    ot_check(th_cmp_imm(0, intr(op->src1.pr0), 0, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE));
+  {
+    int src_reg = op->src1.pr0;
+    /* Handle immediate constant - load into scratch register first */
+    if (th_has_immediate_value(op->src1.r) || src_reg < 0)
+    {
+      src_reg = get_free_scratch_reg(0);
+      load_to_reg(src_reg, -1, &op->src1);
+    }
+    ot_check(th_cmp_imm(0, src_reg, 0, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE));
     return;
+  }
   default:
   {
     printf("compiler_error: unhandled data processing op: %s\n", tcc_ir_get_op_name(op->op));
@@ -3072,17 +2862,20 @@ ST_FUNC void tcc_gen_machine_fp_op(TACQuadruple *q)
     /* For float: XOR R0 with 0x80000000 */
     /* For double: XOR R1 with 0x80000000 (high word has sign) */
     load_to_reg(R0, is_double ? R1 : -1, &q->src1);
-    /* Load 0x80000000 to R12 using literal pool */
-    load_full_const(R12, -1, 0x80000000, NULL);
+    /* Load 0x80000000 to scratch register using literal pool */
+    int scratch_reg = get_free_scratch_reg((1 << R0) | (is_double ? (1 << R1) : 0));
+    load_full_const(scratch_reg, -1, 0x80000000, NULL);
     if (is_double)
     {
       /* XOR high word (R1) with sign bit */
-      ot_check(th_eor_reg(R1, R1, R12, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+      ot_check(
+          th_eor_reg(R1, R1, scratch_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     }
     else
     {
       /* XOR R0 with sign bit */
-      ot_check(th_eor_reg(R0, R0, R12, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+      ot_check(
+          th_eor_reg(R0, R0, scratch_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     }
     store(R0, &q->dest);
     return;
@@ -3279,8 +3072,9 @@ ST_FUNC void tcc_gen_machine_store_op(TACQuadruple *op)
   // if src_reg is -1 then immediate value must be loaded
   if (src_reg < 0)
   {
-    load_to_reg(R12, is_64bit ? R11 : -1, &op->src1);
-    src_reg = R12;
+    int scratch_reg = get_free_scratch_reg(0);
+    load_to_reg(scratch_reg, is_64bit ? R11 : -1, &op->src1);
+    src_reg = scratch_reg;
   }
   store(src_reg, &op->dest);
 }
@@ -3485,8 +3279,9 @@ ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *op)
     {
       int dn = LS_VFP_REG_NUM(op->dest.pr0);
       /* Load constant to integer register, then move to VFP */
-      load_to_reg(R12, -1, &op->src1);
-      ot_check(th_vmov_gp_sp(R12, dn, 0)); /* VMOV Sn, r12 */
+      int scratch_reg = get_free_scratch_reg(0);
+      load_to_reg(scratch_reg, -1, &op->src1);
+      ot_check(th_vmov_gp_sp(scratch_reg, dn, 0)); /* VMOV Sn, scratch_reg */
     }
     else
     {
@@ -3605,11 +3400,12 @@ static void gcall_or_jump(int is_jmp, SValue *dest)
   }
   else
   {
-    load_to_reg(R12, -1, dest);
+    int scratch_reg = get_free_scratch_reg(0);
+    load_to_reg(scratch_reg, -1, dest);
     if (!is_jmp)
-      ot_check(th_blx_reg(intr(R12)));
+      ot_check(th_blx_reg(scratch_reg));
     else
-      ot_check(th_bx_reg(intr(R12)));
+      ot_check(th_bx_reg(scratch_reg));
   }
 }
 
@@ -3624,9 +3420,18 @@ static void load_to_register(int reg, int reg_from, SValue *sv)
 {
   if ((sv->r & VT_VALMASK) == VT_LOCAL)
   {
+    /* VT_LOCAL without VT_LVAL means we need the ADDRESS of the local variable.
+     * In this case we must compute FP + offset, not do a register move. */
+    if (!(sv->r & VT_LVAL))
+    {
+      /* Always compute address via load_vt_local */
+      int r1 = (sv->pr1 >= 0 && is_64bit_type(sv->type.t)) ? sv->pr1 : -1;
+      load_to_reg(reg, r1, sv);
+      return;
+    }
     if (sv->pr0 >= 0 && !(sv->pr0 & PREG_SPILLED))
     {
-      // load local variable from register
+      // load local variable value from register
       if (reg != reg_from)
       {
         ot_check(th_mov_reg(reg, reg_from, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE,
@@ -3637,13 +3442,6 @@ static void load_to_register(int reg, int reg_from, SValue *sv)
     if (sv->pr0 == -1 || (sv->pr0 & PREG_SPILLED))
     {
       /* Spilled local variable - load from stack */
-      int r1 = (sv->pr1 >= 0 && is_64bit_type(sv->type.t)) ? sv->pr1 : -1;
-      load_to_reg(reg, r1, sv);
-      return;
-    }
-    if (sv->r & VT_LVAL)
-    {
-      /* Lvalue: need to load from memory */
       int r1 = (sv->pr1 >= 0 && is_64bit_type(sv->type.t)) ? sv->pr1 : -1;
       load_to_reg(reg, r1, sv);
       return;
@@ -3666,10 +3464,19 @@ static void load_to_register(int reg, int reg_from, SValue *sv)
   }
 }
 
-/* Returns true when a register value can be used directly as a source (not spilled, not lvalue). */
+/* Returns true when a register value can be used directly as a source (not spilled, not lvalue).
+ * For VT_LOCAL without VT_LVAL (address of local variable), we need to compute the address,
+ * so we cannot use the register directly even if it contains the value. */
 static bool is_valid_src_reg(const SValue *sv, int reg)
 {
-  return reg >= 0 && !(reg & PREG_SPILLED) && !(sv->r & VT_LVAL);
+  if (reg < 0 || (reg & PREG_SPILLED))
+    return false;
+  if (sv->r & VT_LVAL)
+    return false;
+  /* VT_LOCAL without VT_LVAL means "address of local variable" - needs address computation */
+  if ((sv->r & VT_VALMASK) == VT_LOCAL)
+    return false;
+  return true;
 }
 
 static int lowest_set_bit(uint32_t mask)
@@ -3871,8 +3678,9 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
       int reg = arg->src1.pr0;
       if (reg == -1 || (reg & PREG_SPILLED) || (arg->src1.r & VT_LVAL))
       {
-        load_to_reg(R12, -1, &arg->src1);
-        reg = R12;
+        int scratch_reg = get_free_scratch_reg(0);
+        load_to_reg(scratch_reg, -1, &arg->src1);
+        reg = scratch_reg;
       }
       ot_check(th_str_imm(reg, R_SP, stack_offset, 6, ENFORCE_ENCODING_NONE));
       stack_offset += 4;

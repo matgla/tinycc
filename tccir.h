@@ -119,6 +119,7 @@ typedef struct IRLiveInterval
 typedef struct SpillContext
 {
   int8_t orig_src1_pr0, orig_src2_pr0, orig_dest_pr0; // Original register allocations
+  int8_t dest_scratch_reg;                            // Scratch register used for dest result
   int src1_offset, src2_offset, dest_offset;          // Stack offsets
   uint8_t src1_spilled : 1;                           // Whether src1 was in memory
   uint8_t src2_spilled : 1;                           // Whether src2 was in memory
