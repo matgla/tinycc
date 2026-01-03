@@ -255,29 +255,91 @@ int allocated_stack_size;
 
 int is_valid_opcode(thumb_opcode op);
 int ot(thumb_opcode op);
+int ot_check(thumb_opcode op);
 static void load_to_register(int reg, int reg_from, SValue *src);
 int th_has_immediate_value(int r);
 int load_word_from_base(int ir, int base, int fc, int sign);
 int th_offset_to_reg(int offset, int sign);
 
+/* Structure to track scratch register allocation with potential save/restore */
+typedef struct ScratchRegAlloc
+{
+  int reg;       /* The allocated scratch register */
+  int saved : 1; /* Whether the register was saved to stack */
+} ScratchRegAlloc;
+
 /* Get a free scratch register using liveness information.
  * exclude_regs is a bitmap of registers that must not be used.
- * Returns architecture_config.scratch_register or second_scratch_register as fallback.
+ * If no free register is found, saves R_IP to stack and returns it.
+ * Returns ScratchRegAlloc with the register and whether it was saved.
  */
-static int get_free_scratch_reg(uint32_t exclude_regs)
+static ScratchRegAlloc get_scratch_reg_with_save(uint32_t exclude_regs)
 {
+  ScratchRegAlloc result = {0};
   TCCIRState *ir = tcc_state->ir;
+
   if (ir)
   {
     int reg = tcc_ls_find_free_scratch_reg(&ir->ls, ir->codegen_instruction_idx, exclude_regs, ir->leaffunc);
     if (reg >= 0)
-      return reg;
+    {
+      result.reg = reg;
+      result.saved = 0;
+      return result;
+    }
   }
-  /* Fallback to configured scratch register */
-  if (!(exclude_regs & (1 << architecture_config.scratch_register)))
-    return architecture_config.scratch_register;
-  /* Last resort - use second scratch, but this may be LR which could be problematic */
-  return architecture_config.second_scratch_register;
+
+  /* No free register found - we need to save one to the stack */
+  /* Prefer R_IP (R12) as it's the inter-procedure scratch register */
+  int reg_to_save = R_IP;
+  if (exclude_regs & (1 << R_IP))
+  {
+    /* R_IP is excluded, try R_LR if we're in a leaf function */
+    if (ir && ir->leaffunc && !(exclude_regs & (1 << R_LR)))
+    {
+      reg_to_save = R_LR;
+    }
+    else
+    {
+      /* Try R0-R3 */
+      for (int r = 0; r <= 3; ++r)
+      {
+        if (!(exclude_regs & (1 << r)))
+        {
+          reg_to_save = r;
+          break;
+        }
+      }
+    }
+  }
+
+  /* Save the register to stack */
+  ot_check(th_push(1 << reg_to_save));
+  result.reg = reg_to_save;
+  result.saved = 1;
+  return result;
+}
+
+/* Restore a scratch register if it was saved */
+static void restore_scratch_reg(ScratchRegAlloc *alloc)
+{
+  if (alloc->saved)
+  {
+    ot_check(th_pop(1 << alloc->reg));
+    alloc->saved = 0;
+  }
+}
+
+/* Simple version that doesn't track saves - for backward compatibility.
+ * WARNING: This version may clobber live data if no free register is available.
+ * Prefer get_scratch_reg_with_save() when possible.
+ */
+static int get_free_scratch_reg(uint32_t exclude_regs)
+{
+  ScratchRegAlloc alloc = get_scratch_reg_with_save(exclude_regs);
+  /* Note: If alloc.saved is true, the register was pushed but we have no way
+   * to restore it here. Callers should use get_scratch_reg_with_save() instead. */
+  return alloc.reg;
 }
 
 static int th_is_caller_saved_register(int reg)
@@ -296,6 +358,223 @@ int ot_check(thumb_opcode op)
     tcc_error("compiler_error: received invalid opcode: 0x%x\n", op.opcode);
   }
   return ot(op);
+}
+
+/* Forward declaration from tccir.c */
+int tcc_ir_is_spilled(SValue *sv);
+int tcc_ir_is_64bit(int t);
+
+/* Preload spilled operands into scratch registers before an operation.
+ * Returns SpillContext with information for store-back.
+ * Parameters:
+ *   q: The IR quad instruction
+ *   preload_src1: Whether to preload src1 if spilled
+ *   preload_src2: Whether to preload src2 if spilled
+ *   setup_dest: Whether to set up dest register if spilled
+ */
+SpillContext tcc_ir_preload_spills(TACQuadruple *q, int preload_src1, int preload_src2, int setup_dest)
+{
+  SpillContext ctx = {0};
+  ctx.is_64bit = tcc_ir_is_64bit(q->dest.type.t);
+  ctx.dest_scratch_reg = -1;
+  ctx.src1_scratch_reg = -1;
+  ctx.src2_scratch_reg = -1;
+  uint32_t exclude_regs = 0;
+
+  /* Save original register allocations */
+  ctx.orig_src1_pr0 = q->src1.pr0;
+  ctx.orig_src2_pr0 = q->src2.pr0;
+  ctx.orig_dest_pr0 = q->dest.pr0;
+
+  /* Preload src1 if needed */
+  if (preload_src1 && tcc_ir_is_spilled(&q->src1) && !th_has_immediate_value(q->src1.r) &&
+      !tcc_ir_is_64bit(q->src1.type.t))
+  {
+    ctx.src1_spilled = 1;
+    ctx.src1_offset = q->src1.c.i;
+
+    /* Find a free scratch register using liveness info */
+    TCCIRState *ir = tcc_state->ir;
+    int scratch =
+        (ir) ? tcc_ls_find_free_scratch_reg(&ir->ls, ir->codegen_instruction_idx, exclude_regs, ir->leaffunc) : -1;
+    if (scratch < 0)
+    {
+      /* No free register - save R_IP to stack and use it */
+      scratch = R_IP;
+      if (exclude_regs & (1 << R_IP))
+      {
+        /* R_IP excluded, try to find another register */
+        for (int r = 0; r <= 3; ++r)
+        {
+          if (!(exclude_regs & (1 << r)))
+          {
+            scratch = r;
+            break;
+          }
+        }
+      }
+      ot_check(th_push(1 << scratch));
+      ctx.src1_reg_saved = 1;
+    }
+    ctx.src1_scratch_reg = scratch;
+
+    /* Call load BEFORE modifying pr0 - load() uses pr0 to detect spilled values.
+     * The first argument to load() specifies the destination register.
+     *
+     * IMPORTANT: If src1 has VT_LVAL but is NOT VT_LOCAL (i.e., it's a temporary
+     * holding a pointer address), we need to strip VT_LVAL - we want to load the
+     * ADDRESS from the spill slot, not dereference it. The actual LOAD operation
+     * will do the dereference.
+     * But for VT_LOCAL variables, VT_LVAL means "load value from stack", so we
+     * must keep it. */
+    int saved_r = q->src1.r;
+    int v = q->src1.r & VT_VALMASK;
+    if (v != VT_LOCAL && v != VT_LLOCAL)
+    {
+      q->src1.r &= ~VT_LVAL; /* Load raw value (the pointer), don't dereference */
+    }
+    load(scratch, &q->src1);
+    q->src1.r = saved_r; /* Restore original r for the actual operation */
+    q->src1.pr0 = scratch;
+    exclude_regs |= (1 << scratch);
+  }
+
+  /* Preload src2 if needed */
+  if (preload_src2 && tcc_ir_is_spilled(&q->src2) && !th_has_immediate_value(q->src2.r) &&
+      !tcc_ir_is_64bit(q->src2.type.t))
+  {
+    ctx.src2_spilled = 1;
+    ctx.src2_offset = q->src2.c.i;
+
+    /* Find a different free scratch register */
+    TCCIRState *ir = tcc_state->ir;
+    int scratch =
+        (ir) ? tcc_ls_find_free_scratch_reg(&ir->ls, ir->codegen_instruction_idx, exclude_regs, ir->leaffunc) : -1;
+    if (scratch < 0)
+    {
+      /* No free register - save one to stack and use it */
+      scratch = R_IP;
+      if (exclude_regs & (1 << R_IP))
+      {
+        for (int r = 0; r <= 3; ++r)
+        {
+          if (!(exclude_regs & (1 << r)))
+          {
+            scratch = r;
+            break;
+          }
+        }
+      }
+      ot_check(th_push(1 << scratch));
+      ctx.src2_reg_saved = 1;
+    }
+    ctx.src2_scratch_reg = scratch;
+
+    /* Call load BEFORE modifying pr0 - load() uses pr0 to detect spilled values.
+     * Same VT_LVAL handling as src1. */
+    int saved_r = q->src2.r;
+    int v = q->src2.r & VT_VALMASK;
+    if (v != VT_LOCAL && v != VT_LLOCAL)
+    {
+      q->src2.r &= ~VT_LVAL;
+    }
+    load(scratch, &q->src2);
+    q->src2.r = saved_r;
+    q->src2.pr0 = scratch;
+    exclude_regs |= (1 << scratch);
+  }
+
+  /* Setup dest if needed */
+  if (setup_dest && tcc_ir_is_spilled(&q->dest) && !tcc_ir_is_64bit(q->dest.type.t))
+  {
+    ctx.dest_spilled = 1;
+    ctx.dest_offset = q->dest.c.i;
+
+    /* Find a free scratch register for dest */
+    TCCIRState *ir = tcc_state->ir;
+    int scratch =
+        (ir) ? tcc_ls_find_free_scratch_reg(&ir->ls, ir->codegen_instruction_idx, exclude_regs, ir->leaffunc) : -1;
+    if (scratch < 0)
+    {
+      /* No free register - save one to stack and use it */
+      scratch = R_IP;
+      if (exclude_regs & (1 << R_IP))
+      {
+        for (int r = 0; r <= 3; ++r)
+        {
+          if (!(exclude_regs & (1 << r)))
+          {
+            scratch = r;
+            break;
+          }
+        }
+      }
+      ot_check(th_push(1 << scratch));
+      ctx.dest_reg_saved = 1;
+    }
+
+    q->dest.pr0 = scratch;
+    ctx.dest_scratch_reg = scratch; /* Save the scratch register used for storing back */
+  }
+
+  return ctx;
+}
+
+/* Restore any scratch registers that were saved during preload */
+void tcc_ir_restore_saved_scratch_regs(SpillContext *ctx)
+{
+  /* Restore in reverse order of saving (LIFO) */
+  if (ctx->dest_reg_saved && ctx->dest_scratch_reg >= 0)
+  {
+    ot_check(th_pop(1 << ctx->dest_scratch_reg));
+    ctx->dest_reg_saved = 0;
+  }
+  if (ctx->src2_reg_saved && ctx->src2_scratch_reg >= 0)
+  {
+    ot_check(th_pop(1 << ctx->src2_scratch_reg));
+    ctx->src2_reg_saved = 0;
+  }
+  if (ctx->src1_reg_saved && ctx->src1_scratch_reg >= 0)
+  {
+    ot_check(th_pop(1 << ctx->src1_scratch_reg));
+    ctx->src1_reg_saved = 0;
+  }
+}
+
+/* Store back a spilled destination after operation completes */
+void tcc_ir_storeback_spill(TACQuadruple *q, SpillContext *ctx)
+{
+  if (ctx->dest_spilled && !tcc_ir_is_64bit(q->dest.type.t))
+  {
+    q->dest.pr0 = ctx->orig_dest_pr0;
+    q->dest.r = VT_LOCAL;
+    q->dest.c.i = ctx->dest_offset;
+
+    /* Use the scratch register that was assigned during preload and contains the result */
+    int scratch = ctx->dest_scratch_reg;
+    if (scratch < 0)
+    {
+      /* Fallback: should not happen if preload was called correctly */
+      TCCIRState *ir = tcc_state->ir;
+      uint32_t exclude_regs = 0;
+      scratch =
+          (ir) ? tcc_ls_find_free_scratch_reg(&ir->ls, ir->codegen_instruction_idx, exclude_regs, ir->leaffunc) : -1;
+      if (scratch < 0)
+      {
+        /* Emergency fallback - save R_IP, use it, restore it */
+        scratch = R_IP;
+        ot_check(th_push(1 << scratch));
+        store(scratch, &q->dest);
+        ot_check(th_pop(1 << scratch));
+        return;
+      }
+    }
+
+    store(scratch, &q->dest);
+  }
+
+  /* Restore any saved scratch registers after the store is done */
+  tcc_ir_restore_saved_scratch_regs(ctx);
 }
 
 ST_FUNC void gen_fill_nops(int bytes)
@@ -789,13 +1068,9 @@ static thumb_opcode th_generic_mov_imm(uint32_t r, int imm)
 }
 int th_offset_to_reg(int off, int sign)
 {
-  /* Find a free scratch register - prefer R_IP (R12) over LR */
+  /* Find a free scratch register */
   uint32_t exclude_regs = 0;
-  TCCIRState *ir = tcc_state->ir;
-  int rr = (ir) ? tcc_ls_find_free_scratch_reg(&ir->ls, ir->codegen_instruction_idx, exclude_regs, ir->leaffunc) : R_IP;
-
-  if (rr < 0)
-    rr = R_IP;
+  int rr = get_free_scratch_reg(exclude_regs);
 
   /* if mov is not possible then load from data */
   if (!ot(th_generic_mov_imm(rr, off)))
@@ -1111,12 +1386,7 @@ void store(int r, SValue *sv)
         /* Load the address into a free scratch register.
          * Exclude the source register 'r' to avoid overwriting the value we want to store. */
         uint32_t exclude_regs = (1 << r);
-        TCCIRState *ir = tcc_state->ir;
-        int base_reg =
-            (ir) ? tcc_ls_find_free_scratch_reg(&ir->ls, ir->codegen_instruction_idx, exclude_regs, ir->leaffunc)
-                 : R_IP;
-        if (base_reg < 0)
-          base_reg = R_IP;
+        int base_reg = get_free_scratch_reg(exclude_regs);
 
         if (!load_word_from_base(base_reg, R_FP, addr_offset, addr_sign))
         {
@@ -1152,11 +1422,7 @@ void store(int r, SValue *sv)
         /* Find a free scratch register for loading global symbol address.
          * Exclude the source register 'r' to avoid overwriting the value we want to store. */
         uint32_t exclude_regs = (1 << r);
-        TCCIRState *ir = tcc_state->ir;
-        base = (ir) ? tcc_ls_find_free_scratch_reg(&ir->ls, ir->codegen_instruction_idx, exclude_regs, ir->leaffunc)
-                    : R_IP;
-        if (base < 0)
-          base = R_IP;
+        base = get_free_scratch_reg(exclude_regs);
 
         load(base, &v1);
         /* Cache this for subsequent accesses to same symbol */
@@ -1447,12 +1713,7 @@ static void load_full_const(int r, int r1, int64_t imm, struct Sym *sym)
 
             /* Find a free scratch register for literal pool entry */
             uint32_t exclude_regs = (1 << r); /* Exclude destination register */
-            TCCIRState *ir = tcc_state->ir;
-            int scratch =
-                (ir) ? tcc_ls_find_free_scratch_reg(&ir->ls, ir->codegen_instruction_idx, exclude_regs, ir->leaffunc)
-                     : R_IP;
-            if (scratch < 0)
-              scratch = R_IP;
+            int scratch = get_free_scratch_reg(exclude_regs);
 
             ot_check(th_ldr_literal(scratch, 0, 1));
             ot_check(
@@ -1488,12 +1749,7 @@ static void load_full_const(int r, int r1, int64_t imm, struct Sym *sym)
 
             /* Find a free scratch register for literal pool entry */
             uint32_t exclude_regs = (1 << r); /* Exclude destination register */
-            TCCIRState *ir = tcc_state->ir;
-            int scratch =
-                (ir) ? tcc_ls_find_free_scratch_reg(&ir->ls, ir->codegen_instruction_idx, exclude_regs, ir->leaffunc)
-                     : R_IP;
-            if (scratch < 0)
-              scratch = R_IP;
+            int scratch = get_free_scratch_reg(exclude_regs);
 
             ot_check(th_ldr_literal(scratch, 0, 1));
             ot_check(

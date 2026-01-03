@@ -56,142 +56,16 @@ static inline int tcc_ir_is_64bit_type(int t)
   return bt == VT_DOUBLE || bt == VT_LDOUBLE || bt == VT_LLONG;
 }
 
-/* Forward declaration of helper function from arm-thumb-gen.c */
-int th_has_immediate_value(int r);
-
 /* Check if an SValue operand is spilled (in memory) */
 int tcc_ir_is_spilled(SValue *sv)
 {
   return (sv->pr0 == -1) || (sv->pr0 & PREG_SPILLED);
 }
 
-/* Preload spilled operands into scratch registers before an operation.
- * Returns SpillContext with information for store-back.
- * Parameters:
- *   q: The IR quad instruction
- *   preload_src1: Whether to preload src1 if spilled
- *   preload_src2: Whether to preload src2 if spilled
- *   setup_dest: Whether to set up dest register if spilled
- */
-SpillContext tcc_ir_preload_spills(TACQuadruple *q, int preload_src1, int preload_src2, int setup_dest)
+/* Returns true if type is 64-bit (double, ldouble, or long long) - exported for machine code */
+int tcc_ir_is_64bit(int t)
 {
-  SpillContext ctx = {0};
-  ctx.is_64bit = tcc_ir_is_64bit_type(q->dest.type.t);
-  ctx.dest_scratch_reg = -1;
-  uint32_t exclude_regs = 0;
-
-  /* Save original register allocations */
-  ctx.orig_src1_pr0 = q->src1.pr0;
-  ctx.orig_src2_pr0 = q->src2.pr0;
-  ctx.orig_dest_pr0 = q->dest.pr0;
-
-  /* Preload src1 if needed */
-  if (preload_src1 && tcc_ir_is_spilled(&q->src1) && !th_has_immediate_value(q->src1.r) &&
-      !tcc_ir_is_64bit_type(q->src1.type.t))
-  {
-    ctx.src1_spilled = 1;
-    ctx.src1_offset = q->src1.c.i;
-
-    /* Find a free scratch register using liveness info */
-    TCCIRState *ir = tcc_state->ir;
-    int scratch = (ir) ? tcc_ls_find_free_scratch_reg(&ir->ls, ir->codegen_instruction_idx, exclude_regs, ir->leaffunc)
-                       : architecture_config.scratch_register;
-    if (scratch < 0)
-      scratch = architecture_config.scratch_register;
-
-    /* Call load BEFORE modifying pr0 - load() uses pr0 to detect spilled values.
-     * The first argument to load() specifies the destination register.
-     *
-     * IMPORTANT: If src1 has VT_LVAL but is NOT VT_LOCAL (i.e., it's a temporary
-     * holding a pointer address), we need to strip VT_LVAL - we want to load the
-     * ADDRESS from the spill slot, not dereference it. The actual LOAD operation
-     * will do the dereference.
-     * But for VT_LOCAL variables, VT_LVAL means "load value from stack", so we
-     * must keep it. */
-    int saved_r = q->src1.r;
-    int v = q->src1.r & VT_VALMASK;
-    if (v != VT_LOCAL && v != VT_LLOCAL)
-    {
-      q->src1.r &= ~VT_LVAL; /* Load raw value (the pointer), don't dereference */
-    }
-    load(scratch, &q->src1);
-    q->src1.r = saved_r; /* Restore original r for the actual operation */
-    q->src1.pr0 = scratch;
-    exclude_regs |= (1 << scratch);
-  }
-
-  /* Preload src2 if needed */
-  if (preload_src2 && tcc_ir_is_spilled(&q->src2) && !th_has_immediate_value(q->src2.r) &&
-      !tcc_ir_is_64bit_type(q->src2.type.t))
-  {
-    ctx.src2_spilled = 1;
-    ctx.src2_offset = q->src2.c.i;
-
-    /* Find a different free scratch register */
-    TCCIRState *ir = tcc_state->ir;
-    int scratch = (ir) ? tcc_ls_find_free_scratch_reg(&ir->ls, ir->codegen_instruction_idx, exclude_regs, ir->leaffunc)
-                       : architecture_config.scratch_register;
-    if (scratch < 0)
-      scratch = architecture_config.scratch_register;
-
-    /* Call load BEFORE modifying pr0 - load() uses pr0 to detect spilled values.
-     * Same VT_LVAL handling as src1. */
-    int saved_r = q->src2.r;
-    int v = q->src2.r & VT_VALMASK;
-    if (v != VT_LOCAL && v != VT_LLOCAL)
-    {
-      q->src2.r &= ~VT_LVAL;
-    }
-    load(scratch, &q->src2);
-    q->src2.r = saved_r;
-    q->src2.pr0 = scratch;
-    exclude_regs |= (1 << scratch);
-  }
-
-  /* Setup dest if needed */
-  if (setup_dest && tcc_ir_is_spilled(&q->dest) && !tcc_ir_is_64bit_type(q->dest.type.t))
-  {
-    ctx.dest_spilled = 1;
-    ctx.dest_offset = q->dest.c.i;
-
-    /* Find a free scratch register for dest */
-    TCCIRState *ir = tcc_state->ir;
-    int scratch = (ir) ? tcc_ls_find_free_scratch_reg(&ir->ls, ir->codegen_instruction_idx, exclude_regs, ir->leaffunc)
-                       : architecture_config.scratch_register;
-    if (scratch < 0)
-      scratch = architecture_config.scratch_register;
-
-    q->dest.pr0 = scratch;
-    ctx.dest_scratch_reg = scratch; /* Save the scratch register used for storing back */
-  }
-
-  return ctx;
-}
-
-/* Store back a spilled destination after operation completes */
-void tcc_ir_storeback_spill(TACQuadruple *q, SpillContext *ctx)
-{
-  if (ctx->dest_spilled && !tcc_ir_is_64bit_type(q->dest.type.t))
-  {
-    q->dest.pr0 = ctx->orig_dest_pr0;
-    q->dest.r = VT_LOCAL;
-    q->dest.c.i = ctx->dest_offset;
-
-    /* Use the scratch register that was assigned during preload and contains the result */
-    int scratch = ctx->dest_scratch_reg;
-    if (scratch < 0)
-    {
-      /* Fallback: should not happen if preload was called correctly */
-      TCCIRState *ir = tcc_state->ir;
-      uint32_t exclude_regs = 0;
-      scratch = (ir) ? tcc_ls_find_free_scratch_reg(&ir->ls, ir->codegen_instruction_idx, exclude_regs, ir->leaffunc)
-                     : architecture_config.scratch_register;
-      if (scratch < 0)
-        scratch = architecture_config.scratch_register;
-    }
-
-    store(scratch, &q->dest);
-  }
+  return tcc_ir_is_64bit_type(t);
 }
 
 void tcc_print_quadruple(TACQuadruple *q, int pc);

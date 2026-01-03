@@ -120,11 +120,15 @@ typedef struct SpillContext
 {
   int8_t orig_src1_pr0, orig_src2_pr0, orig_dest_pr0; // Original register allocations
   int8_t dest_scratch_reg;                            // Scratch register used for dest result
+  int8_t src1_scratch_reg, src2_scratch_reg;          // Scratch registers used for src operands
   int src1_offset, src2_offset, dest_offset;          // Stack offsets
   uint8_t src1_spilled : 1;                           // Whether src1 was in memory
   uint8_t src2_spilled : 1;                           // Whether src2 was in memory
   uint8_t dest_spilled : 1;                           // Whether dest was in memory
   uint8_t is_64bit : 1;                               // Whether operation is 64-bit
+  uint8_t src1_reg_saved : 1;                         // Whether src1 scratch reg was saved to stack
+  uint8_t src2_reg_saved : 1;                         // Whether src2 scratch reg was saved to stack
+  uint8_t dest_reg_saved : 1;                         // Whether dest scratch reg was saved to stack
 } SpillContext;
 
 typedef struct TCCIRState
@@ -217,10 +221,14 @@ void tcc_ir_print_vreg(int vreg);
 void tcc_ir_generate_cmp_jmp_set(TCCIRState *ir);
 void tcc_ir_start_basic_block(TCCIRState *ir);
 
-/* Spill handling helpers - centralized in generate_code */
+/* Machine-independent spill helpers (defined in tccir.c) */
 int tcc_ir_is_spilled(SValue *sv);
+int tcc_ir_is_64bit(int t);
+
+/* Machine-dependent spill handling (defined in machine-specific code, e.g., arm-thumb-gen.c) */
 SpillContext tcc_ir_preload_spills(TACQuadruple *q, int preload_src1, int preload_src2, int setup_dest);
 void tcc_ir_storeback_spill(TACQuadruple *q, SpillContext *ctx);
+void tcc_ir_restore_saved_scratch_regs(SpillContext *ctx);
 
 /* Check if FPU supports double precision (defined in arm-thumb-gen.c) */
 int arm_fpu_supports_double(int fpu_type);
