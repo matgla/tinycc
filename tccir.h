@@ -111,6 +111,19 @@ typedef struct IRLiveInterval
   int16_t original_offset; // for params: original offset from function entry point
 } IRLiveInterval;
 
+/* SpillContext: Tracks spilled register loading/storing for IR operations
+ * Used by generate_code to centralize spill handling before/after machine ops
+ */
+typedef struct SpillContext
+{
+  int8_t orig_src1_pr0, orig_src2_pr0, orig_dest_pr0; // Original register allocations
+  int src1_offset, src2_offset, dest_offset;          // Stack offsets
+  uint8_t src1_spilled : 1;                           // Whether src1 was in memory
+  uint8_t src2_spilled : 1;                           // Whether src2 was in memory
+  uint8_t dest_spilled : 1;                           // Whether dest was in memory
+  uint8_t is_64bit : 1;                               // Whether operation is 64-bit
+} SpillContext;
+
 typedef struct TCCIRState
 {
   // number of function parameters
@@ -194,6 +207,11 @@ int tcc_ir_return_value_optimization(TCCIRState *ir);
 void tcc_ir_print_vreg(int vreg);
 void tcc_ir_generate_cmp_jmp_set(TCCIRState *ir);
 void tcc_ir_start_basic_block(TCCIRState *ir);
+
+/* Spill handling helpers - centralized in generate_code */
+int tcc_ir_is_spilled(SValue *sv);
+SpillContext tcc_ir_preload_spills(TACQuadruple *q, int preload_src1, int preload_src2, int setup_dest);
+void tcc_ir_storeback_spill(TACQuadruple *q, SpillContext *ctx);
 
 /* Check if FPU supports double precision (defined in arm-thumb-gen.c) */
 int arm_fpu_supports_double(int fpu_type);

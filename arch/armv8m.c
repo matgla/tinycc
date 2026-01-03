@@ -27,6 +27,7 @@ ArchitectureConfig architecture_config = {
     .stack_align = 8,
     .reg_size = 4,
     .scratch_register = R_IP,
+    .second_scratch_register = R_LR,
     .parameter_registers = 4,
     .has_fpu = 0,
 };

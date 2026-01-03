@@ -7870,7 +7870,7 @@ ST_FUNC int expr_const(void)
 #ifndef TCC_TARGET_ARM64
 static void gfunc_return(CType *func_type)
 {
-
+  printf("DEBUG gfunc_return: entry, func_type->t=0x%x\n", func_type->t);
   if ((func_type->t & VT_BTYPE) == VT_STRUCT)
   {
     CType type, ret_type;
@@ -7947,6 +7947,7 @@ static void gfunc_return(CType *func_type)
       vtop->r = 0; /* no longer an lvalue */
     }
     tcc_ir_generate_cmp_jmp_set(tcc_state->ir);
+    printf("DEBUG gfunc_return: before RETURNVALUE, vtop->r = 0x%x, VT_LVAL=%d\n", vtop->r, !!(vtop->r & VT_LVAL));
     tcc_ir_put(tcc_state->ir, TCCIR_OP_RETURNVALUE, vtop, NULL, NULL);
   }
   vtop--; /* NOT vpop() because on x86 it would flush the fp stack */

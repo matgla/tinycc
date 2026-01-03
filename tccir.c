@@ -54,6 +54,78 @@ static inline int tcc_ir_is_64bit_type(int t)
   return bt == VT_DOUBLE || bt == VT_LDOUBLE || bt == VT_LLONG;
 }
 
+/* Forward declaration of helper function from arm-thumb-gen.c */
+int th_has_immediate_value(int r);
+
+/* Check if an SValue operand is spilled (in memory) */
+int tcc_ir_is_spilled(SValue *sv)
+{
+  return (sv->pr0 == -1) || (sv->pr0 & PREG_SPILLED);
+}
+
+/* Preload spilled operands into scratch registers before an operation.
+ * Returns SpillContext with information for store-back.
+ * Parameters:
+ *   q: The IR quad instruction
+ *   preload_src1: Whether to preload src1 if spilled
+ *   preload_src2: Whether to preload src2 if spilled
+ *   setup_dest: Whether to set up dest register if spilled
+ */
+SpillContext tcc_ir_preload_spills(TACQuadruple *q, int preload_src1, int preload_src2, int setup_dest)
+{
+  SpillContext ctx = {0};
+  ctx.is_64bit = tcc_ir_is_64bit_type(q->dest.type.t);
+
+  /* Save original register allocations */
+  ctx.orig_src1_pr0 = q->src1.pr0;
+  ctx.orig_src2_pr0 = q->src2.pr0;
+  ctx.orig_dest_pr0 = q->dest.pr0;
+
+  /* Preload src1 if needed */
+  if (preload_src1 && tcc_ir_is_spilled(&q->src1) && !tcc_ir_is_64bit_type(q->src1.type.t))
+  {
+    ctx.src1_spilled = 1;
+    ctx.src1_offset = q->src1.c.i;
+    q->src1.pr0 = architecture_config.scratch_register;
+    tcc_gen_machine_load_register(&q->src1);
+  }
+
+  /* Preload src2 if needed */
+  if (preload_src2 && tcc_ir_is_spilled(&q->src2) && !th_has_immediate_value(q->src2.r) &&
+      !tcc_ir_is_64bit_type(q->src2.type.t))
+  {
+    ctx.src2_spilled = 1;
+    ctx.src2_offset = q->src2.c.i;
+    /* Use second_scratch if src1 also uses first scratch, otherwise use first scratch */
+    int src2_scratch =
+        ctx.src1_spilled ? architecture_config.second_scratch_register : architecture_config.scratch_register;
+    q->src2.pr0 = src2_scratch;
+    tcc_gen_machine_load_register(&q->src2);
+  }
+
+  /* Setup dest if needed */
+  if (setup_dest && tcc_ir_is_spilled(&q->dest) && !tcc_ir_is_64bit_type(q->dest.type.t))
+  {
+    ctx.dest_spilled = 1;
+    ctx.dest_offset = q->dest.c.i;
+    q->dest.pr0 = architecture_config.scratch_register;
+  }
+
+  return ctx;
+}
+
+/* Store back a spilled destination after operation completes */
+void tcc_ir_storeback_spill(TACQuadruple *q, SpillContext *ctx)
+{
+  if (ctx->dest_spilled && !tcc_ir_is_64bit_type(q->dest.type.t))
+  {
+    q->dest.pr0 = ctx->orig_dest_pr0;
+    q->dest.r = VT_LOCAL;
+    q->dest.c.i = ctx->dest_offset;
+    store(architecture_config.scratch_register, &q->dest);
+  }
+}
+
 void tcc_print_quadruple(TACQuadruple *q, int pc);
 void tcc_ir_print_vreg(int vreg);
 
@@ -787,7 +859,10 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
         tcc_ir_set_llong_type(ir, dest->vr);
       }
       dest_interval = tcc_ir_get_live_interval(ir, dest->vr);
-      dest_interval->is_lvalue = 1;
+      /* For LOAD operations, the destination contains the loaded VALUE, not an address,
+       * so it should NOT be marked as an lvalue. For other operations that produce
+       * addresses or variables, keep is_lvalue=1. */
+      dest_interval->is_lvalue = (op != TCCIR_OP_LOAD);
       if (dest_interval->start == INTERVAL_NOT_STARTED)
       {
         dest_interval->start = ir->next_instruction_index;
@@ -853,16 +928,6 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
   }
 
   ir->next_instruction_index++;
-
-  /* Debug: track corruption of instruction 0 */
-  if (pos > 0 && ir->instructions[0].op == TCCIR_OP_STORE)
-  {
-    int ci = ir->instructions[0].dest.c.i;
-    if (ci != 0)
-    {
-      printf("DEBUG CORRUPTION: After adding instr %d (op=%d), instr[0].dest.c.i became %d!\n", pos, op, ci);
-    }
-  }
 
   return pos;
 }
@@ -1287,11 +1352,6 @@ void tcc_ir_patch_live_intervals_registers(TCCIRState *ir)
   for (int i = 0; i < ir->ls.next_interval_index; ++i)
   {
     LSLiveInterval *interval = &ir->ls.intervals[i];
-    if (interval->vreg == 0x20000004) /* Debug TMP:4 */
-    {
-      printf("DEBUG patch_intervals: Interval %d, vreg=TMP:4, stack_location=%d, r0=%d\n", i,
-             (int)interval->stack_location, (int)interval->r0);
-    }
     tcc_ir_assign_physical_register(ir, interval->vreg, interval->stack_location, interval->r0, interval->r1);
   }
 }
@@ -1299,11 +1359,6 @@ void tcc_ir_patch_live_intervals_registers(TCCIRState *ir)
 void tcc_ir_assign_physical_register(TCCIRState *ir, int vreg, int offset, int r0, int r1)
 {
   IRLiveInterval *interval = tcc_ir_get_live_interval(ir, vreg);
-  if (vreg == 0x20000004) /* Debug TMP:4 */
-  {
-    printf("DEBUG assign_physical_register: vreg=TMP:4, offset=%d, r0=%d, setting pr0 to %d\n", offset, r0,
-           (offset != 0) ? PREG_SPILLED : r0);
-  }
   /* If variable is spilled (offset != 0), mark r0 with PREG_SPILLED flag */
   if (offset != 0)
   {
@@ -2462,69 +2517,130 @@ void tcc_ir_generate_code(TCCIRState *ir)
     // emit debug line info for this IR instruction AFTER recording ind
     tcc_debug_line_num(tcc_state, q->line_num);
 
+    /* Fill in register allocations before deciding on preload strategy */
     if (irop_config[q->op].has_src1 == 1)
     {
       tcc_ir_fill_registers(ir, &q->src1);
-      if (q->op != TCCIR_OP_FUNCCALLVAL && q->op != TCCIR_OP_FUNCCALLVOID && q->op != TCCIR_OP_FUNCPARAMVAL &&
-          q->op != TCCIR_OP_FUNCPARAMVOID && q->op != TCCIR_OP_ASSIGN)
-      {
-        if (tcc_ir_operand_in_memory(&q->src1))
-        {
-          /* Skip 64-bit types here - they need special handling with register
-           * pairs, which individual operation handlers provide. Using R12 alone
-           * doesn't work because R12+1 = R13 = SP. */
-          if (!tcc_ir_is_64bit_type(q->src1.type.t))
-          {
-            /* For spilled variables, the load() function needs pr0 to have
-             * PREG_SPILLED flag to know to load from stack. So we temporarily
-             * change pr0 to destination register only for the actual load call. */
-            int8_t orig_pr0 = q->src1.pr0;
-            q->src1.pr0 = architecture_config.scratch_register;
-            tcc_gen_machine_load_register(&q->src1);
-            /* Keep pr0 as scratch register after loading (don't restore orig_pr0)
-             * because the value is now in the scratch register. */
-          }
-        }
-      }
     }
-
     if (irop_config[q->op].has_src2 == 1)
     {
       tcc_ir_fill_registers(ir, &q->src2);
-      if (tcc_ir_operand_in_memory(&q->src2))
-      {
-        /* Skip 64-bit types - need special handling */
-        if (!tcc_ir_is_64bit_type(q->src2.type.t))
-        {
-          q->src2.pr0 = architecture_config.scratch_register;
-          tcc_gen_machine_load_register(&q->src2);
-        }
-      }
     }
-
     if (irop_config[q->op].has_dest == 1)
     {
       tcc_ir_fill_registers(ir, &q->dest);
-      /* Don't pre-load destination to scratch register for operations that
-       * handle their own destination storage (e.g., float conversions that
-       * may need to store to spilled stack locations, or arithmetic ops
-       * that handle spilled dest in tcc_gen_machine_data_processing_op) */
-      if (tcc_ir_operand_in_memory(&q->dest) && (q->op != TCCIR_OP_ASSIGN) && (q->op != TCCIR_OP_STORE) &&
-          (q->op != TCCIR_OP_CVT_FTOF) && (q->op != TCCIR_OP_CVT_ITOF) && (q->op != TCCIR_OP_CVT_FTOI) &&
-          (q->op != TCCIR_OP_FUNCCALLVAL) &&
-          /* Data processing ops handle spilled dest themselves */
-          (q->op != TCCIR_OP_ADD) && (q->op != TCCIR_OP_SUB) && (q->op != TCCIR_OP_MUL) && (q->op != TCCIR_OP_AND) &&
-          (q->op != TCCIR_OP_OR) && (q->op != TCCIR_OP_XOR) && (q->op != TCCIR_OP_SHL) && (q->op != TCCIR_OP_SHR) &&
-          (q->op != TCCIR_OP_SAR))
-      {
-        /* Skip 64-bit types - need special handling */
-        if (!tcc_ir_is_64bit_type(q->dest.type.t))
-        {
-          q->dest.pr0 = architecture_config.scratch_register;
-          tcc_gen_machine_load_register(&q->dest);
-        }
-      }
     }
+
+    /* Determine preload strategy based on operation type */
+    SpillContext spill_ctx = {0};
+    int preload_src1 = 0, preload_src2 = 0, setup_dest = 0;
+
+    switch (q->op)
+    {
+    /* Data processing ops: Load both sources and setup dest */
+    case TCCIR_OP_ADD:
+    case TCCIR_OP_SUB:
+    case TCCIR_OP_MUL:
+    case TCCIR_OP_UMULL:
+    case TCCIR_OP_AND:
+    case TCCIR_OP_OR:
+    case TCCIR_OP_XOR:
+    case TCCIR_OP_SHL:
+    case TCCIR_OP_SHR:
+    case TCCIR_OP_SAR:
+    case TCCIR_OP_DIV:
+    case TCCIR_OP_UDIV:
+    case TCCIR_OP_ADC_GEN:
+    case TCCIR_OP_ADC_USE:
+      preload_src1 = 1;
+      preload_src2 = 1;
+      setup_dest = 1;
+      break;
+
+    /* Comparison ops: Load both sources, no dest writeback */
+    case TCCIR_OP_CMP:
+    case TCCIR_OP_TEST_ZERO:
+      preload_src1 = 1;
+      preload_src2 = (q->op == TCCIR_OP_CMP) ? 1 : 0;
+      setup_dest = 0;
+      break;
+
+    /* FP operations: Load both sources and setup dest */
+    case TCCIR_OP_FADD:
+    case TCCIR_OP_FSUB:
+    case TCCIR_OP_FMUL:
+    case TCCIR_OP_FDIV:
+    case TCCIR_OP_FNEG:
+    case TCCIR_OP_FCMP:
+    case TCCIR_OP_CVT_FTOF:
+    case TCCIR_OP_CVT_ITOF:
+    case TCCIR_OP_CVT_FTOI:
+      preload_src1 = 1;
+      preload_src2 = (q->op != TCCIR_OP_FNEG && q->op != TCCIR_OP_CVT_FTOF && q->op != TCCIR_OP_CVT_ITOF &&
+                      q->op != TCCIR_OP_CVT_FTOI)
+                         ? 1
+                         : 0;
+      setup_dest = 1;
+      break;
+
+    /* Load/Store operations */
+    case TCCIR_OP_LOAD:
+      preload_src1 = 0; /* src1 is address, not data */
+      preload_src2 = 0;
+      setup_dest = 1;
+      break;
+
+    case TCCIR_OP_STORE:
+      preload_src1 = 1; /* src1 is the value to store */
+      preload_src2 = 0; /* src2 is address */
+      setup_dest = 0;   /* dest is address, not a result */
+      break;
+
+    /* Assign/Move operations */
+    case TCCIR_OP_ASSIGN:
+      preload_src1 = 1;
+      preload_src2 = 0;
+      setup_dest = 1;
+      break;
+
+    /* Control flow - no preload for addresses */
+    case TCCIR_OP_JUMP:
+    case TCCIR_OP_JUMPIF:
+    case TCCIR_OP_SETIF:
+      preload_src1 = (q->op == TCCIR_OP_SETIF) ? 0 : 0; /* SETIF reads flags, JUMP ignores src */
+      preload_src2 = 0;
+      setup_dest = (q->op == TCCIR_OP_SETIF) ? 1 : 0;
+      break;
+
+    /* Return and function call operations */
+    case TCCIR_OP_RETURNVALUE:
+      preload_src1 = 1;
+      preload_src2 = 0;
+      setup_dest = 0;
+      break;
+
+    case TCCIR_OP_FUNCCALLVAL:
+    case TCCIR_OP_FUNCCALLVOID:
+      preload_src1 = 0; /* Function pointer, handled specially */
+      preload_src2 = 0;
+      setup_dest = (q->op == TCCIR_OP_FUNCCALLVAL) ? 1 : 0;
+      break;
+
+    /* Default: no preload */
+    case TCCIR_OP_FUNCPARAMVAL:
+    case TCCIR_OP_FUNCPARAMVOID:
+    case TCCIR_OP_RETURNVOID:
+    case TCCIR_OP_BOOL_OR:
+    case TCCIR_OP_BOOL_AND:
+    default:
+      preload_src1 = 0;
+      preload_src2 = 0;
+      setup_dest = 0;
+      break;
+    }
+
+    /* Execute preload */
+    spill_ctx = tcc_ir_preload_spills(q, preload_src1, preload_src2, setup_dest);
 
     switch (q->op)
     {
@@ -2545,6 +2661,8 @@ void tcc_ir_generate_code(TCCIRState *ir)
     case TCCIR_OP_ADC_GEN:
     case TCCIR_OP_ADC_USE:
       tcc_gen_machine_data_processing_op(q);
+      /* Store back spilled dest */
+      tcc_ir_storeback_spill(q, &spill_ctx);
       break;
     case TCCIR_OP_FADD:
     case TCCIR_OP_FSUB:
@@ -2556,6 +2674,8 @@ void tcc_ir_generate_code(TCCIRState *ir)
     case TCCIR_OP_CVT_ITOF:
     case TCCIR_OP_CVT_FTOI:
       tcc_gen_machine_fp_op(q);
+      /* Store back spilled dest */
+      tcc_ir_storeback_spill(q, &spill_ctx);
       break;
     case TCCIR_OP_LOAD:
     {
@@ -2572,6 +2692,8 @@ void tcc_ir_generate_code(TCCIRState *ir)
         }
       }
       tcc_gen_machine_load_op(q);
+      /* Store back spilled dest */
+      tcc_ir_storeback_spill(q, &spill_ctx);
       break;
     }
     case TCCIR_OP_STORE:
@@ -2614,6 +2736,8 @@ void tcc_ir_generate_code(TCCIRState *ir)
           q->dest.pr1 = REG_IRE2; /* R1 */
       }
       tcc_gen_machine_assign_op(q);
+      /* Store back spilled dest */
+      tcc_ir_storeback_spill(q, &spill_ctx);
       break;
     }
     case TCCIR_OP_FUNCPARAMVAL:
@@ -2630,6 +2754,8 @@ void tcc_ir_generate_code(TCCIRState *ir)
       break;
     case TCCIR_OP_SETIF:
       tcc_gen_machine_setif_op(q);
+      /* Store back spilled dest */
+      tcc_ir_storeback_spill(q, &spill_ctx);
       break;
     case TCCIR_OP_BOOL_OR:
     case TCCIR_OP_BOOL_AND:
@@ -2655,6 +2781,8 @@ void tcc_ir_generate_code(TCCIRState *ir)
       tcc_gen_machine_func_call_op(q, drop_return_value, ir, call_idx);
       /* Restore outer call's arguments if this was a nested call */
       ir_to_code_mapping[i] = ind;
+      /* Store back spilled dest */
+      tcc_ir_storeback_spill(q, &spill_ctx);
       break;
     }
     default:

@@ -199,6 +199,8 @@ enum
 #include "arch/fpu/arm/fpv5-sp-d16.h"
 #include "arm-thumb-opcodes.h"
 
+int load_word_from_base(int ir, int base, int fc, int sign);
+
 /* Helper to validate a Sym pointer - returns NULL if invalid/unusable for relocation */
 static inline Sym *validate_sym_for_reloc(Sym *sym)
 {
@@ -278,6 +280,10 @@ ST_DATA const int reg_classes[NB_REGS] = {
 int is_valid_opcode(thumb_opcode op);
 int ot(thumb_opcode op);
 static void load_to_register(int reg, int reg_from, SValue *src);
+int th_has_immediate_value(int r);
+int load_word_from_base(int ir, int base, int fc, int sign);
+int th_offset_to_reg(int offset, int sign);
+
 static int th_is_caller_saved_register(int reg)
 {
   if (tcc_state->text_and_data_separation && reg == R9)
@@ -1336,7 +1342,27 @@ void store(int r, SValue *sv)
     uint32_t base = R_FP;
     if (v < VT_CONST)
     {
-      base = sv->pr0;
+      /* Check if pr0 is valid (not -1 and not spilled) */
+      if (sv->pr0 >= 0 && !(sv->pr0 & PREG_SPILLED))
+      {
+        base = sv->pr0;
+      }
+      else
+      {
+        /* pr0 is spilled or invalid - need to load the address from stack.
+         * The address is stored at the stack location in sv->c.i */
+        int addr_offset = sv->c.i;
+        int addr_sign = (addr_offset < 0);
+        if (addr_sign)
+          addr_offset = -addr_offset;
+        /* Load the address into R_LR (use LR as scratch since R12 may be used for value) */
+        if (!load_word_from_base(R_LR, R_FP, addr_offset, addr_sign))
+        {
+          int rr = th_offset_to_reg(addr_offset, addr_sign);
+          ot_check(th_ldr_reg(R_LR, R_FP, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+        }
+        base = R_LR;
+      }
       v = VT_LOCAL;
       fc = sign = 0;
     }
@@ -2049,10 +2075,21 @@ void load_to_dest(SValue *dest, SValue *sv)
     }
     else if (v < VT_CONST)
     {
-      /* Check if spilled - if so, use FP-relative with offset from c.i */
+      /* For spilled lvalues, we need two-level indirection:
+       * 1. Load the pointer from spill location [FP + spill_offset]
+       * 2. Dereference that pointer to get the final value
+       * For non-spilled, the pointer is already in a register (pr0). */
       if (sv->pr0 & PREG_SPILLED)
       {
-        base = R_FP;
+        SValue v1;
+        memset(&v1, 0, sizeof(SValue));
+        v1.type.t = VT_PTR;
+        v1.r = VT_LOCAL | VT_LVAL;
+        v1.c.i = sv->c.i;
+
+        TRACE("load_to_dest: loading spilled lvalue address from [FP%+lld]", (long long)fc);
+        load(base = 14, &v1); /* Load pointer into R14 first */
+        fc = sign = 0;        /* Dereference with offset 0 from loaded pointer */
         v = VT_LOCAL;
       }
       else
@@ -2200,10 +2237,20 @@ void load(int r, SValue *sv)
     }
     else if (v < VT_CONST)
     {
-      /* Check if spilled - if so, use FP-relative with offset from c.i */
+      /* For spilled lvalues, we need two-level indirection:
+       * 1. Load the pointer from spill location [FP + spill_offset]
+       * 2. Dereference that pointer to get the final value
+       * For non-spilled, the pointer is already in a register (pr0). */
       if (sv->pr0 & PREG_SPILLED)
       {
-        base = R_FP;
+        SValue v1;
+        memset(&v1, 0, sizeof(SValue));
+        v1.type.t = VT_PTR;
+        v1.r = VT_LOCAL | VT_LVAL;
+        v1.c.i = sv->c.i;
+
+        load(base = 14, &v1); /* Load pointer into R14 first */
+        fc = sign = 0;        /* Dereference with offset 0 from loaded pointer */
         v = VT_LOCAL;
       }
       else
@@ -2455,7 +2502,7 @@ ST_FUNC void gen_increment_tcov(SValue *sv)
   TRACE("'gen_increment_tcov'");
 }
 
-static int th_has_immediate_value(int r)
+int th_has_immediate_value(int r)
 {
   return (r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST;
 }
@@ -2476,59 +2523,8 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
   /* Check for 64-bit operations */
   int is_64bit = is_64bit_type(op->dest.type.t);
 
-  /* Check if destination is spilled (on stack) - if so, use R12 as temp */
-  /* Priority: if pr0 is valid and not spilled, use it; otherwise check if it's in memory */
-  int dest_spilled = (op->dest.pr0 == -1) || (op->dest.pr0 & PREG_SPILLED);
-  int orig_dest_pr0 = op->dest.pr0;
-
-  /* Check if source operands are spilled too */
-  /* Only treat as spilled if NOT allocated to a register */
-  int src1_spilled = (op->src1.pr0 == -1) || (op->src1.pr0 & PREG_SPILLED);
-  int src2_spilled = (op->src2.pr0 == -1) || (op->src2.pr0 & PREG_SPILLED);
-  int orig_src1_pr0 = op->src1.pr0;
-  int orig_src2_pr0 = op->src2.pr0;
-
-  /* Load spilled source operands before the operation */
-  if (src1_spilled && op->op != TCCIR_OP_CMP && op->op != TCCIR_OP_TEST_ZERO)
-  {
-    /* Load src1 from memory to R12 */
-    if (is_64bit)
-    {
-      /* For 64-bit, we need two registers */
-      SValue src1_low = op->src1;
-      src1_low.type.t = VT_INT;
-      load(R12, &src1_low);
-
-      SValue src1_high = op->src1;
-      src1_high.type.t = VT_INT;
-      src1_high.c.i += 4;
-      load(R_LR, &src1_high);
-
-      op->src1.pr0 = R12;
-      op->src1.pr1 = R_LR;
-    }
-    else
-    {
-      load(R12, &op->src1);
-      op->src1.pr0 = R12;
-    }
-  }
-
-  if (dest_spilled && op->op != TCCIR_OP_CMP && op->op != TCCIR_OP_TEST_ZERO)
-  {
-    /* For operations that produce a result to be stored, dest will be R12 (same as src1) */
-    op->dest.pr0 = R12;
-    if (is_64bit && op->dest.pr1 == -1)
-    {
-      op->dest.pr1 = R_LR; /* Use LR as second scratch for 64-bit ops */
-    }
-  }
-
-  if (src2_spilled && op->op != TCCIR_OP_CMP && op->op != TCCIR_OP_TEST_ZERO && !th_has_immediate_value(op->src2.r))
-  {
-    /* Load src2 from memory - but this is handled later in the function for imm case */
-    /* For now, just note that src2 needs loading */
-  }
+  /* NOTE: All spilled register loading is now handled centrally in generate_code via
+   * tcc_ir_preload_spills. This function receives valid physical registers in pr0/pr1. */
 
   switch (op->op)
   {
@@ -2683,32 +2679,6 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
   {
     ot_check(handler.reg_handler(op->dest.pr0, op->src1.pr0, op->src2.pr0, flags, THUMB_SHIFT_DEFAULT,
                                  ENFORCE_ENCODING_NONE));
-  }
-
-  /* If destination was spilled, store the result from R12 to memory.
-   * Skip for CMP and TEST_ZERO which don't produce a result (just set flags) */
-  if (dest_spilled && op->op != TCCIR_OP_CMP && op->op != TCCIR_OP_TEST_ZERO)
-  {
-    op->dest.pr0 = orig_dest_pr0; /* Restore original pr0 for store() */
-    /* Ensure dest.r has VT_LOCAL set so store() uses FP-relative addressing */
-    op->dest.r = VT_LOCAL;
-    if (is_64bit)
-    {
-      /* Store both registers for 64-bit result */
-      SValue dest_low = op->dest;
-      dest_low.type.t = VT_INT;
-      store(R12, &dest_low);
-
-      SValue dest_high = op->dest;
-      dest_high.type.t = VT_INT;
-      dest_high.c.i += 4;
-      store(R_LR, &dest_high);
-    }
-    else
-    {
-      /* Store single register for 32-bit result */
-      store(R12, &op->dest);
-    }
   }
 }
 
@@ -3289,45 +3259,31 @@ ST_FUNC void tcc_gen_machine_return_value_op(TACQuadruple *q)
 {
   int is_64bit = is_64bit_type(q->src1.type.t);
 
-  /* If source is an lvalue (memory location), load directly to R0 */
-  if (q->src1.r & VT_LVAL)
-  {
-    load(R0, &q->src1);
-    if (is_64bit)
-    {
-      /* For 64-bit, need to load high word to R1 */
-      SValue hi = q->src1;
-      hi.c.i += 4;
-      load(R1, &hi);
-    }
-    return;
-  }
-
-  if (q->src1.pr0 >= 0 && !(q->src1.pr0 & PREG_SPILLED))
+  /* NOTE: src1 is preloaded to a valid register by generate_code if it was spilled.
+   * Just move to return registers R0 (and R1 for 64-bit). */
+  if (q->src1.pr0 >= 0)
   {
     load_to_register(R0, q->src1.pr0, &q->src1);
-    if (is_64bit)
+    if (is_64bit && q->src1.pr1 >= 0)
     {
       load_to_register(R1, q->src1.pr1, &q->src1);
     }
     return;
   }
-  else
-  {
-    SValue dest;
-    dest.pr0 = R0;
-    dest.pr1 = -1;
-    if (is_64bit)
-    {
-      dest.pr1 = R1;
-    }
-    return load_to_dest(&dest, &q->src1);
-  }
+
+  /* If we get here with invalid pr0, handle constant case */
+  SValue dest;
+  dest.pr0 = R0;
+  dest.pr1 = is_64bit ? R1 : -1;
+  return load_to_dest(&dest, &q->src1);
 }
 
 void tcc_gen_machine_load_op(TACQuadruple *op)
 {
   TRACE("'tcc_gen_machine_load_op'");
+
+  /* NOTE: All spilled dest handling is now done centrally in generate_code.
+   * This function just loads from the source address to the destination register. */
   load_to_dest(&op->dest, &op->src1);
 }
 
@@ -3340,83 +3296,10 @@ ST_FUNC void tcc_gen_machine_store_op(TACQuadruple *op)
   int src_btype = op->src1.type.t & VT_BTYPE;
   int is_64bit = (src_btype == VT_DOUBLE) || (src_btype == VT_LDOUBLE) || (src_btype == VT_LLONG);
 
-  /* Debug output */
-  TRACE("STORE DEBUG: src1.vr=%d, src1.r=0x%x (VT_LVAL=%d), src1.pr0=%d, PREG_SPILLED=%d", op->src1.vr, op->src1.r,
-        (op->src1.r & VT_LVAL) ? 1 : 0, op->src1.pr0, (op->src1.pr0 & PREG_SPILLED) ? 1 : 0);
-
-  /* FIXED: Check for valid register allocation FIRST, before checking VT_LVAL.
-   * For register-allocated variables (like VAR:0 in R5), we should use the
-   * register directly even if VT_LVAL is set. VT_LVAL check should only apply
-   * when there's no valid register (i.e., pr0 < 0 or spilled). */
-  if (op->src1.pr0 >= 0 && !(op->src1.pr0 & PREG_SPILLED))
-  {
-    /* Have a valid register allocation with actual value - use it directly */
-    TRACE("STORE: Using register-allocated value from R%d", op->src1.pr0);
-    src_reg = op->src1.pr0;
-    store(src_reg, &op->dest);
-  }
-  else if (op->src1.r & VT_LVAL)
-  {
-    /* Source is an lvalue that needs dereferencing (no valid register) */
-    TRACE("STORE: Loading lvalue from memory");
-    load(R12, &op->src1);
-    src_reg = R12;
-    store(src_reg, &op->dest);
-  }
-  else if (op->src1.pr0 == -1 || (op->src1.pr0 & PREG_SPILLED))
-  {
-    /* Need to load: no register, spilled, or lvalue that needs dereferencing */
-    if (is_64bit)
-    {
-      /* For 64-bit values, we need to copy both 32-bit words separately.
-       * The source is at sv->c.i (spilled location), dest is at op->dest.c.i */
-      int src_offset = op->src1.c.i;
-      int dst_offset = op->dest.c.i;
-
-      /* Load and store low word */
-      int src_sign = (src_offset < 0);
-      if (src_sign)
-        src_offset = -src_offset;
-      if (!load_word_from_base(R12, R_FP, src_offset, src_sign))
-      {
-        int rr = th_offset_to_reg(src_offset, src_sign);
-        ot_check(th_ldr_reg(R12, R_FP, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-      }
-
-      SValue dest_low = op->dest;
-      dest_low.type.t = VT_INT;
-      store(R12, &dest_low);
-
-      /* Load and store high word (offset +4 from low word) */
-      int high_src_offset = op->src1.c.i + 4;
-      int high_src_sign = (high_src_offset < 0);
-      if (high_src_sign)
-        high_src_offset = -high_src_offset;
-      if (!load_word_from_base(R12, R_FP, high_src_offset, high_src_sign))
-      {
-        int rr = th_offset_to_reg(high_src_offset, high_src_sign);
-        ot_check(th_ldr_reg(R12, R_FP, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-      }
-
-      SValue dest_high = op->dest;
-      dest_high.type.t = VT_INT;
-      dest_high.c.i += 4;
-      store(R12, &dest_high);
-    }
-    else
-    {
-      load(R12, &op->src1);
-      src_reg = R12;
-      store(src_reg, &op->dest);
-    }
-  }
-  else
-  {
-    /* No special handling needed - should not reach here if above conditions are correct */
-    TRACE("STORE: Using register from pr0=%d (fallback)", op->src1.pr0);
-    src_reg = op->src1.pr0;
-    store(src_reg, &op->dest);
-  }
+  /* NOTE: src1 is preloaded to a valid register by generate_code if it was spilled.
+   * Just use pr0 directly. */
+  src_reg = op->src1.pr0;
+  store(src_reg, &op->dest);
 }
 
 ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int stack_size)
@@ -3605,102 +3488,13 @@ ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *op)
   int src_btype = op->src1.type.t & VT_BTYPE;
   int is_64bit = (dest_btype == VT_DOUBLE) || (dest_btype == VT_LDOUBLE) || (dest_btype == VT_LLONG) ||
                  (src_btype == VT_DOUBLE) || (src_btype == VT_LDOUBLE) || (src_btype == VT_LLONG);
-  int dest_spilled = (op->dest.pr0 == -1) || (op->dest.pr0 == (int8_t)PREG_SPILLED) || (op->dest.pr0 & PREG_SPILLED);
   int dest_is_local = (op->dest.r & VT_VALMASK) == VT_LOCAL;
 
-  TRACE("ASSIGN DEBUG: dest.vr=%d, dest.r=0x%x (VT_LOCAL=%d), dest.pr0=%d, src1.pr0=%d, dest_spilled=%d", op->dest.vr,
-        op->dest.r, dest_is_local, op->dest.pr0, op->src1.pr0, dest_spilled);
+  TRACE("ASSIGN DEBUG: dest.vr=%d, dest.r=0x%x (VT_LOCAL=%d), dest.pr0=%d, src1.pr0=%d", op->dest.vr, op->dest.r,
+        dest_is_local, op->dest.pr0, op->src1.pr0);
 
-  if (dest_spilled)
-  {
-    /* Spilled destination - store via integer register.
-     * Ensure dest.r has VT_LOCAL set so store() uses FP-relative addressing */
-    op->dest.r = VT_LOCAL;
-
-    if (src_is_vfp)
-    {
-      int sn = LS_VFP_REG_NUM(op->src1.pr0);
-      /* Move VFP to integer register, then store */
-      ot_check(th_vmov_gp_sp(R12, sn, 1)); /* VMOV r12, Sn */
-      store(R12, &op->dest);
-    }
-    else if (op->src1.pr0 >= 0 && !(op->src1.pr0 & PREG_SPILLED))
-    {
-      /* Source is in a valid register - use it directly */
-      store(op->src1.pr0, &op->dest);
-    }
-    else if ((op->src1.r & VT_VALMASK) == VT_CONST)
-    {
-      /* Source is a constant - load to temp register and store */
-      if (is_64bit)
-      {
-        /* For 64-bit constants, we need to store both words */
-        /* Low word is in c.i, high word needs to be extracted */
-        uint64_t val64 = op->src1.c.i;
-        uint32_t lo = (uint32_t)(val64 & 0xFFFFFFFF);
-        uint32_t hi = (uint32_t)(val64 >> 32);
-        /* Store low word */
-        load_full_const(R12, -1, lo, NULL);
-        SValue dest_low = op->dest;
-        dest_low.type.t = VT_INT;
-        store(R12, &dest_low);
-        /* Store high word */
-        load_full_const(R12, -1, hi, NULL);
-        SValue dest_high = op->dest;
-        dest_high.type.t = VT_INT;
-        dest_high.c.i += 4;
-        store(R12, &dest_high);
-      }
-      else
-      {
-        load(R12, &op->src1);
-        store(R12, &op->dest);
-      }
-    }
-    else
-    {
-      /* Spilled source - load to temp and store */
-      if (is_64bit)
-      {
-        /* For 64-bit values, copy both 32-bit words separately */
-        int src_offset = op->src1.c.i;
-
-        /* Load and store low word */
-        int src_sign = (src_offset < 0);
-        int src_abs = src_sign ? -src_offset : src_offset;
-        if (!load_word_from_base(R12, R_FP, src_abs, src_sign))
-        {
-          int rr = th_offset_to_reg(src_abs, src_sign);
-          ot_check(th_ldr_reg(R12, R_FP, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-        }
-
-        SValue dest_low = op->dest;
-        dest_low.type.t = VT_INT;
-        store(R12, &dest_low);
-
-        /* Load and store high word (offset +4 from low word) */
-        int high_src_offset = op->src1.c.i + 4;
-        int high_src_sign = (high_src_offset < 0);
-        int high_src_abs = high_src_sign ? -high_src_offset : high_src_offset;
-        if (!load_word_from_base(R12, R_FP, high_src_abs, high_src_sign))
-        {
-          int rr = th_offset_to_reg(high_src_abs, high_src_sign);
-          ot_check(th_ldr_reg(R12, R_FP, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-        }
-
-        SValue dest_high = op->dest;
-        dest_high.type.t = VT_INT;
-        dest_high.c.i += 4;
-        store(R12, &dest_high);
-      }
-      else
-      {
-        load(R12, &op->src1);
-        store(R12, &op->dest);
-      }
-    }
-    return;
-  }
+  /* NOTE: Spilled destination handling is now done centrally in generate_code
+   * via tcc_ir_storeback_spill. src1 is also preloaded if it was spilled. */
 
   if ((op->src1.r & VT_VALMASK) == VT_CONST)
   {
@@ -3716,31 +3510,6 @@ ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *op)
       load_to_dest(&op->dest, &op->src1);
     }
     return;
-  }
-
-  if (op->src1.pr0 & PREG_SPILLED)
-  {
-    if (op->dest.pr0 >= 0 && !(op->dest.pr0 & PREG_SPILLED))
-    {
-      load_to_register(op->dest.pr0, -1, &op->src1);
-      return;
-    }
-    else if (op->dest.pr0 & PREG_SPILLED)
-    {
-      /* Debug for VAR:3 */
-      if (op->src1.vr == 0x10000003)
-      {
-        printf("DEBUG before load: src1.vr=0x%x, src1.pr0=%d\n", op->src1.vr, op->src1.pr0);
-      }
-      load(R12, &op->src1);
-      /* Debug for VAR:3 */
-      if (op->src1.vr == 0x10000003)
-      {
-        printf("DEBUG after load: src1.vr=0x%x, src1.pr0=%d\n", op->src1.vr, op->src1.pr0);
-      }
-      store(R12, &op->dest);
-      return;
-    }
   }
 
   if (op->dest.pr0 == op->src1.pr0)
@@ -3777,7 +3546,7 @@ ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *op)
    * a register was allocated. The register serves as a cache, but the canonical
    * location is still on the stack. This is critical for compound assignments
    * like `index += 1` where the incremented value must be stored back. */
-  if (dest_is_local && !dest_spilled && op->dest.pr0 >= 0)
+  if (dest_is_local && op->dest.pr0 >= 0)
   {
     TRACE("ASSIGN: Writing back local variable from R%d to memory at offset %d", op->dest.pr0, op->dest.c.i);
     store(op->dest.pr0, &op->dest);
@@ -4338,17 +4107,14 @@ ST_FUNC void tcc_gen_machine_setif_op(TACQuadruple *q)
   int op = mapcc(q->src1.c.i);
   int dest = q->dest.pr0;
 
+  /* NOTE: Destination is preloaded to a valid register by generate_code if spilled.
+   * Just use it directly. Store-back is also handled centrally. */
+
   /* ITE instruction: mask = 0x4 for ITE pattern (Then followed by Else)
    * The mask encoding: bit 3 = first instr matches cond (1=T)
    *                    bit 2 = second instr matches cond (0=E)
    *                    bit 1 = 0 (end of block)
    * For ITE: mask = 0b0100 = 0x4  (T, then E, then end)
-   * Actually for 2-instruction block: mask should be 0xC (1100) for IT, 0x4 (0100) for IE
-   * Wait, let me recalculate:
-   * mask[3] = 1 if last instruction matches firstcond, 0 otherwise
-   * mask[3:0] with trailing 1 marks end
-   * IT (1 instr): mask = 0x8 (1000)
-   * ITE (2 instr): mask = 0x4 (0100) - first is T, second is E
    */
   /* For EQ the mask 0x4 encodes ITT (both Then). Use 0xC to get ITE. */
   uint16_t it_mask = (op == 0 /* EQ */) ? 0xC : 0x4;

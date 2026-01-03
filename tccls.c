@@ -433,10 +433,15 @@ void tcc_ls_spill_interval_sized(LSLiveIntervalState *ls, int interval_index, in
     return;
   }
   LSLiveInterval *spill = ls->active_set[ls->next_active_index - 1];
-  if (spill->end > interval->end)
+  /* Only steal register from spill if:
+   * 1. spill lives longer than interval (worth spilling)
+   * 2. spill actually has a valid register (r0 >= 0 and not already spilled) */
+  if (spill->end > interval->end && spill->r0 >= 0 && spill->stack_location == 0)
   {
     interval->r0 = spill->r0;
     interval->r1 = spill->r1;
+    spill->r0 = -1;  /* Clear register from spilled interval */
+    spill->r1 = -1;
     spill->stack_location = tcc_ls_next_stack_location_sized(size);
     ls->active_set[ls->next_active_index - 1] = interval;
     qsort(ls->active_set, ls->next_active_index, sizeof(LSLiveInterval *), sort_endpoints);
@@ -602,6 +607,12 @@ void tcc_ls_allocate_registers(LSLiveIntervalState *ls, int used_parameters_regi
 
   for (int i = 0; i < ls->next_interval_index; ++i)
   {
+    /* Check for invalid state: r0 == -1 but not spilled to stack */
+    if (ls->intervals[i].r0 == -1 && ls->intervals[i].stack_location == 0 && !ls->intervals[i].addrtaken)
+    {
+      printf("ERROR: Interval %d has r0=-1 but stack_location=0 (not spilled)! vreg=0x%x\n",
+             i, ls->intervals[i].vreg);
+    }
     printf("Interval %d (%d,%d), ", i, ls->intervals[i].start, ls->intervals[i].end);
     tcc_ir_print_vreg(ls->intervals[i].vreg);
     const char *type_str;

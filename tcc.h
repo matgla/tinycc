@@ -1742,6 +1742,7 @@ typedef struct ArchitectureConfig
   int8_t stack_align;
   int8_t reg_size;
   int8_t scratch_register;
+  int8_t second_scratch_register;
   int8_t parameter_registers;
   int8_t has_fpu : 1;
   const FloatingPointConfig *fpu;

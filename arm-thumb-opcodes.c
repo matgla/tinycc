@@ -668,6 +668,13 @@ thumb_opcode th_generic_op_reg_shift_with_status(uint32_t op, uint32_t rd, uint3
   if (flags == FLAGS_BEHAVIOUR_SET)
     s = 1;
 
+  /* Guard against invalid register values (e.g., -1 or PREG_SPILLED) */
+  if (rd > 15 || rn > 15 || rm > 15)
+  {
+    tcc_error("compiler_error: 'th_generic_op_reg_shift_with_status' invalid register: rd=%d, rn=%d, rm=%d (op=0x%x)\n",
+              rd, rn, rm, op);
+  }
+
   return (thumb_opcode){
       .size = 4,
       .opcode = (op << 16) | (rn << 16) | (rd << 8) | rm | (sr << 4) | (imm2 << 6) | (imm3 << 12) | (s << 20),
