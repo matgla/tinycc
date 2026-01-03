@@ -440,7 +440,7 @@ void tcc_ls_spill_interval_sized(LSLiveIntervalState *ls, int interval_index, in
   {
     interval->r0 = spill->r0;
     interval->r1 = spill->r1;
-    spill->r0 = -1;  /* Clear register from spilled interval */
+    spill->r0 = -1; /* Clear register from spilled interval */
     spill->r1 = -1;
     spill->stack_location = tcc_ls_next_stack_location_sized(size);
     ls->active_set[ls->next_active_index - 1] = interval;
@@ -610,8 +610,7 @@ void tcc_ls_allocate_registers(LSLiveIntervalState *ls, int used_parameters_regi
     /* Check for invalid state: r0 == -1 but not spilled to stack */
     if (ls->intervals[i].r0 == -1 && ls->intervals[i].stack_location == 0 && !ls->intervals[i].addrtaken)
     {
-      printf("ERROR: Interval %d has r0=-1 but stack_location=0 (not spilled)! vreg=0x%x\n",
-             i, ls->intervals[i].vreg);
+      printf("ERROR: Interval %d has r0=-1 but stack_location=0 (not spilled)! vreg=0x%x\n", i, ls->intervals[i].vreg);
     }
     printf("Interval %d (%d,%d), ", i, ls->intervals[i].start, ls->intervals[i].end);
     tcc_ir_print_vreg(ls->intervals[i].vreg);
@@ -659,4 +658,80 @@ void tcc_ls_allocate_registers(LSLiveIntervalState *ls, int used_parameters_regi
       printf("\n");
     }
   }
+}
+
+/* Find a free scratch register at the given instruction index.
+ * Returns -1 if no register is available.
+ *
+ * Parameters:
+ *   ls - the live interval state
+ *   instruction_idx - current instruction index
+ *   exclude_regs - bitmap of registers to exclude (e.g., already used as scratch)
+ *   is_leaf - 1 if this is a leaf function (LR holds return address)
+ */
+int tcc_ls_find_free_scratch_reg(LSLiveIntervalState *ls, int instruction_idx, uint32_t exclude_regs, int is_leaf)
+{
+  uint32_t live_regs = exclude_regs;
+
+  /* Always exclude SP (R13) */
+  live_regs |= (1 << 13);
+
+  /* Exclude LR (R14) in leaf functions - it holds return address */
+  if (is_leaf)
+  {
+    live_regs |= (1 << 14);
+  }
+
+  /* Exclude PC (R15) */
+  live_regs |= (1 << 15);
+
+  /* Mark all registers that are live at this instruction */
+  for (int i = 0; i < ls->next_interval_index; ++i)
+  {
+    LSLiveInterval *interval = &ls->intervals[i];
+
+    /* Skip non-integer registers */
+    if (interval->reg_type != LS_REG_TYPE_INT && interval->reg_type != LS_REG_TYPE_LLONG)
+      continue;
+
+    /* Check if interval is live at this instruction */
+    if (interval->start <= instruction_idx && interval->end >= instruction_idx)
+    {
+      /* This vreg is live - mark its register(s) as unavailable */
+      if (interval->r0 >= 0 && interval->r0 < 16)
+      {
+        live_regs |= (1 << interval->r0);
+      }
+      if (interval->r1 >= 0 && interval->r1 < 16)
+      {
+        live_regs |= (1 << interval->r1);
+      }
+    }
+  }
+
+  /* Prefer caller-saved registers R0-R3, then R12 (IP), then callee-saved R4-R11 */
+  /* First try R0-R3 (caller-saved, often free for scratch) */
+  for (int r = 0; r <= 3; ++r)
+  {
+    if (!(live_regs & (1 << r)))
+      return r;
+  }
+
+  /* Then try R12 (IP - inter-procedure scratch) */
+  if (!(live_regs & (1 << 12)))
+    return 12;
+
+  /* Then try callee-saved R4-R11 */
+  for (int r = 4; r <= 11; ++r)
+  {
+    if (!(live_regs & (1 << r)))
+      return r;
+  }
+
+  /* Finally try LR if not a leaf function */
+  if (!is_leaf && !(live_regs & (1 << 14)))
+    return 14;
+
+  /* No register available */
+  return -1;
 }

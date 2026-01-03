@@ -284,6 +284,26 @@ int th_has_immediate_value(int r);
 int load_word_from_base(int ir, int base, int fc, int sign);
 int th_offset_to_reg(int offset, int sign);
 
+/* Get a free scratch register using liveness information.
+ * exclude_regs is a bitmap of registers that must not be used.
+ * Returns architecture_config.scratch_register or second_scratch_register as fallback.
+ */
+static int get_free_scratch_reg(uint32_t exclude_regs)
+{
+  TCCIRState *ir = tcc_state->ir;
+  if (ir)
+  {
+    int reg = tcc_ls_find_free_scratch_reg(&ir->ls, ir->codegen_instruction_idx, exclude_regs, ir->leaffunc);
+    if (reg >= 0)
+      return reg;
+  }
+  /* Fallback to configured scratch register */
+  if (!(exclude_regs & (1 << architecture_config.scratch_register)))
+    return architecture_config.scratch_register;
+  /* Last resort - use second scratch, but this may be LR which could be problematic */
+  return architecture_config.second_scratch_register;
+}
+
 static int th_is_caller_saved_register(int reg)
 {
   if (tcc_state->text_and_data_separation && reg == R9)
@@ -2532,12 +2552,50 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
   }
   case TCCIR_OP_DIV:
   {
-    ot_check(th_sdiv(op->dest.pr0, op->src1.pr0, op->src2.pr0));
+    int src1_reg = op->src1.pr0;
+    int src2_reg = op->src2.pr0;
+    uint32_t exclude_regs = (1 << op->dest.pr0);
+    /* Handle constant operands - DIV has no immediate form */
+    if (th_has_immediate_value(op->src1.r))
+    {
+      src1_reg = get_free_scratch_reg(exclude_regs);
+      exclude_regs |= (1 << src1_reg);
+      load_to_reg(src1_reg, -1, &op->src1);
+    }
+    else if (src1_reg >= 0)
+    {
+      exclude_regs |= (1 << src1_reg);
+    }
+    if (th_has_immediate_value(op->src2.r))
+    {
+      src2_reg = get_free_scratch_reg(exclude_regs);
+      load_to_reg(src2_reg, -1, &op->src2);
+    }
+    ot_check(th_sdiv(op->dest.pr0, src1_reg, src2_reg));
     return;
   }
   case TCCIR_OP_UDIV:
   {
-    ot_check(th_udiv(op->dest.pr0, op->src1.pr0, op->src2.pr0));
+    int src1_reg = op->src1.pr0;
+    int src2_reg = op->src2.pr0;
+    uint32_t exclude_regs = (1 << op->dest.pr0);
+    /* Handle constant operands - UDIV has no immediate form */
+    if (th_has_immediate_value(op->src1.r))
+    {
+      src1_reg = get_free_scratch_reg(exclude_regs);
+      exclude_regs |= (1 << src1_reg);
+      load_to_reg(src1_reg, -1, &op->src1);
+    }
+    else if (src1_reg >= 0)
+    {
+      exclude_regs |= (1 << src1_reg);
+    }
+    if (th_has_immediate_value(op->src2.r))
+    {
+      src2_reg = get_free_scratch_reg(exclude_regs);
+      load_to_reg(src2_reg, -1, &op->src2);
+    }
+    ot_check(th_udiv(op->dest.pr0, src1_reg, src2_reg));
     return;
   }
   case TCCIR_OP_ADC_USE:
@@ -2562,23 +2620,44 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
   }
   }
 
-  if (op->op == TCCIR_OP_CMP)
+  /* Handle constant operands - load into scratch registers if needed */
   {
-  }
+    int src1_reg = op->src1.pr0;
+    int src2_reg = op->src2.pr0;
+    int src1_is_imm = th_has_immediate_value(op->src1.r);
+    int src2_is_imm = th_has_immediate_value(op->src2.r);
+    uint32_t exclude_regs = 0;
 
-  if (th_has_immediate_value(op->src2.r))
-  {
-    if (!ot(handler.imm_handler(op->dest.pr0, op->src1.pr0, op->src2.c.i, flags, ENFORCE_ENCODING_NONE)))
+    /* Exclude destination register from scratch selection */
+    if (op->dest.pr0 >= 0)
+      exclude_regs |= (1 << op->dest.pr0);
+
+    /* Load constant src1 into scratch register */
+    if (src1_is_imm)
     {
-      // load immediate to temp register and add
-      load_to_reg(R12, -1, &op->src2);
-      ot_check(handler.reg_handler(op->dest.pr0, op->src1.pr0, R12, flags, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+      src1_reg = get_free_scratch_reg(exclude_regs);
+      exclude_regs |= (1 << src1_reg);
+      load_to_reg(src1_reg, -1, &op->src1);
     }
-  }
-  else
-  {
-    ot_check(handler.reg_handler(op->dest.pr0, op->src1.pr0, op->src2.pr0, flags, THUMB_SHIFT_DEFAULT,
-                                 ENFORCE_ENCODING_NONE));
+    else if (src1_reg >= 0)
+    {
+      exclude_regs |= (1 << src1_reg);
+    }
+
+    if (src2_is_imm)
+    {
+      /* Try immediate form first (only if src1 is not also immediate) */
+      if (!src1_is_imm && handler.imm_handler &&
+          ot(handler.imm_handler(op->dest.pr0, src1_reg, op->src2.c.i, flags, ENFORCE_ENCODING_NONE)))
+      {
+        return;
+      }
+      /* Immediate form failed or not available, load to scratch register */
+      src2_reg = get_free_scratch_reg(exclude_regs);
+      load_to_reg(src2_reg, -1, &op->src2);
+    }
+
+    ot_check(handler.reg_handler(op->dest.pr0, src1_reg, src2_reg, flags, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
   }
 }
 

@@ -188,6 +188,8 @@ const IRRegistersConfig irop_config[] = {
     /* Logical boolean operations */
     [TCCIR_OP_BOOL_OR] = {1, 1, 1},   /* dest = (src1 || src2) */
     [TCCIR_OP_BOOL_AND] = {1, 1, 1},  /* dest = (src1 && src2) */
+    /* No-operation */
+    [TCCIR_OP_NOP] = {0, 0, 0},
 };
 // clang-format on
 
@@ -735,6 +737,8 @@ const char *tcc_ir_get_op_name(TccIrOp op)
     return "BOOL_OR";
   case TCCIR_OP_BOOL_AND:
     return "BOOL_AND";
+  case TCCIR_OP_NOP:
+    return "NOP";
   default:
     return "UNKNOWN_OP";
   }
@@ -807,10 +811,6 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
       exit(1);
     }
     q->src1 = *src1;
-    if (tcc_is_vreg_valid(ir, src1->vr))
-    {
-      tcc_ir_set_base_interval_end(ir, src1->vr);
-    }
   }
   else
   {
@@ -825,10 +825,6 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
       exit(1);
     }
     q->src2 = *src2;
-    if (tcc_is_vreg_valid(ir, src2->vr))
-    {
-      tcc_ir_set_base_interval_end(ir, src2->vr);
-    }
   }
   else
   {
@@ -866,15 +862,6 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
        * so it should NOT be marked as an lvalue. For other operations that produce
        * addresses or variables, keep is_lvalue=1. */
       dest_interval->is_lvalue = (op != TCCIR_OP_LOAD);
-      if (dest_interval->start == INTERVAL_NOT_STARTED)
-      {
-        dest_interval->start = ir->next_instruction_index;
-        if (ir->processing_if && TCCIR_DECODE_VREG_TYPE(dest->vr) == TCCIR_VREG_TYPE_VAR)
-        {
-          dest_interval->start_within_if = 1;
-        }
-      }
-      dest_interval->end = ir->next_instruction_index;
     }
   }
   else
@@ -1252,6 +1239,112 @@ static void tcc_ir_extend_param_intervals(TCCIRState *ir)
   }
 }
 
+/* Compute live intervals by scanning the IR after optimizations.
+ * This replaces the incremental tracking done during tcc_ir_put(),
+ * ensuring intervals are always accurate. */
+static void tcc_ir_compute_live_intervals(TCCIRState *ir)
+{
+  /* Reset only start/end positions, preserve other flags like is_lvalue, addrtaken, etc. */
+  for (int i = 0; i < ir->next_local_variable; ++i)
+  {
+    ir->variables_live_intervals[i].start = INTERVAL_NOT_STARTED;
+    ir->variables_live_intervals[i].end = 0;
+  }
+  for (int i = 0; i < ir->next_temporary_variable; ++i)
+  {
+    ir->temporary_variables_live_intervals[i].start = INTERVAL_NOT_STARTED;
+    ir->temporary_variables_live_intervals[i].end = 0;
+  }
+  for (int i = 0; i < ir->next_parameter; ++i)
+  {
+    ir->parameters_live_intervals[i].start = INTERVAL_NOT_STARTED;
+    ir->parameters_live_intervals[i].end = 0;
+  }
+
+  /* Single forward pass over IR to find def/use ranges */
+  for (int i = 0; i < ir->next_instruction_index; ++i)
+  {
+    TACQuadruple *q = &ir->instructions[i];
+
+    /* Skip NOP instructions */
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+
+    /* Process source operands (uses) */
+    if (irop_config[q->op].has_src1 == 1 && tcc_is_vreg_valid(ir, q->src1.vr))
+    {
+      IRLiveInterval *interval = tcc_ir_get_live_interval(ir, q->src1.vr);
+      if (interval->start == INTERVAL_NOT_STARTED)
+      {
+        /* Use before def - this is a parameter or input */
+        interval->start = 0;
+      }
+      interval->end = i;
+    }
+
+    if (irop_config[q->op].has_src2 == 1 && tcc_is_vreg_valid(ir, q->src2.vr))
+    {
+      IRLiveInterval *interval = tcc_ir_get_live_interval(ir, q->src2.vr);
+      if (interval->start == INTERVAL_NOT_STARTED)
+      {
+        /* Use before def - this is a parameter or input */
+        interval->start = 0;
+      }
+      interval->end = i;
+    }
+
+    /* Process destination operand (definition) */
+    if (irop_config[q->op].has_dest == 1 && tcc_is_vreg_valid(ir, q->dest.vr))
+    {
+      IRLiveInterval *interval = tcc_ir_get_live_interval(ir, q->dest.vr);
+      if (interval->start == INTERVAL_NOT_STARTED)
+      {
+        /* First time seeing this vreg - it's defined here */
+        interval->start = i;
+      }
+      interval->end = i;
+    }
+  }
+
+  /* Handle backward jumps - extend intervals for loop variables */
+  for (int i = 0; i < ir->next_instruction_index; ++i)
+  {
+    TACQuadruple *q = &ir->instructions[i];
+    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
+    {
+      int jump_target = q->dest.c.i;
+      /* Backward jump: target is before the jump instruction */
+      if (jump_target < i)
+      {
+        /* Any vreg live at the jump target must extend to the jump */
+        for (int vreg_type = 0; vreg_type < 3; ++vreg_type)
+        {
+          int max_vreg = (vreg_type == 0)   ? ir->next_local_variable
+                         : (vreg_type == 1) ? ir->next_temporary_variable
+                                            : ir->next_parameter;
+          for (int vreg_idx = 0; vreg_idx < max_vreg; ++vreg_idx)
+          {
+            IRLiveInterval *interval = (vreg_type == 0)   ? &ir->variables_live_intervals[vreg_idx]
+                                       : (vreg_type == 1) ? &ir->temporary_variables_live_intervals[vreg_idx]
+                                                          : &ir->parameters_live_intervals[vreg_idx];
+
+            if (interval->start != INTERVAL_NOT_STARTED && interval->start <= jump_target &&
+                interval->end >= jump_target)
+            {
+              /* Variable is live at jump target, extend to jump */
+              if (i > interval->end)
+                interval->end = i;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  /* Extend intervals for vregs used as function parameters */
+  tcc_ir_extend_param_intervals(ir);
+}
+
 void tcc_ir_liveness_analysis(TCCIRState *ir)
 {
   int start, end;
@@ -1261,9 +1354,10 @@ void tcc_ir_liveness_analysis(TCCIRState *ir)
   IRLiveInterval *interval;
   tcc_ls_clear_live_intervals(&ir->ls);
 
-  /* Extend intervals for vregs used as function parameters */
-  tcc_ir_extend_param_intervals(ir);
+  /* Compute live intervals from the IR after optimizations */
+  tcc_ir_compute_live_intervals(ir);
 
+  /* Now populate the linear scan allocator with the computed intervals */
   for (int vreg = 0; vreg < ir->next_local_variable; ++vreg)
   {
     const int encoded_vreg = (TCCIR_VREG_TYPE_VAR << 28) | vreg;
@@ -1271,16 +1365,16 @@ void tcc_ir_liveness_analysis(TCCIRState *ir)
     {
       continue;
     }
-    start = 0;
-    end = ~0;
-    int found = tcc_ir_find_live_interval(ir, encoded_vreg, &start, &end, 1);
-    if (found)
+    interval = tcc_ir_get_live_interval(ir, encoded_vreg);
+    if (interval->start != INTERVAL_NOT_STARTED)
     {
+      start = interval->start;
+      end = interval->end;
       crosses_call = tcc_ir_has_call_in_range(ir, start, end);
-      interval = tcc_ir_get_live_interval(ir, encoded_vreg);
-      addrtaken = interval ? interval->addrtaken : 0;
+      addrtaken = interval->addrtaken;
       reg_type = tcc_ir_get_reg_type(ir, encoded_vreg);
-      if (ir->instructions[end].op == TCCIR_OP_FUNCCALLVAL || ir->instructions[end].op == TCCIR_OP_FUNCCALLVOID)
+      if (end < ir->next_instruction_index &&
+          (ir->instructions[end].op == TCCIR_OP_FUNCCALLVAL || ir->instructions[end].op == TCCIR_OP_FUNCCALLVOID))
       {
         end--; /* Do not include call instruction itself */
       }
@@ -1296,15 +1390,16 @@ void tcc_ir_liveness_analysis(TCCIRState *ir)
     {
       continue;
     }
-    start = 0;
-    end = ~0;
-    if (tcc_ir_find_live_interval(ir, vreg_encoded, &start, &end, 1))
+    interval = tcc_ir_get_live_interval(ir, vreg_encoded);
+    if (interval->start != INTERVAL_NOT_STARTED)
     {
+      start = interval->start;
+      end = interval->end;
       crosses_call = tcc_ir_has_call_in_range(ir, start, end);
-      interval = tcc_ir_get_live_interval(ir, vreg_encoded);
-      addrtaken = interval ? interval->addrtaken : 0;
+      addrtaken = interval->addrtaken;
       reg_type = tcc_ir_get_reg_type(ir, vreg_encoded);
-      if (ir->instructions[end].op == TCCIR_OP_FUNCCALLVAL || ir->instructions[end].op == TCCIR_OP_FUNCCALLVOID)
+      if (end < ir->next_instruction_index &&
+          (ir->instructions[end].op == TCCIR_OP_FUNCCALLVAL || ir->instructions[end].op == TCCIR_OP_FUNCCALLVOID))
       {
         end--; /* Do not include call instruction itself */
       }
@@ -1316,7 +1411,7 @@ void tcc_ir_liveness_analysis(TCCIRState *ir)
   for (int vreg = 0; vreg < ir->next_parameter; ++vreg)
   {
     const int vreg_encoded = (TCCIR_VREG_TYPE_PARAM << 28) | vreg;
-    IRLiveInterval *interval = tcc_ir_get_live_interval(ir, vreg_encoded);
+    interval = tcc_ir_get_live_interval(ir, vreg_encoded);
     /* Parameters start at instruction 0 and end at their last use.
      * If end==0 and param is used at instruction 0, that's valid.
      * If end==0 and param is unused, we still allocate a slot for it. */
@@ -1325,21 +1420,8 @@ void tcc_ir_liveness_analysis(TCCIRState *ir)
     /* If param never used (end would be 0 from memset), set minimal end */
     if (end == 0)
       end = 1; /* Ensure at least one instruction range for allocation */
-    /* Check for backward jumps that would extend end */
-    for (int i = 0; i < ir->next_instruction_index; ++i)
-    {
-      TACQuadruple *q = &ir->instructions[i];
-      if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
-      {
-        int jump_target = q->dest.c.i;
-        if (jump_target < i && start <= jump_target && end >= jump_target)
-        {
-          if (i > end)
-            end = i;
-        }
-      }
-    }
-    if (ir->instructions[end].op == TCCIR_OP_FUNCCALLVAL || ir->instructions[end].op == TCCIR_OP_FUNCCALLVOID)
+    if (end < ir->next_instruction_index &&
+        (ir->instructions[end].op == TCCIR_OP_FUNCCALLVAL || ir->instructions[end].op == TCCIR_OP_FUNCCALLVOID))
     {
       end--; /* Do not include call instruction itself */
     }
@@ -1658,29 +1740,48 @@ int tcc_ir_dead_store_elimination(TCCIRState *ir)
     }
   }
 
-  /* Remove ASSIGN instructions where dest is an unused TMP vreg */
+  /* Remove ASSIGN instructions where dest is an unused TMP vreg, and NOP instructions */
   int changes = 0;
   int write_pos = 0;
   int *new_index = tcc_malloc(sizeof(int) * n);
+
+#ifdef DEBUG_IR_GEN
+  printf("=== DEAD STORE ELIMINATION START ===\n");
+#endif
 
   for (int i = 0; i < n; i++)
   {
     TACQuadruple *q = &ir->instructions[i];
     int keep = 1;
 
-    /* Only consider removing ASSIGN instructions */
-    if (q->op == TCCIR_OP_ASSIGN && TCCIR_DECODE_VREG_TYPE(q->dest.vr) == TCCIR_VREG_TYPE_TEMP)
+    /* Remove NOP instructions */
+    if (q->op == TCCIR_OP_NOP)
+    {
+#ifdef DEBUG_IR_GEN
+      printf("DSE: Removing NOP at i=%d\n", i);
+#endif
+      keep = 0;
+      changes++;
+    }
+    /* Remove ASSIGN instructions where dest is an unused TMP vreg */
+    else if (q->op == TCCIR_OP_ASSIGN && TCCIR_DECODE_VREG_TYPE(q->dest.vr) == TCCIR_VREG_TYPE_TEMP)
     {
       int pos = TCCIR_DECODE_VREG_POSITION(q->dest.vr);
       if (pos <= max_tmp_pos && !(used[pos / 8] & (1 << (pos % 8))))
       {
         /* This ASSIGN's destination is never used - remove it */
+#ifdef DEBUG_IR_GEN
+        printf("DSE: Removing unused ASSIGN to TMP:%d at i=%d\n", pos, i);
+#endif
         keep = 0;
         changes++;
       }
     }
 
     new_index[i] = keep ? write_pos : -1;
+#ifdef DEBUG_IR_GEN
+    printf("DSE: i=%d -> new_index=%d (keep=%d, op=%s)\n", i, new_index[i], keep, tcc_ir_get_op_name(q->op));
+#endif
 
     if (keep)
     {
@@ -1689,6 +1790,10 @@ int tcc_ir_dead_store_elimination(TCCIRState *ir)
       write_pos++;
     }
   }
+
+#ifdef DEBUG_IR_GEN
+  printf("=== DEAD STORE ELIMINATION END (removed %d, n=%d -> %d) ===\n", changes, n, write_pos);
+#endif
 
   /* Update jump targets */
   for (int i = 0; i < write_pos; i++)
@@ -1899,7 +2004,8 @@ int tcc_ir_bool_idempotent(TCCIRState *ir)
     }
 
     /* Check if both operands resolve to the same vreg */
-    if (vr1 == vr2)
+    /* Skip if vr1 or vr2 is -1 (invalid, e.g., from constants) */
+    if (vr1 >= 0 && vr1 == vr2)
     {
       /* Pattern matched: BOOL_OP(x, x) -> x */
 #ifdef DEBUG_IR_GEN
@@ -2138,6 +2244,780 @@ int tcc_ir_bool_simplification(TCCIRState *ir)
 
   tcc_free(vreg_def);
 
+  return changes;
+}
+
+/* Constant Propagation with Algebraic Simplification
+ * Phase 1: Track constant variables, propagate them, and apply algebraic simplifications
+ * Patterns:
+ *   - Replace uses of constant VARs with immediate values
+ *   - X + 0 = X, X - 0 = X, X * 1 = X, X * 0 = 0
+ *   - X & 0 = 0, X & -1 = X, X | 0 = X, X | -1 = -1
+ *   - X << 0 = X, X >> 0 = X, 0 << X = 0
+ *   - C1 OP C2 = result (full constant folding)
+ */
+int tcc_ir_constant_propagation(TCCIRState *ir)
+{
+  /* VarConstInfo: track constant variables */
+  typedef struct
+  {
+    uint8_t is_constant : 1;
+    uint8_t def_count : 7;
+    int64_t value;
+  } VarConstInfo;
+
+  int n = ir->next_instruction_index;
+  int changes = 0;
+  int max_var_pos = 0;
+  int i;
+  TACQuadruple *q;
+  VarConstInfo *var_info;
+
+  if (n == 0)
+    return 0;
+
+  /* Track which VAR vregs are constant (assigned exactly once with a constant value) */
+  for (i = 0; i < n; i++)
+  {
+    q = &ir->instructions[i];
+    if (irop_config[q->op].has_dest && TCCIR_DECODE_VREG_TYPE(q->dest.vr) == TCCIR_VREG_TYPE_VAR)
+    {
+      int pos = TCCIR_DECODE_VREG_POSITION(q->dest.vr);
+      if (pos > max_var_pos)
+        max_var_pos = pos;
+    }
+  }
+
+  if (max_var_pos == 0)
+    return 0;
+
+  var_info = tcc_mallocz(sizeof(VarConstInfo) * (max_var_pos + 1));
+
+  /* First pass: identify constant variables */
+  for (i = 0; i < n; i++)
+  {
+    TACQuadruple *q = &ir->instructions[i];
+
+    /* Track definitions of VAR vregs */
+    if (irop_config[q->op].has_dest && TCCIR_DECODE_VREG_TYPE(q->dest.vr) == TCCIR_VREG_TYPE_VAR)
+    {
+      int pos = TCCIR_DECODE_VREG_POSITION(q->dest.vr);
+      if (pos <= max_var_pos)
+      {
+        var_info[pos].def_count++;
+
+        /* Check if this is a constant assignment */
+        if (q->op == TCCIR_OP_ASSIGN && (q->src1.r & VT_VALMASK) == VT_CONST && !(q->src1.r & VT_SYM))
+        {
+          if (var_info[pos].def_count == 1)
+          {
+            var_info[pos].is_constant = 1;
+            var_info[pos].value = q->src1.c.i;
+          }
+        }
+        else
+        {
+          /* Non-constant assignment - mark as non-constant */
+          var_info[pos].is_constant = 0;
+        }
+      }
+    }
+  }
+
+  /* Mark variables with multiple definitions as non-constant */
+  for (i = 0; i <= max_var_pos; i++)
+  {
+    if (var_info[i].def_count > 1)
+      var_info[i].is_constant = 0;
+  }
+
+  /* Second pass: propagate constants and apply algebraic simplifications */
+  for (i = 0; i < n; i++)
+  {
+    int src1_is_const, src2_is_const;
+    int64_t result;
+    int can_fold;
+    int skip_bool_prop;
+
+    q = &ir->instructions[i];
+
+    /* For BOOL_AND/BOOL_OR, don't propagate constants unless both become constants.
+     * The code generator can't handle mixed const/reg operands for these ops. */
+    skip_bool_prop = 0;
+    if (q->op == TCCIR_OP_BOOL_AND || q->op == TCCIR_OP_BOOL_OR)
+    {
+      int src1_can_be_const = 0, src2_can_be_const = 0;
+      /* Check if both would become constants */
+      if (TCCIR_DECODE_VREG_TYPE(q->src1.vr) == TCCIR_VREG_TYPE_VAR)
+      {
+        int pos = TCCIR_DECODE_VREG_POSITION(q->src1.vr);
+        if (pos <= max_var_pos && var_info[pos].is_constant)
+          src1_can_be_const = 1;
+      }
+      else if ((q->src1.r & VT_VALMASK) == VT_CONST && !(q->src1.r & VT_SYM))
+        src1_can_be_const = 1;
+
+      if (TCCIR_DECODE_VREG_TYPE(q->src2.vr) == TCCIR_VREG_TYPE_VAR)
+      {
+        int pos = TCCIR_DECODE_VREG_POSITION(q->src2.vr);
+        if (pos <= max_var_pos && var_info[pos].is_constant)
+          src2_can_be_const = 1;
+      }
+      else if ((q->src2.r & VT_VALMASK) == VT_CONST && !(q->src2.r & VT_SYM))
+        src2_can_be_const = 1;
+
+      /* Skip propagation if only ONE would become constant (can't generate code) */
+      if (src1_can_be_const != src2_can_be_const)
+        skip_bool_prop = 1;
+    }
+
+    /* Propagate constant VAR vregs to immediate values */
+    if (!skip_bool_prop && irop_config[q->op].has_src1 && TCCIR_DECODE_VREG_TYPE(q->src1.vr) == TCCIR_VREG_TYPE_VAR)
+    {
+      int pos = TCCIR_DECODE_VREG_POSITION(q->src1.vr);
+      if (pos <= max_var_pos && var_info[pos].is_constant)
+      {
+        q->src1.r = VT_CONST;
+        q->src1.c.i = var_info[pos].value;
+        q->src1.vr = -1;
+        changes++;
+      }
+    }
+
+    if (!skip_bool_prop && irop_config[q->op].has_src2 && TCCIR_DECODE_VREG_TYPE(q->src2.vr) == TCCIR_VREG_TYPE_VAR)
+    {
+      int pos = TCCIR_DECODE_VREG_POSITION(q->src2.vr);
+      if (pos <= max_var_pos && var_info[pos].is_constant)
+      {
+        q->src2.r = VT_CONST;
+        q->src2.c.i = var_info[pos].value;
+        q->src2.vr = -1;
+        changes++;
+      }
+    }
+
+    /* Algebraic simplifications */
+    src1_is_const = (q->src1.r & VT_VALMASK) == VT_CONST && !(q->src1.r & VT_SYM);
+    src2_is_const = (q->src2.r & VT_VALMASK) == VT_CONST && !(q->src2.r & VT_SYM);
+
+    /* For commutative operations, if src1 is const and src2 is not, swap them.
+     * This ensures constants end up in src2 where the code generator expects them.
+     * Note: BOOL_AND/BOOL_OR are not included because the code generator doesn't
+     * handle constants in either operand - they require both to be registers. */
+    if (irop_config[q->op].has_src1 && irop_config[q->op].has_src2 && src1_is_const && !src2_is_const)
+    {
+      int is_commutative = 0;
+      switch (q->op)
+      {
+      case TCCIR_OP_ADD:
+      case TCCIR_OP_MUL:
+      case TCCIR_OP_AND:
+      case TCCIR_OP_OR:
+      case TCCIR_OP_XOR:
+        is_commutative = 1;
+        break;
+      default:
+        break;
+      }
+      if (is_commutative)
+      {
+        SValue tmp;
+#ifdef DEBUG_IR_GEN
+        printf("OPTIMIZE: Swap operands for commutative %s (const in src1) at i=%d\n", tcc_ir_get_op_name(q->op), i);
+#endif
+        tmp = q->src1;
+        q->src1 = q->src2;
+        q->src2 = tmp;
+        /* Update flags after swap */
+        src1_is_const = 0;
+        src2_is_const = 1;
+      }
+    }
+
+    /* Full constant folding: C1 OP C2 = result */
+    result = 0;
+    can_fold = 1;
+
+    if (irop_config[q->op].has_src1 && irop_config[q->op].has_src2 && src1_is_const && src2_is_const)
+    {
+      switch (q->op)
+      {
+      case TCCIR_OP_ADD:
+        result = q->src1.c.i + q->src2.c.i;
+        break;
+      case TCCIR_OP_SUB:
+        result = q->src1.c.i - q->src2.c.i;
+        break;
+      case TCCIR_OP_MUL:
+        result = q->src1.c.i * q->src2.c.i;
+        break;
+      case TCCIR_OP_AND:
+        result = q->src1.c.i & q->src2.c.i;
+        break;
+      case TCCIR_OP_OR:
+        result = q->src1.c.i | q->src2.c.i;
+        break;
+      case TCCIR_OP_XOR:
+        result = q->src1.c.i ^ q->src2.c.i;
+        break;
+      case TCCIR_OP_SHL:
+        result = q->src1.c.i << q->src2.c.i;
+        break;
+      case TCCIR_OP_SHR:
+        result = (uint64_t)q->src1.c.i >> q->src2.c.i;
+        break;
+      case TCCIR_OP_SAR:
+        result = q->src1.c.i >> q->src2.c.i;
+        break;
+      case TCCIR_OP_BOOL_AND:
+        result = (q->src1.c.i != 0) && (q->src2.c.i != 0) ? 1 : 0;
+        break;
+      case TCCIR_OP_BOOL_OR:
+        result = (q->src1.c.i != 0) || (q->src2.c.i != 0) ? 1 : 0;
+        break;
+      default:
+        can_fold = 0;
+        break;
+      }
+
+      if (can_fold)
+      {
+#ifdef DEBUG_IR_GEN
+        printf("OPTIMIZE: Constant fold %s(%lld, %lld) = %lld at i=%d\n", tcc_ir_get_op_name(q->op),
+               (long long)q->src1.c.i, (long long)q->src2.c.i, (long long)result, i);
+#endif
+        q->op = TCCIR_OP_ASSIGN;
+        q->src1.r = VT_CONST;
+        q->src1.c.i = result;
+        q->src1.vr = -1;
+        memset(&q->src2, 0, sizeof(q->src2));
+        q->src2.vr = -1;
+        changes++;
+        continue;
+      }
+    }
+
+    /* Algebraic simplifications with one constant operand */
+    if (irop_config[q->op].has_src2 && src2_is_const)
+    {
+      int64_t c;
+      int simplify;
+      int replace_with_zero;
+      int replace_with_const;
+      int64_t const_value;
+
+      c = q->src2.c.i;
+      simplify = 0;
+      replace_with_zero = 0;
+      replace_with_const = 0;
+      const_value = 0;
+
+      switch (q->op)
+      {
+      case TCCIR_OP_ADD:
+      case TCCIR_OP_SUB:
+        if (c == 0)
+          simplify = 1; /* X + 0 = X, X - 0 = X */
+        break;
+      case TCCIR_OP_OR:
+        if (c == 0)
+          simplify = 1; /* X | 0 = X */
+        else if (c == -1 || c == 0xFFFFFFFF)
+        {
+          replace_with_const = 1; /* X | -1 = -1 */
+          const_value = -1;
+        }
+        break;
+      case TCCIR_OP_SHL:
+      case TCCIR_OP_SHR:
+      case TCCIR_OP_SAR:
+        if (c == 0)
+          simplify = 1; /* X << 0 = X, X >> 0 = X */
+        break;
+      case TCCIR_OP_MUL:
+        if (c == 1)
+          simplify = 1; /* X * 1 = X */
+        else if (c == 0)
+          replace_with_zero = 1; /* X * 0 = 0 */
+        break;
+      case TCCIR_OP_DIV:
+      case TCCIR_OP_UDIV:
+        if (c == 1)
+          simplify = 1; /* X / 1 = X */
+        break;
+      case TCCIR_OP_AND:
+        if (c == 0)
+          replace_with_zero = 1; /* X & 0 = 0 */
+        else if (c == -1 || c == 0xFFFFFFFF)
+          simplify = 1; /* X & -1 = X */
+        break;
+      }
+
+      if (simplify)
+      {
+#ifdef DEBUG_IR_GEN
+        printf("OPTIMIZE: Algebraic simplify %s(x, %lld) = x at i=%d\n", tcc_ir_get_op_name(q->op), (long long)c, i);
+#endif
+        q->op = TCCIR_OP_ASSIGN;
+        /* src1 stays as-is, clear src2 */
+        memset(&q->src2, 0, sizeof(q->src2));
+        q->src2.vr = -1;
+        changes++;
+      }
+      else if (replace_with_zero)
+      {
+#ifdef DEBUG_IR_GEN
+        printf("OPTIMIZE: Algebraic simplify %s(x, %lld) = 0 at i=%d\n", tcc_ir_get_op_name(q->op), (long long)c, i);
+#endif
+        q->op = TCCIR_OP_ASSIGN;
+        q->src1.r = VT_CONST;
+        q->src1.c.i = 0;
+        q->src1.vr = -1;
+        memset(&q->src2, 0, sizeof(q->src2));
+        q->src2.vr = -1;
+        changes++;
+      }
+      else if (replace_with_const)
+      {
+#ifdef DEBUG_IR_GEN
+        printf("OPTIMIZE: Algebraic simplify %s(x, %lld) = %lld at i=%d\n", tcc_ir_get_op_name(q->op), (long long)c,
+               (long long)const_value, i);
+#endif
+        q->op = TCCIR_OP_ASSIGN;
+        q->src1.r = VT_CONST;
+        q->src1.c.i = const_value;
+        q->src1.vr = -1;
+        memset(&q->src2, 0, sizeof(q->src2));
+        q->src2.vr = -1;
+        changes++;
+      }
+    }
+
+    /* Handle commutative operations: 0 + X = X, 0 << X = 0 */
+    if (irop_config[q->op].has_src1 && src1_is_const)
+    {
+      int64_t c;
+
+      c = q->src1.c.i;
+
+      switch (q->op)
+      {
+      case TCCIR_OP_ADD:
+      case TCCIR_OP_OR:
+        if (c == 0)
+        {
+          /* 0 + X = X, 0 | X = X (commutative, swap operands) */
+#ifdef DEBUG_IR_GEN
+          printf("OPTIMIZE: Algebraic simplify %s(0, x) = x at i=%d\n", tcc_ir_get_op_name(q->op), i);
+#endif
+          q->op = TCCIR_OP_ASSIGN;
+          q->src1 = q->src2;
+          memset(&q->src2, 0, sizeof(q->src2));
+          q->src2.vr = -1;
+          changes++;
+        }
+        break;
+      case TCCIR_OP_MUL:
+        if (c == 0)
+        {
+          /* 0 * X = 0 */
+#ifdef DEBUG_IR_GEN
+          printf("OPTIMIZE: Algebraic simplify %s(0, x) = 0 at i=%d\n", tcc_ir_get_op_name(q->op), i);
+#endif
+          q->op = TCCIR_OP_ASSIGN;
+          /* src1 is already 0 */
+          memset(&q->src2, 0, sizeof(q->src2));
+          q->src2.vr = -1;
+          changes++;
+        }
+        break;
+      case TCCIR_OP_SHL:
+      case TCCIR_OP_SHR:
+      case TCCIR_OP_SAR:
+        if (c == 0)
+        {
+          /* 0 << X = 0, 0 >> X = 0 */
+#ifdef DEBUG_IR_GEN
+          printf("OPTIMIZE: Algebraic simplify %s(0, x) = 0 at i=%d\n", tcc_ir_get_op_name(q->op), i);
+#endif
+          q->op = TCCIR_OP_ASSIGN;
+          /* src1 is already 0 */
+          memset(&q->src2, 0, sizeof(q->src2));
+          q->src2.vr = -1;
+          changes++;
+        }
+        break;
+      }
+    }
+  }
+
+  /* Third pass: Fold CMP+SETIF patterns when CMP has constant operands */
+  for (i = 0; i < n - 1; i++)
+  {
+    TACQuadruple *cmp_q = &ir->instructions[i];
+    TACQuadruple *setif_q = &ir->instructions[i + 1];
+    int cmp_src1_const, cmp_src2_const;
+    int64_t val1, val2;
+    int cond, result;
+
+    if (cmp_q->op != TCCIR_OP_CMP)
+      continue;
+    if (setif_q->op != TCCIR_OP_SETIF)
+      continue;
+
+    cmp_src1_const = (cmp_q->src1.r & VT_VALMASK) == VT_CONST && !(cmp_q->src1.r & VT_SYM);
+    cmp_src2_const = (cmp_q->src2.r & VT_VALMASK) == VT_CONST && !(cmp_q->src2.r & VT_SYM);
+
+    if (!cmp_src1_const || !cmp_src2_const)
+      continue;
+
+    val1 = cmp_q->src1.c.i;
+    val2 = cmp_q->src2.c.i;
+    cond = setif_q->src1.c.i; /* Condition code stored in src1.c.i (TCC token) */
+
+    /* Evaluate the comparison based on TCC token values */
+    result = 0;
+    switch (cond)
+    {
+    case 0x94: /* TOK_EQ */
+      result = (val1 == val2) ? 1 : 0;
+      break;
+    case 0x95: /* TOK_NE */
+      result = (val1 != val2) ? 1 : 0;
+      break;
+    case 0x9c: /* TOK_LT */
+      result = (val1 < val2) ? 1 : 0;
+      break;
+    case 0x9d: /* TOK_GE */
+      result = (val1 >= val2) ? 1 : 0;
+      break;
+    case 0x9e: /* TOK_LE */
+      result = (val1 <= val2) ? 1 : 0;
+      break;
+    case 0x9f: /* TOK_GT */
+      result = (val1 > val2) ? 1 : 0;
+      break;
+    case 0x96: /* TOK_ULT (unsigned <) */
+      result = ((uint64_t)val1 < (uint64_t)val2) ? 1 : 0;
+      break;
+    case 0x97: /* TOK_UGE (unsigned >=) */
+      result = ((uint64_t)val1 >= (uint64_t)val2) ? 1 : 0;
+      break;
+    case 0x98: /* TOK_ULE (unsigned <=) */
+      result = ((uint64_t)val1 <= (uint64_t)val2) ? 1 : 0;
+      break;
+    case 0x99: /* TOK_UGT (unsigned >) */
+      result = ((uint64_t)val1 > (uint64_t)val2) ? 1 : 0;
+      break;
+    default:
+      /* Unknown condition, don't fold */
+      continue;
+    }
+
+#ifdef DEBUG_IR_GEN
+    printf("OPTIMIZE: Fold CMP+SETIF const (%lld cmp %lld, cond=0x%x) = %d at i=%d\n", (long long)val1, (long long)val2,
+           cond, result, i);
+#endif
+
+    /* Convert CMP to NOP and SETIF to ASSIGN with constant result.
+     * Dead store elimination will remove the NOP. */
+    cmp_q->op = TCCIR_OP_NOP;
+    setif_q->op = TCCIR_OP_ASSIGN;
+    setif_q->src1.r = VT_CONST;
+    setif_q->src1.c.i = result;
+    setif_q->src1.vr = -1;
+    memset(&setif_q->src2, 0, sizeof(setif_q->src2));
+    setif_q->src2.vr = -1;
+    changes++;
+  }
+
+  tcc_free(var_info);
+
+  return changes;
+}
+
+/* Copy Propagation
+ * Phase 2: Eliminate redundant copy temporaries
+ * Patterns:
+ *   - TMP:X <- SRC; ... TMP:X used -> replace uses with SRC
+ *   - Eliminate copy chains
+ */
+int tcc_ir_copy_propagation(TCCIRState *ir)
+{
+  /* Track ASSIGN sources for TMP vregs */
+  typedef struct
+  {
+    int instruction_idx; /* Where this TMP is defined (-1 if not an ASSIGN) */
+    SValue source;       /* Source of the ASSIGN */
+    uint8_t is_copy : 1; /* Whether this is a simple copy (ASSIGN from non-TMP) */
+  } CopyInfo;
+
+  int n = ir->next_instruction_index;
+  int changes = 0;
+  int max_tmp_pos = 0;
+  int i;
+  TACQuadruple *q;
+  CopyInfo *copy_info;
+
+  if (n == 0)
+    return 0;
+
+  /* Build a map from TMP vreg -> its source (if it's a simple ASSIGN) */
+  for (i = 0; i < n; i++)
+  {
+    q = &ir->instructions[i];
+    if (irop_config[q->op].has_dest && TCCIR_DECODE_VREG_TYPE(q->dest.vr) == TCCIR_VREG_TYPE_TEMP)
+    {
+      int pos = TCCIR_DECODE_VREG_POSITION(q->dest.vr);
+      if (pos > max_tmp_pos)
+        max_tmp_pos = pos;
+    }
+  }
+
+  if (max_tmp_pos == 0)
+    return 0;
+
+  copy_info = tcc_mallocz(sizeof(CopyInfo) * (max_tmp_pos + 1));
+  for (i = 0; i <= max_tmp_pos; i++)
+  {
+    copy_info[i].instruction_idx = -1;
+  }
+
+  /* First pass: identify simple copies */
+  for (i = 0; i < n; i++)
+  {
+    q = &ir->instructions[i];
+
+    if (q->op == TCCIR_OP_ASSIGN && irop_config[q->op].has_dest &&
+        TCCIR_DECODE_VREG_TYPE(q->dest.vr) == TCCIR_VREG_TYPE_TEMP)
+    {
+      int pos = TCCIR_DECODE_VREG_POSITION(q->dest.vr);
+      if (pos <= max_tmp_pos)
+      {
+        int src_is_const = (q->src1.r & VT_VALMASK) == VT_CONST;
+        copy_info[pos].instruction_idx = i;
+        copy_info[pos].source = q->src1;
+        /* Only propagate if source is a valid vreg (not TMP, not constant with vr=-1)
+         * and not an lvalue. Constants should be propagated through constant propagation. */
+        copy_info[pos].is_copy = !src_is_const && (q->src1.vr >= 0) &&
+                                 (TCCIR_DECODE_VREG_TYPE(q->src1.vr) != TCCIR_VREG_TYPE_TEMP) &&
+                                 ((q->src1.r & VT_LVAL) == 0); /* Don't propagate lvalues */
+      }
+    }
+  }
+
+  /* Second pass: propagate copies */
+  for (i = 0; i < n; i++)
+  {
+    q = &ir->instructions[i];
+
+    /* Replace uses of TMP vregs that are simple copies */
+    if (irop_config[q->op].has_src1 && TCCIR_DECODE_VREG_TYPE(q->src1.vr) == TCCIR_VREG_TYPE_TEMP)
+    {
+      int pos = TCCIR_DECODE_VREG_POSITION(q->src1.vr);
+      if (pos <= max_tmp_pos && copy_info[pos].is_copy && copy_info[pos].instruction_idx < i)
+      {
+#ifdef DEBUG_IR_GEN
+        printf("OPTIMIZE: Copy propagate TMP:%d <- src at i=%d\n", pos, i);
+#endif
+        q->src1 = copy_info[pos].source;
+        changes++;
+      }
+    }
+
+    if (irop_config[q->op].has_src2 && TCCIR_DECODE_VREG_TYPE(q->src2.vr) == TCCIR_VREG_TYPE_TEMP)
+    {
+      int pos = TCCIR_DECODE_VREG_POSITION(q->src2.vr);
+      if (pos <= max_tmp_pos && copy_info[pos].is_copy && copy_info[pos].instruction_idx < i)
+      {
+#ifdef DEBUG_IR_GEN
+        printf("OPTIMIZE: Copy propagate TMP:%d <- src at i=%d\n", pos, i);
+#endif
+        q->src2 = copy_info[pos].source;
+        changes++;
+      }
+    }
+  }
+
+  tcc_free(copy_info);
+
+  return changes;
+}
+/* Arithmetic Common Subexpression Elimination
+ * Phase 3: Eliminate redundant arithmetic computations within basic blocks
+ * Handles ADD, SUB, MUL, AND, OR, XOR, SHL, SHR, SAR operations
+ */
+int tcc_ir_arithmetic_cse(TCCIRState *ir)
+{
+  typedef struct ArithCSEEntry
+  {
+    TccIrOp op;
+    int src1_vr;
+    int src2_vr;
+    int64_t src1_const;
+    int64_t src2_const;
+    uint8_t src1_is_const : 1;
+    uint8_t src2_is_const : 1;
+    int result_vr;
+    int instruction_idx;
+    struct ArithCSEEntry *next;
+  } ArithCSEEntry;
+
+  int n;
+  int changes;
+  int i, j;
+  TACQuadruple *q;
+  ArithCSEEntry *hash_table[256];
+  ArithCSEEntry *entries;
+  int entry_count;
+
+  n = ir->next_instruction_index;
+  changes = 0;
+
+  if (n == 0)
+    return 0;
+
+  memset(hash_table, 0, sizeof(hash_table));
+  entries = tcc_malloc(sizeof(ArithCSEEntry) * n);
+  entry_count = 0;
+
+  for (i = 0; i < n; i++)
+  {
+    int src1_is_const, src2_is_const;
+    int64_t src1_const, src2_const;
+    int src1_vr, src2_vr;
+    uint32_t h;
+    int found;
+    ArithCSEEntry *e;
+
+    q = &ir->instructions[i];
+
+    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF || q->op == TCCIR_OP_FUNCCALLVOID ||
+        q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_RETURNVALUE || q->op == TCCIR_OP_RETURNVOID)
+    {
+      memset(hash_table, 0, sizeof(hash_table));
+      entry_count = 0;
+      continue;
+    }
+
+    if (q->op != TCCIR_OP_ADD && q->op != TCCIR_OP_SUB && q->op != TCCIR_OP_MUL && q->op != TCCIR_OP_AND &&
+        q->op != TCCIR_OP_OR && q->op != TCCIR_OP_XOR && q->op != TCCIR_OP_SHL && q->op != TCCIR_OP_SHR &&
+        q->op != TCCIR_OP_SAR)
+      continue;
+
+    src1_is_const = (q->src1.r & VT_VALMASK) == VT_CONST && !(q->src1.r & VT_SYM);
+    src2_is_const = (q->src2.r & VT_VALMASK) == VT_CONST && !(q->src2.r & VT_SYM);
+    src1_const = src1_is_const ? q->src1.c.i : 0;
+    src2_const = src2_is_const ? q->src2.c.i : 0;
+    src1_vr = q->src1.vr;
+    src2_vr = q->src2.vr;
+
+    h = (uint32_t)q->op * 31;
+    if (src1_is_const)
+      h += (uint32_t)src1_const * 17;
+    else
+      h += (uint32_t)src1_vr * 17;
+    if (src2_is_const)
+      h += (uint32_t)src2_const * 13;
+    else
+      h += (uint32_t)src2_vr * 13;
+    h = h % 256;
+
+    found = 0;
+    for (e = hash_table[h]; e != NULL; e = e->next)
+    {
+      int is_commutative;
+      int match1, match2;
+
+      if (e->op != q->op)
+        continue;
+
+      if (e->src1_is_const == src1_is_const && e->src2_is_const == src2_is_const)
+      {
+        match1 = e->src1_is_const ? (e->src1_const == src1_const) : (e->src1_vr == src1_vr);
+        match2 = e->src2_is_const ? (e->src2_const == src2_const) : (e->src2_vr == src2_vr);
+        if (match1 && match2)
+        {
+#ifdef DEBUG_IR_GEN
+          printf("OPTIMIZE: Arithmetic CSE %s at %d same as %d -> ASSIGN\n", tcc_ir_get_op_name(q->op), i,
+                 e->instruction_idx);
+#endif
+          q->op = TCCIR_OP_ASSIGN;
+          q->src1.r = 0;
+          q->src1.vr = e->result_vr;
+          q->src1.c.i = 0;
+          memset(&q->src2, 0, sizeof(q->src2));
+          q->src2.vr = -1;
+          changes++;
+          found = 1;
+          break;
+        }
+      }
+
+      is_commutative = (q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_MUL || q->op == TCCIR_OP_AND ||
+                        q->op == TCCIR_OP_OR || q->op == TCCIR_OP_XOR);
+
+      if (is_commutative && e->src1_is_const == src2_is_const && e->src2_is_const == src1_is_const)
+      {
+        match1 = e->src1_is_const ? (e->src1_const == src2_const) : (e->src1_vr == src2_vr);
+        match2 = e->src2_is_const ? (e->src2_const == src1_const) : (e->src2_vr == src1_vr);
+        if (match1 && match2)
+        {
+#ifdef DEBUG_IR_GEN
+          printf("OPTIMIZE: Arithmetic CSE %s at %d same as %d (commutative) -> ASSIGN\n", tcc_ir_get_op_name(q->op), i,
+                 e->instruction_idx);
+#endif
+          q->op = TCCIR_OP_ASSIGN;
+          q->src1.r = 0;
+          q->src1.vr = e->result_vr;
+          q->src1.c.i = 0;
+          memset(&q->src2, 0, sizeof(q->src2));
+          q->src2.vr = -1;
+          changes++;
+          found = 1;
+          break;
+        }
+      }
+    }
+
+    if (!found && entry_count < n)
+    {
+      ArithCSEEntry *new_entry;
+      new_entry = &entries[entry_count++];
+      new_entry->op = q->op;
+      new_entry->src1_vr = src1_vr;
+      new_entry->src2_vr = src2_vr;
+      new_entry->src1_const = src1_const;
+      new_entry->src2_const = src2_const;
+      new_entry->src1_is_const = src1_is_const;
+      new_entry->src2_is_const = src2_is_const;
+      new_entry->result_vr = q->dest.vr;
+      new_entry->instruction_idx = i;
+      new_entry->next = hash_table[h];
+      hash_table[h] = new_entry;
+    }
+
+    if (irop_config[q->op].has_dest)
+    {
+      int dest_vr;
+      dest_vr = q->dest.vr;
+      for (j = 0; j < 256; j++)
+      {
+        ArithCSEEntry **ep;
+        ep = &hash_table[j];
+        while (*ep)
+        {
+          e = *ep;
+          if ((!e->src1_is_const && e->src1_vr == dest_vr) || (!e->src2_is_const && e->src2_vr == dest_vr))
+            *ep = e->next;
+          else
+            ep = &e->next;
+        }
+      }
+    }
+  }
+
+  tcc_free(entries);
   return changes;
 }
 
@@ -2451,6 +3331,9 @@ void tcc_ir_generate_code(TCCIRState *ir)
   {
     drop_return_value = 0;
     q = &ir->instructions[i];
+
+    /* Track current instruction for scratch register allocation */
+    ir->codegen_instruction_idx = i;
 
     ir_to_code_mapping[i] = ind;
 

@@ -9982,6 +9982,18 @@ static void gen_function(Sym *sym)
   /* Dead code elimination - remove unreachable instructions */
   tcc_ir_dead_code_elimination(ir);
 
+  /* Phase 1: Constant Propagation with Algebraic Simplification */
+  if (tcc_ir_constant_propagation(ir))
+    tcc_ir_dead_code_elimination(ir); /* Clean up simplified ops */
+
+  /* Phase 2: Copy Propagation */
+  if (tcc_ir_copy_propagation(ir))
+    tcc_ir_dead_code_elimination(ir); /* Clean up redundant copies */
+
+  /* Phase 3: Arithmetic Common Subexpression Elimination */
+  if (tcc_ir_arithmetic_cse(ir))
+    tcc_ir_dead_code_elimination(ir); /* Clean up duplicate computations */
+
   /* Common subexpression elimination for commutative boolean ops */
   if (tcc_ir_bool_cse(ir))
     tcc_ir_dead_code_elimination(ir); /* Clean up unused ops */

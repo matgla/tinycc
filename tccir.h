@@ -75,6 +75,8 @@ typedef enum TccIrOp
   /* Logical boolean operations - produce 0/1 result */
   TCCIR_OP_BOOL_OR,  /* (src1 != 0) || (src2 != 0) -> 0/1 */
   TCCIR_OP_BOOL_AND, /* (src1 != 0) && (src2 != 0) -> 0/1 */
+  /* No-operation placeholder for dead instructions */
+  TCCIR_OP_NOP,
 } TccIrOp;
 
 typedef struct CType CType;
@@ -155,6 +157,9 @@ typedef struct TCCIRState
   int instructions_size;
   int next_instruction_index;
 
+  /* Current instruction index during code generation - used for scratch register allocation */
+  int codegen_instruction_idx;
+
   uint32_t *ignored_vregs;
   int ignored_vregs_size;
 
@@ -201,6 +206,8 @@ int tcc_ir_generate_test(TCCIRState *ir, int inv, int t);
 int tcc_ir_dead_code_elimination(TCCIRState *ir);
 int tcc_ir_dead_store_elimination(TCCIRState *ir);
 int tcc_ir_constant_propagation(TCCIRState *ir);
+int tcc_ir_copy_propagation(TCCIRState *ir);
+int tcc_ir_arithmetic_cse(TCCIRState *ir);
 int tcc_ir_bool_cse(TCCIRState *ir);
 int tcc_ir_bool_idempotent(TCCIRState *ir);
 int tcc_ir_bool_simplification(TCCIRState *ir);

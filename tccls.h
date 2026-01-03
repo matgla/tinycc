@@ -79,3 +79,14 @@ void tcc_ls_add_live_interval(LSLiveIntervalState *ls, int vreg, int start, int 
                               int reg_type, int lvalue);
 void tcc_ls_allocate_registers(LSLiveIntervalState *ls, int used_parameters_registers,
                                int used_float_parameters_registers);
+
+/* Find a free scratch register at the given instruction index.
+ * Returns -1 if no register is available.
+ *
+ * Parameters:
+ *   ls - the live interval state
+ *   instruction_idx - current instruction index
+ *   exclude_regs - bitmap of registers to exclude (e.g., already used as scratch)
+ *   is_leaf - 1 if this is a leaf function (LR holds return address)
+ */
+int tcc_ls_find_free_scratch_reg(LSLiveIntervalState *ls, int instruction_idx, uint32_t exclude_regs, int is_leaf);
