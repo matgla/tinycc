@@ -23,7 +23,7 @@
 
 #include "tccir.h"
 
-#define DEBUG_IR_GEN
+// #define DEBUG_IR_GEN
 
 /********************************************************/
 /* global variables */
@@ -1194,7 +1194,7 @@ static void gvtst_set(int inv, int t)
     vpushi(0);
     gen_op(TOK_NE);
     if (vtop->r != VT_CMP) /* must be VT_CONST then */
-      vset_VT_CMP(vtop->c.i != 0);
+      vset_VT_CMP(vtop->c.i != 0 ? TOK_NE : TOK_EQ);
   }
 
   p = inv ? &vtop->jfalse : &vtop->jtrue;
@@ -1956,8 +1956,9 @@ ST_FUNC int gv(int rc)
   int bit_pos, bit_size, size, align;
   int vreg = 0;
 
-  /* For IR mode: if we already have a valid vreg computed, no need to do anything */
-  if (tcc_state->ir && vtop->vr >= 0 && !(vtop->r & VT_LVAL))
+  /* For IR mode: if we already have a valid vreg computed, no need to do anything.
+     Valid vregs have type 1, 2, or 3 in the upper 4 bits. Type 0 is invalid. */
+  if (tcc_state->ir && TCCIR_DECODE_VREG_TYPE(vtop->vr) > 0 && !(vtop->r & VT_LVAL))
   {
     printf("gv: IR mode, already has vreg=%d, skipping\n", vtop->vr);
     return vtop->r & VT_VALMASK;
@@ -2120,6 +2121,8 @@ ST_FUNC int gv(int rc)
         dest.type.t = vtop->type.t;
         dest.vr = vreg;
         tcc_ir_put(tcc_state->ir, TCCIR_OP_LOAD, vtop, NULL, &dest);
+        /* After LOAD, the result is in a register, not an lvalue anymore */
+        vtop->r &= ~VT_LVAL;
       }
     }
     vtop->vr = vreg;
@@ -2187,8 +2190,9 @@ ST_FUNC void lexpand(void)
   {
     /* For IR mode: a 64-bit vreg represents the full value.
      * When expanding, create two views: low word keeps same vreg,
-     * high word gets a new vreg with SHR 32 operation. */
-    if (tcc_state->ir && vtop->vr >= 0)
+     * high word gets a new vreg with SHR 32 operation.
+     * Valid vregs have type 1, 2, or 3 in the upper 4 bits. */
+    if (tcc_state->ir && TCCIR_DECODE_VREG_TYPE(vtop->vr) > 0)
     {
       /* Save the original long long value */
       SValue src_llong = *vtop;
@@ -3944,8 +3948,9 @@ again:
     else if (ss == 8)
     {
       /* from long long: just take low order word */
-      /* For IR mode with valid vreg: just change type, backend uses first register of pair */
-      if (tcc_state->ir && vtop->vr >= 0)
+      /* For IR mode with valid vreg: just change type, backend uses first register of pair.
+         Valid vregs have type 1, 2, or 3 in the upper 4 bits. */
+      if (tcc_state->ir && TCCIR_DECODE_VREG_TYPE(vtop->vr) > 0)
       {
         vtop->type.t = VT_INT | (vtop->type.t & VT_UNSIGNED);
       }
@@ -4449,6 +4454,11 @@ ST_FUNC void vstore(void)
       {
         op = TCCIR_OP_ASSIGN;
       }
+#ifdef DEBUG_IR_GEN
+      fprintf(stderr, "DEBUG vstore single word: vtop->r=0x%x, VT_LVAL=%d, VT_VALMASK=0x%x, vtop->vr=%d, check=%d\n",
+              vtop->r, (vtop->r & VT_LVAL) != 0, vtop->r & VT_VALMASK, vtop->vr,
+              (vtop->r & VT_LVAL) && (vtop->r & VT_VALMASK) != VT_LOCAL);
+#endif
       /* If source is an lvalue (memory reference), emit LOAD first to get the value.
        * This handles cases like: int tmp = array[a]; where array[a] is an lvalue */
       if ((vtop->r & VT_LVAL) && (vtop->r & VT_VALMASK) != VT_LOCAL)
@@ -4458,11 +4468,16 @@ ST_FUNC void vstore(void)
         load_dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
         load_dest.r = 0;
         load_dest.c.i = 0;
+#ifdef DEBUG_IR_GEN
+        fprintf(stderr, "DEBUG vstore: emitting LOAD for lvalue, new_vr=%d\n", load_dest.vr);
+#endif
         tcc_ir_put(tcc_state->ir, TCCIR_OP_LOAD, vtop, NULL, &load_dest);
         vtop->vr = load_dest.vr;
         vtop->r = 0; /* no longer an lvalue */
       }
-      // tcc_ir_generate_cmp_jmp_set(tcc_state->ir);
+      /* If source is a VT_CMP (comparison result stored in flags), we need to
+       * materialize it as a 0/1 value before storing. */
+      tcc_ir_generate_cmp_jmp_set(tcc_state->ir);
       tcc_ir_put(tcc_state->ir, op, vtop, NULL, &vtop[-1]);
 
       /* After assignment, update vtop to reference the destination vreg.
@@ -6019,6 +6034,10 @@ static CType *type_decl(CType *type, AttributeDef *ad, int *v, int td)
 /* indirection with full error checking and bound check */
 ST_FUNC void indir(void)
 {
+#ifdef DEBUG_IR_GEN
+  fprintf(stderr, "DEBUG indir: vtop->r=0x%x, vtop->type.t=0x%x, VT_LVAL=%d, vr=%d, sym=%p, c.i=%lld\n", vtop->r,
+          vtop->type.t, (vtop->r & VT_LVAL) != 0, vtop->vr, vtop->sym, (long long)vtop->c.i);
+#endif
   if ((vtop->type.t & VT_BTYPE) != VT_PTR)
   {
     if ((vtop->type.t & VT_BTYPE) == VT_FUNC)
@@ -6037,6 +6056,10 @@ ST_FUNC void indir(void)
     // gv(RC_INT);
   }
   vtop->type = *pointed_type(&vtop->type);
+#ifdef DEBUG_IR_GEN
+  fprintf(stderr, "DEBUG indir after: vtop->r=0x%x, vtop->type.t=0x%x, VT_STRUCT=%d\n", vtop->r, vtop->type.t,
+          (vtop->type.t & VT_BTYPE) == VT_STRUCT);
+#endif
   /* Arrays and functions are never lvalues */
   if (!(vtop->type.t & (VT_ARRAY | VT_VLA)) && (vtop->type.t & VT_BTYPE) != VT_FUNC)
   {
@@ -6047,6 +6070,9 @@ ST_FUNC void indir(void)
       vtop->r |= VT_MUSTBOUND;
 #endif
   }
+#ifdef DEBUG_IR_GEN
+  fprintf(stderr, "DEBUG indir final: vtop->r=0x%x (VT_LVAL=%d)\n", vtop->r, (vtop->r & VT_LVAL) != 0);
+#endif
 }
 
 /* pass a parameter to a function and do type checking and casting */
@@ -6952,11 +6978,23 @@ tok_next:
       /* expect pointer on structure */
       next();
       s = find_field(&vtop->type, tok, &cumofs);
+#ifdef DEBUG_IR_GEN
+      fprintf(stderr, "DEBUG field access: before gaddrof, vtop->r=0x%x, sym=%p, c.i=%lld, cumofs=%d\n", vtop->r,
+              vtop->sym, (long long)vtop->c.i, cumofs);
+#endif
       /* add field offset to pointer */
       gaddrof();
+#ifdef DEBUG_IR_GEN
+      fprintf(stderr, "DEBUG field access: after gaddrof, vtop->r=0x%x, sym=%p, c.i=%lld\n", vtop->r, vtop->sym,
+              (long long)vtop->c.i);
+#endif
       vtop->type = char_pointer_type; /* change type to 'char *' */
       vpushi(cumofs);
       gen_op('+');
+#ifdef DEBUG_IR_GEN
+      fprintf(stderr, "DEBUG field access: after gen_op, vtop->r=0x%x, sym=%p, c.i=%lld, vr=%d\n", vtop->r, vtop->sym,
+              (long long)vtop->c.i, vtop->vr);
+#endif
       /* change type to field type, and set to lvalue */
       vtop->type = s->type;
       vtop->type.t |= qualifiers;
@@ -7084,11 +7122,13 @@ tok_next:
             expr_eq();
             /* Convert VT_CMP/VT_JMP to actual 0/1 value before passing as
              * parameter */
-            tcc_ir_generate_cmp_jmp_set(tcc_state->ir);
+            if (!NOEVAL_WANTED)
+              tcc_ir_generate_cmp_jmp_set(tcc_state->ir);
             gfunc_param_typed(s, sa);
             if (nb_args < 4)
             {
-              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL);
+              if (!NOEVAL_WANTED)
+                tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL);
               vtop--;
             }
           }
@@ -7130,15 +7170,22 @@ tok_next:
         for (int j = 0; j < nb_args - 4; j++)
         {
           num.c.i = nb_args - j;
-          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL);
+          if (!NOEVAL_WANTED)
+            tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL);
           vtop--;
         }
       }
 
       int return_vreg = -1;
-      if (vtop->type.t == VT_VOID)
+      if (NOEVAL_WANTED)
+      {
+        /* When in sizeof/typeof context, skip IR emission but still handle stack */
+        --vtop;
+      }
+      else if (vtop->type.t == VT_VOID)
       {
         tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, vtop, NULL, NULL);
+        --vtop;
       }
       else
       {
@@ -7154,8 +7201,8 @@ tok_next:
         dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
         return_vreg = dest.vr;
         tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, vtop, NULL, &dest);
+        --vtop;
       }
-      --vtop;
 
       if (ret_nregs < 0)
       {
@@ -7753,10 +7800,12 @@ static void expr_cond(void)
       rc = RC_RET(type.t);
 
     tt = r2 = 0;
+    int false_vreg = 0; /* Save false branch vreg for IR mode */
     if (c < 0)
     {
       r2 = gv(rc);
-      tt = gjmp(-1); /* -1 = no chain */
+      false_vreg = vtop->vr; /* Save the false branch's vreg */
+      tt = gjmp(-1);         /* -1 = no chain */
     }
     tcc_ir_backpatch_to_here(tcc_state->ir, u);
     if (c == 1)
@@ -7780,6 +7829,27 @@ static void expr_cond(void)
     if (c < 0)
     {
       r1 = gv(rc);
+      /* For IR mode: after both branches are materialized, we need to ensure
+       * they converge to the same vreg at the merge point.
+       * Generate ASSIGN from true_vreg to false_vreg (which is used at merge). */
+      int true_vreg = vtop->vr;
+      int true_vreg_valid =
+          (true_vreg != -1) && (TCCIR_DECODE_VREG_TYPE(true_vreg) >= 1) && (TCCIR_DECODE_VREG_TYPE(true_vreg) <= 3);
+      int false_vreg_valid =
+          (false_vreg != -1) && (TCCIR_DECODE_VREG_TYPE(false_vreg) >= 1) && (TCCIR_DECODE_VREG_TYPE(false_vreg) <= 3);
+      if (tcc_state->ir && true_vreg_valid && false_vreg_valid && true_vreg != false_vreg)
+      {
+        /* Copy true branch result to false branch's vreg so both paths use same vreg */
+        SValue src, dest;
+        memset(&src, 0, sizeof(SValue));
+        memset(&dest, 0, sizeof(SValue));
+        src.vr = true_vreg;
+        src.type = vtop->type;
+        dest.vr = false_vreg;
+        dest.type = vtop->type;
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_ASSIGN, &src, NULL, &dest);
+        vtop->vr = false_vreg;
+      }
       move_reg(r2, r1, islv ? VT_PTR : type.t);
       vtop->r = r2;
       tcc_ir_backpatch_to_here(tcc_state->ir, tt);

@@ -260,6 +260,7 @@ static void load_to_register(int reg, int reg_from, SValue *src);
 int th_has_immediate_value(int r);
 int load_word_from_base(int ir, int base, int fc, int sign);
 int th_offset_to_reg(int offset, int sign);
+static void tcc_gen_machine_load_from_stack(int reg, int offset);
 
 /* Structure to track scratch register allocation with potential save/restore */
 typedef struct ScratchRegAlloc
@@ -386,9 +387,13 @@ SpillContext tcc_ir_preload_spills(TACQuadruple *q, int preload_src1, int preloa
   ctx.orig_src2_pr0 = q->src2.pr0;
   ctx.orig_dest_pr0 = q->dest.pr0;
 
+  /* Check if src1 is an address-of operation (VT_LOCAL without VT_LVAL).
+   * Address-of doesn't need preload - we compute the address directly. */
+  int src1_is_address_of = ((q->src1.r & VT_VALMASK) == VT_LOCAL) && !(q->src1.r & VT_LVAL);
+
   /* Preload src1 if needed */
   if (preload_src1 && tcc_ir_is_spilled(&q->src1) && !th_has_immediate_value(q->src1.r) &&
-      !tcc_ir_is_64bit(q->src1.type.t))
+      !tcc_ir_is_64bit(q->src1.type.t) && !src1_is_address_of)
   {
     ctx.src1_spilled = 1;
     ctx.src1_offset = q->src1.c.i;
@@ -435,20 +440,63 @@ SpillContext tcc_ir_preload_spills(TACQuadruple *q, int preload_src1, int preloa
       /* Call load BEFORE modifying pr0 - load() uses pr0 to detect spilled values.
        * The first argument to load() specifies the destination register.
        *
-       * IMPORTANT: If src1 has VT_LVAL but is NOT VT_LOCAL (i.e., it's a temporary
-       * holding a pointer address), we need to strip VT_LVAL - we want to load the
-       * ADDRESS from the spill slot, not dereference it. The actual LOAD operation
-       * will do the dereference.
-       * But for VT_LOCAL variables, VT_LVAL means "load value from stack", so we
-       * must keep it. */
+       * IMPORTANT: For spilled VT_LOCAL values, we need to load the VALUE from the
+       * spill slot, not compute the address. The `load()` function with VT_LOCAL
+       * without VT_LVAL computes address-of, which is wrong for spilled temporaries.
+       *
+       * For LOAD operations or ASSIGN from spilled TMPs, we directly generate the
+       * load instruction instead of going through load() to avoid confusion. */
       int saved_r = q->src1.r;
       int v = q->src1.r & VT_VALMASK;
-      if (v != VT_LOCAL && v != VT_LLOCAL)
+      int src1_is_temp = TCCIR_DECODE_VREG_TYPE(q->src1.vr) == TCCIR_VREG_TYPE_TEMP;
+
+      fprintf(stderr, "DEBUG preload_src1: op=%d src1.vr=%d src1.r=0x%x offset=%lld scratch=%d\n", q->op, q->src1.vr,
+              q->src1.r, (long long)q->src1.c.i, scratch);
+
+      /* For spilled VT_LOCAL values (both with and without VT_LVAL), directly load
+       * the value from stack instead of using load() which has confusing semantics. */
+      if (v == VT_LOCAL || v == VT_LLOCAL)
       {
-        q->src1.r &= ~VT_LVAL; /* Load raw value (the pointer), don't dereference */
+        /* Load value from spill slot: LDR scratch, [FP, #offset] */
+        int src_offset = q->src1.c.i;
+        int src_sign = (src_offset < 0);
+        int src_abs = src_sign ? -src_offset : src_offset;
+        if (!load_word_from_base(scratch, R_FP, src_abs, src_sign))
+        {
+          int rr = th_offset_to_reg(src_abs, src_sign);
+          ot_check(th_ldr_reg(scratch, R_FP, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+        }
+        /* Value is now in scratch register. Update r to indicate:
+         * - For LOAD operations: keep VT_LVAL since we loaded a POINTER that needs dereferencing
+         * - For other operations: clear VT_LVAL since we loaded the actual VALUE */
+        if (q->op == TCCIR_OP_LOAD)
+        {
+          q->src1.r = scratch | VT_LVAL; /* Pointer in register, needs dereference */
+        }
+        else
+        {
+          q->src1.r = scratch; /* Value in register */
+        }
       }
-      load(scratch, &q->src1);
-      q->src1.r = saved_r; /* Restore original r for the actual operation */
+      else
+      {
+        /* For non-LOCAL cases, use normal load.
+         * For global symbols (VT_CONST | VT_SYM) with VT_LVAL, we need to:
+         * 1. Load the address into a register (stripping VT_LVAL for the load call)
+         * 2. For LOAD operations, preserve VT_LVAL so we dereference later */
+        int had_lval = saved_r & VT_LVAL;
+        q->src1.r &= ~VT_LVAL; /* Strip VT_LVAL for the load call */
+        load(scratch, &q->src1);
+        /* For LOAD ops on global symbols: address is now in register, needs dereference */
+        if (q->op == TCCIR_OP_LOAD && had_lval)
+        {
+          q->src1.r = scratch | VT_LVAL; /* Address in register, needs dereference */
+        }
+        else
+        {
+          q->src1.r = scratch; /* Value is in this register now */
+        }
+      }
       q->src1.pr0 = scratch;
       exclude_regs |= (1 << scratch);
 
@@ -667,6 +715,8 @@ void tcc_ir_storeback_spill(TACQuadruple *q, SpillContext *ctx)
 {
   if (ctx->dest_spilled && !tcc_ir_is_64bit(q->dest.type.t))
   {
+    fprintf(stderr, "DEBUG storeback_spill: op=%d dest.vr=%d scratch=%d offset=%d\n", q->op, q->dest.vr,
+            ctx->dest_scratch_reg, ctx->dest_offset);
     q->dest.pr0 = ctx->orig_dest_pr0;
     q->dest.r = VT_LOCAL;
     q->dest.c.i = ctx->dest_offset;
@@ -754,7 +804,7 @@ static uint32_t mapcc(int cc)
   case TOK_GT:
     return 0xC; /* GT */
   }
-  tcc_error("unexpected condition code");
+  tcc_error("unexpected condition code: %d (0x%x)", cc, cc);
   return 0xE; /* AL */
 }
 
@@ -1530,6 +1580,29 @@ void store(int r, SValue *sv)
       v = VT_LOCAL;
       fc = sign = 0;
     }
+    else if (v == VT_LOCAL && (sv->pr0 & PREG_SPILLED) && (fr & VT_LVAL) && tcc_is_vreg_valid(tcc_state->ir, sv->vr))
+    {
+      /* Spilled pointer - the address we want to store to is in the spill slot.
+       * Load the address from stack, then store through it with offset 0.
+       * Only do this for valid vregs that were spilled - not for plain stack locations. */
+      int addr_offset = sv->c.i;
+      int addr_sign = (addr_offset < 0);
+      if (addr_sign)
+        addr_offset = -addr_offset;
+      /* Load the address into a free scratch register.
+       * Exclude the source register 'r' to avoid overwriting the value we want to store. */
+      uint32_t exclude_regs = (1 << r);
+      int base_reg = get_free_scratch_reg(exclude_regs);
+
+      if (!load_word_from_base(base_reg, R_FP, addr_offset, addr_sign))
+      {
+        int rr = th_offset_to_reg(addr_offset, addr_sign);
+        ot_check(th_ldr_reg(base_reg, R_FP, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+      }
+      base = base_reg;
+      /* Store to [base + 0] since the address already includes any offset */
+      fc = sign = 0;
+    }
     else if (v == VT_CONST)
     {
       /* Check if we already have this global symbol's base address cached */
@@ -2199,6 +2272,20 @@ void load_to_dest(SValue *dest, SValue *sv)
   fc = sv->c.i;
   int btype = ft & VT_BTYPE;
 
+  /* Handle invalid/uninitialized SValue: if the value part (VT_VALMASK) is 0x3f,
+   * which is an invalid register/value code, this is likely corrupted or
+   * uninitialized. Just load 0 as a fallback. */
+  if ((fr & VT_VALMASK) == 0x3f)
+  {
+    fprintf(stderr, "DEBUG load_to_dest: invalid fr=0x%x, vr=%d, vr_type=%d\n", fr, sv->vr,
+            TCCIR_DECODE_VREG_TYPE(sv->vr));
+    /* Load zero as a safe default */
+    ot_check(th_mov_imm(dest->pr0, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    if (dest->pr1 != PREG_NONE)
+      ot_check(th_mov_imm(dest->pr1, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    return;
+  }
+
   if (fc >= 0)
     sign = 0;
   else
@@ -2218,7 +2305,7 @@ void load_to_dest(SValue *dest, SValue *sv)
   if (fr & VT_LVAL)
   {
     uint32_t base = R_FP;
-    if (tcc_state->ir->leaffunc)
+    if (!tcc_state->need_frame_pointer)
     {
       base = R_SP;
     }
@@ -2317,6 +2404,15 @@ void load_to_dest(SValue *dest, SValue *sv)
         v = VT_LOCAL;
       }
     }
+    else if (v == VT_LOCAL && sv->pr0 != PREG_NONE && !(sv->pr0 & PREG_SPILLED))
+    {
+      /* Preloaded pointer case: pr0 contains the address to load from.
+       * This happens when tcc_ir_preload_spills loaded a spilled pointer. */
+      fprintf(stderr, "DEBUG load_to_dest VT_LOCAL preloaded: base=%d (pr0), orig_fc=%lld -> fc=0\n", sv->pr0,
+              (long long)fc);
+      base = sv->pr0;
+      fc = sign = 0;
+    }
 
     if (v == VT_LOCAL)
     {
@@ -2332,7 +2428,43 @@ void load_to_dest(SValue *dest, SValue *sv)
   else if (v == VT_CONST)
     return load_vt_const(dest->pr0, dest->pr1, sv);
   else if (v == VT_LOCAL)
+  {
+    /* Check if this is a spilled value that needs loading vs address-of computation.
+     * - Spilled value load: pr0 has PREG_SPILLED bit, VT_LVAL was stripped during preload
+     *   -> we need to load the VALUE from stack
+     * - Address-of spilled vreg: pr0 has PREG_SPILLED bit, never had VT_LVAL
+     *   -> we need to compute the ADDRESS (FP + offset)
+     * - Address-of non-spilled: pr0 == PREG_NONE
+     *   -> compute address
+     *
+     * Since we can't distinguish based on VT_LVAL (both cases have no VT_LVAL at this point),
+     * we check if this is coming from a preloaded path vs direct.
+     * If pr0 has PREG_SPILLED and c.i != 0, AND we don't have a valid vr, then load value.
+     * If pr0 has PREG_SPILLED but we have a valid vr (address-of vreg), compute address.
+     */
+    if (sv->pr0 != PREG_NONE && (sv->pr0 & PREG_SPILLED))
+    {
+      /* Check if this is address-of (vr is set) or value load (vr is -1 or 0) */
+      int vreg_type = TCCIR_DECODE_VREG_TYPE(sv->vr);
+      if (vreg_type == 0 || sv->vr == -1 || sv->vr == 0)
+      {
+        /* No valid vreg - this is a spilled value load (from preload path) */
+        int src_offset = sv->c.i;
+        int src_sign = (src_offset < 0);
+        int src_abs = src_sign ? -src_offset : src_offset;
+        if (!load_word_from_base(dest->pr0, R_FP, src_abs, src_sign))
+        {
+          int rr = th_offset_to_reg(src_abs, src_sign);
+          ot_check(th_ldr_reg(dest->pr0, R_FP, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+        }
+        return;
+      }
+      /* Has valid vreg - this is address-of, fall through to compute address */
+    }
+    /* Either pr0 == PREG_NONE (address computation) or address-of with PREG_SPILLED.
+     * Compute address using load_vt_local. */
     return load_vt_local(dest->pr0, sv);
+  }
   else if (v == VT_CMP)
     return load_vt_cmp(dest->pr0, sv);
   else if (v == VT_JMP || v == VT_JMPI)
@@ -2417,7 +2549,8 @@ void load_to_dest(SValue *dest, SValue *sv)
     }
     return;
   }
-  tcc_error("compiler_error: unknown load not implemented\n");
+  tcc_error("compiler_error: unknown load not implemented: v=%d, fr=0x%x, ft=0x%x, VT_LVAL=%d\n", v, fr, ft,
+            (fr & VT_LVAL) ? 1 : 0);
 }
 
 /* Wrapper for legacy load() calls - creates temporary dest SValue */
@@ -2645,8 +2778,23 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
     handler.reg_handler = th_sub_reg;
     break;
   case TCCIR_OP_MUL:
-    ot_check(th_mul(op->dest.pr0, op->src1.pr0, op->src2.pr0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+  {
+    /* MUL instruction doesn't support immediate operands - must be register-register.
+     * If src2 is an immediate, load it into a scratch register first. */
+    int rm = op->src2.pr0;
+    ScratchRegAlloc scratch = {0};
+    if (th_has_immediate_value(op->src2.r))
+    {
+      /* src2 is an immediate - need to load into scratch register */
+      uint32_t exclude = (1 << op->dest.pr0) | (1 << op->src1.pr0);
+      scratch = get_scratch_reg_with_save(exclude);
+      rm = scratch.reg;
+      ot_check(th_mov_imm(rm, op->src2.c.i, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    }
+    ot_check(th_mul(op->dest.pr0, op->src1.pr0, rm, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    restore_scratch_reg(&scratch);
     return;
+  }
   case TCCIR_OP_UMULL:
     /* UMULL: Unsigned 32x32 multiplication producing 64-bit result
      * RdLo (dest.pr0), RdHi (dest.pr1) = Rn (src1.pr0) * Rm (src2.pr0) */
@@ -2672,11 +2820,37 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
   {
     if (is_64bit)
     {
-      /* 64-bit OR: just OR both halves */
+      /* 64-bit OR: OR both halves */
+      /* Low word always ORed */
       ot_check(th_orr_reg(op->dest.pr0, op->src1.pr0, op->src2.pr0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
                           ENFORCE_ENCODING_NONE));
-      ot_check(th_orr_reg(op->dest.pr1, op->src1.pr1, op->src2.pr1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                          ENFORCE_ENCODING_NONE));
+      /* High word: handle mixed 32/64-bit operands */
+      /* For OR: 32-bit value has 0 in high word, ORing with 0 = original */
+      if (op->src1.pr1 == PREG_NONE && op->src2.pr1 == PREG_NONE)
+      {
+        /* Both operands are 32-bit, high word is 0 */
+        ot_check(th_mov_imm(op->dest.pr1, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+      }
+      else if (op->src2.pr1 == PREG_NONE)
+      {
+        /* src2 is 32-bit, just copy src1's high word */
+        if (op->dest.pr1 != op->src1.pr1)
+          ot_check(th_mov_reg(op->dest.pr1, op->src1.pr1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                              ENFORCE_ENCODING_NONE, false));
+      }
+      else if (op->src1.pr1 == PREG_NONE)
+      {
+        /* src1 is 32-bit, just copy src2's high word */
+        if (op->dest.pr1 != op->src2.pr1)
+          ot_check(th_mov_reg(op->dest.pr1, op->src2.pr1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                              ENFORCE_ENCODING_NONE, false));
+      }
+      else
+      {
+        /* Both operands are 64-bit */
+        ot_check(th_orr_reg(op->dest.pr1, op->src1.pr1, op->src2.pr1, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                            THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+      }
       return;
     }
     handler.imm_handler = th_orr_imm;
@@ -2687,11 +2861,23 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
   {
     if (is_64bit)
     {
-      /* 64-bit AND: just AND both halves */
+      /* 64-bit AND: AND both halves */
+      /* Low word always ANDed */
       ot_check(th_and_reg(op->dest.pr0, op->src1.pr0, op->src2.pr0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
                           ENFORCE_ENCODING_NONE));
-      ot_check(th_and_reg(op->dest.pr1, op->src1.pr1, op->src2.pr1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                          ENFORCE_ENCODING_NONE));
+      /* High word: handle mixed 32/64-bit operands */
+      /* For AND: 32-bit value has 0 in high word, ANDing with 0 = 0 */
+      if (op->src1.pr1 == PREG_NONE || op->src2.pr1 == PREG_NONE)
+      {
+        /* Either operand is 32-bit, high word becomes 0 */
+        ot_check(th_mov_imm(op->dest.pr1, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+      }
+      else
+      {
+        /* Both operands are 64-bit */
+        ot_check(th_and_reg(op->dest.pr1, op->src1.pr1, op->src2.pr1, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                            THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+      }
       return;
     }
     handler.imm_handler = th_and_imm;
@@ -2702,11 +2888,37 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
   {
     if (is_64bit)
     {
-      /* 64-bit XOR: just XOR both halves */
+      /* 64-bit XOR: XOR both halves */
+      /* Low word always XORed */
       ot_check(th_eor_reg(op->dest.pr0, op->src1.pr0, op->src2.pr0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
                           ENFORCE_ENCODING_NONE));
-      ot_check(th_eor_reg(op->dest.pr1, op->src1.pr1, op->src2.pr1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                          ENFORCE_ENCODING_NONE));
+      /* High word: handle mixed 32/64-bit operands */
+      /* For XOR: 32-bit value has 0 in high word, XORing with 0 = original */
+      if (op->src1.pr1 == PREG_NONE && op->src2.pr1 == PREG_NONE)
+      {
+        /* Both operands are 32-bit, high word is 0 */
+        ot_check(th_mov_imm(op->dest.pr1, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+      }
+      else if (op->src2.pr1 == PREG_NONE)
+      {
+        /* src2 is 32-bit, just copy src1's high word */
+        if (op->dest.pr1 != op->src1.pr1)
+          ot_check(th_mov_reg(op->dest.pr1, op->src1.pr1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                              ENFORCE_ENCODING_NONE, false));
+      }
+      else if (op->src1.pr1 == PREG_NONE)
+      {
+        /* src1 is 32-bit, just copy src2's high word */
+        if (op->dest.pr1 != op->src2.pr1)
+          ot_check(th_mov_reg(op->dest.pr1, op->src2.pr1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                              ENFORCE_ENCODING_NONE, false));
+      }
+      else
+      {
+        /* Both operands are 64-bit */
+        ot_check(th_eor_reg(op->dest.pr1, op->src1.pr1, op->src2.pr1, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                            THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+      }
       return;
     }
     handler.imm_handler = th_eor_imm;
@@ -2767,6 +2979,90 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
     ot_check(th_udiv(op->dest.pr0, src1_reg, src2_reg));
     return;
   }
+  case TCCIR_OP_IMOD:
+  {
+    /* Signed modulo: result = dividend - (dividend / divisor) * divisor */
+    int src1_reg = op->src1.pr0;
+    int src2_reg = op->src2.pr0;
+    int dest_reg = op->dest.pr0;
+    uint32_t exclude_regs = (1 << dest_reg);
+
+    /* Handle constant operands */
+    if (th_has_immediate_value(op->src1.r))
+    {
+      src1_reg = get_free_scratch_reg(exclude_regs);
+      exclude_regs |= (1 << src1_reg);
+      load_to_reg(src1_reg, PREG_NONE, &op->src1);
+    }
+    else if (src1_reg >= 0)
+    {
+      exclude_regs |= (1 << src1_reg);
+    }
+    if (th_has_immediate_value(op->src2.r))
+    {
+      src2_reg = get_free_scratch_reg(exclude_regs);
+      exclude_regs |= (1 << src2_reg);
+      load_to_reg(src2_reg, PREG_NONE, &op->src2);
+    }
+    else if (src2_reg >= 0)
+    {
+      exclude_regs |= (1 << src2_reg);
+    }
+
+    /* Get scratch register for quotient */
+    int scratch = get_free_scratch_reg(exclude_regs);
+
+    /* quotient = dividend / divisor (signed) */
+    ot_check(th_sdiv(scratch, src1_reg, src2_reg));
+    /* quotient = quotient * divisor */
+    ot_check(th_mul(scratch, scratch, src2_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    /* result = dividend - quotient */
+    ot_check(th_sub_reg(dest_reg, src1_reg, scratch, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                        ENFORCE_ENCODING_NONE));
+    return;
+  }
+  case TCCIR_OP_UMOD:
+  {
+    /* Unsigned modulo: result = dividend - (dividend / divisor) * divisor */
+    int src1_reg = op->src1.pr0;
+    int src2_reg = op->src2.pr0;
+    int dest_reg = op->dest.pr0;
+    uint32_t exclude_regs = (1 << dest_reg);
+
+    /* Handle constant operands */
+    if (th_has_immediate_value(op->src1.r))
+    {
+      src1_reg = get_free_scratch_reg(exclude_regs);
+      exclude_regs |= (1 << src1_reg);
+      load_to_reg(src1_reg, PREG_NONE, &op->src1);
+    }
+    else if (src1_reg >= 0)
+    {
+      exclude_regs |= (1 << src1_reg);
+    }
+    if (th_has_immediate_value(op->src2.r))
+    {
+      src2_reg = get_free_scratch_reg(exclude_regs);
+      exclude_regs |= (1 << src2_reg);
+      load_to_reg(src2_reg, PREG_NONE, &op->src2);
+    }
+    else if (src2_reg >= 0)
+    {
+      exclude_regs |= (1 << src2_reg);
+    }
+
+    /* Get scratch register for quotient */
+    int scratch = get_free_scratch_reg(exclude_regs);
+
+    /* quotient = dividend / divisor (unsigned) */
+    ot_check(th_udiv(scratch, src1_reg, src2_reg));
+    /* quotient = quotient * divisor */
+    ot_check(th_mul(scratch, scratch, src2_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    /* result = dividend - quotient */
+    ot_check(th_sub_reg(dest_reg, src1_reg, scratch, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                        ENFORCE_ENCODING_NONE));
+    return;
+  }
   case TCCIR_OP_ADC_USE:
   {
     handler.imm_handler = th_adc_imm;
@@ -2804,33 +3100,47 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
     int src2_reg = op->src2.pr0;
     int src1_is_imm = th_has_immediate_value(op->src1.r);
     int src2_is_imm = th_has_immediate_value(op->src2.r);
+    /* Check if src1 is VT_LOCAL address-of (needs address computation) */
+    int src1_is_address_of = ((op->src1.r & VT_VALMASK) == VT_LOCAL) && !(op->src1.r & VT_LVAL);
+    /* Check if src2 is VT_LOCAL address-of (needs address computation) */
+    int src2_is_address_of = ((op->src2.r & VT_VALMASK) == VT_LOCAL) && !(op->src2.r & VT_LVAL);
+    /* Check if src1 needs loading: immediate, address-of, or invalid/spilled register */
+    int src1_needs_load = src1_is_imm || src1_is_address_of || src1_reg == PREG_NONE || (src1_reg & PREG_SPILLED);
+    /* Check if src2 needs loading: immediate, address-of, or invalid/spilled register */
+    int src2_needs_load = src2_is_imm || src2_is_address_of || src2_reg == PREG_NONE || (src2_reg & PREG_SPILLED);
     uint32_t exclude_regs = 0;
 
     /* Exclude destination register from scratch selection */
     if (op->dest.pr0 != PREG_NONE && !(op->dest.pr0 & PREG_SPILLED))
       exclude_regs |= (1 << op->dest.pr0);
 
-    /* Load constant src1 into scratch register */
-    if (src1_is_imm)
+    /* Load src1 into scratch register if needed (immediate, VT_LOCAL address, spilled, etc.) */
+    if (src1_needs_load)
     {
       src1_reg = get_free_scratch_reg(exclude_regs);
       exclude_regs |= (1 << src1_reg);
       load_to_reg(src1_reg, PREG_NONE, &op->src1);
     }
-    else if (src1_reg >= 0)
+    else if (src1_reg >= 0 && src1_reg < 16)
     {
       exclude_regs |= (1 << src1_reg);
     }
 
     if (src2_is_imm)
     {
-      /* Try immediate form first (only if src1 is not also immediate) */
+      /* Try immediate form first (only if src1 didn't need loading from immediate) */
       if (!src1_is_imm && handler.imm_handler &&
           ot(handler.imm_handler(op->dest.pr0, src1_reg, op->src2.c.i, flags, ENFORCE_ENCODING_NONE)))
       {
         return;
       }
       /* Immediate form failed or not available, load to scratch register */
+      src2_reg = get_free_scratch_reg(exclude_regs);
+      load_to_reg(src2_reg, PREG_NONE, &op->src2);
+    }
+    else if (src2_needs_load)
+    {
+      /* src2 is not immediate but needs loading (VT_LOCAL address, spilled, etc.) */
       src2_reg = get_free_scratch_reg(exclude_regs);
       load_to_reg(src2_reg, PREG_NONE, &op->src2);
     }
@@ -3442,6 +3752,10 @@ void tcc_gen_machine_load_op(TACQuadruple *op)
 {
   TRACE("'tcc_gen_machine_load_op'");
 
+  fprintf(stderr,
+          "DEBUG tcc_gen_machine_load_op: dest.vr=%d dest.pr0=%d src1.vr=%d src1.pr0=%d src1.r=0x%x src1.c.i=%lld\n",
+          op->dest.vr, op->dest.pr0, op->src1.vr, op->src1.pr0, op->src1.r, (long long)op->src1.c.i);
+
   /* NOTE: All spilled dest handling is now done centrally in generate_code.
    * This function just loads from the source address to the destination register. */
   load_to_dest(&op->dest, &op->src1);
@@ -3560,9 +3874,34 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
       int alloc_r1 = interval->allocation.r1;
       int is_64bit = interval->is_double || interval->is_llong;
 
-      /* Skip if parameter came from stack (not in registers) */
+      /* Handle stack-passed parameters (incoming_r0 < 0) that need to be loaded
+       * into their allocated registers */
       if (incoming_r0 < 0)
+      {
+        /* Parameter came from caller's stack frame */
+        if (alloc_r0 != PREG_SPILLED && alloc_r0 >= 0 && interval->allocation.offset == 0)
+        {
+          /* Linear scan allocated a register - load from caller's stack frame.
+           * The offset is stored in original_offset and is relative to SP after
+           * prolog (i.e., above the saved registers and local stack frame).
+           * We need to add: stack_size (locals) + offset_to_args (pushed regs) */
+          int caller_stack_offset = stack_size + offset_to_args + interval->original_offset;
+          if (is_64bit && alloc_r1 >= 0)
+          {
+            /* 64-bit: load both registers */
+            tcc_gen_machine_load_from_stack(alloc_r0, caller_stack_offset);
+            tcc_gen_machine_load_from_stack(alloc_r1, caller_stack_offset + 4);
+          }
+          else
+          {
+            /* 32-bit: load single register */
+            tcc_gen_machine_load_from_stack(alloc_r0, caller_stack_offset);
+          }
+        }
+        /* If spilled, the parameter stays on the caller's stack and will be
+         * accessed from there when needed */
         continue;
+      }
 
       /* Check if we need to move/store the parameter */
       if (alloc_r0 == PREG_SPILLED || interval->allocation.offset != 0)
@@ -3655,8 +3994,10 @@ ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *op)
                  (src_btype == VT_DOUBLE) || (src_btype == VT_LDOUBLE) || (src_btype == VT_LLONG);
   int dest_is_local = (op->dest.r & VT_VALMASK) == VT_LOCAL;
 
-  TRACE("ASSIGN DEBUG: dest.vr=%d, dest.r=0x%x (VT_LOCAL=%d), dest.pr0=%d, src1.pr0=%d", op->dest.vr, op->dest.r,
-        dest_is_local, op->dest.pr0, op->src1.pr0);
+  fprintf(stderr,
+          "DEBUG tcc_gen_machine_assign_op: dest.vr=%d, dest.r=0x%x (VT_LOCAL=%d), dest.pr0=%d, src1.vr=%d src1.pr0=%d "
+          "src1.r=0x%x\n",
+          op->dest.vr, op->dest.r, dest_is_local, op->dest.pr0, op->src1.vr, op->src1.pr0, op->src1.r);
 
   /* NOTE: Spilled destination handling is now done centrally in generate_code
    * via tcc_ir_storeback_spill. src1 is also preloaded if it was spilled. */
@@ -3675,6 +4016,14 @@ ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *op)
     {
       load_to_dest(&op->dest, &op->src1);
     }
+    return;
+  }
+
+  /* Handle VT_LOCAL - this is address-of spilled vreg.
+   * The src1.r will be VT_LOCAL without VT_LVAL (address computation, not value load). */
+  if ((op->src1.r & VT_VALMASK) == VT_LOCAL)
+  {
+    load_to_dest(&op->dest, &op->src1);
     return;
   }
 
@@ -3708,15 +4057,13 @@ ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *op)
                         ENFORCE_ENCODING_NONE, false));
   }
 
-  /* BUGFIX: For VT_LOCAL destinations, we need to write back to memory even if
-   * a register was allocated. The register serves as a cache, but the canonical
-   * location is still on the stack. This is critical for compound assignments
-   * like `index += 1` where the incremented value must be stored back. */
-  if (dest_is_local && op->dest.pr0 != PREG_NONE)
-  {
-    TRACE("ASSIGN: Writing back local variable from R%d to memory at offset %d", op->dest.pr0, op->dest.c.i);
-    store(op->dest.pr0, &op->dest);
-  }
+  /* NOTE: Writeback to memory for spilled destinations is handled by tcc_ir_storeback_spill
+   * in generate_code(). We should NOT do an inline writeback here because:
+   * 1. Spilled temporaries (TMP vregs) are handled by storeback_spill
+   * 2. For actual local variables (VAR vregs) that are in registers, the register IS the
+   *    canonical location - no writeback needed.
+   * 3. Double writeback causes bugs when VT_LVAL is set (would store TO address instead of AT address)
+   */
 }
 
 // r0 - function
@@ -3760,6 +4107,22 @@ ST_FUNC void tcc_gen_machine_store_to_stack(int reg, int offset)
     /* Offset too large, use scratch register */
     int rr = th_offset_to_reg(abs_offset, sign);
     ot_check(th_str_reg(reg, R_FP, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+  }
+}
+
+/* Load a register from a stack slot relative to SP.
+ * offset is typically positive (parameters above current SP). */
+static void tcc_gen_machine_load_from_stack(int reg, int offset)
+{
+  int sign = (offset < 0);
+  int abs_offset = sign ? -offset : offset;
+
+  /* Try direct LDR with immediate offset */
+  if (!load_word_from_base(reg, R_SP, abs_offset, sign))
+  {
+    /* Offset too large, use scratch register */
+    int rr = th_offset_to_reg(abs_offset, sign);
+    ot_check(th_ldr_reg(reg, R_SP, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
   }
 }
 
@@ -4059,7 +4422,27 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
     is_64bit = is_64bit_type(arg->src1.type.t);
     if (is_64bit)
     {
-      // store(R_SP, &arg->src1);
+      /* 64-bit stack arguments must be 8-byte aligned */
+      stack_offset = TCC_ALIGN(stack_offset, 8);
+
+      int reg_lo = arg->src1.pr0;
+      int reg_hi = arg->src1.pr1;
+
+      /* Load low and high parts into scratch registers if needed */
+      if (reg_lo == PREG_NONE || (reg_lo & PREG_SPILLED) || (arg->src1.r & VT_LVAL))
+      {
+        /* Need to load the 64-bit value to registers first */
+        int scratch_lo = get_free_scratch_reg(0);
+        int scratch_hi = get_free_scratch_reg(1 << scratch_lo);
+        load_to_reg(scratch_lo, scratch_hi, &arg->src1);
+        reg_lo = scratch_lo;
+        reg_hi = scratch_hi;
+      }
+
+      /* Store low word first, then high word */
+      ot_check(th_str_imm(reg_lo, R_SP, stack_offset, 6, ENFORCE_ENCODING_NONE));
+      ot_check(th_str_imm(reg_hi, R_SP, stack_offset + 4, 6, ENFORCE_ENCODING_NONE));
+      stack_offset += 8;
     }
     else
     {

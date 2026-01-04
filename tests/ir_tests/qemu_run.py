@@ -13,8 +13,11 @@ def get_test_output_file(test_name):
 def build_make_command(test_file, machine, compiler):
     return f'make -C qemu/{machine} OUTPUT={CURRENT_DIR}/build TEST_FILES={test_file} CC={compiler} TARGET={get_test_output_file(test_file)}'
 
-def build_qemu_command(machine, kernel_file):
-    return f'qemu-system-arm -machine {machine} -nographic -semihosting -kernel {kernel_file}'
+def build_qemu_command(machine, kernel_file, args=None):
+    cmd = f'qemu-system-arm -machine {machine} -nographic -semihosting -kernel {kernel_file}'
+    if args:
+        cmd += ' -append "' + ' '.join(args) + '"'
+    return cmd
 
 def compile_testcase(test_file, machine, compiler=f"{CURRENT_DIR}/../../armv8m-tcc"):
     global was_cleaned
@@ -36,14 +39,14 @@ def compile_testcase(test_file, machine, compiler=f"{CURRENT_DIR}/../../armv8m-t
     result = get_test_output_file(test_file)
     return result, output_lines
 
-def prepare_test(machine, kernel_file):
-    qemu_command = build_qemu_command(machine, kernel_file)
+def prepare_test(machine, kernel_file, args=None):
+    qemu_command = build_qemu_command(machine, kernel_file, args)
     return pexpect.spawn(qemu_command)
 
-def run_test(test_file, machine):
+def run_test(test_file, machine, args=None):
     test_name = Path(test_file).stem
     output_file, loglines = compile_testcase(CURRENT_DIR / test_file, machine)
-    sut = prepare_test(machine, output_file)
+    sut = prepare_test(machine, output_file, args)
 
     # Enable logging to file using test name
     log_file = open(f"{CURRENT_DIR}/build/{test_name}_output.log", "wb")

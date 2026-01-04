@@ -77,6 +77,7 @@ void tcc_ls_add_live_interval(LSLiveIntervalState *ls, int vreg, int start, int 
   interval->crosses_call = crosses_call;
   interval->addrtaken = addrtaken;
   interval->reg_type = reg_type;
+  interval->lvalue = lvalue;
   ls->next_interval_index++;
 }
 

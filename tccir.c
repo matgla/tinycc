@@ -713,6 +713,14 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
   const int pos = ir->next_instruction_index;
   TACQuadruple *q;
 
+#ifdef DEBUG_IR_GEN
+  if (op == TCCIR_OP_LOAD)
+  {
+    fprintf(stderr, "DEBUG tcc_ir_put LOAD: pos=%d, src1.vr=%d, src1.r=0x%x, dest.vr=%d\n",
+            pos, src1 ? src1->vr : -1, src1 ? src1->r : 0, dest ? dest->vr : -1);
+  }
+#endif
+
   /* Ensure any anonymous symbols in the operands are registered before
    * storing them in the IR instruction. This prevents use-after-free when
    * local scopes are popped before the IR is processed. */
@@ -834,6 +842,10 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
      * redirect that instruction's dest to our dest and skip this ASSIGN. */
     int can_coalesce = (!ir->prevent_coalescing) && (TCCIR_DECODE_VREG_TYPE(src1->vr) == TCCIR_VREG_TYPE_TEMP) &&
                        ((src1->r & VT_LVAL) == 0) && (src1->vr == ir->instructions[pos - 1].dest.vr);
+#ifdef DEBUG_IR_GEN
+    fprintf(stderr, "DEBUG ASSIGN coalesce check: pos=%d, src1->vr=%d, prev_dest_vr=%d, can_coalesce=%d\n",
+            pos, src1->vr, ir->instructions[pos - 1].dest.vr, can_coalesce);
+#endif
     if (can_coalesce)
     {
       /* When coalescing, preserve the original c.i offset for global symbols.
@@ -922,7 +934,8 @@ int tcc_ir_get_vreg_param(TCCIRState *ir)
 
 void tcc_ir_set_addrtaken(TCCIRState *ir, int vreg)
 {
-  if (vreg < 0)
+  /* Check for invalid vreg: -1 is sentinel, and type 0 is invalid */
+  if (vreg < 0 || TCCIR_DECODE_VREG_TYPE(vreg) == 0)
     return;
   IRLiveInterval *interval = tcc_ir_get_live_interval(ir, vreg);
   if (interval)
@@ -933,7 +946,8 @@ void tcc_ir_set_addrtaken(TCCIRState *ir, int vreg)
 
 void tcc_ir_set_float_type(TCCIRState *ir, int vreg, int is_float, int is_double)
 {
-  if (vreg < 0)
+  /* Check for invalid vreg: -1 is sentinel, and type 0 is invalid */
+  if (vreg < 0 || TCCIR_DECODE_VREG_TYPE(vreg) == 0)
     return;
   IRLiveInterval *interval = tcc_ir_get_live_interval(ir, vreg);
   if (interval)
@@ -948,7 +962,8 @@ void tcc_ir_set_float_type(TCCIRState *ir, int vreg, int is_float, int is_double
 
 void tcc_ir_set_llong_type(TCCIRState *ir, int vreg)
 {
-  if (vreg < 0)
+  /* Check for invalid vreg: -1 is sentinel, and type 0 is invalid */
+  if (vreg < 0 || TCCIR_DECODE_VREG_TYPE(vreg) == 0)
     return;
   IRLiveInterval *interval = tcc_ir_get_live_interval(ir, vreg);
   if (interval)
@@ -959,7 +974,8 @@ void tcc_ir_set_llong_type(TCCIRState *ir, int vreg)
 
 void tcc_ir_set_original_offset(TCCIRState *ir, int vreg, int offset)
 {
-  if (vreg < 0)
+  /* Check for invalid vreg: -1 is sentinel, and type 0 is invalid */
+  if (vreg < 0 || TCCIR_DECODE_VREG_TYPE(vreg) == 0)
     return;
   IRLiveInterval *interval = tcc_ir_get_live_interval(ir, vreg);
   if (interval)
@@ -970,7 +986,8 @@ void tcc_ir_set_original_offset(TCCIRState *ir, int vreg, int offset)
 
 int tcc_ir_get_reg_type(TCCIRState *ir, int vreg)
 {
-  if (vreg < 0)
+  /* Check for invalid vreg: -1 is sentinel, and type 0 is invalid */
+  if (vreg < 0 || TCCIR_DECODE_VREG_TYPE(vreg) == 0)
     return LS_REG_TYPE_INT;
   IRLiveInterval *interval = tcc_ir_get_live_interval(ir, vreg);
   if (interval)
@@ -1458,7 +1475,12 @@ void tcc_ir_register_allocation_params(TCCIRState *ir)
         /* Spilled to caller's stack frame - parameter passed on stack */
         interval->incoming_reg0 = -1;
         interval->incoming_reg1 = -1;
-        if (ir->leaffunc && !already_spilled)
+        /* Record where the parameter arrives on the caller's stack frame.
+         * This is relative to SP after prolog (positive offset above saved regs).
+         * The prolog needs to load this into the allocated register. */
+        interval->original_offset = (argno - 4) * 4;
+        /* Only overwrite register allocation if linear scan already spilled it */
+        if (already_spilled)
         {
           tcc_ir_assign_physical_register(ir, encoded_vreg, (argno - 4) * 4, -1, -1);
         }
@@ -1482,7 +1504,12 @@ void tcc_ir_register_allocation_params(TCCIRState *ir)
         /* Spilled to caller's stack frame - parameter passed on stack */
         interval->incoming_reg0 = -1;
         interval->incoming_reg1 = -1;
-        if (ir->leaffunc && !already_spilled)
+        /* Record where the parameter arrives on the caller's stack frame.
+         * This is relative to SP after prolog (positive offset above saved regs).
+         * The prolog needs to load this into the allocated register. */
+        interval->original_offset = (argno - 4) * 4;
+        /* Only overwrite register allocation if linear scan already spilled it */
+        if (already_spilled)
         {
           tcc_ir_assign_physical_register(ir, encoded_vreg, (argno - 4) * 4, -1, -1);
         }
@@ -1494,12 +1521,59 @@ void tcc_ir_register_allocation_params(TCCIRState *ir)
 
 void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
 {
+  int old_r = sv->r;
   if (tcc_is_vreg_valid(ir, sv->vr))
   {
     IRLiveInterval *interval = tcc_ir_get_live_interval(ir, sv->vr);
     sv->pr0 = interval->allocation.r0;
     sv->pr1 = interval->allocation.r1;
     sv->c.i = interval->allocation.offset;
+
+    /* Determine if we should preserve VT_LVAL:
+     * - If old_r was VT_LOCAL|VT_LVAL (local variable on stack), and now
+     *   it's allocated to a register, we should NOT preserve VT_LVAL because
+     *   the value is already in the register, no load needed.
+     * - If old_r has VT_LVAL but (old_r & VT_VALMASK) < VT_CONST, it means
+     *   the vreg holds a pointer that needs dereferencing - preserve VT_LVAL.
+     * - If old_r does NOT have VT_LVAL, this is an address-of operation
+     *   (we want the address, not the value). Do NOT add VT_LVAL. */
+    int old_v = old_r & VT_VALMASK;
+    int preserve_lval = 0;
+    if ((old_r & VT_LVAL) && old_v < VT_CONST)
+    {
+      /* The vreg holds a pointer that needs dereferencing */
+      preserve_lval = VT_LVAL;
+    }
+    /* If old_v == VT_LOCAL, VT_LVAL was for stack access - don't preserve
+     * when allocated to register */
+
+    if (interval->allocation.r0 == PREG_SPILLED || interval->allocation.offset != 0)
+    {
+      /* Spilled to stack - treat as local.
+       * For computed values (old_r was 0 or a register), add VT_LVAL to load the value.
+       * For address-of expressions (old_r == VT_LOCAL without VT_LVAL), don't add VT_LVAL.
+       * If original had VT_LVAL (pointer dereference), preserve it. */
+      int need_lval = (old_r & VT_LVAL);
+      if (old_v < VT_CONST && old_v != VT_LOCAL)
+      {
+        /* old_r was a register or 0 (computed value) - need VT_LVAL to load from stack */
+        need_lval = VT_LVAL;
+      }
+      sv->r = VT_LOCAL | need_lval;
+    }
+    else if (interval->allocation.r0 != PREG_NONE)
+    {
+      /* In a register - set r to the register number, preserving VT_LVAL only for pointer derefs */
+      sv->r = interval->allocation.r0 | preserve_lval;
+    }
+  }
+  else if ((sv->vr == -1 || sv->vr == 0 || TCCIR_DECODE_VREG_TYPE(sv->vr) == 0) &&
+           (sv->r == -1 || sv->r == (int)0xffff || (sv->r & VT_VALMASK) == 0x3f))
+  {
+    /* No valid vreg and invalid .r - this is likely a constant that wasn't
+       properly marked. Treat as VT_CONST while preserving important flags. */
+    int flags = sv->r & (VT_LVAL | VT_SYM);
+    sv->r = VT_CONST | flags;
   }
 }
 
@@ -1513,14 +1587,12 @@ int tcc_ir_dead_code_elimination(TCCIRState *ir)
   if (n == 0)
     return 0;
 
-  /* Allocate reachability bitmap and old->new index mapping */
   uint8_t *reachable = tcc_mallocz((n + 7) / 8);
-  int *new_index = tcc_malloc(sizeof(int) * n);
-
-  /* Mark reachable instructions using a worklist algorithm */
-  int *worklist = tcc_malloc(sizeof(int) * n);
+  int *new_index = tcc_malloc(n * sizeof(int));
+  int *worklist = tcc_malloc(n * sizeof(int));
   int worklist_head = 0, worklist_tail = 0;
 
+/* Mark instruction as reachable if not already marked */
 #define MARK_REACHABLE(idx)                                                                                            \
   do                                                                                                                   \
   {                                                                                                                    \
@@ -3444,8 +3516,13 @@ int tcc_ir_arithmetic_cse(TCCIRState *ir)
                  e->instruction_idx);
 #endif
           q->op = TCCIR_OP_ASSIGN;
-          q->src1.r = 0;
-          q->src1.vr = e->result_vr;
+          /* Create a reference to the previous instruction's dest vreg.
+           * IMPORTANT: Only copy vr and type - do NOT copy VT_LVAL or other flags
+           * that might cause incorrect dereferencing. The dest vreg holds a VALUE,
+           * not an address to be dereferenced. */
+          q->src1.vr = ir->instructions[e->instruction_idx].dest.vr;
+          q->src1.type = ir->instructions[e->instruction_idx].dest.type;
+          q->src1.r = 0; /* No flags - this is a simple vreg read */
           q->src1.c.i = 0;
           memset(&q->src2, 0, sizeof(q->src2));
           q->src2.vr = -1;
@@ -3469,8 +3546,13 @@ int tcc_ir_arithmetic_cse(TCCIRState *ir)
                  e->instruction_idx);
 #endif
           q->op = TCCIR_OP_ASSIGN;
-          q->src1.r = 0;
-          q->src1.vr = e->result_vr;
+          /* Create a reference to the previous instruction's dest vreg.
+           * IMPORTANT: Only copy vr and type - do NOT copy VT_LVAL or other flags
+           * that might cause incorrect dereferencing. The dest vreg holds a VALUE,
+           * not an address to be dereferenced. */
+          q->src1.vr = ir->instructions[e->instruction_idx].dest.vr;
+          q->src1.type = ir->instructions[e->instruction_idx].dest.type;
+          q->src1.r = 0; /* No flags - this is a simple vreg read */
           q->src1.c.i = 0;
           memset(&q->src2, 0, sizeof(q->src2));
           q->src2.vr = -1;
@@ -3983,6 +4065,8 @@ void tcc_ir_generate_code(TCCIRState *ir)
     case TCCIR_OP_XOR:
     case TCCIR_OP_DIV:
     case TCCIR_OP_UDIV:
+    case TCCIR_OP_IMOD:
+    case TCCIR_OP_UMOD:
     case TCCIR_OP_SAR:
     case TCCIR_OP_UMULL:
     case TCCIR_OP_ADC_GEN:
@@ -4169,6 +4253,8 @@ void print_svalue_short(SValue *sv)
       printf("GlobalSym(%d)", sv->sym->v);
       if (sv->c.i != 0)
         printf("+%d", (int)sv->c.i);
+      if (sv->r & VT_LVAL)
+        printf("***DEREF***");
     }
     else
     {
@@ -4317,6 +4403,10 @@ void tcc_print_quadruple(TACQuadruple *q, int pc)
   /* additional information */
   if (op == TCCIR_OP_STORE)
     printf(" [STORE]");
+  else if (op == TCCIR_OP_LOAD)
+    printf(" [LOAD]");
+  else if (op == TCCIR_OP_ASSIGN)
+    printf(" [ASSIGN]");
   else if (op == TCCIR_OP_FUNCCALLVAL)
   {
     printf(" --> ");
@@ -4538,6 +4628,11 @@ int tcc_ir_generate_test(TCCIRState *ir, int inv, int t)
     /* Use cmp_op and invert if needed. In TCC, comparison tokens are designed
      * so that XORing with 1 inverts them (e.g., TOK_EQ ^ 1 = TOK_NE) */
     int cond = vtop->cmp_op ^ inv;
+    /* Validate condition is a valid comparison token */
+    if (cond < TOK_ULT || cond > TOK_GT)
+    {
+      fprintf(stderr, "DEBUG tcc_ir_generate_test: invalid cmp_op=%d, inv=%d, cond=%d\n", vtop->cmp_op, inv, cond);
+    }
     src.c.i = cond;
     dest.vr = -1;
     dest.c.i = t;
@@ -4781,14 +4876,35 @@ ST_FUNC int tcc_has_quadruple_64bit_operand(TACQuadruple *q)
 static bool tcc_ir_operand_needs_dereference(SValue *sv)
 {
   const int val_loc = sv->r & VT_VALMASK;
+#ifdef DEBUG_IR_GEN
+  fprintf(stderr, "DEBUG needs_deref: sv->r=0x%x, val_loc=0x%x, VT_LVAL=%d\n",
+          sv->r, val_loc, (sv->r & VT_LVAL) != 0);
+#endif
   switch (val_loc)
   {
   case VT_CONST:
+    /* VT_CONST with VT_LVAL means we're loading through a global symbol address.
+     * For example: a.x where 'a' is a static struct - the address is a constant
+     * (global symbol) but we need to dereference it to get the value. */
+#ifdef DEBUG_IR_GEN
+    fprintf(stderr, "DEBUG needs_deref VT_CONST: returning %d\n", (sv->r & VT_LVAL) != 0);
+#endif
+    return (sv->r & VT_LVAL) != 0;
   case VT_LLOCAL:
-  case VT_LOCAL:
   case VT_CMP:
   case VT_JMP:
   case VT_JMPI:
+    return false;
+  case VT_LOCAL:
+    /* VT_LOCAL with VT_LVAL normally means "load from stack slot", no dereference.
+     * BUT if pr0 is a valid register (not PREG_NONE, not PREG_SPILLED, and a valid
+     * register number < PREG_SPILLED), it means this was a spilled pointer vreg
+     * that got preloaded - the address is now in pr0 and we need to dereference
+     * it to get the actual data. */
+    if ((sv->r & VT_LVAL) && sv->pr0 != PREG_NONE && sv->pr0 < PREG_SPILLED)
+    {
+      return true;
+    }
     return false;
   default: /* must be temporary vreg */
     return (sv->r & VT_LVAL) != 0;

@@ -48,13 +48,20 @@ TEST_FILES = [
     # ("../tests2/22_floating_point.c", 0), # float support
     # ("../tests2/23_type_coercion.c", 0), # float support
     # ("../tests2/24_math_library.c", 0), # float support
+    # ("../tests2/32_led.c", 0), # double support
     ("../tests2/25_quicksort.c", 0),
     ("../tests2/26_character_constants.c", 0),
     ("../tests2/27_sizeof.c", 0),
     ("../tests2/28_strings.c", 0),
     ("../tests2/29_array_address.c", 0),
     ("../tests2/30_hanoi.c", 0),
+    ("../tests2/33_ternary_op.c", 0),
+
     ("../tests2/72_long_long_constant.c", 0),
+]
+
+TEST_FILES_WITH_ARGS = [
+    ("../tests2/31_args.c", ["arg1", "arg2", "arg3", "arg4", "arg5"], 0),
 ]
 
 def load_expect_file(test_name):
@@ -82,6 +89,40 @@ def test_qemu_execution(test_file, expected_exit_code):
 
     expected_lines = load_expect_file(test_file)
     sut, loglines = run_test(test_file, MACHINE)
+    # remove expected compiler output
+    compiler_verified = False
+    for line in expected_lines:
+        if compiler_verified:
+            break
+        for logline in loglines:
+            if line in logline:
+                expected_lines = [l for l in expected_lines if l != line]
+                compiler_verified = True
+                break
+
+
+    try:
+        for line in expected_lines:
+            if not line is None:
+                sut.expect(line, timeout=1)
+
+        sut.wait()
+        assert sut.exitstatus == expected_exit_code, f"Expected exit code {expected_exit_code}, got {sut.exitstatus}"
+
+        sut.logfile.close()
+    except Exception as e:
+        # Save output log on failure
+        sut.logfile.close()
+        raise AssertionError(f"Test failed for {test_file}: {e}") from e
+
+
+@pytest.mark.parametrize("test_file,args,expected_exit_code", TEST_FILES_WITH_ARGS, ids=[Path(f[0]).stem for f in TEST_FILES_WITH_ARGS])
+def test_qemu_execution_with_args(test_file, args, expected_exit_code):
+    if test_file is None:
+        pytest.fail("test_file is None")
+
+    expected_lines = load_expect_file(test_file)
+    sut, loglines = run_test(test_file, MACHINE, args)
     # remove expected compiler output
     compiler_verified = False
     for line in expected_lines:
