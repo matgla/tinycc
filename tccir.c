@@ -2984,6 +2984,366 @@ int tcc_ir_copy_propagation(TCCIRState *ir)
 
   return changes;
 }
+
+/* Store-Load Forwarding
+ * Phase 4: Replace loads from addresses that were just stored to with the stored value
+ * Uses conservative basic-block-local alias analysis:
+ *   - Stack locals (VT_LOCAL) never alias pointer derefs
+ *   - Track base vreg + offset for array accesses
+ *   - Clear all pointer-based stores at unknown stores
+ *   - Clear all stores at basic block boundaries and function calls
+ */
+int tcc_ir_store_load_forwarding(TCCIRState *ir)
+{
+  typedef struct StoreEntry
+  {
+    int valid;
+    int addr_vr;          /* vreg of the address (for pointer stores) */
+    int addr_is_local;    /* 1 if this is VT_LOCAL (stack variable) */
+    int addr_addrtaken;   /* 1 if address of this local is taken */
+    int64_t local_offset; /* offset for VT_LOCAL or base+offset for arrays */
+    Sym *local_sym;       /* symbol for VT_LOCAL */
+    int stored_value_vr;  /* vreg of the stored value */
+    SValue stored_value;  /* full SValue of what was stored */
+    int instruction_idx;  /* where the store happened */
+    struct StoreEntry *next;
+  } StoreEntry;
+
+  int n = ir->next_instruction_index;
+  int changes = 0;
+  int i;
+  TACQuadruple *q;
+  StoreEntry *hash_table[128];
+  StoreEntry *entries;
+  int entry_count;
+
+  if (n == 0)
+    return 0;
+
+  memset(hash_table, 0, sizeof(hash_table));
+  entries = tcc_malloc(sizeof(StoreEntry) * n);
+  entry_count = 0;
+
+#ifdef DEBUG_IR_GEN
+  printf("=== STORE-LOAD FORWARDING START ===\n");
+#endif
+
+  for (i = 0; i < n; i++)
+  {
+    q = &ir->instructions[i];
+
+    /* Clear all stores at basic block boundaries and function calls */
+    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF || q->op == TCCIR_OP_FUNCCALLVOID ||
+        q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_RETURNVALUE || q->op == TCCIR_OP_RETURNVOID)
+    {
+      memset(hash_table, 0, sizeof(hash_table));
+      entry_count = 0;
+      continue;
+    }
+
+    /* Process LOAD instructions: check if we can forward from a previous store */
+    if (q->op == TCCIR_OP_LOAD)
+    {
+      /* LOAD: dest <- src1***DEREF***
+       * src1 is the address to load from */
+      int addr_valmask = q->src1.r & VT_VALMASK;
+      int addr_is_local = (addr_valmask == VT_LOCAL);
+      int64_t addr_offset = q->src1.c.i;
+      Sym *addr_sym = q->src1.sym;
+      int addr_vr = q->src1.vr;
+      uint32_t h;
+      StoreEntry *e;
+
+      /* CONSERVATIVE: Only forward for stack locals */
+      if (!addr_is_local)
+        continue;
+
+      /* Check if address is taken - if so, skip forwarding (may alias through pointer) */
+      if (addr_vr >= 0)
+      {
+        IRLiveInterval *interval = tcc_ir_get_live_interval(ir, addr_vr);
+        if (interval && interval->addrtaken)
+          continue;
+      }
+
+      /* For VT_LOCAL, hash on symbol pointer and offset */
+      h = ((uintptr_t)addr_sym * 31 + (uint32_t)addr_offset * 17) % 128;
+
+      /* Search for matching store */
+      for (e = hash_table[h]; e != NULL; e = e->next)
+      {
+        if (!e->valid || !e->addr_is_local || e->addr_addrtaken)
+          continue;
+
+        /* Both are stack locals - match on symbol and offset */
+        if (e->local_sym == addr_sym && e->local_offset == addr_offset)
+        {
+#ifdef DEBUG_IR_GEN
+          printf("OPTIMIZE: Store-load forwarding at i=%d from store at i=%d\n", i, e->instruction_idx);
+#endif
+          /* Replace LOAD with ASSIGN from the stored value */
+          q->op = TCCIR_OP_ASSIGN;
+          q->src1 = e->stored_value;
+          memset(&q->src2, 0, sizeof(q->src2));
+          q->src2.vr = -1;
+          changes++;
+          break;
+        }
+      }
+    }
+    /* Process STORE instructions: track them for later forwarding */
+    else if (q->op == TCCIR_OP_STORE)
+    {
+      /* STORE: dest***DEREF*** <- src1
+       * dest is the address, src1 is the value to store */
+      int addr_valmask = q->dest.r & VT_VALMASK;
+      int addr_is_local = (addr_valmask == VT_LOCAL);
+      int64_t addr_offset = q->dest.c.i;
+      Sym *addr_sym = q->dest.sym;
+      int addr_vr = q->dest.vr;
+      int addr_addrtaken = 0;
+      uint32_t h;
+      StoreEntry *new_entry;
+      int j;
+
+      /* CONSERVATIVE: Only track stack locals for forwarding */
+      if (!addr_is_local)
+      {
+        /* Non-local store - must invalidate ALL tracked stores since it could alias */
+        for (j = 0; j < entry_count; j++)
+        {
+          if (entries[j].valid && entries[j].addr_addrtaken)
+          {
+#ifdef DEBUG_IR_GEN
+            printf("STORE-LOAD: Invalidate addr-taken local at i=%d due to pointer store at i=%d\n",
+                   entries[j].instruction_idx, i);
+#endif
+            entries[j].valid = 0;
+          }
+        }
+        continue;
+      }
+
+      /* Check if address of this local is taken */
+      if (addr_vr >= 0)
+      {
+        IRLiveInterval *interval = tcc_ir_get_live_interval(ir, addr_vr);
+        if (interval && interval->addrtaken)
+          addr_addrtaken = 1;
+      }
+
+      /* For VT_LOCAL, hash on symbol pointer and offset */
+      h = ((uintptr_t)addr_sym * 31 + (uint32_t)addr_offset * 17) % 128;
+
+      /* Check if we already have a store to this exact location - if so, invalidate it
+       * (the new store overwrites the old one) */
+      /* Check if we already have a store to this exact location - if so, invalidate it
+       * (the new store overwrites the old one) */
+      for (new_entry = hash_table[h]; new_entry != NULL; new_entry = new_entry->next)
+      {
+        if (new_entry->addr_is_local)
+        {
+          if (new_entry->local_sym == addr_sym && new_entry->local_offset == addr_offset)
+            new_entry->valid = 0;
+        }
+      }
+
+      /* Record the new store */
+      new_entry = &entries[entry_count++];
+      new_entry->valid = 1;
+      new_entry->addr_is_local = addr_is_local;
+      new_entry->addr_addrtaken = addr_addrtaken;
+      new_entry->addr_vr = addr_vr;
+      new_entry->local_offset = addr_offset;
+      new_entry->local_sym = addr_sym;
+      new_entry->stored_value = q->src1;
+      new_entry->stored_value_vr = q->src1.vr;
+      new_entry->instruction_idx = i;
+      new_entry->next = hash_table[h];
+      hash_table[h] = new_entry;
+
+#ifdef DEBUG_IR_GEN
+      printf("STORE-LOAD: Track store at i=%d (local=%d, addrtaken=%d, offset=%lld)\n", i, addr_is_local,
+             addr_addrtaken, (long long)addr_offset);
+#endif
+    }
+
+    /* If this instruction modifies a vreg that's used as a stored value,
+     * invalidate those store entries */
+    if (irop_config[q->op].has_dest && q->op != TCCIR_OP_STORE && q->op != TCCIR_OP_LOAD)
+    {
+      int dest_vr = q->dest.vr;
+      int j;
+
+      for (j = 0; j < entry_count; j++)
+      {
+        if (entries[j].valid)
+        {
+          /* If the stored value vreg is redefined, invalidate */
+          if (entries[j].stored_value_vr == dest_vr)
+          {
+#ifdef DEBUG_IR_GEN
+            printf("STORE-LOAD: Invalidate store at i=%d (stored value redefined at i=%d)\n",
+                   entries[j].instruction_idx, i);
+#endif
+            entries[j].valid = 0;
+          }
+        }
+      }
+    }
+  }
+
+  tcc_free(entries);
+
+#ifdef DEBUG_IR_GEN
+  printf("=== STORE-LOAD FORWARDING END: %d changes ===\n", changes);
+#endif
+
+  return changes;
+}
+
+/* Redundant Store Elimination
+ * Phase 4: Remove stores to memory locations that are overwritten before being read
+ * (dead stores to memory)
+ * CONSERVATIVE: Only handles stack locals whose address is not taken
+ */
+int tcc_ir_redundant_store_elimination(TCCIRState *ir)
+{
+  typedef struct StoreInfo
+  {
+    int addr_vr;
+    int addr_is_local;
+    int addr_addrtaken;
+    int64_t local_offset;
+    Sym *local_sym;
+    int store_idx;
+    int is_dead;
+  } StoreInfo;
+
+  int n = ir->next_instruction_index;
+  int changes = 0;
+  int i, j;
+  TACQuadruple *q;
+  StoreInfo *stores;
+  int store_count;
+
+  if (n == 0)
+    return 0;
+
+  stores = tcc_malloc(sizeof(StoreInfo) * n);
+  store_count = 0;
+
+#ifdef DEBUG_IR_GEN
+  printf("=== REDUNDANT STORE ELIMINATION START ===\n");
+#endif
+
+  /* Collect only VT_LOCAL STORE instructions (whose address is not taken) */
+  for (i = 0; i < n; i++)
+  {
+    q = &ir->instructions[i];
+    if (q->op == TCCIR_OP_STORE)
+    {
+      int addr_valmask = q->dest.r & VT_VALMASK;
+      int addr_is_local = (addr_valmask == VT_LOCAL);
+      int addr_addrtaken = 0;
+      int addr_vr = q->dest.vr;
+
+      /* CONSERVATIVE: Only track stack locals */
+      if (!addr_is_local)
+        continue;
+
+      /* Check if address is taken */
+      if (addr_vr >= 0)
+      {
+        IRLiveInterval *interval = tcc_ir_get_live_interval(ir, addr_vr);
+        if (interval && interval->addrtaken)
+          addr_addrtaken = 1;
+      }
+
+      stores[store_count].addr_is_local = 1;
+      stores[store_count].addr_addrtaken = addr_addrtaken;
+      stores[store_count].addr_vr = addr_vr;
+      stores[store_count].local_offset = q->dest.c.i;
+      stores[store_count].local_sym = q->dest.sym;
+      stores[store_count].store_idx = i;
+      stores[store_count].is_dead = 0;
+      store_count++;
+    }
+  }
+
+  /* For each store, check if it's overwritten before being read */
+  for (i = 0; i < store_count; i++)
+  {
+    int store_idx = stores[i].store_idx;
+    int found_read = 0;
+    int found_overwrite = 0;
+
+    /* Skip stores to addresses that are taken (could be read through pointer) */
+    if (stores[i].addr_addrtaken)
+      continue;
+
+    /* Scan forward from this store */
+    for (j = store_idx + 1; j < n && !found_read && !found_overwrite; j++)
+    {
+      q = &ir->instructions[j];
+
+      /* Stop at basic block boundaries - can't track across blocks conservatively */
+      if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF || q->op == TCCIR_OP_FUNCCALLVOID ||
+          q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_RETURNVALUE || q->op == TCCIR_OP_RETURNVOID)
+      {
+        break;
+      }
+
+      /* Check for LOAD from the same address */
+      if (q->op == TCCIR_OP_LOAD)
+      {
+        int addr_valmask = q->src1.r & VT_VALMASK;
+        int addr_is_local = (addr_valmask == VT_LOCAL);
+
+        if (addr_is_local)
+        {
+          if (stores[i].local_sym == q->src1.sym && stores[i].local_offset == q->src1.c.i)
+            found_read = 1;
+        }
+        /* Non-local load could potentially alias with addr-taken locals
+         * but we already skip addr-taken stores above */
+      }
+
+      /* Check for STORE to the same address (overwrite) */
+      if (q->op == TCCIR_OP_STORE && j != store_idx)
+      {
+        int addr_valmask = q->dest.r & VT_VALMASK;
+        int addr_is_local = (addr_valmask == VT_LOCAL);
+
+        if (addr_is_local)
+        {
+          if (stores[i].local_sym == q->dest.sym && stores[i].local_offset == q->dest.c.i)
+            found_overwrite = 1;
+        }
+      }
+    }
+
+    /* If we found an overwrite without a read in between, the store is dead */
+    if (found_overwrite && !found_read)
+    {
+#ifdef DEBUG_IR_GEN
+      printf("OPTIMIZE: Redundant store at i=%d (overwritten without read)\n", store_idx);
+#endif
+      stores[i].is_dead = 1;
+      ir->instructions[store_idx].op = TCCIR_OP_NOP;
+      changes++;
+    }
+  }
+
+  tcc_free(stores);
+
+#ifdef DEBUG_IR_GEN
+  printf("=== REDUNDANT STORE ELIMINATION END: %d changes ===\n", changes);
+#endif
+
+  return changes;
+}
+
 /* Arithmetic Common Subexpression Elimination
  * Phase 3: Eliminate redundant arithmetic computations within basic blocks
  * Handles ADD, SUB, MUL, AND, OR, XOR, SHL, SHR, SAR operations
@@ -3464,6 +3824,9 @@ void tcc_ir_generate_code(TCCIRState *ir)
   int *return_jump_addrs = tcc_malloc(sizeof(int) * ir->next_instruction_index);
   int num_return_jumps = 0;
 
+  /* Clear spill cache at function start */
+  tcc_ir_spill_cache_clear(&ir->spill_cache);
+
   // generate prolog
   int stack_size = (-loc + 7) & ~7; // align to 8 bytes
   tcc_gen_machine_prolog(ir->leaffunc, ir->ls.dirty_registers, stack_size);
@@ -3718,9 +4081,13 @@ void tcc_ir_generate_code(TCCIRState *ir)
     }
     case TCCIR_OP_JUMP:
       tcc_gen_machine_jump_op(q);
+      /* Clear spill cache at branch - value may come from different path */
+      tcc_ir_spill_cache_clear(&ir->spill_cache);
       break;
     case TCCIR_OP_JUMPIF:
       tcc_gen_machine_conditional_jump_op(q);
+      /* Clear spill cache at conditional branch - target may have different values */
+      tcc_ir_spill_cache_clear(&ir->spill_cache);
       break;
     case TCCIR_OP_SETIF:
       tcc_gen_machine_setif_op(q);
@@ -3753,6 +4120,8 @@ void tcc_ir_generate_code(TCCIRState *ir)
       ir_to_code_mapping[i] = ind;
       /* Store back spilled dest */
       tcc_ir_storeback_spill(q, &spill_ctx);
+      /* Clear spill cache after function call - callee may have modified memory */
+      tcc_ir_spill_cache_clear(&ir->spill_cache);
       break;
     }
     default:

@@ -25,7 +25,7 @@
 #include "tccls.h"
 
 #define PREG_SPILLED 0x80
-#define PREG_NONE 0xFF  /* pr0/pr1 not allocated (replaces -1 for uint8_t) */
+#define PREG_NONE 0xFF /* pr0/pr1 not allocated (replaces -1 for uint8_t) */
 
 typedef enum TccIrOp
 {
@@ -132,6 +132,23 @@ typedef struct SpillContext
   uint8_t dest_reg_saved : 1;                         // Whether dest scratch reg was saved to stack
 } SpillContext;
 
+/* SpillCache: Track which registers hold which stack slot values.
+ * Used to avoid redundant loads when value is already in a register after storeback.
+ * Invalidated by: function calls, branches, stores to different offsets with same register.
+ */
+#define SPILL_CACHE_SIZE 8
+typedef struct SpillCacheEntry
+{
+  int8_t valid;   // Whether this entry is valid
+  int8_t reg;     // Register containing the value
+  int32_t offset; // Stack offset (FP-relative)
+} SpillCacheEntry;
+
+typedef struct SpillCache
+{
+  SpillCacheEntry entries[SPILL_CACHE_SIZE];
+} SpillCache;
+
 typedef struct TCCIRState
 {
   // number of function parameters
@@ -168,6 +185,8 @@ typedef struct TCCIRState
 
   uint32_t *ignored_vregs;
   int ignored_vregs_size;
+
+  SpillCache spill_cache; // Cache for tracking register-stack mappings during codegen
 
   LSLiveIntervalState ls;
 } TCCIRState;
@@ -219,6 +238,8 @@ int tcc_ir_bool_cse(TCCIRState *ir);
 int tcc_ir_bool_idempotent(TCCIRState *ir);
 int tcc_ir_bool_simplification(TCCIRState *ir);
 int tcc_ir_return_value_optimization(TCCIRState *ir);
+int tcc_ir_store_load_forwarding(TCCIRState *ir);
+int tcc_ir_redundant_store_elimination(TCCIRState *ir);
 void tcc_ir_print_vreg(int vreg);
 void tcc_ir_generate_cmp_jmp_set(TCCIRState *ir);
 void tcc_ir_start_basic_block(TCCIRState *ir);
@@ -231,6 +252,13 @@ int tcc_ir_is_64bit(int t);
 SpillContext tcc_ir_preload_spills(TACQuadruple *q, int preload_src1, int preload_src2, int setup_dest);
 void tcc_ir_storeback_spill(TACQuadruple *q, SpillContext *ctx);
 void tcc_ir_restore_saved_scratch_regs(SpillContext *ctx);
+
+/* Spill cache management for avoiding redundant loads */
+void tcc_ir_spill_cache_clear(SpillCache *cache);
+void tcc_ir_spill_cache_record(SpillCache *cache, int reg, int offset);
+int tcc_ir_spill_cache_lookup(SpillCache *cache, int offset);
+void tcc_ir_spill_cache_invalidate_reg(SpillCache *cache, int reg);
+void tcc_ir_spill_cache_invalidate_offset(SpillCache *cache, int offset);
 
 /* Check if FPU supports double precision (defined in arm-thumb-gen.c) */
 int arm_fpu_supports_double(int fpu_type);

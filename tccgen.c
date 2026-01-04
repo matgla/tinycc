@@ -10023,6 +10023,16 @@ static void gen_function(Sym *sym)
   if (tcc_ir_return_value_optimization(ir))
     tcc_ir_dead_code_elimination(ir); /* Clean up unused ops */
 
+  /* Phase 4: Store-Load Forwarding - replace loads from recently stored addresses
+   * CONSERVATIVE: Only handles stack locals whose address is not taken */
+  if (tcc_ir_store_load_forwarding(ir))
+    tcc_ir_dead_code_elimination(ir); /* Clean up forwarded loads */
+
+  /* Phase 4: Redundant Store Elimination - remove stores overwritten before read
+   * CONSERVATIVE: Only handles stack locals whose address is not taken */
+  if (tcc_ir_redundant_store_elimination(ir))
+    tcc_ir_dead_code_elimination(ir); /* Clean up dead stores */
+
   /* Dead store elimination - remove unused ASSIGN instructions */
   tcc_ir_dead_store_elimination(ir);
 

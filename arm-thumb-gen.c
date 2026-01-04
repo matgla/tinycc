@@ -393,50 +393,75 @@ SpillContext tcc_ir_preload_spills(TACQuadruple *q, int preload_src1, int preloa
     ctx.src1_spilled = 1;
     ctx.src1_offset = q->src1.c.i;
 
-    /* Find a free scratch register using liveness info */
+    /* DISABLED: Spill cache causes issues with array accesses and recursive functions.
+     * The cache doesn't track when memory is modified through pointers. */
     TCCIRState *ir = tcc_state->ir;
-    int scratch = (ir) ? tcc_ls_find_free_scratch_reg(&ir->ls, ir->codegen_instruction_idx, exclude_regs, ir->leaffunc)
-                       : PREG_NONE;
-    if (scratch == PREG_NONE)
+    int cached_reg = -1; /* Disabled: always load from stack */
+
+    if (cached_reg >= 0 && !(exclude_regs & (1 << cached_reg)))
     {
-      /* No free register - save R_IP to stack and use it */
-      scratch = R_IP;
-      if (exclude_regs & (1 << R_IP))
+      /* Value already in register - no need to load! */
+      q->src1.pr0 = cached_reg;
+      ctx.src1_scratch_reg = cached_reg;
+      exclude_regs |= (1 << cached_reg);
+    }
+    else
+    {
+      /* Need to load from stack */
+      int scratch = (ir)
+                        ? tcc_ls_find_free_scratch_reg(&ir->ls, ir->codegen_instruction_idx, exclude_regs, ir->leaffunc)
+                        : PREG_NONE;
+      if (scratch == PREG_NONE)
       {
-        /* R_IP excluded, try to find another register */
-        for (int r = 0; r <= 3; ++r)
+        /* No free register - save R_IP to stack and use it */
+        scratch = R_IP;
+        if (exclude_regs & (1 << R_IP))
         {
-          if (!(exclude_regs & (1 << r)))
+          /* R_IP excluded, try to find another register */
+          for (int r = 0; r <= 3; ++r)
           {
-            scratch = r;
-            break;
+            if (!(exclude_regs & (1 << r)))
+            {
+              scratch = r;
+              break;
+            }
           }
         }
+        ot_check(th_push(1 << scratch));
+        ctx.src1_reg_saved = 1;
       }
-      ot_check(th_push(1 << scratch));
-      ctx.src1_reg_saved = 1;
-    }
-    ctx.src1_scratch_reg = scratch;
+      ctx.src1_scratch_reg = scratch;
 
-    /* Call load BEFORE modifying pr0 - load() uses pr0 to detect spilled values.
-     * The first argument to load() specifies the destination register.
-     *
-     * IMPORTANT: If src1 has VT_LVAL but is NOT VT_LOCAL (i.e., it's a temporary
-     * holding a pointer address), we need to strip VT_LVAL - we want to load the
-     * ADDRESS from the spill slot, not dereference it. The actual LOAD operation
-     * will do the dereference.
-     * But for VT_LOCAL variables, VT_LVAL means "load value from stack", so we
-     * must keep it. */
-    int saved_r = q->src1.r;
-    int v = q->src1.r & VT_VALMASK;
-    if (v != VT_LOCAL && v != VT_LLOCAL)
-    {
-      q->src1.r &= ~VT_LVAL; /* Load raw value (the pointer), don't dereference */
+      /* Call load BEFORE modifying pr0 - load() uses pr0 to detect spilled values.
+       * The first argument to load() specifies the destination register.
+       *
+       * IMPORTANT: If src1 has VT_LVAL but is NOT VT_LOCAL (i.e., it's a temporary
+       * holding a pointer address), we need to strip VT_LVAL - we want to load the
+       * ADDRESS from the spill slot, not dereference it. The actual LOAD operation
+       * will do the dereference.
+       * But for VT_LOCAL variables, VT_LVAL means "load value from stack", so we
+       * must keep it. */
+      int saved_r = q->src1.r;
+      int v = q->src1.r & VT_VALMASK;
+      if (v != VT_LOCAL && v != VT_LLOCAL)
+      {
+        q->src1.r &= ~VT_LVAL; /* Load raw value (the pointer), don't dereference */
+      }
+      load(scratch, &q->src1);
+      q->src1.r = saved_r; /* Restore original r for the actual operation */
+      q->src1.pr0 = scratch;
+      exclude_regs |= (1 << scratch);
+
+      /* DISABLED: Don't record in spill cache - causes issues */
+#if 0
+      /* Record in cache that this register now holds this stack slot
+       * BUT only for true spills, not local variables */
+      if (ir && (ctx.orig_src1_pr0 & PREG_SPILLED))
+      {
+        tcc_ir_spill_cache_record(&ir->spill_cache, scratch, ctx.src1_offset);
+      }
+#endif
     }
-    load(scratch, &q->src1);
-    q->src1.r = saved_r; /* Restore original r for the actual operation */
-    q->src1.pr0 = scratch;
-    exclude_regs |= (1 << scratch);
   }
 
   /* Preload src2 if needed */
@@ -446,42 +471,65 @@ SpillContext tcc_ir_preload_spills(TACQuadruple *q, int preload_src1, int preloa
     ctx.src2_spilled = 1;
     ctx.src2_offset = q->src2.c.i;
 
-    /* Find a different free scratch register */
+    /* DISABLED: Spill cache causes issues - always load from stack */
     TCCIRState *ir = tcc_state->ir;
-    int scratch = (ir) ? tcc_ls_find_free_scratch_reg(&ir->ls, ir->codegen_instruction_idx, exclude_regs, ir->leaffunc)
-                       : PREG_NONE;
-    if (scratch == PREG_NONE)
+    int cached_reg = -1; /* Disabled */
+
+    if (cached_reg >= 0 && !(exclude_regs & (1 << cached_reg)))
     {
-      /* No free register - save one to stack and use it */
-      scratch = R_IP;
-      if (exclude_regs & (1 << R_IP))
+      /* Value already in register - no need to load! */
+      q->src2.pr0 = cached_reg;
+      ctx.src2_scratch_reg = cached_reg;
+      exclude_regs |= (1 << cached_reg);
+    }
+    else
+    {
+      /* Need to load from stack */
+      int scratch = (ir)
+                        ? tcc_ls_find_free_scratch_reg(&ir->ls, ir->codegen_instruction_idx, exclude_regs, ir->leaffunc)
+                        : PREG_NONE;
+      if (scratch == PREG_NONE)
       {
-        for (int r = 0; r <= 3; ++r)
+        /* No free register - save one to stack and use it */
+        scratch = R_IP;
+        if (exclude_regs & (1 << R_IP))
         {
-          if (!(exclude_regs & (1 << r)))
+          for (int r = 0; r <= 3; ++r)
           {
-            scratch = r;
-            break;
+            if (!(exclude_regs & (1 << r)))
+            {
+              scratch = r;
+              break;
+            }
           }
         }
+        ot_check(th_push(1 << scratch));
+        ctx.src2_reg_saved = 1;
       }
-      ot_check(th_push(1 << scratch));
-      ctx.src2_reg_saved = 1;
-    }
-    ctx.src2_scratch_reg = scratch;
+      ctx.src2_scratch_reg = scratch;
 
-    /* Call load BEFORE modifying pr0 - load() uses pr0 to detect spilled values.
-     * Same VT_LVAL handling as src1. */
-    int saved_r = q->src2.r;
-    int v = q->src2.r & VT_VALMASK;
-    if (v != VT_LOCAL && v != VT_LLOCAL)
-    {
-      q->src2.r &= ~VT_LVAL;
+      /* Call load BEFORE modifying pr0 - load() uses pr0 to detect spilled values.
+       * Same VT_LVAL handling as src1. */
+      int saved_r = q->src2.r;
+      int v = q->src2.r & VT_VALMASK;
+      if (v != VT_LOCAL && v != VT_LLOCAL)
+      {
+        q->src2.r &= ~VT_LVAL;
+      }
+      load(scratch, &q->src2);
+      q->src2.r = saved_r;
+      q->src2.pr0 = scratch;
+      exclude_regs |= (1 << scratch);
+
+      /* DISABLED: Don't record in spill cache */
+#if 0
+      /* Record in cache but only for true spills */
+      if (ir && (ctx.orig_src2_pr0 & PREG_SPILLED))
+      {
+        tcc_ir_spill_cache_record(&ir->spill_cache, scratch, ctx.src2_offset);
+      }
+#endif
     }
-    load(scratch, &q->src2);
-    q->src2.r = saved_r;
-    q->src2.pr0 = scratch;
-    exclude_regs |= (1 << scratch);
   }
 
   /* Setup dest if needed */
@@ -515,6 +563,12 @@ SpillContext tcc_ir_preload_spills(TACQuadruple *q, int preload_src1, int preloa
 
     q->dest.pr0 = scratch;
     ctx.dest_scratch_reg = scratch; /* Save the scratch register used for storing back */
+
+    /* Invalidate cache entry for this register - it will be overwritten */
+    if (ir)
+    {
+      tcc_ir_spill_cache_invalidate_reg(&ir->spill_cache, scratch);
+    }
   }
 
   return ctx;
@@ -538,6 +592,73 @@ void tcc_ir_restore_saved_scratch_regs(SpillContext *ctx)
   {
     ot_check(th_pop(1 << ctx->src1_scratch_reg));
     ctx->src1_reg_saved = 0;
+  }
+}
+
+/* Spill cache management functions for avoiding redundant loads */
+
+void tcc_ir_spill_cache_clear(SpillCache *cache)
+{
+  for (int i = 0; i < SPILL_CACHE_SIZE; i++)
+  {
+    cache->entries[i].valid = 0;
+  }
+}
+
+void tcc_ir_spill_cache_record(SpillCache *cache, int reg, int offset)
+{
+  /* First invalidate any existing entry for this register or offset */
+  tcc_ir_spill_cache_invalidate_reg(cache, reg);
+  tcc_ir_spill_cache_invalidate_offset(cache, offset);
+
+  /* Find empty slot or oldest entry to replace */
+  for (int i = 0; i < SPILL_CACHE_SIZE; i++)
+  {
+    if (!cache->entries[i].valid)
+    {
+      cache->entries[i].valid = 1;
+      cache->entries[i].reg = reg;
+      cache->entries[i].offset = offset;
+      return;
+    }
+  }
+  /* Cache full - replace first entry (simple eviction) */
+  cache->entries[0].valid = 1;
+  cache->entries[0].reg = reg;
+  cache->entries[0].offset = offset;
+}
+
+int tcc_ir_spill_cache_lookup(SpillCache *cache, int offset)
+{
+  for (int i = 0; i < SPILL_CACHE_SIZE; i++)
+  {
+    if (cache->entries[i].valid && cache->entries[i].offset == offset)
+    {
+      return cache->entries[i].reg;
+    }
+  }
+  return -1; /* Not found */
+}
+
+void tcc_ir_spill_cache_invalidate_reg(SpillCache *cache, int reg)
+{
+  for (int i = 0; i < SPILL_CACHE_SIZE; i++)
+  {
+    if (cache->entries[i].valid && cache->entries[i].reg == reg)
+    {
+      cache->entries[i].valid = 0;
+    }
+  }
+}
+
+void tcc_ir_spill_cache_invalidate_offset(SpillCache *cache, int offset)
+{
+  for (int i = 0; i < SPILL_CACHE_SIZE; i++)
+  {
+    if (cache->entries[i].valid && cache->entries[i].offset == offset)
+    {
+      cache->entries[i].valid = 0;
+    }
   }
 }
 
@@ -571,6 +692,17 @@ void tcc_ir_storeback_spill(TACQuadruple *q, SpillContext *ctx)
     }
 
     store(scratch, &q->dest);
+
+    /* DISABLED: Don't record in spill cache - causes issues with arrays/pointers */
+#if 0
+    /* Record in spill cache that this register now holds this stack slot value
+     * BUT only for true spills (PREG_SPILLED), not for local variables */
+    TCCIRState *ir = tcc_state->ir;
+    if (ir && (ctx->orig_dest_pr0 & PREG_SPILLED))
+    {
+      tcc_ir_spill_cache_record(&ir->spill_cache, scratch, ctx->dest_offset);
+    }
+#endif
   }
 
   /* Restore any saved scratch registers after the store is done */
