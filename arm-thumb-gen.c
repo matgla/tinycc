@@ -483,12 +483,20 @@ SpillContext tcc_ir_preload_spills(TACQuadruple *q, int preload_src1, int preloa
         /* For non-LOCAL cases, use normal load.
          * For global symbols (VT_CONST | VT_SYM) with VT_LVAL, we need to:
          * 1. Load the address into a register (stripping VT_LVAL for the load call)
-         * 2. For LOAD operations, preserve VT_LVAL so we dereference later */
+         * 2. For LOAD operations, preserve VT_LVAL so we dereference later
+         * 3. For ASSIGN operations, dereference immediately */
         int had_lval = saved_r & VT_LVAL;
         q->src1.r &= ~VT_LVAL; /* Strip VT_LVAL for the load call */
         load(scratch, &q->src1);
+        /* For ASSIGN ops with VT_LVAL: dereference now by loading from the address */
+        if (q->op == TCCIR_OP_ASSIGN && had_lval)
+        {
+          /* scratch now contains the address, dereference it */
+          ot_check(th_ldr_imm(scratch, scratch, 0, 6, ENFORCE_ENCODING_NONE));
+          q->src1.r = scratch; /* Value loaded, no more VT_LVAL */
+        }
         /* For LOAD ops on global symbols: address is now in register, needs dereference */
-        if (q->op == TCCIR_OP_LOAD && had_lval)
+        else if (q->op == TCCIR_OP_LOAD && had_lval)
         {
           q->src1.r = scratch | VT_LVAL; /* Address in register, needs dereference */
         }
@@ -4489,6 +4497,22 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
    * Since we load R3→R2→R1→R0, we need to check if a destination will clobber a source
    * needed by LOWER-numbered registers (which haven't been loaded yet). */
   int registers_to_push = 0;
+
+  /* IMPORTANT: If the function pointer is in R0-R3, we need to save it before setting
+   * up parameters, because parameter setup may clobber those registers.
+   * Move it to a safe register using the scratch register allocator. */
+  int func_ptr_reg = q->src1.pr0;
+  int func_ptr_saved_to = PREG_NONE;
+  if (func_ptr_reg >= R0 && func_ptr_reg <= R3)
+  {
+    /* Function pointer is in an argument register - need to save it */
+    /* Use scratch allocator to find a register not used by parameter sources */
+    int scratch = get_free_scratch_reg(future_src_mask | (1u << func_ptr_reg));
+    ot_check(th_mov_reg(scratch, func_ptr_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                        ENFORCE_ENCODING_NONE, false));
+    func_ptr_saved_to = scratch;
+    q->src1.pr0 = scratch; /* Update so gcall_or_jump uses the new register */
+  }
 
   /* Compute sources needed by each lower register before we start loading */
   uint32_t sources_needed_by_lower[4] = {0, 0, 0, 0};

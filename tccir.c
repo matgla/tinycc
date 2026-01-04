@@ -716,8 +716,8 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
 #ifdef DEBUG_IR_GEN
   if (op == TCCIR_OP_LOAD)
   {
-    fprintf(stderr, "DEBUG tcc_ir_put LOAD: pos=%d, src1.vr=%d, src1.r=0x%x, dest.vr=%d\n",
-            pos, src1 ? src1->vr : -1, src1 ? src1->r : 0, dest ? dest->vr : -1);
+    fprintf(stderr, "DEBUG tcc_ir_put LOAD: pos=%d, src1.vr=%d, src1.r=0x%x, dest.vr=%d\n", pos, src1 ? src1->vr : -1,
+            src1 ? src1->r : 0, dest ? dest->vr : -1);
   }
 #endif
 
@@ -806,9 +806,10 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
       }
       dest_interval = tcc_ir_get_live_interval(ir, dest->vr);
       /* For LOAD operations, the destination contains the loaded VALUE, not an address,
-       * so it should NOT be marked as an lvalue. For other operations that produce
-       * addresses or variables, keep is_lvalue=1. */
-      dest_interval->is_lvalue = (op != TCCIR_OP_LOAD);
+       * so it should NOT be marked as an lvalue. For ASSIGN operations where the source
+       * has VT_LVAL set (dereference), the destination also contains a VALUE, not an lvalue.
+       * For other operations that produce addresses or variables, keep is_lvalue=1. */
+      dest_interval->is_lvalue = (op != TCCIR_OP_LOAD) && !(op == TCCIR_OP_ASSIGN && src1 && (src1->r & VT_LVAL));
     }
   }
   else
@@ -843,8 +844,8 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
     int can_coalesce = (!ir->prevent_coalescing) && (TCCIR_DECODE_VREG_TYPE(src1->vr) == TCCIR_VREG_TYPE_TEMP) &&
                        ((src1->r & VT_LVAL) == 0) && (src1->vr == ir->instructions[pos - 1].dest.vr);
 #ifdef DEBUG_IR_GEN
-    fprintf(stderr, "DEBUG ASSIGN coalesce check: pos=%d, src1->vr=%d, prev_dest_vr=%d, can_coalesce=%d\n",
-            pos, src1->vr, ir->instructions[pos - 1].dest.vr, can_coalesce);
+    fprintf(stderr, "DEBUG ASSIGN coalesce check: pos=%d, src1->vr=%d, prev_dest_vr=%d, can_coalesce=%d\n", pos,
+            src1->vr, ir->instructions[pos - 1].dest.vr, can_coalesce);
 #endif
     if (can_coalesce)
     {
@@ -1354,10 +1355,17 @@ void tcc_ir_liveness_analysis(TCCIRState *ir)
       crosses_call = tcc_ir_has_call_in_range(ir, start, end);
       addrtaken = interval->addrtaken;
       reg_type = tcc_ir_get_reg_type(ir, vreg_encoded);
+      /* Normally we don't include the call instruction itself in the interval
+       * (arguments are consumed by the call), BUT if this vreg is the function
+       * pointer (src1 of the call), we must keep it alive through the call. */
       if (end < ir->next_instruction_index &&
           (ir->instructions[end].op == TCCIR_OP_FUNCCALLVAL || ir->instructions[end].op == TCCIR_OP_FUNCCALLVOID))
       {
-        end--; /* Do not include call instruction itself */
+        /* Check if this vreg is the function pointer (src1) of this call */
+        if (ir->instructions[end].src1.vr != vreg_encoded)
+        {
+          end--; /* Do not include call instruction itself for non-func-ptr vregs */
+        }
       }
       tcc_ls_add_live_interval(&ir->ls, vreg_encoded, start, end, crosses_call, addrtaken, reg_type,
                                interval->is_lvalue);
@@ -4877,8 +4885,7 @@ static bool tcc_ir_operand_needs_dereference(SValue *sv)
 {
   const int val_loc = sv->r & VT_VALMASK;
 #ifdef DEBUG_IR_GEN
-  fprintf(stderr, "DEBUG needs_deref: sv->r=0x%x, val_loc=0x%x, VT_LVAL=%d\n",
-          sv->r, val_loc, (sv->r & VT_LVAL) != 0);
+  fprintf(stderr, "DEBUG needs_deref: sv->r=0x%x, val_loc=0x%x, VT_LVAL=%d\n", sv->r, val_loc, (sv->r & VT_LVAL) != 0);
 #endif
   switch (val_loc)
   {
