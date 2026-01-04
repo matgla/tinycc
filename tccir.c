@@ -59,7 +59,7 @@ static inline int tcc_ir_is_64bit_type(int t)
 /* Check if an SValue operand is spilled (in memory) */
 int tcc_ir_is_spilled(SValue *sv)
 {
-  return (sv->pr0 == -1) || (sv->pr0 & PREG_SPILLED);
+  return (sv->pr0 == PREG_NONE) || (sv->pr0 & PREG_SPILLED);
 }
 
 /* Returns true if type is 64-bit (double, ldouble, or long long) - exported for machine code */
@@ -251,7 +251,7 @@ static void tcc_ir_clear_live_intervals(TCCIRState *ir)
 static int tcc_ir_operand_in_memory(SValue *sv)
 {
   const int svt = sv->r & VT_VALMASK;
-  if (sv->pr0 == -1)
+  if (sv->pr0 == PREG_NONE)
   {
     if (svt == VT_LOCAL)
     {
@@ -814,12 +814,12 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
   }
 
   // physical registers were not assigned yet
-  q->src1.pr0 = -1;
-  q->src1.pr1 = -1;
-  q->src2.pr0 = -1;
-  q->src2.pr1 = -1;
-  q->dest.pr0 = -1;
-  q->dest.pr1 = -1;
+  q->src1.pr0 = PREG_NONE;
+  q->src1.pr1 = PREG_NONE;
+  q->src2.pr0 = PREG_NONE;
+  q->src2.pr1 = PREG_NONE;
+  q->dest.pr0 = PREG_NONE;
+  q->dest.pr1 = PREG_NONE;
 
   // store current source line number for debug info
   q->line_num = file ? file->line_num : 0;
@@ -1677,6 +1677,16 @@ int tcc_ir_dead_store_elimination(TCCIRState *ir)
       if (pos <= max_tmp_pos)
         used[pos / 8] |= (1 << (pos % 8));
     }
+
+    /* For STORE operations, the dest field is used as a pointer (address to store to),
+     * not as a destination being written. If dest has VT_LVAL, the vreg is being
+     * dereferenced, so it's a USE not a DEF. Mark it as used. */
+    if (q->op == TCCIR_OP_STORE && TCCIR_DECODE_VREG_TYPE(q->dest.vr) == TCCIR_VREG_TYPE_TEMP)
+    {
+      int pos = TCCIR_DECODE_VREG_POSITION(q->dest.vr);
+      if (pos <= max_tmp_pos)
+        used[pos / 8] |= (1 << (pos % 8));
+    }
   }
 
   /* Remove ASSIGN instructions where dest is an unused TMP vreg, and NOP instructions */
@@ -1741,8 +1751,24 @@ int tcc_ir_dead_store_elimination(TCCIRState *ir)
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
     {
       int old_target = q->dest.c.i;
-      if (old_target >= 0 && old_target < n && new_index[old_target] >= 0)
-        q->dest.c.i = new_index[old_target];
+      if (old_target >= 0 && old_target < n)
+      {
+        if (new_index[old_target] >= 0)
+        {
+          q->dest.c.i = new_index[old_target];
+        }
+        else
+        {
+          /* Target instruction was removed - find next valid instruction */
+          int next = old_target + 1;
+          while (next < n && new_index[next] < 0)
+            next++;
+          if (next < n)
+            q->dest.c.i = new_index[next];
+          else
+            q->dest.c.i = write_pos; /* Past end */
+        }
+      }
       else if (old_target >= n)
         q->dest.c.i = write_pos; /* Past end */
       /* else: old_target < 0 means unpatched, leave as -1 */
@@ -2679,6 +2705,124 @@ int tcc_ir_constant_propagation(TCCIRState *ir)
   return changes;
 }
 
+/* TMP Constant Propagation
+ * After constant folding may create TMP <- #const instructions,
+ * propagate these constants to uses of the TMP within the same basic block.
+ */
+int tcc_ir_tmp_constant_propagation(TCCIRState *ir)
+{
+  typedef struct
+  {
+    int valid;
+    int64_t value;
+  } TmpConstInfo;
+
+  int n = ir->next_instruction_index;
+  int changes = 0;
+  int max_tmp_pos = 0;
+  int i;
+  TACQuadruple *q;
+  TmpConstInfo *tmp_info;
+
+  if (n == 0)
+    return 0;
+
+  /* Find max TMP position */
+  for (i = 0; i < n; i++)
+  {
+    q = &ir->instructions[i];
+    if (irop_config[q->op].has_dest && TCCIR_DECODE_VREG_TYPE(q->dest.vr) == TCCIR_VREG_TYPE_TEMP)
+    {
+      int pos = TCCIR_DECODE_VREG_POSITION(q->dest.vr);
+      if (pos > max_tmp_pos)
+        max_tmp_pos = pos;
+    }
+  }
+
+  if (max_tmp_pos == 0)
+    return 0;
+
+  tmp_info = tcc_mallocz(sizeof(TmpConstInfo) * (max_tmp_pos + 1));
+
+  /* Single pass: track TMP constants and propagate */
+  for (i = 0; i < n; i++)
+  {
+    q = &ir->instructions[i];
+
+    /* Propagate TMP constants to src1 */
+    if (irop_config[q->op].has_src1 && TCCIR_DECODE_VREG_TYPE(q->src1.vr) == TCCIR_VREG_TYPE_TEMP)
+    {
+      int pos = TCCIR_DECODE_VREG_POSITION(q->src1.vr);
+      if (pos <= max_tmp_pos && tmp_info[pos].valid)
+      {
+#ifdef DEBUG_IR_GEN
+        printf("OPTIMIZE: TMP const propagate TMP:%d = %lld to src1 at i=%d\n", pos, (long long)tmp_info[pos].value, i);
+#endif
+        q->src1.r = VT_CONST;
+        q->src1.c.i = tmp_info[pos].value;
+        q->src1.vr = -1;
+        changes++;
+      }
+    }
+
+    /* Propagate TMP constants to src2 */
+    if (irop_config[q->op].has_src2 && TCCIR_DECODE_VREG_TYPE(q->src2.vr) == TCCIR_VREG_TYPE_TEMP)
+    {
+      int pos = TCCIR_DECODE_VREG_POSITION(q->src2.vr);
+      if (pos <= max_tmp_pos && tmp_info[pos].valid)
+      {
+#ifdef DEBUG_IR_GEN
+        printf("OPTIMIZE: TMP const propagate TMP:%d = %lld to src2 at i=%d\n", pos, (long long)tmp_info[pos].value, i);
+#endif
+        q->src2.r = VT_CONST;
+        q->src2.c.i = tmp_info[pos].value;
+        q->src2.vr = -1;
+        changes++;
+      }
+    }
+
+    /* Clear all at basic block boundaries */
+    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF || q->op == TCCIR_OP_FUNCCALLVOID ||
+        q->op == TCCIR_OP_FUNCCALLVAL)
+    {
+      memset(tmp_info, 0, sizeof(TmpConstInfo) * (max_tmp_pos + 1));
+    }
+
+    /* Track TMP <- constant assignments */
+    if (q->op == TCCIR_OP_ASSIGN && irop_config[q->op].has_dest &&
+        TCCIR_DECODE_VREG_TYPE(q->dest.vr) == TCCIR_VREG_TYPE_TEMP)
+    {
+      int pos = TCCIR_DECODE_VREG_POSITION(q->dest.vr);
+      if (pos <= max_tmp_pos)
+      {
+        int src_is_const = (q->src1.r & VT_VALMASK) == VT_CONST && !(q->src1.r & VT_SYM);
+        if (src_is_const)
+        {
+          tmp_info[pos].valid = 1;
+          tmp_info[pos].value = q->src1.c.i;
+#ifdef DEBUG_IR_GEN
+          printf("TMP_CONST: Record TMP:%d = %lld at i=%d\n", pos, (long long)q->src1.c.i, i);
+#endif
+        }
+        else
+        {
+          tmp_info[pos].valid = 0;
+        }
+      }
+    }
+    else if (irop_config[q->op].has_dest && TCCIR_DECODE_VREG_TYPE(q->dest.vr) == TCCIR_VREG_TYPE_TEMP)
+    {
+      /* TMP is defined by non-ASSIGN instruction */
+      int pos = TCCIR_DECODE_VREG_POSITION(q->dest.vr);
+      if (pos <= max_tmp_pos)
+        tmp_info[pos].valid = 0;
+    }
+  }
+
+  tcc_free(tmp_info);
+  return changes;
+}
+
 /* Copy Propagation
  * Phase 2: Eliminate redundant copy temporaries
  * Patterns:
@@ -2687,25 +2831,29 @@ int tcc_ir_constant_propagation(TCCIRState *ir)
  */
 int tcc_ir_copy_propagation(TCCIRState *ir)
 {
-  /* Track ASSIGN sources for TMP vregs */
+  /* Track ASSIGN sources for TMP vregs.
+   * A copy is: TMP:X <- VAR:Y or TMP:X <- PAR:Y (not TMP, not constant)
+   * We can replace uses of TMP:X with the source, as long as the source
+   * hasn't been redefined between the copy and the use.
+   */
   typedef struct
   {
-    int instruction_idx; /* Where this TMP is defined (-1 if not an ASSIGN) */
-    SValue source;       /* Source of the ASSIGN */
-    uint8_t is_copy : 1; /* Whether this is a simple copy (ASSIGN from non-TMP) */
+    int valid;     /* Whether this copy is still valid */
+    int source_vr; /* Source vreg (-1 if not a copy) */
+    SValue source; /* Source of the ASSIGN */
   } CopyInfo;
 
   int n = ir->next_instruction_index;
   int changes = 0;
   int max_tmp_pos = 0;
-  int i;
+  int i, j;
   TACQuadruple *q;
   CopyInfo *copy_info;
 
   if (n == 0)
     return 0;
 
-  /* Build a map from TMP vreg -> its source (if it's a simple ASSIGN) */
+  /* Find max TMP position */
   for (i = 0; i < n; i++)
   {
     q = &ir->instructions[i];
@@ -2721,47 +2869,29 @@ int tcc_ir_copy_propagation(TCCIRState *ir)
     return 0;
 
   copy_info = tcc_mallocz(sizeof(CopyInfo) * (max_tmp_pos + 1));
-  for (i = 0; i <= max_tmp_pos; i++)
-  {
-    copy_info[i].instruction_idx = -1;
-  }
 
-  /* First pass: identify simple copies */
+  /* Single pass: process instructions in order, tracking and propagating copies */
   for (i = 0; i < n; i++)
   {
     q = &ir->instructions[i];
 
-    if (q->op == TCCIR_OP_ASSIGN && irop_config[q->op].has_dest &&
-        TCCIR_DECODE_VREG_TYPE(q->dest.vr) == TCCIR_VREG_TYPE_TEMP)
-    {
-      int pos = TCCIR_DECODE_VREG_POSITION(q->dest.vr);
-      if (pos <= max_tmp_pos)
-      {
-        int src_is_const = (q->src1.r & VT_VALMASK) == VT_CONST;
-        copy_info[pos].instruction_idx = i;
-        copy_info[pos].source = q->src1;
-        /* Only propagate if source is a valid vreg (not TMP, not constant with vr=-1)
-         * and not an lvalue. Constants should be propagated through constant propagation. */
-        copy_info[pos].is_copy = !src_is_const && (q->src1.vr >= 0) &&
-                                 (TCCIR_DECODE_VREG_TYPE(q->src1.vr) != TCCIR_VREG_TYPE_TEMP) &&
-                                 ((q->src1.r & VT_LVAL) == 0); /* Don't propagate lvalues */
-      }
-    }
-  }
-
-  /* Second pass: propagate copies */
-  for (i = 0; i < n; i++)
-  {
-    q = &ir->instructions[i];
-
-    /* Replace uses of TMP vregs that are simple copies */
+    /* First, propagate copies to uses in this instruction.
+     * Important: We DON'T propagate if the use has VT_LVAL because:
+     *   - TMP:X <- VAR:Y (copy of pointer value)
+     *   - ... TMP:X***DEREF*** (load through the pointer)
+     * If we replace TMP:X with VAR:Y (which may have LVAL=load the pointer),
+     * then adding another LVAL would mean double-dereference, which is wrong.
+     * Only propagate to non-LVAL uses where we just need the pointer value.
+     */
     if (irop_config[q->op].has_src1 && TCCIR_DECODE_VREG_TYPE(q->src1.vr) == TCCIR_VREG_TYPE_TEMP)
     {
       int pos = TCCIR_DECODE_VREG_POSITION(q->src1.vr);
-      if (pos <= max_tmp_pos && copy_info[pos].is_copy && copy_info[pos].instruction_idx < i)
+      int has_lval = q->src1.r & VT_LVAL;
+      if (pos <= max_tmp_pos && copy_info[pos].valid && !has_lval)
       {
 #ifdef DEBUG_IR_GEN
-        printf("OPTIMIZE: Copy propagate TMP:%d <- src at i=%d\n", pos, i);
+        printf("OPTIMIZE: Copy propagate TMP:%d -> vreg:%d at i=%d\n", pos,
+               TCCIR_DECODE_VREG_POSITION(copy_info[pos].source_vr), i);
 #endif
         q->src1 = copy_info[pos].source;
         changes++;
@@ -2771,14 +2901,82 @@ int tcc_ir_copy_propagation(TCCIRState *ir)
     if (irop_config[q->op].has_src2 && TCCIR_DECODE_VREG_TYPE(q->src2.vr) == TCCIR_VREG_TYPE_TEMP)
     {
       int pos = TCCIR_DECODE_VREG_POSITION(q->src2.vr);
-      if (pos <= max_tmp_pos && copy_info[pos].is_copy && copy_info[pos].instruction_idx < i)
+      int has_lval = q->src2.r & VT_LVAL;
+      if (pos <= max_tmp_pos && copy_info[pos].valid && !has_lval)
       {
 #ifdef DEBUG_IR_GEN
-        printf("OPTIMIZE: Copy propagate TMP:%d <- src at i=%d\n", pos, i);
+        printf("OPTIMIZE: Copy propagate TMP:%d -> vreg:%d at i=%d\n", pos,
+               TCCIR_DECODE_VREG_POSITION(copy_info[pos].source_vr), i);
 #endif
         q->src2 = copy_info[pos].source;
         changes++;
       }
+    }
+
+    /* If this instruction defines a VAR/PAR, invalidate any copies from that vreg */
+    if (irop_config[q->op].has_dest)
+    {
+      int dest_type = TCCIR_DECODE_VREG_TYPE(q->dest.vr);
+      if (dest_type == TCCIR_VREG_TYPE_VAR || dest_type == TCCIR_VREG_TYPE_PARAM)
+      {
+        int dest_vr = q->dest.vr;
+        for (j = 0; j <= max_tmp_pos; j++)
+        {
+          if (copy_info[j].valid && copy_info[j].source_vr == dest_vr)
+          {
+#ifdef DEBUG_IR_GEN
+            printf("COPY_PROP: Invalidate TMP:%d (source VAR/PAR:%d redefined) at i=%d\n", j,
+                   TCCIR_DECODE_VREG_POSITION(dest_vr), i);
+#endif
+            copy_info[j].valid = 0;
+          }
+        }
+      }
+    }
+
+    /* Clear all copies at basic block boundaries */
+    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF || q->op == TCCIR_OP_FUNCCALLVOID ||
+        q->op == TCCIR_OP_FUNCCALLVAL)
+    {
+      memset(copy_info, 0, sizeof(CopyInfo) * (max_tmp_pos + 1));
+    }
+
+    /* If this is a copy (ASSIGN TMP <- VAR/PAR), record it */
+    if (q->op == TCCIR_OP_ASSIGN && irop_config[q->op].has_dest &&
+        TCCIR_DECODE_VREG_TYPE(q->dest.vr) == TCCIR_VREG_TYPE_TEMP)
+    {
+      int pos = TCCIR_DECODE_VREG_POSITION(q->dest.vr);
+      if (pos <= max_tmp_pos)
+      {
+        int src_valmask = q->src1.r & VT_VALMASK;
+        int src_is_const = src_valmask == VT_CONST;
+        int src_vreg_type = TCCIR_DECODE_VREG_TYPE(q->src1.vr);
+
+        /* Only allow propagation if source is VAR or PAR (not TMP, not constant) */
+        if (!src_is_const && q->src1.vr >= 0 &&
+            (src_vreg_type == TCCIR_VREG_TYPE_VAR || src_vreg_type == TCCIR_VREG_TYPE_PARAM))
+        {
+          copy_info[pos].valid = 1;
+          copy_info[pos].source_vr = q->src1.vr;
+          copy_info[pos].source = q->src1;
+#ifdef DEBUG_IR_GEN
+          printf("COPY_PROP: Record TMP:%d <- vreg:%d (type=%d) at i=%d\n", pos, TCCIR_DECODE_VREG_POSITION(q->src1.vr),
+                 src_vreg_type, i);
+#endif
+        }
+        else
+        {
+          /* TMP is assigned something other than a simple VAR/PAR copy */
+          copy_info[pos].valid = 0;
+        }
+      }
+    }
+    else if (irop_config[q->op].has_dest && TCCIR_DECODE_VREG_TYPE(q->dest.vr) == TCCIR_VREG_TYPE_TEMP)
+    {
+      /* TMP is defined by a non-ASSIGN instruction - invalidate any copy for it */
+      int pos = TCCIR_DECODE_VREG_POSITION(q->dest.vr);
+      if (pos <= max_tmp_pos)
+        copy_info[pos].valid = 0;
     }
   }
 
@@ -3617,7 +3815,7 @@ void print_svalue_short(SValue *sv)
     break;
   // case VT_LOCAL: printf("VReg%d[stack_offset=%d]", sv->vreg, sv->c.i); break;
   case VT_LOCAL:
-    if (sv->pr0 != -1)
+    if (sv->pr0 != PREG_NONE)
     { /* already register-allocated? */
       if (sv->pr0 & PREG_SPILLED)
         printf(SPILL_MARK_BEGIN "SpillLoc[%d]" SPILL_MARK_END, sv->c.i);
@@ -3653,7 +3851,7 @@ void print_svalue_short(SValue *sv)
     printf("VT_JMPI");
     break;
   default: /* must be temporary vreg */
-    if (sv->pr0 == -1)
+    if (sv->pr0 == PREG_NONE)
     {
       tcc_ir_print_vreg(sv->vr);
 #if 0
@@ -4103,8 +4301,8 @@ void tcc_ir_generate_cmp_jmp_set(TCCIRState *ir)
     memset(&dest, 0, sizeof(SValue));
     dest.vr = tcc_ir_get_vreg_temp(ir);
     dest.type.t = VT_INT;
-    dest.pr0 = -1;
-    dest.pr1 = -1;
+    dest.pr0 = PREG_NONE;
+    dest.pr1 = PREG_NONE;
 
     if (jtrue >= 0 || jfalse >= 0)
     {
@@ -4128,8 +4326,8 @@ void tcc_ir_generate_cmp_jmp_set(TCCIRState *ir)
         tcc_ir_backpatch_to_here(ir, jtrue);
         src.r = VT_CONST;
         src.c.i = 1;
-        src.pr0 = -1;
-        src.pr1 = -1;
+        src.pr0 = PREG_NONE;
+        src.pr1 = PREG_NONE;
         tcc_ir_put(ir, TCCIR_OP_ASSIGN, &src, NULL, &dest);
         if (jfalse >= 0)
         {

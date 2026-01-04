@@ -17,6 +17,11 @@ TEST_FILES = [
     ("90_global_array_assignment.c", 0),
     ("bug_swap.c", 0),
     ("bug_partition.c", 0),
+    ("91_const_propagation.c", 0),
+    ("92_loop_invariant.c", 0),
+    ("93_chained_arithmetic.c", 0),
+    ("94_copy_propagation.c", 0),
+    ("95_cse.c", 0),
 
     ("../tests2/00_assignment.c", 0),
     ("../tests2/01_comment.c", 0),

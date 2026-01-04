@@ -428,8 +428,8 @@ typedef struct SValue
   unsigned short r2; /* second register, used for 'long long'
                         type. If not used, set to VT_CONST */
   int vr;            /* virtual register for IR */
-  int8_t pr0;
-  int8_t pr1;
+  uint8_t pr0;
+  uint8_t pr1;
 
   union
   {

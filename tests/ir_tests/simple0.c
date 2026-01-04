@@ -1,39 +1,14 @@
 #include <stdio.h>
 
-int array[4] = {30, 10, 20, 40};
-
-// void swap(int a, int b)
-// {
-//   int tmp = array[a];
-//   array[a] = array[b];
-//   array[b] = tmp;
-// }
-
-int partition(int left, int right)
+int sum(int a, int b)
 {
-  int pivotIndex = left;
-  int pivotValue = array[pivotIndex];
-  int index = left;
-
-  swap(pivotIndex, right);
-
-  for (int i = left; i < right; i++)
-  {
-    if (array[i] < pivotValue)
-    {
-      swap(i, index);
-      index += 1; // This increment is the problem!
-    }
-  }
-
-  return index;
+  return a + b;
 }
 
-// int main()
-// {
-//   printf("Array: %d %d %d %d\n", array[0], array[1], array[2], array[3]);
-//   int result = partition(0, 3);
-//   printf("Partition returned: %d\n", result);
-//   printf("Array: %d %d %d %d\n", array[0], array[1], array[2], array[3]);
-//   return 0;
-// }
+int main(int argc, char *argv[])
+{
+  puts("Hello world\n");
+  int x = sum(3, 31);
+  printf("Sum: %d, %x, %d, %x\n", x, 123, 123, 0xdead);
+  return x;
+}

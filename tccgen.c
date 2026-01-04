@@ -4443,7 +4443,9 @@ ST_FUNC void vstore(void)
       /* single word */
       // store(r, vtop - 1);
       int op = TCCIR_OP_STORE;
-      if ((vtop[-1].r & VT_VALMASK) == VT_LOCAL)
+      /* Use ASSIGN only for VT_LOCAL destinations that have a valid vreg.
+       * Array elements initialized via init_putv have vr=-1 and need STORE. */
+      if ((vtop[-1].r & VT_VALMASK) == VT_LOCAL && vtop[-1].vr != -1)
       {
         op = TCCIR_OP_ASSIGN;
       }
@@ -9293,16 +9295,20 @@ static void init_putv(init_params *p, CType *type, unsigned long c, int vreg)
     vset(&dtype, VT_LOCAL | VT_LVAL, c);
     if (vreg == -1)
     {
-      vtop->vr = tcc_ir_get_vreg_var(tcc_state->ir); // TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_VAR, c);
+      /* Array element initialization: do NOT create a new vreg.
+       * Instead, keep vr = -1 so that vstore() will recognize this
+       * as a memory store, not a variable assignment.
+       * The stack offset 'c' in vtop->c.i identifies the destination. */
+      vtop->vr = -1;
+    }
+    else
+    {
+      vtop->vr = vreg;
       /* Mark long long variables for proper register allocation */
       if ((dtype.t & VT_BTYPE) == VT_LLONG)
       {
         tcc_ir_set_llong_type(tcc_state->ir, vtop->vr);
       }
-    }
-    else
-    {
-      vtop->vr = vreg;
     }
     vswap();
     vstore();
@@ -9986,13 +9992,20 @@ static void gen_function(Sym *sym)
   if (tcc_ir_constant_propagation(ir))
     tcc_ir_dead_code_elimination(ir); /* Clean up simplified ops */
 
+  /* Phase 1b: TMP Constant Propagation - propagate constants from folded expressions */
+  if (tcc_ir_tmp_constant_propagation(ir))
+  {
+    if (tcc_ir_constant_propagation(ir))
+      tcc_ir_dead_code_elimination(ir);
+  }
+
   /* Phase 2: Copy Propagation */
   if (tcc_ir_copy_propagation(ir))
-    tcc_ir_dead_code_elimination(ir); /* Clean up redundant copies */
+    tcc_ir_dead_code_elimination(ir);
 
   /* Phase 3: Arithmetic Common Subexpression Elimination */
   if (tcc_ir_arithmetic_cse(ir))
-    tcc_ir_dead_code_elimination(ir); /* Clean up duplicate computations */
+    tcc_ir_dead_code_elimination(ir);
 
   /* Common subexpression elimination for commutative boolean ops */
   if (tcc_ir_bool_cse(ir))

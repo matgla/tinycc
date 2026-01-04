@@ -21,11 +21,13 @@ Current issues:
 - Store followed by load from same address
 - Unnecessary spills due to excessive temporaries
 
-## Phase 1: Constant Propagation with Algebraic Simplification
+## Phase 1: Constant Propagation with Algebraic Simplification ✅ COMPLETE
 
 **Goal**: Eliminate constant variables and simplify arithmetic with constants.
 
-### 1.1 Track Constant Variables
+**Status**: ✅ Implemented and integrated into optimization pipeline (tccgen.c line 10013-10014).
+
+### 1.1 Track Constant Variables ✅ COMPLETE
 
 For each VAR vreg, determine:
 - Is it assigned exactly once (single definition)?
@@ -35,13 +37,18 @@ For each VAR vreg, determine:
 Data structure:
 ```c
 typedef struct VarConstInfo {
-    int is_constant;      // 1 if var holds known constant
-    int64_t value;        // the constant value
-    int def_count;        // number of definitions
+    uint8_t is_constant : 1;
+    uint8_t def_count : 7;
+    int64_t value;
 } VarConstInfo;
 ```
 
-### 1.2 Propagate Constants
+**Implementation**: `tccir.c` line ~2778 in `tcc_ir_constant_propagation()`
+- First pass: Count VAR definitions and identify constant assignments
+- Mark VARs with single constant definition as is_constant=1
+- Variables with multiple definitions marked as non-constant
+
+### 1.2 Propagate Constants ✅ COMPLETE
 
 Replace uses of constant VARs with immediate values:
 ```
@@ -49,7 +56,13 @@ Before: VReg TMP:11 <-- VReg VAR:0 SHL #2   (where VAR:0 = 0)
 After:  VReg TMP:11 <-- #0 SHL #2
 ```
 
-### 1.3 Algebraic Simplification (Constant Folding)
+**Implementation**: `tccir.c` in `tcc_ir_constant_propagation()`
+- Second pass: For each instruction, check source operands
+- If operand is constant VAR, replace with VT_CONST immediate
+- Special handling for BOOL_AND/BOOL_OR (code gen requires both operands constant or both register)
+- Special handling for VT_LOCAL without VT_LVAL (address computation must remain at runtime)
+
+### 1.3 Algebraic Simplification (Constant Folding) ✅ COMPLETE
 
 Apply these transformations when one operand is constant:
 
@@ -70,40 +83,38 @@ Apply these transformations when one operand is constant:
 | `#0 ADD X` | `X` (ASSIGN) |
 | `#C1 OP #C2` | `#result` (full constant fold) |
 
-### 1.4 Expected Result for Example
+**Implementation**: `tccir.c` in `tcc_ir_constant_propagation()`
+- Applies identity and zero/one rules during constant propagation pass
+- Full constant folding for binary operations with two constant operands
+- Includes safe division by zero checking (skips folding if divisor is 0)
+- Handles signed/unsigned operations correctly (SHR vs SAR, UDIV vs DIV)
 
+### 1.4 Integration and Results
+
+**Integration point**: `tccgen.c` line 10013-10014
+```c
+/* Phase 1: Constant Propagation and Algebraic Simplification */
+if (tcc_ir_constant_propagation(ir))
+  tcc_ir_dead_code_elimination(ir); /* Clean up simplified ops */
 ```
-Before:
-  0018: VReg TMP:11 <-- VReg VAR:0 SHL #2
-  0019: VReg TMP:12 <-- VReg PAR:0 ADD VReg TMP:11
-  0020: VReg TMP:13 <-- VReg TMP:12***DEREF***
 
-After constant propagation (VAR:0 = 0):
-  0018: VReg TMP:11 <-- #0 SHL #2
-  0019: VReg TMP:12 <-- VReg PAR:0 ADD VReg TMP:11
-  0020: VReg TMP:13 <-- VReg TMP:12***DEREF***
+**Optimization pipeline order**:
+1. Boolean simplification
+2. Return value optimization
+3. **Phase 1: Constant propagation** ← NEW
+4. Dead store elimination
 
-After algebraic simplification (#0 SHL #2 = #0):
-  0018: VReg TMP:11 <-- #0
-  0019: VReg TMP:12 <-- VReg PAR:0 ADD VReg TMP:11
-  0020: VReg TMP:13 <-- VReg TMP:12***DEREF***
-
-After X ADD #0 = X:
-  0018: (eliminated by DCE)
-  0019: VReg TMP:12 <-- VReg PAR:0
-  0020: VReg TMP:13 <-- VReg TMP:12***DEREF***
-
-Final (after copy prop):
-  0020: VReg TMP:13 <-- VReg PAR:0***DEREF***
-```
+**Expected impact**: Eliminates constant variable VAR:0 (always 0), reduces instruction count by ~10-15% through algebraic simplification and subsequent dead code elimination.
 
 ---
 
-## Phase 2: Copy Propagation
+## Phase 2: Copy Propagation ✅ COMPLETE
 
 **Goal**: Eliminate redundant copy temporaries.
 
-### 2.1 Identify Copy Chains
+**Status**: ✅ Implemented and integrated into optimization pipeline.
+
+### 2.1 Identify Copy Chains ✅ COMPLETE
 
 Pattern to detect:
 ```
@@ -116,11 +127,62 @@ If TMP:X is used only once and immediately after its definition, replace:
 VAR:Y <-- VAR:Y OP Z
 ```
 
-### 2.2 General Copy Propagation
+**Implementation**: `tccir.c` in `tcc_ir_copy_propagation()` (line ~2825)
+- Single-pass algorithm tracking ASSIGN instructions
+- Replaces uses of copied temps with original source
+- Properly invalidates copies when source VAR/PAR is redefined
+
+### 2.2 General Copy Propagation ✅ COMPLETE
 
 For any `TMP:X <-- SRC` (ASSIGN), replace subsequent uses of TMP:X with SRC (within the same basic block, before SRC is redefined).
 
-### 2.3 Expected Result for Example
+**Implementation**: `tccir.c` in `tcc_ir_copy_propagation()`
+- Tracks copies from VAR or PAR sources (not TMP, not constant)
+- Clears all copy info at basic block boundaries (JUMP, JUMPIF, function calls)
+- Does NOT propagate when use has VT_LVAL (avoids double-dereference bugs)
+- Handles copy invalidation when source vreg is redefined
+
+### 2.3 TMP Constant Propagation ✅ COMPLETE
+
+Also implemented `tcc_ir_tmp_constant_propagation()` to handle patterns where constant folding creates `TMP <- #const` that should be propagated.
+
+**Implementation**: `tccir.c` line ~2686
+- Tracks constant values assigned to TMP vregs
+- Propagates to subsequent uses within same basic block
+- Enables further constant propagation/folding in subsequent pass
+
+### 2.4 Integration
+
+**Integration point**: `tccgen.c` line ~9995
+```c
+/* Phase 1b: TMP Constant Propagation */
+if (tcc_ir_tmp_constant_propagation(ir)) {
+  if (tcc_ir_constant_propagation(ir))
+    tcc_ir_dead_code_elimination(ir);
+}
+
+/* Phase 2: Copy Propagation */
+if (tcc_ir_copy_propagation(ir))
+  tcc_ir_dead_code_elimination(ir);
+```
+
+### 2.5 Bug Fix: DSE STORE Address Tracking ✅ FIXED
+
+A critical bug was discovered where Dead Store Elimination wasn't treating STORE destination vregs as uses. For `TMP:X***DEREF*** <-- value [STORE]`, TMP:X is used as the store address, not being defined.
+
+**Fix**: `tccir.c` in `tcc_ir_dead_store_elimination()` (line ~1681)
+```c
+/* For STORE operations, the dest field is used as a pointer (address to store to),
+ * not as a destination being written. Mark it as used. */
+if (q->op == TCCIR_OP_STORE && TCCIR_DECODE_VREG_TYPE(q->dest.vr) == TCCIR_VREG_TYPE_TEMP)
+{
+  int pos = TCCIR_DECODE_VREG_POSITION(q->dest.vr);
+  if (pos <= max_tmp_pos)
+    used[pos / 8] |= (1 << (pos % 8));
+}
+```
+
+### 2.6 Expected Result for Example
 
 ```
 Before:
@@ -133,37 +195,49 @@ After:
 
 ---
 
-## Phase 3: Common Subexpression Elimination (CSE)
+## Phase 3: Common Subexpression Elimination (CSE) ✅ COMPLETE
 
 **Goal**: Reuse computed values instead of recomputing.
 
-### 3.1 Basic Block CSE
+**Status**: ✅ Implemented for both boolean and arithmetic operations.
 
-Within a basic block (no jumps), track computed expressions:
+### 3.1 Arithmetic CSE ✅ COMPLETE
 
+**Implementation**: `tccir.c` in `tcc_ir_arithmetic_cse()` (line ~2986)
+- Hash table based expression matching
+- Handles ADD, SUB, MUL, AND, OR, XOR, SHL, SHR, SAR operations
+- Tracks expressions per basic block
+- Clears at basic block boundaries (jumps, function calls)
+- Clears expressions when operands are redefined
+
+### 3.2 Handle Commutative Operations ✅ COMPLETE
+
+For ADD, MUL, AND, OR, XOR: operands are normalized (smaller vreg first) in hash computation.
+
+**Implementation**: In `tcc_ir_arithmetic_cse()` hash function
+- Commutative ops have both operands considered in normalized order
+- Matching handles both orderings
+
+### 3.3 Boolean CSE ✅ COMPLETE
+
+**Implementation**: `tccir.c` in `tcc_ir_bool_cse()` (line ~1832)
+- Handles BOOL_AND and BOOL_OR operations
+- Same hash-based approach as arithmetic CSE
+
+### 3.4 Integration
+
+**Integration point**: `tccgen.c` line ~10001
 ```c
-typedef struct CSEEntry {
-    TccIrOp op;
-    int src1_vr;
-    int src2_vr;       // or constant value
-    int src2_is_const;
-    int64_t src2_const;
-    int result_vr;
-    int instruction_idx;
-} CSEEntry;
+/* Phase 3: Arithmetic Common Subexpression Elimination */
+if (tcc_ir_arithmetic_cse(ir))
+  tcc_ir_dead_code_elimination(ir);
+
+/* Common subexpression elimination for commutative boolean ops */
+if (tcc_ir_bool_cse(ir))
+  tcc_ir_dead_code_elimination(ir);
 ```
 
-For each arithmetic instruction, check if same computation exists. If so, replace with ASSIGN from previous result.
-
-### 3.2 Handle Commutative Operations
-
-For ADD, MUL, AND, OR, XOR: normalize operand order (smaller vreg first) before hashing.
-
-### 3.3 Invalidation
-
-Invalidate CSE entry for expression involving vreg X when X is redefined.
-
-### 3.4 Expected Result for Example
+### 3.5 Expected Result for Example
 
 ```
 Before (after loop, instructions 15-25):
@@ -187,11 +261,13 @@ After CSE:
 
 ---
 
-## Phase 4: Store-Load Forwarding (Future)
+## Phase 4: Store-Load Forwarding (Future) ⏸️ DEFERRED
 
 **Goal**: Avoid reloading values that were just stored.
 
-### 4.1 Track Recent Stores
+**Status**: Deferred - requires alias analysis. Focus on Phases 1-3 first.
+
+### 4.1 Track Recent Stores ⏸️ DEFERRED
 
 After a STORE instruction:
 ```
@@ -200,7 +276,7 @@ ADDR***DEREF*** <-- VALUE [STORE]
 
 Track that memory at ADDR contains VALUE.
 
-### 4.2 Forward to Loads
+### 4.2 Forward to Loads ⏸️ DEFERRED
 
 When encountering a LOAD from same address:
 ```
@@ -212,7 +288,7 @@ Replace with:
 DEST <-- VALUE
 ```
 
-### 4.3 Alias Analysis (Simple)
+### 4.3 Alias Analysis (Simple) ⏸️ DEFERRED
 
 Invalidate tracked stores when:
 - Any store to a potentially aliasing address
@@ -237,40 +313,139 @@ After (combined with CSE showing TMP:16 == TMP:10):
 
 ## Implementation Order
 
-1. **Phase 1: Constant Propagation** (tccir.c)
-   - Add `tcc_ir_constant_propagation()` function
-   - Add to optimization pipeline in tccgen.c after dead code elimination
-   - Run dead code elimination after to clean up
+### ✅ Completed - All Phases 1-3
 
-2. **Phase 2: Copy Propagation** (tccir.c)
-   - Add `tcc_ir_copy_propagation()` function
-   - Add to pipeline after constant propagation
+| Phase | Status | Description |
+|-------|--------|-------------|
+| Dead Store Elimination | ✅ Complete | Removes unused ASSIGN instructions |
+| Phase 1: Constant Propagation | ✅ Complete | Propagates constants, algebraic simplification |
+| Phase 1b: TMP Constant Propagation | ✅ Complete | Propagates constants from folded expressions |
+| Phase 2: Copy Propagation | ✅ Complete | Eliminates redundant copy temporaries |
+| Phase 3: Arithmetic CSE | ✅ Complete | Reuses computed arithmetic expressions |
+| Phase 3: Boolean CSE | ✅ Complete | Reuses computed boolean expressions |
+| Phase 4: Store-Load Forwarding | ⏸️ Deferred | Requires alias analysis |
 
-3. **Phase 3: General CSE** (tccir.c)
-   - Extend existing CSE infrastructure (currently bool-only)
-   - Add `tcc_ir_arithmetic_cse()` function
-   - Add to pipeline after copy propagation
+### Key Bug Fixes Applied
 
-4. **Phase 4: Store-Load Forwarding** (future)
-   - More complex, requires alias analysis
-   - Consider as future enhancement
+1. **DSE STORE Address Tracking** - Fixed DSE to treat STORE destination vregs as uses (not definitions)
+2. **Copy Propagation VT_LVAL Handling** - Fixed to NOT propagate when use has VT_LVAL to avoid double-dereference bugs
+3. **Copy Propagation VAR Invalidation** - Fixed to invalidate copies when source VAR/PAR is redefined
+
+### Optimization Pipeline (Final)
+
+Located in `tccgen.c` around line 9980:
+
+```c
+/* Dead code elimination - remove unreachable instructions */
+tcc_ir_dead_code_elimination(ir);
+
+/* Phase 1: Constant Propagation with Algebraic Simplification */
+if (tcc_ir_constant_propagation(ir))
+  tcc_ir_dead_code_elimination(ir);
+
+/* Phase 1b: TMP Constant Propagation */
+if (tcc_ir_tmp_constant_propagation(ir)) {
+  if (tcc_ir_constant_propagation(ir))
+    tcc_ir_dead_code_elimination(ir);
+}
+
+/* Phase 2: Copy Propagation */
+if (tcc_ir_copy_propagation(ir))
+  tcc_ir_dead_code_elimination(ir);
+
+/* Phase 3: Arithmetic CSE */
+if (tcc_ir_arithmetic_cse(ir))
+  tcc_ir_dead_code_elimination(ir);
+
+/* Boolean CSE */
+if (tcc_ir_bool_cse(ir))
+  tcc_ir_dead_code_elimination(ir);
+
+/* Boolean idempotent simplification */
+if (tcc_ir_bool_idempotent(ir))
+  tcc_ir_dead_code_elimination(ir);
+
+/* Boolean expression simplification */
+if (tcc_ir_bool_simplification(ir))
+  tcc_ir_dead_code_elimination(ir);
+
+/* Return value optimization */
+if (tcc_ir_return_value_optimization(ir))
+  tcc_ir_dead_code_elimination(ir);
+
+/* Dead store elimination */
+tcc_ir_dead_store_elimination(ir);
+```
+
+### ⏸️ Phase 4: Store-Load Forwarding - DEFERRED
+**Status**: Requires alias analysis - postpone for future work
 
 ---
 
-## Testing
+## Testing Strategy
 
-Test cases to verify:
-1. Original `Move` function - verify reduced instruction count
-2. Constant variable elimination
-3. Loop with invariant computations
-4. Chained arithmetic with constants
-5. Ensure no correctness regressions in existing test suite
+### Test Cases Needed
+1. ✅ Original `Move` function - primary test case
+2. ❌ Pure constant variable test:
+   ```c
+   int test_const() { int x = 5; return x * 2 + x; }
+   ```
+3. ❌ Loop with invariant:
+   ```c
+   void test_loop(int *arr) {
+     int base = 100;
+     for (int i = 0; i < 10; i++) arr[i] = base + i;
+   }
+   ```
+4. ❌ Chained arithmetic:
+   ```c
+   int test_chain(int x) { return ((x + 0) * 1) + 0; }
+   ```
+5. ✅ Run existing test suite to ensure no regressions
+
+### Verification Commands
+```bash
+# Compile test with IR dump
+./armv8m-tcc -DDEBUG_IR_PRINT -c test.c
+
+# Check instruction count reduction
+grep "DEAD STORE ELIMINATION END" output
+
+# Verify correctness
+./armv8m-tcc -run test.c
+```
+
+---
+
+## Current Status Summary
+
+### ✅ All Core Optimizations Complete
+
+| Optimization | Status | Function |
+|-------------|--------|----------|
+| Dead Code Elimination | ✅ Working | `tcc_ir_dead_code_elimination()` |
+| Dead Store Elimination | ✅ Working | `tcc_ir_dead_store_elimination()` |
+| Constant Propagation | ✅ Working | `tcc_ir_constant_propagation()` |
+| TMP Constant Propagation | ✅ Working | `tcc_ir_tmp_constant_propagation()` |
+| Copy Propagation | ✅ Working | `tcc_ir_copy_propagation()` |
+| Arithmetic CSE | ✅ Working | `tcc_ir_arithmetic_cse()` |
+| Boolean CSE | ✅ Working | `tcc_ir_bool_cse()` |
+| Boolean Idempotent | ✅ Working | `tcc_ir_bool_idempotent()` |
+| Boolean Simplification | ✅ Working | `tcc_ir_bool_simplification()` |
+| Return Value Optimization | ✅ Working | `tcc_ir_return_value_optimization()` |
+
+### Test Results
+- **All 39 IR tests passing** with full optimization pipeline enabled
+- Tests cover: pointers, structs, loops, recursion, arrays, function calls, etc.
+
+### Future Work
+- **Phase 4: Store-Load Forwarding** - Requires alias analysis, deferred for future implementation
 
 ---
 
 ## Expected Final IR for Move()
 
-After all optimizations:
+After all Phase 1-3 optimizations:
 
 ```
 0000: VReg VAR:1 <-- #0

@@ -376,9 +376,9 @@ SpillContext tcc_ir_preload_spills(TACQuadruple *q, int preload_src1, int preloa
 {
   SpillContext ctx = {0};
   ctx.is_64bit = tcc_ir_is_64bit(q->dest.type.t);
-  ctx.dest_scratch_reg = -1;
-  ctx.src1_scratch_reg = -1;
-  ctx.src2_scratch_reg = -1;
+  ctx.dest_scratch_reg = PREG_NONE;
+  ctx.src1_scratch_reg = PREG_NONE;
+  ctx.src2_scratch_reg = PREG_NONE;
   uint32_t exclude_regs = 0;
 
   /* Save original register allocations */
@@ -395,9 +395,9 @@ SpillContext tcc_ir_preload_spills(TACQuadruple *q, int preload_src1, int preloa
 
     /* Find a free scratch register using liveness info */
     TCCIRState *ir = tcc_state->ir;
-    int scratch =
-        (ir) ? tcc_ls_find_free_scratch_reg(&ir->ls, ir->codegen_instruction_idx, exclude_regs, ir->leaffunc) : -1;
-    if (scratch < 0)
+    int scratch = (ir) ? tcc_ls_find_free_scratch_reg(&ir->ls, ir->codegen_instruction_idx, exclude_regs, ir->leaffunc)
+                       : PREG_NONE;
+    if (scratch == PREG_NONE)
     {
       /* No free register - save R_IP to stack and use it */
       scratch = R_IP;
@@ -448,9 +448,9 @@ SpillContext tcc_ir_preload_spills(TACQuadruple *q, int preload_src1, int preloa
 
     /* Find a different free scratch register */
     TCCIRState *ir = tcc_state->ir;
-    int scratch =
-        (ir) ? tcc_ls_find_free_scratch_reg(&ir->ls, ir->codegen_instruction_idx, exclude_regs, ir->leaffunc) : -1;
-    if (scratch < 0)
+    int scratch = (ir) ? tcc_ls_find_free_scratch_reg(&ir->ls, ir->codegen_instruction_idx, exclude_regs, ir->leaffunc)
+                       : PREG_NONE;
+    if (scratch == PREG_NONE)
     {
       /* No free register - save one to stack and use it */
       scratch = R_IP;
@@ -492,9 +492,9 @@ SpillContext tcc_ir_preload_spills(TACQuadruple *q, int preload_src1, int preloa
 
     /* Find a free scratch register for dest */
     TCCIRState *ir = tcc_state->ir;
-    int scratch =
-        (ir) ? tcc_ls_find_free_scratch_reg(&ir->ls, ir->codegen_instruction_idx, exclude_regs, ir->leaffunc) : -1;
-    if (scratch < 0)
+    int scratch = (ir) ? tcc_ls_find_free_scratch_reg(&ir->ls, ir->codegen_instruction_idx, exclude_regs, ir->leaffunc)
+                       : PREG_NONE;
+    if (scratch == PREG_NONE)
     {
       /* No free register - save one to stack and use it */
       scratch = R_IP;
@@ -552,14 +552,14 @@ void tcc_ir_storeback_spill(TACQuadruple *q, SpillContext *ctx)
 
     /* Use the scratch register that was assigned during preload and contains the result */
     int scratch = ctx->dest_scratch_reg;
-    if (scratch < 0)
+    if (scratch == PREG_NONE)
     {
       /* Fallback: should not happen if preload was called correctly */
       TCCIRState *ir = tcc_state->ir;
       uint32_t exclude_regs = 0;
-      scratch =
-          (ir) ? tcc_ls_find_free_scratch_reg(&ir->ls, ir->codegen_instruction_idx, exclude_regs, ir->leaffunc) : -1;
-      if (scratch < 0)
+      scratch = (ir) ? tcc_ls_find_free_scratch_reg(&ir->ls, ir->codegen_instruction_idx, exclude_regs, ir->leaffunc)
+                     : PREG_NONE;
+      if (scratch == PREG_NONE)
       {
         /* Emergency fallback - save R_IP, use it, restore it */
         scratch = R_IP;
@@ -658,7 +658,7 @@ static void th_literal_pool_init()
   thumb_gen_state.generating_function = 0;
   thumb_gen_state.code_size = 0;
   thumb_gen_state.cached_global_sym = NULL;
-  thumb_gen_state.cached_global_reg = -1;
+  thumb_gen_state.cached_global_reg = PREG_NONE;
 }
 
 const FloatingPointConfig arm_soft_fpu_config = {
@@ -1062,7 +1062,7 @@ static thumb_opcode th_generic_mov_imm(uint32_t r, int imm)
 {
   if (imm < 0)
   {
-    return th_mvn_imm(r, 0, -imm + 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE);
+    return th_mvn_imm(r, 0, -imm - 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE);
   }
   return th_mov_imm(r, imm, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE);
 }
@@ -1075,7 +1075,7 @@ int th_offset_to_reg(int off, int sign)
   /* if mov is not possible then load from data */
   if (!ot(th_generic_mov_imm(rr, off)))
   {
-    load_full_const(rr, -1, sign ? -off : off, NULL);
+    load_full_const(rr, PREG_NONE, sign ? -off : off, NULL);
     return rr;
   }
 
@@ -1370,8 +1370,8 @@ void store(int r, SValue *sv)
     uint32_t base = R_FP;
     if (v < VT_CONST)
     {
-      /* Check if pr0 is valid (not -1 and not spilled) */
-      if (sv->pr0 >= 0 && !(sv->pr0 & PREG_SPILLED))
+      /* Check if pr0 is valid (not PREG_NONE and not spilled) */
+      if (sv->pr0 != PREG_NONE && !(sv->pr0 & PREG_SPILLED))
       {
         base = sv->pr0;
       }
@@ -1464,7 +1464,7 @@ void store(int r, SValue *sv)
             /* Double precision - two 32-bit stores (low word first) */
             /* Use sv->pr1 for high register, not r+1 which could be invalid */
             int r_high = sv->pr1;
-            if (r_high < 0 || r_high == R_SP || r_high == R_PC)
+            if (r_high == PREG_NONE || r_high == R_SP || r_high == R_PC)
             {
               /* Fallback: if pr1 not allocated, try r+1 but validate */
               r_high = r + 1;
@@ -1608,7 +1608,7 @@ static void load_full_const(int r, int r1, int64_t imm, struct Sym *sym)
 
   TRACE("'load_full_const' to register: %d, with imm: %d\n", r, imm);
   // allocate space for T1 encoding
-  if (r1 != -1)
+  if (r1 != PREG_NONE)
   {
     est = 4;
   }
@@ -1618,7 +1618,7 @@ static void load_full_const(int r, int r1, int64_t imm, struct Sym *sym)
   }
   entry->short_instruction = est == 2 ? 1 : 0;
 
-  if (r1 == -1)
+  if (r1 == PREG_NONE)
   {
     entry->data_size = 4;
     ot_check(th_ldr_literal(r, 0, 1));
@@ -1708,7 +1708,7 @@ static void load_full_const(int r, int r1, int64_t imm, struct Sym *sym)
             entry2->imm = imm;
             entry2->patch_position = ind;
             entry2->relocation = -1;
-            entry2->data_size = r1 != -1 ? 8 : 4;
+            entry2->data_size = r1 != PREG_NONE ? 8 : 4;
             entry2->short_instruction = false;
 
             /* Find a free scratch register for literal pool entry */
@@ -1990,9 +1990,9 @@ void load_vt_const(int r, int r1, SValue *sv)
       return load_full_const(r, r1, val64, 0);
     }
     if (!ot(o1))
-      load_full_const(r, -1, lo, 0);
+      load_full_const(r, PREG_NONE, lo, 0);
     if (!ot(o2))
-      load_full_const(r1, -1, hi, 0);
+      load_full_const(r1, PREG_NONE, hi, 0);
     return; /* Don't fall through to 32-bit code */
   }
 
@@ -2020,7 +2020,7 @@ void load_vt_local(int r, SValue *sv)
   }
   if (sym_to_use || (-sv->c.i) >= 0xfff)
   {
-    load_full_const(r, -1, sv->c.i, sym_to_use);
+    load_full_const(r, PREG_NONE, sv->c.i, sym_to_use);
     ot_check(th_add_reg(r, R_FP, r, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
   }
   else
@@ -2192,7 +2192,7 @@ void load_to_dest(SValue *dest, SValue *sv)
       if (dest->pr0 == thumb_gen_state.cached_global_reg || dest->pr1 == thumb_gen_state.cached_global_reg)
       {
         thumb_gen_state.cached_global_sym = NULL;
-        thumb_gen_state.cached_global_reg = -1;
+        thumb_gen_state.cached_global_reg = PREG_NONE;
       }
       return load_vt_lval_vt_local(dest->pr0, dest->pr1, sv, ft, fc, sign, base);
     }
@@ -2208,7 +2208,7 @@ void load_to_dest(SValue *dest, SValue *sv)
   else if (v < VT_CONST)
   {
     /* For IR-generated code, use pr0 as the source register */
-    int src_reg = (sv->pr0 >= 0 && !(sv->pr0 & PREG_SPILLED)) ? sv->pr0 : v;
+    int src_reg = (sv->pr0 != PREG_NONE && !(sv->pr0 & PREG_SPILLED)) ? sv->pr0 : v;
 
     /* Check if spilled - load from stack instead of register move.
      * Note: pr0 might have been overwritten with destination register by caller,
@@ -2231,7 +2231,7 @@ void load_to_dest(SValue *dest, SValue *sv)
     {
       /* Check if we're moving between VFP registers or integer registers.
        * Only use VFP if hard float ABI is enabled. */
-      if (tcc_state->float_abi == ARM_HARD_FLOAT && dest->pr0 >= TREG_F0 && dest->pr0 <= TREG_F7 &&
+      if (tcc_state->float_abi == ARM_HARD_FLOAT && dest->pr0 != TREG_F0 && dest->pr0 <= TREG_F7 &&
           src_reg >= TREG_F0 && src_reg <= TREG_F7)
       {
         /* VFP to VFP move */
@@ -2253,7 +2253,7 @@ void load_to_dest(SValue *dest, SValue *sv)
           /* Also move high word for double.
            * Use dest->pr1 for destination high register.
            * Source high register comes from sv->r2 if available, otherwise src_reg+1. */
-          if (dest->pr1 >= 0)
+          if (dest->pr1 != PREG_NONE)
           {
             int v_high = (sv->r2 != VT_CONST) ? sv->r2 : (src_reg + 1);
             if (dest->pr1 != v_high)
@@ -2273,7 +2273,7 @@ void load_to_dest(SValue *dest, SValue *sv)
         ot_check(th_mov_reg(dest->pr0, src_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
                             ENFORCE_ENCODING_NONE, false));
       }
-      if (dest->pr1 != -1 && tcc_is_64bit_operand(sv))
+      if (dest->pr1 != PREG_NONE && tcc_is_64bit_operand(sv))
       {
         int v_high = (sv->r2 != VT_CONST) ? sv->r2 : (src_reg + 1);
         if (dest->pr1 != v_high)
@@ -2294,7 +2294,7 @@ static void load_to_reg(int r, int r1, SValue *sv)
   SValue dest;
   memset(&dest, 0, sizeof(dest));
   dest.pr0 = r;
-  dest.pr1 = r1; /* -1 for 32-bit, actual register for 64-bit */
+  dest.pr1 = r1; /* PREG_NONE for 32-bit, actual register for 64-bit */
   dest.type = sv->type;
   load_to_dest(&dest, sv);
 }
@@ -2302,7 +2302,7 @@ static void load_to_reg(int r, int r1, SValue *sv)
 // Simplified load() - now just calls load_to_reg()
 void load(int r, SValue *sv)
 {
-  load_to_reg(r, -1, sv);
+  load_to_reg(r, PREG_NONE, sv);
 }
 
 static int is_zero_on_stack(int pos)
@@ -2597,7 +2597,7 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
     {
       src1_reg = get_free_scratch_reg(exclude_regs);
       exclude_regs |= (1 << src1_reg);
-      load_to_reg(src1_reg, -1, &op->src1);
+      load_to_reg(src1_reg, PREG_NONE, &op->src1);
     }
     else if (src1_reg >= 0)
     {
@@ -2606,7 +2606,7 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
     if (th_has_immediate_value(op->src2.r))
     {
       src2_reg = get_free_scratch_reg(exclude_regs);
-      load_to_reg(src2_reg, -1, &op->src2);
+      load_to_reg(src2_reg, PREG_NONE, &op->src2);
     }
     ot_check(th_sdiv(op->dest.pr0, src1_reg, src2_reg));
     return;
@@ -2621,7 +2621,7 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
     {
       src1_reg = get_free_scratch_reg(exclude_regs);
       exclude_regs |= (1 << src1_reg);
-      load_to_reg(src1_reg, -1, &op->src1);
+      load_to_reg(src1_reg, PREG_NONE, &op->src1);
     }
     else if (src1_reg >= 0)
     {
@@ -2630,7 +2630,7 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
     if (th_has_immediate_value(op->src2.r))
     {
       src2_reg = get_free_scratch_reg(exclude_regs);
-      load_to_reg(src2_reg, -1, &op->src2);
+      load_to_reg(src2_reg, PREG_NONE, &op->src2);
     }
     ot_check(th_udiv(op->dest.pr0, src1_reg, src2_reg));
     return;
@@ -2652,10 +2652,10 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
   {
     int src_reg = op->src1.pr0;
     /* Handle immediate constant - load into scratch register first */
-    if (th_has_immediate_value(op->src1.r) || src_reg < 0)
+    if (th_has_immediate_value(op->src1.r) || src_reg == PREG_NONE || (src_reg & PREG_SPILLED))
     {
       src_reg = get_free_scratch_reg(0);
-      load_to_reg(src_reg, -1, &op->src1);
+      load_to_reg(src_reg, PREG_NONE, &op->src1);
     }
     ot_check(th_cmp_imm(0, src_reg, 0, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE));
     return;
@@ -2675,7 +2675,7 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
     uint32_t exclude_regs = 0;
 
     /* Exclude destination register from scratch selection */
-    if (op->dest.pr0 >= 0)
+    if (op->dest.pr0 != PREG_NONE && !(op->dest.pr0 & PREG_SPILLED))
       exclude_regs |= (1 << op->dest.pr0);
 
     /* Load constant src1 into scratch register */
@@ -2683,7 +2683,7 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
     {
       src1_reg = get_free_scratch_reg(exclude_regs);
       exclude_regs |= (1 << src1_reg);
-      load_to_reg(src1_reg, -1, &op->src1);
+      load_to_reg(src1_reg, PREG_NONE, &op->src1);
     }
     else if (src1_reg >= 0)
     {
@@ -2700,7 +2700,7 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
       }
       /* Immediate form failed or not available, load to scratch register */
       src2_reg = get_free_scratch_reg(exclude_regs);
-      load_to_reg(src2_reg, -1, &op->src2);
+      load_to_reg(src2_reg, PREG_NONE, &op->src2);
     }
 
     ot_check(handler.reg_handler(op->dest.pr0, src1_reg, src2_reg, flags, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
@@ -2736,13 +2736,13 @@ static const char *get_softfp_func_name(TccIrOp op, int is_double)
 static int load_fp_operand_to_vfp(SValue *sv, int scratch_sreg, int scratch_dreg, int is_double)
 {
   /* Check if operand is already in a VFP register (pr0 has VFP marker) */
-  if (sv->pr0 >= 0 && LS_IS_VFP_REG(sv->pr0))
+  if (sv->pr0 != PREG_NONE && LS_IS_VFP_REG(sv->pr0))
   {
     return LS_VFP_REG_NUM(sv->pr0);
   }
 
   /* Not in VFP reg - load to integer reg and move to VFP scratch */
-  load_to_reg(R0, is_double ? R1 : -1, sv);
+  load_to_reg(R0, is_double ? R1 : PREG_NONE, sv);
   if (is_double)
   {
     ot_check(th_vmov_2gp_dp(R0, R1, scratch_dreg, 0 /* to VFP */));
@@ -2762,7 +2762,7 @@ static int load_fp_operand_to_vfp(SValue *sv, int scratch_sreg, int scratch_dreg
 static void store_fp_result_from_vfp(SValue *dest, int result_sreg, int result_dreg, int is_double)
 {
   /* Check if destination is a VFP register */
-  if (dest->pr0 >= 0 && LS_IS_VFP_REG(dest->pr0))
+  if (dest->pr0 != PREG_NONE && LS_IS_VFP_REG(dest->pr0))
   {
     int dest_sreg = LS_VFP_REG_NUM(dest->pr0);
     if (is_double)
@@ -2791,7 +2791,7 @@ static void store_fp_result_from_vfp(SValue *dest, int result_sreg, int result_d
   {
     ot_check(th_vmov_2gp_dp(R0, R1, result_dreg, 1 /* to ARM */));
     /* If dest has an allocated integer register pair, move to it */
-    if (dest->pr0 >= 0 && !LS_IS_VFP_REG(dest->pr0) && !(dest->pr0 & PREG_SPILLED) && dest->pr1 >= 0)
+    if (dest->pr0 != PREG_NONE && !LS_IS_VFP_REG(dest->pr0) && !(dest->pr0 & PREG_SPILLED) && dest->pr1 != PREG_NONE)
     {
       /* Move R0:R1 to dest register pair */
       if (dest->pr0 != R0)
@@ -2827,7 +2827,7 @@ static void store_fp_result_from_vfp(SValue *dest, int result_sreg, int result_d
   {
     ot_check(th_vmov_gp_sp(R0, result_sreg, 1 /* to ARM */));
     /* If dest has an allocated integer register, move to it */
-    if (dest->pr0 >= 0 && !LS_IS_VFP_REG(dest->pr0) && !(dest->pr0 & PREG_SPILLED))
+    if (dest->pr0 != PREG_NONE && !LS_IS_VFP_REG(dest->pr0) && !(dest->pr0 & PREG_SPILLED))
     {
       if (dest->pr0 != R0)
       {
@@ -2992,7 +2992,7 @@ static void gen_hardfp_cvt_itof(TACQuadruple *q)
   }
 
   /* Load integer to R0, then to S0 */
-  load_to_reg(R0, -1, &q->src1);
+  load_to_reg(R0, PREG_NONE, &q->src1);
   ot_check(th_vmov_gp_sp(R0, 0 /* S0 */, 0 /* to VFP */));
 
   /* VCVT: convert int in S0 to float/double in S0/D0
@@ -3117,10 +3117,10 @@ ST_FUNC void tcc_gen_machine_fp_op(TACQuadruple *q)
     /* Negation: XOR the sign bit */
     /* For float: XOR R0 with 0x80000000 */
     /* For double: XOR R1 with 0x80000000 (high word has sign) */
-    load_to_reg(R0, is_double ? R1 : -1, &q->src1);
+    load_to_reg(R0, is_double ? R1 : PREG_NONE, &q->src1);
     /* Load 0x80000000 to scratch register using literal pool */
     int scratch_reg = get_free_scratch_reg((1 << R0) | (is_double ? (1 << R1) : 0));
-    load_full_const(scratch_reg, -1, 0x80000000, NULL);
+    load_full_const(scratch_reg, PREG_NONE, 0x80000000, NULL);
     if (is_double)
     {
       /* XOR high word (R1) with sign bit */
@@ -3160,8 +3160,8 @@ ST_FUNC void tcc_gen_machine_fp_op(TACQuadruple *q)
     else
     {
       /* Float: src1 in R0, src2 in R1 */
-      load_to_reg(R0, -1, &q->src1);
-      load_to_reg(R1, -1, &q->src2);
+      load_to_reg(R0, PREG_NONE, &q->src1);
+      load_to_reg(R1, PREG_NONE, &q->src2);
     }
 
     /* Get or create the external symbol for the comparison function */
@@ -3198,7 +3198,7 @@ ST_FUNC void tcc_gen_machine_fp_op(TACQuadruple *q)
     else
     {
       /* Same type, no conversion needed - just copy */
-      load_to_reg(R0, src_is_double ? R1 : -1, &q->src1);
+      load_to_reg(R0, src_is_double ? R1 : PREG_NONE, &q->src1);
       store(R0, &q->dest);
       return;
     }
@@ -3289,10 +3289,10 @@ ST_FUNC void tcc_gen_machine_return_value_op(TACQuadruple *q)
 
   /* NOTE: src1 is preloaded to a valid register by generate_code if it was spilled.
    * Just move to return registers R0 (and R1 for 64-bit). */
-  if (q->src1.pr0 >= 0)
+  if (q->src1.pr0 != PREG_NONE)
   {
     load_to_register(R0, q->src1.pr0, &q->src1);
-    if (is_64bit && q->src1.pr1 >= 0)
+    if (is_64bit && q->src1.pr1 != PREG_NONE)
     {
       load_to_register(R1, q->src1.pr1, &q->src1);
     }
@@ -3302,7 +3302,7 @@ ST_FUNC void tcc_gen_machine_return_value_op(TACQuadruple *q)
   /* If we get here with invalid pr0, handle constant case */
   SValue dest;
   dest.pr0 = R0;
-  dest.pr1 = is_64bit ? R1 : -1;
+  dest.pr1 = is_64bit ? R1 : PREG_NONE;
   return load_to_dest(&dest, &q->src1);
 }
 
@@ -3325,11 +3325,11 @@ ST_FUNC void tcc_gen_machine_store_op(TACQuadruple *op)
   int is_64bit = (src_btype == VT_DOUBLE) || (src_btype == VT_LDOUBLE) || (src_btype == VT_LLONG);
 
   src_reg = op->src1.pr0;
-  // if src_reg is -1 then immediate value must be loaded
-  if (src_reg < 0)
+  // if src_reg is PREG_NONE then immediate value must be loaded
+  if (src_reg == PREG_NONE || (src_reg & PREG_SPILLED))
   {
     int scratch_reg = get_free_scratch_reg(0);
-    load_to_reg(scratch_reg, is_64bit ? R11 : -1, &op->src1);
+    load_to_reg(scratch_reg, is_64bit ? R11 : PREG_NONE, &op->src1);
     src_reg = scratch_reg;
   }
   store(src_reg, &op->dest);
@@ -3345,7 +3345,7 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
   thumb_gen_state.code_size = 0;
   /* Clear global symbol cache at function start */
   thumb_gen_state.cached_global_sym = NULL;
-  thumb_gen_state.cached_global_reg = -1;
+  thumb_gen_state.cached_global_reg = PREG_NONE;
 
   if (!leaffunc)
   {
@@ -3536,7 +3536,7 @@ ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *op)
       int dn = LS_VFP_REG_NUM(op->dest.pr0);
       /* Load constant to integer register, then move to VFP */
       int scratch_reg = get_free_scratch_reg(0);
-      load_to_reg(scratch_reg, -1, &op->src1);
+      load_to_reg(scratch_reg, PREG_NONE, &op->src1);
       ot_check(th_vmov_gp_sp(scratch_reg, dn, 0)); /* VMOV Sn, scratch_reg */
     }
     else
@@ -3580,7 +3580,7 @@ ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *op)
    * a register was allocated. The register serves as a cache, but the canonical
    * location is still on the stack. This is critical for compound assignments
    * like `index += 1` where the incremented value must be stored back. */
-  if (dest_is_local && op->dest.pr0 >= 0)
+  if (dest_is_local && op->dest.pr0 != PREG_NONE)
   {
     TRACE("ASSIGN: Writing back local variable from R%d to memory at offset %d", op->dest.pr0, op->dest.c.i);
     store(op->dest.pr0, &op->dest);
@@ -3657,7 +3657,7 @@ static void gcall_or_jump(int is_jmp, SValue *dest)
   else
   {
     int scratch_reg = get_free_scratch_reg(0);
-    load_to_reg(scratch_reg, -1, dest);
+    load_to_reg(scratch_reg, PREG_NONE, dest);
     if (!is_jmp)
       ot_check(th_blx_reg(scratch_reg));
     else
@@ -3681,11 +3681,11 @@ static void load_to_register(int reg, int reg_from, SValue *sv)
     if (!(sv->r & VT_LVAL))
     {
       /* Always compute address via load_vt_local */
-      int r1 = (sv->pr1 >= 0 && is_64bit_type(sv->type.t)) ? sv->pr1 : -1;
+      int r1 = (sv->pr1 != PREG_NONE && is_64bit_type(sv->type.t)) ? sv->pr1 : PREG_NONE;
       load_to_reg(reg, r1, sv);
       return;
     }
-    if (sv->pr0 >= 0 && !(sv->pr0 & PREG_SPILLED))
+    if (sv->pr0 != PREG_NONE && !(sv->pr0 & PREG_SPILLED))
     {
       // load local variable value from register
       if (reg != reg_from)
@@ -3695,19 +3695,19 @@ static void load_to_register(int reg, int reg_from, SValue *sv)
       }
       return;
     }
-    if (sv->pr0 == -1 || (sv->pr0 & PREG_SPILLED))
+    if (sv->pr0 == PREG_NONE || (sv->pr0 & PREG_SPILLED))
     {
       /* Spilled local variable - load from stack */
-      int r1 = (sv->pr1 >= 0 && is_64bit_type(sv->type.t)) ? sv->pr1 : -1;
+      int r1 = (sv->pr1 != PREG_NONE && is_64bit_type(sv->type.t)) ? sv->pr1 : PREG_NONE;
       load_to_reg(reg, r1, sv);
       return;
     }
   }
 
-  if ((sv->r & VT_LVAL) || sv->pr0 == -1 || (sv->pr0 & PREG_SPILLED))
+  if ((sv->r & VT_LVAL) || sv->pr0 == PREG_NONE || (sv->pr0 & PREG_SPILLED))
   {
     /* Lvalue: need to load from memory */
-    int r1 = (sv->pr1 >= 0 && is_64bit_type(sv->type.t)) ? sv->pr1 : -1;
+    int r1 = (sv->pr1 != PREG_NONE && is_64bit_type(sv->type.t)) ? sv->pr1 : PREG_NONE;
     load_to_reg(reg, r1, sv);
     return;
   }
@@ -3725,7 +3725,7 @@ static void load_to_register(int reg, int reg_from, SValue *sv)
  * so we cannot use the register directly even if it contains the value. */
 static bool is_valid_src_reg(const SValue *sv, int reg)
 {
-  if (reg < 0 || (reg & PREG_SPILLED))
+  if (reg == PREG_NONE || (reg & PREG_SPILLED))
     return false;
   if (sv->r & VT_LVAL)
     return false;
@@ -3747,7 +3747,7 @@ static void remap_future_param_sources(int current_dest, int reg_to_save, int re
   /* Walk future params (those with lower destination registers) and rewrite their sources. */
   for (int dest = current_dest - 1; dest >= 0; --dest)
   {
-    if (op_to_reg[dest] == -1)
+    if (op_to_reg[dest] == PREG_NONE)
       continue;
     if (param_src0[dest] == reg_to_save)
       param_src0[dest] = remap_reg;
@@ -3846,7 +3846,7 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
   int next_reg = 0;   /* Next available register (0-3) */
   int stack_size = 0; /* Current stack offset */
   uint32_t register_map = 0;
-  int op_to_reg[4] = {-1, -1, -1, -1};
+  int op_to_reg[4] = {PREG_NONE, PREG_NONE, PREG_NONE, PREG_NONE}; /* Map of register to param index */
   int stack_offset = 0;
 
   // only r0-r3 for arguments, rest arguments go to stack
@@ -3904,14 +3904,14 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
   for (int i = 0; i < param_count; ++i)
   {
     // check if argument goes to register
-    int assigned_register = -1;
+    int assigned_register = PREG_NONE;
     int is_64bit = 0;
     const int argument_index = param_indices[i];
     TACQuadruple *arg = &ir->instructions[argument_index];
 
     for (int j = 0; j < 4; j++)
     {
-      if (op_to_reg[j] == -1)
+      if (op_to_reg[j] == PREG_NONE)
         continue;
       if (op_to_reg[j] == i)
       {
@@ -3919,7 +3919,7 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
         break;
       }
     }
-    if (assigned_register != -1)
+    if (assigned_register != PREG_NONE)
     {
       continue;
     }
@@ -3932,10 +3932,10 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
     else
     {
       int reg = arg->src1.pr0;
-      if (reg == -1 || (reg & PREG_SPILLED) || (arg->src1.r & VT_LVAL))
+      if (reg == PREG_NONE || (reg & PREG_SPILLED) || (arg->src1.r & VT_LVAL))
       {
         int scratch_reg = get_free_scratch_reg(0);
-        load_to_reg(scratch_reg, -1, &arg->src1);
+        load_to_reg(scratch_reg, PREG_NONE, &arg->src1);
         reg = scratch_reg;
       }
       ot_check(th_str_imm(reg, R_SP, stack_offset, 6, ENFORCE_ENCODING_NONE));
@@ -3944,12 +3944,12 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
   }
 
   /* Pre-compute register sources for each register-assigned argument so we can spot conflicts. */
-  int param_src0[4] = {-1, -1, -1, -1};
-  int param_src1[4] = {-1, -1, -1, -1};
+  int param_src0[4] = {PREG_NONE, PREG_NONE, PREG_NONE, PREG_NONE};
+  int param_src1[4] = {PREG_NONE, PREG_NONE, PREG_NONE, PREG_NONE};
   uint32_t future_src_mask = 0;
   for (int dest = 0; dest < 4; ++dest)
   {
-    if (op_to_reg[dest] == -1)
+    if (op_to_reg[dest] == PREG_NONE)
       continue;
     TACQuadruple *arg = &ir->instructions[param_indices[op_to_reg[dest]]];
     const int is_64bit = is_64bit_type(arg->src1.type.t);
@@ -3981,16 +3981,16 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
   {
     for (int lower = 0; lower < dest; ++lower)
     {
-      if (param_src0[lower] != -1)
+      if (param_src0[lower] != PREG_NONE)
         sources_needed_by_lower[dest] |= (1u << param_src0[lower]);
-      if (param_src1[lower] != -1)
+      if (param_src1[lower] != PREG_NONE)
         sources_needed_by_lower[dest] |= (1u << param_src1[lower]);
     }
   }
 
   for (int i = 3; i >= 0; --i)
   {
-    if (op_to_reg[i] == -1)
+    if (op_to_reg[i] == PREG_NONE)
       continue;
     TACQuadruple *arg = &ir->instructions[param_indices[op_to_reg[i]]];
     SValue arg_copy = arg->src1; /* We may rewrite pr0/pr1 if we remap sources. */
@@ -4018,9 +4018,9 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
     }
 
     /* Apply any remapping for this argument. */
-    if (param_src0[dest_reg] != -1)
+    if (param_src0[dest_reg] != PREG_NONE)
       arg_copy.pr0 = param_src0[dest_reg];
-    if (is_64bit && param_src1[dest_reg] != -1)
+    if (is_64bit && param_src1[dest_reg] != PREG_NONE)
       arg_copy.pr1 = param_src1[dest_reg];
 
     if (is_64bit)
@@ -4031,7 +4031,7 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
       dest.pr1 = dest_reg;
       --i; /* Skip the lower register of the pair in next iteration */
 
-      if (arg_copy.pr0 == -1 && arg_copy.pr1 == -1)
+      if (arg_copy.pr0 == PREG_NONE && arg_copy.pr1 == PREG_NONE)
       {
         /* Load from memory/constant */
         load_to_dest(&dest, &arg_copy);
@@ -4067,7 +4067,7 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
   if (th_is_caller_saved_register(thumb_gen_state.cached_global_reg))
   {
     thumb_gen_state.cached_global_sym = NULL;
-    thumb_gen_state.cached_global_reg = -1;
+    thumb_gen_state.cached_global_reg = PREG_NONE;
   }
   if (registers_to_push != 0)
   {
@@ -4087,7 +4087,7 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
   }
 
   /* Handle the return value - move from R0 (and R1 for 64-bit) to destination */
-  int dest_spilled = (q->dest.pr0 == -1) || (q->dest.pr0 & PREG_SPILLED);
+  int dest_spilled = (q->dest.pr0 == PREG_NONE) || (q->dest.pr0 & PREG_SPILLED);
 
   if (dest_spilled)
   {

@@ -25,6 +25,7 @@
 #include "tccls.h"
 
 #define PREG_SPILLED 0x80
+#define PREG_NONE 0xFF  /* pr0/pr1 not allocated (replaces -1 for uint8_t) */
 
 typedef enum TccIrOp
 {
@@ -211,6 +212,7 @@ int tcc_ir_generate_test(TCCIRState *ir, int inv, int t);
 int tcc_ir_dead_code_elimination(TCCIRState *ir);
 int tcc_ir_dead_store_elimination(TCCIRState *ir);
 int tcc_ir_constant_propagation(TCCIRState *ir);
+int tcc_ir_tmp_constant_propagation(TCCIRState *ir);
 int tcc_ir_copy_propagation(TCCIRState *ir);
 int tcc_ir_arithmetic_cse(TCCIRState *ir);
 int tcc_ir_bool_cse(TCCIRState *ir);

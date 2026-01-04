@@ -1,0 +1,6 @@
+test_chain\(42\): 42
+test_chain\(0\): 0
+test_chain\(-5\): -5
+test_shift_zero\(123\): 123
+test_and_or_identity\(255\): 255
+test_sub_zero\(99\): 99

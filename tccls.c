@@ -733,5 +733,5 @@ int tcc_ls_find_free_scratch_reg(LSLiveIntervalState *ls, int instruction_idx, u
     return 14;
 
   /* No register available */
-  return -1;
+  return PREG_NONE;
 }

@@ -1,0 +1,4 @@
+test_const: 15
+test_zero_identity: 10
+test_mul_identity: 42
+test_mul_zero: 0
