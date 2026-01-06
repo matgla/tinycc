@@ -44,7 +44,8 @@ all: build
 build:
 	@echo "Building FP library for $(FPU)..."
 	@mkdir -p $(BUILD_DIR)/$(FPU)
-	$(MAKE) -C $(TARGET_DIR) BUILD_DIR=$(CURDIR)/$(BUILD_DIR)/$(FPU)
+	$(MAKE) -C $(TARGET_DIR) BUILD_DIR=$(CURDIR)/$(BUILD_DIR)/$(FPU) \
+		CFLAGS="$(CFLAGS) -I$(CURDIR)/../../include"
 	$(AR) rcs $(TARGET_LIB) $(BUILD_DIR)/$(FPU)/*.o
 	@echo "Created $(TARGET_LIB)"
 

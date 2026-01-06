@@ -6,7 +6,7 @@
 #ifndef FP_ABI_H
 #define FP_ABI_H
 
-#include <stdint.h>
+#include "tcc_stdint.h"
 
 /* IEEE 754 single-precision float representation */
 typedef union

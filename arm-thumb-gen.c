@@ -840,6 +840,13 @@ ST_FUNC void gen_fill_nops(int bytes)
 
 static uint32_t mapcc(int cc)
 {
+  /* In most places we carry high-level TOK_* comparisons (TOK_EQ, TOK_LT, ...).
+   * Some IR lowering paths may already store an ARM condition code nibble
+   * (0..13) in q->src1.c.i. Accept both forms here.
+   */
+  if ((unsigned)cc <= 0xD)
+    return (uint32_t)cc;
+
   switch (cc)
   {
   case TOK_ULT:

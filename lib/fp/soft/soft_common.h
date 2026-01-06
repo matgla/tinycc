@@ -7,7 +7,7 @@
 #ifndef SOFT_COMMON_H
 #define SOFT_COMMON_H
 
-#include <stdint.h>
+#include "tcc_stdint.h"
 
 /* ===== DOUBLE PRECISION (64-bit) ===== */
 

@@ -7,7 +7,7 @@ SRCS = fadd.c fmul.c fdiv.c fcmp.c dadd.c dmul.c ddiv.c dconv.c dcmp.c conv.c fm
 BUILD_DIR ?= build
 OBJS = $(addprefix $(BUILD_DIR)/,$(SRCS:.c=.o))
 
-CFLAGS += -O2 -Wall -Wextra -I../..
+CFLAGS += -O2 -Wall -Wextra -I../.. -I../../../include
 
 all: $(BUILD_DIR) $(OBJS)
 

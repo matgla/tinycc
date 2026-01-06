@@ -2176,8 +2176,7 @@ ST_FUNC int gv(int rc)
         vset_VT_JMP();
         /* one register type load */
         // load(r, vtop);
-        SValue dest;
-        memset(&dest, 0, sizeof(dest));
+        SValue dest = (SValue){0};
         dest.type.t = vtop->type.t;
         dest.vr = vreg;
         tcc_ir_put(tcc_state->ir, TCCIR_OP_LOAD, vtop, NULL, &dest);
@@ -8040,7 +8039,7 @@ static void gfunc_return(CType *func_type)
     if (vtop->r & VT_LVAL)
     {
       /* Load the value first - this ensures proper size is used */
-      SValue dest;
+      SValue dest = (SValue){0};
       dest.type = vtop->type;
       dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
       dest.r = 0;
