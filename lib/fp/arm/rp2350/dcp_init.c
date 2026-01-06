@@ -4,7 +4,7 @@
  * Reference: RP2350 Datasheet - Section on Double Coprocessor
  */
 
-#include <stdint.h>
+#include "tcc_stdint.h"
 
 /* RP2350 Double Coprocessor Register Definitions */
 #define DCP_BASE 0x50200000

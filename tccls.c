@@ -493,9 +493,21 @@ void tcc_ls_allocate_registers(LSLiveIntervalState *ls, int used_parameters_regi
   ls->dirty_float_registers = 0;
   ls->registers_map = tcc_state->registers_map_for_allocator;
   ls->float_registers_map = tcc_state->float_registers_map_for_allocator;
-  // for (int i = 0; i < used_parameters_registers; ++i) {
-  //   tcc_ls_mark_register_as_used(ls, i);
-  // }
+  /* Keep incoming argument registers (e.g. R0-R3) reserved at function entry.
+   * They carry parameters and are shuffled/saved by the prolog; letting the
+   * allocator reuse them for unrelated intervals can clobber arguments
+   * (seen in ir_tests/20_op_add for 4+ args).
+   *
+   * 'used_parameters_registers' is a logical count (may exceed the physical
+   * register window), so clamp it to the target's parameter register count.
+   */
+  {
+    int reserve = used_parameters_registers;
+    if (reserve > tcc_state->parameters_registers)
+      reserve = tcc_state->parameters_registers;
+    for (int i = 0; i < reserve; ++i)
+      tcc_ls_mark_register_as_used(ls, i);
+  }
   for (int i = 0; i < used_float_parameters_registers; ++i)
   {
     tcc_ls_mark_float_register_as_used(ls, i);

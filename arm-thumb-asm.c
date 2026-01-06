@@ -2793,8 +2793,9 @@ static void thumb_branch(TCCState *s1, int token)
       esym = elfsym(e.sym);
       if (esym && esym->st_shndx == cur_text_section->sh_num)
       {
-        /* strip thumb bit from symbol value for branch calculation */
-        int target = e.v + (esym->st_value & ~1);
+        /* Strip thumb bit from the fully computed target (GAS does this for B/BL).
+           Otherwise we can end up with an odd offset and the short encoding rejects it. */
+        int target = (e.v + esym->st_value) & ~1;
         jump_addr = th_encbranch(ind, target);
       }
       else
@@ -2808,7 +2809,7 @@ static void thumb_branch(TCCState *s1, int token)
           greloca(cur_text_section, e.sym, ind, R_ARM_THM_PC22, 0);
         }
         must_use_t4 = true;
-        jump_addr = th_encbranch(ind, ind + e.v);
+        jump_addr = th_encbranch(ind, (ind + e.v) & ~1);
       }
     }
   }
@@ -2846,11 +2847,17 @@ static void thumb_branch(TCCState *s1, int token)
       return thumb_emit_opcode(th_b_t4(jump_addr));
     }
 
-    if (jump_addr >= -2048 && jump_addr <= 2046 && !must_use_32bit && (condition == 0xe || thumb_conditional_scope > 0))
+    if (jump_addr >= -2048 && jump_addr <= 2046 && !(jump_addr & 1) && !must_use_32bit &&
+        (condition == 0xe || thumb_conditional_scope > 0))
     {
-      return thumb_emit_opcode(th_b_t2(jump_addr));
+      thumb_opcode opcode = th_b_t2(jump_addr);
+      if (opcode.size)
+        return thumb_emit_opcode(opcode);
+      /* If the short encoding can't be formed (e.g. odd offset), fall back. */
+      return thumb_emit_opcode(th_b_t4(jump_addr & ~1));
     }
-    else if (jump_addr >= -256 && jump_addr <= 254 && thumb_conditional_scope == 0 && !must_use_32bit)
+    else if (jump_addr >= -256 && jump_addr <= 254 && !(jump_addr & 1) && thumb_conditional_scope == 0 &&
+             !must_use_32bit)
     {
       return thumb_emit_opcode(th_b_t1(condition, jump_addr >> 1));
     }
