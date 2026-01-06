@@ -1595,11 +1595,16 @@ void tcc_ir_register_allocation_params(TCCIRState *ir)
         /* Parameter arrives in registers */
         interval->incoming_reg0 = argno;
         interval->incoming_reg1 = argno + 1;
+        /* NOTE: For leaf functions, the linear scanner has already assigned registers.
+         * Don't overwrite interval->allocation here - it would clobber the correct allocation
+         * with argno (parameter index), which is NOT the same as the physical register number.
+         * The prolog will use incoming_reg0/1 to know which registers the parameter arrives in. */
+        /* REMOVED BUGGY CODE:
         if (ir->leaffunc && !already_spilled)
         {
-          /* Leaf function and not spilled: keep in registers */
           tcc_ir_assign_physical_register(ir, encoded_vreg, 0, argno, argno + 1);
         }
+        */
         /* If already_spilled or non-leaf: keep the spill location from
          * linear scan, prolog will store incoming registers to stack */
       }
@@ -1626,11 +1631,16 @@ void tcc_ir_register_allocation_params(TCCIRState *ir)
       {
         interval->incoming_reg0 = argno;
         interval->incoming_reg1 = -1;
+        /* NOTE: For leaf functions, the linear scanner has already assigned registers.
+         * Don't overwrite interval->allocation here - it would clobber the correct allocation
+         * with argno (parameter index), which is NOT the same as the physical register number.
+         * The prolog will use incoming_reg0 to know which register the parameter arrives in. */
+        /* REMOVED BUGGY CODE:
         if (ir->leaffunc && !already_spilled)
         {
-          /* Leaf function and not spilled: keep in register */
           tcc_ir_assign_physical_register(ir, encoded_vreg, 0, argno, -1);
         }
+        */
       }
       else
       {
@@ -1689,13 +1699,16 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
      * - If old_r does NOT have VT_LVAL, this is an address-of operation
      *   (we want the address, not the value). Do NOT add VT_LVAL. */
     int preserve_lval = 0;
-    if ((old_r & VT_LVAL) && old_v < VT_CONST)
+    if ((old_r & VT_LVAL) && old_v < VT_CONST && old_v != VT_LOCAL && old_v != VT_LLOCAL)
     {
-      /* The vreg holds a pointer that needs dereferencing */
+      /* The vreg holds a pointer that needs dereferencing.
+       * Note: VT_LOCAL/VT_LLOCAL use VT_LVAL to mean "load from stack slot".
+       * When such a local/param is promoted to a register, we must NOT
+       * preserve VT_LVAL, otherwise we turn a plain value into a pointer
+       * dereference (double-indirection bugs).
+       */
       preserve_lval = VT_LVAL;
     }
-    /* If old_v == VT_LOCAL, VT_LVAL was for stack access - don't preserve
-     * when allocated to register */
 
     if (interval->allocation.r0 == PREG_SPILLED || interval->allocation.offset != 0)
     {
@@ -4162,6 +4175,28 @@ void tcc_ir_generate_code(TCCIRState *ir)
   /* Clear spill cache at function start */
   tcc_ir_spill_cache_clear(&ir->spill_cache);
 
+  /* Some peephole optimizations (LOAD/ASSIGN -> RETURNVALUE in R0, and skipping
+   * RETURNVALUE moves) are only valid when RETURNVALUE is reached by straight-line
+   * fallthrough from the immediately preceding instruction.
+   *
+   * If RETURNVALUE is a jump target (a control-flow merge), those peepholes can
+   * become incorrect: the preceding instruction might not execute on all paths,
+   * leaving the return value in a non-return register.
+   *
+   * Track which IR instruction indices are jump targets to guard these peepholes.
+   */
+  uint8_t *has_incoming_jump = tcc_mallocz(ir->next_instruction_index ? ir->next_instruction_index : 1);
+  for (int i = 0; i < ir->next_instruction_index; ++i)
+  {
+    TACQuadruple *p = &ir->instructions[i];
+    if (p->op == TCCIR_OP_JUMP || p->op == TCCIR_OP_JUMPIF)
+    {
+      int target = p->dest.c.i;
+      if (target >= 0 && target < ir->next_instruction_index)
+        has_incoming_jump[target] = 1;
+    }
+  }
+
   // generate prolog
   int stack_size = (-loc + 7) & ~7; // align to 8 bytes
   int ind_before_prolog = ind;
@@ -4370,7 +4405,7 @@ void tcc_ir_generate_code(TCCIRState *ir)
       /* Peephole: if next instruction is RETURNVALUE using this LOAD's result,
        * load directly to R0 instead of the allocated register */
       const TACQuadruple *ir_next = (i + 1 < ir->next_instruction_index) ? &ir->instructions[i + 1] : NULL;
-      if (ir_next && ir_next->op == TCCIR_OP_RETURNVALUE && ir_next->src1.vr == q->dest.vr)
+      if (ir_next && ir_next->op == TCCIR_OP_RETURNVALUE && ir_next->src1.vr == q->dest.vr && !has_incoming_jump[i + 1])
       {
         q->dest.pr0 = REG_IRET; /* R0 */
         if (tcc_ir_is_64bit_type(q->dest.type.t))
@@ -4403,7 +4438,7 @@ void tcc_ir_generate_code(TCCIRState *ir)
               "prev.dest.vr=%d prev.dest.pr0=%d\n",
               i, q->src1.r, q->src1.vr, (long long)q->src1.c.i, q->src1.pr0, ir_prev ? ir_prev->op : -1,
               ir_prev ? ir_prev->dest.vr : -2, ir_prev ? ir_prev->dest.pr0 : -2);
-      if (ir_prev && (ir_prev->op == TCCIR_OP_LOAD || ir_prev->op == TCCIR_OP_ASSIGN) &&
+      if (!has_incoming_jump[i] && ir_prev && (ir_prev->op == TCCIR_OP_LOAD || ir_prev->op == TCCIR_OP_ASSIGN) &&
           ir_prev->dest.vr == q->src1.vr && ir_prev->dest.pr0 == REG_IRET /* R0 */)
       {
         fprintf(stderr, "DEBUG codegen RETURNVALUE: SKIP due to peephole\n");
@@ -4429,7 +4464,7 @@ void tcc_ir_generate_code(TCCIRState *ir)
       /* Peephole: if next instruction is RETURNVALUE using this ASSIGN's dest,
        * assign directly to R0 to avoid an extra move */
       const TACQuadruple *ir_next = (i + 1 < ir->next_instruction_index) ? &ir->instructions[i + 1] : NULL;
-      if (ir_next && ir_next->op == TCCIR_OP_RETURNVALUE && ir_next->src1.vr == q->dest.vr)
+      if (ir_next && ir_next->op == TCCIR_OP_RETURNVALUE && ir_next->src1.vr == q->dest.vr && !has_incoming_jump[i + 1])
       {
         q->dest.pr0 = REG_IRET; /* R0 */
         if (tcc_ir_is_64bit_type(q->dest.type.t))
@@ -4555,6 +4590,7 @@ void tcc_ir_generate_code(TCCIRState *ir)
   }
 
   tcc_free(return_jump_addrs);
+  tcc_free(has_incoming_jump);
 }
 
 void tcc_ir_print_vreg(int vreg)

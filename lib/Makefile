@@ -123,4 +123,5 @@ $(TCC) : ;
 
 clean :
 	rm -f *.o $(addprefix $(TOP)/,*libtcc1.a $(EXTRA_O))
+	rm -rf build
 	$(MAKE) -C fp clean

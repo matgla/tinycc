@@ -61,6 +61,8 @@ clean:
 	$(MAKE) -C arm/vfpv4-sp clean
 	$(MAKE) -C arm/vfpv5-dp clean
 	$(MAKE) -C arm/rp2350 clean
-	rm -f $(SOFT_LIB) $(VFPV4SP_LIB) $(VFPV5DP_LIB) $(RP2350_LIB)
+	rm -rf $(BUILD_DIR)
+	# Remove archives for all targets (e.g. libtcc1-fp-soft-armv8m.a)
+	rm -f libtcc1-fp-*.a
 
 .PHONY: all build all-variants clean
