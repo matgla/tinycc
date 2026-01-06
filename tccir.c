@@ -4493,7 +4493,8 @@ void tcc_ir_generate_code(TCCIRState *ir)
 
       tcc_gen_machine_func_call_op(q, drop_return_value, ir, call_idx);
       /* Restore outer call's arguments if this was a nested call */
-      ir_to_code_mapping[i] = ind;
+      /* NOTE: ir_to_code_mapping[i] already set before switch - don't override here!
+       * Overriding causes jumps TO this call to land at wrong address (after call). */
 
       /* If we skipped the following RETURNVALUE instruction, it still needs a mapping
        * for any IR jumps/backpatch that might reference it. Keep orig mapping in sync. */
@@ -5087,12 +5088,12 @@ int tcc_ir_gjmp_append(TCCIRState *ir, int n, int t)
 
 void tcc_ir_generate_cmp_jmp_set(TCCIRState *ir)
 {
-#ifdef DEBUG_IR_GEN
-  if (ir->next_instruction_index > 8)
-  {
-    fprintf(stderr, "DEBUG tcc_ir_generate_cmp_jmp_set: ENTRY, instr[8].src1.vr=%d\n", ir->instructions[8].src1.vr);
-  }
-#endif
+  if (ir == NULL)
+    return;
+  /* Guard against invalid vtop - can happen with empty structs */
+  extern SValue _vstack[];
+  if (vtop < _vstack + 1) /* vstack is defined as (_vstack + 1) */
+    return;
   int v = vtop->r & VT_VALMASK;
   if (v == VT_CMP)
   {

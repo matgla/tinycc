@@ -2916,12 +2916,76 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
   case TCCIR_OP_ADD:
     if (is_64bit)
     {
+      const int src2_is_imm = th_has_immediate_value(op->src2.r) || op->src2.pr0 == PREG_NONE;
+      const uint64_t src2_imm = (uint64_t)op->src2.c.i;
+      const uint32_t imm_low = (uint32_t)(src2_imm & 0xffffffffu);
+      const uint32_t imm_high = (uint32_t)(src2_imm >> 32);
+
       /* 64-bit add: ADDS for low words, ADC for high words */
       /* dest.pr0:pr1 = src1.pr0:pr1 + src2.pr0:pr1 */
-      ot_check(th_add_reg(op->dest.pr0, op->src1.pr0, op->src2.pr0, FLAGS_BEHAVIOUR_SET, THUMB_SHIFT_DEFAULT,
-                          ENFORCE_ENCODING_NONE));
-      ot_check(th_adc_reg(op->dest.pr1, op->src1.pr1, op->src2.pr1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                          ENFORCE_ENCODING_NONE));
+      if (src2_is_imm)
+      {
+        thumb_opcode add_low =
+            th_add_imm(op->dest.pr0, op->src1.pr0, imm_low, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE);
+        if (add_low.size == 0)
+        {
+          ScratchRegAlloc scratch = {0};
+          uint32_t exclude = (1u << op->dest.pr0) | (1u << op->src1.pr0);
+          scratch = get_scratch_reg_with_save(exclude);
+          ot_check(th_mov_imm(scratch.reg, imm_low, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+          ot_check(th_add_reg(op->dest.pr0, op->src1.pr0, scratch.reg, FLAGS_BEHAVIOUR_SET, THUMB_SHIFT_DEFAULT,
+                              ENFORCE_ENCODING_NONE));
+          restore_scratch_reg(&scratch);
+        }
+        else
+        {
+          ot_check(add_low);
+        }
+      }
+      else
+      {
+        ot_check(th_add_reg(op->dest.pr0, op->src1.pr0, op->src2.pr0, FLAGS_BEHAVIOUR_SET, THUMB_SHIFT_DEFAULT,
+                            ENFORCE_ENCODING_NONE));
+      }
+      /* High word: handle mixed 32/64-bit operands (pr1 may be PREG_NONE). */
+      if (src2_is_imm)
+      {
+        /* src2 high word comes from immediate */
+        if (op->src1.pr1 != PREG_NONE)
+        {
+          ot_check(
+              th_adc_imm(op->dest.pr1, op->src1.pr1, imm_high, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+        }
+        else
+        {
+          ot_check(th_mov_imm(op->dest.pr1, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+          ot_check(
+              th_adc_imm(op->dest.pr1, op->dest.pr1, imm_high, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+        }
+      }
+      else if (op->src1.pr1 != PREG_NONE && op->src2.pr1 != PREG_NONE)
+      {
+        ot_check(th_adc_reg(op->dest.pr1, op->src1.pr1, op->src2.pr1, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                            THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+      }
+      else if (op->src1.pr1 != PREG_NONE)
+      {
+        /* src2 high word is 0 */
+        ot_check(th_adc_imm(op->dest.pr1, op->src1.pr1, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+      }
+      else if (op->src2.pr1 != PREG_NONE)
+      {
+        /* src1 high word is 0 */
+        ot_check(th_mov_imm(op->dest.pr1, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+        ot_check(th_adc_reg(op->dest.pr1, op->dest.pr1, op->src2.pr1, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                            THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+      }
+      else
+      {
+        /* Both high words are 0, result is carry from low add */
+        ot_check(th_mov_imm(op->dest.pr1, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+        ot_check(th_adc_imm(op->dest.pr1, op->dest.pr1, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+      }
       return;
     }
     handler.imm_handler = th_add_imm;
@@ -2930,11 +2994,75 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
   case TCCIR_OP_SUB:
     if (is_64bit)
     {
+      const int src2_is_imm = th_has_immediate_value(op->src2.r) || op->src2.pr0 == PREG_NONE;
+      const uint64_t src2_imm = (uint64_t)op->src2.c.i;
+      const uint32_t imm_low = (uint32_t)(src2_imm & 0xffffffffu);
+      const uint32_t imm_high = (uint32_t)(src2_imm >> 32);
+
       /* 64-bit sub: SUBS for low words, SBC for high words */
-      ot_check(th_sub_reg(op->dest.pr0, op->src1.pr0, op->src2.pr0, FLAGS_BEHAVIOUR_SET, THUMB_SHIFT_DEFAULT,
-                          ENFORCE_ENCODING_NONE));
-      ot_check(th_sbc_reg(op->dest.pr1, op->src1.pr1, op->src2.pr1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                          ENFORCE_ENCODING_NONE));
+      if (src2_is_imm)
+      {
+        thumb_opcode sub_low =
+            th_sub_imm(op->dest.pr0, op->src1.pr0, imm_low, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE);
+        if (sub_low.size == 0)
+        {
+          ScratchRegAlloc scratch = {0};
+          uint32_t exclude = (1u << op->dest.pr0) | (1u << op->src1.pr0);
+          scratch = get_scratch_reg_with_save(exclude);
+          ot_check(th_mov_imm(scratch.reg, imm_low, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+          ot_check(th_sub_reg(op->dest.pr0, op->src1.pr0, scratch.reg, FLAGS_BEHAVIOUR_SET, THUMB_SHIFT_DEFAULT,
+                              ENFORCE_ENCODING_NONE));
+          restore_scratch_reg(&scratch);
+        }
+        else
+        {
+          ot_check(sub_low);
+        }
+      }
+      else
+      {
+        ot_check(th_sub_reg(op->dest.pr0, op->src1.pr0, op->src2.pr0, FLAGS_BEHAVIOUR_SET, THUMB_SHIFT_DEFAULT,
+                            ENFORCE_ENCODING_NONE));
+      }
+      /* High word: handle mixed 32/64-bit operands (pr1 may be PREG_NONE). */
+      if (src2_is_imm)
+      {
+        /* src2 high word comes from immediate */
+        if (op->src1.pr1 != PREG_NONE)
+        {
+          ot_check(
+              th_sbc_imm(op->dest.pr1, op->src1.pr1, imm_high, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+        }
+        else
+        {
+          ot_check(th_mov_imm(op->dest.pr1, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+          ot_check(
+              th_sbc_imm(op->dest.pr1, op->dest.pr1, imm_high, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+        }
+      }
+      else if (op->src1.pr1 != PREG_NONE && op->src2.pr1 != PREG_NONE)
+      {
+        ot_check(th_sbc_reg(op->dest.pr1, op->src1.pr1, op->src2.pr1, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                            THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+      }
+      else if (op->src1.pr1 != PREG_NONE)
+      {
+        /* src2 high word is 0 */
+        ot_check(th_sbc_imm(op->dest.pr1, op->src1.pr1, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+      }
+      else if (op->src2.pr1 != PREG_NONE)
+      {
+        /* src1 high word is 0 */
+        ot_check(th_mov_imm(op->dest.pr1, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+        ot_check(th_sbc_reg(op->dest.pr1, op->dest.pr1, op->src2.pr1, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                            THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+      }
+      else
+      {
+        /* Both high words are 0, result is derived from borrow out of low sub */
+        ot_check(th_mov_imm(op->dest.pr1, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+        ot_check(th_sbc_imm(op->dest.pr1, op->dest.pr1, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+      }
       return;
     }
     handler.imm_handler = th_sub_imm;
@@ -2969,12 +3097,44 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
     break;
   case TCCIR_OP_SHL:
   {
+    if (is_64bit && th_has_immediate_value(op->src2.r))
+    {
+      const uint32_t sh = (uint32_t)op->src2.c.i;
+      /* Only implement the cases we currently generate in IR lowering (notably shift by 32). */
+      if (sh == 32)
+      {
+        /* (x << 32): low becomes 0, high becomes low(x). Treat missing src1.pr1 as 0. */
+        ot_check(th_mov_imm(op->dest.pr0, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+        ot_check(th_mov_reg(op->dest.pr1, op->src1.pr0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                            ENFORCE_ENCODING_NONE, false));
+        return;
+      }
+    }
     handler.imm_handler = th_lsl_imm;
     handler.reg_handler = th_lsl_reg;
     break;
   }
   case TCCIR_OP_SHR:
   {
+    if (is_64bit && th_has_immediate_value(op->src2.r))
+    {
+      const uint32_t sh = (uint32_t)op->src2.c.i;
+      if (sh == 32)
+      {
+        /* (x >> 32) logical: low becomes high(x), high becomes 0. Missing src1.pr1 treated as 0. */
+        if (op->src1.pr1 != PREG_NONE)
+        {
+          ot_check(th_mov_reg(op->dest.pr0, op->src1.pr1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                              ENFORCE_ENCODING_NONE, false));
+        }
+        else
+        {
+          ot_check(th_mov_imm(op->dest.pr0, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+        }
+        ot_check(th_mov_imm(op->dest.pr1, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+        return;
+      }
+    }
     handler.imm_handler = th_lsr_imm;
     handler.reg_handler = th_lsr_reg;
     break;

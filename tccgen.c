@@ -2295,6 +2295,14 @@ static void lbuild(int t)
    * Generate an OR operation: (high << 32) | low */
   if (tcc_state->ir && vtop[-1].vr >= 0 && vtop[0].vr >= 0)
   {
+    /* In IR mode, vtop entries may still carry address-like VT_LOCAL
+     * flags. lbuild must operate on the VALUES, not addresses.
+     * Force both operands to be treated as rvalues when emitting IR. */
+    SValue low = vtop[-1];
+    SValue high = vtop[0];
+    low.r = 0;
+    high.r = 0;
+
     /* Create new 64-bit temp vreg for result */
     int result_vr = tcc_ir_get_vreg_temp(tcc_state->ir);
 
@@ -2310,14 +2318,14 @@ static void lbuild(int t)
     memset(&high_shifted, 0, sizeof(high_shifted));
     high_shifted.type.t = VT_LLONG;
     high_shifted.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-    tcc_ir_put(tcc_state->ir, TCCIR_OP_SHL, &vtop[0], &shift_amt, &high_shifted);
+    tcc_ir_put(tcc_state->ir, TCCIR_OP_SHL, &high, &shift_amt, &high_shifted);
 
     /* Then OR with low word: result = high_shifted | low */
     SValue result;
     memset(&result, 0, sizeof(result));
     result.type.t = t;
     result.vr = result_vr;
-    tcc_ir_put(tcc_state->ir, TCCIR_OP_OR, &high_shifted, &vtop[-1], &result);
+    tcc_ir_put(tcc_state->ir, TCCIR_OP_OR, &high_shifted, &low, &result);
 
     vtop[-1].vr = result_vr;
     vtop[-1].type.t = t;
@@ -8321,24 +8329,9 @@ static void new_scope(struct scope *o)
   cur_scope->vla.num = 0;
   cur_scope->vla.loc = 0;
   cur_scope->vla.locorig = 0;
-  loc -= PTR_SIZE;
-  if (tcc_state->ir)
-  {
-    SValue dst;
-    memset(&dst, 0, sizeof(dst));
-    dst.type.t = VT_PTR;
-    dst.r = VT_LOCAL | VT_LVAL;
-    dst.c.i = loc;
-    dst.vr = -1;
-    tcc_ir_put(tcc_state->ir, TCCIR_OP_VLA_SP_SAVE, NULL, NULL, &dst);
-  }
-  else
-  {
-    gen_vla_sp_save(loc);
-  }
-  /* The scope prologue saves the pre-scope SP. Reuse that as the default
-   * "before VLA" restore point for VLAs introduced in this scope. */
-  cur_scope->vla.locorig = loc;
+  /* NOTE: We no longer unconditionally save SP for every scope. A pre-VLA SP
+   * save slot is allocated lazily only if/when the first VLA is declared in
+   * this scope. */
   /* record local declaration stack position */
   o->lstk = local_stack;
   o->llstk = local_label_stack;
@@ -9719,7 +9712,15 @@ static void decl_initializer(init_params *p, CType *type, unsigned long c, int f
       )
         vpop();
       else
-        init_putv(p, type, c, vreg);
+      {
+        int align;
+        int size = type_size(type, &align);
+        /* Don't try to store empty structs (size 0) */
+        if (size > 0)
+          init_putv(p, type, c, vreg);
+        else
+          vpop(); /* pop the empty struct value */
+      }
     }
 }
 
@@ -10007,10 +10008,24 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has
       }
       else
       {
-        /* No outer VLA active: the scope prologue already saved SP in
-         * cur_scope->vla.locorig (set by new_scope). */
-        if (!cur_scope->vla.locorig)
-          tcc_error("compiler_error: missing scope SP save slot for VLA");
+        /* No outer VLA active: lazily allocate a slot and save the current SP
+         * as the "before VLA" restore point for VLAs introduced in this scope. */
+        loc -= PTR_SIZE;
+        if (tcc_state->ir)
+        {
+          SValue dst;
+          memset(&dst, 0, sizeof(dst));
+          dst.type.t = VT_PTR;
+          dst.r = VT_LOCAL | VT_LVAL;
+          dst.c.i = loc;
+          dst.vr = -1;
+          tcc_ir_put(tcc_state->ir, TCCIR_OP_VLA_SP_SAVE, NULL, NULL, &dst);
+        }
+        else
+        {
+          gen_vla_sp_save(loc);
+        }
+        cur_scope->vla.locorig = loc;
       }
     }
 
