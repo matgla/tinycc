@@ -26,6 +26,15 @@
 
 #define LS_LIVE_INTERVAL_INIT_SIZE 64
 
+/* NOTE:
+ * The linear-scan allocator needs its own stack slot cursor for spills.
+ * Do NOT reuse the global TCC frontend variable `loc` (declared in tcc.h),
+ * otherwise spill offsets can become 0 (e.g. when `loc == 4`) and codegen
+ * will emit loads/stores at [FP + 0], corrupting the frame (and breaking
+ * indirect calls like function-pointer tables).
+ */
+static int ls_spill_loc;
+
 void tcc_ls_initialize(LSLiveIntervalState *ls)
 {
   ls->intervals_size = LS_LIVE_INTERVAL_INIT_SIZE;
@@ -414,8 +423,14 @@ void tcc_ls_mark_float_register_as_used(LSLiveIntervalState *ls, int reg)
 int tcc_ls_next_stack_location_sized(int size)
 {
   /* Align to size and allocate */
-  loc = (loc - size) & -size;
-  return loc;
+  ls_spill_loc = (ls_spill_loc - size) & -size;
+  /* Offset 0 is not a valid spill slot: codegen treats FP+0 as part of the
+   * saved-register area (e.g. saved R4 at [FP]). If we ever return 0 here,
+   * spilled values will alias the frame header and break indirect calls.
+   */
+  if (ls_spill_loc == 0)
+    ls_spill_loc = -size;
+  return ls_spill_loc;
 }
 
 int tcc_ls_next_stack_location()
@@ -459,8 +474,20 @@ void tcc_ls_spill_interval(LSLiveIntervalState *ls, int interval_index)
 }
 
 void tcc_ls_allocate_registers(LSLiveIntervalState *ls, int used_parameters_registers,
-                               int used_float_parameters_registers)
+                               int used_float_parameters_registers, int spill_base)
 {
+  /* Reset spill cursor for this allocation run.
+   * Start below the frontend-allocated locals so spill slots do not overlap
+   * local variables (which would corrupt things like function-pointer tables
+   * and computed-goto targets).
+   */
+  /* Spill base should be FP-relative and typically negative or 0.
+   * If a positive value sneaks in, clamp to 0 so the first spill goes to -4.
+   */
+  if (spill_base > 0)
+    spill_base = 0;
+  ls_spill_loc = spill_base;
+
   // make all registers available at start
   ls->dirty_registers = 0;
   ls->dirty_float_registers = 0;
@@ -710,7 +737,11 @@ int tcc_ls_find_free_scratch_reg(LSLiveIntervalState *ls, int instruction_idx, u
     }
   }
 
-  /* Prefer caller-saved registers R0-R3, then R12 (IP), then callee-saved R4-R11 */
+  /* Prefer caller-saved registers only.
+   * Scratch allocation happens after the function prolog has been emitted.
+   * Returning a callee-saved register (R4-R11) here can violate the ABI unless
+   * the prolog already saved it.
+   */
   /* First try R0-R3 (caller-saved, often free for scratch) */
   for (int r = 0; r <= 3; ++r)
   {
@@ -721,13 +752,6 @@ int tcc_ls_find_free_scratch_reg(LSLiveIntervalState *ls, int instruction_idx, u
   /* Then try R12 (IP - inter-procedure scratch) */
   if (!(live_regs & (1 << 12)))
     return 12;
-
-  /* Then try callee-saved R4-R11 */
-  for (int r = 4; r <= 11; ++r)
-  {
-    if (!(live_regs & (1 << r)))
-      return r;
-  }
 
   /* Finally try LR if not a leaf function */
   if (!is_leaf && !(live_regs & (1 << 14)))

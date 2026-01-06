@@ -441,6 +441,16 @@ ST_FUNC int tccgen_compile(TCCState *s1)
 ST_FUNC void tccgen_finish(TCCState *s1)
 {
   tcc_debug_end(s1); /* just in case of errors: free memory */
+
+  /* If compilation aborted while generating a function, the per-function IR
+     block allocated in gen_function() may not have been released (because we
+     unwind via longjmp). Free it here to avoid leaks on compile errors. */
+  if (s1->ir)
+  {
+    tcc_ir_release_block(s1->ir);
+    s1->ir = NULL;
+  }
+
   free_inline_functions(s1);
   sym_pop(&global_stack, NULL, 0);
   sym_pop(&local_stack, NULL, 0);
@@ -642,7 +652,11 @@ ST_FUNC void greloca(Section *s, Sym *sym, unsigned long offset, int type, addr_
       tcc_error("internal error: greloca called with garbage symbol (v=0x%x, c=%d, likely invalid pointer)", sym->v,
                 sym->c);
     }
-    if (0 == sym->c)
+    /* Create ELF symbol if not yet created.
+     * sym->c == 0: no ELF symbol yet
+     * sym->c == -3: LABEL_ADDR_TAKEN marker (&&label), need to create symbol
+     * sym->c > 0: valid ELF symbol index */
+    if (sym->c <= 0)
       put_extern_sym(sym, NULL, 0, 0);
     c = sym->c;
     if (c <= 0)
@@ -651,6 +665,7 @@ ST_FUNC void greloca(Section *s, Sym *sym, unsigned long offset, int type, addr_
        * c = 0: put_extern_sym failed or was skipped (NODATA_WANTED?)
        * c = -1: type descriptor symbol (from mk_pointer) - should not be here
        * c = -2: struct/union being defined - should not be here
+       * c = -3: LABEL_ADDR_TAKEN but put_extern_sym didn't create symbol
        * This indicates a bug where we're trying to create a relocation for
        * a symbol that was never properly registered in ELF. */
       tcc_error("internal error: greloca called with invalid symbol (c=%d, v=0x%x, type.t=0x%x, r=0x%x)", c, sym->v,
@@ -781,7 +796,8 @@ ST_FUNC Sym *sym_push(int v, CType *type, int r, int c)
   int vreg = -1;
   /* register local variable at IR code generator, get Vreg number */
   /* XXX: no vreg assignment for params so far */
-  if (((r & VT_VALMASK) == VT_LOCAL) && (r & VT_LVAL) && ((type->t & VT_BTYPE) != VT_STRUCT))
+  if (((r & VT_VALMASK) == VT_LOCAL) && (r & VT_LVAL) && ((type->t & VT_BTYPE) != VT_STRUCT) &&
+      !(type->t & (VT_ARRAY | VT_VLA)))
   {
     if (r & VT_PARAM)
     {
@@ -914,6 +930,7 @@ ST_FUNC Sym *label_push(Sym **ptop, int v, int flags)
   Sym *s, **ps;
   s = sym_push2(ptop, v, VT_STATIC, 0);
   s->r = flags;
+  s->jnext = -1; /* Initialize to -1 so we know if there's an actual forward goto */
   ps = &table_ident[v - TOK_IDENT]->sym_label;
   if (ptop == &global_label_stack)
   {
@@ -947,9 +964,49 @@ ST_FUNC void label_pop(Sym **ptop, Sym *slast, int keep)
     {
       if (s->c)
       {
-        /* define corresponding symbol. A size of
-           1 is put. */
-        put_extern_sym(s, cur_text_section, s->jnext, 1);
+        /* Define corresponding symbol for &&label.
+           In IR mode, the label position is recorded as an IR instruction index
+           (s->jind) BEFORE DCE/IR compaction, so we must translate it using the
+           original-index mapping.
+           Also set Thumb bit (+1) so computed goto uses correct state.
+
+           Note: s->c can be:
+           - -3: LABEL_ADDR_TAKEN marker, need to reset to 0 for put_extern_sym to create symbol
+           - > 0: valid ELF symbol index, put_extern_sym will UPDATE the existing symbol */
+        if (s->c == -3)
+          s->c = 0; /* Reset marker so put_extern_sym creates new symbol */
+
+        if (tcc_state->ir && tcc_state->ir->orig_ir_to_code_mapping && s->jind >= 0 &&
+            s->jind < tcc_state->ir->orig_ir_to_code_mapping_size)
+        {
+          uint32_t off = tcc_state->ir->orig_ir_to_code_mapping[s->jind];
+          /* If the instruction at jind was deleted by DSE/optimization, find the next
+             valid mapping. The sentinel value 0xFFFFFFFF indicates no instruction. */
+          if (off == 0xFFFFFFFF)
+          {
+            for (int idx = s->jind + 1; idx < tcc_state->ir->orig_ir_to_code_mapping_size; idx++)
+            {
+              if (tcc_state->ir->orig_ir_to_code_mapping[idx] != 0xFFFFFFFF)
+              {
+                off = tcc_state->ir->orig_ir_to_code_mapping[idx];
+                break;
+              }
+            }
+          }
+          put_extern_sym(s, cur_text_section, off + 1, 1);
+        }
+        else if (tcc_state->ir && tcc_state->ir->ir_to_code_mapping && s->jind >= 0 &&
+                 s->jind < tcc_state->ir->ir_to_code_mapping_size)
+        {
+          /* Backward-compatible fallback for older IR mapping */
+          uint32_t off = tcc_state->ir->ir_to_code_mapping[s->jind];
+          put_extern_sym(s, cur_text_section, off + 1, 1);
+        }
+        else
+        {
+          /* Fallback for non-IR codegen */
+          put_extern_sym(s, cur_text_section, s->jnext, 1);
+        }
       }
     }
     /* remove label */
@@ -1009,6 +1066,8 @@ static void vsetc(CType *type, int r, CValue *vc)
   vtop->r2 = VT_CONST;
   vtop->c = *vc;
   vtop->vr = -1;
+  vtop->pr0 = PREG_NONE;
+  vtop->pr1 = PREG_NONE;
   vtop->sym = NULL;
   /* Note: jtrue/jfalse are in a union with c, so we DON'T initialize them here.
      They should only be used when r == VT_CMP, and c is used otherwise. */
@@ -2118,6 +2177,7 @@ ST_FUNC int gv(int rc)
         /* one register type load */
         // load(r, vtop);
         SValue dest;
+        memset(&dest, 0, sizeof(dest));
         dest.type.t = vtop->type.t;
         dest.vr = vreg;
         tcc_ir_put(tcc_state->ir, TCCIR_OP_LOAD, vtop, NULL, &dest);
@@ -2356,10 +2416,10 @@ static void gen_opl(int op)
       memset(&param_num, 0, sizeof(SValue));
       param_num.vr = -1;
       /* Generate FUNCPARAMVAL for arg1 (param 1) */
-      param_num.c.i = 1;
+      param_num.c.i = 0;
       tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &param_num, NULL);
       /* Generate FUNCPARAMVAL for arg2 (param 2) */
-      param_num.c.i = 2;
+      param_num.c.i = 1;
       tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[0], &param_num, NULL);
       /* Generate FUNCCALLVAL for the function call (returns long long) */
       memset(&dest, 0, sizeof(SValue));
@@ -2592,10 +2652,10 @@ static void gen_opl(int op)
         memset(&param_num, 0, sizeof(SValue));
         param_num.vr = -1;
         /* Generate FUNCPARAMVAL for arg1 (param 1) */
-        param_num.c.i = 1;
+        param_num.c.i = 0;
         tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &param_num, NULL);
         /* Generate FUNCPARAMVAL for arg2 (param 2) */
-        param_num.c.i = 2;
+        param_num.c.i = 1;
         tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[0], &param_num, NULL);
         /* Generate FUNCCALLVAL for the function call (returns int: -1, 0, or 1) */
         memset(&dest, 0, sizeof(SValue));
@@ -4313,9 +4373,25 @@ ST_FUNC void vstore(void)
       else
 #endif
         vpush_helper_func(TOK_memmove);
-      vrott(4);
-      // gfunc_call(3);
-      tcc_error("6 implement me");
+      {
+        /* Stack is now: dest_lval, dest_ptr, src_ptr, size, func
+         * IR uses 0-based parameter indices. */
+        SValue param_num;
+        memset(&param_num, 0, sizeof(SValue));
+        param_num.vr = -1;
+
+        /* memmove(dest, src, size) */
+        param_num.c.i = 0;
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-3], &param_num, NULL);
+        param_num.c.i = 1;
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-2], &param_num, NULL);
+        param_num.c.i = 2;
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &param_num, NULL);
+
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[0], NULL, NULL);
+        /* Pop func + 3 args; keep the saved destination lvalue as result */
+        vtop -= 4;
+      }
     }
   }
   else if (ft & VT_BITFIELD)
@@ -4431,6 +4507,11 @@ ST_FUNC void vstore(void)
         // Restore original type for proper IR generation
         vtop[-1].type.t = dbt;
         tcc_ir_put(tcc_state->ir, TCCIR_OP_ASSIGN, vtop, NULL, &vtop[-1]);
+        /* Assignment expression evaluates to the assigned value. For VT_LOCAL
+         * destinations with vregs, return the destination vreg (now updated)
+         * so later uses see the correct value. */
+        vtop->vr = vtop[-1].vr;
+        vtop->r = 0;
       }
       else
       {
@@ -4454,23 +4535,20 @@ ST_FUNC void vstore(void)
       {
         op = TCCIR_OP_ASSIGN;
       }
-#ifdef DEBUG_IR_GEN
-      fprintf(stderr, "DEBUG vstore single word: vtop->r=0x%x, VT_LVAL=%d, VT_VALMASK=0x%x, vtop->vr=%d, check=%d\n",
-              vtop->r, (vtop->r & VT_LVAL) != 0, vtop->r & VT_VALMASK, vtop->vr,
-              (vtop->r & VT_LVAL) && (vtop->r & VT_VALMASK) != VT_LOCAL);
-#endif
       /* If source is an lvalue (memory reference), emit LOAD first to get the value.
-       * This handles cases like: int tmp = array[a]; where array[a] is an lvalue */
-      if ((vtop->r & VT_LVAL) && (vtop->r & VT_VALMASK) != VT_LOCAL)
+       * This is required for correctness when both source and destination live
+       * in memory (e.g. range initializer replication copies element[lo] into
+       * element[lo+1..hi]).
+       *
+       * Previously we skipped VT_LOCAL lvalues, assuming the backend would
+       * handle it implicitly; that loses the load and can store garbage/zero. */
+      if (vtop->r & VT_LVAL)
       {
         SValue load_dest;
         load_dest.type = vtop->type;
         load_dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
         load_dest.r = 0;
         load_dest.c.i = 0;
-#ifdef DEBUG_IR_GEN
-        fprintf(stderr, "DEBUG vstore: emitting LOAD for lvalue, new_vr=%d\n", load_dest.vr);
-#endif
         tcc_ir_put(tcc_state->ir, TCCIR_OP_LOAD, vtop, NULL, &load_dest);
         vtop->vr = load_dest.vr;
         vtop->r = 0; /* no longer an lvalue */
@@ -4479,14 +4557,11 @@ ST_FUNC void vstore(void)
        * materialize it as a 0/1 value before storing. */
       tcc_ir_generate_cmp_jmp_set(tcc_state->ir);
       tcc_ir_put(tcc_state->ir, op, vtop, NULL, &vtop[-1]);
-
-      /* After assignment, update vtop to reference the destination vreg.
-       * For assignment expressions like (y = c + d), the result should be
-       * the assigned value (destination), not the source. */
       if (op == TCCIR_OP_ASSIGN)
       {
-        vtop->vr = vtop[-1].vr; /* Use destination's vreg */
-        vtop->r = 0;            /* Clear register info */
+        /* See comment above in the two-word case. */
+        vtop->vr = vtop[-1].vr;
+        vtop->r = 0;
       }
     }
     vswap();
@@ -6034,10 +6109,6 @@ static CType *type_decl(CType *type, AttributeDef *ad, int *v, int td)
 /* indirection with full error checking and bound check */
 ST_FUNC void indir(void)
 {
-#ifdef DEBUG_IR_GEN
-  fprintf(stderr, "DEBUG indir: vtop->r=0x%x, vtop->type.t=0x%x, VT_LVAL=%d, vr=%d, sym=%p, c.i=%lld\n", vtop->r,
-          vtop->type.t, (vtop->r & VT_LVAL) != 0, vtop->vr, vtop->sym, (long long)vtop->c.i);
-#endif
   if ((vtop->type.t & VT_BTYPE) != VT_PTR)
   {
     if ((vtop->type.t & VT_BTYPE) == VT_FUNC)
@@ -6807,6 +6878,15 @@ tok_next:
       if (s->r == LABEL_DECLARED)
         s->r = LABEL_FORWARD;
     }
+    /* Mark that this label's address is taken (&&label). In IR mode, the
+       symbol definition is deferred until after code generation when the
+       final code offsets are known.
+       Use -3 as special marker (distinct from valid ELF indices >= 0,
+       and from -1/-2 used for type descriptors and struct definitions).
+       Only set if not already marked/having an ELF symbol. */
+    if (s->c <= 0)
+      s->c = -3; /* LABEL_ADDR_TAKEN marker */
+    fprintf(stderr, "DEBUG &&label: label '%s' s=%p s->c=%d s->v=%d\n", get_tok_str(tok, NULL), (void *)s, s->c, s->v);
     if ((s->type.t & VT_BTYPE) != VT_PTR)
     {
       s->type.t = VT_VOID;
@@ -7118,7 +7198,9 @@ tok_next:
           }
           else
           {
-            num.c.i = nb_args + 1;
+            /* IR expects 0-based parameter indices.
+             * Keep FUNCPARAMVAL numbering consistent across all call sites. */
+            num.c.i = nb_args;
             expr_eq();
             /* Convert VT_CMP/VT_JMP to actual 0/1 value before passing as
              * parameter */
@@ -7169,7 +7251,9 @@ tok_next:
       {
         for (int j = 0; j < nb_args - 4; j++)
         {
-          num.c.i = nb_args - j;
+          /* 0-based parameter index for remaining (stack) arguments.
+           * vtop iterates from the last argument downward. */
+          num.c.i = nb_args - j - 1;
           if (!NOEVAL_WANTED)
             tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL);
           vtop--;
@@ -7177,13 +7261,24 @@ tok_next:
       }
 
       int return_vreg = -1;
+#ifdef DEBUG_IR_GEN
+      fprintf(stderr, "DEBUG gfunc_call: s->type.t=0x%x, VT_BTYPE=0x%x, is_void=%d, vtop->vr=%d, vtop->r=0x%x\n",
+              s->type.t, s->type.t & VT_BTYPE, (s->type.t & VT_BTYPE) == VT_VOID, vtop->vr, vtop->r);
+#endif
       if (NOEVAL_WANTED)
       {
         /* When in sizeof/typeof context, skip IR emission but still handle stack */
         --vtop;
       }
-      else if (vtop->type.t == VT_VOID)
+      else if ((s->type.t & VT_BTYPE) == VT_VOID)
       {
+        /* In IR mode, make sure the call target is a VALUE (register/temp),
+         * not an lvalue. Indirect calls like tabl1[i]() produce an lvalue
+         * (memory reference) for tabl1[i]; we must LOAD it to get the actual
+         * function pointer value before emitting FUNCCALL.
+         * NOTE: We check s->type.t (the function's return type), not vtop->type.t
+         * (which is VT_FUNC for function pointers). */
+        tcc_ir_load_if_lvalue(tcc_state->ir, vtop);
         tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, vtop, NULL, NULL);
         --vtop;
       }
@@ -7200,8 +7295,28 @@ tok_next:
         dest.r = 0;
         dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
         return_vreg = dest.vr;
+
+        /* See comment above: materialize call target value for indirect calls. */
+        tcc_ir_load_if_lvalue(tcc_state->ir, vtop);
+#ifdef DEBUG_IR_GEN
+        fprintf(stderr, "DEBUG gfunc_call: AFTER load_if_lvalue, vtop->vr=%d, vtop->r=0x%x\n", vtop->vr, vtop->r);
+#endif
         tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, vtop, NULL, &dest);
+#ifdef DEBUG_IR_GEN
+        if (tcc_state->ir->next_instruction_index > 8)
+        {
+          fprintf(stderr, "DEBUG gfunc_call: AFTER FUNCCALLVAL tcc_ir_put, instr[8].src1.vr=%d\n",
+                  tcc_state->ir->instructions[8].src1.vr);
+        }
+#endif
         --vtop;
+#ifdef DEBUG_IR_GEN
+        if (tcc_state->ir->next_instruction_index > 8)
+        {
+          fprintf(stderr, "DEBUG gfunc_call: AFTER vtop--, instr[8].src1.vr=%d\n",
+                  tcc_state->ir->instructions[8].src1.vr);
+        }
+#endif
       }
 
       if (ret_nregs < 0)
@@ -7213,6 +7328,13 @@ tok_next:
       }
       else
       {
+#ifdef DEBUG_IR_GEN
+        if (tcc_state->ir->next_instruction_index > 8)
+        {
+          fprintf(stderr, "DEBUG gfunc_call: ENTERING ret_nregs else, instr[8].src1.vr=%d\n",
+                  tcc_state->ir->instructions[8].src1.vr);
+        }
+#endif
         /* return value */
         n = ret_nregs;
         while (n > 1)
@@ -7229,6 +7351,13 @@ tok_next:
           vtop->vr = return_vreg;
         }
         vsetc(&ret.type, ret.r, &ret.c);
+#ifdef DEBUG_IR_GEN
+        if (tcc_state->ir->next_instruction_index > 8)
+        {
+          fprintf(stderr, "DEBUG gfunc_call: AFTER vsetc, instr[8].src1.vr=%d\n",
+                  tcc_state->ir->instructions[8].src1.vr);
+        }
+#endif
         vtop->vr = return_vreg;
         vtop->r2 = ret.r2;
 
@@ -7275,6 +7404,13 @@ tok_next:
 #endif
         }
       }
+#ifdef DEBUG_IR_GEN
+      if (tcc_state->ir->next_instruction_index > 8)
+      {
+        fprintf(stderr, "DEBUG gfunc_call: END of ret handling, instr[8].src1.vr=%d\n",
+                tcc_state->ir->instructions[8].src1.vr);
+      }
+#endif
       if (s->f.func_noreturn)
       {
         if (debug_modes)
@@ -7496,139 +7632,14 @@ static int condition_3way(void)
   return c;
 }
 
-/* Check if SValue is a comparison result that can be safely converted to 0/1
-   without side effects. This enables bitwise optimization of && and ||. */
-static int is_safe_bool_operand(SValue *sv)
-{
-  /* VT_CMP means it's a pending comparison - safe and already boolean */
-  if ((sv->r & VT_VALMASK) == VT_CMP)
-  {
-    return 1;
-  }
-  /* Constant 0 or 1 */
-  if ((sv->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST && (sv->type.t & VT_BTYPE) == VT_INT &&
-      (unsigned)sv->c.i < 2)
-  {
-    return 1;
-  }
-  /* Simple integer variable (local or in register) - can be converted to bool with != 0 */
-  if (((sv->type.t & VT_BTYPE) == VT_INT || (sv->type.t & VT_BTYPE) == VT_LLONG || (sv->type.t & VT_BTYPE) == VT_PTR) &&
-      !(sv->r & VT_SYM)) /* no symbol/function calls that might have side effects */
-  {
-    return 2; /* return 2 to indicate it needs conversion to bool */
-  }
-  return 0;
-}
-
-/* Convert VT_CMP or a variable to an actual 0/1 value in a register/vreg.
-   This is needed before we can use bitwise operations.
-   safe_type: 1 = VT_CMP (already bool), 2 = variable (needs != 0 conversion) */
-static void materialize_bool(int safe_type)
-{
-  if ((vtop->r & VT_VALMASK) == VT_CMP)
-  {
-    /* Generate code to convert comparison flags to 0/1 */
-    tcc_ir_generate_cmp_jmp_set(tcc_state->ir);
-  }
-  else if (safe_type == 2)
-  {
-    /* Variable needs to be compared with 0 to become a boolean */
-    vpushi(0);
-    gen_op(TOK_NE);
-    /* Now vtop should be VT_CMP, convert it to 0/1 */
-    if ((vtop->r & VT_VALMASK) == VT_CMP)
-    {
-      tcc_ir_generate_cmp_jmp_set(tcc_state->ir);
-    }
-  }
-  else
-  {
-  }
-}
-
 static void expr_landor(int op)
 {
   int t = 0, cc = 1, f = 0, i = op == TOK_LAND, c;
-  int first_safe_type, second_safe_type;
 
-  /* Check if we can use bitwise optimization:
-   * For && we can use &, for || we can use |
-   * This is valid when both operands are known boolean (0/1) values
-   * and we're in IR mode. */
+  /* In classic (non-IR) codegen, jump-chain sentinel is 0.
+     In IR mode, jump-chain sentinel is -1 (see tcc_ir_backpatch). */
   if (tcc_state->ir != NULL)
-  {
-    /* Save current state to check the second operand */
-    SValue first_op = *vtop;
-    int first_c = condition_3way();
-
-    first_safe_type = is_safe_bool_operand(&first_op);
-    /* Only try optimization if first operand is not compile-time constant
-       and is a safe bool operand (comparison result or variable) */
-    if (first_c < 0 && first_safe_type && tok == op)
-    {
-      /* Peek ahead: parse next operand without generating code yet */
-      int saved_tok = tok;
-      next(); /* consume && or || */
-
-      /* Parse the second operand */
-      int saved_nocode = nocode_wanted;
-      expr_landor_next(op);
-      nocode_wanted = saved_nocode;
-
-      /* Check if second operand is also a safe bool */
-      second_safe_type = is_safe_bool_operand(vtop);
-      if (second_safe_type && tok != op)
-      {
-        /* Both operands are safe bools - use optimized operation!
-         * If both are type 2 (variables), use BOOL_OR/BOOL_AND directly.
-         * Otherwise, materialize to 0/1 and use bitwise op. */
-
-        if (first_safe_type == 2 && second_safe_type == 2)
-        {
-          /* Both are variables - use optimized BOOL_OR/BOOL_AND IR operation
-           * This generates: ORRS + ITE for ||, or CMP+IT+CMP+ITE for && */
-          SValue dest;
-          TccIrOp ir_op = (op == TOK_LAND) ? TCCIR_OP_BOOL_AND : TCCIR_OP_BOOL_OR;
-
-          memset(&dest, 0, sizeof(dest));
-          dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-          dest.r = 0;
-          dest.type.t = VT_INT;
-
-          tcc_ir_put(tcc_state->ir, ir_op, &vtop[-1], &vtop[0], &dest);
-
-          vtop--;
-          vtop->vr = dest.vr;
-          vtop->r = 0;
-          vtop->type.t = VT_INT;
-        }
-        else
-        {
-          /* At least one is VT_CMP - materialize both and use bitwise op */
-          materialize_bool(second_safe_type); /* second operand (top of stack) */
-          vswap();
-          materialize_bool(first_safe_type); /* first operand */
-          vswap();
-
-          /* Generate bitwise operation */
-          gen_op(op == TOK_LAND ? '&' : '|');
-        }
-
-        /* Result is already 0 or 1, which is correct for && and || */
-        return;
-      }
-
-      /* Optimization not applicable for chained operators or non-bool second operand.
-       * We need to fall back to branch-based evaluation.
-       * Generate test for first operand now. */
-      vswap(); /* put first operand on top */
-      t = tcc_ir_generate_test(tcc_state->ir, i, t);
-      vswap(); /* restore second operand on top */
-
-      /* Continue with normal processing - the second operand is already parsed */
-      goto continue_landor;
-    }
-  }
+    t = -1;
 
   /* Standard branch-based evaluation */
   for (;;)
@@ -7651,9 +7662,11 @@ static void expr_landor(int op)
     else
       vpop();
     next();
-    int saved_nocode = nocode_wanted;
-    expr_landor_next(op);
-    nocode_wanted = saved_nocode;
+    {
+      int saved_nocode = nocode_wanted;
+      expr_landor_next(op);
+      nocode_wanted = saved_nocode;
+    }
   }
 
 continue_landor:
@@ -7776,12 +7789,13 @@ static void expr_cond(void)
     }
 
     /* keep structs lvalue by transforming `(expr ? a : b)` to `*(expr ? &a :
-       &b)` so that `(expr ? a : b).mem` does not error  with "lvalue expected"
-     */
-    islv = (vtop->r & VT_LVAL) && (sv.r & VT_LVAL) && VT_STRUCT == (type.t & VT_BTYPE);
+      &b)` so that `(expr ? a : b).mem` does not error with "lvalue expected".
+      If the condition is statically false (c == 0), the expression reduces to
+      the selected operand and is already a proper lvalue, so skip this
+      transformation (otherwise we'd call indir() on a non-pointer). */
+    islv = (c != 0) && (vtop->r & VT_LVAL) && (sv.r & VT_LVAL) && VT_STRUCT == (type.t & VT_BTYPE);
 
-    /* now we convert second operand */
-    if (c != 1)
+    if (c != 0)
     {
       gen_cast(&type);
       if (islv)
@@ -7791,6 +7805,15 @@ static void expr_cond(void)
       }
       else if (VT_STRUCT == (vtop->type.t & VT_BTYPE))
         gaddrof();
+    }
+    else
+    {
+      /* Even if the condition is a compile-time constant, the conditional
+         operator's result type is determined from both operands.
+         Do not reduce `0 ? a : b` to just `b`'s type; this breaks sizeof/_Generic.
+         Cast the selected (false) operand to the combined result type.
+         Keep struct lvalues untouched (no &/ * transformation) in this case. */
+      gen_cast(&type);
     }
 
     rc = RC_TYPE(type.t);
@@ -8018,7 +8041,21 @@ static void gfunc_return(CType *func_type)
       vtop->vr = dest.vr;
       vtop->r = 0; /* no longer an lvalue */
     }
+#ifdef DEBUG_IR_GEN
+    if (tcc_state->ir->next_instruction_index > 8)
+    {
+      fprintf(stderr, "DEBUG gfunc_return: BEFORE tcc_ir_generate_cmp_jmp_set, instr[8].src1.vr=%d\n",
+              tcc_state->ir->instructions[8].src1.vr);
+    }
+#endif
     tcc_ir_generate_cmp_jmp_set(tcc_state->ir);
+#ifdef DEBUG_IR_GEN
+    if (tcc_state->ir->next_instruction_index > 8)
+    {
+      fprintf(stderr, "DEBUG gfunc_return: AFTER tcc_ir_generate_cmp_jmp_set, instr[8].src1.vr=%d\n",
+              tcc_state->ir->instructions[8].src1.vr);
+    }
+#endif
     printf("DEBUG gfunc_return: before RETURNVALUE, vtop->r = 0x%x, VT_LVAL=%d\n", vtop->r, !!(vtop->r & VT_LVAL));
     tcc_ir_put(tcc_state->ir, TCCIR_OP_RETURNVALUE, vtop, NULL, NULL);
   }
@@ -8087,6 +8124,8 @@ static void case_sort(struct switch_t *sw)
   }
 }
 
+/* dsym is a jump-chain head (index of a JMP instruction) that will ultimately
+ * be patched to the default label or fall-through. Never pass raw -1 here. */
 static int gcase(struct case_t **base, int len, int dsym)
 {
   struct case_t *p;
@@ -8106,7 +8145,8 @@ static int gcase(struct case_t **base, int len, int dsym)
     {
       int pos = 0;
       gen_op(TOK_EQ); /* jmp to case when equal */
-      pos = tcc_ir_generate_test(tcc_state->ir, 0, 0);
+      /* If comparison fails, jump to default chain 'dsym' (or fall through when -1). */
+      pos = tcc_ir_generate_test(tcc_state->ir, 0, dsym);
       tcc_ir_backpatch(tcc_state->ir, pos, p->ind);
       // gsym_addr(gvtst(0, 0), p->ind);
     }
@@ -8117,14 +8157,12 @@ static int gcase(struct case_t **base, int len, int dsym)
       gen_op(TOK_GT); /* jmp over when > V2 */
       if (len == 1)   /* last case test jumps to default when false */
       {
-        // dsym = gvtst(0, dsym);
         dsym = tcc_ir_generate_test(tcc_state->ir, 0, dsym);
         e = 0;
       }
       else
       {
-        e = tcc_ir_generate_test(tcc_state->ir, 0, 0);
-        // e = gvtst(0, 0);
+        e = tcc_ir_generate_test(tcc_state->ir, 0, dsym);
       }
       vdup(), vpush64(t, p->v1);
       gen_op(TOK_GE); /* jmp to case when >= V1 */
@@ -8177,7 +8215,7 @@ static void try_call_scope_cleanup(Sym *stop)
     SValue src1;
     memset(&src1, 0, sizeof(SValue));
     src1.vr = -1;
-    src1.c.i = 1;
+    src1.c.i = 0;
     tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &src1, NULL);
     tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[-1], NULL, NULL);
     vtop -= 2;
@@ -8240,8 +8278,23 @@ static void block_cleanup(struct scope *o)
 
 static void vla_restore(int loc)
 {
-  if (loc)
+  if (!loc)
+    return;
+
+  if (tcc_state->ir)
+  {
+    SValue src;
+    memset(&src, 0, sizeof(src));
+    src.type.t = VT_PTR;
+    src.r = VT_LOCAL | VT_LVAL;
+    src.c.i = loc;
+    src.vr = -1;
+    tcc_ir_put(tcc_state->ir, TCCIR_OP_VLA_SP_RESTORE, &src, NULL, NULL);
+  }
+  else
+  {
     gen_vla_sp_restore(loc);
+  }
 }
 
 static void vla_leave(struct scope *o)
@@ -8253,7 +8306,6 @@ static void vla_leave(struct scope *o)
   if (v)
     vla_restore(v->vla.locorig);
 }
-
 /* ------------------------------------------------------------------------- */
 /* local scopes */
 
@@ -8263,8 +8315,30 @@ static void new_scope(struct scope *o)
   *o = *cur_scope;
   o->prev = cur_scope;
   cur_scope = o;
+  /* Reset VLA bookkeeping for the new scope. The scope struct is copied from
+   * the parent, so we must clear these fields or we'll restore SP using the
+   * parent's slots. */
   cur_scope->vla.num = 0;
-
+  cur_scope->vla.loc = 0;
+  cur_scope->vla.locorig = 0;
+  loc -= PTR_SIZE;
+  if (tcc_state->ir)
+  {
+    SValue dst;
+    memset(&dst, 0, sizeof(dst));
+    dst.type.t = VT_PTR;
+    dst.r = VT_LOCAL | VT_LVAL;
+    dst.c.i = loc;
+    dst.vr = -1;
+    tcc_ir_put(tcc_state->ir, TCCIR_OP_VLA_SP_SAVE, NULL, NULL, &dst);
+  }
+  else
+  {
+    gen_vla_sp_save(loc);
+  }
+  /* The scope prologue saves the pre-scope SP. Reuse that as the default
+   * "before VLA" restore point for VLAs introduced in this scope. */
+  cur_scope->vla.locorig = loc;
   /* record local declaration stack position */
   o->lstk = local_stack;
   o->llstk = local_label_stack;
@@ -8597,8 +8671,8 @@ again:
     a = b = -1; /* Initialize break/continue chains with -1 sentinel */
     d = gind();
     lblock(&a, &b);
-    // gsym(b);
-    tcc_ir_backpatch_to_here(tcc_state->ir, a);
+    /* continue jumps land at the condition check of the do/while */
+    tcc_ir_backpatch_to_here(tcc_state->ir, b);
     skip(TOK_WHILE);
     skip('(');
     gexpr();
@@ -8659,20 +8733,15 @@ again:
     tcc_ir_put(tcc_state->ir, TCCIR_OP_ASSIGN, vtop, NULL, &dest);
     vtop->vr = dest.vr;
     vtop->r = 0;
-    d = gcase(sw->p, sw->n, 0);
+    /* Build case jump chain; start with empty default chain (-1). */
+    d = gcase(sw->p, sw->n, -1);
     vpop();
 
+    tcc_ir_backpatch(tcc_state->ir, b, c);
     if (sw->def_sym)
-    {
-      tcc_ir_backpatch(tcc_state->ir, b, c);
       tcc_ir_backpatch(tcc_state->ir, d, sw->def_sym);
-    }
-    // gsym_addr(d, sw->def_sym);
     else
-    {
-      tcc_ir_backpatch(tcc_state->ir, b, c);
       tcc_ir_backpatch_to_here(tcc_state->ir, d);
-    }
     // gsym(d);
   skip_switch:
     /* break label */
@@ -8784,10 +8853,11 @@ again:
         {
           Sym *pcl; /* pending cleanup goto */
           for (pcl = s->next; pcl; pcl = pcl->prev)
-            tcc_ir_backpatch_to_here(tcc_state->ir, pcl->jnext);
+            if (pcl->jnext >= 0) /* Only backpatch if there's an actual forward jump */
+              tcc_ir_backpatch_to_here(tcc_state->ir, pcl->jnext);
           sym_pop(&s->next, NULL, 0);
         }
-        else
+        else if (s->jnext >= 0) /* Only backpatch if there's an actual forward jump */
           tcc_ir_backpatch_to_here(tcc_state->ir, s->jnext);
       }
       else
@@ -8795,6 +8865,8 @@ again:
         s = label_push(&global_label_stack, t, LABEL_DEFINED);
       }
       s->jind = gind();
+      fprintf(stderr, "DEBUG label_def: label '%s' defined, s->jind=%d gind()=%d\n", get_tok_str(t, NULL), s->jind,
+              gind());
       s->cleanupstate = cur_scope->cl.s;
 
     block_after_label:
@@ -8947,11 +9019,14 @@ static void init_putz(init_params *p, unsigned long c, int size)
 
     memset(&src1, 0, sizeof(SValue));
     src1.vr = -1;
-    src1.c.i = 1;
+    /* __aeabi_memset(dest, n, c) on ARM EABI; memset(dest, c, n) elsewhere.
+     * TOK_memset maps to __aeabi_memset when TCC_ARM_EABI is defined.
+     * Stack is: dest, c, n */
+    src1.c.i = 0;
     tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-2], &src1, NULL);
-    src1.c.i = 3;
-    tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &src1, NULL);
     src1.c.i = 2;
+    tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &src1, NULL);
+    src1.c.i = 1;
     tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[0], &src1, NULL);
 
     vpush_helper_func(TOK_memset);
@@ -9148,15 +9223,28 @@ static int decl_designator(init_params *p, CType *type, unsigned long c, Sym **c
       type = &t1;
     }
     if (p->sec)
-      vpush_ref(type, p->sec, c, elem_size);
-    else
-      vset(type, VT_LOCAL | VT_LVAL, c);
-    for (i = 1; i < nb_elems; i++)
     {
-      vdup();
-      init_putv(p, type, c + elem_size * i, -1);
+      vpush_ref(type, p->sec, c, elem_size);
+      for (i = 1; i < nb_elems; i++)
+      {
+        vdup();
+        init_putv(p, type, c + elem_size * i, -1);
+      }
+      vpop();
     }
-    vpop();
+    else
+    {
+      /* Local range designators: copy the first element's value into each
+         subsequent slot using vstore, so stack-relative addressing stays
+         correct. */
+      for (i = 1; i < nb_elems; i++)
+      {
+        vset(type, VT_LOCAL | VT_LVAL, c + elem_size * i); /* dest */
+        vset(type, VT_LOCAL | VT_LVAL, c);                 /* src */
+        vstore();
+        vpop(); /* drop dest/result left by vstore */
+      }
+    }
   }
 
   c += nb_elems * elem_size;
@@ -9907,6 +9995,9 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has
     if (NODATA_WANTED)
       goto no_alloc;
 
+    if (tcc_state->ir)
+      tcc_state->force_frame_pointer = 1;
+
     /* save before-VLA stack pointer if needed */
     if (cur_scope->vla.num == 0)
     {
@@ -9916,19 +10007,54 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has
       }
       else
       {
-        gen_vla_sp_save(loc -= PTR_SIZE);
-        cur_scope->vla.locorig = loc;
+        /* No outer VLA active: the scope prologue already saved SP in
+         * cur_scope->vla.locorig (set by new_scope). */
+        if (!cur_scope->vla.locorig)
+          tcc_error("compiler_error: missing scope SP save slot for VLA");
       }
     }
 
     vpush_type_size(type, &a);
-    gen_vla_alloc(type, a);
+    if (tcc_state->ir)
+    {
+      /* vtop holds the runtime allocation size (bytes). Emit an IR op that
+       * adjusts SP and aligns it. */
+      SValue size_sv = *vtop;
+
+      SValue align_sv;
+      memset(&align_sv, 0, sizeof(align_sv));
+      align_sv.type.t = VT_INT;
+      align_sv.r = VT_CONST;
+      align_sv.c.i = a;
+      align_sv.vr = -1;
+
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_VLA_ALLOC, &size_sv, &align_sv, NULL);
+      vpop();
+    }
+    else
+    {
+      gen_vla_alloc(type, a);
+    }
 #if defined TCC_TARGET_PE && defined TCC_TARGET_X86_64
     /* on _WIN64, because of the function args scratch area, the
        result of alloca differs from RSP and is returned in RAX.  */
     gen_vla_result(addr), addr = (loc -= PTR_SIZE);
 #endif
-    gen_vla_sp_save(addr);
+
+    if (tcc_state->ir)
+    {
+      SValue dst;
+      memset(&dst, 0, sizeof(dst));
+      dst.type.t = VT_PTR;
+      dst.r = VT_LOCAL | VT_LVAL;
+      dst.c.i = addr;
+      dst.vr = -1;
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_VLA_SP_SAVE, NULL, NULL, &dst);
+    }
+    else
+    {
+      gen_vla_sp_save(addr);
+    }
     cur_scope->vla.loc = addr;
     cur_scope->vla.num++;
   }
@@ -10000,10 +10126,19 @@ static void gen_function(Sym *sym)
 {
   struct scope f = {0};
   TCCIRState *ir;
+  Sym *global_label_stack_start; /* save global label stack at function start */
   cur_scope = root_scope = &f;
   nocode_wanted = 0;
 
   ind = cur_text_section->data_offset;
+  /* Reset per-function flags */
+  tcc_state->force_frame_pointer = 0;
+
+  /* Save global label stack position so we only pop labels from this function */
+  global_label_stack_start = global_label_stack;
+  fprintf(stderr, "DEBUG gen_function START: %s ind=0x%x global_label_stack=%p\n", get_tok_str(sym->v, NULL), ind,
+          (void *)global_label_stack);
+
   if (sym->a.aligned)
   {
     size_t newoff = section_add(cur_text_section, 0, 1 << (sym->a.aligned - 1));
@@ -10033,8 +10168,8 @@ static void gen_function(Sym *sym)
 #endif
   ir = tcc_ir_allocate_block();
   tcc_state->ir = ir;
-  tcc_ir_add_function_parameters(ir, &sym->type);
   local_scope = 1; /* for function parameters */
+  tcc_ir_add_function_parameters(ir, &sym->type);
   nb_temp_local_vars = 0;
   if (!sym->a.naked)
   {
@@ -10049,11 +10184,18 @@ static void gen_function(Sym *sym)
   /* Backpatch all return jumps to point to the epilogue (past the end of IR) */
   tcc_ir_backpatch_to_here(ir, rsym);
 
-#ifdef DEBUG_IR_GEN
+  // #ifdef DEBUG_IR_GEN
   printf("=== IR BEFORE OPTIMIZATIONS ===\n");
+#ifdef DEBUG_IR_GEN
+  if (ir->next_instruction_index > 8)
+  {
+    fprintf(stderr, "DEBUG before dump: instr[8].op=%d, instr[8].src1.vr=%d, instr[8].src1.r=0x%x\n",
+            ir->instructions[8].op, ir->instructions[8].src1.vr, ir->instructions[8].src1.r);
+  }
+#endif
   tcc_ir_show(ir);
   printf("=== END IR BEFORE OPTIMIZATIONS ===\n");
-#endif
+  // #endif
 
   /* Dead code elimination - remove unreachable instructions */
   tcc_ir_dead_code_elimination(ir);
@@ -10106,6 +10248,23 @@ static void gen_function(Sym *sym)
   /* Dead store elimination - remove unused ASSIGN instructions */
   tcc_ir_dead_store_elimination(ir);
 
+  /* Recompute leafness after IR optimizations.
+   * IR construction marks the function non-leaf as soon as a call op is
+   * emitted, but DCE/other passes can delete calls.
+   */
+  {
+    ir->leaffunc = 1;
+    for (int i = 0; i < ir->next_instruction_index; ++i)
+    {
+      const TACQuadruple *q = &ir->instructions[i];
+      if (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID)
+      {
+        ir->leaffunc = 0;
+        break;
+      }
+    }
+  }
+
   nocode_wanted = 0;
   /* reset local stack */
   pop_local_syms(NULL, 0);
@@ -10113,12 +10272,29 @@ static void gen_function(Sym *sym)
   /* Nested calls are now handled at code generation time via backward scan.
    * No IR reordering needed - saves O(n) memory allocations. */
 
-#ifdef DEBUG_IR_GEN
+  // #ifdef DEBUG_IR_GEN
   tcc_ir_show(ir);
-#endif
+  // #endif
   tcc_ir_liveness_analysis(ir);
   /* TODO: track float_parameters_count separately for hard float ABI */
-  tcc_ls_allocate_registers(&ir->ls, ir->parameters_count, 0);
+  tcc_ls_allocate_registers(&ir->ls, ir->parameters_count, 0, loc);
+
+  /* Make sure the final stack frame is large enough for any spill slots.
+   * The linear-scan allocator assigns negative FP-relative stack locations;
+   * extend `loc` to the most-negative one so spills don't overlap locals.
+   */
+  {
+    int min_stack_loc = 0;
+    for (int i = 0; i < ir->ls.next_interval_index; ++i)
+    {
+      int sl = ir->ls.intervals[i].stack_location;
+      if (sl < min_stack_loc)
+        min_stack_loc = sl;
+    }
+    if (min_stack_loc < loc)
+      loc = min_stack_loc;
+  }
+
   tcc_ir_patch_live_intervals_registers(ir);
   tcc_ir_register_allocation_params(ir);
   tcc_ir_generate_code(ir);
@@ -10136,7 +10312,16 @@ static void gen_function(Sym *sym)
 
   cur_text_section->data_offset = ind;
   local_scope = 0;
-  label_pop(&global_label_stack, NULL, 0);
+  fprintf(stderr, "DEBUG gen_function END: %s ind=0x%x global_label_stack=%p saved=%p\n", funcname, ind,
+          (void *)global_label_stack, (void *)global_label_stack_start);
+  /* Only pop labels defined in this function - use saved stack position */
+  label_pop(&global_label_stack, global_label_stack_start, 0);
+  if (ir && ir->ir_to_code_mapping)
+  {
+    tcc_free(ir->ir_to_code_mapping);
+    ir->ir_to_code_mapping = NULL;
+    ir->ir_to_code_mapping_size = 0;
+  }
   sym_pop(&all_cleanups, NULL, 0);
 
   /* It's better to crash than to generate wrong code */

@@ -303,6 +303,9 @@ int main(int argc0, char **argv0)
   char **argv;
   FILE *ppfp = stdout;
 
+early_exit:
+  /* label target only */
+
 redo:
   argc = argc0, argv = argv0;
   tcc_set_realloc(NULL);
@@ -315,7 +318,10 @@ redo:
 #endif
   opt = tcc_parse_args(s, &argc, &argv, 1);
   if (opt < 0)
-    return 1;
+  {
+    ret = 1;
+    goto cleanup_early;
+  }
 
   if (n == 0)
   {
@@ -323,33 +329,50 @@ redo:
     {
       fputs(help, stdout);
       if (!s->verbose)
-        return 0;
+      {
+        ret = 0;
+        goto cleanup_early;
+      }
       ++opt;
     }
     if (opt == OPT_HELP2)
     {
       fputs(help2, stdout);
-      return 0;
+      ret = 0;
+      goto cleanup_early;
     }
     if (opt == OPT_M32 || opt == OPT_M64)
-      return tcc_tool_cross(s, argv, opt);
+    {
+      ret = tcc_tool_cross(s, argv, opt);
+      goto cleanup_early;
+    }
     if (s->verbose)
       printf("%s", version);
     if (opt == OPT_AR)
-      return tcc_tool_ar(s, argc, argv);
+    {
+      ret = tcc_tool_ar(s, argc, argv);
+      goto cleanup_early;
+    }
 #ifdef TCC_TARGET_PE
     if (opt == OPT_IMPDEF)
-      return tcc_tool_impdef(s, argc, argv);
+    {
+      ret = tcc_tool_impdef(s, argc, argv);
+      goto cleanup_early;
+    }
 #endif
     if (opt == OPT_V)
-      return 0;
+    {
+      ret = 0;
+      goto cleanup_early;
+    }
     if (opt == OPT_PRINT_DIRS)
     {
       /* initialize search dirs */
       set_environment(s);
       tcc_set_output_type(s, TCC_OUTPUT_MEMORY);
       print_search_dirs(s);
-      return 0;
+      ret = 0;
+      goto cleanup_early;
     }
 
     if (s->nb_files == 0)
@@ -373,7 +396,10 @@ redo:
         tcc_error_noabort("cannot specify output file with -c many files");
     }
     if (s->nb_errors)
-      return 1;
+    {
+      ret = 1;
+      goto cleanup_early;
+    }
     if (s->do_bench)
       start_time = getclock_ms();
   }
@@ -458,6 +484,12 @@ redo:
 
   if (!done)
     goto redo;
+  if (ppfp && ppfp != stdout)
+    fclose(ppfp);
+  return ret;
+
+cleanup_early:
+  tcc_delete(s);
   if (ppfp && ppfp != stdout)
     fclose(ppfp);
   return ret;

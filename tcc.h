@@ -950,6 +950,7 @@ struct TCCState
   uint64_t float_registers_map_for_allocator;
   uint8_t omit_frame_pointer;
   uint8_t need_frame_pointer;
+  uint8_t force_frame_pointer; /* required for VLA/dynamic SP even if omit_frame_pointer */
   int stack_location;
 
   /* linker script support */
@@ -1877,6 +1878,11 @@ ST_FUNC void tcc_tcov_reset_ind(TCCState *s1);
 
 typedef struct TACQuadruple
 {
+  /* Original IR instruction index as emitted by tcc_ir_put().
+   * Optimizations like DCE compact/reorder the IR array and change its indices.
+   * `orig_index` stays stable so features like &&label can map to final code.
+   */
+  int orig_index;
   TccIrOp op;
   SValue src1;
   SValue src2;
@@ -1903,9 +1909,13 @@ ST_FUNC void tcc_gen_machine_save_call_context(void);
 ST_FUNC void tcc_gen_machine_restore_call_context(void);
 ST_FUNC void tcc_gen_machine_jump_op(TACQuadruple *q);
 ST_FUNC void tcc_gen_machine_conditional_jump_op(TACQuadruple *q);
+ST_FUNC void tcc_gen_machine_indirect_jump_op(TACQuadruple *q);
 ST_FUNC void tcc_gen_machine_setif_op(TACQuadruple *q);
 ST_FUNC void tcc_gen_machine_bool_op(TACQuadruple *q);
 ST_FUNC void tcc_gen_machine_backpatch_jump(int address, int offset);
+
+/* VLA / dynamic stack operations */
+ST_FUNC void tcc_gen_machine_vla_op(TACQuadruple *q);
 
 ST_FUNC const char *tcc_get_abi_softcall_name(TACQuadruple *q);
 

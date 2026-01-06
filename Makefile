@@ -348,7 +348,15 @@ config.mak:
 	$(if $(wildcard $@),,@echo "Please run ./configure." && exit 1)
 
 # run all tests
-test:
+PYTEST ?= pytest
+
+# run IR tests via pytest (preferred)
+test: cross
+	@echo "------------ ir_tests (pytest) ------------"
+	@cd tests/ir_tests && $(PYTEST) -s
+
+# legacy tests (kept for reference)
+test-legacy:
 	@$(MAKE) -C tests
 # run test(s) from tests2 subdir (see make help)
 tests2.%:
@@ -377,7 +385,7 @@ distclean: clean
 	@rm -vf config.h config.mak config.texi
 	@rm -vf $(TCCDOCS)
 
-.PHONY: all fp-libs clean test tar tags ETAGS doc distclean install uninstall FORCE
+.PHONY: all cross fp-libs clean test test-legacy tar tags ETAGS doc distclean install uninstall FORCE
 
 help:
 	@echo "make"
@@ -391,7 +399,9 @@ help:
 	@echo "   $(wordlist 1,8,$(TCC_X))"
 	@echo "   $(wordlist 9,99,$(TCC_X))"
 	@echo "make test"
-	@echo "   run all tests"
+	@echo "   rebuild + run pytest in tests/ir_tests"
+	@echo "make test-legacy"
+	@echo "   run legacy make-based tests (tests/Makefile)"
 	@echo "make tests2.all / make tests2.37 / make tests2.37+"
 	@echo "   run all/single test(s) from tests2, optionally update .expect"
 	@echo "make testspp.all / make testspp.17"

@@ -202,16 +202,6 @@ static inline Sym *validate_sym_for_reloc(Sym *sym)
 {
   if (!sym)
     return NULL;
-  /* Check for use-after-free */
-  if (sym->v == 0xDEADBEEF)
-  {
-    /* BREAKPOINT: Set breakpoint here in GDB with "b arm-thumb-gen.c:211" */
-    /* Then run "bt" to see the call stack */
-    fprintf(stderr,
-            "DEBUG validate_sym_for_reloc: USE-AFTER-FREE! sym=%p was freed. Set breakpoint at arm-thumb-gen.c:211\n",
-            (void *)sym);
-    return NULL;
-  }
   /* Type descriptors (SYM_FIELD) should not be used for relocations */
   if (sym->v & SYM_FIELD)
     return NULL;
@@ -233,6 +223,7 @@ ST_DATA const char *const target_machine_defs = "__arm__\0"
                                                 "arm_elf\0"
 #if defined TCC_TARGET_ARM_ARCHV8M
                                                 "__ARM_ARCH_8M__\0"
+                                                "__thumb__\0"
 #endif // TCC_TARGET_ARM_ARCHV8M
                                                 "__ARMEL__\0"
                                                 "__APCS_32__\0"
@@ -252,6 +243,11 @@ thumb_flags_behaviour g_setflags = FLAGS_BEHAVIOUR_SET;
 uint32_t caller_saved_registers;
 uint32_t pushed_registers;
 int allocated_stack_size;
+
+/* Additional scratch register exclusions (e.g. to protect argument registers
+ * while materializing an indirect call target). Applied on top of per-call
+ * exclude masks. */
+static uint32_t scratch_global_exclude = 0;
 
 int is_valid_opcode(thumb_opcode op);
 int ot(thumb_opcode op);
@@ -278,6 +274,8 @@ static ScratchRegAlloc get_scratch_reg_with_save(uint32_t exclude_regs)
 {
   ScratchRegAlloc result = {0};
   TCCIRState *ir = tcc_state->ir;
+
+  exclude_regs |= scratch_global_exclude;
 
   if (ir)
   {
@@ -337,6 +335,7 @@ static void restore_scratch_reg(ScratchRegAlloc *alloc)
  */
 static int get_free_scratch_reg(uint32_t exclude_regs)
 {
+  exclude_regs |= scratch_global_exclude;
   ScratchRegAlloc alloc = get_scratch_reg_with_save(exclude_regs);
   /* Note: If alloc.saved is true, the register was pushed but we have no way
    * to restore it here. Callers should use get_scratch_reg_with_save() instead. */
@@ -364,6 +363,13 @@ int ot_check(thumb_opcode op)
 /* Forward declaration from tccir.c */
 int tcc_ir_is_spilled(SValue *sv);
 int tcc_ir_is_64bit(int t);
+
+/* Forward declarations for helpers used by spill preloading. */
+void load_vt_local(int r, SValue *sv);
+int load_short_from_base(int ir, int base, int fc, int sign);
+int load_ushort_from_base(int ir, int base, int fc, int sign);
+int load_byte_from_base(int ir, int base, int fc, int sign);
+int load_ubyte_from_base(int ir, int base, int fc, int sign);
 
 /* Preload spilled operands into scratch registers before an operation.
  * Returns SpillContext with information for store-back.
@@ -450,32 +456,83 @@ SpillContext tcc_ir_preload_spills(TACQuadruple *q, int preload_src1, int preloa
       int v = q->src1.r & VT_VALMASK;
       int src1_is_temp = TCCIR_DECODE_VREG_TYPE(q->src1.vr) == TCCIR_VREG_TYPE_TEMP;
 
-      fprintf(stderr, "DEBUG preload_src1: op=%d src1.vr=%d src1.r=0x%x offset=%lld scratch=%d\n", q->op, q->src1.vr,
-              q->src1.r, (long long)q->src1.c.i, scratch);
-
       /* For spilled VT_LOCAL values (both with and without VT_LVAL), directly load
        * the value from stack instead of using load() which has confusing semantics. */
       if (v == VT_LOCAL || v == VT_LLOCAL)
       {
-        /* Load value from spill slot: LDR scratch, [FP, #offset] */
-        int src_offset = q->src1.c.i;
-        int src_sign = (src_offset < 0);
-        int src_abs = src_sign ? -src_offset : src_offset;
-        if (!load_word_from_base(scratch, R_FP, src_abs, src_sign))
-        {
-          int rr = th_offset_to_reg(src_abs, src_sign);
-          ot_check(th_ldr_reg(scratch, R_FP, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-        }
-        /* Value is now in scratch register. Update r to indicate:
-         * - For LOAD operations: keep VT_LVAL since we loaded a POINTER that needs dereferencing
-         * - For other operations: clear VT_LVAL since we loaded the actual VALUE */
+        /* For LOAD operations, src1 is an address (lvalue).
+         * Preloading must materialize an address into a register.
+         *
+         * There are two distinct cases here:
+         * 1) Real locals/arrays: the spill slot is the object storage; we must compute
+         *    the address of that storage (otherwise we treat the first bytes as a pointer
+         *    and HardFault, e.g. "nonono" -> 0x6f6e6f6e).
+         * 2) Spilled temporaries that hold a pointer: the spill slot contains the pointer
+         *    value; we must load that pointer value and then dereference it.
+         */
         if (q->op == TCCIR_OP_LOAD)
         {
-          q->src1.r = scratch | VT_LVAL; /* Pointer in register, needs dereference */
+          if (src1_is_temp)
+          {
+            /* Spill slot holds the pointer value; load it first, then mark as lvalue. */
+            int src_offset = q->src1.c.i;
+            int src_sign = (src_offset < 0);
+            int src_abs = src_sign ? -src_offset : src_offset;
+            if (!load_word_from_base(scratch, R_FP, src_abs, src_sign))
+            {
+              int rr = th_offset_to_reg(src_abs, src_sign);
+              ot_check(th_ldr_reg(scratch, R_FP, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+            }
+            q->src1.r = scratch | VT_LVAL;
+            q->src1.c.i = 0;
+          }
+          else
+          {
+            /* Spill slot is the object storage; compute its address. */
+            SValue addr = q->src1;
+            addr.r &= ~VT_LVAL; /* VT_LOCAL without VT_LVAL means address-of */
+            load_vt_local(scratch, &addr);
+            q->src1.r = scratch | VT_LVAL; /* address in register, needs dereference */
+            q->src1.c.i = 0;               /* base already points to exact address */
+          }
         }
         else
         {
-          q->src1.r = scratch; /* Value in register */
+          /* Load value from stack with the correct width/sign based on type. */
+          int src_offset = q->src1.c.i;
+          int src_sign = (src_offset < 0);
+          int src_abs = src_sign ? -src_offset : src_offset;
+          int ft = q->src1.type.t;
+          int btype = ft & VT_BTYPE;
+          int ok = 0;
+
+          if (btype == VT_SHORT)
+          {
+            if (ft & VT_UNSIGNED)
+              ok = load_ushort_from_base(scratch, R_FP, src_abs, src_sign);
+            else
+              ok = load_short_from_base(scratch, R_FP, src_abs, src_sign);
+          }
+          else if (btype == VT_BYTE || btype == VT_BOOL)
+          {
+            if (ft & VT_UNSIGNED)
+              ok = load_ubyte_from_base(scratch, R_FP, src_abs, src_sign);
+            else
+              ok = load_byte_from_base(scratch, R_FP, src_abs, src_sign);
+          }
+          else
+          {
+            ok = load_word_from_base(scratch, R_FP, src_abs, src_sign);
+          }
+
+          if (!ok)
+          {
+            int rr = th_offset_to_reg(src_abs, src_sign);
+            ot_check(th_ldr_reg(scratch, R_FP, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+          }
+
+          q->src1.r = scratch; /* value in register */
+          q->src1.c.i = 0;
         }
       }
       else
@@ -723,8 +780,6 @@ void tcc_ir_storeback_spill(TACQuadruple *q, SpillContext *ctx)
 {
   if (ctx->dest_spilled && !tcc_ir_is_64bit(q->dest.type.t))
   {
-    fprintf(stderr, "DEBUG storeback_spill: op=%d dest.vr=%d scratch=%d offset=%d\n", q->op, q->dest.vr,
-            ctx->dest_scratch_reg, ctx->dest_offset);
     q->dest.pr0 = ctx->orig_dest_pr0;
     q->dest.r = VT_LOCAL;
     q->dest.c.i = ctx->dest_offset;
@@ -931,11 +986,9 @@ ST_FUNC void arm_init(struct TCCState *s)
     s->registers_for_allocator += 1;
   }
 
-  if (s->omit_frame_pointer)
-  {
-    s->registers_map_for_allocator |= (1 << ARM_R7);
-    s->registers_for_allocator += 1;
-  }
+  /* Always reserve R7 (FP) and never allocate it as a general register.
+   * The backend relies on a stable FP for FP-relative stack accesses.
+   */
 
   th_literal_pool_init();
 }
@@ -1256,13 +1309,12 @@ static thumb_opcode th_generic_mov_imm(uint32_t r, int imm)
   }
   return th_mov_imm(r, imm, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE);
 }
-int th_offset_to_reg(int off, int sign)
+static int th_offset_to_reg_ex(int off, int sign, uint32_t exclude_regs)
 {
-  /* Find a free scratch register */
-  uint32_t exclude_regs = 0;
+  /* Find a free scratch register (must not clobber excluded regs). */
   int rr = get_free_scratch_reg(exclude_regs);
 
-  /* if mov is not possible then load from data */
+  /* If mov is not possible then load from data */
   if (!ot(th_generic_mov_imm(rr, off)))
   {
     load_full_const(rr, PREG_NONE, sign ? -off : off, NULL);
@@ -1272,6 +1324,11 @@ int th_offset_to_reg(int off, int sign)
   if (sign)
     ot_check(th_rsb_imm(rr, rr, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
   return rr;
+}
+
+int th_offset_to_reg(int off, int sign)
+{
+  return th_offset_to_reg_ex(off, sign, 0);
 }
 
 int th_patch_call(int t, int a)
@@ -1360,14 +1417,26 @@ static void gadd_sp(int val)
 void ggoto(void)
 {
   TRACE("'ggoto'");
-  // Computed goto - vtop contains the target address (pointer)
-  // Emit an IR jump instruction with the target from vtop
-  SValue dest;
-  memset(&dest, 0, sizeof(SValue));
-  dest = *vtop; // Copy vtop as the jump destination (indirect jump)
-  tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
+  /* Computed goto: vtop contains the target address (a pointer value).
+   * In IR mode, this must be an *indirect* jump (BX reg), not a direct
+   * IR jump-to-instruction-index. */
+  tcc_ir_load_if_lvalue(tcc_state->ir, vtop);
+  {
+    SValue target = *vtop;
+    tcc_ir_put(tcc_state->ir, TCCIR_OP_IJUMP, &target, NULL, NULL);
+  }
   vtop--;
   print_vstack("ggoto");
+}
+
+ST_FUNC void tcc_gen_machine_indirect_jump_op(TACQuadruple *q)
+{
+  /* Indirect jump: target address in src1 register */
+  if (q->src1.pr0 == PREG_NONE || (q->src1.pr0 & PREG_SPILLED))
+  {
+    tcc_error("internal error: IJUMP target not in a register");
+  }
+  ot_check(th_bx_reg((uint16_t)q->src1.pr0));
 }
 
 // ST_FUNC int gjmp(int t)
@@ -1434,40 +1503,119 @@ void gsym_addr(int t, int a)
 
 ST_FUNC void gen_vla_alloc(CType *type, int align)
 {
-  // int r = intr(gv(RC_INT));
-  // th_sub_reg(r, 13, r, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-  //            ENFORCE_ENCODING_NONE);
-  // if (align < 8)
-  //   align = 8;
-  // if (align & (align - 1))
-  //   tcc_error("alignment is not a power of 2: %i", align);
-  // /* bic sp, r, #align-1 */
-  // ot_check(th_bic_imm(r, r, align - 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT));
-  // ot_check(th_mov_reg(13, r, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-  // THUMB_SHIFT_DEFAULT,
-  //                     ENFORCE_ENCODING_NONE, false));
-  // vpop();
-  tcc_error("gen_vla_alloc not implemented yet");
+  /* vtop holds the allocation size in bytes. Adjust SP down by that runtime
+   * size and align it to at least 8 bytes.
+   *
+   * This follows the classic TCC scheme:
+   *   r = sp - size
+   *   r = r & ~(align-1)
+   *   sp = r
+   *
+   * The size expression is consumed from the value stack.
+   */
+  (void)type;
+
+  int r = gv(RC_INT);
+
+  /* r = SP - r */
+  ot_check(th_sub_reg(r, R_SP, r, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+
+  if (align < 8)
+    align = 8;
+  if (align & (align - 1))
+    tcc_error("alignment is not a power of 2: %i", align);
+
+  if (align > 1)
+  {
+    /* Try immediate BIC first; if it doesn't encode, fall back to register mask. */
+    if (!ot(th_bic_imm(r, r, (uint32_t)(align - 1), FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE)))
+    {
+      ScratchRegAlloc mask_alloc = get_scratch_reg_with_save(1u << r);
+      int mask_reg = mask_alloc.reg;
+      if (!ot(th_generic_mov_imm(mask_reg, align - 1)))
+      {
+        load_full_const(mask_reg, PREG_NONE, align - 1, NULL);
+      }
+      ot_check(th_bic_reg(r, r, mask_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+      if (mask_alloc.saved)
+      {
+        ot_check(th_pop(1u << mask_reg));
+      }
+    }
+  }
+
+  /* SP = r */
+  ot_check(th_mov_reg(R_SP, r, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
+
+  vpop();
 }
+
+int store_word_to_base(int ir, int base, int fc, int sign);
 
 ST_FUNC void gen_vla_sp_save(int addr)
 {
-  tcc_error("gen_vla_sp_save not implemented yet");
-  // SValue v;
-  // v.type.t = VT_PTR;
-  // v.r = VT_LOCAL | VT_LVAL;
-  // v.c.i = addr;
-  // store(TREG_SP, &v);
+  /* Store current SP into a stack slot (addr is a local stack offset). */
+  int sign = (addr < 0);
+  int abs_off = sign ? -addr : addr;
+  int base = R_FP;
+  int src_reg = R_SP;
+
+  if (!store_word_to_base(src_reg, base, abs_off, sign))
+  {
+    int rr = th_offset_to_reg(abs_off, sign);
+    if (!ot(th_str_reg(src_reg, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE)))
+    {
+      /* Fallback: move SP to scratch and store that. */
+      ScratchRegAlloc tmp_alloc = get_scratch_reg_with_save(0);
+      int tmp = tmp_alloc.reg;
+      ot_check(th_mov_reg(tmp, R_SP, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
+      rr = th_offset_to_reg(abs_off, sign);
+      ot_check(th_str_reg(tmp, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+      if (tmp_alloc.saved)
+        ot_check(th_pop(1u << tmp));
+    }
+  }
 }
 
 ST_FUNC void gen_vla_sp_restore(int addr)
 {
-  tcc_error("gen_vla_sp_restore not implemented yet");
-  // SValue v;
-  // v.type.t = VT_PTR;
-  // v.r = VT_LOCAL | VT_LVAL;
-  // v.c.i = addr;
-  // load(TREG_SP, &v);
+  /* Restore SP from a stack slot (addr is a local stack offset). */
+  int sign = (addr < 0);
+  int abs_off = sign ? -addr : addr;
+  int base = R_FP;
+
+  /* Prefer loading directly into SP if the encoding is available. This avoids
+   * needing a scratch register that would have to be saved/restored using the
+   * current stack pointer (which becomes invalid once SP is updated). */
+  if (load_word_from_base(R_SP, base, abs_off, sign))
+    return;
+
+  {
+    int rr = th_offset_to_reg(abs_off, sign);
+    if (ot(th_ldr_reg(R_SP, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE)))
+      return;
+  }
+
+  /* Fallback: load into an unsaved scratch register and move to SP.
+   * This must not use push/pop saving because SP is about to change. */
+  uint32_t exclude_regs = scratch_global_exclude | (1u << R_SP);
+  int dest = R_IP;
+  TCCIRState *ir = tcc_state->ir;
+  if (ir)
+  {
+    int r = tcc_ls_find_free_scratch_reg(&ir->ls, ir->codegen_instruction_idx, exclude_regs, ir->leaffunc);
+    if (r >= 0)
+      dest = r;
+  }
+
+  if (!load_word_from_base(dest, base, abs_off, sign))
+  {
+    int rr = th_offset_to_reg(abs_off, sign);
+    if (!ot(th_ldr_reg(dest, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE)))
+      tcc_error("compiler_error: failed to encode VLA SP restore (addr=%d)", addr);
+  }
+
+  ot_check(th_mov_reg(R_SP, dest, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
 }
 
 static int unalias_ldbl(int btype)
@@ -1668,7 +1816,7 @@ void store(int r, SValue *sv)
             /* Single precision - one 32-bit store */
             if (!ot(th_str_imm(r, base, fc, sign ? 4 : 6, ENFORCE_ENCODING_NONE)))
             {
-              int rr = th_offset_to_reg(fc, sign);
+              int rr = th_offset_to_reg_ex(fc, sign, (1u << r) | (1u << base));
               ot_check(th_str_reg(r, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
             }
           }
@@ -1691,13 +1839,13 @@ void store(int r, SValue *sv)
             /* Store low word */
             if (!ot(th_str_imm(r, base, fc, sign ? 4 : 6, ENFORCE_ENCODING_NONE)))
             {
-              int rr = th_offset_to_reg(fc, sign);
+              int rr = th_offset_to_reg_ex(fc, sign, (1u << r) | (1u << base));
               ot_check(th_str_reg(r, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
             }
             /* Store high word at fc+4 */
             if (!ot(th_str_imm(r_high, base, fc + 4, sign ? 4 : 6, ENFORCE_ENCODING_NONE)))
             {
-              int rr = th_offset_to_reg(fc + 4, sign);
+              int rr = th_offset_to_reg_ex(fc + 4, sign, (1u << r_high) | (1u << base));
               ot_check(th_str_reg(r_high, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
             }
           }
@@ -1707,7 +1855,7 @@ void store(int r, SValue *sv)
       {
         if (!ot(th_strh_imm(r, base, fc, sign ? 4 : 6, ENFORCE_ENCODING_NONE)))
         {
-          int rr = th_offset_to_reg(fc, sign);
+          int rr = th_offset_to_reg_ex(fc, sign, (1u << r) | (1u << base));
           ot_check(th_strh_reg(r, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
         }
       }
@@ -1715,7 +1863,7 @@ void store(int r, SValue *sv)
       {
         if (!ot(th_strb_imm(r, base, fc, sign ? 4 : 6, ENFORCE_ENCODING_NONE)))
         {
-          int rr = th_offset_to_reg(fc, sign);
+          int rr = th_offset_to_reg_ex(fc, sign, (1u << r) | (1u << base));
           ot_check(th_strb_reg(r, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
         }
       }
@@ -1724,7 +1872,7 @@ void store(int r, SValue *sv)
         TRACE("store: sign: %x, r: %x, base: %x, fc: %x", sign, r, base, fc);
         if (!ot(th_str_imm(r, base, fc, sign ? 4 : 6, ENFORCE_ENCODING_NONE)))
         {
-          int rr = th_offset_to_reg(fc, sign);
+          int rr = th_offset_to_reg_ex(fc, sign, (1u << r) | (1u << base));
           ot_check(th_str_reg(r, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
         }
         TRACE("done");
@@ -2069,7 +2217,7 @@ void load_vt_lval_vt_local(int r, int r1, SValue *sv, int ft, int fc, int sign, 
         success = load_word_from_base(r, base, fc, sign);
         if (!success)
         {
-          int rr = th_offset_to_reg(fc, sign);
+          int rr = th_offset_to_reg_ex(fc, sign, (1u << r) | (1u << base) | (ir_high >= 0 ? (1u << ir_high) : 0));
           ot_check(th_ldr_reg(r, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
         }
         /* Load high word.
@@ -2088,7 +2236,7 @@ void load_vt_lval_vt_local(int r, int r1, SValue *sv, int ft, int fc, int sign, 
         success = load_word_from_base(ir_high, base, fc_high, sign_high);
         if (!success)
         {
-          int rr = th_offset_to_reg(fc_high, sign_high);
+          int rr = th_offset_to_reg_ex(fc_high, sign_high, (1u << ir_high) | (1u << base) | (r >= 0 ? (1u << r) : 0));
           ot_check(th_ldr_reg(ir_high, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
         }
       }
@@ -2098,7 +2246,7 @@ void load_vt_lval_vt_local(int r, int r1, SValue *sv, int ft, int fc, int sign, 
         success = load_word_from_base(r, base, fc, sign);
         if (!success)
         {
-          int rr = th_offset_to_reg(fc, sign);
+          int rr = th_offset_to_reg_ex(fc, sign, (1u << r) | (1u << base));
           ot_check(th_ldr_reg(r, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
         }
       }
@@ -2115,7 +2263,7 @@ void load_vt_lval_vt_local(int r, int r1, SValue *sv, int ft, int fc, int sign, 
       success = load_word_from_base(r, base, fc, sign);
       if (!success)
       {
-        int rr = th_offset_to_reg(fc, sign);
+        int rr = th_offset_to_reg_ex(fc, sign, (1u << r) | (1u << base) | (r1 >= 0 ? (1u << r1) : 0));
         ot_check(th_ldr_reg(r, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
       }
       /* Load high word at offset+4 */
@@ -2129,7 +2277,7 @@ void load_vt_lval_vt_local(int r, int r1, SValue *sv, int ft, int fc, int sign, 
       success = load_word_from_base(r1, base, fc_high, sign_high);
       if (!success)
       {
-        int rr = th_offset_to_reg(fc_high, sign_high);
+        int rr = th_offset_to_reg_ex(fc_high, sign_high, (1u << r1) | (1u << base) | (1u << r));
         ot_check(th_ldr_reg(r1, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
       }
       return;
@@ -2167,7 +2315,7 @@ void load_vt_lval_vt_local(int r, int r1, SValue *sv, int ft, int fc, int sign, 
   {
 
     // now load from dereferenced value
-    int rr = th_offset_to_reg(fc, sign);
+    int rr = th_offset_to_reg_ex(fc, sign, (1u << r) | (1u << base));
     if (btype == VT_SHORT)
     {
       if (ft & VT_UNSIGNED)
@@ -2280,13 +2428,22 @@ void load_to_dest(SValue *dest, SValue *sv)
   fc = sv->c.i;
   int btype = ft & VT_BTYPE;
 
+  /* If we're about to write into the register currently used to cache a global
+   * symbol base address, invalidate the cache first. Otherwise the cache can
+   * become stale (same register, different contents) and later loads may
+   * incorrectly reuse it (e.g. clobbering stdout setup when loading a literal). */
+  if (thumb_gen_state.cached_global_reg != PREG_NONE &&
+      (dest->pr0 == thumb_gen_state.cached_global_reg || dest->pr1 == thumb_gen_state.cached_global_reg))
+  {
+    thumb_gen_state.cached_global_sym = NULL;
+    thumb_gen_state.cached_global_reg = PREG_NONE;
+  }
+
   /* Handle invalid/uninitialized SValue: if the value part (VT_VALMASK) is 0x3f,
    * which is an invalid register/value code, this is likely corrupted or
    * uninitialized. Just load 0 as a fallback. */
   if ((fr & VT_VALMASK) == 0x3f)
   {
-    fprintf(stderr, "DEBUG load_to_dest: invalid fr=0x%x, vr=%d, vr_type=%d\n", fr, sv->vr,
-            TCCIR_DECODE_VREG_TYPE(sv->vr));
     /* Load zero as a safe default */
     ot_check(th_mov_imm(dest->pr0, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
     if (dest->pr1 != PREG_NONE)
@@ -2416,8 +2573,6 @@ void load_to_dest(SValue *dest, SValue *sv)
     {
       /* Preloaded pointer case: pr0 contains the address to load from.
        * This happens when tcc_ir_preload_spills loaded a spilled pointer. */
-      fprintf(stderr, "DEBUG load_to_dest VT_LOCAL preloaded: base=%d (pr0), orig_fc=%lld -> fc=0\n", sv->pr0,
-              (long long)fc);
       base = sv->pr0;
       fc = sign = 0;
     }
@@ -3737,6 +3892,17 @@ ST_FUNC void tcc_gen_machine_return_value_op(TACQuadruple *q)
 {
   int is_64bit = is_64bit_type(q->src1.type.t);
 
+  /* Constants are not held in a physical register; always materialize them
+   * into the return registers, regardless of any (possibly stale) pr0/pr1
+   * fields. */
+  if ((q->src1.r & VT_VALMASK) == VT_CONST)
+  {
+    SValue dest;
+    dest.pr0 = R0;
+    dest.pr1 = is_64bit ? R1 : PREG_NONE;
+    return load_to_dest(&dest, &q->src1);
+  }
+
   /* NOTE: src1 is preloaded to a valid register by generate_code if it was spilled.
    * Just move to return registers R0 (and R1 for 64-bit). */
   if (q->src1.pr0 != PREG_NONE)
@@ -3759,10 +3925,6 @@ ST_FUNC void tcc_gen_machine_return_value_op(TACQuadruple *q)
 void tcc_gen_machine_load_op(TACQuadruple *op)
 {
   TRACE("'tcc_gen_machine_load_op'");
-
-  fprintf(stderr,
-          "DEBUG tcc_gen_machine_load_op: dest.vr=%d dest.pr0=%d src1.vr=%d src1.pr0=%d src1.r=0x%x src1.c.i=%lld\n",
-          op->dest.vr, op->dest.pr0, op->src1.vr, op->src1.pr0, op->src1.r, (long long)op->src1.c.i);
 
   /* NOTE: All spilled dest handling is now done centrally in generate_code.
    * This function just loads from the source address to the destination register. */
@@ -3807,22 +3969,26 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
     registers_count++;
   }
 
-  if (stack_size > 0 && !tcc_state->omit_frame_pointer)
+  /* Keep FP whenever the function needs any FP-relative stack accesses.
+   * The IR layer sets `need_frame_pointer` when parameters are passed on the
+   * caller stack; locals/spills imply `stack_size > 0`. Don't clobber that
+   * signal here.
+   */
   {
-    tcc_state->need_frame_pointer = 1;
-    registers_to_push |= (1 << R_FP);
-    registers_count++;
-  }
-  else
-  {
-    tcc_state->need_frame_pointer = 0;
+    const int need_fp = (tcc_state->force_frame_pointer || tcc_state->need_frame_pointer || (stack_size > 0));
+    tcc_state->need_frame_pointer = need_fp;
+    if (need_fp)
+    {
+      registers_to_push |= (1 << R_FP);
+      registers_count++;
+    }
   }
 
   for (int i = R4; i <= R11; ++i)
   {
     if (tcc_state->text_and_data_separation && i == R9)
       continue;
-    if (!tcc_state->omit_frame_pointer && i == R_FP)
+    if (i == R_FP)
       continue;
     if (used_registers & (1ULL << i))
     {
@@ -3837,6 +4003,7 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
   }
   th_sym_t();
   offset_to_args = registers_count * 4;
+
   if (registers_count > 0)
   {
     ot_check(th_push(registers_to_push));
@@ -3893,7 +4060,9 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
            * The offset is stored in original_offset and is relative to SP after
            * prolog (i.e., above the saved registers and local stack frame).
            * We need to add: stack_size (locals) + offset_to_args (pushed regs) */
-          int caller_stack_offset = stack_size + offset_to_args + interval->original_offset;
+          /* FP is set to SP after pushes; locals are below SP, so caller stack
+           * arguments are always at FP + offset_to_args + original_offset. */
+          int caller_stack_offset = offset_to_args + interval->original_offset;
           if (is_64bit && alloc_r1 >= 0)
           {
             /* 64-bit: load both registers */
@@ -3954,6 +4123,7 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
 ST_FUNC void tcc_gen_machine_epilog(int leaffunc)
 {
   TRACE("'tcc_gen_machine_epilog'");
+
   int lr_saved = pushed_registers & (1 << R_LR);
 
   // restore stack pointer
@@ -4113,24 +4283,28 @@ ST_FUNC void tcc_gen_machine_store_to_stack(int reg, int offset)
   if (!store_word_to_base(reg, R_FP, abs_offset, sign))
   {
     /* Offset too large, use scratch register */
-    int rr = th_offset_to_reg(abs_offset, sign);
+    /* Don't reuse the source register as offset scratch, otherwise we'd
+     * clobber the value before the STR (e.g. store -offset instead of value). */
+    int rr = th_offset_to_reg_ex(abs_offset, sign, (1u << reg) | (1u << R_FP));
     ot_check(th_str_reg(reg, R_FP, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
   }
 }
 
-/* Load a register from a stack slot relative to SP.
- * offset is typically positive (parameters above current SP). */
+/* Load a register from a stack slot relative to FP.
+ * Used for stack-passed incoming parameters (caller stack is above FP). */
 static void tcc_gen_machine_load_from_stack(int reg, int offset)
 {
   int sign = (offset < 0);
   int abs_offset = sign ? -offset : offset;
 
   /* Try direct LDR with immediate offset */
-  if (!load_word_from_base(reg, R_SP, abs_offset, sign))
+  if (!load_word_from_base(reg, R_FP, abs_offset, sign))
   {
     /* Offset too large, use scratch register */
-    int rr = th_offset_to_reg(abs_offset, sign);
-    ot_check(th_ldr_reg(reg, R_SP, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+    /* Avoid using the destination register as offset scratch; some Thumb
+     * encodings have unpredictable behavior when Rt == Rm. */
+    int rr = th_offset_to_reg_ex(abs_offset, sign, (1u << reg) | (1u << R_FP));
+    ot_check(th_ldr_reg(reg, R_FP, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
   }
 }
 
@@ -4159,12 +4333,61 @@ static void gcall_or_jump(int is_jmp, SValue *dest)
   }
   else
   {
-    int scratch_reg = get_free_scratch_reg(0);
-    load_to_reg(scratch_reg, PREG_NONE, dest);
-    if (!is_jmp)
-      ot_check(th_blx_reg(scratch_reg));
+    /* Treat both VT_FUNC and pointer-to-function as function designators.
+     * If we already have the address in a register, it must be used directly
+     * as the branch target (not loaded from). */
+    int bt = dest->type.t & VT_BTYPE;
+    int is_func_designator = 0;
+    if (bt == VT_FUNC)
+      is_func_designator = 1;
+    else if (bt == VT_PTR && dest->type.ref)
+    {
+      int ref_bt = dest->type.ref->type.t & VT_BTYPE;
+      if (ref_bt == VT_FUNC)
+        is_func_designator = 1;
+    }
+
+    /* Calling through a function pointer may involve an explicit or implicit
+     * dereference (e.g. (*fp)()). In C this yields a *function designator* at
+     * the address held in the pointer; it is NOT a memory location that should
+     * be loaded from.
+     *
+     * If the target type is VT_FUNC and the address already lives in a register
+     * (v < VT_CONST), clear VT_LVAL so we don't emit a bogus extra load like
+     *   ldr ip, [ip]
+     * before blx.
+     */
+    if (is_func_designator)
+    {
+      int v = dest->r & VT_VALMASK;
+      if ((dest->r & VT_LVAL) && v < VT_CONST)
+        dest->r &= ~VT_LVAL;
+    }
+
+    /* Indirect call/jump: keep argument registers (R0-R3) intact.
+     * In particular, for indirect calls the target must NOT live in R0,
+     * otherwise arg0 gets overwritten (e.g. fprintfptr(stdout, ...)).
+     * Prefer R12/IP which is caller-saved by the ABI.
+     */
+    if (is_jmp)
+    {
+      load_to_reg(R_IP, PREG_NONE, dest);
+      ot_check(th_bx_reg(R_IP));
+    }
     else
-      ot_check(th_bx_reg(scratch_reg));
+    {
+      ScratchRegAlloc scratch = get_scratch_reg_with_save((1u << R0) | (1u << R1) | (1u << R2) | (1u << R3));
+
+      /* Keep argument registers off-limits while materializing the target. */
+      uint32_t old_exclude = scratch_global_exclude;
+      scratch_global_exclude |= (1u << R0) | (1u << R1) | (1u << R2) | (1u << R3);
+
+      load_to_reg(scratch.reg, PREG_NONE, dest);
+
+      scratch_global_exclude = old_exclude;
+      ot_check(th_blx_reg(scratch.reg));
+      restore_scratch_reg(&scratch);
+    }
   }
 }
 
@@ -4287,7 +4510,9 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
       {
         /* This param belongs to a nested (inner) call, not us */
         int param_num = instr->src2.c.i;
-        if (param_num == 1)
+        /* Params are 0-based; when scanning backwards we have passed all params
+         * for the inner call once we reach its param 0. */
+        if (param_num == 0)
           nested_call_depth--; /* Inner call got all its params */
       }
       else
@@ -4498,21 +4723,21 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
    * needed by LOWER-numbered registers (which haven't been loaded yet). */
   int registers_to_push = 0;
 
-  /* IMPORTANT: If the function pointer is in R0-R3, we need to save it before setting
-   * up parameters, because parameter setup may clobber those registers.
-   * Move it to a safe register using the scratch register allocator. */
-  int func_ptr_reg = q->src1.pr0;
-  int func_ptr_saved_to = PREG_NONE;
-  if (func_ptr_reg >= R0 && func_ptr_reg <= R3)
+  /* If this is an indirect call and the call target currently lives in an
+   * argument register (R0-R3), preserve it while materializing arguments.
+   * Use an aligned temp stack slot and reload into IP right before BLX.
+   * This avoids callee-saved register bookkeeping and keeps ABI stack
+   * alignment valid at the call boundary. */
+  const int orig_func_ptr_reg = q->src1.pr0;
+  int spilled_call_target = 0;
+  if (orig_func_ptr_reg >= R0 && orig_func_ptr_reg <= R3)
   {
-    /* Function pointer is in an argument register - need to save it */
-    /* Use scratch allocator to find a register not used by parameter sources */
-    int scratch = get_free_scratch_reg(future_src_mask | (1u << func_ptr_reg));
-    ot_check(th_mov_reg(scratch, func_ptr_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                        ENFORCE_ENCODING_NONE, false));
-    func_ptr_saved_to = scratch;
-    q->src1.pr0 = scratch; /* Update so gcall_or_jump uses the new register */
+    ot_check(th_sub_sp_imm(R_SP, 8, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    ot_check(th_str_imm(orig_func_ptr_reg, R_SP, 0, 6, ENFORCE_ENCODING_NONE));
+    spilled_call_target = 1;
   }
+
+  uint32_t call_target_mask = 0;
 
   /* Compute sources needed by each lower register before we start loading */
   uint32_t sources_needed_by_lower[4] = {0, 0, 0, 0};
@@ -4526,6 +4751,18 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
         sources_needed_by_lower[dest] |= (1u << param_src1[lower]);
     }
   }
+
+  /* While materializing call arguments, some helpers may allocate scratch
+   * registers based on vreg liveness. The physical argument registers (R0-R3)
+   * are not represented as live vregs here, so without extra care the scratch
+   * allocator can (incorrectly) pick an already-prepared argument register and
+   * clobber it.
+   *
+   * Protect all argument registers globally during argument setup, and
+   * temporarily allow the specific destination register(s) we're writing.
+   */
+  uint32_t saved_global_exclude = scratch_global_exclude;
+  scratch_global_exclude |= (1u << R0) | (1u << R1) | (1u << R2) | (1u << R3) | call_target_mask;
 
   for (int i = 3; i >= 0; --i)
   {
@@ -4562,6 +4799,11 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
     if (is_64bit && param_src1[dest_reg] != PREG_NONE)
       arg_copy.pr1 = param_src1[dest_reg];
 
+    /* Allow the destination register(s) for this argument to be used by
+     * address calculation helpers, but keep other arg registers protected. */
+    const uint32_t tmp_global_exclude = scratch_global_exclude;
+    scratch_global_exclude &= ~dest_mask;
+
     if (is_64bit)
     {
       /* 64-bit values use register pairs (R0:R1 or R2:R3) */
@@ -4587,7 +4829,11 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
       /* 32-bit value - load directly to destination register */
       load_to_register(dest_reg, arg_copy.pr0, &arg_copy);
     }
+
+    scratch_global_exclude = tmp_global_exclude;
   }
+
+  scratch_global_exclude = saved_global_exclude;
 
   if (tcc_state->text_and_data_separation && q->src1.type.t & VT_EXTERN)
   {
@@ -4598,7 +4844,20 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
   {
     ot_check(th_push(registers_to_push));
   }
-  gcall_or_jump(0, &q->src1);
+
+  if (spilled_call_target)
+  {
+    /* Reload the indirect call target and perform the call directly.
+     * Clear VT_LVAL to prevent accidental extra dereference. */
+    q->src1.r &= ~VT_LVAL;
+    ot_check(th_ldr_imm(R_IP, R_SP, 0, 6, ENFORCE_ENCODING_NONE));
+    ot_check(th_add_sp_imm(R_SP, 8, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    ot_check(th_blx_reg(R_IP));
+  }
+  else
+  {
+    gcall_or_jump(0, &q->src1);
+  }
 
   /* Invalidate global symbol cache after function call.
    * All caller-saved registers (R0-R3, R12, LR) are clobbered by the call,
@@ -4772,6 +5031,67 @@ ST_FUNC void tcc_gen_machine_bool_op(TACQuadruple *q)
     ot_check(th_it(0x1, 0x4)); /* ITE NE */
     ot_check(th_mov_imm(dest, 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
     ot_check(th_mov_imm(dest, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+  }
+}
+
+ST_FUNC void tcc_gen_machine_vla_op(TACQuadruple *q)
+{
+  switch (q->op)
+  {
+  case TCCIR_OP_VLA_ALLOC:
+  {
+    int align = (int)q->src2.c.i;
+    if (align < 8)
+      align = 8;
+    if (align & (align - 1))
+      tcc_error("alignment is not a power of 2: %i", align);
+
+    /* Compute new SP in-place in the size register (the size value is dead after this op). */
+    int r = q->src1.pr0;
+
+    /* If src1 wasn't allocated to a register (e.g. constant), load to IP. */
+    if (r == PREG_NONE || (r & PREG_SPILLED) || (q->src1.r & VT_VALMASK) == VT_CONST)
+    {
+      r = R_IP;
+      load_to_reg(r, PREG_NONE, &q->src1);
+    }
+
+    /* r = SP - r */
+    if (r == R_SP)
+      tcc_error("compiler_error: VLA alloc picked SP as temp");
+    ot_check(th_sub_sp_reg(r, r, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+
+    if (align > 1)
+    {
+      /* Align down: r &= ~(align-1). Prefer immediate encoding. */
+      if (!ot(th_bic_imm(r, r, (uint32_t)(align - 1), FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE)))
+      {
+        /* Fallback: materialize mask in a scratch reg and BIC (reg). */
+        ScratchRegAlloc mask_alloc = get_scratch_reg_with_save(1u << r);
+        int mask_reg = mask_alloc.reg;
+        if (!ot(th_generic_mov_imm(mask_reg, align - 1)))
+          load_full_const(mask_reg, PREG_NONE, align - 1, NULL);
+        ot_check(th_bic_reg(r, r, mask_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+        if (mask_alloc.saved)
+          ot_check(th_pop(1u << mask_reg));
+      }
+    }
+
+    ot_check(th_mov_reg(R_SP, r, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
+    break;
+  }
+  case TCCIR_OP_VLA_SP_SAVE:
+    /* Save SP to a fixed stack slot (FP-relative). Use IP as scratch. */
+    ot_check(th_mov_reg(R_IP, R_SP, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
+    store(R_IP, &q->dest);
+    break;
+  case TCCIR_OP_VLA_SP_RESTORE:
+    /* Restore SP from a fixed stack slot (FP-relative). Use IP as scratch. */
+    load(R_IP, &q->src1);
+    ot_check(th_mov_reg(R_SP, R_IP, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
+    break;
+  default:
+    tcc_error("compiler_error: tcc_gen_machine_vla_op unsupported op %d", q->op);
   }
 }
 

@@ -22,7 +22,9 @@ def main():
             file, _ = compile_testcase(Path(args.compile).resolve(), args.machine, )
     if file is None:
         file = args.file
-    print(f"Running QEMU with file: {file}")
+    # Send harness diagnostics to stderr so stdout stays comparable to .expect
+    import sys
+    print(f"Running QEMU with file: {file}", file=sys.stderr)
     qemu_command = build_qemu_command(args.machine, file)
     if args.gdb:
         qemu_command += " -s -S"

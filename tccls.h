@@ -78,7 +78,7 @@ void tcc_ls_clear_live_intervals(LSLiveIntervalState *ls);
 void tcc_ls_add_live_interval(LSLiveIntervalState *ls, int vreg, int start, int end, int crosses_call, int addrtaken,
                               int reg_type, int lvalue);
 void tcc_ls_allocate_registers(LSLiveIntervalState *ls, int used_parameters_registers,
-                               int used_float_parameters_registers);
+                               int used_float_parameters_registers, int spill_base);
 
 /* Find a free scratch register at the given instruction index.
  * Returns -1 if no register is available.

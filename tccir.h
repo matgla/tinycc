@@ -53,6 +53,8 @@ typedef enum TccIrOp
   TCCIR_OP_RETURNVALUE,
   TCCIR_OP_JUMP,
   TCCIR_OP_JUMPIF,
+  /* Indirect jump (computed goto): target in src1 */
+  TCCIR_OP_IJUMP,
   TCCIR_OP_SETIF,
   TCCIR_OP_TEST_ZERO,
   TCCIR_OP_FUNCPARAMVOID,
@@ -76,6 +78,12 @@ typedef enum TccIrOp
   /* Logical boolean operations - produce 0/1 result */
   TCCIR_OP_BOOL_OR,  /* (src1 != 0) || (src2 != 0) -> 0/1 */
   TCCIR_OP_BOOL_AND, /* (src1 != 0) && (src2 != 0) -> 0/1 */
+
+  /* Variable-length array (VLA) / dynamic stack allocation */
+  TCCIR_OP_VLA_ALLOC,      /* adjust SP by runtime size, with alignment */
+  TCCIR_OP_VLA_SP_SAVE,    /* save current SP to a fixed stack slot */
+  TCCIR_OP_VLA_SP_RESTORE, /* restore SP from a fixed stack slot */
+
   /* No-operation placeholder for dead instructions */
   TCCIR_OP_NOP,
 } TccIrOp;
@@ -188,11 +196,29 @@ typedef struct TCCIRState
 
   SpillCache spill_cache; // Cache for tracking register-stack mappings during codegen
 
+  /* Mapping from IR instruction index to generated machine code offset (section-relative).
+   * Size is (next_instruction_index + 1) to include the epilogue mapping.
+   * This is populated during tcc_ir_generate_code() and is used after codegen
+   * for features like GCC's labels-as-values (&&label). */
+  uint32_t *ir_to_code_mapping;
+  int ir_to_code_mapping_size;
+
+  /* Mapping from ORIGINAL IR instruction index (pre-DCE/compaction) to generated
+   * machine code offset. Label positions (s->jind) are recorded before DCE, so
+   * this mapping is the correct one to use for &&label materialization.
+   */
+  uint32_t *orig_ir_to_code_mapping;
+  int orig_ir_to_code_mapping_size;
+
   LSLiveIntervalState ls;
 } TCCIRState;
 
 TCCIRState *tcc_ir_allocate_block();
 void tcc_ir_release_block(TCCIRState *ir);
+
+/* If the value is an lvalue (memory reference), emit an IR load so the
+ * SValue becomes a plain value suitable for arithmetic/indirect calls. */
+void tcc_ir_load_if_lvalue(TCCIRState *ir, SValue *sv);
 
 void tcc_ir_add_function_parameters(TCCIRState *ir, CType *func_type);
 
