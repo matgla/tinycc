@@ -2932,7 +2932,13 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
           ScratchRegAlloc scratch = {0};
           uint32_t exclude = (1u << op->dest.pr0) | (1u << op->src1.pr0);
           scratch = get_scratch_reg_with_save(exclude);
-          ot_check(th_mov_imm(scratch.reg, imm_low, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+          {
+            SValue imm_sv = {0};
+            imm_sv.r = VT_CONST;
+            imm_sv.type.t = VT_INT;
+            imm_sv.c.i = imm_low;
+            load_vt_const(scratch.reg, PREG_NONE, &imm_sv);
+          }
           ot_check(th_add_reg(op->dest.pr0, op->src1.pr0, scratch.reg, FLAGS_BEHAVIOUR_SET, THUMB_SHIFT_DEFAULT,
                               ENFORCE_ENCODING_NONE));
           restore_scratch_reg(&scratch);
@@ -3009,7 +3015,13 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
           ScratchRegAlloc scratch = {0};
           uint32_t exclude = (1u << op->dest.pr0) | (1u << op->src1.pr0);
           scratch = get_scratch_reg_with_save(exclude);
-          ot_check(th_mov_imm(scratch.reg, imm_low, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+          {
+            SValue imm_sv = {0};
+            imm_sv.r = VT_CONST;
+            imm_sv.type.t = VT_INT;
+            imm_sv.c.i = imm_low;
+            load_vt_const(scratch.reg, PREG_NONE, &imm_sv);
+          }
           ot_check(th_sub_reg(op->dest.pr0, op->src1.pr0, scratch.reg, FLAGS_BEHAVIOUR_SET, THUMB_SHIFT_DEFAULT,
                               ENFORCE_ENCODING_NONE));
           restore_scratch_reg(&scratch);
@@ -3080,7 +3092,13 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
       uint32_t exclude = (1 << op->dest.pr0) | (1 << op->src1.pr0);
       scratch = get_scratch_reg_with_save(exclude);
       rm = scratch.reg;
-      ot_check(th_mov_imm(rm, op->src2.c.i, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+      {
+        SValue imm_sv = {0};
+        imm_sv.r = VT_CONST;
+        imm_sv.type.t = VT_INT;
+        imm_sv.c.i = op->src2.c.i;
+        load_vt_const(rm, PREG_NONE, &imm_sv);
+      }
     }
     ot_check(th_mul(op->dest.pr0, op->src1.pr0, rm, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
     restore_scratch_reg(&scratch);
@@ -3143,6 +3161,117 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
   {
     if (is_64bit)
     {
+      const int src1_is_imm = th_has_immediate_value(op->src1.r) || op->src1.pr0 == PREG_NONE;
+      const int src2_is_imm = th_has_immediate_value(op->src2.r) || op->src2.pr0 == PREG_NONE;
+      const uint64_t src1_imm = (uint64_t)op->src1.c.i;
+      const uint64_t src2_imm = (uint64_t)op->src2.c.i;
+
+      /* Both constants: fold and load. */
+      if (src1_is_imm && src2_is_imm)
+      {
+        SValue folded;
+        memset(&folded, 0, sizeof(folded));
+        folded.r = VT_CONST;
+        folded.type = op->dest.type;
+        folded.c.i = (src1_imm | src2_imm);
+        load_to_dest(&op->dest, &folded);
+        return;
+      }
+
+      /* One constant: prefer immediate encoding, otherwise materialize in scratch. */
+      if (src1_is_imm || src2_is_imm)
+      {
+        const uint64_t imm64 = src1_is_imm ? src1_imm : src2_imm;
+        const uint32_t imm_low = (uint32_t)(imm64 & 0xffffffffu);
+        const uint32_t imm_high = (uint32_t)(imm64 >> 32);
+        const int reg_low = src1_is_imm ? op->src2.pr0 : op->src1.pr0;
+        const int reg_high = src1_is_imm ? op->src2.pr1 : op->src1.pr1;
+
+        /* Low word */
+        thumb_opcode or_low =
+            th_orr_imm(op->dest.pr0, reg_low, imm_low, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE);
+        if (or_low.size == 0)
+        {
+          ScratchRegAlloc scratch = {0};
+          uint32_t exclude = (1u << op->dest.pr0) | (1u << reg_low);
+          if (op->dest.pr1 != PREG_NONE)
+            exclude |= (1u << op->dest.pr1);
+          if (reg_high != PREG_NONE)
+            exclude |= (1u << reg_high);
+          scratch = get_scratch_reg_with_save(exclude);
+          SValue imm_sv;
+          memset(&imm_sv, 0, sizeof(imm_sv));
+          imm_sv.r = VT_CONST;
+          imm_sv.type.t = VT_INT | VT_UNSIGNED;
+          imm_sv.c.i = imm_low;
+          load_to_reg(scratch.reg, PREG_NONE, &imm_sv);
+          ot_check(th_orr_reg(op->dest.pr0, reg_low, scratch.reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                              ENFORCE_ENCODING_NONE));
+          restore_scratch_reg(&scratch);
+        }
+        else
+        {
+          ot_check(or_low);
+        }
+
+        /* High word: treat missing high half as 0. */
+        if (op->dest.pr1 != PREG_NONE)
+        {
+          if (reg_high == PREG_NONE)
+          {
+            if (imm_high == 0)
+            {
+              ot_check(th_mov_imm(op->dest.pr1, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+            }
+            else
+            {
+              SValue imm_hi_sv;
+              memset(&imm_hi_sv, 0, sizeof(imm_hi_sv));
+              imm_hi_sv.r = VT_CONST;
+              imm_hi_sv.type.t = VT_INT | VT_UNSIGNED;
+              imm_hi_sv.c.i = imm_high;
+              load_to_reg(op->dest.pr1, PREG_NONE, &imm_hi_sv);
+            }
+          }
+          else
+          {
+            if (imm_high == 0)
+            {
+              if (op->dest.pr1 != reg_high)
+                ot_check(th_mov_reg(op->dest.pr1, reg_high, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                                    ENFORCE_ENCODING_NONE, false));
+            }
+            else
+            {
+              thumb_opcode or_high =
+                  th_orr_imm(op->dest.pr1, reg_high, imm_high, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE);
+              if (or_high.size == 0)
+              {
+                ScratchRegAlloc scratch = {0};
+                uint32_t exclude = (1u << op->dest.pr1) | (1u << reg_high);
+                exclude |= (1u << op->dest.pr0) | (1u << reg_low);
+                scratch = get_scratch_reg_with_save(exclude);
+                SValue imm_sv;
+                memset(&imm_sv, 0, sizeof(imm_sv));
+                imm_sv.r = VT_CONST;
+                imm_sv.type.t = VT_INT | VT_UNSIGNED;
+                imm_sv.c.i = imm_high;
+                load_to_reg(scratch.reg, PREG_NONE, &imm_sv);
+                ot_check(th_orr_reg(op->dest.pr1, reg_high, scratch.reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                                    THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+                restore_scratch_reg(&scratch);
+              }
+              else
+              {
+                ot_check(or_high);
+              }
+            }
+          }
+        }
+
+        return;
+      }
+
       /* 64-bit OR: OR both halves */
       /* Low word always ORed */
       ot_check(th_orr_reg(op->dest.pr0, op->src1.pr0, op->src2.pr0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
@@ -3184,6 +3313,96 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
   {
     if (is_64bit)
     {
+      const int src1_is_imm = th_has_immediate_value(op->src1.r) || op->src1.pr0 == PREG_NONE;
+      const int src2_is_imm = th_has_immediate_value(op->src2.r) || op->src2.pr0 == PREG_NONE;
+      const uint64_t src1_imm = (uint64_t)op->src1.c.i;
+      const uint64_t src2_imm = (uint64_t)op->src2.c.i;
+
+      /* Both constants: fold and load. */
+      if (src1_is_imm && src2_is_imm)
+      {
+        SValue folded;
+        memset(&folded, 0, sizeof(folded));
+        folded.r = VT_CONST;
+        folded.type = op->dest.type;
+        folded.c.i = (src1_imm & src2_imm);
+        load_to_dest(&op->dest, &folded);
+        return;
+      }
+
+      /* One constant: prefer immediate encoding, otherwise materialize in scratch. */
+      if (src1_is_imm || src2_is_imm)
+      {
+        const uint64_t imm64 = src1_is_imm ? src1_imm : src2_imm;
+        const uint32_t imm_low = (uint32_t)(imm64 & 0xffffffffu);
+        const uint32_t imm_high = (uint32_t)(imm64 >> 32);
+        const int reg_low = src1_is_imm ? op->src2.pr0 : op->src1.pr0;
+        const int reg_high = src1_is_imm ? op->src2.pr1 : op->src1.pr1;
+
+        /* Low word */
+        thumb_opcode and_low =
+            th_and_imm(op->dest.pr0, reg_low, imm_low, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE);
+        if (and_low.size == 0)
+        {
+          ScratchRegAlloc scratch = {0};
+          uint32_t exclude = (1u << op->dest.pr0) | (1u << reg_low);
+          if (op->dest.pr1 != PREG_NONE)
+            exclude |= (1u << op->dest.pr1);
+          if (reg_high != PREG_NONE)
+            exclude |= (1u << reg_high);
+          scratch = get_scratch_reg_with_save(exclude);
+          SValue imm_sv;
+          memset(&imm_sv, 0, sizeof(imm_sv));
+          imm_sv.r = VT_CONST;
+          imm_sv.type.t = VT_INT | VT_UNSIGNED;
+          imm_sv.c.i = imm_low;
+          load_to_reg(scratch.reg, PREG_NONE, &imm_sv);
+          ot_check(th_and_reg(op->dest.pr0, reg_low, scratch.reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                              ENFORCE_ENCODING_NONE));
+          restore_scratch_reg(&scratch);
+        }
+        else
+        {
+          ot_check(and_low);
+        }
+
+        /* High word: treat missing high half as 0. For AND, any 32-bit operand forces high word to 0. */
+        if (op->dest.pr1 != PREG_NONE)
+        {
+          if (reg_high == PREG_NONE || imm_high == 0)
+          {
+            ot_check(th_mov_imm(op->dest.pr1, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+          }
+          else
+          {
+            thumb_opcode and_high =
+                th_and_imm(op->dest.pr1, reg_high, imm_high, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE);
+            if (and_high.size == 0)
+            {
+              ScratchRegAlloc scratch = {0};
+              uint32_t exclude = (1u << op->dest.pr1) | (1u << reg_high);
+              exclude |= (1u << op->dest.pr0) | (1u << reg_low);
+              scratch = get_scratch_reg_with_save(exclude);
+              SValue imm_sv;
+              memset(&imm_sv, 0, sizeof(imm_sv));
+              imm_sv.r = VT_CONST;
+              imm_sv.type.t = VT_INT | VT_UNSIGNED;
+              imm_sv.c.i = imm_high;
+              load_to_reg(scratch.reg, PREG_NONE, &imm_sv);
+              ot_check(th_and_reg(op->dest.pr1, reg_high, scratch.reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                                  THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+              restore_scratch_reg(&scratch);
+            }
+            else
+            {
+              ot_check(and_high);
+            }
+          }
+        }
+
+        return;
+      }
+
       /* 64-bit AND: AND both halves */
       /* Low word always ANDed */
       ot_check(th_and_reg(op->dest.pr0, op->src1.pr0, op->src2.pr0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
@@ -3211,6 +3430,117 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
   {
     if (is_64bit)
     {
+      const int src1_is_imm = th_has_immediate_value(op->src1.r) || op->src1.pr0 == PREG_NONE;
+      const int src2_is_imm = th_has_immediate_value(op->src2.r) || op->src2.pr0 == PREG_NONE;
+      const uint64_t src1_imm = (uint64_t)op->src1.c.i;
+      const uint64_t src2_imm = (uint64_t)op->src2.c.i;
+
+      /* Both constants: fold and load. */
+      if (src1_is_imm && src2_is_imm)
+      {
+        SValue folded;
+        memset(&folded, 0, sizeof(folded));
+        folded.r = VT_CONST;
+        folded.type = op->dest.type;
+        folded.c.i = (src1_imm ^ src2_imm);
+        load_to_dest(&op->dest, &folded);
+        return;
+      }
+
+      /* One constant: prefer immediate encoding, otherwise materialize in scratch. */
+      if (src1_is_imm || src2_is_imm)
+      {
+        const uint64_t imm64 = src1_is_imm ? src1_imm : src2_imm;
+        const uint32_t imm_low = (uint32_t)(imm64 & 0xffffffffu);
+        const uint32_t imm_high = (uint32_t)(imm64 >> 32);
+        const int reg_low = src1_is_imm ? op->src2.pr0 : op->src1.pr0;
+        const int reg_high = src1_is_imm ? op->src2.pr1 : op->src1.pr1;
+
+        /* Low word */
+        thumb_opcode xor_low =
+            th_eor_imm(op->dest.pr0, reg_low, imm_low, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE);
+        if (xor_low.size == 0)
+        {
+          ScratchRegAlloc scratch = {0};
+          uint32_t exclude = (1u << op->dest.pr0) | (1u << reg_low);
+          if (op->dest.pr1 != PREG_NONE)
+            exclude |= (1u << op->dest.pr1);
+          if (reg_high != PREG_NONE)
+            exclude |= (1u << reg_high);
+          scratch = get_scratch_reg_with_save(exclude);
+          SValue imm_sv;
+          memset(&imm_sv, 0, sizeof(imm_sv));
+          imm_sv.r = VT_CONST;
+          imm_sv.type.t = VT_INT | VT_UNSIGNED;
+          imm_sv.c.i = imm_low;
+          load_to_reg(scratch.reg, PREG_NONE, &imm_sv);
+          ot_check(th_eor_reg(op->dest.pr0, reg_low, scratch.reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                              ENFORCE_ENCODING_NONE));
+          restore_scratch_reg(&scratch);
+        }
+        else
+        {
+          ot_check(xor_low);
+        }
+
+        /* High word: treat missing high half as 0. */
+        if (op->dest.pr1 != PREG_NONE)
+        {
+          if (reg_high == PREG_NONE)
+          {
+            if (imm_high == 0)
+            {
+              ot_check(th_mov_imm(op->dest.pr1, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+            }
+            else
+            {
+              SValue imm_hi_sv;
+              memset(&imm_hi_sv, 0, sizeof(imm_hi_sv));
+              imm_hi_sv.r = VT_CONST;
+              imm_hi_sv.type.t = VT_INT | VT_UNSIGNED;
+              imm_hi_sv.c.i = imm_high;
+              load_to_reg(op->dest.pr1, PREG_NONE, &imm_hi_sv);
+            }
+          }
+          else
+          {
+            if (imm_high == 0)
+            {
+              if (op->dest.pr1 != reg_high)
+                ot_check(th_mov_reg(op->dest.pr1, reg_high, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                                    ENFORCE_ENCODING_NONE, false));
+            }
+            else
+            {
+              thumb_opcode xor_high =
+                  th_eor_imm(op->dest.pr1, reg_high, imm_high, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE);
+              if (xor_high.size == 0)
+              {
+                ScratchRegAlloc scratch = {0};
+                uint32_t exclude = (1u << op->dest.pr1) | (1u << reg_high);
+                exclude |= (1u << op->dest.pr0) | (1u << reg_low);
+                scratch = get_scratch_reg_with_save(exclude);
+                SValue imm_sv;
+                memset(&imm_sv, 0, sizeof(imm_sv));
+                imm_sv.r = VT_CONST;
+                imm_sv.type.t = VT_INT | VT_UNSIGNED;
+                imm_sv.c.i = imm_high;
+                load_to_reg(scratch.reg, PREG_NONE, &imm_sv);
+                ot_check(th_eor_reg(op->dest.pr1, reg_high, scratch.reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                                    THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+                restore_scratch_reg(&scratch);
+              }
+              else
+              {
+                ot_check(xor_high);
+              }
+            }
+          }
+        }
+
+        return;
+      }
+
       /* 64-bit XOR: XOR both halves */
       /* Low word always XORed */
       ot_check(th_eor_reg(op->dest.pr0, op->src1.pr0, op->src2.pr0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,

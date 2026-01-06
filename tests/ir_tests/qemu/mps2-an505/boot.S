@@ -124,18 +124,132 @@ Reset_Handler:
 .type HardFault_Handler, %function
 .thumb_func
 HardFault_Handler:
-    bkpt #0
-label:
-    b label
+    /* Determine active stack pointer (MSP vs PSP) and grab stacked PC. */
+    tst lr, #4
+    ite eq
+    mrseq r0, msp
+    mrsne r0, psp
+
+    /* r4 = stacked PC */
+    ldr r4, [r0, #24]
+
+    /* Print "HardFault: PC=0x" */
+    adr r1, hf_pc_prefix
+    movs r0, #4          /* SYS_WRITE0 */
+    bkpt 0xAB
+
+    /* Print r4 as 8 hex digits. */
+    mov r5, r4
+    movs r6, #8
+1:
+    lsrs r7, r5, #28     /* top nibble */
+    cmp r7, #9
+    ble 2f
+    adds r7, r7, #('A' - 10)
+    b 3f
+2:
+    adds r7, r7, #'0'
+3:
+    sub sp, sp, #4
+    strb r7, [sp]
+    mov r1, sp
+    movs r0, #3          /* SYS_WRITEC */
+    bkpt 0xAB
+    add sp, sp, #4
+    lsls r5, r5, #4
+    subs r6, r6, #1
+    bne 1b
+
+    /* Print newline */
+    adr r1, hf_nl
+    movs r0, #4
+    bkpt 0xAB
+
+    /* Dump a few fault status registers as raw hex. */
+    adr r1, hf_cfsr_prefix
+    movs r0, #4
+    bkpt 0xAB
+    movw r2, #0xED28      /* CFSR */
+    movt r2, #0xE000
+    ldr r4, [r2]
+    bl hf_print_u32
+
+    adr r1, hf_hfsr_prefix
+    movs r0, #4
+    bkpt 0xAB
+    movw r2, #0xED2C      /* HFSR */
+    movt r2, #0xE000
+    ldr r4, [r2]
+    bl hf_print_u32
+
+    adr r1, hf_bfar_prefix
+    movs r0, #4
+    bkpt 0xAB
+    movw r2, #0xED38      /* BFAR */
+    movt r2, #0xE000
+    ldr r4, [r2]
+    bl hf_print_u32
+
+    adr r1, hf_mmfar_prefix
+    movs r0, #4
+    bkpt 0xAB
+    movw r2, #0xED34      /* MMFAR */
+    movt r2, #0xE000
+    ldr r4, [r2]
+    bl hf_print_u32
+
+    /* Exit QEMU via semihosting so tests fail fast. */
+    movs r0, #0x18        /* SYS_EXIT */
+    movs r1, #0
+    bkpt 0xAB
+    b .
+
+/* Prints r4 as 0xXXXXXXXX\n via semihosting. Clobbers r0-r7. */
+.thumb_func
+hf_print_u32:
+    /* Print "0x" */
+    adr r1, hf_0x
+    movs r0, #4
+    bkpt 0xAB
+    mov r5, r4
+    movs r6, #8
+4:
+    lsrs r7, r5, #28
+    cmp r7, #9
+    ble 5f
+    adds r7, r7, #('A' - 10)
+    b 6f
+5:
+    adds r7, r7, #'0'
+6:
+    sub sp, sp, #4
+    strb r7, [sp]
+    mov r1, sp
+    movs r0, #3
+    bkpt 0xAB
+    add sp, sp, #4
+    lsls r5, r5, #4
+    subs r6, r6, #1
+    bne 4b
+    adr r1, hf_nl
+    movs r0, #4
+    bkpt 0xAB
+    bx lr
+
+.align 2
+hf_pc_prefix:     .asciz "HardFault: PC=0x"
+hf_cfsr_prefix:   .asciz "CFSR="
+hf_hfsr_prefix:   .asciz "HFSR="
+hf_bfar_prefix:   .asciz "BFAR="
+hf_mmfar_prefix:  .asciz "MMFAR="
+hf_0x:            .asciz "0x"
+hf_nl:            .asciz "\n"
 
 /* Default handler for all other interrupts */
 .macro def_irq_handler handler_name
-.weak \handler_name
-.type \handler_name, %function
 .thumb_func
 \handler_name:
     b \handler_name
-.size \handler_name, . - \handler_name
 .endm
 
 /* Core Exception Handlers */
