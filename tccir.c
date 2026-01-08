@@ -2074,17 +2074,12 @@ void tcc_ir_materialize_value(TCCIRState *ir, SValue *sv, TCCMaterializedValue *
   if (!ir || !sv)
     return;
 
-  fprintf(stderr, "[MAT_VALUE] vr=%d pr0=0x%x r=0x%x c.i=%ld type=0x%x\n", sv->vr, sv->pr0, sv->r, (long)sv->c.i,
-          sv->type.t);
-
   if (!(sv->pr0 & PREG_SPILLED))
   {
-    fprintf(stderr, "[MAT_VALUE] -> not spilled, returning\n");
     return;
   }
   if (!tcc_is_vreg_valid(ir, sv->vr))
   {
-    fprintf(stderr, "[MAT_VALUE] -> vreg invalid, returning\n");
     return;
   }
 
@@ -2112,20 +2107,22 @@ void tcc_ir_materialize_value(TCCIRState *ir, SValue *sv, TCCMaterializedValue *
   if (scratch.reg_count == 0)
     tcc_error("compiler_error: unable to allocate scratch register for spill load");
 
-  fprintf(stderr, "[MAT_VALUE] acquired scratch reg[0]=%d, frame_offset=%d is_64bit=%d\n", scratch.regs[0],
-          frame_offset, is_64bit);
-
   tcc_machine_load_spill_slot(scratch.regs[0], frame_offset);
   if (is_64bit)
   {
     if (scratch.reg_count < 2)
       tcc_error("compiler_error: missing register pair for 64-bit spill load");
-    fprintf(stderr, "[MAT_VALUE] acquired scratch reg[1]=%d\n", scratch.regs[1]);
     tcc_machine_load_spill_slot(scratch.regs[1], frame_offset + 4);
   }
 
   int preserved_flags = sv->r & ~VT_VALMASK;
-  preserved_flags &= ~VT_LVAL;
+  /* Preserve VT_LVAL for spilled operands.
+   *
+   * The spill slot stores the vreg's VALUE. For uses that require
+   * dereference (e.g. FUNCPARAMVAL with ***DEREF***), VT_LVAL is carried on
+   * the use-site operand, not on the defining vreg; if we clear VT_LVAL here,
+   * we silently turn a required load-through-pointer into a raw pointer value.
+   */
 
   sv->pr0 = scratch.regs[0];
   sv->pr1 = is_64bit ? scratch.regs[1] : PREG_NONE;

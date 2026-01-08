@@ -523,14 +523,13 @@ int load_ushort_from_base(int ir, int base, int fc, int sign);
 int load_byte_from_base(int ir, int base, int fc, int sign);
 int load_ubyte_from_base(int ir, int base, int fc, int sign);
 
-/* Preload spilled operands into scratch registers before an operation.
- * Returns SpillContext with information for store-back.
- * Parameters:
- *   q: The IR quad instruction
- *   preload_src1: Whether to preload src1 if spilled
- *   preload_src2: Whether to preload src2 if spilled
- *   setup_dest: Whether to set up dest register if spilled
+/* Legacy spill preload/storeback path.
+ *
+ * IR-side materialization in tcc_ir_generate_code() now ensures that VALUE operands
+ * are registers/immediates and ADDRESS operands are explicit, so the backend no
+ * longer needs to guess spill semantics.
  */
+#if 0
 SpillContext tcc_ir_preload_spills(TACQuadruple *q, int preload_src1, int preload_src2, int setup_dest)
 {
   SpillContext ctx = {0};
@@ -1112,40 +1111,12 @@ SpillContext tcc_ir_preload_spills(TACQuadruple *q, int preload_src1, int preloa
   return ctx;
 }
 
+#endif
+
 /* Restore any scratch registers that were saved during preload */
 void tcc_ir_restore_saved_scratch_regs(SpillContext *ctx)
 {
-  /* Restore in reverse order of saving (LIFO) */
-  if (ctx->dest_reg_saved1 && ctx->dest_scratch_reg1 >= 0)
-  {
-    ot_check(th_pop(1 << ctx->dest_scratch_reg1));
-    ctx->dest_reg_saved1 = 0;
-  }
-  if (ctx->dest_reg_saved && ctx->dest_scratch_reg >= 0)
-  {
-    ot_check(th_pop(1 << ctx->dest_scratch_reg));
-    ctx->dest_reg_saved = 0;
-  }
-  if (ctx->src2_reg_saved1 && ctx->src2_scratch_reg1 >= 0)
-  {
-    ot_check(th_pop(1 << ctx->src2_scratch_reg1));
-    ctx->src2_reg_saved1 = 0;
-  }
-  if (ctx->src2_reg_saved && ctx->src2_scratch_reg >= 0)
-  {
-    ot_check(th_pop(1 << ctx->src2_scratch_reg));
-    ctx->src2_reg_saved = 0;
-  }
-  if (ctx->src1_reg_saved1 && ctx->src1_scratch_reg1 >= 0)
-  {
-    ot_check(th_pop(1 << ctx->src1_scratch_reg1));
-    ctx->src1_reg_saved1 = 0;
-  }
-  if (ctx->src1_reg_saved && ctx->src1_scratch_reg >= 0)
-  {
-    ot_check(th_pop(1 << ctx->src1_scratch_reg));
-    ctx->src1_reg_saved = 0;
-  }
+  (void)ctx;
 }
 
 /* Spill cache management functions for avoiding redundant loads */
@@ -1218,74 +1189,8 @@ void tcc_ir_spill_cache_invalidate_offset(SpillCache *cache, int offset)
 /* Store back a spilled destination after operation completes */
 void tcc_ir_storeback_spill(TACQuadruple *q, SpillContext *ctx)
 {
-  if (ctx->dest_spilled && !tcc_ir_is_64bit(q->dest.type.t))
-  {
-    q->dest.pr0 = ctx->orig_dest_pr0;
-    q->dest.r = VT_LOCAL;
-    q->dest.c.i = ctx->dest_offset;
-
-    /* Use the scratch register that was assigned during preload and contains the result */
-    int scratch = ctx->dest_scratch_reg;
-    if (scratch == PREG_NONE)
-    {
-      /* Fallback: should not happen if preload was called correctly */
-      TCCIRState *ir = tcc_state->ir;
-      uint32_t exclude_regs = 0;
-      scratch = (ir) ? tcc_ls_find_free_scratch_reg(&ir->ls, ir->codegen_instruction_idx, exclude_regs, ir->leaffunc)
-                     : PREG_NONE;
-      if (scratch == PREG_NONE)
-      {
-        /* Emergency fallback - save R_IP, use it, restore it */
-        scratch = R_IP;
-        ot_check(th_push(1 << scratch));
-        store(scratch, &q->dest);
-        ot_check(th_pop(1 << scratch));
-        return;
-      }
-    }
-
-    store(scratch, &q->dest);
-
-    /* DISABLED: Don't record in spill cache - causes issues with arrays/pointers */
-#if 0
-    /* Record in spill cache that this register now holds this stack slot value
-     * BUT only for true spills (PREG_SPILLED), not for local variables */
-    TCCIRState *ir = tcc_state->ir;
-    if (ir && (ctx->orig_dest_pr0 & PREG_SPILLED))
-    {
-      tcc_ir_spill_cache_record(&ir->spill_cache, scratch, ctx->dest_offset);
-    }
-#endif
-  }
-
-  if (ctx->dest_spilled && tcc_ir_is_64bit(q->dest.type.t))
-  {
-    q->dest.pr0 = ctx->orig_dest_pr0;
-    q->dest.pr1 = ctx->orig_dest_pr1;
-    q->dest.r = VT_LOCAL;
-    q->dest.c.i = ctx->dest_offset;
-
-    int scratch_lo = ctx->dest_scratch_reg;
-    int scratch_hi = ctx->dest_scratch_reg1;
-    if (scratch_lo == PREG_NONE || scratch_hi == PREG_NONE)
-    {
-      /* Fallback: should not happen if preload was called correctly */
-      tcc_error("compiler_error: missing scratch regs for 64-bit storeback");
-    }
-    else
-    {
-      SValue dest_low = q->dest;
-      SValue dest_high = q->dest;
-      dest_low.type.t = (dest_low.type.t & ~VT_BTYPE) | (VT_INT | (dest_low.type.t & VT_UNSIGNED));
-      dest_high.type.t = dest_low.type.t;
-      dest_high.c.i += 4;
-      store(scratch_lo, &dest_low);
-      store(scratch_hi, &dest_high);
-    }
-  }
-
-  /* Restore any saved scratch registers after the store is done */
-  tcc_ir_restore_saved_scratch_regs(ctx);
+  (void)q;
+  (void)ctx;
 }
 
 ST_FUNC void gen_fill_nops(int bytes)
@@ -2301,111 +2206,19 @@ void store(int r, SValue *sv)
     uint32_t base = R_FP;
     if (v < VT_CONST)
     {
-      /* Check if pr0 is valid (not PREG_NONE and not spilled) */
-      if (sv->pr0 != PREG_NONE && !(sv->pr0 & PREG_SPILLED))
-      {
-        base = sv->pr0;
-        v = VT_LOCAL; /* Set v to VT_LOCAL so the store is emitted below */
-      }
-      else
-      {
-        /* pr0 is spilled or invalid.
-         *
-         * There are two cases:
-         * 1) Spilled pointer value (TEMP/PARAM): the spill slot holds an address.
-         *    We must load that address and store through it.
-         * 2) Concrete stack storage (VAR/local): sv->c.i is the stack offset of the object.
-         *    We must store directly to [FP+offset] (no extra indirection).
-         *
-         * Misclassifying case (2) as (1) produces code like:
-         *   ldr rA, [fp, #-off]; str rX, [rA]
-         * which treats the object contents as a pointer (often uninitialized), corrupting
-         * computations like 64-bit mul expansions.
-         */
-        int is_spilled_ptr = 0;
-        if (sv->pr0 != PREG_NONE && (sv->pr0 & PREG_SPILLED) && (fr & VT_LVAL) &&
-            tcc_is_vreg_valid(tcc_state->ir, sv->vr))
-        {
-          int vreg_type = TCCIR_DECODE_VREG_TYPE(sv->vr);
-          is_spilled_ptr = (vreg_type == TCCIR_VREG_TYPE_TEMP || vreg_type == TCCIR_VREG_TYPE_PARAM);
-        }
-
-        if (is_spilled_ptr)
-        {
-          int addr_offset = sv->c.i;
-          int addr_sign = (addr_offset < 0);
-          if (addr_sign)
-            addr_offset = -addr_offset;
-
-          /* Load the address into a free scratch register.
-           * Exclude the source register 'r' to avoid overwriting the value we want to store. */
-          uint32_t exclude_regs = (1u << r);
-          ScratchRegAlloc base_alloc = get_scratch_reg_with_save(exclude_regs);
-          int base_reg = base_alloc.reg;
-
-          if (!load_word_from_base(base_reg, R_FP, addr_offset, addr_sign))
-          {
-            ScratchRegAlloc rr_alloc = th_offset_to_reg(addr_offset, addr_sign);
-            int rr = rr_alloc.reg;
-            ot_check(th_ldr_reg(base_reg, R_FP, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-            restore_scratch_reg(&rr_alloc);
-          }
-          base = base_reg;
-          v = VT_LOCAL;
-          fc = sign = 0;
-          restore_scratch_reg(&base_alloc);
-        }
-        else
-        {
-          /* Treat as concrete stack storage at [FP + sv->c.i]. */
-          base = R_FP;
-          v = VT_LOCAL;
-          /* Keep fc/sign as computed from sv->c.i above. */
-        }
-      }
-    }
-    else if (v == VT_LOCAL && sv->pr0 != PREG_NONE && (sv->pr0 & PREG_SPILLED) && (fr & VT_LVAL) &&
-             tcc_is_vreg_valid(tcc_state->ir, sv->vr))
-    {
-      /* Spilled pointer - the address we want to store to is in the spill slot.
-       * Load the address from stack, then store through it with offset 0.
+      /* Lvalue address in register:
+       * - For IR-generated code, materialization may put the address in sv->pr0.
+       * - For legacy/non-IR paths, the address register is often encoded directly
+       *   in sv->r (v) with sv->pr0 left as PREG_NONE.
        *
-       * IMPORTANT: Only treat TEMP/PARAM vregs this way.
-       * Regular locals (VAR vregs) spilled to stack represent concrete storage
-       * and must be stored to directly at [FP+off], not indirectly via their
-       * current contents. Misclassifying locals here leads to stores like
-       *   ldr r0, [fp, #-4]; str rX, [r0]
-       * which breaks simple loops (e.g. 118_switch.c never increments i).
-       */
-      int vreg_type = TCCIR_DECODE_VREG_TYPE(sv->vr);
-      if (vreg_type != TCCIR_VREG_TYPE_TEMP && vreg_type != TCCIR_VREG_TYPE_PARAM)
-      {
-        /* Not a spilled pointer value; fall through to direct stack store. */
-      }
+       * Accept both; this is not spill-slot guessing, just choosing the base reg. */
+      if (sv->pr0 != PREG_NONE && sv->pr0 < PREG_SPILLED)
+        base = sv->pr0;
       else
-      {
-        int addr_offset = sv->c.i;
-        int addr_sign = (addr_offset < 0);
-        if (addr_sign)
-          addr_offset = -addr_offset;
-        /* Load the address into a free scratch register.
-         * Exclude the source register 'r' to avoid overwriting the value we want to store. */
-        uint32_t exclude_regs = (1 << r);
-        ScratchRegAlloc base_alloc = get_scratch_reg_with_save(exclude_regs);
-        int base_reg = base_alloc.reg;
-
-        if (!load_word_from_base(base_reg, R_FP, addr_offset, addr_sign))
-        {
-          ScratchRegAlloc rr_alloc = th_offset_to_reg(addr_offset, addr_sign);
-          int rr = rr_alloc.reg;
-          ot_check(th_ldr_reg(base_reg, R_FP, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-          restore_scratch_reg(&rr_alloc);
-        }
-        base = base_reg;
-        /* Store to [base + 0] since the address already includes any offset */
-        fc = sign = 0;
-        restore_scratch_reg(&base_alloc);
-      }
+        base = v;
+      v = VT_LOCAL;
+      fc = 0;
+      sign = 0;
     }
     else if (v == VT_CONST)
     {
@@ -3157,12 +2970,6 @@ void load_to_dest(SValue *dest, SValue *sv)
   fc = sv->c.i;
   int btype = ft & VT_BTYPE;
 
-  fprintf(stderr,
-          "[LOAD_TO_DEST] dest.pr0=%d dest.pr1=%d sv.vr=%d sv.r=0x%x sv.pr0=0x%x sv.c.i=%ld VT_LVAL=%d VT_PARAM=%d "
-          "VT_LOCAL=%d\n",
-          dest->pr0, dest->pr1, sv->vr, sv->r, sv->pr0, (long)sv->c.i, (sv->r & VT_LVAL) ? 1 : 0,
-          (sv->r & VT_PARAM) ? 1 : 0, (sv->r & VT_VALMASK) == VT_LOCAL ? 1 : 0);
-
   /* If we're about to write into the register currently used to cache a global
    * symbol base address, invalidate the cache first. Otherwise the cache can
    * become stale (same register, different contents) and later loads may
@@ -3238,6 +3045,15 @@ void load_to_dest(SValue *dest, SValue *sv)
 
     // load value from stack
     // prepare for new load after pointer dereference
+    // Also handle spilled pointers that need double-dereference:
+    // When v == VT_LOCAL, VT_LVAL is set, and pr0 == PREG_SPILLED, this is a
+    // spilled temporary holding an address that needs dereferencing. Treat it
+    // like VT_LLOCAL: first load the pointer from the spill slot, then deref.
+    if (v == VT_LOCAL && sv->pr0 == PREG_SPILLED)
+    {
+      /* Spilled pointer with dereference needed - treat like VT_LLOCAL */
+      v = VT_LLOCAL;
+    }
     if (v == VT_LLOCAL)
     {
       v1.type.t = VT_PTR;
@@ -3279,61 +3095,48 @@ void load_to_dest(SValue *dest, SValue *sv)
     }
     else if (v < VT_CONST)
     {
-      /* For spilled lvalues, we need two-level indirection:
-       * 1. Load the pointer from spill location [FP + spill_offset]
-       * 2. Dereference that pointer to get the final value
-       * For non-spilled, the pointer is already in a register (pr0). */
-      if (sv->pr0 != PREG_NONE && (sv->pr0 & PREG_SPILLED))
+      /* Address-in-register lvalue. Prefer sv->pr0 when it carries a real register
+       * number, otherwise fall back to the legacy encoding in sv->r (v). */
+      if (sv->pr0 != PREG_NONE && sv->pr0 < PREG_SPILLED)
       {
-        SValue v1;
-        memset(&v1, 0, sizeof(SValue));
-        v1.type.t = VT_PTR;
-        v1.r = VT_LOCAL | VT_LVAL;
-        v1.c.i = sv->c.i;
-        v1.pr0 = PREG_NONE; /* Mark as not having a preloaded register */
-
-        TRACE("load_to_dest: loading spilled lvalue address from [FP%+lld]", (long long)fc);
-        ScratchRegAlloc base_alloc = get_scratch_reg_with_save(0);
-        base = base_alloc.reg;
-        load(base, &v1); /* Load pointer into free scratch register first */
-        restore_scratch_reg(&base_alloc);
-        fc = sign = 0; /* Dereference with offset 0 from loaded pointer */
+        base = sv->pr0;
+        fc = 0;
+        sign = 0;
         v = VT_LOCAL;
+      }
+      else if (sv->pr0 != PREG_NONE && (sv->pr0 & PREG_SPILLED))
+      {
+        /* The address is spilled to the stack. Load it first to a scratch register,
+         * then use that as the base for dereferencing. The spill offset is in sv->c.i.
+         * We do the complete load inline here because we need the scratch register
+         * to remain valid until after the dereference. */
+        ScratchRegAlloc base_alloc =
+            get_scratch_reg_with_save((1u << dest->pr0) | (dest->pr1 != PREG_NONE ? (1u << dest->pr1) : 0));
+        int addr_reg = base_alloc.reg;
+        int spill_offset = sv->c.i;
+        int spill_sign = (spill_offset < 0);
+        int spill_abs = spill_sign ? -spill_offset : spill_offset;
+        if (!load_word_from_base(addr_reg, R_FP, spill_abs, spill_sign))
+        {
+          ScratchRegAlloc rr_alloc =
+              th_offset_to_reg_ex(spill_abs, spill_sign, (1u << addr_reg) | (1u << R_FP) | (1u << dest->pr0));
+          int rr = rr_alloc.reg;
+          ot_check(th_ldr_reg(addr_reg, R_FP, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+          restore_scratch_reg(&rr_alloc);
+        }
+        /* Now addr_reg contains the address to dereference. Do the final load. */
+        load_vt_lval_vt_local(dest->pr0, dest->pr1, sv, ft, 0, 0, addr_reg);
+        /* Now we can restore the scratch register */
+        restore_scratch_reg(&base_alloc);
+        return;
       }
       else
       {
-        base = sv->pr0;
-        fc = sign = 0;
+        base = v;
+        fc = 0;
+        sign = 0;
         v = VT_LOCAL;
       }
-    }
-    else if (v == VT_LOCAL && sv->pr0 != PREG_NONE && (sv->pr0 & PREG_SPILLED))
-    {
-      /* Spilled lvalue case: The pointer is spilled to stack at sv->c.i.
-       * We need two-level indirection:
-       * 1. Load the pointer from [FP + sv->c.i]
-       * 2. Dereference that pointer to get the final value
-       */
-      SValue v1;
-      memset(&v1, 0, sizeof(SValue));
-      v1.type.t = VT_PTR;
-      v1.r = VT_LOCAL | VT_LVAL;
-      v1.c.i = sv->c.i;
-      v1.pr0 = PREG_NONE; /* Mark as not having a preloaded register */
-
-      ScratchRegAlloc base_alloc = get_scratch_reg_with_save(0);
-      base = base_alloc.reg;
-      load(base, &v1); /* Load pointer into scratch register */
-      restore_scratch_reg(&base_alloc);
-      fc = sign = 0; /* Dereference with offset 0 from loaded pointer */
-      /* v remains VT_LOCAL so we fall through to load_vt_lval_vt_local */
-    }
-    else if (v == VT_LOCAL && sv->pr0 != PREG_NONE && !(sv->pr0 & PREG_SPILLED))
-    {
-      /* Preloaded pointer case: pr0 contains the address to load from.
-       * This happens when tcc_ir_preload_spills loaded a spilled pointer. */
-      base = sv->pr0;
-      fc = sign = 0;
     }
 
     if (v == VT_LOCAL)
@@ -3351,54 +3154,7 @@ void load_to_dest(SValue *dest, SValue *sv)
     return load_vt_const(dest->pr0, dest->pr1, sv);
   else if (v == VT_LOCAL)
   {
-    /* Check if this is a spilled value that needs loading vs address-of computation.
-     * - Spilled value load: pr0 has PREG_SPILLED bit, VT_LVAL was stripped during preload
-     *   -> we need to load the VALUE from stack
-     * - Address-of spilled vreg: pr0 has PREG_SPILLED bit, never had VT_LVAL
-     *   -> we need to compute the ADDRESS (FP + offset)
-     * - Address-of non-spilled: pr0 == PREG_NONE
-     *   -> compute address
-     *
-     * Since we can't distinguish based on VT_LVAL (both cases have no VT_LVAL at this point),
-     * we check if this is coming from a preloaded path vs direct.
-     * If pr0 has PREG_SPILLED and c.i != 0, AND we don't have a valid vr, then load value.
-     * If pr0 has PREG_SPILLED but we have a valid vr (address-of vreg), compute address.
-     */
-    if (sv->pr0 != PREG_NONE && (sv->pr0 & PREG_SPILLED))
-    {
-      /* VT_LOCAL without VT_LVAL is ambiguous in this backend:
-       * - real locals/vars: treat as address-of (compute FP + offset)
-       * - spilled values (TMPs, often also spilled PARAMs): treat as value-in-slot (LDR)
-       *
-       * Using the address for spilled TMPs breaks arithmetic, e.g. in ir_tests/20_op_add
-       * simple5() would compute x * (&y_slot) instead of x * y.
-       */
-
-      int vreg_type = (sv->vr == -1) ? 0 : TCCIR_DECODE_VREG_TYPE(sv->vr);
-      /* NOTE: `vr == 0` is used by this IR backend for some real stack locals.
-       * Treating it as an invalid vreg here causes us to LDR the slot value when the
-       * caller actually needs the slot *address* (e.g. for storing back a local loop
-       * counter), which can lead to stores to address `i` instead of [FP+off]. */
-      const int is_spilled_value =
-          (sv->vr == -1 || vreg_type == TCCIR_VREG_TYPE_TEMP || vreg_type == TCCIR_VREG_TYPE_PARAM);
-      if (is_spilled_value)
-      {
-        int src_offset = sv->c.i;
-        int src_sign = (src_offset < 0);
-        int src_abs = src_sign ? -src_offset : src_offset;
-        if (!load_word_from_base(dest->pr0, R_FP, src_abs, src_sign))
-        {
-          ScratchRegAlloc rr_alloc = th_offset_to_reg(src_abs, src_sign);
-          int rr = rr_alloc.reg;
-          ot_check(th_ldr_reg(dest->pr0, R_FP, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-          restore_scratch_reg(&rr_alloc);
-        }
-        return;
-      }
-      /* Otherwise: address-of local storage; fall through to compute address. */
-    }
-    /* Either pr0 == PREG_NONE (address computation) or address-of with PREG_SPILLED.
-     * Compute address using load_vt_local. */
+    /* Address-of stack slot/local. Spills are materialized in IR codegen. */
     int base = R_FP;
     if (tcc_state->need_frame_pointer == 0)
     {
@@ -3414,26 +3170,6 @@ void load_to_dest(SValue *dest, SValue *sv)
   {
     /* For IR-generated code, use pr0 as the source register */
     int src_reg = (sv->pr0 != PREG_NONE && !(sv->pr0 & PREG_SPILLED)) ? sv->pr0 : v;
-
-    /* Check if spilled - load from stack instead of register move.
-     * Note: pr0 might have been overwritten with destination register by caller,
-     * so also check if c.i is non-zero (stack offset) as a backup indicator. */
-    if (((sv->pr0 != PREG_NONE) && (sv->pr0 & PREG_SPILLED)) ||
-        (v < VT_CONST && sv->c.i != 0 && (sv->r & VT_LVAL) == 0))
-    {
-      /* Value is spilled to stack at sv->c.i offset from FP */
-      int src_offset = sv->c.i;
-      int src_sign = (src_offset < 0);
-      int src_abs = src_sign ? -src_offset : src_offset;
-      if (!load_word_from_base(dest->pr0, R_FP, src_abs, src_sign))
-      {
-        ScratchRegAlloc rr_alloc = th_offset_to_reg(src_abs, src_sign);
-        int rr = rr_alloc.reg;
-        ot_check(th_ldr_reg(dest->pr0, R_FP, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-        restore_scratch_reg(&rr_alloc);
-      }
-      return;
-    }
 
     if (is_float(ft))
     {
@@ -7342,19 +7078,31 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
       continue;
     }
 
-    is_64bit = is_64bit_type(arg->src1.type.t);
+    /* Some IR/value paths can represent a scalar argument as an address-of
+     * stack slot (VT_LOCAL without VT_LVAL) even though the argument type is
+     * not a pointer. In that case we must dereference it when materializing
+     * the outgoing argument value; otherwise variadic calls (e.g. printf)
+     * end up receiving stack addresses as integers. */
+    SValue arg_val = arg->src1;
+    const int arg_btype = arg_val.type.t & VT_BTYPE;
+    const int is_stack_addr = ((arg_val.r & VT_VALMASK) == VT_LOCAL) && !(arg_val.r & VT_LVAL);
+    const int needs_deref_for_value = is_stack_addr && arg_btype != VT_PTR && arg_btype != VT_FUNC;
+    if (needs_deref_for_value)
+      arg_val.r |= VT_LVAL;
+
+    is_64bit = is_64bit_type(arg_val.type.t);
     if (is_64bit)
     {
       /* 64-bit stack arguments must be 8-byte aligned */
       stack_offset = TCC_ALIGN(stack_offset, 8);
 
-      int reg_lo = arg->src1.pr0;
-      int reg_hi = arg->src1.pr1;
+      int reg_lo = arg_val.pr0;
+      int reg_hi = arg_val.pr1;
       ScratchRegAlloc scratch_lo_alloc = {0};
       ScratchRegAlloc scratch_hi_alloc = {0};
 
       /* Load low and high parts into scratch registers if needed */
-      if (reg_lo == PREG_NONE || (reg_lo & PREG_SPILLED) || (arg->src1.r & VT_LVAL))
+      if (reg_lo == PREG_NONE || (reg_lo & PREG_SPILLED) || (arg_val.r & VT_LVAL))
       {
         /* Need to load the 64-bit value to registers first */
         /* Do not clobber argument registers (R0-R3): they may hold other args
@@ -7365,7 +7113,7 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
         reg_lo = scratch_lo_alloc.reg;
         scratch_hi_alloc = get_scratch_reg_with_save(stack_exclude | (1u << reg_lo));
         reg_hi = scratch_hi_alloc.reg;
-        load_to_reg(reg_lo, reg_hi, &arg->src1);
+        load_to_reg(reg_lo, reg_hi, &arg_val);
       }
 
       /* Store low word first, then high word */
@@ -7379,15 +7127,15 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
     }
     else
     {
-      int reg = arg->src1.pr0;
+      int reg = arg_val.pr0;
       ScratchRegAlloc scratch_alloc = {0};
-      if (reg == PREG_NONE || (reg & PREG_SPILLED) || (arg->src1.r & VT_LVAL))
+      if (needs_deref_for_value || reg == PREG_NONE || (reg & PREG_SPILLED) || (arg_val.r & VT_LVAL))
       {
         /* Avoid clobbering R0-R3 for the same reason as above. */
         const uint32_t stack_exclude = (1u << R_SP) | (1u << R7) | (1u << R0) | (1u << R1) | (1u << R2) | (1u << R3);
         scratch_alloc = get_scratch_reg_with_save(stack_exclude);
         reg = scratch_alloc.reg;
-        load_to_reg(reg, PREG_NONE, &arg->src1);
+        load_to_reg(reg, PREG_NONE, &arg_val);
       }
       ot_check(th_str_imm(reg, R_SP, stack_offset, 6, ENFORCE_ENCODING_NONE));
       stack_offset += 4;
