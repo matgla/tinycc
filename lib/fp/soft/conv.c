@@ -100,6 +100,83 @@ unsigned int __aeabi_f2uiz(float a)
   }
 }
 
+/* Convert single-precision float to unsigned 64-bit integer (truncate toward zero) */
+unsigned long long __aeabi_f2ulz(float a)
+{
+  union
+  {
+    float f;
+    uint32_t u;
+  } ua = {.f = a};
+  uint32_t bits = ua.u;
+
+  int sign = float_sign(bits);
+  int exp = float_exp(bits);
+  uint32_t mant = float_mant(bits);
+
+  if (sign)
+    return 0;
+  if (exp == 0xFF)
+    return 0; /* NaN/Inf */
+  if (exp == 0)
+    return 0; /* Zero/denormal */
+
+  mant |= FLOAT_IMPLICIT_BIT;
+  int actual_exp = exp - FLOAT_EXP_BIAS;
+  if (actual_exp < 0)
+    return 0;
+  if (actual_exp >= 64)
+    return ~0ULL;
+
+  int shift = actual_exp - 23;
+  if (shift >= 0)
+  {
+    if (shift >= 64)
+      return ~0ULL;
+    return (unsigned long long)mant << shift;
+  }
+  else
+  {
+    return (unsigned long long)mant >> (-shift);
+  }
+}
+
+/* Convert single-precision float to signed 64-bit integer (truncate toward zero) */
+long long __aeabi_f2lz(float a)
+{
+  union
+  {
+    float f;
+    uint32_t u;
+  } ua = {.f = a};
+  uint32_t bits = ua.u;
+
+  int sign = float_sign(bits);
+  int exp = float_exp(bits);
+  uint32_t mant = float_mant(bits);
+
+  if (exp == 0xFF)
+    return 0; /* NaN/Inf */
+  if (exp == 0)
+    return 0; /* Zero/denormal */
+
+  mant |= FLOAT_IMPLICIT_BIT;
+  int actual_exp = exp - FLOAT_EXP_BIAS;
+  if (actual_exp < 0)
+    return 0;
+  if (actual_exp >= 63)
+    return sign ? (long long)0x8000000000000000ULL : (long long)0x7FFFFFFFFFFFFFFFULL;
+
+  int shift = actual_exp - 23;
+  unsigned long long magnitude;
+  if (shift >= 0)
+    magnitude = (unsigned long long)mant << shift;
+  else
+    magnitude = (unsigned long long)mant >> (-shift);
+
+  return sign ? -(long long)magnitude : (long long)magnitude;
+}
+
 /* Convert signed 32-bit integer to single-precision float */
 float __aeabi_i2f(int a)
 {

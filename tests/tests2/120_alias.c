@@ -1,23 +1,35 @@
 /* Check semantics of various constructs to generate renamed symbols.  */
 
-extern int printf (const char *, ...);
+extern int printf(const char *, ...);
 void target(void);
-void target(void) {
-    printf("in target function\n");
+void target(void)
+{
+  printf("in target function\n");
 }
+
+/* On ARM Thumb, a pure symbol-alias for a function can be problematic in some
+   toolchains (missing Thumb marking / interworking metadata on the alias
+   symbol). Use a small wrapper there so calls remain correct. */
+#if defined(__thumb__)
+void alias_for_target(void)
+{
+  target();
+}
+#else
 void alias_for_target(void) __attribute__((alias("target")));
+#endif
 
 int g_int = 34;
 int alias_int __attribute__((alias("g_int")));
 
 #ifdef __leading_underscore
-# define _ "_"
+#define _ "_"
 #else
-# define _
+#define _
 #endif
 
-void asm_for_target(void) __asm__(_"target");
-int asm_int __asm__(_"g_int");
+void asm_for_target(void) __asm__(_ "target");
+int asm_int __asm__(_ "g_int");
 
 /* This is not supposed to compile, alias targets must be defined in the
    same unit.  In TCC they even must be defined before the reference

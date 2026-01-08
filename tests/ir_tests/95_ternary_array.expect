@@ -1,0 +1,5 @@
+arr1 sum: 10 (expected 10)
+arr2 sum: 100 (expected 100)
+m1 sum: 33 (expected 33)
+m2 sum: 330 (expected 330)
+PASS

@@ -191,7 +191,9 @@ extern long double strtold(const char *__nptr, char **__endptr);
 #endif
 
 #ifdef CONFIG_TCC_PIE
-#define CONFIG_TCC_PIC 1
+#ifndef CONFIG_TCC_PIC
+#define CONFIG_TCC_PIC 0
+#endif
 #endif
 
 /* support using libtcc from threads */
@@ -1755,6 +1757,7 @@ extern ArchitectureConfig architecture_config;
 PUB_FUNC const char *default_elfinterp(struct TCCState *s);
 #endif
 ST_FUNC void arm_init(struct TCCState *s);
+ST_FUNC void arm_deinit(struct TCCState *s);
 ST_FUNC void gen_increment_tcov(SValue *sv);
 #endif
 
@@ -1890,6 +1893,20 @@ typedef struct TACQuadruple
   int line_num; /* source line number for debug info */
 } TACQuadruple;
 
+/*
+ * Target-independent helpers that IR-side load/spill materialization will invoke
+ * before delegating to any backend machine op. Backend implementations live in
+ * their respective *-gen.c files and follow the contract documented in
+ * docs/IR_MACHINE_CONTRACT.md.
+ */
+
+ST_FUNC void tcc_machine_acquire_scratch(TCCMachineScratchRegs *scratch, unsigned flags);
+ST_FUNC void tcc_machine_release_scratch(const TCCMachineScratchRegs *scratch);
+
+ST_FUNC void tcc_machine_load_spill_slot(int dest_reg, int frame_offset);
+ST_FUNC void tcc_machine_store_spill_slot(int src_reg, int frame_offset);
+ST_FUNC void tcc_machine_addr_of_stack_slot(int dest_reg, int frame_offset);
+
 ST_FUNC void tcc_gen_machine_data_processing_op(TACQuadruple *q);
 ST_FUNC void tcc_gen_machine_fp_op(TACQuadruple *q);
 ST_FUNC void tcc_gen_machine_load_op(TACQuadruple *q);
@@ -1899,11 +1916,11 @@ ST_FUNC void tcc_gen_machine_store_register(SValue *value);
 ST_FUNC void tcc_gen_machine_store_to_stack(int reg, int offset);
 
 ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *q);
+ST_FUNC void tcc_gen_machine_lea_op(TACQuadruple *q);
 ST_FUNC int tcc_gen_machine_number_of_registers(void);
 ST_FUNC void tcc_gen_machine_return_value_op(TACQuadruple *q);
 ST_FUNC void tcc_gen_machine_epilog(int leaffunc);
 ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int stack_size);
-ST_FUNC void tcc_gen_machine_func_param_op(TACQuadruple *q, int param_num, int instruction_index);
 ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_value, TCCIRState *ir, int call_idx);
 ST_FUNC void tcc_gen_machine_save_call_context(void);
 ST_FUNC void tcc_gen_machine_restore_call_context(void);

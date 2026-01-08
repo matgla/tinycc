@@ -17,6 +17,7 @@ TESTS = \
  abitest \
  asm-c-connect-test \
  vla_test-run \
+ llong_test-run \
  tests2-dir \
  pp-dir \
  memtest \
@@ -271,6 +272,13 @@ vla_test$(EXESUF): vla_test.c
 vla_test-run: vla_test$(EXESUF)
 	@echo ------------ $@ ------------
 	./vla_test$(EXESUF)
+
+llong_test$(EXESUF): llong_test.c
+	$(TCC) -o $@ $^
+
+llong_test-run: llong_test$(EXESUF)
+	@echo ------------ $@ ------------
+	./llong_test$(EXESUF)
 
 .PHONY: abitest vla_test tccb
 

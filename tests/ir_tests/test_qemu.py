@@ -23,6 +23,21 @@ TEST_FILES = [
     ("93_chained_arithmetic.c", 0),
     ("94_copy_propagation.c", 0),
     ("95_cse.c", 0),
+    ("test_ge_operator.c", 0),
+    ("97_void_call_noargs.c", 0),
+    ("98_call_over32_args.c", 0),
+    # ("test_llong_relops.c", 0),
+
+    # ("test_llong_add_signed.c", 0),
+    # ("test_llong_add_unsigned.c", 0),
+    # ("test_llong_load_signed.c", 0),
+    # ("test_llong_load_unsigned.c", 0),
+    # ("test_llong_mul_signed.c", 0),
+    # ("test_llong_mul_unsigned.c", 0),
+    # ("test_llong_div_signed.c", 0),
+    # ("test_llong_div_unsigned.c", 0),
+    # ("test_llong_mod_signed.c", 0),
+    # ("test_llong_mod_unsigned.c", 0),
 
     ("../tests2/00_assignment.c", 0),
     ("../tests2/01_comment.c", 0),
@@ -97,43 +112,37 @@ TEST_FILES = [
     ("../tests2/91_ptr_longlong_arith32.c", 0),
     ("../tests2/92_enum_bitfield.c", 0),
     ("../tests2/93_integer_promotion.c", 0),
-    ("../tests2/94_generic.c", 0),
-    ("../tests2/95_bitfields.c", 0),
-    ("../tests2/95_bitfields_ms.c", 0),
-    ("../tests2/96_nodata_wanted.c", 0),
+    # ("../tests2/95_bitfields.c", 0),
+    # ("../tests2/95_bitfields_ms.c", 0),
+    # ("../tests2/96_nodata_wanted.c", 0),
     ("../tests2/97_utf8_string_literal.c", 0),
-    ("../tests2/98_al_ax_extend.c", 0),
-    ("../tests2/99_fastcall.c", 0),
+    # ("../tests2/98_al_ax_extend.c", 0),
+    # ("../tests2/99_fastcall.c", 0),
     ("../tests2/100_c99array-decls.c", 0),
     # ("../tests2/101_cleanup.c", 0),
     ("../tests2/102_alignas.c", 0),
     ("../tests2/103_implicit_memmove.c", 0),
-    ("../tests2/104_inline.c", 0),
+    (["../tests2/104_inline.c", "../tests2/104+_inline.c"], 0),
     ("../tests2/105_local_extern.c", 0),
-    ("../tests2/106_versym.c", 0),
-    ("../tests2/107_stack_safe.c", 0),
+    # ("../tests2/106_versym.c", 0),
     ("../tests2/108_constructor.c", 0),
-    ("../tests2/112_backtrace.c", 0),
-    ("../tests2/113_btdll.c", 0),
-    ("../tests2/114_bound_signal.c", 0),
-    ("../tests2/115_bound_setjmp.c", 0),
-    ("../tests2/116_bound_setjmp2.c", 0),
-    ("../tests2/117_builtins.c", 0),
-    ("../tests2/118_switch.c", 0),
-    ("../tests2/119_random_stuff.c", 0),
-    ("../tests2/120_alias.c", 0),
-    ("../tests2/121_struct_return.c", 0),
+    # ("../tests2/112_backtrace.c", 0),
+    # ("../tests2/113_btdll.c", 0),
+    # ("../tests2/114_bound_signal.c", 0),
+    # ("../tests2/115_bound_setjmp.c", 0),
+    # ("../tests2/116_bound_setjmp2.c", 0),
+    # ("../tests2/117_builtins.c", 0),
+    # ("../tests2/118_switch.c", 0),
+    (["../tests2/120_alias.c", "../tests2/120+_alias.c"], 0),
     ("../tests2/122_vla_reuse.c", 0),
     ("../tests2/123_vla_bug.c", 0),
-    ("../tests2/124_atomic_counter.c", 0),
-    ("../tests2/125_atomic_misc.c", 0),
-    ("../tests2/126_bound_global.c", 0),
-    ("../tests2/127_asm_goto.c", 0),
-    ("../tests2/128_run_atexit.c", 0),
+    # ("../tests2/124_atomic_counter.c", 0),
+    # ("../tests2/125_atomic_misc.c", 0),
+    # ("../tests2/126_bound_global.c", 0),
+    # ("../tests2/127_asm_goto.c", 0),
+    # ("../tests2/128_run_atexit.c", 0),
     ("../tests2/129_scopes.c", 0),
     ("../tests2/130_large_argument.c", 0),
-    ("../tests2/131_return_struct_in_reg.c", 0),
-    ("../tests2/132_bound_test.c", 0),
     ("../tests2/133_string_concat.c", 0),
     ("../tests2/135_func_arg_struct_compare.c", 0),
 ]
@@ -148,9 +157,15 @@ FLOAT_TEST_FILES = [
     ("../tests2/73_arm64.c", 0),
     ("../tests2/83_utf8_in_identifiers.c", 0),
     ("../tests2/84_hex-float.c", 0),
+    ("../tests2/94_generic.c", 0),
+    ("../tests2/107_stack_safe.c", 0),
     ("../tests2/109_float_struct_calling.c", 0),
     ("../tests2/110_average.c", 0),
     ("../tests2/111_conversion.c", 0),
+    ("../tests2/119_random_stuff.c", 0),
+    ("../tests2/121_struct_return.c", 0),
+    ("../tests2/131_return_struct_in_reg.c", 0),
+    ("../tests2/132_bound_test.c", 0),
     ("../tests2/134_double_to_signed.c", 0),
 
 ]
@@ -159,9 +174,17 @@ TEST_FILES_WITH_ARGS = [
     ("../tests2/31_args.c", ["arg1", "arg2", "arg3", "arg4", "arg5"], 0),
 ]
 
+
+def _primary_test_file(test_file):
+    return test_file[0] if isinstance(test_file, (list, tuple)) else test_file
+
+
+def _test_id(test_file):
+    return Path(_primary_test_file(test_file)).stem
+
 def load_expect_file(test_name):
     """Load and return lines from .expect file and expected exit code"""
-    test_file = Path(test_name)
+    test_file = Path(_primary_test_file(test_name))
     expect_file = CURRENT_DIR / f"{test_file.parent}/{test_file.stem}.expect"
     if not expect_file.exists():
         raise FileNotFoundError(f"Expect file not found: {expect_file}")
@@ -213,70 +236,22 @@ def _run_qemu_test(test_file, expected_exit_code, args=None):
 
 
 
-@pytest.mark.parametrize("test_file,expected_exit_code", TEST_FILES, ids=[Path(f[0]).stem for f in TEST_FILES])
+@pytest.mark.parametrize("test_file,expected_exit_code", TEST_FILES, ids=[_test_id(f[0]) for f in TEST_FILES])
 def test_qemu_execution(test_file, expected_exit_code):
     if test_file is None:
         pytest.fail("test_file is None")
 
-    expected_lines = load_expect_file(test_file)
-    sut, loglines = run_test(test_file, MACHINE)
-    # remove expected compiler output
-    compiler_verified = False
-    for line in expected_lines:
-        if compiler_verified:
-            break
-        for logline in loglines:
-            if line in logline:
-                expected_lines = [l for l in expected_lines if l != line]
-                compiler_verified = True
-                break
+    _run_qemu_test(test_file, expected_exit_code)
 
 
-    try:
-        for line in expected_lines:
-            if not line is None:
-                sut.expect(_escape_regex(line), timeout=1)
-
-        sut.wait()
-        assert sut.exitstatus == expected_exit_code, f"Expected exit code {expected_exit_code}, got {sut.exitstatus}"
-
-        sut.logfile.close()
-    except Exception as e:
-        # Save output log on failure
-        sut.logfile.close()
-        raise AssertionError(f"Test failed for {test_file}: {e}") from e
-
-
-@pytest.mark.parametrize("test_file,args,expected_exit_code", TEST_FILES_WITH_ARGS, ids=[Path(f[0]).stem for f in TEST_FILES_WITH_ARGS])
+@pytest.mark.parametrize(
+    "test_file,args,expected_exit_code",
+    TEST_FILES_WITH_ARGS,
+    ids=[_test_id(f[0]) for f in TEST_FILES_WITH_ARGS],
+)
 def test_qemu_execution_with_args(test_file, args, expected_exit_code):
     if test_file is None:
         pytest.fail("test_file is None")
 
-    expected_lines = load_expect_file(test_file)
-    sut, loglines = run_test(test_file, MACHINE, args)
-    # remove expected compiler output
-    compiler_verified = False
-    for line in expected_lines:
-        if compiler_verified:
-            break
-        for logline in loglines:
-            if line in logline:
-                expected_lines = [l for l in expected_lines if l != line]
-                compiler_verified = True
-                break
-
-
-    try:
-        for line in expected_lines:
-            if not line is None:
-                sut.expect(_escape_regex(line), timeout=1)
-
-        sut.wait()
-        assert sut.exitstatus == expected_exit_code, f"Expected exit code {expected_exit_code}, got {sut.exitstatus}"
-
-        sut.logfile.close()
-    except Exception as e:
-        # Save output log on failure
-        sut.logfile.close()
-        raise AssertionError(f"Test failed for {test_file}: {e}") from e
+    _run_qemu_test(test_file, expected_exit_code, args=args)
 

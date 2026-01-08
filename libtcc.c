@@ -818,6 +818,11 @@ LIBTCCAPI TCCState *tcc_new(void)
 
 LIBTCCAPI void tcc_delete(TCCState *s1)
 {
+  /* free target-specific backend state */
+#if defined(TCC_TARGET_ARM) || defined(TCC_TARGET_ARM_THUMB)
+  arm_deinit(s1);
+#endif
+
   /* free sections */
   tccelf_delete(s1);
 
@@ -858,7 +863,8 @@ LIBTCCAPI void tcc_delete(TCCState *s1)
 
 LIBTCCAPI int tcc_set_output_type(TCCState *s, int output_type)
 {
-#ifdef CONFIG_TCC_PIE
+#if defined(CONFIG_TCC_PIE)
+  /* PIE not supported on bare-metal ARM Thumb targets (no dynamic linker) */
   if (output_type == TCC_OUTPUT_EXE)
     output_type |= TCC_OUTPUT_DYN;
 #endif

@@ -40,6 +40,73 @@
 
 #include "arm-thumb-opcodes.h"
 
+static const char *th_reg_name(unsigned r)
+{
+  static const char *names[] = {"r0", "r1", "r2",  "r3",  "r4",  "r5", "r6", "r7",
+                                "r8", "r9", "r10", "r11", "r12", "sp", "lr", "pc"};
+  if (r < (sizeof(names) / sizeof(names[0])))
+    return names[r];
+  return "r?";
+}
+
+static const char *th_cond_name(unsigned cond)
+{
+  static const char *conds[] = {"eq", "ne", "cs", "cc", "mi", "pl", "vs", "vc",
+                                "hi", "ls", "ge", "lt", "gt", "le", "al", "nv"};
+  return cond < 16 ? conds[cond] : "??";
+}
+
+static const char *th_shift_name(thumb_shift_type t)
+{
+  switch (t)
+  {
+  case THUMB_SHIFT_NONE:
+    return "";
+  case THUMB_SHIFT_LSL:
+    return "lsl";
+  case THUMB_SHIFT_LSR:
+    return "lsr";
+  case THUMB_SHIFT_ASR:
+    return "asr";
+  case THUMB_SHIFT_ROR:
+    return "ror";
+  case THUMB_SHIFT_RRX:
+    return "rrx";
+  default:
+    return "?";
+  }
+}
+
+static void th_trace_regset(uint16_t regs)
+{
+  int first = 1;
+  THOP_TRACE("{");
+  for (unsigned r = 0; r < 16; ++r)
+  {
+    if (regs & (1u << r))
+    {
+      THOP_TRACE("%s%s", first ? "" : ",", th_reg_name(r));
+      first = 0;
+    }
+  }
+  THOP_TRACE("}");
+}
+
+static void th_trace_shift_suffix(thumb_shift shift)
+{
+  if (shift.type == THUMB_SHIFT_NONE)
+    return;
+  if (shift.type == THUMB_SHIFT_RRX)
+  {
+    THOP_TRACE(", rrx");
+    return;
+  }
+  if (shift.mode == THUMB_SHIFT_REGISTER)
+    THOP_TRACE(", %s %s", th_shift_name(shift.type), th_reg_name(shift.value));
+  else
+    THOP_TRACE(", %s #%u", th_shift_name(shift.type), (unsigned)shift.value);
+}
+
 thumb_opcode th_nop(thumb_enforce_encoding encoding)
 {
   if (encoding == ENFORCE_ENCODING_32BIT)
@@ -187,6 +254,7 @@ uint32_t th_encbranch_24(int pos, int addr)
 
 thumb_opcode th_bx_reg(uint16_t rm)
 {
+  THOP_TRACE("bx %s\n", th_reg_name(rm));
   return (thumb_opcode){
       .size = 2,
       .opcode = (0x4700 | ((rm & 0xf) << 3)),
@@ -195,6 +263,7 @@ thumb_opcode th_bx_reg(uint16_t rm)
 
 thumb_opcode th_bl_t1(uint32_t imm)
 {
+  THOP_TRACE("bl <imm 0x%x>\n", (unsigned)imm);
   const uint32_t packed = th_packimm_10_11_0(imm) | 0xF000D000;
   return (thumb_opcode){
       .size = 4,
@@ -204,6 +273,7 @@ thumb_opcode th_bl_t1(uint32_t imm)
 
 thumb_opcode th_blx_reg(uint16_t rm)
 {
+  THOP_TRACE("blx %s\n", th_reg_name(rm));
   return (thumb_opcode){
       .size = 2,
       .opcode = (0x4780 | (rm << 3)),
@@ -212,6 +282,7 @@ thumb_opcode th_blx_reg(uint16_t rm)
 
 thumb_opcode th_b_t1(uint32_t cond, uint32_t imm8)
 {
+  THOP_TRACE("b%s <imm8 0x%x>\n", th_cond_name(cond & 0xf), (unsigned)imm8);
   return (thumb_opcode){
       .size = 2,
       .opcode = 0xd000 | ((cond & 0xf) << 8) | (imm8 & 0xff),
@@ -220,6 +291,7 @@ thumb_opcode th_b_t1(uint32_t cond, uint32_t imm8)
 
 thumb_opcode th_b_t2(int32_t imm11)
 {
+  THOP_TRACE("b <imm11 %d>\n", (int)imm11);
   const int32_t i = imm11 >> 1;
   if (i < 1023 && i > -1024 && !(imm11 & 1))
   {
@@ -236,6 +308,7 @@ thumb_opcode th_b_t2(int32_t imm11)
 
 thumb_opcode th_b_t3(uint32_t op, uint32_t imm)
 {
+  THOP_TRACE("b%s.w <imm 0x%x>\n", th_cond_name(op & 0xf), (unsigned)imm);
   const uint32_t enc = th_encbranch_b_t3(imm);
   return (thumb_opcode){
       .size = 4,
@@ -245,6 +318,7 @@ thumb_opcode th_b_t3(uint32_t op, uint32_t imm)
 
 thumb_opcode th_b_t4(int32_t imm)
 {
+  THOP_TRACE("b.w <imm %d>\n", (int)imm);
   if (imm > 16777215 || imm < -16777215)
     tcc_error("compiler_error: th_b_t4 too far address: 0x%x\n", imm);
 
@@ -256,6 +330,7 @@ thumb_opcode th_b_t4(int32_t imm)
 
 thumb_opcode th_cbz(uint16_t rn, uint32_t imm, uint32_t nonzero)
 {
+  THOP_TRACE("%s %s, <imm 0x%x>\n", nonzero ? "cbnz" : "cbz", th_reg_name(rn), (unsigned)imm);
   const uint32_t imm5 = imm & 0x1f;
   const uint32_t i = (imm >> 5) & 0x1;
 
@@ -313,6 +388,7 @@ thumb_opcode th_mov_reg(uint32_t rd, uint32_t rm, thumb_flags_behaviour flags, t
   if (flags != FLAGS_BEHAVIOUR_SET && encoding != ENFORCE_ENCODING_32BIT && shift.type == THUMB_SHIFT_NONE)
   {
     const uint16_t D = (rd >> 3) & 1;
+    THOP_TRACE("mov %s, %s\n", th_reg_name(rd), th_reg_name(rm));
     return (thumb_opcode){
         .size = 2,
         .opcode = (0x4600 | (D << 7) | (rm << 3) | (rd & 0x7)),
@@ -322,6 +398,7 @@ thumb_opcode th_mov_reg(uint32_t rd, uint32_t rm, thumb_flags_behaviour flags, t
       shift.type != THUMB_SHIFT_ROR &&
       ((flags == FLAGS_BEHAVIOUR_SET && !in_it) || (flags != FLAGS_BEHAVIOUR_SET && in_it)))
   {
+    THOP_TRACE("%s %s, %s, #%u\n", th_shift_name(shift.type), th_reg_name(rd), th_reg_name(rm), (unsigned)shift.value);
     return (thumb_opcode){
         .size = 2,
         .opcode = (0x0000 | (th_shift_value_to_sr_type(shift) << 11) | shift.value << 6 | (rm << 3) | rd),
@@ -329,6 +406,9 @@ thumb_opcode th_mov_reg(uint32_t rd, uint32_t rm, thumb_flags_behaviour flags, t
   }
   if (encoding != ENFORCE_ENCODING_16BIT)
   {
+    THOP_TRACE("mov%s %s, %s", flags == FLAGS_BEHAVIOUR_SET ? "s" : "", th_reg_name(rd), th_reg_name(rm));
+    th_trace_shift_suffix(shift);
+    THOP_TRACE("\n");
     return th_generic_op_reg_shift_with_status(0xea4f, rd, 0xf, rm, flags, shift);
   }
   return (thumb_opcode){
@@ -341,6 +421,7 @@ thumb_opcode th_mov_imm(uint16_t rd, uint32_t imm, thumb_flags_behaviour setflag
 {
   if (rd <= 7 && imm >= 0 && imm <= 255 && setflags != FLAGS_BEHAVIOUR_BLOCK && encoding != ENFORCE_ENCODING_32BIT)
   {
+    THOP_TRACE("movs %s, #%u\n", th_reg_name(rd), (unsigned)imm);
     return (thumb_opcode){
         .size = 2,
         .opcode = 0x2000 | (rd << 8) | imm,
@@ -353,10 +434,13 @@ thumb_opcode th_mov_imm(uint16_t rd, uint32_t imm, thumb_flags_behaviour setflag
     const uint32_t enc = th_pack_const(imm);
     const uint32_t s = (setflags == FLAGS_BEHAVIOUR_SET) ? 1 : 0;
     if (enc)
+    {
+      THOP_TRACE("mov%s %s, #%u\n", s ? "s" : "", th_reg_name(rd), (unsigned)imm);
       return (thumb_opcode){
           .size = 4,
           .opcode = 0xf04f0000 | enc | ((rd & 0xf) << 8) | (s << 20),
       };
+    }
   }
 
   if (imm >= 0 && imm <= 0xffff && rd != R_SP && rd != R_PC && setflags != FLAGS_BEHAVIOUR_SET &&
@@ -365,6 +449,7 @@ thumb_opcode th_mov_imm(uint16_t rd, uint32_t imm, thumb_flags_behaviour setflag
     const uint16_t i = (imm >> 11) & 1;
     const uint32_t imm4 = (imm >> 12) & 0xf;
     const uint32_t imm3 = (imm >> 8) & 0x7;
+    THOP_TRACE("movw %s, #%u\n", th_reg_name(rd), (unsigned)imm);
     return (thumb_opcode){
         .size = 4,
         .opcode = 0xf2400000 | (i << 26) | (imm4 << 16) | (imm3 << 12) | (rd << 8) | (imm & 0xff),
@@ -432,6 +517,8 @@ thumb_opcode th_add_reg(uint32_t rd, uint32_t rn, uint32_t rm, thumb_flags_behav
   if (rm < 8 && rd < 8 && rn < 8 && encoding != ENFORCE_ENCODING_32BIT && shift.type == THUMB_SHIFT_NONE)
   {
     // T1
+    THOP_TRACE("add%s %s, %s, %s\n", flags == FLAGS_BEHAVIOUR_SET ? "s" : "", th_reg_name(rd), th_reg_name(rn),
+               th_reg_name(rm));
     return (thumb_opcode){
         .size = 2,
         .opcode = 0x1800 | (rm << 6) | (rn << 3) | (rd),
@@ -442,12 +529,16 @@ thumb_opcode th_add_reg(uint32_t rd, uint32_t rn, uint32_t rm, thumb_flags_behav
   {
     // T2
     const uint16_t DN = (rd >> 3) & 1;
+    THOP_TRACE("add %s, %s\n", th_reg_name(rd), th_reg_name(rm));
     return (thumb_opcode){
         .size = 2,
         .opcode = 0x4400 | (DN << 7) | ((rm & 0xf) << 3) | (rd & 0x7),
     };
   }
-
+  THOP_TRACE("add%s %s, %s, %s", flags == FLAGS_BEHAVIOUR_SET ? "s" : "", th_reg_name(rd), th_reg_name(rn),
+             th_reg_name(rm));
+  th_trace_shift_suffix(shift);
+  THOP_TRACE("\n");
   return th_generic_op_reg_shift_with_status(0xeb00, rd, rn, rm, flags, shift);
 }
 
@@ -476,6 +567,7 @@ thumb_opcode th_add_imm(uint32_t rd, uint32_t rn, uint32_t imm, thumb_flags_beha
   thumb_opcode op = {0, 0};
   if (rd == rn && rd < 8 && imm <= 255 && encoding != ENFORCE_ENCODING_32BIT)
   {
+    THOP_TRACE("add%s %s, #%u\n", flags == FLAGS_BEHAVIOUR_SET ? "s" : "", th_reg_name(rd), (unsigned)imm);
     return (thumb_opcode){
         .size = 2,
         .opcode = (0x3000 | (rd << 8) | imm),
@@ -484,6 +576,8 @@ thumb_opcode th_add_imm(uint32_t rd, uint32_t rn, uint32_t imm, thumb_flags_beha
 
   if (imm <= 7 && rd < 8 && rn < 8 && encoding != ENFORCE_ENCODING_32BIT)
   {
+    THOP_TRACE("add%s %s, %s, #%u\n", flags == FLAGS_BEHAVIOUR_SET ? "s" : "", th_reg_name(rd), th_reg_name(rn),
+               (unsigned)imm);
     return (thumb_opcode){
         .size = 2,
         .opcode = (0x1c00 | (imm << 6) | (rn << 3) | rd),
@@ -492,9 +586,14 @@ thumb_opcode th_add_imm(uint32_t rd, uint32_t rn, uint32_t imm, thumb_flags_beha
 
   op = th_generic_op_imm_with_status(0xf100, rd, rn, imm, flags);
   if (op.size != 0)
+  {
+    THOP_TRACE("add%s %s, %s, #%u\n", flags == FLAGS_BEHAVIOUR_SET ? "s" : "", th_reg_name(rd), th_reg_name(rn),
+               (unsigned)imm);
     return op;
+  }
   if (imm <= 4095 && encoding != ENFORCE_ENCODING_16BIT && flags != FLAGS_BEHAVIOUR_SET)
   {
+    THOP_TRACE("add %s, %s, #%u\n", th_reg_name(rd), th_reg_name(rn), (unsigned)imm);
     return th_add_imm_t4(rd, rn, imm);
   }
   return op;
@@ -628,6 +727,8 @@ thumb_opcode th_sub_reg(uint32_t rd, uint32_t rn, uint32_t rm, thumb_flags_behav
 {
   if (rd < 8 && rm < 8 && rn < 8 && shift.type == THUMB_SHIFT_NONE && encoding != ENFORCE_ENCODING_32BIT)
   {
+    THOP_TRACE("sub%s %s, %s, %s\n", flags == FLAGS_BEHAVIOUR_SET ? "s" : "", th_reg_name(rd), th_reg_name(rn),
+               th_reg_name(rm));
     return (thumb_opcode){
         .size = 2,
         .opcode = 0x1a00 | (rm << 6) | (rn << 3) | rd,
@@ -639,6 +740,9 @@ thumb_opcode th_sub_reg(uint32_t rd, uint32_t rn, uint32_t rm, thumb_flags_behav
     const uint32_t imm3 = (shift.value >> 2) & 0x7;
     const uint32_t imm2 = shift.value & 0x3;
     const uint32_t s = (flags == FLAGS_BEHAVIOUR_SET) ? 1 : 0;
+    THOP_TRACE("sub%s %s, %s, %s", s ? "s" : "", th_reg_name(rd), th_reg_name(rn), th_reg_name(rm));
+    th_trace_shift_suffix(shift);
+    THOP_TRACE("\n");
     return (thumb_opcode){
         .size = 4,
         .opcode = 0xeba00000 | (s << 20) | (rn << 16) | (rd << 8) | rm | imm3 << 12 | imm2 << 6 |
@@ -741,6 +845,7 @@ thumb_opcode th_cmp_reg(uint32_t rd, uint32_t rn, uint32_t rm, thumb_flags_behav
   (void)flags; /* CMP always sets flags */
   if (rm < 8 && rn < 8 && shift.type == THUMB_SHIFT_NONE && encoding != ENFORCE_ENCODING_32BIT)
   {
+    THOP_TRACE("cmp %s, %s\n", th_reg_name(rn), th_reg_name(rm));
     return (thumb_opcode){
         .size = 2,
         .opcode = (0x4280 | (rm << 3) | rn),
@@ -750,12 +855,15 @@ thumb_opcode th_cmp_reg(uint32_t rd, uint32_t rn, uint32_t rm, thumb_flags_behav
            shift.type == THUMB_SHIFT_NONE)
   {
     const uint16_t N = (rn >> 3) & 0x1;
+    THOP_TRACE("cmp %s, %s\n", th_reg_name(rn), th_reg_name(rm));
     return (thumb_opcode){
         .size = 2,
         .opcode = (0x4500 | (N << 7) | (rm << 3) | (rn & 0x7)),
     };
   }
-
+  THOP_TRACE("cmp %s, %s", th_reg_name(rn), th_reg_name(rm));
+  th_trace_shift_suffix(shift);
+  THOP_TRACE("\n");
   return th_generic_op_reg_shift_with_status(0xebb0, 0xf, rn, rm, FLAGS_BEHAVIOUR_SET, shift);
 }
 
@@ -794,10 +902,10 @@ thumb_opcode th_sub_imm_t4(uint32_t rd, uint32_t rn, uint32_t imm)
 thumb_opcode th_sub_imm(uint32_t rd, uint32_t rn, uint32_t imm, thumb_flags_behaviour flags,
                         thumb_enforce_encoding encoding)
 {
-
   if (rd == rn && imm <= 255 && rd < 8 && encoding != ENFORCE_ENCODING_32BIT)
   {
     // T2
+    THOP_TRACE("sub%s %s, #%u\n", flags == FLAGS_BEHAVIOUR_SET ? "s" : "", th_reg_name(rd), (unsigned)imm);
     return (thumb_opcode){
         .size = 2,
         .opcode = (0x3800 | (rd << 8) | imm),
@@ -807,6 +915,8 @@ thumb_opcode th_sub_imm(uint32_t rd, uint32_t rn, uint32_t imm, thumb_flags_beha
   if (rd < 8 && rn < 8 && imm <= 7 && encoding != ENFORCE_ENCODING_32BIT)
   {
     // T1
+    THOP_TRACE("sub%s %s, %s, #%u\n", flags == FLAGS_BEHAVIOUR_SET ? "s" : "", th_reg_name(rd), th_reg_name(rn),
+               (unsigned)imm);
     return (thumb_opcode){
         .size = 2,
         .opcode = (0x1e00 | (imm << 6) | (rn << 3) | rd),
@@ -819,13 +929,14 @@ thumb_opcode th_sub_imm(uint32_t rd, uint32_t rn, uint32_t imm, thumb_flags_beha
     const uint32_t s = (flags == FLAGS_BEHAVIOUR_SET) ? 1 : 0;
     if (enc || imm == 0)
     {
+      THOP_TRACE("sub%s %s, %s, #%u\n", s ? "s" : "", th_reg_name(rd), th_reg_name(rn), (unsigned)imm);
       return (thumb_opcode){
           .size = 4,
           .opcode = 0xf1a00000 | s << 20 | (rn << 16) | (rd << 8) | enc,
       };
     }
   }
-
+  THOP_TRACE("sub %s, %s, #%u\n", th_reg_name(rd), th_reg_name(rn), (unsigned)imm);
   return th_sub_imm_t4(rd, rn, imm);
 }
 
@@ -836,6 +947,9 @@ thumb_opcode th_push(uint16_t regs)
   if (!(regs & 0xbf00))
   {
     const uint16_t lr = (regs >> 14) & 1;
+    THOP_TRACE("push ");
+    th_trace_regset(regs);
+    THOP_TRACE("\n");
     return (thumb_opcode){
         .size = 2,
         .opcode = (0xb400 | (lr << 8) | (regs & 0xff)),
@@ -846,6 +960,9 @@ thumb_opcode th_push(uint16_t regs)
 #if defined(TCC_TARGET_ARM_ARCHV8M) || defined(TCC_TARGET_ARM_ARCHV7M)
   if (!(regs & 0xa000))
   {
+    THOP_TRACE("push ");
+    th_trace_regset(regs);
+    THOP_TRACE("\n");
     return (thumb_opcode){
         .size = 4,
         .opcode = (0xe92d << 16 | regs),
@@ -877,6 +994,7 @@ thumb_opcode th_ldrsh_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw, thumb
   {
     uint32_t ins = (0xf9b0 | ((rn & 0xf))) << 16;
     ins |= (((rt & 0xf) << 12) | imm);
+    THOP_TRACE("ldrsh %s, [%s, #%d]\n", th_reg_name(rt), th_reg_name(rn), imm);
     return (thumb_opcode){
         .size = 4,
         .opcode = ins,
@@ -885,6 +1003,7 @@ thumb_opcode th_ldrsh_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw, thumb
   else if (imm <= 4095 && rn == R_PC)
   {
     const uint32_t u = (puw & 0x2) >> 1;
+    THOP_TRACE("ldrsh %s, [%s, #%c%d]\n", th_reg_name(rt), th_reg_name(rn), u ? '+' : '-', imm);
     return (thumb_opcode){
         .size = 4,
         .opcode = 0xf93f0000 | (rn << 16) | (rt << 12) | (u << 23) | imm,
@@ -894,7 +1013,28 @@ thumb_opcode th_ldrsh_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw, thumb
   {
     uint32_t ins = (0xf930 | (rn & 0xf)) << 16;
     ins |= (0x0800 | ((rt & 0xf) << 12) | (puw << 8) | imm);
-
+    {
+      const uint32_t p = (puw >> 2) & 1;
+      const uint32_t u = (puw >> 1) & 1;
+      const uint32_t w = (puw >> 0) & 1;
+      if (p && !w)
+      {
+        THOP_TRACE("ldrsh %s, [%s, #%c%d]\n", th_reg_name(rt), th_reg_name(rn), u ? '+' : '-', imm);
+      }
+      else if (p && w)
+      {
+        THOP_TRACE("ldrsh %s, [%s, #%c%d]!\n", th_reg_name(rt), th_reg_name(rn), u ? '+' : '-', imm);
+      }
+      else if (!p && w)
+      {
+        THOP_TRACE("ldrsh %s, [%s], #%c%d\n", th_reg_name(rt), th_reg_name(rn), u ? '+' : '-', imm);
+      }
+      else
+      {
+        THOP_TRACE("ldrsh %s, [%s, #%c%d] (puw=%u)\n", th_reg_name(rt), th_reg_name(rn), u ? '+' : '-', imm,
+                   (unsigned)puw);
+      }
+    }
     return (thumb_opcode){
         .size = 4,
         .opcode = ins,
@@ -916,6 +1056,7 @@ thumb_opcode th_ldrsh_reg(uint32_t rt, uint32_t rn, uint32_t rm, thumb_shift shi
   // puw == 6 means positive offset on rn, so T1 encoding can be used
   if (rm < 8 && rt < 8 && rn < 8 && shift.type == THUMB_SHIFT_NONE && encoding != ENFORCE_ENCODING_32BIT)
   {
+    THOP_TRACE("ldrsh %s, [%s, %s]\n", th_reg_name(rt), th_reg_name(rn), th_reg_name(rm));
     return (thumb_opcode){
         .size = 2,
         .opcode = 0x5e00 | (rm << 6) | (rn << 3) | rt,
@@ -924,6 +1065,9 @@ thumb_opcode th_ldrsh_reg(uint32_t rt, uint32_t rn, uint32_t rm, thumb_shift shi
 #ifndef TCC_TARGET_ARM_ARCHV6M
   else if (rt != R_SP && rm != R_SP && rm != R_SP)
   {
+    THOP_TRACE("ldrsh %s, [%s, %s", th_reg_name(rt), th_reg_name(rn), th_reg_name(rm));
+    th_trace_shift_suffix(shift);
+    THOP_TRACE("]\n");
     return (thumb_opcode){
         .size = 4,
         .opcode = 0xf9300000 | (rn << 16) | (rt << 12) | rm | shift.value << 4,
@@ -941,6 +1085,7 @@ thumb_opcode th_ldrh_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw, thumb_
   // T1 encoding, on armv6-m this one is the only one available
   if (puw == 6 && rn < 8 && rt < 8 && imm <= 62 && encoding != ENFORCE_ENCODING_32BIT && !(imm & 1))
   {
+    THOP_TRACE("ldrh %s, [%s, #%d]\n", th_reg_name(rt), th_reg_name(rn), imm);
     imm = imm >> 1;
     // imm[0] is enforced to be 0, and sould be divided by 2, thus offset is 5
     return (thumb_opcode){
@@ -951,6 +1096,7 @@ thumb_opcode th_ldrh_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw, thumb_
 #ifndef TCC_TARGET_ARM_ARCHV6M
   else if (puw == 6 && rt != R_SP && imm >= 0 && imm <= 4095 && rn != R_PC)
   {
+    THOP_TRACE("ldrh %s, [%s, #%d]\n", th_reg_name(rt), th_reg_name(rn), imm);
     return (thumb_opcode){
         .size = 4,
         .opcode = 0xf8b00000 | (rn << 16) | (rt << 12) | imm,
@@ -959,6 +1105,7 @@ thumb_opcode th_ldrh_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw, thumb_
   else if (imm >= 0 && imm <= 4095 && rn == R_PC)
   {
     const uint32_t u = (puw & 0x2) >> 1;
+    THOP_TRACE("ldrh %s, [%s, #%c%d]\n", th_reg_name(rt), th_reg_name(rn), u ? '+' : '-', imm);
     return (thumb_opcode){
         .size = 4,
         .opcode = 0xf83f0000 | (u << 23) | (rn << 16) | (rt << 12) | imm,
@@ -966,6 +1113,28 @@ thumb_opcode th_ldrh_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw, thumb_
   }
   else if (rt != R_SP && imm <= 255)
   {
+    {
+      const uint32_t p = (puw >> 2) & 1;
+      const uint32_t u = (puw >> 1) & 1;
+      const uint32_t w = (puw >> 0) & 1;
+      if (p && !w)
+      {
+        THOP_TRACE("ldrh %s, [%s, #%c%d]\n", th_reg_name(rt), th_reg_name(rn), u ? '+' : '-', imm);
+      }
+      else if (p && w)
+      {
+        THOP_TRACE("ldrh %s, [%s, #%c%d]!\n", th_reg_name(rt), th_reg_name(rn), u ? '+' : '-', imm);
+      }
+      else if (!p && w)
+      {
+        THOP_TRACE("ldrh %s, [%s], #%c%d\n", th_reg_name(rt), th_reg_name(rn), u ? '+' : '-', imm);
+      }
+      else
+      {
+        THOP_TRACE("ldrh %s, [%s, #%c%d] (puw=%u)\n", th_reg_name(rt), th_reg_name(rn), u ? '+' : '-', imm,
+                   (unsigned)puw);
+      }
+    }
     return (thumb_opcode){
         .size = 4,
         .opcode = 0xf8300800 | (rn << 16) | (rt << 12) | (puw << 8) | imm,
@@ -988,6 +1157,7 @@ thumb_opcode th_ldrh_reg(uint32_t rt, uint32_t rn, uint32_t rm, thumb_shift shif
   // puw == 6 means positive offset on rn, so T1 encoding can be used
   if (rm < 8 && rt < 8 && rn < 8 && shift.type == THUMB_SHIFT_NONE && encoding != ENFORCE_ENCODING_32BIT)
   {
+    THOP_TRACE("ldrh %s, [%s, %s]\n", th_reg_name(rt), th_reg_name(rn), th_reg_name(rm));
     return (thumb_opcode){
         .size = 2,
         .opcode = 0x5a00 | (rm << 6) | (rn << 3) | rt,
@@ -996,6 +1166,9 @@ thumb_opcode th_ldrh_reg(uint32_t rt, uint32_t rn, uint32_t rm, thumb_shift shif
 #ifndef TCC_TARGET_ARM_ARCHV6M
   else if (rt != R_SP && rm != R_SP && rm != R_PC)
   {
+    THOP_TRACE("ldrh %s, [%s, %s", th_reg_name(rt), th_reg_name(rn), th_reg_name(rm));
+    th_trace_shift_suffix(shift);
+    THOP_TRACE("]\n");
     return (thumb_opcode){
         .size = 4,
         .opcode = 0xf8300000 | (rn << 16) | (rt << 12) | rm | shift.value << 4,
@@ -1014,6 +1187,7 @@ thumb_opcode th_ldrsb_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw, thumb
   // puw == 6 means positive offset on rn, so T1 encoding can be used
   if (rt != R_SP && imm <= 4095 && puw == 6 && rn != R_PC)
   {
+    THOP_TRACE("ldrsb %s, [%s, #%d]\n", th_reg_name(rt), th_reg_name(rn), imm);
     return (thumb_opcode){
         .size = 4,
         .opcode = 0xf9900000 | (rn << 16) | (rt << 12) | imm,
@@ -1022,6 +1196,7 @@ thumb_opcode th_ldrsb_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw, thumb
   else if (imm <= 4095 && rn == R_PC)
   {
     const uint32_t u = (puw & 0x2) >> 1;
+    THOP_TRACE("ldrsb %s, [%s, #%c%d]\n", th_reg_name(rt), th_reg_name(rn), u ? '+' : '-', imm);
     return (thumb_opcode){
         .size = 4,
         .opcode = 0xf91f0000 | (rn << 16) | (rt << 12) | (u << 23) | imm,
@@ -1029,6 +1204,28 @@ thumb_opcode th_ldrsb_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw, thumb
   }
   else if (rt != R_SP && imm <= 255)
   {
+    {
+      const uint32_t p = (puw >> 2) & 1;
+      const uint32_t u = (puw >> 1) & 1;
+      const uint32_t w = (puw >> 0) & 1;
+      if (p && !w)
+      {
+        THOP_TRACE("ldrsb %s, [%s, #%c%d]\n", th_reg_name(rt), th_reg_name(rn), u ? '+' : '-', imm);
+      }
+      else if (p && w)
+      {
+        THOP_TRACE("ldrsb %s, [%s, #%c%d]!\n", th_reg_name(rt), th_reg_name(rn), u ? '+' : '-', imm);
+      }
+      else if (!p && w)
+      {
+        THOP_TRACE("ldrsb %s, [%s], #%c%d\n", th_reg_name(rt), th_reg_name(rn), u ? '+' : '-', imm);
+      }
+      else
+      {
+        THOP_TRACE("ldrsb %s, [%s, #%c%d] (puw=%u)\n", th_reg_name(rt), th_reg_name(rn), u ? '+' : '-', imm,
+                   (unsigned)puw);
+      }
+    }
     return (thumb_opcode){
         .size = 4,
         .opcode = 0xf9100800 | (rn << 16) | (rt << 12) | (puw << 8) | imm,
@@ -1051,6 +1248,7 @@ thumb_opcode th_ldrsb_reg(uint32_t rt, uint32_t rn, uint32_t rm, thumb_shift shi
   // puw == 6 means positive offset on rn, so T1 encoding can be used
   if (rm < 8 && rt < 8 && rn < 8 && encoding != ENFORCE_ENCODING_32BIT && shift.type == THUMB_SHIFT_NONE)
   {
+    THOP_TRACE("ldrsb %s, [%s, %s]\n", th_reg_name(rt), th_reg_name(rn), th_reg_name(rm));
     return (thumb_opcode){
         .size = 2,
         .opcode = 0x5600 | (rm << 6) | (rn << 3) | rt,
@@ -1059,6 +1257,9 @@ thumb_opcode th_ldrsb_reg(uint32_t rt, uint32_t rn, uint32_t rm, thumb_shift shi
 #ifndef TCC_TARGET_ARM_ARCHV6M
   else if (rt != R_SP && rm != R_SP && rm != R_SP)
   {
+    THOP_TRACE("ldrsb %s, [%s, %s", th_reg_name(rt), th_reg_name(rn), th_reg_name(rm));
+    th_trace_shift_suffix(shift);
+    THOP_TRACE("]\n");
     return (thumb_opcode){
         .size = 4,
         .opcode = 0xf9100000 | (rn << 16) | (rt << 12) | rm | shift.value << 4,
@@ -1077,6 +1278,7 @@ thumb_opcode th_ldrb_imm(uint16_t rt, uint16_t rn, int imm, uint32_t puw, thumb_
   if (puw == 6 && rn < 8 && rt < 8 && imm <= 31 && encoding != ENFORCE_ENCODING_32BIT)
   {
     // imm[0] is enforced to be 0, and sould be divided by 2, thus offset is 5
+    THOP_TRACE("ldrb %s, [%s, #%d]\n", th_reg_name(rt), th_reg_name(rn), imm);
     return (thumb_opcode){
         .size = 2,
         .opcode = 0x7800 | (imm << 6) | (rn << 3) | rt,
@@ -1085,6 +1287,7 @@ thumb_opcode th_ldrb_imm(uint16_t rt, uint16_t rn, int imm, uint32_t puw, thumb_
 #ifndef TCC_TARGET_ARM_ARCHV6M
   else if (puw == 6 && rt != R_SP && imm >= 0 && imm <= 4095 && rn != R_PC)
   {
+    THOP_TRACE("ldrb %s, [%s, #%d]\n", th_reg_name(rt), th_reg_name(rn), imm);
     return (thumb_opcode){
         .size = 4,
         .opcode = 0xf8900000 | (rn << 16) | (rt << 12) | imm,
@@ -1093,6 +1296,7 @@ thumb_opcode th_ldrb_imm(uint16_t rt, uint16_t rn, int imm, uint32_t puw, thumb_
   else if (imm >= 0 && imm <= 4095 && rn == R_PC)
   {
     uint32_t u = (puw & 0x2) >> 1;
+    THOP_TRACE("ldrb %s, [%s, #%c%d]\n", th_reg_name(rt), th_reg_name(rn), u ? '+' : '-', imm);
     return (thumb_opcode){
         .size = 4,
         .opcode = 0xf81f0000 | (u << 23) | (rt << 12) | imm,
@@ -1100,6 +1304,28 @@ thumb_opcode th_ldrb_imm(uint16_t rt, uint16_t rn, int imm, uint32_t puw, thumb_
   }
   else if (rt != R_SP && imm <= 255)
   {
+    {
+      const uint32_t p = (puw >> 2) & 1;
+      const uint32_t u = (puw >> 1) & 1;
+      const uint32_t w = (puw >> 0) & 1;
+      if (p && !w)
+      {
+        THOP_TRACE("ldrb %s, [%s, #%c%d]\n", th_reg_name(rt), th_reg_name(rn), u ? '+' : '-', imm);
+      }
+      else if (p && w)
+      {
+        THOP_TRACE("ldrb %s, [%s, #%c%d]!\n", th_reg_name(rt), th_reg_name(rn), u ? '+' : '-', imm);
+      }
+      else if (!p && w)
+      {
+        THOP_TRACE("ldrb %s, [%s], #%c%d\n", th_reg_name(rt), th_reg_name(rn), u ? '+' : '-', imm);
+      }
+      else
+      {
+        THOP_TRACE("ldrb %s, [%s, #%c%d] (puw=%u)\n", th_reg_name(rt), th_reg_name(rn), u ? '+' : '-', imm,
+                   (unsigned)puw);
+      }
+    }
     return (thumb_opcode){
         .size = 4,
         .opcode = 0xf8100800 | (rn << 16) | (rt << 12) | (puw << 8) | imm,
@@ -1121,6 +1347,7 @@ thumb_opcode th_ldrb_reg(uint32_t rt, uint32_t rn, uint32_t rm, thumb_shift shif
   }
   if (rm < 8 && rt < 8 && rn < 8 && shift.type == THUMB_SHIFT_NONE && encoding != ENFORCE_ENCODING_32BIT)
   {
+    THOP_TRACE("ldrb %s, [%s, %s]\n", th_reg_name(rt), th_reg_name(rn), th_reg_name(rm));
     return (thumb_opcode){
         .size = 2,
         .opcode = 0x5c00 | (rm << 6) | (rn << 3) | rt,
@@ -1129,6 +1356,9 @@ thumb_opcode th_ldrb_reg(uint32_t rt, uint32_t rn, uint32_t rm, thumb_shift shif
 #ifndef TCC_TARGET_ARM_ARCHV6M
   else if (rt != R_SP && rm != R_SP && rm != R_PC)
   {
+    THOP_TRACE("ldrb %s, [%s, %s", th_reg_name(rt), th_reg_name(rn), th_reg_name(rm));
+    th_trace_shift_suffix(shift);
+    THOP_TRACE("]\n");
     return (thumb_opcode){
         .size = 4,
         .opcode = 0xf8100000 | (rn << 16) | (rt << 12) | rm | shift.value << 4,
@@ -1147,6 +1377,7 @@ thumb_opcode th_ldr_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw, thumb_e
   if (puw == 6 && rn < 8 && rt < 8 && imm <= 124 && !(imm & 3) && encoding != ENFORCE_ENCODING_32BIT)
   {
     // imm[0] is enforced to be 0, and sould be divided by 4, thus offset is 4
+    THOP_TRACE("ldr %s, [%s, #%d]\n", th_reg_name(rt), th_reg_name(rn), imm);
     return (thumb_opcode){
         .size = 2,
         .opcode = 0x6800 | (imm << 4) | (rn << 3) | rt,
@@ -1154,6 +1385,7 @@ thumb_opcode th_ldr_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw, thumb_e
   }
   else if (puw == 6 && rn == R_SP && rt < 8 && imm <= 1020 && encoding != ENFORCE_ENCODING_32BIT)
   {
+    THOP_TRACE("ldr %s, [%s, #%d]\n", th_reg_name(rt), th_reg_name(rn), imm);
     return (thumb_opcode){
         .size = 2,
         .opcode = 0x9800 | (rt << 8) | (imm >> 2),
@@ -1164,6 +1396,7 @@ thumb_opcode th_ldr_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw, thumb_e
   {
     uint32_t ins = (0xf8d0 | (rn & 0xf)) << 16;
     ins |= (rt << 12) | imm;
+    THOP_TRACE("ldr %s, [%s, #%d]\n", th_reg_name(rt), th_reg_name(rn), imm);
     return (thumb_opcode){
         .size = 4,
         .opcode = ins,
@@ -1172,6 +1405,7 @@ thumb_opcode th_ldr_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw, thumb_e
   else if (imm >= 0 && imm <= 4095 && rn == R_PC)
   {
     uint32_t u = (puw & 0x2) >> 1;
+    THOP_TRACE("ldr %s, [%s, #%c%d]\n", th_reg_name(rt), th_reg_name(rn), u ? '+' : '-', imm);
     return (thumb_opcode){
         .size = 4,
         .opcode = 0xf85f0000 | (u << 23) | (rt << 12) | imm,
@@ -1181,6 +1415,28 @@ thumb_opcode th_ldr_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw, thumb_e
   {
     uint32_t ins = (0xf850 | (rn & 0xf)) << 16;
     ins |= (0x0800 | ((rt & 0xf) << 12) | ((puw & 0x7) << 8) | imm);
+    {
+      const uint32_t p = (puw >> 2) & 1;
+      const uint32_t u = (puw >> 1) & 1;
+      const uint32_t w = (puw >> 0) & 1;
+      if (p && !w)
+      {
+        THOP_TRACE("ldr %s, [%s, #%c%d]\n", th_reg_name(rt), th_reg_name(rn), u ? '+' : '-', imm);
+      }
+      else if (p && w)
+      {
+        THOP_TRACE("ldr %s, [%s, #%c%d]!\n", th_reg_name(rt), th_reg_name(rn), u ? '+' : '-', imm);
+      }
+      else if (!p && w)
+      {
+        THOP_TRACE("ldr %s, [%s], #%c%d\n", th_reg_name(rt), th_reg_name(rn), u ? '+' : '-', imm);
+      }
+      else
+      {
+        THOP_TRACE("ldr %s, [%s, #%c%d] (puw=%u)\n", th_reg_name(rt), th_reg_name(rn), u ? '+' : '-', imm,
+                   (unsigned)puw);
+      }
+    }
     return (thumb_opcode){
         .size = 4,
         .opcode = ins,
@@ -1201,6 +1457,7 @@ thumb_opcode th_ldr_reg(uint32_t rt, uint32_t rn, uint32_t rm, thumb_shift shift
   }
   if (rm < 8 && rt < 8 && rn < 8 && shift.type == THUMB_SHIFT_NONE && encoding != ENFORCE_ENCODING_32BIT)
   {
+    THOP_TRACE("ldr %s, [%s, %s]\n", th_reg_name(rt), th_reg_name(rn), th_reg_name(rm));
     return (thumb_opcode){
         .size = 2,
         .opcode = (0x5800 | (rm << 6) | (rn << 3) | rt),
@@ -1209,6 +1466,9 @@ thumb_opcode th_ldr_reg(uint32_t rt, uint32_t rn, uint32_t rm, thumb_shift shift
 #ifndef TCC_TARGET_ARM_ARCHV6M
   else if (rt != R_SP && rm != R_SP && rm != R_PC)
   {
+    THOP_TRACE("ldr %s, [%s, %s", th_reg_name(rt), th_reg_name(rn), th_reg_name(rm));
+    th_trace_shift_suffix(shift);
+    THOP_TRACE("]\n");
     return (thumb_opcode){
         .size = 4,
         .opcode = 0xf8500000 | (rn << 16) | (rt << 12) | rm | shift.value << 4,
@@ -1225,6 +1485,7 @@ thumb_opcode th_ldr_literal(uint16_t rt, uint32_t imm, uint32_t add)
 {
   if (rt < 8 && imm <= 1020)
   {
+    THOP_TRACE("ldr %s, [%s, #%c%u]\n", th_reg_name(rt), th_reg_name(R_PC), (add & 1) ? '+' : '-', (unsigned)imm);
     return (thumb_opcode){
         .size = 2,
         .opcode = 0x4800 | (rt << 8) | imm >> 2,
@@ -1233,6 +1494,7 @@ thumb_opcode th_ldr_literal(uint16_t rt, uint32_t imm, uint32_t add)
 #ifndef TCC_TARGET_ARM_ARCHV6M
   else if (rt != R_PC && imm <= 0xffff)
   {
+    THOP_TRACE("ldr %s, [%s, #%c%u]\n", th_reg_name(rt), th_reg_name(R_PC), (add & 1) ? '+' : '-', (unsigned)imm);
     uint32_t ins = (0xf85f | ((add & 1) << 7)) << 16;
     ins |= (rt & 0xf) << 12 | imm;
     return (thumb_opcode){
@@ -1254,6 +1516,9 @@ thumb_opcode th_pop(uint16_t regs)
   if (!(regs & 0x7f00))
   {
     const uint16_t pc = (regs >> 15) & 1;
+    THOP_TRACE("pop ");
+    th_trace_regset(regs);
+    THOP_TRACE("\n");
     return (thumb_opcode){
         .size = 2,
         .opcode = 0xbc00 | (pc << 8) | (regs & 0xff),
@@ -1264,6 +1529,9 @@ thumb_opcode th_pop(uint16_t regs)
 #if defined(TCC_TARGET_ARM_ARCHV8M) || defined(TCC_TARGET_ARM_ARCHV7M)
   if (!(regs & 0x2000))
   {
+    THOP_TRACE("pop ");
+    th_trace_regset(regs);
+    THOP_TRACE("\n");
     return (thumb_opcode){
         .size = 4,
         .opcode = (0xe8bd << 16) | regs,
@@ -1283,6 +1551,7 @@ thumb_opcode th_strh_imm(uint16_t rt, uint16_t rn, int imm, uint16_t puw, thumb_
   if (puw == 6 && rn < 8 && rt < 8 && imm <= 62 && encoding != ENFORCE_ENCODING_32BIT && !(imm & 1))
   {
     // imm[0] is enforced to be 0, and sould be divided by 2, thus offset is 5
+    THOP_TRACE("strh %s, [%s, #%d]\n", th_reg_name(rt), th_reg_name(rn), imm);
     imm >>= 1;
     return (thumb_opcode){
         .size = 2,
@@ -1292,6 +1561,7 @@ thumb_opcode th_strh_imm(uint16_t rt, uint16_t rn, int imm, uint16_t puw, thumb_
 #ifndef TCC_TARGET_ARM_ARCHV6M
   else if (puw == 6 && rt != R_SP && imm <= 4095)
   {
+    THOP_TRACE("strh %s, [%s, #%d]\n", th_reg_name(rt), th_reg_name(rn), imm);
     return (thumb_opcode){
         .size = 4,
         .opcode = (0xf8a00000 | (rn << 16) | (rt << 12) | imm),
@@ -1299,6 +1569,28 @@ thumb_opcode th_strh_imm(uint16_t rt, uint16_t rn, int imm, uint16_t puw, thumb_
   }
   else if (rt != R_SP && imm <= 255)
   {
+    {
+      const uint32_t p = (puw >> 2) & 1;
+      const uint32_t u = (puw >> 1) & 1;
+      const uint32_t w = (puw >> 0) & 1;
+      if (p && !w)
+      {
+        THOP_TRACE("strh %s, [%s, #%c%d]\n", th_reg_name(rt), th_reg_name(rn), u ? '+' : '-', imm);
+      }
+      else if (p && w)
+      {
+        THOP_TRACE("strh %s, [%s, #%c%d]!\n", th_reg_name(rt), th_reg_name(rn), u ? '+' : '-', imm);
+      }
+      else if (!p && w)
+      {
+        THOP_TRACE("strh %s, [%s], #%c%d\n", th_reg_name(rt), th_reg_name(rn), u ? '+' : '-', imm);
+      }
+      else
+      {
+        THOP_TRACE("strh %s, [%s, #%c%d] (puw=%u)\n", th_reg_name(rt), th_reg_name(rn), u ? '+' : '-', imm,
+                   (unsigned)puw);
+      }
+    }
     return (thumb_opcode){
         .size = 4,
         .opcode = 0xf8200800 | (rn << 16) | (rt << 12) | ((puw & 0x7) << 8) | imm,
@@ -1316,6 +1608,7 @@ thumb_opcode th_strh_reg(uint32_t rt, uint32_t rn, uint32_t rm, thumb_shift shif
   // puw == 6 means positive offset on rn, so T1 encoding can be used
   if (rm < 8 && rt < 8 && rn < 8 && encoding != ENFORCE_ENCODING_32BIT && shift.type == THUMB_SHIFT_NONE)
   {
+    THOP_TRACE("strh %s, [%s, %s]\n", th_reg_name(rt), th_reg_name(rn), th_reg_name(rm));
     return (thumb_opcode){
         .size = 2,
         .opcode = 0x5200 | (rm << 6) | (rn << 3) | rt,
@@ -1324,6 +1617,9 @@ thumb_opcode th_strh_reg(uint32_t rt, uint32_t rn, uint32_t rm, thumb_shift shif
 #ifndef TCC_TARGET_ARM_ARCHV6M
   else if (rt != R_SP && rm != R_SP && rm != R_PC)
   {
+    THOP_TRACE("strh %s, [%s, %s", th_reg_name(rt), th_reg_name(rn), th_reg_name(rm));
+    th_trace_shift_suffix(shift);
+    THOP_TRACE("]\n");
     return (thumb_opcode){
         .size = 4,
         .opcode = 0xf8200000 | (rn << 16) | (rt << 12) | rm | shift.value << 4,
@@ -1342,6 +1638,7 @@ thumb_opcode th_strb_imm(uint16_t rt, uint16_t rn, int imm, uint16_t puw, thumb_
   if (puw == 6 && rn < 8 && rt < 8 && imm <= 31 && encoding != ENFORCE_ENCODING_32BIT)
   {
     // imm[0] is enforced to be 0, and sould be divided by 2, thus offset is 5
+    THOP_TRACE("strb %s, [%s, #%d]\n", th_reg_name(rt), th_reg_name(rn), imm);
     return (thumb_opcode){
         .size = 2,
         .opcode = 0x7000 | (imm << 6) | (rn << 3) | rt,
@@ -1350,6 +1647,7 @@ thumb_opcode th_strb_imm(uint16_t rt, uint16_t rn, int imm, uint16_t puw, thumb_
 #ifndef TCC_TARGET_ARM_ARCHV6M
   else if (puw == 6 && rt != R_SP && imm <= 4095)
   {
+    THOP_TRACE("strb %s, [%s, #%d]\n", th_reg_name(rt), th_reg_name(rn), imm);
     return (thumb_opcode){
         .size = 4,
         .opcode = 0xf8800000 | (rn << 16) | (rt << 12) | imm,
@@ -1357,6 +1655,28 @@ thumb_opcode th_strb_imm(uint16_t rt, uint16_t rn, int imm, uint16_t puw, thumb_
   }
   else if (rt != R_SP && imm <= 255)
   {
+    {
+      const uint32_t p = (puw >> 2) & 1;
+      const uint32_t u = (puw >> 1) & 1;
+      const uint32_t w = (puw >> 0) & 1;
+      if (p && !w)
+      {
+        THOP_TRACE("strb %s, [%s, #%c%d]\n", th_reg_name(rt), th_reg_name(rn), u ? '+' : '-', imm);
+      }
+      else if (p && w)
+      {
+        THOP_TRACE("strb %s, [%s, #%c%d]!\n", th_reg_name(rt), th_reg_name(rn), u ? '+' : '-', imm);
+      }
+      else if (!p && w)
+      {
+        THOP_TRACE("strb %s, [%s], #%c%d\n", th_reg_name(rt), th_reg_name(rn), u ? '+' : '-', imm);
+      }
+      else
+      {
+        THOP_TRACE("strb %s, [%s, #%c%d] (puw=%u)\n", th_reg_name(rt), th_reg_name(rn), u ? '+' : '-', imm,
+                   (unsigned)puw);
+      }
+    }
     return (thumb_opcode){
         .size = 4,
         .opcode = 0xf8000800 | (rn << 16) | (rt << 12) | ((puw & 0x7) << 8) | imm,
@@ -1374,6 +1694,7 @@ thumb_opcode th_strb_reg(uint32_t rt, uint32_t rn, uint32_t rm, thumb_shift shif
   // puw == 6 means positive offset on rn, so T1 encoding can be used
   if (rm < 8 && rt < 8 && rn < 8 && shift.type == THUMB_SHIFT_NONE && encoding != ENFORCE_ENCODING_32BIT)
   {
+    THOP_TRACE("strb %s, [%s, %s]\n", th_reg_name(rt), th_reg_name(rn), th_reg_name(rm));
     return (thumb_opcode){
         .size = 2,
         .opcode = (0x5400 | (rm << 6) | (rn << 3) | rt),
@@ -1382,6 +1703,9 @@ thumb_opcode th_strb_reg(uint32_t rt, uint32_t rn, uint32_t rm, thumb_shift shif
 #ifndef TCC_TARGET_ARM_ARCHV6M
   else if (rt != R_SP && rm != R_SP && rm != R_PC)
   {
+    THOP_TRACE("strb %s, [%s, %s", th_reg_name(rt), th_reg_name(rn), th_reg_name(rm));
+    th_trace_shift_suffix(shift);
+    THOP_TRACE("]\n");
     return (thumb_opcode){
         .size = 4,
         .opcode = 0xf8000000 | (rn << 16) | (rt << 12) | rm | shift.value << 4,
@@ -1403,6 +1727,7 @@ thumb_opcode th_str_reg(uint32_t rt, uint32_t rn, uint32_t rm, thumb_shift shift
 
   if (rm < 8 && rt < 8 && rn < 8 && shift.type == THUMB_SHIFT_NONE && encoding != ENFORCE_ENCODING_32BIT)
   {
+    THOP_TRACE("str %s, [%s, %s]\n", th_reg_name(rt), th_reg_name(rn), th_reg_name(rm));
     return (thumb_opcode){
         .size = 2,
         .opcode = (0x5000 | (rm << 6) | (rn << 3) | rt),
@@ -1411,6 +1736,9 @@ thumb_opcode th_str_reg(uint32_t rt, uint32_t rn, uint32_t rm, thumb_shift shift
 #ifndef TCC_TARGET_ARM_ARCHV6M
   else if (rt != R_SP && rm != R_SP && rm != R_PC)
   {
+    THOP_TRACE("str %s, [%s, %s", th_reg_name(rt), th_reg_name(rn), th_reg_name(rm));
+    th_trace_shift_suffix(shift);
+    THOP_TRACE("]\n");
     return (thumb_opcode){
         .size = 4,
         .opcode = (0xf8400000 | (rn << 16) | (rt << 12) | rm | shift.value << 4),
@@ -3143,6 +3471,7 @@ thumb_opcode th_str_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw, thumb_e
   if (puw == 6 && rn < 8 && rt < 8 && imm <= 124 && !(imm & 3) && encoding != ENFORCE_ENCODING_32BIT)
   {
     // imm[0] is enforced to be 0, and sould be divided by 4, thus offset is 4
+    THOP_TRACE("str %s, [%s, #%d]\n", th_reg_name(rt), th_reg_name(rn), imm);
     return (thumb_opcode){
         .size = 2,
         .opcode = 0x6000 | (imm << 4) | (rn << 3) | rt,
@@ -3150,6 +3479,7 @@ thumb_opcode th_str_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw, thumb_e
   }
   else if (puw == 6 && rn == R_SP && rt < 8 && imm <= 1020 && encoding != ENFORCE_ENCODING_32BIT)
   {
+    THOP_TRACE("str %s, [%s, #%d]\n", th_reg_name(rt), th_reg_name(rn), imm);
     return (thumb_opcode){
         .size = 2,
         .opcode = 0x9000 | (rt << 8) | (imm >> 2),
@@ -3160,6 +3490,7 @@ thumb_opcode th_str_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw, thumb_e
   {
     uint32_t ins = (0xf8c0 | (rn & 0xf)) << 16;
     ins |= (rt << 12) | imm;
+    THOP_TRACE("str %s, [%s, #%d]\n", th_reg_name(rt), th_reg_name(rn), imm);
     return (thumb_opcode){
         .size = 4,
         .opcode = ins,
@@ -3168,6 +3499,7 @@ thumb_opcode th_str_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw, thumb_e
   else if (imm >= 0 && imm <= 4095 && rn == R_PC)
   {
     uint32_t u = (puw & 0x2) >> 1;
+    THOP_TRACE("str %s, [%s, #%c%d]\n", th_reg_name(rt), th_reg_name(rn), u ? '+' : '-', imm);
     return (thumb_opcode){
         .size = 4,
         .opcode = 0xf85f0000 | (u << 23) | (rt << 12) | imm,
@@ -3177,6 +3509,28 @@ thumb_opcode th_str_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw, thumb_e
   {
     uint32_t ins = (0xf840 | (rn & 0xf)) << 16;
     ins |= (0x0800 | ((rt & 0xf) << 12) | ((puw & 0x7) << 8) | imm);
+    {
+      const uint32_t p = (puw >> 2) & 1;
+      const uint32_t u = (puw >> 1) & 1;
+      const uint32_t w = (puw >> 0) & 1;
+      if (p && !w)
+      {
+        THOP_TRACE("str %s, [%s, #%c%d]\n", th_reg_name(rt), th_reg_name(rn), u ? '+' : '-', imm);
+      }
+      else if (p && w)
+      {
+        THOP_TRACE("str %s, [%s, #%c%d]!\n", th_reg_name(rt), th_reg_name(rn), u ? '+' : '-', imm);
+      }
+      else if (!p && w)
+      {
+        THOP_TRACE("str %s, [%s], #%c%d\n", th_reg_name(rt), th_reg_name(rn), u ? '+' : '-', imm);
+      }
+      else
+      {
+        THOP_TRACE("str %s, [%s, #%c%d] (puw=%u)\n", th_reg_name(rt), th_reg_name(rn), u ? '+' : '-', imm,
+                   (unsigned)puw);
+      }
+    }
     return (thumb_opcode){
         .size = 4,
         .opcode = ins,
@@ -3191,6 +3545,7 @@ thumb_opcode th_str_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw, thumb_e
 
 thumb_opcode th_strbt(uint32_t rt, uint32_t rn, int imm)
 {
+  THOP_TRACE("strbt %s, [%s], #%d\n", th_reg_name(rt), th_reg_name(rn), imm);
   return (thumb_opcode){
       .size = 4,
       .opcode = 0xf8000e00 | (rn << 16) | (rt << 12) | (imm & 0xff),
@@ -3201,6 +3556,7 @@ thumb_opcode th_strd_imm(uint32_t rt, uint32_t rt2, uint32_t rn, int imm, uint32
 {
   const uint32_t pu = (puw >> 1) & 0x3;
   const uint32_t w = puw & 0x1;
+  THOP_TRACE("strd %s, %s, [%s, #%d]%s\n", th_reg_name(rt), th_reg_name(rt2), th_reg_name(rn), imm, w ? "!" : "");
   return (thumb_opcode){
       .size = 4,
       .opcode = 0xe8400000 | (pu << 23) | w << 21 | rn << 16 | rt << 12 | rt2 << 8 | (imm >> 2),
@@ -3215,6 +3571,7 @@ thumb_opcode th_strex(uint32_t rd, uint32_t rt, uint32_t rn, int imm)
               "value: 0x3fc\n",
               imm);
   }
+  THOP_TRACE("strex %s, %s, [%s, #%d]\n", th_reg_name(rd), th_reg_name(rt), th_reg_name(rn), imm);
   return (thumb_opcode){
       .size = 4,
       .opcode = 0xe8400000 | (rn << 16) | (rt << 12) | (rd << 8) | (imm >> 2),
@@ -3223,6 +3580,7 @@ thumb_opcode th_strex(uint32_t rd, uint32_t rt, uint32_t rn, int imm)
 
 thumb_opcode th_strexb(uint32_t rd, uint32_t rt, uint32_t rn)
 {
+  THOP_TRACE("strexb %s, %s, [%s]\n", th_reg_name(rd), th_reg_name(rt), th_reg_name(rn));
   return (thumb_opcode){
       .size = 4,
       .opcode = 0xe8c00f40 | (rn << 16) | (rt << 12) | rd,
@@ -3231,6 +3589,7 @@ thumb_opcode th_strexb(uint32_t rd, uint32_t rt, uint32_t rn)
 
 thumb_opcode th_strexh(uint32_t rd, uint32_t rt, uint32_t rn)
 {
+  THOP_TRACE("strexh %s, %s, [%s]\n", th_reg_name(rd), th_reg_name(rt), th_reg_name(rn));
   return (thumb_opcode){
       .size = 4,
       .opcode = 0xe8c00f50 | (rn << 16) | (rt << 12) | rd,
@@ -3239,6 +3598,7 @@ thumb_opcode th_strexh(uint32_t rd, uint32_t rt, uint32_t rn)
 
 thumb_opcode th_strht(uint32_t rt, uint32_t rn, int imm)
 {
+  THOP_TRACE("strht %s, [%s], #%d\n", th_reg_name(rt), th_reg_name(rn), imm);
   return (thumb_opcode){
       .size = 4,
       .opcode = 0xf8200e00 | (rn << 16) | (rt << 12) | (imm & 0xff),
@@ -3247,6 +3607,7 @@ thumb_opcode th_strht(uint32_t rt, uint32_t rn, int imm)
 
 thumb_opcode th_strt(uint32_t rt, uint32_t rn, int imm)
 {
+  THOP_TRACE("strt %s, [%s], #%d\n", th_reg_name(rt), th_reg_name(rn), imm);
   return (thumb_opcode){
       .size = 4,
       .opcode = 0xf8400e00 | (rn << 16) | (rt << 12) | (imm & 0xff),

@@ -80,6 +80,12 @@ void tcc_ls_add_live_interval(LSLiveIntervalState *ls, int vreg, int start, int 
 void tcc_ls_allocate_registers(LSLiveIntervalState *ls, int used_parameters_registers,
                                int used_float_parameters_registers, int spill_base);
 
+/* Reassign stack spill slots densely starting from spill_base.
+ * Useful after rewriting intervals (e.g. dropping some spills) so the frame
+ * size and remaining spill offsets shrink accordingly.
+ */
+void tcc_ls_compact_stack_locations(LSLiveIntervalState *ls, int spill_base);
+
 /* Find a free scratch register at the given instruction index.
  * Returns -1 if no register is available.
  *

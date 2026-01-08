@@ -7,9 +7,18 @@
  * - -mfpu: vfpv4-sp-d16, fpv5-d16, none, etc.
  *
  * Dispatches to the appropriate FP library built from lib/fp/
+ *
+ * KNOWN BUG WORKAROUND:
+ * TinyCC ARM Thumb has a critical bug in the >= operator for unsigned comparisons.
+ * Symptoms: (a >= b) returns incorrect values (often 0 when should be 1, or garbage).
+ * Workaround: Replace (a >= b) with !(a < b) which works correctly.
+ * See tests/ir_tests/test_ge_operator.c for test cases.
  */
 
 #include <stddef.h>
+
+typedef unsigned int u32;
+typedef int s32;
 
 /* FP Library Selection
  * ====================
@@ -35,49 +44,127 @@
 
 /* ARM EABI required symbols for non-FP operations */
 
-/* Memory comparison functions required by EABI */
-int __aeabi_memcpy_aligned(void *dest, const void *src, size_t n)
+/* Memory functions required by EABI */
+
+/* NOTE: ARM EABI defines __aeabi_memset() argument order as (dest, n, c),
+ * i.e. it differs from ISO C memset(dest, c, n).
+ */
+
+static void *aeabi_memcpy_impl(void *dest, const void *src, size_t n)
 {
-  /* stubbed */
-  (void)dest;
-  (void)src;
-  (void)n;
-  return 0;
+  unsigned char *d = (unsigned char *)dest;
+  const unsigned char *s = (const unsigned char *)src;
+
+  /* memcpy has undefined behavior for overlap; we still implement a simple
+   * forward copy (fast and correct for non-overlapping ranges).
+   */
+  if (n == 0 || d == s)
+    return dest;
+
+  /* If both pointers are word-aligned, copy words first. */
+  {
+    unsigned long da = (unsigned long)d;
+    unsigned long sa = (unsigned long)s;
+    if (((da | sa) & (sizeof(unsigned long) - 1)) == 0)
+    {
+      unsigned long *dw = (unsigned long *)d;
+      const unsigned long *sw = (const unsigned long *)s;
+      while (n >= sizeof(unsigned long))
+      {
+        *dw++ = *sw++;
+        n -= sizeof(unsigned long);
+      }
+      d = (unsigned char *)dw;
+      s = (const unsigned char *)sw;
+    }
+  }
+
+  while (n--)
+    *d++ = *s++;
+  return dest;
 }
 
-int __aeabi_memcpy(void *dest, const void *src, size_t n)
+static void *aeabi_memmove_impl(void *dest, const void *src, size_t n)
 {
-  /* stubbed */
-  (void)dest;
-  (void)src;
-  (void)n;
-  return 0;
+  unsigned char *d = (unsigned char *)dest;
+  const unsigned char *s = (const unsigned char *)src;
+
+  if (n == 0 || d == s)
+    return dest;
+
+  if (d < s || d >= (s + n))
+  {
+    /* Non-overlapping (or forward-safe overlap) */
+    return aeabi_memcpy_impl(dest, src, n);
+  }
+
+  /* Overlap with dest inside source range: copy backwards. */
+  d += n;
+  s += n;
+  while (n--)
+    *--d = *--s;
+  return dest;
 }
 
-int __aeabi_memmove(void *dest, const void *src, size_t n)
+void *__aeabi_memcpy_aligned(void *dest, const void *src, size_t n)
 {
-  /* stubbed */
-  (void)dest;
-  (void)src;
-  (void)n;
-  return 0;
+  /* Caller promises alignment; our impl already takes advantage of it. */
+  return aeabi_memcpy_impl(dest, src, n);
 }
 
-int __aeabi_memset(void *s, int c, size_t n)
+void *__aeabi_memcpy(void *dest, const void *src, size_t n)
 {
-  /* stubbed */
-  (void)s;
-  (void)c;
-  (void)n;
-  return 0;
+  return aeabi_memcpy_impl(dest, src, n);
 }
 
-int __aeabi_memclr(void *s, size_t n)
+void *__aeabi_memmove(void *dest, const void *src, size_t n)
 {
-  /* stubbed */
-  (void)s;
-  (void)n;
-  return 0;
+  return aeabi_memmove_impl(dest, src, n);
+}
+
+/* ARM EABI convenience entrypoint: src/dest are 4-byte aligned and n is a
+ * multiple of 4. Some generated code calls this symbol directly.
+ */
+void *__aeabi_memmove4(void *dest, const void *src, size_t n)
+{
+  return aeabi_memmove_impl(dest, src, n);
+}
+
+void *__aeabi_memset(void *dest, size_t n, int c)
+{
+  unsigned char *d = (unsigned char *)dest;
+  unsigned char byte = (unsigned char)c;
+
+  if (n == 0)
+    return dest;
+
+  /* If word-aligned, expand byte to a word and store words first. */
+  {
+    unsigned long da = (unsigned long)d;
+    if ((da & (sizeof(unsigned long) - 1)) == 0)
+    {
+      unsigned long pattern = 0;
+      for (unsigned i = 0; i < sizeof(unsigned long); ++i)
+        pattern = (pattern << 8) | byte;
+
+      unsigned long *dw = (unsigned long *)d;
+      while (n >= sizeof(unsigned long))
+      {
+        *dw++ = pattern;
+        n -= sizeof(unsigned long);
+      }
+      d = (unsigned char *)dw;
+    }
+  }
+
+  while (n--)
+    *d++ = byte;
+  return dest;
+}
+
+void __aeabi_memclr(void *dest, size_t n)
+{
+  (void)__aeabi_memset(dest, n, 0);
 }
 
 /* Division functions */
@@ -85,146 +172,267 @@ int __aeabi_memclr(void *s, size_t n)
 /* Unsigned 32-bit division */
 unsigned int __aeabi_uidiv(unsigned int numerator, unsigned int denominator)
 {
-  /* stubbed */
-  (void)numerator;
-  (void)denominator;
-  return 0;
+  /* Simple restoring division (avoids libgcc dependency). */
+  if (denominator == 0)
+    return 0;
+  u32 q = 0;
+  u32 r = 0;
+  for (int i = 31; i >= 0; --i)
+  {
+    r = (r << 1) | ((numerator >> i) & 1u);
+    /* Workaround for >= bug: use !(r < denominator) instead of (r >= denominator) */
+    if (!(r < denominator))
+    {
+      r -= denominator;
+      q |= (1u << i);
+    }
+  }
+  return q;
 }
 
 /* Signed 32-bit division */
 int __aeabi_idiv(int numerator, int denominator)
 {
-  /* stubbed */
-  (void)numerator;
-  (void)denominator;
-  return 0;
+  if (denominator == 0)
+    return 0;
+  int neg = 0;
+  u32 un = (u32)numerator;
+  u32 ud = (u32)denominator;
+  if (numerator < 0)
+  {
+    neg ^= 1;
+    un = (u32)(-numerator);
+  }
+  if (denominator < 0)
+  {
+    neg ^= 1;
+    ud = (u32)(-denominator);
+  }
+  u32 q = __aeabi_uidiv(un, ud);
+  return neg ? -(int)q : (int)q;
 }
 
-/* 64-bit unsigned division (returns quotient in r0:r1, remainder in r2:r3) */
+/* 64-bit unsigned division/modulus.
+ * AAPCS returns small structs in r0-r3; TCC also consumes quotient in r0:r1.
+ */
 typedef struct
 {
-  unsigned int quotient_low;
-  unsigned int quotient_high;
-  unsigned int remainder_low;
-  unsigned int remainder_high;
+  u32 quotient_low;
+  u32 quotient_high;
+  u32 remainder_low;
+  u32 remainder_high;
 } uint64_div_result;
 
-int __aeabi_uldivmod(unsigned long long numerator, unsigned long long denominator)
+static int u64_ge(u32 a_lo, u32 a_hi, u32 b_lo, u32 b_hi)
 {
-#if 0
-    /* TODO: implement full 64-bit unsigned division */
-    uint64_div_result result;
-    if (denominator == 0) {
-        result.quotient_low = 0;
-        result.quotient_high = 0;
-        result.remainder_low = 0;
-        result.remainder_high = 0;
-        return result;
-    }
-    unsigned long long quotient = numerator / denominator;
-    unsigned long long remainder = numerator % denominator;
-    result.quotient_low = (unsigned int)quotient;
-    result.quotient_high = (unsigned int)(quotient >> 32);
-    result.remainder_low = (unsigned int)remainder;
-    result.remainder_high = (unsigned int)(remainder >> 32);
-    return result;
-#else
-  /* long long support not yet implemented */
-  (void)numerator;
-  (void)denominator;
-  //   return (uint64_div_result){0, 0, 0, 0};
-  return 0;
-#endif
+  /* Compare 64-bit values: return 1 if a >= b, else 0 */
+  if (a_hi > b_hi)
+    return 1;
+  if (a_hi < b_hi)
+    return 0;
+  /* High words equal, compare low words (unsigned) */
+  if (a_lo > b_lo)
+    return 1;
+  if (a_lo < b_lo)
+    return 0;
+  return 1; /* equal */
 }
 
-/* 64-bit signed division */
+static inline void u64_sub(u32 *a_lo, u32 *a_hi, u32 b_lo, u32 b_hi)
+{
+  const u32 old_lo = *a_lo;
+  *a_lo = old_lo - b_lo;
+  const u32 borrow = (old_lo < b_lo);
+  *a_hi = *a_hi - b_hi - borrow;
+}
+
+static void udivmod_u64(uint64_div_result *out, u32 n_lo, u32 n_hi, u32 d_lo, u32 d_hi)
+{
+  out->quotient_low = 0;
+  out->quotient_high = 0;
+  out->remainder_low = 0;
+  out->remainder_high = 0;
+
+  if ((d_lo | d_hi) == 0)
+    return;
+
+  int debug_count = 0;
+
+  for (int i = 63; i >= 0; --i)
+  {
+    /* r <<= 1 */
+    out->remainder_high = (out->remainder_high << 1) | (out->remainder_low >> 31);
+    out->remainder_low <<= 1;
+
+    /* r |= (n >> i) & 1 */
+    u32 bit;
+    if (i >= 32)
+      bit = (n_hi >> (i - 32)) & 1u;
+    else
+      bit = (n_lo >> i) & 1u;
+    out->remainder_low |= bit;
+
+    if (u64_ge(out->remainder_low, out->remainder_high, d_lo, d_hi))
+    {
+      u64_sub(&out->remainder_low, &out->remainder_high, d_lo, d_hi);
+      if (i >= 32)
+        out->quotient_high |= (1u << (i - 32));
+      else
+        out->quotient_low |= (1u << i);
+    }
+  }
+}
+
+/* Type definitions for 64-bit operations */
+typedef unsigned int Wtype;
+typedef long long DWtype;
+typedef unsigned long long UDWtype;
+
+struct DWstruct
+{
+  Wtype low, high;
+};
+
+typedef union
+{
+  struct DWstruct s;
+  DWtype ll;
+} DWunion;
+
+uint64_div_result __aeabi_uldivmod(unsigned long long numerator, unsigned long long denominator)
+{
+  DWunion nn, dd;
+  nn.ll = (UDWtype)numerator;
+  dd.ll = (UDWtype)denominator;
+  uint64_div_result r;
+  udivmod_u64(&r, nn.s.low, nn.s.high, dd.s.low, dd.s.high);
+  return r;
+}
+
+/* 64-bit signed division/modulus (quotient in r0:r1, remainder in r2:r3). */
 typedef struct
 {
-  int quotient_low;
-  int quotient_high;
-  int remainder_low;
-  int remainder_high;
+  u32 quotient_low;
+  s32 quotient_high;
+  u32 remainder_low;
+  s32 remainder_high;
 } int64_div_result;
 
-int __aeabi_ldivmod(long long numerator, long long denominator)
+static inline void u64_neg(u32 *lo, u32 *hi)
 {
-#if 0
-    /* TODO: implement full 64-bit signed division */
-    int64_div_result result;
-    if (denominator == 0) {
-        result.quotient_low = 0;
-        result.quotient_high = 0;
-        result.remainder_low = 0;
-        result.remainder_high = 0;
-        return result;
-    }
-    long long quotient = numerator / denominator;
-    long long remainder = numerator % denominator;
-    result.quotient_low = (int)quotient;
-    result.quotient_high = (int)(quotient >> 32);
-    result.remainder_low = (int)remainder;
-    result.remainder_high = (int)(remainder >> 32);
-    return result;
-#else
-  /* long long support not yet implemented */
-  (void)numerator;
-  (void)denominator;
-  //   return (int64_div_result){0, 0, 0, 0};
-  return 0;
-#endif
+  *lo = ~(*lo) + 1u;
+  *hi = ~(*hi) + (*lo == 0);
+}
+
+/* 64-bit signed division/modulus (quotient in r0:r1, remainder in r2:r3).
+ * IMPORTANT: This function receives parameters in registers per EABI:
+ *   r0 = numerator low, r1 = numerator high
+ *   r2 = denominator low, r3 = denominator high
+ * And must return:
+ *   r0 = quotient low, r1 = quotient high
+ *   r2 = remainder low, r3 = remainder high
+ *
+ * We cannot use normal C calling convention because that would pass/return via stack.
+ * Solution: Use explicit assembly or trust that TinyCC handles __aeabi_* specially.
+ */
+int64_div_result __aeabi_ldivmod(unsigned int n_lo, int n_hi, unsigned int d_lo, int d_hi)
+{
+  int q_neg = 0;
+  int r_neg = 0;
+
+  u32 un_lo = n_lo;
+  u32 un_hi = (u32)n_hi;
+  u32 ud_lo = d_lo;
+  u32 ud_hi = (u32)d_hi;
+
+  if (n_hi < 0)
+  {
+    q_neg ^= 1;
+    r_neg = 1;
+    u64_neg(&un_lo, &un_hi);
+  }
+  if (d_hi < 0)
+  {
+    q_neg ^= 1;
+    u64_neg(&ud_lo, &ud_hi);
+  }
+
+  uint64_div_result ur;
+  udivmod_u64(&ur, un_lo, un_hi, ud_lo, ud_hi);
+
+  u32 qlo = ur.quotient_low;
+  u32 qhi = ur.quotient_high;
+  u32 rlo = ur.remainder_low;
+  u32 rhi = ur.remainder_high;
+
+  if (q_neg)
+    u64_neg(&qlo, &qhi);
+  if (r_neg)
+    u64_neg(&rlo, &rhi);
+
+  int64_div_result out;
+  out.quotient_low = qlo;
+  out.quotient_high = (s32)qhi;
+  out.remainder_low = rlo;
+  out.remainder_high = (s32)rhi;
+  return out;
 }
 
 /* Unsigned 64-bit divide and return remainder */
 unsigned long long __aeabi_ulmod(unsigned long long a, unsigned long long b)
 {
-#if 0
-    /* TODO: implement full 64-bit unsigned modulus */
-    if (b == 0) {
-        return 0;
-    }
-    return a % b;
-#else
-  /* long long support not yet implemented */
-  (void)a;
-  (void)b;
-  return 0;
-#endif
+  uint64_div_result r = __aeabi_uldivmod(a, b);
+  DWunion rr;
+  rr.s.low = r.remainder_low;
+  rr.s.high = r.remainder_high;
+  return rr.ll;
 }
 
 /* Signed 64-bit divide and return remainder */
 long long __aeabi_lmod(long long a, long long b)
 {
-#if 0
-    /* TODO: implement full 64-bit signed modulus */
-    if (b == 0) {
-        return 0;
-    }
-    return a % b;
-#else
-  /* long long support not yet implemented */
-  (void)a;
-  (void)b;
-  return 0;
-#endif
+  DWunion aa, bb;
+  aa.ll = a;
+  bb.ll = b;
+  int64_div_result r = __aeabi_ldivmod(aa.s.low, aa.s.high, bb.s.low, bb.s.high);
+  DWunion rr;
+  rr.s.low = r.remainder_low;
+  rr.s.high = r.remainder_high;
+  return rr.ll;
 }
 
 /* 64-bit comparison functions */
 
 /* Signed 64-bit comparison
  * Returns: <0 if a < b, 0 if a == b, >0 if a > b
- * Uses only 32-bit operations to avoid recursive long long comparison */
+ * Uses only 32-bit operations to avoid recursive long long comparison.
+ *
+ * NOTE: We use explicit 32-bit parameters instead of long long because
+ * TinyCC ARM Thumb has a compiler bug where assigning 64-bit function
+ * parameters to local variables can generate incorrect code that stores
+ * the wrong register pair (stores r0:r1 instead of r2:r3 for the second
+ * parameter). Using explicit 32-bit parameters avoids this bug. */
 int __aeabi_lcmp(unsigned int a_lo, int a_hi, unsigned int b_lo, int b_hi)
 {
   /* Compare high words first (signed) */
   if (a_hi < b_hi)
+  {
     return -1;
+  }
   if (a_hi > b_hi)
+  {
     return 1;
+  }
   /* High words equal, compare low words (unsigned) */
   if (a_lo < b_lo)
+  {
     return -1;
+  }
   if (a_lo > b_lo)
+  {
     return 1;
+  }
+
   return 0;
 }
 
@@ -251,28 +459,17 @@ int __aeabi_ulcmp(unsigned int a_lo, unsigned int a_hi, unsigned int b_lo, unsig
 /* Count leading zeros */
 int __aeabi_clz(int x)
 {
-  /* stubbed */
-  (void)x;
-  return 0;
+  /* Portable clz for 32-bit (undefined for x==0 per EABI; return 32). */
+  u32 v = (u32)x;
+  if (v == 0)
+    return 32;
+  int n = 0;
+  for (u32 bit = 0x80000000u; (v & bit) == 0; bit >>= 1)
+    ++n;
+  return n;
 }
 
 /* 64-bit shift operations - soft implementations for ARM EABI */
-
-/* Type definitions for 64-bit operations */
-typedef unsigned int Wtype;
-typedef long long DWtype;
-typedef unsigned long long UDWtype;
-
-struct DWstruct
-{
-  Wtype low, high;
-};
-
-typedef union
-{
-  struct DWstruct s;
-  DWtype ll;
-} DWunion;
 
 /* Logical shift right for 64-bit unsigned */
 unsigned long long __aeabi_llsr(unsigned long long a, int b)
@@ -306,6 +503,24 @@ long long __aeabi_llsl(long long a, int b)
   {
     u.s.high = ((unsigned)u.s.high << b) | ((unsigned)u.s.low >> (32 - b));
     u.s.low = (unsigned)u.s.low << b;
+  }
+  return u.ll;
+}
+
+/* Arithmetic shift right for 64-bit signed */
+long long __aeabi_lasr(long long a, int b)
+{
+  DWunion u;
+  u.ll = a;
+  if (b >= 32)
+  {
+    u.s.low = (u32)((s32)u.s.high >> (b - 32));
+    u.s.high = (s32)u.s.high >> 31;
+  }
+  else if (b != 0)
+  {
+    u.s.low = ((u32)u.s.low >> b) | ((u32)u.s.high << (32 - b));
+    u.s.high = (s32)u.s.high >> b;
   }
   return u.ll;
 }

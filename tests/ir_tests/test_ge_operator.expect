@@ -1,0 +1,4 @@
+Testing >= operator bug:
+Results:
+Direct >= operator: 10/10 tests passed
+Workaround method: 10/10 tests passed

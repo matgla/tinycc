@@ -64,6 +64,7 @@ typedef enum TccIrOp
   TCCIR_OP_LOAD,
   TCCIR_OP_STORE,
   TCCIR_OP_ASSIGN,
+  TCCIR_OP_LEA, /* Load Effective Address: dest = &src1 (compute address without loading) */
   /* Floating point operations */
   TCCIR_OP_FADD, /* float/double addition */
   TCCIR_OP_FSUB, /* float/double subtraction */
@@ -120,24 +121,43 @@ typedef struct IRLiveInterval
   int8_t incoming_reg0;    // for params: which register arg arrives in (-1 if stack)
   int8_t incoming_reg1;    // for doubles: second register (-1 if not double or stack)
   int16_t original_offset; // for params: original offset from function entry point
+  int stack_slot_index;    // index into stack layout (-1 if not stack-backed)
 } IRLiveInterval;
+
+/* IRCallSite: explicit binding of call arguments to a FUNCCALL instruction.
+ * Phase 1: arg list references the original FUNCPARAMVAL instructions by index.
+ * This avoids backend IR scanning and makes argument ownership stable.
+ */
+typedef struct IRCallSite
+{
+  int call_instr_index; /* index into ir->instructions (current, post-opts) */
+  int call_orig_index;  /* stable orig_index for debugging/mapping */
+  int argc;
+  int *arg_instr_index_by_num; /* length argc; each is an index into ir->instructions */
+} IRCallSite;
 
 /* SpillContext: Tracks spilled register loading/storing for IR operations
  * Used by generate_code to centralize spill handling before/after machine ops
  */
 typedef struct SpillContext
 {
-  int8_t orig_src1_pr0, orig_src2_pr0, orig_dest_pr0; // Original register allocations
-  int8_t dest_scratch_reg;                            // Scratch register used for dest result
-  int8_t src1_scratch_reg, src2_scratch_reg;          // Scratch registers used for src operands
-  int src1_offset, src2_offset, dest_offset;          // Stack offsets
-  uint8_t src1_spilled : 1;                           // Whether src1 was in memory
-  uint8_t src2_spilled : 1;                           // Whether src2 was in memory
-  uint8_t dest_spilled : 1;                           // Whether dest was in memory
-  uint8_t is_64bit : 1;                               // Whether operation is 64-bit
-  uint8_t src1_reg_saved : 1;                         // Whether src1 scratch reg was saved to stack
-  uint8_t src2_reg_saved : 1;                         // Whether src2 scratch reg was saved to stack
-  uint8_t dest_reg_saved : 1;                         // Whether dest scratch reg was saved to stack
+  int8_t orig_src1_pr0, orig_src1_pr1; // Original register allocations
+  int8_t orig_src2_pr0, orig_src2_pr1;
+  int8_t orig_dest_pr0, orig_dest_pr1;
+  int8_t dest_scratch_reg, dest_scratch_reg1; // Scratch register(s) used for dest result
+  int8_t src1_scratch_reg, src1_scratch_reg1; // Scratch register(s) used for src operands
+  int8_t src2_scratch_reg, src2_scratch_reg1;
+  int src1_offset, src2_offset, dest_offset; // Stack offsets
+  uint8_t src1_spilled : 1;                  // Whether src1 was in memory
+  uint8_t src2_spilled : 1;                  // Whether src2 was in memory
+  uint8_t dest_spilled : 1;                  // Whether dest was in memory
+  uint8_t is_64bit : 1;                      // Whether operation is 64-bit
+  uint8_t src1_reg_saved : 1;                // Whether src1 scratch reg was saved to stack
+  uint8_t src1_reg_saved1 : 1;               // Whether src1 scratch reg1 was saved to stack
+  uint8_t src2_reg_saved : 1;                // Whether src2 scratch reg was saved to stack
+  uint8_t src2_reg_saved1 : 1;               // Whether src2 scratch reg1 was saved to stack
+  uint8_t dest_reg_saved : 1;                // Whether dest scratch reg was saved to stack
+  uint8_t dest_reg_saved1 : 1;               // Whether dest scratch reg1 was saved to stack
 } SpillContext;
 
 /* SpillCache: Track which registers hold which stack slot values.
@@ -156,6 +176,75 @@ typedef struct SpillCache
 {
   SpillCacheEntry entries[SPILL_CACHE_SIZE];
 } SpillCache;
+
+typedef enum TCCStackSlotKind
+{
+  TCC_STACK_SLOT_SPILL = 1,
+  TCC_STACK_SLOT_PARAM_SPILL,
+  TCC_STACK_SLOT_LOCAL,
+  TCC_STACK_SLOT_VLA_SAVE,
+} TCCStackSlotKind;
+
+typedef struct TCCStackSlot
+{
+  TCCStackSlotKind kind;
+  int vreg;      // primary owner vreg (or -1 for shared/fixed slots)
+  int offset;    // frame-pointer relative offset (bytes)
+  int size;      // slot size in bytes
+  int alignment; // required alignment in bytes (power of two)
+  uint8_t live_across_calls;
+  uint8_t addressable; // non-zero if slot must remain addressable (addr taken)
+} TCCStackSlot;
+
+typedef struct TCCStackLayout
+{
+  TCCStackSlot *slots;
+  int slot_count;
+  int slot_capacity;
+} TCCStackLayout;
+
+typedef struct TCCMachineScratchRegs
+{
+  unsigned char reg_count;
+  unsigned char saved_mask;
+  int regs[2];
+} TCCMachineScratchRegs;
+
+#define TCC_MACHINE_SCRATCH_NEEDS_PAIR (1u << 0)
+#define TCC_MACHINE_SCRATCH_PREFERS_FLOAT (1u << 1)
+#define TCC_MACHINE_SCRATCH_ALLOW_REUSE (1u << 2)
+
+typedef struct TCCMaterializedValue
+{
+  uint8_t used_scratch;
+  uint8_t is_64bit;
+  uint8_t original_pr0;
+  uint8_t original_pr1;
+  unsigned short original_r;
+  uint64_t original_c_i;
+  TCCMachineScratchRegs scratch;
+} TCCMaterializedValue;
+
+typedef struct TCCMaterializedAddr
+{
+  uint8_t used_scratch;
+  uint8_t original_pr0;
+  uint8_t original_pr1;
+  unsigned short original_r;
+  uint64_t original_c_i;
+  TCCMachineScratchRegs scratch;
+} TCCMaterializedAddr;
+
+typedef struct TCCMaterializedDest
+{
+  uint8_t needs_storeback;
+  uint8_t is_64bit;
+  uint8_t original_pr0;
+  uint8_t original_pr1;
+  unsigned short original_r;
+  int frame_offset;
+  TCCMachineScratchRegs scratch;
+} TCCMaterializedDest;
 
 typedef struct TCCIRState
 {
@@ -191,10 +280,20 @@ typedef struct TCCIRState
   /* Current instruction index during code generation - used for scratch register allocation */
   int codegen_instruction_idx;
 
+  /* Callsite table: built from FUNCPARAM* / FUNCCALL* stream so backends
+   * and liveness do not need to scan the IR instruction stream.
+   */
+  IRCallSite *callsites;
+  int callsite_count;
+  int callsite_capacity;
+  int *callsite_index_by_call_instr; /* maps call instruction index -> callsite index */
+  int callsite_index_by_call_instr_size;
+
   uint32_t *ignored_vregs;
   int ignored_vregs_size;
 
   SpillCache spill_cache; // Cache for tracking register-stack mappings during codegen
+  TCCStackLayout stack_layout;
 
   /* Mapping from IR instruction index to generated machine code offset (section-relative).
    * Size is (next_instruction_index + 1) to include the epilogue mapping.
@@ -239,7 +338,24 @@ int tcc_ir_get_reg_type(TCCIRState *ir, int vreg);
 
 void tcc_ir_liveness_analysis(TCCIRState *ir);
 void tcc_ir_register_allocation_params(TCCIRState *ir);
+/* For parameters that arrive on the caller stack (beyond r0-r3 per AAPCS),
+ * do not allocate separate local spill slots. They already have a stable
+ * incoming stack home for the duration of the call. */
+void tcc_ir_avoid_spilling_stack_passed_params(TCCIRState *ir);
 void tcc_ir_generate_code(TCCIRState *ir);
+void tcc_ir_build_stack_layout(TCCIRState *ir);
+const TCCStackSlot *tcc_ir_stack_slot_by_vreg(const TCCIRState *ir, int vreg);
+const TCCStackSlot *tcc_ir_stack_slot_by_offset(const TCCIRState *ir, int frame_offset);
+void tcc_ir_materialize_value(TCCIRState *ir, SValue *sv, TCCMaterializedValue *result);
+void tcc_ir_materialize_addr(TCCIRState *ir, SValue *sv, TCCMaterializedAddr *result);
+void tcc_ir_materialize_dest(TCCIRState *ir, SValue *dest, TCCMaterializedDest *result);
+
+/* Build and query the callsite table used for parameter binding.
+ * `tcc_ir_build_callsites()` is idempotent and can be called multiple times;
+ * it rebuilds the table to match the current IR stream.
+ */
+void tcc_ir_build_callsites(TCCIRState *ir);
+const IRCallSite *tcc_ir_callsite_for_call(const TCCIRState *ir, int call_instr_index);
 
 int tcc_ir_add_local_variable(TCCIRState *ir, Sym *sym, int stack_offset);
 void tcc_ir_assign_physical_register(TCCIRState *ir, int vreg, int offset, int r0, int r1);

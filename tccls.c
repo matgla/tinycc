@@ -75,10 +75,6 @@ void tcc_ls_add_live_interval(LSLiveIntervalState *ls, int vreg, int start, int 
   interval = &ls->intervals[ls->next_interval_index];
   interval->vreg = vreg;
   interval->start = start;
-  printf("Adding live interval for ");
-  tcc_ir_print_vreg(vreg);
-  printf(", start=%d end=%d crosses_call=%d addrtaken=%d reg_type=%d, is_lvalue: %d\n", start, end, crosses_call,
-         addrtaken, reg_type, lvalue);
   interval->end = end;
   interval->r0 = -1;
   interval->r1 = -1;
@@ -135,6 +131,7 @@ static int sort_endpoints(const void *a, const void *b)
 {
   LSLiveInterval *ia = *(LSLiveInterval **)a;
   LSLiveInterval *ib = *(LSLiveInterval **)b;
+  /* Keep PARAMs first to ensure correct parameter register handling */
   if (TCCIR_DECODE_VREG_TYPE(ia->vreg) == TCCIR_VREG_TYPE_PARAM &&
       TCCIR_DECODE_VREG_TYPE(ib->vreg) != TCCIR_VREG_TYPE_PARAM)
   {
@@ -358,11 +355,15 @@ void tcc_ls_expire_old_intervals(LSLiveIntervalState *ls, int current_index)
       .end = ~0,
       .reg_type = LS_REG_TYPE_INT,
   };
+  /* Iterate through ALL active intervals - cannot break early because
+   * the active set is sorted with PARAMs first (for correct parameter
+   * register assignment), which means a long-lived PARAM might come
+   * before a short-lived TMP that should be expired. */
   for (int i = 0; i < ls->next_active_index; ++i)
   {
     if (ls->active_set[i]->end >= current->start)
     {
-      break;
+      continue; /* Still active, skip */
     }
     /* Release registers based on type */
     if (ls->active_set[i]->reg_type == LS_REG_TYPE_FLOAT)
@@ -438,6 +439,44 @@ int tcc_ls_next_stack_location()
   return tcc_ls_next_stack_location_sized(4);
 }
 
+static int tcc_ls_reg_type_stack_size(int reg_type)
+{
+  switch (reg_type)
+  {
+  case LS_REG_TYPE_LLONG:
+  case LS_REG_TYPE_DOUBLE:
+  case LS_REG_TYPE_DOUBLE_SOFT:
+    return 8;
+  default:
+    return 4;
+  }
+}
+
+void tcc_ls_compact_stack_locations(LSLiveIntervalState *ls, int spill_base)
+{
+  if (!ls)
+    return;
+
+  /* Mirror allocator behavior: spill_base is FP-relative (typically <= 0). */
+  if (spill_base > 0)
+    spill_base = 0;
+
+  int loc = spill_base;
+
+  for (int i = 0; i < ls->next_interval_index; ++i)
+  {
+    LSLiveInterval *it = &ls->intervals[i];
+    if (it->stack_location == 0)
+      continue;
+
+    const int size = tcc_ls_reg_type_stack_size(it->reg_type);
+    loc = (loc - size) & -size;
+    if (loc == 0)
+      loc = -size;
+    it->stack_location = loc;
+  }
+}
+
 /* Spill interval to stack. For doubles, allocates 8 bytes. */
 void tcc_ls_spill_interval_sized(LSLiveIntervalState *ls, int interval_index, int size)
 {
@@ -458,7 +497,7 @@ void tcc_ls_spill_interval_sized(LSLiveIntervalState *ls, int interval_index, in
     interval->r1 = spill->r1;
     spill->r0 = -1; /* Clear register from spilled interval */
     spill->r1 = -1;
-    spill->stack_location = tcc_ls_next_stack_location_sized(size);
+    spill->stack_location = tcc_ls_next_stack_location_sized(tcc_ls_reg_type_stack_size(spill->reg_type));
     ls->active_set[ls->next_active_index - 1] = interval;
     qsort(ls->active_set, ls->next_active_index, sizeof(LSLiveInterval *), sort_endpoints);
   }
@@ -520,7 +559,8 @@ void tcc_ls_allocate_registers(LSLiveIntervalState *ls, int used_parameters_regi
     /* Variables whose address is taken must be on the stack */
     if (ls->intervals[i].addrtaken)
     {
-      ls->intervals[i].stack_location = tcc_ls_next_stack_location();
+      ls->intervals[i].stack_location =
+          tcc_ls_next_stack_location_sized(tcc_ls_reg_type_stack_size(ls->intervals[i].reg_type));
       ls->active_set[ls->next_active_index++] = &ls->intervals[i];
       qsort(ls->active_set, ls->next_active_index, sizeof(LSLiveInterval *), sort_endpoints);
       continue;

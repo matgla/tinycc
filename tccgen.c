@@ -23,7 +23,7 @@
 
 #include "tccir.h"
 
-// #define DEBUG_IR_GEN
+#define DEBUG_IR_GEN
 
 /********************************************************/
 /* global variables */
@@ -796,7 +796,8 @@ ST_FUNC Sym *sym_push(int v, CType *type, int r, int c)
   int vreg = -1;
   /* register local variable at IR code generator, get Vreg number */
   /* XXX: no vreg assignment for params so far */
-  if (((r & VT_VALMASK) == VT_LOCAL) && (r & VT_LVAL) && ((type->t & VT_BTYPE) != VT_STRUCT) &&
+  int valmask = r & VT_VALMASK;
+  if (((valmask == VT_LOCAL) || (valmask == VT_LLOCAL)) && (r & VT_LVAL) && ((type->t & VT_BTYPE) != VT_STRUCT) &&
       !(type->t & (VT_ARRAY | VT_VLA)))
   {
     if (r & VT_PARAM)
@@ -1770,7 +1771,63 @@ ST_FUNC void gaddrof(void)
   vtop->r &= ~VT_LVAL;
   /* tricky: if saved lvalue, then we can go back to lvalue */
   if ((vtop->r & VT_VALMASK) == VT_LLOCAL)
-    vtop->r = (vtop->r & ~VT_VALMASK) | VT_LOCAL | VT_LVAL;
+  {
+    /* VT_LLOCAL means the pointer is stored at the local/param location.
+     * We need to load that pointer value into a temporary. */
+    SValue ptr_location = *vtop; // Save the location where the pointer is stored
+
+    // Convert VT_LLOCAL to VT_LOCAL so backend knows it's a stack/param location
+    ptr_location.r = (ptr_location.r & ~VT_VALMASK) | VT_LOCAL | VT_LVAL;
+    // ptr_location should have pointer type, not struct type
+    // This tells the backend that loading from this location gives us a pointer value
+    ptr_location.type = vtop->type; // Keep the pointer type from the original VT_LLOCAL parameter
+
+    SValue loaded_ptr;
+    memset(&loaded_ptr, 0, sizeof(loaded_ptr));
+    loaded_ptr.type = *pointed_type(&vtop->type);                 // Type of what the pointer points to
+    loaded_ptr.type.t = (loaded_ptr.type.t & ~VT_BTYPE) | VT_PTR; // Make it a pointer type
+    loaded_ptr.type.t &= ~(VT_ARRAY | VT_VLA);
+    loaded_ptr.type.ref = vtop->type.ref;
+    loaded_ptr.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+
+    // Generate LOAD operation: loaded_ptr <-- *ptr_location
+    tcc_ir_put(tcc_state->ir, TCCIR_OP_LOAD, &ptr_location, NULL, &loaded_ptr);
+
+    // Replace vtop with the loaded pointer
+    *vtop = loaded_ptr;
+    // The loaded pointer is the address value itself, NOT an lvalue.
+    // We loaded the pointer from the stack slot; this pointer IS the base address.
+    // Do NOT set VT_LVAL here - that would cause another dereference when we
+    // want to do pointer arithmetic (e.g., adding field offset).
+    vtop->r = 0;
+  }
+  else if ((vtop->r & VT_VALMASK) == VT_LOCAL && tcc_state->ir)
+  {
+    /* VT_LOCAL without VT_LVAL means "address of local variable".
+     * In IR mode, emit explicit LEA to compute FP+offset into a vreg.
+     * This avoids ambiguity where VT_LOCAL alone could be misinterpreted
+     * as either "address value" or "spilled value to load".
+     *
+     * IMPORTANT: Do NOT set VT_LVAL here! LEA needs the raw VT_LOCAL
+     * so that tcc_ir_materialize_addr() computes the stack address.
+     * VT_LVAL would prevent address materialization.
+     */
+    SValue src = *vtop;
+    /* Ensure VT_LOCAL is preserved and VT_LVAL is NOT set */
+    src.r = (src.r & ~VT_LVAL) | VT_LOCAL;
+
+    SValue dest;
+    memset(&dest, 0, sizeof(dest));
+    dest.type.t = VT_PTR;
+    dest.type.ref = vtop->type.ref;
+    dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+
+    tcc_ir_put(tcc_state->ir, TCCIR_OP_LEA, &src, NULL, &dest);
+
+    vtop->vr = dest.vr;
+    vtop->r = 0; /* Now it's a computed value in a vreg */
+    vtop->c.i = 0;
+  }
 }
 
 #ifdef CONFIG_TCC_BCHECK
@@ -2013,7 +2070,7 @@ ST_FUNC int gv(int rc)
   printf("gv(%d) called\n", rc);
   int r, r2, r_ok, r2_ok, rc2, bt;
   int bit_pos, bit_size, size, align;
-  int vreg = 0;
+  int vreg = -1;
 
   /* For IR mode: if we already have a valid vreg computed, no need to do anything.
      Valid vregs have type 1, 2, or 3 in the upper 4 bits. Type 0 is invalid. */
@@ -2087,6 +2144,22 @@ ST_FUNC int gv(int rc)
 #endif
 
     bt = vtop->type.t & VT_BTYPE;
+
+    /* Arrays (including VLAs) are not values you can load from memory.
+     * In most expressions they decay to a pointer to their first element.
+     * If we treat them as an lvalue and "load" them, we end up
+     * dereferencing the computed pointer and accidentally using a[0]
+     * (or addr[0]) instead of the address itself.
+     *
+     * This is particularly visible in tests/tests2/79_vla_continue.c where
+     * `addr[count] = a;` must store the pointer value of `a`.
+     */
+    if ((vtop->r & VT_LVAL) && (vtop->type.t & (VT_ARRAY | VT_VLA)))
+    {
+      gaddrof();
+      vtop->type.t &= ~(VT_ARRAY | VT_VLA);
+      bt = vtop->type.t & VT_BTYPE;
+    }
 
     rc2 = RC2_TYPE(bt, rc);
 
@@ -2180,11 +2253,18 @@ ST_FUNC int gv(int rc)
         dest.type.t = vtop->type.t;
         dest.vr = vreg;
         tcc_ir_put(tcc_state->ir, TCCIR_OP_LOAD, vtop, NULL, &dest);
-        /* After LOAD, the result is in a register, not an lvalue anymore */
-        vtop->r &= ~VT_LVAL;
+        /* After LOAD, the result is a computed value in a vreg.
+           Do not leave it tagged as VT_LOCAL (address-like), otherwise
+           gen_opic() can mis-handle it as a symbol/address (e.g. folding
+           x-100 into an addend) and break integer promotion semantics. */
+        vtop->vr = vreg;
+        vtop->r = 0;
+        vtop->r2 = VT_CONST;
+        vtop->c.i = 0;
+        vtop->sym = NULL;
       }
     }
-    vtop->vr = vreg;
+    /* vtop->vr is set in the IR LOAD/ASSIGN paths when needed */
 #ifdef TCC_TARGET_C67
     /* uses register pairs for doubles */
     if (bt == VT_DOUBLE)
@@ -2247,31 +2327,78 @@ ST_FUNC void lexpand(void)
   }
   else
   {
-    /* For IR mode: a 64-bit vreg represents the full value.
-     * When expanding, create two views: low word keeps same vreg,
-     * high word gets a new vreg with SHR 32 operation.
-     * Valid vregs have type 1, 2, or 3 in the upper 4 bits. */
-    if (tcc_state->ir && TCCIR_DECODE_VREG_TYPE(vtop->vr) > 0)
+    /* For IR mode: materialize the full 64-bit value into a temp vreg first,
+     * then create two independent 32-bit values:
+     * - low word: low32 = (uint32_t)full
+     * - high word: high32 = (uint32_t)(full >> 32)
+     *
+     * IMPORTANT: do NOT reuse the 64-bit vreg as a 32-bit "view".
+     * That causes later 64-bit ops (like lbuild's (high<<32)|low) to
+     * accidentally see/propagate the full's high word via pr1.
+     * Also, shifting by 32 must be done as a 64-bit shift; emitting a 32-bit
+     * SHR #32 is not encodable on Thumb and leads to wrong codegen.
+     */
+    if (tcc_state->ir)
     {
-      /* Save the original long long value */
-      SValue src_llong = *vtop;
+      SValue full;
+      SValue low32;
+      SValue shifted64;
+      SValue shift_amt;
 
-      /* Bottom of stack gets low word (same vreg, just change type) */
+      memset(&full, 0, sizeof(full));
+      full.type.t = vtop->type.t;
+      full.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+      full.r = 0;
+
+      /* Force a value-producing vreg (loads from lvalues if needed). */
+      int assign_pos = tcc_ir_put(tcc_state->ir, TCCIR_OP_ASSIGN, vtop, NULL, &full);
+
+      /* If coalescing happened, update full.vr to match the coalesced instruction's dest */
+      if (assign_pos < tcc_state->ir->next_instruction_index)
+      {
+        full.vr = tcc_state->ir->instructions[assign_pos].dest.vr;
+      }
+
+      /* Create explicit low32 = (uint32_t)full. */
+      memset(&low32, 0, sizeof(low32));
+      low32.type.t = VT_INT | u;
+      low32.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+      low32.r = 0;
+      int low_assign_pos = tcc_ir_put(tcc_state->ir, TCCIR_OP_ASSIGN, &full, NULL, &low32);
+
+      /* NOTE: do not update full.vr based on this ASSIGN.
+       * This instruction produces a 32-bit low word; if we overwrite full.vr
+       * here, the later (full >> 32) would accidentally shift the low word,
+       * yielding a zero high word and breaking 64-bit math.
+       * (low_assign_pos is kept for debugging / symmetry with the earlier ASSIGN.) */
+      (void)low_assign_pos;
+
+      /* Bottom of stack becomes low32. */
       vtop->type.t = VT_INT | u;
+      vtop->vr = low32.vr;
+      vtop->r = 0;
 
-      /* Duplicate and create high word */
+      /* Duplicate and turn the new top into the high32 word. */
       vdup();
       vtop[0].type.t = VT_INT | u;
       vtop[0].vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+      vtop[0].r = 0;
 
-      /* Generate IR to extract high word (shift right 32) */
-      SValue shift_amt;
       memset(&shift_amt, 0, sizeof(shift_amt));
       shift_amt.type.t = VT_INT;
       shift_amt.r = VT_CONST;
       shift_amt.c.i = 32;
       shift_amt.vr = -1;
-      tcc_ir_put(tcc_state->ir, TCCIR_OP_SHR, &src_llong, &shift_amt, &vtop[0]);
+
+      /* shifted64 = full >> 32 (64-bit). */
+      memset(&shifted64, 0, sizeof(shifted64));
+      shifted64.type.t = VT_LLONG | u;
+      shifted64.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+      shifted64.r = 0;
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_SHR, &full, &shift_amt, &shifted64);
+
+      /* high32 = (uint32_t)shifted64 (i.e. original high word). */
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_ASSIGN, &shifted64, NULL, &vtop[0]);
     }
     else
     {
@@ -3383,6 +3510,44 @@ static int compare_types(CType *type1, CType *type2, int unqualified)
 #define CMP_OP 'C'
 #define SHIFT_OP 'S'
 
+static int get_int_type_bits(void)
+{
+  CType it;
+  int align;
+  it.t = VT_INT;
+  it.ref = NULL;
+  return type_size(&it, &align) * 8;
+}
+
+static int promote_bitfield_expr_type(int t)
+{
+  /* Apply integer promotions for bit-field expressions.
+     - For bit-fields based on long long/unsigned long long: keep that type.
+     - For bit-fields based on <= int rank: promote to int, except an
+       unsigned bit-field of full int width promotes to unsigned int.
+
+     This matters because combine_types() runs before gv() has extracted the
+     bit-field and removed VT_BITFIELD, so we must reason about promotions
+     using BIT_SIZE(). */
+  int bt = t & VT_BTYPE;
+  int is_unsigned = t & VT_UNSIGNED;
+  int bf_size = BIT_SIZE(t);
+
+  t &= ~VT_STRUCT_MASK;
+
+  if (bt == VT_LLONG)
+  {
+    /* Keep (un)signed long long. */
+    return t;
+  }
+
+  /* Promote to int, potentially unsigned int. */
+  t = (t & ~(VT_BTYPE | VT_UNSIGNED | VT_LONG)) | VT_INT;
+  if (is_unsigned && bf_size == get_int_type_bits())
+    t |= VT_UNSIGNED;
+  return t;
+}
+
 /* Check if OP1 and OP2 can be "combined" with operation OP, the combined
    type is stored in DEST if non-null (except for pointer plus/minus) . */
 static int combine_types(CType *dest, SValue *op1, SValue *op2, int op)
@@ -3397,6 +3562,12 @@ static int combine_types(CType *dest, SValue *op1, SValue *op2, int op)
 
   type1 = &op1->type, type2 = &op2->type;
   t1 = type1->t, t2 = type2->t;
+
+  if (t1 & VT_BITFIELD)
+    t1 = promote_bitfield_expr_type(t1);
+  if (t2 & VT_BITFIELD)
+    t2 = promote_bitfield_expr_type(t2);
+
   bt1 = t1 & VT_BTYPE, bt2 = t2 & VT_BTYPE;
 
   type.t = VT_VOID;
@@ -3508,8 +3679,8 @@ static int combine_types(CType *dest, SValue *op1, SValue *op2, int op)
     if (bt2 == VT_LLONG)
       type.t &= t2;
     /* convert to unsigned if it does not fit in a long long */
-    if ((t1 & (VT_BTYPE | VT_UNSIGNED | VT_BITFIELD)) == (VT_LLONG | VT_UNSIGNED) ||
-        (t2 & (VT_BTYPE | VT_UNSIGNED | VT_BITFIELD)) == (VT_LLONG | VT_UNSIGNED))
+    if ((t1 & (VT_BTYPE | VT_UNSIGNED)) == (VT_LLONG | VT_UNSIGNED) ||
+        (t2 & (VT_BTYPE | VT_UNSIGNED)) == (VT_LLONG | VT_UNSIGNED))
       type.t |= VT_UNSIGNED;
   }
   else
@@ -3517,8 +3688,8 @@ static int combine_types(CType *dest, SValue *op1, SValue *op2, int op)
     /* integer operations */
     type.t = VT_INT | (VT_LONG & (t1 | t2));
     /* convert to unsigned if it does not fit in an integer */
-    if ((t1 & (VT_BTYPE | VT_UNSIGNED | VT_BITFIELD)) == (VT_INT | VT_UNSIGNED) ||
-        (t2 & (VT_BTYPE | VT_UNSIGNED | VT_BITFIELD)) == (VT_INT | VT_UNSIGNED))
+    if ((t1 & (VT_BTYPE | VT_UNSIGNED)) == (VT_INT | VT_UNSIGNED) ||
+        (t2 & (VT_BTYPE | VT_UNSIGNED)) == (VT_INT | VT_UNSIGNED))
       type.t |= VT_UNSIGNED;
   }
   if (dest)
@@ -6134,10 +6305,6 @@ ST_FUNC void indir(void)
     // gv(RC_INT);
   }
   vtop->type = *pointed_type(&vtop->type);
-#ifdef DEBUG_IR_GEN
-  fprintf(stderr, "DEBUG indir after: vtop->r=0x%x, vtop->type.t=0x%x, VT_STRUCT=%d\n", vtop->r, vtop->type.t,
-          (vtop->type.t & VT_BTYPE) == VT_STRUCT);
-#endif
   /* Arrays and functions are never lvalues */
   if (!(vtop->type.t & (VT_ARRAY | VT_VLA)) && (vtop->type.t & VT_BTYPE) != VT_FUNC)
   {
@@ -6148,9 +6315,6 @@ ST_FUNC void indir(void)
       vtop->r |= VT_MUSTBOUND;
 #endif
   }
-#ifdef DEBUG_IR_GEN
-  fprintf(stderr, "DEBUG indir final: vtop->r=0x%x (VT_LVAL=%d)\n", vtop->r, (vtop->r & VT_LVAL) != 0);
-#endif
 }
 
 /* pass a parameter to a function and do type checking and casting */
@@ -6186,6 +6350,56 @@ static void gfunc_param_typed(Sym *func, Sym *arg)
   {
     type = arg->type;
     type.t &= ~VT_CONSTANT; /* need to do that to avoid false warning */
+
+    /* ARM EABI AAPCS: Composite types (struct/union) larger than 4 words (16 bytes)
+     * must be passed by invisible reference - the caller passes a pointer.
+     * Check if this is a large struct that should be passed by reference. */
+    if ((type.t & VT_BTYPE) == VT_STRUCT)
+    {
+      int align, size = type_size(&type, &align);
+      if (size > 16)
+      {
+        /* Pass by invisible reference: caller must allocate a temporary copy
+         * and pass a pointer to that copy (AAPCS). Passing the original object's
+         * address would break C's by-value semantics.
+         */
+        if (nocode_wanted)
+          return;
+
+        if (!(vtop->r & VT_LVAL))
+        {
+          /* For now we require an lvalue source; most struct expressions in TCC
+           * are materialized as lvalues already.
+           */
+          tcc_error("cannot pass large struct by value");
+        }
+
+        int r2 = 0;
+        int tmp_loc = get_temp_local_var(size, align, &r2);
+
+        /* Store the source struct into the temporary destination.
+         * vstore() will emit a memmove() for struct types.
+         */
+        {
+          SValue dst;
+          memset(&dst, 0, sizeof(dst));
+          dst.type = type;
+          dst.r = VT_LOCAL | VT_LVAL;
+          dst.vr = -1;
+          dst.c.i = tmp_loc;
+          dst.r2 = r2;
+          vpushv(&dst);
+          vswap();
+          vstore();
+        }
+
+        /* Convert the temp lvalue to a pointer argument. */
+        mk_pointer(&vtop->type);
+        gaddrof();
+        return;
+      }
+    }
+
     gen_assign_cast(&type);
   }
 }
@@ -6893,7 +7107,6 @@ tok_next:
        Only set if not already marked/having an ELF symbol. */
     if (s->c <= 0)
       s->c = -3; /* LABEL_ADDR_TAKEN marker */
-    fprintf(stderr, "DEBUG &&label: label '%s' s=%p s->c=%d s->v=%d\n", get_tok_str(tok, NULL), (void *)s, s->c, s->v);
     if ((s->type.t & VT_BTYPE) != VT_PTR)
     {
       s->type.t = VT_VOID;
@@ -7065,23 +7278,11 @@ tok_next:
       /* expect pointer on structure */
       next();
       s = find_field(&vtop->type, tok, &cumofs);
-#ifdef DEBUG_IR_GEN
-      fprintf(stderr, "DEBUG field access: before gaddrof, vtop->r=0x%x, sym=%p, c.i=%lld, cumofs=%d\n", vtop->r,
-              vtop->sym, (long long)vtop->c.i, cumofs);
-#endif
       /* add field offset to pointer */
       gaddrof();
-#ifdef DEBUG_IR_GEN
-      fprintf(stderr, "DEBUG field access: after gaddrof, vtop->r=0x%x, sym=%p, c.i=%lld\n", vtop->r, vtop->sym,
-              (long long)vtop->c.i);
-#endif
       vtop->type = char_pointer_type; /* change type to 'char *' */
       vpushi(cumofs);
       gen_op('+');
-#ifdef DEBUG_IR_GEN
-      fprintf(stderr, "DEBUG field access: after gen_op, vtop->r=0x%x, sym=%p, c.i=%lld, vr=%d\n", vtop->r, vtop->sym,
-              (long long)vtop->c.i, vtop->vr);
-#endif
       /* change type to field type, and set to lvalue */
       vtop->type = s->type;
       vtop->type.t |= qualifiers;
@@ -7173,7 +7374,25 @@ tok_next:
             print_vstack("unary, function call");
           }
           else
+          {
+            /* ret_nregs == 0: struct is returned via an implicit first argument
+             * (sret pointer). In IR mode we must actually emit the parameter and
+             * pop it, otherwise it stays on the value stack and triggers
+             * check_vstack() failures (vstack leak).
+             *
+             * Keep parameter indices 0-based: this implicit argument is param #0.
+             */
+            if (!NOEVAL_WANTED)
+            {
+              SValue num;
+              memset(&num, 0, sizeof(SValue));
+              num.vr = -1;
+              num.c.i = 0;
+              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL);
+            }
+            vtop--;
             nb_args++;
+          }
         }
       }
       else
@@ -7268,10 +7487,6 @@ tok_next:
       }
 
       int return_vreg = -1;
-#ifdef DEBUG_IR_GEN
-      fprintf(stderr, "DEBUG gfunc_call: s->type.t=0x%x, VT_BTYPE=0x%x, is_void=%d, vtop->vr=%d, vtop->r=0x%x\n",
-              s->type.t, s->type.t & VT_BTYPE, (s->type.t & VT_BTYPE) == VT_VOID, vtop->vr, vtop->r);
-#endif
       if (NOEVAL_WANTED)
       {
         /* When in sizeof/typeof context, skip IR emission but still handle stack */
@@ -7305,25 +7520,8 @@ tok_next:
 
         /* See comment above: materialize call target value for indirect calls. */
         tcc_ir_load_if_lvalue(tcc_state->ir, vtop);
-#ifdef DEBUG_IR_GEN
-        fprintf(stderr, "DEBUG gfunc_call: AFTER load_if_lvalue, vtop->vr=%d, vtop->r=0x%x\n", vtop->vr, vtop->r);
-#endif
         tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, vtop, NULL, &dest);
-#ifdef DEBUG_IR_GEN
-        if (tcc_state->ir->next_instruction_index > 8)
-        {
-          fprintf(stderr, "DEBUG gfunc_call: AFTER FUNCCALLVAL tcc_ir_put, instr[8].src1.vr=%d\n",
-                  tcc_state->ir->instructions[8].src1.vr);
-        }
-#endif
         --vtop;
-#ifdef DEBUG_IR_GEN
-        if (tcc_state->ir->next_instruction_index > 8)
-        {
-          fprintf(stderr, "DEBUG gfunc_call: AFTER vtop--, instr[8].src1.vr=%d\n",
-                  tcc_state->ir->instructions[8].src1.vr);
-        }
-#endif
       }
 
       if (ret_nregs < 0)
@@ -7335,13 +7533,6 @@ tok_next:
       }
       else
       {
-#ifdef DEBUG_IR_GEN
-        if (tcc_state->ir->next_instruction_index > 8)
-        {
-          fprintf(stderr, "DEBUG gfunc_call: ENTERING ret_nregs else, instr[8].src1.vr=%d\n",
-                  tcc_state->ir->instructions[8].src1.vr);
-        }
-#endif
         /* return value */
         n = ret_nregs;
         while (n > 1)
@@ -7358,13 +7549,6 @@ tok_next:
           vtop->vr = return_vreg;
         }
         vsetc(&ret.type, ret.r, &ret.c);
-#ifdef DEBUG_IR_GEN
-        if (tcc_state->ir->next_instruction_index > 8)
-        {
-          fprintf(stderr, "DEBUG gfunc_call: AFTER vsetc, instr[8].src1.vr=%d\n",
-                  tcc_state->ir->instructions[8].src1.vr);
-        }
-#endif
         vtop->vr = return_vreg;
         vtop->r2 = ret.r2;
 
@@ -7411,13 +7595,6 @@ tok_next:
 #endif
         }
       }
-#ifdef DEBUG_IR_GEN
-      if (tcc_state->ir->next_instruction_index > 8)
-      {
-        fprintf(stderr, "DEBUG gfunc_call: END of ret handling, instr[8].src1.vr=%d\n",
-                tcc_state->ir->instructions[8].src1.vr);
-      }
-#endif
       if (s->f.func_noreturn)
       {
         if (debug_modes)
@@ -7804,6 +7981,24 @@ static void expr_cond(void)
 
     if (c != 0)
     {
+      /* Arrays must decay to pointers BEFORE gen_cast overwrites the type.
+         gen_cast converts array type to pointer type but doesn't compute the
+         address. If we don't decay here, the VT_ARRAY flag is lost and later
+         gv() won't recognize it needs to call gaddrof().
+
+         Note: Local arrays are stored without VT_LVAL in the symbol table
+         (they decay to pointers immediately). So we check for VT_ARRAY
+         regardless of VT_LVAL for locals. */
+      int is_local_array = ((vtop->r & VT_VALMASK) == VT_LOCAL) && (vtop->type.t & VT_ARRAY);
+      int is_lval_array = (vtop->r & VT_LVAL) && (vtop->type.t & VT_ARRAY);
+      if (is_lval_array || is_local_array)
+      {
+        /* For local arrays without VT_LVAL, temporarily set it for gaddrof */
+        if (is_local_array && !(vtop->r & VT_LVAL))
+          vtop->r |= VT_LVAL;
+        gaddrof();
+        vtop->type.t &= ~VT_ARRAY;
+      }
       gen_cast(&type);
       if (islv)
       {
@@ -7820,6 +8015,12 @@ static void expr_cond(void)
          Do not reduce `0 ? a : b` to just `b`'s type; this breaks sizeof/_Generic.
          Cast the selected (false) operand to the combined result type.
          Keep struct lvalues untouched (no &/ * transformation) in this case. */
+      /* Arrays must decay here too */
+      if ((vtop->r & VT_LVAL) && (vtop->type.t & VT_ARRAY))
+      {
+        gaddrof();
+        vtop->type.t &= ~VT_ARRAY;
+      }
       gen_cast(&type);
     }
 
@@ -7846,6 +8047,18 @@ static void expr_cond(void)
     if (c != 0)
     {
       *vtop = sv;
+      /* Arrays must decay to pointers BEFORE gen_cast overwrites the type.
+         Same logic as for the false branch - handle local arrays without VT_LVAL. */
+      int is_local_array = ((vtop->r & VT_VALMASK) == VT_LOCAL) && (vtop->type.t & VT_ARRAY);
+      int is_lval_array = (vtop->r & VT_LVAL) && (vtop->type.t & VT_ARRAY);
+      if (is_lval_array || is_local_array)
+      {
+        /* For local arrays without VT_LVAL, temporarily set it for gaddrof */
+        if (is_local_array && !(vtop->r & VT_LVAL))
+          vtop->r |= VT_LVAL;
+        gaddrof();
+        vtop->type.t &= ~VT_ARRAY;
+      }
       gen_cast(&type);
       if (islv)
       {
@@ -7972,7 +8185,6 @@ ST_FUNC int expr_const(void)
 #ifndef TCC_TARGET_ARM64
 static void gfunc_return(CType *func_type)
 {
-  printf("DEBUG gfunc_return: entry, func_type->t=0x%x\n", func_type->t);
   if ((func_type->t & VT_BTYPE) == VT_STRUCT)
   {
     CType type, ret_type;
@@ -8048,22 +8260,7 @@ static void gfunc_return(CType *func_type)
       vtop->vr = dest.vr;
       vtop->r = 0; /* no longer an lvalue */
     }
-#ifdef DEBUG_IR_GEN
-    if (tcc_state->ir->next_instruction_index > 8)
-    {
-      fprintf(stderr, "DEBUG gfunc_return: BEFORE tcc_ir_generate_cmp_jmp_set, instr[8].src1.vr=%d\n",
-              tcc_state->ir->instructions[8].src1.vr);
-    }
-#endif
     tcc_ir_generate_cmp_jmp_set(tcc_state->ir);
-#ifdef DEBUG_IR_GEN
-    if (tcc_state->ir->next_instruction_index > 8)
-    {
-      fprintf(stderr, "DEBUG gfunc_return: AFTER tcc_ir_generate_cmp_jmp_set, instr[8].src1.vr=%d\n",
-              tcc_state->ir->instructions[8].src1.vr);
-    }
-#endif
-    printf("DEBUG gfunc_return: before RETURNVALUE, vtop->r = 0x%x, VT_LVAL=%d\n", vtop->r, !!(vtop->r & VT_LVAL));
     tcc_ir_put(tcc_state->ir, TCCIR_OP_RETURNVALUE, vtop, NULL, NULL);
   }
   vtop--; /* NOT vpop() because on x86 it would flush the fp stack */
@@ -8721,6 +8918,10 @@ again:
     // gv(RC_INT);
     memset(&dest, 0, sizeof(SValue));
     dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+    /* The switch value is copied into a temporary vreg used by the case
+      comparison chain. Preserve the original type so the IR can tag the vreg
+      correctly (notably VT_LLONG needs 8-byte spill slots). */
+    dest.type = vtop->type;
     c = tcc_state->ir->next_instruction_index; /* save start of case comparisons */
     tcc_ir_put(tcc_state->ir, TCCIR_OP_ASSIGN, vtop, NULL, &dest);
     vtop->vr = dest.vr;
@@ -8857,8 +9058,6 @@ again:
         s = label_push(&global_label_stack, t, LABEL_DEFINED);
       }
       s->jind = gind();
-      fprintf(stderr, "DEBUG label_def: label '%s' defined, s->jind=%d gind()=%d\n", get_tok_str(t, NULL), s->jind,
-              gind());
       s->cleanupstate = cur_scope->cl.s;
 
     block_after_label:
@@ -10150,8 +10349,6 @@ static void gen_function(Sym *sym)
 
   /* Save global label stack position so we only pop labels from this function */
   global_label_stack_start = global_label_stack;
-  fprintf(stderr, "DEBUG gen_function START: %s ind=0x%x global_label_stack=%p\n", get_tok_str(sym->v, NULL), ind,
-          (void *)global_label_stack);
 
   if (sym->a.aligned)
   {
@@ -10198,18 +10395,11 @@ static void gen_function(Sym *sym)
   /* Backpatch all return jumps to point to the epilogue (past the end of IR) */
   tcc_ir_backpatch_to_here(ir, rsym);
 
-  // #ifdef DEBUG_IR_GEN
-  printf("=== IR BEFORE OPTIMIZATIONS ===\n");
 #ifdef DEBUG_IR_GEN
-  if (ir->next_instruction_index > 8)
-  {
-    fprintf(stderr, "DEBUG before dump: instr[8].op=%d, instr[8].src1.vr=%d, instr[8].src1.r=0x%x\n",
-            ir->instructions[8].op, ir->instructions[8].src1.vr, ir->instructions[8].src1.r);
-  }
-#endif
+  printf("=== IR BEFORE OPTIMIZATIONS ===\n");
   tcc_ir_show(ir);
   printf("=== END IR BEFORE OPTIMIZATIONS ===\n");
-  // #endif
+#endif
 
   /* Dead code elimination - remove unreachable instructions */
   tcc_ir_dead_code_elimination(ir);
@@ -10286,12 +10476,23 @@ static void gen_function(Sym *sym)
   /* Nested calls are now handled at code generation time via backward scan.
    * No IR reordering needed - saves O(n) memory allocations. */
 
-  // #ifdef DEBUG_IR_GEN
+#ifdef DEBUG_IR_GEN
   tcc_ir_show(ir);
-  // #endif
+#endif
   tcc_ir_liveness_analysis(ir);
   /* TODO: track float_parameters_count separately for hard float ABI */
   tcc_ls_allocate_registers(&ir->ls, ir->parameters_count, 0, loc);
+
+  /* Stack-passed params already live in the incoming argument area.
+   * If linear-scan spilled them, drop the local spill slot so we don't bloat
+   * the frame or emit pointless prologue copies (e.g. sum40).
+   * Must run before we extend `loc` based on spill slots.
+   */
+  tcc_ir_avoid_spilling_stack_passed_params(ir);
+
+  /* We may have removed a lot of spill slots (stack-passed params). Repack the
+   * remaining spill slots so other spills don't keep huge negative offsets. */
+  tcc_ls_compact_stack_locations(&ir->ls, loc);
 
   /* Make sure the final stack frame is large enough for any spill slots.
    * The linear-scan allocator assigns negative FP-relative stack locations;
@@ -10311,6 +10512,7 @@ static void gen_function(Sym *sym)
 
   tcc_ir_patch_live_intervals_registers(ir);
   tcc_ir_register_allocation_params(ir);
+  tcc_ir_build_stack_layout(ir);
   tcc_ir_generate_code(ir);
   if (!sym->a.naked)
   {
@@ -10326,8 +10528,6 @@ static void gen_function(Sym *sym)
 
   cur_text_section->data_offset = ind;
   local_scope = 0;
-  fprintf(stderr, "DEBUG gen_function END: %s ind=0x%x global_label_stack=%p saved=%p\n", funcname, ind,
-          (void *)global_label_stack, (void *)global_label_stack_start);
   /* Only pop labels defined in this function - use saved stack position */
   label_pop(&global_label_stack, global_label_stack_start, 0);
   if (ir && ir->ir_to_code_mapping)

@@ -39,6 +39,23 @@
 #include <stdint.h>
 #include <stdio.h>
 
+/* Optional mnemonic-style tracing for opcode builders (th_*).
+ * Enable with e.g.: make CFLAGS+='-DTHUMB_OPCODE_TRACE=1'
+ * Printed output goes to stderr.
+ */
+#ifndef THUMB_OPCODE_TRACE
+#define THUMB_OPCODE_TRACE 1
+#endif
+
+#if THUMB_OPCODE_TRACE
+#define THOP_TRACE(...) fprintf(stderr, __VA_ARGS__)
+#else
+#define THOP_TRACE(...)                                                                                                \
+  do                                                                                                                   \
+  {                                                                                                                    \
+  } while (0)
+#endif
+
 #ifndef TCC_DEBUG
 #define TCC_DEBUG 0
 #endif
