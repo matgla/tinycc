@@ -12,8 +12,8 @@ This removes the current “semantic guessing” split between IR rewriting and 
 Today, operand semantics are inferred via a mix of:
 
 - IR-side rewriting in [`tcc_ir_fill_registers()`](tccir.c:1795) (mutating `SValue` fields like `r`, `pr0/pr1`, `c.i`, and relying on `interval->is_lvalue`).
-- Backend-side special cases (ARM Thumb) in:
-  - [`tcc_ir_preload_spills()`](arm-thumb-gen.c:420) and [`tcc_ir_storeback_spill()`](arm-thumb-gen.c:1114)
+- Backend-side special cases (ARM Thumb) have been spread across (legacy helpers now deleted):
+   - `tcc_ir_preload_spills()` / `tcc_ir_storeback_spill()`
   - [`load_to_dest()`](arm-thumb-gen.c:2959) and helpers, which interpret combinations of `VT_LOCAL`, `VT_LVAL`, `PREG_SPILLED`, and vreg type.
 
 This creates hard-to-reason ambiguities, especially for:
@@ -95,9 +95,8 @@ Make stack allocations predictable by representing them explicitly instead of pa
 ## Backend simplification (ARM as example)
 Once IR owns spill materialization:
 
-- Remove/retire backend-level spill preloading/storeback:
-  - [`tcc_ir_preload_spills()`](arm-thumb-gen.c:420)
-  - [`tcc_ir_storeback_spill()`](arm-thumb-gen.c:1114)
+- Remove/retire backend-level spill preloading/storeback (DONE):
+   - legacy `tcc_ir_preload_spills()` / `tcc_ir_storeback_spill()` have been deleted from `arm-thumb-gen.c`
 
 - Simplify backend load/store core helpers:
   - [`load_to_dest()`](arm-thumb-gen.c:2959) and [`store()`](arm-thumb-gen.c:2141)
@@ -130,8 +129,7 @@ These are the cases that must drive testing because they are the source of curre
 ## Spill ambiguity audit (2026-01-08)
 
 - [tccir.c](tccir.c#L1795-L1877) — `tcc_ir_fill_registers()` rewrites every spilled interval to look like a stack slot by forcing `sv->r = VT_LOCAL | need_lval`. The `need_lval` bit is inferred from the previous `sv->r` flags and `interval->is_lvalue`, so the backend must guess whether plain `VT_LOCAL` means “address-of stack slot” or “value spilled to stack”, especially when `interval->allocation.offset != 0` but `interval->is_lvalue == 0` (destinations of LOAD/ASSIGN).
-- [arm-thumb-gen.c](arm-thumb-gen.c#L420-L934) — `tcc_ir_preload_spills()` re-derives operand semantics by combining `VT_LOCAL`, `VT_LVAL`, the IR op, and vreg types. For example, the LOAD path distinguishes spilled temporaries vs actual locals by checking `TCCIR_VREG_TYPE_TEMP` before deciding whether to load a pointer value or compute the slot address, while global symbol operands strip/reapply `VT_LVAL` depending on whether the op is `LOAD`, `ASSIGN`, or something else.
-- [arm-thumb-gen.c](arm-thumb-gen.c#L1114-L1203) — `tcc_ir_storeback_spill()` restores the original spill view (resetting `q->dest.pr0`, `q->dest.r = VT_LOCAL`) before delegating to `store()`, so every backend store has to re-detect spills instead of receiving an explicit “write this register back to offset”.
+- (Legacy, now removed) `tcc_ir_preload_spills()` / `tcc_ir_storeback_spill()` re-derived operand semantics by combining `VT_LOCAL`, `VT_LVAL`, the IR op, and vreg types. They attempted to distinguish spilled temporaries from actual locals and performed manual load/storeback sequences, but the heuristics were fragile and are now replaced by IR-side materialization.
 - [arm-thumb-gen.c](arm-thumb-gen.c#L2140-L2350) — `store()` contains multiple heuristics to decide whether a `VT_LOCAL` destination is a true stack slot or an address read from a spilled pointer (`PREG_SPILLED` plus `TCCIR_VREG_TYPE_TEMP`). Misclassification leads to double-indirection bugs (loading the slot contents as a pointer or vice versa).
 - [arm-thumb-gen.c](arm-thumb-gen.c#L2963-L3180) — `load_to_dest()` mirrors the same logic for loads: `VT_LOCAL | VT_LVAL` might mean preloaded address vs genuine stack storage; `VT_LOCAL` without `VT_LVAL` might be either address-of or spilled value depending on whether `pr0` has `PREG_SPILLED` and which vreg type produced it. This is why `load_to_dest()` has branches for `sv->vr == -1`, `TCCIR_VREG_TYPE_TEMP`, `VT_PARAM`, etc.
 
@@ -144,9 +142,9 @@ Use the checklist below as the actionable execution order.
 - [x] Audit existing spill/LOAD ambiguity points in [`tcc_ir_fill_registers()`](tccir.c:1795) and backend handling in [`load_to_dest()`](arm-thumb-gen.c:2959) + [`tcc_ir_preload_spills()`](arm-thumb-gen.c:420).
 - [x] Design a minimal target-independent machine API needed by IR for materialization (scratch reg alloc, spill-slot load/store, address-of stack slot) and add declarations in [tcc.h](tcc.h#L1903-L1918).
 - [x] Implement the new machine API for ARM Thumb backend (see [`tcc_machine_acquire_scratch()`](arm-thumb-gen.c#L383-L415), [`tcc_machine_release_scratch()`](arm-thumb-gen.c#L419-L436), and [`tcc_machine_addr_of_stack_slot()`](arm-thumb-gen.c#L2722-L2757)).
-- [ ] Implement IR-side materialization helpers in [`tcc_ir_generate_code()`](tccir.c:4252): `materialize_value`, `materialize_addr`, `materialize_dest` (including 64-bit pairs) and record storeback actions.
-- [ ] Switch IR codegen to use IR-side materialization instead of backend spill preload/storeback.
-- [ ] Remove/disable backend spill preload/storeback paths (e.g. [`tcc_ir_preload_spills()`](arm-thumb-gen.c:420), [`tcc_ir_storeback_spill()`](arm-thumb-gen.c:1114)) once IR materialization is in place.
+- [x] Implement IR-side materialization helpers in [`tcc_ir_generate_code()`](tccir.c:4252): `materialize_value`, `materialize_addr`, `materialize_dest` (including 64-bit pairs) and record storeback actions.
+- [x] Switch IR codegen to use IR-side materialization instead of backend spill preload/storeback.
+- [x] Remove/disable backend spill preload/storeback paths now that materialization is in place.
 - [ ] Simplify backend load/store helpers to stop interpreting spills (remove `PREG_SPILLED`/`VT_LOCAL` heuristics; keep only reg/imm/true memory forms).
 - [ ] Add/adjust regression tests for fragile cases (spilled temps holding pointers, arrays/VLA base pointers, 64-bit ops, switch lowering, indirect calls) and run ir_tests + known failing tests.
 - [ ] Update documentation describing the new boundary and why `VT_LOCAL`/`VT_LVAL` are no longer used to encode spill semantics.

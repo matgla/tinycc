@@ -136,30 +136,6 @@ typedef struct IRCallSite
   int *arg_instr_index_by_num; /* length argc; each is an index into ir->instructions */
 } IRCallSite;
 
-/* SpillContext: Tracks spilled register loading/storing for IR operations
- * Used by generate_code to centralize spill handling before/after machine ops
- */
-typedef struct SpillContext
-{
-  int8_t orig_src1_pr0, orig_src1_pr1; // Original register allocations
-  int8_t orig_src2_pr0, orig_src2_pr1;
-  int8_t orig_dest_pr0, orig_dest_pr1;
-  int8_t dest_scratch_reg, dest_scratch_reg1; // Scratch register(s) used for dest result
-  int8_t src1_scratch_reg, src1_scratch_reg1; // Scratch register(s) used for src operands
-  int8_t src2_scratch_reg, src2_scratch_reg1;
-  int src1_offset, src2_offset, dest_offset; // Stack offsets
-  uint8_t src1_spilled : 1;                  // Whether src1 was in memory
-  uint8_t src2_spilled : 1;                  // Whether src2 was in memory
-  uint8_t dest_spilled : 1;                  // Whether dest was in memory
-  uint8_t is_64bit : 1;                      // Whether operation is 64-bit
-  uint8_t src1_reg_saved : 1;                // Whether src1 scratch reg was saved to stack
-  uint8_t src1_reg_saved1 : 1;               // Whether src1 scratch reg1 was saved to stack
-  uint8_t src2_reg_saved : 1;                // Whether src2 scratch reg was saved to stack
-  uint8_t src2_reg_saved1 : 1;               // Whether src2 scratch reg1 was saved to stack
-  uint8_t dest_reg_saved : 1;                // Whether dest scratch reg was saved to stack
-  uint8_t dest_reg_saved1 : 1;               // Whether dest scratch reg1 was saved to stack
-} SpillContext;
-
 /* SpillCache: Track which registers hold which stack slot values.
  * Used to avoid redundant loads when value is already in a register after storeback.
  * Invalidated by: function calls, branches, stores to different offsets with same register.
@@ -391,9 +367,6 @@ int tcc_ir_is_spilled(SValue *sv);
 int tcc_ir_is_64bit(int t);
 
 /* Machine-dependent spill handling (defined in machine-specific code, e.g., arm-thumb-gen.c) */
-SpillContext tcc_ir_preload_spills(TACQuadruple *q, int preload_src1, int preload_src2, int setup_dest);
-void tcc_ir_storeback_spill(TACQuadruple *q, SpillContext *ctx);
-void tcc_ir_restore_saved_scratch_regs(SpillContext *ctx);
 
 /* Spill cache management for avoiding redundant loads */
 void tcc_ir_spill_cache_clear(SpillCache *cache);

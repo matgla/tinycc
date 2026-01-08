@@ -31,9 +31,9 @@ To keep the above target-independent, each backend must expose a compact helper 
 Declarations will live in `tcc.h`, with implementations supplied per backend (Thumb can reuse `get_scratch_reg_with_save()`, `tcc_gen_machine_store_to_stack()`, etc.).
 
 ## Backend simplifications unlocked
-Once IR obeys this contract, Thumb (and other targets) can delete:
+Once IR obeys this contract, Thumb (and other targets) can delete (and Thumb already has):
 
-- `tcc_ir_preload_spills()` / `tcc_ir_storeback_spill()` in `arm-thumb-gen.c`,
+- the old `tcc_ir_preload_spills()` / `tcc_ir_storeback_spill()` helpers in `arm-thumb-gen.c`,
 - spill-aware branches in `load_to_dest()` / `store()`,
 - heuristics that guess semantics from `VT_LOCAL` / `VT_LVAL` / `PREG_SPILLED`.
 
