@@ -26,6 +26,7 @@ TEST_FILES = [
     ("test_ge_operator.c", 0),
     ("97_void_call_noargs.c", 0),
     ("98_call_over32_args.c", 0),
+    ("99_struct_init_from_struct.c", 0),
     # ("test_llong_relops.c", 0),
 
     # ("test_llong_add_signed.c", 0),

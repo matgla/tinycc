@@ -590,6 +590,25 @@ const IRCallSite *tcc_ir_callsite_for_call(const TCCIRState *ir, int call_instr_
   return &ir->callsites[cs_idx];
 }
 
+/* Check if a vreg is used as an argument to a function call.
+ * Returns 1 if vreg_encoded is src1.vr of any FUNCPARAMVAL bound to call_instr_index. */
+static int tcc_ir_vreg_is_call_argument(const TCCIRState *ir, int vreg_encoded, int call_instr_index)
+{
+  const IRCallSite *cs = tcc_ir_callsite_for_call(ir, call_instr_index);
+  if (!cs)
+    return 0;
+  for (int p = 0; p < cs->argc; ++p)
+  {
+    const int arg_instr_index = cs->arg_instr_index_by_num ? cs->arg_instr_index_by_num[p] : -1;
+    if (arg_instr_index < 0 || arg_instr_index >= ir->next_instruction_index)
+      continue;
+    const TACQuadruple *q = &ir->instructions[arg_instr_index];
+    if (q->op == TCCIR_OP_FUNCPARAMVAL && q->src1.vr == vreg_encoded)
+      return 1;
+  }
+  return 0;
+}
+
 void tcc_ir_release_block(TCCIRState *ir)
 {
   if (!ir)
@@ -1776,7 +1795,10 @@ void tcc_ir_liveness_analysis(TCCIRState *ir)
       if (end < ir->next_instruction_index &&
           (ir->instructions[end].op == TCCIR_OP_FUNCCALLVAL || ir->instructions[end].op == TCCIR_OP_FUNCCALLVOID))
       {
-        end--; /* Do not include call instruction itself */
+        /* Don't decrement if this vreg is an argument to the call - it needs
+         * to stay live during argument loading in tcc_gen_machine_func_call_op */
+        if (!tcc_ir_vreg_is_call_argument(ir, encoded_vreg, end))
+          end--; /* Do not include call instruction itself */
       }
       tcc_ls_add_live_interval(&ir->ls, encoded_vreg, start, end, crosses_call, addrtaken, reg_type,
                                interval->is_lvalue);
@@ -1800,14 +1822,16 @@ void tcc_ir_liveness_analysis(TCCIRState *ir)
       reg_type = tcc_ir_get_reg_type(ir, vreg_encoded);
       /* Normally we don't include the call instruction itself in the interval
        * (arguments are consumed by the call), BUT if this vreg is the function
-       * pointer (src1 of the call), we must keep it alive through the call. */
+       * pointer (src1 of the call) OR a function argument, we must keep it
+       * alive through the call. */
       if (end < ir->next_instruction_index &&
           (ir->instructions[end].op == TCCIR_OP_FUNCCALLVAL || ir->instructions[end].op == TCCIR_OP_FUNCCALLVOID))
       {
-        /* Check if this vreg is the function pointer (src1) of this call */
-        if (ir->instructions[end].src1.vr != vreg_encoded)
+        /* Check if this vreg is the function pointer (src1) of this call,
+         * or if it's an argument to the call */
+        if (ir->instructions[end].src1.vr != vreg_encoded && !tcc_ir_vreg_is_call_argument(ir, vreg_encoded, end))
         {
-          end--; /* Do not include call instruction itself for non-func-ptr vregs */
+          end--; /* Do not include call instruction itself for non-func-ptr and non-arg vregs */
         }
       }
       tcc_ls_add_live_interval(&ir->ls, vreg_encoded, start, end, crosses_call, addrtaken, reg_type,
@@ -1830,7 +1854,9 @@ void tcc_ir_liveness_analysis(TCCIRState *ir)
     if (end < ir->next_instruction_index &&
         (ir->instructions[end].op == TCCIR_OP_FUNCCALLVAL || ir->instructions[end].op == TCCIR_OP_FUNCCALLVOID))
     {
-      end--; /* Do not include call instruction itself */
+      /* Don't decrement if this vreg is an argument to the call */
+      if (!tcc_ir_vreg_is_call_argument(ir, vreg_encoded, end))
+        end--; /* Do not include call instruction itself */
     }
     crosses_call = tcc_ir_has_call_in_range(ir, start, end);
     addrtaken = interval->addrtaken;
@@ -2047,10 +2073,20 @@ void tcc_ir_materialize_value(TCCIRState *ir, SValue *sv, TCCMaterializedValue *
 
   if (!ir || !sv)
     return;
+
+  fprintf(stderr, "[MAT_VALUE] vr=%d pr0=0x%x r=0x%x c.i=%ld type=0x%x\n", sv->vr, sv->pr0, sv->r, (long)sv->c.i,
+          sv->type.t);
+
   if (!(sv->pr0 & PREG_SPILLED))
+  {
+    fprintf(stderr, "[MAT_VALUE] -> not spilled, returning\n");
     return;
+  }
   if (!tcc_is_vreg_valid(ir, sv->vr))
+  {
+    fprintf(stderr, "[MAT_VALUE] -> vreg invalid, returning\n");
     return;
+  }
 
   const int val_kind = sv->r & VT_VALMASK;
   if (!(sv->r & VT_LVAL) && (val_kind == VT_LOCAL || val_kind == VT_LLOCAL))
@@ -2076,11 +2112,15 @@ void tcc_ir_materialize_value(TCCIRState *ir, SValue *sv, TCCMaterializedValue *
   if (scratch.reg_count == 0)
     tcc_error("compiler_error: unable to allocate scratch register for spill load");
 
+  fprintf(stderr, "[MAT_VALUE] acquired scratch reg[0]=%d, frame_offset=%d is_64bit=%d\n", scratch.regs[0],
+          frame_offset, is_64bit);
+
   tcc_machine_load_spill_slot(scratch.regs[0], frame_offset);
   if (is_64bit)
   {
     if (scratch.reg_count < 2)
       tcc_error("compiler_error: missing register pair for 64-bit spill load");
+    fprintf(stderr, "[MAT_VALUE] acquired scratch reg[1]=%d\n", scratch.regs[1]);
     tcc_machine_load_spill_slot(scratch.regs[1], frame_offset + 4);
   }
 
@@ -2108,7 +2148,9 @@ void tcc_ir_materialize_addr(TCCIRState *ir, SValue *sv, TCCMaterializedAddr *re
 
   const int val_kind = sv->r & VT_VALMASK;
   const int wants_stack_address = (val_kind == VT_LOCAL || val_kind == VT_LLOCAL) && !(sv->r & VT_LVAL);
-  const int spilled_pointer = (sv->pr0 & PREG_SPILLED) && tcc_is_vreg_valid(ir, sv->vr);
+  /* Check for spilled pointer: pr0 must be PREG_SPILLED (0x80), NOT PREG_NONE (0xFF).
+   * PREG_NONE has the PREG_SPILLED bit set, so we must explicitly exclude it. */
+  const int spilled_pointer = (sv->pr0 != PREG_NONE) && (sv->pr0 & PREG_SPILLED) && tcc_is_vreg_valid(ir, sv->vr);
 
   if (!wants_stack_address && !spilled_pointer)
     return;
@@ -2421,6 +2463,8 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
   int old_r = sv->r;
   int old_v = old_r & VT_VALMASK;
 
+  fprintf(stderr, "[FILL_REGS] vr=%d old_r=0x%x old_v=0x%x c.i=%ld\n", sv->vr, old_r, old_v, (long)sv->c.i);
+
   /* VT_LOCAL/VT_LLOCAL operands can mean either:
    * - a concrete stack slot (vr == -1), e.g. VLA save slots, or
    * - a logical local tracked as a vreg by the IR (vr != -1).
@@ -2452,6 +2496,8 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
     if (TCCIR_DECODE_VREG_TYPE(sv->vr) == TCCIR_VREG_TYPE_PARAM && interval && interval->incoming_reg0 < 0 &&
         interval->allocation.r0 == PREG_NONE && interval->allocation.offset == 0)
     {
+      fprintf(stderr, "[FILL_REGS] -> stack-passed param path: vr=%d original_offset=%d\n", sv->vr,
+              interval->original_offset);
       sv->pr0 = PREG_NONE;
       sv->pr1 = PREG_NONE;
       sv->c.i = interval->original_offset;
@@ -2461,6 +2507,8 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
         need_lval = VT_LVAL;
 
       sv->r = VT_LOCAL | need_lval | VT_PARAM;
+      fprintf(stderr, "[FILL_REGS] -> after: r=0x%x c.i=%ld VT_PARAM=%d VT_LVAL=%d\n", sv->r, (long)sv->c.i,
+              (sv->r & VT_PARAM) ? 1 : 0, (sv->r & VT_LVAL) ? 1 : 0);
       return;
     }
 
@@ -2507,11 +2555,15 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
         need_lval = VT_LVAL;
       }
       sv->r = VT_LOCAL | need_lval;
+      fprintf(stderr, "[FILL_REGS] -> spilled path: vr=%d r0=%d offset=%d final r=0x%x\n", sv->vr,
+              interval->allocation.r0, interval->allocation.offset, sv->r);
     }
     else if (interval->allocation.r0 != PREG_NONE)
     {
       /* In a register - set r to the register number, preserving VT_LVAL only for pointer derefs */
       sv->r = interval->allocation.r0 | preserve_lval;
+      fprintf(stderr, "[FILL_REGS] -> register path: vr=%d r0=%d pr0=%d final r=0x%x\n", sv->vr,
+              interval->allocation.r0, sv->pr0, sv->r);
     }
   }
   else if ((sv->vr == -1 || sv->vr == 0 || TCCIR_DECODE_VREG_TYPE(sv->vr) == 0) &&
@@ -5325,6 +5377,11 @@ void tcc_ir_generate_code(TCCIRState *ir)
       exit(1);
     }
     };
+
+    /* Clean up scratch register state at end of each IR instruction.
+     * This restores any pushed scratch registers and resets the global exclude mask. */
+    tcc_gen_machine_end_instruction();
+
     tcc_ir_release_materialized_addr(&q->dest, &mat_dest_addr);
     tcc_ir_storeback_materialized_dest(q, &mat_dest);
     tcc_ir_release_materialized_addr(&q->src2, &mat_src2_addr);

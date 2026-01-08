@@ -1930,6 +1930,7 @@ ST_FUNC void tcc_gen_machine_indirect_jump_op(TACQuadruple *q);
 ST_FUNC void tcc_gen_machine_setif_op(TACQuadruple *q);
 ST_FUNC void tcc_gen_machine_bool_op(TACQuadruple *q);
 ST_FUNC void tcc_gen_machine_backpatch_jump(int address, int offset);
+ST_FUNC void tcc_gen_machine_end_instruction(void);
 
 /* VLA / dynamic stack operations */
 ST_FUNC void tcc_gen_machine_vla_op(TACQuadruple *q);
