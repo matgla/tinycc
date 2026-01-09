@@ -136,6 +136,12 @@ These are the cases that must drive testing because they are the source of curre
 ## Implementation checklist (source of truth)
 Use the checklist below as the actionable execution order.
 
+## Status (2026-01-09)
+
+- ARM backend now hard-errors when 64-bit ADD/SUB operands arrive spilled and also rematerializes immediate `src1` values locally to bridge current IR gaps until upstream materialization is fully compliant (see arm-thumb-gen.c around the 64-bit helpers).
+- `pytest tests/ir_tests/test_qemu.py -k 93_integer_promotion` still fails to build via armv8m-tcc (pre-fix log captured) and must be rerun to confirm the regression is cleared after the latest backend change.
+- Remaining risky spots: other 64-bit ops (`UMULL`, logical shifts) are still relying on the new contract but have not been exercised under QEMU yet.
+
 ## Todo checklist
 
 - [x] Write down the IR→machine contract (VALUE operands are only regs/immediates; spills handled in IR). See [docs/IR_MACHINE_CONTRACT.md](../docs/IR_MACHINE_CONTRACT.md).
@@ -147,4 +153,5 @@ Use the checklist below as the actionable execution order.
 - [x] Remove/disable backend spill preload/storeback paths now that materialization is in place.
 - [x] Simplify backend load/store helpers to stop interpreting spills (remove `PREG_SPILLED`/`VT_LOCAL` heuristics; keep only reg/imm/true memory forms).
 - [ ] Add/adjust regression tests for fragile cases (spilled temps holding pointers, arrays/VLA base pointers, 64-bit ops, switch lowering, indirect calls) and run ir_tests + known failing tests.
+   - [ ] Re-run `pytest tests/ir_tests/test_qemu.py -k 93_integer_promotion` after the recent ARM backend change and capture the new log.
 - [ ] Update documentation describing the new boundary and why `VT_LOCAL`/`VT_LVAL` are no longer used to encode spill semantics.

@@ -14,7 +14,7 @@ In particular:
 
 This reduces bug surface (nested calls, optimizations, reordering) and removes backend-only assumptions.
 
-## Current behavior (2026-01-08)
+## Legacy behavior (pre-2026-01-09)
 
 ### How arguments are emitted
 In the front-end ([tccgen.c](../tccgen.c)):
@@ -23,7 +23,7 @@ In the front-end ([tccgen.c](../tccgen.c)):
 - For `nb_args > 4`, additional `FUNCPARAMVAL` are emitted after parsing using `vtop` (so emission order is not strictly the same as evaluation order).
 - `TCCIR_OP_FUNCCALL{VAL,VOID}` is emitted for the call.
 
-### How arguments are consumed
+### How arguments were consumed
 
 - IR liveness uses `tcc_ir_extend_param_intervals()` ([tccir.c](../tccir.c)) which scans backward from each `FUNCCALL*` to find matching `FUNCPARAM*` while skipping nested calls.
 - ARM Thumb backend generates calls in `tcc_gen_machine_func_call_op()` ([arm-thumb-gen.c](../arm-thumb-gen.c)) and also scans backward from the call to find its params, then sorts them by `param_num`.
@@ -45,6 +45,13 @@ In the front-end ([tccgen.c](../tccgen.c)):
 4) **Optimizer coupling**
    - Any pass that deletes/moves `FUNCPARAM*` (or introduces unrelated instructions between params and call) can silently mis-bind args.
    - This is especially risky as the project grows more IR-level transformations.
+
+## Status (2026-01-09)
+
+- **Callsite metadata exists and is populated once.** `IRCallSite` with `IRCallArgument` descriptors now lives in `TCCIRState`, and `tcc_ir_build_callsites()` runs before machine codegen.
+- **Consumers use the metadata.** Liveness extension and ARM Thumb call lowering both consume the pre-built callsite table; the backend no longer scans IR for `FUNCPARAM*` or relies on bitmasks.
+- **Arguments carry descriptors.** Each callsite stores a copy of the argument `SValue`, plus a binding back to the original `FUNCPARAMVAL` for final materialization. This satisfies Phase 2a (descriptor storage), though `FUNCPARAM*` still exist in the stream for now.
+- **Remaining work.** Add a verifier/debug check, trim or NOP-out `FUNCPARAM*`, and land dedicated regression tests (nested calls, >32 args, etc.) per the plan.
 
 ## Target end-state contract (IR → backend)
 
@@ -163,9 +170,9 @@ Prefer placing new focused cases under `tests/ir_tests/` (with `.expect`) if tha
 
 ## Implementation checklist
 
-- [ ] Add `IRCallSite` representation to `TCCIRState`.
-- [ ] Implement `tcc_ir_build_callsites()` and a verifier.
-- [ ] Switch liveness param extension to use callsites.
-- [ ] Switch ARM Thumb call lowering to use callsites (remove backward scan + `params_found`).
+- [x] Add `IRCallSite` representation to `TCCIRState`.
+- [x] Implement `tcc_ir_build_callsites()` (verifier still TODO).
+- [x] Switch liveness param extension to use callsites.
+- [x] Switch ARM Thumb call lowering to use callsites (remove backward scan + `params_found`).
 - [ ] Add regression tests for >32 args + 0-arg void call + nesting.
-- [ ] (Optional) Phase 2: store arg descriptors and NOP-out `FUNCPARAM*`.
+- [ ] (Optional) Phase 2: remove `FUNCPARAM*` as correctness dependency (currently partially done — descriptors are stored, but instructions still remain and are refreshed before codegen).

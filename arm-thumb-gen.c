@@ -325,6 +325,9 @@ int is_valid_opcode(thumb_opcode op);
 int ot(thumb_opcode op);
 int ot_check(thumb_opcode op);
 static void load_to_register(int reg, int reg_from, SValue *src);
+static void thumb_require_materialized_reg(const char *ctx, const char *operand, int reg);
+static void thumb_require_materialized_pair(const char *ctx, const char *operand, int lo, int hi);
+static void thumb_ensure_not_spilled(const char *ctx, const char *operand, int reg);
 int th_has_immediate_value(int r);
 int load_word_from_base(int ir, int base, int fc, int sign);
 static void tcc_gen_machine_load_from_stack(int reg, int offset);
@@ -1355,7 +1358,7 @@ void ggoto(void)
 ST_FUNC void tcc_gen_machine_indirect_jump_op(TACQuadruple *q)
 {
   /* Indirect jump: target address in src1 register */
-  if (q->src1.pr0 == PREG_NONE || (q->src1.pr0 & PREG_SPILLED))
+  if (q->src1.pr0 == PREG_NONE)
   {
     tcc_error("internal error: IJUMP target not in a register");
   }
@@ -1672,10 +1675,7 @@ void store(int r, SValue *sv)
        */
       if (sv->pr0 != PREG_NONE)
       {
-        if (sv->pr0 >= PREG_SPILLED)
-        {
-          tcc_error("compiler_error: store() received a spilled address register after materialization");
-        }
+        thumb_require_materialized_reg("store", "address base", sv->pr0);
         base = sv->pr0;
       }
       else
@@ -2433,6 +2433,7 @@ void load_to_dest(SValue *dest, SValue *sv)
   ft = sv->type.t;
   fc = sv->c.i;
   int btype = ft & VT_BTYPE;
+  const char *ctx = "load_to_dest";
 
   /* If we're about to write into the register currently used to cache a global
    * symbol base address, invalidate the cache first. Otherwise the cache can
@@ -2485,16 +2486,6 @@ void load_to_dest(SValue *dest, SValue *sv)
     uint32_t base = tcc_state->need_frame_pointer ? R_FP : R_SP;
     SValue v1;
 
-    // load value from stack
-    // prepare for new load after pointer dereference
-    if (v == VT_LOCAL && sv->pr0 == PREG_SPILLED)
-    {
-      /* IR must never hand load_to_dest() a spilled pointer to dereference. */
-      thumb_backend_backtrace("load_to_dest spilled pointer operand");
-      thumb_backend_dump_svalue("load_to_dest operand", sv);
-      tcc_error("compiler_error: load_to_dest received a spilled pointer operand after materialization");
-    }
-
     if (v == VT_LLOCAL)
     {
       v1.type.t = VT_PTR;
@@ -2540,10 +2531,7 @@ void load_to_dest(SValue *dest, SValue *sv)
        * number, otherwise fall back to the legacy encoding in sv->r (v). */
       if (sv->pr0 != PREG_NONE)
       {
-        if (sv->pr0 >= PREG_SPILLED)
-        {
-          tcc_error("compiler_error: load_to_dest received a spilled address register after materialization");
-        }
+        thumb_require_materialized_reg(ctx, "lvalue base", sv->pr0);
         base = sv->pr0;
       }
       else
@@ -2588,10 +2576,7 @@ void load_to_dest(SValue *dest, SValue *sv)
     int src_reg = v;
     if (sv->pr0 != PREG_NONE)
     {
-      if (sv->pr0 >= PREG_SPILLED)
-      {
-        tcc_error("compiler_error: load_to_dest received spilled source register after materialization");
-      }
+      thumb_require_materialized_reg(ctx, "source register", sv->pr0);
       src_reg = sv->pr0;
     }
 
@@ -2841,6 +2826,255 @@ typedef struct ThumbDataProcessingHandler
                               thumb_shift shift_type, thumb_enforce_encoding enforce_encoding);
 } ThumbDataProcessingHandler;
 
+static void thumb_require_materialized_reg(const char *ctx, const char *operand, int reg)
+{
+  const bool reg_is_hw = (reg >= 0) && (reg <= 15);
+  if (reg == PREG_NONE || (reg & PREG_SPILLED) || !reg_is_hw)
+  {
+    tcc_error("compiler_error: %s expects %s in a physical register (pr=%d)", ctx, operand, reg);
+  }
+}
+
+static void thumb_require_materialized_pair(const char *ctx, const char *operand, int lo, int hi)
+{
+  thumb_require_materialized_reg(ctx, operand, lo);
+  thumb_require_materialized_reg(ctx, operand, hi);
+}
+
+static void thumb_ensure_not_spilled(const char *ctx, const char *operand, int reg)
+{
+  if (reg != PREG_NONE)
+  {
+    const bool reg_is_hw = (reg >= 0) && (reg <= 15);
+    if ((reg & PREG_SPILLED) || !reg_is_hw)
+    {
+      tcc_error("compiler_error: %s operand %s unexpectedly spilled", ctx, operand);
+    }
+  }
+}
+
+static uint32_t thumb_exclude_mask_for_regs(int count, const int *regs)
+{
+  uint32_t mask = 0;
+  for (int i = 0; i < count; ++i)
+  {
+    const int reg = regs[i];
+    if (reg >= 0 && reg <= 15)
+      mask |= (1u << reg);
+  }
+  return mask;
+}
+
+static void thumb_emit_add_imm_fallback(int rd, int rn, uint32_t imm, thumb_flags_behaviour flags)
+{
+  thumb_opcode add_low = th_add_imm(rd, rn, imm, flags, ENFORCE_ENCODING_NONE);
+  if (add_low.size == 0)
+  {
+    uint32_t exclude = 0;
+    if (rd >= 0 && rd <= 15)
+      exclude |= (1u << rd);
+    if (rn >= 0 && rn <= 15)
+      exclude |= (1u << rn);
+    ScratchRegAlloc scratch = get_scratch_reg_with_save(exclude);
+    SValue imm_sv = {0};
+    imm_sv.r = VT_CONST;
+    imm_sv.type.t = VT_INT;
+    imm_sv.c.i = (int32_t)imm;
+    load_vt_const(scratch.reg, PREG_NONE, &imm_sv);
+    ot_check(th_add_reg(rd, rn, scratch.reg, flags, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+    restore_scratch_reg(&scratch);
+  }
+  else
+  {
+    ot_check(add_low);
+  }
+}
+
+static void thumb_emit_sub_imm_fallback(int rd, int rn, uint32_t imm, thumb_flags_behaviour flags)
+{
+  thumb_opcode sub_low = th_sub_imm(rd, rn, imm, flags, ENFORCE_ENCODING_NONE);
+  if (sub_low.size == 0)
+  {
+    uint32_t exclude = 0;
+    if (rd >= 0 && rd <= 15)
+      exclude |= (1u << rd);
+    if (rn >= 0 && rn <= 15)
+      exclude |= (1u << rn);
+    ScratchRegAlloc scratch = get_scratch_reg_with_save(exclude);
+    SValue imm_sv = {0};
+    imm_sv.r = VT_CONST;
+    imm_sv.type.t = VT_INT;
+    imm_sv.c.i = (int32_t)imm;
+    load_vt_const(scratch.reg, PREG_NONE, &imm_sv);
+    ot_check(th_sub_reg(rd, rn, scratch.reg, flags, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+    restore_scratch_reg(&scratch);
+  }
+  else
+  {
+    ot_check(sub_low);
+  }
+}
+
+static void thumb_emit_add64(TACQuadruple *op)
+{
+  const char *ctx = "64-bit ADD";
+  const bool src2_is_imm = th_has_immediate_value(op->src2.r) || op->src2.pr0 == PREG_NONE;
+  const uint64_t src2_imm = (uint64_t)op->src2.c.i;
+  const uint32_t imm_low = (uint32_t)(src2_imm & 0xffffffffu);
+  const uint32_t imm_high = (uint32_t)(src2_imm >> 32);
+
+  thumb_require_materialized_pair(ctx, "dest", op->dest.pr0, op->dest.pr1);
+  const bool src1_is_imm = (op->src1.pr0 == PREG_NONE) && th_has_immediate_value(op->src1.r);
+  int rn_low = op->src1.pr0;
+  int rn_high = op->src1.pr1;
+  if (src1_is_imm)
+  {
+    load_vt_const(op->dest.pr0, op->dest.pr1, &op->src1);
+    rn_low = op->dest.pr0;
+    rn_high = op->dest.pr1;
+  }
+  else
+  {
+    thumb_require_materialized_reg(ctx, "src1.low", op->src1.pr0);
+    thumb_ensure_not_spilled(ctx, "src1.high", op->src1.pr1);
+  }
+
+  int rm_low = op->src2.pr0;
+  int rm_high = op->src2.pr1;
+  if (!src2_is_imm)
+  {
+    thumb_require_materialized_reg(ctx, "src2.low", rm_low);
+    thumb_ensure_not_spilled(ctx, "src2.high", rm_high);
+  }
+  else
+  {
+    rm_low = PREG_NONE;
+    rm_high = PREG_NONE;
+  }
+
+  if (src2_is_imm)
+  {
+    thumb_emit_add_imm_fallback(op->dest.pr0, rn_low, imm_low, FLAGS_BEHAVIOUR_SET);
+  }
+  else
+  {
+    ot_check(th_add_reg(op->dest.pr0, rn_low, rm_low, FLAGS_BEHAVIOUR_SET, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+  }
+
+  if (src2_is_imm)
+  {
+    if (rn_high != PREG_NONE)
+    {
+      ot_check(th_adc_imm(op->dest.pr1, rn_high, imm_high, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    }
+    else
+    {
+      ot_check(th_mov_imm(op->dest.pr1, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+      ot_check(th_adc_imm(op->dest.pr1, op->dest.pr1, imm_high, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    }
+  }
+  else if (rn_high != PREG_NONE && rm_high != PREG_NONE)
+  {
+    ot_check(th_adc_reg(op->dest.pr1, rn_high, rm_high, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                        ENFORCE_ENCODING_NONE));
+  }
+  else if (rn_high != PREG_NONE)
+  {
+    ot_check(th_adc_imm(op->dest.pr1, rn_high, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+  }
+  else if (rm_high != PREG_NONE)
+  {
+    ot_check(th_mov_imm(op->dest.pr1, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    ot_check(th_adc_reg(op->dest.pr1, op->dest.pr1, rm_high, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                        ENFORCE_ENCODING_NONE));
+  }
+  else
+  {
+    ot_check(th_mov_imm(op->dest.pr1, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    ot_check(th_adc_imm(op->dest.pr1, op->dest.pr1, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+  }
+}
+
+static void thumb_emit_sub64(TACQuadruple *op)
+{
+  const char *ctx = "64-bit SUB";
+  const bool src2_is_imm = th_has_immediate_value(op->src2.r) || op->src2.pr0 == PREG_NONE;
+  const uint64_t src2_imm = (uint64_t)op->src2.c.i;
+  const uint32_t imm_low = (uint32_t)(src2_imm & 0xffffffffu);
+  const uint32_t imm_high = (uint32_t)(src2_imm >> 32);
+
+  thumb_require_materialized_pair(ctx, "dest", op->dest.pr0, op->dest.pr1);
+  const bool src1_is_imm = (op->src1.pr0 == PREG_NONE) && th_has_immediate_value(op->src1.r);
+  int rn_low = op->src1.pr0;
+  int rn_high = op->src1.pr1;
+  if (src1_is_imm)
+  {
+    load_vt_const(op->dest.pr0, op->dest.pr1, &op->src1);
+    rn_low = op->dest.pr0;
+    rn_high = op->dest.pr1;
+  }
+  else
+  {
+    thumb_require_materialized_reg(ctx, "src1.low", op->src1.pr0);
+    thumb_ensure_not_spilled(ctx, "src1.high", op->src1.pr1);
+  }
+
+  int rm_low = op->src2.pr0;
+  int rm_high = op->src2.pr1;
+  if (!src2_is_imm)
+  {
+    thumb_require_materialized_reg(ctx, "src2.low", rm_low);
+    thumb_ensure_not_spilled(ctx, "src2.high", rm_high);
+  }
+  else
+  {
+    rm_low = PREG_NONE;
+    rm_high = PREG_NONE;
+  }
+
+  if (src2_is_imm)
+  {
+    thumb_emit_sub_imm_fallback(op->dest.pr0, rn_low, imm_low, FLAGS_BEHAVIOUR_SET);
+  }
+  else
+  {
+    ot_check(th_sub_reg(op->dest.pr0, rn_low, rm_low, FLAGS_BEHAVIOUR_SET, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+  }
+
+  if (src2_is_imm)
+  {
+    if (rn_high != PREG_NONE)
+    {
+      ot_check(th_sbc_imm(op->dest.pr1, rn_high, imm_high, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    }
+    else
+    {
+      ot_check(th_mov_imm(op->dest.pr1, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+      ot_check(th_sbc_imm(op->dest.pr1, op->dest.pr1, imm_high, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    }
+  }
+  else if (rn_high != PREG_NONE && rm_high != PREG_NONE)
+  {
+    ot_check(th_sbc_reg(op->dest.pr1, rn_high, rm_high, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                        ENFORCE_ENCODING_NONE));
+  }
+  else if (rn_high != PREG_NONE)
+  {
+    ot_check(th_sbc_imm(op->dest.pr1, rn_high, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+  }
+  else if (rm_high != PREG_NONE)
+  {
+    ot_check(th_mov_imm(op->dest.pr1, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    ot_check(th_sbc_reg(op->dest.pr1, op->dest.pr1, rm_high, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                        ENFORCE_ENCODING_NONE));
+  }
+  else
+  {
+    ot_check(th_mov_imm(op->dest.pr1, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    ot_check(th_sbc_imm(op->dest.pr1, op->dest.pr1, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+  }
+}
+
 void tcc_gen_machine_data_processing_op(TACQuadruple *op)
 {
   ThumbDataProcessingHandler handler;
@@ -2858,213 +3092,7 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
   case TCCIR_OP_ADD:
     if (is_64bit)
     {
-      const int src2_is_imm = th_has_immediate_value(op->src2.r) || op->src2.pr0 == PREG_NONE;
-      const uint64_t src2_imm = (uint64_t)op->src2.c.i;
-      const uint32_t imm_low = (uint32_t)(src2_imm & 0xffffffffu);
-      const uint32_t imm_high = (uint32_t)(src2_imm >> 32);
-
-      /* Materialize spilled/unallocated regs (backend must never pass sentinels to opcode encoders). */
-      ScratchRegAlloc rd0_alloc = {0};
-      ScratchRegAlloc rn0_alloc = {0};
-      ScratchRegAlloc rm0_alloc = {0};
-      ScratchRegAlloc rd1_alloc = {0};
-      ScratchRegAlloc rn1_alloc = {0};
-      ScratchRegAlloc rm1_alloc = {0};
-
-      const int rd0_is_mem = (op->dest.pr0 == PREG_NONE || op->dest.pr0 == PREG_SPILLED);
-      const int rn0_is_mem = (op->src1.pr0 == PREG_NONE || op->src1.pr0 == PREG_SPILLED);
-      const int rm0_is_mem = (!src2_is_imm && (op->src2.pr0 == PREG_NONE || op->src2.pr0 == PREG_SPILLED));
-
-      int rd0 = op->dest.pr0;
-      int rn0 = op->src1.pr0;
-      int rm0 = op->src2.pr0;
-
-      uint32_t exclude0 = (1u << R_SP);
-      if (!rd0_is_mem && rd0 >= 0 && rd0 <= 15)
-        exclude0 |= (1u << rd0);
-      if (!rn0_is_mem && rn0 >= 0 && rn0 <= 15)
-        exclude0 |= (1u << rn0);
-      if (!rm0_is_mem && !src2_is_imm && rm0 >= 0 && rm0 <= 15)
-        exclude0 |= (1u << rm0);
-
-      /* Check if operands are 64-bit memory values */
-      const int rd_is_mem = rd0_is_mem || (op->dest.pr1 == PREG_NONE || op->dest.pr1 == PREG_SPILLED);
-      const int rn_is_mem = rn0_is_mem || (op->src1.pr1 == PREG_NONE || op->src1.pr1 == PREG_SPILLED);
-      const int rm_is_mem = rm0_is_mem || (!src2_is_imm && (op->src2.pr1 == PREG_NONE || op->src2.pr1 == PREG_SPILLED));
-
-      /* For 64-bit memory operands, allocate BOTH registers together */
-      int rd1 = op->dest.pr1;
-      int rn1 = op->src1.pr1;
-      int rm1 = op->src2.pr1;
-
-      if (rd_is_mem && rd1 != PREG_NONE)
-      {
-        /* 64-bit dest in memory - allocate both registers */
-        rd0_alloc = get_scratch_reg_with_save(exclude0);
-        rd0 = rd0_alloc.reg;
-        exclude0 |= (1u << rd0);
-        rd1_alloc = get_scratch_reg_with_save(exclude0);
-        rd1 = rd1_alloc.reg;
-        exclude0 |= (1u << rd1);
-        /* Only needed for ADC if dest is also src (carry propagation); safe to preload. */
-        load_to_reg(rd0, rd1, &op->dest);
-      }
-      else if (rd0_is_mem)
-      {
-        /* 32-bit dest in memory */
-        rd0_alloc = get_scratch_reg_with_save(exclude0);
-        rd0 = rd0_alloc.reg;
-        exclude0 |= (1u << rd0);
-        load_to_reg(rd0, PREG_NONE, &op->dest);
-      }
-
-      if (rn_is_mem && rn1 != PREG_NONE)
-      {
-        /* 64-bit src1 in memory - allocate both registers */
-        rn0_alloc = get_scratch_reg_with_save(exclude0);
-        rn0 = rn0_alloc.reg;
-        exclude0 |= (1u << rn0);
-        rn1_alloc = get_scratch_reg_with_save(exclude0);
-        rn1 = rn1_alloc.reg;
-        exclude0 |= (1u << rn1);
-        load_to_reg(rn0, rn1, &op->src1);
-      }
-      else if (rn0_is_mem)
-      {
-        /* 32-bit src1 in memory */
-        rn0_alloc = get_scratch_reg_with_save(exclude0);
-        rn0 = rn0_alloc.reg;
-        exclude0 |= (1u << rn0);
-        load_to_reg(rn0, PREG_NONE, &op->src1);
-      }
-
-      if (rm_is_mem && rm1 != PREG_NONE)
-      {
-        /* 64-bit src2 in memory - allocate both registers */
-        rm0_alloc = get_scratch_reg_with_save(exclude0);
-        rm0 = rm0_alloc.reg;
-        exclude0 |= (1u << rm0);
-        rm1_alloc = get_scratch_reg_with_save(exclude0);
-        rm1 = rm1_alloc.reg;
-        exclude0 |= (1u << rm1);
-        load_to_reg(rm0, rm1, &op->src2);
-      }
-      else if (rm0_is_mem)
-      {
-        /* 32-bit src2 in memory */
-        rm0_alloc = get_scratch_reg_with_save(exclude0);
-        rm0 = rm0_alloc.reg;
-        exclude0 |= (1u << rm0);
-        load_to_reg(rm0, PREG_NONE, &op->src2);
-      }
-
-      /* 64-bit add: ADDS for low words, ADC for high words */
-      /* dest.pr0:pr1 = src1.pr0:pr1 + src2.pr0:pr1 */
-      if (src2_is_imm)
-      {
-        thumb_opcode add_low = th_add_imm(rd0, rn0, imm_low, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE);
-        if (add_low.size == 0)
-        {
-          ScratchRegAlloc scratch = {0};
-          uint32_t exclude = (1u << rd0) | (1u << rn0);
-          scratch = get_scratch_reg_with_save(exclude);
-          {
-            SValue imm_sv = {0};
-            imm_sv.r = VT_CONST;
-            imm_sv.type.t = VT_INT;
-            imm_sv.c.i = imm_low;
-            load_vt_const(scratch.reg, PREG_NONE, &imm_sv);
-          }
-          ot_check(th_add_reg(rd0, rn0, scratch.reg, FLAGS_BEHAVIOUR_SET, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-          restore_scratch_reg(&scratch);
-        }
-        else
-        {
-          ot_check(add_low);
-        }
-      }
-      else
-      {
-        ot_check(th_add_reg(rd0, rn0, rm0, FLAGS_BEHAVIOUR_SET, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-      }
-      /* High word: handle mixed 32/64-bit operands (pr1 may be PREG_NONE). */
-      if (src2_is_imm)
-      {
-        /* src2 high word comes from immediate */
-        if (rn1 != PREG_NONE)
-        {
-          ot_check(th_adc_imm(rd1, rn1, imm_high, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
-        }
-        else
-        {
-          ot_check(th_mov_imm(rd1, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
-          ot_check(th_adc_imm(rd1, rd1, imm_high, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
-        }
-      }
-      else if (rn1 != PREG_NONE && rm1 != PREG_NONE)
-      {
-        ot_check(th_adc_reg(rd1, rn1, rm1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-      }
-      else if (rn1 != PREG_NONE)
-      {
-        /* src2 high word is 0 */
-        ot_check(th_adc_imm(rd1, rn1, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
-      }
-      else if (rm1 != PREG_NONE)
-      {
-        /* src1 high word is 0 */
-        ot_check(th_mov_imm(rd1, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
-        ot_check(th_adc_reg(rd1, rd1, rm1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-      }
-      else
-      {
-        /* Both high words are 0, result is carry from low add */
-        ot_check(th_mov_imm(rd1, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
-        ot_check(th_adc_imm(rd1, rd1, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
-      }
-
-      /* Cleanup: restore scratch registers in reverse order */
-      if (rd_is_mem && rd1 != PREG_NONE)
-      {
-        /* 64-bit dest - store both words manually */
-        SValue dest_with_regs = op->dest;
-        dest_with_regs.pr0 = rd0;
-        dest_with_regs.pr1 = rd1;
-        store(rd0, &dest_with_regs);
-        /* Also need to store high word - create a modified SValue for high word */
-        SValue dest_high = dest_with_regs;
-        dest_high.c.i += 4; /* Offset for high word */
-        store(rd1, &dest_high);
-        restore_scratch_reg(&rd1_alloc);
-        restore_scratch_reg(&rd0_alloc);
-      }
-      else if (rd0_is_mem)
-      {
-        /* 32-bit dest */
-        store(rd0, &op->dest);
-        restore_scratch_reg(&rd0_alloc);
-      }
-
-      if (rn_is_mem && rn1 != PREG_NONE)
-      {
-        restore_scratch_reg(&rn1_alloc);
-        restore_scratch_reg(&rn0_alloc);
-      }
-      else if (rn0_is_mem)
-      {
-        restore_scratch_reg(&rn0_alloc);
-      }
-
-      if (rm_is_mem && rm1 != PREG_NONE)
-      {
-        restore_scratch_reg(&rm1_alloc);
-        restore_scratch_reg(&rm0_alloc);
-      }
-      else if (rm0_is_mem)
-      {
-        restore_scratch_reg(&rm0_alloc);
-      }
-
+      thumb_emit_add64(op);
       return;
     }
     handler.imm_handler = th_add_imm;
@@ -3073,163 +3101,7 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
   case TCCIR_OP_SUB:
     if (is_64bit)
     {
-      const int src2_is_imm = th_has_immediate_value(op->src2.r) || op->src2.pr0 == PREG_NONE;
-      const uint64_t src2_imm = (uint64_t)op->src2.c.i;
-      const uint32_t imm_low = (uint32_t)(src2_imm & 0xffffffffu);
-      const uint32_t imm_high = (uint32_t)(src2_imm >> 32);
-
-      /* Handle memory operands for 64-bit subtraction */
-      int rd0 = op->dest.pr0;
-      int rn0 = op->src1.pr0;
-      int rm0 = op->src2.pr0;
-      int rd1 = op->dest.pr1;
-      int rn1 = op->src1.pr1;
-      int rm1 = op->src2.pr1;
-
-      const int rd_is_mem = (op->dest.pr0 == PREG_NONE || op->dest.pr0 == PREG_SPILLED);
-      const int rn_is_mem = (op->src1.pr0 == PREG_NONE || op->src1.pr0 == PREG_SPILLED);
-      const int rm_is_mem = (!src2_is_imm && (op->src2.pr0 == PREG_NONE || op->src2.pr0 == PREG_SPILLED));
-
-      ScratchRegAlloc rd_alloc = {0}, rn_alloc = {0}, rm_alloc = {0};
-      ScratchRegAlloc rd1_alloc = {0}, rn1_alloc = {0}, rm1_alloc = {0};
-
-      uint32_t exclude = 0;
-      if (!rd_is_mem && rd0 >= 0 && rd0 <= 15)
-        exclude |= (1u << rd0);
-      if (!rd_is_mem && rd1 >= 0 && rd1 <= 15)
-        exclude |= (1u << rd1);
-      if (!rn_is_mem && rn0 >= 0 && rn0 <= 15)
-        exclude |= (1u << rn0);
-      if (!rn_is_mem && rn1 >= 0 && rn1 <= 15)
-        exclude |= (1u << rn1);
-      if (!rm_is_mem && !src2_is_imm && rm0 >= 0 && rm0 <= 15)
-        exclude |= (1u << rm0);
-      if (!rm_is_mem && !src2_is_imm && rm1 >= 0 && rm1 <= 15)
-        exclude |= (1u << rm1);
-
-      /* Load 64-bit values from memory */
-      if (rd_is_mem)
-      {
-        rd_alloc = get_scratch_reg_with_save(exclude);
-        rd0 = rd_alloc.reg;
-        exclude |= (1u << rd0);
-        rd1_alloc = get_scratch_reg_with_save(exclude);
-        rd1 = rd1_alloc.reg;
-        exclude |= (1u << rd1);
-        load_to_reg(rd0, rd1, &op->dest);
-      }
-      if (rn_is_mem)
-      {
-        rn_alloc = get_scratch_reg_with_save(exclude);
-        rn0 = rn_alloc.reg;
-        exclude |= (1u << rn0);
-        rn1_alloc = get_scratch_reg_with_save(exclude);
-        rn1 = rn1_alloc.reg;
-        exclude |= (1u << rn1);
-        load_to_reg(rn0, rn1, &op->src1);
-      }
-      if (rm_is_mem)
-      {
-        rm_alloc = get_scratch_reg_with_save(exclude);
-        rm0 = rm_alloc.reg;
-        exclude |= (1u << rm0);
-        rm1_alloc = get_scratch_reg_with_save(exclude);
-        rm1 = rm1_alloc.reg;
-        exclude |= (1u << rm1);
-        load_to_reg(rm0, rm1, &op->src2);
-      }
-
-      /* 64-bit sub: SUBS for low words, SBC for high words */
-      if (src2_is_imm)
-      {
-        thumb_opcode sub_low = th_sub_imm(rd0, rn0, imm_low, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE);
-        if (sub_low.size == 0)
-        {
-          ScratchRegAlloc scratch = {0};
-          uint32_t exclude = (1u << rd0) | (1u << rn0);
-          scratch = get_scratch_reg_with_save(exclude);
-          {
-            SValue imm_sv = {0};
-            imm_sv.r = VT_CONST;
-            imm_sv.type.t = VT_INT;
-            imm_sv.c.i = imm_low;
-            load_vt_const(scratch.reg, PREG_NONE, &imm_sv);
-          }
-          ot_check(th_sub_reg(rd0, rn0, scratch.reg, FLAGS_BEHAVIOUR_SET, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-          restore_scratch_reg(&scratch);
-        }
-        else
-        {
-          ot_check(sub_low);
-        }
-      }
-      else
-      {
-        ot_check(th_sub_reg(rd0, rn0, rm0, FLAGS_BEHAVIOUR_SET, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-      }
-      /* High word: handle mixed 32/64-bit operands (pr1 may be PREG_NONE). */
-      if (src2_is_imm)
-      {
-        /* src2 high word comes from immediate */
-        if (rn1 != PREG_NONE)
-        {
-          ot_check(th_sbc_imm(rd1, rn1, imm_high, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
-        }
-        else
-        {
-          /* src1 high word is 0 (32-bit value promoted to 64-bit) */
-          ot_check(th_mov_imm(rd1, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
-          ot_check(th_sbc_imm(rd1, rd1, imm_high, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
-        }
-      }
-      else if (rn1 != PREG_NONE && rm1 != PREG_NONE)
-      {
-        ot_check(th_sbc_reg(rd1, rn1, rm1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-      }
-      else if (rn1 != PREG_NONE)
-      {
-        /* src2 high word is 0 */
-        ot_check(th_sbc_imm(rd1, rn1, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
-      }
-      else if (rm1 != PREG_NONE)
-      {
-        /* src1 high word is 0 */
-        ot_check(th_mov_imm(rd1, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
-        ot_check(th_sbc_reg(rd1, rd1, rm1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-      }
-      else
-      {
-        /* Both high words are 0, result is derived from borrow out of low sub */
-        ot_check(th_mov_imm(rd1, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
-        ot_check(th_sbc_imm(rd1, rd1, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
-      }
-
-      /* Store and cleanup */
-      if (rd_is_mem)
-      {
-        /* Store both low and high words for 64-bit dest */
-        SValue dest_with_regs = op->dest;
-        dest_with_regs.pr0 = rd0;
-        dest_with_regs.pr1 = rd1;
-        store(rd0, &dest_with_regs);
-        /* Store high word at offset +4 */
-        SValue dest_high = dest_with_regs;
-        dest_high.c.i += 4;
-        store(rd1, &dest_high);
-        restore_scratch_reg(&rd1_alloc);
-        restore_scratch_reg(&rd_alloc);
-      }
-      if (rn_is_mem)
-      {
-        restore_scratch_reg(&rn1_alloc);
-        restore_scratch_reg(&rn_alloc);
-      }
-      if (rm_is_mem)
-      {
-        restore_scratch_reg(&rm1_alloc);
-        restore_scratch_reg(&rm_alloc);
-      }
-
+      thumb_emit_sub64(op);
       return;
     }
     handler.imm_handler = th_sub_imm;
@@ -3352,68 +3224,33 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
   {
     if (is_64bit && th_has_immediate_value(op->src2.r))
     {
+      const char *ctx = "64-bit SHL";
       const uint32_t sh = (uint32_t)op->src2.c.i;
 
-      /* Materialize src low/high and dest low/high regs (may be spilled/mem). */
+      thumb_require_materialized_pair(ctx, "dest", op->dest.pr0, op->dest.pr1);
+
       int src_lo = op->src1.pr0;
       int src_hi = op->src1.pr1;
-      ScratchRegAlloc src_lo_alloc = {0};
-      ScratchRegAlloc src_hi_alloc = {0};
-
-      const bool dest_is_mem = (op->dest.pr0 == PREG_NONE) || (op->dest.pr1 == PREG_NONE) ||
-                               ((op->dest.pr0 & PREG_SPILLED) != 0) || ((op->dest.pr1 & PREG_SPILLED) != 0);
-      int dst_lo = op->dest.pr0;
-      int dst_hi = op->dest.pr1;
-      ScratchRegAlloc dst_lo_alloc = {0};
-      ScratchRegAlloc dst_hi_alloc = {0};
-
-      uint32_t exclude = 0;
-      if (!dest_is_mem)
+      const bool src_is_imm = (src_lo == PREG_NONE) && th_has_immediate_value(op->src1.r);
+      if (src_is_imm)
       {
-        if (dst_lo <= 15)
-          exclude |= (1u << dst_lo);
-        if (dst_hi <= 15)
-          exclude |= (1u << dst_hi);
+        load_vt_const(op->dest.pr0, op->dest.pr1, &op->src1);
+        src_lo = op->dest.pr0;
+        src_hi = op->dest.pr1;
+      }
+      else
+      {
+        thumb_require_materialized_reg(ctx, "src1.low", src_lo);
+        thumb_ensure_not_spilled(ctx, "src1.high", src_hi);
       }
 
-      if (src_lo == PREG_NONE || (src_lo & PREG_SPILLED) || (op->src1.r & VT_LVAL) ||
-          th_has_immediate_value(op->src1.r))
-      {
-        src_lo_alloc = get_scratch_reg_with_save(exclude);
-        load_to_reg(src_lo_alloc.reg, PREG_NONE, &op->src1);
-        src_lo = src_lo_alloc.reg;
-        exclude |= (1u << src_lo);
-      }
+      const int dst_lo = op->dest.pr0;
+      const int dst_hi = op->dest.pr1;
 
       if (src_hi == PREG_NONE)
       {
-        /* Treat missing high word as 0 for left shift. */
-        src_hi_alloc = get_scratch_reg_with_save(exclude);
-        ot_check(th_mov_imm(src_hi_alloc.reg, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
-        src_hi = src_hi_alloc.reg;
-        exclude |= (1u << src_hi);
-      }
-      else if (src_hi & PREG_SPILLED)
-      {
-        src_hi_alloc = get_scratch_reg_with_save(exclude);
-        {
-          SValue src_hi_sv = op->src1;
-          src_hi_sv.pr0 = src_hi;
-          src_hi_sv.pr1 = PREG_NONE;
-          src_hi_sv.c.i += 4;
-          load_to_reg(src_hi_alloc.reg, PREG_NONE, &src_hi_sv);
-        }
-        src_hi = src_hi_alloc.reg;
-        exclude |= (1u << src_hi);
-      }
-
-      if (dest_is_mem)
-      {
-        dst_lo_alloc = get_scratch_reg_with_save(exclude);
-        dst_lo = dst_lo_alloc.reg;
-        exclude |= (1u << dst_lo);
-        dst_hi_alloc = get_scratch_reg_with_save(exclude);
-        dst_hi = dst_hi_alloc.reg;
+        ot_check(th_mov_imm(dst_hi, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+        src_hi = dst_hi;
       }
 
       if (sh == 0)
@@ -3425,8 +3262,8 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
       }
       else if (sh < 32)
       {
-        ScratchRegAlloc tmp_alloc = {0};
-        tmp_alloc = get_scratch_reg_with_save((1u << dst_lo) | (1u << dst_hi) | (1u << src_lo) | (1u << src_hi));
+        const int regs_for_mask[] = {dst_lo, dst_hi, src_lo, src_hi};
+        ScratchRegAlloc tmp_alloc = get_scratch_reg_with_save(thumb_exclude_mask_for_regs(4, regs_for_mask));
 
         ot_check(th_lsl_imm(dst_lo, src_lo, sh, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
         /* tmp = src_lo >> (32 - sh) */
@@ -3455,19 +3292,6 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
         ot_check(th_mov_imm(dst_hi, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
       }
 
-      if (dest_is_mem)
-      {
-        SValue dest_mem = op->dest;
-        store(dst_lo, &dest_mem);
-        SValue dest_hi_mem = dest_mem;
-        dest_hi_mem.c.i += 4;
-        store(dst_hi, &dest_hi_mem);
-      }
-
-      restore_scratch_reg(&dst_hi_alloc);
-      restore_scratch_reg(&dst_lo_alloc);
-      restore_scratch_reg(&src_hi_alloc);
-      restore_scratch_reg(&src_lo_alloc);
       return;
     }
 
@@ -3480,66 +3304,33 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
   {
     if (is_64bit && th_has_immediate_value(op->src2.r))
     {
+      const char *ctx = "64-bit SHR";
       const uint32_t sh = (uint32_t)op->src2.c.i;
+
+      thumb_require_materialized_pair(ctx, "dest", op->dest.pr0, op->dest.pr1);
 
       int src_lo = op->src1.pr0;
       int src_hi = op->src1.pr1;
-      ScratchRegAlloc src_lo_alloc = {0};
-      ScratchRegAlloc src_hi_alloc = {0};
-
-      const bool dest_is_mem = (op->dest.pr0 == PREG_NONE) || (op->dest.pr1 == PREG_NONE) ||
-                               ((op->dest.pr0 & PREG_SPILLED) != 0) || ((op->dest.pr1 & PREG_SPILLED) != 0);
-      int dst_lo = op->dest.pr0;
-      int dst_hi = op->dest.pr1;
-      ScratchRegAlloc dst_lo_alloc = {0};
-      ScratchRegAlloc dst_hi_alloc = {0};
-
-      uint32_t exclude = 0;
-      if (!dest_is_mem)
+      const bool src_is_imm = (src_lo == PREG_NONE) && th_has_immediate_value(op->src1.r);
+      if (src_is_imm)
       {
-        if (dst_lo <= 15)
-          exclude |= (1u << dst_lo);
-        if (dst_hi <= 15)
-          exclude |= (1u << dst_hi);
+        load_vt_const(op->dest.pr0, op->dest.pr1, &op->src1);
+        src_lo = op->dest.pr0;
+        src_hi = op->dest.pr1;
+      }
+      else
+      {
+        thumb_require_materialized_reg(ctx, "src1.low", src_lo);
+        thumb_ensure_not_spilled(ctx, "src1.high", src_hi);
       }
 
-      if (src_lo == PREG_NONE || (src_lo & PREG_SPILLED) || (op->src1.r & VT_LVAL) ||
-          th_has_immediate_value(op->src1.r))
-      {
-        src_lo_alloc = get_scratch_reg_with_save(exclude);
-        load_to_reg(src_lo_alloc.reg, PREG_NONE, &op->src1);
-        src_lo = src_lo_alloc.reg;
-        exclude |= (1u << src_lo);
-      }
+      const int dst_lo = op->dest.pr0;
+      const int dst_hi = op->dest.pr1;
 
       if (src_hi == PREG_NONE)
       {
-        src_hi_alloc = get_scratch_reg_with_save(exclude);
-        ot_check(th_mov_imm(src_hi_alloc.reg, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
-        src_hi = src_hi_alloc.reg;
-        exclude |= (1u << src_hi);
-      }
-      else if (src_hi & PREG_SPILLED)
-      {
-        src_hi_alloc = get_scratch_reg_with_save(exclude);
-        {
-          SValue src_hi_sv = op->src1;
-          src_hi_sv.pr0 = src_hi;
-          src_hi_sv.pr1 = PREG_NONE;
-          src_hi_sv.c.i += 4;
-          load_to_reg(src_hi_alloc.reg, PREG_NONE, &src_hi_sv);
-        }
-        src_hi = src_hi_alloc.reg;
-        exclude |= (1u << src_hi);
-      }
-
-      if (dest_is_mem)
-      {
-        dst_lo_alloc = get_scratch_reg_with_save(exclude);
-        dst_lo = dst_lo_alloc.reg;
-        exclude |= (1u << dst_lo);
-        dst_hi_alloc = get_scratch_reg_with_save(exclude);
-        dst_hi = dst_hi_alloc.reg;
+        ot_check(th_mov_imm(dst_hi, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+        src_hi = dst_hi;
       }
 
       if (sh == 0)
@@ -3551,8 +3342,8 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
       }
       else if (sh < 32)
       {
-        ScratchRegAlloc tmp_alloc = {0};
-        tmp_alloc = get_scratch_reg_with_save((1u << dst_lo) | (1u << dst_hi) | (1u << src_lo) | (1u << src_hi));
+        const int regs_for_mask[] = {dst_lo, dst_hi, src_lo, src_hi};
+        ScratchRegAlloc tmp_alloc = get_scratch_reg_with_save(thumb_exclude_mask_for_regs(4, regs_for_mask));
 
         /* tmp = src_hi << (32 - sh) */
         ot_check(th_lsl_imm(tmp_alloc.reg, src_hi, 32 - sh, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
@@ -3582,19 +3373,6 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
         ot_check(th_mov_imm(dst_hi, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
       }
 
-      if (dest_is_mem)
-      {
-        SValue dest_mem = op->dest;
-        store(dst_lo, &dest_mem);
-        SValue dest_hi_mem = dest_mem;
-        dest_hi_mem.c.i += 4;
-        store(dst_hi, &dest_hi_mem);
-      }
-
-      restore_scratch_reg(&dst_hi_alloc);
-      restore_scratch_reg(&dst_lo_alloc);
-      restore_scratch_reg(&src_hi_alloc);
-      restore_scratch_reg(&src_lo_alloc);
       return;
     }
 
@@ -4383,67 +4161,34 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
   {
     if (is_64bit && th_has_immediate_value(op->src2.r))
     {
+      const char *ctx = "64-bit SAR";
       const uint32_t sh = (uint32_t)op->src2.c.i;
+
+      thumb_require_materialized_pair(ctx, "dest", op->dest.pr0, op->dest.pr1);
 
       int src_lo = op->src1.pr0;
       int src_hi = op->src1.pr1;
-      ScratchRegAlloc src_lo_alloc = {0};
-      ScratchRegAlloc src_hi_alloc = {0};
-
-      const bool dest_is_mem = (op->dest.pr0 == PREG_NONE) || (op->dest.pr1 == PREG_NONE) ||
-                               ((op->dest.pr0 & PREG_SPILLED) != 0) || ((op->dest.pr1 & PREG_SPILLED) != 0);
-      int dst_lo = op->dest.pr0;
-      int dst_hi = op->dest.pr1;
-      ScratchRegAlloc dst_lo_alloc = {0};
-      ScratchRegAlloc dst_hi_alloc = {0};
-
-      uint32_t exclude = 0;
-      if (!dest_is_mem)
+      const bool src_is_imm = (src_lo == PREG_NONE) && th_has_immediate_value(op->src1.r);
+      if (src_is_imm)
       {
-        if (dst_lo <= 15)
-          exclude |= (1u << dst_lo);
-        if (dst_hi <= 15)
-          exclude |= (1u << dst_hi);
+        load_vt_const(op->dest.pr0, op->dest.pr1, &op->src1);
+        src_lo = op->dest.pr0;
+        src_hi = op->dest.pr1;
+      }
+      else
+      {
+        thumb_require_materialized_reg(ctx, "src1.low", src_lo);
+        thumb_ensure_not_spilled(ctx, "src1.high", src_hi);
       }
 
-      if (src_lo == PREG_NONE || (src_lo & PREG_SPILLED) || (op->src1.r & VT_LVAL) ||
-          th_has_immediate_value(op->src1.r))
-      {
-        src_lo_alloc = get_scratch_reg_with_save(exclude);
-        load_to_reg(src_lo_alloc.reg, PREG_NONE, &op->src1);
-        src_lo = src_lo_alloc.reg;
-        exclude |= (1u << src_lo);
-      }
+      const int dst_lo = op->dest.pr0;
+      const int dst_hi = op->dest.pr1;
 
       if (src_hi == PREG_NONE)
       {
         /* Sign-extend missing high word from src_lo. */
-        src_hi_alloc = get_scratch_reg_with_save(exclude);
-        ot_check(th_asr_imm(src_hi_alloc.reg, src_lo, 31, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
-        src_hi = src_hi_alloc.reg;
-        exclude |= (1u << src_hi);
-      }
-      else if (src_hi & PREG_SPILLED)
-      {
-        src_hi_alloc = get_scratch_reg_with_save(exclude);
-        {
-          SValue src_hi_sv = op->src1;
-          src_hi_sv.pr0 = src_hi;
-          src_hi_sv.pr1 = PREG_NONE;
-          src_hi_sv.c.i += 4;
-          load_to_reg(src_hi_alloc.reg, PREG_NONE, &src_hi_sv);
-        }
-        src_hi = src_hi_alloc.reg;
-        exclude |= (1u << src_hi);
-      }
-
-      if (dest_is_mem)
-      {
-        dst_lo_alloc = get_scratch_reg_with_save(exclude);
-        dst_lo = dst_lo_alloc.reg;
-        exclude |= (1u << dst_lo);
-        dst_hi_alloc = get_scratch_reg_with_save(exclude);
-        dst_hi = dst_hi_alloc.reg;
+        ot_check(th_asr_imm(dst_hi, src_lo, 31, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+        src_hi = dst_hi;
       }
 
       if (sh == 0)
@@ -4455,8 +4200,8 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
       }
       else if (sh < 32)
       {
-        ScratchRegAlloc tmp_alloc = {0};
-        tmp_alloc = get_scratch_reg_with_save((1u << dst_lo) | (1u << dst_hi) | (1u << src_lo) | (1u << src_hi));
+        const int regs_for_mask[] = {dst_lo, dst_hi, src_lo, src_hi};
+        ScratchRegAlloc tmp_alloc = get_scratch_reg_with_save(thumb_exclude_mask_for_regs(4, regs_for_mask));
 
         /* tmp = src_hi << (32 - sh) */
         ot_check(th_lsl_imm(tmp_alloc.reg, src_hi, 32 - sh, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
@@ -4487,19 +4232,6 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
                             false));
       }
 
-      if (dest_is_mem)
-      {
-        SValue dest_mem = op->dest;
-        store(dst_lo, &dest_mem);
-        SValue dest_hi_mem = dest_mem;
-        dest_hi_mem.c.i += 4;
-        store(dst_hi, &dest_hi_mem);
-      }
-
-      restore_scratch_reg(&dst_hi_alloc);
-      restore_scratch_reg(&dst_lo_alloc);
-      restore_scratch_reg(&src_hi_alloc);
-      restore_scratch_reg(&src_lo_alloc);
       return;
     }
 
@@ -4706,11 +4438,15 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
     ScratchRegAlloc src_alloc = {0};
 
     /* Handle immediate constant - load into scratch register first */
-    if (th_has_immediate_value(op->src1.r) || src_reg == PREG_NONE || (src_reg & PREG_SPILLED))
+    if (th_has_immediate_value(op->src1.r) || src_reg == PREG_NONE)
     {
       src_alloc = get_scratch_reg_with_save(0);
       src_reg = src_alloc.reg;
       load_to_reg(src_reg, PREG_NONE, &op->src1);
+    }
+    else
+    {
+      thumb_require_materialized_reg("TEST_ZERO", "src", src_reg);
     }
     ot_check(th_cmp_imm(0, src_reg, 0, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE));
 
@@ -4727,6 +4463,7 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
 
   /* Handle constant operands - load into scratch registers if needed */
   {
+    const char *ctx = tcc_ir_get_op_name(op->op);
     int src1_reg = op->src1.pr0;
     int src2_reg = op->src2.pr0;
     int src1_is_imm = th_has_immediate_value(op->src1.r);
@@ -4735,26 +4472,39 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
     int src1_is_address_of = ((op->src1.r & VT_VALMASK) == VT_LOCAL) && !(op->src1.r & VT_LVAL);
     /* Check if src2 is VT_LOCAL address-of (needs address computation) */
     int src2_is_address_of = ((op->src2.r & VT_VALMASK) == VT_LOCAL) && !(op->src2.r & VT_LVAL);
-    /* Check if src1 needs loading: immediate, address-of, or invalid/spilled register */
-    int src1_needs_load = src1_is_imm || src1_is_address_of || src1_reg == PREG_NONE || (src1_reg & PREG_SPILLED);
-    /* Check if src2 needs loading: immediate, address-of, or invalid/spilled register */
-    int src2_needs_load = src2_is_imm || src2_is_address_of || src2_reg == PREG_NONE || (src2_reg & PREG_SPILLED);
+    /* Check if src1 needs loading: immediate, address-of, or missing register */
+    int src1_needs_load = src1_is_imm || src1_is_address_of || src1_reg == PREG_NONE;
+    /* Check if src2 needs loading: immediate, address-of, or missing register */
+    int src2_needs_load = src2_is_imm || src2_is_address_of || src2_reg == PREG_NONE;
     uint32_t exclude_regs = 0;
     ScratchRegAlloc src1_alloc = {0};
     ScratchRegAlloc src2_alloc = {0};
-    ScratchRegAlloc dest_alloc = {0};
 
-    /* Exclude destination register from scratch selection */
-    if (op->dest.pr0 != PREG_NONE && !(op->dest.pr0 & PREG_SPILLED))
-      exclude_regs |= (1 << op->dest.pr0);
+    const bool dest_sets_flags = (op->op == TCCIR_OP_CMP);
+    int dest_reg = op->dest.pr0;
+    if (dest_reg == PREG_NONE)
+    {
+      if (!dest_sets_flags)
+      {
+        tcc_error("compiler_error: %s missing destination register after materialization", ctx);
+      }
+      /* CMP only sets flags; the encoding ignores Rd. Use R0 to keep encoders happy. */
+      dest_reg = R0;
+    }
+    else
+    {
+      thumb_require_materialized_reg(ctx, "dest", dest_reg);
+      if (dest_reg < 32)
+        exclude_regs |= (1 << dest_reg);
+    }
 
     /* If src2 is already in a register, exclude it too so src1 doesn't clobber it */
-    if (!src2_is_imm && !src2_is_address_of && src2_reg != PREG_NONE && !(src2_reg & PREG_SPILLED) && src2_reg < 16)
+    if (!src2_is_imm && !src2_is_address_of && src2_reg != PREG_NONE && src2_reg < 16)
     {
       exclude_regs |= (1 << src2_reg);
     }
 
-    /* Load src1 into scratch register if needed (immediate, VT_LOCAL address, spilled, etc.) */
+    /* Load src1 into scratch register if needed (immediate, VT_LOCAL address, or unallocated) */
     if (src1_needs_load)
     {
       src1_alloc = get_scratch_reg_with_save(exclude_regs);
@@ -4762,19 +4512,17 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
       exclude_regs |= (1 << src1_reg);
       load_to_reg(src1_reg, PREG_NONE, &op->src1);
     }
-    else if (src1_reg >= 0 && src1_reg < 16)
+    else
     {
-      exclude_regs |= (1 << src1_reg);
+      thumb_require_materialized_reg(ctx, "src1", src1_reg);
+      if (src1_reg >= 0 && src1_reg < 16)
+        exclude_regs |= (1 << src1_reg);
     }
-
-    /* Check if destination is in memory */
-    int dest_reg = op->dest.pr0;
-    int dest_is_memory = (dest_reg == PREG_NONE) || (dest_reg & PREG_SPILLED);
 
     if (src2_is_imm)
     {
       /* Try immediate form first (only if src1 didn't need loading from immediate and dest is in register) */
-      if (!src1_is_imm && !dest_is_memory && handler.imm_handler &&
+      if (!src1_is_imm && handler.imm_handler &&
           ot(handler.imm_handler(dest_reg, src1_reg, op->src2.c.i, flags, ENFORCE_ENCODING_NONE)))
       {
         /* Success - clean up any allocated src1 scratch before returning */
@@ -4789,32 +4537,17 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
     }
     else if (src2_needs_load)
     {
-      /* src2 is not immediate but needs loading (VT_LOCAL address, spilled, etc.) */
+      /* src2 is not immediate but needs loading (VT_LOCAL address or unallocated) */
       src2_alloc = get_scratch_reg_with_save(exclude_regs);
       src2_reg = src2_alloc.reg;
       load_to_reg(src2_reg, PREG_NONE, &op->src2);
     }
-
-    /* Handle memory destination: allocate scratch register, perform op, store result */
-    if (dest_is_memory)
+    else
     {
-      /* Destination is in memory - need scratch register */
-      if (src1_reg >= 0 && src1_reg < 16)
-        exclude_regs |= (1 << src1_reg);
-      if (src2_reg >= 0 && src2_reg < 16)
-        exclude_regs |= (1 << src2_reg);
-      dest_alloc = get_scratch_reg_with_save(exclude_regs);
-      dest_reg = dest_alloc.reg;
+      thumb_require_materialized_reg(ctx, "src2", src2_reg);
     }
 
     ot_check(handler.reg_handler(dest_reg, src1_reg, src2_reg, flags, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-
-    /* Store result to memory if needed */
-    if (dest_is_memory)
-    {
-      store(dest_reg, &op->dest);
-      restore_scratch_reg(&dest_alloc);
-    }
 
     /* Restore allocated source scratches in reverse order */
     if (src2_alloc.reg != 0)
@@ -6191,39 +5924,39 @@ static int is_64bit_type(int t)
 
 static void load_to_register(int reg, int reg_from, SValue *sv)
 {
+  const char *ctx = "load_to_register";
+
   if ((sv->r & VT_VALMASK) == VT_LOCAL)
   {
     /* VT_LOCAL without VT_LVAL means we need the ADDRESS of the local variable.
      * In this case we must compute FP + offset, not do a register move. */
     if (!(sv->r & VT_LVAL))
     {
-      /* Always compute address via load_vt_local */
       int r1 = (sv->pr1 != PREG_NONE && is_64bit_type(sv->type.t)) ? sv->pr1 : PREG_NONE;
       load_to_reg(reg, r1, sv);
       return;
     }
-    if (sv->pr0 != PREG_NONE && !(sv->pr0 & PREG_SPILLED))
+
+    if (sv->pr0 != PREG_NONE)
     {
-      // load local variable value from register
-      if (reg != reg_from)
+      int cached = (reg_from != PREG_NONE) ? reg_from : sv->pr0;
+      thumb_require_materialized_reg(ctx, "cached local value", cached);
+      if (reg != cached)
       {
-        ot_check(th_mov_reg(reg, reg_from, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE,
-                            false));
+        ot_check(
+            th_mov_reg(reg, cached, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
       }
       return;
     }
-    if (sv->pr0 == PREG_NONE || (sv->pr0 & PREG_SPILLED))
-    {
-      /* Spilled local variable - load from stack */
-      int r1 = (sv->pr1 != PREG_NONE && is_64bit_type(sv->type.t)) ? sv->pr1 : PREG_NONE;
-      load_to_reg(reg, r1, sv);
-      return;
-    }
+
+    /* Local spilled to stack - reload */
+    int r1 = (sv->pr1 != PREG_NONE && is_64bit_type(sv->type.t)) ? sv->pr1 : PREG_NONE;
+    load_to_reg(reg, r1, sv);
+    return;
   }
 
-  if ((sv->r & VT_LVAL) || sv->pr0 == PREG_NONE || (sv->pr0 & PREG_SPILLED))
+  if ((sv->r & VT_LVAL) || sv->pr0 == PREG_NONE)
   {
-    /* Lvalue: need to load from memory */
     int r1 = (sv->pr1 != PREG_NONE && is_64bit_type(sv->type.t)) ? sv->pr1 : PREG_NONE;
     load_to_reg(reg, r1, sv);
     return;
@@ -6235,12 +5968,7 @@ static void load_to_register(int reg, int reg_from, SValue *sv)
    * duplicates the low word into the high word (seen in 118_switch.c).
    */
   int src_reg = (reg_from != PREG_NONE) ? reg_from : sv->pr0;
-  if (src_reg == PREG_NONE || (src_reg & PREG_SPILLED))
-  {
-    int r1 = (sv->pr1 != PREG_NONE && is_64bit_type(sv->type.t)) ? sv->pr1 : PREG_NONE;
-    load_to_reg(reg, r1, sv);
-    return;
-  }
+  thumb_require_materialized_reg(ctx, "source register", src_reg);
   if (reg != src_reg)
   {
     ot_check(
