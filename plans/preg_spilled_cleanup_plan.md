@@ -30,16 +30,16 @@ Each unchecked box represents at least one direct `PREG_SPILLED` touch point. Cl
       - Now enforces register materialization up front, borrows dest-high for implicit zero-extension, and only allocates scratch for carry bits (no more `PREG_SPILLED` fallbacks or memory destinations).
 7. - [x] **64-bit SHR immediate path** — [arm-thumb-gen.c#L3301-L3382](arm-thumb-gen.c#L3301-L3382)
       - Mirror of SHL: asserts real registers, zero-extends via dest-high, and removes the spill/memory handling in favor of helper-based assertions.
-8. - [ ] **64-bit OR (imm + reg cases)** — [arm-thumb-gen.c#L3506-L3750](arm-thumb-gen.c#L3506-L3750)
-     - Multiple checks (`rd_low_needs_materialize`, `reg_low == PREG_NONE`, etc.) attempt to cure spilled operands on the fly. Push this work back into IR.
-9. - [ ] **64-bit AND (imm + reg cases)** — [arm-thumb-gen.c#L3839-L4025](arm-thumb-gen.c#L3839-L4025)
-     - Similar spill-aware code when combining operands/dests. Replace with materialize+store helpers and keep only invariant asserts.
-10. - [ ] **64-bit XOR helper** — [arm-thumb-gen.c#L4264-L4310](arm-thumb-gen.c#L4264-L4310)
-      - XOR still checks for spilled dest/src halves. Align with ADD/SUB strategy.
+8. - [x] **64-bit OR (imm + reg cases)** — [arm-thumb-gen.c#L3506-L3750](arm-thumb-gen.c#L3506-L3750)
+      - OR paths now demand materialized operands/dest via the shared helpers, rely on scratch masks for immediates, and no longer try to fix spilled regs.
+9. - [x] **64-bit AND (imm + reg cases)** — [arm-thumb-gen.c#L3839-L4025](arm-thumb-gen.c#L3839-L4025)
+      - Immediate and register flows use the invariant helpers and treat 32-bit halves as zero without any backend-side spill recovery.
+10. - [x] **64-bit XOR helper** — [arm-thumb-gen.c#L4264-L4310](arm-thumb-gen.c#L4264-L4310)
+       - XOR follows the same pattern (helper assertions + scratch-limited immediates) and deletes all `PREG_SPILLED` checks.
 11. - [x] **Generic data-processing fallback** — [arm-thumb-gen.c#L4579-L4665](arm-thumb-gen.c#L4579-L4665)
       - Enforced `thumb_require_materialized_reg()` for dest/src regs, removed memory-destination fallbacks, and added a `TEST_ZERO` guard so any lingering spill now trips an IR bug instead of being silently reloaded.
-12. - [ ] **Hard-float result write-back** — [arm-thumb-gen.c#L4781-L4835](arm-thumb-gen.c#L4781-L4835)
-      - `store_fp_result_from_vfp()` special-cases spilled destinations when moving results out of VFP regs. Replace with storeback helpers (or assert) once IR hands us concrete regs/lvalues.
+12. - [x] **Hard-float result write-back** — [arm-thumb-gen.c#L4781-L4835](arm-thumb-gen.c#L4781-L4835)
+      - `store_fp_result_from_vfp()` now requires a materialized integer destination register (or true memory lvalue) and no longer treats `PREG_SPILLED` as a stack-backed destination.
 13. - [ ] **Scalar store op** — [arm-thumb-gen.c#L5330-L5360](arm-thumb-gen.c#L5330-L5360)
       - `tcc_gen_machine_store_op()` still reloads source registers if `pr0` is `PREG_SPILLED`. Replace with `load_to_dest`-style materialization earlier.
 14. - [ ] **Parameter shuffle in prolog** — [arm-thumb-gen.c#L5483-L5530](arm-thumb-gen.c#L5483-L5530)

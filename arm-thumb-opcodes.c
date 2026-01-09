@@ -1775,12 +1775,12 @@ thumb_opcode th_mul(uint32_t rd, uint32_t rn, uint32_t rm, thumb_flags_behaviour
   };
 }
 
-thumb_opcode th_umull(uint32_t rdlo, uint32_t rdhi, uint16_t rn, uint16_t rm)
+thumb_opcode th_umull(uint32_t rdlo, uint32_t rdhi, uint32_t rn, uint32_t rm)
 {
 #ifndef TCC_TARGET_ARM_ARCHV6M
   return (thumb_opcode){
       .size = 4,
-      .opcode = 0xfba00000 | (rn << 16) | (rdlo << 12) | (rdhi << 8) | rm,
+      .opcode = 0xfba00000 | ((rn & 0xf) << 16) | ((rdlo & 0xf) << 12) | ((rdhi & 0xf) << 8) | (rm & 0xf),
   };
 #endif
   return (thumb_opcode){

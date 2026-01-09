@@ -265,7 +265,7 @@ thumb_opcode th_str_reg(uint32_t rt, uint32_t rn, uint32_t rm, thumb_shift shift
 
 thumb_opcode th_mul(uint32_t rd, uint32_t rn, uint32_t rm, thumb_flags_behaviour flags,
                     thumb_enforce_encoding encoding);
-thumb_opcode th_umull(uint32_t rdlo, uint32_t rdhi, uint16_t rn, uint16_t rm);
+thumb_opcode th_umull(uint32_t rdlo, uint32_t rdhi, uint32_t rn, uint32_t rm);
 thumb_opcode th_udiv(uint16_t rd, uint16_t rn, uint16_t rm);
 thumb_opcode th_sdiv(uint16_t rd, uint16_t rn, uint16_t rm);
 

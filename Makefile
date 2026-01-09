@@ -115,7 +115,9 @@ TCC_X = armv8m
 
 # cross libtcc1.a targets to build
 LIBTCC1_X = $(filter-out c67,$(TCC_X))
-FP_LIBS_CROSS = $(foreach X,$(TCC_X),$X-fp-libs)
+FP_LIBS_STAMP_DIR = $(TOP)/lib/fp/build
+FP_LIBS_SRC_DEPS = $(shell find $(TOP)/lib/fp -type f \( -name 'Makefile' -o -name '*.[chS]' \) -print 2>/dev/null)
+FP_LIBS_CROSS = $(foreach X,$(TCC_X),$(FP_LIBS_STAMP_DIR)/.$X-fp-libs.stamp)
 
 
 PROGS_CROSS = $(foreach X,$(TCC_X),$X-tcc$(EXESUF))
@@ -130,8 +132,13 @@ cross-%: %-tcc$(EXESUF) %-libtcc1.a ;
 
 fp-libs: $(FP_LIBS_CROSS)
 
-%-fp-libs: %-tcc$(EXESUF) FORCE
+# Backwards-compatible aliases (won't rebuild if stamp is up-to-date)
+%-fp-libs: $(FP_LIBS_STAMP_DIR)/.%-fp-libs.stamp
+
+$(FP_LIBS_STAMP_DIR)/.%-fp-libs.stamp: %-tcc$(EXESUF) $(FP_LIBS_SRC_DEPS)
+	@mkdir -p $(FP_LIBS_STAMP_DIR)
 	@$(MAKE) --no-print-directory -C lib CROSS_TARGET=$* fp-libs
+	@touch $@
 
 install: ; @$(MAKE) --no-print-directory  install$(CFG)
 install-strip: ; @$(MAKE) --no-print-directory  install$(CFG) CONFIG_strip=yes
