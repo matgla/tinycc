@@ -50,8 +50,6 @@ extern float strtof(const char *__nptr, char **__endptr);
 extern long double strtold(const char *__nptr, char **__endptr);
 #endif
 
-#include "tccir.h"
-
 #ifndef O_BINARY
 #define O_BINARY 0
 #endif
@@ -326,6 +324,9 @@ extern long double strtold(const char *__nptr, char **__endptr);
 #endif
 
 /* -------------------------------------------- */
+/* Forward declarations needed by target includes */
+typedef struct Sym Sym;
+
 /* include the target specific definitions */
 
 #define TARGET_DEFS_ONLY
@@ -474,7 +475,7 @@ struct FuncAttr
 };
 
 /* symbol management */
-typedef struct Sym
+struct Sym
 {
   int v;            /* symbol token */
   unsigned short r; /* associated register or VT_CONST/VT_LOCAL and LVAL type */
@@ -510,8 +511,9 @@ typedef struct Sym
   };
   struct Sym *prev;     /* prev symbol in stack */
   struct Sym *prev_tok; /* previous symbol for this token */
-} Sym;
+};
 
+#include "tccir.h"
 /* section definition */
 typedef struct Section
 {

@@ -6293,11 +6293,13 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
   /* IR owns call argument binding; backend must not scan for FUNCPARAM*. */
   const IRCallSite *cs = tcc_ir_callsite_for_call(ir, call_idx);
   int param_count = 0;
-  const int *param_indices = NULL;
+  const IRCallArgument *call_args = NULL;
   if (cs)
   {
     param_count = cs->argc;
-    param_indices = cs->arg_instr_index_by_num;
+    call_args = cs->args;
+    if (param_count > 0 && !call_args)
+      tcc_error("Missing call argument descriptors for call at IR index %d", call_idx);
   }
   else
   {
@@ -6320,17 +6322,17 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
   // only r0-r3 for arguments, rest arguments go to stack
   for (int i = 0; i < param_count; ++i)
   {
-    const int argument_index = param_indices[i];
-    TACQuadruple *arg = &ir->instructions[argument_index];
-    const int is_64bit = is_64bit_type(arg->src1.type.t);
-    const int is_struct = (arg->src1.type.t & VT_BTYPE) == VT_STRUCT;
+    const SValue *arg_value = tcc_ir_callsite_arg_value_ptr(ir, &call_args[i]);
+    const int is_64bit = is_64bit_type(arg_value->type.t);
+    const int is_struct = (arg_value->type.t & VT_BTYPE) == VT_STRUCT;
     int arg_size = is_64bit ? 8 : 4;
 
     /* For structs passed by value, use actual struct size */
     if (is_struct && !is_64bit)
     {
       int align;
-      arg_size = type_size(&arg->src1.type, &align);
+      CType arg_type = arg_value->type;
+      arg_size = type_size(&arg_type, &align);
       arg_size = TCC_ALIGN(arg_size, 4); /* Round up to 4-byte alignment */
     }
 
@@ -6427,8 +6429,6 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
     // check if argument goes to register
     int assigned_register = PREG_NONE;
     int is_64bit = 0;
-    const int argument_index = param_indices[i];
-    TACQuadruple *arg = &ir->instructions[argument_index];
 
     for (int j = 0; j < 4; j++)
     {
@@ -6450,7 +6450,8 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
      * not a pointer. In that case we must dereference it when materializing
      * the outgoing argument value; otherwise variadic calls (e.g. printf)
      * end up receiving stack addresses as integers. */
-    SValue arg_val = arg->src1;
+    const SValue *arg_src = tcc_ir_callsite_arg_value_ptr(ir, &call_args[i]);
+    SValue arg_val = arg_src ? *arg_src : (SValue){0};
     const int arg_btype = arg_val.type.t & VT_BTYPE;
     const int is_stack_addr = ((arg_val.r & VT_VALMASK) == VT_LOCAL) && !(arg_val.r & VT_LVAL);
     const int is_stack_param_vreg = (arg_val.r & VT_PARAM) && ((arg_val.r & VT_VALMASK) == VT_LOCAL);
@@ -6465,7 +6466,7 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
     if (TCC_DUMP_THUMB_GEN)
     {
       THGEN_DUMP("stack arg[%d]: assigned_reg=%d vr=%d orig_r=0x%x c=%d needs_deref=%d stack_param_lval=%d\n", i,
-                 assigned_register, arg->src1.vr, arg->src1.r, arg->src1.c.i, needs_deref_for_value,
+                 assigned_register, arg_val.vr, arg_val.r, arg_val.c.i, needs_deref_for_value,
                  is_stack_param_lvalue_pre);
     }
 
@@ -6597,28 +6598,28 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
   {
     if (op_to_reg[dest] == PREG_NONE)
       continue;
-    TACQuadruple *arg = &ir->instructions[param_indices[op_to_reg[dest]]];
-    const int is_64bit = is_64bit_type(arg->src1.type.t);
-    if (is_valid_src_reg(&arg->src1, arg->src1.pr0))
+    const SValue *arg_value = tcc_ir_callsite_arg_value_ptr(ir, &call_args[op_to_reg[dest]]);
+    const int is_64bit = is_64bit_type(arg_value->type.t);
+    if (is_valid_src_reg(arg_value, arg_value->pr0))
     {
-      param_src0[dest] = arg->src1.pr0;
+      param_src0[dest] = arg_value->pr0;
       /* Don't add to conflict mask if src==dest (no real conflict, just loading from self) */
-      if (arg->src1.pr0 != dest)
-        future_src_mask |= (1u << arg->src1.pr0);
+      if (arg_value->pr0 != dest)
+        future_src_mask |= (1u << arg_value->pr0);
     }
-    else if ((arg->src1.r & VT_LVAL) && arg->src1.pr0 != PREG_NONE && !(arg->src1.pr0 & PREG_SPILLED))
+    else if ((arg_value->r & VT_LVAL) && arg_value->pr0 != PREG_NONE && !(arg_value->pr0 & PREG_SPILLED))
     {
       /* Lvalue: pr0 contains pointer to dereference. Track it separately. */
-      param_lval_src[dest] = arg->src1.pr0;
-      if (arg->src1.pr0 != dest)
-        future_src_mask |= (1u << arg->src1.pr0);
+      param_lval_src[dest] = arg_value->pr0;
+      if (arg_value->pr0 != dest)
+        future_src_mask |= (1u << arg_value->pr0);
     }
-    if (is_64bit && is_valid_src_reg(&arg->src1, arg->src1.pr1))
+    if (is_64bit && is_valid_src_reg(arg_value, arg_value->pr1))
     {
-      param_src1[dest] = arg->src1.pr1;
+      param_src1[dest] = arg_value->pr1;
       /* Don't add to conflict mask if src==dest */
-      if (arg->src1.pr1 != dest)
-        future_src_mask |= (1u << arg->src1.pr1);
+      if (arg_value->pr1 != dest)
+        future_src_mask |= (1u << arg_value->pr1);
     }
   }
 
@@ -6692,8 +6693,8 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
      * We'll load both words into (Rn, Rn+1) in one go.
      */
     {
-      TACQuadruple *arg_probe = &ir->instructions[param_indices[op_to_reg[i]]];
-      if (is_64bit_type(arg_probe->src1.type.t) && (i & 1))
+      const SValue *arg_probe = tcc_ir_callsite_arg_value_ptr(ir, &call_args[op_to_reg[i]]);
+      if (is_64bit_type(arg_probe->type.t) && (i & 1))
         continue;
     }
 
@@ -6748,8 +6749,8 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
       }
     }
 
-    TACQuadruple *arg = &ir->instructions[param_indices[op_to_reg[i]]];
-    SValue arg_copy = arg->src1;
+    const SValue *arg_src = tcc_ir_callsite_arg_value_ptr(ir, &call_args[op_to_reg[i]]);
+    SValue arg_copy = arg_src ? *arg_src : (SValue){0};
     const int is_64bit = is_64bit_type(arg_copy.type.t);
     const int dest_reg = i;
 
@@ -6795,8 +6796,8 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
     if (lval_params_done & (1u << i))
       continue; /* Already handled in first pass */
 
-    TACQuadruple *arg = &ir->instructions[param_indices[op_to_reg[i]]];
-    SValue arg_copy = arg->src1; /* We may rewrite pr0/pr1 if we remap sources. */
+    const SValue *arg_src2 = tcc_ir_callsite_arg_value_ptr(ir, &call_args[op_to_reg[i]]);
+    SValue arg_copy = arg_src2 ? *arg_src2 : (SValue){0}; /* We may rewrite pr0/pr1 if we remap sources. */
 
     const int is_64bit = is_64bit_type(arg_copy.type.t);
     const int dest_reg = i;
@@ -6922,7 +6923,6 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
 
   if (drop_result)
   {
-    /* param_indices is owned by IR callsite table */
     return;
   }
 
@@ -6971,8 +6971,6 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
                           false));
     }
   }
-
-  /* param_indices is owned by IR callsite table */
 }
 
 ST_FUNC void tcc_gen_machine_jump_op(TACQuadruple *q)

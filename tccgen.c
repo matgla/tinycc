@@ -10511,6 +10511,7 @@ static void gen_function(Sym *sym)
   }
 
   tcc_ir_patch_live_intervals_registers(ir);
+  tcc_ir_refresh_callsite_args(ir);
   tcc_ir_register_allocation_params(ir);
   tcc_ir_build_stack_layout(ir);
   tcc_ir_generate_code(ir);

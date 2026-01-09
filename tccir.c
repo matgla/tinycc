@@ -417,6 +417,8 @@ TCCIRState *tcc_ir_allocate_block()
   block->callsite_capacity = 0;
   block->callsite_index_by_call_instr = NULL;
   block->callsite_index_by_call_instr_size = 0;
+  block->callsite_arg_binding_by_instr = NULL;
+  block->callsite_arg_binding_size = 0;
 
   tcc_ls_initialize(&block->ls);
   block->stack_layout.slots = NULL;
@@ -431,9 +433,9 @@ static void tcc_ir_callsites_clear(TCCIRState *ir)
   {
     for (int i = 0; i < ir->callsite_count; ++i)
     {
-      if (ir->callsites[i].arg_instr_index_by_num)
-        tcc_free(ir->callsites[i].arg_instr_index_by_num);
-      ir->callsites[i].arg_instr_index_by_num = NULL;
+      if (ir->callsites[i].args)
+        tcc_free(ir->callsites[i].args);
+      ir->callsites[i].args = NULL;
     }
     tcc_free(ir->callsites);
     ir->callsites = NULL;
@@ -447,6 +449,13 @@ static void tcc_ir_callsites_clear(TCCIRState *ir)
     ir->callsite_index_by_call_instr = NULL;
   }
   ir->callsite_index_by_call_instr_size = 0;
+
+  if (ir->callsite_arg_binding_by_instr)
+  {
+    tcc_free(ir->callsite_arg_binding_by_instr);
+    ir->callsite_arg_binding_by_instr = NULL;
+  }
+  ir->callsite_arg_binding_size = 0;
 }
 
 void tcc_ir_build_callsites(TCCIRState *ir)
@@ -458,6 +467,14 @@ void tcc_ir_build_callsites(TCCIRState *ir)
   ir->callsite_index_by_call_instr = tcc_malloc(sizeof(int) * ir->callsite_index_by_call_instr_size);
   for (int i = 0; i < ir->callsite_index_by_call_instr_size; ++i)
     ir->callsite_index_by_call_instr[i] = -1;
+
+  ir->callsite_arg_binding_size = ir->callsite_index_by_call_instr_size;
+  ir->callsite_arg_binding_by_instr = tcc_malloc(sizeof(IRCallsiteArgBinding) * ir->callsite_arg_binding_size);
+  for (int i = 0; i < ir->callsite_arg_binding_size; ++i)
+  {
+    ir->callsite_arg_binding_by_instr[i].callsite_index = -1;
+    ir->callsite_arg_binding_by_instr[i].arg_index = -1;
+  }
 
   for (int call_idx = 0; call_idx < n; ++call_idx)
   {
@@ -541,41 +558,87 @@ void tcc_ir_build_callsites(TCCIRState *ir)
       ir->callsites = tcc_realloc(ir->callsites, sizeof(IRCallSite) * ir->callsite_capacity);
     }
 
-    IRCallSite *cs = &ir->callsites[ir->callsite_count];
+    const int callsite_index = ir->callsite_count;
+    IRCallSite *cs = &ir->callsites[callsite_index];
     cs->call_instr_index = call_idx;
     cs->call_orig_index = call->orig_index;
     cs->argc = argc;
-    cs->arg_instr_index_by_num = NULL;
+    cs->args = NULL;
 
     if (argc > 0)
     {
-      cs->arg_instr_index_by_num = tcc_malloc(sizeof(int) * argc);
+      cs->args = tcc_malloc(sizeof(IRCallArgument) * argc);
       for (int a = 0; a < argc; ++a)
-        cs->arg_instr_index_by_num[a] = -1;
+      {
+        cs->args[a].instr_index = -1;
+        cs->args[a].value = (SValue){0};
+      }
 
       for (int k = 0; k < pairs_count; ++k)
       {
         const int pnum = param_nums[k];
         if (pnum < 0 || pnum >= argc)
           continue;
-        if (cs->arg_instr_index_by_num[pnum] != -1)
+        if (cs->args[pnum].instr_index != -1)
           tcc_error("Duplicate FUNCPARAMVAL %d bound to call at IR index %d", pnum, call_idx);
-        cs->arg_instr_index_by_num[pnum] = param_instrs[k];
+
+        const int instr_index = param_instrs[k];
+        cs->args[pnum].instr_index = instr_index;
+        if (instr_index >= 0 && instr_index < ir->callsite_arg_binding_size)
+        {
+          ir->callsite_arg_binding_by_instr[instr_index].callsite_index = callsite_index;
+          ir->callsite_arg_binding_by_instr[instr_index].arg_index = pnum;
+        }
+
+        if (instr_index >= 0 && instr_index < ir->next_instruction_index)
+        {
+          cs->args[pnum].value = ir->instructions[instr_index].src1;
+        }
       }
 
       for (int p = 0; p < argc; ++p)
       {
-        if (cs->arg_instr_index_by_num[p] == -1)
+        if (cs->args[p].instr_index == -1)
           tcc_error("Missing FUNCPARAMVAL %d for call at IR index %d", p, call_idx);
       }
     }
 
-    ir->callsite_index_by_call_instr[call_idx] = ir->callsite_count;
+    ir->callsite_index_by_call_instr[call_idx] = callsite_index;
     ir->callsite_count++;
 
     tcc_free(param_nums);
     tcc_free(param_instrs);
   }
+}
+
+void tcc_ir_refresh_callsite_args(TCCIRState *ir)
+{
+  if (!ir || !ir->callsites)
+    return;
+
+  for (int cs_i = 0; cs_i < ir->callsite_count; ++cs_i)
+  {
+    IRCallSite *cs = &ir->callsites[cs_i];
+    if (!cs->args)
+      continue;
+    for (int p = 0; p < cs->argc; ++p)
+    {
+      const int instr_index = cs->args[p].instr_index;
+      if (instr_index < 0 || instr_index >= ir->next_instruction_index)
+        continue;
+      cs->args[p].value = ir->instructions[instr_index].src1;
+    }
+  }
+}
+
+const SValue *tcc_ir_callsite_arg_value_ptr(const TCCIRState *ir, const IRCallArgument *arg)
+{
+  if (!ir || !arg)
+    return NULL;
+  const int idx = arg->instr_index;
+  if (idx >= 0 && idx < ir->next_instruction_index)
+    return &ir->instructions[idx].src1;
+  return &arg->value;
 }
 
 const IRCallSite *tcc_ir_callsite_for_call(const TCCIRState *ir, int call_instr_index)
@@ -595,15 +658,12 @@ const IRCallSite *tcc_ir_callsite_for_call(const TCCIRState *ir, int call_instr_
 static int tcc_ir_vreg_is_call_argument(const TCCIRState *ir, int vreg_encoded, int call_instr_index)
 {
   const IRCallSite *cs = tcc_ir_callsite_for_call(ir, call_instr_index);
-  if (!cs)
+  if (!cs || !cs->args)
     return 0;
   for (int p = 0; p < cs->argc; ++p)
   {
-    const int arg_instr_index = cs->arg_instr_index_by_num ? cs->arg_instr_index_by_num[p] : -1;
-    if (arg_instr_index < 0 || arg_instr_index >= ir->next_instruction_index)
-      continue;
-    const TACQuadruple *q = &ir->instructions[arg_instr_index];
-    if (q->op == TCCIR_OP_FUNCPARAMVAL && q->src1.vr == vreg_encoded)
+    const SValue *arg_value = &cs->args[p].value;
+    if (arg_value->vr == vreg_encoded)
       return 1;
   }
   return 0;
@@ -1640,17 +1700,14 @@ static void tcc_ir_extend_param_intervals(TCCIRState *ir)
   {
     const IRCallSite *cs = &ir->callsites[cs_i];
     const int call_index = cs->call_instr_index;
+    if (!cs->args)
+      continue;
     for (int p = 0; p < cs->argc; ++p)
     {
-      const int arg_instr_index = cs->arg_instr_index_by_num ? cs->arg_instr_index_by_num[p] : -1;
-      if (arg_instr_index < 0 || arg_instr_index >= ir->next_instruction_index)
-        continue;
-      TACQuadruple *q = &ir->instructions[arg_instr_index];
-      if (q->op != TCCIR_OP_FUNCPARAMVAL)
-        continue;
-      if (tcc_is_vreg_valid(ir, q->src1.vr))
+      const SValue *arg_value = &cs->args[p].value;
+      if (tcc_is_vreg_valid(ir, arg_value->vr))
       {
-        IRLiveInterval *interval = tcc_ir_get_live_interval(ir, q->src1.vr);
+        IRLiveInterval *interval = tcc_ir_get_live_interval(ir, arg_value->vr);
         if (interval && interval->end < call_index)
           interval->end = call_index;
       }
@@ -5314,8 +5371,22 @@ void tcc_ir_generate_code(TCCIRState *ir)
       tcc_gen_machine_lea_op(q);
       break;
     case TCCIR_OP_FUNCPARAMVAL:
-      /* IR-only marker; call lowering consumes args via callsite table. */
+    {
+      /* IR-only marker; refresh callsite descriptor with materialized value. */
+      if (ir->callsite_arg_binding_by_instr && i >= 0 && i < ir->callsite_arg_binding_size)
+      {
+        const IRCallsiteArgBinding *binding = &ir->callsite_arg_binding_by_instr[i];
+        if (binding->callsite_index >= 0 && binding->callsite_index < ir->callsite_count)
+        {
+          IRCallSite *cs = &ir->callsites[binding->callsite_index];
+          if (binding->arg_index >= 0 && binding->arg_index < cs->argc)
+          {
+            cs->args[binding->arg_index].value = q->src1;
+          }
+        }
+      }
       break;
+    }
     case TCCIR_OP_JUMP:
       tcc_gen_machine_jump_op(q);
       /* Clear spill cache at branch - value may come from different path */

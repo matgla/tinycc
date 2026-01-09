@@ -124,17 +124,27 @@ typedef struct IRLiveInterval
   int stack_slot_index;    // index into stack layout (-1 if not stack-backed)
 } IRLiveInterval;
 
+typedef struct IRCallArgument
+{
+  SValue value;    /* argument value as emitted in FUNCPARAMVAL */
+  int instr_index; /* original FUNCPARAMVAL instruction index (for diagnostics) */
+} IRCallArgument;
+
 /* IRCallSite: explicit binding of call arguments to a FUNCCALL instruction.
- * Phase 1: arg list references the original FUNCPARAMVAL instructions by index.
- * This avoids backend IR scanning and makes argument ownership stable.
- */
+ * Arguments are stored as descriptors so backends never scan FUNCPARAMVAL. */
 typedef struct IRCallSite
 {
   int call_instr_index; /* index into ir->instructions (current, post-opts) */
   int call_orig_index;  /* stable orig_index for debugging/mapping */
   int argc;
-  int *arg_instr_index_by_num; /* length argc; each is an index into ir->instructions */
+  IRCallArgument *args; /* length argc */
 } IRCallSite;
+
+typedef struct IRCallsiteArgBinding
+{
+  int callsite_index;
+  int arg_index;
+} IRCallsiteArgBinding;
 
 /* SpillCache: Track which registers hold which stack slot values.
  * Used to avoid redundant loads when value is already in a register after storeback.
@@ -264,6 +274,8 @@ typedef struct TCCIRState
   int callsite_capacity;
   int *callsite_index_by_call_instr; /* maps call instruction index -> callsite index */
   int callsite_index_by_call_instr_size;
+  IRCallsiteArgBinding *callsite_arg_binding_by_instr; /* maps FUNCPARAM instr -> callsite/arg */
+  int callsite_arg_binding_size;
 
   uint32_t *ignored_vregs;
   int ignored_vregs_size;
@@ -314,6 +326,8 @@ int tcc_ir_get_reg_type(TCCIRState *ir, int vreg);
 
 void tcc_ir_liveness_analysis(TCCIRState *ir);
 void tcc_ir_register_allocation_params(TCCIRState *ir);
+void tcc_ir_refresh_callsite_args(TCCIRState *ir);
+const SValue *tcc_ir_callsite_arg_value_ptr(const TCCIRState *ir, const IRCallArgument *arg);
 /* For parameters that arrive on the caller stack (beyond r0-r3 per AAPCS),
  * do not allocate separate local spill slots. They already have a stable
  * incoming stack home for the duration of the call. */
