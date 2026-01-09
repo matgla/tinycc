@@ -197,6 +197,68 @@ enum
 #include "arch/fpu/arm/fpv5-sp-d16.h"
 #include "arm-thumb-opcodes.h"
 
+#include <inttypes.h>
+
+#if defined(__linux__)
+#include <execinfo.h>
+#include <limits.h>
+#include <unistd.h>
+
+static void thumb_backend_dump_addr2line(void *const *frames, int count)
+{
+  char exe_path[PATH_MAX];
+  ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+  if (len < 0)
+    return;
+  exe_path[len] = '\0';
+
+  for (int i = 0; i < count; ++i)
+  {
+    char cmd[PATH_MAX + 128];
+    snprintf(cmd, sizeof(cmd), "addr2line -f -p -e %s %p", exe_path, frames[i]);
+    FILE *fp = popen(cmd, "r");
+    if (!fp)
+    {
+      fprintf(stderr, "  [%02d] %p (addr2line unavailable)\n", i, frames[i]);
+      continue;
+    }
+    char line[512];
+    if (fgets(line, sizeof(line), fp))
+    {
+      /* addr2line output already ends with a newline */
+      fprintf(stderr, "  [%02d] %s", i, line);
+    }
+    else
+    {
+      fprintf(stderr, "  [%02d] %p (addr2line lookup failed)\n", i, frames[i]);
+    }
+    pclose(fp);
+  }
+}
+
+static void thumb_backend_backtrace(const char *reason)
+{
+  void *frames[32];
+  int count = backtrace(frames, 32);
+  fprintf(stderr, "Thumb backend contract violation: %s\n", reason);
+  backtrace_symbols_fd(frames, count, 2);
+  thumb_backend_dump_addr2line(frames, count);
+}
+#else
+static void thumb_backend_backtrace(const char *reason)
+{
+  (void)reason;
+}
+#endif
+
+static void thumb_backend_dump_svalue(const char *label, const SValue *sv)
+{
+  if (!sv)
+    return;
+  fprintf(stderr, "%s: r=0x%x pr0=%d pr1=%d vr=%d c.i=%lld type=0x%x flags=0x%x sym=%p\n", label, sv->r, sv->pr0,
+          sv->pr1, sv->vr, (long long)sv->c.i, sv->type.t, sv->type.ref ? sv->type.ref->type.t : 0, (void *)sv->sym);
+}
+
 int load_word_from_base(int ir, int base, int fc, int sign);
 
 /* Helper to validate a Sym pointer - returns NULL if invalid/unusable for relocation */
@@ -1607,12 +1669,19 @@ void store(int r, SValue *sv)
        * - For IR-generated code, materialization may put the address in sv->pr0.
        * - For legacy/non-IR paths, the address register is often encoded directly
        *   in sv->r (v) with sv->pr0 left as PREG_NONE.
-       *
-       * Accept both; this is not spill-slot guessing, just choosing the base reg. */
-      if (sv->pr0 != PREG_NONE && sv->pr0 < PREG_SPILLED)
+       */
+      if (sv->pr0 != PREG_NONE)
+      {
+        if (sv->pr0 >= PREG_SPILLED)
+        {
+          tcc_error("compiler_error: store() received a spilled address register after materialization");
+        }
         base = sv->pr0;
+      }
       else
+      {
         base = v;
+      }
       v = VT_LOCAL;
       fc = 0;
       sign = 0;
@@ -2055,9 +2124,7 @@ void load_vt_lval_vt_local(int r, int r1, SValue *sv, int ft, int fc, int sign, 
      * Note: r values 0-4 are always integer registers (R0-R3, R12=TREG_R12=4).
      * r values 5-12 could be TREG_F0-F7 OR physical R5-R12.
      * We use a heuristic: if r is a known scratch register (R12=12), use
-     * integer path. Also check sv->pr0 - if it's PREG_SPILLED, we're loading
-     * from stack to temp register for copy, which should use integer path.
-     * Only use VFP if hard float ABI is enabled. */
+     * integer path. Only use VFP if hard float ABI is enabled. */
     int use_vfp = (tcc_state->float_abi == ARM_HARD_FLOAT) && (r >= TREG_F0 && r <= TREG_F7);
     /* Override: if r is physical R12 (12), always use integer path */
     if (r == 12 || r == 14)
@@ -2418,39 +2485,16 @@ void load_to_dest(SValue *dest, SValue *sv)
     uint32_t base = tcc_state->need_frame_pointer ? R_FP : R_SP;
     SValue v1;
 
-    // /* First check if this is a register-allocated LOCAL variable.
-    //  * In this case pr0 contains the allocated register, and we should
-    //  * do a register move instead of loading from memory.
-    //  * NOTE: This only applies to VT_LOCAL, NOT to v < VT_CONST which means
-    //  * the address is in a register and needs dereferencing. */
-    // if (v == VT_LOCAL && sv->pr0 >= 0 && !(sv->pr0 & PREG_SPILLED))
-    // {
-    //   /* Allocated to register - do register move, not memory load. */
-    //   /* For doubles in integer registers (soft float) */
-    //   if (dest->pr0 != sv->pr0)
-    //   {
-    //     ot_check(th_mov_reg(dest->pr0, sv->pr0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-    //                         ENFORCE_ENCODING_NONE, false));
-    //   }
-    //   if (tcc_is_64bit_operand(dest) && dest->pr1 != sv->pr1)
-    //   {
-    //     ot_check(th_mov_reg(dest->pr1, sv->pr1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-    //                         ENFORCE_ENCODING_NONE, false));
-    //   }
-    //   return;
-    // }
-
     // load value from stack
     // prepare for new load after pointer dereference
-    // Also handle spilled pointers that need double-dereference:
-    // When v == VT_LOCAL, VT_LVAL is set, and pr0 == PREG_SPILLED, this is a
-    // spilled temporary holding an address that needs dereferencing. Treat it
-    // like VT_LLOCAL: first load the pointer from the spill slot, then deref.
     if (v == VT_LOCAL && sv->pr0 == PREG_SPILLED)
     {
-      /* Spilled pointer with dereference needed - treat like VT_LLOCAL */
-      v = VT_LLOCAL;
+      /* IR must never hand load_to_dest() a spilled pointer to dereference. */
+      thumb_backend_backtrace("load_to_dest spilled pointer operand");
+      thumb_backend_dump_svalue("load_to_dest operand", sv);
+      tcc_error("compiler_error: load_to_dest received a spilled pointer operand after materialization");
     }
+
     if (v == VT_LLOCAL)
     {
       v1.type.t = VT_PTR;
@@ -2494,46 +2538,21 @@ void load_to_dest(SValue *dest, SValue *sv)
     {
       /* Address-in-register lvalue. Prefer sv->pr0 when it carries a real register
        * number, otherwise fall back to the legacy encoding in sv->r (v). */
-      if (sv->pr0 != PREG_NONE && sv->pr0 < PREG_SPILLED)
+      if (sv->pr0 != PREG_NONE)
       {
-        base = sv->pr0;
-        fc = 0;
-        sign = 0;
-        v = VT_LOCAL;
-      }
-      else if (sv->pr0 != PREG_NONE && (sv->pr0 & PREG_SPILLED))
-      {
-        /* The address is spilled to the stack. Load it first to a scratch register,
-         * then use that as the base for dereferencing. The spill offset is in sv->c.i.
-         * We do the complete load inline here because we need the scratch register
-         * to remain valid until after the dereference. */
-        ScratchRegAlloc base_alloc =
-            get_scratch_reg_with_save((1u << dest->pr0) | (dest->pr1 != PREG_NONE ? (1u << dest->pr1) : 0));
-        int addr_reg = base_alloc.reg;
-        int spill_offset = sv->c.i;
-        int spill_sign = (spill_offset < 0);
-        int spill_abs = spill_sign ? -spill_offset : spill_offset;
-        if (!load_word_from_base(addr_reg, R_FP, spill_abs, spill_sign))
+        if (sv->pr0 >= PREG_SPILLED)
         {
-          ScratchRegAlloc rr_alloc =
-              th_offset_to_reg_ex(spill_abs, spill_sign, (1u << addr_reg) | (1u << R_FP) | (1u << dest->pr0));
-          int rr = rr_alloc.reg;
-          ot_check(th_ldr_reg(addr_reg, R_FP, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-          restore_scratch_reg(&rr_alloc);
+          tcc_error("compiler_error: load_to_dest received a spilled address register after materialization");
         }
-        /* Now addr_reg contains the address to dereference. Do the final load. */
-        load_vt_lval_vt_local(dest->pr0, dest->pr1, sv, ft, 0, 0, addr_reg);
-        /* Now we can restore the scratch register */
-        restore_scratch_reg(&base_alloc);
-        return;
+        base = sv->pr0;
       }
       else
       {
         base = v;
-        fc = 0;
-        sign = 0;
-        v = VT_LOCAL;
       }
+      fc = 0;
+      sign = 0;
+      v = VT_LOCAL;
     }
 
     if (v == VT_LOCAL)
@@ -2566,7 +2585,15 @@ void load_to_dest(SValue *dest, SValue *sv)
   else if (v < VT_CONST)
   {
     /* For IR-generated code, use pr0 as the source register */
-    int src_reg = (sv->pr0 != PREG_NONE && !(sv->pr0 & PREG_SPILLED)) ? sv->pr0 : v;
+    int src_reg = v;
+    if (sv->pr0 != PREG_NONE)
+    {
+      if (sv->pr0 >= PREG_SPILLED)
+      {
+        tcc_error("compiler_error: load_to_dest received spilled source register after materialization");
+      }
+      src_reg = sv->pr0;
+    }
 
     if (is_float(ft))
     {
@@ -5548,25 +5575,14 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
       int src;
     } ParamMove;
 
-    typedef struct StackParamLoad
-    {
-      int dst0;
-      int dst1;
-      int caller_off;
-      int is_64bit;
-    } StackParamLoad;
-
     /* NOTE: Do not hard-code small fixed arrays here.
      * Functions can legally have >32 parameters (e.g. sum40 in tests), and
      * overflowing these buffers corrupts prolog codegen and breaks calls.
      * Worst-case: a 64-bit param can contribute up to 2 reg moves.
      */
     const int max_param_moves = ir->next_parameter * 2 + 8;
-    const int max_param_loads = ir->next_parameter + 8;
     ParamMove *moves = tcc_malloc(sizeof(ParamMove) * max_param_moves);
     int move_count = 0;
-    StackParamLoad *loads = tcc_malloc(sizeof(StackParamLoad) * max_param_loads);
-    int load_count = 0;
 
     for (int vreg = 0; vreg < ir->next_parameter; ++vreg)
     {
@@ -5584,45 +5600,12 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
 
       if (incoming_r0 < 0)
       {
-        /* Stack-passed parameter: defer loads until after register shuffles. */
-        if (alloc_r0 != PREG_SPILLED && alloc_r0 != PREG_NONE && alloc_r0 >= 0 && alloc_r0 <= R12 &&
-            interval->allocation.offset == 0)
-        {
-          const int caller_stack_offset = offset_to_args + interval->original_offset;
-          loads[load_count++] = (StackParamLoad){
-              .dst0 = alloc_r0,
-              .dst1 = alloc_r1,
-              .caller_off = caller_stack_offset,
-              .is_64bit = is_64bit,
-          };
-        }
-        else if (alloc_r0 == PREG_SPILLED || interval->allocation.offset != 0)
-        {
-          /* Stack-passed parameter that is also spilled: load from caller's stack
-           * and store to our local stack (spill location). Use a scratch register. */
-          const int caller_stack_offset = offset_to_args + interval->original_offset;
-          const int spill_offset = interval->allocation.offset;
-          int scratch = R_IP; /* Use IP as scratch */
-
-          if (is_64bit)
-          {
-            /* Load low word from caller's stack */
-            tcc_gen_machine_load_from_stack(scratch, caller_stack_offset);
-            /* Store to spill location */
-            tcc_gen_machine_store_to_stack(scratch, spill_offset);
-            /* Load high word from caller's stack */
-            tcc_gen_machine_load_from_stack(scratch, caller_stack_offset + 4);
-            /* Store to spill location */
-            tcc_gen_machine_store_to_stack(scratch, spill_offset + 4);
-          }
-          else
-          {
-            /* Load from caller's stack */
-            tcc_gen_machine_load_from_stack(scratch, caller_stack_offset);
-            /* Store to spill location */
-            tcc_gen_machine_store_to_stack(scratch, spill_offset);
-          }
-        }
+        /* Stack-passed parameters live permanently in the caller's argument
+         * area. Leave their allocations empty so IR materialization can treat
+         * them as VT_PARAM lvalues and load directly when needed. */
+        interval->allocation.r0 = PREG_NONE;
+        interval->allocation.r1 = PREG_NONE;
+        interval->allocation.offset = 0;
         continue;
       }
 
@@ -5714,22 +5697,7 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
       moves[0].src = temp;
     }
 
-    /* Finally, load stack-passed parameters into their allocated registers. */
-    for (int i = 0; i < load_count; ++i)
-    {
-      if (loads[i].is_64bit && loads[i].dst1 >= 0)
-      {
-        tcc_gen_machine_load_from_stack(loads[i].dst0, loads[i].caller_off);
-        tcc_gen_machine_load_from_stack(loads[i].dst1, loads[i].caller_off + 4);
-      }
-      else
-      {
-        tcc_gen_machine_load_from_stack(loads[i].dst0, loads[i].caller_off);
-      }
-    }
-
     tcc_free(moves);
-    tcc_free(loads);
   }
 }
 
@@ -6485,9 +6453,79 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
     SValue arg_val = arg->src1;
     const int arg_btype = arg_val.type.t & VT_BTYPE;
     const int is_stack_addr = ((arg_val.r & VT_VALMASK) == VT_LOCAL) && !(arg_val.r & VT_LVAL);
-    const int needs_deref_for_value = is_stack_addr && arg_btype != VT_PTR && arg_btype != VT_FUNC;
+    const int is_stack_param_vreg = (arg_val.r & VT_PARAM) && ((arg_val.r & VT_VALMASK) == VT_LOCAL);
+    const int needs_deref_for_value =
+        is_stack_addr && !is_stack_param_vreg && arg_btype != VT_PTR && arg_btype != VT_FUNC;
     if (needs_deref_for_value)
       arg_val.r |= VT_LVAL;
+
+    const int stack_param_offset = arg_val.c.i;
+    const int is_stack_param_lvalue_pre = is_stack_param_vreg;
+
+    if (TCC_DUMP_THUMB_GEN)
+    {
+      THGEN_DUMP("stack arg[%d]: assigned_reg=%d vr=%d orig_r=0x%x c=%d needs_deref=%d stack_param_lval=%d\n", i,
+                 assigned_register, arg->src1.vr, arg->src1.r, arg->src1.c.i, needs_deref_for_value,
+                 is_stack_param_lvalue_pre);
+    }
+
+    TCCMaterializedValue mat_arg = {0};
+    if (!is_stack_param_lvalue_pre)
+    {
+      tcc_ir_materialize_value(ir, &arg_val, &mat_arg);
+
+      if (TCC_DUMP_THUMB_GEN)
+      {
+        THGEN_DUMP("stack arg[%d]: materialized r=0x%x pr0=%d pr1=%d c=%d param=%d lval=%d\n", i, arg_val.r,
+                   arg_val.pr0, arg_val.pr1, arg_val.c.i, (arg_val.r & VT_PARAM) ? 1 : 0,
+                   (arg_val.r & VT_LVAL) ? 1 : 0);
+      }
+    }
+
+    const int is_stack_param_lvalue = is_stack_param_lvalue_pre;
+    if (is_stack_param_lvalue)
+    {
+      const int caller_stack_offset = offset_to_args + stack_param_offset;
+      const uint32_t stack_exclude = (1u << R_SP) | (1u << R7) | (1u << R0) | (1u << R1) | (1u << R2) | (1u << R3);
+
+      if (TCC_DUMP_THUMB_GEN)
+      {
+        THGEN_DUMP("stack arg[%d]: copy from caller stack offset=%d (orig=%d, offset_to_args=%d)\n", i,
+                   caller_stack_offset, stack_param_offset, offset_to_args);
+      }
+
+      if (is_64bit_type(arg_val.type.t))
+      {
+        stack_offset = TCC_ALIGN(stack_offset, 8);
+
+        ScratchRegAlloc scratch_lo_alloc = get_scratch_reg_with_save(stack_exclude);
+        ScratchRegAlloc scratch_hi_alloc = get_scratch_reg_with_save(stack_exclude | (1u << scratch_lo_alloc.reg));
+
+        tcc_gen_machine_load_from_stack(scratch_lo_alloc.reg, caller_stack_offset);
+        tcc_gen_machine_load_from_stack(scratch_hi_alloc.reg, caller_stack_offset + 4);
+
+        ot_check(th_str_imm(scratch_lo_alloc.reg, R_SP, stack_offset, 6, ENFORCE_ENCODING_NONE));
+        ot_check(th_str_imm(scratch_hi_alloc.reg, R_SP, stack_offset + 4, 6, ENFORCE_ENCODING_NONE));
+        stack_offset += 8;
+
+        restore_scratch_reg(&scratch_hi_alloc);
+        restore_scratch_reg(&scratch_lo_alloc);
+      }
+      else
+      {
+        ScratchRegAlloc scratch_alloc = get_scratch_reg_with_save(stack_exclude);
+        int reg = scratch_alloc.reg;
+        tcc_gen_machine_load_from_stack(reg, caller_stack_offset);
+        ot_check(th_str_imm(reg, R_SP, stack_offset, 6, ENFORCE_ENCODING_NONE));
+        stack_offset += 4;
+        restore_scratch_reg(&scratch_alloc);
+      }
+
+      if (mat_arg.used_scratch)
+        tcc_machine_release_scratch(&mat_arg.scratch);
+
+      continue;
+    }
 
     is_64bit = is_64bit_type(arg_val.type.t);
     if (is_64bit)
@@ -6542,6 +6580,9 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
       /* Restore scratch after use */
       restore_scratch_reg(&scratch_alloc);
     }
+
+    if (mat_arg.used_scratch)
+      tcc_machine_release_scratch(&mat_arg.scratch);
   }
   /* Pre-compute register sources for each register-assigned argument so we can spot conflicts.
    * For lvalues (VT_LVAL set), the pr0 register contains a pointer that will be dereferenced.
@@ -6761,6 +6802,16 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
     const int dest_reg = i;
     const uint32_t dest_mask = is_64bit ? ((1u << dest_reg) | (1u << (dest_reg - 1))) : (1u << dest_reg);
 
+    /* If IR handed us a spilled pointer for an lvalue argument, reload it now so
+     * load_to_dest() never sees a PREG_SPILLED base register. */
+    TCCMaterializedValue mat_reg_arg = {0};
+    const bool needs_spilled_ptr_reload =
+        ((arg_copy.r & VT_LVAL) != 0) && (arg_copy.pr0 != PREG_NONE) && (arg_copy.pr0 & PREG_SPILLED);
+    if (needs_spilled_ptr_reload)
+    {
+      tcc_ir_materialize_value(ir, &arg_copy, &mat_reg_arg);
+    }
+
     /* Check if writing to dest_reg would clobber a source needed by lower registers.
      * Note: lvalue sources are now handled in the first pass, so we only need to
      * check non-lvalue sources here. */
@@ -6825,6 +6876,11 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
     }
 
     scratch_global_exclude = tmp_global_exclude;
+
+    if (mat_reg_arg.used_scratch)
+    {
+      tcc_machine_release_scratch(&mat_reg_arg.scratch);
+    }
   }
 
   scratch_global_exclude = saved_global_exclude;

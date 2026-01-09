@@ -2074,6 +2074,15 @@ void tcc_ir_materialize_value(TCCIRState *ir, SValue *sv, TCCMaterializedValue *
   if (!ir || !sv)
     return;
 
+  if ((sv->r & VT_PARAM) && ((sv->r & VT_VALMASK) == VT_LOCAL))
+  {
+    /* Stack-passed parameters live in the caller frame. Leave them as VT_PARAM
+     * lvalues so the backend can read directly from the caller stack. */
+    sv->pr0 = PREG_NONE;
+    sv->pr1 = PREG_NONE;
+    return;
+  }
+
   if (!(sv->pr0 & PREG_SPILLED))
   {
     return;
@@ -2147,7 +2156,7 @@ void tcc_ir_materialize_addr(TCCIRState *ir, SValue *sv, TCCMaterializedAddr *re
   const int wants_stack_address = (val_kind == VT_LOCAL || val_kind == VT_LLOCAL) && !(sv->r & VT_LVAL);
   /* Check for spilled pointer: pr0 must be PREG_SPILLED (0x80), NOT PREG_NONE (0xFF).
    * PREG_NONE has the PREG_SPILLED bit set, so we must explicitly exclude it. */
-  const int spilled_pointer = (sv->pr0 != PREG_NONE) && (sv->pr0 & PREG_SPILLED) && tcc_is_vreg_valid(ir, sv->vr);
+  const int spilled_pointer = (sv->pr0 != PREG_NONE) && (sv->pr0 & PREG_SPILLED);
 
   if (!wants_stack_address && !spilled_pointer)
     return;
@@ -2356,6 +2365,9 @@ void tcc_ir_register_allocation_params(TCCIRState *ir)
          * The caller-stack location is tracked in original_offset and used by
          * the prolog to load from the incoming argument area.
          */
+        interval->allocation.r0 = PREG_NONE;
+        interval->allocation.r1 = PREG_NONE;
+        interval->allocation.offset = 0;
       }
       argno += 2;
     }
@@ -2388,6 +2400,9 @@ void tcc_ir_register_allocation_params(TCCIRState *ir)
         /* See 64-bit case above: do not overwrite allocator spill slots with
          * caller-stack offsets.
          */
+        interval->allocation.r0 = PREG_NONE;
+        interval->allocation.r1 = PREG_NONE;
+        interval->allocation.offset = 0;
       }
       argno++;
     }

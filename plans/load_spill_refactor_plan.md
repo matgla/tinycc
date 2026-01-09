@@ -145,6 +145,6 @@ Use the checklist below as the actionable execution order.
 - [x] Implement IR-side materialization helpers in [`tcc_ir_generate_code()`](tccir.c:4252): `materialize_value`, `materialize_addr`, `materialize_dest` (including 64-bit pairs) and record storeback actions.
 - [x] Switch IR codegen to use IR-side materialization instead of backend spill preload/storeback.
 - [x] Remove/disable backend spill preload/storeback paths now that materialization is in place.
-- [ ] Simplify backend load/store helpers to stop interpreting spills (remove `PREG_SPILLED`/`VT_LOCAL` heuristics; keep only reg/imm/true memory forms).
+- [x] Simplify backend load/store helpers to stop interpreting spills (remove `PREG_SPILLED`/`VT_LOCAL` heuristics; keep only reg/imm/true memory forms).
 - [ ] Add/adjust regression tests for fragile cases (spilled temps holding pointers, arrays/VLA base pointers, 64-bit ops, switch lowering, indirect calls) and run ir_tests + known failing tests.
 - [ ] Update documentation describing the new boundary and why `VT_LOCAL`/`VT_LVAL` are no longer used to encode spill semantics.

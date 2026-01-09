@@ -38,3 +38,4 @@ Once IR obeys this contract, Thumb (and other targets) can delete (and Thumb alr
 - heuristics that guess semantics from `VT_LOCAL` / `VT_LVAL` / `PREG_SPILLED`.
 
 Backends become responsible only for true loads/stores between registers/immediates and concrete addresses, which eliminates the current semantic guessing layer.
+As a guardrail, the remaining Thumb helpers now error out immediately if `PREG_SPILLED` ever reaches them, so contract violations show up as compiler bugs instead of latent miscompilations.
