@@ -323,6 +323,9 @@ extern long double strtold(const char *__nptr, char **__endptr);
 #define inline
 #endif
 
+/* Call ABI assignment query (types; target hook prototype is later). */
+#include "tccabi.h"
+
 /* -------------------------------------------- */
 /* Forward declarations needed by target includes */
 typedef struct Sym Sym;
@@ -658,6 +661,13 @@ typedef struct CachedInclude
 #define CACHED_INCLUDES_HASH_SIZE 32
 
 #ifdef CONFIG_TCC_ASM
+
+/* Target-specific register count for inline asm constraints.
+ * In this fork we currently support ARM Thumb only. */
+#if defined(TCC_TARGET_ARM_THUMB) && !defined(NB_ASM_REGS)
+#define NB_ASM_REGS 16
+#endif
+
 typedef struct ExprValue
 {
   uint64_t v;
@@ -1445,12 +1455,8 @@ ST_FUNC void vpop(void);
 ST_FUNC void lexpand(void);
 #endif
 #if defined(TCC_TARGET_ARM) || defined(TCC_TARGET_ARM_THUMB)
-ST_FUNC int get_reg_ex(int rc, int rc2);
+/* IR-only: no physical register allocation in the frontend. */
 #endif
-ST_FUNC void save_reg(int r);
-ST_FUNC void save_reg_upstack(int r, int n);
-ST_FUNC int get_reg(int rc);
-ST_FUNC void save_regs(int n);
 ST_FUNC void gaddrof(void);
 ST_FUNC int gv(int rc);
 ST_FUNC void gv2(int rc1, int rc2);
@@ -1785,6 +1791,11 @@ ST_FUNC void subst_asm_operand(CString *add_str, SValue *sv, int modifier);
 ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands, int nb_outputs, int is_output, uint8_t *clobber_regs,
                           int out_reg);
 ST_FUNC void asm_clobber(uint8_t *clobber_regs, const char *str);
+
+/* Emit a fully prepared GCC-style inline asm block.
+ * Used by IR codegen to lower TCCIR_OP_INLINE_ASM without relying on front-end load/store helpers. */
+ST_FUNC void tcc_asm_emit_inline(ASMOperand *operands, int nb_operands, int nb_outputs, int nb_labels,
+                                 uint8_t *clobber_regs, const char *asm_str, int asm_len, int must_subst);
 #endif
 
 /* ------------ tccpe.c -------------- */
@@ -1893,6 +1904,7 @@ typedef struct TACQuadruple
   SValue src2;
   SValue dest;
   int line_num; /* source line number for debug info */
+  int aux;      /* op-specific payload (e.g., inline asm id) */
 } TACQuadruple;
 
 /*
@@ -1916,6 +1928,7 @@ ST_FUNC void tcc_gen_machine_store_op(TACQuadruple *q);
 ST_FUNC void tcc_gen_machine_load_register(SValue *value);
 ST_FUNC void tcc_gen_machine_store_register(SValue *value);
 ST_FUNC void tcc_gen_machine_store_to_stack(int reg, int offset);
+ST_FUNC void tcc_gen_machine_store_to_sp(int reg, int offset);
 
 ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *q);
 ST_FUNC void tcc_gen_machine_lea_op(TACQuadruple *q);
@@ -1924,6 +1937,7 @@ ST_FUNC void tcc_gen_machine_return_value_op(TACQuadruple *q);
 ST_FUNC void tcc_gen_machine_epilog(int leaffunc);
 ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int stack_size);
 ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_value, TCCIRState *ir, int call_idx);
+ST_FUNC int tcc_gen_machine_abi_assign_call_args(const TCCAbiArgDesc *args, int argc, TCCAbiCallLayout *out_layout);
 ST_FUNC void tcc_gen_machine_save_call_context(void);
 ST_FUNC void tcc_gen_machine_restore_call_context(void);
 ST_FUNC void tcc_gen_machine_jump_op(TACQuadruple *q);

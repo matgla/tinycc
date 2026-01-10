@@ -1562,6 +1562,55 @@ static void subst_asm_operands(ASMOperand *operands, int nb_operands, CString *o
   }
 }
 
+/* Lower a fully parsed GCC-style inline asm block.
+ * This is shared between the classic front-end path and IR codegen.
+ */
+ST_FUNC void tcc_asm_emit_inline(ASMOperand *operands, int nb_operands, int nb_outputs, int nb_labels,
+                                 uint8_t *clobber_regs, const char *asm_str, int asm_len, int must_subst)
+{
+  int out_reg;
+  Section *sec;
+  CString astr, astr1;
+
+  if (!operands)
+    tcc_error("tcc_asm_emit_inline: NULL operands");
+  if (!asm_str || asm_len < 0)
+    tcc_error("tcc_asm_emit_inline: invalid asm string");
+
+  /* compute constraints */
+  asm_compute_constraints(operands, nb_operands, nb_outputs, clobber_regs, &out_reg);
+
+  cstr_new_s(&astr);
+  cstr_cat(&astr, asm_str, asm_len + 1);
+
+  /* substitute operands in the asm string */
+  if (must_subst)
+  {
+    cstr_new_s(&astr1);
+    cstr_cat(&astr1, astr.data, astr.size);
+    cstr_reset(&astr);
+    subst_asm_operands(operands, nb_operands + nb_labels, &astr, astr1.data);
+    cstr_free_s(&astr1);
+  }
+
+  /* generate loads */
+  asm_gen_code(operands, nb_operands, nb_outputs, 0, clobber_regs, out_reg);
+
+  /* We don't allow switching section within inline asm to bleed out. */
+  sec = cur_text_section;
+  tcc_assemble_inline(tcc_state, astr.data, astr.size - 1, 0);
+  if (sec != cur_text_section)
+  {
+    tcc_warning("inline asm tries to change current section");
+    use_section1(tcc_state, sec);
+  }
+
+  /* store output values */
+  asm_gen_code(operands, nb_operands, nb_outputs, 1, clobber_regs, out_reg);
+
+  cstr_free_s(&astr);
+}
+
 static void parse_asm_operands(ASMOperand *operands, int *nb_operands_ptr, int is_output)
 {
   ASMOperand *op;
@@ -1730,8 +1779,46 @@ ST_FUNC void asm_instr(void)
   if (tok != ';')
     expect("';'");
 
-  /* save all values in the memory */
-  save_regs(0);
+  /* IR-only mode: inline asm still relies on legacy backend load/store
+     operand materialization and physical register state. */
+  if (tcc_state->ir)
+  {
+    /* Record inline asm for IR codegen lowering.
+     * Emit marker ops so liveness/regalloc see uses/defs across the barrier.
+     */
+    int asm_len = astr.size - 1;
+    int inline_asm_id = tcc_ir_add_inline_asm(tcc_state->ir, astr.data, asm_len, must_subst, operands, nb_operands,
+                                              nb_outputs, nb_labels, clobber_regs);
+
+    /* Read operands (inputs + read/write outputs) */
+    for (i = 0; i < nb_outputs; ++i)
+    {
+      if (operands[i].is_rw)
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_ASM_INPUT, operands[i].vt, NULL, NULL);
+    }
+    for (i = nb_outputs; i < nb_operands; ++i)
+    {
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_ASM_INPUT, operands[i].vt, NULL, NULL);
+    }
+
+    tcc_ir_put_inline_asm(tcc_state->ir, inline_asm_id);
+
+    /* Written operands (outputs) */
+    for (i = 0; i < nb_outputs; ++i)
+    {
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_ASM_OUTPUT, NULL, NULL, operands[i].vt);
+    }
+
+    cstr_free_s(&astr);
+
+    /* restore the current C token */
+    next();
+
+    /* free the value stack entries for asm operands */
+    for (i = 0; i < nb_operands; i++)
+      vpop();
+    return;
+  }
 
   /* compute constraints */
   asm_compute_constraints(operands, nb_operands, nb_outputs, clobber_regs, &out_reg);

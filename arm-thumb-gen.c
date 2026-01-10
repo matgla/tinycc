@@ -194,6 +194,110 @@ enum
 #define USING_GLOBALS
 #include "tcc.h"
 
+static inline int tcc_abi_align_up_int(int v, int align)
+{
+  return (v + align - 1) & ~(align - 1);
+}
+
+/* Target ABI hook: AAPCS-like argument assignment for ARM (R0-R3 + stack).
+ *
+ * This is a pure layout function: it does not materialize values and does not
+ * touch SP. IR can use it to lower calls into explicit CALLSEQ/CALLARG ops.
+ */
+ST_FUNC int tcc_gen_machine_abi_assign_call_args(const TCCAbiArgDesc *args, int argc, TCCAbiCallLayout *out_layout)
+{
+  if (!out_layout || (argc > 0 && (!args || !out_layout->locs)))
+    return -1;
+
+  int next_reg = 0;  /* Next GP arg register index (0..3) */
+  int stack_off = 0; /* Current outgoing stack offset */
+
+  for (int i = 0; i < argc; ++i)
+  {
+    const TCCAbiArgDesc *ad = &args[i];
+    TCCAbiArgLoc *loc = &out_layout->locs[i];
+
+    int size = ad->size;
+    int align = ad->alignment;
+    if (align < 4)
+      align = 4;
+
+    loc->size = (uint16_t)size;
+    loc->reg_base = 0;
+    loc->reg_count = 0;
+    loc->stack_off = 0;
+
+    if (ad->kind == TCC_ABI_ARG_SCALAR64)
+    {
+      /* 64-bit values require even register alignment and 8-byte stack alignment. */
+      if (next_reg & 1)
+        next_reg++;
+      if (next_reg <= 2)
+      {
+        loc->kind = TCC_ABI_LOC_REG;
+        loc->reg_base = (uint8_t)next_reg;
+        loc->reg_count = 2;
+        next_reg += 2;
+      }
+      else
+      {
+        stack_off = tcc_abi_align_up_int(stack_off, 8);
+        loc->kind = TCC_ABI_LOC_STACK;
+        loc->stack_off = stack_off;
+        stack_off += 8;
+        next_reg = 4;
+      }
+      continue;
+    }
+
+    if (ad->kind == TCC_ABI_ARG_STRUCT_BYVAL)
+    {
+      /* Structs: may occupy multiple 4-byte slots in remaining regs, else stack. */
+      int slot_sz = tcc_abi_align_up_int(size, 4);
+      int regs_needed = (slot_sz + 3) / 4;
+      if (next_reg + regs_needed <= 4)
+      {
+        loc->kind = TCC_ABI_LOC_REG;
+        loc->reg_base = (uint8_t)next_reg;
+        loc->reg_count = (uint8_t)regs_needed;
+        next_reg += regs_needed;
+      }
+      else
+      {
+        stack_off = tcc_abi_align_up_int(stack_off, align);
+        loc->kind = TCC_ABI_LOC_STACK;
+        loc->stack_off = stack_off;
+        stack_off += slot_sz;
+        next_reg = 4;
+      }
+      continue;
+    }
+
+    /* Default: 32-bit scalar. */
+    if (next_reg <= 3)
+    {
+      loc->kind = TCC_ABI_LOC_REG;
+      loc->reg_base = (uint8_t)next_reg;
+      loc->reg_count = 1;
+      next_reg++;
+    }
+    else
+    {
+      stack_off = tcc_abi_align_up_int(stack_off, 4);
+      loc->kind = TCC_ABI_LOC_STACK;
+      loc->stack_off = stack_off;
+      stack_off += 4;
+      next_reg = 4;
+    }
+  }
+
+  /* AAPCS requires 8-byte SP alignment at call boundary. */
+  out_layout->argc = argc;
+  out_layout->stack_align = 8;
+  out_layout->stack_size = tcc_abi_align_up_int(stack_off, 8);
+  return 0;
+}
+
 #include "arch/fpu/arm/fpv5-sp-d16.h"
 #include "arm-thumb-opcodes.h"
 
@@ -338,6 +442,185 @@ typedef struct ScratchRegAlloc
   int reg;       /* The allocated scratch register */
   int saved : 1; /* Whether the register was saved to stack */
 } ScratchRegAlloc;
+
+/* Forward declarations needed by multi-scratch helpers. */
+static ScratchRegAlloc get_scratch_reg_with_save(uint32_t exclude_regs);
+static void restore_scratch_reg(ScratchRegAlloc *alloc);
+
+typedef struct ScratchRegAllocs
+{
+  int regs[8];         /* The allocated scratch registers */
+  int count;           /* Number of registers allocated */
+  uint32_t saved_mask; /* Bitmask of registers that were saved (pushed) */
+} ScratchRegAllocs;
+
+static ScratchRegAllocs get_scratch_regs_with_save(uint32_t exclude_regs, int count)
+{
+  ScratchRegAllocs result;
+  memset(&result, 0, sizeof(result));
+  if (count <= 0)
+    return result;
+  if (count > (int)(sizeof(result.regs) / sizeof(result.regs[0])))
+    tcc_error("compiler_error: requested too many scratch regs (%d)", count);
+
+  TCCIRState *ir = tcc_state->ir;
+  uint32_t exclude = exclude_regs | scratch_global_exclude;
+  uint32_t regs_to_save = 0;
+
+  fprintf(stderr, "[SCRATCH] get_scratch_regs: count=%d input_exclude=0x%x global_exclude=0x%x\n", count, exclude_regs,
+          scratch_global_exclude);
+
+  /* First pass: try to find free registers */
+  for (int i = 0; i < count; ++i)
+  {
+    int reg = PREG_NONE;
+    if (ir)
+    {
+      reg = tcc_ls_find_free_scratch_reg(&ir->ls, ir->codegen_instruction_idx, exclude, ir->leaffunc);
+    }
+
+    if (reg != PREG_NONE && reg >= 0 && reg < 16)
+    {
+      /* Found a free register */
+      fprintf(stderr, "[SCRATCH] -> reg[%d]=%d (free)\n", i, reg);
+      result.regs[i] = reg;
+      exclude |= (1u << reg);
+      /* R11 and R12 are permanent scratch registers and can be reused freely.
+       * Don't add them to global exclude. */
+      if (reg != 11 && reg != 12)
+        scratch_global_exclude |= (1u << reg);
+      result.count++;
+    }
+    else
+    {
+      /* Need to save a register - select one based on priority */
+      int reg_to_save = -1;
+      if (!(exclude & (1 << R_IP)))
+      {
+        reg_to_save = R_IP;
+      }
+      else if (ir && ir->leaffunc && !(exclude & (1 << R_LR)))
+      {
+        reg_to_save = R_LR;
+      }
+      else
+      {
+        /* Try R0-R3 */
+        for (int r = 0; r <= 3; ++r)
+        {
+          if (!(exclude & (1 << r)))
+          {
+            reg_to_save = r;
+            break;
+          }
+        }
+      }
+
+      if (reg_to_save < 0)
+      {
+        /* Try R4-R10, skipping R11/R12 which are reserved for call argument processing */
+        for (int r = 4; r <= 10; ++r)
+        {
+          if (!(exclude & (1 << r)))
+          {
+            reg_to_save = r;
+            break;
+          }
+        }
+      }
+
+      if (reg_to_save < 0)
+      {
+        tcc_error("compiler_error: no register available for scratch (all 16 registers excluded)");
+      }
+
+      fprintf(stderr, "[SCRATCH] -> reg[%d]=%d (will save)\n", i, reg_to_save);
+      result.regs[i] = reg_to_save;
+      regs_to_save |= (1u << reg_to_save);
+      exclude |= (1u << reg_to_save);
+      result.count++;
+    }
+  }
+
+  /* Second pass: emit a single PUSH for all registers that need saving */
+  if (regs_to_save != 0)
+  {
+    fprintf(stderr, "[SCRATCH] Pushing registers (mask=0x%x) in single instruction\n", regs_to_save);
+    ot_check(th_push(regs_to_save));
+    result.saved_mask = regs_to_save;
+
+    /* Track each saved register in the push stack for proper LIFO ordering */
+    for (int i = 0; i < count; ++i)
+    {
+      if (regs_to_save & (1u << result.regs[i]))
+      {
+        if (scratch_push_count < 128)
+        {
+          scratch_push_stack[scratch_push_count++] = result.regs[i];
+        }
+        else
+        {
+          tcc_error("compiler_error: scratch register push stack overflow (>128 pushes without restore)");
+        }
+      }
+    }
+  }
+
+  return result;
+}
+
+static void restore_scratch_regs(ScratchRegAllocs *allocs)
+{
+  if (!allocs || allocs->count <= 0)
+    return;
+
+  if (allocs->saved_mask != 0)
+  {
+    /* Check if we can restore all saved registers in LIFO order */
+    int can_restore_all = 1;
+    int check_count = 0;
+
+    /* Count how many saved registers we have and verify LIFO order */
+    for (int i = allocs->count - 1; i >= 0 && can_restore_all; --i)
+    {
+      if (allocs->saved_mask & (1u << allocs->regs[i]))
+      {
+        int stack_idx = scratch_push_count - 1 - check_count;
+        if (stack_idx < 0 || scratch_push_stack[stack_idx] != allocs->regs[i])
+        {
+          can_restore_all = 0;
+        }
+        check_count++;
+      }
+    }
+
+    if (can_restore_all && check_count > 0)
+    {
+      /* We can restore all saved registers with a single POP */
+      fprintf(stderr, "[SCRATCH] Popping registers (mask=0x%x) in single instruction\n", allocs->saved_mask);
+      ot_check(th_pop(allocs->saved_mask));
+
+      /* Update the push stack and global exclude */
+      scratch_push_count -= check_count;
+      for (int i = 0; i < allocs->count; ++i)
+      {
+        if (allocs->saved_mask & (1u << allocs->regs[i]))
+        {
+          scratch_global_exclude &= ~(1u << allocs->regs[i]);
+        }
+      }
+      allocs->saved_mask = 0;
+    }
+    else
+    {
+      /* Cannot restore in order - defer to individual restore or end-of-instruction cleanup */
+      fprintf(stderr, "[SCRATCH] WARNING: restore_scratch_regs out of order; deferring POP\n");
+      /* Keep saved_mask set so cleanup knows these need restoration */
+    }
+  }
+
+  allocs->count = 0;
+}
 ScratchRegAlloc th_offset_to_reg(int offset, int sign);
 
 /* Get a free scratch register using liveness information.
@@ -366,8 +649,11 @@ static ScratchRegAlloc get_scratch_reg_with_save(uint32_t exclude_regs)
       fprintf(stderr, "[SCRATCH] -> returning reg=%d (free) exclude=0x%x\n", reg, exclude_regs);
       result.reg = reg;
       result.saved = 0;
-      /* Update global exclude so subsequent calls won't return the same register */
-      scratch_global_exclude |= (1u << reg);
+      /* Update global exclude so subsequent calls won't return the same register.
+       * Exception: R11/R12 are reserved for call argument processing and can be
+       * reused freely without exclusion. They must never be saved/pushed. */
+      if (reg != 11 && reg != 12)
+        scratch_global_exclude |= (1u << reg);
       return result;
     }
   }
@@ -441,37 +727,38 @@ static void restore_scratch_reg(ScratchRegAlloc *alloc)
 {
   if (alloc->saved)
   {
-    ot_check(th_pop(1 << alloc->reg));
-    alloc->saved = 0;
-    /* Remove from push stack - find and remove this register.
-     * NOTE: This assumes callers restore in reverse order of allocation.
-     * If not, we may corrupt the stack! For safety, only remove if it's
-     * the last pushed register. */
+    /* We MUST restore in strict LIFO order.
+     * An out-of-order POP corrupts SP (and can crash under QEMU).
+     * If callers restore out of order, defer the POP to end-of-instruction
+     * cleanup (restore_all_pushed_scratch_regs), and keep the register
+     * excluded so it cannot be reused before it is actually restored.
+     */
     if (scratch_push_count > 0 && scratch_push_stack[scratch_push_count - 1] == alloc->reg)
     {
+      ot_check(th_pop(1 << alloc->reg));
+      alloc->saved = 0;
       scratch_push_count--;
+      scratch_global_exclude &= ~(1u << alloc->reg);
     }
-    else if (scratch_push_count > 0)
+    else
     {
-      fprintf(stderr,
-              "[SCRATCH] WARNING: restore_scratch_reg out of order! "
-              "reg=%d but top of stack is %d\n",
-              alloc->reg, scratch_push_stack[scratch_push_count - 1]);
-      /* Still need to find and remove it to avoid double-pop */
-      for (int i = scratch_push_count - 1; i >= 0; i--)
+      if (scratch_push_count > 0)
       {
-        if (scratch_push_stack[i] == alloc->reg)
-        {
-          /* Shift remaining entries down */
-          for (int j = i; j < scratch_push_count - 1; j++)
-            scratch_push_stack[j] = scratch_push_stack[j + 1];
-          scratch_push_count--;
-          break;
-        }
+        fprintf(stderr,
+                "[SCRATCH] WARNING: restore_scratch_reg out of order; deferring POP "
+                "reg=%d (top=%d)\n",
+                alloc->reg, scratch_push_stack[scratch_push_count - 1]);
       }
+      else
+      {
+        fprintf(stderr, "[SCRATCH] WARNING: restore_scratch_reg with empty push stack; deferring POP reg=%d\n",
+                alloc->reg);
+      }
+      return;
     }
   }
-  /* Always release from global exclude */
+
+  /* Always release from global exclude for non-saved scratch regs. */
   scratch_global_exclude &= ~(1u << alloc->reg);
 }
 
@@ -506,6 +793,16 @@ ST_FUNC void tcc_machine_acquire_scratch(TCCMachineScratchRegs *scratch, unsigne
   uint32_t exclude_regs = 0;
   const int need_pair = (flags & TCC_MACHINE_SCRATCH_NEEDS_PAIR) != 0;
 
+  if (flags & TCC_MACHINE_SCRATCH_AVOID_CALL_ARG_REGS)
+  {
+    exclude_regs |= (1u << R0) | (1u << R1) | (1u << R2) | (1u << R3);
+  }
+
+  if (flags & TCC_MACHINE_SCRATCH_AVOID_PERM_SCRATCH)
+  {
+    exclude_regs |= (1u << R11) | (1u << R12);
+  }
+
   ScratchRegAlloc first = get_scratch_reg_with_save(exclude_regs);
   if (first.reg == PREG_NONE)
     tcc_error("compiler_error: unable to allocate scratch register");
@@ -515,8 +812,10 @@ ST_FUNC void tcc_machine_acquire_scratch(TCCMachineScratchRegs *scratch, unsigne
   if (first.saved)
     scratch->saved_mask |= 1u;
   exclude_regs |= (1u << first.reg);
-  /* Update global exclude so subsequent scratch allocations don't get same register */
-  scratch_global_exclude |= (1u << first.reg);
+  /* Update global exclude so subsequent scratch allocations don't get same register.
+   * Exception: R11 and R12 are permanent scratch registers and can be reused. */
+  if (first.reg != 11 && first.reg != 12)
+    scratch_global_exclude |= (1u << first.reg);
 
   if (need_pair)
   {
@@ -528,8 +827,10 @@ ST_FUNC void tcc_machine_acquire_scratch(TCCMachineScratchRegs *scratch, unsigne
     scratch->reg_count = 2;
     if (second.saved)
       scratch->saved_mask |= 2u;
-    /* Update global exclude for pair's second register too */
-    scratch_global_exclude |= (1u << second.reg);
+    /* Update global exclude for pair's second register too.
+     * Exception: R11 and R12 are permanent scratch registers and can be reused. */
+    if (second.reg != 11 && second.reg != 12)
+      scratch_global_exclude |= (1u << second.reg);
   }
 }
 
@@ -538,24 +839,18 @@ ST_FUNC void tcc_machine_release_scratch(const TCCMachineScratchRegs *scratch)
   if (!scratch)
     return;
 
-  /* Clear global exclude bits for released registers so they can be reused */
-  for (int i = 0; i < scratch->reg_count; ++i)
-  {
-    int reg = scratch->regs[i];
-    if (reg != PREG_NONE && reg >= 0 && reg < 16)
-      scratch_global_exclude &= ~(1u << reg);
-  }
-
+  /* IMPORTANT: scratch registers are acquired via get_scratch_reg_with_save(),
+   * which records PUSH order in scratch_push_stack for end-of-instruction cleanup.
+   * Releasing must therefore go through restore_scratch_reg() so the push-stack
+   * accounting stays consistent (otherwise restore_all_pushed_scratch_regs() may
+   * POP registers a second time and corrupt the stack).
+   */
   for (int i = scratch->reg_count - 1; i >= 0; --i)
   {
-    if (!(scratch->saved_mask & (1u << i)))
-      continue;
-
-    int reg = scratch->regs[i];
-    if (reg == PREG_NONE)
-      continue;
-
-    ot_check(th_pop(1 << reg));
+    ScratchRegAlloc alloc = {0};
+    alloc.reg = scratch->regs[i];
+    alloc.saved = (scratch->saved_mask & (1u << i)) != 0;
+    restore_scratch_reg(&alloc);
   }
 }
 
@@ -803,6 +1098,8 @@ ST_FUNC void arm_init(struct TCCState *s)
   text_and_data_separation = s->text_and_data_separation;
   pic = s->pic;
   s->parameters_registers = 4;
+  /* R12 (IP) is the standard inter-procedure scratch register.
+   * R11 is also available for allocation but reserved during call argument processing. */
   s->registers_map_for_allocator = (1 << ARM_R0) | (1 << ARM_R1) | (1 << ARM_R2) | (1 << ARM_R3) | (1 << ARM_R4) |
                                    (1 << ARM_R5) | (1 << ARM_R6) | (1 << ARM_R8) | (1 << ARM_R10) | (1 << ARM_R11) |
                                    (1 << ARM_R12);
@@ -1306,14 +1603,35 @@ int th_patch_call(int t, int a)
 
 static void gadd_sp(int val)
 {
+  if (val == 0)
+    return;
+
   if (val > 0)
   {
-    ot_check(th_add_sp_imm(R_SP, val, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    thumb_opcode add_imm = th_add_sp_imm(R_SP, (uint32_t)val, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE);
+    if (is_valid_opcode(add_imm))
+    {
+      ot(add_imm);
+      return;
+    }
+
+    /* Large adjustment: materialize value into IP and add via register form. */
+    load_full_const(R_IP, PREG_NONE, (int64_t)val, NULL);
+    ot_check(th_add_sp_reg(R_SP, R_IP, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE, THUMB_SHIFT_DEFAULT));
+    return;
   }
-  else if (val < 0)
+
+  /* val < 0 */
+  const uint32_t sub = (uint32_t)(-val);
+  thumb_opcode sub_imm = th_sub_sp_imm(R_SP, sub, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE);
+  if (is_valid_opcode(sub_imm))
   {
-    ot_check(th_sub_sp_imm(R_SP, -val, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    ot(sub_imm);
+    return;
   }
+
+  load_full_const(R_IP, PREG_NONE, (int64_t)sub, NULL);
+  ot_check(th_sub_sp_reg(R_SP, R_IP, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
 }
 
 // // all params needs to be passed in core registers or not
@@ -1649,6 +1967,24 @@ void store(int r, SValue *sv)
   int v, fc, ft, fr, sign;
   TRACE("'store' reg: %d", r);
 
+  /* IR owns spills: backend store must never be asked to store from a spilled
+   * sentinel or a non-hardware register.
+   *
+   * For hard-float, `r` may be a VFP register (TREG_F0..TREG_F7). Otherwise it
+   * must be an integer HW register.
+   */
+  if (r == PREG_NONE || (r & PREG_SPILLED))
+    tcc_error("compiler_error: store called with non-materialized source reg %d", r);
+  if (tcc_state->float_abi == ARM_HARD_FLOAT && r >= TREG_F0 && r <= TREG_F7)
+  {
+    /* ok: VFP source */
+  }
+  else
+  {
+    /* Must be an integer hardware register. */
+    thumb_require_materialized_reg("store", "src", r);
+  }
+
   fr = sv->r;
   ft = sv->type.t;
   fc = sv->c.i;
@@ -1741,19 +2077,15 @@ void store(int r, SValue *sv)
           else
           {
             /* Double precision - two 32-bit stores (low word first) */
-            /* Use sv->pr1 for high register, not r+1 which could be invalid */
+            /* IR owns spills: the caller must provide an explicit high-word
+             * register in sv->pr1; do not guess r+1.
+             */
             int r_high = sv->pr1;
-            if (r_high == PREG_NONE || r_high == R_SP || r_high == R_PC)
-            {
-              /* Fallback: if pr1 not allocated, try r+1 but validate */
-              r_high = r + 1;
-              if (r_high == R_SP || r_high == R_PC)
-              {
-                tcc_error("compiler_error: cannot store double - no valid high "
-                          "register (pr1=%d, r+1=%d would be SP/PC)\n",
-                          sv->pr1, r + 1);
-              }
-            }
+            if (r_high == PREG_NONE)
+              tcc_error("compiler_error: cannot store double - missing source high register (sv->pr1)");
+            thumb_require_materialized_reg("store", "src.high", r_high);
+            if (r_high == R_SP || r_high == R_PC)
+              tcc_error("compiler_error: cannot store double - invalid source high register %d", r_high);
             /* Store low word */
             if (!ot(th_str_imm(r, base, fc, sign ? 4 : 6, ENFORCE_ENCODING_NONE)))
             {
@@ -3312,7 +3644,7 @@ static void thumb_emit_shift64_imm(TACQuadruple *op, const char *ctx, bool is_le
   else
   {
     /* Low word must be usable as a register input. */
-    if (src_lo == PREG_NONE || (src_lo & PREG_SPILLED) || (op->src1.r & VT_LVAL) || th_has_immediate_value(op->src1.r))
+    if (src_lo == PREG_NONE || (op->src1.r & VT_LVAL) || th_has_immediate_value(op->src1.r))
     {
       src_lo_alloc = get_scratch_reg_with_save(exclude);
       src_lo = src_lo_alloc.reg;
@@ -3330,22 +3662,20 @@ static void thumb_emit_shift64_imm(TACQuadruple *op, const char *ctx, bool is_le
     /* High word may be missing (treated as 0 or sign-extension), but if it exists it must be usable too. */
     if (src_hi != PREG_NONE)
     {
-      if ((src_hi & PREG_SPILLED) || !thumb_is_hw_reg(src_hi))
-      {
-        src_hi_alloc = get_scratch_reg_with_save(exclude);
-        src_hi = src_hi_alloc.reg;
-        if (thumb_is_hw_reg(src_hi))
-          exclude |= (1u << src_hi);
-        SValue src1_hi = op->src1;
-        src1_hi.c.i += 4;
-        load_to_reg(src_hi, PREG_NONE, &src1_hi);
-      }
-      else
-      {
-        thumb_require_materialized_reg(ctx, "src1.high", src_hi);
-        if (thumb_is_hw_reg(src_hi))
-          exclude |= (1u << src_hi);
-      }
+      thumb_require_materialized_reg(ctx, "src1.high", src_hi);
+      if (thumb_is_hw_reg(src_hi))
+        exclude |= (1u << src_hi);
+    }
+    else if (op->src1.r & VT_LVAL)
+    {
+      /* Lvalue source: load high word from (addr + 4) into a scratch. */
+      src_hi_alloc = get_scratch_reg_with_save(exclude);
+      src_hi = src_hi_alloc.reg;
+      if (thumb_is_hw_reg(src_hi))
+        exclude |= (1u << src_hi);
+      SValue src1_hi = op->src1;
+      src1_hi.c.i += 4;
+      load_to_reg(src_hi, PREG_NONE, &src1_hi);
     }
     else
     {
@@ -3505,7 +3835,7 @@ static void thumb_materialize_binop32_sources(TACQuadruple *op, const char *ctx,
   *rn_alloc = (ScratchRegAlloc){0};
   *rm_alloc = (ScratchRegAlloc){0};
 
-  if (*rn == PREG_NONE || (*rn & PREG_SPILLED) || (op->src1.r & VT_LVAL) || th_has_immediate_value(op->src1.r))
+  if (*rn == PREG_NONE || (op->src1.r & VT_LVAL) || th_has_immediate_value(op->src1.r))
   {
     *rn_alloc = get_scratch_reg_with_save(*exclude);
     *rn = rn_alloc->reg;
@@ -3519,7 +3849,7 @@ static void thumb_materialize_binop32_sources(TACQuadruple *op, const char *ctx,
       *exclude |= (1u << *rn);
   }
 
-  if (*rm == PREG_NONE || (*rm & PREG_SPILLED) || (op->src2.r & VT_LVAL) || th_has_immediate_value(op->src2.r))
+  if (*rm == PREG_NONE || (op->src2.r & VT_LVAL) || th_has_immediate_value(op->src2.r))
   {
     *rm_alloc = get_scratch_reg_with_save(*exclude);
     *rm = rm_alloc->reg;
@@ -3597,7 +3927,7 @@ static void thumb_emit_longmul32x32_to64(TACQuadruple *op, thumb_longmul_handler
 
   uint32_t exclude = 0;
 
-  if (rn == PREG_NONE || (rn & PREG_SPILLED) || (op->src1.r & VT_LVAL) || th_has_immediate_value(op->src1.r))
+  if (rn == PREG_NONE || (op->src1.r & VT_LVAL) || th_has_immediate_value(op->src1.r))
   {
     rn_alloc = get_scratch_reg_with_save(exclude);
     rn = rn_alloc.reg;
@@ -3611,7 +3941,7 @@ static void thumb_emit_longmul32x32_to64(TACQuadruple *op, thumb_longmul_handler
       exclude |= (1u << rn);
   }
 
-  if (rm == PREG_NONE || (rm & PREG_SPILLED) || (op->src2.r & VT_LVAL) || th_has_immediate_value(op->src2.r))
+  if (rm == PREG_NONE || (op->src2.r & VT_LVAL) || th_has_immediate_value(op->src2.r))
   {
     rm_alloc = get_scratch_reg_with_save(exclude);
     rm = rm_alloc.reg;
@@ -4582,6 +4912,7 @@ void tcc_gen_machine_load_op(TACQuadruple *op)
 ST_FUNC void tcc_gen_machine_store_op(TACQuadruple *op)
 {
   TRACE("'tcc_gen_machine_store_op'");
+  const char *ctx = "tcc_gen_machine_store_op";
   int src_reg;
   /* Check for 64-bit types - include VT_LLONG for soft-float doubles and long
    * long */
@@ -4590,14 +4921,41 @@ ST_FUNC void tcc_gen_machine_store_op(TACQuadruple *op)
 
   src_reg = op->src1.pr0;
   ScratchRegAlloc scratch_alloc = {0};
-  // if src_reg is PREG_NONE then immediate value must be loaded
-  if (src_reg == PREG_NONE || (src_reg & PREG_SPILLED))
+
+  /* IR owns spills: backend must never see PREG_SPILLED here. */
+  if (src_reg != PREG_NONE)
+    thumb_require_materialized_reg(ctx, "src.low", src_reg);
+
+  /* If src_reg is missing, or src1 isn't a direct register value (const/lvalue), reload it. */
+  const int src_is_const = ((op->src1.r & VT_VALMASK) == VT_CONST);
+  const int src_is_lval = (op->src1.r & VT_LVAL) != 0;
+  const int need_reload = (src_reg == PREG_NONE) || src_is_const || src_is_lval;
+
+  if (need_reload)
   {
-    scratch_alloc = get_scratch_reg_with_save(0);
+    /* For 64-bit reloads we use R11 as the high word; keep it out of the low scratch choice. */
+    const uint32_t exclude = is_64bit ? (1u << R11) : 0;
+    scratch_alloc = get_scratch_reg_with_save(exclude);
     src_reg = scratch_alloc.reg;
     load_to_reg(src_reg, is_64bit ? R11 : PREG_NONE, &op->src1);
+
+    SValue store_dest = op->dest;
+    if (is_64bit)
+      store_dest.pr1 = R11;
+    store(src_reg, &store_dest);
   }
-  store(src_reg, &op->dest);
+  else
+  {
+    SValue store_dest = op->dest;
+    if (is_64bit)
+    {
+      store_dest.pr1 = op->src1.pr1;
+      if (store_dest.pr1 != PREG_NONE)
+        thumb_require_materialized_reg(ctx, "src.high", store_dest.pr1);
+    }
+    store(src_reg, &store_dest);
+  }
+
   if (scratch_alloc.saved || scratch_alloc.reg >= 0)
     restore_scratch_reg(&scratch_alloc);
 }
@@ -4647,6 +5005,8 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
       registers_count++;
     }
   }
+  /* Keep the total push size 8-byte aligned (AAPCS). This must not be done by
+   * adding padding below SP (would shift prepared-call stack arguments). */
   if (registers_count % 2 != 0)
   {
     registers_to_push |= (1 << R12);
@@ -4664,7 +5024,6 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
   // allocate stack space for local variables
   /* Keep SP 8-byte aligned (AAPCS). tccir normally pre-aligns stack_size, but
    * be defensive here because other codepaths may call into the backend.
-   * This also ensures call-sites that assume aligned SP remain correct.
    */
   if (stack_size & 7)
     stack_size = (stack_size + 7) & ~7;
@@ -4682,7 +5041,7 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
   }
   if (stack_size > 0)
   {
-    ot_check(th_sub_sp_imm(R_SP, stack_size, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    gadd_sp(-stack_size);
   }
 
   /* Move parameters from incoming registers to their allocated locations.
@@ -4743,8 +5102,10 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
         continue;
       }
 
-      /* Spilled parameters: store incoming regs to their stack slots. */
-      if (alloc_r0 == PREG_SPILLED || interval->allocation.offset != 0)
+      /* Stack-home parameters: store incoming regs to their stack slots.
+       * IR owns spills; avoid inspecting PREG_SPILLED sentinels here.
+       */
+      if (interval->allocation.offset != 0)
       {
         const int stack_offset = interval->allocation.offset;
         if (is_64bit && incoming_r1 >= 0)
@@ -4850,7 +5211,7 @@ ST_FUNC void tcc_gen_machine_epilog(int leaffunc)
   else if (allocated_stack_size > 0)
   {
     // deallocate stack space for local variables
-    ot_check(th_add_sp_imm(R_SP, allocated_stack_size, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    gadd_sp(allocated_stack_size);
   }
 
   if (lr_saved)
@@ -4874,6 +5235,7 @@ ST_FUNC void tcc_gen_machine_epilog(int leaffunc)
 
 ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *op)
 {
+  const char *ctx = "tcc_gen_machine_assign_op";
   /* Only consider VFP registers if hard float ABI is enabled */
   int use_vfp_regs = (tcc_state->float_abi == ARM_HARD_FLOAT);
   int dest_is_vfp = use_vfp_regs && LS_IS_VFP_REG(op->dest.pr0);
@@ -4908,9 +5270,14 @@ ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *op)
     ScratchRegAlloc src_lo_alloc = {0};
     ScratchRegAlloc src_hi_alloc = {0};
 
+    /* IR owns spills: if a register is present, it must be materialized. */
+    if (src_lo != PREG_NONE)
+      thumb_require_materialized_reg(ctx, "src.low", src_lo);
+    if (src_hi != PREG_NONE)
+      thumb_require_materialized_reg(ctx, "src.high", src_hi);
+
     /* Materialize source into registers if needed (const/spilled/lvalue/etc). */
-    if ((op->src1.r & VT_VALMASK) == VT_CONST || (op->src1.r & VT_LVAL) || src_lo == PREG_NONE ||
-        (src_lo & PREG_SPILLED))
+    if ((op->src1.r & VT_VALMASK) == VT_CONST || (op->src1.r & VT_LVAL) || src_lo == PREG_NONE)
     {
       uint32_t exclude = 0;
       if (!dest_in_mem)
@@ -4927,7 +5294,7 @@ ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *op)
       src_lo = src_lo_alloc.reg;
       src_hi = src_hi_alloc.reg;
     }
-    else if (src_hi == PREG_NONE || (src_hi & PREG_SPILLED))
+    else if (src_hi == PREG_NONE)
     {
       /* Mixed 32->64 promotion: treat missing high word as 0. */
       uint32_t exclude = 0;
@@ -5062,16 +5429,12 @@ ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *op)
  */
 ST_FUNC void tcc_gen_machine_lea_op(TACQuadruple *op)
 {
+  const char *ctx = "tcc_gen_machine_lea_op";
   int dest_reg = op->dest.pr0;
   int src_v = op->src1.r & VT_VALMASK;
 
-  /* Handle spilled destination - use scratch register then store */
-  ScratchRegAlloc dest_alloc = {0};
-  if (dest_reg == PREG_NONE || (dest_reg & PREG_SPILLED))
-  {
-    dest_alloc = get_scratch_reg_with_save(0);
-    dest_reg = dest_alloc.reg;
-  }
+  /* IR owns spills: LEA destination must already be materialized. */
+  thumb_require_materialized_reg(ctx, "dest", dest_reg);
 
   if (src_v == VT_LOCAL || src_v == VT_LLOCAL)
   {
@@ -5120,35 +5483,19 @@ ST_FUNC void tcc_gen_machine_lea_op(TACQuadruple *op)
   {
     /* Fallback: if src is already in a register, just move it */
     int src_reg = op->src1.pr0;
-    if (src_reg != PREG_NONE && !(src_reg & PREG_SPILLED) && src_reg != dest_reg)
+    if (src_reg != PREG_NONE)
     {
-      ot_check(th_mov_reg(dest_reg, src_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE,
-                          false));
+      thumb_require_materialized_reg(ctx, "src", src_reg);
+      if (src_reg != dest_reg)
+      {
+        ot_check(th_mov_reg(dest_reg, src_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                            ENFORCE_ENCODING_NONE, false));
+      }
     }
-    else if (src_reg == PREG_NONE || (src_reg & PREG_SPILLED))
+    else
     {
       tcc_error("compiler_error: LEA on unexpected operand type r=0x%x", op->src1.r);
     }
-  }
-
-  /* Store back if destination was spilled */
-  if (dest_alloc.reg != 0)
-  {
-    if ((op->dest.pr0 & PREG_SPILLED) && op->dest.c.i != 0)
-    {
-      /* Store to spill slot */
-      int offset = (int)op->dest.c.i;
-      int sign = (offset < 0);
-      int abs_offset = sign ? -offset : offset;
-      if (!store_word_to_base(dest_reg, R_FP, abs_offset, sign))
-      {
-        ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(abs_offset, sign, (1u << dest_reg) | (1u << R_FP));
-        int rr = rr_alloc.reg;
-        ot_check(th_str_reg(dest_reg, R_FP, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-        restore_scratch_reg(&rr_alloc);
-      }
-    }
-    restore_scratch_reg(&dest_alloc);
   }
 }
 
@@ -5196,6 +5543,24 @@ ST_FUNC void tcc_gen_machine_store_to_stack(int reg, int offset)
     ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(abs_offset, sign, (1u << reg) | (1u << R_FP));
     int rr = rr_alloc.reg;
     ot_check(th_str_reg(reg, R_FP, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+    restore_scratch_reg(&rr_alloc);
+  }
+}
+
+/* Store a register to a stack slot relative to SP.
+ * Used for outgoing call arguments (stack args must be located at SP at call time).
+ * offset is expected to be non-negative.
+ */
+ST_FUNC void tcc_gen_machine_store_to_sp(int reg, int offset)
+{
+  int sign = (offset < 0);
+  int abs_offset = sign ? -offset : offset;
+
+  if (!store_word_to_base(reg, R_SP, abs_offset, sign))
+  {
+    ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(abs_offset, sign, (1u << reg) | (1u << R_SP));
+    int rr = rr_alloc.reg;
+    ot_check(th_str_reg(reg, R_SP, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     restore_scratch_reg(&rr_alloc);
   }
 }
@@ -5436,6 +5801,41 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
     tcc_error("Missing callsite binding for call at IR index %d", call_idx);
   }
 
+  /* Fast path: arguments are already placed by IR according to ABI layout.
+   * Emit only the call and return-value moves.
+   */
+  if (cs && cs->args_prepared)
+  {
+    gcall_or_jump(0, &q->src1);
+
+    if (th_is_caller_saved_register(thumb_gen_state.cached_global_reg))
+    {
+      thumb_gen_state.cached_global_sym = NULL;
+      thumb_gen_state.cached_global_reg = PREG_NONE;
+    }
+
+    if (drop_result)
+      return;
+
+    thumb_require_materialized_reg("tcc_gen_machine_func_call_op(prepared)", "dest.low", q->dest.pr0);
+    if (tcc_is_64bit_operand(&q->dest))
+    {
+      if (q->dest.pr1 != PREG_NONE)
+        thumb_require_materialized_reg("tcc_gen_machine_func_call_op(prepared)", "dest.high", q->dest.pr1);
+      if (q->dest.pr1 != R1)
+      {
+        ot_check(th_mov_reg(q->dest.pr1, R1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE,
+                            false));
+      }
+    }
+    if (q->dest.pr0 != R0)
+    {
+      ot_check(th_mov_reg(q->dest.pr0, R0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE,
+                          false));
+    }
+    return;
+  }
+
   /* First pass: calculate register and stack slot assignments for each argument
    * following AAPCS rules:
    * - 32-bit args go in R0-R3 then stack
@@ -5528,6 +5928,106 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
   /* Align total stack to 8 bytes as required by AAPCS */
   stack_size = TCC_ALIGN(stack_size, 8);
 
+  /* For stack-passed arguments we must not emit any extra PUSH/POP while
+   * writing to the outgoing argument area at [SP + stack_offset].
+   *
+   * Previously we used generic scratch allocation during stack-arg emission,
+   * which can save a register with PUSH/POP. That shifts SP and corrupts
+   * the argument layout for variadic calls.
+   *
+   * We also cannot blindly use R0-R3 as temporaries here: at this point the
+   * backend may still be holding *pointers* in those registers that are needed
+   * later to load the register-passed arguments (e.g. c[0].x/c[0].y in
+   * 90_struct-init).
+   *
+   * Solution: allocate a dedicated temp register pair once (may be saved with
+   * PUSH before reserving the arg area), exclude all registers already used as
+   * arg sources, and then use only these temps for stack-arg materialization.
+   */
+  ScratchRegAllocs stack_arg_tmps;
+  memset(&stack_arg_tmps, 0, sizeof(stack_arg_tmps));
+  int stack_arg_tmp0_reg = PREG_NONE;
+  int stack_arg_tmp1_reg = PREG_NONE;
+  int need_stack_arg_tmps = 0;
+  for (int i = 0; i < param_count; ++i)
+  {
+    int assigned_register = PREG_NONE;
+    for (int j = 0; j < 4; j++)
+    {
+      if (op_to_reg[j] == PREG_NONE)
+        continue;
+      if (op_to_reg[j] == i)
+      {
+        assigned_register = j;
+        break;
+      }
+    }
+    if (assigned_register == PREG_NONE)
+    {
+      need_stack_arg_tmps = 1;
+      break;
+    }
+  }
+
+  if (need_stack_arg_tmps)
+  {
+    /* Reserve 2 scratch registers for stack argument marshalling.
+     *
+     * For non-leaf functions, the register allocator has already reserved R10 and R11
+     * specifically for this purpose. We exclude:
+     * - R0-R3 (destination registers for register-passed arguments)
+     * - Source registers (pr0/pr1) for register-passed arguments only
+     *
+     * The reserved R10/R11 will be allocated by get_scratch_regs_with_save() since
+     * they're not allocated to any virtual registers. They're guaranteed to be free
+     * and won't conflict with source pointers for stack arguments.
+     */
+    uint32_t tmp_exclude = (1u << R_SP) | (1u << R7) | (1u << R0) | (1u << R1) | (1u << R2) | (1u << R3);
+
+    /* Exclude source registers for register-passed arguments (R0-R3 destinations) */
+    for (int dest = 0; dest < 4; ++dest)
+    {
+      if (op_to_reg[dest] == PREG_NONE)
+        continue;
+      const SValue *arg_value = tcc_ir_callsite_arg_value_ptr(ir, &call_args[op_to_reg[dest]]);
+      if (!arg_value)
+        continue;
+      /* Skip accessing pr0/pr1 for lvalue arguments - this would trigger premature
+       * FILL_REGS loads of spilled pointers */
+      if (!(arg_value->r & VT_LVAL))
+      {
+        if (arg_value->pr0 != PREG_NONE && arg_value->pr0 >= 0 && arg_value->pr0 < 16)
+          tmp_exclude |= (1u << arg_value->pr0);
+        if (arg_value->pr1 != PREG_NONE && arg_value->pr1 >= 0 && arg_value->pr1 < 16)
+          tmp_exclude |= (1u << arg_value->pr1);
+      }
+    }
+
+    /* Allocate the 2 reserved scratch registers (R10, R11 for non-leaf functions).
+     * These should be free since the register allocator excluded them. */
+    stack_arg_tmps = get_scratch_regs_with_save(tmp_exclude, 2);
+    stack_arg_tmp0_reg = stack_arg_tmps.regs[0];
+    stack_arg_tmp1_reg = stack_arg_tmps.regs[1];
+
+    fprintf(stderr, "[SCRATCH] Allocated stack arg temps: r%d, r%d (saved_mask=0x%x)\n", stack_arg_tmp0_reg,
+            stack_arg_tmp1_reg, stack_arg_tmps.saved_mask);
+  }
+
+  /* If call-time argument materialization had to save scratch registers,
+   * it may have pushed an odd number of words. That would misalign SP at the
+   * call boundary and can break variadic calls (e.g. printf in 90_struct-init).
+   *
+   * Do NOT pop those saved scratch regs here (they may still be needed by
+   * materialized operands). Instead, insert a 4-byte pad so SP remains 8-byte
+   * aligned for the duration of this call, then remove it afterwards.
+   */
+  int call_align_pad = 0;
+  if (scratch_push_count & 1)
+  {
+    ot_check(th_sub_sp_imm(R_SP, 4, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    call_align_pad = 4;
+  }
+
   /* Some configurations preserve additional registers around calls.
    * IMPORTANT: any such pushes must happen BEFORE laying out stack arguments,
    * otherwise SP at call-time no longer matches where we stored the args.
@@ -5552,7 +6052,56 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
     ot_check(th_sub_sp_imm(R_SP, stack_size, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
   }
 
+  /* Precompute which registers are needed by future STACK-passed args.
+   * When materializing a stack argument into a temp register, avoid clobbering
+   * a register that will be needed later as a source pointer/value for another
+   * stack argument.
+   */
+  uint32_t *future_stack_src_mask = NULL;
+  if (need_stack_arg_tmps)
+  {
+    future_stack_src_mask = tcc_mallocz(sizeof(uint32_t) * (param_count + 1));
+    future_stack_src_mask[param_count] = 0;
+    for (int i = param_count - 1; i >= 0; --i)
+    {
+      uint32_t mask = future_stack_src_mask[i + 1];
+
+      int assigned_register = PREG_NONE;
+      for (int j = 0; j < 4; j++)
+      {
+        if (op_to_reg[j] == PREG_NONE)
+          continue;
+        if (op_to_reg[j] == i)
+        {
+          assigned_register = j;
+          break;
+        }
+      }
+
+      if (assigned_register == PREG_NONE)
+      {
+        const SValue *arg_value = tcc_ir_callsite_arg_value_ptr(ir, &call_args[i]);
+        if (arg_value)
+        {
+          /* Skip accessing pr0/pr1 for lvalue arguments - this would trigger premature
+           * FILL_REGS loads of spilled pointers. These will be loaded just-in-time during
+           * the stack argument loop. */
+          if (!(arg_value->r & VT_LVAL))
+          {
+            if (arg_value->pr0 != PREG_NONE && arg_value->pr0 >= 0 && arg_value->pr0 < 16)
+              mask |= (1u << arg_value->pr0);
+            if (arg_value->pr1 != PREG_NONE && arg_value->pr1 >= 0 && arg_value->pr1 < 16)
+              mask |= (1u << arg_value->pr1);
+          }
+        }
+      }
+
+      future_stack_src_mask[i] = mask;
+    }
+  }
+
   /* Push stack arguments first */
+  int last_stack_arg_temp_used = -1; /* Track which temp was last used to alternate */
   for (int i = 0; i < param_count; ++i)
   {
     // check if argument goes to register
@@ -5586,6 +6135,10 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
     const int is_stack_param_vreg = (arg_val.r & VT_PARAM) && ((arg_val.r & VT_VALMASK) == VT_LOCAL);
     const int needs_deref_for_value =
         is_stack_addr && !is_stack_param_vreg && arg_btype != VT_PTR && arg_btype != VT_FUNC;
+
+    /* Save the stack offset before setting VT_LVAL for direct load optimization */
+    const int direct_stack_offset = needs_deref_for_value ? arg_val.c.i : 0;
+
     if (needs_deref_for_value)
       arg_val.r |= VT_LVAL;
 
@@ -5600,7 +6153,11 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
     }
 
     TCCMaterializedValue mat_arg = {0};
-    if (!is_stack_param_lvalue_pre)
+    /* Skip materialization for stack arguments that need deref - we'll handle the pointer
+     * load and deref together in the stack arg loop to avoid premature register clobbering */
+    const int skip_materialize = needs_deref_for_value || (arg_val.r & VT_LVAL);
+
+    if (!is_stack_param_lvalue_pre && !skip_materialize)
     {
       tcc_ir_materialize_value(ir, &arg_val, &mat_arg);
 
@@ -5616,7 +6173,6 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
     if (is_stack_param_lvalue)
     {
       const int caller_stack_offset = offset_to_args + stack_param_offset;
-      const uint32_t stack_exclude = (1u << R_SP) | (1u << R7) | (1u << R0) | (1u << R1) | (1u << R2) | (1u << R3);
 
       if (TCC_DUMP_THUMB_GEN)
       {
@@ -5628,27 +6184,36 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
       {
         stack_offset = TCC_ALIGN(stack_offset, 8);
 
-        ScratchRegAlloc scratch_lo_alloc = get_scratch_reg_with_save(stack_exclude);
-        ScratchRegAlloc scratch_hi_alloc = get_scratch_reg_with_save(stack_exclude | (1u << scratch_lo_alloc.reg));
+        /* Choose temps that won't clobber future stack-arg sources. */
+        int t0 = stack_arg_tmp0_reg;
+        int t1 = stack_arg_tmp1_reg;
+        if (future_stack_src_mask && (future_stack_src_mask[i + 1] & (1u << t0)))
+        {
+          t0 = stack_arg_tmp1_reg;
+          t1 = stack_arg_tmp0_reg;
+        }
 
-        tcc_gen_machine_load_from_stack(scratch_lo_alloc.reg, caller_stack_offset);
-        tcc_gen_machine_load_from_stack(scratch_hi_alloc.reg, caller_stack_offset + 4);
+        tcc_gen_machine_load_from_stack(t0, caller_stack_offset);
+        tcc_gen_machine_load_from_stack(t1, caller_stack_offset + 4);
 
-        ot_check(th_str_imm(scratch_lo_alloc.reg, R_SP, stack_offset, 6, ENFORCE_ENCODING_NONE));
-        ot_check(th_str_imm(scratch_hi_alloc.reg, R_SP, stack_offset + 4, 6, ENFORCE_ENCODING_NONE));
+        ot_check(th_str_imm(t0, R_SP, stack_offset, 6, ENFORCE_ENCODING_NONE));
+        ot_check(th_str_imm(t1, R_SP, stack_offset + 4, 6, ENFORCE_ENCODING_NONE));
         stack_offset += 8;
-
-        restore_scratch_reg(&scratch_hi_alloc);
-        restore_scratch_reg(&scratch_lo_alloc);
       }
       else
       {
-        ScratchRegAlloc scratch_alloc = get_scratch_reg_with_save(stack_exclude);
-        int reg = scratch_alloc.reg;
-        tcc_gen_machine_load_from_stack(reg, caller_stack_offset);
-        ot_check(th_str_imm(reg, R_SP, stack_offset, 6, ENFORCE_ENCODING_NONE));
+        int t0 = stack_arg_tmp0_reg;
+        /* Alternate to avoid reusing same temp */
+        if (last_stack_arg_temp_used == stack_arg_tmp0_reg)
+          t0 = stack_arg_tmp1_reg;
+        /* Avoid clobbering future sources */
+        if (future_stack_src_mask && (future_stack_src_mask[i + 1] & (1u << t0)))
+          t0 = (t0 == stack_arg_tmp0_reg) ? stack_arg_tmp1_reg : stack_arg_tmp0_reg;
+
+        tcc_gen_machine_load_from_stack(t0, caller_stack_offset);
+        ot_check(th_str_imm(t0, R_SP, stack_offset, 6, ENFORCE_ENCODING_NONE));
         stack_offset += 4;
-        restore_scratch_reg(&scratch_alloc);
+        last_stack_arg_temp_used = t0;
       }
 
       if (mat_arg.used_scratch)
@@ -5663,57 +6228,115 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
       /* 64-bit stack arguments must be 8-byte aligned */
       stack_offset = TCC_ALIGN(stack_offset, 8);
 
-      int reg_lo = arg_val.pr0;
-      int reg_hi = arg_val.pr1;
-      ScratchRegAlloc scratch_lo_alloc = {0};
-      ScratchRegAlloc scratch_hi_alloc = {0};
-
-      /* Load low and high parts into scratch registers if needed */
-      if (reg_lo == PREG_NONE || (reg_lo & PREG_SPILLED) || (arg_val.r & VT_LVAL))
+      /* As above, stack args are emitted before register args, so R0/R1 are
+       * available as temporaries. However, register-passed arguments may still
+       * depend on pointers currently held in R0-R3. Use dedicated temps.
+       */
+      /* Avoid clobbering a future stack-arg source register (e.g. a pointer
+       * to the next struct field) by choosing which temp gets written first.
+       */
+      int t0 = stack_arg_tmp0_reg;
+      int t1 = stack_arg_tmp1_reg;
+      if (future_stack_src_mask && (future_stack_src_mask[i + 1] & (1u << t0)))
       {
-        /* Need to load the 64-bit value to registers first */
-        /* Do not clobber argument registers (R0-R3): they may hold other args
-         * or values that will be forwarded into registers later (e.g. long long
-         * return value in R0/R1). */
-        const uint32_t stack_exclude = (1u << R_SP) | (1u << R7) | (1u << R0) | (1u << R1) | (1u << R2) | (1u << R3);
-        scratch_lo_alloc = get_scratch_reg_with_save(stack_exclude);
-        reg_lo = scratch_lo_alloc.reg;
-        scratch_hi_alloc = get_scratch_reg_with_save(stack_exclude | (1u << reg_lo));
-        reg_hi = scratch_hi_alloc.reg;
-        load_to_reg(reg_lo, reg_hi, &arg_val);
+        t0 = stack_arg_tmp1_reg;
+        t1 = stack_arg_tmp0_reg;
       }
+      load_to_reg(t0, t1, &arg_val);
 
       /* Store low word first, then high word */
-      ot_check(th_str_imm(reg_lo, R_SP, stack_offset, 6, ENFORCE_ENCODING_NONE));
-      ot_check(th_str_imm(reg_hi, R_SP, stack_offset + 4, 6, ENFORCE_ENCODING_NONE));
+      ot_check(th_str_imm(t0, R_SP, stack_offset, 6, ENFORCE_ENCODING_NONE));
+      ot_check(th_str_imm(t1, R_SP, stack_offset + 4, 6, ENFORCE_ENCODING_NONE));
       stack_offset += 8;
-
-      /* Restore scratches after use */
-      restore_scratch_reg(&scratch_hi_alloc);
-      restore_scratch_reg(&scratch_lo_alloc);
+      last_stack_arg_temp_used = t1; /* Track that we used both temps */
     }
     else
     {
       int reg = arg_val.pr0;
-      ScratchRegAlloc scratch_alloc = {0};
-      if (needs_deref_for_value || reg == PREG_NONE || (reg & PREG_SPILLED) || (arg_val.r & VT_LVAL))
+
+      if (reg != PREG_NONE)
+        thumb_require_materialized_reg("tcc_gen_machine_func_call_op", "stack_arg", reg);
+
+      if (needs_deref_for_value || reg == PREG_NONE || (arg_val.r & VT_LVAL))
       {
-        /* Avoid clobbering R0-R3 for the same reason as above. */
-        const uint32_t stack_exclude = (1u << R_SP) | (1u << R7) | (1u << R0) | (1u << R1) | (1u << R2) | (1u << R3);
-        scratch_alloc = get_scratch_reg_with_save(stack_exclude);
-        reg = scratch_alloc.reg;
-        load_to_reg(reg, PREG_NONE, &arg_val);
+        /* Optimize: if this is a simple stack deref, load directly instead of
+         * going through load_to_reg which might spill/reload the pointer */
+        if (needs_deref_for_value && direct_stack_offset != 0)
+        {
+          /* Direct load from stack location - no pointer materialization needed */
+          int t0 = stack_arg_tmp0_reg;
+
+          /* Alternate temps to avoid clobbering */
+          if (last_stack_arg_temp_used == stack_arg_tmp0_reg)
+            t0 = stack_arg_tmp1_reg;
+          else if (last_stack_arg_temp_used == stack_arg_tmp1_reg)
+            t0 = stack_arg_tmp0_reg;
+
+          /* Load directly from the stack offset */
+          ot_check(th_ldr_imm(t0, R_FP, direct_stack_offset, 4, ENFORCE_ENCODING_NONE));
+          reg = t0;
+          last_stack_arg_temp_used = t0;
+        }
+        else
+        {
+          /* Alternate between the two scratch temps to avoid reusing the same register
+           * for consecutive loads. This prevents issues when loading multiple fields
+           * from the same struct where all loads would clobber each other. */
+          int t0 = stack_arg_tmp0_reg;
+
+          /* First priority: alternate from last used temp */
+          if (last_stack_arg_temp_used == stack_arg_tmp0_reg)
+            t0 = stack_arg_tmp1_reg;
+          else if (last_stack_arg_temp_used == stack_arg_tmp1_reg)
+            t0 = stack_arg_tmp0_reg;
+
+          /* Second priority: avoid clobbering future stack arg sources */
+          if (future_stack_src_mask && (future_stack_src_mask[i + 1] & (1u << t0)))
+            t0 = (t0 == stack_arg_tmp0_reg) ? stack_arg_tmp1_reg : stack_arg_tmp0_reg;
+
+          /* Third priority: avoid conflict with current lvalue source */
+          if ((arg_val.r & VT_LVAL) && arg_val.pr0 == t0)
+            t0 = (t0 == stack_arg_tmp0_reg) ? stack_arg_tmp1_reg : stack_arg_tmp0_reg;
+
+          if (TCC_DUMP_THUMB_GEN)
+            THGEN_DUMP("stack arg[%d]: calling load_to_reg with t0=%d (r%d), lval=%d, pr0=%d\n", i, t0, t0,
+                       (arg_val.r & VT_LVAL) ? 1 : 0, arg_val.pr0);
+
+          /* If this is an LVAL with a spilled pointer, load the pointer
+           * into our chosen temp register first, then adjust arg_val to use that register */
+          if ((arg_val.r & VT_LVAL) && tcc_ir_is_spilled(&arg_val))
+          {
+            /* The pointer VReg is spilled. Load it into t0 first. */
+            SValue ptr_val = arg_val;
+            ptr_val.r &= ~VT_LVAL; /* Remove LVAL to load the pointer itself, not deref it */
+
+            if (TCC_DUMP_THUMB_GEN)
+              THGEN_DUMP("  -> Pointer is spilled (vr=%d, pr0=%d), loading into r%d first\n", ptr_val.vr, ptr_val.pr0,
+                         t0);
+
+            load_to_reg(t0, PREG_NONE, &ptr_val);
+
+            /* Now adjust arg_val to indicate the pointer is in t0 */
+            arg_val.pr0 = t0;
+            arg_val.r |= VT_LVAL; /* Re-add LVAL for the actual deref */
+          }
+
+          load_to_reg(t0, PREG_NONE, &arg_val);
+          reg = t0;
+          last_stack_arg_temp_used = t0;
+        }
       }
+
       ot_check(th_str_imm(reg, R_SP, stack_offset, 6, ENFORCE_ENCODING_NONE));
       stack_offset += 4;
-
-      /* Restore scratch after use */
-      restore_scratch_reg(&scratch_alloc);
     }
 
     if (mat_arg.used_scratch)
       tcc_machine_release_scratch(&mat_arg.scratch);
   }
+
+  if (future_stack_src_mask)
+    tcc_free(future_stack_src_mask);
   /* Pre-compute register sources for each register-assigned argument so we can spot conflicts.
    * For lvalues (VT_LVAL set), the pr0 register contains a pointer that will be dereferenced.
    * Even though we can't remap this (we must load through it), we still need to track that
@@ -5729,6 +6352,11 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
       continue;
     const SValue *arg_value = tcc_ir_callsite_arg_value_ptr(ir, &call_args[op_to_reg[dest]]);
     const int is_64bit = is_64bit_type(arg_value->type.t);
+
+    if (TCC_DUMP_THUMB_GEN)
+      THGEN_DUMP("Checking reg arg R%d (param %d): vr=%d pr0=%d lval=%d\n", dest, op_to_reg[dest], arg_value->vr,
+                 arg_value->pr0, (arg_value->r & VT_LVAL) ? 1 : 0);
+
     if (is_valid_src_reg(arg_value, arg_value->pr0))
     {
       param_src0[dest] = arg_value->pr0;
@@ -5736,9 +6364,13 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
       if (arg_value->pr0 != dest)
         future_src_mask |= (1u << arg_value->pr0);
     }
-    else if ((arg_value->r & VT_LVAL) && arg_value->pr0 != PREG_NONE && !(arg_value->pr0 & PREG_SPILLED))
+    else if ((arg_value->r & VT_LVAL) && arg_value->pr0 != PREG_NONE)
     {
       /* Lvalue: pr0 contains pointer to dereference. Track it separately. */
+      if (TCC_DUMP_THUMB_GEN)
+        THGEN_DUMP("  -> Calling thumb_require_materialized_reg for lval pr0=%d\n", arg_value->pr0);
+
+      thumb_require_materialized_reg("tcc_gen_machine_func_call_op", "lval_ptr", arg_value->pr0);
       param_lval_src[dest] = arg_value->pr0;
       if (arg_value->pr0 != dest)
         future_src_mask |= (1u << arg_value->pr0);
@@ -5810,6 +6442,9 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
    * Processing R1 first (loading from R2) is safe because R2 will be written
    * AFTER R1, so R2's old value (the pointer) is still valid when R1 reads it.
    */
+  if (TCC_DUMP_THUMB_GEN)
+    THGEN_DUMP("=== FIRST PASS: Processing lvalue params for R0-R3 ===\n");
+
   uint32_t lval_params_done = 0;
   for (int i = 0; i <= 3; ++i)
   {
@@ -5817,6 +6452,9 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
       continue;
     if (param_lval_src[i] == PREG_NONE)
       continue; /* Not an lvalue param, skip for now */
+
+    if (TCC_DUMP_THUMB_GEN)
+      THGEN_DUMP("Processing lvalue param for R%d, lval_src=%d\n", i, param_lval_src[i]);
 
     /* For 64-bit args, only process the low register of the pair here.
      * We'll load both words into (Rn, Rn+1) in one go.
@@ -5932,15 +6570,10 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
     const int dest_reg = i;
     const uint32_t dest_mask = is_64bit ? ((1u << dest_reg) | (1u << (dest_reg - 1))) : (1u << dest_reg);
 
-    /* If IR handed us a spilled pointer for an lvalue argument, reload it now so
-     * load_to_dest() never sees a PREG_SPILLED base register. */
+    /* IR owns spills: if we have a pointer register for an lvalue, it must be materialized. */
     TCCMaterializedValue mat_reg_arg = {0};
-    const bool needs_spilled_ptr_reload =
-        ((arg_copy.r & VT_LVAL) != 0) && (arg_copy.pr0 != PREG_NONE) && (arg_copy.pr0 & PREG_SPILLED);
-    if (needs_spilled_ptr_reload)
-    {
-      tcc_ir_materialize_value(ir, &arg_copy, &mat_reg_arg);
-    }
+    if ((arg_copy.r & VT_LVAL) != 0 && arg_copy.pr0 != PREG_NONE)
+      thumb_require_materialized_reg("tcc_gen_machine_func_call_op", "lval_ptr", arg_copy.pr0);
 
     /* Check if writing to dest_reg would clobber a source needed by lower registers.
      * Note: lvalue sources are now handled in the first pass, so we only need to
@@ -6008,9 +6641,7 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
     scratch_global_exclude = tmp_global_exclude;
 
     if (mat_reg_arg.used_scratch)
-    {
       tcc_machine_release_scratch(&mat_reg_arg.scratch);
-    }
   }
 
   scratch_global_exclude = saved_global_exclude;
@@ -6050,55 +6681,43 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
     ot_check(th_pop(registers_to_push));
   }
 
+  if (call_align_pad)
+  {
+    ot_check(th_add_sp_imm(R_SP, call_align_pad, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+  }
+
+  /* Restore the dedicated stack-arg temporaries last, once SP is back to the
+   * pre-call state (after stack arg cleanup, saved-reg POPs, and alignment pad).
+   */
+  if (need_stack_arg_tmps)
+  {
+    restore_scratch_regs(&stack_arg_tmps);
+  }
+
   if (drop_result)
   {
     return;
   }
 
-  /* Handle the return value - move from R0 (and R1 for 64-bit) to destination */
-  int dest_spilled = (q->dest.pr0 == PREG_NONE) || (q->dest.pr0 & PREG_SPILLED);
-
-  if (dest_spilled)
+  /* Handle the return value - move from R0 (and R1 for 64-bit) to destination.
+   * IR owns spills: destination must already be materialized and any storeback
+   * happens in IR codegen.
+   */
+  thumb_require_materialized_reg("tcc_gen_machine_func_call_op", "dest.low", q->dest.pr0);
+  if (tcc_is_64bit_operand(&q->dest))
   {
-    /* Result goes to stack */
-    int offset = q->dest.c.i;
-    int puw = (offset >= 0) ? 6 : 4; /* puw=6 for positive, puw=4 for negative */
-    int abs_offset = (offset >= 0) ? offset : -offset;
-
-    if (tcc_is_64bit_operand(&q->dest))
-    {
-      /* Store 64-bit result: R0 to low word, R1 to high word */
-      ot_check(th_str_imm(R0, R_FP, abs_offset, puw, ENFORCE_ENCODING_NONE));
-      /* High word is at offset+4 for positive, offset-4 (closer to FP) for negative */
-      int high_offset = (offset >= 0) ? abs_offset + 4 : abs_offset - 4;
-      int high_puw = (offset >= 0) ? 6 : 4;
-      if (high_offset < 0)
-      {
-        high_offset = -high_offset;
-        high_puw = 6;
-      }
-      ot_check(th_str_imm(R1, R_FP, high_offset, high_puw, ENFORCE_ENCODING_NONE));
-    }
-    else
-    {
-      /* Store 32-bit result */
-      ot_check(th_str_imm(R0, R_FP, abs_offset, puw, ENFORCE_ENCODING_NONE));
-    }
-  }
-  else
-  {
-    /* Result goes to register(s) */
-    if (tcc_is_64bit_operand(&q->dest) && q->dest.pr1 != R1)
+    if (q->dest.pr1 != PREG_NONE)
+      thumb_require_materialized_reg("tcc_gen_machine_func_call_op", "dest.high", q->dest.pr1);
+    if (q->dest.pr1 != R1)
     {
       ot_check(th_mov_reg(q->dest.pr1, R1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE,
                           false));
     }
-
-    if (q->dest.pr0 != R0)
-    {
-      ot_check(th_mov_reg(q->dest.pr0, R0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE,
-                          false));
-    }
+  }
+  if (q->dest.pr0 != R0)
+  {
+    ot_check(
+        th_mov_reg(q->dest.pr0, R0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
   }
 }
 
@@ -6213,6 +6832,7 @@ ST_FUNC void tcc_gen_machine_vla_op(TACQuadruple *q)
   {
   case TCCIR_OP_VLA_ALLOC:
   {
+    const char *ctx = "tcc_gen_machine_vla_op";
     int align = (int)q->src2.c.i;
     if (align < 8)
       align = 8;
@@ -6222,8 +6842,11 @@ ST_FUNC void tcc_gen_machine_vla_op(TACQuadruple *q)
     /* Compute new SP in-place in the size register (the size value is dead after this op). */
     int r = q->src1.pr0;
 
-    /* If src1 wasn't allocated to a register (e.g. constant), load to IP. */
-    if (r == PREG_NONE || (r & PREG_SPILLED) || (q->src1.r & VT_VALMASK) == VT_CONST)
+    if (r != PREG_NONE)
+      thumb_require_materialized_reg(ctx, "size", r);
+
+    /* Fallback for non-IR callers: if src1 wasn't allocated to a register (e.g. constant), load to IP. */
+    if (r == PREG_NONE || (q->src1.r & VT_VALMASK) == VT_CONST)
     {
       r = R_IP;
       load_to_reg(r, PREG_NONE, &q->src1);

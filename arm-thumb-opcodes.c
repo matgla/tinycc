@@ -955,9 +955,9 @@ thumb_opcode th_push(uint16_t regs)
         .opcode = (0xb400 | (lr << 8) | (regs & 0xff)),
     };
   }
-// T2 encoding R0-R12 + LR only, > armv7-m
+// T2 encoding R0-R12 + LR only, Thumb-2 (not available on ARMv6-M)
 // (T1 in armv8-m - inconsistent naming in reference manual)
-#if defined(TCC_TARGET_ARM_ARCHV8M) || defined(TCC_TARGET_ARM_ARCHV7M)
+#ifndef TCC_TARGET_ARM_ARCHV6M
   if (!(regs & 0xa000))
   {
     THOP_TRACE("push ");
@@ -1524,9 +1524,9 @@ thumb_opcode th_pop(uint16_t regs)
         .opcode = 0xbc00 | (pc << 8) | (regs & 0xff),
     };
   }
-// T2 encoding R0-R12 + PC + LR, > armv7-m
+// T2 encoding R0-R12 + PC + LR, Thumb-2 (not available on ARMv6-M)
 // (T1 in armv8-m - inconsistent naming in reference manual)
-#if defined(TCC_TARGET_ARM_ARCHV8M) || defined(TCC_TARGET_ARM_ARCHV7M)
+#ifndef TCC_TARGET_ARM_ARCHV6M
   if (!(regs & 0x2000))
   {
     THOP_TRACE("pop ");

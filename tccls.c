@@ -60,7 +60,7 @@ void tcc_ls_clear_live_intervals(LSLiveIntervalState *ls)
 }
 
 void tcc_ls_add_live_interval(LSLiveIntervalState *ls, int vreg, int start, int end, int crosses_call, int addrtaken,
-                              int reg_type, int lvalue)
+                              int reg_type, int lvalue, int precolored_reg)
 {
   LSLiveInterval *interval;
 
@@ -76,7 +76,7 @@ void tcc_ls_add_live_interval(LSLiveIntervalState *ls, int vreg, int start, int 
   interval->vreg = vreg;
   interval->start = start;
   interval->end = end;
-  interval->r0 = -1;
+  interval->r0 = precolored_reg; /* -1 means no preference, >= 0 is ABI register hint */
   interval->r1 = -1;
   interval->stack_location = 0;
   interval->crosses_call = crosses_call;
@@ -532,21 +532,18 @@ void tcc_ls_allocate_registers(LSLiveIntervalState *ls, int used_parameters_regi
   ls->dirty_float_registers = 0;
   ls->registers_map = tcc_state->registers_map_for_allocator;
   ls->float_registers_map = tcc_state->float_registers_map_for_allocator;
-  /* Keep incoming argument registers (e.g. R0-R3) reserved at function entry.
-   * They carry parameters and are shuffled/saved by the prolog; letting the
-   * allocator reuse them for unrelated intervals can clobber arguments
-   * (seen in ir_tests/20_op_add for 4+ args).
+
+  /* R11 is available for normal allocation, but reserved during call argument processing.
+   * R12 (IP) is the standard inter-procedure scratch register. */
+  /* Note: We used to reserve R0-R3 here, but with parameter pre-coloring, the
+   * PAR:n intervals get assigned R0-R3 directly. The intervals themselves will
+   * prevent those registers from being reused by other intervals during their
+   * live range. So we no longer pre-reserve parameter registers.
    *
-   * 'used_parameters_registers' is a logical count (may exceed the physical
-   * register window), so clamp it to the target's parameter register count.
+   * The parameter pre-coloring (r0 = 0..3 for PAR:0..3) ensures that parameters
+   * are allocated to their ABI-mandated registers, and the linear-scan algorithm
+   * will prevent conflicts with other intervals.
    */
-  {
-    int reserve = used_parameters_registers;
-    if (reserve > tcc_state->parameters_registers)
-      reserve = tcc_state->parameters_registers;
-    for (int i = 0; i < reserve; ++i)
-      tcc_ls_mark_register_as_used(ls, i);
-  }
   for (int i = 0; i < used_float_parameters_registers; ++i)
   {
     tcc_ls_mark_float_register_as_used(ls, i);
@@ -804,6 +801,10 @@ int tcc_ls_find_free_scratch_reg(LSLiveIntervalState *ls, int instruction_idx, u
   /* Then try R12 (IP - inter-procedure scratch) */
   if (!(live_regs & (1 << 12)))
     return 12;
+
+  /* Try R11 - reserved for call argument processing but available as scratch otherwise */
+  if (!(live_regs & (1 << 11)))
+    return 11;
 
   /* Finally try LR if not a leaf function */
   if (!is_leaf && !(live_regs & (1 << 14)))

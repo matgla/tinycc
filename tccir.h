@@ -85,12 +85,52 @@ typedef enum TccIrOp
   TCCIR_OP_VLA_SP_SAVE,    /* save current SP to a fixed stack slot */
   TCCIR_OP_VLA_SP_RESTORE, /* restore SP from a fixed stack slot */
 
+  /* Inline asm support (IR-only):
+   * - ASM_INPUT: marks vreg uses feeding the asm block
+   * - INLINE_ASM: barrier/call-like instruction carrying asm payload id
+   * - ASM_OUTPUT: marks vreg defs produced by the asm block
+   */
+  TCCIR_OP_ASM_INPUT,
+  TCCIR_OP_INLINE_ASM,
+  TCCIR_OP_ASM_OUTPUT,
+
+  /* Explicit call sequence lowering (Option A scaffold).
+   * These ops allow the IR to represent the ABI-mandated call argument
+   * placement explicitly, so backends can become mostly "dumb emitters".
+   *
+   * Semantics (initially ARM/AAPCS-focused, but encoded generically):
+   * - CALLSEQ_BEGIN: reserve outgoing argument stack area (and optional pad)
+   * - CALLARG_REG:   place an argument value into a numbered ABI arg register
+   * - CALLARG_STACK: place an argument value at outgoing stack offset
+   * - CALLSEQ_END:   release outgoing argument stack area (and optional pad)
+   */
+  TCCIR_OP_CALLSEQ_BEGIN,
+  TCCIR_OP_CALLARG_REG,
+  TCCIR_OP_CALLARG_STACK,
+  TCCIR_OP_CALLSEQ_END,
+
   /* No-operation placeholder for dead instructions */
   TCCIR_OP_NOP,
 } TccIrOp;
 
 typedef struct CType CType;
 typedef struct SValue SValue;
+
+#ifdef CONFIG_TCC_ASM
+typedef struct ASMOperand ASMOperand;
+typedef struct TCCIRInlineAsm
+{
+  char *asm_str;
+  int asm_len;
+  int must_subst;
+  int nb_operands;
+  int nb_outputs;
+  int nb_labels;
+  uint8_t clobber_regs[NB_ASM_REGS];
+  ASMOperand *operands; /* length (nb_operands + nb_labels) */
+  SValue *values;       /* length nb_operands; operands[i].vt points into this */
+} TCCIRInlineAsm;
+#endif
 
 typedef struct TACQuadruple TACQuadruple;
 typedef struct Sym Sym;
@@ -137,7 +177,8 @@ typedef struct IRCallSite
   int call_instr_index; /* index into ir->instructions (current, post-opts) */
   int call_orig_index;  /* stable orig_index for debugging/mapping */
   int argc;
-  IRCallArgument *args; /* length argc */
+  uint8_t args_prepared; /* non-zero if IR prepares ABI call args (backend must not marshal) */
+  IRCallArgument *args;  /* length argc */
 } IRCallSite;
 
 typedef struct IRCallsiteArgBinding
@@ -199,6 +240,10 @@ typedef struct TCCMachineScratchRegs
 #define TCC_MACHINE_SCRATCH_NEEDS_PAIR (1u << 0)
 #define TCC_MACHINE_SCRATCH_PREFERS_FLOAT (1u << 1)
 #define TCC_MACHINE_SCRATCH_ALLOW_REUSE (1u << 2)
+/* Exclude ABI arg registers (e.g. R0-R3 on ARM) from scratch allocation. */
+#define TCC_MACHINE_SCRATCH_AVOID_CALL_ARG_REGS (1u << 3)
+/* Exclude "permanent scratch" regs (e.g. R11/R12 on ARM) from scratch allocation. */
+#define TCC_MACHINE_SCRATCH_AVOID_PERM_SCRATCH (1u << 4)
 
 typedef struct TCCMaterializedValue
 {
@@ -277,11 +322,30 @@ typedef struct TCCIRState
   IRCallsiteArgBinding *callsite_arg_binding_by_instr; /* maps FUNCPARAM instr -> callsite/arg */
   int callsite_arg_binding_size;
 
+  /* Optional per-call ABI layouts (computed via target hook).
+   * Indexed by callsite_index; layout.locs is owned by IR and freed with callsites.
+   */
+  TCCAbiCallLayout *callsite_abi_layouts;
+  int callsite_abi_layouts_size;
+
+  /* Outgoing call argument area reserved in the function frame (FP-relative).
+   * If non-zero, stack args are stored at [FP + call_outgoing_base + stack_off].
+   */
+  int call_outgoing_base; /* frame offset (typically negative) */
+  int call_outgoing_size; /* bytes reserved (may include alignment padding) */
+
   uint32_t *ignored_vregs;
   int ignored_vregs_size;
 
   SpillCache spill_cache; // Cache for tracking register-stack mappings during codegen
   TCCStackLayout stack_layout;
+
+#ifdef CONFIG_TCC_ASM
+  /* Inline asm blocks recorded during IR building, lowered during codegen. */
+  TCCIRInlineAsm *inline_asms;
+  int inline_asm_count;
+  int inline_asm_capacity;
+#endif
 
   /* Mapping from IR instruction index to generated machine code offset (section-relative).
    * Size is (next_instruction_index + 1) to include the epilogue mapping.
@@ -298,6 +362,9 @@ typedef struct TCCIRState
   int orig_ir_to_code_mapping_size;
 
   LSLiveIntervalState ls;
+
+  /* Extra scratch allocation flags to apply during materialization for the current IR instruction. */
+  unsigned codegen_materialize_scratch_flags;
 } TCCIRState;
 
 TCCIRState *tcc_ir_allocate_block();
@@ -314,6 +381,12 @@ int tcc_ir_gvtst(TCCIRState *ir, int inv, int t);
 void tcc_ir_gen_opi(TCCIRState *ir, int op);
 void tcc_ir_gen_opf(TCCIRState *ir, int op);
 int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *dest);
+
+#ifdef CONFIG_TCC_ASM
+int tcc_ir_add_inline_asm(TCCIRState *ir, const char *asm_str, int asm_len, int must_subst, ASMOperand *operands,
+                          int nb_operands, int nb_outputs, int nb_labels, const uint8_t *clobber_regs);
+void tcc_ir_put_inline_asm(TCCIRState *ir, int inline_asm_id);
+#endif
 
 int tcc_ir_get_vreg_temp(TCCIRState *ir);
 int tcc_ir_get_vreg_var(TCCIRState *ir);

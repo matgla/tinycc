@@ -1554,154 +1554,9 @@ static Sym *external_sym(int v, CType *type, int r, AttributeDef *ad)
   return s;
 }
 
-/* save registers up to (vtop - n) stack entry */
-ST_FUNC void save_regs(int n)
-{
-  SValue *p, *p1;
-  for (p = vstack, p1 = vtop - n; p <= p1; p++)
-    save_reg(p->r);
-}
+/* Legacy register spilling helpers removed: IR owns spilling. */
 
-/* save r to the memory stack, and mark it as being free */
-ST_FUNC void save_reg(int r)
-{
-  save_reg_upstack(r, 0);
-}
-
-/* save r to the memory stack, and mark it as being free,
-   if seen up to (vtop - n) stack entry */
-ST_FUNC void save_reg_upstack(int r, int n)
-{
-  int l, size, align, bt, r2;
-  SValue *p, *p1, sv;
-
-  if ((r &= VT_VALMASK) >= VT_CONST)
-    return;
-  if (nocode_wanted)
-    return;
-  l = r2 = 0;
-  for (p = vstack, p1 = vtop - n; p <= p1; p++)
-  {
-    if ((p->r & VT_VALMASK) == r || p->r2 == r)
-    {
-      /* must save value on stack if not already done */
-      if (!l)
-      {
-        bt = p->type.t & VT_BTYPE;
-        if (bt == VT_VOID)
-          continue;
-        if ((p->r & VT_LVAL) || bt == VT_FUNC)
-          bt = VT_PTR;
-        sv.type.t = bt;
-        size = type_size(&sv.type, &align);
-        l = get_temp_local_var(size, align, &r2);
-        sv.r = VT_LOCAL | VT_LVAL;
-        sv.c.i = l;
-        store(p->r & VT_VALMASK, &sv);
-#if defined(TCC_TARGET_I386) || defined(TCC_TARGET_X86_64)
-        /* x86 specific: need to pop fp register ST0 if saved */
-        if (r == TREG_ST0)
-        {
-          o(0xd8dd); /* fstp %st(0) */
-        }
-#endif
-        /* special long long case */
-        if (p->r2 < VT_CONST && USING_TWO_WORDS(bt))
-        {
-          sv.c.i += PTR_SIZE;
-          store(p->r2, &sv);
-        }
-      }
-      /* mark that stack entry as being saved on the stack */
-      if (p->r & VT_LVAL)
-      {
-        /* also clear the bounded flag because the
-           relocation address of the function was stored in
-           p->c.i */
-        p->r = (p->r & ~(VT_VALMASK | VT_BOUNDED)) | VT_LLOCAL;
-      }
-      else
-      {
-        p->r = VT_LVAL | VT_LOCAL;
-        p->type.t &= ~VT_ARRAY; /* cannot combine VT_LVAL with VT_ARRAY */
-      }
-      p->sym = NULL;
-      p->r2 = r2;
-      p->c.i = l;
-    }
-  }
-}
-
-#ifdef TCC_TARGET_ARM
-/* find a register of class 'rc2' with at most one reference on stack.
- * If none, call get_reg(rc) */
-ST_FUNC int get_reg_ex(int rc, int rc2)
-{
-  int r;
-  SValue *p;
-
-  for (r = 0; r < NB_REGS; r++)
-  {
-    if (reg_classes[r] & rc2)
-    {
-      int n;
-      n = 0;
-      for (p = vstack; p <= vtop; p++)
-      {
-        if ((p->r & VT_VALMASK) == r || p->r2 == r)
-          n++;
-      }
-      if (n <= 1)
-        return r;
-    }
-  }
-  return get_reg(rc);
-}
-#endif
-
-/* find a free register of class 'rc'. If none, save one register */
-ST_FUNC int get_reg(int rc)
-{
-  int r;
-  SValue *p;
-
-  /* find a free register */
-  for (r = 0; r < NB_REGS; r++)
-  {
-    if (reg_classes[r] & rc)
-    {
-      if (nocode_wanted)
-        return r;
-      for (p = vstack; p <= vtop; p++)
-      {
-        if ((p->r & VT_VALMASK) == r || p->r2 == r)
-          goto notfound;
-      }
-      return r;
-    }
-  notfound:;
-  }
-
-  /* no register left : free the first one on the stack (VERY
-     IMPORTANT to start from the bottom to ensure that we don't
-     spill registers used in gen_opi()) */
-  for (p = vstack; p <= vtop; p++)
-  {
-    /* look at second register (if long long) */
-    r = p->r2;
-    if (r < VT_CONST && (reg_classes[r] & rc))
-      goto save_found;
-    r = p->r & VT_VALMASK;
-    if (r < VT_CONST && (reg_classes[r] & rc))
-    {
-    save_found:
-      save_reg(r);
-      return r;
-    }
-  }
-  /* Should never comes here */
-  return -1;
-}
+/* IR-only: frontend never allocates physical registers. */
 
 /* find a free temporary local variable (return the offset on stack) match
    size and align. If none, add new temporary stack variable */
@@ -1752,17 +1607,11 @@ static int get_temp_local_var(int size, int align, int *r2)
    memory if needed */
 static void move_reg(int r, int s, int t)
 {
-  SValue sv;
-
-  if (r != s)
-  {
-    save_reg(r);
-    sv.type.t = t;
-    sv.type.ref = NULL;
-    sv.r = s;
-    sv.c.i = 0;
-    load(r, &sv);
-  }
+  (void)r;
+  (void)s;
+  (void)t;
+  /* IR-only: physical register shuffling is handled after IR lowering. */
+  return;
 }
 
 /* get address of vtop (vtop MUST BE an lvalue) */
@@ -1980,7 +1829,6 @@ static void incr_bf_adr(int o)
 static void load_packed_bf(CType *type, int bit_pos, int bit_size)
 {
   int n, o, bits;
-  save_reg_upstack(vtop->r, 1);
   vpush64(type->t & VT_BTYPE, 0); // B X
   bits = 0, o = bit_pos >> 3, bit_pos &= 7;
   do
@@ -2017,7 +1865,6 @@ static void store_packed_bf(int bit_pos, int bit_size)
   int bits, n, o, m, c;
   c = (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST;
   vswap(); // X B
-  save_reg_upstack(vtop->r, 1);
   bits = 0, o = bit_pos >> 3, bit_pos &= 7;
   do
   {
@@ -2171,72 +2018,23 @@ ST_FUNC int gv(int rc)
     r_ok = !(vtop->r & VT_LVAL) && (r < VT_CONST) && (reg_classes[r] & rc);
     r2_ok = !rc2 || ((vtop->r2 < VT_CONST) && (reg_classes[vtop->r2] & rc2));
 
-    if (!r_ok || !r2_ok)
+    if (tcc_state->ir == NULL)
     {
+      if (!nocode_wanted)
+        tcc_error("IR-only: gv() requires IR");
+      return 0;
+    }
 
-      if (!r_ok)
+    if (tcc_state->ir && rc2)
+    {
+      /* IR mode: treat 64-bit values as a single vreg, even on targets where
+       * the legacy backend would split into two registers.
+       *
+       * Always materialize into a vreg if we don't already have one.
+       */
+      if (vtop->vr == -1 || (vtop->r & VT_LVAL) || (vtop->r & VT_VALMASK) >= VT_CONST)
       {
-        if (1 /* we can 'mov (r),r' in cases */
-            && r < VT_CONST && (reg_classes[r] & rc) && !rc2)
-          save_reg_upstack(r, 1);
-        else
-          r = get_reg(rc);
-      }
-
-      if (rc2)
-      {
-        int load_type = (bt == VT_QFLOAT) ? VT_DOUBLE : VT_PTRDIFF_T;
-        int original_type = vtop->type.t;
-
-        /* two register type load :
-           expand to two words temporarily */
-        if ((vtop->r & (VT_VALMASK | VT_LVAL)) == VT_CONST)
-        {
-          /* load constant */
-          unsigned long long ll = vtop->c.i;
-          vtop->c.i = ll; /* first word */
-          load(r, vtop);
-          vtop->r = r;      /* save register value */
-          vpushi(ll >> 32); /* second word */
-        }
-        else if (vtop->r & VT_LVAL)
-        {
-          /* We do not want to modifier the long long pointer here.
-             So we save any other instances down the stack */
-          save_reg_upstack(vtop->r, 1);
-          /* load from memory */
-          vtop->type.t = load_type;
-          load(r, vtop);
-          vdup();
-          vtop[-1].r = r; /* save register value */
-          /* increment pointer to get second word */
-          incr_offset(PTR_SIZE);
-        }
-        else
-        {
-          /* move registers */
-          if (!r_ok)
-            load(r, vtop);
-          if (r2_ok && vtop->r2 < VT_CONST)
-            goto done;
-          vdup();
-          vtop[-1].r = r; /* save register value */
-          vtop->r = vtop[-1].r2;
-        }
-        /* Allocate second register. Here we rely on the fact that
-           get_reg() tries first to free r2 of an SValue. */
-        r2 = get_reg(rc2);
-        load(r2, vtop);
-        vpop();
-        /* write second register */
-        vtop->r2 = r2;
-      done:
-        vtop->type.t = original_type;
-      }
-      else
-      {
-        vreg = tcc_ir_get_vreg_temp(tcc_state->ir);
-        /* Mark temp vreg with correct type for register allocation */
+        int vreg = tcc_ir_get_vreg_temp(tcc_state->ir);
         if (is_float(vtop->type.t))
         {
           int is_double = (vtop->type.t & VT_BTYPE) == VT_DOUBLE || (vtop->type.t & VT_BTYPE) == VT_LDOUBLE;
@@ -2246,23 +2044,50 @@ ST_FUNC int gv(int rc)
         {
           tcc_ir_set_llong_type(tcc_state->ir, vreg);
         }
+
         vset_VT_JMP();
-        /* one register type load */
-        // load(r, vtop);
         SValue dest = (SValue){0};
-        dest.type.t = vtop->type.t;
+        dest.type = vtop->type;
         dest.vr = vreg;
         tcc_ir_put(tcc_state->ir, TCCIR_OP_LOAD, vtop, NULL, &dest);
-        /* After LOAD, the result is a computed value in a vreg.
-           Do not leave it tagged as VT_LOCAL (address-like), otherwise
-           gen_opic() can mis-handle it as a symbol/address (e.g. folding
-           x-100 into an addend) and break integer promotion semantics. */
+
         vtop->vr = vreg;
         vtop->r = 0;
         vtop->r2 = VT_CONST;
         vtop->c.i = 0;
         vtop->sym = NULL;
       }
+      return 0;
+    }
+
+    if (!r_ok || !r2_ok)
+    {
+      /* IR-only: materialize into a vreg; no physical reg allocation. */
+      if (rc2)
+        tcc_error("IR-only: unexpected legacy 2-reg gv path");
+
+      vreg = tcc_ir_get_vreg_temp(tcc_state->ir);
+      if (is_float(vtop->type.t))
+      {
+        int is_double = (vtop->type.t & VT_BTYPE) == VT_DOUBLE || (vtop->type.t & VT_BTYPE) == VT_LDOUBLE;
+        tcc_ir_set_float_type(tcc_state->ir, vreg, 1, is_double);
+      }
+      else if ((vtop->type.t & VT_BTYPE) == VT_LLONG)
+      {
+        tcc_ir_set_llong_type(tcc_state->ir, vreg);
+      }
+
+      vset_VT_JMP();
+      SValue dest = (SValue){0};
+      dest.type.t = vtop->type.t;
+      dest.vr = vreg;
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_LOAD, vtop, NULL, &dest);
+
+      vtop->vr = vreg;
+      vtop->r = 0;
+      vtop->r2 = VT_CONST;
+      vtop->c.i = 0;
+      vtop->sym = NULL;
     }
     /* vtop->vr is set in the IR LOAD/ASSIGN paths when needed */
 #ifdef TCC_TARGET_C67
@@ -2271,7 +2096,7 @@ ST_FUNC int gv(int rc)
       vtop->r2 = r + 1;
 #endif
   }
-  return r;
+  return 0;
 }
 
 /* generate vtop[-1] and vtop[0] in resp. classes rc1 and rc2 */
@@ -3098,7 +2923,7 @@ void gen_negf(int op)
 
   size = type_size(&vtop->type, &align);
   bt = vtop->type.t & VT_BTYPE;
-  save_reg(gv(RC_TYPE(bt)));
+  gv(RC_TYPE(bt));
   vdup();
   incr_bf_adr(size - 1);
   vdup();
@@ -4664,12 +4489,34 @@ ST_FUNC void vstore(void)
     if ((vtop[-1].r & VT_VALMASK) == VT_LLOCAL)
     {
       SValue sv;
-      r = get_reg(RC_INT);
-      sv.type.t = VT_PTRDIFF_T;
-      sv.r = VT_LOCAL | VT_LVAL;
-      sv.c.i = vtop[-1].c.i;
-      load(r, &sv);
-      vtop[-1].r = r | VT_LVAL;
+      if (tcc_state->ir)
+      {
+        /* IR mode: load the saved pointer value into a vreg, and keep the
+         * destination as a dereferenced address (***DEREF***).
+         */
+        SValue ptr_location;
+        memset(&ptr_location, 0, sizeof(ptr_location));
+        ptr_location.type.t = VT_PTRDIFF_T;
+        ptr_location.r = VT_LOCAL | VT_LVAL;
+        ptr_location.c.i = vtop[-1].c.i;
+
+        SValue loaded_ptr;
+        memset(&loaded_ptr, 0, sizeof(loaded_ptr));
+        loaded_ptr.type.t = VT_PTRDIFF_T;
+        loaded_ptr.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_LOAD, &ptr_location, NULL, &loaded_ptr);
+
+        vtop[-1].r &= ~VT_VALMASK;
+        vtop[-1].r |= VT_LVAL;
+        vtop[-1].vr = loaded_ptr.vr;
+        vtop[-1].c.i = 0;
+        vtop[-1].sym = NULL;
+      }
+      else
+      {
+        if (!nocode_wanted)
+          tcc_error("IR-only: VT_LLOCAL reload requires IR");
+      }
     }
 
     r = vtop->r & VT_VALMASK;
@@ -4677,23 +4524,57 @@ ST_FUNC void vstore(void)
        store second register at word + 4 (or +8 for x86-64)  */
     if (USING_TWO_WORDS(dbt))
     {
-      int load_type = (dbt == VT_QFLOAT) ? VT_DOUBLE : VT_PTRDIFF_T;
-      vtop[-1].type.t = load_type;
-      // For IR generation, handle long long as a single 64-bit value
-      if ((vtop[-1].r & VT_VALMASK) == VT_LOCAL)
+      /* IR generation: handle long long as a single 64-bit value, and always
+       * emit IR STORE/ASSIGN instead of calling the backend store() twice.
+       *
+       * Calling backend store() here is unsafe in IR mode because register
+       * allocation/spilling can turn the low bits (VT_VALMASK) into VT_LOCAL
+       * (0x32), which is not a physical register.
+       */
+      if (tcc_state->ir)
       {
-        // Restore original type for proper IR generation
+        int op = TCCIR_OP_STORE;
+
+        /* Keep the original destination type for a 64-bit store. */
         vtop[-1].type.t = dbt;
-        tcc_ir_put(tcc_state->ir, TCCIR_OP_ASSIGN, vtop, NULL, &vtop[-1]);
-        /* Assignment expression evaluates to the assigned value. For VT_LOCAL
-         * destinations with vregs, return the destination vreg (now updated)
-         * so later uses see the correct value. */
-        vtop->vr = vtop[-1].vr;
-        vtop->r = 0;
+
+        /* Match the single-word behavior: local vreg destinations use ASSIGN. */
+        if ((vtop[-1].r & VT_VALMASK) == VT_LOCAL && vtop[-1].vr != -1)
+          op = TCCIR_OP_ASSIGN;
+
+        /* If source is an lvalue (memory reference), emit LOAD first to get
+         * the value, so STORE doesn't try to store memory-to-memory.
+         */
+        if (vtop->r & VT_LVAL)
+        {
+          SValue load_dest;
+          load_dest.type = vtop->type;
+          load_dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+          load_dest.r = 0;
+          load_dest.c.i = 0;
+          tcc_ir_put(tcc_state->ir, TCCIR_OP_LOAD, vtop, NULL, &load_dest);
+          vtop->vr = load_dest.vr;
+          vtop->r = 0;
+        }
+
+        tcc_ir_generate_cmp_jmp_set(tcc_state->ir);
+        tcc_ir_put(tcc_state->ir, op, vtop, NULL, &vtop[-1]);
+
+        if (op == TCCIR_OP_ASSIGN)
+        {
+          /* Assignment expression evaluates to the assigned value. For VT_LOCAL
+           * destinations with vregs, return the destination vreg (now updated)
+           * so later uses see the correct value.
+           */
+          vtop->vr = vtop[-1].vr;
+          vtop->r = 0;
+        }
       }
       else
       {
-        // Old path for non-IR backends
+        /* Old path for non-IR backends: store low word then high word. */
+        int load_type = (dbt == VT_QFLOAT) ? VT_DOUBLE : VT_PTRDIFF_T;
+        vtop[-1].type.t = load_type;
         store(r, vtop - 1);
         vswap();
         incr_offset(PTR_SIZE);
@@ -6776,8 +6657,6 @@ tok_next:
         expect("constant");
       if (0 == local_scope)
         tcc_error("statement expression outside of function");
-      /* save all registers */
-      save_regs(0);
       /* statement expression : we do not accept break/continue
          inside as GCC does.  We do retain the nocode_wanted state,
          as statement expressions can't ever be entered from the
@@ -7901,7 +7780,6 @@ static void expr_cond(void)
     {
       if (c < 0)
       {
-        save_regs(1);
         tt = tcc_ir_generate_test(tcc_state->ir, 1, -1);
       }
       else
@@ -7913,7 +7791,6 @@ static void expr_cond(void)
     {
       /* needed to avoid having different registers saved in
          each branch */
-      save_regs(1);
       gv_dup();
       tt = tcc_ir_generate_test(tcc_state->ir, 0, -1);
     }
@@ -8093,8 +7970,11 @@ static void expr_cond(void)
         tcc_ir_put(tcc_state->ir, TCCIR_OP_ASSIGN, &src, NULL, &dest);
         vtop->vr = false_vreg;
       }
-      move_reg(r2, r1, islv ? VT_PTR : type.t);
-      vtop->r = r2;
+      if (!tcc_state->ir)
+      {
+        move_reg(r2, r1, islv ? VT_PTR : type.t);
+        vtop->r = r2;
+      }
       tcc_ir_backpatch_to_here(tcc_state->ir, tt);
     }
 

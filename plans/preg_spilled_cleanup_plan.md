@@ -40,8 +40,8 @@ Each unchecked box represents at least one direct `PREG_SPILLED` touch point. Cl
       - Enforced `thumb_require_materialized_reg()` for dest/src regs, removed memory-destination fallbacks, and added a `TEST_ZERO` guard so any lingering spill now trips an IR bug instead of being silently reloaded.
 12. - [x] **Hard-float result write-back** — [arm-thumb-gen.c#L4781-L4835](arm-thumb-gen.c#L4781-L4835)
       - `store_fp_result_from_vfp()` now requires a materialized integer destination register (or true memory lvalue) and no longer treats `PREG_SPILLED` as a stack-backed destination.
-13. - [ ] **Scalar store op** — [arm-thumb-gen.c#L5330-L5360](arm-thumb-gen.c#L5330-L5360)
-      - `tcc_gen_machine_store_op()` still reloads source registers if `pr0` is `PREG_SPILLED`. Replace with `load_to_dest`-style materialization earlier.
+13. - [x] **Scalar store op** — [arm-thumb-gen.c#L5330-L5360](arm-thumb-gen.c#L5330-L5360)
+      - `tcc_gen_machine_store_op()` no longer treats `PREG_SPILLED` as reloadable; it requires materialized source regs and uses a scratch reload path only for true const/lvalue/missing-reg sources.
 14. - [ ] **Parameter shuffle in prolog** — [arm-thumb-gen.c#L5483-L5530](arm-thumb-gen.c#L5483-L5530)
       - Spilled parameters (allocation `r0 == PREG_SPILLED`) trigger stack stores. Ensure IR encodes stack slots explicitly so prolog no longer inspects the sentinel.
 15. - [ ] **64-bit assign/move** — [arm-thumb-gen.c#L5649-L5685](arm-thumb-gen.c#L5649-L5685)
@@ -51,7 +51,8 @@ Each unchecked box represents at least one direct `PREG_SPILLED` touch point. Cl
 17. - [x] **`load_to_register` / helper utilities** — [arm-thumb-gen.c#L6075-L6135](arm-thumb-gen.c#L6075-L6135)
       - Simplified to rely on the shared helper for cached-register moves; spilled cases now fall back to `load_to_reg()` without touching `PREG_SPILLED`.
 18. - [ ] **Call lowering (stack + register args)** — [arm-thumb-gen.c#L6413-L6685](arm-thumb-gen.c#L6413-L6685)
-      - Argument setup still inspects `PREG_SPILLED` for stack writes, lvalue remapping, and documentation comments (e.g., [arm-thumb-gen.c#L6677-L6682](arm-thumb-gen.c#L6677-L6682)). Move spill handling into IR materialization and leave only diagnostics here.
+      - **IR-side pressure reduction (done):** callsite binding now folds common “stack address temp → deref” argument patterns into direct stack lvalues, reducing the number of live address temporaries around large/varargs calls (e.g. `printf` in `tests/tests2/90_struct-init.c`). See [tccir.c#L550-L820](tccir.c#L550-L820).
+      - Remaining work: argument setup still inspects `PREG_SPILLED` for stack writes, lvalue remapping, and documentation comments (e.g., [arm-thumb-gen.c#L6677-L6682](arm-thumb-gen.c#L6677-L6682)). Move spill handling into IR materialization and leave only diagnostics here.
 19. - [ ] **Return write-back** — [arm-thumb-gen.c#L6800-L6835](arm-thumb-gen.c#L6800-L6835)
       - Return-value store checks whether the destination virtual register is spilled. Ensure IR either keeps the value in R0/R1 or encodes a true stack lvalue.
 20. - [ ] **VLA helpers** — [arm-thumb-gen.c#L6967-L6998](arm-thumb-gen.c#L6967-L6998)

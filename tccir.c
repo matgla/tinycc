@@ -235,6 +235,21 @@ const IRRegistersConfig irop_config[] = {
     [TCCIR_OP_VLA_SP_SAVE] = {1, 0, 0},    /* dest=stack slot to store SP */
     [TCCIR_OP_VLA_SP_RESTORE] = {0, 1, 0}, /* src1=stack slot holding saved SP */
 
+    /* Inline asm markers/barrier */
+    [TCCIR_OP_ASM_INPUT] = {0, 1, 0},
+    [TCCIR_OP_INLINE_ASM] = {0, 0, 0},
+    [TCCIR_OP_ASM_OUTPUT] = {1, 0, 0},
+    /* Explicit call sequence ops (Option A scaffold)
+     * - CALLSEQ_BEGIN: src1=stack_size (bytes), src2=pad (bytes)
+     * - CALLARG_REG: src1=value, src2=reg_index (immediate)
+     * - CALLARG_STACK: src1=value, src2=stack_off (immediate)
+     * - CALLSEQ_END: src1=stack_size (bytes), src2=pad (bytes)
+     */
+    [TCCIR_OP_CALLSEQ_BEGIN] = {0, 1, 1},
+    [TCCIR_OP_CALLARG_REG] = {0, 1, 1},
+    [TCCIR_OP_CALLARG_STACK] = {0, 1, 1},
+    [TCCIR_OP_CALLSEQ_END] = {0, 1, 1},
+
     /* No-operation */
     [TCCIR_OP_NOP] = {0, 0, 0},
 };
@@ -424,11 +439,35 @@ TCCIRState *tcc_ir_allocate_block()
   block->stack_layout.slots = NULL;
   block->stack_layout.slot_capacity = 0;
   block->stack_layout.slot_count = 0;
+
+#ifdef CONFIG_TCC_ASM
+  block->inline_asms = NULL;
+  block->inline_asm_count = 0;
+  block->inline_asm_capacity = 0;
+#endif
   return block;
 }
 
 static void tcc_ir_callsites_clear(TCCIRState *ir)
 {
+  if (ir->callsite_abi_layouts)
+  {
+    for (int i = 0; i < ir->callsite_abi_layouts_size; ++i)
+    {
+      if (ir->callsite_abi_layouts[i].locs)
+        tcc_free(ir->callsite_abi_layouts[i].locs);
+      ir->callsite_abi_layouts[i].locs = NULL;
+      ir->callsite_abi_layouts[i].argc = 0;
+      ir->callsite_abi_layouts[i].stack_size = 0;
+      ir->callsite_abi_layouts[i].stack_align = 0;
+    }
+    tcc_free(ir->callsite_abi_layouts);
+    ir->callsite_abi_layouts = NULL;
+  }
+  ir->callsite_abi_layouts_size = 0;
+  ir->call_outgoing_base = 0;
+  ir->call_outgoing_size = 0;
+
   if (ir->callsites)
   {
     for (int i = 0; i < ir->callsite_count; ++i)
@@ -436,6 +475,7 @@ static void tcc_ir_callsites_clear(TCCIRState *ir)
       if (ir->callsites[i].args)
         tcc_free(ir->callsites[i].args);
       ir->callsites[i].args = NULL;
+      ir->callsites[i].args_prepared = 0;
     }
     tcc_free(ir->callsites);
     ir->callsites = NULL;
@@ -456,6 +496,177 @@ static void tcc_ir_callsites_clear(TCCIRState *ir)
     ir->callsite_arg_binding_by_instr = NULL;
   }
   ir->callsite_arg_binding_size = 0;
+}
+
+#ifdef CONFIG_TCC_ASM
+static void tcc_ir_inline_asms_ensure_capacity(TCCIRState *ir, int needed)
+{
+  if (!ir)
+    return;
+  if (ir->inline_asm_capacity >= needed)
+    return;
+  int new_cap = ir->inline_asm_capacity ? ir->inline_asm_capacity : 8;
+  while (new_cap < needed)
+    new_cap <<= 1;
+  ir->inline_asms = tcc_realloc(ir->inline_asms, sizeof(TCCIRInlineAsm) * new_cap);
+  memset(ir->inline_asms + ir->inline_asm_capacity, 0, sizeof(TCCIRInlineAsm) * (new_cap - ir->inline_asm_capacity));
+  ir->inline_asm_capacity = new_cap;
+}
+
+int tcc_ir_add_inline_asm(TCCIRState *ir, const char *asm_str, int asm_len, int must_subst, ASMOperand *operands,
+                          int nb_operands, int nb_outputs, int nb_labels, const uint8_t *clobber_regs)
+{
+  if (!ir)
+    return -1;
+  if (!asm_str || asm_len < 0)
+    tcc_error("IR: invalid inline asm string");
+  if (nb_operands < 0 || nb_operands > MAX_ASM_OPERANDS)
+    tcc_error("IR: invalid asm operand count");
+  if (nb_labels < 0 || nb_operands + nb_labels > MAX_ASM_OPERANDS)
+    tcc_error("IR: invalid asm label count");
+  if (nb_outputs < 0 || nb_outputs > nb_operands)
+    tcc_error("IR: invalid asm output count");
+
+  tcc_ir_inline_asms_ensure_capacity(ir, ir->inline_asm_count + 1);
+  const int id = ir->inline_asm_count++;
+  TCCIRInlineAsm *ia = &ir->inline_asms[id];
+
+  ia->asm_len = asm_len;
+  ia->asm_str = tcc_mallocz((size_t)asm_len + 1);
+  memcpy(ia->asm_str, asm_str, (size_t)asm_len);
+  ia->must_subst = must_subst;
+  ia->nb_operands = nb_operands;
+  ia->nb_outputs = nb_outputs;
+  ia->nb_labels = nb_labels;
+  if (clobber_regs)
+    memcpy(ia->clobber_regs, clobber_regs, NB_ASM_REGS);
+  else
+    memset(ia->clobber_regs, 0, NB_ASM_REGS);
+
+  ia->operands = tcc_mallocz(sizeof(ASMOperand) * (nb_operands + nb_labels));
+  memcpy(ia->operands, operands, sizeof(ASMOperand) * (nb_operands + nb_labels));
+
+  ia->values = tcc_mallocz(sizeof(SValue) * nb_operands);
+  for (int i = 0; i < nb_operands; ++i)
+  {
+    if (!operands[i].vt)
+      tcc_error("IR: asm operand missing value");
+    ia->values[i] = *operands[i].vt;
+    ia->operands[i].vt = &ia->values[i];
+  }
+  for (int i = nb_operands; i < nb_operands + nb_labels; ++i)
+  {
+    ia->operands[i].vt = NULL;
+  }
+
+  /* Conservative: inline asm is call-like for leaf analysis. */
+  ir->leaffunc = 0;
+
+  return id;
+}
+
+void tcc_ir_put_inline_asm(TCCIRState *ir, int inline_asm_id)
+{
+  if (!ir)
+    return;
+  const int idx = tcc_ir_put(ir, TCCIR_OP_INLINE_ASM, NULL, NULL, NULL);
+  if (idx >= 0)
+    ir->instructions[idx].aux = inline_asm_id;
+  ir->leaffunc = 0;
+}
+#endif
+
+/* Peephole helpers for callsite argument folding (see tcc_ir_build_callsites). */
+static int tcc_ir_is_stack_addr_operand_novreg(const SValue *sv)
+{
+  if (!sv)
+    return 0;
+  int val_kind = sv->r & VT_VALMASK;
+  if ((val_kind == VT_LOCAL || val_kind == VT_LLOCAL) && !(sv->r & VT_LVAL) && sv->vr == -1)
+    return 1;
+  return 0;
+}
+
+static int tcc_ir_find_def_for_vreg_before(const TCCIRState *ir, int vreg_encoded, int start_idx)
+{
+  if (!ir)
+    return -1;
+  if (start_idx > ir->next_instruction_index)
+    start_idx = ir->next_instruction_index;
+  for (int i = start_idx - 1; i >= 0; --i)
+  {
+    const TACQuadruple *q = &ir->instructions[i];
+    if (q->dest.vr == vreg_encoded)
+      return i;
+  }
+  return -1;
+}
+
+/* Resolve a vreg that represents a stack address into (kind, offset).
+ * Returns 1 on success, 0 on failure.
+ * This is conservative and intended for simple TEMP address chains.
+ */
+static int tcc_ir_try_resolve_stack_addr(const TCCIRState *ir, int vreg_encoded, int start_idx, int depth,
+                                         int *out_kind, int *out_offset)
+{
+  if (!ir || !out_kind || !out_offset)
+    return 0;
+  if (depth <= 0)
+    return 0;
+
+  const int def_idx = tcc_ir_find_def_for_vreg_before(ir, vreg_encoded, start_idx);
+  if (def_idx < 0)
+    return 0;
+
+  const TACQuadruple *def = &ir->instructions[def_idx];
+
+  /* Base case: vreg = Addr[StackLoc[off]] (no VT_LVAL and no vreg on the address operand). */
+  if (def->op == TCCIR_OP_ASSIGN && tcc_ir_is_stack_addr_operand_novreg(&def->src1))
+  {
+    *out_kind = def->src1.r & VT_VALMASK;
+    *out_offset = def->src1.c.i;
+    return 1;
+  }
+
+  /* Copy chain: vreg = other_vreg (address value). */
+  if (def->op == TCCIR_OP_ASSIGN && tcc_is_vreg_valid((TCCIRState *)ir, def->src1.vr) && !(def->src1.r & VT_LVAL))
+  {
+    return tcc_ir_try_resolve_stack_addr(ir, def->src1.vr, def_idx, depth - 1, out_kind, out_offset);
+  }
+
+  /* Simple address arithmetic: vreg = base_vreg +/- const. */
+  if ((def->op == TCCIR_OP_ADD || def->op == TCCIR_OP_SUB) && !(def->src1.r & VT_LVAL) && !(def->src2.r & VT_LVAL))
+  {
+    const int src1_is_vreg = tcc_is_vreg_valid((TCCIRState *)ir, def->src1.vr);
+    const int src2_is_vreg = tcc_is_vreg_valid((TCCIRState *)ir, def->src2.vr);
+    const int src1_is_const = (def->src1.r & VT_VALMASK) == VT_CONST && !(def->src1.r & VT_SYM);
+    const int src2_is_const = (def->src2.r & VT_VALMASK) == VT_CONST && !(def->src2.r & VT_SYM);
+
+    (void)src2_is_vreg;
+
+    int base_kind = 0;
+    int base_off = 0;
+
+    if (src1_is_vreg && src2_is_const)
+    {
+      if (!tcc_ir_try_resolve_stack_addr(ir, def->src1.vr, def_idx, depth - 1, &base_kind, &base_off))
+        return 0;
+      *out_kind = base_kind;
+      *out_offset = (def->op == TCCIR_OP_ADD) ? (base_off + def->src2.c.i) : (base_off - def->src2.c.i);
+      return 1;
+    }
+    if (src1_is_const && src2_is_vreg && def->op == TCCIR_OP_ADD)
+    {
+      /* const + base */
+      if (!tcc_ir_try_resolve_stack_addr(ir, def->src2.vr, def_idx, depth - 1, &base_kind, &base_off))
+        return 0;
+      *out_kind = base_kind;
+      *out_offset = base_off + def->src1.c.i;
+      return 1;
+    }
+  }
+
+  return 0;
 }
 
 void tcc_ir_build_callsites(TCCIRState *ir)
@@ -596,6 +807,48 @@ void tcc_ir_build_callsites(TCCIRState *ir)
         }
       }
 
+      /* Fold deref-of-stack-address temps into direct stack lvalues for this callsite. */
+      for (int p = 0; p < argc; ++p)
+      {
+        const int instr_index = cs->args[p].instr_index;
+        if (instr_index < 0 || instr_index >= ir->next_instruction_index)
+          continue;
+
+        TACQuadruple *param_q = &ir->instructions[instr_index];
+        SValue *arg = &param_q->src1;
+        if (!(arg->r & VT_LVAL))
+          continue;
+        if (!tcc_is_vreg_valid(ir, arg->vr))
+          continue;
+
+        /* Some lvalue forms encode an additional constant offset in arg->c.i
+         * (e.g. base_vreg + off represented as LVAL(vr=base_vreg, c.i=off)).
+         * Preserve it when folding the base address, otherwise distinct fields
+         * can collapse onto the same stack slot.
+         */
+        const int extra_off = arg->c.i;
+
+        int kind = 0;
+        int off = 0;
+        if (!tcc_ir_try_resolve_stack_addr(ir, arg->vr, instr_index, 8, &kind, &off))
+          continue;
+
+        /* Rewrite FUNCPARAM operand to a direct stack lvalue. */
+        SValue folded = {0};
+        folded.type = arg->type;
+        folded.r = (kind & VT_VALMASK) | VT_LVAL;
+        folded.vr = -1;
+        folded.c.i = off + extra_off;
+        folded.pr0 = PREG_NONE;
+        folded.pr1 = PREG_NONE;
+        *arg = folded;
+
+        /* Keep the callsite snapshot coherent with the rewritten instruction.
+         * Some analysis passes consult cs->args[p].value (not the instruction).
+         */
+        cs->args[p].value = folded;
+      }
+
       for (int p = 0; p < argc; ++p)
       {
         if (cs->args[p].instr_index == -1)
@@ -702,6 +955,29 @@ void tcc_ir_release_block(TCCIRState *ir)
   }
 
   tcc_ir_callsites_clear(ir);
+
+#ifdef CONFIG_TCC_ASM
+  if (ir->inline_asms)
+  {
+    for (int i = 0; i < ir->inline_asm_count; ++i)
+    {
+      TCCIRInlineAsm *ia = &ir->inline_asms[i];
+      if (ia->asm_str)
+        tcc_free(ia->asm_str);
+      ia->asm_str = NULL;
+      if (ia->operands)
+        tcc_free(ia->operands);
+      ia->operands = NULL;
+      if (ia->values)
+        tcc_free(ia->values);
+      ia->values = NULL;
+    }
+    tcc_free(ir->inline_asms);
+  }
+  ir->inline_asms = NULL;
+  ir->inline_asm_count = 0;
+  ir->inline_asm_capacity = 0;
+#endif
 
   if (ir->variables_live_intervals != NULL)
   {
@@ -1158,6 +1434,20 @@ const char *tcc_ir_get_op_name(TccIrOp op)
     return "VLA_SP_SAVE";
   case TCCIR_OP_VLA_SP_RESTORE:
     return "VLA_SP_RESTORE";
+  case TCCIR_OP_ASM_INPUT:
+    return "ASM_INPUT";
+  case TCCIR_OP_INLINE_ASM:
+    return "INLINE_ASM";
+  case TCCIR_OP_ASM_OUTPUT:
+    return "ASM_OUTPUT";
+  case TCCIR_OP_CALLSEQ_BEGIN:
+    return "CALLSEQ_BEGIN";
+  case TCCIR_OP_CALLARG_REG:
+    return "CALLARG_REG";
+  case TCCIR_OP_CALLARG_STACK:
+    return "CALLARG_STACK";
+  case TCCIR_OP_CALLSEQ_END:
+    return "CALLSEQ_END";
   case TCCIR_OP_NOP:
     return "NOP";
   default:
@@ -1856,12 +2146,13 @@ void tcc_ir_liveness_analysis(TCCIRState *ir)
          * to stay live during argument loading in tcc_gen_machine_func_call_op */
         if (!tcc_ir_vreg_is_call_argument(ir, encoded_vreg, end))
           end--; /* Do not include call instruction itself */
+        else
+          crosses_call = 1; /* Call arg must be in callee-saved reg or spilled */
       }
       tcc_ls_add_live_interval(&ir->ls, encoded_vreg, start, end, crosses_call, addrtaken, reg_type,
-                               interval->is_lvalue);
+                               interval->is_lvalue, -1);
     }
   }
-
   for (int vreg = 0; vreg < ir->next_temporary_variable; ++vreg)
   {
     const int vreg_encoded = (TCCIR_VREG_TYPE_TEMP << 28) | vreg;
@@ -1890,9 +2181,15 @@ void tcc_ir_liveness_analysis(TCCIRState *ir)
         {
           end--; /* Do not include call instruction itself for non-func-ptr and non-arg vregs */
         }
+        else
+        {
+          /* This vreg IS a call argument or func ptr - it crosses this call
+           * and must be in a callee-saved register or spilled. */
+          crosses_call = 1;
+        }
       }
       tcc_ls_add_live_interval(&ir->ls, vreg_encoded, start, end, crosses_call, addrtaken, reg_type,
-                               interval->is_lvalue);
+                               interval->is_lvalue, -1);
     }
   }
 
@@ -1918,7 +2215,11 @@ void tcc_ir_liveness_analysis(TCCIRState *ir)
     crosses_call = tcc_ir_has_call_in_range(ir, start, end);
     addrtaken = interval->addrtaken;
     reg_type = tcc_ir_get_reg_type(ir, vreg_encoded);
-    tcc_ls_add_live_interval(&ir->ls, vreg_encoded, start, end, crosses_call, addrtaken, reg_type, interval->is_lvalue);
+    /* Pre-color parameters to their ABI registers (R0-R3 for first 4 params).
+     * Parameters beyond 4 come on the stack and get -1. */
+    int precolored = (vreg < 4) ? vreg : -1;
+    tcc_ls_add_live_interval(&ir->ls, vreg_encoded, start, end, crosses_call, addrtaken, reg_type, interval->is_lvalue,
+                             precolored);
   }
 }
 
@@ -2161,7 +2462,8 @@ void tcc_ir_materialize_value(TCCIRState *ir, SValue *sv, TCCMaterializedValue *
 
   const int frame_offset = tcc_ir_materialization_offset(ir, sv);
   const int is_64bit = tcc_ir_is_64bit_type(sv->type.t);
-  const unsigned scratch_flags = is_64bit ? TCC_MACHINE_SCRATCH_NEEDS_PAIR : 0;
+  const unsigned scratch_flags =
+      (is_64bit ? TCC_MACHINE_SCRATCH_NEEDS_PAIR : 0) | (ir ? ir->codegen_materialize_scratch_flags : 0);
   unsigned short original_r = sv->r;
 
   result->original_pr0 = sv->pr0;
@@ -2226,7 +2528,7 @@ void tcc_ir_materialize_addr(TCCIRState *ir, SValue *sv, TCCMaterializedAddr *re
   result->original_c_i = sv->c.i;
 
   TCCMachineScratchRegs scratch = {0};
-  tcc_machine_acquire_scratch(&scratch, 0);
+  tcc_machine_acquire_scratch(&scratch, (ir ? ir->codegen_materialize_scratch_flags : 0));
   if (scratch.reg_count == 0)
     tcc_error("compiler_error: unable to allocate scratch register for address materialization");
 
@@ -2271,7 +2573,8 @@ void tcc_ir_materialize_dest(TCCIRState *ir, SValue *dest, TCCMaterializedDest *
 
   const int frame_offset = tcc_ir_materialization_offset(ir, dest);
   const int is_64bit = tcc_ir_is_64bit_type(dest->type.t);
-  const unsigned scratch_flags = is_64bit ? TCC_MACHINE_SCRATCH_NEEDS_PAIR : 0;
+  const unsigned scratch_flags =
+      (is_64bit ? TCC_MACHINE_SCRATCH_NEEDS_PAIR : 0) | (ir ? ir->codegen_materialize_scratch_flags : 0);
   TCCMachineScratchRegs scratch = {0};
   tcc_machine_acquire_scratch(&scratch, scratch_flags);
   if (scratch.reg_count == 0)
@@ -5009,6 +5312,47 @@ static int tcc_ir_is_fpu_operation(TccIrOp op)
   }
 }
 
+#ifdef CONFIG_TCC_ASM
+static void tcc_ir_codegen_inline_asm(TCCIRState *ir, const TACQuadruple *q)
+{
+  if (!ir || !q)
+    return;
+  const int id = q->aux;
+  if (id < 0 || id >= ir->inline_asm_count)
+    tcc_error("IR: invalid inline asm id");
+
+  TCCIRInlineAsm *ia = &ir->inline_asms[id];
+  if (!ia->asm_str)
+    tcc_error("IR: inline asm payload missing");
+
+  const int nb_operands = ia->nb_operands;
+  const int nb_labels = ia->nb_labels;
+  if (nb_operands < 0 || nb_operands > MAX_ASM_OPERANDS || nb_operands + nb_labels > MAX_ASM_OPERANDS)
+    tcc_error("IR: invalid asm operand count");
+
+  ASMOperand ops[MAX_ASM_OPERANDS];
+  SValue vals[MAX_ASM_OPERANDS];
+  memset(ops, 0, sizeof(ops));
+  memset(vals, 0, sizeof(vals));
+
+  memcpy(ops, ia->operands, sizeof(ASMOperand) * (nb_operands + nb_labels));
+  for (int i = 0; i < nb_operands; ++i)
+  {
+    vals[i] = ia->values[i];
+    tcc_ir_fill_registers(ir, &vals[i]);
+    ops[i].vt = &vals[i];
+  }
+  for (int i = nb_operands; i < nb_operands + nb_labels; ++i)
+    ops[i].vt = NULL;
+
+  uint8_t clobber_regs[NB_ASM_REGS];
+  memcpy(clobber_regs, ia->clobber_regs, sizeof(clobber_regs));
+
+  tcc_asm_emit_inline(ops, nb_operands, ia->nb_outputs, nb_labels, clobber_regs, ia->asm_str, ia->asm_len,
+                      ia->must_subst);
+}
+#endif
+
 void tcc_ir_generate_code(TCCIRState *ir)
 {
   TACQuadruple *q;
@@ -5018,6 +5362,117 @@ void tcc_ir_generate_code(TCCIRState *ir)
    * Backends are not allowed to scan FUNCPARAM instructions.
    */
   tcc_ir_build_callsites(ir);
+
+  /* Compute ABI call layouts for eligible scalar-only calls.
+   *
+   * The IR-prepared call path writes any outgoing stack args into a fixed
+   * FP-relative outgoing area reserved in the function frame.
+   */
+  if (ir->callsite_count > 0)
+  {
+    ir->callsite_abi_layouts = tcc_mallocz(sizeof(TCCAbiCallLayout) * (size_t)ir->callsite_count);
+    ir->callsite_abi_layouts_size = ir->callsite_count;
+
+    for (int cs_idx = 0; cs_idx < ir->callsite_count; ++cs_idx)
+    {
+      IRCallSite *cs = &ir->callsites[cs_idx];
+      cs->args_prepared = 0;
+
+      const int argc = cs->argc;
+      if (argc <= 0)
+      {
+        /* No arguments - trivially prepared */
+        cs->args_prepared = 1;
+        continue;
+      }
+
+      int eligible = 1;
+      TCCAbiArgDesc *descs = tcc_mallocz(sizeof(TCCAbiArgDesc) * (size_t)argc);
+      TCCAbiArgLoc *locs = tcc_mallocz(sizeof(TCCAbiArgLoc) * (size_t)argc);
+
+      for (int a = 0; a < argc; ++a)
+      {
+        const SValue *sv = tcc_ir_callsite_arg_value_ptr(ir, &cs->args[a]);
+        int bt = sv->type.t & VT_BTYPE;
+
+        int align = 4;
+        CType tmp = sv->type;
+        int size = type_size(&tmp, &align);
+
+        if (bt == VT_STRUCT)
+        {
+          /* Structs passed by value: use actual struct size */
+          int slot_sz = (size + 3) & ~3; /* Round up to 4-byte alignment */
+          descs[a].kind = TCC_ABI_ARG_STRUCT_BYVAL;
+          descs[a].size = (uint16_t)slot_sz;
+          descs[a].alignment = (uint8_t)((align < 4) ? 4 : align);
+        }
+        else if (size == 8)
+        {
+          descs[a].kind = TCC_ABI_ARG_SCALAR64;
+          descs[a].size = 8;
+          descs[a].alignment = (uint8_t)((align < 8) ? 8 : align);
+        }
+        else
+        {
+          descs[a].kind = TCC_ABI_ARG_SCALAR32;
+          descs[a].size = 4;
+          descs[a].alignment = (uint8_t)((align < 4) ? 4 : align);
+        }
+      }
+
+      if (!eligible)
+      {
+        tcc_free(descs);
+        tcc_free(locs);
+        continue;
+      }
+
+      TCCAbiCallLayout layout = {0};
+      layout.argc = argc;
+      layout.locs = locs;
+      if (tcc_gen_machine_abi_assign_call_args(descs, argc, &layout) != 0)
+      {
+        tcc_free(descs);
+        tcc_free(locs);
+        continue;
+      }
+
+      ir->callsite_abi_layouts[cs_idx] = layout;
+      cs->args_prepared = 1;
+
+      tcc_free(descs);
+    }
+
+    /* Reserve a fixed outgoing stack args area in the function frame.
+     * Stack args will be written to [FP + call_outgoing_base + stack_off]. */
+    int max_out_stack = 0;
+    int max_out_align = 8;
+    for (int cs_idx = 0; cs_idx < ir->callsite_count; ++cs_idx)
+    {
+      const IRCallSite *cs = &ir->callsites[cs_idx];
+      if (!cs->args_prepared)
+        continue;
+      const TCCAbiCallLayout *layout = &ir->callsite_abi_layouts[cs_idx];
+      if (layout->stack_size > max_out_stack)
+        max_out_stack = layout->stack_size;
+      if (layout->stack_align > max_out_align)
+        max_out_align = layout->stack_align;
+    }
+
+    if (max_out_stack > 0)
+    {
+      int out_size = (max_out_stack + (max_out_align - 1)) & ~(max_out_align - 1);
+      /* Also keep 8-byte alignment for the overall frame. */
+      out_size = (out_size + 7) & ~7;
+      ir->call_outgoing_size = out_size;
+      /* NOTE: do NOT modify `loc` here.
+       * We reserve the outgoing area at the very bottom of the frame (at SP)
+       * right before prolog, so stack args are at call-time SP.
+       */
+      ir->call_outgoing_base = 0;
+    }
+  }
 
   THGEN_DUMP("DEBUG tcc_ir_generate_code: ind=0x%x func_ind=0x%x n=%d\n", ind, func_ind, ir->next_instruction_index);
   if (TCC_DUMP_THUMB_GEN)
@@ -5098,6 +5553,15 @@ void tcc_ir_generate_code(TCCIRState *ir)
     }
   }
 
+  /* Reserve outgoing call stack args area at the very bottom of the frame.
+   * This ensures prepared-call stack args are at call-time SP.
+   */
+  if (ir->call_outgoing_size > 0)
+  {
+    loc -= ir->call_outgoing_size;
+    ir->call_outgoing_base = loc;
+  }
+
   // generate prolog
   int stack_size = (-loc + 7) & ~7; // align to 8 bytes
   THGEN_DUMP("DEBUG prolog: loc=%d stack_size=%d\n", loc, stack_size);
@@ -5108,6 +5572,9 @@ void tcc_ir_generate_code(TCCIRState *ir)
   {
     drop_return_value = 0;
     q = &ir->instructions[i];
+
+    /* Default: no extra scratch constraints for this instruction. */
+    ir->codegen_materialize_scratch_flags = 0;
 
     /* Track current instruction for scratch register allocation */
     ir->codegen_instruction_idx = i;
@@ -5221,21 +5688,25 @@ void tcc_ir_generate_code(TCCIRState *ir)
       need_src1_value = true;
       break;
     case TCCIR_OP_FUNCPARAMVAL:
-      /* FUNCPARAM instructions are IR-only call argument markers.
-       * Backends consume arguments through the callsite table at FUNCCALL time.
-       *
-       * Still materialize src1 as a VALUE: arguments can be lvalues (including
-       * stack/struct lvalues) and must be converted to value form before they
-       * are passed.
+      /* FUNCPARAMVAL is an IR-only marker.
+       * Do not materialize here: any scratch regs acquired would be released at
+       * end-of-instruction and could not be relied on by the later FUNCCALL.
+       * Call arguments are materialized for real at FUNCCALL time.
        */
-      need_src1_value = true;
       break;
     case TCCIR_OP_FUNCCALLVAL:
       need_dest_value = true;
       /* fall through */
     case TCCIR_OP_FUNCCALLVOID:
+    {
+      int callsite_index = -1;
+      if (ir->callsite_index_by_call_instr && i >= 0 && i < ir->callsite_index_by_call_instr_size)
+        callsite_index = ir->callsite_index_by_call_instr[i];
+      if (callsite_index >= 0 && callsite_index < ir->callsite_count && ir->callsites[callsite_index].args_prepared)
+        ir->codegen_materialize_scratch_flags |= TCC_MACHINE_SCRATCH_AVOID_CALL_ARG_REGS;
       need_src1_value = true;
       break;
+    }
     case TCCIR_OP_VLA_ALLOC:
       need_src1_value = true;
       break;
@@ -5430,7 +5901,195 @@ void tcc_ir_generate_code(TCCIRState *ir)
       //   ++i; // skip next instruction
       // }
 
-      tcc_gen_machine_func_call_op(q, drop_return_value, ir, call_idx);
+      int callsite_index = -1;
+      if (ir->callsite_index_by_call_instr && call_idx >= 0 && call_idx < ir->callsite_index_by_call_instr_size)
+        callsite_index = ir->callsite_index_by_call_instr[call_idx];
+
+      IRCallSite *cs = NULL;
+      int prepared = 0;
+      if (callsite_index >= 0 && callsite_index < ir->callsite_count)
+      {
+        cs = &ir->callsites[callsite_index];
+        prepared = cs->args_prepared;
+      }
+
+      if (prepared)
+      {
+        if (!ir->callsite_abi_layouts || callsite_index >= ir->callsite_abi_layouts_size)
+          tcc_error("compiler_error: missing ABI layout for prepared callsite %d", callsite_index);
+
+        const TCCAbiCallLayout *layout = &ir->callsite_abi_layouts[callsite_index];
+        if (layout->argc != cs->argc)
+          tcc_error("compiler_error: ABI layout argc mismatch for callsite %d", callsite_index);
+        if (layout->stack_size != 0 && ir->call_outgoing_size == 0)
+          tcc_error("compiler_error: prepared call has stack args but no outgoing area");
+
+        TACQuadruple call_q = *q;
+
+        /* If indirect call target ended up in R0-R3, preserve it before filling arg regs. */
+        TCCMachineScratchRegs pinned_target = {0};
+        int pinned_in_use = 0;
+        if ((call_q.src1.r & (VT_VALMASK | VT_LVAL)) != VT_CONST && call_q.src1.pr0 >= 0 && call_q.src1.pr0 <= 3)
+        {
+          tcc_machine_acquire_scratch(&pinned_target,
+                                      TCC_MACHINE_SCRATCH_AVOID_CALL_ARG_REGS | TCC_MACHINE_SCRATCH_AVOID_PERM_SCRATCH);
+          pinned_in_use = 1;
+          SValue mv_src = call_q.src1;
+          SValue mv_dst;
+          memset(&mv_dst, 0, sizeof(mv_dst));
+          mv_dst.type = mv_src.type;
+          mv_dst.pr0 = pinned_target.regs[0];
+          mv_dst.pr1 = PREG_NONE;
+          mv_dst.r = 0;
+          mv_dst.vr = -1;
+          TACQuadruple mv = {0};
+          mv.op = TCCIR_OP_ASSIGN;
+          mv.src1 = mv_src;
+          mv.dest = mv_dst;
+          tcc_gen_machine_assign_op(&mv);
+          call_q.src1.pr0 = pinned_target.regs[0];
+        }
+
+        /* Stack args -> fixed outgoing area (FP-relative). Do this before filling R0-R3
+         * so any scratch usage cannot clobber prepared argument registers. */
+        if (layout->stack_size != 0)
+        {
+          for (int a = 0; a < cs->argc; ++a)
+          {
+            const TCCAbiArgLoc *loca = &layout->locs[a];
+            if (loca->kind != TCC_ABI_LOC_STACK)
+              continue;
+
+            const int out_off = loca->stack_off;
+            const int is_64 = (loca->size == 8);
+
+            /* Compute arg value into scratch regs, then store into outgoing area. */
+            TCCMachineScratchRegs tmp = {0};
+            tcc_machine_acquire_scratch(&tmp, TCC_MACHINE_SCRATCH_AVOID_CALL_ARG_REGS |
+                                                  TCC_MACHINE_SCRATCH_AVOID_PERM_SCRATCH |
+                                                  (is_64 ? TCC_MACHINE_SCRATCH_NEEDS_PAIR : 0));
+
+            SValue arg_sv = *tcc_ir_callsite_arg_value_ptr(ir, &cs->args[a]);
+            /* Clear any pre-allocated physical registers from linear-scan. */
+            arg_sv.pr0 = PREG_NONE;
+            arg_sv.pr1 = PREG_NONE;
+
+            const int want_deref = tcc_ir_operand_needs_dereference(&arg_sv);
+            TCCMaterializedValue mat_val = {0};
+            TCCMaterializedAddr mat_addr = {0};
+            unsigned saved_flags = ir->codegen_materialize_scratch_flags;
+            ir->codegen_materialize_scratch_flags =
+                TCC_MACHINE_SCRATCH_AVOID_CALL_ARG_REGS | TCC_MACHINE_SCRATCH_AVOID_PERM_SCRATCH;
+            if (want_deref)
+              tcc_ir_materialize_addr(ir, &arg_sv, &mat_addr);
+            else
+              tcc_ir_materialize_value(ir, &arg_sv, &mat_val);
+            ir->codegen_materialize_scratch_flags = saved_flags;
+
+            SValue dst;
+            memset(&dst, 0, sizeof(dst));
+            dst.type = arg_sv.type;
+            dst.r = 0;
+            dst.vr = -1;
+            dst.pr0 = tmp.regs[0];
+            dst.pr1 = is_64 ? tmp.regs[1] : PREG_NONE;
+
+            TACQuadruple mv = {0};
+            mv.op = want_deref ? TCCIR_OP_LOAD : TCCIR_OP_ASSIGN;
+            mv.src1 = arg_sv;
+            mv.dest = dst;
+            if (want_deref)
+              tcc_gen_machine_load_op(&mv);
+            else
+              tcc_gen_machine_assign_op(&mv);
+
+            tcc_gen_machine_store_to_sp(dst.pr0, out_off);
+            if (is_64)
+              tcc_gen_machine_store_to_sp(dst.pr1, out_off + 4);
+
+            if (want_deref)
+              tcc_ir_release_materialized_addr(&arg_sv, &mat_addr);
+            else
+              tcc_ir_release_materialized_value(&arg_sv, &mat_val);
+
+            tcc_machine_release_scratch(&tmp);
+          }
+        }
+
+        /* Reg args -> R0..R3.
+         * IMPORTANT: fill argument registers from high to low (R3..R0) to avoid
+         * clobbering when an argument value happens to live in a lower arg reg.
+         * (e.g. arg1 in R0, arg0 in R0 after literal load).
+         */
+        for (int reg = 3; reg >= 0; --reg)
+        {
+          for (int a = 0; a < cs->argc; ++a)
+          {
+            const TCCAbiArgLoc *loca = &layout->locs[a];
+            if (loca->kind != TCC_ABI_LOC_REG)
+              continue;
+            /* Only process when we hit the highest register of a multi-reg arg,
+             * since we iterate from high to low. For single-reg args, reg_base == reg.
+             * For multi-reg args, we start when reg == reg_base + reg_count - 1. */
+            int top_reg = (int)loca->reg_base + (int)loca->reg_count - 1;
+            if (reg != top_reg)
+              continue;
+
+            SValue arg_sv = *tcc_ir_callsite_arg_value_ptr(ir, &cs->args[a]);
+            /* If the VReg is allocated to an argument register (R0-R3), we need to avoid
+             * using it directly since it will be clobbered by earlier argument setup.
+             * In that case, clear pr0/pr1 to force a spill reload.
+             * If allocated to a callee-saved register (R4+), we can use it directly. */
+            if (arg_sv.pr0 >= 0 && arg_sv.pr0 <= 3)
+              arg_sv.pr0 = PREG_NONE;
+            if (arg_sv.pr1 >= 0 && arg_sv.pr1 <= 3)
+              arg_sv.pr1 = PREG_NONE;
+
+            const int want_deref = tcc_ir_operand_needs_dereference(&arg_sv);
+            TCCMaterializedValue mat_val = {0};
+            TCCMaterializedAddr mat_addr = {0};
+            unsigned saved_flags = ir->codegen_materialize_scratch_flags;
+            ir->codegen_materialize_scratch_flags =
+                TCC_MACHINE_SCRATCH_AVOID_CALL_ARG_REGS | TCC_MACHINE_SCRATCH_AVOID_PERM_SCRATCH;
+            if (want_deref)
+              tcc_ir_materialize_addr(ir, &arg_sv, &mat_addr);
+            else
+              tcc_ir_materialize_value(ir, &arg_sv, &mat_val);
+            ir->codegen_materialize_scratch_flags = saved_flags;
+
+            SValue dst;
+            memset(&dst, 0, sizeof(dst));
+            dst.type = arg_sv.type;
+            dst.r = 0;
+            dst.vr = -1;
+            dst.pr0 = loca->reg_base;
+            dst.pr1 = (loca->reg_count == 2) ? (loca->reg_base + 1) : PREG_NONE;
+
+            TACQuadruple mv = {0};
+            mv.op = want_deref ? TCCIR_OP_LOAD : TCCIR_OP_ASSIGN;
+            mv.src1 = arg_sv;
+            mv.dest = dst;
+            if (want_deref)
+              tcc_gen_machine_load_op(&mv);
+            else
+              tcc_gen_machine_assign_op(&mv);
+
+            if (want_deref)
+              tcc_ir_release_materialized_addr(&arg_sv, &mat_addr);
+            else
+              tcc_ir_release_materialized_value(&arg_sv, &mat_val);
+          }
+        }
+
+        tcc_gen_machine_func_call_op(&call_q, drop_return_value, ir, call_idx);
+
+        if (pinned_in_use)
+          tcc_machine_release_scratch(&pinned_target);
+      }
+      else
+      {
+        tcc_error("compiler_error: callsite %d not prepared (legacy path removed)", callsite_index);
+      }
       /* Restore outer call's arguments if this was a nested call */
       /* NOTE: ir_to_code_mapping[i] already set before switch - don't override here!
        * Overriding causes jumps TO this call to land at wrong address (after call). */
@@ -5445,6 +6104,21 @@ void tcc_ir_generate_code(TCCIRState *ir)
       }
       /* Clear spill cache after function call - callee may have modified memory */
       tcc_ir_spill_cache_clear(&ir->spill_cache);
+      break;
+    }
+    case TCCIR_OP_ASM_INPUT:
+    case TCCIR_OP_ASM_OUTPUT:
+      /* Marker ops only: regalloc/liveness uses them, codegen emits nothing. */
+      break;
+    case TCCIR_OP_INLINE_ASM:
+    {
+#ifdef CONFIG_TCC_ASM
+      tcc_ir_codegen_inline_asm(ir, q);
+      /* Inline asm may clobber registers/memory: treat as a full barrier. */
+      tcc_ir_spill_cache_clear(&ir->spill_cache);
+#else
+      tcc_error("inline asm not supported");
+#endif
       break;
     }
     default:
