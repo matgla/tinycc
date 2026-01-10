@@ -308,6 +308,12 @@ typedef struct TCCIRState
   int instructions_size;
   int next_instruction_index;
 
+  /* Monotonic ID for binding FUNCPARAM* instructions to their owning FUNCCALL*.
+   * Stored in TACQuadruple.aux for those ops.
+   * 0 means "legacy/unknown" and falls back to nested-scan binding.
+   */
+  int next_call_id;
+
   /* Current instruction index during code generation - used for scratch register allocation */
   int codegen_instruction_idx;
 
@@ -381,6 +387,7 @@ int tcc_ir_gvtst(TCCIRState *ir, int inv, int t);
 void tcc_ir_gen_opi(TCCIRState *ir, int op);
 void tcc_ir_gen_opf(TCCIRState *ir, int op);
 int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *dest);
+int tcc_ir_put_with_aux(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *dest, int aux);
 
 #ifdef CONFIG_TCC_ASM
 int tcc_ir_add_inline_asm(TCCIRState *ir, const char *asm_str, int asm_len, int must_subst, ASMOperand *operands,

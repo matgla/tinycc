@@ -2820,23 +2820,12 @@ void load_to_dest(SValue *dest, SValue *sv)
 
     if (v == VT_LLOCAL)
     {
-      v1.type.t = VT_PTR;
-      v1.r = VT_LOCAL | VT_LVAL;
-      /* For VT_LLOCAL parameters, the pointer is stored at the parameter location.
-       * sv->c.i contains the base parameter offset (e.g., 0 for first param).
-       * For parameters, we need to add offset_to_args to get the FP-relative offset. */
-      v1.c.i = sv->c.i;
-
-      if (sv->r & VT_PARAM)
-      {
-        v1.c.i += offset_to_args;
-      }
-
-      ScratchRegAlloc base_alloc = get_scratch_reg_with_save(0);
-      base = base_alloc.reg;
-      load(base, &v1);
-      restore_scratch_reg(&base_alloc);
-      fc = sign = 0;
+      /* VT_LLOCAL is a direct stack lvalue at FP/SP + offset.
+       * Do NOT treat it as an extra level of indirection (pointer stored on stack).
+       * The old behavior caused double-dereferences like:
+       *   ldr r0, [fp, off]; ldr rX, [r0]
+       * which breaks plain locals (e.g. loop indices) and struct-init tests.
+       */
       v = VT_LOCAL;
     }
     else if (v == VT_CONST)
@@ -3344,28 +3333,101 @@ static void thumb_emit_opcode64_imm(TACQuadruple *op, const char *ctx, ThumbData
   const uint32_t imm_low = (uint32_t)(src2_imm & 0xffffffffu);
   const uint32_t imm_high = (uint32_t)(src2_imm >> 32);
 
-  thumb_require_materialized_pair(ctx, "dest", op->dest.pr0, op->dest.pr1);
+  /* dest might not be in physical regs (e.g. lives in memory). */
+  uint32_t exclude = 0;
+  ScratchRegAlloc rd_low_alloc = {0};
+  ScratchRegAlloc rd_high_alloc = {0};
+  bool store_low = false;
+  bool store_high = false;
+  int rd_low = op->dest.pr0;
+  int rd_high = op->dest.pr1;
+  thumb_prepare_dest_pair_for_64bit_op(ctx, &op->dest, &rd_low, &rd_high, &rd_low_alloc, &rd_high_alloc, &store_low,
+                                       &store_high, &exclude);
+
+  const bool src1_is64 = is_64bit_type(op->src1.type.t);
+  const bool src2_is64 = is_64bit_type(op->src2.type.t);
+
+  /* Materialize src1. */
   const bool src1_is_imm = (op->src1.pr0 == PREG_NONE) && th_has_immediate_value(op->src1.r);
   int rn_low = op->src1.pr0;
-  int rn_high = op->src1.pr1;
+  int rn_high = (src1_is64 ? op->src1.pr1 : PREG_NONE);
+  ScratchRegAlloc rn_low_alloc = {0};
+  ScratchRegAlloc rn_high_alloc = {0};
+
   if (src1_is_imm)
   {
-    load_vt_const(op->dest.pr0, op->dest.pr1, &op->src1);
-    rn_low = op->dest.pr0;
-    rn_high = op->dest.pr1;
+    if (src1_is64)
+    {
+      load_vt_const(rd_low, rd_high, &op->src1);
+      rn_low = rd_low;
+      rn_high = rd_high;
+    }
+    else
+    {
+      load_to_reg(rd_low, PREG_NONE, &op->src1);
+      rn_low = rd_low;
+      rn_high = PREG_NONE;
+    }
+  }
+  else if (thumb_is_hw_reg(rn_low) && (!src1_is64 || (rn_high != PREG_NONE && thumb_is_hw_reg(rn_high))))
+  {
+    thumb_require_materialized_reg(ctx, "src1.low", rn_low);
+    if (src1_is64 && rn_high != PREG_NONE)
+      thumb_ensure_not_spilled(ctx, "src1.high", rn_high);
+    exclude |= (1u << rn_low);
+    if (src1_is64 && rn_high != PREG_NONE)
+      exclude |= (1u << rn_high);
   }
   else
   {
-    thumb_require_materialized_reg(ctx, "src1.low", op->src1.pr0);
-    thumb_ensure_not_spilled(ctx, "src1.high", op->src1.pr1);
+    rn_low_alloc = get_scratch_reg_with_save(exclude);
+    rn_low = rn_low_alloc.reg;
+    exclude |= (1u << rn_low);
+    if (src1_is64)
+    {
+      rn_high_alloc = get_scratch_reg_with_save(exclude);
+      rn_high = rn_high_alloc.reg;
+      exclude |= (1u << rn_high);
+      load_to_reg(rn_low, rn_high, &op->src1);
+    }
+    else
+    {
+      rn_high = PREG_NONE;
+      load_to_reg(rn_low, PREG_NONE, &op->src1);
+    }
   }
 
+  /* Materialize src2 (if not immediate). */
   int rm_low = op->src2.pr0;
-  int rm_high = op->src2.pr1;
+  int rm_high = (src2_is64 ? op->src2.pr1 : PREG_NONE);
+  ScratchRegAlloc rm_low_alloc = {0};
+  ScratchRegAlloc rm_high_alloc = {0};
   if (!src2_is_imm)
   {
-    thumb_require_materialized_reg(ctx, "src2.low", rm_low);
-    thumb_ensure_not_spilled(ctx, "src2.high", rm_high);
+    if (thumb_is_hw_reg(rm_low) && (!src2_is64 || (rm_high != PREG_NONE && thumb_is_hw_reg(rm_high))))
+    {
+      thumb_require_materialized_reg(ctx, "src2.low", rm_low);
+      if (src2_is64 && rm_high != PREG_NONE)
+        thumb_ensure_not_spilled(ctx, "src2.high", rm_high);
+    }
+    else
+    {
+      rm_low_alloc = get_scratch_reg_with_save(exclude);
+      rm_low = rm_low_alloc.reg;
+      exclude |= (1u << rm_low);
+      if (src2_is64)
+      {
+        rm_high_alloc = get_scratch_reg_with_save(exclude);
+        rm_high = rm_high_alloc.reg;
+        exclude |= (1u << rm_high);
+        load_to_reg(rm_low, rm_high, &op->src2);
+      }
+      else
+      {
+        rm_high = PREG_NONE;
+        load_to_reg(rm_low, PREG_NONE, &op->src2);
+      }
+    }
   }
   else
   {
@@ -3373,50 +3435,53 @@ static void thumb_emit_opcode64_imm(TACQuadruple *op, const char *ctx, ThumbData
     rm_high = PREG_NONE;
   }
 
+  /* Low word sets carry/flags for the high word. */
   if (src2_is_imm)
-  {
-    thumb_emit_op_imm_fallback(op->dest.pr0, rn_low, imm_low, FLAGS_BEHAVIOUR_SET, regular);
-  }
+    thumb_emit_op_imm_fallback(rd_low, rn_low, imm_low, FLAGS_BEHAVIOUR_SET, regular);
   else
-  {
-    ot_check(regular.reg_handler(op->dest.pr0, rn_low, rm_low, FLAGS_BEHAVIOUR_SET, THUMB_SHIFT_DEFAULT,
-                                 ENFORCE_ENCODING_NONE));
-  }
+    ot_check(
+        regular.reg_handler(rd_low, rn_low, rm_low, FLAGS_BEHAVIOUR_SET, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
 
   if (src2_is_imm)
   {
     if (rn_high != PREG_NONE)
     {
-      ot_check(
-          carry.imm_handler(op->dest.pr1, rn_high, imm_high, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+      ot_check(carry.imm_handler(rd_high, rn_high, imm_high, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
     }
     else
     {
-      ot_check(th_mov_imm(op->dest.pr1, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
-      ot_check(carry.imm_handler(op->dest.pr1, op->dest.pr1, imm_high, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                                 ENFORCE_ENCODING_NONE));
+      ot_check(th_mov_imm(rd_high, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+      ot_check(carry.imm_handler(rd_high, rd_high, imm_high, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
     }
   }
   else if (rn_high != PREG_NONE && rm_high != PREG_NONE)
   {
-    ot_check(carry.reg_handler(op->dest.pr1, rn_high, rm_high, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+    ot_check(carry.reg_handler(rd_high, rn_high, rm_high, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
                                ENFORCE_ENCODING_NONE));
   }
   else if (rn_high != PREG_NONE)
   {
-    ot_check(carry.imm_handler(op->dest.pr1, rn_high, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    ot_check(carry.imm_handler(rd_high, rn_high, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
   }
   else if (rm_high != PREG_NONE)
   {
-    ot_check(th_mov_imm(op->dest.pr1, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
-    ot_check(carry.reg_handler(op->dest.pr1, op->dest.pr1, rm_high, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+    ot_check(th_mov_imm(rd_high, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    ot_check(carry.reg_handler(rd_high, rd_high, rm_high, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
                                ENFORCE_ENCODING_NONE));
   }
   else
   {
-    ot_check(th_mov_imm(op->dest.pr1, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
-    ot_check(carry.imm_handler(op->dest.pr1, op->dest.pr1, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    ot_check(th_mov_imm(rd_high, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    ot_check(carry.imm_handler(rd_high, rd_high, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
   }
+
+  thumb_store_dest_pair_if_needed(&op->dest, rd_low, rd_high, store_low, store_high);
+  restore_scratch_reg(&rm_high_alloc);
+  restore_scratch_reg(&rm_low_alloc);
+  restore_scratch_reg(&rn_high_alloc);
+  restore_scratch_reg(&rn_low_alloc);
+  restore_scratch_reg(&rd_high_alloc);
+  restore_scratch_reg(&rd_low_alloc);
 }
 
 typedef uint64_t (*thumb_u64_fold_t)(uint64_t lhs, uint64_t rhs);
@@ -5132,9 +5197,13 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
       }
     }
 
-    /* Execute collected register moves with cycle breaking.
-     * Greedy algorithm: emit moves whose source is not a destination; if only
-     * cycles remain, spill one source into a temp register and continue.
+    /* Execute collected register moves as a true parallel move.
+     *
+     * - Emit any move whose source is not a destination.
+     * - If only cycles remain, rotate a cycle using a temporary register.
+     *
+     * This is required for correct swaps like (r1<-r2, r2<-r1) without
+     * clobbering one of the incoming argument registers.
      */
     while (move_count > 0)
     {
@@ -5145,11 +5214,13 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
           dst_mask |= (1u << moves[i].dst);
       }
 
+      /* First: emit all acyclic moves. */
       int progressed = 0;
       for (int i = 0; i < move_count; ++i)
       {
         const int dst = moves[i].dst;
         const int src = moves[i].src;
+
         if (dst == src)
         {
           moves[i] = moves[--move_count];
@@ -5157,8 +5228,9 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
           progressed = 1;
           continue;
         }
+
         if (src >= 0 && src < 32 && (dst_mask & (1u << src)))
-          continue; /* src will be overwritten later */
+          continue; /* src is still needed as a destination somewhere */
 
         ot_check(
             th_mov_reg(dst, src, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
@@ -5166,15 +5238,13 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
         --i;
         progressed = 1;
       }
-
       if (progressed)
         continue;
 
-      /* Cycle: break it using a temporary register (prefer IP). */
+      /* Cycle: rotate it using a temporary register (prefer IP). */
       int temp = R_IP;
       if (dst_mask & (1u << temp))
       {
-        /* Find any non-destination temp among allocatable regs. */
         for (int r = R4; r <= R11; ++r)
         {
           if (!(dst_mask & (1u << r)))
@@ -5184,12 +5254,49 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
           }
         }
       }
+      if (dst_mask & (1u << temp))
+      {
+        tcc_error("compiler_error: prolog param shuffle has no temp register");
+      }
 
-      /* Save the source of the first move into temp, then rewrite that move
-       * to read from temp; this makes it schedulable in the next iteration. */
-      ot_check(th_mov_reg(temp, moves[0].src, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE,
-                          false));
-      moves[0].src = temp;
+      /* Pick any destination in the remaining cycle, save its original value,
+       * then walk dst<-src edges until we return to the start.
+       */
+      const int start = moves[0].dst;
+      ot_check(
+          th_mov_reg(temp, start, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
+
+      int cur = start;
+      for (;;)
+      {
+        int idx = -1;
+        for (int i = 0; i < move_count; ++i)
+        {
+          if (moves[i].dst == cur)
+          {
+            idx = i;
+            break;
+          }
+        }
+        if (idx < 0)
+        {
+          tcc_error("compiler_error: broken prolog param shuffle cycle");
+        }
+
+        const int src = moves[idx].src;
+        moves[idx] = moves[--move_count];
+
+        if (src == start)
+        {
+          ot_check(
+              th_mov_reg(cur, temp, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
+          break;
+        }
+
+        ot_check(
+            th_mov_reg(cur, src, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
+        cur = src;
+      }
     }
 
     tcc_free(moves);

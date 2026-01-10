@@ -2372,20 +2372,21 @@ static void gen_opl(int op)
     {
       SValue param_num;
       SValue dest;
+      const int call_id = tcc_state->ir ? tcc_state->ir->next_call_id++ : 0;
       memset(&param_num, 0, sizeof(SValue));
       param_num.vr = -1;
       /* Generate FUNCPARAMVAL for arg1 (param 1) */
       param_num.c.i = 0;
-      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &param_num, NULL);
+      tcc_ir_put_with_aux(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &param_num, NULL, call_id);
       /* Generate FUNCPARAMVAL for arg2 (param 2) */
       param_num.c.i = 1;
-      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[0], &param_num, NULL);
+      tcc_ir_put_with_aux(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[0], &param_num, NULL, call_id);
       /* Generate FUNCCALLVAL for the function call (returns long long) */
       memset(&dest, 0, sizeof(SValue));
       dest.type.t = VT_LLONG;
       dest.r = 0;
       dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[-2], NULL, &dest);
+      tcc_ir_put_with_aux(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[-2], NULL, &dest, call_id);
       /* Pop all 3 values (arg1, arg2, func) and push result */
       vtop -= 3;
       vpushi(0);
@@ -2608,20 +2609,21 @@ static void gen_opl(int op)
       {
         SValue param_num;
         SValue dest;
+        const int call_id = tcc_state->ir ? tcc_state->ir->next_call_id++ : 0;
         memset(&param_num, 0, sizeof(SValue));
         param_num.vr = -1;
         /* Generate FUNCPARAMVAL for arg1 (param 1) */
         param_num.c.i = 0;
-        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &param_num, NULL);
+        tcc_ir_put_with_aux(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &param_num, NULL, call_id);
         /* Generate FUNCPARAMVAL for arg2 (param 2) */
         param_num.c.i = 1;
-        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[0], &param_num, NULL);
+        tcc_ir_put_with_aux(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[0], &param_num, NULL, call_id);
         /* Generate FUNCCALLVAL for the function call (returns int: -1, 0, or 1) */
         memset(&dest, 0, sizeof(SValue));
         dest.type.t = VT_INT;
         dest.r = 0;
         dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[-2], NULL, &dest);
+        tcc_ir_put_with_aux(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[-2], NULL, &dest, call_id);
         /* Pop all 3 values (arg1, arg2, func) and push result */
         vtop -= 3;
         vpushi(0);
@@ -4380,18 +4382,19 @@ ST_FUNC void vstore(void)
         /* Stack is now: dest_lval, dest_ptr, src_ptr, size, func
          * IR uses 0-based parameter indices. */
         SValue param_num;
+        const int call_id = tcc_state->ir ? tcc_state->ir->next_call_id++ : 0;
         memset(&param_num, 0, sizeof(SValue));
         param_num.vr = -1;
 
         /* memmove(dest, src, size) */
         param_num.c.i = 0;
-        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-3], &param_num, NULL);
+        tcc_ir_put_with_aux(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-3], &param_num, NULL, call_id);
         param_num.c.i = 1;
-        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-2], &param_num, NULL);
+        tcc_ir_put_with_aux(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-2], &param_num, NULL, call_id);
         param_num.c.i = 2;
-        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &param_num, NULL);
+        tcc_ir_put_with_aux(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &param_num, NULL, call_id);
 
-        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[0], NULL, NULL);
+        tcc_ir_put_with_aux(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[0], NULL, NULL, call_id);
         /* Pop func + 3 args; keep the saved destination lvalue as result */
         vtop -= 4;
       }
@@ -7215,6 +7218,14 @@ tok_next:
       /* get return type */
       s = vtop->type.ref;
       next();
+
+      /* Each IR-level call gets a unique call_id so FUNCPARAM* can be bound
+       * without fragile nested-depth scanning. Stored in TACQuadruple.aux.
+       */
+      int call_id = 0;
+      if (!NOEVAL_WANTED && tcc_state->ir)
+        call_id = tcc_state->ir->next_call_id++;
+
       sa = s->next; /* first parameter */
       nb_args = regsize = 0;
       ret.r2 = VT_CONST;
@@ -7267,7 +7278,7 @@ tok_next:
               memset(&num, 0, sizeof(SValue));
               num.vr = -1;
               num.c.i = 0;
-              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL);
+              tcc_ir_put_with_aux(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL, call_id);
             }
             vtop--;
             nb_args++;
@@ -7312,12 +7323,9 @@ tok_next:
             if (!NOEVAL_WANTED)
               tcc_ir_generate_cmp_jmp_set(tcc_state->ir);
             gfunc_param_typed(s, sa);
-            if (nb_args < 4)
-            {
-              if (!NOEVAL_WANTED)
-                tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL);
-              vtop--;
-            }
+            if (!NOEVAL_WANTED)
+              tcc_ir_put_with_aux(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL, call_id);
+            vtop--; /* consumed */
           }
           nb_args++;
           if (sa)
@@ -7343,27 +7351,24 @@ tok_next:
           begin_macro(p, 1), next();
           expr_eq();
           gfunc_param_typed(s, sa);
+          /* We evaluate right-to-left; assign 0-based parameter indices
+           * corresponding to original left-to-right argument positions.
+           */
+          if (!NOEVAL_WANTED)
+          {
+            SValue num;
+            memset(&num, 0, sizeof(SValue));
+            num.vr = -1;
+            num.c.i = nb_args - 1 - n;
+            tcc_ir_put_with_aux(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL, call_id);
+          }
+          vtop--; /* consumed */
           end_macro();
         }
-        vrev(n);
       }
 
       next();
       // gfunc_call(nb_args);
-      SValue num;
-      num.vr = -1;
-      if (nb_args > 4)
-      {
-        for (int j = 0; j < nb_args - 4; j++)
-        {
-          /* 0-based parameter index for remaining (stack) arguments.
-           * vtop iterates from the last argument downward. */
-          num.c.i = nb_args - j - 1;
-          if (!NOEVAL_WANTED)
-            tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL);
-          vtop--;
-        }
-      }
 
       int return_vreg = -1;
       if (NOEVAL_WANTED)
@@ -7380,7 +7385,7 @@ tok_next:
          * NOTE: We check s->type.t (the function's return type), not vtop->type.t
          * (which is VT_FUNC for function pointers). */
         tcc_ir_load_if_lvalue(tcc_state->ir, vtop);
-        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, vtop, NULL, NULL);
+        tcc_ir_put_with_aux(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, vtop, NULL, NULL, call_id);
         --vtop;
       }
       else
@@ -7389,7 +7394,7 @@ tok_next:
         memset(&dest, 0, sizeof(SValue));
         if (nb_args == 0)
         {
-          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVOID, NULL, NULL, NULL);
+          tcc_ir_put_with_aux(tcc_state->ir, TCCIR_OP_FUNCPARAMVOID, NULL, NULL, NULL, call_id);
         }
         // perhaps this should be a correct type :(
         dest.type.t = VT_INT;
@@ -7399,7 +7404,7 @@ tok_next:
 
         /* See comment above: materialize call target value for indirect calls. */
         tcc_ir_load_if_lvalue(tcc_state->ir, vtop);
-        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, vtop, NULL, &dest);
+        tcc_ir_put_with_aux(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, vtop, NULL, &dest, call_id);
         --vtop;
       }
 
@@ -8297,11 +8302,12 @@ static void try_call_scope_cleanup(Sym *stop)
     gaddrof();
     // gfunc_call(1);
     SValue src1;
+    const int call_id = tcc_state->ir ? tcc_state->ir->next_call_id++ : 0;
     memset(&src1, 0, sizeof(SValue));
     src1.vr = -1;
     src1.c.i = 0;
-    tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &src1, NULL);
-    tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[-1], NULL, NULL);
+    tcc_ir_put_with_aux(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &src1, NULL, call_id);
+    tcc_ir_put_with_aux(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[-1], NULL, NULL, call_id);
     vtop -= 2;
   }
 }
@@ -9090,22 +9096,23 @@ static void init_putz(init_params *p, unsigned long c, int size)
 
     memset(&src1, 0, sizeof(SValue));
     src1.vr = -1;
+    const int call_id = tcc_state->ir ? tcc_state->ir->next_call_id++ : 0;
     /* __aeabi_memset(dest, n, c) on ARM EABI; memset(dest, c, n) elsewhere.
      * TOK_memset maps to __aeabi_memset when TCC_ARM_EABI is defined.
      * Stack is: dest, c, n */
     src1.c.i = 0;
-    tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-2], &src1, NULL);
+    tcc_ir_put_with_aux(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-2], &src1, NULL, call_id);
     src1.c.i = 2;
-    tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &src1, NULL);
+    tcc_ir_put_with_aux(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &src1, NULL, call_id);
     src1.c.i = 1;
-    tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[0], &src1, NULL);
+    tcc_ir_put_with_aux(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[0], &src1, NULL, call_id);
 
     vpush_helper_func(TOK_memset);
     memset(&dest, 0, sizeof(SValue));
     dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
     dest.type.t = vtop[-3].type.t;
     dest.r = 0;
-    tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[0], NULL, &dest);
+    tcc_ir_put_with_aux(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[0], NULL, &dest, call_id);
     vtop -= 4;
 
     // vtop -= 4;

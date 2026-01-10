@@ -66,7 +66,13 @@ def compile_testcase(test_file, machine, compiler=f"{CURRENT_DIR}/../../armv8m-t
 
 def prepare_test(machine, kernel_file, args=None):
     qemu_command = build_qemu_command(machine, kernel_file, args)
-    return pexpect.spawn(qemu_command)
+    # Use a wide pseudo-terminal so long lines (e.g. separators) aren't wrapped.
+    # Wrapped lines confuse the pytest pexpect-based matcher and lead to EOF mismatches
+    # even when the program output is correct.
+    sut = pexpect.spawn(qemu_command)
+    # rows, cols
+    sut.setwinsize(200, 1000)
+    return sut
 
 def run_test(test_file, machine, args=None):
     primary = _primary_file(test_file)

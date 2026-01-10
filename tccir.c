@@ -411,6 +411,7 @@ TCCIRState *tcc_ir_allocate_block()
   block->orig_ir_to_code_mapping_size = 0;
 
   block->next_instruction_index = 0;
+  block->next_call_id = 1;
 
   block->leaffunc = 1;
   block->processing_if = 0;
@@ -446,6 +447,14 @@ TCCIRState *tcc_ir_allocate_block()
   block->inline_asm_capacity = 0;
 #endif
   return block;
+}
+
+int tcc_ir_put_with_aux(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *dest, int aux)
+{
+  const int idx = tcc_ir_put(ir, op, src1, src2, dest);
+  if (idx >= 0 && idx < ir->next_instruction_index)
+    ir->instructions[idx].aux = aux;
+  return idx;
 }
 
 static void tcc_ir_callsites_clear(TCCIRState *ir)
@@ -693,61 +702,99 @@ void tcc_ir_build_callsites(TCCIRState *ir)
     if (call->op != TCCIR_OP_FUNCCALLVAL && call->op != TCCIR_OP_FUNCCALLVOID)
       continue;
 
+    const int call_id = call->aux;
+
     int pairs_cap = 8;
     int pairs_count = 0;
     int *param_nums = tcc_malloc(sizeof(int) * pairs_cap);
     int *param_instrs = tcc_malloc(sizeof(int) * pairs_cap);
 
-    int nested_call_depth = 0;
-
-    for (int i = call_idx - 1; i >= 0; --i)
+    if (call_id > 0)
     {
-      TACQuadruple *q = &ir->instructions[i];
-
-      if (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID)
+      /* Preferred binding: explicit call_id stored in q->aux.
+       * This makes nested calls trivial because each call has its own ID.
+       */
+      for (int i = call_idx - 1; i >= 0; --i)
       {
-        /* If we haven't seen any params for this call, treat a previous call
-         * as a boundary (covers 0-arg calls without FUNCPARAMVOID).
-         * Otherwise, this is a nested (inner) call and we must skip its params.
-         */
-        if (nested_call_depth == 0 && pairs_count == 0)
-          break;
-        nested_call_depth++;
-        continue;
-      }
-
-      if (q->op == TCCIR_OP_FUNCPARAMVAL)
-      {
-        const int param_num = q->src2.c.i; /* 0-based */
-        if (nested_call_depth > 0)
+        TACQuadruple *q = &ir->instructions[i];
+        if (q->aux != call_id)
+          continue;
+        if (q->op == TCCIR_OP_FUNCPARAMVAL)
         {
+          const int param_num = (int)(q->src2.c.i & 0xFFFFFFFFu); /* 0-based */
+          if (pairs_count >= pairs_cap)
+          {
+            pairs_cap *= 2;
+            param_nums = tcc_realloc(param_nums, sizeof(int) * pairs_cap);
+            param_instrs = tcc_realloc(param_instrs, sizeof(int) * pairs_cap);
+          }
+          param_nums[pairs_count] = param_num;
+          param_instrs[pairs_count] = i;
+          pairs_count++;
           if (param_num == 0)
-            nested_call_depth--;
-          continue;
+            break;
         }
-
-        if (pairs_count >= pairs_cap)
+        else if (q->op == TCCIR_OP_FUNCPARAMVOID)
         {
-          pairs_cap *= 2;
-          param_nums = tcc_realloc(param_nums, sizeof(int) * pairs_cap);
-          param_instrs = tcc_realloc(param_instrs, sizeof(int) * pairs_cap);
-        }
-        param_nums[pairs_count] = param_num;
-        param_instrs[pairs_count] = i;
-        pairs_count++;
-        if (param_num == 0)
+          /* 0-arg call marker */
           break;
-        continue;
+        }
       }
+    }
+    else
+    {
+      /* Legacy binding: nested-depth scan over param_num==0 boundaries. */
+      int nested_call_depth = 0;
 
-      if (q->op == TCCIR_OP_FUNCPARAMVOID)
+      for (int i = call_idx - 1; i >= 0; --i)
       {
-        if (nested_call_depth > 0)
+        TACQuadruple *q = &ir->instructions[i];
+
+        if (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID)
         {
-          nested_call_depth--;
+          /* If we haven't seen any params for this call, treat a previous call
+           * as a boundary (covers 0-arg calls without FUNCPARAMVOID).
+           * Otherwise, this is a nested (inner) call and we must skip its params.
+           */
+          if (nested_call_depth == 0 && pairs_count == 0)
+            break;
+          nested_call_depth++;
           continue;
         }
-        break;
+
+        if (q->op == TCCIR_OP_FUNCPARAMVAL)
+        {
+          const int param_num = (int)(q->src2.c.i & 0xFFFFFFFFu); /* 0-based */
+          if (nested_call_depth > 0)
+          {
+            if (param_num == 0)
+              nested_call_depth--;
+            continue;
+          }
+
+          if (pairs_count >= pairs_cap)
+          {
+            pairs_cap *= 2;
+            param_nums = tcc_realloc(param_nums, sizeof(int) * pairs_cap);
+            param_instrs = tcc_realloc(param_instrs, sizeof(int) * pairs_cap);
+          }
+          param_nums[pairs_count] = param_num;
+          param_instrs[pairs_count] = i;
+          pairs_count++;
+          if (param_num == 0)
+            break;
+          continue;
+        }
+
+        if (q->op == TCCIR_OP_FUNCPARAMVOID)
+        {
+          if (nested_call_depth > 0)
+          {
+            nested_call_depth--;
+            continue;
+          }
+          break;
+        }
       }
     }
 
@@ -827,6 +874,14 @@ void tcc_ir_build_callsites(TCCIRState *ir)
          * can collapse onto the same stack slot.
          */
         const int extra_off = arg->c.i;
+
+        /* Do not fold PARAM vregs into concrete stack lvalues.
+         * Parameters may be materialized specially (e.g. from incoming regs), and
+         * rewriting them to a fixed stack slot can alias the saved-register area
+         * (e.g. vfunc(int a) -> reads saved IP instead of 'a').
+         */
+        if (TCCIR_DECODE_VREG_TYPE(arg->vr) == TCCIR_VREG_TYPE_PARAM)
+          continue;
 
         int kind = 0;
         int off = 0;
@@ -1295,12 +1350,19 @@ void tcc_ir_load_if_lvalue(TCCIRState *ir, SValue *sv)
       return;
     }
 
+    /* LOAD expects an address value in src1; the VT_LVAL flag on `sv` means
+     * "this is an lvalue" (stack slot / pointer-deref). Pass the address to
+     * LOAD (clear VT_LVAL) to avoid double-dereference in later codegen.
+     */
+    SValue load_addr = *sv;
+    load_addr.r &= ~VT_LVAL;
+
     SValue load_dest;
     load_dest.type = sv->type;
     load_dest.vr = tcc_ir_get_vreg_temp(ir);
     load_dest.r = 0;
     load_dest.c.i = 0;
-    tcc_ir_put(ir, TCCIR_OP_LOAD, sv, NULL, &load_dest);
+    tcc_ir_put(ir, TCCIR_OP_LOAD, &load_addr, NULL, &load_dest);
     sv->vr = load_dest.vr;
     sv->r = 0; /* no longer an lvalue */
   }
@@ -2212,12 +2274,34 @@ void tcc_ir_liveness_analysis(TCCIRState *ir)
       if (!tcc_ir_vreg_is_call_argument(ir, vreg_encoded, end))
         end--; /* Do not include call instruction itself */
     }
-    crosses_call = tcc_ir_has_call_in_range(ir, start, end);
+    /* Parameters are live at function entry *before* IR instruction 0.
+     * So a call at IR[0] must be treated as crossing for parameters, unlike
+     * temporaries/locals where start marks a definition point.
+     *
+     * We intentionally scan calls in [0, end) (excluding end, which may be a
+     * last-use-at-call position).
+     */
+    crosses_call = 0;
+    for (int i = 0; i < end && i < ir->next_instruction_index; ++i)
+    {
+      const TccIrOp op = ir->instructions[i].op;
+      if (op == TCCIR_OP_FUNCCALLVOID || op == TCCIR_OP_FUNCCALLVAL)
+      {
+        crosses_call = 1;
+        break;
+      }
+    }
     addrtaken = interval->addrtaken;
     reg_type = tcc_ir_get_reg_type(ir, vreg_encoded);
-    /* Pre-color parameters to their ABI registers (R0-R3 for first 4 params).
-     * Parameters beyond 4 come on the stack and get -1. */
-    int precolored = (vreg < 4) ? vreg : -1;
+    /* Pre-color parameters to their ABI registers (R0-R3 for first 4 params)
+     * only if they do NOT cross a call.
+     *
+     * If a parameter is live across a call, it must not remain in caller-saved
+     * R0-R3. Leave it un-precolored so the allocator can place it in a
+     * callee-saved register (or spill). The prolog still knows the incoming
+     * ABI register via incoming_reg0/1 and will copy it accordingly.
+     */
+    int precolored = (vreg < 4 && !crosses_call) ? vreg : -1;
     tcc_ls_add_live_interval(&ir->ls, vreg_encoded, start, end, crosses_call, addrtaken, reg_type, interval->is_lvalue,
                              precolored);
   }
@@ -2484,13 +2568,21 @@ void tcc_ir_materialize_value(TCCIRState *ir, SValue *sv, TCCMaterializedValue *
   }
 
   int preserved_flags = sv->r & ~VT_VALMASK;
-  /* Preserve VT_LVAL for spilled operands.
+  /* The spill slot stores the vreg's VALUE.
    *
-   * The spill slot stores the vreg's VALUE. For uses that require
-   * dereference (e.g. FUNCPARAMVAL with ***DEREF***), VT_LVAL is carried on
-   * the use-site operand, not on the defining vreg; if we clear VT_LVAL here,
-   * we silently turn a required load-through-pointer into a raw pointer value.
+   * Important distinction:
+   * - VT_LVAL on a normal (non-VT_LOCAL) operand means "load through pointer" and
+   *   must be preserved.
+   * - VT_LVAL on VT_LOCAL/VT_LLOCAL means "load from stack slot". Once we've
+   *   loaded the spill slot into a register, that flag must be cleared, otherwise
+   *   downstream code will incorrectly dereference the loaded value as an address
+   *   (double-deref), e.g. treating an int loop index as int*.
    */
+  {
+    const int orig_kind = original_r & VT_VALMASK;
+    if (orig_kind == VT_LOCAL || orig_kind == VT_LLOCAL)
+      preserved_flags &= ~VT_LVAL;
+  }
 
   sv->pr0 = scratch.regs[0];
   sv->pr1 = is_64bit ? scratch.regs[1] : PREG_NONE;
@@ -2835,8 +2927,6 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
   int old_r = sv->r;
   int old_v = old_r & VT_VALMASK;
 
-  fprintf(stderr, "[FILL_REGS] vr=%d old_r=0x%x old_v=0x%x c.i=%ld\n", sv->vr, old_r, old_v, (long)sv->c.i);
-
   /* VT_LOCAL/VT_LLOCAL operands can mean either:
    * - a concrete stack slot (vr == -1), e.g. VLA save slots, or
    * - a logical local tracked as a vreg by the IR (vr != -1).
@@ -2868,8 +2958,6 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
     if (TCCIR_DECODE_VREG_TYPE(sv->vr) == TCCIR_VREG_TYPE_PARAM && interval && interval->incoming_reg0 < 0 &&
         interval->allocation.r0 == PREG_NONE && interval->allocation.offset == 0)
     {
-      fprintf(stderr, "[FILL_REGS] -> stack-passed param path: vr=%d original_offset=%d\n", sv->vr,
-              interval->original_offset);
       sv->pr0 = PREG_NONE;
       sv->pr1 = PREG_NONE;
       sv->c.i = interval->original_offset;
@@ -2879,8 +2967,6 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
         need_lval = VT_LVAL;
 
       sv->r = VT_LOCAL | need_lval | VT_PARAM;
-      fprintf(stderr, "[FILL_REGS] -> after: r=0x%x c.i=%ld VT_PARAM=%d VT_LVAL=%d\n", sv->r, (long)sv->c.i,
-              (sv->r & VT_PARAM) ? 1 : 0, (sv->r & VT_LVAL) ? 1 : 0);
       return;
     }
 
@@ -2927,15 +3013,11 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
         need_lval = VT_LVAL;
       }
       sv->r = VT_LOCAL | need_lval;
-      fprintf(stderr, "[FILL_REGS] -> spilled path: vr=%d r0=%d offset=%d final r=0x%x\n", sv->vr,
-              interval->allocation.r0, interval->allocation.offset, sv->r);
     }
     else if (interval->allocation.r0 != PREG_NONE)
     {
       /* In a register - set r to the register number, preserving VT_LVAL only for pointer derefs */
       sv->r = interval->allocation.r0 | preserve_lval;
-      fprintf(stderr, "[FILL_REGS] -> register path: vr=%d r0=%d pr0=%d final r=0x%x\n", sv->vr,
-              interval->allocation.r0, sv->pr0, sv->r);
     }
   }
   else if ((sv->vr == -1 || sv->vr == 0 || TCCIR_DECODE_VREG_TYPE(sv->vr) == 0) &&
@@ -5046,6 +5128,7 @@ void tcc_ir_put_soft_call(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2
 {
   SValue param;
   Sym *sym;
+  const int call_id = ir ? ir->next_call_id++ : 0;
   TACQuadruple q = {
       .op = op,
   };
@@ -5073,12 +5156,12 @@ void tcc_ir_put_soft_call(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2
   if (irop_config[q.op].has_src1)
   {
     param.c.i = 0;
-    tcc_ir_put(ir, TCCIR_OP_FUNCPARAMVAL, src1, &param, NULL);
+    tcc_ir_put_with_aux(ir, TCCIR_OP_FUNCPARAMVAL, src1, &param, NULL, call_id);
   }
   if (irop_config[q.op].has_src2)
   {
     param.c.i = 1;
-    tcc_ir_put(ir, TCCIR_OP_FUNCPARAMVAL, src2, &param, NULL);
+    tcc_ir_put_with_aux(ir, TCCIR_OP_FUNCPARAMVAL, src2, &param, NULL, call_id);
   }
   sym = external_global_sym(tok_alloc_const(func_name), &func_old_type);
   param.r = VT_CONST | VT_SYM;
@@ -5087,11 +5170,11 @@ void tcc_ir_put_soft_call(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2
 
   if (irop_config[q.op].has_dest)
   {
-    tcc_ir_put(ir, TCCIR_OP_FUNCCALLVAL, &param, NULL, dest);
+    tcc_ir_put_with_aux(ir, TCCIR_OP_FUNCCALLVAL, &param, NULL, dest, call_id);
   }
   else
   {
-    tcc_ir_put(ir, TCCIR_OP_FUNCCALLVOID, &param, NULL, NULL);
+    tcc_ir_put_with_aux(ir, TCCIR_OP_FUNCCALLVOID, &param, NULL, NULL, call_id);
   }
 }
 
@@ -5970,9 +6053,13 @@ void tcc_ir_generate_code(TCCIRState *ir)
                                                   (is_64 ? TCC_MACHINE_SCRATCH_NEEDS_PAIR : 0));
 
             SValue arg_sv = *tcc_ir_callsite_arg_value_ptr(ir, &cs->args[a]);
-            /* Clear any pre-allocated physical registers from linear-scan. */
-            arg_sv.pr0 = PREG_NONE;
-            arg_sv.pr1 = PREG_NONE;
+            /* Do NOT blindly clear pr0/pr1 here.
+             * For stack-passed call arguments it is common that the source value
+             * currently lives in R0-R3 (e.g. the 4th user argument to printf).
+             * Clearing pr0/pr1 can force materialization to fall back to a bogus
+             * stack reload (often from offset 0), aliasing the saved-register area
+             * and corrupting variadic calls.
+             */
 
             const int want_deref = tcc_ir_operand_needs_dereference(&arg_sv);
             TCCMaterializedValue mat_val = {0};
@@ -6036,14 +6123,14 @@ void tcc_ir_generate_code(TCCIRState *ir)
               continue;
 
             SValue arg_sv = *tcc_ir_callsite_arg_value_ptr(ir, &cs->args[a]);
-            /* If the VReg is allocated to an argument register (R0-R3), we need to avoid
-             * using it directly since it will be clobbered by earlier argument setup.
-             * In that case, clear pr0/pr1 to force a spill reload.
-             * If allocated to a callee-saved register (R4+), we can use it directly. */
-            if (arg_sv.pr0 >= 0 && arg_sv.pr0 <= 3)
-              arg_sv.pr0 = PREG_NONE;
-            if (arg_sv.pr1 >= 0 && arg_sv.pr1 <= 3)
-              arg_sv.pr1 = PREG_NONE;
+            /* Do NOT blindly clear pr0/pr1 for values currently in R0-R3.
+             * That can force a bogus “spill reload” from offset 0, which is not
+             * a valid spill slot and may alias the function’s saved-register area
+             * (e.g. vfunc printing saved IP instead of its parameter).
+             *
+             * We already fill argument registers from high to low (R3..R0), which
+             * avoids the common clobber hazard for sources living in lower regs.
+             */
 
             const int want_deref = tcc_ir_operand_needs_dereference(&arg_sv);
             TCCMaterializedValue mat_val = {0};
@@ -6862,15 +6949,12 @@ static bool tcc_ir_operand_needs_dereference(SValue *sv)
   case VT_JMPI:
     return false;
   case VT_LOCAL:
-    /* VT_LOCAL with VT_LVAL normally means "load from stack slot", no dereference.
-     * BUT if pr0 is a valid register (not PREG_NONE, not PREG_SPILLED, and a valid
-     * register number < PREG_SPILLED), it means this was a spilled pointer vreg
-     * that got preloaded - the address is now in pr0 and we need to dereference
-     * it to get the actual data. */
-    if ((sv->r & VT_LVAL) && sv->pr0 != PREG_NONE && sv->pr0 < PREG_SPILLED)
-    {
-      return true;
-    }
+    /* VT_LOCAL is used for stack slots (spills/locals).
+     * Even if VT_LVAL is set, this is a direct stack load/store form, not a
+     * pointer dereference. If a spill was preloaded into pr0, pr0 already holds
+     * the value; emitting an extra load would incorrectly dereference the value
+     * as an address (seen in tests2/90_struct-init.c).
+     */
     return false;
   default: /* must be temporary vreg */
     return (sv->r & VT_LVAL) != 0;
