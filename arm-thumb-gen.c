@@ -5889,6 +5889,125 @@ static void load_immediate(int reg, uint32_t imm, Sym *sym, int update_flags)
   }
 }
 
+typedef enum ThumbArgMoveKind
+{
+  THUMB_ARG_MOVE_REG,
+  THUMB_ARG_MOVE_IMM,
+} ThumbArgMoveKind;
+
+typedef struct ThumbArgMove
+{
+  ThumbArgMoveKind kind;
+  int dst_reg;
+  int src_reg;  /* valid when kind==THUMB_ARG_MOVE_REG */
+  uint32_t imm; /* valid when kind==THUMB_ARG_MOVE_IMM */
+  Sym *sym;     /* valid when kind==THUMB_ARG_MOVE_IMM */
+} ThumbArgMove;
+
+static void thumb_emit_arg_move(const ThumbArgMove *m)
+{
+  if (m->kind == THUMB_ARG_MOVE_REG)
+  {
+    if (m->src_reg == m->dst_reg)
+      return;
+    ot_check(th_mov_reg(m->dst_reg, m->src_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                        ENFORCE_ENCODING_NONE, false));
+    return;
+  }
+
+  /* THUMB_ARG_MOVE_IMM */
+  load_immediate(m->dst_reg, m->imm, m->sym, false);
+}
+
+/* Schedule register argument setup as a parallel assignment.
+ * This avoids clobbering a source register needed for another argument.
+ * Example: r0 <- r6, r1 <- r0 must be emitted as:
+ *   mov r1, r0
+ *   mov r0, r6
+ */
+static void thumb_emit_parallel_arg_moves(ThumbArgMove *moves, int move_count)
+{
+  if (move_count <= 0)
+    return;
+
+  uint8_t done[16];
+  memset(done, 0, sizeof(done));
+
+  ScratchRegAlloc tmp_alloc = (ScratchRegAlloc){0};
+  int have_tmp = 0;
+
+  for (int remaining = move_count; remaining > 0;)
+  {
+    uint32_t src_set = 0;
+    for (int i = 0; i < move_count; ++i)
+    {
+      if (done[i])
+        continue;
+      if (moves[i].kind == THUMB_ARG_MOVE_REG)
+        src_set |= (1u << moves[i].src_reg);
+    }
+
+    int chosen = -1;
+    for (int i = 0; i < move_count; ++i)
+    {
+      if (done[i])
+        continue;
+      if ((src_set & (1u << moves[i].dst_reg)) == 0)
+      {
+        chosen = i;
+        break;
+      }
+    }
+
+    if (chosen < 0)
+    {
+      /* Cycle among register moves. Break it with a scratch temp. */
+      int cyc = -1;
+      for (int i = 0; i < move_count; ++i)
+      {
+        if (!done[i] && moves[i].kind == THUMB_ARG_MOVE_REG)
+        {
+          cyc = i;
+          break;
+        }
+      }
+      if (cyc < 0)
+        tcc_error("compiler_error: arg move cycle without reg sources");
+
+      if (!have_tmp)
+      {
+        /* Exclude all regs involved in the parallel move. */
+        uint32_t exclude = 0;
+        for (int i = 0; i < move_count; ++i)
+        {
+          if (done[i])
+            continue;
+          exclude |= (1u << moves[i].dst_reg);
+          if (moves[i].kind == THUMB_ARG_MOVE_REG)
+            exclude |= (1u << moves[i].src_reg);
+        }
+        /* Also exclude SP/PC. */
+        exclude |= (1u << ARM_SP) | (1u << ARM_PC);
+        tmp_alloc = get_scratch_reg_with_save(exclude);
+        have_tmp = 1;
+      }
+
+      thumb_require_materialized_reg("thumb_emit_parallel_arg_moves", "tmp", tmp_alloc.reg);
+      ot_check(th_mov_reg(tmp_alloc.reg, moves[cyc].src_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                          ENFORCE_ENCODING_NONE, false));
+      moves[cyc].src_reg = tmp_alloc.reg;
+      continue;
+    }
+
+    thumb_emit_arg_move(&moves[chosen]);
+    done[chosen] = 1;
+    --remaining;
+  }
+
+  if (have_tmp && tmp_alloc.saved)
+    ot_check(th_pop(1u << tmp_alloc.reg));
+}
+
 ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCIRState *ir, int call_idx)
 {
   if (!q || !ir)
@@ -5964,6 +6083,79 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
   }
 
   /* Step 4: Place arguments according to ABI layout */
+  /* First build a safe parallel move list for R0-R3 arguments.
+   * This prevents clobbering sources when multiple arguments originate
+   * from overlapping registers (common with nested calls). */
+  ThumbArgMove reg_moves[8];
+  int reg_move_count = 0;
+
+  for (int i = 0; i < argc; ++i)
+  {
+    const TCCAbiArgLoc *loc = &layout.locs[i];
+    const SValue *arg = &args[i];
+    const int bt = arg->type.t & VT_BTYPE;
+    const int is_64bit = tcc_is_64bit_type(arg->type.t);
+
+    if (loc->kind != TCC_ABI_LOC_REG)
+      continue;
+
+    int base_reg = ARM_R0 + loc->reg_base;
+
+    if (bt == VT_STRUCT)
+    {
+      /* TODO: implement small struct in registers */
+      int words = (loc->size + 3) / 4;
+      for (int w = 0; w < words && w < loc->reg_count; w++)
+        call_site->registers_map |= (1 << (base_reg + w));
+      continue;
+    }
+
+    if (is_64bit)
+    {
+      if (arg->pr0 != PREG_NONE && arg->pr1 != PREG_NONE)
+      {
+        if (arg->pr0 != base_reg)
+          reg_moves[reg_move_count++] =
+              (ThumbArgMove){.kind = THUMB_ARG_MOVE_REG, .dst_reg = base_reg, .src_reg = arg->pr0};
+        if (arg->pr1 != (base_reg + 1))
+          reg_moves[reg_move_count++] =
+              (ThumbArgMove){.kind = THUMB_ARG_MOVE_REG, .dst_reg = base_reg + 1, .src_reg = arg->pr1};
+      }
+      else
+      {
+        /* TODO: Implement 64-bit load */
+      }
+      call_site->registers_map |= (1 << base_reg);
+      call_site->registers_map |= (1 << (base_reg + 1));
+      continue;
+    }
+
+    /* 32-bit scalar */
+    if (arg->pr0 != PREG_NONE)
+    {
+      if (arg->pr0 != base_reg)
+        reg_moves[reg_move_count++] =
+            (ThumbArgMove){.kind = THUMB_ARG_MOVE_REG, .dst_reg = base_reg, .src_reg = arg->pr0};
+    }
+    else if ((arg->r & VT_VALMASK) == VT_CONST)
+    {
+      uint32_t imm = (uint32_t)arg->c.i;
+      Sym *sym = (arg->r & VT_SYM) ? arg->sym : NULL;
+      reg_moves[reg_move_count++] =
+          (ThumbArgMove){.kind = THUMB_ARG_MOVE_IMM, .dst_reg = base_reg, .imm = imm, .sym = sym};
+    }
+    else
+    {
+      /* Load from memory */
+      /* TODO: Implement memory load */
+    }
+
+    call_site->registers_map |= (1 << base_reg);
+  }
+
+  thumb_emit_parallel_arg_moves(reg_moves, reg_move_count);
+
+  /* Now handle stack arguments (if any). */
   for (int i = 0; i < argc; ++i)
   {
     const TCCAbiArgLoc *loc = &layout.locs[i];
@@ -5972,67 +6164,9 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
     const int is_64bit = tcc_is_64bit_type(arg->type.t);
 
     if (loc->kind == TCC_ABI_LOC_REG)
-    {
-      /* Argument goes in registers R0-R3 */
-      int base_reg = ARM_R0 + loc->reg_base;
+      continue;
 
-      if (bt == VT_STRUCT)
-      {
-        /* Small struct in registers - copy word by word */
-        int words = (loc->size + 3) / 4;
-        for (int w = 0; w < words && w < loc->reg_count; w++)
-        {
-          /* TODO: Load struct fields into registers */
-          /* For now, mark registers as used */
-          call_site->registers_map |= (1 << (base_reg + w));
-        }
-      }
-      else if (is_64bit)
-      {
-        /* 64-bit value in register pair */
-        if (arg->pr0 != PREG_NONE && arg->pr1 != PREG_NONE)
-        {
-          /* Value already in registers - move to argument registers */
-          if (arg->pr0 != base_reg)
-            ot_check(th_mov_reg(base_reg, arg->pr0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                                ENFORCE_ENCODING_NONE, false));
-          if (arg->pr1 != (base_reg + 1))
-            ot_check(th_mov_reg(base_reg + 1, arg->pr1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                                ENFORCE_ENCODING_NONE, false));
-        }
-        else
-        {
-          /* Load 64-bit value from memory/constant */
-          /* TODO: Implement 64-bit load */
-        }
-        call_site->registers_map |= (1 << base_reg);
-        call_site->registers_map |= (1 << (base_reg + 1));
-      }
-      else
-      {
-        /* 32-bit value in single register */
-        if (arg->pr0 != PREG_NONE && arg->pr0 != base_reg)
-        {
-          /* Value already in a register - move it */
-          ot_check(th_mov_reg(base_reg, arg->pr0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                              ENFORCE_ENCODING_NONE, false));
-        }
-        else if ((arg->r & VT_VALMASK) == VT_CONST)
-        {
-          /* Load constant or symbol address */
-          uint32_t imm = (uint32_t)arg->c.i;
-          Sym *sym = (arg->r & VT_SYM) ? arg->sym : NULL;
-          load_immediate(base_reg, imm, sym, false);
-        }
-        else
-        {
-          /* Load from memory */
-          /* TODO: Implement memory load */
-        }
-        call_site->registers_map |= (1 << base_reg);
-      }
-    }
-    else /* TCC_ABI_LOC_STACK */
+    /* TCC_ABI_LOC_STACK */
     {
       /* Argument goes on stack */
       int stack_offset = loc->stack_off;

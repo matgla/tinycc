@@ -2047,20 +2047,42 @@ static int tcc_ir_has_call_in_range(TCCIRState *ir, int start, int end)
  * corresponding FUNCCALL instruction. */
 static void tcc_ir_extend_param_intervals(TCCIRState *ir)
 {
-  for (int cs_i = 0; cs_i < ir->callsite_count; ++cs_i)
+  if (!ir)
+    return;
+
+  /* FUNCCALL* does not list its arguments explicitly; instead arguments are
+   * represented by preceding FUNCPARAMVAL markers tagged with the same call_id.
+   *
+   * For register allocation correctness, any vreg used in FUNCPARAMVAL must be
+   * considered live until the owning FUNCCALL instruction (not just until the
+   * FUNCPARAMVAL marker). Otherwise values can be allocated in caller-saved
+   * registers and clobbered by intervening calls.
+   */
+  for (int call_idx = 0; call_idx < ir->next_instruction_index; ++call_idx)
   {
-    const IRCallSite *cs = &ir->callsites[cs_i];
-    const int call_index = cs->call_instr_index;
-    if (!cs->args)
+    const TACQuadruple *callq = &ir->instructions[call_idx];
+    if (callq->op != TCCIR_OP_FUNCCALLVOID && callq->op != TCCIR_OP_FUNCCALLVAL)
       continue;
-    for (int p = 0; p < cs->argc; ++p)
+
+    /* FUNCCALL* stores call_id in src2.c.i encoded like FUNCPARAMVAL. */
+    const int call_id = TCCIR_DECODE_CALL_ID(callq->src2.c.i);
+    for (int j = call_idx - 1; j >= 0; --j)
     {
-      const SValue *arg_value = &cs->args[p].value;
-      if (tcc_is_vreg_valid(ir, arg_value->vr))
+      const TACQuadruple *p = &ir->instructions[j];
+      if (p->op != TCCIR_OP_FUNCPARAMVAL)
+        continue;
+
+      const int param_call_id = TCCIR_DECODE_CALL_ID(p->src2.c.i);
+      if (param_call_id != call_id)
+        continue;
+
+      if (tcc_is_vreg_valid(ir, p->src1.vr))
       {
-        IRLiveInterval *interval = tcc_ir_get_live_interval(ir, arg_value->vr);
-        if (interval && interval->end < call_index)
-          interval->end = call_index;
+        IRLiveInterval *interval = tcc_ir_get_live_interval(ir, p->src1.vr);
+        if (interval && interval->end < (uint32_t)call_idx)
+          interval->end = (uint32_t)call_idx;
+        if (interval && interval->start == INTERVAL_NOT_STARTED)
+          interval->start = 0;
       }
     }
   }

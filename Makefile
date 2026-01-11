@@ -101,6 +101,35 @@ DEF-arm-eabi       = -DTCC_TARGET_ARM -DTCC_ARM_VFP -DTCC_ARM_EABI
 DEF-arm-eabihf     = $(DEF-arm-eabi) -DTCC_ARM_HARDFLOAT
 DEF-armv8m         = $(DEF-arm-eabihf) -DTCC_TARGET_ARM_THUMB -DTCC_TARGET_ARM_ARCHV8M
 
+# --- armv8m libc/include autodetection ---
+# When building the armv8m cross-compiler, default to the Arm GNU Embedded
+# (arm-none-eabi) toolchain's newlib headers/libs so <stdio.h> resolves even
+# on hosts without /usr/include (e.g. macOS).
+ARM_NONE_EABI_GCC ?= arm-none-eabi-gcc
+# Keep aligned with tests/ir_tests/qemu/* Makefiles.
+ARMV8M_GCC_ABI_FLAGS ?= -mcpu=cortex-m33 -mthumb -mfloat-abi=soft
+
+ARMV8M_SYSROOT := $(shell $(ARM_NONE_EABI_GCC) $(ARMV8M_GCC_ABI_FLAGS) --print-sysroot 2>/dev/null)
+ARMV8M_LIBC_A := $(shell $(ARM_NONE_EABI_GCC) $(ARMV8M_GCC_ABI_FLAGS) -print-file-name=libc.a 2>/dev/null)
+ARMV8M_GCC_INCLUDE := $(shell $(ARM_NONE_EABI_GCC) $(ARMV8M_GCC_ABI_FLAGS) -print-file-name=include 2>/dev/null)
+ARMV8M_GCC_INCLUDE_FIXED := $(shell $(ARM_NONE_EABI_GCC) $(ARMV8M_GCC_ABI_FLAGS) -print-file-name=include-fixed 2>/dev/null)
+
+ifneq ($(strip $(ARMV8M_SYSROOT)),)
+INC-armv8m ?= {B}/include:$(ARMV8M_SYSROOT)/include
+endif
+
+ifneq ($(findstring /,$(ARMV8M_GCC_INCLUDE)),)
+INC-armv8m := $(INC-armv8m):$(ARMV8M_GCC_INCLUDE)
+endif
+
+ifneq ($(findstring /,$(ARMV8M_GCC_INCLUDE_FIXED)),)
+INC-armv8m := $(INC-armv8m):$(ARMV8M_GCC_INCLUDE_FIXED)
+endif
+
+ifneq ($(findstring /,$(ARMV8M_LIBC_A)),)
+LIB-armv8m ?= {B}:$(dir $(ARMV8M_LIBC_A))
+endif
+
 ifeq ($(INCLUDED),no)
 # --------------------------------------------------------------------------
 # running top Makefile
