@@ -18,17 +18,11 @@
  * You should have received a copy of the GNU Lesser General Public
  * License along with this library; if not, write to the Free Software
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
-/*
- * IR->Thumb codegen trace.
- * Enable with e.g.: make CFLAGS+='-DTCC_DUMP_THUMB_GEN=1'
- *
- * If you prefer printing mnemonics from inside the Thumb opcode builders
- * (see THUMB_OPCODE_TRACE in arm-thumb-opcodes.h), set:
- *   -DTCC_DUMP_THUMB_GEN_SPAN=0
- * to avoid also dumping raw bytes / external-disassembly spans.
  */
 #define USING_GLOBALS
 #include "tcc.h"
+
+#include "tccdebug.h"
 
 #ifndef TCC_DUMP_THUMB_GEN_SPAN
 #define TCC_DUMP_THUMB_GEN_SPAN 1
@@ -46,18 +40,10 @@
 #include <unistd.h>
 #endif
 
-/* Macro-guarded IR->machine dump.
- * Enable with e.g.: make CFLAGS+='-DTCC_DUMP_THUMB_GEN=1'
- * Output goes to stderr.
- */
 #ifndef TCC_DUMP_THUMB_GEN
-#define TCC_DUMP_THUMB_GEN 0
+#define TCC_DUMP_THUMB_GEN 1
 #endif
 
-/* If enabled, attempts to print real mnemonics by invoking an external
- * disassembler (arm-none-eabi-objdump or llvm-objdump) on the newly emitted
- * bytes. Falls back to a raw halfword dump if unavailable.
- */
 #ifndef TCC_DUMP_THUMB_GEN_MNEMONICS
 #define TCC_DUMP_THUMB_GEN_MNEMONICS 0
 #endif
@@ -71,6 +57,23 @@
   } while (0)
 #endif
 
+/* Terminal color codes for spill locations in debug output */
+#define SPILL_MARK_BEGIN "\033[41m"
+#define SPILL_MARK_END "\033[0m"
+
+#if TCC_DUMP_THUMB_GEN
+/* Forward declarations for debug functions */
+typedef struct IRRegistersConfig
+{
+  uint8_t has_dest : 1;
+  uint8_t has_src1 : 1;
+  uint8_t has_src2 : 1;
+} IRRegistersConfig;
+
+extern const IRRegistersConfig irop_config[];
+const char *tcc_ir_get_vreg_type_string(int vreg);
+#endif
+
 static inline int is_thumb2_32bit_prefix(uint16_t h1)
 {
   /* Thumb-2 32-bit instructions have a first halfword with top 5 bits:
@@ -81,6 +84,10 @@ static inline int is_thumb2_32bit_prefix(uint16_t h1)
   uint16_t top5 = h1 & 0xF800;
   return top5 == 0xE800 || top5 == 0xF000 || top5 == 0xF800;
 }
+
+#if TCC_DUMP_THUMB_GEN && (defined(__linux__) || defined(__APPLE__))
+static int tcc_try_dump_thumb_with_objdump(const unsigned char *bytes, size_t len, uint32_t start_vma);
+#endif
 
 static void tcc_dump_thumb_generated_span(uint32_t start, uint32_t end)
 {
@@ -126,6 +133,353 @@ static void tcc_dump_thumb_generated_span(uint32_t start, uint32_t end)
 #endif
 }
 
+#if TCC_DUMP_THUMB_GEN && (defined(__linux__) || defined(__APPLE__))
+static int tcc_find_executable_in_path(const char *exe, char *out_path, size_t out_cap)
+{
+  if (!exe || !*exe || !out_path || out_cap == 0)
+    return 0;
+  const char *path = getenv("PATH");
+  if (!path)
+    return 0;
+
+  const size_t exe_len = strlen(exe);
+  const char *p = path;
+  while (*p)
+  {
+    const char *colon = strchr(p, ':');
+    size_t dir_len = colon ? (size_t)(colon - p) : strlen(p);
+    if (dir_len == 0)
+    {
+      p = colon ? colon + 1 : p + dir_len;
+      continue;
+    }
+
+    /* candidate = <dir>/<exe> */
+    size_t need = dir_len + 1 + exe_len + 1;
+    if (need <= out_cap)
+    {
+      memcpy(out_path, p, dir_len);
+      out_path[dir_len] = '/';
+      memcpy(out_path + dir_len + 1, exe, exe_len);
+      out_path[dir_len + 1 + exe_len] = '\0';
+
+      if (access(out_path, X_OK) == 0)
+        return 1;
+    }
+
+    p = colon ? colon + 1 : p + dir_len;
+  }
+  return 0;
+}
+
+static int tcc_try_dump_thumb_with_objdump(const unsigned char *bytes, size_t len, uint32_t start_vma)
+{
+  if (!bytes || len == 0)
+    return 0;
+
+  char objdump_path[512];
+  if (!tcc_find_executable_in_path("arm-none-eabi-objdump", objdump_path, sizeof(objdump_path)))
+  {
+    /* No suitable disassembler found. */
+    return 0;
+  }
+
+  char tmp_template[] = "/tmp/tcc-thumb-XXXXXX";
+  int fd = mkstemp(tmp_template);
+  if (fd < 0)
+    return 0;
+
+  ssize_t w = write(fd, bytes, len);
+  close(fd);
+  if (w < 0 || (size_t)w != len)
+  {
+    unlink(tmp_template);
+    return 0;
+  }
+
+  /* Disassemble raw bytes as ARM with forced Thumb.
+   * --adjust-vma makes addresses match section offsets.
+   */
+  char cmd[1024];
+  snprintf(cmd, sizeof(cmd), "%s -D -b binary -marm -Mforce-thumb --adjust-vma=0x%x --no-show-raw-insn %s 2>/dev/null",
+           objdump_path, (unsigned)start_vma, tmp_template);
+
+  FILE *fp = popen(cmd, "r");
+  if (!fp)
+  {
+    unlink(tmp_template);
+    return 0;
+  }
+
+  /* Print objdump output verbatim, but keep it visually nested under the IR op. */
+  char line[512];
+  int any = 0;
+  while (fgets(line, sizeof(line), fp))
+  {
+    /* Filter obvious headers to keep output compact. */
+    if (strstr(line, "file format") || strstr(line, "Disassembly of"))
+      continue;
+    THGEN_DUMP("    %s", line);
+    any = 1;
+  }
+  pclose(fp);
+  unlink(tmp_template);
+  return any;
+}
+#endif
+
+#if TCC_DUMP_THUMB_GEN
+static void tcc_dump_svalue_short_to(FILE *out, const SValue *sv)
+{
+  if (!sv)
+  {
+    fprintf(out, "<null>");
+    return;
+  }
+
+  const int r = sv->r;
+  const int val_loc = r & VT_VALMASK;
+  switch (val_loc)
+  {
+  case VT_CONST:
+    if (r & VT_SYM)
+    {
+      fprintf(out, "%s", get_tok_str(sv->sym ? sv->sym->v : 0, NULL));
+      if (sv->c.i)
+        fprintf(out, "+%d", (int)sv->c.i);
+    }
+    else
+    {
+      if (!(r & VT_LVAL))
+        fprintf(out, "#%d", (int)sv->c.i);
+      else
+        fprintf(out, "#%d***DEREF***", (int)sv->c.i);
+    }
+    break;
+  case VT_LLOCAL:
+    fprintf(out, "VT_LLOCAL(cval=%d)", (int)sv->c.i);
+    break;
+  case VT_LOCAL:
+    if (sv->pr0 != PREG_NONE)
+    {
+      if (sv->pr0 & PREG_SPILLED)
+        fprintf(out, SPILL_MARK_BEGIN "SpillLoc[%d]" SPILL_MARK_END, (int)sv->c.i);
+      else
+      {
+        if (!(r & VT_LVAL))
+          fprintf(out, "&");
+        fprintf(out, "R%d", sv->pr0);
+      }
+    }
+    else if (sv->vr != -1)
+    {
+      if (!(r & VT_LVAL))
+        fprintf(out, "&");
+      /* Match tcc_ir_print_vreg() formatting */
+      fprintf(out, "VReg %s:%d", tcc_ir_get_vreg_type_string(sv->vr), TCCIR_DECODE_VREG_POSITION(sv->vr));
+    }
+    else if (!(r & VT_LVAL))
+    {
+      fprintf(out, "Addr[StackLoc[%d]]", (int)sv->c.i);
+    }
+    else
+    {
+      fprintf(out, "StackLoc[%d]", (int)sv->c.i);
+    }
+    break;
+  case VT_CMP:
+    fprintf(out, "VT_CMP");
+    break;
+  case VT_JMP:
+    fprintf(out, "VT_JMP");
+    break;
+  case VT_JMPI:
+    fprintf(out, "VT_JMPI");
+    break;
+  default:
+    if (sv->pr0 == PREG_NONE)
+    {
+      fprintf(out, "VReg %s:%d", tcc_ir_get_vreg_type_string(sv->vr), TCCIR_DECODE_VREG_POSITION(sv->vr));
+      if (r & VT_LVAL)
+        fprintf(out, "***DEREF***");
+    }
+    else
+    {
+      if (sv->pr0 & PREG_SPILLED)
+        fprintf(out, SPILL_MARK_BEGIN "SpillLoc[%d]" SPILL_MARK_END, (int)sv->c.i);
+      else
+        fprintf(out, "R%d", sv->pr0);
+      if (r & VT_LVAL)
+        fprintf(out, "***DEREF***");
+    }
+    break;
+  }
+}
+
+static void tcc_dump_quadruple_to(FILE *out, const TACQuadruple *q, int pc)
+{
+  if (!q)
+  {
+    fprintf(out, "%04d: <null>\n", pc);
+    return;
+  }
+
+  const int op = q->op;
+  fprintf(out, "%04d: ", pc);
+  switch (op)
+  {
+  case TCCIR_OP_RETURNVALUE:
+  case TCCIR_OP_RETURNVOID:
+  case TCCIR_OP_FUNCCALLVOID:
+  case TCCIR_OP_FUNCCALLVAL:
+  case TCCIR_OP_FUNCPARAMVOID:
+  case TCCIR_OP_TEST_ZERO:
+  case TCCIR_OP_CMP:
+    fprintf(out, "%s ", tcc_ir_get_op_name(op));
+    break;
+  case TCCIR_OP_FUNCPARAMVAL:
+    fprintf(out, "%s%d[call_%d] ", tcc_ir_get_op_name(op), TCCIR_DECODE_PARAM_IDX(q->src2.c.i),
+            TCCIR_DECODE_CALL_ID(q->src2.c.i));
+    break;
+  case TCCIR_OP_JUMP:
+  case TCCIR_OP_JUMPIF:
+    fprintf(out, "JMP to %d ", (int)q->dest.c.i);
+    break;
+  case TCCIR_OP_IJUMP:
+    fprintf(out, "IJMP ");
+    tcc_dump_svalue_short_to(out, &q->src1);
+    fprintf(out, " ");
+    break;
+  default:
+    tcc_dump_svalue_short_to(out, &q->dest);
+    fprintf(out, " <-- ");
+    break;
+  }
+
+  if (irop_config[op].has_src1)
+  {
+    if (op == TCCIR_OP_SETIF)
+      fprintf(out, "(cond=0x%x)", (unsigned)q->src1.c.i);
+    else if (op != TCCIR_OP_JUMPIF)
+      tcc_dump_svalue_short_to(out, &q->src1);
+  }
+
+  if (irop_config[op].has_src2)
+  {
+    switch (op)
+    {
+    case TCCIR_OP_CMP:
+      fprintf(out, ",");
+      tcc_dump_svalue_short_to(out, &q->src2);
+      break;
+    case TCCIR_OP_FUNCPARAMVAL:
+    case TCCIR_OP_FUNCCALLVAL:
+      break;
+    default:
+      fprintf(out, " %s ", tcc_ir_get_op_name(op));
+      tcc_dump_svalue_short_to(out, &q->src2);
+      break;
+    }
+  }
+
+  if (op == TCCIR_OP_STORE)
+    fprintf(out, " [STORE]");
+  else if (op == TCCIR_OP_LOAD)
+    fprintf(out, " [LOAD]");
+  else if (op == TCCIR_OP_ASSIGN)
+    fprintf(out, " [ASSIGN]");
+  else if (op == TCCIR_OP_FUNCCALLVAL)
+  {
+    fprintf(out, " --> ");
+    tcc_dump_svalue_short_to(out, &q->dest);
+  }
+  else if (op == TCCIR_OP_JUMPIF)
+  {
+    fprintf(out, " if \"");
+    switch (q->src1.c.i)
+    {
+    case TOK_EQ:
+      fprintf(out, "==");
+      break;
+    case TOK_NE:
+      fprintf(out, "!=");
+      break;
+    case TOK_LT:
+      fprintf(out, "<S");
+      break;
+    case TOK_GT:
+      fprintf(out, ">S");
+      break;
+    case TOK_LE:
+      fprintf(out, "<=S");
+      break;
+    case TOK_GE:
+      fprintf(out, ">=S");
+      break;
+    case TOK_ULT:
+      fprintf(out, "<U");
+      break;
+    case TOK_UGT:
+      fprintf(out, ">U");
+      break;
+    case TOK_ULE:
+      fprintf(out, "<=U");
+      break;
+    case TOK_UGE:
+      fprintf(out, ">=U");
+      break;
+    default:
+      fprintf(out, "cc=0x%x", (unsigned)q->src1.c.i);
+      break;
+    }
+    fprintf(out, "\"");
+  }
+  else if (op == TCCIR_OP_SETIF)
+  {
+    fprintf(out, "1 if \"");
+    switch (q->src1.c.i)
+    {
+    case TOK_EQ:
+      fprintf(out, "==");
+      break;
+    case TOK_NE:
+      fprintf(out, "!=");
+      break;
+    case TOK_LT:
+      fprintf(out, "<S");
+      break;
+    case TOK_GT:
+      fprintf(out, ">S");
+      break;
+    case TOK_LE:
+      fprintf(out, "<=S");
+      break;
+    case TOK_GE:
+      fprintf(out, ">=S");
+      break;
+    case TOK_ULT:
+      fprintf(out, "<U");
+      break;
+    case TOK_UGT:
+      fprintf(out, ">U");
+      break;
+    case TOK_ULE:
+      fprintf(out, "<=U");
+      break;
+    case TOK_UGE:
+      fprintf(out, ">=U");
+      break;
+    default:
+      fprintf(out, "cc=0x%x", (unsigned)q->src1.c.i);
+      break;
+    }
+    fprintf(out, "\"");
+  }
+
+  fprintf(out, "\n");
+}
+#endif
+
 #define TCC_STACK_LAYOUT_INIT_CAPACITY 16
 
 #define QUADRUPLE_INIT_SIZE 128
@@ -168,15 +522,58 @@ int tcc_ir_is_64bit(int t)
   return tcc_ir_is_64bit_type(t);
 }
 
+static void tcc_abi_call_layout_ensure_capacity(TCCAbiCallLayout *layout, int needed)
+{
+  if (!layout)
+    return;
+  if (needed <= 0)
+    return;
+
+  if (layout->capacity >= needed && layout->locs && layout->args_effective && layout->args_original &&
+      layout->arg_flags)
+    return;
+
+  int new_capacity = layout->capacity ? layout->capacity : 8;
+  while (new_capacity < needed)
+    new_capacity *= 2;
+
+  layout->locs = (TCCAbiArgLoc *)tcc_realloc(layout->locs, sizeof(TCCAbiArgLoc) * (size_t)new_capacity);
+  layout->args_original =
+      (TCCAbiArgDesc *)tcc_realloc(layout->args_original, sizeof(TCCAbiArgDesc) * (size_t)new_capacity);
+  layout->args_effective =
+      (TCCAbiArgDesc *)tcc_realloc(layout->args_effective, sizeof(TCCAbiArgDesc) * (size_t)new_capacity);
+  layout->arg_flags = (uint8_t *)tcc_realloc(layout->arg_flags, (size_t)new_capacity);
+
+  /* Zero-init the newly added tail. */
+  if (new_capacity > layout->capacity)
+  {
+    const int old = layout->capacity;
+    memset(&layout->locs[old], 0, sizeof(TCCAbiArgLoc) * (size_t)(new_capacity - old));
+    memset(&layout->args_original[old], 0, sizeof(TCCAbiArgDesc) * (size_t)(new_capacity - old));
+    memset(&layout->args_effective[old], 0, sizeof(TCCAbiArgDesc) * (size_t)(new_capacity - old));
+    memset(&layout->arg_flags[old], 0, (size_t)(new_capacity - old));
+  }
+
+  layout->capacity = new_capacity;
+}
+
+static void tcc_abi_call_layout_deinit(TCCAbiCallLayout *layout)
+{
+  if (!layout)
+    return;
+  if (layout->locs)
+    tcc_free(layout->locs);
+  if (layout->args_original)
+    tcc_free(layout->args_original);
+  if (layout->args_effective)
+    tcc_free(layout->args_effective);
+  if (layout->arg_flags)
+    tcc_free(layout->arg_flags);
+  memset(layout, 0, sizeof(*layout));
+}
+
 void tcc_print_quadruple(TACQuadruple *q, int pc);
 void tcc_ir_print_vreg(int vreg);
-
-typedef struct IRRegistersConfig
-{
-  uint8_t has_dest : 1;
-  uint8_t has_src1 : 1;
-  uint8_t has_src2 : 1;
-} IRRegistersConfig;
 
 // clang-format off
 const IRRegistersConfig irop_config[] = {
@@ -206,53 +603,50 @@ const IRRegistersConfig irop_config[] = {
     [TCCIR_OP_JUMPIF] = {1, 1, 0},
     [TCCIR_OP_IJUMP] = {0, 1, 0},
     [TCCIR_OP_SETIF] = {1, 1, 0},
-    [TCCIR_OP_FUNCPARAMVOID] = {0, 0, 0},
+    /* FUNCPARAMVOID carries call_id in src2.c.i (encoded like FUNCPARAMVAL). */
+    [TCCIR_OP_FUNCPARAMVOID] = {0, 0, 1},
     [TCCIR_OP_FUNCPARAMVAL] = {0, 1, 1},
-    [TCCIR_OP_FUNCCALLVOID] = {0, 1, 0},
-    [TCCIR_OP_FUNCCALLVAL] = {1, 1, 0},
+    /* FUNCCALL* carries call_id in src2.c.i so backends can match parameters. */
+    [TCCIR_OP_FUNCCALLVOID] = {0, 1, 1},
+    [TCCIR_OP_FUNCCALLVAL] = {1, 1, 1},
     [TCCIR_OP_LOAD] = {1, 1, 0},
     [TCCIR_OP_STORE] = {1, 1, 0},
     [TCCIR_OP_ASSIGN] = {1, 1, 0},
     [TCCIR_OP_LEA] = {1, 1, 0},    /* dest = &src1 */
     [TCCIR_OP_TEST_ZERO] = {0, 1, 0},
     /* Floating point operations */
-    [TCCIR_OP_FADD] = {1, 1, 1},
-    [TCCIR_OP_FSUB] = {1, 1, 1},
-    [TCCIR_OP_FMUL] = {1, 1, 1},
-    [TCCIR_OP_FDIV] = {1, 1, 1},
-    [TCCIR_OP_FNEG] = {1, 1, 0},  /* unary: src1=input, dest */
+    [TCCIR_OP_FADD] = {1, 1, 1}, [TCCIR_OP_FSUB] = {1, 1, 1}, [TCCIR_OP_FMUL] = {1, 1, 1}, [TCCIR_OP_FDIV] = {1, 1, 1},
+    [TCCIR_OP_FNEG] = {1, 1, 0}, /* unary: src1=input, dest */
     [TCCIR_OP_FCMP] = {0, 1, 1},
     /* Floating point conversion operations */
-    [TCCIR_OP_CVT_FTOF] = {1, 1, 0},  /* dest=result, src1=input */
-    [TCCIR_OP_CVT_ITOF] = {1, 1, 0},  /* dest=result, src1=input */
-    [TCCIR_OP_CVT_FTOI] = {1, 1, 0},  /* dest=result, src1=input */
+    [TCCIR_OP_CVT_FTOF] = {1, 1, 0}, /* dest=result, src1=input */
+    [TCCIR_OP_CVT_ITOF] = {1, 1, 0}, /* dest=result, src1=input */
+    [TCCIR_OP_CVT_FTOI] = {1, 1, 0}, /* dest=result, src1=input */
     /* Logical boolean operations */
-    [TCCIR_OP_BOOL_OR] = {1, 1, 1},   /* dest = (src1 || src2) */
-    [TCCIR_OP_BOOL_AND] = {1, 1, 1},  /* dest = (src1 && src2) */
+    [TCCIR_OP_BOOL_OR] = {1, 1, 1},  /* dest = (src1 || src2) */
+    [TCCIR_OP_BOOL_AND] = {1, 1, 1}, /* dest = (src1 && src2) */
 
     /* VLA / dynamic stack ops */
     [TCCIR_OP_VLA_ALLOC] = {0, 1, 1},      /* src1=size(bytes), src2=align(bytes) */
     [TCCIR_OP_VLA_SP_SAVE] = {1, 0, 0},    /* dest=stack slot to store SP */
     [TCCIR_OP_VLA_SP_RESTORE] = {0, 1, 0}, /* src1=stack slot holding saved SP */
 
-    /* Inline asm markers/barrier */
-    [TCCIR_OP_ASM_INPUT] = {0, 1, 0},
-    [TCCIR_OP_INLINE_ASM] = {0, 0, 0},
-    [TCCIR_OP_ASM_OUTPUT] = {1, 0, 0},
+    /* Inline asm markers/barrier.
+     * INLINE_ASM carries inline_asm_id in src1.c.i. */
+    [TCCIR_OP_ASM_INPUT] = {0, 1, 0}, [TCCIR_OP_INLINE_ASM] = {0, 1, 0}, [TCCIR_OP_ASM_OUTPUT] = {1, 0, 0},
     /* Explicit call sequence ops (Option A scaffold)
      * - CALLSEQ_BEGIN: src1=stack_size (bytes), src2=pad (bytes)
      * - CALLARG_REG: src1=value, src2=reg_index (immediate)
      * - CALLARG_STACK: src1=value, src2=stack_off (immediate)
      * - CALLSEQ_END: src1=stack_size (bytes), src2=pad (bytes)
      */
-    [TCCIR_OP_CALLSEQ_BEGIN] = {0, 1, 1},
-    [TCCIR_OP_CALLARG_REG] = {0, 1, 1},
-    [TCCIR_OP_CALLARG_STACK] = {0, 1, 1},
+    [TCCIR_OP_CALLSEQ_BEGIN] = {0, 1, 1}, [TCCIR_OP_CALLARG_REG] = {0, 1, 1}, [TCCIR_OP_CALLARG_STACK] = {0, 1, 1},
     [TCCIR_OP_CALLSEQ_END] = {0, 1, 1},
 
     /* No-operation */
     [TCCIR_OP_NOP] = {0, 0, 0},
-};
+}
+;
 // clang-format on
 
 #define IR_MAX_VARS 10000
@@ -277,7 +671,7 @@ static int tcc_is_vreg_valid(TCCIRState *ir, int vr)
   return 0;
 }
 
-static IRLiveInterval *tcc_ir_get_live_interval(TCCIRState *ir, int vreg)
+IRLiveInterval *tcc_ir_get_live_interval(TCCIRState *ir, int vreg)
 {
   if (vreg < 0)
   {
@@ -428,14 +822,6 @@ TCCIRState *tcc_ir_allocate_block()
     exit(1);
   }
 
-  block->callsites = NULL;
-  block->callsite_count = 0;
-  block->callsite_capacity = 0;
-  block->callsite_index_by_call_instr = NULL;
-  block->callsite_index_by_call_instr_size = 0;
-  block->callsite_arg_binding_by_instr = NULL;
-  block->callsite_arg_binding_size = 0;
-
   tcc_ls_initialize(&block->ls);
   block->stack_layout.slots = NULL;
   block->stack_layout.slot_capacity = 0;
@@ -447,64 +833,6 @@ TCCIRState *tcc_ir_allocate_block()
   block->inline_asm_capacity = 0;
 #endif
   return block;
-}
-
-int tcc_ir_put_with_aux(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *dest, int aux)
-{
-  const int idx = tcc_ir_put(ir, op, src1, src2, dest);
-  if (idx >= 0 && idx < ir->next_instruction_index)
-    ir->instructions[idx].aux = aux;
-  return idx;
-}
-
-static void tcc_ir_callsites_clear(TCCIRState *ir)
-{
-  if (ir->callsite_abi_layouts)
-  {
-    for (int i = 0; i < ir->callsite_abi_layouts_size; ++i)
-    {
-      if (ir->callsite_abi_layouts[i].locs)
-        tcc_free(ir->callsite_abi_layouts[i].locs);
-      ir->callsite_abi_layouts[i].locs = NULL;
-      ir->callsite_abi_layouts[i].argc = 0;
-      ir->callsite_abi_layouts[i].stack_size = 0;
-      ir->callsite_abi_layouts[i].stack_align = 0;
-    }
-    tcc_free(ir->callsite_abi_layouts);
-    ir->callsite_abi_layouts = NULL;
-  }
-  ir->callsite_abi_layouts_size = 0;
-  ir->call_outgoing_base = 0;
-  ir->call_outgoing_size = 0;
-
-  if (ir->callsites)
-  {
-    for (int i = 0; i < ir->callsite_count; ++i)
-    {
-      if (ir->callsites[i].args)
-        tcc_free(ir->callsites[i].args);
-      ir->callsites[i].args = NULL;
-      ir->callsites[i].args_prepared = 0;
-    }
-    tcc_free(ir->callsites);
-    ir->callsites = NULL;
-  }
-  ir->callsite_count = 0;
-  ir->callsite_capacity = 0;
-
-  if (ir->callsite_index_by_call_instr)
-  {
-    tcc_free(ir->callsite_index_by_call_instr);
-    ir->callsite_index_by_call_instr = NULL;
-  }
-  ir->callsite_index_by_call_instr_size = 0;
-
-  if (ir->callsite_arg_binding_by_instr)
-  {
-    tcc_free(ir->callsite_arg_binding_by_instr);
-    ir->callsite_arg_binding_by_instr = NULL;
-  }
-  ir->callsite_arg_binding_size = 0;
 }
 
 #ifdef CONFIG_TCC_ASM
@@ -578,9 +906,8 @@ void tcc_ir_put_inline_asm(TCCIRState *ir, int inline_asm_id)
 {
   if (!ir)
     return;
-  const int idx = tcc_ir_put(ir, TCCIR_OP_INLINE_ASM, NULL, NULL, NULL);
-  if (idx >= 0)
-    ir->instructions[idx].aux = inline_asm_id;
+  SValue id_sv = tcc_svalue_const_i64(inline_asm_id);
+  (void)tcc_ir_put(ir, TCCIR_OP_INLINE_ASM, &id_sv, NULL, NULL);
   ir->leaffunc = 0;
 }
 #endif
@@ -678,305 +1005,6 @@ static int tcc_ir_try_resolve_stack_addr(const TCCIRState *ir, int vreg_encoded,
   return 0;
 }
 
-void tcc_ir_build_callsites(TCCIRState *ir)
-{
-  tcc_ir_callsites_clear(ir);
-
-  const int n = ir->next_instruction_index;
-  ir->callsite_index_by_call_instr_size = n > 0 ? n : 1;
-  ir->callsite_index_by_call_instr = tcc_malloc(sizeof(int) * ir->callsite_index_by_call_instr_size);
-  for (int i = 0; i < ir->callsite_index_by_call_instr_size; ++i)
-    ir->callsite_index_by_call_instr[i] = -1;
-
-  ir->callsite_arg_binding_size = ir->callsite_index_by_call_instr_size;
-  ir->callsite_arg_binding_by_instr = tcc_malloc(sizeof(IRCallsiteArgBinding) * ir->callsite_arg_binding_size);
-  for (int i = 0; i < ir->callsite_arg_binding_size; ++i)
-  {
-    ir->callsite_arg_binding_by_instr[i].callsite_index = -1;
-    ir->callsite_arg_binding_by_instr[i].arg_index = -1;
-  }
-
-  for (int call_idx = 0; call_idx < n; ++call_idx)
-  {
-    TACQuadruple *call = &ir->instructions[call_idx];
-    if (call->op != TCCIR_OP_FUNCCALLVAL && call->op != TCCIR_OP_FUNCCALLVOID)
-      continue;
-
-    const int call_id = call->aux;
-
-    int pairs_cap = 8;
-    int pairs_count = 0;
-    int *param_nums = tcc_malloc(sizeof(int) * pairs_cap);
-    int *param_instrs = tcc_malloc(sizeof(int) * pairs_cap);
-
-    if (call_id > 0)
-    {
-      /* Preferred binding: explicit call_id stored in q->aux.
-       * This makes nested calls trivial because each call has its own ID.
-       */
-      for (int i = call_idx - 1; i >= 0; --i)
-      {
-        TACQuadruple *q = &ir->instructions[i];
-        if (q->aux != call_id)
-          continue;
-        if (q->op == TCCIR_OP_FUNCPARAMVAL)
-        {
-          const int param_num = (int)(q->src2.c.i & 0xFFFFFFFFu); /* 0-based */
-          if (pairs_count >= pairs_cap)
-          {
-            pairs_cap *= 2;
-            param_nums = tcc_realloc(param_nums, sizeof(int) * pairs_cap);
-            param_instrs = tcc_realloc(param_instrs, sizeof(int) * pairs_cap);
-          }
-          param_nums[pairs_count] = param_num;
-          param_instrs[pairs_count] = i;
-          pairs_count++;
-          if (param_num == 0)
-            break;
-        }
-        else if (q->op == TCCIR_OP_FUNCPARAMVOID)
-        {
-          /* 0-arg call marker */
-          break;
-        }
-      }
-    }
-    else
-    {
-      /* Legacy binding: nested-depth scan over param_num==0 boundaries. */
-      int nested_call_depth = 0;
-
-      for (int i = call_idx - 1; i >= 0; --i)
-      {
-        TACQuadruple *q = &ir->instructions[i];
-
-        if (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID)
-        {
-          /* If we haven't seen any params for this call, treat a previous call
-           * as a boundary (covers 0-arg calls without FUNCPARAMVOID).
-           * Otherwise, this is a nested (inner) call and we must skip its params.
-           */
-          if (nested_call_depth == 0 && pairs_count == 0)
-            break;
-          nested_call_depth++;
-          continue;
-        }
-
-        if (q->op == TCCIR_OP_FUNCPARAMVAL)
-        {
-          const int param_num = (int)(q->src2.c.i & 0xFFFFFFFFu); /* 0-based */
-          if (nested_call_depth > 0)
-          {
-            if (param_num == 0)
-              nested_call_depth--;
-            continue;
-          }
-
-          if (pairs_count >= pairs_cap)
-          {
-            pairs_cap *= 2;
-            param_nums = tcc_realloc(param_nums, sizeof(int) * pairs_cap);
-            param_instrs = tcc_realloc(param_instrs, sizeof(int) * pairs_cap);
-          }
-          param_nums[pairs_count] = param_num;
-          param_instrs[pairs_count] = i;
-          pairs_count++;
-          if (param_num == 0)
-            break;
-          continue;
-        }
-
-        if (q->op == TCCIR_OP_FUNCPARAMVOID)
-        {
-          if (nested_call_depth > 0)
-          {
-            nested_call_depth--;
-            continue;
-          }
-          break;
-        }
-      }
-    }
-
-    int argc = 0;
-    if (pairs_count > 0)
-    {
-      int max_param = -1;
-      for (int k = 0; k < pairs_count; ++k)
-        if (param_nums[k] > max_param)
-          max_param = param_nums[k];
-      argc = max_param + 1;
-      if (argc < 0)
-        argc = 0;
-    }
-
-    if (ir->callsite_count >= ir->callsite_capacity)
-    {
-      ir->callsite_capacity = ir->callsite_capacity ? ir->callsite_capacity * 2 : 16;
-      ir->callsites = tcc_realloc(ir->callsites, sizeof(IRCallSite) * ir->callsite_capacity);
-    }
-
-    const int callsite_index = ir->callsite_count;
-    IRCallSite *cs = &ir->callsites[callsite_index];
-    cs->call_instr_index = call_idx;
-    cs->call_orig_index = call->orig_index;
-    cs->argc = argc;
-    cs->args = NULL;
-
-    if (argc > 0)
-    {
-      cs->args = tcc_malloc(sizeof(IRCallArgument) * argc);
-      for (int a = 0; a < argc; ++a)
-      {
-        cs->args[a].instr_index = -1;
-        cs->args[a].value = (SValue){0};
-      }
-
-      for (int k = 0; k < pairs_count; ++k)
-      {
-        const int pnum = param_nums[k];
-        if (pnum < 0 || pnum >= argc)
-          continue;
-        if (cs->args[pnum].instr_index != -1)
-          tcc_error("Duplicate FUNCPARAMVAL %d bound to call at IR index %d", pnum, call_idx);
-
-        const int instr_index = param_instrs[k];
-        cs->args[pnum].instr_index = instr_index;
-        if (instr_index >= 0 && instr_index < ir->callsite_arg_binding_size)
-        {
-          ir->callsite_arg_binding_by_instr[instr_index].callsite_index = callsite_index;
-          ir->callsite_arg_binding_by_instr[instr_index].arg_index = pnum;
-        }
-
-        if (instr_index >= 0 && instr_index < ir->next_instruction_index)
-        {
-          cs->args[pnum].value = ir->instructions[instr_index].src1;
-        }
-      }
-
-      /* Fold deref-of-stack-address temps into direct stack lvalues for this callsite. */
-      for (int p = 0; p < argc; ++p)
-      {
-        const int instr_index = cs->args[p].instr_index;
-        if (instr_index < 0 || instr_index >= ir->next_instruction_index)
-          continue;
-
-        TACQuadruple *param_q = &ir->instructions[instr_index];
-        SValue *arg = &param_q->src1;
-        if (!(arg->r & VT_LVAL))
-          continue;
-        if (!tcc_is_vreg_valid(ir, arg->vr))
-          continue;
-
-        /* Some lvalue forms encode an additional constant offset in arg->c.i
-         * (e.g. base_vreg + off represented as LVAL(vr=base_vreg, c.i=off)).
-         * Preserve it when folding the base address, otherwise distinct fields
-         * can collapse onto the same stack slot.
-         */
-        const int extra_off = arg->c.i;
-
-        /* Do not fold PARAM vregs into concrete stack lvalues.
-         * Parameters may be materialized specially (e.g. from incoming regs), and
-         * rewriting them to a fixed stack slot can alias the saved-register area
-         * (e.g. vfunc(int a) -> reads saved IP instead of 'a').
-         */
-        if (TCCIR_DECODE_VREG_TYPE(arg->vr) == TCCIR_VREG_TYPE_PARAM)
-          continue;
-
-        int kind = 0;
-        int off = 0;
-        if (!tcc_ir_try_resolve_stack_addr(ir, arg->vr, instr_index, 8, &kind, &off))
-          continue;
-
-        /* Rewrite FUNCPARAM operand to a direct stack lvalue. */
-        SValue folded = {0};
-        folded.type = arg->type;
-        folded.r = (kind & VT_VALMASK) | VT_LVAL;
-        folded.vr = -1;
-        folded.c.i = off + extra_off;
-        folded.pr0 = PREG_NONE;
-        folded.pr1 = PREG_NONE;
-        *arg = folded;
-
-        /* Keep the callsite snapshot coherent with the rewritten instruction.
-         * Some analysis passes consult cs->args[p].value (not the instruction).
-         */
-        cs->args[p].value = folded;
-      }
-
-      for (int p = 0; p < argc; ++p)
-      {
-        if (cs->args[p].instr_index == -1)
-          tcc_error("Missing FUNCPARAMVAL %d for call at IR index %d", p, call_idx);
-      }
-    }
-
-    ir->callsite_index_by_call_instr[call_idx] = callsite_index;
-    ir->callsite_count++;
-
-    tcc_free(param_nums);
-    tcc_free(param_instrs);
-  }
-}
-
-void tcc_ir_refresh_callsite_args(TCCIRState *ir)
-{
-  if (!ir || !ir->callsites)
-    return;
-
-  for (int cs_i = 0; cs_i < ir->callsite_count; ++cs_i)
-  {
-    IRCallSite *cs = &ir->callsites[cs_i];
-    if (!cs->args)
-      continue;
-    for (int p = 0; p < cs->argc; ++p)
-    {
-      const int instr_index = cs->args[p].instr_index;
-      if (instr_index < 0 || instr_index >= ir->next_instruction_index)
-        continue;
-      cs->args[p].value = ir->instructions[instr_index].src1;
-    }
-  }
-}
-
-const SValue *tcc_ir_callsite_arg_value_ptr(const TCCIRState *ir, const IRCallArgument *arg)
-{
-  if (!ir || !arg)
-    return NULL;
-  const int idx = arg->instr_index;
-  if (idx >= 0 && idx < ir->next_instruction_index)
-    return &ir->instructions[idx].src1;
-  return &arg->value;
-}
-
-const IRCallSite *tcc_ir_callsite_for_call(const TCCIRState *ir, int call_instr_index)
-{
-  if (!ir || !ir->callsite_index_by_call_instr)
-    return NULL;
-  if (call_instr_index < 0 || call_instr_index >= ir->callsite_index_by_call_instr_size)
-    return NULL;
-  const int cs_idx = ir->callsite_index_by_call_instr[call_instr_index];
-  if (cs_idx < 0 || cs_idx >= ir->callsite_count)
-    return NULL;
-  return &ir->callsites[cs_idx];
-}
-
-/* Check if a vreg is used as an argument to a function call.
- * Returns 1 if vreg_encoded is src1.vr of any FUNCPARAMVAL bound to call_instr_index. */
-static int tcc_ir_vreg_is_call_argument(const TCCIRState *ir, int vreg_encoded, int call_instr_index)
-{
-  const IRCallSite *cs = tcc_ir_callsite_for_call(ir, call_instr_index);
-  if (!cs || !cs->args)
-    return 0;
-  for (int p = 0; p < cs->argc; ++p)
-  {
-    const SValue *arg_value = &cs->args[p].value;
-    if (arg_value->vr == vreg_encoded)
-      return 1;
-  }
-  return 0;
-}
-
 void tcc_ir_release_block(TCCIRState *ir)
 {
   if (!ir)
@@ -1008,8 +1036,6 @@ void tcc_ir_release_block(TCCIRState *ir)
   {
     tcc_free(ir->instructions);
   }
-
-  tcc_ir_callsites_clear(ir);
 
 #ifdef CONFIG_TCC_ASM
   if (ir->inline_asms)
@@ -1061,141 +1087,163 @@ void tcc_ir_release_block(TCCIRState *ir)
 
 void tcc_ir_add_function_parameters(TCCIRState *ir, CType *func_type)
 {
-  Sym *sym, *sym2;
-  int n = 0, size = 0, align = 0, pn = 0,
-      sn = 0; // pn = core registers, sn = stack
+  Sym *sym = NULL;
+  int size = 0, align = 0;
+  SValue dst;
+
+  TCCAbiCallLayout call_layout;
+  memset(&call_layout, 0, sizeof(call_layout));
+
   sym = func_type->ref;
   func_vt = sym->type;
   tcc_state->need_frame_pointer = 0;
 
-  /* The IR backend currently relies on the global `loc` (from tccgen)
-     for stack frame sizing. Ensure it is reset per-function so that
-     subsequent functions don't inherit the previous function's frame. */
   loc = 0;
 
-  for (sym2 = sym->next; sym2 && (n < architecture_config.parameter_registers); sym2 = sym2->next)
-  {
-    size = type_size(&sym2->type, &align);
-    /* ARM EABI AAPCS: structs/unions larger than 16 bytes are passed by
-     * invisible reference (a pointer) for register accounting.
-     */
-    if ((sym2->type.t & VT_BTYPE) == VT_STRUCT && size > 16)
-    {
-      size = architecture_config.reg_size;
-      align = architecture_config.reg_size;
-    }
-    if (is_float(sym2->type.t))
-    {
-      /* Soft-float ABI: floats/doubles are passed in integer registers.
-       * - float (4 bytes): 1 register, no special alignment
-       * - double (8 bytes): 2 registers, must start at even register boundary
-       * For hard-float (VFP), this would need separate FP register tracking. */
-      if (tcc_ir_is_double_type(sym2->type.t))
-      {
-        /* Align to even register for double (8-byte alignment) */
-        n = (n + 1) & ~1;
-      }
-    }
-    n += CEIL_DIV(size, architecture_config.reg_size);
-  }
-
-  if (n > architecture_config.parameter_registers)
-  {
-    n = architecture_config.parameter_registers;
-  }
-
-  ir->parameters_count = n;
-  // PC must be aligned to 8 bytes for ARM EABI
-  n = ALIGN(n * architecture_config.reg_size, architecture_config.stack_align) / architecture_config.reg_size;
-
-  while ((sym = sym->next))
+  int arg_index = 0;
+  for (sym = sym->next; sym; sym = sym->next, ++arg_index)
   {
     CType *type = &sym->type;
-    int flags;
+    int flags = 0;
     int addr = 0;
-    int actual_size;
-    int is_large_struct = 0;
-    int large_struct_param_vr = -1;
-    int large_struct_ptr_slot = 0;
 
     size = type_size(type, &align);
-    actual_size = size;
+    if (align < 1)
+      align = 1;
 
-    /* ARM EABI AAPCS: Composite types (struct/union) larger than 4 words (16 bytes)
-     * are passed by invisible reference - the caller passes a pointer.
-     * The callee receives a pointer, not the struct itself.
-     */
-    if ((type->t & VT_BTYPE) == VT_STRUCT && size > 16)
+    TCCAbiArgDesc desc;
+    memset(&desc, 0, sizeof(desc));
+    memset(&dst, 0, sizeof(dst));
+
+    if ((type->t & VT_BTYPE) == VT_STRUCT)
     {
-      is_large_struct = 1;
-      size = architecture_config.reg_size; /* Pointer size */
-      align = architecture_config.reg_size;
+      desc.kind = TCC_ABI_ARG_STRUCT_BYVAL;
+      desc.size = (uint16_t)size;
+      desc.alignment = (uint8_t)align;
     }
-
-    size = CEIL_DIV(size, architecture_config.reg_size);
-    align = ALIGN(align, architecture_config.reg_size);
-    if (pn < architecture_config.parameter_registers)
+    else if (tcc_ir_is_64bit_type(type->t))
     {
-      pn = (pn + (align - 1) / 4) & -(align / 4); // ALIGN(pn, align);
-      addr = pn * architecture_config.reg_size;
-      pn += size;
-      if (!sn && pn > architecture_config.parameter_registers)
-      {
-        sn = pn - architecture_config.parameter_registers;
-      }
+      desc.kind = TCC_ABI_ARG_SCALAR64;
+      desc.size = 8;
+      desc.alignment = (uint8_t)align;
     }
     else
     {
-      // take from stack
-      sn = (sn + (align - 1) / 4) & -(align / 4);
-      addr = (sn)*architecture_config.reg_size;
-      sn += size;
-      pn += size;
-      tcc_state->need_frame_pointer = 1;
+      desc.kind = TCC_ABI_ARG_SCALAR32;
+      desc.size = 4;
+      desc.alignment = (uint8_t)align;
     }
 
-    /* Large structs passed by invisible reference:
-     * - ABI provides a pointer as the incoming parameter.
-     * - For the C-visible struct parameter we model it as VT_LLOCAL where the
-     *   pointer is stored in a callee-local slot.
-     * - Insert an initial STORE from the hidden pointer-param vreg into that slot.
-     */
-    if (is_large_struct)
-    {
-      /* Allocate a local slot to hold the incoming pointer. */
-      loc = (loc - architecture_config.reg_size) & -architecture_config.reg_size;
-      large_struct_ptr_slot = loc;
+    TCCAbiArgLoc loc_info = tcc_abi_classify_argument(&call_layout, arg_index, &desc);
 
-      /* Create a hidden parameter vreg for the incoming pointer and store it. */
-      large_struct_param_vr = tcc_ir_get_vreg_param(ir);
+    /* Any stack-passed argument means we must keep a stable frame pointer
+     * for addressing the caller argument area.
+     */
+    if (loc_info.kind == TCC_ABI_LOC_STACK)
+      tcc_state->need_frame_pointer = 1;
+
+    if ((type->t & VT_BTYPE) == VT_STRUCT)
+    {
+      const int invisible_ref =
+          (call_layout.arg_flags && (call_layout.arg_flags[arg_index] & TCC_ABI_ARG_FLAG_INVISIBLE_REF));
+      const int actual_size = (call_layout.args_original ? (int)call_layout.args_original[arg_index].size : size);
+      const int actual_align =
+          (call_layout.args_original ? (int)call_layout.args_original[arg_index].alignment : align);
+      int slot_align = actual_align;
+      if (slot_align < 4)
+        slot_align = 4;
+
+      if (invisible_ref)
       {
+        /* ABI decided: large struct passed as hidden pointer.
+         * Materialize: read pointer param into a callee-local slot,
+         * expose C-visible struct param as an lvalue at that slot.
+         */
+        loc = (loc - PTR_SIZE) & -PTR_SIZE;
+        const int ptr_slot = loc;
+        const int ptr_param_vr = tcc_ir_get_vreg_param(ir);
+
         SValue src;
-        SValue dst;
         memset(&src, 0, sizeof(src));
         memset(&dst, 0, sizeof(dst));
         src.type.t = VT_PTR;
         src.r = 0;
-        src.vr = large_struct_param_vr;
-
+        src.vr = ptr_param_vr;
         dst.type.t = VT_PTR;
         dst.r = VT_LOCAL | VT_LVAL;
         dst.vr = -1;
-        dst.c.i = large_struct_ptr_slot;
-
+        dst.c.i = ptr_slot;
         tcc_ir_put(ir, TCCIR_OP_STORE, &src, NULL, &dst);
+
+        flags = VT_LVAL | VT_LLOCAL;
+        addr = ptr_slot;
+        sym_push(sym->v & ~SYM_FIELD, type, flags, addr);
+        continue;
       }
 
-      flags = VT_LVAL | VT_LLOCAL;
-      addr = large_struct_ptr_slot;
+      if (loc_info.kind == TCC_ABI_LOC_REG)
+      {
+        /* Struct passed in registers: spill incoming words into a callee-local
+         * home and model the C-visible param as an lvalue on that home.
+         */
+        int slot_size = tcc_abi_align_up_int(actual_size, 4);
+        loc = (loc - slot_size) & -slot_align;
+        const int struct_slot = loc;
+
+        const int word_count = (slot_size + 3) / 4;
+        for (int w = 0; w < word_count; ++w)
+        {
+          const int word_param_vr = tcc_ir_get_vreg_param(ir);
+          SValue src;
+          SValue dst;
+          memset(&src, 0, sizeof(src));
+          memset(&dst, 0, sizeof(dst));
+          src.type.t = VT_INT;
+          src.r = 0;
+          src.vr = word_param_vr;
+          dst.type.t = VT_INT;
+          dst.r = VT_LOCAL | VT_LVAL;
+          dst.vr = -1;
+          dst.c.i = struct_slot + w * 4;
+          tcc_ir_put(ir, TCCIR_OP_STORE, &src, NULL, &dst);
+        }
+
+        flags = VT_LVAL | VT_LLOCAL;
+        addr = struct_slot;
+        sym_push(sym->v & ~SYM_FIELD, type, flags, addr);
+        continue;
+      }
+
+      /* Struct passed on stack: keep it as a VT_PARAM lvalue at incoming stack offset. */
+      flags = VT_PARAM | VT_LVAL | VT_LOCAL;
+      addr = loc_info.stack_off;
+      sym_push(sym->v & ~SYM_FIELD, type, flags, addr);
+      continue;
+    }
+
+    /* Scalar params are always represented as PARAM vregs.
+     * Do not encode ABI offsets here; prolog/incoming-reg tracking computes
+     * that later from PARAM vreg ordering.
+     */
+    if (loc_info.kind == TCC_ABI_LOC_REG)
+    {
+      /* In-register param */
+      flags = VT_PARAM | VT_LVAL;
+      // argument is materialized in register, not local stack
+      addr = 0;
     }
     else
     {
       flags = VT_PARAM | VT_LVAL | VT_LOCAL;
+      addr = loc_info.stack_off;
+      /* On-stack param */
     }
-    sym_push(sym->v & ~SYM_FIELD, type, flags, addr);
+
+    sym->r |= ~(VT_LVAL | VT_LLOCAL);
+    tcc_debug_print_sym(sym_push(sym->v & ~SYM_FIELD, type, flags, addr));
   }
-  ir->leaffunc = 1;
-  ir->loc = 0;
+
+  tcc_abi_call_layout_deinit(&call_layout);
 }
 
 void tcc_ir_gen_opf(TCCIRState *ir, int op)
@@ -1327,56 +1375,10 @@ TccIrOp tcc_irop_from_token(int token)
   exit(1);
 }
 
-/* Helper: if sv is an lvalue (memory reference), emit a LOAD and update sv
- * to reference the loaded value. Used by frontend lowering and IR ops. */
-void tcc_ir_load_if_lvalue(TCCIRState *ir, SValue *sv)
-{
-  /* If operand is an lvalue, load it so arithmetic compares use the value
-   * instead of the stack address. This must also cover VT_LOCAL|VT_LVAL
-   * (locals/params), not just non-local lvalues.
-   *
-   * IMPORTANT EXCEPTION: Arrays with VT_LVAL are NOT memory references to load!
-   * In C, arrays decay to pointers to their first element. When an array has
-   * VT_LVAL set, it means "address of array" not "load from array address".
-   * For arrays, we should NOT emit a LOAD - just clear VT_LVAL to get the
-   * address value (which for VT_LOCAL arrays is FP + offset).
-   */
-  if (sv->r & VT_LVAL)
-  {
-    /* Arrays decay to pointers - don't load, just clear VT_LVAL to get address */
-    if (sv->type.t & VT_ARRAY)
-    {
-      sv->r &= ~VT_LVAL;
-      return;
-    }
-
-    /* LOAD expects an address value in src1; the VT_LVAL flag on `sv` means
-     * "this is an lvalue" (stack slot / pointer-deref). Pass the address to
-     * LOAD (clear VT_LVAL) to avoid double-dereference in later codegen.
-     */
-    SValue load_addr = *sv;
-    load_addr.r &= ~VT_LVAL;
-
-    SValue load_dest;
-    load_dest.type = sv->type;
-    load_dest.vr = tcc_ir_get_vreg_temp(ir);
-    load_dest.r = 0;
-    load_dest.c.i = 0;
-    tcc_ir_put(ir, TCCIR_OP_LOAD, &load_addr, NULL, &load_dest);
-    sv->vr = load_dest.vr;
-    sv->r = 0; /* no longer an lvalue */
-  }
-}
-
 void tcc_ir_gen_opi(TCCIRState *ir, int op)
 {
   const TccIrOp ir_op = tcc_irop_from_token(op);
   SValue dest;
-
-  /* Load operands from memory if they are lvalues (e.g., array[i]).
-   * This ensures we compare/operate on values, not addresses. */
-  tcc_ir_load_if_lvalue(ir, &vtop[-1]);
-  tcc_ir_load_if_lvalue(ir, &vtop[0]);
 
   if (ir_op == TCCIR_OP_CMP)
   {
@@ -2045,9 +2047,6 @@ static int tcc_ir_has_call_in_range(TCCIRState *ir, int start, int end)
  * corresponding FUNCCALL instruction. */
 static void tcc_ir_extend_param_intervals(TCCIRState *ir)
 {
-  /* Ensure callsite bindings exist for the current IR stream. */
-  tcc_ir_build_callsites(ir);
-
   for (int cs_i = 0; cs_i < ir->callsite_count; ++cs_i)
   {
     const IRCallSite *cs = &ir->callsites[cs_i];
@@ -2206,10 +2205,8 @@ void tcc_ir_liveness_analysis(TCCIRState *ir)
       {
         /* Don't decrement if this vreg is an argument to the call - it needs
          * to stay live during argument loading in tcc_gen_machine_func_call_op */
-        if (!tcc_ir_vreg_is_call_argument(ir, encoded_vreg, end))
-          end--; /* Do not include call instruction itself */
-        else
-          crosses_call = 1; /* Call arg must be in callee-saved reg or spilled */
+        // end--; /* Do not include call instruction itself */
+        // crosses_call = 1; /* Call arg must be in callee-saved reg or spilled */
       }
       tcc_ls_add_live_interval(&ir->ls, encoded_vreg, start, end, crosses_call, addrtaken, reg_type,
                                interval->is_lvalue, -1);
@@ -2234,22 +2231,22 @@ void tcc_ir_liveness_analysis(TCCIRState *ir)
        * (arguments are consumed by the call), BUT if this vreg is the function
        * pointer (src1 of the call) OR a function argument, we must keep it
        * alive through the call. */
-      if (end < ir->next_instruction_index &&
-          (ir->instructions[end].op == TCCIR_OP_FUNCCALLVAL || ir->instructions[end].op == TCCIR_OP_FUNCCALLVOID))
-      {
-        /* Check if this vreg is the function pointer (src1) of this call,
-         * or if it's an argument to the call */
-        if (ir->instructions[end].src1.vr != vreg_encoded && !tcc_ir_vreg_is_call_argument(ir, vreg_encoded, end))
-        {
-          end--; /* Do not include call instruction itself for non-func-ptr and non-arg vregs */
-        }
-        else
-        {
-          /* This vreg IS a call argument or func ptr - it crosses this call
-           * and must be in a callee-saved register or spilled. */
-          crosses_call = 1;
-        }
-      }
+      // if (end < ir->next_instruction_index &&
+      //     (ir->instructions[end].op == TCCIR_OP_FUNCCALLVAL || ir->instructions[end].op == TCCIR_OP_FUNCCALLVOID))
+      // {
+      //   /* Check if this vreg is the function pointer (src1) of this call,
+      //    * or if it's an argument to the call */
+      //   if (ir->instructions[end].src1.vr != vreg_encoded && !tcc_ir_vreg_is_call_argument(ir, vreg_encoded, end))
+      //   {
+      //     end--; /* Do not include call instruction itself for non-func-ptr and non-arg vregs */
+      //   }
+      //   else
+      //   {
+      //     /* This vreg IS a call argument or func ptr - it crosses this call
+      //      * and must be in a callee-saved register or spilled. */
+      //     crosses_call = 1;
+      //   }
+      // }
       tcc_ls_add_live_interval(&ir->ls, vreg_encoded, start, end, crosses_call, addrtaken, reg_type,
                                interval->is_lvalue, -1);
     }
@@ -2267,13 +2264,13 @@ void tcc_ir_liveness_analysis(TCCIRState *ir)
     /* If param never used (end would be 0 from memset), set minimal end */
     if (end == 0)
       end = 1; /* Ensure at least one instruction range for allocation */
-    if (end < ir->next_instruction_index &&
-        (ir->instructions[end].op == TCCIR_OP_FUNCCALLVAL || ir->instructions[end].op == TCCIR_OP_FUNCCALLVOID))
-    {
-      /* Don't decrement if this vreg is an argument to the call */
-      if (!tcc_ir_vreg_is_call_argument(ir, vreg_encoded, end))
-        end--; /* Do not include call instruction itself */
-    }
+    // if (end < ir->next_instruction_index &&
+    //     (ir->instructions[end].op == TCCIR_OP_FUNCCALLVAL || ir->instructions[end].op == TCCIR_OP_FUNCCALLVOID))
+    // {
+    //   /* Don't decrement if this vreg is an argument to the call */
+    //   if (!tcc_ir_vreg_is_call_argument(ir, vreg_encoded, end))
+    //     end--; /* Do not include call instruction itself */
+    // }
     /* Parameters are live at function entry *before* IR instruction 0.
      * So a call at IR[0] must be treated as crossing for parameters, unlike
      * temporaries/locals where start marks a definition point.
@@ -2525,6 +2522,19 @@ void tcc_ir_materialize_value(TCCIRState *ir, SValue *sv, TCCMaterializedValue *
     return;
   }
 
+  /* Register parameters (VT_PARAM with vreg, not on stack) have VT_LVAL set
+   * to allow taking their address. But when materializing the VALUE, we need to
+   * clear VT_LVAL since the register already holds the value, not a pointer. */
+  if ((sv->r & VT_PARAM) && (sv->r & VT_LVAL))
+  {
+    const int val_kind = sv->r & VT_VALMASK;
+    if (val_kind != VT_LOCAL && val_kind != VT_LLOCAL)
+    {
+      /* Register parameter - clear VT_LVAL since it's already a value */
+      sv->r &= ~VT_LVAL;
+    }
+  }
+
   if (!(sv->pr0 & PREG_SPILLED))
   {
     return;
@@ -2586,7 +2596,9 @@ void tcc_ir_materialize_value(TCCIRState *ir, SValue *sv, TCCMaterializedValue *
 
   sv->pr0 = scratch.regs[0];
   sv->pr1 = is_64bit ? scratch.regs[1] : PREG_NONE;
-  sv->r = (unsigned short)(sv->pr0 | preserved_flags);
+  /* sv->r should only contain the register number and semantic flags (VT_LVAL, VT_PARAM, etc.),
+   * not PREG_SPILLED which is only for sv->pr0 */
+  sv->r = (unsigned short)(scratch.regs[0] | preserved_flags);
   sv->c.i = 0;
 
   result->used_scratch = 1;
@@ -2595,7 +2607,7 @@ void tcc_ir_materialize_value(TCCIRState *ir, SValue *sv, TCCMaterializedValue *
   result->scratch = scratch;
 }
 
-void tcc_ir_materialize_addr(TCCIRState *ir, SValue *sv, TCCMaterializedAddr *result)
+void tcc_ir_materialize_addr(TCCIRState *ir, SValue *sv, TCCMaterializedAddr *result, int dest_reg)
 {
   if (result)
     memset(result, 0, sizeof(*result));
@@ -2611,6 +2623,20 @@ void tcc_ir_materialize_addr(TCCIRState *ir, SValue *sv, TCCMaterializedAddr *re
 
   if (!wants_stack_address && !spilled_pointer)
     return;
+
+  /* Optimization: For VT_LOCAL with encodable offsets, skip materialization.
+   * Let the backend handle it directly with [base, #offset] addressing mode
+   * instead of wasting a scratch register to compute the address. */
+  if (wants_stack_address)
+  {
+    const int frame_offset = tcc_ir_materialization_offset(ir, sv);
+    const int is_param = (sv->r & VT_PARAM) ? 1 : 0;
+    /* Use the actual destination register for the encoding test.
+     * If dest_reg is invalid (PREG_NONE), fall back to r12 (typical scratch). */
+    const int test_reg = (dest_reg != PREG_NONE && dest_reg < 16) ? dest_reg : 12;
+    if (tcc_machine_can_encode_stack_offset_with_param_adj(frame_offset, is_param, test_reg))
+      return; /* Backend can encode this offset directly, no scratch needed */
+  }
 
   tcc_ir_require_materialization_result(result, "materialize_addr");
 
@@ -2861,6 +2887,38 @@ void tcc_ir_register_allocation_params(TCCIRState *ir)
   }
 }
 
+/* Mark function return value vregs with incoming_reg0 to indicate they arrive in r0.
+ * This allows the register allocator to decide whether to keep them in r0 or move them
+ * if r0 is needed for something else (like the next call's argument). */
+void tcc_ir_mark_return_value_incoming_regs(TCCIRState *ir)
+{
+  if (!ir)
+    return;
+
+  /* Scan all instructions to find FUNCCALLVAL that produce return values */
+  for (int i = 0; i < ir->next_instruction_index; ++i)
+  {
+    TACQuadruple *q = &ir->instructions[i];
+    if (q->op != TCCIR_OP_FUNCCALLVAL)
+      continue;
+
+    /* dest is the vreg that receives the return value */
+    if (q->dest.vr < 0 || !tcc_is_vreg_valid(ir, q->dest.vr))
+      continue;
+
+    IRLiveInterval *interval = tcc_ir_get_live_interval(ir, q->dest.vr);
+    if (!interval)
+      continue;
+
+    /* Mark that this vreg arrives in r0 (or r0+r1 for 64-bit returns) */
+    interval->incoming_reg0 = 0; /* r0 */
+    if (interval->is_llong || interval->is_double)
+      interval->incoming_reg1 = 1; /* r1 */
+    else
+      interval->incoming_reg1 = -1;
+  }
+}
+
 void tcc_ir_avoid_spilling_stack_passed_params(TCCIRState *ir)
 {
   if (!ir)
@@ -2970,6 +3028,14 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
       return;
     }
 
+    /* Register-passed parameters: if allocated to a register (not spilled),
+     * clear VT_LVAL. The value is already in the register, no dereference needed.
+     * VT_LVAL is only used on parameters for address-of operations (&param) or
+     * when they're on the stack (VT_LOCAL).
+     */
+    int is_register_param =
+        (TCCIR_DECODE_VREG_TYPE(sv->vr) == TCCIR_VREG_TYPE_PARAM && interval && interval->incoming_reg0 >= 0);
+
     sv->pr0 = interval->allocation.r0;
     sv->pr1 = interval->allocation.r1;
     sv->c.i = interval->allocation.offset;
@@ -2980,10 +3046,13 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
      *   the value is already in the register, no load needed.
      * - If old_r has VT_LVAL but (old_r & VT_VALMASK) < VT_CONST, it means
      *   the vreg holds a pointer that needs dereferencing - preserve VT_LVAL.
+     * - Register parameters: do NOT preserve VT_LVAL when allocated to a register.
+     *   VT_LVAL on parameters is only needed for stack params (VT_LOCAL) or for
+     *   address-of operations.
      * - If old_r does NOT have VT_LVAL, this is an address-of operation
      *   (we want the address, not the value). Do NOT add VT_LVAL. */
-    int preserve_lval = 0;
-    if ((old_r & VT_LVAL) && old_v < VT_CONST && old_v != VT_LOCAL && old_v != VT_LLOCAL)
+    int preserve_flags = old_r & VT_PARAM; /* Always preserve VT_PARAM */
+    if ((old_r & VT_LVAL) && old_v < VT_CONST && old_v != VT_LOCAL && old_v != VT_LLOCAL && !is_register_param)
     {
       /* The vreg holds a pointer that needs dereferencing.
        * Note: VT_LOCAL/VT_LLOCAL use VT_LVAL to mean "load from stack slot".
@@ -2991,7 +3060,7 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
        * preserve VT_LVAL, otherwise we turn a plain value into a pointer
        * dereference (double-indirection bugs).
        */
-      preserve_lval = VT_LVAL;
+      preserve_flags |= VT_LVAL;
     }
 
     if (interval->allocation.r0 == PREG_SPILLED || interval->allocation.offset != 0)
@@ -3012,12 +3081,12 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
          * (not a pure write destination) - need VT_LVAL to load from stack */
         need_lval = VT_LVAL;
       }
-      sv->r = VT_LOCAL | need_lval;
+      sv->r = VT_LOCAL | need_lval | (old_r & VT_PARAM);
     }
     else if (interval->allocation.r0 != PREG_NONE)
     {
       /* In a register - set r to the register number, preserving VT_LVAL only for pointer derefs */
-      sv->r = interval->allocation.r0 | preserve_lval;
+      sv->r = interval->allocation.r0 | preserve_flags;
     }
   }
   else if ((sv->vr == -1 || sv->vr == 0 || TCCIR_DECODE_VREG_TYPE(sv->vr) == 0) &&
@@ -5155,13 +5224,13 @@ void tcc_ir_put_soft_call(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2
   memset(&param, 0, sizeof(SValue));
   if (irop_config[q.op].has_src1)
   {
-    param.c.i = 0;
-    tcc_ir_put_with_aux(ir, TCCIR_OP_FUNCPARAMVAL, src1, &param, NULL, call_id);
+    param.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
+    tcc_ir_put(ir, TCCIR_OP_FUNCPARAMVAL, src1, &param, NULL);
   }
   if (irop_config[q.op].has_src2)
   {
-    param.c.i = 1;
-    tcc_ir_put_with_aux(ir, TCCIR_OP_FUNCPARAMVAL, src2, &param, NULL, call_id);
+    param.c.i = TCCIR_ENCODE_PARAM(call_id, 1);
+    tcc_ir_put(ir, TCCIR_OP_FUNCPARAMVAL, src2, &param, NULL);
   }
   sym = external_global_sym(tok_alloc_const(func_name), &func_old_type);
   param.r = VT_CONST | VT_SYM;
@@ -5170,11 +5239,13 @@ void tcc_ir_put_soft_call(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2
 
   if (irop_config[q.op].has_dest)
   {
-    tcc_ir_put_with_aux(ir, TCCIR_OP_FUNCCALLVAL, &param, NULL, dest, call_id);
+    SValue call_id_sv = tcc_ir_svalue_call_id(call_id);
+    tcc_ir_put(ir, TCCIR_OP_FUNCCALLVAL, &param, &call_id_sv, dest);
   }
   else
   {
-    tcc_ir_put_with_aux(ir, TCCIR_OP_FUNCCALLVOID, &param, NULL, NULL, call_id);
+    SValue call_id_sv = tcc_ir_svalue_call_id(call_id);
+    tcc_ir_put(ir, TCCIR_OP_FUNCCALLVOID, &param, &call_id_sv, NULL);
   }
 }
 
@@ -5400,7 +5471,7 @@ static void tcc_ir_codegen_inline_asm(TCCIRState *ir, const TACQuadruple *q)
 {
   if (!ir || !q)
     return;
-  const int id = q->aux;
+  const int id = (int)q->src1.c.i;
   if (id < 0 || id >= ir->inline_asm_count)
     tcc_error("IR: invalid inline asm id");
 
@@ -5440,136 +5511,6 @@ void tcc_ir_generate_code(TCCIRState *ir)
 {
   TACQuadruple *q;
   int drop_return_value = 0;
-
-  /* Build callsite bindings for machine call lowering.
-   * Backends are not allowed to scan FUNCPARAM instructions.
-   */
-  tcc_ir_build_callsites(ir);
-
-  /* Compute ABI call layouts for eligible scalar-only calls.
-   *
-   * The IR-prepared call path writes any outgoing stack args into a fixed
-   * FP-relative outgoing area reserved in the function frame.
-   */
-  if (ir->callsite_count > 0)
-  {
-    ir->callsite_abi_layouts = tcc_mallocz(sizeof(TCCAbiCallLayout) * (size_t)ir->callsite_count);
-    ir->callsite_abi_layouts_size = ir->callsite_count;
-
-    for (int cs_idx = 0; cs_idx < ir->callsite_count; ++cs_idx)
-    {
-      IRCallSite *cs = &ir->callsites[cs_idx];
-      cs->args_prepared = 0;
-
-      const int argc = cs->argc;
-      if (argc <= 0)
-      {
-        /* No arguments - trivially prepared */
-        cs->args_prepared = 1;
-        continue;
-      }
-
-      int eligible = 1;
-      TCCAbiArgDesc *descs = tcc_mallocz(sizeof(TCCAbiArgDesc) * (size_t)argc);
-      TCCAbiArgLoc *locs = tcc_mallocz(sizeof(TCCAbiArgLoc) * (size_t)argc);
-
-      for (int a = 0; a < argc; ++a)
-      {
-        const SValue *sv = tcc_ir_callsite_arg_value_ptr(ir, &cs->args[a]);
-        int bt = sv->type.t & VT_BTYPE;
-
-        int align = 4;
-        CType tmp = sv->type;
-        int size = type_size(&tmp, &align);
-
-        if (bt == VT_STRUCT)
-        {
-          /* Structs passed by value: use actual struct size */
-          int slot_sz = (size + 3) & ~3; /* Round up to 4-byte alignment */
-          descs[a].kind = TCC_ABI_ARG_STRUCT_BYVAL;
-          descs[a].size = (uint16_t)slot_sz;
-          descs[a].alignment = (uint8_t)((align < 4) ? 4 : align);
-        }
-        else if (size == 8)
-        {
-          descs[a].kind = TCC_ABI_ARG_SCALAR64;
-          descs[a].size = 8;
-          descs[a].alignment = (uint8_t)((align < 8) ? 8 : align);
-        }
-        else
-        {
-          descs[a].kind = TCC_ABI_ARG_SCALAR32;
-          descs[a].size = 4;
-          descs[a].alignment = (uint8_t)((align < 4) ? 4 : align);
-        }
-      }
-
-      if (!eligible)
-      {
-        tcc_free(descs);
-        tcc_free(locs);
-        continue;
-      }
-
-      TCCAbiCallLayout layout = {0};
-      layout.argc = argc;
-      layout.locs = locs;
-      if (tcc_gen_machine_abi_assign_call_args(descs, argc, &layout) != 0)
-      {
-        tcc_free(descs);
-        tcc_free(locs);
-        continue;
-      }
-
-      ir->callsite_abi_layouts[cs_idx] = layout;
-      cs->args_prepared = 1;
-
-      tcc_free(descs);
-    }
-
-    /* Reserve a fixed outgoing stack args area in the function frame.
-     * Stack args will be written to [FP + call_outgoing_base + stack_off]. */
-    int max_out_stack = 0;
-    int max_out_align = 8;
-    for (int cs_idx = 0; cs_idx < ir->callsite_count; ++cs_idx)
-    {
-      const IRCallSite *cs = &ir->callsites[cs_idx];
-      if (!cs->args_prepared)
-        continue;
-      const TCCAbiCallLayout *layout = &ir->callsite_abi_layouts[cs_idx];
-      if (layout->stack_size > max_out_stack)
-        max_out_stack = layout->stack_size;
-      if (layout->stack_align > max_out_align)
-        max_out_align = layout->stack_align;
-    }
-
-    if (max_out_stack > 0)
-    {
-      int out_size = (max_out_stack + (max_out_align - 1)) & ~(max_out_align - 1);
-      /* Also keep 8-byte alignment for the overall frame. */
-      out_size = (out_size + 7) & ~7;
-      ir->call_outgoing_size = out_size;
-      /* NOTE: do NOT modify `loc` here.
-       * We reserve the outgoing area at the very bottom of the frame (at SP)
-       * right before prolog, so stack args are at call-time SP.
-       */
-      ir->call_outgoing_base = 0;
-    }
-  }
-
-  THGEN_DUMP("DEBUG tcc_ir_generate_code: ind=0x%x func_ind=0x%x n=%d\n", ind, func_ind, ir->next_instruction_index);
-  if (TCC_DUMP_THUMB_GEN)
-  {
-    int rv_count = 0;
-    for (int i = 0; i < ir->next_instruction_index; ++i)
-      if (ir->instructions[i].op == TCCIR_OP_RETURNVALUE)
-        rv_count++;
-    THGEN_DUMP("DEBUG tcc_ir_generate_code: returnvalue_count=%d last_ops:", rv_count);
-    for (int k = ir->next_instruction_index - 3; k < ir->next_instruction_index; ++k)
-      if (k >= 0)
-        THGEN_DUMP(" %d", ir->instructions[k].op);
-    THGEN_DUMP("\n");
-  }
 
   /* `&&label` stores label positions as IR indices BEFORE DCE/compaction.
    * Build a mapping for original indices, not just the compacted array indices.
@@ -5663,12 +5604,6 @@ void tcc_ir_generate_code(TCCIRState *ir)
     ir->codegen_instruction_idx = i;
 
     int ind_before = ind;
-
-    if (TCC_DUMP_THUMB_GEN)
-    {
-      THGEN_DUMP("IR[%d] orig=%d line=%d ind=0x%x op=%s\n", i, q->orig_index, q->line_num, ind,
-                 tcc_ir_get_op_name(q->op));
-    }
 
     ir_to_code_mapping[i] = ind;
 
@@ -5771,10 +5706,9 @@ void tcc_ir_generate_code(TCCIRState *ir)
       need_src1_value = true;
       break;
     case TCCIR_OP_FUNCPARAMVAL:
-      /* FUNCPARAMVAL is an IR-only marker.
-       * Do not materialize here: any scratch regs acquired would be released at
-       * end-of-instruction and could not be relied on by the later FUNCCALL.
-       * Call arguments are materialized for real at FUNCCALL time.
+      /* FUNCPARAMVAL is a marker op only.
+       * Argument placement is handled when we reach the owning FUNCCALL*,
+       * so do not materialize anything here (would just emit dead loads).
        */
       break;
     case TCCIR_OP_FUNCCALLVAL:
@@ -5782,11 +5716,6 @@ void tcc_ir_generate_code(TCCIRState *ir)
       /* fall through */
     case TCCIR_OP_FUNCCALLVOID:
     {
-      int callsite_index = -1;
-      if (ir->callsite_index_by_call_instr && i >= 0 && i < ir->callsite_index_by_call_instr_size)
-        callsite_index = ir->callsite_index_by_call_instr[i];
-      if (callsite_index >= 0 && callsite_index < ir->callsite_count && ir->callsites[callsite_index].args_prepared)
-        ir->codegen_materialize_scratch_flags |= TCC_MACHINE_SCRATCH_AVOID_CALL_ARG_REGS;
       need_src1_value = true;
       break;
     }
@@ -5803,19 +5732,22 @@ void tcc_ir_generate_code(TCCIRState *ir)
     TCCMaterializedAddr mat_src2_addr = {0};
     TCCMaterializedAddr mat_dest_addr = {0};
     TCCMaterializedDest mat_dest = {0};
-
+#if TCC_DUMP_THUMB_GEN
+    THGEN_DUMP("IR[%d] orig=%d line=%d ind=0x%x ", i, q->orig_index, q->line_num, ind);
+    tcc_dump_quadruple_to(stderr, q, i);
+#endif
     if (need_src1_value)
       tcc_ir_materialize_value(ir, &q->src1, &mat_src1);
     if (need_src1_addr)
-      tcc_ir_materialize_addr(ir, &q->src1, &mat_src1_addr);
+      tcc_ir_materialize_addr(ir, &q->src1, &mat_src1_addr, q->dest.pr0);
     if (need_src2_value)
       tcc_ir_materialize_value(ir, &q->src2, &mat_src2);
     if (need_src2_addr)
-      tcc_ir_materialize_addr(ir, &q->src2, &mat_src2_addr);
+      tcc_ir_materialize_addr(ir, &q->src2, &mat_src2_addr, q->dest.pr0);
     if (need_dest_value)
       tcc_ir_materialize_dest(ir, &q->dest, &mat_dest);
     if (need_dest_addr)
-      tcc_ir_materialize_addr(ir, &q->dest, &mat_dest_addr);
+      tcc_ir_materialize_addr(ir, &q->dest, &mat_dest_addr, q->dest.pr0);
 
     switch (q->op)
     {
@@ -5863,14 +5795,7 @@ void tcc_ir_generate_code(TCCIRState *ir)
           q->dest.pr1 = REG_IRE2; /* R1 */
         }
       }
-      if (tcc_ir_operand_needs_dereference(&q->src1))
-      {
-        tcc_gen_machine_load_op(q);
-      }
-      else
-      {
-        tcc_gen_machine_assign_op(q);
-      }
+      tcc_gen_machine_load_op(q);
       break;
     }
     case TCCIR_OP_STORE:
@@ -5926,19 +5851,7 @@ void tcc_ir_generate_code(TCCIRState *ir)
       break;
     case TCCIR_OP_FUNCPARAMVAL:
     {
-      /* IR-only marker; refresh callsite descriptor with materialized value. */
-      if (ir->callsite_arg_binding_by_instr && i >= 0 && i < ir->callsite_arg_binding_size)
-      {
-        const IRCallsiteArgBinding *binding = &ir->callsite_arg_binding_by_instr[i];
-        if (binding->callsite_index >= 0 && binding->callsite_index < ir->callsite_count)
-        {
-          IRCallSite *cs = &ir->callsites[binding->callsite_index];
-          if (binding->arg_index >= 0 && binding->arg_index < cs->argc)
-          {
-            cs->args[binding->arg_index].value = q->src1;
-          }
-        }
-      }
+      tcc_gen_machine_func_parameter_op(q);
       break;
     }
     case TCCIR_OP_JUMP:
@@ -5963,6 +5876,8 @@ void tcc_ir_generate_code(TCCIRState *ir)
       tcc_gen_machine_bool_op(q);
       break;
     case TCCIR_OP_FUNCPARAMVOID:
+      /* Create call site for void calls (no parameters) */
+      tcc_gen_machine_func_parameter_op(q);
       break;
     case TCCIR_OP_VLA_ALLOC:
     case TCCIR_OP_VLA_SP_SAVE:
@@ -5974,221 +5889,7 @@ void tcc_ir_generate_code(TCCIRState *ir)
       /* fall through */
     case TCCIR_OP_FUNCCALLVAL:
     {
-      // Save the call instruction index before potentially incrementing i
-      int call_idx = i;
-      // if return follows call then we can optimize away move
-      const TACQuadruple *ir_next = (i + 1 < ir->next_instruction_index) ? &ir->instructions[i + 1] : NULL;
-      // if (ir_next && ir_next->op == TCCIR_OP_RETURNVALUE && ir_next->src1.vr == q->dest.vr && q->src1.vr != -1)
-      // {
-      //   q->dest.pr0 = REG_IRET;
-      //   ++i; // skip next instruction
-      // }
-
-      int callsite_index = -1;
-      if (ir->callsite_index_by_call_instr && call_idx >= 0 && call_idx < ir->callsite_index_by_call_instr_size)
-        callsite_index = ir->callsite_index_by_call_instr[call_idx];
-
-      IRCallSite *cs = NULL;
-      int prepared = 0;
-      if (callsite_index >= 0 && callsite_index < ir->callsite_count)
-      {
-        cs = &ir->callsites[callsite_index];
-        prepared = cs->args_prepared;
-      }
-
-      if (prepared)
-      {
-        if (!ir->callsite_abi_layouts || callsite_index >= ir->callsite_abi_layouts_size)
-          tcc_error("compiler_error: missing ABI layout for prepared callsite %d", callsite_index);
-
-        const TCCAbiCallLayout *layout = &ir->callsite_abi_layouts[callsite_index];
-        if (layout->argc != cs->argc)
-          tcc_error("compiler_error: ABI layout argc mismatch for callsite %d", callsite_index);
-        if (layout->stack_size != 0 && ir->call_outgoing_size == 0)
-          tcc_error("compiler_error: prepared call has stack args but no outgoing area");
-
-        TACQuadruple call_q = *q;
-
-        /* If indirect call target ended up in R0-R3, preserve it before filling arg regs. */
-        TCCMachineScratchRegs pinned_target = {0};
-        int pinned_in_use = 0;
-        if ((call_q.src1.r & (VT_VALMASK | VT_LVAL)) != VT_CONST && call_q.src1.pr0 >= 0 && call_q.src1.pr0 <= 3)
-        {
-          tcc_machine_acquire_scratch(&pinned_target,
-                                      TCC_MACHINE_SCRATCH_AVOID_CALL_ARG_REGS | TCC_MACHINE_SCRATCH_AVOID_PERM_SCRATCH);
-          pinned_in_use = 1;
-          SValue mv_src = call_q.src1;
-          SValue mv_dst;
-          memset(&mv_dst, 0, sizeof(mv_dst));
-          mv_dst.type = mv_src.type;
-          mv_dst.pr0 = pinned_target.regs[0];
-          mv_dst.pr1 = PREG_NONE;
-          mv_dst.r = 0;
-          mv_dst.vr = -1;
-          TACQuadruple mv = {0};
-          mv.op = TCCIR_OP_ASSIGN;
-          mv.src1 = mv_src;
-          mv.dest = mv_dst;
-          tcc_gen_machine_assign_op(&mv);
-          call_q.src1.pr0 = pinned_target.regs[0];
-        }
-
-        /* Stack args -> fixed outgoing area (FP-relative). Do this before filling R0-R3
-         * so any scratch usage cannot clobber prepared argument registers. */
-        if (layout->stack_size != 0)
-        {
-          for (int a = 0; a < cs->argc; ++a)
-          {
-            const TCCAbiArgLoc *loca = &layout->locs[a];
-            if (loca->kind != TCC_ABI_LOC_STACK)
-              continue;
-
-            const int out_off = loca->stack_off;
-            const int is_64 = (loca->size == 8);
-
-            /* Compute arg value into scratch regs, then store into outgoing area. */
-            TCCMachineScratchRegs tmp = {0};
-            tcc_machine_acquire_scratch(&tmp, TCC_MACHINE_SCRATCH_AVOID_CALL_ARG_REGS |
-                                                  TCC_MACHINE_SCRATCH_AVOID_PERM_SCRATCH |
-                                                  (is_64 ? TCC_MACHINE_SCRATCH_NEEDS_PAIR : 0));
-
-            SValue arg_sv = *tcc_ir_callsite_arg_value_ptr(ir, &cs->args[a]);
-            /* Do NOT blindly clear pr0/pr1 here.
-             * For stack-passed call arguments it is common that the source value
-             * currently lives in R0-R3 (e.g. the 4th user argument to printf).
-             * Clearing pr0/pr1 can force materialization to fall back to a bogus
-             * stack reload (often from offset 0), aliasing the saved-register area
-             * and corrupting variadic calls.
-             */
-
-            const int want_deref = tcc_ir_operand_needs_dereference(&arg_sv);
-            TCCMaterializedValue mat_val = {0};
-            TCCMaterializedAddr mat_addr = {0};
-            unsigned saved_flags = ir->codegen_materialize_scratch_flags;
-            ir->codegen_materialize_scratch_flags =
-                TCC_MACHINE_SCRATCH_AVOID_CALL_ARG_REGS | TCC_MACHINE_SCRATCH_AVOID_PERM_SCRATCH;
-            if (want_deref)
-              tcc_ir_materialize_addr(ir, &arg_sv, &mat_addr);
-            else
-              tcc_ir_materialize_value(ir, &arg_sv, &mat_val);
-            ir->codegen_materialize_scratch_flags = saved_flags;
-
-            SValue dst;
-            memset(&dst, 0, sizeof(dst));
-            dst.type = arg_sv.type;
-            dst.r = 0;
-            dst.vr = -1;
-            dst.pr0 = tmp.regs[0];
-            dst.pr1 = is_64 ? tmp.regs[1] : PREG_NONE;
-
-            TACQuadruple mv = {0};
-            mv.op = want_deref ? TCCIR_OP_LOAD : TCCIR_OP_ASSIGN;
-            mv.src1 = arg_sv;
-            mv.dest = dst;
-            if (want_deref)
-              tcc_gen_machine_load_op(&mv);
-            else
-              tcc_gen_machine_assign_op(&mv);
-
-            tcc_gen_machine_store_to_sp(dst.pr0, out_off);
-            if (is_64)
-              tcc_gen_machine_store_to_sp(dst.pr1, out_off + 4);
-
-            if (want_deref)
-              tcc_ir_release_materialized_addr(&arg_sv, &mat_addr);
-            else
-              tcc_ir_release_materialized_value(&arg_sv, &mat_val);
-
-            tcc_machine_release_scratch(&tmp);
-          }
-        }
-
-        /* Reg args -> R0..R3.
-         * IMPORTANT: fill argument registers from high to low (R3..R0) to avoid
-         * clobbering when an argument value happens to live in a lower arg reg.
-         * (e.g. arg1 in R0, arg0 in R0 after literal load).
-         */
-        for (int reg = 3; reg >= 0; --reg)
-        {
-          for (int a = 0; a < cs->argc; ++a)
-          {
-            const TCCAbiArgLoc *loca = &layout->locs[a];
-            if (loca->kind != TCC_ABI_LOC_REG)
-              continue;
-            /* Only process when we hit the highest register of a multi-reg arg,
-             * since we iterate from high to low. For single-reg args, reg_base == reg.
-             * For multi-reg args, we start when reg == reg_base + reg_count - 1. */
-            int top_reg = (int)loca->reg_base + (int)loca->reg_count - 1;
-            if (reg != top_reg)
-              continue;
-
-            SValue arg_sv = *tcc_ir_callsite_arg_value_ptr(ir, &cs->args[a]);
-            /* Do NOT blindly clear pr0/pr1 for values currently in R0-R3.
-             * That can force a bogus “spill reload” from offset 0, which is not
-             * a valid spill slot and may alias the function’s saved-register area
-             * (e.g. vfunc printing saved IP instead of its parameter).
-             *
-             * We already fill argument registers from high to low (R3..R0), which
-             * avoids the common clobber hazard for sources living in lower regs.
-             */
-
-            const int want_deref = tcc_ir_operand_needs_dereference(&arg_sv);
-            TCCMaterializedValue mat_val = {0};
-            TCCMaterializedAddr mat_addr = {0};
-            unsigned saved_flags = ir->codegen_materialize_scratch_flags;
-            ir->codegen_materialize_scratch_flags =
-                TCC_MACHINE_SCRATCH_AVOID_CALL_ARG_REGS | TCC_MACHINE_SCRATCH_AVOID_PERM_SCRATCH;
-            if (want_deref)
-              tcc_ir_materialize_addr(ir, &arg_sv, &mat_addr);
-            else
-              tcc_ir_materialize_value(ir, &arg_sv, &mat_val);
-            ir->codegen_materialize_scratch_flags = saved_flags;
-
-            SValue dst;
-            memset(&dst, 0, sizeof(dst));
-            dst.type = arg_sv.type;
-            dst.r = 0;
-            dst.vr = -1;
-            dst.pr0 = loca->reg_base;
-            dst.pr1 = (loca->reg_count == 2) ? (loca->reg_base + 1) : PREG_NONE;
-
-            TACQuadruple mv = {0};
-            mv.op = want_deref ? TCCIR_OP_LOAD : TCCIR_OP_ASSIGN;
-            mv.src1 = arg_sv;
-            mv.dest = dst;
-            if (want_deref)
-              tcc_gen_machine_load_op(&mv);
-            else
-              tcc_gen_machine_assign_op(&mv);
-
-            if (want_deref)
-              tcc_ir_release_materialized_addr(&arg_sv, &mat_addr);
-            else
-              tcc_ir_release_materialized_value(&arg_sv, &mat_val);
-          }
-        }
-
-        tcc_gen_machine_func_call_op(&call_q, drop_return_value, ir, call_idx);
-
-        if (pinned_in_use)
-          tcc_machine_release_scratch(&pinned_target);
-      }
-      else
-      {
-        tcc_error("compiler_error: callsite %d not prepared (legacy path removed)", callsite_index);
-      }
-      /* Restore outer call's arguments if this was a nested call */
-      /* NOTE: ir_to_code_mapping[i] already set before switch - don't override here!
-       * Overriding causes jumps TO this call to land at wrong address (after call). */
-
-      /* If we skipped the following RETURNVALUE instruction, it still needs a mapping
-       * for any IR jumps/backpatch that might reference it. Keep orig mapping in sync. */
-      if (i >= 0 && i < ir->next_instruction_index)
-      {
-        int skipped_orig = ir->instructions[i].orig_index;
-        if (skipped_orig >= 0 && skipped_orig < ir->orig_ir_to_code_mapping_size)
-          orig_ir_to_code_mapping[skipped_orig] = ind;
-      }
+      tcc_gen_machine_func_call_op(q, drop_return_value, ir, i);
       /* Clear spill cache after function call - callee may have modified memory */
       tcc_ir_spill_cache_clear(&ir->spill_cache);
       break;
@@ -6233,12 +5934,14 @@ void tcc_ir_generate_code(TCCIRState *ir)
     tcc_ir_release_materialized_addr(&q->src1, &mat_src1_addr);
     tcc_ir_release_materialized_value(&q->src1, &mat_src1);
 
+    /* Disabled: hex dump of emitted bytes
     if (TCC_DUMP_THUMB_GEN && TCC_DUMP_THUMB_GEN_SPAN)
     {
       uint32_t ind_after = ind;
       THGEN_DUMP("  ; emitted %u bytes (0x%x -> 0x%x)\n", (unsigned)(ind_after - ind_before), ind_before, ind_after);
       tcc_dump_thumb_generated_span((uint32_t)ind_before, (uint32_t)ind_after);
     }
+    */
   }
 
   ir_to_code_mapping[ir->next_instruction_index] = ind;
@@ -6280,8 +5983,6 @@ void tcc_ir_print_vreg(int vreg)
 void print_svalue_short(SValue *sv)
 {
   int val_loc = sv->r & VT_VALMASK;
-#define SPILL_MARK_BEGIN "\033[41m"
-#define SPILL_MARK_END "\033[0m"
 
   /* XXX: probably show ignored vregs in a special way */
   switch (val_loc)
@@ -6399,7 +6100,8 @@ void tcc_print_quadruple(TACQuadruple *q, int pc)
     printf("%s ", tcc_ir_get_op_name(op));
     break;
   case TCCIR_OP_FUNCPARAMVAL:
-    printf("%s%d ", tcc_ir_get_op_name(op), q->src2.c.i);
+    printf("%s%d[call_%d] ", tcc_ir_get_op_name(op), TCCIR_DECODE_PARAM_IDX(q->src2.c.i),
+           TCCIR_DECODE_CALL_ID(q->src2.c.i));
     break;
   case TCCIR_OP_JUMP:
   case TCCIR_OP_JUMPIF:
@@ -6756,7 +6458,6 @@ int tcc_ir_generate_test(TCCIRState *ir, int inv, int t)
        * Otherwise we end up testing the address, which is almost always non-zero
        * and can lead to invalid indirect calls.
        */
-      tcc_ir_load_if_lvalue(ir, &vtop[0]);
       tcc_ir_put(ir, TCCIR_OP_TEST_ZERO, &vtop[0], NULL, NULL);
       vtop->r = VT_CMP;
       vtop->cmp_op = TOK_NE;
@@ -6939,6 +6640,7 @@ static bool tcc_ir_operand_needs_dereference(SValue *sv)
   switch (val_loc)
   {
   case VT_CONST:
+  case VT_LOCAL:
     /* VT_CONST with VT_LVAL means we're loading through a global symbol address.
      * For example: a.x where 'a' is a static struct - the address is a constant
      * (global symbol) but we need to dereference it to get the value. */
@@ -6947,14 +6649,6 @@ static bool tcc_ir_operand_needs_dereference(SValue *sv)
   case VT_CMP:
   case VT_JMP:
   case VT_JMPI:
-    return false;
-  case VT_LOCAL:
-    /* VT_LOCAL is used for stack slots (spills/locals).
-     * Even if VT_LVAL is set, this is a direct stack load/store form, not a
-     * pointer dereference. If a spill was preloaded into pr0, pr0 already holds
-     * the value; emitting an extra load would incorrectly dereference the value
-     * as an address (seen in tests2/90_struct-init.c).
-     */
     return false;
   default: /* must be temporary vreg */
     return (sv->r & VT_LVAL) != 0;

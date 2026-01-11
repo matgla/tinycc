@@ -113,6 +113,14 @@ typedef enum TccIrOp
   TCCIR_OP_NOP,
 } TccIrOp;
 
+/* FUNCPARAMVAL encoding helpers:
+ * src2.c.i encodes both parameter index (lower 16 bits) and call_id (upper 16 bits)
+ * This keeps call/param binding explicit and makes the IR more compact.
+ */
+#define TCCIR_ENCODE_PARAM(call_id, param_idx) (((int64_t)(call_id) << 16) | ((param_idx) & 0xFFFF))
+#define TCCIR_DECODE_CALL_ID(encoded) ((int)((encoded) >> 16))
+#define TCCIR_DECODE_PARAM_IDX(encoded) ((int)((encoded) & 0xFFFF))
+
 typedef struct CType CType;
 typedef struct SValue SValue;
 
@@ -169,23 +177,6 @@ typedef struct IRCallArgument
   SValue value;    /* argument value as emitted in FUNCPARAMVAL */
   int instr_index; /* original FUNCPARAMVAL instruction index (for diagnostics) */
 } IRCallArgument;
-
-/* IRCallSite: explicit binding of call arguments to a FUNCCALL instruction.
- * Arguments are stored as descriptors so backends never scan FUNCPARAMVAL. */
-typedef struct IRCallSite
-{
-  int call_instr_index; /* index into ir->instructions (current, post-opts) */
-  int call_orig_index;  /* stable orig_index for debugging/mapping */
-  int argc;
-  uint8_t args_prepared; /* non-zero if IR prepares ABI call args (backend must not marshal) */
-  IRCallArgument *args;  /* length argc */
-} IRCallSite;
-
-typedef struct IRCallsiteArgBinding
-{
-  int callsite_index;
-  int arg_index;
-} IRCallsiteArgBinding;
 
 /* SpillCache: Track which registers hold which stack slot values.
  * Used to avoid redundant loads when value is already in a register after storeback.
@@ -309,30 +300,13 @@ typedef struct TCCIRState
   int next_instruction_index;
 
   /* Monotonic ID for binding FUNCPARAM* instructions to their owning FUNCCALL*.
-   * Stored in TACQuadruple.aux for those ops.
+   * Encoded in instruction operands for those ops.
    * 0 means "legacy/unknown" and falls back to nested-scan binding.
    */
   int next_call_id;
 
   /* Current instruction index during code generation - used for scratch register allocation */
   int codegen_instruction_idx;
-
-  /* Callsite table: built from FUNCPARAM* / FUNCCALL* stream so backends
-   * and liveness do not need to scan the IR instruction stream.
-   */
-  IRCallSite *callsites;
-  int callsite_count;
-  int callsite_capacity;
-  int *callsite_index_by_call_instr; /* maps call instruction index -> callsite index */
-  int callsite_index_by_call_instr_size;
-  IRCallsiteArgBinding *callsite_arg_binding_by_instr; /* maps FUNCPARAM instr -> callsite/arg */
-  int callsite_arg_binding_size;
-
-  /* Optional per-call ABI layouts (computed via target hook).
-   * Indexed by callsite_index; layout.locs is owned by IR and freed with callsites.
-   */
-  TCCAbiCallLayout *callsite_abi_layouts;
-  int callsite_abi_layouts_size;
 
   /* Outgoing call argument area reserved in the function frame (FP-relative).
    * If non-zero, stack args are stored at [FP + call_outgoing_base + stack_off].
@@ -378,7 +352,6 @@ void tcc_ir_release_block(TCCIRState *ir);
 
 /* If the value is an lvalue (memory reference), emit an IR load so the
  * SValue becomes a plain value suitable for arithmetic/indirect calls. */
-void tcc_ir_load_if_lvalue(TCCIRState *ir, SValue *sv);
 
 void tcc_ir_add_function_parameters(TCCIRState *ir, CType *func_type);
 
@@ -387,7 +360,6 @@ int tcc_ir_gvtst(TCCIRState *ir, int inv, int t);
 void tcc_ir_gen_opi(TCCIRState *ir, int op);
 void tcc_ir_gen_opf(TCCIRState *ir, int op);
 int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *dest);
-int tcc_ir_put_with_aux(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *dest, int aux);
 
 #ifdef CONFIG_TCC_ASM
 int tcc_ir_add_inline_asm(TCCIRState *ir, const char *asm_str, int asm_len, int must_subst, ASMOperand *operands,
@@ -406,26 +378,18 @@ int tcc_ir_get_reg_type(TCCIRState *ir, int vreg);
 
 void tcc_ir_liveness_analysis(TCCIRState *ir);
 void tcc_ir_register_allocation_params(TCCIRState *ir);
-void tcc_ir_refresh_callsite_args(TCCIRState *ir);
-const SValue *tcc_ir_callsite_arg_value_ptr(const TCCIRState *ir, const IRCallArgument *arg);
 /* For parameters that arrive on the caller stack (beyond r0-r3 per AAPCS),
  * do not allocate separate local spill slots. They already have a stable
  * incoming stack home for the duration of the call. */
+void tcc_ir_mark_return_value_incoming_regs(TCCIRState *ir);
 void tcc_ir_avoid_spilling_stack_passed_params(TCCIRState *ir);
 void tcc_ir_generate_code(TCCIRState *ir);
 void tcc_ir_build_stack_layout(TCCIRState *ir);
 const TCCStackSlot *tcc_ir_stack_slot_by_vreg(const TCCIRState *ir, int vreg);
 const TCCStackSlot *tcc_ir_stack_slot_by_offset(const TCCIRState *ir, int frame_offset);
 void tcc_ir_materialize_value(TCCIRState *ir, SValue *sv, TCCMaterializedValue *result);
-void tcc_ir_materialize_addr(TCCIRState *ir, SValue *sv, TCCMaterializedAddr *result);
+void tcc_ir_materialize_addr(TCCIRState *ir, SValue *sv, TCCMaterializedAddr *result, int dest_reg);
 void tcc_ir_materialize_dest(TCCIRState *ir, SValue *dest, TCCMaterializedDest *result);
-
-/* Build and query the callsite table used for parameter binding.
- * `tcc_ir_build_callsites()` is idempotent and can be called multiple times;
- * it rebuilds the table to match the current IR stream.
- */
-void tcc_ir_build_callsites(TCCIRState *ir);
-const IRCallSite *tcc_ir_callsite_for_call(const TCCIRState *ir, int call_instr_index);
 
 int tcc_ir_add_local_variable(TCCIRState *ir, Sym *sym, int stack_offset);
 void tcc_ir_assign_physical_register(TCCIRState *ir, int vreg, int offset, int r0, int r1);
@@ -435,6 +399,7 @@ void tcc_ir_drop_return_value(TCCIRState *ir);
 void tcc_ir_set_addrtaken(TCCIRState *ir, int vreg);
 
 void tcc_ir_patch_live_intervals_registers(TCCIRState *ir);
+IRLiveInterval *tcc_ir_get_live_interval(TCCIRState *ir, int vreg);
 void tcc_ir_backpatch(TCCIRState *ir, int t, int target_address);
 void tcc_ir_backpatch_to_here(TCCIRState *ir, int t);
 void tcc_ir_backpatch_first(TCCIRState *ir, int t, int target_address);

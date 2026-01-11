@@ -18,14 +18,7 @@
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
-#ifndef ONE_SOURCE
-#define ONE_SOURCE 1
-#endif
-
 #include "tcc.h"
-#if ONE_SOURCE
-#include "libtcc.c"
-#endif
 #include "tcctools.c"
 
 static const char help[] = "Tiny C Compiler " TCC_VERSION " - Copyright (C) 2001-2006 Fabrice Bellard\n"

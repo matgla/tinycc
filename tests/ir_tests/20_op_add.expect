@@ -8,4 +8,5 @@ Result simple2: 9
 Result simple3: 50
 Result simple4: 42
 Result simple5: 457
-Total sum: -1677103158
+Result simple2(simple01(), simple02(5)): -1118077469
+Total sum: 1499786669

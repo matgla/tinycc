@@ -1,55 +1,5 @@
-#ifdef TARGET_DEFS_ONLY
-
-#define EM_TCC_TARGET EM_ARM
-
-/* relocation type for 32 bit data relocation */
-#define R_DATA_32 R_ARM_ABS32
-#define R_DATA_PTR R_ARM_ABS32
-#define R_JMP_SLOT R_ARM_JUMP_SLOT
-#define R_GLOB_DAT R_ARM_GLOB_DAT
-#define R_COPY R_ARM_COPY
-#define R_RELATIVE R_ARM_RELATIVE
-
-#define R_NUM R_ARM_NUM
-
-#define ELF_START_ADDR 0x00010000
-
-#ifdef TCC_TARGET_ARM_THUMB
-#define ELF_PAGE_SIZE 0x1000
-#else
-#define ELF_PAGE_SIZE 0x10000
-#endif
-
-#define PCRELATIVE_DLLPLT 1
-#define RELOCATE_DLLPLT 1
-
-enum float_abi
-{
-  ARM_SOFT_FLOAT,   /* Pure software FP - no FPU instructions, soft ABI */
-  ARM_SOFTFP_FLOAT, /* Software FP calling convention, but can use FPU */
-  ARM_HARD_FLOAT,   /* Hardware FP calling convention with FPU */
-};
-
-/* ARM FPU types for -mfpu option */
-enum arm_fpu_type
-{
-  ARM_FPU_AUTO = 0,      /* Auto-detect or use default */
-  ARM_FPU_NONE,          /* No FPU */
-  ARM_FPU_VFP,           /* VFPv2 (ARM1136JF-S, etc.) */
-  ARM_FPU_VFPV3,         /* VFPv3 or VFPv3-D16 */
-  ARM_FPU_VFPV4,         /* VFPv4 or VFPv4-D16 */
-  ARM_FPU_FPV4_SP_D16,   /* FPv4-SP-D16 (Cortex-M4) - single precision only */
-  ARM_FPU_FPV5_SP_D16,   /* FPv5-SP-D16 (Cortex-M7, ARMv8-M) - single precision */
-  ARM_FPU_FPV5_D16,      /* FPv5-D16 (Cortex-M7, ARMv8-M) - single+double */
-  ARM_FPU_NEON,          /* NEON with VFPv3 */
-  ARM_FPU_NEON_VFPV4,    /* NEON with VFPv4 */
-  ARM_FPU_NEON_FP_ARMV8, /* NEON with ARMv8 FP */
-};
-
-#else /* !TARGET_DEFS_ONLY */
-
-#include "arm-thumb-opcodes.h"
 #include "tcc.h"
+#include "arm-thumb-opcodes.h"
 
 #ifdef NEED_RELOC_TYPE
 /* Returns 1 for a code relocation, 0 for a data relocation. For unknown
@@ -636,5 +586,3 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
     return;
   }
 }
-
-#endif /* !TARGET_DEFS_ONLY */

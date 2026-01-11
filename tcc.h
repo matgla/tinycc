@@ -304,18 +304,14 @@ extern long double strtold(const char *__nptr, char **__endptr);
 #define PUB_FUNC
 #endif
 
-#ifndef ONE_SOURCE
-#define ONE_SOURCE 0
-#endif
-
-#if ONE_SOURCE
-#define ST_INLN static inline
-#define ST_FUNC static
-#define ST_DATA static
-#else
+/* Always compile from separate objects */
 #define ST_INLN
 #define ST_FUNC
 #define ST_DATA extern
+
+/* Target-specific definitions (after ST_FUNC is defined) */
+#if defined(TCC_TARGET_ARM_THUMB)
+#include "arm-thumb-defs.h"
 #endif
 
 #ifdef TCC_PROFILE /* profile all functions */
@@ -331,12 +327,6 @@ extern long double strtold(const char *__nptr, char **__endptr);
 typedef struct Sym Sym;
 
 /* include the target specific definitions */
-
-#define TARGET_DEFS_ONLY
-#include "arm-link.c"
-#include "arm-thumb-asm.c"
-#include "arm-thumb-gen.c"
-#undef TARGET_DEFS_ONLY
 
 /* -------------------------------------------- */
 
@@ -1006,6 +996,20 @@ struct filespec
 #define VT_BOUNDED                                                                                                     \
   0x8000 /* value is bounded. The address of the                                                                       \
             bounding function call point is in vc */
+
+static inline SValue tcc_svalue_const_i64(int64_t v)
+{
+  SValue sv = {0};
+  sv.vr = -1;
+  sv.r = VT_CONST;
+  sv.c.i = (uint64_t)v;
+  return sv;
+}
+
+static inline SValue tcc_ir_svalue_call_id(int call_id)
+{
+  return tcc_svalue_const_i64((int64_t)TCCIR_ENCODE_PARAM(call_id, 0));
+}
 /* types */
 #define VT_BTYPE 0x000f /* mask for basic type */
 #define VT_VOID 0       /* void type */
@@ -1904,7 +1908,6 @@ typedef struct TACQuadruple
   SValue src2;
   SValue dest;
   int line_num; /* source line number for debug info */
-  int aux;      /* op-specific payload (e.g., inline asm id) */
 } TACQuadruple;
 
 /*
@@ -1917,6 +1920,8 @@ typedef struct TACQuadruple
 ST_FUNC void tcc_machine_acquire_scratch(TCCMachineScratchRegs *scratch, unsigned flags);
 ST_FUNC void tcc_machine_release_scratch(const TCCMachineScratchRegs *scratch);
 
+ST_FUNC int tcc_machine_can_encode_stack_offset_for_reg(int frame_offset, int dest_reg);
+ST_FUNC int tcc_machine_can_encode_stack_offset_with_param_adj(int frame_offset, int is_param, int dest_reg);
 ST_FUNC void tcc_machine_load_spill_slot(int dest_reg, int frame_offset);
 ST_FUNC void tcc_machine_store_spill_slot(int src_reg, int frame_offset);
 ST_FUNC void tcc_machine_addr_of_stack_slot(int dest_reg, int frame_offset);
@@ -1947,6 +1952,7 @@ ST_FUNC void tcc_gen_machine_setif_op(TACQuadruple *q);
 ST_FUNC void tcc_gen_machine_bool_op(TACQuadruple *q);
 ST_FUNC void tcc_gen_machine_backpatch_jump(int address, int offset);
 ST_FUNC void tcc_gen_machine_end_instruction(void);
+ST_FUNC void tcc_gen_machine_func_parameter_op(TACQuadruple *q);
 
 /* VLA / dynamic stack operations */
 ST_FUNC void tcc_gen_machine_vla_op(TACQuadruple *q);
@@ -2053,11 +2059,7 @@ static inline void post_sem(TCCSem *p)
 
 /********************************************************/
 #undef ST_DATA
-#if ONE_SOURCE
-#define ST_DATA static
-#else
 #define ST_DATA
-#endif
 /********************************************************/
 
 #define text_section TCC_STATE_VAR(text_section)

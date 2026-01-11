@@ -18,31 +18,6 @@
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
-#ifndef ONE_SOURCE
-#define ONE_SOURCE 1
-#endif
-
-#if ONE_SOURCE
-#include "tccasm.c"
-#include "tccdbg.c"
-#include "tccelf.c"
-#include "tccgen.c"
-#include "tccir.c"
-#include "tccld.c"
-#include "tccls.c"
-#include "tccpp.c"
-#include "tccyaff.c"
-#if defined(TCC_TARGET_ARM_THUMB)
-#include "arch/armv8m.c"
-#include "arm-link.c"
-#include "arm-thumb-asm.c"
-#include "arm-thumb-gen.c"
-#include "arm-thumb-opcodes.c"
-#else
-#error unknown target
-#endif
-#endif /* ONE_SOURCE */
-
 #include "tcc.h"
 
 /********************************************************/
@@ -2111,9 +2086,3 @@ PUB_FUNC void tcc_print_stats(TCCState *s1, unsigned total_time)
   fprintf(stderr, " %d max (bytes)\n", mem_max_size);
 #endif
 }
-
-#if ONE_SOURCE
-#undef malloc
-#undef realloc
-#undef free
-#endif

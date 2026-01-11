@@ -23,23 +23,12 @@
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
-#ifdef TARGET_DEFS_ONLY
-
-#define CONFIG_TCC_ASM
-#define NB_ASM_REGS 16
-
-ST_FUNC void g(int c);
-ST_FUNC void gen_le16(int c);
-ST_FUNC void gen_le32(int c);
-
-#else
-
 #define USING_GLOBALS
 #include <ctype.h>
 #include <string.h>
 
-#include "arm-thumb-opcodes.h"
 #include "tcc.h"
+#include "arm-thumb-opcodes.h"
 
 enum
 {
@@ -3123,4 +3112,3 @@ ST_FUNC void asm_opcode(TCCState *s1, int token)
 }
 
 /*************************************************************/
-#endif /* ifdef TARGET_DEFS_ONLY */

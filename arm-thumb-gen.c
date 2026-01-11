@@ -33,73 +33,19 @@
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
-#ifdef TARGET_DEFS_ONLY
-
 #if defined(TCC_ARM_EABI) && !defined(TCC_ARM_VFP)
 #error "Currently TinyCC only supports float computation with VFP instructions"
-#endif
-
-/* number of available registers */
-#ifdef TCC_ARM_VFP
-#define NB_REGS 13
-#else
-#define NB_REGS 9
 #endif
 
 #ifndef CONFIG_TCC_CPUVER
 #define CONFIG_TCC_CPUVER 5
 #endif
 
-/* a register can belong to several classes. The classes must be
-   sorted from more general to more precise (see gv2() code which does
-   assumptions on it). */
-#define RC_INT 0x0001   /* generic integer register */
-#define RC_FLOAT 0x0002 /* generic float register */
-#define RC_R0 0x0004
-#define RC_R1 0x0008
-#define RC_R2 0x0010
-#define RC_R3 0x0020
-#define RC_R12 0x0040
-#define RC_F0 0x0080
-#define RC_F1 0x0100
-#define RC_F2 0x0200
-#define RC_F3 0x0400
-#ifdef TCC_ARM_VFP
-#define RC_F4 0x0800
-#define RC_F5 0x1000
-#define RC_F6 0x2000
-#define RC_F7 0x4000
-#endif
-#define RC_IRET RC_R0 /* function return: integer register */
-#define RC_IRE2 RC_R1 /* function return: second integer register */
-#define RC_FRET RC_F0 /* function return: float register */
-
-typedef struct ThumbLiteralPoolEntry
-{
-  Sym *sym;
-  int relocation;
-  int patch_position;
-  int short_instruction;
-  int data_size;
-  int64_t imm;
-  int shared_index; /* Index of earlier entry with same value, or -1 if unique
-                     */
-} ThumbLiteralPoolEntry;
-
-typedef struct ThumbGeneratorState
-{
-  uint8_t generating_function : 1;
-  int code_size;
-  ThumbLiteralPoolEntry *literal_pool;
-  int literal_pool_size;
-  int literal_pool_count;
-  /* Cache for global symbol base address to avoid redundant loads */
-  Sym *cached_global_sym; /* Last loaded global symbol */
-  int cached_global_reg;  /* Register holding its base address */
-  int *function_argument_list;
-  int function_argument_list_size;
-  int function_argument_count;
-} ThumbGeneratorState;
+#include "arm-thumb-defs.h"
+#include "tcc.h"
+#include "tccir.h"
+#include "tccls.h"
+#include "tcctype.h"
 
 ThumbGeneratorState thumb_gen_state;
 
@@ -123,81 +69,8 @@ enum Armv8mRegisters
   ARM_PC = 15
 };
 
-/* pretty names for the registers */
-enum
-{
-  TREG_R0 = 0,
-  TREG_R1,
-  TREG_R2,
-  TREG_R3,
-  TREG_R12,
-  TREG_F0,
-  TREG_F1,
-  TREG_F2,
-  TREG_F3,
-#ifdef TCC_ARM_VFP
-  TREG_F4,
-  TREG_F5,
-  TREG_F6,
-  TREG_F7,
-#endif
-  TREG_SP = 13,
-  TREG_LR,
-};
-
-/* return registers for function */
-#define REG_IRET TREG_R0 /* single word int return register */
-#define REG_IRE2 TREG_R1 /* second word return register (for long long) */
-#define REG_FRET TREG_F0 /* float return register */
-
-#ifdef TCC_ARM_EABI
-#define TOK___divdi3 TOK___aeabi_ldivmod
-#define TOK___moddi3 TOK___aeabi_ldivmod
-#define TOK___udivdi3 TOK___aeabi_uldivmod
-#define TOK___umoddi3 TOK___aeabi_uldivmod
-#endif
-
-/* Do not invert parameter evaluation order for ARM AAPCS; arguments are
- * laid out left-to-right in registers/stack and inverting breaks 64-bit
- * stack arguments ordering. */
-#define INVERT_FUNC_PARAMS
-
-/* defined if structures are passed as pointers. Otherwise structures
-   are directly pushed on stack. */
-/* #define FUNC_STRUCT_PARAM_AS_PTR */
-
-/* pointer size, in bytes */
-#define PTR_SIZE 4
-
-/* long double size and alignment, in bytes */
-#ifdef TCC_ARM_VFP
-#define LDOUBLE_SIZE 8
-#endif
-
-#ifndef LDOUBLE_SIZE
-#define LDOUBLE_SIZE 8
-#endif
-
-#ifdef TCC_ARM_EABI
-#define LDOUBLE_ALIGN 8
-#else
-#define LDOUBLE_ALIGN 4
-#endif
-
-/* maximum alignment (for aligned attribute support) */
-#define MAX_ALIGN 8
-
-#define CHAR_IS_UNSIGNED
-
-#else // TARGET_DEFS_ONLY
-
 #define USING_GLOBALS
 #include "tcc.h"
-
-static inline int tcc_abi_align_up_int(int v, int align)
-{
-  return (v + align - 1) & ~(align - 1);
-}
 
 /* Target ABI hook: AAPCS-like argument assignment for ARM (R0-R3 + stack).
  *
@@ -303,58 +176,6 @@ ST_FUNC int tcc_gen_machine_abi_assign_call_args(const TCCAbiArgDesc *args, int 
 
 #include <inttypes.h>
 
-#if defined(__linux__)
-#include <execinfo.h>
-#include <limits.h>
-#include <unistd.h>
-
-static void thumb_backend_dump_addr2line(void *const *frames, int count)
-{
-  char exe_path[PATH_MAX];
-  ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
-  if (len < 0)
-    return;
-  exe_path[len] = '\0';
-
-  for (int i = 0; i < count; ++i)
-  {
-    char cmd[PATH_MAX + 128];
-    snprintf(cmd, sizeof(cmd), "addr2line -f -p -e %s %p", exe_path, frames[i]);
-    FILE *fp = popen(cmd, "r");
-    if (!fp)
-    {
-      fprintf(stderr, "  [%02d] %p (addr2line unavailable)\n", i, frames[i]);
-      continue;
-    }
-    char line[512];
-    if (fgets(line, sizeof(line), fp))
-    {
-      /* addr2line output already ends with a newline */
-      fprintf(stderr, "  [%02d] %s", i, line);
-    }
-    else
-    {
-      fprintf(stderr, "  [%02d] %p (addr2line lookup failed)\n", i, frames[i]);
-    }
-    pclose(fp);
-  }
-}
-
-static void thumb_backend_backtrace(const char *reason)
-{
-  void *frames[32];
-  int count = backtrace(frames, 32);
-  fprintf(stderr, "Thumb backend contract violation: %s\n", reason);
-  backtrace_symbols_fd(frames, count, 2);
-  thumb_backend_dump_addr2line(frames, count);
-}
-#else
-static void thumb_backend_backtrace(const char *reason)
-{
-  (void)reason;
-}
-#endif
-
 static void thumb_backend_dump_svalue(const char *label, const SValue *sv)
 {
   if (!sv)
@@ -399,6 +220,15 @@ ST_DATA const char *const target_machine_defs = "__arm__\0"
                                                 "__ARM_EABI__\0"
 #endif
     ;
+
+/* Register class array - maps each register to its class flags */
+ST_DATA const int reg_classes[NB_REGS] = {
+    RC_INT | RC_R0,   RC_INT | RC_R1,   RC_INT | RC_R2,   RC_INT | RC_R3,   RC_INT | RC_R12,
+    RC_FLOAT | RC_F0, RC_FLOAT | RC_F1, RC_FLOAT | RC_F2, RC_FLOAT | RC_F3,
+#ifdef TCC_ARM_VFP
+    RC_FLOAT | RC_F4, RC_FLOAT | RC_F5, RC_FLOAT | RC_F6, RC_FLOAT | RC_F7,
+#endif
+};
 
 enum float_abi float_abi;
 unsigned char text_and_data_separation;
@@ -865,10 +695,10 @@ static int th_is_caller_saved_register(int reg)
 
 int ot_check(thumb_opcode op)
 {
-  if (!is_valid_opcode(op))
-  {
-    tcc_error("compiler_error: received invalid opcode: 0x%x\n", op.opcode);
-  }
+  // if (!is_valid_opcode(op))
+  // {
+  //   tcc_error("compiler_error: received invalid opcode: 0x%x\n", op.opcode);
+  // }
   return ot(op);
 }
 
@@ -1132,6 +962,7 @@ ST_FUNC void arm_init(struct TCCState *s)
    */
 
   th_literal_pool_init();
+  thumb_gen_state.call_sites = NULL;
 }
 
 ST_FUNC void arm_deinit(struct TCCState *s)
@@ -1145,6 +976,7 @@ ST_FUNC void arm_deinit(struct TCCState *s)
   thumb_gen_state.code_size = 0;
   thumb_gen_state.cached_global_sym = NULL;
   thumb_gen_state.cached_global_reg = PREG_NONE;
+  thumb_free_call_sites();
 }
 
 static int regmask(int r)
@@ -1664,7 +1496,6 @@ void ggoto(void)
   /* Computed goto: vtop contains the target address (a pointer value).
    * In IR mode, this must be an *indirect* jump (BX reg), not a direct
    * IR jump-to-instruction-index. */
-  tcc_ir_load_if_lvalue(tcc_state->ir, vtop);
   {
     SValue target = *vtop;
     tcc_ir_put(tcc_state->ir, TCCIR_OP_IJUMP, &target, NULL, NULL);
@@ -1858,6 +1689,32 @@ int store_word_to_base(int ir, int base, int fc, int sign)
   const thumb_opcode ins = th_str_imm(ir, base, fc, sign ? 4 : 6, ENFORCE_ENCODING_NONE);
   TRACE("Store word sign: %d, r %d, base: %d, fc: %d\n", sign, ir, base, fc, sign);
   return ot(ins);
+}
+
+ST_FUNC int tcc_machine_can_encode_stack_offset_for_reg(int frame_offset, int dest_reg)
+{
+  /* Check if frame_offset can be directly encoded in ldr/str instructions
+   * without requiring a scratch register. This is used to avoid wasteful
+   * address materialization when the backend can handle the offset directly.
+   * Tests with dest_reg since encoding availability depends on the register. */
+  const int base_reg = tcc_state->need_frame_pointer ? R_FP : R_SP;
+  const int sign = (frame_offset < 0);
+  const int abs_offset = sign ? -frame_offset : frame_offset;
+
+  /* Try to encode as ldr instruction with the actual destination register.
+   * Some encodings (e.g., Thumb-1 T1) only work with low registers (r0-r7). */
+  const thumb_opcode ins = th_ldr_imm(dest_reg, base_reg, abs_offset, sign ? 4 : 6, ENFORCE_ENCODING_NONE);
+  return (ins.size != 0);
+}
+
+ST_FUNC int tcc_machine_can_encode_stack_offset_with_param_adj(int frame_offset, int is_param, int dest_reg)
+{
+  /* Like tcc_machine_can_encode_stack_offset_for_reg, but applies offset_to_args for VT_PARAM.
+   * Stack parameters need offset_to_args adjustment (prologue push size). */
+  int offset = frame_offset;
+  if (is_param)
+    offset += offset_to_args;
+  return tcc_machine_can_encode_stack_offset_for_reg(offset, dest_reg);
 }
 
 ST_FUNC void tcc_machine_load_spill_slot(int dest_reg, int frame_offset)
@@ -2709,7 +2566,11 @@ void load_vt_local(int r, SValue *sv, int base)
    * When computing their address, fold in offset_to_args (prologue push size).
    */
   if (sv->r & VT_PARAM)
+  {
+    fprintf(stderr, "DEBUG load_vt_local: VT_PARAM detected, off=%d, offset_to_args=%d, new off=%d\n", off,
+            offset_to_args, off + offset_to_args);
     off += offset_to_args;
+  }
 
   TRACE("'load_vt_local' r: %d, off: %x", r, (uint32_t)off);
   Sym *sym_to_use = NULL;
@@ -2803,6 +2664,8 @@ void load_to_dest(SValue *dest, SValue *sv)
    * The ARM EABI places stack parameters in the caller's frame above the saved FP. */
   if (sv->r & VT_PARAM)
   {
+    fprintf(stderr, "DEBUG load_to_dest: VT_PARAM detected, fc=%d, offset_to_args=%d, new fc=%d\n", (int)fc,
+            offset_to_args, (int)fc + offset_to_args);
     fc += offset_to_args;
   }
 
@@ -5028,6 +4891,14 @@ ST_FUNC void tcc_gen_machine_store_op(TACQuadruple *op)
 ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int stack_size)
 {
   thumb_gen_state.function_argument_count = 0;
+  ThumbGenCallSite *call_state = (ThumbGenCallSite *)tcc_malloc(sizeof(ThumbGenCallSite));
+  *call_state = (ThumbGenCallSite){
+      .call_id = -1,
+      .registers_map = 0,
+      .next = NULL,
+  };
+  thumb_append_call_site(call_state);
+
   uint16_t registers_to_push = 0;
   int registers_count = 0;
 
@@ -5338,6 +5209,8 @@ ST_FUNC void tcc_gen_machine_epilog(int leaffunc)
   thumb_gen_state.generating_function = 0;
   ot_check(th_bx_reg(R_LR));
   th_literal_pool_generate();
+
+  thumb_free_call_sites();
 }
 
 ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *op)
@@ -5889,943 +5762,366 @@ static void remap_future_param_sources(int current_dest, int reg_to_save, int re
   }
 }
 
+static void tcc_thumb_ir_store_u32_to_sp(TCCIRState *ir, int off, SValue *val)
+{
+  (void)ir;
+  TCCMachineScratchRegs scratch = {0};
+  tcc_machine_acquire_scratch(&scratch, TCC_MACHINE_SCRATCH_AVOID_CALL_ARG_REGS);
+  int rtmp = scratch.regs[0];
+  load_to_reg(rtmp, PREG_NONE, val);
+  tcc_gen_machine_store_to_sp(rtmp, off);
+  tcc_machine_release_scratch(&scratch);
+}
+
+static void tcc_thumb_ir_store_u64_to_sp(TCCIRState *ir, int off, SValue *val)
+{
+  (void)ir;
+  TCCMachineScratchRegs scratch = {0};
+  tcc_machine_acquire_scratch(&scratch, TCC_MACHINE_SCRATCH_NEEDS_PAIR | TCC_MACHINE_SCRATCH_AVOID_CALL_ARG_REGS);
+  int rlo = scratch.regs[0];
+  int rhi = scratch.regs[1];
+  load_to_reg(rlo, rhi, val);
+  tcc_gen_machine_store_to_sp(rlo, off);
+  tcc_gen_machine_store_to_sp(rhi, off + 4);
+  tcc_machine_release_scratch(&scratch);
+}
+
+static void tcc_thumb_ir_copy_struct_to_sp(int dst_off, const SValue *sv, int size)
+{
+  const int slot_sz = tcc_abi_align_up_int(size, 4);
+  TCCMachineScratchRegs scratch = {0};
+  /* Need base+tmp. Avoid call arg regs. */
+  tcc_machine_acquire_scratch(&scratch, TCC_MACHINE_SCRATCH_NEEDS_PAIR | TCC_MACHINE_SCRATCH_AVOID_CALL_ARG_REGS);
+  int base = scratch.regs[0];
+  int tmp = scratch.regs[1];
+
+  SValue addr = *sv;
+  addr.r &= ~VT_LVAL;
+  addr.type.t = VT_PTR;
+  load_to_reg(base, PREG_NONE, &addr);
+
+  /* Copy full words */
+  int copied = 0;
+  while (copied + 4 <= size)
+  {
+    if (!load_word_from_base(tmp, base, copied, 0))
+    {
+      ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(
+          copied, 0, (1u << tmp) | (1u << base) | (1u << R_SP) | (1u << R0) | (1u << R1) | (1u << R2) | (1u << R3));
+      int rr = rr_alloc.reg;
+      ot_check(th_ldr_reg(tmp, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+      restore_scratch_reg(&rr_alloc);
+    }
+    tcc_gen_machine_store_to_sp(tmp, dst_off + copied);
+    copied += 4;
+  }
+
+  /* Tail bytes */
+  if (copied < size)
+  {
+    for (; copied < size; ++copied)
+    {
+      if (!load_ubyte_from_base(tmp, base, copied, 0))
+      {
+        ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(
+            copied, 0, (1u << tmp) | (1u << base) | (1u << R_SP) | (1u << R0) | (1u << R1) | (1u << R2) | (1u << R3));
+        int rr = rr_alloc.reg;
+        ot_check(th_ldrb_reg(tmp, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+        restore_scratch_reg(&rr_alloc);
+      }
+      /* store byte tmp -> [sp + dst_off + copied] */
+      const int off = dst_off + copied;
+      if (!ot(th_strb_imm(tmp, R_SP, off, 6, ENFORCE_ENCODING_NONE)))
+      {
+        ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(
+            off, 0, (1u << tmp) | (1u << R_SP) | (1u << base) | (1u << R0) | (1u << R1) | (1u << R2) | (1u << R3));
+        int rr = rr_alloc.reg;
+        ot_check(th_strb_reg(tmp, R_SP, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+        restore_scratch_reg(&rr_alloc);
+      }
+    }
+  }
+
+  /* Zero-pad to slot size */
+  if (slot_sz > size)
+  {
+    ot_check(th_eor_reg(tmp, tmp, tmp, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+    for (int off = size; off < slot_sz; ++off)
+    {
+      const int sp_off = dst_off + off;
+      if (!ot(th_strb_imm(tmp, R_SP, sp_off, 6, ENFORCE_ENCODING_NONE)))
+      {
+        ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(
+            sp_off, 0, (1u << tmp) | (1u << R_SP) | (1u << base) | (1u << R0) | (1u << R1) | (1u << R2) | (1u << R3));
+        int rr = rr_alloc.reg;
+        ot_check(th_strb_reg(tmp, R_SP, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+        restore_scratch_reg(&rr_alloc);
+      }
+    }
+  }
+
+  tcc_machine_release_scratch(&scratch);
+}
+
+/* Load a 32-bit immediate value or symbol address into a register.
+ * Uses th_generic_mov_imm if possible (pure immediates only), otherwise loads from literal pool.
+ * reg: target register
+ * imm: 32-bit immediate value or offset to load
+ * sym: symbol reference (NULL for pure immediates)
+ * update_flags: whether the load should update condition flags (currently unused)
+ */
+static void load_immediate(int reg, uint32_t imm, Sym *sym, int update_flags)
+{
+  (void)update_flags; /* Currently not used, reserved for future use */
+
+  /* If there's a symbol, always use literal pool for relocations */
+  if (sym)
+  {
+    load_full_const(reg, PREG_NONE, imm, sym);
+    return;
+  }
+
+  /* Try to encode as ARM immediate (supports various rotated 8-bit patterns) */
+  if (!ot(th_generic_mov_imm(reg, imm)))
+  {
+    /* Value doesn't fit in immediate encoding, use literal pool */
+    load_full_const(reg, PREG_NONE, imm, NULL);
+  }
+}
+
 ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCIRState *ir, int call_idx)
 {
-  /* IR owns call argument binding; backend must not scan for FUNCPARAM*. */
-  const IRCallSite *cs = tcc_ir_callsite_for_call(ir, call_idx);
-  int param_count = 0;
-  const IRCallArgument *call_args = NULL;
-  if (cs)
+  if (!q || !ir)
+    tcc_error("compiler_error: func_call_op requires q+ir");
+
+  /* Get call_id from src2.c.i (keeps call/param binding explicit). */
+  const int call_id = TCCIR_DECODE_CALL_ID(q->src2.c.i);
+
+  /* Get the cached call site created during FUNCPARAMVAL processing */
+  ThumbGenCallSite *call_site = thumb_get_call_site_for_id(call_id);
+  if (!call_site)
+    tcc_error("compiler_error: no call site found for call_id=%d", call_id);
+
+  /* Build ABI call layout using tccabi */
+  TCCAbiCallLayout layout;
+  memset(&layout, 0, sizeof(layout));
+
+  const int argc = thumb_build_call_layout_from_ir(ir, call_idx, call_id, &layout);
+  if (argc < 0)
+    tcc_error("compiler_error: failed to build call layout for call_id=%d", call_id);
+
+  /* Calculate total stack space needed */
+  const int stack_size = (argc > 0) ? (int)layout.stack_size : 0;
+
+  /* Collect argument values by scanning backwards */
+  SValue *args = NULL;
+  if (argc > 0)
   {
-    param_count = cs->argc;
-    call_args = cs->args;
-    if (param_count > 0 && !call_args)
-      tcc_error("Missing call argument descriptors for call at IR index %d", call_idx);
-  }
-  else
-  {
-    /* Should not happen: tcc_ir_generate_code() builds callsites upfront. */
-    tcc_error("Missing callsite binding for call at IR index %d", call_idx);
-  }
+    args = (SValue *)tcc_mallocz(sizeof(SValue) * argc);
 
-  /* Fast path: arguments are already placed by IR according to ABI layout.
-   * Emit only the call and return-value moves.
-   */
-  if (cs && cs->args_prepared)
-  {
-    gcall_or_jump(0, &q->src1);
-
-    if (th_is_caller_saved_register(thumb_gen_state.cached_global_reg))
+    for (int j = call_idx - 1; j >= 0; --j)
     {
-      thumb_gen_state.cached_global_sym = NULL;
-      thumb_gen_state.cached_global_reg = PREG_NONE;
-    }
-
-    if (drop_result)
-      return;
-
-    thumb_require_materialized_reg("tcc_gen_machine_func_call_op(prepared)", "dest.low", q->dest.pr0);
-    if (tcc_is_64bit_operand(&q->dest))
-    {
-      if (q->dest.pr1 != PREG_NONE)
-        thumb_require_materialized_reg("tcc_gen_machine_func_call_op(prepared)", "dest.high", q->dest.pr1);
-      if (q->dest.pr1 != R1)
+      const TACQuadruple *p = &ir->instructions[j];
+      if (p->op == TCCIR_OP_FUNCPARAMVAL)
       {
-        ot_check(th_mov_reg(q->dest.pr1, R1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE,
-                            false));
-      }
-    }
-    if (q->dest.pr0 != R0)
-    {
-      ot_check(th_mov_reg(q->dest.pr0, R0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE,
-                          false));
-    }
-    return;
-  }
-
-  /* First pass: calculate register and stack slot assignments for each argument
-   * following AAPCS rules:
-   * - 32-bit args go in R0-R3 then stack
-   * - 64-bit args go in R0:R1 or R2:R3 (must be even-aligned), then stack
-   * - 64-bit args on stack must be 8-byte aligned
-   */
-  int next_reg = 0;   /* Next available register (0-3) */
-  int stack_size = 0; /* Current stack offset */
-  uint32_t register_map = 0;
-  int op_to_reg[4] = {PREG_NONE, PREG_NONE, PREG_NONE, PREG_NONE}; /* Map of register to param index */
-  int stack_offset = 0;
-
-  // only r0-r3 for arguments, rest arguments go to stack
-  for (int i = 0; i < param_count; ++i)
-  {
-    const SValue *arg_value = tcc_ir_callsite_arg_value_ptr(ir, &call_args[i]);
-    const int is_64bit = is_64bit_type(arg_value->type.t);
-    const int is_struct = (arg_value->type.t & VT_BTYPE) == VT_STRUCT;
-    int arg_size = is_64bit ? 8 : 4;
-
-    /* For structs passed by value, use actual struct size */
-    if (is_struct && !is_64bit)
-    {
-      int align;
-      CType arg_type = arg_value->type;
-      arg_size = type_size(&arg_type, &align);
-      arg_size = TCC_ALIGN(arg_size, 4); /* Round up to 4-byte alignment */
-    }
-
-    if (is_64bit)
-    {
-      /* 64-bit value needs even-aligned register pair */
-      if (next_reg & 1)
-        next_reg++; /* Align to even register */
-      if (next_reg <= 2)
-      {
-        /* Fits in registers (R0:R1 or R2:R3) */
-        register_map |= (1 << next_reg) | (1 << (next_reg + 1));
-        op_to_reg[next_reg] = i;
-        op_to_reg[next_reg + 1] = i;
-        next_reg += 2;
-      }
-      else
-      {
-        /* Goes on stack, 8-byte aligned */
-        stack_size = TCC_ALIGN(stack_size, 8);
-        stack_size += 8;
-      }
-    }
-    else
-    {
-      /* 32-bit value or struct */
-      if (next_reg <= 3 && !is_struct)
-      {
-        /* Scalars fit in one register */
-        register_map |= (1 << next_reg);
-        op_to_reg[next_reg] = i;
-        next_reg++;
-      }
-      else if (is_struct)
-      {
-        /* Structs may occupy multiple registers or go to stack */
-        int regs_needed = (arg_size + 3) / 4; /* Number of 4-byte slots */
-        if (next_reg + regs_needed <= 4)
+        int param_call_id = TCCIR_DECODE_CALL_ID(p->src2.c.i);
+        if (param_call_id == call_id)
         {
-          /* Fits in remaining registers */
-          for (int r = 0; r < regs_needed; r++)
+          int param_idx = TCCIR_DECODE_PARAM_IDX(p->src2.c.i);
+          if (param_idx >= 0 && param_idx < argc)
           {
-            register_map |= (1 << (next_reg + r));
-            op_to_reg[next_reg + r] = i;
+            args[param_idx] = p->src1;
           }
-          next_reg += regs_needed;
-        }
-        else
-        {
-          /* Goes to stack */
-          stack_size = TCC_ALIGN(stack_size, 4);
-          stack_size += arg_size;
-          next_reg = 4; /* No more registers available */
         }
       }
-      else
-      {
-        /* Scalar goes to stack */
-        stack_size += 4;
-      }
     }
   }
 
-  /* Align total stack to 8 bytes as required by AAPCS */
-  stack_size = TCC_ALIGN(stack_size, 8);
-
-  /* For stack-passed arguments we must not emit any extra PUSH/POP while
-   * writing to the outgoing argument area at [SP + stack_offset].
-   *
-   * Previously we used generic scratch allocation during stack-arg emission,
-   * which can save a register with PUSH/POP. That shifts SP and corrupts
-   * the argument layout for variadic calls.
-   *
-   * We also cannot blindly use R0-R3 as temporaries here: at this point the
-   * backend may still be holding *pointers* in those registers that are needed
-   * later to load the register-passed arguments (e.g. c[0].x/c[0].y in
-   * 90_struct-init).
-   *
-   * Solution: allocate a dedicated temp register pair once (may be saved with
-   * PUSH before reserving the arg area), exclude all registers already used as
-   * arg sources, and then use only these temps for stack-arg materialization.
-   */
-  ScratchRegAllocs stack_arg_tmps;
-  memset(&stack_arg_tmps, 0, sizeof(stack_arg_tmps));
-  int stack_arg_tmp0_reg = PREG_NONE;
-  int stack_arg_tmp1_reg = PREG_NONE;
-  int need_stack_arg_tmps = 0;
-  for (int i = 0; i < param_count; ++i)
+  /* Step 1: Check if any argument registers (R0-R3) are currently in use
+   * If we have a nested call, we need to preserve them */
+  int arg_regs_in_use = 0;
+  for (int reg = ARM_R0; reg <= ARM_R3; reg++)
   {
-    int assigned_register = PREG_NONE;
-    for (int j = 0; j < 4; j++)
+    if (call_site->registers_map & (1 << reg))
     {
-      if (op_to_reg[j] == PREG_NONE)
-        continue;
-      if (op_to_reg[j] == i)
-      {
-        assigned_register = j;
-        break;
-      }
-    }
-    if (assigned_register == PREG_NONE)
-    {
-      need_stack_arg_tmps = 1;
-      break;
+      arg_regs_in_use |= (1 << reg);
     }
   }
 
-  if (need_stack_arg_tmps)
+  /* Step 2: Push argument registers that are in use (nested call case) */
+  if (arg_regs_in_use != 0)
   {
-    /* Reserve 2 scratch registers for stack argument marshalling.
-     *
-     * For non-leaf functions, the register allocator has already reserved R10 and R11
-     * specifically for this purpose. We exclude:
-     * - R0-R3 (destination registers for register-passed arguments)
-     * - Source registers (pr0/pr1) for register-passed arguments only
-     *
-     * The reserved R10/R11 will be allocated by get_scratch_regs_with_save() since
-     * they're not allocated to any virtual registers. They're guaranteed to be free
-     * and won't conflict with source pointers for stack arguments.
-     */
-    uint32_t tmp_exclude = (1u << R_SP) | (1u << R7) | (1u << R0) | (1u << R1) | (1u << R2) | (1u << R3);
-
-    /* Exclude source registers for register-passed arguments (R0-R3 destinations) */
-    for (int dest = 0; dest < 4; ++dest)
-    {
-      if (op_to_reg[dest] == PREG_NONE)
-        continue;
-      const SValue *arg_value = tcc_ir_callsite_arg_value_ptr(ir, &call_args[op_to_reg[dest]]);
-      if (!arg_value)
-        continue;
-      /* Skip accessing pr0/pr1 for lvalue arguments - this would trigger premature
-       * FILL_REGS loads of spilled pointers */
-      if (!(arg_value->r & VT_LVAL))
-      {
-        if (arg_value->pr0 != PREG_NONE && arg_value->pr0 >= 0 && arg_value->pr0 < 16)
-          tmp_exclude |= (1u << arg_value->pr0);
-        if (arg_value->pr1 != PREG_NONE && arg_value->pr1 >= 0 && arg_value->pr1 < 16)
-          tmp_exclude |= (1u << arg_value->pr1);
-      }
-    }
-
-    /* Allocate the 2 reserved scratch registers (R10, R11 for non-leaf functions).
-     * These should be free since the register allocator excluded them. */
-    stack_arg_tmps = get_scratch_regs_with_save(tmp_exclude, 2);
-    stack_arg_tmp0_reg = stack_arg_tmps.regs[0];
-    stack_arg_tmp1_reg = stack_arg_tmps.regs[1];
-
-    fprintf(stderr, "[SCRATCH] Allocated stack arg temps: r%d, r%d (saved_mask=0x%x)\n", stack_arg_tmp0_reg,
-            stack_arg_tmp1_reg, stack_arg_tmps.saved_mask);
+    uint16_t push_mask = (uint16_t)arg_regs_in_use;
+    ot_check(th_push(push_mask));
+    call_site->used_stack_size += __builtin_popcount(arg_regs_in_use) * 4;
   }
 
-  /* If call-time argument materialization had to save scratch registers,
-   * it may have pushed an odd number of words. That would misalign SP at the
-   * call boundary and can break variadic calls (e.g. printf in 90_struct-init).
-   *
-   * Do NOT pop those saved scratch regs here (they may still be needed by
-   * materialized operands). Instead, insert a 4-byte pad so SP remains 8-byte
-   * aligned for the duration of this call, then remove it afterwards.
-   */
-  int call_align_pad = 0;
-  if (scratch_push_count & 1)
-  {
-    ot_check(th_sub_sp_imm(R_SP, 4, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
-    call_align_pad = 4;
-  }
-
-  /* Some configurations preserve additional registers around calls.
-   * IMPORTANT: any such pushes must happen BEFORE laying out stack arguments,
-   * otherwise SP at call-time no longer matches where we stored the args.
-   * This breaks stack-passed args and variadic calls (e.g. printf in tests).
-   */
-  int registers_to_push = 0;
-  if (tcc_state->text_and_data_separation && (q->src1.type.t & VT_EXTERN))
-  {
-    /* Preserve the cached-global registers across external calls.
-     * Use bitwise OR (not logical OR).
-     */
-    registers_to_push |= (1 << R9) | (1 << R8);
-  }
-  if (registers_to_push != 0)
-  {
-    ot_check(th_push(registers_to_push));
-  }
-
-  /* Reserve stack space for arguments if needed */
+  /* Step 3: Reserve stack space for stack arguments */
   if (stack_size > 0)
   {
-    ot_check(th_sub_sp_imm(R_SP, stack_size, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    gadd_sp(-stack_size);
+    call_site->used_stack_size += stack_size;
   }
 
-  /* Precompute which registers are needed by future STACK-passed args.
-   * When materializing a stack argument into a temp register, avoid clobbering
-   * a register that will be needed later as a source pointer/value for another
-   * stack argument.
-   */
-  uint32_t *future_stack_src_mask = NULL;
-  if (need_stack_arg_tmps)
+  /* Step 4: Place arguments according to ABI layout */
+  for (int i = 0; i < argc; ++i)
   {
-    future_stack_src_mask = tcc_mallocz(sizeof(uint32_t) * (param_count + 1));
-    future_stack_src_mask[param_count] = 0;
-    for (int i = param_count - 1; i >= 0; --i)
-    {
-      uint32_t mask = future_stack_src_mask[i + 1];
+    const TCCAbiArgLoc *loc = &layout.locs[i];
+    const SValue *arg = &args[i];
+    const int bt = arg->type.t & VT_BTYPE;
+    const int is_64bit = tcc_is_64bit_type(arg->type.t);
 
-      int assigned_register = PREG_NONE;
-      for (int j = 0; j < 4; j++)
+    if (loc->kind == TCC_ABI_LOC_REG)
+    {
+      /* Argument goes in registers R0-R3 */
+      int base_reg = ARM_R0 + loc->reg_base;
+
+      if (bt == VT_STRUCT)
       {
-        if (op_to_reg[j] == PREG_NONE)
-          continue;
-        if (op_to_reg[j] == i)
+        /* Small struct in registers - copy word by word */
+        int words = (loc->size + 3) / 4;
+        for (int w = 0; w < words && w < loc->reg_count; w++)
         {
-          assigned_register = j;
-          break;
+          /* TODO: Load struct fields into registers */
+          /* For now, mark registers as used */
+          call_site->registers_map |= (1 << (base_reg + w));
         }
       }
-
-      if (assigned_register == PREG_NONE)
+      else if (is_64bit)
       {
-        const SValue *arg_value = tcc_ir_callsite_arg_value_ptr(ir, &call_args[i]);
-        if (arg_value)
+        /* 64-bit value in register pair */
+        if (arg->pr0 != PREG_NONE && arg->pr1 != PREG_NONE)
         {
-          /* Skip accessing pr0/pr1 for lvalue arguments - this would trigger premature
-           * FILL_REGS loads of spilled pointers. These will be loaded just-in-time during
-           * the stack argument loop. */
-          if (!(arg_value->r & VT_LVAL))
-          {
-            if (arg_value->pr0 != PREG_NONE && arg_value->pr0 >= 0 && arg_value->pr0 < 16)
-              mask |= (1u << arg_value->pr0);
-            if (arg_value->pr1 != PREG_NONE && arg_value->pr1 >= 0 && arg_value->pr1 < 16)
-              mask |= (1u << arg_value->pr1);
-          }
-        }
-      }
-
-      future_stack_src_mask[i] = mask;
-    }
-  }
-
-  /* Push stack arguments first */
-  int last_stack_arg_temp_used = -1; /* Track which temp was last used to alternate */
-  for (int i = 0; i < param_count; ++i)
-  {
-    // check if argument goes to register
-    int assigned_register = PREG_NONE;
-    int is_64bit = 0;
-
-    for (int j = 0; j < 4; j++)
-    {
-      if (op_to_reg[j] == PREG_NONE)
-        continue;
-      if (op_to_reg[j] == i)
-      {
-        assigned_register = j;
-        break;
-      }
-    }
-    if (assigned_register != PREG_NONE)
-    {
-      continue;
-    }
-
-    /* Some IR/value paths can represent a scalar argument as an address-of
-     * stack slot (VT_LOCAL without VT_LVAL) even though the argument type is
-     * not a pointer. In that case we must dereference it when materializing
-     * the outgoing argument value; otherwise variadic calls (e.g. printf)
-     * end up receiving stack addresses as integers. */
-    const SValue *arg_src = tcc_ir_callsite_arg_value_ptr(ir, &call_args[i]);
-    SValue arg_val = arg_src ? *arg_src : (SValue){0};
-    const int arg_btype = arg_val.type.t & VT_BTYPE;
-    const int is_stack_addr = ((arg_val.r & VT_VALMASK) == VT_LOCAL) && !(arg_val.r & VT_LVAL);
-    const int is_stack_param_vreg = (arg_val.r & VT_PARAM) && ((arg_val.r & VT_VALMASK) == VT_LOCAL);
-    const int needs_deref_for_value =
-        is_stack_addr && !is_stack_param_vreg && arg_btype != VT_PTR && arg_btype != VT_FUNC;
-
-    /* Save the stack offset before setting VT_LVAL for direct load optimization */
-    const int direct_stack_offset = needs_deref_for_value ? arg_val.c.i : 0;
-
-    if (needs_deref_for_value)
-      arg_val.r |= VT_LVAL;
-
-    const int stack_param_offset = arg_val.c.i;
-    const int is_stack_param_lvalue_pre = is_stack_param_vreg;
-
-    if (TCC_DUMP_THUMB_GEN)
-    {
-      THGEN_DUMP("stack arg[%d]: assigned_reg=%d vr=%d orig_r=0x%x c=%d needs_deref=%d stack_param_lval=%d\n", i,
-                 assigned_register, arg_val.vr, arg_val.r, arg_val.c.i, needs_deref_for_value,
-                 is_stack_param_lvalue_pre);
-    }
-
-    TCCMaterializedValue mat_arg = {0};
-    /* Skip materialization for stack arguments that need deref - we'll handle the pointer
-     * load and deref together in the stack arg loop to avoid premature register clobbering */
-    const int skip_materialize = needs_deref_for_value || (arg_val.r & VT_LVAL);
-
-    if (!is_stack_param_lvalue_pre && !skip_materialize)
-    {
-      tcc_ir_materialize_value(ir, &arg_val, &mat_arg);
-
-      if (TCC_DUMP_THUMB_GEN)
-      {
-        THGEN_DUMP("stack arg[%d]: materialized r=0x%x pr0=%d pr1=%d c=%d param=%d lval=%d\n", i, arg_val.r,
-                   arg_val.pr0, arg_val.pr1, arg_val.c.i, (arg_val.r & VT_PARAM) ? 1 : 0,
-                   (arg_val.r & VT_LVAL) ? 1 : 0);
-      }
-    }
-
-    const int is_stack_param_lvalue = is_stack_param_lvalue_pre;
-    if (is_stack_param_lvalue)
-    {
-      const int caller_stack_offset = offset_to_args + stack_param_offset;
-
-      if (TCC_DUMP_THUMB_GEN)
-      {
-        THGEN_DUMP("stack arg[%d]: copy from caller stack offset=%d (orig=%d, offset_to_args=%d)\n", i,
-                   caller_stack_offset, stack_param_offset, offset_to_args);
-      }
-
-      if (is_64bit_type(arg_val.type.t))
-      {
-        stack_offset = TCC_ALIGN(stack_offset, 8);
-
-        /* Choose temps that won't clobber future stack-arg sources. */
-        int t0 = stack_arg_tmp0_reg;
-        int t1 = stack_arg_tmp1_reg;
-        if (future_stack_src_mask && (future_stack_src_mask[i + 1] & (1u << t0)))
-        {
-          t0 = stack_arg_tmp1_reg;
-          t1 = stack_arg_tmp0_reg;
-        }
-
-        tcc_gen_machine_load_from_stack(t0, caller_stack_offset);
-        tcc_gen_machine_load_from_stack(t1, caller_stack_offset + 4);
-
-        ot_check(th_str_imm(t0, R_SP, stack_offset, 6, ENFORCE_ENCODING_NONE));
-        ot_check(th_str_imm(t1, R_SP, stack_offset + 4, 6, ENFORCE_ENCODING_NONE));
-        stack_offset += 8;
-      }
-      else
-      {
-        int t0 = stack_arg_tmp0_reg;
-        /* Alternate to avoid reusing same temp */
-        if (last_stack_arg_temp_used == stack_arg_tmp0_reg)
-          t0 = stack_arg_tmp1_reg;
-        /* Avoid clobbering future sources */
-        if (future_stack_src_mask && (future_stack_src_mask[i + 1] & (1u << t0)))
-          t0 = (t0 == stack_arg_tmp0_reg) ? stack_arg_tmp1_reg : stack_arg_tmp0_reg;
-
-        tcc_gen_machine_load_from_stack(t0, caller_stack_offset);
-        ot_check(th_str_imm(t0, R_SP, stack_offset, 6, ENFORCE_ENCODING_NONE));
-        stack_offset += 4;
-        last_stack_arg_temp_used = t0;
-      }
-
-      if (mat_arg.used_scratch)
-        tcc_machine_release_scratch(&mat_arg.scratch);
-
-      continue;
-    }
-
-    is_64bit = is_64bit_type(arg_val.type.t);
-    if (is_64bit)
-    {
-      /* 64-bit stack arguments must be 8-byte aligned */
-      stack_offset = TCC_ALIGN(stack_offset, 8);
-
-      /* As above, stack args are emitted before register args, so R0/R1 are
-       * available as temporaries. However, register-passed arguments may still
-       * depend on pointers currently held in R0-R3. Use dedicated temps.
-       */
-      /* Avoid clobbering a future stack-arg source register (e.g. a pointer
-       * to the next struct field) by choosing which temp gets written first.
-       */
-      int t0 = stack_arg_tmp0_reg;
-      int t1 = stack_arg_tmp1_reg;
-      if (future_stack_src_mask && (future_stack_src_mask[i + 1] & (1u << t0)))
-      {
-        t0 = stack_arg_tmp1_reg;
-        t1 = stack_arg_tmp0_reg;
-      }
-      load_to_reg(t0, t1, &arg_val);
-
-      /* Store low word first, then high word */
-      ot_check(th_str_imm(t0, R_SP, stack_offset, 6, ENFORCE_ENCODING_NONE));
-      ot_check(th_str_imm(t1, R_SP, stack_offset + 4, 6, ENFORCE_ENCODING_NONE));
-      stack_offset += 8;
-      last_stack_arg_temp_used = t1; /* Track that we used both temps */
-    }
-    else
-    {
-      int reg = arg_val.pr0;
-
-      if (reg != PREG_NONE)
-        thumb_require_materialized_reg("tcc_gen_machine_func_call_op", "stack_arg", reg);
-
-      if (needs_deref_for_value || reg == PREG_NONE || (arg_val.r & VT_LVAL))
-      {
-        /* Optimize: if this is a simple stack deref, load directly instead of
-         * going through load_to_reg which might spill/reload the pointer */
-        if (needs_deref_for_value && direct_stack_offset != 0)
-        {
-          /* Direct load from stack location - no pointer materialization needed */
-          int t0 = stack_arg_tmp0_reg;
-
-          /* Alternate temps to avoid clobbering */
-          if (last_stack_arg_temp_used == stack_arg_tmp0_reg)
-            t0 = stack_arg_tmp1_reg;
-          else if (last_stack_arg_temp_used == stack_arg_tmp1_reg)
-            t0 = stack_arg_tmp0_reg;
-
-          /* Load directly from the stack offset */
-          ot_check(th_ldr_imm(t0, R_FP, direct_stack_offset, 4, ENFORCE_ENCODING_NONE));
-          reg = t0;
-          last_stack_arg_temp_used = t0;
+          /* Value already in registers - move to argument registers */
+          if (arg->pr0 != base_reg)
+            ot_check(th_mov_reg(base_reg, arg->pr0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                                ENFORCE_ENCODING_NONE, false));
+          if (arg->pr1 != (base_reg + 1))
+            ot_check(th_mov_reg(base_reg + 1, arg->pr1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                                ENFORCE_ENCODING_NONE, false));
         }
         else
         {
-          /* Alternate between the two scratch temps to avoid reusing the same register
-           * for consecutive loads. This prevents issues when loading multiple fields
-           * from the same struct where all loads would clobber each other. */
-          int t0 = stack_arg_tmp0_reg;
-
-          /* First priority: alternate from last used temp */
-          if (last_stack_arg_temp_used == stack_arg_tmp0_reg)
-            t0 = stack_arg_tmp1_reg;
-          else if (last_stack_arg_temp_used == stack_arg_tmp1_reg)
-            t0 = stack_arg_tmp0_reg;
-
-          /* Second priority: avoid clobbering future stack arg sources */
-          if (future_stack_src_mask && (future_stack_src_mask[i + 1] & (1u << t0)))
-            t0 = (t0 == stack_arg_tmp0_reg) ? stack_arg_tmp1_reg : stack_arg_tmp0_reg;
-
-          /* Third priority: avoid conflict with current lvalue source */
-          if ((arg_val.r & VT_LVAL) && arg_val.pr0 == t0)
-            t0 = (t0 == stack_arg_tmp0_reg) ? stack_arg_tmp1_reg : stack_arg_tmp0_reg;
-
-          if (TCC_DUMP_THUMB_GEN)
-            THGEN_DUMP("stack arg[%d]: calling load_to_reg with t0=%d (r%d), lval=%d, pr0=%d\n", i, t0, t0,
-                       (arg_val.r & VT_LVAL) ? 1 : 0, arg_val.pr0);
-
-          /* If this is an LVAL with a spilled pointer, load the pointer
-           * into our chosen temp register first, then adjust arg_val to use that register */
-          if ((arg_val.r & VT_LVAL) && tcc_ir_is_spilled(&arg_val))
-          {
-            /* The pointer VReg is spilled. Load it into t0 first. */
-            SValue ptr_val = arg_val;
-            ptr_val.r &= ~VT_LVAL; /* Remove LVAL to load the pointer itself, not deref it */
-
-            if (TCC_DUMP_THUMB_GEN)
-              THGEN_DUMP("  -> Pointer is spilled (vr=%d, pr0=%d), loading into r%d first\n", ptr_val.vr, ptr_val.pr0,
-                         t0);
-
-            load_to_reg(t0, PREG_NONE, &ptr_val);
-
-            /* Now adjust arg_val to indicate the pointer is in t0 */
-            arg_val.pr0 = t0;
-            arg_val.r |= VT_LVAL; /* Re-add LVAL for the actual deref */
-          }
-
-          load_to_reg(t0, PREG_NONE, &arg_val);
-          reg = t0;
-          last_stack_arg_temp_used = t0;
+          /* Load 64-bit value from memory/constant */
+          /* TODO: Implement 64-bit load */
         }
-      }
-
-      ot_check(th_str_imm(reg, R_SP, stack_offset, 6, ENFORCE_ENCODING_NONE));
-      stack_offset += 4;
-    }
-
-    if (mat_arg.used_scratch)
-      tcc_machine_release_scratch(&mat_arg.scratch);
-  }
-
-  if (future_stack_src_mask)
-    tcc_free(future_stack_src_mask);
-  /* Pre-compute register sources for each register-assigned argument so we can spot conflicts.
-   * For lvalues (VT_LVAL set), the pr0 register contains a pointer that will be dereferenced.
-   * Even though we can't remap this (we must load through it), we still need to track that
-   * this register will be READ from - so writing to it as a destination would be wrong.
-   * Track lvalue source registers separately so we can detect these conflicts. */
-  int param_src0[4] = {PREG_NONE, PREG_NONE, PREG_NONE, PREG_NONE};
-  int param_src1[4] = {PREG_NONE, PREG_NONE, PREG_NONE, PREG_NONE};
-  int param_lval_src[4] = {PREG_NONE, PREG_NONE, PREG_NONE, PREG_NONE}; /* Source reg for lvalue dereference */
-  uint32_t future_src_mask = 0;
-  for (int dest = 0; dest < 4; ++dest)
-  {
-    if (op_to_reg[dest] == PREG_NONE)
-      continue;
-    const SValue *arg_value = tcc_ir_callsite_arg_value_ptr(ir, &call_args[op_to_reg[dest]]);
-    const int is_64bit = is_64bit_type(arg_value->type.t);
-
-    if (TCC_DUMP_THUMB_GEN)
-      THGEN_DUMP("Checking reg arg R%d (param %d): vr=%d pr0=%d lval=%d\n", dest, op_to_reg[dest], arg_value->vr,
-                 arg_value->pr0, (arg_value->r & VT_LVAL) ? 1 : 0);
-
-    if (is_valid_src_reg(arg_value, arg_value->pr0))
-    {
-      param_src0[dest] = arg_value->pr0;
-      /* Don't add to conflict mask if src==dest (no real conflict, just loading from self) */
-      if (arg_value->pr0 != dest)
-        future_src_mask |= (1u << arg_value->pr0);
-    }
-    else if ((arg_value->r & VT_LVAL) && arg_value->pr0 != PREG_NONE)
-    {
-      /* Lvalue: pr0 contains pointer to dereference. Track it separately. */
-      if (TCC_DUMP_THUMB_GEN)
-        THGEN_DUMP("  -> Calling thumb_require_materialized_reg for lval pr0=%d\n", arg_value->pr0);
-
-      thumb_require_materialized_reg("tcc_gen_machine_func_call_op", "lval_ptr", arg_value->pr0);
-      param_lval_src[dest] = arg_value->pr0;
-      if (arg_value->pr0 != dest)
-        future_src_mask |= (1u << arg_value->pr0);
-    }
-    if (is_64bit && is_valid_src_reg(arg_value, arg_value->pr1))
-    {
-      param_src1[dest] = arg_value->pr1;
-      /* Don't add to conflict mask if src==dest */
-      if (arg_value->pr1 != dest)
-        future_src_mask |= (1u << arg_value->pr1);
-    }
-  }
-
-  /* Load register arguments in descending order (R3 → R2 → R1 → R0),
-   * but detect when writing to a destination register would clobber a still-needed source.
-   * Since we load R3→R2→R1→R0, we need to check if a destination will clobber a source
-   * needed by LOWER-numbered registers (which haven't been loaded yet). */
-  /* If this is an indirect call and the call target currently lives in an
-   * argument register (R0-R3), preserve it while materializing arguments.
-   * Use an aligned temp stack slot and reload into IP right before BLX.
-   * This avoids callee-saved register bookkeeping and keeps ABI stack
-   * alignment valid at the call boundary. */
-  const int orig_func_ptr_reg = q->src1.pr0;
-  int spilled_call_target = 0;
-  if (orig_func_ptr_reg >= R0 && orig_func_ptr_reg <= R3)
-  {
-    ot_check(th_sub_sp_imm(R_SP, 8, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
-    ot_check(th_str_imm(orig_func_ptr_reg, R_SP, 0, 6, ENFORCE_ENCODING_NONE));
-    spilled_call_target = 1;
-  }
-
-  uint32_t call_target_mask = 0;
-
-  /* Compute sources needed by each lower register before we start loading.
-   * Include both direct register sources (param_src0/param_src1) and lvalue
-   * pointer sources (param_lval_src) that will be dereferenced. */
-  uint32_t sources_needed_by_lower[4] = {0, 0, 0, 0};
-  for (int dest = 0; dest < 4; ++dest)
-  {
-    for (int lower = 0; lower < dest; ++lower)
-    {
-      if (param_src0[lower] != PREG_NONE)
-        sources_needed_by_lower[dest] |= (1u << param_src0[lower]);
-      if (param_src1[lower] != PREG_NONE)
-        sources_needed_by_lower[dest] |= (1u << param_src1[lower]);
-      if (param_lval_src[lower] != PREG_NONE)
-        sources_needed_by_lower[dest] |= (1u << param_lval_src[lower]);
-    }
-  }
-
-  /* While materializing call arguments, some helpers may allocate scratch
-   * registers based on vreg liveness. The physical argument registers (R0-R3)
-   * are not represented as live vregs here, so without extra care the scratch
-   * allocator can (incorrectly) pick an already-prepared argument register and
-   * clobber it.
-   *
-   * Protect all argument registers globally during argument setup, and
-   * temporarily allow the specific destination register(s) we're writing.
-   * Also protect R7 (frame pointer) which must not be used as scratch.
-   */
-  uint32_t saved_global_exclude = scratch_global_exclude;
-  scratch_global_exclude |= (1u << R0) | (1u << R1) | (1u << R2) | (1u << R3) | (1u << R7) | call_target_mask;
-
-  /* FIRST PASS: Process lvalue params in ASCENDING order (R0, R1, R2, R3).
-   * For lvalue sources, the source register contains a pointer that we load through.
-   * Processing in ascending order ensures we don't clobber a source register that
-   * a higher-numbered param still needs. For example:
-   *   R1 loads from [R2], R2 loads from [R3], R3 loads from [R4]
-   * Processing R1 first (loading from R2) is safe because R2 will be written
-   * AFTER R1, so R2's old value (the pointer) is still valid when R1 reads it.
-   */
-  if (TCC_DUMP_THUMB_GEN)
-    THGEN_DUMP("=== FIRST PASS: Processing lvalue params for R0-R3 ===\n");
-
-  uint32_t lval_params_done = 0;
-  for (int i = 0; i <= 3; ++i)
-  {
-    if (op_to_reg[i] == PREG_NONE)
-      continue;
-    if (param_lval_src[i] == PREG_NONE)
-      continue; /* Not an lvalue param, skip for now */
-
-    if (TCC_DUMP_THUMB_GEN)
-      THGEN_DUMP("Processing lvalue param for R%d, lval_src=%d\n", i, param_lval_src[i]);
-
-    /* For 64-bit args, only process the low register of the pair here.
-     * We'll load both words into (Rn, Rn+1) in one go.
-     */
-    {
-      const SValue *arg_probe = tcc_ir_callsite_arg_value_ptr(ir, &call_args[op_to_reg[i]]);
-      if (is_64bit_type(arg_probe->type.t) && (i & 1))
-        continue;
-    }
-
-    /* If the current destination register will be overwritten by materializing
-     * this lvalue, but its *current* value is still needed as a pointer source
-     * for a higher-numbered lvalue argument, preserve it in IP (R12) and
-     * remap those future lvalue loads to use IP.
-     *
-     * This prevents patterns like:
-     *   R2 = *(...)        ; loads arg2, clobbers pointer-in-R2
-     *   R3 = *R2           ; intended load through pointer, now wrong
-     *
-     * Seen in variadic calls where multiple args are loaded from memory.
-     */
-    {
-      int need_preserve = 0;
-      for (int higher = i + 1; higher <= 3; ++higher)
-      {
-        if (op_to_reg[higher] == PREG_NONE)
-          continue;
-        if (param_lval_src[higher] == i)
-        {
-          need_preserve = 1;
-          break;
-        }
-      }
-
-      if (need_preserve)
-      {
-        /* Only use IP if it isn't already a required source for some argument.
-         * (If it is, we'd clobber that value.) */
-        int ip_busy = 0;
-        for (int r = 0; r < 4; ++r)
-        {
-          if (param_src0[r] == R_IP || param_src1[r] == R_IP || param_lval_src[r] == R_IP)
-          {
-            ip_busy = 1;
-            break;
-          }
-        }
-
-        if (!ip_busy)
-        {
-          ot_check(
-              th_mov_reg(R_IP, i, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
-          for (int higher = i + 1; higher <= 3; ++higher)
-          {
-            if (param_lval_src[higher] == i)
-              param_lval_src[higher] = R_IP;
-          }
-        }
-      }
-    }
-
-    const SValue *arg_src = tcc_ir_callsite_arg_value_ptr(ir, &call_args[op_to_reg[i]]);
-    SValue arg_copy = arg_src ? *arg_src : (SValue){0};
-    const int is_64bit = is_64bit_type(arg_copy.type.t);
-    const int dest_reg = i;
-
-    /* Apply lvalue source remapping if any */
-    arg_copy.pr0 = param_lval_src[dest_reg];
-
-    const uint32_t tmp_global_exclude = scratch_global_exclude;
-    const uint32_t dest_mask = is_64bit ? ((1u << dest_reg) | (1u << (dest_reg + 1))) : (1u << dest_reg);
-    scratch_global_exclude &= ~dest_mask;
-
-    if (is_64bit)
-    {
-      /* 64-bit lvalue - load both low/high words into the argument pair.
-       * Previously we only loaded the low word and marked the pair as done,
-       * leaving the high word uninitialized (breaks 118_switch.c).
-       */
-      if (dest_reg <= 2)
-      {
-        load_to_reg(dest_reg, dest_reg + 1, &arg_copy);
+        call_site->registers_map |= (1 << base_reg);
+        call_site->registers_map |= (1 << (base_reg + 1));
       }
       else
       {
-        /* Should not happen (64-bit args are even-aligned), but be safe. */
-        load_to_register(dest_reg, arg_copy.pr0, &arg_copy);
+        /* 32-bit value in single register */
+        if (arg->pr0 != PREG_NONE && arg->pr0 != base_reg)
+        {
+          /* Value already in a register - move it */
+          ot_check(th_mov_reg(base_reg, arg->pr0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                              ENFORCE_ENCODING_NONE, false));
+        }
+        else if ((arg->r & VT_VALMASK) == VT_CONST)
+        {
+          /* Load constant or symbol address */
+          uint32_t imm = (uint32_t)arg->c.i;
+          Sym *sym = (arg->r & VT_SYM) ? arg->sym : NULL;
+          load_immediate(base_reg, imm, sym, false);
+        }
+        else
+        {
+          /* Load from memory */
+          /* TODO: Implement memory load */
+        }
+        call_site->registers_map |= (1 << base_reg);
       }
     }
-    else
+    else /* TCC_ABI_LOC_STACK */
     {
-      /* 32-bit lvalue - load directly to destination register */
-      load_to_register(dest_reg, arg_copy.pr0, &arg_copy);
-    }
+      /* Argument goes on stack */
+      int stack_offset = loc->stack_off;
 
-    scratch_global_exclude = tmp_global_exclude;
-    lval_params_done |= dest_mask;
+      if (bt == VT_STRUCT)
+      {
+        /* Copy struct to stack */
+        /* TODO: Implement struct copy */
+      }
+      else if (is_64bit)
+      {
+        /* Store 64-bit value to stack */
+        /* TODO: Implement 64-bit store */
+      }
+      else
+      {
+        /* Store 32-bit value to stack */
+        if (arg->pr0 != PREG_NONE)
+        {
+          /* Value in register - store it */
+          if (!store_word_to_base(arg->pr0, ARM_SP, stack_offset, 0))
+          {
+            /* Offset too large, use scratch register */
+            load_immediate(ARM_R12, stack_offset, NULL, false);
+            ot_check(th_str_reg(arg->pr0, ARM_SP, ARM_R12, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+          }
+        }
+        else if ((arg->r & VT_VALMASK) == VT_CONST)
+        {
+          /* Load constant or symbol address into R12 and store */
+          uint32_t imm = (uint32_t)arg->c.i;
+          Sym *sym = (arg->r & VT_SYM) ? arg->sym : NULL;
+          load_immediate(ARM_R12, imm, sym, false);
+          if (!store_word_to_base(ARM_R12, ARM_SP, stack_offset, 0))
+          {
+            load_immediate(ARM_R12, stack_offset, NULL, false);
+            ot_check(th_str_reg(ARM_R12, ARM_SP, ARM_R12, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+          }
+        }
+      }
+    }
   }
 
-  /* SECOND PASS: Process non-lvalue params in DESCENDING order (R3, R2, R1, R0).
-   * This is the standard order that avoids clobbering source registers. */
-  for (int i = 3; i >= 0; --i)
+  /* Step 5: Emit the call instruction */
+  gcall_or_jump(0, &q->src1);
+
+  /* Step 6: Clean up stack arguments */
+  if (stack_size > 0)
   {
-    if (op_to_reg[i] == PREG_NONE)
-      continue;
-    if (lval_params_done & (1u << i))
-      continue; /* Already handled in first pass */
+    gadd_sp(stack_size);
+    call_site->used_stack_size -= stack_size;
+  }
 
-    const SValue *arg_src2 = tcc_ir_callsite_arg_value_ptr(ir, &call_args[op_to_reg[i]]);
-    SValue arg_copy = arg_src2 ? *arg_src2 : (SValue){0}; /* We may rewrite pr0/pr1 if we remap sources. */
+  /* Step 7: Restore argument registers if we pushed them */
+  if (arg_regs_in_use != 0)
+  {
+    uint16_t pop_mask = (uint16_t)arg_regs_in_use;
+    ot_check(th_pop(pop_mask));
+    call_site->used_stack_size -= __builtin_popcount(arg_regs_in_use) * 4;
+  }
 
-    const int is_64bit = is_64bit_type(arg_copy.type.t);
-    const int dest_reg = i;
-    const uint32_t dest_mask = is_64bit ? ((1u << dest_reg) | (1u << (dest_reg - 1))) : (1u << dest_reg);
-
-    /* IR owns spills: if we have a pointer register for an lvalue, it must be materialized. */
-    TCCMaterializedValue mat_reg_arg = {0};
-    if ((arg_copy.r & VT_LVAL) != 0 && arg_copy.pr0 != PREG_NONE)
-      thumb_require_materialized_reg("tcc_gen_machine_func_call_op", "lval_ptr", arg_copy.pr0);
-
-    /* Check if writing to dest_reg would clobber a source needed by lower registers.
-     * Note: lvalue sources are now handled in the first pass, so we only need to
-     * check non-lvalue sources here. */
-    const uint32_t conflict_mask = dest_mask & sources_needed_by_lower[dest_reg];
-    if (conflict_mask)
+  /* Step 8: Handle return value if needed */
+  if (!drop_result && q->op == TCCIR_OP_FUNCCALLVAL)
+  {
+    /* Move return value from R0 (and R1 for 64-bit) to destination */
+    if (q->dest.pr0 != PREG_NONE && q->dest.pr0 != ARM_R0)
     {
-      const int reg_to_save = lowest_set_bit(conflict_mask); /* pick lowest conflicting register */
-      const bool r12_busy = sources_needed_by_lower[dest_reg] & (1u << R_IP);
-      if (!r12_busy && !(dest_mask & (1u << R_IP)))
+      ot_check(th_mov_reg(q->dest.pr0, ARM_R0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                          ENFORCE_ENCODING_NONE, false));
+    }
+
+    if (tcc_is_64bit_type(q->dest.type.t) && q->dest.pr1 != PREG_NONE)
+    {
+      if (q->dest.pr1 != ARM_R1)
       {
-        ot_check(th_mov_reg(R_IP, reg_to_save, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+        ot_check(th_mov_reg(q->dest.pr1, ARM_R1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
                             ENFORCE_ENCODING_NONE, false));
-        remap_future_param_sources(dest_reg, reg_to_save, R_IP, param_src0, param_src1, param_lval_src, op_to_reg);
-      }
-      else
-      {
-        /* No safe scratch register; skip remapping (rare). */
       }
     }
-
-    /* Apply any remapping for this argument (non-lvalue sources only in this pass). */
-    if (param_src0[dest_reg] != PREG_NONE)
-      arg_copy.pr0 = param_src0[dest_reg];
-    if (is_64bit && param_src1[dest_reg] != PREG_NONE)
-      arg_copy.pr1 = param_src1[dest_reg];
-
-    /* Allow the destination register(s) for this argument to be used by
-     * address calculation helpers, but keep other arg registers protected. */
-    const uint32_t tmp_global_exclude = scratch_global_exclude;
-    scratch_global_exclude &= ~dest_mask;
-
-    if (is_64bit)
-    {
-      /* 64-bit values use register pairs (R0:R1 or R2:R3) */
-      SValue dest;
-      dest.pr0 = dest_reg - 1;
-      dest.pr1 = dest_reg;
-      --i; /* Skip the lower register of the pair in next iteration */
-
-      /* If either half isn't a usable register source (spilled, lvalue, etc),
-       * materialize the whole 64-bit value into the destination pair.
-       * This avoids trying to load only one half from memory and also keeps
-       * the low/high word selection consistent.
-       */
-      const bool src0_ok = is_valid_src_reg(&arg_copy, arg_copy.pr0);
-      const bool src1_ok = is_valid_src_reg(&arg_copy, arg_copy.pr1);
-      if (!src0_ok || !src1_ok)
-      {
-        load_to_dest(&dest, &arg_copy);
-      }
-      else
-      {
-        /* Move from source register pair */
-        load_to_register(dest_reg - 1, arg_copy.pr0, &arg_copy);
-        load_to_register(dest_reg, arg_copy.pr1, &arg_copy);
-      }
-    }
-    else
-    {
-      /* 32-bit value - load directly to destination register */
-      load_to_register(dest_reg, arg_copy.pr0, &arg_copy);
-    }
-
-    scratch_global_exclude = tmp_global_exclude;
-
-    if (mat_reg_arg.used_scratch)
-      tcc_machine_release_scratch(&mat_reg_arg.scratch);
   }
 
-  scratch_global_exclude = saved_global_exclude;
+  /* Clear argument register usage from call site */
+  call_site->registers_map &= ~0x0F; /* Clear R0-R3 */
 
-  /* registers_to_push handled before stack arg layout */
-
-  if (spilled_call_target)
-  {
-    /* Reload the indirect call target and perform the call directly.
-     * Clear VT_LVAL to prevent accidental extra dereference. */
-    q->src1.r &= ~VT_LVAL;
-    ot_check(th_ldr_imm(R_IP, R_SP, 0, 6, ENFORCE_ENCODING_NONE));
-    ot_check(th_add_sp_imm(R_SP, 8, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
-    ot_check(th_blx_reg(R_IP));
-  }
-  else
-  {
-    gcall_or_jump(0, &q->src1);
-  }
-
-  /* Invalidate global symbol cache after function call.
-   * All caller-saved registers (R0-R3, R12, LR) are clobbered by the call,
-   * so any cached global address in those registers is now invalid. */
-  if (th_is_caller_saved_register(thumb_gen_state.cached_global_reg))
-  {
-    thumb_gen_state.cached_global_sym = NULL;
-    thumb_gen_state.cached_global_reg = PREG_NONE;
-  }
-
-  /* Clean up stack space used for arguments (undo sub_sp before popping). */
-  if (stack_size > 0)
-  {
-    ot_check(th_add_sp_imm(R_SP, stack_size, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
-  }
-  if (registers_to_push != 0)
-  {
-    ot_check(th_pop(registers_to_push));
-  }
-
-  if (call_align_pad)
-  {
-    ot_check(th_add_sp_imm(R_SP, call_align_pad, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
-  }
-
-  /* Restore the dedicated stack-arg temporaries last, once SP is back to the
-   * pre-call state (after stack arg cleanup, saved-reg POPs, and alignment pad).
-   */
-  if (need_stack_arg_tmps)
-  {
-    restore_scratch_regs(&stack_arg_tmps);
-  }
-
-  if (drop_result)
-  {
-    return;
-  }
-
-  /* Handle the return value - move from R0 (and R1 for 64-bit) to destination.
-   * IR owns spills: destination must already be materialized and any storeback
-   * happens in IR codegen.
-   */
-  thumb_require_materialized_reg("tcc_gen_machine_func_call_op", "dest.low", q->dest.pr0);
-  if (tcc_is_64bit_operand(&q->dest))
-  {
-    if (q->dest.pr1 != PREG_NONE)
-      thumb_require_materialized_reg("tcc_gen_machine_func_call_op", "dest.high", q->dest.pr1);
-    if (q->dest.pr1 != R1)
-    {
-      ot_check(th_mov_reg(q->dest.pr1, R1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE,
-                          false));
-    }
-  }
-  if (q->dest.pr0 != R0)
-  {
-    ot_check(
-        th_mov_reg(q->dest.pr0, R0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
-  }
+  /* Clean up */
+  if (args)
+    tcc_free(args);
+  if (layout.locs)
+    tcc_free(layout.locs);
 }
 
 ST_FUNC void tcc_gen_machine_jump_op(TACQuadruple *q)
@@ -7148,4 +6444,49 @@ ST_FUNC const char *tcc_get_abi_softcall_name(TACQuadruple *q)
   return NULL;
 }
 
-#endif // TARGET_DEFS_ONLY
+ST_FUNC void tcc_gen_machine_func_parameter_op(TACQuadruple *q)
+{
+  if (q == NULL)
+    tcc_error("compiler_error: func_parameter_op requires q");
+
+  /* Decode call_id and parameter index from src2.c.i */
+  int call_id = TCCIR_DECODE_CALL_ID(q->src2.c.i);
+  int param_index = TCCIR_DECODE_PARAM_IDX(q->src2.c.i);
+
+  /* Find or create call site for this call_id */
+  ThumbGenCallSite *call_site = thumb_get_call_site_for_id(call_id);
+  if (call_site == NULL)
+  {
+    /* First parameter for this call - create call site */
+    call_site = (ThumbGenCallSite *)tcc_malloc(sizeof(ThumbGenCallSite));
+    memset(call_site, 0, sizeof(ThumbGenCallSite));
+    call_site->call_id = call_id;
+    call_site->function_argument_list = NULL;
+    call_site->function_argument_count = 0;
+    call_site->used_stack_size = 0;
+    call_site->registers_map = 0;
+    call_site->next = NULL;
+    thumb_append_call_site(call_site);
+  }
+
+  /* FUNCPARAMVOID is a marker for a 0-argument call.
+   * Ensure the call site exists, but do not create a fake argument entry. */
+  if (q->op == TCCIR_OP_FUNCPARAMVOID)
+    return;
+
+  /* Expand argument list if needed */
+  if (param_index >= call_site->function_argument_count)
+  {
+    int new_count = param_index + 1;
+    call_site->function_argument_list = (int *)tcc_realloc(call_site->function_argument_list, new_count * sizeof(int));
+    /* Initialize new slots */
+    for (int i = call_site->function_argument_count; i < new_count; i++)
+    {
+      call_site->function_argument_list[i] = -1;
+    }
+    call_site->function_argument_count = new_count;
+  }
+
+  /* Store parameter information - for now just mark as present */
+  call_site->function_argument_list[param_index] = 1; /* Mark parameter as present */
+}

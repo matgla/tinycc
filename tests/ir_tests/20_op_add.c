@@ -95,6 +95,14 @@ int main(int argc, char *argv[])
   printf("Result simple5: %d\n", res);
   sum += res;
 
+  res = simple2(simple01(), simple02(5));
+  printf("Result simple2(simple01(), simple02(5)): %d\n", res);
+  sum += res;
+
+  res = simple5(simple1(3), 2, 3, 4, 5, simple5(1, 2, 3, 4, 5, 6));
+  printf("Result simple5(...): %d\n", res);
+  sum += res;
+
   printf("Total sum: %d\n", sum);
   return 0;
 }

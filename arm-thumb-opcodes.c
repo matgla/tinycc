@@ -33,11 +33,8 @@
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
-#ifndef TARGET_DEFS_ONLY
-
 #define USING_GLOBALS
 #include "tcc.h"
-
 #include "arm-thumb-opcodes.h"
 
 static const char *th_reg_name(unsigned r)
@@ -3868,5 +3865,3 @@ void th_sym_d()
   const int info = ELFW(ST_INFO)(STB_LOCAL, STT_NOTYPE);
   set_elf_sym(symtab_section, ind, 0, info, 0, 1, "$d");
 }
-
-#endif // TARGET_DEFS_ONLY

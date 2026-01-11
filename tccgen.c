@@ -50,7 +50,7 @@ static int local_scope;
 ST_DATA char debug_modes;
 
 ST_DATA SValue *vtop;
-static SValue _vstack[1 + VSTACK_SIZE];
+ST_DATA SValue _vstack[1 + VSTACK_SIZE];
 #define vstack (_vstack + 1)
 
 ST_DATA int nocode_wanted;                /* no code generation wanted */
@@ -797,10 +797,11 @@ ST_FUNC Sym *sym_push(int v, CType *type, int r, int c)
   /* register local variable at IR code generator, get Vreg number */
   /* XXX: no vreg assignment for params so far */
   int valmask = r & VT_VALMASK;
-  if (((valmask == VT_LOCAL) || (valmask == VT_LLOCAL)) && (r & VT_LVAL) && ((type->t & VT_BTYPE) != VT_STRUCT) &&
-      !(type->t & (VT_ARRAY | VT_VLA)))
+
+  // {
+  if (r & VT_PARAM)
   {
-    if (r & VT_PARAM)
+    if (valmask != VT_LOCAL && valmask != VT_LLOCAL)
     {
       vreg = tcc_ir_get_vreg_param(tcc_state->ir);
       tcc_ir_assign_physical_register(tcc_state->ir, vreg, c, -1, -1);
@@ -818,7 +819,11 @@ ST_FUNC Sym *sym_push(int v, CType *type, int r, int c)
         tcc_ir_set_llong_type(tcc_state->ir, vreg);
       }
     }
-    else
+  }
+  else
+  {
+    if (((valmask == VT_LOCAL) || (valmask == VT_LLOCAL)) && (r & VT_LVAL) && ((type->t & VT_BTYPE) != VT_STRUCT) &&
+        !(type->t & (VT_ARRAY | VT_VLA)))
     {
       vreg = tcc_ir_get_vreg_var(tcc_state->ir);
       /* Mark float/double variables */
@@ -834,6 +839,7 @@ ST_FUNC Sym *sym_push(int v, CType *type, int r, int c)
       }
     }
   }
+  // }
   // r &= ~VT_PARAM;
 
   if (local_stack)
@@ -2375,18 +2381,19 @@ static void gen_opl(int op)
       const int call_id = tcc_state->ir ? tcc_state->ir->next_call_id++ : 0;
       memset(&param_num, 0, sizeof(SValue));
       param_num.vr = -1;
-      /* Generate FUNCPARAMVAL for arg1 (param 1) */
-      param_num.c.i = 0;
-      tcc_ir_put_with_aux(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &param_num, NULL, call_id);
-      /* Generate FUNCPARAMVAL for arg2 (param 2) */
-      param_num.c.i = 1;
-      tcc_ir_put_with_aux(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[0], &param_num, NULL, call_id);
+      /* Generate FUNCPARAMVAL for arg1 (param 0) */
+      param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &param_num, NULL);
+      /* Generate FUNCPARAMVAL for arg2 (param 1) */
+      param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 1);
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[0], &param_num, NULL);
       /* Generate FUNCCALLVAL for the function call (returns long long) */
       memset(&dest, 0, sizeof(SValue));
       dest.type.t = VT_LLONG;
       dest.r = 0;
       dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-      tcc_ir_put_with_aux(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[-2], NULL, &dest, call_id);
+      SValue call_id_sv = tcc_ir_svalue_call_id(call_id);
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[-2], &call_id_sv, &dest);
       /* Pop all 3 values (arg1, arg2, func) and push result */
       vtop -= 3;
       vpushi(0);
@@ -2612,18 +2619,19 @@ static void gen_opl(int op)
         const int call_id = tcc_state->ir ? tcc_state->ir->next_call_id++ : 0;
         memset(&param_num, 0, sizeof(SValue));
         param_num.vr = -1;
-        /* Generate FUNCPARAMVAL for arg1 (param 1) */
-        param_num.c.i = 0;
-        tcc_ir_put_with_aux(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &param_num, NULL, call_id);
-        /* Generate FUNCPARAMVAL for arg2 (param 2) */
-        param_num.c.i = 1;
-        tcc_ir_put_with_aux(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[0], &param_num, NULL, call_id);
+        /* Generate FUNCPARAMVAL for arg1 (param 0) */
+        param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &param_num, NULL);
+        /* Generate FUNCPARAMVAL for arg2 (param 1) */
+        param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 1);
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[0], &param_num, NULL);
         /* Generate FUNCCALLVAL for the function call (returns int: -1, 0, or 1) */
         memset(&dest, 0, sizeof(SValue));
         dest.type.t = VT_INT;
         dest.r = 0;
         dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-        tcc_ir_put_with_aux(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[-2], NULL, &dest, call_id);
+        SValue call_id_sv = tcc_ir_svalue_call_id(call_id);
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[-2], &call_id_sv, &dest);
         /* Pop all 3 values (arg1, arg2, func) and push result */
         vtop -= 3;
         vpushi(0);
@@ -4387,14 +4395,15 @@ ST_FUNC void vstore(void)
         param_num.vr = -1;
 
         /* memmove(dest, src, size) */
-        param_num.c.i = 0;
-        tcc_ir_put_with_aux(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-3], &param_num, NULL, call_id);
-        param_num.c.i = 1;
-        tcc_ir_put_with_aux(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-2], &param_num, NULL, call_id);
-        param_num.c.i = 2;
-        tcc_ir_put_with_aux(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &param_num, NULL, call_id);
+        param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-3], &param_num, NULL);
+        param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 1);
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-2], &param_num, NULL);
+        param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 2);
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &param_num, NULL);
 
-        tcc_ir_put_with_aux(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[0], NULL, NULL, call_id);
+        SValue call_id_sv = tcc_ir_svalue_call_id(call_id);
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[0], &call_id_sv, NULL);
         /* Pop func + 3 args; keep the saved destination lvalue as result */
         vtop -= 4;
       }
@@ -7113,7 +7122,13 @@ tok_next:
     /* A symbol that has a register is a local register variable,
        which starts out as VT_LOCAL value.  */
     if ((r & VT_VALMASK) < VT_CONST)
-      r = (r & ~VT_VALMASK) | VT_LOCAL;
+    {
+      // parameter is always a local value
+      if (!(r & VT_PARAM))
+      {
+        r = (r & ~VT_VALMASK) | VT_LOCAL;
+      }
+    }
 
     vset(&s->type, r, s->c);
     /* Point to s as backpointer (even without r&VT_SYM).
@@ -7220,7 +7235,7 @@ tok_next:
       next();
 
       /* Each IR-level call gets a unique call_id so FUNCPARAM* can be bound
-       * without fragile nested-depth scanning. Stored in TACQuadruple.aux.
+       * without fragile nested-depth scanning.
        */
       int call_id = 0;
       if (!NOEVAL_WANTED && tcc_state->ir)
@@ -7277,8 +7292,8 @@ tok_next:
               SValue num;
               memset(&num, 0, sizeof(SValue));
               num.vr = -1;
-              num.c.i = 0;
-              tcc_ir_put_with_aux(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL, call_id);
+              num.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
+              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL);
             }
             vtop--;
             nb_args++;
@@ -7316,7 +7331,6 @@ tok_next:
           {
             /* IR expects 0-based parameter indices.
              * Keep FUNCPARAMVAL numbering consistent across all call sites. */
-            num.c.i = nb_args;
             expr_eq();
             /* Convert VT_CMP/VT_JMP to actual 0/1 value before passing as
              * parameter */
@@ -7324,7 +7338,10 @@ tok_next:
               tcc_ir_generate_cmp_jmp_set(tcc_state->ir);
             gfunc_param_typed(s, sa);
             if (!NOEVAL_WANTED)
-              tcc_ir_put_with_aux(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL, call_id);
+            {
+              num.c.i = TCCIR_ENCODE_PARAM(call_id, nb_args);
+              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL);
+            }
             vtop--; /* consumed */
           }
           nb_args++;
@@ -7359,8 +7376,8 @@ tok_next:
             SValue num;
             memset(&num, 0, sizeof(SValue));
             num.vr = -1;
-            num.c.i = nb_args - 1 - n;
-            tcc_ir_put_with_aux(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL, call_id);
+            num.c.i = TCCIR_ENCODE_PARAM(call_id, nb_args - 1 - n);
+            tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL);
           }
           vtop--; /* consumed */
           end_macro();
@@ -7384,8 +7401,8 @@ tok_next:
          * function pointer value before emitting FUNCCALL.
          * NOTE: We check s->type.t (the function's return type), not vtop->type.t
          * (which is VT_FUNC for function pointers). */
-        tcc_ir_load_if_lvalue(tcc_state->ir, vtop);
-        tcc_ir_put_with_aux(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, vtop, NULL, NULL, call_id);
+        SValue call_id_sv = tcc_ir_svalue_call_id(call_id);
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, vtop, &call_id_sv, NULL);
         --vtop;
       }
       else
@@ -7394,7 +7411,8 @@ tok_next:
         memset(&dest, 0, sizeof(SValue));
         if (nb_args == 0)
         {
-          tcc_ir_put_with_aux(tcc_state->ir, TCCIR_OP_FUNCPARAMVOID, NULL, NULL, NULL, call_id);
+          SValue call_id_sv = tcc_ir_svalue_call_id(call_id);
+          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVOID, NULL, &call_id_sv, NULL);
         }
         // perhaps this should be a correct type :(
         dest.type.t = VT_INT;
@@ -7403,8 +7421,8 @@ tok_next:
         return_vreg = dest.vr;
 
         /* See comment above: materialize call target value for indirect calls. */
-        tcc_ir_load_if_lvalue(tcc_state->ir, vtop);
-        tcc_ir_put_with_aux(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, vtop, NULL, &dest, call_id);
+        SValue call_id_sv = tcc_ir_svalue_call_id(call_id);
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, vtop, &call_id_sv, &dest);
         --vtop;
       }
 
@@ -8305,9 +8323,10 @@ static void try_call_scope_cleanup(Sym *stop)
     const int call_id = tcc_state->ir ? tcc_state->ir->next_call_id++ : 0;
     memset(&src1, 0, sizeof(SValue));
     src1.vr = -1;
-    src1.c.i = 0;
-    tcc_ir_put_with_aux(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &src1, NULL, call_id);
-    tcc_ir_put_with_aux(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[-1], NULL, NULL, call_id);
+    src1.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
+    tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &src1, NULL);
+    SValue call_id_sv = tcc_ir_svalue_call_id(call_id);
+    tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[-1], &call_id_sv, NULL);
     vtop -= 2;
   }
 }
@@ -9100,19 +9119,20 @@ static void init_putz(init_params *p, unsigned long c, int size)
     /* __aeabi_memset(dest, n, c) on ARM EABI; memset(dest, c, n) elsewhere.
      * TOK_memset maps to __aeabi_memset when TCC_ARM_EABI is defined.
      * Stack is: dest, c, n */
-    src1.c.i = 0;
-    tcc_ir_put_with_aux(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-2], &src1, NULL, call_id);
-    src1.c.i = 2;
-    tcc_ir_put_with_aux(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &src1, NULL, call_id);
-    src1.c.i = 1;
-    tcc_ir_put_with_aux(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[0], &src1, NULL, call_id);
+    src1.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
+    tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-2], &src1, NULL);
+    src1.c.i = TCCIR_ENCODE_PARAM(call_id, 2);
+    tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &src1, NULL);
+    src1.c.i = TCCIR_ENCODE_PARAM(call_id, 1);
+    tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[0], &src1, NULL);
 
     vpush_helper_func(TOK_memset);
     memset(&dest, 0, sizeof(SValue));
     dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
     dest.type.t = vtop[-3].type.t;
     dest.r = 0;
-    tcc_ir_put_with_aux(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[0], NULL, &dest, call_id);
+    SValue call_id_sv = tcc_ir_svalue_call_id(call_id);
+    tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[0], &call_id_sv, &dest);
     vtop -= 4;
 
     // vtop -= 4;
@@ -10367,6 +10387,11 @@ static void gen_function(Sym *sym)
   tcc_ir_show(ir);
 #endif
   tcc_ir_liveness_analysis(ir);
+
+  /* Mark return value vregs with incoming_reg0=0 BEFORE allocation
+   * so the allocator knows they arrive in r0 and can optimize accordingly */
+  tcc_ir_mark_return_value_incoming_regs(ir);
+
   /* TODO: track float_parameters_count separately for hard float ABI */
   tcc_ls_allocate_registers(&ir->ls, ir->parameters_count, 0, loc);
 
@@ -10398,7 +10423,6 @@ static void gen_function(Sym *sym)
   }
 
   tcc_ir_patch_live_intervals_registers(ir);
-  tcc_ir_refresh_callsite_args(ir);
   tcc_ir_register_allocation_params(ir);
   tcc_ir_build_stack_layout(ir);
   tcc_ir_generate_code(ir);

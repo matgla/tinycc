@@ -21,7 +21,7 @@ LIBTCC1 = libtcc1.a
 LINK_LIBTCC =
 LIBS =
 CFLAGS += $(CPPFLAGS) -std=c11 -Wno-unused-function -Wno-declaration-after-statement
-VPATH = $(TOPSRC)
+VPATH = $(TOPSRC) $(TOPSRC)/arch
 -LTCC = $(TOP)/$(LIBTCC)
 
 ifdef CONFIG_WIN32
@@ -185,30 +185,21 @@ LIB-$(TR) ?= {B}:/usr/$(TRIPLET-$T)/lib:/usr/lib/$(MARCH-$T)
 INC-$(TR) ?= {B}/include:/usr/$(TRIPLET-$T)/include:/usr/include
 endif
 
-CORE_FILES = tccir.c tccls.c tcc.c tcctools.c libtcc.c tccpp.c tccgen.c tccdbg.c tccelf.c tccasm.c tccyaff.c tccld.c
+CORE_FILES = tccir.c tccls.c tcc.c tcctools.c libtcc.c tccpp.c tccgen.c tccdbg.c tccelf.c tccasm.c tccyaff.c tccld.c tccdebug.c
 CORE_FILES += tcc.h config.h libtcc.h tcctok.h tccir.h tccld.h
-armv8m_FILES = $(CORE_FILES) arm-thumb-opcodes.c arm-thumb-gen.c arm-link.c arm-thumb-asm.c thumb-tok.h
+armv8m_FILES = $(CORE_FILES) arch/arm_aapcs.c arch/armv8m.c arm-thumb-opcodes.c arm-thumb-gen.c arm-thumb-callsite.c arm-link.c arm-thumb-asm.c arm-thumb-defs.h thumb-tok.h
 
 TCCDEFS_H$(subst yes,,$(CONFIG_predefs)) = tccdefs_.h
 
 # libtcc sources
 LIBTCC_SRC = $(filter-out tcc.c tcctools.c,$(filter %.c,$($T_FILES)))
 
-ifeq ($(ONE_SOURCE),yes)
-LIBTCC_OBJ = $(X)libtcc.o
-LIBTCC_INC = $($T_FILES)
-TCC_FILES = $(X)tcc.o
-$(X)tcc.o $(X)libtcc.o : $(TCCDEFS_H)
-else
+# Compile from separate objects
 LIBTCC_OBJ = $(patsubst %.c,$(X)%.o,$(LIBTCC_SRC))
 LIBTCC_INC = $(filter %.h %-gen.c %-link.c,$($T_FILES))
 TCC_FILES = $(X)tcc.o $(LIBTCC_OBJ)
 $(X)tccpp.o : $(TCCDEFS_H)
-$(X)libtcc.o : DEFINES += -DONE_SOURCE=0
-$(CROSS_TARGET)-tcc.o : DEFINES += -DONE_SOURCE=0
-endif
-# native tcc always made from tcc.o and libtcc.[so|a]
-tcc.o : DEFINES += -DONE_SOURCE=0
+
 DEFINES += -I$(TOP)
 
 GITHASH:=$(shell git rev-parse --abbrev-ref HEAD 2>/dev/null || echo no)
@@ -228,8 +219,12 @@ endif
 	# todo: how to pass host CC there?
 	gcc -DC2STR $(filter %.c,$^) -o c2str.exe && ./c2str.exe $< $@
 
-# target specific object rule
+# target specific object rules
 $(X)%.o : %.c $(LIBTCC_INC)
+	$S$(CC) -o $@ -c $< $(addsuffix ,$(DEFINES) $(CFLAGS))
+
+$(X)arch/%.o : arch/%.c $(LIBTCC_INC)
+	@mkdir -p $(dir $@)
 	$S$(CC) -o $@ -c $< $(addsuffix ,$(DEFINES) $(CFLAGS))
 
 # additional dependencies
@@ -248,7 +243,7 @@ $(X)tcc.o : DEFINES += $(DEF_GITHASH)
 # to the same goals and only remakes it once, but that doesn't work over
 # sub-makes like in this target)
 %-tcc$(EXESUF): $(TCCDEFS_H) FORCE
-	@$(MAKE) --no-print-directory $@ CROSS_TARGET=$* ONE_SOURCE=$(or $(ONE_SOURCE),yes)
+	@$(MAKE) --no-print-directory $@ CROSS_TARGET=$*
 
 $(CROSS_TARGET)-tcc$(EXESUF): $(TCC_FILES)
 	$S$(CC) -o $@ $^ $(LIBS) $(LDFLAGS)
@@ -398,9 +393,9 @@ help:
 	@echo "make"
 	@echo "   build native compiler (from separate objects)"
 	@echo "make cross"
-	@echo "   build cross compilers (from one source)"
-	@echo "make ONE_SOURCE=no/yes SILENT=no/yes"
-	@echo "   force building from separate/one object(s), less/more silently"
+	@echo "   build cross compilers (from separate objects)"
+	@echo "make SILENT=no/yes"
+	@echo "   build less/more silently"
 	@echo "make cross-TARGET"
 	@echo "   build one specific cross compiler for 'TARGET'. Currently supported:"
 	@echo "   $(wordlist 1,8,$(TCC_X))"
