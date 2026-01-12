@@ -1927,7 +1927,7 @@ ST_FUNC void tcc_machine_store_spill_slot(int src_reg, int frame_offset);
 ST_FUNC void tcc_machine_addr_of_stack_slot(int dest_reg, int frame_offset);
 
 /* Constant/value materialization - load various value types into registers */
-ST_FUNC void tcc_machine_load_constant(int dest_reg, int dest_reg_high, int64_t value, int is_64bit);
+ST_FUNC void tcc_machine_load_constant(int dest_reg, int dest_reg_high, int64_t value, int is_64bit, Sym *sym);
 ST_FUNC void tcc_machine_load_cmp_result(int dest_reg, int condition_code);
 ST_FUNC void tcc_machine_load_jmp_result(int dest_reg, int jmp_addr, int invert);
 

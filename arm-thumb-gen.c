@@ -2360,11 +2360,24 @@ ST_FUNC void tcc_machine_addr_of_stack_slot(int dest_reg, int frame_offset)
 
 /* Load a constant value into a register (or register pair for 64-bit).
  * This is a simplified wrapper around load_full_const/th_generic_mov_imm
- * that doesn't require an SValue. Used by IR-level materialization. */
-ST_FUNC void tcc_machine_load_constant(int dest_reg, int dest_reg_high, int64_t value, int is_64bit)
+ * that doesn't require an SValue. Used by IR-level materialization.
+ * If sym is non-NULL, a relocation will be generated for symbol-relative constants. */
+ST_FUNC void tcc_machine_load_constant(int dest_reg, int dest_reg_high, int64_t value, int is_64bit, Sym *sym)
 {
   if (dest_reg == PREG_NONE)
     tcc_error("compiler_error: load_constant requires a destination register");
+
+  /* Symbol-relative constants always need the literal pool for relocations */
+  if (sym)
+  {
+    Sym *validated_sym = validate_sym_for_reloc(sym);
+    if (validated_sym)
+    {
+      load_full_const(dest_reg, dest_reg_high, value, validated_sym);
+      return;
+    }
+    /* Invalid or missing sym - fall through to treat as plain constant */
+  }
 
   if (is_64bit)
   {
@@ -2658,42 +2671,6 @@ void load_vt_lval_vt_local(int r, int r1, SValue *sv, int ft, int fc, int sign, 
   }
 }
 
-void load_vt_const(int r, int r1, SValue *sv)
-{
-  TRACE("'load_vt_const' r: %i, const: %i, sym: %i", r, (int)sv->c.i, (sv->r & VT_SYM) == VT_SYM);
-
-  if (tcc_is_64bit_operand(sv))
-  {
-    const uint64_t val64 = sv->c.i; /* c.i is the same memory as c.d due to union */
-    const uint32_t lo = (uint32_t)(val64 & 0xFFFFFFFF);
-    const uint32_t hi = (uint32_t)(val64 >> 32);
-    thumb_opcode o1 = th_generic_mov_imm(r, lo);
-    thumb_opcode o2 = th_generic_mov_imm(r1, hi);
-    if (o1.size == 0 && o2.size == 0)
-    {
-      return load_full_const(r, r1, val64, 0);
-    }
-    if (!ot(o1))
-      load_full_const(r, PREG_NONE, lo, 0);
-    if (!ot(o2))
-      load_full_const(r1, PREG_NONE, hi, 0);
-    return; /* Don't fall through to 32-bit code */
-  }
-
-  if (sv->r & VT_SYM)
-  {
-    Sym *validated_sym = validate_sym_for_reloc(sv->sym);
-    if (validated_sym)
-    {
-      return load_full_const(r, r1, sv->c.i, validated_sym);
-    }
-    /* Invalid or missing sym - treat as constant without relocation */
-  }
-
-  if (!ot(th_generic_mov_imm(r, sv->c.i)))
-    load_full_const(r, r1, sv->c.i, 0);
-}
-
 void load_vt_local(int r, SValue *sv, int base)
 {
   int off = sv->c.i;
@@ -2722,35 +2699,6 @@ void load_vt_local(int r, SValue *sv, int base)
   {
     ot_check(th_sub_imm(r, base, -off, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
   }
-}
-
-void load_vt_cmp(int r, SValue *sv)
-{
-  const uint32_t firstcond = mapcc(sv->c.i);
-  TRACE("'load_vt_cmp' to reg: %d, op: 0x%x\n", r, (uint32_t)sv->c.i);
-  if (r == R_SP || r == R_PC)
-  {
-    tcc_error("compiler_error: load_vt_cmp can't be used for pc or sp\n");
-  }
-
-  // it block
-  o(0xbf00 | (firstcond << 4) | 0x4 | ((~firstcond & 1) << 3));
-  ot_check(th_generic_mov_imm(r, 1));
-  ot_check(th_generic_mov_imm(r, 0));
-}
-
-void load_vt_jmp_jmpi(int r, SValue *sv)
-{
-#ifdef TCC_TARGET_ARM_ARCHV6M
-  if (r > 7)
-  {
-    tcc_error("compiler_error: implement load_vt_jmp_jmpi for armv6m\n");
-  }
-#endif
-  ot_check(th_generic_mov_imm(r, sv->r & 1));
-  ot_check(th_b_t4(2));
-  gsym(sv->c.i);
-  ot_check(th_generic_mov_imm(r, (sv->r ^ 1) & 1));
 }
 
 void load_to_dest(SValue *dest, SValue *sv)
@@ -2874,7 +2822,12 @@ void load_to_dest(SValue *dest, SValue *sv)
     }
   }
   else if (v == VT_CONST)
-    return load_vt_const(dest->pr0, dest->pr1, sv);
+  {
+    /* Route through machine API for constants */
+    Sym *sym = (sv->r & VT_SYM) ? sv->sym : NULL;
+    int is_64bit = tcc_is_64bit_operand(sv);
+    return tcc_machine_load_constant(dest->pr0, dest->pr1, sv->c.i, is_64bit, sym);
+  }
   else if (v == VT_LOCAL)
   {
     /* Address-of stack slot/local. Spills are materialized in IR codegen. */
@@ -2886,9 +2839,9 @@ void load_to_dest(SValue *dest, SValue *sv)
     return load_vt_local(dest->pr0, sv, base);
   }
   else if (v == VT_CMP)
-    return load_vt_cmp(dest->pr0, sv);
+    return tcc_machine_load_cmp_result(dest->pr0, sv->c.i);
   else if (v == VT_JMP || v == VT_JMPI)
-    return load_vt_jmp_jmpi(dest->pr0, sv);
+    return tcc_machine_load_jmp_result(dest->pr0, sv->c.i, v == VT_JMPI);
   else if (v < VT_CONST)
   {
     /* For IR-generated code, use pr0 as the source register */
@@ -3258,11 +3211,7 @@ static void thumb_emit_add_imm_fallback(int rd, int rn, uint32_t imm, thumb_flag
     if (rn >= 0 && rn <= 15)
       exclude |= (1u << rn);
     ScratchRegAlloc scratch = get_scratch_reg_with_save(exclude);
-    SValue imm_sv = {0};
-    imm_sv.r = VT_CONST;
-    imm_sv.type.t = VT_INT;
-    imm_sv.c.i = (int32_t)imm;
-    load_vt_const(scratch.reg, PREG_NONE, &imm_sv);
+    tcc_machine_load_constant(scratch.reg, PREG_NONE, (int32_t)imm, 0, NULL);
     ot_check(th_add_reg(rd, rn, scratch.reg, flags, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     restore_scratch_reg(&scratch);
   }
@@ -3283,11 +3232,7 @@ static void thumb_emit_sub_imm_fallback(int rd, int rn, uint32_t imm, thumb_flag
     if (rn >= 0 && rn <= 15)
       exclude |= (1u << rn);
     ScratchRegAlloc scratch = get_scratch_reg_with_save(exclude);
-    SValue imm_sv = {0};
-    imm_sv.r = VT_CONST;
-    imm_sv.type.t = VT_INT;
-    imm_sv.c.i = (int32_t)imm;
-    load_vt_const(scratch.reg, PREG_NONE, &imm_sv);
+    tcc_machine_load_constant(scratch.reg, PREG_NONE, (int32_t)imm, 0, NULL);
     ot_check(th_sub_reg(rd, rn, scratch.reg, flags, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     restore_scratch_reg(&scratch);
   }
@@ -3309,11 +3254,7 @@ static void thumb_emit_op_imm_fallback(int rd, int rn, uint32_t imm, thumb_flags
     if (rn >= 0 && rn <= 15)
       exclude |= (1u << rn);
     ScratchRegAlloc scratch = get_scratch_reg_with_save(exclude);
-    SValue imm_sv = {0};
-    imm_sv.r = VT_CONST;
-    imm_sv.type.t = VT_INT;
-    imm_sv.c.i = (int32_t)imm;
-    load_vt_const(scratch.reg, PREG_NONE, &imm_sv);
+    tcc_machine_load_constant(scratch.reg, PREG_NONE, (int32_t)imm, 0, NULL);
     ot_check(handler.reg_handler(rd, rn, scratch.reg, flags, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     restore_scratch_reg(&scratch);
   }
@@ -3354,15 +3295,16 @@ static void thumb_emit_opcode64_imm(TACQuadruple *op, const char *ctx, ThumbData
 
   if (src1_is_imm)
   {
+    Sym *sym = (op->src1.r & VT_SYM) ? op->src1.sym : NULL;
     if (src1_is64)
     {
-      load_vt_const(rd_low, rd_high, &op->src1);
+      tcc_machine_load_constant(rd_low, rd_high, op->src1.c.i, 1, sym);
       rn_low = rd_low;
       rn_high = rd_high;
     }
     else
     {
-      load_to_reg(rd_low, PREG_NONE, &op->src1);
+      tcc_machine_load_constant(rd_low, PREG_NONE, op->src1.c.i, 0, sym);
       rn_low = rd_low;
       rn_high = PREG_NONE;
     }
@@ -3552,12 +3494,10 @@ static void thumb_emit_logical64_op(TACQuadruple *op, ThumbDataProcessingHandler
 
   if (src1_is_imm && src2_is_imm)
   {
-    SValue folded;
-    memset(&folded, 0, sizeof(folded));
-    folded.r = VT_CONST;
-    folded.type = op->dest.type;
-    folded.c.i = (int64_t)fold64(src1_imm, src2_imm);
-    load_to_dest(&op->dest, &folded);
+    /* Constant folding: load the computed result directly to destination */
+    int64_t folded_value = (int64_t)fold64(src1_imm, src2_imm);
+    int is_64bit = tcc_is_64bit_operand(&op->dest);
+    tcc_machine_load_constant(op->dest.pr0, op->dest.pr1, folded_value, is_64bit, NULL);
     return;
   }
 
@@ -3785,7 +3725,8 @@ static void thumb_emit_shift64_imm(TACQuadruple *op, const char *ctx, bool is_le
   const bool src_is_imm = (src_lo == PREG_NONE) && th_has_immediate_value(op->src1.r);
   if (src_is_imm)
   {
-    load_vt_const(dst_lo, dst_hi, &op->src1);
+    Sym *sym = (op->src1.r & VT_SYM) ? op->src1.sym : NULL;
+    tcc_machine_load_constant(dst_lo, dst_hi, op->src1.c.i, 1, sym);
     src_lo = dst_lo;
     src_hi = dst_hi;
   }
@@ -5052,10 +4993,9 @@ ST_FUNC void tcc_gen_machine_return_value_op(TACQuadruple *q)
    * fields. */
   if ((q->src1.r & VT_VALMASK) == VT_CONST)
   {
-    SValue dest;
-    dest.pr0 = R0;
-    dest.pr1 = is_64bit ? R1 : PREG_NONE;
-    return load_to_dest(&dest, &q->src1);
+    Sym *sym = (q->src1.r & VT_SYM) ? q->src1.sym : NULL;
+    tcc_machine_load_constant(R0, is_64bit ? R1 : PREG_NONE, q->src1.c.i, is_64bit, sym);
+    return;
   }
 
   /* NOTE: src1 is preloaded to a valid register by generate_code if it was spilled.
@@ -5574,15 +5514,19 @@ ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *op)
     return;
   }
 
-  if ((op->src1.r & VT_VALMASK) == VT_CONST)
+  if ((op->src1.r & VT_VALMASK) == VT_CONST && !(op->src1.r & VT_LVAL))
   {
+    /* Pure constant (not a memory dereference). Use machine API directly. */
+    Sym *sym = (op->src1.r & VT_SYM) ? op->src1.sym : NULL;
+    int is_64bit = tcc_is_64bit_operand(&op->src1);
+
     if (dest_is_vfp)
     {
       int dn = LS_VFP_REG_NUM(op->dest.pr0);
       /* Load constant to integer register, then move to VFP */
       ScratchRegAlloc scratch_alloc = get_scratch_reg_with_save(0);
       int scratch_reg = scratch_alloc.reg;
-      load_to_reg(scratch_reg, PREG_NONE, &op->src1);
+      tcc_machine_load_constant(scratch_reg, PREG_NONE, op->src1.c.i, 0, sym);
       ot_check(th_vmov_gp_sp(scratch_reg, dn, 0)); /* VMOV Sn, scratch_reg */
       restore_scratch_reg(&scratch_alloc);
     }
@@ -5593,7 +5537,7 @@ ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *op)
        * Remove VT_LVAL to prevent store() from trying to dereference. */
       ScratchRegAlloc scratch_alloc = get_scratch_reg_with_save(0);
       int scratch_reg = scratch_alloc.reg;
-      load_to_reg(scratch_reg, PREG_NONE, &op->src1);
+      tcc_machine_load_constant(scratch_reg, PREG_NONE, op->src1.c.i, 0, sym);
       SValue dest_direct = op->dest;
       dest_direct.r &= ~VT_LVAL; /* Clear VT_LVAL - we want direct store to stack offset */
       store(scratch_reg, &dest_direct);
@@ -5601,7 +5545,36 @@ ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *op)
     }
     else
     {
-      load_to_dest(&op->dest, &op->src1);
+      tcc_machine_load_constant(op->dest.pr0, is_64bit ? op->dest.pr1 : PREG_NONE, op->src1.c.i, is_64bit, sym);
+    }
+    return;
+  }
+
+  /* VT_CONST with VT_LVAL means dereference a global symbol - use load_to_reg */
+  if ((op->src1.r & VT_VALMASK) == VT_CONST && (op->src1.r & VT_LVAL))
+  {
+    if (dest_is_vfp)
+    {
+      int dn = LS_VFP_REG_NUM(op->dest.pr0);
+      ScratchRegAlloc scratch_alloc = get_scratch_reg_with_save(0);
+      int scratch_reg = scratch_alloc.reg;
+      load_to_reg(scratch_reg, PREG_NONE, &op->src1);
+      ot_check(th_vmov_gp_sp(scratch_reg, dn, 0));
+      restore_scratch_reg(&scratch_alloc);
+    }
+    else if ((op->dest.r & VT_LVAL) && ((op->dest.r & VT_VALMASK) == VT_LOCAL || (op->dest.r & VT_VALMASK) == VT_CONST))
+    {
+      ScratchRegAlloc scratch_alloc = get_scratch_reg_with_save(0);
+      int scratch_reg = scratch_alloc.reg;
+      load_to_reg(scratch_reg, PREG_NONE, &op->src1);
+      SValue dest_direct = op->dest;
+      dest_direct.r &= ~VT_LVAL;
+      store(scratch_reg, &dest_direct);
+      restore_scratch_reg(&scratch_alloc);
+    }
+    else
+    {
+      load_to_reg(op->dest.pr0, op->dest.pr1, &op->src1);
     }
     return;
   }

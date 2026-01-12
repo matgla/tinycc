@@ -2594,7 +2594,7 @@ void tcc_ir_materialize_const_to_reg(TCCIRState *ir, SValue *sv, TCCMaterialized
 
   if (val_kind == VT_CONST)
   {
-    tcc_machine_load_constant(scratch.regs[0], is_64bit ? scratch.regs[1] : PREG_NONE, sv->c.i, is_64bit);
+    tcc_machine_load_constant(scratch.regs[0], is_64bit ? scratch.regs[1] : PREG_NONE, sv->c.i, is_64bit, NULL);
   }
   else if (val_kind == VT_CMP)
   {
