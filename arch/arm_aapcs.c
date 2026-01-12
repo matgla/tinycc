@@ -87,7 +87,32 @@ TCCAbiArgLoc tcc_abi_classify_argument(TCCAbiCallLayout *layout, int arg_index, 
   {
     const int slot_sz = tcc_abi_align_up_int(size, 4);
     const int regs_needed = (slot_sz + 3) / 4;
-    if ((int)layout->next_reg + regs_needed <= 4)
+    
+    /* AAPCS: Composite types > 4 words (16 bytes) are passed by invisible reference.
+     * The caller passes a pointer in a register, callee dereferences. */
+    if (size > 16)
+    {
+      /* Mark as invisible reference */
+      if (layout->arg_flags)
+        layout->arg_flags[arg_index] |= TCC_ABI_ARG_FLAG_INVISIBLE_REF;
+      /* Pass the pointer in a register (like a scalar) */
+      if (layout->next_reg <= 3)
+      {
+        loc.kind = TCC_ABI_LOC_REG;
+        loc.reg_base = layout->next_reg;
+        loc.reg_count = 1;
+        loc.size = 4; /* pointer size */
+        layout->next_reg++;
+      }
+      else
+      {
+        loc.kind = TCC_ABI_LOC_STACK;
+        loc.stack_off = layout->next_stack_off;
+        loc.size = 4; /* pointer size */
+        layout->next_stack_off += 4;
+      }
+    }
+    else if ((int)layout->next_reg + regs_needed <= 4)
     {
       loc.kind = TCC_ABI_LOC_REG;
       loc.reg_base = layout->next_reg;

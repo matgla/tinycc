@@ -1,11 +1,13 @@
 extern int printf(const char *, ...);
 
-typedef struct {
+typedef struct
+{
   int x;
   int y;
 } TestStruct;
 
-int main() {
+int main()
+{
   TestStruct s = {};
   s.x = 10;
   s.y = 20;
@@ -14,9 +16,3 @@ int main() {
 
   return 0;
 }
-
-// void aeabi_memset(void *dest, int n, int c) {
-//   for (int i = 0; i < n; i++) {
-//     ((unsigned char *)dest)[i] = (unsigned char)c;
-//   }
-// }

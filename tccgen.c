@@ -7402,7 +7402,25 @@ tok_next:
          * NOTE: We check s->type.t (the function's return type), not vtop->type.t
          * (which is VT_FUNC for function pointers). */
         SValue call_id_sv = tcc_ir_svalue_call_id(call_id);
-        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, vtop, &call_id_sv, NULL);
+        /* Emit FUNCPARAMVOID for 0-arg calls so backend creates a call site */
+        if (nb_args == 0)
+        {
+          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVOID, NULL, &call_id_sv, NULL);
+        }
+        /* For indirect calls (VT_LVAL set), emit a LOAD to get the function pointer value */
+        SValue call_target = *vtop;
+        if (vtop->r & VT_LVAL)
+        {
+          SValue load_dest;
+          memset(&load_dest, 0, sizeof(SValue));
+          load_dest.type = vtop->type;
+          load_dest.r = 0;
+          load_dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+          tcc_ir_put(tcc_state->ir, TCCIR_OP_LOAD, vtop, NULL, &load_dest);
+          call_target = load_dest;
+          call_target.r &= ~VT_LVAL; /* Clear VT_LVAL since we now have the value */
+        }
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &call_target, &call_id_sv, NULL);
         --vtop;
       }
       else
@@ -7420,9 +7438,21 @@ tok_next:
         dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
         return_vreg = dest.vr;
 
-        /* See comment above: materialize call target value for indirect calls. */
+        /* For indirect calls (VT_LVAL set), emit a LOAD to get the function pointer value */
         SValue call_id_sv = tcc_ir_svalue_call_id(call_id);
-        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, vtop, &call_id_sv, &dest);
+        SValue call_target = *vtop;
+        if (vtop->r & VT_LVAL)
+        {
+          SValue load_dest;
+          memset(&load_dest, 0, sizeof(SValue));
+          load_dest.type = vtop->type;
+          load_dest.r = 0;
+          load_dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+          tcc_ir_put(tcc_state->ir, TCCIR_OP_LOAD, vtop, NULL, &load_dest);
+          call_target = load_dest;
+          call_target.r &= ~VT_LVAL; /* Clear VT_LVAL since we now have the value */
+        }
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &call_target, &call_id_sv, &dest);
         --vtop;
       }
 
@@ -8973,7 +9003,7 @@ again:
     }
       if (debug_modes)
         tcc_tcov_reset_ind(tcc_state);
-      vla_restore(cur_scope->vla.loc);
+      vla_restore(cur_scope->vla.locorig);
 
       if (tok != '}')
       {

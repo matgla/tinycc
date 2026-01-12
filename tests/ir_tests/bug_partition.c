@@ -1,4 +1,4 @@
-#include <stdio.h>
+extern void printf(const char *format, ...);
 
 int array[4] = {30, 10, 20, 40};
 

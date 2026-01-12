@@ -72,6 +72,7 @@ typedef struct IRRegistersConfig
 
 extern const IRRegistersConfig irop_config[];
 const char *tcc_ir_get_vreg_type_string(int vreg);
+static bool tcc_ir_operand_needs_dereference(SValue *sv);
 #endif
 
 static inline int is_thumb2_32bit_prefix(uint16_t h1)
@@ -133,101 +134,6 @@ static void tcc_dump_thumb_generated_span(uint32_t start, uint32_t end)
 #endif
 }
 
-#if TCC_DUMP_THUMB_GEN && (defined(__linux__) || defined(__APPLE__))
-static int tcc_find_executable_in_path(const char *exe, char *out_path, size_t out_cap)
-{
-  if (!exe || !*exe || !out_path || out_cap == 0)
-    return 0;
-  const char *path = getenv("PATH");
-  if (!path)
-    return 0;
-
-  const size_t exe_len = strlen(exe);
-  const char *p = path;
-  while (*p)
-  {
-    const char *colon = strchr(p, ':');
-    size_t dir_len = colon ? (size_t)(colon - p) : strlen(p);
-    if (dir_len == 0)
-    {
-      p = colon ? colon + 1 : p + dir_len;
-      continue;
-    }
-
-    /* candidate = <dir>/<exe> */
-    size_t need = dir_len + 1 + exe_len + 1;
-    if (need <= out_cap)
-    {
-      memcpy(out_path, p, dir_len);
-      out_path[dir_len] = '/';
-      memcpy(out_path + dir_len + 1, exe, exe_len);
-      out_path[dir_len + 1 + exe_len] = '\0';
-
-      if (access(out_path, X_OK) == 0)
-        return 1;
-    }
-
-    p = colon ? colon + 1 : p + dir_len;
-  }
-  return 0;
-}
-
-static int tcc_try_dump_thumb_with_objdump(const unsigned char *bytes, size_t len, uint32_t start_vma)
-{
-  if (!bytes || len == 0)
-    return 0;
-
-  char objdump_path[512];
-  if (!tcc_find_executable_in_path("arm-none-eabi-objdump", objdump_path, sizeof(objdump_path)))
-  {
-    /* No suitable disassembler found. */
-    return 0;
-  }
-
-  char tmp_template[] = "/tmp/tcc-thumb-XXXXXX";
-  int fd = mkstemp(tmp_template);
-  if (fd < 0)
-    return 0;
-
-  ssize_t w = write(fd, bytes, len);
-  close(fd);
-  if (w < 0 || (size_t)w != len)
-  {
-    unlink(tmp_template);
-    return 0;
-  }
-
-  /* Disassemble raw bytes as ARM with forced Thumb.
-   * --adjust-vma makes addresses match section offsets.
-   */
-  char cmd[1024];
-  snprintf(cmd, sizeof(cmd), "%s -D -b binary -marm -Mforce-thumb --adjust-vma=0x%x --no-show-raw-insn %s 2>/dev/null",
-           objdump_path, (unsigned)start_vma, tmp_template);
-
-  FILE *fp = popen(cmd, "r");
-  if (!fp)
-  {
-    unlink(tmp_template);
-    return 0;
-  }
-
-  /* Print objdump output verbatim, but keep it visually nested under the IR op. */
-  char line[512];
-  int any = 0;
-  while (fgets(line, sizeof(line), fp))
-  {
-    /* Filter obvious headers to keep output compact. */
-    if (strstr(line, "file format") || strstr(line, "Disassembly of"))
-      continue;
-    THGEN_DUMP("    %s", line);
-    any = 1;
-  }
-  pclose(fp);
-  unlink(tmp_template);
-  return any;
-}
-#endif
-
 #if TCC_DUMP_THUMB_GEN
 static void tcc_dump_svalue_short_to(FILE *out, const SValue *sv)
 {
@@ -257,7 +163,11 @@ static void tcc_dump_svalue_short_to(FILE *out, const SValue *sv)
     }
     break;
   case VT_LLOCAL:
-    fprintf(out, "VT_LLOCAL(cval=%d)", (int)sv->c.i);
+    /* VT_LLOCAL with VT_LVAL: spilled pointer needing double dereference */
+    if (sv->pr0 != PREG_NONE && (sv->pr0 & PREG_SPILLED))
+      fprintf(out, SPILL_MARK_BEGIN "SpillLoc[%d]***DEREF***" SPILL_MARK_END, (int)sv->c.i);
+    else
+      fprintf(out, "VT_LLOCAL(cval=%d)", (int)sv->c.i);
     break;
   case VT_LOCAL:
     if (sv->pr0 != PREG_NONE)
@@ -300,7 +210,7 @@ static void tcc_dump_svalue_short_to(FILE *out, const SValue *sv)
     if (sv->pr0 == PREG_NONE)
     {
       fprintf(out, "VReg %s:%d", tcc_ir_get_vreg_type_string(sv->vr), TCCIR_DECODE_VREG_POSITION(sv->vr));
-      if (r & VT_LVAL)
+      if (tcc_ir_operand_needs_dereference(sv))
         fprintf(out, "***DEREF***");
     }
     else
@@ -309,7 +219,7 @@ static void tcc_dump_svalue_short_to(FILE *out, const SValue *sv)
         fprintf(out, SPILL_MARK_BEGIN "SpillLoc[%d]" SPILL_MARK_END, (int)sv->c.i);
       else
         fprintf(out, "R%d", sv->pr0);
-      if (r & VT_LVAL)
+      if (tcc_ir_operand_needs_dereference(sv))
         fprintf(out, "***DEREF***");
     }
     break;
@@ -1099,6 +1009,13 @@ void tcc_ir_add_function_parameters(TCCIRState *ir, CType *func_type)
   tcc_state->need_frame_pointer = 0;
 
   loc = 0;
+
+  /* Count arguments to pre-allocate layout arrays */
+  int arg_count = 0;
+  for (Sym *s = sym->next; s; s = s->next)
+    arg_count++;
+  if (arg_count > 0)
+    tcc_abi_call_layout_ensure_capacity(&call_layout, arg_count);
 
   int arg_index = 0;
   for (sym = sym->next; sym; sym = sym->next, ++arg_index)
@@ -2222,13 +2139,14 @@ void tcc_ir_liveness_analysis(TCCIRState *ir)
       crosses_call = tcc_ir_has_call_in_range(ir, start, end);
       addrtaken = interval->addrtaken;
       reg_type = tcc_ir_get_reg_type(ir, encoded_vreg);
+      /* If the interval ends at a CALL instruction, this vreg is a parameter
+       * to that call (interval was extended by tcc_ir_extend_param_intervals).
+       * It must be in a callee-saved register because the call's argument
+       * setup phase may clobber caller-saved registers. */
       if (end < ir->next_instruction_index &&
           (ir->instructions[end].op == TCCIR_OP_FUNCCALLVAL || ir->instructions[end].op == TCCIR_OP_FUNCCALLVOID))
       {
-        /* Don't decrement if this vreg is an argument to the call - it needs
-         * to stay live during argument loading in tcc_gen_machine_func_call_op */
-        // end--; /* Do not include call instruction itself */
-        // crosses_call = 1; /* Call arg must be in callee-saved reg or spilled */
+        crosses_call = 1;
       }
       tcc_ls_add_live_interval(&ir->ls, encoded_vreg, start, end, crosses_call, addrtaken, reg_type,
                                interval->is_lvalue, -1);
@@ -2249,26 +2167,15 @@ void tcc_ir_liveness_analysis(TCCIRState *ir)
       crosses_call = tcc_ir_has_call_in_range(ir, start, end);
       addrtaken = interval->addrtaken;
       reg_type = tcc_ir_get_reg_type(ir, vreg_encoded);
-      /* Normally we don't include the call instruction itself in the interval
-       * (arguments are consumed by the call), BUT if this vreg is the function
-       * pointer (src1 of the call) OR a function argument, we must keep it
-       * alive through the call. */
-      // if (end < ir->next_instruction_index &&
-      //     (ir->instructions[end].op == TCCIR_OP_FUNCCALLVAL || ir->instructions[end].op == TCCIR_OP_FUNCCALLVOID))
-      // {
-      //   /* Check if this vreg is the function pointer (src1) of this call,
-      //    * or if it's an argument to the call */
-      //   if (ir->instructions[end].src1.vr != vreg_encoded && !tcc_ir_vreg_is_call_argument(ir, vreg_encoded, end))
-      //   {
-      //     end--; /* Do not include call instruction itself for non-func-ptr and non-arg vregs */
-      //   }
-      //   else
-      //   {
-      //     /* This vreg IS a call argument or func ptr - it crosses this call
-      //      * and must be in a callee-saved register or spilled. */
-      //     crosses_call = 1;
-      //   }
-      // }
+      /* If the interval ends at a CALL instruction, this vreg is a parameter
+       * to that call (interval was extended by tcc_ir_extend_param_intervals).
+       * It must be in a callee-saved register because the call's argument
+       * setup phase may clobber caller-saved registers. */
+      if (end < ir->next_instruction_index &&
+          (ir->instructions[end].op == TCCIR_OP_FUNCCALLVAL || ir->instructions[end].op == TCCIR_OP_FUNCCALLVOID))
+      {
+        crosses_call = 1;
+      }
       tcc_ls_add_live_interval(&ir->ls, vreg_encoded, start, end, crosses_call, addrtaken, reg_type,
                                interval->is_lvalue, -1);
     }
@@ -2569,9 +2476,10 @@ void tcc_ir_materialize_value(TCCIRState *ir, SValue *sv, TCCMaterializedValue *
   const int val_kind = sv->r & VT_VALMASK;
   if (!(sv->r & VT_LVAL) && (val_kind == VT_LOCAL || val_kind == VT_LLOCAL))
   {
-    const int vreg_type = TCCIR_DECODE_VREG_TYPE(sv->vr);
-    if (vreg_type == TCCIR_VREG_TYPE_VAR || vreg_type == TCCIR_VREG_TYPE_PARAM)
-      return;
+    /* VT_LOCAL without VT_LVAL represents "address of stack location".
+     * This is an address computation (fp + offset), not a value to be loaded.
+     * Skip materialization - the backend will compute the address directly. */
+    return;
   }
 
   tcc_ir_require_materialization_result(result, "materialize_value");
@@ -3092,18 +3000,44 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
        * For address-of expressions (old_r == VT_LOCAL without VT_LVAL), don't add VT_LVAL.
        * If original had VT_LVAL (pointer dereference), preserve it.
        *
-       * IMPORTANT: If interval->is_lvalue is 0, this is a DESTINATION of a LOAD or ASSIGN
-       * operation - we're WRITING to the spill slot, not reading from it. Do NOT add VT_LVAL
-       * in this case, as that would cause the spill preload to try to load from an
-       * uninitialized spill slot. */
-      int need_lval = (old_r & VT_LVAL);
-      if (old_v < VT_CONST && old_v != VT_LOCAL && interval->is_lvalue)
+       * DOUBLE INDIRECTION CASE: If old_r has VT_LVAL AND the original was NOT
+       * already a local variable (VT_LOCAL), then the code wants to DEREFERENCE
+       * the value held in this vreg. If that value is spilled:
+       *   - Spill slot contains a POINTER value (e.g., result of ADD on address)
+       *   - Need to: (1) load pointer from spill, (2) dereference it
+       * Use VT_LLOCAL to encode this double-indirection requirement.
+       *
+       * But if old_v == VT_LOCAL, the VT_LVAL means "load/store from/to this stack slot"
+       * which is standard local variable access - do NOT use VT_LLOCAL.
+       *
+       * ADDRESS-OF CASE: If old_v == VT_LOCAL and old_r does NOT have VT_LVAL,
+       * this is an address-of operation (&var). We want the ADDRESS of the spill
+       * slot, not its contents. Do NOT add VT_LVAL in this case.
+       *
+       * COMPUTED VALUE CASE: If old_v was a register (computed value that got
+       * spilled), we ALWAYS need VT_LVAL to load the value from the spill slot. */
+      int need_lval;
+      if (old_v == VT_LOCAL || old_v == VT_LLOCAL)
       {
-        /* old_r was a register or 0 (computed value) AND this interval IS an lvalue
-         * (not a pure write destination) - need VT_LVAL to load from stack */
+        /* Local variable: preserve VT_LVAL to distinguish load vs address-of */
+        need_lval = (old_r & VT_LVAL);
+      }
+      else
+      {
+        /* Computed value (was in register): always need VT_LVAL to load from spill */
         need_lval = VT_LVAL;
       }
-      sv->r = VT_LOCAL | need_lval | (old_r & VT_PARAM);
+      int base_kind = VT_LOCAL;
+      if ((old_r & VT_LVAL) && old_v != VT_LOCAL && old_v != VT_LLOCAL)
+      {
+        /* The original use wants to dereference the value in this vreg.
+         * Since the value is spilled, we need double indirection:
+         * load pointer from spill slot, then dereference it.
+         * Note: We exclude VT_LOCAL/VT_LLOCAL because their VT_LVAL means
+         * "access this stack slot" not "dereference pointer in vreg". */
+        base_kind = VT_LLOCAL;
+      }
+      sv->r = base_kind | need_lval | (old_r & VT_PARAM);
     }
     else if (interval->allocation.r0 != PREG_NONE)
     {
@@ -5916,6 +5850,9 @@ void tcc_ir_generate_code(TCCIRState *ir)
       tcc_ir_spill_cache_clear(&ir->spill_cache);
       break;
     }
+    case TCCIR_OP_NOP:
+      /* No operation - skip silently */
+      break;
     case TCCIR_OP_ASM_INPUT:
     case TCCIR_OP_ASM_OUTPUT:
       /* Marker ops only: regalloc/liveness uses them, codegen emits nothing. */
@@ -6028,7 +5965,11 @@ void print_svalue_short(SValue *sv)
     }
     break;
   case VT_LLOCAL:
-    printf("VT_LLOCAL (cval=%d)", sv->c.i);
+    /* VT_LLOCAL with VT_LVAL: spilled pointer needing double dereference */
+    if (sv->pr0 != PREG_NONE && (sv->pr0 & PREG_SPILLED))
+      printf(SPILL_MARK_BEGIN "SpillLoc[%d]***DEREF***" SPILL_MARK_END, sv->c.i);
+    else
+      printf("VT_LLOCAL (cval=%d)", sv->c.i);
     break;
   // case VT_LOCAL: printf("VReg%d[stack_offset=%d]", sv->vreg, sv->c.i); break;
   case VT_LOCAL:
@@ -6090,7 +6031,7 @@ void print_svalue_short(SValue *sv)
       if (sv->r & VT_LVAL) printf(",LVAL");
       printf("]");
 #endif
-      if (sv->r & VT_LVAL)
+      if (tcc_ir_operand_needs_dereference(sv))
         printf("***DEREF***");
     }
     else
@@ -6099,7 +6040,7 @@ void print_svalue_short(SValue *sv)
         printf(SPILL_MARK_BEGIN "SpillLoc[%d]" SPILL_MARK_END, sv->c.i);
       else
         printf("R%d", sv->pr0);
-      if (sv->r & VT_LVAL)
+      if (tcc_ir_operand_needs_dereference(sv))
         printf("***DEREF***");
     }
     break;
@@ -6673,6 +6614,11 @@ static bool tcc_ir_operand_needs_dereference(SValue *sv)
   case VT_JMPI:
     return false;
   default: /* must be temporary vreg */
+    /* Register parameters (VT_PARAM without VT_LOCAL) have VT_LVAL set to allow
+     * taking their address (&param), but the register holds the VALUE directly,
+     * not a pointer. So VT_LVAL does NOT mean dereference for these. */
+    if ((sv->r & VT_PARAM) && !(sv->r & VT_LOCAL))
+      return false;
     return (sv->r & VT_LVAL) != 0;
   }
 }

@@ -1,4 +1,4 @@
-#include <stdio.h>
+extern void printf(const char *format, ...);
 
 static int bar(int x)
 {

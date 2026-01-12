@@ -6,8 +6,12 @@
                 "${workspaceFolder}/**"
             ],
             "defines": [
-                "-DTARGET_OS_YasOS=1",
-                "-DUSING_GLOBALS=1"
+                "TCC_TARGET_ARM=1",
+                "TCC_ARM_VFP=1",
+                "TCC_ARM_EABI=1",
+                "TCC_ARM_HARDFLOAT=1",
+                "TCC_TARGET_ARM_THUMB=1",
+                "TCC_TARGET_ARM_ARCHV8M=1"
             ],
             "compilerPath": "/usr/bin/clang",
             "cStandard": "c17",
