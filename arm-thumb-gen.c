@@ -1855,9 +1855,99 @@ ST_FUNC int gfunc_sret(CType *vt, int variadic, CType *ret, int *ret_align, int 
 // are those offsets to allow TREG_R0 start from other register than r0?
 // not sure
 
+static void th_store32_imm_or_reg(int src_reg, uint32_t base_reg, int abs_off, int sign)
+{
+  if (!ot(th_str_imm(src_reg, base_reg, abs_off, sign ? 4 : 6, ENFORCE_ENCODING_NONE)))
+  {
+    ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(abs_off, sign, (1u << src_reg) | (1u << base_reg));
+    int rr = rr_alloc.reg;
+    ot_check(th_str_reg(src_reg, base_reg, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+    restore_scratch_reg(&rr_alloc);
+  }
+}
+
+static void th_store16_imm_or_reg(int src_reg, uint32_t base_reg, int abs_off, int sign)
+{
+  if (!ot(th_strh_imm(src_reg, base_reg, abs_off, sign ? 4 : 6, ENFORCE_ENCODING_NONE)))
+  {
+    ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(abs_off, sign, (1u << src_reg) | (1u << base_reg));
+    int rr = rr_alloc.reg;
+    ot_check(th_strh_reg(src_reg, base_reg, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+    restore_scratch_reg(&rr_alloc);
+  }
+}
+
+static void th_store8_imm_or_reg(int src_reg, uint32_t base_reg, int abs_off, int sign)
+{
+  if (!ot(th_strb_imm(src_reg, base_reg, abs_off, sign ? 4 : 6, ENFORCE_ENCODING_NONE)))
+  {
+    ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(abs_off, sign, (1u << src_reg) | (1u << base_reg));
+    int rr = rr_alloc.reg;
+    ot_check(th_strb_reg(src_reg, base_reg, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+    restore_scratch_reg(&rr_alloc);
+  }
+}
+
+static uint32_t th_store_resolve_base(int src_reg, SValue *sv, int ft, int *abs_off, int *sign,
+                                      ScratchRegAlloc *base_alloc, int *has_base_alloc)
+{
+  int off = sv->c.i;
+  if (off >= 0)
+    *sign = 0;
+  else
+  {
+    *sign = 1;
+    off = -off;
+  }
+  *abs_off = off;
+  *has_base_alloc = 0;
+
+  uint32_t base_reg = R_FP;
+  int fr = sv->r;
+  int v = fr & VT_VALMASK;
+
+  if ((fr & VT_LVAL) && v < VT_CONST)
+  {
+    /* Lvalue address already in a register. Prefer materialized address in sv->pr0
+     * (IR paths) but fall back to legacy encoding in sv->r.
+     */
+    base_reg = (sv->pr0 != PREG_NONE) ? sv->pr0 : v;
+    thumb_require_materialized_reg("store", "address base", base_reg);
+    *abs_off = 0;
+    *sign = 0;
+    return base_reg;
+  }
+
+  if ((fr & VT_LVAL) && v == VT_CONST)
+  {
+    /* Global symbol lvalue: load the base address (without offset) into a scratch reg.
+     * Keep the scratch reg live until the actual store is emitted.
+     */
+    SValue v1;
+    Sym *validated_sym = (sv->r & VT_SYM) ? validate_sym_for_reloc(sv->sym) : NULL;
+    memset(&v1, 0, sizeof(SValue));
+    v1.type.t = ft;
+    v1.r = (fr & ~VT_LVAL) | (validated_sym ? VT_SYM : 0);
+    v1.c.i = 0;
+    v1.sym = validated_sym;
+    v1.pr0 = PREG_NONE;
+
+    uint32_t exclude_regs = (1u << src_reg);
+    *base_alloc = get_scratch_reg_with_save(exclude_regs);
+    base_reg = base_alloc->reg;
+    *has_base_alloc = 1;
+
+    load(base_reg, &v1);
+    return base_reg;
+  }
+
+  /* Default: stack/local address (FP-based). */
+  return base_reg;
+}
+
 void store(int r, SValue *sv)
 {
-  int v, fc, ft, fr, sign;
+  int v, ft, fr;
   TRACE("'store' reg: %d", r);
 
   /* IR owns spills: backend store must never be asked to store from a spilled
@@ -1880,16 +1970,6 @@ void store(int r, SValue *sv)
 
   fr = sv->r;
   ft = sv->type.t;
-  fc = sv->c.i;
-
-  if (fc >= 0)
-    sign = 0;
-  else
-  {
-    sign = 1;
-    fc = -fc;
-  }
-
   v = fr & VT_VALMASK;
 
   /* Handle register-to-register store (destination is a physical register, not memory).
@@ -1917,143 +1997,66 @@ void store(int r, SValue *sv)
 
   if (fr & VT_LVAL || fr == VT_LOCAL)
   {
-    uint32_t base = R_FP;
-    if (v < VT_CONST)
+    int abs_off, sign;
+    ScratchRegAlloc base_alloc = (ScratchRegAlloc){0};
+    int has_base_alloc = 0;
+    uint32_t base = th_store_resolve_base(r, sv, ft, &abs_off, &sign, &base_alloc, &has_base_alloc);
+
+    /* Check if source is VFP or integer register.
+     * Only use VFP instructions if hard float ABI is enabled.
+     */
+    if (is_float(ft))
     {
-      /* Lvalue address in register:
-       * - For IR-generated code, materialization may put the address in sv->pr0.
-       * - For legacy/non-IR paths, the address register is often encoded directly
-       *   in sv->r (v) with sv->pr0 left as PREG_NONE.
-       */
-      if (sv->pr0 != PREG_NONE)
+      if (tcc_state->float_abi == ARM_HARD_FLOAT && r >= TREG_F0 && r <= TREG_F7)
       {
-        thumb_require_materialized_reg("store", "address base", sv->pr0);
-        base = sv->pr0;
+        /* VFP source - use VSTR */
+        if ((ft & VT_BTYPE) != VT_FLOAT)
+          ot_check(th_vstr(base, r, !sign, 1, abs_off));
+        else
+          ot_check(th_vstr(base, r, !sign, 0, abs_off));
       }
       else
       {
-        base = v;
-      }
-      v = VT_LOCAL;
-      fc = 0;
-      sign = 0;
-    }
-    else if (v == VT_CONST)
-    {
-      /* Load the base address of the global symbol (without offset) */
-      SValue v1;
-      Sym *validated_sym = (sv->r & VT_SYM) ? validate_sym_for_reloc(sv->sym) : NULL;
-      memset(&v1, 0, sizeof(SValue));
-      v1.type.t = ft;
-      v1.r = (fr & ~VT_LVAL) | (validated_sym ? VT_SYM : 0);
-      v1.c.i = 0; /* Load base address, not base+offset */
-      v1.sym = validated_sym;
-      v1.pr0 = PREG_NONE; /* Mark as not having a preloaded register */
-
-      /* Find a free scratch register for loading the global symbol address.
-       * Exclude the source register 'r' to avoid overwriting the value we want to store. */
-      uint32_t exclude_regs = (1 << r);
-      ScratchRegAlloc base_alloc = get_scratch_reg_with_save(exclude_regs);
-      base = base_alloc.reg;
-
-      load(base, &v1);
-      /* fc already has the field offset from sv->c.i */
-      sign = 0;
-      v = VT_LOCAL;
-      restore_scratch_reg(&base_alloc);
-    }
-    if (v == VT_LOCAL)
-    {
-      if (is_float(ft))
-      {
-        /* Check if source is VFP or integer register.
-         * Only use VFP instructions if hard float ABI is enabled. */
-        if (tcc_state->float_abi == ARM_HARD_FLOAT && r >= TREG_F0 && r <= TREG_F7)
+        /* Soft-float (or integer-reg float values): use integer stores. */
+        if ((ft & VT_BTYPE) == VT_FLOAT)
         {
-          /* Source is VFP register - use VSTR */
-          if ((ft & VT_BTYPE) != VT_FLOAT)
-            ot_check(th_vstr(base, r, !sign, 1, fc));
-          else
-            ot_check(th_vstr(base, r, !sign, 0, fc));
+          th_store32_imm_or_reg(r, base, abs_off, sign);
         }
         else
         {
-          /* Source is integer register - use regular STR for soft float path */
-          if ((ft & VT_BTYPE) == VT_FLOAT)
-          {
-            /* Single precision - one 32-bit store */
-            if (!ot(th_str_imm(r, base, fc, sign ? 4 : 6, ENFORCE_ENCODING_NONE)))
-            {
-              ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(fc, sign, (1u << r) | (1u << base));
-              int rr = rr_alloc.reg;
-              ot_check(th_str_reg(r, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-              restore_scratch_reg(&rr_alloc);
-            }
-          }
-          else
-          {
-            /* Double precision - two 32-bit stores (low word first) */
-            /* IR owns spills: the caller must provide an explicit high-word
-             * register in sv->pr1; do not guess r+1.
-             */
-            int r_high = sv->pr1;
-            if (r_high == PREG_NONE)
-              tcc_error("compiler_error: cannot store double - missing source high register (sv->pr1)");
-            thumb_require_materialized_reg("store", "src.high", r_high);
-            if (r_high == R_SP || r_high == R_PC)
-              tcc_error("compiler_error: cannot store double - invalid source high register %d", r_high);
-            /* Store low word */
-            if (!ot(th_str_imm(r, base, fc, sign ? 4 : 6, ENFORCE_ENCODING_NONE)))
-            {
-              ScratchRegAlloc rr_alloc_lo = th_offset_to_reg_ex(fc, sign, (1u << r) | (1u << base));
-              int rr = rr_alloc_lo.reg;
-              ot_check(th_str_reg(r, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-              restore_scratch_reg(&rr_alloc_lo);
-            }
-            /* Store high word at fc+4 */
-            if (!ot(th_str_imm(r_high, base, fc + 4, sign ? 4 : 6, ENFORCE_ENCODING_NONE)))
-            {
-              ScratchRegAlloc rr_alloc_hi = th_offset_to_reg_ex(fc + 4, sign, (1u << r_high) | (1u << base));
-              int rr = rr_alloc_hi.reg;
-              ot_check(th_str_reg(r_high, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-              restore_scratch_reg(&rr_alloc_hi);
-            }
-          }
+          /* Double precision - two 32-bit stores (low word first).
+           * IR owns spills: the caller must provide an explicit high-word
+           * register in sv->pr1; do not guess r+1.
+           */
+          int r_high = sv->pr1;
+          if (r_high == PREG_NONE)
+            tcc_error("compiler_error: cannot store double - missing source high register (sv->pr1)");
+          thumb_require_materialized_reg("store", "src.high", r_high);
+          if (r_high == R_SP || r_high == R_PC)
+            tcc_error("compiler_error: cannot store double - invalid source high register %d", r_high);
+
+          th_store32_imm_or_reg(r, base, abs_off, sign);
+          th_store32_imm_or_reg(r_high, base, abs_off + 4, sign);
         }
-      }
-      else if ((ft & VT_BTYPE) == VT_SHORT)
-      {
-        if (!ot(th_strh_imm(r, base, fc, sign ? 4 : 6, ENFORCE_ENCODING_NONE)))
-        {
-          ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(fc, sign, (1u << r) | (1u << base));
-          int rr = rr_alloc.reg;
-          ot_check(th_strh_reg(r, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-          restore_scratch_reg(&rr_alloc);
-        }
-      }
-      else if ((ft & VT_BTYPE) == VT_BYTE)
-      {
-        if (!ot(th_strb_imm(r, base, fc, sign ? 4 : 6, ENFORCE_ENCODING_NONE)))
-        {
-          ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(fc, sign, (1u << r) | (1u << base));
-          int rr = rr_alloc.reg;
-          ot_check(th_strb_reg(r, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-          restore_scratch_reg(&rr_alloc);
-        }
-      }
-      else
-      {
-        TRACE("store: sign: %x, r: %x, base: %x, fc: %x", sign, r, base, fc);
-        if (!ot(th_str_imm(r, base, fc, sign ? 4 : 6, ENFORCE_ENCODING_NONE)))
-        {
-          ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(fc, sign, (1u << r) | (1u << base));
-          int rr = rr_alloc.reg;
-          ot_check(th_str_reg(r, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-          restore_scratch_reg(&rr_alloc);
-        }
-        TRACE("done");
       }
     }
+    else if ((ft & VT_BTYPE) == VT_SHORT)
+    {
+      th_store16_imm_or_reg(r, base, abs_off, sign);
+    }
+    else if ((ft & VT_BTYPE) == VT_BYTE)
+    {
+      th_store8_imm_or_reg(r, base, abs_off, sign);
+    }
+    else
+    {
+      TRACE("store: sign: %x, r: %x, base: %x, off: %x", sign, r, base, abs_off);
+      th_store32_imm_or_reg(r, base, abs_off, sign);
+      TRACE("done");
+    }
+
+    if (has_base_alloc)
+      restore_scratch_reg(&base_alloc);
   }
 }
 
