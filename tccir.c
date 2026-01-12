@@ -2464,6 +2464,19 @@ void tcc_ir_materialize_value(TCCIRState *ir, SValue *sv, TCCMaterializedValue *
     }
   }
 
+  const int val_kind = sv->r & VT_VALMASK;
+  const int is_64bit = tcc_ir_is_64bit_type(sv->type.t);
+  const unsigned scratch_flags =
+      (is_64bit ? TCC_MACHINE_SCRATCH_NEEDS_PAIR : 0) | (ir ? ir->codegen_materialize_scratch_flags : 0);
+
+  /* Note: VT_CONST values are NOT automatically materialized here because many operations
+   * (shifts, bitwise ops) can use immediate operands directly. Operations that need
+   * constants in registers should use the explicit tcc_ir_materialize_const_to_reg() helper.
+   *
+   * Similarly, VT_CMP and VT_JMP/VT_JMPI are typically handled by branch/conditional ops
+   * directly. Only materialize them when explicitly needed via tcc_ir_materialize_const_to_reg(). */
+
+  /* Check for spilled values - this is the original materialization path */
   if (!(sv->pr0 & PREG_SPILLED))
   {
     return;
@@ -2473,7 +2486,6 @@ void tcc_ir_materialize_value(TCCIRState *ir, SValue *sv, TCCMaterializedValue *
     return;
   }
 
-  const int val_kind = sv->r & VT_VALMASK;
   if (!(sv->r & VT_LVAL) && (val_kind == VT_LOCAL || val_kind == VT_LLOCAL))
   {
     /* VT_LOCAL without VT_LVAL represents "address of stack location".
@@ -2482,12 +2494,9 @@ void tcc_ir_materialize_value(TCCIRState *ir, SValue *sv, TCCMaterializedValue *
     return;
   }
 
-  tcc_ir_require_materialization_result(result, "materialize_value");
+  tcc_ir_require_materialization_result(result, "materialize_value(spill)");
 
   const int frame_offset = tcc_ir_materialization_offset(ir, sv);
-  const int is_64bit = tcc_ir_is_64bit_type(sv->type.t);
-  const unsigned scratch_flags =
-      (is_64bit ? TCC_MACHINE_SCRATCH_NEEDS_PAIR : 0) | (ir ? ir->codegen_materialize_scratch_flags : 0);
   unsigned short original_r = sv->r;
 
   result->original_pr0 = sv->pr0;
@@ -2534,6 +2543,76 @@ void tcc_ir_materialize_value(TCCIRState *ir, SValue *sv, TCCMaterializedValue *
   result->used_scratch = 1;
   result->is_64bit = is_64bit;
   result->original_r = original_r;
+  result->scratch = scratch;
+}
+
+/* Explicit helper to materialize constants, comparisons, or jump results into registers.
+ * Unlike tcc_ir_materialize_value() which only handles spills, this function explicitly
+ * loads VT_CONST, VT_CMP, VT_JMP, VT_JMPI values into scratch registers.
+ * Use this when an operation requires its operand to be in a register (e.g., reg-reg binops). */
+void tcc_ir_materialize_const_to_reg(TCCIRState *ir, SValue *sv, TCCMaterializedValue *result)
+{
+  if (result)
+    memset(result, 0, sizeof(*result));
+
+  if (!ir || !sv)
+    return;
+
+  const int val_kind = sv->r & VT_VALMASK;
+
+  /* Only handle values that aren't already in a register */
+  if (sv->pr0 != PREG_NONE && !(sv->pr0 & PREG_SPILLED))
+    return;
+
+  /* Only handle constants, comparisons, and jump conditions */
+  if (val_kind != VT_CONST && val_kind != VT_CMP && val_kind != VT_JMP && val_kind != VT_JMPI)
+    return;
+
+  /* Skip VT_CONST with VT_SYM (symbol references) - those need special handling */
+  if (val_kind == VT_CONST && (sv->r & VT_SYM))
+    return;
+
+  /* Skip VT_CONST with VT_LVAL (memory loads) - those need load_to_dest */
+  if (val_kind == VT_CONST && (sv->r & VT_LVAL))
+    return;
+
+  tcc_ir_require_materialization_result(result, "materialize_const_to_reg");
+
+  const int is_64bit = tcc_ir_is_64bit_type(sv->type.t);
+  const unsigned scratch_flags =
+      (is_64bit ? TCC_MACHINE_SCRATCH_NEEDS_PAIR : 0) | (ir ? ir->codegen_materialize_scratch_flags : 0);
+
+  result->original_pr0 = sv->pr0;
+  result->original_pr1 = sv->pr1;
+  result->original_c_i = sv->c.i;
+  result->original_r = sv->r;
+
+  TCCMachineScratchRegs scratch = {0};
+  tcc_machine_acquire_scratch(&scratch, scratch_flags);
+  if (scratch.reg_count == 0)
+    tcc_error("compiler_error: unable to allocate scratch register for const-to-reg");
+
+  if (val_kind == VT_CONST)
+  {
+    tcc_machine_load_constant(scratch.regs[0], is_64bit ? scratch.regs[1] : PREG_NONE, sv->c.i, is_64bit);
+  }
+  else if (val_kind == VT_CMP)
+  {
+    tcc_machine_load_cmp_result(scratch.regs[0], sv->c.i);
+  }
+  else /* VT_JMP or VT_JMPI */
+  {
+    const int invert = (val_kind == VT_JMPI) ? 1 : 0;
+    tcc_machine_load_jmp_result(scratch.regs[0], sv->c.i, invert);
+  }
+
+  sv->pr0 = scratch.regs[0];
+  sv->pr1 = is_64bit ? scratch.regs[1] : PREG_NONE;
+  sv->r = (unsigned short)(scratch.regs[0]);
+  sv->c.i = 0;
+
+  result->used_scratch = 1;
+  result->is_64bit = is_64bit;
   result->scratch = scratch;
 }
 
@@ -5589,23 +5668,32 @@ void tcc_ir_generate_code(TCCIRState *ir)
     bool need_src1_addr = false;
     bool need_src2_addr = false;
     bool need_dest_addr = false;
+    bool need_src1_in_reg = false; /* Operand must be in register, not immediate */
+    bool need_src2_in_reg = false;
 
     switch (q->op)
     {
-    case TCCIR_OP_ADD:
-    case TCCIR_OP_SUB:
     case TCCIR_OP_MUL:
     case TCCIR_OP_DIV:
     case TCCIR_OP_UDIV:
     case TCCIR_OP_IMOD:
     case TCCIR_OP_UMOD:
+    case TCCIR_OP_UMULL:
+      /* These operations require register-only operands (no immediate forms) */
+      need_src1_value = true;
+      need_src2_value = true;
+      need_dest_value = true;
+      need_src1_in_reg = true;
+      need_src2_in_reg = true;
+      break;
+    case TCCIR_OP_ADD:
+    case TCCIR_OP_SUB:
     case TCCIR_OP_AND:
     case TCCIR_OP_OR:
     case TCCIR_OP_XOR:
     case TCCIR_OP_SHL:
     case TCCIR_OP_SHR:
     case TCCIR_OP_SAR:
-    case TCCIR_OP_UMULL:
     case TCCIR_OP_ADC_GEN:
     case TCCIR_OP_ADC_USE:
     case TCCIR_OP_BOOL_OR:
@@ -5704,6 +5792,16 @@ void tcc_ir_generate_code(TCCIRState *ir)
       tcc_ir_materialize_dest(ir, &q->dest, &mat_dest);
     if (need_dest_addr)
       tcc_ir_materialize_addr(ir, &q->dest, &mat_dest_addr, q->dest.pr0);
+
+    /* For operations that require register-only operands (MUL, DIV, MOD),
+     * ensure constants/comparisons are loaded into registers. This replaces
+     * backend-level thumb_materialize_binop32_sources() with IR-level handling. */
+    TCCMaterializedValue mat_src1_reg = {0};
+    TCCMaterializedValue mat_src2_reg = {0};
+    if (need_src1_in_reg)
+      tcc_ir_materialize_const_to_reg(ir, &q->src1, &mat_src1_reg);
+    if (need_src2_in_reg)
+      tcc_ir_materialize_const_to_reg(ir, &q->src2, &mat_src2_reg);
 
     switch (q->op)
     {
@@ -5889,7 +5987,9 @@ void tcc_ir_generate_code(TCCIRState *ir)
     tcc_ir_release_materialized_addr(&q->dest, &mat_dest_addr);
     tcc_ir_storeback_materialized_dest(q, &mat_dest);
     tcc_ir_release_materialized_addr(&q->src2, &mat_src2_addr);
+    tcc_ir_release_materialized_value(&q->src2, &mat_src2_reg);
     tcc_ir_release_materialized_value(&q->src2, &mat_src2);
+    tcc_ir_release_materialized_value(&q->src1, &mat_src1_reg);
     tcc_ir_release_materialized_addr(&q->src1, &mat_src1_addr);
     tcc_ir_release_materialized_value(&q->src1, &mat_src1);
 

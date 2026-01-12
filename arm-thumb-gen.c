@@ -2358,6 +2358,82 @@ ST_FUNC void tcc_machine_addr_of_stack_slot(int dest_reg, int frame_offset)
   }
 }
 
+/* Load a constant value into a register (or register pair for 64-bit).
+ * This is a simplified wrapper around load_full_const/th_generic_mov_imm
+ * that doesn't require an SValue. Used by IR-level materialization. */
+ST_FUNC void tcc_machine_load_constant(int dest_reg, int dest_reg_high, int64_t value, int is_64bit)
+{
+  if (dest_reg == PREG_NONE)
+    tcc_error("compiler_error: load_constant requires a destination register");
+
+  if (is_64bit)
+  {
+    if (dest_reg_high == PREG_NONE)
+      tcc_error("compiler_error: 64-bit load_constant requires high register");
+
+    const uint32_t lo = (uint32_t)(value & 0xFFFFFFFF);
+    const uint32_t hi = (uint32_t)((uint64_t)value >> 32);
+
+    /* Try immediate encoding for both halves */
+    thumb_opcode o1 = th_generic_mov_imm(dest_reg, lo);
+    thumb_opcode o2 = th_generic_mov_imm(dest_reg_high, hi);
+
+    if (o1.size == 0 && o2.size == 0)
+    {
+      /* Both need literal pool - use combined 64-bit load */
+      load_full_const(dest_reg, dest_reg_high, value, NULL);
+      return;
+    }
+
+    /* Load each half separately */
+    if (!ot(o1))
+      load_full_const(dest_reg, PREG_NONE, lo, NULL);
+    if (!ot(o2))
+      load_full_const(dest_reg_high, PREG_NONE, hi, NULL);
+    return;
+  }
+
+  /* 32-bit constant */
+  if (!ot(th_generic_mov_imm(dest_reg, (uint32_t)value)))
+    load_full_const(dest_reg, PREG_NONE, value, NULL);
+}
+
+/* Load comparison result (0 or 1) based on condition flags.
+ * Used by IR-level materialization for VT_CMP values. */
+ST_FUNC void tcc_machine_load_cmp_result(int dest_reg, int condition_code)
+{
+  if (dest_reg == PREG_NONE)
+    tcc_error("compiler_error: load_cmp_result requires a destination register");
+  if (dest_reg == R_SP || dest_reg == R_PC)
+    tcc_error("compiler_error: load_cmp_result cannot use SP or PC");
+
+  const uint32_t firstcond = mapcc(condition_code);
+  /* IT block: if cond then mov 1, else mov 0 */
+  o(0xbf00 | (firstcond << 4) | 0x4 | ((~firstcond & 1) << 3));
+  ot_check(th_generic_mov_imm(dest_reg, 1));
+  ot_check(th_generic_mov_imm(dest_reg, 0));
+}
+
+/* Load jump condition result (0 or 1) based on a pending jump target.
+ * Used by IR-level materialization for VT_JMP/VT_JMPI values. */
+ST_FUNC void tcc_machine_load_jmp_result(int dest_reg, int jmp_addr, int invert)
+{
+  if (dest_reg == PREG_NONE)
+    tcc_error("compiler_error: load_jmp_result requires a destination register");
+
+#ifdef TCC_TARGET_ARM_ARCHV6M
+  if (dest_reg > 7)
+    tcc_error("compiler_error: implement load_jmp_result for armv6m with high register");
+#endif
+
+  /* Load the "true" branch value, then unconditionally branch over the "false" value,
+   * then patch the jump target to land on the "false" value */
+  ot_check(th_generic_mov_imm(dest_reg, invert ? 0 : 1));
+  ot_check(th_b_t4(2));
+  gsym(jmp_addr);
+  ot_check(th_generic_mov_imm(dest_reg, invert ? 1 : 0));
+}
+
 void load_vt_lval_vt_local(int r, int r1, SValue *sv, int ft, int fc, int sign, uint32_t base)
 {
   int success = 0;
@@ -3895,47 +3971,10 @@ static thumb_opcode thumb_udiv_regonly(uint32_t rd, uint32_t rn, uint32_t rm)
   return th_udiv((uint16_t)rd, (uint16_t)rn, (uint16_t)rm);
 }
 
-static void thumb_materialize_binop32_sources(TACQuadruple *op, const char *ctx, int rd, int *rn, int *rm,
-                                              uint32_t *exclude, ScratchRegAlloc *rn_alloc, ScratchRegAlloc *rm_alloc)
-{
-  if (!rn || !rm || !exclude || !rn_alloc || !rm_alloc)
-    tcc_error("compiler_error: %s invalid arguments", ctx);
-
-  *exclude = 0;
-  if (thumb_is_hw_reg(rd))
-    *exclude |= (1u << rd);
-
-  *rn = op->src1.pr0;
-  *rm = op->src2.pr0;
-  *rn_alloc = (ScratchRegAlloc){0};
-  *rm_alloc = (ScratchRegAlloc){0};
-
-  if (*rn == PREG_NONE || (op->src1.r & VT_LVAL) || th_has_immediate_value(op->src1.r))
-  {
-    *rn_alloc = get_scratch_reg_with_save(*exclude);
-    *rn = rn_alloc->reg;
-    *exclude |= (1u << *rn);
-    load_to_reg(*rn, PREG_NONE, &op->src1);
-  }
-  else
-  {
-    thumb_require_materialized_reg(ctx, "src1", *rn);
-    if (thumb_is_hw_reg(*rn))
-      *exclude |= (1u << *rn);
-  }
-
-  if (*rm == PREG_NONE || (op->src2.r & VT_LVAL) || th_has_immediate_value(op->src2.r))
-  {
-    *rm_alloc = get_scratch_reg_with_save(*exclude);
-    *rm = rm_alloc->reg;
-    *exclude |= (1u << *rm);
-    load_to_reg(*rm, PREG_NONE, &op->src2);
-  }
-  else
-  {
-    thumb_require_materialized_reg(ctx, "src2", *rm);
-  }
-}
+/* NOTE: thumb_materialize_binop32_sources() has been removed.
+ * Constant-to-register materialization is now handled by IR-level
+ * tcc_ir_materialize_const_to_reg() in tccir.c. Backend functions like
+ * thumb_emit_regonly_binop32() now only handle VT_LVAL fallback. */
 
 static void thumb_emit_regonly_binop32(TACQuadruple *op, thumb_regonly3_handler_t emitter, const char *ctx)
 {
@@ -3944,12 +3983,39 @@ static void thumb_emit_regonly_binop32(TACQuadruple *op, thumb_regonly3_handler_
     tcc_error("compiler_error: %s missing destination register", ctx);
   thumb_require_materialized_reg(ctx, "dest", rd);
 
-  int rn = PREG_NONE;
-  int rm = PREG_NONE;
-  uint32_t exclude = 0;
+  /* IR-level tcc_ir_materialize_const_to_reg() now handles constant-to-register
+   * conversion for register-only operations. Operands should already be in registers. */
+  int rn = op->src1.pr0;
+  int rm = op->src2.pr0;
+
+  /* Fall back to backend materialization for VT_LVAL (memory loads) that
+   * weren't handled by IR-level materialization */
   ScratchRegAlloc rn_alloc = {0};
   ScratchRegAlloc rm_alloc = {0};
-  thumb_materialize_binop32_sources(op, ctx, rd, &rn, &rm, &exclude, &rn_alloc, &rm_alloc);
+  uint32_t exclude = (1u << rd);
+
+  if (rn == PREG_NONE || (op->src1.r & VT_LVAL))
+  {
+    rn_alloc = get_scratch_reg_with_save(exclude);
+    rn = rn_alloc.reg;
+    exclude |= (1u << rn);
+    load_to_reg(rn, PREG_NONE, &op->src1);
+  }
+  else
+  {
+    thumb_require_materialized_reg(ctx, "src1", rn);
+  }
+
+  if (rm == PREG_NONE || (op->src2.r & VT_LVAL))
+  {
+    rm_alloc = get_scratch_reg_with_save(exclude);
+    rm = rm_alloc.reg;
+    load_to_reg(rm, PREG_NONE, &op->src2);
+  }
+  else
+  {
+    thumb_require_materialized_reg(ctx, "src2", rm);
+  }
 
   ot_check(emitter((uint32_t)rd, (uint32_t)rn, (uint32_t)rm));
   restore_scratch_reg(&rm_alloc);
@@ -3963,13 +4029,42 @@ static void thumb_emit_mod32(TACQuadruple *op, thumb_regonly3_handler_t div_emit
     tcc_error("compiler_error: %s missing destination register", ctx);
   thumb_require_materialized_reg(ctx, "dest", dest_reg);
 
-  int src1_reg = PREG_NONE;
-  int src2_reg = PREG_NONE;
-  uint32_t exclude_regs = 0;
+  /* IR-level tcc_ir_materialize_const_to_reg() now handles constant-to-register
+   * conversion for register-only operations. Operands should already be in registers. */
+  int src1_reg = op->src1.pr0;
+  int src2_reg = op->src2.pr0;
+
+  /* Fall back to backend materialization for VT_LVAL (memory loads) */
   ScratchRegAlloc src1_alloc = {0};
   ScratchRegAlloc src2_alloc = {0};
   ScratchRegAlloc quotient_alloc = {0};
-  thumb_materialize_binop32_sources(op, ctx, dest_reg, &src1_reg, &src2_reg, &exclude_regs, &src1_alloc, &src2_alloc);
+  uint32_t exclude_regs = (1u << dest_reg);
+
+  if (src1_reg == PREG_NONE || (op->src1.r & VT_LVAL))
+  {
+    src1_alloc = get_scratch_reg_with_save(exclude_regs);
+    src1_reg = src1_alloc.reg;
+    exclude_regs |= (1u << src1_reg);
+    load_to_reg(src1_reg, PREG_NONE, &op->src1);
+  }
+  else
+  {
+    thumb_require_materialized_reg(ctx, "src1", src1_reg);
+    exclude_regs |= (1u << src1_reg);
+  }
+
+  if (src2_reg == PREG_NONE || (op->src2.r & VT_LVAL))
+  {
+    src2_alloc = get_scratch_reg_with_save(exclude_regs);
+    src2_reg = src2_alloc.reg;
+    exclude_regs |= (1u << src2_reg);
+    load_to_reg(src2_reg, PREG_NONE, &op->src2);
+  }
+  else
+  {
+    thumb_require_materialized_reg(ctx, "src2", src2_reg);
+    exclude_regs |= (1u << src2_reg);
+  }
 
   /* quotient = src1 / src2 */
   quotient_alloc = get_scratch_reg_with_save(exclude_regs);
