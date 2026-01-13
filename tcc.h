@@ -754,6 +754,19 @@ struct TCCState
 #endif
   unsigned char test_coverage; /* generate test coverage code */
 
+  /* IR optimization flags (-f options) */
+  unsigned char opt_dce;                /* -fdce: dead code elimination */
+  unsigned char opt_const_prop;         /* -fconst-prop: constant propagation */
+  unsigned char opt_copy_prop;          /* -fcopy-prop: copy propagation */
+  unsigned char opt_cse;                /* -fcse: common subexpression elimination */
+  unsigned char opt_bool_cse;           /* -fbool-cse: boolean CSE */
+  unsigned char opt_bool_idempotent;    /* -fbool-idempotent: boolean idempotent simplification */
+  unsigned char opt_bool_simplify;      /* -fbool-simplify: boolean expression simplification */
+  unsigned char opt_return_value;       /* -freturn-value-opt: return value optimization */
+  unsigned char opt_store_load_fwd;     /* -fstore-load-fwd: store-load forwarding */
+  unsigned char opt_redundant_store;    /* -fredundant-store-elim: redundant store elimination */
+  unsigned char opt_dead_store;         /* -fdead-store-elim: dead store elimination */
+
   /* use GNU C extensions */
   unsigned char gnu_ext;
   /* use TinyCC extensions */

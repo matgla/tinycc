@@ -1,0 +1,4 @@
+test_name,compile_time_s,user_time_s,sys_time_s,max_rss_kb,heap_peak_kb,heap_allocations,heap_temporary_allocs,heaptrack_file,text_size,data_size,bss_size,total_size,success,error
+01_hello_world,0.05467603300007795,0.01,0.01,27292,0,0,0,,52024,2604,988,55616,True,
+20_op_add,0.05611750799994297,0.01,0.01,27464,0,0,0,,52392,2860,988,56240,True,
+30_function_call,0.04747326699998666,0.0,0.0,17800,0,0,0,,12236,2200,984,15420,True,

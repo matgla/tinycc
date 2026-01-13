@@ -14,18 +14,22 @@ args.add_argument(
 )
 args.add_argument("--machine", "-m", default="mps2-an505", type=str, help="QEMU machine type.")
 args.add_argument("--gdb", action="store_true", help="Enable GDB debugging.")
-args.add_argument("--gcc", "-g", type=str, help="Path to the GCC compiler to use.")
+args.add_argument("--gcc", type=str, help="Path to the GCC compiler to use.")
+args.add_argument("--cflags", type=str, help="Additional CFLAGS (e.g. -O0, -O2, -Os, -Og).")
 args, _ = args.parse_known_args()
 
 def main():
     file = None
     if args.compile:
         sources = [Path(p).resolve() for p in args.compile]
+        compiler_kwargs = {}
         if args.gcc:
             print(f"Using custom compiler: {args.gcc}")
-            file, _ = compile_testcase(sources, args.machine, compiler=args.gcc)
-        else:
-            file, _ = compile_testcase(sources, args.machine)
+            compiler_kwargs["compiler"] = args.gcc
+        if args.cflags:
+            print(f"Using CFLAGS: {args.cflags}")
+            compiler_kwargs["cflags"] = args.cflags
+        file, _ = compile_testcase(sources, args.machine, **compiler_kwargs)
     if file is None:
         file = args.file
     # Send harness diagnostics to stderr so stdout stays comparable to .expect

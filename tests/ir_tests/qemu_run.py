@@ -24,11 +24,11 @@ def get_test_output_file(test_name):
     primary = _primary_file(test_name)
     return f"{CURRENT_DIR}/build/{Path(primary).stem}.elf"
 
-def build_make_command(test_file, machine, compiler):
+def build_make_command(test_file, machine, compiler, cflags=None):
     make_dir = CURRENT_DIR / 'qemu' / machine
     test_files = [str(f) for f in _as_file_list(test_file)]
     test_files_value = " ".join(test_files)
-    return [
+    cmd = [
         "make",
         "-C",
         str(make_dir),
@@ -37,6 +37,9 @@ def build_make_command(test_file, machine, compiler):
         f"CC={compiler}",
         f"TARGET={get_test_output_file(test_file)}",
     ]
+    if cflags:
+        cmd.append(f"EXTRA_CFLAGS={cflags}")
+    return cmd
 
 def build_qemu_command(machine, kernel_file, args=None):
     cmd = f'qemu-system-arm -machine {machine} -nographic -semihosting -kernel {kernel_file}'
@@ -44,9 +47,9 @@ def build_qemu_command(machine, kernel_file, args=None):
         cmd += ' -append "' + ' '.join(args) + '"'
     return cmd
 
-def compile_testcase(test_file, machine, compiler=f"{CURRENT_DIR}/../../armv8m-tcc"):
+def compile_testcase(test_file, machine, compiler=f"{CURRENT_DIR}/../../armv8m-tcc", cflags=None):
     global was_cleaned
-    make_command = build_make_command(test_file, machine, compiler)
+    make_command = build_make_command(test_file, machine, compiler, cflags)
     if not was_cleaned:
         result = subprocess.run(make_command + ["clean"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if result.returncode != 0:
@@ -74,12 +77,12 @@ def prepare_test(machine, kernel_file, args=None):
     sut.setwinsize(200, 1000)
     return sut
 
-def run_test(test_file, machine, args=None):
+def run_test(test_file, machine, args=None, cflags=None):
     primary = _primary_file(test_file)
     test_name = Path(primary).stem
 
     test_files = [CURRENT_DIR / Path(f) for f in _as_file_list(test_file)]
-    output_file, loglines = compile_testcase(test_files, machine)
+    output_file, loglines = compile_testcase(test_files, machine, cflags=cflags)
     sut = prepare_test(machine, output_file, args)
 
     # Enable logging to file using test name

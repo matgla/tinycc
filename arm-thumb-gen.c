@@ -298,8 +298,10 @@ static ScratchRegAllocs get_scratch_regs_with_save(uint32_t exclude_regs, int co
   uint32_t exclude = exclude_regs | scratch_global_exclude;
   uint32_t regs_to_save = 0;
 
+#ifdef ARM_THUMB_DEBUG_SCRATCH
   fprintf(stderr, "[SCRATCH] get_scratch_regs: count=%d input_exclude=0x%x global_exclude=0x%x\n", count, exclude_regs,
           scratch_global_exclude);
+#endif
 
   /* First pass: try to find free registers */
   for (int i = 0; i < count; ++i)
@@ -313,7 +315,9 @@ static ScratchRegAllocs get_scratch_regs_with_save(uint32_t exclude_regs, int co
     if (reg != PREG_NONE && reg >= 0 && reg < 16)
     {
       /* Found a free register */
+#ifdef ARM_THUMB_DEBUG_SCRATCH
       fprintf(stderr, "[SCRATCH] -> reg[%d]=%d (free)\n", i, reg);
+#endif
       result.regs[i] = reg;
       exclude |= (1u << reg);
       /* R11 and R12 are permanent scratch registers and can be reused freely.
@@ -365,7 +369,9 @@ static ScratchRegAllocs get_scratch_regs_with_save(uint32_t exclude_regs, int co
         tcc_error("compiler_error: no register available for scratch (all 16 registers excluded)");
       }
 
+#ifdef ARM_THUMB_DEBUG_SCRATCH
       fprintf(stderr, "[SCRATCH] -> reg[%d]=%d (will save)\n", i, reg_to_save);
+#endif
       result.regs[i] = reg_to_save;
       regs_to_save |= (1u << reg_to_save);
       exclude |= (1u << reg_to_save);
@@ -376,7 +382,9 @@ static ScratchRegAllocs get_scratch_regs_with_save(uint32_t exclude_regs, int co
   /* Second pass: emit a single PUSH for all registers that need saving */
   if (regs_to_save != 0)
   {
+#ifdef ARM_THUMB_DEBUG_SCRATCH
     fprintf(stderr, "[SCRATCH] Pushing registers (mask=0x%x) in single instruction\n", regs_to_save);
+#endif
     ot_check(th_push(regs_to_save));
     result.saved_mask = regs_to_save;
 
@@ -428,7 +436,9 @@ static void restore_scratch_regs(ScratchRegAllocs *allocs)
     if (can_restore_all && check_count > 0)
     {
       /* We can restore all saved registers with a single POP */
+#ifdef ARM_THUMB_DEBUG_SCRATCH
       fprintf(stderr, "[SCRATCH] Popping registers (mask=0x%x) in single instruction\n", allocs->saved_mask);
+#endif
       ot_check(th_pop(allocs->saved_mask));
 
       /* Update the push stack and global exclude */
@@ -445,7 +455,9 @@ static void restore_scratch_regs(ScratchRegAllocs *allocs)
     else
     {
       /* Cannot restore in order - defer to individual restore or end-of-instruction cleanup */
+#ifdef ARM_THUMB_DEBUG_SCRATCH
       fprintf(stderr, "[SCRATCH] WARNING: restore_scratch_regs out of order; deferring POP\n");
+#endif
       /* Keep saved_mask set so cleanup knows these need restoration */
     }
   }
@@ -464,8 +476,10 @@ static ScratchRegAlloc get_scratch_reg_with_save(uint32_t exclude_regs)
   ScratchRegAlloc result = {0};
   TCCIRState *ir = tcc_state->ir;
 
+#ifdef ARM_THUMB_DEBUG_SCRATCH
   fprintf(stderr, "[SCRATCH] get_scratch_reg: input_exclude=0x%x global_exclude=0x%x\n", exclude_regs,
           scratch_global_exclude);
+#endif
 
   exclude_regs |= scratch_global_exclude;
 
@@ -477,7 +491,9 @@ static ScratchRegAlloc get_scratch_reg_with_save(uint32_t exclude_regs)
      */
     if (reg != PREG_NONE && reg >= 0 && reg < 16)
     {
+#ifdef ARM_THUMB_DEBUG_SCRATCH
       fprintf(stderr, "[SCRATCH] -> returning reg=%d (free) exclude=0x%x\n", reg, exclude_regs);
+#endif
       result.reg = reg;
       result.saved = 0;
       /* Update global exclude so subsequent calls won't return the same register.
@@ -533,7 +549,9 @@ static ScratchRegAlloc get_scratch_reg_with_save(uint32_t exclude_regs)
   }
 
   /* No free register found - save one to the stack */
+#ifdef ARM_THUMB_DEBUG_SCRATCH
   fprintf(stderr, "[SCRATCH] WARNING: no free scratch register! Saving r%d to stack\n", reg_to_save);
+#endif
   ot_check(th_push(1 << reg_to_save));
   result.reg = reg_to_save;
   result.saved = 1;
@@ -575,15 +593,19 @@ static void restore_scratch_reg(ScratchRegAlloc *alloc)
     {
       if (scratch_push_count > 0)
       {
+#ifdef ARM_THUMB_DEBUG_SCRATCH
         fprintf(stderr,
                 "[SCRATCH] WARNING: restore_scratch_reg out of order; deferring POP "
                 "reg=%d (top=%d)\n",
                 alloc->reg, scratch_push_stack[scratch_push_count - 1]);
+#endif
       }
       else
       {
+#ifdef ARM_THUMB_DEBUG_SCRATCH
         fprintf(stderr, "[SCRATCH] WARNING: restore_scratch_reg with empty push stack; deferring POP reg=%d\n",
                 alloc->reg);
+#endif
       }
       return;
     }
@@ -603,7 +625,9 @@ static void restore_all_pushed_scratch_regs(void)
   for (int i = scratch_push_count - 1; i >= 0; i--)
   {
     int reg = scratch_push_stack[i];
+#ifdef ARM_THUMB_DEBUG_SCRATCH
     fprintf(stderr, "[SCRATCH] auto-restoring r%d (push order %d)\n", reg, i);
+#endif
     ot_check(th_pop(1 << reg));
   }
   scratch_push_count = 0;
@@ -2682,8 +2706,6 @@ void load_vt_local(int r, SValue *sv, int base)
    */
   if (sv->r & VT_PARAM)
   {
-    fprintf(stderr, "DEBUG load_vt_local: VT_PARAM detected, off=%d, offset_to_args=%d, new off=%d\n", off,
-            offset_to_args, off + offset_to_args);
     off += offset_to_args;
   }
 
@@ -2750,8 +2772,6 @@ void load_to_dest(SValue *dest, SValue *sv)
    * The ARM EABI places stack parameters in the caller's frame above the saved FP. */
   if (sv->r & VT_PARAM)
   {
-    fprintf(stderr, "DEBUG load_to_dest: VT_PARAM detected, fc=%d, offset_to_args=%d, new fc=%d\n", (int)fc,
-            offset_to_args, (int)fc + offset_to_args);
     fc += offset_to_args;
   }
 

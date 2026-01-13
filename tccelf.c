@@ -1154,13 +1154,6 @@ ST_FUNC void relocate_syms(TCCState *s1, Section *symtab, int do_resolve)
       }
       name = (char *)s1->symtab->link->data + sym->st_name;
       /* Debug: print symbol info when name is empty or looks wrong */
-      if (name[0] == '\0' || sym->st_name == 0)
-      {
-        fprintf(
-            stderr,
-            "DEBUG relocate_syms: symbol %d has empty name (st_name=%u, st_info=0x%x, st_value=0x%lx, st_size=%lu)\n",
-            sym_idx, sym->st_name, sym->st_info, (unsigned long)sym->st_value, (unsigned long)sym->st_size);
-      }
       /* Use ld.so to resolve symbol for us (for tcc -run) */
       if (do_resolve)
       {

@@ -1541,6 +1541,18 @@ static const FlagDef options_f[] = {{offsetof(TCCState, char_is_unsigned), 0, "u
                                     {offsetof(TCCState, unwind_tables), 0, "asynchronous-unwind-tables"},
                                     {offsetof(TCCState, function_sections), 0, "function-sections"},
                                     {offsetof(TCCState, data_sections), 0, "data-sections"},
+                                    /* IR optimization flags */
+                                    {offsetof(TCCState, opt_dce), 0, "dce"},
+                                    {offsetof(TCCState, opt_const_prop), 0, "const-prop"},
+                                    {offsetof(TCCState, opt_copy_prop), 0, "copy-prop"},
+                                    {offsetof(TCCState, opt_cse), 0, "cse"},
+                                    {offsetof(TCCState, opt_bool_cse), 0, "bool-cse"},
+                                    {offsetof(TCCState, opt_bool_idempotent), 0, "bool-idempotent"},
+                                    {offsetof(TCCState, opt_bool_simplify), 0, "bool-simplify"},
+                                    {offsetof(TCCState, opt_return_value), 0, "return-value-opt"},
+                                    {offsetof(TCCState, opt_store_load_fwd), 0, "store-load-fwd"},
+                                    {offsetof(TCCState, opt_redundant_store), 0, "redundant-store-elim"},
+                                    {offsetof(TCCState, opt_dead_store), 0, "dead-store-elim"},
                                     {0, 0, NULL}};
 
 static const FlagDef options_m[] = {{offsetof(TCCState, ms_bitfields), 0, "ms-bitfields"}, {0, 0, NULL}};
@@ -2004,6 +2016,21 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
       break;
     case TCC_OPTION_O:
       s->optimize = atoi(optarg);
+      /* Enable all IR optimizations when -O1 or higher */
+      if (s->optimize >= 1)
+      {
+        s->opt_dce = 1;
+        s->opt_const_prop = 1;
+        s->opt_copy_prop = 1;
+        s->opt_cse = 1;
+        s->opt_bool_cse = 1;
+        s->opt_bool_idempotent = 1;
+        s->opt_bool_simplify = 1;
+        s->opt_return_value = 1;
+        s->opt_store_load_fwd = 1;
+        s->opt_redundant_store = 1;
+        s->opt_dead_store = 1;
+      }
       break;
     case TCC_OPTION_T:
       if (s->linker_script)

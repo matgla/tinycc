@@ -275,7 +275,7 @@ $(X)tcc.o : DEFINES += $(DEF_GITHASH)
 	@$(MAKE) --no-print-directory $@ CROSS_TARGET=$*
 
 $(CROSS_TARGET)-tcc$(EXESUF): $(TCC_FILES)
-	$S$(CC) -o $@ $^ $(LIBS) $(LDFLAGS)
+	$S$(CC) -o $@ $^ $(LDFLAGS) $(LIBS)
 
 # Cross libtcc1.a
 %-libtcc1.a : %-tcc$(EXESUF) FORCE

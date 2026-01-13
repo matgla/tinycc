@@ -24,8 +24,9 @@ LIBRDIMON_PATH = $(shell arm-none-eabi-gcc $(GCC_ABI_FLAGS) -print-file-name=lib
 # Note: newlib_build in this repo is a single-variant build (no multilib).
 USE_NEWLIB_BUILD ?= 0
 
-CFLAGS += -nostdlib -g -fvisibility=hidden $(GCC_ABI_FLAGS) -gdwarf #-ffunction-sections
-LDFLAGS = $(CFLAGS) -g -fvisibility=hidden -B$(TCC_PATH) #-Wl,--gc-sections
+EXTRA_CFLAGS ?=
+CFLAGS += -nostdlib -g -fvisibility=hidden $(GCC_ABI_FLAGS) -gdwarf -ffunction-sections $(EXTRA_CFLAGS)
+LDFLAGS = $(CFLAGS) -g -fvisibility=hidden -B$(TCC_PATH) -Wl,--gc-sections
 
 TCC_PATH = $(shell realpath $(MAKEFILE_DIR)../../../../)
 LIBC_INCLUDES = $(shell realpath $(MAKEFILE_DIR)../../libc_includes)

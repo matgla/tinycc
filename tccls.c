@@ -24,6 +24,9 @@
 
 #include "tcc.h"
 
+/* Define TCC_LS_DEBUG to enable printing of linear scan state */
+/* #define TCC_LS_DEBUG */
+
 #define LS_LIVE_INTERVAL_INIT_SIZE 64
 
 /* NOTE:
@@ -682,13 +685,16 @@ void tcc_ls_allocate_registers(LSLiveIntervalState *ls, int used_parameters_regi
     qsort(ls->active_set, ls->next_active_index, sizeof(LSLiveInterval *), sort_endpoints);
   }
 
+#ifdef TCC_LS_DEBUG
+  tcc_ls_print_intervals(ls);
+#endif
+}
+
+#ifdef TCC_LS_DEBUG
+static void tcc_ls_print_intervals(LSLiveIntervalState *ls)
+{
   for (int i = 0; i < ls->next_interval_index; ++i)
   {
-    /* Check for invalid state: r0 == -1 but not spilled to stack */
-    if (ls->intervals[i].r0 == -1 && ls->intervals[i].stack_location == 0 && !ls->intervals[i].addrtaken)
-    {
-      printf("ERROR: Interval %d has r0=-1 but stack_location=0 (not spilled)! vreg=0x%x\n", i, ls->intervals[i].vreg);
-    }
     printf("Interval %d (%d,%d), ", i, ls->intervals[i].start, ls->intervals[i].end);
     tcc_ir_print_vreg(ls->intervals[i].vreg);
     const char *type_str;
@@ -736,6 +742,7 @@ void tcc_ls_allocate_registers(LSLiveIntervalState *ls, int used_parameters_regi
     }
   }
 }
+#endif
 
 /* Find a free scratch register at the given instruction index.
  * Returns -1 if no register is available.

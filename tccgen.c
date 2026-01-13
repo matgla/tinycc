@@ -23,7 +23,7 @@
 
 #include "tccir.h"
 
-#define DEBUG_IR_GEN
+// #define DEBUG_IR_GEN
 
 /********************************************************/
 /* global variables */
@@ -1920,7 +1920,6 @@ static int adjust_bf(SValue *sv, int bit_pos, int bit_size)
    register value (such as structures). */
 ST_FUNC int gv(int rc)
 {
-  printf("gv(%d) called\n", rc);
   int r, r2, r_ok, r2_ok, rc2, bt;
   int bit_pos, bit_size, size, align;
   int vreg = -1;
@@ -1929,7 +1928,6 @@ ST_FUNC int gv(int rc)
      Valid vregs have type 1, 2, or 3 in the upper 4 bits. Type 0 is invalid. */
   if (tcc_state->ir && TCCIR_DECODE_VREG_TYPE(vtop->vr) > 0 && !(vtop->r & VT_LVAL))
   {
-    printf("gv: IR mode, already has vreg=%d, skipping\n", vtop->vr);
     return vtop->r & VT_VALMASK;
   }
 
@@ -2301,7 +2299,6 @@ static void lbuild(int t)
    register */
 static void gv_dup(void)
 {
-  printf("gv_dup() called\n");
   int t, rc, r;
   SValue sv;
 
@@ -10339,55 +10336,67 @@ static void gen_function(Sym *sym)
 #endif
 
   /* Dead code elimination - remove unreachable instructions */
-  tcc_ir_dead_code_elimination(ir);
+  if (tcc_state->opt_dce)
+    tcc_ir_dead_code_elimination(ir);
 
   /* Phase 1: Constant Propagation with Algebraic Simplification */
-  if (tcc_ir_constant_propagation(ir))
-    tcc_ir_dead_code_elimination(ir); /* Clean up simplified ops */
+  if (tcc_state->opt_const_prop && tcc_ir_constant_propagation(ir))
+    if (tcc_state->opt_dce)
+      tcc_ir_dead_code_elimination(ir); /* Clean up simplified ops */
 
   /* Phase 1b: TMP Constant Propagation - propagate constants from folded expressions */
-  if (tcc_ir_tmp_constant_propagation(ir))
+  if (tcc_state->opt_const_prop && tcc_ir_tmp_constant_propagation(ir))
   {
     if (tcc_ir_constant_propagation(ir))
-      tcc_ir_dead_code_elimination(ir);
+      if (tcc_state->opt_dce)
+        tcc_ir_dead_code_elimination(ir);
   }
 
   /* Phase 2: Copy Propagation */
-  if (tcc_ir_copy_propagation(ir))
-    tcc_ir_dead_code_elimination(ir);
+  if (tcc_state->opt_copy_prop && tcc_ir_copy_propagation(ir))
+    if (tcc_state->opt_dce)
+      tcc_ir_dead_code_elimination(ir);
 
   /* Phase 3: Arithmetic Common Subexpression Elimination */
-  if (tcc_ir_arithmetic_cse(ir))
-    tcc_ir_dead_code_elimination(ir);
+  if (tcc_state->opt_cse && tcc_ir_arithmetic_cse(ir))
+    if (tcc_state->opt_dce)
+      tcc_ir_dead_code_elimination(ir);
 
   /* Common subexpression elimination for commutative boolean ops */
-  if (tcc_ir_bool_cse(ir))
-    tcc_ir_dead_code_elimination(ir); /* Clean up unused ops */
+  if (tcc_state->opt_bool_cse && tcc_ir_bool_cse(ir))
+    if (tcc_state->opt_dce)
+      tcc_ir_dead_code_elimination(ir); /* Clean up unused ops */
 
   /* Idempotent boolean simplification: BOOL_OP(x, x) -> x */
-  if (tcc_ir_bool_idempotent(ir))
-    tcc_ir_dead_code_elimination(ir); /* Clean up unused ops */
+  if (tcc_state->opt_bool_idempotent && tcc_ir_bool_idempotent(ir))
+    if (tcc_state->opt_dce)
+      tcc_ir_dead_code_elimination(ir); /* Clean up unused ops */
 
   /* Boolean expression simplification - eliminate redundant BOOL_OR/BOOL_AND */
-  if (tcc_ir_bool_simplification(ir))
-    tcc_ir_dead_code_elimination(ir); /* Clean up unused ops */
+  if (tcc_state->opt_bool_simplify && tcc_ir_bool_simplification(ir))
+    if (tcc_state->opt_dce)
+      tcc_ir_dead_code_elimination(ir); /* Clean up unused ops */
 
   /* Return value optimization - fold LOAD -> RETURNVALUE */
-  if (tcc_ir_return_value_optimization(ir))
-    tcc_ir_dead_code_elimination(ir); /* Clean up unused ops */
+  if (tcc_state->opt_return_value && tcc_ir_return_value_optimization(ir))
+    if (tcc_state->opt_dce)
+      tcc_ir_dead_code_elimination(ir); /* Clean up unused ops */
 
   /* Phase 4: Store-Load Forwarding - replace loads from recently stored addresses
    * CONSERVATIVE: Only handles stack locals whose address is not taken */
-  if (tcc_ir_store_load_forwarding(ir))
-    tcc_ir_dead_code_elimination(ir); /* Clean up forwarded loads */
+  if (tcc_state->opt_store_load_fwd && tcc_ir_store_load_forwarding(ir))
+    if (tcc_state->opt_dce)
+      tcc_ir_dead_code_elimination(ir); /* Clean up forwarded loads */
 
   /* Phase 4: Redundant Store Elimination - remove stores overwritten before read
    * CONSERVATIVE: Only handles stack locals whose address is not taken */
-  if (tcc_ir_redundant_store_elimination(ir))
-    tcc_ir_dead_code_elimination(ir); /* Clean up dead stores */
+  if (tcc_state->opt_redundant_store && tcc_ir_redundant_store_elimination(ir))
+    if (tcc_state->opt_dce)
+      tcc_ir_dead_code_elimination(ir); /* Clean up dead stores */
 
   /* Dead store elimination - remove unused ASSIGN instructions */
-  tcc_ir_dead_store_elimination(ir);
+  if (tcc_state->opt_dead_store)
+    tcc_ir_dead_store_elimination(ir);
 
   /* Recompute leafness after IR optimizations.
    * IR construction marks the function non-leaf as soon as a call op is

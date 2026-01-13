@@ -25,7 +25,7 @@
 #include "tccdebug.h"
 
 #ifndef TCC_DUMP_THUMB_GEN_SPAN
-#define TCC_DUMP_THUMB_GEN_SPAN 1
+#define TCC_DUMP_THUMB_GEN_SPAN 0
 #endif
 
 #include <ctype.h>
@@ -35,13 +35,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if defined(__linux__) || defined(__APPLE__)
-#include <fcntl.h>
-#include <unistd.h>
-#endif
-
 #ifndef TCC_DUMP_THUMB_GEN
-#define TCC_DUMP_THUMB_GEN 1
+#define TCC_DUMP_THUMB_GEN 0
 #endif
 
 #ifndef TCC_DUMP_THUMB_GEN_MNEMONICS
@@ -61,7 +56,6 @@
 #define SPILL_MARK_BEGIN "\033[41m"
 #define SPILL_MARK_END "\033[0m"
 
-#if TCC_DUMP_THUMB_GEN
 /* Forward declarations for debug functions */
 typedef struct IRRegistersConfig
 {
@@ -73,7 +67,6 @@ typedef struct IRRegistersConfig
 extern const IRRegistersConfig irop_config[];
 const char *tcc_ir_get_vreg_type_string(int vreg);
 static bool tcc_ir_operand_needs_dereference(SValue *sv);
-#endif
 
 static inline int is_thumb2_32bit_prefix(uint16_t h1)
 {
@@ -1157,7 +1150,7 @@ void tcc_ir_add_function_parameters(TCCIRState *ir, CType *func_type)
     }
 
     sym->r |= ~(VT_LVAL | VT_LLOCAL);
-    tcc_debug_print_sym(sym_push(sym->v & ~SYM_FIELD, type, flags, addr));
+    sym_push(sym->v & ~SYM_FIELD, type, flags, addr);
   }
 
   tcc_abi_call_layout_deinit(&call_layout);
@@ -6382,28 +6375,18 @@ void tcc_ir_backpatch(TCCIRState *ir, int t, int target_address)
   if (t < 0)
     return; /* -1 means no chain */
 
-  printf("\n=== BACKPATCH CALLED: t=%d target=%d ===\n", t, target_address);
-
   while (t >= 0 && t < ir->next_instruction_index)
   {
     TccIrOp op = ir->instructions[t].op;
-    printf("  Patching instr[%d]: op=%d", t, op);
 
     /* Check if this instruction is actually a jump */
     if (op != TCCIR_OP_JUMP && op != TCCIR_OP_JUMPIF)
     {
-      printf(" ERROR: Not a jump instruction!\n");
-      printf("  Dumping first 10 instructions:\n");
-      for (int i = 0; i < 10 && i < ir->next_instruction_index; i++)
-      {
-        printf("    [%d] op=%d dest.c.i=%d\n", i, ir->instructions[i].op, (int)ir->instructions[i].dest.c.i);
-      }
       break; /* Don't corrupt non-jump instructions */
     }
 
     cur = &ir->instructions[t].dest;
     next = cur->c.i;
-    printf(" (next=%d) -> setting to %d\n", next, target_address);
     cur->c.i = target_address;
 
     /* Chain ends when next is -1 (sentinel), out of range, or already patched */
@@ -6411,7 +6394,6 @@ void tcc_ir_backpatch(TCCIRState *ir, int t, int target_address)
       break;
     t = next;
   }
-  printf("=== BACKPATCH DONE ===\n\n");
 }
 
 void tcc_ir_backpatch_to_here(TCCIRState *ir, int t)
