@@ -6,6 +6,14 @@ TEST_FILES ?= $(MAKEFILE_DIR)main.c
 OUTPUT ?= $(MAKEFILE_DIR)build/
 TARGET ?= $(OUTPUT)/hello.elf
 
+# Profiling support
+# CC_WRAPPER: prefix for compiler invocations (e.g., "heaptrack --record-only -o /tmp/ht" or "/usr/bin/time -v -a -o /tmp/metrics.txt")
+# Set to empty by default (no profiling)
+CC_WRAPPER ?=
+
+# Size tool for binary analysis
+SIZE_CMD ?= arm-none-eabi-size
+
 GCC_ABI_FLAGS = -mcpu=cortex-m33 -mthumb -mfloat-abi=soft #-mfloat-abi=hard -mfpu=fpv5-sp-d16
 
 ARM_SYSROOT = $(shell arm-none-eabi-gcc $(GCC_ABI_FLAGS) --print-sysroot)
@@ -62,13 +70,19 @@ $(OUTPUT):
 	mkdir -p $(OUTPUT)
 
 $(OUTPUT)/%.o: $(MAKEFILE_DIR)%.c | $(OUTPUT)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC_WRAPPER) $(CC) $(CFLAGS) -c $< -o $@
 
 $(OUTPUT)/%.o: $(MAKEFILE_DIR)%.S | $(OUTPUT)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC_WRAPPER) $(CC) $(CFLAGS) -c $< -o $@
 
 $(TARGET): $(OBJS)
-	$(CC) $^ $(CRT_LIBS) -o $@ $(LDFLAGS)
+	$(CC_WRAPPER) $(CC) $^ $(CRT_LIBS) -o $@ $(LDFLAGS)
+
+# Report binary size after build
+size: $(TARGET)
+	@$(SIZE_CMD) $(TARGET)
 
 clean:
 	rm -rf $(OUTPUT)
+
+.PHONY: all clean size
