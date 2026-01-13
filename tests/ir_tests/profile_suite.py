@@ -5,11 +5,13 @@ Profile TinyCC compiler memory usage and performance across the test suite.
 Uses the unified qemu_run.py infrastructure with profiling support.
 
 Usage:
-    python profile_suite.py [--output-dir DIR] [--limit N] [--profiler heaptrack|time]
+    python profile_suite.py [--output-dir DIR] [--limit N] [--profiler heaptrack|time|perf]
 
 Output:
     - profile_results/heaptrack_*.zst - heaptrack data files (use heaptrack_gui to view)
     - profile_results/time_*.txt      - GNU time output files
+    - profile_results/perf_*.data     - perf data files (use perf report to view)
+    - profile_results/perf_*.svg      - CPU flamegraph SVG files (open in browser)
     - profile_results/summary.csv     - CSV with all metrics
     - profile_results/summary.json    - JSON with all metrics
 """
@@ -89,9 +91,18 @@ def print_result(result: CompileResult, test_name: str, idx: int, total: int):
     else:
         mem_str = "mem=N/A"
 
+    extra = ""
+    if result.perf_samples > 0:
+        extra = f" samples={result.perf_samples}"
+        # Show memory alongside perf samples if available
+        if result.max_rss_kb > 0 and result.heap_peak_kb == 0:
+            extra += f" rss={result.max_rss_kb}KB"
+    if result.flamegraph_file:
+        extra += " [flamegraph]"
+
     print(f"[{idx:3d}/{total}] {test_name:40s} {status:4s} "
           f"time={result.compile_time_s:.3f}s {mem_str} "
-          f"bin={result.total_size}B")
+          f"bin={result.total_size}B{extra}")
 
 
 def result_to_dict(result: CompileResult, test_name: str) -> dict:
@@ -106,6 +117,8 @@ def result_to_dict(result: CompileResult, test_name: str) -> dict:
         "heap_peak_kb": result.heap_peak_kb,
         "heap_allocations": result.heap_allocations,
         "heap_temporary_allocs": result.heap_temporary_allocs,
+        "perf_samples": result.perf_samples,
+        "flamegraph_file": result.flamegraph_file,
         "profile_file": result.profile_file,
         "text_size": result.text_size,
         "data_size": result.data_size,
@@ -151,11 +164,16 @@ def write_summary(results, output_dir):
         if max_rss > 0:
             print(f"Max RSS:          {max_rss} KB ({max_rss/1024:.2f} MB)")
         print(f"Total binary size: {total_bin_size} bytes ({total_bin_size/1024:.2f} KB)")
+        # Count flamegraphs generated
+        flamegraph_count = sum(1 for r in successful if r.get("flamegraph_file"))
+
         print(f"\nResults saved to: {output_dir}")
         print(f"  - {csv_file.name}")
         print(f"  - {json_file.name}")
         if max_heap > 0:
-            print(f"  - heaptrack_*.zst files (open with heaptrack_gui for flamegraphs)")
+            print(f"  - heaptrack_*.zst files (open with heaptrack_gui for memory flamegraphs)")
+        if flamegraph_count > 0:
+            print(f"  - {flamegraph_count} perf_*.svg flamegraph(s) (open in browser for CPU profiling)")
 
 
 def main():
@@ -164,7 +182,7 @@ def main():
                         help="Output directory for profile data")
     parser.add_argument("--limit", "-n", type=int, default=0,
                         help="Limit number of tests to run (0 = all)")
-    parser.add_argument("--profiler", "-p", choices=["heaptrack", "time"], default="heaptrack",
+    parser.add_argument("--profiler", "-p", choices=["heaptrack", "time", "perf"], default="heaptrack",
                         help="Profiler tool to use (default: heaptrack)")
     parser.add_argument("--include-float", action="store_true",
                         help="Include floating point tests")

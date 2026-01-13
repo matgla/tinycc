@@ -4,6 +4,7 @@
  * This file is part of TinyCC
  */
 #define USING_GLOBALS
+#include <limits.h>
 #include "arm-thumb-defs.h"
 #include "tcc.h"
 #include "tccabi.h"
@@ -12,91 +13,154 @@
 
 void thumb_free_call_sites(void)
 {
-  ThumbGenCallSite *call_site = thumb_gen_state.call_sites;
-  while (call_site)
+  if (thumb_gen_state.call_sites_by_id)
   {
-    ThumbGenCallSite *next = call_site->next;
-    /* Free the argument list if allocated */
-    if (call_site->function_argument_list)
+    for (int i = 0; i < thumb_gen_state.call_sites_by_id_size; ++i)
     {
-      tcc_free(call_site->function_argument_list);
-      call_site->function_argument_list = NULL;
+      ThumbGenCallSite *cs = &thumb_gen_state.call_sites_by_id[i];
+      if (cs->function_argument_list)
+      {
+        tcc_free(cs->function_argument_list);
+        cs->function_argument_list = NULL;
+      }
     }
-    tcc_free(call_site);
-    call_site = next;
+    tcc_free(thumb_gen_state.call_sites_by_id);
+    thumb_gen_state.call_sites_by_id = NULL;
   }
-  thumb_gen_state.call_sites = NULL;
+  thumb_gen_state.call_sites_by_id_size = 0;
 }
 
-void thumb_append_call_site(ThumbGenCallSite *new_state)
+static void thumb_ensure_call_site_capacity(int call_id)
 {
-  ThumbGenCallSite *next = thumb_gen_state.call_sites;
-  if (thumb_gen_state.call_sites == NULL)
-  {
-    thumb_gen_state.call_sites = new_state;
+  if (call_id < 0)
     return;
-  }
 
-  while (next->next)
+  if (call_id >= thumb_gen_state.call_sites_by_id_size)
   {
-    next = next->next;
+    int new_size = thumb_gen_state.call_sites_by_id_size ? thumb_gen_state.call_sites_by_id_size : 16;
+    while (new_size <= call_id)
+    {
+      if (new_size > (INT_MAX >> 1))
+        break;
+      new_size <<= 1;
+    }
+
+    if (new_size > call_id)
+    {
+      ThumbGenCallSite *new_tab =
+          (ThumbGenCallSite *)tcc_realloc(thumb_gen_state.call_sites_by_id, (size_t)new_size * sizeof(*new_tab));
+      memset(new_tab + thumb_gen_state.call_sites_by_id_size, 0,
+             (size_t)(new_size - thumb_gen_state.call_sites_by_id_size) * sizeof(*new_tab));
+      thumb_gen_state.call_sites_by_id = new_tab;
+      thumb_gen_state.call_sites_by_id_size = new_size;
+    }
   }
-  next->next = new_state;
+}
+
+ThumbGenCallSite *thumb_get_or_create_call_site(int call_id)
+{
+  if (call_id < 0)
+    return NULL;
+
+  thumb_ensure_call_site_capacity(call_id);
+  if (call_id >= thumb_gen_state.call_sites_by_id_size)
+    return NULL;
+
+  ThumbGenCallSite *cs = &thumb_gen_state.call_sites_by_id[call_id];
+  cs->call_id = call_id;
+  return cs;
 }
 
 ThumbGenCallSite *thumb_get_call_site_for_id(int call_id)
 {
-  ThumbGenCallSite *call_state = thumb_gen_state.call_sites;
-  while (call_state)
-  {
-    if (call_state->call_id == call_id)
-      return call_state;
-    call_state = call_state->next;
-  }
+  if (call_id >= 0 && call_id < thumb_gen_state.call_sites_by_id_size && thumb_gen_state.call_sites_by_id)
+    return &thumb_gen_state.call_sites_by_id[call_id];
   return NULL;
 }
 
 /* Build ABI call layout from IR instructions for a given call_id.
  * Scans backwards from call_idx to find all FUNCPARAMVAL operations for this call.
+ * argc_hint: if >= 0, use this as the known argument count (from FUNCCALL encoding).
+ * out_args: if non-NULL, will be allocated and filled with argument SValues.
  * Returns the number of arguments found, or -1 on error.
  */
-int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, TCCAbiCallLayout *layout)
+int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, int argc_hint,
+                                     TCCAbiCallLayout *layout, SValue **out_args)
 {
   if (!ir || !layout || call_idx < 0)
     return -1;
 
-  /* Scan backwards to find all FUNCPARAMVAL ops for this call_id */
-  int max_arg_index = -1;
-  for (int j = call_idx - 1; j >= 0; --j)
+  /* Use fixed-size arrays for small argument counts to avoid allocations.
+   * Most calls have few arguments, so this is a significant optimization. */
+  #define MAX_INLINE_ARGS 16
+  TCCAbiArgDesc inline_arg_descs[MAX_INLINE_ARGS];
+  uint8_t inline_found[MAX_INLINE_ARGS];
+  TCCAbiArgDesc *arg_descs = NULL;
+  uint8_t *found = NULL;
+  SValue *args = NULL;
+
+  /* If argc_hint is provided and valid, use it directly (O(argc) scan only).
+   * Otherwise, fall back to scanning to find max_arg_index (O(n) scan). */
+  int argc;
+  if (argc_hint >= 0)
   {
-    const TACQuadruple *p = &ir->instructions[j];
-    if (p->op == TCCIR_OP_FUNCPARAMVAL)
+    argc = argc_hint;
+  }
+  else
+  {
+    /* Legacy fallback: scan to find max_arg_index */
+    int max_arg_index = -1;
+    for (int j = call_idx - 1; j >= 0; --j)
     {
-      int param_call_id = TCCIR_DECODE_CALL_ID(p->src2.c.i);
-      if (param_call_id == call_id)
+      const TACQuadruple *p = &ir->instructions[j];
+      if (p->op == TCCIR_OP_FUNCPARAMVAL)
       {
-        int param_idx = TCCIR_DECODE_PARAM_IDX(p->src2.c.i);
-        if (param_idx > max_arg_index)
-          max_arg_index = param_idx;
+        int param_call_id = TCCIR_DECODE_CALL_ID(p->src2.c.i);
+        if (param_call_id == call_id)
+        {
+          int param_idx = TCCIR_DECODE_PARAM_IDX(p->src2.c.i);
+          if (param_idx > max_arg_index)
+            max_arg_index = param_idx;
+        }
       }
     }
+    argc = max_arg_index + 1;
   }
 
-  const int argc = max_arg_index + 1;
   if (argc <= 0)
   {
     layout->argc = 0;
     layout->stack_size = 0;
+    if (out_args)
+      *out_args = NULL;
     return 0;
   }
 
-  /* Allocate arrays for argument descriptors and locations */
-  TCCAbiArgDesc *arg_descs = (TCCAbiArgDesc *)tcc_mallocz(sizeof(TCCAbiArgDesc) * argc);
-  layout->locs = (TCCAbiArgLoc *)tcc_mallocz(sizeof(TCCAbiArgLoc) * argc);
-  uint8_t *found = (uint8_t *)tcc_mallocz(sizeof(uint8_t) * argc);
+  memset(inline_found, 0, sizeof(inline_found));
 
-  /* Collect all parameters for this call */
-  for (int j = call_idx - 1; j >= 0; --j)
+  /* Allocate arrays based on argc */
+  if (argc <= MAX_INLINE_ARGS)
+  {
+    /* Fast path: use inline arrays */
+    arg_descs = inline_arg_descs;
+    found = inline_found;
+  }
+  else
+  {
+    /* Slow path: heap allocation needed */
+    arg_descs = (TCCAbiArgDesc *)tcc_mallocz(sizeof(TCCAbiArgDesc) * argc);
+    found = (uint8_t *)tcc_mallocz(sizeof(uint8_t) * argc);
+  }
+
+  /* Allocate args array if caller wants SValues */
+  if (out_args)
+  {
+    args = (SValue *)tcc_mallocz(sizeof(SValue) * argc);
+  }
+
+  /* Single scan to collect both parameter type info AND SValues */
+  int found_count = 0;
+  for (int j = call_idx - 1; j >= 0 && found_count < argc; --j)
   {
     const TACQuadruple *p = &ir->instructions[j];
     if (p->op == TCCIR_OP_FUNCPARAMVAL)
@@ -105,14 +169,14 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, T
       if (param_call_id == call_id)
       {
         int param_idx = TCCIR_DECODE_PARAM_IDX(p->src2.c.i);
-        if (param_idx < 0 || param_idx >= argc)
+        if (param_idx >= 0 && param_idx < argc && !found[param_idx])
         {
-          tcc_error("compiler_error: bad FUNCPARAMVAL index %d (argc=%d)", param_idx, argc);
-          goto cleanup_error;
-        }
+          /* Collect SValue if requested */
+          if (args)
+          {
+            args[param_idx] = p->src1;
+          }
 
-        if (!found[param_idx])
-        {
           /* Determine argument type and size */
           const int bt = p->src1.type.t & VT_BTYPE;
           int size = 0;
@@ -141,6 +205,7 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, T
           }
 
           found[param_idx] = 1;
+          found_count++;
         }
       }
     }
@@ -156,6 +221,9 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, T
     }
   }
 
+  /* Allocate layout locations */
+  layout->locs = (TCCAbiArgLoc *)tcc_mallocz(sizeof(TCCAbiArgLoc) * argc);
+
   /* Use target ABI hook to compute register/stack layout */
   if (tcc_gen_machine_abi_assign_call_args(arg_descs, argc, layout) < 0)
   {
@@ -164,17 +232,36 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, T
   }
 
   layout->argc = argc;
-  tcc_free(arg_descs);
-  tcc_free(found);
+
+  /* Return args to caller if requested */
+  if (out_args)
+  {
+    *out_args = args;
+  }
+
+  /* Free heap-allocated arrays if used */
+  if (argc > MAX_INLINE_ARGS)
+  {
+    tcc_free(arg_descs);
+    tcc_free(found);
+  }
   return argc;
 
 cleanup_error:
-  tcc_free(arg_descs);
+  if (argc > MAX_INLINE_ARGS)
+  {
+    tcc_free(arg_descs);
+    tcc_free(found);
+  }
+  if (args)
+  {
+    tcc_free(args);
+  }
   if (layout->locs)
   {
     tcc_free(layout->locs);
     layout->locs = NULL;
   }
-  tcc_free(found);
   return -1;
+  #undef MAX_INLINE_ARGS
 }

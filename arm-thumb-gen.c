@@ -987,7 +987,8 @@ ST_FUNC void arm_init(struct TCCState *s)
    */
 
   th_literal_pool_init();
-  thumb_gen_state.call_sites = NULL;
+  thumb_gen_state.call_sites_by_id = NULL;
+  thumb_gen_state.call_sites_by_id_size = 0;
 }
 
 ST_FUNC void arm_deinit(struct TCCState *s)
@@ -1184,10 +1185,6 @@ static void th_literal_pool_generate(void)
 
     branch_hw0_after = *(uint16_t *)(cur_text_section->data + branch_pos);
     branch_hw1_after = *(uint16_t *)(cur_text_section->data + branch_pos + 2);
-
-    printf("literal_pool[%d]: branch_pos=0x%x need_align=%d pool_size=%d count=%d branch=%04x %04x, jump: 0x%x\n",
-           this_pool, branch_pos, need_align, pool_size, thumb_gen_state.literal_pool_count, branch_hw0_after,
-           branch_hw1_after, branch_after_pool);
   }
   th_sym_t();
 
@@ -1225,12 +1222,6 @@ static void th_literal_pool_generate(void)
       else
       {
         overlaps |= (p1 >= branch_start && p1 < branch_end);
-      }
-
-      if (overlaps)
-      {
-        printf("literal_pool[%d]: entry %d patch overlaps branch: patch_pos=0x%x short=%d data_size=%d branch_pos=0x%x",
-               this_pool, i, entry->patch_position, entry->short_instruction, entry->data_size, branch_pos);
       }
     }
 
@@ -5104,13 +5095,9 @@ ST_FUNC void tcc_gen_machine_store_op(TACQuadruple *op)
 ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int stack_size)
 {
   thumb_gen_state.function_argument_count = 0;
-  ThumbGenCallSite *call_state = (ThumbGenCallSite *)tcc_malloc(sizeof(ThumbGenCallSite));
-  *call_state = (ThumbGenCallSite){
-      .call_id = -1,
-      .registers_map = 0,
-      .next = NULL,
-  };
-  thumb_append_call_site(call_state);
+  /* call_id -1 is reserved for function prolog metadata - but that doesn't
+   * need to be stored in call_sites_by_id (which uses non-negative IDs).
+   * If needed, handle it separately or skip. */
 
   uint16_t registers_to_push = 0;
   int registers_count = 0;
@@ -5670,7 +5657,21 @@ ST_FUNC void tcc_gen_machine_lea_op(TACQuadruple *op)
     if (tcc_state->need_frame_pointer == 0)
       base = R_SP;
 
-    int offset = (int)op->src1.c.i;
+    /* Use vreg-based stack slot offset if available, otherwise fall back to c.i */
+    int offset;
+    const TCCStackSlot *slot = tcc_ir_stack_slot_by_vreg(tcc_state->ir, op->src1.vr);
+    if (slot)
+      offset = slot->offset;
+    else
+      offset = (int)op->src1.c.i;
+    /* Stack parameters live above the saved-register area.
+     * When computing their address, fold in offset_to_args (prologue push size). */
+    if (op->src1.r & VT_PARAM)
+      offset += offset_to_args;
+    /* Stack parameters live above the saved-register area.
+     * When computing their address, fold in offset_to_args (prologue push size). */
+    if (op->src1.r & VT_PARAM)
+      offset += offset_to_args;
     /* Stack parameters live above the saved-register area.
      * When computing their address, fold in offset_to_args (prologue push size). */
     if (op->src1.r & VT_PARAM)
@@ -6283,8 +6284,9 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
   if (!q || !ir)
     tcc_error("compiler_error: func_call_op requires q+ir");
 
-  /* Get call_id from src2.c.i (keeps call/param binding explicit). */
+  /* Get call_id and argc from src2.c.i (keeps call/param binding explicit). */
   const int call_id = TCCIR_DECODE_CALL_ID(q->src2.c.i);
+  const int argc_hint = TCCIR_DECODE_CALL_ARGC(q->src2.c.i);
 
   /* Get the cached call site created during FUNCPARAMVAL processing */
   ThumbGenCallSite *call_site = thumb_get_call_site_for_id(call_id);
@@ -6295,36 +6297,14 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
   TCCAbiCallLayout layout;
   memset(&layout, 0, sizeof(layout));
 
-  const int argc = thumb_build_call_layout_from_ir(ir, call_idx, call_id, &layout);
+  /* Single scan: get both ABI layout AND argument SValues */
+  SValue *args = NULL;
+  const int argc = thumb_build_call_layout_from_ir(ir, call_idx, call_id, argc_hint, &layout, &args);
   if (argc < 0)
     tcc_error("compiler_error: failed to build call layout for call_id=%d", call_id);
 
   /* Calculate total stack space needed */
   const int stack_size = (argc > 0) ? (int)layout.stack_size : 0;
-
-  /* Collect argument values by scanning backwards */
-  SValue *args = NULL;
-  if (argc > 0)
-  {
-    args = (SValue *)tcc_mallocz(sizeof(SValue) * argc);
-
-    for (int j = call_idx - 1; j >= 0; --j)
-    {
-      const TACQuadruple *p = &ir->instructions[j];
-      if (p->op == TCCIR_OP_FUNCPARAMVAL)
-      {
-        int param_call_id = TCCIR_DECODE_CALL_ID(p->src2.c.i);
-        if (param_call_id == call_id)
-        {
-          int param_idx = TCCIR_DECODE_PARAM_IDX(p->src2.c.i);
-          if (param_idx >= 0 && param_idx < argc)
-          {
-            args[param_idx] = p->src1;
-          }
-        }
-      }
-    }
-  }
 
   /* Step 1: Check if any argument registers (R0-R3) are currently in use
    * If we have a nested call, we need to preserve them */
@@ -7018,19 +6998,11 @@ ST_FUNC void tcc_gen_machine_func_parameter_op(TACQuadruple *q)
   int param_index = TCCIR_DECODE_PARAM_IDX(q->src2.c.i);
 
   /* Find or create call site for this call_id */
-  ThumbGenCallSite *call_site = thumb_get_call_site_for_id(call_id);
+  ThumbGenCallSite *call_site = thumb_get_or_create_call_site(call_id);
   if (call_site == NULL)
   {
-    /* First parameter for this call - create call site */
-    call_site = (ThumbGenCallSite *)tcc_malloc(sizeof(ThumbGenCallSite));
-    memset(call_site, 0, sizeof(ThumbGenCallSite));
-    call_site->call_id = call_id;
-    call_site->function_argument_list = NULL;
-    call_site->function_argument_count = 0;
-    call_site->used_stack_size = 0;
-    call_site->registers_map = 0;
-    call_site->next = NULL;
-    thumb_append_call_site(call_site);
+    tcc_error("compiler_error: failed to allocate call site for call_id=%d", call_id);
+    return;
   }
 
   /* FUNCPARAMVOID is a marker for a 0-argument call.

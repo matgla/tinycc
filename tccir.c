@@ -30,6 +30,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -708,7 +709,8 @@ TCCIRState *tcc_ir_allocate_block()
   block->orig_ir_to_code_mapping_size = 0;
 
   block->next_instruction_index = 0;
-  block->next_call_id = 1;
+  /* call_id is 0-based and monotonically increasing per function. */
+  block->next_call_id = 0;
 
   block->leaffunc = 1;
   block->processing_if = 0;
@@ -729,6 +731,9 @@ TCCIRState *tcc_ir_allocate_block()
   block->stack_layout.slots = NULL;
   block->stack_layout.slot_capacity = 0;
   block->stack_layout.slot_count = 0;
+  block->stack_layout.offset_hash_keys = NULL;
+  block->stack_layout.offset_hash_values = NULL;
+  block->stack_layout.offset_hash_size = 0;
 
 #ifdef CONFIG_TCC_ASM
   block->inline_asms = NULL;
@@ -983,6 +988,18 @@ void tcc_ir_release_block(TCCIRState *ir)
     ir->stack_layout.slot_capacity = 0;
     ir->stack_layout.slot_count = 0;
   }
+
+  if (ir->stack_layout.offset_hash_keys)
+  {
+    tcc_free(ir->stack_layout.offset_hash_keys);
+    ir->stack_layout.offset_hash_keys = NULL;
+  }
+  if (ir->stack_layout.offset_hash_values)
+  {
+    tcc_free(ir->stack_layout.offset_hash_values);
+    ir->stack_layout.offset_hash_values = NULL;
+  }
+  ir->stack_layout.offset_hash_size = 0;
 
   tcc_ls_deinitialize(&ir->ls);
   tcc_free(ir);
@@ -1610,6 +1627,13 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
     ir->leaffunc = 0;
   }
 
+  /* LEA takes the address of src1, so mark it as address-taken.
+   * This ensures it gets spilled to the stack rather than kept only in a register. */
+  if (op == TCCIR_OP_LEA && src1 && tcc_is_vreg_valid(ir, src1->vr))
+  {
+    tcc_ir_set_addrtaken(ir, src1->vr);
+  }
+
   // physical registers were not assigned yet
   q->src1.pr0 = PREG_NONE;
   q->src1.pr1 = PREG_NONE;
@@ -1928,28 +1952,25 @@ static int tcc_ir_find_live_interval(TCCIRState *ir, int vreg, int *start, int *
   return retval;
 }
 
-/* Check if there's a function call between start and end instruction indices
- * A call at the start position is where the value is defined, so it doesn't
- * count. A call at the end position is where the value is last used, so it
- * doesn't count. We only care about calls strictly between start and end. */
-static int tcc_ir_has_call_in_range(TCCIRState *ir, int start, int end)
+/* Check if there's a function call strictly between [start, end).
+ * Used by register allocation to decide whether an interval crosses a call.
+ * This is implemented via a prefix-sum array of call instructions. */
+static int tcc_ir_has_call_in_range_prefix(const int *call_prefix, int start, int end, int instruction_count)
 {
-  for (int i = start + 1; i < end && i < ir->next_instruction_index; ++i)
-  {
-    TccIrOp op = ir->instructions[i].op;
-    if (i == end - 1)
-    {
-      if (op == TCCIR_OP_FUNCCALLVOID || op == TCCIR_OP_FUNCCALLVAL)
-      {
-        return 1;
-      }
-    }
-    if (op == TCCIR_OP_FUNCCALLVOID || op == TCCIR_OP_FUNCCALLVAL)
-    {
-      return 1;
-    }
-  }
-  return 0;
+  if (!call_prefix)
+    return 0;
+  if (instruction_count <= 0)
+    return 0;
+  if (start < -1)
+    start = -1;
+  if (end > instruction_count)
+    end = instruction_count;
+  /* We want calls with indices i in [start+1, end-1]. */
+  if (end <= start + 1)
+    return 0;
+  if (start + 1 >= instruction_count)
+    return 0;
+  return (call_prefix[end] - call_prefix[start + 1]) != 0;
 }
 
 /* Extend live intervals for vregs used as function parameters.
@@ -1959,6 +1980,57 @@ static void tcc_ir_extend_param_intervals(TCCIRState *ir)
 {
   if (!ir)
     return;
+
+  const int n = ir->next_instruction_index;
+  const int max_call_id = ir->next_call_id;
+
+  /* Fast path: use call_id -> call_idx mapping when call_id is available.
+   * call_id is monotonically increasing per function and encoded in both
+   * FUNCPARAMVAL and FUNCCALL*.
+   */
+  int *call_idx_by_id = NULL;
+  if (max_call_id > 0)
+  {
+    call_idx_by_id = (int *)tcc_malloc(sizeof(int) * max_call_id);
+    for (int i = 0; i < max_call_id; ++i)
+      call_idx_by_id[i] = -1;
+
+    for (int call_idx = 0; call_idx < n; ++call_idx)
+    {
+      const TACQuadruple *callq = &ir->instructions[call_idx];
+      if (callq->op != TCCIR_OP_FUNCCALLVOID && callq->op != TCCIR_OP_FUNCCALLVAL)
+        continue;
+      const int call_id = TCCIR_DECODE_CALL_ID(callq->src2.c.i);
+      if (call_id >= 0 && call_id < max_call_id)
+        call_idx_by_id[call_id] = call_idx;
+    }
+
+    for (int j = 0; j < n; ++j)
+    {
+      const TACQuadruple *p = &ir->instructions[j];
+      if (p->op != TCCIR_OP_FUNCPARAMVAL)
+        continue;
+
+      const int call_id = TCCIR_DECODE_CALL_ID(p->src2.c.i);
+      if (call_id < 0 || call_id >= max_call_id)
+        continue;
+      const int call_idx = call_idx_by_id[call_id];
+      if (call_idx < 0)
+        continue;
+
+      if (tcc_is_vreg_valid(ir, p->src1.vr))
+      {
+        IRLiveInterval *interval = tcc_ir_get_live_interval(ir, p->src1.vr);
+        if (interval && interval->end < (uint32_t)call_idx)
+          interval->end = (uint32_t)call_idx;
+        if (interval && interval->start == INTERVAL_NOT_STARTED)
+          interval->start = 0;
+      }
+    }
+
+    tcc_free(call_idx_by_id);
+    return;
+  }
 
   /* FUNCCALL* does not list its arguments explicitly; instead arguments are
    * represented by preceding FUNCPARAMVAL markers tagged with the same call_id.
@@ -1996,6 +2068,159 @@ static void tcc_ir_extend_param_intervals(TCCIRState *ir)
       }
     }
   }
+}
+
+static void tcc_ir_extend_intervals_for_backward_jumps(TCCIRState *ir)
+{
+  if (!ir)
+    return;
+
+  const int n = ir->next_instruction_index;
+  if (n <= 0)
+    return;
+
+  int *extend_to = (int *)tcc_malloc(sizeof(int) * n);
+  for (int i = 0; i < n; ++i)
+    extend_to[i] = -1;
+
+  /* Collect the maximum jump index for each backward-jump target. */
+  for (int i = 0; i < n; ++i)
+  {
+    const TACQuadruple *q = &ir->instructions[i];
+    if (q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF)
+      continue;
+    const int target = q->dest.c.i;
+    if (target < 0 || target >= n)
+      continue;
+    if (target >= i)
+      continue;
+    if (extend_to[target] < i)
+      extend_to[target] = i;
+  }
+
+  int target_count = 0;
+  for (int t = 0; t < n; ++t)
+    if (extend_to[t] >= 0)
+      ++target_count;
+  if (target_count == 0)
+  {
+    tcc_free(extend_to);
+    return;
+  }
+
+  int *targets = (int *)tcc_malloc(sizeof(int) * target_count);
+  int out = 0;
+  for (int t = 0; t < n; ++t)
+    if (extend_to[t] >= 0)
+      targets[out++] = t;
+
+  const int local_count = ir->next_local_variable;
+  const int temp_count = ir->next_temporary_variable;
+  const int param_count = ir->next_parameter;
+  const int interval_count = local_count + temp_count + param_count;
+
+  int *start_head = (int *)tcc_malloc(sizeof(int) * n);
+  for (int i = 0; i < n; ++i)
+    start_head[i] = -1;
+  int *start_next = (int *)tcc_malloc(sizeof(int) * interval_count);
+  IRLiveInterval **start_interval = (IRLiveInterval **)tcc_malloc(sizeof(IRLiveInterval *) * interval_count);
+
+  int node_idx = 0;
+  for (int v = 0; v < local_count; ++v)
+  {
+    IRLiveInterval *interval = &ir->variables_live_intervals[v];
+    if (interval->start == INTERVAL_NOT_STARTED)
+      continue;
+    int s = (int)interval->start;
+    if (s < 0)
+      s = 0;
+    if (s >= n)
+      continue;
+    start_interval[node_idx] = interval;
+    start_next[node_idx] = start_head[s];
+    start_head[s] = node_idx++;
+  }
+  for (int v = 0; v < temp_count; ++v)
+  {
+    IRLiveInterval *interval = &ir->temporary_variables_live_intervals[v];
+    if (interval->start == INTERVAL_NOT_STARTED)
+      continue;
+    int s = (int)interval->start;
+    if (s < 0)
+      s = 0;
+    if (s >= n)
+      continue;
+    start_interval[node_idx] = interval;
+    start_next[node_idx] = start_head[s];
+    start_head[s] = node_idx++;
+  }
+  for (int v = 0; v < param_count; ++v)
+  {
+    IRLiveInterval *interval = &ir->parameters_live_intervals[v];
+    if (interval->start == INTERVAL_NOT_STARTED)
+      continue;
+    int s = (int)interval->start;
+    if (s < 0)
+      s = 0;
+    if (s >= n)
+      continue;
+    start_interval[node_idx] = interval;
+    start_next[node_idx] = start_head[s];
+    start_head[s] = node_idx++;
+  }
+
+  IRLiveInterval **active = (IRLiveInterval **)tcc_malloc(sizeof(IRLiveInterval *) * node_idx);
+  int active_count = 0;
+  int scan_pos = 0;
+
+  for (int ti = 0; ti < target_count; ++ti)
+  {
+    const int target = targets[ti];
+    const int jump_end = extend_to[target];
+    if (jump_end < 0)
+      continue;
+
+    /* Advance scan position and add intervals that start in [scan_pos, target]. */
+    for (; scan_pos <= target && scan_pos < n; ++scan_pos)
+    {
+      for (int node = start_head[scan_pos]; node != -1; node = start_next[node])
+      {
+        active[active_count++] = start_interval[node];
+      }
+    }
+
+    /* Compact active set to intervals that are live at 'target'. */
+    int w = 0;
+    for (int i = 0; i < active_count; ++i)
+    {
+      IRLiveInterval *interval = active[i];
+      if (!interval)
+        continue;
+      if (interval->start == INTERVAL_NOT_STARTED)
+        continue;
+      if ((int)interval->start > target)
+        continue;
+      if ((int)interval->end < target)
+        continue;
+      active[w++] = interval;
+    }
+    active_count = w;
+
+    /* Extend all intervals live at the jump target. */
+    for (int i = 0; i < active_count; ++i)
+    {
+      IRLiveInterval *interval = active[i];
+      if ((int)interval->end < jump_end)
+        interval->end = (uint32_t)jump_end;
+    }
+  }
+
+  tcc_free(active);
+  tcc_free(start_interval);
+  tcc_free(start_next);
+  tcc_free(start_head);
+  tcc_free(targets);
+  tcc_free(extend_to);
 }
 
 /* Compute live intervals by scanning the IR after optimizations.
@@ -2066,39 +2291,7 @@ static void tcc_ir_compute_live_intervals(TCCIRState *ir)
   }
 
   /* Handle backward jumps - extend intervals for loop variables */
-  for (int i = 0; i < ir->next_instruction_index; ++i)
-  {
-    TACQuadruple *q = &ir->instructions[i];
-    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
-    {
-      int jump_target = q->dest.c.i;
-      /* Backward jump: target is before the jump instruction */
-      if (jump_target < i)
-      {
-        /* Any vreg live at the jump target must extend to the jump */
-        for (int vreg_type = 0; vreg_type < 3; ++vreg_type)
-        {
-          int max_vreg = (vreg_type == 0)   ? ir->next_local_variable
-                         : (vreg_type == 1) ? ir->next_temporary_variable
-                                            : ir->next_parameter;
-          for (int vreg_idx = 0; vreg_idx < max_vreg; ++vreg_idx)
-          {
-            IRLiveInterval *interval = (vreg_type == 0)   ? &ir->variables_live_intervals[vreg_idx]
-                                       : (vreg_type == 1) ? &ir->temporary_variables_live_intervals[vreg_idx]
-                                                          : &ir->parameters_live_intervals[vreg_idx];
-
-            if (interval->start != INTERVAL_NOT_STARTED && interval->start <= jump_target &&
-                interval->end >= jump_target)
-            {
-              /* Variable is live at jump target, extend to jump */
-              if (i > interval->end)
-                interval->end = i;
-            }
-          }
-        }
-      }
-    }
-  }
+  tcc_ir_extend_intervals_for_backward_jumps(ir);
 
   /* Extend intervals for vregs used as function parameters */
   tcc_ir_extend_param_intervals(ir);
@@ -2113,6 +2306,20 @@ void tcc_ir_liveness_analysis(TCCIRState *ir)
   IRLiveInterval *interval;
   tcc_ls_clear_live_intervals(&ir->ls);
 
+  const int instruction_count = ir->next_instruction_index;
+  int *call_prefix = NULL;
+  if (instruction_count > 0)
+  {
+    call_prefix = (int *)tcc_malloc(sizeof(int) * (instruction_count + 1));
+    call_prefix[0] = 0;
+    for (int i = 0; i < instruction_count; ++i)
+    {
+      const TccIrOp op = ir->instructions[i].op;
+      const int is_call = (op == TCCIR_OP_FUNCCALLVOID || op == TCCIR_OP_FUNCCALLVAL) ? 1 : 0;
+      call_prefix[i + 1] = call_prefix[i] + is_call;
+    }
+  }
+
   /* Compute live intervals from the IR after optimizations */
   tcc_ir_compute_live_intervals(ir);
 
@@ -2120,16 +2327,16 @@ void tcc_ir_liveness_analysis(TCCIRState *ir)
   for (int vreg = 0; vreg < ir->next_local_variable; ++vreg)
   {
     const int encoded_vreg = (TCCIR_VREG_TYPE_VAR << 28) | vreg;
-    if (tcc_is_vreg_ignored(ir, vreg))
+    if (tcc_is_vreg_ignored(ir, encoded_vreg))
     {
       continue;
     }
-    interval = tcc_ir_get_live_interval(ir, encoded_vreg);
+    interval = &ir->variables_live_intervals[vreg];
     if (interval->start != INTERVAL_NOT_STARTED)
     {
       start = interval->start;
       end = interval->end;
-      crosses_call = tcc_ir_has_call_in_range(ir, start, end);
+      crosses_call = tcc_ir_has_call_in_range_prefix(call_prefix, start, end, instruction_count);
       addrtaken = interval->addrtaken;
       reg_type = tcc_ir_get_reg_type(ir, encoded_vreg);
       /* If the interval ends at a CALL instruction, this vreg is a parameter
@@ -2148,16 +2355,16 @@ void tcc_ir_liveness_analysis(TCCIRState *ir)
   for (int vreg = 0; vreg < ir->next_temporary_variable; ++vreg)
   {
     const int vreg_encoded = (TCCIR_VREG_TYPE_TEMP << 28) | vreg;
-    if (tcc_is_vreg_ignored(ir, vreg))
+    if (tcc_is_vreg_ignored(ir, vreg_encoded))
     {
       continue;
     }
-    interval = tcc_ir_get_live_interval(ir, vreg_encoded);
+    interval = &ir->temporary_variables_live_intervals[vreg];
     if (interval->start != INTERVAL_NOT_STARTED)
     {
       start = interval->start;
       end = interval->end;
-      crosses_call = tcc_ir_has_call_in_range(ir, start, end);
+      crosses_call = tcc_ir_has_call_in_range_prefix(call_prefix, start, end, instruction_count);
       addrtaken = interval->addrtaken;
       reg_type = tcc_ir_get_reg_type(ir, vreg_encoded);
       /* If the interval ends at a CALL instruction, this vreg is a parameter
@@ -2177,7 +2384,7 @@ void tcc_ir_liveness_analysis(TCCIRState *ir)
   for (int vreg = 0; vreg < ir->next_parameter; ++vreg)
   {
     const int vreg_encoded = (TCCIR_VREG_TYPE_PARAM << 28) | vreg;
-    interval = tcc_ir_get_live_interval(ir, vreg_encoded);
+    interval = &ir->parameters_live_intervals[vreg];
     /* Parameters start at instruction 0 and end at their last use.
      * If end==0 and param is used at instruction 0, that's valid.
      * If end==0 and param is unused, we still allocate a slot for it. */
@@ -2200,16 +2407,7 @@ void tcc_ir_liveness_analysis(TCCIRState *ir)
      * We intentionally scan calls in [0, end) (excluding end, which may be a
      * last-use-at-call position).
      */
-    crosses_call = 0;
-    for (int i = 0; i < end && i < ir->next_instruction_index; ++i)
-    {
-      const TccIrOp op = ir->instructions[i].op;
-      if (op == TCCIR_OP_FUNCCALLVOID || op == TCCIR_OP_FUNCCALLVAL)
-      {
-        crosses_call = 1;
-        break;
-      }
-    }
+    crosses_call = (call_prefix && end > 0) ? (call_prefix[end] != 0) : 0;
     addrtaken = interval->addrtaken;
     reg_type = tcc_ir_get_reg_type(ir, vreg_encoded);
     /* Pre-color parameters to their ABI registers (R0-R3 for first 4 params)
@@ -2224,6 +2422,9 @@ void tcc_ir_liveness_analysis(TCCIRState *ir)
     tcc_ls_add_live_interval(&ir->ls, vreg_encoded, start, end, crosses_call, addrtaken, reg_type, interval->is_lvalue,
                              precolored);
   }
+
+  if (call_prefix)
+    tcc_free(call_prefix);
 }
 
 void tcc_ir_patch_live_intervals_registers(TCCIRState *ir)
@@ -2232,6 +2433,10 @@ void tcc_ir_patch_live_intervals_registers(TCCIRState *ir)
   {
     LSLiveInterval *interval = &ir->ls.intervals[i];
     tcc_ir_assign_physical_register(ir, interval->vreg, interval->stack_location, interval->r0, interval->r1);
+    /* Also copy crosses_call to IRLiveInterval for fast lookup later */
+    IRLiveInterval *ir_interval = tcc_ir_get_live_interval(ir, interval->vreg);
+    if (ir_interval)
+      ir_interval->crosses_call = interval->crosses_call;
   }
 }
 
@@ -2265,6 +2470,159 @@ static void tcc_ir_stack_layout_reset(TCCStackLayout *layout)
   if (!layout)
     return;
   layout->slot_count = 0;
+  if (layout->offset_hash_keys && layout->offset_hash_size > 0)
+  {
+    for (int i = 0; i < layout->offset_hash_size; ++i)
+      layout->offset_hash_keys[i] = INT32_MIN;
+  }
+}
+
+static inline uint32_t tcc_ir_hash_u32(uint32_t x)
+{
+  /* A small integer hash suitable for hash tables.
+   * (Public-domain style mix; good enough for our offsets.)
+   */
+  x ^= x >> 16;
+  x *= 0x7feb352dU;
+  x ^= x >> 15;
+  x *= 0x846ca68bU;
+  x ^= x >> 16;
+  return x;
+}
+
+static int tcc_ir_stack_layout_offset_hash_lookup_index(const TCCStackLayout *layout, int offset)
+{
+  if (!layout || !layout->offset_hash_keys || layout->offset_hash_size <= 0)
+    return -1;
+
+  const int size = layout->offset_hash_size;
+  const int mask = size - 1;
+  uint32_t h = tcc_ir_hash_u32((uint32_t)offset);
+  int pos = (int)(h & (uint32_t)mask);
+
+  for (int probe = 0; probe < size; ++probe)
+  {
+    const int key = layout->offset_hash_keys[pos];
+    if (key == INT32_MIN)
+      return -1;
+    if (key == offset)
+      return layout->offset_hash_values[pos];
+    pos = (pos + 1) & mask;
+  }
+  return -1;
+}
+
+static void tcc_ir_stack_layout_offset_hash_rebuild(TCCStackLayout *layout, int new_size)
+{
+  if (!layout)
+    return;
+  if (new_size < 0)
+    return;
+  if (new_size == 0)
+  {
+    if (layout->offset_hash_keys)
+      tcc_free(layout->offset_hash_keys);
+    if (layout->offset_hash_values)
+      tcc_free(layout->offset_hash_values);
+    layout->offset_hash_keys = NULL;
+    layout->offset_hash_values = NULL;
+    layout->offset_hash_size = 0;
+    return;
+  }
+
+  int *new_keys = (int *)tcc_malloc(sizeof(int) * (size_t)new_size);
+  int *new_vals = (int *)tcc_malloc(sizeof(int) * (size_t)new_size);
+  for (int i = 0; i < new_size; ++i)
+    new_keys[i] = INT32_MIN;
+
+  const int mask = new_size - 1;
+  for (int slot_index = 0; slot_index < layout->slot_count; ++slot_index)
+  {
+    const int offset = layout->slots[slot_index].offset;
+    uint32_t h = tcc_ir_hash_u32((uint32_t)offset);
+    int pos = (int)(h & (uint32_t)mask);
+    while (new_keys[pos] != INT32_MIN)
+      pos = (pos + 1) & mask;
+    new_keys[pos] = offset;
+    new_vals[pos] = slot_index;
+  }
+
+  if (layout->offset_hash_keys)
+    tcc_free(layout->offset_hash_keys);
+  if (layout->offset_hash_values)
+    tcc_free(layout->offset_hash_values);
+  layout->offset_hash_keys = new_keys;
+  layout->offset_hash_values = new_vals;
+  layout->offset_hash_size = new_size;
+}
+
+static void tcc_ir_stack_layout_offset_hash_ensure_capacity(TCCStackLayout *layout, int needed_slots)
+{
+  if (!layout)
+    return;
+  if (needed_slots <= 0)
+    return;
+
+  /* Keep load factor <= 0.5 for fast probes. */
+  int target = 16;
+  while (target < needed_slots * 2)
+    target <<= 1;
+
+  if (layout->offset_hash_size >= target)
+    return;
+  tcc_ir_stack_layout_offset_hash_rebuild(layout, target);
+}
+
+static void tcc_ir_stack_layout_offset_hash_insert(TCCStackLayout *layout, int offset, int slot_index)
+{
+  if (!layout)
+    return;
+  if (slot_index < 0)
+    return;
+
+  if (!layout->offset_hash_keys || layout->offset_hash_size <= 0)
+    tcc_ir_stack_layout_offset_hash_ensure_capacity(layout, layout->slot_count + 1);
+
+  if (!layout->offset_hash_keys || layout->offset_hash_size <= 0)
+    return;
+
+  const int size = layout->offset_hash_size;
+  const int mask = size - 1;
+  uint32_t h = tcc_ir_hash_u32((uint32_t)offset);
+  int pos = (int)(h & (uint32_t)mask);
+  for (int probe = 0; probe < size; ++probe)
+  {
+    const int key = layout->offset_hash_keys[pos];
+    if (key == INT32_MIN || key == offset)
+    {
+      layout->offset_hash_keys[pos] = offset;
+      layout->offset_hash_values[pos] = slot_index;
+      return;
+    }
+    pos = (pos + 1) & mask;
+  }
+
+  /* Table unexpectedly full: grow and retry once. */
+  tcc_ir_stack_layout_offset_hash_rebuild(layout, size ? (size << 1) : 16);
+  if (!layout->offset_hash_keys || layout->offset_hash_size <= 0)
+    return;
+
+  /* Retry insert after rebuild. */
+  const int new_size = layout->offset_hash_size;
+  const int new_mask = new_size - 1;
+  h = tcc_ir_hash_u32((uint32_t)offset);
+  pos = (int)(h & (uint32_t)new_mask);
+  for (int probe = 0; probe < new_size; ++probe)
+  {
+    const int key = layout->offset_hash_keys[pos];
+    if (key == INT32_MIN || key == offset)
+    {
+      layout->offset_hash_keys[pos] = offset;
+      layout->offset_hash_values[pos] = slot_index;
+      return;
+    }
+    pos = (pos + 1) & new_mask;
+  }
 }
 
 static void tcc_ir_stack_layout_ensure_capacity(TCCStackLayout *layout, int needed_slots)
@@ -2284,24 +2642,17 @@ static TCCStackSlot *tcc_ir_stack_layout_find_by_offset(TCCStackLayout *layout, 
 {
   if (!layout)
     return NULL;
+
+  const int idx = tcc_ir_stack_layout_offset_hash_lookup_index(layout, offset);
+  if (idx >= 0 && idx < layout->slot_count)
+    return &layout->slots[idx];
+
   for (int i = 0; i < layout->slot_count; ++i)
   {
     if (layout->slots[i].offset == offset)
       return &layout->slots[i];
   }
   return NULL;
-}
-
-static int tcc_ir_stack_layout_interval_crosses_call(const TCCIRState *ir, int vreg)
-{
-  if (!ir)
-    return 0;
-  for (int i = 0; i < ir->ls.next_interval_index; ++i)
-  {
-    if ((int)ir->ls.intervals[i].vreg == vreg)
-      return ir->ls.intervals[i].crosses_call ? 1 : 0;
-  }
-  return 0;
 }
 
 static TCCStackSlotKind tcc_ir_stack_slot_kind_for_type(TCCIR_VREG_TYPE type)
@@ -2337,8 +2688,12 @@ static void tcc_ir_stack_layout_note_interval(TCCIRState *ir, int vreg, IRLiveIn
     slot->alignment = (slot->size >= 8) ? 8 : 4;
     slot->kind = kind;
     slot->vreg = vreg;
-    slot->live_across_calls = tcc_ir_stack_layout_interval_crosses_call(ir, vreg);
+    slot->live_across_calls = interval->crosses_call;
     slot->addressable = interval->addrtaken ? 1 : 0;
+
+    /* Maintain the fast lookup table for offset -> slot index. */
+    tcc_ir_stack_layout_offset_hash_ensure_capacity(layout, layout->slot_count);
+    tcc_ir_stack_layout_offset_hash_insert(layout, slot->offset, layout->slot_count - 1);
   }
   else if (slot->vreg == -1)
   {
@@ -2374,6 +2729,13 @@ void tcc_ir_build_stack_layout(TCCIRState *ir)
     return;
 
   tcc_ir_stack_layout_reset(&ir->stack_layout);
+
+  /* Pre-size the offset hash for fast lookups and to avoid O(n^2) during layout build.
+   * Worst-case slots are bounded by total vregs of params/locals/temps.
+   */
+  const int estimated_slots = ir->next_local_variable + ir->next_temporary_variable + ir->next_parameter;
+  tcc_ir_stack_layout_offset_hash_ensure_capacity(&ir->stack_layout, estimated_slots + 8);
+
   tcc_ir_stack_layout_collect(ir, ir->variables_live_intervals, ir->next_local_variable, TCCIR_VREG_TYPE_VAR);
   tcc_ir_stack_layout_collect(ir, ir->temporary_variables_live_intervals, ir->next_temporary_variable,
                               TCCIR_VREG_TYPE_TEMP);
@@ -2396,6 +2758,11 @@ const TCCStackSlot *tcc_ir_stack_slot_by_offset(const TCCIRState *ir, int frame_
 {
   if (!ir)
     return NULL;
+
+  const int idx = tcc_ir_stack_layout_offset_hash_lookup_index(&ir->stack_layout, frame_offset);
+  if (idx >= 0 && idx < ir->stack_layout.slot_count)
+    return &ir->stack_layout.slots[idx];
+
   for (int i = 0; i < ir->stack_layout.slot_count; ++i)
   {
     if (ir->stack_layout.slots[i].offset == frame_offset)
@@ -5250,15 +5617,18 @@ void tcc_ir_put_soft_call(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2
     return;
   }
   memset(&param, 0, sizeof(SValue));
+  int argc = 0;
   if (irop_config[q.op].has_src1)
   {
     param.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
     tcc_ir_put(ir, TCCIR_OP_FUNCPARAMVAL, src1, &param, NULL);
+    argc++;
   }
   if (irop_config[q.op].has_src2)
   {
     param.c.i = TCCIR_ENCODE_PARAM(call_id, 1);
     tcc_ir_put(ir, TCCIR_OP_FUNCPARAMVAL, src2, &param, NULL);
+    argc++;
   }
   sym = external_global_sym(tok_alloc_const(func_name), &func_old_type);
   param.r = VT_CONST | VT_SYM;
@@ -5267,12 +5637,12 @@ void tcc_ir_put_soft_call(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2
 
   if (irop_config[q.op].has_dest)
   {
-    SValue call_id_sv = tcc_ir_svalue_call_id(call_id);
+    SValue call_id_sv = tcc_ir_svalue_call_id_argc(call_id, argc);
     tcc_ir_put(ir, TCCIR_OP_FUNCCALLVAL, &param, &call_id_sv, dest);
   }
   else
   {
-    SValue call_id_sv = tcc_ir_svalue_call_id(call_id);
+    SValue call_id_sv = tcc_ir_svalue_call_id_argc(call_id, argc);
     tcc_ir_put(ir, TCCIR_OP_FUNCCALLVOID, &param, &call_id_sv, NULL);
   }
 }

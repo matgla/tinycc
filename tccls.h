@@ -68,6 +68,16 @@ typedef struct LSLiveIntervalState
   uint64_t dirty_registers;       // integer registers that were used
   uint64_t float_registers_map;   // VFP registers (s0-s31 mapped to bits 0-31)
   uint64_t dirty_float_registers; // VFP registers that were used
+
+  /* Optional precomputed table: live integer registers bitmap at each IR instruction.
+   * If present, scratch register lookup can be O(1).
+   */
+  uint32_t *live_regs_by_instruction;
+  int live_regs_by_instruction_size;
+
+  /* Cache for scratch register lookup - avoid recomputing for same instruction */
+  int cached_instruction_idx;
+  uint32_t cached_live_regs;
 } LSLiveIntervalState;
 
 void tcc_ls_initialize(LSLiveIntervalState *ls);
@@ -86,10 +96,12 @@ void tcc_ls_allocate_registers(LSLiveIntervalState *ls, int used_parameters_regi
  */
 void tcc_ls_compact_stack_locations(LSLiveIntervalState *ls, int spill_base);
 
+/* Reset scratch register cache - call before codegen starts */
+void tcc_ls_reset_scratch_cache(LSLiveIntervalState *ls);
+
 /* Find a free scratch register at the given instruction index.
  * Returns -1 if no register is available.
- *
- * Parameters:
+ * Uses per-instruction caching for efficiency.
  *   ls - the live interval state
  *   instruction_idx - current instruction index
  *   exclude_regs - bitmap of registers to exclude (e.g., already used as scratch)

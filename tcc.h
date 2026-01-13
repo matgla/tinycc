@@ -1023,6 +1023,11 @@ static inline SValue tcc_ir_svalue_call_id(int call_id)
 {
   return tcc_svalue_const_i64((int64_t)TCCIR_ENCODE_PARAM(call_id, 0));
 }
+
+static inline SValue tcc_ir_svalue_call_id_argc(int call_id, int argc)
+{
+  return tcc_svalue_const_i64((int64_t)TCCIR_ENCODE_CALL(call_id, argc));
+}
 /* types */
 #define VT_BTYPE 0x000f /* mask for basic type */
 #define VT_VOID 0       /* void type */

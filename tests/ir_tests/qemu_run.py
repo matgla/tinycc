@@ -32,9 +32,11 @@ was_cleaned = False
 @dataclass
 class ProfileConfig:
     """Configuration for compiler profiling."""
-    tool: str = "none"  # "none", "heaptrack", "time"
+    tool: str = "none"  # "none", "heaptrack", "time", "perf"
     output_dir: Optional[Path] = None
     output_prefix: str = ""  # prefix for output files (e.g., test name)
+    perf_frequency: int = 99  # sampling frequency for perf (Hz)
+    measure_memory: bool = True  # For perf: also capture memory usage via /usr/bin/time
 
     def get_wrapper_cmd(self) -> str:
         """Get the CC_WRAPPER command for make."""
@@ -47,6 +49,14 @@ class ProfileConfig:
         elif self.tool == "time":
             out_file = self.output_dir / f"time_{self.output_prefix}.txt"
             return f"/usr/bin/time -v -a -o {out_file}"
+        elif self.tool == "perf":
+            perf_file = self.output_dir / f"perf_{self.output_prefix}.data"
+            if self.measure_memory:
+                # Wrap perf with time to get memory metrics too
+                time_file = self.output_dir / f"time_{self.output_prefix}.txt"
+                return f"/usr/bin/time -v -a -o {time_file} perf record -F {self.perf_frequency} -g --call-graph dwarf -o {perf_file}"
+            else:
+                return f"perf record -F {self.perf_frequency} -g --call-graph dwarf -o {perf_file}"
         else:
             return ""
 
@@ -56,9 +66,11 @@ class CompileConfig:
     """Configuration for compilation."""
     compiler: Optional[Path] = None  # None = use default armv8m-tcc
     extra_cflags: str = ""
+    defines: Optional[list] = None  # List of defines, e.g. ["FOO", "BAR=1"]
     profiler: Optional[ProfileConfig] = None
     clean_before_build: bool = True
     output_dir: Optional[Path] = None  # None = use default build dir
+    output_suffix: str = ""  # Suffix to add to output filename (e.g. "_tag")
 
     def __post_init__(self):
         if self.compiler is None:
@@ -80,12 +92,15 @@ class CompileResult:
     heap_allocations: int = 0
     heap_temporary_allocs: int = 0
     profile_file: str = ""
+    flamegraph_file: str = ""  # SVG flamegraph (for perf profiling)
+    perf_samples: int = 0  # Number of perf samples collected
     # Binary size metrics
     text_size: int = 0
     data_size: int = 0
     bss_size: int = 0
     total_size: int = 0
     error: str = ""
+    make_command: list = None  # The make command that was executed
 
 
 def _as_file_list(test_file):
@@ -101,14 +116,14 @@ def _primary_file(test_file):
     return files[0]
 
 
-def get_test_output_file(test_name, output_dir=None):
+def get_test_output_file(test_name, output_dir=None, suffix=""):
     primary = _primary_file(test_name)
     if output_dir is None:
         output_dir = CURRENT_DIR / "build"
-    return output_dir / f"{Path(primary).stem}.elf"
+    return output_dir / f"{Path(primary).stem}{suffix}.elf"
 
 
-def build_make_command(test_file, machine, compiler, output_dir=None, cflags=None, cc_wrapper=None):
+def build_make_command(test_file, machine, compiler, output_dir=None, cflags=None, defines=None, cc_wrapper=None, output_suffix=""):
     """Build the make command for compiling a test case."""
     make_dir = CURRENT_DIR / 'qemu' / machine
     test_files = [str(f) for f in _as_file_list(test_file)]
@@ -124,10 +139,17 @@ def build_make_command(test_file, machine, compiler, output_dir=None, cflags=Non
         f"OUTPUT={output_dir}",
         f"TEST_FILES={test_files_value}",
         f"CC={compiler}",
-        f"TARGET={get_test_output_file(test_file, output_dir)}",
+        f"TARGET={get_test_output_file(test_file, output_dir, output_suffix)}",
     ]
+    # Build EXTRA_CFLAGS from cflags and defines
+    extra_cflags_parts = []
     if cflags:
-        cmd.append(f"EXTRA_CFLAGS={cflags}")
+        extra_cflags_parts.append(cflags)
+    if defines:
+        for d in defines:
+            extra_cflags_parts.append(f"-D{d}")
+    if extra_cflags_parts:
+        cmd.append(f"EXTRA_CFLAGS={' '.join(extra_cflags_parts)}")
     if cc_wrapper:
         cmd.append(f"CC_WRAPPER={cc_wrapper}")
     return cmd
@@ -194,6 +216,112 @@ def parse_time_output(time_file):
 
     if max_rss_values:
         metrics['max_rss_kb'] = max(max_rss_values)
+
+    return metrics
+
+
+def parse_perf_output(perf_data_file, generate_flamegraph=True):
+    """Parse perf data and optionally generate a flamegraph SVG.
+
+    Requires:
+    - perf (Linux perf tools)
+    - For flamegraphs: either 'flamegraph' CLI tool or FlameGraph scripts
+    """
+    metrics = {'samples': 0, 'flamegraph_file': ''}
+
+    perf_file = Path(perf_data_file)
+    if not perf_file.exists():
+        return metrics
+
+    # Get sample count from perf report
+    result = subprocess.run(
+        ["perf", "report", "-i", str(perf_file), "--stdio", "--header"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    if result.returncode == 0:
+        output = result.stdout.decode(errors='replace')
+        for line in output.split('\n'):
+            if 'sample' in line.lower() and ('event' in line.lower() or 'of' in line.lower()):
+                match = re.search(r'(\d+)\s+sample', line.lower())
+                if match:
+                    metrics['samples'] = int(match.group(1))
+                    break
+
+    if not generate_flamegraph:
+        return metrics
+
+    # Generate flamegraph
+    flamegraph_svg = perf_file.with_suffix('.svg')
+
+    # Try using 'flamegraph' CLI tool first (cargo install flamegraph)
+    result = subprocess.run(
+        ["which", "flamegraph"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    if result.returncode == 0:
+        # Use flamegraph CLI - it reads perf.data directly
+        result = subprocess.run(
+            ["flamegraph", "--perfdata", str(perf_file), "-o", str(flamegraph_svg)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if result.returncode == 0 and flamegraph_svg.exists():
+            metrics['flamegraph_file'] = str(flamegraph_svg)
+            return metrics
+
+    # Fallback: use perf script + FlameGraph scripts
+    # perf script -> stackcollapse-perf.pl -> flamegraph.pl
+    perf_script_result = subprocess.run(
+        ["perf", "script", "-i", str(perf_file)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    if perf_script_result.returncode != 0:
+        return metrics
+
+    # Try different collapse tools
+    collapse_result = None
+    collapse_tools = ["stackcollapse-perf.pl", "inferno-collapse-perf"]
+    for tool in collapse_tools:
+        try:
+            collapse_result = subprocess.run(
+                [tool],
+                input=perf_script_result.stdout,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            if collapse_result.returncode == 0:
+                break
+        except FileNotFoundError:
+            continue
+
+    if collapse_result is None or collapse_result.returncode != 0:
+        return metrics
+
+    # Try different flamegraph tools
+    fg_tools = [
+        ["flamegraph.pl", "--title", perf_file.stem],
+        ["inferno-flamegraph", "--title", perf_file.stem],
+    ]
+    for tool_cmd in fg_tools:
+        try:
+            fg_result = subprocess.run(
+                tool_cmd,
+                input=collapse_result.stdout,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            if fg_result.returncode == 0:
+                flamegraph_svg.write_bytes(fg_result.stdout)
+                metrics['flamegraph_file'] = str(flamegraph_svg)
+                break
+        except FileNotFoundError:
+            continue
 
     return metrics
 
@@ -300,7 +428,9 @@ def compile_testcase(test_file, machine, compiler=None, cflags=None, config=None
         prefix = config.profiler.output_prefix
         for old_file in list(config.profiler.output_dir.glob(f"heaptrack_{prefix}*.zst")) + \
                         list(config.profiler.output_dir.glob(f"heaptrack_{prefix}*.gz")) + \
-                        list(config.profiler.output_dir.glob(f"time_{prefix}.txt")):
+                        list(config.profiler.output_dir.glob(f"time_{prefix}.txt")) + \
+                        list(config.profiler.output_dir.glob(f"perf_{prefix}.data")) + \
+                        list(config.profiler.output_dir.glob(f"perf_{prefix}.svg")):
             old_file.unlink()
 
     # Build make command
@@ -308,7 +438,9 @@ def compile_testcase(test_file, machine, compiler=None, cflags=None, config=None
         test_file, machine, str(config.compiler),
         output_dir=output_dir,
         cflags=config.extra_cflags or None,
-        cc_wrapper=cc_wrapper
+        defines=config.defines,
+        cc_wrapper=cc_wrapper,
+        output_suffix=config.output_suffix
     )
 
     # Clean if needed
@@ -324,7 +456,7 @@ def compile_testcase(test_file, machine, compiler=None, cflags=None, config=None
     result = subprocess.run(make_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     elapsed = time.perf_counter() - start
 
-    elf_file = get_test_output_file(test_file, output_dir)
+    elf_file = get_test_output_file(test_file, output_dir, config.output_suffix)
     output_lines = []
     if result.stdout:
         output_lines.extend(result.stdout.decode().splitlines())
@@ -336,6 +468,7 @@ def compile_testcase(test_file, machine, compiler=None, cflags=None, config=None
         elf_file=elf_file,
         output_lines=output_lines,
         compile_time_s=elapsed,
+        make_command=make_command,
     )
 
     if result.returncode != 0:
@@ -367,6 +500,20 @@ def compile_testcase(test_file, machine, compiler=None, cflags=None, config=None
             compile_result.sys_time_s = time_metrics['sys_time']
             compile_result.max_rss_kb = time_metrics['max_rss_kb']
             compile_result.profile_file = str(time_file)
+        elif config.profiler.tool == "perf":
+            perf_file = config.profiler.output_dir / f"perf_{prefix}.data"
+            perf_metrics = parse_perf_output(perf_file, generate_flamegraph=True)
+            compile_result.perf_samples = perf_metrics['samples']
+            compile_result.profile_file = str(perf_file)
+            compile_result.flamegraph_file = perf_metrics['flamegraph_file']
+            # Also parse time output if measure_memory was enabled
+            if getattr(config.profiler, 'measure_memory', True):
+                time_file = config.profiler.output_dir / f"time_{prefix}.txt"
+                if time_file.exists():
+                    time_metrics = parse_time_output(time_file)
+                    compile_result.user_time_s = time_metrics['user_time']
+                    compile_result.sys_time_s = time_metrics['sys_time']
+                    compile_result.max_rss_kb = time_metrics['max_rss_kb']
 
     return compile_result
 
@@ -379,7 +526,7 @@ def prepare_test(machine, kernel_file, args=None):
     return sut
 
 
-def run_test(test_file, machine, args=None, cflags=None, config=None):
+def run_test(test_file, machine, args=None, cflags=None, defines=None, config=None):
     """
     Compile and prepare a test for QEMU execution.
 
@@ -388,6 +535,7 @@ def run_test(test_file, machine, args=None, cflags=None, config=None):
         machine: QEMU machine type
         args: Arguments to pass to the test program
         cflags: Extra CFLAGS (deprecated, use config)
+        defines: List of defines (deprecated, use config)
         config: CompileConfig for compilation options
 
     Returns:
@@ -403,6 +551,8 @@ def run_test(test_file, machine, args=None, cflags=None, config=None):
         config = CompileConfig()
     if cflags:
         config.extra_cflags = cflags
+    if defines:
+        config.defines = defines
 
     compile_result = compile_testcase(test_files, machine, config=config)
 

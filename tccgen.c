@@ -916,7 +916,16 @@ ST_FUNC void sym_pop(Sym **ptop, Sym *b, int keep)
     /* Don't free symbols that have been exported to ELF (sym->c != 0)
        as they may still be referenced by IR instructions */
     if (!keep && s->c == 0)
-      sym_free(s);
+    {
+      /* In IR mode the backend may still need Sym pointers (notably for
+       * VT_SYM address materialization and relocations). Block-scope extern
+       * declarations create temporary Sym copies that can be referenced by IR
+       * after the scope ends; freeing them here can lead to missing relocations
+       * and loads/stores from address 0 at runtime.
+       */
+      if (!(tcc_state->ir && (s->r & VT_SYM)))
+        sym_free(s);
+    }
     s = ss;
   }
   if (!keep)
@@ -2389,7 +2398,7 @@ static void gen_opl(int op)
       dest.type.t = VT_LLONG;
       dest.r = 0;
       dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-      SValue call_id_sv = tcc_ir_svalue_call_id(call_id);
+      SValue call_id_sv = tcc_ir_svalue_call_id_argc(call_id, 2);
       tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[-2], &call_id_sv, &dest);
       /* Pop all 3 values (arg1, arg2, func) and push result */
       vtop -= 3;
@@ -2627,7 +2636,7 @@ static void gen_opl(int op)
         dest.type.t = VT_INT;
         dest.r = 0;
         dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-        SValue call_id_sv = tcc_ir_svalue_call_id(call_id);
+        SValue call_id_sv = tcc_ir_svalue_call_id_argc(call_id, 2);
         tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[-2], &call_id_sv, &dest);
         /* Pop all 3 values (arg1, arg2, func) and push result */
         vtop -= 3;
@@ -4399,7 +4408,7 @@ ST_FUNC void vstore(void)
         param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 2);
         tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &param_num, NULL);
 
-        SValue call_id_sv = tcc_ir_svalue_call_id(call_id);
+        SValue call_id_sv = tcc_ir_svalue_call_id_argc(call_id, 3);
         tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[0], &call_id_sv, NULL);
         /* Pop func + 3 args; keep the saved destination lvalue as result */
         vtop -= 4;
@@ -7398,7 +7407,7 @@ tok_next:
          * function pointer value before emitting FUNCCALL.
          * NOTE: We check s->type.t (the function's return type), not vtop->type.t
          * (which is VT_FUNC for function pointers). */
-        SValue call_id_sv = tcc_ir_svalue_call_id(call_id);
+        SValue call_id_sv = tcc_ir_svalue_call_id_argc(call_id, nb_args);
         /* Emit FUNCPARAMVOID for 0-arg calls so backend creates a call site */
         if (nb_args == 0)
         {
@@ -7426,7 +7435,7 @@ tok_next:
         memset(&dest, 0, sizeof(SValue));
         if (nb_args == 0)
         {
-          SValue call_id_sv = tcc_ir_svalue_call_id(call_id);
+          SValue call_id_sv = tcc_ir_svalue_call_id_argc(call_id, 0);
           tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVOID, NULL, &call_id_sv, NULL);
         }
         // perhaps this should be a correct type :(
@@ -7436,7 +7445,7 @@ tok_next:
         return_vreg = dest.vr;
 
         /* For indirect calls (VT_LVAL set), emit a LOAD to get the function pointer value */
-        SValue call_id_sv = tcc_ir_svalue_call_id(call_id);
+        SValue call_id_sv = tcc_ir_svalue_call_id_argc(call_id, nb_args);
         SValue call_target = *vtop;
         if (vtop->r & VT_LVAL)
         {
@@ -8343,6 +8352,7 @@ static void try_call_scope_cleanup(Sym *stop)
     vpushsym(&fs->type, fs);
     vset(&vs->type, vs->r, vs->c);
     vtop->sym = vs;
+    vtop->vr = vs->vreg; /* Set vreg so gaddrof() can compute correct address */
     mk_pointer(&vtop->type);
     gaddrof();
     // gfunc_call(1);
@@ -8352,7 +8362,7 @@ static void try_call_scope_cleanup(Sym *stop)
     src1.vr = -1;
     src1.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
     tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &src1, NULL);
-    SValue call_id_sv = tcc_ir_svalue_call_id(call_id);
+    SValue call_id_sv = tcc_ir_svalue_call_id_argc(call_id, 1);
     tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[-1], &call_id_sv, NULL);
     vtop -= 2;
   }
@@ -9158,7 +9168,7 @@ static void init_putz(init_params *p, unsigned long c, int size)
     dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
     dest.type.t = vtop[-3].type.t;
     dest.r = 0;
-    SValue call_id_sv = tcc_ir_svalue_call_id(call_id);
+    SValue call_id_sv = tcc_ir_svalue_call_id_argc(call_id, 3);
     tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[0], &call_id_sv, &dest);
     vtop -= 4;
 
@@ -10433,6 +10443,9 @@ static void gen_function(Sym *sym)
 
   /* TODO: track float_parameters_count separately for hard float ABI */
   tcc_ls_allocate_registers(&ir->ls, ir->parameters_count, 0, loc);
+
+  /* Reset scratch register cache before codegen */
+  tcc_ls_reset_scratch_cache(&ir->ls);
 
   /* Stack-passed params already live in the incoming argument area.
    * If linear-scan spilled them, drop the local spill slot so we don't bloat

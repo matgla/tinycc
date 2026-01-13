@@ -2,6 +2,7 @@ from qemu_run import build_qemu_command, compile_testcase
 
 import argparse
 import subprocess
+import sys
 from pathlib import Path
 
 args = argparse.ArgumentParser(description="Build QEMU command for a given test file and machine.")
@@ -29,11 +30,14 @@ def main():
         if args.cflags:
             print(f"Using CFLAGS: {args.cflags}")
             compiler_kwargs["cflags"] = args.cflags
-        file, _ = compile_testcase(sources, args.machine, **compiler_kwargs)
+        result = compile_testcase(sources, args.machine, **compiler_kwargs)
+        if not result.success:
+            print(f"Compilation failed:\n{result.error}", file=sys.stderr)
+            sys.exit(1)
+        file = result.elf_file
     if file is None:
         file = args.file
     # Send harness diagnostics to stderr so stdout stays comparable to .expect
-    import sys
     print(f"Running QEMU with file: {file}", file=sys.stderr)
     qemu_command = build_qemu_command(args.machine, file)
     if args.gdb:

@@ -121,6 +121,13 @@ typedef enum TccIrOp
 #define TCCIR_DECODE_CALL_ID(encoded) ((int)((encoded) >> 16))
 #define TCCIR_DECODE_PARAM_IDX(encoded) ((int)((encoded) & 0xFFFF))
 
+/* FUNCCALL encoding helpers:
+ * For FUNCCALLVOID/FUNCCALLVAL, src2.c.i encodes call_id (bits 16-31) and argc (bits 0-15).
+ * This allows the backend to know how many arguments to expect without scanning.
+ */
+#define TCCIR_ENCODE_CALL(call_id, argc) (((int64_t)(call_id) << 16) | ((argc) & 0xFFFF))
+#define TCCIR_DECODE_CALL_ARGC(encoded) ((int)((encoded) & 0xFFFF))
+
 typedef struct CType CType;
 typedef struct SValue SValue;
 
@@ -163,8 +170,9 @@ typedef struct IRLiveInterval
   uint8_t is_llong : 1;        // whether this is a long long (64-bit int)
   uint8_t use_vfp : 1;         // whether to use VFP registers (hard float)
   uint8_t is_lvalue : 1;
-  uint32_t start; // start instruction index
-  uint32_t end;   // end instruction index
+  uint8_t crosses_call : 1; // whether interval spans a function call
+  uint32_t start;           // start instruction index
+  uint32_t end;             // end instruction index
   IRVregReplacement allocation;
   int8_t incoming_reg0;    // for params: which register arg arrives in (-1 if stack)
   int8_t incoming_reg1;    // for doubles: second register (-1 if not double or stack)
@@ -219,6 +227,14 @@ typedef struct TCCStackLayout
   TCCStackSlot *slots;
   int slot_count;
   int slot_capacity;
+
+  /* Optional fast index: frame offset -> slot index.
+   * Uses open addressing with linear probing.
+   * Empty keys are marked with INT32_MIN (see tccir.c implementation).
+   */
+  int *offset_hash_keys;
+  int *offset_hash_values;
+  int offset_hash_size; /* 0 if disabled, otherwise power-of-two */
 } TCCStackLayout;
 
 typedef struct TCCMachineScratchRegs

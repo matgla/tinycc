@@ -48,18 +48,132 @@ void tcc_ls_initialize(LSLiveIntervalState *ls)
   ls->next_active_index = 0;
   ls->dirty_registers = 0;
   ls->dirty_float_registers = 0;
+  ls->live_regs_by_instruction = NULL;
+  ls->live_regs_by_instruction_size = 0;
+  ls->cached_instruction_idx = -1;
+  ls->cached_live_regs = 0;
 }
 
 void tcc_ls_deinitialize(LSLiveIntervalState *ls)
 {
   tcc_free(ls->intervals);
   tcc_free(ls->active_set);
+
+  if (ls->live_regs_by_instruction)
+  {
+    tcc_free(ls->live_regs_by_instruction);
+    ls->live_regs_by_instruction = NULL;
+    ls->live_regs_by_instruction_size = 0;
+  }
+}
+
+void tcc_ls_reset_scratch_cache(LSLiveIntervalState *ls)
+{
+  ls->cached_instruction_idx = -1;
+  ls->cached_live_regs = 0;
 }
 
 void tcc_ls_clear_live_intervals(LSLiveIntervalState *ls)
 {
   ls->next_interval_index = 0;
   ls->next_active_index = 0;
+
+  /* Intervals changed; invalidate any precomputed liveness table. */
+  if (ls->live_regs_by_instruction)
+  {
+    tcc_free(ls->live_regs_by_instruction);
+    ls->live_regs_by_instruction = NULL;
+    ls->live_regs_by_instruction_size = 0;
+  }
+
+  tcc_ls_reset_scratch_cache(ls);
+}
+
+static void tcc_ls_build_live_regs_by_instruction(LSLiveIntervalState *ls)
+{
+  if (!ls)
+    return;
+
+  if (ls->live_regs_by_instruction)
+  {
+    tcc_free(ls->live_regs_by_instruction);
+    ls->live_regs_by_instruction = NULL;
+    ls->live_regs_by_instruction_size = 0;
+  }
+
+  uint32_t max_end = 0;
+  int has_any = 0;
+  for (int i = 0; i < ls->next_interval_index; ++i)
+  {
+    const LSLiveInterval *interval = &ls->intervals[i];
+
+    /* Only track integer register occupancy; skip spilled/stack-only intervals. */
+    if (interval->reg_type != LS_REG_TYPE_INT && interval->reg_type != LS_REG_TYPE_LLONG &&
+        interval->reg_type != LS_REG_TYPE_DOUBLE_SOFT)
+      continue;
+    if (interval->addrtaken || interval->stack_location != 0)
+      continue;
+    if (interval->r0 < 0)
+      continue;
+
+    has_any = 1;
+    if (interval->end > max_end)
+      max_end = interval->end;
+  }
+
+  if (!has_any)
+    return;
+
+  const int size = (int)max_end + 1;
+  uint32_t *start_masks = (uint32_t *)tcc_mallocz(sizeof(uint32_t) * (size_t)size);
+  uint32_t *end_masks = (uint32_t *)tcc_mallocz(sizeof(uint32_t) * (size_t)size);
+  ls->live_regs_by_instruction = (uint32_t *)tcc_malloc(sizeof(uint32_t) * (size_t)size);
+  ls->live_regs_by_instruction_size = size;
+
+  for (int i = 0; i < ls->next_interval_index; ++i)
+  {
+    const LSLiveInterval *interval = &ls->intervals[i];
+
+    if (interval->reg_type != LS_REG_TYPE_INT && interval->reg_type != LS_REG_TYPE_LLONG &&
+        interval->reg_type != LS_REG_TYPE_DOUBLE_SOFT)
+      continue;
+    if (interval->addrtaken || interval->stack_location != 0)
+      continue;
+    if (interval->r0 < 0)
+      continue;
+    if ((int)interval->start < 0 || (int)interval->end < 0)
+      continue;
+    if ((int)interval->start >= size)
+      continue;
+
+    uint32_t mask = 0;
+    if (interval->r0 >= 0 && interval->r0 < 16)
+      mask |= (1u << interval->r0);
+    if (interval->r1 >= 0 && interval->r1 < 16)
+      mask |= (1u << interval->r1);
+
+    /* Ignore anything outside the 0..15 integer register window. */
+    if (!mask)
+      continue;
+
+    start_masks[interval->start] |= mask;
+    if ((int)interval->end < size)
+      end_masks[interval->end] |= mask;
+    else
+      end_masks[size - 1] |= mask;
+  }
+
+  uint32_t live = 0;
+  for (int idx = 0; idx < size; ++idx)
+  {
+    live |= start_masks[idx];
+    ls->live_regs_by_instruction[idx] = live;
+    /* Inclusive end: remove after recording this instruction's occupancy. */
+    live &= ~end_masks[idx];
+  }
+
+  tcc_free(start_masks);
+  tcc_free(end_masks);
 }
 
 void tcc_ls_add_live_interval(LSLiveIntervalState *ls, int vreg, int start, int end, int crosses_call, int addrtaken,
@@ -688,6 +802,9 @@ void tcc_ls_allocate_registers(LSLiveIntervalState *ls, int used_parameters_regi
 #ifdef TCC_LS_DEBUG
   tcc_ls_print_intervals(ls);
 #endif
+
+  /* Build O(1) scratch-reg liveness table for codegen. */
+  tcc_ls_build_live_regs_by_instruction(ls);
 }
 
 #ifdef TCC_LS_DEBUG
@@ -744,8 +861,38 @@ static void tcc_ls_print_intervals(LSLiveIntervalState *ls)
 }
 #endif
 
+/* Compute live registers bitmap for a given instruction index */
+static uint32_t tcc_ls_compute_live_regs(LSLiveIntervalState *ls, int instruction_idx)
+{
+  uint32_t live_regs = 0;
+  for (int i = 0; i < ls->next_interval_index; ++i)
+  {
+    LSLiveInterval *interval = &ls->intervals[i];
+
+    /* Skip non-integer registers */
+    if (interval->reg_type != LS_REG_TYPE_INT && interval->reg_type != LS_REG_TYPE_LLONG)
+      continue;
+
+    /* Check if interval is live at this instruction */
+    if (interval->start <= instruction_idx && interval->end >= instruction_idx)
+    {
+      /* This vreg is live - mark its register(s) as unavailable */
+      if (interval->r0 >= 0 && interval->r0 < 16)
+      {
+        live_regs |= (1 << interval->r0);
+      }
+      if (interval->r1 >= 0 && interval->r1 < 16)
+      {
+        live_regs |= (1 << interval->r1);
+      }
+    }
+  }
+  return live_regs;
+}
+
 /* Find a free scratch register at the given instruction index.
  * Returns -1 if no register is available.
+ * Uses per-instruction caching for efficiency.
  *
  * Parameters:
  *   ls - the live interval state
@@ -769,27 +916,24 @@ int tcc_ls_find_free_scratch_reg(LSLiveIntervalState *ls, int instruction_idx, u
   /* Exclude PC (R15) */
   live_regs |= (1 << 15);
 
-  /* Mark all registers that are live at this instruction */
-  for (int i = 0; i < ls->next_interval_index; ++i)
+  /* Prefer precomputed liveness when available (fast path). */
+  if (ls->live_regs_by_instruction && instruction_idx >= 0 && instruction_idx < ls->live_regs_by_instruction_size)
   {
-    LSLiveInterval *interval = &ls->intervals[i];
-
-    /* Skip non-integer registers */
-    if (interval->reg_type != LS_REG_TYPE_INT && interval->reg_type != LS_REG_TYPE_LLONG)
-      continue;
-
-    /* Check if interval is live at this instruction */
-    if (interval->start <= instruction_idx && interval->end >= instruction_idx)
+    live_regs |= ls->live_regs_by_instruction[instruction_idx];
+  }
+  else
+  {
+    /* Use cached live registers if same instruction, otherwise compute and cache */
+    if (ls->cached_instruction_idx == instruction_idx)
     {
-      /* This vreg is live - mark its register(s) as unavailable */
-      if (interval->r0 >= 0 && interval->r0 < 16)
-      {
-        live_regs |= (1 << interval->r0);
-      }
-      if (interval->r1 >= 0 && interval->r1 < 16)
-      {
-        live_regs |= (1 << interval->r1);
-      }
+      live_regs |= ls->cached_live_regs;
+    }
+    else
+    {
+      uint32_t computed = tcc_ls_compute_live_regs(ls, instruction_idx);
+      ls->cached_instruction_idx = instruction_idx;
+      ls->cached_live_regs = computed;
+      live_regs |= computed;
     }
   }
 
@@ -799,22 +943,22 @@ int tcc_ls_find_free_scratch_reg(LSLiveIntervalState *ls, int instruction_idx, u
    * the prolog already saved it.
    */
   /* First try R0-R3 (caller-saved, often free for scratch) */
-  for (int r = 0; r <= 3; ++r)
   {
-    if (!(live_regs & (1 << r)))
-      return r;
+    const uint32_t avail_low = (~live_regs) & 0xFu;
+    if (avail_low)
+      return (int)__builtin_ctz(avail_low);
   }
 
   /* Then try R12 (IP - inter-procedure scratch) */
-  if (!(live_regs & (1 << 12)))
+  if (!(live_regs & (1u << 12)))
     return 12;
 
   /* Try R11 - reserved for call argument processing but available as scratch otherwise */
-  if (!(live_regs & (1 << 11)))
+  if (!(live_regs & (1u << 11)))
     return 11;
 
   /* Finally try LR if not a leaf function */
-  if (!is_leaf && !(live_regs & (1 << 14)))
+  if (!is_leaf && !(live_regs & (1u << 14)))
     return 14;
 
   /* No register available */

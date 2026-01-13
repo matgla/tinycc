@@ -1,7 +1,7 @@
 import pytest
 import re
 from pathlib import Path
-from qemu_run import run_test
+from qemu_run import run_test, compile_testcase, CompileConfig, prepare_test
 
 MACHINE = "mps2-an505"
 CURRENT_DIR = Path(__file__).parent
@@ -89,8 +89,7 @@ TEST_FILES = [
     ("../tests2/51_static.c", 0),
     ("../tests2/52_unnamed_enum.c", 0),
     ("../tests2/54_goto.c", 0),
-    # ("../tests2/55_lshift_type.c", 0),
-    # ("../tests2/60_errors_and_warnings.c", 0), # separate test with tags
+    ("../tests2/55_lshift_type.c", 0),
     ("../tests2/61_integers.c", 0),
     ("../tests2/64_macro_nesting.c", 0),
     ("../tests2/67_macro_concat.c", 0),
@@ -113,14 +112,12 @@ TEST_FILES = [
     ("../tests2/91_ptr_longlong_arith32.c", 0),
     ("../tests2/92_enum_bitfield.c", 0),
     ("../tests2/93_integer_promotion.c", 0),
-    # ("../tests2/95_bitfields.c", 0),
-    # ("../tests2/95_bitfields_ms.c", 0),
-    # ("../tests2/96_nodata_wanted.c", 0),
+    # ("../tests2/95_bitfields_ms.c", 0), # MS bitfield layout
     ("../tests2/97_utf8_string_literal.c", 0),
-    # ("../tests2/98_al_ax_extend.c", 0),
-    # ("../tests2/99_fastcall.c", 0),
+    # ("../tests2/98_al_ax_extend.c", 0), # x86
+    # ("../tests2/99_fastcall.c", 0), # x86
     ("../tests2/100_c99array-decls.c", 0),
-    # ("../tests2/101_cleanup.c", 0),
+    ("../tests2/101_cleanup.c", 0),
     ("../tests2/102_alignas.c", 0),
     ("../tests2/103_implicit_memmove.c", 0),
     (["../tests2/104_inline.c", "../tests2/104+_inline.c"], 0),
@@ -175,6 +172,15 @@ TEST_FILES_WITH_ARGS = [
     ("../tests2/31_args.c", ["arg1", "arg2", "arg3", "arg4", "arg5"], 0),
 ]
 
+# Tagged test files: source files where tags are auto-discovered from .expect file
+# Tags are identified by [tag_name] lines in the expect file
+# Each tag becomes a separate test with -Dtag_name define
+TAGGED_TEST_FILES = [
+    "../tests2/60_errors_and_warnings.c",
+    "../tests2/95_bitfields.c",
+    # "../tests2/96_nodata_wanted.c",
+]
+
 
 def _primary_test_file(test_file):
     return test_file[0] if isinstance(test_file, (list, tuple)) else test_file
@@ -200,6 +206,68 @@ def load_expect_file(test_name):
     return lines
 
 
+def load_tagged_expect_file(test_name):
+    """Load and parse a tagged .expect file.
+
+    Returns a dict: {tag_name: {"lines": [...], "exit_code": N}}
+    Tags are identified by [tag_name] lines, exit codes by [returns N] lines.
+
+    Tag names may be either:
+    - A plain preprocessor symbol: [FOO]
+    - A valued define: [FOO=1] (will be passed as -DFOO=1)
+    """
+    test_file = Path(_primary_test_file(test_name))
+    expect_file = CURRENT_DIR / f"{test_file.parent}/{test_file.stem}.expect"
+    if not expect_file.exists():
+        raise FileNotFoundError(f"Expect file not found: {expect_file}")
+
+    tags = {}
+    current_tag = None
+    # Allow either [NAME] or [NAME=VALUE]. VALUE is captured verbatim (trimmed)
+    # up to the closing bracket so it can express things like 1, 0x10, etc.
+    tag_pattern = re.compile(r'^\[([a-zA-Z_][a-zA-Z0-9_]*)(?:=([^\]]+))?\]$')
+    returns_pattern = re.compile(r'^\[returns (\d+)\]$')
+
+    with open(expect_file, "r") as f:
+        for line in f:
+            stripped = line.rstrip('\n')
+
+            # Check for tag marker
+            tag_match = tag_pattern.match(stripped)
+            if tag_match:
+                name = tag_match.group(1)
+                value = tag_match.group(2)
+                if value is not None:
+                    value = value.strip()
+                    current_tag = f"{name}={value}"
+                else:
+                    current_tag = name
+                tags[current_tag] = {"lines": [], "exit_code": 0}
+                continue
+
+            # Check for returns marker
+            returns_match = returns_pattern.match(stripped)
+            if returns_match and current_tag:
+                tags[current_tag]["exit_code"] = int(returns_match.group(1))
+                continue
+
+            # Add line to current tag
+            if current_tag and stripped:
+                tags[current_tag]["lines"].append(stripped)
+
+    return tags
+
+
+def _sanitize_tag_for_filename(tag: str) -> str:
+        """Make a tag safe to use in filenames/output suffixes.
+
+        Examples:
+            "test_var_2" -> "test_var_2"
+            "TEST=1"     -> "TEST_1"
+        """
+        return re.sub(r"[^a-zA-Z0-9_]+", "_", tag).strip("_")
+
+
 def _strip_compiler_output(expected_lines, loglines):
     """Remove compiler output from the expectation list."""
     sanitized = expected_lines.copy()
@@ -220,9 +288,9 @@ def _escape_regex(line):
     return re.escape(line)
 
 
-def _run_qemu_test(test_file, expected_exit_code, args=None):
+def _run_qemu_test(test_file, expected_exit_code, args=None, defines=None):
     expected_lines = load_expect_file(test_file)
-    sut, loglines = run_test(test_file, MACHINE, args)
+    sut, loglines = run_test(test_file, MACHINE, args, defines=defines)
     expected_lines = _strip_compiler_output(expected_lines, loglines)
     try:
         for line in expected_lines:
@@ -232,6 +300,77 @@ def _run_qemu_test(test_file, expected_exit_code, args=None):
         assert sut.exitstatus == expected_exit_code, f"Expected exit code {expected_exit_code}, got {sut.exitstatus}"
     except Exception as e:
         raise AssertionError(f"Test failed for {test_file}: {e}") from e
+    finally:
+        sut.logfile.close()
+
+
+def _run_tagged_qemu_test(test_file, tag, expected_lines, expected_exit_code):
+    """Run a tagged test with specific define and expected output.
+
+    Tagged tests may either:
+    1. Fail to compile (expected compiler errors/warnings)
+    2. Compile successfully and run with expected exit code and/or output
+    3. Compile with warnings and run with expected output
+    """
+    test_files = [CURRENT_DIR / Path(test_file)]
+    safe_tag = _sanitize_tag_for_filename(tag)
+    config = CompileConfig(defines=[tag], output_suffix=f"_{safe_tag}")
+    test_name = Path(test_file).stem
+
+    result = compile_testcase(test_files, MACHINE, config=config)
+
+    # Write log file with compiler command and output
+    log_path = f"{CURRENT_DIR}/build/{test_name}_{safe_tag}_output.log"
+    with open(log_path, "w") as log_file:
+        log_file.write(f"=== Compile: {test_file} with -D{tag} ===\n")
+        if result.make_command:
+            log_file.write(f"=== Make command: {' '.join(result.make_command)} ===\n")
+        log_file.write(f"=== Compiler output ===\n")
+        for line in result.output_lines:
+            log_file.write(line + "\n")
+        log_file.write(f"=== Success: {result.success} ===\n\n")
+
+    compiler_output = "\n".join(result.output_lines)
+
+    # Separate expected lines into compile-time and runtime
+    # Compile-time lines typically contain the source filename
+    source_basename = Path(test_file).name
+    compile_expected = []
+    runtime_expected = []
+    for line in expected_lines:
+        if line and source_basename in line:
+            compile_expected.append(line)
+        else:
+            runtime_expected.append(line)
+
+    # Verify compile-time expected lines in compiler output
+    for line in compile_expected:
+        if line and line not in compiler_output:
+            raise AssertionError(
+                f"Expected compile-time line not found for {test_file} [{tag}]:\n"
+                f"Expected: {line}\n"
+                f"Got:\n{compiler_output}"
+            )
+
+    # If compilation failed, we're done (compile error tests)
+    if not result.success:
+        return
+
+    # Compilation succeeded - run the test
+    sut = prepare_test(MACHINE, result.elf_file)
+    log_file = open(log_path, "ab")  # Append runtime output
+    log_file.write(b"=== Runtime output ===\n")
+    sut.logfile = log_file
+
+    try:
+        # Match expected runtime output
+        for line in runtime_expected:
+            if line is not None:
+                sut.expect(_escape_regex(line), timeout=1)
+        sut.wait()
+        assert sut.exitstatus == expected_exit_code, f"Expected exit code {expected_exit_code}, got {sut.exitstatus}"
+    except Exception as e:
+        raise AssertionError(f"Test failed for {test_file} [{tag}]: {e}") from e
     finally:
         sut.logfile.close()
 
@@ -256,3 +395,32 @@ def test_qemu_execution_with_args(test_file, args, expected_exit_code):
 
     _run_qemu_test(test_file, expected_exit_code, args=args)
 
+
+def _generate_tagged_test_params():
+    """Generate test parameters for all tagged tests.
+
+    Tags are auto-discovered from the .expect file.
+    """
+    params = []
+    ids = []
+    for test_file in TAGGED_TEST_FILES:
+        tag_data = load_tagged_expect_file(test_file)
+        for tag, data in tag_data.items():
+            params.append((test_file, tag, data["lines"], data["exit_code"]))
+            ids.append(f"{_test_id(test_file)}[{tag}]")
+    return params, ids
+
+
+_TAGGED_PARAMS, _TAGGED_IDS = _generate_tagged_test_params() if TAGGED_TEST_FILES else ([], [])
+
+
+@pytest.mark.parametrize(
+    "test_file,tag,expected_lines,expected_exit_code",
+    _TAGGED_PARAMS,
+    ids=_TAGGED_IDS,
+)
+def test_qemu_tagged_execution(test_file, tag, expected_lines, expected_exit_code):
+    if test_file is None:
+        pytest.fail("test_file is None")
+
+    _run_tagged_qemu_test(test_file, tag, expected_lines, expected_exit_code)
