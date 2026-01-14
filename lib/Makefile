@@ -48,7 +48,7 @@ OSX_O =
 
 # ARM Floating Point Library Objects
 # Built from lib/fp/ directory for different FPU configurations
-ARM_FP_O = armeabi.o
+ARM_FP_O = armeabi.o armeabi_divmod.o
 
 # backtrace/bcheck/run only for native compiler
 Nat = $(if $X,no,)
@@ -76,7 +76,7 @@ OBJ-arm-vfp = $(OBJ-arm)
 OBJ-arm-eabi = $(OBJ-arm)
 OBJ-arm-eabihf = $(OBJ-arm)
 OBJ-arm-wince = $(ARM_O) $(WIN_O)
-OBJ-armv8m = alloca.o armeabi.o
+OBJ-armv8m = alloca.o armeabi.o armeabi_divmod.o
 OBJ-riscv64 = $(RISCV64_O) $(LIN_O)
 
 OBJ-extra = $(filter $(EXTRA_O),$(OBJ-$T))

@@ -767,6 +767,11 @@ struct TCCState
   unsigned char opt_redundant_store; /* -fredundant-store-elim: redundant store elimination */
   unsigned char opt_dead_store;      /* -fdead-store-elim: dead store elimination */
 
+#ifdef CONFIG_TCC_DEBUG
+  /* Debug-only runtime features */
+  unsigned char dump_ir; /* -dump-ir: print IR (pre/post opts) to stdout */
+#endif
+
   /* use GNU C extensions */
   unsigned char gnu_ext;
   /* use TinyCC extensions */

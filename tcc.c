@@ -73,6 +73,9 @@ static const char help[] = "Tiny C Compiler " TCC_VERSION " - Copyright (C) 2001
                            "  -M[M]D       generate make dependency file [ignore system files]\n"
                            "  -M[M]        as above but no other output\n"
                            "  -MF file     specify dependency file name\n"
+#ifdef CONFIG_TCC_DEBUG
+                           "  -dump-ir     dump IR (pre/post optimizations)\n"
+#endif
 #if defined(TCC_TARGET_I386) || defined(TCC_TARGET_X86_64)
                            "  -m32/64      defer to i386/x86_64 cross compiler\n"
 #endif

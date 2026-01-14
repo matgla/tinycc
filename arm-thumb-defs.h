@@ -151,9 +151,9 @@ enum
 /* Token definitions for EABI */
 #ifdef TCC_ARM_EABI
 #define TOK___divdi3 TOK___aeabi_ldivmod
-#define TOK___moddi3 TOK___aeabi_ldivmod
+#define TOK___moddi3 TOK___aeabi_lmod
 #define TOK___udivdi3 TOK___aeabi_uldivmod
-#define TOK___umoddi3 TOK___aeabi_uldivmod
+#define TOK___umoddi3 TOK___aeabi_ulmod
 #endif
 
 /* Forward declarations */
@@ -211,9 +211,8 @@ typedef struct SValue SValue;
 ST_FUNC void thumb_free_call_sites(void);
 ST_FUNC ThumbGenCallSite *thumb_get_or_create_call_site(int call_id);
 ST_FUNC ThumbGenCallSite *thumb_get_call_site_for_id(int call_id);
-ST_FUNC int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id,
-                                              int argc_hint, TCCAbiCallLayout *layout,
-                                              SValue **out_args);
+ST_FUNC int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, int argc_hint,
+                                            TCCAbiCallLayout *layout, SValue **out_args);
 
 ST_FUNC void g(int c);
 ST_FUNC void gen_le16(int c);

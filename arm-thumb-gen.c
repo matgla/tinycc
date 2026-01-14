@@ -2045,7 +2045,15 @@ void store(int r, SValue *sv)
            */
           int r_high = sv->pr1;
           if (r_high == PREG_NONE)
-            tcc_error("compiler_error: cannot store double - missing source high register (sv->pr1)");
+          {
+            /* Legacy (non-IR) backend paths may still call store() with only
+             * the low register. In that case, assume a conventional register
+             * pair (low=r, high=r+1). */
+            if (thumb_is_hw_reg(r) && thumb_is_hw_reg(r + 1) && (r + 1) != R_SP && (r + 1) != R_PC)
+              r_high = r + 1;
+            else
+              tcc_error("compiler_error: cannot store double - missing source high register (sv->pr1)");
+          }
           thumb_require_materialized_reg("store", "src.high", r_high);
           if (r_high == R_SP || r_high == R_PC)
             tcc_error("compiler_error: cannot store double - invalid source high register %d", r_high);
@@ -2071,7 +2079,14 @@ void store(int r, SValue *sv)
       /* Long long - store both low and high words */
       int r_high = sv->pr1;
       if (r_high == PREG_NONE)
-        tcc_error("compiler_error: cannot store llong - missing source high register (sv->pr1)");
+      {
+        /* Legacy (non-IR) backend paths may still call store() with only the
+         * low register. Assume the value is in a register pair (r, r+1). */
+        if (thumb_is_hw_reg(r) && thumb_is_hw_reg(r + 1) && (r + 1) != R_SP && (r + 1) != R_PC)
+          r_high = r + 1;
+        else
+          tcc_error("compiler_error: cannot store llong - missing source high register (sv->pr1)");
+      }
       thumb_require_materialized_reg("store", "src.high", r_high);
       if (r_high == R_SP || r_high == R_PC)
         tcc_error("compiler_error: cannot store llong - invalid source high register %d", r_high);
@@ -5301,13 +5316,25 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
     while (move_count > 0)
     {
       uint32_t dst_mask = 0;
+      uint32_t src_mask = 0;
       for (int i = 0; i < move_count; ++i)
       {
         if (moves[i].dst >= 0 && moves[i].dst < 32)
           dst_mask |= (1u << moves[i].dst);
+        if (moves[i].src >= 0 && moves[i].src < 32)
+          src_mask |= (1u << moves[i].src);
       }
 
-      /* First: emit all acyclic moves. */
+      /* First: emit all acyclic moves.
+       *
+       * A move is safe to emit if its destination is not used as a source by
+       * any remaining move. This prevents clobbering values needed later.
+       *
+       * Example chain that must be ordered correctly:
+       *   r1 <- r2
+       *   r2 <- r3
+       * Here r2 is both a source and a destination. We must emit r1<-r2 first.
+       */
       int progressed = 0;
       for (int i = 0; i < move_count; ++i)
       {
@@ -5322,8 +5349,8 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
           continue;
         }
 
-        if (src >= 0 && src < 32 && (dst_mask & (1u << src)))
-          continue; /* src is still needed as a destination somewhere */
+        if (dst >= 0 && dst < 32 && (src_mask & (1u << dst)))
+          continue; /* dst's current value is still needed as a source somewhere */
 
         ot_check(
             th_mov_reg(dst, src, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
@@ -5443,13 +5470,12 @@ ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *op)
   int use_vfp_regs = (tcc_state->float_abi == ARM_HARD_FLOAT);
   int dest_is_vfp = use_vfp_regs && LS_IS_VFP_REG(op->dest.pr0);
   int src_is_vfp = use_vfp_regs && LS_IS_VFP_REG(op->src1.pr0);
-  /* Check both dest and src1 types for 64-bit detection - includes double,
-   * ldouble, and llong. Dest may not have proper type info when assigning
-   * from a 64-bit source */
-  int dest_btype = op->dest.type.t & VT_BTYPE;
-  int src_btype = op->src1.type.t & VT_BTYPE;
-  int is_64bit = (dest_btype == VT_DOUBLE) || (dest_btype == VT_LDOUBLE) || (dest_btype == VT_LLONG) ||
-                 (src_btype == VT_DOUBLE) || (src_btype == VT_LDOUBLE) || (src_btype == VT_LLONG);
+  /* For ASSIGN, the destination type defines the operation width.
+   * A 64-bit->32-bit assignment is a narrowing conversion (low word only).
+   * Treating it as a 64-bit move can try to write a non-existent high reg
+   * (often PREG_NONE=0xFF), which encodes as PC and generates invalid code.
+   */
+  const int dest_is_64bit = is_64bit_type(op->dest.type.t);
   int dest_is_local = (op->dest.r & VT_VALMASK) == VT_LOCAL;
 
   /* NOTE: Avoid noisy debug prints in normal builds. */
@@ -5458,7 +5484,7 @@ ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *op)
    * tcc_ir_generate_code() before we get here, so src1/dest already name
    * concrete registers or true memory lvalues. */
 
-  if (is_64bit)
+  if (dest_is_64bit)
   {
     /* 64-bit assign/move must preserve both low and high words.
      * This is critical for switch-range lowering which spills 64-bit
@@ -5550,7 +5576,7 @@ ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *op)
   {
     /* Pure constant (not a memory dereference). Use machine API directly. */
     Sym *sym = (op->src1.r & VT_SYM) ? op->src1.sym : NULL;
-    int is_64bit = tcc_is_64bit_operand(&op->src1);
+    int is_64bit = dest_is_64bit;
 
     if (dest_is_vfp)
     {
@@ -5606,7 +5632,7 @@ ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *op)
     }
     else
     {
-      load_to_reg(op->dest.pr0, op->dest.pr1, &op->src1);
+      load_to_reg(op->dest.pr0, dest_is_64bit ? op->dest.pr1 : PREG_NONE, &op->src1);
     }
     return;
   }

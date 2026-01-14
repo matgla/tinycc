@@ -385,8 +385,8 @@ int tcc_ls_assign_register_pair(LSLiveIntervalState *ls, int *r0_out, int *r1_ou
         (tcc_state->registers_map_for_allocator & ((uint64_t)1 << (reg + 1))) &&
         (ls->registers_map & ((uint64_t)1 << reg)) && (ls->registers_map & ((uint64_t)1 << (reg + 1))))
     {
-      /* Skip R12:R13 - R13 is SP */
-      if (reg + 1 == 13)
+      /* Skip any pair touching SP (R13) or PC (R15). */
+      if (reg == 13 || reg == 15 || (reg + 1) == 13 || (reg + 1) == 15)
         continue;
       /* Allocate both */
       ls->registers_map &= ~((uint64_t)1 << reg);
@@ -437,8 +437,9 @@ int tcc_ls_assign_callee_saved_register_pair(LSLiveIntervalState *ls, int *r0_ou
         (tcc_state->registers_map_for_allocator & ((uint64_t)1 << (reg + 1))) &&
         (ls->registers_map & ((uint64_t)1 << reg)) && (ls->registers_map & ((uint64_t)1 << (reg + 1))))
     {
-      if (reg + 1 == 13)
-        continue; /* Skip R12:R13 */
+      /* Skip any pair touching SP (R13) or PC (R15). */
+      if (reg == 13 || reg == 15 || (reg + 1) == 13 || (reg + 1) == 15)
+        continue;
       ls->registers_map &= ~((uint64_t)1 << reg);
       ls->registers_map &= ~((uint64_t)1 << (reg + 1));
       ls->dirty_registers |= ((uint64_t)1 << reg);

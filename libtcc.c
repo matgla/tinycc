@@ -1434,6 +1434,9 @@ enum
   TCC_OPTION_fpic,
   TCC_OPTION_fpie,
   TCC_OPTION_T,
+#ifdef CONFIG_TCC_DEBUG
+  TCC_OPTION_dump_ir,
+#endif
 };
 
 #define TCC_OPTION_HAS_ARG 0x0001
@@ -1458,6 +1461,10 @@ static const TCCOption tcc_options[] = {
     {"c", TCC_OPTION_c, 0},
     {"dumpmachine", TCC_OPTION_dumpmachine, 0},
     {"dumpversion", TCC_OPTION_dumpversion, 0},
+#ifdef CONFIG_TCC_DEBUG
+    /* Must appear before the short "-d" option, otherwise "-dump-ir" is parsed as "-d ump-ir". */
+    {"dump-ir", TCC_OPTION_dump_ir, 0},
+#endif
     {"d", TCC_OPTION_d, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP},
     {"static", TCC_OPTION_static, 0},
     {"std", TCC_OPTION_std, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP},
@@ -2040,6 +2047,11 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
       }
       s->linker_script = tcc_strdup(optarg);
       break;
+#ifdef CONFIG_TCC_DEBUG
+    case TCC_OPTION_dump_ir:
+      s->dump_ir = 1;
+      break;
+#endif
     case TCC_OPTION_print_search_dirs:
       x = OPT_PRINT_DIRS;
       goto extra_action;

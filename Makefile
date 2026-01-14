@@ -24,6 +24,12 @@ CFLAGS += $(CPPFLAGS) -std=c11 -Wno-unused-function -Wno-declaration-after-state
 VPATH = $(TOPSRC) $(TOPSRC)/arch
 -LTCC = $(TOP)/$(LIBTCC)
 
+# Enable extra runtime-debug features (not for release builds).
+# This is intentionally controlled by configure's --debug (CONFIG_debug=yes).
+ifeq ($(CONFIG_debug),yes)
+ CFLAGS += -DCONFIG_TCC_DEBUG
+endif
+
 ifdef CONFIG_WIN32
  CFG = -win
  ifneq ($(CONFIG_static),yes)
@@ -148,6 +154,15 @@ FP_LIBS_STAMP_DIR = $(TOP)/lib/fp/build
 FP_LIBS_SRC_DEPS = $(shell find $(TOP)/lib/fp -type f \( -name 'Makefile' -o -name '*.[chS]' \) -print 2>/dev/null)
 FP_LIBS_CROSS = $(foreach X,$(TCC_X),$(FP_LIBS_STAMP_DIR)/.$X-fp-libs.stamp)
 
+# When TinyCC itself is built with ASan, leak detection (LSan) may cause
+# the compiler process to exit non-zero on teardown, breaking recursive
+# builds that invoke the freshly built compiler (e.g. fp-libs).
+# Disable leak detection for those nested invocations so the build can
+# proceed while still keeping ASan instrumentation.
+ifeq ($(CONFIG_asan),yes)
+SAN_ENV = LSAN_OPTIONS=detect_leaks=0 ASAN_OPTIONS=detect_leaks=0
+endif
+
 
 PROGS_CROSS = $(foreach X,$(TCC_X),$X-tcc$(EXESUF))
 LIBTCC1_CROSS = $(foreach X,$(LIBTCC1_X),$X-libtcc1.a)
@@ -166,7 +181,7 @@ fp-libs: $(FP_LIBS_CROSS)
 
 $(FP_LIBS_STAMP_DIR)/.%-fp-libs.stamp: %-tcc$(EXESUF) $(FP_LIBS_SRC_DEPS)
 	@mkdir -p $(FP_LIBS_STAMP_DIR)
-	@$(MAKE) --no-print-directory -C lib CROSS_TARGET=$* fp-libs
+	@$(SAN_ENV) $(MAKE) --no-print-directory -C lib CROSS_TARGET=$* fp-libs
 	@touch $@
 
 install: ; @$(MAKE) --no-print-directory  install$(CFG)

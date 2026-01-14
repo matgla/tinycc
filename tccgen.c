@@ -2207,14 +2207,32 @@ ST_FUNC void lexpand(void)
       low32.type.t = VT_INT | u;
       low32.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
       low32.r = 0;
+      int old_prevent_coalescing = tcc_state->ir->prevent_coalescing;
+      tcc_state->ir->prevent_coalescing = 1;
       int low_assign_pos = tcc_ir_put(tcc_state->ir, TCCIR_OP_ASSIGN, &full, NULL, &low32);
+      tcc_state->ir->prevent_coalescing = old_prevent_coalescing;
+
+      /* IMPORTANT (IR mode): prevent ASSIGN coalescing here.
+       *
+       * lexpand splits a 64-bit value `full` into low/high 32-bit words.
+       * We still need `full` for the subsequent (full >> 32) extraction.
+       *
+       * The IR layer has an ASSIGN coalescing peephole that can rewrite the
+       * previous instruction's destination to our `low32` and drop this ASSIGN
+       * when the source is a TEMP produced by the previous instruction.
+       *
+       * That optimization is invalid for lexpand: it would make the original
+       * `full` vreg undefined for the later shift, causing codegen to read from
+       * uninitialized registers (observed as stray use of r9 in mul_s).
+       */
+      (void)low_assign_pos;
 
       /* NOTE: do not update full.vr based on this ASSIGN.
        * This instruction produces a 32-bit low word; if we overwrite full.vr
        * here, the later (full >> 32) would accidentally shift the low word,
        * yielding a zero high word and breaking 64-bit math.
        * (low_assign_pos is kept for debugging / symmetry with the earlier ASSIGN.) */
-      (void)low_assign_pos;
+      /* low_assign_pos is kept only for debugging/symmetry. */
 
       /* Bottom of stack becomes low32. */
       vtop->type.t = VT_INT | u;
@@ -10358,10 +10376,13 @@ static void gen_function(Sym *sym)
   /* Backpatch all return jumps to point to the epilogue (past the end of IR) */
   tcc_ir_backpatch_to_here(ir, rsym);
 
-#ifdef DEBUG_IR_GEN
-  printf("=== IR BEFORE OPTIMIZATIONS ===\n");
-  tcc_ir_show(ir);
-  printf("=== END IR BEFORE OPTIMIZATIONS ===\n");
+#ifdef CONFIG_TCC_DEBUG
+  if (tcc_state->dump_ir)
+  {
+    printf("=== IR BEFORE OPTIMIZATIONS ===\n");
+    tcc_ir_show(ir);
+    printf("=== END IR BEFORE OPTIMIZATIONS ===\n");
+  }
 #endif
 
   /* Dead code elimination - remove unreachable instructions */
@@ -10451,8 +10472,13 @@ static void gen_function(Sym *sym)
   /* Nested calls are now handled at code generation time via backward scan.
    * No IR reordering needed - saves O(n) memory allocations. */
 
-#ifdef DEBUG_IR_GEN
-  tcc_ir_show(ir);
+#ifdef CONFIG_TCC_DEBUG
+  if (tcc_state->dump_ir)
+  {
+    printf("=== IR AFTER OPTIMIZATIONS ===\n");
+    tcc_ir_show(ir);
+    printf("=== END IR AFTER OPTIMIZATIONS ===\n");
+  }
 #endif
   tcc_ir_liveness_analysis(ir);
 

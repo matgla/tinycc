@@ -283,6 +283,25 @@ static void udivmod_u64(uint64_div_result *out, u32 n_lo, u32 n_hi, u32 d_lo, u3
   }
 }
 
+/* Helpers for __aeabi_{u,}ldivmod wrappers.
+ *
+ * TinyCC (ARM/Thumb) currently miscompiles functions that *return* a 16-byte
+ * struct, using an implicit sret pointer, which does not match the EABI for
+ * __aeabi_{u,}ldivmod (which returns quotient in r0:r1 and remainder in r2:r3).
+ *
+ * We therefore implement the EABI entry points in assembly and call these C
+ * helpers to compute the results into memory.
+ */
+void __tcc_aeabi_uldivmod_helper(u32 n_lo, u32 n_hi, u32 d_lo, u32 d_hi, u32 *q_lo, u32 *q_hi, u32 *r_lo, u32 *r_hi)
+{
+  uint64_div_result r;
+  udivmod_u64(&r, n_lo, n_hi, d_lo, d_hi);
+  *q_lo = r.quotient_low;
+  *q_hi = r.quotient_high;
+  *r_lo = r.remainder_low;
+  *r_hi = r.remainder_high;
+}
+
 /* Type definitions for 64-bit operations */
 typedef unsigned int Wtype;
 typedef long long DWtype;
@@ -299,43 +318,13 @@ typedef union
   DWtype ll;
 } DWunion;
 
-uint64_div_result __aeabi_uldivmod(unsigned long long numerator, unsigned long long denominator)
-{
-  DWunion nn, dd;
-  nn.ll = (UDWtype)numerator;
-  dd.ll = (UDWtype)denominator;
-  uint64_div_result r;
-  udivmod_u64(&r, nn.s.low, nn.s.high, dd.s.low, dd.s.high);
-  return r;
-}
-
-/* 64-bit signed division/modulus (quotient in r0:r1, remainder in r2:r3). */
-typedef struct
-{
-  u32 quotient_low;
-  s32 quotient_high;
-  u32 remainder_low;
-  s32 remainder_high;
-} int64_div_result;
-
 static inline void u64_neg(u32 *lo, u32 *hi)
 {
   *lo = ~(*lo) + 1u;
   *hi = ~(*hi) + (*lo == 0);
 }
 
-/* 64-bit signed division/modulus (quotient in r0:r1, remainder in r2:r3).
- * IMPORTANT: This function receives parameters in registers per EABI:
- *   r0 = numerator low, r1 = numerator high
- *   r2 = denominator low, r3 = denominator high
- * And must return:
- *   r0 = quotient low, r1 = quotient high
- *   r2 = remainder low, r3 = remainder high
- *
- * We cannot use normal C calling convention because that would pass/return via stack.
- * Solution: Use explicit assembly or trust that TinyCC handles __aeabi_* specially.
- */
-int64_div_result __aeabi_ldivmod(unsigned int n_lo, int n_hi, unsigned int d_lo, int d_hi)
+void __tcc_aeabi_ldivmod_helper(u32 n_lo, s32 n_hi, u32 d_lo, s32 d_hi, u32 *q_lo, u32 *q_hi, u32 *r_lo, u32 *r_hi)
 {
   int q_neg = 0;
   int r_neg = 0;
@@ -360,45 +349,15 @@ int64_div_result __aeabi_ldivmod(unsigned int n_lo, int n_hi, unsigned int d_lo,
   uint64_div_result ur;
   udivmod_u64(&ur, un_lo, un_hi, ud_lo, ud_hi);
 
-  u32 qlo = ur.quotient_low;
-  u32 qhi = ur.quotient_high;
-  u32 rlo = ur.remainder_low;
-  u32 rhi = ur.remainder_high;
-
   if (q_neg)
-    u64_neg(&qlo, &qhi);
+    u64_neg(&ur.quotient_low, &ur.quotient_high);
   if (r_neg)
-    u64_neg(&rlo, &rhi);
+    u64_neg(&ur.remainder_low, &ur.remainder_high);
 
-  int64_div_result out;
-  out.quotient_low = qlo;
-  out.quotient_high = (s32)qhi;
-  out.remainder_low = rlo;
-  out.remainder_high = (s32)rhi;
-  return out;
-}
-
-/* Unsigned 64-bit divide and return remainder */
-unsigned long long __aeabi_ulmod(unsigned long long a, unsigned long long b)
-{
-  uint64_div_result r = __aeabi_uldivmod(a, b);
-  DWunion rr;
-  rr.s.low = r.remainder_low;
-  rr.s.high = r.remainder_high;
-  return rr.ll;
-}
-
-/* Signed 64-bit divide and return remainder */
-long long __aeabi_lmod(long long a, long long b)
-{
-  DWunion aa, bb;
-  aa.ll = a;
-  bb.ll = b;
-  int64_div_result r = __aeabi_ldivmod(aa.s.low, aa.s.high, bb.s.low, bb.s.high);
-  DWunion rr;
-  rr.s.low = r.remainder_low;
-  rr.s.high = r.remainder_high;
-  return rr.ll;
+  *q_lo = ur.quotient_low;
+  *q_hi = ur.quotient_high;
+  *r_lo = ur.remainder_low;
+  *r_hi = ur.remainder_high;
 }
 
 /* 64-bit comparison functions */
