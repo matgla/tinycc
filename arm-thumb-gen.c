@@ -3209,7 +3209,15 @@ static void thumb_prepare_dest_pair_for_64bit_op(const char *ctx, SValue *dest, 
   *store_low = false;
   *store_high = false;
 
-  if (thumb_is_hw_reg(*rd_low))
+  /* If the chosen destination register overlaps with an excluded register
+   * (typically a live source operand), do not write the result in-place.
+   * Materialize into scratch and store back afterward.
+   *
+   * This matters for ops like UMULL and 64-bit shifts where the machine
+   * instruction sequence expects sources to remain intact while producing
+   * a 64-bit result.
+   */
+  if (thumb_is_hw_reg(*rd_low) && ((*exclude_mask & (1u << *rd_low)) == 0))
   {
     thumb_require_materialized_reg(ctx, "dest.low", *rd_low);
     *exclude_mask |= (1u << *rd_low);
@@ -3222,7 +3230,7 @@ static void thumb_prepare_dest_pair_for_64bit_op(const char *ctx, SValue *dest, 
     *exclude_mask |= (1u << *rd_low);
   }
 
-  if (thumb_is_hw_reg(*rd_high))
+  if (thumb_is_hw_reg(*rd_high) && ((*exclude_mask & (1u << *rd_high)) == 0))
   {
     thumb_require_materialized_reg(ctx, "dest.high", *rd_high);
     *exclude_mask |= (1u << *rd_high);

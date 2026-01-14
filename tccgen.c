@@ -2165,8 +2165,65 @@ ST_FUNC void lexpand(void)
   }
   else if (v == (VT_LVAL | VT_CONST) || v == (VT_LVAL | VT_LOCAL))
   {
-    vdup();
-    vtop[0].c.i += 4;
+    /* For IR mode, we need to generate explicit load operations */
+    if (tcc_state->ir)
+    {
+      /* Load the full 64-bit value first, then split it */
+      SValue full;
+      SValue low32;
+      SValue shifted64;
+      SValue shift_amt;
+
+      memset(&full, 0, sizeof(full));
+      full.type.t = vtop->type.t;
+      full.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+      full.r = 0;
+
+      /* Force load of the 64-bit value */
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_ASSIGN, vtop, NULL, &full);
+
+      /* Create explicit low32 = (uint32_t)full. */
+      memset(&low32, 0, sizeof(low32));
+      low32.type.t = VT_INT | u;
+      low32.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+      low32.r = 0;
+      int old_prevent_coalescing = tcc_state->ir->prevent_coalescing;
+      tcc_state->ir->prevent_coalescing = 1;
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_ASSIGN, &full, NULL, &low32);
+      tcc_state->ir->prevent_coalescing = old_prevent_coalescing;
+
+      /* Bottom of stack becomes low32. */
+      vtop->type.t = VT_INT | u;
+      vtop->vr = low32.vr;
+      vtop->r = 0;
+
+      /* Duplicate and turn the new top into the high32 word. */
+      vdup();
+      vtop[0].type.t = VT_INT | u;
+      vtop[0].vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+      vtop[0].r = 0;
+
+      memset(&shift_amt, 0, sizeof(shift_amt));
+      shift_amt.type.t = VT_INT;
+      shift_amt.r = VT_CONST;
+      shift_amt.c.i = 32;
+      shift_amt.vr = -1;
+
+      /* shifted64 = full >> 32 (64-bit). */
+      memset(&shifted64, 0, sizeof(shifted64));
+      shifted64.type.t = VT_LLONG | u;
+      shifted64.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+      shifted64.r = 0;
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_SHR, &full, &shift_amt, &shifted64);
+
+      /* high32 = (uint32_t)shifted64 (i.e. original high word). */
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_ASSIGN, &shifted64, NULL, &vtop[0]);
+    }
+    else
+    {
+      vdup();
+      vtop[0].c.i += 4;
+    }
   }
   else
   {
@@ -2488,6 +2545,7 @@ static void gen_opl(int op)
     /* Fall through for non-IR mode */
     /* FALLTHROUGH */
   case '*':
+    t = vtop->type.t; /* Save type for lbuild at end */
     vswap();
     lexpand();
     vrotb(3);
@@ -8333,11 +8391,14 @@ static int gcase(struct case_t **base, int len, int dsym)
       if (len == 1)   /* last case test jumps to default when false */
       {
         dsym = tcc_ir_generate_test(tcc_state->ir, 0, dsym);
-        e = 0;
+        e = -1; /* Use -1 so tcc_ir_backpatch_to_here will be a no-op */
       }
       else
       {
-        e = tcc_ir_generate_test(tcc_state->ir, 0, dsym);
+        /* Use -1 (not dsym) as target to avoid corrupting the default chain.
+         * The e jump will be backpatched independently to fall through.
+         * Using -1 ensures backpatching stops at e and doesn't follow any chain. */
+        e = tcc_ir_generate_test(tcc_state->ir, 0, -1);
       }
       vdup(), vpush64(t, p->v1);
       gen_op(TOK_GE); /* jmp to case when >= V1 */

@@ -18,6 +18,12 @@ TEST_FILES = [
     ("90_global_array_assignment.c", 0),
     ("bug_swap.c", 0),
     ("bug_partition.c", 0),
+    ("bug_llong_const.c", 0),
+    ("bug_mul_by_const.c", 0),
+    ("bug_mul_compound.c", 0),
+    ("bug_ull_mul10_loop.c", 0),
+    ("bug_ull_mul10_once.c", 0),
+    ("bug_ll_mul10_switch_min.c", 0),
     # ("test_cleanup_double.c", 0),
     ("91_const_propagation.c", 0),
     ("92_loop_invariant.c", 0),
@@ -120,7 +126,7 @@ TEST_FILES = [
     # ("../tests2/98_al_ax_extend.c", 0), # x86
     # ("../tests2/99_fastcall.c", 0), # x86
     ("../tests2/100_c99array-decls.c", 0),
-    # ("../tests2/101_cleanup.c", 0),
+    # ("../tests2/101_cleanup.c", 0), fix double support first
     ("../tests2/102_alignas.c", 0),
     ("../tests2/103_implicit_memmove.c", 0),
     (["../tests2/104_inline.c", "../tests2/104+_inline.c"], 0),
@@ -133,7 +139,7 @@ TEST_FILES = [
     # ("../tests2/115_bound_setjmp.c", 0),
     # ("../tests2/116_bound_setjmp2.c", 0),
     # ("../tests2/117_builtins.c", 0),
-    # ("../tests2/118_switch.c", 0),
+    ("../tests2/118_switch.c", 0),
     (["../tests2/120_alias.c", "../tests2/120+_alias.c"], 0),
     ("../tests2/122_vla_reuse.c", 0),
     ("../tests2/123_vla_bug.c", 0),

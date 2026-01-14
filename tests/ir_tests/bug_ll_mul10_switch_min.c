@@ -52,7 +52,7 @@ int main(void)
   /* Signed path */
   {
     long long v = 1;
-    for (i = 0; i < 8; i++)
+    for (i = 0; i < 14; i++)
     {
       U64 u;
       u.ull = (unsigned long long)v;
@@ -64,7 +64,7 @@ int main(void)
   /* Unsigned path */
   {
     unsigned long long v = 1;
-    for (i = 0; i < 8; i++)
+    for (i = 0; i < 14; i++)
     {
       U64 u;
       u.ull = v;
