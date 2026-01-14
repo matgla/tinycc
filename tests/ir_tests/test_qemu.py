@@ -32,9 +32,9 @@ TEST_FILES = [
     ("test_struct_return.c", 0),
     ("test_llong_relops.c", 0),
 
-    # ("test_llong_add_signed.c", 0),
-    # ("test_llong_add_unsigned.c", 0),
-    # ("test_llong_load_signed.c", 0),
+    ("test_llong_add_signed.c", 0),
+    ("test_llong_add_unsigned.c", 0),
+    ("test_llong_load_signed.c", 0),
     # ("test_llong_load_unsigned.c", 0),
     # ("test_llong_mul_signed.c", 0),
     # ("test_llong_mul_unsigned.c", 0),

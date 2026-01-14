@@ -115,8 +115,33 @@ Reset_Handler:
     dsb                         /* Data Synchronization Barrier */
     isb                         /* Instruction Synchronization Barrier */
 
+    /* Initialize memory before calling into C. */
+    ldr r0, =__data_load__
+    ldr r1, =__data_start__
+    ldr r2, =__data_end__
+1:
+    cmp r1, r2
+    bhs 2f
+    ldr r3, [r0], #4
+    str r3, [r1], #4
+    b 1b
+
+2:
+    ldr r0, =__bss_start__
+    ldr r1, =__bss_end__
+    movs r2, #0
+3:
+    cmp r0, r1
+    bhs 4f
+    str r2, [r0], #4
+    b 3b
+
+4:
+    /* Jump to _mainCRTStartup (from rdimon-crt0.o) which properly sets up
+       argc/argv via semihosting before calling main. */
     bl _mainCRTStartup
-    /* If main returns, loop forever */
+
+    /* If _mainCRTStartup returns (via exit), loop forever. */
 .Lloop_forever:
     b .Lloop_forever
 .size Reset_Handler, . - Reset_Handler
@@ -244,6 +269,9 @@ hf_bfar_prefix:   .asciz "BFAR="
 hf_mmfar_prefix:  .asciz "MMFAR="
 hf_0x:            .asciz "0x"
 hf_nl:            .asciz "\n"
+
+/* Re-align after variable-length strings so following Thumb code is aligned. */
+.balign 2
 
 /* Default handler for all other interrupts */
 .macro def_irq_handler handler_name

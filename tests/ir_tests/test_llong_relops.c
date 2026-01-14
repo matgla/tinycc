@@ -93,6 +93,7 @@ static int run_signed(void)
   for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i)
   {
     const s_case *c = &cases[i];
+    printf("Case %u: a=%lld b=%lld\n", i, c->a, c->b);
 
     if (check1("s ge", ge_s(c->a, c->b), c->ge))
       return 1;

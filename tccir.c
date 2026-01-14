@@ -3603,7 +3603,17 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
          * "access this stack slot" not "dereference pointer in vreg". */
         base_kind = VT_LLOCAL;
       }
-      sv->r = base_kind | need_lval | (old_r & VT_PARAM);
+      /* Only preserve VT_PARAM for stack-passed parameters (incoming_reg0 < 0).
+       * Register-passed parameters that are spilled to local stack should NOT
+       * have VT_PARAM set, because VT_PARAM causes load_to_dest to add
+       * offset_to_args (for accessing caller's argument area), but spilled
+       * register params live in the callee's local stack area (negative FP offset). */
+      int spilled_param_flag = 0;
+      if ((old_r & VT_PARAM) && interval->incoming_reg0 < 0)
+      {
+        spilled_param_flag = VT_PARAM;
+      }
+      sv->r = base_kind | need_lval | spilled_param_flag;
     }
     else if (interval->allocation.r0 != PREG_NONE)
     {

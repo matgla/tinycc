@@ -205,6 +205,12 @@ static void asm_expr_unary(TCCState *s1, ExprValue *pe)
     }
     next();
     break;
+  case '=':
+    /* GAS-style "=expr". Semantics are target-specific (e.g. ldr pseudo-op).
+       At the expression level we treat it as a no-op unary operator. */
+    next();
+    asm_expr_unary(s1, pe);
+    break;
   case '+':
     next();
     asm_expr_unary(s1, pe);

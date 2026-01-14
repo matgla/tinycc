@@ -2050,8 +2050,11 @@ void store(int r, SValue *sv)
           if (r_high == R_SP || r_high == R_PC)
             tcc_error("compiler_error: cannot store double - invalid source high register %d", r_high);
 
+          /* High word is at +4 from low word. When sign=1 (negative offset),
+           * we need to decrease abs_off to get a higher address. */
+          int hi_abs_off = sign ? (abs_off - 4) : (abs_off + 4);
           th_store32_imm_or_reg(r, base, abs_off, sign);
-          th_store32_imm_or_reg(r_high, base, abs_off + 4, sign);
+          th_store32_imm_or_reg(r_high, base, hi_abs_off, sign);
         }
       }
     }
@@ -2062,6 +2065,22 @@ void store(int r, SValue *sv)
     else if ((ft & VT_BTYPE) == VT_BYTE)
     {
       th_store8_imm_or_reg(r, base, abs_off, sign);
+    }
+    else if ((ft & VT_BTYPE) == VT_LLONG)
+    {
+      /* Long long - store both low and high words */
+      int r_high = sv->pr1;
+      if (r_high == PREG_NONE)
+        tcc_error("compiler_error: cannot store llong - missing source high register (sv->pr1)");
+      thumb_require_materialized_reg("store", "src.high", r_high);
+      if (r_high == R_SP || r_high == R_PC)
+        tcc_error("compiler_error: cannot store llong - invalid source high register %d", r_high);
+
+      /* High word is at +4 from low word. When sign=1 (negative offset),
+       * we need to decrease abs_off to get a higher address. */
+      int hi_abs_off = sign ? (abs_off - 4) : (abs_off + 4);
+      th_store32_imm_or_reg(r, base, abs_off, sign);
+      th_store32_imm_or_reg(r_high, base, hi_abs_off, sign);
     }
     else
     {
@@ -2411,21 +2430,19 @@ ST_FUNC void tcc_machine_load_constant(int dest_reg, int dest_reg_high, int64_t 
     const uint32_t hi = (uint32_t)((uint64_t)value >> 32);
 
     /* Try immediate encoding for both halves */
-    thumb_opcode o1 = th_generic_mov_imm(dest_reg, lo);
-    thumb_opcode o2 = th_generic_mov_imm(dest_reg_high, hi);
+    thumb_opcode o1 = th_generic_mov_imm(dest_reg, (int)lo);
+    thumb_opcode o2 = th_generic_mov_imm(dest_reg_high, (int)hi);
 
-    if (o1.size == 0 && o2.size == 0)
+    if (o1.size != 0 && o2.size != 0)
     {
-      /* Both need literal pool - use combined 64-bit load */
-      load_full_const(dest_reg, dest_reg_high, value, NULL);
+      /* Both can be encoded as immediates */
+      ot(o1);
+      ot(o2);
       return;
     }
 
-    /* Load each half separately */
-    if (!ot(o1))
-      load_full_const(dest_reg, PREG_NONE, lo, NULL);
-    if (!ot(o2))
-      load_full_const(dest_reg_high, PREG_NONE, hi, NULL);
+    /* At least one half needs literal pool - use combined 64-bit load */
+    load_full_const(dest_reg, dest_reg_high, value, NULL);
     return;
   }
 
@@ -6628,8 +6645,89 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
       }
       else if (is_64bit)
       {
-        /* Store 64-bit value to stack */
-        /* TODO: Implement 64-bit store */
+        /* Store 64-bit value to stack.
+         * Need to store both low and high words (little-endian: low at lower address). */
+        int lo_offset = stack_offset;
+        int hi_offset = stack_offset + 4;
+
+        if (arg->r & VT_LVAL)
+        {
+          /* Value is in memory, load both words and store to stack */
+          SValue sv_copy = *arg;
+          load_to_reg(ARM_R12, ARM_LR, &sv_copy);
+          /* R12 = low word, LR = high word */
+          if (!store_word_to_base(ARM_R12, ARM_SP, lo_offset, 0))
+          {
+            ot_check(th_push(1 << ARM_R0));
+            load_immediate(ARM_R0, lo_offset, NULL, false);
+            ot_check(th_str_reg(ARM_R12, ARM_SP, ARM_R0, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+            ot_check(th_pop(1 << ARM_R0));
+          }
+          if (!store_word_to_base(ARM_LR, ARM_SP, hi_offset, 0))
+          {
+            ot_check(th_push(1 << ARM_R0));
+            load_immediate(ARM_R0, hi_offset, NULL, false);
+            ot_check(th_str_reg(ARM_LR, ARM_SP, ARM_R0, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+            ot_check(th_pop(1 << ARM_R0));
+          }
+        }
+        else if (arg->pr0 != PREG_NONE && arg->pr1 != PREG_NONE)
+        {
+          /* Value is in register pair pr0 (low) and pr1 (high) */
+          int lo_reg = arg->pr0;
+          int hi_reg = arg->pr1;
+
+          if (!store_word_to_base(lo_reg, ARM_SP, lo_offset, 0))
+          {
+            load_immediate(ARM_R12, lo_offset, NULL, false);
+            ot_check(th_str_reg(lo_reg, ARM_SP, ARM_R12, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+          }
+          if (!store_word_to_base(hi_reg, ARM_SP, hi_offset, 0))
+          {
+            load_immediate(ARM_R12, hi_offset, NULL, false);
+            ot_check(th_str_reg(hi_reg, ARM_SP, ARM_R12, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+          }
+        }
+        else if ((arg->r & VT_VALMASK) == VT_CONST)
+        {
+          /* 64-bit constant */
+          uint32_t lo_val = (uint32_t)arg->c.i;
+          uint32_t hi_val = (uint32_t)(arg->c.i >> 32);
+
+          load_immediate(ARM_R12, lo_val, NULL, false);
+          if (!store_word_to_base(ARM_R12, ARM_SP, lo_offset, 0))
+          {
+            load_immediate(ARM_LR, lo_offset, NULL, false);
+            ot_check(th_str_reg(ARM_R12, ARM_SP, ARM_LR, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+          }
+
+          load_immediate(ARM_R12, hi_val, NULL, false);
+          if (!store_word_to_base(ARM_R12, ARM_SP, hi_offset, 0))
+          {
+            load_immediate(ARM_LR, hi_offset, NULL, false);
+            ot_check(th_str_reg(ARM_R12, ARM_SP, ARM_LR, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+          }
+        }
+        else
+        {
+          /* Fallback: use load_to_reg to get the 64-bit value into R12+LR, then store */
+          SValue sv_copy = *arg;
+          load_to_reg(ARM_R12, ARM_LR, &sv_copy);
+          if (!store_word_to_base(ARM_R12, ARM_SP, lo_offset, 0))
+          {
+            ot_check(th_push(1 << ARM_R0));
+            load_immediate(ARM_R0, lo_offset, NULL, false);
+            ot_check(th_str_reg(ARM_R12, ARM_SP, ARM_R0, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+            ot_check(th_pop(1 << ARM_R0));
+          }
+          if (!store_word_to_base(ARM_LR, ARM_SP, hi_offset, 0))
+          {
+            ot_check(th_push(1 << ARM_R0));
+            load_immediate(ARM_R0, hi_offset, NULL, false);
+            ot_check(th_str_reg(ARM_LR, ARM_SP, ARM_R0, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+            ot_check(th_pop(1 << ARM_R0));
+          }
+        }
       }
       else
       {
