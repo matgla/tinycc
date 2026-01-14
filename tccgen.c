@@ -60,8 +60,13 @@ ST_DATA int nocode_wanted;                /* no code generation wanted */
 /* no code output after unconditional jumps such as with if (0) ... */
 #define CODE_OFF_BIT 0x20000000
 #define CODE_OFF()                                                                                                     \
-  if (!nocode_wanted)                                                                                                  \
-  (nocode_wanted |= CODE_OFF_BIT)
+  do                                                                                                                   \
+  {                                                                                                                    \
+    if (!nocode_wanted)                                                                                                \
+    {                                                                                                                  \
+      nocode_wanted |= CODE_OFF_BIT;                                                                                   \
+    }                                                                                                                  \
+  } while (0)
 #define CODE_ON() (nocode_wanted &= ~CODE_OFF_BIT)
 
 /* no code output when parsing sizeof()/typeof() etc. (using nocode_wanted++/--)
@@ -4540,7 +4545,9 @@ ST_FUNC void vstore(void)
     r = vtop->r & VT_VALMASK;
     /* two word case handling :
        store second register at word + 4 (or +8 for x86-64)  */
-    if (USING_TWO_WORDS(dbt))
+    /* On 32-bit systems, doubles are 64-bit and need two-word handling like long long */
+    int is_64bit_type = USING_TWO_WORDS(dbt) || (PTR_SIZE == 4 && (dbt == VT_DOUBLE || dbt == VT_LDOUBLE));
+    if (is_64bit_type)
     {
       /* IR generation: handle long long as a single 64-bit value, and always
        * emit IR STORE/ASSIGN instead of calling the backend store() twice.
@@ -7469,6 +7476,13 @@ tok_next:
         arch_transfer_ret_regs(1);
 #endif
       }
+      else if (ret_nregs == 0)
+      {
+        /* Struct returned via sret pointer: the callee already wrote to the
+         * sret buffer. Just push the buffer location as an lvalue. */
+        vsetc(&ret.type, ret.r, &ret.c);
+        /* Do NOT set vtop->vr = return_vreg - there's no return register for sret */
+      }
       else
       {
         /* return value */
@@ -8585,13 +8599,16 @@ again:
       dest.c.i = -1; /* Will be patched to end of else block */
       d = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
       tcc_ir_backpatch_to_here(tcc_state->ir, a);
+      CODE_ON(); /* Code after if-branch is reachable via else path */
       next();
       block(0);
       tcc_ir_backpatch_to_here(tcc_state->ir, d);
+      CODE_ON(); /* Code after if-else is reachable from both paths */
     }
     else
     {
       tcc_ir_backpatch_to_here(tcc_state->ir, a);
+      CODE_ON(); /* Code after if is reachable when condition is false */
     }
     prev_scope_s(&o);
   }
@@ -9979,7 +9996,9 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has
   }
 
   if (!v && NODATA_WANTED)
+  {
     size = 0, align = 1;
+  }
 
   if ((r & VT_VALMASK) == VT_LOCAL)
   {

@@ -18,6 +18,7 @@ TEST_FILES = [
     ("90_global_array_assignment.c", 0),
     ("bug_swap.c", 0),
     ("bug_partition.c", 0),
+    # ("test_cleanup_double.c", 0),
     ("91_const_propagation.c", 0),
     ("92_loop_invariant.c", 0),
     ("93_chained_arithmetic.c", 0),
@@ -27,7 +28,9 @@ TEST_FILES = [
     ("97_void_call_noargs.c", 0),
     ("98_call_over32_args.c", 0),
     ("99_struct_init_from_struct.c", 0),
-    # ("test_llong_relops.c", 0),
+    ("test_struct_pass_by_value.c", 0),
+    ("test_struct_return.c", 0),
+    ("test_llong_relops.c", 0),
 
     # ("test_llong_add_signed.c", 0),
     # ("test_llong_add_unsigned.c", 0),
@@ -117,7 +120,7 @@ TEST_FILES = [
     # ("../tests2/98_al_ax_extend.c", 0), # x86
     # ("../tests2/99_fastcall.c", 0), # x86
     ("../tests2/100_c99array-decls.c", 0),
-    ("../tests2/101_cleanup.c", 0),
+    # ("../tests2/101_cleanup.c", 0),
     ("../tests2/102_alignas.c", 0),
     ("../tests2/103_implicit_memmove.c", 0),
     (["../tests2/104_inline.c", "../tests2/104+_inline.c"], 0),

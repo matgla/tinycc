@@ -2327,10 +2327,15 @@ int load_short_from_base(int ir, int base, int fc, int sign)
   return ot(ins);
 }
 
-ST_FUNC void tcc_machine_addr_of_stack_slot(int dest_reg, int frame_offset)
+ST_FUNC void tcc_machine_addr_of_stack_slot(int dest_reg, int frame_offset, int is_param)
 {
   if (dest_reg == PREG_NONE)
     tcc_error("compiler_error: addr_of_stack_slot requires a destination register");
+
+  /* Stack parameters live above the saved-register area.
+   * When computing their address, fold in offset_to_args (prologue push size). */
+  if (is_param)
+    frame_offset += offset_to_args;
 
   const int base_reg = tcc_state->need_frame_pointer ? R_FP : R_SP;
 
@@ -5668,14 +5673,6 @@ ST_FUNC void tcc_gen_machine_lea_op(TACQuadruple *op)
      * When computing their address, fold in offset_to_args (prologue push size). */
     if (op->src1.r & VT_PARAM)
       offset += offset_to_args;
-    /* Stack parameters live above the saved-register area.
-     * When computing their address, fold in offset_to_args (prologue push size). */
-    if (op->src1.r & VT_PARAM)
-      offset += offset_to_args;
-    /* Stack parameters live above the saved-register area.
-     * When computing their address, fold in offset_to_args (prologue push size). */
-    if (op->src1.r & VT_PARAM)
-      offset += offset_to_args;
     int sign = (offset < 0);
     int abs_offset = sign ? -offset : offset;
 
@@ -6135,19 +6132,22 @@ typedef enum ThumbArgMoveKind
   THUMB_ARG_MOVE_IMM64,      /* load 64-bit immediate into register pair */
   THUMB_ARG_MOVE_LOCAL_ADDR, /* compute address of local: fp + offset */
   THUMB_ARG_MOVE_LVAL,       /* load from memory (lvalue) */
+  THUMB_ARG_MOVE_STRUCT,     /* load struct words into consecutive registers */
 } ThumbArgMoveKind;
 
 typedef struct ThumbArgMove
 {
   ThumbArgMoveKind kind;
   int dst_reg;
-  int dst_reg_hi;   /* valid when kind==THUMB_ARG_MOVE_IMM64 */
-  int src_reg;      /* valid when kind==THUMB_ARG_MOVE_REG */
-  uint32_t imm;     /* valid when kind==THUMB_ARG_MOVE_IMM */
-  uint64_t imm64;   /* valid when kind==THUMB_ARG_MOVE_IMM64 */
-  Sym *sym;         /* valid when kind==THUMB_ARG_MOVE_IMM */
-  int local_offset; /* valid when kind==THUMB_ARG_MOVE_LOCAL_ADDR */
-  SValue lval_sv;   /* valid when kind==THUMB_ARG_MOVE_LVAL */
+  int dst_reg_hi;        /* valid when kind==THUMB_ARG_MOVE_IMM64 */
+  int src_reg;           /* valid when kind==THUMB_ARG_MOVE_REG */
+  uint32_t imm;          /* valid when kind==THUMB_ARG_MOVE_IMM */
+  uint64_t imm64;        /* valid when kind==THUMB_ARG_MOVE_IMM64 */
+  Sym *sym;              /* valid when kind==THUMB_ARG_MOVE_IMM */
+  int local_offset;      /* valid when kind==THUMB_ARG_MOVE_LOCAL_ADDR */
+  int local_is_param;    /* valid when kind==THUMB_ARG_MOVE_LOCAL_ADDR - if true, add offset_to_args */
+  SValue lval_sv;        /* valid when kind==THUMB_ARG_MOVE_LVAL */
+  int struct_word_count; /* valid when kind==THUMB_ARG_MOVE_STRUCT */
 } ThumbArgMove;
 
 static void thumb_emit_arg_move(const ThumbArgMove *m)
@@ -6164,7 +6164,7 @@ static void thumb_emit_arg_move(const ThumbArgMove *m)
   if (m->kind == THUMB_ARG_MOVE_LOCAL_ADDR)
   {
     /* Compute address of local variable: dst = fp + offset */
-    tcc_machine_addr_of_stack_slot(m->dst_reg, m->local_offset);
+    tcc_machine_addr_of_stack_slot(m->dst_reg, m->local_offset, m->local_is_param);
     return;
   }
 
@@ -6172,7 +6172,69 @@ static void thumb_emit_arg_move(const ThumbArgMove *m)
   {
     /* Load value from memory (lvalue) */
     SValue sv_copy = m->lval_sv;
-    load_to_reg(m->dst_reg, PREG_NONE, &sv_copy);
+    /* Use dst_reg_hi for 64-bit types (double, long long) */
+    int hi_reg = (tcc_is_64bit_type(sv_copy.type.t) && m->dst_reg_hi != 0) ? m->dst_reg_hi : PREG_NONE;
+    load_to_reg(m->dst_reg, hi_reg, &sv_copy);
+    return;
+  }
+
+  if (m->kind == THUMB_ARG_MOVE_STRUCT)
+  {
+    /* Load struct words into consecutive registers.
+     * The lval_sv contains the struct address. */
+    SValue sv_copy = m->lval_sv;
+    int word_count = m->struct_word_count;
+    int base_dst = m->dst_reg;
+
+    /* Get the struct base address into a scratch register */
+    int base_addr_reg = ARM_R12;
+
+    if ((sv_copy.r & VT_VALMASK) == VT_LOCAL)
+    {
+      /* Local struct - compute FP + offset */
+      int local_off = (int)sv_copy.c.i;
+      int is_param = (sv_copy.r & VT_PARAM) ? 1 : 0;
+      tcc_machine_addr_of_stack_slot(base_addr_reg, local_off, is_param);
+    }
+    else if ((sv_copy.r & VT_VALMASK) == VT_CONST && (sv_copy.r & VT_SYM))
+    {
+      /* Global struct */
+      load_immediate(base_addr_reg, (uint32_t)sv_copy.c.i, sv_copy.sym, false);
+    }
+    else if (sv_copy.pr0 != PREG_NONE && !(sv_copy.pr0 & PREG_SPILLED))
+    {
+      /* Address already in a register */
+      base_addr_reg = sv_copy.pr0;
+    }
+    else
+    {
+      /* Fallback: try to compute struct address */
+      SValue addr_sv = sv_copy;
+      addr_sv.r &= ~VT_LVAL; /* we want the address, not the value */
+      load_to_reg(base_addr_reg, PREG_NONE, &addr_sv);
+    }
+
+    /* Load each word from the struct into consecutive target registers */
+    for (int w = 0; w < word_count; ++w)
+    {
+      int dst = base_dst + w;
+      int offset = w * 4;
+      if (!load_word_from_base(dst, base_addr_reg, offset, 0))
+      {
+        /* Large offset - use R12 as scratch if it's not our base */
+        if (base_addr_reg != ARM_R12)
+        {
+          load_immediate(ARM_R12, offset, NULL, false);
+          ot_check(th_ldr_reg(dst, base_addr_reg, ARM_R12, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+        }
+        else
+        {
+          /* base_addr_reg is R12, need another approach */
+          load_immediate(ARM_LR, offset, NULL, false);
+          ot_check(th_ldr_reg(dst, base_addr_reg, ARM_LR, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+        }
+      }
+    }
     return;
   }
 
@@ -6361,8 +6423,18 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
 
     if (bt == VT_STRUCT)
     {
-      /* TODO: implement small struct in registers */
+      /* Load struct words into consecutive registers */
       int words = (loc->size + 3) / 4;
+      if (words > 0 && words <= 4)
+      {
+        /* Add a struct move to load words into R0-R3 */
+        reg_moves[reg_move_count++] = (ThumbArgMove){
+            .kind = THUMB_ARG_MOVE_STRUCT,
+            .dst_reg = base_reg,
+            .lval_sv = *arg,
+            .struct_word_count = words,
+        };
+      }
       for (int w = 0; w < words && w < loc->reg_count; w++)
         call_site->registers_map |= (1 << (base_reg + w));
       continue;
@@ -6370,7 +6442,16 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
 
     if (is_64bit)
     {
-      if (arg->pr0 != PREG_NONE && arg->pr1 != PREG_NONE)
+      /* Check for lvalue first - if VT_LVAL is set, we need to load from memory,
+       * regardless of whether pr0/pr1 are set (they'd hold the address, not the value) */
+      if (arg->r & VT_LVAL)
+      {
+        /* Load value from memory (lvalue dereference) */
+        SValue sv_copy = *arg;
+        reg_moves[reg_move_count++] = (ThumbArgMove){
+            .kind = THUMB_ARG_MOVE_LVAL, .dst_reg = base_reg, .dst_reg_hi = base_reg + 1, .lval_sv = sv_copy};
+      }
+      else if (arg->pr0 != PREG_NONE && arg->pr1 != PREG_NONE)
       {
         if (arg->pr0 != base_reg)
           reg_moves[reg_move_count++] =
@@ -6379,7 +6460,7 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
           reg_moves[reg_move_count++] =
               (ThumbArgMove){.kind = THUMB_ARG_MOVE_REG, .dst_reg = base_reg + 1, .src_reg = arg->pr1};
       }
-      else if ((arg->r & VT_VALMASK) == VT_CONST && !(arg->r & VT_LVAL))
+      else if ((arg->r & VT_VALMASK) == VT_CONST)
       {
         /* 64-bit constant - load into register pair */
         reg_moves[reg_move_count++] = (ThumbArgMove){
@@ -6387,10 +6468,10 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
       }
       else
       {
-        /* Fallback: use load_to_reg for other 64-bit cases (lval, etc.) */
+        /* Fallback: use load_to_reg for other 64-bit cases */
         SValue sv_copy = *arg;
-        reg_moves[reg_move_count++] =
-            (ThumbArgMove){.kind = THUMB_ARG_MOVE_LVAL, .dst_reg = base_reg, .lval_sv = sv_copy};
+        reg_moves[reg_move_count++] = (ThumbArgMove){
+            .kind = THUMB_ARG_MOVE_LVAL, .dst_reg = base_reg, .dst_reg_hi = base_reg + 1, .lval_sv = sv_copy};
       }
       call_site->registers_map |= (1 << base_reg);
       call_site->registers_map |= (1 << (base_reg + 1));
@@ -6420,8 +6501,10 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
     else if ((arg->r & VT_VALMASK) == VT_LOCAL && !(arg->r & VT_LVAL))
     {
       /* Address of local variable - compute fp + offset */
-      reg_moves[reg_move_count++] =
-          (ThumbArgMove){.kind = THUMB_ARG_MOVE_LOCAL_ADDR, .dst_reg = base_reg, .local_offset = (int)arg->c.i};
+      reg_moves[reg_move_count++] = (ThumbArgMove){.kind = THUMB_ARG_MOVE_LOCAL_ADDR,
+                                                   .dst_reg = base_reg,
+                                                   .local_offset = (int)arg->c.i,
+                                                   .local_is_param = (arg->r & VT_PARAM) ? 1 : 0};
     }
     else
     {
@@ -6482,8 +6565,66 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
 
       if (bt == VT_STRUCT)
       {
-        /* Copy struct to stack */
-        /* TODO: Implement struct copy */
+        /* Copy struct to stack. Get struct address and copy each word. */
+        int struct_size = loc->size; /* use ABI-computed size */
+        int words = (struct_size + 3) / 4;
+        int base_addr_reg = ARM_R12;
+
+        /* Get the struct base address */
+        if ((arg->r & VT_VALMASK) == VT_LOCAL)
+        {
+          int local_off = (int)arg->c.i;
+          int is_param = (arg->r & VT_PARAM) ? 1 : 0;
+          tcc_machine_addr_of_stack_slot(base_addr_reg, local_off, is_param);
+        }
+        else if ((arg->r & VT_VALMASK) == VT_CONST && (arg->r & VT_SYM))
+        {
+          load_immediate(base_addr_reg, (uint32_t)arg->c.i, arg->sym, false);
+        }
+        else if (arg->pr0 != PREG_NONE && !(arg->pr0 & PREG_SPILLED))
+        {
+          base_addr_reg = arg->pr0;
+        }
+        else
+        {
+          SValue addr_sv = *arg;
+          addr_sv.r &= ~VT_LVAL;
+          load_to_reg(base_addr_reg, PREG_NONE, &addr_sv);
+        }
+
+        /* Copy each word from struct to stack */
+        for (int w = 0; w < words; ++w)
+        {
+          int src_off = w * 4;
+          int dst_off = stack_offset + w * 4;
+
+          /* Load word from struct into LR (use LR as temp since R12 may hold base) */
+          if (!load_word_from_base(ARM_LR, base_addr_reg, src_off, 0))
+          {
+            load_immediate(ARM_LR, src_off, NULL, false);
+            ot_check(th_ldr_reg(ARM_LR, base_addr_reg, ARM_LR, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+          }
+
+          /* Store to stack */
+          if (!store_word_to_base(ARM_LR, ARM_SP, dst_off, 0))
+          {
+            /* Need a different scratch - use R12 if it's not our base */
+            int scratch = (base_addr_reg != ARM_R12) ? ARM_R12 : ARM_R0;
+            /* Save R0 if we need it as scratch */
+            if (scratch == ARM_R0)
+            {
+              ot_check(th_push(1 << ARM_R0));
+              load_immediate(ARM_R0, dst_off, NULL, false);
+              ot_check(th_str_reg(ARM_LR, ARM_SP, ARM_R0, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+              ot_check(th_pop(1 << ARM_R0));
+            }
+            else
+            {
+              load_immediate(scratch, dst_off, NULL, false);
+              ot_check(th_str_reg(ARM_LR, ARM_SP, scratch, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+            }
+          }
+        }
       }
       else if (is_64bit)
       {

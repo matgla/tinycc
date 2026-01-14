@@ -1019,6 +1019,42 @@ void tcc_ir_add_function_parameters(TCCIRState *ir, CType *func_type)
   tcc_state->need_frame_pointer = 0;
 
   loc = 0;
+  func_vc = 0; /* Default: no sret pointer */
+
+  /* Check if function returns a struct via hidden sret pointer */
+  if ((sym->type.t & VT_BTYPE) == VT_STRUCT)
+  {
+    CType ret_type;
+    int ret_align, regsize;
+    int variadic = (sym->f.func_type == FUNC_ELLIPSIS);
+    int ret_nregs = gfunc_sret(&sym->type, variadic, &ret_type, &ret_align, &regsize);
+    if (ret_nregs == 0)
+    {
+      /* Struct is returned via hidden pointer in first parameter (r0).
+       * Allocate a local slot to store the sret pointer, consume a PARAM vreg,
+       * and set func_vc so gfunc_return knows where to find it.
+       */
+      loc = (loc - PTR_SIZE) & -PTR_SIZE;
+      func_vc = loc;
+      tcc_state->need_frame_pointer = 1;
+
+      /* Consume a PARAM vreg for the hidden sret pointer */
+      int sret_param_vr = tcc_ir_get_vreg_param(ir);
+
+      /* Store the sret pointer to the local slot */
+      SValue src;
+      memset(&src, 0, sizeof(src));
+      memset(&dst, 0, sizeof(dst));
+      src.type.t = VT_PTR;
+      src.r = 0;
+      src.vr = sret_param_vr;
+      dst.type.t = VT_PTR;
+      dst.r = VT_LOCAL | VT_LVAL;
+      dst.vr = -1;
+      dst.c.i = func_vc;
+      tcc_ir_put(ir, TCCIR_OP_STORE, &src, NULL, &dst);
+    }
+  }
 
   /* Count arguments to pre-allocate layout arrays */
   int arg_count = 0;
@@ -1073,9 +1109,9 @@ void tcc_ir_add_function_parameters(TCCIRState *ir, CType *func_type)
     {
       const int invisible_ref =
           (call_layout.arg_flags && (call_layout.arg_flags[arg_index] & TCC_ABI_ARG_FLAG_INVISIBLE_REF));
-      const int actual_size = (call_layout.args_original ? (int)call_layout.args_original[arg_index].size : size);
-      const int actual_align =
-          (call_layout.args_original ? (int)call_layout.args_original[arg_index].alignment : align);
+      /* Use size/align from type_size(), not from args_original which may be uninitialized */
+      const int actual_size = size;
+      const int actual_align = align;
       int slot_align = actual_align;
       if (slot_align < 4)
         slot_align = 4;
@@ -1135,7 +1171,10 @@ void tcc_ir_add_function_parameters(TCCIRState *ir, CType *func_type)
           tcc_ir_put(ir, TCCIR_OP_STORE, &src, NULL, &dst);
         }
 
-        flags = VT_LVAL | VT_LLOCAL;
+        /* The struct is now at struct_slot as a direct value (not a pointer).
+         * Use VT_LOCAL|VT_LVAL so the struct param is accessed as a direct lvalue.
+         */
+        flags = VT_LVAL | VT_LOCAL;
         addr = struct_slot;
         sym_push(sym->v & ~SYM_FIELD, type, flags, addr);
         continue;
@@ -2730,16 +2769,103 @@ void tcc_ir_build_stack_layout(TCCIRState *ir)
 
   tcc_ir_stack_layout_reset(&ir->stack_layout);
 
-  /* Pre-size the offset hash for fast lookups and to avoid O(n^2) during layout build.
-   * Worst-case slots are bounded by total vregs of params/locals/temps.
+  /* Build stack slots only for intervals that actually ended up stack-backed.
+   * We iterate over the allocator's interval list (ir->ls.intervals) which is
+   * typically much smaller than the total number of vregs created. We extract
+   * all slot metadata directly from LSLiveInterval to avoid expensive
+   * tcc_ir_get_live_interval() lookups per interval.
    */
-  const int estimated_slots = ir->next_local_variable + ir->next_temporary_variable + ir->next_parameter;
-  tcc_ir_stack_layout_offset_hash_ensure_capacity(&ir->stack_layout, estimated_slots + 8);
+  const int n = ir->ls.next_interval_index;
+  if (n <= 0)
+    return;
 
-  tcc_ir_stack_layout_collect(ir, ir->variables_live_intervals, ir->next_local_variable, TCCIR_VREG_TYPE_VAR);
-  tcc_ir_stack_layout_collect(ir, ir->temporary_variables_live_intervals, ir->next_temporary_variable,
-                              TCCIR_VREG_TYPE_TEMP);
-  tcc_ir_stack_layout_collect(ir, ir->parameters_live_intervals, ir->next_parameter, TCCIR_VREG_TYPE_PARAM);
+  /* Count stack-backed intervals for pre-sizing. */
+  int estimated_slots = 0;
+  for (int i = 0; i < n; ++i)
+  {
+    if (ir->ls.intervals[i].stack_location != 0)
+      estimated_slots++;
+  }
+  if (estimated_slots == 0)
+    return;
+
+  /* Pre-allocate slots array and hash table. */
+  TCCStackLayout *layout = &ir->stack_layout;
+  tcc_ir_stack_layout_ensure_capacity(layout, estimated_slots);
+  tcc_ir_stack_layout_offset_hash_ensure_capacity(layout, estimated_slots + 8);
+
+  /* Build slots directly from LSLiveInterval data. */
+  for (int i = 0; i < n; ++i)
+  {
+    const LSLiveInterval *ls_it = &ir->ls.intervals[i];
+    const int offset = (int)ls_it->stack_location;
+    if (offset == 0)
+      continue;
+
+    /* Check if we already have a slot at this offset (via hash). */
+    const int existing_idx = tcc_ir_stack_layout_offset_hash_lookup_index(layout, offset);
+    if (existing_idx >= 0)
+    {
+      /* Slot exists; just update vreg owner if needed. */
+      TCCStackSlot *slot = &layout->slots[existing_idx];
+      if (slot->vreg == -1)
+        slot->vreg = (int)ls_it->vreg;
+      /* Update stack_slot_index in corresponding IRLiveInterval. */
+      IRLiveInterval *ir_interval = tcc_ir_get_live_interval(ir, (int)ls_it->vreg);
+      if (ir_interval)
+        ir_interval->stack_slot_index = existing_idx;
+      continue;
+    }
+
+    /* New slot: derive size from reg_type. */
+    int size = 4;
+    switch (ls_it->reg_type)
+    {
+    case LS_REG_TYPE_LLONG:
+    case LS_REG_TYPE_DOUBLE:
+    case LS_REG_TYPE_DOUBLE_SOFT:
+      size = 8;
+      break;
+    default:
+      size = 4;
+      break;
+    }
+
+    /* Derive kind from vreg type. */
+    const TCCIR_VREG_TYPE vtype = (TCCIR_VREG_TYPE)TCCIR_DECODE_VREG_TYPE((int)ls_it->vreg);
+    TCCStackSlotKind kind;
+    switch (vtype)
+    {
+    case TCCIR_VREG_TYPE_PARAM:
+      kind = TCC_STACK_SLOT_PARAM_SPILL;
+      break;
+    case TCCIR_VREG_TYPE_VAR:
+      kind = TCC_STACK_SLOT_LOCAL;
+      break;
+    default:
+      kind = TCC_STACK_SLOT_SPILL;
+      break;
+    }
+
+    /* Create slot directly. */
+    const int slot_idx = layout->slot_count++;
+    TCCStackSlot *slot = &layout->slots[slot_idx];
+    slot->offset = offset;
+    slot->size = size;
+    slot->alignment = (size >= 8) ? 8 : 4;
+    slot->kind = kind;
+    slot->vreg = (int)ls_it->vreg;
+    slot->live_across_calls = ls_it->crosses_call;
+    slot->addressable = ls_it->addrtaken ? 1 : 0;
+
+    /* Insert into hash table for fast lookup. */
+    tcc_ir_stack_layout_offset_hash_insert(layout, offset, slot_idx);
+
+    /* Update stack_slot_index in corresponding IRLiveInterval. */
+    IRLiveInterval *ir_interval = tcc_ir_get_live_interval(ir, (int)ls_it->vreg);
+    if (ir_interval)
+      ir_interval->stack_slot_index = slot_idx;
+  }
 }
 
 const TCCStackSlot *tcc_ir_stack_slot_by_vreg(const TCCIRState *ir, int vreg)
@@ -3021,10 +3147,11 @@ void tcc_ir_materialize_addr(TCCIRState *ir, SValue *sv, TCCMaterializedAddr *re
 
   const int target_reg = scratch.regs[0];
   const int frame_offset = tcc_ir_materialization_offset(ir, sv);
+  const int is_param = (sv->r & VT_PARAM) ? 1 : 0;
 
   if (wants_stack_address)
   {
-    tcc_machine_addr_of_stack_slot(target_reg, frame_offset);
+    tcc_machine_addr_of_stack_slot(target_reg, frame_offset, is_param);
     int flags = (sv->r & ~VT_VALMASK) | VT_LVAL;
     sv->pr0 = target_reg;
     sv->pr1 = PREG_NONE;
@@ -5986,7 +6113,6 @@ void tcc_ir_generate_code(TCCIRState *ir)
 
   // generate prolog
   int stack_size = (-loc + 7) & ~7; // align to 8 bytes
-  THGEN_DUMP("DEBUG prolog: loc=%d stack_size=%d\n", loc, stack_size);
   int ind_before_prolog = ind;
   tcc_gen_machine_prolog(ir->leaffunc, ir->ls.dirty_registers, stack_size);
 

@@ -755,17 +755,17 @@ struct TCCState
   unsigned char test_coverage; /* generate test coverage code */
 
   /* IR optimization flags (-f options) */
-  unsigned char opt_dce;                /* -fdce: dead code elimination */
-  unsigned char opt_const_prop;         /* -fconst-prop: constant propagation */
-  unsigned char opt_copy_prop;          /* -fcopy-prop: copy propagation */
-  unsigned char opt_cse;                /* -fcse: common subexpression elimination */
-  unsigned char opt_bool_cse;           /* -fbool-cse: boolean CSE */
-  unsigned char opt_bool_idempotent;    /* -fbool-idempotent: boolean idempotent simplification */
-  unsigned char opt_bool_simplify;      /* -fbool-simplify: boolean expression simplification */
-  unsigned char opt_return_value;       /* -freturn-value-opt: return value optimization */
-  unsigned char opt_store_load_fwd;     /* -fstore-load-fwd: store-load forwarding */
-  unsigned char opt_redundant_store;    /* -fredundant-store-elim: redundant store elimination */
-  unsigned char opt_dead_store;         /* -fdead-store-elim: dead store elimination */
+  unsigned char opt_dce;             /* -fdce: dead code elimination */
+  unsigned char opt_const_prop;      /* -fconst-prop: constant propagation */
+  unsigned char opt_copy_prop;       /* -fcopy-prop: copy propagation */
+  unsigned char opt_cse;             /* -fcse: common subexpression elimination */
+  unsigned char opt_bool_cse;        /* -fbool-cse: boolean CSE */
+  unsigned char opt_bool_idempotent; /* -fbool-idempotent: boolean idempotent simplification */
+  unsigned char opt_bool_simplify;   /* -fbool-simplify: boolean expression simplification */
+  unsigned char opt_return_value;    /* -freturn-value-opt: return value optimization */
+  unsigned char opt_store_load_fwd;  /* -fstore-load-fwd: store-load forwarding */
+  unsigned char opt_redundant_store; /* -fredundant-store-elim: redundant store elimination */
+  unsigned char opt_dead_store;      /* -fdead-store-elim: dead store elimination */
 
   /* use GNU C extensions */
   unsigned char gnu_ext;
@@ -1942,7 +1942,7 @@ ST_FUNC int tcc_machine_can_encode_stack_offset_for_reg(int frame_offset, int de
 ST_FUNC int tcc_machine_can_encode_stack_offset_with_param_adj(int frame_offset, int is_param, int dest_reg);
 ST_FUNC void tcc_machine_load_spill_slot(int dest_reg, int frame_offset);
 ST_FUNC void tcc_machine_store_spill_slot(int src_reg, int frame_offset);
-ST_FUNC void tcc_machine_addr_of_stack_slot(int dest_reg, int frame_offset);
+ST_FUNC void tcc_machine_addr_of_stack_slot(int dest_reg, int frame_offset, int is_param);
 
 /* Constant/value materialization - load various value types into registers */
 ST_FUNC void tcc_machine_load_constant(int dest_reg, int dest_reg_high, int64_t value, int is_64bit, Sym *sym);
