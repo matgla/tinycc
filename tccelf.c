@@ -3313,7 +3313,7 @@ static void gc_sections(TCCState *s1)
   for (i = 1; i < s1->nb_sections; i++)
   {
     s = s1->sections[i];
-    if (!s || !s->name)
+    if (!s)
       continue;
     /* Keep symtab, strtab, shstrtab, and relocation sections */
     if (s->sh_type == SHT_SYMTAB || s->sh_type == SHT_STRTAB || s->sh_type == SHT_HASH || s->sh_type == SHT_DYNSYM ||
@@ -3510,7 +3510,6 @@ static int elf_output_file(TCCState *s1, const char *filename)
   {
     if (file_type & TCC_OUTPUT_EXE)
     {
-      char *ptr;
       /* allow override the dynamic loader */
       const char *elfint = getenv("LD_SO");
       if (elfint == NULL)

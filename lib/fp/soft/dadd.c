@@ -14,7 +14,9 @@ double __aeabi_dadd(double a, double b)
   {
     double d;
     uint64_t u;
-  } ua = {.d = a}, ub = {.d = b}, ur;
+  } ua, ub, ur;
+  ua.d = a;
+  ub.d = b;
   uint64_t a_bits = ua.u, b_bits = ub.u;
 
   int a_sign = double_sign(a_bits);
@@ -170,7 +172,8 @@ double __aeabi_dsub(double a, double b)
   {
     double d;
     uint64_t u;
-  } ub = {.d = b};
+  } ub;
+  ub.d = b;
   ub.u ^= DOUBLE_SIGN_BIT; /* Flip sign bit */
   return __aeabi_dadd(a, ub.d);
 }

@@ -299,9 +299,6 @@ int main(int argc0, char **argv0)
   char **argv;
   FILE *ppfp = stdout;
 
-early_exit:
-  /* label target only */
-
 redo:
   argc = argc0, argv = argv0;
   tcc_set_realloc(NULL);
@@ -500,7 +497,7 @@ ST_FUNC int tcc_is_64bit_operand(SValue *sv)
   }
 
   vt = sv->type.t & VT_BTYPE;
-  if ((vt == VT_LLONG) || (vt == VT_DOUBLE))
+  if ((vt == VT_LLONG) || (vt == VT_DOUBLE) || (vt == VT_LDOUBLE))
   {
     return 1;
   }

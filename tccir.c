@@ -636,6 +636,9 @@ static void tcc_ir_init_interval_starts(IRLiveInterval *intervals, int count)
     intervals[i].incoming_reg0 = -1;
     intervals[i].incoming_reg1 = -1;
     intervals[i].stack_slot_index = -1;
+    intervals[i].allocation.r0 = PREG_NONE;
+    intervals[i].allocation.r1 = PREG_NONE;
+    intervals[i].allocation.offset = 0;
   }
 }
 
@@ -1018,7 +1021,9 @@ void tcc_ir_add_function_parameters(TCCIRState *ir, CType *func_type)
   func_vt = sym->type;
   tcc_state->need_frame_pointer = 0;
 
-  loc = 0;
+  int variadic = (sym->f.func_type == FUNC_ELLIPSIS);
+  /* Reserve fixed varargs save area so locals don't overlap FP-24..FP-4. */
+  loc = variadic ? -28 : 0;
   func_vc = 0; /* Default: no sret pointer */
 
   /* Check if function returns a struct via hidden sret pointer */
@@ -1026,7 +1031,6 @@ void tcc_ir_add_function_parameters(TCCIRState *ir, CType *func_type)
   {
     CType ret_type;
     int ret_align, regsize;
-    int variadic = (sym->f.func_type == FUNC_ELLIPSIS);
     int ret_nregs = gfunc_sret(&sym->type, variadic, &ret_type, &ret_align, &regsize);
     if (ret_nregs == 0)
     {
@@ -1619,13 +1623,32 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
       /* Ensure the vreg is tagged with the correct type for register
        * allocation. This is important for 64-bit values (double/long long)
        * which require a register pair in soft-float. Some paths create temps
-       * without an explicit type tag; deriving it here prevents pr1 from
-       * staying -1. */
-      if (tcc_ir_is_float_type(dest->type.t))
+       * without an explicit type tag; derive it from sources when missing. */
+      if (dest->type.t == 0)
       {
-        tcc_ir_set_float_type(ir, dest->vr, 1, tcc_ir_is_double_type(dest->type.t));
+        if (src1 && tcc_ir_is_float_type(src1->type.t))
+        {
+          q->dest.type = src1->type;
+        }
+        else if (src2 && tcc_ir_is_float_type(src2->type.t))
+        {
+          q->dest.type = src2->type;
+        }
+        else if (src1 && tcc_ir_is_64bit_type(src1->type.t))
+        {
+          q->dest.type = src1->type;
+        }
+        else if (src2 && tcc_ir_is_64bit_type(src2->type.t))
+        {
+          q->dest.type = src2->type;
+        }
       }
-      else if ((dest->type.t & VT_BTYPE) == VT_LLONG)
+
+      if (tcc_ir_is_float_type(q->dest.type.t))
+      {
+        tcc_ir_set_float_type(ir, dest->vr, 1, tcc_ir_is_double_type(q->dest.type.t));
+      }
+      else if ((q->dest.type.t & VT_BTYPE) == VT_LLONG)
       {
         tcc_ir_set_llong_type(ir, dest->vr);
       }
@@ -1638,7 +1661,6 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
        * - Arithmetic ops (ADD, SUB, etc.): produce VALUES → is_lvalue=0
        * - ASSIGN with VT_LVAL source: produces a VALUE (dereferenced) → is_lvalue=0
        * - ASSIGN without VT_LVAL source: produces an ADDRESS → is_lvalue=1 */
-      int old_is_lvalue = dest_interval->is_lvalue;
       int new_is_lvalue;
       int src_is_stack_addr = tcc_ir_operand_is_stack_addr(src1);
       if (op == TCCIR_OP_ASSIGN && src1 && !(src1->r & VT_LVAL) && !src_is_stack_addr)
@@ -1820,9 +1842,8 @@ void tcc_ir_set_float_type(TCCIRState *ir, int vreg, int is_float, int is_double
   {
     interval->is_float = is_float;
     interval->is_double = is_double;
-    /* For now, assume soft-float for ARM Thumb (no VFP for doubles) */
-    /* TODO: make this configurable based on target */
-    interval->use_vfp = 0;
+    /* Use VFP registers only when the target ABI supports hard-float. */
+    interval->use_vfp = (tcc_state && tcc_state->float_abi == ARM_HARD_FLOAT);
   }
 }
 
@@ -1869,7 +1890,8 @@ int tcc_ir_get_reg_type(TCCIRState *ir, int vreg)
         /* For soft-float, doubles use two integer registers */
         return interval->use_vfp ? LS_REG_TYPE_DOUBLE : LS_REG_TYPE_DOUBLE_SOFT;
       }
-      return LS_REG_TYPE_FLOAT;
+      /* For soft-float, single-precision values live in integer registers. */
+      return interval->use_vfp ? LS_REG_TYPE_FLOAT : LS_REG_TYPE_INT;
     }
   }
   return LS_REG_TYPE_INT;
@@ -2344,6 +2366,35 @@ void tcc_ir_liveness_analysis(TCCIRState *ir)
   int reg_type;
   IRLiveInterval *interval;
   tcc_ls_clear_live_intervals(&ir->ls);
+
+  /* Ensure vreg type tags stay in sync with IR operand types after
+   * optimizations/coalescing. This is critical for 64-bit values that
+   * require register pairs. */
+  for (int i = 0; i < ir->next_instruction_index; ++i)
+  {
+    TACQuadruple *q = &ir->instructions[i];
+    if (irop_config[q->op].has_dest && tcc_is_vreg_valid(ir, q->dest.vr))
+    {
+      if (tcc_ir_is_float_type(q->dest.type.t))
+        tcc_ir_set_float_type(ir, q->dest.vr, 1, tcc_ir_is_double_type(q->dest.type.t));
+      else if ((q->dest.type.t & VT_BTYPE) == VT_LLONG)
+        tcc_ir_set_llong_type(ir, q->dest.vr);
+    }
+    if (irop_config[q->op].has_src1 && tcc_is_vreg_valid(ir, q->src1.vr))
+    {
+      if (tcc_ir_is_float_type(q->src1.type.t))
+        tcc_ir_set_float_type(ir, q->src1.vr, 1, tcc_ir_is_double_type(q->src1.type.t));
+      else if ((q->src1.type.t & VT_BTYPE) == VT_LLONG)
+        tcc_ir_set_llong_type(ir, q->src1.vr);
+    }
+    if (irop_config[q->op].has_src2 && tcc_is_vreg_valid(ir, q->src2.vr))
+    {
+      if (tcc_ir_is_float_type(q->src2.type.t))
+        tcc_ir_set_float_type(ir, q->src2.vr, 1, tcc_ir_is_double_type(q->src2.type.t));
+      else if ((q->src2.type.t & VT_BTYPE) == VT_LLONG)
+        tcc_ir_set_llong_type(ir, q->src2.vr);
+    }
+  }
 
   const int instruction_count = ir->next_instruction_index;
   int *call_prefix = NULL;
@@ -3113,8 +3164,14 @@ void tcc_ir_materialize_addr(TCCIRState *ir, SValue *sv, TCCMaterializedAddr *re
   const int val_kind = sv->r & VT_VALMASK;
   const int wants_stack_address = (val_kind == VT_LOCAL || val_kind == VT_LLOCAL) && !(sv->r & VT_LVAL);
   /* Check for spilled pointer: pr0 must be PREG_SPILLED (0x80), NOT PREG_NONE (0xFF).
-   * PREG_NONE has the PREG_SPILLED bit set, so we must explicitly exclude it. */
-  const int spilled_pointer = (sv->pr0 != PREG_NONE) && (sv->pr0 & PREG_SPILLED);
+   * PREG_NONE has the PREG_SPILLED bit set, so we must explicitly exclude it.
+   * IMPORTANT: This is for cases where a POINTER value (result of address arithmetic)
+   * was spilled to stack and needs to be reloaded to dereference through it.
+   * This is NOT for regular local variables that happen to be spilled - those are
+   * handled by VT_LOCAL|VT_LVAL path in the backend.
+   * Exclude VT_LOCAL/VT_LLOCAL from being treated as spilled pointers. */
+  const int is_local_access = (val_kind == VT_LOCAL || val_kind == VT_LLOCAL);
+  const int spilled_pointer = !is_local_access && (sv->pr0 != PREG_NONE) && (sv->pr0 & PREG_SPILLED);
 
   if (!wants_stack_address && !spilled_pointer)
     return;
@@ -3291,14 +3348,21 @@ void tcc_ir_register_allocation_params(TCCIRState *ir)
      */
     int is_64bit = interval && (interval->is_double || interval->is_llong);
 
+    /* If the ABI incoming registers were already set (e.g., by the
+     * parameter handling in tcc_ir_add_function_parameters), respect them
+     * and only advance argno for subsequent parameters.
+     */
+    if (interval && (interval->incoming_reg0 >= 0 || interval->incoming_reg1 >= 0))
+    {
+      argno += is_64bit ? 2 : 1;
+      continue;
+    }
+
     /* AAPCS: 64-bit values must be aligned to even register pairs */
     if (is_64bit && (argno & 1))
     {
       argno++; /* skip odd register to align to even */
     }
-
-    /* Check if linear scan allocator already spilled this parameter */
-    int already_spilled = (interval->allocation.r0 == PREG_SPILLED || interval->allocation.offset != 0);
 
     if (is_64bit)
     {
@@ -3549,6 +3613,8 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
      *   (we want the address, not the value). Do NOT add VT_LVAL. */
     int preserve_flags = old_r & VT_PARAM; /* Always preserve VT_PARAM */
     if ((old_r & VT_LVAL) && old_v < VT_CONST && old_v != VT_LOCAL && old_v != VT_LLOCAL && !is_register_param)
+    {
+      /* The vreg holds a pointer that needs dereferencing.
     {
       /* The vreg holds a pointer that needs dereferencing.
        * Note: VT_LOCAL/VT_LLOCAL use VT_LVAL to mean "load from stack slot".
@@ -4646,6 +4712,8 @@ int tcc_ir_constant_propagation(TCCIRState *ir)
         else if (c == -1 || c == 0xFFFFFFFF)
           simplify = 1; /* X & -1 = X */
         break;
+      default:
+        break;
       }
 
       if (simplify)
@@ -4741,6 +4809,8 @@ int tcc_ir_constant_propagation(TCCIRState *ir)
           q->src2.vr = -1;
           changes++;
         }
+        break;
+      default:
         break;
       }
     }
@@ -6123,7 +6193,6 @@ void tcc_ir_generate_code(TCCIRState *ir)
 
   // generate prolog
   int stack_size = (-loc + 7) & ~7; // align to 8 bytes
-  int ind_before_prolog = ind;
   tcc_gen_machine_prolog(ir->leaffunc, ir->ls.dirty_registers, stack_size);
 
   for (int i = 0; i < ir->next_instruction_index; i++)
@@ -6136,8 +6205,6 @@ void tcc_ir_generate_code(TCCIRState *ir)
 
     /* Track current instruction for scratch register allocation */
     ir->codegen_instruction_idx = i;
-
-    int ind_before = ind;
 
     ir_to_code_mapping[i] = ind;
 
@@ -6409,11 +6476,15 @@ void tcc_ir_generate_code(TCCIRState *ir)
     }
     case TCCIR_OP_JUMP:
       tcc_gen_machine_jump_op(q);
+      /* Update mapping to actual instruction address (may have shifted due to literal pool) */
+      ir_to_code_mapping[i] = ind - 4;
       /* Clear spill cache at branch - value may come from different path */
       tcc_ir_spill_cache_clear(&ir->spill_cache);
       break;
     case TCCIR_OP_JUMPIF:
       tcc_gen_machine_conditional_jump_op(q);
+      /* Update mapping to actual instruction address (may have shifted due to literal pool) */
+      ir_to_code_mapping[i] = ind - 4;
       /* Clear spill cache at conditional branch - target may have different values */
       tcc_ir_spill_cache_clear(&ir->spill_cache);
       break;
@@ -6566,16 +6637,16 @@ void print_svalue_short(SValue *sv)
   case VT_LLOCAL:
     /* VT_LLOCAL with VT_LVAL: spilled pointer needing double dereference */
     if (sv->pr0 != PREG_NONE && (sv->pr0 & PREG_SPILLED))
-      printf(SPILL_MARK_BEGIN "SpillLoc[%d]***DEREF***" SPILL_MARK_END, sv->c.i);
+      printf(SPILL_MARK_BEGIN "SpillLoc[%ld]***DEREF***" SPILL_MARK_END, (long)sv->c.i);
     else
-      printf("VT_LLOCAL (cval=%d)", sv->c.i);
+      printf("VT_LLOCAL (cval=%ld)", (long)sv->c.i);
     break;
   // case VT_LOCAL: printf("VReg%d[stack_offset=%d]", sv->vreg, sv->c.i); break;
   case VT_LOCAL:
     if (sv->pr0 != PREG_NONE)
     { /* already register-allocated? */
       if (sv->pr0 & PREG_SPILLED)
-        printf(SPILL_MARK_BEGIN "SpillLoc[%d]" SPILL_MARK_END, sv->c.i);
+        printf(SPILL_MARK_BEGIN "SpillLoc[%ld]" SPILL_MARK_END, (long)sv->c.i);
       else
       {
         if (!(sv->r & VT_LVAL))
@@ -6591,11 +6662,11 @@ void print_svalue_short(SValue *sv)
     }
     else if (!(sv->r & VT_LVAL))
     { /* no LVAL, is just an address */
-      printf("Addr[StackLoc[%d]]", sv->c.i);
+      printf("Addr[StackLoc[%ld]]", (long)sv->c.i);
     }
     else
     { /* fixed location on stack */
-      printf("StackLoc[%d]", sv->c.i);
+      printf("StackLoc[%ld]", (long)sv->c.i);
     }
     break;
   case VT_CMP:
@@ -6636,7 +6707,7 @@ void print_svalue_short(SValue *sv)
     else
     {
       if (sv->pr0 & PREG_SPILLED)
-        printf(SPILL_MARK_BEGIN "SpillLoc[%d]" SPILL_MARK_END, sv->c.i);
+        printf(SPILL_MARK_BEGIN "SpillLoc[%ld]" SPILL_MARK_END, (long)sv->c.i);
       else
         printf("R%d", sv->pr0);
       if (tcc_ir_operand_needs_dereference(sv))
@@ -6667,7 +6738,7 @@ void tcc_print_quadruple(TACQuadruple *q, int pc)
     break;
   case TCCIR_OP_JUMP:
   case TCCIR_OP_JUMPIF:
-    printf("JMP to %d ", q->dest.c.i);
+    printf("JMP to %ld ", (long)q->dest.c.i);
     break;
   case TCCIR_OP_IJUMP:
     printf("IJMP ");
@@ -6684,7 +6755,7 @@ void tcc_print_quadruple(TACQuadruple *q, int pc)
     if (op == TCCIR_OP_SETIF)
     {
       /* Print condition code instead of vreg for SETIF */
-      printf("(cond=0x%x)", q->src1.c.i);
+      printf("(cond=0x%lx)", (unsigned long)q->src1.c.i);
     }
     else if (op != TCCIR_OP_JUMPIF)
     {
@@ -6756,7 +6827,7 @@ void tcc_print_quadruple(TACQuadruple *q, int pc)
       printf(">=U");
       break;
     default:
-      printf("cc=0x%x", q->src1.c.i);
+      printf("cc=0x%lx", (unsigned long)q->src1.c.i);
       break;
     }
     printf("\"");

@@ -3,9 +3,10 @@
 
 include ../../../config.mak
 
-SRCS = fadd.c fmul.c fdiv.c fcmp.c dadd.c dmul.c ddiv.c dconv.c dcmp.c conv.c fmt.c
+SRCS = fadd.c fmul.c fdiv.c fcmp.c dadd.c dmul.c ddiv.c dconv.c dcmp.c conv.c f2d_stub.S
 BUILD_DIR ?= build
 OBJS = $(addprefix $(BUILD_DIR)/,$(SRCS:.c=.o))
+OBJS := $(OBJS:.S=.o)
 
 CFLAGS += -O2 -Wall -Wextra -I../.. -I../../../include
 
@@ -15,6 +16,9 @@ $(BUILD_DIR):
 	@mkdir -p $@
 
 $(BUILD_DIR)/%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/%.o: %.S
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:

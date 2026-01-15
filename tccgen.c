@@ -103,6 +103,7 @@ static CString initstr;
 
 const char *get_value_type(int r)
 {
+  return NULL;
 }
 
 static struct switch_t
@@ -831,6 +832,9 @@ ST_FUNC Sym *sym_push(int v, CType *type, int r, int c)
         !(type->t & (VT_ARRAY | VT_VLA)))
     {
       vreg = tcc_ir_get_vreg_var(tcc_state->ir);
+      /* Set the variable's stack offset so LEA operations can find it */
+      if (vreg >= 0)
+        tcc_ir_assign_physical_register(tcc_state->ir, vreg, c, -1, -1);
       /* Mark float/double variables */
       if (is_float(type->t))
       {
@@ -1934,7 +1938,7 @@ static int adjust_bf(SValue *sv, int bit_pos, int bit_size)
    register value (such as structures). */
 ST_FUNC int gv(int rc)
 {
-  int r, r2, r_ok, r2_ok, rc2, bt;
+  int r, r_ok, r2_ok, rc2, bt;
   int bit_pos, bit_size, size, align;
   int vreg = -1;
 
@@ -2388,7 +2392,7 @@ static void lbuild(int t)
    register */
 static void gv_dup(void)
 {
-  int t, rc, r;
+  int t;
   SValue sv;
 
   t = vtop->type.t;
@@ -2431,7 +2435,7 @@ static void gv_dup(void)
 /* generate CPU independent (unsigned) long long operations */
 static void gen_opl(int op)
 {
-  int t, a, b, op1, c, i;
+  int t, op1, c, i;
   int func;
   unsigned short reg_iret = REG_IRET;
   unsigned short reg_lret = REG_IRE2;
@@ -2498,19 +2502,20 @@ static void gen_opl(int op)
     if (tcc_state->ir)
     {
       t = vtop->type.t;
+      int dest_type = VT_LLONG | (t & VT_UNSIGNED);
       if (op == '+' || op == '-')
       {
         /* 64-bit add/sub - generate single IR operation */
         SValue dest;
         memset(&dest, 0, sizeof(SValue));
         dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-        dest.type.t = t;
+        dest.type.t = dest_type;
         dest.r = 0;
         TccIrOp ir_op = (op == '+') ? TCCIR_OP_ADD : TCCIR_OP_SUB;
         tcc_ir_put(tcc_state->ir, ir_op, &vtop[-1], &vtop[0], &dest);
         vtop--;
         vtop->vr = dest.vr;
-        vtop->type.t = t;
+        vtop->type.t = dest_type;
         vtop->r = 0;
       }
       else
@@ -2519,7 +2524,7 @@ static void gen_opl(int op)
         SValue dest;
         memset(&dest, 0, sizeof(SValue));
         dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-        dest.type.t = t;
+        dest.type.t = dest_type;
         dest.r = 0;
         TccIrOp ir_op;
         switch (op)
@@ -2537,7 +2542,7 @@ static void gen_opl(int op)
         tcc_ir_put(tcc_state->ir, ir_op, &vtop[-1], &vtop[0], &dest);
         vtop--;
         vtop->vr = dest.vr;
-        vtop->type.t = t;
+        vtop->type.t = dest_type;
         vtop->r = 0;
       }
       break;
@@ -4587,7 +4592,6 @@ ST_FUNC void vstore(void)
     /* if lvalue was saved on stack, must read it */
     if ((vtop[-1].r & VT_VALMASK) == VT_LLOCAL)
     {
-      SValue sv;
       if (tcc_state->ir)
       {
         /* IR mode: load the saved pointer value into a vreg, and keep the
@@ -7521,8 +7525,9 @@ tok_next:
           SValue call_id_sv = tcc_ir_svalue_call_id_argc(call_id, 0);
           tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVOID, NULL, &call_id_sv, NULL);
         }
-        // perhaps this should be a correct type :(
-        dest.type.t = VT_INT;
+        /* Use the actual return type so 64-bit/float returns are modeled correctly
+         * (e.g., __aeabi_f2d returns a double in R0:R1). */
+        dest.type = ret.type;
         dest.r = 0;
         dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
         return_vreg = dest.vr;
@@ -7881,7 +7886,6 @@ static void expr_landor(int op)
     }
   }
 
-continue_landor:
   if (cc || f)
   {
     vpop();
@@ -7905,8 +7909,11 @@ continue_landor:
 
 static int is_cond_bool(SValue *sv)
 {
-  if ((sv->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST && (sv->type.t & VT_BTYPE) == VT_INT)
-    return (unsigned)sv->c.i < 2;
+  /* Only return true for actual comparison results (VT_CMP).
+   * Previously this also returned true for constants 0/1, but that caused
+   * incorrect code generation for ternary expressions like `x == 0 ? 1 : 0`
+   * because the optimization path would generate SETIF instructions that
+   * depend on stale condition flags after unconditional branches. */
   if (sv->r == VT_CMP)
     return 1;
   return 0;

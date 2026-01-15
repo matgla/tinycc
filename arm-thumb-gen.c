@@ -72,6 +72,8 @@ enum Armv8mRegisters
 #define USING_GLOBALS
 #include "tcc.h"
 
+#include <stdlib.h>
+
 /* Target ABI hook: AAPCS-like argument assignment for ARM (R0-R3 + stack).
  *
  * This is a pure layout function: it does not materialize values and does not
@@ -320,10 +322,9 @@ static ScratchRegAllocs get_scratch_regs_with_save(uint32_t exclude_regs, int co
 #endif
       result.regs[i] = reg;
       exclude |= (1u << reg);
-      /* R11 and R12 are permanent scratch registers and can be reused freely.
-       * Don't add them to global exclude. */
-      if (reg != 11 && reg != 12)
-        scratch_global_exclude |= (1u << reg);
+      /* Mark as globally excluded while live so nested helpers cannot
+       * accidentally reuse it and clobber a still-needed operand. */
+      scratch_global_exclude |= (1u << reg);
       result.count++;
     }
     else
@@ -497,10 +498,9 @@ static ScratchRegAlloc get_scratch_reg_with_save(uint32_t exclude_regs)
       result.reg = reg;
       result.saved = 0;
       /* Update global exclude so subsequent calls won't return the same register.
-       * Exception: R11/R12 are reserved for call argument processing and can be
-       * reused freely without exclusion. They must never be saved/pushed. */
-      if (reg != 11 && reg != 12)
-        scratch_global_exclude |= (1u << reg);
+       * This prevents nested scratch allocations from silently reusing and
+       * clobbering a still-live operand (e.g. during constant materialization). */
+      scratch_global_exclude |= (1u << reg);
       return result;
     }
   }
@@ -861,10 +861,6 @@ static uint32_t mapcc(int cc)
   return 0xE; /* AL */
 }
 
-static int func_nregs = 0; // number of registers stored in function prologue
-static int func_sub_sp_offset = 0;
-static int leaffunc = 0; // function is leaf
-
 #if defined(TCC_ARM_EABI) && !defined(CONFIG_TCC_ELFINTERP)
 const char *default_elfinterp(struct TCCState *s)
 {
@@ -1060,8 +1056,7 @@ static void th_literal_pool_generate(void)
     if (thumb_gen_state.literal_pool[i].shared_index == -1)
     {
       unique_count++;
-      /* Account for 8-byte literals */
-      int entry_size = thumb_gen_state.literal_pool[i].data_size > 0 ? thumb_gen_state.literal_pool[i].data_size : 4;
+      int entry_size = (thumb_gen_state.literal_pool[i].data_size == 8) ? 8 : 4;
       pool_size += entry_size;
     }
   }
@@ -1073,18 +1068,11 @@ static void th_literal_pool_generate(void)
   int branch_pos = ind;
   int need_align = (ind & 2) ? 2 : 0; /* alignment padding after branch */
 
-  uint16_t branch_hw0_before = 0, branch_hw1_before = 0;
-  uint16_t branch_hw0_after = 0, branch_hw1_after = 0;
-
   if (thumb_gen_state.generating_function)
   {
     /* Emit placeholder branch (will be patched later) - use 32-bit B.W */
     o(0xf000); /* first halfword of B.W */
     o(0x9000); /* second halfword placeholder */
-
-    /* Snapshot placeholder encoding so we can detect later clobbers */
-    branch_hw0_before = *(uint16_t *)(cur_text_section->data + branch_pos);
-    branch_hw1_before = *(uint16_t *)(cur_text_section->data + branch_pos + 2);
   }
 
   if (need_align)
@@ -1169,22 +1157,24 @@ static void th_literal_pool_generate(void)
   }
 
   /* Patch the branch instruction to jump to after the pool.
-   * Use the computed pool size rather than (ind - branch_pos), because `ind`
-   * can be perturbed by other codepaths and must not affect the local skip.
+   * Use the actual emitted size (ind - branch_pos) to avoid any drift between
+   * the precomputed pool size and what was really written.
    * Offset is relative to PC (branch_pos + 4).
    */
   if (thumb_gen_state.generating_function)
   {
-    const int branch_after_pool =
-        pool_size + need_align; // ind - branch_pos - 4; // branch_pos + 4 + need_align + pool_size;
+    const int branch_after_pool = ind - branch_pos - 4;
     // th_patch_call(branch_pos, branch_after_pool);
     thumb_opcode branch = th_b_t4(branch_after_pool);
     uint16_t *branch_patch = (uint16_t *)(cur_text_section->data + branch_pos);
     branch_patch[0] = (branch.opcode >> 16) & 0xffff;
     branch_patch[1] = branch.opcode & 0xffff;
 
-    branch_hw0_after = *(uint16_t *)(cur_text_section->data + branch_pos);
-    branch_hw1_after = *(uint16_t *)(cur_text_section->data + branch_pos + 2);
+    if (tcc_state && tcc_state->verbose)
+    {
+      tcc_warning("literal_pool[%d]: branch_pos=0x%x need_align=%d pool_size=%d ind_end=0x%x branch_after_pool=%d",
+                  this_pool, branch_pos, need_align, pool_size, ind, branch_after_pool);
+    }
   }
   th_sym_t();
 
@@ -1962,7 +1952,7 @@ static uint32_t th_store_resolve_base(int src_reg, SValue *sv, int ft, int *abs_
 
 void store(int r, SValue *sv)
 {
-  int v, ft, fr;
+  int ft, fr;
   TRACE("'store' reg: %d", r);
 
   /* IR owns spills: backend store must never be asked to store from a spilled
@@ -1985,7 +1975,6 @@ void store(int r, SValue *sv)
 
   fr = sv->r;
   ft = sv->type.t;
-  v = fr & VT_VALMASK;
 
   /* Handle register-to-register store (destination is a physical register, not memory).
    * This happens when storing to a parameter that lives in a callee-saved register. */
@@ -2002,10 +1991,21 @@ void store(int r, SValue *sv)
     int src_btype = ft & VT_BTYPE;
     if ((src_btype == VT_DOUBLE || src_btype == VT_LDOUBLE || src_btype == VT_LLONG) && sv->pr1 != PREG_NONE)
     {
-      /* The caller should have set up pr1 for the destination high register.
-       * The source high register comes from sv->pr1 passed by the caller. */
-      /* Actually, for store() the source high is implicit (r+1 or caller-provided).
-       * For now, just handle the case where sv->pr1 is the dest high. */
+      /* The caller should set sv->pr1 to the destination high register.
+       * Source high is assumed to be the next register (r+1) for 64-bit values. */
+      int dest_hi = sv->pr1;
+      if (dest_hi != dest_reg)
+      {
+        int src_hi = r + 1;
+        if (!thumb_is_hw_reg(src_hi) || src_hi == R_SP || src_hi == R_PC)
+          tcc_error("compiler_error: cannot store 64-bit reg pair - invalid source high register %d", src_hi);
+        thumb_require_materialized_reg("store", "dest.high", dest_hi);
+        if (dest_hi != src_hi)
+        {
+          ot_check(th_mov_reg(dest_hi, src_hi, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                              ENFORCE_ENCODING_NONE, false));
+        }
+      }
     }
     return;
   }
@@ -2761,7 +2761,6 @@ void load_to_dest(SValue *dest, SValue *sv)
   fr = sv->r;
   ft = sv->type.t;
   fc = sv->c.i;
-  int btype = ft & VT_BTYPE;
   const char *ctx = "load_to_dest";
 
   /* If we're about to write into the register currently used to cache a global
@@ -2928,10 +2927,10 @@ void load_to_dest(SValue *dest, SValue *sv)
         {
           /* Also move high word for double.
            * Use dest->pr1 for destination high register.
-           * Source high register comes from sv->r2 if available, otherwise src_reg+1. */
+           * Source high register comes from sv->pr1 if available, otherwise src_reg+1. */
           if (dest->pr1 != PREG_NONE)
           {
-            int v_high = (sv->r2 != VT_CONST) ? sv->r2 : (src_reg + 1);
+            int v_high = (sv->pr1 != PREG_NONE) ? sv->pr1 : (src_reg + 1);
             if (dest->pr1 != v_high)
             {
               ot_check(th_mov_reg(dest->pr1, v_high, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
@@ -2951,7 +2950,7 @@ void load_to_dest(SValue *dest, SValue *sv)
       }
       if (dest->pr1 != PREG_NONE && tcc_is_64bit_operand(sv))
       {
-        int v_high = (sv->r2 != VT_CONST) ? sv->r2 : (src_reg + 1);
+        int v_high = (sv->pr1 != PREG_NONE) ? sv->pr1 : ((sv->r2 != VT_CONST) ? sv->r2 : (src_reg + 1));
         if (dest->pr1 != v_high)
         {
           ot_check(th_mov_reg(dest->pr1, v_high, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
@@ -3209,6 +3208,25 @@ static void thumb_prepare_dest_pair_for_64bit_op(const char *ctx, SValue *dest, 
   *store_low = false;
   *store_high = false;
 
+  /* Defensive fix: if a 64-bit register destination is missing the high register,
+   * assume a consecutive pair (r, r+1). This prevents storing the high word into
+   * the low register when pr1 is unset.
+   */
+  if (((*rd_high == PREG_NONE) || (*rd_high == *rd_low)) && dest->pr0 != PREG_NONE && !(dest->r & VT_LVAL) &&
+      dest->r != VT_LOCAL)
+  {
+    int candidate = *rd_low + 1;
+    if (thumb_is_hw_reg(*rd_low) && thumb_is_hw_reg(candidate) && candidate != R_SP && candidate != R_PC)
+    {
+      dest->pr1 = candidate;
+      *rd_high = candidate;
+    }
+    else
+    {
+      tcc_error("compiler_error: %s missing high register for 64-bit destination (pr0=%d)", ctx, *rd_low);
+    }
+  }
+
   /* If the chosen destination register overlaps with an excluded register
    * (typically a live source operand), do not write the result in-place.
    * Materialize into scratch and store back afterward.
@@ -3249,34 +3267,54 @@ static void thumb_store_dest_pair_if_needed(SValue *dest, int rd_low, int rd_hig
   if (!dest)
     return;
 
+  const bool dest_is_reg =
+      (!(dest->r & VT_LVAL) && dest->r != VT_LOCAL && dest->pr0 != PREG_NONE && thumb_is_hw_reg(dest->pr0));
+
   if (store_low)
-    store(rd_low, dest);
+  {
+    if (dest_is_reg)
+    {
+      if (dest->pr0 != rd_low)
+      {
+        ot_check(th_mov_reg(dest->pr0, rd_low, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                            ENFORCE_ENCODING_NONE, false));
+      }
+    }
+    else
+    {
+      SValue dest_lo = *dest;
+      dest_lo.pr1 = PREG_NONE;
+      dest_lo.type.t = VT_INT;
+      store(rd_low, &dest_lo);
+    }
+  }
   if (store_high)
   {
-    SValue dest_hi = *dest;
-    dest_hi.c.i += 4;
-    store(rd_high, &dest_hi);
-  }
-}
-
-static void thumb_emit_add_imm_fallback(int rd, int rn, uint32_t imm, thumb_flags_behaviour flags)
-{
-  thumb_opcode add_low = th_add_imm(rd, rn, imm, flags, ENFORCE_ENCODING_NONE);
-  if (add_low.size == 0)
-  {
-    uint32_t exclude = 0;
-    if (rd >= 0 && rd <= 15)
-      exclude |= (1u << rd);
-    if (rn >= 0 && rn <= 15)
-      exclude |= (1u << rn);
-    ScratchRegAlloc scratch = get_scratch_reg_with_save(exclude);
-    tcc_machine_load_constant(scratch.reg, PREG_NONE, (int32_t)imm, 0, NULL);
-    ot_check(th_add_reg(rd, rn, scratch.reg, flags, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-    restore_scratch_reg(&scratch);
-  }
-  else
-  {
-    ot_check(add_low);
+    if (dest_is_reg)
+    {
+      int dest_high = dest->pr1;
+      if (dest_high == PREG_NONE || dest_high == dest->pr0)
+      {
+        int candidate = dest->pr0 + 1;
+        if (thumb_is_hw_reg(dest->pr0) && thumb_is_hw_reg(candidate) && candidate != R_SP && candidate != R_PC)
+          dest_high = candidate;
+      }
+      if (dest_high == PREG_NONE)
+        tcc_error("compiler_error: missing high register for 64-bit storeback");
+      if (dest_high != rd_high)
+      {
+        ot_check(th_mov_reg(dest_high, rd_high, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                            ENFORCE_ENCODING_NONE, false));
+      }
+    }
+    else
+    {
+      SValue dest_hi = *dest;
+      dest_hi.c.i += 4;
+      dest_hi.pr1 = PREG_NONE;
+      dest_hi.type.t = VT_INT;
+      store(rd_high, &dest_hi);
+    }
   }
 }
 
@@ -3546,10 +3584,32 @@ static void thumb_emit_dp_imm_with_fallback(ThumbDataProcessingHandler handler, 
 static void thumb_emit_logical64_op(TACQuadruple *op, ThumbDataProcessingHandler handler, thumb_u64_fold_t fold64,
                                     thumb_u32_fold_t fold32, const char *ctx)
 {
-  const bool src1_is_imm = th_has_immediate_value(op->src1.r) || op->src1.pr0 == PREG_NONE;
-  const bool src2_is_imm = th_has_immediate_value(op->src2.r) || op->src2.pr0 == PREG_NONE;
+  static int debug_logical64 = -1;
+  if (debug_logical64 == -1)
+    debug_logical64 = (getenv("TCC_DEBUG_LOGICAL64") != NULL);
+
+  /* Only treat true VT_CONST operands as immediates.
+   * Non-immediate values may legitimately have pr0==PREG_NONE (e.g. stack locals)
+   * and must be loaded/materialized, not misclassified as constants.
+   */
+  const bool src1_is_imm = th_has_immediate_value(op->src1.r);
+  const bool src2_is_imm = th_has_immediate_value(op->src2.r);
   const uint64_t src1_imm = (uint64_t)op->src1.c.i;
   const uint64_t src2_imm = (uint64_t)op->src2.c.i;
+
+  /* If the destination vreg is the same as a source, but pr1 is missing or
+   * corrupted, inherit the source high register to avoid clobbering the low. */
+  if (op->dest.pr0 != PREG_NONE && (op->dest.pr1 == PREG_NONE || op->dest.pr1 == op->dest.pr0))
+  {
+    if (op->dest.vr == op->src1.vr && op->src1.pr1 != PREG_NONE)
+      op->dest.pr1 = op->src1.pr1;
+    else if (op->dest.vr == op->src2.vr && op->src2.pr1 != PREG_NONE)
+      op->dest.pr1 = op->src2.pr1;
+    else if (op->dest.pr0 == op->src1.pr0 && op->src1.pr1 != PREG_NONE)
+      op->dest.pr1 = op->src1.pr1;
+    else if (op->dest.pr0 == op->src2.pr0 && op->src2.pr1 != PREG_NONE)
+      op->dest.pr1 = op->src2.pr1;
+  }
 
   if (src1_is_imm && src2_is_imm)
   {
@@ -3576,14 +3636,72 @@ static void thumb_emit_logical64_op(TACQuadruple *op, ThumbDataProcessingHandler
     const uint32_t imm_high = (uint32_t)(imm64 >> 32);
     const bool reg_src_is64 = is_64bit_type(reg_src->type.t);
 
-    thumb_require_materialized_reg(ctx, "src.low", reg_src->pr0);
-    if (reg_src_is64 && reg_src->pr1 != PREG_NONE)
-      thumb_require_materialized_reg(ctx, "src.high", reg_src->pr1);
-    else
-      thumb_ensure_not_spilled(ctx, "src.high", reg_src->pr1);
+    /* Materialize the register source if it isn't already in registers (e.g. stack local).
+     * Also: a 64-bit stack local may sometimes arrive as VT_LOCAL without VT_LVAL;
+     * for 64-bit ops we always need the VALUE, not the address.
+     */
+    ScratchRegAlloc reg_src_lo_alloc = (ScratchRegAlloc){0};
+    ScratchRegAlloc reg_src_hi_alloc = (ScratchRegAlloc){0};
+    int rn_low = reg_src->pr0;
+    int rn_high = (reg_src_is64 ? reg_src->pr1 : PREG_NONE);
 
-    const int rn_low = reg_src->pr0;
-    const int rn_high = (reg_src_is64 && reg_src->pr1 != PREG_NONE) ? reg_src->pr1 : PREG_NONE;
+    const int reg_src_kind = reg_src->r & VT_VALMASK;
+    const bool reg_src_is_stack_local = (reg_src_kind == VT_LOCAL || reg_src_kind == VT_LLOCAL);
+    const bool reg_src_is_addr_of_local = reg_src_is64 && reg_src_is_stack_local && !(reg_src->r & VT_LVAL);
+    /* Heuristic fallback: some IR paths may lose VT_LOCAL/VT_LLOCAL while still
+      carrying a stack frame offset in c.i. For 64-bit ops, treat that as a
+      stack value that must be loaded (not an address). */
+    const bool reg_src_force_value_load = reg_src_is64 && !(reg_src->r & VT_LVAL) && (reg_src->c.i != 0);
+
+    if (rn_low == PREG_NONE || (reg_src_is64 && rn_high == PREG_NONE) || reg_src_is_addr_of_local ||
+        reg_src_force_value_load)
+    {
+      uint32_t load_exclude = 0;
+      reg_src_lo_alloc = get_scratch_reg_with_save(load_exclude);
+      rn_low = reg_src_lo_alloc.reg;
+      if (thumb_is_hw_reg(rn_low))
+        load_exclude |= (1u << rn_low);
+      if (reg_src_is64)
+      {
+        reg_src_hi_alloc = get_scratch_reg_with_save(load_exclude);
+        rn_high = reg_src_hi_alloc.reg;
+        if (thumb_is_hw_reg(rn_high))
+          load_exclude |= (1u << rn_high);
+      }
+
+      SValue tmp = *reg_src;
+
+      /* For 64-bit logical ops we always need an rvalue. Stack locals sometimes
+       * arrive as VT_LOCAL/VT_LLOCAL without VT_LVAL (i.e. address-of stack slot);
+       * force a value load in that case.
+       */
+      if (reg_src_is64)
+      {
+        const int tmp_kind = tmp.r & VT_VALMASK;
+        if ((tmp_kind == VT_LOCAL || tmp_kind == VT_LLOCAL) && !(tmp.r & VT_LVAL))
+          tmp.r |= VT_LVAL;
+      }
+
+      if (debug_logical64 && reg_src_is64)
+      {
+        const int reg_src_kind_dbg = reg_src->r & VT_VALMASK;
+        const int tmp_kind_dbg = tmp.r & VT_VALMASK;
+        fprintf(stderr,
+                "[DBG] %s imm64=0x%08x%08x reg_src.r=0x%x kind=%d LVAL=%d pr0=%d pr1=%d c.i=%lld tmp.r=0x%x kind=%d "
+                "LVAL=%d c.i=%lld\n",
+                ctx, (unsigned)(imm64 >> 32), (unsigned)(imm64 & 0xffffffffu), reg_src->r, reg_src_kind_dbg,
+                !!(reg_src->r & VT_LVAL), reg_src->pr0, reg_src->pr1, (long long)reg_src->c.i, tmp.r, tmp_kind_dbg,
+                !!(tmp.r & VT_LVAL), (long long)tmp.c.i);
+      }
+      load_to_reg(rn_low, reg_src_is64 ? rn_high : PREG_NONE, &tmp);
+    }
+
+    thumb_require_materialized_reg(ctx, "src.low", rn_low);
+    if (reg_src_is64 && rn_high != PREG_NONE)
+      thumb_require_materialized_reg(ctx, "src.high", rn_high);
+    else
+      thumb_ensure_not_spilled(ctx, "src.high", rn_high);
+
     const int mask_regs_for_dest[] = {rn_low, rn_high};
     dest_exclude = thumb_exclude_mask_for_regs(2, mask_regs_for_dest);
     thumb_prepare_dest_pair_for_64bit_op(ctx, &op->dest, &rd_low, &rd_high, &rd_low_alloc, &rd_high_alloc, &store_low,
@@ -3610,6 +3728,11 @@ static void thumb_emit_logical64_op(TACQuadruple *op, ThumbDataProcessingHandler
     {
       thumb_emit_dp_imm_with_fallback(handler, rd_high, rn_high, imm_high, imm_exclude);
     }
+
+    if (reg_src_hi_alloc.reg != 0)
+      restore_scratch_reg(&reg_src_hi_alloc);
+    if (reg_src_lo_alloc.reg != 0)
+      restore_scratch_reg(&reg_src_lo_alloc);
 
     goto thumb_logical64_cleanup;
   }
@@ -4695,6 +4818,108 @@ static void gen_hardfp_cmp(TACQuadruple *q, int is_double)
   ot_check(th_vmrs(0x0f)); /* 0x0f = APSR_nzcv */
 }
 
+/* Generate a soft-float library function call for FP operations.
+ * Parameters are passed in R0, R1 (float) or R0:R1, R2:R3 (double)
+ * according to EABI soft-float calling convention.
+ */
+static void gen_softfp_call(TACQuadruple *q, const char *func_name, int is_double)
+{
+  Sym *sym;
+  SValue func_sv;
+
+  /* Load operands into argument registers per soft-float EABI convention */
+  if (q->op == TCCIR_OP_FNEG)
+  {
+    /* Unary: single operand in R0 (float) or R0:R1 (double) */
+    load_to_reg(R0, is_double ? R1 : PREG_NONE, &q->src1);
+  }
+  else if (q->op == TCCIR_OP_FCMP)
+  {
+    /* Binary comparison: src1 in R0/R0:R1, src2 in R1/R2:R3 */
+    if (is_double)
+    {
+      load_to_reg(R0, R1, &q->src1);
+      load_to_reg(R2, R3, &q->src2);
+    }
+    else
+    {
+      load_to_reg(R0, PREG_NONE, &q->src1);
+      load_to_reg(R1, PREG_NONE, &q->src2);
+    }
+  }
+  else if (q->op == TCCIR_OP_CVT_FTOF || q->op == TCCIR_OP_CVT_ITOF || q->op == TCCIR_OP_CVT_FTOI)
+  {
+    /* Conversion: single operand in R0 (float/int) or R0:R1 (double/long) */
+    int src_is_64bit = is_64bit_type(q->src1.type.t);
+    load_to_reg(R0, src_is_64bit ? R1 : PREG_NONE, &q->src1);
+  }
+  else
+  {
+    /* Binary arithmetic: src1 in R0/R0:R1, src2 in R1/R2:R3 */
+    if (is_double)
+    {
+      load_to_reg(R0, R1, &q->src1);
+      load_to_reg(R2, R3, &q->src2);
+    }
+    else
+    {
+      load_to_reg(R0, PREG_NONE, &q->src1);
+      load_to_reg(R1, PREG_NONE, &q->src2);
+    }
+  }
+
+  /* Get or create the external symbol for the soft-float function */
+  sym = external_global_sym(tok_alloc_const(func_name), &func_old_type);
+
+  /* Set up SValue for the function call */
+  memset(&func_sv, 0, sizeof(SValue));
+  func_sv.r = VT_CONST | VT_SYM;
+  func_sv.sym = sym;
+  func_sv.c.i = 0;
+
+  /* Generate BL to the soft-float function */
+  gcall_or_jump(0, &func_sv);
+
+  /* Result is in R0 (float/int) or R0:R1 (double/long) */
+  if (q->op != TCCIR_OP_FCMP)
+  {
+    if (is_64bit_type(q->dest.type.t))
+    {
+      /* For 64-bit results, R0 holds low word, R1 holds high word. */
+      if (q->dest.pr0 != PREG_NONE || q->dest.pr1 != PREG_NONE)
+      {
+        if (q->dest.pr0 == PREG_NONE || q->dest.pr1 == PREG_NONE)
+          tcc_error("compiler_error: soft-float double result destination missing register half");
+        thumb_require_materialized_reg("gen_softfp_call", "dest.low", q->dest.pr0);
+        thumb_require_materialized_reg("gen_softfp_call", "dest.high", q->dest.pr1);
+        if (q->dest.pr0 != R0)
+        {
+          ot_check(th_mov_reg(q->dest.pr0, R0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                              ENFORCE_ENCODING_NONE, false));
+        }
+        if (q->dest.pr1 != R1)
+        {
+          ot_check(th_mov_reg(q->dest.pr1, R1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                              ENFORCE_ENCODING_NONE, false));
+        }
+      }
+      else
+      {
+        /* Memory destination: store both words using store(). */
+        int saved_pr1 = q->dest.pr1;
+        q->dest.pr1 = R1;
+        store(R0, &q->dest);
+        q->dest.pr1 = saved_pr1;
+      }
+    }
+    else
+    {
+      store(R0, &q->dest);
+    }
+  }
+  /* For FCMP, result is in CPSR flags - no store needed */
+}
+
 /* Generate float-to-float conversion (float <-> double).
  * Uses VCVT for hard float, library calls for soft float.
  */
@@ -4745,7 +4970,7 @@ static void gen_hardfp_cvt_itof(TACQuadruple *q)
     {
       func_name = is_unsigned ? "__aeabi_ul2f" : "__aeabi_l2f";
     }
-    // gen_softfp_call(q, func_name, 0);
+    gen_softfp_call(q, func_name, 0);
     return;
   }
 
@@ -4786,7 +5011,7 @@ static void gen_hardfp_cvt_ftoi(TACQuadruple *q)
     {
       func_name = is_unsigned ? "__aeabi_f2ulz" : "__aeabi_f2lz";
     }
-    // gen_softfp_call(q, func_name, src_is_double);
+    gen_softfp_call(q, func_name, src_is_double);
     return;
   }
 
@@ -4830,10 +5055,12 @@ ST_FUNC void tcc_gen_machine_fp_op(TACQuadruple *q)
   int is_double = ((q->src1.type.t & VT_BTYPE) != VT_FLOAT);
   const char *func_name;
 
-  /* Use VFP hardware instructions when hard float ABI is enabled
-   * AND the FPU supports the precision (always for float, check for double) */
-  int use_vfp =
-      (tcc_state->float_abi == ARM_HARD_FLOAT) && (!is_double || arm_fpu_supports_double(tcc_state->fpu_type));
+  /* Use VFP hardware instructions when:
+   * - Hardware float ABI (pass args in VFP regs) OR softfp ABI (pass args in GPRs but can use VFP instructions)
+   * - AND the FPU supports the precision (always for float, check for double)
+   * Note: For softfp, we use VFP instructions but function calls still pass args in R0-R3 */
+  int use_vfp = (tcc_state->float_abi == ARM_HARD_FLOAT || tcc_state->float_abi == ARM_SOFTFP_FLOAT) &&
+                (!is_double || arm_fpu_supports_double(tcc_state->fpu_type));
 
   if (use_vfp)
   {
@@ -4962,7 +5189,7 @@ ST_FUNC void tcc_gen_machine_fp_op(TACQuadruple *q)
       store(R0, &q->dest);
       return;
     }
-    // gen_softfp_call(q, func_name_cvt, src_is_double);
+    gen_softfp_call(q, func_name_cvt, src_is_double);
     return;
   }
 
@@ -4996,7 +5223,7 @@ ST_FUNC void tcc_gen_machine_fp_op(TACQuadruple *q)
         func_name_cvt = is_unsigned ? "__aeabi_ui2f" : "__aeabi_i2f";
       }
     }
-    // gen_softfp_call(q, func_name_cvt, 0);
+    gen_softfp_call(q, func_name_cvt, 0);
     return;
   }
 
@@ -5030,13 +5257,13 @@ ST_FUNC void tcc_gen_machine_fp_op(TACQuadruple *q)
         func_name_cvt = is_unsigned ? "__aeabi_f2uiz" : "__aeabi_f2iz";
       }
     }
-    // gen_softfp_call(q, func_name_cvt, src_is_double);
+    gen_softfp_call(q, func_name_cvt, src_is_double);
     return;
   }
 
   if (func_name)
   {
-    // gen_softfp_call(q, func_name, is_double);
+    gen_softfp_call(q, func_name, is_double);
     return;
   }
 
@@ -5152,11 +5379,18 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
   /* Clear global symbol cache at function start */
   thumb_gen_state.cached_global_sym = NULL;
   thumb_gen_state.cached_global_reg = PREG_NONE;
+  TCCIRState *ir = tcc_state->ir;
 
   if (!leaffunc)
   {
     registers_to_push |= (1 << R_LR);
     registers_count++;
+  }
+
+  /* Variadic functions need a stable FP for va_list setup. */
+  if (func_var)
+  {
+    tcc_state->need_frame_pointer = 1;
   }
 
   /* Keep FP whenever the function needs any FP-relative stack accesses.
@@ -5203,6 +5437,8 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
   pushed_registers = registers_to_push;
 
   // allocate stack space for local variables
+  /* Variadic save area is reserved in the IR stack layout (loc bias). */
+
   /* Keep SP 8-byte aligned (AAPCS). tccir normally pre-aligns stack_size, but
    * be defensive here because other codepaths may call into the backend.
    */
@@ -5225,12 +5461,64 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
     gadd_sp(-stack_size);
   }
 
+  /* For variadic functions, save incoming r0-r3 in a fixed area at FP-16..FP-4
+   * and store the caller stack-args pointer at FP-20.
+   */
+  int named_reg_bytes = 0;
+  int named_stack_bytes = 0;
+  if (func_var && ir)
+  {
+    for (int vreg = 0; vreg < ir->next_parameter; ++vreg)
+    {
+      const int encoded_vreg = (TCCIR_VREG_TYPE_PARAM << 28) | vreg;
+      IRLiveInterval *interval = tcc_ir_get_live_interval(ir, encoded_vreg);
+      if (!interval)
+        continue;
+
+      int max_reg = -1;
+      if (interval->incoming_reg0 >= 0)
+        max_reg = interval->incoming_reg0;
+      if (interval->incoming_reg1 >= 0 && interval->incoming_reg1 > max_reg)
+        max_reg = interval->incoming_reg1;
+
+      if (max_reg >= 0)
+      {
+        const int bytes = (max_reg + 1) * 4;
+        if (bytes > named_reg_bytes)
+          named_reg_bytes = bytes;
+      }
+      else
+      {
+        const int size = (interval->is_double || interval->is_llong) ? 8 : 4;
+        const int end = interval->original_offset + size;
+        if (end > named_stack_bytes)
+          named_stack_bytes = end;
+      }
+    }
+  }
+
+  if (func_var)
+  {
+    tcc_gen_machine_store_to_stack(R0, -16);
+    tcc_gen_machine_store_to_stack(R1, -12);
+    tcc_gen_machine_store_to_stack(R2, -8);
+    tcc_gen_machine_store_to_stack(R3, -4);
+
+    /* stack args start at FP + offset_to_args + named_stack_bytes */
+    ot_check(th_add_imm(R12, R_FP, offset_to_args + named_stack_bytes, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                        ENFORCE_ENCODING_NONE));
+    tcc_gen_machine_store_to_stack(R12, -20);
+
+    /* store the number of named-arg bytes consumed in r0-r3 */
+    tcc_machine_load_constant(R12, PREG_NONE, named_reg_bytes, 0, NULL);
+    tcc_gen_machine_store_to_stack(R12, -24);
+  }
+
   /* Move parameters from incoming registers to their allocated locations.
    * For non-leaf functions or parameters that cross calls:
    * - If allocated to callee-saved register: move from R0-R3 to allocated reg
    * - If spilled: store from R0-R3 to stack location
    * For leaf functions with params staying in R0-R3: no move needed */
-  TCCIRState *ir = tcc_state->ir;
   if (ir)
   {
     /* Parameter shuffling must not clobber still-needed incoming registers.
@@ -5473,7 +5761,6 @@ ST_FUNC void tcc_gen_machine_epilog(int leaffunc)
 
 ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *op)
 {
-  const char *ctx = "tcc_gen_machine_assign_op";
   /* Only consider VFP registers if hard float ABI is enabled */
   int use_vfp_regs = (tcc_state->float_abi == ARM_HARD_FLOAT);
   int dest_is_vfp = use_vfp_regs && LS_IS_VFP_REG(op->dest.pr0);
@@ -5484,7 +5771,6 @@ ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *op)
    * (often PREG_NONE=0xFF), which encodes as PC and generates invalid code.
    */
   const int dest_is_64bit = is_64bit_type(op->dest.type.t);
-  int dest_is_local = (op->dest.r & VT_VALMASK) == VT_LOCAL;
 
   /* NOTE: Avoid noisy debug prints in normal builds. */
 
@@ -5713,13 +5999,27 @@ ST_FUNC void tcc_gen_machine_lea_op(TACQuadruple *op)
     if (tcc_state->need_frame_pointer == 0)
       base = R_SP;
 
-    /* Use vreg-based stack slot offset if available, otherwise fall back to c.i */
+    /* For local variables (VAR vregs), use the original offset from c.i.
+     * The register allocator may have assigned a different spill slot,
+     * but for address-of operations we need the original variable location.
+     * For spilled temps/params, use the allocated stack slot offset.
+     */
     int offset;
-    const TCCStackSlot *slot = tcc_ir_stack_slot_by_vreg(tcc_state->ir, op->src1.vr);
-    if (slot)
-      offset = slot->offset;
-    else
+    const int vreg_type = TCCIR_DECODE_VREG_TYPE(op->src1.vr);
+    if (vreg_type == TCCIR_VREG_TYPE_VAR && op->src1.c.i != 0)
+    {
+      /* VAR vreg with non-zero c.i: use original variable offset */
       offset = (int)op->src1.c.i;
+    }
+    else
+    {
+      /* Use vreg-based stack slot offset if available, otherwise fall back to c.i */
+      const TCCStackSlot *slot = tcc_ir_stack_slot_by_vreg(tcc_state->ir, op->src1.vr);
+      if (slot)
+        offset = slot->offset;
+      else
+        offset = (int)op->src1.c.i;
+    }
     /* Stack parameters live above the saved-register area.
      * When computing their address, fold in offset_to_args (prologue push size). */
     if (op->src1.r & VT_PARAM)
@@ -7162,6 +7462,8 @@ ST_FUNC const char *tcc_get_abi_softcall_name(TACQuadruple *q)
       return "__aeabi_ddiv";
     case TCCIR_OP_FNEG:
       return "__aeabi_dneg";
+    default:
+      break;
     }
   }
   else
@@ -7178,6 +7480,8 @@ ST_FUNC const char *tcc_get_abi_softcall_name(TACQuadruple *q)
       return "__aeabi_fdiv";
     case TCCIR_OP_FNEG:
       return "__aeabi_fneg";
+    default:
+      break;
     }
   }
 
@@ -7256,6 +7560,8 @@ ST_FUNC const char *tcc_get_abi_softcall_name(TACQuadruple *q)
     return dest_64bit ? "__aeabi_i2d" : "__aeabi_i2f";
   }
   break;
+  default:
+    break;
   }
 
   return NULL;

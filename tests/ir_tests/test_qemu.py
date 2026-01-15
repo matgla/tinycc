@@ -38,6 +38,10 @@ TEST_FILES = [
     ("test_struct_return.c", 0),
     ("test_llong_relops.c", 0),
 
+    # AEABI soft-float regressions (bit-level tests; avoids printf %f).
+    ("test_aeabi_dmul_bits.c", 0),
+    ("test_f2d_bits.c", 0),
+
     ("test_llong_add_signed.c", 0),
     ("test_llong_add_unsigned.c", 0),
     ("test_llong_load_signed.c", 0),
@@ -297,9 +301,11 @@ def _escape_regex(line):
     return re.escape(line)
 
 
-def _run_qemu_test(test_file, expected_exit_code, args=None, defines=None):
+def _run_qemu_test(test_file, expected_exit_code, args=None, defines=None, opt_level="-O0", output_dir=None):
     expected_lines = load_expect_file(test_file)
-    sut, loglines = run_test(test_file, MACHINE, args, defines=defines)
+    opt_suffix = f"_{opt_level.replace('-', '')}"
+    config = CompileConfig(extra_cflags=opt_level, output_suffix=opt_suffix, output_dir=output_dir)
+    sut, loglines = run_test(test_file, MACHINE, args, defines=defines, config=config)
     expected_lines = _strip_compiler_output(expected_lines, loglines)
     try:
         for line in expected_lines:
@@ -308,12 +314,12 @@ def _run_qemu_test(test_file, expected_exit_code, args=None, defines=None):
         sut.wait()
         assert sut.exitstatus == expected_exit_code, f"Expected exit code {expected_exit_code}, got {sut.exitstatus}"
     except Exception as e:
-        raise AssertionError(f"Test failed for {test_file}: {e}") from e
+        raise AssertionError(f"Test failed for {test_file} with {opt_level}: {e}") from e
     finally:
         sut.logfile.close()
 
 
-def _run_tagged_qemu_test(test_file, tag, expected_lines, expected_exit_code):
+def _run_tagged_qemu_test(test_file, tag, expected_lines, expected_exit_code, opt_level="-O0", output_dir=None):
     """Run a tagged test with specific define and expected output.
 
     Tagged tests may either:
@@ -323,15 +329,16 @@ def _run_tagged_qemu_test(test_file, tag, expected_lines, expected_exit_code):
     """
     test_files = [CURRENT_DIR / Path(test_file)]
     safe_tag = _sanitize_tag_for_filename(tag)
-    config = CompileConfig(defines=[tag], output_suffix=f"_{safe_tag}")
+    opt_suffix = f"_{safe_tag}_{opt_level.replace('-', '')}"
+    config = CompileConfig(defines=[tag], output_suffix=opt_suffix, extra_cflags=opt_level, output_dir=output_dir)
     test_name = Path(test_file).stem
 
     result = compile_testcase(test_files, MACHINE, config=config)
 
     # Write log file with compiler command and output
-    log_path = f"{CURRENT_DIR}/build/{test_name}_{safe_tag}_output.log"
+    log_path = str(result.elf_file.with_name(f"{result.elf_file.stem}_output.log"))
     with open(log_path, "w") as log_file:
-        log_file.write(f"=== Compile: {test_file} with -D{tag} ===\n")
+        log_file.write(f"=== Compile: {test_file} {opt_level} with -D{tag} ===\n")
         if result.make_command:
             log_file.write(f"=== Make command: {' '.join(result.make_command)} ===\n")
         log_file.write(f"=== Compiler output ===\n")
@@ -379,30 +386,58 @@ def _run_tagged_qemu_test(test_file, tag, expected_lines, expected_exit_code):
         sut.wait()
         assert sut.exitstatus == expected_exit_code, f"Expected exit code {expected_exit_code}, got {sut.exitstatus}"
     except Exception as e:
-        raise AssertionError(f"Test failed for {test_file} [{tag}]: {e}") from e
+        raise AssertionError(f"Test failed for {test_file} [{tag}] with {opt_level}: {e}") from e
     finally:
         sut.logfile.close()
 
 
+# Optimization levels to test
+OPT_LEVELS = ["-O0", "-O1"]
 
-@pytest.mark.parametrize("test_file,expected_exit_code", TEST_FILES, ids=[_test_id(f[0]) for f in TEST_FILES])
-def test_qemu_execution(test_file, expected_exit_code):
+
+def _generate_matrix_params(test_list):
+    params = []
+    ids = []
+    for test_file, expected in test_list:
+        for opt in OPT_LEVELS:
+            params.append((test_file, expected, opt))
+            ids.append(f"{_test_id(test_file)}{opt}")
+    return params, ids
+
+
+_MATRIX_PARAMS, _MATRIX_IDS = _generate_matrix_params(TEST_FILES)
+
+
+@pytest.mark.parametrize("test_file,expected_exit_code,opt_level", _MATRIX_PARAMS, ids=_MATRIX_IDS)
+def test_qemu_execution(test_file, expected_exit_code, opt_level, tmp_path):
     if test_file is None:
         pytest.fail("test_file is None")
 
-    _run_qemu_test(test_file, expected_exit_code)
+    _run_qemu_test(test_file, expected_exit_code, opt_level=opt_level, output_dir=tmp_path)
 
 
-@pytest.mark.parametrize(
-    "test_file,args,expected_exit_code",
-    TEST_FILES_WITH_ARGS,
-    ids=[_test_id(f[0]) for f in TEST_FILES_WITH_ARGS],
-)
-def test_qemu_execution_with_args(test_file, args, expected_exit_code):
+
+
+
+def _generate_matrix_params_for_args(test_list_with_args):
+    params = []
+    ids = []
+    for test_file, args, expected in test_list_with_args:
+        for opt in OPT_LEVELS:
+            params.append((test_file, args, expected, opt))
+            ids.append(f"{_test_id(test_file)}{opt}")
+    return params, ids
+
+
+_MATRIX_ARGS_PARAMS, _MATRIX_ARGS_IDS = _generate_matrix_params_for_args(TEST_FILES_WITH_ARGS)
+
+
+@pytest.mark.parametrize("test_file,args,expected_exit_code,opt_level", _MATRIX_ARGS_PARAMS, ids=_MATRIX_ARGS_IDS)
+def test_qemu_execution_with_args(test_file, args, expected_exit_code, opt_level, tmp_path):
     if test_file is None:
         pytest.fail("test_file is None")
 
-    _run_qemu_test(test_file, expected_exit_code, args=args)
+    _run_qemu_test(test_file, expected_exit_code, args=args, opt_level=opt_level, output_dir=tmp_path)
 
 
 def _generate_tagged_test_params():
@@ -423,13 +458,26 @@ def _generate_tagged_test_params():
 _TAGGED_PARAMS, _TAGGED_IDS = _generate_tagged_test_params() if TAGGED_TEST_FILES else ([], [])
 
 
+def _generate_tagged_matrix_params(tagged_params):
+    params = []
+    ids = []
+    for test_file, tag, lines, exit_code in tagged_params:
+        for opt in OPT_LEVELS:
+            params.append((test_file, tag, lines, exit_code, opt))
+            ids.append(f"{_test_id(test_file)}[{tag}]{opt}")
+    return params, ids
+
+
+_TAGGED_MATRIX_PARAMS, _TAGGED_MATRIX_IDS = _generate_tagged_matrix_params(_TAGGED_PARAMS) if _TAGGED_PARAMS else ([], [])
+
+
 @pytest.mark.parametrize(
-    "test_file,tag,expected_lines,expected_exit_code",
-    _TAGGED_PARAMS,
-    ids=_TAGGED_IDS,
+    "test_file,tag,expected_lines,expected_exit_code,opt_level",
+    _TAGGED_MATRIX_PARAMS,
+    ids=_TAGGED_MATRIX_IDS,
 )
-def test_qemu_tagged_execution(test_file, tag, expected_lines, expected_exit_code):
+def test_qemu_tagged_execution(test_file, tag, expected_lines, expected_exit_code,opt_level, tmp_path):
     if test_file is None:
         pytest.fail("test_file is None")
 
-    _run_tagged_qemu_test(test_file, tag, expected_lines, expected_exit_code)
+    _run_tagged_qemu_test(test_file, tag, expected_lines, expected_exit_code, opt_level=opt_level, output_dir=tmp_path)

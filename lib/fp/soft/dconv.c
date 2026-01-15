@@ -7,6 +7,9 @@
 #include "../fp_abi.h"
 #include "soft_common.h"
 
+unsigned long long __aeabi_llsr(unsigned long long a, int b);
+long long __aeabi_llsl(long long a, int b);
+
 /* Convert signed int to double */
 double __aeabi_i2d(int a)
 {
@@ -42,10 +45,10 @@ double __aeabi_i2d(int a)
   int exp = DOUBLE_EXP_BIAS + msb_pos;
 
   /* Shift to get 52-bit mantissa */
-  uint64_t mant = (uint64_t)abs_a << (52 - msb_pos);
+  uint64_t mant = (uint64_t)__aeabi_llsl((long long)abs_a, 52 - msb_pos);
   mant &= DOUBLE_MANT_MASK;
 
-  ur.u = ((uint64_t)sign << 63) | ((uint64_t)exp << 52) | mant;
+  ur.u = make_double(sign, exp, mant);
   return ur.d;
 }
 
@@ -69,10 +72,10 @@ double __aeabi_ui2d(unsigned int a)
 
   int exp = DOUBLE_EXP_BIAS + msb_pos;
 
-  uint64_t mant = (uint64_t)a << (52 - msb_pos);
+  uint64_t mant = (uint64_t)__aeabi_llsl((long long)a, 52 - msb_pos);
   mant &= DOUBLE_MANT_MASK;
 
-  ur.u = ((uint64_t)exp << 52) | mant;
+  ur.u = make_double(0, exp, mant);
   return ur.d;
 }
 
@@ -83,7 +86,8 @@ int __aeabi_d2iz(double a)
   {
     double d;
     uint64_t u;
-  } ua = {.d = a};
+  } ua;
+  ua.d = a;
   uint64_t bits = ua.u;
 
   int sign = double_sign(bits);
@@ -109,13 +113,9 @@ int __aeabi_d2iz(double a)
   int shift = actual_exp - 52;
   uint32_t result;
   if (shift >= 0)
-  {
-    result = (uint32_t)(mant << shift);
-  }
+    result = (uint32_t)__aeabi_llsl((long long)mant, shift);
   else
-  {
-    result = (uint32_t)(mant >> (-shift));
-  }
+    result = (uint32_t)__aeabi_llsr(mant, -shift);
 
   return sign ? -(int)result : (int)result;
 }
@@ -127,7 +127,8 @@ unsigned int __aeabi_d2uiz(double a)
   {
     double d;
     uint64_t u;
-  } ua = {.d = a};
+  } ua;
+  ua.d = a;
   uint64_t bits = ua.u;
 
   int sign = double_sign(bits);
@@ -152,13 +153,8 @@ unsigned int __aeabi_d2uiz(double a)
 
   int shift = actual_exp - 52;
   if (shift >= 0)
-  {
-    return (uint32_t)(mant << shift);
-  }
-  else
-  {
-    return (uint32_t)(mant >> (-shift));
-  }
+    return (uint32_t)__aeabi_llsl((long long)mant, shift);
+  return (uint32_t)__aeabi_llsr(mant, -shift);
 }
 
 /* Convert double to unsigned 64-bit integer (truncate toward zero) */
@@ -168,7 +164,8 @@ unsigned long long __aeabi_d2ulz(double a)
   {
     double d;
     uint64_t u;
-  } ua = {.d = a};
+  } ua;
+  ua.d = a;
   uint64_t bits = ua.u;
 
   int sign = double_sign(bits);
@@ -194,12 +191,9 @@ unsigned long long __aeabi_d2ulz(double a)
   {
     if (shift >= 64)
       return ~0ULL;
-    return (unsigned long long)mant << shift;
+    return (unsigned long long)__aeabi_llsl((long long)mant, shift);
   }
-  else
-  {
-    return (unsigned long long)mant >> (-shift);
-  }
+  return (unsigned long long)__aeabi_llsr(mant, -shift);
 }
 
 /* Convert double to signed 64-bit integer (truncate toward zero) */
@@ -209,7 +203,8 @@ long long __aeabi_d2lz(double a)
   {
     double d;
     uint64_t u;
-  } ua = {.d = a};
+  } ua;
+  ua.d = a;
   uint64_t bits = ua.u;
 
   int sign = double_sign(bits);
@@ -231,27 +226,25 @@ long long __aeabi_d2lz(double a)
   int shift = actual_exp - 52;
   unsigned long long magnitude;
   if (shift >= 0)
-    magnitude = (unsigned long long)mant << shift;
+    magnitude = (unsigned long long)__aeabi_llsl((long long)mant, shift);
   else
-    magnitude = (unsigned long long)mant >> (-shift);
+    magnitude = (unsigned long long)__aeabi_llsr(mant, -shift);
 
   return sign ? -(long long)magnitude : (long long)magnitude;
 }
 
-/* Convert single to double precision */
-double __aeabi_f2d(float a)
+/* Convert single to double precision (raw float bits in r0). */
+double __aeabi_f2d_bits(uint32_t bits)
 {
   union
   {
-    float f;
-    uint32_t u;
-  } ua = {.f = a};
-  union
-  {
+    struct
+    {
+      uint32_t lo;
+      uint32_t hi;
+    } w;
     double d;
-    uint64_t u;
   } ur;
-  uint32_t bits = ua.u;
 
   int sign = (bits >> 31) & 1;
   int exp = (bits >> 23) & 0xFF;
@@ -261,23 +254,24 @@ double __aeabi_f2d(float a)
   if (exp == 0xFF)
   {
     /* Inf or NaN */
-    ur.u = ((uint64_t)sign << 63) | DOUBLE_EXP_MASK | ((uint64_t)mant << 29);
+    ur.w.hi = ((uint32_t)sign << 31) | 0x7FF00000u | (mant >> 3);
+    ur.w.lo = mant << 29;
     return ur.d;
   }
   if (exp == 0 && mant == 0)
   {
     /* Zero */
-    ur.u = (uint64_t)sign << 63;
+    ur.w.hi = (uint32_t)sign << 31;
+    ur.w.lo = 0;
     return ur.d;
   }
 
   /* Convert exponent: remove float bias, add double bias */
   int new_exp = exp - FLOAT_EXP_BIAS + DOUBLE_EXP_BIAS;
 
-  /* Expand mantissa from 23 bits to 52 bits */
-  uint64_t new_mant = (uint64_t)mant << 29;
-
-  ur.u = ((uint64_t)sign << 63) | ((uint64_t)new_exp << 52) | new_mant;
+  /* Build double using 32-bit words to avoid 64-bit shifts. */
+  ur.w.hi = ((uint32_t)sign << 31) | ((uint32_t)new_exp << 20) | (mant >> 3);
+  ur.w.lo = mant << 29;
   return ur.d;
 }
 
@@ -288,7 +282,8 @@ float __aeabi_d2f(double a)
   {
     double d;
     uint64_t u;
-  } ua = {.d = a};
+  } ua;
+  ua.d = a;
   union
   {
     float f;
@@ -296,15 +291,15 @@ float __aeabi_d2f(double a)
   } ur;
   uint64_t bits = ua.u;
 
-  int sign = (bits >> 63) & 1;
-  int exp = (bits >> 52) & 0x7FF;
-  uint64_t mant = bits & DOUBLE_MANT_MASK;
+  int sign = double_sign(bits);
+  int exp = double_exp(bits);
+  uint64_t mant = double_mant(bits);
 
   /* Handle special cases */
   if (exp == 0x7FF)
   {
     /* Inf or NaN */
-    ur.u = ((uint32_t)sign << 31) | 0x7F800000U | ((uint32_t)(mant >> 29) & FLOAT_MANT_MASK);
+    ur.u = ((uint32_t)sign << 31) | 0x7F800000U | ((uint32_t)__aeabi_llsr(mant, 29) & FLOAT_MANT_MASK);
     return ur.f;
   }
   if (exp == 0 && mant == 0)
@@ -332,7 +327,7 @@ float __aeabi_d2f(double a)
   }
 
   /* Truncate mantissa from 52 bits to 23 bits */
-  uint32_t new_mant = (uint32_t)(mant >> 29);
+  uint32_t new_mant = (uint32_t)__aeabi_llsr(mant, 29);
 
   ur.u = ((uint32_t)sign << 31) | ((uint32_t)new_exp << 23) | new_mant;
   return ur.f;

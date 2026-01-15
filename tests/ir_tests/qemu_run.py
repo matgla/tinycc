@@ -66,10 +66,12 @@ class CompileConfig:
     """Configuration for compilation."""
     compiler: Optional[Path] = None  # None = use default armv8m-tcc
     extra_cflags: str = ""
+    dump_ir: bool = False  # Pass -dump-ir to the compiler (TinyCC only)
     defines: Optional[list] = None  # List of defines, e.g. ["FOO", "BAR=1"]
     profiler: Optional[ProfileConfig] = None
     clean_before_build: bool = True
     output_dir: Optional[Path] = None  # None = use default build dir
+    output_prefix: str = ""  # Prefix to add to output filename (e.g. "O0_")
     output_suffix: str = ""  # Suffix to add to output filename (e.g. "_tag")
 
     def __post_init__(self):
@@ -116,14 +118,14 @@ def _primary_file(test_file):
     return files[0]
 
 
-def get_test_output_file(test_name, output_dir=None, suffix=""):
+def get_test_output_file(test_name, output_dir=None, prefix="", suffix=""):
     primary = _primary_file(test_name)
     if output_dir is None:
         output_dir = CURRENT_DIR / "build"
-    return output_dir / f"{Path(primary).stem}{suffix}.elf"
+    return output_dir / f"{prefix}{Path(primary).stem}{suffix}.elf"
 
 
-def build_make_command(test_file, machine, compiler, output_dir=None, cflags=None, defines=None, cc_wrapper=None, output_suffix=""):
+def build_make_command(test_file, machine, compiler, output_dir=None, cflags=None, defines=None, cc_wrapper=None, output_prefix="", output_suffix=""):
     """Build the make command for compiling a test case."""
     make_dir = CURRENT_DIR / 'qemu' / machine
     test_files = [str(f) for f in _as_file_list(test_file)]
@@ -139,7 +141,7 @@ def build_make_command(test_file, machine, compiler, output_dir=None, cflags=Non
         f"OUTPUT={output_dir}",
         f"TEST_FILES={test_files_value}",
         f"CC={compiler}",
-        f"TARGET={get_test_output_file(test_file, output_dir, output_suffix)}",
+        f"TARGET={get_test_output_file(test_file, output_dir, prefix=output_prefix, suffix=output_suffix)}",
     ]
     # Build EXTRA_CFLAGS from cflags and defines
     extra_cflags_parts = []
@@ -410,6 +412,12 @@ def compile_testcase(test_file, machine, compiler=None, cflags=None, config=None
     if cflags is not None:
         config.extra_cflags = cflags
 
+    # Convenience: allow callers to request IR dumping without manually
+    # threading -dump-ir through extra_cflags.
+    if getattr(config, "dump_ir", False):
+        if "-dump-ir" not in (config.extra_cflags or ""):
+            config.extra_cflags = (config.extra_cflags + " -dump-ir").strip()
+
     # Determine output directory
     output_dir = config.output_dir or (CURRENT_DIR / "build")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -440,6 +448,7 @@ def compile_testcase(test_file, machine, compiler=None, cflags=None, config=None
         cflags=config.extra_cflags or None,
         defines=config.defines,
         cc_wrapper=cc_wrapper,
+        output_prefix=config.output_prefix,
         output_suffix=config.output_suffix
     )
 
@@ -456,7 +465,7 @@ def compile_testcase(test_file, machine, compiler=None, cflags=None, config=None
     result = subprocess.run(make_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     elapsed = time.perf_counter() - start
 
-    elf_file = get_test_output_file(test_file, output_dir, config.output_suffix)
+    elf_file = get_test_output_file(test_file, output_dir, prefix=config.output_prefix, suffix=config.output_suffix)
     output_lines = []
     if result.stdout:
         output_lines.extend(result.stdout.decode().splitlines())
@@ -541,9 +550,6 @@ def run_test(test_file, machine, args=None, cflags=None, defines=None, config=No
     Returns:
         Tuple of (pexpect.spawn, output_lines)
     """
-    primary = _primary_file(test_file)
-    test_name = Path(primary).stem
-
     test_files = [CURRENT_DIR / Path(f) for f in _as_file_list(test_file)]
 
     # Use new compile_testcase with config
@@ -561,8 +567,11 @@ def run_test(test_file, machine, args=None, cflags=None, defines=None, config=No
 
     sut = prepare_test(machine, compile_result.elf_file, args)
 
-    # Enable logging to file
-    log_file = open(f"{CURRENT_DIR}/build/{test_name}_output.log", "wb")
+    # Enable logging to file (name follows built ELF, so it naturally includes prefix/suffix)
+    log_path = compile_result.elf_file.with_name(f"{compile_result.elf_file.stem}_output.log")
+    log_file = open(log_path, "wb")
+    if config and config.extra_cflags:
+        log_file.write(f"=== EXTRA_CFLAGS: {config.extra_cflags} ===\n".encode())
     sut.logfile = log_file
 
     return sut, compile_result.output_lines

@@ -18,22 +18,44 @@
 #define DOUBLE_EXP_SHIFT 52
 #define DOUBLE_IMPLICIT_BIT (1ULL << 52)
 
+typedef union
+{
+  uint64_t u;
+  struct
+  {
+#if defined(__BYTE_ORDER__) && defined(__ORDER_BIG_ENDIAN__) && (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
+    uint32_t hi;
+    uint32_t lo;
+#else
+    uint32_t lo;
+    uint32_t hi;
+#endif
+  } w;
+} u64_words;
+
 /* Extract sign from double bits */
 static inline int double_sign(uint64_t bits)
 {
-  return (bits >> 63) & 1;
+  u64_words v;
+  v.u = bits;
+  return (v.w.hi >> 31) & 1;
 }
 
 /* Extract exponent from double bits */
 static inline int double_exp(uint64_t bits)
 {
-  return (bits >> 52) & 0x7FF;
+  u64_words v;
+  v.u = bits;
+  return (v.w.hi >> 20) & 0x7FF;
 }
 
 /* Extract mantissa from double bits */
 static inline uint64_t double_mant(uint64_t bits)
 {
-  return bits & DOUBLE_MANT_MASK;
+  u64_words v;
+  v.u = bits;
+  v.w.hi &= 0xFFFFF;
+  return v.u;
 }
 
 /* Check if double bits represent NaN */
@@ -57,45 +79,55 @@ static inline int is_zero_bits(uint64_t bits)
 /* Build double from components */
 static inline uint64_t make_double(int sign, int exp, uint64_t mant)
 {
-  return ((uint64_t)sign << 63) | ((uint64_t)exp << 52) | (mant & DOUBLE_MANT_MASK);
+  u64_words v;
+  u64_words m;
+  m.u = mant;
+  v.w.lo = m.w.lo;
+  v.w.hi = ((uint32_t)sign << 31) | ((uint32_t)exp << 20) | (m.w.hi & 0xFFFFF);
+  return v.u;
+}
+
+/* Count leading zeros in 32-bit value */
+static inline int clz32(uint32_t x)
+{
+  int n = 0;
+  if (x == 0)
+    return 32;
+  if ((x & 0xFFFF0000U) == 0)
+  {
+    n += 16;
+    x <<= 16;
+  }
+  if ((x & 0xFF000000U) == 0)
+  {
+    n += 8;
+    x <<= 8;
+  }
+  if ((x & 0xF0000000U) == 0)
+  {
+    n += 4;
+    x <<= 4;
+  }
+  if ((x & 0xC0000000U) == 0)
+  {
+    n += 2;
+    x <<= 2;
+  }
+  if ((x & 0x80000000U) == 0)
+  {
+    n += 1;
+  }
+  return n;
 }
 
 /* Count leading zeros in 64-bit value */
 static inline int clz64(uint64_t x)
 {
-  int n = 0;
-  if (x == 0)
-    return 64;
-  if ((x & 0xFFFFFFFF00000000ULL) == 0)
-  {
-    n += 32;
-    x <<= 32;
-  }
-  if ((x & 0xFFFF000000000000ULL) == 0)
-  {
-    n += 16;
-    x <<= 16;
-  }
-  if ((x & 0xFF00000000000000ULL) == 0)
-  {
-    n += 8;
-    x <<= 8;
-  }
-  if ((x & 0xF000000000000000ULL) == 0)
-  {
-    n += 4;
-    x <<= 4;
-  }
-  if ((x & 0xC000000000000000ULL) == 0)
-  {
-    n += 2;
-    x <<= 2;
-  }
-  if ((x & 0x8000000000000000ULL) == 0)
-  {
-    n += 1;
-  }
-  return n;
+  u64_words v;
+  v.u = x;
+  if (v.w.hi != 0)
+    return clz32(v.w.hi);
+  return 32 + clz32(v.w.lo);
 }
 
 /* ===== SINGLE PRECISION (32-bit) ===== */
@@ -146,39 +178,6 @@ static inline int is_zero_f(uint32_t bits)
 static inline uint32_t make_float(int sign, int exp, uint32_t mant)
 {
   return ((uint32_t)sign << 31) | ((uint32_t)exp << 23) | (mant & FLOAT_MANT_MASK);
-}
-
-/* Count leading zeros in 32-bit value */
-static inline int clz32(uint32_t x)
-{
-  int n = 0;
-  if (x == 0)
-    return 32;
-  if ((x & 0xFFFF0000U) == 0)
-  {
-    n += 16;
-    x <<= 16;
-  }
-  if ((x & 0xFF000000U) == 0)
-  {
-    n += 8;
-    x <<= 8;
-  }
-  if ((x & 0xF0000000U) == 0)
-  {
-    n += 4;
-    x <<= 4;
-  }
-  if ((x & 0xC0000000U) == 0)
-  {
-    n += 2;
-    x <<= 2;
-  }
-  if ((x & 0x80000000U) == 0)
-  {
-    n += 1;
-  }
-  return n;
 }
 
 #endif /* SOFT_COMMON_H */

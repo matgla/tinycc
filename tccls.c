@@ -751,6 +751,15 @@ void tcc_ls_allocate_registers(LSLiveIntervalState *ls, int used_parameters_regi
         }
       }
 
+      if (ls->intervals[i].r0 == ls->intervals[i].r1)
+      {
+        /* Invalid register pair: force spill rather than clobbering. */
+        if (ls->intervals[i].r0 >= 0)
+          tcc_ls_release_register(ls, ls->intervals[i].r0);
+        ls->intervals[i].r0 = -1;
+        ls->intervals[i].r1 = -1;
+      }
+
       if (ls->intervals[i].r0 == -1 || ls->intervals[i].r1 == -1)
       {
         /* Couldn't allocate pair - spill to stack */

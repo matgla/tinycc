@@ -399,7 +399,7 @@ PYTEST ?= pytest
 # run IR tests via pytest (preferred)
 test: cross
 	@echo "------------ ir_tests (pytest) ------------"
-	@cd tests/ir_tests && $(PYTEST) -s
+	@cd tests/ir_tests && $(PYTEST) -s -n auto
 
 # legacy tests (kept for reference)
 test-legacy:
