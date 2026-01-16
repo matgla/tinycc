@@ -7,24 +7,81 @@
 #include "../fp_abi.h"
 #include "soft_common.h"
 
-/* 64x64 -> 128 multiply using 32-bit partial products.
- * Returns the full product as (hi, lo) words.
+/* 64x64 -> 128 multiply.
+ *
+ * Keep multiplications to 32x32->64, but avoid doing 64-bit additions.
+ * Some low-opt codegen paths for 64-bit add/adc are unreliable; accumulating
+ * in 32-bit words with explicit carry keeps the result stable at -O0/-O1.
  */
+static inline uint32_t add32_c(uint32_t a, uint32_t b, uint32_t cin, uint32_t *cout)
+{
+  uint32_t s = a + b;
+  uint32_t c = (s < a);
+  uint32_t s2 = s + cin;
+  c |= (s2 < s);
+  *cout = c;
+  return s2;
+}
+
+static inline void add64_shift32(uint32_t *w1, uint32_t *w2, uint32_t *w3, uint32_t lo, uint32_t hi)
+{
+  uint32_t c;
+  *w1 = add32_c(*w1, lo, 0, &c);
+  *w2 = add32_c(*w2, hi, c, &c);
+  *w3 = add32_c(*w3, 0, c, &c);
+}
+
+static inline void add64_shift64(uint32_t *w2, uint32_t *w3, uint32_t lo, uint32_t hi)
+{
+  uint32_t c;
+  *w2 = add32_c(*w2, lo, 0, &c);
+  *w3 = add32_c(*w3, hi, c, &c);
+}
+
+static inline void mul32wide_u32(uint32_t a, uint32_t b, uint32_t *lo, uint32_t *hi)
+{
+  const uint32_t a0 = a & 0xFFFFu;
+  const uint32_t a1 = a >> 16;
+  const uint32_t b0 = b & 0xFFFFu;
+  const uint32_t b1 = b >> 16;
+
+  const uint32_t p0 = a0 * b0;
+  const uint32_t p1 = a0 * b1;
+  const uint32_t p2 = a1 * b0;
+  const uint32_t p3 = a1 * b1;
+
+  const uint32_t mid = (p0 >> 16) + (p1 & 0xFFFFu) + (p2 & 0xFFFFu);
+  *lo = (p0 & 0xFFFFu) | (mid << 16);
+  *hi = p3 + (p1 >> 16) + (p2 >> 16) + (mid >> 16);
+}
+
 static inline void mul64wide(uint64_t a, uint64_t b, uint64_t *hi, uint64_t *lo)
 {
-  const uint64_t a0 = (uint32_t)a;
-  const uint64_t a1 = a >> 32;
-  const uint64_t b0 = (uint32_t)b;
-  const uint64_t b1 = b >> 32;
+  uint32_t a0 = (uint32_t)a;
+  uint32_t a1 = (uint32_t)(a >> 32);
+  uint32_t b0 = (uint32_t)b;
+  uint32_t b1 = (uint32_t)(b >> 32);
 
-  const uint64_t p0 = a0 * b0;
-  const uint64_t p1 = a0 * b1;
-  const uint64_t p2 = a1 * b0;
-  const uint64_t p3 = a1 * b1;
+  uint32_t p0_lo, p0_hi;
+  uint32_t p1_lo, p1_hi;
+  uint32_t p2_lo, p2_hi;
+  uint32_t p3_lo, p3_hi;
+  mul32wide_u32(a0, b0, &p0_lo, &p0_hi);
+  mul32wide_u32(a0, b1, &p1_lo, &p1_hi);
+  mul32wide_u32(a1, b0, &p2_lo, &p2_hi);
+  mul32wide_u32(a1, b1, &p3_lo, &p3_hi);
 
-  const uint64_t mid = (p0 >> 32) + (p1 & 0xFFFFFFFFULL) + (p2 & 0xFFFFFFFFULL);
-  *lo = (p0 & 0xFFFFFFFFULL) | (mid << 32);
-  *hi = p3 + (p1 >> 32) + (p2 >> 32) + (mid >> 32);
+  uint32_t w0 = p0_lo;
+  uint32_t w1 = p0_hi;
+  uint32_t w2 = 0;
+  uint32_t w3 = 0;
+
+  add64_shift32(&w1, &w2, &w3, p1_lo, p1_hi);
+  add64_shift32(&w1, &w2, &w3, p2_lo, p2_hi);
+  add64_shift64(&w2, &w3, p3_lo, p3_hi);
+
+  *lo = ((uint64_t)w1 << 32) | (uint64_t)w0;
+  *hi = ((uint64_t)w3 << 32) | (uint64_t)w2;
 }
 
 /* Multiply two double-precision floats */
@@ -92,6 +149,47 @@ double __aeabi_dmul(double a, double b)
     return ur.d;
   }
 
+  /* Fast path: multiplying by an exact power-of-two keeps the other mantissa
+   * unchanged (no rounding), only the exponent is adjusted.
+   *
+   * This also avoids low-opt codegen pitfalls in the wide-multiply path.
+   */
+  if (a_exp != 0 && b_exp != 0)
+  {
+    if (a_mant == 0)
+    {
+      int exp = a_exp + b_exp - DOUBLE_EXP_BIAS;
+      if (exp >= 0x7FF)
+      {
+        ur.u = make_double(result_sign, 0x7FF, 0);
+        return ur.d;
+      }
+      if (exp <= 0)
+      {
+        ur.u = make_double(result_sign, 0, 0);
+        return ur.d;
+      }
+      ur.u = make_double(result_sign, exp, b_mant);
+      return ur.d;
+    }
+    if (b_mant == 0)
+    {
+      int exp = a_exp + b_exp - DOUBLE_EXP_BIAS;
+      if (exp >= 0x7FF)
+      {
+        ur.u = make_double(result_sign, 0x7FF, 0);
+        return ur.d;
+      }
+      if (exp <= 0)
+      {
+        ur.u = make_double(result_sign, 0, 0);
+        return ur.d;
+      }
+      ur.u = make_double(result_sign, exp, a_mant);
+      return ur.d;
+    }
+  }
+
   /* Add implicit bit for normalized numbers */
   if (a_exp != 0)
     a_mant |= DOUBLE_IMPLICIT_BIT;
@@ -120,14 +218,47 @@ double __aeabi_dmul(double a, double b)
     result_exp++;
   }
 
-  /* Compute mant = prod >> shift (this yields a 53-bit value with implicit bit). */
-  uint64_t mant = (prod_hi << (64 - shift)) | (prod_lo >> shift);
+  /* Compute mant = prod >> shift (yields a 53-bit value with implicit bit).
+   *
+   * Do this with 32-bit pieces to avoid fragile 64-bit shift codegen on some
+   * low-opt paths.
+   */
+  const uint32_t prod_lo_lo = (uint32_t)prod_lo;
+  const uint32_t prod_lo_hi = (uint32_t)(prod_lo >> 32);
+  const uint32_t prod_hi_lo = (uint32_t)prod_hi;
+  const uint32_t prod_hi_hi = (uint32_t)(prod_hi >> 32);
 
-  /* Round to nearest, ties to even, using the remaining low 'shift' bits. */
-  const uint64_t rem_mask = (1ULL << shift) - 1ULL;
-  const uint64_t rem = prod_lo & rem_mask;
-  const uint64_t halfway = 1ULL << (shift - 1);
-  if (rem > halfway || (rem == halfway && (mant & 1ULL)))
+  uint32_t mant_lo32;
+  uint32_t mant_hi32;
+  int guard;
+  int sticky;
+  if (shift == 52)
+  {
+    /* mant = (prod_hi << 12) | (prod_lo >> 52) */
+    mant_lo32 = (prod_hi_lo << 12) | (prod_lo_hi >> 20);
+    mant_hi32 = (prod_hi_hi << 12) | (prod_hi_lo >> 20);
+
+    /* guard is bit 51 of prod_lo => bit 19 of prod_lo_hi */
+    guard = (int)((prod_lo_hi >> 19) & 1u);
+    sticky = (prod_lo_lo != 0) || ((prod_lo_hi & ((1u << 19) - 1u)) != 0);
+  }
+  else
+  {
+    /* shift == 53: mant = (prod_hi << 11) | (prod_lo >> 53) */
+    mant_lo32 = (prod_hi_lo << 11) | (prod_lo_hi >> 21);
+    mant_hi32 = (prod_hi_hi << 11) | (prod_hi_lo >> 21);
+
+    /* guard is bit 52 of prod_lo => bit 20 of prod_lo_hi */
+    guard = (int)((prod_lo_hi >> 20) & 1u);
+    sticky = (prod_lo_lo != 0) || ((prod_lo_hi & ((1u << 20) - 1u)) != 0);
+  }
+
+  uint64_t mant = ((uint64_t)mant_hi32 << 32) | (uint64_t)mant_lo32;
+
+  /* Round to nearest, ties to even: increment if guard==1 and
+   * (sticky==1 or LSB==1).
+   */
+  if (guard && (sticky || (mant & 1ULL)))
     mant++;
 
   /* Handle rounding overflow (e.g. 1.111... + 1 ulp -> 10.000...). */
