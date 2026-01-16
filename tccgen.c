@@ -8441,7 +8441,11 @@ static void try_call_scope_cleanup(Sym *stop)
 {
   Sym *cls = cur_scope->cl.s;
 
-  if (nocode_wanted)
+  /* Cleanups must still be emitted in CODE_OFF regions (unreachable by fallthrough)
+   * because forward gotos can jump to cleanup landing pads.
+   * Still suppress in true no-eval/const-expression contexts.
+   */
+  if (nocode_wanted & ~CODE_OFF_BIT)
     return;
 
   for (; cls != stop; cls = cls->next)

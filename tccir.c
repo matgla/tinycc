@@ -4904,22 +4904,34 @@ int tcc_ir_constant_propagation(TCCIRState *ir)
 /* TMP Constant Propagation
  * After constant folding may create TMP <- #const instructions,
  * propagate these constants to uses of the TMP within the same basic block.
+ *
+ * Performance: Uses generation counters for O(1) block clears instead of memset.
+ * Stack buffers avoid malloc for small functions.
  */
 int tcc_ir_tmp_constant_propagation(TCCIRState *ir)
 {
   typedef struct
   {
-    int valid;
+    int gen; /* Generation when this entry is valid */
     int64_t value;
   } TmpConstInfo;
+
+  /* Stack buffers for common case */
+#define TMP_CONST_STACK_SIZE 64
+#define TMP_CONST_STACK_N 256
+  TmpConstInfo tmp_info_stack[TMP_CONST_STACK_SIZE];
+  int block_start_seen_stack[TMP_CONST_STACK_N];
 
   int n = ir->next_instruction_index;
   int changes = 0;
   int max_tmp_pos = 0;
+  int current_gen = 1; /* Generation counter, 0 means invalid */
   int i;
   TACQuadruple *q;
   TmpConstInfo *tmp_info;
-  uint8_t *block_start;
+  int *block_start_seen;
+  int block_start_gen = 1;
+  void *heap_alloc = NULL;
 
   if (n == 0)
     return 0;
@@ -4939,14 +4951,25 @@ int tcc_ir_tmp_constant_propagation(TCCIRState *ir)
   if (max_tmp_pos == 0)
     return 0;
 
-  tmp_info = tcc_mallocz(sizeof(TmpConstInfo) * (max_tmp_pos + 1));
+  /* Use stack buffers if possible */
+  if (max_tmp_pos < TMP_CONST_STACK_SIZE && n <= TMP_CONST_STACK_N)
+  {
+    tmp_info = tmp_info_stack;
+    block_start_seen = block_start_seen_stack;
+    memset(tmp_info, 0, sizeof(TmpConstInfo) * (max_tmp_pos + 1));
+    memset(block_start_seen, 0, sizeof(int) * n);
+  }
+  else
+  {
+    size_t tmp_size = sizeof(TmpConstInfo) * (max_tmp_pos + 1);
+    size_t block_size = sizeof(int) * n;
+    heap_alloc = tcc_mallocz(tmp_size + block_size);
+    tmp_info = (TmpConstInfo *)heap_alloc;
+    block_start_seen = (int *)((char *)heap_alloc + tmp_size);
+  }
 
-  /* Basic-block-local propagation must not cross join points.
-   * Treat any jump target as a basic block start and clear state there.
-   * Otherwise we can incorrectly propagate values from one predecessor
-   * into a join block (e.g. short-circuit boolean lowering). */
-  block_start = tcc_mallocz(n);
-  block_start[0] = 1;
+  /* Mark block starts */
+  block_start_seen[0] = block_start_gen;
   for (i = 0; i < n; i++)
   {
     q = &ir->instructions[i];
@@ -4954,7 +4977,7 @@ int tcc_ir_tmp_constant_propagation(TCCIRState *ir)
     {
       int tgt = q->dest.c.i;
       if (tgt >= 0 && tgt < n)
-        block_start[tgt] = 1;
+        block_start_seen[tgt] = block_start_gen;
     }
   }
 
@@ -4963,17 +4986,17 @@ int tcc_ir_tmp_constant_propagation(TCCIRState *ir)
   {
     q = &ir->instructions[i];
 
-    /* Clear at basic block entry (jump targets) to avoid cross-predecessor propagation. */
-    if (i != 0 && block_start[i])
+    /* Clear at basic block entry (jump targets) - O(1) via generation bump */
+    if (i != 0 && block_start_seen[i] == block_start_gen)
     {
-      memset(tmp_info, 0, sizeof(TmpConstInfo) * (max_tmp_pos + 1));
+      current_gen++;
     }
 
     /* Propagate TMP constants to src1 */
     if (irop_config[q->op].has_src1 && TCCIR_DECODE_VREG_TYPE(q->src1.vr) == TCCIR_VREG_TYPE_TEMP)
     {
       int pos = TCCIR_DECODE_VREG_POSITION(q->src1.vr);
-      if (pos <= max_tmp_pos && tmp_info[pos].valid)
+      if (pos <= max_tmp_pos && tmp_info[pos].gen == current_gen)
       {
 #ifdef DEBUG_IR_GEN
         printf("OPTIMIZE: TMP const propagate TMP:%d = %lld to src1 at i=%d\n", pos, (long long)tmp_info[pos].value, i);
@@ -4989,7 +5012,7 @@ int tcc_ir_tmp_constant_propagation(TCCIRState *ir)
     if (irop_config[q->op].has_src2 && TCCIR_DECODE_VREG_TYPE(q->src2.vr) == TCCIR_VREG_TYPE_TEMP)
     {
       int pos = TCCIR_DECODE_VREG_POSITION(q->src2.vr);
-      if (pos <= max_tmp_pos && tmp_info[pos].valid)
+      if (pos <= max_tmp_pos && tmp_info[pos].gen == current_gen)
       {
 #ifdef DEBUG_IR_GEN
         printf("OPTIMIZE: TMP const propagate TMP:%d = %lld to src2 at i=%d\n", pos, (long long)tmp_info[pos].value, i);
@@ -5001,11 +5024,11 @@ int tcc_ir_tmp_constant_propagation(TCCIRState *ir)
       }
     }
 
-    /* Clear all at basic block boundaries */
+    /* Clear all at basic block boundaries - O(1) via generation bump */
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF || q->op == TCCIR_OP_FUNCCALLVOID ||
         q->op == TCCIR_OP_FUNCCALLVAL)
     {
-      memset(tmp_info, 0, sizeof(TmpConstInfo) * (max_tmp_pos + 1));
+      current_gen++;
     }
 
     /* Track TMP <- constant assignments */
@@ -5018,7 +5041,7 @@ int tcc_ir_tmp_constant_propagation(TCCIRState *ir)
         int src_is_const = (q->src1.r & VT_VALMASK) == VT_CONST && !(q->src1.r & VT_SYM);
         if (src_is_const)
         {
-          tmp_info[pos].valid = 1;
+          tmp_info[pos].gen = current_gen;
           tmp_info[pos].value = q->src1.c.i;
 #ifdef DEBUG_IR_GEN
           printf("TMP_CONST: Record TMP:%d = %lld at i=%d\n", pos, (long long)q->src1.c.i, i);
@@ -5026,7 +5049,7 @@ int tcc_ir_tmp_constant_propagation(TCCIRState *ir)
         }
         else
         {
-          tmp_info[pos].valid = 0;
+          tmp_info[pos].gen = 0;
         }
       }
     }
@@ -5035,12 +5058,12 @@ int tcc_ir_tmp_constant_propagation(TCCIRState *ir)
       /* TMP is defined by non-ASSIGN instruction */
       int pos = TCCIR_DECODE_VREG_POSITION(q->dest.vr);
       if (pos <= max_tmp_pos)
-        tmp_info[pos].valid = 0;
+        tmp_info[pos].gen = 0;
     }
   }
 
-  tcc_free(block_start);
-  tcc_free(tmp_info);
+  if (heap_alloc)
+    tcc_free(heap_alloc);
   return changes;
 }
 
@@ -5049,6 +5072,12 @@ int tcc_ir_tmp_constant_propagation(TCCIRState *ir)
  * Patterns:
  *   - TMP:X <- SRC; ... TMP:X used -> replace uses with SRC
  *   - Eliminate copy chains
+ *
+ * Optimized with generation counters + reverse lists for O(1) block clears
+ * and O(k) invalidation on VAR/PAR redefinitions (k = copies from that source).
+ *
+ * Performance: Uses stack buffers for small functions to avoid malloc overhead.
+ * Block starts are discovered on-the-fly using a two-generation scheme.
  */
 int tcc_ir_copy_propagation(TCCIRState *ir)
 {
@@ -5056,46 +5085,123 @@ int tcc_ir_copy_propagation(TCCIRState *ir)
    * A copy is: TMP:X <- VAR:Y or TMP:X <- PAR:Y (not TMP, not constant)
    * We can replace uses of TMP:X with the source, as long as the source
    * hasn't been redefined between the copy and the use.
+   *
+   * Uses generation counter: entry is valid only if entry.gen == current_gen.
+   * Clears become O(1) by incrementing current_gen.
    */
   typedef struct
   {
-    int valid;     /* Whether this copy is still valid */
-    int source_vr; /* Source vreg (-1 if not a copy) */
-    SValue source; /* Source of the ASSIGN */
+    int gen;              /* Generation when this entry was recorded */
+    int source_vr;        /* Source vreg */
+    SValue source;        /* Source of the ASSIGN */
+    int next_same_source; /* Next TMP with same source_vr (per-generation list) */
   } CopyInfo;
+
+  typedef struct
+  {
+    int head; /* Head of TMP list for this source */
+    int gen;  /* Generation when head is valid */
+  } SourceInfo;
+
+  /* Stack buffers for small functions (covers most cases) */
+#define COPY_PROP_STACK_TMP 64
+#define COPY_PROP_STACK_VAR 32
+#define COPY_PROP_STACK_PARAM 16
+  CopyInfo copy_info_stack[COPY_PROP_STACK_TMP];
+  SourceInfo var_sources_stack[COPY_PROP_STACK_VAR];
+  SourceInfo param_sources_stack[COPY_PROP_STACK_PARAM];
 
   int n = ir->next_instruction_index;
   int changes = 0;
   int max_tmp_pos = 0;
-  int i, j;
+  int max_var_pos = 0;
+  int max_param_pos = 0;
+  int current_gen = 1;   /* Generation counter, starts at 1 (0 means invalid) */
+  int active_copies = 0; /* Number of active TMP copies in current_gen */
+  int i;
   TACQuadruple *q;
   CopyInfo *copy_info;
-  uint8_t *block_start;
+  SourceInfo *var_sources;
+  SourceInfo *param_sources;
+  void *heap_alloc = NULL; /* Single heap allocation if needed */
+  int block_start_gen = 1; /* Generation for block start detection */
+  int *block_start_seen;   /* Per-instruction: generation when marked as block start */
+  int block_start_seen_stack[256];
 
   if (n == 0)
     return 0;
 
-  /* Find max TMP position */
+  /* Find max positions for TMP, VAR, and PARAM in a single pass */
   for (i = 0; i < n; i++)
   {
     q = &ir->instructions[i];
-    if (irop_config[q->op].has_dest && TCCIR_DECODE_VREG_TYPE(q->dest.vr) == TCCIR_VREG_TYPE_TEMP)
+    if (irop_config[q->op].has_dest)
     {
+      int vr_type = TCCIR_DECODE_VREG_TYPE(q->dest.vr);
       int pos = TCCIR_DECODE_VREG_POSITION(q->dest.vr);
-      if (pos > max_tmp_pos)
+      if (vr_type == TCCIR_VREG_TYPE_TEMP && pos > max_tmp_pos)
         max_tmp_pos = pos;
+      else if (vr_type == TCCIR_VREG_TYPE_VAR && pos > max_var_pos)
+        max_var_pos = pos;
+      else if (vr_type == TCCIR_VREG_TYPE_PARAM && pos > max_param_pos)
+        max_param_pos = pos;
+    }
+    if (irop_config[q->op].has_src1)
+    {
+      int vr_type = TCCIR_DECODE_VREG_TYPE(q->src1.vr);
+      int pos = TCCIR_DECODE_VREG_POSITION(q->src1.vr);
+      if (vr_type == TCCIR_VREG_TYPE_VAR && pos > max_var_pos)
+        max_var_pos = pos;
+      else if (vr_type == TCCIR_VREG_TYPE_PARAM && pos > max_param_pos)
+        max_param_pos = pos;
+    }
+    if (irop_config[q->op].has_src2)
+    {
+      int vr_type = TCCIR_DECODE_VREG_TYPE(q->src2.vr);
+      int pos = TCCIR_DECODE_VREG_POSITION(q->src2.vr);
+      if (vr_type == TCCIR_VREG_TYPE_VAR && pos > max_var_pos)
+        max_var_pos = pos;
+      else if (vr_type == TCCIR_VREG_TYPE_PARAM && pos > max_param_pos)
+        max_param_pos = pos;
     }
   }
 
   if (max_tmp_pos == 0)
     return 0;
 
-  copy_info = tcc_mallocz(sizeof(CopyInfo) * (max_tmp_pos + 1));
+  /* Use stack buffers if possible, otherwise single heap allocation */
+  if (max_tmp_pos < COPY_PROP_STACK_TMP && max_var_pos < COPY_PROP_STACK_VAR && max_param_pos < COPY_PROP_STACK_PARAM &&
+      n <= 256)
+  {
+    copy_info = copy_info_stack;
+    var_sources = var_sources_stack;
+    param_sources = param_sources_stack;
+    block_start_seen = block_start_seen_stack;
+    /* Zero only what we need */
+    memset(copy_info, 0, sizeof(CopyInfo) * (max_tmp_pos + 1));
+    memset(var_sources, 0, sizeof(SourceInfo) * (max_var_pos + 1));
+    memset(param_sources, 0, sizeof(SourceInfo) * (max_param_pos + 1));
+    memset(block_start_seen, 0, sizeof(int) * n);
+  }
+  else
+  {
+    /* Single allocation for all arrays */
+    size_t copy_size = sizeof(CopyInfo) * (max_tmp_pos + 1);
+    size_t var_size = sizeof(SourceInfo) * (max_var_pos + 1);
+    size_t param_size = sizeof(SourceInfo) * (max_param_pos + 1);
+    size_t block_size = sizeof(int) * n;
+    heap_alloc = tcc_mallocz(copy_size + var_size + param_size + block_size);
+    copy_info = (CopyInfo *)heap_alloc;
+    var_sources = (SourceInfo *)((char *)heap_alloc + copy_size);
+    param_sources = (SourceInfo *)((char *)heap_alloc + copy_size + var_size);
+    block_start_seen = (int *)((char *)heap_alloc + copy_size + var_size + param_size);
+  }
 
-  /* Like TMP constant propagation, copy propagation is basic-block-local.
-   * Clear at jump targets to avoid propagating copies across join points. */
-  block_start = tcc_mallocz(n);
-  block_start[0] = 1;
+  /* Mark instruction 0 as block start */
+  block_start_seen[0] = block_start_gen;
+
+  /* Two-pass approach: first mark block starts, then propagate.
+   * This is still O(n) but avoids separate allocation for block_start bitmap. */
   for (i = 0; i < n; i++)
   {
     q = &ir->instructions[i];
@@ -5103,7 +5209,7 @@ int tcc_ir_copy_propagation(TCCIRState *ir)
     {
       int tgt = q->dest.c.i;
       if (tgt >= 0 && tgt < n)
-        block_start[tgt] = 1;
+        block_start_seen[tgt] = block_start_gen;
     }
   }
 
@@ -5112,12 +5218,14 @@ int tcc_ir_copy_propagation(TCCIRState *ir)
   {
     q = &ir->instructions[i];
 
-    if (i != 0 && block_start[i])
+    /* At block boundaries, invalidate all copies by incrementing generation */
+    if (i != 0 && block_start_seen[i] == block_start_gen)
     {
-      memset(copy_info, 0, sizeof(CopyInfo) * (max_tmp_pos + 1));
+      current_gen++;
+      active_copies = 0;
     }
 
-    /* First, propagate copies to uses in this instruction.
+    /* Propagate copies to uses in this instruction.
      * Important: We DON'T propagate if the use has VT_LVAL because:
      *   - TMP:X <- VAR:Y (copy of pointer value)
      *   - ... TMP:X***DEREF*** (load through the pointer)
@@ -5125,11 +5233,11 @@ int tcc_ir_copy_propagation(TCCIRState *ir)
      * then adding another LVAL would mean double-dereference, which is wrong.
      * Only propagate to non-LVAL uses where we just need the pointer value.
      */
-    if (irop_config[q->op].has_src1 && TCCIR_DECODE_VREG_TYPE(q->src1.vr) == TCCIR_VREG_TYPE_TEMP)
+    if (active_copies > 0 && irop_config[q->op].has_src1 && TCCIR_DECODE_VREG_TYPE(q->src1.vr) == TCCIR_VREG_TYPE_TEMP)
     {
       int pos = TCCIR_DECODE_VREG_POSITION(q->src1.vr);
       int has_lval = q->src1.r & VT_LVAL;
-      if (pos <= max_tmp_pos && copy_info[pos].valid && !has_lval)
+      if (pos <= max_tmp_pos && copy_info[pos].gen == current_gen && !has_lval)
       {
 #ifdef DEBUG_IR_GEN
         printf("OPTIMIZE: Copy propagate TMP:%d -> vreg:%d at i=%d\n", pos,
@@ -5140,11 +5248,11 @@ int tcc_ir_copy_propagation(TCCIRState *ir)
       }
     }
 
-    if (irop_config[q->op].has_src2 && TCCIR_DECODE_VREG_TYPE(q->src2.vr) == TCCIR_VREG_TYPE_TEMP)
+    if (active_copies > 0 && irop_config[q->op].has_src2 && TCCIR_DECODE_VREG_TYPE(q->src2.vr) == TCCIR_VREG_TYPE_TEMP)
     {
       int pos = TCCIR_DECODE_VREG_POSITION(q->src2.vr);
       int has_lval = q->src2.r & VT_LVAL;
-      if (pos <= max_tmp_pos && copy_info[pos].valid && !has_lval)
+      if (pos <= max_tmp_pos && copy_info[pos].gen == current_gen && !has_lval)
       {
 #ifdef DEBUG_IR_GEN
         printf("OPTIMIZE: Copy propagate TMP:%d -> vreg:%d at i=%d\n", pos,
@@ -5155,32 +5263,50 @@ int tcc_ir_copy_propagation(TCCIRState *ir)
       }
     }
 
-    /* If this instruction defines a VAR/PAR, invalidate any copies from that vreg */
-    if (irop_config[q->op].has_dest)
+    /* If this instruction defines a VAR/PAR, invalidate any copies that use it as source.
+     * Uses per-source reverse list to avoid scanning all TMPs. */
+    if (active_copies > 0 && irop_config[q->op].has_dest)
     {
       int dest_type = TCCIR_DECODE_VREG_TYPE(q->dest.vr);
       if (dest_type == TCCIR_VREG_TYPE_VAR || dest_type == TCCIR_VREG_TYPE_PARAM)
       {
         int dest_vr = q->dest.vr;
-        for (j = 0; j <= max_tmp_pos; j++)
+        int dest_pos = TCCIR_DECODE_VREG_POSITION(dest_vr);
+        SourceInfo *src_info = NULL;
+        if (dest_type == TCCIR_VREG_TYPE_VAR && dest_pos <= max_var_pos)
+          src_info = &var_sources[dest_pos];
+        else if (dest_type == TCCIR_VREG_TYPE_PARAM && dest_pos <= max_param_pos)
+          src_info = &param_sources[dest_pos];
+
+        if (src_info && src_info->gen == current_gen)
         {
-          if (copy_info[j].valid && copy_info[j].source_vr == dest_vr)
+          int tmp_pos = src_info->head;
+          while (tmp_pos >= 0)
           {
+            int next = copy_info[tmp_pos].next_same_source;
+            if (copy_info[tmp_pos].gen == current_gen && copy_info[tmp_pos].source_vr == dest_vr)
+            {
 #ifdef DEBUG_IR_GEN
-            printf("COPY_PROP: Invalidate TMP:%d (source VAR/PAR:%d redefined) at i=%d\n", j,
-                   TCCIR_DECODE_VREG_POSITION(dest_vr), i);
+              printf("COPY_PROP: Invalidate TMP:%d (source VAR/PAR:%d redefined) at i=%d\n", tmp_pos,
+                     TCCIR_DECODE_VREG_POSITION(dest_vr), i);
 #endif
-            copy_info[j].valid = 0;
+              copy_info[tmp_pos].gen = 0;
+              if (active_copies > 0)
+                active_copies--;
+            }
+            tmp_pos = next;
           }
+          src_info->head = -1;
         }
       }
     }
 
-    /* Clear all copies at basic block boundaries */
+    /* Clear all copies at basic block boundaries - O(1) operation */
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF || q->op == TCCIR_OP_FUNCCALLVOID ||
         q->op == TCCIR_OP_FUNCCALLVAL)
     {
-      memset(copy_info, 0, sizeof(CopyInfo) * (max_tmp_pos + 1));
+      current_gen++;
+      active_copies = 0;
     }
 
     /* If this is a copy (ASSIGN TMP <- VAR/PAR), record it */
@@ -5198,7 +5324,28 @@ int tcc_ir_copy_propagation(TCCIRState *ir)
         if (!src_is_const && q->src1.vr >= 0 &&
             (src_vreg_type == TCCIR_VREG_TYPE_VAR || src_vreg_type == TCCIR_VREG_TYPE_PARAM))
         {
-          copy_info[pos].valid = 1;
+          int src_pos = TCCIR_DECODE_VREG_POSITION(q->src1.vr);
+          SourceInfo *src_info = NULL;
+
+          if (src_vreg_type == TCCIR_VREG_TYPE_VAR && src_pos <= max_var_pos)
+            src_info = &var_sources[src_pos];
+          else if (src_vreg_type == TCCIR_VREG_TYPE_PARAM && src_pos <= max_param_pos)
+            src_info = &param_sources[src_pos];
+
+          if (src_info)
+          {
+            if (src_info->gen != current_gen)
+            {
+              src_info->head = -1;
+              src_info->gen = current_gen;
+            }
+            copy_info[pos].next_same_source = src_info->head;
+            src_info->head = pos;
+          }
+
+          if (copy_info[pos].gen != current_gen)
+            active_copies++;
+          copy_info[pos].gen = current_gen;
           copy_info[pos].source_vr = q->src1.vr;
           copy_info[pos].source = q->src1;
 #ifdef DEBUG_IR_GEN
@@ -5208,8 +5355,11 @@ int tcc_ir_copy_propagation(TCCIRState *ir)
         }
         else
         {
-          /* TMP is assigned something other than a simple VAR/PAR copy */
-          copy_info[pos].valid = 0;
+          /* TMP is assigned something other than a simple VAR/PAR copy - invalidate */
+          if (copy_info[pos].gen == current_gen && active_copies > 0)
+            active_copies--;
+          copy_info[pos].gen = 0;
+          copy_info[pos].next_same_source = -1;
         }
       }
     }
@@ -5218,12 +5368,17 @@ int tcc_ir_copy_propagation(TCCIRState *ir)
       /* TMP is defined by a non-ASSIGN instruction - invalidate any copy for it */
       int pos = TCCIR_DECODE_VREG_POSITION(q->dest.vr);
       if (pos <= max_tmp_pos)
-        copy_info[pos].valid = 0;
+      {
+        if (copy_info[pos].gen == current_gen && active_copies > 0)
+          active_copies--;
+        copy_info[pos].gen = 0;
+        copy_info[pos].next_same_source = -1;
+      }
     }
   }
 
-  tcc_free(block_start);
-  tcc_free(copy_info);
+  if (heap_alloc)
+    tcc_free(heap_alloc);
 
   return changes;
 }

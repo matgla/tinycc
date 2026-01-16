@@ -130,7 +130,7 @@ TEST_FILES = [
     # ("../tests2/98_al_ax_extend.c", 0), # x86
     # ("../tests2/99_fastcall.c", 0), # x86
     ("../tests2/100_c99array-decls.c", 0),
-    # ("../tests2/101_cleanup.c", 0), fix double support first
+    ("../tests2/101_cleanup.c", 0),
     ("../tests2/102_alignas.c", 0),
     ("../tests2/103_implicit_memmove.c", 0),
     (["../tests2/104_inline.c", "../tests2/104+_inline.c"], 0),

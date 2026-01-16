@@ -6716,8 +6716,8 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
   if (argc < 0)
     tcc_error("compiler_error: failed to build call layout for call_id=%d", call_id);
 
-  /* Calculate total stack space needed */
-  const int stack_size = (argc > 0) ? (int)layout.stack_size : 0;
+  /* Calculate total outgoing stack space needed (stack arguments). */
+  int stack_size = (argc > 0) ? (int)layout.stack_size : 0;
 
   /* Step 1: Check if any argument registers (R0-R3) are currently in use
    * If we have a nested call, we need to preserve them */
@@ -6730,15 +6730,28 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
     }
   }
 
-  /* Step 2: Push argument registers that are in use (nested call case) */
-  if (arg_regs_in_use != 0)
+  /* AAPCS requires SP to be 8-byte aligned at call boundaries.
+   * Pushing an odd number of registers would misalign SP, so pad with R12.
+   */
+  int arg_regs_push_mask = arg_regs_in_use;
+  int arg_regs_push_count = __builtin_popcount((unsigned)arg_regs_push_mask);
+  if ((arg_regs_push_count & 1) != 0)
   {
-    uint16_t push_mask = (uint16_t)arg_regs_in_use;
+    arg_regs_push_mask |= (1 << ARM_R12);
+    arg_regs_push_count++;
+  }
+
+  /* Step 2: Push argument registers that are in use (nested call case) */
+  if (arg_regs_push_mask != 0)
+  {
+    uint16_t push_mask = (uint16_t)arg_regs_push_mask;
     ot_check(th_push(push_mask));
-    call_site->used_stack_size += __builtin_popcount(arg_regs_in_use) * 4;
+    call_site->used_stack_size += arg_regs_push_count * 4;
   }
 
   /* Step 3: Reserve stack space for stack arguments */
+  if (stack_size & 7)
+    stack_size = (stack_size + 7) & ~7;
   if (stack_size > 0)
   {
     gadd_sp(-stack_size);
@@ -7204,11 +7217,11 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
   }
 
   /* Step 7: Restore argument registers if we pushed them */
-  if (arg_regs_in_use != 0)
+  if (arg_regs_push_mask != 0)
   {
-    uint16_t pop_mask = (uint16_t)arg_regs_in_use;
+    uint16_t pop_mask = (uint16_t)arg_regs_push_mask;
     ot_check(th_pop(pop_mask));
-    call_site->used_stack_size -= __builtin_popcount(arg_regs_in_use) * 4;
+    call_site->used_stack_size -= arg_regs_push_count * 4;
   }
 
   /* Step 8: Handle return value if needed */

@@ -5,7 +5,7 @@ Profile TinyCC compiler memory usage and performance across the test suite.
 Uses the unified qemu_run.py infrastructure with profiling support.
 
 Usage:
-    python profile_suite.py [--output-dir DIR] [--limit N] [--profiler heaptrack|time|perf]
+    python profile_suite.py [--output-dir DIR] [--limit N] [--profiler heaptrack|time|perf] [--cflags "..."]
 
 Output:
     - profile_results/heaptrack_*.zst - heaptrack data files (use heaptrack_gui to view)
@@ -53,7 +53,7 @@ def _test_id(test_file):
     return Path(primary).stem if primary else "unknown"
 
 
-def profile_test(test_file, output_dir, profiler_tool="heaptrack"):
+def profile_test(test_file, output_dir, profiler_tool="heaptrack", extra_cflags: str = ""):
     """Profile a single test compilation."""
     test_name = _test_id(test_file)
 
@@ -70,6 +70,7 @@ def profile_test(test_file, output_dir, profiler_tool="heaptrack"):
 
     config = CompileConfig(
         profiler=profile_config,
+        extra_cflags=extra_cflags or "",
         output_dir=output_dir / "build",
         clean_before_build=True,
     )
@@ -186,6 +187,8 @@ def main():
                         help="Profiler tool to use (default: heaptrack)")
     parser.add_argument("--include-float", action="store_true",
                         help="Include floating point tests")
+    parser.add_argument("--cflags", type=str, default="",
+                        help="Additional CFLAGS to pass to the compiler (e.g. '-O0 -g -DDEBUG')")
     parser.add_argument("--test", "-t", type=str,
                         help="Run only test matching this pattern")
     args = parser.parse_args()
@@ -212,11 +215,18 @@ def main():
     print(f"Profiling {len(all_tests)} tests")
     print(f"Output directory: {args.output_dir}")
     print(f"Profiler: {args.profiler}")
+    if args.cflags:
+        print(f"Extra CFLAGS: {args.cflags}")
     print("=" * 70)
 
     results = []
     for idx, (test_file, _) in enumerate(all_tests, 1):
-        result, test_name = profile_test(test_file, args.output_dir, profiler_tool=args.profiler)
+        result, test_name = profile_test(
+            test_file,
+            args.output_dir,
+            profiler_tool=args.profiler,
+            extra_cflags=args.cflags,
+        )
         result_dict = result_to_dict(result, test_name)
         results.append(result_dict)
         print_result(result, test_name, idx, len(all_tests))
