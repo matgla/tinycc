@@ -1641,7 +1641,10 @@ static void move_reg(int r, int s, int t)
 /* get address of vtop (vtop MUST BE an lvalue) */
 ST_FUNC void gaddrof(void)
 {
+  int orig_r = vtop->r;
   vtop->r &= ~VT_LVAL;
+  fprintf(stderr, "DEBUG gaddrof: orig_r=0x%x after_strip=0x%x valmask=0x%x VT_LOCAL=0x%x c.i=%lld\n",
+          orig_r, vtop->r, vtop->r & VT_VALMASK, VT_LOCAL, (long long)vtop->c.i);
   /* tricky: if saved lvalue, then we can go back to lvalue */
   if ((vtop->r & VT_VALMASK) == VT_LLOCAL)
   {

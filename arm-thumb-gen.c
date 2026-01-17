@@ -1860,15 +1860,20 @@ ST_FUNC int gfunc_sret(CType *vt, int variadic, CType *ret, int *ret_align, int 
 // are those offsets to allow TREG_R0 start from other register than r0?
 // not sure
 
-static void th_store32_imm_or_reg(int src_reg, uint32_t base_reg, int abs_off, int sign)
+static void th_store32_imm_or_reg_ex(int src_reg, uint32_t base_reg, int abs_off, int sign, uint32_t extra_exclude)
 {
   if (!ot(th_str_imm(src_reg, base_reg, abs_off, sign ? 4 : 6, ENFORCE_ENCODING_NONE)))
   {
-    ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(abs_off, sign, (1u << src_reg) | (1u << base_reg));
+    ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(abs_off, sign, (1u << src_reg) | (1u << base_reg) | extra_exclude);
     int rr = rr_alloc.reg;
     ot_check(th_str_reg(src_reg, base_reg, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     restore_scratch_reg(&rr_alloc);
   }
+}
+
+static void th_store32_imm_or_reg(int src_reg, uint32_t base_reg, int abs_off, int sign)
+{
+  th_store32_imm_or_reg_ex(src_reg, base_reg, abs_off, sign, 0);
 }
 
 static void th_store16_imm_or_reg(int src_reg, uint32_t base_reg, int abs_off, int sign)
@@ -1950,7 +1955,18 @@ static uint32_t th_store_resolve_base(int src_reg, SValue *sv, int ft, int *abs_
   return base_reg;
 }
 
+/* Extended store function that allows excluding additional registers from
+ * scratch allocation. This is needed when storing two halves of a 64-bit
+ * value separately - the first store must not clobber the register holding
+ * the second half. */
+static void store_ex(int r, SValue *sv, uint32_t extra_exclude);
+
 void store(int r, SValue *sv)
+{
+  store_ex(r, sv, 0);
+}
+
+static void store_ex(int r, SValue *sv, uint32_t extra_exclude)
 {
   int ft, fr;
   TRACE("'store' reg: %d", r);
@@ -2035,7 +2051,7 @@ void store(int r, SValue *sv)
         /* Soft-float (or integer-reg float values): use integer stores. */
         if ((ft & VT_BTYPE) == VT_FLOAT)
         {
-          th_store32_imm_or_reg(r, base, abs_off, sign);
+          th_store32_imm_or_reg_ex(r, base, abs_off, sign, extra_exclude);
         }
         else
         {
@@ -2061,7 +2077,9 @@ void store(int r, SValue *sv)
           /* High word is at +4 from low word. When sign=1 (negative offset),
            * we need to decrease abs_off to get a higher address. */
           int hi_abs_off = sign ? (abs_off - 4) : (abs_off + 4);
-          th_store32_imm_or_reg(r, base, abs_off, sign);
+          /* When storing the low word, exclude r_high from scratch allocation
+           * to prevent clobbering the high word value before it's stored. */
+          th_store32_imm_or_reg_ex(r, base, abs_off, sign, (1u << r_high));
           th_store32_imm_or_reg(r_high, base, hi_abs_off, sign);
         }
       }
@@ -2094,13 +2112,15 @@ void store(int r, SValue *sv)
       /* High word is at +4 from low word. When sign=1 (negative offset),
        * we need to decrease abs_off to get a higher address. */
       int hi_abs_off = sign ? (abs_off - 4) : (abs_off + 4);
-      th_store32_imm_or_reg(r, base, abs_off, sign);
+      /* When storing the low word, exclude r_high from scratch allocation
+       * to prevent clobbering the high word value before it's stored. */
+      th_store32_imm_or_reg_ex(r, base, abs_off, sign, (1u << r_high));
       th_store32_imm_or_reg(r_high, base, hi_abs_off, sign);
     }
     else
     {
       TRACE("store: sign: %x, r: %x, base: %x, off: %x", sign, r, base, abs_off);
-      th_store32_imm_or_reg(r, base, abs_off, sign);
+      th_store32_imm_or_reg_ex(r, base, abs_off, sign, extra_exclude);
       TRACE("done");
     }
 
@@ -2731,8 +2751,11 @@ void load_vt_local(int r, SValue *sv, int base)
   int off = sv->c.i;
   /* Stack parameters live above the saved-register area.
    * When computing their address, fold in offset_to_args (prologue push size).
+   * EXCEPTION: Variadic register parameters are saved in the prologue at
+   * negative offsets (FP-16 to FP-4), so they're already in our local frame
+   * and should NOT have offset_to_args added.
    */
-  if (sv->r & VT_PARAM)
+  if ((sv->r & VT_PARAM) && off >= 0)
   {
     off += offset_to_args;
   }
@@ -2796,8 +2819,11 @@ void load_to_dest(SValue *dest, SValue *sv)
 
   /* Parameters passed on the stack are always accessed via FP with positive offsets.
    * offset_to_args is only for computing FP-relative offsets, not SP-relative.
-   * The ARM EABI places stack parameters in the caller's frame above the saved FP. */
-  if (sv->r & VT_PARAM)
+   * The ARM EABI places stack parameters in the caller's frame above the saved FP.
+   * EXCEPTION: Variadic register parameters are saved in the prologue at
+   * negative offsets (FP-16 to FP-4), so they're already in our local frame
+   * and should NOT have offset_to_args added. */
+  if ((sv->r & VT_PARAM) && !sign)
   {
     fc += offset_to_args;
   }
@@ -5837,14 +5863,16 @@ ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *op)
 
     if (dest_in_mem)
     {
-      /* Store low and high words separately as 32-bit stores. */
+      /* Store low and high words separately as 32-bit stores.
+       * When storing the low word, exclude src_hi from scratch allocation
+       * to prevent clobbering the high word value before it's stored. */
       SValue dest_low = op->dest;
       SValue dest_high = op->dest;
       dest_low.type.t = (dest_low.type.t & ~VT_BTYPE) | (VT_INT | (dest_low.type.t & VT_UNSIGNED));
       dest_high.type.t = dest_low.type.t;
       dest_high.c.i += 4;
 
-      store(src_lo, &dest_low);
+      store_ex(src_lo, &dest_low, (1u << src_hi));
       store(src_hi, &dest_high);
     }
     else
@@ -6021,8 +6049,11 @@ ST_FUNC void tcc_gen_machine_lea_op(TACQuadruple *op)
         offset = (int)op->src1.c.i;
     }
     /* Stack parameters live above the saved-register area.
-     * When computing their address, fold in offset_to_args (prologue push size). */
-    if (op->src1.r & VT_PARAM)
+     * When computing their address, fold in offset_to_args (prologue push size).
+     * EXCEPTION: Variadic register parameters are saved in the prologue at
+     * negative offsets (FP-16 to FP-4), so they're already in our local frame
+     * and should NOT have offset_to_args added. */
+    if ((op->src1.r & VT_PARAM) && offset >= 0)
       offset += offset_to_args;
     int sign = (offset < 0);
     int abs_offset = sign ? -offset : offset;
@@ -7123,8 +7154,11 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
           /* Local variable - compute address (fp + offset) then load/store */
           int local_off = (int)arg->c.i;
           /* Stack parameters live above the saved-register area.
-           * When computing their address, fold in offset_to_args (prologue push size). */
-          if (arg->r & VT_PARAM)
+           * When computing their address, fold in offset_to_args (prologue push size).
+           * EXCEPTION: Variadic register parameters are saved in the prologue at
+           * negative offsets (FP-16 to FP-4), so they're already in our local frame
+           * and should NOT have offset_to_args added. */
+          if ((arg->r & VT_PARAM) && local_off >= 0)
             local_off += offset_to_args;
           int local_sign = (local_off < 0);
           int local_abs = local_sign ? -local_off : local_off;
@@ -7163,7 +7197,11 @@ ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_result, TCCI
            * Step 1: Load the pointer from spill slot into R12
            * Step 2: Dereference R12 to get the actual value */
           int local_off = (int)arg->c.i;
-          if (arg->r & VT_PARAM)
+          /* Stack parameters live above the saved-register area.
+           * EXCEPTION: Variadic register parameters are saved in the prologue at
+           * negative offsets (FP-16 to FP-4), so they're already in our local frame
+           * and should NOT have offset_to_args added. */
+          if ((arg->r & VT_PARAM) && local_off >= 0)
             local_off += offset_to_args;
           int local_sign = (local_off < 0);
           int local_abs = local_sign ? -local_off : local_off;

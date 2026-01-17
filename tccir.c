@@ -1199,8 +1199,19 @@ void tcc_ir_add_function_parameters(TCCIRState *ir, CType *func_type)
     {
       /* In-register param */
       flags = VT_PARAM | VT_LVAL;
-      // argument is materialized in register, not local stack
-      addr = 0;
+      if (variadic) {
+        /* For variadic functions, r0-r3 are saved at fixed offsets:
+         * r0 at FP-16, r1 at FP-12, r2 at FP-8, r3 at FP-4.
+         * This allows &param to compute the correct address.
+         */
+        addr = -16 + (loc_info.reg_base * 4);
+        flags |= VT_LOCAL;  /* Mark as having a stack location */
+        fprintf(stderr, "DEBUG: variadic param arg_index=%d reg_base=%d addr=%d\n", 
+                arg_index, loc_info.reg_base, addr);
+      } else {
+        // argument is materialized in register, not local stack
+        addr = 0;
+      }
     }
     else
     {
@@ -3182,7 +3193,9 @@ void tcc_ir_materialize_addr(TCCIRState *ir, SValue *sv, TCCMaterializedAddr *re
   if (wants_stack_address)
   {
     const int frame_offset = tcc_ir_materialization_offset(ir, sv);
-    const int is_param = (sv->r & VT_PARAM) ? 1 : 0;
+    /* VT_PARAM with positive offset = stack parameter in caller frame, needs offset_to_args.
+     * VT_PARAM with negative offset = variadic register param saved in our frame, no adjustment. */
+    const int is_param = ((sv->r & VT_PARAM) && frame_offset >= 0) ? 1 : 0;
     /* Use the actual destination register for the encoding test.
      * If dest_reg is invalid (PREG_NONE), fall back to r12 (typical scratch). */
     const int test_reg = (dest_reg != PREG_NONE && dest_reg < 16) ? dest_reg : 12;
@@ -3204,7 +3217,9 @@ void tcc_ir_materialize_addr(TCCIRState *ir, SValue *sv, TCCMaterializedAddr *re
 
   const int target_reg = scratch.regs[0];
   const int frame_offset = tcc_ir_materialization_offset(ir, sv);
-  const int is_param = (sv->r & VT_PARAM) ? 1 : 0;
+  /* VT_PARAM with positive offset = stack parameter in caller frame, needs offset_to_args.
+   * VT_PARAM with negative offset = variadic register param saved in our frame, no adjustment. */
+  const int is_param = ((sv->r & VT_PARAM) && frame_offset >= 0) ? 1 : 0;
 
   if (wants_stack_address)
   {
