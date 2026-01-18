@@ -23,6 +23,7 @@
 #ifndef TCC_LD_H
 #define TCC_LD_H
 
+#include "tcctypes.h"
 #include <stdint.h>
 
 #define LD_MAX_MEMORY_REGIONS 16
@@ -48,7 +49,8 @@
 #define LD_PAT_GLOB 1  /* wildcard match like *(.text*) */
 #define LD_PAT_KEEP 2  /* KEEP() - don't garbage collect */
 
-typedef struct LDMemoryRegion {
+typedef struct LDMemoryRegion
+{
   char name[64];
   uint32_t attributes;
   addr_t origin;
@@ -56,44 +58,52 @@ typedef struct LDMemoryRegion {
   addr_t current; /* current allocation position */
 } LDMemoryRegion;
 
-typedef struct LDPhdr {
+typedef struct LDPhdr
+{
   char name[64];
   uint32_t type;  /* PT_LOAD, PT_NULL, etc */
   uint32_t flags; /* PF_R, PF_W, PF_X */
 } LDPhdr;
 
-typedef struct LDSectionPattern {
+typedef struct LDSectionPattern
+{
   char pattern[128];
   int type; /* LD_PAT_EXACT, LD_PAT_GLOB, LD_PAT_KEEP */
   int keep; /* 1 if KEEP() */
 } LDSectionPattern;
 
-typedef struct LDOutputSection {
+typedef struct LDOutputSection
+{
   char name[64];
-  addr_t address;        /* explicit address if set, otherwise 0 */
-  addr_t align;          /* alignment requirement */
-  addr_t current_offset; /* current offset within section */
-  addr_t start_lc; /* location counter at section entry (for offset calc) */
-  int memory_region_idx; /* index into memory_regions, -1 if none */
-  int phdr_idx;          /* index into phdrs, -1 if none */
-  int has_address;       /* 1 if address explicitly set */
+  addr_t address;             /* explicit address if set, otherwise 0 */
+  addr_t align;               /* alignment requirement */
+  addr_t current_offset;      /* current offset within section */
+  addr_t start_lc;            /* location counter at section entry (for offset calc) */
+  int memory_region_idx;      /* index into memory_regions, -1 if none */
+  int load_memory_region_idx; /* index into memory_regions for LMA, -1 if none */
+  int phdr_idx;               /* index into phdrs, -1 if none */
+  int has_address;            /* 1 if address explicitly set */
 
   /* Section patterns to include */
   LDSectionPattern patterns[LD_MAX_SECTION_PATTERNS];
   int nb_patterns;
 } LDOutputSection;
 
-typedef struct LDSymbol {
+typedef struct LDSymbol
+{
   char name[128];
   addr_t value;
-  addr_t section_offset;   /* offset from section start when defined */
-  int visibility;          /* LD_SYM_GLOBAL, LD_SYM_HIDDEN, etc */
-  int defined;             /* 1 if value is defined */
-  int is_location_counter; /* 1 if value is current location counter */
-  int section_idx; /* output section index where defined, -1 if absolute */
+  addr_t section_offset;    /* offset from section start when defined */
+  int visibility;           /* LD_SYM_GLOBAL, LD_SYM_HIDDEN, etc */
+  int defined;              /* 1 if value is defined */
+  int is_location_counter;  /* 1 if value is current location counter */
+  int section_idx;          /* output section index where defined, -1 if absolute */
+  int has_loadaddr;         /* 1 if value is LOADADDR of a section */
+  int loadaddr_section_idx; /* output section index for LOADADDR */
 } LDSymbol;
 
-typedef struct LDScript {
+typedef struct LDScript
+{
   /* MEMORY regions */
   LDMemoryRegion memory_regions[LD_MAX_MEMORY_REGIONS];
   int nb_memory_regions;
@@ -130,8 +140,7 @@ void ld_script_init(LDScript *ld);
 int ld_script_parse(struct TCCState *s1, LDScript *ld, int fd);
 
 /* Parse a linker script from string */
-int ld_script_parse_string(struct TCCState *s1, LDScript *ld,
-                           const char *script);
+int ld_script_parse_string(struct TCCState *s1, LDScript *ld, const char *script);
 
 /* Apply linker script to section layout */
 int ld_script_apply(struct TCCState *s1, LDScript *ld);

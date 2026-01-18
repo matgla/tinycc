@@ -177,3 +177,15 @@ double __aeabi_dsub(double a, double b)
   ub.u ^= DOUBLE_SIGN_BIT; /* Flip sign bit */
   return __aeabi_dadd(a, ub.d);
 }
+
+double __aeabi_dneg(double a)
+{
+  union
+  {
+    double d;
+    uint64_t u;
+  } ua;
+  ua.d = a;
+  ua.u ^= DOUBLE_SIGN_BIT;
+  return ua.d;
+}

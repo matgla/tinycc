@@ -41,6 +41,7 @@ TEST_FILES = [
     # AEABI soft-float regressions (bit-level tests; avoids printf %f).
     ("test_aeabi_dmul_bits.c", 0),
     ("test_f2d_bits.c", 0),
+    ("test_aeabi_double_all.c", 0),
 
     ("test_llong_add_signed.c", 0),
     ("test_llong_add_unsigned.c", 0),
@@ -52,6 +53,7 @@ TEST_FILES = [
     ("test_llong_div_unsigned.c", 0),
     ("test_llong_mod_signed.c", 0),
     ("test_llong_mod_unsigned.c", 0),
+    ("test_llong_bitwise.c", 0),
 
     ("../tests2/00_assignment.c", 0),
     ("../tests2/01_comment.c", 0),

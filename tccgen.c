@@ -1643,8 +1643,6 @@ ST_FUNC void gaddrof(void)
 {
   int orig_r = vtop->r;
   vtop->r &= ~VT_LVAL;
-  fprintf(stderr, "DEBUG gaddrof: orig_r=0x%x after_strip=0x%x valmask=0x%x VT_LOCAL=0x%x c.i=%lld\n",
-          orig_r, vtop->r, vtop->r & VT_VALMASK, VT_LOCAL, (long long)vtop->c.i);
   /* tricky: if saved lvalue, then we can go back to lvalue */
   if ((vtop->r & VT_VALMASK) == VT_LLOCAL)
   {
@@ -2351,8 +2349,16 @@ static void lbuild(int t)
      * Force both operands to be treated as rvalues when emitting IR. */
     SValue low = vtop[-1];
     SValue high = vtop[0];
-    low.r = 0;
-    high.r = 0;
+    /* Preserve constants and symbols. Only force stack-address operands
+     * (VT_LOCAL / VT_LLOCAL without VT_LVAL) to be loaded as values. */
+    {
+      const int low_kind = low.r & VT_VALMASK;
+      if ((low_kind == VT_LOCAL || low_kind == VT_LLOCAL) && !(low.r & VT_LVAL))
+        low.r |= VT_LVAL;
+      const int high_kind = high.r & VT_VALMASK;
+      if ((high_kind == VT_LOCAL || high_kind == VT_LLOCAL) && !(high.r & VT_LVAL))
+        high.r |= VT_LVAL;
+    }
 
     /* Create new 64-bit temp vreg for result */
     int result_vr = tcc_ir_get_vreg_temp(tcc_state->ir);

@@ -4912,6 +4912,10 @@ static void ld_update_symbol_values(TCCState *s1, LDScript *ld)
   addr_t sec_end;
   int i, j;
   addr_t output_section_addrs[LD_MAX_OUTPUT_SECTIONS] = {0};
+  int output_section_has_addr[LD_MAX_OUTPUT_SECTIONS] = {0};
+  addr_t output_section_loadaddrs[LD_MAX_OUTPUT_SECTIONS] = {0};
+  addr_t output_section_sizes[LD_MAX_OUTPUT_SECTIONS] = {0};
+  addr_t output_section_align[LD_MAX_OUTPUT_SECTIONS] = {0};
 
   /* Find section addresses and map output sections to actual addresses */
   for (i = 1; i < s1->nb_sections; i++)
@@ -4963,8 +4967,56 @@ static void ld_update_symbol_values(TCCState *s1, LDScript *ld)
       if (!strcmp(s->name, ld->output_sections[j].name))
       {
         output_section_addrs[j] = s->sh_addr;
+        output_section_has_addr[j] = 1;
         break;
       }
+    }
+
+    /* Accumulate sizes/alignments for load address computation */
+    if (ld)
+    {
+      int pat_idx = -1;
+      int ld_idx = ld_find_output_section_idx(s1, s->name, &pat_idx);
+      if (ld_idx >= 0 && ld_idx < ld->nb_output_sections)
+      {
+        addr_t align = s->sh_addralign ? s->sh_addralign : 1;
+        if (align > output_section_align[ld_idx])
+          output_section_align[ld_idx] = align;
+        if (s->sh_type != SHT_NOBITS)
+          output_section_sizes[ld_idx] += s->sh_size;
+      }
+    }
+  }
+
+  /* Compute output section load addresses (LMA) */
+  if (ld)
+  {
+    addr_t lma_cur[LD_MAX_MEMORY_REGIONS] = {0};
+    if (ld->nb_memory_regions > 0)
+    {
+      for (i = 0; i < ld->nb_memory_regions; i++)
+        lma_cur[i] = ld->memory_regions[i].origin;
+      for (j = 0; j < ld->nb_output_sections; j++)
+      {
+        int mr = ld->output_sections[j].load_memory_region_idx;
+        if (mr < 0)
+          mr = ld->output_sections[j].memory_region_idx;
+        if (mr < 0)
+          mr = 0;
+        if (mr >= 0 && mr < ld->nb_memory_regions)
+        {
+          addr_t align = output_section_align[j] ? output_section_align[j] : 1;
+          addr_t cur = lma_cur[mr];
+          addr_t lma_start = (cur + align - 1) & ~(align - 1);
+          output_section_loadaddrs[j] = lma_start;
+          lma_cur[mr] = lma_start + output_section_sizes[j];
+        }
+      }
+    }
+    else
+    {
+      for (j = 0; j < ld->nb_output_sections; j++)
+        output_section_loadaddrs[j] = output_section_addrs[j];
     }
   }
 
@@ -4976,7 +5028,7 @@ static void ld_update_symbol_values(TCCState *s1, LDScript *ld)
   /* Initialize memory region end addresses from laid-out sections */
   for (j = 0; j < ld->nb_output_sections; j++)
   {
-    if (output_section_addrs[j] != 0)
+    if (output_section_has_addr[j])
     {
       int mr = ld->output_sections[j].memory_region_idx;
       if (mr < 0)
@@ -5009,6 +5061,7 @@ static void ld_update_symbol_values(TCCState *s1, LDScript *ld)
       if (mr >= 0 && mr < ld->nb_memory_regions)
       {
         output_section_addrs[j] = mr_end[mr];
+        output_section_has_addr[j] = 1;
         mr_end[mr] += ld->output_sections[j].current_offset;
       }
     }
@@ -5022,11 +5075,23 @@ static void ld_update_symbol_values(TCCState *s1, LDScript *ld)
     if (sym->defined && sym->section_idx >= 0 && sym->section_idx < ld->nb_output_sections)
     {
       addr_t section_addr = output_section_addrs[sym->section_idx];
-      if (section_addr > 0)
+      if (output_section_has_addr[sym->section_idx])
       {
         /* Symbol value = section base address + offset within section */
         sym->value = section_addr + sym->section_offset;
       }
+    }
+  }
+
+  /* Resolve LOADADDR() symbols using computed LMA addresses */
+  for (j = 0; j < ld->nb_symbols; j++)
+  {
+    LDSymbol *sym = &ld->symbols[j];
+    if (sym->has_loadaddr && sym->loadaddr_section_idx >= 0 && sym->loadaddr_section_idx < ld->nb_output_sections)
+    {
+      addr_t lma = output_section_loadaddrs[sym->loadaddr_section_idx];
+      sym->value = lma;
+      sym->defined = 1;
     }
   }
 

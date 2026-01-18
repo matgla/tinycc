@@ -1649,6 +1649,9 @@ static void thumb_single_memory_transfer_opcode(TCCState *s1, int token)
       int literal_pos;
       int aligned_insn_pos;
       int jump_addr;
+      int branch_pos;
+      int literal_end;
+      int branch_offset;
       int puw = 0x6;
 
       next();
@@ -1657,11 +1660,17 @@ static void thumb_single_memory_transfer_opcode(TCCState *s1, int token)
       /* Emit a 32-bit LDR (literal) so it works for any Rt.
          Place the literal immediately after, aligned to 4 bytes.
        */
-      literal_pos = (insn_pos + 4 + 3) & ~3;
       aligned_insn_pos = insn_pos & ~3;
+      branch_pos = insn_pos + 4;
+      literal_pos = (branch_pos + 4 + 3) & ~3;
       jump_addr = literal_pos - aligned_insn_pos - 4;
 
       thumb_emit_opcode(th_ldr_imm(ops[0].reg, R_PC, jump_addr, puw, ENFORCE_ENCODING_32BIT));
+
+      /* Emit branch to skip over the inline literal data. */
+      literal_end = literal_pos + 4;
+      branch_offset = literal_end - (branch_pos + 4);
+      thumb_emit_opcode(th_b_t4(branch_offset));
 
       /* Pad to 4-byte alignment if needed. */
       while (ind < literal_pos)

@@ -5797,6 +5797,7 @@ ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *op)
    * (often PREG_NONE=0xFF), which encodes as PC and generates invalid code.
    */
   const int dest_is_64bit = is_64bit_type(op->dest.type.t);
+  const int src_is_64bit = is_64bit_type(op->src1.type.t);
 
   /* NOTE: Avoid noisy debug prints in normal builds. */
 
@@ -5815,7 +5816,7 @@ ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *op)
     const int dest_in_mem = (op->dest.r & VT_LVAL) != 0;
 
     int src_lo = op->src1.pr0;
-    int src_hi = op->src1.pr1;
+    int src_hi = src_is_64bit ? op->src1.pr1 : PREG_NONE;
     ScratchRegAlloc src_lo_alloc = {0};
     ScratchRegAlloc src_hi_alloc = {0};
 
@@ -5826,7 +5827,7 @@ ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *op)
     /* Materialize source into registers if needed (const/spilled/lvalue/etc).
      * If either half is spilled, reload the whole 64-bit value. */
     if ((op->src1.r & VT_VALMASK) == VT_CONST || (op->src1.r & VT_LVAL) || src_lo == PREG_NONE || src_lo_spilled ||
-        src_hi_spilled)
+        (src_is_64bit && src_hi_spilled))
     {
       uint32_t exclude = 0;
       if (!dest_in_mem)
@@ -5838,10 +5839,18 @@ ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *op)
       }
       src_lo_alloc = get_scratch_reg_with_save(exclude);
       exclude |= (1u << src_lo_alloc.reg);
-      src_hi_alloc = get_scratch_reg_with_save(exclude);
-      load_to_reg(src_lo_alloc.reg, src_hi_alloc.reg, &op->src1);
+      if (src_is_64bit)
+      {
+        src_hi_alloc = get_scratch_reg_with_save(exclude);
+        load_to_reg(src_lo_alloc.reg, src_hi_alloc.reg, &op->src1);
+        src_hi = src_hi_alloc.reg;
+      }
+      else
+      {
+        load_to_reg(src_lo_alloc.reg, PREG_NONE, &op->src1);
+        src_hi = PREG_NONE;
+      }
       src_lo = src_lo_alloc.reg;
-      src_hi = src_hi_alloc.reg;
     }
     else if (src_hi == PREG_NONE)
     {

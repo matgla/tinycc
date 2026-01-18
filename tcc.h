@@ -294,9 +294,9 @@ extern long double strtold(const char *__nptr, char **__endptr);
 /* -------------------------------------------- */
 
 #include "dwarf.h"
-#include "elf.h"
 #include "libtcc.h"
 #include "stab.h"
+#include "tcctypes.h"
 
 /* -------------------------------------------- */
 
@@ -329,25 +329,6 @@ typedef struct Sym Sym;
 /* include the target specific definitions */
 
 /* -------------------------------------------- */
-
-#if PTR_SIZE == 8
-#define ELFCLASSW ELFCLASS64
-#define ElfW(type) Elf##64##_##type
-#define ELFW(type) ELF##64##_##type
-#define ElfW_Rel ElfW(Rela)
-#define SHT_RELX SHT_RELA
-#define REL_SECTION_FMT ".rela%s"
-#else
-#define ELFCLASSW ELFCLASS32
-#define ElfW(type) Elf##32##_##type
-#define ELFW(type) ELF##32##_##type
-#define ElfW_Rel ElfW(Rel)
-#define SHT_RELX SHT_REL
-#define REL_SECTION_FMT ".rel%s"
-#endif
-/* target address type */
-#define addr_t ElfW(Addr)
-#define ElfSym ElfW(Sym)
 
 #if PTR_SIZE == 8 && !defined TCC_TARGET_PE
 #define LONG_SIZE 8
