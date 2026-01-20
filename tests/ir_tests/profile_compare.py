@@ -21,6 +21,22 @@ Usage:
     # Upload to GitHub Gist (requires gh CLI or GITHUB_TOKEN)
     python profile_compare.py baseline.json current.json --gist
 
+Git Comparison (automated build & profile):
+    # Compare a git tag/branch/commit against current HEAD
+    python profile_compare.py --git-compare v0.9.27
+
+    # Compare two specific commits
+    python profile_compare.py --git-compare abc123 --git-current def456
+
+    # Quick comparison with limited tests
+    python profile_compare.py --git-compare v0.9.27 --limit 10
+
+    # Use time profiler instead of heaptrack
+    python profile_compare.py --git-compare v0.9.27 --profiler time
+
+    # Generate HTML report from git comparison
+    python profile_compare.py --git-compare v0.9.27 --html report.html
+
 Output formats:
     - Console: colored diff table
     - Markdown: gist-friendly table
@@ -30,8 +46,11 @@ Output formats:
 
 import argparse
 import json
+import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -39,6 +58,7 @@ from typing import Optional
 
 CURRENT_DIR = Path(__file__).parent
 BASELINES_DIR = CURRENT_DIR / "profile_baselines"
+REPO_ROOT = CURRENT_DIR.parent.parent  # tinycc root
 
 
 @dataclass
@@ -497,6 +517,209 @@ def list_baselines() -> list[str]:
     return [p.stem for p in BASELINES_DIR.glob("*.json")]
 
 
+def run_cmd(cmd: list[str], cwd: Path = None, check: bool = True) -> subprocess.CompletedProcess:
+    """Run a command and return result."""
+    print(f"  $ {' '.join(cmd)}")
+    result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    if check and result.returncode != 0:
+        print(f"Command failed: {result.stderr}")
+        raise subprocess.CalledProcessError(result.returncode, cmd, result.stdout, result.stderr)
+    return result
+
+
+def get_git_short_hash(ref: str, repo_path: Path = REPO_ROOT) -> str:
+    """Get short hash for a git ref."""
+    result = run_cmd(["git", "rev-parse", "--short", ref], cwd=repo_path)
+    return result.stdout.strip()
+
+
+def get_git_commit_info(ref: str, repo_path: Path = REPO_ROOT) -> dict:
+    """Get commit info for a git ref."""
+    # Get hash
+    hash_result = run_cmd(["git", "rev-parse", "--short", ref], cwd=repo_path)
+    short_hash = hash_result.stdout.strip()
+
+    # Get full hash
+    full_hash_result = run_cmd(["git", "rev-parse", ref], cwd=repo_path)
+    full_hash = full_hash_result.stdout.strip()
+
+    # Get commit subject
+    subject_result = run_cmd(["git", "log", "-1", "--format=%s", ref], cwd=repo_path)
+    subject = subject_result.stdout.strip()
+
+    # Get commit date
+    date_result = run_cmd(["git", "log", "-1", "--format=%ci", ref], cwd=repo_path)
+    date = date_result.stdout.strip()
+
+    return {
+        "ref": ref,
+        "short_hash": short_hash,
+        "full_hash": full_hash,
+        "subject": subject,
+        "date": date,
+    }
+
+
+def create_worktree(ref: str, worktree_path: Path, repo_path: Path = REPO_ROOT) -> None:
+    """Create a git worktree for the given ref."""
+    # Remove existing worktree if present
+    if worktree_path.exists():
+        print(f"Removing existing worktree at {worktree_path}")
+        run_cmd(["git", "worktree", "remove", "--force", str(worktree_path)], cwd=repo_path, check=False)
+        if worktree_path.exists():
+            shutil.rmtree(worktree_path)
+
+    print(f"Creating worktree for {ref} at {worktree_path}")
+    run_cmd(["git", "worktree", "add", "--detach", str(worktree_path), ref], cwd=repo_path)
+
+
+def remove_worktree(worktree_path: Path, repo_path: Path = REPO_ROOT) -> None:
+    """Remove a git worktree."""
+    if worktree_path.exists():
+        print(f"Removing worktree at {worktree_path}")
+        run_cmd(["git", "worktree", "remove", "--force", str(worktree_path)], cwd=repo_path, check=False)
+        if worktree_path.exists():
+            shutil.rmtree(worktree_path)
+
+
+def build_tinycc(source_path: Path, build_path: Path = None) -> Path:
+    """Build TinyCC from source (in-tree build), returns path to armv8m-tcc binary."""
+    print(f"\nBuilding TinyCC from {source_path}")
+
+    # TinyCC requires in-tree build, so we build directly in the source directory
+    # The build_path parameter is kept for API compatibility but not used
+
+    # Configure
+    configure_script = source_path / "configure"
+    if not configure_script.exists():
+        raise FileNotFoundError(f"configure script not found at {configure_script}")
+
+    print("  Configuring...")
+    run_cmd(["./configure", "--enable-cross", "--enable-O2"], cwd=source_path)
+
+    # Build
+    print("  Building...")
+    nproc = os.cpu_count() or 4
+    run_cmd(["make", f"-j{nproc}"], cwd=source_path)
+
+    # Return path to armv8m-tcc binary (cross compiler for ARM Cortex-M)
+    tcc_path = source_path / "armv8m-tcc"
+    if not tcc_path.exists():
+        raise FileNotFoundError(f"armv8m-tcc binary not found at {tcc_path}")
+
+    return tcc_path
+
+
+def run_profile_suite(tcc_path: Path, output_dir: Path, profiler: str = "heaptrack",
+                      limit: int = 0, cflags: str = "") -> Path:
+    """Run profile_suite.py with a specific tcc binary, returns path to summary.json."""
+    print(f"\nRunning profile suite with {tcc_path}")
+    print(f"  Output: {output_dir}")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Build the command
+    cmd = [
+        sys.executable,
+        str(CURRENT_DIR / "profile_suite.py"),
+        "--output-dir", str(output_dir),
+        "--profiler", profiler,
+        "--compiler", str(tcc_path),
+    ]
+
+    if limit > 0:
+        cmd.extend(["--limit", str(limit)])
+
+    if cflags:
+        cmd.extend(["--cflags", cflags])
+
+    print(f"  $ {' '.join(cmd)}")
+    result = subprocess.run(cmd, cwd=CURRENT_DIR)
+
+    if result.returncode != 0:
+        print(f"Warning: profile_suite exited with code {result.returncode}")
+
+    summary_path = output_dir / "summary.json"
+    if not summary_path.exists():
+        raise FileNotFoundError(f"Profile summary not found at {summary_path}")
+
+    return summary_path
+
+
+def git_compare(baseline_ref: str, current_ref: str = "HEAD",
+                profiler: str = "heaptrack", limit: int = 0, cflags: str = "",
+                output_dir: Path = None, keep_worktrees: bool = False) -> tuple[dict, dict, str, str]:
+    """
+    Compare profiling results between two git revisions.
+
+    Returns: (baseline_data, current_data, baseline_name, current_name)
+    """
+    if output_dir is None:
+        output_dir = CURRENT_DIR / "profile_results"
+
+    # Get commit info
+    baseline_info = get_git_commit_info(baseline_ref)
+    current_info = get_git_commit_info(current_ref)
+
+    print("=" * 70)
+    print("Git Comparison")
+    print("=" * 70)
+    print(f"Baseline: {baseline_ref} ({baseline_info['short_hash']})")
+    print(f"          {baseline_info['subject'][:60]}")
+    print(f"Current:  {current_ref} ({current_info['short_hash']})")
+    print(f"          {current_info['subject'][:60]}")
+    print("=" * 70)
+
+    # Create temporary directory for worktrees and builds
+    with tempfile.TemporaryDirectory(prefix="tcc_profile_") as tmpdir:
+        tmpdir = Path(tmpdir)
+
+        # --- Build and profile baseline ---
+        print("\n" + "=" * 70)
+        print(f"PHASE 1: Building and profiling baseline ({baseline_ref})")
+        print("=" * 70)
+
+        baseline_worktree = tmpdir / "baseline_src"
+        baseline_profile_dir = output_dir / f"baseline_{baseline_info['short_hash']}"
+
+        create_worktree(baseline_ref, baseline_worktree)
+        baseline_tcc = build_tinycc(baseline_worktree)
+        baseline_summary = run_profile_suite(
+            baseline_tcc, baseline_profile_dir,
+            profiler=profiler, limit=limit, cflags=cflags
+        )
+        baseline_data = load_profile(baseline_summary)
+
+        if not keep_worktrees:
+            remove_worktree(baseline_worktree)
+
+        # --- Build and profile current ---
+        print("\n" + "=" * 70)
+        print(f"PHASE 2: Building and profiling current ({current_ref})")
+        print("=" * 70)
+
+        # Always create a worktree for clean, isolated builds
+        current_worktree = tmpdir / "current_src"
+        create_worktree(current_ref, current_worktree)
+
+        current_profile_dir = output_dir / f"current_{current_info['short_hash']}"
+
+        current_tcc = build_tinycc(current_worktree)
+        current_summary = run_profile_suite(
+            current_tcc, current_profile_dir,
+            profiler=profiler, limit=limit, cflags=cflags
+        )
+        current_data = load_profile(current_summary)
+
+        if not keep_worktrees:
+            remove_worktree(current_worktree)
+
+    baseline_name = f"{baseline_ref} ({baseline_info['short_hash']})"
+    current_name = f"{current_ref} ({current_info['short_hash']})"
+
+    return baseline_data, current_data, baseline_name, current_name
+
+
 def upload_gist(content: str, filename: str, description: str, public: bool = False) -> Optional[str]:
     """
     Upload content to GitHub Gist.
@@ -564,7 +787,23 @@ def upload_gist(content: str, filename: str, description: str, public: bool = Fa
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Compare TinyCC profile results")
+    parser = argparse.ArgumentParser(
+        description="Compare TinyCC profile results",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Git comparison examples:
+  # Compare a specific commit/tag against current HEAD
+  python profile_compare.py --git-compare v0.9.27
+
+  # Compare two specific commits
+  python profile_compare.py --git-compare abc123 --git-current def456
+
+  # Quick comparison with limited tests
+  python profile_compare.py --git-compare v0.9.27 --limit 10
+
+  # Use time profiler instead of heaptrack
+  python profile_compare.py --git-compare v0.9.27 --profiler time
+""")
     parser.add_argument("baseline", nargs="?", help="Baseline profile JSON file")
     parser.add_argument("current", nargs="?", help="Current profile JSON file")
     parser.add_argument("--save-baseline", metavar="FILE", help="Save profile as baseline")
@@ -575,6 +814,22 @@ def main():
     parser.add_argument("--html", metavar="FILE", help="Output HTML report")
     parser.add_argument("--gist", action="store_true", help="Upload report to GitHub Gist")
     parser.add_argument("--gist-public", action="store_true", help="Make gist public (default: secret)")
+
+    # Git comparison options
+    parser.add_argument("--git-compare", "-g", metavar="REF",
+                        help="Compare against a git ref (tag/branch/commit). "
+                             "Builds that revision, runs profiling, then compares with current HEAD.")
+    parser.add_argument("--git-current", metavar="REF", default="HEAD",
+                        help="Git ref to use as 'current' (default: HEAD)")
+    parser.add_argument("--profiler", "-p", choices=["heaptrack", "time", "perf"], default="heaptrack",
+                        help="Profiler tool to use for git comparison (default: heaptrack)")
+    parser.add_argument("--limit", "-n", type=int, default=0,
+                        help="Limit number of tests to run (0 = all)")
+    parser.add_argument("--cflags", type=str, default="",
+                        help="Additional CFLAGS to pass to the compiler")
+    parser.add_argument("--output-dir", "-o", type=Path, default=None,
+                        help="Output directory for profile results")
+
     args = parser.parse_args()
 
     # List baselines
@@ -594,28 +849,45 @@ def main():
         save_baseline(Path(args.save_baseline), name)
         return 0
 
-    # Compare - need either (baseline + current) or (--load-baseline + current)
-    current_path = args.current or args.baseline  # If only one positional, it's current
-
-    if not current_path:
-        parser.print_help()
-        return 1
-
-    # Load baseline
-    if args.load_baseline:
-        baseline_data, baseline_name = load_baseline(args.load_baseline)
-        current_path = args.current or args.baseline
-    elif args.baseline and args.current:
-        baseline_data = load_profile(Path(args.baseline))
-        baseline_name = Path(args.baseline).stem
-        current_path = args.current
+    # Git comparison mode
+    if args.git_compare:
+        try:
+            baseline_data, current_data, baseline_name, current_name = git_compare(
+                baseline_ref=args.git_compare,
+                current_ref=args.git_current,
+                profiler=args.profiler,
+                limit=args.limit,
+                cflags=args.cflags,
+                output_dir=args.output_dir,
+            )
+        except Exception as e:
+            print(f"Error during git comparison: {e}")
+            import traceback
+            traceback.print_exc()
+            return 1
     else:
-        parser.error("Either (baseline current) or (--load-baseline current) required")
-        return 1
+        # File comparison mode - need either (baseline + current) or (--load-baseline + current)
+        current_path = args.current or args.baseline  # If only one positional, it's current
 
-    # Load current
-    current_data = load_profile(Path(current_path))
-    current_name = Path(current_path).stem
+        if not current_path:
+            parser.print_help()
+            return 1
+
+        # Load baseline
+        if args.load_baseline:
+            baseline_data, baseline_name = load_baseline(args.load_baseline)
+            current_path = args.current or args.baseline
+        elif args.baseline and args.current:
+            baseline_data = load_profile(Path(args.baseline))
+            baseline_name = Path(args.baseline).stem
+            current_path = args.current
+        else:
+            parser.error("Either (baseline current), (--load-baseline current), or (--git-compare REF) required")
+            return 1
+
+        # Load current
+        current_data = load_profile(Path(current_path))
+        current_name = Path(current_path).stem
 
     # Compare
     comparisons = compare_profiles(baseline_data, current_data)

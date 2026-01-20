@@ -2832,12 +2832,16 @@ void load_to_dest(SValue *dest, SValue *sv)
   }
 
   /* Parameters passed on the stack are always accessed via FP with positive offsets.
-   * offset_to_args is only for computing FP-relative offsets, not SP-relative.
-   * The ARM EABI places stack parameters in the caller's frame above the saved FP.
+   * Apply `offset_to_args` only for stack-resident params (VT_LOCAL + VT_PARAM).
+   * Register-passed params may still carry VT_PARAM for IR semantics, but must
+   * NOT be adjusted here (it would corrupt pointer dereferences and other uses
+   * where `fc` is not a frame offset).
+   *
    * EXCEPTION: Variadic register parameters are saved in the prologue at
    * negative offsets (FP-16 to FP-4), so they're already in our local frame
-   * and should NOT have offset_to_args added. */
-  if ((sv->r & VT_PARAM) && !sign)
+   * and should NOT have offset_to_args added.
+   */
+  if ((sv->r & VT_PARAM) && !sign && ((sv->r & VT_VALMASK) == VT_LOCAL))
   {
     fc += offset_to_args;
   }

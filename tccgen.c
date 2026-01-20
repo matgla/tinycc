@@ -977,6 +977,7 @@ ST_FUNC void label_pop(Sym **ptop, Sym *slast, int keep)
   for (s = *ptop; s != slast; s = s1)
   {
     s1 = s->prev;
+    int addr_taken = (s->c == -3 || s->c > 0); /* Remember if address was taken before modifying s->c */
     if (s->r == LABEL_DECLARED)
     {
       tcc_warning_c(warn_all)("label '%s' declared but not used", get_tok_str(s->v, NULL));
@@ -1037,7 +1038,10 @@ ST_FUNC void label_pop(Sym **ptop, Sym *slast, int keep)
     /* remove label */
     if (s->r != LABEL_GONE)
       table_ident[s->v - TOK_IDENT]->sym_label = s->prev_tok;
-    if (!keep)
+    /* Don't free local label symbols whose address was taken (&&label) until
+       after IR codegen, as the IR instructions still reference them. The symbol
+       will be freed later with global labels after code generation. */
+    if (!keep && !addr_taken)
       sym_free(s);
     else
       s->r = LABEL_GONE;
@@ -8870,8 +8874,15 @@ again:
       tcc_debug_stabn(tcc_state, N_RBRAC, ind - func_ind);
     if (local_scope)
       next();
-    else if (!nocode_wanted)
-      check_func_return();
+    else
+    {
+      /* For main(), always generate return 0 even if nocode_wanted is set
+       * (which can happen due to control flow analysis after if/else etc.) */
+      if (nocode_wanted && !strcmp(funcname, "main") && (func_vt.t & VT_BTYPE) == VT_INT)
+        CODE_ON();
+      if (!nocode_wanted)
+        check_func_return();
+    }
   }
   else if (t == TOK_RETURN)
   {

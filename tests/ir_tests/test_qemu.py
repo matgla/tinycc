@@ -147,7 +147,7 @@ TEST_FILES = [
     # ("../tests2/98_al_ax_extend.c", 0), # x86
     # ("../tests2/99_fastcall.c", 0), # x86
     ("../tests2/100_c99array-decls.c", 0),
-    ("../tests2/101_cleanup.c", 0),
+    ("../tests2/101_cleanup.c", 105),
     ("../tests2/102_alignas.c", 0),
     ("../tests2/103_implicit_memmove.c", 0),
     (["../tests2/104_inline.c", "../tests2/104+_inline.c"], 0),
@@ -195,7 +195,6 @@ FLOAT_TEST_FILES = [
     ("../tests2/131_return_struct_in_reg.c", 0),
     ("../tests2/132_bound_test.c", 0),
     ("../tests2/134_double_to_signed.c", 0),
-
 ]
 
 TEST_FILES_WITH_ARGS = [
@@ -208,7 +207,7 @@ TEST_FILES_WITH_ARGS = [
 TAGGED_TEST_FILES = [
     "../tests2/60_errors_and_warnings.c",
     "../tests2/95_bitfields.c",
-    # "../tests2/96_nodata_wanted.c",
+    "../tests2/96_nodata_wanted.c",
 ]
 
 

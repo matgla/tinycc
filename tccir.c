@@ -4545,6 +4545,18 @@ int tcc_ir_constant_propagation(TCCIRState *ir)
       int pos = TCCIR_DECODE_VREG_POSITION(q->dest.vr);
       if (pos <= max_var_pos)
       {
+        /* If the address of a local is taken, it can be modified through aliases
+         * (e.g. passed as an out-parameter). Such variables are not safe for
+         * constant propagation even if they are only assigned once.
+         */
+        IRLiveInterval *interval = tcc_ir_get_live_interval(ir, q->dest.vr);
+        if (interval && interval->addrtaken)
+        {
+          var_info[pos].def_count++;
+          var_info[pos].is_constant = 0;
+          continue;
+        }
+
         var_info[pos].def_count++;
 
         /* Check if this is a constant assignment */
@@ -5791,6 +5803,31 @@ int tcc_ir_redundant_store_elimination(TCCIRState *ir)
          * but we already skip addr-taken stores above */
       }
 
+      /* Check for any instruction that reads from the same VT_LOCAL in src1 or src2
+       * (e.g., AND, OR, ADD operations that directly use stack locations) */
+      if (irop_config[q->op].has_src1)
+      {
+        int addr_valmask = q->src1.r & VT_VALMASK;
+        int addr_is_local = (addr_valmask == VT_LOCAL);
+
+        if (addr_is_local)
+        {
+          if (stores[i].local_sym == q->src1.sym && stores[i].local_offset == q->src1.c.i)
+            found_read = 1;
+        }
+      }
+      if (irop_config[q->op].has_src2)
+      {
+        int addr_valmask = q->src2.r & VT_VALMASK;
+        int addr_is_local = (addr_valmask == VT_LOCAL);
+
+        if (addr_is_local)
+        {
+          if (stores[i].local_sym == q->src2.sym && stores[i].local_offset == q->src2.c.i)
+            found_read = 1;
+        }
+      }
+
       /* Check for STORE to the same address (overwrite) */
       if (q->op == TCCIR_OP_STORE && j != store_idx)
       {
@@ -5839,8 +5876,12 @@ int tcc_ir_arithmetic_cse(TCCIRState *ir)
     int src2_vr;
     int64_t src1_const;
     int64_t src2_const;
+    Sym *src1_sym; /* Symbol pointer when VT_SYM is set */
+    Sym *src2_sym; /* Symbol pointer when VT_SYM is set */
     uint8_t src1_is_const : 1;
     uint8_t src2_is_const : 1;
+    uint8_t src1_is_sym : 1; /* True if src1 has VT_SYM */
+    uint8_t src2_is_sym : 1; /* True if src2 has VT_SYM */
     int result_vr;
     int instruction_idx;
     struct ArithCSEEntry *next;
@@ -5867,8 +5908,10 @@ int tcc_ir_arithmetic_cse(TCCIRState *ir)
   for (i = 0; i < n; i++)
   {
     int src1_is_const, src2_is_const;
+    int src1_is_sym, src2_is_sym;
     int64_t src1_const, src2_const;
     int src1_vr, src2_vr;
+    Sym *src1_sym, *src2_sym;
     uint32_t h;
     int found;
     ArithCSEEntry *e;
@@ -5890,18 +5933,26 @@ int tcc_ir_arithmetic_cse(TCCIRState *ir)
 
     src1_is_const = (q->src1.r & VT_VALMASK) == VT_CONST && !(q->src1.r & VT_SYM);
     src2_is_const = (q->src2.r & VT_VALMASK) == VT_CONST && !(q->src2.r & VT_SYM);
+    src1_is_sym = (q->src1.r & VT_SYM) != 0;
+    src2_is_sym = (q->src2.r & VT_SYM) != 0;
     src1_const = src1_is_const ? q->src1.c.i : 0;
     src2_const = src2_is_const ? q->src2.c.i : 0;
+    src1_sym = src1_is_sym ? q->src1.sym : NULL;
+    src2_sym = src2_is_sym ? q->src2.sym : NULL;
     src1_vr = q->src1.vr;
     src2_vr = q->src2.vr;
 
     h = (uint32_t)q->op * 31;
     if (src1_is_const)
       h += (uint32_t)src1_const * 17;
+    else if (src1_is_sym)
+      h += (uint32_t)(uintptr_t)src1_sym * 17;
     else
       h += (uint32_t)src1_vr * 17;
     if (src2_is_const)
       h += (uint32_t)src2_const * 13;
+    else if (src2_is_sym)
+      h += (uint32_t)(uintptr_t)src2_sym * 13;
     else
       h += (uint32_t)src2_vr * 13;
     h = h % 256;
@@ -5915,10 +5966,26 @@ int tcc_ir_arithmetic_cse(TCCIRState *ir)
       if (e->op != q->op)
         continue;
 
-      if (e->src1_is_const == src1_is_const && e->src2_is_const == src2_is_const)
+      /* Must match symbol flags as well as const flags */
+      if (e->src1_is_const == src1_is_const && e->src2_is_const == src2_is_const &&
+          e->src1_is_sym == src1_is_sym && e->src2_is_sym == src2_is_sym)
       {
-        match1 = e->src1_is_const ? (e->src1_const == src1_const) : (e->src1_vr == src1_vr);
-        match2 = e->src2_is_const ? (e->src2_const == src2_const) : (e->src2_vr == src2_vr);
+        /* For consts, compare constant value; for symbols, compare symbol pointer;
+         * otherwise compare vreg */
+        if (src1_is_const)
+          match1 = (e->src1_const == src1_const);
+        else if (src1_is_sym)
+          match1 = (e->src1_sym == src1_sym);
+        else
+          match1 = (e->src1_vr == src1_vr);
+
+        if (src2_is_const)
+          match2 = (e->src2_const == src2_const);
+        else if (src2_is_sym)
+          match2 = (e->src2_sym == src2_sym);
+        else
+          match2 = (e->src2_vr == src2_vr);
+
         if (match1 && match2)
         {
 #ifdef DEBUG_IR_GEN
@@ -5945,10 +6012,24 @@ int tcc_ir_arithmetic_cse(TCCIRState *ir)
       is_commutative = (q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_MUL || q->op == TCCIR_OP_AND ||
                         q->op == TCCIR_OP_OR || q->op == TCCIR_OP_XOR);
 
-      if (is_commutative && e->src1_is_const == src2_is_const && e->src2_is_const == src1_is_const)
+      /* For commutative ops, also check swapped operands (with matching flags) */
+      if (is_commutative && e->src1_is_const == src2_is_const && e->src2_is_const == src1_is_const &&
+          e->src1_is_sym == src2_is_sym && e->src2_is_sym == src1_is_sym)
       {
-        match1 = e->src1_is_const ? (e->src1_const == src2_const) : (e->src1_vr == src2_vr);
-        match2 = e->src2_is_const ? (e->src2_const == src1_const) : (e->src2_vr == src1_vr);
+        if (src2_is_const)
+          match1 = (e->src1_const == src2_const);
+        else if (src2_is_sym)
+          match1 = (e->src1_sym == src2_sym);
+        else
+          match1 = (e->src1_vr == src2_vr);
+
+        if (src1_is_const)
+          match2 = (e->src2_const == src1_const);
+        else if (src1_is_sym)
+          match2 = (e->src2_sym == src1_sym);
+        else
+          match2 = (e->src2_vr == src1_vr);
+
         if (match1 && match2)
         {
 #ifdef DEBUG_IR_GEN
@@ -5982,8 +6063,12 @@ int tcc_ir_arithmetic_cse(TCCIRState *ir)
       new_entry->src2_vr = src2_vr;
       new_entry->src1_const = src1_const;
       new_entry->src2_const = src2_const;
+      new_entry->src1_sym = src1_sym;
+      new_entry->src2_sym = src2_sym;
       new_entry->src1_is_const = src1_is_const;
       new_entry->src2_is_const = src2_is_const;
+      new_entry->src1_is_sym = src1_is_sym;
+      new_entry->src2_is_sym = src2_is_sym;
       new_entry->result_vr = q->dest.vr;
       new_entry->instruction_idx = i;
       new_entry->next = hash_table[h];

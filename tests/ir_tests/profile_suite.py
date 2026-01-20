@@ -53,7 +53,7 @@ def _test_id(test_file):
     return Path(primary).stem if primary else "unknown"
 
 
-def profile_test(test_file, output_dir, profiler_tool="heaptrack", extra_cflags: str = ""):
+def profile_test(test_file, output_dir, profiler_tool="heaptrack", extra_cflags: str = "", compiler: Path = None):
     """Profile a single test compilation."""
     test_name = _test_id(test_file)
 
@@ -69,6 +69,7 @@ def profile_test(test_file, output_dir, profiler_tool="heaptrack", extra_cflags:
     )
 
     config = CompileConfig(
+        compiler=compiler,
         profiler=profile_config,
         extra_cflags=extra_cflags or "",
         output_dir=output_dir / "build",
@@ -191,6 +192,8 @@ def main():
                         help="Additional CFLAGS to pass to the compiler (e.g. '-O0 -g -DDEBUG')")
     parser.add_argument("--test", "-t", type=str,
                         help="Run only test matching this pattern")
+    parser.add_argument("--compiler", "-c", type=Path, default=None,
+                        help="Path to compiler binary (default: use armv8m-tcc from repo root)")
     args = parser.parse_args()
 
     # Prepare output directory
@@ -215,6 +218,8 @@ def main():
     print(f"Profiling {len(all_tests)} tests")
     print(f"Output directory: {args.output_dir}")
     print(f"Profiler: {args.profiler}")
+    if args.compiler:
+        print(f"Compiler: {args.compiler}")
     if args.cflags:
         print(f"Extra CFLAGS: {args.cflags}")
     print("=" * 70)
@@ -226,6 +231,7 @@ def main():
             args.output_dir,
             profiler_tool=args.profiler,
             extra_cflags=args.cflags,
+            compiler=args.compiler,
         )
         result_dict = result_to_dict(result, test_name)
         results.append(result_dict)
