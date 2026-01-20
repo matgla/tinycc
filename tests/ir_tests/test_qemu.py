@@ -46,6 +46,8 @@ TEST_FILES = [
     ("test_f2d_bits.c", 0),
     ("test_aeabi_double_all.c", 0),
 
+    ("test_dmul_orig_override.c", 0),
+
     ("test_llong_add_signed.c", 0),
     ("test_llong_add_unsigned.c", 0),
     ("test_llong_load_signed.c", 0),
@@ -55,6 +57,13 @@ TEST_FILES = [
     ("test_llong_mul_parts.c", 0),
     ("test_llong_mul_64bit.c", 0),
     ("test_llong_mul_reg.c", 0),
+
+    ("test_mul32wide_outparams.c", 0),
+    ("test_mul64wide_compare.c", 0),
+    ("test_u64_mask_bit41.c", 0),
+    ("test_u64_param_split.c", 0),
+    ("test_u64_shift32.c", 0),
+    ("test_u64_shift_add.c", 0),
     ("test_llong_div_signed.c", 0),
     ("test_llong_div_unsigned.c", 0),
     ("test_llong_mod_signed.c", 0),
