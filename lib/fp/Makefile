@@ -9,6 +9,11 @@
 
 include ../../config.mak
 
+# Cross-build knobs (so we don't accidentally inherit host-only flags like ASAN)
+FP_CC ?= $(CC)
+FP_AR ?= $(AR)
+FP_CFLAGS ?= $(CFLAGS)
+
 # Default to soft float if not specified
 FPU ?= soft
 TARGET ?= arm
@@ -45,8 +50,8 @@ build:
 	@echo "Building FP library for $(FPU)..."
 	@mkdir -p $(BUILD_DIR)/$(FPU)
 	$(MAKE) -C $(TARGET_DIR) BUILD_DIR=$(CURDIR)/$(BUILD_DIR)/$(FPU) \
-		CFLAGS="$(CFLAGS) -I$(CURDIR)/../../include"
-	$(AR) rcs $(TARGET_LIB) $(BUILD_DIR)/$(FPU)/*.o
+		FP_CC="$(FP_CC)" FP_CFLAGS="$(FP_CFLAGS) -I$(CURDIR)/../../include"
+	$(FP_AR) rcs $(TARGET_LIB) $(BUILD_DIR)/$(FPU)/*.o
 	@echo "Created $(TARGET_LIB)"
 
 # Build all variants

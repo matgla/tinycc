@@ -4,8 +4,8 @@
  * Pure software IEEE 754 implementation - no FPU required
  */
 
-#include "../fp_abi.h"
-#include "soft_common.h"
+#include "../../../lib/fp/fp_abi.h"
+#include "../../../lib/fp/soft/soft_common.h"
 
 /* 64x64 -> 128 multiply.
  *
@@ -57,19 +57,10 @@ static inline void mul32wide_u32(uint32_t a, uint32_t b, uint32_t *lo, uint32_t 
 
 static inline void mul64wide(uint64_t a, uint64_t b, uint64_t *hi, uint64_t *lo)
 {
-  /* Avoid 64-bit shifts-by-32 here.
-   * Some low-opt codegen paths have historically produced wrong results for
-   * those, which breaks the wide-multiply path for non-power-of-two inputs.
-   */
-  u64_words aa;
-  u64_words bb;
-  aa.u = a;
-  bb.u = b;
-
-  uint32_t a0 = aa.w.lo;
-  uint32_t a1 = aa.w.hi;
-  uint32_t b0 = bb.w.lo;
-  uint32_t b1 = bb.w.hi;
+  uint32_t a0 = (uint32_t)a;
+  uint32_t a1 = (uint32_t)(a >> 32);
+  uint32_t b0 = (uint32_t)b;
+  uint32_t b1 = (uint32_t)(b >> 32);
 
   uint32_t p0_lo, p0_hi;
   uint32_t p1_lo, p1_hi;
@@ -89,14 +80,8 @@ static inline void mul64wide(uint64_t a, uint64_t b, uint64_t *hi, uint64_t *lo)
   add64_shift32(&w1, &w2, &w3, p2_lo, p2_hi);
   add64_shift64(&w2, &w3, p3_lo, p3_hi);
 
-  u64_words out_lo;
-  u64_words out_hi;
-  out_lo.w.lo = w0;
-  out_lo.w.hi = w1;
-  out_hi.w.lo = w2;
-  out_hi.w.hi = w3;
-  *lo = out_lo.u;
-  *hi = out_hi.u;
+  *lo = ((uint64_t)w1 << 32) | (uint64_t)w0;
+  *hi = ((uint64_t)w3 << 32) | (uint64_t)w2;
 }
 
 /* Multiply two double-precision floats */
@@ -225,15 +210,9 @@ double __aeabi_dmul(double a, double b)
    * If bit105 is set, shift by 53 and increment exponent.
    * Otherwise shift by 52.
    */
-  /* Determine whether the top bit is at position 105 (vs 104). Avoid 64-bit
-   * masking/shift here; use 32-bit word access instead.
-   *
-   * bit105 is bit 41 within prod_hi, i.e. bit 9 of prod_hi.hi (bits 32..63).
-   */
-  u64_words prod_hi_w;
-  prod_hi_w.u = prod_hi;
+  const uint64_t bit105_mask = 1ULL << (105 - 64); /* bit 41 within prod_hi */
   int shift = 52;
-  if (prod_hi_w.w.hi & (1u << 9))
+  if (prod_hi & bit105_mask)
   {
     shift = 53;
     result_exp++;
@@ -244,15 +223,10 @@ double __aeabi_dmul(double a, double b)
    * Do this with 32-bit pieces to avoid fragile 64-bit shift codegen on some
    * low-opt paths.
    */
-  u64_words prod_lo_w;
-  u64_words prod_hi_w2;
-  prod_lo_w.u = prod_lo;
-  prod_hi_w2.u = prod_hi;
-
-  const uint32_t prod_lo_lo = prod_lo_w.w.lo;
-  const uint32_t prod_lo_hi = prod_lo_w.w.hi;
-  const uint32_t prod_hi_lo = prod_hi_w2.w.lo;
-  const uint32_t prod_hi_hi = prod_hi_w2.w.hi;
+  const uint32_t prod_lo_lo = (uint32_t)prod_lo;
+  const uint32_t prod_lo_hi = (uint32_t)(prod_lo >> 32);
+  const uint32_t prod_hi_lo = (uint32_t)prod_hi;
+  const uint32_t prod_hi_hi = (uint32_t)(prod_hi >> 32);
 
   uint32_t mant_lo32;
   uint32_t mant_hi32;

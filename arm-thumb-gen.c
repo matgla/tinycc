@@ -4637,28 +4637,62 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
   }
   case TCCIR_OP_TEST_ZERO:
   {
-    int src_reg = op->src1.pr0;
-    ScratchRegAlloc src_alloc = {0};
+    const int is64 = tcc_is_64bit_operand(&op->src1);
+    int src_lo = op->src1.pr0;
+    int src_hi = op->src1.pr1;
 
-    /* Handle immediate constant, missing register, or lvalue (needs dereference).
+    /* Handle immediate constant, missing register(s), or lvalue (needs dereference).
      * When VT_LVAL is set, the register holds an address and we need to load
      * the value it points to before comparing against zero. */
-    int needs_load = th_has_immediate_value(op->src1.r) || src_reg == PREG_NONE || (op->src1.r & VT_LVAL);
+    const int needs_load = th_has_immediate_value(op->src1.r) || src_lo == PREG_NONE || (op->src1.r & VT_LVAL) ||
+                           (is64 && src_hi == PREG_NONE);
+
+    if (!is64)
+    {
+      ScratchRegAlloc src_alloc = {0};
+      if (needs_load)
+      {
+        src_alloc = get_scratch_reg_with_save(0);
+        src_lo = src_alloc.reg;
+        load_to_reg(src_lo, PREG_NONE, &op->src1);
+      }
+      else
+      {
+        thumb_require_materialized_reg("TEST_ZERO", "src", src_lo);
+      }
+
+      ot_check(th_cmp_imm(0, src_lo, 0, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE));
+
+      if (src_alloc.reg != 0)
+        restore_scratch_reg(&src_alloc);
+      return;
+    }
+
+    /* 64-bit: Z must be set iff (lo == 0 && hi == 0).
+     * Use CMP lo,#0; IT EQ; CMPEQ hi,#0 so if lo!=0 we keep Z=0. */
+    TCCMachineScratchRegs scratch;
+    memset(&scratch, 0, sizeof(scratch));
+    int used_scratch = 0;
     if (needs_load)
     {
-      src_alloc = get_scratch_reg_with_save(0);
-      src_reg = src_alloc.reg;
-      load_to_reg(src_reg, PREG_NONE, &op->src1);
+      used_scratch = 1;
+      tcc_machine_acquire_scratch(&scratch, TCC_MACHINE_SCRATCH_NEEDS_PAIR);
+      src_lo = scratch.regs[0];
+      src_hi = scratch.regs[1];
+      load_to_reg(src_lo, src_hi, &op->src1);
     }
     else
     {
-      thumb_require_materialized_reg("TEST_ZERO", "src", src_reg);
+      thumb_require_materialized_reg("TEST_ZERO", "src_lo", src_lo);
+      thumb_require_materialized_reg("TEST_ZERO", "src_hi", src_hi);
     }
-    ot_check(th_cmp_imm(0, src_reg, 0, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE));
 
-    /* Restore if allocated */
-    if (src_alloc.reg != 0)
-      restore_scratch_reg(&src_alloc);
+    ot_check(th_cmp_imm(0, src_lo, 0, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE));
+    ot_check(th_it(mapcc(TOK_EQ), 0x8)); /* IT EQ (single instruction) */
+    ot_check(th_cmp_imm(0, src_hi, 0, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE));
+
+    if (used_scratch)
+      tcc_machine_release_scratch(&scratch);
     return;
   }
   default:
