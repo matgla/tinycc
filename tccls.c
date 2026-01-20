@@ -608,8 +608,11 @@ void tcc_ls_spill_interval_sized(LSLiveIntervalState *ls, int interval_index, in
   LSLiveInterval *spill = ls->active_set[ls->next_active_index - 1];
   /* Only steal register from spill if:
    * 1. spill lives longer than interval (worth spilling)
-   * 2. spill actually has a valid register (r0 >= 0 and not already spilled) */
-  if (spill->end > interval->end && spill->r0 >= 0 && spill->stack_location == 0)
+   * 2. spill actually has a valid register (r0 >= 0 and not already spilled)
+   * 3. For 64-bit intervals (size==8), spill must also have a valid r1 (register pair) */
+  int spill_has_pair = (spill->r1 >= 0);
+  int needs_pair = (size == 8);
+  if (spill->end > interval->end && spill->r0 >= 0 && spill->stack_location == 0 && (!needs_pair || spill_has_pair))
   {
     interval->r0 = spill->r0;
     interval->r1 = spill->r1;
@@ -734,7 +737,8 @@ void tcc_ls_allocate_registers(LSLiveIntervalState *ls, int used_parameters_regi
       else
       {
         /* Pre-assigned r0 - try to get it and find r1 */
-        ls->intervals[i].r0 = tcc_ls_assign_register(ls, ls->intervals[i].r0);
+        int pre_r0 = ls->intervals[i].r0;
+        ls->intervals[i].r0 = tcc_ls_assign_register(ls, pre_r0);
         if (ls->intervals[i].r0 >= 0)
         {
           /* Got r0, now find r1 (prefer r0+1 if available) */
@@ -748,6 +752,20 @@ void tcc_ls_allocate_registers(LSLiveIntervalState *ls, int used_parameters_regi
             /* Try any available register */
             ls->intervals[i].r1 = tcc_ls_assign_any_register(ls);
           }
+        }
+        else
+        {
+          /* Pre-assigned register unavailable - fall back to allocating a fresh pair */
+          if (ls->intervals[i].crosses_call)
+          {
+            tcc_ls_assign_callee_saved_register_pair(ls, &r0, &r1);
+          }
+          else
+          {
+            tcc_ls_assign_register_pair(ls, &r0, &r1);
+          }
+          ls->intervals[i].r0 = r0;
+          ls->intervals[i].r1 = r1;
         }
       }
 

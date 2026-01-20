@@ -668,6 +668,7 @@ static void tcc_ir_clear_live_intervals(TCCIRState *ir)
   {
     tcc_free(ir->parameters_live_intervals);
   }
+
   ir->parameters_live_intervals = (IRLiveInterval *)tcc_mallocz(sizeof(IRLiveInterval) * IR_LIVE_INTERVAL_INIT_SIZE);
   tcc_ir_init_interval_starts(ir->parameters_live_intervals, IR_LIVE_INTERVAL_INIT_SIZE);
   ir->next_parameter = 0;
@@ -705,6 +706,8 @@ TCCIRState *tcc_ir_allocate_block()
     exit(1);
   }
   block->parameters_count = 0;
+  block->named_arg_reg_bytes = 0;
+  block->named_arg_stack_bytes = 0;
   block->active_set = (IRLiveInterval **)tcc_mallocz(sizeof(IRLiveInterval *) * tcc_gen_machine_number_of_registers());
   block->ir_to_code_mapping = NULL;
   block->ir_to_code_mapping_size = 0;
@@ -1066,6 +1069,12 @@ void tcc_ir_add_function_parameters(TCCIRState *ir, CType *func_type)
     arg_count++;
   if (arg_count > 0)
     tcc_abi_call_layout_ensure_capacity(&call_layout, arg_count);
+  if (ir)
+  {
+    ir->parameters_count = (int8_t)arg_count;
+    ir->named_arg_reg_bytes = 0;
+    ir->named_arg_stack_bytes = 0;
+  }
 
   int arg_index = 0;
   for (sym = sym->next; sym; sym = sym->next, ++arg_index)
@@ -1102,6 +1111,21 @@ void tcc_ir_add_function_parameters(TCCIRState *ir, CType *func_type)
     }
 
     TCCAbiArgLoc loc_info = tcc_abi_classify_argument(&call_layout, arg_index, &desc);
+    if (ir)
+    {
+      if (loc_info.kind == TCC_ABI_LOC_REG)
+      {
+        int bytes = (loc_info.reg_base + loc_info.reg_count) * 4;
+        if (bytes > ir->named_arg_reg_bytes)
+          ir->named_arg_reg_bytes = bytes;
+      }
+      else
+      {
+        int end = loc_info.stack_off + loc_info.size;
+        if (end > ir->named_arg_stack_bytes)
+          ir->named_arg_stack_bytes = end;
+      }
+    }
 
     /* Any stack-passed argument means we must keep a stable frame pointer
      * for addressing the caller argument area.
@@ -1199,16 +1223,17 @@ void tcc_ir_add_function_parameters(TCCIRState *ir, CType *func_type)
     {
       /* In-register param */
       flags = VT_PARAM | VT_LVAL;
-      if (variadic) {
+      if (variadic)
+      {
         /* For variadic functions, r0-r3 are saved at fixed offsets:
          * r0 at FP-16, r1 at FP-12, r2 at FP-8, r3 at FP-4.
          * This allows &param to compute the correct address.
          */
         addr = -16 + (loc_info.reg_base * 4);
-        flags |= VT_LOCAL;  /* Mark as having a stack location */
-        fprintf(stderr, "DEBUG: variadic param arg_index=%d reg_base=%d addr=%d\n", 
-                arg_index, loc_info.reg_base, addr);
-      } else {
+        flags |= VT_LOCAL; /* Mark as having a stack location */
+      }
+      else
+      {
         // argument is materialized in register, not local stack
         addr = 0;
       }
@@ -1388,6 +1413,7 @@ void tcc_ir_gen_opi(TCCIRState *ir, int op)
   tcc_ir_put(ir, ir_op, &vtop[-1], &vtop[0], &dest);
   vtop[-1].vr = dest.vr;
   vtop[-1].r = 0;
+  vtop[-1].type = dest.type; /* Update type - critical for UMULL which produces 64-bit from 32-bit inputs */
   --vtop;
 }
 
@@ -1655,6 +1681,17 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
         }
       }
 
+      /* Ensure 64-bit shifts keep a 64-bit destination, even if the caller
+       * accidentally provided a 32-bit dest type (the C semantics require
+       * the shift to produce a 64-bit result, with any truncation done by
+       * a subsequent cast). This prevents emitting 32-bit shifts that drop
+       * the high word. */
+      if ((op == TCCIR_OP_SHL || op == TCCIR_OP_SHR || op == TCCIR_OP_SAR) && src1 &&
+          tcc_ir_is_64bit_type(src1->type.t))
+      {
+        q->dest.type = src1->type;
+      }
+
       if (tcc_ir_is_float_type(q->dest.type.t))
       {
         tcc_ir_set_float_type(ir, dest->vr, 1, tcc_ir_is_double_type(q->dest.type.t));
@@ -1724,9 +1761,18 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
   else if (op == TCCIR_OP_ASSIGN && pos > 0)
   {
     /* Try to coalesce: if assigning from a TEMP that was the dest of the previous instruction,
-     * redirect that instruction's dest to our dest and skip this ASSIGN. */
-    const int can_coalesce = (!ir->prevent_coalescing) && (TCCIR_DECODE_VREG_TYPE(src1->vr) == TCCIR_VREG_TYPE_TEMP) &&
-                             ((src1->r & VT_LVAL) == 0) && (src1->vr == ir->instructions[pos - 1].dest.vr);
+     * redirect that instruction's dest to our dest and skip this ASSIGN.
+     *
+     * NOTE: Do not coalesce when widths differ (e.g. 64-bit result assigned to 32-bit temp).
+     * That would downcast the producer op (like SHR #32 on a 64-bit value) to 32-bit and
+     * lose the high word in codegen.
+     */
+    const int prev_is_64bit = ((ir->instructions[pos - 1].dest.type.t & VT_BTYPE) == VT_LLONG);
+    const int new_is_64bit = ((dest->type.t & VT_BTYPE) == VT_LLONG);
+    const int width_match = (prev_is_64bit == new_is_64bit);
+    const int can_coalesce = (!ir->prevent_coalescing) && width_match &&
+                             (TCCIR_DECODE_VREG_TYPE(src1->vr) == TCCIR_VREG_TYPE_TEMP) && ((src1->r & VT_LVAL) == 0) &&
+                             (src1->vr == ir->instructions[pos - 1].dest.vr);
     if (can_coalesce)
     {
       /* When coalescing, preserve the original c.i offset for global symbols.
@@ -1736,25 +1782,44 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
       int preserve_offset = ((ir->instructions[pos - 1].dest.r & (VT_VALMASK | VT_SYM)) == (VT_CONST | VT_SYM)) &&
                             (ir->instructions[pos - 1].op == TCCIR_OP_STORE);
 
-      /* Preserve the original type - important for 64-bit operations where the result
-       * is VT_LLONG but may be assigned to a VT_INT variable (extracting low 32 bits) */
-      CType prev_type = ir->instructions[pos - 1].dest.type;
-
-      /* Copy type information (like is_llong) from the old dest to the new dest before coalescing */
+      /* When coalescing, preserve the original c.i offset for global symbols.
+       * For STORE operations, the dest.c.i contains the offset into the global symbol
+       * and should not be overwritten by the local variable's stack offset.
+       *
+       * IMPORTANT: When a 64-bit operation result is assigned to a 32-bit variable
+       * (e.g., extracting high word via lexpand), we must NOT propagate is_llong
+       * to the 32-bit vreg, and we must use the ASSIGN's destination type, not
+       * the operation's result type. Otherwise, the register allocator will
+       * incorrectly allocate a register pair for what should be a 32-bit value.
+       */
+      int old_dest_type = ir->instructions[pos - 1].dest.type.t;
+      int new_dest_type = ir->instructions[pos].dest.type.t;
+      int old_is_64bit = ((old_dest_type & VT_BTYPE) == VT_LLONG);
+      int new_is_64bit = ((new_dest_type & VT_BTYPE) == VT_LLONG);
+      /* Copy type information (like is_llong) from the old dest to the new dest,
+       * but ONLY if both are 64-bit. If the new dest is 32-bit, it should NOT
+       * inherit is_llong from a 64-bit source. */
       int old_dest_vr = ir->instructions[pos - 1].dest.vr;
       int new_dest_vr = ir->instructions[pos].dest.vr;
       if (tcc_is_vreg_valid(ir, old_dest_vr) && tcc_is_vreg_valid(ir, new_dest_vr))
       {
         IRLiveInterval *old_interval = tcc_ir_get_live_interval(ir, old_dest_vr);
         IRLiveInterval *new_interval = tcc_ir_get_live_interval(ir, new_dest_vr);
-        if (old_interval && new_interval && old_interval->is_llong)
+        /* Only propagate is_llong if BOTH source and dest are 64-bit */
+        if (old_interval && new_interval && old_interval->is_llong && new_is_64bit)
           new_interval->is_llong = 1;
       }
 
+      /* Save prev_type only if we need to preserve it (same width) */
+      CType prev_type = ir->instructions[pos - 1].dest.type;
+      int preserve_type = (old_is_64bit == new_is_64bit);
+
       ir->instructions[pos - 1].dest = ir->instructions[pos].dest;
 
-      /* Restore the original type - the coalesced instruction should keep its original result type */
-      ir->instructions[pos - 1].dest.type = prev_type;
+      /* Only restore the original type if widths match. When coalescing a 64-bit
+       * result to a 32-bit variable, use the ASSIGN's destination type (32-bit). */
+      if (preserve_type)
+        ir->instructions[pos - 1].dest.type = prev_type;
 
       if (preserve_offset)
       {
@@ -2547,7 +2612,11 @@ void tcc_ir_assign_physical_register(TCCIRState *ir, int vreg, int offset, int r
   /* If variable is spilled (offset != 0), mark r0 with PREG_SPILLED flag */
   if (offset != 0)
   {
+    const int is_64bit = interval->is_double || interval->is_llong;
     interval->allocation.r0 = PREG_SPILLED;
+    /* For 64-bit values, mark the high word as spilled too so codegen reloads it
+     * instead of treating an uninitialized pr1 as a real register. */
+    interval->allocation.r1 = is_64bit ? PREG_SPILLED : PREG_NONE;
   }
   else
   {

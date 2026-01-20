@@ -1787,7 +1787,21 @@ ST_FUNC void tcc_machine_store_spill_slot(int src_reg, int frame_offset)
 
   if (!store_word_to_base(src_reg, base_reg, abs_offset, sign))
   {
-    ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(abs_offset, sign, (1u << src_reg) | (1u << base_reg));
+    /* Avoid clobbering the other half of a 64-bit value when storing
+     * paired registers. The allocator uses adjacent register pairs for
+     * 64-bit values (e.g. r0/r1, r2/r3, r4/r5). When storing one half,
+     * do not use the adjacent register as the scratch offset register.
+     */
+    uint32_t extra_exclude = 0;
+    if (src_reg >= ARM_R0 && src_reg <= ARM_R12)
+    {
+      int adj = (src_reg & 1) ? (src_reg - 1) : (src_reg + 1);
+      if (adj >= ARM_R0 && adj <= ARM_R12 && adj != ARM_SP && adj != ARM_PC)
+        extra_exclude |= (1u << adj);
+    }
+
+    ScratchRegAlloc rr_alloc =
+        th_offset_to_reg_ex(abs_offset, sign, (1u << src_reg) | (1u << base_reg) | extra_exclude);
     int rr = rr_alloc.reg;
     ot_check(th_str_reg(src_reg, base_reg, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     restore_scratch_reg(&rr_alloc);
@@ -3390,7 +3404,7 @@ static void thumb_emit_op_imm_fallback(int rd, int rn, uint32_t imm, thumb_flags
 static void thumb_emit_opcode64_imm(TACQuadruple *op, const char *ctx, ThumbDataProcessingHandler regular,
                                     ThumbDataProcessingHandler carry)
 {
-  const bool src2_is_imm = th_has_immediate_value(op->src2.r) || op->src2.pr0 == PREG_NONE;
+  const bool src2_is_imm = th_has_immediate_value(op->src2.r);
   const uint64_t src2_imm = (uint64_t)op->src2.c.i;
   const uint32_t imm_low = (uint32_t)(src2_imm & 0xffffffffu);
   const uint32_t imm_high = (uint32_t)(src2_imm >> 32);
@@ -3415,6 +3429,10 @@ static void thumb_emit_opcode64_imm(TACQuadruple *op, const char *ctx, ThumbData
   int rn_high = (src1_is64 ? op->src1.pr1 : PREG_NONE);
   ScratchRegAlloc rn_low_alloc = {0};
   ScratchRegAlloc rn_high_alloc = {0};
+  const int src1_kind = op->src1.r & VT_VALMASK;
+  const bool src1_is_address_of = (src1_kind == VT_LOCAL || src1_kind == VT_LLOCAL) && !(op->src1.r & VT_LVAL);
+  const bool src1_is_sym_address = (op->src1.r & VT_SYM) && !(op->src1.r & VT_LVAL);
+  const bool src1_needs_value_load = src1_is_address_of || src1_is_sym_address;
 
   if (src1_is_imm)
   {
@@ -3432,7 +3450,8 @@ static void thumb_emit_opcode64_imm(TACQuadruple *op, const char *ctx, ThumbData
       rn_high = PREG_NONE;
     }
   }
-  else if (thumb_is_hw_reg(rn_low) && (!src1_is64 || (rn_high != PREG_NONE && thumb_is_hw_reg(rn_high))))
+  else if (!src1_needs_value_load && !(op->src1.r & VT_LVAL) && thumb_is_hw_reg(rn_low) &&
+           (!src1_is64 || (rn_high != PREG_NONE && thumb_is_hw_reg(rn_high))))
   {
     thumb_require_materialized_reg(ctx, "src1.low", rn_low);
     if (src1_is64 && rn_high != PREG_NONE)
@@ -3451,12 +3470,18 @@ static void thumb_emit_opcode64_imm(TACQuadruple *op, const char *ctx, ThumbData
       rn_high_alloc = get_scratch_reg_with_save(exclude);
       rn_high = rn_high_alloc.reg;
       exclude |= (1u << rn_high);
-      load_to_reg(rn_low, rn_high, &op->src1);
+      SValue src1_tmp = op->src1;
+      if (src1_needs_value_load)
+        src1_tmp.r |= VT_LVAL;
+      load_to_reg(rn_low, rn_high, &src1_tmp);
     }
     else
     {
       rn_high = PREG_NONE;
-      load_to_reg(rn_low, PREG_NONE, &op->src1);
+      SValue src1_tmp = op->src1;
+      if (src1_needs_value_load)
+        src1_tmp.r |= VT_LVAL;
+      load_to_reg(rn_low, PREG_NONE, &src1_tmp);
     }
   }
 
@@ -3465,9 +3490,14 @@ static void thumb_emit_opcode64_imm(TACQuadruple *op, const char *ctx, ThumbData
   int rm_high = (src2_is64 ? op->src2.pr1 : PREG_NONE);
   ScratchRegAlloc rm_low_alloc = {0};
   ScratchRegAlloc rm_high_alloc = {0};
+  const int src2_kind = op->src2.r & VT_VALMASK;
+  const bool src2_is_address_of = (src2_kind == VT_LOCAL || src2_kind == VT_LLOCAL) && !(op->src2.r & VT_LVAL);
+  const bool src2_is_sym_address = (op->src2.r & VT_SYM) && !(op->src2.r & VT_LVAL);
+  const bool src2_needs_value_load = src2_is_address_of || src2_is_sym_address;
   if (!src2_is_imm)
   {
-    if (thumb_is_hw_reg(rm_low) && (!src2_is64 || (rm_high != PREG_NONE && thumb_is_hw_reg(rm_high))))
+    if (!src2_needs_value_load && !(op->src2.r & VT_LVAL) && thumb_is_hw_reg(rm_low) &&
+        (!src2_is64 || (rm_high != PREG_NONE && thumb_is_hw_reg(rm_high))))
     {
       thumb_require_materialized_reg(ctx, "src2.low", rm_low);
       if (src2_is64 && rm_high != PREG_NONE)
@@ -3483,12 +3513,18 @@ static void thumb_emit_opcode64_imm(TACQuadruple *op, const char *ctx, ThumbData
         rm_high_alloc = get_scratch_reg_with_save(exclude);
         rm_high = rm_high_alloc.reg;
         exclude |= (1u << rm_high);
-        load_to_reg(rm_low, rm_high, &op->src2);
+        SValue src2_tmp = op->src2;
+        if (src2_needs_value_load)
+          src2_tmp.r |= VT_LVAL;
+        load_to_reg(rm_low, rm_high, &src2_tmp);
       }
       else
       {
         rm_high = PREG_NONE;
-        load_to_reg(rm_low, PREG_NONE, &op->src2);
+        SValue src2_tmp = op->src2;
+        if (src2_needs_value_load)
+          src2_tmp.r |= VT_LVAL;
+        load_to_reg(rm_low, PREG_NONE, &src2_tmp);
       }
     }
   }
@@ -3673,14 +3709,15 @@ static void thumb_emit_logical64_op(TACQuadruple *op, ThumbDataProcessingHandler
 
     const int reg_src_kind = reg_src->r & VT_VALMASK;
     const bool reg_src_is_stack_local = (reg_src_kind == VT_LOCAL || reg_src_kind == VT_LLOCAL);
-    const bool reg_src_is_addr_of_local = reg_src_is64 && reg_src_is_stack_local && !(reg_src->r & VT_LVAL);
+    const bool reg_src_is_lval = (reg_src->r & VT_LVAL) != 0;
+    const bool reg_src_is_sym = (reg_src->r & VT_SYM) != 0;
     /* Heuristic fallback: some IR paths may lose VT_LOCAL/VT_LLOCAL while still
       carrying a stack frame offset in c.i. For 64-bit ops, treat that as a
       stack value that must be loaded (not an address). */
     const bool reg_src_force_value_load = reg_src_is64 && !(reg_src->r & VT_LVAL) && (reg_src->c.i != 0);
+    const bool reg_src_needs_load = reg_src_is64 && (reg_src_is_stack_local || reg_src_is_lval || reg_src_is_sym);
 
-    if (rn_low == PREG_NONE || (reg_src_is64 && rn_high == PREG_NONE) || reg_src_is_addr_of_local ||
-        reg_src_force_value_load)
+    if (rn_low == PREG_NONE || (reg_src_is64 && rn_high == PREG_NONE) || reg_src_needs_load || reg_src_force_value_load)
     {
       uint32_t load_exclude = 0;
       reg_src_lo_alloc = get_scratch_reg_with_save(load_exclude);
@@ -3771,6 +3808,12 @@ static void thumb_emit_logical64_op(TACQuadruple *op, ThumbDataProcessingHandler
   const bool src1_hi_spilled = (op->src1.pr1 != PREG_NONE) && (op->src1.pr1 & PREG_SPILLED);
   const bool src2_lo_spilled = (op->src2.pr0 != PREG_NONE) && (op->src2.pr0 & PREG_SPILLED);
   const bool src2_hi_spilled = (op->src2.pr1 != PREG_NONE) && (op->src2.pr1 & PREG_SPILLED);
+  const int src1_kind = op->src1.r & VT_VALMASK;
+  const int src2_kind = op->src2.r & VT_VALMASK;
+  const bool src1_is_stack_local = (src1_kind == VT_LOCAL || src1_kind == VT_LLOCAL);
+  const bool src2_is_stack_local = (src2_kind == VT_LOCAL || src2_kind == VT_LLOCAL);
+  const bool src1_needs_load = src1_is64 && (src1_is_stack_local || (op->src1.r & VT_LVAL) || (op->src1.r & VT_SYM));
+  const bool src2_needs_load = src2_is64 && (src2_is_stack_local || (op->src2.r & VT_LVAL) || (op->src2.r & VT_SYM));
 
   int src1_lo = op->src1.pr0;
   int src1_hi = op->src1.pr1;
@@ -3783,13 +3826,16 @@ static void thumb_emit_logical64_op(TACQuadruple *op, ThumbDataProcessingHandler
   uint32_t src_exclude = 0;
 
   /* Reload spilled src1.low */
-  if (src1_lo_spilled)
+  if (src1_lo == PREG_NONE || src1_lo_spilled || src1_needs_load)
   {
     src1_lo_alloc = get_scratch_reg_with_save(src_exclude);
     src1_lo = src1_lo_alloc.reg;
     if (thumb_is_hw_reg(src1_lo))
       src_exclude |= (1u << src1_lo);
-    load_to_reg(src1_lo, PREG_NONE, &op->src1);
+    SValue src1_tmp = op->src1;
+    if (src1_is_stack_local && !(src1_tmp.r & VT_LVAL))
+      src1_tmp.r |= VT_LVAL;
+    load_to_reg(src1_lo, PREG_NONE, &src1_tmp);
   }
   else
   {
@@ -3799,13 +3845,15 @@ static void thumb_emit_logical64_op(TACQuadruple *op, ThumbDataProcessingHandler
   }
 
   /* Reload spilled src1.high */
-  if (src1_hi_spilled)
+  if (src1_is64 && (src1_hi == PREG_NONE || src1_hi_spilled || src1_needs_load))
   {
     src1_hi_alloc = get_scratch_reg_with_save(src_exclude);
     src1_hi = src1_hi_alloc.reg;
     if (thumb_is_hw_reg(src1_hi))
       src_exclude |= (1u << src1_hi);
     SValue src1_hi_val = op->src1;
+    if (src1_is_stack_local && !(src1_hi_val.r & VT_LVAL))
+      src1_hi_val.r |= VT_LVAL;
     src1_hi_val.c.i += 4;
     load_to_reg(src1_hi, PREG_NONE, &src1_hi_val);
   }
@@ -3821,13 +3869,16 @@ static void thumb_emit_logical64_op(TACQuadruple *op, ThumbDataProcessingHandler
   }
 
   /* Reload spilled src2.low */
-  if (src2_lo_spilled)
+  if (src2_lo == PREG_NONE || src2_lo_spilled || src2_needs_load)
   {
     src2_lo_alloc = get_scratch_reg_with_save(src_exclude);
     src2_lo = src2_lo_alloc.reg;
     if (thumb_is_hw_reg(src2_lo))
       src_exclude |= (1u << src2_lo);
-    load_to_reg(src2_lo, PREG_NONE, &op->src2);
+    SValue src2_tmp = op->src2;
+    if (src2_is_stack_local && !(src2_tmp.r & VT_LVAL))
+      src2_tmp.r |= VT_LVAL;
+    load_to_reg(src2_lo, PREG_NONE, &src2_tmp);
   }
   else
   {
@@ -3837,13 +3888,15 @@ static void thumb_emit_logical64_op(TACQuadruple *op, ThumbDataProcessingHandler
   }
 
   /* Reload spilled src2.high */
-  if (src2_hi_spilled)
+  if (src2_is64 && (src2_hi == PREG_NONE || src2_hi_spilled || src2_needs_load))
   {
     src2_hi_alloc = get_scratch_reg_with_save(src_exclude);
     src2_hi = src2_hi_alloc.reg;
     if (thumb_is_hw_reg(src2_hi))
       src_exclude |= (1u << src2_hi);
     SValue src2_hi_val = op->src2;
+    if (src2_is_stack_local && !(src2_hi_val.r & VT_LVAL))
+      src2_hi_val.r |= VT_LVAL;
     src2_hi_val.c.i += 4;
     load_to_reg(src2_hi, PREG_NONE, &src2_hi_val);
   }
@@ -3931,6 +3984,9 @@ static void thumb_emit_shift64_imm(TACQuadruple *op, const char *ctx, bool is_le
   ScratchRegAlloc src_hi_alloc = (ScratchRegAlloc){0};
 
   const bool src_is_imm = (src_lo == PREG_NONE) && th_has_immediate_value(op->src1.r);
+  const int src1_kind = op->src1.r & VT_VALMASK;
+  const bool src1_is_address_of = (src1_kind == VT_LOCAL || src1_kind == VT_LLOCAL) && !(op->src1.r & VT_LVAL);
+  const bool src1_is_sym_address = (op->src1.r & VT_SYM) && !(op->src1.r & VT_LVAL);
   if (src_is_imm)
   {
     Sym *sym = (op->src1.r & VT_SYM) ? op->src1.sym : NULL;
@@ -3944,7 +4000,8 @@ static void thumb_emit_shift64_imm(TACQuadruple *op, const char *ctx, bool is_le
     const bool src_hi_spilled = (src_hi != PREG_NONE) && (src_hi & PREG_SPILLED);
 
     /* Low word must be usable as a register input. */
-    if (src_lo == PREG_NONE || src_lo_spilled || (op->src1.r & VT_LVAL) || th_has_immediate_value(op->src1.r))
+    if (src_lo == PREG_NONE || src_lo_spilled || (op->src1.r & VT_LVAL) || src1_is_address_of || src1_is_sym_address ||
+        th_has_immediate_value(op->src1.r))
     {
       src_lo_alloc = get_scratch_reg_with_save(exclude);
       src_lo = src_lo_alloc.reg;
@@ -3966,7 +4023,7 @@ static void thumb_emit_shift64_imm(TACQuadruple *op, const char *ctx, bool is_le
       if (thumb_is_hw_reg(src_hi))
         exclude |= (1u << src_hi);
     }
-    else if (src_hi_spilled || (op->src1.r & VT_LVAL))
+    else if (src_hi_spilled || (op->src1.r & VT_LVAL) || src1_is_address_of || src1_is_sym_address)
     {
       /* Lvalue source: load high word from (addr + 4) into a scratch. */
       src_hi_alloc = get_scratch_reg_with_save(exclude);
@@ -4477,8 +4534,10 @@ void tcc_gen_machine_data_processing_op(TACQuadruple *op)
   ThumbDataProcessingHandler handler;
   thumb_flags_behaviour flags = FLAGS_BEHAVIOUR_NOT_IMPORTANT;
 
-  /* Check for 64-bit operations */
-  if (is_64bit_type(op->dest.type.t))
+  /* Check for 64-bit operations.
+   * UMULL always produces a 64-bit result from 32-bit inputs, so it must
+   * always use the 64-bit handler regardless of the dest type annotation. */
+  if (is_64bit_type(op->dest.type.t) || op->op == TCCIR_OP_UMULL)
   {
     return thumb_process_data64_op(op);
   }
@@ -5494,33 +5553,8 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
   int named_stack_bytes = 0;
   if (func_var && ir)
   {
-    for (int vreg = 0; vreg < ir->next_parameter; ++vreg)
-    {
-      const int encoded_vreg = (TCCIR_VREG_TYPE_PARAM << 28) | vreg;
-      IRLiveInterval *interval = tcc_ir_get_live_interval(ir, encoded_vreg);
-      if (!interval)
-        continue;
-
-      int max_reg = -1;
-      if (interval->incoming_reg0 >= 0)
-        max_reg = interval->incoming_reg0;
-      if (interval->incoming_reg1 >= 0 && interval->incoming_reg1 > max_reg)
-        max_reg = interval->incoming_reg1;
-
-      if (max_reg >= 0)
-      {
-        const int bytes = (max_reg + 1) * 4;
-        if (bytes > named_reg_bytes)
-          named_reg_bytes = bytes;
-      }
-      else
-      {
-        const int size = (interval->is_double || interval->is_llong) ? 8 : 4;
-        const int end = interval->original_offset + size;
-        if (end > named_stack_bytes)
-          named_stack_bytes = end;
-      }
-    }
+    named_reg_bytes = ir->named_arg_reg_bytes;
+    named_stack_bytes = ir->named_arg_stack_bytes;
   }
 
   if (func_var)
@@ -5886,12 +5920,12 @@ ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *op)
     }
     else
     {
-      if (op->dest.pr0 != src_lo)
+      if (op->dest.pr0 != src_lo && op->dest.pr0 != PREG_NONE && src_lo != PREG_NONE)
       {
         ot_check(th_mov_reg(op->dest.pr0, src_lo, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
                             ENFORCE_ENCODING_NONE, false));
       }
-      if (op->dest.pr1 != src_hi)
+      if (op->dest.pr1 != src_hi && op->dest.pr1 != PREG_NONE && src_hi != PREG_NONE)
       {
         ot_check(th_mov_reg(op->dest.pr1, src_hi, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
                             ENFORCE_ENCODING_NONE, false));

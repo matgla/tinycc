@@ -91,32 +91,28 @@ double __aeabi_ddiv(double a, double b)
   int result_exp = a_exp - b_exp + DOUBLE_EXP_BIAS;
 
   /* Perform division using restoring division algorithm */
-  /* We need 53 bits of quotient precision */
-  /* Shift dividend left to maximize precision */
+  /* We need 53 bits of quotient precision plus guard bits */
   uint64_t dividend = a_mant;
   uint64_t divisor = b_mant;
   uint64_t quotient = 0;
 
-  /* Normalize both to have MSB at bit 63 for maximum precision */
-  int a_shift = clz64(dividend);
-  int b_shift = clz64(divisor);
-  dividend <<= a_shift;
-  divisor <<= b_shift;
+  /* Both mantissas have implicit bit at position 52, values in [1.0, 2.0) */
+  /* The quotient will be in range [0.5, 2.0) */
+  /* We want to generate the quotient bit by bit starting from MSB */
 
-  /* Adjust exponent for the shift */
-  result_exp += (b_shift - a_shift);
-
-  /* If dividend < divisor after normalization, we need to adjust */
+  /* If dividend < divisor, the quotient is in [0.5, 1.0) */
+  /* Pre-shift dividend to ensure first iteration can produce a quotient bit */
   if (dividend < divisor)
   {
+    dividend <<= 1;
     result_exp--;
   }
 
-  /* Perform 53 iterations of division */
+  /* Perform 54 iterations to get 54 bits (53 + 1 guard bit) */
   for (int i = 0; i < 54; i++)
   {
     quotient <<= 1;
-    if (dividend >= divisor)
+    if (!(dividend < divisor))
     {
       dividend -= divisor;
       quotient |= 1;
@@ -124,15 +120,17 @@ double __aeabi_ddiv(double a, double b)
     dividend <<= 1;
   }
 
-  /* Round: check if remainder >= half divisor */
-  if (dividend >= divisor)
+  /* Use guard bit for rounding, then scale back to 53 bits */
+  uint64_t guard = quotient & 1;
+  quotient >>= 1;
+  if (guard && dividend)
   {
     quotient++;
   }
 
   /* Normalize quotient - should have MSB around bit 53 */
   /* Shift to get 52-bit mantissa */
-  while (quotient >= (DOUBLE_IMPLICIT_BIT << 1))
+  while (!(quotient < (DOUBLE_IMPLICIT_BIT << 1)))
   {
     quotient >>= 1;
     result_exp++;

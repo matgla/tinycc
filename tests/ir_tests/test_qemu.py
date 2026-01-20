@@ -37,6 +37,9 @@ TEST_FILES = [
     ("test_struct_pass_by_value.c", 0),
     ("test_struct_return.c", 0),
     ("test_llong_relops.c", 0),
+    ("test_double_printf_ops.c", 0),
+    ("test_double_printf_literals.c", 0),
+    ("test_double_printf_mixed.c", 0),
 
     # AEABI soft-float regressions (bit-level tests; avoids printf %f).
     ("test_aeabi_dmul_bits.c", 0),
@@ -49,6 +52,9 @@ TEST_FILES = [
     ("test_llong_load_unsigned.c", 0),
     ("test_llong_mul_signed.c", 0),
     ("test_llong_mul_unsigned.c", 0),
+    ("test_llong_mul_parts.c", 0),
+    ("test_llong_mul_64bit.c", 0),
+    ("test_llong_mul_reg.c", 0),
     ("test_llong_div_signed.c", 0),
     ("test_llong_div_unsigned.c", 0),
     ("test_llong_mod_signed.c", 0),

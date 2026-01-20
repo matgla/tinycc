@@ -288,6 +288,9 @@ typedef struct TCCIRState
 {
   // number of function parameters
   int8_t parameters_count;
+  /* Named-argument usage for variadic prolog (AAPCS). */
+  int named_arg_reg_bytes;
+  int named_arg_stack_bytes;
 
   uint8_t leaffunc : 1;
   uint8_t processing_if : 1;

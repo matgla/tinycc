@@ -4,7 +4,7 @@ static int check_u64(const char *name, unsigned long long got, unsigned long lon
 {
   if (got != exp)
   {
-    printf("FAIL %s got=%llu exp=%llu\n", name, got, exp);
+    printf("FAIL %s got=%llx exp=%llx\n", name, got, exp);
     return 1;
   }
   return 0;

@@ -396,8 +396,21 @@ config.mak:
 # run all tests
 PYTEST ?= pytest
 
+# Host tests for soft-float aeabi functions
+AEABI_HOST_TESTS = test_aeabi_all test_host test_dmul_host
+AEABI_HOST_TEST_DIR = lib/fp/soft
+
+test-aeabi-host:
+	@echo "------------ aeabi host tests ------------"
+	@for t in $(AEABI_HOST_TESTS); do \
+		echo "Building and running $$t..."; \
+		$(CC) -O2 -DHOST_TEST $(AEABI_HOST_TEST_DIR)/$$t.c -o $(AEABI_HOST_TEST_DIR)/$$t -lm && \
+		$(AEABI_HOST_TEST_DIR)/$$t || exit 1; \
+	done
+	@echo "------------ aeabi host tests passed ------------"
+
 # run IR tests via pytest (preferred)
-test: cross
+test: cross test-aeabi-host
 	@echo "------------ ir_tests (pytest) ------------"
 	@cd tests/ir_tests && $(PYTEST) -s -n auto
 
@@ -431,7 +444,7 @@ distclean: clean
 	@rm -vf config.h config.mak config.texi
 	@rm -vf $(TCCDOCS)
 
-.PHONY: all cross fp-libs clean test test-legacy tar tags ETAGS doc distclean install uninstall FORCE
+.PHONY: all cross fp-libs clean test test-aeabi-host test-legacy tar tags ETAGS doc distclean install uninstall FORCE
 
 help:
 	@echo "make"

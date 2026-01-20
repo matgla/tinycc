@@ -1221,6 +1221,14 @@ static void args_parser_add_file(TCCState *s, const char *filename, int filetype
   dynarray_add(&s->files, &s->nb_files, f);
 }
 
+static void args_parser_add_group_marker(TCCState *s, int marker_type)
+{
+  struct filespec *f = tcc_malloc(sizeof *f + 1);
+  f->type = marker_type;
+  f->name[0] = '\0';
+  dynarray_add(&s->files, &s->nb_files, f);
+}
+
 /* set linker options */
 static int tcc_set_linker(TCCState *s, const char *option)
 {
@@ -1332,6 +1340,14 @@ static int tcc_set_linker(TCCState *s, const char *option)
     else if (link_option(option, "install_name=", &p))
     {
       copy_linker_arg(&s->soname, p, 0);
+    }
+    else if (link_option(option, "start-group", &p))
+    {
+      args_parser_add_group_marker(s, AFF_GROUP_START);
+    }
+    else if (link_option(option, "end-group", &p))
+    {
+      args_parser_add_group_marker(s, AFF_GROUP_END);
     }
     else if (ret = link_option(option, "?whole-archive", &p), ret)
     {

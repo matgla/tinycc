@@ -33,6 +33,50 @@
                     "ignoreFailures": true
                 }
             ]
+        },
+        {
+            "name": "QEMU mps2-an505 (gdb)",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/tests/ir_tests/build/test_double_printf_literals.elf",
+            "MIMode": "gdb",
+            "miDebuggerPath": "arm-none-eabi-gdb",
+            "miDebuggerServerAddress": "localhost:1234",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Set Disassembly Flavor to Intel",
+                    "text": "-gdb-set disassembly-flavor intel",
+                    "ignoreFailures": true
+                }
+            ]
+        },
+        {
+            "name": "QEMU mps2-an505 (connect)",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/tests/ir_tests/build/test_double_printf_literals.elf",
+            "MIMode": "gdb",
+            "miDebuggerPath": "arm-none-eabi-gdb",
+            "miDebuggerServerAddress": "localhost:1234",
+            "cwd": "${workspaceFolder}/tests/ir_tests/build",
+            "stopAtConnect": true,
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Set Disassembly Flavor to Intel",
+                    "text": "-gdb-set disassembly-flavor intel",
+                    "ignoreFailures": true
+                }
+            ]
         }
     ]
 }

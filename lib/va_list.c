@@ -71,7 +71,7 @@ void *__va_arg(__builtin_va_list ap, int arg_type, int size, int align)
 #endif
 
 #if defined __arm__
-/* ARM EABI va_list support (soft-float / integer regs only). */
+/* ARM EABI va_list support (AAPCS). */
 extern void abort(void);
 
 static inline char *tcc_align_ptr(char *p, int align)
@@ -88,13 +88,22 @@ void __tcc_va_start(__builtin_va_list ap, void *last, int size, int align, void 
   char *stack_base = *(char **)(frame - 20); /* stored by prolog */
   int reg_bytes = *(int *)(frame - 24);      /* bytes of named args in r0-r3 */
 
-  ap->__gr_top = reg_save + 16;
   if (reg_bytes < 0)
     reg_bytes = 0;
   if (reg_bytes > 16)
     reg_bytes = 16;
-  ap->__gr_offs = reg_bytes;
+
+  ap->__gr_top = reg_save + 16;
+  /* GCC-compatible: __gr_offs is a negative offset from __gr_top. */
+  ap->__gr_offs = reg_bytes - 16;
   ap->__stack = stack_base ? stack_base : frame;
+
+#ifdef __ARM_PCS_VFP
+  /* We do not currently save VFP argument registers for varargs.
+     Initialize VFP fields so GCC-style va_arg falls back to core/stack. */
+  ap->__vr_top = 0;
+  ap->__vr_offs = 0;
+#endif
 }
 
 void *__va_arg(__builtin_va_list ap, int size, int align)
@@ -108,11 +117,13 @@ void *__va_arg(__builtin_va_list ap, int size, int align)
   int reg_align = align;
   if (reg_align < 4)
     reg_align = 4;
+
+  /* __gr_offs is a negative offset from __gr_top. Align toward 0. */
   int reg_offs = (ap->__gr_offs + reg_align - 1) & ~(reg_align - 1);
 
-  if (reg_offs + sz <= 16)
+  if (reg_offs + sz <= 0)
   {
-    char *p = ap->__gr_top + reg_offs - 16;
+    char *p = (char *)ap->__gr_top + reg_offs;
     ap->__gr_offs = reg_offs + sz;
     return p;
   }

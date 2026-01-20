@@ -77,7 +77,7 @@ static int fail_u64(const char *name, uint64_t got, uint64_t exp)
   write_str(" exp=0x");
   write_hex64(exp);
   write_str("\n");
-  return 1;
+  exit(1);
 }
 
 static int fail_u32(const char *name, uint32_t got, uint32_t exp)
@@ -93,7 +93,7 @@ static int fail_u32(const char *name, uint32_t got, uint32_t exp)
   write_str(" exp=0x");
   write_hex32(exp);
   write_str("\n");
-  return 1;
+  exit(1);
 }
 
 static int fail_i32(const char *name, int got, int exp)
@@ -124,6 +124,71 @@ int main(void)
   out.d = __aeabi_dmul(a.d, b.d);
   if (fail_u64("dmul", out.u, 0x4008000000000000ULL))
     return 1; /* 3.0 */
+
+  /* Additional multiplication tests */
+  /* 1.0 * 10.0 = 10.0 */
+  a.u = 0x3FF0000000000000ULL; /* 1.0 */
+  b.u = 0x4024000000000000ULL; /* 10.0 */
+  out.d = __aeabi_dmul(a.d, b.d);
+  fail_u64("dmul_1_10", out.u, 0x4024000000000000ULL); /* 10.0 */
+
+  /* 2.0 * 3.0 = 6.0 */
+  a.u = 0x4000000000000000ULL; /* 2.0 */
+  b.u = 0x4008000000000000ULL; /* 3.0 */
+  out.d = __aeabi_dmul(a.d, b.d);
+  fail_u64("dmul_2_3", out.u, 0x4018000000000000ULL); /* 6.0 */
+
+  /* 3.0 * 3.0 = 9.0 */
+  a.u = 0x4008000000000000ULL; /* 3.0 */
+  b.u = 0x4008000000000000ULL; /* 3.0 */
+  out.d = __aeabi_dmul(a.d, b.d);
+  fail_u64("dmul_3_3", out.u, 0x4022000000000000ULL); /* 9.0 */
+
+  /* 2.0 * 2.0 = 4.0 */
+  a.u = 0x4000000000000000ULL; /* 2.0 */
+  b.u = 0x4000000000000000ULL; /* 2.0 */
+  out.d = __aeabi_dmul(a.d, b.d);
+  fail_u64("dmul_2_2", out.u, 0x4010000000000000ULL); /* 4.0 */
+
+  /* 0.5 * 2.0 = 1.0 */
+  a.u = 0x3FE0000000000000ULL; /* 0.5 */
+  b.u = 0x4000000000000000ULL; /* 2.0 */
+  out.d = __aeabi_dmul(a.d, b.d);
+  fail_u64("dmul_0p5_2", out.u, 0x3FF0000000000000ULL); /* 1.0 */
+
+  /* 1.5 * 1.5 = 2.25 */
+  a.u = 0x3FF8000000000000ULL; /* 1.5 */
+  b.u = 0x3FF8000000000000ULL; /* 1.5 */
+  out.d = __aeabi_dmul(a.d, b.d);
+  fail_u64("dmul_1p5_1p5", out.u, 0x4002000000000000ULL); /* 2.25 */
+
+  /* 10.0 * 10.0 = 100.0 */
+  a.u = 0x4024000000000000ULL; /* 10.0 */
+  b.u = 0x4024000000000000ULL; /* 10.0 */
+  out.d = __aeabi_dmul(a.d, b.d);
+  fail_u64("dmul_10_10", out.u, 0x4059000000000000ULL); /* 100.0 */
+
+  /* -2.0 * 3.0 = -6.0 */
+  a.u = 0xC000000000000000ULL; /* -2.0 */
+  b.u = 0x4008000000000000ULL; /* 3.0 */
+  out.d = __aeabi_dmul(a.d, b.d);
+  fail_u64("dmul_neg2_3", out.u, 0xC018000000000000ULL); /* -6.0 */
+
+  /* -2.0 * -3.0 = 6.0 */
+  a.u = 0xC000000000000000ULL; /* -2.0 */
+  b.u = 0xC008000000000000ULL; /* -3.0 */
+  out.d = __aeabi_dmul(a.d, b.d);
+  fail_u64("dmul_neg2_neg3", out.u, 0x4018000000000000ULL); /* 6.0 */
+
+  /* 1.0 * 0.0 = 0.0 */
+  a.u = 0x3FF0000000000000ULL; /* 1.0 */
+  b.u = 0x0000000000000000ULL; /* 0.0 */
+  out.d = __aeabi_dmul(a.d, b.d);
+  fail_u64("dmul_1_0", out.u, 0x0000000000000000ULL); /* 0.0 */
+
+  /* Restore original test values */
+  a.u = 0x3ff8000000000000ULL; /* 1.5 */
+  b.u = 0x4000000000000000ULL; /* 2.0 */
 
   out.d = __aeabi_ddiv(a.d, b.d);
   if (fail_u64("ddiv", out.u, 0x3fe8000000000000ULL))
@@ -197,6 +262,64 @@ int main(void)
   out.d = __aeabi_ui2d(42U);
   if (fail_u64("ui2d", out.u, 0x4045000000000000ULL))
     return 1; /* 42.0 */
+
+  /* Additional division tests to find the bug */
+
+  /* 4.0 / 2.0 = 2.0 (simple, powers of 2) */
+  a.u = 0x4010000000000000ULL; /* 4.0 */
+  b.u = 0x4000000000000000ULL; /* 2.0 */
+  out.d = __aeabi_ddiv(a.d, b.d);
+  fail_u64("ddiv_4_2", out.u, 0x4000000000000000ULL); /* 2.0 */
+
+  /* 6.0 / 2.0 = 3.0 */
+  a.u = 0x4018000000000000ULL; /* 6.0 */
+  b.u = 0x4000000000000000ULL; /* 2.0 */
+  out.d = __aeabi_ddiv(a.d, b.d);
+  fail_u64("ddiv_6_2", out.u, 0x4008000000000000ULL); /* 3.0 */
+
+  /* 6.0 / 3.0 = 2.0 */
+  a.u = 0x4018000000000000ULL; /* 6.0 */
+  b.u = 0x4008000000000000ULL; /* 3.0 */
+  out.d = __aeabi_ddiv(a.d, b.d);
+  fail_u64("ddiv_6_3", out.u, 0x4000000000000000ULL); /* 2.0 */
+
+  /* 9.0 / 3.0 = 3.0 */
+  a.u = 0x4022000000000000ULL; /* 9.0 */
+  b.u = 0x4008000000000000ULL; /* 3.0 */
+  out.d = __aeabi_ddiv(a.d, b.d);
+  fail_u64("ddiv_9_3", out.u, 0x4008000000000000ULL); /* 3.0 */
+
+  /* 7.0 / 2.0 = 3.5 (non-integer result with power of 2 divisor) */
+  a.u = 0x401C000000000000ULL; /* 7.0 */
+  b.u = 0x4000000000000000ULL; /* 2.0 */
+  out.d = __aeabi_ddiv(a.d, b.d);
+  fail_u64("ddiv_7_2", out.u, 0x400C000000000000ULL); /* 3.5 */
+
+  /* 5.0 / 2.0 = 2.5 */
+  a.u = 0x4014000000000000ULL; /* 5.0 */
+  b.u = 0x4000000000000000ULL; /* 2.0 */
+  out.d = __aeabi_ddiv(a.d, b.d);
+  fail_u64("ddiv_5_2", out.u, 0x4004000000000000ULL); /* 2.5 */
+
+  /* 1.0 / 3.0 = 0.333... (repeating decimal) */
+  a.u = 0x3FF0000000000000ULL; /* 1.0 */
+  b.u = 0x4008000000000000ULL; /* 3.0 */
+  out.d = __aeabi_ddiv(a.d, b.d);
+  fail_u64("ddiv_1_3", out.u, 0x3FD5555555555555ULL); /* 0.333... */
+
+  /* 2.0 / 3.0 = 0.666... */
+  a.u = 0x4000000000000000ULL; /* 2.0 */
+  b.u = 0x4008000000000000ULL; /* 3.0 */
+  out.d = __aeabi_ddiv(a.d, b.d);
+  fail_u64("ddiv_2_3", out.u, 0x3FE5555555555555ULL); /* 0.666... */
+
+  /* Test 10.0 / 3.0 = 3.333... (reproduces division bug) */
+  /* 10.0 = 0x4024000000000000, 3.0 = 0x4008000000000000 */
+  /* 10/3 = 3.333... = 0x400AAAAAAAAAAAAB (rounded) */
+  a.u = 0x4024000000000000ULL; /* 10.0 */
+  b.u = 0x4008000000000000ULL; /* 3.0 */
+  out.d = __aeabi_ddiv(a.d, b.d);
+  fail_u64("ddiv_10_3", out.u, 0x400AAAAAAAAAAAABULL); /* 3.333... (rounded) */
 
   write_str("PASS\n");
   return 0;

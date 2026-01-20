@@ -222,12 +222,23 @@ typedef char *__builtin_va_list;
 #elif defined __arm__
 /* ARM EABI va_list support.
    Kept in sync with lib/va_list.c helpers. */
+#if defined __ARM_PCS_VFP
+typedef struct
+{
+  void *__stack;
+  void *__gr_top;
+  void *__vr_top;
+  int __gr_offs;
+  int __vr_offs;
+} __builtin_va_list[1];
+#else
 typedef struct
 {
   void *__stack;
   void *__gr_top;
   int __gr_offs;
 } __builtin_va_list[1];
+#endif
 
 void __tcc_va_start(__builtin_va_list ap, void *last, int size, int align, void *fp);
 void *__va_arg(__builtin_va_list ap, int size, int align);

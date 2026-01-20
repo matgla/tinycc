@@ -2183,6 +2183,8 @@ ST_FUNC void lexpand(void)
       full.type.t = vtop->type.t;
       full.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
       full.r = 0;
+      if ((full.type.t & VT_BTYPE) == VT_LLONG)
+        tcc_ir_set_llong_type(tcc_state->ir, full.vr);
 
       /* Force load of the 64-bit value */
       tcc_ir_put(tcc_state->ir, TCCIR_OP_ASSIGN, vtop, NULL, &full);
@@ -2219,10 +2221,18 @@ ST_FUNC void lexpand(void)
       shifted64.type.t = VT_LLONG | u;
       shifted64.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
       shifted64.r = 0;
+      tcc_ir_set_llong_type(tcc_state->ir, shifted64.vr);
       tcc_ir_put(tcc_state->ir, TCCIR_OP_SHR, &full, &shift_amt, &shifted64);
 
-      /* high32 = (uint32_t)shifted64 (i.e. original high word). */
+      /* high32 = (uint32_t)shifted64 (i.e. original high word).
+       * IMPORTANT: prevent coalescing here! The SHR must remain a 64-bit operation
+       * to correctly extract the high word. If coalesced with this 32-bit ASSIGN,
+       * the SHR's dest type would become 32-bit and codegen would emit a 32-bit shift
+       * instead of a 64-bit shift, causing the high word to be lost. */
+      old_prevent_coalescing = tcc_state->ir->prevent_coalescing;
+      tcc_state->ir->prevent_coalescing = 1;
       tcc_ir_put(tcc_state->ir, TCCIR_OP_ASSIGN, &shifted64, NULL, &vtop[0]);
+      tcc_state->ir->prevent_coalescing = old_prevent_coalescing;
     }
     else
     {
@@ -2254,7 +2264,8 @@ ST_FUNC void lexpand(void)
       full.type.t = vtop->type.t;
       full.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
       full.r = 0;
-
+      if ((full.type.t & VT_BTYPE) == VT_LLONG)
+        tcc_ir_set_llong_type(tcc_state->ir, full.vr);
       /* Force a value-producing vreg (loads from lvalues if needed). */
       int assign_pos = tcc_ir_put(tcc_state->ir, TCCIR_OP_ASSIGN, vtop, NULL, &full);
 
@@ -2262,6 +2273,8 @@ ST_FUNC void lexpand(void)
       if (assign_pos < tcc_state->ir->next_instruction_index)
       {
         full.vr = tcc_state->ir->instructions[assign_pos].dest.vr;
+        /* Also update full.type to match the coalesced instruction's dest type! */
+        full.type.t = tcc_state->ir->instructions[assign_pos].dest.type.t;
       }
 
       /* Create explicit low32 = (uint32_t)full. */
@@ -2318,10 +2331,18 @@ ST_FUNC void lexpand(void)
       shifted64.type.t = VT_LLONG | u;
       shifted64.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
       shifted64.r = 0;
+      tcc_ir_set_llong_type(tcc_state->ir, shifted64.vr);
       tcc_ir_put(tcc_state->ir, TCCIR_OP_SHR, &full, &shift_amt, &shifted64);
 
-      /* high32 = (uint32_t)shifted64 (i.e. original high word). */
+      /* high32 = (uint32_t)shifted64 (i.e. original high word).
+       * IMPORTANT: prevent coalescing here! The SHR must remain a 64-bit operation
+       * to correctly extract the high word. If coalesced with this 32-bit ASSIGN,
+       * the SHR's dest type would become 32-bit and codegen would emit a 32-bit shift
+       * instead of a 64-bit shift, causing the high word to be lost. */
+      old_prevent_coalescing = tcc_state->ir->prevent_coalescing;
+      tcc_state->ir->prevent_coalescing = 1;
       tcc_ir_put(tcc_state->ir, TCCIR_OP_ASSIGN, &shifted64, NULL, &vtop[0]);
+      tcc_state->ir->prevent_coalescing = old_prevent_coalescing;
     }
     else
     {
@@ -2341,54 +2362,112 @@ ST_FUNC void lexpand(void)
 static void lbuild(int t)
 {
   /* For IR mode: combine low and high vregs into a single 64-bit vreg.
-   * Generate an OR operation: (high << 32) | low */
-  if (tcc_state->ir && vtop[-1].vr >= 0 && vtop[0].vr >= 0)
+   * Generate an OR operation: (high << 32) | low
+   *
+   * Handle cases where one or both operands are constants (vr == -1).
+   * Constants are encoded with VT_CONST in .r and the value in .c.i.
+   */
+  if (tcc_state->ir)
   {
-    /* In IR mode, vtop entries may still carry address-like VT_LOCAL
-     * flags. lbuild must operate on the VALUES, not addresses.
-     * Force both operands to be treated as rvalues when emitting IR. */
     SValue low = vtop[-1];
     SValue high = vtop[0];
-    /* Preserve constants and symbols. Only force stack-address operands
-     * (VT_LOCAL / VT_LLOCAL without VT_LVAL) to be loaded as values. */
+    /* Check if we have valid operands (either vreg or constant) */
+    int low_is_const = (low.vr < 0) && ((low.r & VT_VALMASK) == VT_CONST);
+    int high_is_const = (high.vr < 0) && ((high.r & VT_VALMASK) == VT_CONST);
+    int low_is_vreg = (low.vr >= 0);
+    int high_is_vreg = (high.vr >= 0);
+
+    /* Only proceed if both operands are valid (vreg or constant) */
+    if ((low_is_vreg || low_is_const) && (high_is_vreg || high_is_const))
     {
-      const int low_kind = low.r & VT_VALMASK;
-      if ((low_kind == VT_LOCAL || low_kind == VT_LLOCAL) && !(low.r & VT_LVAL))
-        low.r |= VT_LVAL;
-      const int high_kind = high.r & VT_VALMASK;
-      if ((high_kind == VT_LOCAL || high_kind == VT_LLOCAL) && !(high.r & VT_LVAL))
-        high.r |= VT_LVAL;
+      /* Special case: both are constants - compute result directly */
+      if (low_is_const && high_is_const)
+      {
+        uint64_t result_val = ((uint64_t)(uint32_t)high.c.i << 32) | (uint32_t)low.c.i;
+        vtop[-1].c.i = (long long)result_val;
+        vtop[-1].type.t = t;
+        vtop[-1].r = VT_CONST;
+        vtop[-1].vr = -1;
+        vpop();
+        return;
+      }
+
+      /* In IR mode, vtop entries may still carry address-like VT_LOCAL
+       * flags. lbuild must operate on the VALUES, not addresses.
+       * Force both operands to be treated as rvalues when emitting IR. */
+      {
+        const int low_kind = low.r & VT_VALMASK;
+        if ((low_kind == VT_LOCAL || low_kind == VT_LLOCAL) && !(low.r & VT_LVAL))
+          low.r |= VT_LVAL;
+        const int high_kind = high.r & VT_VALMASK;
+        if ((high_kind == VT_LOCAL || high_kind == VT_LLOCAL) && !(high.r & VT_LVAL))
+          high.r |= VT_LVAL;
+      }
+
+      /* Create new 64-bit temp vreg for result */
+      int result_vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+      if ((t & VT_BTYPE) == VT_LLONG)
+        tcc_ir_set_llong_type(tcc_state->ir, result_vr);
+      /* Special case: high word is constant 0 - just assign/extend low to 64-bit */
+      if (high_is_const && high.c.i == 0)
+      {
+        /* Result is just the low word zero-extended to 64-bit.
+         * Generate: result = low | 0 (or just assign if low is already correct) */
+        SValue result;
+        memset(&result, 0, sizeof(result));
+        result.type.t = t;
+        result.vr = result_vr;
+        result.r = 0;
+        if ((result.type.t & VT_BTYPE) == VT_LLONG)
+          tcc_ir_set_llong_type(tcc_state->ir, result.vr);
+
+        /* For zero-extension, we can use ASSIGN with proper type or OR with 0 */
+        SValue zero;
+        memset(&zero, 0, sizeof(zero));
+        zero.type.t = VT_LLONG;
+        zero.r = VT_CONST;
+        zero.c.i = 0;
+        zero.vr = -1;
+
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_OR, &low, &zero, &result);
+
+        vtop[-1].vr = result_vr;
+        vtop[-1].type.t = t;
+        vtop[-1].r = 0;
+        vpop();
+        return;
+      }
+
+      /* First shift high word left by 32: high_shifted = high << 32 */
+      SValue shift_amt;
+      memset(&shift_amt, 0, sizeof(shift_amt));
+      shift_amt.type.t = VT_INT;
+      shift_amt.r = VT_CONST;
+      shift_amt.c.i = 32;
+      shift_amt.vr = -1;
+
+      SValue high_shifted;
+      memset(&high_shifted, 0, sizeof(high_shifted));
+      high_shifted.type.t = VT_LLONG;
+      high_shifted.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+      tcc_ir_set_llong_type(tcc_state->ir, high_shifted.vr);
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_SHL, &high, &shift_amt, &high_shifted);
+
+      /* Then OR with low word: result = high_shifted | low */
+      SValue result;
+      memset(&result, 0, sizeof(result));
+      result.type.t = t;
+      result.vr = result_vr;
+      if ((result.type.t & VT_BTYPE) == VT_LLONG)
+        tcc_ir_set_llong_type(tcc_state->ir, result.vr);
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_OR, &high_shifted, &low, &result);
+
+      vtop[-1].vr = result_vr;
+      vtop[-1].type.t = t;
+      vtop[-1].r = 0;
+      vpop();
+      return;
     }
-
-    /* Create new 64-bit temp vreg for result */
-    int result_vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-
-    /* First shift high word left by 32: high_shifted = high << 32 */
-    SValue shift_amt;
-    memset(&shift_amt, 0, sizeof(shift_amt));
-    shift_amt.type.t = VT_INT;
-    shift_amt.r = VT_CONST;
-    shift_amt.c.i = 32;
-    shift_amt.vr = -1;
-
-    SValue high_shifted;
-    memset(&high_shifted, 0, sizeof(high_shifted));
-    high_shifted.type.t = VT_LLONG;
-    high_shifted.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-    tcc_ir_put(tcc_state->ir, TCCIR_OP_SHL, &high, &shift_amt, &high_shifted);
-
-    /* Then OR with low word: result = high_shifted | low */
-    SValue result;
-    memset(&result, 0, sizeof(result));
-    result.type.t = t;
-    result.vr = result_vr;
-    tcc_ir_put(tcc_state->ir, TCCIR_OP_OR, &high_shifted, &low, &result);
-
-    vtop[-1].vr = result_vr;
-    vtop[-1].type.t = t;
-    vtop[-1].r = 0;
-    vpop();
-    return;
   }
   gv2(RC_INT, RC_INT);
   vtop[-1].r2 = vtop[0].r;
@@ -2520,6 +2599,8 @@ static void gen_opl(int op)
         dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
         dest.type.t = dest_type;
         dest.r = 0;
+        if ((dest_type & VT_BTYPE) == VT_LLONG)
+          tcc_ir_set_llong_type(tcc_state->ir, dest.vr);
         TccIrOp ir_op = (op == '+') ? TCCIR_OP_ADD : TCCIR_OP_SUB;
         tcc_ir_put(tcc_state->ir, ir_op, &vtop[-1], &vtop[0], &dest);
         vtop--;
@@ -2535,6 +2616,8 @@ static void gen_opl(int op)
         dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
         dest.type.t = dest_type;
         dest.r = 0;
+        if ((dest_type & VT_BTYPE) == VT_LLONG)
+          tcc_ir_set_llong_type(tcc_state->ir, dest.vr);
         TccIrOp ir_op;
         switch (op)
         {
@@ -3780,6 +3863,10 @@ redo:
       /* relational op: the result is an int */
       vtop->type.t = VT_INT;
     }
+    else if (op == TOK_UMULL)
+    {
+      /* UMULL produces 64-bit result from 32-bit inputs - preserve the type set by tcc_ir_gen_opi */
+    }
     else
     {
       vtop->type.t = t;
@@ -4121,12 +4208,25 @@ again:
     }
     else if (ss == 8)
     {
-      /* from long long: just take low order word */
-      /* For IR mode with valid vreg: just change type, backend uses first register of pair.
-         Valid vregs have type 1, 2, or 3 in the upper 4 bits. */
+      /* from long long: take low order word
+       * IMPORTANT (IR mode): do NOT retag the existing 64-bit vreg as 32-bit.
+       * That would break subsequent uses that still need the full 64-bit value
+       * (e.g. high-word extraction via SHR #32), causing 32-bit shifts and
+       * lost high words. Instead, materialize a new 32-bit temp. */
       if (tcc_state->ir && TCCIR_DECODE_VREG_TYPE(vtop->vr) > 0)
       {
-        vtop->type.t = VT_INT | (vtop->type.t & VT_UNSIGNED);
+        SValue low32;
+        memset(&low32, 0, sizeof(low32));
+        low32.type.t = VT_INT | (vtop->type.t & VT_UNSIGNED);
+        low32.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+        low32.r = 0;
+        int old_prevent_coalescing = tcc_state->ir->prevent_coalescing;
+        tcc_state->ir->prevent_coalescing = 1;
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_ASSIGN, vtop, NULL, &low32);
+        tcc_state->ir->prevent_coalescing = old_prevent_coalescing;
+        vtop->type.t = low32.type.t;
+        vtop->vr = low32.vr;
+        vtop->r = 0;
       }
       else
       {

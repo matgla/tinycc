@@ -2,7 +2,7 @@
 
 TARGET=arm-none-eabi
 
-mkdir newlib_build
+mkdir -p newlib_build
 cd newlib_build
 export CFLAGS_FOR_TARGET='-g -Os -mfloat-abi=hard -mfpu=fpv5-sp-d16 -ffunction-sections -fdata-sections -mcpu=cortex-m33'
 ../libs/newlib/configure \

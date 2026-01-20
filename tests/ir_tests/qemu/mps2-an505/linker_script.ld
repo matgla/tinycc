@@ -7,8 +7,8 @@ MEMORY
 
 ENTRY (Reset_Handler)
 
-__stack_size__ = 0x2000;  /* 8KB stack */
-__heap_size__  = 0x10000; /* 64KB heap */
+__stack_size__ = 0x20000;  /* 8KB stack */
+__heap_size__  = 0x100000; /* 64KB heap */
 
 
 SECTIONS

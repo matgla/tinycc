@@ -417,6 +417,78 @@ redo:
   do
   {
     struct filespec *f = s->files[n];
+
+    if (f->type & AFF_GROUP_START)
+    {
+      int depth = 1;
+      int group_start = n + 1;
+      int group_end = group_start;
+
+      for (; group_end < s->nb_files; ++group_end)
+      {
+        if (s->files[group_end]->type & AFF_GROUP_START)
+          ++depth;
+        else if (s->files[group_end]->type & AFF_GROUP_END)
+        {
+          if (--depth == 0)
+            break;
+        }
+      }
+
+      if (group_end >= s->nb_files)
+      {
+        ret = tcc_error_noabort("missing --end-group");
+        break;
+      }
+
+      s->new_undef_sym = 0;
+      for (int i = group_start; i < group_end && ret == 0; ++i)
+      {
+        struct filespec *g = s->files[i];
+        s->filetype = g->type;
+        if (g->type & AFF_TYPE_LIB)
+        {
+          ret = tcc_add_library(s, g->name);
+        }
+        else
+        {
+          if (1 == s->verbose)
+            printf("-> %s\n", g->name);
+          if (!first_file && g->name[0])
+            first_file = g->name;
+          ret = tcc_add_file(s, g->name);
+        }
+      }
+
+      while (ret == 0 && s->new_undef_sym)
+      {
+        s->new_undef_sym = 0;
+        for (int i = group_start; i < group_end && ret == 0; ++i)
+        {
+          struct filespec *g = s->files[i];
+          const char *ext;
+          if (g->type & AFF_TYPE_LIB)
+          {
+            ret = tcc_add_library(s, g->name);
+          }
+          else
+          {
+            ext = tcc_fileextension(g->name);
+            if (ext[0] && !strcmp(ext + 1, "a"))
+              ret = tcc_add_file(s, g->name);
+          }
+        }
+      }
+
+      n = group_end + 1;
+      continue;
+    }
+    else if (f->type & AFF_GROUP_END)
+    {
+      ret = tcc_error_noabort("unmatched --end-group");
+      break;
+    }
+
     s->filetype = f->type;
     if (f->type & AFF_TYPE_LIB)
     {

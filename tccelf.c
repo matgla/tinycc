@@ -2347,6 +2347,14 @@ static int set_sec_sizes(TCCState *s1)
       s->sh_size = 0;
     }
 #endif
+
+    /* Suppress legacy stabs sections. */
+    if (!strcmp(s->name, ".stab") || !strcmp(s->name, ".stabstr") || !strncmp(s->name, ".rel.stab", 9) ||
+        !strncmp(s->name, ".rela.stab", 10))
+    {
+      s->sh_flags = 0;
+      s->sh_size = 0;
+    }
   }
   return textrel;
 }

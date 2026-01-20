@@ -886,12 +886,17 @@ struct TCCState
   Section *eh_frame_section;
   Section *eh_frame_hdr_section;
   unsigned long eh_start;
+#if defined(TCC_TARGET_ARM_THUMB)
+  Section *arm_exidx_section;
+  Section *arm_extab_section;
+#endif
   /* debug sections */
   Section *stab_section;
   Section *dwarf_info_section;
   Section *dwarf_abbrev_section;
   Section *dwarf_line_section;
   Section *dwarf_aranges_section;
+  Section *dwarf_ranges_section;
   Section *dwarf_str_section;
   Section *dwarf_line_str_section;
   int dwlo, dwhi; /* dwarf section range */
@@ -966,7 +971,7 @@ struct LDScript;
 
 struct filespec
 {
-  char type;
+  int type;
   char name[1];
 };
 
@@ -1244,6 +1249,9 @@ ST_FUNC int tcc_add_file_internal(TCCState *s1, const char *filename, int flags)
 #define AFF_REFERENCED_DLL 0x20 /* load a referenced dll from another dll */
 #define AFF_TYPE_BIN 0x40       /* file to add is binary */
 #define AFF_WHOLE_ARCHIVE 0x80  /* load all objects from archive */
+/* file list markers */
+#define AFF_GROUP_START 0x100 /* begin --start-group */
+#define AFF_GROUP_END 0x200   /* end --end-group */
 /* s->filetype: */
 #define AFF_TYPE_NONE 0
 #define AFF_TYPE_C 1
@@ -1980,6 +1988,7 @@ ST_FUNC int tcc_has_quadruple_64bit_operand(TACQuadruple *q);
 #define dwarf_abbrev_section s1->dwarf_abbrev_section
 #define dwarf_line_section s1->dwarf_line_section
 #define dwarf_aranges_section s1->dwarf_aranges_section
+#define dwarf_ranges_section s1->dwarf_ranges_section
 #define dwarf_str_section s1->dwarf_str_section
 #define dwarf_line_str_section s1->dwarf_line_str_section
 
