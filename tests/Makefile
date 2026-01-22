@@ -88,6 +88,10 @@ all test :
 	@$(MAKE) --no-print-directory -s clean
 	@$(MAKE) --no-print-directory -s -r _all
 
+test-prepare:
+	@echo ------------ $@ ------------
+	@cd $(TOPSRC)/tests/ir_tests/qemu/mps2-an505 && sh ./build_newlib.sh
+
 _all : $(TESTS)
 
 armv8m-ehabi:
@@ -295,7 +299,7 @@ llong_test-run: llong_test$(EXESUF)
 	@echo ------------ $@ ------------
 	./llong_test$(EXESUF)
 
-.PHONY: abitest vla_test tccb
+.PHONY: test-prepare abitest vla_test tccb
 
 asm-c-connect$(EXESUF): asm-c-connect-1.c asm-c-connect-2.c
 	$(TCC) -o $@ $^

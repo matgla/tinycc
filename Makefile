@@ -393,8 +393,25 @@ tar:    tcc-doc.html
 config.mak:
 	$(if $(wildcard $@),,@echo "Please run ./configure." && exit 1)
 
+#+#+#+#+-----------------------------------------------------------------------
 # run all tests
+PYTHON ?= python3
 PYTEST ?= pytest
+
+# If set to 1 (default), `make test` will create a local virtualenv and install
+# Python requirements for tests/ir_tests before invoking pytest.
+USE_VENV ?= 1
+VENV_DIR ?= .venv
+VENV_BINDIR := $(CURDIR)/$(VENV_DIR)/bin
+VENV_PY := $(VENV_BINDIR)/python
+VENV_PIP := $(VENV_BINDIR)/pip
+
+IRTESTS_DIR := tests/ir_tests
+IRTESTS_REQUIREMENTS := $(IRTESTS_DIR)/requirements.txt
+IRTESTS_VENV_STAMP := $(VENV_DIR)/.irtests-requirements.stamp
+
+NEWLIB_DIR := $(IRTESTS_DIR)/qemu/mps2-an505/newlib_build/arm-none-eabi/newlib
+NEWLIB_LIBC_A := $(NEWLIB_DIR)/libc.a
 
 # Host tests for soft-float aeabi functions
 AEABI_HOST_TESTS = test_aeabi_all test_host test_dmul_host
@@ -409,10 +426,41 @@ test-aeabi-host:
 	done
 	@echo "------------ aeabi host tests passed ------------"
 
+.PHONY: test-venv
+test-venv:
+	@set -e; \
+	if [ "$(USE_VENV)" != "1" ]; then exit 0; fi; \
+	if [ ! -f "$(IRTESTS_REQUIREMENTS)" ]; then echo "Missing $(IRTESTS_REQUIREMENTS)"; exit 1; fi; \
+	$(MAKE) --no-print-directory $(IRTESTS_VENV_STAMP)
+
+$(IRTESTS_VENV_STAMP): $(IRTESTS_REQUIREMENTS)
+	@set -e; \
+	if [ "$(USE_VENV)" != "1" ]; then exit 0; fi; \
+	if [ ! -x "$(VENV_PY)" ]; then \
+		echo "------------ ir_tests: creating venv ($(VENV_DIR)) ------------"; \
+		$(PYTHON) -m venv "$(VENV_DIR)"; \
+	fi; \
+	echo "------------ ir_tests: installing python deps ------------"; \
+	"$(VENV_PY)" -m pip install -U pip; \
+	"$(VENV_PY)" -m pip install -r "$(IRTESTS_REQUIREMENTS)"; \
+	touch "$@"
+
+.PHONY: test-prepare
+test-prepare:
+	@set -e; \
+	if [ -f "$(NEWLIB_LIBC_A)" ]; then exit 0; fi; \
+	echo "------------ ir_tests: building newlib (first run) ------------"; \
+	cd $(IRTESTS_DIR)/qemu/mps2-an505 && sh ./build_newlib.sh
+
+
 # run IR tests via pytest (preferred)
-test: cross test-aeabi-host
+test: cross test-aeabi-host test-venv test-prepare
 	@echo "------------ ir_tests (pytest) ------------"
-	@cd tests/ir_tests && $(PYTEST) -s -n auto
+	@if [ "$(USE_VENV)" = "1" ]; then \
+		cd $(IRTESTS_DIR) && "$(VENV_PY)" -m pytest -s -n auto; \
+	else \
+		cd $(IRTESTS_DIR) && $(PYTEST) -s -n auto; \
+	fi
 
 # legacy tests (kept for reference)
 test-legacy:

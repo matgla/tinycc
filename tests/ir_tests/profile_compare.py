@@ -517,14 +517,71 @@ def list_baselines() -> list[str]:
     return [p.stem for p in BASELINES_DIR.glob("*.json")]
 
 
-def run_cmd(cmd: list[str], cwd: Path = None, check: bool = True) -> subprocess.CompletedProcess:
+def run_cmd(
+    cmd: list[str],
+    cwd: Path = None,
+    check: bool = True,
+    input_text: Optional[str] = None,
+) -> subprocess.CompletedProcess:
     """Run a command and return result."""
     print(f"  $ {' '.join(cmd)}")
-    result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    result = subprocess.run(
+        cmd,
+        cwd=cwd,
+        input=input_text,
+        capture_output=True,
+        text=True,
+    )
     if check and result.returncode != 0:
         print(f"Command failed: {result.stderr}")
         raise subprocess.CalledProcessError(result.returncode, cmd, result.stdout, result.stderr)
     return result
+
+
+def is_workspace_ref(ref: str) -> bool:
+    return ref.strip().lower() == "workspace"
+
+
+def copy_untracked_files(repo_path: Path, dest_path: Path) -> int:
+    """Copy untracked files from repo_path into dest_path."""
+    result = run_cmd(
+        ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+        cwd=repo_path,
+    )
+    raw = result.stdout
+    if not raw:
+        return 0
+
+    count = 0
+    for rel in raw.split("\0"):
+        if not rel:
+            continue
+        src = repo_path / rel
+        dst = dest_path / rel
+        if src.is_dir():
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+        count += 1
+    return count
+
+
+def create_workspace_snapshot(
+    worktree_path: Path,
+    base_ref: str = "HEAD",
+    repo_path: Path = REPO_ROOT,
+) -> None:
+    """Create a worktree at base_ref and apply current working-tree changes on top."""
+    create_worktree(base_ref, worktree_path, repo_path=repo_path)
+
+    patch = run_cmd(["git", "diff", base_ref], cwd=repo_path).stdout
+    if patch.strip():
+        # Apply the patch inside the snapshot worktree.
+        run_cmd(["git", "apply", "-"], cwd=worktree_path, input_text=patch)
+
+    copied = copy_untracked_files(repo_path, worktree_path)
+    if copied:
+        print(f"  Copied {copied} untracked file(s) into workspace snapshot")
 
 
 def get_git_short_hash(ref: str, repo_path: Path = REPO_ROOT) -> str:
@@ -658,8 +715,15 @@ def git_compare(baseline_ref: str, current_ref: str = "HEAD",
         output_dir = CURRENT_DIR / "profile_results"
 
     # Get commit info
-    baseline_info = get_git_commit_info(baseline_ref)
-    current_info = get_git_commit_info(current_ref)
+    if is_workspace_ref(baseline_ref):
+        baseline_info = get_git_commit_info("HEAD")
+    else:
+        baseline_info = get_git_commit_info(baseline_ref)
+
+    if is_workspace_ref(current_ref):
+        current_info = get_git_commit_info("HEAD")
+    else:
+        current_info = get_git_commit_info(current_ref)
 
     print("=" * 70)
     print("Git Comparison")
@@ -680,9 +744,13 @@ def git_compare(baseline_ref: str, current_ref: str = "HEAD",
         print("=" * 70)
 
         baseline_worktree = tmpdir / "baseline_src"
-        baseline_profile_dir = output_dir / f"baseline_{baseline_info['short_hash']}"
+        baseline_dir_name = f"baseline_{baseline_info['short_hash']}" + ("_workspace" if is_workspace_ref(baseline_ref) else "")
+        baseline_profile_dir = output_dir / baseline_dir_name
 
-        create_worktree(baseline_ref, baseline_worktree)
+        if is_workspace_ref(baseline_ref):
+            create_workspace_snapshot(baseline_worktree, base_ref="HEAD")
+        else:
+            create_worktree(baseline_ref, baseline_worktree)
         baseline_tcc = build_tinycc(baseline_worktree)
         baseline_summary = run_profile_suite(
             baseline_tcc, baseline_profile_dir,
@@ -698,11 +766,16 @@ def git_compare(baseline_ref: str, current_ref: str = "HEAD",
         print(f"PHASE 2: Building and profiling current ({current_ref})")
         print("=" * 70)
 
-        # Always create a worktree for clean, isolated builds
+        # Always build from a clean directory. If current_ref is "workspace",
+        # snapshot the working tree state into a temporary worktree.
         current_worktree = tmpdir / "current_src"
-        create_worktree(current_ref, current_worktree)
+        if is_workspace_ref(current_ref):
+            create_workspace_snapshot(current_worktree, base_ref="HEAD")
+        else:
+            create_worktree(current_ref, current_worktree)
 
-        current_profile_dir = output_dir / f"current_{current_info['short_hash']}"
+        current_dir_name = f"current_{current_info['short_hash']}" + ("_workspace" if is_workspace_ref(current_ref) else "")
+        current_profile_dir = output_dir / current_dir_name
 
         current_tcc = build_tinycc(current_worktree)
         current_summary = run_profile_suite(
@@ -715,7 +788,12 @@ def git_compare(baseline_ref: str, current_ref: str = "HEAD",
             remove_worktree(current_worktree)
 
     baseline_name = f"{baseline_ref} ({baseline_info['short_hash']})"
+    if is_workspace_ref(baseline_ref):
+        baseline_name = f"workspace (based on HEAD {baseline_info['short_hash']})"
+
     current_name = f"{current_ref} ({current_info['short_hash']})"
+    if is_workspace_ref(current_ref):
+        current_name = f"workspace (based on HEAD {current_info['short_hash']})"
 
     return baseline_data, current_data, baseline_name, current_name
 
@@ -795,6 +873,9 @@ Git comparison examples:
   # Compare a specific commit/tag against current HEAD
   python profile_compare.py --git-compare v0.9.27
 
+    # Compare a commit/tag against your current workspace (uncommitted changes)
+    python profile_compare.py --git-compare HEAD --git-current workspace
+
   # Compare two specific commits
   python profile_compare.py --git-compare abc123 --git-current def456
 
@@ -820,7 +901,8 @@ Git comparison examples:
                         help="Compare against a git ref (tag/branch/commit). "
                              "Builds that revision, runs profiling, then compares with current HEAD.")
     parser.add_argument("--git-current", metavar="REF", default="HEAD",
-                        help="Git ref to use as 'current' (default: HEAD)")
+                        help="Git ref to use as 'current' (default: HEAD). "
+                            "Special value: 'workspace' uses your current working tree (uncommitted changes) by snapshotting it into a temp build dir.")
     parser.add_argument("--profiler", "-p", choices=["heaptrack", "time", "perf"], default="heaptrack",
                         help="Profiler tool to use for git comparison (default: heaptrack)")
     parser.add_argument("--limit", "-n", type=int, default=0,
@@ -831,6 +913,12 @@ Git comparison examples:
                         help="Output directory for profile results")
 
     args = parser.parse_args()
+
+    # Backwards-compatible convenience: allow `profile_compare.py -g <ref> workspace`
+    # to mean `--git-current workspace`.
+    if args.git_compare and args.baseline and not args.current and args.baseline.strip().lower() == "workspace":
+        args.git_current = "workspace"
+        args.baseline = None
 
     # List baselines
     if args.list_baselines:

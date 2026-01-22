@@ -3,6 +3,51 @@ import re
 from pathlib import Path
 from qemu_run import run_test, compile_testcase, CompileConfig, prepare_test
 
+
+# When expected output contains floating point literals, match numerically and
+# compare with a tolerance instead of exact string match.
+# This is useful because some embedded printf implementations can differ in
+# rounding/truncation behaviour for %f formatting.
+_FLOAT_RE = r"[-+]?(?:\d+\.\d*|\d*\.\d+)(?:[eE][-+]?\d+)?"
+_FLOAT_EXPECT_LINE_RE = re.compile(rf"^(?P<prefix>.*?=)(?P<value>{_FLOAT_RE})$")
+_FLOAT_CAPTURE_RE = rf"({_FLOAT_RE})"
+
+
+def _expect_line(sut, expected_line: str, *, timeout: int = 1, float_tol: float = 1e-5):
+    """Expect a line from QEMU output.
+
+    If the expected line ends with a float literal (e.g. "sum=3.500000"),
+    capture the actual float and compare within tolerance.
+    """
+    if expected_line is None:
+        return
+
+    float_matches = list(re.finditer(_FLOAT_RE, expected_line))
+    if float_matches:
+        # Build a regex that treats all non-float parts literally, and captures
+        # each float. Then compare each captured float numerically.
+        parts = []
+        expected_values = []
+        last_end = 0
+        for fm in float_matches:
+            parts.append(re.escape(expected_line[last_end:fm.start()]))
+            parts.append(_FLOAT_CAPTURE_RE)
+            expected_values.append(float(fm.group(0)))
+            last_end = fm.end()
+        parts.append(re.escape(expected_line[last_end:]))
+        pattern = "".join(parts)
+
+        sut.expect(pattern, timeout=timeout)
+        actual_values = [float(sut.match.group(i + 1)) for i in range(len(expected_values))]
+        for expected_value, actual_value in zip(expected_values, actual_values):
+            if abs(actual_value - expected_value) > float_tol:
+                raise AssertionError(
+                    f"Float output mismatch: expected {expected_value} got {actual_value} (tol={float_tol})"
+                )
+        return
+
+    sut.expect(_escape_regex(expected_line), timeout=timeout)
+
 MACHINE = "mps2-an505"
 CURRENT_DIR = Path(__file__).parent
 
@@ -325,8 +370,7 @@ def _run_qemu_test(test_file, expected_exit_code, args=None, defines=None, opt_l
     expected_lines = _strip_compiler_output(expected_lines, loglines)
     try:
         for line in expected_lines:
-            if line is not None:
-                sut.expect(_escape_regex(line), timeout=1)
+            _expect_line(sut, line, timeout=1)
         sut.wait()
         assert sut.exitstatus == expected_exit_code, f"Expected exit code {expected_exit_code}, got {sut.exitstatus}"
     except Exception as e:
@@ -397,8 +441,7 @@ def _run_tagged_qemu_test(test_file, tag, expected_lines, expected_exit_code, op
     try:
         # Match expected runtime output
         for line in runtime_expected:
-            if line is not None:
-                sut.expect(_escape_regex(line), timeout=1)
+            _expect_line(sut, line, timeout=1)
         sut.wait()
         assert sut.exitstatus == expected_exit_code, f"Expected exit code {expected_exit_code}, got {sut.exitstatus}"
     except Exception as e:
