@@ -74,3 +74,7 @@ __pycache__/
 tests/ir_tests/qemu/mps2-an505/newlib_build/
 tests/ir_tests/profile_results
 tests/ir_tests/profile_baselines
+
+lib/fp/soft/test_aeabi_all
+lib/fp/soft/test_dmul_host
+lib/fp/soft/test_host

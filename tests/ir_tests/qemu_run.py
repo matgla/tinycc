@@ -17,8 +17,12 @@ Usage for profiling:
     result = compile_testcase(["test.c"], "mps2-an505", config=config)
 """
 
+import os
 import pexpect
 import re
+import shlex
+import sys
+import time
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -27,6 +31,104 @@ from typing import Optional
 CURRENT_DIR = Path(__file__).parent
 
 was_cleaned = False
+
+
+class SubprocessSUT:
+    """Minimal pexpect-like interface for reading QEMU output without PTYs.
+
+    This avoids Python 3.13+ warnings (and potential flakiness) around
+    forkpty() in multi-threaded processes on macOS.
+    """
+
+    def __init__(self, command: str):
+        argv = shlex.split(command)
+        self._proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=0,
+        )
+        if self._proc.stdout is None:
+            raise RuntimeError("Failed to spawn process with stdout pipe")
+        self._fd = self._proc.stdout.fileno()
+        self._buffer = ""
+        self.match = None
+        self.exitstatus = None
+        self.logfile = None
+
+    def setwinsize(self, *_args, **_kwargs):
+        # No PTY; nothing to do.
+        return
+
+    def _append_output(self, data: bytes):
+        if not data:
+            return
+        if self.logfile is not None:
+            try:
+                self.logfile.write(data)
+                self.logfile.flush()
+            except Exception:
+                # Best-effort logging; don't break tests due to logging.
+                pass
+        text = data.decode("utf-8", errors="replace")
+        # Normalize CRLF/CR to LF for more predictable matching.
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        self._buffer += text
+        # Keep buffer bounded (large enough for regex searching and debugging).
+        if len(self._buffer) > 256_000:
+            self._buffer = self._buffer[-128_000:]
+
+    def expect(self, pattern, timeout: int = 1):
+        if isinstance(pattern, (bytes, bytearray)):
+            pattern = pattern.decode("utf-8", errors="replace")
+        regex = pattern if hasattr(pattern, "search") else re.compile(pattern)
+
+        deadline = time.monotonic() + float(timeout)
+        while True:
+            m = regex.search(self._buffer)
+            if m is not None:
+                self.match = m
+                return m
+
+            # If process exited and no more output is coming, bail out.
+            if self._proc.poll() is not None:
+                # Drain any remaining bytes.
+                try:
+                    while True:
+                        chunk = os.read(self._fd, 4096)
+                        if not chunk:
+                            break
+                        self._append_output(chunk)
+                except OSError:
+                    pass
+                m = regex.search(self._buffer)
+                if m is not None:
+                    self.match = m
+                    return m
+                raise TimeoutError(f"Pattern not found before process exit: {pattern!r}")
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"Timeout waiting for pattern: {pattern!r}")
+
+            # Wait for stdout to become readable, then read a chunk.
+            import select
+
+            r, _, _ = select.select([self._fd], [], [], min(0.05, remaining))
+            if not r:
+                continue
+            try:
+                chunk = os.read(self._fd, 4096)
+            except OSError:
+                chunk = b""
+            if chunk:
+                self._append_output(chunk)
+
+    def wait(self, timeout: Optional[int] = None):
+        rc = self._proc.wait(timeout=timeout)
+        self.exitstatus = rc
+        return rc
 
 
 @dataclass
@@ -529,7 +631,13 @@ def compile_testcase(test_file, machine, compiler=None, cflags=None, config=None
 
 def prepare_test(machine, kernel_file, args=None):
     qemu_command = build_qemu_command(machine, kernel_file, args)
-    # Use a wide pseudo-terminal so long lines aren't wrapped
+    # Default to pipe-based execution on macOS to avoid pty.forkpty()
+    # warnings/flakiness in multi-threaded processes (Python 3.13+).
+    force_pexpect = os.environ.get("TINYCC_IRTEST_USE_PEXPECT", "")
+    if sys.platform == "darwin" and force_pexpect.strip() not in {"1", "true", "TRUE"}:
+        return SubprocessSUT(qemu_command)
+
+    # Otherwise, use a wide pseudo-terminal so long lines aren't wrapped.
     sut = pexpect.spawn(qemu_command)
     sut.setwinsize(200, 1000)
     return sut
