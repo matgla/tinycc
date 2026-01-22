@@ -23,6 +23,10 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
+from _venv_bootstrap import ensure_venv
+
+ensure_venv()
+
 from qemu_run import (
     compile_testcase,
     CompileConfig,
@@ -184,8 +188,12 @@ def main():
                         help="Output directory for profile data")
     parser.add_argument("--limit", "-n", type=int, default=0,
                         help="Limit number of tests to run (0 = all)")
-    parser.add_argument("--profiler", "-p", choices=["heaptrack", "time", "perf"], default="heaptrack",
-                        help="Profiler tool to use (default: heaptrack)")
+    default_profiler = "time" if sys.platform == "darwin" else "heaptrack"
+    profiler_choices = ["heaptrack", "time", "perf"]
+    if sys.platform == "darwin":
+        profiler_choices.append("xctrace")
+    parser.add_argument("--profiler", "-p", choices=profiler_choices, default=default_profiler,
+                        help=f"Profiler tool to use (default: {default_profiler})")
     parser.add_argument("--include-float", action="store_true",
                         help="Include floating point tests")
     parser.add_argument("--cflags", type=str, default="",

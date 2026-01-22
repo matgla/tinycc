@@ -376,7 +376,7 @@ typedef struct CString
 } CString;
 
 /* type definition */
-typedef struct CType
+typedef struct __attribute__((packed)) CType
 {
   int t;
   struct Sym *ref;
@@ -398,15 +398,20 @@ typedef union CValue
 } CValue;
 
 /* value on stack */
+/* Temp local variable index encoded in vr field: vr = -2 - index (0..7)
+ * This allows tracking which temp local slot an SValue uses without a separate field.
+ * vr = -1 remains the sentinel for "no virtual register". */
+#define VR_TEMP_LOCAL(idx) (-2 - (idx))
+#define VR_IS_TEMP_LOCAL(vr) ((vr) <= -2 && (vr) >= -9)
+#define VR_TEMP_LOCAL_IDX(vr) (-2 - (vr))
+
 typedef struct SValue
 {
-  CType type;        /* type */
-  unsigned short r;  /* register + flags */
-  unsigned short r2; /* second register, used for 'long long'
-                        type. If not used, set to VT_CONST */
-  int vr;            /* virtual register for IR */
   uint8_t pr0;
   uint8_t pr1;
+  unsigned short r; /* register + flags */
+  CType type;       /* type */
+  int vr;           /* virtual register for IR */
 
   union
   {
@@ -1470,9 +1475,6 @@ ST_FUNC void vpop(void);
 #if PTR_SIZE == 4
 ST_FUNC void lexpand(void);
 #endif
-#if defined(TCC_TARGET_ARM) || defined(TCC_TARGET_ARM_THUMB)
-/* IR-only: no physical register allocation in the frontend. */
-#endif
 ST_FUNC void gaddrof(void);
 ST_FUNC int gv(int rc);
 ST_FUNC void gv2(int rc1, int rc2);
@@ -1914,12 +1916,12 @@ typedef struct TACQuadruple
    * Optimizations like DCE compact/reorder the IR array and change its indices.
    * `orig_index` stays stable so features like &&label can map to final code.
    */
-  int orig_index;
   TccIrOp op;
+  uint16_t line_num; /* source line number for debug info */
+  int orig_index;
   SValue src1;
   SValue src2;
   SValue dest;
-  int line_num; /* source line number for debug info */
 } TACQuadruple;
 
 /*

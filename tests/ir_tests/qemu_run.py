@@ -21,6 +21,7 @@ import os
 import pexpect
 import re
 import shlex
+import shutil
 import sys
 import time
 import subprocess
@@ -134,7 +135,7 @@ class SubprocessSUT:
 @dataclass
 class ProfileConfig:
     """Configuration for compiler profiling."""
-    tool: str = "none"  # "none", "heaptrack", "time", "perf"
+    tool: str = "none"  # "none", "heaptrack", "time", "perf", "xctrace"
     output_dir: Optional[Path] = None
     output_prefix: str = ""  # prefix for output files (e.g., test name)
     perf_frequency: int = 99  # sampling frequency for perf (Hz)
@@ -146,12 +147,19 @@ class ProfileConfig:
             return ""
 
         if self.tool == "heaptrack":
+            if sys.platform == "darwin":
+                raise RuntimeError("heaptrack is not available on macOS; use --profiler time")
             out_file = self.output_dir / f"heaptrack_{self.output_prefix}"
             return f"heaptrack --record-only -o {out_file}"
         elif self.tool == "time":
             out_file = self.output_dir / f"time_{self.output_prefix}.txt"
+            if sys.platform == "darwin":
+                timewrap = CURRENT_DIR / "timewrap.py"
+                return f"{sys.executable} {timewrap} -a -o {out_file} --"
             return f"/usr/bin/time -v -a -o {out_file}"
         elif self.tool == "perf":
+            if sys.platform == "darwin":
+                raise RuntimeError("perf profiling is Linux-only; use --profiler time on macOS")
             perf_file = self.output_dir / f"perf_{self.output_prefix}.data"
             if self.measure_memory:
                 # Wrap perf with time to get memory metrics too
@@ -159,6 +167,25 @@ class ProfileConfig:
                 return f"/usr/bin/time -v -a -o {time_file} perf record -F {self.perf_frequency} -g --call-graph dwarf -o {perf_file}"
             else:
                 return f"perf record -F {self.perf_frequency} -g --call-graph dwarf -o {perf_file}"
+        elif self.tool == "xctrace":
+            if sys.platform != "darwin":
+                raise RuntimeError("xctrace profiling is macOS-only")
+            # Ensure xctrace is available (usually requires full Xcode).
+            probe = subprocess.run(
+                ["xcrun", "-f", "xctrace"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            if probe.returncode != 0:
+                raise RuntimeError(
+                    "xctrace not found. Install Xcode (not just Command Line Tools), open it once, "
+                    "accept the license, then run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer"
+                )
+            trace_file = self.output_dir / f"xctrace_{self.output_prefix}.trace"
+            # Note: `xctrace` is provided by Xcode Command Line Tools.
+            # We keep it minimal and record an Allocations trace for the compiler invocation.
+            return f"xcrun xctrace record --template Allocations --output {trace_file} --launch --"
         else:
             return ""
 
@@ -543,6 +570,11 @@ def compile_testcase(test_file, machine, compiler=None, cflags=None, config=None
                         list(config.profiler.output_dir.glob(f"perf_{prefix}.svg")):
             old_file.unlink()
 
+        # xctrace outputs a directory ending with .trace
+        old_trace = config.profiler.output_dir / f"xctrace_{prefix}.trace"
+        if old_trace.exists():
+            shutil.rmtree(old_trace, ignore_errors=True)
+
     # Build make command
     make_command = build_make_command(
         test_file, machine, str(config.compiler),
@@ -625,17 +657,27 @@ def compile_testcase(test_file, machine, compiler=None, cflags=None, config=None
                     compile_result.user_time_s = time_metrics['user_time']
                     compile_result.sys_time_s = time_metrics['sys_time']
                     compile_result.max_rss_kb = time_metrics['max_rss_kb']
+        elif config.profiler.tool == "xctrace":
+            trace_file = config.profiler.output_dir / f"xctrace_{prefix}.trace"
+            if trace_file.exists():
+                compile_result.profile_file = str(trace_file)
 
     return compile_result
 
 
 def prepare_test(machine, kernel_file, args=None):
     qemu_command = build_qemu_command(machine, kernel_file, args)
-    # Default to pipe-based execution on macOS to avoid pty.forkpty()
-    # warnings/flakiness in multi-threaded processes (Python 3.13+).
+    # Prefer pipe-based execution when possible.
+    #
+    # - On macOS we avoid pty.forkpty() warnings/flakiness in multi-threaded
+    #   processes (Python 3.13+).
+    # - On Python 3.14+ a DeprecationWarning is emitted when forkpty() is used
+    #   from a multi-threaded process (common under pytest), so avoid PTYs by
+    #   default there as well.
     force_pexpect = os.environ.get("TINYCC_IRTEST_USE_PEXPECT", "")
-    if sys.platform == "darwin" and force_pexpect.strip() not in {"1", "true", "TRUE"}:
-        return SubprocessSUT(qemu_command)
+    if force_pexpect.strip() not in {"1", "true", "TRUE"}:
+        if sys.platform == "darwin" or sys.version_info >= (3, 14):
+            return SubprocessSUT(qemu_command)
 
     # Otherwise, use a wide pseudo-terminal so long lines aren't wrapped.
     sut = pexpect.spawn(qemu_command)

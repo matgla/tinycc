@@ -27,7 +27,7 @@
 #define PREG_SPILLED 0x80
 #define PREG_NONE 0xFF /* pr0/pr1 not allocated (replaces -1 for uint8_t) */
 
-typedef enum TccIrOp
+typedef enum TccIrOp : uint8_t
 {
   TCCIR_OP_ADD,
   TCCIR_OP_ADC_USE,
@@ -284,6 +284,25 @@ typedef struct TCCMaterializedDest
   TCCMachineScratchRegs scratch;
 } TCCMaterializedDest;
 
+/* Compact IR instruction - stores operand indices instead of full SValues */
+typedef struct IRQuadCompact
+{
+  int orig_index;        /* Original IR index (stable across DCE) */
+  TccIrOp op;            /* Operation code */
+  uint32_t operand_base; /* Index into svalue_pool */
+  int line_num;          /* Source line for debug info */
+} IRQuadCompact;
+
+/* Per-operation operand configuration (defined in tccir.c) */
+typedef struct IRRegistersConfig
+{
+  uint8_t has_dest : 1;
+  uint8_t has_src1 : 1;
+  uint8_t has_src2 : 1;
+} IRRegistersConfig;
+
+extern const IRRegistersConfig irop_config[];
+
 typedef struct TCCIRState
 {
   // number of function parameters
@@ -300,6 +319,16 @@ typedef struct TCCIRState
   int32_t loc;
 
   TACQuadruple *instructions;
+
+  /* SValue pool for compact IR storage - operands stored contiguously */
+  SValue *svalue_pool;
+  int svalue_pool_count;
+  int svalue_pool_capacity;
+
+  /* Compact instruction array - parallel to instructions[] for now */
+  IRQuadCompact *compact_instructions;
+  int compact_instructions_size;
+
   IRLiveInterval **active_set;
 
   IRLiveInterval *variables_live_intervals;
@@ -467,3 +496,73 @@ typedef enum TCCIR_VREG_TYPE
 #define TCCIR_DECODE_VREG_POSITION(vr) (vr & 0xFFFFFFF)
 #define TCCIR_DECODE_VREG_TYPE(vr) (vr >> 28)
 #define TCCIR_ENCODE_VREG(type, position) (((type) << 28) | (position))
+
+/* SValue pool accessor functions for compact IR storage.
+ * Operand layout in pool: dest (if present), src1 (if present), src2 (if present).
+ * Returns NULL if the operand is not used by this operation. */
+
+static inline int ir_op_slot_count(TccIrOp op)
+{
+  return irop_config[op].has_dest + irop_config[op].has_src1 + irop_config[op].has_src2;
+}
+
+static inline SValue *tcc_ir_op_get_dest(TCCIRState *ir, IRQuadCompact *q)
+{
+  if (!irop_config[q->op].has_dest)
+    return NULL;
+  return &ir->svalue_pool[q->operand_base];
+}
+
+static inline SValue *tcc_ir_get_dest(TCCIRState *ir, int index)
+{
+  IRQuadCompact *q = &ir->compact_instructions[index];
+  if (!irop_config[q->op].has_dest)
+    return NULL;
+  return &ir->svalue_pool[q->operand_base];
+}
+
+static inline SValue *tcc_ir_op_get_src1(TCCIRState *ir, IRQuadCompact *q)
+{
+  if (!irop_config[q->op].has_src1)
+    return NULL;
+  int off = irop_config[q->op].has_dest;
+  return &ir->svalue_pool[q->operand_base + off];
+}
+
+static inline SValue *tcc_ir_get_src1(TCCIRState *ir, int index)
+{
+  IRQuadCompact *q = &ir->compact_instructions[index];
+  if (!irop_config[q->op].has_src1)
+    return NULL;
+  const int off = irop_config[q->op].has_dest;
+  return &ir->svalue_pool[q->operand_base + off];
+}
+
+static inline SValue *tcc_ir_op_get_src2(TCCIRState *ir, IRQuadCompact *q)
+{
+  if (!irop_config[q->op].has_src2)
+    return NULL;
+  int off = irop_config[q->op].has_dest + irop_config[q->op].has_src1;
+  return &ir->svalue_pool[q->operand_base + off];
+}
+
+static inline SValue *tcc_ir_get_src2(TCCIRState *ir, int index)
+{
+  IRQuadCompact *q = &ir->compact_instructions[index];
+  if (!irop_config[q->op].has_src2)
+    return NULL;
+  int off = irop_config[q->op].has_dest + irop_config[q->op].has_src1;
+  return &ir->svalue_pool[q->operand_base + off];
+}
+
+/* Pool management functions */
+void tcc_ir_svalue_pool_init(TCCIRState *ir);
+void tcc_ir_svalue_pool_free(TCCIRState *ir);
+int tcc_ir_svalue_pool_add(TCCIRState *ir, const SValue *sv);
+
+/* Expand a compact instruction to a full TACQuadruple (for migration) */
+void tcc_ir_expand_quad(TCCIRState *ir, int index, TACQuadruple *out);
+
+/* Write back modified operands from a TACQuadruple to the pool */
+void tcc_ir_writeback_quad(TCCIRState *ir, int index, TACQuadruple *q);
+void tcc_ir_writeback_compact(TCCIRState *ir, int index);

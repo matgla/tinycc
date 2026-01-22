@@ -3283,7 +3283,6 @@ ST_FUNC void tcc_tcov_block_begin(TCCState *s1)
     put_extern_sym(&label, tcov_section, ((unsigned char *)ptr - tcov_section->data) + 8, 0);
     sv.type = label.type;
     sv.r = VT_SYM | VT_LVAL | VT_CONST;
-    sv.r2 = VT_CONST;
     sv.c.i = 0;
     sv.sym = &label;
 #if defined TCC_TARGET_I386 || defined TCC_TARGET_X86_64 || defined TCC_TARGET_ARM || defined TCC_TARGET_ARM64 ||      \

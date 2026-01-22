@@ -58,14 +58,6 @@
 #define SPILL_MARK_END "\033[0m"
 
 /* Forward declarations for debug functions */
-typedef struct IRRegistersConfig
-{
-  uint8_t has_dest : 1;
-  uint8_t has_src1 : 1;
-  uint8_t has_src2 : 1;
-} IRRegistersConfig;
-
-extern const IRRegistersConfig irop_config[];
 const char *tcc_ir_get_vreg_type_string(int vreg);
 static bool tcc_ir_operand_needs_dereference(SValue *sv);
 
@@ -697,6 +689,131 @@ static int tcc_ir_operand_in_memory(SValue *sv)
   return sv->pr0 & PREG_SPILLED;
 }
 
+/* SValue pool management for compact IR storage */
+#define SVALUE_POOL_INIT_SIZE 256
+
+void tcc_ir_svalue_pool_init(TCCIRState *ir)
+{
+  ir->svalue_pool_capacity = SVALUE_POOL_INIT_SIZE;
+  ir->svalue_pool_count = 0;
+  ir->svalue_pool = (SValue *)tcc_mallocz(sizeof(SValue) * ir->svalue_pool_capacity);
+  if (!ir->svalue_pool)
+  {
+    fprintf(stderr, "tcc_ir_svalue_pool_init: out of memory\n");
+    exit(1);
+  }
+}
+
+void tcc_ir_svalue_pool_free(TCCIRState *ir)
+{
+  if (ir->svalue_pool)
+  {
+    tcc_free(ir->svalue_pool);
+    ir->svalue_pool = NULL;
+  }
+  ir->svalue_pool_count = 0;
+  ir->svalue_pool_capacity = 0;
+}
+
+int tcc_ir_svalue_pool_add(TCCIRState *ir, const SValue *sv)
+{
+  if (ir->svalue_pool_count >= ir->svalue_pool_capacity)
+  {
+    ir->svalue_pool_capacity *= 2;
+    ir->svalue_pool = (SValue *)tcc_realloc(ir->svalue_pool, sizeof(SValue) * ir->svalue_pool_capacity);
+    if (!ir->svalue_pool)
+    {
+      fprintf(stderr, "tcc_ir_svalue_pool_add: out of memory\n");
+      exit(1);
+    }
+  }
+  ir->svalue_pool[ir->svalue_pool_count] = *sv;
+  return ir->svalue_pool_count++;
+}
+
+/* Expand a compact instruction to a full TACQuadruple.
+ * This is used during migration to allow existing backend code to work unchanged.
+ * The expanded quad reads operands from the pool. */
+void tcc_ir_expand_quad(TCCIRState *ir, int index, TACQuadruple *out)
+{
+  IRQuadCompact *cq = &ir->compact_instructions[index];
+  memset(out, 0, sizeof(TACQuadruple));
+  out->orig_index = cq->orig_index;
+  out->op = cq->op;
+  out->line_num = cq->line_num;
+
+  SValue *dest = tcc_ir_op_get_dest(ir, cq);
+  SValue *src1 = tcc_ir_op_get_src1(ir, cq);
+  SValue *src2 = tcc_ir_op_get_src2(ir, cq);
+
+  if (dest)
+    out->dest = *dest;
+  else
+    out->dest.vr = -1;
+
+  if (src1)
+    out->src1 = *src1;
+  else
+    out->src1.vr = -1;
+
+  if (src2)
+    out->src2 = *src2;
+  else
+    out->src2.vr = -1;
+}
+
+/* Write back modified operands from a TACQuadruple to the pool.
+ * This is needed when codegen modifies operands (e.g., filling in physical registers). */
+void tcc_ir_writeback_quad(TCCIRState *ir, int index, TACQuadruple *q)
+{
+  IRQuadCompact *cq = &ir->compact_instructions[index];
+
+  SValue *dest = tcc_ir_op_get_dest(ir, cq);
+  SValue *src1 = tcc_ir_op_get_src1(ir, cq);
+  SValue *src2 = tcc_ir_op_get_src2(ir, cq);
+
+  if (dest)
+    *dest = q->dest;
+  if (src1)
+    *src1 = q->src1;
+  if (src2)
+    *src2 = q->src2;
+}
+
+void tcc_ir_writeback_compact(TCCIRState *ir, int index)
+{
+  IRQuadCompact *q = &ir->compact_instructions[index];
+  SValue *dest = tcc_ir_op_get_dest(ir, q);
+  SValue *src1 = tcc_ir_op_get_src1(ir, q);
+  SValue *src2 = tcc_ir_op_get_src2(ir, q);
+  TACQuadruple *quad = &ir->instructions[index];
+
+  quad->orig_index = q->orig_index;
+  quad->op = q->op;
+  quad->line_num = q->line_num;
+  if (dest)
+    quad->dest = *dest;
+  else
+  {
+    memset(&quad->dest, 0, sizeof(SValue));
+    quad->dest.vr = -1;
+  }
+  if (src1)
+    quad->src1 = *src1;
+  else
+  {
+    memset(&quad->src1, 0, sizeof(SValue));
+    quad->src1.vr = -1;
+  }
+  if (src2)
+    quad->src2 = *src2;
+  else
+  {
+    memset(&quad->src2, 0, sizeof(SValue));
+    quad->src2.vr = -1;
+  }
+}
+
 TCCIRState *tcc_ir_allocate_block()
 {
   TCCIRState *block = (TCCIRState *)tcc_mallocz(sizeof(TCCIRState));
@@ -730,6 +847,18 @@ TCCIRState *tcc_ir_allocate_block()
   if (!block->instructions)
   {
     fprintf(stderr, "tcc_ir_allocate_block: out of memory\n");
+    exit(1);
+  }
+
+  /* Initialize SValue pool for compact IR storage */
+  tcc_ir_svalue_pool_init(block);
+
+  /* Initialize compact instructions array */
+  block->compact_instructions_size = QUADRUPLE_INIT_SIZE;
+  block->compact_instructions = (IRQuadCompact *)tcc_mallocz(sizeof(IRQuadCompact) * QUADRUPLE_INIT_SIZE);
+  if (!block->compact_instructions)
+  {
+    fprintf(stderr, "tcc_ir_allocate_block: out of memory (compact_instructions)\n");
     exit(1);
   }
 
@@ -845,8 +974,8 @@ static int tcc_ir_find_def_for_vreg_before(const TCCIRState *ir, int vreg_encode
     start_idx = ir->next_instruction_index;
   for (int i = start_idx - 1; i >= 0; --i)
   {
-    const TACQuadruple *q = &ir->instructions[i];
-    if (q->dest.vr == vreg_encoded)
+    const SValue *dest = tcc_ir_op_get_dest((TCCIRState *)ir, &ir->compact_instructions[i]);
+    if (dest->vr == vreg_encoded)
       return i;
   }
   return -1;
@@ -868,29 +997,30 @@ static int tcc_ir_try_resolve_stack_addr(const TCCIRState *ir, int vreg_encoded,
   if (def_idx < 0)
     return 0;
 
-  const TACQuadruple *def = &ir->instructions[def_idx];
-
+  const IRQuadCompact *def = &ir->compact_instructions[def_idx];
+  const SValue *def_src1 = tcc_ir_op_get_src1((TCCIRState *)ir, def);
   /* Base case: vreg = Addr[StackLoc[off]] (no VT_LVAL and no vreg on the address operand). */
-  if (def->op == TCCIR_OP_ASSIGN && tcc_ir_is_stack_addr_operand_novreg(&def->src1))
+  if (def->op == TCCIR_OP_ASSIGN && tcc_ir_is_stack_addr_operand_novreg(def_src1))
   {
-    *out_kind = def->src1.r & VT_VALMASK;
-    *out_offset = def->src1.c.i;
+    *out_kind = def_src1->r & VT_VALMASK;
+    *out_offset = def_src1->c.i;
     return 1;
   }
 
   /* Copy chain: vreg = other_vreg (address value). */
-  if (def->op == TCCIR_OP_ASSIGN && tcc_is_vreg_valid((TCCIRState *)ir, def->src1.vr) && !(def->src1.r & VT_LVAL))
+  if (def->op == TCCIR_OP_ASSIGN && tcc_is_vreg_valid((TCCIRState *)ir, def_src1->vr) && !(def_src1->r & VT_LVAL))
   {
-    return tcc_ir_try_resolve_stack_addr(ir, def->src1.vr, def_idx, depth - 1, out_kind, out_offset);
+    return tcc_ir_try_resolve_stack_addr(ir, def_src1->vr, def_idx, depth - 1, out_kind, out_offset);
   }
 
+  const SValue *def_src2 = tcc_ir_op_get_src2((TCCIRState *)ir, def);
   /* Simple address arithmetic: vreg = base_vreg +/- const. */
-  if ((def->op == TCCIR_OP_ADD || def->op == TCCIR_OP_SUB) && !(def->src1.r & VT_LVAL) && !(def->src2.r & VT_LVAL))
+  if ((def->op == TCCIR_OP_ADD || def->op == TCCIR_OP_SUB) && !(def_src1->r & VT_LVAL) && !(def_src2->r & VT_LVAL))
   {
-    const int src1_is_vreg = tcc_is_vreg_valid((TCCIRState *)ir, def->src1.vr);
-    const int src2_is_vreg = tcc_is_vreg_valid((TCCIRState *)ir, def->src2.vr);
-    const int src1_is_const = (def->src1.r & VT_VALMASK) == VT_CONST && !(def->src1.r & VT_SYM);
-    const int src2_is_const = (def->src2.r & VT_VALMASK) == VT_CONST && !(def->src2.r & VT_SYM);
+    const int src1_is_vreg = tcc_is_vreg_valid((TCCIRState *)ir, def_src1->vr);
+    const int src2_is_vreg = tcc_is_vreg_valid((TCCIRState *)ir, def_src2->vr);
+    const int src1_is_const = (def_src1->r & VT_VALMASK) == VT_CONST && !(def_src1->r & VT_SYM);
+    const int src2_is_const = (def_src2->r & VT_VALMASK) == VT_CONST && !(def_src2->r & VT_SYM);
 
     (void)src2_is_vreg;
 
@@ -899,19 +1029,19 @@ static int tcc_ir_try_resolve_stack_addr(const TCCIRState *ir, int vreg_encoded,
 
     if (src1_is_vreg && src2_is_const)
     {
-      if (!tcc_ir_try_resolve_stack_addr(ir, def->src1.vr, def_idx, depth - 1, &base_kind, &base_off))
+      if (!tcc_ir_try_resolve_stack_addr(ir, def_src1->vr, def_idx, depth - 1, &base_kind, &base_off))
         return 0;
       *out_kind = base_kind;
-      *out_offset = (def->op == TCCIR_OP_ADD) ? (base_off + def->src2.c.i) : (base_off - def->src2.c.i);
+      *out_offset = (def->op == TCCIR_OP_ADD) ? (base_off + def_src2->c.i) : (base_off - def_src2->c.i);
       return 1;
     }
     if (src1_is_const && src2_is_vreg && def->op == TCCIR_OP_ADD)
     {
       /* const + base */
-      if (!tcc_ir_try_resolve_stack_addr(ir, def->src2.vr, def_idx, depth - 1, &base_kind, &base_off))
+      if (!tcc_ir_try_resolve_stack_addr(ir, def_src2->vr, def_idx, depth - 1, &base_kind, &base_off))
         return 0;
       *out_kind = base_kind;
-      *out_offset = base_off + def->src1.c.i;
+      *out_offset = base_off + def_src1->c.i;
       return 1;
     }
   }
@@ -949,6 +1079,17 @@ void tcc_ir_release_block(TCCIRState *ir)
   if (ir->instructions != NULL)
   {
     tcc_free(ir->instructions);
+  }
+
+  /* Free SValue pool */
+  tcc_ir_svalue_pool_free(ir);
+
+  /* Free compact instructions array */
+  if (ir->compact_instructions)
+  {
+    tcc_free(ir->compact_instructions);
+    ir->compact_instructions = NULL;
+    ir->compact_instructions_size = 0;
   }
 
 #ifdef CONFIG_TCC_ASM
@@ -1562,20 +1703,6 @@ static int tcc_ir_operand_is_stack_addr(const SValue *sv)
 
 int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *dest)
 {
-  /* Respect front-end code suppression.
-   *
-   * The parser uses `nocode_wanted` to parse expressions/statements without
-   * generating code (dead `?:` arms, sizeof/typeof, const-eval, etc.). In IR
-   * mode, many front-end paths still call into `tcc_ir_put()` unconditionally;
-   * without a guard, IR for suppressed regions can be emitted and later run,
-   * causing hangs (see tests/tests2/87_dead_code.c).
-   *
-   * However `nocode_wanted` also carries the internal CODE_OFF bit (set after
-   * unconditional jumps/returns to suppress fallthrough until a label). That
-   * state must NOT suppress IR globally, or reachable code paths can lose IR
-   * emission (e.g. the else-arm of an if whose then-arm ends with return),
-   * breaking programs like tests/tests2/15_recursion.c.
-   */
   {
     /* Must match CODE_OFF_BIT in tccgen.c */
     const int IR_CODE_OFF_BIT = 0x20000000;
@@ -1585,7 +1712,6 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
 
   // resize array if needed
   const int pos = ir->next_instruction_index;
-  TACQuadruple *q;
   /* Ensure any anonymous symbols in the operands are registered before
    * storing them in the IR instruction. This prevents use-after-free when
    * local scopes are popped before the IR is processed. */
@@ -1611,38 +1737,23 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
       exit(1);
     }
   }
-  q = &ir->instructions[pos];
-  memset(q, 0, sizeof(TACQuadruple)); /* Zero-initialize to avoid garbage in unused fields */
-  q->orig_index = pos;
-  q->op = op;
-
-  if (irop_config[op].has_src1 == 1)
+  if (ir->next_instruction_index >= ir->compact_instructions_size)
   {
-    if (src1 == NULL)
+    ir->compact_instructions_size <<= 1;
+    ir->compact_instructions =
+        (IRQuadCompact *)tcc_realloc(ir->compact_instructions, sizeof(IRQuadCompact) * ir->compact_instructions_size);
+    if (!ir->compact_instructions)
     {
-      fprintf(stderr, "tcc_ir_put: src1 is NULL for op %s\n", tcc_ir_get_op_name(op));
+      fprintf(stderr, "tcc_ir_put: out of memory (compact)\n");
       exit(1);
     }
-    q->src1 = *src1;
-  }
-  else
-  {
-    q->src1.vr = -1;
   }
 
-  if (irop_config[op].has_src2 == 1)
-  {
-    if (src2 == NULL)
-    {
-      fprintf(stderr, "tcc_ir_put: src2 is NULL for op %s\n", tcc_ir_get_op_name(op));
-      exit(1);
-    }
-    q->src2 = *src2;
-  }
-  else
-  {
-    q->src2.vr = -1;
-  }
+  IRQuadCompact *cq = &ir->compact_instructions[pos];
+  memset(cq, 0, sizeof(IRQuadCompact));
+  cq->op = (uint8_t)op;
+  cq->orig_index = pos;
+  cq->operand_base = ir->svalue_pool_count;
 
   if (irop_config[op].has_dest == 1)
   {
@@ -1653,82 +1764,83 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
       exit(1);
     }
 
-    q->dest = *dest;
-
     if (tcc_is_vreg_valid(ir, dest->vr))
     {
-      /* Ensure the vreg is tagged with the correct type for register
-       * allocation. This is important for 64-bit values (double/long long)
-       * which require a register pair in soft-float. Some paths create temps
-       * without an explicit type tag; derive it from sources when missing. */
       if (dest->type.t == 0)
       {
         if (src1 && tcc_ir_is_float_type(src1->type.t))
         {
-          q->dest.type = src1->type;
+          dest->type = src1->type;
         }
         else if (src2 && tcc_ir_is_float_type(src2->type.t))
         {
-          q->dest.type = src2->type;
+          dest->type = src2->type;
         }
         else if (src1 && tcc_ir_is_64bit_type(src1->type.t))
         {
-          q->dest.type = src1->type;
+          dest->type = src1->type;
         }
         else if (src2 && tcc_ir_is_64bit_type(src2->type.t))
         {
-          q->dest.type = src2->type;
+          dest->type = src2->type;
         }
       }
 
-      /* Ensure 64-bit shifts keep a 64-bit destination, even if the caller
-       * accidentally provided a 32-bit dest type (the C semantics require
-       * the shift to produce a 64-bit result, with any truncation done by
-       * a subsequent cast). This prevents emitting 32-bit shifts that drop
-       * the high word. */
       if ((op == TCCIR_OP_SHL || op == TCCIR_OP_SHR || op == TCCIR_OP_SAR) && src1 &&
           tcc_ir_is_64bit_type(src1->type.t))
       {
-        q->dest.type = src1->type;
+        dest->type = src1->type;
       }
 
-      if (tcc_ir_is_float_type(q->dest.type.t))
+      if (tcc_ir_is_float_type(dest->type.t))
       {
-        tcc_ir_set_float_type(ir, dest->vr, 1, tcc_ir_is_double_type(q->dest.type.t));
+        tcc_ir_set_float_type(ir, dest->vr, 1, tcc_ir_is_double_type(dest->type.t));
       }
-      else if ((q->dest.type.t & VT_BTYPE) == VT_LLONG)
+      else if ((dest->type.t & VT_BTYPE) == VT_LLONG)
       {
         tcc_ir_set_llong_type(ir, dest->vr);
       }
       dest_interval = tcc_ir_get_live_interval(ir, dest->vr);
-      /* Most operations produce VALUES, not addresses, so is_lvalue should be 0.
-       * The only case where is_lvalue should be 1 is when we're assigning an ADDRESS
-       * to a variable (like ASSIGN of &var, without VT_LVAL dereference).
-       * - LOAD: produces a VALUE (loaded from memory) → is_lvalue=0
-       * - FUNCCALLVAL: produces a VALUE (return value) → is_lvalue=0
-       * - Arithmetic ops (ADD, SUB, etc.): produce VALUES → is_lvalue=0
-       * - ASSIGN with VT_LVAL source: produces a VALUE (dereferenced) → is_lvalue=0
-       * - ASSIGN without VT_LVAL source: produces an ADDRESS → is_lvalue=1 */
       int new_is_lvalue;
       int src_is_stack_addr = tcc_ir_operand_is_stack_addr(src1);
       if (op == TCCIR_OP_ASSIGN && src1 && !(src1->r & VT_LVAL) && !src_is_stack_addr)
       {
-        /* ASSIGN of a non-stack address (no VT_LVAL) produces an lvalue that must be
-         * reloaded if spilled. True stack addresses (Addr[StackLoc]) stay as raw
-         * addresses so they can be recomputed instead of reloaded. */
         new_is_lvalue = 1;
       }
       else
       {
-        /* All other operations (LOAD, arithmetic, function calls, etc.) produce values */
         new_is_lvalue = 0;
       }
       dest_interval->is_lvalue = new_is_lvalue;
     }
+
+    dest->pr0 = PREG_NONE;
+    dest->pr1 = PREG_NONE;
+    tcc_ir_svalue_pool_add(ir, dest);
   }
-  else
+
+  if (irop_config[op].has_src1 == 1)
   {
-    q->dest.vr = -1;
+    if (src1 == NULL)
+    {
+      fprintf(stderr, "tcc_ir_put: src1 is NULL for op %s\n", tcc_ir_get_op_name(op));
+      exit(1);
+    }
+    src1->pr0 = PREG_NONE;
+    src1->pr1 = PREG_NONE;
+    tcc_ir_svalue_pool_add(ir, src1);
+  }
+
+  if (irop_config[op].has_src2 == 1)
+  {
+    if (src2 == NULL)
+    {
+      fprintf(stderr, "tcc_ir_put: src2 is NULL for op %s\n", tcc_ir_get_op_name(op));
+      exit(1);
+    }
+    src2->pr0 = PREG_NONE;
+    src2->pr1 = PREG_NONE;
+    tcc_ir_svalue_pool_add(ir, src2);
   }
 
   if ((op == TCCIR_OP_FUNCCALLVOID) || (op == TCCIR_OP_FUNCCALLVAL))
@@ -1743,16 +1855,8 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
     tcc_ir_set_addrtaken(ir, src1->vr);
   }
 
-  // physical registers were not assigned yet
-  q->src1.pr0 = PREG_NONE;
-  q->src1.pr1 = PREG_NONE;
-  q->src2.pr0 = PREG_NONE;
-  q->src2.pr1 = PREG_NONE;
-  q->dest.pr0 = PREG_NONE;
-  q->dest.pr1 = PREG_NONE;
-
   // store current source line number for debug info
-  q->line_num = file ? file->line_num : 0;
+  cq->line_num = file ? file->line_num : 0;
 
   if (ir->basic_block_start)
   {
@@ -1767,20 +1871,22 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
      * That would downcast the producer op (like SHR #32 on a 64-bit value) to 32-bit and
      * lose the high word in codegen.
      */
-    const int prev_is_64bit = ((ir->instructions[pos - 1].dest.type.t & VT_BTYPE) == VT_LLONG);
+    SValue *prev_dest = tcc_ir_get_dest(ir, pos - 1);
+    const int prev_dest_vr = prev_dest ? prev_dest->vr : -1;
+    const int prev_is_64bit = prev_dest ? ((prev_dest->type.t & VT_BTYPE) == VT_LLONG) : 0;
     const int new_is_64bit = ((dest->type.t & VT_BTYPE) == VT_LLONG);
     const int width_match = (prev_is_64bit == new_is_64bit);
     const int can_coalesce = (!ir->prevent_coalescing) && width_match &&
                              (TCCIR_DECODE_VREG_TYPE(src1->vr) == TCCIR_VREG_TYPE_TEMP) && ((src1->r & VT_LVAL) == 0) &&
-                             (src1->vr == ir->instructions[pos - 1].dest.vr);
+                             (src1->vr == prev_dest_vr);
     if (can_coalesce)
     {
       /* When coalescing, preserve the original c.i offset for global symbols.
        * For STORE operations, the dest.c.i contains the offset into the global symbol
        * and should not be overwritten by the local variable's stack offset. */
-      int prev_c_i = ir->instructions[pos - 1].dest.c.i;
-      int preserve_offset = ((ir->instructions[pos - 1].dest.r & (VT_VALMASK | VT_SYM)) == (VT_CONST | VT_SYM)) &&
-                            (ir->instructions[pos - 1].op == TCCIR_OP_STORE);
+      const int prev_c_i = prev_dest->c.i;
+      const int preserve_offset = ((prev_dest->r & (VT_VALMASK | VT_SYM)) == (VT_CONST | VT_SYM)) &&
+                                  (ir->compact_instructions[pos - 1].op == TCCIR_OP_STORE);
 
       /* When coalescing, preserve the original c.i offset for global symbols.
        * For STORE operations, the dest.c.i contains the offset into the global symbol
@@ -1792,15 +1898,15 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
        * the operation's result type. Otherwise, the register allocator will
        * incorrectly allocate a register pair for what should be a 32-bit value.
        */
-      int old_dest_type = ir->instructions[pos - 1].dest.type.t;
-      int new_dest_type = ir->instructions[pos].dest.type.t;
-      int old_is_64bit = ((old_dest_type & VT_BTYPE) == VT_LLONG);
-      int new_is_64bit = ((new_dest_type & VT_BTYPE) == VT_LLONG);
+      const int old_dest_type = prev_dest->type.t;
+      const int new_dest_type = dest->type.t;
+      const int old_is_64bit = ((old_dest_type & VT_BTYPE) == VT_LLONG);
+      const int new_is_64bit = ((new_dest_type & VT_BTYPE) == VT_LLONG);
       /* Copy type information (like is_llong) from the old dest to the new dest,
        * but ONLY if both are 64-bit. If the new dest is 32-bit, it should NOT
        * inherit is_llong from a 64-bit source. */
-      int old_dest_vr = ir->instructions[pos - 1].dest.vr;
-      int new_dest_vr = ir->instructions[pos].dest.vr;
+      const int old_dest_vr = prev_dest->vr;
+      const int new_dest_vr = dest->vr;
       if (tcc_is_vreg_valid(ir, old_dest_vr) && tcc_is_vreg_valid(ir, new_dest_vr))
       {
         IRLiveInterval *old_interval = tcc_ir_get_live_interval(ir, old_dest_vr);
@@ -1811,20 +1917,32 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
       }
 
       /* Save prev_type only if we need to preserve it (same width) */
-      CType prev_type = ir->instructions[pos - 1].dest.type;
+      CType prev_type = prev_dest->type;
       int preserve_type = (old_is_64bit == new_is_64bit);
 
-      ir->instructions[pos - 1].dest = ir->instructions[pos].dest;
+      *prev_dest = *dest;
 
       /* Only restore the original type if widths match. When coalescing a 64-bit
        * result to a 32-bit variable, use the ASSIGN's destination type (32-bit). */
       if (preserve_type)
-        ir->instructions[pos - 1].dest.type = prev_type;
+        prev_dest->type = prev_type;
 
       if (preserve_offset)
       {
         /* Restore the original offset for global symbols */
-        ir->instructions[pos - 1].dest.c.i = prev_c_i;
+        prev_dest->c.i = prev_c_i;
+      }
+
+      /* Update the pool entry for the coalesced instruction's dest.
+       * The previous instruction's dest is at pool[operand_base + 0] since
+       * dest is always first in the layout when present. */
+      {
+        IRQuadCompact *prev_cq = &ir->compact_instructions[pos - 1];
+        if (irop_config[prev_cq->op].has_dest)
+        {
+          ir->svalue_pool[prev_cq->operand_base] = *prev_dest;
+          tcc_ir_writeback_compact(ir, pos - 1);
+        }
       }
 
       /* Don't increment - the ASSIGN at pos should be overwritten by the next instruction */
@@ -1832,6 +1950,7 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
     }
   }
 
+  tcc_ir_writeback_compact(ir, pos);
   ir->next_instruction_index++;
 
   return pos;
@@ -2066,10 +2185,10 @@ static int tcc_ir_find_live_interval(TCCIRState *ir, int vreg, int *start, int *
    * until the jump instruction. */
   for (int i = 0; i < ir->next_instruction_index; ++i)
   {
-    TACQuadruple *q = &ir->instructions[i];
+    IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
     {
-      int jump_target = q->dest.c.i;
+      const int jump_target = tcc_ir_op_get_dest(ir, q)->c.i;
       /* Backward jump: target is before the jump instruction */
       if (jump_target < i)
       {
@@ -2134,30 +2253,33 @@ static void tcc_ir_extend_param_intervals(TCCIRState *ir)
 
     for (int call_idx = 0; call_idx < n; ++call_idx)
     {
-      const TACQuadruple *callq = &ir->instructions[call_idx];
+      const IRQuadCompact *callq = &ir->compact_instructions[call_idx];
+
       if (callq->op != TCCIR_OP_FUNCCALLVOID && callq->op != TCCIR_OP_FUNCCALLVAL)
         continue;
-      const int call_id = TCCIR_DECODE_CALL_ID(callq->src2.c.i);
+      const int call_id = TCCIR_DECODE_CALL_ID(tcc_ir_op_get_src2(ir, callq)->c.i);
       if (call_id >= 0 && call_id < max_call_id)
         call_idx_by_id[call_id] = call_idx;
     }
 
     for (int j = 0; j < n; ++j)
     {
-      const TACQuadruple *p = &ir->instructions[j];
+
+      const IRQuadCompact *p = &ir->compact_instructions[j];
       if (p->op != TCCIR_OP_FUNCPARAMVAL)
         continue;
 
-      const int call_id = TCCIR_DECODE_CALL_ID(p->src2.c.i);
+      const int call_id = TCCIR_DECODE_CALL_ID(tcc_ir_op_get_src2(ir, p)->c.i);
       if (call_id < 0 || call_id >= max_call_id)
         continue;
       const int call_idx = call_idx_by_id[call_id];
       if (call_idx < 0)
         continue;
 
-      if (tcc_is_vreg_valid(ir, p->src1.vr))
+      SValue *src1 = tcc_ir_op_get_src1(ir, p);
+      if (tcc_is_vreg_valid(ir, src1->vr))
       {
-        IRLiveInterval *interval = tcc_ir_get_live_interval(ir, p->src1.vr);
+        IRLiveInterval *interval = tcc_ir_get_live_interval(ir, src1->vr);
         if (interval && interval->end < (uint32_t)call_idx)
           interval->end = (uint32_t)call_idx;
         if (interval && interval->start == INTERVAL_NOT_STARTED)
@@ -2179,25 +2301,26 @@ static void tcc_ir_extend_param_intervals(TCCIRState *ir)
    */
   for (int call_idx = 0; call_idx < ir->next_instruction_index; ++call_idx)
   {
-    const TACQuadruple *callq = &ir->instructions[call_idx];
+    const IRQuadCompact *callq = &ir->compact_instructions[call_idx];
     if (callq->op != TCCIR_OP_FUNCCALLVOID && callq->op != TCCIR_OP_FUNCCALLVAL)
       continue;
 
     /* FUNCCALL* stores call_id in src2.c.i encoded like FUNCPARAMVAL. */
-    const int call_id = TCCIR_DECODE_CALL_ID(callq->src2.c.i);
+    const int call_id = TCCIR_DECODE_CALL_ID(tcc_ir_op_get_src2(ir, callq)->c.i);
     for (int j = call_idx - 1; j >= 0; --j)
     {
-      const TACQuadruple *p = &ir->instructions[j];
+      const IRQuadCompact *p = &ir->compact_instructions[j];
       if (p->op != TCCIR_OP_FUNCPARAMVAL)
         continue;
 
-      const int param_call_id = TCCIR_DECODE_CALL_ID(p->src2.c.i);
+      const int param_call_id = TCCIR_DECODE_CALL_ID(tcc_ir_op_get_src2(ir, p)->c.i);
       if (param_call_id != call_id)
         continue;
 
-      if (tcc_is_vreg_valid(ir, p->src1.vr))
+      const SValue *src1 = tcc_ir_op_get_src1(ir, p);
+      if (tcc_is_vreg_valid(ir, src1->vr))
       {
-        IRLiveInterval *interval = tcc_ir_get_live_interval(ir, p->src1.vr);
+        IRLiveInterval *interval = tcc_ir_get_live_interval(ir, src1->vr);
         if (interval && interval->end < (uint32_t)call_idx)
           interval->end = (uint32_t)call_idx;
         if (interval && interval->start == INTERVAL_NOT_STARTED)
@@ -2223,10 +2346,10 @@ static void tcc_ir_extend_intervals_for_backward_jumps(TCCIRState *ir)
   /* Collect the maximum jump index for each backward-jump target. */
   for (int i = 0; i < n; ++i)
   {
-    const TACQuadruple *q = &ir->instructions[i];
+    const IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF)
       continue;
-    const int target = q->dest.c.i;
+    const int target = tcc_ir_op_get_dest(ir, q)->c.i;
     if (target < 0 || target >= n)
       continue;
     if (target >= i)
@@ -2509,8 +2632,8 @@ void tcc_ir_liveness_analysis(TCCIRState *ir)
        * to that call (interval was extended by tcc_ir_extend_param_intervals).
        * It must be in a callee-saved register because the call's argument
        * setup phase may clobber caller-saved registers. */
-      if (end < ir->next_instruction_index &&
-          (ir->instructions[end].op == TCCIR_OP_FUNCCALLVAL || ir->instructions[end].op == TCCIR_OP_FUNCCALLVOID))
+      if (end < ir->next_instruction_index && (ir->compact_instructions[end].op == TCCIR_OP_FUNCCALLVAL ||
+                                               ir->compact_instructions[end].op == TCCIR_OP_FUNCCALLVOID))
       {
         crosses_call = 1;
       }
@@ -2559,13 +2682,6 @@ void tcc_ir_liveness_analysis(TCCIRState *ir)
     /* If param never used (end would be 0 from memset), set minimal end */
     if (end == 0)
       end = 1; /* Ensure at least one instruction range for allocation */
-    // if (end < ir->next_instruction_index &&
-    //     (ir->instructions[end].op == TCCIR_OP_FUNCCALLVAL || ir->instructions[end].op == TCCIR_OP_FUNCCALLVOID))
-    // {
-    //   /* Don't decrement if this vreg is an argument to the call */
-    //   if (!tcc_ir_vreg_is_call_argument(ir, vreg_encoded, end))
-    //     end--; /* Do not include call instruction itself */
-    // }
     /* Parameters are live at function entry *before* IR instruction 0.
      * So a call at IR[0] must be treated as crossing for parameters, unlike
      * temporaries/locals where start marks a definition point.
@@ -3542,15 +3658,16 @@ void tcc_ir_mark_return_value_incoming_regs(TCCIRState *ir)
   /* Scan all instructions to find FUNCCALLVAL that produce return values */
   for (int i = 0; i < ir->next_instruction_index; ++i)
   {
-    TACQuadruple *q = &ir->instructions[i];
+    IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op != TCCIR_OP_FUNCCALLVAL)
       continue;
 
     /* dest is the vreg that receives the return value */
-    if (q->dest.vr < 0 || !tcc_is_vreg_valid(ir, q->dest.vr))
+    const SValue *dest = tcc_ir_op_get_dest(ir, q);
+    if (dest->vr < 0 || !tcc_is_vreg_valid(ir, dest->vr))
       continue;
 
-    IRLiveInterval *interval = tcc_ir_get_live_interval(ir, q->dest.vr);
+    IRLiveInterval *interval = tcc_ir_get_live_interval(ir, dest->vr);
     if (!interval)
       continue;
 
@@ -3792,7 +3909,6 @@ int tcc_ir_dead_code_elimination(TCCIRState *ir)
     return 0;
 
   uint8_t *reachable = tcc_mallocz((n + 7) / 8);
-  int *new_index = tcc_malloc(n * sizeof(int));
   int *worklist = tcc_malloc(n * sizeof(int));
   int worklist_head = 0, worklist_tail = 0;
 
@@ -3813,17 +3929,17 @@ int tcc_ir_dead_code_elimination(TCCIRState *ir)
   while (worklist_head < worklist_tail)
   {
     int i = worklist[worklist_head++];
-    TACQuadruple *q = &ir->instructions[i];
-
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    const SValue *dest = tcc_ir_op_get_dest(ir, q);
     switch (q->op)
     {
     case TCCIR_OP_JUMP:
       /* Unconditional jump - only the target is reachable */
-      MARK_REACHABLE(q->dest.c.i);
+      MARK_REACHABLE(dest->c.i);
       break;
     case TCCIR_OP_JUMPIF:
       /* Conditional jump - both target and fall-through are reachable */
-      MARK_REACHABLE(q->dest.c.i);
+      MARK_REACHABLE(dest->c.i);
       MARK_REACHABLE(i + 1);
       break;
     case TCCIR_OP_IJUMP:
@@ -3848,75 +3964,27 @@ int tcc_ir_dead_code_elimination(TCCIRState *ir)
 
 #undef MARK_REACHABLE
 
-  /* Count reachable instructions and build index mapping */
-  int new_count = 0;
+  /* Mark unreachable instructions as NOP (no array compaction needed) */
+  int changes = 0;
   for (int i = 0; i < n; i++)
   {
-    if (reachable[i / 8] & (1 << (i % 8)))
+    if (!(reachable[i / 8] & (1 << (i % 8))))
     {
-      new_index[i] = new_count++;
-    }
-    else
-    {
-      new_index[i] = -1; /* Dead instruction */
+      ir->compact_instructions[i].op = TCCIR_OP_NOP;
+      tcc_ir_writeback_compact(ir, i);
+      changes++;
     }
   }
-
-  /* If nothing was eliminated, clean up and return */
-  if (new_count == n)
-  {
-    tcc_free(reachable);
-    tcc_free(new_index);
-    tcc_free(worklist);
-    return 0;
-  }
-
-  /* Compact instructions and update jump targets */
-  int write_pos = 0;
-  for (int i = 0; i < n; i++)
-  {
-    if (new_index[i] >= 0)
-    {
-      TACQuadruple *q = &ir->instructions[i];
-
-      /* Update jump targets */
-      if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
-      {
-        int old_target = q->dest.c.i;
-        if (old_target >= 0 && old_target < n)
-        {
-          q->dest.c.i = new_index[old_target];
-        }
-        else if (old_target >= n)
-        {
-          /* Target is past the end (epilogue) - adjust for removed instructions
-           */
-          q->dest.c.i = new_count;
-        }
-        /* else: old_target < 0 means unpatched jump, leave as -1 */
-      }
-
-      /* Move instruction to new position if needed */
-      if (write_pos != i)
-      {
-        ir->instructions[write_pos] = *q;
-      }
-      write_pos++;
-    }
-  }
-
-  ir->next_instruction_index = new_count;
 
   tcc_free(reachable);
-  tcc_free(new_index);
   tcc_free(worklist);
 
-  return 1;
+  return changes;
 }
 
 /* Dead Store Elimination - remove ASSIGN instructions where the destination
  * vreg is never used. This eliminates redundant copies after CSE/idempotent
- * optimizations.
+ * optimizations. Instead of compacting the array, we mark dead stores as NOP.
  */
 int tcc_ir_dead_store_elimination(TCCIRState *ir)
 {
@@ -3928,10 +3996,13 @@ int tcc_ir_dead_store_elimination(TCCIRState *ir)
   int max_tmp_pos = 0;
   for (int i = 0; i < n; i++)
   {
-    TACQuadruple *q = &ir->instructions[i];
-    if (irop_config[q->op].has_dest && TCCIR_DECODE_VREG_TYPE(q->dest.vr) == TCCIR_VREG_TYPE_TEMP)
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    const SValue *dest = tcc_ir_op_get_dest(ir, q);
+    if (irop_config[q->op].has_dest && TCCIR_DECODE_VREG_TYPE(dest->vr) == TCCIR_VREG_TYPE_TEMP)
     {
-      int pos = TCCIR_DECODE_VREG_POSITION(q->dest.vr);
+      const int pos = TCCIR_DECODE_VREG_POSITION(dest->vr);
       if (pos > max_tmp_pos)
         max_tmp_pos = pos;
     }
@@ -3945,20 +4016,24 @@ int tcc_ir_dead_store_elimination(TCCIRState *ir)
   /* Mark all TMP vregs that are used as sources */
   for (int i = 0; i < n; i++)
   {
-    TACQuadruple *q = &ir->instructions[i];
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
 
     /* Check src1 */
-    if (irop_config[q->op].has_src1 && TCCIR_DECODE_VREG_TYPE(q->src1.vr) == TCCIR_VREG_TYPE_TEMP)
+    const SValue *src1 = tcc_ir_op_get_src1(ir, q);
+    if (irop_config[q->op].has_src1 && TCCIR_DECODE_VREG_TYPE(src1->vr) == TCCIR_VREG_TYPE_TEMP)
     {
-      int pos = TCCIR_DECODE_VREG_POSITION(q->src1.vr);
+      const int pos = TCCIR_DECODE_VREG_POSITION(src1->vr);
       if (pos <= max_tmp_pos)
         used[pos / 8] |= (1 << (pos % 8));
     }
 
     /* Check src2 */
-    if (irop_config[q->op].has_src2 && TCCIR_DECODE_VREG_TYPE(q->src2.vr) == TCCIR_VREG_TYPE_TEMP)
+    const SValue *src2 = tcc_ir_op_get_src2(ir, q);
+    if (irop_config[q->op].has_src2 && TCCIR_DECODE_VREG_TYPE(src2->vr) == TCCIR_VREG_TYPE_TEMP)
     {
-      int pos = TCCIR_DECODE_VREG_POSITION(q->src2.vr);
+      const int pos = TCCIR_DECODE_VREG_POSITION(src2->vr);
       if (pos <= max_tmp_pos)
         used[pos / 8] |= (1 << (pos % 8));
     }
@@ -3966,18 +4041,17 @@ int tcc_ir_dead_store_elimination(TCCIRState *ir)
     /* For STORE operations, the dest field is used as a pointer (address to store to),
      * not as a destination being written. If dest has VT_LVAL, the vreg is being
      * dereferenced, so it's a USE not a DEF. Mark it as used. */
-    if (q->op == TCCIR_OP_STORE && TCCIR_DECODE_VREG_TYPE(q->dest.vr) == TCCIR_VREG_TYPE_TEMP)
+    const SValue *dest = tcc_ir_op_get_dest(ir, q);
+    if (q->op == TCCIR_OP_STORE && TCCIR_DECODE_VREG_TYPE(dest->vr) == TCCIR_VREG_TYPE_TEMP)
     {
-      int pos = TCCIR_DECODE_VREG_POSITION(q->dest.vr);
+      const int pos = TCCIR_DECODE_VREG_POSITION(dest->vr);
       if (pos <= max_tmp_pos)
         used[pos / 8] |= (1 << (pos % 8));
     }
   }
 
-  /* Remove ASSIGN instructions where dest is an unused TMP vreg, and NOP instructions */
+  /* Mark dead ASSIGN instructions as NOP (no array compaction needed) */
   int changes = 0;
-  int write_pos = 0;
-  int *new_index = tcc_malloc(sizeof(int) * n);
 
 #ifdef DEBUG_IR_GEN
   printf("=== DEAD STORE ELIMINATION START ===\n");
@@ -3985,82 +4059,35 @@ int tcc_ir_dead_store_elimination(TCCIRState *ir)
 
   for (int i = 0; i < n; i++)
   {
-    TACQuadruple *q = &ir->instructions[i];
-    int keep = 1;
-
-    /* Remove NOP instructions */
+    IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP)
+      continue;
+
+    /* Mark ASSIGN instructions where dest is an unused TMP vreg as NOP */
+    const SValue *dest = tcc_ir_op_get_dest(ir, q);
+    if (q->op == TCCIR_OP_ASSIGN && TCCIR_DECODE_VREG_TYPE(dest->vr) == TCCIR_VREG_TYPE_TEMP)
     {
-      keep = 0;
-      changes++;
-    }
-    /* Remove ASSIGN instructions where dest is an unused TMP vreg */
-    else if (q->op == TCCIR_OP_ASSIGN && TCCIR_DECODE_VREG_TYPE(q->dest.vr) == TCCIR_VREG_TYPE_TEMP)
-    {
-      int pos = TCCIR_DECODE_VREG_POSITION(q->dest.vr);
+      const int pos = TCCIR_DECODE_VREG_POSITION(dest->vr);
       if (pos <= max_tmp_pos && !(used[pos / 8] & (1 << (pos % 8))))
       {
-        /* This ASSIGN's destination is never used - remove it */
-        keep = 0;
+        /* This ASSIGN's destination is never used - mark as NOP */
+        q->op = TCCIR_OP_NOP;
+        tcc_ir_writeback_compact(ir, i);
         changes++;
       }
-    }
-
-    new_index[i] = keep ? write_pos : -1;
-
-    if (keep)
-    {
-      if (write_pos != i)
-        ir->instructions[write_pos] = *q;
-      write_pos++;
     }
   }
 
 #ifdef DEBUG_IR_GEN
-  printf("=== DEAD STORE ELIMINATION END (removed %d, n=%d -> %d) ===\n", changes, n, write_pos);
+  printf("=== DEAD STORE ELIMINATION END (marked %d as NOP) ===\n", changes);
 #endif
-
-  /* Update jump targets */
-  for (int i = 0; i < write_pos; i++)
-  {
-    TACQuadruple *q = &ir->instructions[i];
-    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
-    {
-      int old_target = q->dest.c.i;
-      if (old_target >= 0 && old_target < n)
-      {
-        if (new_index[old_target] >= 0)
-        {
-          q->dest.c.i = new_index[old_target];
-        }
-        else
-        {
-          /* Target instruction was removed - find next valid instruction */
-          int next = old_target + 1;
-          while (next < n && new_index[next] < 0)
-            next++;
-          if (next < n)
-            q->dest.c.i = new_index[next];
-          else
-            q->dest.c.i = write_pos; /* Past end */
-        }
-      }
-      else if (old_target >= n)
-        q->dest.c.i = write_pos; /* Past end */
-      /* else: old_target < 0 means unpatched, leave as -1 */
-    }
-  }
-
-  ir->next_instruction_index = write_pos;
-
   tcc_free(used);
-  tcc_free(new_index);
 
   return changes;
 }
 
 /* Helper: check if two SValues refer to the same virtual register */
-static int same_vreg(SValue *a, SValue *b)
+static int same_vreg(const SValue *a, const SValue *b)
 {
   /* Both must be vregs (not constants) */
   if ((a->r & VT_VALMASK) == VT_CONST || (b->r & VT_VALMASK) == VT_CONST)
@@ -4069,13 +4096,18 @@ static int same_vreg(SValue *a, SValue *b)
 }
 
 /* Helper: check if two BOOL_OR/BOOL_AND ops have same operands (in any order) */
-static int same_bool_operands(TACQuadruple *q1, TACQuadruple *q2)
+static int same_bool_operands(TCCIRState *ir, IRQuadCompact *q1, IRQuadCompact *q2)
 {
+  const SValue *s11 = tcc_ir_op_get_src1(ir, q1);
+  const SValue *s12 = tcc_ir_op_get_src2(ir, q1);
+  const SValue *s21 = tcc_ir_op_get_src1(ir, q2);
+  const SValue *s22 = tcc_ir_op_get_src2(ir, q2);
+
   /* Same order: (a,b) == (a,b) */
-  if (same_vreg(&q1->src1, &q2->src1) && same_vreg(&q1->src2, &q2->src2))
+  if (same_vreg(s11, s21) && same_vreg(s12, s22))
     return 1;
   /* Swapped order: (a,b) == (b,a) - only valid for commutative ops */
-  if (same_vreg(&q1->src1, &q2->src2) && same_vreg(&q1->src2, &q2->src1))
+  if (same_vreg(s11, s22) && same_vreg(s12, s21))
     return 1;
   return 0;
 }
@@ -4121,20 +4153,25 @@ int tcc_ir_bool_cse(TCCIRState *ir)
 
   for (int i = 0; i < n; i++)
   {
-    TACQuadruple *q = &ir->instructions[i];
+    IRQuadCompact *q = &ir->compact_instructions[i];
+
+    if (q->op == TCCIR_OP_NOP)
+      continue;
 
     /* Only handle BOOL_OR and BOOL_AND - they are commutative */
     if (q->op != TCCIR_OP_BOOL_OR && q->op != TCCIR_OP_BOOL_AND)
       continue;
 
-    uint32_t h = cse_hash(q->op, q->src1.vr, q->src2.vr);
+    SValue *src1 = tcc_ir_op_get_src1(ir, q);
+    SValue *src2 = tcc_ir_op_get_src2(ir, q);
+    const uint32_t h = cse_hash(q->op, src1->vr, src2->vr);
 
     /* Search hash bucket for match */
     int found = 0;
     for (CSEHashEntry *e = hash_table[h]; e != NULL; e = e->next)
     {
-      TACQuadruple *prev = &ir->instructions[e->instruction_idx];
-      if (prev->op == q->op && same_bool_operands(prev, q))
+      IRQuadCompact *prev = &ir->compact_instructions[e->instruction_idx];
+      if (prev->op == q->op && same_bool_operands(ir, prev, q))
       {
         /* Found duplicate! Replace with ASSIGN from previous result */
 #ifdef DEBUG_IR_GEN
@@ -4142,9 +4179,11 @@ int tcc_ir_bool_cse(TCCIRState *ir)
                e->instruction_idx);
 #endif
         q->op = TCCIR_OP_ASSIGN;
-        q->src1 = prev->dest;
-        memset(&q->src2, 0, sizeof(q->src2));
+        *src1 = *tcc_ir_op_get_dest(ir, prev);
+        memset(src2, 0, sizeof(SValue));
+        src2->vr = -1;
         changes++;
+        tcc_ir_writeback_compact(ir, i);
         found = 1;
         break;
       }
@@ -4186,10 +4225,13 @@ int tcc_ir_bool_idempotent(TCCIRState *ir)
   int max_tmp_pos = 0;
   for (int i = 0; i < n; i++)
   {
-    TACQuadruple *q = &ir->instructions[i];
-    if (irop_config[q->op].has_dest && TCCIR_DECODE_VREG_TYPE(q->dest.vr) == TCCIR_VREG_TYPE_TEMP)
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    const SValue *dest = tcc_ir_op_get_dest(ir, q);
+    if (irop_config[q->op].has_dest && TCCIR_DECODE_VREG_TYPE(dest->vr) == TCCIR_VREG_TYPE_TEMP)
     {
-      int pos = TCCIR_DECODE_VREG_POSITION(q->dest.vr);
+      const int pos = TCCIR_DECODE_VREG_POSITION(dest->vr);
       if (pos > max_tmp_pos)
         max_tmp_pos = pos;
     }
@@ -4201,25 +4243,31 @@ int tcc_ir_bool_idempotent(TCCIRState *ir)
 
   for (int i = 0; i < n; i++)
   {
-    TACQuadruple *q = &ir->instructions[i];
-    if (irop_config[q->op].has_dest && TCCIR_DECODE_VREG_TYPE(q->dest.vr) == TCCIR_VREG_TYPE_TEMP)
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    const SValue *dest = tcc_ir_op_get_dest(ir, q);
+    if (irop_config[q->op].has_dest && TCCIR_DECODE_VREG_TYPE(dest->vr) == TCCIR_VREG_TYPE_TEMP)
     {
-      int pos = TCCIR_DECODE_VREG_POSITION(q->dest.vr);
+      const int pos = TCCIR_DECODE_VREG_POSITION(dest->vr);
       vreg_def[pos] = i;
     }
   }
 
   for (int i = 0; i < n; i++)
   {
-    TACQuadruple *q = &ir->instructions[i];
+    IRQuadCompact *q = &ir->compact_instructions[i];
+
+    if (q->op == TCCIR_OP_NOP)
+      continue;
 
     /* Only handle BOOL_OR and BOOL_AND */
     if (q->op != TCCIR_OP_BOOL_OR && q->op != TCCIR_OP_BOOL_AND)
       continue;
 
     /* Resolve both operands through ASSIGN chains (only for TMP vregs) */
-    int vr1 = q->src1.vr;
-    int vr2 = q->src2.vr;
+    int vr1 = tcc_ir_op_get_src1(ir, q)->vr;
+    int vr2 = tcc_ir_op_get_src2(ir, q)->vr;
 
     /* Follow ASSIGN chains for TMP vregs */
     while (TCCIR_DECODE_VREG_TYPE(vr1) == TCCIR_VREG_TYPE_TEMP)
@@ -4227,10 +4275,10 @@ int tcc_ir_bool_idempotent(TCCIRState *ir)
       int pos = TCCIR_DECODE_VREG_POSITION(vr1);
       if (pos > max_tmp_pos || vreg_def[pos] < 0)
         break;
-      TACQuadruple *def = &ir->instructions[vreg_def[pos]];
+      IRQuadCompact *def = &ir->compact_instructions[vreg_def[pos]];
       if (def->op != TCCIR_OP_ASSIGN)
         break;
-      vr1 = def->src1.vr;
+      vr1 = tcc_ir_op_get_src1(ir, def)->vr;
     }
 
     while (TCCIR_DECODE_VREG_TYPE(vr2) == TCCIR_VREG_TYPE_TEMP)
@@ -4238,10 +4286,10 @@ int tcc_ir_bool_idempotent(TCCIRState *ir)
       int pos = TCCIR_DECODE_VREG_POSITION(vr2);
       if (pos > max_tmp_pos || vreg_def[pos] < 0)
         break;
-      TACQuadruple *def = &ir->instructions[vreg_def[pos]];
+      IRQuadCompact *def = &ir->compact_instructions[vreg_def[pos]];
       if (def->op != TCCIR_OP_ASSIGN)
         break;
-      vr2 = def->src1.vr;
+      vr2 = tcc_ir_op_get_src1(ir, def)->vr;
     }
 
     /* Check if both operands resolve to the same vreg */
@@ -4255,8 +4303,12 @@ int tcc_ir_bool_idempotent(TCCIRState *ir)
 #endif
       q->op = TCCIR_OP_ASSIGN;
       /* src1 already has the right value, just clear src2 */
-      memset(&q->src2, 0, sizeof(q->src2));
+      SValue *src2 = tcc_ir_op_get_src2(ir, q);
+      memset(src2, 0, sizeof(*src2));
+      src2->vr = -1;
       changes++;
+
+      tcc_ir_writeback_compact(ir, i);
     }
   }
 
@@ -4282,105 +4334,153 @@ int tcc_ir_bool_idempotent(TCCIRState *ir)
  */
 int tcc_ir_return_value_optimization(TCCIRState *ir)
 {
-  /* Disabled for now - the optimization incorrectly handles cases where
-   * a local variable is initialized from a constant (loaded to registers)
-   * but never stored to memory. The RETURNVALUE then tries to load from
-   * a memory location that doesn't contain the value.
-   *
-   * TODO: Enable this optimization only when we can prove the source
-   * variable has been stored to memory (has a STORE instruction to it).
-   */
-  return 0;
-
-#if 0 /* Original implementation - kept for reference */
   int n = ir->next_instruction_index;
   int changes = 0;
 
   if (n < 2)
     return 0;
 
-  /* For each RETURNVALUE, check if its source is a temp vreg
-   * that was just loaded and used only by this RETURNVALUE */
+  /* Conservative return value optimization: fold
+   *   tmp = LOAD [addr]
+   *   RETURNVALUE tmp
+   * into
+   *   RETURNVALUE [addr]
+   * when:
+   * - tmp is a TEMP vreg
+   * - the defining op is a LOAD in the same basic block
+   * - tmp is used only by that RETURNVALUE inside the block
+   * - the LOAD reads from a stack local (VT_LOCAL)
+   * - we can prove the stack slot has been written via a prior STORE in-block
+   */
   for (int i = 0; i < n; i++)
   {
-    TACQuadruple *ret = &ir->instructions[i];
+    IRQuadCompact *ret = &ir->compact_instructions[i];
+    if (ret->op == TCCIR_OP_NOP)
+      continue;
     if (ret->op != TCCIR_OP_RETURNVALUE)
       continue;
 
-    /* src1 must be a temp vreg */
-    if (TCCIR_DECODE_VREG_TYPE(ret->src1.vr) != TCCIR_VREG_TYPE_TEMP)
+    const SValue *src1 = tcc_ir_op_get_src1(ir, ret);
+    if (TCCIR_DECODE_VREG_TYPE(src1->vr) != TCCIR_VREG_TYPE_TEMP)
       continue;
 
-    int ret_vreg = ret->src1.vr;
+    const int ret_vreg = src1->vr;
 
-    /* Find the instruction that defines this temp vreg */
-    int def_idx = -1;
-    for (int j = i - 1; j >= 0; j--)
+    /* Find basic block start for conservative local scan */
+    int bb_start = 0;
+    for (int j = i - 1; j >= 0; --j)
     {
-      TACQuadruple *q = &ir->instructions[j];
-      if (irop_config[q->op].has_dest && q->dest.vr == ret_vreg)
+      TccIrOp op = ir->compact_instructions[j].op;
+      if (op == TCCIR_OP_JUMP || op == TCCIR_OP_JUMPIF || op == TCCIR_OP_FUNCCALLVOID || op == TCCIR_OP_FUNCCALLVAL ||
+          op == TCCIR_OP_RETURNVALUE || op == TCCIR_OP_RETURNVOID)
+      {
+        bb_start = j + 1;
+        break;
+      }
+    }
+
+    /* Find the defining instruction for the returned tmp vreg within the same BB */
+    int def_idx = -1;
+    for (int j = i - 1; j >= bb_start; --j)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[j];
+      if (q->op == TCCIR_OP_NOP)
+        continue;
+      const SValue *dest = tcc_ir_op_get_dest(ir, q);
+      if (irop_config[q->op].has_dest && dest->vr == ret_vreg)
       {
         def_idx = j;
         break;
       }
     }
-
     if (def_idx < 0)
       continue;
 
-    TACQuadruple *def = &ir->instructions[def_idx];
-
-    /* Must be a LOAD instruction */
+    IRQuadCompact *def = &ir->compact_instructions[def_idx];
     if (def->op != TCCIR_OP_LOAD)
       continue;
 
-    /* The LOAD source must be the same type as LOAD destination (no cast involved).
-     * If there's a type mismatch (e.g., loading int from long long local),
-     * we can't optimize because we'd need to do a proper truncating load. */
-    int src_btype = def->src1.type.t & VT_BTYPE;
-    int dst_btype = def->dest.type.t & VT_BTYPE;
-#ifdef DEBUG_IR_GEN
-#endif
-    if (src_btype != dst_btype)
-      continue; /* Type cast involved, don't optimize */
-
-    /* Check that the temp vreg is only used by this RETURNVALUE */
-    int use_count = 0;
-    for (int j = def_idx + 1; j < n; j++)
+    /* Only optimize loads from stack locals, and only when we've seen a prior
+     * STORE to the same slot in this basic block. */
+    const SValue *load_src = tcc_ir_op_get_src1(ir, def);
+    const int load_valmask = load_src->r & VT_VALMASK;
+    if (load_valmask != VT_LOCAL)
+      continue;
+    const Sym *load_sym = load_src->sym;
+    const int64_t load_off = load_src->c.i;
+    int found_prior_store = 0;
+    for (int j = def_idx - 1; j >= bb_start; --j)
     {
-      TACQuadruple *q = &ir->instructions[j];
-      if (irop_config[q->op].has_src1 && q->src1.vr == ret_vreg)
-        use_count++;
-      if (irop_config[q->op].has_src2 && q->src2.vr == ret_vreg)
-        use_count++;
+      IRQuadCompact *q = &ir->compact_instructions[j];
+      if (q->op == TCCIR_OP_NOP)
+        continue;
+      if (q->op != TCCIR_OP_STORE)
+        continue;
+      const SValue *store_dest = tcc_ir_op_get_dest(ir, q);
+      if ((store_dest->r & VT_VALMASK) != VT_LOCAL)
+        continue;
+      if (store_dest->sym == load_sym && store_dest->c.i == load_off)
+      {
+        found_prior_store = 1;
+        break;
+      }
     }
+    if (!found_prior_store)
+      continue;
 
+    /* The LOAD source must be the same basic type as its destination (no cast involved).
+     * If there's a type mismatch, we could need a truncating load. */
+    const int src_btype = load_src->type.t & VT_BTYPE;
+    const int dst_btype = tcc_ir_op_get_dest(ir, def)->type.t & VT_BTYPE;
+    if (src_btype != dst_btype)
+      continue;
+
+    /* Check that the temp vreg is only used by this RETURNVALUE within the BB */
+    int use_count = 0;
+    for (int j = def_idx + 1; j < n; ++j)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[j];
+      if (q->op == TCCIR_OP_NOP)
+        continue;
+      if (irop_config[q->op].has_src1 && tcc_ir_op_get_src1(ir, q)->vr == ret_vreg)
+        use_count++;
+      if (irop_config[q->op].has_src2 && tcc_ir_op_get_src2(ir, q)->vr == ret_vreg)
+        use_count++;
+
+      if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF || q->op == TCCIR_OP_FUNCCALLVOID ||
+          q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_RETURNVALUE || q->op == TCCIR_OP_RETURNVOID)
+        break;
+    }
     if (use_count != 1)
       continue;
 
-    /* Optimization: propagate LOAD source to RETURNVALUE, but keep the return type */
 #ifdef DEBUG_IR_GEN
-    printf("OPTIMIZE: LOAD vr%d -> RETURNVALUE vr%d => RETURNVALUE from mem\n", ret_vreg, ret_vreg);
+    printf("OPTIMIZE: fold LOAD->RETURNVALUE at i=%d (def=%d, vr=%d)\n", i, def_idx, ret_vreg);
 #endif
 
-    /* Save the return type (from the LOAD destination, which has the cast type) */
-    CType ret_type = def->dest.type;
+    /* Preserve the return type (from the LOAD destination). */
+    const SValue *load_dest = tcc_ir_op_get_dest(ir, def);
+    CType ret_type = load_dest->type;
 
-    /* Copy the LOAD source to RETURNVALUE */
-    ret->src1 = def->src1;
-    /* Preserve the return type (may be different from source type due to cast) */
-    ret->src1.type = ret_type;
+    SValue *load_src1 = tcc_ir_op_get_src1(ir, def);
+    SValue *ret_src1 = tcc_ir_op_get_src1(ir, ret);
+    *ret_src1 = *load_src1;
+    ret_src1->type = ret_type;
 
-    /* Mark the LOAD for elimination by converting to no-op
-     * (DCE will clean it up) */
+    /* Convert the LOAD into a no-op ASSIGN; DCE will remove it. */
     def->op = TCCIR_OP_ASSIGN;
-    def->src1 = def->dest; /* Self-assign becomes no-op */
+    *load_src1 = *load_dest;
+    SValue *load_src2 = tcc_ir_op_get_src2(ir, def);
+    memset(load_src2, 0, sizeof(*load_src2));
+    load_src2->vr = -1;
+
+    tcc_ir_writeback_compact(ir, def_idx);
+    tcc_ir_writeback_compact(ir, i);
 
     changes++;
   }
 
   return changes;
-#endif
 }
 
 /* Boolean expression simplification - eliminate redundant BOOL_OR/BOOL_AND
@@ -4400,10 +4500,13 @@ int tcc_ir_bool_simplification(TCCIRState *ir)
   int max_tmp_pos = 0;
   for (int i = 0; i < n; i++)
   {
-    TACQuadruple *q = &ir->instructions[i];
-    if (irop_config[q->op].has_dest && TCCIR_DECODE_VREG_TYPE(q->dest.vr) == TCCIR_VREG_TYPE_TEMP)
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    const SValue *dest = tcc_ir_op_get_dest(ir, q);
+    if (irop_config[q->op].has_dest && TCCIR_DECODE_VREG_TYPE(dest->vr) == TCCIR_VREG_TYPE_TEMP)
     {
-      int pos = TCCIR_DECODE_VREG_POSITION(q->dest.vr);
+      const int pos = TCCIR_DECODE_VREG_POSITION(dest->vr);
       if (pos > max_tmp_pos)
         max_tmp_pos = pos;
     }
@@ -4415,10 +4518,13 @@ int tcc_ir_bool_simplification(TCCIRState *ir)
 
   for (int i = 0; i < n; i++)
   {
-    TACQuadruple *q = &ir->instructions[i];
-    if (irop_config[q->op].has_dest && TCCIR_DECODE_VREG_TYPE(q->dest.vr) == TCCIR_VREG_TYPE_TEMP)
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    const SValue *dest = tcc_ir_op_get_dest(ir, q);
+    if (irop_config[q->op].has_dest && TCCIR_DECODE_VREG_TYPE(dest->vr) == TCCIR_VREG_TYPE_TEMP)
     {
-      int pos = TCCIR_DECODE_VREG_POSITION(q->dest.vr);
+      const int pos = TCCIR_DECODE_VREG_POSITION(dest->vr);
       vreg_def[pos] = i;
     }
   }
@@ -4427,7 +4533,10 @@ int tcc_ir_bool_simplification(TCCIRState *ir)
    * and BOOL_OR(BOOL_AND(a,b), BOOL_AND(b,a)) patterns */
   for (int i = 0; i < n; i++)
   {
-    TACQuadruple *q = &ir->instructions[i];
+    IRQuadCompact *q = &ir->compact_instructions[i];
+
+    if (q->op == TCCIR_OP_NOP)
+      continue;
 
     /* Must be BOOL_AND or BOOL_OR */
     if (q->op != TCCIR_OP_BOOL_AND && q->op != TCCIR_OP_BOOL_OR)
@@ -4435,15 +4544,17 @@ int tcc_ir_bool_simplification(TCCIRState *ir)
 
     /* Get the defining instructions for both operands (only TMP vregs) */
     int def1 = -1, def2 = -1;
-    if (TCCIR_DECODE_VREG_TYPE(q->src1.vr) == TCCIR_VREG_TYPE_TEMP)
+    SValue *src1 = tcc_ir_op_get_src1(ir, q);
+    if (TCCIR_DECODE_VREG_TYPE(src1->vr) == TCCIR_VREG_TYPE_TEMP)
     {
-      int pos = TCCIR_DECODE_VREG_POSITION(q->src1.vr);
+      const int pos = TCCIR_DECODE_VREG_POSITION(src1->vr);
       if (pos <= max_tmp_pos)
         def1 = vreg_def[pos];
     }
-    if (TCCIR_DECODE_VREG_TYPE(q->src2.vr) == TCCIR_VREG_TYPE_TEMP)
+    SValue *src2 = tcc_ir_op_get_src2(ir, q);
+    if (TCCIR_DECODE_VREG_TYPE(src2->vr) == TCCIR_VREG_TYPE_TEMP)
     {
-      int pos = TCCIR_DECODE_VREG_POSITION(q->src2.vr);
+      const int pos = TCCIR_DECODE_VREG_POSITION(src2->vr);
       if (pos <= max_tmp_pos)
         def2 = vreg_def[pos];
     }
@@ -4451,8 +4562,8 @@ int tcc_ir_bool_simplification(TCCIRState *ir)
     if (def1 < 0 || def2 < 0)
       continue;
 
-    TACQuadruple *q1 = &ir->instructions[def1];
-    TACQuadruple *q2 = &ir->instructions[def2];
+    IRQuadCompact *q1 = &ir->compact_instructions[def1];
+    IRQuadCompact *q2 = &ir->compact_instructions[def2];
 
     /* For BOOL_AND, both inputs should be BOOL_OR (and vice versa) */
     TccIrOp expected_inner = (q->op == TCCIR_OP_BOOL_AND) ? TCCIR_OP_BOOL_OR : TCCIR_OP_BOOL_AND;
@@ -4460,7 +4571,7 @@ int tcc_ir_bool_simplification(TCCIRState *ir)
     if (q1->op != expected_inner || q2->op != expected_inner)
       continue;
 
-    if (!same_bool_operands(q1, q2))
+    if (!same_bool_operands(ir, q1, q2))
       continue;
 
     /* Pattern matched!
@@ -4476,11 +4587,14 @@ int tcc_ir_bool_simplification(TCCIRState *ir)
 #endif
     /* Replace outer op with ASSIGN from first inner op result */
     q->op = TCCIR_OP_ASSIGN;
-    q->src1 = q1->dest; /* Copy the result of first BOOL_OR/BOOL_AND */
-    memset(&q->src2, 0, sizeof(q->src2));
+    *src1 = *tcc_ir_op_get_dest(ir, q1); /* Copy the result of first BOOL_OR/BOOL_AND */
+    memset(src2, 0, sizeof(SValue));
+    src2->vr = -1;
 
     /* The second inner op will be eliminated by DCE if unused */
     changes++;
+
+    tcc_ir_writeback_compact(ir, i);
   }
 
   tcc_free(vreg_def);
@@ -4511,7 +4625,7 @@ int tcc_ir_constant_propagation(TCCIRState *ir)
   int changes = 0;
   int max_var_pos = 0;
   int i;
-  TACQuadruple *q;
+  IRQuadCompact *q;
   VarConstInfo *var_info;
 
   if (n == 0)
@@ -4520,10 +4634,13 @@ int tcc_ir_constant_propagation(TCCIRState *ir)
   /* Track which VAR vregs are constant (assigned exactly once with a constant value) */
   for (i = 0; i < n; i++)
   {
-    q = &ir->instructions[i];
-    if (irop_config[q->op].has_dest && TCCIR_DECODE_VREG_TYPE(q->dest.vr) == TCCIR_VREG_TYPE_VAR)
+    q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    const SValue *dest = tcc_ir_op_get_dest(ir, q);
+    if (irop_config[q->op].has_dest && TCCIR_DECODE_VREG_TYPE(dest->vr) == TCCIR_VREG_TYPE_VAR)
     {
-      int pos = TCCIR_DECODE_VREG_POSITION(q->dest.vr);
+      const int pos = TCCIR_DECODE_VREG_POSITION(dest->vr);
       if (pos > max_var_pos)
         max_var_pos = pos;
     }
@@ -4537,19 +4654,23 @@ int tcc_ir_constant_propagation(TCCIRState *ir)
   /* First pass: identify constant variables */
   for (i = 0; i < n; i++)
   {
-    TACQuadruple *q = &ir->instructions[i];
+    IRQuadCompact *q = &ir->compact_instructions[i];
+
+    if (q->op == TCCIR_OP_NOP)
+      continue;
 
     /* Track definitions of VAR vregs */
-    if (irop_config[q->op].has_dest && TCCIR_DECODE_VREG_TYPE(q->dest.vr) == TCCIR_VREG_TYPE_VAR)
+    const SValue *dest = tcc_ir_op_get_dest(ir, q);
+    if (irop_config[q->op].has_dest && TCCIR_DECODE_VREG_TYPE(dest->vr) == TCCIR_VREG_TYPE_VAR)
     {
-      int pos = TCCIR_DECODE_VREG_POSITION(q->dest.vr);
+      const int pos = TCCIR_DECODE_VREG_POSITION(dest->vr);
       if (pos <= max_var_pos)
       {
         /* If the address of a local is taken, it can be modified through aliases
          * (e.g. passed as an out-parameter). Such variables are not safe for
          * constant propagation even if they are only assigned once.
          */
-        IRLiveInterval *interval = tcc_ir_get_live_interval(ir, q->dest.vr);
+        IRLiveInterval *interval = tcc_ir_get_live_interval(ir, dest->vr);
         if (interval && interval->addrtaken)
         {
           var_info[pos].def_count++;
@@ -4560,12 +4681,13 @@ int tcc_ir_constant_propagation(TCCIRState *ir)
         var_info[pos].def_count++;
 
         /* Check if this is a constant assignment */
-        if (q->op == TCCIR_OP_ASSIGN && (q->src1.r & VT_VALMASK) == VT_CONST && !(q->src1.r & VT_SYM))
+        const SValue *src1 = tcc_ir_op_get_src1(ir, q);
+        if (q->op == TCCIR_OP_ASSIGN && (src1->r & VT_VALMASK) == VT_CONST && !(src1->r & VT_SYM))
         {
           if (var_info[pos].def_count == 1)
           {
             var_info[pos].is_constant = 1;
-            var_info[pos].value = q->src1.c.i;
+            var_info[pos].value = src1->c.i;
           }
         }
         else
@@ -4592,31 +4714,38 @@ int tcc_ir_constant_propagation(TCCIRState *ir)
     int can_fold;
     int skip_bool_prop;
 
-    q = &ir->instructions[i];
+    q = &ir->compact_instructions[i];
+
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+
+    int modified = 0;
 
     /* For BOOL_AND/BOOL_OR, don't propagate constants unless both become constants.
      * The code generator can't handle mixed const/reg operands for these ops. */
     skip_bool_prop = 0;
+    SValue *src1 = tcc_ir_op_get_src1(ir, q);
+    SValue *src2 = tcc_ir_op_get_src2(ir, q);
     if (q->op == TCCIR_OP_BOOL_AND || q->op == TCCIR_OP_BOOL_OR)
     {
       int src1_can_be_const = 0, src2_can_be_const = 0;
       /* Check if both would become constants */
-      if (TCCIR_DECODE_VREG_TYPE(q->src1.vr) == TCCIR_VREG_TYPE_VAR)
+      if (TCCIR_DECODE_VREG_TYPE(src1->vr) == TCCIR_VREG_TYPE_VAR)
       {
-        int pos = TCCIR_DECODE_VREG_POSITION(q->src1.vr);
+        int pos = TCCIR_DECODE_VREG_POSITION(src1->vr);
         if (pos <= max_var_pos && var_info[pos].is_constant)
           src1_can_be_const = 1;
       }
-      else if ((q->src1.r & VT_VALMASK) == VT_CONST && !(q->src1.r & VT_SYM))
+      else if ((src1->r & VT_VALMASK) == VT_CONST && !(src1->r & VT_SYM))
         src1_can_be_const = 1;
 
-      if (TCCIR_DECODE_VREG_TYPE(q->src2.vr) == TCCIR_VREG_TYPE_VAR)
+      if (TCCIR_DECODE_VREG_TYPE(src2->vr) == TCCIR_VREG_TYPE_VAR)
       {
-        int pos = TCCIR_DECODE_VREG_POSITION(q->src2.vr);
+        int pos = TCCIR_DECODE_VREG_POSITION(src2->vr);
         if (pos <= max_var_pos && var_info[pos].is_constant)
           src2_can_be_const = 1;
       }
-      else if ((q->src2.r & VT_VALMASK) == VT_CONST && !(q->src2.r & VT_SYM))
+      else if ((src2->r & VT_VALMASK) == VT_CONST && !(src2->r & VT_SYM))
         src2_can_be_const = 1;
 
       /* Skip propagation if only ONE would become constant (can't generate code) */
@@ -4627,35 +4756,37 @@ int tcc_ir_constant_propagation(TCCIRState *ir)
     /* Propagate constant VAR vregs to immediate values.
      * IMPORTANT: Don't propagate if src1 is VT_LOCAL without VT_LVAL - that means
      * "address of local variable", not its value. The address must be computed at runtime. */
-    if (!skip_bool_prop && irop_config[q->op].has_src1 && TCCIR_DECODE_VREG_TYPE(q->src1.vr) == TCCIR_VREG_TYPE_VAR &&
-        !((q->src1.r & VT_VALMASK) == VT_LOCAL && !(q->src1.r & VT_LVAL)))
+    if (!skip_bool_prop && irop_config[q->op].has_src1 && TCCIR_DECODE_VREG_TYPE(src1->vr) == TCCIR_VREG_TYPE_VAR &&
+        !((src1->r & VT_VALMASK) == VT_LOCAL && !(src1->r & VT_LVAL)))
     {
-      int pos = TCCIR_DECODE_VREG_POSITION(q->src1.vr);
+      const int pos = TCCIR_DECODE_VREG_POSITION(src1->vr);
       if (pos <= max_var_pos && var_info[pos].is_constant)
       {
-        q->src1.r = VT_CONST;
-        q->src1.c.i = var_info[pos].value;
-        q->src1.vr = -1;
+        src1->r = VT_CONST;
+        src1->c.i = var_info[pos].value;
+        src1->vr = -1;
         changes++;
+        modified = 1;
       }
     }
 
-    if (!skip_bool_prop && irop_config[q->op].has_src2 && TCCIR_DECODE_VREG_TYPE(q->src2.vr) == TCCIR_VREG_TYPE_VAR &&
-        !((q->src2.r & VT_VALMASK) == VT_LOCAL && !(q->src2.r & VT_LVAL)))
+    if (!skip_bool_prop && irop_config[q->op].has_src2 && TCCIR_DECODE_VREG_TYPE(src2->vr) == TCCIR_VREG_TYPE_VAR &&
+        !((src2->r & VT_VALMASK) == VT_LOCAL && !(src2->r & VT_LVAL)))
     {
-      int pos = TCCIR_DECODE_VREG_POSITION(q->src2.vr);
+      const int pos = TCCIR_DECODE_VREG_POSITION(src2->vr);
       if (pos <= max_var_pos && var_info[pos].is_constant)
       {
-        q->src2.r = VT_CONST;
-        q->src2.c.i = var_info[pos].value;
-        q->src2.vr = -1;
+        src2->r = VT_CONST;
+        src2->c.i = var_info[pos].value;
+        src2->vr = -1;
         changes++;
+        modified = 1;
       }
     }
 
     /* Algebraic simplifications */
-    src1_is_const = (q->src1.r & VT_VALMASK) == VT_CONST && !(q->src1.r & VT_SYM);
-    src2_is_const = (q->src2.r & VT_VALMASK) == VT_CONST && !(q->src2.r & VT_SYM);
+    src1_is_const = irop_config[q->op].has_src1 ? (src1->r & VT_VALMASK) == VT_CONST && !(src1->r & VT_SYM) : 0;
+    src2_is_const = irop_config[q->op].has_src2 ? (src2->r & VT_VALMASK) == VT_CONST && !(src2->r & VT_SYM) : 0;
 
     /* For commutative operations, if src1 is const and src2 is not, swap them.
      * This ensures constants end up in src2 where the code generator expects them.
@@ -4682,12 +4813,13 @@ int tcc_ir_constant_propagation(TCCIRState *ir)
 #ifdef DEBUG_IR_GEN
         printf("OPTIMIZE: Swap operands for commutative %s (const in src1) at i=%d\n", tcc_ir_get_op_name(q->op), i);
 #endif
-        tmp = q->src1;
-        q->src1 = q->src2;
-        q->src2 = tmp;
+        tmp = *src1;
+        *src1 = *src2;
+        *src2 = tmp;
         /* Update flags after swap */
         src1_is_const = 0;
         src2_is_const = 1;
+        modified = 1;
       }
     }
 
@@ -4700,37 +4832,37 @@ int tcc_ir_constant_propagation(TCCIRState *ir)
       switch (q->op)
       {
       case TCCIR_OP_ADD:
-        result = q->src1.c.i + q->src2.c.i;
+        result = src1->c.i + src2->c.i;
         break;
       case TCCIR_OP_SUB:
-        result = q->src1.c.i - q->src2.c.i;
+        result = src1->c.i - src2->c.i;
         break;
       case TCCIR_OP_MUL:
-        result = q->src1.c.i * q->src2.c.i;
+        result = src1->c.i * src2->c.i;
         break;
       case TCCIR_OP_AND:
-        result = q->src1.c.i & q->src2.c.i;
+        result = src1->c.i & src2->c.i;
         break;
       case TCCIR_OP_OR:
-        result = q->src1.c.i | q->src2.c.i;
+        result = src1->c.i | src2->c.i;
         break;
       case TCCIR_OP_XOR:
-        result = q->src1.c.i ^ q->src2.c.i;
+        result = src1->c.i ^ src2->c.i;
         break;
       case TCCIR_OP_SHL:
-        result = q->src1.c.i << q->src2.c.i;
+        result = src1->c.i << src2->c.i;
         break;
       case TCCIR_OP_SHR:
-        result = (uint64_t)q->src1.c.i >> q->src2.c.i;
+        result = (uint64_t)src1->c.i >> src2->c.i;
         break;
       case TCCIR_OP_SAR:
-        result = q->src1.c.i >> q->src2.c.i;
+        result = src1->c.i >> src2->c.i;
         break;
       case TCCIR_OP_BOOL_AND:
-        result = (q->src1.c.i != 0) && (q->src2.c.i != 0) ? 1 : 0;
+        result = (src1->c.i != 0) && (src2->c.i != 0) ? 1 : 0;
         break;
       case TCCIR_OP_BOOL_OR:
-        result = (q->src1.c.i != 0) || (q->src2.c.i != 0) ? 1 : 0;
+        result = (src1->c.i != 0) || (src2->c.i != 0) ? 1 : 0;
         break;
       default:
         can_fold = 0;
@@ -4744,12 +4876,15 @@ int tcc_ir_constant_propagation(TCCIRState *ir)
                (long long)q->src1.c.i, (long long)q->src2.c.i, (long long)result, i);
 #endif
         q->op = TCCIR_OP_ASSIGN;
-        q->src1.r = VT_CONST;
-        q->src1.c.i = result;
-        q->src1.vr = -1;
-        memset(&q->src2, 0, sizeof(q->src2));
-        q->src2.vr = -1;
+        src1->r = VT_CONST;
+        src1->c.i = result;
+        src1->vr = -1;
+        memset(src2, 0, sizeof(*src2));
+        src2->vr = -1;
         changes++;
+        modified = 1;
+
+        tcc_ir_writeback_compact(ir, i);
         continue;
       }
     }
@@ -4763,7 +4898,7 @@ int tcc_ir_constant_propagation(TCCIRState *ir)
       int replace_with_const;
       int64_t const_value;
 
-      c = q->src2.c.i;
+      c = src2->c.i;
       simplify = 0;
       replace_with_zero = 0;
       replace_with_const = 0;
@@ -4819,9 +4954,10 @@ int tcc_ir_constant_propagation(TCCIRState *ir)
 #endif
         q->op = TCCIR_OP_ASSIGN;
         /* src1 stays as-is, clear src2 */
-        memset(&q->src2, 0, sizeof(q->src2));
-        q->src2.vr = -1;
+        memset(src2, 0, sizeof(*src2));
+        src2->vr = -1;
         changes++;
+        modified = 1;
       }
       else if (replace_with_zero)
       {
@@ -4829,12 +4965,13 @@ int tcc_ir_constant_propagation(TCCIRState *ir)
         printf("OPTIMIZE: Algebraic simplify %s(x, %lld) = 0 at i=%d\n", tcc_ir_get_op_name(q->op), (long long)c, i);
 #endif
         q->op = TCCIR_OP_ASSIGN;
-        q->src1.r = VT_CONST;
-        q->src1.c.i = 0;
-        q->src1.vr = -1;
-        memset(&q->src2, 0, sizeof(q->src2));
-        q->src2.vr = -1;
+        src1->r = VT_CONST;
+        src1->c.i = 0;
+        src1->vr = -1;
+        memset(src2, 0, sizeof(*src2));
+        src2->vr = -1;
         changes++;
+        modified = 1;
       }
       else if (replace_with_const)
       {
@@ -4843,21 +4980,20 @@ int tcc_ir_constant_propagation(TCCIRState *ir)
                (long long)const_value, i);
 #endif
         q->op = TCCIR_OP_ASSIGN;
-        q->src1.r = VT_CONST;
-        q->src1.c.i = const_value;
-        q->src1.vr = -1;
-        memset(&q->src2, 0, sizeof(q->src2));
-        q->src2.vr = -1;
+        src1->r = VT_CONST;
+        src1->c.i = const_value;
+        src1->vr = -1;
+        memset(src2, 0, sizeof(*src2));
+        src2->vr = -1;
         changes++;
+        modified = 1;
       }
     }
 
     /* Handle commutative operations: 0 + X = X, 0 << X = 0 */
     if (irop_config[q->op].has_src1 && src1_is_const)
     {
-      int64_t c;
-
-      c = q->src1.c.i;
+      const int64_t c = src1->c.i;
 
       switch (q->op)
       {
@@ -4870,10 +5006,11 @@ int tcc_ir_constant_propagation(TCCIRState *ir)
           printf("OPTIMIZE: Algebraic simplify %s(0, x) = x at i=%d\n", tcc_ir_get_op_name(q->op), i);
 #endif
           q->op = TCCIR_OP_ASSIGN;
-          q->src1 = q->src2;
-          memset(&q->src2, 0, sizeof(q->src2));
-          q->src2.vr = -1;
+          *src1 = *src2;
+          memset(src2, 0, sizeof(*src2));
+          src2->vr = -1;
           changes++;
+          modified = 1;
         }
         break;
       case TCCIR_OP_MUL:
@@ -4885,9 +5022,10 @@ int tcc_ir_constant_propagation(TCCIRState *ir)
 #endif
           q->op = TCCIR_OP_ASSIGN;
           /* src1 is already 0 */
-          memset(&q->src2, 0, sizeof(q->src2));
-          q->src2.vr = -1;
+          memset(src2, 0, sizeof(*src2));
+          src2->vr = -1;
           changes++;
+          modified = 1;
         }
         break;
       case TCCIR_OP_SHL:
@@ -4901,22 +5039,25 @@ int tcc_ir_constant_propagation(TCCIRState *ir)
 #endif
           q->op = TCCIR_OP_ASSIGN;
           /* src1 is already 0 */
-          memset(&q->src2, 0, sizeof(q->src2));
-          q->src2.vr = -1;
+          memset(src2, 0, sizeof(*src2));
+          src2->vr = -1;
           changes++;
+          modified = 1;
         }
         break;
       default:
         break;
       }
     }
+
+    tcc_ir_writeback_compact(ir, i);
   }
 
   /* Third pass: Fold CMP+SETIF patterns when CMP has constant operands */
   for (i = 0; i < n - 1; i++)
   {
-    TACQuadruple *cmp_q = &ir->instructions[i];
-    TACQuadruple *setif_q = &ir->instructions[i + 1];
+    IRQuadCompact *cmp_q = &ir->compact_instructions[i];
+    IRQuadCompact *setif_q = &ir->compact_instructions[i + 1];
     int cmp_src1_const, cmp_src2_const;
     int64_t val1, val2;
     int cond, result;
@@ -4926,15 +5067,18 @@ int tcc_ir_constant_propagation(TCCIRState *ir)
     if (setif_q->op != TCCIR_OP_SETIF)
       continue;
 
-    cmp_src1_const = (cmp_q->src1.r & VT_VALMASK) == VT_CONST && !(cmp_q->src1.r & VT_SYM);
-    cmp_src2_const = (cmp_q->src2.r & VT_VALMASK) == VT_CONST && !(cmp_q->src2.r & VT_SYM);
+    const SValue *src1 = tcc_ir_op_get_src1(ir, cmp_q);
+    const SValue *src2 = tcc_ir_op_get_src2(ir, cmp_q);
+    cmp_src1_const = (src1->r & VT_VALMASK) == VT_CONST && !(src1->r & VT_SYM);
+    cmp_src2_const = (src2->r & VT_VALMASK) == VT_CONST && !(src2->r & VT_SYM);
 
     if (!cmp_src1_const || !cmp_src2_const)
       continue;
 
-    val1 = cmp_q->src1.c.i;
-    val2 = cmp_q->src2.c.i;
-    cond = setif_q->src1.c.i; /* Condition code stored in src1.c.i (TCC token) */
+    val1 = src1->c.i;
+    val2 = src2->c.i;
+    SValue *setif_src1 = tcc_ir_op_get_src1(ir, setif_q);
+    cond = setif_src1->c.i; /* Condition code stored in src1.c.i (TCC token) */
 
     /* Evaluate the comparison based on TCC token values */
     result = 0;
@@ -4983,12 +5127,20 @@ int tcc_ir_constant_propagation(TCCIRState *ir)
     /* Convert CMP to NOP and SETIF to ASSIGN with constant result.
      * Dead store elimination will remove the NOP. */
     cmp_q->op = TCCIR_OP_NOP;
+    ir->compact_instructions[i].op = TCCIR_OP_NOP;
     setif_q->op = TCCIR_OP_ASSIGN;
-    setif_q->src1.r = VT_CONST;
-    setif_q->src1.c.i = result;
-    setif_q->src1.vr = -1;
-    memset(&setif_q->src2, 0, sizeof(setif_q->src2));
-    setif_q->src2.vr = -1;
+    ir->compact_instructions[i + 1].op = TCCIR_OP_ASSIGN;
+    setif_src1->r = VT_CONST;
+    setif_src1->c.i = result;
+    setif_src1->vr = -1;
+    SValue *setif_src2 = tcc_ir_op_get_src2(ir, setif_q);
+    if (setif_src2)
+    {
+      memset(setif_src2, 0, sizeof(*setif_src2));
+      setif_src2->vr = -1;
+    }
+    tcc_ir_writeback_compact(ir, i);
+    tcc_ir_writeback_compact(ir, i + 1);
     changes++;
   }
 
@@ -5023,7 +5175,7 @@ int tcc_ir_tmp_constant_propagation(TCCIRState *ir)
   int max_tmp_pos = 0;
   int current_gen = 1; /* Generation counter, 0 means invalid */
   int i;
-  TACQuadruple *q;
+  IRQuadCompact *q;
   TmpConstInfo *tmp_info;
   int *block_start_seen;
   int block_start_gen = 1;
@@ -5035,10 +5187,11 @@ int tcc_ir_tmp_constant_propagation(TCCIRState *ir)
   /* Find max TMP position */
   for (i = 0; i < n; i++)
   {
-    q = &ir->instructions[i];
-    if (irop_config[q->op].has_dest && TCCIR_DECODE_VREG_TYPE(q->dest.vr) == TCCIR_VREG_TYPE_TEMP)
+    q = &ir->compact_instructions[i];
+    const SValue *dest = tcc_ir_op_get_dest(ir, q);
+    if (irop_config[q->op].has_dest && TCCIR_DECODE_VREG_TYPE(dest->vr) == TCCIR_VREG_TYPE_TEMP)
     {
-      int pos = TCCIR_DECODE_VREG_POSITION(q->dest.vr);
+      const int pos = TCCIR_DECODE_VREG_POSITION(dest->vr);
       if (pos > max_tmp_pos)
         max_tmp_pos = pos;
     }
@@ -5068,10 +5221,11 @@ int tcc_ir_tmp_constant_propagation(TCCIRState *ir)
   block_start_seen[0] = block_start_gen;
   for (i = 0; i < n; i++)
   {
-    q = &ir->instructions[i];
+    q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
     {
-      int tgt = q->dest.c.i;
+      const SValue *dest = tcc_ir_op_get_dest(ir, q);
+      const int tgt = dest->c.i;
       if (tgt >= 0 && tgt < n)
         block_start_seen[tgt] = block_start_gen;
     }
@@ -5080,7 +5234,7 @@ int tcc_ir_tmp_constant_propagation(TCCIRState *ir)
   /* Single pass: track TMP constants and propagate */
   for (i = 0; i < n; i++)
   {
-    q = &ir->instructions[i];
+    q = &ir->compact_instructions[i];
 
     /* Clear at basic block entry (jump targets) - O(1) via generation bump */
     if (i != 0 && block_start_seen[i] == block_start_gen)
@@ -5088,35 +5242,46 @@ int tcc_ir_tmp_constant_propagation(TCCIRState *ir)
       current_gen++;
     }
 
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+
+    int modified = 0;
+    SValue *src1 = tcc_ir_op_get_src1(ir, q);
+
     /* Propagate TMP constants to src1 */
-    if (irop_config[q->op].has_src1 && TCCIR_DECODE_VREG_TYPE(q->src1.vr) == TCCIR_VREG_TYPE_TEMP)
+    if (irop_config[q->op].has_src1 && TCCIR_DECODE_VREG_TYPE(src1->vr) == TCCIR_VREG_TYPE_TEMP)
     {
-      int pos = TCCIR_DECODE_VREG_POSITION(q->src1.vr);
+      const int pos = TCCIR_DECODE_VREG_POSITION(src1->vr);
       if (pos <= max_tmp_pos && tmp_info[pos].gen == current_gen)
       {
 #ifdef DEBUG_IR_GEN
         printf("OPTIMIZE: TMP const propagate TMP:%d = %lld to src1 at i=%d\n", pos, (long long)tmp_info[pos].value, i);
 #endif
-        q->src1.r = VT_CONST;
-        q->src1.c.i = tmp_info[pos].value;
-        q->src1.vr = -1;
+        src1->r = VT_CONST;
+        src1->c.i = tmp_info[pos].value;
+        src1->vr = -1;
+        tcc_ir_writeback_compact(ir, i);
         changes++;
+        modified = 1;
       }
     }
 
+    SValue *src2 = tcc_ir_op_get_src2(ir, q);
     /* Propagate TMP constants to src2 */
-    if (irop_config[q->op].has_src2 && TCCIR_DECODE_VREG_TYPE(q->src2.vr) == TCCIR_VREG_TYPE_TEMP)
+    if (irop_config[q->op].has_src2 && TCCIR_DECODE_VREG_TYPE(src2->vr) == TCCIR_VREG_TYPE_TEMP)
     {
-      int pos = TCCIR_DECODE_VREG_POSITION(q->src2.vr);
+      const int pos = TCCIR_DECODE_VREG_POSITION(src2->vr);
       if (pos <= max_tmp_pos && tmp_info[pos].gen == current_gen)
       {
 #ifdef DEBUG_IR_GEN
         printf("OPTIMIZE: TMP const propagate TMP:%d = %lld to src2 at i=%d\n", pos, (long long)tmp_info[pos].value, i);
 #endif
-        q->src2.r = VT_CONST;
-        q->src2.c.i = tmp_info[pos].value;
-        q->src2.vr = -1;
+        src2->r = VT_CONST;
+        src2->c.i = tmp_info[pos].value;
+        src2->vr = -1;
         changes++;
+        modified = 1;
+        tcc_ir_writeback_compact(ir, i);
       }
     }
 
@@ -5127,18 +5292,19 @@ int tcc_ir_tmp_constant_propagation(TCCIRState *ir)
       current_gen++;
     }
 
+    SValue *dest = tcc_ir_op_get_dest(ir, q);
     /* Track TMP <- constant assignments */
     if (q->op == TCCIR_OP_ASSIGN && irop_config[q->op].has_dest &&
-        TCCIR_DECODE_VREG_TYPE(q->dest.vr) == TCCIR_VREG_TYPE_TEMP)
+        TCCIR_DECODE_VREG_TYPE(dest->vr) == TCCIR_VREG_TYPE_TEMP)
     {
-      int pos = TCCIR_DECODE_VREG_POSITION(q->dest.vr);
+      int pos = TCCIR_DECODE_VREG_POSITION(dest->vr);
       if (pos <= max_tmp_pos)
       {
-        int src_is_const = (q->src1.r & VT_VALMASK) == VT_CONST && !(q->src1.r & VT_SYM);
+        int src_is_const = (src1->r & VT_VALMASK) == VT_CONST && !(src1->r & VT_SYM);
         if (src_is_const)
         {
           tmp_info[pos].gen = current_gen;
-          tmp_info[pos].value = q->src1.c.i;
+          tmp_info[pos].value = src1->c.i;
 #ifdef DEBUG_IR_GEN
           printf("TMP_CONST: Record TMP:%d = %lld at i=%d\n", pos, (long long)q->src1.c.i, i);
 #endif
@@ -5149,10 +5315,10 @@ int tcc_ir_tmp_constant_propagation(TCCIRState *ir)
         }
       }
     }
-    else if (irop_config[q->op].has_dest && TCCIR_DECODE_VREG_TYPE(q->dest.vr) == TCCIR_VREG_TYPE_TEMP)
+    else if (irop_config[q->op].has_dest && TCCIR_DECODE_VREG_TYPE(dest->vr) == TCCIR_VREG_TYPE_TEMP)
     {
       /* TMP is defined by non-ASSIGN instruction */
-      int pos = TCCIR_DECODE_VREG_POSITION(q->dest.vr);
+      const int pos = TCCIR_DECODE_VREG_POSITION(dest->vr);
       if (pos <= max_tmp_pos)
         tmp_info[pos].gen = 0;
     }
@@ -5215,7 +5381,7 @@ int tcc_ir_copy_propagation(TCCIRState *ir)
   int current_gen = 1;   /* Generation counter, starts at 1 (0 means invalid) */
   int active_copies = 0; /* Number of active TMP copies in current_gen */
   int i;
-  TACQuadruple *q;
+  IRQuadCompact *q;
   CopyInfo *copy_info;
   SourceInfo *var_sources;
   SourceInfo *param_sources;
@@ -5230,11 +5396,14 @@ int tcc_ir_copy_propagation(TCCIRState *ir)
   /* Find max positions for TMP, VAR, and PARAM in a single pass */
   for (i = 0; i < n; i++)
   {
-    q = &ir->instructions[i];
+    q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
     if (irop_config[q->op].has_dest)
     {
-      int vr_type = TCCIR_DECODE_VREG_TYPE(q->dest.vr);
-      int pos = TCCIR_DECODE_VREG_POSITION(q->dest.vr);
+      const SValue *dest = tcc_ir_op_get_dest(ir, q);
+      const int vr_type = TCCIR_DECODE_VREG_TYPE(dest->vr);
+      const int pos = TCCIR_DECODE_VREG_POSITION(dest->vr);
       if (vr_type == TCCIR_VREG_TYPE_TEMP && pos > max_tmp_pos)
         max_tmp_pos = pos;
       else if (vr_type == TCCIR_VREG_TYPE_VAR && pos > max_var_pos)
@@ -5244,8 +5413,9 @@ int tcc_ir_copy_propagation(TCCIRState *ir)
     }
     if (irop_config[q->op].has_src1)
     {
-      int vr_type = TCCIR_DECODE_VREG_TYPE(q->src1.vr);
-      int pos = TCCIR_DECODE_VREG_POSITION(q->src1.vr);
+      const SValue *src1 = tcc_ir_op_get_src1(ir, q);
+      const int vr_type = TCCIR_DECODE_VREG_TYPE(src1->vr);
+      const int pos = TCCIR_DECODE_VREG_POSITION(src1->vr);
       if (vr_type == TCCIR_VREG_TYPE_VAR && pos > max_var_pos)
         max_var_pos = pos;
       else if (vr_type == TCCIR_VREG_TYPE_PARAM && pos > max_param_pos)
@@ -5253,8 +5423,9 @@ int tcc_ir_copy_propagation(TCCIRState *ir)
     }
     if (irop_config[q->op].has_src2)
     {
-      int vr_type = TCCIR_DECODE_VREG_TYPE(q->src2.vr);
-      int pos = TCCIR_DECODE_VREG_POSITION(q->src2.vr);
+      const SValue *src2 = tcc_ir_op_get_src2(ir, q);
+      const int vr_type = TCCIR_DECODE_VREG_TYPE(src2->vr);
+      const int pos = TCCIR_DECODE_VREG_POSITION(src2->vr);
       if (vr_type == TCCIR_VREG_TYPE_VAR && pos > max_var_pos)
         max_var_pos = pos;
       else if (vr_type == TCCIR_VREG_TYPE_PARAM && pos > max_param_pos)
@@ -5300,10 +5471,10 @@ int tcc_ir_copy_propagation(TCCIRState *ir)
    * This is still O(n) but avoids separate allocation for block_start bitmap. */
   for (i = 0; i < n; i++)
   {
-    q = &ir->instructions[i];
+    q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
     {
-      int tgt = q->dest.c.i;
+      const int tgt = tcc_ir_op_get_dest(ir, q)->c.i;
       if (tgt >= 0 && tgt < n)
         block_start_seen[tgt] = block_start_gen;
     }
@@ -5312,7 +5483,7 @@ int tcc_ir_copy_propagation(TCCIRState *ir)
   /* Single pass: process instructions in order, tracking and propagating copies */
   for (i = 0; i < n; i++)
   {
-    q = &ir->instructions[i];
+    q = &ir->compact_instructions[i];
 
     /* At block boundaries, invalidate all copies by incrementing generation */
     if (i != 0 && block_start_seen[i] == block_start_gen)
@@ -5320,6 +5491,11 @@ int tcc_ir_copy_propagation(TCCIRState *ir)
       current_gen++;
       active_copies = 0;
     }
+
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+
+    int modified = 0;
 
     /* Propagate copies to uses in this instruction.
      * Important: We DON'T propagate if the use has VT_LVAL because:
@@ -5329,33 +5505,37 @@ int tcc_ir_copy_propagation(TCCIRState *ir)
      * then adding another LVAL would mean double-dereference, which is wrong.
      * Only propagate to non-LVAL uses where we just need the pointer value.
      */
-    if (active_copies > 0 && irop_config[q->op].has_src1 && TCCIR_DECODE_VREG_TYPE(q->src1.vr) == TCCIR_VREG_TYPE_TEMP)
+    SValue *src1 = tcc_ir_op_get_src1(ir, q);
+    if (active_copies > 0 && irop_config[q->op].has_src1 && TCCIR_DECODE_VREG_TYPE(src1->vr) == TCCIR_VREG_TYPE_TEMP)
     {
-      int pos = TCCIR_DECODE_VREG_POSITION(q->src1.vr);
-      int has_lval = q->src1.r & VT_LVAL;
+      const int pos = TCCIR_DECODE_VREG_POSITION(src1->vr);
+      const int has_lval = src1->r & VT_LVAL;
       if (pos <= max_tmp_pos && copy_info[pos].gen == current_gen && !has_lval)
       {
 #ifdef DEBUG_IR_GEN
         printf("OPTIMIZE: Copy propagate TMP:%d -> vreg:%d at i=%d\n", pos,
                TCCIR_DECODE_VREG_POSITION(copy_info[pos].source_vr), i);
 #endif
-        q->src1 = copy_info[pos].source;
+        *src1 = copy_info[pos].source;
         changes++;
+        modified = 1;
       }
     }
 
-    if (active_copies > 0 && irop_config[q->op].has_src2 && TCCIR_DECODE_VREG_TYPE(q->src2.vr) == TCCIR_VREG_TYPE_TEMP)
+    SValue *src2 = tcc_ir_op_get_src2(ir, q);
+    if (active_copies > 0 && irop_config[q->op].has_src2 && TCCIR_DECODE_VREG_TYPE(src2->vr) == TCCIR_VREG_TYPE_TEMP)
     {
-      int pos = TCCIR_DECODE_VREG_POSITION(q->src2.vr);
-      int has_lval = q->src2.r & VT_LVAL;
+      const int pos = TCCIR_DECODE_VREG_POSITION(src2->vr);
+      const int has_lval = src2->r & VT_LVAL;
       if (pos <= max_tmp_pos && copy_info[pos].gen == current_gen && !has_lval)
       {
 #ifdef DEBUG_IR_GEN
         printf("OPTIMIZE: Copy propagate TMP:%d -> vreg:%d at i=%d\n", pos,
                TCCIR_DECODE_VREG_POSITION(copy_info[pos].source_vr), i);
 #endif
-        q->src2 = copy_info[pos].source;
+        *src2 = copy_info[pos].source;
         changes++;
+        modified = 1;
       }
     }
 
@@ -5363,10 +5543,11 @@ int tcc_ir_copy_propagation(TCCIRState *ir)
      * Uses per-source reverse list to avoid scanning all TMPs. */
     if (active_copies > 0 && irop_config[q->op].has_dest)
     {
-      int dest_type = TCCIR_DECODE_VREG_TYPE(q->dest.vr);
+      const SValue *dest = tcc_ir_op_get_dest(ir, q);
+      const int dest_type = TCCIR_DECODE_VREG_TYPE(dest->vr);
       if (dest_type == TCCIR_VREG_TYPE_VAR || dest_type == TCCIR_VREG_TYPE_PARAM)
       {
-        int dest_vr = q->dest.vr;
+        const int dest_vr = dest->vr;
         int dest_pos = TCCIR_DECODE_VREG_POSITION(dest_vr);
         SourceInfo *src_info = NULL;
         if (dest_type == TCCIR_VREG_TYPE_VAR && dest_pos <= max_var_pos)
@@ -5406,21 +5587,22 @@ int tcc_ir_copy_propagation(TCCIRState *ir)
     }
 
     /* If this is a copy (ASSIGN TMP <- VAR/PAR), record it */
+    SValue *dest = tcc_ir_op_get_dest(ir, q);
     if (q->op == TCCIR_OP_ASSIGN && irop_config[q->op].has_dest &&
-        TCCIR_DECODE_VREG_TYPE(q->dest.vr) == TCCIR_VREG_TYPE_TEMP)
+        TCCIR_DECODE_VREG_TYPE(dest->vr) == TCCIR_VREG_TYPE_TEMP)
     {
-      int pos = TCCIR_DECODE_VREG_POSITION(q->dest.vr);
+      const int pos = TCCIR_DECODE_VREG_POSITION(dest->vr);
       if (pos <= max_tmp_pos)
       {
-        int src_valmask = q->src1.r & VT_VALMASK;
+        const int src_valmask = src1->r & VT_VALMASK;
         int src_is_const = src_valmask == VT_CONST;
-        int src_vreg_type = TCCIR_DECODE_VREG_TYPE(q->src1.vr);
+        int src_vreg_type = TCCIR_DECODE_VREG_TYPE(src1->vr);
 
         /* Only allow propagation if source is VAR or PAR (not TMP, not constant) */
-        if (!src_is_const && q->src1.vr >= 0 &&
+        if (!src_is_const && src1->vr >= 0 &&
             (src_vreg_type == TCCIR_VREG_TYPE_VAR || src_vreg_type == TCCIR_VREG_TYPE_PARAM))
         {
-          int src_pos = TCCIR_DECODE_VREG_POSITION(q->src1.vr);
+          int src_pos = TCCIR_DECODE_VREG_POSITION(src1->vr);
           SourceInfo *src_info = NULL;
 
           if (src_vreg_type == TCCIR_VREG_TYPE_VAR && src_pos <= max_var_pos)
@@ -5442,8 +5624,8 @@ int tcc_ir_copy_propagation(TCCIRState *ir)
           if (copy_info[pos].gen != current_gen)
             active_copies++;
           copy_info[pos].gen = current_gen;
-          copy_info[pos].source_vr = q->src1.vr;
-          copy_info[pos].source = q->src1;
+          copy_info[pos].source_vr = src1->vr;
+          copy_info[pos].source = *src1;
 #ifdef DEBUG_IR_GEN
           printf("COPY_PROP: Record TMP:%d <- vreg:%d (type=%d) at i=%d\n", pos, TCCIR_DECODE_VREG_POSITION(q->src1.vr),
                  src_vreg_type, i);
@@ -5459,10 +5641,10 @@ int tcc_ir_copy_propagation(TCCIRState *ir)
         }
       }
     }
-    else if (irop_config[q->op].has_dest && TCCIR_DECODE_VREG_TYPE(q->dest.vr) == TCCIR_VREG_TYPE_TEMP)
+    else if (irop_config[q->op].has_dest && TCCIR_DECODE_VREG_TYPE(dest->vr) == TCCIR_VREG_TYPE_TEMP)
     {
       /* TMP is defined by a non-ASSIGN instruction - invalidate any copy for it */
-      int pos = TCCIR_DECODE_VREG_POSITION(q->dest.vr);
+      const int pos = TCCIR_DECODE_VREG_POSITION(dest->vr);
       if (pos <= max_tmp_pos)
       {
         if (copy_info[pos].gen == current_gen && active_copies > 0)
@@ -5471,6 +5653,8 @@ int tcc_ir_copy_propagation(TCCIRState *ir)
         copy_info[pos].next_same_source = -1;
       }
     }
+
+    tcc_ir_writeback_compact(ir, i);
   }
 
   if (heap_alloc)
@@ -5540,11 +5724,12 @@ int tcc_ir_store_load_forwarding(TCCIRState *ir)
     {
       /* LOAD: dest <- src1***DEREF***
        * src1 is the address to load from */
-      int addr_valmask = q->src1.r & VT_VALMASK;
-      int addr_is_local = (addr_valmask == VT_LOCAL);
-      int64_t addr_offset = q->src1.c.i;
-      Sym *addr_sym = q->src1.sym;
-      int addr_vr = q->src1.vr;
+      const SValue *src1 = tcc_ir_get_src1(ir, i);
+      const int addr_valmask = src1->r & VT_VALMASK;
+      const int addr_is_local = (addr_valmask == VT_LOCAL);
+      const int64_t addr_offset = src1->c.i;
+      const Sym *addr_sym = src1->sym;
+      const int addr_vr = src1->vr;
       uint32_t h;
       StoreEntry *e;
 
@@ -5650,8 +5835,9 @@ int tcc_ir_store_load_forwarding(TCCIRState *ir)
       new_entry->addr_vr = addr_vr;
       new_entry->local_offset = addr_offset;
       new_entry->local_sym = addr_sym;
-      new_entry->stored_value = q->src1;
-      new_entry->stored_value_vr = q->src1.vr;
+      const SValue *src1 = tcc_ir_get_src1(ir, i);
+      new_entry->stored_value = *src1;
+      new_entry->stored_value_vr = src1->vr;
       new_entry->instruction_idx = i;
       new_entry->next = hash_table[h];
       hash_table[h] = new_entry;
@@ -5735,12 +5921,15 @@ int tcc_ir_redundant_store_elimination(TCCIRState *ir)
   for (i = 0; i < n; i++)
   {
     q = &ir->instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
     if (q->op == TCCIR_OP_STORE)
     {
-      int addr_valmask = q->dest.r & VT_VALMASK;
-      int addr_is_local = (addr_valmask == VT_LOCAL);
+      const SValue *dest = tcc_ir_get_dest(ir, i);
+      const int addr_valmask = dest->r & VT_VALMASK;
+      const int addr_is_local = (addr_valmask == VT_LOCAL);
       int addr_addrtaken = 0;
-      int addr_vr = q->dest.vr;
+      int addr_vr = dest->vr;
 
       /* CONSERVATIVE: Only track stack locals */
       if (!addr_is_local)
@@ -5757,8 +5946,8 @@ int tcc_ir_redundant_store_elimination(TCCIRState *ir)
       stores[store_count].addr_is_local = 1;
       stores[store_count].addr_addrtaken = addr_addrtaken;
       stores[store_count].addr_vr = addr_vr;
-      stores[store_count].local_offset = q->dest.c.i;
-      stores[store_count].local_sym = q->dest.sym;
+      stores[store_count].local_offset = dest->c.i;
+      stores[store_count].local_sym = dest->sym;
       stores[store_count].store_idx = i;
       stores[store_count].is_dead = 0;
       store_count++;
@@ -5781,6 +5970,9 @@ int tcc_ir_redundant_store_elimination(TCCIRState *ir)
     {
       q = &ir->instructions[j];
 
+      if (q->op == TCCIR_OP_NOP)
+        continue;
+
       /* Stop at basic block boundaries - can't track across blocks conservatively */
       if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF || q->op == TCCIR_OP_FUNCCALLVOID ||
           q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_RETURNVALUE || q->op == TCCIR_OP_RETURNVOID)
@@ -5791,8 +5983,9 @@ int tcc_ir_redundant_store_elimination(TCCIRState *ir)
       /* Check for LOAD from the same address */
       if (q->op == TCCIR_OP_LOAD)
       {
-        int addr_valmask = q->src1.r & VT_VALMASK;
-        int addr_is_local = (addr_valmask == VT_LOCAL);
+        const SValue *src1 = tcc_ir_get_src1(ir, j);
+        const int addr_valmask = src1->r & VT_VALMASK;
+        const int addr_is_local = (addr_valmask == VT_LOCAL);
 
         if (addr_is_local)
         {
@@ -5807,7 +6000,8 @@ int tcc_ir_redundant_store_elimination(TCCIRState *ir)
        * (e.g., AND, OR, ADD operations that directly use stack locations) */
       if (irop_config[q->op].has_src1)
       {
-        int addr_valmask = q->src1.r & VT_VALMASK;
+        const SValue *src1 = tcc_ir_get_src1(ir, j);
+        int addr_valmask = src1->r & VT_VALMASK;
         int addr_is_local = (addr_valmask == VT_LOCAL);
 
         if (addr_is_local)
@@ -5850,8 +6044,11 @@ int tcc_ir_redundant_store_elimination(TCCIRState *ir)
 #endif
       stores[i].is_dead = 1;
       ir->instructions[store_idx].op = TCCIR_OP_NOP;
+      ir->compact_instructions[store_idx].op = TCCIR_OP_NOP;
       changes++;
     }
+    ir->compact_instructions[i].op = q->op;
+    tcc_ir_writeback_quad(ir, i, q);
   }
 
   tcc_free(stores);
@@ -5890,7 +6087,7 @@ int tcc_ir_arithmetic_cse(TCCIRState *ir)
   int n;
   int changes;
   int i, j;
-  TACQuadruple *q;
+  IRQuadCompact *q;
   ArithCSEEntry *hash_table[256];
   ArithCSEEntry *entries;
   int entry_count;
@@ -5916,7 +6113,10 @@ int tcc_ir_arithmetic_cse(TCCIRState *ir)
     int found;
     ArithCSEEntry *e;
 
-    q = &ir->instructions[i];
+    q = &ir->compact_instructions[i];
+
+    if (q->op == TCCIR_OP_NOP)
+      continue;
 
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF || q->op == TCCIR_OP_FUNCCALLVOID ||
         q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_RETURNVALUE || q->op == TCCIR_OP_RETURNVOID)
@@ -5931,16 +6131,19 @@ int tcc_ir_arithmetic_cse(TCCIRState *ir)
         q->op != TCCIR_OP_SAR)
       continue;
 
-    src1_is_const = (q->src1.r & VT_VALMASK) == VT_CONST && !(q->src1.r & VT_SYM);
-    src2_is_const = (q->src2.r & VT_VALMASK) == VT_CONST && !(q->src2.r & VT_SYM);
-    src1_is_sym = (q->src1.r & VT_SYM) != 0;
-    src2_is_sym = (q->src2.r & VT_SYM) != 0;
-    src1_const = src1_is_const ? q->src1.c.i : 0;
-    src2_const = src2_is_const ? q->src2.c.i : 0;
-    src1_sym = src1_is_sym ? q->src1.sym : NULL;
-    src2_sym = src2_is_sym ? q->src2.sym : NULL;
-    src1_vr = q->src1.vr;
-    src2_vr = q->src2.vr;
+    SValue *src1 = tcc_ir_op_get_src1(ir, q);
+    SValue *src2 = tcc_ir_op_get_src2(ir, q);
+    const SValue *dest = tcc_ir_op_get_dest(ir, q);
+    src1_is_const = (src1->r & VT_VALMASK) == VT_CONST && !(src1->r & VT_SYM);
+    src2_is_const = (src2->r & VT_VALMASK) == VT_CONST && !(src2->r & VT_SYM);
+    src1_is_sym = (src1->r & VT_SYM) != 0;
+    src2_is_sym = (src2->r & VT_SYM) != 0;
+    src1_const = src1_is_const ? src1->c.i : 0;
+    src2_const = src2_is_const ? src2->c.i : 0;
+    src1_sym = src1_is_sym ? src1->sym : NULL;
+    src2_sym = src2_is_sym ? src2->sym : NULL;
+    src1_vr = src1->vr;
+    src2_vr = src2->vr;
 
     h = (uint32_t)q->op * 31;
     if (src1_is_const)
@@ -5967,8 +6170,8 @@ int tcc_ir_arithmetic_cse(TCCIRState *ir)
         continue;
 
       /* Must match symbol flags as well as const flags */
-      if (e->src1_is_const == src1_is_const && e->src2_is_const == src2_is_const &&
-          e->src1_is_sym == src1_is_sym && e->src2_is_sym == src2_is_sym)
+      if (e->src1_is_const == src1_is_const && e->src2_is_const == src2_is_const && e->src1_is_sym == src1_is_sym &&
+          e->src2_is_sym == src2_is_sym)
       {
         /* For consts, compare constant value; for symbols, compare symbol pointer;
          * otherwise compare vreg */
@@ -5997,13 +6200,16 @@ int tcc_ir_arithmetic_cse(TCCIRState *ir)
            * IMPORTANT: Only copy vr and type - do NOT copy VT_LVAL or other flags
            * that might cause incorrect dereferencing. The dest vreg holds a VALUE,
            * not an address to be dereferenced. */
-          q->src1.vr = ir->instructions[e->instruction_idx].dest.vr;
-          q->src1.type = ir->instructions[e->instruction_idx].dest.type;
-          q->src1.r = 0; /* No flags - this is a simple vreg read */
-          q->src1.c.i = 0;
-          memset(&q->src2, 0, sizeof(q->src2));
-          q->src2.vr = -1;
+          src1->vr = tcc_ir_get_dest(ir, e->instruction_idx)->vr;
+          src1->type = tcc_ir_get_dest(ir, e->instruction_idx)->type;
+          src1->r = 0; /* No flags - this is a simple vreg read */
+          src1->c.i = 0;
+          memset(src2, 0, sizeof(*src2));
+          src2->vr = -1;
           changes++;
+
+          tcc_ir_writeback_compact(ir, i);
+
           found = 1;
           break;
         }
@@ -6041,13 +6247,16 @@ int tcc_ir_arithmetic_cse(TCCIRState *ir)
            * IMPORTANT: Only copy vr and type - do NOT copy VT_LVAL or other flags
            * that might cause incorrect dereferencing. The dest vreg holds a VALUE,
            * not an address to be dereferenced. */
-          q->src1.vr = ir->instructions[e->instruction_idx].dest.vr;
-          q->src1.type = ir->instructions[e->instruction_idx].dest.type;
-          q->src1.r = 0; /* No flags - this is a simple vreg read */
-          q->src1.c.i = 0;
-          memset(&q->src2, 0, sizeof(q->src2));
-          q->src2.vr = -1;
+          src1->vr = tcc_ir_get_dest(ir, e->instruction_idx)->vr;
+          src1->type = tcc_ir_get_dest(ir, e->instruction_idx)->type;
+          src1->r = 0; /* No flags - this is a simple vreg read */
+          src1->c.i = 0;
+          memset(src2, 0, sizeof(*src2));
+          src2->vr = -1;
           changes++;
+
+          tcc_ir_writeback_compact(ir, i);
+
           found = 1;
           break;
         }
@@ -6069,7 +6278,7 @@ int tcc_ir_arithmetic_cse(TCCIRState *ir)
       new_entry->src2_is_const = src2_is_const;
       new_entry->src1_is_sym = src1_is_sym;
       new_entry->src2_is_sym = src2_is_sym;
-      new_entry->result_vr = q->dest.vr;
+      new_entry->result_vr = dest->vr;
       new_entry->instruction_idx = i;
       new_entry->next = hash_table[h];
       hash_table[h] = new_entry;
@@ -6078,7 +6287,7 @@ int tcc_ir_arithmetic_cse(TCCIRState *ir)
     if (irop_config[q->op].has_dest)
     {
       int dest_vr;
-      dest_vr = q->dest.vr;
+      dest_vr = dest->vr;
       for (j = 0; j < 256; j++)
       {
         ArithCSEEntry **ep;
@@ -6498,6 +6707,8 @@ void tcc_ir_generate_code(TCCIRState *ir)
   for (int i = 0; i < ir->next_instruction_index; ++i)
   {
     TACQuadruple *p = &ir->instructions[i];
+    // if (q->op == TCCIR_OP_NOP)
+    // continue;
     if (p->op == TCCIR_OP_JUMP || p->op == TCCIR_OP_JUMPIF)
     {
       int target = p->dest.c.i;
@@ -7238,10 +7449,13 @@ void tcc_ir_show(TCCIRState *ir)
 {
   for (int i = 0; i < ir->next_instruction_index; i++)
   {
-    tcc_print_quadruple(&ir->instructions[i], i);
+    TACQuadruple q;
+    tcc_ir_expand_quad(ir, i, &q);
+    tcc_print_quadruple(&q, i);
   }
 }
 
+// TODO svalue-later
 void tcc_ir_drop_return_value(TCCIRState *ir)
 {
   if (ir->next_instruction_index == 0)
@@ -7278,7 +7492,7 @@ void tcc_ir_backpatch(TCCIRState *ir, int t, int target_address)
 
   while (t >= 0 && t < ir->next_instruction_index)
   {
-    TccIrOp op = ir->instructions[t].op;
+    TccIrOp op = ir->compact_instructions[t].op;
 
     /* Check if this instruction is actually a jump */
     if (op != TCCIR_OP_JUMP && op != TCCIR_OP_JUMPIF)
@@ -7286,9 +7500,10 @@ void tcc_ir_backpatch(TCCIRState *ir, int t, int target_address)
       break; /* Don't corrupt non-jump instructions */
     }
 
-    cur = &ir->instructions[t].dest;
+    cur = tcc_ir_op_get_dest(ir, &ir->compact_instructions[t]);
     next = cur->c.i;
     cur->c.i = target_address;
+    tcc_ir_writeback_compact(ir, t);
 
     /* Chain ends when next is -1 (sentinel), out of range, or already patched */
     if (next < 0 || next >= ir->next_instruction_index || next == target_address)
@@ -7424,13 +7639,14 @@ void tcc_ir_backpatch_first(TCCIRState *ir, int t, int target_address)
   do
   {
     lp = t;
-    next = ir->instructions[t].dest.c.i;
+    next = tcc_ir_op_get_dest(ir, &ir->compact_instructions[t])->c.i;
     /* Stop if we hit end of chain or go out of bounds */
     if (next < 0 || next >= ir->next_instruction_index)
       break;
     t = next;
   } while (1);
-  ir->instructions[lp].dest.c.i = target_address;
+  tcc_ir_get_dest(ir, lp)->c.i = target_address;
+  tcc_ir_writeback_compact(ir, lp);
 }
 
 /* Append target t to end of jump chain n, return head of chain */
@@ -7501,7 +7717,8 @@ void tcc_ir_generate_cmp_jmp_set(TCCIRState *ir)
           src.c.i = 0;
           tcc_ir_put(ir, TCCIR_OP_ASSIGN, &src, NULL, &dest);
           /* Patch skip_jump to end */
-          ir->instructions[skip_jump].dest.c.i = ir->next_instruction_index;
+          tcc_ir_get_dest(ir, skip_jump)->c.i = ir->next_instruction_index;
+          tcc_ir_writeback_compact(ir, skip_jump);
         }
       }
       else if (jfalse >= 0)
@@ -7513,7 +7730,8 @@ void tcc_ir_generate_cmp_jmp_set(TCCIRState *ir)
       }
 
       /* Patch end_jump to here */
-      ir->instructions[end_jump].dest.c.i = ir->next_instruction_index;
+      tcc_ir_get_dest(ir, end_jump)->c.i = ir->next_instruction_index;
+      tcc_ir_writeback_compact(ir, end_jump);
       tcc_ir_start_basic_block(ir);
     }
     else
@@ -7553,9 +7771,9 @@ void tcc_ir_generate_cmp_jmp_set(TCCIRState *ir)
     tcc_ir_backpatch_to_here(ir, vtop->c.i);
     src1.c.i = t ^ 1;
     tcc_ir_put(ir, TCCIR_OP_ASSIGN, &src1, NULL, &dest);
-
-    ir->instructions[end_jump].dest.c.i = ir->next_instruction_index;
-    tcc_ir_start_basic_block(ir);
+    SValue *end_dest = tcc_ir_op_get_dest(ir, &ir->compact_instructions[end_jump]);
+    end_dest->c.i = ir->next_instruction_index;
+    tcc_ir_writeback_compact(ir, end_jump);
     vtop->vr = dest.vr;
     vtop->r = 0;
   }

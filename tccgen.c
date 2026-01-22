@@ -186,7 +186,7 @@ static void gen_inline_functions(TCCState *s);
 static void free_inline_functions(TCCState *s);
 static void skip_or_save_block(TokenString **str);
 static void gv_dup(void);
-static int get_temp_local_var(int size, int align, int *r2);
+static int get_temp_local_var(int size, int align, int *vr_out);
 static void cast_error(CType *st, CType *dt);
 static void end_switch(void);
 static void do_Static_assert(void);
@@ -281,32 +281,10 @@ static int R_RET(int t)
   return REG_FRET;
 }
 
-/* returns 2nd function return register, if any */
-static int R2_RET(int t)
-{
-  t &= VT_BTYPE;
-#if PTR_SIZE == 4
-  if (t == VT_LLONG)
-    return REG_IRE2;
-#elif defined TCC_TARGET_X86_64
-  if (t == VT_QLONG)
-    return REG_IRE2;
-  if (t == VT_QFLOAT)
-    return REG_FRE2;
-#elif defined TCC_TARGET_RISCV64
-  if (t == VT_LDOUBLE)
-    return REG_IRE2;
-#endif
-  return VT_CONST;
-}
-
-/* returns true for two-word types */
-#define USING_TWO_WORDS(t) (R2_RET(t) != VT_CONST)
-
 /* put function return registers to stack value */
 static void PUT_R_RET(SValue *sv, int t)
 {
-  sv->r = R_RET(t), sv->r2 = R2_RET(t);
+  sv->r = R_RET(t);
 }
 
 /* returns function return register class for type t */
@@ -323,23 +301,23 @@ static int RC_TYPE(int t)
   return RC_FLOAT;
 }
 
-/* returns 2nd register class corresponding to t and rc */
-static int RC2_TYPE(int t, int rc)
-{
-  if (!USING_TWO_WORDS(t))
-    return 0;
-#ifdef RC_IRE2
-  if (rc == RC_IRET)
-    return RC_IRE2;
-#endif
-#ifdef RC_FRE2
-  if (rc == RC_FRET)
-    return RC_FRE2;
-#endif
-  if (rc & RC_FLOAT)
-    return RC_FLOAT;
-  return RC_INT;
-}
+// /* returns 2nd register class corresponding to t and rc */
+// static int RC2_TYPE(int t, int rc)
+// {
+//   if (!USING_TWO_WORDS(t))
+//     return 0;
+// #ifdef RC_IRE2
+//   if (rc == RC_IRET)
+//     return RC_IRE2;
+// #endif
+// #ifdef RC_FRE2
+//   if (rc == RC_FRET)
+//     return RC_FRE2;
+// #endif
+//   if (rc & RC_FLOAT)
+//     return RC_FLOAT;
+//   return RC_INT;
+// }
 
 /* we use our own 'finite' function to avoid potential problems with
    non standard math libs */
@@ -1092,7 +1070,6 @@ static void vsetc(CType *type, int r, CValue *vc)
   print_vstack("vsetc");
   vtop->type = *type;
   vtop->r = r;
-  vtop->r2 = VT_CONST;
   vtop->c = *vc;
   vtop->vr = -1;
   vtop->pr0 = PREG_NONE;
@@ -1587,8 +1564,9 @@ static Sym *external_sym(int v, CType *type, int r, AttributeDef *ad)
 /* IR-only: frontend never allocates physical registers. */
 
 /* find a free temporary local variable (return the offset on stack) match
-   size and align. If none, add new temporary stack variable */
-static int get_temp_local_var(int size, int align, int *r2)
+   size and align. If none, add new temporary stack variable.
+   The temp local index is encoded in vr_out using VR_TEMP_LOCAL(). */
+static int get_temp_local_var(int size, int align, int *vr_out)
 {
   int i;
   struct temp_local_variable *temp_var;
@@ -1602,9 +1580,8 @@ static int get_temp_local_var(int size, int align, int *r2)
     r = p->r & VT_VALMASK;
     if (r == VT_LOCAL || r == VT_LLOCAL)
     {
-      r = p->r2 - (VT_CONST + 1);
-      if (r >= 0 && r < MAX_TEMP_LOCAL_VARIABLE_NUMBER)
-        used |= 1 << r;
+      if (VR_IS_TEMP_LOCAL(p->vr))
+        used |= 1 << VR_TEMP_LOCAL_IDX(p->vr);
     }
   }
   for (i = 0; i < nb_temp_local_vars; i++)
@@ -1613,21 +1590,21 @@ static int get_temp_local_var(int size, int align, int *r2)
     if (!(used & 1 << i) && temp_var->size >= size && temp_var->align >= align)
     {
     ret_tmp:
-      *r2 = (VT_CONST + 1) + i;
+      *vr_out = VR_TEMP_LOCAL(i);
       return temp_var->location;
     }
   }
   loc = (loc - size) & -align;
   if (nb_temp_local_vars < MAX_TEMP_LOCAL_VARIABLE_NUMBER)
   {
-    temp_var = &arr_temp_local_vars[i];
+    temp_var = &arr_temp_local_vars[nb_temp_local_vars];
     temp_var->location = loc;
     temp_var->size = size;
     temp_var->align = align;
     nb_temp_local_vars++;
     goto ret_tmp;
   }
-  *r2 = VT_CONST;
+  *vr_out = -1; /* No temp local slot available */
   return loc;
 }
 
@@ -2035,7 +2012,7 @@ ST_FUNC int gv(int rc)
       bt = vtop->type.t & VT_BTYPE;
     }
 
-    rc2 = RC2_TYPE(bt, rc);
+    rc2 = RC_INT; // RC2_TYPE(bt, rc);
 
     /* need to reload if:
        - constant
@@ -2043,7 +2020,7 @@ ST_FUNC int gv(int rc)
        - already a register, but not in the right class */
     r = vtop->r & VT_VALMASK;
     r_ok = !(vtop->r & VT_LVAL) && (r < VT_CONST) && (reg_classes[r] & rc);
-    r2_ok = !rc2 || ((vtop->r2 < VT_CONST) && (reg_classes[vtop->r2] & rc2));
+    r2_ok = !rc2;
 
     if (tcc_state->ir == NULL)
     {
@@ -2080,7 +2057,6 @@ ST_FUNC int gv(int rc)
 
         vtop->vr = vreg;
         vtop->r = 0;
-        vtop->r2 = VT_CONST;
         vtop->c.i = 0;
         vtop->sym = NULL;
       }
@@ -2112,16 +2088,10 @@ ST_FUNC int gv(int rc)
 
       vtop->vr = vreg;
       vtop->r = 0;
-      vtop->r2 = VT_CONST;
       vtop->c.i = 0;
       vtop->sym = NULL;
     }
     /* vtop->vr is set in the IR LOAD/ASSIGN paths when needed */
-#ifdef TCC_TARGET_C67
-    /* uses register pairs for doubles */
-    if (bt == VT_DOUBLE)
-      vtop->r2 = r + 1;
-#endif
   }
   return 0;
 }
@@ -2276,9 +2246,11 @@ ST_FUNC void lexpand(void)
       /* If coalescing happened, update full.vr to match the coalesced instruction's dest */
       if (assign_pos < tcc_state->ir->next_instruction_index)
       {
-        full.vr = tcc_state->ir->instructions[assign_pos].dest.vr;
+        TACQuadruple q;
+        tcc_ir_expand_quad(tcc_state->ir, assign_pos, &q);
+        full.vr = q.dest.vr;
         /* Also update full.type to match the coalesced instruction's dest type! */
-        full.type.t = tcc_state->ir->instructions[assign_pos].dest.type.t;
+        full.type.t = q.dest.type.t;
       }
 
       /* Create explicit low32 = (uint32_t)full. */
@@ -2347,14 +2319,6 @@ ST_FUNC void lexpand(void)
       tcc_state->ir->prevent_coalescing = 1;
       tcc_ir_put(tcc_state->ir, TCCIR_OP_ASSIGN, &shifted64, NULL, &vtop[0]);
       tcc_state->ir->prevent_coalescing = old_prevent_coalescing;
-    }
-    else
-    {
-      /* Old backend path */
-      gv(RC_INT);
-      vdup();
-      vtop[0].r = vtop[-1].r2;
-      vtop[0].r2 = vtop[-1].r2 = VT_CONST;
     }
   }
   vtop[0].type.t = vtop[-1].type.t = VT_INT | u;
@@ -2473,10 +2437,6 @@ static void lbuild(int t)
       return;
     }
   }
-  gv2(RC_INT, RC_INT);
-  vtop[-1].r2 = vtop[0].r;
-  vtop[-1].type.t = t;
-  vpop();
 }
 #endif
 
@@ -2582,7 +2542,6 @@ static void gen_opl(int op)
       vtop->type.t = VT_LLONG;
       vtop->vr = dest.vr;
       vtop->r = reg_iret;
-      vtop->r2 = reg_lret;
     }
     break;
   case '^':
@@ -4739,7 +4698,8 @@ ST_FUNC void vstore(void)
     /* two word case handling :
        store second register at word + 4 (or +8 for x86-64)  */
     /* On 32-bit systems, doubles are 64-bit and need two-word handling like long long */
-    int is_64bit_type = USING_TWO_WORDS(dbt) || (PTR_SIZE == 4 && (dbt == VT_DOUBLE || dbt == VT_LDOUBLE));
+    int is_64bit_type = (PTR_SIZE == 4 && (dbt == VT_DOUBLE || dbt == VT_LDOUBLE || dbt == VT_LLONG)) ||
+                        (PTR_SIZE == 8 && dbt == VT_LLONG);
     if (is_64bit_type)
     {
       /* IR generation: handle long long as a single 64-bit value, and always
@@ -4787,18 +4747,6 @@ ST_FUNC void vstore(void)
           vtop->vr = vtop[-1].vr;
           vtop->r = 0;
         }
-      }
-      else
-      {
-        /* Old path for non-IR backends: store low word then high word. */
-        int load_type = (dbt == VT_QFLOAT) ? VT_DOUBLE : VT_PTRDIFF_T;
-        vtop[-1].type.t = load_type;
-        store(r, vtop - 1);
-        vswap();
-        incr_offset(PTR_SIZE);
-        vswap();
-        /* XXX: it works because r2 is spilled last ! */
-        store(vtop->r2, vtop - 1);
       }
     }
     else
@@ -6473,8 +6421,8 @@ static void gfunc_param_typed(Sym *func, Sym *arg)
           tcc_error("cannot pass large struct by value");
         }
 
-        int r2 = 0;
-        int tmp_loc = get_temp_local_var(size, align, &r2);
+        int temp_vr;
+        int tmp_loc = get_temp_local_var(size, align, &temp_vr);
 
         /* Store the source struct into the temporary destination.
          * vstore() will emit a memmove() for struct types.
@@ -6484,9 +6432,8 @@ static void gfunc_param_typed(Sym *func, Sym *arg)
           memset(&dst, 0, sizeof(dst));
           dst.type = type;
           dst.r = VT_LOCAL | VT_LVAL;
-          dst.vr = -1;
+          dst.vr = temp_vr;
           dst.c.i = tmp_loc;
-          dst.r2 = r2;
           vpushv(&dst);
           vswap();
           vstore();
@@ -7449,7 +7396,6 @@ tok_next:
 
       sa = s->next; /* first parameter */
       nb_args = regsize = 0;
-      ret.r2 = VT_CONST;
       /* compute first implicit argument if a structure is returned */
       if ((s->type.t & VT_BTYPE) == VT_STRUCT)
       {
@@ -7696,7 +7642,6 @@ tok_next:
         }
         vsetc(&ret.type, ret.r, &ret.c);
         vtop->vr = return_vreg;
-        vtop->r2 = ret.r2;
 
         /* handle packed struct return */
         if (((s->type.t & VT_BTYPE) == VT_STRUCT) && ret_nregs)
@@ -8171,10 +8116,6 @@ static void expr_cond(void)
     }
 
     rc = RC_TYPE(type.t);
-    /* for long longs, we use fixed registers to avoid having
-       to handle a complicated move */
-    if (USING_TWO_WORDS(type.t))
-      rc = RC_RET(type.t);
 
     tt = r2 = 0;
     int false_vreg = 0; /* Save false branch vreg for IR mode */
@@ -10648,7 +10589,7 @@ static void gen_function(Sym *sym)
     ir->leaffunc = 1;
     for (int i = 0; i < ir->next_instruction_index; ++i)
     {
-      const TACQuadruple *q = &ir->instructions[i];
+      const IRQuadCompact *q = &ir->compact_instructions[i];
       if (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID)
       {
         ir->leaffunc = 0;

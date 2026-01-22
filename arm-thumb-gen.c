@@ -2994,7 +2994,11 @@ void load_to_dest(SValue *dest, SValue *sv)
       }
       if (dest->pr1 != PREG_NONE && tcc_is_64bit_operand(sv))
       {
-        int v_high = (sv->pr1 != PREG_NONE) ? sv->pr1 : ((sv->r2 != VT_CONST) ? sv->r2 : (src_reg + 1));
+        if (sv->pr1 == PREG_NONE)
+        {
+          tcc_error("compiler_error: source high register missing for 64-bit move\n");
+        }
+        const int v_high = sv->pr1;
         if (dest->pr1 != v_high)
         {
           ot_check(th_mov_reg(dest->pr1, v_high, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,

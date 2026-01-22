@@ -278,7 +278,7 @@ void tcc_debug_print_svalue(const SValue *sv)
   if (vt & VT_VOLATILE)
     fprintf(stderr, " volatile");
 
-  fprintf(stderr, ", vr=%d, pr0=%u, pr1=%u, r2=0x%04x", sv->vr, (unsigned)sv->pr0, (unsigned)sv->pr1, (unsigned)sv->r2);
+  fprintf(stderr, ", vr=%d, pr0=%u, pr1=%u", sv->vr, (unsigned)sv->pr0, (unsigned)sv->pr1);
   fprintf(stderr, " }\n");
 }
 

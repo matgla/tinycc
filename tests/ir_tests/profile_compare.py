@@ -56,6 +56,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from _venv_bootstrap import ensure_venv
+
+ensure_venv()
+
 CURRENT_DIR = Path(__file__).parent
 BASELINES_DIR = CURRENT_DIR / "profile_baselines"
 REPO_ROOT = CURRENT_DIR.parent.parent  # tinycc root
@@ -202,6 +206,17 @@ def compute_summary(comparisons: list[TestComparison]) -> dict:
             summary["max_heap_baseline_kb"] = max(c.heap_peak.baseline for c in successful if c.heap_peak)
             summary["max_heap_current_kb"] = max(c.heap_peak.current for c in successful if c.heap_peak)
 
+        # Max RSS (only if any test reports RSS)
+        if any(c.max_rss and (c.max_rss.baseline > 0 or c.max_rss.current > 0) for c in successful):
+            rss_baseline_vals = [c.max_rss.baseline for c in successful if c.max_rss]
+            rss_current_vals = [c.max_rss.current for c in successful if c.max_rss]
+            if rss_baseline_vals and rss_current_vals:
+                summary["max_rss_baseline_kb"] = max(rss_baseline_vals)
+                summary["max_rss_current_kb"] = max(rss_current_vals)
+                b = summary["max_rss_baseline_kb"]
+                c = summary["max_rss_current_kb"]
+                summary["rss_diff_pct"] = ((c - b) / b * 100) if b else 0
+
         baseline_time = sum(c.compile_time.baseline for c in successful if c.compile_time)
         current_time = sum(c.compile_time.current for c in successful if c.compile_time)
         summary["total_time_baseline_s"] = baseline_time
@@ -232,6 +247,10 @@ def format_console(comparisons: list[TestComparison], summary: dict, baseline_na
         sign = "+" if summary["heap_diff_pct"] > 0 else ""
         lines.append(f"  Max Heap: {summary['max_heap_baseline_kb']}KB -> {summary['max_heap_current_kb']}KB ({sign}{summary['heap_diff_pct']:.1f}%)")
 
+    if "rss_diff_pct" in summary:
+        sign = "+" if summary["rss_diff_pct"] > 0 else ""
+        lines.append(f"  Max RSS: {summary['max_rss_baseline_kb']}KB -> {summary['max_rss_current_kb']}KB ({sign}{summary['rss_diff_pct']:.1f}%)")
+
     sign = "+" if summary["time_diff_pct"] > 0 else ""
     lines.append(f"  Total Time: {summary['total_time_baseline_s']:.2f}s -> {summary['total_time_current_s']:.2f}s ({sign}{summary['time_diff_pct']:.1f}%)")
 
@@ -246,6 +265,11 @@ def format_console(comparisons: list[TestComparison], summary: dict, baseline_na
             regressions.append((c.test_name, "heap", c.heap_peak))
         elif c.heap_peak and c.heap_peak.is_significant and c.heap_peak.is_better:
             improvements.append((c.test_name, "heap", c.heap_peak))
+
+        if c.max_rss and c.max_rss.is_significant and not c.max_rss.is_better:
+            regressions.append((c.test_name, "rss", c.max_rss))
+        elif c.max_rss and c.max_rss.is_significant and c.max_rss.is_better:
+            improvements.append((c.test_name, "rss", c.max_rss))
 
         if c.binary_size and c.binary_size.is_significant and not c.binary_size.is_better:
             regressions.append((c.test_name, "size", c.binary_size))
@@ -288,6 +312,11 @@ def format_markdown(comparisons: list[TestComparison], summary: dict, baseline_n
         emoji = ":red_circle:" if summary["heap_diff_pct"] > 5 else (":green_circle:" if summary["heap_diff_pct"] < -5 else ":white_circle:")
         lines.append(f"| Max Heap Peak | {summary['max_heap_baseline_kb']} KB | {summary['max_heap_current_kb']} KB | {sign}{summary['heap_diff_pct']:.1f}% {emoji} |")
 
+    if "max_rss_baseline_kb" in summary:
+        sign = "+" if summary["rss_diff_pct"] > 0 else ""
+        emoji = ":red_circle:" if summary["rss_diff_pct"] > 5 else (":green_circle:" if summary["rss_diff_pct"] < -5 else ":white_circle:")
+        lines.append(f"| Max RSS | {summary['max_rss_baseline_kb']} KB | {summary['max_rss_current_kb']} KB | {sign}{summary['rss_diff_pct']:.1f}% {emoji} |")
+
     sign = "+" if summary["time_diff_pct"] > 0 else ""
     emoji = ":red_circle:" if summary["time_diff_pct"] > 10 else (":green_circle:" if summary["time_diff_pct"] < -10 else ":white_circle:")
     lines.append(f"| Total Compile Time | {summary['total_time_baseline_s']:.2f}s | {summary['total_time_current_s']:.2f}s | {sign}{summary['time_diff_pct']:.1f}% {emoji} |")
@@ -301,6 +330,8 @@ def format_markdown(comparisons: list[TestComparison], summary: dict, baseline_n
     for c in comparisons:
         if c.heap_peak and c.heap_peak.is_significant:
             significant.append((c.test_name, "Heap", c.heap_peak))
+        if c.max_rss and c.max_rss.is_significant:
+            significant.append((c.test_name, "RSS", c.max_rss))
         if c.binary_size and c.binary_size.is_significant:
             significant.append((c.test_name, "Size", c.binary_size))
 
@@ -319,14 +350,15 @@ def format_markdown(comparisons: list[TestComparison], summary: dict, baseline_n
     lines.append(f"<details>")
     lines.append(f"<summary>Full Results ({len(comparisons)} tests)</summary>")
     lines.append(f"")
-    lines.append(f"| Test | Heap (KB) | Size (B) | Time (s) |")
-    lines.append(f"|------|-----------|----------|----------|")
+    lines.append(f"| Test | Heap (KB) | RSS (KB) | Size (B) | Time (s) |")
+    lines.append(f"|------|-----------|----------|----------|----------|")
     for c in comparisons:
         if c.baseline_success and c.current_success:
             heap_str = f"{c.heap_peak.current:.0f}" if c.heap_peak else "-"
+            rss_str = f"{c.max_rss.current:.0f}" if c.max_rss else "-"
             size_str = f"{c.binary_size.current:.0f}" if c.binary_size else "-"
             time_str = f"{c.compile_time.current:.3f}" if c.compile_time else "-"
-            lines.append(f"| {c.test_name} | {heap_str} | {size_str} | {time_str} |")
+            lines.append(f"| {c.test_name} | {heap_str} | {rss_str} | {size_str} | {time_str} |")
     lines.append(f"")
     lines.append(f"</details>")
 
@@ -398,6 +430,15 @@ def format_html(comparisons: list[TestComparison], summary: dict, baseline_name:
                 </div>
             </div>
             ''' if 'max_heap_current_kb' in summary else '')}
+            {"".join(f'''
+            <div class="stat">
+                <div class="stat-value">{summary.get('max_rss_current_kb', 0)} KB</div>
+                <div class="stat-label">Max RSS</div>
+                <div class="stat-change {'positive' if summary.get('rss_diff_pct', 0) > 5 else 'negative' if summary.get('rss_diff_pct', 0) < -5 else 'neutral'}">
+                    {"+" if summary.get('rss_diff_pct', 0) > 0 else ""}{summary.get('rss_diff_pct', 0):.1f}%
+                </div>
+            </div>
+            ''' if 'max_rss_current_kb' in summary else '')}
             <div class="stat">
                 <div class="stat-value">{summary['total_time_current_s']:.2f}s</div>
                 <div class="stat-label">Total Compile Time</div>
@@ -429,6 +470,7 @@ def format_html(comparisons: list[TestComparison], summary: dict, baseline_name:
             <tr>
                 <th>Test</th>
                 <th>Heap Peak (KB)</th>
+                <th>Max RSS (KB)</th>
                 <th>Binary Size (B)</th>
                 <th>Compile Time (s)</th>
             </tr>
@@ -436,6 +478,7 @@ def format_html(comparisons: list[TestComparison], summary: dict, baseline_name:
             <tr>
                 <td>{c.test_name}</td>
                 <td>{f"{c.heap_peak.current:.0f}" if c.heap_peak else "-"}</td>
+                <td>{f"{c.max_rss.current:.0f}" if c.max_rss else "-"}</td>
                 <td>{f"{c.binary_size.current:.0f}" if c.binary_size else "-"}</td>
                 <td>{f"{c.compile_time.current:.3f}" if c.compile_time else "-"}</td>
             </tr>
@@ -903,8 +946,14 @@ Git comparison examples:
     parser.add_argument("--git-current", metavar="REF", default="HEAD",
                         help="Git ref to use as 'current' (default: HEAD). "
                             "Special value: 'workspace' uses your current working tree (uncommitted changes) by snapshotting it into a temp build dir.")
-    parser.add_argument("--profiler", "-p", choices=["heaptrack", "time", "perf"], default="heaptrack",
-                        help="Profiler tool to use for git comparison (default: heaptrack)")
+    default_profiler = "time" if sys.platform == "darwin" else "heaptrack"
+    profiler_choices = ["heaptrack", "time", "perf"]
+    if sys.platform == "darwin":
+        profiler_choices.extend(["xctrace", "xcprofile"])  # alias for xctrace
+    parser.add_argument("--profiler", "-p", choices=profiler_choices, default=default_profiler,
+                        help=f"Profiler tool to use for git comparison (default: {default_profiler})")
+    parser.add_argument("--xcprofile", action="store_true",
+                        help="macOS convenience switch: same as --profiler xctrace")
     parser.add_argument("--limit", "-n", type=int, default=0,
                         help="Limit number of tests to run (0 = all)")
     parser.add_argument("--cflags", type=str, default="",
@@ -913,6 +962,13 @@ Git comparison examples:
                         help="Output directory for profile results")
 
     args = parser.parse_args()
+
+    if args.profiler == "xcprofile":
+        args.profiler = "xctrace"
+    if args.xcprofile:
+        if sys.platform != "darwin":
+            raise SystemExit("--xcprofile is macOS-only")
+        args.profiler = "xctrace"
 
     # Backwards-compatible convenience: allow `profile_compare.py -g <ref> workspace`
     # to mean `--git-current workspace`.
