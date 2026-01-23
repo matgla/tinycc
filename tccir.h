@@ -318,8 +318,6 @@ typedef struct TCCIRState
   uint8_t prevent_coalescing;
   int32_t loc;
 
-  TACQuadruple *instructions;
-
   /* SValue pool for compact IR storage - operands stored contiguously */
   SValue *svalue_pool;
   int svalue_pool_count;
@@ -565,4 +563,3 @@ void tcc_ir_expand_quad(TCCIRState *ir, int index, TACQuadruple *out);
 
 /* Write back modified operands from a TACQuadruple to the pool */
 void tcc_ir_writeback_quad(TCCIRState *ir, int index, TACQuadruple *q);
-void tcc_ir_writeback_compact(TCCIRState *ir, int index);

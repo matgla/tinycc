@@ -405,14 +405,13 @@ typedef union CValue
 #define VR_IS_TEMP_LOCAL(vr) ((vr) <= -2 && (vr) >= -9)
 #define VR_TEMP_LOCAL_IDX(vr) (-2 - (vr))
 
-typedef struct SValue
+typedef struct __attribute__((packed)) SValue
 {
   uint8_t pr0;
   uint8_t pr1;
   unsigned short r; /* register + flags */
-  CType type;       /* type */
   int vr;           /* virtual register for IR */
-
+  CType type;       /* type */
   union
   {
     struct
@@ -431,6 +430,8 @@ typedef struct SValue
   }; /* result of unary() for an identifier. */
 
 } SValue;
+
+_Static_assert(sizeof(SValue) == 44, "SValue size changed");
 
 /* symbol attributes */
 struct SymAttr

@@ -4,12 +4,12 @@
  * This file is part of TinyCC
  */
 #define USING_GLOBALS
-#include <limits.h>
 #include "arm-thumb-defs.h"
 #include "tcc.h"
 #include "tccabi.h"
 #include "tccir.h"
 #include "tcctype.h"
+#include <limits.h>
 
 void thumb_free_call_sites(void)
 {
@@ -84,15 +84,15 @@ ThumbGenCallSite *thumb_get_call_site_for_id(int call_id)
  * out_args: if non-NULL, will be allocated and filled with argument SValues.
  * Returns the number of arguments found, or -1 on error.
  */
-int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, int argc_hint,
-                                     TCCAbiCallLayout *layout, SValue **out_args)
+int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, int argc_hint, TCCAbiCallLayout *layout,
+                                    SValue **out_args)
 {
   if (!ir || !layout || call_idx < 0)
     return -1;
 
-  /* Use fixed-size arrays for small argument counts to avoid allocations.
-   * Most calls have few arguments, so this is a significant optimization. */
-  #define MAX_INLINE_ARGS 16
+/* Use fixed-size arrays for small argument counts to avoid allocations.
+ * Most calls have few arguments, so this is a significant optimization. */
+#define MAX_INLINE_ARGS 16
   TCCAbiArgDesc inline_arg_descs[MAX_INLINE_ARGS];
   uint8_t inline_found[MAX_INLINE_ARGS];
   TCCAbiArgDesc *arg_descs = NULL;
@@ -112,13 +112,14 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, i
     int max_arg_index = -1;
     for (int j = call_idx - 1; j >= 0; --j)
     {
-      const TACQuadruple *p = &ir->instructions[j];
+      const IRQuadCompact *p = &ir->compact_instructions[j];
       if (p->op == TCCIR_OP_FUNCPARAMVAL)
       {
-        int param_call_id = TCCIR_DECODE_CALL_ID(p->src2.c.i);
+        const SValue *src2 = tcc_ir_get_src2(ir, j);
+        int param_call_id = src2 ? TCCIR_DECODE_CALL_ID(src2->c.i) : -1;
         if (param_call_id == call_id)
         {
-          int param_idx = TCCIR_DECODE_PARAM_IDX(p->src2.c.i);
+          int param_idx = TCCIR_DECODE_PARAM_IDX(src2->c.i);
           if (param_idx > max_arg_index)
             max_arg_index = param_idx;
         }
@@ -162,36 +163,46 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, i
   int found_count = 0;
   for (int j = call_idx - 1; j >= 0 && found_count < argc; --j)
   {
-    const TACQuadruple *p = &ir->instructions[j];
+    const IRQuadCompact *p = &ir->compact_instructions[j];
     if (p->op == TCCIR_OP_FUNCPARAMVAL)
     {
-      int param_call_id = TCCIR_DECODE_CALL_ID(p->src2.c.i);
+      const SValue *src2 = tcc_ir_get_src2(ir, j);
+      int param_call_id = src2 ? TCCIR_DECODE_CALL_ID(src2->c.i) : -1;
       if (param_call_id == call_id)
       {
-        int param_idx = TCCIR_DECODE_PARAM_IDX(p->src2.c.i);
+        const SValue *src1 = tcc_ir_get_src1(ir, j);
+        int param_idx = TCCIR_DECODE_PARAM_IDX(src2->c.i);
         if (param_idx >= 0 && param_idx < argc && !found[param_idx])
         {
           /* Collect SValue if requested */
           if (args)
           {
-            args[param_idx] = p->src1;
+            if (src1)
+            {
+              args[param_idx] = *src1;
+            }
+            else
+            {
+              memset(&args[param_idx], 0, sizeof(SValue));
+              args[param_idx].vr = -1;
+            }
           }
 
           /* Determine argument type and size */
-          const int bt = p->src1.type.t & VT_BTYPE;
+          const int bt = src1->type.t & VT_BTYPE;
           int size = 0;
           int align = 0;
 
           if (bt == VT_STRUCT)
           {
-            size = type_size(&p->src1.type, &align);
+            size = type_size(&src1->type, &align);
             if (align < 1)
               align = 1;
             arg_descs[param_idx].kind = TCC_ABI_ARG_STRUCT_BYVAL;
             arg_descs[param_idx].size = (uint16_t)size;
             arg_descs[param_idx].alignment = (uint8_t)align;
           }
-          else if (tcc_is_64bit_type(p->src1.type.t))
+          else if (tcc_is_64bit_type(src1->type.t))
           {
             arg_descs[param_idx].kind = TCC_ABI_ARG_SCALAR64;
             arg_descs[param_idx].size = 8;
@@ -263,5 +274,5 @@ cleanup_error:
     layout->locs = NULL;
   }
   return -1;
-  #undef MAX_INLINE_ARGS
+#undef MAX_INLINE_ARGS
 }
