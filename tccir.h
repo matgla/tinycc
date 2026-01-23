@@ -504,14 +504,14 @@ static inline int ir_op_slot_count(TccIrOp op)
   return irop_config[op].has_dest + irop_config[op].has_src1 + irop_config[op].has_src2;
 }
 
-static inline SValue *tcc_ir_op_get_dest(TCCIRState *ir, IRQuadCompact *q)
+static inline SValue *tcc_ir_op_get_dest(const TCCIRState *ir, const IRQuadCompact *q)
 {
   if (!irop_config[q->op].has_dest)
     return NULL;
   return &ir->svalue_pool[q->operand_base];
 }
 
-static inline SValue *tcc_ir_get_dest(TCCIRState *ir, int index)
+static inline SValue *tcc_ir_get_dest(const TCCIRState *ir, int index)
 {
   IRQuadCompact *q = &ir->compact_instructions[index];
   if (!irop_config[q->op].has_dest)
@@ -519,7 +519,7 @@ static inline SValue *tcc_ir_get_dest(TCCIRState *ir, int index)
   return &ir->svalue_pool[q->operand_base];
 }
 
-static inline SValue *tcc_ir_op_get_src1(TCCIRState *ir, IRQuadCompact *q)
+static inline SValue *tcc_ir_op_get_src1(const TCCIRState *ir, const IRQuadCompact *q)
 {
   if (!irop_config[q->op].has_src1)
     return NULL;
@@ -527,7 +527,7 @@ static inline SValue *tcc_ir_op_get_src1(TCCIRState *ir, IRQuadCompact *q)
   return &ir->svalue_pool[q->operand_base + off];
 }
 
-static inline SValue *tcc_ir_get_src1(TCCIRState *ir, int index)
+static inline SValue *tcc_ir_get_src1(const TCCIRState *ir, int index)
 {
   IRQuadCompact *q = &ir->compact_instructions[index];
   if (!irop_config[q->op].has_src1)
@@ -536,7 +536,7 @@ static inline SValue *tcc_ir_get_src1(TCCIRState *ir, int index)
   return &ir->svalue_pool[q->operand_base + off];
 }
 
-static inline SValue *tcc_ir_op_get_src2(TCCIRState *ir, IRQuadCompact *q)
+static inline SValue *tcc_ir_op_get_src2(const TCCIRState *ir, const IRQuadCompact *q)
 {
   if (!irop_config[q->op].has_src2)
     return NULL;
@@ -544,7 +544,7 @@ static inline SValue *tcc_ir_op_get_src2(TCCIRState *ir, IRQuadCompact *q)
   return &ir->svalue_pool[q->operand_base + off];
 }
 
-static inline SValue *tcc_ir_get_src2(TCCIRState *ir, int index)
+static inline SValue *tcc_ir_get_src2(const TCCIRState *ir, int index)
 {
   IRQuadCompact *q = &ir->compact_instructions[index];
   if (!irop_config[q->op].has_src2)

@@ -34,8 +34,8 @@
  */
 
 #define USING_GLOBALS
-#include "tcc.h"
 #include "arm-thumb-opcodes.h"
+#include "tcc.h"
 
 static const char *th_reg_name(unsigned r)
 {
@@ -962,7 +962,7 @@ thumb_opcode th_push(uint16_t regs)
     THOP_TRACE("\n");
     return (thumb_opcode){
         .size = 4,
-        .opcode = (0xe92d << 16 | regs),
+        .opcode = (0xe92dU << 16 | regs),
     };
   }
 #endif
@@ -1531,7 +1531,7 @@ thumb_opcode th_pop(uint16_t regs)
     THOP_TRACE("\n");
     return (thumb_opcode){
         .size = 4,
-        .opcode = (0xe8bd << 16) | regs,
+        .opcode = (0xe8bdU << 16) | regs,
     };
   }
 #endif

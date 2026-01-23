@@ -1,5 +1,5 @@
-#include "tcc.h"
 #include "arm-thumb-opcodes.h"
+#include "tcc.h"
 
 #ifdef NEED_RELOC_TYPE
 /* Returns 1 for a code relocation, 0 for a data relocation. For unknown
@@ -226,17 +226,17 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
   case R_ARM_PLT32:
   {
     int x, is_thumb, is_call, h, blx_avail, is_bl, th_ko;
-    x = (*(int *)ptr) & 0xffffff;
+    x = read32le(ptr) & 0xffffff;
 #ifdef DEBUG_RELOC
     printf("reloc %d: x=0x%x val=0x%x ", type, x, val);
 #endif
-    (*(int *)ptr) &= 0xff000000;
+    write32le(ptr, read32le(ptr) & 0xff000000);
     if (x & 0x800000)
       x -= 0x1000000;
     x <<= 2;
     blx_avail = (CONFIG_TCC_CPUVER >= 5);
     is_thumb = val & 1;
-    is_bl = (*(unsigned *)ptr) >> 24 == 0xeb;
+    is_bl = read32le(ptr) >> 24 == 0xeb;
     is_call = (type == R_ARM_CALL || (type == R_ARM_PC24 && is_bl));
     x += val - addr;
 #ifdef DEBUG_RELOC
@@ -252,9 +252,9 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
     if (is_thumb)
     {
       x |= h << 24;
-      (*(int *)ptr) = 0xfa << 24; /* bl -> blx */
+      write32le(ptr, 0xfa << 24); /* bl -> blx */
     }
-    (*(int *)ptr) |= x;
+    write32le(ptr, read32le(ptr) | x);
   }
     return;
   case R_ARM_THM_JUMP6:
@@ -470,22 +470,22 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
     imm4 = (val >> 12) & 0xf;
     x = (imm4 << 16) | imm12;
     if (type == R_ARM_THM_MOVT_ABS)
-      *(int *)ptr |= x;
+      write32le(ptr, read32le(ptr) | x);
     else
-      *(int *)ptr += x;
+      add32le(ptr, x);
   }
     return;
   case R_ARM_MOVT_PREL:
   case R_ARM_MOVW_PREL_NC:
   {
-    int insn = *(int *)ptr;
+    int insn = read32le(ptr);
     int addend = ((insn >> 4) & 0xf000) | (insn & 0xfff);
 
     addend = (addend ^ 0x8000) - 0x8000;
     val += addend - addr;
     if (type == R_ARM_MOVT_PREL)
       val >>= 16;
-    *(int *)ptr = (insn & 0xfff0f000) | ((val & 0xf000) << 4) | (val & 0xfff);
+    write32le(ptr, (insn & 0xfff0f000) | ((val & 0xf000) << 4) | (val & 0xfff));
   }
     return;
   case R_ARM_THM_MOVT_ABS:
@@ -500,21 +500,20 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
     imm4 = (val >> 12) & 0xf;
     x = (imm3 << 28) | (imm8 << 16) | (i << 10) | imm4;
     if (type == R_ARM_THM_MOVT_ABS)
-      *(int *)ptr |= x;
+      write32le(ptr, read32le(ptr) | x);
     else
-      *(int *)ptr += x;
+      add32le(ptr, x);
   }
     return;
   case R_ARM_PREL31:
   {
     int x;
-    x = (*(int *)ptr) & 0x7fffffff;
-    (*(int *)ptr) &= 0x80000000;
+    x = read32le(ptr) & 0x7fffffff;
     x = (x * 2) / 2;
     x += val - addr;
     if ((x ^ (x >> 1)) & 0x40000000)
       tcc_error_noabort("can't relocate value at %x,%d", addr, type);
-    (*(int *)ptr) |= x & 0x7fffffff;
+    write32le(ptr, (read32le(ptr) & 0x80000000) | (x & 0x7fffffff));
   }
     return;
   case R_ARM_ABS32:
@@ -540,32 +539,32 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
       }
     }
 
-    *(int *)ptr += val;
+    add32le(ptr, val);
 
     return;
   case R_ARM_REL32:
-    *(int *)ptr += val - addr;
+    add32le(ptr, val - addr);
     return;
   case R_ARM_GOTPC:
-    *(int *)ptr += s1->got->sh_addr - addr;
+    add32le(ptr, s1->got->sh_addr - addr);
     return;
   case R_ARM_GOTOFF:
-    *(int *)ptr += val - s1->got->sh_addr;
+    add32le(ptr, val - s1->got->sh_addr);
     return;
   case R_ARM_GOT32:
     /* we load the got offset */
-    *(int *)ptr = get_sym_attr(s1, sym_index, 0)->got_offset;
+    write32le(ptr, get_sym_attr(s1, sym_index, 0)->got_offset);
     return;
   case R_ARM_GOT_PREL:
     /* we load the pc relative got offset */
-    *(int *)ptr = s1->got->sh_addr + get_sym_attr(s1, sym_index, 0)->got_offset - addr - 8;
+    write32le(ptr, s1->got->sh_addr + get_sym_attr(s1, sym_index, 0)->got_offset - addr - 8);
     return;
   case R_ARM_COPY:
     return;
   case R_ARM_V4BX:
     /* trade Thumb support for ARMv4 support */
-    if ((0x0ffffff0 & *(int *)ptr) == 0x012FFF10)
-      *(int *)ptr ^= 0xE12FFF10 ^ 0xE1A0F000; /* BX Rm -> MOV PC, Rm */
+    if ((0x0ffffff0 & read32le(ptr)) == 0x012FFF10)
+      write32le(ptr, read32le(ptr) ^ (0xE12FFF10 ^ 0xE1A0F000)); /* BX Rm -> MOV PC, Rm */
     return;
   case R_ARM_GLOB_DAT:
   case R_ARM_JUMP_SLOT:

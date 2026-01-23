@@ -468,7 +468,7 @@ static void tcc_abi_call_layout_deinit(TCCAbiCallLayout *layout)
   memset(layout, 0, sizeof(*layout));
 }
 
-void tcc_print_quadruple(TACQuadruple *q, int pc);
+void tcc_print_quadruple(TCCIRState *ir, IRQuadCompact *q, int pc);
 void tcc_ir_print_vreg(int vreg);
 
 // clang-format off
@@ -731,55 +731,6 @@ int tcc_ir_svalue_pool_add(TCCIRState *ir, const SValue *sv)
   return ir->svalue_pool_count++;
 }
 
-/* Expand a compact instruction to a full TACQuadruple.
- * This is used during migration to allow existing backend code to work unchanged.
- * The expanded quad reads operands from the pool. */
-void tcc_ir_expand_quad(TCCIRState *ir, int index, TACQuadruple *out)
-{
-  IRQuadCompact *cq = &ir->compact_instructions[index];
-  memset(out, 0, sizeof(TACQuadruple));
-  out->orig_index = cq->orig_index;
-  out->op = cq->op;
-  out->line_num = cq->line_num;
-
-  SValue *dest = tcc_ir_op_get_dest(ir, cq);
-  SValue *src1 = tcc_ir_op_get_src1(ir, cq);
-  SValue *src2 = tcc_ir_op_get_src2(ir, cq);
-
-  if (dest)
-    out->dest = *dest;
-  else
-    out->dest.vr = -1;
-
-  if (src1)
-    out->src1 = *src1;
-  else
-    out->src1.vr = -1;
-
-  if (src2)
-    out->src2 = *src2;
-  else
-    out->src2.vr = -1;
-}
-
-/* Write back modified operands from a TACQuadruple to the pool.
- * This is needed when codegen modifies operands (e.g., filling in physical registers). */
-void tcc_ir_writeback_quad(TCCIRState *ir, int index, TACQuadruple *q)
-{
-  IRQuadCompact *cq = &ir->compact_instructions[index];
-
-  SValue *dest = tcc_ir_op_get_dest(ir, cq);
-  SValue *src1 = tcc_ir_op_get_src1(ir, cq);
-  SValue *src2 = tcc_ir_op_get_src2(ir, cq);
-
-  if (dest)
-    *dest = q->dest;
-  if (src1)
-    *src1 = q->src1;
-  if (src2)
-    *src2 = q->src2;
-}
-
 TCCIRState *tcc_ir_allocate_block()
 {
   TCCIRState *block = (TCCIRState *)tcc_mallocz(sizeof(TCCIRState));
@@ -956,7 +907,7 @@ static int tcc_ir_try_resolve_stack_addr(const TCCIRState *ir, int vreg_encoded,
     return 0;
 
   const IRQuadCompact *def = &ir->compact_instructions[def_idx];
-  const SValue *def_src1 = tcc_ir_op_get_src1((TCCIRState *)ir, def);
+  const SValue *def_src1 = tcc_ir_op_get_src1(ir, def);
   /* Base case: vreg = Addr[StackLoc[off]] (no VT_LVAL and no vreg on the address operand). */
   if (def->op == TCCIR_OP_ASSIGN && tcc_ir_is_stack_addr_operand_novreg(def_src1))
   {
@@ -1698,6 +1649,12 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
   cq->orig_index = pos;
   cq->operand_base = ir->svalue_pool_count;
 
+  if (op == TCCIR_OP_FUNCCALLVOID || op == TCCIR_OP_FUNCCALLVAL)
+  {
+    fprintf(stderr, "DEBUG PUT CALL[%d] START: op=%d (VOID=%d, VAL=%d), operand_base=%d, has_dest=%d, dest=%p\n", pos,
+            op, TCCIR_OP_FUNCCALLVOID, TCCIR_OP_FUNCCALLVAL, cq->operand_base, irop_config[op].has_dest, (void *)dest);
+  }
+
   if (irop_config[op].has_dest == 1)
   {
     IRLiveInterval *dest_interval = NULL;
@@ -1768,6 +1725,12 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
     {
       fprintf(stderr, "tcc_ir_put: src1 is NULL for op %s\n", tcc_ir_get_op_name(op));
       exit(1);
+    }
+    if (op == TCCIR_OP_FUNCCALLVOID || op == TCCIR_OP_FUNCCALLVAL)
+    {
+      fprintf(stderr,
+              "DEBUG PUT CALL[%d]: operand_base=%d, src1_pool_idx=%d, src1->r=0x%x, src1->sym=%p, src1->vr=%d\n", pos,
+              cq->operand_base, ir->svalue_pool_count, src1->r, (void *)src1->sym, src1->vr);
     }
     src1->pr0 = PREG_NONE;
     src1->pr1 = PREG_NONE;
@@ -3416,21 +3379,21 @@ void tcc_ir_materialize_dest(TCCIRState *ir, SValue *dest, TCCMaterializedDest *
   dest->c.i = 0;
 }
 
-static void tcc_ir_storeback_materialized_dest(TACQuadruple *q, TCCMaterializedDest *mat)
+static void tcc_ir_storeback_materialized_dest(SValue *dest, TCCMaterializedDest *mat)
 {
   if (!mat || !mat->needs_storeback)
     return;
 
-  tcc_machine_store_spill_slot(q->dest.pr0, mat->frame_offset);
+  tcc_machine_store_spill_slot(dest->pr0, mat->frame_offset);
   if (mat->is_64bit)
-    tcc_machine_store_spill_slot(q->dest.pr1, mat->frame_offset + 4);
+    tcc_machine_store_spill_slot(dest->pr1, mat->frame_offset + 4);
 
   tcc_machine_release_scratch(&mat->scratch);
 
-  q->dest.pr0 = mat->original_pr0;
-  q->dest.pr1 = mat->original_pr1;
-  q->dest.r = mat->original_r;
-  q->dest.c.i = mat->frame_offset;
+  dest->pr0 = mat->original_pr0;
+  dest->pr1 = mat->original_pr1;
+  dest->r = mat->original_r;
+  dest->c.i = mat->frame_offset;
 }
 
 static void tcc_ir_release_materialized_value(SValue *sv, TCCMaterializedValue *mat)
@@ -3836,12 +3799,19 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
     }
   }
   else if ((sv->vr == -1 || sv->vr == 0 || TCCIR_DECODE_VREG_TYPE(sv->vr) == 0) &&
-           (sv->r == -1 || sv->r == (int)0xffff || (sv->r & VT_VALMASK) == 0x3f))
+           (sv->r == -1 || sv->r == (int)0xffff || (old_v >= VT_CONST)))
   {
-    /* No valid vreg and invalid .r - this is likely a constant that wasn't
-       properly marked. Treat as VT_CONST while preserving important flags. */
+    /* No valid vreg and either invalid .r or a constant - preserve important flags.
+     * This handles global symbol references (VT_CONST | VT_SYM) and plain constants. */
     int flags = sv->r & (VT_LVAL | VT_SYM);
     sv->r = VT_CONST | flags;
+  }
+  else if (sv->vr == -1 && old_r == 0 && sv->sym)
+  {
+    /* Special case: old_r=0 but has a symbol - this is a function symbol reference
+     * that wasn't marked as VT_CONST. Preserve the symbol. */
+    fprintf(stderr, "DEBUG fill_registers: fixing unmarked symbol, sym=%p\n", (void *)sv->sym);
+    sv->r = VT_CONST | VT_SYM;
   }
 }
 
@@ -5606,7 +5576,7 @@ int tcc_ir_store_load_forwarding(TCCIRState *ir)
     int addr_is_local;    /* 1 if this is VT_LOCAL (stack variable) */
     int addr_addrtaken;   /* 1 if address of this local is taken */
     int64_t local_offset; /* offset for VT_LOCAL or base+offset for arrays */
-    Sym *local_sym;       /* symbol for VT_LOCAL */
+    const Sym *local_sym; /* symbol for VT_LOCAL */
     int stored_value_vr;  /* vreg of the stored value */
     SValue stored_value;  /* full SValue of what was stored */
     int instruction_idx;  /* where the store happened */
@@ -6254,24 +6224,9 @@ void tcc_ir_put_soft_call(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2
   SValue param;
   Sym *sym;
   const int call_id = ir ? ir->next_call_id++ : 0;
-  TACQuadruple q = {
-      .op = op,
-  };
   const char *func_name = NULL;
 
-  if (irop_config[q.op].has_src1)
-  {
-    q.src1 = *src1;
-  }
-  if (irop_config[q.op].has_src2)
-  {
-    q.src2 = *src2;
-  }
-  if (irop_config[q.op].has_dest)
-  {
-    q.dest = *dest;
-  }
-  func_name = tcc_get_abi_softcall_name(&q);
+  func_name = tcc_get_abi_softcall_name(src1, src2, dest, op);
   if (func_name == NULL)
   {
     tcc_error("No soft-float ABI function for operation %s\n", tcc_ir_get_op_name(op));
@@ -6279,13 +6234,13 @@ void tcc_ir_put_soft_call(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2
   }
   memset(&param, 0, sizeof(SValue));
   int argc = 0;
-  if (irop_config[q.op].has_src1)
+  if (irop_config[op].has_src1)
   {
     param.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
     tcc_ir_put(ir, TCCIR_OP_FUNCPARAMVAL, src1, &param, NULL);
     argc++;
   }
-  if (irop_config[q.op].has_src2)
+  if (irop_config[op].has_src2)
   {
     param.c.i = TCCIR_ENCODE_PARAM(call_id, 1);
     tcc_ir_put(ir, TCCIR_OP_FUNCPARAMVAL, src2, &param, NULL);
@@ -6296,7 +6251,7 @@ void tcc_ir_put_soft_call(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2
   param.sym = sym;
   param.c.i = 0;
 
-  if (irop_config[q.op].has_dest)
+  if (irop_config[op].has_dest)
   {
     SValue call_id_sv = tcc_ir_svalue_call_id_argc(call_id, argc);
     tcc_ir_put(ir, TCCIR_OP_FUNCCALLVAL, &param, &call_id_sv, dest);
@@ -6526,11 +6481,11 @@ static int tcc_ir_is_fpu_operation(TccIrOp op)
 }
 
 #ifdef CONFIG_TCC_ASM
-static void tcc_ir_codegen_inline_asm(TCCIRState *ir, const TACQuadruple *q)
+static void tcc_ir_codegen_inline_asm(TCCIRState *ir, const SValue *dest)
 {
-  if (!ir || !q)
+  if (!ir || !dest)
     return;
-  const int id = (int)q->src1.c.i;
+  const int id = (int)dest->c.i;
   if (id < 0 || id >= ir->inline_asm_count)
     tcc_error("IR: invalid inline asm id");
 
@@ -6674,6 +6629,14 @@ void tcc_ir_generate_code(TCCIRState *ir)
     SValue *src1 = tcc_ir_op_get_src1(ir, cq);
     SValue *src2 = tcc_ir_op_get_src2(ir, cq);
     SValue *dest = tcc_ir_op_get_dest(ir, cq);
+    if (cq->op == TCCIR_OP_FUNCCALLVOID || cq->op == TCCIR_OP_FUNCCALLVAL)
+    {
+      int src1_off = irop_config[cq->op].has_dest;
+      fprintf(stderr,
+              "DEBUG GEN CALL[%d]: cq->op=%d, operand_base=%d, has_dest=%d, src1_pool_idx=%d, src1->r=0x%x, "
+              "src1->sym=%p, src1->vr=%d\n",
+              i, cq->op, cq->operand_base, src1_off, cq->operand_base + src1_off, src1->r, (void *)src1->sym, src1->vr);
+    }
     if (irop_config[cq->op].has_src1 == 1)
     {
       tcc_ir_fill_registers(ir, src1);
@@ -6846,8 +6809,6 @@ void tcc_ir_generate_code(TCCIRState *ir)
       tcc_ir_materialize_const_to_reg(ir, src2, &mat_src2_reg);
     }
 
-    TACQuadruple qq;
-    tcc_ir_expand_quad(ir, i, &qq);
     switch (cq->op)
     {
     case TCCIR_OP_MUL:
@@ -6868,8 +6829,7 @@ void tcc_ir_generate_code(TCCIRState *ir)
     case TCCIR_OP_UMULL:
     case TCCIR_OP_ADC_GEN:
     case TCCIR_OP_ADC_USE:
-      tcc_gen_machine_data_processing_op(&qq);
-      tcc_ir_writeback_quad(ir, i, &qq);
+      tcc_gen_machine_data_processing_op(src1, src2, dest, cq->op);
       break;
     case TCCIR_OP_FADD:
     case TCCIR_OP_FSUB:
@@ -6880,8 +6840,7 @@ void tcc_ir_generate_code(TCCIRState *ir)
     case TCCIR_OP_CVT_FTOF:
     case TCCIR_OP_CVT_ITOF:
     case TCCIR_OP_CVT_FTOI:
-      tcc_gen_machine_fp_op(&qq);
-      tcc_ir_writeback_quad(ir, i, &qq);
+      tcc_gen_machine_fp_op(src1, src2, dest, cq->op);
       break;
     case TCCIR_OP_LOAD:
     {
@@ -6898,14 +6857,11 @@ void tcc_ir_generate_code(TCCIRState *ir)
           dest->pr1 = REG_IRE2; /* R1 */
         }
       }
-      tcc_ir_expand_quad(ir, i, &qq);
-      tcc_gen_machine_load_op(&qq);
-      tcc_ir_writeback_quad(ir, i, &qq);
+      tcc_gen_machine_load_op(src1, dest, cq->op);
       break;
     }
     case TCCIR_OP_STORE:
-      tcc_gen_machine_store_op(&qq);
-      tcc_ir_writeback_quad(ir, i, &qq);
+      tcc_gen_machine_store_op(src1, dest, cq->op);
       break;
     case TCCIR_OP_RETURNVALUE:
     {
@@ -6915,7 +6871,7 @@ void tcc_ir_generate_code(TCCIRState *ir)
       const SValue *ir_prev_dest = ir_prev ? tcc_ir_op_get_dest(ir, ir_prev) : NULL;
       THGEN_DUMP("DEBUG codegen RETURNVALUE: i=%d src1.r=0x%x src1.vr=%d src1.c.i=%lld src1.pr0=%d prev.op=%d "
                  "prev.dest.vr=%d prev.dest.pr0=%d\n",
-                 i, q->src1.r, src1->vr, (long long)src1->c.i, src1->pr0, ir_prev ? ir_prev->op : -1,
+                 i, cq->op, src1->vr, (long long)src1->c.i, src1->pr0, ir_prev ? ir_prev->op : -1,
                  ir_prev_dest ? ir_prev_dest->vr : -2, ir_prev_dest ? ir_prev_dest->pr0 : -2);
       if (!has_incoming_jump[i] && ir_prev && (ir_prev->op == TCCIR_OP_LOAD || ir_prev->op == TCCIR_OP_ASSIGN) &&
           ir_prev_dest->vr == src1->vr && ir_prev_dest->pr0 == REG_IRET /* R0 */)
@@ -6926,8 +6882,7 @@ void tcc_ir_generate_code(TCCIRState *ir)
       }
       else
       {
-        tcc_gen_machine_return_value_op(&qq);
-        tcc_ir_writeback_quad(ir, i, &qq);
+        tcc_gen_machine_return_value_op(src1, cq->op);
       }
     }
     case TCCIR_OP_RETURNVOID:
@@ -6936,8 +6891,7 @@ void tcc_ir_generate_code(TCCIRState *ir)
       if (i != ir->next_instruction_index - 1)
       {
         return_jump_addrs[num_return_jumps++] = ind;
-        tcc_gen_machine_jump_op(&qq);
-        tcc_ir_writeback_quad(ir, i, &qq);
+        tcc_gen_machine_jump_op(dest, cq->op);
       }
       break;
     case TCCIR_OP_ASSIGN:
@@ -6952,70 +6906,58 @@ void tcc_ir_generate_code(TCCIRState *ir)
         if (tcc_ir_is_64bit_type(dest->type.t))
           dest->pr1 = REG_IRE2; /* R1 */
       }
-      tcc_ir_expand_quad(ir, i, &qq);
-      tcc_gen_machine_assign_op(&qq);
-      tcc_ir_writeback_quad(ir, i, &qq);
+      tcc_gen_machine_assign_op(src1, dest, cq->op);
       break;
     }
     case TCCIR_OP_LEA:
       /* Load Effective Address: compute address of src1 into dest */
-      tcc_gen_machine_lea_op(&qq);
-      tcc_ir_writeback_quad(ir, i, &qq);
+      tcc_gen_machine_lea_op(src1, dest, cq->op);
       break;
     case TCCIR_OP_FUNCPARAMVAL:
     {
-      tcc_gen_machine_func_parameter_op(&qq);
-      tcc_ir_writeback_quad(ir, i, &qq);
+      tcc_gen_machine_func_parameter_op(src1, src2, cq->op);
       break;
     }
     case TCCIR_OP_JUMP:
-      tcc_gen_machine_jump_op(&qq);
-      tcc_ir_writeback_quad(ir, i, &qq);
+      tcc_gen_machine_jump_op(dest, cq->op);
       /* Update mapping to actual instruction address (may have shifted due to literal pool) */
       ir_to_code_mapping[i] = ind - 4;
       /* Clear spill cache at branch - value may come from different path */
       tcc_ir_spill_cache_clear(&ir->spill_cache);
       break;
     case TCCIR_OP_JUMPIF:
-      tcc_gen_machine_conditional_jump_op(&qq);
-      tcc_ir_writeback_quad(ir, i, &qq);
+      tcc_gen_machine_conditional_jump_op(src1, dest, cq->op);
       /* Update mapping to actual instruction address (may have shifted due to literal pool) */
       ir_to_code_mapping[i] = ind - 4;
       /* Clear spill cache at conditional branch - target may have different values */
       tcc_ir_spill_cache_clear(&ir->spill_cache);
       break;
     case TCCIR_OP_IJUMP:
-      tcc_gen_machine_indirect_jump_op(&qq);
-      tcc_ir_writeback_quad(ir, i, &qq);
+      tcc_gen_machine_indirect_jump_op(src1);
       tcc_ir_spill_cache_clear(&ir->spill_cache);
       break;
     case TCCIR_OP_SETIF:
-      tcc_gen_machine_setif_op(&qq);
-      tcc_ir_writeback_quad(ir, i, &qq);
+      tcc_gen_machine_setif_op(src1, src2, dest, cq->op);
       break;
     case TCCIR_OP_BOOL_OR:
     case TCCIR_OP_BOOL_AND:
-      tcc_gen_machine_bool_op(&qq);
-      tcc_ir_writeback_quad(ir, i, &qq);
+      tcc_gen_machine_bool_op(src1, src2, dest, cq->op);
       break;
     case TCCIR_OP_FUNCPARAMVOID:
       /* Create call site for void calls (no parameters) */
-      tcc_gen_machine_func_parameter_op(&qq);
-      tcc_ir_writeback_quad(ir, i, &qq);
+      tcc_gen_machine_func_parameter_op(src1, src2, cq->op);
       break;
     case TCCIR_OP_VLA_ALLOC:
     case TCCIR_OP_VLA_SP_SAVE:
     case TCCIR_OP_VLA_SP_RESTORE:
-      tcc_gen_machine_vla_op(&qq);
-      tcc_ir_writeback_quad(ir, i, &qq);
+      tcc_gen_machine_vla_op(src1, src2, dest, cq->op);
       break;
     case TCCIR_OP_FUNCCALLVOID:
       drop_return_value = 1;
       /* fall through */
     case TCCIR_OP_FUNCCALLVAL:
     {
-      tcc_gen_machine_func_call_op(&qq, drop_return_value, ir, i);
-      tcc_ir_writeback_quad(ir, i, &qq);
+      tcc_gen_machine_func_call_op(src1, src2, dest, drop_return_value, ir, i);
       /* Clear spill cache after function call - callee may have modified memory */
       tcc_ir_spill_cache_clear(&ir->spill_cache);
       break;
@@ -7030,8 +6972,7 @@ void tcc_ir_generate_code(TCCIRState *ir)
     case TCCIR_OP_INLINE_ASM:
     {
 #ifdef CONFIG_TCC_ASM
-      tcc_ir_codegen_inline_asm(ir, &qq);
-      tcc_ir_writeback_quad(ir, i, &qq);
+      tcc_ir_codegen_inline_asm(ir, dest);
       /* Inline asm may clobber registers/memory: treat as a full barrier. */
       tcc_ir_spill_cache_clear(&ir->spill_cache);
 #else
@@ -7058,8 +6999,7 @@ void tcc_ir_generate_code(TCCIRState *ir)
     tcc_gen_machine_end_instruction();
 
     tcc_ir_release_materialized_addr(dest, &mat_dest_addr);
-    tcc_ir_storeback_materialized_dest(&qq, &mat_dest);
-    tcc_ir_writeback_quad(ir, i, &qq);
+    tcc_ir_storeback_materialized_dest(dest, &mat_dest);
     tcc_ir_release_materialized_addr(src2, &mat_src2_addr);
     tcc_ir_release_materialized_value(src2, &mat_src2_reg);
     tcc_ir_release_materialized_value(src2, &mat_src2);
@@ -7221,9 +7161,13 @@ void print_svalue_short(SValue *sv)
   }
 }
 
-void tcc_print_quadruple(TACQuadruple *q, int pc)
+void tcc_print_quadruple(TCCIRState *ir, IRQuadCompact *q, int pc)
 {
   int op = q->op;
+  SValue *src1 = tcc_ir_op_get_src1(ir, q);
+  SValue *src2 = tcc_ir_op_get_src2(ir, q);
+  SValue *dest = tcc_ir_op_get_dest(ir, q);
+
   printf("%04d: ", pc);
   switch (op)
   {
@@ -7237,20 +7181,20 @@ void tcc_print_quadruple(TACQuadruple *q, int pc)
     printf("%s ", tcc_ir_get_op_name(op));
     break;
   case TCCIR_OP_FUNCPARAMVAL:
-    printf("%s%d[call_%d] ", tcc_ir_get_op_name(op), TCCIR_DECODE_PARAM_IDX(q->src2.c.i),
-           TCCIR_DECODE_CALL_ID(q->src2.c.i));
+    printf("%s%d[call_%d] ", tcc_ir_get_op_name(op), TCCIR_DECODE_PARAM_IDX(src2->c.i),
+           TCCIR_DECODE_CALL_ID(src2->c.i));
     break;
   case TCCIR_OP_JUMP:
   case TCCIR_OP_JUMPIF:
-    printf("JMP to %ld ", (long)q->dest.c.i);
+    printf("JMP to %ld ", (long)dest->c.i);
     break;
   case TCCIR_OP_IJUMP:
     printf("IJMP ");
-    print_svalue_short(&q->src1);
+    print_svalue_short(src1);
     printf(" ");
     break;
   default:
-    print_svalue_short(&q->dest);
+    print_svalue_short(dest);
     printf(" <-- ");
   }
 
@@ -7259,11 +7203,11 @@ void tcc_print_quadruple(TACQuadruple *q, int pc)
     if (op == TCCIR_OP_SETIF)
     {
       /* Print condition code instead of vreg for SETIF */
-      printf("(cond=0x%lx)", (unsigned long)q->src1.c.i);
+      printf("(cond=0x%lx)", (unsigned long)src1->c.i);
     }
     else if (op != TCCIR_OP_JUMPIF)
     {
-      print_svalue_short(&q->src1);
+      print_svalue_short(src1);
     }
   }
 
@@ -7273,14 +7217,14 @@ void tcc_print_quadruple(TACQuadruple *q, int pc)
     {
     case TCCIR_OP_CMP:
       printf(",");
-      print_svalue_short(&q->src2);
+      print_svalue_short(src2);
       break;
     case TCCIR_OP_FUNCPARAMVAL:
     case TCCIR_OP_FUNCCALLVAL:
       break;
     default:
       printf(" %s ", tcc_ir_get_op_name(op));
-      print_svalue_short(&q->src2);
+      print_svalue_short(src2);
     }
   }
   /* additional information */
@@ -7293,12 +7237,12 @@ void tcc_print_quadruple(TACQuadruple *q, int pc)
   else if (op == TCCIR_OP_FUNCCALLVAL)
   {
     printf(" --> ");
-    print_svalue_short(&q->dest);
+    print_svalue_short(dest);
   }
   else if (op == TCCIR_OP_JUMPIF)
   {
     printf(" if \"");
-    switch (q->src1.c.i)
+    switch (src1->c.i)
     {
     case TOK_EQ:
       printf("==");
@@ -7331,7 +7275,7 @@ void tcc_print_quadruple(TACQuadruple *q, int pc)
       printf(">=U");
       break;
     default:
-      printf("cc=0x%lx", (unsigned long)q->src1.c.i);
+      printf("cc=0x%lx", (unsigned long)src1->c.i);
       break;
     }
     printf("\"");
@@ -7340,7 +7284,7 @@ void tcc_print_quadruple(TACQuadruple *q, int pc)
   else if (op == TCCIR_OP_SETIF)
   {
     printf("1 if \"");
-    switch (q->src1.c.i)
+    switch (src1->c.i)
     {
     case TOK_EQ:
       printf("==");
@@ -7418,9 +7362,8 @@ void tcc_ir_show(TCCIRState *ir)
 {
   for (int i = 0; i < ir->next_instruction_index; i++)
   {
-    TACQuadruple q;
-    tcc_ir_expand_quad(ir, i, &q);
-    tcc_print_quadruple(&q, i);
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    tcc_print_quadruple(ir, q, i);
   }
 }
 
@@ -7447,7 +7390,9 @@ void tcc_ir_drop_return_value(TCCIRState *ir)
         interval->start = INTERVAL_NOT_STARTED;
         interval->end = 0;
       }
-      last_instr->op = TCCIR_OP_FUNCCALLVOID;
+      /* Do NOT change op to FUNCCALLVOID - this would break operand_base offsets
+       * since FUNCCALLVAL has has_dest=1 while FUNCCALLVOID has has_dest=0.
+       * The dest vreg is already marked invalid above, so codegen will ignore it. */
       dest->vr = -1;
       /* NOTE: Do NOT clear src1.vr - it contains the function address to call! */
     }
@@ -7750,14 +7695,18 @@ void tcc_ir_start_basic_block(TCCIRState *ir)
   ir->basic_block_start = 1;
 }
 
-ST_FUNC int tcc_has_quadruple_64bit_operand(TACQuadruple *q)
+ST_FUNC int tcc_has_quadruple_64bit_operand(SValue *src1, SValue *src2, SValue *dest, TccIrOp op)
 {
-  /* Check both operands for 64-bit (double/long long) types */
-  if (tcc_is_64bit_operand(&q->src1))
+  /* Check all operands for 64-bit (double/long long) types */
+  if (src1 && tcc_is_64bit_operand(src1))
   {
     return 1;
   }
-  if (tcc_is_64bit_operand(&q->src2))
+  if (src2 && tcc_is_64bit_operand(src2))
+  {
+    return 1;
+  }
+  if (dest && tcc_is_64bit_operand(dest))
   {
     return 1;
   }

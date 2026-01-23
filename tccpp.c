@@ -147,7 +147,7 @@ typedef struct tal_header_t
   int line_num; /* negative line_num used for double free check */
   char file_name[TAL_DEBUG_FILE_LEN + 1];
 #endif
-} tal_header_t;
+} __attribute__((aligned(sizeof(void *)))) tal_header_t;
 
 /* ------------------------------------------------------------------------- */
 
@@ -238,15 +238,18 @@ static void *tal_realloc_impl(TinyAlloc **pal, void *p, unsigned size TAL_DEBUG_
   tal_header_t *header;
   void *ret;
   int is_own;
-  unsigned adj_size = (size + 3) & -4;
+  unsigned adj_size = (size + sizeof(void *) - 1) & ~(sizeof(void *) - 1);
   TinyAlloc *al = *pal;
 
 tail_call:
   is_own = (al->buffer <= (uint8_t *)p && (uint8_t *)p < al->buffer + al->size);
   if ((!p || is_own) && size <= al->limit)
   {
-    if (al->p - al->buffer + adj_size + sizeof(tal_header_t) < al->size)
+    /* Align allocation pointer to ensure proper alignment */
+    unsigned char *aligned_p = (unsigned char *)(((size_t)al->p + sizeof(void *) - 1) & ~(sizeof(void *) - 1));
+    if (aligned_p - al->buffer + adj_size + sizeof(tal_header_t) < al->size)
     {
+      al->p = aligned_p;
       header = (tal_header_t *)al->p;
       header->size = adj_size;
 #ifdef TAL_DEBUG

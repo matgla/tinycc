@@ -280,17 +280,19 @@ static int sort_endpoints(const void *a, const void *b)
 
 void tcc_ls_release_register(LSLiveIntervalState *ls, int reg)
 {
+  if (reg < 0)
+    return;
   if (tcc_state->registers_map_for_allocator & ((uint64_t)1 << reg))
   {
     ls->registers_map |= ((uint64_t)1 << reg);
     return;
   }
-  // fprintf(stderr, "Error: trying to release unallocatable register %d\n",
-  // reg); exit(1);
 }
 
 void tcc_ls_release_float_register(LSLiveIntervalState *ls, int reg)
 {
+  if (reg < 0)
+    return;
   if (tcc_state->float_registers_map_for_allocator & ((uint64_t)1 << reg))
   {
     ls->float_registers_map |= ((uint64_t)1 << reg);

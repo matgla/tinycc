@@ -622,7 +622,10 @@ static void asm_parse_directive(TCCState *s1, int global)
     {
       sec->data_offset = ind;
       ptr = section_ptr_add(sec, size);
-      memset(ptr, v, size);
+      if (ptr != NULL)
+      {
+        memset(ptr, v, size);
+      }
     }
     ind += size;
     break;

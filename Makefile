@@ -20,7 +20,7 @@ LIBTCC = libtcc.a
 LIBTCC1 = libtcc1.a
 LINK_LIBTCC =
 LIBS =
-CFLAGS += $(CPPFLAGS) -std=c11 -Wno-unused-function -Wno-declaration-after-statement
+CFLAGS += $(CPPFLAGS) -std=c11 -Wno-unused-function -Wno-declaration-after-statement -Werror
 VPATH = $(TOPSRC) $(TOPSRC)/arch
 -LTCC = $(TOP)/$(LIBTCC)
 
@@ -181,8 +181,8 @@ fp-libs: $(FP_LIBS_CROSS)
 
 $(FP_LIBS_STAMP_DIR)/.%-fp-libs.stamp: %-tcc$(EXESUF) $(FP_LIBS_SRC_DEPS)
 	@mkdir -p $(FP_LIBS_STAMP_DIR)
-	@$(SAN_ENV) $(MAKE) --no-print-directory -C lib CROSS_TARGET=$* fp-libs
-	@touch $@
+	@rm -f $@
+	@$(SAN_ENV) $(MAKE) --no-print-directory -C lib CROSS_TARGET=$* fp-libs && touch $@
 
 install: ; @$(MAKE) --no-print-directory  install$(CFG)
 install-strip: ; @$(MAKE) --no-print-directory  install$(CFG) CONFIG_strip=yes

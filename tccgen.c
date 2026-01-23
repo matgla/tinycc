@@ -2246,11 +2246,10 @@ ST_FUNC void lexpand(void)
       /* If coalescing happened, update full.vr to match the coalesced instruction's dest */
       if (assign_pos < tcc_state->ir->next_instruction_index)
       {
-        TACQuadruple q;
-        tcc_ir_expand_quad(tcc_state->ir, assign_pos, &q);
-        full.vr = q.dest.vr;
+        SValue *dest = tcc_ir_get_dest(tcc_state->ir, assign_pos);
+        full.vr = dest->vr;
         /* Also update full.type to match the coalesced instruction's dest type! */
-        full.type.t = q.dest.type.t;
+        full.type.t = dest->type.t;
       }
 
       /* Create explicit low32 = (uint32_t)full. */
@@ -4260,7 +4259,7 @@ done:
 }
 
 /* return type size as known at compile time. Put alignment at 'a' */
-ST_FUNC int type_size(CType *type, int *a)
+ST_FUNC int type_size(const CType *type, int *a)
 {
   Sym *s;
   int bt;
@@ -5617,7 +5616,7 @@ do_decl:
             }
             else
             {
-              type1.t = (type1.t & ~VT_STRUCT_MASK) | VT_BITFIELD | (bit_size << (VT_STRUCT_SHIFT + 6));
+              type1.t = (type1.t & ~VT_STRUCT_MASK) | VT_BITFIELD | ((unsigned)bit_size << (VT_STRUCT_SHIFT + 6));
             }
           }
           if (v != 0 || (type1.t & VT_BTYPE) == VT_STRUCT)

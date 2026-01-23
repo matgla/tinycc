@@ -1480,7 +1480,7 @@ ST_FUNC void gaddrof(void);
 ST_FUNC int gv(int rc);
 ST_FUNC void gv2(int rc1, int rc2);
 ST_FUNC void gen_op(int op);
-ST_FUNC int type_size(CType *type, int *a);
+ST_FUNC int type_size(const CType *type, int *a);
 ST_FUNC void mk_pointer(CType *type);
 ST_FUNC void vstore(void);
 ST_FUNC void inc(int post, int c);
@@ -1911,20 +1911,6 @@ ST_FUNC void tcc_tcov_block_end(TCCState *s1, int line);
 ST_FUNC void tcc_tcov_block_begin(TCCState *s1);
 ST_FUNC void tcc_tcov_reset_ind(TCCState *s1);
 
-typedef struct TACQuadruple
-{
-  /* Original IR instruction index as emitted by tcc_ir_put().
-   * Optimizations like DCE compact/reorder the IR array and change its indices.
-   * `orig_index` stays stable so features like &&label can map to final code.
-   */
-  TccIrOp op;
-  uint16_t line_num; /* source line number for debug info */
-  int orig_index;
-  SValue src1;
-  SValue src2;
-  SValue dest;
-} TACQuadruple;
-
 /*
  * Target-independent helpers that IR-side load/spill materialization will invoke
  * before delegating to any backend machine op. Backend implementations live in
@@ -1946,41 +1932,42 @@ ST_FUNC void tcc_machine_load_constant(int dest_reg, int dest_reg_high, int64_t 
 ST_FUNC void tcc_machine_load_cmp_result(int dest_reg, int condition_code);
 ST_FUNC void tcc_machine_load_jmp_result(int dest_reg, int jmp_addr, int invert);
 
-ST_FUNC void tcc_gen_machine_data_processing_op(TACQuadruple *q);
-ST_FUNC void tcc_gen_machine_fp_op(TACQuadruple *q);
-ST_FUNC void tcc_gen_machine_load_op(TACQuadruple *q);
-ST_FUNC void tcc_gen_machine_store_op(TACQuadruple *q);
+ST_FUNC void tcc_gen_machine_data_processing_op(SValue *src1, SValue *src2, SValue *dest, TccIrOp op);
+ST_FUNC void tcc_gen_machine_fp_op(SValue *src1, SValue *src2, SValue *dest, TccIrOp op);
+ST_FUNC void tcc_gen_machine_load_op(SValue *src1, SValue *dest, TccIrOp op);
+ST_FUNC void tcc_gen_machine_store_op(SValue *src, SValue *dest, TccIrOp op);
 ST_FUNC void tcc_gen_machine_load_register(SValue *value);
 ST_FUNC void tcc_gen_machine_store_register(SValue *value);
 ST_FUNC void tcc_gen_machine_store_to_stack(int reg, int offset);
 ST_FUNC void tcc_gen_machine_store_to_sp(int reg, int offset);
 
-ST_FUNC void tcc_gen_machine_assign_op(TACQuadruple *q);
-ST_FUNC void tcc_gen_machine_lea_op(TACQuadruple *q);
+ST_FUNC void tcc_gen_machine_assign_op(SValue *src1, SValue *dest, TccIrOp op);
+ST_FUNC void tcc_gen_machine_lea_op(SValue *src1, SValue *dest, TccIrOp op);
 ST_FUNC int tcc_gen_machine_number_of_registers(void);
-ST_FUNC void tcc_gen_machine_return_value_op(TACQuadruple *q);
+ST_FUNC void tcc_gen_machine_return_value_op(SValue *src1, TccIrOp op);
 ST_FUNC void tcc_gen_machine_epilog(int leaffunc);
 ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int stack_size);
-ST_FUNC void tcc_gen_machine_func_call_op(TACQuadruple *q, int drop_value, TCCIRState *ir, int call_idx);
+ST_FUNC void tcc_gen_machine_func_call_op(SValue *func_target, SValue *call_id_sv, SValue *dest, int drop_value,
+                                          TCCIRState *ir, int call_idx);
 ST_FUNC int tcc_gen_machine_abi_assign_call_args(const TCCAbiArgDesc *args, int argc, TCCAbiCallLayout *out_layout);
 ST_FUNC void tcc_gen_machine_save_call_context(void);
 ST_FUNC void tcc_gen_machine_restore_call_context(void);
-ST_FUNC void tcc_gen_machine_jump_op(TACQuadruple *q);
-ST_FUNC void tcc_gen_machine_conditional_jump_op(TACQuadruple *q);
-ST_FUNC void tcc_gen_machine_indirect_jump_op(TACQuadruple *q);
-ST_FUNC void tcc_gen_machine_setif_op(TACQuadruple *q);
-ST_FUNC void tcc_gen_machine_bool_op(TACQuadruple *q);
+ST_FUNC void tcc_gen_machine_jump_op(SValue *dest, TccIrOp op);
+ST_FUNC void tcc_gen_machine_conditional_jump_op(SValue *cond_sv, SValue *dest, TccIrOp op);
+ST_FUNC void tcc_gen_machine_indirect_jump_op(const SValue *src1);
+ST_FUNC void tcc_gen_machine_setif_op(SValue *src1, SValue *src2, SValue *dest, TccIrOp op);
+ST_FUNC void tcc_gen_machine_bool_op(SValue *src1, SValue *src2, SValue *dest, TccIrOp op);
 ST_FUNC void tcc_gen_machine_backpatch_jump(int address, int offset);
 ST_FUNC void tcc_gen_machine_end_instruction(void);
-ST_FUNC void tcc_gen_machine_func_parameter_op(TACQuadruple *q);
+ST_FUNC void tcc_gen_machine_func_parameter_op(SValue *src1, SValue *src2, TccIrOp op);
 
 /* VLA / dynamic stack operations */
-ST_FUNC void tcc_gen_machine_vla_op(TACQuadruple *q);
+ST_FUNC void tcc_gen_machine_vla_op(SValue *src1, SValue *src2, SValue *dest, TccIrOp op);
 
-ST_FUNC const char *tcc_get_abi_softcall_name(TACQuadruple *q);
+ST_FUNC const char *tcc_get_abi_softcall_name(SValue *src1, SValue *src2, SValue *dest, TccIrOp op);
 
 ST_FUNC int tcc_is_64bit_operand(SValue *sv);
-ST_FUNC int tcc_has_quadruple_64bit_operand(TACQuadruple *q);
+ST_FUNC int tcc_has_quadruple_64bit_operand(SValue *src1, SValue *src2, SValue *dest, TccIrOp op);
 
 #define stab_section s1->stab_section
 #define stabstr_section stab_section->link
