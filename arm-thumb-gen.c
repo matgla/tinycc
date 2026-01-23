@@ -2770,15 +2770,6 @@ void load_to_dest(SValue *dest, SValue *sv)
   /* Handle invalid/uninitialized SValue: if the value part (VT_VALMASK) is 0x3f,
    * which is an invalid register/value code, this is likely corrupted or
    * uninitialized. Just load 0 as a fallback. */
-  if ((fr & VT_VALMASK) == 0x3f)
-  {
-    /* Load zero as a safe default */
-    ot_check(th_mov_imm(dest->pr0_reg, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
-    if (dest->pr1_reg != PREG_REG_NONE)
-      ot_check(th_mov_imm(dest->pr1_reg, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
-    return;
-  }
-
   if (fc >= 0)
     sign = 0;
   else

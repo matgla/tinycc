@@ -958,29 +958,27 @@ struct filespec
 };
 
 /* The current value can be: */
-#define VT_VALMASK 0x003f /* mask for value location, register or: */
-#define VT_CONST                                                                                                       \
-  0x0030                 /* constant in vc (must be first non register value)                                          \
-                          */
-#define VT_LLOCAL 0x0031 /* lvalue, offset on stack */
-#define VT_LOCAL 0x0032  /* offset on stack */
-#define VT_CMP 0x0033    /* the value is stored in processor flags (in vc) */
-#define VT_JMP 0x0034    /* value is the consequence of jmp true (even) */
-#define VT_JMPI 0x0035   /* value is the consequence of jmp false (odd) */
-#define VT_PARAM 0x0080  /* register allocation */
-#define VT_LVAL 0x0100   /* var is an lvalue */
-#define VT_SYM 0x0200    /* a symbol value is added */
+#define VT_VALMASK 0x001F /* mask for value location (bits 0-6 of r field) */
+#define VT_CONST 0x0010   /* constant in vc */
+#define VT_LLOCAL 0x0011  /* lvalue, offset on stack */
+#define VT_LOCAL 0x0012   /* offset on stack */
+#define VT_CMP 0x0013     /* the value is stored in processor flags (in vc) */
+#define VT_JMP 0x0014     /* value is the consequence of jmp true (even) */
+#define VT_JMPI 0x0015    /* value is the consequence of jmp false (odd) */
+#define VT_PARAM 0x0020   /* register allocation */
+#define VT_LVAL 0x0040    /* var is an lvalue */
+#define VT_SYM 0x0080     /* a symbol value is added */
 #define VT_MUSTCAST                                                                                                    \
-  0x0C00 /* value must be casted to be correct (used for                                                               \
+  0x0100 /* value must be casted to be correct (used for                                                               \
             char/short stored in integer registers) */
 #define VT_NONCONST                                                                                                    \
-  0x1000 /* VT_CONST, but not an (C standard) integer                                                                  \
+  0x0200 /* VT_CONST, but not an (C standard) integer                                                                  \
             constant expression */
 #define VT_MUSTBOUND                                                                                                   \
-  0x4000 /* bound checking must be done before                                                                         \
+  0x0400 /* bound checking must be done before                                                                         \
             dereferencing value */
 #define VT_BOUNDED                                                                                                     \
-  0x8000 /* value is bounded. The address of the                                                                       \
+  0x0800 /* value is bounded. The address of the                                                                       \
             bounding function call point is in vc */
 
 /* Legacy inline wrappers - for compatibility */

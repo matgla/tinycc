@@ -32,21 +32,29 @@ typedef struct Sym Sym;
  */
 typedef struct SValue
 {
-  struct
-  {
-    uint8_t pr0_reg : 5;     /* Physical register number (0-15 for ARM, 31=PREG_REG_NONE) */
-    uint8_t pr0_spilled : 1; /* Spilled to stack flag */
-  };
+  uint8_t pr0_reg : 5;     /* Physical register number (0-15 for ARM, 31=PREG_REG_NONE) */
+  uint8_t pr0_spilled : 1; /* Spilled to stack flag */
+  uint8_t pr1_reg : 5;     /* Physical register number (0-15 for ARM, 31=PREG_REG_NONE) */
+  uint8_t pr1_spilled : 1; /* Spilled to stack flag */
 
-  struct
+  /* Value location and flags - union for bitfield or legacy access */
+  union
   {
-    uint8_t pr1_reg : 5;     /* Physical register number (0-15 for ARM, 31=PREG_REG_NONE) */
-    uint8_t pr1_spilled : 1; /* Spilled to stack flag */
+    unsigned short r; /* legacy: full 16-bit register + flags */
+    struct
+    {
+      unsigned short location : 8;    /* VT_CONST, VT_LOCAL, VT_LLOCAL, VT_CMP, VT_JMP, VT_JMPI (bits 0-7) */
+      unsigned short is_lval : 1;     /* VT_LVAL: var is an lvalue (bit 8) */
+      unsigned short has_sym : 1;     /* VT_SYM: symbol value is added (bit 9) */
+      unsigned short mustcast : 2;    /* VT_MUSTCAST: value must be casted (bits 10-11) */
+      unsigned short nonconst : 1;    /* VT_NONCONST: not a C standard integer constant (bit 12) */
+      unsigned short reserved_13 : 1; /* unused (bit 13) */
+      unsigned short mustbound : 1;   /* VT_MUSTBOUND: bound checking required (bit 14) */
+      unsigned short bounded : 1;     /* VT_BOUNDED: value is bounded (bit 15) */
+    };
   };
-
-  unsigned short r; /* register + flags */
-  int vr;           /* virtual register for IR */
-  CType type;       /* type */
+  int vr;     /* virtual register for IR */
+  CType type; /* type */
   union
   {
     struct

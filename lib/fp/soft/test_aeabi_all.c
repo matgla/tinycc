@@ -1,7 +1,13 @@
 /*
  * Comprehensive host-side tests for all soft-float aeabi functions
  * Compile with: gcc -O2 -DHOST_TEST test_aeabi_all.c -o test_aeabi_all -lm && ./test_aeabi_all
+ *
+ * THIS FILE MUST NOT BE INCLUDED IN REGULAR BUILDS - IT IS A STANDALONE TEST ONLY
  */
+
+#ifndef HOST_TEST
+#error "test_aeabi_all.c must be compiled with -DHOST_TEST flag only (standalone test file)"
+#endif
 
 #include <float.h>
 #include <math.h>
