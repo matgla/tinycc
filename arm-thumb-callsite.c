@@ -183,7 +183,7 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, i
             }
             else
             {
-              memset(&args[param_idx], 0, sizeof(SValue));
+              svalue_init(&args[param_idx]);
               args[param_idx].vr = -1;
             }
           }

@@ -411,28 +411,8 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
       to_plt = (val >= plt->sh_addr) && (val < plt->sh_addr + plt->data_offset);
     }
     is_call = (type == R_ARM_THM_PC22);
-    if (!to_plt && !is_call)
-    {
-      // int index;
-      // uint8_t *p;
-      // char *name, buf[1024];
-      // Section *text;
-
-      // name = (char *)symtab_section->link->data + sym->st_name;
-      // text = s1->sections[sym->st_shndx];
-
-      /* Modify reloc to target a thumb stub to switch to ARM */
-      // val += 1;
-      // rel->r_info = ELFW(R_INFO)(index, type);
-      /* Create a thumb stub function to switch to ARM mode */
-      // p = section_ptr_add(text, 8);
-      // write32le(p, 0x4778);         /* bx pc */
-      // write32le(p + 2, 0x46c0);     /* nop   */
-      // write32le(p + 4, 0xeafffffe); /* b $sym */
-    }
 
     /* Compute final offset */
-
     x += val - addr;
     if (is_call)
     {

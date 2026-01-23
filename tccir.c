@@ -150,21 +150,21 @@ static void tcc_dump_svalue_short_to(FILE *out, const SValue *sv)
     break;
   case VT_LLOCAL:
     /* VT_LLOCAL with VT_LVAL: spilled pointer needing double dereference */
-    if (sv->pr0 != PREG_NONE && (sv->pr0 & PREG_SPILLED))
+    if (sv->pr0_reg != PREG_REG_NONE && sv->pr0_spilled)
       fprintf(out, SPILL_MARK_BEGIN "SpillLoc[%d]***DEREF***" SPILL_MARK_END, (int)sv->c.i);
     else
       fprintf(out, "VT_LLOCAL(cval=%d)", (int)sv->c.i);
     break;
   case VT_LOCAL:
-    if (sv->pr0 != PREG_NONE)
+    if (sv->pr0_reg != PREG_REG_NONE)
     {
-      if (sv->pr0 & PREG_SPILLED)
+      if (sv->pr0_spilled)
         fprintf(out, SPILL_MARK_BEGIN "SpillLoc[%d]" SPILL_MARK_END, (int)sv->c.i);
       else
       {
         if (!(r & VT_LVAL))
           fprintf(out, "&");
-        fprintf(out, "R%d", sv->pr0);
+        fprintf(out, "R%d", sv->pr0_reg);
       }
     }
     else if (sv->vr != -1)
@@ -193,7 +193,7 @@ static void tcc_dump_svalue_short_to(FILE *out, const SValue *sv)
     fprintf(out, "VT_JMPI");
     break;
   default:
-    if (sv->pr0 == PREG_NONE)
+    if (sv->pr0_reg == PREG_REG_NONE)
     {
       fprintf(out, "VReg %s:%d", tcc_ir_get_vreg_type_string(sv->vr), TCCIR_DECODE_VREG_POSITION(sv->vr));
       if (tcc_ir_operand_needs_dereference(sv))
@@ -201,10 +201,10 @@ static void tcc_dump_svalue_short_to(FILE *out, const SValue *sv)
     }
     else
     {
-      if (sv->pr0 & PREG_SPILLED)
+      if (sv->pr0_spilled)
         fprintf(out, SPILL_MARK_BEGIN "SpillLoc[%d]" SPILL_MARK_END, (int)sv->c.i);
       else
-        fprintf(out, "R%d", sv->pr0);
+        fprintf(out, "R%d", sv->pr0_reg);
       if (tcc_ir_operand_needs_dereference(sv))
         fprintf(out, "***DEREF***");
     }
@@ -409,7 +409,7 @@ static inline int tcc_ir_is_64bit_type(int t)
 /* Check if an SValue operand is spilled (in memory) */
 int tcc_ir_is_spilled(SValue *sv)
 {
-  return (sv->pr0 == PREG_NONE) || (sv->pr0 & PREG_SPILLED);
+  return (sv->pr0_reg == PREG_REG_NONE) || sv->pr0_spilled;
 }
 
 /* Returns true if type is 64-bit (double, ldouble, or long long) - exported for machine code */
@@ -669,7 +669,7 @@ static void tcc_ir_clear_live_intervals(TCCIRState *ir)
 static int tcc_ir_operand_in_memory(SValue *sv)
 {
   const int svt = sv->r & VT_VALMASK;
-  if (sv->pr0 == PREG_NONE)
+  if (sv->pr0_reg == PREG_REG_NONE)
   {
     if (svt == VT_LOCAL)
     {
@@ -686,7 +686,7 @@ static int tcc_ir_operand_in_memory(SValue *sv)
     //     check\n");
     return 0;
   }
-  return sv->pr0 & PREG_SPILLED;
+  return sv->pr0_spilled;
 }
 
 /* SValue pool management for compact IR storage */
@@ -1341,7 +1341,7 @@ void tcc_ir_gen_opf(TCCIRState *ir, int op)
   /* Handle negation (unary) */
   if (ir_op == TCCIR_OP_FNEG)
   {
-    memset(&dest, 0, sizeof(SValue));
+    svalue_init(&dest);
     dest.vr = tcc_ir_get_vreg_temp(ir);
     dest.r = 0;
     dest.type = vtop->type;
@@ -1355,7 +1355,7 @@ void tcc_ir_gen_opf(TCCIRState *ir, int op)
   }
 
   /* Binary FP operations */
-  memset(&dest, 0, sizeof(SValue));
+  svalue_init(&dest);
   dest.vr = tcc_ir_get_vreg_temp(ir);
   dest.r = 0;
   dest.type = vtop[-1].type;
@@ -1442,7 +1442,7 @@ void tcc_ir_gen_opi(TCCIRState *ir, int op)
     return;
   }
 
-  memset(&dest, 0, sizeof(SValue));
+  svalue_init(&dest);
   dest.vr = tcc_ir_get_vreg_temp(ir);
   dest.r = 0;
   /* Most integer ops preserve the operand type, but UMULL produces a 64-bit result. */
@@ -1649,12 +1649,6 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
   cq->orig_index = pos;
   cq->operand_base = ir->svalue_pool_count;
 
-  if (op == TCCIR_OP_FUNCCALLVOID || op == TCCIR_OP_FUNCCALLVAL)
-  {
-    fprintf(stderr, "DEBUG PUT CALL[%d] START: op=%d (VOID=%d, VAL=%d), operand_base=%d, has_dest=%d, dest=%p\n", pos,
-            op, TCCIR_OP_FUNCCALLVOID, TCCIR_OP_FUNCCALLVAL, cq->operand_base, irop_config[op].has_dest, (void *)dest);
-  }
-
   if (irop_config[op].has_dest == 1)
   {
     IRLiveInterval *dest_interval = NULL;
@@ -1714,8 +1708,10 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
       dest_interval->is_lvalue = new_is_lvalue;
     }
 
-    dest->pr0 = PREG_NONE;
-    dest->pr1 = PREG_NONE;
+    dest->pr0_reg = PREG_REG_NONE;
+    dest->pr0_spilled = 0;
+    dest->pr1_reg = PREG_REG_NONE;
+    dest->pr1_spilled = 0;
     tcc_ir_svalue_pool_add(ir, dest);
   }
 
@@ -1726,14 +1722,10 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
       fprintf(stderr, "tcc_ir_put: src1 is NULL for op %s\n", tcc_ir_get_op_name(op));
       exit(1);
     }
-    if (op == TCCIR_OP_FUNCCALLVOID || op == TCCIR_OP_FUNCCALLVAL)
-    {
-      fprintf(stderr,
-              "DEBUG PUT CALL[%d]: operand_base=%d, src1_pool_idx=%d, src1->r=0x%x, src1->sym=%p, src1->vr=%d\n", pos,
-              cq->operand_base, ir->svalue_pool_count, src1->r, (void *)src1->sym, src1->vr);
-    }
-    src1->pr0 = PREG_NONE;
-    src1->pr1 = PREG_NONE;
+    src1->pr0_reg = PREG_REG_NONE;
+    src1->pr0_spilled = 0;
+    src1->pr1_reg = PREG_REG_NONE;
+    src1->pr1_spilled = 0;
     tcc_ir_svalue_pool_add(ir, src1);
   }
 
@@ -1744,8 +1736,10 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
       fprintf(stderr, "tcc_ir_put: src2 is NULL for op %s\n", tcc_ir_get_op_name(op));
       exit(1);
     }
-    src2->pr0 = PREG_NONE;
-    src2->pr1 = PREG_NONE;
+    src2->pr0_reg = PREG_REG_NONE;
+    src2->pr0_spilled = 0;
+    src2->pr1_reg = PREG_REG_NONE;
+    src2->pr1_spilled = 0;
     tcc_ir_svalue_pool_add(ir, src2);
   }
 
@@ -2639,10 +2633,10 @@ void tcc_ir_assign_physical_register(TCCIRState *ir, int vreg, int offset, int r
   if (offset != 0)
   {
     const int is_64bit = interval->is_double || interval->is_llong;
-    interval->allocation.r0 = PREG_SPILLED;
+    interval->allocation.r0 = PREG_SPILLED | PREG_REG_NONE;
     /* For 64-bit values, mark the high word as spilled too so codegen reloads it
      * instead of treating an uninitialized pr1 as a real register. */
-    interval->allocation.r1 = is_64bit ? PREG_SPILLED : PREG_NONE;
+    interval->allocation.r1 = is_64bit ? (PREG_SPILLED | PREG_REG_NONE) : PREG_NONE;
   }
   else
   {
@@ -3089,8 +3083,10 @@ void tcc_ir_materialize_value(TCCIRState *ir, SValue *sv, TCCMaterializedValue *
   {
     /* Stack-passed parameters live in the caller frame. Leave them as VT_PARAM
      * lvalues so the backend can read directly from the caller stack. */
-    sv->pr0 = PREG_NONE;
-    sv->pr1 = PREG_NONE;
+    sv->pr0_reg = PREG_REG_NONE;
+    sv->pr0_spilled = 0;
+    sv->pr1_reg = PREG_REG_NONE;
+    sv->pr1_spilled = 0;
     return;
   }
 
@@ -3120,7 +3116,7 @@ void tcc_ir_materialize_value(TCCIRState *ir, SValue *sv, TCCMaterializedValue *
    * directly. Only materialize them when explicitly needed via tcc_ir_materialize_const_to_reg(). */
 
   /* Check for spilled values - this is the original materialization path */
-  if (!(sv->pr0 & PREG_SPILLED))
+  if (!sv->pr0_spilled)
   {
     return;
   }
@@ -3142,8 +3138,8 @@ void tcc_ir_materialize_value(TCCIRState *ir, SValue *sv, TCCMaterializedValue *
   const int frame_offset = tcc_ir_materialization_offset(ir, sv);
   unsigned short original_r = sv->r;
 
-  result->original_pr0 = sv->pr0;
-  result->original_pr1 = sv->pr1;
+  result->original_pr0 = (sv->pr0_spilled ? PREG_SPILLED : 0) | sv->pr0_reg;
+  result->original_pr1 = (sv->pr1_spilled ? PREG_SPILLED : 0) | sv->pr1_reg;
   result->original_c_i = sv->c.i;
 
   TCCMachineScratchRegs scratch = {0};
@@ -3176,8 +3172,18 @@ void tcc_ir_materialize_value(TCCIRState *ir, SValue *sv, TCCMaterializedValue *
       preserved_flags &= ~VT_LVAL;
   }
 
-  sv->pr0 = scratch.regs[0];
-  sv->pr1 = is_64bit ? scratch.regs[1] : PREG_NONE;
+  sv->pr0_reg = scratch.regs[0];
+  sv->pr0_spilled = 0;
+  if (is_64bit)
+  {
+    sv->pr1_reg = scratch.regs[1];
+    sv->pr1_spilled = 0;
+  }
+  else
+  {
+    sv->pr1_reg = PREG_REG_NONE;
+    sv->pr1_spilled = 0;
+  }
   /* sv->r should only contain the register number and semantic flags (VT_LVAL, VT_PARAM, etc.),
    * not PREG_SPILLED which is only for sv->pr0 */
   sv->r = (unsigned short)(scratch.regs[0] | preserved_flags);
@@ -3204,7 +3210,7 @@ void tcc_ir_materialize_const_to_reg(TCCIRState *ir, SValue *sv, TCCMaterialized
   const int val_kind = sv->r & VT_VALMASK;
 
   /* Only handle values that aren't already in a register */
-  if (sv->pr0 != PREG_NONE && !(sv->pr0 & PREG_SPILLED))
+  if (sv->pr0_reg != PREG_REG_NONE && !sv->pr0_spilled)
     return;
 
   /* Only handle constants, comparisons, and jump conditions */
@@ -3225,8 +3231,8 @@ void tcc_ir_materialize_const_to_reg(TCCIRState *ir, SValue *sv, TCCMaterialized
   const unsigned scratch_flags =
       (is_64bit ? TCC_MACHINE_SCRATCH_NEEDS_PAIR : 0) | (ir ? ir->codegen_materialize_scratch_flags : 0);
 
-  result->original_pr0 = sv->pr0;
-  result->original_pr1 = sv->pr1;
+  result->original_pr0 = (sv->pr0_spilled ? PREG_SPILLED : 0) | sv->pr0_reg;
+  result->original_pr1 = (sv->pr1_spilled ? PREG_SPILLED : 0) | sv->pr1_reg;
   result->original_c_i = sv->c.i;
   result->original_r = sv->r;
 
@@ -3249,8 +3255,18 @@ void tcc_ir_materialize_const_to_reg(TCCIRState *ir, SValue *sv, TCCMaterialized
     tcc_machine_load_jmp_result(scratch.regs[0], sv->c.i, invert);
   }
 
-  sv->pr0 = scratch.regs[0];
-  sv->pr1 = is_64bit ? scratch.regs[1] : PREG_NONE;
+  sv->pr0_reg = scratch.regs[0];
+  sv->pr0_spilled = 0;
+  if (is_64bit)
+  {
+    sv->pr1_reg = scratch.regs[1];
+    sv->pr1_spilled = 0;
+  }
+  else
+  {
+    sv->pr1_reg = PREG_REG_NONE;
+    sv->pr1_spilled = 0;
+  }
   sv->r = (unsigned short)(scratch.regs[0]);
   sv->c.i = 0;
 
@@ -3277,7 +3293,7 @@ void tcc_ir_materialize_addr(TCCIRState *ir, SValue *sv, TCCMaterializedAddr *re
    * handled by VT_LOCAL|VT_LVAL path in the backend.
    * Exclude VT_LOCAL/VT_LLOCAL from being treated as spilled pointers. */
   const int is_local_access = (val_kind == VT_LOCAL || val_kind == VT_LLOCAL);
-  const int spilled_pointer = !is_local_access && (sv->pr0 != PREG_NONE) && (sv->pr0 & PREG_SPILLED);
+  const int spilled_pointer = !is_local_access && (sv->pr0_reg != PREG_REG_NONE) && sv->pr0_spilled;
 
   if (!wants_stack_address && !spilled_pointer)
     return;
@@ -3301,8 +3317,8 @@ void tcc_ir_materialize_addr(TCCIRState *ir, SValue *sv, TCCMaterializedAddr *re
   tcc_ir_require_materialization_result(result, "materialize_addr");
 
   result->original_r = sv->r;
-  result->original_pr0 = sv->pr0;
-  result->original_pr1 = sv->pr1;
+  result->original_pr0 = (sv->pr0_spilled ? PREG_SPILLED : 0) | sv->pr0_reg;
+  result->original_pr1 = (sv->pr1_spilled ? PREG_SPILLED : 0) | sv->pr1_reg;
   result->original_c_i = sv->c.i;
 
   TCCMachineScratchRegs scratch = {0};
@@ -3320,16 +3336,20 @@ void tcc_ir_materialize_addr(TCCIRState *ir, SValue *sv, TCCMaterializedAddr *re
   {
     tcc_machine_addr_of_stack_slot(target_reg, frame_offset, is_param);
     int flags = (sv->r & ~VT_VALMASK) | VT_LVAL;
-    sv->pr0 = target_reg;
-    sv->pr1 = PREG_NONE;
+    sv->pr0_reg = target_reg;
+    sv->pr0_spilled = 0;
+    sv->pr1_reg = PREG_REG_NONE;
+    sv->pr1_spilled = 0;
     sv->r = (unsigned short)(target_reg | flags);
     sv->c.i = 0;
   }
   else if (spilled_pointer)
   {
     tcc_machine_load_spill_slot(target_reg, frame_offset);
-    sv->pr0 = target_reg;
-    sv->pr1 = PREG_NONE;
+    sv->pr0_reg = target_reg;
+    sv->pr0_spilled = 0;
+    sv->pr1_reg = PREG_REG_NONE;
+    sv->pr1_spilled = 0;
     sv->r = (unsigned short)((sv->r & ~VT_VALMASK) | target_reg);
     sv->c.i = 0;
   }
@@ -3345,7 +3365,7 @@ void tcc_ir_materialize_dest(TCCIRState *ir, SValue *dest, TCCMaterializedDest *
 
   if (!ir || !dest)
     return;
-  if (!(dest->pr0 & PREG_SPILLED))
+  if (!dest->pr0_spilled)
     return;
   if (!tcc_is_vreg_valid(ir, dest->vr))
     return;
@@ -3366,16 +3386,26 @@ void tcc_ir_materialize_dest(TCCIRState *ir, SValue *dest, TCCMaterializedDest *
   result->needs_storeback = 1;
   result->is_64bit = is_64bit;
   result->frame_offset = frame_offset;
-  result->original_pr0 = dest->pr0;
-  result->original_pr1 = dest->pr1;
+  result->original_pr0 = (dest->pr0_spilled ? PREG_SPILLED : 0) | dest->pr0_reg;
+  result->original_pr1 = (dest->pr1_spilled ? PREG_SPILLED : 0) | dest->pr1_reg;
   result->original_r = dest->r;
   result->scratch = scratch;
 
-  dest->pr0 = scratch.regs[0];
-  dest->pr1 = is_64bit ? scratch.regs[1] : PREG_NONE;
+  dest->pr0_reg = scratch.regs[0];
+  dest->pr0_spilled = 0;
+  if (is_64bit)
+  {
+    dest->pr1_reg = scratch.regs[1];
+    dest->pr1_spilled = 0;
+  }
+  else
+  {
+    dest->pr1_reg = PREG_REG_NONE;
+    dest->pr1_spilled = 0;
+  }
   int flags = dest->r & ~VT_VALMASK;
   flags &= ~VT_LVAL;
-  dest->r = (unsigned short)(dest->pr0 | flags);
+  dest->r = (unsigned short)(dest->pr0_reg | flags);
   dest->c.i = 0;
 }
 
@@ -3384,14 +3414,16 @@ static void tcc_ir_storeback_materialized_dest(SValue *dest, TCCMaterializedDest
   if (!mat || !mat->needs_storeback)
     return;
 
-  tcc_machine_store_spill_slot(dest->pr0, mat->frame_offset);
+  tcc_machine_store_spill_slot(dest->pr0_reg, mat->frame_offset);
   if (mat->is_64bit)
-    tcc_machine_store_spill_slot(dest->pr1, mat->frame_offset + 4);
+    tcc_machine_store_spill_slot(dest->pr1_reg, mat->frame_offset + 4);
 
   tcc_machine_release_scratch(&mat->scratch);
 
-  dest->pr0 = mat->original_pr0;
-  dest->pr1 = mat->original_pr1;
+  dest->pr0_reg = mat->original_pr0 & PREG_REG_NONE;
+  dest->pr0_spilled = (mat->original_pr0 & PREG_SPILLED) != 0;
+  dest->pr1_reg = mat->original_pr1 & PREG_REG_NONE;
+  dest->pr1_spilled = (mat->original_pr1 & PREG_SPILLED) != 0;
   dest->r = mat->original_r;
   dest->c.i = mat->frame_offset;
 }
@@ -3404,8 +3436,10 @@ static void tcc_ir_release_materialized_value(SValue *sv, TCCMaterializedValue *
   tcc_machine_release_scratch(&mat->scratch);
   if (sv)
   {
-    sv->pr0 = mat->original_pr0;
-    sv->pr1 = mat->original_pr1;
+    sv->pr0_reg = mat->original_pr0 & PREG_REG_NONE;
+    sv->pr0_spilled = (mat->original_pr0 & PREG_SPILLED) != 0;
+    sv->pr1_reg = mat->original_pr1 & PREG_REG_NONE;
+    sv->pr1_spilled = (mat->original_pr1 & PREG_SPILLED) != 0;
     sv->r = mat->original_r;
     sv->c.i = mat->original_c_i;
   }
@@ -3419,8 +3453,10 @@ static void tcc_ir_release_materialized_addr(SValue *sv, TCCMaterializedAddr *ma
   tcc_machine_release_scratch(&mat->scratch);
   if (sv)
   {
-    sv->pr0 = mat->original_pr0;
-    sv->pr1 = mat->original_pr1;
+    sv->pr0_reg = mat->original_pr0 & PREG_REG_NONE;
+    sv->pr0_spilled = (mat->original_pr0 & PREG_SPILLED) != 0;
+    sv->pr1_reg = mat->original_pr1 & PREG_REG_NONE;
+    sv->pr1_spilled = (mat->original_pr1 & PREG_SPILLED) != 0;
     sv->r = mat->original_r;
     sv->c.i = mat->original_c_i;
   }
@@ -3668,8 +3704,10 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
    */
   if ((old_v == VT_LOCAL || old_v == VT_LLOCAL) && sv->vr == -1)
   {
-    sv->pr0 = PREG_NONE;
-    sv->pr1 = PREG_NONE;
+    sv->pr0_reg = PREG_REG_NONE;
+    sv->pr0_spilled = 0;
+    sv->pr1_reg = PREG_REG_NONE;
+    sv->pr1_spilled = 0;
     return;
   }
   if (tcc_is_vreg_valid(ir, sv->vr))
@@ -3687,8 +3725,10 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
     if (TCCIR_DECODE_VREG_TYPE(sv->vr) == TCCIR_VREG_TYPE_PARAM && interval && interval->incoming_reg0 < 0 &&
         interval->allocation.r0 == PREG_NONE && interval->allocation.offset == 0)
     {
-      sv->pr0 = PREG_NONE;
-      sv->pr1 = PREG_NONE;
+      sv->pr0_reg = PREG_REG_NONE;
+      sv->pr0_spilled = 0;
+      sv->pr1_reg = PREG_REG_NONE;
+      sv->pr1_spilled = 0;
       sv->c.i = interval->original_offset;
 
       int need_lval = (old_r & VT_LVAL);
@@ -3707,8 +3747,10 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
     int is_register_param =
         (TCCIR_DECODE_VREG_TYPE(sv->vr) == TCCIR_VREG_TYPE_PARAM && interval && interval->incoming_reg0 >= 0);
 
-    sv->pr0 = interval->allocation.r0;
-    sv->pr1 = interval->allocation.r1;
+    sv->pr0_reg = interval->allocation.r0 & PREG_REG_NONE;
+    sv->pr0_spilled = (interval->allocation.r0 & PREG_SPILLED) != 0;
+    sv->pr1_reg = interval->allocation.r1 & PREG_REG_NONE;
+    sv->pr1_spilled = (interval->allocation.r1 & PREG_SPILLED) != 0;
     sv->c.i = interval->allocation.offset;
 
     /* Determine if we should preserve VT_LVAL:
@@ -3734,7 +3776,7 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
       preserve_flags |= VT_LVAL;
     }
 
-    if (interval->allocation.r0 == PREG_SPILLED || interval->allocation.offset != 0)
+    if ((interval->allocation.r0 & PREG_SPILLED) || interval->allocation.offset != 0)
     {
       /* Spilled to stack - treat as local.
        * For computed values (old_r was 0 or a register), add VT_LVAL to load the value.
@@ -3808,7 +3850,6 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
   {
     /* Special case: old_r=0 but has a symbol - this is a function symbol reference
      * that wasn't marked as VT_CONST. Preserve the symbol. */
-    fprintf(stderr, "DEBUG fill_registers: fixing unmarked symbol, sym=%p\n", (void *)sv->sym);
     sv->r = VT_CONST | VT_SYM;
   }
 }
@@ -4093,7 +4134,7 @@ int tcc_ir_bool_cse(TCCIRState *ir)
 #endif
         q->op = TCCIR_OP_ASSIGN;
         *src1 = *tcc_ir_op_get_dest(ir, prev);
-        memset(src2, 0, sizeof(SValue));
+        svalue_init(src2);
         src2->vr = -1;
         changes++;
         found = 1;
@@ -4494,7 +4535,7 @@ int tcc_ir_bool_simplification(TCCIRState *ir)
     /* Replace outer op with ASSIGN from first inner op result */
     q->op = TCCIR_OP_ASSIGN;
     *src1 = *tcc_ir_op_get_dest(ir, q1); /* Copy the result of first BOOL_OR/BOOL_AND */
-    memset(src2, 0, sizeof(SValue));
+    svalue_init(src2);
     src2->vr = -1;
 
     /* The second inner op will be eliminated by DCE if unused */
@@ -6211,7 +6252,7 @@ void tcc_ir_put_soft_call(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2
     tcc_error("No soft-float ABI function for operation %s\n", tcc_ir_get_op_name(op));
     return;
   }
-  memset(&param, 0, sizeof(SValue));
+  svalue_init(&param);
   int argc = 0;
   if (irop_config[op].has_src1)
   {
@@ -6608,14 +6649,6 @@ void tcc_ir_generate_code(TCCIRState *ir)
     SValue *src1 = tcc_ir_op_get_src1(ir, cq);
     SValue *src2 = tcc_ir_op_get_src2(ir, cq);
     SValue *dest = tcc_ir_op_get_dest(ir, cq);
-    if (cq->op == TCCIR_OP_FUNCCALLVOID || cq->op == TCCIR_OP_FUNCCALLVAL)
-    {
-      int src1_off = irop_config[cq->op].has_dest;
-      fprintf(stderr,
-              "DEBUG GEN CALL[%d]: cq->op=%d, operand_base=%d, has_dest=%d, src1_pool_idx=%d, src1->r=0x%x, "
-              "src1->sym=%p, src1->vr=%d\n",
-              i, cq->op, cq->operand_base, src1_off, cq->operand_base + src1_off, src1->r, (void *)src1->sym, src1->vr);
-    }
     if (irop_config[cq->op].has_src1 == 1)
     {
       tcc_ir_fill_registers(ir, src1);
@@ -6753,7 +6786,7 @@ void tcc_ir_generate_code(TCCIRState *ir)
     }
     else if (need_src1_addr)
     {
-      tcc_ir_materialize_addr(ir, src1, &mat_src1_addr, dest->pr0);
+      tcc_ir_materialize_addr(ir, src1, &mat_src1_addr, dest->pr0_reg);
     }
 
     if (need_src2_value)
@@ -6762,7 +6795,7 @@ void tcc_ir_generate_code(TCCIRState *ir)
     }
     else if (need_src2_addr)
     {
-      tcc_ir_materialize_addr(ir, src2, &mat_src2_addr, dest->pr0);
+      tcc_ir_materialize_addr(ir, src2, &mat_src2_addr, dest->pr0_reg);
     }
 
     if (need_dest_value)
@@ -6830,10 +6863,12 @@ void tcc_ir_generate_code(TCCIRState *ir)
       if (ir_next && ir_next->op == TCCIR_OP_RETURNVALUE && ir_next_src1 && ir_next_src1->vr == dest->vr &&
           !has_incoming_jump[i + 1])
       {
-        dest->pr0 = REG_IRET; /* R0 */
+        dest->pr0_reg = REG_IRET; /* R0 */
+        dest->pr0_spilled = 0;
         if (tcc_ir_is_64bit_type(dest->type.t))
         {
-          dest->pr1 = REG_IRE2; /* R1 */
+          dest->pr1_reg = REG_IRE2; /* R1 */
+          dest->pr1_spilled = 0;
         }
       }
       tcc_gen_machine_load_op(src1, dest, cq->op);
@@ -6848,12 +6883,12 @@ void tcc_ir_generate_code(TCCIRState *ir)
        * skip the return value copy */
       const IRQuadCompact *ir_prev = (i > 0) ? &ir->compact_instructions[i - 1] : NULL;
       const SValue *ir_prev_dest = ir_prev ? tcc_ir_op_get_dest(ir, ir_prev) : NULL;
-      THGEN_DUMP("DEBUG codegen RETURNVALUE: i=%d src1.r=0x%x src1.vr=%d src1.c.i=%lld src1.pr0=%d prev.op=%d "
-                 "prev.dest.vr=%d prev.dest.pr0=%d\n",
-                 i, cq->op, src1->vr, (long long)src1->c.i, src1->pr0, ir_prev ? ir_prev->op : -1,
-                 ir_prev_dest ? ir_prev_dest->vr : -2, ir_prev_dest ? ir_prev_dest->pr0 : -2);
+      THGEN_DUMP("DEBUG codegen RETURNVALUE: i=%d src1.r=0x%x src1.vr=%d src1.c.i=%lld src1.pr0_reg=%d prev.op=%d "
+                 "prev.dest.vr=%d prev.dest.pr0_reg=%d\n",
+                 i, cq->op, src1->vr, (long long)src1->c.i, src1->pr0_reg, ir_prev ? ir_prev->op : -1,
+                 ir_prev_dest ? ir_prev_dest->vr : -2, ir_prev_dest ? ir_prev_dest->pr0_reg : -2);
       if (!has_incoming_jump[i] && ir_prev && (ir_prev->op == TCCIR_OP_LOAD || ir_prev->op == TCCIR_OP_ASSIGN) &&
-          ir_prev_dest->vr == src1->vr && ir_prev_dest->pr0 == REG_IRET /* R0 */)
+          ir_prev_dest->vr == src1->vr && ir_prev_dest->pr0_reg == REG_IRET /* R0 */)
       {
         THGEN_DUMP("DEBUG codegen RETURNVALUE: SKIP due to peephole\n");
         /* Value is already in R0, no need to generate return value op */
@@ -6881,9 +6916,13 @@ void tcc_ir_generate_code(TCCIRState *ir)
       const SValue *ir_next_src1 = ir_next ? tcc_ir_op_get_src1(ir, ir_next) : NULL;
       if (ir_next && ir_next->op == TCCIR_OP_RETURNVALUE && ir_next_src1->vr == dest->vr && !has_incoming_jump[i + 1])
       {
-        dest->pr0 = REG_IRET; /* R0 */
+        dest->pr0_reg = REG_IRET; /* R0 */
+        dest->pr0_spilled = 0;
         if (tcc_ir_is_64bit_type(dest->type.t))
-          dest->pr1 = REG_IRE2; /* R1 */
+        {
+          dest->pr1_reg = REG_IRE2; /* R1 */
+          dest->pr1_spilled = 0;
+        }
       }
       tcc_gen_machine_assign_op(src1, dest, cq->op);
       break;
@@ -7059,22 +7098,22 @@ void print_svalue_short(SValue *sv)
     break;
   case VT_LLOCAL:
     /* VT_LLOCAL with VT_LVAL: spilled pointer needing double dereference */
-    if (sv->pr0 != PREG_NONE && (sv->pr0 & PREG_SPILLED))
+    if (sv->pr0_reg != PREG_REG_NONE && sv->pr0_spilled)
       printf(SPILL_MARK_BEGIN "SpillLoc[%ld]***DEREF***" SPILL_MARK_END, (long)sv->c.i);
     else
       printf("VT_LLOCAL (cval=%ld)", (long)sv->c.i);
     break;
   // case VT_LOCAL: printf("VReg%d[stack_offset=%d]", sv->vreg, sv->c.i); break;
   case VT_LOCAL:
-    if (sv->pr0 != PREG_NONE)
+    if (sv->pr0_reg != PREG_REG_NONE)
     { /* already register-allocated? */
-      if (sv->pr0 & PREG_SPILLED)
+      if (sv->pr0_spilled)
         printf(SPILL_MARK_BEGIN "SpillLoc[%ld]" SPILL_MARK_END, (long)sv->c.i);
       else
       {
         if (!(sv->r & VT_LVAL))
           printf("&"); /* address-of */
-        printf("R%d", sv->pr0);
+        printf("R%d", sv->pr0_reg);
       }
     }
     else if (sv->vr != -1)
@@ -7102,7 +7141,7 @@ void print_svalue_short(SValue *sv)
     printf("VT_JMPI");
     break;
   default: /* must be temporary vreg */
-    if (sv->pr0 == PREG_NONE)
+    if (sv->pr0_reg == PREG_REG_NONE)
     {
       tcc_ir_print_vreg(sv->vr);
 #if 0
@@ -7129,10 +7168,10 @@ void print_svalue_short(SValue *sv)
     }
     else
     {
-      if (sv->pr0 & PREG_SPILLED)
+      if (sv->pr0_spilled)
         printf(SPILL_MARK_BEGIN "SpillLoc[%ld]" SPILL_MARK_END, (long)sv->c.i);
       else
-        printf("R%d", sv->pr0);
+        printf("R%d", sv->pr0_reg);
       if (tcc_ir_operand_needs_dereference(sv))
         printf("***DEREF***");
     }
@@ -7423,8 +7462,8 @@ int tcc_ir_generate_test(TCCIRState *ir, int inv, int t)
     int jtrue = vtop->jtrue;
     int jfalse = vtop->jfalse;
 
-    memset(&src, 0, sizeof(SValue));
-    memset(&dest, 0, sizeof(SValue));
+    svalue_init(&src);
+    svalue_init(&dest);
     src.vr = -1;
     /* Use cmp_op and invert if needed. In TCC, comparison tokens are designed
      * so that XORing with 1 inverts them (e.g., TOK_EQ ^ 1 = TOK_NE) */
@@ -7487,7 +7526,7 @@ int tcc_ir_generate_test(TCCIRState *ir, int inv, int t)
     else
     {
       SValue dest;
-      memset(&dest, 0, sizeof(SValue));
+      svalue_init(&dest);
       dest.vr = -1;
       dest.c.i = t;
       t = tcc_ir_put(ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
@@ -7501,7 +7540,7 @@ int tcc_ir_generate_test(TCCIRState *ir, int inv, int t)
       if ((vtop->c.i != 0) != inv)
       {
         SValue dest;
-        memset(&dest, 0, sizeof(SValue));
+        svalue_init(&dest);
         dest.vr = -1;
         dest.c.i = t;
         t = tcc_ir_put(ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
@@ -7567,18 +7606,20 @@ void tcc_ir_generate_cmp_jmp_set(TCCIRState *ir)
     SValue src, dest;
     int jtrue = vtop->jtrue;
     int jfalse = vtop->jfalse;
-    memset(&src, 0, sizeof(SValue));
-    memset(&dest, 0, sizeof(SValue));
+    svalue_init(&src);
+    svalue_init(&dest);
     dest.vr = tcc_ir_get_vreg_temp(ir);
     dest.type.t = VT_INT;
-    dest.pr0 = PREG_NONE;
-    dest.pr1 = PREG_NONE;
+    dest.pr0_reg = PREG_REG_NONE;
+    dest.pr0_spilled = 0;
+    dest.pr1_reg = PREG_REG_NONE;
+    dest.pr1_spilled = 0;
 
     if (jtrue >= 0 || jfalse >= 0)
     {
       /* We have pending jump chains - need to merge them with the comparison */
       SValue jump_dest;
-      memset(&jump_dest, 0, sizeof(SValue));
+      svalue_init(&jump_dest);
       jump_dest.vr = -1;
 
       /* Generate SETIF for the comparison part */
@@ -7596,8 +7637,10 @@ void tcc_ir_generate_cmp_jmp_set(TCCIRState *ir)
         tcc_ir_backpatch_to_here(ir, jtrue);
         src.r = VT_CONST;
         src.c.i = 1;
-        src.pr0 = PREG_NONE;
-        src.pr1 = PREG_NONE;
+        src.pr0_reg = PREG_REG_NONE;
+        src.pr0_spilled = 0;
+        src.pr1_reg = PREG_REG_NONE;
+        src.pr1_spilled = 0;
         tcc_ir_put(ir, TCCIR_OP_ASSIGN, &src, NULL, &dest);
         if (jfalse >= 0)
         {
@@ -7641,9 +7684,9 @@ void tcc_ir_generate_cmp_jmp_set(TCCIRState *ir)
     SValue dest, src1;
     SValue jump_dest;
     int t;
-    memset(&src1, 0, sizeof(SValue));
-    memset(&dest, 0, sizeof(SValue));
-    memset(&jump_dest, 0, sizeof(SValue));
+    svalue_init(&src1);
+    svalue_init(&dest);
+    svalue_init(&jump_dest);
     dest.vr = tcc_ir_get_vreg_temp(ir);
     dest.type.t = VT_INT;
     src1.vr = -1;

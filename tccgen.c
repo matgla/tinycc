@@ -218,7 +218,7 @@ static int gind()
 static void gjmp_addr_acs(int t)
 {
   SValue dest;
-  memset(&dest, 0, sizeof(SValue));
+  svalue_init(&dest);
   dest.vr = -1;
   dest.c.i = t;
   tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
@@ -231,7 +231,7 @@ static int gjmp_acs(int t)
 {
   // t = gjmp(t);
   SValue dest;
-  memset(&dest, 0, sizeof(SValue));
+  svalue_init(&dest);
   dest.vr = -1;
   dest.c.i = t;
   t = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
@@ -1072,8 +1072,10 @@ static void vsetc(CType *type, int r, CValue *vc)
   vtop->r = r;
   vtop->c = *vc;
   vtop->vr = -1;
-  vtop->pr0 = PREG_NONE;
-  vtop->pr1 = PREG_NONE;
+  vtop->pr0_reg = PREG_REG_NONE;
+  vtop->pr0_spilled = 0;
+  vtop->pr1_reg = PREG_REG_NONE;
+  vtop->pr1_spilled = 0;
   vtop->sym = NULL;
   /* Note: jtrue/jfalse are in a union with c, so we DON'T initialize them here.
      They should only be used when r == VT_CMP, and c is used otherwise. */
@@ -2046,7 +2048,8 @@ ST_FUNC int gv(int rc)
         }
 
         vset_VT_JMP();
-        SValue dest = (SValue){0};
+        SValue dest;
+        svalue_init(&dest);
         dest.type = vtop->type;
         dest.vr = vreg;
         tcc_ir_put(tcc_state->ir, TCCIR_OP_LOAD, vtop, NULL, &dest);
@@ -2077,7 +2080,8 @@ ST_FUNC int gv(int rc)
       }
 
       vset_VT_JMP();
-      SValue dest = (SValue){0};
+      SValue dest;
+      svalue_init(&dest);
       dest.type.t = vtop->type.t;
       dest.vr = vreg;
       tcc_ir_put(tcc_state->ir, TCCIR_OP_LOAD, vtop, NULL, &dest);
@@ -2514,7 +2518,7 @@ static void gen_opl(int op)
       SValue param_num;
       SValue dest;
       const int call_id = tcc_state->ir ? tcc_state->ir->next_call_id++ : 0;
-      memset(&param_num, 0, sizeof(SValue));
+      svalue_init(&param_num);
       param_num.vr = -1;
       /* Generate FUNCPARAMVAL for arg1 (param 0) */
       param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
@@ -2523,7 +2527,7 @@ static void gen_opl(int op)
       param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 1);
       tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[0], &param_num, NULL);
       /* Generate FUNCCALLVAL for the function call (returns long long) */
-      memset(&dest, 0, sizeof(SValue));
+      svalue_init(&dest);
       dest.type.t = VT_LLONG;
       dest.r = 0;
       dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
@@ -2551,7 +2555,7 @@ static void gen_opl(int op)
       {
         /* 64-bit add/sub - generate single IR operation */
         SValue dest;
-        memset(&dest, 0, sizeof(SValue));
+        svalue_init(&dest);
         dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
         dest.type.t = dest_type;
         dest.r = 0;
@@ -2568,7 +2572,7 @@ static void gen_opl(int op)
       {
         /* 64-bit bitwise ops (^, &, |) - generate single IR operation */
         SValue dest;
-        memset(&dest, 0, sizeof(SValue));
+        svalue_init(&dest);
         dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
         dest.type.t = dest_type;
         dest.r = 0;
@@ -2757,7 +2761,7 @@ static void gen_opl(int op)
         SValue param_num;
         SValue dest;
         const int call_id = tcc_state->ir ? tcc_state->ir->next_call_id++ : 0;
-        memset(&param_num, 0, sizeof(SValue));
+        svalue_init(&param_num);
         param_num.vr = -1;
         /* Generate FUNCPARAMVAL for arg1 (param 0) */
         param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
@@ -2766,7 +2770,7 @@ static void gen_opl(int op)
         param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 1);
         tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[0], &param_num, NULL);
         /* Generate FUNCCALLVAL for the function call (returns int: -1, 0, or 1) */
-        memset(&dest, 0, sizeof(SValue));
+        svalue_init(&dest);
         dest.type.t = VT_INT;
         dest.r = 0;
         dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
@@ -4548,7 +4552,7 @@ ST_FUNC void vstore(void)
          * IR uses 0-based parameter indices. */
         SValue param_num;
         const int call_id = tcc_state->ir ? tcc_state->ir->next_call_id++ : 0;
-        memset(&param_num, 0, sizeof(SValue));
+        svalue_init(&param_num);
         param_num.vr = -1;
 
         /* memmove(dest, src, size) */
@@ -6336,7 +6340,7 @@ ST_FUNC void indir(void)
   if (vtop->r & VT_LVAL)
   {
     SValue dest;
-    memset(&dest, 0, sizeof(SValue));
+    svalue_init(&dest);
     dest.type = *pointed_type(&vtop->type);
     dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
     tcc_ir_put(tcc_state->ir, TCCIR_OP_ASSIGN, vtop, NULL, &dest);
@@ -7435,7 +7439,7 @@ tok_next:
             if (!NOEVAL_WANTED)
             {
               SValue num;
-              memset(&num, 0, sizeof(SValue));
+              svalue_init(&num);
               num.vr = -1;
               num.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
               tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL);
@@ -7463,7 +7467,7 @@ tok_next:
       {
         r = tcc_state->reverse_funcargs;
         SValue num;
-        memset(&num, 0, sizeof(SValue));
+        svalue_init(&num);
         num.vr = -1;
         for (;;)
         {
@@ -7519,7 +7523,7 @@ tok_next:
           if (!NOEVAL_WANTED)
           {
             SValue num;
-            memset(&num, 0, sizeof(SValue));
+            svalue_init(&num);
             num.vr = -1;
             num.c.i = TCCIR_ENCODE_PARAM(call_id, nb_args - 1 - n);
             tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL);
@@ -7557,7 +7561,7 @@ tok_next:
         if (vtop->r & VT_LVAL)
         {
           SValue load_dest;
-          memset(&load_dest, 0, sizeof(SValue));
+          svalue_init(&load_dest);
           load_dest.type = vtop->type;
           load_dest.r = 0;
           load_dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
@@ -7571,7 +7575,7 @@ tok_next:
       else
       {
         SValue dest;
-        memset(&dest, 0, sizeof(SValue));
+        svalue_init(&dest);
         if (nb_args == 0)
         {
           SValue call_id_sv = tcc_ir_svalue_call_id_argc(call_id, 0);
@@ -7590,7 +7594,7 @@ tok_next:
         if (vtop->r & VT_LVAL)
         {
           SValue load_dest;
-          memset(&load_dest, 0, sizeof(SValue));
+          svalue_init(&load_dest);
           load_dest.type = vtop->type;
           load_dest.r = 0;
           load_dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
@@ -8164,8 +8168,8 @@ static void expr_cond(void)
       {
         /* Copy true branch result to false branch's vreg so both paths use same vreg */
         SValue src, dest;
-        memset(&src, 0, sizeof(SValue));
-        memset(&dest, 0, sizeof(SValue));
+        svalue_init(&src);
+        svalue_init(&dest);
         src.vr = true_vreg;
         src.type = vtop->type;
         dest.vr = false_vreg;
@@ -8334,7 +8338,8 @@ static void gfunc_return(CType *func_type)
     if (vtop->r & VT_LVAL)
     {
       /* Load the value first - this ensures proper size is used */
-      SValue dest = (SValue){0};
+      SValue dest;
+      svalue_init(&dest);
       dest.type = vtop->type;
       dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
       dest.r = 0;
@@ -8467,7 +8472,7 @@ static int gcase(struct case_t **base, int len, int dsym)
   }
   /* jump automagically will suppress more jumps */
   // return gjmp(dsym);
-  memset(&dest, 0, sizeof(SValue));
+  svalue_init(&dest);
   dest.vr = -1;
   dest.c.i = dsym;
   return tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
@@ -8509,7 +8514,7 @@ static void try_call_scope_cleanup(Sym *stop)
     // gfunc_call(1);
     SValue src1;
     const int call_id = tcc_state->ir ? tcc_state->ir->next_call_id++ : 0;
-    memset(&src1, 0, sizeof(SValue));
+    svalue_init(&src1);
     src1.vr = -1;
     src1.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
     tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &src1, NULL);
@@ -8731,7 +8736,7 @@ again:
     if (tok == TOK_ELSE)
     {
       SValue dest;
-      memset(&dest, 0, sizeof(SValue));
+      svalue_init(&dest);
       dest.vr = -1;
       dest.c.i = -1; /* Will be patched to end of else block */
       d = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
@@ -8762,7 +8767,7 @@ again:
     b = -1; /* Initialize continue chain with -1 sentinel */
     lblock(&a, &b);
     // gjmp_addr(d);
-    memset(&dest, 0, sizeof(SValue));
+    svalue_init(&dest);
     dest.vr = -1;
     dest.c.i = d;
     d = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
@@ -8849,7 +8854,7 @@ again:
     if (tok != '}' || local_scope != 1)
     {
       SValue dest;
-      memset(&dest, 0, sizeof(SValue));
+      svalue_init(&dest);
       dest.vr = -1;
       dest.c.i = rsym; /* Chain return jumps: point to previous rsym */
       rsym = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
@@ -8869,7 +8874,7 @@ again:
       leave_scope(cur_switch->scope);
     else
       leave_scope(loop_scope);
-    memset(&dest, 0, sizeof(SValue));
+    svalue_init(&dest);
     dest.vr = -1;
     dest.c.i = *cur_scope->bsym;
     *cur_scope->bsym = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
@@ -8883,7 +8888,7 @@ again:
     if (!cur_scope->csym)
       tcc_error("cannot continue");
     leave_scope(loop_scope);
-    memset(&dest, 0, sizeof(SValue));
+    svalue_init(&dest);
     dest.vr = -1;
     dest.c.i = *cur_scope->csym;
     // *cur_scope->csym = gjmp(*cur_scope->csym);
@@ -8919,7 +8924,7 @@ again:
     {
       // e = gjmp(0);
       SValue dest;
-      memset(&dest, 0, sizeof(SValue));
+      svalue_init(&dest);
       dest.vr = -1;
       dest.c.i = -1;
       e = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
@@ -8928,7 +8933,7 @@ again:
       gexpr();
       vpop();
       // gjmp_addr(c);
-      memset(&dest, 0, sizeof(SValue));
+      svalue_init(&dest);
       dest.vr = -1;
       dest.c.i = d;
       tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
@@ -8941,7 +8946,7 @@ again:
     lblock(&a, &b);
     // gjmp_addr(d);
     SValue dest;
-    memset(&dest, 0, sizeof(SValue));
+    svalue_init(&dest);
     dest.vr = -1;
     dest.c.i = c;
     /* Temporarily restore line number for backward jump instruction */
@@ -9000,7 +9005,7 @@ again:
     sw->sv = *vtop--; /* save switch value */
     print_vstack("block(2)");
     a = -1; /* Initialize break chain with -1 sentinel */
-    memset(&dest, 0, sizeof(SValue));
+    svalue_init(&dest);
     dest.vr = -1;
     dest.c.i = -1; /* Initial jump target, will be patched */
     b = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
@@ -9019,7 +9024,7 @@ again:
     sw->bsym = NULL; /* marker for 32bit:gen_opl() */
     vpushv(&sw->sv);
     // gv(RC_INT);
-    memset(&dest, 0, sizeof(SValue));
+    svalue_init(&dest);
     dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
     /* The switch value is copied into a temporary vreg used by the case
       comparison chain. Preserve the original type so the IR can tag the vreg
@@ -9114,7 +9119,7 @@ again:
       else
       {
         SValue dest;
-        memset(&dest, 0, sizeof(SValue));
+        svalue_init(&dest);
         try_call_cleanup_goto(s->cleanupstate);
         dest.vr = -1;
         dest.c.i = s->jind;
@@ -9311,7 +9316,7 @@ static void init_putz(init_params *p, unsigned long c, int size)
     vpushi(0);
     vpushs(size);
 
-    memset(&src1, 0, sizeof(SValue));
+    svalue_init(&src1);
     src1.vr = -1;
     const int call_id = tcc_state->ir ? tcc_state->ir->next_call_id++ : 0;
     /* __aeabi_memset(dest, n, c) on ARM EABI; memset(dest, c, n) elsewhere.
@@ -9325,7 +9330,7 @@ static void init_putz(init_params *p, unsigned long c, int size)
     tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[0], &src1, NULL);
 
     vpush_helper_func(TOK_memset);
-    memset(&dest, 0, sizeof(SValue));
+    svalue_init(&dest);
     dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
     dest.type.t = vtop[-3].type.t;
     dest.r = 0;

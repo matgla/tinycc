@@ -405,31 +405,7 @@ typedef union CValue
 #define VR_IS_TEMP_LOCAL(vr) ((vr) <= -2 && (vr) >= -9)
 #define VR_TEMP_LOCAL_IDX(vr) (-2 - (vr))
 
-typedef struct SValue
-{
-  uint8_t pr0;
-  uint8_t pr1;
-  unsigned short r; /* register + flags */
-  int vr;           /* virtual register for IR */
-  CType type;       /* type */
-  union
-  {
-    struct
-    {
-      int jtrue, jfalse;
-    }; /* forward jmps */
-    CValue c; /* constant, if VT_CONST */
-  };
-  union
-  {
-    struct
-    {
-      unsigned short cmp_op, cmp_r;
-    }; /* VT_CMP operation */
-    struct Sym *sym; /* symbol, if (VT_SYM | VT_CONST), or if */
-  }; /* result of unary() for an identifier. */
-
-} SValue;
+#include "svalue.h"
 
 // _Static_assert(sizeof(SValue) == 40, "SValue size changed");
 
@@ -1007,23 +983,20 @@ struct filespec
   0x8000 /* value is bounded. The address of the                                                                       \
             bounding function call point is in vc */
 
+/* Legacy inline wrappers - for compatibility */
 static inline SValue tcc_svalue_const_i64(int64_t v)
 {
-  SValue sv = {0};
-  sv.vr = -1;
-  sv.r = VT_CONST;
-  sv.c.i = (uint64_t)v;
-  return sv;
+  return svalue_const_i64(v);
 }
 
 static inline SValue tcc_ir_svalue_call_id(int call_id)
 {
-  return tcc_svalue_const_i64((int64_t)TCCIR_ENCODE_PARAM(call_id, 0));
+  return svalue_call_id(call_id);
 }
 
 static inline SValue tcc_ir_svalue_call_id_argc(int call_id, int argc)
 {
-  return tcc_svalue_const_i64((int64_t)TCCIR_ENCODE_CALL(call_id, argc));
+  return svalue_call_id_argc(call_id, argc);
 }
 /* types */
 #define VT_BTYPE 0x000f /* mask for basic type */
