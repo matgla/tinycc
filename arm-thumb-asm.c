@@ -2168,7 +2168,6 @@ static thumb_opcode thumb_vcmp_opcode(TCCState *s1, int token)
   }
 
   Operand ops[2] = {};
-  const char *tokstr = get_tok_str(token, NULL);
   const int nb_ops = process_operands(s1, sizeof(ops) / sizeof(ops[0]), ops);
   const uint32_t sz = thumb_vfp_size_from_token(token);
 

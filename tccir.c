@@ -3726,8 +3726,6 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
     if ((old_r & VT_LVAL) && old_v < VT_CONST && old_v != VT_LOCAL && old_v != VT_LLOCAL && !is_register_param)
     {
       /* The vreg holds a pointer that needs dereferencing.
-    {
-      /* The vreg holds a pointer that needs dereferencing.
        * Note: VT_LOCAL/VT_LLOCAL use VT_LVAL to mean "load from stack slot".
        * When such a local/param is promoted to a register, we must NOT
        * preserve VT_LVAL, otherwise we turn a plain value into a pointer
@@ -4625,8 +4623,6 @@ int tcc_ir_constant_propagation(TCCIRState *ir)
     if (q->op == TCCIR_OP_NOP)
       continue;
 
-    int modified = 0;
-
     /* For BOOL_AND/BOOL_OR, don't propagate constants unless both become constants.
      * The code generator can't handle mixed const/reg operands for these ops. */
     skip_bool_prop = 0;
@@ -4672,7 +4668,6 @@ int tcc_ir_constant_propagation(TCCIRState *ir)
         src1->c.i = var_info[pos].value;
         src1->vr = -1;
         changes++;
-        modified = 1;
       }
     }
 
@@ -4686,7 +4681,6 @@ int tcc_ir_constant_propagation(TCCIRState *ir)
         src2->c.i = var_info[pos].value;
         src2->vr = -1;
         changes++;
-        modified = 1;
       }
     }
 
@@ -4725,7 +4719,6 @@ int tcc_ir_constant_propagation(TCCIRState *ir)
         /* Update flags after swap */
         src1_is_const = 0;
         src2_is_const = 1;
-        modified = 1;
       }
     }
 
@@ -4788,7 +4781,6 @@ int tcc_ir_constant_propagation(TCCIRState *ir)
         memset(src2, 0, sizeof(*src2));
         src2->vr = -1;
         changes++;
-        modified = 1;
         continue;
       }
     }
@@ -4861,7 +4853,6 @@ int tcc_ir_constant_propagation(TCCIRState *ir)
         memset(src2, 0, sizeof(*src2));
         src2->vr = -1;
         changes++;
-        modified = 1;
       }
       else if (replace_with_zero)
       {
@@ -4875,7 +4866,6 @@ int tcc_ir_constant_propagation(TCCIRState *ir)
         memset(src2, 0, sizeof(*src2));
         src2->vr = -1;
         changes++;
-        modified = 1;
       }
       else if (replace_with_const)
       {
@@ -4890,7 +4880,6 @@ int tcc_ir_constant_propagation(TCCIRState *ir)
         memset(src2, 0, sizeof(*src2));
         src2->vr = -1;
         changes++;
-        modified = 1;
       }
     }
 
@@ -4914,7 +4903,6 @@ int tcc_ir_constant_propagation(TCCIRState *ir)
           memset(src2, 0, sizeof(*src2));
           src2->vr = -1;
           changes++;
-          modified = 1;
         }
         break;
       case TCCIR_OP_MUL:
@@ -4929,7 +4917,6 @@ int tcc_ir_constant_propagation(TCCIRState *ir)
           memset(src2, 0, sizeof(*src2));
           src2->vr = -1;
           changes++;
-          modified = 1;
         }
         break;
       case TCCIR_OP_SHL:
@@ -4946,7 +4933,6 @@ int tcc_ir_constant_propagation(TCCIRState *ir)
           memset(src2, 0, sizeof(*src2));
           src2->vr = -1;
           changes++;
-          modified = 1;
         }
         break;
       default:
@@ -5145,7 +5131,6 @@ int tcc_ir_tmp_constant_propagation(TCCIRState *ir)
     if (q->op == TCCIR_OP_NOP)
       continue;
 
-    int modified = 0;
     SValue *src1 = tcc_ir_op_get_src1(ir, q);
 
     /* Propagate TMP constants to src1 */
@@ -5161,7 +5146,6 @@ int tcc_ir_tmp_constant_propagation(TCCIRState *ir)
         src1->c.i = tmp_info[pos].value;
         src1->vr = -1;
         changes++;
-        modified = 1;
       }
     }
 
@@ -5179,7 +5163,6 @@ int tcc_ir_tmp_constant_propagation(TCCIRState *ir)
         src2->c.i = tmp_info[pos].value;
         src2->vr = -1;
         changes++;
-        modified = 1;
       }
     }
 
@@ -5393,8 +5376,6 @@ int tcc_ir_copy_propagation(TCCIRState *ir)
     if (q->op == TCCIR_OP_NOP)
       continue;
 
-    int modified = 0;
-
     /* Propagate copies to uses in this instruction.
      * Important: We DON'T propagate if the use has VT_LVAL because:
      *   - TMP:X <- VAR:Y (copy of pointer value)
@@ -5416,7 +5397,6 @@ int tcc_ir_copy_propagation(TCCIRState *ir)
 #endif
         *src1 = copy_info[pos].source;
         changes++;
-        modified = 1;
       }
     }
 
@@ -5433,7 +5413,6 @@ int tcc_ir_copy_propagation(TCCIRState *ir)
 #endif
         *src2 = copy_info[pos].source;
         changes++;
-        modified = 1;
       }
     }
 

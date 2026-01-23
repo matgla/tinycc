@@ -1301,7 +1301,6 @@ static int tcc_assemble_internal(TCCState *s1, int do_preprocess, int global)
           const int *body_ptr;
           int arg_count = 0;
           int i, t;
-          CValue cv;
 
           /* initialize arg_strs */
           for (i = 0; i < ASM_MACRO_MAX_ARGS; i++)

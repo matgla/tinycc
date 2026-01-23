@@ -553,7 +553,7 @@ static int ld_parse_memory(LDParser *p)
         return tcc_error_noabort("too many memory regions");
       }
       mr = &p->ld->memory_regions[p->ld->nb_memory_regions];
-      strncpy(mr->name, p->tok_buf, sizeof(mr->name) - 1);
+      pstrcpy(mr->name, sizeof(mr->name), p->tok_buf);
       ld_next_token(p);
 
       /* Parse attributes (rwx) */
@@ -614,7 +614,7 @@ static int ld_parse_phdrs(LDParser *p)
         return tcc_error_noabort("too many program headers");
       }
       ph = &p->ld->phdrs[p->ld->nb_phdrs];
-      strncpy(ph->name, p->tok_buf, sizeof(ph->name) - 1);
+      pstrcpy(ph->name, sizeof(ph->name), p->tok_buf);
       ld_next_token(p);
 
       /* Parse type (PT_LOAD, PT_NULL, etc) */
@@ -690,7 +690,7 @@ static int ld_parse_section_pattern(LDParser *p, LDOutputSection *os, int keep)
         if (os->nb_patterns < LD_MAX_SECTION_PATTERNS)
         {
           pat = &os->patterns[os->nb_patterns];
-          strncpy(pat->pattern, p->tok_buf, sizeof(pat->pattern) - 1);
+          pstrcpy(pat->pattern, sizeof(pat->pattern), p->tok_buf);
           pat->keep = keep;
           pat->type = (strchr(pat->pattern, '*') != NULL) ? LD_PAT_GLOB : LD_PAT_EXACT;
           os->nb_patterns++;
@@ -782,7 +782,7 @@ static int ld_parse_output_section_contents(LDParser *p, LDOutputSection *os)
       {
         /* Could be symbol assignment: sym = expr */
         char name[128];
-        strncpy(name, p->tok_buf, sizeof(name) - 1);
+        pstrcpy(name, sizeof(name), p->tok_buf);
         ld_next_token(p);
         if (p->tok == '=')
         {
@@ -858,7 +858,7 @@ static int ld_parse_sections(LDParser *p)
       }
       os = &p->ld->output_sections[p->ld->nb_output_sections];
       os->name[0] = '.';
-      strncpy(os->name + 1, p->tok_buf, sizeof(os->name) - 2);
+      pstrcpy(os->name + 1, sizeof(os->name) - 1, p->tok_buf);
       os->memory_region_idx = -1;
       os->load_memory_region_idx = -1;
       os->phdr_idx = -1;
@@ -950,7 +950,7 @@ static int ld_parse_sections(LDParser *p)
     {
       /* Could be symbol assignment or output section without leading dot */
       char name[128];
-      strncpy(name, p->tok_buf, sizeof(name) - 1);
+      pstrcpy(name, sizeof(name), p->tok_buf);
       ld_next_token(p);
 
       if (p->tok == '=')
@@ -981,7 +981,7 @@ static int ld_parse_sections(LDParser *p)
           return tcc_error_noabort("too many output sections");
         }
         os = &p->ld->output_sections[p->ld->nb_output_sections];
-        strncpy(os->name, name, sizeof(os->name) - 1);
+        pstrcpy(os->name, sizeof(os->name), name);
         os->memory_region_idx = -1;
         os->load_memory_region_idx = -1;
         os->phdr_idx = -1;
@@ -1074,12 +1074,16 @@ static int ld_parse_sections(LDParser *p)
 
 static int ld_parse_entry(LDParser *p)
 {
+  TCCState *s1 = p->s1;
   ld_next_token(p); /* skip 'ENTRY' */
   if (ld_expect(p, '('))
     return -1;
   if (p->tok == LDTOK_NAME)
   {
-    strncpy(p->ld->entry_point, p->tok_buf, sizeof(p->ld->entry_point) - 1);
+    size_t len = strlen(p->tok_buf);
+    if (len >= sizeof(p->ld->entry_point))
+      return tcc_error_noabort("ENTRY name too long");
+    memcpy(p->ld->entry_point, p->tok_buf, len + 1);
     p->ld->has_entry = 1;
     ld_next_token(p);
   }
@@ -1154,7 +1158,7 @@ int ld_script_parse(TCCState *s1, LDScript *ld, int fd)
       {
         /* Unknown command - might be top-level symbol assignment */
         char name[128];
-        strncpy(name, parser.tok_buf, sizeof(name) - 1);
+        pstrcpy(name, sizeof(name), parser.tok_buf);
         ld_next_token(&parser);
         if (parser.tok == '=')
         {
@@ -1268,7 +1272,7 @@ int ld_script_find_or_create_symbol(LDScript *ld, const char *name)
   if (ld->nb_symbols >= LD_MAX_SYMBOLS)
     return -1;
   idx = ld->nb_symbols++;
-  strncpy(ld->symbols[idx].name, name, sizeof(ld->symbols[idx].name) - 1);
+  pstrcpy(ld->symbols[idx].name, sizeof(ld->symbols[idx].name), name);
   ld->symbols[idx].value = 0;
   ld->symbols[idx].defined = 0;
   ld->symbols[idx].visibility = LD_SYM_GLOBAL;

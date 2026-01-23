@@ -292,7 +292,7 @@ static unsigned getclock_ms(void)
 int main(int argc0, char **argv0)
 {
   TCCState *s, *s1;
-  int ret, opt, n = 0, t = 0, done;
+  int ret = 0, opt, n = 0, t = 0, done;
   unsigned start_time = 0, end_time = 0;
   const char *first_file;
   int argc;

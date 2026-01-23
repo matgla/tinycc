@@ -1622,7 +1622,6 @@ static void move_reg(int r, int s, int t)
 /* get address of vtop (vtop MUST BE an lvalue) */
 ST_FUNC void gaddrof(void)
 {
-  int orig_r = vtop->r;
   vtop->r &= ~VT_LVAL;
   /* tricky: if saved lvalue, then we can go back to lvalue */
   if ((vtop->r & VT_VALMASK) == VT_LLOCAL)
@@ -1920,7 +1919,7 @@ static int adjust_bf(SValue *sv, int bit_pos, int bit_size)
    register value (such as structures). */
 ST_FUNC int gv(int rc)
 {
-  int r, r_ok, r2_ok, rc2, bt;
+  int r, r_ok, r2_ok, rc2;
   int bit_pos, bit_size, size, align;
   int vreg = -1;
 
@@ -1994,8 +1993,6 @@ ST_FUNC int gv(int rc)
       gbound();
 #endif
 
-    bt = vtop->type.t & VT_BTYPE;
-
     /* Arrays (including VLAs) are not values you can load from memory.
      * In most expressions they decay to a pointer to their first element.
      * If we treat them as an lvalue and "load" them, we end up
@@ -2009,7 +2006,6 @@ ST_FUNC int gv(int rc)
     {
       gaddrof();
       vtop->type.t &= ~(VT_ARRAY | VT_VLA);
-      bt = vtop->type.t & VT_BTYPE;
     }
 
     rc2 = RC_INT; // RC2_TYPE(bt, rc);
@@ -2489,7 +2485,6 @@ static void gen_opl(int op)
   int t, op1, c, i;
   int func;
   unsigned short reg_iret = REG_IRET;
-  unsigned short reg_lret = REG_IRE2;
   SValue tmp;
 
   switch (op)
@@ -2509,7 +2504,6 @@ static void gen_opl(int op)
   gen_mod_func:
 #ifdef TCC_ARM_EABI
     reg_iret = TREG_R2;
-    reg_lret = TREG_R3;
 #endif
   gen_func:
     /* call generic long long function */

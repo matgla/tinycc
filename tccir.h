@@ -24,8 +24,8 @@
 
 #include "tccls.h"
 
-#define PREG_SPILLED 0x80
-#define PREG_NONE 0xFF /* pr0/pr1 not allocated (replaces -1 for uint8_t) */
+#define PREG_SPILLED 0x20
+#define PREG_NONE 0x3F /* pr0/pr1 not allocated (replaces -1 for uint8_t) */
 
 typedef enum TccIrOp : uint8_t
 {

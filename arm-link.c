@@ -384,7 +384,7 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
   case R_ARM_THM_JUMP24:
   {
     int x, hi, lo, s, j1, j2, i1, i2, imm10, imm11;
-    int is_call, to_plt, blx_bit = 1 << 12;
+    int is_call, to_plt = 0, blx_bit = 1 << 12;
     Section *plt;
     /* weak reference */
     if (sym->st_shndx == SHN_UNDEF && ELFW(ST_BIND)(sym->st_info) == STB_WEAK)
