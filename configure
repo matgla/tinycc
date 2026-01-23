@@ -172,6 +172,8 @@ for opt do
   ;;
   --enable-asan) confvars_set asan
   ;;
+  --enable-ubsan) confvars_set ubsan
+  ;;
   --enable-lsan) confvars_set lsan
   ;;
   --with-libgcc) confvars_set libgcc
@@ -222,6 +224,7 @@ Advanced options (experts only):
 
   --debug                  include debug info with resulting binaries
   --enable-asan            enable AddressSanitizer (ASan)
+  --enable-ubsan           enable UndefinedBehaviorSanitizer (UBSan)
   --enable-lsan            enable LeakSanitizer (LSan)
   --enable-O0              disable optimizations (GCC -O0)
   --enable-O1              basic optimizations (GCC -O1)
@@ -572,6 +575,10 @@ if confvars_has asan; then
   CFLAGS="$CFLAGS -fsanitize=address -fno-omit-frame-pointer"
   # libasan must appear before other libs on the final link line.
   LDFLAGS="-lasan $LDFLAGS -fsanitize=address"
+fi
+if confvars_has ubsan; then
+  CFLAGS="$CFLAGS -fsanitize=undefined -fno-omit-frame-pointer"
+  LDFLAGS="$LDFLAGS -fsanitize=undefined"
 fi
 if confvars_has lsan; then
   CFLAGS="$CFLAGS -fsanitize=leak"
