@@ -7431,23 +7431,24 @@ void tcc_ir_drop_return_value(TCCIRState *ir)
   {
     return;
   }
-  TACQuadruple *last_instr = &ir->compact_instructions[ir->next_instruction_index - 1];
+  IRQuadCompact *last_instr = &ir->compact_instructions[ir->next_instruction_index - 1];
 
   if (last_instr->op == TCCIR_OP_FUNCCALLVAL)
   {
     /* Only drop return values that are assigned to temporaries.
      * If coalescing redirected the dest to a VAR, the value IS used
      * and should not be dropped. */
-    if (TCCIR_DECODE_VREG_TYPE(last_instr->dest.vr) == TCCIR_VREG_TYPE_TEMP)
+    SValue *dest = tcc_ir_op_get_dest(ir, last_instr);
+    if (TCCIR_DECODE_VREG_TYPE(dest->vr) == TCCIR_VREG_TYPE_TEMP)
     {
-      if (tcc_is_vreg_valid(ir, last_instr->dest.vr))
+      if (tcc_is_vreg_valid(ir, dest->vr))
       {
-        IRLiveInterval *interval = tcc_ir_get_live_interval(ir, last_instr->dest.vr);
+        IRLiveInterval *interval = tcc_ir_get_live_interval(ir, dest->vr);
         interval->start = INTERVAL_NOT_STARTED;
         interval->end = 0;
       }
       last_instr->op = TCCIR_OP_FUNCCALLVOID;
-      last_instr->dest.vr = -1;
+      dest->vr = -1;
       /* NOTE: Do NOT clear src1.vr - it contains the function address to call! */
     }
   }

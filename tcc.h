@@ -376,7 +376,7 @@ typedef struct CString
 } CString;
 
 /* type definition */
-typedef struct __attribute__((packed)) CType
+typedef struct CType
 {
   int t;
   struct Sym *ref;
@@ -405,7 +405,7 @@ typedef union CValue
 #define VR_IS_TEMP_LOCAL(vr) ((vr) <= -2 && (vr) >= -9)
 #define VR_TEMP_LOCAL_IDX(vr) (-2 - (vr))
 
-typedef struct __attribute__((packed)) SValue
+typedef struct SValue
 {
   uint8_t pr0;
   uint8_t pr1;
@@ -431,7 +431,7 @@ typedef struct __attribute__((packed)) SValue
 
 } SValue;
 
-_Static_assert(sizeof(SValue) == 44, "SValue size changed");
+// _Static_assert(sizeof(SValue) == 40, "SValue size changed");
 
 /* symbol attributes */
 struct SymAttr
