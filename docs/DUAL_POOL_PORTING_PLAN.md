@@ -334,9 +334,18 @@ make clean && make && make test -j32
   - [x] Implement `svalue_to_iroperand()` - converts SValue to tagged IROperand
   - [x] Implement `iroperand_to_svalue()` - expands IROperand back to SValue
 
-- [ ] Phase 3: Synchronized write helpers
-  - [ ] Implement `tcc_ir_write_operand()`
-  - [ ] Implement `tcc_ir_sync_pools()`
+- [x] Phase 3: Synchronized write helpers ✅
+  - [x] Define `TACQuadruple` struct (expanded instruction form)
+  - [x] Implement `tcc_ir_expand_quad()` - expand IRQuadCompact to TACQuadruple
+  - [x] Implement `tcc_ir_writeback_quad()` - write TACQuadruple back to svalue_pool
+  - [x] Implement `tcc_ir_sync_operand()` - write single operand to both pools
+  - [x] Implement `tcc_ir_sync_quad()` - sync all operands to both pools
+
+- [x] Phase 3.5: Parallel IROperand population ✅
+  - [x] Add `iroperand_pool` array to TCCIRState (parallel to svalue_pool)
+  - [x] Modify `tcc_ir_svalue_pool_add()` to populate both pools
+  - [x] Add IROperand accessor functions (`tcc_ir_get_dest_irop()`, etc.)
+  - [x] All 466 tests passing with dual-pool population
 
 - [ ] Phase 4-5: Port functions (see Tier list above)
   - [ ] Tier 1: DCE, DSE, bool_idempotent

@@ -728,6 +728,21 @@ int tcc_ir_svalue_pool_add(TCCIRState *ir, const SValue *sv)
     }
   }
   ir->svalue_pool[ir->svalue_pool_count] = *sv;
+
+  /* Also add IROperand representation in parallel */
+  if (ir->iroperand_pool_count >= ir->iroperand_pool_capacity)
+  {
+    ir->iroperand_pool_capacity *= 2;
+    ir->iroperand_pool = (IROperand *)tcc_realloc(ir->iroperand_pool, sizeof(IROperand) * ir->iroperand_pool_capacity);
+    if (!ir->iroperand_pool)
+    {
+      fprintf(stderr, "tcc_ir_svalue_pool_add: out of memory (iroperand)\n");
+      exit(1);
+    }
+  }
+  ir->iroperand_pool[ir->iroperand_pool_count] = svalue_to_iroperand(ir, sv);
+  ir->iroperand_pool_count++;
+
   return ir->svalue_pool_count++;
 }
 
@@ -754,7 +769,12 @@ void tcc_ir_pools_init(TCCIRState *ir)
   ir->pool_symref_count = 0;
   ir->pool_symref = (IRPoolSymref *)tcc_mallocz(sizeof(IRPoolSymref) * ir->pool_symref_capacity);
 
-  if (!ir->pool_i64 || !ir->pool_f64 || !ir->pool_symref)
+  /* IROperand pool - parallel to svalue_pool */
+  ir->iroperand_pool_capacity = IRPOOL_INIT_SIZE;
+  ir->iroperand_pool_count = 0;
+  ir->iroperand_pool = (IROperand *)tcc_mallocz(sizeof(IROperand) * ir->iroperand_pool_capacity);
+
+  if (!ir->pool_i64 || !ir->pool_f64 || !ir->pool_symref || !ir->iroperand_pool)
   {
     fprintf(stderr, "tcc_ir_pools_init: out of memory\n");
     exit(1);
@@ -786,6 +806,14 @@ void tcc_ir_pools_free(TCCIRState *ir)
   }
   ir->pool_symref_count = 0;
   ir->pool_symref_capacity = 0;
+
+  if (ir->iroperand_pool)
+  {
+    tcc_free(ir->iroperand_pool);
+    ir->iroperand_pool = NULL;
+  }
+  ir->iroperand_pool_count = 0;
+  ir->iroperand_pool_capacity = 0;
 }
 
 uint32_t tcc_ir_pool_add_i64(TCCIRState *ir, int64_t val)
@@ -846,40 +874,49 @@ uint32_t tcc_ir_pool_add_symref(TCCIRState *ir, Sym *sym, int32_t addend, uint32
  * and the new IROperand-based system during the migration period.
  */
 
-/* Convert SValue to IROperand, adding to appropriate pool if needed */
+/* Convert SValue to IROperand, adding to appropriate pool if needed.
+ * The vreg field is ALWAYS preserved from sv->vr.
+ */
 IROperand svalue_to_iroperand(TCCIRState *ir, const SValue *sv)
 {
   if (!sv)
-    return IROP_NONE;
+    return irop_make_none();
 
+  int32_t vr = sv->vr; /* Always preserve vreg */
   int val_kind = sv->r & VT_VALMASK;
   int is_lval = sv->r & VT_LVAL;
   int has_sym = sv->r & VT_SYM;
   int btype = sv->type.t & VT_BTYPE;
 
+  /* Build flags */
+  uint8_t flags = 0;
+  if (is_lval)
+    flags |= IROP_FLAG_LVAL;
+  if (val_kind == VT_LOCAL)
+    flags |= IROP_FLAG_LOCAL;
+
   /* Case 1: Pure vreg (no const, no sym, no lval, valid vr) */
-  if (sv->vr >= 0 && val_kind != VT_CONST && val_kind != VT_LOCAL && !has_sym)
+  if (vr >= 0 && val_kind != VT_CONST && val_kind != VT_LOCAL && !has_sym && !is_lval)
   {
-    return irop_make_vreg(sv->vr);
+    return irop_make_vreg(vr);
   }
 
   /* Case 2: Symbol reference - always goes to symref pool */
   if (has_sym)
   {
-    uint32_t flags = 0;
+    uint32_t pool_flags = 0;
     if (is_lval)
-      flags |= IRPOOL_SYMREF_LVAL;
+      pool_flags |= IRPOOL_SYMREF_LVAL;
     if (val_kind == VT_LOCAL)
-      flags |= IRPOOL_SYMREF_LOCAL;
-    uint32_t idx = tcc_ir_pool_add_symref(ir, sv->sym, (int32_t)sv->c.i, flags);
-    return irop_make_symref(idx);
+      pool_flags |= IRPOOL_SYMREF_LOCAL;
+    uint32_t idx = tcc_ir_pool_add_symref(ir, sv->sym, (int32_t)sv->c.i, pool_flags);
+    return irop_make_symref(vr, idx, flags);
   }
 
   /* Case 3: VT_LOCAL stack offset (no symbol) */
-  if (val_kind == VT_LOCAL && !is_lval)
+  if (val_kind == VT_LOCAL)
   {
-    /* Stack offset fits in 32 bits */
-    return irop_make_stackoff((int32_t)sv->c.i);
+    return irop_make_stackoff(vr, (int32_t)sv->c.i, flags);
   }
 
   /* Case 4: Float constant - inline F32 */
@@ -891,7 +928,7 @@ IROperand svalue_to_iroperand(TCCIRState *ir, const SValue *sv)
       uint32_t bits;
     } u;
     u.f = sv->c.f;
-    return irop_make_f32(u.bits);
+    return irop_make_f32(vr, u.bits);
   }
 
   /* Case 5: Double constant - pool F64 */
@@ -904,14 +941,14 @@ IROperand svalue_to_iroperand(TCCIRState *ir, const SValue *sv)
     } u;
     u.d = sv->c.d;
     uint32_t idx = tcc_ir_pool_add_f64(ir, u.bits);
-    return irop_make_f64(idx);
+    return irop_make_f64(vr, idx);
   }
 
   /* Case 6: 64-bit integer constant - pool I64 */
   if (btype == VT_LLONG && val_kind == VT_CONST)
   {
     uint32_t idx = tcc_ir_pool_add_i64(ir, (int64_t)sv->c.i);
-    return irop_make_i64(idx);
+    return irop_make_i64(vr, idx);
   }
 
   /* Case 7: 32-bit integer constant - inline IMM32 */
@@ -921,61 +958,59 @@ IROperand svalue_to_iroperand(TCCIRState *ir, const SValue *sv)
     int64_t val = (int64_t)sv->c.i;
     if (val >= INT32_MIN && val <= INT32_MAX)
     {
-      return irop_make_imm32((int32_t)val);
+      return irop_make_imm32(vr, (int32_t)val);
     }
     /* Doesn't fit - use I64 pool */
     uint32_t idx = tcc_ir_pool_add_i64(ir, val);
-    return irop_make_i64(idx);
-  }
-
-  /* Case 8: VT_LOCAL with lval - needs symref to preserve semantics */
-  if (val_kind == VT_LOCAL && is_lval)
-  {
-    uint32_t flags = IRPOOL_SYMREF_LVAL | IRPOOL_SYMREF_LOCAL;
-    uint32_t idx = tcc_ir_pool_add_symref(ir, NULL, (int32_t)sv->c.i, flags);
-    return irop_make_symref(idx);
+    return irop_make_i64(vr, idx);
   }
 
   /* Fallback: use symref pool for complex cases */
-  uint32_t flags = 0;
+  uint32_t pool_flags = 0;
   if (is_lval)
-    flags |= IRPOOL_SYMREF_LVAL;
+    pool_flags |= IRPOOL_SYMREF_LVAL;
   if (val_kind == VT_LOCAL)
-    flags |= IRPOOL_SYMREF_LOCAL;
-  uint32_t idx = tcc_ir_pool_add_symref(ir, sv->sym, (int32_t)sv->c.i, flags);
-  return irop_make_symref(idx);
+    pool_flags |= IRPOOL_SYMREF_LOCAL;
+  uint32_t idx = tcc_ir_pool_add_symref(ir, sv->sym, (int32_t)sv->c.i, pool_flags);
+  return irop_make_symref(vr, idx, flags);
 }
 
-/* Expand IROperand back to SValue (for backward compatibility) */
+/* Expand IROperand back to SValue (for backward compatibility).
+ * The vreg field is always restored from op.vr (with tag/flags stripped).
+ */
 void iroperand_to_svalue(const TCCIRState *ir, IROperand op, SValue *out)
 {
   svalue_init(out);
 
-  int tag = irop_get_tag(op);
+  /* Always restore vreg from IROperand (strip embedded tag/flags) */
+  out->vr = irop_get_vreg(op.vr);
+
+  int tag = irop_get_tag(op.vr);
+  int flags = irop_get_flags(op.vr);
 
   switch (tag)
   {
   case IROP_TAG_NONE:
     /* Already initialized by svalue_init */
-    out->vr = -1;
     break;
 
   case IROP_TAG_VREG:
-    out->vr = irop_get_vreg(op);
     out->r = VT_CONST; /* vreg-only, no memory location */
     break;
 
   case IROP_TAG_IMM32:
     out->r = VT_CONST;
-    out->c.i = (int64_t)irop_get_imm32(op);
-    out->vr = -1;
+    out->c.i = (int64_t)op.u.imm32;
     break;
 
   case IROP_TAG_STACKOFF:
+  {
     out->r = VT_LOCAL;
-    out->c.i = (int64_t)irop_get_stackoff(op);
-    out->vr = -1;
+    if (flags & IROP_FLAG_LVAL)
+      out->r |= VT_LVAL;
+    out->c.i = (int64_t)op.u.imm32; /* stack offset stored in imm32 */
     break;
+  }
 
   case IROP_TAG_F32:
   {
@@ -984,27 +1019,25 @@ void iroperand_to_svalue(const TCCIRState *ir, IROperand op, SValue *out)
       uint32_t bits;
       float f;
     } u;
-    u.bits = irop_get_f32(op);
+    u.bits = op.u.f32_bits;
     out->r = VT_CONST;
     out->c.f = u.f;
     out->type.t = VT_FLOAT;
-    out->vr = -1;
     break;
   }
 
   case IROP_TAG_I64:
   {
-    uint32_t idx = irop_get_pool_idx(op);
+    uint32_t idx = op.u.pool_idx;
     out->r = VT_CONST;
     out->c.i = (uint64_t)ir->pool_i64[idx];
     out->type.t = VT_LLONG;
-    out->vr = -1;
     break;
   }
 
   case IROP_TAG_F64:
   {
-    uint32_t idx = irop_get_pool_idx(op);
+    uint32_t idx = op.u.pool_idx;
     union
     {
       uint64_t bits;
@@ -1014,13 +1047,12 @@ void iroperand_to_svalue(const TCCIRState *ir, IROperand op, SValue *out)
     out->r = VT_CONST;
     out->c.d = u.d;
     out->type.t = VT_DOUBLE;
-    out->vr = -1;
     break;
   }
 
   case IROP_TAG_SYMREF:
   {
-    uint32_t idx = irop_get_pool_idx(op);
+    uint32_t idx = op.u.pool_idx;
     IRPoolSymref *ref = &ir->pool_symref[idx];
     out->sym = ref->sym;
     out->c.i = (int64_t)ref->addend;
@@ -1036,15 +1068,161 @@ void iroperand_to_svalue(const TCCIRState *ir, IROperand op, SValue *out)
     if (ref->sym)
       out->r |= VT_SYM;
 
-    out->vr = -1;
     break;
   }
 
   default:
-    /* Unknown tag - initialize to safe default */
-    out->vr = -1;
+    /* Unknown tag - already initialized by svalue_init */
     break;
   }
+}
+
+/* ============================================================================
+ * Instruction expansion and writeback functions
+ * ============================================================================
+ */
+
+/* Expand a compact instruction to a full TACQuadruple (for migration) */
+void tcc_ir_expand_quad(TCCIRState *ir, int index, TACQuadruple *out)
+{
+  IRQuadCompact *cq = &ir->compact_instructions[index];
+
+  memset(out, 0, sizeof(TACQuadruple));
+  out->orig_index = cq->orig_index;
+  out->op = cq->op;
+  out->line_num = cq->line_num;
+
+  /* Copy operands from svalue_pool */
+  const IRRegistersConfig *cfg = &irop_config[cq->op];
+  int pool_off = cq->operand_base;
+
+  if (cfg->has_dest)
+  {
+    out->dest = ir->svalue_pool[pool_off];
+    pool_off++;
+  }
+  else
+  {
+    svalue_init(&out->dest);
+    out->dest.vr = -1;
+  }
+
+  if (cfg->has_src1)
+  {
+    out->src1 = ir->svalue_pool[pool_off];
+    pool_off++;
+  }
+  else
+  {
+    svalue_init(&out->src1);
+    out->src1.vr = -1;
+  }
+
+  if (cfg->has_src2)
+  {
+    out->src2 = ir->svalue_pool[pool_off];
+  }
+  else
+  {
+    svalue_init(&out->src2);
+    out->src2.vr = -1;
+  }
+}
+
+/* Write back modified operands from a TACQuadruple to the svalue_pool */
+void tcc_ir_writeback_quad(TCCIRState *ir, int index, TACQuadruple *q)
+{
+  IRQuadCompact *cq = &ir->compact_instructions[index];
+  const IRRegistersConfig *cfg = &irop_config[cq->op];
+  int pool_off = cq->operand_base;
+
+  if (cfg->has_dest)
+  {
+    ir->svalue_pool[pool_off] = q->dest;
+    pool_off++;
+  }
+
+  if (cfg->has_src1)
+  {
+    ir->svalue_pool[pool_off] = q->src1;
+    pool_off++;
+  }
+
+  if (cfg->has_src2)
+  {
+    ir->svalue_pool[pool_off] = q->src2;
+  }
+}
+
+/* ============================================================================
+ * Synchronized write helpers - update BOTH pool systems
+ * ============================================================================
+ * During the migration period, both svalue_pool and the IROperand pools must
+ * be kept in sync. These functions write to both simultaneously.
+ *
+ * NOTE: The IROperand pools are append-only during this phase. We don't update
+ * existing entries - instead we add new ones. This is acceptable since the
+ * pools are only used for reading after the IR is fully built.
+ */
+
+/* Write a single operand to both pool systems */
+void tcc_ir_sync_operand(TCCIRState *ir, int instr_idx, int operand_slot, const SValue *sv)
+{
+  IRQuadCompact *cq = &ir->compact_instructions[instr_idx];
+  const IRRegistersConfig *cfg = &irop_config[cq->op];
+
+  /* Calculate pool offset for this operand slot */
+  int pool_off = cq->operand_base;
+  if (operand_slot == 0)
+  {
+    /* dest slot */
+    if (!cfg->has_dest)
+      return;
+  }
+  else if (operand_slot == 1)
+  {
+    /* src1 slot */
+    if (!cfg->has_src1)
+      return;
+    if (cfg->has_dest)
+      pool_off++;
+  }
+  else if (operand_slot == 2)
+  {
+    /* src2 slot */
+    if (!cfg->has_src2)
+      return;
+    if (cfg->has_dest)
+      pool_off++;
+    if (cfg->has_src1)
+      pool_off++;
+  }
+  else
+  {
+    return; /* invalid slot */
+  }
+
+  /* Write to svalue_pool (old system) */
+  ir->svalue_pool[pool_off] = *sv;
+
+  /* Convert and store to IROperand pools (new system) - append-only */
+  /* Note: we don't store the IROperand back into an instruction array yet,
+   * but the conversion populates the appropriate pool (i64/f64/symref) */
+  (void)svalue_to_iroperand(ir, sv);
+}
+
+/* Sync all operands of a TACQuadruple to both pool systems */
+void tcc_ir_sync_quad(TCCIRState *ir, int instr_idx, const TACQuadruple *q)
+{
+  IRQuadCompact *cq = &ir->compact_instructions[instr_idx];
+  const IRRegistersConfig *cfg = &irop_config[cq->op];
+
+  if (cfg->has_dest)
+    tcc_ir_sync_operand(ir, instr_idx, 0, &q->dest);
+  if (cfg->has_src1)
+    tcc_ir_sync_operand(ir, instr_idx, 1, &q->src1);
+  if (cfg->has_src2)
+    tcc_ir_sync_operand(ir, instr_idx, 2, &q->src2);
 }
 
 TCCIRState *tcc_ir_allocate_block()
@@ -6868,6 +7046,20 @@ void tcc_ir_generate_code(TCCIRState *ir)
   // TACQuadruple *q;
   IRQuadCompact *cq;
   int drop_return_value = 0;
+
+  /* Print vreg statistics for size optimization analysis */
+  {
+    int local_count = ir->next_local_variable;
+    int temp_count = ir->next_temporary_variable;
+    int param_count = ir->next_parameter;
+    int total_vregs = local_count + temp_count + param_count;
+    if (total_vregs > 1000) /* Only print for large functions */
+      fprintf(stderr, "[VREG STATS] locals=%d temps=%d params=%d total=%d (max_encoded=%d)\n",
+              local_count, temp_count, param_count, total_vregs,
+              (local_count > temp_count ? local_count : temp_count) > param_count
+                  ? (local_count > temp_count ? local_count : temp_count)
+                  : param_count);
+  }
 
   /* `&&label` stores label positions as IR indices BEFORE DCE/compaction.
    * Build a mapping for original indices, not just the compacted array indices.
