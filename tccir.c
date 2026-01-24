@@ -7222,7 +7222,7 @@ void tcc_ir_generate_code(TCCIRState *ir)
       if (ir_next && ir_next->op == TCCIR_OP_RETURNVALUE)
       {
         IROperand next_src1_irop = tcc_ir_op_get_src1_irop(ir, ir_next);
-        ir_next_src1_vr = irop_get_vreg(next_src1_irop.vr);
+        ir_next_src1_vr = irop_get_vreg(&next_src1_irop);
       }
       if (ir_next && ir_next->op == TCCIR_OP_RETURNVALUE && ir_next_src1_vr == dest->vr && !has_incoming_jump[i + 1])
       {
@@ -7268,7 +7268,7 @@ void tcc_ir_generate_code(TCCIRState *ir)
       if (i != ir->next_instruction_index - 1)
       {
         return_jump_addrs[num_return_jumps++] = ind;
-        tcc_gen_machine_jump_op(dest, cq->op);
+        tcc_gen_machine_jump_op(cq->op);
       }
       break;
     case TCCIR_OP_ASSIGN:
@@ -7280,7 +7280,7 @@ void tcc_ir_generate_code(TCCIRState *ir)
       if (ir_next && ir_next->op == TCCIR_OP_RETURNVALUE)
       {
         IROperand next_src1_irop = tcc_ir_op_get_src1_irop(ir, ir_next);
-        ir_next_src1_vr = irop_get_vreg(next_src1_irop.vr);
+        ir_next_src1_vr = irop_get_vreg(&next_src1_irop);
       }
       if (ir_next && ir_next->op == TCCIR_OP_RETURNVALUE && ir_next_src1_vr == dest->vr && !has_incoming_jump[i + 1])
       {
@@ -7305,7 +7305,7 @@ void tcc_ir_generate_code(TCCIRState *ir)
       break;
     }
     case TCCIR_OP_JUMP:
-      tcc_gen_machine_jump_op(dest, cq->op);
+      tcc_gen_machine_jump_op(cq->op);
       /* Update mapping to actual instruction address (may have shifted due to literal pool) */
       ir_to_code_mapping[i] = ind - 4;
       /* Clear spill cache at branch - value may come from different path */
@@ -7319,7 +7319,9 @@ void tcc_ir_generate_code(TCCIRState *ir)
       tcc_ir_spill_cache_clear(&ir->spill_cache);
       break;
     case TCCIR_OP_IJUMP:
-      tcc_gen_machine_indirect_jump_op(src1);
+      const IROperand c = svalue_to_iroperand(ir, src1);
+      tcc_gen_machine_indirect_jump_op(c);
+      irop_compare_svalue(ir, src1, c, "indirect jump");
       tcc_ir_spill_cache_clear(&ir->spill_cache);
       break;
     case TCCIR_OP_SETIF:

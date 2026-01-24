@@ -1490,24 +1490,23 @@ void ggoto(void)
   print_vstack("ggoto");
 }
 
-ST_FUNC void tcc_gen_machine_indirect_jump_op(const SValue *src1)
+ST_FUNC void tcc_gen_machine_indirect_jump_op(IROperand src1)
 {
   /* Indirect jump: target address in src1 register.
    * If VT_LVAL is set, src1.pr0 holds a pointer to the target address,
    * and we need to load the actual target address before jumping. */
-  if (src1->pr0_reg == PREG_REG_NONE)
+  if (src1.pr0_reg == PREG_REG_NONE)
   {
     tcc_error("internal error: IJUMP target not in a register");
   }
 
-  int target_reg = src1->pr0_reg;
+  int target_reg = src1.pr0_reg;
   ScratchRegAlloc scratch = {0};
 
   /* Check if we need to dereference: VT_LVAL means the register holds a pointer
    * to the target address, not the target address itself */
-  const int val_kind = src1->r & VT_VALMASK;
-  const int is_address_of = (val_kind == VT_LOCAL || val_kind == VT_LLOCAL) && !(src1->r & VT_LVAL);
-  const int needs_deref = (src1->r & VT_LVAL) && !is_address_of;
+  const int is_address_of = (src1.is_llocal || src1.is_local) && !(src1.is_lval);
+  const int needs_deref = (src1.is_lval) && !is_address_of;
 
   if (needs_deref)
   {
@@ -6640,10 +6639,11 @@ static void thumb_emit_arg_move(const ThumbArgMove *m)
     SValue sv_copy = m->lval_sv;
     /* Use dst_reg_hi for 64-bit types (double, long long) */
     int hi_reg = (tcc_is_64bit_type(sv_copy.type.t) && m->dst_reg_hi != 0) ? m->dst_reg_hi : PREG_NONE;
-    if (tcc_is_64bit_type(sv_copy.type.t) && m->dst_reg_hi == 0) {
+    if (tcc_is_64bit_type(sv_copy.type.t) && m->dst_reg_hi == 0)
+    {
       fprintf(stderr, "WARNING: THUMB_ARG_MOVE_LVAL for 64-bit but dst_reg_hi=0!\n");
-      fprintf(stderr, "  sv: vr=%d type.t=0x%x r=0x%x pr0=%d pr1=%d\n",
-              sv_copy.vr, sv_copy.type.t, sv_copy.r, sv_copy.pr0_reg, sv_copy.pr1_reg);
+      fprintf(stderr, "  sv: vr=%d type.t=0x%x r=0x%x pr0=%d pr1=%d\n", sv_copy.vr, sv_copy.type.t, sv_copy.r,
+              sv_copy.pr0_reg, sv_copy.pr1_reg);
       fprintf(stderr, "  dst_reg=%d, dst_reg_hi=%d\n", m->dst_reg, m->dst_reg_hi);
     }
     load_to_reg(m->dst_reg, hi_reg, &sv_copy);
@@ -7396,7 +7396,7 @@ ST_FUNC void tcc_gen_machine_func_call_op(SValue *func_target, SValue *call_id_s
     tcc_free(layout.locs);
 }
 
-ST_FUNC void tcc_gen_machine_jump_op(SValue *dest, TccIrOp op)
+ST_FUNC void tcc_gen_machine_jump_op(TccIrOp op)
 {
   ot_check(th_b_t4(0)); // patch me later
 }
