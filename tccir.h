@@ -22,6 +22,7 @@
 
 #include <stdint.h>
 
+#include "tccir_operand.h"
 #include "tccls.h"
 
 #define PREG_SPILLED 0x20
@@ -317,198 +318,6 @@ typedef struct IRRegistersConfig
 
 extern const IRRegistersConfig irop_config[];
 
-/* ============================================================================
- * IROperand: Compact 8-byte operand representation (vs ~56 byte SValue)
- * ============================================================================
- * Always includes vreg field so optimization passes can access it directly.
- * Tag and flags are packed into reserved bits of the vr field.
- *
- * Memory savings: 8 bytes vs 56 bytes = ~7x smaller per operand.
- * Main savings come from:
- *   - No CType struct (8+ bytes)
- *   - No full CValue union
- *   - Pool indices for 64-bit values and symbols
- *   - Tag+flags packed into vr field
- *
- * vr field layout (32 bits):
- *   Bits 0-19:  vreg position (max 1M vregs per type - plenty for 131K observed)
- *   Bits 20-22: tag (3 bits, 8 values)
- *   Bits 23-24: flags (2 bits)
- *   Bits 25-27: reserved
- *   Bits 28-31: vreg type (from TCCIR_ENCODE_VREG)
- *
- * Special case: vr == -1 (0xFFFFFFFF) means "no vreg associated"
- */
-
-/* Bit positions for tag/flags in vr field */
-#define IROP_VR_TAG_SHIFT 20
-#define IROP_VR_TAG_MASK (0x7 << IROP_VR_TAG_SHIFT) /* 3 bits */
-#define IROP_VR_FLAGS_SHIFT 23
-#define IROP_VR_FLAGS_MASK (0x3 << IROP_VR_FLAGS_SHIFT) /* 2 bits */
-#define IROP_VR_POSITION_MASK 0xFFFFF                   /* 20 bits for position */
-
-/* Tags for IROperand (stored in bits 20-22 of vr) */
-#define IROP_TAG_NONE 0     /* sentinel for unused operand */
-#define IROP_TAG_VREG 1     /* pure vreg with no additional data */
-#define IROP_TAG_IMM32 2    /* payload.imm32: signed 32-bit immediate */
-#define IROP_TAG_STACKOFF 3 /* payload.imm32: signed 32-bit FP-relative offset */
-#define IROP_TAG_F32 4      /* payload.f32_bits: 32-bit float bits (inline) */
-#define IROP_TAG_I64 5      /* payload.pool_idx: index into pool_i64[] */
-#define IROP_TAG_F64 6      /* payload.pool_idx: index into pool_f64[] */
-#define IROP_TAG_SYMREF 7   /* payload.pool_idx: index into pool_symref[] */
-
-/* Flags for IROperand (stored in bits 23-24 of vr) */
-#define IROP_FLAG_LVAL (1u << 0)  /* value is an lvalue (needs dereference) */
-#define IROP_FLAG_LOCAL (1u << 1) /* VT_LOCAL semantics */
-
-typedef struct __attribute__((packed)) IROperand
-{
-  int32_t vr; /* vreg id with embedded tag+flags, -1 if not associated */
-  union
-  {
-    int32_t imm32;     /* for IMM32, STACKOFF */
-    uint32_t f32_bits; /* for F32 */
-    uint32_t pool_idx; /* for I64, F64, SYMREF */
-  } u;
-} IROperand;
-
-_Static_assert(sizeof(IROperand) == 8, "IROperand must be 8 bytes");
-
-/* Extract tag from vr field (handles vr == -1 case) */
-static inline int irop_get_tag(int32_t vr)
-{
-  if (vr < 0)
-    return IROP_TAG_NONE;
-  return (vr & IROP_VR_TAG_MASK) >> IROP_VR_TAG_SHIFT;
-}
-
-/* Extract flags from vr field (handles vr == -1 case) */
-static inline int irop_get_flags(int32_t vr)
-{
-  if (vr < 0)
-    return 0;
-  return (vr & IROP_VR_FLAGS_MASK) >> IROP_VR_FLAGS_SHIFT;
-}
-
-/* Extract clean vreg value (strips tag+flags, preserves type bits) */
-static inline int32_t irop_get_vreg(int32_t vr)
-{
-  if (vr < 0)
-    return -1;
-  /* Keep type bits (28-31) and position bits (0-19), clear tag/flags (20-27) */
-  return (vr & 0xF00FFFFF);
-}
-
-/* Encode vreg with tag and flags */
-static inline int32_t irop_encode_vr(int32_t vreg, int tag, int flags)
-{
-  if (vreg < 0)
-  {
-    /* No vreg - encode tag/flags in a special way or just return -1 with embedded info */
-    /* For vr == -1, we can't embed info, so we use a sentinel approach:
-     * Use a large negative value that encodes tag/flags in low bits */
-    return -1; /* For now, just return -1; tag/flags need payload inspection */
-  }
-  /* Clear existing tag/flags bits, then set new ones */
-  int32_t clean = vreg & ~(IROP_VR_TAG_MASK | IROP_VR_FLAGS_MASK);
-  return clean | (tag << IROP_VR_TAG_SHIFT) | (flags << IROP_VR_FLAGS_SHIFT);
-}
-
-/* Sentinel for "no operand" */
-#define IROP_NONE ((IROperand){.vr = -1, .u = {.imm32 = 0}})
-
-/* Encoding helpers */
-static inline IROperand irop_make_none(void)
-{
-  IROperand op;
-  op.vr = -1;
-  op.u.imm32 = 0;
-  return op;
-}
-
-static inline IROperand irop_make_vreg(int32_t vreg)
-{
-  IROperand op;
-  op.vr = irop_encode_vr(vreg, IROP_TAG_VREG, 0);
-  op.u.imm32 = 0;
-  return op;
-}
-
-static inline IROperand irop_make_imm32(int32_t vreg, int32_t val)
-{
-  IROperand op;
-  op.vr = irop_encode_vr(vreg, IROP_TAG_IMM32, 0);
-  op.u.imm32 = val;
-  return op;
-}
-
-static inline IROperand irop_make_stackoff(int32_t vreg, int32_t offset, uint8_t flags)
-{
-  IROperand op;
-  op.vr = irop_encode_vr(vreg, IROP_TAG_STACKOFF, flags);
-  op.u.imm32 = offset;
-  return op;
-}
-
-static inline IROperand irop_make_f32(int32_t vreg, uint32_t bits)
-{
-  IROperand op;
-  op.vr = irop_encode_vr(vreg, IROP_TAG_F32, 0);
-  op.u.f32_bits = bits;
-  return op;
-}
-
-static inline IROperand irop_make_i64(int32_t vreg, uint32_t pool_idx)
-{
-  IROperand op;
-  op.vr = irop_encode_vr(vreg, IROP_TAG_I64, 0);
-  op.u.pool_idx = pool_idx;
-  return op;
-}
-
-static inline IROperand irop_make_f64(int32_t vreg, uint32_t pool_idx)
-{
-  IROperand op;
-  op.vr = irop_encode_vr(vreg, IROP_TAG_F64, 0);
-  op.u.pool_idx = pool_idx;
-  return op;
-}
-
-static inline IROperand irop_make_symref(int32_t vreg, uint32_t pool_idx, uint8_t flags)
-{
-  IROperand op;
-  op.vr = irop_encode_vr(vreg, IROP_TAG_SYMREF, flags);
-  op.u.pool_idx = pool_idx;
-  return op;
-}
-
-/* Decoding helpers */
-static inline int irop_is_none(IROperand op)
-{
-  return op.vr < 0 || irop_get_tag(op.vr) == IROP_TAG_NONE;
-}
-
-static inline int irop_has_vreg(IROperand op)
-{
-  return op.vr >= 0;
-}
-
-/* ============================================================================
- * Pool entry types - separate arrays for cache efficiency
- * ============================================================================
- */
-
-/* Symref pool entry: symbol reference with addend and flags */
-#define IRPOOL_SYMREF_LVAL (1u << 0)  /* value is an lvalue (needs dereference) */
-#define IRPOOL_SYMREF_LOCAL (1u << 1) /* VT_LOCAL semantics */
-
-typedef struct IRPoolSymref
-{
-  struct Sym *sym;
-  int32_t addend;
-  uint32_t flags;
-} IRPoolSymref;
-
 typedef struct TCCIRState
 {
   // number of function parameters
@@ -671,6 +480,12 @@ void tcc_ir_show(TCCIRState *ir);
 void tcc_ir_drop_return_value(TCCIRState *ir);
 void tcc_ir_set_addrtaken(TCCIRState *ir, int vreg);
 
+/* Codegen operand access - reads from iroperand_pool with register allocation */
+int tcc_ir_codegen_get_operand(TCCIRState *ir, const IRQuadCompact *q, int slot, SValue *out);
+int tcc_ir_codegen_get_dest(TCCIRState *ir, const IRQuadCompact *q, SValue *out);
+int tcc_ir_codegen_get_src1(TCCIRState *ir, const IRQuadCompact *q, SValue *out);
+int tcc_ir_codegen_get_src2(TCCIRState *ir, const IRQuadCompact *q, SValue *out);
+
 void tcc_ir_patch_live_intervals_registers(TCCIRState *ir);
 IRLiveInterval *tcc_ir_get_live_interval(TCCIRState *ir, int vreg);
 void tcc_ir_backpatch(TCCIRState *ir, int t, int target_address);
@@ -709,20 +524,6 @@ void tcc_ir_spill_cache_invalidate_offset(SpillCache *cache, int offset);
 
 /* Check if FPU supports double precision (defined in arm-thumb-gen.c) */
 int arm_fpu_supports_double(int fpu_type);
-
-typedef enum TCCIR_VREG_TYPE
-{
-  TCCIR_VREG_TYPE_VAR = 1,
-  TCCIR_VREG_TYPE_TEMP = 2,
-  TCCIR_VREG_TYPE_PARAM = 3,
-} TCCIR_VREG_TYPE;
-
-/* Vreg encoding: type in top 4 bits, position in bottom 20 bits.
- * Bits 20-27 are reserved for IROperand tag+flags encoding. */
-#define TCCIR_VREG_POSITION_MASK 0xFFFFF /* 20 bits for position */
-#define TCCIR_DECODE_VREG_POSITION(vr) ((vr) & TCCIR_VREG_POSITION_MASK)
-#define TCCIR_DECODE_VREG_TYPE(vr) ((vr) >> 28)
-#define TCCIR_ENCODE_VREG(type, position) (((type) << 28) | ((position) & TCCIR_VREG_POSITION_MASK))
 
 /* SValue pool accessor functions for compact IR storage.
  * Operand layout in pool: dest (if present), src1 (if present), src2 (if present).
@@ -843,17 +644,6 @@ static inline IROperand tcc_ir_get_src2_irop(const TCCIRState *ir, int index)
 void tcc_ir_svalue_pool_init(TCCIRState *ir);
 void tcc_ir_svalue_pool_free(TCCIRState *ir);
 int tcc_ir_svalue_pool_add(TCCIRState *ir, const SValue *sv);
-
-/* IROperand pool management - separate pools for cache efficiency */
-void tcc_ir_pools_init(TCCIRState *ir);
-void tcc_ir_pools_free(TCCIRState *ir);
-uint32_t tcc_ir_pool_add_i64(TCCIRState *ir, int64_t val);
-uint32_t tcc_ir_pool_add_f64(TCCIRState *ir, uint64_t bits);
-uint32_t tcc_ir_pool_add_symref(TCCIRState *ir, struct Sym *sym, int32_t addend, uint32_t flags);
-
-/* IROperand <-> SValue conversion functions */
-IROperand svalue_to_iroperand(TCCIRState *ir, const SValue *sv);
-void iroperand_to_svalue(const TCCIRState *ir, IROperand op, SValue *out);
 
 /* Expand a compact instruction to a full TACQuadruple (for migration) */
 void tcc_ir_expand_quad(TCCIRState *ir, int index, TACQuadruple *out);

@@ -747,337 +747,6 @@ int tcc_ir_svalue_pool_add(TCCIRState *ir, const SValue *sv)
 }
 
 /* ============================================================================
- * IROperand pool management - separate pools for cache efficiency
- * ============================================================================
- */
-#define IRPOOL_INIT_SIZE 64
-
-void tcc_ir_pools_init(TCCIRState *ir)
-{
-  /* I64 pool */
-  ir->pool_i64_capacity = IRPOOL_INIT_SIZE;
-  ir->pool_i64_count = 0;
-  ir->pool_i64 = (int64_t *)tcc_mallocz(sizeof(int64_t) * ir->pool_i64_capacity);
-
-  /* F64 pool */
-  ir->pool_f64_capacity = IRPOOL_INIT_SIZE;
-  ir->pool_f64_count = 0;
-  ir->pool_f64 = (uint64_t *)tcc_mallocz(sizeof(uint64_t) * ir->pool_f64_capacity);
-
-  /* Symref pool */
-  ir->pool_symref_capacity = IRPOOL_INIT_SIZE;
-  ir->pool_symref_count = 0;
-  ir->pool_symref = (IRPoolSymref *)tcc_mallocz(sizeof(IRPoolSymref) * ir->pool_symref_capacity);
-
-  /* IROperand pool - parallel to svalue_pool */
-  ir->iroperand_pool_capacity = IRPOOL_INIT_SIZE;
-  ir->iroperand_pool_count = 0;
-  ir->iroperand_pool = (IROperand *)tcc_mallocz(sizeof(IROperand) * ir->iroperand_pool_capacity);
-
-  if (!ir->pool_i64 || !ir->pool_f64 || !ir->pool_symref || !ir->iroperand_pool)
-  {
-    fprintf(stderr, "tcc_ir_pools_init: out of memory\n");
-    exit(1);
-  }
-}
-
-void tcc_ir_pools_free(TCCIRState *ir)
-{
-  if (ir->pool_i64)
-  {
-    tcc_free(ir->pool_i64);
-    ir->pool_i64 = NULL;
-  }
-  ir->pool_i64_count = 0;
-  ir->pool_i64_capacity = 0;
-
-  if (ir->pool_f64)
-  {
-    tcc_free(ir->pool_f64);
-    ir->pool_f64 = NULL;
-  }
-  ir->pool_f64_count = 0;
-  ir->pool_f64_capacity = 0;
-
-  if (ir->pool_symref)
-  {
-    tcc_free(ir->pool_symref);
-    ir->pool_symref = NULL;
-  }
-  ir->pool_symref_count = 0;
-  ir->pool_symref_capacity = 0;
-
-  if (ir->iroperand_pool)
-  {
-    tcc_free(ir->iroperand_pool);
-    ir->iroperand_pool = NULL;
-  }
-  ir->iroperand_pool_count = 0;
-  ir->iroperand_pool_capacity = 0;
-}
-
-uint32_t tcc_ir_pool_add_i64(TCCIRState *ir, int64_t val)
-{
-  if (ir->pool_i64_count >= ir->pool_i64_capacity)
-  {
-    ir->pool_i64_capacity *= 2;
-    ir->pool_i64 = (int64_t *)tcc_realloc(ir->pool_i64, sizeof(int64_t) * ir->pool_i64_capacity);
-    if (!ir->pool_i64)
-    {
-      fprintf(stderr, "tcc_ir_pool_add_i64: out of memory\n");
-      exit(1);
-    }
-  }
-  ir->pool_i64[ir->pool_i64_count] = val;
-  return (uint32_t)ir->pool_i64_count++;
-}
-
-uint32_t tcc_ir_pool_add_f64(TCCIRState *ir, uint64_t bits)
-{
-  if (ir->pool_f64_count >= ir->pool_f64_capacity)
-  {
-    ir->pool_f64_capacity *= 2;
-    ir->pool_f64 = (uint64_t *)tcc_realloc(ir->pool_f64, sizeof(uint64_t) * ir->pool_f64_capacity);
-    if (!ir->pool_f64)
-    {
-      fprintf(stderr, "tcc_ir_pool_add_f64: out of memory\n");
-      exit(1);
-    }
-  }
-  ir->pool_f64[ir->pool_f64_count] = bits;
-  return (uint32_t)ir->pool_f64_count++;
-}
-
-uint32_t tcc_ir_pool_add_symref(TCCIRState *ir, Sym *sym, int32_t addend, uint32_t flags)
-{
-  if (ir->pool_symref_count >= ir->pool_symref_capacity)
-  {
-    ir->pool_symref_capacity *= 2;
-    ir->pool_symref = (IRPoolSymref *)tcc_realloc(ir->pool_symref, sizeof(IRPoolSymref) * ir->pool_symref_capacity);
-    if (!ir->pool_symref)
-    {
-      fprintf(stderr, "tcc_ir_pool_add_symref: out of memory\n");
-      exit(1);
-    }
-  }
-  IRPoolSymref *entry = &ir->pool_symref[ir->pool_symref_count];
-  entry->sym = sym;
-  entry->addend = addend;
-  entry->flags = flags;
-  return (uint32_t)ir->pool_symref_count++;
-}
-
-/* ============================================================================
- * IROperand <-> SValue conversion functions
- * ============================================================================
- * These form the synchronization layer between the old SValue-based system
- * and the new IROperand-based system during the migration period.
- */
-
-/* Convert SValue to IROperand, adding to appropriate pool if needed.
- * The vreg field is ALWAYS preserved from sv->vr.
- */
-IROperand svalue_to_iroperand(TCCIRState *ir, const SValue *sv)
-{
-  if (!sv)
-    return irop_make_none();
-
-  int32_t vr = sv->vr; /* Always preserve vreg */
-  int val_kind = sv->r & VT_VALMASK;
-  int is_lval = sv->r & VT_LVAL;
-  int has_sym = sv->r & VT_SYM;
-  int btype = sv->type.t & VT_BTYPE;
-
-  /* Build flags */
-  uint8_t flags = 0;
-  if (is_lval)
-    flags |= IROP_FLAG_LVAL;
-  if (val_kind == VT_LOCAL)
-    flags |= IROP_FLAG_LOCAL;
-
-  /* Case 1: Pure vreg (no const, no sym, no lval, valid vr) */
-  if (vr >= 0 && val_kind != VT_CONST && val_kind != VT_LOCAL && !has_sym && !is_lval)
-  {
-    return irop_make_vreg(vr);
-  }
-
-  /* Case 2: Symbol reference - always goes to symref pool */
-  if (has_sym)
-  {
-    uint32_t pool_flags = 0;
-    if (is_lval)
-      pool_flags |= IRPOOL_SYMREF_LVAL;
-    if (val_kind == VT_LOCAL)
-      pool_flags |= IRPOOL_SYMREF_LOCAL;
-    uint32_t idx = tcc_ir_pool_add_symref(ir, sv->sym, (int32_t)sv->c.i, pool_flags);
-    return irop_make_symref(vr, idx, flags);
-  }
-
-  /* Case 3: VT_LOCAL stack offset (no symbol) */
-  if (val_kind == VT_LOCAL)
-  {
-    return irop_make_stackoff(vr, (int32_t)sv->c.i, flags);
-  }
-
-  /* Case 4: Float constant - inline F32 */
-  if (btype == VT_FLOAT && val_kind == VT_CONST)
-  {
-    union
-    {
-      float f;
-      uint32_t bits;
-    } u;
-    u.f = sv->c.f;
-    return irop_make_f32(vr, u.bits);
-  }
-
-  /* Case 5: Double constant - pool F64 */
-  if (btype == VT_DOUBLE && val_kind == VT_CONST)
-  {
-    union
-    {
-      double d;
-      uint64_t bits;
-    } u;
-    u.d = sv->c.d;
-    uint32_t idx = tcc_ir_pool_add_f64(ir, u.bits);
-    return irop_make_f64(vr, idx);
-  }
-
-  /* Case 6: 64-bit integer constant - pool I64 */
-  if (btype == VT_LLONG && val_kind == VT_CONST)
-  {
-    uint32_t idx = tcc_ir_pool_add_i64(ir, (int64_t)sv->c.i);
-    return irop_make_i64(vr, idx);
-  }
-
-  /* Case 7: 32-bit integer constant - inline IMM32 */
-  if (val_kind == VT_CONST)
-  {
-    /* Check if value fits in signed 32-bit */
-    int64_t val = (int64_t)sv->c.i;
-    if (val >= INT32_MIN && val <= INT32_MAX)
-    {
-      return irop_make_imm32(vr, (int32_t)val);
-    }
-    /* Doesn't fit - use I64 pool */
-    uint32_t idx = tcc_ir_pool_add_i64(ir, val);
-    return irop_make_i64(vr, idx);
-  }
-
-  /* Fallback: use symref pool for complex cases */
-  uint32_t pool_flags = 0;
-  if (is_lval)
-    pool_flags |= IRPOOL_SYMREF_LVAL;
-  if (val_kind == VT_LOCAL)
-    pool_flags |= IRPOOL_SYMREF_LOCAL;
-  uint32_t idx = tcc_ir_pool_add_symref(ir, sv->sym, (int32_t)sv->c.i, pool_flags);
-  return irop_make_symref(vr, idx, flags);
-}
-
-/* Expand IROperand back to SValue (for backward compatibility).
- * The vreg field is always restored from op.vr (with tag/flags stripped).
- */
-void iroperand_to_svalue(const TCCIRState *ir, IROperand op, SValue *out)
-{
-  svalue_init(out);
-
-  /* Always restore vreg from IROperand (strip embedded tag/flags) */
-  out->vr = irop_get_vreg(op.vr);
-
-  int tag = irop_get_tag(op.vr);
-  int flags = irop_get_flags(op.vr);
-
-  switch (tag)
-  {
-  case IROP_TAG_NONE:
-    /* Already initialized by svalue_init */
-    break;
-
-  case IROP_TAG_VREG:
-    out->r = VT_CONST; /* vreg-only, no memory location */
-    break;
-
-  case IROP_TAG_IMM32:
-    out->r = VT_CONST;
-    out->c.i = (int64_t)op.u.imm32;
-    break;
-
-  case IROP_TAG_STACKOFF:
-  {
-    out->r = VT_LOCAL;
-    if (flags & IROP_FLAG_LVAL)
-      out->r |= VT_LVAL;
-    out->c.i = (int64_t)op.u.imm32; /* stack offset stored in imm32 */
-    break;
-  }
-
-  case IROP_TAG_F32:
-  {
-    union
-    {
-      uint32_t bits;
-      float f;
-    } u;
-    u.bits = op.u.f32_bits;
-    out->r = VT_CONST;
-    out->c.f = u.f;
-    out->type.t = VT_FLOAT;
-    break;
-  }
-
-  case IROP_TAG_I64:
-  {
-    uint32_t idx = op.u.pool_idx;
-    out->r = VT_CONST;
-    out->c.i = (uint64_t)ir->pool_i64[idx];
-    out->type.t = VT_LLONG;
-    break;
-  }
-
-  case IROP_TAG_F64:
-  {
-    uint32_t idx = op.u.pool_idx;
-    union
-    {
-      uint64_t bits;
-      double d;
-    } u;
-    u.bits = ir->pool_f64[idx];
-    out->r = VT_CONST;
-    out->c.d = u.d;
-    out->type.t = VT_DOUBLE;
-    break;
-  }
-
-  case IROP_TAG_SYMREF:
-  {
-    uint32_t idx = op.u.pool_idx;
-    IRPoolSymref *ref = &ir->pool_symref[idx];
-    out->sym = ref->sym;
-    out->c.i = (int64_t)ref->addend;
-
-    if (ref->flags & IRPOOL_SYMREF_LOCAL)
-      out->r = VT_LOCAL;
-    else
-      out->r = VT_CONST;
-
-    if (ref->flags & IRPOOL_SYMREF_LVAL)
-      out->r |= VT_LVAL;
-
-    if (ref->sym)
-      out->r |= VT_SYM;
-
-    break;
-  }
-
-  default:
-    /* Unknown tag - already initialized by svalue_init */
-    break;
-  }
-}
-
-/* ============================================================================
  * Instruction expansion and writeback functions
  * ============================================================================
  */
@@ -1129,7 +798,7 @@ void tcc_ir_expand_quad(TCCIRState *ir, int index, TACQuadruple *out)
   }
 }
 
-/* Write back modified operands from a TACQuadruple to the svalue_pool */
+/* Write back modified operands from a TACQuadruple to BOTH pools */
 void tcc_ir_writeback_quad(TCCIRState *ir, int index, TACQuadruple *q)
 {
   IRQuadCompact *cq = &ir->compact_instructions[index];
@@ -1139,18 +808,21 @@ void tcc_ir_writeback_quad(TCCIRState *ir, int index, TACQuadruple *q)
   if (cfg->has_dest)
   {
     ir->svalue_pool[pool_off] = q->dest;
+    ir->iroperand_pool[pool_off] = svalue_to_iroperand(ir, &q->dest);
     pool_off++;
   }
 
   if (cfg->has_src1)
   {
     ir->svalue_pool[pool_off] = q->src1;
+    ir->iroperand_pool[pool_off] = svalue_to_iroperand(ir, &q->src1);
     pool_off++;
   }
 
   if (cfg->has_src2)
   {
     ir->svalue_pool[pool_off] = q->src2;
+    ir->iroperand_pool[pool_off] = svalue_to_iroperand(ir, &q->src2);
   }
 }
 
@@ -1205,10 +877,52 @@ void tcc_ir_sync_operand(TCCIRState *ir, int instr_idx, int operand_slot, const 
   /* Write to svalue_pool (old system) */
   ir->svalue_pool[pool_off] = *sv;
 
-  /* Convert and store to IROperand pools (new system) - append-only */
-  /* Note: we don't store the IROperand back into an instruction array yet,
-   * but the conversion populates the appropriate pool (i64/f64/symref) */
-  (void)svalue_to_iroperand(ir, sv);
+  /* Write to iroperand_pool (new system) - keep both pools in sync */
+  ir->iroperand_pool[pool_off] = svalue_to_iroperand(ir, sv);
+}
+
+/* Sync operand from svalue_pool to iroperand_pool (for optimization passes
+ * that modify svalue_pool directly). Does NOT take an SValue parameter -
+ * reads from the pool that was already written. */
+void tcc_ir_resync_operand(TCCIRState *ir, int instr_idx, int operand_slot)
+{
+  IRQuadCompact *cq = &ir->compact_instructions[instr_idx];
+  const IRRegistersConfig *cfg = &irop_config[cq->op];
+
+  /* Calculate pool offset for this operand slot */
+  int pool_off = cq->operand_base;
+  if (operand_slot == 0)
+  {
+    /* dest slot */
+    if (!cfg->has_dest)
+      return;
+  }
+  else if (operand_slot == 1)
+  {
+    /* src1 slot */
+    if (!cfg->has_src1)
+      return;
+    if (cfg->has_dest)
+      pool_off++;
+  }
+  else if (operand_slot == 2)
+  {
+    /* src2 slot */
+    if (!cfg->has_src2)
+      return;
+    if (cfg->has_dest)
+      pool_off++;
+    if (cfg->has_src1)
+      pool_off++;
+  }
+  else
+  {
+    return; /* invalid slot */
+  }
+
+  /* Read from svalue_pool and write to iroperand_pool */
+  const SValue *sv = &ir->svalue_pool[pool_off];
+  ir->iroperand_pool[pool_off] = svalue_to_iroperand(ir, sv);
 }
 
 /* Sync all operands of a TACQuadruple to both pool systems */
@@ -1223,6 +937,20 @@ void tcc_ir_sync_quad(TCCIRState *ir, int instr_idx, const TACQuadruple *q)
     tcc_ir_sync_operand(ir, instr_idx, 1, &q->src1);
   if (cfg->has_src2)
     tcc_ir_sync_operand(ir, instr_idx, 2, &q->src2);
+}
+
+/* Set jump target address in dest operand, updating both pools */
+void tcc_ir_set_dest_jump_target(TCCIRState *ir, int instr_idx, int target_address)
+{
+  IRQuadCompact *cq = &ir->compact_instructions[instr_idx];
+  int pool_off = cq->operand_base;
+
+  /* Update svalue_pool */
+  SValue *sv = &ir->svalue_pool[pool_off];
+  sv->c.i = target_address;
+
+  /* Update iroperand_pool */
+  ir->iroperand_pool[pool_off] = svalue_to_iroperand(ir, sv);
 }
 
 TCCIRState *tcc_ir_allocate_block()
@@ -2340,7 +2068,9 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
         IRQuadCompact *prev_cq = &ir->compact_instructions[pos - 1];
         if (irop_config[prev_cq->op].has_dest)
         {
-          ir->svalue_pool[prev_cq->operand_base] = *prev_dest;
+          int pool_off = prev_cq->operand_base;
+          ir->svalue_pool[pool_off] = *prev_dest;
+          ir->iroperand_pool[pool_off] = svalue_to_iroperand(ir, prev_dest);
         }
       }
 
@@ -4192,6 +3922,15 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
   int old_r = sv->r;
   int old_v = old_r & VT_VALMASK;
 
+  /* DEBUG: trace fill_registers path for specific failing vreg */
+  int debug_this = (sv->vr == 536871041 || sv->vr == 536871050 || sv->vr == 536870995 || sv->vr == 536871053);
+
+  if (debug_this)
+  {
+    fprintf(stderr, "DEBUG fill_registers ENTER: sv=%p vr=%d r=0x%x type.t=0x%x is_valid=%d\n", (void *)sv, sv->vr,
+            sv->r, sv->type.t, tcc_is_vreg_valid(ir, sv->vr));
+  }
+
   /* VT_LOCAL/VT_LLOCAL operands can mean either:
    * - a concrete stack slot (vr == -1), e.g. VLA save slots, or
    * - a logical local tracked as a vreg by the IR (vr != -1).
@@ -4252,6 +3991,12 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
     sv->pr1_reg = interval->allocation.r1 & PREG_REG_NONE;
     sv->pr1_spilled = (interval->allocation.r1 & PREG_SPILLED) != 0;
     sv->c.i = interval->allocation.offset;
+
+    if (debug_this)
+    {
+      fprintf(stderr, "DEBUG fill_registers: after alloc: vr=%d r0=0x%x r1=0x%x pr0=%d pr1=%d\n", sv->vr,
+              interval->allocation.r0, interval->allocation.r1, sv->pr0_reg, sv->pr1_reg);
+    }
 
     /* Determine if we should preserve VT_LVAL:
      * - If old_r was VT_LOCAL|VT_LVAL (local variable on stack), and now
@@ -4352,6 +4097,72 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
      * that wasn't marked as VT_CONST. Preserve the symbol. */
     sv->r = VT_CONST | VT_SYM;
   }
+}
+
+/* ============================================================================
+ * IROperand-based codegen helpers
+ * ============================================================================
+ * These functions read operands from iroperand_pool (compact representation)
+ * and expand them to SValue for codegen. This is the first step in migrating
+ * codegen away from svalue_pool.
+ */
+
+/* Read operand from iroperand_pool, expand to SValue, and apply register allocation.
+ * Returns true if operand was fetched (has_XXX == 1), false otherwise.
+ * The output SValue is ready for codegen with pr0_reg/pr0_spilled filled in. */
+ST_FUNC int tcc_ir_codegen_get_operand(TCCIRState *ir, const IRQuadCompact *q, int slot, SValue *out)
+{
+  int off;
+  int has_operand;
+
+  switch (slot)
+  {
+  case 0: /* dest */
+    has_operand = irop_config[q->op].has_dest;
+    off = 0;
+    break;
+  case 1: /* src1 */
+    has_operand = irop_config[q->op].has_src1;
+    off = irop_config[q->op].has_dest;
+    break;
+  case 2: /* src2 */
+    has_operand = irop_config[q->op].has_src2;
+    off = irop_config[q->op].has_dest + irop_config[q->op].has_src1;
+    break;
+  default:
+    return 0;
+  }
+
+  if (!has_operand)
+  {
+    svalue_init(out);
+    return 0;
+  }
+
+  /* Read from iroperand_pool and expand to SValue */
+  IROperand irop = ir->iroperand_pool[q->operand_base + off];
+  iroperand_to_svalue(ir, irop, out);
+
+  /* Apply register allocation */
+  tcc_ir_fill_registers(ir, out);
+
+  return 1;
+}
+
+/* Convenience wrappers for each operand slot */
+ST_FUNC int tcc_ir_codegen_get_dest(TCCIRState *ir, const IRQuadCompact *q, SValue *out)
+{
+  return tcc_ir_codegen_get_operand(ir, q, 0, out);
+}
+
+ST_FUNC int tcc_ir_codegen_get_src1(TCCIRState *ir, const IRQuadCompact *q, SValue *out)
+{
+  return tcc_ir_codegen_get_operand(ir, q, 1, out);
+}
+
+ST_FUNC int tcc_ir_codegen_get_src2(TCCIRState *ir, const IRQuadCompact *q, SValue *out)
+{
+  return tcc_ir_codegen_get_operand(ir, q, 2, out);
 }
 
 /* Dead Code Elimination pass
@@ -4541,10 +4352,10 @@ int tcc_ir_dead_store_elimination(TCCIRState *ir)
 }
 
 /* Helper: check if two SValues refer to the same virtual register */
-static int same_vreg(const SValue *a, const SValue *b)
+static int same_vreg_svalue(const SValue *a, const SValue *b)
 {
-  /* Both must be vregs (not constants) */
-  if ((a->r & VT_VALMASK) == VT_CONST || (b->r & VT_VALMASK) == VT_CONST)
+  /* Both must have valid vregs */
+  if (a->vr < 0 || b->vr < 0)
     return 0;
   return a->vr == b->vr;
 }
@@ -4558,10 +4369,10 @@ static int same_bool_operands(TCCIRState *ir, IRQuadCompact *q1, IRQuadCompact *
   const SValue *s22 = tcc_ir_op_get_src2(ir, q2);
 
   /* Same order: (a,b) == (a,b) */
-  if (same_vreg(s11, s21) && same_vreg(s12, s22))
+  if (same_vreg_svalue(s11, s21) && same_vreg_svalue(s12, s22))
     return 1;
   /* Swapped order: (a,b) == (b,a) - only valid for commutative ops */
-  if (same_vreg(s11, s22) && same_vreg(s12, s21))
+  if (same_vreg_svalue(s11, s22) && same_vreg_svalue(s12, s21))
     return 1;
   return 0;
 }
@@ -4634,8 +4445,10 @@ int tcc_ir_bool_cse(TCCIRState *ir)
 #endif
         q->op = TCCIR_OP_ASSIGN;
         *src1 = *tcc_ir_op_get_dest(ir, prev);
+        tcc_ir_resync_operand(ir, i, 1);
         svalue_init(src2);
         src2->vr = -1;
+        tcc_ir_resync_operand(ir, i, 2);
         changes++;
         found = 1;
         break;
@@ -4759,6 +4572,7 @@ int tcc_ir_bool_idempotent(TCCIRState *ir)
       SValue *src2 = tcc_ir_op_get_src2(ir, q);
       memset(src2, 0, sizeof(*src2));
       src2->vr = -1;
+      tcc_ir_resync_operand(ir, i, 2);
       changes++;
     }
   }
@@ -4917,13 +4731,16 @@ int tcc_ir_return_value_optimization(TCCIRState *ir)
     SValue *ret_src1 = tcc_ir_op_get_src1(ir, ret);
     *ret_src1 = *load_src1;
     ret_src1->type = ret_type;
+    tcc_ir_resync_operand(ir, i, 1);
 
     /* Convert the LOAD into a no-op ASSIGN; DCE will remove it. */
     def->op = TCCIR_OP_ASSIGN;
     *load_src1 = *load_dest;
+    tcc_ir_resync_operand(ir, def_idx, 1);
     SValue *load_src2 = tcc_ir_op_get_src2(ir, def);
     memset(load_src2, 0, sizeof(*load_src2));
     load_src2->vr = -1;
+    tcc_ir_resync_operand(ir, def_idx, 2);
     changes++;
   }
 
@@ -5035,8 +4852,10 @@ int tcc_ir_bool_simplification(TCCIRState *ir)
     /* Replace outer op with ASSIGN from first inner op result */
     q->op = TCCIR_OP_ASSIGN;
     *src1 = *tcc_ir_op_get_dest(ir, q1); /* Copy the result of first BOOL_OR/BOOL_AND */
+    tcc_ir_resync_operand(ir, i, 1);
     svalue_init(src2);
     src2->vr = -1;
+    tcc_ir_resync_operand(ir, i, 2);
 
     /* The second inner op will be eliminated by DCE if unused */
     changes++;
@@ -5208,6 +5027,7 @@ int tcc_ir_constant_propagation(TCCIRState *ir)
         src1->r = VT_CONST;
         src1->c.i = var_info[pos].value;
         src1->vr = -1;
+        tcc_ir_resync_operand(ir, i, 1);
         changes++;
       }
     }
@@ -5221,6 +5041,7 @@ int tcc_ir_constant_propagation(TCCIRState *ir)
         src2->r = VT_CONST;
         src2->c.i = var_info[pos].value;
         src2->vr = -1;
+        tcc_ir_resync_operand(ir, i, 2);
         changes++;
       }
     }
@@ -5257,6 +5078,8 @@ int tcc_ir_constant_propagation(TCCIRState *ir)
         tmp = *src1;
         *src1 = *src2;
         *src2 = tmp;
+        tcc_ir_resync_operand(ir, i, 1);
+        tcc_ir_resync_operand(ir, i, 2);
         /* Update flags after swap */
         src1_is_const = 0;
         src2_is_const = 1;
@@ -5319,8 +5142,10 @@ int tcc_ir_constant_propagation(TCCIRState *ir)
         src1->r = VT_CONST;
         src1->c.i = result;
         src1->vr = -1;
+        tcc_ir_resync_operand(ir, i, 1);
         memset(src2, 0, sizeof(*src2));
         src2->vr = -1;
+        tcc_ir_resync_operand(ir, i, 2);
         changes++;
         continue;
       }
@@ -5391,8 +5216,10 @@ int tcc_ir_constant_propagation(TCCIRState *ir)
 #endif
         q->op = TCCIR_OP_ASSIGN;
         /* src1 stays as-is, clear src2 */
+        tcc_ir_resync_operand(ir, i, 1);
         memset(src2, 0, sizeof(*src2));
         src2->vr = -1;
+        tcc_ir_resync_operand(ir, i, 2);
         changes++;
       }
       else if (replace_with_zero)
@@ -5404,8 +5231,10 @@ int tcc_ir_constant_propagation(TCCIRState *ir)
         src1->r = VT_CONST;
         src1->c.i = 0;
         src1->vr = -1;
+        tcc_ir_resync_operand(ir, i, 1);
         memset(src2, 0, sizeof(*src2));
         src2->vr = -1;
+        tcc_ir_resync_operand(ir, i, 2);
         changes++;
       }
       else if (replace_with_const)
@@ -5418,8 +5247,10 @@ int tcc_ir_constant_propagation(TCCIRState *ir)
         src1->r = VT_CONST;
         src1->c.i = const_value;
         src1->vr = -1;
+        tcc_ir_resync_operand(ir, i, 1);
         memset(src2, 0, sizeof(*src2));
         src2->vr = -1;
+        tcc_ir_resync_operand(ir, i, 2);
         changes++;
       }
     }
@@ -5441,8 +5272,10 @@ int tcc_ir_constant_propagation(TCCIRState *ir)
 #endif
           q->op = TCCIR_OP_ASSIGN;
           *src1 = *src2;
+          tcc_ir_resync_operand(ir, i, 1);
           memset(src2, 0, sizeof(*src2));
           src2->vr = -1;
+          tcc_ir_resync_operand(ir, i, 2);
           changes++;
         }
         break;
@@ -5455,8 +5288,10 @@ int tcc_ir_constant_propagation(TCCIRState *ir)
 #endif
           q->op = TCCIR_OP_ASSIGN;
           /* src1 is already 0 */
+          tcc_ir_resync_operand(ir, i, 1);
           memset(src2, 0, sizeof(*src2));
           src2->vr = -1;
+          tcc_ir_resync_operand(ir, i, 2);
           changes++;
         }
         break;
@@ -5471,8 +5306,10 @@ int tcc_ir_constant_propagation(TCCIRState *ir)
 #endif
           q->op = TCCIR_OP_ASSIGN;
           /* src1 is already 0 */
+          tcc_ir_resync_operand(ir, i, 1);
           memset(src2, 0, sizeof(*src2));
           src2->vr = -1;
+          tcc_ir_resync_operand(ir, i, 2);
           changes++;
         }
         break;
@@ -5562,11 +5399,13 @@ int tcc_ir_constant_propagation(TCCIRState *ir)
     setif_src1->r = VT_CONST;
     setif_src1->c.i = result;
     setif_src1->vr = -1;
+    tcc_ir_resync_operand(ir, i + 1, 1);
     SValue *setif_src2 = tcc_ir_op_get_src2(ir, setif_q);
     if (setif_src2)
     {
       memset(setif_src2, 0, sizeof(*setif_src2));
       setif_src2->vr = -1;
+      tcc_ir_resync_operand(ir, i + 1, 2);
     }
     changes++;
   }
@@ -5686,6 +5525,7 @@ int tcc_ir_tmp_constant_propagation(TCCIRState *ir)
         src1->r = VT_CONST;
         src1->c.i = tmp_info[pos].value;
         src1->vr = -1;
+        tcc_ir_resync_operand(ir, i, 1);
         changes++;
       }
     }
@@ -5703,6 +5543,7 @@ int tcc_ir_tmp_constant_propagation(TCCIRState *ir)
         src2->r = VT_CONST;
         src2->c.i = tmp_info[pos].value;
         src2->vr = -1;
+        tcc_ir_resync_operand(ir, i, 2);
         changes++;
       }
     }
@@ -5937,6 +5778,7 @@ int tcc_ir_copy_propagation(TCCIRState *ir)
                TCCIR_DECODE_VREG_POSITION(copy_info[pos].source_vr), i);
 #endif
         *src1 = copy_info[pos].source;
+        tcc_ir_resync_operand(ir, i, 1);
         changes++;
       }
     }
@@ -5953,6 +5795,7 @@ int tcc_ir_copy_propagation(TCCIRState *ir)
                TCCIR_DECODE_VREG_POSITION(copy_info[pos].source_vr), i);
 #endif
         *src2 = copy_info[pos].source;
+        tcc_ir_resync_operand(ir, i, 2);
         changes++;
       }
     }
@@ -6180,6 +6023,7 @@ int tcc_ir_store_load_forwarding(TCCIRState *ir)
           q->op = TCCIR_OP_ASSIGN;
           SValue *src1 = tcc_ir_get_src1(ir, i);
           *src1 = e->stored_value;
+          tcc_ir_resync_operand(ir, i, 1);
           /* Note: ASSIGN has no src2, so no need to clear it */
           changes++;
           break;
@@ -6620,8 +6464,10 @@ int tcc_ir_arithmetic_cse(TCCIRState *ir)
           src1->type = tcc_ir_get_dest(ir, e->instruction_idx)->type;
           src1->r = 0; /* No flags - this is a simple vreg read */
           src1->c.i = 0;
+          tcc_ir_resync_operand(ir, i, 1);
           memset(src2, 0, sizeof(*src2));
           src2->vr = -1;
+          tcc_ir_resync_operand(ir, i, 2);
           changes++;
           found = 1;
           break;
@@ -6664,8 +6510,10 @@ int tcc_ir_arithmetic_cse(TCCIRState *ir)
           src1->type = tcc_ir_get_dest(ir, e->instruction_idx)->type;
           src1->r = 0; /* No flags - this is a simple vreg read */
           src1->c.i = 0;
+          tcc_ir_resync_operand(ir, i, 1);
           memset(src2, 0, sizeof(*src2));
           src2->vr = -1;
+          tcc_ir_resync_operand(ir, i, 2);
           changes++;
           found = 1;
           break;
@@ -7120,8 +6968,9 @@ void tcc_ir_generate_code(TCCIRState *ir)
     IRQuadCompact *p = &ir->compact_instructions[i];
     if (p->op == TCCIR_OP_JUMP || p->op == TCCIR_OP_JUMPIF)
     {
-      const SValue *dest = tcc_ir_get_dest(ir, i);
-      int target = dest ? dest->c.i : -1;
+      /* Read jump target from IROperand pool */
+      IROperand dest_irop = tcc_ir_get_dest_irop(ir, i);
+      int target = (int)dest_irop.u.imm32;
       if (target >= 0 && target < ir->next_instruction_index)
         has_incoming_jump[target] = 1;
     }
@@ -7159,22 +7008,18 @@ void tcc_ir_generate_code(TCCIRState *ir)
     // emit debug line info for this IR instruction AFTER recording ind
     tcc_debug_line_num(tcc_state, cq->line_num);
 
-    /* Fill in register allocations before deciding on materialization */
+    /* Get operand pointers from svalue_pool (the working storage) */
     SValue *src1 = tcc_ir_op_get_src1(ir, cq);
     SValue *src2 = tcc_ir_op_get_src2(ir, cq);
     SValue *dest = tcc_ir_op_get_dest(ir, cq);
-    if (irop_config[cq->op].has_src1 == 1)
-    {
+
+    /* Apply register allocation to operands */
+    if (src1)
       tcc_ir_fill_registers(ir, src1);
-    }
-    if (irop_config[cq->op].has_src2 == 1)
-    {
+    if (src2)
       tcc_ir_fill_registers(ir, src2);
-    }
-    if (irop_config[cq->op].has_dest == 1)
-    {
+    if (dest)
       tcc_ir_fill_registers(ir, dest);
-    }
 
     bool need_src1_value = false;
     bool need_src2_value = false;
@@ -7373,9 +7218,13 @@ void tcc_ir_generate_code(TCCIRState *ir)
       /* Peephole: if next instruction is RETURNVALUE using this LOAD's result,
        * load directly to R0 instead of the allocated register */
       const IRQuadCompact *ir_next = (i + 1 < ir->next_instruction_index) ? &ir->compact_instructions[i + 1] : NULL;
-      const SValue *ir_next_src1 = ir_next ? tcc_ir_op_get_src1(ir, ir_next) : NULL;
-      if (ir_next && ir_next->op == TCCIR_OP_RETURNVALUE && ir_next_src1 && ir_next_src1->vr == dest->vr &&
-          !has_incoming_jump[i + 1])
+      int ir_next_src1_vr = -1;
+      if (ir_next && ir_next->op == TCCIR_OP_RETURNVALUE)
+      {
+        IROperand next_src1_irop = tcc_ir_op_get_src1_irop(ir, ir_next);
+        ir_next_src1_vr = irop_get_vreg(next_src1_irop.vr);
+      }
+      if (ir_next && ir_next->op == TCCIR_OP_RETURNVALUE && ir_next_src1_vr == dest->vr && !has_incoming_jump[i + 1])
       {
         dest->pr0_reg = REG_IRET; /* R0 */
         dest->pr0_spilled = 0;
@@ -7427,8 +7276,13 @@ void tcc_ir_generate_code(TCCIRState *ir)
       /* Peephole: if next instruction is RETURNVALUE using this ASSIGN's dest,
        * assign directly to R0 to avoid an extra move */
       const IRQuadCompact *ir_next = (i + 1 < ir->next_instruction_index) ? &ir->compact_instructions[i + 1] : NULL;
-      const SValue *ir_next_src1 = ir_next ? tcc_ir_op_get_src1(ir, ir_next) : NULL;
-      if (ir_next && ir_next->op == TCCIR_OP_RETURNVALUE && ir_next_src1->vr == dest->vr && !has_incoming_jump[i + 1])
+      int ir_next_src1_vr = -1;
+      if (ir_next && ir_next->op == TCCIR_OP_RETURNVALUE)
+      {
+        IROperand next_src1_irop = tcc_ir_op_get_src1_irop(ir, ir_next);
+        ir_next_src1_vr = irop_get_vreg(next_src1_irop.vr);
+      }
+      if (ir_next && ir_next->op == TCCIR_OP_RETURNVALUE && ir_next_src1_vr == dest->vr && !has_incoming_jump[i + 1])
       {
         dest->pr0_reg = REG_IRET; /* R0 */
         dest->pr0_spilled = 0;
@@ -7952,6 +7806,10 @@ void tcc_ir_backpatch(TCCIRState *ir, int t, int target_address)
     next = cur->c.i;
     cur->c.i = target_address;
 
+    /* Sync to iroperand_pool as well to keep both pools in sync */
+    int pool_off = ir->compact_instructions[t].operand_base;
+    ir->iroperand_pool[pool_off] = svalue_to_iroperand(ir, cur);
+
     /* Chain ends when next is -1 (sentinel), out of range, or already patched */
     if (next < 0 || next >= ir->next_instruction_index || next == target_address)
       break;
@@ -8092,7 +7950,7 @@ void tcc_ir_backpatch_first(TCCIRState *ir, int t, int target_address)
       break;
     t = next;
   } while (1);
-  tcc_ir_get_dest(ir, lp)->c.i = target_address;
+  tcc_ir_set_dest_jump_target(ir, lp, target_address);
 }
 
 /* Append target t to end of jump chain n, return head of chain */
@@ -8167,7 +8025,7 @@ void tcc_ir_generate_cmp_jmp_set(TCCIRState *ir)
           src.c.i = 0;
           tcc_ir_put(ir, TCCIR_OP_ASSIGN, &src, NULL, &dest);
           /* Patch skip_jump to end */
-          tcc_ir_get_dest(ir, skip_jump)->c.i = ir->next_instruction_index;
+          tcc_ir_set_dest_jump_target(ir, skip_jump, ir->next_instruction_index);
         }
       }
       else if (jfalse >= 0)
@@ -8179,7 +8037,7 @@ void tcc_ir_generate_cmp_jmp_set(TCCIRState *ir)
       }
 
       /* Patch end_jump to here */
-      tcc_ir_get_dest(ir, end_jump)->c.i = ir->next_instruction_index;
+      tcc_ir_set_dest_jump_target(ir, end_jump, ir->next_instruction_index);
       tcc_ir_start_basic_block(ir);
     }
     else

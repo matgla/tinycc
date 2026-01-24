@@ -2402,7 +2402,11 @@ ST_FUNC void tcc_machine_load_constant(int dest_reg, int dest_reg_high, int64_t 
   if (is_64bit)
   {
     if (dest_reg_high == PREG_NONE)
+    {
+      fprintf(stderr, "ERROR: 64-bit load_constant called with PREG_NONE high register\n");
+      fprintf(stderr, "  dest_reg=%d, value=0x%llx, is_64bit=%d\n", dest_reg, (unsigned long long)value, is_64bit);
       tcc_error("compiler_error: 64-bit load_constant requires high register");
+    }
 
     const uint32_t lo = (uint32_t)(value & 0xFFFFFFFF);
     const uint32_t hi = (uint32_t)((uint64_t)value >> 32);
@@ -2724,6 +2728,7 @@ void load_to_dest(SValue *dest, SValue *sv)
 {
   int v, ft, fr, sign;
   int64_t fc;
+
   fr = sv->r;
   ft = sv->type.t;
   fc = sv->c.i;
@@ -6635,6 +6640,12 @@ static void thumb_emit_arg_move(const ThumbArgMove *m)
     SValue sv_copy = m->lval_sv;
     /* Use dst_reg_hi for 64-bit types (double, long long) */
     int hi_reg = (tcc_is_64bit_type(sv_copy.type.t) && m->dst_reg_hi != 0) ? m->dst_reg_hi : PREG_NONE;
+    if (tcc_is_64bit_type(sv_copy.type.t) && m->dst_reg_hi == 0) {
+      fprintf(stderr, "WARNING: THUMB_ARG_MOVE_LVAL for 64-bit but dst_reg_hi=0!\n");
+      fprintf(stderr, "  sv: vr=%d type.t=0x%x r=0x%x pr0=%d pr1=%d\n",
+              sv_copy.vr, sv_copy.type.t, sv_copy.r, sv_copy.pr0_reg, sv_copy.pr1_reg);
+      fprintf(stderr, "  dst_reg=%d, dst_reg_hi=%d\n", m->dst_reg, m->dst_reg_hi);
+    }
     load_to_reg(m->dst_reg, hi_reg, &sv_copy);
     return;
   }
@@ -6917,6 +6928,15 @@ ST_FUNC void tcc_gen_machine_func_call_op(SValue *func_target, SValue *call_id_s
 
     if (is_64bit)
     {
+      /* Defensive check: 64-bit register arguments must have 2 registers */
+      if (loc->reg_count < 2)
+      {
+        fprintf(stderr, "ERROR: 64-bit arg with reg_count=%d (expected 2), base_reg=%d\n", loc->reg_count, base_reg);
+        fprintf(stderr, "  arg: vr=%d type.t=0x%x r=0x%x pr0=%d pr1=%d\n", arg->vr, arg->type.t, arg->r, arg->pr0_reg,
+                arg->pr1_reg);
+        tcc_error("compiler_error: 64-bit register argument has insufficient registers");
+      }
+
       /* Check for lvalue first - if VT_LVAL is set, we need to load from memory,
        * regardless of whether pr0/pr1 are set (they'd hold the address, not the value) */
       if (arg->r & VT_LVAL)
@@ -6954,6 +6974,10 @@ ST_FUNC void tcc_gen_machine_func_call_op(SValue *func_target, SValue *call_id_s
     }
 
     /* 32-bit scalar */
+    if (tcc_is_64bit_type(arg->type.t))
+    {
+      fprintf(stderr, "BUG: 64-bit arg in 32-bit scalar path! type.t=0x%x is_64bit=%d\n", arg->type.t, is_64bit);
+    }
     if (arg->r & VT_LVAL)
     {
       /* Load value from memory (lvalue dereference) - must check this FIRST
