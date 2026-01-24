@@ -4339,7 +4339,7 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
     }
   }
   else if ((sv->vr == -1 || sv->vr == 0 || TCCIR_DECODE_VREG_TYPE(sv->vr) == 0) &&
-           (sv->r == -1 || sv->r == (int)0xffff || (old_v >= VT_CONST)))
+           (sv->r == -1 || sv->r == PREG_REG_NONE || (old_v >= VT_CONST)))
   {
     /* No valid vreg and either invalid .r or a constant - preserve important flags.
      * This handles global symbol references (VT_CONST | VT_SYM) and plain constants. */

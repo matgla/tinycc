@@ -4074,9 +4074,8 @@ ST_FUNC int tcc_load_object_file(TCCState *s1, int fd, unsigned long file_offset
         )
         {
         invalid_reloc:
-          // tcc_error_noabort("Invalid relocation entry [%2d] '%s' @ %.8x", i,
-          // strsec + sh->sh_name, (int)rel->r_offset);
-          // goto the_end;
+          tcc_error_noabort("Invalid relocation entry [%2d] '%s' @ %.8x", i, strsec + sh->sh_name, (int)rel->r_offset);
+          goto the_end;
         }
         rel->r_info = ELFW(R_INFO)(sym_index, type);
         /* offset the relocation offset */

@@ -40,7 +40,7 @@ typedef struct SValue
   /* Value location and flags - union for bitfield or legacy access */
   union
   {
-    unsigned short r; /* legacy: full 16-bit register + flags */
+    short r; /* legacy: full 16-bit register + flags */
     struct
     {
       unsigned short location : 8;    /* VT_CONST, VT_LOCAL, VT_LLOCAL, VT_CMP, VT_JMP, VT_JMPI (bits 0-7) */

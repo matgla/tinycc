@@ -274,8 +274,8 @@ int th_patch_call(int t, int a);
 /* Structure to track scratch register allocation with potential save/restore */
 typedef struct ScratchRegAlloc
 {
-  int reg;       /* The allocated scratch register */
-  int saved : 1; /* Whether the register was saved to stack */
+  int reg : 31;       /* The allocated scratch register */
+  uint32_t saved : 1; /* Whether the register was saved to stack */
 } ScratchRegAlloc;
 
 /* Forward declarations needed by multi-scratch helpers. */
@@ -1054,13 +1054,11 @@ static void th_literal_pool_generate(void)
   const int this_pool = ++pool_seq;
 
   /* Count unique literals to calculate pool size */
-  int unique_count = 0;
   int pool_size = 0;
   for (int i = 0; i < thumb_gen_state.literal_pool_count; i++)
   {
     if (thumb_gen_state.literal_pool[i].shared_index == -1)
     {
-      unique_count++;
       int entry_size = (thumb_gen_state.literal_pool[i].data_size == 8) ? 8 : 4;
       pool_size += entry_size;
     }
@@ -1195,29 +1193,6 @@ static void th_literal_pool_generate(void)
     {
       b0_prev = *(uint16_t *)(cur_text_section->data + branch_pos);
       b1_prev = *(uint16_t *)(cur_text_section->data + branch_pos + 2);
-    }
-
-    /* Debug: detect if this patch write overlaps the pool skip-branch */
-    if (thumb_gen_state.generating_function && tcc_state && tcc_state->verbose)
-    {
-      const int branch_start = branch_pos;
-      const int branch_end = branch_pos + 4;
-      const int p0 = entry->patch_position;
-      const int p1 = entry->patch_position + 2;
-      int overlaps = 0;
-      if (entry->short_instruction)
-      {
-        overlaps |= (p0 >= branch_start && p0 < branch_end);
-      }
-      else if (entry->data_size == 8)
-      {
-        overlaps |= (p0 >= branch_start && p0 < branch_end);
-        overlaps |= (p1 >= branch_start && p1 < branch_end);
-      }
-      else
-      {
-        overlaps |= (p1 >= branch_start && p1 < branch_end);
-      }
     }
 
     // patch the instruction that references this literal
