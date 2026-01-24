@@ -7054,8 +7054,8 @@ void tcc_ir_generate_code(TCCIRState *ir)
     int param_count = ir->next_parameter;
     int total_vregs = local_count + temp_count + param_count;
     if (total_vregs > 1000) /* Only print for large functions */
-      fprintf(stderr, "[VREG STATS] locals=%d temps=%d params=%d total=%d (max_encoded=%d)\n",
-              local_count, temp_count, param_count, total_vregs,
+      fprintf(stderr, "[VREG STATS] locals=%d temps=%d params=%d total=%d (max_encoded=%d)\n", local_count, temp_count,
+              param_count, total_vregs,
               (local_count > temp_count ? local_count : temp_count) > param_count
                   ? (local_count > temp_count ? local_count : temp_count)
                   : param_count);

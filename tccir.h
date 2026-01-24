@@ -342,10 +342,10 @@ extern const IRRegistersConfig irop_config[];
 
 /* Bit positions for tag/flags in vr field */
 #define IROP_VR_TAG_SHIFT 20
-#define IROP_VR_TAG_MASK (0x7 << IROP_VR_TAG_SHIFT)   /* 3 bits */
+#define IROP_VR_TAG_MASK (0x7 << IROP_VR_TAG_SHIFT) /* 3 bits */
 #define IROP_VR_FLAGS_SHIFT 23
 #define IROP_VR_FLAGS_MASK (0x3 << IROP_VR_FLAGS_SHIFT) /* 2 bits */
-#define IROP_VR_POSITION_MASK 0xFFFFF /* 20 bits for position */
+#define IROP_VR_POSITION_MASK 0xFFFFF                   /* 20 bits for position */
 
 /* Tags for IROperand (stored in bits 20-22 of vr) */
 #define IROP_TAG_NONE 0     /* sentinel for unused operand */
