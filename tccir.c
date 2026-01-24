@@ -731,6 +731,322 @@ int tcc_ir_svalue_pool_add(TCCIRState *ir, const SValue *sv)
   return ir->svalue_pool_count++;
 }
 
+/* ============================================================================
+ * IROperand pool management - separate pools for cache efficiency
+ * ============================================================================
+ */
+#define IRPOOL_INIT_SIZE 64
+
+void tcc_ir_pools_init(TCCIRState *ir)
+{
+  /* I64 pool */
+  ir->pool_i64_capacity = IRPOOL_INIT_SIZE;
+  ir->pool_i64_count = 0;
+  ir->pool_i64 = (int64_t *)tcc_mallocz(sizeof(int64_t) * ir->pool_i64_capacity);
+
+  /* F64 pool */
+  ir->pool_f64_capacity = IRPOOL_INIT_SIZE;
+  ir->pool_f64_count = 0;
+  ir->pool_f64 = (uint64_t *)tcc_mallocz(sizeof(uint64_t) * ir->pool_f64_capacity);
+
+  /* Symref pool */
+  ir->pool_symref_capacity = IRPOOL_INIT_SIZE;
+  ir->pool_symref_count = 0;
+  ir->pool_symref = (IRPoolSymref *)tcc_mallocz(sizeof(IRPoolSymref) * ir->pool_symref_capacity);
+
+  if (!ir->pool_i64 || !ir->pool_f64 || !ir->pool_symref)
+  {
+    fprintf(stderr, "tcc_ir_pools_init: out of memory\n");
+    exit(1);
+  }
+}
+
+void tcc_ir_pools_free(TCCIRState *ir)
+{
+  if (ir->pool_i64)
+  {
+    tcc_free(ir->pool_i64);
+    ir->pool_i64 = NULL;
+  }
+  ir->pool_i64_count = 0;
+  ir->pool_i64_capacity = 0;
+
+  if (ir->pool_f64)
+  {
+    tcc_free(ir->pool_f64);
+    ir->pool_f64 = NULL;
+  }
+  ir->pool_f64_count = 0;
+  ir->pool_f64_capacity = 0;
+
+  if (ir->pool_symref)
+  {
+    tcc_free(ir->pool_symref);
+    ir->pool_symref = NULL;
+  }
+  ir->pool_symref_count = 0;
+  ir->pool_symref_capacity = 0;
+}
+
+uint32_t tcc_ir_pool_add_i64(TCCIRState *ir, int64_t val)
+{
+  if (ir->pool_i64_count >= ir->pool_i64_capacity)
+  {
+    ir->pool_i64_capacity *= 2;
+    ir->pool_i64 = (int64_t *)tcc_realloc(ir->pool_i64, sizeof(int64_t) * ir->pool_i64_capacity);
+    if (!ir->pool_i64)
+    {
+      fprintf(stderr, "tcc_ir_pool_add_i64: out of memory\n");
+      exit(1);
+    }
+  }
+  ir->pool_i64[ir->pool_i64_count] = val;
+  return (uint32_t)ir->pool_i64_count++;
+}
+
+uint32_t tcc_ir_pool_add_f64(TCCIRState *ir, uint64_t bits)
+{
+  if (ir->pool_f64_count >= ir->pool_f64_capacity)
+  {
+    ir->pool_f64_capacity *= 2;
+    ir->pool_f64 = (uint64_t *)tcc_realloc(ir->pool_f64, sizeof(uint64_t) * ir->pool_f64_capacity);
+    if (!ir->pool_f64)
+    {
+      fprintf(stderr, "tcc_ir_pool_add_f64: out of memory\n");
+      exit(1);
+    }
+  }
+  ir->pool_f64[ir->pool_f64_count] = bits;
+  return (uint32_t)ir->pool_f64_count++;
+}
+
+uint32_t tcc_ir_pool_add_symref(TCCIRState *ir, Sym *sym, int32_t addend, uint32_t flags)
+{
+  if (ir->pool_symref_count >= ir->pool_symref_capacity)
+  {
+    ir->pool_symref_capacity *= 2;
+    ir->pool_symref = (IRPoolSymref *)tcc_realloc(ir->pool_symref, sizeof(IRPoolSymref) * ir->pool_symref_capacity);
+    if (!ir->pool_symref)
+    {
+      fprintf(stderr, "tcc_ir_pool_add_symref: out of memory\n");
+      exit(1);
+    }
+  }
+  IRPoolSymref *entry = &ir->pool_symref[ir->pool_symref_count];
+  entry->sym = sym;
+  entry->addend = addend;
+  entry->flags = flags;
+  return (uint32_t)ir->pool_symref_count++;
+}
+
+/* ============================================================================
+ * IROperand <-> SValue conversion functions
+ * ============================================================================
+ * These form the synchronization layer between the old SValue-based system
+ * and the new IROperand-based system during the migration period.
+ */
+
+/* Convert SValue to IROperand, adding to appropriate pool if needed */
+IROperand svalue_to_iroperand(TCCIRState *ir, const SValue *sv)
+{
+  if (!sv)
+    return IROP_NONE;
+
+  int val_kind = sv->r & VT_VALMASK;
+  int is_lval = sv->r & VT_LVAL;
+  int has_sym = sv->r & VT_SYM;
+  int btype = sv->type.t & VT_BTYPE;
+
+  /* Case 1: Pure vreg (no const, no sym, no lval, valid vr) */
+  if (sv->vr >= 0 && val_kind != VT_CONST && val_kind != VT_LOCAL && !has_sym)
+  {
+    return irop_make_vreg(sv->vr);
+  }
+
+  /* Case 2: Symbol reference - always goes to symref pool */
+  if (has_sym)
+  {
+    uint32_t flags = 0;
+    if (is_lval)
+      flags |= IRPOOL_SYMREF_LVAL;
+    if (val_kind == VT_LOCAL)
+      flags |= IRPOOL_SYMREF_LOCAL;
+    uint32_t idx = tcc_ir_pool_add_symref(ir, sv->sym, (int32_t)sv->c.i, flags);
+    return irop_make_symref(idx);
+  }
+
+  /* Case 3: VT_LOCAL stack offset (no symbol) */
+  if (val_kind == VT_LOCAL && !is_lval)
+  {
+    /* Stack offset fits in 32 bits */
+    return irop_make_stackoff((int32_t)sv->c.i);
+  }
+
+  /* Case 4: Float constant - inline F32 */
+  if (btype == VT_FLOAT && val_kind == VT_CONST)
+  {
+    union
+    {
+      float f;
+      uint32_t bits;
+    } u;
+    u.f = sv->c.f;
+    return irop_make_f32(u.bits);
+  }
+
+  /* Case 5: Double constant - pool F64 */
+  if (btype == VT_DOUBLE && val_kind == VT_CONST)
+  {
+    union
+    {
+      double d;
+      uint64_t bits;
+    } u;
+    u.d = sv->c.d;
+    uint32_t idx = tcc_ir_pool_add_f64(ir, u.bits);
+    return irop_make_f64(idx);
+  }
+
+  /* Case 6: 64-bit integer constant - pool I64 */
+  if (btype == VT_LLONG && val_kind == VT_CONST)
+  {
+    uint32_t idx = tcc_ir_pool_add_i64(ir, (int64_t)sv->c.i);
+    return irop_make_i64(idx);
+  }
+
+  /* Case 7: 32-bit integer constant - inline IMM32 */
+  if (val_kind == VT_CONST)
+  {
+    /* Check if value fits in signed 32-bit */
+    int64_t val = (int64_t)sv->c.i;
+    if (val >= INT32_MIN && val <= INT32_MAX)
+    {
+      return irop_make_imm32((int32_t)val);
+    }
+    /* Doesn't fit - use I64 pool */
+    uint32_t idx = tcc_ir_pool_add_i64(ir, val);
+    return irop_make_i64(idx);
+  }
+
+  /* Case 8: VT_LOCAL with lval - needs symref to preserve semantics */
+  if (val_kind == VT_LOCAL && is_lval)
+  {
+    uint32_t flags = IRPOOL_SYMREF_LVAL | IRPOOL_SYMREF_LOCAL;
+    uint32_t idx = tcc_ir_pool_add_symref(ir, NULL, (int32_t)sv->c.i, flags);
+    return irop_make_symref(idx);
+  }
+
+  /* Fallback: use symref pool for complex cases */
+  uint32_t flags = 0;
+  if (is_lval)
+    flags |= IRPOOL_SYMREF_LVAL;
+  if (val_kind == VT_LOCAL)
+    flags |= IRPOOL_SYMREF_LOCAL;
+  uint32_t idx = tcc_ir_pool_add_symref(ir, sv->sym, (int32_t)sv->c.i, flags);
+  return irop_make_symref(idx);
+}
+
+/* Expand IROperand back to SValue (for backward compatibility) */
+void iroperand_to_svalue(const TCCIRState *ir, IROperand op, SValue *out)
+{
+  svalue_init(out);
+
+  int tag = irop_get_tag(op);
+
+  switch (tag)
+  {
+  case IROP_TAG_NONE:
+    /* Already initialized by svalue_init */
+    out->vr = -1;
+    break;
+
+  case IROP_TAG_VREG:
+    out->vr = irop_get_vreg(op);
+    out->r = VT_CONST; /* vreg-only, no memory location */
+    break;
+
+  case IROP_TAG_IMM32:
+    out->r = VT_CONST;
+    out->c.i = (int64_t)irop_get_imm32(op);
+    out->vr = -1;
+    break;
+
+  case IROP_TAG_STACKOFF:
+    out->r = VT_LOCAL;
+    out->c.i = (int64_t)irop_get_stackoff(op);
+    out->vr = -1;
+    break;
+
+  case IROP_TAG_F32:
+  {
+    union
+    {
+      uint32_t bits;
+      float f;
+    } u;
+    u.bits = irop_get_f32(op);
+    out->r = VT_CONST;
+    out->c.f = u.f;
+    out->type.t = VT_FLOAT;
+    out->vr = -1;
+    break;
+  }
+
+  case IROP_TAG_I64:
+  {
+    uint32_t idx = irop_get_pool_idx(op);
+    out->r = VT_CONST;
+    out->c.i = (uint64_t)ir->pool_i64[idx];
+    out->type.t = VT_LLONG;
+    out->vr = -1;
+    break;
+  }
+
+  case IROP_TAG_F64:
+  {
+    uint32_t idx = irop_get_pool_idx(op);
+    union
+    {
+      uint64_t bits;
+      double d;
+    } u;
+    u.bits = ir->pool_f64[idx];
+    out->r = VT_CONST;
+    out->c.d = u.d;
+    out->type.t = VT_DOUBLE;
+    out->vr = -1;
+    break;
+  }
+
+  case IROP_TAG_SYMREF:
+  {
+    uint32_t idx = irop_get_pool_idx(op);
+    IRPoolSymref *ref = &ir->pool_symref[idx];
+    out->sym = ref->sym;
+    out->c.i = (int64_t)ref->addend;
+
+    if (ref->flags & IRPOOL_SYMREF_LOCAL)
+      out->r = VT_LOCAL;
+    else
+      out->r = VT_CONST;
+
+    if (ref->flags & IRPOOL_SYMREF_LVAL)
+      out->r |= VT_LVAL;
+
+    if (ref->sym)
+      out->r |= VT_SYM;
+
+    out->vr = -1;
+    break;
+  }
+
+  default:
+    /* Unknown tag - initialize to safe default */
+    out->vr = -1;
+    break;
+  }
+}
+
 TCCIRState *tcc_ir_allocate_block()
 {
   TCCIRState *block = (TCCIRState *)tcc_mallocz(sizeof(TCCIRState));
@@ -761,6 +1077,9 @@ TCCIRState *tcc_ir_allocate_block()
 
   /* Initialize SValue pool for compact IR storage */
   tcc_ir_svalue_pool_init(block);
+
+  /* Initialize IROperand pools (i64, f64, symref) */
+  tcc_ir_pools_init(block);
 
   /* Initialize compact instructions array */
   block->compact_instructions_size = QUADRUPLE_INIT_SIZE;
@@ -987,6 +1306,9 @@ void tcc_ir_release_block(TCCIRState *ir)
 
   /* Free SValue pool */
   tcc_ir_svalue_pool_free(ir);
+
+  /* Free IROperand pools */
+  tcc_ir_pools_free(ir);
 
   /* Free compact instructions array */
   if (ir->compact_instructions)

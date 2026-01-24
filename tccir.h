@@ -304,6 +304,127 @@ typedef struct IRRegistersConfig
 
 extern const IRRegistersConfig irop_config[];
 
+/* ============================================================================
+ * IROperand: Compact u64-tagged operand representation
+ * ============================================================================
+ * 3-bit tag in low bits, remaining 61 bits are payload.
+ * This avoids pointer tagging issues on 32-bit ARM M-profile.
+ *
+ * Inline types (no pool needed):
+ *   IMM32, VREG, STACKOFF, F32 - payload fits in 32 bits
+ *
+ * Pooled types (separate pools for cache efficiency):
+ *   I64    - index into pool_i64[]
+ *   F64    - index into pool_f64[]
+ *   SYMREF - index into pool_symref[]
+ */
+typedef uint64_t IROperand;
+
+/* 3-bit tags (8 types max) */
+#define IROP_TAG_IMM32 0    /* payload: signed 32-bit immediate */
+#define IROP_TAG_VREG 1     /* payload: vreg id */
+#define IROP_TAG_STACKOFF 2 /* payload: signed 32-bit FP-relative offset */
+#define IROP_TAG_F32 3      /* payload: 32-bit float bits (inline) */
+#define IROP_TAG_I64 4      /* payload: index into pool_i64[] */
+#define IROP_TAG_F64 5      /* payload: index into pool_f64[] */
+#define IROP_TAG_SYMREF 6   /* payload: index into pool_symref[] */
+#define IROP_TAG_NONE 7     /* sentinel for unused operand */
+
+#define IROP_TAG_MASK 7
+#define IROP_PAYLOAD_SHIFT 3
+
+/* Sentinel for "no operand" */
+#define IROP_NONE ((IROperand)IROP_TAG_NONE)
+
+/* Encoding helpers - inline types */
+static inline IROperand irop_make_imm32(int32_t val)
+{
+  return ((uint64_t)(uint32_t)val << IROP_PAYLOAD_SHIFT) | IROP_TAG_IMM32;
+}
+
+static inline IROperand irop_make_vreg(int vreg)
+{
+  return ((uint64_t)(uint32_t)vreg << IROP_PAYLOAD_SHIFT) | IROP_TAG_VREG;
+}
+
+static inline IROperand irop_make_stackoff(int32_t offset)
+{
+  return ((uint64_t)(uint32_t)offset << IROP_PAYLOAD_SHIFT) | IROP_TAG_STACKOFF;
+}
+
+static inline IROperand irop_make_f32(uint32_t bits)
+{
+  return ((uint64_t)bits << IROP_PAYLOAD_SHIFT) | IROP_TAG_F32;
+}
+
+/* Encoding helpers - pooled types */
+static inline IROperand irop_make_i64(uint32_t pool_idx)
+{
+  return ((uint64_t)pool_idx << IROP_PAYLOAD_SHIFT) | IROP_TAG_I64;
+}
+
+static inline IROperand irop_make_f64(uint32_t pool_idx)
+{
+  return ((uint64_t)pool_idx << IROP_PAYLOAD_SHIFT) | IROP_TAG_F64;
+}
+
+static inline IROperand irop_make_symref(uint32_t pool_idx)
+{
+  return ((uint64_t)pool_idx << IROP_PAYLOAD_SHIFT) | IROP_TAG_SYMREF;
+}
+
+/* Decoding helpers */
+static inline int irop_get_tag(IROperand op)
+{
+  return (int)(op & IROP_TAG_MASK);
+}
+
+static inline int32_t irop_get_imm32(IROperand op)
+{
+  return (int32_t)(op >> IROP_PAYLOAD_SHIFT);
+}
+
+static inline int irop_get_vreg(IROperand op)
+{
+  return (int)(op >> IROP_PAYLOAD_SHIFT);
+}
+
+static inline int32_t irop_get_stackoff(IROperand op)
+{
+  return (int32_t)(op >> IROP_PAYLOAD_SHIFT);
+}
+
+static inline uint32_t irop_get_f32(IROperand op)
+{
+  return (uint32_t)(op >> IROP_PAYLOAD_SHIFT);
+}
+
+static inline uint32_t irop_get_pool_idx(IROperand op)
+{
+  return (uint32_t)(op >> IROP_PAYLOAD_SHIFT);
+}
+
+static inline int irop_is_none(IROperand op)
+{
+  return (op & IROP_TAG_MASK) == IROP_TAG_NONE;
+}
+
+/* ============================================================================
+ * Pool entry types - separate arrays for cache efficiency
+ * ============================================================================
+ */
+
+/* Symref pool entry: symbol reference with addend and flags */
+#define IRPOOL_SYMREF_LVAL (1u << 0)  /* value is an lvalue (needs dereference) */
+#define IRPOOL_SYMREF_LOCAL (1u << 1) /* VT_LOCAL semantics */
+
+typedef struct IRPoolSymref
+{
+  struct Sym *sym;
+  int32_t addend;
+  uint32_t flags;
+} IRPoolSymref;
+
 typedef struct TCCIRState
 {
   // number of function parameters
@@ -323,6 +444,19 @@ typedef struct TCCIRState
   SValue *svalue_pool;
   int svalue_pool_count;
   int svalue_pool_capacity;
+
+  /* IROperand separate pools for cache efficiency */
+  int64_t *pool_i64; /* 64-bit integer constants */
+  int pool_i64_count;
+  int pool_i64_capacity;
+
+  uint64_t *pool_f64; /* 64-bit double bits */
+  int pool_f64_count;
+  int pool_f64_capacity;
+
+  IRPoolSymref *pool_symref; /* symbol references */
+  int pool_symref_count;
+  int pool_symref_capacity;
 
   /* Compact instruction array - parallel to instructions[] for now */
   IRQuadCompact *compact_instructions;
@@ -558,6 +692,17 @@ static inline SValue *tcc_ir_get_src2(const TCCIRState *ir, int index)
 void tcc_ir_svalue_pool_init(TCCIRState *ir);
 void tcc_ir_svalue_pool_free(TCCIRState *ir);
 int tcc_ir_svalue_pool_add(TCCIRState *ir, const SValue *sv);
+
+/* IROperand pool management - separate pools for cache efficiency */
+void tcc_ir_pools_init(TCCIRState *ir);
+void tcc_ir_pools_free(TCCIRState *ir);
+uint32_t tcc_ir_pool_add_i64(TCCIRState *ir, int64_t val);
+uint32_t tcc_ir_pool_add_f64(TCCIRState *ir, uint64_t bits);
+uint32_t tcc_ir_pool_add_symref(TCCIRState *ir, struct Sym *sym, int32_t addend, uint32_t flags);
+
+/* IROperand <-> SValue conversion functions */
+IROperand svalue_to_iroperand(TCCIRState *ir, const SValue *sv);
+void iroperand_to_svalue(const TCCIRState *ir, IROperand op, SValue *out);
 
 /* Expand a compact instruction to a full TACQuadruple (for migration) */
 void tcc_ir_expand_quad(TCCIRState *ir, int index, TACQuadruple *out);
