@@ -62,14 +62,15 @@ typedef enum TCCIR_VREG_TYPE
 
 /* Compressed basic type (stored in bits 25-27 of vr)
  * This allows reconstruction of type.t during iroperand_to_svalue().
- * Smaller integer types (byte/short) are promoted to INT32 for codegen. */
-#define IROP_BTYPE_INT32 0   /* VT_VOID, VT_BYTE, VT_SHORT, VT_INT, VT_PTR, VT_BOOL */
+ * Preserves byte/short distinction for correct load instruction generation. */
+#define IROP_BTYPE_INT32 0   /* VT_VOID, VT_INT, VT_PTR, VT_BOOL */
 #define IROP_BTYPE_INT64 1   /* VT_LLONG */
 #define IROP_BTYPE_FLOAT32 2 /* VT_FLOAT */
 #define IROP_BTYPE_FLOAT64 3 /* VT_DOUBLE, VT_LDOUBLE */
 #define IROP_BTYPE_STRUCT 4  /* VT_STRUCT */
 #define IROP_BTYPE_FUNC 5    /* VT_FUNC */
-/* 6-7 reserved */
+#define IROP_BTYPE_INT8 6    /* VT_BYTE */
+#define IROP_BTYPE_INT16 7   /* VT_SHORT */
 
 typedef struct __attribute__((packed)) IROperand
 {
@@ -103,7 +104,7 @@ typedef struct __attribute__((packed)) IROperand
   uint8_t pr1_reg : 5;     /* Physical register 1 for 64-bit values */
   uint8_t pr1_spilled : 1; /* pr1 spilled to stack */
   uint8_t is_sym : 1;      /* VT_SYM: has associated symbol */
-  uint8_t reserved : 1;    /* Reserved for future use */
+  uint8_t is_param : 1;    /* VT_PARAM: stack-passed parameter (needs offset_to_args) */
 } IROperand;
 
 _Static_assert(sizeof(IROperand) == 10, "IROperand must be 10 bytes");
@@ -283,7 +284,8 @@ static inline int32_t irop_get_vreg(const IROperand *op)
                .is_static = 0,                                                                                         \
                .pr1_reg = 0x1F,                                                                                        \
                .pr1_spilled = 0,                                                                                       \
-               .reserved = 0})
+               .is_sym = 0,                                                                                            \
+               .is_param = 0})
 
 /* Helper to initialize physical reg fields to defaults */
 static inline void irop_init_phys_regs(IROperand *op)
@@ -295,7 +297,7 @@ static inline void irop_init_phys_regs(IROperand *op)
   op->pr1_reg = 0x1F; /* PREG_REG_NONE */
   op->pr1_spilled = 0;
   op->is_sym = 0;
-  op->reserved = 0;
+  op->is_param = 0;
 }
 
 /* Helper to set vreg fields from a vreg value.
@@ -365,7 +367,8 @@ static inline IROperand irop_make_imm32(int32_t vreg, int32_t val, int btype)
   return op;
 }
 
-static inline IROperand irop_make_stackoff(int32_t vreg, int32_t offset, int is_lval, int is_llocal, int btype)
+static inline IROperand irop_make_stackoff(int32_t vreg, int32_t offset, int is_lval, int is_llocal, int is_param_flag,
+                                           int btype)
 {
   IROperand op;
   op.vr = 0;
@@ -378,6 +381,7 @@ static inline IROperand irop_make_stackoff(int32_t vreg, int32_t offset, int is_
   op.btype = btype;
   op.u.imm32 = offset;
   irop_init_phys_regs(&op);
+  op.is_param = is_param_flag; /* Set AFTER irop_init_phys_regs to avoid being overwritten */
   return op;
 }
 

@@ -188,6 +188,10 @@ static int vt_btype_to_irop_btype(int vt_btype)
 {
   switch (vt_btype)
   {
+  case VT_BYTE:
+    return IROP_BTYPE_INT8;
+  case VT_SHORT:
+    return IROP_BTYPE_INT16;
   case VT_LLONG:
     return IROP_BTYPE_INT64;
   case VT_FLOAT:
@@ -200,7 +204,7 @@ static int vt_btype_to_irop_btype(int vt_btype)
   case VT_FUNC:
     return IROP_BTYPE_FUNC;
   default:
-    /* VT_VOID, VT_BYTE, VT_SHORT, VT_INT, VT_PTR, VT_BOOL -> INT32 */
+    /* VT_VOID, VT_INT, VT_PTR, VT_BOOL -> INT32 */
     return IROP_BTYPE_INT32;
   }
 }
@@ -210,6 +214,10 @@ static int irop_btype_to_vt_btype(int irop_btype)
 {
   switch (irop_btype)
   {
+  case IROP_BTYPE_INT8:
+    return VT_BYTE;
+  case IROP_BTYPE_INT16:
+    return VT_SHORT;
   case IROP_BTYPE_INT64:
     return VT_LLONG;
   case IROP_BTYPE_FLOAT32:
@@ -226,7 +234,7 @@ static int irop_btype_to_vt_btype(int irop_btype)
 }
 
 /* Helper to copy physical register info and type flags from SValue to IROperand.
- * NOTE: This does NOT set is_const or is_sym - those are semantic flags that
+ * NOTE: This does NOT set is_const, is_sym, or is_param - those are semantic flags that
  * should be set by the irop_make_* functions based on the operand type.
  */
 static inline void irop_copy_svalue_info(IROperand *op, const SValue *sv)
@@ -237,8 +245,7 @@ static inline void irop_copy_svalue_info(IROperand *op, const SValue *sv)
   op->pr1_spilled = sv->pr1_spilled;
   op->is_unsigned = (sv->type.t & VT_UNSIGNED) ? 1 : 0;
   op->is_static = (sv->type.t & VT_STATIC) ? 1 : 0;
-  /* Don't overwrite is_sym or is_const - those are set by irop_make_* */
-  op->reserved = 0;
+  /* Don't overwrite is_sym, is_const, or is_param - those are set by irop_make_* */
 }
 
 /* Convert SValue to IROperand, adding to appropriate pool if needed.
@@ -269,6 +276,7 @@ IROperand svalue_to_iroperand(TCCIRState *ir, const SValue *sv)
   {
     result = irop_make_vreg(vr, irop_bt);
     result.is_lval = is_lval;
+    result.is_param = (sv->r & VT_PARAM) ? 1 : 0; /* Preserve VT_PARAM for register params */
     irop_copy_svalue_info(&result, sv);
     /* Capture physical register from VT_VALMASK if it's a register number */
     if (val_kind < VT_CONST && val_kind < 32) /* Physical register in VT_VALMASK */
@@ -282,6 +290,7 @@ IROperand svalue_to_iroperand(TCCIRState *ir, const SValue *sv)
   {
     result = irop_make_vreg(vr, irop_bt);
     result.is_lval = is_lval;
+    result.is_param = (sv->r & VT_PARAM) ? 1 : 0; /* Preserve VT_PARAM for register params */
     irop_copy_svalue_info(&result, sv);
     result.pr0_reg = val_kind; /* Physical register in VT_VALMASK */
     goto done;
@@ -304,7 +313,28 @@ IROperand svalue_to_iroperand(TCCIRState *ir, const SValue *sv)
   /* Case 3: VT_LOCAL or VT_LLOCAL stack offset (no symbol) */
   if (val_kind == VT_LOCAL || val_kind == VT_LLOCAL)
   {
-    result = irop_make_stackoff(vr, (int32_t)sv->c.i, is_lval, is_llocal, irop_bt);
+    int is_param = (sv->r & VT_PARAM) ? 1 : 0;
+    int offset_val = (int32_t)sv->c.i;
+#if 1
+    if (is_param && offset_val > 0)
+    {
+      fprintf(stderr,
+              "DEBUG svalue_to_iroperand: StackOff stack_param vr=%d off=%d is_param=%d is_lval=%d is_llocal=%d "
+              "(sv->r=0x%x "
+              "VT_PARAM=0x%x)\n",
+              vr, offset_val, is_param, is_lval, is_llocal, sv->r, VT_PARAM);
+    }
+#endif
+    result = irop_make_stackoff(vr, offset_val, is_lval, is_llocal, is_param, irop_bt);
+#if 1
+    if (is_param && offset_val > 0)
+    {
+      fprintf(
+          stderr,
+          "DEBUG svalue_to_iroperand: After irop_make_stackoff: result.u.imm32=%d result.is_param=%d result.tag=%d\n",
+          result.u.imm32, result.is_param, result.tag);
+    }
+#endif
     irop_copy_svalue_info(&result, sv);
     goto done;
   }
@@ -441,8 +471,8 @@ void iroperand_to_svalue(const TCCIRState *ir, IROperand op, SValue *out)
       out->r = VT_LOCAL;
     if (op.is_lval)
       out->r |= VT_LVAL;
-    /* Derive VT_PARAM from vreg type - PARAM vregs represent parameter locations */
-    if (TCCIR_DECODE_VREG_TYPE(out->vr) == TCCIR_VREG_TYPE_PARAM)
+    /* Restore VT_PARAM from explicit is_param flag */
+    if (op.is_param)
       out->r |= VT_PARAM;
     out->c.i = (int64_t)op.u.imm32; /* stack offset stored in imm32 */
     break;

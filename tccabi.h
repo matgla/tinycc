@@ -33,15 +33,17 @@ typedef enum TCCAbiLocKind
 {
   TCC_ABI_LOC_REG = 1,
   TCC_ABI_LOC_STACK,
+  TCC_ABI_LOC_REG_STACK, /* Split: some words in regs, rest on stack */
 } TCCAbiLocKind;
 
 typedef struct TCCAbiArgLoc
 {
   TCCAbiLocKind kind;
-  uint8_t reg_base;  /* first arg register index (0 == R0 on ARM) */
-  uint8_t reg_count; /* number of consecutive arg registers */
-  int32_t stack_off; /* outgoing stack offset in bytes (from outgoing area base) */
-  uint16_t size;     /* bytes copied/passed */
+  uint8_t reg_base;    /* first arg register index (0 == R0 on ARM) */
+  uint8_t reg_count;   /* number of consecutive arg registers */
+  int32_t stack_off;   /* outgoing stack offset in bytes (from outgoing area base) */
+  uint16_t size;       /* bytes copied/passed */
+  uint16_t stack_size; /* bytes on stack (for REG_STACK split) */
 } TCCAbiArgLoc;
 
 typedef struct TCCAbiCallLayout

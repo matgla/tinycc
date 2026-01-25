@@ -779,29 +779,27 @@ ST_FUNC Sym *sym_push(int v, CType *type, int r, int c)
   TokenSym *ts;
   int vreg = -1;
   /* register local variable at IR code generator, get Vreg number */
-  /* XXX: no vreg assignment for params so far */
   int valmask = r & VT_VALMASK;
 
-  // {
   if (r & VT_PARAM)
   {
-    if (valmask != VT_LOCAL && valmask != VT_LLOCAL)
+    /* Create PARAM vreg for ALL parameters, including stack-passed ones */
+    vreg = tcc_ir_get_vreg_param(tcc_state->ir);
+    /* For stack-passed params (VT_LOCAL), c is the stack offset;
+     * for register params, c is the parameter index */
+    tcc_ir_assign_physical_register(tcc_state->ir, vreg, c, -1, -1);
+    /* Store original parameter offset for prolog code generation */
+    tcc_ir_set_original_offset(tcc_state->ir, vreg, c);
+    /* Mark float/double parameters */
+    if (is_float(type->t))
     {
-      vreg = tcc_ir_get_vreg_param(tcc_state->ir);
-      tcc_ir_assign_physical_register(tcc_state->ir, vreg, c, -1, -1);
-      /* Store original parameter offset for prolog code generation */
-      tcc_ir_set_original_offset(tcc_state->ir, vreg, c);
-      /* Mark float/double parameters */
-      if (is_float(type->t))
-      {
-        int is_double = (type->t & VT_BTYPE) == VT_DOUBLE || (type->t & VT_BTYPE) == VT_LDOUBLE;
-        tcc_ir_set_float_type(tcc_state->ir, vreg, 1, is_double);
-      }
-      /* Mark long long parameters */
-      if ((type->t & VT_BTYPE) == VT_LLONG)
-      {
-        tcc_ir_set_llong_type(tcc_state->ir, vreg);
-      }
+      int is_double = (type->t & VT_BTYPE) == VT_DOUBLE || (type->t & VT_BTYPE) == VT_LDOUBLE;
+      tcc_ir_set_float_type(tcc_state->ir, vreg, 1, is_double);
+    }
+    /* Mark long long parameters */
+    if ((type->t & VT_BTYPE) == VT_LLONG)
+    {
+      tcc_ir_set_llong_type(tcc_state->ir, vreg);
     }
   }
   else
@@ -2052,6 +2050,8 @@ ST_FUNC int gv(int rc)
         svalue_init(&dest);
         dest.type = vtop->type;
         dest.vr = vreg;
+        if ((vtop->r & VT_PARAM) && (vtop->r & VT_LVAL))
+          fprintf(stderr, "DEBUG gv LOAD (rc2): vtop r=0x%x c.i=%lld vr=%d\n", vtop->r, (long long)vtop->c.i, vtop->vr);
         tcc_ir_put(tcc_state->ir, TCCIR_OP_LOAD, vtop, NULL, &dest);
 
         vtop->vr = vreg;
@@ -2084,6 +2084,8 @@ ST_FUNC int gv(int rc)
       svalue_init(&dest);
       dest.type.t = vtop->type.t;
       dest.vr = vreg;
+      if ((vtop->r & VT_PARAM) && (vtop->r & VT_LVAL))
+        fprintf(stderr, "DEBUG gv LOAD: vtop r=0x%x c.i=%lld vr=%d\n", vtop->r, (long long)vtop->c.i, vtop->vr);
       tcc_ir_put(tcc_state->ir, TCCIR_OP_LOAD, vtop, NULL, &dest);
 
       vtop->vr = vreg;
@@ -10472,6 +10474,7 @@ static void gen_function(Sym *sym)
   func_ind = ind;
   func_vt = sym->type.ref->type;
   func_var = sym->type.ref->f.func_type == FUNC_ELLIPSIS;
+  fprintf(stderr, "DEBUG gen_function: %s\n", funcname);
 
   /* NOTE: we patch the symbol size later */
   put_extern_sym(sym, cur_text_section, ind + 1, 0);

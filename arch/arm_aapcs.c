@@ -18,8 +18,9 @@
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
-#include <string.h>
 #include "tccabi.h"
+#include <stdio.h>
+#include <string.h>
 
 TCCAbiArgLoc tcc_abi_classify_argument(TCCAbiCallLayout *layout, int arg_index, const TCCAbiArgDesc *arg_desc)
 {
@@ -87,7 +88,7 @@ TCCAbiArgLoc tcc_abi_classify_argument(TCCAbiCallLayout *layout, int arg_index, 
   {
     const int slot_sz = tcc_abi_align_up_int(size, 4);
     const int regs_needed = (slot_sz + 3) / 4;
-    
+
     /* AAPCS: Composite types > 4 words (16 bytes) are passed by invisible reference.
      * The caller passes a pointer in a register, callee dereferences. */
     if (size > 16)
@@ -118,6 +119,24 @@ TCCAbiArgLoc tcc_abi_classify_argument(TCCAbiCallLayout *layout, int arg_index, 
       loc.reg_base = layout->next_reg;
       loc.reg_count = (uint8_t)regs_needed;
       layout->next_reg = (uint8_t)(layout->next_reg + regs_needed);
+      fprintf(stderr, "DEBUG ABI: struct arg %d -> REG: base=%d count=%d\n", arg_index, loc.reg_base, loc.reg_count);
+    }
+    else if (layout->next_reg <= 3)
+    {
+      /* AAPCS: Struct straddles registers and stack.
+       * Put first word(s) in remaining registers, rest on stack. */
+      int regs_avail = 4 - layout->next_reg;
+      int words_on_stack = regs_needed - regs_avail;
+      loc.kind = TCC_ABI_LOC_REG_STACK;
+      loc.reg_base = layout->next_reg;
+      loc.reg_count = (uint8_t)regs_avail;
+      layout->next_stack_off = tcc_abi_align_up_int(layout->next_stack_off, align);
+      loc.stack_off = layout->next_stack_off;
+      loc.stack_size = (uint16_t)(words_on_stack * 4);
+      layout->next_stack_off += words_on_stack * 4;
+      layout->next_reg = 4;
+      fprintf(stderr, "DEBUG ABI: struct arg %d -> REG_STACK: base=%d reg_count=%d stack_off=%d stack_size=%d\n",
+              arg_index, loc.reg_base, loc.reg_count, loc.stack_off, loc.stack_size);
     }
     else
     {
@@ -136,6 +155,7 @@ TCCAbiArgLoc tcc_abi_classify_argument(TCCAbiCallLayout *layout, int arg_index, 
       loc.reg_base = layout->next_reg;
       loc.reg_count = 1;
       layout->next_reg++;
+      fprintf(stderr, "DEBUG ABI: scalar arg %d -> REG: base=%d\n", arg_index, loc.reg_base);
     }
     else
     {
@@ -144,6 +164,7 @@ TCCAbiArgLoc tcc_abi_classify_argument(TCCAbiCallLayout *layout, int arg_index, 
       loc.stack_off = layout->next_stack_off;
       layout->next_stack_off += 4;
       layout->next_reg = 4;
+      fprintf(stderr, "DEBUG ABI: scalar arg %d -> STACK: off=%d\n", arg_index, loc.stack_off);
     }
   }
 

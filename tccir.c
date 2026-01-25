@@ -729,6 +729,10 @@ int tcc_ir_svalue_pool_add(TCCIRState *ir, const SValue *sv)
   }
   ir->svalue_pool[ir->svalue_pool_count] = *sv;
 
+  if ((sv->r & VT_PARAM) && (sv->r & VT_LVAL) && (sv->r & VT_LOCAL))
+    fprintf(stderr, "DEBUG svalue_pool_add: index=%d vr=%d r=0x%x c.i=%lld (ir->next_instruction_index=%d)\n",
+            ir->svalue_pool_count, sv->vr, sv->r, (long long)sv->c.i, ir->next_instruction_index);
+
   /* Also add IROperand representation in parallel */
   if (ir->iroperand_pool_count >= ir->iroperand_pool_capacity)
   {
@@ -1392,6 +1396,16 @@ void tcc_ir_add_function_parameters(TCCIRState *ir, CType *func_type)
         if (bytes > ir->named_arg_reg_bytes)
           ir->named_arg_reg_bytes = bytes;
       }
+      else if (loc_info.kind == TCC_ABI_LOC_REG_STACK)
+      {
+        /* Split arg: count reg portion toward reg bytes, stack portion toward stack bytes */
+        int reg_bytes = (loc_info.reg_base + loc_info.reg_count) * 4;
+        if (reg_bytes > ir->named_arg_reg_bytes)
+          ir->named_arg_reg_bytes = reg_bytes;
+        int stack_end = loc_info.stack_off + loc_info.stack_size;
+        if (stack_end > ir->named_arg_stack_bytes)
+          ir->named_arg_stack_bytes = stack_end;
+      }
       else
       {
         int end = loc_info.stack_off + loc_info.size;
@@ -1403,7 +1417,7 @@ void tcc_ir_add_function_parameters(TCCIRState *ir, CType *func_type)
     /* Any stack-passed argument means we must keep a stable frame pointer
      * for addressing the caller argument area.
      */
-    if (loc_info.kind == TCC_ABI_LOC_STACK)
+    if (loc_info.kind == TCC_ABI_LOC_STACK || loc_info.kind == TCC_ABI_LOC_REG_STACK)
       tcc_state->need_frame_pointer = 1;
 
     if ((type->t & VT_BTYPE) == VT_STRUCT)
@@ -1473,6 +1487,83 @@ void tcc_ir_add_function_parameters(TCCIRState *ir, CType *func_type)
         }
 
         /* The struct is now at struct_slot as a direct value (not a pointer).
+         * Use VT_LOCAL|VT_LVAL so the struct param is accessed as a direct lvalue.
+         */
+        flags = VT_LVAL | VT_LOCAL;
+        addr = struct_slot;
+        sym_push(sym->v & ~SYM_FIELD, type, flags, addr);
+        continue;
+      }
+
+      if (loc_info.kind == TCC_ABI_LOC_REG_STACK)
+      {
+        /* Struct straddles registers and stack: allocate local home, spill
+         * register words from PARAM vregs, and copy stack words from caller area.
+         */
+        int slot_size = tcc_abi_align_up_int(actual_size, 4);
+        loc = (loc - slot_size) & -slot_align;
+        const int struct_slot = loc;
+
+        const int total_words = (slot_size + 3) / 4;
+        const int reg_words = loc_info.reg_count;
+        const int stack_words = total_words - reg_words;
+
+        /* Spill register words (from PARAM vregs) */
+        for (int w = 0; w < reg_words; ++w)
+        {
+          const int word_param_vr = tcc_ir_get_vreg_param(ir);
+          SValue src;
+          SValue dst;
+          memset(&src, 0, sizeof(src));
+          memset(&dst, 0, sizeof(dst));
+          src.type.t = VT_INT;
+          src.r = 0;
+          src.vr = word_param_vr;
+          dst.type.t = VT_INT;
+          dst.r = VT_LOCAL | VT_LVAL;
+          dst.vr = -1;
+          dst.c.i = struct_slot + w * 4;
+          tcc_ir_put(ir, TCCIR_OP_STORE, &src, NULL, &dst);
+        }
+
+        /* Copy stack words from caller argument area */
+        for (int w = 0; w < stack_words; ++w)
+        {
+          SValue src;
+          SValue dst;
+          SValue tmp;
+          memset(&src, 0, sizeof(src));
+          memset(&dst, 0, sizeof(dst));
+          memset(&tmp, 0, sizeof(tmp));
+
+          /* Allocate a temp vreg to hold the loaded value */
+          int temp_vr = tcc_ir_get_vreg_temp(ir);
+
+          /* Source: stack parameter at loc_info.stack_off + w*4 */
+          src.type.t = VT_INT;
+          src.r = VT_PARAM | VT_LVAL | VT_LOCAL;
+          src.vr = -1;
+          src.c.i = loc_info.stack_off + w * 4;
+
+          /* Temp destination: load into temp vreg */
+          tmp.type.t = VT_INT;
+          tmp.r = 0;
+          tmp.vr = temp_vr;
+
+          tcc_ir_put(ir, TCCIR_OP_LOAD, &src, NULL, &tmp);
+
+          /* Final destination: local slot at struct_slot + (reg_words + w)*4 */
+          dst.type.t = VT_INT;
+          dst.r = VT_LOCAL | VT_LVAL;
+          dst.vr = -1;
+          dst.c.i = struct_slot + (reg_words + w) * 4;
+
+          /* Store from temp to destination */
+          tmp.r = 0; /* Clear lval flag for store source */
+          tcc_ir_put(ir, TCCIR_OP_STORE, &tmp, NULL, &dst);
+        }
+
+        /* The struct is now at struct_slot as a direct value.
          * Use VT_LOCAL|VT_LVAL so the struct param is accessed as a direct lvalue.
          */
         flags = VT_LVAL | VT_LOCAL;
@@ -3767,9 +3858,14 @@ void tcc_ir_register_allocation_params(TCCIRState *ir)
         interval->incoming_reg0 = -1;
         interval->incoming_reg1 = -1;
         /* Record where the parameter arrives on the caller's stack frame.
-         * This is relative to SP after prolog (positive offset above saved regs).
-         * The prolog needs to load this into the allocated register. */
-        interval->original_offset = (argno - 4) * 4;
+         * Use original_offset if already set by tcc_ir_set_original_offset
+         * (from the ABI layout), otherwise compute from argno.
+         * The ABI-derived offset is more accurate for complex cases like
+         * split structs (REG_STACK) where argno doesn't account for
+         * stack words that don't have PARAM vregs.
+         */
+        if (interval->original_offset == 0)
+          interval->original_offset = (argno - 4) * 4;
         /* IMPORTANT: If linear scan already spilled this parameter, keep the
          * allocator-provided spill location (a negative FP-relative offset).
          * Overwriting allocation.offset with the caller-stack offset would make
@@ -3808,9 +3904,11 @@ void tcc_ir_register_allocation_params(TCCIRState *ir)
         interval->incoming_reg0 = -1;
         interval->incoming_reg1 = -1;
         /* Record where the parameter arrives on the caller's stack frame.
-         * This is relative to SP after prolog (positive offset above saved regs).
-         * The prolog needs to load this into the allocated register. */
-        interval->original_offset = (argno - 4) * 4;
+         * Use original_offset if already set by tcc_ir_set_original_offset
+         * (from the ABI layout), otherwise compute from argno.
+         */
+        if (interval->original_offset == 0)
+          interval->original_offset = (argno - 4) * 4;
         /* See 64-bit case above: do not overwrite allocator spill slots with
          * caller-stack offsets.
          */
@@ -3964,6 +4062,8 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
     if (TCCIR_DECODE_VREG_TYPE(sv->vr) == TCCIR_VREG_TYPE_PARAM && interval && interval->incoming_reg0 < 0 &&
         interval->allocation.r0 == PREG_NONE && interval->allocation.offset == 0)
     {
+      fprintf(stderr, "DEBUG fill_registers STACK PARAM: vr=%d original_offset=%d\n", sv->vr,
+              interval->original_offset);
       sv->pr0_reg = PREG_REG_NONE;
       sv->pr0_spilled = 0;
       sv->pr1_reg = PREG_REG_NONE;
@@ -3991,6 +4091,12 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
     sv->pr1_reg = interval->allocation.r1 & PREG_REG_NONE;
     sv->pr1_spilled = (interval->allocation.r1 & PREG_SPILLED) != 0;
     sv->c.i = interval->allocation.offset;
+
+    if ((TCCIR_DECODE_VREG_TYPE(sv->vr) == TCCIR_VREG_TYPE_PARAM) && (old_r & VT_PARAM))
+      fprintf(stderr,
+              "DEBUG fill_registers PARAM: vr=%d old_r=0x%x alloc.offset=%d alloc.r0=0x%x sv->c.i=%lld orig_off=%d\n",
+              sv->vr, old_r, interval->allocation.offset, interval->allocation.r0, (long long)sv->c.i,
+              interval->original_offset);
 
     if (debug_this)
     {
@@ -6989,8 +7095,10 @@ void tcc_ir_generate_code(TCCIRState *ir)
   int stack_size = (-loc + 7) & ~7; // align to 8 bytes
   tcc_gen_machine_prolog(ir->leaffunc, ir->ls.dirty_registers, stack_size);
 
+  fprintf(stderr, "DEBUG codegen loop: next_instruction_index=%d\n", ir->next_instruction_index);
   for (int i = 0; i < ir->next_instruction_index; i++)
   {
+    fprintf(stderr, "DEBUG codegen loop: i=%d op=%d\n", i, ir->compact_instructions[i].op);
     drop_return_value = 0;
     cq = &ir->compact_instructions[i];
 
@@ -7020,6 +7128,12 @@ void tcc_ir_generate_code(TCCIRState *ir)
       tcc_ir_fill_registers(ir, src2);
     if (dest)
       tcc_ir_fill_registers(ir, dest);
+
+    /* Resync IROperand pool after fill_registers, since fill_registers may have
+     * modified the SValue (e.g., adding VT_PARAM for stack-passed parameters). */
+    tcc_ir_resync_operand(ir, i, 0); /* dest */
+    tcc_ir_resync_operand(ir, i, 1); /* src1 */
+    tcc_ir_resync_operand(ir, i, 2); /* src2 */
 
     bool need_src1_value = false;
     bool need_src2_value = false;
@@ -7136,8 +7250,7 @@ void tcc_ir_generate_code(TCCIRState *ir)
     TCCMaterializedAddr mat_dest_addr = {0};
     TCCMaterializedDest mat_dest = {0};
 #if TCC_DUMP_THUMB_GEN
-    THGEN_DUMP("IR[%d] orig=%d line=%d ind=0x%x ", i, q->orig_index, q->line_num, ind);
-    tcc_dump_quadruple_to(stderr, q, i);
+    THGEN_DUMP("IR[%d] orig=%d line=%d ind=0x%x op=%d\n", i, cq->orig_index, cq->line_num, ind, cq->op);
 #endif
     if (need_src1_value)
     {
@@ -7228,14 +7341,30 @@ void tcc_ir_generate_code(TCCIRState *ir)
         IROperand next_src1_irop = tcc_ir_op_get_src1_irop(ir, ir_next);
         ir_next_src1_vr = irop_get_vreg(&next_src1_irop);
       }
+      int is_64bit_load = tcc_ir_is_64bit_type(dest->type.t);
+      fprintf(stderr,
+              "DEBUG LOAD PEEPHOLE: i=%d dest->vr=%d ir_next_src1_vr=%d has_incoming_jump[i+1]=%d is_64bit=%d "
+              "dest->pr0_reg=%d dest->pr1_reg=%d\n",
+              i, dest->vr, ir_next_src1_vr, has_incoming_jump[i + 1], is_64bit_load, dest->pr0_reg, dest->pr1_reg);
       if (ir_next && ir_next->op == TCCIR_OP_RETURNVALUE && ir_next_src1_vr == dest->vr && !has_incoming_jump[i + 1])
       {
+        fprintf(stderr, "DEBUG LOAD PEEPHOLE: FIRING! Setting pr0_reg=0 pr1_reg=%d\n", is_64bit_load ? 1 : 31);
         dest->pr0_reg = REG_IRET; /* R0 */
         dest->pr0_spilled = 0;
-        if (tcc_ir_is_64bit_type(dest->type.t))
+        /* Also update dest->r to have R0 in VT_VALMASK (svalue_to_iroperand reads from there) */
+        dest->r = (dest->r & ~VT_VALMASK) | REG_IRET;
+        if (is_64bit_load)
         {
           dest->pr1_reg = REG_IRE2; /* R1 */
           dest->pr1_spilled = 0;
+        }
+        /* Also update the interval allocation so that RETURNVALUE's src1 gets the same registers */
+        IRLiveInterval *interval = tcc_ir_get_live_interval(ir, dest->vr);
+        if (interval)
+        {
+          interval->allocation.r0 = REG_IRET;
+          if (is_64bit_load)
+            interval->allocation.r1 = REG_IRE2;
         }
       }
       tcc_gen_machine_load_op(src1, dest, cq->op);
@@ -7255,7 +7384,8 @@ void tcc_ir_generate_code(TCCIRState *ir)
                  i, cq->op, src1->vr, (long long)src1->c.i, src1->pr0_reg, ir_prev ? ir_prev->op : -1,
                  ir_prev_dest ? ir_prev_dest->vr : -2, ir_prev_dest ? ir_prev_dest->pr0_reg : -2);
       if (!has_incoming_jump[i] && ir_prev && (ir_prev->op == TCCIR_OP_LOAD || ir_prev->op == TCCIR_OP_ASSIGN) &&
-          ir_prev_dest->vr == src1->vr && ir_prev_dest->pr0_reg == REG_IRET /* R0 */)
+          ir_prev_dest->vr == src1->vr && ir_prev_dest->pr0_reg == REG_IRET /* R0 */ &&
+          src1->pr0_reg == REG_IRET /* src1 must also still be in R0 */)
       {
         THGEN_DUMP("DEBUG codegen RETURNVALUE: SKIP due to peephole\n");
         /* Value is already in R0, no need to generate return value op */
@@ -7384,10 +7514,6 @@ void tcc_ir_generate_code(TCCIRState *ir)
     }
     };
 
-    /* Clean up scratch register state at end of each IR instruction.
-     * This restores any pushed scratch registers and resets the global exclude mask. */
-    tcc_gen_machine_end_instruction();
-
     tcc_ir_release_materialized_addr(dest, &mat_dest_addr);
     tcc_ir_storeback_materialized_dest(dest, &mat_dest);
     tcc_ir_release_materialized_addr(src2, &mat_src2_addr);
@@ -7396,6 +7522,10 @@ void tcc_ir_generate_code(TCCIRState *ir)
     tcc_ir_release_materialized_value(src1, &mat_src1_reg);
     tcc_ir_release_materialized_addr(src1, &mat_src1_addr);
     tcc_ir_release_materialized_value(src1, &mat_src1);
+
+    /* Clean up scratch register state at end of each IR instruction.
+     * This restores any pushed scratch registers and resets the global exclude mask. */
+    tcc_gen_machine_end_instruction();
 
     /* Disabled: hex dump of emitted bytes
     if (TCC_DUMP_THUMB_GEN && TCC_DUMP_THUMB_GEN_SPAN)

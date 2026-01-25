@@ -44,7 +44,7 @@
  * Printed output goes to stderr.
  */
 #ifndef THUMB_OPCODE_TRACE
-#define THUMB_OPCODE_TRACE 0
+#define THUMB_OPCODE_TRACE 1
 #endif
 
 #if THUMB_OPCODE_TRACE
