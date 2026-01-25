@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <stdlib.h>
 
 struct Sym;
 struct TCCIRState;
@@ -106,6 +107,42 @@ typedef struct __attribute__((packed)) IROperand
 } IROperand;
 
 _Static_assert(sizeof(IROperand) == 10, "IROperand must be 10 bytes");
+
+/* ============================================================================
+ * Pool entry types - separate arrays for cache efficiency
+ * ============================================================================
+ */
+
+/* Symref pool entry: symbol reference with addend and flags */
+#define IRPOOL_SYMREF_LVAL (1u << 0)  /* value is an lvalue (needs dereference) */
+#define IRPOOL_SYMREF_LOCAL (1u << 1) /* VT_LOCAL semantics */
+
+typedef struct IRPoolSymref
+{
+  struct Sym *sym;
+  int32_t addend;
+  uint32_t flags;
+} IRPoolSymref;
+
+/* IROperand pool management - separate pools for cache efficiency */
+void tcc_ir_pools_init(struct TCCIRState *ir);
+void tcc_ir_pools_free(struct TCCIRState *ir);
+uint32_t tcc_ir_pool_add_i64(struct TCCIRState *ir, int64_t val);
+uint32_t tcc_ir_pool_add_f64(struct TCCIRState *ir, uint64_t bits);
+uint32_t tcc_ir_pool_add_symref(struct TCCIRState *ir, struct Sym *sym, int32_t addend, uint32_t flags);
+
+/* Pool read accessors (for inline helpers) */
+int64_t *tcc_ir_pool_get_i64_ptr(const struct TCCIRState *ir, uint32_t idx);
+uint64_t *tcc_ir_pool_get_f64_ptr(const struct TCCIRState *ir, uint32_t idx);
+IRPoolSymref *tcc_ir_pool_get_symref_ptr(const struct TCCIRState *ir, uint32_t idx);
+struct Sym *irop_get_sym(IROperand op);
+
+/* IROperand <-> SValue conversion functions */
+IROperand svalue_to_iroperand(struct TCCIRState *ir, const struct SValue *sv);
+void iroperand_to_svalue(const struct TCCIRState *ir, IROperand op, struct SValue *out);
+
+/* Debug: compare SValue with IROperand and print differences (returns 1 if mismatch) */
+int irop_compare_svalue(const struct TCCIRState *ir, const struct SValue *sv, IROperand op, const char *context);
 
 /* Position sentinel value: max 18-bit value means "no position" */
 #define IROP_POSITION_NONE 0x3FFFF
@@ -467,38 +504,3 @@ static inline int irop_op_is_const(const IROperand *op)
     return 0;
   return op->is_const;
 }
-
-/* ============================================================================
- * Pool entry types - separate arrays for cache efficiency
- * ============================================================================
- */
-
-/* Symref pool entry: symbol reference with addend and flags */
-#define IRPOOL_SYMREF_LVAL (1u << 0)  /* value is an lvalue (needs dereference) */
-#define IRPOOL_SYMREF_LOCAL (1u << 1) /* VT_LOCAL semantics */
-
-typedef struct IRPoolSymref
-{
-  struct Sym *sym;
-  int32_t addend;
-  uint32_t flags;
-} IRPoolSymref;
-
-/* IROperand pool management - separate pools for cache efficiency */
-void tcc_ir_pools_init(struct TCCIRState *ir);
-void tcc_ir_pools_free(struct TCCIRState *ir);
-uint32_t tcc_ir_pool_add_i64(struct TCCIRState *ir, int64_t val);
-uint32_t tcc_ir_pool_add_f64(struct TCCIRState *ir, uint64_t bits);
-uint32_t tcc_ir_pool_add_symref(struct TCCIRState *ir, struct Sym *sym, int32_t addend, uint32_t flags);
-
-/* Pool read accessors (for inline helpers) */
-int64_t *tcc_ir_pool_get_i64_ptr(const struct TCCIRState *ir, uint32_t idx);
-uint64_t *tcc_ir_pool_get_f64_ptr(const struct TCCIRState *ir, uint32_t idx);
-IRPoolSymref *tcc_ir_pool_get_symref_ptr(const struct TCCIRState *ir, uint32_t idx);
-
-/* IROperand <-> SValue conversion functions */
-IROperand svalue_to_iroperand(struct TCCIRState *ir, const struct SValue *sv);
-void iroperand_to_svalue(const struct TCCIRState *ir, IROperand op, struct SValue *out);
-
-/* Debug: compare SValue with IROperand and print differences (returns 1 if mismatch) */
-int irop_compare_svalue(const struct TCCIRState *ir, const struct SValue *sv, IROperand op, const char *context);

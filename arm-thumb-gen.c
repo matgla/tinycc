@@ -4409,14 +4409,14 @@ thumb_logical64_cleanup:
   restore_scratch_reg(&src1_lo_alloc);
 }
 
-static void thumb_emit_shift64_imm(SValue *src1, SValue *src2, SValue *dest, TccIrOp op, const char *ctx, bool is_left,
-                                   thumb_imm_handler_t dst_lo_shift, thumb_imm_handler_t dst_hi_shift,
+static void thumb_emit_shift64_imm(IROperand dest, IROperand src1, IROperand src2, TccIrOp op, const char *ctx,
+                                   bool is_left, thumb_imm_handler_t dst_lo_shift, thumb_imm_handler_t dst_hi_shift,
                                    thumb_imm_handler_t cross_shift, bool sign_extend_missing_hi, bool arith_right)
 {
-  const uint32_t sh = (uint32_t)src2->c.i;
+  const uint32_t sh = (uint32_t)src2.u.imm32;
 
-  int dst_lo = dest->pr0_reg;
-  int dst_hi = dest->pr1_reg;
+  int dst_lo = dest.pr0_reg;
+  int dst_hi = dest.pr1_reg;
   ScratchRegAlloc dst_lo_alloc = (ScratchRegAlloc){0};
   ScratchRegAlloc dst_hi_alloc = (ScratchRegAlloc){0};
   bool store_lo = false;
@@ -4428,19 +4428,18 @@ static void thumb_emit_shift64_imm(SValue *src1, SValue *src2, SValue *dest, Tcc
   thumb_prepare_dest_pair_for_64bit_op(ctx, dest, &dst_lo, &dst_hi, &dst_lo_alloc, &dst_hi_alloc, &store_lo, &store_hi,
                                        &exclude);
 
-  int src_lo = src1->pr0_reg;
-  int src_hi = src1->pr1_reg;
+  int src_lo = src1.pr0_reg;
+  int src_hi = src1.pr1_reg;
   ScratchRegAlloc src_lo_alloc = (ScratchRegAlloc){0};
   ScratchRegAlloc src_hi_alloc = (ScratchRegAlloc){0};
 
-  const bool src_is_imm = (src_lo == PREG_REG_NONE) && th_has_immediate_value(src1->r);
-  const int src1_kind = src1->r & VT_VALMASK;
-  const bool src1_is_address_of = (src1_kind == VT_LOCAL || src1_kind == VT_LLOCAL) && !(src1->r & VT_LVAL);
-  const bool src1_is_sym_address = (src1->r & VT_SYM) && !(src1->r & VT_LVAL);
+  const bool src_is_imm = (src_lo == PREG_REG_NONE) && irop_is_immediate(&src1);
+  const bool src1_is_address_of = (src1.is_local || src1.is_llocal) && !(src1.is_lval);
+  const bool src1_is_sym_address = (src1.is_sym) && !(src1.is_lval);
   if (src_is_imm)
   {
-    Sym *sym = (src1->r & VT_SYM) ? src1->sym : NULL;
-    tcc_machine_load_constant(dst_lo, dst_hi, src1->c.i, 1, sym);
+    Sym *sym = (src1.is_sym) ? src1.sym : NULL;
+    tcc_machine_load_constant(dst_lo, dst_hi, src1.u.imm32, 1, sym);
     src_lo = dst_lo;
     src_hi = dst_hi;
   }

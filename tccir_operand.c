@@ -170,6 +170,12 @@ IRPoolSymref *tcc_ir_pool_get_symref_ptr(const TCCIRState *ir, uint32_t idx)
   return &ir->pool_symref[idx];
 }
 
+/* Public wrapper: get symbol from IROperand using the global tcc_state->ir. */
+ST_FUNC struct Sym *irop_get_sym(IROperand op)
+{
+  return irop_get_sym_ex(tcc_state->ir, op);
+}
+
 /* ============================================================================
  * IROperand <-> SValue conversion functions
  * ============================================================================
