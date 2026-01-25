@@ -2050,8 +2050,6 @@ ST_FUNC int gv(int rc)
         svalue_init(&dest);
         dest.type = vtop->type;
         dest.vr = vreg;
-        if ((vtop->r & VT_PARAM) && (vtop->r & VT_LVAL))
-          fprintf(stderr, "DEBUG gv LOAD (rc2): vtop r=0x%x c.i=%lld vr=%d\n", vtop->r, (long long)vtop->c.i, vtop->vr);
         tcc_ir_put(tcc_state->ir, TCCIR_OP_LOAD, vtop, NULL, &dest);
 
         vtop->vr = vreg;
@@ -2084,8 +2082,6 @@ ST_FUNC int gv(int rc)
       svalue_init(&dest);
       dest.type.t = vtop->type.t;
       dest.vr = vreg;
-      if ((vtop->r & VT_PARAM) && (vtop->r & VT_LVAL))
-        fprintf(stderr, "DEBUG gv LOAD: vtop r=0x%x c.i=%lld vr=%d\n", vtop->r, (long long)vtop->c.i, vtop->vr);
       tcc_ir_put(tcc_state->ir, TCCIR_OP_LOAD, vtop, NULL, &dest);
 
       vtop->vr = vreg;
@@ -10474,7 +10470,6 @@ static void gen_function(Sym *sym)
   func_ind = ind;
   func_vt = sym->type.ref->type;
   func_var = sym->type.ref->f.func_type == FUNC_ELLIPSIS;
-  fprintf(stderr, "DEBUG gen_function: %s\n", funcname);
 
   /* NOTE: we patch the symbol size later */
   put_extern_sym(sym, cur_text_section, ind + 1, 0);

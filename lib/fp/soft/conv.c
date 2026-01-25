@@ -94,10 +94,7 @@ unsigned int __aeabi_f2uiz(float a)
   {
     return mant << shift;
   }
-  else
-  {
-    return mant >> (-shift);
-  }
+  return mant >> (-shift);
 }
 
 /* Convert single-precision float to unsigned 64-bit integer (truncate toward zero) */
@@ -135,10 +132,7 @@ unsigned long long __aeabi_f2ulz(float a)
       return ~0ULL;
     return (unsigned long long)mant << shift;
   }
-  else
-  {
-    return (unsigned long long)mant >> (-shift);
-  }
+  return (unsigned long long)mant >> (-shift);
 }
 
 /* Convert single-precision float to signed 64-bit integer (truncate toward zero) */

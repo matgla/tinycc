@@ -1580,7 +1580,6 @@ ST_DATA const int reg_classes[NB_REGS];
 
 ST_FUNC void gsym_addr(int t, int a);
 ST_FUNC void gsym(int t);
-ST_FUNC void load(int r, SValue *sv);
 ST_FUNC void store(int r, SValue *v);
 ST_FUNC int gfunc_sret(CType *vt, int variadic, CType *ret, int *align, int *regsize);
 ST_FUNC void gfunc_call(int nb_args);
@@ -1888,6 +1887,8 @@ ST_FUNC void tcc_tcov_reset_ind(TCCState *s1);
  * their respective *-gen.c files and follow the contract documented in
  * docs/IR_MACHINE_CONTRACT.md.
  */
+
+ST_FUNC void tcc_machine_load_to_reg(int reg0, int reg1, SValue *src);
 
 ST_FUNC void tcc_machine_acquire_scratch(TCCMachineScratchRegs *scratch, unsigned flags);
 ST_FUNC void tcc_machine_release_scratch(const TCCMachineScratchRegs *scratch);

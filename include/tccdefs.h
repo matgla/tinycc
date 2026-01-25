@@ -209,8 +209,10 @@ typedef struct
 void *__va_arg(__builtin_va_list ap, int arg_type, int size, int align);
 #define __builtin_va_start(ap, last) (*(ap) = *(__builtin_va_list)((char *)__builtin_frame_address(0) - 24))
 #define __builtin_va_arg(ap, t) (*(t *)(__va_arg(ap, __builtin_va_arg_types(t), sizeof(t), __alignof__(t))))
+#ifdef TCC_IS_NATIVE
 #ifndef __builtin_va_copy
 #define __builtin_va_copy(dest, src) (*(dest) = *(src))
+#endif
 #endif
 
 #else /* _WIN64 */
@@ -246,8 +248,10 @@ void *__va_arg(__builtin_va_list ap, int size, int align);
 #define __builtin_va_start(ap, last)                                                                                   \
   __tcc_va_start((ap), &(last), sizeof(last), __alignof__(last), __builtin_frame_address(0))
 #define __builtin_va_arg(ap, type) (*(type *)__va_arg((ap), sizeof(type), __alignof__(type)))
+#ifdef TCC_IS_NATIVE
 #ifndef __builtin_va_copy
 #define __builtin_va_copy(dest, src) (*(dest) = *(src))
+#endif
 #endif
 
 #elif defined __aarch64__
@@ -282,8 +286,10 @@ typedef char *__builtin_va_list;
 
 #endif
 #define __builtin_va_end(ap) (void)(ap)
+#ifdef TCC_IS_NATIVE
 #ifndef __builtin_va_copy
 #define __builtin_va_copy(dest, src) (dest) = (src)
+#endif
 #endif
 
 /* TCC BBUILTIN AND BOUNDS ALIASES */

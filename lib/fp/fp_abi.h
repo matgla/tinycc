@@ -43,10 +43,11 @@ typedef union
 #define AEABI_CMP_UN 0x80000000 /* unordered (NaN): N=1 */
 
 /* Special float values */
-#define FLOAT_SIGN_BIT 0x80000000
-#define FLOAT_EXPONENT_MASK 0x7F800000
-#define FLOAT_MANTISSA_MASK 0x007FFFFF
-#define FLOAT_QUIET_BIT 0x00400000
+// #undef FLOAT_SIGN_BIT
+// #define FLOAT_SIGN_BIT 0x80000000
+// #define FLOAT_EXPONENT_MASK 0x7F800000
+// #define FLOAT_MANTISSA_MASK 0x007FFFFF
+// #define FLOAT_QUIET_BIT 0x00400000
 
 /* Special double values */
 #define DOUBLE_SIGN_BIT 0x8000000000000000ULL

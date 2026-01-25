@@ -729,10 +729,6 @@ int tcc_ir_svalue_pool_add(TCCIRState *ir, const SValue *sv)
   }
   ir->svalue_pool[ir->svalue_pool_count] = *sv;
 
-  if ((sv->r & VT_PARAM) && (sv->r & VT_LVAL) && (sv->r & VT_LOCAL))
-    fprintf(stderr, "DEBUG svalue_pool_add: index=%d vr=%d r=0x%x c.i=%lld (ir->next_instruction_index=%d)\n",
-            ir->svalue_pool_count, sv->vr, sv->r, (long long)sv->c.i, ir->next_instruction_index);
-
   /* Also add IROperand representation in parallel */
   if (ir->iroperand_pool_count >= ir->iroperand_pool_capacity)
   {
@@ -4020,15 +4016,6 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
   int old_r = sv->r;
   int old_v = old_r & VT_VALMASK;
 
-  /* DEBUG: trace fill_registers path for specific failing vreg */
-  int debug_this = (sv->vr == 536871041 || sv->vr == 536871050 || sv->vr == 536870995 || sv->vr == 536871053);
-
-  if (debug_this)
-  {
-    fprintf(stderr, "DEBUG fill_registers ENTER: sv=%p vr=%d r=0x%x type.t=0x%x is_valid=%d\n", (void *)sv, sv->vr,
-            sv->r, sv->type.t, tcc_is_vreg_valid(ir, sv->vr));
-  }
-
   /* VT_LOCAL/VT_LLOCAL operands can mean either:
    * - a concrete stack slot (vr == -1), e.g. VLA save slots, or
    * - a logical local tracked as a vreg by the IR (vr != -1).
@@ -4062,8 +4049,6 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
     if (TCCIR_DECODE_VREG_TYPE(sv->vr) == TCCIR_VREG_TYPE_PARAM && interval && interval->incoming_reg0 < 0 &&
         interval->allocation.r0 == PREG_NONE && interval->allocation.offset == 0)
     {
-      fprintf(stderr, "DEBUG fill_registers STACK PARAM: vr=%d original_offset=%d\n", sv->vr,
-              interval->original_offset);
       sv->pr0_reg = PREG_REG_NONE;
       sv->pr0_spilled = 0;
       sv->pr1_reg = PREG_REG_NONE;
@@ -4091,18 +4076,6 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
     sv->pr1_reg = interval->allocation.r1 & PREG_REG_NONE;
     sv->pr1_spilled = (interval->allocation.r1 & PREG_SPILLED) != 0;
     sv->c.i = interval->allocation.offset;
-
-    if ((TCCIR_DECODE_VREG_TYPE(sv->vr) == TCCIR_VREG_TYPE_PARAM) && (old_r & VT_PARAM))
-      fprintf(stderr,
-              "DEBUG fill_registers PARAM: vr=%d old_r=0x%x alloc.offset=%d alloc.r0=0x%x sv->c.i=%lld orig_off=%d\n",
-              sv->vr, old_r, interval->allocation.offset, interval->allocation.r0, (long long)sv->c.i,
-              interval->original_offset);
-
-    if (debug_this)
-    {
-      fprintf(stderr, "DEBUG fill_registers: after alloc: vr=%d r0=0x%x r1=0x%x pr0=%d pr1=%d\n", sv->vr,
-              interval->allocation.r0, interval->allocation.r1, sv->pr0_reg, sv->pr1_reg);
-    }
 
     /* Determine if we should preserve VT_LVAL:
      * - If old_r was VT_LOCAL|VT_LVAL (local variable on stack), and now
@@ -7095,10 +7068,8 @@ void tcc_ir_generate_code(TCCIRState *ir)
   int stack_size = (-loc + 7) & ~7; // align to 8 bytes
   tcc_gen_machine_prolog(ir->leaffunc, ir->ls.dirty_registers, stack_size);
 
-  fprintf(stderr, "DEBUG codegen loop: next_instruction_index=%d\n", ir->next_instruction_index);
   for (int i = 0; i < ir->next_instruction_index; i++)
   {
-    fprintf(stderr, "DEBUG codegen loop: i=%d op=%d\n", i, ir->compact_instructions[i].op);
     drop_return_value = 0;
     cq = &ir->compact_instructions[i];
 
@@ -7342,13 +7313,8 @@ void tcc_ir_generate_code(TCCIRState *ir)
         ir_next_src1_vr = irop_get_vreg(&next_src1_irop);
       }
       int is_64bit_load = tcc_ir_is_64bit_type(dest->type.t);
-      fprintf(stderr,
-              "DEBUG LOAD PEEPHOLE: i=%d dest->vr=%d ir_next_src1_vr=%d has_incoming_jump[i+1]=%d is_64bit=%d "
-              "dest->pr0_reg=%d dest->pr1_reg=%d\n",
-              i, dest->vr, ir_next_src1_vr, has_incoming_jump[i + 1], is_64bit_load, dest->pr0_reg, dest->pr1_reg);
       if (ir_next && ir_next->op == TCCIR_OP_RETURNVALUE && ir_next_src1_vr == dest->vr && !has_incoming_jump[i + 1])
       {
-        fprintf(stderr, "DEBUG LOAD PEEPHOLE: FIRING! Setting pr0_reg=0 pr1_reg=%d\n", is_64bit_load ? 1 : 31);
         dest->pr0_reg = REG_IRET; /* R0 */
         dest->pr0_spilled = 0;
         /* Also update dest->r to have R0 in VT_VALMASK (svalue_to_iroperand reads from there) */
@@ -7379,22 +7345,12 @@ void tcc_ir_generate_code(TCCIRState *ir)
        * skip the return value copy */
       const IRQuadCompact *ir_prev = (i > 0) ? &ir->compact_instructions[i - 1] : NULL;
       const SValue *ir_prev_dest = ir_prev ? tcc_ir_op_get_dest(ir, ir_prev) : NULL;
-      fprintf(stderr, "DEBUG codegen RETURNVALUE: i=%d src1.r=0x%x src1.vr=%d src1.c.i=%lld src1.pr0_reg=%d prev.op=%d "
-                 "prev.dest.vr=%d prev.dest.pr0_reg=%d\n",
-                 i, cq->op, src1->vr, (long long)src1->c.i, src1->pr0_reg, ir_prev ? ir_prev->op : -1,
-                 ir_prev_dest ? ir_prev_dest->vr : -2, ir_prev_dest ? ir_prev_dest->pr0_reg : -2);
 
       /* Check if the previous instruction already placed the value in R0.
        * Note: We must check ir_prev_dest->pr0_reg, not src1->pr0_reg, because the ASSIGN peephole
        * may have redirected the destination to R0 after register allocation set src1->pr0_reg. */
-      if (!has_incoming_jump[i] && ir_prev && (ir_prev->op == TCCIR_OP_LOAD || ir_prev->op == TCCIR_OP_ASSIGN) &&
-          ir_prev_dest->vr == src1->vr && ir_prev_dest->pr0_reg == REG_IRET /* R0 */)
-      {
-        THGEN_DUMP("DEBUG codegen RETURNVALUE: SKIP due to peephole\n");
-        /* Value is already in R0, no need to generate return value op */
-        /* Just fall through to RETURNVOID which handles the jump */
-      }
-      else
+      if (has_incoming_jump[i] || !ir_prev || (ir_prev->op != TCCIR_OP_LOAD && ir_prev->op != TCCIR_OP_ASSIGN) ||
+          ir_prev_dest->vr != src1->vr || ir_prev_dest->pr0_reg != REG_IRET)
       {
         tcc_gen_machine_return_value_op(src1, cq->op);
       }

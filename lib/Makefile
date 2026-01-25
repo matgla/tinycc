@@ -125,3 +125,12 @@ clean :
 	rm -f *.o $(addprefix $(TOP)/,*libtcc1.a $(EXTRA_O))
 	rm -rf build
 	$(MAKE) -C fp clean
+
+# Clean only FP libraries for a specific cross target
+clean-fp-libs:
+	@echo "Cleaning FP libraries for $(CROSS_TARGET)..."
+	@rm -f $(TOP)/lib/fp/libtcc1-fp-*.a
+	@rm -f $(TOP)/lib/fp/build/.$(CROSS_TARGET)-fp-libs.stamp
+	@rm -f $(TOP)/lib/fp/build/.$(CROSS_TARGET)-tcc.checksum
+	@rm -f $(TOP)/lib/fp/build/.$(CROSS_TARGET)-fp-libs.checksum.saved
+	@rm -rf $(TOP)/lib/fp/build/soft $(TOP)/lib/fp/build/vfpv4-sp $(TOP)/lib/fp/build/vfpv5-dp $(TOP)/lib/fp/build/rp2350

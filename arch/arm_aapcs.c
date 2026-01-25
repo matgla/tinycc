@@ -119,7 +119,6 @@ TCCAbiArgLoc tcc_abi_classify_argument(TCCAbiCallLayout *layout, int arg_index, 
       loc.reg_base = layout->next_reg;
       loc.reg_count = (uint8_t)regs_needed;
       layout->next_reg = (uint8_t)(layout->next_reg + regs_needed);
-      fprintf(stderr, "DEBUG ABI: struct arg %d -> REG: base=%d count=%d\n", arg_index, loc.reg_base, loc.reg_count);
     }
     else if (layout->next_reg <= 3)
     {
@@ -135,8 +134,6 @@ TCCAbiArgLoc tcc_abi_classify_argument(TCCAbiCallLayout *layout, int arg_index, 
       loc.stack_size = (uint16_t)(words_on_stack * 4);
       layout->next_stack_off += words_on_stack * 4;
       layout->next_reg = 4;
-      fprintf(stderr, "DEBUG ABI: struct arg %d -> REG_STACK: base=%d reg_count=%d stack_off=%d stack_size=%d\n",
-              arg_index, loc.reg_base, loc.reg_count, loc.stack_off, loc.stack_size);
     }
     else
     {
@@ -155,7 +152,6 @@ TCCAbiArgLoc tcc_abi_classify_argument(TCCAbiCallLayout *layout, int arg_index, 
       loc.reg_base = layout->next_reg;
       loc.reg_count = 1;
       layout->next_reg++;
-      fprintf(stderr, "DEBUG ABI: scalar arg %d -> REG: base=%d\n", arg_index, loc.reg_base);
     }
     else
     {
@@ -164,12 +160,10 @@ TCCAbiArgLoc tcc_abi_classify_argument(TCCAbiCallLayout *layout, int arg_index, 
       loc.stack_off = layout->next_stack_off;
       layout->next_stack_off += 4;
       layout->next_reg = 4;
-      fprintf(stderr, "DEBUG ABI: scalar arg %d -> STACK: off=%d\n", arg_index, loc.stack_off);
     }
   }
 
   layout->stack_size = tcc_abi_align_up_int(layout->next_stack_off, layout->stack_align ? layout->stack_align : 8);
-  //   layout->locs[arg_index] = loc;
   return loc;
 }
 

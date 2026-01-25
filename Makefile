@@ -154,6 +154,9 @@ FP_LIBS_STAMP_DIR = $(TOP)/lib/fp/build
 FP_LIBS_SRC_DEPS = $(shell find $(TOP)/lib/fp -type f \( -name 'Makefile' -o -name '*.[chS]' \) -print 2>/dev/null)
 FP_LIBS_CROSS = $(foreach X,$(TCC_X),$(FP_LIBS_STAMP_DIR)/.$X-fp-libs.stamp)
 
+# Checksum utility for detecting compiler changes
+CHECKSUM_CMD = $(shell command -v sha256sum 2>/dev/null || command -v md5sum 2>/dev/null || echo "")
+
 # When TinyCC itself is built with ASan, leak detection (LSan) may cause
 # the compiler process to exit non-zero on teardown, breaking recursive
 # builds that invoke the freshly built compiler (e.g. fp-libs).
@@ -179,10 +182,33 @@ fp-libs: $(FP_LIBS_CROSS)
 # Backwards-compatible aliases (won't rebuild if stamp is up-to-date)
 %-fp-libs: $(FP_LIBS_STAMP_DIR)/.%-fp-libs.stamp
 
-$(FP_LIBS_STAMP_DIR)/.%-fp-libs.stamp: %-tcc$(EXESUF) $(FP_LIBS_SRC_DEPS)
+# Compiler checksum file (tracks when compiler binary actually changes)
+$(FP_LIBS_STAMP_DIR)/.%-tcc.checksum: %-tcc$(EXESUF)
 	@mkdir -p $(FP_LIBS_STAMP_DIR)
+	@if [ -n "$(CHECKSUM_CMD)" ]; then \
+		$(CHECKSUM_CMD) $< | awk '{print $$1}' > $@.tmp && \
+		if [ -f $@ ] && [ "$$(cat $@)" = "$$(cat $@.tmp)" ]; then \
+			rm -f $@.tmp; \
+		else \
+			mv $@.tmp $@; \
+		fi; \
+	else \
+		touch $@; \
+	fi
+
+$(FP_LIBS_STAMP_DIR)/.%-fp-libs.stamp: $(FP_LIBS_STAMP_DIR)/.%-tcc.checksum $(FP_LIBS_SRC_DEPS)
+	@mkdir -p $(FP_LIBS_STAMP_DIR)
+	@# Check if checksum changed - if so, clean and rebuild fplibs
+	@if [ -f $(FP_LIBS_STAMP_DIR)/.$*-fp-libs.checksum.saved ]; then \
+		if ! cmp -s $(FP_LIBS_STAMP_DIR)/.$*-fp-libs.checksum.saved $(FP_LIBS_STAMP_DIR)/.$*-tcc.checksum; then \
+			echo "Compiler $*-tcc changed - cleaning and rebuilding fplibs"; \
+			$(MAKE) --no-print-directory -C lib clean-fp-libs CROSS_TARGET=$*; \
+		fi; \
+	fi
 	@rm -f $@
 	@$(SAN_ENV) $(MAKE) --no-print-directory -C lib CROSS_TARGET=$* fp-libs && touch $@
+	@# Save the checksum that was used for this build
+	@cp $(abspath $(FP_LIBS_STAMP_DIR)/.$*-tcc.checksum) $(abspath $(FP_LIBS_STAMP_DIR)/.$*-fp-libs.checksum.saved)
 
 install: ; @$(MAKE) --no-print-directory  install$(CFG)
 install-strip: ; @$(MAKE) --no-print-directory  install$(CFG) CONFIG_strip=yes

@@ -282,12 +282,12 @@ ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands, int nb_outputs,
           sv = *op->vt;
           sv.r = (sv.r & ~VT_VALMASK) | VT_LOCAL | VT_LVAL;
           sv.type.t = VT_PTR;
-          load(op->reg, &sv);
+          tcc_machine_load_to_reg(op->reg, -1, &sv);
         }
         else if (i >= nb_outputs || op->is_rw)
         { // not write-only
           /* load value in register */
-          load(op->reg, op->vt);
+          tcc_machine_load_to_reg(op->reg, -1, op->vt);
           if (op->is_llong)
             tcc_error("long long not implemented");
         }
@@ -310,7 +310,7 @@ ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands, int nb_outputs,
             sv = *op->vt;
             sv.r = (sv.r & ~VT_VALMASK) | VT_LOCAL;
             sv.type.t = VT_PTR;
-            load(out_reg, &sv);
+            tcc_machine_load_to_reg(out_reg, -1, &sv);
 
             sv = *op->vt;
             sv.r = (sv.r & ~VT_VALMASK) | out_reg;

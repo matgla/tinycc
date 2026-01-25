@@ -315,26 +315,7 @@ IROperand svalue_to_iroperand(TCCIRState *ir, const SValue *sv)
   {
     int is_param = (sv->r & VT_PARAM) ? 1 : 0;
     int offset_val = (int32_t)sv->c.i;
-#if 1
-    if (is_param && offset_val > 0)
-    {
-      fprintf(stderr,
-              "DEBUG svalue_to_iroperand: StackOff stack_param vr=%d off=%d is_param=%d is_lval=%d is_llocal=%d "
-              "(sv->r=0x%x "
-              "VT_PARAM=0x%x)\n",
-              vr, offset_val, is_param, is_lval, is_llocal, sv->r, VT_PARAM);
-    }
-#endif
     result = irop_make_stackoff(vr, offset_val, is_lval, is_llocal, is_param, irop_bt);
-#if 1
-    if (is_param && offset_val > 0)
-    {
-      fprintf(
-          stderr,
-          "DEBUG svalue_to_iroperand: After irop_make_stackoff: result.u.imm32=%d result.is_param=%d result.tag=%d\n",
-          result.u.imm32, result.is_param, result.tag);
-    }
-#endif
     irop_copy_svalue_info(&result, sv);
     goto done;
   }
