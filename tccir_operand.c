@@ -234,7 +234,7 @@ IROperand svalue_to_iroperand(TCCIRState *ir, const SValue *sv)
 
   IROperand result;
 
-  /* Case 1: vreg (possibly with lval for register-indirect access) 
+  /* Case 1: vreg (possibly with lval for register-indirect access)
    * Handles both pure vregs and register-indirect lvalues.
    * val_kind being a physical register (< VT_CONST) means the value is in/through that register. */
   if (vr >= 0 && val_kind != VT_CONST && val_kind != VT_LOCAL && val_kind != VT_LLOCAL && !has_sym)
@@ -245,6 +245,17 @@ IROperand svalue_to_iroperand(TCCIRState *ir, const SValue *sv)
     /* Capture physical register from VT_VALMASK if it's a register number */
     if (val_kind < VT_CONST && val_kind < 32) /* Physical register in VT_VALMASK */
       result.pr0_reg = val_kind;
+    goto done;
+  }
+
+  /* Case 1b: Physical register with no vreg (vr < 0)
+   * Value is purely in a physical register, not tracked by IR vreg system. */
+  if (vr < 0 && val_kind < VT_CONST && val_kind < 32 && !has_sym)
+  {
+    result = irop_make_vreg(vr, irop_bt);
+    result.is_lval = is_lval;
+    irop_copy_svalue_info(&result, sv);
+    result.pr0_reg = val_kind; /* Physical register in VT_VALMASK */
     goto done;
   }
 
@@ -317,9 +328,7 @@ IROperand svalue_to_iroperand(TCCIRState *ir, const SValue *sv)
     /* Check if value fits in 32-bit (signed or unsigned depending on type) */
     int64_t val = (int64_t)sv->c.i;
     int is_unsigned = (sv->type.t & VT_UNSIGNED) ? 1 : 0;
-    int fits_32bit = is_unsigned 
-        ? (val >= 0 && val <= (int64_t)UINT32_MAX)
-        : (val >= INT32_MIN && val <= INT32_MAX);
+    int fits_32bit = is_unsigned ? (val >= 0 && val <= (int64_t)UINT32_MAX) : (val >= INT32_MIN && val <= INT32_MAX);
     if (fits_32bit)
     {
       result = irop_make_imm32(vr, (int32_t)val, irop_bt);
@@ -543,12 +552,16 @@ int irop_compare_svalue(const TCCIRState *ir, const SValue *sv, IROperand op, co
   /* Compare type.t basic type - allow equivalent compressed types */
   int sv_btype = sv->type.t & VT_BTYPE;
   int rec_btype = reconstructed.type.t & VT_BTYPE;
-  /* VT_BYTE, VT_SHORT, VT_INT, VT_PTR, VT_BOOL all compress to INT32 -> VT_INT 
+  /* VT_BYTE, VT_SHORT, VT_INT, VT_PTR, VT_BOOL all compress to INT32 -> VT_INT
    * This is acceptable lossy compression since they're all <= 32 bits */
-  int sv_btype_class = (sv_btype == VT_BYTE || sv_btype == VT_SHORT || sv_btype == VT_INT || 
-                        sv_btype == VT_PTR || sv_btype == VT_BOOL || sv_btype == VT_VOID) ? VT_INT : sv_btype;
-  int rec_btype_class = (rec_btype == VT_BYTE || rec_btype == VT_SHORT || rec_btype == VT_INT ||
-                         rec_btype == VT_PTR || rec_btype == VT_BOOL || rec_btype == VT_VOID) ? VT_INT : rec_btype;
+  int sv_btype_class = (sv_btype == VT_BYTE || sv_btype == VT_SHORT || sv_btype == VT_INT || sv_btype == VT_PTR ||
+                        sv_btype == VT_BOOL || sv_btype == VT_VOID)
+                           ? VT_INT
+                           : sv_btype;
+  int rec_btype_class = (rec_btype == VT_BYTE || rec_btype == VT_SHORT || rec_btype == VT_INT || rec_btype == VT_PTR ||
+                         rec_btype == VT_BOOL || rec_btype == VT_VOID)
+                            ? VT_INT
+                            : rec_btype;
   if (sv_btype_class != rec_btype_class)
   {
     fprintf(stderr, "IROP_MISMATCH[%s]: VT_BTYPE: orig=0x%x reconstructed=0x%x\n", context, sv_btype, rec_btype);
@@ -566,8 +579,7 @@ int irop_compare_svalue(const TCCIRState *ir, const SValue *sv, IROperand op, co
   /* Compare c.i for non-float types, only when it's meaningful */
   /* c.i matters for: VT_CONST, VT_LOCAL, VT_LLOCAL (offsets), VT_SYM (offsets) */
   int sv_valkind = sv->r & VT_VALMASK;
-  int c_i_matters = (sv_valkind == VT_CONST || sv_valkind == VT_LOCAL || 
-                     sv_valkind == VT_LLOCAL || (sv->r & VT_SYM));
+  int c_i_matters = (sv_valkind == VT_CONST || sv_valkind == VT_LOCAL || sv_valkind == VT_LLOCAL || (sv->r & VT_SYM));
   if (c_i_matters && sv_btype != VT_FLOAT && sv_btype != VT_DOUBLE && sv_btype != VT_LDOUBLE)
   {
     if (sv->c.i != reconstructed.c.i)

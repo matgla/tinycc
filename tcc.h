@@ -1924,10 +1924,10 @@ ST_FUNC int tcc_gen_machine_abi_assign_call_args(const TCCAbiArgDesc *args, int 
 ST_FUNC void tcc_gen_machine_save_call_context(void);
 ST_FUNC void tcc_gen_machine_restore_call_context(void);
 ST_FUNC void tcc_gen_machine_jump_op(TccIrOp op);
-ST_FUNC void tcc_gen_machine_conditional_jump_op(SValue *cond_sv, SValue *dest, TccIrOp op);
+ST_FUNC void tcc_gen_machine_conditional_jump_op(IROperand src, TccIrOp op);
 ST_FUNC void tcc_gen_machine_indirect_jump_op(IROperand src1);
-ST_FUNC void tcc_gen_machine_setif_op(SValue *src1, SValue *src2, SValue *dest, TccIrOp op);
-ST_FUNC void tcc_gen_machine_bool_op(SValue *src1, SValue *src2, SValue *dest, TccIrOp op);
+ST_FUNC void tcc_gen_machine_setif_op(IROperand dest, IROperand src, TccIrOp op);
+ST_FUNC void tcc_gen_machine_bool_op(IROperand dest, IROperand src1, IROperand src2, TccIrOp op);
 ST_FUNC void tcc_gen_machine_backpatch_jump(int address, int offset);
 ST_FUNC void tcc_gen_machine_end_instruction(void);
 ST_FUNC void tcc_gen_machine_func_parameter_op(SValue *src1, SValue *src2, TccIrOp op);

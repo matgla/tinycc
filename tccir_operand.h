@@ -120,8 +120,7 @@ static inline int irop_is_neg_vreg(const IROperand *op)
 static inline int irop_has_no_vreg(const IROperand *op)
 {
   /* Either negative vreg sentinel OR the old vr < 0 check for IROP_NONE */
-  return irop_is_neg_vreg(op) || 
-         (op->position == IROP_POSITION_NONE && op->vreg_type == 0);
+  return irop_is_neg_vreg(op) || (op->position == IROP_POSITION_NONE && op->vreg_type == 0);
 }
 
 /* Extract tag from operand (using bitfield) */
@@ -139,6 +138,20 @@ static inline int irop_get_btype(const IROperand *op)
   if (op->position == IROP_POSITION_NONE && op->vreg_type == 0)
     return IROP_BTYPE_INT32; /* default */
   return op->btype;
+}
+
+/* Check if operand has a 64-bit type */
+static inline int irop_is_64bit(const IROperand *op)
+{
+  int btype = irop_get_btype(op);
+  return btype == IROP_BTYPE_INT64 || btype == IROP_BTYPE_FLOAT64;
+}
+
+/* Check if operand has an immediate value */
+static inline int irop_is_immediate(const IROperand *op)
+{
+  int tag = irop_get_tag(op);
+  return tag == IROP_TAG_IMM32 || tag == IROP_TAG_F32 || tag == IROP_TAG_I64 || tag == IROP_TAG_F64;
 }
 
 /* Extract clean vreg value (type + position, for IR passes) */
@@ -195,7 +208,8 @@ static inline void irop_set_vreg(IROperand *op, int32_t vreg)
   {
     /* Encode small negative: -1 -> idx 0, -2 -> idx 1, etc. */
     int neg_idx = (int)(-vreg - 1);
-    if (neg_idx > 15) neg_idx = 15; /* Clamp to 4 bits */
+    if (neg_idx > 15)
+      neg_idx = 15; /* Clamp to 4 bits */
     /* Sentinel in upper bits, neg index in lower 4 bits */
     op->position = IROP_NEG_VREG_SENTINEL | (neg_idx & 0xF);
     op->vreg_type = 0xF;
@@ -335,8 +349,7 @@ static inline IROperand irop_make_symref(int32_t vreg, uint32_t pool_idx, int is
 static inline int irop_is_none(const IROperand *op)
 {
   /* Check for IROP_NONE: position=max, vreg_type=0, or tag=NONE */
-  return (op->position == IROP_POSITION_NONE && op->vreg_type == 0) || 
-         irop_get_tag(op) == IROP_TAG_NONE;
+  return (op->position == IROP_POSITION_NONE && op->vreg_type == 0) || irop_get_tag(op) == IROP_TAG_NONE;
 }
 
 static inline int irop_has_vreg(const IROperand *op)

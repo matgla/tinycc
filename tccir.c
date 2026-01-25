@@ -7180,6 +7180,10 @@ void tcc_ir_generate_code(TCCIRState *ir)
       tcc_ir_materialize_const_to_reg(ir, src2, &mat_src2_reg);
     }
 
+    const IROperand dest_ir = svalue_to_iroperand(ir, dest);
+    const IROperand src1_ir = svalue_to_iroperand(ir, src1);
+    const IROperand src2_ir = svalue_to_iroperand(ir, src2);
+
     switch (cq->op)
     {
     case TCCIR_OP_MUL:
@@ -7312,24 +7316,22 @@ void tcc_ir_generate_code(TCCIRState *ir)
       tcc_ir_spill_cache_clear(&ir->spill_cache);
       break;
     case TCCIR_OP_JUMPIF:
-      tcc_gen_machine_conditional_jump_op(src1, dest, cq->op);
+      tcc_gen_machine_conditional_jump_op(src1_ir, cq->op);
       /* Update mapping to actual instruction address (may have shifted due to literal pool) */
       ir_to_code_mapping[i] = ind - 4;
       /* Clear spill cache at conditional branch - target may have different values */
       tcc_ir_spill_cache_clear(&ir->spill_cache);
       break;
     case TCCIR_OP_IJUMP:
-      const IROperand c = svalue_to_iroperand(ir, src1);
-      tcc_gen_machine_indirect_jump_op(c);
-      irop_compare_svalue(ir, src1, c, "indirect jump");
+      tcc_gen_machine_indirect_jump_op(src1_ir);
       tcc_ir_spill_cache_clear(&ir->spill_cache);
       break;
     case TCCIR_OP_SETIF:
-      tcc_gen_machine_setif_op(src1, src2, dest, cq->op);
+      tcc_gen_machine_setif_op(dest_ir, src1_ir, cq->op);
       break;
     case TCCIR_OP_BOOL_OR:
     case TCCIR_OP_BOOL_AND:
-      tcc_gen_machine_bool_op(src1, src2, dest, cq->op);
+      tcc_gen_machine_bool_op(dest_ir, src1_ir, src2_ir, cq->op);
       break;
     case TCCIR_OP_FUNCPARAMVOID:
       /* Create call site for void calls (no parameters) */
@@ -7839,6 +7841,7 @@ int tcc_ir_generate_test(TCCIRState *ir, int inv, int t)
     svalue_init(&src);
     svalue_init(&dest);
     src.vr = -1;
+    src.r = VT_CONST;
     /* Use cmp_op and invert if needed. In TCC, comparison tokens are designed
      * so that XORing with 1 inverts them (e.g., TOK_EQ ^ 1 = TOK_NE) */
     int cond = vtop->cmp_op ^ inv;
@@ -7998,6 +8001,7 @@ void tcc_ir_generate_cmp_jmp_set(TCCIRState *ir)
 
       /* Generate SETIF for the comparison part */
       src.vr = -1;
+      src.r = VT_CONST;
       src.c.i = vtop->cmp_op;
       tcc_ir_put(ir, TCCIR_OP_SETIF, &src, NULL, &dest);
 
@@ -8046,6 +8050,7 @@ void tcc_ir_generate_cmp_jmp_set(TCCIRState *ir)
     {
       /* Simple case - just SETIF */
       src.vr = -1;
+      src.r = VT_CONST;
       src.c.i = vtop->cmp_op;
       tcc_ir_put(ir, TCCIR_OP_SETIF, &src, NULL, &dest);
     }
