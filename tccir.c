@@ -7379,13 +7379,16 @@ void tcc_ir_generate_code(TCCIRState *ir)
        * skip the return value copy */
       const IRQuadCompact *ir_prev = (i > 0) ? &ir->compact_instructions[i - 1] : NULL;
       const SValue *ir_prev_dest = ir_prev ? tcc_ir_op_get_dest(ir, ir_prev) : NULL;
-      THGEN_DUMP("DEBUG codegen RETURNVALUE: i=%d src1.r=0x%x src1.vr=%d src1.c.i=%lld src1.pr0_reg=%d prev.op=%d "
+      fprintf(stderr, "DEBUG codegen RETURNVALUE: i=%d src1.r=0x%x src1.vr=%d src1.c.i=%lld src1.pr0_reg=%d prev.op=%d "
                  "prev.dest.vr=%d prev.dest.pr0_reg=%d\n",
                  i, cq->op, src1->vr, (long long)src1->c.i, src1->pr0_reg, ir_prev ? ir_prev->op : -1,
                  ir_prev_dest ? ir_prev_dest->vr : -2, ir_prev_dest ? ir_prev_dest->pr0_reg : -2);
+
+      /* Check if the previous instruction already placed the value in R0.
+       * Note: We must check ir_prev_dest->pr0_reg, not src1->pr0_reg, because the ASSIGN peephole
+       * may have redirected the destination to R0 after register allocation set src1->pr0_reg. */
       if (!has_incoming_jump[i] && ir_prev && (ir_prev->op == TCCIR_OP_LOAD || ir_prev->op == TCCIR_OP_ASSIGN) &&
-          ir_prev_dest->vr == src1->vr && ir_prev_dest->pr0_reg == REG_IRET /* R0 */ &&
-          src1->pr0_reg == REG_IRET /* src1 must also still be in R0 */)
+          ir_prev_dest->vr == src1->vr && ir_prev_dest->pr0_reg == REG_IRET /* R0 */)
       {
         THGEN_DUMP("DEBUG codegen RETURNVALUE: SKIP due to peephole\n");
         /* Value is already in R0, no need to generate return value op */

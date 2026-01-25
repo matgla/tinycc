@@ -375,6 +375,7 @@ uint32_t th_shift_value_to_sr_type(thumb_shift shift)
 thumb_opcode th_mov_reg(uint32_t rd, uint32_t rm, thumb_flags_behaviour flags, thumb_shift shift,
                         thumb_enforce_encoding encoding, bool in_it)
 {
+  fprintf(stderr, "THOP th_mov_reg: rd=%u rm=%u\n", rd, rm);
   if (shift.mode == THUMB_SHIFT_REGISTER && shift.type != THUMB_SHIFT_NONE)
   {
     return th_mov_reg_shift(rd, rm, shift.value, flags, shift, encoding);
@@ -383,6 +384,7 @@ thumb_opcode th_mov_reg(uint32_t rd, uint32_t rm, thumb_flags_behaviour flags, t
   if (flags != FLAGS_BEHAVIOUR_SET && encoding != ENFORCE_ENCODING_32BIT && shift.type == THUMB_SHIFT_NONE)
   {
     const uint16_t D = (rd >> 3) & 1;
+    fprintf(stderr, "THOP th_mov_reg T1: MOV R%u, R%u opcode=0x%04x\n", rd, rm, (0x4600 | (D << 7) | (rm << 3) | (rd & 0x7)));
     THOP_TRACE("mov %s, %s\n", th_reg_name(rd), th_reg_name(rm));
     return (thumb_opcode){
         .size = 2,
