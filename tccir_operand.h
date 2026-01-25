@@ -154,6 +154,71 @@ static inline int irop_is_immediate(const IROperand *op)
   return tag == IROP_TAG_IMM32 || tag == IROP_TAG_F32 || tag == IROP_TAG_I64 || tag == IROP_TAG_F64;
 }
 
+/* Get 64-bit integer value from operand (works for IMM32, I64, and STACKOFF)
+ * Requires ir state for pool lookup. Pass NULL to only handle inline values. */
+static inline int64_t irop_get_imm64_ex(const struct TCCIRState *ir, IROperand op)
+{
+  int tag = irop_get_tag(&op);
+  switch (tag)
+  {
+  case IROP_TAG_IMM32:
+  case IROP_TAG_STACKOFF:
+    /* Sign-extend 32-bit immediate to 64-bit */
+    return (int64_t)op.u.imm32;
+  case IROP_TAG_I64:
+    /* Look up in pool */
+    if (ir)
+    {
+      int64_t *p = tcc_ir_pool_get_i64_ptr(ir, op.u.pool_idx);
+      if (p)
+        return *p;
+    }
+    return 0;
+  case IROP_TAG_F32:
+    /* Treat float bits as unsigned 32-bit */
+    return (int64_t)(uint32_t)op.u.f32_bits;
+  case IROP_TAG_F64:
+    /* Look up in pool and return raw bits */
+    if (ir)
+    {
+      uint64_t *p = tcc_ir_pool_get_f64_ptr(ir, op.u.pool_idx);
+      if (p)
+        return (int64_t)*p;
+    }
+    return 0;
+  default:
+    return 0;
+  }
+}
+
+/* Get symbol from SYMREF operand. Requires ir state for pool lookup. */
+static inline struct Sym *irop_get_sym_ex(const struct TCCIRState *ir, IROperand op)
+{
+  if (irop_get_tag(&op) != IROP_TAG_SYMREF)
+    return NULL;
+  if (!ir)
+    return NULL;
+  IRPoolSymref *entry = tcc_ir_pool_get_symref_ptr(ir, op.u.pool_idx);
+  return entry ? entry->sym : NULL;
+}
+
+/* Get symref pool entry (includes symbol, addend, and flags) */
+static inline IRPoolSymref *irop_get_symref_ex(const struct TCCIRState *ir, IROperand op)
+{
+  if (irop_get_tag(&op) != IROP_TAG_SYMREF)
+    return NULL;
+  if (!ir)
+    return NULL;
+  return tcc_ir_pool_get_symref_ptr(ir, op.u.pool_idx);
+}
+
+/* Convenience macros that use tcc_state->ir (requires tcc.h to be included first) */
+#ifdef TCC_STATE_VAR
+#define irop_get_imm64(op) irop_get_imm64_ex(TCC_STATE_VAR(ir), op)
+#define irop_get_sym(op) irop_get_sym_ex(TCC_STATE_VAR(ir), op)
+#define irop_get_symref(op) irop_get_symref_ex(TCC_STATE_VAR(ir), op)
+#endif
+
 /* Extract clean vreg value (type + position, for IR passes) */
 static inline int32_t irop_get_vreg(const IROperand *op)
 {
@@ -425,6 +490,11 @@ void tcc_ir_pools_free(struct TCCIRState *ir);
 uint32_t tcc_ir_pool_add_i64(struct TCCIRState *ir, int64_t val);
 uint32_t tcc_ir_pool_add_f64(struct TCCIRState *ir, uint64_t bits);
 uint32_t tcc_ir_pool_add_symref(struct TCCIRState *ir, struct Sym *sym, int32_t addend, uint32_t flags);
+
+/* Pool read accessors (for inline helpers) */
+int64_t *tcc_ir_pool_get_i64_ptr(const struct TCCIRState *ir, uint32_t idx);
+uint64_t *tcc_ir_pool_get_f64_ptr(const struct TCCIRState *ir, uint32_t idx);
+IRPoolSymref *tcc_ir_pool_get_symref_ptr(const struct TCCIRState *ir, uint32_t idx);
 
 /* IROperand <-> SValue conversion functions */
 IROperand svalue_to_iroperand(struct TCCIRState *ir, const struct SValue *sv);

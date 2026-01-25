@@ -148,6 +148,28 @@ uint32_t tcc_ir_pool_add_symref(TCCIRState *ir, Sym *sym, int32_t addend, uint32
   return (uint32_t)ir->pool_symref_count++;
 }
 
+/* Pool read accessors */
+int64_t *tcc_ir_pool_get_i64_ptr(const TCCIRState *ir, uint32_t idx)
+{
+  if (!ir || idx >= (uint32_t)ir->pool_i64_count)
+    return NULL;
+  return &ir->pool_i64[idx];
+}
+
+uint64_t *tcc_ir_pool_get_f64_ptr(const TCCIRState *ir, uint32_t idx)
+{
+  if (!ir || idx >= (uint32_t)ir->pool_f64_count)
+    return NULL;
+  return &ir->pool_f64[idx];
+}
+
+IRPoolSymref *tcc_ir_pool_get_symref_ptr(const TCCIRState *ir, uint32_t idx)
+{
+  if (!ir || idx >= (uint32_t)ir->pool_symref_count)
+    return NULL;
+  return &ir->pool_symref[idx];
+}
+
 /* ============================================================================
  * IROperand <-> SValue conversion functions
  * ============================================================================
