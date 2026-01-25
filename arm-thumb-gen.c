@@ -199,6 +199,7 @@ static int scratch_push_count = 0;
 int is_valid_opcode(thumb_opcode op);
 int ot(thumb_opcode op);
 int ot_check(thumb_opcode op);
+static void load_to_register_ir(int reg, int reg_from, IROperand src);
 static void load_to_register(int reg, int reg_from, SValue *src);
 static void thumb_require_materialized_reg(const char *ctx, const char *operand, int reg);
 static void thumb_require_materialized_pair(const char *ctx, const char *operand, int lo, int hi);
@@ -1870,14 +1871,16 @@ static uint32_t th_store_resolve_base_ir(int src_reg, IROperand sv, int btype, i
   /* Global symbol lvalue: load the base address into a scratch reg */
   if (sv.is_lval && tag == IROP_TAG_SYMREF)
   {
-    Sym *sym = irop_get_sym(sv);
+    IRPoolSymref *symref = irop_get_symref_ex(tcc_state->ir, sv);
+    Sym *sym = symref ? symref->sym : NULL;
     Sym *validated_sym = sym ? validate_sym_for_reloc(sym) : NULL;
+    int32_t addend = symref ? symref->addend : 0;
 
     SValue v1;
     svalue_init(&v1);
     v1.type.t = irop_btype_to_vt_btype_for_load(btype, sv.is_unsigned);
     v1.r = VT_CONST | (validated_sym ? VT_SYM : 0);
-    v1.c.i = 0;
+    v1.c.i = addend;
     v1.sym = validated_sym;
     v1.pr0_reg = PREG_REG_NONE;
     v1.pr0_spilled = 0;
@@ -2025,12 +2028,15 @@ static void store_ex_ir(int r, IROperand sv, uint32_t extra_exclude)
         }
       }
     }
-    else if (btype == IROP_BTYPE_INT32 && !is_64bit)
+    else if (btype == IROP_BTYPE_INT16)
     {
-      /* Check for short/byte based on original type info - for now assume 32-bit */
-      TRACE("store: sign: %x, r: %x, base: %x, off: %x", sign, r, base, abs_off);
-      th_store32_imm_or_reg_ex(r, base, abs_off, sign, extra_exclude);
-      TRACE("done");
+      /* 16-bit short store */
+      th_store16_imm_or_reg(r, base, abs_off, sign);
+    }
+    else if (btype == IROP_BTYPE_INT8)
+    {
+      /* 8-bit byte store */
+      th_store8_imm_or_reg(r, base, abs_off, sign);
     }
     else if (is_64bit)
     {
@@ -2077,165 +2083,9 @@ static void store_ir(int r, IROperand sv)
 
 static void store_ex(int r, SValue *sv, uint32_t extra_exclude)
 {
-  int ft, fr;
-  TRACE("'store' reg: %d", r);
-
-  /* IR owns spills: backend store must never be asked to store from a spilled
-   * sentinel or a non-hardware register.
-   *
-   * For hard-float, `r` may be a VFP register (TREG_F0..TREG_F7). Otherwise it
-   * must be an integer HW register.
-   */
-  if (r == PREG_NONE)
-    tcc_error("compiler_error: store called with non-materialized source reg %d", r);
-  if (tcc_state->float_abi == ARM_HARD_FLOAT && r >= TREG_F0 && r <= TREG_F7)
-  {
-    /* ok: VFP source */
-  }
-  else
-  {
-    /* Must be an integer hardware register. */
-    thumb_require_materialized_reg("store", "src", r);
-  }
-
-  fr = sv->r;
-  ft = sv->type.t;
-
-  /* Handle register-to-register store (destination is a physical register, not memory).
-   * This happens when storing to a parameter that lives in a callee-saved register. */
-  if (!(fr & VT_LVAL) && fr != VT_LOCAL && sv->pr0_reg != PREG_REG_NONE && thumb_is_hw_reg(sv->pr0_reg))
-  {
-    int dest_reg = sv->pr0_reg;
-    thumb_require_materialized_reg("store", "dest", dest_reg);
-    if (dest_reg != r)
-    {
-      ot_check(
-          th_mov_reg(dest_reg, r, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
-    }
-    /* For 64-bit types, also move the high word */
-    int src_btype = ft & VT_BTYPE;
-    if ((src_btype == VT_DOUBLE || src_btype == VT_LDOUBLE || src_btype == VT_LLONG) && sv->pr1_reg != PREG_REG_NONE)
-    {
-      /* The caller should set sv->pr1 to the destination high register.
-       * Source high is assumed to be the next register (r+1) for 64-bit values. */
-      int dest_hi = sv->pr1_reg;
-      if (dest_hi != dest_reg)
-      {
-        int src_hi = r + 1;
-        if (!thumb_is_hw_reg(src_hi) || src_hi == R_SP || src_hi == R_PC)
-          tcc_error("compiler_error: cannot store 64-bit reg pair - invalid source high register %d", src_hi);
-        thumb_require_materialized_reg("store", "dest.high", dest_hi);
-        if (dest_hi != src_hi)
-        {
-          ot_check(th_mov_reg(dest_hi, src_hi, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                              ENFORCE_ENCODING_NONE, false));
-        }
-      }
-    }
-    return;
-  }
-
-  if (fr & VT_LVAL || fr == VT_LOCAL)
-  {
-    int abs_off, sign;
-    ScratchRegAlloc base_alloc = (ScratchRegAlloc){0};
-    int has_base_alloc = 0;
-    uint32_t base = th_store_resolve_base(r, sv, ft, &abs_off, &sign, &base_alloc, &has_base_alloc);
-
-    /* Check if source is VFP or integer register.
-     * Only use VFP instructions if hard float ABI is enabled.
-     */
-    if (is_float(ft))
-    {
-      if (tcc_state->float_abi == ARM_HARD_FLOAT && r >= TREG_F0 && r <= TREG_F7)
-      {
-        /* VFP source - use VSTR */
-        if ((ft & VT_BTYPE) != VT_FLOAT)
-          ot_check(th_vstr(base, r, !sign, 1, abs_off));
-        else
-          ot_check(th_vstr(base, r, !sign, 0, abs_off));
-      }
-      else
-      {
-        /* Soft-float (or integer-reg float values): use integer stores. */
-        if ((ft & VT_BTYPE) == VT_FLOAT)
-        {
-          th_store32_imm_or_reg_ex(r, base, abs_off, sign, extra_exclude);
-        }
-        else
-        {
-          /* Double precision - two 32-bit stores (low word first).
-           * IR owns spills: the caller must provide an explicit high-word
-           * register in sv->pr1; do not guess r+1.
-           */
-          int r_high = sv->pr1_reg;
-          if (r_high == PREG_NONE)
-          {
-            /* Legacy (non-IR) backend paths may still call store() with only
-             * the low register. In that case, assume a conventional register
-             * pair (low=r, high=r+1). */
-            if (thumb_is_hw_reg(r) && thumb_is_hw_reg(r + 1) && (r + 1) != R_SP && (r + 1) != R_PC)
-              r_high = r + 1;
-            else
-              tcc_error("compiler_error: cannot store double - missing source high register (sv->pr1_reg)");
-          }
-          thumb_require_materialized_reg("store", "src.high", r_high);
-          if (r_high == R_SP || r_high == R_PC)
-            tcc_error("compiler_error: cannot store double - invalid source high register %d", r_high);
-
-          /* High word is at +4 from low word. When sign=1 (negative offset),
-           * we need to decrease abs_off to get a higher address. */
-          int hi_abs_off = sign ? (abs_off - 4) : (abs_off + 4);
-          /* When storing the low word, exclude r_high from scratch allocation
-           * to prevent clobbering the high word value before it's stored. */
-          th_store32_imm_or_reg_ex(r, base, abs_off, sign, (1u << r_high));
-          th_store32_imm_or_reg(r_high, base, hi_abs_off, sign);
-        }
-      }
-    }
-    else if ((ft & VT_BTYPE) == VT_SHORT)
-    {
-      th_store16_imm_or_reg(r, base, abs_off, sign);
-    }
-    else if ((ft & VT_BTYPE) == VT_BYTE)
-    {
-      th_store8_imm_or_reg(r, base, abs_off, sign);
-    }
-    else if ((ft & VT_BTYPE) == VT_LLONG)
-    {
-      /* Long long - store both low and high words */
-      int r_high = sv->pr1_reg;
-      if (r_high == PREG_NONE)
-      {
-        /* Legacy (non-IR) backend paths may still call store() with only the
-         * low register. Assume the value is in a register pair (r, r+1). */
-        if (thumb_is_hw_reg(r) && thumb_is_hw_reg(r + 1) && (r + 1) != R_SP && (r + 1) != R_PC)
-          r_high = r + 1;
-        else
-          tcc_error("compiler_error: cannot store llong - missing source high register (sv->pr1_reg)");
-      }
-      thumb_require_materialized_reg("store", "src.high", r_high);
-      if (r_high == R_SP || r_high == R_PC)
-        tcc_error("compiler_error: cannot store llong - invalid source high register %d", r_high);
-
-      /* High word is at +4 from low word. When sign=1 (negative offset),
-       * we need to decrease abs_off to get a higher address. */
-      int hi_abs_off = sign ? (abs_off - 4) : (abs_off + 4);
-      /* When storing the low word, exclude r_high from scratch allocation
-       * to prevent clobbering the high word value before it's stored. */
-      th_store32_imm_or_reg_ex(r, base, abs_off, sign, (1u << r_high));
-      th_store32_imm_or_reg(r_high, base, hi_abs_off, sign);
-    }
-    else
-    {
-      TRACE("store: sign: %x, r: %x, base: %x, off: %x", sign, r, base, abs_off);
-      th_store32_imm_or_reg_ex(r, base, abs_off, sign, extra_exclude);
-      TRACE("done");
-    }
-
-    if (has_base_alloc)
-      restore_scratch_reg(&base_alloc);
-  }
+  /* Legacy wrapper: convert SValue to IROperand and delegate to store_ex_ir */
+  const IROperand sv_ir = svalue_to_iroperand(tcc_state->ir, sv);
+  store_ex_ir(r, sv_ir, extra_exclude);
 }
 
 static void load_vt_lval_vt_local_float(int r, SValue *sv, int ft, int fc, int sign, uint32_t base)
@@ -6578,24 +6428,26 @@ static int is_64bit_type(int t)
   return (bt == VT_DOUBLE || bt == VT_LDOUBLE || bt == VT_LLONG);
 }
 
-static void load_to_register(int reg, int reg_from, SValue *sv)
+/* IROperand version of load_to_register */
+static void load_to_register_ir(int reg, int reg_from, IROperand src)
 {
-  const char *ctx = "load_to_register";
+  const char *ctx = "load_to_register_ir";
 
-  if ((sv->r & VT_VALMASK) == VT_LOCAL)
+  /* VT_LOCAL case: check if we need the address or the value */
+  if (src.is_local)
   {
-    /* VT_LOCAL without VT_LVAL means we need the ADDRESS of the local variable.
-     * In this case we must compute FP + offset, not do a register move. */
-    if (!(sv->r & VT_LVAL))
+    /* Local without lval means we need the ADDRESS - use full load machinery */
+    if (!src.is_lval)
     {
-      int r1 = (sv->pr1_reg != PREG_REG_NONE && is_64bit_type(sv->type.t)) ? sv->pr1_reg : PREG_REG_NONE;
-      tcc_machine_load_to_reg(reg, r1, sv);
+      int r1 = (src.pr1_reg != PREG_REG_NONE && irop_is_64bit(&src)) ? src.pr1_reg : PREG_REG_NONE;
+      load_to_reg_ir(reg, r1, src);
       return;
     }
 
-    if (sv->pr0_reg != PREG_REG_NONE)
+    /* Local with lval: value is cached in register or needs reload */
+    if (src.pr0_reg != PREG_REG_NONE)
     {
-      int cached = (reg_from != PREG_NONE) ? reg_from : sv->pr0_reg;
+      int cached = (reg_from != PREG_NONE) ? reg_from : src.pr0_reg;
       thumb_require_materialized_reg(ctx, "cached local value", cached);
       if (reg != cached)
       {
@@ -6606,30 +6458,36 @@ static void load_to_register(int reg, int reg_from, SValue *sv)
     }
 
     /* Local spilled to stack - reload */
-    int r1 = (sv->pr1_reg != PREG_REG_NONE && is_64bit_type(sv->type.t)) ? sv->pr1_reg : PREG_REG_NONE;
-    tcc_machine_load_to_reg(reg, r1, sv);
+    int r1 = (src.pr1_reg != PREG_REG_NONE && irop_is_64bit(&src)) ? src.pr1_reg : PREG_REG_NONE;
+    load_to_reg_ir(reg, r1, src);
     return;
   }
 
-  if ((sv->r & VT_LVAL) || sv->pr0_reg == PREG_REG_NONE)
+  /* If it's an lval or not in a register, do a full load */
+  if (src.is_lval || src.pr0_reg == PREG_REG_NONE)
   {
-    int r1 = (sv->pr1_reg != PREG_REG_NONE && is_64bit_type(sv->type.t)) ? sv->pr1_reg : PREG_REG_NONE;
-    tcc_machine_load_to_reg(reg, r1, sv);
+    int r1 = (src.pr1_reg != PREG_REG_NONE && irop_is_64bit(&src)) ? src.pr1_reg : PREG_REG_NONE;
+    load_to_reg_ir(reg, r1, src);
     return;
   }
 
   /* Value is in a valid register - move it.
    * For 64-bit values, callers may request moving either the low or high word
-   * via 'reg_from'. Using sv->pr0 unconditionally breaks word selection and
-   * duplicates the low word into the high word (seen in 118_switch.c).
-   */
-  int src_reg = (reg_from != PREG_NONE) ? reg_from : sv->pr0_reg;
+   * via 'reg_from'. Using src.pr0 unconditionally breaks word selection. */
+  int src_reg = (reg_from != PREG_NONE) ? reg_from : src.pr0_reg;
   thumb_require_materialized_reg(ctx, "source register", src_reg);
   if (reg != src_reg)
   {
     ot_check(
         th_mov_reg(reg, src_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
   }
+}
+
+/* Legacy wrapper: convert SValue to IROperand */
+static void load_to_register(int reg, int reg_from, SValue *sv)
+{
+  const IROperand src_ir = svalue_to_iroperand(tcc_state->ir, sv);
+  load_to_register_ir(reg, reg_from, src_ir);
 }
 
 /* Returns true when a register value can be used directly as a source (not spilled, not lvalue).
