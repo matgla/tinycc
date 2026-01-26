@@ -7100,12 +7100,6 @@ void tcc_ir_generate_code(TCCIRState *ir)
     if (dest)
       tcc_ir_fill_registers(ir, dest);
 
-    /* Resync IROperand pool after fill_registers, since fill_registers may have
-     * modified the SValue (e.g., adding VT_PARAM for stack-passed parameters). */
-    tcc_ir_resync_operand(ir, i, 0); /* dest */
-    tcc_ir_resync_operand(ir, i, 1); /* src1 */
-    tcc_ir_resync_operand(ir, i, 2); /* src2 */
-
     bool need_src1_value = false;
     bool need_src2_value = false;
     bool need_dest_value = false;
@@ -7264,6 +7258,12 @@ void tcc_ir_generate_code(TCCIRState *ir)
       tcc_ir_materialize_const_to_reg(ir, src2, &mat_src2_reg);
     }
 
+    /* Resync IROperand pool after fill_registers, since fill_registers may have
+     * modified the SValue (e.g., adding VT_PARAM for stack-passed parameters). */
+    tcc_ir_resync_operand(ir, i, 0); /* dest */
+    tcc_ir_resync_operand(ir, i, 1); /* src1 */
+    tcc_ir_resync_operand(ir, i, 2); /* src2 */
+
     const IROperand dest_ir = svalue_to_iroperand(ir, dest);
     const IROperand src1_ir = svalue_to_iroperand(ir, src1);
     const IROperand src2_ir = svalue_to_iroperand(ir, src2);
@@ -7310,7 +7310,7 @@ void tcc_ir_generate_code(TCCIRState *ir)
       if (ir_next && ir_next->op == TCCIR_OP_RETURNVALUE)
       {
         IROperand next_src1_irop = tcc_ir_op_get_src1_irop(ir, ir_next);
-        ir_next_src1_vr = irop_get_vreg(&next_src1_irop);
+        ir_next_src1_vr = irop_get_vreg(next_src1_irop);
       }
       int is_64bit_load = tcc_ir_is_64bit_type(dest->type.t);
       if (ir_next && ir_next->op == TCCIR_OP_RETURNVALUE && ir_next_src1_vr == dest->vr && !has_incoming_jump[i + 1])
@@ -7352,7 +7352,7 @@ void tcc_ir_generate_code(TCCIRState *ir)
       if (has_incoming_jump[i] || !ir_prev || (ir_prev->op != TCCIR_OP_LOAD && ir_prev->op != TCCIR_OP_ASSIGN) ||
           ir_prev_dest->vr != src1->vr || ir_prev_dest->pr0_reg != REG_IRET)
       {
-        tcc_gen_machine_return_value_op(src1, cq->op);
+        tcc_gen_machine_return_value_op(src1_ir, cq->op);
       }
     }
     case TCCIR_OP_RETURNVOID:
@@ -7373,7 +7373,7 @@ void tcc_ir_generate_code(TCCIRState *ir)
       if (ir_next && ir_next->op == TCCIR_OP_RETURNVALUE)
       {
         IROperand next_src1_irop = tcc_ir_op_get_src1_irop(ir, ir_next);
-        ir_next_src1_vr = irop_get_vreg(&next_src1_irop);
+        ir_next_src1_vr = irop_get_vreg(next_src1_irop);
       }
       if (ir_next && ir_next->op == TCCIR_OP_RETURNVALUE && ir_next_src1_vr == dest->vr && !has_incoming_jump[i + 1])
       {
@@ -7385,16 +7385,20 @@ void tcc_ir_generate_code(TCCIRState *ir)
           dest->pr1_spilled = 0;
         }
       }
-      tcc_gen_machine_assign_op(src1, dest, cq->op);
+      /* Create fresh IROperands after peephole modifications */
+      IROperand assign_dest_ir = svalue_to_iroperand(ir, dest);
+      IROperand assign_src1_ir = svalue_to_iroperand(ir, src1);
+      tcc_gen_machine_assign_op(assign_dest_ir, assign_src1_ir, cq->op);
       break;
     }
     case TCCIR_OP_LEA:
       /* Load Effective Address: compute address of src1 into dest */
-      tcc_gen_machine_lea_op(src1, dest, cq->op);
+      tcc_gen_machine_lea_op(dest_ir, src1_ir, cq->op);
       break;
     case TCCIR_OP_FUNCPARAMVAL:
+    case TCCIR_OP_FUNCPARAMVOID:
     {
-      tcc_gen_machine_func_parameter_op(src1, src2, cq->op);
+      tcc_gen_machine_func_parameter_op(src1_ir, src2_ir, cq->op);
       break;
     }
     case TCCIR_OP_JUMP:
@@ -7422,10 +7426,7 @@ void tcc_ir_generate_code(TCCIRState *ir)
     case TCCIR_OP_BOOL_AND:
       tcc_gen_machine_bool_op(dest_ir, src1_ir, src2_ir, cq->op);
       break;
-    case TCCIR_OP_FUNCPARAMVOID:
-      /* Create call site for void calls (no parameters) */
-      tcc_gen_machine_func_parameter_op(src1, src2, cq->op);
-      break;
+
     case TCCIR_OP_VLA_ALLOC:
     case TCCIR_OP_VLA_SP_SAVE:
     case TCCIR_OP_VLA_SP_RESTORE:

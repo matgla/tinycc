@@ -149,44 +149,44 @@ int irop_compare_svalue(const struct TCCIRState *ir, const struct SValue *sv, IR
 #define IROP_POSITION_NONE 0x3FFFF
 
 /* Check if operand encodes a negative vreg (sentinel pattern) */
-static inline int irop_is_neg_vreg(const IROperand *op)
+static inline int irop_is_neg_vreg(const IROperand op)
 {
-  return op->vreg_type == 0xF && (op->position & 0x3FFF0) == IROP_NEG_VREG_SENTINEL;
+  return op.vreg_type == 0xF && (op.position & 0x3FFF0) == IROP_NEG_VREG_SENTINEL;
 }
 
 /* Check if operand has no associated vreg */
-static inline int irop_has_no_vreg(const IROperand *op)
+static inline int irop_has_no_vreg(const IROperand op)
 {
   /* Either negative vreg sentinel OR the old vr < 0 check for IROP_NONE */
-  return irop_is_neg_vreg(op) || (op->position == IROP_POSITION_NONE && op->vreg_type == 0);
+  return irop_is_neg_vreg(op) || (op.position == IROP_POSITION_NONE && op.vreg_type == 0);
 }
 
 /* Extract tag from operand (using bitfield) */
-static inline int irop_get_tag(const IROperand *op)
+static inline int irop_get_tag(const IROperand op)
 {
   /* For negative vregs (encoded with sentinel), tag is still valid in bitfield */
-  if (op->position == IROP_POSITION_NONE && op->vreg_type == 0)
+  if (op.position == IROP_POSITION_NONE && op.vreg_type == 0)
     return IROP_TAG_NONE;
-  return op->tag;
+  return op.tag;
 }
 
 /* Extract btype from operand (using bitfield) */
-static inline int irop_get_btype(const IROperand *op)
+static inline int irop_get_btype(const IROperand op)
 {
-  if (op->position == IROP_POSITION_NONE && op->vreg_type == 0)
+  if (op.position == IROP_POSITION_NONE && op.vreg_type == 0)
     return IROP_BTYPE_INT32; /* default */
-  return op->btype;
+  return op.btype;
 }
 
 /* Check if operand has a 64-bit type */
-static inline int irop_is_64bit(const IROperand *op)
+static inline int irop_is_64bit(const IROperand op)
 {
   int btype = irop_get_btype(op);
   return btype == IROP_BTYPE_INT64 || btype == IROP_BTYPE_FLOAT64;
 }
 
 /* Check if operand has an immediate value */
-static inline int irop_is_immediate(const IROperand *op)
+static inline int irop_is_immediate(const IROperand op)
 {
   int tag = irop_get_tag(op);
   return tag == IROP_TAG_IMM32 || tag == IROP_TAG_F32 || tag == IROP_TAG_I64 || tag == IROP_TAG_F64;
@@ -196,7 +196,7 @@ static inline int irop_is_immediate(const IROperand *op)
  * Requires ir state for pool lookup. Pass NULL to only handle inline values. */
 static inline int64_t irop_get_imm64_ex(const struct TCCIRState *ir, IROperand op)
 {
-  int tag = irop_get_tag(&op);
+  int tag = irop_get_tag(op);
   switch (tag)
   {
   case IROP_TAG_IMM32:
@@ -232,7 +232,7 @@ static inline int64_t irop_get_imm64_ex(const struct TCCIRState *ir, IROperand o
 /* Get symbol from SYMREF operand. Requires ir state for pool lookup. */
 static inline struct Sym *irop_get_sym_ex(const struct TCCIRState *ir, IROperand op)
 {
-  if (irop_get_tag(&op) != IROP_TAG_SYMREF)
+  if (irop_get_tag(op) != IROP_TAG_SYMREF)
     return NULL;
   if (!ir)
     return NULL;
@@ -243,7 +243,7 @@ static inline struct Sym *irop_get_sym_ex(const struct TCCIRState *ir, IROperand
 /* Get symref pool entry (includes symbol, addend, and flags) */
 static inline IRPoolSymref *irop_get_symref_ex(const struct TCCIRState *ir, IROperand op)
 {
-  if (irop_get_tag(&op) != IROP_TAG_SYMREF)
+  if (irop_get_tag(op) != IROP_TAG_SYMREF)
     return NULL;
   if (!ir)
     return NULL;
@@ -258,20 +258,20 @@ static inline IRPoolSymref *irop_get_symref_ex(const struct TCCIRState *ir, IROp
 #endif
 
 /* Extract clean vreg value (type + position, for IR passes) */
-static inline int32_t irop_get_vreg(const IROperand *op)
+static inline int32_t irop_get_vreg(const IROperand op)
 {
   /* Check for negative vreg sentinel: vreg_type=0xF and position bits 4-17 all set */
-  if (op->vreg_type == 0xF && (op->position & 0x3FFF0) == IROP_NEG_VREG_SENTINEL)
+  if (op.vreg_type == 0xF && (op.position & 0x3FFF0) == IROP_NEG_VREG_SENTINEL)
   {
     /* Decode negative vreg: idx 0 -> -1, idx 1 -> -2, etc. */
-    int neg_idx = op->position & 0xF;
+    int neg_idx = op.position & 0xF;
     return -(neg_idx + 1);
   }
   /* Position == max sentinel with vreg_type 0 means no vreg (-1) */
-  if (op->position == IROP_POSITION_NONE && op->vreg_type == 0)
+  if (op.position == IROP_POSITION_NONE && op.vreg_type == 0)
     return -1;
   /* Reconstruct vreg: type in bits 28-31, position in bits 0-17 */
-  return (op->vreg_type << 28) | op->position;
+  return (op.vreg_type << 28) | op.position;
 }
 
 /* Sentinel for "no operand" */
@@ -452,13 +452,13 @@ static inline IROperand irop_make_symref(int32_t vreg, uint32_t pool_idx, int is
 }
 
 /* Decoding helpers */
-static inline int irop_is_none(const IROperand *op)
+static inline int irop_is_none(const IROperand op)
 {
   /* Check for IROP_NONE: position=max, vreg_type=0, or tag=NONE */
-  return (op->position == IROP_POSITION_NONE && op->vreg_type == 0) || irop_get_tag(op) == IROP_TAG_NONE;
+  return (op.position == IROP_POSITION_NONE && op.vreg_type == 0) || irop_get_tag(op) == IROP_TAG_NONE;
 }
 
-static inline int irop_has_vreg(const IROperand *op)
+static inline int irop_has_vreg(const IROperand op)
 {
   /* Has vreg if not IROP_NONE and not the negative vreg sentinel returning -1 specifically for "no vreg" */
   int vreg = irop_get_vreg(op);
@@ -466,45 +466,45 @@ static inline int irop_has_vreg(const IROperand *op)
 }
 
 /* Get immediate value (for IMM32 or STACKOFF tags) */
-static inline int32_t irop_get_imm32(const IROperand *op)
+static inline int32_t irop_get_imm32(const IROperand op)
 {
-  return op->u.imm32;
+  return op.u.imm32;
 }
 
 /* Get pool index (for I64, F64, SYMREF tags) */
-static inline uint32_t irop_get_pool_idx(const IROperand *op)
+static inline uint32_t irop_get_pool_idx(const IROperand op)
 {
-  return op->u.pool_idx;
+  return op.u.pool_idx;
 }
 
 /* Check if operand is an lvalue (needs dereference) - uses bitfield */
-static inline int irop_op_is_lval(const IROperand *op)
+static inline int irop_op_is_lval(const IROperand op)
 {
-  if (op->vr < 0)
+  if (op.vr < 0)
     return 0;
-  return op->is_lval;
+  return op.is_lval;
 }
 
 /* Check if operand has VT_LOCAL semantics - uses bitfield */
-static inline int irop_op_is_local(const IROperand *op)
+static inline int irop_op_is_local(const IROperand op)
 {
-  if (op->vr < 0)
+  if (op.vr < 0)
     return 0;
-  return op->is_local;
+  return op.is_local;
 }
 
 /* Check if operand has VT_LLOCAL semantics (double indirection) - uses bitfield */
-static inline int irop_op_is_llocal(const IROperand *op)
+static inline int irop_op_is_llocal(const IROperand op)
 {
-  if (op->vr < 0)
+  if (op.vr < 0)
     return 0;
-  return op->is_llocal;
+  return op.is_llocal;
 }
 
 /* Check if operand is constant - uses bitfield */
-static inline int irop_op_is_const(const IROperand *op)
+static inline int irop_op_is_const(const IROperand op)
 {
-  if (op->vr < 0)
+  if (op.vr < 0)
     return 0;
-  return op->is_const;
+  return op.is_const;
 }

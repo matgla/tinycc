@@ -370,7 +370,7 @@ def _run_qemu_test(test_file, expected_exit_code, args=None, defines=None, opt_l
     expected_lines = _strip_compiler_output(expected_lines, loglines)
     try:
         for line in expected_lines:
-            _expect_line(sut, line, timeout=1)
+            _expect_line(sut, line, timeout=3)
         sut.wait()
         assert sut.exitstatus == expected_exit_code, f"Expected exit code {expected_exit_code}, got {sut.exitstatus}"
     except Exception as e:

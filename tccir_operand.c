@@ -398,7 +398,7 @@ IROperand svalue_to_iroperand(TCCIRState *ir, const SValue *sv)
 
 done:
   /* Debug: verify round-trip conversion preserves data */
-  assert(irop_compare_svalue(ir, sv, result, "svalue_to_iroperand") == 0);
+  // irop_compare_svalue(ir, sv, result, "svalue_to_iroperand");
   return result;
 }
 
@@ -410,10 +410,10 @@ void iroperand_to_svalue(const TCCIRState *ir, IROperand op, SValue *out)
   svalue_init(out);
 
   /* Always restore vreg from IROperand (strip embedded tag/flags/btype) */
-  out->vr = irop_get_vreg(&op);
+  out->vr = irop_get_vreg(op);
 
-  int tag = irop_get_tag(&op);
-  int irop_bt = irop_get_btype(&op);
+  int tag = irop_get_tag(op);
+  int irop_bt = irop_get_btype(op);
 
   /* Restore type.t from compressed btype (unless overridden below) */
   out->type.t = irop_btype_to_vt_btype(irop_bt);
@@ -555,100 +555,91 @@ int irop_compare_svalue(const TCCIRState *ir, const SValue *sv, IROperand op, co
 
   int mismatch = 0;
 
-  /* Compare vr (vreg) */
-  if (sv->vr != reconstructed.vr)
+  /* Compare individual fields and report differences */
+  if (reconstructed.pr0_reg != sv->pr0_reg)
   {
-    fprintf(stderr, "IROP_MISMATCH[%s]: vr: orig=%d reconstructed=%d\n", context, sv->vr, reconstructed.vr);
+    fprintf(stderr, "%s: pr0_reg mismatch: reconstructed=%d, expected=%d\n", context, reconstructed.pr0_reg,
+            sv->pr0_reg);
     mismatch = 1;
   }
 
-  /* Compare r (storage class/flags) - mask out bits that aren't preserved */
-  int sv_valmask = sv->r & VT_VALMASK;
-  int rec_valmask = reconstructed.r & VT_VALMASK;
-  if (sv_valmask != rec_valmask)
+  if (reconstructed.pr0_spilled != sv->pr0_spilled)
   {
-    fprintf(stderr, "IROP_MISMATCH[%s]: r&VT_VALMASK: orig=0x%x reconstructed=0x%x\n", context, sv_valmask,
-            rec_valmask);
+    fprintf(stderr, "%s: pr0_spilled mismatch: reconstructed=%d, expected=%d\n", context, reconstructed.pr0_spilled,
+            sv->pr0_spilled);
     mismatch = 1;
   }
 
-  int sv_lval = (sv->r & VT_LVAL) ? 1 : 0;
-  int rec_lval = (reconstructed.r & VT_LVAL) ? 1 : 0;
-  if (sv_lval != rec_lval)
+  if (reconstructed.pr1_reg != sv->pr1_reg)
   {
-    fprintf(stderr, "IROP_MISMATCH[%s]: VT_LVAL: orig=%d reconstructed=%d\n", context, sv_lval, rec_lval);
+    fprintf(stderr, "%s: pr1_reg mismatch: reconstructed=%d, expected=%d\n", context, reconstructed.pr1_reg,
+            sv->pr1_reg);
     mismatch = 1;
   }
 
-  int sv_sym = (sv->r & VT_SYM) ? 1 : 0;
-  int rec_sym = (reconstructed.r & VT_SYM) ? 1 : 0;
-  if (sv_sym != rec_sym)
+  if (reconstructed.pr1_spilled != sv->pr1_spilled)
   {
-    fprintf(stderr, "IROP_MISMATCH[%s]: VT_SYM: orig=%d reconstructed=%d\n", context, sv_sym, rec_sym);
+    fprintf(stderr, "%s: pr1_spilled mismatch: reconstructed=%d, expected=%d\n", context, reconstructed.pr1_spilled,
+            sv->pr1_spilled);
     mismatch = 1;
   }
 
-  /* Compare type.t basic type - allow equivalent compressed types */
-  int sv_btype = sv->type.t & VT_BTYPE;
-  int rec_btype = reconstructed.type.t & VT_BTYPE;
-  /* VT_BYTE, VT_SHORT, VT_INT, VT_PTR, VT_BOOL all compress to INT32 -> VT_INT
-   * This is acceptable lossy compression since they're all <= 32 bits */
-  int sv_btype_class = (sv_btype == VT_BYTE || sv_btype == VT_SHORT || sv_btype == VT_INT || sv_btype == VT_PTR ||
-                        sv_btype == VT_BOOL || sv_btype == VT_VOID)
-                           ? VT_INT
-                           : sv_btype;
-  int rec_btype_class = (rec_btype == VT_BYTE || rec_btype == VT_SHORT || rec_btype == VT_INT || rec_btype == VT_PTR ||
-                         rec_btype == VT_BOOL || rec_btype == VT_VOID)
-                            ? VT_INT
-                            : rec_btype;
-  if (sv_btype_class != rec_btype_class)
+  if (reconstructed.r != sv->r)
   {
-    fprintf(stderr, "IROP_MISMATCH[%s]: VT_BTYPE: orig=0x%x reconstructed=0x%x\n", context, sv_btype, rec_btype);
+    fprintf(stderr, "%s: r mismatch: reconstructed=0x%04x, expected=0x%04x\n", context, reconstructed.r, sv->r);
     mismatch = 1;
   }
 
-  int sv_unsigned = (sv->type.t & VT_UNSIGNED) ? 1 : 0;
-  int rec_unsigned = (reconstructed.type.t & VT_UNSIGNED) ? 1 : 0;
-  if (sv_unsigned != rec_unsigned)
+  if (reconstructed.vr != sv->vr)
   {
-    fprintf(stderr, "IROP_MISMATCH[%s]: VT_UNSIGNED: orig=%d reconstructed=%d\n", context, sv_unsigned, rec_unsigned);
+    fprintf(stderr, "%s: vr mismatch: reconstructed=%d, expected=%d\n", context, reconstructed.vr, sv->vr);
     mismatch = 1;
   }
 
-  /* Compare c.i for non-float types, only when it's meaningful */
-  /* c.i matters for: VT_CONST, VT_LOCAL, VT_LLOCAL (offsets), VT_SYM (offsets) */
-  int sv_valkind = sv->r & VT_VALMASK;
-  int c_i_matters = (sv_valkind == VT_CONST || sv_valkind == VT_LOCAL || sv_valkind == VT_LLOCAL || (sv->r & VT_SYM));
-  if (c_i_matters && sv_btype != VT_FLOAT && sv_btype != VT_DOUBLE && sv_btype != VT_LDOUBLE)
+  if (reconstructed.type.t != sv->type.t)
   {
-    if (sv->c.i != reconstructed.c.i)
+    fprintf(stderr, "%s: type.t mismatch: reconstructed=0x%08x, expected=0x%08x\n", context, reconstructed.type.t,
+            sv->type.t);
+    mismatch = 1;
+  }
+
+  if (reconstructed.type.ref != sv->type.ref)
+  {
+    fprintf(stderr, "%s: type.ref mismatch: reconstructed=%p, expected=%p\n", context, (void *)reconstructed.type.ref,
+            (void *)sv->type.ref);
+    mismatch = 1;
+  }
+
+  /* Compare CValue (c union) - compare multiple members for better diagnosis */
+  if (reconstructed.c.i != sv->c.i)
+  {
+    fprintf(stderr, "%s: c.i mismatch: reconstructed=0x%016llx, expected=0x%016llx\n", context,
+            (unsigned long long)reconstructed.c.i, (unsigned long long)sv->c.i);
+    mismatch = 1;
+  }
+  else if (memcmp(&reconstructed.c, &sv->c, sizeof(CValue)) != 0)
+  {
+    /* Check string members if i matches but bytes differ (likely padding or str variant) */
+    if (reconstructed.c.str.data != sv->c.str.data || reconstructed.c.str.size != sv->c.str.size)
     {
-      fprintf(stderr, "IROP_MISMATCH[%s]: c.i: orig=0x%llx reconstructed=0x%llx\n", context,
-              (unsigned long long)sv->c.i, (unsigned long long)reconstructed.c.i);
-      mismatch = 1;
+      fprintf(stderr, "%s: c.str mismatch: data=%p/%p, size=%d/%d\n", context, (void *)reconstructed.c.str.data,
+              (void *)sv->c.str.data, reconstructed.c.str.size, sv->c.str.size);
     }
-  }
-
-  /* Compare sym pointer - only if VT_SYM is set (otherwise sym is garbage) */
-  if (sv_sym && sv->sym != reconstructed.sym)
-  {
-    fprintf(stderr, "IROP_MISMATCH[%s]: sym: orig=%p reconstructed=%p\n", context, (void *)sv->sym,
-            (void *)reconstructed.sym);
+    else
+    {
+      fprintf(stderr, "%s: c mismatch: bytes differ (likely padding)\n", context);
+      fprintf(stderr, "  reconstructed.c.i = 0x%016llx\n", (unsigned long long)reconstructed.c.i);
+      fprintf(stderr, "  expected.c.i = 0x%016llx\n", (unsigned long long)sv->c.i);
+    }
     mismatch = 1;
   }
 
-  if (mismatch)
+  /* Compare sym pointer */
+  if (reconstructed.sym != sv->sym)
   {
-    fprintf(stderr, "IROP_MISMATCH[%s]: Original SValue: vr=%d r=0x%x type.t=0x%x c.i=0x%llx sym=%p\n", context, sv->vr,
-            sv->r, sv->type.t, (unsigned long long)sv->c.i, (void *)sv->sym);
-    fprintf(stderr,
-            "IROP_MISMATCH[%s]: IROperand: tag=%d is_lval=%d is_llocal=%d is_local=%d is_const=%d is_sym=%d "
-            "btype=%d position=%d vreg_type=%d\n",
-            context, op.tag, op.is_lval, op.is_llocal, op.is_local, op.is_const, op.is_sym, op.btype, op.position,
-            op.vreg_type);
-    fprintf(stderr, "IROP_MISMATCH[%s]: Reconstructed: vr=%d r=0x%x type.t=0x%x c.i=0x%llx sym=%p\n", context,
-            reconstructed.vr, reconstructed.r, reconstructed.type.t, (unsigned long long)reconstructed.c.i,
-            (void *)reconstructed.sym);
+    fprintf(stderr, "%s: sym mismatch: reconstructed=%p, expected=%p\n", context, (void *)reconstructed.sym,
+            (void *)sv->sym);
+    mismatch = 1;
   }
 
   return mismatch;

@@ -1908,15 +1908,13 @@ ST_FUNC void tcc_gen_machine_data_processing_op(SValue *src1, SValue *src2, SVal
 ST_FUNC void tcc_gen_machine_fp_op(SValue *src1, SValue *src2, SValue *dest, TccIrOp op);
 ST_FUNC void tcc_gen_machine_load_op(SValue *src1, SValue *dest, TccIrOp op);
 ST_FUNC void tcc_gen_machine_store_op(SValue *src, SValue *dest, TccIrOp op);
-ST_FUNC void tcc_gen_machine_load_register(SValue *value);
-ST_FUNC void tcc_gen_machine_store_register(SValue *value);
 ST_FUNC void tcc_gen_machine_store_to_stack(int reg, int offset);
 ST_FUNC void tcc_gen_machine_store_to_sp(int reg, int offset);
 
-ST_FUNC void tcc_gen_machine_assign_op(SValue *src1, SValue *dest, TccIrOp op);
-ST_FUNC void tcc_gen_machine_lea_op(SValue *src1, SValue *dest, TccIrOp op);
+ST_FUNC void tcc_gen_machine_assign_op(IROperand dest, IROperand src, TccIrOp op);
+ST_FUNC void tcc_gen_machine_lea_op(IROperand dest, IROperand src, TccIrOp op);
 ST_FUNC int tcc_gen_machine_number_of_registers(void);
-ST_FUNC void tcc_gen_machine_return_value_op(SValue *src1, TccIrOp op);
+ST_FUNC void tcc_gen_machine_return_value_op(IROperand src, TccIrOp op);
 ST_FUNC void tcc_gen_machine_epilog(int leaffunc);
 ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int stack_size);
 ST_FUNC void tcc_gen_machine_func_call_op(SValue *func_target, SValue *call_id_sv, SValue *dest, int drop_value,
@@ -1931,7 +1929,7 @@ ST_FUNC void tcc_gen_machine_setif_op(IROperand dest, IROperand src, TccIrOp op)
 ST_FUNC void tcc_gen_machine_bool_op(IROperand dest, IROperand src1, IROperand src2, TccIrOp op);
 ST_FUNC void tcc_gen_machine_backpatch_jump(int address, int offset);
 ST_FUNC void tcc_gen_machine_end_instruction(void);
-ST_FUNC void tcc_gen_machine_func_parameter_op(SValue *src1, SValue *src2, TccIrOp op);
+ST_FUNC void tcc_gen_machine_func_parameter_op(IROperand src1, IROperand src2, TccIrOp op);
 
 /* VLA / dynamic stack operations */
 ST_FUNC void tcc_gen_machine_vla_op(SValue *src1, SValue *src2, SValue *dest, TccIrOp op);

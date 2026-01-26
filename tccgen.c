@@ -2518,6 +2518,7 @@ static void gen_opl(int op)
       const int call_id = tcc_state->ir ? tcc_state->ir->next_call_id++ : 0;
       svalue_init(&param_num);
       param_num.vr = -1;
+      param_num.r = VT_CONST;
       /* Generate FUNCPARAMVAL for arg1 (param 0) */
       param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
       tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &param_num, NULL);
@@ -2762,6 +2763,7 @@ static void gen_opl(int op)
         svalue_init(&param_num);
         param_num.vr = -1;
         /* Generate FUNCPARAMVAL for arg1 (param 0) */
+        param_num.r = VT_CONST;
         param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
         tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &param_num, NULL);
         /* Generate FUNCPARAMVAL for arg2 (param 1) */
@@ -4553,6 +4555,7 @@ ST_FUNC void vstore(void)
         svalue_init(&param_num);
         param_num.vr = -1;
 
+        param_num.r = VT_CONST;
         /* memmove(dest, src, size) */
         param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
         tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-3], &param_num, NULL);
@@ -7439,6 +7442,7 @@ tok_next:
               SValue num;
               svalue_init(&num);
               num.vr = -1;
+              num.r = VT_CONST;
               num.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
               tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL);
             }
@@ -7486,6 +7490,7 @@ tok_next:
             gfunc_param_typed(s, sa);
             if (!NOEVAL_WANTED)
             {
+              num.r = VT_CONST;
               num.c.i = TCCIR_ENCODE_PARAM(call_id, nb_args);
               tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL);
             }
@@ -7523,6 +7528,7 @@ tok_next:
             SValue num;
             svalue_init(&num);
             num.vr = -1;
+            num.r = VT_CONST;
             num.c.i = TCCIR_ENCODE_PARAM(call_id, nb_args - 1 - n);
             tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL);
           }
@@ -8514,6 +8520,7 @@ static void try_call_scope_cleanup(Sym *stop)
     const int call_id = tcc_state->ir ? tcc_state->ir->next_call_id++ : 0;
     svalue_init(&src1);
     src1.vr = -1;
+    src1.r = VT_CONST;
     src1.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
     tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &src1, NULL);
     SValue call_id_sv = tcc_ir_svalue_call_id_argc(call_id, 1);
@@ -9320,6 +9327,7 @@ static void init_putz(init_params *p, unsigned long c, int size)
     /* __aeabi_memset(dest, n, c) on ARM EABI; memset(dest, c, n) elsewhere.
      * TOK_memset maps to __aeabi_memset when TCC_ARM_EABI is defined.
      * Stack is: dest, c, n */
+    src1.r = VT_CONST;
     src1.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
     tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-2], &src1, NULL);
     src1.c.i = TCCIR_ENCODE_PARAM(call_id, 2);

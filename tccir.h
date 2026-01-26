@@ -119,16 +119,18 @@ typedef enum TccIrOp : uint8_t
  * src2.c.i encodes both parameter index (lower 16 bits) and call_id (upper 16 bits)
  * This keeps call/param binding explicit and makes the IR more compact.
  */
-#define TCCIR_ENCODE_PARAM(call_id, param_idx) (((int64_t)(call_id) << 16) | ((param_idx) & 0xFFFF))
-#define TCCIR_DECODE_CALL_ID(encoded) ((int)((encoded) >> 16))
-#define TCCIR_DECODE_PARAM_IDX(encoded) ((int)((encoded) & 0xFFFF))
+#define TCCIR_ENCODE_PARAM(call_id, param_idx)                                                                         \
+  ((int64_t)(int32_t)(((uint32_t)(call_id) << 16) | ((uint32_t)(param_idx) & 0xFFFFu)))
+#define TCCIR_DECODE_CALL_ID(encoded) ((int)(((uint32_t)(encoded)) >> 16))
+#define TCCIR_DECODE_PARAM_IDX(encoded) ((int)(((uint32_t)(encoded)) & 0xFFFF))
 
 /* FUNCCALL encoding helpers:
  * For FUNCCALLVOID/FUNCCALLVAL, src2.c.i encodes call_id (bits 16-31) and argc (bits 0-15).
  * This allows the backend to know how many arguments to expect without scanning.
  */
-#define TCCIR_ENCODE_CALL(call_id, argc) (((int64_t)(call_id) << 16) | ((argc) & 0xFFFF))
-#define TCCIR_DECODE_CALL_ARGC(encoded) ((int)((encoded) & 0xFFFF))
+#define TCCIR_ENCODE_CALL(call_id, argc)                                                                               \
+  ((int64_t)(int32_t)(((uint32_t)(call_id) << 16) | ((uint32_t)(argc) & 0xFFFFu)))
+#define TCCIR_DECODE_CALL_ARGC(encoded) ((int)(((uint32_t)(encoded)) & 0xFFFF))
 
 typedef struct CType CType;
 typedef struct SValue SValue;
