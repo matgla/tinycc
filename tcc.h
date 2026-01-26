@@ -1905,9 +1905,9 @@ ST_FUNC void tcc_machine_load_cmp_result(int dest_reg, int condition_code);
 ST_FUNC void tcc_machine_load_jmp_result(int dest_reg, int jmp_addr, int invert);
 
 ST_FUNC void tcc_gen_machine_data_processing_op(SValue *src1, SValue *src2, SValue *dest, TccIrOp op);
-ST_FUNC void tcc_gen_machine_fp_op(SValue *src1, SValue *src2, SValue *dest, TccIrOp op);
-ST_FUNC void tcc_gen_machine_load_op(SValue *src1, SValue *dest, TccIrOp op);
-ST_FUNC void tcc_gen_machine_store_op(SValue *src, SValue *dest, TccIrOp op);
+ST_FUNC void tcc_gen_machine_fp_op(IROperand dest, IROperand src1, IROperand src2, TccIrOp op);
+ST_FUNC void tcc_gen_machine_load_op(IROperand dest, IROperand src);
+ST_FUNC void tcc_gen_machine_store_op(IROperand dest, IROperand src, TccIrOp op);
 ST_FUNC void tcc_gen_machine_store_to_stack(int reg, int offset);
 ST_FUNC void tcc_gen_machine_store_to_sp(int reg, int offset);
 
@@ -1932,7 +1932,7 @@ ST_FUNC void tcc_gen_machine_end_instruction(void);
 ST_FUNC void tcc_gen_machine_func_parameter_op(IROperand src1, IROperand src2, TccIrOp op);
 
 /* VLA / dynamic stack operations */
-ST_FUNC void tcc_gen_machine_vla_op(SValue *src1, SValue *src2, SValue *dest, TccIrOp op);
+ST_FUNC void tcc_gen_machine_vla_op(IROperand dest, IROperand src1, IROperand src2, TccIrOp op);
 
 ST_FUNC const char *tcc_get_abi_softcall_name(SValue *src1, SValue *src2, SValue *dest, TccIrOp op);
 

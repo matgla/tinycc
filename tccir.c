@@ -7299,7 +7299,7 @@ void tcc_ir_generate_code(TCCIRState *ir)
     case TCCIR_OP_CVT_FTOF:
     case TCCIR_OP_CVT_ITOF:
     case TCCIR_OP_CVT_FTOI:
-      tcc_gen_machine_fp_op(src1, src2, dest, cq->op);
+      tcc_gen_machine_fp_op(dest_ir, src1_ir, src2_ir, cq->op);
       break;
     case TCCIR_OP_LOAD:
     {
@@ -7333,11 +7333,13 @@ void tcc_ir_generate_code(TCCIRState *ir)
             interval->allocation.r1 = REG_IRE2;
         }
       }
-      tcc_gen_machine_load_op(src1, dest, cq->op);
+      const IROperand load_dest_ir = svalue_to_iroperand(ir, dest);
+      const IROperand load_src1_ir = svalue_to_iroperand(ir, src1);
+      tcc_gen_machine_load_op(load_dest_ir, load_src1_ir);
       break;
     }
     case TCCIR_OP_STORE:
-      tcc_gen_machine_store_op(src1, dest, cq->op);
+      tcc_gen_machine_store_op(dest_ir, src1_ir, cq->op);
       break;
     case TCCIR_OP_RETURNVALUE:
     {
@@ -7430,7 +7432,7 @@ void tcc_ir_generate_code(TCCIRState *ir)
     case TCCIR_OP_VLA_ALLOC:
     case TCCIR_OP_VLA_SP_SAVE:
     case TCCIR_OP_VLA_SP_RESTORE:
-      tcc_gen_machine_vla_op(src1, src2, dest, cq->op);
+      tcc_gen_machine_vla_op(dest_ir, src1_ir, src2_ir, cq->op);
       break;
     case TCCIR_OP_FUNCCALLVOID:
       drop_return_value = 1;
