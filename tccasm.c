@@ -779,7 +779,7 @@ static void asm_parse_directive(TCCState *s1, int global)
     while (repeat-- > 0)
     {
       tcc_assemble_internal(s1, (parse_flags & PARSE_FLAG_PREPROCESS), global);
-      macro_ptr = init_str->str;
+      macro_ptr = tok_str_buf(init_str);
     }
     end_macro();
     next();
@@ -1328,7 +1328,7 @@ static int tcc_assemble_internal(TCCState *s1, int do_preprocess, int global)
 
           /* build expanded token string with argument substitution */
           expanded = tok_str_alloc();
-          body_ptr = m->body->str;
+          body_ptr = tok_str_buf(m->body);
           for (;;)
           {
             t = *body_ptr++;
@@ -1346,7 +1346,7 @@ static int tcc_assemble_internal(TCCState *s1, int do_preprocess, int global)
               if (t == m->args[i])
               {
                 /* substitute with argument tokens */
-                const int *arg_ptr = arg_strs[i]->str;
+                const int *arg_ptr = tok_str_buf(arg_strs[i]);
                 int at;
                 while ((at = *arg_ptr++) != TOK_EOF)
                 {

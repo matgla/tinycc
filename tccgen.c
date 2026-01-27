@@ -220,6 +220,7 @@ static int gjmp_acs(int t)
   SValue dest;
   svalue_init(&dest);
   dest.vr = -1;
+  dest.r = VT_CONST; /* Mark as constant so jump target is stored in u.imm32 */
   dest.c.i = t;
   t = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
 
@@ -2231,10 +2232,12 @@ ST_FUNC void lexpand(void)
       /* If coalescing happened, update full.vr to match the coalesced instruction's dest */
       if (assign_pos < tcc_state->ir->next_instruction_index)
       {
-        SValue *dest = tcc_ir_get_dest(tcc_state->ir, assign_pos);
-        full.vr = dest->vr;
+        IROperand dest = tcc_ir_get_dest(tcc_state->ir, assign_pos);
+        full.vr = irop_get_vreg(dest);
         /* Also update full.type to match the coalesced instruction's dest type! */
-        full.type.t = dest->type.t;
+        full.type.t = irop_btype_to_vt_btype(irop_get_btype(dest));
+        if (dest.is_unsigned)
+          full.type.t |= VT_UNSIGNED;
       }
 
       /* Create explicit low32 = (uint32_t)full. */
@@ -5966,6 +5969,7 @@ static int post_type(CType *type, AttributeDef *ad, int storage, int td)
   CType pt;
   TokenString *vla_array_tok = NULL;
   int *vla_array_str = NULL;
+  int vla_array_str_on_heap = 0;  /* 1 if vla_array_str is heap-allocated, 0 if inline */
 
   if (tok == '(')
   {
@@ -6102,7 +6106,8 @@ static int post_type(CType *type, AttributeDef *ad, int storage, int td)
           nocode_wanted = 1;
           skip_or_save_block(&vla_array_tok);
           unget_tok(0);
-          vla_array_str = vla_array_tok->str;
+          vla_array_str = tok_str_buf(vla_array_tok);
+          vla_array_str_on_heap = vla_array_tok->allocated_len > 0;
           begin_macro(vla_array_tok, 2);
           next();
           gexpr();
@@ -6186,8 +6191,9 @@ static int post_type(CType *type, AttributeDef *ad, int storage, int td)
       /* for function args, the top dimension is converted to pointer */
       if ((t1 & VT_VLA) && (td & TYPE_NEST))
         s->vla_array_str = vla_array_str;
-      else
+      else if (vla_array_str_on_heap)
         tok_str_free_str(vla_array_str);
+      /* else: inline buffer, will be freed with TokenString struct */
     }
   }
   return 1;
@@ -8432,6 +8438,7 @@ static int gcase(struct case_t **base, int len, int dsym)
   // return gjmp(dsym);
   svalue_init(&dest);
   dest.vr = -1;
+  dest.r = VT_CONST; /* Mark as constant so jump target is stored in u.imm32 */
   dest.c.i = dsym;
   return tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
 }
@@ -8697,7 +8704,8 @@ again:
       SValue dest;
       svalue_init(&dest);
       dest.vr = -1;
-      dest.c.i = -1; /* Will be patched to end of else block */
+      dest.r = VT_CONST; /* Mark as constant so jump target is stored in u.imm32 */
+      dest.c.i = -1;     /* Will be patched to end of else block */
       d = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
       tcc_ir_backpatch_to_here(tcc_state->ir, a);
       CODE_ON(); /* Code after if-branch is reachable via else path */
@@ -8728,6 +8736,7 @@ again:
     // gjmp_addr(d);
     svalue_init(&dest);
     dest.vr = -1;
+    dest.r = VT_CONST; /* Mark as constant so jump target is stored in u.imm32 */
     dest.c.i = d;
     d = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
     // gsym_addr(b, d);
@@ -8815,7 +8824,8 @@ again:
       SValue dest;
       svalue_init(&dest);
       dest.vr = -1;
-      dest.c.i = rsym; /* Chain return jumps: point to previous rsym */
+      dest.r = VT_CONST; /* Mark as constant so jump target is stored in u.imm32 */
+      dest.c.i = rsym;   /* Chain return jumps: point to previous rsym */
       rsym = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
       // rsym = gjmp(rsym);
     }
@@ -8835,6 +8845,7 @@ again:
       leave_scope(loop_scope);
     svalue_init(&dest);
     dest.vr = -1;
+    dest.r = VT_CONST; /* Mark as constant so jump target is stored in u.imm32 */
     dest.c.i = *cur_scope->bsym;
     *cur_scope->bsym = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
     // *cur_scope->bsym = gjmp(*cur_scope->bsym);
@@ -8849,6 +8860,7 @@ again:
     leave_scope(loop_scope);
     svalue_init(&dest);
     dest.vr = -1;
+    dest.r = VT_CONST; /* Mark as constant so jump target is stored in u.imm32 */
     dest.c.i = *cur_scope->csym;
     // *cur_scope->csym = gjmp(*cur_scope->csym);
     *cur_scope->csym = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
@@ -8885,6 +8897,7 @@ again:
       SValue dest;
       svalue_init(&dest);
       dest.vr = -1;
+      dest.r = VT_CONST; /* Mark as constant so jump target is stored in u.imm32 */
       dest.c.i = -1;
       e = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
       // d = gind();
@@ -8894,6 +8907,7 @@ again:
       // gjmp_addr(c);
       svalue_init(&dest);
       dest.vr = -1;
+      dest.r = VT_CONST; /* Mark as constant so jump target is stored in u.imm32 */
       dest.c.i = d;
       tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
       tcc_ir_backpatch_to_here(tcc_state->ir, e);
@@ -8907,6 +8921,7 @@ again:
     SValue dest;
     svalue_init(&dest);
     dest.vr = -1;
+    dest.r = VT_CONST; /* Mark as constant so jump target is stored in u.imm32 */
     dest.c.i = c;
     /* Temporarily restore line number for backward jump instruction */
     {
@@ -8966,10 +8981,12 @@ again:
     a = -1; /* Initialize break chain with -1 sentinel */
     svalue_init(&dest);
     dest.vr = -1;
-    dest.c.i = -1; /* Initial jump target, will be patched */
+    dest.r = VT_CONST; /* Mark as constant so jump target is stored in u.imm32 */
+    dest.c.i = -1;     /* Initial jump target, will be patched */
     b = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
     // b = gjmp(0); /* jump to first case */
     lblock(&a, NULL);
+    dest.r = VT_CONST; /* Mark as constant so jump target is stored in u.imm32 */
     dest.c.i = a;
     a = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
     // a = gjmp(a); /* add implicit break */
@@ -9081,6 +9098,7 @@ again:
         svalue_init(&dest);
         try_call_cleanup_goto(s->cleanupstate);
         dest.vr = -1;
+        dest.r = VT_CONST; /* Mark as constant so jump target is stored in u.imm32 */
         dest.c.i = s->jind;
         // gjmp_addr(s->jind);
         tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
@@ -10078,7 +10096,7 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has
     next();
     decl_initializer(&p, type, 0, DIF_FIRST | DIF_SIZE_ONLY, vreg);
     /* prepare second initializer parsing */
-    macro_ptr = init_str->str;
+    macro_ptr = tok_str_buf(init_str);
     next();
 
     /* if still unknown size, error */
@@ -10381,8 +10399,9 @@ static void func_vla_arg_code(Sym *arg)
 
     unget_tok(0);
     vla_array_tok = tok_str_alloc();
-    vla_array_tok->str = arg->type.ref->vla_array_str;
-    begin_macro(vla_array_tok, 1);
+    vla_array_tok->data.str = arg->type.ref->vla_array_str;
+    vla_array_tok->allocated_len = 1;
+    begin_macro(vla_array_tok, 2);  /* alloc=2: don't free borrowed buffer */
     next();
     gexpr();
     end_macro();
@@ -10680,10 +10699,8 @@ static void gen_inline_functions(TCCState *s)
         if (s->function_sections)
         {
           /* -ffunction-sections: create .text.funcname section */
-          char sec_name[256];
-          const char *func_name = get_tok_str(sym->v, NULL);
-          snprintf(sec_name, sizeof(sec_name), ".text.%s", func_name);
-          cur_text_section = new_section(s, sec_name, SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR);
+          /* Merged: use .text instead of .text.funcname to reduce section count */
+          cur_text_section = text_section;
         }
         else
         {
@@ -10922,10 +10939,8 @@ static int decl(int l)
             if (tcc_state->function_sections)
             {
               /* -ffunction-sections: create .text.funcname section */
-              char sec_name[256];
-              const char *func_name = get_tok_str(v, NULL);
-              snprintf(sec_name, sizeof(sec_name), ".text.%s", func_name);
-              cur_text_section = new_section(tcc_state, sec_name, SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR);
+              /* Merged: use .text instead of .text.funcname to reduce section count */
+              cur_text_section = text_section;
             }
             else
             {

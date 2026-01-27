@@ -1,6 +1,11 @@
-#include <stdio.h>
+/* Test calling puts without stdio.h */
 
-int main() {
-    puts("Hello");
+/* Declare puts manually - it's linked from libc */
+extern int puts(const char *s);
+extern int printf(const char *format, ...);
+
+int main(void) {
+    puts("Hello from puts!");
+    printf("Printf works: %d\n", 42);
     return 0;
 }

@@ -345,9 +345,9 @@ typedef struct Sym Sym;
 #define TOKSTR_MAX_SIZE 256
 #define PACK_STACK_SIZE 8
 
-#define TOK_HASH_SIZE 16384 /* must be a power of two */
-#define TOK_ALLOC_INCR 512  /* must be a power of two */
-#define TOK_MAX_SIZE 4      /* token max size in int unit when stored in string */
+#define TOK_HASH_SIZE 4096 /* must be a power of two */
+#define TOK_ALLOC_INCR 256 /* must be a power of two */
+#define TOK_MAX_SIZE 4     /* token max size in int unit when stored in string */
 
 /* token symbol management */
 typedef struct TokenSym
@@ -470,6 +470,28 @@ struct Sym
 };
 
 #include "tccir.h"
+
+/* Relocation patch for lazy sections - stores a single relocation modification
+ * to be applied during streaming output instead of materializing the section */
+typedef struct RelocPatch
+{
+  uint32_t offset; /* Offset within section */
+  uint32_t value;  /* Value to write (for 32-bit relocations) */
+  struct RelocPatch *next;
+} RelocPatch;
+
+/* Deferred chunk for lazy section loading - optimized for memory
+ * Using 32-bit sizes for compactness (object file sections are < 4GB) */
+typedef struct DeferredChunk
+{
+  const char *source_path; /* Path to source file (reference, not owned) */
+  uint32_t file_offset;    /* Relative offset within source file */
+  uint32_t size;           /* Size of this chunk */
+  uint32_t dest_offset;    /* Offset in destination section */
+  struct DeferredChunk *next;
+  int materialized;        /* 1 if this chunk has been loaded */
+} DeferredChunk;
+
 /* section definition */
 typedef struct Section
 {
@@ -492,8 +514,60 @@ typedef struct Section
   struct Section *reloc;   /* corresponding section for relocation, if any */
   struct Section *hash;    /* hash table for symbols */
   struct Section *prev;    /* previous section on section stack */
-  char name[1];            /* section name */
+  /* Lazy loading support - use int instead of bit fields to avoid padding issues */
+  int lazy;                     /* 1 = section uses lazy loading */
+  int materialized;             /* 1 = data has been loaded (legacy) */
+  int has_deferred_chunks;      /* 1 = has chunks not yet materialized */
+  int fully_materialized;       /* 1 = all chunks materialized */
+  DeferredChunk *deferred_head; /* List of chunks to load */
+  DeferredChunk *deferred_tail; /* For O(1) append */
+  /* Relocation patches - stored as dynamic array for memory efficiency
+   * Each patch is 8 bytes (offset+value) vs 24 bytes with linked list */
+  uint32_t *reloc_patch_offsets; /* Array of patch offsets */
+  uint32_t *reloc_patch_values;  /* Array of patch values */
+  int nb_reloc_patches;          /* Number of patches */
+  int alloc_reloc_patches;       /* Allocated size of arrays */
+  /* String table deduplication - hash table for quick lookup */
+  uint32_t *str_hash; /* Hash table: hash -> offset in data */
+  int str_hash_size;  /* Size of hash table */
+  int str_hash_count; /* Number of entries in hash */
+  char name[1];       /* section name */
 } Section;
+
+/* -------------------------------------------------- */
+/* Garbage Collection During Loading (Phase 2) - Lazy Section Info */
+
+/* Represents a section that may be loaded lazily based on GC */
+typedef struct LazySectionInfo
+{
+  char *name;              /* Section name (owned) */
+  uint32_t size;           /* Section size */
+  uint32_t file_offset;    /* Offset in source file */
+  uint32_t archive_offset; /* Archive member offset (0 if not in archive) */
+  Section *section;        /* NULL until loaded */
+  int referenced;          /* Set by GC mark phase */
+  int sh_type;             /* Section type */
+  int sh_flags;            /* Section flags */
+  int sh_addralign;        /* Section alignment */
+  int reloc_index;         /* Index of relocation section, or 0 */
+} LazySectionInfo;
+
+/* Represents an object file being loaded lazily */
+typedef struct LazyObjectFile
+{
+  char *filename;            /* Object file path */
+  LazySectionInfo *sections; /* Array of lazy sections */
+  int nb_sections;           /* Number of sections */
+  int fd;                    /* File descriptor (kept open during loading) */
+  unsigned long file_offset; /* Offset within file (for archives) */
+  ElfW(Ehdr) ehdr;           /* ELF header */
+  ElfW(Shdr) * shdr;         /* Section headers (loaded) */
+  char *strsec;              /* Section name string table */
+  ElfW(Sym) * symtab;        /* Symbol table (loaded immediately) */
+  char *strtab;              /* String table for symbols */
+  int nb_syms;               /* Number of symbols */
+  int *old_to_new_syms;      /* Symbol index mapping */
+} LazyObjectFile;
 
 typedef struct DLLReference
 {
@@ -567,19 +641,31 @@ typedef struct BufferedFile
 #define CH_EOF (-1) /* end of file */
 
 /* used to record tokens */
+/* Small Buffer Optimization: inline 4 ints (16 bytes) for small token strings.
+   allocated_len == 0 means using inline buffer (small_buf).
+   allocated_len > 0 means using heap buffer (str pointer). */
+#define TOKSTR_SMALL_BUFSIZE 8 /* number of ints in inline buffer */
+
 typedef struct TokenString
 {
-  int *str;
-  int len;
-  int need_spc;
-  int allocated_len;
-  int last_line_num;
-  int save_line_num;
-  /* used to chain token-strings with begin/end_macro() */
-  struct TokenString *prev;
-  const int *prev_ptr;
   char alloc;
+  signed char need_spc;         /* space insertion state: -1, 0, 1, 2, 3 */
+  unsigned short last_line_num; /* last recorded line number (0 = none) */
+  unsigned short allocated_len; /* 0 = inline, >0 = heap capacity */
+  unsigned short save_line_num; /* saved line number for macro */
+  int len;                      /* current length in ints */
+  /* used to chain token-strings with begin/end_macro() */
+  const int *prev_ptr;
+  union
+  {
+    int *str;                            /* heap buffer pointer */
+    int small_buf[TOKSTR_SMALL_BUFSIZE]; /* inline buffer for small strings */
+  } data;
+  struct TokenString *prev;
 } TokenString;
+
+/* Access TokenString buffer (either inline small_buf or heap str) */
+#define tok_str_buf(s) ((s)->allocated_len > 0 ? (s)->data.str : (s)->data.small_buf)
 
 /* GNUC attribute definition */
 typedef struct AttributeDef
@@ -743,7 +829,8 @@ struct TCCState
   unsigned char dflag; /* -dX value */
   unsigned char Pflag; /* -P switch (LINE_MACRO_OUTPUT_FORMAT) */
 
-  unsigned char pic; /* enable position independent code */
+  unsigned char pic;    /* enable position independent code */
+  unsigned char no_pie; /* disable PIE for executables */
 #ifdef TCC_TARGET_X86_64
   unsigned char nosse; /* For -mno-sse support. */
 #endif
@@ -920,6 +1007,15 @@ struct TCCState
 
   /* for warnings/errors for object files */
   const char *current_filename;
+  /* Archive member offset for lazy loading (0 if not in archive) */
+  unsigned long current_archive_offset;
+  /* Archive file path for lazy loading (NULL if not in archive) */
+  const char *current_archive_path;
+
+  /* Phase 2: Garbage Collection During Loading */
+  LazyObjectFile **lazy_objfiles; /* Array of lazy-loaded object files */
+  int nb_lazy_objfiles;           /* Number of lazy object files */
+  int gc_sections_aggressive;     /* Enable aggressive GC during loading */
 
   /* used by main and tcc_parse_args only */
   struct filespec **files; /* files seen on command line */
@@ -1496,6 +1592,7 @@ ST_FUNC Section *new_section(TCCState *s1, const char *name, int sh_type, int sh
 ST_FUNC void section_realloc(Section *sec, unsigned long new_size);
 ST_FUNC size_t section_add(Section *sec, addr_t size, int align);
 ST_FUNC void *section_ptr_add(Section *sec, addr_t size);
+ST_FUNC void section_prealloc(Section *sec, unsigned long size);
 ST_FUNC Section *find_section(TCCState *s1, const char *name);
 ST_FUNC void free_section(Section *s);
 ST_FUNC Section *new_symtab(TCCState *s1, const char *symtab_name, int sh_type, int sh_flags, const char *strtab_name,
@@ -1517,6 +1614,10 @@ ST_FUNC ssize_t full_read(int fd, void *buf, size_t count);
 ST_FUNC void *load_data(int fd, unsigned long file_offset, unsigned long size);
 ST_FUNC int tcc_object_type(int fd, ElfW(Ehdr) * h);
 ST_FUNC int tcc_load_object_file(TCCState *s1, int fd, unsigned long file_offset);
+ST_FUNC int tcc_load_object_file_lazy(TCCState *s1, int fd, unsigned long file_offset);
+ST_FUNC void tcc_gc_mark_phase(TCCState *s1);
+ST_FUNC void tcc_load_referenced_sections(TCCState *s1);
+ST_FUNC void tcc_free_lazy_objfiles(TCCState *s1);
 ST_FUNC int tcc_load_archive(TCCState *s1, int fd, int alacarte);
 ST_FUNC void add_array(TCCState *s1, const char *sec, int c);
 
@@ -1886,8 +1987,6 @@ ST_FUNC void tcc_tcov_reset_ind(TCCState *s1);
  * their respective *-gen.c files and follow the contract documented in
  * docs/IR_MACHINE_CONTRACT.md.
  */
-
-ST_FUNC void tcc_machine_load_to_reg(int reg0, int reg1, SValue *src);
 
 ST_FUNC void tcc_machine_acquire_scratch(TCCMachineScratchRegs *scratch, unsigned flags);
 ST_FUNC void tcc_machine_release_scratch(const TCCMachineScratchRegs *scratch);

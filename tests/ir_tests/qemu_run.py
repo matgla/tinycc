@@ -196,6 +196,7 @@ class CompileConfig:
     compiler: Optional[Path] = None  # None = use default armv8m-tcc
     extra_cflags: str = ""
     dump_ir: bool = False  # Pass -dump-ir to the compiler (TinyCC only)
+    two_phase: bool = False  # Use two-phase compilation (reduces memory)
     defines: Optional[list] = None  # List of defines, e.g. ["FOO", "BAR=1"]
     profiler: Optional[ProfileConfig] = None
     clean_before_build: bool = True
@@ -254,7 +255,7 @@ def get_test_output_file(test_name, output_dir=None, prefix="", suffix=""):
     return output_dir / f"{prefix}{Path(primary).stem}{suffix}.elf"
 
 
-def build_make_command(test_file, machine, compiler, output_dir=None, cflags=None, defines=None, cc_wrapper=None, output_prefix="", output_suffix=""):
+def build_make_command(test_file, machine, compiler, output_dir=None, cflags=None, defines=None, cc_wrapper=None, two_phase=False, output_prefix="", output_suffix=""):
     """Build the make command for compiling a test case."""
     make_dir = CURRENT_DIR / 'qemu' / machine
     test_files = [str(f) for f in _as_file_list(test_file)]
@@ -283,6 +284,8 @@ def build_make_command(test_file, machine, compiler, output_dir=None, cflags=Non
         cmd.append(f"EXTRA_CFLAGS={' '.join(extra_cflags_parts)}")
     if cc_wrapper:
         cmd.append(f"CC_WRAPPER={cc_wrapper}")
+    if two_phase:
+        cmd.append("TWO_PHASE=1")
     return cmd
 
 
@@ -582,6 +585,7 @@ def compile_testcase(test_file, machine, compiler=None, cflags=None, config=None
         cflags=config.extra_cflags or None,
         defines=config.defines,
         cc_wrapper=cc_wrapper,
+        two_phase=config.two_phase,
         output_prefix=config.output_prefix,
         output_suffix=config.output_suffix
     )
@@ -602,9 +606,9 @@ def compile_testcase(test_file, machine, compiler=None, cflags=None, config=None
     elf_file = get_test_output_file(test_file, output_dir, prefix=config.output_prefix, suffix=config.output_suffix)
     output_lines = []
     if result.stdout:
-        output_lines.extend(result.stdout.decode().splitlines())
+        output_lines.extend(result.stdout.decode('utf-8', errors='replace').splitlines())
     if result.stderr:
-        output_lines.extend(result.stderr.decode().splitlines())
+        output_lines.extend(result.stderr.decode('utf-8', errors='replace').splitlines())
 
     compile_result = CompileResult(
         success=(result.returncode == 0),
@@ -615,8 +619,8 @@ def compile_testcase(test_file, machine, compiler=None, cflags=None, config=None
     )
 
     if result.returncode != 0:
-        compile_result.error = (result.stderr.decode() if result.stderr else "") + \
-                               (result.stdout.decode() if result.stdout else "")
+        compile_result.error = (result.stderr.decode('utf-8', errors='replace') if result.stderr else "") + \
+                               (result.stdout.decode('utf-8', errors='replace') if result.stdout else "")
         return compile_result
 
     # Get binary size

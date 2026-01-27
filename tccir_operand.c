@@ -19,6 +19,7 @@
  */
 
 #include "tccir_operand.h"
+#define USING_GLOBALS
 #include "tcc.h"
 #include "tccir.h"
 
@@ -50,12 +51,17 @@ void tcc_ir_pools_init(TCCIRState *ir)
   ir->pool_symref_count = 0;
   ir->pool_symref = (IRPoolSymref *)tcc_mallocz(sizeof(IRPoolSymref) * ir->pool_symref_capacity);
 
+  /* CType pool for struct/array types */
+  ir->pool_ctype_capacity = IRPOOL_INIT_SIZE;
+  ir->pool_ctype_count = 0;
+  ir->pool_ctype = (CType *)tcc_mallocz(sizeof(CType) * ir->pool_ctype_capacity);
+
   /* IROperand pool - parallel to svalue_pool */
   ir->iroperand_pool_capacity = IRPOOL_INIT_SIZE;
   ir->iroperand_pool_count = 0;
   ir->iroperand_pool = (IROperand *)tcc_mallocz(sizeof(IROperand) * ir->iroperand_pool_capacity);
 
-  if (!ir->pool_i64 || !ir->pool_f64 || !ir->pool_symref || !ir->iroperand_pool)
+  if (!ir->pool_i64 || !ir->pool_f64 || !ir->pool_symref || !ir->pool_ctype || !ir->iroperand_pool)
   {
     fprintf(stderr, "tcc_ir_pools_init: out of memory\n");
     exit(1);
@@ -87,6 +93,14 @@ void tcc_ir_pools_free(TCCIRState *ir)
   }
   ir->pool_symref_count = 0;
   ir->pool_symref_capacity = 0;
+
+  if (ir->pool_ctype)
+  {
+    tcc_free(ir->pool_ctype);
+    ir->pool_ctype = NULL;
+  }
+  ir->pool_ctype_count = 0;
+  ir->pool_ctype_capacity = 0;
 
   if (ir->iroperand_pool)
   {
@@ -170,10 +184,41 @@ IRPoolSymref *tcc_ir_pool_get_symref_ptr(const TCCIRState *ir, uint32_t idx)
   return &ir->pool_symref[idx];
 }
 
+uint32_t tcc_ir_pool_add_ctype(TCCIRState *ir, const CType *ctype)
+{
+  if (ir->pool_ctype_count >= ir->pool_ctype_capacity)
+  {
+    ir->pool_ctype_capacity *= 2;
+    ir->pool_ctype = (CType *)tcc_realloc(ir->pool_ctype, sizeof(CType) * ir->pool_ctype_capacity);
+    if (!ir->pool_ctype)
+    {
+      fprintf(stderr, "tcc_ir_pool_add_ctype: out of memory\n");
+      exit(1);
+    }
+  }
+  ir->pool_ctype[ir->pool_ctype_count] = *ctype;
+  return (uint32_t)ir->pool_ctype_count++;
+}
+
+CType *tcc_ir_pool_get_ctype_ptr(const TCCIRState *ir, uint32_t idx)
+{
+  if (!ir || idx >= (uint32_t)ir->pool_ctype_count)
+    return NULL;
+  return &ir->pool_ctype[idx];
+}
+
 /* Public wrapper: get symbol from IROperand using the global tcc_state->ir. */
 ST_FUNC struct Sym *irop_get_sym(IROperand op)
 {
   return irop_get_sym_ex(tcc_state->ir, op);
+}
+
+/* Get CType for struct operands using global tcc_state->ir */
+CType *irop_get_ctype(IROperand op)
+{
+  if (op.btype != IROP_BTYPE_STRUCT)
+    return NULL;
+  return tcc_ir_pool_get_ctype_ptr(tcc_state->ir, op.u.s.ctype_idx);
 }
 
 /* ============================================================================
@@ -210,7 +255,7 @@ static int vt_btype_to_irop_btype(int vt_btype)
 }
 
 /* Convert compressed IROP_BTYPE back to VT_BTYPE for SValue reconstruction */
-static int irop_btype_to_vt_btype(int irop_btype)
+int irop_btype_to_vt_btype(int irop_btype)
 {
   switch (irop_btype)
   {
@@ -397,6 +442,39 @@ IROperand svalue_to_iroperand(TCCIRState *ir, const SValue *sv)
   }
 
 done:
+  /* For STRUCT types, encode CType pool index + preserve original data in split format */
+  if (irop_bt == IROP_BTYPE_STRUCT)
+  {
+    uint32_t ctype_idx = tcc_ir_pool_add_ctype(ir, &sv->type);
+    int tag = irop_get_tag(result);
+
+    if (tag == IROP_TAG_STACKOFF)
+    {
+      /* Stack offset: store offset/4 in aux_data (assumes 4-byte aligned, ±128KB range) */
+      int32_t offset = result.u.imm32;
+      result.u.s.ctype_idx = (uint16_t)ctype_idx;
+      result.u.s.aux_data = (int16_t)(offset >> 2); /* offset/4 to fit in 16 bits */
+    }
+    else if (tag == IROP_TAG_SYMREF)
+    {
+      /* Symbol ref: store symref pool index in aux_data (max 64K symbols) */
+      uint32_t symref_idx = result.u.pool_idx;
+      result.u.s.ctype_idx = (uint16_t)ctype_idx;
+      result.u.s.aux_data = (int16_t)symref_idx;
+    }
+    else if (tag == IROP_TAG_VREG)
+    {
+      /* Pure vreg: u is unused, just store ctype_idx */
+      result.u.s.ctype_idx = (uint16_t)ctype_idx;
+      result.u.s.aux_data = 0;
+    }
+    else
+    {
+      tcc_error("UNHANDLED TAG=%d! u.imm32=%d u.pool_idx=%u\n", tag, result.u.imm32, result.u.pool_idx);
+    }
+    /* Other tags (IMM32, etc.) - shouldn't happen for structs, leave as-is */
+  }
+
   /* Debug: verify round-trip conversion preserves data */
   // irop_compare_svalue(ir, sv, result, "svalue_to_iroperand");
   return result;
@@ -455,7 +533,11 @@ void iroperand_to_svalue(const TCCIRState *ir, IROperand op, SValue *out)
     /* Restore VT_PARAM from explicit is_param flag */
     if (op.is_param)
       out->r |= VT_PARAM;
-    out->c.i = (int64_t)op.u.imm32; /* stack offset stored in imm32 */
+    /* For STRUCT types, offset is stored in aux_data * 4 */
+    if (irop_bt == IROP_BTYPE_STRUCT)
+      out->c.i = (int64_t)op.u.s.aux_data << 2; /* aux_data * 4 */
+    else
+      out->c.i = (int64_t)op.u.imm32; /* stack offset stored in imm32 */
     break;
   }
 
@@ -505,7 +587,8 @@ void iroperand_to_svalue(const TCCIRState *ir, IROperand op, SValue *out)
 
   case IROP_TAG_SYMREF:
   {
-    uint32_t idx = op.u.pool_idx;
+    /* For STRUCT types, symref index is stored in aux_data */
+    uint32_t idx = (irop_bt == IROP_BTYPE_STRUCT) ? (uint32_t)(uint16_t)op.u.s.aux_data : op.u.pool_idx;
     IRPoolSymref *ref = &ir->pool_symref[idx];
     out->sym = ref->sym;
     out->c.i = (int64_t)ref->addend;
@@ -543,6 +626,21 @@ void iroperand_to_svalue(const TCCIRState *ir, IROperand op, SValue *out)
     out->type.t |= VT_UNSIGNED;
   if (op.is_static)
     out->type.t |= VT_STATIC;
+
+  /* For STRUCT types, restore full CType from pool (including type.ref) */
+  if (irop_bt == IROP_BTYPE_STRUCT)
+  {
+    CType *ct = tcc_ir_pool_get_ctype_ptr(ir, op.u.s.ctype_idx);
+    if (ct)
+    {
+      out->type = *ct; /* Restore full CType including ref pointer */
+      /* Re-apply any type flags that were set above */
+      if (op.is_unsigned)
+        out->type.t |= VT_UNSIGNED;
+      if (op.is_static)
+        out->type.t |= VT_STATIC;
+    }
+  }
 }
 
 /* Debug: compare SValue with IROperand by converting IROperand back to SValue
@@ -643,4 +741,87 @@ int irop_compare_svalue(const TCCIRState *ir, const SValue *sv, IROperand op, co
   }
 
   return mismatch;
+}
+
+int irop_type_size(IROperand op)
+{
+  switch (op.btype)
+  {
+  case IROP_BTYPE_INT8:
+    return 1;
+  case IROP_BTYPE_INT16:
+    return 2;
+  case IROP_BTYPE_INT32:
+  case IROP_BTYPE_FLOAT32:
+    return 4;
+  case IROP_BTYPE_INT64:
+  case IROP_BTYPE_FLOAT64:
+    return 8;
+  case IROP_BTYPE_STRUCT:
+    /* For structs, get CType from pool using split ctype_idx field */
+    {
+      CType *ct = tcc_ir_pool_get_ctype_ptr(tcc_state->ir, op.u.s.ctype_idx);
+      if (ct)
+      {
+        int align;
+        return type_size(ct, &align);
+      }
+    }
+    break;
+  default:
+    break;
+  }
+  return 0; // Unknown size
+}
+
+/* Get type size and alignment from IROperand.
+ * For structs, uses the CType pool to compute actual size/alignment.
+ * Returns size in bytes, writes alignment to *align_out if non-NULL. */
+int irop_type_size_align(IROperand op, int *align_out)
+{
+  int align = 4; /* default alignment */
+
+  switch (op.btype)
+  {
+  case IROP_BTYPE_INT8:
+    align = 1;
+    if (align_out)
+      *align_out = align;
+    return 1;
+  case IROP_BTYPE_INT16:
+    align = 2;
+    if (align_out)
+      *align_out = align;
+    return 2;
+  case IROP_BTYPE_INT32:
+  case IROP_BTYPE_FLOAT32:
+    align = 4;
+    if (align_out)
+      *align_out = align;
+    return 4;
+  case IROP_BTYPE_INT64:
+  case IROP_BTYPE_FLOAT64:
+    align = 8;
+    if (align_out)
+      *align_out = align;
+    return 8;
+  case IROP_BTYPE_STRUCT:
+    /* For structs, get CType from pool using split ctype_idx field */
+    {
+      CType *ct = tcc_ir_pool_get_ctype_ptr(tcc_state->ir, op.u.s.ctype_idx);
+      if (ct)
+      {
+        int size = type_size(ct, &align);
+        if (align_out)
+          *align_out = align;
+        return size;
+      }
+    }
+    break;
+  default:
+    break;
+  }
+  if (align_out)
+    *align_out = align;
+  return 0; // Unknown size
 }

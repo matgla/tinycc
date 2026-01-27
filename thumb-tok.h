@@ -118,7 +118,9 @@ DEF_ASM(iteee) // must be last
 #define THUMB_REGULAR_VARIANT(tok) #tok "eq"
 #define THUMB_SETFLAGS_VARIANT(tok) #tok "seq"
 
-#define THUMB_INSTRUCTION_GROUP(tok) ((((tok) - TOK_ASM_nopeq) & 0xFFFFFFC0) + TOK_ASM_nopeq)
+/* DEPRECATED: These macros are obsolete after token refactoring */
+/* Kept temporarily for reference during transition - DO NOT USE */
+#define THUMB_INSTRUCTION_GROUP(tok) ((((tok) - TOK_ASM_nop) & 0xFFFFFFC0) + TOK_ASM_nop)
 
 #define THUMB_HAS_WIDE_QUALIFIER(tok)                                                                                  \
   ((tok - THUMB_INSTRUCTION_GROUP(tok)) > 0x0f && (tok - THUMB_INSTRUCTION_GROUP(tok)) <= 0x1f)
@@ -133,272 +135,217 @@ DEF_ASM(iteee) // must be last
 
 #define THUMB_IS_SETFLAGS(group, tok) ((tok - group) == 0x40)
 
-/* Note: condition code is 4 bits */
-#define DEF_ASM_CONDED(x)                                                                                              \
-  DEF(TOK_ASM_##x##eq, #x "eq")                                                                                        \
-  DEF(TOK_ASM_##x##ne, #x "ne")                                                                                        \
-  DEF(TOK_ASM_##x##cs, #x "cs")                                                                                        \
-  DEF(TOK_ASM_##x##cc, #x "cc")                                                                                        \
-  DEF(TOK_ASM_##x##mi, #x "mi")                                                                                        \
-  DEF(TOK_ASM_##x##pl, #x "pl")                                                                                        \
-  DEF(TOK_ASM_##x##vs, #x "vs")                                                                                        \
-  DEF(TOK_ASM_##x##vc, #x "vc")                                                                                        \
-  DEF(TOK_ASM_##x##hi, #x "hi")                                                                                        \
-  DEF(TOK_ASM_##x##ls, #x "ls")                                                                                        \
-  DEF(TOK_ASM_##x##ge, #x "ge")                                                                                        \
-  DEF(TOK_ASM_##x##lt, #x "lt")                                                                                        \
-  DEF(TOK_ASM_##x##gt, #x "gt")                                                                                        \
-  DEF(TOK_ASM_##x##le, #x "le")                                                                                        \
-  DEF(TOK_ASM_##x, #x)                                                                                                 \
-  DEF(TOK_ASM_##x##rsvd, #x "rsvd")
+/* New simplified macro - single token per instruction */
+/* Condition codes and width qualifiers are now parsed at runtime */
+#define DEF_ASM_BASE(x) DEF(TOK_ASM_##x, #x)
 
-/* Note: condition code is 4 bits */
-#define DEF_ASM_CONDED_WITH_SUFFIX(x, y)                                                                               \
-  DEF(TOK_ASM_##x##eq##_##y, #x "eq." #y)                                                                              \
-  DEF(TOK_ASM_##x##ne##_##y, #x "ne." #y)                                                                              \
-  DEF(TOK_ASM_##x##cs##_##y, #x "cs." #y)                                                                              \
-  DEF(TOK_ASM_##x##cc##_##y, #x "cc." #y)                                                                              \
-  DEF(TOK_ASM_##x##mi##_##y, #x "mi." #y)                                                                              \
-  DEF(TOK_ASM_##x##pl##_##y, #x "pl." #y)                                                                              \
-  DEF(TOK_ASM_##x##vs##_##y, #x "vs." #y)                                                                              \
-  DEF(TOK_ASM_##x##vc##_##y, #x "vc." #y)                                                                              \
-  DEF(TOK_ASM_##x##hi##_##y, #x "hi." #y)                                                                              \
-  DEF(TOK_ASM_##x##ls##_##y, #x "ls." #y)                                                                              \
-  DEF(TOK_ASM_##x##ge##_##y, #x "ge." #y)                                                                              \
-  DEF(TOK_ASM_##x##lt##_##y, #x "lt." #y)                                                                              \
-  DEF(TOK_ASM_##x##gt##_##y, #x "gt." #y)                                                                              \
-  DEF(TOK_ASM_##x##le##_##y, #x "le." #y)                                                                              \
-  DEF(TOK_ASM_##x##_##y, #x "." #y)                                                                                    \
-  DEF(TOK_ASM_##x##rsvd##_##y, #x "rsvd." #y)
+/* Old macros - now just wrappers around DEF_ASM_BASE for compatibility */
+#define DEF_ASM_CONDED(x) DEF_ASM_BASE(x)
+#define DEF_ASM_CONDED_WITH_QUALIFIER(x) DEF_ASM_BASE(x)
+#define DEF_ASM_CONDED_WITH_SUFFIX(x, y) DEF_ASM_BASE(x)
+#define DEF_ASM_CONDED_VFP_F32_F64(x) DEF_ASM_BASE(x)
+#define DEF_ASM_CONDED_WITH_TWO_SUFFIXES(x, y, z) DEF_ASM_BASE(x)
 
-#define DEF_ASM_CONDED_VFP_F32_F64(x)                                                                                  \
-  DEF_ASM_CONDED_WITH_SUFFIX(x, f32)                                                                                   \
-  DEF_ASM_CONDED_WITH_SUFFIX(x, f64)
+/* Note: add new tokens after nop (MUST always use DEF_ASM_BASE) */
 
-#define DEF_ASM_CONDED_WITH_TWO_SUFFIXES(x, y, z)                                                                      \
-  DEF(TOK_ASM_##x##eq##_##y##_##z, #x "eq." #y "." #z)                                                                 \
-  DEF(TOK_ASM_##x##ne##_##y##_##z, #x "ne." #y "." #z)                                                                 \
-  DEF(TOK_ASM_##x##cs##_##y##_##z, #x "cs." #y "." #z)                                                                 \
-  DEF(TOK_ASM_##x##cc##_##y##_##z, #x "cc." #y "." #z)                                                                 \
-  DEF(TOK_ASM_##x##mi##_##y##_##z, #x "mi." #y "." #z)                                                                 \
-  DEF(TOK_ASM_##x##pl##_##y##_##z, #x "pl." #y "." #z)                                                                 \
-  DEF(TOK_ASM_##x##vs##_##y##_##z, #x "vs." #y "." #z)                                                                 \
-  DEF(TOK_ASM_##x##vc##_##y##_##z, #x "vc." #y "." #z)                                                                 \
-  DEF(TOK_ASM_##x##hi##_##y##_##z, #x "hi." #y "." #z)                                                                 \
-  DEF(TOK_ASM_##x##ls##_##y##_##z, #x "ls." #y "." #z)                                                                 \
-  DEF(TOK_ASM_##x##ge##_##y##_##z, #x "ge." #y "." #z)                                                                 \
-  DEF(TOK_ASM_##x##lt##_##y##_##z, #x "lt." #y "." #z)                                                                 \
-  DEF(TOK_ASM_##x##gt##_##y##_##z, #x "gt." #y "." #z)                                                                 \
-  DEF(TOK_ASM_##x##le##_##y##_##z, #x "le." #y "." #z)                                                                 \
-  DEF(TOK_ASM_##x##_##y##_##z, #x "." #y "." #z)                                                                       \
-  DEF(TOK_ASM_##x##rsvd##_##y##_##z, #x "rsvd." #y "." #z)
-
-/* Note: add new tokens after nop (MUST always use DEF_ASM_CONDED) */
-
-#define DEF_ASM_CONDED_WITH_QUALIFIER(x)                                                                               \
-  DEF_ASM_CONDED(x)                                                                                                    \
-  DEF_ASM_CONDED_WITH_SUFFIX(x, w)                                                                                     \
-  DEF_ASM_CONDED_WITH_SUFFIX(x, n)                                                                                     \
-  DEF_ASM_CONDED_WITH_SUFFIX(x, _) // last just to align to the 6 bits
-
-DEF_ASM_CONDED_WITH_QUALIFIER(nop)
-DEF_ASM_CONDED_WITH_QUALIFIER(sev)
-DEF_ASM_CONDED_WITH_QUALIFIER(wfi)
-DEF_ASM_CONDED_WITH_QUALIFIER(wfe)
-DEF_ASM_CONDED_WITH_QUALIFIER(yield)
+DEF_ASM_BASE(nop)
+DEF_ASM_BASE(sev)
+DEF_ASM_BASE(wfi)
+DEF_ASM_BASE(wfe)
+DEF_ASM_BASE(yield)
 
 // Data manipulation instructions
-DEF_ASM_CONDED_WITH_QUALIFIER(adc)
-DEF_ASM_CONDED_WITH_QUALIFIER(adcs)
+DEF_ASM_BASE(adc)
+DEF_ASM_BASE(adcs)
 
-DEF_ASM_CONDED_WITH_QUALIFIER(add)
-DEF_ASM_CONDED_WITH_QUALIFIER(adds)
+DEF_ASM_BASE(add)
+DEF_ASM_BASE(adds)
 
-DEF_ASM_CONDED_WITH_QUALIFIER(and)
-DEF_ASM_CONDED_WITH_QUALIFIER(ands)
-DEF_ASM_CONDED_WITH_QUALIFIER(addw)
+DEF_ASM_BASE(and)
+DEF_ASM_BASE(ands)
+DEF_ASM_BASE(addw)
 
-DEF_ASM_CONDED_WITH_QUALIFIER(bfc)
-DEF_ASM_CONDED_WITH_QUALIFIER(bfi)
+DEF_ASM_BASE(bfc)
+DEF_ASM_BASE(bfi)
 
-DEF_ASM_CONDED_WITH_QUALIFIER(bic)
-DEF_ASM_CONDED_WITH_QUALIFIER(bics)
+DEF_ASM_BASE(bic)
+DEF_ASM_BASE(bics)
 
-DEF_ASM_CONDED_WITH_QUALIFIER(clz)
-DEF_ASM_CONDED_WITH_QUALIFIER(cmn)
+DEF_ASM_BASE(clz)
+DEF_ASM_BASE(cmn)
 
-DEF_ASM_CONDED_WITH_QUALIFIER(eor)
-DEF_ASM_CONDED_WITH_QUALIFIER(eors)
+DEF_ASM_BASE(eor)
+DEF_ASM_BASE(eors)
 
-DEF_ASM_CONDED_WITH_QUALIFIER(mvn)
-DEF_ASM_CONDED_WITH_QUALIFIER(mvns)
+DEF_ASM_BASE(mvn)
+DEF_ASM_BASE(mvns)
 
-DEF_ASM_CONDED_WITH_QUALIFIER(orn)
-DEF_ASM_CONDED_WITH_QUALIFIER(orns)
+DEF_ASM_BASE(orn)
+DEF_ASM_BASE(orns)
 
-DEF_ASM_CONDED_WITH_QUALIFIER(orr)
-DEF_ASM_CONDED_WITH_QUALIFIER(orrs)
+DEF_ASM_BASE(orr)
+DEF_ASM_BASE(orrs)
 
-DEF_ASM_CONDED_WITH_QUALIFIER(rsb)
-DEF_ASM_CONDED_WITH_QUALIFIER(rsbs)
+DEF_ASM_BASE(rsb)
+DEF_ASM_BASE(rsbs)
 
-DEF_ASM_CONDED_WITH_QUALIFIER(sbc)
-DEF_ASM_CONDED_WITH_QUALIFIER(sbcs)
+DEF_ASM_BASE(sbc)
+DEF_ASM_BASE(sbcs)
 
-DEF_ASM_CONDED_WITH_QUALIFIER(sbfx)
+DEF_ASM_BASE(sbfx)
 
-DEF_ASM_CONDED_WITH_QUALIFIER(rbit)
-DEF_ASM_CONDED_WITH_QUALIFIER(revsh)
-DEF_ASM_CONDED_WITH_QUALIFIER(rev)
-DEF_ASM_CONDED_WITH_QUALIFIER(rev16)
+DEF_ASM_BASE(rbit)
+DEF_ASM_BASE(revsh)
+DEF_ASM_BASE(rev)
+DEF_ASM_BASE(rev16)
 
-DEF_ASM_CONDED_WITH_QUALIFIER(ror)
-DEF_ASM_CONDED_WITH_QUALIFIER(rors)
+DEF_ASM_BASE(ror)
+DEF_ASM_BASE(rors)
 
-DEF_ASM_CONDED_WITH_QUALIFIER(lsl)
-DEF_ASM_CONDED_WITH_QUALIFIER(lsls)
+DEF_ASM_BASE(lsl)
+DEF_ASM_BASE(lsls)
 
-DEF_ASM_CONDED_WITH_QUALIFIER(lsr)
-DEF_ASM_CONDED_WITH_QUALIFIER(lsrs)
+DEF_ASM_BASE(lsr)
+DEF_ASM_BASE(lsrs)
 
-DEF_ASM_CONDED_WITH_QUALIFIER(asr)
-DEF_ASM_CONDED_WITH_QUALIFIER(asrs)
+DEF_ASM_BASE(asr)
+DEF_ASM_BASE(asrs)
 
-DEF_ASM_CONDED_WITH_QUALIFIER(rrx)
-DEF_ASM_CONDED_WITH_QUALIFIER(rrxs)
+DEF_ASM_BASE(rrx)
+DEF_ASM_BASE(rrxs)
 
-DEF_ASM_CONDED_WITH_QUALIFIER(pkhbt)
-DEF_ASM_CONDED_WITH_QUALIFIER(pkhtb)
+DEF_ASM_BASE(pkhbt)
+DEF_ASM_BASE(pkhtb)
 
-DEF_ASM_CONDED_WITH_QUALIFIER(mov)
-DEF_ASM_CONDED_WITH_QUALIFIER(movs)
-DEF_ASM_CONDED_WITH_QUALIFIER(movt)
-DEF_ASM_CONDED_WITH_QUALIFIER(movw)
-DEF_ASM_CONDED_WITH_QUALIFIER(mrs)
-DEF_ASM_CONDED_WITH_QUALIFIER(msr)
+DEF_ASM_BASE(mov)
+DEF_ASM_BASE(movs)
+DEF_ASM_BASE(movt)
+DEF_ASM_BASE(movw)
+DEF_ASM_BASE(mrs)
+DEF_ASM_BASE(msr)
 // Addressing instructions
 
-DEF_ASM_CONDED_WITH_QUALIFIER(adr)
+DEF_ASM_BASE(adr)
 
-DEF_ASM_CONDED_WITH_QUALIFIER(cmp)
+DEF_ASM_BASE(cmp)
 
-DEF_ASM_CONDED_WITH_QUALIFIER(push)
-DEF_ASM_CONDED_WITH_QUALIFIER(pop)
+DEF_ASM_BASE(push)
+DEF_ASM_BASE(pop)
 
 // control instructions
-DEF_ASM_CONDED_WITH_QUALIFIER(clrex)
-DEF_ASM_CONDED_WITH_QUALIFIER(bkpt)
-DEF_ASM_CONDED_WITH_QUALIFIER(svc)
-DEF_ASM_CONDED_WITH_QUALIFIER(cpsid)
-DEF_ASM_CONDED_WITH_QUALIFIER(cpsie)
-DEF_ASM_CONDED_WITH_QUALIFIER(csdb)
-DEF_ASM_CONDED_WITH_QUALIFIER(dmb)
-DEF_ASM_CONDED_WITH_QUALIFIER(dsb)
-DEF_ASM_CONDED_WITH_QUALIFIER(isb)
-DEF_ASM_CONDED_WITH_QUALIFIER(ssbb)
-DEF_ASM_CONDED_WITH_QUALIFIER(tt)
-DEF_ASM_CONDED_WITH_QUALIFIER(ttt)
-DEF_ASM_CONDED_WITH_QUALIFIER(tta)
-DEF_ASM_CONDED_WITH_QUALIFIER(ttat)
-DEF_ASM_CONDED_WITH_QUALIFIER(udf)
+DEF_ASM_BASE(clrex)
+DEF_ASM_BASE(bkpt)
+DEF_ASM_BASE(svc)
+DEF_ASM_BASE(cpsid)
+DEF_ASM_BASE(cpsie)
+DEF_ASM_BASE(csdb)
+DEF_ASM_BASE(dmb)
+DEF_ASM_BASE(dsb)
+DEF_ASM_BASE(isb)
+DEF_ASM_BASE(ssbb)
+DEF_ASM_BASE(tt)
+DEF_ASM_BASE(ttt)
+DEF_ASM_BASE(tta)
+DEF_ASM_BASE(ttat)
+DEF_ASM_BASE(udf)
 
-DEF_ASM_CONDED_WITH_QUALIFIER(b)
-DEF_ASM_CONDED_WITH_QUALIFIER(bl)
-DEF_ASM_CONDED_WITH_QUALIFIER(bx)
-DEF_ASM_CONDED_WITH_QUALIFIER(blx)
-DEF_ASM_CONDED_WITH_QUALIFIER(cbz)
-DEF_ASM_CONDED_WITH_QUALIFIER(cbnz)
-DEF_ASM_CONDED_WITH_QUALIFIER(tbb)
-DEF_ASM_CONDED_WITH_QUALIFIER(tbh)
-DEF_ASM_CONDED_WITH_QUALIFIER(teq)
-DEF_ASM_CONDED_WITH_QUALIFIER(tst)
+DEF_ASM_BASE(b)
+DEF_ASM_BASE(bl)
+DEF_ASM_BASE(bx)
+DEF_ASM_BASE(blx)
+DEF_ASM_BASE(cbz)
+DEF_ASM_BASE(cbnz)
+DEF_ASM_BASE(tbb)
+DEF_ASM_BASE(tbh)
+DEF_ASM_BASE(teq)
+DEF_ASM_BASE(tst)
 
 // memory access instructions
-DEF_ASM_CONDED_WITH_QUALIFIER(lda)
-DEF_ASM_CONDED_WITH_QUALIFIER(ldab)
-DEF_ASM_CONDED_WITH_QUALIFIER(ldaex)
-DEF_ASM_CONDED_WITH_QUALIFIER(ldaexb)
-DEF_ASM_CONDED_WITH_QUALIFIER(ldaexh)
-DEF_ASM_CONDED_WITH_QUALIFIER(ldah)
-DEF_ASM_CONDED_WITH_QUALIFIER(ldm)
-DEF_ASM_CONDED_WITH_QUALIFIER(ldmfd)
-DEF_ASM_CONDED_WITH_QUALIFIER(ldmia)
+DEF_ASM_BASE(lda)
+DEF_ASM_BASE(ldab)
+DEF_ASM_BASE(ldaex)
+DEF_ASM_BASE(ldaexb)
+DEF_ASM_BASE(ldaexh)
+DEF_ASM_BASE(ldah)
+DEF_ASM_BASE(ldm)
+DEF_ASM_BASE(ldmfd)
+DEF_ASM_BASE(ldmia)
 
-DEF_ASM_CONDED_WITH_QUALIFIER(ldmdb)
-DEF_ASM_CONDED_WITH_QUALIFIER(ldmea)
+DEF_ASM_BASE(ldmdb)
+DEF_ASM_BASE(ldmea)
 
-DEF_ASM_CONDED_WITH_QUALIFIER(ldr)
-DEF_ASM_CONDED_WITH_QUALIFIER(ldrb)
-DEF_ASM_CONDED_WITH_QUALIFIER(ldrbt)
-DEF_ASM_CONDED_WITH_QUALIFIER(ldrd)
-DEF_ASM_CONDED_WITH_QUALIFIER(ldrex)
-DEF_ASM_CONDED_WITH_QUALIFIER(ldrexb)
-DEF_ASM_CONDED_WITH_QUALIFIER(ldrexh)
-DEF_ASM_CONDED_WITH_QUALIFIER(ldrh)
-DEF_ASM_CONDED_WITH_QUALIFIER(ldrht)
-DEF_ASM_CONDED_WITH_QUALIFIER(ldrsb)
-DEF_ASM_CONDED_WITH_QUALIFIER(ldrsbt)
-DEF_ASM_CONDED_WITH_QUALIFIER(ldrsh)
-DEF_ASM_CONDED_WITH_QUALIFIER(ldrsht)
-DEF_ASM_CONDED_WITH_QUALIFIER(ldrt)
-DEF_ASM_CONDED_WITH_QUALIFIER(pld)
-DEF_ASM_CONDED_WITH_QUALIFIER(pldw)
-DEF_ASM_CONDED_WITH_QUALIFIER(pli)
-DEF_ASM_CONDED_WITH_QUALIFIER(pliw)
+DEF_ASM_BASE(ldr)
+DEF_ASM_BASE(ldrb)
+DEF_ASM_BASE(ldrbt)
+DEF_ASM_BASE(ldrd)
+DEF_ASM_BASE(ldrex)
+DEF_ASM_BASE(ldrexb)
+DEF_ASM_BASE(ldrexh)
+DEF_ASM_BASE(ldrh)
+DEF_ASM_BASE(ldrht)
+DEF_ASM_BASE(ldrsb)
+DEF_ASM_BASE(ldrsbt)
+DEF_ASM_BASE(ldrsh)
+DEF_ASM_BASE(ldrsht)
+DEF_ASM_BASE(ldrt)
+DEF_ASM_BASE(pld)
+DEF_ASM_BASE(pldw)
+DEF_ASM_BASE(pli)
+DEF_ASM_BASE(pliw)
 
-DEF_ASM_CONDED_WITH_QUALIFIER(stl)
-DEF_ASM_CONDED_WITH_QUALIFIER(stlb)
-DEF_ASM_CONDED_WITH_QUALIFIER(stlex)
-DEF_ASM_CONDED_WITH_QUALIFIER(stlexb)
-DEF_ASM_CONDED_WITH_QUALIFIER(stlexh)
-DEF_ASM_CONDED_WITH_QUALIFIER(stlh)
-DEF_ASM_CONDED_WITH_QUALIFIER(stm)
-DEF_ASM_CONDED_WITH_QUALIFIER(stmia)
-DEF_ASM_CONDED_WITH_QUALIFIER(stmea)
-DEF_ASM_CONDED_WITH_QUALIFIER(stmdb)
-DEF_ASM_CONDED_WITH_QUALIFIER(stmfd)
-DEF_ASM_CONDED_WITH_QUALIFIER(str)
-DEF_ASM_CONDED_WITH_QUALIFIER(strb)
-DEF_ASM_CONDED_WITH_QUALIFIER(strbt)
-DEF_ASM_CONDED_WITH_QUALIFIER(strd)
-DEF_ASM_CONDED_WITH_QUALIFIER(strex)
-DEF_ASM_CONDED_WITH_QUALIFIER(strexb)
-DEF_ASM_CONDED_WITH_QUALIFIER(strexh)
-DEF_ASM_CONDED_WITH_QUALIFIER(strh)
-DEF_ASM_CONDED_WITH_QUALIFIER(strht)
-DEF_ASM_CONDED_WITH_QUALIFIER(strt)
-DEF_ASM_CONDED_WITH_QUALIFIER(sub)
-DEF_ASM_CONDED_WITH_QUALIFIER(subs)
-DEF_ASM_CONDED_WITH_QUALIFIER(subw)
-DEF_ASM_CONDED_WITH_QUALIFIER(sxtb)
-DEF_ASM_CONDED_WITH_QUALIFIER(sxth)
-DEF_ASM_CONDED_WITH_QUALIFIER(uxtb)
-DEF_ASM_CONDED_WITH_QUALIFIER(uxth)
+DEF_ASM_BASE(stl)
+DEF_ASM_BASE(stlb)
+DEF_ASM_BASE(stlex)
+DEF_ASM_BASE(stlexb)
+DEF_ASM_BASE(stlexh)
+DEF_ASM_BASE(stlh)
+DEF_ASM_BASE(stm)
+DEF_ASM_BASE(stmia)
+DEF_ASM_BASE(stmea)
+DEF_ASM_BASE(stmdb)
+DEF_ASM_BASE(stmfd)
+DEF_ASM_BASE(str)
+DEF_ASM_BASE(strb)
+DEF_ASM_BASE(strbt)
+DEF_ASM_BASE(strd)
+DEF_ASM_BASE(strex)
+DEF_ASM_BASE(strexb)
+DEF_ASM_BASE(strexh)
+DEF_ASM_BASE(strh)
+DEF_ASM_BASE(strht)
+DEF_ASM_BASE(strt)
+DEF_ASM_BASE(sub)
+DEF_ASM_BASE(subs)
+DEF_ASM_BASE(subw)
+DEF_ASM_BASE(sxtb)
+DEF_ASM_BASE(sxth)
+DEF_ASM_BASE(uxtb)
+DEF_ASM_BASE(uxth)
 
-DEF_ASM_CONDED_WITH_QUALIFIER(mla)
-DEF_ASM_CONDED_WITH_QUALIFIER(mls)
+DEF_ASM_BASE(mla)
+DEF_ASM_BASE(mls)
 
-DEF_ASM_CONDED_WITH_QUALIFIER(mul)
-DEF_ASM_CONDED_WITH_QUALIFIER(muls)
-DEF_ASM_CONDED_WITH_QUALIFIER(sdiv)
-DEF_ASM_CONDED_WITH_QUALIFIER(smlal)
-DEF_ASM_CONDED_WITH_QUALIFIER(smull)
-DEF_ASM_CONDED_WITH_QUALIFIER(ssat)
-DEF_ASM_CONDED_WITH_QUALIFIER(udiv)
-DEF_ASM_CONDED_WITH_QUALIFIER(umlal)
-DEF_ASM_CONDED_WITH_QUALIFIER(umull)
-DEF_ASM_CONDED_WITH_QUALIFIER(usat)
+DEF_ASM_BASE(mul)
+DEF_ASM_BASE(muls)
+DEF_ASM_BASE(sdiv)
+DEF_ASM_BASE(smlal)
+DEF_ASM_BASE(smull)
+DEF_ASM_BASE(ssat)
+DEF_ASM_BASE(udiv)
+DEF_ASM_BASE(umlal)
+DEF_ASM_BASE(umull)
+DEF_ASM_BASE(usat)
 
 /* floating point */
-DEF_ASM_CONDED_WITH_QUALIFIER(vpush)
-DEF_ASM_CONDED_WITH_QUALIFIER(vpop)
-DEF_ASM_CONDED_VFP_F32_F64(vadd)
-DEF_ASM_CONDED_VFP_F32_F64(vsub)
-DEF_ASM_CONDED_VFP_F32_F64(vmul)
-DEF_ASM_CONDED_VFP_F32_F64(vdiv)
-DEF_ASM_CONDED_VFP_F32_F64(vneg)
-DEF_ASM_CONDED_VFP_F32_F64(vcmp)
-DEF_ASM_CONDED(vmov)
-DEF_ASM_CONDED(vmrs)
+DEF_ASM_BASE(vpush)
+DEF_ASM_BASE(vpop)
+DEF_ASM_BASE(vadd)
+DEF_ASM_BASE(vsub)
+DEF_ASM_BASE(vmul)
+DEF_ASM_BASE(vdiv)
+DEF_ASM_BASE(vneg)
+DEF_ASM_BASE(vcmp)
+DEF_ASM_BASE(vmov)
+DEF_ASM_BASE(vmrs)
 
 /* multiplication */

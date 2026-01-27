@@ -242,6 +242,17 @@ FLOAT_TEST_FILES = [
     ("../tests2/134_double_to_signed.c", 0),
 ]
 
+# Known TCC compiler bug reproduction tests
+# These tests are expected to fail until the bugs are fixed
+TCC_BUG_TEST_FILES = [
+    # Bug: "load_to_dest_ir I64/F64: dest.pr1 is spilled, need IR-level handling"
+    # Occurs when returning 64-bit values from functions with volatile memory access
+    ("test_tcc_i64_ir_bug.c", 0),
+    
+    # Bug: Volatile register access issues with ARM DWT cycle counter
+    ("test_tcc_volatile_reg.c", 0),
+]
+
 TEST_FILES_WITH_ARGS = [
     ("../tests2/31_args.c", ["arg1", "arg2", "arg3", "arg4", "arg5"], 0),
 ]
@@ -540,3 +551,37 @@ def test_qemu_tagged_execution(test_file, tag, expected_lines, expected_exit_cod
         pytest.fail("test_file is None")
 
     _run_tagged_qemu_test(test_file, tag, expected_lines, expected_exit_code, opt_level=opt_level, output_dir=tmp_path)
+
+
+
+# TCC Compiler Bug Test Matrix
+def _generate_tcc_bug_params():
+    """Generate test parameters for TCC bug reproduction tests."""
+    params = []
+    ids = []
+    for test_file, expected in TCC_BUG_TEST_FILES:
+        for opt in OPT_LEVELS:
+            params.append((test_file, expected, opt))
+            ids.append(f"{_test_id(test_file)}{opt}")
+    return params, ids
+
+
+_TCC_BUG_PARAMS, _TCC_BUG_IDS = _generate_tcc_bug_params() if TCC_BUG_TEST_FILES else ([], [])
+
+
+@pytest.mark.parametrize("test_file,expected_exit_code,opt_level", _TCC_BUG_PARAMS, ids=_TCC_BUG_IDS)
+def test_tcc_compiler_bugs(test_file, expected_exit_code, opt_level, tmp_path):
+    """Test cases for TCC compiler bug reproductions.
+    
+    These tests verify that previously fixed compiler bugs stay fixed:
+    
+    1. test_tcc_i64_ir_bug: "load_to_dest_ir I64/F64: dest.pr1 is spilled" error
+       - Fixed: Handle case when pr1_spilled is set but pr1_reg is PREG_REG_NONE
+       
+    2. test_tcc_volatile_reg: Volatile memory-mapped register access issues
+       - Fixed: Handle 64-bit constant load to 32-bit destination
+    """
+    if test_file is None:
+        pytest.fail("test_file is None")
+
+    _run_qemu_test(test_file, expected_exit_code, opt_level=opt_level, output_dir=tmp_path)

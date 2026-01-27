@@ -1,0 +1,3 @@
+# Requirements for RP2350 benchmark runners
+pyserial>=3.5
+paramiko>=2.7.0

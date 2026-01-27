@@ -4,3 +4,6 @@
 [submodule "tests/ir_tests/qemu/mps2-an505/libs/newlib"]
 	path = tests/ir_tests/qemu/mps2-an505/libs/newlib
 	url = https://github.com/bminor/newlib.git
+[submodule "tests/benchmarks/libs/pico-sdk"]
+	path = tests/benchmarks/libs/pico-sdk
+	url = https://github.com/raspberrypi/pico-sdk.git

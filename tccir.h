@@ -335,11 +335,6 @@ typedef struct TCCIRState
   uint8_t prevent_coalescing;
   int32_t loc;
 
-  /* SValue pool for compact IR storage - operands stored contiguously */
-  SValue *svalue_pool;
-  int svalue_pool_count;
-  int svalue_pool_capacity;
-
   /* IROperand separate pools for cache efficiency */
   int64_t *pool_i64; /* 64-bit integer constants */
   int pool_i64_count;
@@ -353,9 +348,13 @@ typedef struct TCCIRState
   int pool_symref_count;
   int pool_symref_capacity;
 
-  /* IROperand array - parallel to svalue_pool, stores compact 8-byte operands.
-   * Index i in iroperand_pool corresponds to index i in svalue_pool.
-   * During migration, both are populated; after migration, svalue_pool is removed. */
+  CType *pool_ctype; /* CType storage for struct/array operands */
+  int pool_ctype_count;
+  int pool_ctype_capacity;
+
+  /* IROperand pool - stores compact 8-byte operands for all instruction operands.
+   * Operand layout: dest (if present), src1 (if present), src2 (if present).
+   * IRQuadCompact.operand_base indexes into this pool. */
   IROperand *iroperand_pool;
   int iroperand_pool_count;
   int iroperand_pool_capacity;
@@ -484,9 +483,6 @@ void tcc_ir_set_addrtaken(TCCIRState *ir, int vreg);
 
 /* Codegen operand access - reads from iroperand_pool with register allocation */
 int tcc_ir_codegen_get_operand(TCCIRState *ir, const IRQuadCompact *q, int slot, SValue *out);
-int tcc_ir_codegen_get_dest(TCCIRState *ir, const IRQuadCompact *q, SValue *out);
-int tcc_ir_codegen_get_src1(TCCIRState *ir, const IRQuadCompact *q, SValue *out);
-int tcc_ir_codegen_get_src2(TCCIRState *ir, const IRQuadCompact *q, SValue *out);
 
 void tcc_ir_patch_live_intervals_registers(TCCIRState *ir);
 IRLiveInterval *tcc_ir_get_live_interval(TCCIRState *ir, int vreg);
@@ -508,6 +504,8 @@ int tcc_ir_return_value_optimization(TCCIRState *ir);
 int tcc_ir_store_load_forwarding(TCCIRState *ir);
 int tcc_ir_redundant_store_elimination(TCCIRState *ir);
 void tcc_ir_print_vreg(int vreg);
+void print_iroperand_short(TCCIRState *ir, IROperand op);
+void tcc_print_quadruple_irop(TCCIRState *ir, IRQuadCompact *q, int pc);
 void tcc_ir_generate_cmp_jmp_set(TCCIRState *ir);
 void tcc_ir_start_basic_block(TCCIRState *ir);
 
@@ -544,71 +542,21 @@ static inline int ir_op_slot_count(TccIrOp op)
   return irop_config[op].has_dest + irop_config[op].has_src1 + irop_config[op].has_src2;
 }
 
-static inline SValue *tcc_ir_op_get_dest(const TCCIRState *ir, const IRQuadCompact *q)
-{
-  if (!irop_config[q->op].has_dest)
-    return NULL;
-  return &ir->svalue_pool[q->operand_base];
-}
-
-static inline SValue *tcc_ir_get_dest(const TCCIRState *ir, int index)
-{
-  IRQuadCompact *q = &ir->compact_instructions[index];
-  if (!irop_config[q->op].has_dest)
-    return NULL;
-  return &ir->svalue_pool[q->operand_base];
-}
-
-static inline SValue *tcc_ir_op_get_src1(const TCCIRState *ir, const IRQuadCompact *q)
-{
-  if (!irop_config[q->op].has_src1)
-    return NULL;
-  int off = irop_config[q->op].has_dest;
-  return &ir->svalue_pool[q->operand_base + off];
-}
-
-static inline SValue *tcc_ir_get_src1(const TCCIRState *ir, int index)
-{
-  IRQuadCompact *q = &ir->compact_instructions[index];
-  if (!irop_config[q->op].has_src1)
-    return NULL;
-  const int off = irop_config[q->op].has_dest;
-  return &ir->svalue_pool[q->operand_base + off];
-}
-
-static inline SValue *tcc_ir_op_get_src2(const TCCIRState *ir, const IRQuadCompact *q)
-{
-  if (!irop_config[q->op].has_src2)
-    return NULL;
-  int off = irop_config[q->op].has_dest + irop_config[q->op].has_src1;
-  return &ir->svalue_pool[q->operand_base + off];
-}
-
-static inline SValue *tcc_ir_get_src2(const TCCIRState *ir, int index)
-{
-  IRQuadCompact *q = &ir->compact_instructions[index];
-  if (!irop_config[q->op].has_src2)
-    return NULL;
-  int off = irop_config[q->op].has_dest + irop_config[q->op].has_src1;
-  return &ir->svalue_pool[q->operand_base + off];
-}
-
 /* ============================================================================
  * IROperand pool accessor functions - compact 8-byte operand access
  * ============================================================================
- * These mirror the SValue accessors but return IROperand instead.
- * Operand layout matches svalue_pool: dest (if present), src1, src2.
+ * Operand layout: dest (if present), src1 (if present), src2 (if present).
  * Returns IROP_NONE if the operand is not used by this operation.
  */
 
-static inline IROperand tcc_ir_op_get_dest_irop(const TCCIRState *ir, const IRQuadCompact *q)
+static inline IROperand tcc_ir_op_get_dest(const TCCIRState *ir, const IRQuadCompact *q)
 {
   if (!irop_config[q->op].has_dest)
     return IROP_NONE;
   return ir->iroperand_pool[q->operand_base];
 }
 
-static inline IROperand tcc_ir_get_dest_irop(const TCCIRState *ir, int index)
+static inline IROperand tcc_ir_get_dest(const TCCIRState *ir, int index)
 {
   IRQuadCompact *q = &ir->compact_instructions[index];
   if (!irop_config[q->op].has_dest)
@@ -616,7 +564,7 @@ static inline IROperand tcc_ir_get_dest_irop(const TCCIRState *ir, int index)
   return ir->iroperand_pool[q->operand_base];
 }
 
-static inline IROperand tcc_ir_op_get_src1_irop(const TCCIRState *ir, const IRQuadCompact *q)
+static inline IROperand tcc_ir_op_get_src1(const TCCIRState *ir, const IRQuadCompact *q)
 {
   if (!irop_config[q->op].has_src1)
     return IROP_NONE;
@@ -624,7 +572,7 @@ static inline IROperand tcc_ir_op_get_src1_irop(const TCCIRState *ir, const IRQu
   return ir->iroperand_pool[q->operand_base + off];
 }
 
-static inline IROperand tcc_ir_get_src1_irop(const TCCIRState *ir, int index)
+static inline IROperand tcc_ir_get_src1(const TCCIRState *ir, int index)
 {
   IRQuadCompact *q = &ir->compact_instructions[index];
   if (!irop_config[q->op].has_src1)
@@ -633,7 +581,7 @@ static inline IROperand tcc_ir_get_src1_irop(const TCCIRState *ir, int index)
   return ir->iroperand_pool[q->operand_base + off];
 }
 
-static inline IROperand tcc_ir_op_get_src2_irop(const TCCIRState *ir, const IRQuadCompact *q)
+static inline IROperand tcc_ir_op_get_src2(const TCCIRState *ir, const IRQuadCompact *q)
 {
   if (!irop_config[q->op].has_src2)
     return IROP_NONE;
@@ -641,26 +589,69 @@ static inline IROperand tcc_ir_op_get_src2_irop(const TCCIRState *ir, const IRQu
   return ir->iroperand_pool[q->operand_base + off];
 }
 
-static inline IROperand tcc_ir_get_src2_irop(const TCCIRState *ir, int index)
+static inline IROperand tcc_ir_get_src2(const TCCIRState *ir, int index)
 {
   IRQuadCompact *q = &ir->compact_instructions[index];
   if (!irop_config[q->op].has_src2)
     return IROP_NONE;
   int off = irop_config[q->op].has_dest + irop_config[q->op].has_src1;
   return ir->iroperand_pool[q->operand_base + off];
+}
+
+/* ============================================================================
+ * IROperand pool setter functions
+ * ============================================================================
+ * Direct operand pool manipulation - used by optimization passes.
+ */
+
+static inline void tcc_ir_op_set_dest(TCCIRState *ir, const IRQuadCompact *q, IROperand irop)
+{
+  if (!irop_config[q->op].has_dest)
+    return;
+  ir->iroperand_pool[q->operand_base] = irop;
+}
+
+static inline void tcc_ir_set_dest(TCCIRState *ir, int index, IROperand irop)
+{
+  IRQuadCompact *q = &ir->compact_instructions[index];
+  if (!irop_config[q->op].has_dest)
+    return;
+  ir->iroperand_pool[q->operand_base] = irop;
+}
+
+static inline void tcc_ir_op_set_src1(TCCIRState *ir, const IRQuadCompact *q, IROperand irop)
+{
+  if (!irop_config[q->op].has_src1)
+    return;
+  int off = irop_config[q->op].has_dest;
+  ir->iroperand_pool[q->operand_base + off] = irop;
+}
+
+static inline void tcc_ir_set_src1(TCCIRState *ir, int index, IROperand irop)
+{
+  IRQuadCompact *q = &ir->compact_instructions[index];
+  if (!irop_config[q->op].has_src1)
+    return;
+  int off = irop_config[q->op].has_dest;
+  ir->iroperand_pool[q->operand_base + off] = irop;
+}
+
+static inline void tcc_ir_op_set_src2(TCCIRState *ir, const IRQuadCompact *q, IROperand irop)
+{
+  if (!irop_config[q->op].has_src2)
+    return;
+  int off = irop_config[q->op].has_dest + irop_config[q->op].has_src1;
+  ir->iroperand_pool[q->operand_base + off] = irop;
+}
+
+static inline void tcc_ir_set_src2(TCCIRState *ir, int index, IROperand irop)
+{
+  IRQuadCompact *q = &ir->compact_instructions[index];
+  if (!irop_config[q->op].has_src2)
+    return;
+  int off = irop_config[q->op].has_dest + irop_config[q->op].has_src1;
+  ir->iroperand_pool[q->operand_base + off] = irop;
 }
 
 /* Pool management functions */
-void tcc_ir_svalue_pool_init(TCCIRState *ir);
-void tcc_ir_svalue_pool_free(TCCIRState *ir);
-int tcc_ir_svalue_pool_add(TCCIRState *ir, const SValue *sv);
-
-/* Expand a compact instruction to a full TACQuadruple (for migration) */
-void tcc_ir_expand_quad(TCCIRState *ir, int index, TACQuadruple *out);
-
-/* Write back modified operands from a TACQuadruple to the pool */
-void tcc_ir_writeback_quad(TCCIRState *ir, int index, TACQuadruple *q);
-
-/* Synchronized write helpers - update BOTH svalue_pool and IROperand pools */
-void tcc_ir_sync_operand(TCCIRState *ir, int instr_idx, int operand_slot, const SValue *sv);
-void tcc_ir_sync_quad(TCCIRState *ir, int instr_idx, const TACQuadruple *q);
+int tcc_ir_iroperand_pool_add(TCCIRState *ir, IROperand irop);

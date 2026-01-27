@@ -149,7 +149,12 @@
 #define __UINTPTR_TYPE__ unsigned __PTRDIFF_TYPE__
 #define __INTPTR_TYPE__ __PTRDIFF_TYPE__
 #endif
+#define __INT8_TYPE__ signed char
+#define __INT16_TYPE__ short
 #define __INT32_TYPE__ int
+#define __UINT8_TYPE__ unsigned char
+#define __UINT16_TYPE__ unsigned short
+#define __UINT32_TYPE__ unsigned int
 
 #if !defined _WIN32
 /* glibc defines. We do not support __USER_NAME_PREFIX__ */

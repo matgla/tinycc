@@ -1,6 +1,7 @@
 #ifndef ARM_THUMB_DEFS_H
 #define ARM_THUMB_DEFS_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 /* ARM Thumb target definitions */
@@ -217,5 +218,62 @@ ST_FUNC int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int ca
 ST_FUNC void g(int c);
 ST_FUNC void gen_le16(int c);
 ST_FUNC void gen_le32(int c);
+
+/* ========================================================================
+ * Assembly Suffix Parsing - Runtime parsing of condition codes and qualifiers
+ * ======================================================================== */
+
+/* Condition code enumeration for ARM/Thumb instructions */
+typedef enum thumb_condition_code {
+    COND_EQ = 0,  /* Equal */
+    COND_NE = 1,  /* Not equal */
+    COND_CS = 2,  /* Carry set (unsigned >=) */
+    COND_CC = 3,  /* Carry clear (unsigned <) */
+    COND_MI = 4,  /* Minus (negative) */
+    COND_PL = 5,  /* Plus (positive or zero) */
+    COND_VS = 6,  /* Overflow set */
+    COND_VC = 7,  /* Overflow clear */
+    COND_HI = 8,  /* Higher (unsigned >) */
+    COND_LS = 9,  /* Lower or same (unsigned <=) */
+    COND_GE = 10, /* Greater or equal (signed >=) */
+    COND_LT = 11, /* Less than (signed <) */
+    COND_GT = 12, /* Greater than (signed >) */
+    COND_LE = 13, /* Less or equal (signed <=) */
+    COND_AL = 14, /* Always (unconditional) */
+    COND_RSVD = 15, /* Reserved */
+} thumb_condition_code;
+
+/* Width qualifier enumeration for ARM/Thumb instructions */
+typedef enum thumb_width_qualifier {
+    WIDTH_NONE = 0,   /* No qualifier */
+    WIDTH_WIDE = 1,   /* .w - force 32-bit encoding */
+    WIDTH_NARROW = 2, /* .n - force 16-bit encoding */
+    WIDTH_RESERVED = 3, /* ._ - reserved */
+} thumb_width_qualifier;
+
+/* Suffix parsing result */
+typedef struct thumb_asm_suffix {
+    thumb_condition_code condition;
+    thumb_width_qualifier width;
+    uint8_t has_suffix; /* 1 if any suffix was present */
+} thumb_asm_suffix;
+
+/* Condition code name to value mapping structure */
+typedef struct cond_name_entry {
+    const char *name;
+    int code;
+} cond_name_entry_t;
+
+/* Condition code name to value mapping table */
+extern const cond_name_entry_t cond_names[];
+
+/* Parse assembly instruction token string to extract base token and condition code */
+/* Input:  token - the token ID to parse
+ * Output: base_token - receives the base instruction token ID (e.g., TOK_ASM_add)
+ * Returns: The condition code (0-14 for eq/al, or -1 for AL/no suffix)
+ */
+ST_FUNC int thumb_parse_token_suffix(int token, int *base_token);
+
+#define COND_NAMES_COUNT 16
 
 #endif /* ARM_THUMB_DEFS_H */

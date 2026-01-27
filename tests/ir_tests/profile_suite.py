@@ -57,7 +57,7 @@ def _test_id(test_file):
     return Path(primary).stem if primary else "unknown"
 
 
-def profile_test(test_file, output_dir, profiler_tool="heaptrack", extra_cflags: str = "", compiler: Path = None):
+def profile_test(test_file, output_dir, profiler_tool="heaptrack", extra_cflags: str = "", compiler: Path = None, two_phase: bool = False):
     """Profile a single test compilation."""
     test_name = _test_id(test_file)
 
@@ -76,6 +76,7 @@ def profile_test(test_file, output_dir, profiler_tool="heaptrack", extra_cflags:
         compiler=compiler,
         profiler=profile_config,
         extra_cflags=extra_cflags or "",
+        two_phase=two_phase,
         output_dir=output_dir / "build",
         clean_before_build=True,
     )
@@ -197,11 +198,13 @@ def main():
     parser.add_argument("--include-float", action="store_true",
                         help="Include floating point tests")
     parser.add_argument("--cflags", type=str, default="",
-                        help="Additional CFLAGS to pass to the compiler (e.g. '-O0 -g -DDEBUG')")
+                        help="Additional CFLAGS to pass to the compiler (e.g. '-Wl,--gc-sections-aggressive')")
     parser.add_argument("--test", "-t", type=str,
                         help="Run only test matching this pattern")
     parser.add_argument("--compiler", "-c", type=Path, default=None,
                         help="Path to compiler binary (default: use armv8m-tcc from repo root)")
+    parser.add_argument("--two-phase", action="store_true",
+                        help="Use two-phase compilation (reduces memory usage)")
     args = parser.parse_args()
 
     # Prepare output directory
@@ -240,6 +243,7 @@ def main():
             profiler_tool=args.profiler,
             extra_cflags=args.cflags,
             compiler=args.compiler,
+            two_phase=args.two_phase,
         )
         result_dict = result_to_dict(result, test_name)
         results.append(result_dict)

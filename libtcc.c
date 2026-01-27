@@ -19,6 +19,7 @@
  */
 
 #include "tcc.h"
+#include "tccld.h"
 
 /********************************************************/
 /* global variables */
@@ -767,6 +768,7 @@ LIBTCCAPI TCCState *tcc_new(void)
   s->char_is_unsigned = 1;
 #endif
   s->pic = 0;
+  s->no_pie = 0;
 #if defined(TCC_TARGET_ARM) || defined(TCC_TARGET_ARM_THUMB)
   s->float_abi = ARM_SOFTFP_FLOAT; // use soft abi and prefer hard library as default
   s->fpu_type = ARM_FPU_AUTO;      /* default to auto-detect */
@@ -798,6 +800,9 @@ LIBTCCAPI void tcc_delete(TCCState *s1)
   arm_deinit(s1);
 #endif
 
+  /* free lazy object files (Phase 2 GC) */
+  tcc_free_lazy_objfiles(s1);
+
   /* free sections */
   tccelf_delete(s1);
 
@@ -819,7 +824,10 @@ LIBTCCAPI void tcc_delete(TCCState *s1)
   tcc_free(s1->outfile);
   tcc_free(s1->deps_outfile);
   tcc_free(s1->linker_script);
-  tcc_free(s1->ld_script);
+  if (s1->ld_script) {
+    ld_script_cleanup(s1->ld_script);
+    tcc_free(s1->ld_script);
+  }
   dynarray_reset(&s1->files, &s1->nb_files);
   dynarray_reset(&s1->target_deps, &s1->nb_target_deps);
   dynarray_reset(&s1->pragma_libs, &s1->nb_pragma_libs);
@@ -840,8 +848,20 @@ LIBTCCAPI int tcc_set_output_type(TCCState *s, int output_type)
 {
 #if defined(CONFIG_TCC_PIE)
   /* PIE not supported on bare-metal ARM Thumb targets (no dynamic linker) */
-  if (output_type == TCC_OUTPUT_EXE)
+  if (output_type == TCC_OUTPUT_EXE) {
+#if defined(TCC_TARGET_ARM_THUMB)
+    /* Disable PIE for bare-metal ARM Thumb targets */
+    /* (no dynamic linker available) */
+#elif defined(s)
+    if (s->no_pie) {
+      /* Explicitly disabled via -no-pie */
+    } else {
+      output_type |= TCC_OUTPUT_DYN;
+    }
+#else
     output_type |= TCC_OUTPUT_DYN;
+#endif
+  }
 #endif
   s->output_type = output_type;
 
@@ -940,6 +960,7 @@ ST_FUNC int tcc_add_file_internal(TCCState *s1, const char *filename, int flags)
   }
 
   s1->current_filename = filename;
+  s1->current_archive_offset = 0;  /* Reset archive offset for regular files */
   if (flags & AFF_TYPE_BIN)
   {
     ElfW(Ehdr) ehdr;
@@ -1325,6 +1346,11 @@ static int tcc_set_linker(TCCState *s, const char *option)
     {
       s->gc_sections = 1;
     }
+    else if (link_option(option, "gc-sections-aggressive", &p))
+    {
+      s->gc_sections = 1;
+      s->gc_sections_aggressive = 1;
+    }
     else if (link_option(option, "no-gc-sections", &p))
     {
       s->gc_sections = 0;
@@ -1449,6 +1475,7 @@ enum
   TCC_OPTION_mpic_data_is_text_relative,
   TCC_OPTION_fpic,
   TCC_OPTION_fpie,
+  TCC_OPTION_no_pie,
   TCC_OPTION_T,
 #ifdef CONFIG_TCC_DEBUG
   TCC_OPTION_dump_ir,
@@ -1497,6 +1524,7 @@ static const TCCOption tcc_options[] = {
     {"O", TCC_OPTION_O, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP},
     {"fpie", TCC_OPTION_fpie, 0},
     {"fpic", TCC_OPTION_fpic, 0},
+    {"no-pie", TCC_OPTION_no_pie, 0},
 #if defined(TCC_TARGET_ARM) || defined(TCC_TARGET_ARM_THUMB)
     {"mfloat-abi=", TCC_OPTION_mfloat_abi, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP},
     {"mfloat-abi", TCC_OPTION_mfloat_abi, TCC_OPTION_HAS_ARG},
@@ -1885,6 +1913,9 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
     case TCC_OPTION_fpic:
     case TCC_OPTION_fpie:
       s->pic = 1;
+      break;
+    case TCC_OPTION_no_pie:
+      s->no_pie = 1;
       break;
 #if defined(TCC_TARGET_ARM) || defined(TCC_TARGET_ARM_THUMB)
     case TCC_OPTION_mfloat_abi:

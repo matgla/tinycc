@@ -268,6 +268,41 @@ static int ld_expect(LDParser *p, int tok)
   return 0;
 }
 
+/* ================= Dynamic Pattern Management ================= */
+
+/* Add a pattern to an output section with dynamic allocation.
+ * Returns pointer to the new pattern or NULL on error. */
+static LDSectionPattern *ld_add_pattern(LDOutputSection *os, int keep)
+{
+    if (os->nb_patterns >= os->patterns_capacity) {
+        /* Grow the patterns array */
+        int new_capacity = os->patterns_capacity == 0 ? 4 : os->patterns_capacity * 2;
+        LDSectionPattern *new_patterns = tcc_realloc(os->patterns, 
+                                                      new_capacity * sizeof(LDSectionPattern));
+        if (!new_patterns)
+            return NULL;
+        os->patterns = new_patterns;
+        os->patterns_capacity = new_capacity;
+    }
+    
+    LDSectionPattern *pat = &os->patterns[os->nb_patterns++];
+    memset(pat, 0, sizeof(*pat));
+    pat->keep = keep;
+    pat->type = LD_PAT_GLOB;
+    return pat;
+}
+
+/* Free all dynamically allocated patterns in an output section */
+static void ld_free_patterns(LDOutputSection *os)
+{
+    if (os->patterns) {
+        tcc_free(os->patterns);
+        os->patterns = NULL;
+    }
+    os->nb_patterns = 0;
+    os->patterns_capacity = 0;
+}
+
 /* ================= Expression Parser ================= */
 
 static addr_t ld_parse_expr(LDParser *p);
@@ -664,12 +699,11 @@ static int ld_parse_phdrs(LDParser *p)
 static int ld_parse_section_pattern(LDParser *p, LDOutputSection *os, int keep)
 {
   LDSectionPattern *pat;
-  if (os->nb_patterns >= LD_MAX_SECTION_PATTERNS)
+  
+  /* Allocate initial pattern */
+  pat = ld_add_pattern(os, keep);
+  if (!pat)
     return -1;
-
-  pat = &os->patterns[os->nb_patterns];
-  pat->keep = keep;
-  pat->type = LD_PAT_GLOB;
 
   /* Parse file pattern (e.g., * or *.o) */
   if (p->tok == LDTOK_NAME || p->tok == '*')
@@ -687,13 +721,10 @@ static int ld_parse_section_pattern(LDParser *p, LDOutputSection *os, int keep)
     {
       if (p->tok == LDTOK_NAME || p->tok == '.')
       {
-        if (os->nb_patterns < LD_MAX_SECTION_PATTERNS)
-        {
-          pat = &os->patterns[os->nb_patterns];
+        pat = ld_add_pattern(os, keep);
+        if (pat) {
           pstrcpy(pat->pattern, sizeof(pat->pattern), p->tok_buf);
-          pat->keep = keep;
           pat->type = (strchr(pat->pattern, '*') != NULL) ? LD_PAT_GLOB : LD_PAT_EXACT;
-          os->nb_patterns++;
         }
         ld_next_token(p);
       }
@@ -1097,6 +1128,18 @@ void ld_script_init(LDScript *ld)
   memset(ld, 0, sizeof(*ld));
   ld->current_section_idx = -1;
   ld->current_memory_region_idx = -1;
+}
+
+/* Free all dynamically allocated memory in the linker script */
+void ld_script_cleanup(LDScript *ld)
+{
+  if (!ld)
+    return;
+  
+  /* Free dynamically allocated patterns for each output section */
+  for (int i = 0; i < ld->nb_output_sections; i++) {
+    ld_free_patterns(&ld->output_sections[i]);
+  }
 }
 
 int ld_script_parse(TCCState *s1, LDScript *ld, int fd)

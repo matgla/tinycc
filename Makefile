@@ -479,8 +479,20 @@ test-prepare:
 	cd $(IRTESTS_DIR)/qemu/mps2-an505 && sh ./build_newlib.sh
 
 
+ASMTESTS_DIR := tests/thumb/armv8m
+
+.PHONY: test-asm
+test-asm: cross
+	@echo "------------ assembler tests (pytest) ------------"
+	@cd $(ASMTESTS_DIR) && \
+		TEST_CC="$(CURDIR)/armv8m-tcc" \
+		TEST_COMPARE_CC="arm-none-eabi-gcc" \
+		TEST_OBJDUMP="arm-none-eabi-objdump" \
+		TEST_OBJCOPY="arm-none-eabi-objcopy" \
+		$(PYTEST) --tb=short -q .
+
 # run IR tests via pytest (preferred)
-test: cross test-aeabi-host test-venv test-prepare
+test: cross test-aeabi-host test-asm test-venv test-prepare
 	@echo "------------ ir_tests (pytest) ------------"
 	@if [ "$(USE_VENV)" = "1" ]; then \
 		cd $(IRTESTS_DIR) && "$(VENV_PY)" -m pytest -s -n auto; \

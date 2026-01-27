@@ -115,11 +115,11 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, i
       const IRQuadCompact *p = &ir->compact_instructions[j];
       if (p->op == TCCIR_OP_FUNCPARAMVAL)
       {
-        const SValue *src2 = tcc_ir_get_src2(ir, j);
-        int param_call_id = src2 ? TCCIR_DECODE_CALL_ID((uint32_t)src2->c.i) : -1;
+        const IROperand src2 = tcc_ir_get_src2(ir, j);
+        int param_call_id = irop_is_none(src2) ? -1 : TCCIR_DECODE_CALL_ID((uint32_t)src2.u.imm32);
         if (param_call_id == call_id)
         {
-          int param_idx = src2 ? TCCIR_DECODE_PARAM_IDX((uint32_t)src2->c.i) : -1;
+          int param_idx = TCCIR_DECODE_PARAM_IDX((uint32_t)src2.u.imm32);
           if (param_idx > max_arg_index)
             max_arg_index = param_idx;
         }
@@ -159,54 +159,48 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, i
     args = (IROperand *)tcc_mallocz(sizeof(IROperand) * argc);
   }
 
-  /* Single scan to collect both parameter type info AND SValues */
   int found_count = 0;
   for (int j = call_idx - 1; j >= 0 && found_count < argc; --j)
   {
     const IRQuadCompact *p = &ir->compact_instructions[j];
     if (p->op == TCCIR_OP_FUNCPARAMVAL)
     {
-      const SValue *src2 = tcc_ir_get_src2(ir, j);
-      int param_call_id = src2 ? TCCIR_DECODE_CALL_ID((uint32_t)src2->c.i) : -1;
+      const IROperand src2 = tcc_ir_get_src2(ir, j);
+      int param_call_id = !irop_is_none(src2) ? TCCIR_DECODE_CALL_ID((uint32_t)src2.u.imm32) : -1;
       if (param_call_id == call_id)
       {
-        const IROperand src1_irop = tcc_ir_get_src1_irop(ir, j);
-        const SValue *src1_sv = tcc_ir_get_src1(ir, j);
-        int param_idx = src2 ? TCCIR_DECODE_PARAM_IDX((uint32_t)src2->c.i) : -1;
+        const IROperand src1_irop = tcc_ir_get_src1(ir, j);
+        int param_idx = TCCIR_DECODE_PARAM_IDX((uint32_t)src2.u.imm32);
         if (param_idx >= 0 && param_idx < argc && !found[param_idx])
         {
           /* Collect IROperand if requested */
           if (args)
           {
-            if (src1_sv)
-              args[param_idx] = svalue_to_iroperand(ir, src1_sv);
-            else
-              args[param_idx] = src1_irop;
+            args[param_idx] = src1_irop;
             /* Apply register allocation to the operand */
             tcc_ir_fill_registers_ir(ir, &args[param_idx]);
           }
-
           /* Determine argument type and size */
-          if (!src1_sv)
+          if (irop_is_none(src1_irop))
           {
             tcc_error("compiler_error: FUNCPARAMVAL missing src1 for call_id=%d arg=%d", call_id, param_idx);
             goto cleanup_error;
           }
 
-          const int bt = src1_sv->type.t & VT_BTYPE;
+          // const int bt = src1_sv->type.t & VT_BTYPE;
           int size = 0;
           int align = 0;
 
-          if (bt == VT_STRUCT)
+          if (src1_irop.btype == IROP_BTYPE_STRUCT)
           {
-            size = type_size(&src1_sv->type, &align);
+            size = irop_type_size_align(src1_irop, &align);
             if (align < 1)
               align = 1;
             arg_descs[param_idx].kind = TCC_ABI_ARG_STRUCT_BYVAL;
             arg_descs[param_idx].size = (uint16_t)size;
             arg_descs[param_idx].alignment = (uint8_t)align;
           }
-          else if (tcc_is_64bit_type(src1_sv->type.t))
+          else if (irop_is_64bit(src1_irop))
           {
             arg_descs[param_idx].kind = TCC_ABI_ARG_SCALAR64;
             arg_descs[param_idx].size = 8;

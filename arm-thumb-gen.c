@@ -255,11 +255,11 @@ static ScratchRegAlloc get_scratch_reg_with_save(uint32_t exclude_regs)
     }
   }
 
+  int reg_to_save = -1;
 no_free_reg:
 
   /* No free register found - we need to save one to the stack */
   /* Prefer R_IP (R12) as it's the inter-procedure scratch register */
-  int reg_to_save = -1;
   if (!(exclude_regs & (1 << R_IP)))
   {
     reg_to_save = R_IP;
@@ -1548,7 +1548,9 @@ static uint32_t th_store_resolve_base_ir(int src_reg, IROperand sv, int btype, i
   int32_t off = 0;
 
   /* Get offset from IROperand */
-  if (tag == IROP_TAG_STACKOFF || tag == IROP_TAG_IMM32)
+  if (tag == IROP_TAG_STACKOFF)
+    off = irop_get_stack_offset(sv);
+  else if (tag == IROP_TAG_IMM32)
     off = sv.u.imm32;
 
   if (off >= 0)
@@ -2365,7 +2367,7 @@ void load_to_dest_ir(IROperand dest, IROperand src)
   case IROP_TAG_STACKOFF:
   {
     /* Stack-relative offset (VT_LOCAL or VT_LLOCAL semantics) */
-    int frame_offset = src.u.imm32;
+    int frame_offset = irop_get_stack_offset(src);
     int base_reg = tcc_state->need_frame_pointer ? R_FP : R_SP;
 
     /* Apply offset_to_args for stack-passed parameters */
@@ -2386,7 +2388,7 @@ void load_to_dest_ir(IROperand dest, IROperand src)
     else
     {
       /* Address-of stack slot: compute FP/SP + offset */
-      tcc_machine_addr_of_stack_slot(dest.pr0_reg, src.u.imm32, src.is_param);
+      tcc_machine_addr_of_stack_slot(dest.pr0_reg, irop_get_stack_offset(src), src.is_param);
     }
     return;
   }
@@ -2408,20 +2410,27 @@ void load_to_dest_ir(IROperand dest, IROperand src)
   case IROP_TAG_F64:
   {
     const uint64_t value = irop_get_imm64_ex(tcc_state->ir, src);
-    if (dest.pr1_spilled)
+    /* Check if destination is actually 64-bit (has a valid pr1_reg or is spilled).
+     * Note: pr1_spilled=1 with pr1_reg=PREG_REG_NONE is an inconsistent state
+     * that shouldn't happen, but we handle it by treating as 32-bit destination. */
+    const int dest_has_pr1 = (dest.pr1_reg != PREG_REG_NONE);
+    if (!dest_has_pr1 && !dest.pr1_spilled)
+    {
+      /* 32-bit destination - only load low 32 bits */
+      tcc_machine_load_constant(dest.pr0_reg, PREG_REG_NONE, (int64_t)(uint32_t)value, 0, NULL);
+    }
+    else if (dest.pr1_spilled && !dest_has_pr1)
+    {
+      /* Inconsistent state: spilled flag set but no register.
+       * This is a bug in the register allocator, but handle it gracefully
+       * by treating as 32-bit destination. */
+      tcc_machine_load_constant(dest.pr0_reg, PREG_REG_NONE, (int64_t)(uint32_t)value, 0, NULL);
+    }
+    else if (dest.pr1_spilled)
     {
       /* High register is spilled - this case should be handled at the IR level
-       * by first loading to a scratch reg then storing to spill slot.
-       * For now, error out to identify where this is happening. */
+       * by first loading to a scratch reg then storing to spill slot. */
       tcc_error("compiler_error: load_to_dest_ir I64/F64: dest.pr1 is spilled, need IR-level handling");
-    }
-    if (dest.pr1_reg == PREG_REG_NONE)
-    {
-      /* No high register allocated - use a scratch register for high word */
-      ScratchRegAlloc hi_alloc = get_scratch_reg_with_save((1u << dest.pr0_reg) | (1u << ARM_SP) | (1u << ARM_PC));
-      tcc_machine_load_constant(dest.pr0_reg, hi_alloc.reg, (int64_t)value, 1, NULL);
-      /* The high word is loaded but discarded - caller must not need it */
-      restore_scratch_reg(&hi_alloc);
     }
     else
     {
@@ -2469,12 +2478,6 @@ void load_to_dest_ir(IROperand dest, IROperand src)
     tcc_error("compiler_error: unknown IROperand tag in load_to_dest_ir: %d\n", tag);
     return;
   }
-}
-
-ST_FUNC void tcc_machine_load_to_reg(int r, int r1, SValue *src)
-{
-  const IROperand s = svalue_to_iroperand(tcc_state->ir, src);
-  load_to_reg_ir(r, r1, s);
 }
 
 /* Wrapper for loading IROperand to a register pair */
@@ -2656,6 +2659,7 @@ static void thumb_store_dest_pair_if_needed_ir(IROperand dest, int rd_low, int r
       IROperand dest_hi = dest;
       dest_hi.pr1_reg = PREG_REG_NONE;
       dest_hi.pr1_spilled = 0;
+      int orig_btype = dest_hi.btype;
       dest_hi.btype = IROP_BTYPE_INT32;
       if (irop_get_tag(dest_hi) == IROP_TAG_SYMREF)
       {
@@ -2665,6 +2669,11 @@ static void thumb_store_dest_pair_if_needed_ir(IROperand dest, int rd_low, int r
           uint32_t idx = tcc_ir_pool_add_symref(tcc_state->ir, symref->sym, symref->addend + 4, symref->flags);
           dest_hi.u.pool_idx = idx;
         }
+      }
+      else if (orig_btype == IROP_BTYPE_STRUCT)
+      {
+        /* For struct types, offset is stored as aux_data * 4, so add 1 to aux_data */
+        dest_hi.u.s.aux_data += 1; /* +4 bytes = +1 in aux_data units */
       }
       else
       {
@@ -4689,10 +4698,19 @@ static void assign_op_64bit(IROperand dest, IROperand src)
     /* Store low and high words separately as 32-bit stores.
      * When storing the low word, exclude src_hi from scratch allocation
      * to prevent clobbering the high word value before it's stored. */
+    int orig_btype = dest.btype;
     IROperand dest_lo = dest;
     dest_lo.btype = IROP_BTYPE_INT32;
     IROperand dest_hi = dest_lo;
-    dest_hi.u.imm32 += 4;
+    if (orig_btype == IROP_BTYPE_STRUCT)
+    {
+      /* For struct types, offset is stored as aux_data * 4, so add 1 to aux_data */
+      dest_hi.u.s.aux_data += 1; /* +4 bytes = +1 in aux_data units */
+    }
+    else
+    {
+      dest_hi.u.imm32 += 4;
+    }
 
     store_ex_ir(src_lo, dest_lo, (1u << src_hi));
     store_ir(src_hi, dest_hi);
@@ -4813,10 +4831,11 @@ ST_FUNC void tcc_gen_machine_lea_op(IROperand dest, IROperand src, TccIrOp op)
      */
     int offset;
     const int vreg_type = TCCIR_DECODE_VREG_TYPE(src.vr);
-    if (vreg_type == TCCIR_VREG_TYPE_VAR && src.u.imm32 != 0)
+    int src_stack_offset = irop_get_stack_offset(src);
+    if (vreg_type == TCCIR_VREG_TYPE_VAR && src_stack_offset != 0)
     {
       /* VAR vreg with non-zero c.i: use original variable offset */
-      offset = src.u.imm32;
+      offset = src_stack_offset;
     }
     else
     {
@@ -4825,7 +4844,7 @@ ST_FUNC void tcc_gen_machine_lea_op(IROperand dest, IROperand src, TccIrOp op)
       if (slot)
         offset = slot->offset;
       else
-        offset = (int)src.u.imm32;
+        offset = src_stack_offset;
     }
     /* Stack parameters live above the saved-register area.
      * When computing their address, fold in offset_to_args (prologue push size).
@@ -5379,7 +5398,7 @@ static int get_struct_base_addr(const IROperand *arg, int default_reg)
 
   if (tag == IROP_TAG_STACKOFF && arg->is_local)
   {
-    int local_off = arg->u.imm32;
+    int local_off = irop_get_stack_offset(*arg);
     if (arg->is_param && local_off >= 0)
       local_off += offset_to_args;
 
@@ -5888,6 +5907,7 @@ ST_FUNC void tcc_gen_machine_setif_op(IROperand dest, IROperand src, TccIrOp op)
   if (dest.pr0_reg >= 15)
     tcc_error("compiler_error: setif_op destination register is invalid (%d)", dest.pr0_reg);
   const int cond = mapcc(src.u.imm32);
+
   ot_check(th_mov_imm(dest.pr0_reg, 0, FLAGS_BEHAVIOUR_BLOCK, ENFORCE_ENCODING_NONE));
   ot_check(th_it(cond, 0x8)); /* IT <cond> (single instruction) */
   ot_check(th_mov_imm(dest.pr0_reg, 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));

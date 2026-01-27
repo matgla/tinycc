@@ -21,6 +21,10 @@
 #define USING_GLOBALS
 #include "tcc.h"
 
+#ifdef TCC_TARGET_ARM_ARCHV8M
+#include "arm-thumb-defs.h"
+#endif
+
 /* #define to 1 to enable (see parse_pp_string()) */
 #define ACCEPT_LF_IN_STRINGS 0
 
@@ -119,10 +123,10 @@ ST_FUNC void expect(const char *msg)
 #define TAL_DEBUG_FILE_LEN 40
 #endif
 
-#define TOKSYM_TAL_SIZE (768 * 1024) /* allocator for tiny TokenSym in table_ident */
-#define TOKSTR_TAL_SIZE (768 * 1024) /* allocator for tiny TokenString instances */
-#define TOKSYM_TAL_LIMIT 256         /* prefer unique limits to distinguish allocators debug msgs */
-#define TOKSTR_TAL_LIMIT 1024        /* 256 * sizeof(int) */
+#define TOKSYM_TAL_SIZE (48 * 1024) /* allocator for tiny TokenSym in table_ident */
+#define TOKSTR_TAL_SIZE (8 * 1024)  /* allocator for TokenString structs only (not buffers) */
+#define TOKSYM_TAL_LIMIT 256        /* prefer unique limits to distinguish allocators debug msgs */
+#define TOKSTR_TAL_LIMIT 128        /* structs are ~48-64 bytes */
 
 typedef struct TinyAlloc
 {
@@ -335,6 +339,10 @@ tail_call:
 }
 
 #endif /* USE_TAL */
+/* String token statistics - enable for analysis
+static unsigned long str_total_added = 0;
+static unsigned long str_bytes_copied = 0;
+*/
 
 /* ------------------------------------------------------------------------- */
 /* CString handling */
@@ -551,6 +559,40 @@ ST_FUNC TokenSym *tok_alloc(const char *str, int len)
       return ts;
     pts = &(ts->hash_next);
   }
+
+  /* NOTE: ARM assembly suffix parsing is now handled entirely in asm_opcode()
+   * via thumb_parse_token_suffix(). The aliasing below is disabled because
+   * it loses the original token string (e.g., "bhs" becomes "b"), making it
+   * impossible to extract the condition code later.
+   */
+#if 0 && defined(TCC_TARGET_ARM_ARCHV8M)
+  if (parse_flags & PARSE_FLAG_ASM_FILE && len >= 3)
+  {
+    /* Check if this looks like <instr><cond> where cond is 2 chars */
+    /* Use global condition codes array from arm-thumb-defs.h */
+    /* Note: len >= 3 to handle short instructions like "bhs" (b + hs) */
+    for (i = 0; cond_names[i].name != NULL; i++)
+    {
+      if (len >= 3 && memcmp(str + len - 2, cond_names[i].name, 2) == 0)
+      {
+        /* Found condition code suffix - try base instruction */
+        TokenSym *base_ts = tok_alloc(str, len - 2);
+        if (base_ts)
+        {
+          /* Create a token entry for the full string with the base token's ID */
+          /* Note: We're creating a separate token entry but reusing the base token's ID.
+           * This allows asm_opcode() to identify the base instruction while still
+           * having access to the full token string for suffix parsing. */
+          TokenSym *alias_ts = tok_alloc_new(pts, str, len);
+          alias_ts->tok = base_ts->tok;
+          return alias_ts;
+        }
+        break;
+      }
+    }
+  }
+#endif
+
   return tok_alloc_new(pts, str, len);
 }
 
@@ -1103,10 +1145,9 @@ static inline int tok_size(const int *p)
 /* token string handling */
 ST_INLN void tok_str_new(TokenString *s)
 {
-  s->str = NULL;
   s->len = s->need_spc = 0;
-  s->allocated_len = 0;
-  s->last_line_num = -1;
+  s->allocated_len = 0; /* 0 means using inline buffer (small_buf) */
+  s->last_line_num = 0; /* 0 means no line recorded yet */
 }
 
 ST_FUNC TokenString *tok_str_alloc(void)
@@ -1116,33 +1157,87 @@ ST_FUNC TokenString *tok_str_alloc(void)
   return str;
 }
 
+/* Note: str pointer passed here must be the heap pointer, not inline buffer */
 ST_FUNC void tok_str_free_str(int *str)
 {
-  tal_free(tokstr_alloc, str);
+  tcc_free(str);
 }
 
 ST_FUNC void tok_str_free(TokenString *str)
 {
-  tok_str_free_str(str->str);
+  if (str->allocated_len > 0)
+    tok_str_free_str(str->data.str);
   tal_free(tokstr_alloc, str);
+}
+
+/* Ensure the TokenString buffer is heap-allocated.
+   Returns the heap buffer pointer. Used when storing buffer refs in Sym->d/e.
+   For empty buffers, returns NULL (safe to tok_str_free_str). */
+static int *tok_str_ensure_heap(TokenString *s)
+{
+  if (s->len == 0)
+    return NULL;
+  if (s->allocated_len == 0)
+  {
+    /* Convert inline buffer to heap buffer */
+    int *heap_buf = tcc_malloc(s->len * sizeof(int));
+    memcpy(heap_buf, s->data.small_buf, s->len * sizeof(int));
+    s->data.str = heap_buf;
+    s->allocated_len = s->len;
+  }
+  return s->data.str;
 }
 
 ST_FUNC int *tok_str_realloc(TokenString *s, int new_size)
 {
   int *str, size;
 
+  /* Check if we can still use the inline buffer */
+  if (new_size <= TOKSTR_SMALL_BUFSIZE && s->allocated_len == 0)
+    return s->data.small_buf;
+
+  /* Transition from inline to heap buffer */
+  if (s->allocated_len == 0)
+  {
+    /* Allocate new heap buffer and copy inline data */
+    size = 8;
+    while (size < new_size)
+      size = size + (size >> 1); /* 1.5x growth */
+    str = tcc_malloc(size * sizeof(int));
+    if (s->len > 0)
+      memcpy(str, s->data.small_buf, s->len * sizeof(int));
+    s->data.str = str;
+    s->allocated_len = size;
+    return str;
+  }
+
+  /* Already using heap buffer - grow if needed */
   size = s->allocated_len;
-  if (size < 16)
-    size = 16;
   while (size < new_size)
-    size = size * 2;
+    size = size + (size >> 1); /* 1.5x growth instead of 2x */
   if (size > s->allocated_len)
   {
-    str = tal_realloc(tokstr_alloc, s->str, size * sizeof(int));
+    str = tcc_realloc(s->data.str, size * sizeof(int));
     s->allocated_len = size;
-    s->str = str;
+    s->data.str = str;
   }
-  return s->str;
+  return s->data.str;
+}
+
+/* Shrink heap-allocated token string buffer to exact size.
+   With system malloc, shrinking returns memory properly. */
+static void tok_str_shrink(TokenString *s)
+{
+  int exact = s->len;
+  if (exact > 0 && s->allocated_len > exact + 4)
+  {
+    int *ns = tcc_realloc(s->data.str, exact * sizeof(int));
+    if (ns)
+    {
+      s->data.str = ns;
+      s->allocated_len = exact;
+    }
+  }
 }
 
 ST_FUNC void tok_str_add(TokenString *s, int t)
@@ -1150,8 +1245,8 @@ ST_FUNC void tok_str_add(TokenString *s, int t)
   int len, *str;
 
   len = s->len;
-  str = s->str;
-  if (len >= s->allocated_len)
+  str = tok_str_buf(s);
+  if (len >= (s->allocated_len > 0 ? s->allocated_len : TOKSTR_SMALL_BUFSIZE))
     str = tok_str_realloc(s, len + 1);
   str[len++] = t;
   s->len = len;
@@ -1163,7 +1258,7 @@ ST_FUNC void begin_macro(TokenString *str, int alloc)
   str->prev = macro_stack;
   str->prev_ptr = macro_ptr;
   str->save_line_num = file->line_num;
-  macro_ptr = str->str;
+  macro_ptr = tok_str_buf(str);
   macro_stack = str;
 }
 
@@ -1181,7 +1276,7 @@ ST_FUNC void end_macro(void)
   else
   {
     if (str->alloc == 2)
-      str->str = NULL; /* don't free */
+      str->data.str = NULL; /* don't free */
     tok_str_free(str);
   }
 }
@@ -1189,13 +1284,61 @@ ST_FUNC void end_macro(void)
 static void tok_str_add2(TokenString *s, int t, CValue *cv)
 {
   int len, *str;
+  int nb_words;
+  int capacity;
 
   len = s->len;
-  str = s->str;
+  str = tok_str_buf(s);
+  capacity = s->allocated_len > 0 ? s->allocated_len : TOKSTR_SMALL_BUFSIZE;
 
-  /* allocate space for worst case */
-  if (len + TOK_MAX_SIZE >= s->allocated_len)
-    str = tok_str_realloc(s, len + TOK_MAX_SIZE + 1);
+  /* compute exact size needed based on token type */
+  switch (t)
+  {
+  case TOK_CINT:
+  case TOK_CUINT:
+  case TOK_CCHAR:
+  case TOK_LCHAR:
+  case TOK_CFLOAT:
+  case TOK_LINENUM:
+#if LONG_SIZE == 4
+  case TOK_CLONG:
+  case TOK_CULONG:
+#endif
+    nb_words = 2;
+    break;
+  case TOK_CDOUBLE:
+  case TOK_CLLONG:
+  case TOK_CULLONG:
+#if LONG_SIZE == 8
+  case TOK_CLONG:
+  case TOK_CULONG:
+#endif
+    nb_words = 3;
+    break;
+  case TOK_CLDOUBLE:
+#if LDOUBLE_SIZE == 8 || defined TCC_USING_DOUBLE_FOR_LDOUBLE
+    nb_words = 3;
+#elif LDOUBLE_SIZE == 12
+    nb_words = 4;
+#elif LDOUBLE_SIZE == 16
+    nb_words = 5;
+#else
+#error add long double size support
+#endif
+    break;
+  case TOK_PPNUM:
+  case TOK_PPSTR:
+  case TOK_STR:
+  case TOK_LSTR:
+    nb_words = 1 + (1 + (cv->str.size + sizeof(int) - 1) / sizeof(int));
+    break;
+  default:
+    nb_words = 1;
+    break;
+  }
+
+  if (len + nb_words > capacity)
+    str = tok_str_realloc(s, len + nb_words);
   str[len++] = t;
   switch (t)
   {
@@ -1217,12 +1360,10 @@ static void tok_str_add2(TokenString *s, int t, CValue *cv)
   case TOK_LSTR:
   {
     /* Insert the string into the int array. */
-    size_t nb_words = 1 + (cv->str.size + sizeof(int) - 1) / sizeof(int);
-    if (len + nb_words >= s->allocated_len)
-      str = tok_str_realloc(s, len + nb_words + 1);
+    size_t str_words = 1 + (cv->str.size + sizeof(int) - 1) / sizeof(int);
     str[len] = cv->str.size;
     memcpy(&str[len + 1], cv->str.data, cv->str.size);
-    len += nb_words;
+    len += str_words;
   }
   break;
   case TOK_CDOUBLE:
@@ -1658,7 +1799,7 @@ static int expr_preprocess(TCCState *s1)
 ST_FUNC void pp_error(CString *cs)
 {
   cstr_printf(cs, "bad preprocessor expression: #%s", get_tok_str(pp_expr, 0));
-  macro_ptr = macro_stack->str;
+  macro_ptr = tok_str_buf(macro_stack);
   while (next(), tok != TOK_EOF)
     cstr_printf(cs, " %s", get_tok_str(tok, &tokc));
 }
@@ -1754,10 +1895,11 @@ ST_FUNC void parse_define(void)
   }
   parse_flags = saved_parse_flags;
   tok_str_add(&str, 0);
+  tok_str_shrink(&str);
   if (t0 == TOK_PPJOIN)
   bad_twosharp:
     tcc_error("'##' cannot appear at either end of macro");
-  define_push(v, t, str.str, first);
+  define_push(v, t, tok_str_ensure_heap(&str), first);
   // tok_print(str.str, "#define (%d) %s %d:", t | is_vaargs * 4, get_tok_str(v,
   // 0));
 }
@@ -3491,8 +3633,9 @@ static int *macro_arg_subst(Sym **nested_list, const int *macro_str, Sym *args)
              if empty VA_ARGS variable. */
           if (t1 == TOK_PPJOIN && t0 == ',' && gnu_ext && s->type.t)
           {
-            int c = str.str[str.len - 1];
-            while (str.str[--str.len] != ',')
+            int *str_buf = tok_str_buf(&str);
+            int c = str_buf[str.len - 1];
+            while (str_buf[--str.len] != ',')
               ;
             if (*st == TOK_EOF)
             {
@@ -3502,8 +3645,9 @@ static int *macro_arg_subst(Sym **nested_list, const int *macro_str, Sym *args)
             {
               /* suppress '##' and add variable */
               str.len++;
+              str_buf = tok_str_buf(&str);
               if (c == ' ')
-                str.str[str.len++] = c;
+                str_buf[str.len++] = c;
               goto add_var;
             }
           }
@@ -3526,7 +3670,7 @@ static int *macro_arg_subst(Sym **nested_list, const int *macro_str, Sym *args)
             tok_str_new(&str2);
             macro_subst(&str2, nested_list, st);
             tok_str_add(&str2, TOK_EOF);
-            s->e = str2.str;
+            s->e = tok_str_ensure_heap(&str2);
           }
           st = s->e;
         }
@@ -3549,8 +3693,9 @@ static int *macro_arg_subst(Sym **nested_list, const int *macro_str, Sym *args)
       t0 = t1, t1 = t;
   }
   tok_str_add(&str, 0);
-  PP_PRINT(("areslt:", 0, str.str));
-  return str.str;
+  tok_str_shrink(&str);
+  PP_PRINT(("areslt:", 0, tok_str_buf(&str)));
+  return tok_str_ensure_heap(&str);
 }
 
 /* handle the '##' operator. return the resulting string (which must be freed).
@@ -3614,8 +3759,8 @@ static inline int *macro_twosharps(const int *ptr0)
       tok_str_add2(&macro_str1, t1, &cv1);
   }
   tok_str_add(&macro_str1, 0);
-  PP_PRINT(("pasted:", 0, macro_str1.str));
-  return macro_str1.str;
+  PP_PRINT(("pasted:", 0, tok_str_buf(&macro_str1)));
+  return tok_str_ensure_heap(&macro_str1);
 }
 
 static int peek_file(TokenString *ws_str)
@@ -3743,13 +3888,15 @@ static int macro_subst_tok(TokenString *tok_str, Sym **nested_list, Sym *s)
         tok_str_add2_spc(tok_str, v, 0);
         if (parse_flags & PARSE_FLAG_SPACES)
           for (i = 0; i < str.len; i++)
-            tok_str_add(tok_str, str.str[i]);
-        tok_str_free_str(str.str);
+            tok_str_add(tok_str, tok_str_buf(&str)[i]);
+        if (str.allocated_len > 0)
+          tok_str_free_str(str.data.str);
         return 0;
       }
       else
       {
-        tok_str_free_str(str.str);
+        if (str.allocated_len > 0)
+          tok_str_free_str(str.data.str);
       }
 
       /* argument macro */
@@ -3790,7 +3937,7 @@ static int macro_subst_tok(TokenString *tok_str, Sym **nested_list, Sym *s)
         }
         tok_str_add(&str, TOK_EOF);
         sa1 = sym_push2(&args, sa->v & ~SYM_FIELD, sa->type.t, 0);
-        sa1->d = str.str;
+        sa1->d = tok_str_ensure_heap(&str);
         sa = sa->next;
         if (t == ')')
         {
@@ -3916,7 +4063,8 @@ static int macro_subst(TokenString *tok_str, Sym **nested_list, const int *macro
         goto no_subst;
       }
       str = tok_str_alloc();
-      str->str = (int *)macro_str; /* setup stream for possible arguments */
+      str->data.str = (int *)macro_str; /* setup stream for possible arguments */
+      str->allocated_len = 1;           /* indicate heap buffer (read-only view) */
       begin_macro(str, 2);
       nosubst = macro_subst_tok(tok_str, nested_list, s);
       if (macro_stack != str)
@@ -3946,7 +4094,7 @@ static int macro_subst(TokenString *tok_str, Sym **nested_list, const int *macro
 
 #ifdef PP_DEBUG
   tok_str_add(tok_str, 0), --tok_str->len;
-  PP_PRINT(("-result:", 0, tok_str->str + tlen));
+  PP_PRINT(("-result:", 0, tok_str_buf(tok_str) + tlen));
 #endif
   return nosubst;
 }
@@ -4287,11 +4435,26 @@ ST_FUNC void tccpp_delete(TCCState *s)
   tcc_free(table_ident);
   table_ident = NULL;
 
+  /* String token statistics disabled
+  if (str_total_added > 0) {
+    fprintf(stderr, "String tokens: %lu, bytes: %lu\n",
+            str_total_added, str_bytes_copied);
+  }
+  */
+
   /* free static buffers */
   cstr_free(&tokcstr);
   cstr_free(&cstr_buf);
-  tok_str_free_str(tokstr_buf.str);
-  tok_str_free_str(unget_buf.str);
+  if (tokstr_buf.allocated_len > 0)
+    tok_str_free_str(tokstr_buf.data.str);
+  if (unget_buf.allocated_len > 0)
+    tok_str_free_str(unget_buf.data.str);
+
+  /* free string pool (currently unused)
+  tal_delete(strpool_alloc);
+  strpool_alloc = NULL;
+  memset(strpool_hash, 0, sizeof(strpool_hash));
+  */
 
   /* free allocators */
   tal_delete(toksym_alloc);

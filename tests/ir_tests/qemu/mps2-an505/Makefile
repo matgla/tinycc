@@ -53,7 +53,14 @@ NEWLIB_LIBC_G = $(NEWLIB_DIR)/libc_g.a
 NEWLIB_LIBM_G = $(NEWLIB_DIR)/libm_g.a
 
 EXTRA_CFLAGS ?=
-CFLAGS += -nostdlib -g -fvisibility=hidden $(GCC_ABI_FLAGS) -gdwarf -ffunction-sections $(EXTRA_CFLAGS)
+CFLAGS += -nostdlib -fvisibility=hidden $(GCC_ABI_FLAGS) -ffunction-sections $(EXTRA_CFLAGS)
+
+# Two-phase compilation support (reduces memory usage)
+TWO_PHASE ?=
+TCC_FLAGS +=
+ifneq ($(TWO_PHASE),)
+TCC_FLAGS += -two-phase
+endif
 TCC_PATH = $(shell realpath $(MAKEFILE_DIR)../../../../)
 LDFLAGS = -Wl,--gc-sections
 
@@ -97,7 +104,7 @@ $(OUTPUT):
 	mkdir -p $(OUTPUT)
 
 $(OUTPUT)/%.o: $(MAKEFILE_DIR)%.c | $(OUTPUT)
-	$(CC_WRAPPER) $(CC) $(CFLAGS) -c $< -o $@
+	$(CC_WRAPPER) $(CC) $(CFLAGS) $(TCC_FLAGS) -c $< -o $@
 
 $(OUTPUT)/%.o: $(MAKEFILE_DIR)%.S | $(OUTPUT)
 	$(CC_WRAPPER) $(CC) $(CFLAGS) -c $< -o $@

@@ -6,6 +6,7 @@
 struct Sym;
 struct TCCIRState;
 struct SValue;
+struct CType;
 
 /* ============================================================================
  * Vreg encoding
@@ -92,9 +93,14 @@ typedef struct __attribute__((packed)) IROperand
   };
   union
   {
-    int32_t imm32;     /* for IMM32, STACKOFF */
+    int32_t imm32;     /* for IMM32, STACKOFF (non-struct) */
     uint32_t f32_bits; /* for F32 */
-    uint32_t pool_idx; /* for I64, F64, SYMREF */
+    uint32_t pool_idx; /* for I64, F64, SYMREF (non-struct) */
+    struct
+    {                     /* for STRUCT types - split encoding */
+      uint16_t ctype_idx; /* index into pool_ctype (lower 16 bits) */
+      int16_t aux_data;   /* aux: stack offset/4 for STACKOFF, symref_idx for SYMREF */
+    } s;
   } u;
   /* Physical register allocation (filled by register allocator for codegen) */
   uint8_t pr0_reg : 5;     /* Physical register 0 (0-15 for ARM, 31=PREG_REG_NONE) */
@@ -131,16 +137,28 @@ void tcc_ir_pools_free(struct TCCIRState *ir);
 uint32_t tcc_ir_pool_add_i64(struct TCCIRState *ir, int64_t val);
 uint32_t tcc_ir_pool_add_f64(struct TCCIRState *ir, uint64_t bits);
 uint32_t tcc_ir_pool_add_symref(struct TCCIRState *ir, struct Sym *sym, int32_t addend, uint32_t flags);
+uint32_t tcc_ir_pool_add_ctype(struct TCCIRState *ir, const struct CType *ctype);
 
 /* Pool read accessors (for inline helpers) */
 int64_t *tcc_ir_pool_get_i64_ptr(const struct TCCIRState *ir, uint32_t idx);
 uint64_t *tcc_ir_pool_get_f64_ptr(const struct TCCIRState *ir, uint32_t idx);
 IRPoolSymref *tcc_ir_pool_get_symref_ptr(const struct TCCIRState *ir, uint32_t idx);
+struct CType *tcc_ir_pool_get_ctype_ptr(const struct TCCIRState *ir, uint32_t idx);
 struct Sym *irop_get_sym(IROperand op);
 
 /* IROperand <-> SValue conversion functions */
 IROperand svalue_to_iroperand(struct TCCIRState *ir, const struct SValue *sv);
 void iroperand_to_svalue(const struct TCCIRState *ir, IROperand op, struct SValue *out);
+
+/* Convert IROP_BTYPE to VT_BTYPE */
+int irop_btype_to_vt_btype(int irop_btype);
+
+/* Type size/alignment from IROperand (uses CType pool for structs) */
+int irop_type_size(IROperand op);
+int irop_type_size_align(IROperand op, int *align_out);
+
+/* Get CType for struct operands (returns NULL for non-struct types) */
+struct CType *irop_get_ctype(IROperand op);
 
 /* Debug: compare SValue with IROperand and print differences (returns 1 if mismatch) */
 int irop_compare_svalue(const struct TCCIRState *ir, const struct SValue *sv, IROperand op, const char *context);
@@ -200,8 +218,12 @@ static inline int64_t irop_get_imm64_ex(const struct TCCIRState *ir, IROperand o
   switch (tag)
   {
   case IROP_TAG_IMM32:
-  case IROP_TAG_STACKOFF:
     /* Sign-extend 32-bit immediate to 64-bit */
+    return (int64_t)op.u.imm32;
+  case IROP_TAG_STACKOFF:
+    /* For STRUCT types, offset is in aux_data * 4; otherwise in imm32 */
+    if (op.btype == IROP_BTYPE_STRUCT)
+      return (int64_t)((int32_t)op.u.s.aux_data << 2);
     return (int64_t)op.u.imm32;
   case IROP_TAG_I64:
     /* Look up in pool */
@@ -236,7 +258,9 @@ static inline struct Sym *irop_get_sym_ex(const struct TCCIRState *ir, IROperand
     return NULL;
   if (!ir)
     return NULL;
-  IRPoolSymref *entry = tcc_ir_pool_get_symref_ptr(ir, op.u.pool_idx);
+  /* For STRUCT types, symref index is in aux_data */
+  uint32_t idx = (op.btype == IROP_BTYPE_STRUCT) ? (uint32_t)(uint16_t)op.u.s.aux_data : op.u.pool_idx;
+  IRPoolSymref *entry = tcc_ir_pool_get_symref_ptr(ir, idx);
   return entry ? entry->sym : NULL;
 }
 
@@ -247,7 +271,9 @@ static inline IRPoolSymref *irop_get_symref_ex(const struct TCCIRState *ir, IROp
     return NULL;
   if (!ir)
     return NULL;
-  return tcc_ir_pool_get_symref_ptr(ir, op.u.pool_idx);
+  /* For STRUCT types, symref index is in aux_data */
+  uint32_t idx = (op.btype == IROP_BTYPE_STRUCT) ? (uint32_t)(uint16_t)op.u.s.aux_data : op.u.pool_idx;
+  return tcc_ir_pool_get_symref_ptr(ir, idx);
 }
 
 /* Convenience macros that use tcc_state->ir (requires tcc.h to be included first) */
@@ -465,7 +491,15 @@ static inline int irop_has_vreg(const IROperand op)
   return vreg >= 0 || (vreg < -1); /* -2, -3, etc. are temp locals - they DO have a vreg */
 }
 
-/* Get immediate value (for IMM32 or STACKOFF tags) */
+/* Get stack offset from STACKOFF operand (handles STRUCT split encoding) */
+static inline int32_t irop_get_stack_offset(const IROperand op)
+{
+  if (op.btype == IROP_BTYPE_STRUCT)
+    return (int32_t)op.u.s.aux_data << 2; /* Stored as offset/4 */
+  return op.u.imm32;
+}
+
+/* Get immediate value (for IMM32 tag - NOT for STACKOFF with struct types!) */
 static inline int32_t irop_get_imm32(const IROperand op)
 {
   return op.u.imm32;

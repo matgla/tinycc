@@ -32,6 +32,7 @@ ST_FUNC int code_reloc(int reloc_type)
   case R_ARM_PLT32:
   case R_ARM_THM_PC22:
   case R_ARM_THM_JUMP24:
+  case R_ARM_THM_JUMP19:
   case R_ARM_PREL31:
   case R_ARM_V4BX:
   case R_ARM_JUMP_SLOT:
@@ -64,6 +65,7 @@ ST_FUNC int gotplt_entry_type(int reloc_type)
   case R_ARM_THM_PC22:
   case R_ARM_THM_ALU_PREL_11_0:
   case R_ARM_THM_JUMP6:
+  case R_ARM_THM_JUMP19:
   case R_ARM_THM_JUMP24:
   case R_ARM_MOVT_ABS:
   case R_ARM_MOVW_ABS_NC:
@@ -374,6 +376,44 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
     x >>= 2;
     /* Compute and store final offset */
     (*(uint16_t *)(ptr + 2)) = orig | (x & 0xff);
+  }
+    return;
+
+  case R_ARM_THM_JUMP19:
+  {
+    int x, hi, lo, s, j1, j2, imm6, imm11;
+    /* weak reference */
+    if (sym->st_shndx == SHN_UNDEF && ELFW(ST_BIND)(sym->st_info) == STB_WEAK)
+      return;
+
+    /* Get initial offset from T3 encoding */
+    hi = (*(uint16_t *)ptr);
+    lo = (*(uint16_t *)(ptr + 2));
+    s = (hi >> 10) & 1;
+    j1 = (lo >> 13) & 1;
+    j2 = (lo >> 11) & 1;
+    imm6 = hi & 0x3f;
+    imm11 = lo & 0x7ff;
+    /* T3: offset = SignExtend(S:J2:J1:imm6:imm11:'0', 21) */
+    x = (s << 20) | (j2 << 19) | (j1 << 18) | (imm6 << 12) | (imm11 << 1);
+    if (x & 0x100000) /* sign extend from bit 20 */
+      x -= 0x200000;
+
+    /* Compute final offset */
+    x += val - addr;
+
+    /* Check range (±1MB) */
+    if (x >= 0x100000 || x < -0x100000)
+      tcc_error_noabort("conditional branch target out of range: %x,%d", addr, type);
+
+    /* Encode back into T3 format (preserve condition code in hi[9:6]) */
+    s = (x >> 20) & 1;
+    j2 = (x >> 19) & 1;
+    j1 = (x >> 18) & 1;
+    imm6 = (x >> 12) & 0x3f;
+    imm11 = (x >> 1) & 0x7ff;
+    (*(uint16_t *)ptr) = (uint16_t)((hi & 0xfbc0) | (s << 10) | imm6);
+    (*(uint16_t *)(ptr + 2)) = (uint16_t)((lo & 0xd000) | (j1 << 13) | (j2 << 11) | imm11);
   }
     return;
 

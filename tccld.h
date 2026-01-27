@@ -84,9 +84,10 @@ typedef struct LDOutputSection
   int phdr_idx;               /* index into phdrs, -1 if none */
   int has_address;            /* 1 if address explicitly set */
 
-  /* Section patterns to include */
-  LDSectionPattern patterns[LD_MAX_SECTION_PATTERNS];
+  /* Section patterns to include - dynamically allocated */
+  LDSectionPattern *patterns;
   int nb_patterns;
+  int patterns_capacity;
 } LDOutputSection;
 
 typedef struct LDSymbol
@@ -124,6 +125,10 @@ typedef struct LDScript
   char entry_point[128];
   int has_entry;
 
+  /* Computed load addresses (populated by ld_update_symbol_values) */
+  addr_t output_section_loadaddrs[LD_MAX_OUTPUT_SECTIONS];
+  int has_loadaddrs; /* 1 after LMA computation is done */
+
   /* Current parsing state */
   addr_t location_counter;
   int current_section_idx;
@@ -135,6 +140,9 @@ struct TCCState;
 
 /* Initialize linker script structure */
 void ld_script_init(LDScript *ld);
+
+/* Cleanup and free dynamically allocated memory in linker script */
+void ld_script_cleanup(LDScript *ld);
 
 /* Parse a linker script file */
 int ld_script_parse(struct TCCState *s1, LDScript *ld, int fd);
