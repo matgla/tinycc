@@ -76,50 +76,6 @@ static inline int is_thumb2_32bit_prefix(uint16_t h1)
 static int tcc_try_dump_thumb_with_objdump(const unsigned char *bytes, size_t len, uint32_t start_vma);
 #endif
 
-static void tcc_dump_thumb_generated_span(uint32_t start, uint32_t end)
-{
-#if TCC_DUMP_THUMB_GEN
-  if (!cur_text_section || !cur_text_section->data)
-    return;
-  if (end <= start)
-    return;
-
-  unsigned char *data = cur_text_section->data;
-
-  if (TCC_DUMP_THUMB_GEN_MNEMONICS)
-  {
-    if (tcc_try_dump_thumb_with_objdump(data + start, (size_t)(end - start), start))
-      return;
-  }
-
-  uint32_t pc = start;
-
-  while (pc < end)
-  {
-    if (pc + 2 > end)
-    {
-      THGEN_DUMP("  %08x: <truncated %u byte>\n", pc, (unsigned)(end - pc));
-      break;
-    }
-
-    uint16_t h1 = (uint16_t)(data[pc] | (data[pc + 1] << 8));
-
-    if (is_thumb2_32bit_prefix(h1) && pc + 4 <= end)
-    {
-      uint16_t h2 = (uint16_t)(data[pc + 2] | (data[pc + 3] << 8));
-      uint32_t op32 = ((uint32_t)h1 << 16) | (uint32_t)h2;
-      THGEN_DUMP("  %08x: %04x %04x    ; thumb32 0x%08x\n", pc, h1, h2, op32);
-      pc += 4;
-    }
-    else
-    {
-      THGEN_DUMP("  %08x: %04x         ; thumb16\n", pc, h1);
-      pc += 2;
-    }
-  }
-#endif
-}
-
 #if TCC_DUMP_THUMB_GEN
 static void tcc_dump_svalue_short_to(FILE *out, const SValue *sv)
 {
@@ -612,12 +568,6 @@ IRLiveInterval *tcc_ir_get_live_interval(TCCIRState *ir, int vreg)
   return NULL;
 }
 
-static void tcc_ir_set_base_interval_end(TCCIRState *ir, int vreg)
-{
-  IRLiveInterval *interval = tcc_ir_get_live_interval(ir, vreg);
-  interval->end = ir->next_instruction_index;
-}
-
 /* Initialize all interval start fields to INTERVAL_NOT_STARTED and incoming_reg
  * to -1 */
 static void tcc_ir_init_interval_starts(IRLiveInterval *intervals, int count)
@@ -664,29 +614,6 @@ static void tcc_ir_clear_live_intervals(TCCIRState *ir)
   ir->parameters_live_intervals = (IRLiveInterval *)tcc_mallocz(sizeof(IRLiveInterval) * IR_LIVE_INTERVAL_INIT_SIZE);
   tcc_ir_init_interval_starts(ir->parameters_live_intervals, IR_LIVE_INTERVAL_INIT_SIZE);
   ir->next_parameter = 0;
-}
-
-static int tcc_ir_operand_in_memory(SValue *sv)
-{
-  const int svt = sv->r & VT_VALMASK;
-  if (sv->pr0_reg == PREG_REG_NONE)
-  {
-    if (svt == VT_LOCAL)
-    {
-      return 1;
-    }
-    else if (svt == VT_CONST)
-    {
-      // VT_SYM is global variable, else is immediate
-      return sv->r & VT_SYM;
-    }
-    // fprintf(
-    //     stderr,
-    //     "tcc_ir_operand_in_memory: unexpected operand type in memory
-    //     check\n");
-    return 0;
-  }
-  return sv->pr0_spilled;
 }
 
 /* SValue pool management for compact IR storage */
@@ -1088,100 +1015,6 @@ void tcc_ir_put_inline_asm(TCCIRState *ir, int inline_asm_id)
   ir->leaffunc = 0;
 }
 #endif
-
-/* Peephole helpers for callsite argument folding (see tcc_ir_build_callsites). */
-static int tcc_ir_is_stack_addr_operand_novreg(const SValue *sv)
-{
-  if (!sv)
-    return 0;
-  int val_kind = sv->r & VT_VALMASK;
-  if ((val_kind == VT_LOCAL || val_kind == VT_LLOCAL) && !(sv->r & VT_LVAL) && sv->vr == -1)
-    return 1;
-  return 0;
-}
-
-static int tcc_ir_find_def_for_vreg_before(const TCCIRState *ir, int vreg_encoded, int start_idx)
-{
-  if (!ir)
-    return -1;
-  if (start_idx > ir->next_instruction_index)
-    start_idx = ir->next_instruction_index;
-  for (int i = start_idx - 1; i >= 0; --i)
-  {
-    const SValue *dest = tcc_ir_op_get_dest((TCCIRState *)ir, &ir->compact_instructions[i]);
-    if (dest->vr == vreg_encoded)
-      return i;
-  }
-  return -1;
-}
-
-/* Resolve a vreg that represents a stack address into (kind, offset).
- * Returns 1 on success, 0 on failure.
- * This is conservative and intended for simple TEMP address chains.
- */
-static int tcc_ir_try_resolve_stack_addr(const TCCIRState *ir, int vreg_encoded, int start_idx, int depth,
-                                         int *out_kind, int *out_offset)
-{
-  if (!ir || !out_kind || !out_offset)
-    return 0;
-  if (depth <= 0)
-    return 0;
-
-  const int def_idx = tcc_ir_find_def_for_vreg_before(ir, vreg_encoded, start_idx);
-  if (def_idx < 0)
-    return 0;
-
-  const IRQuadCompact *def = &ir->compact_instructions[def_idx];
-  const SValue *def_src1 = tcc_ir_op_get_src1(ir, def);
-  /* Base case: vreg = Addr[StackLoc[off]] (no VT_LVAL and no vreg on the address operand). */
-  if (def->op == TCCIR_OP_ASSIGN && tcc_ir_is_stack_addr_operand_novreg(def_src1))
-  {
-    *out_kind = def_src1->r & VT_VALMASK;
-    *out_offset = def_src1->c.i;
-    return 1;
-  }
-
-  /* Copy chain: vreg = other_vreg (address value). */
-  if (def->op == TCCIR_OP_ASSIGN && tcc_is_vreg_valid((TCCIRState *)ir, def_src1->vr) && !(def_src1->r & VT_LVAL))
-  {
-    return tcc_ir_try_resolve_stack_addr(ir, def_src1->vr, def_idx, depth - 1, out_kind, out_offset);
-  }
-
-  const SValue *def_src2 = tcc_ir_op_get_src2((TCCIRState *)ir, def);
-  /* Simple address arithmetic: vreg = base_vreg +/- const. */
-  if ((def->op == TCCIR_OP_ADD || def->op == TCCIR_OP_SUB) && !(def_src1->r & VT_LVAL) && !(def_src2->r & VT_LVAL))
-  {
-    const int src1_is_vreg = tcc_is_vreg_valid((TCCIRState *)ir, def_src1->vr);
-    const int src2_is_vreg = tcc_is_vreg_valid((TCCIRState *)ir, def_src2->vr);
-    const int src1_is_const = (def_src1->r & VT_VALMASK) == VT_CONST && !(def_src1->r & VT_SYM);
-    const int src2_is_const = (def_src2->r & VT_VALMASK) == VT_CONST && !(def_src2->r & VT_SYM);
-
-    (void)src2_is_vreg;
-
-    int base_kind = 0;
-    int base_off = 0;
-
-    if (src1_is_vreg && src2_is_const)
-    {
-      if (!tcc_ir_try_resolve_stack_addr(ir, def_src1->vr, def_idx, depth - 1, &base_kind, &base_off))
-        return 0;
-      *out_kind = base_kind;
-      *out_offset = (def->op == TCCIR_OP_ADD) ? (base_off + def_src2->c.i) : (base_off - def_src2->c.i);
-      return 1;
-    }
-    if (src1_is_const && src2_is_vreg && def->op == TCCIR_OP_ADD)
-    {
-      /* const + base */
-      if (!tcc_ir_try_resolve_stack_addr(ir, def_src2->vr, def_idx, depth - 1, &base_kind, &base_off))
-        return 0;
-      *out_kind = base_kind;
-      *out_offset = base_off + def_src1->c.i;
-      return 1;
-    }
-  }
-
-  return 0;
-}
 
 void tcc_ir_release_block(TCCIRState *ir)
 {
@@ -2346,83 +2179,6 @@ static int tcc_is_vreg_ignored(TCCIRState *ir, int vreg)
 
 #define IGNORED_VREGS_INIT_SIZE 64
 
-static void tcc_set_vreg_ignored(TCCIRState *ir, int vreg)
-{
-  const int position = TCCIR_DECODE_VREG_POSITION(vreg);
-  const int type = TCCIR_DECODE_VREG_TYPE(vreg);
-  const int type_bit = tcc_get_vreg_type_bit(type);
-  const int bit_offset = position * IGNORED_VREG_BITS_PER_ENTRY + type_bit;
-  const int index = bit_offset / 32;
-  const int bit = bit_offset % 32;
-  if (type_bit < 0)
-  {
-    return;
-  }
-
-  if (ir->ignored_vregs == NULL)
-  {
-    ir->ignored_vregs_size = IGNORED_VREGS_INIT_SIZE;
-    ir->ignored_vregs = (uint32_t *)tcc_mallocz(sizeof(uint32_t) * ir->ignored_vregs_size);
-  }
-
-  // Resize if needed
-  while (index >= ir->ignored_vregs_size)
-  {
-    const int new_size = ir->ignored_vregs_size << 1;
-    ir->ignored_vregs = (uint32_t *)tcc_realloc(ir->ignored_vregs, sizeof(uint32_t) * new_size);
-    memset(ir->ignored_vregs + ir->ignored_vregs_size, 0, sizeof(uint32_t) * (new_size - ir->ignored_vregs_size));
-    ir->ignored_vregs_size = new_size;
-  }
-
-  ir->ignored_vregs[index] |= (1 << bit);
-}
-
-static int tcc_ir_find_live_interval(TCCIRState *ir, int vreg, int *start, int *end, int check_for_backwards_jumps)
-{
-  int retval = 0;
-  IRLiveInterval *interval = tcc_ir_get_live_interval(ir, vreg);
-
-  *start = interval->start;
-  *end = interval->end;
-
-  if (interval->start != INTERVAL_NOT_STARTED)
-  {
-    retval = 1;
-  }
-
-  if (!check_for_backwards_jumps)
-  {
-    return retval;
-  }
-
-  /* Check for backward jumps that would extend the live interval.
-   * If a variable is live at a backward jump target, it must stay live
-   * until the jump instruction. */
-  for (int i = 0; i < ir->next_instruction_index; ++i)
-  {
-    IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
-    {
-      const int jump_target = tcc_ir_op_get_dest(ir, q)->c.i;
-      /* Backward jump: target is before the jump instruction */
-      if (jump_target < i)
-      {
-        /* If variable is live at jump target (start <= target),
-         * extend end to include the jump instruction */
-        if (*start != INTERVAL_NOT_STARTED && *start <= jump_target && *end >= jump_target)
-        {
-          if (i > *end)
-          {
-            *end = i;
-          }
-        }
-      }
-    }
-  }
-
-  return retval;
-}
-
 /* Check if there's a function call strictly between [start, end).
  * Used by register allocation to decide whether an interval crosses a call.
  * This is implemented via a prefix-sum array of call instructions. */
@@ -2963,15 +2719,6 @@ void tcc_ir_assign_physical_register(TCCIRState *ir, int vreg, int offset, int r
   interval->allocation.offset = offset;
 }
 
-static int tcc_ir_stack_slot_size_from_interval(const IRLiveInterval *interval)
-{
-  if (!interval)
-    return 0;
-  if (interval->is_double || interval->is_llong)
-    return 8;
-  return 4;
-}
-
 static void tcc_ir_stack_layout_reset(TCCStackLayout *layout)
 {
   if (!layout)
@@ -3143,91 +2890,6 @@ static void tcc_ir_stack_layout_ensure_capacity(TCCStackLayout *layout, int need
     new_capacity *= 2;
   layout->slots = (TCCStackSlot *)tcc_realloc(layout->slots, sizeof(TCCStackSlot) * new_capacity);
   layout->slot_capacity = new_capacity;
-}
-
-static TCCStackSlot *tcc_ir_stack_layout_find_by_offset(TCCStackLayout *layout, int offset)
-{
-  if (!layout)
-    return NULL;
-
-  const int idx = tcc_ir_stack_layout_offset_hash_lookup_index(layout, offset);
-  if (idx >= 0 && idx < layout->slot_count)
-    return &layout->slots[idx];
-
-  for (int i = 0; i < layout->slot_count; ++i)
-  {
-    if (layout->slots[i].offset == offset)
-      return &layout->slots[i];
-  }
-  return NULL;
-}
-
-static TCCStackSlotKind tcc_ir_stack_slot_kind_for_type(TCCIR_VREG_TYPE type)
-{
-  switch (type)
-  {
-  case TCCIR_VREG_TYPE_PARAM:
-    return TCC_STACK_SLOT_PARAM_SPILL;
-  case TCCIR_VREG_TYPE_VAR:
-    return TCC_STACK_SLOT_LOCAL;
-  default:
-    return TCC_STACK_SLOT_SPILL;
-  }
-}
-
-static void tcc_ir_stack_layout_note_interval(TCCIRState *ir, int vreg, IRLiveInterval *interval, TCCStackSlotKind kind)
-{
-  if (!interval || interval->allocation.offset == 0)
-  {
-    if (interval)
-      interval->stack_slot_index = -1;
-    return;
-  }
-
-  TCCStackLayout *layout = &ir->stack_layout;
-  TCCStackSlot *slot = tcc_ir_stack_layout_find_by_offset(layout, interval->allocation.offset);
-  if (!slot)
-  {
-    tcc_ir_stack_layout_ensure_capacity(layout, layout->slot_count + 1);
-    slot = &layout->slots[layout->slot_count++];
-    slot->offset = interval->allocation.offset;
-    slot->size = tcc_ir_stack_slot_size_from_interval(interval);
-    slot->alignment = (slot->size >= 8) ? 8 : 4;
-    slot->kind = kind;
-    slot->vreg = vreg;
-    slot->live_across_calls = interval->crosses_call;
-    slot->addressable = interval->addrtaken ? 1 : 0;
-
-    /* Maintain the fast lookup table for offset -> slot index. */
-    tcc_ir_stack_layout_offset_hash_ensure_capacity(layout, layout->slot_count);
-    tcc_ir_stack_layout_offset_hash_insert(layout, slot->offset, layout->slot_count - 1);
-  }
-  else if (slot->vreg == -1)
-  {
-    slot->vreg = vreg;
-  }
-
-  interval->stack_slot_index = (int)(slot - layout->slots);
-}
-
-static void tcc_ir_stack_layout_collect(TCCIRState *ir, IRLiveInterval *intervals, int count, TCCIR_VREG_TYPE type)
-{
-  if (!intervals || count <= 0)
-    return;
-
-  for (int idx = 0; idx < count; ++idx)
-  {
-    IRLiveInterval *interval = &intervals[idx];
-    /* Skip unused intervals (never started and no allocation). */
-    if (interval->start == INTERVAL_NOT_STARTED && interval->allocation.offset == 0 && interval->allocation.r0 == 0)
-    {
-      interval->stack_slot_index = -1;
-      continue;
-    }
-
-    const int encoded_vreg = TCCIR_ENCODE_VREG(type, idx);
-    tcc_ir_stack_layout_note_interval(ir, encoded_vreg, interval, tcc_ir_stack_slot_kind_for_type(type));
-  }
 }
 
 void tcc_ir_build_stack_layout(TCCIRState *ir)
@@ -7288,7 +6950,7 @@ void tcc_ir_generate_code(TCCIRState *ir)
     case TCCIR_OP_UMULL:
     case TCCIR_OP_ADC_GEN:
     case TCCIR_OP_ADC_USE:
-      tcc_gen_machine_data_processing_op(src1, src2, dest, cq->op);
+      tcc_gen_machine_data_processing_op(src1_ir, src2_ir, dest_ir, cq->op);
       break;
     case TCCIR_OP_FADD:
     case TCCIR_OP_FSUB:

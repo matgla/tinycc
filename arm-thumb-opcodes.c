@@ -37,43 +37,6 @@
 #include "arm-thumb-opcodes.h"
 #include "tcc.h"
 
-static const char *th_reg_name(unsigned r)
-{
-  static const char *names[] = {"r0", "r1", "r2",  "r3",  "r4",  "r5", "r6", "r7",
-                                "r8", "r9", "r10", "r11", "r12", "sp", "lr", "pc"};
-  if (r < (sizeof(names) / sizeof(names[0])))
-    return names[r];
-  return "r?";
-}
-
-static const char *th_cond_name(unsigned cond)
-{
-  static const char *conds[] = {"eq", "ne", "cs", "cc", "mi", "pl", "vs", "vc",
-                                "hi", "ls", "ge", "lt", "gt", "le", "al", "nv"};
-  return cond < 16 ? conds[cond] : "??";
-}
-
-static const char *th_shift_name(thumb_shift_type t)
-{
-  switch (t)
-  {
-  case THUMB_SHIFT_NONE:
-    return "";
-  case THUMB_SHIFT_LSL:
-    return "lsl";
-  case THUMB_SHIFT_LSR:
-    return "lsr";
-  case THUMB_SHIFT_ASR:
-    return "asr";
-  case THUMB_SHIFT_ROR:
-    return "ror";
-  case THUMB_SHIFT_RRX:
-    return "rrx";
-  default:
-    return "?";
-  }
-}
-
 static void th_trace_regset(uint16_t regs)
 {
   THOP_TRACE("{");

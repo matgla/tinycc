@@ -74,8 +74,6 @@ enum Armv8mRegisters
 
 #include <stdlib.h>
 
-static int irop_btype_to_vt_btype_for_load(int irop_btype, int is_unsigned);
-
 /* Target ABI hook: AAPCS-like argument assignment for ARM (R0-R3 + stack).
  *
  * This is a pure layout function: it does not materialize values and does not
@@ -113,16 +111,6 @@ ST_FUNC int tcc_gen_machine_abi_assign_call_args(const TCCAbiArgDesc *args, int 
 
 #include <inttypes.h>
 
-static void thumb_backend_dump_svalue(const char *label, const SValue *sv)
-{
-  if (!sv)
-    return;
-  uint8_t pr0_packed = (sv->pr0_spilled ? PREG_SPILLED : 0) | sv->pr0_reg;
-  uint8_t pr1_packed = (sv->pr1_spilled ? PREG_SPILLED : 0) | sv->pr1_reg;
-  fprintf(stderr, "%s: r=0x%x pr0=%d pr1=%d vr=%d c.i=%lld type=0x%x flags=0x%x sym=%p\n", label, sv->r, pr0_packed,
-          pr1_packed, sv->vr, (long long)sv->c.i, sv->type.t, sv->type.ref ? sv->type.ref->type.t : 0, (void *)sv->sym);
-}
-
 int load_word_from_base(int ir, int base, int fc, int sign);
 
 /* Helper to validate a Sym pointer - returns NULL if invalid/unusable for relocation */
@@ -140,7 +128,6 @@ static inline Sym *validate_sym_for_reloc(Sym *sym)
 }
 
 /* Forward declarations */
-static int is_64bit_type(int t);
 void load_to_dest_ir(IROperand dest, IROperand src);
 void load_to_dest(SValue *dest, SValue *src);
 static void load_to_reg_ir(int r, int r1, IROperand src);
@@ -202,14 +189,12 @@ int is_valid_opcode(thumb_opcode op);
 int ot(thumb_opcode op);
 int ot_check(thumb_opcode op);
 static void load_to_register_ir(int reg, int reg_from, IROperand src);
-static void load_to_register(int reg, int reg_from, SValue *src);
 static void thumb_require_materialized_reg(const char *ctx, const char *operand, int reg);
-static void thumb_require_materialized_pair(const char *ctx, const char *operand, int lo, int hi);
 static void thumb_ensure_not_spilled(const char *ctx, const char *operand, int reg);
 static bool thumb_is_hw_reg(int reg);
+static int get_struct_base_addr(const IROperand *arg, int default_reg);
 int th_has_immediate_value(int r);
 int load_word_from_base(int ir, int base, int fc, int sign);
-static void tcc_gen_machine_load_from_stack(int reg, int offset);
 int th_patch_call(int t, int a);
 /* Structure to track scratch register allocation with potential save/restore */
 typedef struct ScratchRegAlloc
@@ -229,184 +214,6 @@ typedef struct ScratchRegAllocs
   uint32_t saved_mask; /* Bitmask of registers that were saved (pushed) */
 } ScratchRegAllocs;
 
-static ScratchRegAllocs get_scratch_regs_with_save(uint32_t exclude_regs, int count)
-{
-  ScratchRegAllocs result;
-  memset(&result, 0, sizeof(result));
-  if (count <= 0)
-    return result;
-  if (count > (int)(sizeof(result.regs) / sizeof(result.regs[0])))
-    tcc_error("compiler_error: requested too many scratch regs (%d)", count);
-
-  TCCIRState *ir = tcc_state->ir;
-  uint32_t exclude = exclude_regs | scratch_global_exclude;
-  uint32_t regs_to_save = 0;
-
-#ifdef ARM_THUMB_DEBUG_SCRATCH
-  fprintf(stderr, "[SCRATCH] get_scratch_regs: count=%d input_exclude=0x%x global_exclude=0x%x\n", count, exclude_regs,
-          scratch_global_exclude);
-#endif
-
-  /* First pass: try to find free registers */
-  for (int i = 0; i < count; ++i)
-  {
-    int reg = PREG_NONE;
-    if (ir)
-    {
-      reg = tcc_ls_find_free_scratch_reg(&ir->ls, ir->codegen_instruction_idx, exclude, ir->leaffunc);
-    }
-
-    if (reg != PREG_NONE && reg >= 0 && reg < 16)
-    {
-      /* Found a free register */
-#ifdef ARM_THUMB_DEBUG_SCRATCH
-      fprintf(stderr, "[SCRATCH] -> reg[%d]=%d (free)\n", i, reg);
-#endif
-      result.regs[i] = reg;
-      exclude |= (1u << reg);
-      /* Mark as globally excluded while live so nested helpers cannot
-       * accidentally reuse it and clobber a still-needed operand. */
-      scratch_global_exclude |= (1u << reg);
-      result.count++;
-    }
-    else
-    {
-      /* Need to save a register - select one based on priority */
-      int reg_to_save = -1;
-      if (!(exclude & (1 << R_IP)))
-      {
-        reg_to_save = R_IP;
-      }
-      else if (ir && ir->leaffunc && !(exclude & (1 << R_LR)))
-      {
-        reg_to_save = R_LR;
-      }
-      else
-      {
-        /* Try R0-R3 */
-        for (int r = 0; r <= 3; ++r)
-        {
-          if (!(exclude & (1 << r)))
-          {
-            reg_to_save = r;
-            break;
-          }
-        }
-      }
-
-      if (reg_to_save < 0)
-      {
-        /* Try R4-R10, skipping R11/R12 which are reserved for call argument processing */
-        for (int r = 4; r <= 10; ++r)
-        {
-          if (!(exclude & (1 << r)))
-          {
-            reg_to_save = r;
-            break;
-          }
-        }
-      }
-
-      if (reg_to_save < 0)
-      {
-        tcc_error("compiler_error: no register available for scratch (all 16 registers excluded)");
-      }
-
-#ifdef ARM_THUMB_DEBUG_SCRATCH
-      fprintf(stderr, "[SCRATCH] -> reg[%d]=%d (will save)\n", i, reg_to_save);
-#endif
-      result.regs[i] = reg_to_save;
-      regs_to_save |= (1u << reg_to_save);
-      exclude |= (1u << reg_to_save);
-      result.count++;
-    }
-  }
-
-  /* Second pass: emit a single PUSH for all registers that need saving */
-  if (regs_to_save != 0)
-  {
-#ifdef ARM_THUMB_DEBUG_SCRATCH
-    fprintf(stderr, "[SCRATCH] Pushing registers (mask=0x%x) in single instruction\n", regs_to_save);
-#endif
-    ot_check(th_push(regs_to_save));
-    result.saved_mask = regs_to_save;
-
-    /* Track each saved register in the push stack for proper LIFO ordering */
-    for (int i = 0; i < count; ++i)
-    {
-      if (regs_to_save & (1u << result.regs[i]))
-      {
-        if (scratch_push_count < 128)
-        {
-          scratch_push_stack[scratch_push_count++] = result.regs[i];
-        }
-        else
-        {
-          tcc_error("compiler_error: scratch register push stack overflow (>128 pushes without restore)");
-        }
-      }
-    }
-  }
-
-  return result;
-}
-
-static void restore_scratch_regs(ScratchRegAllocs *allocs)
-{
-  if (!allocs || allocs->count <= 0)
-    return;
-
-  if (allocs->saved_mask != 0)
-  {
-    /* Check if we can restore all saved registers in LIFO order */
-    int can_restore_all = 1;
-    int check_count = 0;
-
-    /* Count how many saved registers we have and verify LIFO order */
-    for (int i = allocs->count - 1; i >= 0 && can_restore_all; --i)
-    {
-      if (allocs->saved_mask & (1u << allocs->regs[i]))
-      {
-        int stack_idx = scratch_push_count - 1 - check_count;
-        if (stack_idx < 0 || scratch_push_stack[stack_idx] != allocs->regs[i])
-        {
-          can_restore_all = 0;
-        }
-        check_count++;
-      }
-    }
-
-    if (can_restore_all && check_count > 0)
-    {
-      /* We can restore all saved registers with a single POP */
-#ifdef ARM_THUMB_DEBUG_SCRATCH
-      fprintf(stderr, "[SCRATCH] Popping registers (mask=0x%x) in single instruction\n", allocs->saved_mask);
-#endif
-      ot_check(th_pop(allocs->saved_mask));
-
-      /* Update the push stack and global exclude */
-      scratch_push_count -= check_count;
-      for (int i = 0; i < allocs->count; ++i)
-      {
-        if (allocs->saved_mask & (1u << allocs->regs[i]))
-        {
-          scratch_global_exclude &= ~(1u << allocs->regs[i]);
-        }
-      }
-      allocs->saved_mask = 0;
-    }
-    else
-    {
-      /* Cannot restore in order - defer to individual restore or end-of-instruction cleanup */
-#ifdef ARM_THUMB_DEBUG_SCRATCH
-      fprintf(stderr, "[SCRATCH] WARNING: restore_scratch_regs out of order; deferring POP\n");
-#endif
-      /* Keep saved_mask set so cleanup knows these need restoration */
-    }
-  }
-
-  allocs->count = 0;
-}
 ScratchRegAlloc th_offset_to_reg(int offset, int sign);
 
 /* Get a free scratch register using liveness information.
@@ -434,6 +241,9 @@ static ScratchRegAlloc get_scratch_reg_with_save(uint32_t exclude_regs)
      */
     if (reg != PREG_NONE && reg >= 0 && reg < 16)
     {
+      /* Never use SP or PC as scratch registers. */
+      if (reg == R_SP || reg == R_PC)
+        goto no_free_reg;
 #ifdef ARM_THUMB_DEBUG_SCRATCH
       fprintf(stderr, "[SCRATCH] -> returning reg=%d (free) exclude=0x%x\n", reg, exclude_regs);
 #endif
@@ -446,6 +256,8 @@ static ScratchRegAlloc get_scratch_reg_with_save(uint32_t exclude_regs)
       return result;
     }
   }
+
+    no_free_reg:
 
   /* No free register found - we need to save one to the stack */
   /* Prefer R_IP (R12) as it's the inter-procedure scratch register */
@@ -654,21 +466,12 @@ ST_FUNC void tcc_machine_release_scratch(const TCCMachineScratchRegs *scratch)
   }
 }
 
-static int th_is_caller_saved_register(int reg)
-{
-  if (tcc_state->text_and_data_separation && reg == R9)
-  {
-    return 1;
-  }
-  return (reg >= R0 && reg <= R3) || reg == R_LR || reg == R_IP;
-}
-
 int ot_check(thumb_opcode op)
 {
-  // if (!is_valid_opcode(op))
-  // {
-  //   tcc_error("compiler_error: received invalid opcode: 0x%x\n", op.opcode);
-  // }
+  if (!is_valid_opcode(op))
+  {
+    tcc_error("compiler_error: received invalid opcode: 0x%x\n", op.opcode);
+  }
   return ot(op);
 }
 
@@ -677,7 +480,6 @@ int tcc_ir_is_spilled(SValue *sv);
 int tcc_ir_is_64bit(int t);
 
 /* Forward declarations for helpers used by spill preloading. */
-void load_vt_local(int r, SValue *sv, int base);
 int load_short_from_base(int ir, int base, int fc, int sign);
 int load_ushort_from_base(int ir, int base, int fc, int sign);
 int load_byte_from_base(int ir, int base, int fc, int sign);
@@ -946,11 +748,6 @@ ST_FUNC void arm_deinit(struct TCCState *s)
   thumb_free_call_sites();
 }
 
-static int regmask(int r)
-{
-  return reg_classes[r] & ~(RC_INT | RC_FLOAT);
-}
-
 /*
  * Write 2 - byte Thumb instruction
  * current write position must be 16-bit aligned
@@ -1206,7 +1003,7 @@ int ot(thumb_opcode op)
 }
 
 static void load_full_const(int r, int r1, int64_t imm, struct Sym *sym);
-static void gcall_or_jump(int is_jmp, SValue *dest);
+static void gcall_or_jump_ir(int is_jmp, IROperand dest);
 
 // TODO: this is armv7-m code
 int decbranch(int pos)
@@ -1795,9 +1592,6 @@ static uint32_t th_store_resolve_base_ir(int src_reg, IROperand sv, int btype, i
     base_reg = base_alloc->reg;
     *has_base_alloc = 1;
 
-    /* Load (sym + addend) into base register.
-     * This is equivalent to the legacy SValue { VT_CONST|VT_SYM, c.i=addend }.
-     */
     tcc_machine_load_constant(base_reg, PREG_REG_NONE, addend, 0, validated_sym);
     return base_reg;
   }
@@ -1978,7 +1772,7 @@ static void store_ex_ir(int r, IROperand sv, uint32_t extra_exclude)
   }
 }
 
-static void store_ir(int r, IROperand sv)
+void store_ir(int r, IROperand sv)
 {
   store_ex_ir(r, sv, 0);
 }
@@ -1988,19 +1782,6 @@ static void store_ex(int r, SValue *sv, uint32_t extra_exclude)
   /* Legacy wrapper: convert SValue to IROperand and delegate to store_ex_ir */
   const IROperand sv_ir = svalue_to_iroperand(tcc_state->ir, sv);
   store_ex_ir(r, sv_ir, extra_exclude);
-}
-
-static void load_vt_lval_vt_local_float(int r, SValue *sv, int ft, int fc, int sign, uint32_t base)
-{
-  if ((ft & VT_BTYPE) != VT_FLOAT)
-  {
-    // load double
-    ot_check(th_vldr(base, r, !sign, 1, fc));
-  }
-  else
-  {
-    ot_check(th_vldr(base, r, !sign, 0, fc));
-  }
 }
 
 static ThumbLiteralPoolEntry *th_literal_pool_allocate()
@@ -2380,370 +2161,28 @@ ST_FUNC void tcc_machine_load_jmp_result(int dest_reg, int jmp_addr, int invert)
   ot_check(th_generic_mov_imm(dest_reg, invert ? 1 : 0));
 }
 
-void load_vt_lval_vt_local(int r, int r1, SValue *sv, int ft, int fc, int sign, uint32_t base)
-{
-  int success = 0;
-  const int btype = ft & VT_BTYPE;
-
-  TRACE("load_vt_lval_vt_local: fc: %i", fc);
-
-  if (is_float(ft))
-  {
-    /* Check if destination is a VFP register or an integer register.
-     * For soft float (IR code path), floats are loaded to integer registers.
-     * Note: r values 0-4 are always integer registers (R0-R3, R12=TREG_R12=4).
-     * r values 5-12 could be TREG_F0-F7 OR physical R5-R12.
-     * We use a heuristic: if r is a known scratch register (R12=12), use
-     * integer path. Only use VFP if hard float ABI is enabled. */
-    int use_vfp = (tcc_state->float_abi == ARM_HARD_FLOAT) && (r >= TREG_F0 && r <= TREG_F7);
-    /* Override: if r is physical R12 (12), always use integer path */
-    if (r == 12 || r == 14)
-    {
-      use_vfp = 0;
-    }
-    if (use_vfp)
-    {
-      /* VFP register - use VFP load instructions */
-      TRACE("load float to VFP r: %d, base: %d, fc: %d, sign: %d\n", r, base, fc, sign);
-      return load_vt_lval_vt_local_float(r, sv, ft, fc, sign, base);
-    }
-    else
-    {
-      /* Integer register - load float as raw bits (soft float) */
-      TRACE("load float to INT r: %d, base: %d, fc: %d, sign: %d\n", r, base, fc, sign);
-      if (btype == VT_DOUBLE || btype == VT_LDOUBLE)
-      {
-        /* Double: load 64 bits to pre-allocated register pair.
-         * Use r1 parameter (high register) from caller.
-         * Fallback to ir+1 for backward compatibility if r1 is not provided (-1). */
-        int ir_high = r1;
-        if (ir_high < 0)
-        {
-          /* Fallback: try r+1 but validate */
-          ir_high = r + 1;
-          if (ir_high == R_SP || ir_high == R_PC)
-          {
-            tcc_error("compiler_error: cannot load double - no valid high register "
-                      "(r1=%d, r+1=%d would be SP/PC)\n",
-                      r1, r + 1);
-          }
-        }
-        /* If base overlaps with destination, preserve it for the pair load.
-         * Otherwise the first load clobbers the base before the second load.
-         */
-        ScratchRegAlloc base_alloc = {0};
-        uint32_t base_reg = base;
-        if (base_reg == (uint32_t)r || base_reg == (uint32_t)ir_high)
-        {
-          uint32_t exclude = (1u << r) | (1u << ir_high);
-          base_alloc = get_scratch_reg_with_save(exclude);
-          base_reg = (uint32_t)base_alloc.reg;
-          ot_check(th_mov_reg((int)base_reg, (int)base, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                              ENFORCE_ENCODING_NONE, false));
-        }
-
-        /* Load low word first */
-        success = load_word_from_base(r, base_reg, fc, sign);
-        if (!success)
-        {
-          ScratchRegAlloc rr_alloc =
-              th_offset_to_reg_ex(fc, sign, (1u << r) | (1u << base_reg) | (ir_high >= 0 ? (1u << ir_high) : 0));
-          int rr = rr_alloc.reg;
-          ot_check(th_ldr_reg(r, base_reg, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-          restore_scratch_reg(&rr_alloc);
-        }
-        /* Load high word.
-         * For negative offsets (sign=1), high word is at fc-4 (closer to base).
-         * For positive offsets (sign=0), high word is at fc+4 (further from
-         * base).
-         */
-        int fc_high = sign ? (fc - 4) : (fc + 4);
-        int sign_high = sign;
-        /* Handle case where fc_high becomes 0 or changes sign */
-        if (sign && fc_high < 0)
-        {
-          fc_high = -fc_high;
-          sign_high = 0;
-        }
-        success = load_word_from_base(ir_high, base_reg, fc_high, sign_high);
-        if (!success)
-        {
-          ScratchRegAlloc rr_alloc =
-              th_offset_to_reg_ex(fc_high, sign_high, (1u << ir_high) | (1u << base_reg) | (r >= 0 ? (1u << r) : 0));
-          int rr = rr_alloc.reg;
-          ot_check(th_ldr_reg(ir_high, base_reg, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-          restore_scratch_reg(&rr_alloc);
-        }
-
-        if (base_alloc.saved)
-        {
-          restore_scratch_reg(&base_alloc);
-        }
-      }
-      else
-      {
-        /* Float: load 32 bits to single integer register */
-        success = load_word_from_base(r, base, fc, sign);
-        if (!success)
-        {
-          ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(fc, sign, (1u << r) | (1u << base));
-          int rr = rr_alloc.reg;
-          ot_check(th_ldr_reg(r, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-          restore_scratch_reg(&rr_alloc);
-        }
-      }
-      return;
-    }
-  }
-  else if (btype == VT_LLONG || btype == VT_PTR)
-  {
-    /* 64-bit integer type - load to register pair if r1 is provided and valid */
-    /* Note: r1 comes from uint8_t pr1, so -1 becomes 255. Check r1 <= 15 to exclude invalid values. */
-    if (r1 >= 0 && r1 <= 15 && r1 != R_SP && r1 != R_PC && (btype == VT_LLONG))
-    {
-      TRACE("load 64-bit int to r:%d:r1:%d, base: %d, fc: %d, sign: %d\n", r, r1, base, fc, sign);
-      /* If base overlaps with destination, preserve it for the pair load.
-       * Otherwise the first load clobbers the base before the second load.
-       */
-      ScratchRegAlloc base_alloc = {0};
-      uint32_t base_reg = base;
-      if (base_reg == (uint32_t)r || base_reg == (uint32_t)r1)
-      {
-        uint32_t exclude = (1u << r) | (1u << r1);
-        base_alloc = get_scratch_reg_with_save(exclude);
-        base_reg = (uint32_t)base_alloc.reg;
-        ot_check(th_mov_reg((int)base_reg, (int)base, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                            ENFORCE_ENCODING_NONE, false));
-      }
-      /* Load low word */
-      success = load_word_from_base(r, base_reg, fc, sign);
-      if (!success)
-      {
-        ScratchRegAlloc rr_alloc =
-            th_offset_to_reg_ex(fc, sign, (1u << r) | (1u << base_reg) | (r1 >= 0 ? (1u << r1) : 0));
-        int rr = rr_alloc.reg;
-        ot_check(th_ldr_reg(r, base_reg, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-        restore_scratch_reg(&rr_alloc);
-      }
-      /* Load high word at offset+4 */
-      int fc_high = sign ? (fc - 4) : (fc + 4);
-      int sign_high = sign;
-      if (sign && fc_high < 0)
-      {
-        fc_high = -fc_high;
-        sign_high = 0;
-      }
-      success = load_word_from_base(r1, base_reg, fc_high, sign_high);
-      if (!success)
-      {
-        ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(fc_high, sign_high, (1u << r1) | (1u << base_reg) | (1u << r));
-        int rr = rr_alloc.reg;
-        ot_check(th_ldr_reg(r1, base_reg, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-        restore_scratch_reg(&rr_alloc);
-      }
-
-      if (base_alloc.saved)
-      {
-        restore_scratch_reg(&base_alloc);
-      }
-      return;
-    }
-    /* Fall through to 32-bit load for pointers or if r1 not provided */
-  }
-  else if (btype == VT_SHORT)
-  {
-    TRACE("load short to r: %d, base: %d, fc: %d, sign: %d\n", r, base, fc, sign);
-    if (!(ft & VT_UNSIGNED))
-    {
-      success = load_short_from_base(r, base, fc, sign);
-    }
-    else
-    {
-      success = load_ushort_from_base(r, base, fc, sign);
-    }
-  }
-  else if (btype == VT_BYTE || btype == VT_BOOL)
-  {
-    if (!(ft & VT_UNSIGNED))
-    {
-      success = load_byte_from_base(r, base, fc, sign);
-    }
-    else
-    {
-      success = load_ubyte_from_base(r, base, fc, sign);
-    }
-  }
-  else
-  {
-    success = load_word_from_base(r, base, fc, sign);
-  }
-  if (!success)
-  {
-
-    // now load from dereferenced value
-    ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(fc, sign, (1u << r) | (1u << base));
-    int rr = rr_alloc.reg;
-    if (btype == VT_SHORT)
-    {
-      if (ft & VT_UNSIGNED)
-        ot_check(th_ldrh_reg(r, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-      else
-        ot_check(th_ldrsh_reg(r, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-    }
-    else if (btype == VT_BYTE || btype == VT_BOOL)
-    {
-      if (ft & VT_UNSIGNED)
-        ot_check(th_ldrb_reg(r, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-      else
-        ot_check(th_ldrsb_reg(r, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-    }
-    else
-      ot_check(th_ldr_reg(r, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-
-    restore_scratch_reg(&rr_alloc);
-  }
-}
-
-void load_vt_local(int r, SValue *sv, int base)
-{
-  int off = sv->c.i;
-  /* Stack parameters live above the saved-register area.
-   * When computing their address, fold in offset_to_args (prologue push size).
-   * EXCEPTION: Variadic register parameters are saved in the prologue at
-   * negative offsets (FP-16 to FP-4), so they're already in our local frame
-   * and should NOT have offset_to_args added.
-   */
-  if ((sv->r & VT_PARAM) && off >= 0)
-  {
-    off += offset_to_args;
-  }
-
-  TRACE("'load_vt_local' r: %d, off: %x", r, (uint32_t)off);
-  Sym *sym_to_use = NULL;
-  if (sv->r & VT_SYM)
-  {
-    sym_to_use = validate_sym_for_reloc(sv->sym);
-  }
-  if (sym_to_use || (-off) >= 0xfff)
-  {
-    load_full_const(r, PREG_NONE, off, sym_to_use);
-    ot_check(th_add_reg(r, base, r, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-  }
-  else
-  {
-    ot_check(th_sub_imm(r, base, -off, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
-  }
-}
-
-/* Convert IROP_BTYPE to VT_BTYPE for load operations */
-static int irop_btype_to_vt_btype_for_load(int irop_btype, int is_unsigned)
-{
-  int vt;
-  switch (irop_btype)
-  {
-  case IROP_BTYPE_INT8:
-    vt = VT_BYTE;
-    break;
-  case IROP_BTYPE_INT16:
-    vt = VT_SHORT;
-    break;
-  case IROP_BTYPE_INT64:
-    vt = VT_LLONG;
-    break;
-  case IROP_BTYPE_FLOAT32:
-    vt = VT_FLOAT;
-    break;
-  case IROP_BTYPE_FLOAT64:
-    vt = VT_DOUBLE;
-    break;
-  case IROP_BTYPE_STRUCT:
-    vt = VT_STRUCT;
-    break;
-  case IROP_BTYPE_FUNC:
-    vt = VT_FUNC;
-    break;
-  default:
-    vt = VT_INT;
-    break;
-  }
-  if (is_unsigned)
-    vt |= VT_UNSIGNED;
-  return vt;
-}
-
 /* Load value from memory at base+offset into register(s).
- * This is a simplified version of load_vt_lval_vt_local that doesn't need SValue.
+ * Uses IROP_BTYPE_* constants directly, no VT_* conversion needed.
  */
-static void load_vt_lval_vt_local_from_base(int r, int r1, int ft, int fc, int sign, uint32_t base)
+static void load_from_base_ir(int r, int r1, int irop_btype, int is_unsigned, int fc, int sign, uint32_t base)
 {
   int success = 0;
-  const int btype = ft & VT_BTYPE;
+  const int is_64bit = (irop_btype == IROP_BTYPE_INT64 || irop_btype == IROP_BTYPE_FLOAT64);
 
-  TRACE("load_vt_lval_vt_local_from_base: r=%d, r1=%d, ft=0x%x, fc=%d, sign=%d, base=%d", r, r1, ft, fc, sign, base);
+  TRACE("load_from_base_ir: r=%d, r1=%d, irop_btype=%d, is_unsigned=%d, fc=%d, sign=%d, base=%d", r, r1, irop_btype,
+        is_unsigned, fc, sign, base);
 
-  if (is_float(ft))
+  if (is_64bit)
   {
-    /* Integer register - load float as raw bits (soft float) */
-    if (btype == VT_DOUBLE || btype == VT_LDOUBLE)
-    {
-      /* Double: load 64 bits to register pair */
-      int ir_high = r1;
-      if (ir_high < 0 || ir_high == PREG_REG_NONE)
-      {
-        ir_high = r + 1;
-        if (ir_high == R_SP || ir_high == R_PC)
-        {
-          tcc_error("compiler_error: cannot load double - no valid high register");
-        }
-      }
-
-      /* If base overlaps with destination, preserve it */
-      ScratchRegAlloc base_alloc = {0};
-      uint32_t base_reg = base;
-      if (base_reg == (uint32_t)r || base_reg == (uint32_t)ir_high)
-      {
-        uint32_t exclude = (1u << r) | (1u << ir_high);
-        base_alloc = get_scratch_reg_with_save(exclude);
-        base_reg = (uint32_t)base_alloc.reg;
-        ot_check(th_mov_reg((int)base_reg, (int)base, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                            ENFORCE_ENCODING_NONE, false));
-      }
-
-      /* Load low word first */
-      success = load_word_from_base(r, base_reg, fc, sign);
-      if (!success)
-      {
-        ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(fc, sign, (1u << r) | (1u << base_reg) | (1u << ir_high));
-        int rr = rr_alloc.reg;
-        ot_check(th_ldr_reg(r, base_reg, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-        restore_scratch_reg(&rr_alloc);
-      }
-
-      /* Load high word */
-      int fc_high = sign ? (fc - 4) : (fc + 4);
-      success = load_word_from_base(ir_high, base_reg, fc_high, sign);
-      if (!success)
-      {
-        ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(fc_high, sign, (1u << r) | (1u << base_reg) | (1u << ir_high));
-        int rr = rr_alloc.reg;
-        ot_check(th_ldr_reg(ir_high, base_reg, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-        restore_scratch_reg(&rr_alloc);
-      }
-
-      if (base_alloc.saved)
-        restore_scratch_reg(&base_alloc);
-      return;
-    }
-    /* Single float: load as word */
-    success = load_word_from_base(r, base, fc, sign);
-  }
-  else if (btype == VT_LLONG)
-  {
-    /* 64-bit integer - load to register pair */
+    /* 64-bit value (double float or long long) - load to register pair */
     int ir_high = r1;
     if (ir_high < 0 || ir_high == PREG_REG_NONE)
     {
       ir_high = r + 1;
+      if (ir_high == R_SP || ir_high == R_PC)
+      {
+        tcc_error("compiler_error: cannot load 64-bit value - no valid high register");
+      }
     }
 
     /* If base overlaps with destination, preserve it */
@@ -2758,6 +2197,7 @@ static void load_vt_lval_vt_local_from_base(int r, int r1, int ft, int fc, int s
                           ENFORCE_ENCODING_NONE, false));
     }
 
+    /* Load low word */
     success = load_word_from_base(r, base_reg, fc, sign);
     if (!success)
     {
@@ -2767,6 +2207,7 @@ static void load_vt_lval_vt_local_from_base(int r, int r1, int ft, int fc, int s
       restore_scratch_reg(&rr_alloc);
     }
 
+    /* Load high word */
     int fc_high = sign ? (fc - 4) : (fc + 4);
     success = load_word_from_base(ir_high, base_reg, fc_high, sign);
     if (!success)
@@ -2781,22 +2222,24 @@ static void load_vt_lval_vt_local_from_base(int r, int r1, int ft, int fc, int s
       restore_scratch_reg(&base_alloc);
     return;
   }
-  else if (btype == VT_SHORT)
+
+  if (irop_btype == IROP_BTYPE_INT16)
   {
-    if (!(ft & VT_UNSIGNED))
+    if (!is_unsigned)
       success = load_short_from_base(r, base, fc, sign);
     else
       success = load_ushort_from_base(r, base, fc, sign);
   }
-  else if (btype == VT_BYTE || btype == VT_BOOL)
+  else if (irop_btype == IROP_BTYPE_INT8)
   {
-    if (!(ft & VT_UNSIGNED))
+    if (!is_unsigned)
       success = load_byte_from_base(r, base, fc, sign);
     else
       success = load_ubyte_from_base(r, base, fc, sign);
   }
   else
   {
+    /* IROP_BTYPE_INT32, IROP_BTYPE_FLOAT32, IROP_BTYPE_STRUCT, IROP_BTYPE_FUNC: load as word */
     success = load_word_from_base(r, base, fc, sign);
   }
 
@@ -2804,16 +2247,16 @@ static void load_vt_lval_vt_local_from_base(int r, int r1, int ft, int fc, int s
   {
     ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(fc, sign, (1u << r) | (1u << base));
     int rr = rr_alloc.reg;
-    if (btype == VT_SHORT)
+    if (irop_btype == IROP_BTYPE_INT16)
     {
-      if (ft & VT_UNSIGNED)
+      if (is_unsigned)
         ot_check(th_ldrh_reg(r, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
       else
         ot_check(th_ldrsh_reg(r, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     }
-    else if (btype == VT_BYTE || btype == VT_BOOL)
+    else if (irop_btype == IROP_BTYPE_INT8)
     {
-      if (ft & VT_UNSIGNED)
+      if (is_unsigned)
         ot_check(th_ldrb_reg(r, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
       else
         ot_check(th_ldrsb_reg(r, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
@@ -2875,8 +2318,7 @@ void load_to_dest_ir(IROperand dest, IROperand src)
       /* Register-indirect load: src_reg holds address */
       thumb_require_materialized_reg(ctx, "lvalue base", src_reg);
       int pr1_for_load = dest.pr1_spilled ? PREG_REG_NONE : dest.pr1_reg;
-      int ft = irop_btype_to_vt_btype_for_load(btype, src.is_unsigned);
-      load_vt_lval_vt_local_from_base(dest.pr0_reg, pr1_for_load, ft, 0, 0, src_reg);
+      load_from_base_ir(dest.pr0_reg, pr1_for_load, btype, src.is_unsigned, 0, 0, src_reg);
       return;
     }
 
@@ -2966,8 +2408,7 @@ void load_to_dest_ir(IROperand dest, IROperand src)
     {
       /* Load value from stack location */
       int pr1_for_load = dest.pr1_spilled ? PREG_REG_NONE : dest.pr1_reg;
-      int ft = irop_btype_to_vt_btype_for_load(btype, src.is_unsigned);
-      load_vt_lval_vt_local_from_base(dest.pr0_reg, pr1_for_load, ft, abs_offset, sign, base_reg);
+      load_from_base_ir(dest.pr0_reg, pr1_for_load, btype, src.is_unsigned, abs_offset, sign, base_reg);
     }
     else
     {
@@ -2994,7 +2435,25 @@ void load_to_dest_ir(IROperand dest, IROperand src)
   case IROP_TAG_F64:
   {
     const uint64_t value = irop_get_imm64_ex(tcc_state->ir, src);
-    tcc_machine_load_constant(dest.pr0_reg, dest.pr1_spilled ? PREG_REG_NONE : dest.pr1_reg, (int64_t)value, 1, NULL);
+    if (dest.pr1_spilled)
+    {
+      /* High register is spilled - this case should be handled at the IR level
+       * by first loading to a scratch reg then storing to spill slot.
+       * For now, error out to identify where this is happening. */
+      tcc_error("compiler_error: load_to_dest_ir I64/F64: dest.pr1 is spilled, need IR-level handling");
+    }
+    if (dest.pr1_reg == PREG_REG_NONE)
+    {
+      /* No high register allocated - use a scratch register for high word */
+      ScratchRegAlloc hi_alloc = get_scratch_reg_with_save((1u << dest.pr0_reg) | (1u << ARM_SP) | (1u << ARM_PC));
+      tcc_machine_load_constant(dest.pr0_reg, hi_alloc.reg, (int64_t)value, 1, NULL);
+      /* The high word is loaded but discarded - caller must not need it */
+      restore_scratch_reg(&hi_alloc);
+    }
+    else
+    {
+      tcc_machine_load_constant(dest.pr0_reg, dest.pr1_reg, (int64_t)value, 1, NULL);
+    }
     return;
   }
   case IROP_TAG_SYMREF:
@@ -3021,10 +2480,9 @@ void load_to_dest_ir(IROperand dest, IROperand src)
       tcc_machine_load_constant(base_reg, PREG_REG_NONE, 0, 0, validated_sym);
 
       /* Load value from the address with addend offset */
-      int ft = irop_btype_to_vt_btype_for_load(btype, src.is_unsigned);
       int sign = (addend < 0);
       int abs_offset = sign ? -addend : addend;
-      load_vt_lval_vt_local_from_base(dest.pr0_reg, pr1_for_const, ft, abs_offset, sign, base_reg);
+      load_from_base_ir(dest.pr0_reg, pr1_for_const, btype, src.is_unsigned, abs_offset, sign, base_reg);
 
       restore_scratch_reg(&base_alloc);
       return;
@@ -3058,17 +2516,6 @@ static void load_to_reg_ir(int r, int r1, IROperand src)
   load_to_dest_ir(dest, src);
 }
 
-static int is_zero_on_stack(int pos)
-{
-  if ((vtop[pos].r & (VT_VALMASK | VT_LVAL | VT_SYM)) != VT_CONST)
-    return 0;
-  if (vtop[pos].type.t == VT_FLOAT)
-    return vtop[pos].c.f == 0.f;
-  if (vtop[pos].type.t == VT_DOUBLE)
-    return vtop[pos].c.d == 0.0;
-  return vtop[pos].c.ld = 0.l;
-}
-
 ST_FUNC void gen_increment_tcov(SValue *sv)
 {
   TRACE("'gen_increment_tcov'");
@@ -3100,12 +2547,6 @@ static void thumb_require_materialized_reg(const char *ctx, const char *operand,
   }
 }
 
-static void thumb_require_materialized_pair(const char *ctx, const char *operand, int lo, int hi)
-{
-  thumb_require_materialized_reg(ctx, operand, lo);
-  thumb_require_materialized_reg(ctx, operand, hi);
-}
-
 static void thumb_ensure_not_spilled(const char *ctx, const char *operand, int reg)
 {
   if (reg != PREG_REG_NONE)
@@ -3134,24 +2575,21 @@ static bool thumb_is_hw_reg(int reg)
 {
   return reg >= 0 && reg <= 15;
 }
-static void thumb_prepare_dest_pair_for_64bit_op(const char *ctx, SValue *dest, int *rd_low, int *rd_high,
-                                                 ScratchRegAlloc *rd_low_alloc, ScratchRegAlloc *rd_high_alloc,
-                                                 bool *store_low, bool *store_high, uint32_t *exclude_mask)
+
+static void thumb_prepare_dest_pair_for_64bit_op_ir(const char *ctx, IROperand *dest, int *rd_low, int *rd_high,
+                                                    ScratchRegAlloc *rd_low_alloc, ScratchRegAlloc *rd_high_alloc,
+                                                    bool *store_low, bool *store_high, uint32_t *exclude_mask)
 {
   if (!dest || !rd_low || !rd_high || !rd_low_alloc || !rd_high_alloc || !store_low || !store_high || !exclude_mask)
-    tcc_error("compiler_error: invalid arguments to thumb_prepare_dest_pair_for_64bit_op");
+    tcc_error("compiler_error: invalid arguments to thumb_prepare_dest_pair_for_64bit_op_ir");
 
   *rd_low = dest->pr0_reg;
   *rd_high = dest->pr1_reg;
   *store_low = false;
   *store_high = false;
 
-  /* Defensive fix: if a 64-bit register destination is missing the high register,
-   * assume a consecutive pair (r, r+1). This prevents storing the high word into
-   * the low register when pr1 is unset.
-   */
-  if (((*rd_high == PREG_REG_NONE) || (*rd_high == *rd_low)) && dest->pr0_reg != PREG_REG_NONE &&
-      !(dest->r & VT_LVAL) && dest->r != VT_LOCAL)
+  if (((*rd_high == PREG_REG_NONE) || (*rd_high == *rd_low)) && dest->pr0_reg != PREG_REG_NONE && !dest->is_lval &&
+      !dest->is_local && !dest->is_llocal)
   {
     int candidate = *rd_low + 1;
     if (thumb_is_hw_reg(*rd_low) && thumb_is_hw_reg(candidate) && candidate != R_SP && candidate != R_PC)
@@ -3166,14 +2604,6 @@ static void thumb_prepare_dest_pair_for_64bit_op(const char *ctx, SValue *dest, 
     }
   }
 
-  /* If the chosen destination register overlaps with an excluded register
-   * (typically a live source operand), do not write the result in-place.
-   * Materialize into scratch and store back afterward.
-   *
-   * This matters for ops like UMULL and 64-bit shifts where the machine
-   * instruction sequence expects sources to remain intact while producing
-   * a 64-bit result.
-   */
   if (thumb_is_hw_reg(*rd_low) && ((*exclude_mask & (1u << *rd_low)) == 0))
   {
     thumb_require_materialized_reg(ctx, "dest.low", *rd_low);
@@ -3201,42 +2631,42 @@ static void thumb_prepare_dest_pair_for_64bit_op(const char *ctx, SValue *dest, 
   }
 }
 
-static void thumb_store_dest_pair_if_needed(SValue *dest, int rd_low, int rd_high, bool store_low, bool store_high)
+static void thumb_store_dest_pair_if_needed_ir(IROperand dest, int rd_low, int rd_high, bool store_low, bool store_high)
 {
-  if (!dest)
+  if (irop_is_none(dest))
     return;
 
-  const bool dest_is_reg =
-      (!(dest->r & VT_LVAL) && dest->r != VT_LOCAL && dest->pr0_reg != PREG_REG_NONE && thumb_is_hw_reg(dest->pr0_reg));
+  const bool dest_is_reg = (!dest.is_lval && !dest.is_local && !dest.is_llocal && dest.pr0_reg != PREG_REG_NONE &&
+                            thumb_is_hw_reg(dest.pr0_reg));
 
   if (store_low)
   {
     if (dest_is_reg)
     {
-      if (dest->pr0_reg != rd_low)
+      if (dest.pr0_reg != rd_low)
       {
-        ot_check(th_mov_reg(dest->pr0_reg, rd_low, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+        ot_check(th_mov_reg(dest.pr0_reg, rd_low, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
                             ENFORCE_ENCODING_NONE, false));
       }
     }
     else
     {
-      SValue dest_lo = *dest;
+      IROperand dest_lo = dest;
       dest_lo.pr1_reg = PREG_REG_NONE;
       dest_lo.pr1_spilled = 0;
-      dest_lo.type.t = VT_INT;
-      store(rd_low, &dest_lo);
+      dest_lo.btype = IROP_BTYPE_INT32;
+      store_ex_ir(rd_low, dest_lo, store_high ? (1u << rd_high) : 0);
     }
   }
   if (store_high)
   {
     if (dest_is_reg)
     {
-      int dest_high = dest->pr1_reg;
-      if (dest_high == PREG_REG_NONE || dest_high == dest->pr0_reg)
+      int dest_high = dest.pr1_reg;
+      if (dest_high == PREG_REG_NONE || dest_high == dest.pr0_reg)
       {
-        int candidate = dest->pr0_reg + 1;
-        if (!dest->pr0_spilled && thumb_is_hw_reg(dest->pr0_reg) && thumb_is_hw_reg(candidate) && candidate != R_SP &&
+        int candidate = dest.pr0_reg + 1;
+        if (!dest.pr0_spilled && thumb_is_hw_reg(dest.pr0_reg) && thumb_is_hw_reg(candidate) && candidate != R_SP &&
             candidate != R_PC)
           dest_high = candidate;
       }
@@ -3250,34 +2680,25 @@ static void thumb_store_dest_pair_if_needed(SValue *dest, int rd_low, int rd_hig
     }
     else
     {
-      SValue dest_hi = *dest;
-      dest_hi.c.i += 4;
+      IROperand dest_hi = dest;
       dest_hi.pr1_reg = PREG_REG_NONE;
       dest_hi.pr1_spilled = 0;
-      dest_hi.type.t = VT_INT;
-      store(rd_high, &dest_hi);
+      dest_hi.btype = IROP_BTYPE_INT32;
+      if (irop_get_tag(dest_hi) == IROP_TAG_SYMREF)
+      {
+        IRPoolSymref *symref = irop_get_symref_ex(tcc_state->ir, dest_hi);
+        if (symref)
+        {
+          uint32_t idx = tcc_ir_pool_add_symref(tcc_state->ir, symref->sym, symref->addend + 4, symref->flags);
+          dest_hi.u.pool_idx = idx;
+        }
+      }
+      else
+      {
+        dest_hi.u.imm32 += 4;
+      }
+      store_ir(rd_high, dest_hi);
     }
-  }
-}
-
-static void thumb_emit_sub_imm_fallback(int rd, int rn, uint32_t imm, thumb_flags_behaviour flags)
-{
-  thumb_opcode sub_low = th_sub_imm(rd, rn, imm, flags, ENFORCE_ENCODING_NONE);
-  if (sub_low.size == 0)
-  {
-    uint32_t exclude = 0;
-    if (rd >= 0 && rd <= 15)
-      exclude |= (1u << rd);
-    if (rn >= 0 && rn <= 15)
-      exclude |= (1u << rn);
-    ScratchRegAlloc scratch = get_scratch_reg_with_save(exclude);
-    tcc_machine_load_constant(scratch.reg, PREG_NONE, (int32_t)imm, 0, NULL);
-    ot_check(th_sub_reg(rd, rn, scratch.reg, flags, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-    restore_scratch_reg(&scratch);
-  }
-  else
-  {
-    ot_check(sub_low);
   }
 }
 
@@ -3303,11 +2724,132 @@ static void thumb_emit_op_imm_fallback(int rd, int rn, uint32_t imm, thumb_flags
   }
 }
 
-static void thumb_emit_opcode64_imm(SValue *src1, SValue *src2, SValue *dest, TccIrOp op, const char *ctx,
-                                    ThumbDataProcessingHandler regular, ThumbDataProcessingHandler carry)
+static bool thumb_irop_has_immediate_value(IROperand op)
 {
-  const bool src2_is_imm = th_has_immediate_value(src2->r);
-  const uint64_t src2_imm = (uint64_t)src2->c.i;
+  int tag = irop_get_tag(op);
+  return tag == IROP_TAG_IMM32 || tag == IROP_TAG_I64 || tag == IROP_TAG_F32 || tag == IROP_TAG_F64;
+}
+
+static bool thumb_irop_needs_value_load(IROperand op)
+{
+  const bool is_address_of = (op.is_local || op.is_llocal) && !op.is_lval;
+  const bool is_sym_address = (op.is_sym || irop_get_tag(op) == IROP_TAG_SYMREF) && !op.is_lval;
+  return is_address_of || is_sym_address;
+}
+
+static void thumb_materialize_src1_for_64op(const char *ctx, IROperand src1, bool src1_is64, int rd_low, int rd_high,
+                                            int *rn_low, int *rn_high, ScratchRegAlloc *rn_low_alloc,
+                                            ScratchRegAlloc *rn_high_alloc, uint32_t *exclude)
+{
+  const bool src1_is_imm = (src1.pr0_reg == PREG_REG_NONE) && thumb_irop_has_immediate_value(src1);
+  int low = src1.pr0_reg;
+  int high = (src1_is64 ? src1.pr1_reg : PREG_REG_NONE);
+  const bool needs_value_load = thumb_irop_needs_value_load(src1);
+
+  if (src1_is_imm)
+  {
+    Sym *sym = src1.is_sym ? irop_get_sym_ex(tcc_state->ir, src1) : NULL;
+    const int64_t imm = irop_get_imm64_ex(tcc_state->ir, src1);
+    if (src1_is64)
+    {
+      tcc_machine_load_constant(rd_low, rd_high, imm, 1, sym);
+      low = rd_low;
+      high = rd_high;
+    }
+    else
+    {
+      tcc_machine_load_constant(rd_low, PREG_NONE, imm, 0, sym);
+      low = rd_low;
+      high = PREG_REG_NONE;
+    }
+  }
+  else if (!needs_value_load && !src1.is_lval && thumb_is_hw_reg(low) &&
+           (!src1_is64 || (high != PREG_REG_NONE && thumb_is_hw_reg(high))))
+  {
+    thumb_require_materialized_reg(ctx, "src1.low", low);
+    if (src1_is64 && high != PREG_REG_NONE)
+      thumb_ensure_not_spilled(ctx, "src1.high", high);
+    *exclude |= (1u << low);
+    if (src1_is64 && high != PREG_REG_NONE)
+      *exclude |= (1u << high);
+  }
+  else
+  {
+    *rn_low_alloc = get_scratch_reg_with_save(*exclude);
+    low = rn_low_alloc->reg;
+    *exclude |= (1u << low);
+    if (src1_is64)
+    {
+      *rn_high_alloc = get_scratch_reg_with_save(*exclude);
+      high = rn_high_alloc->reg;
+      *exclude |= (1u << high);
+      IROperand src1_tmp = src1;
+      load_to_reg_ir(low, high, src1_tmp);
+    }
+    else
+    {
+      high = PREG_REG_NONE;
+      IROperand src1_tmp = src1;
+      load_to_reg_ir(low, PREG_NONE, src1_tmp);
+    }
+  }
+
+  *rn_low = low;
+  *rn_high = high;
+}
+
+static void thumb_materialize_src2_for_64op(const char *ctx, IROperand src2, bool src2_is64, bool src2_is_imm,
+                                            int *rm_low, int *rm_high, ScratchRegAlloc *rm_low_alloc,
+                                            ScratchRegAlloc *rm_high_alloc, uint32_t *exclude)
+{
+  if (src2_is_imm)
+  {
+    *rm_low = PREG_REG_NONE;
+    *rm_high = PREG_REG_NONE;
+    return;
+  }
+
+  int low = src2.pr0_reg;
+  int high = (src2_is64 ? src2.pr1_reg : PREG_REG_NONE);
+  const bool needs_value_load = thumb_irop_needs_value_load(src2);
+
+  if (!needs_value_load && !src2.is_lval && thumb_is_hw_reg(low) &&
+      (!src2_is64 || (high != PREG_REG_NONE && thumb_is_hw_reg(high))))
+  {
+    thumb_require_materialized_reg(ctx, "src2.low", low);
+    if (src2_is64 && high != PREG_REG_NONE)
+      thumb_ensure_not_spilled(ctx, "src2.high", high);
+  }
+  else
+  {
+    *rm_low_alloc = get_scratch_reg_with_save(*exclude);
+    low = rm_low_alloc->reg;
+    *exclude |= (1u << low);
+    if (src2_is64)
+    {
+      *rm_high_alloc = get_scratch_reg_with_save(*exclude);
+      high = rm_high_alloc->reg;
+      *exclude |= (1u << high);
+      IROperand src2_tmp = src2;
+      load_to_reg_ir(low, high, src2_tmp);
+    }
+    else
+    {
+      high = PREG_REG_NONE;
+      IROperand src2_tmp = src2;
+      load_to_reg_ir(low, PREG_NONE, src2_tmp);
+    }
+  }
+
+  *rm_low = low;
+  *rm_high = high;
+}
+
+static void thumb_emit_opcode64_imm_ir(IROperand src1, IROperand src2, IROperand dest, TccIrOp op, const char *ctx,
+                                       ThumbDataProcessingHandler regular, ThumbDataProcessingHandler carry)
+{
+  const bool src2_is_imm = thumb_irop_has_immediate_value(src2);
+  const uint64_t src2_imm = (uint64_t)irop_get_imm64_ex(tcc_state->ir, src2);
   const uint32_t imm_low = (uint32_t)(src2_imm & 0xffffffffu);
   const uint32_t imm_high = (uint32_t)(src2_imm >> 32);
 
@@ -3317,124 +2859,29 @@ static void thumb_emit_opcode64_imm(SValue *src1, SValue *src2, SValue *dest, Tc
   ScratchRegAlloc rd_high_alloc = {0};
   bool store_low = false;
   bool store_high = false;
-  int rd_low = dest->pr0_reg;
-  int rd_high = dest->pr1_reg;
-  thumb_prepare_dest_pair_for_64bit_op(ctx, dest, &rd_low, &rd_high, &rd_low_alloc, &rd_high_alloc, &store_low,
-                                       &store_high, &exclude);
+  int rd_low = dest.pr0_reg;
+  int rd_high = dest.pr1_reg;
+  thumb_prepare_dest_pair_for_64bit_op_ir(ctx, &dest, &rd_low, &rd_high, &rd_low_alloc, &rd_high_alloc, &store_low,
+                                          &store_high, &exclude);
 
-  const bool src1_is64 = is_64bit_type(src1->type.t);
-  const bool src2_is64 = is_64bit_type(src2->type.t);
+  const bool src1_is64 = irop_is_64bit(src1);
+  const bool src2_is64 = irop_is_64bit(src2);
 
   /* Materialize src1. */
-  const bool src1_is_imm = (src1->pr0_reg == PREG_REG_NONE) && th_has_immediate_value(src1->r);
-  int rn_low = src1->pr0_reg;
-  int rn_high = (src1_is64 ? src1->pr1_reg : PREG_REG_NONE);
+  int rn_low = src1.pr0_reg;
+  int rn_high = (src1_is64 ? src1.pr1_reg : PREG_REG_NONE);
   ScratchRegAlloc rn_low_alloc = {0};
   ScratchRegAlloc rn_high_alloc = {0};
-  const int src1_kind = src1->r & VT_VALMASK;
-  const bool src1_is_address_of = (src1_kind == VT_LOCAL || src1_kind == VT_LLOCAL) && !(src1->r & VT_LVAL);
-  const bool src1_is_sym_address = (src1->r & VT_SYM) && !(src1->r & VT_LVAL);
-  const bool src1_needs_value_load = src1_is_address_of || src1_is_sym_address;
-
-  if (src1_is_imm)
-  {
-    Sym *sym = (src1->r & VT_SYM) ? src1->sym : NULL;
-    if (src1_is64)
-    {
-      tcc_machine_load_constant(rd_low, rd_high, src1->c.i, 1, sym);
-      rn_low = rd_low;
-      rn_high = rd_high;
-    }
-    else
-    {
-      tcc_machine_load_constant(rd_low, PREG_NONE, src1->c.i, 0, sym);
-      rn_low = rd_low;
-      rn_high = PREG_REG_NONE;
-    }
-  }
-  else if (!src1_needs_value_load && !(src1->r & VT_LVAL) && thumb_is_hw_reg(rn_low) &&
-           (!src1_is64 || (rn_high != PREG_REG_NONE && thumb_is_hw_reg(rn_high))))
-  {
-    thumb_require_materialized_reg(ctx, "src1.low", rn_low);
-    if (src1_is64 && rn_high != PREG_REG_NONE)
-      thumb_ensure_not_spilled(ctx, "src1.high", rn_high);
-    exclude |= (1u << rn_low);
-    if (src1_is64 && rn_high != PREG_REG_NONE)
-      exclude |= (1u << rn_high);
-  }
-  else
-  {
-    rn_low_alloc = get_scratch_reg_with_save(exclude);
-    rn_low = rn_low_alloc.reg;
-    exclude |= (1u << rn_low);
-    if (src1_is64)
-    {
-      rn_high_alloc = get_scratch_reg_with_save(exclude);
-      rn_high = rn_high_alloc.reg;
-      exclude |= (1u << rn_high);
-      SValue src1_tmp = *src1;
-      if (src1_needs_value_load)
-        src1_tmp.r |= VT_LVAL;
-      tcc_machine_load_to_reg(rn_low, rn_high, &src1_tmp);
-    }
-    else
-    {
-      rn_high = PREG_REG_NONE;
-      SValue src1_tmp = *src1;
-      if (src1_needs_value_load)
-        src1_tmp.r |= VT_LVAL;
-      tcc_machine_load_to_reg(rn_low, PREG_NONE, &src1_tmp);
-    }
-  }
+  thumb_materialize_src1_for_64op(ctx, src1, src1_is64, rd_low, rd_high, &rn_low, &rn_high, &rn_low_alloc,
+                                  &rn_high_alloc, &exclude);
 
   /* Materialize src2 (if not immediate). */
-  int rm_low = src2->pr0_reg;
-  int rm_high = (src2_is64 ? src2->pr1_reg : PREG_REG_NONE);
+  int rm_low = src2.pr0_reg;
+  int rm_high = (src2_is64 ? src2.pr1_reg : PREG_REG_NONE);
   ScratchRegAlloc rm_low_alloc = {0};
   ScratchRegAlloc rm_high_alloc = {0};
-  const int src2_kind = src2->r & VT_VALMASK;
-  const bool src2_is_address_of = (src2_kind == VT_LOCAL || src2_kind == VT_LLOCAL) && !(src2->r & VT_LVAL);
-  const bool src2_is_sym_address = (src2->r & VT_SYM) && !(src2->r & VT_LVAL);
-  const bool src2_needs_value_load = src2_is_address_of || src2_is_sym_address;
-  if (!src2_is_imm)
-  {
-    if (!src2_needs_value_load && !(src2->r & VT_LVAL) && thumb_is_hw_reg(rm_low) &&
-        (!src2_is64 || (rm_high != PREG_REG_NONE && thumb_is_hw_reg(rm_high))))
-    {
-      thumb_require_materialized_reg(ctx, "src2.low", rm_low);
-      if (src2_is64 && rm_high != PREG_REG_NONE)
-        thumb_ensure_not_spilled(ctx, "src2.high", rm_high);
-    }
-    else
-    {
-      rm_low_alloc = get_scratch_reg_with_save(exclude);
-      rm_low = rm_low_alloc.reg;
-      exclude |= (1u << rm_low);
-      if (src2_is64)
-      {
-        rm_high_alloc = get_scratch_reg_with_save(exclude);
-        rm_high = rm_high_alloc.reg;
-        exclude |= (1u << rm_high);
-        SValue src2_tmp = *src2;
-        if (src2_needs_value_load)
-          src2_tmp.r |= VT_LVAL;
-        tcc_machine_load_to_reg(rm_low, rm_high, &src2_tmp);
-      }
-      else
-      {
-        rm_high = PREG_REG_NONE;
-        SValue src2_tmp = *src2;
-        if (src2_needs_value_load)
-          src2_tmp.r |= VT_LVAL;
-        tcc_machine_load_to_reg(rm_low, PREG_NONE, &src2_tmp);
-      }
-    }
-  }
-  else
-  {
-    rm_low = PREG_REG_NONE;
-    rm_high = PREG_REG_NONE;
-  }
+  thumb_materialize_src2_for_64op(ctx, src2, src2_is64, src2_is_imm, &rm_low, &rm_high, &rm_low_alloc, &rm_high_alloc,
+                                  &exclude);
 
   /* Low word sets carry/flags for the high word. */
   if (src2_is_imm)
@@ -3476,7 +2923,7 @@ static void thumb_emit_opcode64_imm(SValue *src1, SValue *src2, SValue *dest, Tc
     ot_check(carry.imm_handler(rd_high, rd_high, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
   }
 
-  thumb_store_dest_pair_if_needed(dest, rd_low, rd_high, store_low, store_high);
+  thumb_store_dest_pair_if_needed_ir(dest, rd_low, rd_high, store_low, store_high);
   restore_scratch_reg(&rm_high_alloc);
   restore_scratch_reg(&rm_low_alloc);
   restore_scratch_reg(&rn_high_alloc);
@@ -3515,12 +2962,9 @@ static uint32_t thumb_fold_u32_xor(uint32_t lhs, uint32_t rhs)
 
 static void thumb_materialize_u32(int rd, uint32_t value)
 {
-  SValue imm_sv;
-  memset(&imm_sv, 0, sizeof(imm_sv));
-  imm_sv.r = VT_CONST;
-  imm_sv.type.t = VT_INT | VT_UNSIGNED;
-  imm_sv.c.i = value;
-  tcc_machine_load_to_reg(rd, PREG_NONE, &imm_sv);
+  IROperand imm_irop = irop_make_imm32(0, (int32_t)value, IROP_BTYPE_INT32);
+  imm_irop.is_unsigned = 1;
+  load_to_reg_ir(rd, PREG_NONE, imm_irop);
 }
 
 static void thumb_emit_dp_imm_with_fallback(ThumbDataProcessingHandler handler, int rd, int rn, uint32_t imm,
@@ -3545,7 +2989,7 @@ static void thumb_emit_dp_imm_with_fallback(ThumbDataProcessingHandler handler, 
   }
 }
 
-static void thumb_emit_logical64_op(SValue *src1, SValue *src2, SValue *dest, TccIrOp op,
+static void thumb_emit_logical64_op(IROperand src1, IROperand src2, IROperand dest, TccIrOp op,
                                     ThumbDataProcessingHandler handler, thumb_u64_fold_t fold64,
                                     thumb_u32_fold_t fold32, const char *ctx)
 {
@@ -3553,52 +2997,33 @@ static void thumb_emit_logical64_op(SValue *src1, SValue *src2, SValue *dest, Tc
   if (debug_logical64 == -1)
     debug_logical64 = (getenv("TCC_DEBUG_LOGICAL64") != NULL);
 
-  /* Only treat true VT_CONST operands as immediates.
+  /* Only treat true immediate operands as immediates.
    * Non-immediate values may legitimately have pr0==PREG_NONE (e.g. stack locals)
    * and must be loaded/materialized, not misclassified as constants.
    */
-  const bool src1_is_imm = th_has_immediate_value(src1->r);
-  const bool src2_is_imm = th_has_immediate_value(src2->r);
-  const uint64_t src1_imm = (uint64_t)src1->c.i;
-  const uint64_t src2_imm = (uint64_t)src2->c.i;
-
-  /* If the destination vreg is the same as a source, but pr1 is missing or
-   * corrupted, inherit the source high register to avoid clobbering the low. */
-  uint8_t dest_pr0_packed = (dest->pr0_spilled ? PREG_SPILLED : 0) | dest->pr0_reg;
-  uint8_t dest_pr1_packed = (dest->pr1_spilled ? PREG_SPILLED : 0) | dest->pr1_reg;
-  uint8_t src1_pr0_packed = (src1->pr0_spilled ? PREG_SPILLED : 0) | src1->pr0_reg;
-  uint8_t src2_pr0_packed = (src2->pr0_spilled ? PREG_SPILLED : 0) | src2->pr0_reg;
-  if (dest->pr0_reg != PREG_REG_NONE && (dest->pr1_reg == PREG_REG_NONE || dest_pr1_packed == dest_pr0_packed))
-  {
-    if (dest->vr == src1->vr && src1->pr1_reg != PREG_REG_NONE)
-    {
-      dest->pr1_reg = src1->pr1_reg;
-      dest->pr1_spilled = src1->pr1_spilled;
-    }
-    else if (dest->vr == src2->vr && src2->pr1_reg != PREG_REG_NONE)
-    {
-      dest->pr1_reg = src2->pr1_reg;
-      dest->pr1_spilled = src2->pr1_spilled;
-    }
-    else if (dest_pr0_packed == src1_pr0_packed && src1->pr1_reg != PREG_REG_NONE)
-    {
-      dest->pr1_reg = src1->pr1_reg;
-      dest->pr1_spilled = src1->pr1_spilled;
-    }
-    else if (dest_pr0_packed == src2_pr0_packed && src2->pr1_reg != PREG_REG_NONE)
-    {
-      dest->pr1_reg = src2->pr1_reg;
-      dest->pr1_spilled = src2->pr1_spilled;
-    }
-  }
+  const bool src1_is_imm = thumb_irop_has_immediate_value(src1);
+  const bool src2_is_imm = thumb_irop_has_immediate_value(src2);
+  const uint64_t src1_imm = (uint64_t)irop_get_imm64_ex(tcc_state->ir, src1);
+  const uint64_t src2_imm = (uint64_t)irop_get_imm64_ex(tcc_state->ir, src2);
 
   if (src1_is_imm && src2_is_imm)
   {
     /* Constant folding: load the computed result directly to destination */
     int64_t folded_value = (int64_t)fold64(src1_imm, src2_imm);
-    int is_64bit = tcc_is_64bit_operand(dest);
-    int pr1_for_const = dest->pr1_spilled ? PREG_REG_NONE : dest->pr1_reg;
-    tcc_machine_load_constant(dest->pr0_reg, pr1_for_const, folded_value, is_64bit, NULL);
+    uint32_t exclude = 0;
+    ScratchRegAlloc rd_low_alloc = {0};
+    ScratchRegAlloc rd_high_alloc = {0};
+    bool store_low = false;
+    bool store_high = false;
+    int rd_low = dest.pr0_reg;
+    int rd_high = dest.pr1_reg;
+
+    thumb_prepare_dest_pair_for_64bit_op_ir(ctx, &dest, &rd_low, &rd_high, &rd_low_alloc, &rd_high_alloc, &store_low,
+                                            &store_high, &exclude);
+    tcc_machine_load_constant(rd_low, rd_high, folded_value, irop_is_64bit(dest), NULL);
+    thumb_store_dest_pair_if_needed_ir(dest, rd_low, rd_high, store_low, store_high);
+    restore_scratch_reg(&rd_high_alloc);
+    restore_scratch_reg(&rd_low_alloc);
     return;
   }
 
@@ -3606,80 +3031,27 @@ static void thumb_emit_logical64_op(SValue *src1, SValue *src2, SValue *dest, Tc
   ScratchRegAlloc rd_high_alloc = {0};
   bool store_low = false;
   bool store_high = false;
-  int rd_low = dest->pr0_reg;
-  int rd_high = dest->pr1_reg;
+  int rd_low = dest.pr0_reg;
+  int rd_high = dest.pr1_reg;
   uint32_t dest_exclude = 0;
 
   if (src1_is_imm || src2_is_imm)
   {
-    const SValue *reg_src = src1_is_imm ? src2 : src1;
+    const IROperand reg_src = src1_is_imm ? src2 : src1;
     const uint64_t imm64 = src1_is_imm ? src1_imm : src2_imm;
     const uint32_t imm_low = (uint32_t)(imm64 & 0xffffffffu);
     const uint32_t imm_high = (uint32_t)(imm64 >> 32);
-    const bool reg_src_is64 = is_64bit_type(reg_src->type.t);
-
-    /* Materialize the register source if it isn't already in registers (e.g. stack local).
-     * Also: a 64-bit stack local may sometimes arrive as VT_LOCAL without VT_LVAL;
-     * for 64-bit ops we always need the VALUE, not the address.
-     */
+    const bool reg_src_is64 = irop_is_64bit(reg_src);
     ScratchRegAlloc reg_src_lo_alloc = (ScratchRegAlloc){0};
     ScratchRegAlloc reg_src_hi_alloc = (ScratchRegAlloc){0};
-    int rn_low = reg_src->pr0_reg;
-    int pr1_reg_or_none = reg_src->pr1_spilled ? PREG_REG_NONE : reg_src->pr1_reg;
-    int rn_high = (reg_src_is64 ? pr1_reg_or_none : PREG_REG_NONE);
+    int rn_low = reg_src.pr0_reg;
+    int rn_high = (reg_src_is64 ? reg_src.pr1_reg : PREG_REG_NONE);
 
-    const int reg_src_kind = reg_src->r & VT_VALMASK;
-    const bool reg_src_is_stack_local = (reg_src_kind == VT_LOCAL || reg_src_kind == VT_LLOCAL);
-    const bool reg_src_is_lval = (reg_src->r & VT_LVAL) != 0;
-    const bool reg_src_is_sym = (reg_src->r & VT_SYM) != 0;
-    /* Heuristic fallback: some IR paths may lose VT_LOCAL/VT_LLOCAL while still
-      carrying a stack frame offset in c.i. For 64-bit ops, treat that as a
-      stack value that must be loaded (not an address). */
-    const bool reg_src_force_value_load = reg_src_is64 && !(reg_src->r & VT_LVAL) && (reg_src->c.i != 0);
-    const bool reg_src_needs_load = reg_src_is64 && (reg_src_is_stack_local || reg_src_is_lval || reg_src_is_sym);
+    thumb_prepare_dest_pair_for_64bit_op_ir(ctx, &dest, &rd_low, &rd_high, &rd_low_alloc, &rd_high_alloc, &store_low,
+                                            &store_high, &dest_exclude);
 
-    if (rn_low == PREG_REG_NONE || (reg_src_is64 && rn_high == PREG_REG_NONE) || reg_src_needs_load ||
-        reg_src_force_value_load)
-    {
-      uint32_t load_exclude = 0;
-      reg_src_lo_alloc = get_scratch_reg_with_save(load_exclude);
-      rn_low = reg_src_lo_alloc.reg;
-      if (thumb_is_hw_reg(rn_low))
-        load_exclude |= (1u << rn_low);
-      if (reg_src_is64)
-      {
-        reg_src_hi_alloc = get_scratch_reg_with_save(load_exclude);
-        rn_high = reg_src_hi_alloc.reg;
-        if (thumb_is_hw_reg(rn_high))
-          load_exclude |= (1u << rn_high);
-      }
-
-      SValue tmp = *reg_src;
-
-      /* For 64-bit logical ops we always need an rvalue. Stack locals sometimes
-       * arrive as VT_LOCAL/VT_LLOCAL without VT_LVAL (i.e. address-of stack slot);
-       * force a value load in that case.
-       */
-      if (reg_src_is64)
-      {
-        const int tmp_kind = tmp.r & VT_VALMASK;
-        if ((tmp_kind == VT_LOCAL || tmp_kind == VT_LLOCAL) && !(tmp.r & VT_LVAL))
-          tmp.r |= VT_LVAL;
-      }
-
-      tcc_machine_load_to_reg(rn_low, reg_src_is64 ? rn_high : PREG_NONE, &tmp);
-    }
-
-    thumb_require_materialized_reg(ctx, "src.low", rn_low);
-    if (reg_src_is64 && rn_high != PREG_NONE)
-      thumb_require_materialized_reg(ctx, "src.high", rn_high);
-    else
-      thumb_ensure_not_spilled(ctx, "src.high", rn_high);
-
-    const int mask_regs_for_dest[] = {rn_low, rn_high};
-    dest_exclude = thumb_exclude_mask_for_regs(2, mask_regs_for_dest);
-    thumb_prepare_dest_pair_for_64bit_op(ctx, dest, &rd_low, &rd_high, &rd_low_alloc, &rd_high_alloc, &store_low,
-                                         &store_high, &dest_exclude);
+    thumb_materialize_src1_for_64op(ctx, reg_src, reg_src_is64, rd_low, rd_high, &rn_low, &rn_high, &reg_src_lo_alloc,
+                                    &reg_src_hi_alloc, &dest_exclude);
 
     uint32_t imm_exclude = 0;
     if (thumb_is_hw_reg(rd_low))
@@ -3711,136 +3083,36 @@ static void thumb_emit_logical64_op(SValue *src1, SValue *src2, SValue *dest, Tc
     goto thumb_logical64_cleanup;
   }
 
-  const bool src1_is64 = is_64bit_type(src1->type.t);
-  const bool src2_is64 = is_64bit_type(src2->type.t);
+  const bool src1_is64 = irop_is_64bit(src1);
+  const bool src2_is64 = irop_is_64bit(src2);
 
-  /* Check if sources are spilled and need reload */
-  const bool src1_lo_spilled = (src1->pr0_reg != PREG_REG_NONE) && src1->pr0_spilled;
-  const bool src1_hi_spilled = (src1->pr1_reg != PREG_REG_NONE) && src1->pr1_spilled;
-  const bool src2_lo_spilled = (src2->pr0_reg != PREG_REG_NONE) && src2->pr0_spilled;
-  const bool src2_hi_spilled = (src2->pr1_reg != PREG_REG_NONE) && src2->pr1_spilled;
-  const int src1_kind = src1->r & VT_VALMASK;
-  const int src2_kind = src2->r & VT_VALMASK;
-  const bool src1_is_stack_local = (src1_kind == VT_LOCAL || src1_kind == VT_LLOCAL);
-  const bool src2_is_stack_local = (src2_kind == VT_LOCAL || src2_kind == VT_LLOCAL);
-  const bool src1_needs_load = src1_is64 && (src1_is_stack_local || (src1->r & VT_LVAL) || (src1->r & VT_SYM));
-  const bool src2_needs_load = src2_is64 && (src2_is_stack_local || (src2->r & VT_LVAL) || (src2->r & VT_SYM));
-
-  int src1_lo = src1->pr0_reg;
-  int src1_hi = src1->pr1_reg;
-  int src2_lo = src2->pr0_reg;
-  int src2_hi = src2->pr1_reg;
+  int src1_lo = src1.pr0_reg;
+  int src1_hi = src1.pr1_reg;
+  int src2_lo = src2.pr0_reg;
+  int src2_hi = src2.pr1_reg;
   ScratchRegAlloc src1_lo_alloc = {0};
   ScratchRegAlloc src1_hi_alloc = {0};
   ScratchRegAlloc src2_lo_alloc = {0};
   ScratchRegAlloc src2_hi_alloc = {0};
   uint32_t src_exclude = 0;
 
-  /* Reload spilled src1.low */
-  if (src1_lo == PREG_REG_NONE || src1_lo_spilled || src1_needs_load)
-  {
-    src1_lo_alloc = get_scratch_reg_with_save(src_exclude);
-    src1_lo = src1_lo_alloc.reg;
-    if (thumb_is_hw_reg(src1_lo))
-      src_exclude |= (1u << src1_lo);
-    SValue src1_tmp = *src1;
-    if (src1_is_stack_local && !(src1_tmp.r & VT_LVAL))
-      src1_tmp.r |= VT_LVAL;
-    tcc_machine_load_to_reg(src1_lo, PREG_NONE, &src1_tmp);
-  }
-  else
-  {
-    thumb_require_materialized_reg(ctx, "src1.low", src1_lo);
-    if (thumb_is_hw_reg(src1_lo))
-      src_exclude |= (1u << src1_lo);
-  }
-
-  /* Reload spilled src1.high */
-  if (src1_is64 && (src1_hi == PREG_REG_NONE || src1_hi_spilled || src1_needs_load))
-  {
-    src1_hi_alloc = get_scratch_reg_with_save(src_exclude);
-    src1_hi = src1_hi_alloc.reg;
-    if (thumb_is_hw_reg(src1_hi))
-      src_exclude |= (1u << src1_hi);
-    SValue src1_hi_val = *src1;
-    if (src1_is_stack_local && !(src1_hi_val.r & VT_LVAL))
-      src1_hi_val.r |= VT_LVAL;
-    src1_hi_val.c.i += 4;
-    tcc_machine_load_to_reg(src1_hi, PREG_NONE, &src1_hi_val);
-  }
-  else if (src1_is64 && src1_hi != PREG_NONE)
-  {
-    thumb_require_materialized_reg(ctx, "src1.high", src1_hi);
-    if (thumb_is_hw_reg(src1_hi))
-      src_exclude |= (1u << src1_hi);
-  }
-  else
-  {
-    thumb_ensure_not_spilled(ctx, "src1.high", src1_hi);
-  }
-
-  /* Reload spilled src2.low */
-  if (src2_lo == PREG_REG_NONE || src2_lo_spilled || src2_needs_load)
-  {
-    src2_lo_alloc = get_scratch_reg_with_save(src_exclude);
-    src2_lo = src2_lo_alloc.reg;
-    if (thumb_is_hw_reg(src2_lo))
-      src_exclude |= (1u << src2_lo);
-    SValue src2_tmp = *src2;
-    if (src2_is_stack_local && !(src2_tmp.r & VT_LVAL))
-      src2_tmp.r |= VT_LVAL;
-    tcc_machine_load_to_reg(src2_lo, PREG_NONE, &src2_tmp);
-  }
-  else
-  {
-    thumb_require_materialized_reg(ctx, "src2.low", src2_lo);
-    if (thumb_is_hw_reg(src2_lo))
-      src_exclude |= (1u << src2_lo);
-  }
-
-  /* Reload spilled src2.high */
-  if (src2_is64 && (src2_hi == PREG_REG_NONE || src2_hi_spilled || src2_needs_load))
-  {
-    src2_hi_alloc = get_scratch_reg_with_save(src_exclude);
-    src2_hi = src2_hi_alloc.reg;
-    if (thumb_is_hw_reg(src2_hi))
-      src_exclude |= (1u << src2_hi);
-    SValue src2_hi_val = *src2;
-    if (src2_is_stack_local && !(src2_hi_val.r & VT_LVAL))
-      src2_hi_val.r |= VT_LVAL;
-    src2_hi_val.c.i += 4;
-    tcc_machine_load_to_reg(src2_hi, PREG_NONE, &src2_hi_val);
-  }
-  else if (src2_is64 && src2_hi != PREG_NONE)
-  {
-    thumb_require_materialized_reg(ctx, "src2.high", src2_hi);
-    if (thumb_is_hw_reg(src2_hi))
-      src_exclude |= (1u << src2_hi);
-  }
-  else
-  {
-    thumb_ensure_not_spilled(ctx, "src2.high", src2_hi);
-  }
-
-  const int src1_high = (src1_is64 && src1_hi != PREG_NONE) ? src1_hi : PREG_NONE;
-  const int src2_high = (src2_is64 && src2_hi != PREG_NONE) ? src2_hi : PREG_NONE;
-  const int mask_regs_for_dest[] = {src1_lo, src1_high, src2_lo, src2_high};
-  dest_exclude = thumb_exclude_mask_for_regs(4, mask_regs_for_dest);
-  thumb_prepare_dest_pair_for_64bit_op(ctx, dest, &rd_low, &rd_high, &rd_low_alloc, &rd_high_alloc, &store_low,
-                                       &store_high, &dest_exclude);
+  thumb_materialize_src1_for_64op(ctx, src1, src1_is64, rd_low, rd_high, &src1_lo, &src1_hi, &src1_lo_alloc,
+                                  &src1_hi_alloc, &src_exclude);
+  thumb_materialize_src2_for_64op(ctx, src2, src2_is64, false, &src2_lo, &src2_hi, &src2_lo_alloc, &src2_hi_alloc,
+                                  &src_exclude);
 
   ot_check(handler.reg_handler(rd_low, src1_lo, src2_lo, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
                                ENFORCE_ENCODING_NONE));
 
-  const bool src1_high_valid = thumb_is_hw_reg(src1_high);
-  const bool src2_high_valid = thumb_is_hw_reg(src2_high);
+  const bool src1_high_valid = thumb_is_hw_reg(src1_hi);
+  const bool src2_high_valid = thumb_is_hw_reg(src2_hi);
   if (!src1_high_valid && !src2_high_valid)
   {
     thumb_materialize_u32(rd_high, fold32(0u, 0u));
   }
   else if (!src1_high_valid || !src2_high_valid)
   {
-    const int available = src1_high_valid ? src1_high : src2_high;
+    const int available = src1_high_valid ? src1_hi : src2_hi;
     uint32_t exclude = 0;
     if (thumb_is_hw_reg(rd_low))
       exclude |= (1u << rd_low);
@@ -3856,12 +3128,12 @@ static void thumb_emit_logical64_op(SValue *src1, SValue *src2, SValue *dest, Tc
   }
   else
   {
-    ot_check(handler.reg_handler(rd_high, src1_high, src2_high, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+    ot_check(handler.reg_handler(rd_high, src1_hi, src2_hi, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
                                  ENFORCE_ENCODING_NONE));
   }
 
 thumb_logical64_cleanup:
-  thumb_store_dest_pair_if_needed(dest, rd_low, rd_high, store_low, store_high);
+  thumb_store_dest_pair_if_needed_ir(dest, rd_low, rd_high, store_low, store_high);
   restore_scratch_reg(&rd_high_alloc);
   restore_scratch_reg(&rd_low_alloc);
   restore_scratch_reg(&src2_hi_alloc);
@@ -3870,14 +3142,14 @@ thumb_logical64_cleanup:
   restore_scratch_reg(&src1_lo_alloc);
 }
 
-static void thumb_emit_shift64_imm(SValue *src1, SValue *src2, SValue *dest, TccIrOp op, const char *ctx, bool is_left,
-                                   thumb_imm_handler_t dst_lo_shift, thumb_imm_handler_t dst_hi_shift,
+static void thumb_emit_shift64_imm(IROperand src1, IROperand src2, IROperand dest, TccIrOp op, const char *ctx,
+                                   bool is_left, thumb_imm_handler_t dst_lo_shift, thumb_imm_handler_t dst_hi_shift,
                                    thumb_imm_handler_t cross_shift, bool sign_extend_missing_hi, bool arith_right)
 {
-  const uint32_t sh = (uint32_t)src2->c.i;
+  const uint32_t sh = (uint32_t)irop_get_imm64_ex(tcc_state->ir, src2);
 
-  int dst_lo = dest->pr0_reg;
-  int dst_hi = dest->pr1_reg;
+  int dst_lo = dest.pr0_reg;
+  int dst_hi = dest.pr1_reg;
   ScratchRegAlloc dst_lo_alloc = (ScratchRegAlloc){0};
   ScratchRegAlloc dst_hi_alloc = (ScratchRegAlloc){0};
   bool store_lo = false;
@@ -3886,70 +3158,17 @@ static void thumb_emit_shift64_imm(SValue *src1, SValue *src2, SValue *dest, Tcc
 
   /* For shifts, dest might not be assigned a physical register (e.g. value lives in memory).
      Use scratch regs in that case, then store the result back. */
-  thumb_prepare_dest_pair_for_64bit_op(ctx, dest, &dst_lo, &dst_hi, &dst_lo_alloc, &dst_hi_alloc, &store_lo, &store_hi,
-                                       &exclude);
+  thumb_prepare_dest_pair_for_64bit_op_ir(ctx, &dest, &dst_lo, &dst_hi, &dst_lo_alloc, &dst_hi_alloc, &store_lo,
+                                          &store_hi, &exclude);
 
-  int src_lo = src1->pr0_reg;
-  int src_hi = src1->pr1_reg;
+  int src_lo = src1.pr0_reg;
+  int src_hi = src1.pr1_reg;
   ScratchRegAlloc src_lo_alloc = (ScratchRegAlloc){0};
   ScratchRegAlloc src_hi_alloc = (ScratchRegAlloc){0};
+  const bool src1_is64 = irop_is_64bit(src1);
 
-  const bool src_is_imm = (src_lo == PREG_REG_NONE) && th_has_immediate_value(src1->r);
-  const int src1_kind = src1->r & VT_VALMASK;
-  const bool src1_is_address_of = (src1_kind == VT_LOCAL || src1_kind == VT_LLOCAL) && !(src1->r & VT_LVAL);
-  const bool src1_is_sym_address = (src1->r & VT_SYM) && !(src1->r & VT_LVAL);
-  if (src_is_imm)
-  {
-    Sym *sym = (src1->r & VT_SYM) ? src1->sym : NULL;
-    tcc_machine_load_constant(dst_lo, dst_hi, src1->c.i, 1, sym);
-    src_lo = dst_lo;
-    src_hi = dst_hi;
-  }
-  else
-  {
-    const bool src_lo_spilled = (src_lo != PREG_REG_NONE) && src1->pr0_spilled;
-    const bool src_hi_spilled = (src_hi != PREG_REG_NONE) && src1->pr1_spilled;
-
-    /* Low word must be usable as a register input. */
-    if (src_lo == PREG_REG_NONE || src_lo_spilled || (src1->r & VT_LVAL) || src1_is_address_of || src1_is_sym_address ||
-        th_has_immediate_value(src1->r))
-    {
-      src_lo_alloc = get_scratch_reg_with_save(exclude);
-      src_lo = src_lo_alloc.reg;
-      if (thumb_is_hw_reg(src_lo))
-        exclude |= (1u << src_lo);
-      tcc_machine_load_to_reg(src_lo, PREG_NONE, src1);
-    }
-    else
-    {
-      thumb_require_materialized_reg(ctx, "src1.low", src_lo);
-      if (thumb_is_hw_reg(src_lo))
-        exclude |= (1u << src_lo);
-    }
-
-    /* High word may be missing (treated as 0 or sign-extension), but if it exists it must be usable too. */
-    if (src_hi != PREG_REG_NONE && !src_hi_spilled)
-    {
-      thumb_require_materialized_reg(ctx, "src1.high", src_hi);
-      if (thumb_is_hw_reg(src_hi))
-        exclude |= (1u << src_hi);
-    }
-    else if (src_hi_spilled || (src1->r & VT_LVAL) || src1_is_address_of || src1_is_sym_address)
-    {
-      /* Lvalue source: load high word from (addr + 4) into a scratch. */
-      src_hi_alloc = get_scratch_reg_with_save(exclude);
-      src_hi = src_hi_alloc.reg;
-      if (thumb_is_hw_reg(src_hi))
-        exclude |= (1u << src_hi);
-      SValue src1_hi = *src1;
-      src1_hi.c.i += 4;
-      tcc_machine_load_to_reg(src_hi, PREG_NONE, &src1_hi);
-    }
-    else
-    {
-      thumb_ensure_not_spilled(ctx, "src1.high", src_hi);
-    }
-  }
+  thumb_materialize_src1_for_64op(ctx, src1, src1_is64, dst_lo, dst_hi, &src_lo, &src_hi, &src_lo_alloc, &src_hi_alloc,
+                                  &exclude);
 
   if (src_hi == PREG_REG_NONE)
   {
@@ -4064,7 +3283,7 @@ static void thumb_emit_shift64_imm(SValue *src1, SValue *src2, SValue *dest, Tcc
   }
 
 thumb_shift64_cleanup:
-  thumb_store_dest_pair_if_needed(dest, dst_lo, dst_hi, store_lo, store_hi);
+  thumb_store_dest_pair_if_needed_ir(dest, dst_lo, dst_hi, store_lo, store_hi);
   restore_scratch_reg(&src_hi_alloc);
   restore_scratch_reg(&src_lo_alloc);
   restore_scratch_reg(&dst_hi_alloc);
@@ -4093,18 +3312,18 @@ static thumb_opcode thumb_udiv_regonly(uint32_t rd, uint32_t rn, uint32_t rm)
  * tcc_ir_materialize_const_to_reg() in tccir.c. Backend functions like
  * thumb_emit_regonly_binop32() now only handle VT_LVAL fallback. */
 
-static void thumb_emit_regonly_binop32(SValue *src1, SValue *src2, SValue *dest, TccIrOp op,
+static void thumb_emit_regonly_binop32(IROperand src1, IROperand src2, IROperand dest, TccIrOp op,
                                        thumb_regonly3_handler_t emitter, const char *ctx)
 {
-  int rd = dest->pr0_reg;
+  int rd = dest.pr0_reg;
   if (rd == PREG_REG_NONE)
     tcc_error("compiler_error: %s missing destination register", ctx);
   thumb_require_materialized_reg(ctx, "dest", rd);
 
   /* IR-level tcc_ir_materialize_const_to_reg() now handles constant-to-register
    * conversion for register-only operations. Operands should already be in registers. */
-  int rn = src1->pr0_reg;
-  int rm = src2->pr0_reg;
+  int rn = src1.pr0_reg;
+  int rm = src2.pr0_reg;
 
   /* Fall back to backend materialization for VT_LVAL (memory loads) that
    * weren't handled by IR-level materialization */
@@ -4112,23 +3331,25 @@ static void thumb_emit_regonly_binop32(SValue *src1, SValue *src2, SValue *dest,
   ScratchRegAlloc rm_alloc = {0};
   uint32_t exclude = (1u << rd);
 
-  if (rn == PREG_REG_NONE || (src1->r & VT_LVAL))
+  if (rn == PREG_REG_NONE || src1.is_lval || thumb_irop_needs_value_load(src1) || thumb_irop_has_immediate_value(src1))
   {
     rn_alloc = get_scratch_reg_with_save(exclude);
     rn = rn_alloc.reg;
     exclude |= (1u << rn);
-    tcc_machine_load_to_reg(rn, PREG_NONE, src1);
+    IROperand src1_tmp = src1;
+    load_to_reg_ir(rn, PREG_NONE, src1_tmp);
   }
   else
   {
     thumb_require_materialized_reg(ctx, "src1", rn);
   }
 
-  if (rm == PREG_REG_NONE || (src2->r & VT_LVAL))
+  if (rm == PREG_REG_NONE || src2.is_lval || thumb_irop_needs_value_load(src2) || thumb_irop_has_immediate_value(src2))
   {
     rm_alloc = get_scratch_reg_with_save(exclude);
     rm = rm_alloc.reg;
-    tcc_machine_load_to_reg(rm, PREG_NONE, src2);
+    IROperand src2_tmp = src2;
+    load_to_reg_ir(rm, PREG_NONE, src2_tmp);
   }
   else
   {
@@ -4140,18 +3361,18 @@ static void thumb_emit_regonly_binop32(SValue *src1, SValue *src2, SValue *dest,
   restore_scratch_reg(&rn_alloc);
 }
 
-static void thumb_emit_mod32(SValue *src1, SValue *src2, SValue *dest, TccIrOp op, thumb_regonly3_handler_t div_emitter,
-                             const char *ctx)
+static void thumb_emit_mod32(IROperand src1, IROperand src2, IROperand dest, TccIrOp op,
+                             thumb_regonly3_handler_t div_emitter, const char *ctx)
 {
-  int dest_reg = dest->pr0_reg;
+  int dest_reg = dest.pr0_reg;
   if (dest_reg == PREG_REG_NONE)
     tcc_error("compiler_error: %s missing destination register", ctx);
   thumb_require_materialized_reg(ctx, "dest", dest_reg);
 
   /* IR-level tcc_ir_materialize_const_to_reg() now handles constant-to-register
    * conversion for register-only operations. Operands should already be in registers. */
-  int src1_reg = src1->pr0_reg;
-  int src2_reg = src2->pr0_reg;
+  int src1_reg = src1.pr0_reg;
+  int src2_reg = src2.pr0_reg;
 
   /* Fall back to backend materialization for VT_LVAL (memory loads) */
   ScratchRegAlloc src1_alloc = {0};
@@ -4159,12 +3380,14 @@ static void thumb_emit_mod32(SValue *src1, SValue *src2, SValue *dest, TccIrOp o
   ScratchRegAlloc quotient_alloc = {0};
   uint32_t exclude_regs = (1u << dest_reg);
 
-  if (src1_reg == PREG_REG_NONE || (src1->r & VT_LVAL))
+  if (src1_reg == PREG_REG_NONE || src1.is_lval || thumb_irop_needs_value_load(src1) ||
+      thumb_irop_has_immediate_value(src1))
   {
     src1_alloc = get_scratch_reg_with_save(exclude_regs);
     src1_reg = src1_alloc.reg;
     exclude_regs |= (1u << src1_reg);
-    tcc_machine_load_to_reg(src1_reg, PREG_NONE, src1);
+    IROperand src1_tmp = src1;
+    load_to_reg_ir(src1_reg, PREG_NONE, src1_tmp);
   }
   else
   {
@@ -4172,12 +3395,14 @@ static void thumb_emit_mod32(SValue *src1, SValue *src2, SValue *dest, TccIrOp o
     exclude_regs |= (1u << src1_reg);
   }
 
-  if (src2_reg == PREG_REG_NONE || (src2->r & VT_LVAL))
+  if (src2_reg == PREG_REG_NONE || src2.is_lval || thumb_irop_needs_value_load(src2) ||
+      thumb_irop_has_immediate_value(src2))
   {
     src2_alloc = get_scratch_reg_with_save(exclude_regs);
     src2_reg = src2_alloc.reg;
     exclude_regs |= (1u << src2_reg);
-    tcc_machine_load_to_reg(src2_reg, PREG_NONE, src2);
+    IROperand src2_tmp = src2;
+    load_to_reg_ir(src2_reg, PREG_NONE, src2_tmp);
   }
   else
   {
@@ -4200,29 +3425,30 @@ static void thumb_emit_mod32(SValue *src1, SValue *src2, SValue *dest, TccIrOp o
   restore_scratch_reg(&src1_alloc);
 }
 
-static void thumb_emit_mul32(SValue *src1, SValue *src2, SValue *dest, TccIrOp op)
+static void thumb_emit_mul32(IROperand src1, IROperand src2, IROperand dest, TccIrOp op)
 {
   thumb_emit_regonly_binop32(src1, src2, dest, op, thumb_mul_regonly, "MUL");
 }
 
 typedef thumb_opcode (*thumb_longmul_handler_t)(uint32_t rdlo, uint32_t rdhi, uint32_t rn, uint32_t rm);
 
-static void thumb_emit_longmul32x32_to64(SValue *src1, SValue *src2, SValue *dest, TccIrOp op,
+static void thumb_emit_longmul32x32_to64(IROperand src1, IROperand src2, IROperand dest, TccIrOp op,
                                          thumb_longmul_handler_t emitter, const char *ctx)
 {
-  int rn = src1->pr0_reg;
-  int rm = src2->pr0_reg;
+  int rn = src1.pr0_reg;
+  int rm = src2.pr0_reg;
   ScratchRegAlloc rn_alloc = {0};
   ScratchRegAlloc rm_alloc = {0};
 
   uint32_t exclude = 0;
 
-  if (rn == PREG_REG_NONE || (src1->r & VT_LVAL) || th_has_immediate_value(src1->r))
+  if (rn == PREG_REG_NONE || src1.is_lval || thumb_irop_needs_value_load(src1) || thumb_irop_has_immediate_value(src1))
   {
     rn_alloc = get_scratch_reg_with_save(exclude);
     rn = rn_alloc.reg;
     exclude |= (1u << rn);
-    tcc_machine_load_to_reg(rn, PREG_NONE, src1);
+    IROperand src1_tmp = src1;
+    load_to_reg_ir(rn, PREG_NONE, src1_tmp);
   }
   else
   {
@@ -4231,12 +3457,13 @@ static void thumb_emit_longmul32x32_to64(SValue *src1, SValue *src2, SValue *des
       exclude |= (1u << rn);
   }
 
-  if (rm == PREG_REG_NONE || (src2->r & VT_LVAL) || th_has_immediate_value(src2->r))
+  if (rm == PREG_REG_NONE || src2.is_lval || thumb_irop_needs_value_load(src2) || thumb_irop_has_immediate_value(src2))
   {
     rm_alloc = get_scratch_reg_with_save(exclude);
     rm = rm_alloc.reg;
     exclude |= (1u << rm);
-    tcc_machine_load_to_reg(rm, PREG_NONE, src2);
+    IROperand src2_tmp = src2;
+    load_to_reg_ir(rm, PREG_NONE, src2_tmp);
   }
   else
   {
@@ -4249,22 +3476,22 @@ static void thumb_emit_longmul32x32_to64(SValue *src1, SValue *src2, SValue *des
   ScratchRegAlloc rd_high_alloc = {0};
   bool store_low = false;
   bool store_high = false;
-  int rd_low = dest->pr0_reg;
-  int rd_high = dest->pr1_reg;
+  int rd_low = dest.pr0_reg;
+  int rd_high = dest.pr1_reg;
 
-  thumb_prepare_dest_pair_for_64bit_op(ctx, dest, &rd_low, &rd_high, &rd_low_alloc, &rd_high_alloc, &store_low,
-                                       &store_high, &exclude);
+  thumb_prepare_dest_pair_for_64bit_op_ir(ctx, &dest, &rd_low, &rd_high, &rd_low_alloc, &rd_high_alloc, &store_low,
+                                          &store_high, &exclude);
 
   ot_check(emitter(rd_low, rd_high, rn, rm));
 
-  thumb_store_dest_pair_if_needed(dest, rd_low, rd_high, store_low, store_high);
+  thumb_store_dest_pair_if_needed_ir(dest, rd_low, rd_high, store_low, store_high);
   restore_scratch_reg(&rd_high_alloc);
   restore_scratch_reg(&rd_low_alloc);
   restore_scratch_reg(&rm_alloc);
   restore_scratch_reg(&rn_alloc);
 }
 
-static void thumb_process_data64_op(SValue *src1, SValue *src2, SValue *dest, TccIrOp op)
+static void thumb_process_data64_op(IROperand src1, IROperand src2, IROperand dest, TccIrOp op)
 {
   ThumbDataProcessingHandler regular_handler;
   ThumbDataProcessingHandler carry_handler;
@@ -4296,21 +3523,21 @@ static void thumb_process_data64_op(SValue *src1, SValue *src2, SValue *dest, Tc
   break;
   case TCCIR_OP_SHL:
   {
-    if (!th_has_immediate_value(src2->r))
+    if (!thumb_irop_has_immediate_value(src2))
       tcc_error("compiler_error: 64-bit SHL expects immediate shift count");
     thumb_emit_shift64_imm(src1, src2, dest, op, "64-bit SHL", true, th_lsl_imm, th_lsl_imm, th_lsr_imm, false, false);
     return;
   }
   case TCCIR_OP_SHR:
   {
-    if (!th_has_immediate_value(src2->r))
+    if (!thumb_irop_has_immediate_value(src2))
       tcc_error("compiler_error: 64-bit SHR expects immediate shift count");
     thumb_emit_shift64_imm(src1, src2, dest, op, "64-bit SHR", false, th_lsr_imm, th_lsr_imm, th_lsl_imm, false, false);
     return;
   }
   case TCCIR_OP_SAR:
   {
-    if (!th_has_immediate_value(src2->r))
+    if (!thumb_irop_has_immediate_value(src2))
       tcc_error("compiler_error: 64-bit SAR expects immediate shift count");
     thumb_emit_shift64_imm(src1, src2, dest, op, "64-bit SAR", false, th_lsr_imm, th_asr_imm, th_lsl_imm, true, true);
     return;
@@ -4343,29 +3570,24 @@ static void thumb_process_data64_op(SValue *src1, SValue *src2, SValue *dest, Tc
     break;
   }
 
-  return thumb_emit_opcode64_imm(src1, src2, dest, op, context, regular_handler, carry_handler);
+  return thumb_emit_opcode64_imm_ir(src1, src2, dest, op, context, regular_handler, carry_handler);
 }
 
-static void thumb_emit_data_processing_op32(SValue *src1, SValue *src2, SValue *dest, TccIrOp op,
+static void thumb_emit_data_processing_op32(IROperand src1, IROperand src2, IROperand dest, TccIrOp op,
                                             ThumbDataProcessingHandler handler, thumb_flags_behaviour flags)
 {
   const char *ctx = tcc_ir_get_op_name(op);
 
-  int src1_reg = src1->pr0_reg;
-  int src2_reg = src2->pr0_reg;
+  int src1_reg = src1.pr0_reg;
+  int src2_reg = src2.pr0_reg;
 
-  const bool src1_is_imm = th_has_immediate_value(src1->r);
-  const bool src2_is_imm = th_has_immediate_value(src2->r);
+  const bool src1_is_imm = thumb_irop_has_immediate_value(src1);
+  const bool src2_is_imm = thumb_irop_has_immediate_value(src2);
 
-  const bool src1_is_address_of = ((src1->r & VT_VALMASK) == VT_LOCAL) && !(src1->r & VT_LVAL);
-  const bool src2_is_address_of = ((src2->r & VT_VALMASK) == VT_LOCAL) && !(src2->r & VT_LVAL);
-
-  /* VT_LVAL on a non-local operand means "register holds pointer, dereference it" */
-  const bool src1_is_lval = (src1->r & VT_LVAL) && !src1_is_address_of;
-  const bool src2_is_lval = (src2->r & VT_LVAL) && !src2_is_address_of;
-
-  const bool src1_needs_load = src1_is_imm || src1_is_address_of || src1_is_lval || src1_reg == PREG_REG_NONE;
-  const bool src2_needs_load = src2_is_imm || src2_is_address_of || src2_is_lval || src2_reg == PREG_REG_NONE;
+  const bool src1_needs_load =
+      src1_is_imm || thumb_irop_needs_value_load(src1) || src1.is_lval || src1_reg == PREG_REG_NONE;
+  const bool src2_needs_load =
+      src2_is_imm || thumb_irop_needs_value_load(src2) || src2.is_lval || src2_reg == PREG_REG_NONE;
 
   uint32_t exclude_regs = 0;
   ScratchRegAlloc src1_alloc = {0};
@@ -4373,7 +3595,7 @@ static void thumb_emit_data_processing_op32(SValue *src1, SValue *src2, SValue *
 
   const bool dest_sets_flags = (op == TCCIR_OP_CMP);
   int dest_reg = PREG_NONE;
-  if (dest == NULL)
+  if (irop_is_none(dest))
   {
     if (!dest_sets_flags)
       tcc_error("compiler_error: %s requires a destination", ctx);
@@ -4382,7 +3604,7 @@ static void thumb_emit_data_processing_op32(SValue *src1, SValue *src2, SValue *
   }
   else
   {
-    dest_reg = dest->pr0_reg;
+    dest_reg = dest.pr0_reg;
     if (dest_reg == PREG_REG_NONE)
     {
       if (!dest_sets_flags)
@@ -4399,7 +3621,7 @@ static void thumb_emit_data_processing_op32(SValue *src1, SValue *src2, SValue *
   }
 
   /* If src2 is already in a register, exclude it too so src1 doesn't clobber it */
-  if (!src2_is_imm && !src2_is_address_of && thumb_is_hw_reg(src2_reg))
+  if (!src2_is_imm && !thumb_irop_needs_value_load(src2) && !src2.is_lval && thumb_is_hw_reg(src2_reg))
   {
     exclude_regs |= (1u << src2_reg);
   }
@@ -4410,7 +3632,8 @@ static void thumb_emit_data_processing_op32(SValue *src1, SValue *src2, SValue *
     src1_reg = src1_alloc.reg;
     if (thumb_is_hw_reg(src1_reg))
       exclude_regs |= (1u << src1_reg);
-    tcc_machine_load_to_reg(src1_reg, PREG_NONE, src1);
+    IROperand src1_tmp = src1;
+    load_to_reg_ir(src1_reg, PREG_NONE, src1_tmp);
   }
   else
   {
@@ -4422,7 +3645,8 @@ static void thumb_emit_data_processing_op32(SValue *src1, SValue *src2, SValue *
   if (src2_is_imm)
   {
     /* Try immediate form first; if it doesn't encode, fall back to loading src2. */
-    if (handler.imm_handler && ot(handler.imm_handler(dest_reg, src1_reg, src2->c.i, flags, ENFORCE_ENCODING_NONE)))
+    const uint32_t imm_val = (uint32_t)irop_get_imm64_ex(tcc_state->ir, src2);
+    if (handler.imm_handler && ot(handler.imm_handler(dest_reg, src1_reg, imm_val, flags, ENFORCE_ENCODING_NONE)))
     {
       if (src1_alloc.reg != 0)
         restore_scratch_reg(&src1_alloc);
@@ -4431,13 +3655,15 @@ static void thumb_emit_data_processing_op32(SValue *src1, SValue *src2, SValue *
 
     src2_alloc = get_scratch_reg_with_save(exclude_regs);
     src2_reg = src2_alloc.reg;
-    tcc_machine_load_to_reg(src2_reg, PREG_NONE, src2);
+    IROperand src2_tmp = src2;
+    load_to_reg_ir(src2_reg, PREG_NONE, src2_tmp);
   }
   else if (src2_needs_load)
   {
     src2_alloc = get_scratch_reg_with_save(exclude_regs);
     src2_reg = src2_alloc.reg;
-    tcc_machine_load_to_reg(src2_reg, PREG_NONE, src2);
+    IROperand src2_tmp = src2;
+    load_to_reg_ir(src2_reg, PREG_NONE, src2_tmp);
   }
   else
   {
@@ -4452,7 +3678,7 @@ static void thumb_emit_data_processing_op32(SValue *src1, SValue *src2, SValue *
     restore_scratch_reg(&src1_alloc);
 }
 
-void tcc_gen_machine_data_processing_op(SValue *src1, SValue *src2, SValue *dest, TccIrOp op)
+void tcc_gen_machine_data_processing_op(IROperand src1, IROperand src2, IROperand dest, TccIrOp op)
 {
   ThumbDataProcessingHandler handler;
   thumb_flags_behaviour flags = FLAGS_BEHAVIOUR_NOT_IMPORTANT;
@@ -4460,7 +3686,7 @@ void tcc_gen_machine_data_processing_op(SValue *src1, SValue *src2, SValue *dest
   /* Check for 64-bit operations.
    * UMULL always produces a 64-bit result from 32-bit inputs, so it must
    * always use the 64-bit handler regardless of the dest type annotation. */
-  if (dest && (is_64bit_type(dest->type.t) || op == TCCIR_OP_UMULL))
+  if (!irop_is_none(dest) && (irop_is_64bit(dest) || op == TCCIR_OP_UMULL))
   {
     return thumb_process_data64_op(src1, src2, dest, op);
   }
@@ -4560,15 +3786,15 @@ void tcc_gen_machine_data_processing_op(SValue *src1, SValue *src2, SValue *dest
   }
   case TCCIR_OP_TEST_ZERO:
   {
-    const int is64 = tcc_is_64bit_operand(src1);
-    int src_lo = src1->pr0_reg;
-    int src_hi = src1->pr1_reg;
+    const int is64 = irop_is_64bit(src1);
+    int src_lo = src1.pr0_reg;
+    int src_hi = src1.pr1_reg;
 
     /* Handle immediate constant, missing register(s), or lvalue (needs dereference).
      * When VT_LVAL is set, the register holds an address and we need to load
      * the value it points to before comparing against zero. */
-    const int needs_load = th_has_immediate_value(src1->r) || src_lo == PREG_REG_NONE || (src1->r & VT_LVAL) ||
-                           (is64 && src_hi == PREG_REG_NONE);
+    const int needs_load = thumb_irop_has_immediate_value(src1) || src_lo == PREG_REG_NONE || src1.is_lval ||
+                           thumb_irop_needs_value_load(src1) || (is64 && src_hi == PREG_REG_NONE);
 
     if (!is64)
     {
@@ -4577,7 +3803,8 @@ void tcc_gen_machine_data_processing_op(SValue *src1, SValue *src2, SValue *dest
       {
         src_alloc = get_scratch_reg_with_save(0);
         src_lo = src_alloc.reg;
-        tcc_machine_load_to_reg(src_lo, PREG_NONE, src1);
+        IROperand src1_tmp = src1;
+        load_to_reg_ir(src_lo, PREG_NONE, src1_tmp);
       }
       else
       {
@@ -4602,7 +3829,8 @@ void tcc_gen_machine_data_processing_op(SValue *src1, SValue *src2, SValue *dest
       tcc_machine_acquire_scratch(&scratch, TCC_MACHINE_SCRATCH_NEEDS_PAIR);
       src_lo = scratch.regs[0];
       src_hi = scratch.regs[1];
-      tcc_machine_load_to_reg(src_lo, src_hi, src1);
+      IROperand src1_tmp = src1;
+      load_to_reg_ir(src_lo, src_hi, src1_tmp);
     }
     else
     {
@@ -4649,256 +3877,11 @@ static const char *get_softfp_func_name(TccIrOp op, int is_double)
   }
 }
 
-// /* Helper to load a float operand to a VFP register.
-//  * If the operand is already in a VFP register, just return its number.
-//  * Otherwise, load to integer reg and move to the specified VFP scratch
-//  * register.
-//  */
-// static int load_fp_operand_to_vfp(IROperand sv, int scratch_sreg, int scratch_dreg, int is_double)
-// {
-//   /* Check if operand is already in a VFP register (pr0 has VFP marker) */
-//   uint8_t pr0_packed = (sv.pr0_spilled ? PREG_SPILLED : 0) | sv.pr0_reg;
-//   if (pr0_packed != PREG_NONE && LS_IS_VFP_REG(sv->pr0_reg))
-//   {
-//     return LS_VFP_REG_NUM(sv->pr0_reg);
-//   }
-
-//   /* Not in VFP reg - load to integer reg and move to VFP scratch */
-//   tcc_machine_load_to_reg(R0, is_double ? R1 : PREG_NONE, sv);
-//   if (is_double)
-//   {
-//     ot_check(th_vmov_2gp_dp(R0, R1, scratch_dreg, 0 /* to VFP */));
-//     return scratch_dreg * 2; /* D0 = S0:S1, D1 = S2:S3 */
-//   }
-//   else
-//   {
-//     ot_check(th_vmov_gp_sp(R0, scratch_sreg, 0 /* to VFP */));
-//     return scratch_sreg;
-//   }
-// }
-
-/* Helper to store result from VFP register to destination (IROperand version).
- * If destination is a VFP register, move directly.
- * Otherwise, move to integer reg and store.
- */
-static void store_fp_result_from_vfp_ir(IROperand dest, int result_sreg, int result_dreg, int is_double)
-{
-  /* Check if destination is a VFP register */
-  uint8_t pr0_packed = (dest.pr0_spilled ? PREG_SPILLED : 0) | dest.pr0_reg;
-  if (pr0_packed != PREG_NONE && LS_IS_VFP_REG(dest.pr0_reg))
-  {
-    int dest_sreg = LS_VFP_REG_NUM(dest.pr0_reg);
-    if (is_double)
-    {
-      /* Move D-reg to D-reg (result_dreg to dest_dreg)
-       * dest_sreg is S-register number, convert to D-register number */
-      int dest_dreg = dest_sreg / 2;
-      if (result_dreg != dest_dreg)
-      {
-        ot_check(th_vmov_register(dest_dreg, result_dreg, 1)); /* double */
-      }
-    }
-    else
-    {
-      /* Move S-reg to S-reg */
-      if (result_sreg != dest_sreg)
-      {
-        ot_check(th_vmov_register(dest_sreg, result_sreg, 0)); /* single */
-      }
-    }
-    return;
-  }
-
-  /* Destination is not in VFP - move to integer reg and store/move */
-  if (is_double)
-  {
-    ot_check(th_vmov_2gp_dp(R0, R1, result_dreg, 1 /* to ARM */));
-    /* IR owns spills: destination must be either a real register pair or a true memory lvalue. */
-    if (dest.pr0_reg != PREG_REG_NONE || dest.pr1_reg != PREG_REG_NONE)
-    {
-      if (dest.pr0_reg == PREG_REG_NONE || dest.pr1_reg == PREG_REG_NONE)
-        tcc_error("compiler_error: hard-float double result destination missing register half");
-      if (dest.pr0_spilled || dest.pr1_spilled)
-        tcc_error("compiler_error: hard-float double result destination unexpectedly spilled");
-      thumb_require_materialized_reg("store_fp_result_from_vfp_ir", "dest.low", dest.pr0_reg);
-      thumb_require_materialized_reg("store_fp_result_from_vfp_ir", "dest.high", dest.pr1_reg);
-
-      /* Move R0:R1 to dest register pair */
-      if (dest.pr0_reg != R0)
-      {
-        ot_check(th_mov_reg(dest.pr0_reg, R0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE,
-                            false));
-      }
-      if (dest.pr1_reg != R1)
-      {
-        ot_check(th_mov_reg(dest.pr1_reg, R1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE,
-                            false));
-      }
-    }
-    else if (dest.is_lval)
-    {
-      /* Store both words to memory using store_ir(). */
-      IROperand dest_with_r1 = dest;
-      dest_with_r1.pr1_reg = R1;
-      store_ir(R0, dest_with_r1);
-    }
-    else
-    {
-      tcc_error("compiler_error: hard-float double result destination is neither register nor memory lvalue");
-    }
-  }
-  else
-  {
-    ot_check(th_vmov_gp_sp(R0, result_sreg, 1 /* to ARM */));
-    /* IR owns spills: destination must be either a real register or a true memory lvalue. */
-    if (dest.pr0_reg != PREG_REG_NONE)
-    {
-      uint8_t pr0_packed = (dest.pr0_spilled ? PREG_SPILLED : 0) | dest.pr0_reg;
-      thumb_require_materialized_reg("store_fp_result_from_vfp_ir", "dest", pr0_packed);
-      if (dest.pr0_reg != R0)
-      {
-        ot_check(th_mov_reg(dest.pr0_reg, R0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE,
-                            false));
-      }
-    }
-    else if (dest.is_lval)
-    {
-      store_ir(R0, dest);
-    }
-    else
-    {
-      tcc_error("compiler_error: hard-float float result destination is neither register nor memory lvalue");
-    }
-  }
-}
-
-// /* Generate VFP hardware floating point operation.
-//  * Uses S0/D0 as temporary registers for operands and result.
-//  * For single precision: S0, S1, S2
-//  * For double precision: D0, D1
-//  */
-// static void gen_hardfp_op(IROperand src1, IROperand src2, IROperand dest, TccIrOp op, int is_double)
-// {
-//   uint32_t sz = is_double ? 1 : 0;
-//   int src1_reg, src2_reg;
-
-//   /* Load first operand - may already be in a VFP register */
-//   src1_reg = load_fp_operand_to_vfp(src1, 0 /* S0 */, 0 /* D0 */, is_double);
-
-//   /* Load second operand for binary ops */
-//   if (op != TCCIR_OP_FNEG)
-//   {
-//     src2_reg = load_fp_operand_to_vfp(src2, 2 /* S2 */, 1 /* D1 */, is_double);
-//   }
-//   else
-//   {
-//     src2_reg = 0; /* unused for negation */
-//   }
-
-//   /* Perform the VFP operation - result in S0/D0 */
-//   switch (op)
-//   {
-//   case TCCIR_OP_FADD:
-//     if (is_double)
-//       ot_check(th_vadd_f(0, src1_reg / 2, src2_reg / 2, sz));
-//     else
-//       ot_check(th_vadd_f(0, src1_reg, src2_reg, sz));
-//     break;
-//   case TCCIR_OP_FSUB:
-//     if (is_double)
-//       ot_check(th_vsub_f(0, src1_reg / 2, src2_reg / 2, sz));
-//     else
-//       ot_check(th_vsub_f(0, src1_reg, src2_reg, sz));
-//     break;
-//   case TCCIR_OP_FMUL:
-//     if (is_double)
-//       ot_check(th_vmul_f(0, src1_reg / 2, src2_reg / 2, sz));
-//     else
-//       ot_check(th_vmul_f(0, src1_reg, src2_reg, sz));
-//     break;
-//   case TCCIR_OP_FDIV:
-//     if (is_double)
-//       ot_check(th_vdiv_f(0, src1_reg / 2, src2_reg / 2, sz));
-//     else
-//       ot_check(th_vdiv_f(0, src1_reg, src2_reg, sz));
-//     break;
-//   case TCCIR_OP_FNEG:
-//     ot_check(th_vneg_f(0, src1_reg, sz));
-//     break;
-//   default:
-//     tcc_error("compiler_error: unsupported FP op in gen_hardfp_op");
-//   }
-
-//   /* Store result from S0/D0 to destination */
-//   store_fp_result_from_vfp_ir(dest, 0 /* S0 */, 0 /* D0 */, is_double);
-// }
-
-/* Helper to load a float operand to a VFP register (IROperand version).
- * If the operand is already in a VFP register, just return its number.
- * Otherwise, load to integer reg and move to the specified VFP scratch register.
- */
-static int load_fp_operand_to_vfp_ir(IROperand sv, int scratch_sreg, int scratch_dreg, int is_double)
-{
-  /* Check if operand is already in a VFP register (pr0 has VFP marker) */
-  uint8_t pr0_packed = (sv.pr0_spilled ? PREG_SPILLED : 0) | sv.pr0_reg;
-  if (pr0_packed != PREG_NONE && LS_IS_VFP_REG(sv.pr0_reg))
-  {
-    return LS_VFP_REG_NUM(sv.pr0_reg);
-  }
-
-  /* Not in VFP reg - load to integer reg and move to VFP scratch */
-  load_to_reg_ir(R0, is_double ? R1 : PREG_NONE, sv);
-  if (is_double)
-  {
-    ot_check(th_vmov_2gp_dp(R0, R1, scratch_dreg, 0 /* to VFP */));
-    return scratch_dreg * 2; /* D0 = S0:S1, D1 = S2:S3 */
-  }
-  else
-  {
-    ot_check(th_vmov_gp_sp(R0, scratch_sreg, 0 /* to VFP */));
-    return scratch_sreg;
-  }
-}
-
-/* Generate VFP hardware floating point comparison.
- * Uses VCMP and VMRS to transfer flags to CPSR.
- */
-static void gen_hardfp_cmp(IROperand src1, IROperand src2, IROperand dest, TccIrOp op, int is_double)
-{
-  (void)dest; /* dest unused for comparison - result is in CPSR flags */
-  (void)op;   /* op unused - always FCMP */
-  uint32_t sz = is_double ? 1 : 0;
-  int src1_reg, src2_reg;
-
-  /* Load operands - may already be in VFP registers */
-  /* First load src1 to see what register it uses */
-  src1_reg = load_fp_operand_to_vfp_ir(src1, 0 /* S0 */, 0 /* D0 */, is_double);
-
-  /* Choose scratch for src2 that doesn't conflict with src1 */
-  int scratch_s = (src1_reg < 4) ? 4 : 0; /* Use S4/D2 if src1 uses S0-S3 */
-  int scratch_d = (src1_reg < 4) ? 2 : 0;
-
-  src2_reg = load_fp_operand_to_vfp_ir(src2, scratch_s, scratch_d, is_double);
-
-  /* VCMP - compare */
-  if (is_double)
-    ot_check(th_vcmp_f(src1_reg / 2, src2_reg / 2, sz));
-  else
-    ot_check(th_vcmp_f(src1_reg, src2_reg, sz));
-
-  /* VMRS APSR_nzcv, FPSCR - transfer FP flags to CPSR */
-  ot_check(th_vmrs(0x0f)); /* 0x0f = APSR_nzcv */
-}
-
-/* Generate a soft-float library function call for FP operations.
- * Parameters are passed in R0, R1 (float) or R0:R1, R2:R3 (double)
- * according to EABI soft-float calling convention.
- */
 static void gen_softfp_call(IROperand src1, IROperand src2, IROperand dest, TccIrOp op, const char *func_name,
                             int is_double)
 {
   Sym *sym;
-  SValue func_sv;
+  IROperand func_op;
 
   /* Load operands into argument registers per soft-float EABI convention */
   if (op == TCCIR_OP_FNEG)
@@ -4944,14 +3927,12 @@ static void gen_softfp_call(IROperand src1, IROperand src2, IROperand dest, TccI
   /* Get or create the external symbol for the soft-float function */
   sym = external_global_sym(tok_alloc_const(func_name), &func_old_type);
 
-  /* Set up SValue for the function call */
-  svalue_init(&func_sv);
-  func_sv.r = VT_CONST | VT_SYM;
-  func_sv.sym = sym;
-  func_sv.c.i = 0;
+  /* Set up IROperand for the function call */
+  uint32_t sym_idx = tcc_ir_pool_add_symref(tcc_state->ir, sym, 0, 0);
+  func_op = irop_make_symref(-1, sym_idx, 0, 0, 1, IROP_BTYPE_FUNC);
 
   /* Generate BL to the soft-float function */
-  gcall_or_jump(0, &func_sv);
+  gcall_or_jump_ir(0, func_op);
 
   /* Result is in R0 (float/int) or R0:R1 (double/long) */
   if (op != TCCIR_OP_FCMP)
@@ -4992,117 +3973,6 @@ static void gen_softfp_call(IROperand src1, IROperand src2, IROperand dest, TccI
     }
   }
   /* For FCMP, result is in CPSR flags - no store needed */
-}
-
-/* Generate float-to-float conversion (float <-> double).
- * Uses VCVT for hard float, library calls for soft float.
- */
-static void gen_hardfp_cvt_ftof(IROperand src1, IROperand dest, TccIrOp op)
-{
-  (void)op;
-  int src_is_double = (irop_get_btype(src1) == IROP_BTYPE_FLOAT64);
-  int dst_is_double = (irop_get_btype(dest) == IROP_BTYPE_FLOAT64);
-  int src_reg;
-
-  /* Load source - may already be in VFP register */
-  src_reg = load_fp_operand_to_vfp_ir(src1, 0 /* S0 */, 0 /* D0 */, src_is_double);
-
-  /* Convert */
-  if (dst_is_double && !src_is_double)
-  {
-    /* float to double: Sn -> D0 */
-    ot_check(th_vcvt_float_to_double(0, src_reg));
-  }
-  else if (!dst_is_double && src_is_double)
-  {
-    /* double to float: Dn -> S0 */
-    ot_check(th_vcvt_double_to_float(0, src_reg / 2));
-  }
-  /* else: same type, no conversion needed - may need move */
-
-  /* Store result to destination */
-  store_fp_result_from_vfp_ir(dest, 0 /* S0 */, 0 /* D0 */, dst_is_double);
-}
-
-/* Generate int-to-float conversion.
- * Uses VCVT for hard float, library calls for soft float.
- */
-static void gen_hardfp_cvt_itof(IROperand src1, IROperand dest, TccIrOp op)
-{
-  int src_is_64bit = (irop_get_btype(src1) == IROP_BTYPE_INT64);
-  int dst_is_double = (irop_get_btype(dest) == IROP_BTYPE_FLOAT64);
-  int is_unsigned = src1.is_unsigned;
-
-  /* For LLONG, we need library call even in hard float mode */
-  if (src_is_64bit)
-  {
-    const char *func_name;
-    if (dst_is_double)
-    {
-      func_name = is_unsigned ? "__aeabi_ul2d" : "__aeabi_l2d";
-    }
-    else
-    {
-      func_name = is_unsigned ? "__aeabi_ul2f" : "__aeabi_l2f";
-    }
-    gen_softfp_call(src1, irop_make_none(), dest, op, func_name, 0);
-    return;
-  }
-
-  /* Load integer to R0, then to S0 */
-  load_to_reg_ir(R0, PREG_NONE, src1);
-  ot_check(th_vmov_gp_sp(R0, 0 /* S0 */, 0 /* to VFP */));
-
-  /* VCVT: convert int in S0 to float/double in S0/D0
-   * opc2=0 for unsigned, opc2=1 for signed
-   * sz=1 for double, sz=0 for float
-   * op=1 means int-to-float direction
-   */
-  ot_check(th_vcvt_fp_int(0, 0, 0 /* always write to S0/D0 */, dst_is_double, is_unsigned ? 0 : 1));
-
-  /* Store result to destination */
-  store_fp_result_from_vfp_ir(dest, 0 /* S0 */, 0 /* D0 */, dst_is_double);
-}
-
-/* Generate float-to-int conversion.
- * Uses VCVT for hard float, library calls for soft float.
- */
-static void gen_hardfp_cvt_ftoi(IROperand src1, IROperand dest, TccIrOp op)
-{
-  int src_is_double = (irop_get_btype(src1) == IROP_BTYPE_FLOAT64);
-  int dst_is_64bit = (irop_get_btype(dest) == IROP_BTYPE_INT64);
-  int is_unsigned = dest.is_unsigned;
-  int src_reg;
-
-  /* For LLONG destination, we need library call even in hard float mode */
-  if (dst_is_64bit)
-  {
-    const char *func_name;
-    if (src_is_double)
-    {
-      func_name = is_unsigned ? "__aeabi_d2ulz" : "__aeabi_d2lz";
-    }
-    else
-    {
-      func_name = is_unsigned ? "__aeabi_f2ulz" : "__aeabi_f2lz";
-    }
-    gen_softfp_call(src1, irop_make_none(), dest, op, func_name, src_is_double);
-    return;
-  }
-
-  /* Load float/double source - may already be in VFP register */
-  src_reg = load_fp_operand_to_vfp_ir(src1, 0 /* S0 */, 0 /* D0 */, src_is_double);
-
-  /* VCVT: convert float/double to int
-   * opc2=4 for unsigned, opc2=5 for signed (with round toward zero)
-   * Result goes to S0
-   */
-  ot_check(th_vcvt_fp_int(0, src_is_double ? src_reg / 2 : src_reg, is_unsigned ? 0x4 : 0x5, src_is_double, 1));
-
-  /* Move result from S0 to R0 */
-  ot_check(th_vmov_gp_sp(R0, 0 /* S0 */, 1 /* to ARM */));
-
-  store_ir(R0, dest);
 }
 
 /* Check if the selected FPU supports double precision operations */
@@ -5149,7 +4019,7 @@ static void gen_softfp_fcmp(IROperand src1, IROperand src2, int is_double)
 {
   const char *cmp_func = is_double ? "__aeabi_cdcmple" : "__aeabi_cfcmple";
   Sym *sym;
-  SValue func_sv;
+  IROperand func_op;
 
   if (is_double)
   {
@@ -5164,12 +4034,10 @@ static void gen_softfp_fcmp(IROperand src1, IROperand src2, int is_double)
 
   sym = external_global_sym(tok_alloc_const(cmp_func), &func_old_type);
 
-  svalue_init(&func_sv);
-  func_sv.r = VT_CONST | VT_SYM;
-  func_sv.sym = sym;
-  func_sv.c.i = 0;
+  uint32_t sym_idx = tcc_ir_pool_add_symref(tcc_state->ir, sym, 0, 0);
+  func_op = irop_make_symref(-1, sym_idx, 0, 0, 1, IROP_BTYPE_FUNC);
 
-  gcall_or_jump(0, &func_sv);
+  gcall_or_jump_ir(0, func_op);
 }
 
 /* Get soft float function name for float<->double conversion */
@@ -5211,14 +4079,6 @@ static const char *get_softfp_cvt_ftoi_func_name(IROperand src1, IROperand dest)
                        : (src_is_double ? "__aeabi_d2lz" : "__aeabi_f2lz");
   return is_unsigned ? (src_is_double ? "__aeabi_d2uiz" : "__aeabi_f2uiz")
                      : (src_is_double ? "__aeabi_d2iz" : "__aeabi_f2iz");
-}
-
-/* Check if VFP hardware can be used for this operation */
-static int can_use_vfp(int is_double)
-{
-  if (tcc_state->float_abi != ARM_HARD_FLOAT && tcc_state->float_abi != ARM_SOFTFP_FLOAT)
-    return 0;
-  return !is_double || arm_fpu_supports_double(tcc_state->fpu_type);
 }
 
 /* Generate floating point operation.
@@ -5787,245 +4647,170 @@ ST_FUNC void tcc_gen_machine_epilog(int leaffunc)
   thumb_free_call_sites();
 }
 
-ST_FUNC void tcc_gen_machine_assign_op(IROperand dest, IROperand src, TccIrOp op)
+/* Helper: assign to 64-bit destination */
+static void assign_op_64bit(IROperand dest, IROperand src)
 {
-  const int dest_is_64bit = irop_is_64bit(dest);
   const int src_is_64bit = irop_is_64bit(src);
+  const int dest_in_mem = dest.is_lval;
 
-  int dest_is_vfp = 0; // dest_is_64bit;
-  int src_is_vfp = 0;  // src_is_64bit;
+  int src_lo = src.pr0_reg;
+  int src_hi = src_is_64bit ? src.pr1_reg : PREG_REG_NONE;
+  ScratchRegAlloc src_lo_alloc = {0};
+  ScratchRegAlloc src_hi_alloc = {0};
 
-  if (dest_is_64bit)
+  /* Check for spilled sources - these need to be loaded to registers */
+  const int src_lo_spilled = (src_lo != PREG_REG_NONE) && src.pr0_spilled;
+  const int src_hi_spilled = (src_hi != PREG_REG_NONE) && src.pr1_spilled;
+
+  /* Materialize source into registers if needed (const/spilled/lvalue/etc).
+   * If either half is spilled, reload the whole 64-bit value.
+   * Check tag for true constants to avoid misinterpreting vregs with stale is_const flag. */
+  int src_tag = irop_get_tag(src);
+  int src_is_imm = (src_tag == IROP_TAG_IMM32 || src_tag == IROP_TAG_I64 || src_tag == IROP_TAG_F32 ||
+                    src_tag == IROP_TAG_F64 || src_tag == IROP_TAG_SYMREF || src_tag == IROP_TAG_STACKOFF);
+  if (src_is_imm || src.is_lval || src_lo == PREG_REG_NONE || src_lo_spilled || (src_is_64bit && src_hi_spilled))
   {
-    const int dest_in_mem = dest.is_lval;
-
-    int src_lo = src.pr0_reg;
-    int src_hi = src_is_64bit ? src.pr1_reg : PREG_REG_NONE;
-    ScratchRegAlloc src_lo_alloc = {0};
-    ScratchRegAlloc src_hi_alloc = {0};
-
-    /* Check for spilled sources - these need to be loaded to registers */
-    const int src_lo_spilled = (src_lo != PREG_REG_NONE) && src.pr0_spilled;
-    const int src_hi_spilled = (src_hi != PREG_REG_NONE) && src.pr1_spilled;
-
-    /* Materialize source into registers if needed (const/spilled/lvalue/etc).
-     * If either half is spilled, reload the whole 64-bit value.
-     * Check tag for true constants to avoid misinterpreting vregs with stale is_const flag. */
-    int src_tag = irop_get_tag(src);
-    int src_is_imm = (src_tag == IROP_TAG_IMM32 || src_tag == IROP_TAG_I64 || src_tag == IROP_TAG_F32 ||
-                      src_tag == IROP_TAG_F64 || src_tag == IROP_TAG_SYMREF || src_tag == IROP_TAG_STACKOFF);
-    if (src_is_imm || src.is_lval || src_lo == PREG_REG_NONE || src_lo_spilled || (src_is_64bit && src_hi_spilled))
+    uint32_t exclude = 0;
+    if (!dest_in_mem)
     {
-      uint32_t exclude = 0;
-      if (!dest_in_mem)
-      {
-        if (dest.pr0_reg != PREG_REG_NONE && !dest.pr0_spilled && dest.pr0_reg <= 15)
-          exclude |= (1u << dest.pr0_reg);
-        if (dest.pr1_reg != PREG_REG_NONE && !dest.pr1_spilled && dest.pr1_reg <= 15)
-          exclude |= (1u << dest.pr1_reg);
-      }
-      src_lo_alloc = get_scratch_reg_with_save(exclude);
-      exclude |= (1u << src_lo_alloc.reg);
-      if (src_is_64bit)
-      {
-        src_hi_alloc = get_scratch_reg_with_save(exclude);
-        SValue src_sv;
-        iroperand_to_svalue(tcc_state->ir, src, &src_sv);
-        tcc_machine_load_to_reg(src_lo_alloc.reg, src_hi_alloc.reg, &src_sv);
-        src_hi = src_hi_alloc.reg;
-      }
-      else
-      {
-        SValue src_sv;
-        iroperand_to_svalue(tcc_state->ir, src, &src_sv);
-        tcc_machine_load_to_reg(src_lo_alloc.reg, PREG_REG_NONE, &src_sv);
-        src_hi = PREG_REG_NONE;
-      }
-      src_lo = src_lo_alloc.reg;
+      if (dest.pr0_reg != PREG_REG_NONE && !dest.pr0_spilled && dest.pr0_reg <= 15)
+        exclude |= (1u << dest.pr0_reg);
+      if (dest.pr1_reg != PREG_REG_NONE && !dest.pr1_spilled && dest.pr1_reg <= 15)
+        exclude |= (1u << dest.pr1_reg);
     }
-    else if (src_hi == PREG_REG_NONE)
+    src_lo_alloc = get_scratch_reg_with_save(exclude);
+    exclude |= (1u << src_lo_alloc.reg);
+    if (src_is_64bit)
     {
-      /* Mixed 32->64 promotion: treat missing high word as 0. */
-      uint32_t exclude = 0;
-      if (!dest_in_mem)
-      {
-        if (dest.pr0_reg != PREG_REG_NONE && !dest.pr0_spilled && dest.pr0_reg <= 15)
-          exclude |= (1u << dest.pr0_reg);
-        if (dest.pr1_reg != PREG_REG_NONE && !dest.pr1_spilled && dest.pr1_reg <= 15)
-          exclude |= (1u << dest.pr1_reg);
-      }
-      if (src_lo != PREG_REG_NONE && src_lo <= 15)
-        exclude |= (1u << src_lo);
       src_hi_alloc = get_scratch_reg_with_save(exclude);
-      ot_check(th_mov_imm(src_hi_alloc.reg, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+      load_to_reg_ir(src_lo_alloc.reg, src_hi_alloc.reg, src);
       src_hi = src_hi_alloc.reg;
-    }
-
-    if (dest_in_mem)
-    {
-      /* Store low and high words separately as 32-bit stores.
-       * When storing the low word, exclude src_hi from scratch allocation
-       * to prevent clobbering the high word value before it's stored. */
-      SValue dest_low_sv, dest_high_sv;
-      iroperand_to_svalue(tcc_state->ir, dest, &dest_low_sv);
-      iroperand_to_svalue(tcc_state->ir, dest, &dest_high_sv);
-      dest_low_sv.type.t = (dest_low_sv.type.t & ~VT_BTYPE) | (VT_INT | (dest_low_sv.type.t & VT_UNSIGNED));
-      dest_high_sv.type.t = dest_low_sv.type.t;
-      dest_high_sv.c.i += 4;
-
-      store_ex(src_lo, &dest_low_sv, (1u << src_hi));
-      store(src_hi, &dest_high_sv);
     }
     else
     {
-      if (dest.pr0_reg != src_lo && dest.pr0_reg != PREG_REG_NONE && src_lo != PREG_REG_NONE)
-      {
-        ot_check(th_mov_reg(dest.pr0_reg, src_lo, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                            ENFORCE_ENCODING_NONE, false));
-      }
-      if (dest.pr1_reg != src_hi && dest.pr1_reg != PREG_REG_NONE && src_hi != PREG_REG_NONE)
-      {
-        ot_check(th_mov_reg(dest.pr1_reg, src_hi, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                            ENFORCE_ENCODING_NONE, false));
-      }
+      load_to_reg_ir(src_lo_alloc.reg, PREG_REG_NONE, src);
+      src_hi = PREG_REG_NONE;
     }
+    src_lo = src_lo_alloc.reg;
+  }
+  else if (src_hi == PREG_REG_NONE)
+  {
+    /* Mixed 32->64 promotion: treat missing high word as 0. */
+    uint32_t exclude = 0;
+    if (!dest_in_mem)
+    {
+      if (dest.pr0_reg != PREG_REG_NONE && !dest.pr0_spilled && dest.pr0_reg <= 15)
+        exclude |= (1u << dest.pr0_reg);
+      if (dest.pr1_reg != PREG_REG_NONE && !dest.pr1_spilled && dest.pr1_reg <= 15)
+        exclude |= (1u << dest.pr1_reg);
+    }
+    if (src_lo != PREG_REG_NONE && src_lo <= 15)
+      exclude |= (1u << src_lo);
+    src_hi_alloc = get_scratch_reg_with_save(exclude);
+    ot_check(th_mov_imm(src_hi_alloc.reg, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    src_hi = src_hi_alloc.reg;
+  }
 
-    restore_scratch_reg(&src_hi_alloc);
-    restore_scratch_reg(&src_lo_alloc);
+  if (dest_in_mem)
+  {
+    /* Store low and high words separately as 32-bit stores.
+     * When storing the low word, exclude src_hi from scratch allocation
+     * to prevent clobbering the high word value before it's stored. */
+    IROperand dest_lo = dest;
+    dest_lo.btype = IROP_BTYPE_INT32;
+    IROperand dest_hi = dest_lo;
+    dest_hi.u.imm32 += 4;
+
+    store_ex_ir(src_lo, dest_lo, (1u << src_hi));
+    store_ir(src_hi, dest_hi);
+  }
+  else
+  {
+    if (dest.pr0_reg != src_lo && dest.pr0_reg != PREG_REG_NONE && src_lo != PREG_REG_NONE)
+    {
+      ot_check(th_mov_reg(dest.pr0_reg, src_lo, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                          ENFORCE_ENCODING_NONE, false));
+    }
+    if (dest.pr1_reg != src_hi && dest.pr1_reg != PREG_REG_NONE && src_hi != PREG_REG_NONE)
+    {
+      ot_check(th_mov_reg(dest.pr1_reg, src_hi, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                          ENFORCE_ENCODING_NONE, false));
+    }
+  }
+
+  restore_scratch_reg(&src_hi_alloc);
+  restore_scratch_reg(&src_lo_alloc);
+}
+
+ST_FUNC void tcc_gen_machine_assign_op(IROperand dest, IROperand src, TccIrOp op)
+{
+  const int dest_is_64bit = irop_is_64bit(dest);
+
+  /* 64-bit destination has dedicated handler */
+  if (dest_is_64bit)
+  {
+    assign_op_64bit(dest, src);
     return;
   }
 
-  /* Check that is_const is consistent with tag - only IMM32/I64/F32/F64 are true constants */
   int tag = irop_get_tag(src);
   int is_imm_const = (tag == IROP_TAG_IMM32 || tag == IROP_TAG_I64 || tag == IROP_TAG_F32 || tag == IROP_TAG_F64);
 
   if (is_imm_const && !src.is_lval)
   {
     Sym *sym = irop_get_sym_ex(tcc_state->ir, src);
-    int is_64bit = dest_is_64bit;
     int64_t src_imm = irop_get_imm64_ex(tcc_state->ir, src);
 
-    if (dest_is_vfp)
+    if (dest.is_lval && (dest.is_local || dest.is_const))
     {
-      int dn = LS_VFP_REG_NUM(dest.pr0_reg);
-      /* Load constant to integer register, then move to VFP */
       ScratchRegAlloc scratch_alloc = get_scratch_reg_with_save(0);
-      int scratch_reg = scratch_alloc.reg;
-      tcc_machine_load_constant(scratch_reg, PREG_NONE, src_imm, 0, sym);
-      ot_check(th_vmov_gp_sp(scratch_reg, dn, 0)); /* VMOV Sn, scratch_reg */
-      restore_scratch_reg(&scratch_alloc);
-    }
-    else if (dest.is_lval && (dest.is_local || dest.is_const))
-    {
-      /* Destination is a memory location (e.g., spilled variable with address taken).
-       * Load constant into scratch register, then store to destination memory.
-       * Remove VT_LVAL to prevent store() from trying to dereference. */
-      ScratchRegAlloc scratch_alloc = get_scratch_reg_with_save(0);
-      int scratch_reg = scratch_alloc.reg;
-      tcc_machine_load_constant(scratch_reg, PREG_NONE, src_imm, 0, sym);
-      SValue dest_direct;
-      iroperand_to_svalue(tcc_state->ir, dest, &dest_direct);
-      dest_direct.r &= ~VT_LVAL; /* Clear VT_LVAL - we want direct store to stack offset */
-      store(scratch_reg, &dest_direct);
+      tcc_machine_load_constant(scratch_alloc.reg, PREG_NONE, src_imm, 0, sym);
+      IROperand dest_direct = dest;
+      dest_direct.is_lval = 0;
+      store_ir(scratch_alloc.reg, dest_direct);
       restore_scratch_reg(&scratch_alloc);
     }
     else
     {
-      tcc_machine_load_constant(dest.pr0_reg, is_64bit ? dest.pr1_reg : PREG_REG_NONE, src_imm, is_64bit, sym);
+      tcc_machine_load_constant(dest.pr0_reg, dest_is_64bit ? dest.pr1_reg : PREG_REG_NONE, src_imm, dest_is_64bit,
+                                sym);
     }
     return;
   }
 
-  /* VT_CONST with VT_LVAL means dereference a global symbol - use load_to_reg */
+  /* Symbol dereference (SYMREF with is_lval) */
   if ((src.is_sym || tag == IROP_TAG_SYMREF) && src.is_lval)
   {
-    SValue src_sv;
-    iroperand_to_svalue(tcc_state->ir, src, &src_sv);
-    if (dest_is_vfp)
-    {
-      int dn = LS_VFP_REG_NUM(dest.pr0_reg);
-      ScratchRegAlloc scratch_alloc = get_scratch_reg_with_save(0);
-      int scratch_reg = scratch_alloc.reg;
-      tcc_machine_load_to_reg(scratch_reg, PREG_REG_NONE, &src_sv);
-      ot_check(th_vmov_gp_sp(scratch_reg, dn, 0));
-      restore_scratch_reg(&scratch_alloc);
-    }
-    else if (dest.is_lval && (dest.is_local || dest.is_const))
+    if (dest.is_lval && (dest.is_local || dest.is_const))
     {
       ScratchRegAlloc scratch_alloc = get_scratch_reg_with_save(0);
-      int scratch_reg = scratch_alloc.reg;
-      tcc_machine_load_to_reg(scratch_reg, PREG_REG_NONE, &src_sv);
-      SValue dest_direct;
-      iroperand_to_svalue(tcc_state->ir, dest, &dest_direct);
-      dest_direct.r &= ~VT_LVAL;
-      store(scratch_reg, &dest_direct);
+      load_to_reg_ir(scratch_alloc.reg, PREG_REG_NONE, src);
+      IROperand dest_direct = dest;
+      dest_direct.is_lval = 0;
+      store_ir(scratch_alloc.reg, dest_direct);
       restore_scratch_reg(&scratch_alloc);
     }
     else
     {
-      tcc_machine_load_to_reg(dest.pr0_reg, dest_is_64bit ? dest.pr1_reg : PREG_REG_NONE, &src_sv);
+      load_to_reg_ir(dest.pr0_reg, dest_is_64bit ? dest.pr1_reg : PREG_REG_NONE, src);
     }
     return;
   }
 
-  /* SYMREF without is_lval means load symbol address (not dereference) */
-  if ((src.is_sym || tag == IROP_TAG_SYMREF) && !src.is_lval)
+  /* Symbol address, local address, or memory load - load_to_dest_ir handles all */
+  if ((src.is_sym || tag == IROP_TAG_SYMREF) || src.is_local || src.is_lval)
   {
     load_to_dest_ir(dest, src);
     return;
   }
 
-  /* Handle VT_LOCAL - this is address-of spilled vreg.
-   * The src.is_local will be set without is_lval (address computation, not value load). */
-  if (src.is_local && !src.is_lval)
-  {
-    SValue dest_sv, src_sv;
-    iroperand_to_svalue(tcc_state->ir, dest, &dest_sv);
-    iroperand_to_svalue(tcc_state->ir, src, &src_sv);
-    load_to_dest(&dest_sv, &src_sv);
-    return;
-  }
-
-  /* Handle any is_lval source - this is loading from memory (stack, register-indirect, etc.) */
-  if (src.is_lval)
-  {
-    SValue dest_sv, src_sv;
-    iroperand_to_svalue(tcc_state->ir, dest, &dest_sv);
-    iroperand_to_svalue(tcc_state->ir, src, &src_sv);
-    load_to_dest(&dest_sv, &src_sv);
-    return;
-  }
-
+  /* Same register - nothing to do */
   if (dest.pr0_reg == src.pr0_reg && dest.pr0_spilled == src.pr0_spilled)
-  {
     return;
-  }
 
   /* Register to register move */
-  if (dest_is_vfp && src_is_vfp)
-  {
-    int dn = LS_VFP_REG_NUM(dest.pr0_reg);
-    int sn = LS_VFP_REG_NUM(src.pr0_reg);
-    /* VFP to VFP move */
-    ot_check(th_vmov_register(dn, sn, 0)); /* VMOV.F32 Sd, Sm */
-  }
-  else if (dest_is_vfp && !src_is_vfp)
-  {
-    int dn = LS_VFP_REG_NUM(dest.pr0_reg);
-    /* Integer to VFP */
-    ot_check(th_vmov_gp_sp(src.pr0_reg, dn, 0)); /* VMOV Sn, Rm */
-  }
-  else if (!dest_is_vfp && src_is_vfp)
-  {
-    int sn = LS_VFP_REG_NUM(src.pr0_reg);
-    /* VFP to integer */
-    ot_check(th_vmov_gp_sp(dest.pr0_reg, sn, 1)); /* VMOV Rd, Sn */
-  }
-  else
-  {
-    ot_check(th_mov_reg(dest.pr0_reg, src.pr0_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                        ENFORCE_ENCODING_NONE, false));
-  }
+  ot_check(th_mov_reg(dest.pr0_reg, src.pr0_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                      ENFORCE_ENCODING_NONE, false));
 }
 
 /* Load Effective Address: compute the address of src1 into dest.
@@ -6188,29 +4973,11 @@ ST_FUNC void tcc_gen_machine_store_to_sp(int reg, int offset)
   }
 }
 
-/* Load a register from a stack slot relative to FP.
- * Used for stack-passed incoming parameters (caller stack is above FP). */
-static void tcc_gen_machine_load_from_stack(int reg, int offset)
+static void gcall_or_jump_ir(int is_jmp, IROperand dest)
 {
-  int sign = (offset < 0);
-  int abs_offset = sign ? -offset : offset;
+  const int tag = irop_get_tag(dest);
 
-  /* Try direct LDR with immediate offset */
-  if (!load_word_from_base(reg, R_FP, abs_offset, sign))
-  {
-    /* Offset too large, use scratch register */
-    /* Avoid using the destination register as offset scratch; some Thumb
-     * encodings have unpredictable behavior when Rt == Rm. */
-    ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(abs_offset, sign, (1u << reg) | (1u << R_FP));
-    int rr = rr_alloc.reg;
-    ot_check(th_ldr_reg(reg, R_FP, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-    restore_scratch_reg(&rr_alloc);
-  }
-}
-
-static void gcall_or_jump(int is_jmp, SValue *dest)
-{
-  if ((dest->r & (VT_VALMASK | VT_LVAL)) == VT_CONST)
+  if ((tag == IROP_TAG_IMM32 || tag == IROP_TAG_SYMREF) && !dest.is_lval)
   {
     /* IMPORTANT: ot_check() may flush a pending literal pool *before* emitting
      * this BL, which inserts a pool skip-branch at the current `ind`.
@@ -6219,8 +4986,31 @@ static void gcall_or_jump(int is_jmp, SValue *dest)
      *
      * Therefore: emit first, then record relocation at the actual BL position.
      */
+    Sym *sym = NULL;
+    Sym *validated_sym = NULL;
+    Sym *reloc_sym = NULL;
+    int32_t addend = 0;
+    if (tag == IROP_TAG_SYMREF)
+    {
+      IRPoolSymref *symref = irop_get_symref_ex(tcc_state->ir, dest);
+      sym = symref ? symref->sym : NULL;
+      addend = symref ? symref->addend : 0;
+      validated_sym = sym ? validate_sym_for_reloc(sym) : NULL;
+      /* If symbol is not yet registered, try to externalize it so relocation works.
+       * This mirrors load_full_const() behavior for literal pools. */
+      if (sym && !validated_sym && !(sym->v & SYM_FIELD))
+      {
+        put_extern_sym(sym, NULL, 0, 0);
+        validated_sym = validate_sym_for_reloc(sym);
+      }
+      /* Preserve legacy behavior: if a symbol exists, emit relocation even if
+       * validation failed (e.g. before registration), unless it's a type field. */
+      if (sym && !(sym->v & SYM_FIELD))
+        reloc_sym = validated_sym ? validated_sym : sym;
+    }
+
     uint32_t imm;
-    if (dest->r & VT_SYM)
+    if (reloc_sym)
     {
       /* For symbol relocations, keep a benign placeholder immediate.
        * Using -4 encodes a self-call (common placeholder) and provides a
@@ -6230,17 +5020,18 @@ static void gcall_or_jump(int is_jmp, SValue *dest)
     }
     else
     {
-      imm = th_encbranch(ind, ind + dest->c.i);
+      const int32_t rel = (tag == IROP_TAG_IMM32) ? dest.u.imm32 : addend;
+      imm = th_encbranch(ind, ind + rel);
     }
 
     TRACE("gcall_or_jmp: %d, ind: 0x%x, 0x%x", is_jmp, ind, imm);
     if (imm)
     {
       ot_check(th_bl_t1(imm));
-      if (dest->r & VT_SYM)
+      if (reloc_sym)
       {
         int call_pos = ind - 4; /* th_bl_t1 is always 4 bytes */
-        greloc(cur_text_section, dest->sym, call_pos, R_ARM_THM_JUMP24);
+        greloc(cur_text_section, reloc_sym, call_pos, R_ARM_THM_JUMP24);
       }
     }
   }
@@ -6248,20 +5039,14 @@ static void gcall_or_jump(int is_jmp, SValue *dest)
   {
     /* Indirect call through register.
      *
-     * When the target type is VT_FUNC (direct function designator), if the
-     * address already lives in a register (v < VT_CONST), clear VT_LVAL so
-     * we don't emit a bogus extra load like "ldr ip, [ip]" before blx.
-     *
-     * BUT: When we have a pointer-to-function (bt == VT_PTR pointing to VT_FUNC),
-     * VT_LVAL means the register holds the ADDRESS where the function pointer
-     * is stored (e.g., from array access tabl[i]), and we DO need to load from it.
+     * When the target type is IROP_BTYPE_FUNC (direct function designator), if the
+     * address already lives in a register, clear is_lval so we don't emit a bogus
+     * extra load like "ldr ip, [ip]" before blx.
      */
-    int bt = dest->type.t & VT_BTYPE;
-    if (bt == VT_FUNC)
+    int bt = irop_get_btype(dest);
+    if (bt == IROP_BTYPE_FUNC && dest.is_lval && tag == IROP_TAG_VREG && dest.pr0_reg != PREG_REG_NONE)
     {
-      int v = dest->r & VT_VALMASK;
-      if ((dest->r & VT_LVAL) && v < VT_CONST)
-        dest->r &= ~VT_LVAL;
+      dest.is_lval = 0;
     }
 
     /* Indirect call/jump: keep argument registers (R0-R3) intact.
@@ -6271,7 +5056,7 @@ static void gcall_or_jump(int is_jmp, SValue *dest)
      */
     if (is_jmp)
     {
-      tcc_machine_load_to_reg(R_IP, PREG_NONE, dest);
+      load_to_reg_ir(R_IP, PREG_NONE, dest);
       ot_check(th_bx_reg(R_IP));
     }
     else
@@ -6282,20 +5067,13 @@ static void gcall_or_jump(int is_jmp, SValue *dest)
       uint32_t old_exclude = scratch_global_exclude;
       scratch_global_exclude |= (1u << R0) | (1u << R1) | (1u << R2) | (1u << R3);
 
-      tcc_machine_load_to_reg(scratch.reg, PREG_NONE, dest);
+      load_to_reg_ir(scratch.reg, PREG_NONE, dest);
 
       scratch_global_exclude = old_exclude;
       ot_check(th_blx_reg(scratch.reg));
       restore_scratch_reg(&scratch);
     }
   }
-}
-
-/* Helper to check if a type is 64-bit (double or long long) */
-static int is_64bit_type(int t)
-{
-  int bt = t & VT_BTYPE;
-  return (bt == VT_DOUBLE || bt == VT_LDOUBLE || bt == VT_LLONG);
 }
 
 /* IROperand version of load_to_register */
@@ -6353,154 +5131,6 @@ static void load_to_register_ir(int reg, int reg_from, IROperand src)
   }
 }
 
-/* Legacy wrapper: convert SValue to IROperand */
-static void load_to_register(int reg, int reg_from, SValue *sv)
-{
-  const IROperand src_ir = svalue_to_iroperand(tcc_state->ir, sv);
-  load_to_register_ir(reg, reg_from, src_ir);
-}
-
-/* Returns true when a register value can be used directly as a source (not spilled, not lvalue).
- * For VT_LOCAL without VT_LVAL (address of local variable), we need to compute the address,
- * so we cannot use the register directly even if it contains the value. */
-static bool is_valid_src_reg(const SValue *sv, int reg)
-{
-  if (reg == PREG_NONE)
-    return false;
-  if (sv->r & VT_LVAL)
-    return false;
-  /* VT_LOCAL without VT_LVAL means "address of local variable" - needs address computation */
-  if ((sv->r & VT_VALMASK) == VT_LOCAL)
-    return false;
-  return true;
-}
-
-static int lowest_set_bit(uint32_t mask)
-{
-  return __builtin_ctz(mask);
-}
-
-/* Preserve a register that will be clobbered by later parameter writes. We try to remap it to R12.
- * This also handles lvalue sources - if a param needs to dereference through a register,
- * remapping the pointer to R12 allows the load to happen from R12 instead. */
-static void remap_future_param_sources(int current_dest, int reg_to_save, int remap_reg, int *param_src0,
-                                       int *param_src1, int *param_lval_src, int *op_to_reg)
-{
-  /* Walk future params (those with lower destination registers) and rewrite their sources. */
-  for (int dest = current_dest - 1; dest >= 0; --dest)
-  {
-    if (op_to_reg[dest] == PREG_NONE)
-      continue;
-    if (param_src0[dest] == reg_to_save)
-      param_src0[dest] = remap_reg;
-    if (param_src1[dest] == reg_to_save)
-      param_src1[dest] = remap_reg;
-    if (param_lval_src[dest] == reg_to_save)
-      param_lval_src[dest] = remap_reg;
-  }
-}
-
-static void tcc_thumb_ir_store_u32_to_sp(TCCIRState *ir, int off, SValue *val)
-{
-  (void)ir;
-  TCCMachineScratchRegs scratch = {0};
-  tcc_machine_acquire_scratch(&scratch, TCC_MACHINE_SCRATCH_AVOID_CALL_ARG_REGS);
-  int rtmp = scratch.regs[0];
-  tcc_machine_load_to_reg(rtmp, PREG_NONE, val);
-  tcc_gen_machine_store_to_sp(rtmp, off);
-  tcc_machine_release_scratch(&scratch);
-}
-
-static void tcc_thumb_ir_store_u64_to_sp(TCCIRState *ir, int off, SValue *val)
-{
-  (void)ir;
-  TCCMachineScratchRegs scratch = {0};
-  tcc_machine_acquire_scratch(&scratch, TCC_MACHINE_SCRATCH_NEEDS_PAIR | TCC_MACHINE_SCRATCH_AVOID_CALL_ARG_REGS);
-  int rlo = scratch.regs[0];
-  int rhi = scratch.regs[1];
-  tcc_machine_load_to_reg(rlo, rhi, val);
-  tcc_gen_machine_store_to_sp(rlo, off);
-  tcc_gen_machine_store_to_sp(rhi, off + 4);
-  tcc_machine_release_scratch(&scratch);
-}
-
-static void tcc_thumb_ir_copy_struct_to_sp(int dst_off, const SValue *sv, int size)
-{
-  const int slot_sz = tcc_abi_align_up_int(size, 4);
-  TCCMachineScratchRegs scratch = {0};
-  /* Need base+tmp. Avoid call arg regs. */
-  tcc_machine_acquire_scratch(&scratch, TCC_MACHINE_SCRATCH_NEEDS_PAIR | TCC_MACHINE_SCRATCH_AVOID_CALL_ARG_REGS);
-  int base = scratch.regs[0];
-  int tmp = scratch.regs[1];
-
-  SValue addr = *sv;
-  addr.r &= ~VT_LVAL;
-  addr.type.t = VT_PTR;
-  tcc_machine_load_to_reg(base, PREG_NONE, &addr);
-
-  /* Copy full words */
-  int copied = 0;
-  while (copied + 4 <= size)
-  {
-    if (!load_word_from_base(tmp, base, copied, 0))
-    {
-      ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(
-          copied, 0, (1u << tmp) | (1u << base) | (1u << R_SP) | (1u << R0) | (1u << R1) | (1u << R2) | (1u << R3));
-      int rr = rr_alloc.reg;
-      ot_check(th_ldr_reg(tmp, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-      restore_scratch_reg(&rr_alloc);
-    }
-    tcc_gen_machine_store_to_sp(tmp, dst_off + copied);
-    copied += 4;
-  }
-
-  /* Tail bytes */
-  if (copied < size)
-  {
-    for (; copied < size; ++copied)
-    {
-      if (!load_ubyte_from_base(tmp, base, copied, 0))
-      {
-        ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(
-            copied, 0, (1u << tmp) | (1u << base) | (1u << R_SP) | (1u << R0) | (1u << R1) | (1u << R2) | (1u << R3));
-        int rr = rr_alloc.reg;
-        ot_check(th_ldrb_reg(tmp, base, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-        restore_scratch_reg(&rr_alloc);
-      }
-      /* store byte tmp -> [sp + dst_off + copied] */
-      const int off = dst_off + copied;
-      if (!ot(th_strb_imm(tmp, R_SP, off, 6, ENFORCE_ENCODING_NONE)))
-      {
-        ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(
-            off, 0, (1u << tmp) | (1u << R_SP) | (1u << base) | (1u << R0) | (1u << R1) | (1u << R2) | (1u << R3));
-        int rr = rr_alloc.reg;
-        ot_check(th_strb_reg(tmp, R_SP, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-        restore_scratch_reg(&rr_alloc);
-      }
-    }
-  }
-
-  /* Zero-pad to slot size */
-  if (slot_sz > size)
-  {
-    ot_check(th_eor_reg(tmp, tmp, tmp, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-    for (int off = size; off < slot_sz; ++off)
-    {
-      const int sp_off = dst_off + off;
-      if (!ot(th_strb_imm(tmp, R_SP, sp_off, 6, ENFORCE_ENCODING_NONE)))
-      {
-        ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(
-            sp_off, 0, (1u << tmp) | (1u << R_SP) | (1u << base) | (1u << R0) | (1u << R1) | (1u << R2) | (1u << R3));
-        int rr = rr_alloc.reg;
-        ot_check(th_strb_reg(tmp, R_SP, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-        restore_scratch_reg(&rr_alloc);
-      }
-    }
-  }
-
-  tcc_machine_release_scratch(&scratch);
-}
-
 /* Load a 32-bit immediate value or symbol address into a register.
  * Uses th_generic_mov_imm if possible (pure immediates only), otherwise loads from literal pool.
  * reg: target register
@@ -6548,7 +5178,7 @@ typedef struct ThumbArgMove
   Sym *sym;              /* valid when kind==THUMB_ARG_MOVE_IMM */
   int local_offset;      /* valid when kind==THUMB_ARG_MOVE_LOCAL_ADDR */
   int local_is_param;    /* valid when kind==THUMB_ARG_MOVE_LOCAL_ADDR - if true, add offset_to_args */
-  SValue lval_sv;        /* valid when kind==THUMB_ARG_MOVE_LVAL */
+  IROperand lval_op;     /* valid when kind==THUMB_ARG_MOVE_LVAL/STRUCT */
   int struct_word_count; /* valid when kind==THUMB_ARG_MOVE_STRUCT */
 } ThumbArgMove;
 
@@ -6557,7 +5187,7 @@ typedef struct CallGenContext
 {
   ThumbGenCallSite *call_site;
   TCCAbiCallLayout *layout;
-  SValue *args;
+  IROperand *args;
   int argc;
   int stack_size;
 } CallGenContext;
@@ -6583,48 +5213,25 @@ static void thumb_emit_arg_move(const ThumbArgMove *m)
   if (m->kind == THUMB_ARG_MOVE_LVAL)
   {
     /* Load value from memory (lvalue) */
-    SValue sv_copy = m->lval_sv;
+    IROperand op = m->lval_op;
     /* Use dst_reg_hi for 64-bit types (double, long long) */
-    const int hi_reg = (tcc_is_64bit_type(sv_copy.type.t) && m->dst_reg_hi != 0) ? m->dst_reg_hi : PREG_NONE;
-    tcc_machine_load_to_reg(m->dst_reg, hi_reg, &sv_copy);
+    const int hi_reg = (irop_is_64bit(op) && m->dst_reg_hi != PREG_REG_NONE) ? m->dst_reg_hi : PREG_NONE;
+    load_to_reg_ir(m->dst_reg, hi_reg, op);
     return;
   }
 
   if (m->kind == THUMB_ARG_MOVE_STRUCT)
   {
     /* Load struct words into consecutive registers.
-     * The lval_sv contains the struct address. */
-    SValue sv_copy = m->lval_sv;
+     * The lval_op contains the struct address. */
+    IROperand op = m->lval_op;
     int word_count = m->struct_word_count;
     int base_dst = m->dst_reg;
 
     /* Get the struct base address into a scratch register */
     int base_addr_reg = ARM_R12;
 
-    if ((sv_copy.r & VT_VALMASK) == VT_LOCAL)
-    {
-      /* Local struct - compute FP + offset */
-      int local_off = (int)sv_copy.c.i;
-      int is_param = (sv_copy.r & VT_PARAM) ? 1 : 0;
-      tcc_machine_addr_of_stack_slot(base_addr_reg, local_off, is_param);
-    }
-    else if ((sv_copy.r & VT_VALMASK) == VT_CONST && (sv_copy.r & VT_SYM))
-    {
-      /* Global struct */
-      load_immediate(base_addr_reg, (uint32_t)sv_copy.c.i, sv_copy.sym, false);
-    }
-    else if (sv_copy.pr0_reg != PREG_REG_NONE && !sv_copy.pr0_spilled)
-    {
-      /* Address already in a register */
-      base_addr_reg = sv_copy.pr0_reg;
-    }
-    else
-    {
-      /* Fallback: try to compute struct address */
-      SValue addr_sv = sv_copy;
-      addr_sv.r &= ~VT_LVAL; /* we want the address, not the value */
-      tcc_machine_load_to_reg(base_addr_reg, PREG_NONE, &addr_sv);
-    }
+    base_addr_reg = get_struct_base_addr(&op, base_addr_reg);
 
     /* Load each word from the struct into consecutive target registers */
     for (int w = 0; w < word_count; ++w)
@@ -6791,17 +5398,39 @@ static void store_word_to_stack_safe(int src_reg, int stack_offset, int base_add
 }
 
 /* Get struct base address into a register */
-static int get_struct_base_addr(const SValue *arg, int default_reg)
+static int get_struct_base_addr(const IROperand *arg, int default_reg)
 {
   int base_addr_reg = default_reg;
 
-  if ((arg->r & VT_VALMASK) == VT_LOCAL)
+  const int tag = irop_get_tag(*arg);
+
+  if (tag == IROP_TAG_STACKOFF && arg->is_local)
   {
-    tcc_machine_addr_of_stack_slot(base_addr_reg, (int)arg->c.i, (arg->r & VT_PARAM) ? 1 : 0);
+    int local_off = arg->u.imm32;
+    if (arg->is_param && local_off >= 0)
+      local_off += offset_to_args;
+
+    if (arg->is_llocal)
+    {
+      int sign = (local_off < 0);
+      int abs_off = sign ? -local_off : local_off;
+      if (!load_word_from_base(base_addr_reg, ARM_R7, abs_off, sign))
+      {
+        load_immediate(base_addr_reg, local_off, NULL, false);
+        ot_check(th_ldr_reg(base_addr_reg, ARM_R7, base_addr_reg, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+      }
+    }
+    else
+    {
+      tcc_machine_addr_of_stack_slot(base_addr_reg, local_off, arg->is_param ? 1 : 0);
+    }
   }
-  else if ((arg->r & VT_VALMASK) == VT_CONST && (arg->r & VT_SYM))
+  else if (tag == IROP_TAG_SYMREF)
   {
-    load_immediate(base_addr_reg, (uint32_t)arg->c.i, arg->sym, false);
+    IRPoolSymref *symref = irop_get_symref_ex(tcc_state->ir, *arg);
+    Sym *sym = symref ? symref->sym : NULL;
+    int32_t addend = symref ? symref->addend : 0;
+    load_immediate(base_addr_reg, (uint32_t)addend, sym, false);
   }
   else if (arg->pr0_reg != PREG_REG_NONE && !arg->pr0_spilled)
   {
@@ -6809,16 +5438,16 @@ static int get_struct_base_addr(const SValue *arg, int default_reg)
   }
   else
   {
-    SValue addr_sv = *arg;
-    addr_sv.r &= ~VT_LVAL;
-    tcc_machine_load_to_reg(base_addr_reg, PREG_NONE, &addr_sv);
+    IROperand addr_op = *arg;
+    addr_op.is_lval = 0;
+    load_to_reg_ir(base_addr_reg, PREG_NONE, addr_op);
   }
 
   return base_addr_reg;
 }
 
 /* Build register move for a struct argument */
-static int build_reg_move_struct(ThumbArgMove *moves, int move_count, const SValue *arg, const TCCAbiArgLoc *loc,
+static int build_reg_move_struct(ThumbArgMove *moves, int move_count, const IROperand *arg, const TCCAbiArgLoc *loc,
                                  int base_reg, ThumbGenCallSite *call_site)
 {
   int words = loc->reg_count;
@@ -6827,7 +5456,7 @@ static int build_reg_move_struct(ThumbArgMove *moves, int move_count, const SVal
     moves[move_count++] = (ThumbArgMove){
         .kind = THUMB_ARG_MOVE_STRUCT,
         .dst_reg = base_reg,
-        .lval_sv = *arg,
+        .lval_op = *arg,
         .struct_word_count = words,
     };
   }
@@ -6837,13 +5466,13 @@ static int build_reg_move_struct(ThumbArgMove *moves, int move_count, const SVal
 }
 
 /* Build register move for a 64-bit argument */
-static int build_reg_move_64bit(ThumbArgMove *moves, int move_count, const SValue *arg, int base_reg,
+static int build_reg_move_64bit(ThumbArgMove *moves, int move_count, const IROperand *arg, int base_reg,
                                 ThumbGenCallSite *call_site)
 {
-  if (arg->r & VT_LVAL)
+  if (arg->is_lval)
   {
     moves[move_count++] =
-        (ThumbArgMove){.kind = THUMB_ARG_MOVE_LVAL, .dst_reg = base_reg, .dst_reg_hi = base_reg + 1, .lval_sv = *arg};
+        (ThumbArgMove){.kind = THUMB_ARG_MOVE_LVAL, .dst_reg = base_reg, .dst_reg_hi = base_reg + 1, .lval_op = *arg};
   }
   else if (arg->pr0_reg != PREG_REG_NONE && arg->pr1_reg != PREG_REG_NONE)
   {
@@ -6853,15 +5482,16 @@ static int build_reg_move_64bit(ThumbArgMove *moves, int move_count, const SValu
       moves[move_count++] =
           (ThumbArgMove){.kind = THUMB_ARG_MOVE_REG, .dst_reg = base_reg + 1, .src_reg = arg->pr1_reg};
   }
-  else if ((arg->r & VT_VALMASK) == VT_CONST)
+  else if (irop_is_immediate(*arg))
   {
-    moves[move_count++] = (ThumbArgMove){
-        .kind = THUMB_ARG_MOVE_IMM64, .dst_reg = base_reg, .dst_reg_hi = base_reg + 1, .imm64 = arg->c.i};
+    const uint64_t imm64 = (uint64_t)irop_get_imm64_ex(tcc_state->ir, *arg);
+    moves[move_count++] =
+        (ThumbArgMove){.kind = THUMB_ARG_MOVE_IMM64, .dst_reg = base_reg, .dst_reg_hi = base_reg + 1, .imm64 = imm64};
   }
   else
   {
     moves[move_count++] =
-        (ThumbArgMove){.kind = THUMB_ARG_MOVE_LVAL, .dst_reg = base_reg, .dst_reg_hi = base_reg + 1, .lval_sv = *arg};
+        (ThumbArgMove){.kind = THUMB_ARG_MOVE_LVAL, .dst_reg = base_reg, .dst_reg_hi = base_reg + 1, .lval_op = *arg};
   }
 
   call_site->registers_map |= (1 << base_reg) | (1 << (base_reg + 1));
@@ -6869,35 +5499,41 @@ static int build_reg_move_64bit(ThumbArgMove *moves, int move_count, const SValu
 }
 
 /* Build register move for a 32-bit argument */
-static int build_reg_move_32bit(ThumbArgMove *moves, int move_count, const SValue *arg, int base_reg,
+static int build_reg_move_32bit(ThumbArgMove *moves, int move_count, const IROperand *arg, int base_reg,
                                 ThumbGenCallSite *call_site)
 {
-  if (arg->r & VT_LVAL)
+  if (arg->is_lval)
   {
-    moves[move_count++] = (ThumbArgMove){.kind = THUMB_ARG_MOVE_LVAL, .dst_reg = base_reg, .lval_sv = *arg};
+    moves[move_count++] = (ThumbArgMove){.kind = THUMB_ARG_MOVE_LVAL, .dst_reg = base_reg, .lval_op = *arg};
   }
   else if (arg->pr0_reg != PREG_REG_NONE && !arg->pr0_spilled)
   {
     if (arg->pr0_reg != base_reg)
       moves[move_count++] = (ThumbArgMove){.kind = THUMB_ARG_MOVE_REG, .dst_reg = base_reg, .src_reg = arg->pr0_reg};
   }
-  else if ((arg->r & VT_VALMASK) == VT_CONST)
+  else if (irop_get_tag(*arg) == IROP_TAG_SYMREF)
   {
-    moves[move_count++] = (ThumbArgMove){.kind = THUMB_ARG_MOVE_IMM,
-                                         .dst_reg = base_reg,
-                                         .imm = (uint32_t)arg->c.i,
-                                         .sym = (arg->r & VT_SYM) ? arg->sym : NULL};
+    IRPoolSymref *symref = irop_get_symref_ex(tcc_state->ir, *arg);
+    Sym *sym = symref ? symref->sym : NULL;
+    int32_t addend = symref ? symref->addend : 0;
+    moves[move_count++] =
+        (ThumbArgMove){.kind = THUMB_ARG_MOVE_IMM, .dst_reg = base_reg, .imm = (uint32_t)addend, .sym = sym};
   }
-  else if ((arg->r & VT_VALMASK) == VT_LOCAL && !(arg->r & VT_LVAL))
+  else if (irop_get_tag(*arg) == IROP_TAG_IMM32)
+  {
+    moves[move_count++] =
+        (ThumbArgMove){.kind = THUMB_ARG_MOVE_IMM, .dst_reg = base_reg, .imm = (uint32_t)arg->u.imm32, .sym = NULL};
+  }
+  else if (irop_get_tag(*arg) == IROP_TAG_STACKOFF && arg->is_local && !arg->is_lval)
   {
     moves[move_count++] = (ThumbArgMove){.kind = THUMB_ARG_MOVE_LOCAL_ADDR,
                                          .dst_reg = base_reg,
-                                         .local_offset = (int)arg->c.i,
-                                         .local_is_param = (arg->r & VT_PARAM) ? 1 : 0};
+                                         .local_offset = (int)arg->u.imm32,
+                                         .local_is_param = arg->is_param ? 1 : 0};
   }
   else
   {
-    moves[move_count++] = (ThumbArgMove){.kind = THUMB_ARG_MOVE_LVAL, .dst_reg = base_reg, .lval_sv = *arg};
+    moves[move_count++] = (ThumbArgMove){.kind = THUMB_ARG_MOVE_LVAL, .dst_reg = base_reg, .lval_op = *arg};
   }
 
   call_site->registers_map |= (1 << base_reg);
@@ -6905,7 +5541,7 @@ static int build_reg_move_32bit(ThumbArgMove *moves, int move_count, const SValu
 }
 
 /* Place a struct argument on stack */
-static void place_stack_arg_struct(const SValue *arg, const TCCAbiArgLoc *loc, int stack_offset)
+static void place_stack_arg_struct(const IROperand *arg, const TCCAbiArgLoc *loc, int stack_offset)
 {
   int words_in_regs = (loc->kind == TCC_ABI_LOC_REG_STACK) ? loc->reg_count : 0;
   int struct_src_offset = words_in_regs * 4;
@@ -6931,15 +5567,15 @@ static void place_stack_arg_struct(const SValue *arg, const TCCAbiArgLoc *loc, i
 }
 
 /* Place a 64-bit argument on stack */
-static void place_stack_arg_64bit(const SValue *arg, int stack_offset)
+static void place_stack_arg_64bit(const IROperand *arg, int stack_offset)
 {
   int lo_offset = stack_offset;
   int hi_offset = stack_offset + 4;
 
-  if (arg->r & VT_LVAL)
+  if (arg->is_lval)
   {
-    SValue sv_copy = *arg;
-    tcc_machine_load_to_reg(ARM_R12, ARM_LR, &sv_copy);
+    IROperand op = *arg;
+    load_to_reg_ir(ARM_R12, ARM_LR, op);
     store_word_to_stack_safe(ARM_R12, lo_offset, ARM_R12);
     store_word_to_stack_safe(ARM_LR, hi_offset, ARM_R12);
   }
@@ -6948,33 +5584,34 @@ static void place_stack_arg_64bit(const SValue *arg, int stack_offset)
     store_word_to_stack(arg->pr0_reg, lo_offset);
     store_word_to_stack(arg->pr1_reg, hi_offset);
   }
-  else if ((arg->r & VT_VALMASK) == VT_CONST)
+  else if (irop_is_immediate(*arg))
   {
-    load_immediate(ARM_R12, (uint32_t)arg->c.i, NULL, false);
+    uint64_t imm64 = (uint64_t)irop_get_imm64_ex(tcc_state->ir, *arg);
+    load_immediate(ARM_R12, (uint32_t)imm64, NULL, false);
     store_word_to_stack(ARM_R12, lo_offset);
-    load_immediate(ARM_R12, (uint32_t)(arg->c.i >> 32), NULL, false);
+    load_immediate(ARM_R12, (uint32_t)(imm64 >> 32), NULL, false);
     store_word_to_stack(ARM_R12, hi_offset);
   }
   else
   {
-    SValue sv_copy = *arg;
-    tcc_machine_load_to_reg(ARM_R12, ARM_LR, &sv_copy);
+    IROperand op = *arg;
+    load_to_reg_ir(ARM_R12, ARM_LR, op);
     store_word_to_stack_safe(ARM_R12, lo_offset, ARM_R12);
     store_word_to_stack_safe(ARM_LR, hi_offset, ARM_R12);
   }
 }
 
 /* Helper to compute local offset with parameter adjustment */
-static int compute_local_offset(const SValue *arg)
+static int compute_local_offset(const IROperand *arg)
 {
-  int local_off = (int)arg->c.i;
-  if ((arg->r & VT_PARAM) && local_off >= 0)
+  int local_off = (int)arg->u.imm32;
+  if (arg->is_param && local_off >= 0)
     local_off += offset_to_args;
   return local_off;
 }
 
 /* Place a 32-bit argument on stack */
-static void place_stack_arg_32bit(const SValue *arg, int stack_offset)
+static void place_stack_arg_32bit(const IROperand *arg, int stack_offset)
 {
   if (arg->pr0_reg != PREG_REG_NONE && !arg->pr0_spilled)
   {
@@ -6983,27 +5620,37 @@ static void place_stack_arg_32bit(const SValue *arg, int stack_offset)
       return;
 
     int src_reg = arg->pr0_reg;
-    if (arg->r & VT_LVAL)
+    if (arg->is_lval)
     {
       ot_check(th_ldr_imm(ARM_R12, src_reg, 0, 6, ENFORCE_ENCODING_NONE));
       src_reg = ARM_R12;
     }
     store_word_to_stack(src_reg, stack_offset);
   }
-  else if ((arg->r & VT_VALMASK) == VT_CONST)
+  else if (irop_get_tag(*arg) == IROP_TAG_SYMREF)
   {
-    load_immediate(ARM_R12, (uint32_t)arg->c.i, (arg->r & VT_SYM) ? arg->sym : NULL, false);
-    if (arg->r & VT_LVAL)
+    IRPoolSymref *symref = irop_get_symref_ex(tcc_state->ir, *arg);
+    Sym *sym = symref ? symref->sym : NULL;
+    int32_t addend = symref ? symref->addend : 0;
+    load_immediate(ARM_R12, (uint32_t)addend, sym, false);
+    if (arg->is_lval)
       ot_check(th_ldr_imm(ARM_R12, ARM_R12, 0, 6, ENFORCE_ENCODING_NONE));
     store_word_to_stack(ARM_R12, stack_offset);
   }
-  else if ((arg->r & VT_VALMASK) == VT_LOCAL)
+  else if (irop_get_tag(*arg) == IROP_TAG_IMM32)
+  {
+    load_immediate(ARM_R12, (uint32_t)arg->u.imm32, NULL, false);
+    if (arg->is_lval)
+      ot_check(th_ldr_imm(ARM_R12, ARM_R12, 0, 6, ENFORCE_ENCODING_NONE));
+    store_word_to_stack(ARM_R12, stack_offset);
+  }
+  else if (irop_get_tag(*arg) == IROP_TAG_STACKOFF && arg->is_local && !arg->is_llocal)
   {
     int local_off = compute_local_offset(arg);
     int local_sign = (local_off < 0);
     int local_abs = local_sign ? -local_off : local_off;
 
-    if (arg->r & VT_LVAL)
+    if (arg->is_lval)
     {
       if (!load_word_from_base(ARM_R12, ARM_R7, local_abs, local_sign))
       {
@@ -7022,7 +5669,7 @@ static void place_stack_arg_32bit(const SValue *arg, int stack_offset)
     }
     store_word_to_stack(ARM_R12, stack_offset);
   }
-  else if ((arg->r & VT_VALMASK) == VT_LLOCAL)
+  else if (irop_get_tag(*arg) == IROP_TAG_STACKOFF && arg->is_llocal)
   {
     int local_off = compute_local_offset(arg);
     int local_sign = (local_off < 0);
@@ -7033,14 +5680,14 @@ static void place_stack_arg_32bit(const SValue *arg, int stack_offset)
       load_immediate(ARM_R12, local_off, NULL, false);
       ot_check(th_ldr_reg(ARM_R12, ARM_R7, ARM_R12, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     }
-    if (arg->r & VT_LVAL)
+    if (arg->is_lval)
       ot_check(th_ldr_imm(ARM_R12, ARM_R12, 0, 6, ENFORCE_ENCODING_NONE));
     store_word_to_stack(ARM_R12, stack_offset);
   }
   else
   {
-    SValue tmp_sv = *arg;
-    tcc_machine_load_to_reg(ARM_R12, -1, &tmp_sv);
+    IROperand op = *arg;
+    load_to_reg_ir(ARM_R12, PREG_NONE, op);
     store_word_to_stack(ARM_R12, stack_offset);
   }
 }
@@ -7053,16 +5700,16 @@ static int build_register_arg_moves(CallGenContext *ctx, ThumbArgMove *reg_moves
   for (int i = 0; i < ctx->argc; ++i)
   {
     const TCCAbiArgLoc *loc = &ctx->layout->locs[i];
-    const SValue *arg = &ctx->args[i];
-    const int bt = arg->type.t & VT_BTYPE;
-    const int is_64bit = tcc_is_64bit_type(arg->type.t);
+    const IROperand *arg = &ctx->args[i];
+    const int bt = irop_get_btype(*arg);
+    const int is_64bit = irop_is_64bit(*arg);
 
     if (loc->kind != TCC_ABI_LOC_REG && loc->kind != TCC_ABI_LOC_REG_STACK)
       continue;
 
     int base_reg = ARM_R0 + loc->reg_base;
 
-    if (bt == VT_STRUCT)
+    if (bt == IROP_BTYPE_STRUCT)
     {
       move_count = build_reg_move_struct(reg_moves, move_count, arg, loc, base_reg, ctx->call_site);
     }
@@ -7087,12 +5734,12 @@ static void presave_stack_args_from_arg_regs(CallGenContext *ctx)
   for (int i = 0; i < ctx->argc; ++i)
   {
     const TCCAbiArgLoc *loc = &ctx->layout->locs[i];
-    const SValue *arg = &ctx->args[i];
-    const int bt = arg->type.t & VT_BTYPE;
+    const IROperand *arg = &ctx->args[i];
+    const int bt = irop_get_btype(*arg);
 
     if (loc->kind == TCC_ABI_LOC_REG)
       continue;
-    if (bt == VT_STRUCT || tcc_is_64bit_type(arg->type.t))
+    if (bt == IROP_BTYPE_STRUCT || irop_is_64bit(*arg))
       continue;
 
     if (arg->pr0_reg != PREG_REG_NONE && !arg->pr0_spilled && arg->pr0_reg <= ARM_R3)
@@ -7108,16 +5755,16 @@ static void place_stack_arguments(CallGenContext *ctx)
   for (int i = 0; i < ctx->argc; ++i)
   {
     const TCCAbiArgLoc *loc = &ctx->layout->locs[i];
-    const SValue *arg = &ctx->args[i];
-    const int bt = arg->type.t & VT_BTYPE;
-    const int is_64bit = tcc_is_64bit_type(arg->type.t);
+    const IROperand *arg = &ctx->args[i];
+    const int bt = irop_get_btype(*arg);
+    const int is_64bit = irop_is_64bit(*arg);
 
     if (loc->kind == TCC_ABI_LOC_REG)
       continue;
 
     int stack_offset = loc->stack_off;
 
-    if (bt == VT_STRUCT)
+    if (bt == IROP_BTYPE_STRUCT)
       place_stack_arg_struct(arg, loc, stack_offset);
     else if (is_64bit)
       place_stack_arg_64bit(arg, stack_offset);
@@ -7127,21 +5774,21 @@ static void place_stack_arguments(CallGenContext *ctx)
 }
 
 /* Handle return value after call */
-static void handle_return_value(SValue *dest, int drop_value)
+static void handle_return_value(IROperand dest, int drop_value)
 {
   if (drop_value)
     return;
 
-  if (dest->pr0_reg != PREG_REG_NONE && dest->pr0_reg != ARM_R0)
+  if (dest.pr0_reg != PREG_REG_NONE && dest.pr0_reg != ARM_R0)
   {
-    ot_check(th_mov_reg(dest->pr0_reg, ARM_R0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                        ENFORCE_ENCODING_NONE, false));
+    ot_check(th_mov_reg(dest.pr0_reg, ARM_R0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE,
+                        false));
   }
 
-  if (tcc_is_64bit_type(dest->type.t) && dest->pr1_reg != PREG_REG_NONE && dest->pr1_reg != ARM_R1)
+  if (irop_is_64bit(dest) && dest.pr1_reg != PREG_REG_NONE && dest.pr1_reg != ARM_R1)
   {
-    ot_check(th_mov_reg(dest->pr1_reg, ARM_R1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                        ENFORCE_ENCODING_NONE, false));
+    ot_check(th_mov_reg(dest.pr1_reg, ARM_R1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE,
+                        false));
   }
 }
 
@@ -7154,6 +5801,9 @@ ST_FUNC void tcc_gen_machine_func_call_op(SValue *func_target, SValue *call_id_s
   if (!call_id_sv || !ir)
     tcc_error("compiler_error: func_call_op requires call_id_sv+ir");
 
+  const IROperand func_target_ir = svalue_to_iroperand(tcc_state->ir, func_target);
+  const IROperand dest_ir = svalue_to_iroperand(tcc_state->ir, dest);
+
   const int call_id = TCCIR_DECODE_CALL_ID(call_id_sv->c.i);
   const int argc_hint = TCCIR_DECODE_CALL_ARGC(call_id_sv->c.i);
 
@@ -7165,7 +5815,7 @@ ST_FUNC void tcc_gen_machine_func_call_op(SValue *func_target, SValue *call_id_s
   TCCAbiCallLayout layout;
   memset(&layout, 0, sizeof(layout));
 
-  SValue *args = NULL;
+  IROperand *args = NULL;
   const int argc = thumb_build_call_layout_from_ir(ir, call_idx, call_id, argc_hint, &layout, &args);
   if (argc < 0)
     tcc_error("compiler_error: failed to build call layout for call_id=%d", call_id);
@@ -7224,7 +5874,7 @@ ST_FUNC void tcc_gen_machine_func_call_op(SValue *func_target, SValue *call_id_s
   place_stack_arguments(&ctx);
 
   /* === Emit call === */
-  gcall_or_jump(0, func_target);
+  gcall_or_jump_ir(0, func_target_ir);
 
   /* Restore scratch register exclusion */
   scratch_global_exclude = saved_scratch_exclude;
@@ -7242,7 +5892,7 @@ ST_FUNC void tcc_gen_machine_func_call_op(SValue *func_target, SValue *call_id_s
     call_site->used_stack_size -= arg_regs_push_count * 4;
   }
 
-  handle_return_value(dest, drop_value);
+  handle_return_value(dest_ir, drop_value);
 
   call_site->registers_map &= ~0x0F; /* Clear R0-R3 */
 
@@ -7265,6 +5915,8 @@ ST_FUNC void tcc_gen_machine_conditional_jump_op(IROperand src, TccIrOp op)
 
 ST_FUNC void tcc_gen_machine_setif_op(IROperand dest, IROperand src, TccIrOp op)
 {
+  if (dest.pr0_reg >= 15)
+    tcc_error("compiler_error: setif_op destination register is invalid (%d)", dest.pr0_reg);
   const int cond = mapcc(src.u.imm32);
   ot_check(th_mov_imm(dest.pr0_reg, 0, FLAGS_BEHAVIOUR_BLOCK, ENFORCE_ENCODING_NONE));
   ot_check(th_it(cond, 0x8)); /* IT <cond> (single instruction) */
@@ -7297,6 +5949,9 @@ ST_FUNC void tcc_gen_machine_bool_op(IROperand dest, IROperand src1, IROperand s
   const int dest_reg = dest.pr0_reg;
   const int src1_reg = src1.pr0_reg;
   const int src2_reg = src2.pr0_reg;
+
+  if (dest_reg >= 15)
+    tcc_error("compiler_error: bool_op destination register is invalid (%d)", dest_reg);
 
   if (op == TCCIR_OP_BOOL_OR)
   {

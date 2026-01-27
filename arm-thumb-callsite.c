@@ -81,11 +81,11 @@ ThumbGenCallSite *thumb_get_call_site_for_id(int call_id)
 /* Build ABI call layout from IR instructions for a given call_id.
  * Scans backwards from call_idx to find all FUNCPARAMVAL operations for this call.
  * argc_hint: if >= 0, use this as the known argument count (from FUNCCALL encoding).
- * out_args: if non-NULL, will be allocated and filled with argument SValues.
+ * out_args: if non-NULL, will be allocated and filled with argument IROperands.
  * Returns the number of arguments found, or -1 on error.
  */
 int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, int argc_hint, TCCAbiCallLayout *layout,
-                                    SValue **out_args)
+                                    IROperand **out_args)
 {
   if (!ir || !layout || call_idx < 0)
     return -1;
@@ -97,7 +97,7 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, i
   uint8_t inline_found[MAX_INLINE_ARGS];
   TCCAbiArgDesc *arg_descs = NULL;
   uint8_t *found = NULL;
-  SValue *args = NULL;
+  IROperand *args = NULL;
 
   /* If argc_hint is provided and valid, use it directly (O(argc) scan only).
    * Otherwise, fall back to scanning to find max_arg_index (O(n) scan). */
@@ -116,10 +116,10 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, i
       if (p->op == TCCIR_OP_FUNCPARAMVAL)
       {
         const SValue *src2 = tcc_ir_get_src2(ir, j);
-        int param_call_id = src2 ? TCCIR_DECODE_CALL_ID(src2->c.i) : -1;
+        int param_call_id = src2 ? TCCIR_DECODE_CALL_ID((uint32_t)src2->c.i) : -1;
         if (param_call_id == call_id)
         {
-          int param_idx = TCCIR_DECODE_PARAM_IDX(src2->c.i);
+          int param_idx = src2 ? TCCIR_DECODE_PARAM_IDX((uint32_t)src2->c.i) : -1;
           if (param_idx > max_arg_index)
             max_arg_index = param_idx;
         }
@@ -153,10 +153,10 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, i
     found = (uint8_t *)tcc_mallocz(sizeof(uint8_t) * argc);
   }
 
-  /* Allocate args array if caller wants SValues */
+  /* Allocate args array if caller wants IROperands */
   if (out_args)
   {
-    args = (SValue *)tcc_mallocz(sizeof(SValue) * argc);
+    args = (IROperand *)tcc_mallocz(sizeof(IROperand) * argc);
   }
 
   /* Single scan to collect both parameter type info AND SValues */
@@ -167,42 +167,44 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, i
     if (p->op == TCCIR_OP_FUNCPARAMVAL)
     {
       const SValue *src2 = tcc_ir_get_src2(ir, j);
-      int param_call_id = src2 ? TCCIR_DECODE_CALL_ID(src2->c.i) : -1;
+      int param_call_id = src2 ? TCCIR_DECODE_CALL_ID((uint32_t)src2->c.i) : -1;
       if (param_call_id == call_id)
       {
-        const SValue *src1 = tcc_ir_get_src1(ir, j);
-        int param_idx = TCCIR_DECODE_PARAM_IDX(src2->c.i);
+        const IROperand src1_irop = tcc_ir_get_src1_irop(ir, j);
+        const SValue *src1_sv = tcc_ir_get_src1(ir, j);
+        int param_idx = src2 ? TCCIR_DECODE_PARAM_IDX((uint32_t)src2->c.i) : -1;
         if (param_idx >= 0 && param_idx < argc && !found[param_idx])
         {
-          /* Collect SValue if requested */
+          /* Collect IROperand if requested */
           if (args)
           {
-            if (src1)
-            {
-              args[param_idx] = *src1;
-            }
+            if (src1_sv)
+              args[param_idx] = svalue_to_iroperand(ir, src1_sv);
             else
-            {
-              svalue_init(&args[param_idx]);
-              args[param_idx].vr = -1;
-            }
+              args[param_idx] = src1_irop;
           }
 
           /* Determine argument type and size */
-          const int bt = src1->type.t & VT_BTYPE;
+          if (!src1_sv)
+          {
+            tcc_error("compiler_error: FUNCPARAMVAL missing src1 for call_id=%d arg=%d", call_id, param_idx);
+            goto cleanup_error;
+          }
+
+          const int bt = src1_sv->type.t & VT_BTYPE;
           int size = 0;
           int align = 0;
 
           if (bt == VT_STRUCT)
           {
-            size = type_size(&src1->type, &align);
+            size = type_size(&src1_sv->type, &align);
             if (align < 1)
               align = 1;
             arg_descs[param_idx].kind = TCC_ABI_ARG_STRUCT_BYVAL;
             arg_descs[param_idx].size = (uint16_t)size;
             arg_descs[param_idx].alignment = (uint8_t)align;
           }
-          else if (tcc_is_64bit_type(src1->type.t))
+          else if (tcc_is_64bit_type(src1_sv->type.t))
           {
             arg_descs[param_idx].kind = TCC_ABI_ARG_SCALAR64;
             arg_descs[param_idx].size = 8;

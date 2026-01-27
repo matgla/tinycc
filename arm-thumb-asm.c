@@ -29,6 +29,11 @@
 
 #include "arm-thumb-opcodes.h"
 #include "tcc.h"
+#include "tccir.h"
+
+/* Forward declarations for IR-based load/store from arm-thumb-gen.c */
+void load_to_dest_ir(IROperand dest, IROperand src);
+void store_ir(int r, IROperand sv);
 
 enum
 {
@@ -306,20 +311,32 @@ ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands, int nb_outputs,
         {
           if (!op->is_memory)
           {
-            SValue sv;
-            sv = *op->vt;
-            sv.r = (sv.r & ~VT_VALMASK) | VT_LOCAL;
-            sv.type.t = VT_PTR;
-            tcc_machine_load_to_reg(out_reg, -1, &sv);
+            IROperand ir_op = svalue_to_iroperand(tcc_state->ir, op->vt);
 
-            sv = *op->vt;
-            sv.r = (sv.r & ~VT_VALMASK) | out_reg;
-            store(op->reg, &sv);
+            /* Load pointer from LOCAL stack slot into out_reg.
+               Change LLOCAL->LOCAL and set btype to PTR (INT32). */
+            IROperand addr = ir_op;
+            addr.is_llocal = 0;
+            addr.btype = IROP_BTYPE_INT32;
+            IROperand dest = irop_make_none();
+            dest.pr0_reg = out_reg;
+            dest.pr0_spilled = 0;
+            dest.btype = addr.btype;
+            load_to_dest_ir(dest, addr);
+
+            /* Store op->reg through the pointer now in out_reg */
+            IROperand store_dest = irop_make_vreg(irop_get_vreg(ir_op), irop_get_btype(ir_op));
+            store_dest.is_lval = ir_op.is_lval;
+            store_dest.is_unsigned = ir_op.is_unsigned;
+            store_dest.pr0_reg = out_reg;
+            store_dest.pr0_spilled = 0;
+            store_ir(op->reg, store_dest);
           }
         }
         else
         {
-          store(op->reg, op->vt);
+          IROperand ir_op = svalue_to_iroperand(tcc_state->ir, op->vt);
+          store_ir(op->reg, ir_op);
           if (op->is_llong)
             tcc_error("long long not implemented");
         }

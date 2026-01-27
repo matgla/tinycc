@@ -181,7 +181,6 @@ static int is_compatible_unqualified_types(CType *type1, CType *type2);
 static inline int64_t expr_const64(void);
 static void vpush64(int ty, unsigned long long v);
 static void vpush(CType *type);
-static int gvtst(int inv, int t);
 static void gen_inline_functions(TCCState *s);
 static void free_inline_functions(TCCState *s);
 static void skip_or_save_block(TokenString **str);
@@ -212,18 +211,6 @@ static int gind()
   if (debug_modes)
     tcc_tcov_block_begin(tcc_state);
   return t;
-}
-
-/* Set 'nocode_wanted' after unconditional (backwards) jump */
-static void gjmp_addr_acs(int t)
-{
-  SValue dest;
-  svalue_init(&dest);
-  dest.vr = -1;
-  dest.c.i = t;
-  tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
-  // gjmp_addr(t);
-  CODE_OFF();
 }
 
 /* Set 'nocode_wanted' after unconditional (forwards) jump */
@@ -3863,39 +3850,6 @@ static void gen_cvt_itof1(int t)
   else
   {
     gen_cvt_itof(t);
-  }
-}
-#endif
-
-#if defined TCC_TARGET_ARM64 || defined TCC_TARGET_RISCV64
-#define gen_cvt_ftoi1 gen_cvt_ftoi
-#else
-/* generic ftoi for unsigned long long case */
-static void gen_cvt_ftoi1(int t)
-{
-  int st;
-  if (t == (VT_LLONG | VT_UNSIGNED))
-  {
-    /* not handled natively */
-    st = vtop->type.t & VT_BTYPE;
-    if (st == VT_FLOAT)
-      vpush_helper_func(TOK___fixunssfdi);
-#if LDOUBLE_SIZE != 8
-    else if (st == VT_LDOUBLE)
-      vpush_helper_func(TOK___fixunsxfdi);
-#endif
-    else
-      vpush_helper_func(TOK___fixunsdfdi);
-    vrott(2);
-    // gfunc_call(1);
-    tcc_error("4 implement me");
-    vpushi(0);
-    PUT_R_RET(vtop, t);
-  }
-  else
-  {
-    // gen_cvt_ftoi(t);
-    tcc_error("5 implement me");
   }
 }
 #endif

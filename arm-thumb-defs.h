@@ -205,14 +205,14 @@ extern ThumbGeneratorState thumb_gen_state;
 /* Forward declarations for types from other headers */
 typedef struct TCCIRState TCCIRState;
 typedef struct TCCAbiCallLayout TCCAbiCallLayout;
-typedef struct SValue SValue;
+typedef struct IROperand IROperand;
 
 /* Call site management functions */
 ST_FUNC void thumb_free_call_sites(void);
 ST_FUNC ThumbGenCallSite *thumb_get_or_create_call_site(int call_id);
 ST_FUNC ThumbGenCallSite *thumb_get_call_site_for_id(int call_id);
 ST_FUNC int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, int argc_hint,
-                                            TCCAbiCallLayout *layout, SValue **out_args);
+                                            TCCAbiCallLayout *layout, IROperand **out_args);
 
 ST_FUNC void g(int c);
 ST_FUNC void gen_le16(int c);
