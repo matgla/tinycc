@@ -182,6 +182,8 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, i
               args[param_idx] = svalue_to_iroperand(ir, src1_sv);
             else
               args[param_idx] = src1_irop;
+            /* Apply register allocation to the operand */
+            tcc_ir_fill_registers_ir(ir, &args[param_idx]);
           }
 
           /* Determine argument type and size */

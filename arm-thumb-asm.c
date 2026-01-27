@@ -283,16 +283,31 @@ ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands, int nb_outputs,
         {
           /* memory reference case (for both input and
              output cases) */
-          SValue sv;
-          sv = *op->vt;
-          sv.r = (sv.r & ~VT_VALMASK) | VT_LOCAL | VT_LVAL;
-          sv.type.t = VT_PTR;
-          tcc_machine_load_to_reg(op->reg, -1, &sv);
+          /* Convert LLOCAL stack slot to a pointer in a LOCAL stack slot.
+            This matches the old SValue rewrite to VT_LOCAL|VT_LVAL with VT_PTR type. */
+          IROperand src = svalue_to_iroperand(tcc_state->ir, op->vt);
+          src.is_llocal = 0;
+          src.is_lval = 1;
+          src.btype = IROP_BTYPE_INT32; /* pointers are 32-bit on ARMv8-M */
+          IROperand dest = irop_make_none();
+          dest.pr0_reg = op->reg;
+          dest.pr0_spilled = 0;
+          dest.pr1_reg = PREG_REG_NONE;
+          dest.pr1_spilled = 0;
+          dest.btype = src.btype;
+          load_to_dest_ir(dest, src);
         }
         else if (i >= nb_outputs || op->is_rw)
         { // not write-only
           /* load value in register */
-          tcc_machine_load_to_reg(op->reg, -1, op->vt);
+          IROperand src = svalue_to_iroperand(tcc_state->ir, op->vt);
+          IROperand dest = irop_make_none();
+          dest.pr0_reg = op->reg;
+          dest.pr0_spilled = 0;
+          dest.pr1_reg = PREG_REG_NONE;
+          dest.pr1_spilled = 0;
+          dest.btype = src.btype;
+          load_to_dest_ir(dest, src);
           if (op->is_llong)
             tcc_error("long long not implemented");
         }

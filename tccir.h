@@ -513,7 +513,15 @@ void tcc_ir_start_basic_block(TCCIRState *ir);
 
 /* Machine-independent spill helpers (defined in tccir.c) */
 int tcc_ir_is_spilled(SValue *sv);
+int tcc_ir_is_spilled_ir(const IROperand *op);
 int tcc_ir_is_64bit(int t);
+
+/* IROperand-based materialization functions (defined in tccir.c) */
+void tcc_ir_fill_registers_ir(TCCIRState *ir, IROperand *op);
+void tcc_ir_materialize_value_ir(TCCIRState *ir, IROperand *op, TCCMaterializedValue *result);
+void tcc_ir_materialize_const_to_reg_ir(TCCIRState *ir, IROperand *op, TCCMaterializedValue *result);
+void tcc_ir_materialize_addr_ir(TCCIRState *ir, IROperand *op, TCCMaterializedAddr *result, int dest_reg);
+void tcc_ir_materialize_dest_ir(TCCIRState *ir, IROperand *op, TCCMaterializedDest *result);
 
 /* Machine-dependent spill handling (defined in machine-specific code, e.g., arm-thumb-gen.c) */
 

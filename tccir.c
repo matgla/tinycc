@@ -3044,6 +3044,24 @@ static int tcc_ir_materialization_offset(const TCCIRState *ir, const SValue *sv)
   return sv ? sv->c.i : 0;
 }
 
+static const TCCStackSlot *tcc_ir_materialization_slot_ir(const TCCIRState *ir, const IROperand *op)
+{
+  if (!ir || !op)
+    return NULL;
+  const int vreg = irop_get_vreg(*op);
+  if (!tcc_is_vreg_valid((TCCIRState *)ir, vreg))
+    return NULL;
+  return tcc_ir_stack_slot_by_vreg(ir, vreg);
+}
+
+static int tcc_ir_materialization_offset_ir(const TCCIRState *ir, const IROperand *op)
+{
+  const TCCStackSlot *slot = tcc_ir_materialization_slot_ir(ir, op);
+  if (slot)
+    return slot->offset;
+  return op ? (int)irop_get_imm64_ex(ir, *op) : 0;
+}
+
 static void tcc_ir_require_materialization_result(void *ptr, const char *what)
 {
   if (!ptr)
@@ -3388,57 +3406,335 @@ void tcc_ir_materialize_dest(TCCIRState *ir, SValue *dest, TCCMaterializedDest *
   dest->c.i = 0;
 }
 
-static void tcc_ir_storeback_materialized_dest(SValue *dest, TCCMaterializedDest *mat)
+/* ============================================================================
+ * IROperand-based materialization functions
+ * ============================================================================
+ * These operate on IROperand* directly, avoiding SValue conversion.
+ * Since codegen works with local IROperand copies, the release functions
+ * only need to release scratch registers (no state restoration).
+ */
+
+int tcc_ir_is_spilled_ir(const IROperand *op)
+{
+  return (op->pr0_reg == PREG_REG_NONE) || op->pr0_spilled;
+}
+
+void tcc_ir_materialize_value_ir(TCCIRState *ir, IROperand *op, TCCMaterializedValue *result)
+{
+  if (result)
+    memset(result, 0, sizeof(*result));
+
+  if (!ir || !op)
+    return;
+
+  const int vreg = irop_get_vreg(*op);
+
+  if (op->is_param && op->is_local)
+  {
+    /* Stack-passed parameters live in the caller frame. Leave them as
+     * param lvalues so the backend can read directly from the caller stack. */
+    op->pr0_reg = PREG_REG_NONE;
+    op->pr0_spilled = 0;
+    op->pr1_reg = PREG_REG_NONE;
+    op->pr1_spilled = 0;
+    return;
+  }
+
+  /* Register parameters with is_lval: clear is_lval since the register
+   * already holds the value, not a pointer. */
+  if (op->is_param && op->is_lval)
+  {
+    if (!op->is_local && !op->is_llocal)
+    {
+      op->is_lval = 0;
+    }
+  }
+
+  const int is_64bit = irop_is_64bit(*op);
+  const unsigned scratch_flags =
+      (is_64bit ? TCC_MACHINE_SCRATCH_NEEDS_PAIR : 0) | (ir ? ir->codegen_materialize_scratch_flags : 0);
+
+  if (!op->pr0_spilled)
+  {
+    return;
+  }
+  if (!tcc_is_vreg_valid(ir, vreg))
+  {
+    return;
+  }
+
+  if (!op->is_lval && op->is_local)
+  {
+    /* VT_LOCAL without VT_LVAL represents "address of stack location".
+     * Skip materialization - the backend will compute the address directly. */
+    return;
+  }
+
+  tcc_ir_require_materialization_result(result, "materialize_value_ir(spill)");
+
+  const int frame_offset = tcc_ir_materialization_offset_ir(ir, op);
+
+  result->original_pr0 = (op->pr0_spilled ? PREG_SPILLED : 0) | op->pr0_reg;
+  result->original_pr1 = (op->pr1_spilled ? PREG_SPILLED : 0) | op->pr1_reg;
+
+  TCCMachineScratchRegs scratch = {0};
+  tcc_machine_acquire_scratch(&scratch, scratch_flags);
+  if (scratch.reg_count == 0)
+    tcc_error("compiler_error: unable to allocate scratch register for spill load");
+
+  tcc_machine_load_spill_slot(scratch.regs[0], frame_offset);
+  if (is_64bit)
+  {
+    if (scratch.reg_count < 2)
+      tcc_error("compiler_error: missing register pair for 64-bit spill load");
+    tcc_machine_load_spill_slot(scratch.regs[1], frame_offset + 4);
+  }
+
+  /* Once loaded from spill slot, clear local/llocal flags for stack-origin values.
+   * The value is now in a register, not on the stack. */
+  const int was_local = op->is_local;
+  const int was_llocal = op->is_llocal;
+  if (was_local || was_llocal)
+    op->is_lval = 0;
+
+  op->pr0_reg = scratch.regs[0];
+  op->pr0_spilled = 0;
+  if (is_64bit)
+  {
+    op->pr1_reg = scratch.regs[1];
+    op->pr1_spilled = 0;
+  }
+  else
+  {
+    op->pr1_reg = PREG_REG_NONE;
+    op->pr1_spilled = 0;
+  }
+  op->tag = IROP_TAG_VREG;
+  op->is_local = 0;
+  op->is_llocal = 0;
+  op->is_const = 0;
+  op->u.imm32 = 0;
+
+  result->used_scratch = 1;
+  result->is_64bit = is_64bit;
+  result->scratch = scratch;
+}
+
+void tcc_ir_materialize_const_to_reg_ir(TCCIRState *ir, IROperand *op, TCCMaterializedValue *result)
+{
+  if (result)
+    memset(result, 0, sizeof(*result));
+
+  if (!ir || !op)
+    return;
+
+  /* Only handle values that aren't already in a register */
+  if (op->pr0_reg != PREG_REG_NONE && !op->pr0_spilled)
+    return;
+
+  const int tag = irop_get_tag(*op);
+
+  /* Only handle constants (IMM32, I64, F32, F64) - not VREG or STACKOFF */
+  if (tag != IROP_TAG_IMM32 && tag != IROP_TAG_I64 && tag != IROP_TAG_F32 && tag != IROP_TAG_F64)
+    return;
+
+  /* Skip constants with symbols (SYMREF) - those need special handling */
+  if (op->is_sym)
+    return;
+
+  /* Skip constants with lval (memory loads) - those need load_to_dest */
+  if (op->is_lval)
+    return;
+
+  tcc_ir_require_materialization_result(result, "materialize_const_to_reg_ir");
+
+  const int is_64bit = irop_is_64bit(*op);
+  const unsigned scratch_flags =
+      (is_64bit ? TCC_MACHINE_SCRATCH_NEEDS_PAIR : 0) | (ir ? ir->codegen_materialize_scratch_flags : 0);
+
+  result->original_pr0 = (op->pr0_spilled ? PREG_SPILLED : 0) | op->pr0_reg;
+  result->original_pr1 = (op->pr1_spilled ? PREG_SPILLED : 0) | op->pr1_reg;
+
+  TCCMachineScratchRegs scratch = {0};
+  tcc_machine_acquire_scratch(&scratch, scratch_flags);
+  if (scratch.reg_count == 0)
+    tcc_error("compiler_error: unable to allocate scratch register for const-to-reg");
+
+  int64_t val = irop_get_imm64_ex(ir, *op);
+  tcc_machine_load_constant(scratch.regs[0], is_64bit ? scratch.regs[1] : PREG_NONE, val, is_64bit, NULL);
+
+  op->pr0_reg = scratch.regs[0];
+  op->pr0_spilled = 0;
+  if (is_64bit)
+  {
+    op->pr1_reg = scratch.regs[1];
+    op->pr1_spilled = 0;
+  }
+  else
+  {
+    op->pr1_reg = PREG_REG_NONE;
+    op->pr1_spilled = 0;
+  }
+  op->tag = IROP_TAG_VREG;
+  op->is_const = 0;
+  op->u.imm32 = 0;
+
+  result->used_scratch = 1;
+  result->is_64bit = is_64bit;
+  result->scratch = scratch;
+}
+
+void tcc_ir_materialize_addr_ir(TCCIRState *ir, IROperand *op, TCCMaterializedAddr *result, int dest_reg)
+{
+  if (result)
+    memset(result, 0, sizeof(*result));
+
+  if (!ir || !op)
+    return;
+
+  const int wants_stack_address = op->is_local && !op->is_lval;
+  /* Spilled pointer: pr0 must be PREG_SPILLED, NOT PREG_NONE.
+   * Exclude local/llocal from being treated as spilled pointers. */
+  const int is_local_access = op->is_local;
+  const int spilled_pointer = !is_local_access && (op->pr0_reg != PREG_REG_NONE) && op->pr0_spilled;
+
+  if (!wants_stack_address && !spilled_pointer)
+    return;
+
+  /* Optimization: For locals with encodable offsets, skip materialization. */
+  if (wants_stack_address)
+  {
+    const int frame_offset = tcc_ir_materialization_offset_ir(ir, op);
+    const int is_param = (op->is_param && frame_offset >= 0) ? 1 : 0;
+    const int test_reg = (dest_reg != PREG_NONE && dest_reg < 16) ? dest_reg : 12;
+    if (tcc_machine_can_encode_stack_offset_with_param_adj(frame_offset, is_param, test_reg))
+      return;
+  }
+
+  tcc_ir_require_materialization_result(result, "materialize_addr_ir");
+
+  result->original_pr0 = (op->pr0_spilled ? PREG_SPILLED : 0) | op->pr0_reg;
+  result->original_pr1 = (op->pr1_spilled ? PREG_SPILLED : 0) | op->pr1_reg;
+
+  TCCMachineScratchRegs scratch = {0};
+  tcc_machine_acquire_scratch(&scratch, (ir ? ir->codegen_materialize_scratch_flags : 0));
+  if (scratch.reg_count == 0)
+    tcc_error("compiler_error: unable to allocate scratch register for address materialization");
+
+  const int target_reg = scratch.regs[0];
+  const int frame_offset = tcc_ir_materialization_offset_ir(ir, op);
+  const int is_param = (op->is_param && frame_offset >= 0) ? 1 : 0;
+
+  if (wants_stack_address)
+  {
+    tcc_machine_addr_of_stack_slot(target_reg, frame_offset, is_param);
+    op->pr0_reg = target_reg;
+    op->pr0_spilled = 0;
+    op->pr1_reg = PREG_REG_NONE;
+    op->pr1_spilled = 0;
+    op->is_lval = 1;
+    op->tag = IROP_TAG_VREG;
+    op->is_local = 0;
+    op->is_llocal = 0;
+    op->is_const = 0;
+    op->u.imm32 = 0;
+  }
+  else if (spilled_pointer)
+  {
+    tcc_machine_load_spill_slot(target_reg, frame_offset);
+    op->pr0_reg = target_reg;
+    op->pr0_spilled = 0;
+    op->pr1_reg = PREG_REG_NONE;
+    op->pr1_spilled = 0;
+    op->tag = IROP_TAG_VREG;
+    op->is_local = 0;
+    op->is_llocal = 0;
+    op->is_const = 0;
+    op->u.imm32 = 0;
+  }
+
+  result->used_scratch = 1;
+  result->scratch = scratch;
+}
+
+void tcc_ir_materialize_dest_ir(TCCIRState *ir, IROperand *op, TCCMaterializedDest *result)
+{
+  if (result)
+    memset(result, 0, sizeof(*result));
+
+  if (!ir || !op)
+    return;
+  if (!op->pr0_spilled)
+    return;
+
+  const int vreg = irop_get_vreg(*op);
+  if (!tcc_is_vreg_valid(ir, vreg))
+    return;
+
+  tcc_ir_require_materialization_result(result, "materialize_dest_ir");
+
+  const int frame_offset = tcc_ir_materialization_offset_ir(ir, op);
+  const int is_64bit = irop_is_64bit(*op);
+  const unsigned scratch_flags =
+      (is_64bit ? TCC_MACHINE_SCRATCH_NEEDS_PAIR : 0) | (ir ? ir->codegen_materialize_scratch_flags : 0);
+  TCCMachineScratchRegs scratch = {0};
+  tcc_machine_acquire_scratch(&scratch, scratch_flags);
+  if (scratch.reg_count == 0)
+    tcc_error("compiler_error: unable to allocate scratch register for spill destination");
+  if (is_64bit && scratch.reg_count < 2)
+    tcc_error("compiler_error: missing register pair for 64-bit spill destination");
+
+  result->needs_storeback = 1;
+  result->is_64bit = is_64bit;
+  result->frame_offset = frame_offset;
+  result->original_pr0 = (op->pr0_spilled ? PREG_SPILLED : 0) | op->pr0_reg;
+  result->original_pr1 = (op->pr1_spilled ? PREG_SPILLED : 0) | op->pr1_reg;
+  result->scratch = scratch;
+
+  op->pr0_reg = scratch.regs[0];
+  op->pr0_spilled = 0;
+  if (is_64bit)
+  {
+    op->pr1_reg = scratch.regs[1];
+    op->pr1_spilled = 0;
+  }
+  else
+  {
+    op->pr1_reg = PREG_REG_NONE;
+    op->pr1_spilled = 0;
+  }
+  op->is_lval = 0;
+  op->tag = IROP_TAG_VREG;
+  op->is_local = 0;
+  op->is_llocal = 0;
+  op->is_const = 0;
+  op->u.imm32 = 0;
+}
+
+static void tcc_ir_storeback_materialized_dest_ir(IROperand *op, TCCMaterializedDest *mat)
 {
   if (!mat || !mat->needs_storeback)
     return;
 
-  tcc_machine_store_spill_slot(dest->pr0_reg, mat->frame_offset);
+  tcc_machine_store_spill_slot(op->pr0_reg, mat->frame_offset);
   if (mat->is_64bit)
-    tcc_machine_store_spill_slot(dest->pr1_reg, mat->frame_offset + 4);
+    tcc_machine_store_spill_slot(op->pr1_reg, mat->frame_offset + 4);
 
   tcc_machine_release_scratch(&mat->scratch);
-
-  dest->pr0_reg = mat->original_pr0 & PREG_REG_NONE;
-  dest->pr0_spilled = (mat->original_pr0 & PREG_SPILLED) != 0;
-  dest->pr1_reg = mat->original_pr1 & PREG_REG_NONE;
-  dest->pr1_spilled = (mat->original_pr1 & PREG_SPILLED) != 0;
-  dest->r = mat->original_r;
-  dest->c.i = mat->frame_offset;
 }
 
-static void tcc_ir_release_materialized_value(SValue *sv, TCCMaterializedValue *mat)
+static void tcc_ir_release_materialized_value_ir(TCCMaterializedValue *mat)
 {
   if (!mat || !mat->used_scratch)
     return;
-
   tcc_machine_release_scratch(&mat->scratch);
-  if (sv)
-  {
-    sv->pr0_reg = mat->original_pr0 & PREG_REG_NONE;
-    sv->pr0_spilled = (mat->original_pr0 & PREG_SPILLED) != 0;
-    sv->pr1_reg = mat->original_pr1 & PREG_REG_NONE;
-    sv->pr1_spilled = (mat->original_pr1 & PREG_SPILLED) != 0;
-    sv->r = mat->original_r;
-    sv->c.i = mat->original_c_i;
-  }
 }
 
-static void tcc_ir_release_materialized_addr(SValue *sv, TCCMaterializedAddr *mat)
+static void tcc_ir_release_materialized_addr_ir(TCCMaterializedAddr *mat)
 {
   if (!mat || !mat->used_scratch)
     return;
-
   tcc_machine_release_scratch(&mat->scratch);
-  if (sv)
-  {
-    sv->pr0_reg = mat->original_pr0 & PREG_REG_NONE;
-    sv->pr0_spilled = (mat->original_pr0 & PREG_SPILLED) != 0;
-    sv->pr1_reg = mat->original_pr1 & PREG_REG_NONE;
-    sv->pr1_spilled = (mat->original_pr1 & PREG_SPILLED) != 0;
-    sv->r = mat->original_r;
-    sv->c.i = mat->original_c_i;
-  }
 }
 
 const char *tcc_ir_get_vreg_type_string(int vreg)
@@ -3838,6 +4134,134 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
      * that wasn't marked as VT_CONST. Preserve the symbol. */
     sv->r = VT_CONST | VT_SYM;
   }
+}
+
+void tcc_ir_fill_registers_ir(TCCIRState *ir, IROperand *op)
+{
+  const int old_is_local = op->is_local;
+  const int old_is_llocal = op->is_llocal;
+  const int old_is_const = op->is_const;
+  const int old_is_lval = op->is_lval;
+  const int old_is_param = op->is_param;
+
+  const int vreg = irop_get_vreg(*op);
+
+  /* VT_LOCAL/VT_LLOCAL operands can mean either:
+   * - a concrete stack slot (vr == -1), e.g. VLA save slots, or
+   * - a logical local tracked as a vreg by the IR (vr != -1).
+   *
+   * For concrete stack slots, do not rewrite them into registers here; doing
+   * so can create uninitialized register reads at runtime. */
+  if ((old_is_local || old_is_llocal) && vreg == -1)
+  {
+    op->pr0_reg = PREG_REG_NONE;
+    op->pr0_spilled = 0;
+    op->pr1_reg = PREG_REG_NONE;
+    op->pr1_spilled = 0;
+    return;
+  }
+
+  if (tcc_is_vreg_valid(ir, vreg))
+  {
+    IRLiveInterval *interval = tcc_ir_get_live_interval(ir, vreg);
+
+    /* Stack-passed parameters: if not allocated to a register, treat them as
+     * residing in the incoming argument area (VT_PARAM) rather than forcing a
+     * separate local spill slot. */
+    if (TCCIR_DECODE_VREG_TYPE(vreg) == TCCIR_VREG_TYPE_PARAM && interval && interval->incoming_reg0 < 0 &&
+        interval->allocation.r0 == PREG_NONE && interval->allocation.offset == 0)
+    {
+      op->pr0_reg = PREG_REG_NONE;
+      op->pr0_spilled = 0;
+      op->pr1_reg = PREG_REG_NONE;
+      op->pr1_spilled = 0;
+      op->u.imm32 = interval->original_offset;
+      op->tag = IROP_TAG_STACKOFF;
+
+      int need_lval = old_is_lval;
+      /* old_v < VT_CONST && old_v != VT_LOCAL && old_v != VT_LLOCAL → reg kind operand */
+      if (!old_is_const && !old_is_local && !old_is_llocal && interval->is_lvalue)
+        need_lval = 1;
+
+      op->is_local = 1;
+      op->is_llocal = 0;
+      op->is_const = 0;
+      op->is_lval = need_lval;
+      op->is_param = 1;
+      return;
+    }
+
+    /* Register-passed parameters: if allocated to a register (not spilled),
+     * clear VT_LVAL. The value is already in the register, no dereference needed. */
+    int is_register_param =
+        (TCCIR_DECODE_VREG_TYPE(vreg) == TCCIR_VREG_TYPE_PARAM && interval && interval->incoming_reg0 >= 0);
+
+    op->pr0_reg = interval->allocation.r0 & PREG_REG_NONE;
+    op->pr0_spilled = (interval->allocation.r0 & PREG_SPILLED) != 0;
+    op->pr1_reg = interval->allocation.r1 & PREG_REG_NONE;
+    op->pr1_spilled = (interval->allocation.r1 & PREG_SPILLED) != 0;
+    op->u.imm32 = interval->allocation.offset;
+
+    /* Determine if we should preserve is_lval:
+     * - If was local|lval and now in register, do NOT preserve is_lval
+     * - If was lval with reg-kind operand (pointer deref), preserve is_lval
+     * - Register parameters: do NOT preserve is_lval when in register */
+    int preserve_param = old_is_param;
+    int preserve_lval = 0;
+    if (old_is_lval && !old_is_const && !old_is_local && !old_is_llocal && !is_register_param)
+    {
+      preserve_lval = 1;
+    }
+
+    if ((interval->allocation.r0 & PREG_SPILLED) || interval->allocation.offset != 0)
+    {
+      /* Spilled to stack */
+      int need_lval;
+      if (old_is_local || old_is_llocal)
+      {
+        need_lval = old_is_lval;
+      }
+      else
+      {
+        /* Computed value (was in register): always need lval to load from spill */
+        need_lval = 1;
+      }
+
+      int use_llocal = 0;
+      if (old_is_lval && !old_is_local && !old_is_llocal)
+      {
+        /* Double indirection: spilled pointer that needs dereferencing */
+        use_llocal = 1;
+      }
+
+      /* Only preserve is_param for stack-passed parameters (incoming_reg0 < 0).
+       * Register-passed parameters spilled to local stack should NOT have is_param. */
+      int spilled_param = 0;
+      if (old_is_param && interval->incoming_reg0 < 0)
+      {
+        spilled_param = 1;
+      }
+
+      op->is_local = 1;
+      op->is_llocal = use_llocal;
+      op->is_const = 0;
+      op->is_lval = need_lval;
+      op->is_param = spilled_param;
+      op->tag = IROP_TAG_STACKOFF;
+    }
+    else if (interval->allocation.r0 != PREG_NONE)
+    {
+      /* In a register */
+      op->is_local = 0;
+      op->is_llocal = 0;
+      op->is_const = 0;
+      op->is_lval = preserve_lval;
+      op->is_param = preserve_param;
+      op->tag = IROP_TAG_VREG;
+    }
+  }
+  /* No valid vreg: constants, symbols, etc. - IROperand already has the right encoding
+   * from the pool. Nothing to do for register allocation. */
 }
 
 /* ============================================================================
@@ -6590,11 +7014,10 @@ static int tcc_ir_is_fpu_operation(TccIrOp op)
 }
 
 #ifdef CONFIG_TCC_ASM
-static void tcc_ir_codegen_inline_asm(TCCIRState *ir, const SValue *dest)
+static void tcc_ir_codegen_inline_asm_by_id(TCCIRState *ir, int id)
 {
-  if (!ir || !dest)
+  if (!ir)
     return;
-  const int id = (int)dest->c.i;
   if (id < 0 || id >= ir->inline_asm_count)
     tcc_error("IR: invalid inline asm id");
 
@@ -6627,6 +7050,14 @@ static void tcc_ir_codegen_inline_asm(TCCIRState *ir, const SValue *dest)
 
   tcc_asm_emit_inline(ops, nb_operands, ia->nb_outputs, nb_labels, clobber_regs, ia->asm_str, ia->asm_len,
                       ia->must_subst);
+}
+
+static void tcc_ir_codegen_inline_asm_ir(TCCIRState *ir, IROperand dest_irop)
+{
+  if (!ir)
+    return;
+  const int id = (int)irop_get_imm64_ex(ir, dest_irop);
+  tcc_ir_codegen_inline_asm_by_id(ir, id);
 }
 #endif
 
@@ -6749,18 +7180,18 @@ void tcc_ir_generate_code(TCCIRState *ir)
     // emit debug line info for this IR instruction AFTER recording ind
     tcc_debug_line_num(tcc_state, cq->line_num);
 
-    /* Get operand pointers from svalue_pool (the working storage) */
-    SValue *src1 = tcc_ir_op_get_src1(ir, cq);
-    SValue *src2 = tcc_ir_op_get_src2(ir, cq);
-    SValue *dest = tcc_ir_op_get_dest(ir, cq);
+    /* Get operand copies from iroperand_pool (compact representation) */
+    IROperand src1_ir = tcc_ir_op_get_src1_irop(ir, cq);
+    IROperand src2_ir = tcc_ir_op_get_src2_irop(ir, cq);
+    IROperand dest_ir = tcc_ir_op_get_dest_irop(ir, cq);
 
     /* Apply register allocation to operands */
-    if (src1)
-      tcc_ir_fill_registers(ir, src1);
-    if (src2)
-      tcc_ir_fill_registers(ir, src2);
-    if (dest)
-      tcc_ir_fill_registers(ir, dest);
+    if (irop_get_tag(src1_ir) != IROP_TAG_NONE)
+      tcc_ir_fill_registers_ir(ir, &src1_ir);
+    if (irop_get_tag(src2_ir) != IROP_TAG_NONE)
+      tcc_ir_fill_registers_ir(ir, &src2_ir);
+    if (irop_get_tag(dest_ir) != IROP_TAG_NONE)
+      tcc_ir_fill_registers_ir(ir, &dest_ir);
 
     bool need_src1_value = false;
     bool need_src2_value = false;
@@ -6881,54 +7312,43 @@ void tcc_ir_generate_code(TCCIRState *ir)
 #endif
     if (need_src1_value)
     {
-      tcc_ir_materialize_value(ir, src1, &mat_src1);
+      tcc_ir_materialize_value_ir(ir, &src1_ir, &mat_src1);
     }
     else if (need_src1_addr)
     {
-      tcc_ir_materialize_addr(ir, src1, &mat_src1_addr, dest->pr0_reg);
+      tcc_ir_materialize_addr_ir(ir, &src1_ir, &mat_src1_addr, dest_ir.pr0_reg);
     }
 
     if (need_src2_value)
     {
-      tcc_ir_materialize_value(ir, src2, &mat_src2);
+      tcc_ir_materialize_value_ir(ir, &src2_ir, &mat_src2);
     }
     else if (need_src2_addr)
     {
-      tcc_ir_materialize_addr(ir, src2, &mat_src2_addr, dest->pr0_reg);
+      tcc_ir_materialize_addr_ir(ir, &src2_ir, &mat_src2_addr, dest_ir.pr0_reg);
     }
 
     if (need_dest_value)
     {
-      tcc_ir_materialize_dest(ir, dest, &mat_dest);
+      tcc_ir_materialize_dest_ir(ir, &dest_ir, &mat_dest);
     }
     else if (need_dest_addr)
     {
-      tcc_ir_materialize_addr(ir, dest, &mat_dest_addr, PREG_NONE);
+      tcc_ir_materialize_addr_ir(ir, &dest_ir, &mat_dest_addr, PREG_NONE);
     }
 
     /* For operations that require register-only operands (MUL, DIV, MOD),
-     * ensure constants/comparisons are loaded into registers. This replaces
-     * backend-level thumb_materialize_binop32_sources() with IR-level handling. */
+     * ensure constants/comparisons are loaded into registers. */
     TCCMaterializedValue mat_src1_reg = {0};
     TCCMaterializedValue mat_src2_reg = {0};
     if (need_src1_in_reg)
     {
-      tcc_ir_materialize_const_to_reg(ir, src1, &mat_src1_reg);
+      tcc_ir_materialize_const_to_reg_ir(ir, &src1_ir, &mat_src1_reg);
     }
     if (need_src2_in_reg)
     {
-      tcc_ir_materialize_const_to_reg(ir, src2, &mat_src2_reg);
+      tcc_ir_materialize_const_to_reg_ir(ir, &src2_ir, &mat_src2_reg);
     }
-
-    /* Resync IROperand pool after fill_registers, since fill_registers may have
-     * modified the SValue (e.g., adding VT_PARAM for stack-passed parameters). */
-    tcc_ir_resync_operand(ir, i, 0); /* dest */
-    tcc_ir_resync_operand(ir, i, 1); /* src1 */
-    tcc_ir_resync_operand(ir, i, 2); /* src2 */
-
-    const IROperand dest_ir = svalue_to_iroperand(ir, dest);
-    const IROperand src1_ir = svalue_to_iroperand(ir, src1);
-    const IROperand src2_ir = svalue_to_iroperand(ir, src2);
 
     switch (cq->op)
     {
@@ -6974,20 +7394,19 @@ void tcc_ir_generate_code(TCCIRState *ir)
         IROperand next_src1_irop = tcc_ir_op_get_src1_irop(ir, ir_next);
         ir_next_src1_vr = irop_get_vreg(next_src1_irop);
       }
-      int is_64bit_load = tcc_ir_is_64bit_type(dest->type.t);
-      if (ir_next && ir_next->op == TCCIR_OP_RETURNVALUE && ir_next_src1_vr == dest->vr && !has_incoming_jump[i + 1])
+      const int dest_vreg = irop_get_vreg(dest_ir);
+      int is_64bit_load = irop_is_64bit(dest_ir);
+      if (ir_next && ir_next->op == TCCIR_OP_RETURNVALUE && ir_next_src1_vr == dest_vreg && !has_incoming_jump[i + 1])
       {
-        dest->pr0_reg = REG_IRET; /* R0 */
-        dest->pr0_spilled = 0;
-        /* Also update dest->r to have R0 in VT_VALMASK (svalue_to_iroperand reads from there) */
-        dest->r = (dest->r & ~VT_VALMASK) | REG_IRET;
+        dest_ir.pr0_reg = REG_IRET; /* R0 */
+        dest_ir.pr0_spilled = 0;
         if (is_64bit_load)
         {
-          dest->pr1_reg = REG_IRE2; /* R1 */
-          dest->pr1_spilled = 0;
+          dest_ir.pr1_reg = REG_IRE2; /* R1 */
+          dest_ir.pr1_spilled = 0;
         }
         /* Also update the interval allocation so that RETURNVALUE's src1 gets the same registers */
-        IRLiveInterval *interval = tcc_ir_get_live_interval(ir, dest->vr);
+        IRLiveInterval *interval = tcc_ir_get_live_interval(ir, dest_vreg);
         if (interval)
         {
           interval->allocation.r0 = REG_IRET;
@@ -6995,9 +7414,7 @@ void tcc_ir_generate_code(TCCIRState *ir)
             interval->allocation.r1 = REG_IRE2;
         }
       }
-      const IROperand load_dest_ir = svalue_to_iroperand(ir, dest);
-      const IROperand load_src1_ir = svalue_to_iroperand(ir, src1);
-      tcc_gen_machine_load_op(load_dest_ir, load_src1_ir);
+      tcc_gen_machine_load_op(dest_ir, src1_ir);
       break;
     }
     case TCCIR_OP_STORE:
@@ -7006,15 +7423,25 @@ void tcc_ir_generate_code(TCCIRState *ir)
     case TCCIR_OP_RETURNVALUE:
     {
       /* Peephole: if previous instruction was LOAD/ASSIGN that already loaded to R0,
-       * skip the return value copy */
+       * skip the return value copy.
+       * Check the interval allocation (updated by LOAD/ASSIGN peepholes) instead of
+       * pool entries, since we work with local IROperand copies. */
       const IRQuadCompact *ir_prev = (i > 0) ? &ir->compact_instructions[i - 1] : NULL;
-      const SValue *ir_prev_dest = ir_prev ? tcc_ir_op_get_dest(ir, ir_prev) : NULL;
-
-      /* Check if the previous instruction already placed the value in R0.
-       * Note: We must check ir_prev_dest->pr0_reg, not src1->pr0_reg, because the ASSIGN peephole
-       * may have redirected the destination to R0 after register allocation set src1->pr0_reg. */
-      if (has_incoming_jump[i] || !ir_prev || (ir_prev->op != TCCIR_OP_LOAD && ir_prev->op != TCCIR_OP_ASSIGN) ||
-          ir_prev_dest->vr != src1->vr || ir_prev_dest->pr0_reg != REG_IRET)
+      int skip_copy = 0;
+      if (!has_incoming_jump[i] && ir_prev && (ir_prev->op == TCCIR_OP_LOAD || ir_prev->op == TCCIR_OP_ASSIGN))
+      {
+        IROperand prev_dest_irop = tcc_ir_op_get_dest_irop(ir, ir_prev);
+        const int prev_dest_vreg = irop_get_vreg(prev_dest_irop);
+        const int src1_vreg = irop_get_vreg(src1_ir);
+        if (prev_dest_vreg == src1_vreg)
+        {
+          /* Check if the LOAD/ASSIGN peephole updated the interval to R0 */
+          IRLiveInterval *prev_interval = tcc_ir_get_live_interval(ir, prev_dest_vreg);
+          if (prev_interval && prev_interval->allocation.r0 == REG_IRET)
+            skip_copy = 1;
+        }
+      }
+      if (!skip_copy)
       {
         tcc_gen_machine_return_value_op(src1_ir, cq->op);
       }
@@ -7039,20 +7466,27 @@ void tcc_ir_generate_code(TCCIRState *ir)
         IROperand next_src1_irop = tcc_ir_op_get_src1_irop(ir, ir_next);
         ir_next_src1_vr = irop_get_vreg(next_src1_irop);
       }
-      if (ir_next && ir_next->op == TCCIR_OP_RETURNVALUE && ir_next_src1_vr == dest->vr && !has_incoming_jump[i + 1])
+      const int assign_dest_vreg = irop_get_vreg(dest_ir);
+      if (ir_next && ir_next->op == TCCIR_OP_RETURNVALUE && ir_next_src1_vr == assign_dest_vreg &&
+          !has_incoming_jump[i + 1])
       {
-        dest->pr0_reg = REG_IRET; /* R0 */
-        dest->pr0_spilled = 0;
-        if (tcc_ir_is_64bit_type(dest->type.t))
+        dest_ir.pr0_reg = REG_IRET; /* R0 */
+        dest_ir.pr0_spilled = 0;
+        if (irop_is_64bit(dest_ir))
         {
-          dest->pr1_reg = REG_IRE2; /* R1 */
-          dest->pr1_spilled = 0;
+          dest_ir.pr1_reg = REG_IRE2; /* R1 */
+          dest_ir.pr1_spilled = 0;
+        }
+        /* Update the interval allocation so RETURNVALUE sees the change */
+        IRLiveInterval *interval = tcc_ir_get_live_interval(ir, assign_dest_vreg);
+        if (interval)
+        {
+          interval->allocation.r0 = REG_IRET;
+          if (irop_is_64bit(dest_ir))
+            interval->allocation.r1 = REG_IRE2;
         }
       }
-      /* Create fresh IROperands after peephole modifications */
-      IROperand assign_dest_ir = svalue_to_iroperand(ir, dest);
-      IROperand assign_src1_ir = svalue_to_iroperand(ir, src1);
-      tcc_gen_machine_assign_op(assign_dest_ir, assign_src1_ir, cq->op);
+      tcc_gen_machine_assign_op(dest_ir, src1_ir, cq->op);
       break;
     }
     case TCCIR_OP_LEA:
@@ -7101,7 +7535,7 @@ void tcc_ir_generate_code(TCCIRState *ir)
       /* fall through */
     case TCCIR_OP_FUNCCALLVAL:
     {
-      tcc_gen_machine_func_call_op(src1, src2, dest, drop_return_value, ir, i);
+      tcc_gen_machine_func_call_op(src1_ir, src2_ir, dest_ir, drop_return_value, ir, i);
       /* Clear spill cache after function call - callee may have modified memory */
       tcc_ir_spill_cache_clear(&ir->spill_cache);
       break;
@@ -7116,7 +7550,7 @@ void tcc_ir_generate_code(TCCIRState *ir)
     case TCCIR_OP_INLINE_ASM:
     {
 #ifdef CONFIG_TCC_ASM
-      tcc_ir_codegen_inline_asm(ir, dest);
+      tcc_ir_codegen_inline_asm_ir(ir, dest_ir);
       /* Inline asm may clobber registers/memory: treat as a full barrier. */
       tcc_ir_spill_cache_clear(&ir->spill_cache);
 #else
@@ -7138,14 +7572,14 @@ void tcc_ir_generate_code(TCCIRState *ir)
     }
     };
 
-    tcc_ir_release_materialized_addr(dest, &mat_dest_addr);
-    tcc_ir_storeback_materialized_dest(dest, &mat_dest);
-    tcc_ir_release_materialized_addr(src2, &mat_src2_addr);
-    tcc_ir_release_materialized_value(src2, &mat_src2_reg);
-    tcc_ir_release_materialized_value(src2, &mat_src2);
-    tcc_ir_release_materialized_value(src1, &mat_src1_reg);
-    tcc_ir_release_materialized_addr(src1, &mat_src1_addr);
-    tcc_ir_release_materialized_value(src1, &mat_src1);
+    tcc_ir_release_materialized_addr_ir(&mat_dest_addr);
+    tcc_ir_storeback_materialized_dest_ir(&dest_ir, &mat_dest);
+    tcc_ir_release_materialized_addr_ir(&mat_src2_addr);
+    tcc_ir_release_materialized_value_ir(&mat_src2_reg);
+    tcc_ir_release_materialized_value_ir(&mat_src2);
+    tcc_ir_release_materialized_value_ir(&mat_src1_reg);
+    tcc_ir_release_materialized_addr_ir(&mat_src1_addr);
+    tcc_ir_release_materialized_value_ir(&mat_src1);
 
     /* Clean up scratch register state at end of each IR instruction.
      * This restores any pushed scratch registers and resets the global exclude mask. */

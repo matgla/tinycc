@@ -129,9 +129,7 @@ static inline Sym *validate_sym_for_reloc(Sym *sym)
 
 /* Forward declarations */
 void load_to_dest_ir(IROperand dest, IROperand src);
-void load_to_dest(SValue *dest, SValue *src);
 static void load_to_reg_ir(int r, int r1, IROperand src);
-static void store_ex(int r, SValue *sv, uint32_t extra_exclude);
 static void store_ex_ir(int r, IROperand sv, uint32_t extra_exclude);
 
 ST_DATA const char *const target_machine_defs = "__arm__\0"
@@ -257,7 +255,7 @@ static ScratchRegAlloc get_scratch_reg_with_save(uint32_t exclude_regs)
     }
   }
 
-    no_free_reg:
+no_free_reg:
 
   /* No free register found - we need to save one to the stack */
   /* Prefer R_IP (R12) as it's the inter-procedure scratch register */
@@ -474,10 +472,6 @@ int ot_check(thumb_opcode op)
   }
   return ot(op);
 }
-
-/* Forward declaration from tccir.c */
-int tcc_ir_is_spilled(SValue *sv);
-int tcc_ir_is_64bit(int t);
 
 /* Forward declarations for helpers used by spill preloading. */
 int load_short_from_base(int ir, int base, int fc, int sign);
@@ -1600,11 +1594,6 @@ static uint32_t th_store_resolve_base_ir(int src_reg, IROperand sv, int btype, i
   return base_reg;
 }
 
-void store(int r, SValue *sv)
-{
-  store_ex(r, sv, 0);
-}
-
 /* IROperand-based store functions */
 static void store_ex_ir(int r, IROperand sv, uint32_t extra_exclude)
 {
@@ -1775,13 +1764,6 @@ static void store_ex_ir(int r, IROperand sv, uint32_t extra_exclude)
 void store_ir(int r, IROperand sv)
 {
   store_ex_ir(r, sv, 0);
-}
-
-static void store_ex(int r, SValue *sv, uint32_t extra_exclude)
-{
-  /* Legacy wrapper: convert SValue to IROperand and delegate to store_ex_ir */
-  const IROperand sv_ir = svalue_to_iroperand(tcc_state->ir, sv);
-  store_ex_ir(r, sv_ir, extra_exclude);
 }
 
 static ThumbLiteralPoolEntry *th_literal_pool_allocate()
@@ -2267,13 +2249,6 @@ static void load_from_base_ir(int r, int r1, int irop_btype, int is_unsigned, in
   }
 }
 
-void load_to_dest(SValue *dest, SValue *src)
-{
-  const IROperand d = svalue_to_iroperand(tcc_state->ir, dest);
-  const IROperand s = svalue_to_iroperand(tcc_state->ir, src);
-  load_to_dest_ir(d, s);
-}
-
 void load_to_dest_ir(IROperand dest, IROperand src)
 {
   const char *ctx = "load_to_dest_ir";
@@ -2366,13 +2341,11 @@ void load_to_dest_ir(IROperand dest, IROperand src)
       }
       if (dest.pr1_reg != PREG_REG_NONE && is_64bit)
       {
-        if (src.pr1_reg == PREG_REG_NONE)
+        /* For 64-bit values, use pr1_reg if set, otherwise assume consecutive register pair */
+        int src_high = (src.pr1_reg != PREG_REG_NONE) ? src.pr1_reg : (src_reg + 1);
+        if (dest.pr1_reg != src_high)
         {
-          tcc_error("compiler_error: source high register missing for 64-bit move\n");
-        }
-        if (dest.pr1_reg != src.pr1_reg)
-        {
-          ot_check(th_mov_reg(dest.pr1_reg, src.pr1_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+          ot_check(th_mov_reg(dest.pr1_reg, src_high, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
                               ENFORCE_ENCODING_NONE, false));
         }
       }
@@ -5794,18 +5767,15 @@ static void handle_return_value(IROperand dest, int drop_value)
 
 /* ======================================================================== */
 
-ST_FUNC void tcc_gen_machine_func_call_op(SValue *func_target, SValue *call_id_sv, SValue *dest, int drop_value,
+ST_FUNC void tcc_gen_machine_func_call_op(IROperand func_target, IROperand call_id_op, IROperand dest, int drop_value,
                                           TCCIRState *ir, int call_idx)
 {
   /* === Validation === */
-  if (!call_id_sv || !ir)
-    tcc_error("compiler_error: func_call_op requires call_id_sv+ir");
+  if (irop_is_none(call_id_op) || !ir)
+    tcc_error("compiler_error: func_call_op requires call_id+ir");
 
-  const IROperand func_target_ir = svalue_to_iroperand(tcc_state->ir, func_target);
-  const IROperand dest_ir = svalue_to_iroperand(tcc_state->ir, dest);
-
-  const int call_id = TCCIR_DECODE_CALL_ID(call_id_sv->c.i);
-  const int argc_hint = TCCIR_DECODE_CALL_ARGC(call_id_sv->c.i);
+  const int call_id = TCCIR_DECODE_CALL_ID(call_id_op.u.imm32);
+  const int argc_hint = TCCIR_DECODE_CALL_ARGC(call_id_op.u.imm32);
 
   ThumbGenCallSite *call_site = thumb_get_call_site_for_id(call_id);
   if (!call_site)
@@ -5874,7 +5844,7 @@ ST_FUNC void tcc_gen_machine_func_call_op(SValue *func_target, SValue *call_id_s
   place_stack_arguments(&ctx);
 
   /* === Emit call === */
-  gcall_or_jump_ir(0, func_target_ir);
+  gcall_or_jump_ir(0, func_target);
 
   /* Restore scratch register exclusion */
   scratch_global_exclude = saved_scratch_exclude;
@@ -5892,7 +5862,7 @@ ST_FUNC void tcc_gen_machine_func_call_op(SValue *func_target, SValue *call_id_s
     call_site->used_stack_size -= arg_regs_push_count * 4;
   }
 
-  handle_return_value(dest_ir, drop_value);
+  handle_return_value(dest, drop_value);
 
   call_site->registers_map &= ~0x0F; /* Clear R0-R3 */
 
