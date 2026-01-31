@@ -81,19 +81,19 @@ float __aeabi_fdiv(float a, float b)
   /* Calculate result exponent */
   int result_exp = a_exp - b_exp + FLOAT_EXP_BIAS;
 
-  /* Normalize for division */
-  int a_shift = clz32(a_mant) - 8; /* Shift to bit 23 */
-  int b_shift = clz32(b_mant) - 8;
-
-  /* Use 64-bit for precision */
-  uint64_t dividend = (uint64_t)a_mant << 32;
-  uint64_t divisor = (uint64_t)b_mant << (32 - 23);
-
-  /* Adjust exponent */
-  result_exp += (b_shift - a_shift);
-
-  /* Perform division */
+  /* Perform division using restoring division algorithm */
+  uint64_t dividend = a_mant;
+  uint64_t divisor = b_mant;
   uint64_t quotient = 0;
+
+  /* Align dividend with divisor */
+  if (dividend < divisor)
+  {
+    dividend <<= 1;
+    result_exp--;
+  }
+
+  /* Generate 25 bits (1 integer + 23 fraction + 1 guard) */
   for (int i = 0; i < 25; i++)
   {
     quotient <<= 1;
@@ -105,16 +105,17 @@ float __aeabi_fdiv(float a, float b)
     dividend <<= 1;
   }
 
-  /* Normalize quotient */
-  while (quotient >= (FLOAT_IMPLICIT_BIT << 1))
+  /* Round using guard bit - round half up */
+  uint32_t guard = quotient & 1;
+  quotient >>= 1;
+  if (guard && dividend)
+    quotient++;
+
+  /* Final normalization - quotient should be in [2^23, 2^24) */
+  if (quotient >= (FLOAT_IMPLICIT_BIT << 1))
   {
     quotient >>= 1;
     result_exp++;
-  }
-  while (quotient && !(quotient & FLOAT_IMPLICIT_BIT))
-  {
-    quotient <<= 1;
-    result_exp--;
   }
 
   if (result_exp >= 0xFF)

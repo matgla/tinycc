@@ -11,7 +11,7 @@
 extern int benchmark_main(void);
 
 #define UART_ID uart0
-#define BAUD_RATE 115200
+#define BAUD_RATE 9600
 #define UART_TX_PIN 32
 #define UART_RX_PIN 33
 #define LED_PIN 25
@@ -25,6 +25,24 @@ int main(void)
   uart_init(UART_ID, BAUD_RATE);
   gpio_set_function(UART_TX_PIN, GPIO_FUNC_UART);
   gpio_set_function(UART_RX_PIN, GPIO_FUNC_UART);
+
+  // Flush UART TX FIFO and wait for line to stabilize
+  uart_tx_wait_blocking(UART_ID);
+  sleep_ms(100);
+
+  // Send sync pattern to help host synchronize
+  // This allows any garbage from power-up to be discarded
+  for (int i = 0; i < 20; i++)
+  {
+    uart_putc_raw(UART_ID, '~');
+  }
+  printf("\r\n");
+  uart_tx_wait_blocking(UART_ID);
+  sleep_ms(50);
+
+  // Send clear sync marker that host will look for
+  printf("===SYNC_START===\r\n");
+  uart_tx_wait_blocking(UART_ID);
 
   // Send UART message
   printf("Starting benchmark:\r\n\r\n");

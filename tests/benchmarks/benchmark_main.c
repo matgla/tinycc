@@ -4,14 +4,20 @@
  * This allows linking as a library with different main() implementations
  */
 
+#include "benchmarks.h"
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-#include <stdint.h>
-#include "benchmarks.h"
 
-/* Semihosting interface for timing - may be platform-specific */
+/* Pico SDK watchdog support */
+#ifdef PICO_PLATFORM
+#include "hardware/watchdog.h"
+#endif
+
+/* Cycle counter interface */
 extern void enable_cycle_counter(void);
-extern unsigned int get_cycle_count_low(void);
+extern uint64_t get_cycle_count(void);
+extern int using_dwt_counter(void);
 
 /* Benchmark function type */
 typedef int (*benchmark_func_t)(int iterations);
@@ -19,189 +25,250 @@ typedef int (*benchmark_func_t)(int iterations);
 /* Benchmark registration */
 #define MAX_BENCHMARKS 16
 
-typedef struct {
-    const char *name;
-    benchmark_func_t func;
-    int default_iterations;
-    const char *description;
+typedef struct
+{
+  const char *name;
+  benchmark_func_t func;
+  int iterations;
+  const char *description;
+  int expected_result;
+  int verify_status; /* 0=not checked, 1=pass, 2=fail */
 } benchmark_t;
 
 static benchmark_t benchmarks[MAX_BENCHMARKS];
 static int num_benchmarks = 0;
 
-void register_benchmark(const char *name, benchmark_func_t func,
-                        int default_iterations, const char *description) {
-    if (num_benchmarks >= MAX_BENCHMARKS) return;
-    benchmarks[num_benchmarks].name = name;
-    benchmarks[num_benchmarks].func = func;
-    benchmarks[num_benchmarks].default_iterations = default_iterations;
-    benchmarks[num_benchmarks].description = description;
-    num_benchmarks++;
+/* Special marker: no expected result set (skip verification) */
+#define NO_EXPECTED_RESULT 0xDEADBEEF
+
+void register_benchmark(const char *name, benchmark_func_t func, int iterations, const char *description)
+{
+  register_benchmark_ex(name, func, iterations, description, NO_EXPECTED_RESULT);
+}
+
+void register_benchmark_ex(const char *name, benchmark_func_t func, int iterations, const char *description,
+                           int expected_result)
+{
+  if (num_benchmarks >= MAX_BENCHMARKS)
+    return;
+  /* Check for duplicate registration (can happen with constructor attributes) */
+  for (int i = 0; i < num_benchmarks; i++)
+  {
+    if (strcmp(benchmarks[i].name, name) == 0)
+      return; /* Already registered */
+  }
+  benchmarks[num_benchmarks].name = name;
+  benchmarks[num_benchmarks].func = func;
+  benchmarks[num_benchmarks].iterations = iterations;
+  benchmarks[num_benchmarks].description = description;
+  benchmarks[num_benchmarks].expected_result = expected_result;
+  benchmarks[num_benchmarks].verify_status = VERIFY_NOT_CHECKED;
+  num_benchmarks++;
+}
+
+int get_benchmark_verify_status(const char *name)
+{
+  for (int i = 0; i < num_benchmarks; i++)
+  {
+    if (strcmp(benchmarks[i].name, name) == 0)
+    {
+      return benchmarks[i].verify_status;
+    }
+  }
+  return VERIFY_NOT_CHECKED;
+}
+
+int get_benchmark_expected_result(const char *name)
+{
+  for (int i = 0; i < num_benchmarks; i++)
+  {
+    if (strcmp(benchmarks[i].name, name) == 0)
+    {
+      return benchmarks[i].expected_result;
+    }
+  }
+  return 0;
 }
 
 /* Run a single benchmark and return cycle count */
-static unsigned int run_benchmark_cycles(const benchmark_t *bench, int iterations) {
-    volatile int result = 0;  /* Prevent optimization */
+static uint64_t run_benchmark_cycles(const benchmark_t *bench, int iterations)
+{
+  volatile int result = 0; /* Prevent optimization */
 
-    /* Warmup */
-    bench->func(iterations / 10);
+  /* Warmup */
+  bench->func(iterations / 10);
 
-    /* Actual measurement */
-    unsigned int start = get_cycle_count_low();
-    result = bench->func(iterations);
-    unsigned int end = get_cycle_count_low();
+  /* Actual measurement using DWT cycle counter with 64-bit overflow tracking */
+  uint64_t start = get_cycle_count();
+  result = bench->func(iterations);
+  uint64_t end = get_cycle_count();
 
-    /* Use result to prevent optimization */
-    (void)result;
+  /* Use result to prevent optimization */
+  (void)result;
 
-    return end - start;
+  return end - start;
 }
 
-/* Calibrate iterations to run for approximately target_cycles */
-static int calibrate_iterations(const benchmark_t *bench, unsigned int target_cycles) {
-    int iterations = bench->default_iterations;
-    unsigned int cycles;
+/* Guard to prevent double initialization */
+static int benchmarks_initialized = 0;
 
-    /* Try up to 3 times to get a stable measurement */
-    for (int attempt = 0; attempt < 3; attempt++) {
-        cycles = run_benchmark_cycles(bench, iterations);
-
-        if (cycles == 0) {
-            /* Cycle counter not available, use default iterations */
-            return bench->default_iterations;
-        }
-
-        if (cycles >= target_cycles / 2 && cycles <= target_cycles * 2) {
-            /* Good enough */
-            return iterations;
-        }
-
-        if (cycles < target_cycles / 10) {
-            /* Too fast, increase iterations */
-            iterations *= 10;
-        } else if (cycles < target_cycles) {
-            /* Slightly too fast */
-            iterations = (int)((long long)iterations * target_cycles / cycles);
-        } else {
-            /* Too slow, decrease iterations */
-            iterations = (int)((long long)iterations * target_cycles / cycles);
-            if (iterations < 10) iterations = 10;
-        }
-    }
-
-    return iterations;
-}
-
-/* Verify which compiler was actually used */
-static int get_compiler_signature(void) {
-#ifdef __TINYC__
-    /* TCC-specific: return a different value */
-    return 0x544343;  /* "TCC" in hex */
-#else
-    /* GCC/Clang */
-    return 0x474343;  /* "GCC" in hex */
+int benchmark_main(void)
+{
+  /* Disable watchdog to prevent resets during long benchmarks */
+#ifdef PICO_PLATFORM
+  watchdog_disable();
 #endif
-}
 
-int benchmark_main(void) {
-    /* Early debug print - before anything else */
-    printf("\r\n[DEBUG] benchmark_main() started\r\n");
-
-    /* Initialize all benchmark modules */
-    printf("[DEBUG] init_math_benchmarks...\r\n");
+  /* Initialize all benchmark modules (only once) */
+  if (!benchmarks_initialized)
+  {
+    benchmarks_initialized = 1;
     init_math_benchmarks();
-    printf("[DEBUG] init_control_benchmarks...\r\n");
     init_control_benchmarks();
-    printf("[DEBUG] init_string_benchmarks...\r\n");
     init_string_benchmarks();
-    printf("[DEBUG] init_algorithm_benchmarks...\r\n");
     init_algorithm_benchmarks();
+    init_mibench_benchmarks();
+  }
 
-    printf("[DEBUG] enable_cycle_counter...\r\n");
-    enable_cycle_counter();
+  enable_cycle_counter();
 
-    printf("[DEBUG] getting compiler signature...\r\n");
-    /* Verify compiler signature matches macro */
-    int sig = get_compiler_signature();
-    printf("[DEBUG] sig=0x%06X\r\n", sig);
-
-    const char* compiler_name;
-#ifdef __TINYC__
-    compiler_name = "TCC";
-    if (sig != 0x544343) {
-        printf("ERROR: Compiler mismatch! Expected TCC but got different code\n");
-        return 1;
-    }
-#else
-    compiler_name = "GCC";
-    if (sig != 0x474343) {
-        printf("ERROR: Compiler mismatch! Expected GCC but got different code\n");
-        return 1;
-    }
-#endif
-
-    printf("[DEBUG] printing banner...\r\n");
-    printf("\n========================================\n");
-    printf("ARMv8-M Benchmark Suite\n");
-    printf("Compiler: %s (sig=0x%06X)\n", compiler_name, sig);
-    printf("Build: %s\n",
-#ifdef __TINYC__
-        "TINYCC"
-#else
-        "GCC"
-#endif
-    );
+  printf("\n========================================\n");
+  printf("ARMv8-M Benchmark Suite\n");
+  printf("Compiler: %s (sig=0x%06X)\n", benchmark_compiler_name, benchmark_compiler_sig);
+  printf("Build: %s\n", benchmark_compiler_id);
 #ifdef __OPTIMIZE__
-    printf("Optimization: O1\n");
+  printf("Optimization: O1\n");
 #else
-    printf("Optimization: O0\n");
+  printf("Optimization: O0\n");
 #endif
-    printf("Target: ARM Cortex-M33 (ARMv8-M)\n");
-    printf("========================================\n\n");
+  printf("Target: ARM Cortex-M33 (ARMv8-M)\n");
+  printf("========================================\n\n");
 
-    if (num_benchmarks == 0) {
-        printf("No benchmarks registered!\n");
-        return 1;
+  if (num_benchmarks == 0)
+  {
+    printf("No benchmarks registered!\n");
+    return 1;
+  }
+
+  printf("Running %d benchmarks...\n\n", num_benchmarks);
+
+  /* Check if cycle counter is working */
+  uint64_t test_time = get_cycle_count();
+  int have_cycle_counter = (test_time != 0 || using_dwt_counter());
+
+  /* First pass: Verify correctness with known iteration counts */
+  printf("Verifying benchmark correctness...\n");
+  /* Use volatile to prevent TCC optimization issues with local vars */
+  volatile int verify_passed = 0;
+  volatile int verify_failed = 0;
+  volatile int verify_skipped = 0;
+
+  for (int i = 0; i < num_benchmarks; i++)
+  {
+    benchmark_t *bench = &benchmarks[i];
+
+    if (bench->expected_result != NO_EXPECTED_RESULT)
+    {
+      /* Run with registered iteration count to verify result */
+      int result = bench->func(bench->iterations);
+      if (result == bench->expected_result)
+      {
+        bench->verify_status = VERIFY_PASS;
+        verify_passed++;
+      }
+      else
+      {
+        bench->verify_status = VERIFY_FAIL;
+        verify_failed++;
+        printf("VERIFY FAIL: %s expected %d, got %d\n", bench->name, bench->expected_result, result);
+      }
+    }
+    else
+    {
+      bench->verify_status = VERIFY_NOT_CHECKED;
+      verify_skipped++;
+    }
+  }
+
+  if (verify_failed > 0)
+  {
+    printf("\nWARNING: %d benchmark(s) failed verification!\n", verify_failed);
+  }
+  if (verify_passed > 0)
+  {
+    printf("%d benchmark(s) passed verification, ", verify_passed);
+    if (verify_skipped > 0)
+    {
+      printf("%d skipped (no expected value)\n\n", verify_skipped);
+    }
+    else
+    {
+      printf("\n\n");
+    }
+  }
+
+  /* Second pass: Run performance measurements */
+  if (have_cycle_counter)
+  {
+    printf("%-20s %12s %12s %12s %8s\n", "Benchmark", "Iterations", "Cycles/iter", "Result", "Verify");
+    printf("%-20s %12s %12s %12s %8s\n", "---------", "----------", "-----------", "------", "------");
+  }
+  else
+  {
+    printf("Note: DWT cycle counter not available (running in QEMU/simulator)\n");
+    printf("%-20s %12s %12s %8s\n", "Benchmark", "Iterations", "Result", "Verify");
+    printf("%-20s %12s %12s %8s\n", "---------", "----------", "------", "------");
+  }
+
+  for (int i = 0; i < num_benchmarks; i++)
+  {
+    const benchmark_t *bench = &benchmarks[i];
+    int iterations = bench->iterations;
+
+    /* Avoid complex ternary chain - TCC may have codegen issues with it */
+    const char *verify_str;
+    if (bench->verify_status == VERIFY_PASS)
+    {
+      verify_str = "PASS";
+    }
+    else if (bench->verify_status == VERIFY_FAIL)
+    {
+      verify_str = "FAIL";
+    }
+    else if (bench->verify_status == VERIFY_NOT_CHECKED)
+    {
+      verify_str = "SKIP";
+    }
+    else
+    {
+      verify_str = "?";
     }
 
-    printf("Running %d benchmarks...\n\n", num_benchmarks);
+    if (have_cycle_counter)
+    {
+      /* Run with registered iteration count */
+      uint64_t cycles = run_benchmark_cycles(bench, iterations);
+      double cycles_per_iter = (double)cycles / iterations;
 
-    /* Check if cycle counter is working */
-    unsigned int test_cycles = get_cycle_count_low();
-    int have_cycle_counter = (test_cycles != 0);
+      /* Run once more to get a result value */
+      int result = bench->func(1);
 
-    if (have_cycle_counter) {
-        printf("%-20s %12s %12s %12s\n", "Benchmark", "Iterations", "Cycles/iter", "Result");
-        printf("%-20s %12s %12s %12s\n", "---------", "----------", "-----------", "------");
-    } else {
-        printf("Note: DWT cycle counter not available (running in QEMU/simulator)\n");
-        printf("%-20s %12s %12s\n", "Benchmark", "Iterations", "Result");
-        printf("%-20s %12s %12s\n", "---------", "----------", "------");
+      printf("%-20s %12d %12.2f %12d %8s\n", bench->name, iterations, cycles_per_iter, result, verify_str);
+      fflush(stdout);
     }
-
-    for (int i = 0; i < num_benchmarks; i++) {
-        const benchmark_t *bench = &benchmarks[i];
-
-        if (have_cycle_counter) {
-            /* Calibrate to run for approximately 100,000 cycles */
-            int iterations = calibrate_iterations(bench, 100000);
-            unsigned int cycles = run_benchmark_cycles(bench, iterations);
-            double cycles_per_iter = cycles / (double)iterations;
-
-            /* Run once more to get a result value */
-            int result = bench->func(1);
-
-            printf("%-20s %12d %12.2f %12d\n", bench->name, iterations, cycles_per_iter, result);
-        } else {
-            /* Just run default iterations and show result */
-            int result = bench->func(bench->default_iterations);
-            printf("%-20s %12d %12d\n", bench->name, bench->default_iterations, result);
-        }
+    else
+    {
+      /* Just run registered iterations and show result */
+      int result = bench->func(iterations);
+      printf("%-20s %12d %12d %8s\n", bench->name, iterations, result, verify_str);
+      fflush(stdout);
     }
+  }
 
-    printf("\n========================================\n");
-    printf("Benchmark complete\n");
-    printf("========================================\n");
+  printf("\n========================================\n");
+  printf("Benchmark complete\n");
+  printf("========================================\n");
+  fflush(stdout);
 
-    return 0;
+  return 0;
 }

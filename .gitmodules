@@ -7,3 +7,6 @@
 [submodule "tests/benchmarks/libs/pico-sdk"]
 	path = tests/benchmarks/libs/pico-sdk
 	url = https://github.com/raspberrypi/pico-sdk.git
+[submodule "tests/benchmarks/mibench"]
+	path = tests/benchmarks/mibench
+	url = https://github.com/embecosm/mibench.git

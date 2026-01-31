@@ -1,80 +1,77 @@
 /*
  * String manipulation benchmark
  * Tests: memcpy, strcpy, strlen, string comparisons
+ * All benchmarks return deterministic results independent of iteration count
  */
 
-#include <string.h>
 #include "benchmarks.h"
+#include <string.h>
 
-/* String copy benchmark */
-int bench_strcpy(int iterations) {
-    char src[256] = "The quick brown fox jumps over the lazy dog. "
-                    "Pack my box with five dozen liquor jugs. "
-                    "How vexingly quick daft zebras jump!";
-    char dst[256];
-    volatile int total_len = 0;
-    
-    for (int i = 0; i < iterations; i++) {
-        strcpy(dst, src);
-        total_len += strlen(dst);
-        /* Modify src slightly */
-        src[0] = 'A' + (i % 26);
-    }
-    
-    return total_len;
+/* String copy benchmark - deterministic */
+int bench_strcpy(int iterations)
+{
+  /* Fixed string - no modification */
+  char src[256] = "The quick brown fox jumps over the lazy dog. "
+                  "Pack my box with five dozen liquor jugs. "
+                  "How vexingly quick daft zebras jump!";
+  char dst[256];
+  int len = 0;
+
+  for (int n = 0; n < iterations; n++)
+  {
+    strcpy(dst, src);
+    len = strlen(dst);
+  }
+
+  return len;
 }
 
-/* Memory copy benchmark */
-int bench_memcpy(int iterations) {
-    char src[512];
-    char dst[512];
-    volatile int checksum = 0;
-    
-    /* Initialize source */
-    for (int i = 0; i < 512; i++) {
-        src[i] = (char)(i * 7 + 13);
+/* Memory copy benchmark - deterministic */
+int bench_memcpy(int iterations)
+{
+  char src[512];
+  char dst[512];
+  int checksum = 0;
+
+  for (int i = 0; i < 512; i++)
+  {
+    src[i] = (char)((i * 7 + 13) & 0xFF);
+  }
+
+  for (int n = 0; n < iterations; n++)
+  {
+    memcpy(dst, src, 256);
+    memcpy(dst + 256, src, 128);
+
+    checksum = 0;
+    for (int j = 0; j < 256; j++)
+    {
+      checksum += (unsigned char)dst[j];
     }
-    
-    for (int i = 0; i < iterations; i++) {
-        memcpy(dst, src, 256);
-        memcpy(dst + 256, src, 128);
-        
-        /* Simple checksum */
-        checksum = 0;
-        for (int j = 0; j < 256; j++) {
-            checksum += dst[j];
-        }
-        
-        /* Modify source */
-        src[0] = (char)i;
-    }
-    
-    return checksum;
+  }
+
+  return checksum;
 }
 
-/* String comparison benchmark */
-int bench_strcmp(int iterations) {
-    const char *strings[] = {
-        "alpha", "beta", "gamma", "delta", "epsilon",
-        "zeta", "eta", "theta", "iota", "kappa"
-    };
-    int num_strings = sizeof(strings) / sizeof(strings[0]);
-    volatile int result = 0;
-    
-    for (int i = 0; i < iterations; i++) {
-        for (int j = 0; j < num_strings; j++) {
-            for (int k = 0; k < num_strings; k++) {
-                result += strcmp(strings[j], strings[k]);
-            }
-        }
-    }
-    
-    return result;
+/* String comparison benchmark - deterministic */
+int bench_strcmp(int iterations)
+{
+  const char *s1 = "alpha";
+  const char *s2 = "beta";
+  int result = 0;
+
+  for (int n = 0; n < iterations; n++)
+  {
+    result = strcmp(s1, s2);
+  }
+
+  return result + 100;
 }
 
-/* Register benchmark */
-void init_string_benchmarks(void) {
-    register_benchmark("strcpy", bench_strcpy, 5000, "String copy operations");
-    register_benchmark("memcpy", bench_memcpy, 2000, "Memory copy operations");
-    register_benchmark("strcmp", bench_strcmp, 500, "String comparisons");
+/* Register benchmark with expected results */
+void init_string_benchmarks(void)
+{
+  register_benchmark_ex("strcpy", bench_strcpy, 1000, "String copy operations", 122);
+  register_benchmark_ex("memcpy", bench_memcpy, 1000, "Memory copy operations", 32640);
+  register_benchmark_ex("strcmp", bench_strcmp, 1000, "String comparisons", 99);
 }

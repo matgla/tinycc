@@ -1855,7 +1855,6 @@ static void load_full_const(int r, int r1, int64_t imm, struct Sym *sym)
 
   entry = th_literal_pool_find_or_allocate(sym, imm);
   entry->sym = sym;
-  entry->imm = imm;
   entry->patch_position = patch_pos;
   entry->relocation = -1; /* No relocation by default */
   entry->data_size = (r1 == PREG_NONE) ? 4 : 8;
@@ -1870,12 +1869,22 @@ static void load_full_const(int r, int r1, int64_t imm, struct Sym *sym)
     if (sym)
     {
       entry->relocation = R_ARM_ABS32;
+      /* The imm value is the addend (offset from symbol base).
+         For arr[i], imm = i * sizeof(element).
+         The linker will add the symbol's address to this addend. */
+      entry->imm = imm;
+    }
+    else
+    {
+      entry->imm = imm;
     }
   }
   else
   {
     if (sym)
     {
+      /* For PIC relocations, the addend is also needed */
+      entry->imm = imm;
       if (text_and_data_separation)
       {
         // all data except constants in .ro section can be addressed relative to
@@ -4159,6 +4168,17 @@ ST_FUNC void tcc_gen_machine_return_value_op(IROperand src, TccIrOp op)
    * fields. */
   if (src.is_const)
   {
+    /* For symbol references, get the addend from the symref pool entry.
+     * src.u.pool_idx is the symref pool index, NOT the addend value. */
+    if (irop_get_tag(src) == IROP_TAG_SYMREF)
+    {
+      IRPoolSymref *symref = irop_get_symref_ex(tcc_state->ir, src);
+      Sym *sym = symref ? symref->sym : NULL;
+      int32_t addend = symref ? symref->addend : 0;
+      tcc_machine_load_constant(R0, is_64bit ? R1 : PREG_NONE, addend, is_64bit, sym);
+      return;
+    }
+    /* For plain constants (IMM32, I64, etc.), use the immediate value directly */
     Sym *sym = irop_get_sym(src);
     tcc_machine_load_constant(R0, is_64bit ? R1 : PREG_NONE, src.u.imm32, is_64bit, sym);
     return;

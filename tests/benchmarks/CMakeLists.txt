@@ -22,15 +22,30 @@ set(BENCHMARK_COMPILER "GCC" CACHE STRING "Compiler for benchmark library (TCC o
 # Usage: cmake -DBENCHMARK_OPT_LEVEL=0 .. or -DBENCHMARK_OPT_LEVEL=1 ..
 set(BENCHMARK_OPT_LEVEL "1" CACHE STRING "Optimization level (0 or 1)")
 
-# Benchmark source files (all except platform-specific main files)
+# Benchmark source files - ONLY the actual benchmark code, compiled with selected compiler
+# Timing/calibration code stays in GCC-compiled minimal_uart_picosdk.c
 set(BENCHMARK_LIB_SRCS
-    ${CMAKE_CURRENT_SOURCE_DIR}/benchmark_main.c
     ${CMAKE_CURRENT_SOURCE_DIR}/bench_math.c
     ${CMAKE_CURRENT_SOURCE_DIR}/bench_control.c
     ${CMAKE_CURRENT_SOURCE_DIR}/bench_string.c
     ${CMAKE_CURRENT_SOURCE_DIR}/bench_algorithm.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/cycle_counter.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/compiler_id.c
 )
+
+# MiBench adapter files (optional, enabled by default)
+option(ENABLE_MIBENCH "Enable MiBench benchmarks" ON)
+if(ENABLE_MIBENCH)
+    message(STATUS "MiBench benchmarks: ENABLED")
+    list(APPEND BENCHMARK_LIB_SRCS
+        ${CMAKE_CURRENT_SOURCE_DIR}/mibench/adapters/mibench_sha.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/mibench/adapters/mibench_bitcount.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/mibench/adapters/mibench_crc32.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/mibench/adapters/mibench_init.c
+    )
+    add_definitions(-DENABLE_MIBENCH=1)
+else()
+    message(STATUS "MiBench benchmarks: DISABLED")
+endif()
 
 # Common flags for benchmark library
 set(BENCH_ARCH_FLAGS "-mcpu=cortex-m33" "-mthumb" "-mfloat-abi=soft")
@@ -55,6 +70,17 @@ if(BENCHMARK_COMPILER STREQUAL "TCC")
     endif()
 
     message(STATUS "Using TCC: ${TCC_EXE}")
+    
+    # Find TCC's soft-float runtime library for fair comparison with GCC's libgcc
+    # TCC_EXE is typically at <tcc_root>/armv8m-tcc, libs are at <tcc_root>/lib/fp/
+    get_filename_component(TCC_DIR ${TCC_EXE} DIRECTORY)
+    set(TCC_FP_LIB "${TCC_DIR}/lib/fp/libtcc1-fp-soft-armv8m.a")
+    if(EXISTS ${TCC_FP_LIB})
+        message(STATUS "Using TCC soft-float runtime: ${TCC_FP_LIB}")
+    else()
+        message(WARNING "TCC soft-float runtime not found at ${TCC_FP_LIB}")
+        set(TCC_FP_LIB "")
+    endif()
 
     # Define source files and their object file mappings
     set(TCC_OBJECTS "")
@@ -125,15 +151,31 @@ endif()
 
 add_executable(minimal_uart_picosdk${BENCHMARK_EXECUTABLE_SUFFIX}
     minimal_uart_picosdk.c
+    benchmark_main.c
+    cycle_counter.c
 )
 
 # Link to Pico SDK libraries
+# Note: We intentionally don't use pico_float here to compare compiler's built-in soft-float
 target_link_libraries(minimal_uart_picosdk${BENCHMARK_EXECUTABLE_SUFFIX}
     pico_stdlib
     hardware_uart
     hardware_gpio
     ${BENCHMARK_LIB}
 )
+
+# Use compiler's own soft-float implementation for fair TCC vs GCC comparison
+# (instead of Pico SDK's optimized pico_float library)
+pico_set_float_implementation(minimal_uart_picosdk${BENCHMARK_EXECUTABLE_SUFFIX} compiler)
+
+# For TCC builds, also link TCC's soft-float runtime library explicitly
+if(BENCHMARK_COMPILER STREQUAL "TCC" AND TCC_FP_LIB)
+    # Use --whole-archive to ensure TCC's soft-float symbols take precedence
+    target_link_libraries(minimal_uart_picosdk${BENCHMARK_EXECUTABLE_SUFFIX}
+        -Wl,--whole-archive ${TCC_FP_LIB} -Wl,--no-whole-archive
+    )
+    message(STATUS "Linked TCC soft-float runtime for fair comparison with GCC libgcc")
+endif()
 
 target_compile_definitions(minimal_uart_picosdk${BENCHMARK_EXECUTABLE_SUFFIX}
     PUBLIC

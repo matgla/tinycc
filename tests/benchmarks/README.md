@@ -70,6 +70,8 @@ See [RP2350_README.md](RP2350_README.md) for detailed setup instructions.
 
 ## Benchmarks
 
+### Core Micro-benchmarks
+
 | Benchmark | Description |
 |-----------|-------------|
 | integer_math | Integer arithmetic (mul, shift, xor) |
@@ -84,6 +86,16 @@ See [RP2350_README.md](RP2350_README.md) for detailed setup instructions.
 | fibonacci | Recursive function calls |
 | bubble_sort | Nested loops |
 | linked_list | Pointer chasing |
+
+### MiBench Suite (Real-world Benchmarks)
+
+| Benchmark | Category | Description |
+|-----------|----------|-------------|
+| mibench_sha | Security | SHA-1 cryptographic hash |
+| mibench_bitcount | Automotive | Bit counting algorithms |
+| mibench_crc32 | Telecomm | CRC32 checksum computation |
+
+See [MIBENCH_INTEGRATION.md](MIBENCH_INTEGRATION.md) for full MiBench integration plan.
 
 ## Files
 

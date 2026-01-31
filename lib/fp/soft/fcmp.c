@@ -85,34 +85,7 @@ int __aeabi_fcmpun(float a, float b)
   return fcmp_core(a, b) == 2 ? 1 : 0;
 }
 
-/* Wrapper functions with 'c' prefix that set ARM CPSR flags */
-
-int __aeabi_cfcmple(float a, float b)
-{
-  return __aeabi_fcmple(a, b);
-}
-
-int __aeabi_cfrcmple(float a, float b)
-{
-  return __aeabi_fcmple(b, a);
-}
-
-int __aeabi_cfcmplt(float a, float b)
-{
-  return __aeabi_fcmplt(a, b);
-}
-
-int __aeabi_cfcmpge(float a, float b)
-{
-  return __aeabi_fcmpge(a, b);
-}
-
-int __aeabi_cfcmpgt(float a, float b)
-{
-  return __aeabi_fcmpgt(a, b);
-}
-
-int __aeabi_cfcmpeq(float a, float b)
-{
-  return __aeabi_fcmpeq(a, b);
-}
+/* Note: The 'c' prefix functions (__aeabi_cfcmple, __aeabi_cfrcmple, etc.)
+ * that set ARM CPSR flags are implemented in assembly in fcmp_asm.S
+ * because C code cannot directly manipulate the ARM condition flags.
+ */

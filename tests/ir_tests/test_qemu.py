@@ -69,6 +69,9 @@ TEST_FILES = [
     ("bug_ull_mul10_loop.c", 0),
     ("bug_ull_mul10_once.c", 0),
     ("bug_ll_mul10_switch_min.c", 0),
+    # KNOWN BUG: Return from else block with string literal - pointer corrupted
+    # ("bug_ternary_string.c", 0),  # Nested ternary with string literals
+    # ("bug_return_else_string.c", 0),  # Return string from else block
     # ("test_cleanup_double.c", 0),
     ("91_const_propagation.c", 0),
     ("92_loop_invariant.c", 0),
@@ -85,6 +88,10 @@ TEST_FILES = [
     ("test_double_printf_ops.c", 0),
     ("test_double_printf_literals.c", 0),
     ("test_double_printf_mixed.c", 0),
+
+    # Single-precision float tests
+    ("72_float_result.c", 1),  # Returns 1 on success (non-standard convention)
+    ("73_float_ops.c", 1),     # Returns 1 on success
 
     # AEABI soft-float regressions (bit-level tests; avoids printf %f).
     ("test_aeabi_dmul_bits.c", 0),
@@ -248,9 +255,17 @@ TCC_BUG_TEST_FILES = [
     # Bug: "load_to_dest_ir I64/F64: dest.pr1 is spilled, need IR-level handling"
     # Occurs when returning 64-bit values from functions with volatile memory access
     ("test_tcc_i64_ir_bug.c", 0),
-    
+
     # Bug: Volatile register access issues with ARM DWT cycle counter
     ("test_tcc_volatile_reg.c", 0),
+
+    # Bug: Float math loop produces incorrect result
+    # TCC returns 4999/8999 instead of expected 2574 in float math calculations
+    # See: bench_math.c bench_float_math() benchmark
+    ("test_float_math_loop.c", 0),
+
+    # Debug test for float operations
+    ("test_float_simple_calc.c", 0),
 ]
 
 TEST_FILES_WITH_ARGS = [
@@ -572,12 +587,12 @@ _TCC_BUG_PARAMS, _TCC_BUG_IDS = _generate_tcc_bug_params() if TCC_BUG_TEST_FILES
 @pytest.mark.parametrize("test_file,expected_exit_code,opt_level", _TCC_BUG_PARAMS, ids=_TCC_BUG_IDS)
 def test_tcc_compiler_bugs(test_file, expected_exit_code, opt_level, tmp_path):
     """Test cases for TCC compiler bug reproductions.
-    
+
     These tests verify that previously fixed compiler bugs stay fixed:
-    
+
     1. test_tcc_i64_ir_bug: "load_to_dest_ir I64/F64: dest.pr1 is spilled" error
        - Fixed: Handle case when pr1_spilled is set but pr1_reg is PREG_REG_NONE
-       
+
     2. test_tcc_volatile_reg: Volatile memory-mapped register access issues
        - Fixed: Handle 64-bit constant load to 32-bit destination
     """
