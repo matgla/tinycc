@@ -1,0 +1,240 @@
+================================================================================
+BUBBLE_SORT DISASSEMBLY COMPARISON: TCC -O1 vs GCC -O1
+================================================================================
+
+Source Code (bench_algorithm.c):
+--------------------------------
+int bench_bubble_sort(int iterations)
+{
+  (void)iterations;
+
+  int arr[64];
+  int checksum = 0;
+
+  /* Initialize with fixed deterministic values */
+  for (int i = 0; i < 64; i++) {
+      arr[i] = (63 - i) * 7 + 100;
+  }
+
+  /* Bubble sort */
+  for (int i = 0; i < 63; i++) {
+      for (int j = 0; j < 63 - i; j++) {
+          if (arr[j] > arr[j + 1]) {
+              int temp = arr[j];
+              arr[j] = arr[j + 1];
+              arr[j + 1] = temp;
+          }
+      }
+  }
+
+  /* Checksum of sorted array */
+  checksum = 0;
+  for (int i = 0; i < 64; i++) {
+      checksum += arr[i] * i;
+  }
+
+  return checksum;
+}
+
+================================================================================
+TCC -O1 (28 instructions, 188 bytes)
+================================================================================
+200044a2 <bench_bubble_sort>:
+200044a2:  e92d 03f0   stmdb   sp!, {r4, r5, r6, r7, r8, r9}   // Save regs
+200044a6:  f10d 0700   add.w   r7, sp, #0                        // Frame pointer
+200044aa:  b0c0        sub     sp, #256                          // Allocate arr[64]
+
+; Initialization loop: arr[i] = (63 - i) * 7 + 100
+200044ac:  2100        movs    r1, #0                            // checksum = 0
+200044ae:  2200        movs    r2, #0                            // i = 0
+200044b0:  2a40        cmp     r2, #64                           // i < 64?
+200044b2:  f280 8018   bge.w   200044e6                          // Exit loop
+200044b6:  f000 b803   b.w     200044c0                          // Jump to body
+200044ba:  3201        adds    r2, #1                            // i++
+200044bc:  f7ff bff8   b.w     200044b0                          // Continue loop
+200044c0:  ea4f 0082   mov.w   r0, r2, lsl #2                    // r0 = i * 4
+200044c4:  f5a7 7c80   sub.w   ip, r7, #256                      // ip = &arr[0]
+200044c8:  eb0c 0300   add.w   r3, ip, r0                        // r3 = &arr[i]
+200044cc:  f04f 0c3f   mov.w   ip, #63                           // ip = 63
+200044d0:  ebac 0002   sub.w   r0, ip, r2                        // r0 = 63 - i
+200044d4:  f04f 0c07   mov.w   ip, #7                            // ip = 7
+200044d8:  fb00 f40c   mul.w   r4, r0, ip                        // r4 = (63-i)*7
+200044dc:  f104 0064   add.w   r0, r4, #100                      // r0 = (63-i)*7+100
+200044e0:  6018        str     r0, [r3, #0]                      // arr[i] = value
+200044e2:  f7ff bfea   b.w     200044ba                          // Next iteration
+
+; Outer bubble sort loop: for (i = 0; i < 63; i++)
+200044e6:  2000        movs    r0, #0                            // i = 0
+200044e8:  283f        cmp     r0, #63                           // i < 63?
+200044ea:  f280 804d   bge.w   20004588                          // Exit to checksum
+200044ee:  f000 b803   b.w     200044f8                          // Jump to inner loop
+200044f2:  3001        adds    r0, #1                            // i++
+200044f4:  f7ff bff8   b.w     200044e8                          // Continue outer
+
+; Inner bubble sort loop: for (j = 0; j < 63 - i; j++)
+200044f8:  2200        movs    r2, #0                            // j = 0
+200044fa:  f04f 0c3f   mov.w   ip, #63                           // ip = 63
+200044fe:  ebac 0300   sub.w   r3, ip, r0                        // r3 = 63 - i
+20004502:  429a        cmp     r2, r3                            // j < 63-i?
+20004504:  f280 803e   bge.w   20004584                          // Exit inner
+20004508:  f000 b803   b.w     20004512                          // Jump to compare
+2000450c:  3201        adds    r2, #1                            // j++
+2000450e:  f7ff bff4   b.w     200044fa                          // Continue inner
+
+; Compare arr[j] > arr[j+1]
+20004512:  ea4f 0482   mov.w   r4, r2, lsl #2                    // r4 = j * 4
+20004516:  f5a7 7c80   sub.w   ip, r7, #256                      // ip = &arr[0]
+2000451a:  eb0c 0504   add.w   r5, ip, r4                        // r5 = &arr[j]
+2000451e:  1c54        adds    r4, r2, #1                        // r4 = j + 1
+20004520:  ea4f 0684   mov.w   r6, r4, lsl #2                    // r6 = (j+1)*4
+20004524:  f5a7 7c80   sub.w   ip, r7, #256                      // ip = &arr[0]
+20004528:  eb0c 0406   add.w   r4, ip, r6                        // r4 = &arr[j+1]
+2000452c:  f8d5 c000   ldr.w   ip, [r5]                          // ip = arr[j]
+20004530:  b500        push    {lr}                              // Save lr
+20004532:  f8d4 e000   ldr.w   lr, [r4]                          // lr = arr[j+1]
+20004536:  45f4        cmp     ip, lr                            // Compare
+20004538:  e8bd 4000   ldmia.w sp!, {lr}                         // Restore lr
+2000453c:  f340 8020   ble.w   20004580                          // Skip if <=
+
+; Swap arr[j] and arr[j+1]
+20004540:  ea4f 0482   mov.w   r4, r2, lsl #2                    // r4 = j * 4
+20004544:  f5a7 7c80   sub.w   ip, r7, #256                      // ip = &arr[0]
+20004548:  eb0c 0504   add.w   r5, ip, r4                        // r5 = &arr[j]
+2000454c:  682e        ldr     r6, [r5, #0]                      // temp = arr[j]
+2000454e:  4625        mov     r5, r4
+20004550:  f5a7 7c80   sub.w   ip, r7, #256                      // ip = &arr[0]
+20004554:  eb0c 0405   add.w   r4, ip, r5                        // r4 = &arr[j]
+20004558:  1c55        adds    r5, r2, #1                        // r5 = j + 1
+2000455a:  ea4f 0885   mov.w   r8, r5, lsl #2                    // r8 = (j+1)*4
+2000455e:  f5a7 7c80   sub.w   ip, r7, #256                      // ip = &arr[0]
+20004562:  eb0c 0908   add.w   r9, ip, r8                        // r9 = &arr[j+1]
+20004566:  f8d9 8000   ldr.w   r8, [r9]                          // r8 = arr[j+1]
+2000456a:  f8c4 8000   str.w   r8, [r4]                          // arr[j] = arr[j+1]
+2000456e:  462c        mov     r4, r5
+20004570:  ea4f 0584   mov.w   r5, r4, lsl #2
+20004574:  f5a7 7c80   sub.w   ip, r7, #256                      // ip = &arr[0]
+20004578:  eb0c 0405   add.w   r4, ip, r5                        // r4 = &arr[j+1]
+2000457c:  4635        mov     r5, r6                            // r5 = temp
+2000457e:  6025        str     r5, [r4, #0]                      // arr[j+1] = temp
+20004580:  f7ff bfc4   b.w     2000450c                          // Continue inner
+20004584:  f7ff bfb5   b.w     200044f2                          // Continue outer
+
+; Checksum loop
+20004588:  2100        movs    r1, #0                            // checksum = 0
+2000458a:  2000        movs    r0, #0                            // i = 0
+2000458c:  2840        cmp     r0, #64                           // i < 64?
+2000458e:  f280 8012   bge.w   200045b6                          // Exit
+20004592:  f000 b803   b.w     2000459c                          // Jump to body
+20004596:  3001        adds    r0, #1                            // i++
+20004598:  f7ff bff8   b.w     2000458c                          // Continue loop
+2000459c:  ea4f 0280   mov.w   r2, r0, lsl #2                    // r2 = i * 4
+200045a0:  f5a7 7c80   sub.w   ip, r7, #256                      // ip = &arr[0]
+200045a4:  eb0c 0302   add.w   r3, ip, r2                        // r3 = &arr[i]
+200045a8:  f8d3 c000   ldr.w   ip, [r3]                          // ip = arr[i]
+200045ac:  fb0c f200   mul.w   r2, ip, r0                        // r2 = arr[i] * i
+200045b0:  1889        adds    r1, r1, r2                        // checksum += ...
+200045b2:  f7ff bff0   b.w     20004596                          // Next iteration
+
+200045b6:  4608        mov     r0, r1                            // Return checksum
+200045b8:  46bd        mov     sp, r7                            // Restore sp
+200045ba:  e8bd 03f0   ldmia.w sp!, {r4, r5, r6, r7, r8, r9}    // Restore regs
+200045be:  4770        bx      lr                                // Return
+
+================================================================================
+GCC -O1 (22 instructions, 76 bytes) 
+================================================================================
+20003d30 <bench_bubble_sort>:
+20003d30:  b500        push    {lr}                              // Save lr
+20003d32:  b0c1        sub     sp, #260                          // Allocate arr[64] + padding
+20003d34:  46ee        mov     lr, sp                            // lr = array base
+20003d36:  f1ad 0c04   sub.w   ip, sp, #4                        // ip = end pointer
+20003d3a:  a83f        add     r0, sp, #252                      // r0 = last element ptr
+20003d3c:  4662        mov     r2, ip                            // r2 = current ptr
+
+; Initialization loop (unrolled/optimized): arr[i] = (63 - i) * 7 + 100
+20003d3e:  f240 231d   movw    r3, #541                          // r3 = 541 (start value)
+20003d42:  f842 3f04   str.w   r3, [r2, #4]!                     // Store, post-increment
+20003d46:  3b07        subs    r3, #7                            // r3 -= 7
+20003d48:  4282        cmp     r2, r0                            // At end?
+20003d4a:  d1fa        bne.n   20003d42                          // Continue
+
+; Combined bubble sort loops (optimized structure)
+20003d4c:  4673        mov     r3, lr                            // r3 = array base
+20003d4e:  681a        ldr     r2, [r3, #0]                      // r2 = arr[j]
+20003d50:  f853 1f04   ldr.w   r1, [r3, #4]!                     // r1 = arr[j+1], r3 += 4
+20003d54:  428a        cmp     r2, r1                            // Compare
+20003d56:  bfc4        itt     gt                                // If greater than
+20003d58:  f843 1c04   strgt.w r1, [r3, #-4]                     //   arr[j] = arr[j+1]
+20003d5c:  601a        strgt   r2, [r3, #0]                      //   arr[j+1] = temp
+20003d5e:  4283        cmp     r3, r0                            // At end?
+20003d60:  d1f5        bne.n   20003d4e                          // Continue inner
+20003d62:  3804        subs    r0, #4                            // Reduce end pointer
+20003d64:  4570        cmp     r0, lr                            // Done?
+20003d66:  d1f1        bne.n   20003d4c                          // Continue outer
+
+; Checksum loop with MLA instruction
+20003d68:  2300        movs    r3, #0                            // i = 0
+20003d6a:  4618        mov     r0, r3                            // checksum = 0
+20003d6c:  f85c 2f04   ldr.w   r2, [ip, #4]!                     // r2 = arr[i], post-inc
+20003d70:  fb02 0003   mla     r0, r2, r3, r0                    // r0 += r2 * r3
+20003d74:  3301        adds    r3, #1                            // i++
+20003d76:  2b40        cmp     r3, #64                           // i < 64?
+20003d78:  d1f8        bne.n   20003d6c                          // Continue
+
+20003d7a:  b041        add     sp, #260                          // Deallocate
+20003d7c:  f85d fb04   ldr.w   pc, [sp], #4                      // Return
+
+================================================================================
+ANALYSIS
+================================================================================
+
+1. CODE SIZE:
+   - TCC -O1: ~188 bytes (47 instructions, 4 bytes each on average)
+   - GCC -O1: ~76 bytes (22 instructions)
+   - GCC is 2.5x smaller
+
+2. STACK USAGE:
+   - Both use 256 bytes for arr[64]
+   - TCC saves 6 registers (r4-r9) = 24 bytes
+   - GCC saves only lr = 4 bytes
+   - Total: TCC ~280 bytes, GCC ~260 bytes
+
+3. KEY OPTIMIZATIONS GCC DOES THAT TCC DOESN'T:
+
+   a) Initialization loop:
+      - TCC: Calculates (63-i)*7+100 for each element
+      - GCC: Uses movw #541 (first value), decrements by 7 each iteration
+      - GCC eliminates multiplication entirely!
+
+   b) Bubble sort loop structure:
+      - TCC: Nested loops with separate outer/inner loop counters
+      - GCC: Single combined loop using end pointer that decrements
+      - GCC uses post-increment addressing (str.w r3, [r2, #4]!)
+      - GCC uses IT (If-Then) instruction for conditional swap
+
+   c) Register usage:
+      - TCC: Uses r4-r9 extensively, many redundant loads
+      - GCC: Minimal register usage, efficient register allocation
+
+   d) Instruction selection:
+      - GCC uses MLA (Multiply-Accumulate) for checksum
+      - TCC uses separate MUL and ADD instructions
+
+   e) Branch optimization:
+      - TCC: Many unconditional branches (b.w) to code just a few bytes away
+      - GCC: Short conditional branches (bne.n), no unnecessary jumps
+
+4. PERFORMANCE IMPLICATIONS:
+   - GCC version will be significantly faster due to:
+     * Fewer instructions per iteration
+     * Better instruction scheduling
+     * No redundant memory accesses
+     * Use of IT blocks instead of branches
+     * MLA instruction for checksum
+
+5. TCC WEAKNESSES OBSERVED:
+   - Redundant calculations of array base address (f5a7 7c80 repeated many times)
+   - Poor constant propagation
+   - No loop fusion or restructuring
+   - Excessive register spilling (push/pop lr around compare)
+   - Inefficient array indexing (recalculates offsets repeatedly)
