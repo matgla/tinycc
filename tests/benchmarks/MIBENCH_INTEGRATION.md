@@ -91,10 +91,10 @@ tests/benchmarks/
 │   │   ├── security/
 │   │   ├── telecomm/
 │   │   └── ...
-│   ├── adapters/             # Adapter files
-│   │   ├── mibench_basicmath.c
-│   │   ├── mibench_bitcount.c
-│   │   └── ...
+├── mibench_adapters/         # Adapter files (project-specific)
+│   ├── mibench_basicmath.c
+│   ├── mibench_bitcount.c
+│   └── ...
 │   ├── data/                 # Test data files (inputs)
 │   │   ├── small/            # Small dataset (fast test)
 │   │   └── large/            # Large dataset (comprehensive)
@@ -108,7 +108,7 @@ tests/benchmarks/
 Each MiBench benchmark needs an adapter to integrate with our harness:
 
 ```c
-// mibench/adapters/mibench_basicmath.c
+// mibench_adapters/mibench_basicmath.c
 #include "benchmarks.h"
 #include "../sources/automotive/basicmath/basicmath_small.c"
 
@@ -145,7 +145,7 @@ if(ENABLE_MIBENCH)
     endif()
     
     # Add MiBench sources to build
-    file(GLOB MIBENCH_ADAPTERS mibench/adapters/*.c)
+    file(GLOB MIBENCH_ADAPTERS mibench_adapters/*.c)
     target_sources(benchmark PRIVATE ${MIBENCH_ADAPTERS})
     
     # Include paths

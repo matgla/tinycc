@@ -528,6 +528,91 @@ def print_opt_comparison(compiler_name: str, o0_result: CompilerResult, o1_resul
     print("="*80)
 
 
+def print_three_way_comparison(tcc_o1: CompilerResult, gcc_o0: CompilerResult, gcc_o1: CompilerResult):
+    """Print comparison table of TCC -O1 vs GCC -O0 and GCC -O1."""
+    print("\n" + "="*100)
+    print("COMPREHENSIVE COMPARISON: TCC -O1 vs GCC -O0 vs GCC -O1")
+    print("="*100)
+
+    # Binary sizes
+    print("\n--- Binary Size Comparison ---")
+    print(f"{'Section':<15} {'TCC-O1':>12} {'GCC-O0':>12} {'GCC-O1':>12} {'TCC/GCC-O1':>12}")
+    print(f"{'-'*15} {'-'*12} {'-'*12} {'-'*12} {'-'*12}")
+
+    for section in ['text', 'data', 'bss', 'dec']:
+        tcc_size = tcc_o1.build_size.get(section, 0)
+        gcc_o0_size = gcc_o0.build_size.get(section, 0)
+        gcc_o1_size = gcc_o1.build_size.get(section, 0)
+        ratio = (tcc_size / gcc_o1_size * 100) if gcc_o1_size > 0 else 0
+        print(f"{section:<15} {tcc_size:>12} {gcc_o0_size:>12} {gcc_o1_size:>12} {ratio:>11.1f}%")
+
+    # Performance comparison
+    print("\n--- Performance Comparison (cycles per iteration) ---")
+    print(f"{'Benchmark':<25} {'TCC-O1':>12} {'GCC-O0':>12} {'GCC-O1':>12} {'TCC/GCC-O0':>12} {'TCC/GCC-O1':>12}")
+    print(f"{'-'*25} {'-'*12} {'-'*12} {'-'*12} {'-'*12} {'-'*12}")
+
+    tcc_benches = {b.name: b for b in tcc_o1.benchmarks}
+    gcc_o0_benches = {b.name: b for b in gcc_o0.benchmarks}
+    gcc_o1_benches = {b.name: b for b in gcc_o1.benchmarks}
+
+    all_names = sorted(set(tcc_benches.keys()) | set(gcc_o0_benches.keys()) | set(gcc_o1_benches.keys()))
+
+    total_tcc = 0
+    total_gcc_o0 = 0
+    total_gcc_o1 = 0
+    tcc_vs_gcc_o0_wins = 0
+    tcc_vs_gcc_o1_wins = 0
+
+    for name in all_names:
+        tcc_b = tcc_benches.get(name)
+        gcc_o0_b = gcc_o0_benches.get(name)
+        gcc_o1_b = gcc_o1_benches.get(name)
+
+        tcc_cycles = tcc_b.cycles_per_iter if tcc_b else 0
+        gcc_o0_cycles = gcc_o0_b.cycles_per_iter if gcc_o0_b else 0
+        gcc_o1_cycles = gcc_o1_b.cycles_per_iter if gcc_o1_b else 0
+
+        # Format output strings
+        tcc_str = f"{tcc_cycles:.2f}" if tcc_b else "N/A"
+        gcc_o0_str = f"{gcc_o0_cycles:.2f}" if gcc_o0_b else "N/A"
+        gcc_o1_str = f"{gcc_o1_cycles:.2f}" if gcc_o1_b else "N/A"
+
+        # Calculate ratios
+        if tcc_cycles > 0 and gcc_o0_cycles > 0:
+            ratio_o0 = (tcc_cycles / gcc_o0_cycles * 100)
+            ratio_o0_str = f"{ratio_o0:.1f}%"
+            total_tcc += tcc_cycles
+            total_gcc_o0 += gcc_o0_cycles
+            if tcc_cycles < gcc_o0_cycles:
+                tcc_vs_gcc_o0_wins += 1
+        else:
+            ratio_o0_str = "N/A"
+
+        if tcc_cycles > 0 and gcc_o1_cycles > 0:
+            ratio_o1 = (tcc_cycles / gcc_o1_cycles * 100)
+            ratio_o1_str = f"{ratio_o1:.1f}%"
+            total_gcc_o1 += gcc_o1_cycles
+            if tcc_cycles < gcc_o1_cycles:
+                tcc_vs_gcc_o1_wins += 1
+        else:
+            ratio_o1_str = "N/A"
+
+        print(f"{name:<25} {tcc_str:>12} {gcc_o0_str:>12} {gcc_o1_str:>12} {ratio_o0_str:>12} {ratio_o1_str:>12}")
+
+    print(f"{'-'*25} {'-'*12} {'-'*12} {'-'*12} {'-'*12} {'-'*12}")
+
+    # Overall summary
+    if total_tcc > 0 and total_gcc_o0 > 0 and total_gcc_o1 > 0:
+        overall_ratio_o0 = (total_tcc / total_gcc_o0 * 100)
+        overall_ratio_o1 = (total_tcc / total_gcc_o1 * 100)
+        print(f"\n{'OVERALL':<25} {total_tcc:>12.2f} {total_gcc_o0:>12.2f} {total_gcc_o1:>12.2f} {overall_ratio_o0:>11.1f}% {overall_ratio_o1:>11.1f}%")
+
+    print(f"\n--- Summary ---")
+    print(f"TCC-O1 vs GCC-O0: TCC wins {tcc_vs_gcc_o0_wins}/{len(all_names)} benchmarks")
+    print(f"TCC-O1 vs GCC-O1: TCC wins {tcc_vs_gcc_o1_wins}/{len(all_names)} benchmarks")
+    print("="*100)
+
+
 def print_comparison(tcc_result: CompilerResult, gcc_result: CompilerResult):
     """Print comparison table of TCC vs GCC results with verification status."""
     print("\n" + "="*80)
@@ -765,23 +850,21 @@ def main():
 
     # Run based on optimization level selection
     if args.opt_level == "both":
-        # Run both -O0 and -O1 and compare
-        tcc_o0, gcc_o0 = run_single_opt("0", " (1/2)")
+        # Run TCC-O1, GCC-O0, and GCC-O1 for comprehensive comparison
+        print("="*80)
+        print("Running comprehensive comparison: TCC-O1, GCC-O0, GCC-O1")
+        print("="*80)
+        
+        tcc_o1, _ = run_single_opt("1", " (1/3) - TCC")
         print("\n")
-        tcc_o1, gcc_o1 = run_single_opt("1", " (2/2)")
+        _, gcc_o0 = run_single_opt("0", " (2/3) - GCC-O0")
+        print("\n")
+        _, gcc_o1 = run_single_opt("1", " (3/3) - GCC-O1")
 
-        # Print -O0 vs -O1 comparison for each compiler
-        if tcc_o0 and tcc_o1:
+        # Print comprehensive three-way comparison
+        if tcc_o1 and gcc_o0 and gcc_o1:
             print("\n")
-            print_opt_comparison("TCC", tcc_o0, tcc_o1)
-        if gcc_o0 and gcc_o1:
-            print("\n")
-            print_opt_comparison("GCC", gcc_o0, gcc_o1)
-
-        # Also print TCC vs GCC for -O1 (the default comparison)
-        if tcc_o1 and gcc_o1:
-            print("\n")
-            print_comparison(tcc_o1, gcc_o1)
+            print_three_way_comparison(tcc_o1, gcc_o0, gcc_o1)
     else:
         # Run single optimization level
         tcc_result, gcc_result = run_single_opt(args.opt_level)
@@ -798,18 +881,14 @@ def main():
             f.write("="*80 + "\n\n")
 
             if args.opt_level == "both":
-                # Save results from both optimization levels
-                if tcc_o0:
-                    f.write(f"--- TCC -O0 Raw Output ---\n")
-                    f.write(tcc_o0.raw_output)
+                # Save results from comprehensive comparison
+                if tcc_o1:
+                    f.write(f"--- TCC -O1 Raw Output ---\n")
+                    f.write(tcc_o1.raw_output)
                     f.write("\n\n")
                 if gcc_o0:
                     f.write(f"--- GCC -O0 Raw Output ---\n")
                     f.write(gcc_o0.raw_output)
-                    f.write("\n\n")
-                if tcc_o1:
-                    f.write(f"--- TCC -O1 Raw Output ---\n")
-                    f.write(tcc_o1.raw_output)
                     f.write("\n\n")
                 if gcc_o1:
                     f.write(f"--- GCC -O1 Raw Output ---\n")

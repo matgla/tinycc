@@ -37,10 +37,10 @@ option(ENABLE_MIBENCH "Enable MiBench benchmarks" ON)
 if(ENABLE_MIBENCH)
     message(STATUS "MiBench benchmarks: ENABLED")
     list(APPEND BENCHMARK_LIB_SRCS
-        ${CMAKE_CURRENT_SOURCE_DIR}/mibench/adapters/mibench_sha.c
-        ${CMAKE_CURRENT_SOURCE_DIR}/mibench/adapters/mibench_bitcount.c
-        ${CMAKE_CURRENT_SOURCE_DIR}/mibench/adapters/mibench_crc32.c
-        ${CMAKE_CURRENT_SOURCE_DIR}/mibench/adapters/mibench_init.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/mibench_adapters/mibench_sha.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/mibench_adapters/mibench_bitcount.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/mibench_adapters/mibench_crc32.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/mibench_adapters/mibench_init.c
     )
     add_definitions(-DENABLE_MIBENCH=1)
 else()
