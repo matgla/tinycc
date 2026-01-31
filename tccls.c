@@ -983,9 +983,15 @@ int tcc_ls_find_free_scratch_reg(LSLiveIntervalState *ls, int instruction_idx, u
   if (!(live_regs & (1u << 12)))
     return 12;
 
-  /* Try R11 - reserved for call argument processing but available as scratch otherwise */
-  if (!(live_regs & (1u << 11)))
-    return 11;
+  /* IMPORTANT: Do NOT return R11 or any callee-saved register (R4-R10) here!
+   * These registers can only be used as scratch if they were already saved
+   * in the function prolog. If we return them as "free", the caller won't
+   * save them (since they appear "free"), but the prolog also didn't save
+   * them (since they weren't in dirty_registers), leading to ABI violations.
+   *
+   * The caller (get_scratch_reg_with_save) will fall through to push/pop
+   * these registers if no caller-saved registers are available.
+   */
 
   /* Finally try LR if not a leaf function */
   if (!is_leaf && !(live_regs & (1u << 14)))

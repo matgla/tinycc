@@ -5,6 +5,7 @@
  */
 
 #include "benchmarks.h"
+#include <stdio.h>
 
 /* Helper functions for call benchmark */
 static int NOINLINE func_a(int x)
@@ -80,11 +81,14 @@ int bench_switch(int iterations)
 {
   int r = 0;
 
+  /* No debug prints - check if TCC code without printf works */
+
   for (int n = 0; n < iterations; n++)
   {
     int i = 7; /* Fixed value for deterministic result */
 
     r = 1000; /* Reset each iteration */
+
     switch (i)
     {
     case 0:
@@ -116,6 +120,7 @@ int bench_switch(int iterations)
     }
   }
 
+  /* No printf at end either */
   return r;
 }
 

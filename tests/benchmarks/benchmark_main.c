@@ -95,10 +95,8 @@ static uint64_t run_benchmark_cycles(const benchmark_t *bench, int iterations)
 {
   volatile int result = 0; /* Prevent optimization */
 
-  /* Warmup */
   bench->func(iterations / 10);
 
-  /* Actual measurement using DWT cycle counter with 64-bit overflow tracking */
   uint64_t start = get_cycle_count();
   result = bench->func(iterations);
   uint64_t end = get_cycle_count();
@@ -151,6 +149,7 @@ int benchmark_main(void)
   }
 
   printf("Running %d benchmarks...\n\n", num_benchmarks);
+  fflush(stdout);
 
   /* Check if cycle counter is working */
   uint64_t test_time = get_cycle_count();
@@ -212,6 +211,7 @@ int benchmark_main(void)
   {
     printf("%-20s %12s %12s %12s %8s\n", "Benchmark", "Iterations", "Cycles/iter", "Result", "Verify");
     printf("%-20s %12s %12s %12s %8s\n", "---------", "----------", "-----------", "------", "------");
+    fflush(stdout);
   }
   else
   {
@@ -248,12 +248,21 @@ int benchmark_main(void)
     {
       /* Run with registered iteration count */
       uint64_t cycles = run_benchmark_cycles(bench, iterations);
-      double cycles_per_iter = (double)cycles / iterations;
-
-      /* Run once more to get a result value */
       int result = bench->func(1);
-
-      printf("%-20s %12d %12.2f %12d %8s\n", bench->name, iterations, cycles_per_iter, result, verify_str);
+      /* Small delay after TCC function returns */
+      for (volatile int delay = 0; delay < 100000; delay++)
+      {
+      }
+      /* Split the printf into multiple simple ones */
+      printf("%-20s ", bench->name);
+      fflush(stdout);
+      printf("%12d ", iterations);
+      fflush(stdout);
+      printf("%12d ", (int)(cycles & 0xFFFFFFFF)); /* Just print raw cycles */
+      fflush(stdout);
+      printf("%12d ", result);
+      fflush(stdout);
+      printf("%8s\n", verify_str);
       fflush(stdout);
     }
     else

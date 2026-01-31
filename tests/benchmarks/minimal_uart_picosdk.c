@@ -11,7 +11,7 @@
 extern int benchmark_main(void);
 
 #define UART_ID uart0
-#define BAUD_RATE 9600
+#define BAUD_RATE 460800
 #define UART_TX_PIN 32
 #define UART_RX_PIN 33
 #define LED_PIN 25

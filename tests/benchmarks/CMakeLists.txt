@@ -70,7 +70,7 @@ if(BENCHMARK_COMPILER STREQUAL "TCC")
     endif()
 
     message(STATUS "Using TCC: ${TCC_EXE}")
-    
+
     # Find TCC's soft-float runtime library for fair comparison with GCC's libgcc
     # TCC_EXE is typically at <tcc_root>/armv8m-tcc, libs are at <tcc_root>/lib/fp/
     get_filename_component(TCC_DIR ${TCC_EXE} DIRECTORY)
@@ -96,7 +96,6 @@ if(BENCHMARK_COMPILER STREQUAL "TCC")
             OUTPUT ${obj}
             COMMAND ${TCC_EXE} -c ${BENCH_ARCH_FLAGS} -O${BENCHMARK_OPT_LEVEL} -g
                 -I${CMAKE_CURRENT_SOURCE_DIR}
-                -I${CMAKE_CURRENT_SOURCE_DIR}/../ir_tests/libc_includes
                 -I${CMAKE_CURRENT_SOURCE_DIR}/../../include
                 ${src} -o ${obj}
             DEPENDS ${src}

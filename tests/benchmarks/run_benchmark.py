@@ -271,7 +271,7 @@ ELF="{remote_elf}"
 
 echo "Configuring serial port..."
 # Configure serial port with proper flush settings
-stty -F $SERIAL 9600 cs8 -cstopb -parenb raw -echo 2>/dev/null || true
+stty -F $SERIAL 460800 cs8 -cstopb -parenb raw -echo 2>/dev/null || true
 
 # Clear any pending data in serial port using multiple methods
 echo "Flushing serial port..."
