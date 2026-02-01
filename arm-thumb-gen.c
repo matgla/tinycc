@@ -3669,6 +3669,21 @@ static void thumb_emit_data_processing_op32(IROperand src1, IROperand src2, IROp
     restore_scratch_reg(&src1_alloc);
 }
 
+/* Helper to get accumulator operand for MLA instruction (4th operand)
+ * MLA instructions have 4 operands: dest = src1 * src2 + accum
+ * The accumulator is stored as an extra operand at pool[operand_base + 3]
+ */
+static inline IROperand tcc_ir_op_get_accum_inline(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  if (!ir || !q)
+    return IROP_NONE;
+  /* Accumulator is stored at operand_base + 3 for MLA */
+  int accum_idx = q->operand_base + 3;
+  if (accum_idx >= 0 && accum_idx < ir->iroperand_pool_count)
+    return ir->iroperand_pool[accum_idx];
+  return IROP_NONE;
+}
+
 void tcc_gen_machine_data_processing_op(IROperand src1, IROperand src2, IROperand dest, TccIrOp op)
 {
   ThumbDataProcessingHandler handler;
@@ -3699,6 +3714,63 @@ void tcc_gen_machine_data_processing_op(IROperand src1, IROperand src2, IROperan
   case TCCIR_OP_MUL:
   {
     thumb_emit_mul32(src1, src2, dest, op);
+    return;
+  }
+  case TCCIR_OP_MLA:
+  {
+    /* MLA: dest = src1 * src2 + accum
+     * Accumulator is stored as extra operand at operand_base + 3 */
+    TCCIRState *ir_state = tcc_state->ir;
+    int instr_idx = ir_state->codegen_instruction_idx;
+    IRQuadCompact *mla_q = &ir_state->compact_instructions[instr_idx];
+    IROperand accum = tcc_ir_op_get_accum_inline(ir_state, mla_q);
+
+    int src1_reg = src1.pr0_reg;
+    int src2_reg = src2.pr0_reg;
+    int accum_reg = accum.pr0_reg;
+    int dest_reg = dest.pr0_reg;
+
+    /* Ensure all operands are in registers */
+    if (src1_reg == PREG_REG_NONE || src2_reg == PREG_REG_NONE || 
+        accum_reg == PREG_REG_NONE || dest_reg == PREG_REG_NONE)
+    {
+      /* Fallback: emit MUL then ADD */
+      /* First emit MUL: dest = src1 * src2 */
+      thumb_emit_mul32(src1, src2, dest, TCCIR_OP_MUL);
+      /* Then emit ADD: dest = dest + accum */
+      /* Use th_add_reg if accum is in a register, otherwise th_add_imm */
+      if (accum_reg != PREG_REG_NONE)
+      {
+        ot_check(th_add_reg((uint32_t)dest_reg, (uint32_t)dest_reg, 
+                            (uint32_t)accum_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, 
+                            THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+      }
+      else if (irop_is_immediate(accum))
+      {
+        int64_t imm = irop_get_imm64_ex(ir_state, accum);
+        ot_check(th_add_imm((uint32_t)dest_reg, (uint32_t)dest_reg, 
+                            (uint32_t)imm, FLAGS_BEHAVIOUR_NOT_IMPORTANT, 
+                            ENFORCE_ENCODING_NONE));
+      }
+      return;
+    }
+
+    /* Get the physical register for the accumulator from the live interval */
+    /* The accum.pr0_reg might not be set because it's an extra operand */
+    int32_t accum_vr = irop_get_vreg(accum);
+    int accum_phys_reg = accum_reg;
+    IRLiveInterval *accum_li = NULL;
+    if (accum_vr >= 0)
+    {
+      accum_li = tcc_ir_get_live_interval(ir_state, accum_vr);
+      if (accum_li && accum_li->allocation.r0 != PREG_REG_NONE)
+        accum_phys_reg = accum_li->allocation.r0;
+    }
+    
+    /* Emit MLA instruction: th_mla(rd, rn, rm, ra) -> rd = rn * rm + ra */
+    /* src1 = rn, src2 = rm, accum = ra, dest = rd */
+    ot_check(th_mla((uint32_t)dest_reg, (uint32_t)src1_reg, 
+                    (uint32_t)src2_reg, (uint32_t)accum_phys_reg));
     return;
   }
   case TCCIR_OP_CMP:

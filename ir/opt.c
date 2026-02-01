@@ -2337,6 +2337,241 @@ int tcc_ir_opt_run_by_name(TCCIRState *ir, const char *name)
 }
 
 /* ============================================================================
+ * MLA (Multiply-Accumulate) Fusion Optimization
+ * ============================================================================
+ *
+ * Fuses MUL followed by ADD into a single MLA instruction.
+ * Pattern:  temp = a * b; result = temp + c;
+ * Becomes:  result = MLA(a, b, c);  // result = a * b + c
+ *
+ * Requirements:
+ * - The MUL result must have exactly one use (the ADD instruction)
+ * - Both MUL and ADD must be in the same basic block
+ * - MLA is available in ARMv7-M and later (Cortex-M3, M4, M7, M33)
+ *
+ * The optimization transforms:
+ *   MUL temp, a, b       -> MLA result, a, b, c
+ *   ADD result, temp, c  -> (NOP - removed by DCE)
+ *
+ * Or:
+ *   MUL temp, a, b       -> MLA result, a, b, c
+ *   ADD result, c, temp  -> (NOP - removed by DCE)
+ */
+
+int tcc_ir_opt_mla_fusion(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  int changes = 0;
+  int i;
+
+  if (n == 0)
+    return 0;
+
+  for (i = 0; i < n; i++)
+  {
+    IRQuadCompact *add_q = &ir->compact_instructions[i];
+
+    /* Look for ADD instructions */
+    if (add_q->op != TCCIR_OP_ADD)
+      continue;
+
+    IROperand add_src1 = tcc_ir_op_get_src1(ir, add_q);
+    IROperand add_src2 = tcc_ir_op_get_src2(ir, add_q);
+#ifdef DEBUG_IR_GEN
+    IROperand add_dest = tcc_ir_op_get_dest(ir, add_q);
+#endif
+
+    /* Find which source (if any) is the MUL result */
+    int32_t mul_result_vr = -1;
+    IROperand accum_op;
+
+    if (irop_has_vreg(add_src1))
+    {
+      mul_result_vr = irop_get_vreg(add_src1);
+      accum_op = add_src2;
+    }
+    else if (irop_has_vreg(add_src2))
+    {
+      mul_result_vr = irop_get_vreg(add_src2);
+      accum_op = add_src1;
+    }
+    else
+    {
+      /* Both operands are immediates - not our pattern */
+      continue;
+    }
+
+    /* Skip if this is an address calculation (base + offset)
+     * MLA is for arithmetic: a * b + c
+     * Address calc is: &array[i] = base + (i * sizeof(element))
+     * 
+     * Heuristics to detect address calculations:
+     * 1. Accumulator is a memory address (is_local, is_lval, etc.)
+     * 2. Accumulator is a symbol reference (GlobalSym)
+     * 3. MUL result (the other operand) is used as an offset (not a value)
+     */
+    
+    /* Check 1: Accumulator should not be a memory address */
+    if (accum_op.is_local || accum_op.is_llocal || accum_op.is_lval)
+    {
+      continue;
+    }
+    
+    /* Check 2: Accumulator should not be a symbol reference (GlobalSym) */
+    /* Symbol references have SYMREF tag */
+    if (irop_get_tag(accum_op) == IROP_TAG_SYMREF)
+    {
+      continue;
+    }
+    
+    /* Check 3: The MUL result should be used as a value, not an offset
+     * If the ADD destination is an address, this is likely an address calc */
+    IROperand add_dest = tcc_ir_op_get_dest(ir, add_q);
+    if (add_dest.is_local || add_dest.is_llocal || add_dest.is_lval)
+    {
+      continue;
+    }
+    
+    /* Check 4: Both operands of the ADD should be values (not addresses)
+     * If one operand is a symbol ref and the other is a MUL result,
+     * this is likely an address calculation */
+    if (irop_get_tag(add_src1) == IROP_TAG_SYMREF || 
+        irop_get_tag(add_src2) == IROP_TAG_SYMREF)
+    {
+      continue;
+    }
+
+    /* Find the instruction that defines this vreg */
+    int mul_idx = tcc_ir_find_defining_instruction(ir, mul_result_vr, i);
+    if (mul_idx < 0)
+    {
+      continue;
+    }
+
+    /* Check if the defining instruction is a MUL */
+    IRQuadCompact *mul_q = &ir->compact_instructions[mul_idx];
+    if (mul_q->op != TCCIR_OP_MUL)
+    {
+      continue;
+    }
+
+    /* Check if the MUL result has exactly one use (this ADD) */
+    /* Note: tcc_ir_vreg_has_single_use returns true if there's exactly 1 OTHER use,
+     * but we want to check if there are 0 other uses (only used by this ADD) */
+    int other_uses = 0;
+    for (int j = 0; j < n; ++j)
+    {
+      if (j == i) continue;
+      IRQuadCompact *qj = &ir->compact_instructions[j];
+      if (qj->op == TCCIR_OP_NOP) continue;
+      IROperand s1 = tcc_ir_op_get_src1(ir, qj);
+      IROperand s2 = tcc_ir_op_get_src2(ir, qj);
+      if (irop_get_vreg(s1) == mul_result_vr || irop_get_vreg(s2) == mul_result_vr)
+      {
+        other_uses++;
+        break;
+      }
+    }
+    if (other_uses > 0)
+    {
+      continue;
+    }
+
+    /* Check that MUL and ADD are in the same basic block */
+    /* Simple check: no jumps between them */
+    int same_block = 1;
+    for (int j = mul_idx + 1; j < i; j++)
+    {
+      IRQuadCompact *between = &ir->compact_instructions[j];
+      if (between->op == TCCIR_OP_JUMP || between->op == TCCIR_OP_JUMPIF ||
+          between->op == TCCIR_OP_NOP)
+      {
+        same_block = 0;
+        break;
+      }
+    }
+    if (!same_block)
+      continue;
+
+    /* Check that accumulator is defined before the MUL (if it's a vreg) */
+    /* The MLA will replace the MUL, so accumulator must be ready before mul_idx */
+    int32_t accum_vr = irop_get_vreg(accum_op);
+    if (accum_vr >= 0)
+    {
+      int accum_def_idx = tcc_ir_find_defining_instruction(ir, accum_vr, i);
+      if (accum_def_idx < 0 || accum_def_idx >= i)
+      {
+        continue;
+      }
+      /* Also check that accumulator is defined BEFORE the MUL we're fusing */
+      /* After fusion, MLA will be at mul_idx, so accumulator must be ready before then */
+      if (accum_def_idx >= mul_idx)
+      {
+        continue;
+      }
+    }
+
+#ifdef DEBUG_IR_GEN
+    /* Get MUL operands for debug output */
+    IROperand mul_src1 = tcc_ir_op_get_src1(ir, mul_q);
+    IROperand mul_src2 = tcc_ir_op_get_src2(ir, mul_q);
+#endif
+
+    /* Transform MUL + ADD into MLA */
+    /* 1. Change MUL opcode to MLA */
+    mul_q->op = TCCIR_OP_MLA;
+
+    /* 2. Change MLA destination to ADD's destination */
+    /* The dest is at operand_base + 0 */
+    int mul_dest_idx = mul_q->operand_base;
+    int add_dest_idx = add_q->operand_base;
+    if (mul_dest_idx >= 0 && mul_dest_idx < ir->iroperand_pool_count &&
+        add_dest_idx >= 0 && add_dest_idx < ir->iroperand_pool_count)
+    {
+      ir->iroperand_pool[mul_dest_idx] = ir->iroperand_pool[add_dest_idx];
+    }
+
+    /* 3. Store accumulator as extra operand at operand_base + 3 */
+    /* First ensure pool has space and extend to include slot +3 */
+    int accum_idx = mul_q->operand_base + 3;
+    
+    /* Extend pool to include the accumulator slot if needed */
+    while (ir->iroperand_pool_count <= accum_idx)
+    {
+      tcc_ir_pool_add(ir, IROP_NONE);
+    }
+    
+    if (accum_idx >= ir->iroperand_pool_capacity)
+    {
+      /* Not enough space - revert */
+      mul_q->op = TCCIR_OP_MUL;
+      continue;
+    }
+
+    /* Store accumulator operand */
+    ir->iroperand_pool[accum_idx] = accum_op;
+
+    /* 4. Mark ADD as NOP (will be removed by DCE) */
+    add_q->op = TCCIR_OP_NOP;
+
+#ifdef DEBUG_IR_GEN
+    printf("MLA FUSION: MUL@%d + ADD@%d -> MLA vr%d = vr%d * vr%d + ",
+           mul_idx, i, irop_get_vreg(add_dest),
+           irop_get_vreg(mul_src1), irop_get_vreg(mul_src2));
+    printf("vr%d\n", irop_get_vreg(accum_op));
+#endif
+
+    changes++;
+  }
+
+#ifdef DEBUG_IR_GEN
+  printf("=== MLA FUSION END: %d fusions ===\n", changes);
+#endif
+
+  return changes;
+}
+
+/* ============================================================================
  * Helper Functions for Optimization
  * ============================================================================ */
 

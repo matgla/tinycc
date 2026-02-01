@@ -10525,6 +10525,12 @@ static void gen_function(Sym *sym)
     if (tcc_state->opt_dce)
       tcc_ir_opt_dce(ir);
 
+  /* Phase 3b: MLA (Multiply-Accumulate) Fusion - fuse MUL + ADD into MLA */
+  /* This should run after CSE so we have clean MUL+ADD patterns */
+  if (tcc_ir_opt_mla_fusion(ir))
+    if (tcc_state->opt_dce)
+      tcc_ir_opt_dce(ir); /* Remove the NOP'd ADD instructions */
+
   /* Common subexpression elimination for commutative boolean ops */
   if (tcc_state->opt_bool_cse && tcc_ir_opt_cse_bool(ir))
     if (tcc_state->opt_dce)

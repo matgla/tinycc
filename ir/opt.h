@@ -56,6 +56,9 @@ int tcc_ir_opt_sl_forward(struct TCCIRState *ir);
 /* Redundant Store Elimination */
 int tcc_ir_opt_store_redundant(struct TCCIRState *ir);
 
+/* MLA (Multiply-Accumulate) Fusion - fuse MUL + ADD into MLA */
+int tcc_ir_opt_mla_fusion(struct TCCIRState *ir);
+
 /* ============================================================================
  * Optimization Driver
  * ============================================================================ */

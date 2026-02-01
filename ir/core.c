@@ -1693,6 +1693,7 @@ const IRRegistersConfig irop_config[] = {
     [TCCIR_OP_SUBC_GEN] = {1, 1, 1},
     [TCCIR_OP_SUBC_USE] = {1, 1, 1},
     [TCCIR_OP_MUL] = {1, 1, 1},
+    [TCCIR_OP_MLA] = {1, 1, 1},  /* MLA has accumulator as extra operand at pool[operand_base+3] */
     [TCCIR_OP_UMULL] = {1, 1, 1},
     [TCCIR_OP_DIV] = {1, 1, 1},
     [TCCIR_OP_UMOD] = {1, 1, 1},

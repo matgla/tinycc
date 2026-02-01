@@ -1311,6 +1311,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
     switch (cq->op)
     {
     case TCCIR_OP_MUL:
+    case TCCIR_OP_MLA:
     case TCCIR_OP_ADD:
     case TCCIR_OP_SUB:
     case TCCIR_OP_CMP:

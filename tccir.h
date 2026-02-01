@@ -38,6 +38,7 @@ typedef enum TccIrOp : uint8_t
   TCCIR_OP_SUBC_USE,
   TCCIR_OP_SUBC_GEN,
   TCCIR_OP_MUL,
+  TCCIR_OP_MLA,       /* Multiply-Accumulate: dest = src1 * src2 + accum */
   TCCIR_OP_UMULL,
   TCCIR_OP_DIV,
   TCCIR_OP_UMOD,
