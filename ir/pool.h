@@ -11,7 +11,7 @@
 #ifndef TCC_IR_POOL_H
 #define TCC_IR_POOL_H
 
-#include "operand.h"
+/* operand.h is included via tcc.h as tccir_operand.h */
 
 struct TCCIRState;
 
@@ -75,5 +75,11 @@ struct CType *tcc_ir_pool_ctype_get(struct TCCIRState *ir, int index);
 
 /* Set jump target address in dest operand */
 void tcc_ir_pool_jump_target_set(struct TCCIRState *ir, int instr_idx, int target_address);
+
+/* Get jump target address from dest operand */
+int tcc_ir_pool_jump_target_get(struct TCCIRState *ir, int instr_idx);
+
+/* Convenience wrapper for setting jump target */
+void tcc_ir_set_dest_jump_target(struct TCCIRState *ir, int instr_idx, int target_address);
 
 #endif /* TCC_IR_POOL_H */

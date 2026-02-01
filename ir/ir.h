@@ -11,13 +11,11 @@
 #ifndef TCC_IR_INTERNAL_H
 #define TCC_IR_INTERNAL_H
 
-/* This header is INTERNAL to the IR implementation.
- * It should only be included by .c files in the ir/ directory.
- * The public API is in tccir.h at the project root.
- */
+#include <stdbool.h>
 
 /* ============================================================================
  * Include tcc.h first (required for all definitions)
+ * This must be included before any other headers to ensure VT_*, etc are defined
  * ============================================================================ */
 
 #define USING_GLOBALS
@@ -27,7 +25,7 @@
  * Module Headers
  * ============================================================================ */
 
-#include "operand.h"
+/* Note: tccir.h and tccir_operand.h are already included via tcc.h */
 #include "type.h"
 #include "pool.h"
 #include "vreg.h"

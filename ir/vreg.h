@@ -11,7 +11,7 @@
 #ifndef TCC_IR_VREG_H
 #define TCC_IR_VREG_H
 
-#include "operand.h"
+/* operand.h is included via tcc.h as tccir_operand.h */
 
 struct TCCIRState;
 
@@ -93,14 +93,8 @@ void tcc_ir_vreg_preg_hi_set(struct TCCIRState *ir, int vreg, int preg);
  * Live Interval Access
  * ============================================================================ */
 
-/* Get live interval for variable vreg */
-struct IRLiveInterval *tcc_ir_vreg_live_interval_var(struct TCCIRState *ir, int vreg);
-
-/* Get live interval for temporary vreg */
-struct IRLiveInterval *tcc_ir_vreg_live_interval_temp(struct TCCIRState *ir, int vreg);
-
-/* Get live interval for parameter vreg */
-struct IRLiveInterval *tcc_ir_vreg_live_interval_param(struct TCCIRState *ir, int vreg);
+/* Get live interval for vreg */
+struct IRLiveInterval *tcc_ir_vreg_live_interval(struct TCCIRState *ir, int vreg);
 
 /* ============================================================================
  * Stack Slot Access

@@ -11,90 +11,58 @@
 #ifndef TCC_IR_TYPE_H
 #define TCC_IR_TYPE_H
 
-#include "../tcc.h"
-
 /* ============================================================================
- * Type Classification
+ * Type Classification - Implemented in type.c
  * ============================================================================ */
 
 /* Returns true if type is float */
-static inline int tcc_ir_type_is_float(int t)
-{
-  return (t & VT_BTYPE) == VT_FLOAT;
-}
+int tcc_ir_type_is_float(int t);
 
 /* Returns true if type is double */
-static inline int tcc_ir_type_is_double(int t)
-{
-  int btype = t & VT_BTYPE;
-  return btype == VT_DOUBLE || btype == VT_LDOUBLE;
-}
+int tcc_ir_type_is_double(int t);
 
 /* Returns true if type is 64-bit (double, ldouble, or long long) */
-static inline int tcc_ir_type_is_64bit(int t)
-{
-  int btype = t & VT_BTYPE;
-  return btype == VT_DOUBLE || btype == VT_LDOUBLE || btype == VT_LLONG;
-}
+int tcc_ir_type_is_64bit(int t);
 
 /* Returns true if type is floating point (float or double) */
-static inline int tcc_ir_type_is_fp(int t)
-{
-  int btype = t & VT_BTYPE;
-  return btype == VT_FLOAT || btype == VT_DOUBLE || btype == VT_LDOUBLE;
-}
+int tcc_ir_type_is_fp(int t);
 
 /* Returns true if type is integer (not floating point) */
-static inline int tcc_ir_type_is_int(int t)
-{
-  return !tcc_ir_type_is_fp(t);
-}
+int tcc_ir_type_is_int(int t);
 
 /* Returns true if type is pointer */
-static inline int tcc_ir_type_is_ptr(int t)
-{
-  return (t & VT_BTYPE) == VT_PTR;
-}
+int tcc_ir_type_is_ptr(int t);
 
 /* Returns true if type is struct */
-static inline int tcc_ir_type_is_struct(int t)
-{
-  return (t & VT_BTYPE) == VT_STRUCT;
-}
+int tcc_ir_type_is_struct(int t);
 
 /* Returns true if type is void */
-static inline int tcc_ir_type_is_void(int t)
-{
-  return (t & VT_BTYPE) == VT_VOID;
-}
+int tcc_ir_type_is_void(int t);
 
 /* Returns true if type is unsigned */
-static inline int tcc_ir_type_is_unsigned(int t)
-{
-  return (t & VT_UNSIGNED) != 0;
-}
+int tcc_ir_type_is_unsigned(int t);
 
 /* Returns true if type is signed */
-static inline int tcc_ir_type_is_signed(int t)
-{
-  return !tcc_ir_type_is_unsigned(t) && !tcc_ir_type_is_fp(t);
-}
+int tcc_ir_type_is_signed(int t);
 
 /* Returns true if type is boolean (from comparison) */
-static inline int tcc_ir_type_is_bool(int t)
-{
-  return (t & VT_CMP) != 0;
-}
+int tcc_ir_type_is_bool(int t);
 
 /* ============================================================================
  * SValue Type Helpers
  * ============================================================================ */
 
 /* Check if an SValue operand is spilled (in memory) */
-int tcc_ir_type_spilled(SValue *sv);
+int tcc_ir_type_spilled(struct SValue *sv);
 
 /* Returns true if SValue type is 64-bit */
 int tcc_ir_type_64bit(int t);
+
+/* Check if an SValue operand is spilled (legacy name) */
+int tcc_ir_is_spilled(struct SValue *sv);
+
+/* Returns true if type is 64-bit (legacy name) */
+int tcc_ir_is_64bit(int t);
 
 /* ============================================================================
  * FPU Operation Detection

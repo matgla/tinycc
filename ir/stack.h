@@ -16,13 +16,14 @@
 struct TCCIRState;
 struct SValue;
 struct IROperand;
+struct SpillCache;
 
 /* ============================================================================
  * Stack Layout Building
  * ============================================================================ */
 
 /* Build complete stack layout for function */
-void tcc_ir_stack_layout_build(struct TCCIRState *ir);
+void tcc_ir_stack_build(struct TCCIRState *ir);
 
 /* Reset stack layout to empty */
 void tcc_ir_stack_reset(struct TCCIRState *ir);
@@ -32,10 +33,10 @@ void tcc_ir_stack_reset(struct TCCIRState *ir);
  * ============================================================================ */
 
 /* Get stack slot by vreg (or NULL if not found) */
-const struct TCCStackSlot *tcc_ir_stack_slot_by_vreg(struct TCCIRState *ir, int vreg);
+const struct TCCStackSlot *tcc_ir_stack_slot_by_vreg(const struct TCCIRState *ir, int vreg);
 
 /* Get stack slot by frame offset (or NULL if not found) */
-const struct TCCStackSlot *tcc_ir_stack_slot_by_offset(struct TCCIRState *ir, int frame_offset);
+const struct TCCStackSlot *tcc_ir_stack_slot_by_offset(const struct TCCIRState *ir, int frame_offset);
 
 /* Get stack slot by index */
 const struct TCCStackSlot *tcc_ir_stack_slot_by_index(struct TCCIRState *ir, int idx);
@@ -48,16 +49,16 @@ int tcc_ir_stack_slot_count(struct TCCIRState *ir);
  * ============================================================================ */
 
 /* Get stack slot for materializing SValue */
-const struct TCCStackSlot *tcc_ir_stack_mat_slot(struct TCCIRState *ir, const struct SValue *sv);
+const struct TCCStackSlot *tcc_ir_mat_slot_sv(const struct TCCIRState *ir, const struct SValue *sv);
 
 /* Get frame offset for materializing SValue */
-int tcc_ir_stack_mat_offset(struct TCCIRState *ir, const struct SValue *sv);
+int tcc_ir_mat_offset_sv(const struct TCCIRState *ir, const struct SValue *sv);
 
 /* Get stack slot for materializing IROperand */
-const struct TCCStackSlot *tcc_ir_stack_mat_slot_op(struct TCCIRState *ir, const struct IROperand *op);
+const struct TCCStackSlot *tcc_ir_mat_slot_op(const struct TCCIRState *ir, const struct IROperand *op);
 
 /* Get frame offset for materializing IROperand */
-int tcc_ir_stack_mat_offset_op(struct TCCIRState *ir, const struct IROperand *op);
+int tcc_ir_mat_offset_op(const struct TCCIRState *ir, const struct IROperand *op);
 
 /* ============================================================================
  * Physical Register Assignment
@@ -70,7 +71,7 @@ void tcc_ir_stack_reg_assign(struct TCCIRState *ir, int vreg, int offset, int r0
 void tcc_ir_stack_reg_get(struct TCCIRState *ir, int vreg, int *r0, int *r1);
 
 /* ============================================================================
- * Spill Cache
+ * Spill Cache (IR State Wrappers)
  * ============================================================================ */
 
 /* Clear spill cache */
@@ -103,5 +104,15 @@ int tcc_ir_stack_args_offset(struct TCCIRState *ir);
 
 /* Get size of arguments area */
 int tcc_ir_stack_args_size(struct TCCIRState *ir);
+
+/* ============================================================================
+ * Legacy API Wrappers (to be deprecated)
+ * ============================================================================ */
+
+/* Build stack layout - legacy name (calls tcc_ir_stack_build) */
+void tcc_ir_build_stack_layout(struct TCCIRState *ir);
+
+/* Assign physical registers to vreg - legacy name (calls tcc_ir_stack_reg_assign) */
+void tcc_ir_assign_physical_register(struct TCCIRState *ir, int vreg, int offset, int r0, int r1);
 
 #endif /* TCC_IR_STACK_H */

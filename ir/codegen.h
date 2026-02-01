@@ -67,6 +67,9 @@ void tcc_ir_codegen_params_setup(struct TCCIRState *ir);
 /* Generate machine code from IR */
 void tcc_ir_codegen_generate(struct TCCIRState *ir);
 
+/* Main code generation entry point (legacy wrapper) */
+void tcc_ir_generate_code(struct TCCIRState *ir);
+
 /* Generate code for comparison and jump/set */
 void tcc_ir_codegen_cmp_jmp_set(struct TCCIRState *ir);
 
@@ -88,6 +91,9 @@ int tcc_ir_codegen_jump_append(struct TCCIRState *ir, int chain, int jump);
 
 /* Generate test and jump */
 int tcc_ir_codegen_test_gen(struct TCCIRState *ir, int invert, int test);
+
+/* Drop unused return value from function call */
+void tcc_ir_codegen_drop_return(struct TCCIRState *ir);
 
 /* ============================================================================
  * Basic Blocks

@@ -32,6 +32,9 @@ int tcc_ir_opt_const_prop_tmp(struct TCCIRState *ir);
 /* Copy Propagation - replace copies with originals */
 int tcc_ir_opt_copy_prop(struct TCCIRState *ir);
 
+/* Legacy copy propagation function - wrapper for tcc_ir_opt_copy_prop */
+int tcc_ir_copy_propagation(struct TCCIRState *ir);
+
 /* Arithmetic CSE - eliminate redundant arithmetic */
 int tcc_ir_opt_cse_arith(struct TCCIRState *ir);
 
@@ -103,5 +106,15 @@ void tcc_ir_opt_fp_cache_record(struct TCCIRState *ir, int offset, int phys_reg)
 
 /* Invalidate register entry in FP cache */
 void tcc_ir_opt_fp_cache_invalidate_reg(struct TCCIRState *ir, int phys_reg);
+
+/* ============================================================================
+ * Helper Functions (defined in tccir.c, used by optimization passes)
+ * ============================================================================ */
+
+/* Find the defining instruction for a vreg before a given index */
+int tcc_ir_find_defining_instruction(struct TCCIRState *ir, int32_t vreg, int before_idx);
+
+/* Check if a vreg has exactly one use (excluding a specific index) */
+int tcc_ir_vreg_has_single_use(struct TCCIRState *ir, int32_t vreg, int exclude_idx);
 
 #endif /* TCC_IR_OPT_H */

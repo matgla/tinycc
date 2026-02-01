@@ -21,6 +21,9 @@
 #define USING_GLOBALS
 #include "tcc.h"
 
+#include "ir/core.h"
+#include "ir/codegen.h"
+#include "ir/opt.h"
 #include "tccir.h"
 
 // #define DEBUG_IR_GEN
@@ -419,7 +422,7 @@ ST_FUNC void tccgen_finish(TCCState *s1)
      unwind via longjmp). Free it here to avoid leaks on compile errors. */
   if (s1->ir)
   {
-    tcc_ir_release_block(s1->ir);
+    tcc_ir_free(s1->ir);
     s1->ir = NULL;
   }
 
@@ -1042,7 +1045,7 @@ static void vcheck_cmp(void)
     // if (vtop->r == VT_CMP) {
     // vset_VT_JMP();
     // }
-    tcc_ir_generate_cmp_jmp_set(tcc_state->ir);
+    tcc_ir_codegen_cmp_jmp_set(tcc_state->ir);
   }
 }
 
@@ -1225,7 +1228,7 @@ static void vset_VT_JMP(void)
   int origt = vtop->type.t;
   /* we need to jump to 'mov $0,%R' or 'mov $1,%R' */
   int inv = op & (op < 2); /* small optimization */
-  int test = tcc_ir_generate_test(tcc_state->ir, inv, 0);
+  int test = tcc_ir_codegen_test_gen(tcc_state->ir, inv, 0);
   vseti(VT_JMP + inv, test);
   vtop->type.t |= origt & (VT_UNSIGNED | VT_DEFSIGN);
   // } else {
@@ -1252,10 +1255,10 @@ static void gvtst_set(int inv, int t)
 
   p = inv ? &vtop->jfalse : &vtop->jtrue;
   *p = tcc_ir_gjmp_append(tcc_state->ir, *p, t);
-  // tcc_ir_generate_test(tcc_state->ir, inv, t);
+  // tcc_ir_codegen_test_gen(tcc_state->ir, inv, t);
   // if (vtop->)
   // *p = tcc_ir_gjmp_append(tcc_state->ir, *p, t);
-  // tcc_ir_generate_cmp_jmp_set(tcc_state->ir);
+  // tcc_ir_codegen_cmp_jmp_set(tcc_state->ir);
 }
 
 /* generate a zero or nozero test */
@@ -3037,7 +3040,7 @@ static void gen_opic(int op)
       else
       {
         // gen_opi(op);
-        tcc_ir_gen_opi(tcc_state->ir, op);
+        tcc_ir_gen_i(tcc_state->ir, op);
       }
     }
     if (vtop->r == VT_CONST)
@@ -3211,7 +3214,7 @@ static void gen_opif(int op)
     else
     {
       // gen_opf(op);
-      tcc_ir_gen_opf(tcc_state->ir, op);
+      tcc_ir_gen_f(tcc_state->ir, op);
     }
   }
 }
@@ -4690,7 +4693,7 @@ ST_FUNC void vstore(void)
           vtop->r = 0;
         }
 
-        tcc_ir_generate_cmp_jmp_set(tcc_state->ir);
+        tcc_ir_codegen_cmp_jmp_set(tcc_state->ir);
         tcc_ir_put(tcc_state->ir, op, vtop, NULL, &vtop[-1]);
 
         if (op == TCCIR_OP_ASSIGN)
@@ -4735,7 +4738,7 @@ ST_FUNC void vstore(void)
       }
       /* If source is a VT_CMP (comparison result stored in flags), we need to
        * materialize it as a 0/1 value before storing. */
-      tcc_ir_generate_cmp_jmp_set(tcc_state->ir);
+      tcc_ir_codegen_cmp_jmp_set(tcc_state->ir);
       tcc_ir_put(tcc_state->ir, op, vtop, NULL, &vtop[-1]);
       if (op == TCCIR_OP_ASSIGN)
       {
@@ -5969,7 +5972,7 @@ static int post_type(CType *type, AttributeDef *ad, int storage, int td)
   CType pt;
   TokenString *vla_array_tok = NULL;
   int *vla_array_str = NULL;
-  int vla_array_str_on_heap = 0;  /* 1 if vla_array_str is heap-allocated, 0 if inline */
+  int vla_array_str_on_heap = 0; /* 1 if vla_array_str is heap-allocated, 0 if inline */
 
   if (tok == '(')
   {
@@ -7446,7 +7449,7 @@ tok_next:
             /* Convert VT_CMP/VT_JMP to actual 0/1 value before passing as
              * parameter */
             if (!NOEVAL_WANTED)
-              tcc_ir_generate_cmp_jmp_set(tcc_state->ir);
+              tcc_ir_codegen_cmp_jmp_set(tcc_state->ir);
             gfunc_param_typed(s, sa);
             if (!NOEVAL_WANTED)
             {
@@ -7893,7 +7896,7 @@ static void expr_landor(int op)
     if (c < 0)
     {
       // t = gvtst(i, t);
-      t = tcc_ir_generate_test(tcc_state->ir, i, t);
+      t = tcc_ir_codegen_test_gen(tcc_state->ir, i, t);
     }
     else
       vpop();
@@ -7955,7 +7958,7 @@ static void expr_cond(void)
     {
       if (c < 0)
       {
-        tt = tcc_ir_generate_test(tcc_state->ir, 1, -1);
+        tt = tcc_ir_codegen_test_gen(tcc_state->ir, 1, -1);
       }
       else
       {
@@ -7967,7 +7970,7 @@ static void expr_cond(void)
       /* needed to avoid having different registers saved in
          each branch */
       gv_dup();
-      tt = tcc_ir_generate_test(tcc_state->ir, 0, -1);
+      tt = tcc_ir_codegen_test_gen(tcc_state->ir, 0, -1);
     }
 
     if (c == 0)
@@ -8012,7 +8015,7 @@ static void expr_cond(void)
       /* optimize "if (f ? a > b : c || d) ..." for example, where normally
          "a < b" and "c || d" would be forced to "(int)0/1" first, whereas
          this code jumps directly to the if's then/else branches. */
-      t1 = tcc_ir_generate_test(tcc_state->ir, 0, -1);
+      t1 = tcc_ir_codegen_test_gen(tcc_state->ir, 0, -1);
       t2 = gjmp(-1); /* -1 = no chain */
       tcc_ir_backpatch_to_here(tcc_state->ir, u);
       vpushv(&sv);
@@ -8187,7 +8190,7 @@ ST_FUNC void gexpr(void)
       vpop();
       next();
       expr_eq();
-      tcc_ir_drop_return_value(tcc_state->ir);
+      tcc_ir_codegen_drop_return(tcc_state->ir);
     } while (tok == ',');
 
     /* convert array & function to pointer */
@@ -8312,7 +8315,7 @@ static void gfunc_return(CType *func_type)
       vtop->vr = dest.vr;
       vtop->r = 0; /* no longer an lvalue */
     }
-    tcc_ir_generate_cmp_jmp_set(tcc_state->ir);
+    tcc_ir_codegen_cmp_jmp_set(tcc_state->ir);
     tcc_ir_put(tcc_state->ir, TCCIR_OP_RETURNVALUE, vtop, NULL, NULL);
   }
   vtop--; /* NOT vpop() because on x86 it would flush the fp stack */
@@ -8402,7 +8405,7 @@ static int gcase(struct case_t **base, int len, int dsym)
       int pos = 0;
       gen_op(TOK_EQ); /* jmp to case when equal */
       /* If comparison fails, jump to default chain 'dsym' (or fall through when -1). */
-      pos = tcc_ir_generate_test(tcc_state->ir, 0, dsym);
+      pos = tcc_ir_codegen_test_gen(tcc_state->ir, 0, dsym);
       tcc_ir_backpatch(tcc_state->ir, pos, p->ind);
       // gsym_addr(gvtst(0, 0), p->ind);
     }
@@ -8413,7 +8416,7 @@ static int gcase(struct case_t **base, int len, int dsym)
       gen_op(TOK_GT); /* jmp over when > V2 */
       if (len == 1)   /* last case test jumps to default when false */
       {
-        dsym = tcc_ir_generate_test(tcc_state->ir, 0, dsym);
+        dsym = tcc_ir_codegen_test_gen(tcc_state->ir, 0, dsym);
         e = -1; /* Use -1 so tcc_ir_backpatch_to_here will be a no-op */
       }
       else
@@ -8421,11 +8424,11 @@ static int gcase(struct case_t **base, int len, int dsym)
         /* Use -1 (not dsym) as target to avoid corrupting the default chain.
          * The e jump will be backpatched independently to fall through.
          * Using -1 ensures backpatching stops at e and doesn't follow any chain. */
-        e = tcc_ir_generate_test(tcc_state->ir, 0, -1);
+        e = tcc_ir_codegen_test_gen(tcc_state->ir, 0, -1);
       }
       vdup(), vpush64(t, p->v1);
       gen_op(TOK_GE); /* jmp to case when >= V1 */
-      pos = tcc_ir_generate_test(tcc_state->ir, 0, p->ind);
+      pos = tcc_ir_codegen_test_gen(tcc_state->ir, 0, p->ind);
       tcc_ir_backpatch(tcc_state->ir, pos, p->ind);
       // gsym_addr(gvtst(0, 0), p->ind);
       dsym = gcase(base, l2, dsym);
@@ -8697,7 +8700,7 @@ again:
     skip('(');
     gexpr();
     skip(')');
-    a = tcc_ir_generate_test(tcc_state->ir, 1, -1);
+    a = tcc_ir_codegen_test_gen(tcc_state->ir, 1, -1);
     block(0);
     if (tok == TOK_ELSE)
     {
@@ -8730,7 +8733,7 @@ again:
     gexpr();
     skip(')');
     // a = gvtst(1, 0);
-    a = tcc_ir_generate_test(tcc_state->ir, 1, -1);
+    a = tcc_ir_codegen_test_gen(tcc_state->ir, 1, -1);
     b = -1; /* Initialize continue chain with -1 sentinel */
     lblock(&a, &b);
     // gjmp_addr(d);
@@ -8888,7 +8891,7 @@ again:
     if (tok != ';')
     {
       gexpr();
-      a = tcc_ir_generate_test(tcc_state->ir, 1, -1);
+      a = tcc_ir_codegen_test_gen(tcc_state->ir, 1, -1);
     }
     skip(';');
     if (tok != ')')
@@ -8950,7 +8953,7 @@ again:
     skip(')');
     skip(';');
     // c = gvtst(0, 0);
-    c = tcc_ir_generate_test(tcc_state->ir, 0, -1);
+    c = tcc_ir_codegen_test_gen(tcc_state->ir, 0, -1);
 
     // gsym_addr(c, d);
     tcc_ir_backpatch(tcc_state->ir, c, d);
@@ -9182,7 +9185,7 @@ again:
         else
         {
           gexpr();
-          tcc_ir_drop_return_value(tcc_state->ir);
+          tcc_ir_codegen_drop_return(tcc_state->ir);
           vpop();
         }
         skip(';');
@@ -10401,7 +10404,7 @@ static void func_vla_arg_code(Sym *arg)
     vla_array_tok = tok_str_alloc();
     vla_array_tok->data.str = arg->type.ref->vla_array_str;
     vla_array_tok->allocated_len = 1;
-    begin_macro(vla_array_tok, 2);  /* alloc=2: don't free borrowed buffer */
+    begin_macro(vla_array_tok, 2); /* alloc=2: don't free borrowed buffer */
     next();
     gexpr();
     end_macro();
@@ -10468,10 +10471,10 @@ static void gen_function(Sym *sym)
 #ifdef DEBUG_IR_GEN
   printf("Generating IR for function %s\n", funcname);
 #endif
-  ir = tcc_ir_allocate_block();
+  ir = tcc_ir_alloc();
   tcc_state->ir = ir;
   local_scope = 1; /* for function parameters */
-  tcc_ir_add_function_parameters(ir, &sym->type);
+  tcc_ir_params_add(ir, &sym->type);
   nb_temp_local_vars = 0;
   if (!sym->a.naked)
   {
@@ -10497,66 +10500,66 @@ static void gen_function(Sym *sym)
 
   /* Dead code elimination - remove unreachable instructions */
   if (tcc_state->opt_dce)
-    tcc_ir_dead_code_elimination(ir);
+    tcc_ir_opt_dce(ir);
 
   /* Phase 1: Constant Propagation with Algebraic Simplification */
-  if (tcc_state->opt_const_prop && tcc_ir_constant_propagation(ir))
+  if (tcc_state->opt_const_prop && tcc_ir_opt_const_prop(ir))
     if (tcc_state->opt_dce)
-      tcc_ir_dead_code_elimination(ir); /* Clean up simplified ops */
+      tcc_ir_opt_dce(ir); /* Clean up simplified ops */
 
   /* Phase 1b: TMP Constant Propagation - propagate constants from folded expressions */
-  if (tcc_state->opt_const_prop && tcc_ir_tmp_constant_propagation(ir))
+  if (tcc_state->opt_const_prop && tcc_ir_opt_const_prop_tmp(ir))
   {
-    if (tcc_ir_constant_propagation(ir))
+    if (tcc_ir_opt_const_prop(ir))
       if (tcc_state->opt_dce)
-        tcc_ir_dead_code_elimination(ir);
+        tcc_ir_opt_dce(ir);
   }
 
   /* Phase 2: Copy Propagation */
-  if (tcc_state->opt_copy_prop && tcc_ir_copy_propagation(ir))
+  if (tcc_state->opt_copy_prop && tcc_ir_opt_copy_prop(ir))
     if (tcc_state->opt_dce)
-      tcc_ir_dead_code_elimination(ir);
+      tcc_ir_opt_dce(ir);
 
   /* Phase 3: Arithmetic Common Subexpression Elimination */
-  if (tcc_state->opt_cse && tcc_ir_arithmetic_cse(ir))
+  if (tcc_state->opt_cse && tcc_ir_opt_cse_arith(ir))
     if (tcc_state->opt_dce)
-      tcc_ir_dead_code_elimination(ir);
+      tcc_ir_opt_dce(ir);
 
   /* Common subexpression elimination for commutative boolean ops */
-  if (tcc_state->opt_bool_cse && tcc_ir_bool_cse(ir))
+  if (tcc_state->opt_bool_cse && tcc_ir_opt_cse_bool(ir))
     if (tcc_state->opt_dce)
-      tcc_ir_dead_code_elimination(ir); /* Clean up unused ops */
+      tcc_ir_opt_dce(ir); /* Clean up unused ops */
 
   /* Idempotent boolean simplification: BOOL_OP(x, x) -> x */
-  if (tcc_state->opt_bool_idempotent && tcc_ir_bool_idempotent(ir))
+  if (tcc_state->opt_bool_idempotent && tcc_ir_opt_bool_idempotent(ir))
     if (tcc_state->opt_dce)
-      tcc_ir_dead_code_elimination(ir); /* Clean up unused ops */
+      tcc_ir_opt_dce(ir); /* Clean up unused ops */
 
   /* Boolean expression simplification - eliminate redundant BOOL_OR/BOOL_AND */
-  if (tcc_state->opt_bool_simplify && tcc_ir_bool_simplification(ir))
+  if (tcc_state->opt_bool_simplify && tcc_ir_opt_bool_simplify(ir))
     if (tcc_state->opt_dce)
-      tcc_ir_dead_code_elimination(ir); /* Clean up unused ops */
+      tcc_ir_opt_dce(ir); /* Clean up unused ops */
 
   /* Return value optimization - fold LOAD -> RETURNVALUE */
-  if (tcc_state->opt_return_value && tcc_ir_return_value_optimization(ir))
+  if (tcc_state->opt_return_value && tcc_ir_opt_return(ir))
     if (tcc_state->opt_dce)
-      tcc_ir_dead_code_elimination(ir); /* Clean up unused ops */
+      tcc_ir_opt_dce(ir); /* Clean up unused ops */
 
   /* Phase 4: Store-Load Forwarding - replace loads from recently stored addresses
    * CONSERVATIVE: Only handles stack locals whose address is not taken */
-  if (tcc_state->opt_store_load_fwd && tcc_ir_store_load_forwarding(ir))
+  if (tcc_state->opt_store_load_fwd && tcc_ir_opt_sl_forward(ir))
     if (tcc_state->opt_dce)
-      tcc_ir_dead_code_elimination(ir); /* Clean up forwarded loads */
+      tcc_ir_opt_dce(ir); /* Clean up forwarded loads */
 
   /* Phase 4: Redundant Store Elimination - remove stores overwritten before read
    * CONSERVATIVE: Only handles stack locals whose address is not taken */
-  if (tcc_state->opt_redundant_store && tcc_ir_redundant_store_elimination(ir))
+  if (tcc_state->opt_redundant_store && tcc_ir_opt_store_redundant(ir))
     if (tcc_state->opt_dce)
-      tcc_ir_dead_code_elimination(ir); /* Clean up dead stores */
+      tcc_ir_opt_dce(ir); /* Clean up dead stores */
 
   /* Dead store elimination - remove unused ASSIGN instructions */
   if (tcc_state->opt_dead_store)
-    tcc_ir_dead_store_elimination(ir);
+    tcc_ir_opt_dse(ir);
 
   /* Recompute leafness after IR optimizations.
    * IR construction marks the function non-leaf as soon as a call op is
@@ -10632,7 +10635,7 @@ static void gen_function(Sym *sym)
   tcc_ir_patch_live_intervals_registers(ir);
   tcc_ir_register_allocation_params(ir);
   tcc_ir_build_stack_layout(ir);
-  tcc_ir_generate_code(ir);
+  tcc_ir_codegen_generate(ir);
   if (!sym->a.naked)
   {
     tcc_debug_prolog_epilog(tcc_state, 1);
@@ -10669,7 +10672,7 @@ static void gen_function(Sym *sym)
 
   /* do this after funcend debug info */
   next();
-  tcc_ir_release_block(ir);
+  tcc_ir_free(ir);
   tcc_state->ir = NULL;
 }
 

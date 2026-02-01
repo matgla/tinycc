@@ -19,6 +19,7 @@
  */
 
 #include "tccabi.h"
+#include "../tcc.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -170,4 +171,54 @@ TCCAbiArgLoc tcc_abi_classify_argument(TCCAbiCallLayout *layout, int arg_index, 
 int tcc_abi_align_up_int(int v, int align)
 {
   return (v + align - 1) & ~(align - 1);
+}
+
+void tcc_abi_call_layout_ensure_capacity(TCCAbiCallLayout *layout, int needed)
+{
+  if (!layout)
+    return;
+  if (needed <= 0)
+    return;
+
+  if (layout->capacity >= needed && layout->locs && layout->args_effective && layout->args_original &&
+      layout->arg_flags)
+    return;
+
+  int new_capacity = layout->capacity ? layout->capacity : 8;
+  while (new_capacity < needed)
+    new_capacity *= 2;
+
+  layout->locs = (TCCAbiArgLoc *)tcc_realloc(layout->locs, sizeof(TCCAbiArgLoc) * (size_t)new_capacity);
+  layout->args_original =
+      (TCCAbiArgDesc *)tcc_realloc(layout->args_original, sizeof(TCCAbiArgDesc) * (size_t)new_capacity);
+  layout->args_effective =
+      (TCCAbiArgDesc *)tcc_realloc(layout->args_effective, sizeof(TCCAbiArgDesc) * (size_t)new_capacity);
+  layout->arg_flags = (uint8_t *)tcc_realloc(layout->arg_flags, (size_t)new_capacity);
+
+  /* Zero-init the newly added tail. */
+  if (new_capacity > layout->capacity)
+  {
+    const int old = layout->capacity;
+    memset(&layout->locs[old], 0, sizeof(TCCAbiArgLoc) * (size_t)(new_capacity - old));
+    memset(&layout->args_original[old], 0, sizeof(TCCAbiArgDesc) * (size_t)(new_capacity - old));
+    memset(&layout->args_effective[old], 0, sizeof(TCCAbiArgDesc) * (size_t)(new_capacity - old));
+    memset(&layout->arg_flags[old], 0, (size_t)(new_capacity - old));
+  }
+
+  layout->capacity = new_capacity;
+}
+
+void tcc_abi_call_layout_deinit(TCCAbiCallLayout *layout)
+{
+  if (!layout)
+    return;
+  if (layout->locs)
+    tcc_free(layout->locs);
+  if (layout->args_original)
+    tcc_free(layout->args_original);
+  if (layout->args_effective)
+    tcc_free(layout->args_effective);
+  if (layout->arg_flags)
+    tcc_free(layout->arg_flags);
+  memset(layout, 0, sizeof(*layout));
 }

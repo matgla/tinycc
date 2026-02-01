@@ -11,7 +11,7 @@
 #ifndef TCC_IR_CORE_H
 #define TCC_IR_CORE_H
 
-#include "operand.h"
+/* operand.h is included via tcc.h as tccir_operand.h */
 
 struct TCCIRState;
 struct SValue;
@@ -55,6 +55,12 @@ void tcc_ir_params_add(struct TCCIRState *ir, struct CType *func_type);
 
 /* Add local variable to IR */
 int tcc_ir_local_add(struct TCCIRState *ir, struct Sym *sym, int stack_offset);
+
+/* Parameter processing helpers */
+void tcc_ir_params_process_single(struct TCCIRState *ir, struct Sym *sym, int arg_index, struct TCCAbiCallLayout *call_layout);
+void tcc_ir_params_update_tracking(struct TCCIRState *ir, struct TCCAbiArgLoc loc_info);
+void tcc_ir_params_process_struct(struct TCCIRState *ir, struct Sym *sym, struct CType *type, int size, int align, struct TCCAbiArgLoc *loc_info, struct TCCAbiCallLayout *call_layout, int arg_index);
+void tcc_ir_params_process_scalar(struct TCCIRState *ir, struct Sym *sym, struct CType *type, struct TCCAbiArgLoc *loc_info);
 
 /* ============================================================================
  * Integer Operations
@@ -203,6 +209,22 @@ int tcc_ir_asm_add(struct TCCIRState *ir, const char *asm_str, int asm_len,
 void tcc_ir_asm_put(struct TCCIRState *ir, int asm_id);
 
 #endif /* CONFIG_TCC_ASM */
+
+/* ============================================================================
+ * Jump Chain Management
+ * ============================================================================ */
+
+/* Backpatch jump chain to target address */
+void tcc_ir_backpatch(struct TCCIRState *ir, int t, int target_address);
+
+/* Backpatch jump chain to current instruction position */
+void tcc_ir_backpatch_to_here(struct TCCIRState *ir, int t);
+
+/* Backpatch first jump in chain to target address */
+void tcc_ir_backpatch_first(struct TCCIRState *ir, int t, int target_address);
+
+/* Append target to end of jump chain, return head */
+int tcc_ir_gjmp_append(struct TCCIRState *ir, int n, int t);
 
 /* ============================================================================
  * Utility Functions

@@ -417,7 +417,7 @@ typedef struct TCCIRState
 
   /* Mapping from IR instruction index to generated machine code offset (section-relative).
    * Size is (next_instruction_index + 1) to include the epilogue mapping.
-   * This is populated during tcc_ir_generate_code() and is used after codegen
+   * This is populated during tcc_ir_codegen_generate() and is used after codegen
    * for features like GCC's labels-as-values (&&label). */
   uint32_t *ir_to_code_mapping;
   int ir_to_code_mapping_size;
@@ -436,17 +436,11 @@ typedef struct TCCIRState
 } TCCIRState;
 
 TCCIRState *tcc_ir_allocate_block();
-void tcc_ir_release_block(TCCIRState *ir);
 
 /* If the value is an lvalue (memory reference), emit an IR load so the
  * SValue becomes a plain value suitable for arithmetic/indirect calls. */
 
-void tcc_ir_add_function_parameters(TCCIRState *ir, CType *func_type);
 
-int tcc_ir_gvtst(TCCIRState *ir, int inv, int t);
-
-void tcc_ir_gen_opi(TCCIRState *ir, int op);
-void tcc_ir_gen_opf(TCCIRState *ir, int op);
 int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *dest);
 
 #ifdef CONFIG_TCC_ASM
@@ -471,7 +465,6 @@ void tcc_ir_register_allocation_params(TCCIRState *ir);
  * incoming stack home for the duration of the call. */
 void tcc_ir_mark_return_value_incoming_regs(TCCIRState *ir);
 void tcc_ir_avoid_spilling_stack_passed_params(TCCIRState *ir);
-void tcc_ir_generate_code(TCCIRState *ir);
 void tcc_ir_build_stack_layout(TCCIRState *ir);
 const TCCStackSlot *tcc_ir_stack_slot_by_vreg(const TCCIRState *ir, int vreg);
 const TCCStackSlot *tcc_ir_stack_slot_by_offset(const TCCIRState *ir, int frame_offset);
@@ -480,15 +473,10 @@ void tcc_ir_materialize_const_to_reg(TCCIRState *ir, SValue *sv, TCCMaterialized
 void tcc_ir_materialize_addr(TCCIRState *ir, SValue *sv, TCCMaterializedAddr *result, int dest_reg);
 void tcc_ir_materialize_dest(TCCIRState *ir, SValue *dest, TCCMaterializedDest *result);
 
-int tcc_ir_add_local_variable(TCCIRState *ir, Sym *sym, int stack_offset);
 void tcc_ir_assign_physical_register(TCCIRState *ir, int vreg, int offset, int r0, int r1);
 const char *tcc_ir_get_op_name(TccIrOp op);
 void tcc_ir_show(TCCIRState *ir);
-void tcc_ir_drop_return_value(TCCIRState *ir);
 void tcc_ir_set_addrtaken(TCCIRState *ir, int vreg);
-
-/* Codegen operand access - reads from iroperand_pool with register allocation */
-int tcc_ir_codegen_get_operand(TCCIRState *ir, const IRQuadCompact *q, int slot, SValue *out);
 
 void tcc_ir_patch_live_intervals_registers(TCCIRState *ir);
 IRLiveInterval *tcc_ir_get_live_interval(TCCIRState *ir, int vreg);
@@ -496,24 +484,10 @@ void tcc_ir_backpatch(TCCIRState *ir, int t, int target_address);
 void tcc_ir_backpatch_to_here(TCCIRState *ir, int t);
 void tcc_ir_backpatch_first(TCCIRState *ir, int t, int target_address);
 int tcc_ir_gjmp_append(TCCIRState *ir, int n, int t);
-int tcc_ir_generate_test(TCCIRState *ir, int inv, int t);
-int tcc_ir_dead_code_elimination(TCCIRState *ir);
-int tcc_ir_dead_store_elimination(TCCIRState *ir);
-int tcc_ir_constant_propagation(TCCIRState *ir);
-int tcc_ir_tmp_constant_propagation(TCCIRState *ir);
-int tcc_ir_copy_propagation(TCCIRState *ir);
-int tcc_ir_arithmetic_cse(TCCIRState *ir);
-int tcc_ir_bool_cse(TCCIRState *ir);
-int tcc_ir_bool_idempotent(TCCIRState *ir);
-int tcc_ir_bool_simplification(TCCIRState *ir);
-int tcc_ir_return_value_optimization(TCCIRState *ir);
-int tcc_ir_store_load_forwarding(TCCIRState *ir);
-int tcc_ir_redundant_store_elimination(TCCIRState *ir);
 void tcc_ir_print_vreg(int vreg);
 void print_iroperand_short(TCCIRState *ir, IROperand op);
 void tcc_print_quadruple_irop(TCCIRState *ir, IRQuadCompact *q, int pc);
-void tcc_ir_generate_cmp_jmp_set(TCCIRState *ir);
-void tcc_ir_start_basic_block(TCCIRState *ir);
+
 
 /* Machine-independent spill helpers (defined in tccir.c) */
 int tcc_ir_is_spilled(SValue *sv);

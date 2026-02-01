@@ -117,8 +117,8 @@ make cross
 # Build everything including fp-libs
 make cross fp-libs
 
-# Run tests
-make test
+# Run tests (use -j16 for parallel execution)
+make test -j16
 
 # Clean build artifacts
 make clean
@@ -157,21 +157,21 @@ The project uses multiple testing frameworks:
 ### Running Tests
 
 ```bash
-# Full test suite (requires ARM cross toolchain)
-make test
+# Full test suite (requires ARM cross toolchain, use -j16 for parallel execution)
+make test -j16
 
 # Run only IR tests
 make test-venv test-prepare
 cd tests/ir_tests && pytest -s -n auto
 
 # Run only assembly tests
-make test-asm
+make test-asm -j16
 
 # Run legacy tests
-make test-legacy
+make test-legacy -j16
 
 # Run AEABI host tests
-make test-aeabi-host
+make test-aeabi-host -j16
 ```
 
 ### Test Requirements for IR Tests

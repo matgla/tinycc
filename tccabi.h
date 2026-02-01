@@ -90,3 +90,5 @@ typedef struct TCCAbiCallLayout
 
 TCCAbiArgLoc tcc_abi_classify_argument(TCCAbiCallLayout *layout, int arg_index, const TCCAbiArgDesc *arg_desc);
 int tcc_abi_align_up_int(int v, int align);
+void tcc_abi_call_layout_ensure_capacity(TCCAbiCallLayout *layout, int needed);
+void tcc_abi_call_layout_deinit(TCCAbiCallLayout *layout);

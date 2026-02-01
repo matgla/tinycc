@@ -11,7 +11,7 @@
 #ifndef TCC_IR_MAT_H
 #define TCC_IR_MAT_H
 
-#include "operand.h"
+/* operand.h is included via tcc.h as tccir_operand.h */
 
 struct TCCIRState;
 struct SValue;
@@ -102,5 +102,8 @@ int tcc_ir_mat_spilled(struct SValue *sv);
 
 /* Check if IROperand is spilled */
 int tcc_ir_mat_spilled_op(const struct IROperand *op);
+
+/* Check if operand needs dereference based on its flags */
+bool tcc_ir_operand_needs_dereference(struct SValue *sv);
 
 #endif /* TCC_IR_MAT_H */

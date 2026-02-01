@@ -93,10 +93,13 @@ const char *tcc_ir_dump_vreg_type(int vreg_type);
 void tcc_ir_print_vreg(int vreg);
 
 /* ============================================================================
- * Machine Code Dumping (ARM-specific)
+ * Legacy Dump Functions (used when TCC_DUMP_THUMB_GEN is enabled)
  * ============================================================================ */
 
-/* Try to dump machine code with objdump */
-int tcc_ir_dump_try_objdump(const unsigned char *bytes, size_t len, uint32_t start_vma);
+/* Dump SValue short form to file (legacy implementation) */
+void tcc_dump_svalue_short_to(FILE *out, const struct SValue *sv);
+
+/* Dump quadruple to file (legacy implementation) */
+void tcc_dump_quadruple_to(FILE *out, const struct TACQuadruple *q, int pc);
 
 #endif /* TCC_IR_DUMP_H */

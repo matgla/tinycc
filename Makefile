@@ -255,8 +255,10 @@ LIB-$(TR) ?= {B}:/usr/$(TRIPLET-$T)/lib:/usr/lib/$(MARCH-$T)
 INC-$(TR) ?= {B}/include:/usr/$(TRIPLET-$T)/include:/usr/include
 endif
 
-CORE_FILES = tccir.c tccir_operand.c tccls.c tcc.c tcctools.c libtcc.c tccpp.c tccgen.c tccdbg.c tccelf.c tccasm.c tccyaff.c tccld.c tccdebug.c svalue.c tccmachine.c tccopt.c
+IR_FILES = ir/type.c ir/pool.c ir/vreg.c ir/stack.c ir/live.c ir/mat.c ir/dump.c ir/codegen.c ir/opt.c ir/core.c
+CORE_FILES = tccir_operand.c tccls.c tcc.c tcctools.c libtcc.c tccpp.c tccgen.c tccdbg.c tccelf.c tccasm.c tccyaff.c tccld.c tccdebug.c svalue.c tccmachine.c tccopt.c $(IR_FILES)
 CORE_FILES += tcc.h config.h libtcc.h tcctok.h tccir.h tccir_operand.h tccld.h tccmachine.h tccopt.h
+CORE_FILES += $(wildcard ir/*.h)
 armv8m_FILES = $(CORE_FILES) arch/arm_aapcs.c arch/armv8m.c arm-thumb-opcodes.c arm-thumb-gen.c arm-thumb-callsite.c arm-link.c arm-thumb-asm.c arm-thumb-defs.h thumb-tok.h
 
 TCCDEFS_H$(subst yes,,$(CONFIG_predefs)) = tccdefs_.h
@@ -270,7 +272,7 @@ LIBTCC_INC = $(filter %.h %-gen.c %-link.c,$($T_FILES))
 TCC_FILES = $(X)tcc.o $(LIBTCC_OBJ)
 $(X)tccpp.o : $(TCCDEFS_H)
 
-DEFINES += -I$(TOP)
+DEFINES += -I$(TOP) -I$(TOP)/ir
 
 GITHASH:=$(shell git rev-parse --abbrev-ref HEAD 2>/dev/null || echo no)
 ifneq ($(GITHASH),no)
@@ -294,6 +296,10 @@ $(X)%.o : %.c $(LIBTCC_INC)
 	$S$(CC) -o $@ -c $< $(addsuffix ,$(DEFINES) $(CFLAGS))
 
 $(X)arch/%.o : arch/%.c $(LIBTCC_INC)
+	@mkdir -p $(dir $@)
+	$S$(CC) -o $@ -c $< $(addsuffix ,$(DEFINES) $(CFLAGS))
+
+$(X)ir/%.o : ir/%.c $(LIBTCC_INC)
 	@mkdir -p $(dir $@)
 	$S$(CC) -o $@ -c $< $(addsuffix ,$(DEFINES) $(CFLAGS))
 
