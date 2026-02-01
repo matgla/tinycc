@@ -320,6 +320,9 @@ typedef struct IRRegistersConfig
 
 extern const IRRegistersConfig irop_config[];
 
+/* Forward declaration for FP materialization cache */
+typedef struct TCCFPMatCache TCCFPMatCache;
+
 typedef struct TCCIRState
 {
   // number of function parameters
@@ -334,6 +337,9 @@ typedef struct TCCIRState
   uint8_t basic_block_start : 1;
   uint8_t prevent_coalescing;
   int32_t loc;
+  
+  /* Optimization module data - opaque pointer to keep IR arch-independent */
+  TCCFPMatCache *opt_fp_mat_cache;
 
   /* IROperand separate pools for cache efficiency */
   int64_t *pool_i64; /* 64-bit integer constants */

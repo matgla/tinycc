@@ -1,0 +1,6 @@
+=== Frame Pointer Offset Cache Test ===
+test_multiple_access: sum = 150
+test_loop_access: arr[0] = 0, arr[1] = 10
+test_mixed_access: arr[0] = 4, arr[1] = 8
+test_swap_pattern: 70 80 50 60
+=== Test Complete ===

@@ -22,6 +22,8 @@
 #define USING_GLOBALS
 #include "tcc.h"
 
+#include "tccmachine.h"
+#include "tccopt.h"
 #include "tccdebug.h"
 
 #ifndef TCC_DUMP_THUMB_GEN_SPAN
@@ -684,6 +686,10 @@ TCCIRState *tcc_ir_allocate_block()
   block->inline_asm_count = 0;
   block->inline_asm_capacity = 0;
 #endif
+
+  /* Initialize optimization module data */
+  block->opt_fp_mat_cache = NULL;
+  
   return block;
 }
 
@@ -861,6 +867,10 @@ void tcc_ir_release_block(TCCIRState *ir)
   ir->stack_layout.offset_hash_size = 0;
 
   tcc_ls_deinitialize(&ir->ls);
+  
+  /* Free optimization module data */
+  tcc_opt_fp_mat_cache_free(ir);
+  
   tcc_free(ir);
 }
 

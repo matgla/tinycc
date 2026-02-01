@@ -815,6 +815,7 @@ struct TCCState
   unsigned char opt_store_load_fwd;  /* -fstore-load-fwd: store-load forwarding */
   unsigned char opt_redundant_store; /* -fredundant-store-elim: redundant store elimination */
   unsigned char opt_dead_store;      /* -fdead-store-elim: dead store elimination */
+  unsigned char opt_fp_offset_cache; /* -ffp-offset-cache: frame pointer offset caching */
 
 #ifdef CONFIG_TCC_DEBUG
   /* Debug-only runtime features */

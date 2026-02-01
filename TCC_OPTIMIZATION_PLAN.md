@@ -210,7 +210,145 @@ GCC recognizes the bubble sort pattern and transforms it. This is advanced, so f
 
 ---
 
-## Phase 5: IT (If-Then) Block Generation - MEDIUM PRIORITY
+## Phase 5: LDR/STR with Offset Addressing - HIGH PRIORITY
+
+### Problem
+TCC generates explicit address calculations for array accesses instead of using ARM's offset addressing modes. This results in 3-4 instructions per array access when 1 would suffice.
+
+### Example: Loading arr[j] and arr[j+1]
+
+**TCC (4 instructions per load):**
+```asm
+; Load arr[j]
+20004512:  ea4f 0482   mov.w   r4, r2, lsl #2    ; r4 = j * 4
+20004516:  f5a7 7c80   sub.w   ip, r7, #256      ; ip = &arr[0] (CSE failed!)
+2000451a:  eb0c 0504   add.w   r5, ip, r4        ; r5 = &arr[j]
+2000452c:  f8d5 c000   ldr.w   ip, [r5]          ; ip = arr[j]
+
+; Load arr[j+1] - recalculates everything!
+2000451e:  1c54        adds    r4, r2, #1        ; r4 = j + 1
+20004520:  ea4f 0684   mov.w   r6, r4, lsl #2    ; r6 = (j+1)*4
+20004524:  f5a7 7c80   sub.w   ip, r7, #256      ; ip = &arr[0] (AGAIN!)
+20004528:  eb0c 0406   add.w   r4, ip, r6        ; r4 = &arr[j+1]
+20004532:  f8d4 e000   ldr.w   lr, [r4]          ; lr = arr[j+1]
+```
+
+**GCC (1-2 instructions with offset addressing):**
+```asm
+; r3 = array pointer, r0 = end pointer
+20003d4e:  681a        ldr     r2, [r3, #0]      ; r2 = arr[j] (offset 0)
+20003d50:  f853 1f04   ldr.w   r1, [r3, #4]!     ; r1 = arr[j+1], r3 += 4 (post-increment)
+```
+
+### ARM Addressing Modes Available
+
+ARM Thumb-2 provides several efficient addressing modes TCC should use:
+
+1. **`[Rn, #offset]`** - Load with immediate offset (best for struct/array access)
+   ```asm
+   ldr r0, [r1, #8]      ; r0 = *(r1 + 8)
+   ```
+
+2. **`[Rn, #offset]!`** - Load with pre-increment (update pointer before)
+   ```asm
+   ldr r0, [r1, #4]!     ; r1 += 4; r0 = *r1
+   ```
+
+3. **`[Rn], #offset`** - Load with post-increment (update pointer after)
+   ```asm
+   ldr r0, [r1], #4      ; r0 = *r1; r1 += 4
+   ```
+
+4. **`[Rn, Rm, LSL #n]`** - Load with register offset + shift
+   ```asm
+   ldr r0, [r1, r2, LSL #2]  ; r0 = *(r1 + (r2 << 2))
+   ```
+
+### Solution
+Add pattern matching in instruction selector to use offset addressing:
+
+**Implementation Steps:**
+
+1. **Detect array access patterns:**
+   ```c
+   // Pattern: arr[const_index] → use [base, #offset]
+   *(base + const) → ldr rd, [base, #const]
+   
+   // Pattern: arr[i] where i is loop variable → use [base, i, LSL #2]
+   *(base + (i << 2)) → ldr rd, [base, i, LSL #2]
+   
+   // Pattern: sequential access → use post-increment
+   for (i=0; i<n; i++) arr[i] → pointer with post-increment
+   ```
+
+2. **Add addressing mode to IR:**
+   - Extend IR to represent memory operands with offset
+   - Track base register + offset instead of computing full address
+
+3. **Code generation for offset modes:**
+   ```c
+   // In arm-thumb-gen.c
+   // Instead of:
+   emit("mov r4, r2, lsl #2");      // offset = i*4
+   emit("add r5, base, r4");        // addr = base + offset
+   emit("ldr ip, [r5]");            // load
+   
+   // Generate:
+   emit("ldr ip, [base, r2, LSL #2]");  // single instruction!
+   ```
+
+4. **Sequential access optimization:**
+   - Detect `arr[i]` followed by `arr[i+1]`
+   - First load: `[ptr, #0]`
+   - Second load: `[ptr, #4]!` or load then `add ptr, #4`
+
+### Concrete Example Transformations
+
+**Current TCC (10 instructions for swap):**
+```asm
+mov  r4, r2, lsl #2       ; offset j
+sub  ip, r7, #256         ; base
+add  r5, ip, r4           ; &arr[j]
+ldr  r6, [r5]             ; temp = arr[j]
+adds r5, r2, #1           ; j+1
+mov  r8, r5, lsl #2       ; offset j+1
+sub  ip, r7, #256         ; base (again!)
+add  r9, ip, r8           ; &arr[j+1]
+ldr  r8, [r9]             ; arr[j+1]
+str  r8, [r5]             ; arr[j] = arr[j+1]
+...
+```
+
+**Optimized (3 instructions):**
+```asm
+ldr  r6, [r3, r2, LSL #2]     ; temp = arr[j]
+ldr  r8, [r3, r4, LSL #2]     ; arr[j+1] (assuming r4=j+1)
+str  r8, [r3, r2, LSL #2]     ; arr[j] = arr[j+1]
+str  r6, [r3, r4, LSL #2]     ; arr[j+1] = temp
+```
+
+Or with pointer iteration (even better):
+```asm
+ldr  r2, [r3, #0]         ; r2 = arr[j]
+ldr  r1, [r3, #4]!        ; r1 = arr[j+1], r3 += 4
+str  r1, [r3, #-4]        ; arr[j] = r1 (was arr[j+1])
+str  r2, [r3]             ; arr[j+1] = r2 (was arr[j])
+```
+
+**Expected Impact:**
+- **70-80% reduction** in array access instruction count
+- Eliminates explicit address calculations
+- Better instruction scheduling (fewer dependencies)
+- Smaller code size
+
+**Files to Modify:**
+- `arm-thumb-gen.c` - Add offset addressing pattern matching
+- `tccir.c` - May need IR changes to represent offset operands
+- `arm-thumb-opcodes.c` - Ensure offset variants of LDR/STR exist
+
+---
+
+## Phase 6: IT (If-Then) Block Generation - MEDIUM PRIORITY
 
 ### Problem
 TCC uses branches for conditional stores, GCC uses IT blocks.
@@ -256,7 +394,7 @@ Add IT block generation for short conditional sequences.
 
 ---
 
-## Phase 6: Register Allocation Improvements - LOW PRIORITY
+## Phase 7: Register Allocation Improvements - LOW PRIORITY
 
 ### Problem
 TCC saves 6 registers (r4-r9) vs GCC saving only lr. This indicates:
@@ -293,7 +431,7 @@ Improve register allocator in `tccls.c`:
 
 ---
 
-## Phase 7: Branch Optimization - LOW PRIORITY
+## Phase 8: Branch Optimization - LOW PRIORITY
 
 ### Problem
 TCC generates unnecessary long branches to nearby code.
@@ -328,10 +466,11 @@ These are only a few bytes away but use 32-bit branch encoding.
 | 1 | Common Subexpression Elimination | Medium | Very High | **P0** |
 | 2 | Constant Propagation/Strength Reduction | Medium | Very High | **P0** |
 | 3 | Instruction Selection (MLA, post-inc) | Low | High | **P1** |
-| 4 | Loop Structure Optimization | High | High | **P1** |
-| 5 | IT Block Generation | Medium | Medium | **P2** |
-| 6 | Register Allocation | High | Medium | **P2** |
-| 7 | Branch Optimization | Low | Low | **P3** |
+| 4 | LDR/STR with Offset Addressing | Low | Very High | **P0** |
+| 5 | Loop Structure Optimization | High | High | **P1** |
+| 6 | IT Block Generation | Medium | Medium | **P2** |
+| 7 | Register Allocation | High | Medium | **P2** |
+| 8 | Branch Optimization | Low | Low | **P3** |
 
 ---
 
@@ -345,6 +484,7 @@ After implementing all phases, measure improvement on `bubble_sort`:
 | Instructions | ~47 | ~25 | ~22 |
 | Registers Saved | 6 | 1-2 | 1 |
 | Multiplications | 64+ | 0 | 0 |
+| Array Access Instructions | 8 per element | 1-2 | 1 |
 | Loads/Stores (inner loop) | 10+ | 2-3 | 2 |
 
 **Stretch Goal:** Within 1.3x of GCC -O1 code size for this benchmark.
@@ -380,8 +520,13 @@ For immediate impact with manageable effort:
    - Detect `MUL` + `ADD` sequence in instruction selector
    - Replace with single `MLA` instruction
 
-3. **Use post-increment for array loops** (Phase 3)
+3. **Use LDR with offset addressing** (Phase 4)
+   - Detect `*(base + (index << 2))` pattern
+   - Replace 3-4 instructions with single `ldr rd, [base, index, LSL #2]`
+   - 70-80% reduction in array access code size
+
+4. **Use post-increment for array loops** (Phase 3/4)
    - Detect `for(i=0; i<n; i++) arr[i]` pattern
    - Generate pointer + post-increment
 
-These three changes alone could reduce code size by 40-50%.
+These four changes alone could reduce code size by 50-60%.
