@@ -80,6 +80,7 @@ TEST_FILES = [
     ("95_cse.c", 0),
     ("test_fp_offset_cache.c", 0),
     ("test_ge_operator.c", 0),
+    ("test_mla_fusion.c", 0),
     ("97_void_call_noargs.c", 0),
     ("98_call_over32_args.c", 0),
     ("99_struct_init_from_struct.c", 0),

@@ -1,0 +1,6 @@
+mla_simple(3, 4, 5) = 17 (expected 17)
+mla_swapped(3, 4, 5) = 17 (expected 17)
+mla_multiple(2, 3, 4, 5) = 55 (expected 55)
+mla_loop(5, 2, 0) = 20 (expected 20)
+mla_complex(2, 3, 4, 5) = 34 (expected 34)
+All MLA tests passed! Sum: 143
