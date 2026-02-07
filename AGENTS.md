@@ -168,6 +168,9 @@ make container-push DOCKER_REGISTRY=ghcr.io DOCKER_IMAGE_NAME=moby/tinycc-armv8m
 make container-push DOCKER_REGISTRY=docker.io DOCKER_IMAGE_NAME=myuser/tinycc-armv8m DOCKER_IMAGE_TAG=latest
 ```
 
+**CI/CD:**
+The CI workflow (`.github/workflows/ci.yml`) pulls the pre-built image from `ghcr.io/USERNAME/tinycc-armv8m:latest` and runs tests inside it. The container image is built and pushed by `.github/workflows/docker-build.yml` when the Dockerfile changes or manually via workflow dispatch.
+
 **Legacy aliases:** `make docker-build` and `make docker-push` also work.
 
 **Manual Docker usage:**

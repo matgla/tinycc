@@ -6,9 +6,19 @@ on:
   pull_request:
     branches: [mob]
 
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/tinycc-armv8m
+
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/${{ github.repository_owner }}/tinycc-armv8m:latest
+      options: --user root
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
 
     steps:
       - name: Checkout repository
@@ -16,22 +26,11 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Configure
+        run: ./configure --enable-O2 --enable-asan
 
-      - name: Build Docker image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          load: true
-          tags: tinycc-armv8m:ci
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Run tests in Docker container
+      - name: Build and test
         run: |
-          docker run --rm \
-            -v $(pwd):/workspace \
-            -w /workspace \
-            tinycc-armv8m:ci \
-            bash -c "virtualenv .venv && source .venv/bin/activate && make test -j$(nproc)"
+          virtualenv .venv
+          source .venv/bin/activate
+          make test -j$(nproc)
