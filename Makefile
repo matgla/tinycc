@@ -552,9 +552,7 @@ CONTAINER_RUNTIME := $(shell \
   elif command -v docker >/dev/null 2>&1; then \
     echo docker; \
   fi)
-ifeq ($(CONTAINER_RUNTIME),)
-  $(warning No container runtime found. Please install docker or podman.)
-endif
+# Note: Container runtime is only needed for container-* and docker-* targets
 
 container-build:
 ifeq ($(CONTAINER_RUNTIME),)

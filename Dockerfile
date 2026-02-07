@@ -18,6 +18,7 @@ RUN apt-get update && apt-get install -y \
     virtualenv \
     qemu-user \
     qemu-user-static \
+    qemu-system-arm \
     binutils-arm-none-eabi \
     gcc-arm-none-eabi \
     libnewlib-arm-none-eabi \

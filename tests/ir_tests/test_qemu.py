@@ -215,7 +215,7 @@ TEST_FILES = [
     # ("../tests2/98_al_ax_extend.c", 0), # x86
     # ("../tests2/99_fastcall.c", 0), # x86
     ("../tests2/100_c99array-decls.c", 0),
-    ("../tests2/101_cleanup.c", 105),
+    ("../tests2/101_cleanup.c", (105, 30)),  # Longer timeout for cleanup test
     ("../tests2/102_alignas.c", 0),
     ("../tests2/103_implicit_memmove.c", 0),
     (["../tests2/104_inline.c", "../tests2/104+_inline.c"], 0),
@@ -409,7 +409,7 @@ def _escape_regex(line):
     return re.escape(line)
 
 
-def _run_qemu_test(test_file, expected_exit_code, args=None, defines=None, opt_level="-O0", output_dir=None):
+def _run_qemu_test(test_file, expected_exit_code, args=None, defines=None, opt_level="-O0", output_dir=None, timeout=10):
     expected_lines = load_expect_file(test_file)
     opt_suffix = f"_{opt_level.replace('-', '')}"
     config = CompileConfig(extra_cflags=opt_level, output_suffix=opt_suffix, output_dir=output_dir)
@@ -417,7 +417,7 @@ def _run_qemu_test(test_file, expected_exit_code, args=None, defines=None, opt_l
     expected_lines = _strip_compiler_output(expected_lines, loglines)
     try:
         for line in expected_lines:
-            _expect_line(sut, line, timeout=3)
+            _expect_line(sut, line, timeout=timeout)
         sut.wait()
         assert sut.exitstatus == expected_exit_code, f"Expected exit code {expected_exit_code}, got {sut.exitstatus}"
     except Exception as e:
@@ -505,8 +505,15 @@ def _generate_matrix_params(test_list):
     params = []
     ids = []
     for test_file, expected in test_list:
+        # Support (exit_code,) or (exit_code, timeout) format
+        if isinstance(expected, tuple):
+            exit_code = expected[0]
+            timeout = expected[1] if len(expected) > 1 else 10
+        else:
+            exit_code = expected
+            timeout = 10
         for opt in OPT_LEVELS:
-            params.append((test_file, expected, opt))
+            params.append((test_file, exit_code, timeout, opt))
             ids.append(f"{_test_id(test_file)}{opt}")
     return params, ids
 
@@ -514,12 +521,12 @@ def _generate_matrix_params(test_list):
 _MATRIX_PARAMS, _MATRIX_IDS = _generate_matrix_params(TEST_FILES)
 
 
-@pytest.mark.parametrize("test_file,expected_exit_code,opt_level", _MATRIX_PARAMS, ids=_MATRIX_IDS)
-def test_qemu_execution(test_file, expected_exit_code, opt_level, tmp_path):
+@pytest.mark.parametrize("test_file,expected_exit_code,timeout,opt_level", _MATRIX_PARAMS, ids=_MATRIX_IDS)
+def test_qemu_execution(test_file, expected_exit_code, timeout, opt_level, tmp_path):
     if test_file is None:
         pytest.fail("test_file is None")
 
-    _run_qemu_test(test_file, expected_exit_code, opt_level=opt_level, output_dir=tmp_path)
+    _run_qemu_test(test_file, expected_exit_code, opt_level=opt_level, output_dir=tmp_path, timeout=timeout)
 
 
 

@@ -65,6 +65,7 @@ TCC_PATH = $(shell realpath $(MAKEFILE_DIR)../../../../)
 LDFLAGS = -Wl,--gc-sections
 
 LIBC_INCLUDES = $(shell realpath $(MAKEFILE_DIR)../../libc_includes)
+NEWLIB_INCLUDES = $(LIBC_INCLUDES)/newlib
 ifeq ($(USE_NEWLIB_BUILD),1)
 LIBGLOSS_PATH = $(shell realpath $(NEWLIB_BUILD_DIR)/arm-none-eabi/libgloss/arm)
 else
@@ -74,7 +75,7 @@ endif
 CRT_LIBS =
 
 ifneq (,$(findstring armv8m-tcc,$(CC)))
-CFLAGS += -I$(LIBC_INCLUDES) -I$(ARM_SYSROOT)/include -I$(TCC_PATH)/include
+CFLAGS += -I$(LIBC_INCLUDES) -I$(NEWLIB_INCLUDES) -I$(ARM_SYSROOT)/include -I$(TCC_PATH)/include
 LDFLAGS += -B$(TCC_PATH)
 ifeq ($(USE_NEWLIB_BUILD),1)
 LIBC_LIB := $(if $(and $(filter 1,$(DEBUG_LIBC)),$(wildcard $(NEWLIB_LIBC_G))),c_g,c)
