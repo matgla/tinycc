@@ -28,6 +28,7 @@ jobs:
         run: ./configure --enable-O2 --enable-asan
 
       - name: Build and test
+        shell: bash
         run: |
           virtualenv .venv
           source .venv/bin/activate
