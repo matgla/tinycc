@@ -6,15 +6,11 @@ on:
   pull_request:
     branches: [mob]
 
-env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/tinycc-armv8m
-
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
     container:
-      image: ghcr.io/${{ github.repository_owner }}/tinycc-armv8m:latest
+      image: ghcr.io/matgla/tinycc-armv8m:latest
       options: --user root
       credentials:
         username: ${{ github.actor }}
