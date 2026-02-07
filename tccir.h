@@ -68,6 +68,16 @@ typedef enum TccIrOp : uint8_t
   TCCIR_OP_STORE,
   TCCIR_OP_ASSIGN,
   TCCIR_OP_LEA, /* Load Effective Address: dest = &src1 (compute address without loading) */
+  
+  /* Indexed memory operations for array access optimization */
+  TCCIR_OP_LOAD_INDEXED,  /* dest = *(base + (index << scale)) - ARM LDR rd,[rn,rm,LSL #scale] */
+  TCCIR_OP_STORE_INDEXED, /* *(base + (index << scale)) = src - ARM STR rd,[rn,rm,LSL #scale] */
+  
+  /* Post-increment memory operations for sequential access optimization
+   * These combine a load/store with pointer increment: */
+  TCCIR_OP_LOAD_POSTINC,  /* dest = *ptr; ptr += offset - ARM LDR rd,[rn],#imm */
+  TCCIR_OP_STORE_POSTINC, /* *ptr = src; ptr += offset - ARM STR rd,[rn],#imm */
+  
   /* Floating point operations */
   TCCIR_OP_FADD, /* float/double addition */
   TCCIR_OP_FSUB, /* float/double subtraction */
@@ -114,6 +124,13 @@ typedef enum TccIrOp : uint8_t
 
   /* No-operation placeholder for dead instructions */
   TCCIR_OP_NOP,
+
+  /* Jump table switch for dense case statements:
+   * src1 = index vreg (already adjusted: value - min_case)
+   * src2.c.i = table_id (references switch table data)
+   * no dest - this instruction branches directly
+   */
+  TCCIR_OP_SWITCH_TABLE,
 } TccIrOp;
 
 /* FUNCPARAMVAL encoding helpers:
@@ -254,6 +271,15 @@ typedef struct TCCStackLayout
   int *offset_hash_values;
   int offset_hash_size; /* 0 if disabled, otherwise power-of-two */
 } TCCStackLayout;
+
+/* Switch table metadata for jump table generation */
+typedef struct TCCIRSwitchTable {
+  int64_t min_val;        /* Minimum case value */
+  int64_t max_val;        /* Maximum case value */
+  int default_target;     /* IR index for default case */
+  int *targets;           /* Array of IR indices [max-min+1] */
+  int num_entries;        /* Size of targets array */
+} TCCIRSwitchTable;
 
 typedef struct TCCMachineScratchRegs
 {
@@ -434,6 +460,11 @@ typedef struct TCCIRState
 
   /* Extra scratch allocation flags to apply during materialization for the current IR instruction. */
   unsigned codegen_materialize_scratch_flags;
+
+  /* Switch tables for jump table generation */
+  TCCIRSwitchTable *switch_tables;
+  int num_switch_tables;
+  int switch_tables_capacity;
 } TCCIRState;
 
 TCCIRState *tcc_ir_allocate_block();
@@ -477,6 +508,7 @@ void tcc_ir_materialize_dest(TCCIRState *ir, SValue *dest, TCCMaterializedDest *
 void tcc_ir_assign_physical_register(TCCIRState *ir, int vreg, int offset, int r0, int r1);
 const char *tcc_ir_get_op_name(TccIrOp op);
 void tcc_ir_show(TCCIRState *ir);
+void tcc_ir_dump_set_show_physical_regs(int show);
 void tcc_ir_set_addrtaken(TCCIRState *ir, int vreg);
 
 void tcc_ir_patch_live_intervals_registers(TCCIRState *ir);
@@ -577,6 +609,31 @@ static inline IROperand tcc_ir_get_src2(const TCCIRState *ir, int index)
     return IROP_NONE;
   int off = irop_config[q->op].has_dest + irop_config[q->op].has_src1;
   return ir->iroperand_pool[q->operand_base + off];
+}
+
+/* Get the 4th operand (scale) for indexed memory operations.
+ * This is stored at operand_base + 3 for LOAD_INDEXED/STORE_INDEXED.
+ */
+static inline IROperand tcc_ir_op_get_scale(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  /* Scale is at operand_base + 3 (after dest, base/src1, index/src2) */
+  int scale_idx = q->operand_base + 3;
+  if (scale_idx >= 0 && scale_idx < ir->iroperand_pool_count)
+    return ir->iroperand_pool[scale_idx];
+  return IROP_NONE;
+}
+
+/* Get the 4th operand (accumulator) for MLA (Multiply-Accumulate) operations.
+ * MLA: dest = src1 * src2 + accum
+ * This is stored at operand_base + 3 for MLA.
+ */
+static inline IROperand tcc_ir_op_get_accum(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  /* Accumulator is at operand_base + 3 (after dest, src1, src2) */
+  int accum_idx = q->operand_base + 3;
+  if (accum_idx >= 0 && accum_idx < ir->iroperand_pool_count)
+    return ir->iroperand_pool[accum_idx];
+  return IROP_NONE;
 }
 
 /* ============================================================================

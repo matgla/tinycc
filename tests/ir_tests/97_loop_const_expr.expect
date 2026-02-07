@@ -1,0 +1,4 @@
+PASS: test_const_hoist
+PASS: test_chained_hoist
+PASS: test_conditionals_pattern
+All LICM constant expression tests passed!

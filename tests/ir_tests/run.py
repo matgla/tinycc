@@ -23,6 +23,12 @@ args.add_argument(
     action="store_true",
     help="Print compiler/make output to stderr (useful with --dump-ir).",
 )
+args.add_argument(
+    "--args",
+    "-a",
+    nargs="*",
+    help="Arguments to pass to the test program (via QEMU semihosting).",
+)
 args, _ = args.parse_known_args()
 
 def main():
@@ -53,7 +59,7 @@ def main():
         file = args.file
     # Send harness diagnostics to stderr so stdout stays comparable to .expect
     print(f"Running QEMU with file: {file}", file=sys.stderr)
-    qemu_command = build_qemu_command(args.machine, file)
+    qemu_command = build_qemu_command(args.machine, file, args=args.args)
     if args.gdb:
         qemu_command += " -s -S"
     subprocess.run(qemu_command, shell=True)

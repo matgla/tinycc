@@ -1723,6 +1723,10 @@ const IRRegistersConfig irop_config[] = {
     [TCCIR_OP_STORE] = {1, 1, 0},
     [TCCIR_OP_ASSIGN] = {1, 1, 0},
     [TCCIR_OP_LEA] = {1, 1, 0},    /* dest = &src1 */
+    [TCCIR_OP_LOAD_INDEXED] = {1, 1, 1},   /* dest = *(base + (index << scale)) */
+    [TCCIR_OP_STORE_INDEXED] = {1, 1, 1},  /* *(base + (index << scale)) = src */
+    [TCCIR_OP_LOAD_POSTINC] = {1, 1, 0},   /* dest = *ptr; ptr += offset */
+    [TCCIR_OP_STORE_POSTINC] = {1, 1, 0},  /* *ptr = src; ptr += offset */
     [TCCIR_OP_TEST_ZERO] = {0, 1, 0},
     /* Floating point operations */
     [TCCIR_OP_FADD] = {1, 1, 1}, [TCCIR_OP_FSUB] = {1, 1, 1}, [TCCIR_OP_FMUL] = {1, 1, 1}, [TCCIR_OP_FDIV] = {1, 1, 1},
@@ -1755,6 +1759,8 @@ const IRRegistersConfig irop_config[] = {
 
     /* No-operation */
     [TCCIR_OP_NOP] = {0, 0, 0},
+    /* Jump table switch: src1=index vreg, src2=table_id, no dest */
+    [TCCIR_OP_SWITCH_TABLE] = {0, 1, 1},
 }
 ;
 // clang-format on

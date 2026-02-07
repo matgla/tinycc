@@ -174,6 +174,35 @@ make test-legacy -j16
 make test-aeabi-host -j16
 ```
 
+### Quick Test Runner (run.py)
+
+For quick manual testing, use `tests/ir_tests/run.py`:
+
+```bash
+cd tests/ir_tests
+
+# Compile and run a single file with default flags
+python run.py -c mytest.c
+
+# Compile with optimization flags
+python run.py -c mytest.c --cflags="-O1"
+
+# Dump IR while running
+python run.py -c mytest.c --cflags="-O1" --dump-ir
+
+# Use GCC instead of TCC for comparison
+python run.py -c mytest.c --gcc=/usr/bin/arm-none-eabi-gcc
+
+# Run a pre-compiled ELF file
+python run.py -f build/mytest.elf
+
+# Enable GDB debugging (QEMU waits for debugger)
+python run.py -c mytest.c --gdb
+
+# Pass command-line arguments to the test program
+python run.py -c mytest.c --args arg1 arg2 arg3
+```
+
 ### Test Requirements for IR Tests
 
 The first run will build newlib for the ARM target:
@@ -269,11 +298,20 @@ CFLAGS += -std=c11 -Wunused-function -Wno-declaration-after-statement -Werror
 
 Enable debug output with build flags:
 ```bash
-make CFLAGS+='-DPARSE_DEBUG'      # Parser debug
+make CFLAGS+='-DPARSE_DEBUG'       # Parser debug
 make CFLAGS+='-DPP_DEBUG'          # Preprocessor debug
 make CFLAGS+='-DASM_DEBUG'         # Assembler debug
 make CFLAGS+='-DCONFIG_TCC_DEBUG'  # IR dump (-dump-ir)
+make CFLAGS+='-DTCC_LS_DEBUG'      # Register allocator debug (linear scan)
 ```
+
+The `TCC_LS_DEBUG` flag enables detailed logging of the linear scan register allocator:
+- Live interval creation and range information
+- Register assignment decisions (including callee-saved vs caller-saved)
+- Spilling decisions and stack slot allocation
+- Active interval expiration
+- Scratch register allocation
+- Final register allocation summary
 
 ## Floating Point Support
 

@@ -69,18 +69,22 @@ TEST_FILES = [
     ("bug_ull_mul10_loop.c", 0),
     ("bug_ull_mul10_once.c", 0),
     ("bug_ll_mul10_switch_min.c", 0),
-    # KNOWN BUG: Return from else block with string literal - pointer corrupted
     # ("bug_ternary_string.c", 0),  # Nested ternary with string literals
     # ("bug_return_else_string.c", 0),  # Return string from else block
-    # ("test_cleanup_double.c", 0),
+    ("test_cleanup_double.c", 0),
     ("91_const_propagation.c", 0),
     ("92_loop_invariant.c", 0),
     ("93_chained_arithmetic.c", 0),
     ("94_copy_propagation.c", 0),
     ("95_cse.c", 0),
+    ("95_const_branch_fold.c", 0),
+    ("96_const_cmp_fold_vreg.c", 0),
+    ("97_loop_const_expr.c", 0),
+    ("98_value_tracking.c", 0),
     ("test_fp_offset_cache.c", 0),
     ("test_ge_operator.c", 0),
     ("test_mla_fusion.c", 0),
+    ("test_offset_addressing.c", 0),
     ("97_void_call_noargs.c", 0),
     ("98_call_over32_args.c", 0),
     ("99_struct_init_from_struct.c", 0),
@@ -90,6 +94,13 @@ TEST_FILES = [
     ("test_double_printf_ops.c", 0),
     ("test_double_printf_literals.c", 0),
     ("test_double_printf_mixed.c", 0),
+
+    # Pure function hoisting tests (LICM optimization)
+    ("100_pure_func_strlen.c", 0),
+    ("101_pure_func_abs.c", 0),
+    ("102_pure_func_strcmp.c", 0),
+    ("103_pure_func_multiple.c", 0),
+    ("104_pure_func_variant.c", 0),
 
     # Single-precision float tests
     ("72_float_result.c", 1),  # Returns 1 on success (non-standard convention)
@@ -123,6 +134,9 @@ TEST_FILES = [
     ("test_llong_mod_signed.c", 0),
     ("test_llong_mod_unsigned.c", 0),
     ("test_llong_bitwise.c", 0),
+
+    # Induction variable strength reduction test
+    ("110_iv_strength_reduction.c", 0),
 
     ("../tests2/00_assignment.c", 0),
     ("../tests2/01_comment.c", 0),
@@ -227,6 +241,11 @@ TEST_FILES = [
     ("../tests2/130_large_argument.c", 0),
     ("../tests2/133_string_concat.c", 0),
     ("../tests2/135_func_arg_struct_compare.c", 0),
+
+    # Switch statement tests (jump table optimization)
+    ("test_switch.c", 0),
+    ("test_switch_simple.c", 0),
+    ("test_switch_small.c", 0),  # Only 3 cases - won't trigger jump table
 ]
 
 FLOAT_TEST_FILES = [

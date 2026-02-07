@@ -99,6 +99,11 @@ ST_FUNC void g(int c)
   int ind1;
   if (nocode_wanted)
     return;
+  /* During dry-run, don't write to section data, just track position */
+  if (tcc_gen_machine_dry_run_is_active()) {
+    ind++;
+    return;
+  }
   ind1 = ind + 1;
   if (ind1 > cur_text_section->data_allocated)
     section_realloc(cur_text_section, ind1);
@@ -117,6 +122,11 @@ ST_FUNC void gen_le32(int i)
   int ind1;
   if (nocode_wanted)
     return;
+  /* During dry-run, don't write to section data, just track position */
+  if (tcc_gen_machine_dry_run_is_active()) {
+    ind += 4;
+    return;
+  }
   ind1 = ind + 4;
   if (ind1 > cur_text_section->data_allocated)
     section_realloc(cur_text_section, ind1);

@@ -177,7 +177,7 @@ uint32_t th_encbranch(int pos, int addr)
 uint32_t th_encbranch_8(int pos, int addr)
 {
   addr = (addr - pos - 4) >> 1;
-  if (addr >= 127 || addr < -128)
+  if (addr > 127 || addr < -128)
   {
     tcc_error("compiler_error: th_encbranch_8 too far address: %i\n", addr);
     return 0;

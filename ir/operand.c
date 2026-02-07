@@ -319,8 +319,11 @@ IROperand svalue_to_iroperand(TCCIRState *ir, const SValue *sv)
    * val_kind being a physical register (< VT_CONST) means the value is in/through that register. */
   if (vr >= 0 && val_kind != VT_CONST && val_kind != VT_LOCAL && val_kind != VT_LLOCAL && !has_sym)
   {
+    int is_reg_param = (sv->r & VT_PARAM) && !is_local && !is_llocal;
     result = irop_make_vreg(vr, irop_bt);
-    result.is_lval = is_lval;
+    /* For register parameters, the value is directly in the register - no dereferencing needed.
+     * Clear is_lval for register params since they're already values, not addresses. */
+    result.is_lval = is_reg_param ? 0 : is_lval;
     result.is_param = (sv->r & VT_PARAM) ? 1 : 0; /* Preserve VT_PARAM for register params */
     irop_copy_svalue_info(&result, sv);
     /* Capture physical register from VT_VALMASK if it's a register number */
@@ -333,8 +336,11 @@ IROperand svalue_to_iroperand(TCCIRState *ir, const SValue *sv)
    * Value is purely in a physical register, not tracked by IR vreg system. */
   if (vr < 0 && val_kind < VT_CONST && val_kind < 32 && !has_sym)
   {
+    int is_reg_param = (sv->r & VT_PARAM) && !is_local && !is_llocal;
     result = irop_make_vreg(vr, irop_bt);
-    result.is_lval = is_lval;
+    /* For register parameters, the value is directly in the register - no dereferencing needed.
+     * Clear is_lval for register params since they're already values, not addresses. */
+    result.is_lval = is_reg_param ? 0 : is_lval;
     result.is_param = (sv->r & VT_PARAM) ? 1 : 0; /* Preserve VT_PARAM for register params */
     irop_copy_svalue_info(&result, sv);
     result.pr0_reg = val_kind; /* Physical register in VT_VALMASK */

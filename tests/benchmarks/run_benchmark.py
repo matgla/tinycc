@@ -75,6 +75,59 @@ def get_binary_size(elf_path: Path) -> Dict[str, int]:
     return {}
 
 
+def get_tcc_compiler_path() -> Optional[Path]:
+    """Find the armv8m-tcc compiler path."""
+    script_dir = Path(__file__).parent
+    # Look in parent of benchmarks directory (typical TCC repo layout)
+    tcc_paths = [
+        script_dir / ".." / ".." / "armv8m-tcc",
+        script_dir / ".." / "armv8m-tcc",
+    ]
+    for path in tcc_paths:
+        resolved = path.resolve()
+        if resolved.exists():
+            return resolved
+    # Try finding in PATH
+    code, stdout, _ = run_command(["which", "armv8m-tcc"])
+    if code == 0:
+        return Path(stdout.strip())
+    return None
+
+
+def get_compiler_timestamp(compiler: str) -> Optional[float]:
+    """Get the modification timestamp of the compiler binary."""
+    if compiler.lower() == "tcc":
+        tcc_path = get_tcc_compiler_path()
+        if tcc_path:
+            return tcc_path.stat().st_mtime
+    return None
+
+
+def get_marker_path(build_dir: Path, compiler: str) -> Path:
+    """Get the path to the compiler timestamp marker file."""
+    return build_dir / f".compiler_{compiler.lower()}_timestamp"
+
+
+def check_compiler_changed(build_dir: Path, compiler: str) -> bool:
+    """Check if the compiler has been updated since last build."""
+    marker_file = get_marker_path(build_dir, compiler)
+    if not marker_file.exists():
+        return True  # No marker means we need to check
+    
+    compiler_ts = get_compiler_timestamp(compiler)
+    if compiler_ts is None:
+        return False  # Can't check, assume no change
+    
+    marker_ts = marker_file.stat().st_mtime
+    return compiler_ts > marker_ts
+
+
+def update_compiler_marker(build_dir: Path, compiler: str):
+    """Update the compiler timestamp marker file."""
+    marker_file = get_marker_path(build_dir, compiler)
+    marker_file.touch()
+
+
 def build_compiler(compiler: str, ssh_host: str, opt_level: str = "1") -> Tuple[bool, Optional[Path], Dict[str, int]]:
     """Build benchmark for specified compiler (tcc or gcc)."""
     print(f"\n{'='*50}")
@@ -88,6 +141,20 @@ def build_compiler(compiler: str, ssh_host: str, opt_level: str = "1") -> Tuple[
 
     # Create build directory
     build_dir.mkdir(parents=True, exist_ok=True)
+
+    # Check if compiler has been updated (especially important for TCC development)
+    force_reconfigure = False
+    if compiler.lower() == "tcc":
+        tcc_path = get_tcc_compiler_path()
+        if tcc_path:
+            print(f"Using TCC: {tcc_path}")
+            if check_compiler_changed(build_dir, compiler):
+                print(f"TCC compiler has been updated, forcing reconfiguration...")
+                force_reconfigure = True
+                # Remove CMake cache to force reconfiguration
+                cmake_cache = build_dir / "CMakeCache.txt"
+                if cmake_cache.exists():
+                    cmake_cache.unlink()
 
     # Set environment with PICO_SDK_PATH
     env = os.environ.copy()
@@ -115,6 +182,10 @@ def build_compiler(compiler: str, ssh_host: str, opt_level: str = "1") -> Tuple[
     if code != 0:
         print(f"Make failed:\n{stderr}")
         return False, None, {}
+    
+    # Update compiler marker after successful build
+    if compiler.lower() == "tcc":
+        update_compiler_marker(build_dir, compiler)
 
     # Check ELF file
     elf_file = build_dir / f"minimal_uart_picosdk_{compiler.lower()}.elf"
@@ -613,6 +684,185 @@ def print_three_way_comparison(tcc_o1: CompilerResult, gcc_o0: CompilerResult, g
     print("="*100)
 
 
+def print_four_way_comparison(tcc_o0: CompilerResult, tcc_o1: CompilerResult, 
+                               gcc_o0: CompilerResult, gcc_o1: CompilerResult):
+    """Print comparison table of TCC -O0, TCC -O1, GCC -O0, and GCC -O1."""
+    print("\n" + "="*120)
+    print("COMPREHENSIVE COMPARISON: TCC-O0 vs TCC-O1 vs GCC-O0 vs GCC-O1")
+    print("="*120)
+
+    # Binary sizes
+    print("\n--- Binary Size Comparison ---")
+    print(f"{'Section':<15} {'TCC-O0':>12} {'TCC-O1':>12} {'GCC-O0':>12} {'GCC-O1':>12} {'TCC-O1/GCC-O1':>14}")
+    print(f"{'-'*15} {'-'*12} {'-'*12} {'-'*12} {'-'*12} {'-'*14}")
+
+    for section in ['text', 'data', 'bss', 'dec']:
+        tcc_o0_size = tcc_o0.build_size.get(section, 0)
+        tcc_o1_size = tcc_o1.build_size.get(section, 0)
+        gcc_o0_size = gcc_o0.build_size.get(section, 0)
+        gcc_o1_size = gcc_o1.build_size.get(section, 0)
+        ratio = (tcc_o1_size / gcc_o1_size * 100) if gcc_o1_size > 0 else 0
+        print(f"{section:<15} {tcc_o0_size:>12} {tcc_o1_size:>12} {gcc_o0_size:>12} {gcc_o1_size:>12} {ratio:>13.1f}%")
+
+    # Show TCC -O0 vs -O1 improvement
+    print("\n--- TCC Optimization Improvement (-O0 vs -O1) ---")
+    for section in ['text', 'dec']:
+        o0_size = tcc_o0.build_size.get(section, 0)
+        o1_size = tcc_o1.build_size.get(section, 0)
+        if o0_size > 0:
+            reduction = ((o0_size - o1_size) / o0_size * 100)
+            print(f"{section}: {o0_size} -> {o1_size} ({reduction:.1f}% reduction)")
+
+    # Performance comparison
+    print("\n--- Performance Comparison (cycles per iteration) ---")
+    print(f"{'Benchmark':<25} {'TCC-O0':>12} {'TCC-O1':>12} {'GCC-O0':>12} {'GCC-O1':>12} {'TCC-O1/GCC-O1':>14}")
+    print(f"{'-'*25} {'-'*12} {'-'*12} {'-'*12} {'-'*12} {'-'*14}")
+
+    tcc_o0_benches = {b.name: b for b in tcc_o0.benchmarks}
+    tcc_o1_benches = {b.name: b for b in tcc_o1.benchmarks}
+    gcc_o0_benches = {b.name: b for b in gcc_o0.benchmarks}
+    gcc_o1_benches = {b.name: b for b in gcc_o1.benchmarks}
+
+    all_names = sorted(set(tcc_o0_benches.keys()) | set(tcc_o1_benches.keys()) | 
+                       set(gcc_o0_benches.keys()) | set(gcc_o1_benches.keys()))
+
+    total_tcc_o0 = 0
+    total_tcc_o1 = 0
+    total_gcc_o0 = 0
+    total_gcc_o1 = 0
+
+    for name in all_names:
+        tcc_o0_b = tcc_o0_benches.get(name)
+        tcc_o1_b = tcc_o1_benches.get(name)
+        gcc_o0_b = gcc_o0_benches.get(name)
+        gcc_o1_b = gcc_o1_benches.get(name)
+
+        tcc_o0_cycles = tcc_o0_b.cycles_per_iter if tcc_o0_b else 0
+        tcc_o1_cycles = tcc_o1_b.cycles_per_iter if tcc_o1_b else 0
+        gcc_o0_cycles = gcc_o0_b.cycles_per_iter if gcc_o0_b else 0
+        gcc_o1_cycles = gcc_o1_b.cycles_per_iter if gcc_o1_b else 0
+
+        tcc_o0_str = f"{tcc_o0_cycles:.2f}" if tcc_o0_b else "N/A"
+        tcc_o1_str = f"{tcc_o1_cycles:.2f}" if tcc_o1_b else "N/A"
+        gcc_o0_str = f"{gcc_o0_cycles:.2f}" if gcc_o0_b else "N/A"
+        gcc_o1_str = f"{gcc_o1_cycles:.2f}" if gcc_o1_b else "N/A"
+
+        if tcc_o1_cycles > 0 and gcc_o1_cycles > 0:
+            ratio = (tcc_o1_cycles / gcc_o1_cycles * 100)
+            ratio_str = f"{ratio:.1f}%"
+            total_tcc_o0 += tcc_o0_cycles if tcc_o0_b else 0
+            total_tcc_o1 += tcc_o1_cycles
+            total_gcc_o0 += gcc_o0_cycles if gcc_o0_b else 0
+            total_gcc_o1 += gcc_o1_cycles
+        else:
+            ratio_str = "N/A"
+
+        print(f"{name:<25} {tcc_o0_str:>12} {tcc_o1_str:>12} {gcc_o0_str:>12} {gcc_o1_str:>12} {ratio_str:>14}")
+
+    print(f"{'-'*25} {'-'*12} {'-'*12} {'-'*12} {'-'*12} {'-'*14}")
+
+    # Overall summary
+    if total_tcc_o1 > 0 and total_gcc_o1 > 0:
+        overall_ratio = (total_tcc_o1 / total_gcc_o1 * 100)
+        print(f"\n{'OVERALL':<25} {total_tcc_o0:>12.2f} {total_tcc_o1:>12.2f} {total_gcc_o0:>12.2f} {total_gcc_o1:>12.2f} {overall_ratio:>13.1f}%")
+
+    print(f"\n--- Summary ---")
+    print(f"TCC -O0 vs -O1: {(total_tcc_o0/total_tcc_o1*100):.1f}% (higher is better for -O1)")
+    print(f"TCC-O1 vs GCC-O1: {(total_tcc_o1/total_gcc_o1*100):.1f}% (lower is better)")
+    print("="*120)
+
+    # NEW: TCC -O1 vs GCC -O0 comparison
+    print_four_way_comparison_tcc_o1_vs_gcc_o0(tcc_o1, gcc_o0, all_names, 
+                                                tcc_o1_benches, gcc_o0_benches)
+
+
+def print_four_way_comparison_tcc_o1_vs_gcc_o0(tcc_o1: CompilerResult, gcc_o0: CompilerResult,
+                                                all_names: List[str],
+                                                tcc_o1_benches: Dict[str, BenchmarkResult],
+                                                gcc_o0_benches: Dict[str, BenchmarkResult]):
+    """Print detailed TCC -O1 vs GCC -O0 comparison (fair compiler comparison)."""
+    print("\n" + "="*100)
+    print("CROSS-COMPILER COMPARISON: TCC -O1 vs GCC -O0 (Fair Optimization Level)")
+    print("="*100)
+    print("This comparison shows TCC with optimizations enabled against GCC without optimizations.")
+    print("This is useful for evaluating TCC's optimization capabilities vs GCC baseline.\n")
+
+    # Binary sizes for this specific comparison
+    print("--- Binary Size Comparison ---")
+    print(f"{'Section':<15} {'TCC-O1':>12} {'GCC-O0':>12} {'TCC/GCC %':>12}")
+    print(f"{'-'*15} {'-'*12} {'-'*12} {'-'*12}")
+
+    for section in ['text', 'data', 'bss', 'dec']:
+        tcc_size = tcc_o1.build_size.get(section, 0)
+        gcc_size = gcc_o0.build_size.get(section, 0)
+        ratio = (tcc_size / gcc_size * 100) if gcc_size > 0 else 0
+        print(f"{section:<15} {tcc_size:>12} {gcc_size:>12} {ratio:>11.1f}%")
+
+    # Performance comparison
+    print("\n--- Performance Comparison (cycles per iteration) ---")
+    print(f"{'Benchmark':<25} {'TCC-O1':>12} {'GCC-O0':>12} {'TCC/GCC %':>12} {'Winner':>10} {'Speedup':>10}")
+    print(f"{'-'*25} {'-'*12} {'-'*12} {'-'*12} {'-'*10} {'-'*10}")
+
+    total_tcc_o1 = 0
+    total_gcc_o0 = 0
+    tcc_wins = 0
+    gcc_wins = 0
+    ties = 0
+
+    for name in all_names:
+        tcc_b = tcc_o1_benches.get(name)
+        gcc_b = gcc_o0_benches.get(name)
+
+        tcc_cycles = tcc_b.cycles_per_iter if tcc_b else 0
+        gcc_cycles = gcc_b.cycles_per_iter if gcc_b else 0
+
+        tcc_str = f"{tcc_cycles:.2f}" if tcc_b else "N/A"
+        gcc_str = f"{gcc_cycles:.2f}" if gcc_b else "N/A"
+
+        if tcc_cycles > 0 and gcc_cycles > 0:
+            ratio = (tcc_cycles / gcc_cycles * 100)
+            ratio_str = f"{ratio:.1f}%"
+            total_tcc_o1 += tcc_cycles
+            total_gcc_o0 += gcc_cycles
+            
+            # Determine winner
+            if abs(ratio - 100) < 5:
+                winner = "TIE"
+                ties += 1
+            elif tcc_cycles < gcc_cycles:
+                winner = "TCC"
+                tcc_wins += 1
+            else:
+                winner = "GCC"
+                gcc_wins += 1
+            
+            speedup = gcc_cycles / tcc_cycles if tcc_cycles > 0 else 0
+            speedup_str = f"{speedup:.2f}x" if speedup > 0 else "N/A"
+        else:
+            ratio_str = "N/A"
+            winner = "N/A"
+            speedup_str = "N/A"
+
+        print(f"{name:<25} {tcc_str:>12} {gcc_str:>12} {ratio_str:>12} {winner:>10} {speedup_str:>10}")
+
+    print(f"{'-'*25} {'-'*12} {'-'*12} {'-'*12} {'-'*10} {'-'*10}")
+
+    # Overall summary
+    if total_tcc_o1 > 0 and total_gcc_o0 > 0:
+        overall_ratio = (total_tcc_o1 / total_gcc_o0 * 100)
+        overall_speedup = total_gcc_o0 / total_tcc_o1
+        print(f"\n{'OVERALL':<25} {total_tcc_o1:>12.2f} {total_gcc_o0:>12.2f} {overall_ratio:>11.1f}%")
+
+    print(f"\n--- Summary ---")
+    print(f"TCC-O1 wins: {tcc_wins} benchmarks")
+    print(f"GCC-O0 wins: {gcc_wins} benchmarks")
+    print(f"Ties: {ties} benchmarks")
+    if total_tcc_o1 > 0 and total_gcc_o0 > 0:
+        print(f"Overall speedup: TCC-O1 is {overall_speedup:.2f}x {'faster' if overall_speedup > 1 else 'slower'} than GCC-O0")
+        print(f"Percentage: TCC-O1 uses {overall_ratio:.1f}% of GCC-O0 cycles ({'lower is better' if overall_ratio < 100 else 'higher is worse'})")
+    print("="*100)
+
+
 def print_comparison(tcc_result: CompilerResult, gcc_result: CompilerResult):
     """Print comparison table of TCC vs GCC results with verification status."""
     print("\n" + "="*80)
@@ -850,21 +1100,23 @@ def main():
 
     # Run based on optimization level selection
     if args.opt_level == "both":
-        # Run TCC-O1, GCC-O0, and GCC-O1 for comprehensive comparison
+        # Run TCC-O0, TCC-O1, GCC-O0, and GCC-O1 for comprehensive comparison
         print("="*80)
-        print("Running comprehensive comparison: TCC-O1, GCC-O0, GCC-O1")
+        print("Running comprehensive comparison: TCC-O0, TCC-O1, GCC-O0, GCC-O1")
         print("="*80)
         
-        tcc_o1, _ = run_single_opt("1", " (1/3) - TCC")
+        tcc_o0, _ = run_single_opt("0", " (1/4) - TCC-O0")
         print("\n")
-        _, gcc_o0 = run_single_opt("0", " (2/3) - GCC-O0")
+        tcc_o1, _ = run_single_opt("1", " (2/4) - TCC-O1")
         print("\n")
-        _, gcc_o1 = run_single_opt("1", " (3/3) - GCC-O1")
+        _, gcc_o0 = run_single_opt("0", " (3/4) - GCC-O0")
+        print("\n")
+        _, gcc_o1 = run_single_opt("1", " (4/4) - GCC-O1")
 
-        # Print comprehensive three-way comparison
-        if tcc_o1 and gcc_o0 and gcc_o1:
+        # Print comprehensive comparison
+        if tcc_o0 and tcc_o1 and gcc_o0 and gcc_o1:
             print("\n")
-            print_three_way_comparison(tcc_o1, gcc_o0, gcc_o1)
+            print_four_way_comparison(tcc_o0, tcc_o1, gcc_o0, gcc_o1)
     else:
         # Run single optimization level
         tcc_result, gcc_result = run_single_opt(args.opt_level)
@@ -882,6 +1134,10 @@ def main():
 
             if args.opt_level == "both":
                 # Save results from comprehensive comparison
+                if tcc_o0:
+                    f.write(f"--- TCC -O0 Raw Output ---\n")
+                    f.write(tcc_o0.raw_output)
+                    f.write("\n\n")
                 if tcc_o1:
                     f.write(f"--- TCC -O1 Raw Output ---\n")
                     f.write(tcc_o1.raw_output)

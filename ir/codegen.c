@@ -1117,9 +1117,402 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
     ir->call_outgoing_base = loc;
   }
 
-  // generate prolog
   int stack_size = (-loc + 7) & ~7; // align to 8 bytes
-  tcc_gen_machine_prolog(ir->leaffunc, ir->ls.dirty_registers, stack_size);
+
+  /* ============================================================================
+   * DRY RUN PASS: Analyze scratch register needs before emitting prologue
+   * ============================================================================
+   * This discovers what scratch registers will be needed during code generation,
+   * allowing us to include them in the prologue (avoiding push/pop in loops).
+   */
+  int original_leaffunc = ir->leaffunc;
+  uint32_t extra_prologue_regs = 0;
+
+#if 1  /* DRY_RUN_ENABLED */
+  /* Initialize dry-run state and branch optimization */
+  tcc_gen_machine_dry_run_init();
+  tcc_gen_machine_branch_opt_init();
+  tcc_gen_machine_dry_run_start();
+  
+  /* Reset scratch state for clean dry-run */
+  tcc_gen_machine_reset_scratch_state();
+  tcc_ir_spill_cache_clear(&ir->spill_cache);
+
+  /* Save state that will be modified during dry run */
+  int saved_ind = ind;
+  int saved_codegen_idx = ir->codegen_instruction_idx;
+  int saved_loc = loc;
+  int saved_call_outgoing_base = ir->call_outgoing_base;
+
+  /* Run through all instructions without emitting.
+   * We call the actual codegen functions, but ot() is a no-op during dry-run.
+   * This ensures we exercise the exact same code paths for scratch allocation. */
+  for (int i = 0; i < ir->next_instruction_index; i++)
+  {
+    ir->codegen_instruction_idx = i;
+    cq = &ir->compact_instructions[i];
+
+    /* Skip marker ops */
+    if (cq->op == TCCIR_OP_ASM_INPUT || cq->op == TCCIR_OP_ASM_OUTPUT ||
+        cq->op == TCCIR_OP_NOP || cq->op == TCCIR_OP_INLINE_ASM)
+      continue;
+
+    /* Determine materialization needs (same logic as real pass) */
+    bool need_src1_value = false;
+    bool need_src2_value = false;
+    bool need_dest_value = false;
+    bool need_src1_addr = false;
+    bool need_src2_addr = false;
+    bool need_dest_addr = false;
+    bool need_src1_in_reg = false;
+    bool need_src2_in_reg = false;
+
+    switch (cq->op)
+    {
+    case TCCIR_OP_LOAD:
+      need_src1_addr = true;
+      need_dest_value = true;
+      break;
+    case TCCIR_OP_STORE:
+      need_src1_value = true;
+      need_dest_addr = true;
+      break;
+    case TCCIR_OP_LOAD_INDEXED:
+      need_src1_value = true;
+      need_src2_value = true;
+      need_dest_value = true;
+      break;
+    case TCCIR_OP_STORE_INDEXED:
+      need_src1_value = true;
+      need_dest_addr = true;
+      need_src2_value = true;
+      break;
+    case TCCIR_OP_LOAD_POSTINC:
+      need_src1_value = true;
+      need_dest_value = true;
+      break;
+    case TCCIR_OP_STORE_POSTINC:
+      need_src1_value = true;
+      need_dest_value = true;
+      break;
+    case TCCIR_OP_ASSIGN:
+      need_src1_value = true;
+      need_dest_value = true;
+      break;
+    case TCCIR_OP_MUL:
+    case TCCIR_OP_DIV:
+    case TCCIR_OP_UDIV:
+    case TCCIR_OP_IMOD:
+    case TCCIR_OP_UMOD:
+    case TCCIR_OP_UMULL:
+      need_src1_value = true;
+      need_src2_value = true;
+      need_dest_value = true;
+      need_src1_in_reg = true;
+      need_src2_in_reg = true;
+      break;
+    case TCCIR_OP_ADD:
+    case TCCIR_OP_SUB:
+    case TCCIR_OP_SHL:
+    case TCCIR_OP_SHR:
+    case TCCIR_OP_SAR:
+    case TCCIR_OP_AND:
+    case TCCIR_OP_OR:
+    case TCCIR_OP_XOR:
+    case TCCIR_OP_CMP:
+    case TCCIR_OP_MLA:
+    case TCCIR_OP_ADC_GEN:
+    case TCCIR_OP_ADC_USE:
+    case TCCIR_OP_TEST_ZERO:
+      need_src1_value = true;
+      need_src2_value = true;
+      need_dest_value = true;
+      break;
+    case TCCIR_OP_RETURNVALUE:
+      need_src1_value = true;
+      break;
+    case TCCIR_OP_LEA:
+      need_src1_addr = true;
+      need_dest_value = true;
+      break;
+    case TCCIR_OP_SETIF:
+      need_dest_value = true;
+      break;
+    case TCCIR_OP_FUNCCALLVAL:
+      need_dest_value = true;
+      /* fall through */
+    case TCCIR_OP_FUNCCALLVOID:
+      need_src1_value = true;
+      break;
+    case TCCIR_OP_FUNCPARAMVAL:
+    case TCCIR_OP_FUNCPARAMVOID:
+      need_src1_value = true;
+      break;
+    case TCCIR_OP_VLA_ALLOC:
+    case TCCIR_OP_VLA_SP_SAVE:
+    case TCCIR_OP_VLA_SP_RESTORE:
+      need_src1_value = true;
+      break;
+    case TCCIR_OP_IJUMP:
+      need_src1_value = true;
+      break;
+    case TCCIR_OP_BOOL_OR:
+    case TCCIR_OP_BOOL_AND:
+      need_src1_value = true;
+      need_src2_value = true;
+      need_dest_value = true;
+      break;
+    case TCCIR_OP_FADD:
+    case TCCIR_OP_FSUB:
+    case TCCIR_OP_FMUL:
+    case TCCIR_OP_FDIV:
+    case TCCIR_OP_FNEG:
+    case TCCIR_OP_FCMP:
+    case TCCIR_OP_CVT_FTOF:
+    case TCCIR_OP_CVT_ITOF:
+    case TCCIR_OP_CVT_FTOI:
+      need_src1_value = true;
+      need_src2_value = true;
+      need_dest_value = true;
+      break;
+    case TCCIR_OP_SWITCH_TABLE:
+      need_src1_value = true;  /* Index vreg needs materialization */
+      /* src2 contains table_id which is an immediate, not a vreg */
+      break;
+    default:
+      break;
+    }
+
+    /* Get operand copies from iroperand_pool */
+    IROperand src1_ir = tcc_ir_op_get_src1(ir, cq);
+    IROperand src2_ir = tcc_ir_op_get_src2(ir, cq);
+    IROperand dest_ir = tcc_ir_op_get_dest(ir, cq);
+
+    /* Apply register allocation to operands */
+    if (irop_get_tag(src1_ir) != IROP_TAG_NONE)
+      tcc_ir_fill_registers_ir(ir, &src1_ir);
+    if (irop_get_tag(src2_ir) != IROP_TAG_NONE)
+      tcc_ir_fill_registers_ir(ir, &src2_ir);
+    if (irop_get_tag(dest_ir) != IROP_TAG_NONE)
+      tcc_ir_fill_registers_ir(ir, &dest_ir);
+
+    /* Materialize operands - this is where scratch registers get allocated */
+    TCCMaterializedValue mat_src1 = {0};
+    TCCMaterializedValue mat_src2 = {0};
+    TCCMaterializedAddr mat_src1_addr = {0};
+    TCCMaterializedAddr mat_src2_addr = {0};
+    TCCMaterializedAddr mat_dest_addr = {0};
+    TCCMaterializedDest mat_dest = {0};
+
+    if (need_src1_value)
+      tcc_ir_materialize_value_ir(ir, &src1_ir, &mat_src1);
+    else if (need_src1_addr)
+      tcc_ir_materialize_addr_ir(ir, &src1_ir, &mat_src1_addr, dest_ir.pr0_reg);
+
+    if (need_src2_value)
+      tcc_ir_materialize_value_ir(ir, &src2_ir, &mat_src2);
+    else if (need_src2_addr)
+      tcc_ir_materialize_addr_ir(ir, &src2_ir, &mat_src2_addr, dest_ir.pr0_reg);
+
+    if (need_dest_value)
+      tcc_ir_materialize_dest_ir(ir, &dest_ir, &mat_dest);
+    else if (need_dest_addr)
+      tcc_ir_materialize_addr_ir(ir, &dest_ir, &mat_dest_addr, PREG_NONE);
+
+    /* For operations that require register-only operands, materialize constants to registers */
+    TCCMaterializedValue mat_src1_reg = {0};
+    TCCMaterializedValue mat_src2_reg = {0};
+    if (need_src1_in_reg && !mat_src1.used_scratch)
+      tcc_ir_materialize_const_to_reg_ir(ir, &src1_ir, &mat_src1_reg);
+    if (need_src2_in_reg && !mat_src2.used_scratch)
+      tcc_ir_materialize_const_to_reg_ir(ir, &src2_ir, &mat_src2_reg);
+
+    /* Call the actual codegen function - ot() will be a no-op in dry-run mode,
+     * but scratch allocation inside these functions will still be recorded */
+    switch (cq->op)
+    {
+    case TCCIR_OP_LOAD:
+      tcc_gen_machine_load_op(dest_ir, src1_ir);
+      break;
+    case TCCIR_OP_STORE:
+      tcc_gen_machine_store_op(dest_ir, src1_ir, cq->op);
+      break;
+    case TCCIR_OP_LOAD_INDEXED:
+    {
+      IROperand base_op = src1_ir;
+      IROperand index_op = src2_ir;
+      IROperand scale_op = tcc_ir_op_get_scale(ir, cq);
+      tcc_gen_machine_load_indexed_op(dest_ir, base_op, index_op, scale_op);
+      break;
+    }
+    case TCCIR_OP_STORE_INDEXED:
+    {
+      IROperand base_op = dest_ir;
+      IROperand index_op = src2_ir;
+      IROperand scale_op = tcc_ir_op_get_scale(ir, cq);
+      tcc_gen_machine_store_indexed_op(base_op, index_op, scale_op, src1_ir);
+      break;
+    }
+    case TCCIR_OP_LOAD_POSTINC:
+    {
+      IROperand ptr_op = src1_ir;
+      IROperand offset_op = tcc_ir_op_get_scale(ir, cq);
+      tcc_gen_machine_load_postinc_op(dest_ir, ptr_op, offset_op);
+      break;
+    }
+    case TCCIR_OP_STORE_POSTINC:
+    {
+      IROperand ptr_op = dest_ir;
+      IROperand value_op = src1_ir;
+      IROperand offset_op = tcc_ir_op_get_scale(ir, cq);
+      tcc_gen_machine_store_postinc_op(ptr_op, value_op, offset_op);
+      break;
+    }
+    case TCCIR_OP_LEA:
+      tcc_gen_machine_lea_op(dest_ir, src1_ir, cq->op);
+      break;
+    case TCCIR_OP_ASSIGN:
+      tcc_gen_machine_assign_op(dest_ir, src1_ir, cq->op);
+      break;
+    case TCCIR_OP_RETURNVALUE:
+      tcc_gen_machine_return_value_op(src1_ir, cq->op);
+      break;
+    case TCCIR_OP_RETURNVOID:
+      /* No scratch allocation needed */
+      break;
+    case TCCIR_OP_JUMP:
+      /* Record branch for optimization analysis (ot() is no-op during dry-run) */
+      tcc_gen_machine_jump_op(cq->op, dest_ir, i);
+      break;
+    case TCCIR_OP_JUMPIF:
+      /* Record branch for optimization analysis (ot() is no-op during dry-run) */
+      tcc_gen_machine_conditional_jump_op(src1_ir, cq->op, dest_ir, i);
+      break;
+    case TCCIR_OP_MUL:
+    case TCCIR_OP_MLA:
+    case TCCIR_OP_ADD:
+    case TCCIR_OP_SUB:
+    case TCCIR_OP_CMP:
+    case TCCIR_OP_TEST_ZERO:
+    case TCCIR_OP_SHL:
+    case TCCIR_OP_SHR:
+    case TCCIR_OP_OR:
+    case TCCIR_OP_AND:
+    case TCCIR_OP_XOR:
+    case TCCIR_OP_DIV:
+    case TCCIR_OP_UDIV:
+    case TCCIR_OP_IMOD:
+    case TCCIR_OP_UMOD:
+    case TCCIR_OP_SAR:
+    case TCCIR_OP_UMULL:
+    case TCCIR_OP_ADC_GEN:
+    case TCCIR_OP_ADC_USE:
+      tcc_gen_machine_data_processing_op(src1_ir, src2_ir, dest_ir, cq->op);
+      break;
+    case TCCIR_OP_IJUMP:
+      tcc_gen_machine_indirect_jump_op(src1_ir);
+      break;
+    case TCCIR_OP_SWITCH_TABLE:
+      /* Dry-run: approximate TBB/TBH instruction size (4 bytes) + table size */
+      /* Actual table size depends on range, but for dry-run we just need consistency */
+      ind += 4;  /* TBB/TBH instruction */
+      ind += 4;  /* Approximate table size (will be refined in real pass) */
+      break;
+    case TCCIR_OP_SETIF:
+      tcc_gen_machine_setif_op(dest_ir, src1_ir, cq->op);
+      break;
+    case TCCIR_OP_BOOL_OR:
+    case TCCIR_OP_BOOL_AND:
+      tcc_gen_machine_bool_op(dest_ir, src1_ir, src2_ir, cq->op);
+      break;
+    case TCCIR_OP_FUNCCALLVOID:
+    case TCCIR_OP_FUNCCALLVAL:
+      tcc_gen_machine_func_call_op(src1_ir, src2_ir, dest_ir, 0, ir, i);
+      break;
+    case TCCIR_OP_FUNCPARAMVAL:
+    case TCCIR_OP_FUNCPARAMVOID:
+      tcc_gen_machine_func_parameter_op(src1_ir, src2_ir, cq->op);
+      break;
+    case TCCIR_OP_FADD:
+    case TCCIR_OP_FSUB:
+    case TCCIR_OP_FMUL:
+    case TCCIR_OP_FDIV:
+    case TCCIR_OP_FNEG:
+    case TCCIR_OP_FCMP:
+    case TCCIR_OP_CVT_FTOF:
+    case TCCIR_OP_CVT_ITOF:
+    case TCCIR_OP_CVT_FTOI:
+      tcc_gen_machine_fp_op(dest_ir, src1_ir, src2_ir, cq->op);
+      break;
+    case TCCIR_OP_VLA_ALLOC:
+    case TCCIR_OP_VLA_SP_SAVE:
+    case TCCIR_OP_VLA_SP_RESTORE:
+      tcc_gen_machine_vla_op(dest_ir, src1_ir, src2_ir, cq->op);
+      break;
+    default:
+      /* Unknown op - skip */
+      break;
+    }
+
+    /* Release any scratch registers allocated during materialization */
+    if (mat_src1.used_scratch)
+      tcc_machine_release_scratch(&mat_src1.scratch);
+    if (mat_src2.used_scratch)
+      tcc_machine_release_scratch(&mat_src2.scratch);
+    if (mat_src1_addr.used_scratch)
+      tcc_machine_release_scratch(&mat_src1_addr.scratch);
+    if (mat_src2_addr.used_scratch)
+      tcc_machine_release_scratch(&mat_src2_addr.scratch);
+    if (mat_dest_addr.used_scratch)
+      tcc_machine_release_scratch(&mat_dest_addr.scratch);
+    if (mat_src1_reg.used_scratch)
+      tcc_machine_release_scratch(&mat_src1_reg.scratch);
+    if (mat_src2_reg.used_scratch)
+      tcc_machine_release_scratch(&mat_src2_reg.scratch);
+
+    /* Clean up scratch register state */
+    tcc_gen_machine_end_instruction();
+  }
+
+  /* End dry-run and analyze results */
+  tcc_gen_machine_dry_run_end();
+
+  /* Analyze branch offsets and select optimal encodings */
+  tcc_gen_machine_branch_opt_analyze(ir_to_code_mapping, ir->next_instruction_index);
+
+  /* Check if LR was pushed during dry run in a leaf function */
+  if (original_leaffunc && tcc_gen_machine_dry_run_get_lr_push_count() > 0)
+  {
+    /* LR was pushed in loop - save at prologue instead */
+    extra_prologue_regs |= (1 << 14); /* R_LR */
+    /* NOTE: We don't modify ir->leaffunc here because optimizations may depend on it.
+     * The extra_prologue_regs will ensure LR is pushed in the prologue, making it 
+     * available as scratch without push/pop in loops, which is the main goal. */
+  }
+
+  /* Restore state for real code generation */
+  ind = saved_ind;
+  loc = saved_loc;
+  ir->call_outgoing_base = saved_call_outgoing_base;
+  ir->codegen_instruction_idx = saved_codegen_idx;
+  
+  /* Reset scratch state for real pass */
+  tcc_gen_machine_reset_scratch_state();
+  
+  /* Clear caches for fresh start - dry-run may have recorded entries
+   * but the actual instructions were never emitted */
+  tcc_ir_spill_cache_clear(&ir->spill_cache);
+  tcc_ir_opt_fp_cache_clear(ir);
+#endif  /* DRY_RUN_DISABLED */
+
+  /* ============================================================================
+   * REAL CODE GENERATION PASS
+   * ============================================================================
+   */
+
+  // generate prolog (with extra registers if needed)
+  (void)original_leaffunc;  /* May be unused when dry-run is disabled */
+  tcc_gen_machine_prolog(ir->leaffunc, ir->ls.dirty_registers, stack_size, extra_prologue_regs);
 
   for (int i = 0; i < ir->next_instruction_index; i++)
   {
@@ -1144,6 +1537,32 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
     IROperand src1_ir = tcc_ir_op_get_src1(ir, cq);
     IROperand src2_ir = tcc_ir_op_get_src2(ir, cq);
     IROperand dest_ir = tcc_ir_op_get_dest(ir, cq);
+
+    /* Peephole for LOAD/ASSIGN/LOAD_INDEXED followed by RETURNVALUE:
+     * Update the live interval to use R0 BEFORE register allocation.
+     * This ensures the load result goes directly to the return register.
+     */
+    if (cq->op == TCCIR_OP_LOAD || cq->op == TCCIR_OP_ASSIGN || cq->op == TCCIR_OP_LOAD_INDEXED)
+    {
+      const IRQuadCompact *ir_next = (i + 1 < ir->next_instruction_index) ? &ir->compact_instructions[i + 1] : NULL;
+      if (ir_next && ir_next->op == TCCIR_OP_RETURNVALUE && !has_incoming_jump[i + 1])
+      {
+        IROperand next_src1 = tcc_ir_op_get_src1(ir, ir_next);
+        int next_vr = irop_get_vreg(next_src1);
+        int dest_vr = irop_get_vreg(dest_ir);
+        if (next_vr == dest_vr && next_vr >= 0)
+        {
+          IRLiveInterval *li = tcc_ir_get_live_interval(ir, dest_vr);
+          if (li && li->allocation.r0 != REG_IRET)
+          {
+            li->allocation.r0 = REG_IRET;
+            li->allocation.offset = 0;
+            if (li->is_llong || li->is_double)
+              li->allocation.r1 = REG_IRE2;
+          }
+        }
+      }
+    }
 
     /* Apply register allocation to operands */
     if (irop_get_tag(src1_ir) != IROP_TAG_NONE)
@@ -1379,6 +1798,77 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
     case TCCIR_OP_STORE:
       tcc_gen_machine_store_op(dest_ir, src1_ir, cq->op);
       break;
+    case TCCIR_OP_LOAD_INDEXED:
+    {
+      /* LOAD_INDEXED: dest = *(base + (index << scale))
+       * IR operands: dest, base, index, scale
+       * Use src1_ir and src2_ir which already have register allocation applied
+       */
+      IROperand base_op = src1_ir;  /* base was src1 */
+      IROperand index_op = src2_ir; /* index was src2 */
+      IROperand scale_op = tcc_ir_op_get_scale(ir, cq);
+
+      /* Peephole: if next instruction is RETURNVALUE using this LOAD_INDEXED's result,
+       * load directly to R0 instead of the allocated register */
+      const IRQuadCompact *ir_next = (i + 1 < ir->next_instruction_index) ? &ir->compact_instructions[i + 1] : NULL;
+      int ir_next_src1_vr = -1;
+      if (ir_next && ir_next->op == TCCIR_OP_RETURNVALUE)
+      {
+        IROperand next_src1_irop = tcc_ir_op_get_src1(ir, ir_next);
+        ir_next_src1_vr = irop_get_vreg(next_src1_irop);
+      }
+      const int dest_vreg = irop_get_vreg(dest_ir);
+      if (ir_next && ir_next->op == TCCIR_OP_RETURNVALUE && ir_next_src1_vr == dest_vreg && !has_incoming_jump[i + 1])
+      {
+        dest_ir.pr0_reg = REG_IRET; /* R0 */
+        dest_ir.pr0_spilled = 0;
+        /* Also update the interval allocation so that RETURNVALUE's src1 gets the same registers */
+        IRLiveInterval *interval = tcc_ir_get_live_interval(ir, dest_vreg);
+        if (interval)
+        {
+          interval->allocation.r0 = REG_IRET;
+        }
+      }
+
+      tcc_gen_machine_load_indexed_op(dest_ir, base_op, index_op, scale_op);
+      break;
+    }
+    case TCCIR_OP_STORE_INDEXED:
+    {
+      /* STORE_INDEXED: *(base + (index << scale)) = value
+       * IR operands: base, value, index, scale
+       * Use dest_ir, src1_ir, src2_ir which already have register allocation applied
+       */
+      IROperand base_op = dest_ir;  /* base is in "dest" position */
+      IROperand value_op = src1_ir; /* value is in "src1" position */
+      IROperand index_op = src2_ir; /* index is in "src2" position */
+      IROperand scale_op = tcc_ir_op_get_scale(ir, cq);
+      tcc_gen_machine_store_indexed_op(base_op, index_op, scale_op, value_op);
+      break;
+    }
+    case TCCIR_OP_LOAD_POSTINC:
+    {
+      /* LOAD_POSTINC: dest = *ptr; ptr += offset
+       * IR operands: dest, ptr, offset
+       * Use dest_ir, src1_ir (ptr), and scale field for offset
+       */
+      IROperand ptr_op = src1_ir;  /* pointer register */
+      IROperand offset_op = tcc_ir_op_get_scale(ir, cq); /* offset is in scale position */
+      tcc_gen_machine_load_postinc_op(dest_ir, ptr_op, offset_op);
+      break;
+    }
+    case TCCIR_OP_STORE_POSTINC:
+    {
+      /* STORE_POSTINC: *ptr = src; ptr += offset
+       * IR operands: ptr, src, offset
+       * Use dest_ir (ptr), src1_ir (value), and scale field for offset
+       */
+      IROperand ptr_op = dest_ir;   /* pointer register */
+      IROperand value_op = src1_ir; /* value to store */
+      IROperand offset_op = tcc_ir_op_get_scale(ir, cq); /* offset is in scale position */
+      tcc_gen_machine_store_postinc_op(ptr_op, value_op, offset_op);
+      break;
+    }
     case TCCIR_OP_RETURNVALUE:
     {
       /* Peephole: if previous instruction was LOAD/ASSIGN that already loaded to R0,
@@ -1411,7 +1901,8 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
       if (i != ir->next_instruction_index - 1)
       {
         return_jump_addrs[num_return_jumps++] = ind;
-        tcc_gen_machine_jump_op(cq->op);
+        /* Return jumps target the epilogue (-1 indicates no IR target) */
+        tcc_gen_machine_jump_op(cq->op, dest_ir, i);
       }
       break;
     case TCCIR_OP_ASSIGN:
@@ -1459,16 +1950,16 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
       break;
     }
     case TCCIR_OP_JUMP:
-      tcc_gen_machine_jump_op(cq->op);
+      tcc_gen_machine_jump_op(cq->op, dest_ir, i);
       /* Update mapping to actual instruction address (may have shifted due to literal pool) */
-      ir_to_code_mapping[i] = ind - 4;
+      ir_to_code_mapping[i] = ind - (tcc_gen_machine_branch_opt_get_encoding(i) == 16 ? 2 : 4);
       /* Clear spill cache at branch - value may come from different path */
       tcc_ir_spill_cache_clear(&ir->spill_cache);
       break;
     case TCCIR_OP_JUMPIF:
-      tcc_gen_machine_conditional_jump_op(src1_ir, cq->op);
+      tcc_gen_machine_conditional_jump_op(src1_ir, cq->op, dest_ir, i);
       /* Update mapping to actual instruction address (may have shifted due to literal pool) */
-      ir_to_code_mapping[i] = ind - 4;
+      ir_to_code_mapping[i] = ind - (tcc_gen_machine_branch_opt_get_encoding(i) == 16 ? 2 : 4);
       /* Clear spill cache at conditional branch - target may have different values */
       tcc_ir_spill_cache_clear(&ir->spill_cache);
       break;
@@ -1476,6 +1967,14 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
       tcc_gen_machine_indirect_jump_op(src1_ir);
       tcc_ir_spill_cache_clear(&ir->spill_cache);
       break;
+    case TCCIR_OP_SWITCH_TABLE:
+    {
+      int table_id = (int)irop_get_imm64_ex(ir, src2_ir);
+      TCCIRSwitchTable *table = &ir->switch_tables[table_id];
+      tcc_gen_machine_switch_table_op(src1_ir, table, ir, i);
+      tcc_ir_spill_cache_clear(&ir->spill_cache);
+      break;
+    }
     case TCCIR_OP_SETIF:
       tcc_gen_machine_setif_op(dest_ir, src1_ir, cq->op);
       break;

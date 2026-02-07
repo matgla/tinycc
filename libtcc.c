@@ -824,7 +824,8 @@ LIBTCCAPI void tcc_delete(TCCState *s1)
   tcc_free(s1->outfile);
   tcc_free(s1->deps_outfile);
   tcc_free(s1->linker_script);
-  if (s1->ld_script) {
+  if (s1->ld_script)
+  {
     ld_script_cleanup(s1->ld_script);
     tcc_free(s1->ld_script);
   }
@@ -848,14 +849,18 @@ LIBTCCAPI int tcc_set_output_type(TCCState *s, int output_type)
 {
 #if defined(CONFIG_TCC_PIE)
   /* PIE not supported on bare-metal ARM Thumb targets (no dynamic linker) */
-  if (output_type == TCC_OUTPUT_EXE) {
+  if (output_type == TCC_OUTPUT_EXE)
+  {
 #if defined(TCC_TARGET_ARM_THUMB)
     /* Disable PIE for bare-metal ARM Thumb targets */
     /* (no dynamic linker available) */
 #elif defined(s)
-    if (s->no_pie) {
+    if (s->no_pie)
+    {
       /* Explicitly disabled via -no-pie */
-    } else {
+    }
+    else
+    {
       output_type |= TCC_OUTPUT_DYN;
     }
 #else
@@ -960,7 +965,7 @@ ST_FUNC int tcc_add_file_internal(TCCState *s1, const char *filename, int flags)
   }
 
   s1->current_filename = filename;
-  s1->current_archive_offset = 0;  /* Reset archive offset for regular files */
+  s1->current_archive_offset = 0; /* Reset archive offset for regular files */
   if (flags & AFF_TYPE_BIN)
   {
     ElfW(Ehdr) ehdr;
@@ -1604,6 +1609,7 @@ static const FlagDef options_f[] = {{offsetof(TCCState, char_is_unsigned), 0, "u
                                     {offsetof(TCCState, opt_store_load_fwd), 0, "store-load-fwd"},
                                     {offsetof(TCCState, opt_redundant_store), 0, "redundant-store-elim"},
                                     {offsetof(TCCState, opt_dead_store), 0, "dead-store-elim"},
+                                    {offsetof(TCCState, opt_iv_strength_red), 0, "iv-strength-red"},
                                     {0, 0, NULL}};
 
 static const FlagDef options_m[] = {{offsetof(TCCState, ms_bitfields), 0, "ms-bitfields"}, {0, 0, NULL}};
@@ -2084,6 +2090,15 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
         s->opt_store_load_fwd = 1;
         s->opt_redundant_store = 1;
         s->opt_dead_store = 1;
+        s->opt_indexed_memory = 1;  /* Fuse SHL+ADD+LOAD/STORE into indexed ops */
+        s->opt_postinc_fusion = 1;  /* Fuse LOAD/STORE + ADD into post-increment ops */
+        s->opt_mla_fusion = 1;      /* Fuse MUL+ADD into MLA */
+        s->opt_fp_offset_cache = 1; /* Cache frame pointer offset calculations */
+        s->opt_stack_addr_cse = 1;  /* Hoist repeated stack address computations */
+        s->opt_licm = 1;            /* Loop-invariant code motion */
+        s->opt_strength_red = 1;    /* Strength reduction for multiply */
+        s->opt_iv_strength_red = 1; /* IV strength reduction for array loops */
+        s->opt_jump_threading = 1;  /* Jump threading optimization */
       }
       break;
     case TCC_OPTION_T:

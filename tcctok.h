@@ -163,6 +163,9 @@ DEF(TOK_NODECORATE, "nodecorate")
 DEF(TOK_NORETURN1, "noreturn")
 DEF(TOK_NORETURN2, "__noreturn__")
 DEF(TOK_NORETURN3, "_Noreturn")
+DEF(TOK_PURE1, "pure")
+DEF(TOK_PURE2, "__pure__")
+/* Note: TOK_CONST1/2/3 already defined for const keyword */
 DEF(TOK_VISIBILITY1, "visibility")
 DEF(TOK_VISIBILITY2, "__visibility__")
 

@@ -122,9 +122,11 @@ int tcc_opt_fp_mat_cache_lookup(TCCIRState *ir, int offset, int *phys_reg)
       *phys_reg = cache->entries[i].phys_reg;
       cache->entries[i].last_use = cache->access_count;
       opt_stats.fp_cache_hits++;
+
       return 1;
     }
   }
+
   return 0;
 }
 
@@ -137,6 +139,7 @@ void tcc_opt_fp_mat_cache_record(TCCIRState *ir, int offset, int phys_reg)
     return;
     
   TCCFPMatCache *cache = (TCCFPMatCache*)ir->opt_fp_mat_cache;
+
   cache->access_count++;
   
   /* Check if already exists - update it */

@@ -21,8 +21,9 @@
 #define USING_GLOBALS
 #include "tcc.h"
 
-#include "ir/core.h"
 #include "ir/codegen.h"
+#include "ir/core.h"
+#include "ir/licm.h"
 #include "ir/opt.h"
 #include "tccir.h"
 
@@ -1382,6 +1383,10 @@ static void merge_funcattr(struct FuncAttr *fa, struct FuncAttr *fa1)
     fa->func_ctor = 1;
   if (fa1->func_dtor)
     fa->func_dtor = 1;
+  if (fa1->func_pure)
+    fa->func_pure = 1;
+  if (fa1->func_const)
+    fa->func_const = 1;
 }
 
 /* Merge attributes.  */
@@ -1483,6 +1488,10 @@ static void patch_storage(Sym *sym, AttributeDef *ad, CType *type)
     tcc_error("incompatible dll linkage for redefinition of '%s'", get_tok_str(sym->v, NULL));
 #endif
   merge_symattr(&sym->a, &ad->a);
+  /* Note: func_pure/func_const attributes are handled in external_sym
+   * and in the function type symbol (type.ref->f), not in sym->f.
+   * We don't merge ad->f into sym->f here to avoid corrupting function
+   * type information (func_type, func_args). */
   if (ad->asm_label)
     sym->asm_label = ad->asm_label;
   update_storage(sym);
@@ -1534,6 +1543,12 @@ static Sym *external_sym(int v, CType *type, int r, AttributeDef *ad)
     s = global_identifier_push(v, type->t, 0);
     s->r |= r;
     s->a = ad->a;
+    /* Merge function attributes (pure, const, etc.) without overwriting
+     * func_type and func_args which are set from type.ref->f */
+    if (ad->f.func_pure)
+      s->f.func_pure = 1;
+    if (ad->f.func_const)
+      s->f.func_const = 1;
     s->asm_label = ad->asm_label;
     s->type.ref = type->ref;
     /* copy type to the global stack */
@@ -4930,6 +4945,14 @@ redo:
     case TOK_NORETURN1:
     case TOK_NORETURN2:
       ad->f.func_noreturn = 1;
+      break;
+    case TOK_PURE1:
+    case TOK_PURE2:
+      ad->f.func_pure = 1;
+      break;
+    case TOK_CONST2:
+    case TOK_CONST3:
+      ad->f.func_const = 1;
       break;
     case TOK_CDECL1:
     case TOK_CDECL2:
@@ -8383,6 +8406,159 @@ static void case_sort(struct switch_t *sw)
   }
 }
 
+/* ============================================================================
+ * Jump Table Switch Optimization
+ * ============================================================================
+ * For dense switch statements, use a jump table with TBB/TBH instructions
+ * instead of linear/binary search for O(1) dispatch.
+ */
+
+/* Check if switch is suitable for jump table optimization.
+ * Criteria:
+ *   - Optimization enabled (-O1 or higher)
+ *   - At least 4 cases
+ *   - At least 50% density (num_cases / range >= 0.5)
+ *   - Range fits in TBH (<= 65535) for TBB/TBH
+ *   - No case ranges (v1 == v2 for all cases)
+ *   - Not long long type (to simplify initial implementation)
+ */
+static int switch_can_use_jump_table(struct switch_t *sw)
+{
+  /* Only use jump tables when optimization is enabled */
+  if (!tcc_state->optimize)
+    return 0;
+
+  if (sw->n < 4)
+    return 0; /* Too few cases to justify overhead */
+
+  int64_t min_val = sw->p[0]->v1;
+  int64_t max_val = sw->p[sw->n - 1]->v2;
+  int64_t range = max_val - min_val + 1;
+
+  /* Check density: must be at least 50% filled */
+  if (sw->n * 2 < range)
+    return 0;
+
+  /* Check range fits in TBH (halfword indexing, max 65536 entries) */
+  if (range > 65536)
+    return 0;
+
+  /* Check for case ranges (v1 != v2) - not supported initially */
+  for (int i = 0; i < sw->n; i++)
+  {
+    if (sw->p[i]->v1 != sw->p[i]->v2)
+      return 0;
+  }
+
+  /* Check integer type (not long long for simplicity) */
+  if ((sw->sv.type.t & VT_BTYPE) == VT_LLONG)
+    return 0;
+
+  return 1;
+}
+
+/* Allocate and populate a switch table for jump table generation.
+ * Returns the table_id to be used with TCCIR_OP_SWITCH_TABLE.
+ */
+static int tcc_ir_add_switch_table(TCCIRState *ir, int64_t min_val, int64_t max_val, int default_target,
+                                   struct switch_t *sw)
+{
+  /* Grow array if needed */
+  if (ir->num_switch_tables >= ir->switch_tables_capacity)
+  {
+    ir->switch_tables_capacity = ir->switch_tables_capacity * 2 + 4;
+    ir->switch_tables = tcc_realloc(ir->switch_tables, ir->switch_tables_capacity * sizeof(*ir->switch_tables));
+  }
+
+  int id = ir->num_switch_tables++;
+  TCCIRSwitchTable *table = &ir->switch_tables[id];
+
+  table->min_val = min_val;
+  table->max_val = max_val;
+  table->default_target = default_target;
+  table->num_entries = (int)(max_val - min_val + 1);
+  table->targets = tcc_mallocz(table->num_entries * sizeof(int));
+
+  /* Fill with default target initially */
+  for (int i = 0; i < table->num_entries; i++)
+  {
+    table->targets[i] = default_target;
+  }
+
+  /* Fill in actual case targets */
+  for (int i = 0; i < sw->n; i++)
+  {
+    int idx = (int)(sw->p[i]->v1 - min_val);
+    if (idx >= 0 && idx < table->num_entries)
+      table->targets[idx] = sw->p[i]->ind;
+  }
+
+  return id;
+}
+
+/* Generate jump table for switch statement.
+ * Emits:
+ *   1. Bounds check: if (index - min > max-min) goto default
+ *   2. SWITCH_TABLE instruction with table reference
+ *
+ * Note: Like gcase(), this function does NOT pop the switch value from vtop.
+ * The caller is responsible for vpop() after gcase_jump_table returns.
+ */
+static int gcase_jump_table(struct switch_t *sw, int dsym)
+{
+  int64_t min_val = sw->p[0]->v1;
+  int64_t max_val = sw->p[sw->n - 1]->v2;
+  int range = (int)(max_val - min_val);
+  TCCIRState *ir = tcc_state->ir;
+
+  /* We need to preserve the original switch value on vtop for the caller.
+   * So we work on a duplicated copy. */
+
+  /* Duplicate the switch value for our manipulation */
+  vdup();
+
+  /* Adjust index: index = index - min_val (if min_val != 0) */
+  if (min_val != 0)
+  {
+    vpush64(VT_INT, min_val);
+    gen_op('-');
+  }
+
+  /* Duplicate adjusted index for bounds check */
+  vdup();
+
+  /* Compare: if (index > range) goto default
+   * Use unsigned comparison since we just subtracted min */
+  vpush64(VT_INT, range);
+  gen_op(TOK_UGT); /* Unsigned greater than */
+
+  /* Jump to default if out of bounds */
+  int bounds_fail = tcc_ir_codegen_test_gen(ir, 0, dsym);
+
+  /* Allocate switch table */
+  int table_id = tcc_ir_add_switch_table(ir, min_val, max_val, dsym, sw);
+
+  /* Emit SWITCH_TABLE instruction.
+   * vtop currently holds the adjusted index (0 to range).
+   * We'll use src2 to store the table_id. */
+  SValue table_ref;
+  svalue_init(&table_ref);
+  table_ref.r = VT_CONST;
+  table_ref.c.i = table_id;
+  table_ref.type.t = VT_INT;
+
+  /* src1 = adjusted index (current vtop)
+   * src2 = table_id (encoded in an SValue)
+   * The backend will handle the actual table emission */
+  tcc_ir_put(ir, TCCIR_OP_SWITCH_TABLE, vtop, &table_ref, NULL);
+
+  /* Pop our working copy of the adjusted index.
+   * The original switch value remains on the stack below. */
+  vpop();
+
+  return bounds_fail; /* Return the jump for potential further use */
+}
+
 /* dsym is a jump-chain head (index of a JMP instruction) that will ultimately
  * be patched to the default label or fall-through. Never pass raw -1 here. */
 static int gcase(struct case_t **base, int len, int dsym)
@@ -9013,8 +9189,16 @@ again:
     tcc_ir_put(tcc_state->ir, TCCIR_OP_ASSIGN, vtop, NULL, &dest);
     vtop->vr = dest.vr;
     vtop->r = 0;
-    /* Build case jump chain; start with empty default chain (-1). */
-    d = gcase(sw->p, sw->n, -1);
+    /* Build case jump chain; start with empty default chain (-1).
+     * Use jump table for dense switches, otherwise fall back to binary search. */
+    if (switch_can_use_jump_table(sw))
+    {
+      d = gcase_jump_table(sw, -1);
+    }
+    else
+    {
+      d = gcase(sw->p, sw->n, -1);
+    }
     vpop();
 
     tcc_ir_backpatch(tcc_state->ir, b, c);
@@ -10440,6 +10624,7 @@ static void gen_function(Sym *sym)
   ind = cur_text_section->data_offset;
   /* Reset per-function flags */
   tcc_state->force_frame_pointer = 0;
+  tcc_state->need_frame_pointer = 0;
 
   /* Save global label stack position so we only pop labels from this function */
   global_label_stack_start = global_label_stack;
@@ -10473,6 +10658,11 @@ static void gen_function(Sym *sym)
 #endif
   ir = tcc_ir_alloc();
   tcc_state->ir = ir;
+
+  /* Initialize FP offset cache for code generation optimization */
+  if (tcc_state->opt_fp_offset_cache)
+    tcc_ir_opt_fp_cache_init(ir);
+
   local_scope = 1; /* for function parameters */
   tcc_ir_params_add(ir, &sym->type);
   nb_temp_local_vars = 0;
@@ -10492,44 +10682,147 @@ static void gen_function(Sym *sym)
 #ifdef CONFIG_TCC_DEBUG
   if (tcc_state->dump_ir)
   {
+    tcc_ir_dump_set_show_physical_regs(0); /* Show only virtual registers */
     printf("=== IR BEFORE OPTIMIZATIONS ===\n");
     tcc_ir_show(ir);
     printf("=== END IR BEFORE OPTIMIZATIONS ===\n");
   }
 #endif
 
-  /* Dead code elimination - remove unreachable instructions */
-  if (tcc_state->opt_dce)
-    tcc_ir_opt_dce(ir);
+  /* Iterative optimization loop
+   * Runs optimization passes until no more changes are made,
+   * or until max iterations reached. This allows constant propagation
+   * to feed into branch folding, which then enables more DCE, etc.
+   */
+  int iteration = 0;
+  const int max_iterations = 10;
+  int changes = 0;
 
-  /* Phase 1: Constant Propagation with Algebraic Simplification */
-  if (tcc_state->opt_const_prop && tcc_ir_opt_const_prop(ir))
-    if (tcc_state->opt_dce)
-      tcc_ir_opt_dce(ir); /* Clean up simplified ops */
-
-  /* Phase 1b: TMP Constant Propagation - propagate constants from folded expressions */
-  if (tcc_state->opt_const_prop && tcc_ir_opt_const_prop_tmp(ir))
+  do
   {
-    if (tcc_ir_opt_const_prop(ir))
+    changes = 0;
+    iteration++;
+
+    /* Dead code elimination - remove unreachable instructions */
+    if (tcc_state->opt_dce)
+      changes += tcc_ir_opt_dce(ir);
+
+    /* Phase 1: Constant Propagation with Algebraic Simplification */
+    if (tcc_state->opt_const_prop)
+      changes += tcc_ir_opt_const_prop(ir);
+
+    /* Phase 1b: TMP Constant Propagation - propagate constants from folded expressions */
+    if (tcc_state->opt_const_prop)
+      changes += tcc_ir_opt_const_prop_tmp(ir);
+
+    /* Phase 1c: Constant Branch Folding - fold branches with constant conditions
+     * This is critical for optimizing conditionals where values are constants.
+     * Must run after constant propagation to maximize folding opportunities.
+     */
+    if (tcc_state->opt_const_prop)
+      changes += tcc_ir_opt_branch_folding(ir);
+
+    /* Phase 1d: Value Tracking through Arithmetic - track constants through ADD/SUB
+     * This enables folding comparisons like "CMP V0, #1000000" when V0 has a
+     * known constant value from previous arithmetic (e.g., V0 = 1234 - 42 = 1192).
+     */
+    if (tcc_state->opt_const_prop)
+      changes += tcc_ir_opt_value_tracking(ir);
+
+    /* Phase 2: Copy Propagation */
+    if (tcc_state->opt_copy_prop)
+      changes += tcc_ir_opt_copy_prop(ir);
+
+    /* Phase 3: Arithmetic Common Subexpression Elimination */
+    if (tcc_state->opt_cse)
+      changes += tcc_ir_opt_cse_arith(ir);
+
+  } while (changes > 0 && iteration < max_iterations);
+
+  /* Phase 3b: Global CSE - eliminate redundant computations across basic blocks
+   * This catches cases like address calculations in if/else branches where
+   * the same computation happens in both branches.
+   * NOTE: Currently disabled due to issues with complex control flow (gotos/labels)
+   */
+  (void)tcc_ir_opt_cse_global;
+  // #if 0
+  if (tcc_state->opt_cse)
+  {
+    int gcse_changes = tcc_ir_opt_cse_global(ir);
+    if (gcse_changes > 0)
+    {
       if (tcc_state->opt_dce)
-        tcc_ir_opt_dce(ir);
+        tcc_ir_opt_dce(ir); /* Clean up any newly dead code */
+
+      /* GCSE creates TMP<-TMP ASSIGN (copy) instructions. Run copy propagation
+       * to propagate these copies, enabling further CSE matches.
+       * Example: GCSE replaces T12<-V1 SHL #2 with T12<-T7. Then P0 ADD T12
+       * doesn't match P0 ADD T7 until copy prop replaces T12 with T7. */
+      for (int gcse_round = 0; gcse_round < 3; gcse_round++)
+      {
+        int cp = tcc_state->opt_copy_prop ? tcc_ir_opt_copy_prop(ir) : 0;
+        if (cp <= 0)
+          break;
+        int cse2 = tcc_ir_opt_cse_arith(ir);
+        cse2 += tcc_ir_opt_cse_global(ir);
+        if (tcc_state->opt_dce)
+          tcc_ir_opt_dce(ir);
+        if (cse2 <= 0)
+          break;
+      }
+    }
   }
+  // #endif
 
-  /* Phase 2: Copy Propagation */
-  if (tcc_state->opt_copy_prop && tcc_ir_opt_copy_prop(ir))
-    if (tcc_state->opt_dce)
-      tcc_ir_opt_dce(ir);
+#ifdef DEBUG_IR_GEN
+  if (iteration > 1)
+  {
+    printf("OPTIMIZE: Ran %d optimization iterations\n", iteration);
+  }
+#endif
 
-  /* Phase 3: Arithmetic Common Subexpression Elimination */
-  if (tcc_state->opt_cse && tcc_ir_opt_cse_arith(ir))
-    if (tcc_state->opt_dce)
-      tcc_ir_opt_dce(ir);
+  /* Phase 2c: Jump Threading - forward jump targets through NOPs and chains
+   * This eliminates unnecessary jumps and simplifies control flow.
+   */
+  if (tcc_state->opt_jump_threading)
+  {
+    int jump_changes = tcc_ir_opt_jump_threading(ir);
+    if (jump_changes)
+    {
+      /* Eliminate fall-through jumps after threading */
+      jump_changes += tcc_ir_opt_eliminate_fallthrough(ir);
+      if (tcc_state->opt_dce)
+        tcc_ir_opt_dce(ir); /* Clean up any newly unreachable code */
+    }
+  }
 
   /* Phase 3b: MLA (Multiply-Accumulate) Fusion - fuse MUL + ADD into MLA */
   /* This should run after CSE so we have clean MUL+ADD patterns */
-  if (tcc_ir_opt_mla_fusion(ir))
+  if (tcc_state->opt_mla_fusion && tcc_ir_opt_mla_fusion(ir))
     if (tcc_state->opt_dce)
-      tcc_ir_opt_dce(ir); /* Remove the NOP'd ADD instructions */
+      tcc_ir_opt_dce(ir); /* Clean up any newly unreachable code */
+
+  /* Phase 3c: Stack Address CSE - hoist repeated stack address computations
+   * This enables indexed memory fusion for stack-allocated arrays by
+   * creating a vreg to hold the base address instead of recomputing it.
+   */
+  if (tcc_state->opt_stack_addr_cse && tcc_ir_opt_stack_addr_cse(ir))
+    if (tcc_state->opt_dce)
+      tcc_ir_opt_dce(ir); /* Clean up any newly unreachable code */
+
+  /* Phase 4: Indexed Load/Store Fusion - fuse SHL + ADD + LOAD/STORE
+   * Pattern: arr[index] -> uses ARM's LDR/STR with scaled register offset
+   */
+  if (tcc_state->opt_indexed_memory && tcc_ir_opt_indexed_memory_fusion(ir))
+    if (tcc_state->opt_dce)
+      tcc_ir_opt_dce(ir); /* Clean up any newly unreachable code */
+
+  /* Phase 4b: Post-Increment Load/Store Fusion - fuse LOAD/STORE + ADD
+   * Pattern: *ptr++; -> uses ARM's LDR/STR with post-increment
+   */
+  if (tcc_state->opt_postinc_fusion && tcc_ir_opt_postinc_fusion(ir))
+    if (tcc_state->opt_dce)
+      tcc_ir_opt_dce(ir); /* Clean up any newly unreachable code */
 
   /* Common subexpression elimination for commutative boolean ops */
   if (tcc_state->opt_bool_cse && tcc_ir_opt_cse_bool(ir))
@@ -10567,6 +10860,31 @@ static void gen_function(Sym *sym)
   if (tcc_state->opt_dead_store)
     tcc_ir_opt_dse(ir);
 
+  /* Phase 5: Loop-Invariant Code Motion - hoist computations out of loops
+   * Returns the detected loop structure for reuse by IV Strength Reduction. */
+  IRLoops *licm_loops = NULL;
+  if (tcc_state->opt_licm)
+    licm_loops = tcc_ir_opt_licm_ex(ir);
+
+  /* Phase 6: Induction Variable Strength Reduction - transform array indexing
+   * from: base + i*stride (SHL + ADD each iteration)
+   * to:   ptr += stride (single ADD, enabling post-increment addressing)
+   * Uses loop structure from LICM to avoid re-detection index mismatch. */
+  if (tcc_state->opt_iv_strength_red)
+  {
+    if (licm_loops)
+      tcc_ir_opt_iv_strength_reduction_with_loops(ir, licm_loops);
+    else
+      tcc_ir_opt_iv_strength_reduction(ir);
+  }
+  tcc_ir_free_loops(licm_loops);
+
+  /* Phase 7: Strength Reduction - transform MUL by constant to shift/add */
+  if (tcc_state->opt_strength_red)
+    tcc_ir_opt_strength_reduction(ir);
+
+  tcc_ir_opt_dce(ir); /* Final pass to mark unreachable code as NOP */
+
   /* Recompute leafness after IR optimizations.
    * IR construction marks the function non-leaf as soon as a call op is
    * emitted, but DCE/other passes can delete calls.
@@ -10591,14 +10909,6 @@ static void gen_function(Sym *sym)
   /* Nested calls are now handled at code generation time via backward scan.
    * No IR reordering needed - saves O(n) memory allocations. */
 
-#ifdef CONFIG_TCC_DEBUG
-  if (tcc_state->dump_ir)
-  {
-    printf("=== IR AFTER OPTIMIZATIONS ===\n");
-    tcc_ir_show(ir);
-    printf("=== END IR AFTER OPTIMIZATIONS ===\n");
-  }
-#endif
   tcc_ir_liveness_analysis(ir);
 
   /* Mark return value vregs with incoming_reg0=0 BEFORE allocation
@@ -10646,6 +10956,28 @@ static void gen_function(Sym *sym)
   {
     tcc_debug_prolog_epilog(tcc_state, 1);
     // gfunc_epilog();
+  }
+
+#ifdef CONFIG_TCC_DEBUG
+  if (tcc_state->dump_ir)
+  {
+    tcc_ir_dump_set_show_physical_regs(1); /* Show physical registers with virtual register info */
+    printf("=== IR AFTER OPTIMIZATIONS ===\n");
+    tcc_ir_show(ir);
+    printf("=== END IR AFTER OPTIMIZATIONS ===\n");
+  }
+#endif
+
+  /* Infer and cache function purity for LICM optimization
+   * This allows LICM to hoist calls to pure functions defined in the same TU */
+  if (tcc_state->opt_licm && ir && sym)
+  {
+    /* Forward declare the inference function */
+    extern TCCFuncPurity tcc_ir_infer_func_purity(TCCIRState * ir, Sym * func_sym);
+    extern void tcc_ir_cache_func_purity(TCCState * s, int func_token, TCCFuncPurity purity);
+
+    TCCFuncPurity purity = tcc_ir_infer_func_purity(ir, sym);
+    tcc_ir_cache_func_purity(tcc_state, sym->v, purity);
   }
 
   /* end of function */

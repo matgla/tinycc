@@ -42,6 +42,7 @@
 #endif
 
 #include "arm-thumb-defs.h"
+#include "ir/opt.h"
 #include "tcc.h"
 #include "tccir.h"
 #include "tccls.h"
@@ -212,6 +213,454 @@ typedef struct ScratchRegAllocs
   uint32_t saved_mask; /* Bitmask of registers that were saved (pushed) */
 } ScratchRegAllocs;
 
+/* ============================================================
+ * Dry-Run Code Generation State
+ * ============================================================
+ * Two-pass code generation system for optimal register allocation.
+ * Pass 1 (Dry Run): Analyze register needs without emitting code
+ * Pass 2 (Real Emit): Generate code with optimal prologue based on Pass 1
+ */
+
+typedef struct CodeGenDryRunState
+{
+  int active;                   /* 1 = dry run, 0 = real emit */
+  uint32_t scratch_regs_pushed; /* Bitmap of regs pushed as scratch */
+  int scratch_push_count;       /* Total scratch push operations */
+  int lr_push_count;            /* Times LR specifically was pushed */
+  int instruction_count;        /* IR instructions processed */
+} CodeGenDryRunState;
+
+static CodeGenDryRunState dry_run_state;
+
+/* Separate literal pool for dry-run mode to avoid modifying the real pool.
+ * This allows accurate code size tracking without affecting the real pass. */
+static ThumbLiteralPoolEntry *dry_run_literal_pool = NULL;
+static int dry_run_literal_pool_count = 0;
+static int dry_run_literal_pool_size = 0;
+
+/* Hash table for O(1) literal pool lookups instead of O(n) linear search.
+ * Key: (sym, imm), Value: index into literal pool array.
+ * Using open addressing with linear probing. */
+#define LITERAL_POOL_HASH_SIZE 256 /* Power of 2 for fast modulo */
+typedef struct LiteralPoolHashEntry
+{
+  Sym *sym;
+  int64_t imm;
+  int pool_index; /* Index into literal pool array, or -1 if empty */
+  int valid;      /* 1 if this slot contains a valid entry, 0 if empty */
+} LiteralPoolHashEntry;
+
+static LiteralPoolHashEntry literal_pool_hash[LITERAL_POOL_HASH_SIZE];
+static LiteralPoolHashEntry dry_run_literal_pool_hash[LITERAL_POOL_HASH_SIZE];
+
+static inline uint32_t literal_pool_hash_func(Sym *sym, int64_t imm)
+{
+  /* Simple hash combining pointer and immediate value */
+  uint64_t h = (uint64_t)(uintptr_t)sym;
+  h ^= (uint64_t)imm;
+  h ^= h >> 33;
+  h *= 0xff51afd7ed558ccdULL;
+  h ^= h >> 33;
+  return (uint32_t)(h & (LITERAL_POOL_HASH_SIZE - 1));
+}
+
+static void literal_pool_hash_clear(LiteralPoolHashEntry *hash)
+{
+  for (int i = 0; i < LITERAL_POOL_HASH_SIZE; i++)
+  {
+    hash[i].valid = 0;
+    hash[i].pool_index = -1;
+  }
+}
+
+static int literal_pool_hash_find(LiteralPoolHashEntry *hash, Sym *sym, int64_t imm)
+{
+  uint32_t idx = literal_pool_hash_func(sym, imm);
+  for (int i = 0; i < LITERAL_POOL_HASH_SIZE; i++)
+  {
+    uint32_t probe = (idx + i) & (LITERAL_POOL_HASH_SIZE - 1);
+    if (!hash[probe].valid)
+    {
+      return -1; /* Empty slot - not found */
+    }
+    if (hash[probe].sym == sym && hash[probe].imm == imm)
+    {
+      return hash[probe].pool_index;
+    }
+  }
+  return -1; /* Table full, not found */
+}
+
+static void literal_pool_hash_insert(LiteralPoolHashEntry *hash, Sym *sym, int64_t imm, int pool_index)
+{
+  uint32_t idx = literal_pool_hash_func(sym, imm);
+  for (int i = 0; i < LITERAL_POOL_HASH_SIZE; i++)
+  {
+    uint32_t probe = (idx + i) & (LITERAL_POOL_HASH_SIZE - 1);
+    if (!hash[probe].valid)
+    {
+      hash[probe].sym = sym;
+      hash[probe].imm = imm;
+      hash[probe].pool_index = pool_index;
+      hash[probe].valid = 1;
+      return;
+    }
+  }
+  /* Table full - this shouldn't happen with reasonable pool sizes */
+}
+
+static void dry_run_init(void)
+{
+  memset(&dry_run_state, 0, sizeof(dry_run_state));
+}
+
+static void dry_run_record_push(int reg)
+{
+  dry_run_state.scratch_regs_pushed |= (1u << reg);
+  dry_run_state.scratch_push_count++;
+  if (reg == R_LR)
+    dry_run_state.lr_push_count++;
+}
+
+/* Structure to save/restore thumb_gen_state for dry-run isolation */
+typedef struct ThumbGenStateSnapshot
+{
+  int code_size;
+  int literal_pool_count;
+  int literal_pool_size;
+  ThumbLiteralPoolEntry *literal_pool;
+  Sym *cached_global_sym;
+  int cached_global_reg;
+  int function_argument_count;
+  int call_sites_by_id_size;
+  ThumbGenCallSite *call_sites_by_id;
+} ThumbGenStateSnapshot;
+
+static ThumbGenStateSnapshot dry_run_snapshot;
+
+static void thumb_gen_state_snapshot_save(ThumbGenStateSnapshot *snap)
+{
+  snap->code_size = thumb_gen_state.code_size;
+  snap->literal_pool_count = thumb_gen_state.literal_pool_count;
+  snap->literal_pool_size = thumb_gen_state.literal_pool_size;
+  snap->literal_pool = thumb_gen_state.literal_pool;
+  snap->cached_global_sym = thumb_gen_state.cached_global_sym;
+  snap->cached_global_reg = thumb_gen_state.cached_global_reg;
+  snap->function_argument_count = thumb_gen_state.function_argument_count;
+  /* call_sites_by_id is more complex - save pointer and size */
+  snap->call_sites_by_id_size = thumb_gen_state.call_sites_by_id_size;
+  snap->call_sites_by_id = thumb_gen_state.call_sites_by_id;
+}
+
+static void thumb_gen_state_snapshot_restore(ThumbGenStateSnapshot *snap)
+{
+  thumb_gen_state.code_size = snap->code_size;
+  /* Free any literal pool array allocated during dry-run (if reallocated) */
+  if (thumb_gen_state.literal_pool != snap->literal_pool)
+  {
+    tcc_free(thumb_gen_state.literal_pool);
+  }
+  thumb_gen_state.literal_pool = snap->literal_pool;
+  thumb_gen_state.literal_pool_count = snap->literal_pool_count;
+  thumb_gen_state.literal_pool_size = snap->literal_pool_size;
+  thumb_gen_state.cached_global_sym = snap->cached_global_sym;
+  thumb_gen_state.cached_global_reg = snap->cached_global_reg;
+  thumb_gen_state.function_argument_count = snap->function_argument_count;
+  /* Free any call sites created during dry-run */
+  if (thumb_gen_state.call_sites_by_id != snap->call_sites_by_id)
+  {
+    tcc_free(thumb_gen_state.call_sites_by_id);
+  }
+  thumb_gen_state.call_sites_by_id = snap->call_sites_by_id;
+  thumb_gen_state.call_sites_by_id_size = snap->call_sites_by_id_size;
+}
+
+/* ============================================================
+ * Branch Instruction Optimization State
+ * ============================================================
+ * Tracks branch instructions during dry-run to select optimal
+ * 16-bit vs 32-bit encodings based on actual jump distances.
+ */
+
+typedef enum
+{
+  BRANCH_ENC_UNKNOWN = 0,
+  BRANCH_ENC_16BIT = 16,
+  BRANCH_ENC_32BIT = 32
+} BranchEncoding;
+
+typedef struct BranchInfo
+{
+  int ir_index;            /* IR instruction index of the branch */
+  int source_addr;         /* Code address where branch is emitted */
+  int target_ir;           /* Target IR instruction index */
+  int target_addr;         /* Target code address (computed after dry-run) */
+  int offset;              /* Computed offset = target - source - 4 */
+  int is_conditional;      /* 1 = conditional (JUMPIF), 0 = unconditional (JUMP) */
+  BranchEncoding encoding; /* Selected encoding after analysis */
+} BranchInfo;
+
+typedef struct BranchOptState
+{
+  BranchInfo *branches;     /* Array of branch info */
+  int branch_count;         /* Number of branches */
+  int branch_capacity;      /* Allocated capacity */
+  int optimization_enabled; /* Flag to enable/disable */
+  int code_size_reduction;  /* Total bytes saved */
+} BranchOptState;
+
+static BranchOptState branch_opt_state;
+
+/* Forward declarations */
+static void branch_opt_init(void);
+static void branch_opt_record(int ir_index, int source_addr, int target_ir, int is_conditional);
+static void branch_opt_analyze(uint32_t *ir_to_code_mapping, int mapping_size);
+/* Public accessor for branch encoding - returns 16 or 32 */
+ST_FUNC int tcc_gen_machine_branch_opt_get_encoding(int ir_index)
+{
+  for (int i = 0; i < branch_opt_state.branch_count; i++)
+  {
+    if (branch_opt_state.branches[i].ir_index == ir_index)
+    {
+      return branch_opt_state.branches[i].encoding == BRANCH_ENC_16BIT ? 16 : 32;
+    }
+  }
+  return 32; /* Conservative fallback */
+}
+
+static BranchEncoding branch_opt_get_encoding(int ir_index);
+
+/* Check if offset fits in 16-bit conditional branch (T1 encoding)
+ * Range: -256 to +254 bytes (imm8 * 2), must be even */
+static int branch_fits_t1(int offset)
+{
+  return (offset >= -256 && offset <= 254 && (offset & 1) == 0);
+}
+
+/* Check if offset fits in 16-bit unconditional branch (T2 encoding)
+ * Range: -2048 to +2046 bytes (imm11 * 2), must be even */
+static int branch_fits_t2(int offset)
+{
+  return (offset >= -2048 && offset <= 2046 && (offset & 1) == 0);
+}
+
+/* Initialize branch optimization state */
+static void branch_opt_init(void)
+{
+  branch_opt_state.branch_count = 0;
+  branch_opt_state.optimization_enabled = 1;
+  branch_opt_state.code_size_reduction = 0;
+  if (!branch_opt_state.branches)
+  {
+    branch_opt_state.branch_capacity = 64;
+    branch_opt_state.branches = tcc_malloc(branch_opt_state.branch_capacity * sizeof(BranchInfo));
+  }
+}
+
+/* Record a branch for later optimization analysis */
+static void branch_opt_record(int ir_index, int source_addr, int target_ir, int is_conditional)
+{
+  if (!branch_opt_state.optimization_enabled)
+    return;
+
+  /* Grow array if needed */
+  if (branch_opt_state.branch_count >= branch_opt_state.branch_capacity)
+  {
+    branch_opt_state.branch_capacity *= 2;
+    branch_opt_state.branches =
+        tcc_realloc(branch_opt_state.branches, branch_opt_state.branch_capacity * sizeof(BranchInfo));
+  }
+
+  BranchInfo *b = &branch_opt_state.branches[branch_opt_state.branch_count++];
+  b->ir_index = ir_index;
+  b->source_addr = source_addr;
+  b->target_ir = target_ir;
+  b->target_addr = -1; /* Unknown until targets resolved */
+  b->offset = 0;
+  b->is_conditional = is_conditional;
+  b->encoding = BRANCH_ENC_32BIT; /* Conservative default */
+}
+
+/* Analyze branch offsets and select optimal encodings.
+ * Uses iterative relaxation: shrinking branches may enable more 16-bit branches.
+ */
+static void branch_opt_analyze(uint32_t *ir_to_code_mapping, int mapping_size)
+{
+  if (!branch_opt_state.optimization_enabled || branch_opt_state.branch_count == 0)
+    return;
+
+  /* Phase 1: Resolve target addresses from dry-run mapping */
+  for (int i = 0; i < branch_opt_state.branch_count; i++)
+  {
+    BranchInfo *b = &branch_opt_state.branches[i];
+    if (b->target_ir >= 0 && b->target_ir < mapping_size)
+    {
+      b->target_addr = ir_to_code_mapping[b->target_ir];
+    }
+    else
+    {
+      b->target_addr = b->source_addr; /* Self-loop fallback */
+    }
+  }
+
+  /* Phase 2: Iterative relaxation
+   * Keep trying to convert 32-bit to 16-bit until no more changes.
+   * Each conversion shrinks code by 2 bytes, potentially enabling more.
+   */
+  int changed;
+  int iterations = 0;
+  const int MAX_ITERATIONS = 10; /* Prevent infinite loops */
+
+  do
+  {
+    changed = 0;
+    int cumulative_shrink = 0;
+
+    for (int i = 0; i < branch_opt_state.branch_count; i++)
+    {
+      BranchInfo *b = &branch_opt_state.branches[i];
+
+      /* Adjust addresses for branches after us that already shrunk */
+      int adjusted_source = b->source_addr - cumulative_shrink;
+      int adjusted_target = b->target_addr;
+
+      /* Adjust target if it's after shrunk branches */
+      for (int j = 0; j < i; j++)
+      {
+        if (branch_opt_state.branches[j].encoding == BRANCH_ENC_16BIT &&
+            branch_opt_state.branches[j].source_addr < b->target_addr)
+        {
+          adjusted_target -= 2; /* This branch shrunk by 2 bytes */
+        }
+      }
+
+      /* Compute offset: target - (source + instruction_size)
+       * For Thumb: offset = target - source - 4 (pipeline offset) */
+      int offset = adjusted_target - adjusted_source - 4;
+      b->offset = offset;
+
+      /* Try to use 16-bit encoding */
+      if (b->encoding == BRANCH_ENC_32BIT)
+      {
+        int can_use_16bit = b->is_conditional ? branch_fits_t1(offset) : branch_fits_t2(offset);
+
+        if (can_use_16bit)
+        {
+          b->encoding = BRANCH_ENC_16BIT;
+          cumulative_shrink += 2;
+          changed = 1;
+        }
+      }
+    }
+
+    iterations++;
+  } while (changed && iterations < MAX_ITERATIONS);
+
+  /* Calculate total savings */
+  branch_opt_state.code_size_reduction = 0;
+  for (int i = 0; i < branch_opt_state.branch_count; i++)
+  {
+    if (branch_opt_state.branches[i].encoding == BRANCH_ENC_16BIT)
+    {
+      branch_opt_state.code_size_reduction += 2;
+    }
+  }
+
+#ifdef DEBUG_BRANCH_OPT
+  fprintf(stderr,
+          "[BRANCH_OPT] %d branches, %d converted to 16-bit, "
+          "%d bytes saved, %d iterations\n",
+          branch_opt_state.branch_count, branch_opt_state.code_size_reduction / 2, branch_opt_state.code_size_reduction,
+          iterations);
+#endif
+}
+
+/* Lookup encoding decision for a given IR index */
+/* Local version that returns the enum type */
+static BranchEncoding branch_opt_get_encoding(int ir_index)
+{
+  for (int i = 0; i < branch_opt_state.branch_count; i++)
+  {
+    if (branch_opt_state.branches[i].ir_index == ir_index)
+    {
+      return branch_opt_state.branches[i].encoding;
+    }
+  }
+  return BRANCH_ENC_32BIT; /* Conservative fallback */
+}
+
+/* Public interface for branch optimization */
+ST_FUNC void tcc_gen_machine_branch_opt_analyze(uint32_t *ir_to_code_mapping, int mapping_size)
+{
+  branch_opt_analyze(ir_to_code_mapping, mapping_size);
+}
+
+ST_FUNC void tcc_gen_machine_branch_opt_init(void)
+{
+  branch_opt_init();
+}
+
+/* Public interface for dry-run code generation */
+ST_FUNC void tcc_gen_machine_dry_run_init(void)
+{
+  dry_run_init();
+}
+
+ST_FUNC void tcc_gen_machine_dry_run_start(void)
+{
+  dry_run_state.active = 1;
+  /* Allocate dry-run literal pool if not already allocated */
+  if (!dry_run_literal_pool)
+  {
+    dry_run_literal_pool_size = 64;
+    dry_run_literal_pool = tcc_malloc(dry_run_literal_pool_size * sizeof(ThumbLiteralPoolEntry));
+  }
+  dry_run_literal_pool_count = 0;
+  /* Clear the dry-run hash table */
+  literal_pool_hash_clear(dry_run_literal_pool_hash);
+  /* Save thumb_gen_state before dry-run */
+  thumb_gen_state_snapshot_save(&dry_run_snapshot);
+  /* Reset state that should start fresh for dry-run */
+  thumb_gen_state.code_size = 0;
+  thumb_gen_state.literal_pool_count = 0;
+  thumb_gen_state.cached_global_sym = NULL;
+  thumb_gen_state.cached_global_reg = PREG_NONE;
+  thumb_gen_state.function_argument_count = 0;
+  /* call_sites_by_id - don't modify, just track that we saved it */
+}
+
+ST_FUNC void tcc_gen_machine_dry_run_end(void)
+{
+  dry_run_state.active = 0;
+  /* Restore thumb_gen_state after dry-run */
+  thumb_gen_state_snapshot_restore(&dry_run_snapshot);
+  /* Note: we keep dry_run_literal_pool allocated for reuse */
+}
+
+ST_FUNC int tcc_gen_machine_dry_run_get_lr_push_count(void)
+{
+  return dry_run_state.lr_push_count;
+}
+
+ST_FUNC uint32_t tcc_gen_machine_dry_run_get_scratch_regs_pushed(void)
+{
+  return dry_run_state.scratch_regs_pushed;
+}
+
+/* Check if dry-run mode is currently active */
+ST_FUNC int tcc_gen_machine_dry_run_is_active(void)
+{
+  return dry_run_state.active;
+}
+
+/* Reset scratch register state between dry-run and real passes */
+ST_FUNC void tcc_gen_machine_reset_scratch_state(void)
+{
+  scratch_global_exclude = 0;
+  scratch_push_count = 0;
+  memset(scratch_push_stack, 0, sizeof(scratch_push_stack));
+}
+
 ScratchRegAlloc th_offset_to_reg(int offset, int sign);
 
 /* Get a free scratch register using liveness information.
@@ -257,6 +706,22 @@ static ScratchRegAlloc get_scratch_reg_with_save(uint32_t exclude_regs)
 
   int reg_to_save = -1;
 no_free_reg:
+  /* lr_saved_in_prologue needs to be computed here to satisfy compiler flow analysis */
+  int lr_saved_in_prologue = (pushed_registers & (1u << R_LR)) ? 1 : 0;
+
+  /* In non-leaf functions OR when LR was pushed in prologue (e.g., due to dry-run
+   * discovering it would be needed as scratch), LR is already saved.
+   * We can use it as scratch without push/pop since the epilog will restore it.
+   * This is more efficient than pushing another register.
+   */
+  if (ir && (lr_saved_in_prologue || !ir->leaffunc) && !(exclude_regs & (1 << R_LR)))
+  {
+    /* LR is saved at prologue, use it freely */
+    result.reg = R_LR;
+    result.saved = 0; /* No push needed - already saved at prologue */
+    scratch_global_exclude |= (1u << R_LR);
+    return result;
+  }
 
   /* No free register found - we need to save one to the stack */
   /* Prefer R_IP (R12) as it's the inter-procedure scratch register */
@@ -304,6 +769,18 @@ no_free_reg:
 #ifdef ARM_THUMB_DEBUG_SCRATCH
   fprintf(stderr, "[SCRATCH] WARNING: no free scratch register! Saving r%d to stack\n", reg_to_save);
 #endif
+
+  /* Dry run: record what we would push, but don't emit */
+  if (dry_run_state.active)
+  {
+    dry_run_record_push(reg_to_save);
+    /* Return as if it's free for consistent allocation decisions */
+    result.reg = reg_to_save;
+    result.saved = 0;
+    scratch_global_exclude |= (1u << reg_to_save);
+    return result;
+  }
+
   ot_check(th_push(1 << reg_to_save));
   result.reg = reg_to_save;
   result.saved = 1;
@@ -326,6 +803,26 @@ no_free_reg:
 /* Restore a scratch register if it was saved */
 static void restore_scratch_reg(ScratchRegAlloc *alloc)
 {
+  /* Dry run: don't emit pop, just update tracking */
+  if (dry_run_state.active)
+  {
+    if (alloc->saved)
+    {
+      /* Track that we would have popped */
+      if (scratch_push_count > 0 && scratch_push_stack[scratch_push_count - 1] == alloc->reg)
+      {
+        scratch_push_count--;
+      }
+      alloc->saved = 0;
+    }
+    /* Release from global exclude */
+    if (alloc->reg >= 0 && alloc->reg < 32)
+    {
+      scratch_global_exclude &= ~(1u << alloc->reg);
+    }
+    return;
+  }
+
   if (alloc->saved)
   {
     /* We MUST restore in strict LIFO order.
@@ -375,6 +872,14 @@ static void restore_scratch_reg(ScratchRegAlloc *alloc)
  * used .reg and discarded the saved flag. POP in reverse order of PUSH! */
 static void restore_all_pushed_scratch_regs(void)
 {
+  /* Dry run: don't emit pops, just reset tracking */
+  if (dry_run_state.active)
+  {
+    scratch_push_count = 0;
+    scratch_global_exclude = 0;
+    return;
+  }
+
   /* Pop in reverse order - ARM POP with register lists pops in register-number
    * order, so we must issue individual POPs in reverse push order */
   for (int i = scratch_push_count - 1; i >= 0; i--)
@@ -635,6 +1140,8 @@ static void th_literal_pool_init()
   thumb_gen_state.code_size = 0;
   thumb_gen_state.cached_global_sym = NULL;
   thumb_gen_state.cached_global_reg = PREG_NONE;
+  /* Clear the hash table for O(1) lookups */
+  literal_pool_hash_clear(literal_pool_hash);
 }
 
 const FloatingPointConfig arm_soft_fpu_config = {
@@ -750,6 +1257,15 @@ void o(unsigned int i)
 {
   const int ind1 = ind + 2;
   TRACE("  o: 0x%03x pc: 0x%x", i, ind);
+
+  /* During dry-run, don't actually write to section data.
+   * Just update ind to track code size. */
+  if (dry_run_state.active)
+  {
+    ind += 2;
+    return;
+  }
+
   if (nocode_wanted)
   {
     return;
@@ -775,6 +1291,9 @@ static void th_literal_pool_generate(void)
   if (generating_pool)
     return;
 
+  /* During dry-run, we still need to generate the literal pool to ensure
+   * code addresses match the real pass. The o() function will handle not
+   * writing to section data during dry-run, but will increment ind. */
   if (thumb_gen_state.literal_pool_count == 0)
   {
     thumb_gen_state.code_size = 0;
@@ -784,13 +1303,17 @@ static void th_literal_pool_generate(void)
   generating_pool = 1;
   const int this_pool = ++pool_seq;
 
+  /* Use dry-run pool during dry-run, otherwise use the real pool */
+  ThumbLiteralPoolEntry *pool = dry_run_state.active ? dry_run_literal_pool : thumb_gen_state.literal_pool;
+  int pool_count = dry_run_state.active ? dry_run_literal_pool_count : thumb_gen_state.literal_pool_count;
+
   /* Count unique literals to calculate pool size */
   int pool_size = 0;
-  for (int i = 0; i < thumb_gen_state.literal_pool_count; i++)
+  for (int i = 0; i < pool_count; i++)
   {
-    if (thumb_gen_state.literal_pool[i].shared_index == -1)
+    if (pool[i].shared_index == -1)
     {
-      int entry_size = (thumb_gen_state.literal_pool[i].data_size == 8) ? 8 : 4;
+      int entry_size = (pool[i].data_size == 8) ? 8 : 4;
       pool_size += entry_size;
     }
   }
@@ -818,14 +1341,14 @@ static void th_literal_pool_generate(void)
   }
 
   /* Array to store the output position of each unique literal */
-  int *literal_positions = tcc_malloc(thumb_gen_state.literal_pool_count * sizeof(int));
+  int *literal_positions = tcc_malloc(pool_count * sizeof(int));
 
   th_sym_d();
 
   /* First pass: emit unique literals and record their positions */
-  for (int i = 0; i < thumb_gen_state.literal_pool_count; i++)
+  for (int i = 0; i < pool_count; i++)
   {
-    ThumbLiteralPoolEntry *entry = &thumb_gen_state.literal_pool[i];
+    ThumbLiteralPoolEntry *entry = &pool[i];
     if (entry->shared_index == -1)
     {
       /* This is a unique entry - emit the literal value */
@@ -844,7 +1367,9 @@ static void th_literal_pool_generate(void)
           entry->sym = NULL;
         }
       }
-      if (entry->relocation != -1 && entry->sym)
+      /* Skip relocation creation during dry-run - relocations should only be
+       * created during the real code generation pass. */
+      if (!dry_run_state.active && entry->relocation != -1 && entry->sym)
       {
         /* Validate symbol before creating relocation - sym must have valid ELF index
          * or be registerable. Type descriptors (SYM_FIELD) have c=-1 and should not
@@ -913,9 +1438,9 @@ static void th_literal_pool_generate(void)
   th_sym_t();
 
   /* Second pass: patch all instructions to point to correct literal position */
-  for (int i = 0; i < thumb_gen_state.literal_pool_count; i++)
+  for (int i = 0; i < pool_count; i++)
   {
-    ThumbLiteralPoolEntry *entry = &thumb_gen_state.literal_pool[i];
+    ThumbLiteralPoolEntry *entry = &pool[i];
     int literal_pos = literal_positions[i];
     int aligned_position = ((literal_pos - entry->patch_position) + 3) & ~3;
 
@@ -967,6 +1492,8 @@ static void th_literal_pool_generate(void)
   thumb_gen_state.literal_pool_count = 0;
   thumb_gen_state.code_size = 0;
   generating_pool = 0;
+  /* Clear the hash table after flushing pool */
+  literal_pool_hash_clear(literal_pool_hash);
 }
 
 int is_valid_opcode(thumb_opcode op)
@@ -978,6 +1505,28 @@ int ot(thumb_opcode op)
 {
   if (op.size == 0)
     return op.size;
+
+  /* Dry run: don't emit actual opcodes, but still track code size and
+   * handle literal pool generation to ensure code addresses match real pass. */
+  if (dry_run_state.active)
+  {
+    if (thumb_gen_state.generating_function)
+    {
+      thumb_gen_state.code_size += op.size;
+      /* Check if literal pool needs to be generated during dry-run.
+       * We need to call th_literal_pool_generate to properly track the
+       * code size including the literal pool, so that ind matches
+       * between dry-run and real pass. */
+      const int max_offset = thumb_gen_state.code_size + thumb_gen_state.literal_pool_count * 4;
+      if (max_offset >= 1020)
+      {
+        th_literal_pool_generate();
+      }
+    }
+    /* Increment ind as if we emitted the instruction, but don't write to section */
+    ind += op.size;
+    return op.size;
+  }
 
   if (thumb_gen_state.generating_function)
   {
@@ -1235,6 +1784,164 @@ ST_FUNC void tcc_gen_machine_indirect_jump_op(IROperand src1)
   if (scratch.saved)
   {
     ot_check(th_pop(1u << scratch.reg));
+  }
+}
+
+/* ============================================================================
+ * Switch Table / Jump Table Generation
+ * ============================================================================
+ * Generates TBB/TBH instruction followed by a jump table for O(1) switch dispatch.
+ * The index is already bounds-checked and adjusted (index = value - min_case).
+ */
+
+ST_FUNC void tcc_gen_machine_switch_table_op(IROperand src1, TCCIRSwitchTable *table, TCCIRState *ir, int ir_idx)
+{
+  (void)ir;     /* Unused for now, may be needed for relocation */
+  (void)ir_idx; /* Unused for now, may be needed for debug */
+
+  TRACE("'tcc_gen_machine_switch_table_op' table_id=%d entries=%d\n", table - ir->switch_tables, table->num_entries);
+
+  /* Get the index register (already holds value - min_val) */
+  if (src1.pr0_reg == PREG_REG_NONE)
+  {
+    tcc_error("internal error: SWITCH_TABLE index not in a register");
+  }
+  int index_reg = src1.pr0_reg;
+
+  /* Determine whether to use TBB (byte offsets) or TBH (halfword offsets).
+   * TBB: range <= 255 (byte index max)
+   * TBH: range <= 65535 (halfword index max)
+   * We use TBH if num_entries > 255 since we need more than byte range.
+   */
+  int use_tbh = (table->num_entries > 255);
+
+  /* Emit TBB/TBH instruction.
+   * TBB/TBH reads PC+4, so the table must follow immediately after.
+   * Format: TBB [PC, Rm] or TBH [PC, Rm, LSL #1]
+   * We use PC (R15) as the base register.
+   */
+  if (use_tbh)
+  {
+    /* TBH: halfword table, index shifted left by 1 */
+    ot_check(th_tbb(15 /* PC */, index_reg, 1));
+  }
+  else
+  {
+    /* TBB: byte table */
+    ot_check(th_tbb(15 /* PC */, index_reg, 0));
+  }
+
+  /* Record the current position as the table start for relocations */
+  int table_start = ind;
+
+  /* Emit jump table entries.
+   * TBB/TBH offsets are relative to the instruction following TBB/TBH,
+   * which is at 'table_start'. Each entry is divided by 2 (halfword aligned).
+   *
+   * For TBB: byte offset = (target - table_start) / 2
+   * For TBH: halfword offset = (target - table_start) / 2
+   */
+  for (int i = 0; i < table->num_entries; i++)
+  {
+    int target_ir = table->targets[i];
+
+    /* Store the target IR index as a relocation entry.
+     * We'll patch the actual offset after all code is generated
+     * using the ir_to_code_mapping.
+     */
+    if (use_tbh)
+    {
+      /* Halfword offset - reserve 2 bytes */
+      /* We'll need to patch this later with the actual offset */
+      g(0);
+      g(0);
+    }
+    else
+    {
+      /* Byte offset - reserve 1 byte */
+      g(0);
+    }
+
+    /* Add a relocation entry for this table slot.
+     * We use the existing relocation infrastructure by treating each
+     * table entry as a small relocation that points to the target IR.
+     */
+    (void)target_ir; /* Will be used for relocation */
+  }
+
+  /* Align to halfword boundary after table if needed (for TBB) */
+  if (!use_tbh && (ind & 1))
+  {
+    g(0); /* Padding byte */
+  }
+
+  /* The table entries need to be patched with actual offsets.
+   * This is done in a second pass after all code is generated,
+   * using the ir_to_code_mapping array which maps IR indices to code addresses.
+   *
+   * For now, we emit placeholder entries that will be fixed up.
+   * The fixup should happen during tcc_ir_codegen_backpatch_jumps or similar.
+   */
+
+  /* Record table relocation info for later patching.
+   * We need to store:
+   *   - table_start: address of first table entry
+   *   - num_entries: number of table entries
+   *   - target IR indices for each entry
+   *
+   * For simplicity, we'll do a runtime patch after code generation
+   * using the ir_to_code_mapping that was built during generation.
+   */
+
+  /* Store the table info for the second pass patching.
+   * We'll access ir->ir_to_code_mapping to get the actual addresses.
+   */
+  if (ir && ir->ir_to_code_mapping)
+  {
+    /* Patch the table entries now that we have the mapping */
+    for (int i = 0; i < table->num_entries; i++)
+    {
+      int target_ir = table->targets[i];
+      int entry_addr = table_start + (use_tbh ? i * 2 : i);
+
+      /* Get target address from the IR-to-code mapping */
+      int target_addr;
+      if (target_ir >= 0 && target_ir < ir->ir_to_code_mapping_size)
+      {
+        target_addr = ir->ir_to_code_mapping[target_ir];
+      }
+      else
+      {
+        /* Default case: point to end of switch (current position) */
+        target_addr = ind;
+      }
+
+      /* Calculate offset: (target - table_start) / 2
+       * TBB/TBH offsets are signed and multiplied by 2 by the hardware.
+       */
+      int offset = (target_addr - table_start) / 2;
+
+      /* Range check */
+      if (use_tbh)
+      {
+        if (offset < -32768 || offset > 32767)
+        {
+          tcc_error("internal error: TBH offset out of range");
+        }
+        /* Patch halfword entry */
+        write16le(cur_text_section->data + entry_addr, (uint16_t)(offset & 0xFFFF));
+      }
+      else
+      {
+        if (offset < -128 || offset > 127)
+        {
+          /* Fall back to TBH if TBB offset out of range */
+          tcc_error("internal error: TBB offset out of range, should have used TBH");
+        }
+        /* Patch byte entry */
+        cur_text_section->data[entry_addr] = (uint8_t)(offset & 0xFF);
+      }
+    }
   }
 }
 
@@ -1771,6 +2478,26 @@ void store_ir(int r, IROperand sv)
 static ThumbLiteralPoolEntry *th_literal_pool_allocate()
 {
   ThumbLiteralPoolEntry *entry;
+
+  /* During dry-run, use separate pool to avoid modifying the real pool.
+   * This prevents memory corruption when restoring state after dry-run. */
+  if (dry_run_state.active)
+  {
+    if (dry_run_literal_pool_count >= dry_run_literal_pool_size)
+    {
+      dry_run_literal_pool_size <<= 1;
+      dry_run_literal_pool =
+          tcc_realloc(dry_run_literal_pool, dry_run_literal_pool_size * sizeof(ThumbLiteralPoolEntry));
+    }
+    entry = &dry_run_literal_pool[dry_run_literal_pool_count++];
+    memset(entry, 0, sizeof(ThumbLiteralPoolEntry));
+    entry->relocation = -1;
+    entry->shared_index = -1;
+    /* Track the count in the main state for code size calculations */
+    thumb_gen_state.literal_pool_count++;
+    return entry;
+  }
+
   if (thumb_gen_state.literal_pool_count >= thumb_gen_state.literal_pool_size)
   {
     const int new_size = thumb_gen_state.literal_pool_size << 1;
@@ -1785,27 +2512,39 @@ static ThumbLiteralPoolEntry *th_literal_pool_allocate()
 }
 
 /* Find existing literal pool entry with same sym and imm, and allocate new
-   entry that shares its literal value */
+   entry that shares its literal value.
+   Uses hash table for O(1) lookup instead of O(n) linear search. */
 static ThumbLiteralPoolEntry *th_literal_pool_find_or_allocate(Sym *sym, int64_t imm)
 {
-  int found_index = -1;
-  /* Search existing entries for a match */
-  for (int i = 0; i < thumb_gen_state.literal_pool_count; i++)
+  int found_index;
+  LiteralPoolHashEntry *hash;
+  int new_index;
+
+  if (dry_run_state.active)
   {
-    ThumbLiteralPoolEntry *e = &thumb_gen_state.literal_pool[i];
-    /* Match on sym and imm, and it must be a primary entry (not shared) */
-    if (e->sym == sym && e->imm == imm && e->shared_index == -1)
-    {
-      found_index = i;
-      break;
-    }
+    hash = dry_run_literal_pool_hash;
+    new_index = dry_run_literal_pool_count;
   }
+  else
+  {
+    hash = literal_pool_hash;
+    new_index = thumb_gen_state.literal_pool_count;
+  }
+
+  /* O(1) hash lookup instead of O(n) linear search */
+  found_index = literal_pool_hash_find(hash, sym, imm);
+
   /* Allocate new entry */
   ThumbLiteralPoolEntry *entry = th_literal_pool_allocate();
   if (found_index >= 0)
   {
     /* Mark as sharing with the found entry */
     entry->shared_index = found_index;
+  }
+  else
+  {
+    /* This is a new primary entry - add to hash table */
+    literal_pool_hash_insert(hash, sym, imm, new_index);
   }
   return entry;
 }
@@ -1820,21 +2559,29 @@ static void load_full_const(int r, int r1, int64_t imm, struct Sym *sym)
 
   /* Validate symbol - only use symbols that can be externalized */
   sym = validate_sym_for_reloc(sym);
-  if (sym && sym->c == 0)
+
+  /* During dry-run, skip symbol registration and literal pool allocation.
+   * We just emit the instruction (ot_check handles dry-run mode) to track
+   * code size and scratch register usage, without creating side effects. */
+  if (!dry_run_state.active)
   {
-    /* Symbol not yet registered - try to register it */
-    put_extern_sym(sym, NULL, 0, 0);
-    if (sym->c <= 0)
+    if (sym && sym->c == 0)
     {
-      /* Registration failed - symbol can't be externalized */
-      sym = NULL;
+      /* Symbol not yet registered - try to register it */
+      put_extern_sym(sym, NULL, 0, 0);
+      if (sym->c <= 0)
+      {
+        /* Registration failed - symbol can't be externalized */
+        sym = NULL;
+      }
+    }
+
+    if (sym)
+    {
+      esym = elfsym(sym);
     }
   }
 
-  if (sym)
-  {
-    esym = elfsym(sym);
-  }
   TRACE("'load_full_const' to register: %d, with imm: %d\n", r, imm);
 
   /* Emit the instruction first.
@@ -1853,6 +2600,10 @@ static void load_full_const(int r, int r1, int64_t imm, struct Sym *sym)
   ot_check(load_ins);
   patch_pos = ind - load_ins.size;
 
+  /* During dry-run, we still need to create the literal pool entry to ensure
+   * the literal pool behavior (threshold checks, sharing, etc.) matches the real pass.
+   * We still set sym so that find_or_allocate can match entries correctly.
+   * We just skip symbol registration and relocation setup. */
   entry = th_literal_pool_find_or_allocate(sym, imm);
   entry->sym = sym;
   entry->patch_position = patch_pos;
@@ -2038,6 +2789,28 @@ ST_FUNC void tcc_machine_addr_of_stack_slot(int dest_reg, int frame_offset, int 
     return;
   }
 
+  /* Check FP offset cache for existing computation
+   * Only use cache for callee-saved registers (r4-r11) since scratch registers
+   * like ip (r12) can be overwritten at any time without invalidating the cache. */
+  TCCIRState *ir = tcc_state->ir;
+  int cached_reg = -1;
+  int is_callee_saved = (dest_reg >= R4 && dest_reg <= R11);
+
+  if (ir && is_callee_saved && tcc_ir_opt_fp_cache_lookup(ir, frame_offset, &cached_reg))
+  {
+    /* Cache hit! Verify the cached register is also callee-saved */
+    if (cached_reg >= R4 && cached_reg <= R11)
+    {
+      if (cached_reg != dest_reg)
+      {
+        ot_check(th_mov_reg(dest_reg, cached_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                            ENFORCE_ENCODING_NONE, false));
+      }
+      return;
+    }
+    /* Cached in scratch register - don't use it */
+  }
+
   const int neg = (frame_offset < 0);
   int abs_off = neg ? -frame_offset : frame_offset;
   thumb_opcode op = neg ? th_sub_imm(dest_reg, base_reg, abs_off, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE)
@@ -2046,6 +2819,10 @@ ST_FUNC void tcc_machine_addr_of_stack_slot(int dest_reg, int frame_offset, int 
   if (op.size != 0)
   {
     ot_check(op);
+    /* Record in cache for future reuse - only for callee-saved registers
+     * which won't be clobbered unexpectedly */
+    if (ir && is_callee_saved)
+      tcc_ir_opt_fp_cache_record(ir, frame_offset, dest_reg);
     return;
   }
 
@@ -2068,6 +2845,10 @@ ST_FUNC void tcc_machine_addr_of_stack_slot(int dest_reg, int frame_offset, int 
   {
     restore_scratch_reg(&offset_alloc);
   }
+
+  /* Record complex computation in cache - only for callee-saved registers */
+  if (ir && is_callee_saved)
+    tcc_ir_opt_fp_cache_record(ir, frame_offset, dest_reg);
 }
 
 /* Load a constant value into a register (or register pair for 64-bit).
@@ -3564,6 +4345,37 @@ static void thumb_process_data64_op(IROperand src1, IROperand src2, IROperand de
   return thumb_emit_opcode64_imm_ir(src1, src2, dest, op, context, regular_handler, carry_handler);
 }
 
+/* Helper to check if operand is an address-of-stack (not lval) that might be cached */
+static int is_addr_of_stack_operand(IROperand op)
+{
+  return (irop_get_tag(op) == IROP_TAG_STACKOFF && !op.is_lval);
+}
+
+/* Helper to get cached stack address register if available.
+ * Returns the cached register (r4-r11) or -1 if not cached. */
+static int get_cached_stack_addr_reg(IROperand op)
+{
+  if (!is_addr_of_stack_operand(op))
+    return -1;
+
+  TCCIRState *ir = tcc_state->ir;
+  if (!ir)
+    return -1;
+
+  int frame_offset = irop_get_stack_offset(op);
+  if (op.is_param)
+    frame_offset += offset_to_args;
+
+  int cached_reg = -1;
+  if (tcc_ir_opt_fp_cache_lookup(ir, frame_offset, &cached_reg))
+  {
+    /* Verify the cached register is callee-saved (safe to use) */
+    if (cached_reg >= R4 && cached_reg <= R11)
+      return cached_reg;
+  }
+  return -1;
+}
+
 static void thumb_emit_data_processing_op32(IROperand src1, IROperand src2, IROperand dest, TccIrOp op,
                                             ThumbDataProcessingHandler handler, thumb_flags_behaviour flags)
 {
@@ -3575,10 +4387,16 @@ static void thumb_emit_data_processing_op32(IROperand src1, IROperand src2, IROp
   const bool src1_is_imm = thumb_irop_has_immediate_value(src1);
   const bool src2_is_imm = thumb_irop_has_immediate_value(src2);
 
-  const bool src1_needs_load =
-      src1_is_imm || thumb_irop_needs_value_load(src1) || src1.is_lval || src1_reg == PREG_REG_NONE;
-  const bool src2_needs_load =
-      src2_is_imm || thumb_irop_needs_value_load(src2) || src2.is_lval || src2_reg == PREG_REG_NONE;
+  /* Check for cached stack address before determining if load is needed.
+   * If src1 or src2 is an address-of-stack that's already cached in a callee-saved
+   * register, we can use that register directly instead of loading. */
+  int src1_cached_reg = get_cached_stack_addr_reg(src1);
+  int src2_cached_reg = get_cached_stack_addr_reg(src2);
+
+  const bool src1_needs_load = (src1_cached_reg < 0) && (src1_is_imm || thumb_irop_needs_value_load(src1) ||
+                                                         src1.is_lval || src1_reg == PREG_REG_NONE);
+  const bool src2_needs_load = (src2_cached_reg < 0) && (src2_is_imm || thumb_irop_needs_value_load(src2) ||
+                                                         src2.is_lval || src2_reg == PREG_REG_NONE);
 
   uint32_t exclude_regs = 0;
   ScratchRegAlloc src1_alloc = {0};
@@ -3611,13 +4429,24 @@ static void thumb_emit_data_processing_op32(IROperand src1, IROperand src2, IROp
     }
   }
 
-  /* If src2 is already in a register, exclude it too so src1 doesn't clobber it */
-  if (!src2_is_imm && !thumb_irop_needs_value_load(src2) && !src2.is_lval && thumb_is_hw_reg(src2_reg))
+  /* If src2 is already in a register or cached, exclude it so src1 doesn't clobber it */
+  if (src2_cached_reg >= 0)
+  {
+    exclude_regs |= (1u << src2_cached_reg);
+  }
+  else if (!src2_is_imm && !thumb_irop_needs_value_load(src2) && !src2.is_lval && thumb_is_hw_reg(src2_reg))
   {
     exclude_regs |= (1u << src2_reg);
   }
 
-  if (src1_needs_load)
+  if (src1_cached_reg >= 0)
+  {
+    /* Use the cached register directly - no load needed */
+    src1_reg = src1_cached_reg;
+    if (thumb_is_hw_reg(src1_reg))
+      exclude_regs |= (1u << src1_reg);
+  }
+  else if (src1_needs_load)
   {
     src1_alloc = get_scratch_reg_with_save(exclude_regs);
     src1_reg = src1_alloc.reg;
@@ -3633,7 +4462,12 @@ static void thumb_emit_data_processing_op32(IROperand src1, IROperand src2, IROp
       exclude_regs |= (1u << src1_reg);
   }
 
-  if (src2_is_imm)
+  if (src2_cached_reg >= 0)
+  {
+    /* Use the cached register directly - no load needed */
+    src2_reg = src2_cached_reg;
+  }
+  else if (src2_is_imm)
   {
     /* Try immediate form first; if it doesn't encode, fall back to loading src2. */
     const uint32_t imm_val = (uint32_t)irop_get_imm64_ex(tcc_state->ir, src2);
@@ -3725,14 +4559,27 @@ void tcc_gen_machine_data_processing_op(IROperand src1, IROperand src2, IROperan
     IRQuadCompact *mla_q = &ir_state->compact_instructions[instr_idx];
     IROperand accum = tcc_ir_op_get_accum_inline(ir_state, mla_q);
 
-    int src1_reg = src1.pr0_reg;
-    int src2_reg = src2.pr0_reg;
+    const int src1_reg = src1.pr0_reg;
+    const int src2_reg = src2.pr0_reg;
+    const int dest_reg = dest.pr0_reg;
+
+    /* The accumulator operand may not have pr0_reg set because it was added
+     * to the operand pool during MLA fusion, not during normal IR generation.
+     * We need to resolve its physical register from its live interval. */
     int accum_reg = accum.pr0_reg;
-    int dest_reg = dest.pr0_reg;
+    int32_t accum_vr = irop_get_vreg(accum);
+    if (accum_vr >= 0)
+    {
+      IRLiveInterval *accum_li = tcc_ir_get_live_interval(ir_state, accum_vr);
+      if (accum_li && accum_li->allocation.r0 != PREG_REG_NONE)
+      {
+        accum_reg = accum_li->allocation.r0;
+      }
+    }
 
     /* Ensure all operands are in registers */
-    if (src1_reg == PREG_REG_NONE || src2_reg == PREG_REG_NONE || 
-        accum_reg == PREG_REG_NONE || dest_reg == PREG_REG_NONE)
+    if (src1_reg == PREG_REG_NONE || src2_reg == PREG_REG_NONE || accum_reg == PREG_REG_NONE ||
+        dest_reg == PREG_REG_NONE)
     {
       /* Fallback: emit MUL then ADD */
       /* First emit MUL: dest = src1 * src2 */
@@ -3741,36 +4588,21 @@ void tcc_gen_machine_data_processing_op(IROperand src1, IROperand src2, IROperan
       /* Use th_add_reg if accum is in a register, otherwise th_add_imm */
       if (accum_reg != PREG_REG_NONE)
       {
-        ot_check(th_add_reg((uint32_t)dest_reg, (uint32_t)dest_reg, 
-                            (uint32_t)accum_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, 
+        ot_check(th_add_reg((uint32_t)dest_reg, (uint32_t)dest_reg, (uint32_t)accum_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
                             THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
       }
       else if (irop_is_immediate(accum))
       {
         int64_t imm = irop_get_imm64_ex(ir_state, accum);
-        ot_check(th_add_imm((uint32_t)dest_reg, (uint32_t)dest_reg, 
-                            (uint32_t)imm, FLAGS_BEHAVIOUR_NOT_IMPORTANT, 
+        ot_check(th_add_imm((uint32_t)dest_reg, (uint32_t)dest_reg, (uint32_t)imm, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
                             ENFORCE_ENCODING_NONE));
       }
       return;
     }
 
-    /* Get the physical register for the accumulator from the live interval */
-    /* The accum.pr0_reg might not be set because it's an extra operand */
-    int32_t accum_vr = irop_get_vreg(accum);
-    int accum_phys_reg = accum_reg;
-    IRLiveInterval *accum_li = NULL;
-    if (accum_vr >= 0)
-    {
-      accum_li = tcc_ir_get_live_interval(ir_state, accum_vr);
-      if (accum_li && accum_li->allocation.r0 != PREG_REG_NONE)
-        accum_phys_reg = accum_li->allocation.r0;
-    }
-    
     /* Emit MLA instruction: th_mla(rd, rn, rm, ra) -> rd = rn * rm + ra */
     /* src1 = rn, src2 = rm, accum = ra, dest = rd */
-    ot_check(th_mla((uint32_t)dest_reg, (uint32_t)src1_reg, 
-                    (uint32_t)src2_reg, (uint32_t)accum_phys_reg));
+    ot_check(th_mla((uint32_t)dest_reg, (uint32_t)src1_reg, (uint32_t)src2_reg, (uint32_t)accum_reg));
     return;
   }
   case TCCIR_OP_CMP:
@@ -4351,7 +5183,303 @@ ST_FUNC void tcc_gen_machine_store_op(IROperand dest, IROperand src, TccIrOp op)
     restore_scratch_reg(&scratch_alloc);
 }
 
-ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int stack_size)
+/* Indexed load: dest = *(base + (index << scale))
+ * Generates: LDR dest, [base, index, LSL #scale]
+ */
+ST_FUNC void tcc_gen_machine_load_indexed_op(IROperand dest, IROperand base, IROperand index, IROperand scale)
+{
+  TRACE("'tcc_gen_machine_load_indexed_op'");
+  const char *ctx = "tcc_gen_machine_load_indexed_op";
+
+  int dest_reg = dest.pr0_reg;
+  if (dest_reg == PREG_REG_NONE)
+  {
+    tcc_error("compiler_error: %s requires materialized destination register", ctx);
+    return;
+  }
+
+  /* Get base register - may need to load from literal pool for globals */
+  int base_reg = base.pr0_reg;
+  ScratchRegAlloc base_alloc = {0};
+  if (base_reg == PREG_REG_NONE || base.pr0_spilled || base.is_const || base.is_lval)
+  {
+    base_alloc = get_scratch_reg_with_save(1u << dest_reg);
+    base_reg = base_alloc.reg;
+    load_to_reg_ir(base_reg, PREG_NONE, base);
+  }
+
+  /* Get index register - must be materialized */
+  int index_reg = index.pr0_reg;
+  ScratchRegAlloc index_alloc = {0};
+  if (index_reg == PREG_REG_NONE || index.pr0_spilled || index.is_const || index.is_lval)
+  {
+    uint32_t exclude = (1u << dest_reg) | (1u << base_reg);
+    index_alloc = get_scratch_reg_with_save(exclude);
+    index_reg = index_alloc.reg;
+    load_to_reg_ir(index_reg, PREG_NONE, index);
+  }
+
+  /* Get scale amount */
+  int shift_amount = scale.is_const ? scale.u.imm32 : 2; /* default to 2 (x4) */
+  if (shift_amount < 0 || shift_amount > 31)
+    shift_amount = 2;
+
+  /* Generate: ldr dest, [base, index, LSL #shift_amount] */
+  thumb_shift shift = {.type = THUMB_SHIFT_LSL, .value = (uint32_t)shift_amount, .mode = THUMB_SHIFT_IMMEDIATE};
+
+  /* Determine load type based on operand btype */
+  int btype = irop_get_btype(dest);
+
+  if (btype == IROP_BTYPE_INT8)
+  {
+    if (dest.is_unsigned)
+      ot_check(th_ldrb_reg(dest_reg, base_reg, index_reg, shift, ENFORCE_ENCODING_NONE));
+    else
+      ot_check(th_ldrsb_reg(dest_reg, base_reg, index_reg, shift, ENFORCE_ENCODING_NONE));
+  }
+  else if (btype == IROP_BTYPE_INT16)
+  {
+    if (dest.is_unsigned)
+      ot_check(th_ldrh_reg(dest_reg, base_reg, index_reg, shift, ENFORCE_ENCODING_NONE));
+    else
+      ot_check(th_ldrsh_reg(dest_reg, base_reg, index_reg, shift, ENFORCE_ENCODING_NONE));
+  }
+  else
+  {
+    /* Default 32-bit load */
+    ot_check(th_ldr_reg(dest_reg, base_reg, index_reg, shift, ENFORCE_ENCODING_NONE));
+  }
+
+  /* Restore scratch registers */
+  if (index_alloc.saved || index_alloc.reg >= 0)
+    restore_scratch_reg(&index_alloc);
+  if (base_alloc.saved || base_alloc.reg >= 0)
+    restore_scratch_reg(&base_alloc);
+}
+
+/* Indexed store: *(base + (index << scale)) = value
+ * Generates: STR value, [base, index, LSL #scale]
+ */
+ST_FUNC void tcc_gen_machine_store_indexed_op(IROperand base, IROperand index, IROperand scale, IROperand value)
+{
+  TRACE("'tcc_gen_machine_store_indexed_op'");
+
+  /* Get value register */
+  int value_reg = value.pr0_reg;
+  ScratchRegAlloc value_alloc = {0};
+  if (value_reg == PREG_REG_NONE || value.pr0_spilled || value.is_const || value.is_lval)
+  {
+    value_alloc = get_scratch_reg_with_save(0);
+    value_reg = value_alloc.reg;
+    load_to_reg_ir(value_reg, PREG_NONE, value);
+  }
+
+  /* Get base register */
+  int base_reg = base.pr0_reg;
+  ScratchRegAlloc base_alloc = {0};
+  if (base_reg == PREG_REG_NONE || base.pr0_spilled || base.is_const || base.is_lval)
+  {
+    uint32_t exclude = (1u << value_reg);
+    base_alloc = get_scratch_reg_with_save(exclude);
+    base_reg = base_alloc.reg;
+    load_to_reg_ir(base_reg, PREG_NONE, base);
+  }
+
+  /* Get index register */
+  int index_reg = index.pr0_reg;
+  ScratchRegAlloc index_alloc = {0};
+  if (index_reg == PREG_REG_NONE || index.pr0_spilled || index.is_const || index.is_lval)
+  {
+    uint32_t exclude = (1u << value_reg) | (1u << base_reg);
+    index_alloc = get_scratch_reg_with_save(exclude);
+    index_reg = index_alloc.reg;
+    load_to_reg_ir(index_reg, PREG_NONE, index);
+  }
+
+  /* Get scale amount */
+  int shift_amount = scale.is_const ? scale.u.imm32 : 2;
+  if (shift_amount < 0 || shift_amount > 31)
+    shift_amount = 2;
+
+  /* Generate: str value, [base, index, LSL #shift_amount] */
+  thumb_shift shift = {.type = THUMB_SHIFT_LSL, .value = (uint32_t)shift_amount, .mode = THUMB_SHIFT_IMMEDIATE};
+
+  /* Determine store type based on value btype */
+  int btype = irop_get_btype(value);
+
+  if (btype == IROP_BTYPE_INT8)
+  {
+    ot_check(th_strb_reg(value_reg, base_reg, index_reg, shift, ENFORCE_ENCODING_NONE));
+  }
+  else if (btype == IROP_BTYPE_INT16)
+  {
+    ot_check(th_strh_reg(value_reg, base_reg, index_reg, shift, ENFORCE_ENCODING_NONE));
+  }
+  else
+  {
+    /* Default 32-bit store */
+    ot_check(th_str_reg(value_reg, base_reg, index_reg, shift, ENFORCE_ENCODING_NONE));
+  }
+
+  /* Restore scratch registers */
+  if (index_alloc.saved || index_alloc.reg >= 0)
+    restore_scratch_reg(&index_alloc);
+  if (base_alloc.saved || base_alloc.reg >= 0)
+    restore_scratch_reg(&base_alloc);
+  if (value_alloc.saved || value_alloc.reg >= 0)
+    restore_scratch_reg(&value_alloc);
+}
+
+/* Post-increment load: dest = *ptr; ptr += offset
+ * Generates: LDR dest, [ptr], #offset
+ *
+ * puw encoding for post-increment (ARM ARM):
+ * p = 0 (post-indexed), u = 1 (add), w = 1 (writeback) -> puw = 0b011 = 3
+ */
+ST_FUNC void tcc_gen_machine_load_postinc_op(IROperand dest, IROperand ptr, IROperand offset)
+{
+  TRACE("'tcc_gen_machine_load_postinc_op'");
+  const char *ctx = "tcc_gen_machine_load_postinc_op";
+
+  int dest_reg = dest.pr0_reg;
+  if (dest_reg == PREG_REG_NONE)
+  {
+    tcc_error("compiler_error: %s requires materialized destination register", ctx);
+    return;
+  }
+
+  /* Get pointer register - this register will be updated */
+  int ptr_reg = ptr.pr0_reg;
+  ScratchRegAlloc ptr_alloc = {0};
+  if (ptr_reg == PREG_REG_NONE || ptr.pr0_spilled || ptr.is_const || ptr.is_lval)
+  {
+    /* Pointer must be in a register for post-increment */
+    uint32_t exclude = (1u << dest_reg);
+    ptr_alloc = get_scratch_reg_with_save(exclude);
+    ptr_reg = ptr_alloc.reg;
+    load_to_reg_ir(ptr_reg, PREG_NONE, ptr);
+  }
+
+  /* Get offset - must be 0-255 for 32-bit encoding with puw */
+  int offset_imm = offset.is_const ? offset.u.imm32 : 4; /* default to 4 (int size) */
+
+  /* If offset is outside valid range, we can't use post-increment encoding.
+   * This is a limitation of the current implementation - we would need to
+   * emit separate load + add instructions for large offsets. */
+  if (offset_imm < 0 || offset_imm > 255)
+  {
+    /* Clean up and return - the IR should not have created this case */
+    if (ptr_alloc.saved || ptr_alloc.reg >= 0)
+      restore_scratch_reg(&ptr_alloc);
+    tcc_error("compiler_error: post-increment offset %d out of range (0-255)", offset_imm);
+    return;
+  }
+
+  /* Determine load type based on operand btype */
+  int btype = irop_get_btype(dest);
+
+  /* puw = 3 for post-increment (p=0, u=1, w=1) */
+  uint32_t puw = 3;
+
+  if (btype == IROP_BTYPE_INT8)
+  {
+    if (dest.is_unsigned)
+      ot_check(th_ldrb_imm(dest_reg, ptr_reg, offset_imm, puw, ENFORCE_ENCODING_NONE));
+    else
+      ot_check(th_ldrsb_imm(dest_reg, ptr_reg, offset_imm, puw, ENFORCE_ENCODING_NONE));
+  }
+  else if (btype == IROP_BTYPE_INT16)
+  {
+    if (dest.is_unsigned)
+      ot_check(th_ldrh_imm(dest_reg, ptr_reg, offset_imm, puw, ENFORCE_ENCODING_NONE));
+    else
+      ot_check(th_ldrsh_imm(dest_reg, ptr_reg, offset_imm, puw, ENFORCE_ENCODING_NONE));
+  }
+  else
+  {
+    /* Default 32-bit load with post-increment */
+    ot_check(th_ldr_imm(dest_reg, ptr_reg, offset_imm, puw, ENFORCE_ENCODING_NONE));
+  }
+
+  /* Restore scratch register if we allocated one for pointer */
+  if (ptr_alloc.saved || ptr_alloc.reg >= 0)
+    restore_scratch_reg(&ptr_alloc);
+}
+
+/* Post-increment store: *ptr = value; ptr += offset
+ * Generates: STR value, [ptr], #offset
+ *
+ * puw encoding for post-increment (ARM ARM):
+ * p = 0 (post-indexed), u = 1 (add), w = 1 (writeback) -> puw = 0b011 = 3
+ */
+ST_FUNC void tcc_gen_machine_store_postinc_op(IROperand ptr, IROperand value, IROperand offset)
+{
+  TRACE("'tcc_gen_machine_store_postinc_op'");
+
+  /* Get value register */
+  int value_reg = value.pr0_reg;
+  ScratchRegAlloc value_alloc = {0};
+  if (value_reg == PREG_REG_NONE || value.pr0_spilled || value.is_const || value.is_lval)
+  {
+    value_alloc = get_scratch_reg_with_save(0);
+    value_reg = value_alloc.reg;
+    load_to_reg_ir(value_reg, PREG_NONE, value);
+  }
+
+  /* Get pointer register - this register will be updated */
+  int ptr_reg = ptr.pr0_reg;
+  ScratchRegAlloc ptr_alloc = {0};
+  if (ptr_reg == PREG_REG_NONE || ptr.pr0_spilled || ptr.is_const || ptr.is_lval)
+  {
+    uint32_t exclude = (1u << value_reg);
+    ptr_alloc = get_scratch_reg_with_save(exclude);
+    ptr_reg = ptr_alloc.reg;
+    load_to_reg_ir(ptr_reg, PREG_NONE, ptr);
+  }
+
+  /* Get offset - must be 0-255 for 32-bit encoding with puw */
+  int offset_imm = offset.is_const ? offset.u.imm32 : 4; /* default to 4 (int size) */
+
+  /* If offset is outside valid range, we can't use post-increment encoding. */
+  if (offset_imm < 0 || offset_imm > 255)
+  {
+    /* Clean up and return - the IR should not have created this case */
+    if (ptr_alloc.saved || ptr_alloc.reg >= 0)
+      restore_scratch_reg(&ptr_alloc);
+    if (value_alloc.saved || value_alloc.reg >= 0)
+      restore_scratch_reg(&value_alloc);
+    tcc_error("compiler_error: post-increment offset %d out of range (0-255)", offset_imm);
+    return;
+  }
+
+  /* Determine store type based on value btype */
+  int btype = irop_get_btype(value);
+
+  /* puw = 3 for post-increment (p=0, u=1, w=1) */
+  uint32_t puw = 3;
+
+  if (btype == IROP_BTYPE_INT8)
+  {
+    ot_check(th_strb_imm(value_reg, ptr_reg, offset_imm, puw, ENFORCE_ENCODING_NONE));
+  }
+  else if (btype == IROP_BTYPE_INT16)
+  {
+    ot_check(th_strh_imm(value_reg, ptr_reg, offset_imm, puw, ENFORCE_ENCODING_NONE));
+  }
+  else
+  {
+    /* Default 32-bit store with post-increment */
+    ot_check(th_str_imm(value_reg, ptr_reg, offset_imm, puw, ENFORCE_ENCODING_NONE));
+  }
+
+  /* Restore scratch registers */
+  if (ptr_alloc.saved || ptr_alloc.reg >= 0)
+    restore_scratch_reg(&ptr_alloc);
+  if (value_alloc.saved || value_alloc.reg >= 0)
+    restore_scratch_reg(&value_alloc);
+}
+
+ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int stack_size, uint32_t extra_prologue_regs)
 {
   thumb_gen_state.function_argument_count = 0;
   /* call_id -1 is reserved for function prolog metadata - but that doesn't
@@ -4372,6 +5500,16 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
   {
     registers_to_push |= (1 << R_LR);
     registers_count++;
+  }
+
+  /* Add extra registers discovered during dry-run (e.g., LR in leaf functions) */
+  if (extra_prologue_regs & (1u << R_LR))
+  {
+    if (!(registers_to_push & (1u << R_LR)))
+    {
+      registers_to_push |= (1u << R_LR);
+      registers_count++;
+    }
   }
 
   /* Variadic functions need a stable FP for va_list setup. */
@@ -5080,17 +6218,22 @@ static void gcall_or_jump_ir(int is_jmp, IROperand dest)
       sym = symref ? symref->sym : NULL;
       addend = symref ? symref->addend : 0;
       validated_sym = sym ? validate_sym_for_reloc(sym) : NULL;
-      /* If symbol is not yet registered, try to externalize it so relocation works.
-       * This mirrors load_full_const() behavior for literal pools. */
-      if (sym && !validated_sym && !(sym->v & SYM_FIELD))
+      /* During dry-run, skip symbol registration and relocation setup.
+       * We only need to track scratch register usage, not create actual relocations. */
+      if (!dry_run_state.active)
       {
-        put_extern_sym(sym, NULL, 0, 0);
-        validated_sym = validate_sym_for_reloc(sym);
+        /* If symbol is not yet registered, try to externalize it so relocation works.
+         * This mirrors load_full_const() behavior for literal pools. */
+        if (sym && !validated_sym && !(sym->v & SYM_FIELD))
+        {
+          put_extern_sym(sym, NULL, 0, 0);
+          validated_sym = validate_sym_for_reloc(sym);
+        }
+        /* Preserve legacy behavior: if a symbol exists, emit relocation even if
+         * validation failed (e.g. before registration), unless it's a type field. */
+        if (sym && !(sym->v & SYM_FIELD))
+          reloc_sym = validated_sym ? validated_sym : sym;
       }
-      /* Preserve legacy behavior: if a symbol exists, emit relocation even if
-       * validation failed (e.g. before registration), unless it's a type field. */
-      if (sym && !(sym->v & SYM_FIELD))
-        reloc_sym = validated_sym ? validated_sym : sym;
     }
 
     uint32_t imm;
@@ -5112,7 +6255,8 @@ static void gcall_or_jump_ir(int is_jmp, IROperand dest)
     if (imm)
     {
       ot_check(th_bl_t1(imm));
-      if (reloc_sym)
+      /* During dry-run, skip creating relocations */
+      if (!dry_run_state.active && reloc_sym)
       {
         int call_pos = ind - 4; /* th_bl_t1 is always 4 bytes */
         greloc(cur_text_section, reloc_sym, call_pos, R_ARM_THM_JUMP24);
@@ -5983,15 +7127,57 @@ ST_FUNC void tcc_gen_machine_func_call_op(IROperand func_target, IROperand call_
     tcc_free(layout.locs);
 }
 
-ST_FUNC void tcc_gen_machine_jump_op(TccIrOp op)
+ST_FUNC void tcc_gen_machine_jump_op(TccIrOp op, IROperand dest, int ir_idx)
 {
-  ot_check(th_b_t4(0)); // patch me later
+  /* Get target IR index from dest operand (immediate value containing target) */
+  int target_ir = irop_get_imm32(dest);
+
+  if (dry_run_state.active)
+  {
+    /* Record branch for later optimization analysis */
+    branch_opt_record(ir_idx, ind, target_ir, 0); /* 0 = unconditional */
+    /* Emit 32-bit placeholder for code size tracking */
+    ot_check(th_b_t4(0));
+    return;
+  }
+
+  /* Real pass: check if we determined this can be 16-bit */
+  BranchEncoding enc = branch_opt_get_encoding(ir_idx);
+  if (enc == BRANCH_ENC_16BIT)
+  {
+    ot_check(th_b_t2(0)); /* 16-bit placeholder */
+  }
+  else
+  {
+    ot_check(th_b_t4(0)); /* 32-bit placeholder */
+  }
 }
 
-ST_FUNC void tcc_gen_machine_conditional_jump_op(IROperand src, TccIrOp op)
+ST_FUNC void tcc_gen_machine_conditional_jump_op(IROperand src, TccIrOp op, IROperand dest, int ir_idx)
 {
   int cond = mapcc(src.u.imm32);
-  ot_check(th_b_t3(cond, 0)); // patch me later
+  /* Get target IR index from dest operand */
+  int target_ir = irop_get_imm32(dest);
+
+  if (dry_run_state.active)
+  {
+    /* Record branch for later optimization analysis */
+    branch_opt_record(ir_idx, ind, target_ir, 1); /* 1 = conditional */
+    /* Emit 32-bit placeholder for code size tracking */
+    ot_check(th_b_t3(cond, 0));
+    return;
+  }
+
+  /* Real pass: check if we determined this can be 16-bit */
+  BranchEncoding enc = branch_opt_get_encoding(ir_idx);
+  if (enc == BRANCH_ENC_16BIT)
+  {
+    ot_check(th_b_t1(cond, 0)); /* 16-bit conditional */
+  }
+  else
+  {
+    ot_check(th_b_t3(cond, 0)); /* 32-bit conditional */
+  }
 }
 
 ST_FUNC void tcc_gen_machine_setif_op(IROperand dest, IROperand src, TccIrOp op)
@@ -6327,6 +7513,12 @@ ST_FUNC void tcc_gen_machine_func_parameter_op(IROperand src1, IROperand src2, T
   /* FUNCPARAMVOID is a marker for a 0-argument call.
    * Ensure the call site exists, but do not create a fake argument entry. */
   if (op == TCCIR_OP_FUNCPARAMVOID)
+    return;
+
+  /* During dry-run, don't modify the argument list - it causes memory leaks
+   * when we restore the call sites after dry-run. The argument list is not
+   * needed for scratch register tracking anyway. */
+  if (dry_run_state.active)
     return;
 
   /* Expand argument list if needed */

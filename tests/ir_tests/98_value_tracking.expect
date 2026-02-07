@@ -1,0 +1,5 @@
+PASS: test_value_track_sub
+PASS: test_value_track_add
+PASS: test_chained_arithmetic
+PASS: test_conditionals_pattern
+All value tracking tests passed!

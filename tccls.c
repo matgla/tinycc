@@ -27,6 +27,15 @@
 /* Define TCC_LS_DEBUG to enable printing of linear scan state */
 /* #define TCC_LS_DEBUG */
 
+#ifdef TCC_LS_DEBUG
+#include <stdio.h>
+#define LS_DBG(fmt, ...) printf("[LS] " fmt "\n", ##__VA_ARGS__)
+#define LS_DBG_INDENT(indent, fmt, ...) printf("[LS] %*s" fmt "\n", (indent) * 2, "", ##__VA_ARGS__)
+#else
+#define LS_DBG(fmt, ...) ((void)0)
+#define LS_DBG_INDENT(indent, fmt, ...) ((void)0)
+#endif
+
 #define LS_LIVE_INTERVAL_INIT_SIZE 64
 
 /* NOTE:
@@ -40,6 +49,7 @@ static int ls_spill_loc;
 
 void tcc_ls_initialize(LSLiveIntervalState *ls)
 {
+  LS_DBG("Initializing linear scan allocator");
   ls->intervals_size = LS_LIVE_INTERVAL_INIT_SIZE;
   ls->intervals = (LSLiveInterval *)tcc_malloc(sizeof(LSLiveInterval) * ls->intervals_size);
   ls->next_interval_index = 0;
@@ -180,6 +190,32 @@ void tcc_ls_add_live_interval(LSLiveIntervalState *ls, int vreg, int start, int 
                               int reg_type, int lvalue, int precolored_reg)
 {
   LSLiveInterval *interval;
+#ifdef TCC_LS_DEBUG
+  const char *type_str;
+  switch (reg_type)
+  {
+  case LS_REG_TYPE_INT:
+    type_str = "INT";
+    break;
+  case LS_REG_TYPE_FLOAT:
+    type_str = "FLOAT";
+    break;
+  case LS_REG_TYPE_DOUBLE:
+    type_str = "DOUBLE";
+    break;
+  case LS_REG_TYPE_LLONG:
+    type_str = "LLONG";
+    break;
+  case LS_REG_TYPE_DOUBLE_SOFT:
+    type_str = "DOUBLE_SOFT";
+    break;
+  default:
+    type_str = "UNKNOWN";
+    break;
+  }
+  LS_DBG("Adding interval: vreg=%u range=[%d,%d] type=%s crosses_call=%d addrtaken=%d precolored=%d lvalue=%d", vreg,
+         start, end, type_str, crosses_call, addrtaken, precolored_reg, lvalue);
+#endif
 
   if (ls->next_interval_index >= ls->intervals_size)
   {
@@ -466,6 +502,7 @@ void tcc_ls_expire_old_intervals(LSLiveIntervalState *ls, int current_index)
 {
   int removed_intervals = 0;
   LSLiveInterval *current = &ls->intervals[current_index];
+  LS_DBG("  Expiring intervals ending before %d (current active=%d)", current->start, ls->next_active_index);
   static LSLiveInterval dirty = {
       .r0 = 0,
       .r1 = 0,
@@ -488,11 +525,15 @@ void tcc_ls_expire_old_intervals(LSLiveIntervalState *ls, int current_index)
     /* Release registers based on type */
     if (ls->active_set[i]->reg_type == LS_REG_TYPE_FLOAT)
     {
+      LS_DBG("    Releasing float register S%d (vreg=%u ended at %d)", LS_VFP_REG_NUM(ls->active_set[i]->r0),
+             ls->active_set[i]->vreg, ls->active_set[i]->end);
       tcc_ls_release_float_register(ls, ls->active_set[i]->r0);
     }
     else if (ls->active_set[i]->reg_type == LS_REG_TYPE_DOUBLE)
     {
       /* VFP double - release both S registers */
+      LS_DBG("    Releasing double registers S%d:S%d (vreg=%u ended at %d)", LS_VFP_REG_NUM(ls->active_set[i]->r0),
+             LS_VFP_REG_NUM(ls->active_set[i]->r1), ls->active_set[i]->vreg, ls->active_set[i]->end);
       tcc_ls_release_float_register(ls, ls->active_set[i]->r0);
       if (ls->active_set[i]->r1 >= 0)
       {
@@ -502,6 +543,17 @@ void tcc_ls_expire_old_intervals(LSLiveIntervalState *ls, int current_index)
     else
     {
       /* Integer types (INT, LLONG, DOUBLE_SOFT) */
+      if (ls->active_set[i]->r1 >= 0 &&
+          (ls->active_set[i]->reg_type == LS_REG_TYPE_LLONG || ls->active_set[i]->reg_type == LS_REG_TYPE_DOUBLE_SOFT))
+      {
+        LS_DBG("    Releasing register pair R%d:R%d (vreg=%u ended at %d)", ls->active_set[i]->r0,
+               ls->active_set[i]->r1, ls->active_set[i]->vreg, ls->active_set[i]->end);
+      }
+      else
+      {
+        LS_DBG("    Releasing register R%d (vreg=%u ended at %d)", ls->active_set[i]->r0, ls->active_set[i]->vreg,
+               ls->active_set[i]->end);
+      }
       tcc_ls_release_register(ls, ls->active_set[i]->r0);
       /* Release second register for 64-bit types */
       if (ls->active_set[i]->r1 >= 0 &&
@@ -515,6 +567,10 @@ void tcc_ls_expire_old_intervals(LSLiveIntervalState *ls, int current_index)
   }
   qsort(ls->active_set, ls->next_active_index, sizeof(LSLiveInterval *), sort_endpoints);
   ls->next_active_index -= removed_intervals;
+  if (removed_intervals > 0)
+  {
+    LS_DBG("  Expired %d intervals, %d remain active", removed_intervals, ls->next_active_index);
+  }
 }
 
 void tcc_ls_mark_register_as_used(LSLiveIntervalState *ls, int reg)
@@ -601,10 +657,12 @@ void tcc_ls_compact_stack_locations(LSLiveIntervalState *ls, int spill_base)
 void tcc_ls_spill_interval_sized(LSLiveIntervalState *ls, int interval_index, int size)
 {
   LSLiveInterval *interval = &ls->intervals[interval_index];
+  LS_DBG("  Spilling interval vreg=%u: trying to find register by spilling another", interval->vreg);
   /* If no active intervals, just spill to stack */
   if (ls->next_active_index == 0)
   {
     interval->stack_location = tcc_ls_next_stack_location_sized(size);
+    LS_DBG("    No active intervals, spilled to stack at %d", (int)interval->stack_location);
     return;
   }
   LSLiveInterval *spill = ls->active_set[ls->next_active_index - 1];
@@ -616,17 +674,32 @@ void tcc_ls_spill_interval_sized(LSLiveIntervalState *ls, int interval_index, in
   int needs_pair = (size == 8);
   if (spill->end > interval->end && spill->r0 >= 0 && spill->stack_location == 0 && (!needs_pair || spill_has_pair))
   {
+    LS_DBG("    Stealing register%s from vreg=%u (lives longer to %d) -> spilled to %d", needs_pair ? " pair" : "",
+           spill->vreg, spill->end, (int)tcc_ls_next_stack_location_sized(tcc_ls_reg_type_stack_size(spill->reg_type)));
     interval->r0 = spill->r0;
     interval->r1 = spill->r1;
     spill->r0 = -1; /* Clear register from spilled interval */
     spill->r1 = -1;
     spill->stack_location = tcc_ls_next_stack_location_sized(tcc_ls_reg_type_stack_size(spill->reg_type));
+    if (needs_pair)
+    {
+      LS_DBG("    Got register pair R%d:R%d", interval->r0, interval->r1);
+    }
+    else if (interval->reg_type == LS_REG_TYPE_FLOAT || interval->reg_type == LS_REG_TYPE_DOUBLE)
+    {
+      LS_DBG("    Got float register S%d", LS_VFP_REG_NUM(interval->r0));
+    }
+    else
+    {
+      LS_DBG("    Got register R%d", interval->r0);
+    }
     ls->active_set[ls->next_active_index - 1] = interval;
     qsort(ls->active_set, ls->next_active_index, sizeof(LSLiveInterval *), sort_endpoints);
   }
   else
   {
     interval->stack_location = tcc_ls_next_stack_location_sized(size);
+    LS_DBG("    Spilled to stack at %d", (int)interval->stack_location);
   }
 }
 
@@ -635,9 +708,19 @@ void tcc_ls_spill_interval(LSLiveIntervalState *ls, int interval_index)
   tcc_ls_spill_interval_sized(ls, interval_index, 4);
 }
 
+#ifdef TCC_LS_DEBUG
+static void tcc_ls_print_intervals(LSLiveIntervalState *ls);
+#endif
+
 void tcc_ls_allocate_registers(LSLiveIntervalState *ls, int used_parameters_registers,
                                int used_float_parameters_registers, int spill_base)
 {
+  LS_DBG("=== Starting register allocation ===");
+  LS_DBG("Parameters: used_param_regs=%d used_float_param_regs=%d spill_base=%d", used_parameters_registers,
+         used_float_parameters_registers, spill_base);
+  LS_DBG("Available integer registers: 0x%llx", (unsigned long long)tcc_state->registers_map_for_allocator);
+  LS_DBG("Available float registers: 0x%llx", (unsigned long long)tcc_state->float_registers_map_for_allocator);
+
   /* Reset spill cursor for this allocation run.
    * Start below the frontend-allocated locals so spill slots do not overlap
    * local variables (which would corrupt things like function-pointer tables
@@ -655,6 +738,8 @@ void tcc_ls_allocate_registers(LSLiveIntervalState *ls, int used_parameters_regi
   ls->dirty_float_registers = 0;
   ls->registers_map = tcc_state->registers_map_for_allocator;
   ls->float_registers_map = tcc_state->float_registers_map_for_allocator;
+  LS_DBG("Initial integer register map: 0x%llx", (unsigned long long)ls->registers_map);
+  LS_DBG("Initial float register map: 0x%llx", (unsigned long long)ls->float_registers_map);
 
   /* R11 is available for normal allocation, but reserved during call argument processing.
    * R12 (IP) is the standard inter-procedure scratch register. */
@@ -669,18 +754,25 @@ void tcc_ls_allocate_registers(LSLiveIntervalState *ls, int used_parameters_regi
    */
   for (int i = 0; i < used_float_parameters_registers; ++i)
   {
+    LS_DBG("Marking float parameter register S%d as used", i);
     tcc_ls_mark_float_register_as_used(ls, i);
   }
   qsort(ls->intervals, ls->next_interval_index, sizeof(LSLiveInterval), sort_startpoints);
+  LS_DBG("Sorted %d intervals by start point", ls->next_interval_index);
   for (int i = 0; i < ls->next_interval_index; ++i)
   {
+    LS_DBG("--- Processing interval %d/%d: vreg=%u range=[%d,%d] ---", i, ls->next_interval_index,
+           ls->intervals[i].vreg, ls->intervals[i].start, ls->intervals[i].end);
     tcc_ls_expire_old_intervals(ls, i);
+    LS_DBG("After expire: active_set size=%d, available int regs=0x%llx, available float regs=0x%llx",
+           ls->next_active_index, (unsigned long long)ls->registers_map, (unsigned long long)ls->float_registers_map);
 
     /* Variables whose address is taken must be on the stack */
     if (ls->intervals[i].addrtaken)
     {
       ls->intervals[i].stack_location =
           tcc_ls_next_stack_location_sized(tcc_ls_reg_type_stack_size(ls->intervals[i].reg_type));
+      LS_DBG("  Address-taken variable -> spilled to stack at %d", (int)ls->intervals[i].stack_location);
       ls->active_set[ls->next_active_index++] = &ls->intervals[i];
       qsort(ls->active_set, ls->next_active_index, sizeof(LSLiveInterval *), sort_endpoints);
       continue;
@@ -703,6 +795,7 @@ void tcc_ls_allocate_registers(LSLiveIntervalState *ls, int used_parameters_regi
       {
         /* For floats crossing calls, all S0-S15 are caller-saved anyway */
         ls->intervals[i].r0 = tcc_ls_assign_any_float_register(ls);
+        LS_DBG("  Assigned float register S%d (any)", LS_VFP_REG_NUM(ls->intervals[i].r0));
       }
       else
       {
@@ -711,10 +804,12 @@ void tcc_ls_allocate_registers(LSLiveIntervalState *ls, int used_parameters_regi
         int vfp_idx = LS_IS_VFP_REG(ls->intervals[i].r0) ? LS_VFP_REG_NUM(ls->intervals[i].r0) : ls->intervals[i].r0;
         int assigned = tcc_ls_assign_float_register(ls, vfp_idx);
         ls->intervals[i].r0 = (assigned >= 0) ? LS_VFP_REG_BASE + assigned : -1;
+        LS_DBG("  Assigned precolored float register S%d (requested S%d)", assigned, vfp_idx);
       }
       if (ls->intervals[i].r0 == -1)
       {
         /* Spill to stack */
+        LS_DBG("  No float register available, spilling to stack");
         tcc_ls_spill_interval(ls, i);
       }
     }
@@ -783,6 +878,7 @@ void tcc_ls_allocate_registers(LSLiveIntervalState *ls, int used_parameters_regi
       if (ls->intervals[i].r0 == -1 || ls->intervals[i].r1 == -1)
       {
         /* Couldn't allocate pair - spill to stack */
+        LS_DBG("  Could not allocate register pair, spilling to stack");
         /* Release any partially allocated register */
         if (ls->intervals[i].r0 >= 0)
         {
@@ -796,6 +892,11 @@ void tcc_ls_allocate_registers(LSLiveIntervalState *ls, int used_parameters_regi
         }
         tcc_ls_spill_interval_sized(ls, i, 8); /* 64-bit = 8 bytes */
       }
+      else
+      {
+        LS_DBG("  Assigned register pair R%d:R%d%s", ls->intervals[i].r0, ls->intervals[i].r1,
+               ls->intervals[i].crosses_call ? " (callee-saved)" : "");
+      }
     }
     else
     {
@@ -808,20 +909,39 @@ void tcc_ls_allocate_registers(LSLiveIntervalState *ls, int used_parameters_regi
         if (ls->intervals[i].crosses_call)
         {
           ls->intervals[i].r0 = tcc_ls_assign_callee_saved_register(ls);
+          if (ls->intervals[i].r0 != -1)
+          {
+            LS_DBG("  Assigned callee-saved register R%d", ls->intervals[i].r0);
+          }
         }
         else
         {
           ls->intervals[i].r0 = tcc_ls_assign_any_register(ls);
+          if (ls->intervals[i].r0 != -1)
+          {
+            LS_DBG("  Assigned register R%d", ls->intervals[i].r0);
+          }
         }
       }
       else
       {
+        int precolored = ls->intervals[i].r0;
         ls->intervals[i].r0 = tcc_ls_assign_register(ls, ls->intervals[i].r0);
+        if (ls->intervals[i].r0 != -1)
+        {
+          LS_DBG("  Assigned precolored register R%d", ls->intervals[i].r0);
+        }
+        else
+        {
+          (void)precolored; /* Only used in debug builds */
+          LS_DBG("  Precolored register R%d unavailable, will try spill/allocate", precolored);
+        }
       }
 
       if (ls->intervals[i].r0 == -1)
       {
         // add spilling
+        LS_DBG("  No register available, spilling to stack");
         tcc_ls_spill_interval(ls, i);
       }
     }
@@ -831,6 +951,9 @@ void tcc_ls_allocate_registers(LSLiveIntervalState *ls, int used_parameters_regi
 
 #ifdef TCC_LS_DEBUG
   tcc_ls_print_intervals(ls);
+  LS_DBG("Final dirty registers: int=0x%llx float=0x%llx", (unsigned long long)ls->dirty_registers,
+         (unsigned long long)ls->dirty_float_registers);
+  LS_DBG("=== Register allocation complete ===");
 #endif
 
   /* Build O(1) scratch-reg liveness table for codegen. */
@@ -934,6 +1057,9 @@ int tcc_ls_find_free_scratch_reg(LSLiveIntervalState *ls, int instruction_idx, u
 {
   uint32_t live_regs = exclude_regs;
 
+  LS_DBG("  Finding scratch register at instruction %d (is_leaf=%d)", instruction_idx, is_leaf);
+  LS_DBG("    Exclude regs: 0x%x", exclude_regs);
+
   /* Always exclude SP (R13) */
   live_regs |= (1 << 13);
 
@@ -950,6 +1076,7 @@ int tcc_ls_find_free_scratch_reg(LSLiveIntervalState *ls, int instruction_idx, u
   if (ls->live_regs_by_instruction && instruction_idx >= 0 && instruction_idx < ls->live_regs_by_instruction_size)
   {
     live_regs |= ls->live_regs_by_instruction[instruction_idx];
+    LS_DBG("    Using precomputed liveness: 0x%x", live_regs);
   }
   else
   {
@@ -957,6 +1084,7 @@ int tcc_ls_find_free_scratch_reg(LSLiveIntervalState *ls, int instruction_idx, u
     if (ls->cached_instruction_idx == instruction_idx)
     {
       live_regs |= ls->cached_live_regs;
+      LS_DBG("    Using cached liveness: 0x%x", live_regs);
     }
     else
     {
@@ -964,6 +1092,7 @@ int tcc_ls_find_free_scratch_reg(LSLiveIntervalState *ls, int instruction_idx, u
       ls->cached_instruction_idx = instruction_idx;
       ls->cached_live_regs = computed;
       live_regs |= computed;
+      LS_DBG("    Computed live registers: 0x%x", live_regs);
     }
   }
 
@@ -976,12 +1105,19 @@ int tcc_ls_find_free_scratch_reg(LSLiveIntervalState *ls, int instruction_idx, u
   {
     const uint32_t avail_low = (~live_regs) & 0xFu;
     if (avail_low)
-      return (int)__builtin_ctz(avail_low);
+    {
+      int reg = (int)__builtin_ctz(avail_low);
+      LS_DBG("    Found scratch register R%d (from R0-R3)", reg);
+      return reg;
+    }
   }
 
   /* Then try R12 (IP - inter-procedure scratch) */
   if (!(live_regs & (1u << 12)))
+  {
+    LS_DBG("    Found scratch register R12 (IP)");
     return 12;
+  }
 
   /* IMPORTANT: Do NOT return R11 or any callee-saved register (R4-R10) here!
    * These registers can only be used as scratch if they were already saved
@@ -995,8 +1131,12 @@ int tcc_ls_find_free_scratch_reg(LSLiveIntervalState *ls, int instruction_idx, u
 
   /* Finally try LR if not a leaf function */
   if (!is_leaf && !(live_regs & (1u << 14)))
+  {
+    LS_DBG("    Found scratch register R14 (LR)");
     return 14;
+  }
 
   /* No register available */
+  LS_DBG("    No scratch register available");
   return PREG_NONE;
 }

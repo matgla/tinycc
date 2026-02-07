@@ -427,7 +427,9 @@ struct FuncAttr
       func_dtor : 1,      /* attribute((destructor)) */
       func_args : 8,      /* PE __stdcall args */
       func_alwinl : 1,    /* always_inline */
-      xxxx : 15;
+      func_pure : 1,      /* attribute((pure)) - no side effects, reads memory */
+      func_const : 1,     /* attribute((const)) - no side effects, no memory reads */
+      xxxx : 13;
 };
 
 /* symbol management */
@@ -489,7 +491,7 @@ typedef struct DeferredChunk
   uint32_t size;           /* Size of this chunk */
   uint32_t dest_offset;    /* Offset in destination section */
   struct DeferredChunk *next;
-  int materialized;        /* 1 if this chunk has been loaded */
+  int materialized; /* 1 if this chunk has been loaded */
 } DeferredChunk;
 
 /* section definition */
@@ -816,6 +818,24 @@ struct TCCState
   unsigned char opt_redundant_store; /* -fredundant-store-elim: redundant store elimination */
   unsigned char opt_dead_store;      /* -fdead-store-elim: dead store elimination */
   unsigned char opt_fp_offset_cache; /* -ffp-offset-cache: frame pointer offset caching */
+  unsigned char opt_indexed_memory;  /* -findexed-memory: indexed load/store fusion */
+  unsigned char opt_postinc_fusion;  /* -fpostinc-fusion: post-increment load/store fusion */
+  unsigned char opt_mla_fusion;      /* -fmla-fusion: multiply-accumulate fusion */
+  unsigned char opt_stack_addr_cse;  /* -fstack-addr-cse: stack address CSE */
+  unsigned char opt_licm;            /* -flicm: loop-invariant code motion */
+  unsigned char opt_strength_red;    /* -fstrength-reduce: strength reduction for multiply */
+  unsigned char opt_iv_strength_red; /* -fiv-strength-red: IV strength reduction for array access */
+  unsigned char opt_jump_threading;  /* -fjump-threading: jump threading optimization */
+
+  /* Function purity cache for LICM optimization */
+  /* Cache stores inferred purity for functions in the current translation unit */
+#define FUNC_PURITY_CACHE_SIZE 256
+  struct
+  {
+    int token;  /* Function name token (v field of Sym) */
+    int purity; /* TCC_FUNC_PURITY_* value */
+  } func_purity_cache[FUNC_PURITY_CACHE_SIZE];
+  int func_purity_cache_count;
 
 #ifdef CONFIG_TCC_DEBUG
   /* Debug-only runtime features */
@@ -2007,6 +2027,10 @@ ST_FUNC void tcc_gen_machine_data_processing_op(IROperand src1, IROperand src2, 
 ST_FUNC void tcc_gen_machine_fp_op(IROperand dest, IROperand src1, IROperand src2, TccIrOp op);
 ST_FUNC void tcc_gen_machine_load_op(IROperand dest, IROperand src);
 ST_FUNC void tcc_gen_machine_store_op(IROperand dest, IROperand src, TccIrOp op);
+ST_FUNC void tcc_gen_machine_load_indexed_op(IROperand dest, IROperand base, IROperand index, IROperand scale);
+ST_FUNC void tcc_gen_machine_store_indexed_op(IROperand base, IROperand index, IROperand scale, IROperand value);
+ST_FUNC void tcc_gen_machine_load_postinc_op(IROperand dest, IROperand ptr, IROperand offset);
+ST_FUNC void tcc_gen_machine_store_postinc_op(IROperand ptr, IROperand value, IROperand offset);
 ST_FUNC void tcc_gen_machine_store_to_stack(int reg, int offset);
 ST_FUNC void tcc_gen_machine_store_to_sp(int reg, int offset);
 
@@ -2015,20 +2039,37 @@ ST_FUNC void tcc_gen_machine_lea_op(IROperand dest, IROperand src, TccIrOp op);
 ST_FUNC int tcc_gen_machine_number_of_registers(void);
 ST_FUNC void tcc_gen_machine_return_value_op(IROperand src, TccIrOp op);
 ST_FUNC void tcc_gen_machine_epilog(int leaffunc);
-ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int stack_size);
+ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int stack_size,
+                                    uint32_t extra_prologue_regs);
 ST_FUNC void tcc_gen_machine_func_call_op(IROperand func_target, IROperand call_id, IROperand dest, int drop_value,
                                           TCCIRState *ir, int call_idx);
 ST_FUNC int tcc_gen_machine_abi_assign_call_args(const TCCAbiArgDesc *args, int argc, TCCAbiCallLayout *out_layout);
 ST_FUNC void tcc_gen_machine_save_call_context(void);
 ST_FUNC void tcc_gen_machine_restore_call_context(void);
-ST_FUNC void tcc_gen_machine_jump_op(TccIrOp op);
-ST_FUNC void tcc_gen_machine_conditional_jump_op(IROperand src, TccIrOp op);
+ST_FUNC void tcc_gen_machine_jump_op(TccIrOp op, IROperand dest, int ir_idx);
+ST_FUNC void tcc_gen_machine_conditional_jump_op(IROperand src, TccIrOp op, IROperand dest, int ir_idx);
 ST_FUNC void tcc_gen_machine_indirect_jump_op(IROperand src1);
+ST_FUNC void tcc_gen_machine_switch_table_op(IROperand src1, struct TCCIRSwitchTable *table, struct TCCIRState *ir,
+                                             int ir_idx);
 ST_FUNC void tcc_gen_machine_setif_op(IROperand dest, IROperand src, TccIrOp op);
 ST_FUNC void tcc_gen_machine_bool_op(IROperand dest, IROperand src1, IROperand src2, TccIrOp op);
 ST_FUNC void tcc_gen_machine_backpatch_jump(int address, int offset);
 ST_FUNC void tcc_gen_machine_end_instruction(void);
+
+/* Dry-run code generation interface for two-pass optimization */
+ST_FUNC void tcc_gen_machine_dry_run_init(void);
+ST_FUNC void tcc_gen_machine_dry_run_start(void);
+ST_FUNC void tcc_gen_machine_dry_run_end(void);
+ST_FUNC int tcc_gen_machine_dry_run_get_lr_push_count(void);
+ST_FUNC uint32_t tcc_gen_machine_dry_run_get_scratch_regs_pushed(void);
+ST_FUNC void tcc_gen_machine_reset_scratch_state(void);
+ST_FUNC int tcc_gen_machine_dry_run_is_active(void);
 ST_FUNC void tcc_gen_machine_func_parameter_op(IROperand src1, IROperand src2, TccIrOp op);
+
+/* Branch optimization interface */
+ST_FUNC void tcc_gen_machine_branch_opt_init(void);
+ST_FUNC void tcc_gen_machine_branch_opt_analyze(uint32_t *ir_to_code_mapping, int mapping_size);
+ST_FUNC int tcc_gen_machine_branch_opt_get_encoding(int ir_index); /* Returns 16 or 32 */
 
 /* VLA / dynamic stack operations */
 ST_FUNC void tcc_gen_machine_vla_op(IROperand dest, IROperand src1, IROperand src2, TccIrOp op);
