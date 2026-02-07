@@ -23,6 +23,7 @@ RUN apt-get update && apt-get install -y \
     libnewlib-arm-none-eabi \
     libstdc++-arm-none-eabi-newlib \
     gdb-multiarch \
+    texinfo \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
