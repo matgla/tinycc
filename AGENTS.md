@@ -134,6 +134,65 @@ make install
 - `libtcc1-fp-*.a` - Floating point libraries for different FPU configs
 - `libtcc.a` or `libtcc.so` - Library version of compiler
 
+### Docker Environment
+
+A Dockerfile is provided for a reproducible build environment with all dependencies pre-installed. The CI workflow also uses this Dockerfile for consistent testing.
+
+**Build the container image using Make:**
+```bash
+# Build with default settings (localhost/tinycc-armv8m:latest)
+make container-build
+
+# Build for GitHub Container Registry (GHCR)
+make container-build DOCKER_REGISTRY=ghcr.io DOCKER_IMAGE_NAME=yourusername/tinycc-armv8m
+
+# Build for Docker Hub
+make container-build DOCKER_REGISTRY=docker.io DOCKER_IMAGE_NAME=yourusername/tinycc-armv8m
+```
+
+**Push the container image to registry:**
+```bash
+# Push to GitHub Container Registry (must be logged in: docker/podman login ghcr.io)
+make container-push DOCKER_REGISTRY=ghcr.io DOCKER_IMAGE_NAME=yourusername/tinycc-armv8m
+
+# Push to Docker Hub (must be logged in: docker/podman login docker.io)
+make container-push DOCKER_REGISTRY=docker.io DOCKER_IMAGE_NAME=yourusername/tinycc-armv8m
+```
+
+**Examples:**
+```bash
+# Build and push to GHCR for this repo (moby/tinycc)
+make container-push DOCKER_REGISTRY=ghcr.io DOCKER_IMAGE_NAME=moby/tinycc-armv8m DOCKER_IMAGE_TAG=v1.0
+
+# Build and push to Docker Hub
+make container-push DOCKER_REGISTRY=docker.io DOCKER_IMAGE_NAME=myuser/tinycc-armv8m DOCKER_IMAGE_TAG=latest
+```
+
+**Legacy aliases:** `make docker-build` and `make docker-push` also work.
+
+**Manual Docker usage:**
+```bash
+# Build manually
+docker build -t tinycc-armv8m .
+
+# Interactive shell
+docker run -it --rm -v $(pwd):/workspace tinycc-armv8m
+
+# Run tests directly
+docker run --rm -v $(pwd):/workspace tinycc-armv8m bash -c "\
+  virtualenv .venv && \
+  source .venv/bin/activate && \
+  make test -j$(nproc)"
+```
+
+**Docker image includes:**
+- Ubuntu 24.04 base
+- GCC, G++, Make, Git
+- Python 3 with virtualenv support
+- ARM cross-compilation toolchain (`gcc-arm-none-eabi`)
+- QEMU user-mode for ARM emulation
+- GDB multi-arch for debugging
+
 ## Testing
 
 ### Test Structure

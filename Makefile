@@ -538,6 +538,39 @@ distclean: clean
 
 .PHONY: all cross fp-libs clean test test-aeabi-host test-legacy tar tags ETAGS doc distclean install uninstall FORCE
 
+# Container image settings (auto-detect docker or podman)
+# For GHCR: set DOCKER_REGISTRY=ghcr.io and DOCKER_IMAGE_NAME=username/repo
+DOCKER_REGISTRY ?= localhost
+DOCKER_IMAGE_NAME ?= tinycc-armv8m
+DOCKER_IMAGE_TAG ?= latest
+DOCKER_FULL_IMAGE = $(DOCKER_REGISTRY)/$(DOCKER_IMAGE_NAME):$(DOCKER_IMAGE_TAG)
+
+# Detect available container runtime (prefer podman, fallback to docker)
+CONTAINER_RUNTIME := $(shell command -v podman 2>/dev/null || command -v docker 2>/dev/null)
+ifeq ($(CONTAINER_RUNTIME),)
+  $(warning No container runtime found. Please install docker or podman.)
+endif
+
+container-build:
+ifeq ($(CONTAINER_RUNTIME),)
+	$(error No container runtime found. Please install docker or podman.)
+else
+	@echo "Building container image with $(CONTAINER_RUNTIME): $(DOCKER_FULL_IMAGE)"
+	$(CONTAINER_RUNTIME) build -t $(DOCKER_FULL_IMAGE) .
+endif
+
+container-push: container-build
+ifeq ($(CONTAINER_RUNTIME),)
+	$(error No container runtime found. Please install docker or podman.)
+else
+	@echo "Pushing container image with $(CONTAINER_RUNTIME): $(DOCKER_FULL_IMAGE)"
+	$(CONTAINER_RUNTIME) push $(DOCKER_FULL_IMAGE)
+endif
+
+# Legacy aliases for backwards compatibility
+docker-build: container-build
+docker-push: container-push
+
 help:
 	@echo "make"
 	@echo "   build native compiler (from separate objects)"
@@ -563,6 +596,12 @@ help:
 	@echo "   run tests with the installed tcc"
 	@echo "Other supported make targets:"
 	@echo "   install install-strip uninstall doc [dist]clean tags ETAGS tar help"
+	@echo "   container-build"
+	@echo "      build container image (auto-detects docker/podman)"
+	@echo "   container-push"
+	@echo "      build and push container image to registry"
+	@echo "   docker-build (legacy alias)"
+	@echo "   docker-push (legacy alias)"
 	@echo "Custom configuration:"
 	@echo "   The makefile includes a file 'config-extra.mak' if it is present."
 	@echo "   This file may contain some custom configuration.  For example to"
