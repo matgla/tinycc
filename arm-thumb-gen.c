@@ -705,9 +705,10 @@ static ScratchRegAlloc get_scratch_reg_with_save(uint32_t exclude_regs)
   }
 
   int reg_to_save = -1;
+  int lr_saved_in_prologue = 0;
 no_free_reg:
   /* lr_saved_in_prologue needs to be computed here to satisfy compiler flow analysis */
-  int lr_saved_in_prologue = (pushed_registers & (1u << R_LR)) ? 1 : 0;
+  lr_saved_in_prologue = (pushed_registers & (1u << R_LR)) ? 1 : 0;
 
   /* In non-leaf functions OR when LR was pushed in prologue (e.g., due to dry-run
    * discovering it would be needed as scratch), LR is already saved.

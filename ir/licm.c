@@ -1983,12 +1983,12 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
    * happen at the VLA allocation point, not in the preheader.
    */
   int hoisted_calls = tcc_ir_hoist_pure_calls(ir, loops);
-
+  (void)hoisted_calls;
   /* Step 3: Hoist other invariant instructions (stack addresses, constants) */
   int hoisted = tcc_ir_hoist_loop_invariants(ir, loops);
-  hoisted += hoisted_calls;
-
+  (void)hoisted;
 #ifdef DEBUG_IR_GEN
+  hoisted += hoisted_calls;
   printf("[LICM] Hoisted %d instruction(s) and %d pure call(s)\n", hoisted - hoisted_calls, hoisted_calls);
 #endif
 
