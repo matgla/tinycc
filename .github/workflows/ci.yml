@@ -19,8 +19,19 @@ jobs:
       - name: Install arm-none-eabi-gcc
         uses: carlosperate/arm-none-eabi-gcc-action@v1
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install virtualenv
+        run: pip install virtualenv
+
       - name: Configure
         run: ./configure --enable-O2 --enable-asan
 
       - name: Build and test
-        run: make test -j$(nproc)
+        run: |
+          virtualenv .venv
+          source .venv/bin/activate
+          make test -j$(nproc)
