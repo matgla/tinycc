@@ -1,0 +1,4 @@
+PASS: test_fold_modulo
+PASS: test_fold_branch
+PASS: test_nested_fold
+All constant branch folding tests passed!

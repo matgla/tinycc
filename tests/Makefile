@@ -6,6 +6,7 @@ TOP = ..
 include $(TOP)/Makefile
 VPATH = $(TOPSRC)/tests $(TOPSRC)
 CFLAGS := $(filter-out -g% -O%,$(CFLAGS)) -I$(TOPSRC) -I$(TOP) $(LDFLAGS)
+READELF ?= $(shell command -v arm-none-eabi-readelf 2>/dev/null || command -v readelf 2>/dev/null)
 
 # what tests to run
 TESTS = \
@@ -17,6 +18,7 @@ TESTS = \
  abitest \
  asm-c-connect-test \
  vla_test-run \
+ llong_test-run \
  tests2-dir \
  pp-dir \
  memtest \
@@ -52,6 +54,9 @@ ifeq ($(ARCH),arm)
 # of functions via bit masking comes out as 1.  Just disable thumb.
 test.ref: CFLAGS+=-marm
 endif
+ifneq (,$(filter armv8m,$(ARCH)))
+ TESTS += armv8m-ehabi
+endif
 ifeq ($(ARCH)$(CONFIG_WIN32),i386)
 # tcctest.c:get_asm_string uses a construct that is checked too strictly
 # by GCC in 32bit mode when PIC is enabled.
@@ -83,7 +88,22 @@ all test :
 	@$(MAKE) --no-print-directory -s clean
 	@$(MAKE) --no-print-directory -s -r _all
 
+test-prepare:
+	@echo ------------ $@ ------------
+	@cd $(TOPSRC)/tests/ir_tests/qemu/mps2-an505 && sh ./build_newlib.sh
+
 _all : $(TESTS)
+
+armv8m-ehabi:
+	@echo ------------ $@ ------------
+	@if [ -z "$(READELF)" ]; then echo "readelf not found"; exit 1; fi
+	@$(MAKE) --no-print-directory -C $(TOPSRC)/tests/ir_tests/qemu/mps2-an505 \
+		TEST_FILES=$(TOPSRC)/tests/ir_tests/ehabi_unwind_test.c \
+		OUTPUT=$(TOPSRC)/tests/ir_tests/qemu/mps2-an505/build/ehabi_unwind_test \
+		TARGET=$(TOPSRC)/tests/ir_tests/qemu/mps2-an505/build/ehabi_unwind_test/ehabi_unwind_test.elf
+	@$(READELF) -u $(TOPSRC)/tests/ir_tests/qemu/mps2-an505/build/ehabi_unwind_test/ehabi_unwind_test.elf | \
+		grep -q "Unwind section '.ARM.exidx'" || \
+		(echo "Missing .ARM.exidx unwind info"; exit 1)
 
 hello-exe: ../examples/ex1.c
 	@echo ------------ $@ ------------
@@ -272,7 +292,14 @@ vla_test-run: vla_test$(EXESUF)
 	@echo ------------ $@ ------------
 	./vla_test$(EXESUF)
 
-.PHONY: abitest vla_test tccb
+llong_test$(EXESUF): llong_test.c
+	$(TCC) -o $@ $^
+
+llong_test-run: llong_test$(EXESUF)
+	@echo ------------ $@ ------------
+	./llong_test$(EXESUF)
+
+.PHONY: test-prepare abitest vla_test tccb
 
 asm-c-connect$(EXESUF): asm-c-connect-1.c asm-c-connect-2.c
 	$(TCC) -o $@ $^

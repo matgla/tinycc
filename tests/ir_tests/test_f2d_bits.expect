@@ -1,0 +1,5 @@
+Testing __aeabi_f2d (bit check)
+Float bits: 0x3f800000
+Double hi: 0x3ff00000
+Double lo: 0x00000000
+PASS: Double value is correct!

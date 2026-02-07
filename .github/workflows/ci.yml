@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [mob]
+  pull_request:
+    branches: [mob]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: read
+    container:
+      image: ghcr.io/matgla/tinycc-armv8m:latest
+      options: --user root
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure
+        run: ./configure --enable-cross --enable-O2 
+
+      - name: Build and test
+        shell: bash
+        run: |
+          virtualenv .venv
+          source .venv/bin/activate
+          make test -j$(nproc)

@@ -1,0 +1,3 @@
+float_math(1) = 2574
+Expected: 2574
+PASS: Result matches expected

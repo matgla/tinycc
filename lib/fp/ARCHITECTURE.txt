@@ -1,0 +1,249 @@
+/*
+ * TinyCC Floating Point Library Architecture Overview
+ *
+ * This document describes the overall design and component interactions
+ * for the modular floating point support system.
+ */
+
+/**
+ * ARCHITECTURE OVERVIEW
+ * =====================
+ *
+ *                                   TinyCC Compiler
+ *                                         |
+ *                                         v
+ *                          ARM Code Generation (arm-thumb-gen.c)
+ *                                         |
+ *                    +--------------------+--------------------+
+ *                    |                                           |
+ *                    v                                           v
+ *            Integer Operations                      Floating Point Operations
+ *                    |                                           |
+ *                    |                              +------------+--------+
+ *                    |                              |             |       |
+ *                    v                              v             v       v
+ *                  [Built-in]              __aeabi_fadd   __aeabi_dadd  [etc]
+ *                                                  |             |
+ *                                    +--------------+-------------+
+ *                                    |
+ *                              FP Library Selector
+ *                                    |
+ *          +-------+-------+---------+---------+
+ *          |       |       |         |         |
+ *          v       v       v         v         v
+ *        soft  vfpv4-sp vfpv5-dp   rp2350   [future]
+ *
+ */
+
+/**
+ * CONFIGURATION MATRIX
+ * ====================
+ *
+ * Target CPU       | FPU Type      | Library         | Build Flag
+ * -----------------+---------------+-----------------+-------------------
+ * Cortex-M0        | None          | soft            | FPU=soft
+ * Cortex-M0+       | None          | soft            | FPU=soft
+ * Cortex-M3        | None          | soft            | FPU=soft
+ * Cortex-M4        | None          | soft            | FPU=soft
+ * Cortex-M4F       | VFPv4-SP      | vfpv4-sp        | FPU=vfpv4-sp
+ * Cortex-M7        | VFPv5-DP      | vfpv5-dp        | FPU=vfpv5-dp
+ * RP2040           | None          | soft            | FPU=soft
+ * RP2350           | DCP           | rp2350          | FPU=rp2350
+ *
+ */
+
+/**
+ * FUNCTION DISTRIBUTION
+ * =====================
+ *
+ * ARITHMETIC OPERATIONS
+ * ---------------------
+ * __aeabi_fadd(float, float)      -> float
+ * __aeabi_fsub(float, float)      -> float
+ * __aeabi_fmul(float, float)      -> float
+ * __aeabi_fdiv(float, float)      -> float
+ *
+ * __aeabi_dadd(double, double)    -> double
+ * __aeabi_dsub(double, double)    -> double
+ * __aeabi_dmul(double, double)    -> double
+ * __aeabi_ddiv(double, double)    -> double
+ *
+ * COMPARISON OPERATIONS (return CPSR flags)
+ * -----------------------------------------
+ * __aeabi_cfcmple(float, float)   -> flags (float <= ...)
+ * __aeabi_cfcmplt(float, float)   -> flags
+ * __aeabi_cfcmpge(float, float)   -> flags
+ * __aeabi_cfcmpgt(float, float)   -> flags
+ * __aeabi_cfcmpeq(float, float)   -> flags
+ *
+ * __aeabi_cdcmple(double, double) -> flags
+ * __aeabi_cdcmplt(double, double) -> flags
+ * __aeabi_cdcmpge(double, double) -> flags
+ * __aeabi_cdcmpgt(double, double) -> flags
+ * __aeabi_cdcmpeq(double, double) -> flags
+ *
+ * CONVERSION OPERATIONS
+ * --------------------
+ * Integer -> Float
+ *   __aeabi_i2f(int)           -> float
+ *   __aeabi_ui2f(unsigned int) -> float
+ *
+ * Integer -> Double
+ *   __aeabi_i2d(int)           -> double
+ *   __aeabi_ui2d(unsigned int) -> double
+ *
+ * Float -> Integer
+ *   __aeabi_f2iz(float)        -> int (truncate toward zero)
+ *   __aeabi_f2uiz(float)       -> unsigned int
+ *
+ * Double -> Integer
+ *   __aeabi_d2iz(double)       -> int
+ *   __aeabi_d2uiz(double)      -> unsigned int
+ *
+ * Float <-> Double
+ *   __aeabi_f2d(float)         -> double
+ *   __aeabi_d2f(double)        -> float
+ *
+ */
+
+/**
+ * IMPLEMENTATION DISPATCH
+ * =======================
+ *
+ * SOFT FLOAT (soft/)
+ * ------------------
+ * All operations implemented in portable C using bit manipulation:
+ * - Manual exponent and mantissa extraction
+ * - IEEE 754 rounding and special case handling
+ * - Full 80-bit intermediate precision
+ *
+ * Files:
+ * - fadd.c: __aeabi_fadd, __aeabi_fsub
+ * - fmul.c: __aeabi_fmul
+ * - fdiv.c: __aeabi_fdiv
+ * - fcmp.c: __aeabi_cfcmp* functions
+ * - dcmp.c: __aeabi_cdcmp* functions
+ * - conv.c: f2i, i2f, d2i, i2d, f2ui, ui2f, d2ui, ui2d
+ * - fmt.c:  f2d, d2f
+ *
+ * VFPV4-SP (arm/vfpv4-sp/)
+ * -------------------------
+ * Single-precision uses hardware VFP instructions:
+ * - VADD.F32, VSUB.F32, VMUL.F32, VDIV.F32 (arithmetic)
+ * - VCMP.F32, VMRS APSR_NZCV,FPSCR (comparison)
+ * - VCVT.S32.F32, VCVT.F32.S32 (conversions)
+ *
+ * Double-precision delegated to software:
+ * - Soft float library loaded for __aeabi_dadd, etc.
+ *
+ * Files:
+ * - fops.c: Float arithmetic via VFPv4
+ * - fcmp.c: Float comparison via VFPv4
+ * - conv.c: Float conversions via VFPv4
+ * - dops_soft.c: Stubs delegating to software
+ *
+ * VFPV5-DP (arm/vfpv5-dp/)
+ * -------------------------
+ * Both single and double-precision use hardware:
+ * - VADD.F32/F64, VMUL.F32/F64, VDIV.F32/F64
+ * - VCMP.F32/F64, VMRS
+ * - VCVT between all types
+ *
+ * Files:
+ * - ops.c: Float and double arithmetic
+ * - cmp.c: Float and double comparison
+ * - conv.c: All conversions
+ *
+ * RP2350 (arm/rp2350/)
+ * --------------------
+ * Double-precision via coprocessor interface:
+ * - MCR/MCRR to load coprocessor registers
+ * - Coprocessor opcodes for arithmetic
+ * - MRC/MRRC to read results
+ *
+ * Single-precision may use VFPv4 or software:
+ * - Implementation TBD based on CPU capabilities
+ *
+ * Files:
+ * - dcp_init.c: Coprocessor initialization
+ * - dcp_ops.c: Double arithmetic via DCP
+ * - dcp_cmp.c: Double comparison via DCP
+ * - dcp_conv.c: Double conversions via DCP
+ *
+ */
+
+/**
+ * CALLING CONVENTION
+ * ==================
+ *
+ * Soft-float ABI (-mfloat-abi=soft):
+ *   float arg1, arg2 in r0, r1
+ *   double arg in r0:r1, r2:r3
+ *   Return values in r0 (float) or r0:r1 (double)
+ *
+ * Hard-float ABI (-mfloat-abi=hard):
+ *   float arg1, arg2 in s0, s1
+ *   double arg in d0, d1
+ *   Return values in s0 (float) or d0 (double)
+ *
+ * Comparison returns:
+ *   CPSR flags in r0 (N, Z, C, V bits)
+ *   Can be directly consumed by conditional branches
+ *
+ */
+
+/**
+ * COMPILATION FLOW
+ * ================
+ *
+ * 1. User calls: gcc -march=cortex-m7 -mfpu=fpv5-d16 test.c -o test
+ *
+ * 2. TCC detects FPU type and selects library:
+ *    -mfpu=fpv5-d16 -> FPU=vfpv5-dp -> lib/fp/libtcc1-fp-vfpv5-dp-$(TARGET).a
+ *
+ * 3. Code generation emits AEABI function calls:
+ *    float c = a + b;  -> __aeabi_fadd(a, b)
+ *    double d = x * y; -> __aeabi_dmul(x, y)
+ *
+ * 4. Linker resolves symbols:
+ *    __aeabi_fadd -> arm/vfpv5-dp/ops.c:__aeabi_fadd
+ *    (with VADD.F32 instruction)
+ *
+ * 5. Object code execution uses hardware when available
+ *
+ */
+
+/**
+ * TESTING MATRIX
+ * ==============
+ *
+ * Test File              | Float | Double | Comparisons | Conversions
+ * -----------------------+-------+--------+-------------+---
+ * 71_float_simple.c      | YES   |        |             | Basic
+ * 71_double_simple.c     |       | YES    |             | Basic
+ * 72_float_result.c      | YES   |        | YES         | YES
+ * 73_double_printf.c     |       | YES    | YES         | YES
+ * tests/abitest.c        | YES   | YES    | YES         | YES
+ *
+ */
+
+/**
+ * ERROR HANDLING
+ * ==============
+ *
+ * Special Values:
+ *   NaN + anything    -> NaN
+ *   Inf + finite      -> Inf
+ *   0 / 0             -> NaN
+ *   x / 0 (x != 0)    -> Inf
+ *   0 / 0             -> NaN
+ *
+ * Overflow/Underflow:
+ *   Result too large  -> Inf (with sign)
+ *   Result too small  -> 0 (with sign) or denormalized
+ *
+ * Rounding:
+ *   Default: Round-to-Nearest-Even (banker's rounding)
+ *   Per IEEE 754-2008
+ *
+ */

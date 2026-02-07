@@ -163,6 +163,9 @@ DEF(TOK_NODECORATE, "nodecorate")
 DEF(TOK_NORETURN1, "noreturn")
 DEF(TOK_NORETURN2, "__noreturn__")
 DEF(TOK_NORETURN3, "_Noreturn")
+DEF(TOK_PURE1, "pure")
+DEF(TOK_PURE2, "__pure__")
+/* Note: TOK_CONST1/2/3 already defined for const keyword */
 DEF(TOK_VISIBILITY1, "visibility")
 DEF(TOK_VISIBILITY2, "__visibility__")
 
@@ -206,9 +209,8 @@ DEF_ATOMIC(atomic_nand_fetch)
 
 /* pragma */
 DEF(TOK_pack, "pack")
-#if !defined(TCC_TARGET_I386) && !defined(TCC_TARGET_X86_64) &&                \
-    !defined(TCC_TARGET_ARM) && !defined(TCC_TARGET_ARM64) &&                  \
-    !defined(TCC_TARGET_RISCV64)
+#if !defined(TCC_TARGET_I386) && !defined(TCC_TARGET_X86_64) && !defined(TCC_TARGET_ARM) &&                            \
+    !defined(TCC_TARGET_ARM64) && !defined(TCC_TARGET_RISCV64)
 /* already defined for assembler */
 DEF(TOK_ASM_push, "push")
 DEF(TOK_ASM_pop, "pop")
@@ -251,8 +253,12 @@ DEF(TOK_memmove8, "__aeabi_memmove8")
 DEF(TOK_memset, "__aeabi_memset")
 DEF(TOK___aeabi_ldivmod, "__aeabi_ldivmod")
 DEF(TOK___aeabi_uldivmod, "__aeabi_uldivmod")
+DEF(TOK___aeabi_lmod, "__aeabi_lmod")
+DEF(TOK___aeabi_ulmod, "__aeabi_ulmod")
 DEF(TOK___aeabi_idivmod, "__aeabi_idivmod")
 DEF(TOK___aeabi_uidivmod, "__aeabi_uidivmod")
+DEF(TOK___aeabi_lcmp, "__aeabi_lcmp")
+DEF(TOK___aeabi_ulcmp, "__aeabi_ulcmp")
 DEF(TOK___divsi3, "__aeabi_idiv")
 DEF(TOK___udivsi3, "__aeabi_uidiv")
 DEF(TOK___floatdisf, "__aeabi_l2f")
@@ -401,6 +407,8 @@ DEF_ASMDIR(rept)
 DEF_ASMDIR(endr)
 DEF_ASMDIR(org)
 DEF_ASMDIR(quad)
+DEF_ASMDIR(macro)
+DEF_ASMDIR(endm)
 #if defined(TCC_TARGET_I386)
 DEF_ASMDIR(code16)
 DEF_ASMDIR(code32)

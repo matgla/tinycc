@@ -1,0 +1,4 @@
+After 10 multiplications by 10:
+v = 0x00000002540be400
+expect: v = 0x00000002540be400 (10^10 = 10000000000)
+PASS

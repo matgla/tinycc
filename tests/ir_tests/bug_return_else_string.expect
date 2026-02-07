@@ -1,0 +1,17 @@
+Testing return from else block...
+
+get_str_direct:
+  i=0: "WORLD" (expected "WORLD")
+  i=1: "HELLO" (expected "HELLO")
+
+get_str_local:
+  i=0: "WORLD" (expected "WORLD")
+  i=1: "HELLO" (expected "HELLO")
+
+get_str_chain:
+  i=0: "ZERO" (expected "ZERO")
+  i=1: "ONE" (expected "ONE")
+  i=2: "TWO" (expected "TWO")
+  i=3: "OTHER" (expected "OTHER")
+
+PASS

@@ -1,0 +1,26 @@
+Testing nested ternary string selection...
+
+get_status_ternary:
+  status=0: got "PASS", expected "PASS" -> OK
+  status=1: got "FAIL", expected "FAIL" -> OK
+  status=2: got "SKIP", expected "SKIP" -> OK
+  status=3: got "?", expected "?" -> OK
+
+get_status_ifelse:
+  status=0: got "PASS", expected "PASS" -> OK
+  status=1: got "FAIL", expected "FAIL" -> OK
+  status=2: got "SKIP", expected "SKIP" -> OK
+  status=3: got "?", expected "?" -> OK
+
+get_status_local:
+  status=0: got "PASS", expected "PASS" -> OK
+  status=1: got "FAIL", expected "FAIL" -> OK
+  status=2: got "SKIP", expected "SKIP" -> OK
+  status=3: got "?", expected "?" -> OK
+
+get_simple_ternary:
+  val=0: got "ZERO", expected "ZERO" -> OK
+  val=1: got "ONE", expected "ONE" -> OK
+  val=2: got "OTHER", expected "OTHER" -> OK
+
+PASS: All tests passed

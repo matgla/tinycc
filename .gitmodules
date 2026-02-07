@@ -1,3 +1,12 @@
 [submodule "tests/externals/c-testsuite"]
 	path = tests/externals/c-testsuite
 	url = https://github.com/c-testsuite/c-testsuite.git
+[submodule "tests/ir_tests/qemu/mps2-an505/libs/newlib"]
+	path = tests/ir_tests/qemu/mps2-an505/libs/newlib
+	url = https://sourceware.org/git/newlib-cygwin.git
+[submodule "tests/benchmarks/libs/pico-sdk"]
+	path = tests/benchmarks/libs/pico-sdk
+	url = https://github.com/raspberrypi/pico-sdk.git
+[submodule "tests/benchmarks/mibench"]
+	path = tests/benchmarks/mibench
+	url = https://github.com/embecosm/mibench.git

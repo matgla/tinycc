@@ -1,0 +1,13 @@
+Result simple0: '12312'
+Result simple01: -559038737
+Result simple02: -559038736
+Result simple022: -559038727
+Result simple1: 46
+Result simple_stack: 126
+Result simple2: 9
+Result simple3: 50
+Result simple4: 42
+Result simple5: 457
+Result simple2(simple01(), simple02(5)): -1118077469
+Result simple5(...): 144
+Total sum: 1499786813

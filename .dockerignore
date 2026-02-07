@@ -1,0 +1,46 @@
+# Build artifacts
+*.o
+*.a
+*.so
+*.exe
+armv8m-tcc
+armv8m-*/
+
+# Generated config files
+config.h
+config.mak
+config.texi
+
+# Virtual environments
+.venv/
+venv/
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+
+# Test artifacts
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Documentation build artifacts
+*.html
+*.pdf
+
+# Backup files
+*~
+*.swp
+*.swo
+*.bak
+
+# OS files
+.DS_Store
+Thumbs.db

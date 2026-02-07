@@ -20,9 +20,15 @@ LIBTCC = libtcc.a
 LIBTCC1 = libtcc1.a
 LINK_LIBTCC =
 LIBS =
-CFLAGS += $(CPPFLAGS)
-VPATH = $(TOPSRC)
+CFLAGS += $(CPPFLAGS) -std=c11 -Wunused-function -Wno-declaration-after-statement -Werror
+VPATH = $(TOPSRC) $(TOPSRC)/arch
 -LTCC = $(TOP)/$(LIBTCC)
+
+# Enable extra runtime-debug features (not for release builds).
+# This is intentionally controlled by configure's --debug (CONFIG_debug=yes).
+ifeq ($(CONFIG_debug),yes)
+ CFLAGS += -DCONFIG_TCC_DEBUG
+endif
 
 ifdef CONFIG_WIN32
  CFG = -win
@@ -94,31 +100,41 @@ CFLAGS_P = $(CFLAGS) -pg -static -DCONFIG_TCC_STATIC -DTCC_PROFILE
 LIBS_P = $(LIBS)
 LDFLAGS_P = $(LDFLAGS)
 
-DEF-i386           = -DTCC_TARGET_I386
-DEF-i386-win32     = -DTCC_TARGET_I386 -DTCC_TARGET_PE
-DEF-i386-OpenBSD   = $(DEF-i386) -DTARGETOS_OpenBSD
-DEF-x86_64         = -DTCC_TARGET_X86_64
-DEF-x86_64-win32   = -DTCC_TARGET_X86_64 -DTCC_TARGET_PE
-DEF-x86_64-osx     = -DTCC_TARGET_X86_64 -DTCC_TARGET_MACHO
 DEF-arm-fpa        = -DTCC_TARGET_ARM
 DEF-arm-fpa-ld     = -DTCC_TARGET_ARM -DLDOUBLE_SIZE=12
 DEF-arm-vfp        = -DTCC_TARGET_ARM -DTCC_ARM_VFP
 DEF-arm-eabi       = -DTCC_TARGET_ARM -DTCC_ARM_VFP -DTCC_ARM_EABI
 DEF-arm-eabihf     = $(DEF-arm-eabi) -DTCC_ARM_HARDFLOAT
-DEF-arm            = $(DEF-arm-eabihf)
-DEF-arm-NetBSD     = $(DEF-arm-eabihf) -DTARGETOS_NetBSD
-DEF-arm-wince      = $(DEF-arm-eabihf) -DTCC_TARGET_PE
 DEF-armv8m         = $(DEF-arm-eabihf) -DTCC_TARGET_ARM_THUMB -DTCC_TARGET_ARM_ARCHV8M
-DEF-arm64          = -DTCC_TARGET_ARM64
-DEF-arm64-osx      = $(DEF-arm64) -DTCC_TARGET_MACHO
-DEF-arm64-FreeBSD  = $(DEF-arm64) -DTARGETOS_FreeBSD
-DEF-arm64-NetBSD   = $(DEF-arm64) -DTARGETOS_NetBSD
-DEF-arm64-OpenBSD  = $(DEF-arm64) -DTARGETOS_OpenBSD
-DEF-riscv64        = -DTCC_TARGET_RISCV64
-DEF-c67            = -DTCC_TARGET_C67 -w # disable warnigs
-DEF-x86_64-FreeBSD = $(DEF-x86_64) -DTARGETOS_FreeBSD
-DEF-x86_64-NetBSD  = $(DEF-x86_64) -DTARGETOS_NetBSD
-DEF-x86_64-OpenBSD = $(DEF-x86_64) -DTARGETOS_OpenBSD
+
+# --- armv8m libc/include autodetection ---
+# When building the armv8m cross-compiler, default to the Arm GNU Embedded
+# (arm-none-eabi) toolchain's newlib headers/libs so <stdio.h> resolves even
+# on hosts without /usr/include (e.g. macOS).
+ARM_NONE_EABI_GCC ?= arm-none-eabi-gcc
+# Keep aligned with tests/ir_tests/qemu/* Makefiles.
+ARMV8M_GCC_ABI_FLAGS ?= -mcpu=cortex-m33 -mthumb -mfloat-abi=soft
+
+ARMV8M_SYSROOT := $(shell $(ARM_NONE_EABI_GCC) $(ARMV8M_GCC_ABI_FLAGS) --print-sysroot 2>/dev/null)
+ARMV8M_LIBC_A := $(shell $(ARM_NONE_EABI_GCC) $(ARMV8M_GCC_ABI_FLAGS) -print-file-name=libc.a 2>/dev/null)
+ARMV8M_GCC_INCLUDE := $(shell $(ARM_NONE_EABI_GCC) $(ARMV8M_GCC_ABI_FLAGS) -print-file-name=include 2>/dev/null)
+ARMV8M_GCC_INCLUDE_FIXED := $(shell $(ARM_NONE_EABI_GCC) $(ARMV8M_GCC_ABI_FLAGS) -print-file-name=include-fixed 2>/dev/null)
+
+ifneq ($(strip $(ARMV8M_SYSROOT)),)
+INC-armv8m ?= {B}/include:$(ARMV8M_SYSROOT)/include
+endif
+
+ifneq ($(findstring /,$(ARMV8M_GCC_INCLUDE)),)
+INC-armv8m := $(INC-armv8m):$(ARMV8M_GCC_INCLUDE)
+endif
+
+ifneq ($(findstring /,$(ARMV8M_GCC_INCLUDE_FIXED)),)
+INC-armv8m := $(INC-armv8m):$(ARMV8M_GCC_INCLUDE_FIXED)
+endif
+
+ifneq ($(findstring /,$(ARMV8M_LIBC_A)),)
+LIB-armv8m ?= {B}:$(dir $(ARMV8M_LIBC_A))
+endif
 
 ifeq ($(INCLUDED),no)
 # --------------------------------------------------------------------------
@@ -128,16 +144,27 @@ PROGS = tcc$(EXESUF)
 TCCLIBS = $(LIBTCCDEF) $(LIBTCC) $(LIBTCC1)
 TCCDOCS = tcc.1 tcc-doc.html tcc-doc.info
 
-all: $(PROGS) $(TCCLIBS) $(TCCDOCS)
+# all: $(PROGS) $(TCCLIBS) $(TCCDOCS)
 
-# cross compiler targets to build
-#TCC_X = i386 x86_64 i386-win32 x86_64-win32 x86_64-osx arm arm64 arm-wince c67
-# TCC_X += riscv64 arm64-osx
 TCC_X = armv8m
-# TCC_X += arm-fpa arm-fpa-ld arm-vfp arm-eabi
 
 # cross libtcc1.a targets to build
 LIBTCC1_X = $(filter-out c67,$(TCC_X))
+FP_LIBS_STAMP_DIR = $(TOP)/lib/fp/build
+FP_LIBS_SRC_DEPS = $(shell find $(TOP)/lib/fp -type f \( -name 'Makefile' -o -name '*.[chS]' \) -print 2>/dev/null)
+FP_LIBS_CROSS = $(foreach X,$(TCC_X),$(FP_LIBS_STAMP_DIR)/.$X-fp-libs.stamp)
+
+# Checksum utility for detecting compiler changes
+CHECKSUM_CMD = $(shell command -v sha256sum 2>/dev/null || command -v md5sum 2>/dev/null || echo "")
+
+# When TinyCC itself is built with ASan, leak detection (LSan) may cause
+# the compiler process to exit non-zero on teardown, breaking recursive
+# builds that invoke the freshly built compiler (e.g. fp-libs).
+# Disable leak detection for those nested invocations so the build can
+# proceed while still keeping ASan instrumentation.
+ifeq ($(CONFIG_asan),yes)
+SAN_ENV = LSAN_OPTIONS=detect_leaks=0 ASAN_OPTIONS=detect_leaks=0
+endif
 
 
 PROGS_CROSS = $(foreach X,$(TCC_X),$X-tcc$(EXESUF))
@@ -145,10 +172,43 @@ LIBTCC1_CROSS = $(foreach X,$(LIBTCC1_X),$X-libtcc1.a)
 
 $(info $(LIBTCC1_CROSS))
 # build cross compilers & libs
-cross: $(LIBTCC1_CROSS) $(PROGS_CROSS)
+cross: $(LIBTCC1_CROSS) $(PROGS_CROSS) $(FP_LIBS_CROSS)
 
 # build specific cross compiler & lib
 cross-%: %-tcc$(EXESUF) %-libtcc1.a ;
+
+fp-libs: $(FP_LIBS_CROSS)
+
+# Backwards-compatible aliases (won't rebuild if stamp is up-to-date)
+%-fp-libs: $(FP_LIBS_STAMP_DIR)/.%-fp-libs.stamp
+
+# Compiler checksum file (tracks when compiler binary actually changes)
+$(FP_LIBS_STAMP_DIR)/.%-tcc.checksum: %-tcc$(EXESUF)
+	@mkdir -p $(FP_LIBS_STAMP_DIR)
+	@if [ -n "$(CHECKSUM_CMD)" ]; then \
+		$(CHECKSUM_CMD) $< | awk '{print $$1}' > $@.tmp && \
+		if [ -f $@ ] && [ "$$(cat $@)" = "$$(cat $@.tmp)" ]; then \
+			rm -f $@.tmp; \
+		else \
+			mv $@.tmp $@; \
+		fi; \
+	else \
+		touch $@; \
+	fi
+
+$(FP_LIBS_STAMP_DIR)/.%-fp-libs.stamp: $(FP_LIBS_STAMP_DIR)/.%-tcc.checksum $(FP_LIBS_SRC_DEPS)
+	@mkdir -p $(FP_LIBS_STAMP_DIR)
+	@# Check if checksum changed - if so, clean and rebuild fplibs
+	@if [ -f $(FP_LIBS_STAMP_DIR)/.$*-fp-libs.checksum.saved ]; then \
+		if ! cmp -s $(FP_LIBS_STAMP_DIR)/.$*-fp-libs.checksum.saved $(FP_LIBS_STAMP_DIR)/.$*-tcc.checksum; then \
+			echo "Compiler $*-tcc changed - cleaning and rebuilding fplibs"; \
+			$(MAKE) --no-print-directory -C lib clean-fp-libs CROSS_TARGET=$*; \
+		fi; \
+	fi
+	@rm -f $@
+	@$(SAN_ENV) $(MAKE) --no-print-directory -C lib CROSS_TARGET=$* fp-libs && touch $@
+	@# Save the checksum that was used for this build
+	@cp $(abspath $(FP_LIBS_STAMP_DIR)/.$*-tcc.checksum) $(abspath $(FP_LIBS_STAMP_DIR)/.$*-fp-libs.checksum.saved)
 
 install: ; @$(MAKE) --no-print-directory  install$(CFG)
 install-strip: ; @$(MAKE) --no-print-directory  install$(CFG) CONFIG_strip=yes
@@ -188,12 +248,6 @@ endif
 
 ifneq ($(T),$(NATIVE_TARGET))
 # assume support files for cross-targets in "/usr/<triplet>" by default
-TRIPLET-i386 ?= i686-linux-gnu
-TRIPLET-x86_64 ?= x86_64-linux-gnu
-TRIPLET-arm ?= arm-linux-gnueabi
-TRIPLET-arm64 ?= aarch64-linux-gnu
-TRIPLET-riscv64 ?= riscv64-linux-gnu
-MARCH-i386 ?= i386-linux-gnu
 MARCH-$T ?= $(TRIPLET-$T)
 TR = $(if $(TRIPLET-$T),$T,ignored)
 CRT-$(TR) ?= /usr/$(TRIPLET-$T)/lib
@@ -201,48 +255,24 @@ LIB-$(TR) ?= {B}:/usr/$(TRIPLET-$T)/lib:/usr/lib/$(MARCH-$T)
 INC-$(TR) ?= {B}/include:/usr/$(TRIPLET-$T)/include:/usr/include
 endif
 
-CORE_FILES = tcc.c tcctools.c libtcc.c tccpp.c tccgen.c tccdbg.c tccelf.c tccasm.c tccyaff.c
-CORE_FILES += tcc.h config.h libtcc.h tcctok.h
-i386_FILES = $(CORE_FILES) i386-gen.c i386-link.c i386-asm.c i386-asm.h i386-tok.h
-i386-win32_FILES = $(i386_FILES) tccpe.c
-x86_64_FILES = $(CORE_FILES) x86_64-gen.c x86_64-link.c i386-asm.c x86_64-asm.h
-x86_64-win32_FILES = $(x86_64_FILES) tccpe.c
-x86_64-osx_FILES = $(x86_64_FILES) tccmacho.c
-arm_FILES = $(CORE_FILES) arm-gen.c arm-link.c arm-asm.c arm-tok.h
-armv8m_FILES = $(CORE_FILES) arm-thumb-opcodes.c arm-thumb-gen.c arm-link.c arm-thumb-asm.c thumb-tok.h 
-arm-wince_FILES = $(arm_FILES) tccpe.c
-arm-eabihf_FILES = $(arm_FILES)
-arm-fpa_FILES     = $(arm_FILES)
-arm-fpa-ld_FILES  = $(arm_FILES)
-arm-vfp_FILES     = $(arm_FILES)
-arm-eabi_FILES    = $(arm_FILES)
-arm-eabihf_FILES  = $(arm_FILES)
-arm64_FILES = $(CORE_FILES) arm64-gen.c arm64-link.c arm64-asm.c
-arm64-osx_FILES = $(arm64_FILES) tccmacho.c
-c67_FILES = $(CORE_FILES) c67-gen.c c67-link.c tcccoff.c
-riscv64_FILES = $(CORE_FILES) riscv64-gen.c riscv64-link.c riscv64-asm.c
+IR_FILES = ir/type.c ir/pool.c ir/vreg.c ir/stack.c ir/live.c ir/mat.c ir/dump.c ir/codegen.c ir/opt.c ir/opt_jump_thread.c ir/licm.c ir/core.c
+CORE_FILES = tccir_operand.c tccls.c tcc.c tcctools.c libtcc.c tccpp.c tccgen.c tccdbg.c tccelf.c tccasm.c tccyaff.c tccld.c tccdebug.c svalue.c tccmachine.c tccopt.c $(IR_FILES)
+CORE_FILES += tcc.h config.h libtcc.h tcctok.h tccir.h tccir_operand.h tccld.h tccmachine.h tccopt.h
+CORE_FILES += $(wildcard ir/*.h)
+armv8m_FILES = $(CORE_FILES) arch/arm_aapcs.c arch/armv8m.c arm-thumb-opcodes.c arm-thumb-gen.c arm-thumb-callsite.c arm-link.c arm-thumb-asm.c arm-thumb-defs.h thumb-tok.h
 
 TCCDEFS_H$(subst yes,,$(CONFIG_predefs)) = tccdefs_.h
 
 # libtcc sources
 LIBTCC_SRC = $(filter-out tcc.c tcctools.c,$(filter %.c,$($T_FILES)))
 
-ifeq ($(ONE_SOURCE),yes)
-LIBTCC_OBJ = $(X)libtcc.o
-LIBTCC_INC = $($T_FILES)
-TCC_FILES = $(X)tcc.o
-$(X)tcc.o $(X)libtcc.o : $(TCCDEFS_H)
-else
+# Compile from separate objects
 LIBTCC_OBJ = $(patsubst %.c,$(X)%.o,$(LIBTCC_SRC))
 LIBTCC_INC = $(filter %.h %-gen.c %-link.c,$($T_FILES))
 TCC_FILES = $(X)tcc.o $(LIBTCC_OBJ)
 $(X)tccpp.o : $(TCCDEFS_H)
-$(X)libtcc.o : DEFINES += -DONE_SOURCE=0
-$(CROSS_TARGET)-tcc.o : DEFINES += -DONE_SOURCE=0
-endif
-# native tcc always made from tcc.o and libtcc.[so|a]
-tcc.o : DEFINES += -DONE_SOURCE=0
-DEFINES += -I$(TOP)
+
+DEFINES += -I$(TOP) -I$(TOP)/ir
 
 GITHASH:=$(shell git rev-parse --abbrev-ref HEAD 2>/dev/null || echo no)
 ifneq ($(GITHASH),no)
@@ -261,8 +291,16 @@ endif
 	# todo: how to pass host CC there?
 	gcc -DC2STR $(filter %.c,$^) -o c2str.exe && ./c2str.exe $< $@
 
-# target specific object rule
+# target specific object rules
 $(X)%.o : %.c $(LIBTCC_INC)
+	$S$(CC) -o $@ -c $< $(addsuffix ,$(DEFINES) $(CFLAGS))
+
+$(X)arch/%.o : arch/%.c $(LIBTCC_INC)
+	@mkdir -p $(dir $@)
+	$S$(CC) -o $@ -c $< $(addsuffix ,$(DEFINES) $(CFLAGS))
+
+$(X)ir/%.o : ir/%.c $(LIBTCC_INC)
+	@mkdir -p $(dir $@)
 	$S$(CC) -o $@ -c $< $(addsuffix ,$(DEFINES) $(CFLAGS))
 
 # additional dependencies
@@ -270,8 +308,8 @@ $(X)tcc.o : tcctools.c
 $(X)tcc.o : DEFINES += $(DEF_GITHASH)
 
 # Host Tiny C Compiler
-tcc$(EXESUF): tcc.o $(LIBTCC)
-	$S$(CC) -o $@ $^ $(addsuffix ,$(LIBS) $(LDFLAGS) $(LINK_LIBTCC))
+# tcc$(EXESUF): tcc.o $(LIBTCC)
+# 	$S$(CC) -o $@ $^ $(addsuffix ,$(LIBS) $(LDFLAGS) $(LINK_LIBTCC))
 
 # Cross Tiny C Compilers
 # (the TCCDEFS_H dependency is only necessary for parallel makes,
@@ -281,47 +319,10 @@ tcc$(EXESUF): tcc.o $(LIBTCC)
 # to the same goals and only remakes it once, but that doesn't work over
 # sub-makes like in this target)
 %-tcc$(EXESUF): $(TCCDEFS_H) FORCE
-	@$(MAKE) --no-print-directory $@ CROSS_TARGET=$* ONE_SOURCE=$(or $(ONE_SOURCE),yes)
+	@$(MAKE) --no-print-directory $@ CROSS_TARGET=$*
 
 $(CROSS_TARGET)-tcc$(EXESUF): $(TCC_FILES)
-	$S$(CC) -o $@ $^ $(LIBS) $(LDFLAGS)
-
-# profiling version
-tcc_p$(EXESUF): $($T_FILES)
-	$S$(CC) -o $@ $< $(DEFINES) $(CFLAGS_P) $(LIBS_P) $(LDFLAGS_P)
-
-# static libtcc library
-libtcc.a: $(LIBTCC_OBJ)
-	$S$(AR) rcs $@ $^
-
-# dynamic libtcc library
-libtcc.so: $(LIBTCC_OBJ)
-	$S$(CC) -shared -Wl,-soname,$@ -o $@ $^ $(LIBS) $(LDFLAGS)
-
-libtcc.so: override CFLAGS += -fPIC
-libtcc.so: override LDFLAGS += -fPIC
-
-# OSX dynamic libtcc library
-libtcc.dylib: $(LIBTCC_OBJ)
-	$S$(CC) -dynamiclib $(DYLIBVER) -install_name @rpath/$@ -o $@ $^ $(LDFLAGS) 
-
-# OSX libtcc.dylib (without rpath/ prefix)
-libtcc.osx: $(LIBTCC_OBJ)
-	$S$(CC) -shared -install_name libtcc.dylib -o libtcc.dylib $^ $(LDFLAGS) 
-
-# windows dynamic libtcc library
-libtcc.dll : $(LIBTCC_OBJ)
-	$S$(CC) -shared -o $@ $^ $(LDFLAGS)
-libtcc.dll : DEFINES += -DLIBTCC_AS_DLL
-
-# import file for windows libtcc.dll
-libtcc.def : libtcc.dll tcc$(EXESUF)
-	$S$(XTCC) -impdef $< -o $@
-XTCC ?= ./tcc$(EXESUF)
-
-# TinyCC runtime libraries
-libtcc1.a : tcc$(EXESUF) FORCE
-	@$(MAKE) -C lib
+	$S$(CC) -o $@ $^ $(LDFLAGS) $(LIBS)
 
 # Cross libtcc1.a
 %-libtcc1.a : %-tcc$(EXESUF) FORCE
@@ -398,37 +399,6 @@ uninstall-unx:
 	@rm -fv "$(docdir)/tcc-doc.html"
 	@rm -frv "$(tccdir)"
 
-# install progs & libs on windows
-install-win:
-	$(call BINCHECK)
-	$(call IBw,$(PROGS) *-tcc.exe libtcc.dll,"$(bindir)")
-	$(call IF,$(TOPSRC)/win32/lib/*.def,"$(tccdir)/lib")
-	$(call IFw,libtcc1.a $(EXTRA_O) $(LIBTCC1_W),"$(tccdir)/lib")
-	$(call IF,$(TOPSRC)/include/*.h $(TOPSRC)/tcclib.h,"$(tccdir)/include")
-	$(call IR,$(TOPSRC)/win32/include,"$(tccdir)/include")
-	$(call IR,$(TOPSRC)/win32/examples,"$(tccdir)/examples")
-	$(call IF,$(TOPSRC)/tests/libtcc_test.c,"$(tccdir)/examples")
-	$(call IFw,$(TOPSRC)/libtcc.h libtcc.def libtcc.a,"$(libdir)")
-	$(call IFw,$(TOPSRC)/win32/tcc-win32.txt tcc-doc.html,"$(docdir)")
-ifneq "$(wildcard $(LIBTCC1_U))" ""
-	$(call IFw,$(LIBTCC1_U),"$(tccdir)/lib")
-	$(call IF,$(TOPSRC)/include/*.h $(TOPSRC)/tcclib.h,"$(tccdir)/lib/include")
-endif
-
-# uninstall on windows
-uninstall-win:
-	@rm -fv $(foreach P,libtcc*.dll $(PROGS) *-tcc.exe,"$(bindir)"/$P)
-	@rm -fr $(foreach P,doc examples include lib libtcc,"$(tccdir)"/$P/*)
-	@rm -frv $(foreach P,doc examples include lib libtcc,"$(tccdir)"/$P)
-
-# the msys-git shell works to configure && make except it does not have install
-ifeq ($(OS),Windows_NT)
-ifeq ($(shell $(call WHICH,install) || echo no),no)
-INSTALL = cp
-INSTALLBIN = cp
-endif
-endif
-
 # --------------------------------------------------------------------------
 # other stuff
 
@@ -455,8 +425,89 @@ tar:    tcc-doc.html
 config.mak:
 	$(if $(wildcard $@),,@echo "Please run ./configure." && exit 1)
 
+#+#+#+#+-----------------------------------------------------------------------
 # run all tests
-test:
+PYTHON ?= python3
+PYTEST ?= pytest
+
+# If set to 1 (default), `make test` will create a local virtualenv and install
+# Python requirements for tests/ir_tests before invoking pytest.
+USE_VENV ?= 1
+VENV_DIR ?= .venv
+VENV_BINDIR := $(CURDIR)/$(VENV_DIR)/bin
+VENV_PY := $(VENV_BINDIR)/python
+VENV_PIP := $(VENV_BINDIR)/pip
+
+IRTESTS_DIR := tests/ir_tests
+IRTESTS_REQUIREMENTS := $(IRTESTS_DIR)/requirements.txt
+IRTESTS_VENV_STAMP := $(VENV_DIR)/.irtests-requirements.stamp
+
+NEWLIB_DIR := $(IRTESTS_DIR)/qemu/mps2-an505/newlib_build/arm-none-eabi/newlib
+NEWLIB_LIBC_A := $(NEWLIB_DIR)/libc.a
+
+# Host tests for soft-float aeabi functions
+AEABI_HOST_TESTS = test_aeabi_all test_host test_dmul_host
+AEABI_HOST_TEST_DIR = lib/fp/soft
+
+test-aeabi-host:
+	@echo "------------ aeabi host tests ------------"
+	@for t in $(AEABI_HOST_TESTS); do \
+		echo "Building and running $$t..."; \
+		$(CC) -O2 -DHOST_TEST $(AEABI_HOST_TEST_DIR)/$$t.c -o $(AEABI_HOST_TEST_DIR)/$$t -lm && \
+		$(AEABI_HOST_TEST_DIR)/$$t || exit 1; \
+	done
+	@echo "------------ aeabi host tests passed ------------"
+
+.PHONY: test-venv
+test-venv:
+	@set -e; \
+	if [ "$(USE_VENV)" != "1" ]; then exit 0; fi; \
+	if [ ! -f "$(IRTESTS_REQUIREMENTS)" ]; then echo "Missing $(IRTESTS_REQUIREMENTS)"; exit 1; fi; \
+	$(MAKE) --no-print-directory $(IRTESTS_VENV_STAMP)
+
+$(IRTESTS_VENV_STAMP): $(IRTESTS_REQUIREMENTS)
+	@set -e; \
+	if [ "$(USE_VENV)" != "1" ]; then exit 0; fi; \
+	if [ ! -x "$(VENV_PY)" ]; then \
+		echo "------------ ir_tests: creating venv ($(VENV_DIR)) ------------"; \
+		$(PYTHON) -m venv "$(VENV_DIR)"; \
+	fi; \
+	echo "------------ ir_tests: installing python deps ------------"; \
+	"$(VENV_PY)" -m pip install -U pip; \
+	"$(VENV_PY)" -m pip install -r "$(IRTESTS_REQUIREMENTS)"; \
+	touch "$@"
+
+.PHONY: test-prepare
+test-prepare:
+	@set -e; \
+	if [ -f "$(NEWLIB_LIBC_A)" ]; then exit 0; fi; \
+	echo "------------ ir_tests: building newlib (first run) ------------"; \
+	cd $(IRTESTS_DIR)/qemu/mps2-an505 && sh ./build_newlib.sh
+
+
+ASMTESTS_DIR := tests/thumb/armv8m
+
+.PHONY: test-asm
+test-asm: cross
+	@echo "------------ assembler tests (pytest) ------------"
+	@cd $(ASMTESTS_DIR) && \
+		TEST_CC="$(CURDIR)/armv8m-tcc" \
+		TEST_COMPARE_CC="arm-none-eabi-gcc" \
+		TEST_OBJDUMP="arm-none-eabi-objdump" \
+		TEST_OBJCOPY="arm-none-eabi-objcopy" \
+		$(PYTEST) --tb=short -q .
+
+# run IR tests via pytest (preferred)
+test: cross test-aeabi-host test-asm test-venv test-prepare
+	@echo "------------ ir_tests (pytest) ------------"
+	@if [ "$(USE_VENV)" = "1" ]; then \
+		cd $(IRTESTS_DIR) && "$(VENV_PY)" -m pytest -s -n auto; \
+	else \
+		cd $(IRTESTS_DIR) && $(PYTEST) -s -n auto; \
+	fi
+
+# legacy tests (kept for reference)
+test-legacy:
 	@$(MAKE) -C tests
 # run test(s) from tests2 subdir (see make help)
 tests2.%:
@@ -485,21 +536,70 @@ distclean: clean
 	@rm -vf config.h config.mak config.texi
 	@rm -vf $(TCCDOCS)
 
-.PHONY: all clean test tar tags ETAGS doc distclean install uninstall FORCE
+.PHONY: all cross fp-libs clean test test-aeabi-host test-legacy tar tags ETAGS doc distclean install uninstall FORCE
+
+# Container image settings (auto-detect docker or podman)
+DOCKER_REGISTRY ?= ghcr.io
+DOCKER_IMAGE_NAME ?= matgla/tinycc-armv8m
+DOCKER_IMAGE_TAG ?= latest
+DOCKER_FULL_IMAGE = $(DOCKER_REGISTRY)/$(DOCKER_IMAGE_NAME):$(DOCKER_IMAGE_TAG)
+
+# Detect available container runtime (prefer podman, fallback to docker)
+# User can override with: make docker-start CONTAINER_RUNTIME=docker
+CONTAINER_RUNTIME := $(shell \
+  if command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then \
+    echo podman; \
+  elif command -v docker >/dev/null 2>&1; then \
+    echo docker; \
+  fi)
+# Note: Container runtime is only needed for container-* and docker-* targets
+
+container-build:
+ifeq ($(CONTAINER_RUNTIME),)
+	$(error No container runtime found. Please install docker or podman.)
+else
+	@echo "Building container image with $(CONTAINER_RUNTIME): $(DOCKER_FULL_IMAGE)"
+	$(CONTAINER_RUNTIME) build -t $(DOCKER_FULL_IMAGE) .
+endif
+
+container-push: container-build
+ifeq ($(CONTAINER_RUNTIME),)
+	$(error No container runtime found. Please install docker or podman.)
+else
+	@echo "Pushing container image with $(CONTAINER_RUNTIME): $(DOCKER_FULL_IMAGE)"
+	$(CONTAINER_RUNTIME) push $(DOCKER_FULL_IMAGE)
+endif
+
+# Legacy aliases for backwards compatibility
+docker-build: container-build
+docker-push: container-push
+
+# Pull and start container interactively with current directory mounted
+docker-start:
+ifeq ($(CONTAINER_RUNTIME),)
+	$(error No container runtime found. Please install docker or podman.)
+else
+	@echo "Pulling container image with $(CONTAINER_RUNTIME): $(DOCKER_FULL_IMAGE)"
+	$(CONTAINER_RUNTIME) pull $(DOCKER_FULL_IMAGE)
+	@echo "Starting container with $(CONTAINER_RUNTIME)..."
+	$(CONTAINER_RUNTIME) run -it --rm -v $(CURDIR):/workspace $(DOCKER_FULL_IMAGE)
+endif
 
 help:
 	@echo "make"
 	@echo "   build native compiler (from separate objects)"
 	@echo "make cross"
-	@echo "   build cross compilers (from one source)"
-	@echo "make ONE_SOURCE=no/yes SILENT=no/yes"
-	@echo "   force building from separate/one object(s), less/more silently"
+	@echo "   build cross compilers (from separate objects)"
+	@echo "make SILENT=no/yes"
+	@echo "   build less/more silently"
 	@echo "make cross-TARGET"
 	@echo "   build one specific cross compiler for 'TARGET'. Currently supported:"
 	@echo "   $(wordlist 1,8,$(TCC_X))"
 	@echo "   $(wordlist 9,99,$(TCC_X))"
 	@echo "make test"
-	@echo "   run all tests"
+	@echo "   rebuild + run pytest in tests/ir_tests"
+	@echo "make test-legacy"
+	@echo "   run legacy make-based tests (tests/Makefile)"
 	@echo "make tests2.all / make tests2.37 / make tests2.37+"
 	@echo "   run all/single test(s) from tests2, optionally update .expect"
 	@echo "make testspp.all / make testspp.17"
@@ -510,6 +610,14 @@ help:
 	@echo "   run tests with the installed tcc"
 	@echo "Other supported make targets:"
 	@echo "   install install-strip uninstall doc [dist]clean tags ETAGS tar help"
+	@echo "   container-build"
+	@echo "      build container image (auto-detects docker/podman)"
+	@echo "   container-push"
+	@echo "      build and push container image to registry"
+	@echo "   docker-build (legacy alias)"
+	@echo "   docker-push (legacy alias)"
+	@echo "   docker-start"
+	@echo "      pull and start container interactively (mounts current dir to /workspace)"
 	@echo "Custom configuration:"
 	@echo "   The makefile includes a file 'config-extra.mak' if it is present."
 	@echo "   This file may contain some custom configuration.  For example to"

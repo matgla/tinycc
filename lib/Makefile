@@ -14,6 +14,7 @@ $(info CROSS_TARGET='$(CROSS_TARGET)')
 
 TCC = $(TOP)/$(X)tcc$(EXESUF)
 XTCC ?= $(TOP)/$(X)tcc$(EXESUF)
+FP_CC := $(abspath $(TOP)/$(X)tcc$(EXESUF))
 XCC = $(XTCC)
 XAR = $(XTCC) -ar
 XFLAGS-unx = -B$(TOPSRC)
@@ -31,19 +32,23 @@ arm-libtcc1-usegcc ?= no
 ifeq "$($(T)-libtcc1-usegcc)" "yes"
  XCC = $(CC)
  XAR = $(AR)
- XFLAGS = $(CFLAGS) -fPIC -fno-omit-frame-pointer -Wno-unused-function -Wno-unused-variable
+ XFLAGS = $(CFLAGS) -fPIC -fno-omit-frame-pointer -Wno-unused-function -Wno-unused-variable -mfloat-abi=hard -mfpu=fpv4-sp-d16
  BFLAGS = $(if $(CONFIG_dwarf),-gdwarf,-gstabs)
 endif
 
 I386_O = libtcc1.o alloca.o alloca-bt.o $(COMMON_O)
 X86_64_O = libtcc1.o alloca.o alloca-bt.o $(COMMON_O)
-ARM_O = libtcc1.o armeabi.o alloca.o armflush.o $(COMMON_O)
+ARM_O = libtcc1.o alloca.o armflush.o $(COMMON_O) $(ARM_FP_O)
 ARM64_O = lib-arm64.o $(COMMON_O)
 RISCV64_O = lib-arm64.o $(COMMON_O)
 COMMON_O = stdatomic.o atomic.o builtin.o
 WIN_O = crt1.o crt1w.o wincrt1.o wincrt1w.o dllcrt1.o dllmain.o
 LIN_O = dsohandle.o
 OSX_O =
+
+# ARM Floating Point Library Objects
+# Built from lib/fp/ directory for different FPU configurations
+ARM_FP_O = armeabi.o armeabi_divmod.o
 
 # backtrace/bcheck/run only for native compiler
 Nat = $(if $X,no,)
@@ -71,7 +76,7 @@ OBJ-arm-vfp = $(OBJ-arm)
 OBJ-arm-eabi = $(OBJ-arm)
 OBJ-arm-eabihf = $(OBJ-arm)
 OBJ-arm-wince = $(ARM_O) $(WIN_O)
-OBJ-armv8m = armeabi.o thumbflush.o alloca.o
+OBJ-armv8m = alloca.o armeabi.o armeabi_divmod.o va_list.o
 OBJ-riscv64 = $(RISCV64_O) $(LIN_O)
 
 OBJ-extra = $(filter $(EXTRA_O),$(OBJ-$T))
@@ -101,8 +106,32 @@ $(TOP)/bt-exe.o : XFLAGS += -I$(TOP)
 $(X)crt1w.o : crt1.c
 $(X)wincrt1w.o : wincrt1.c
 
+# Build FP libraries for ARM targets
+.PHONY: fp-libs
+fp-libs:
+	$(MAKE) -C fp FPU=soft TARGET=$(T) CC="$(FP_CC)" AR="$(FP_CC) -ar" CFLAGS="$(XFLAGS)"
+	$(MAKE) -C fp FPU=vfpv4-sp TARGET=$(T) CC="$(FP_CC)" AR="$(FP_CC) -ar" CFLAGS="$(XFLAGS)"
+	$(MAKE) -C fp FPU=vfpv5-dp TARGET=$(T) CC="$(FP_CC)" AR="$(FP_CC) -ar" CFLAGS="$(XFLAGS)"
+	$(MAKE) -C fp FPU=rp2350 TARGET=$(T) CC="$(FP_CC)" AR="$(FP_CC) -ar" CFLAGS="$(XFLAGS)"
+
+# Build armeabi.o which dispatches to correct FP library
+$(X)armeabi.o : armeabi.c $(TCC)
+	$S$(XCC) -c $< -o $@ $(XFLAGS)
+
 # don't try to make it
 $(TCC) : ;
 
 clean :
 	rm -f *.o $(addprefix $(TOP)/,*libtcc1.a $(EXTRA_O))
+	rm -rf build
+	$(MAKE) -C fp clean
+
+# Clean only FP libraries for a specific cross target
+# Note: don't delete .checksum file here - it's needed by the parent Makefile
+# after clean-fp-libs runs to save as .checksum.saved
+clean-fp-libs:
+	@echo "Cleaning FP libraries for $(CROSS_TARGET)..."
+	@rm -f $(TOP)/lib/fp/libtcc1-fp-*.a
+	@rm -f $(TOP)/lib/fp/build/.$(CROSS_TARGET)-fp-libs.stamp
+	@rm -f $(TOP)/lib/fp/build/.$(CROSS_TARGET)-fp-libs.checksum.saved
+	@rm -rf $(TOP)/lib/fp/build/soft $(TOP)/lib/fp/build/vfpv4-sp $(TOP)/lib/fp/build/vfpv5-dp $(TOP)/lib/fp/build/rp2350
