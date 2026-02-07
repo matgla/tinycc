@@ -332,10 +332,7 @@ ArchitectureConfig architecture_config = {
 
 ### Style Guidelines
 
-- **C Standard**: C11 (`-std=c11`)
-- **Indentation**: 2 spaces (no tabs)
-- **Line Length**: ~100 characters
-- **Braces**: K&R style, opening brace on same line
+check .clang-format
 
 Example:
 ```c

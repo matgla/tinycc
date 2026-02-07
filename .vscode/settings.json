@@ -1,6 +1,1 @@
-{
-    "chat.tools.terminal.autoApprove": {
-        "make": true,
-        "heaptrack_print": true
-    }
-}
+{}
