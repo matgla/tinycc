@@ -539,14 +539,19 @@ distclean: clean
 .PHONY: all cross fp-libs clean test test-aeabi-host test-legacy tar tags ETAGS doc distclean install uninstall FORCE
 
 # Container image settings (auto-detect docker or podman)
-# For GHCR: set DOCKER_REGISTRY=ghcr.io and DOCKER_IMAGE_NAME=username/repo
-DOCKER_REGISTRY ?= localhost
-DOCKER_IMAGE_NAME ?= tinycc-armv8m
+DOCKER_REGISTRY ?= ghcr.io
+DOCKER_IMAGE_NAME ?= matgla/tinycc-armv8m
 DOCKER_IMAGE_TAG ?= latest
 DOCKER_FULL_IMAGE = $(DOCKER_REGISTRY)/$(DOCKER_IMAGE_NAME):$(DOCKER_IMAGE_TAG)
 
 # Detect available container runtime (prefer podman, fallback to docker)
-CONTAINER_RUNTIME := $(shell command -v podman 2>/dev/null || command -v docker 2>/dev/null)
+# User can override with: make docker-start CONTAINER_RUNTIME=docker
+CONTAINER_RUNTIME := $(shell \
+  if command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then \
+    echo podman; \
+  elif command -v docker >/dev/null 2>&1; then \
+    echo docker; \
+  fi)
 ifeq ($(CONTAINER_RUNTIME),)
   $(warning No container runtime found. Please install docker or podman.)
 endif
@@ -570,6 +575,17 @@ endif
 # Legacy aliases for backwards compatibility
 docker-build: container-build
 docker-push: container-push
+
+# Pull and start container interactively with current directory mounted
+docker-start:
+ifeq ($(CONTAINER_RUNTIME),)
+	$(error No container runtime found. Please install docker or podman.)
+else
+	@echo "Pulling container image with $(CONTAINER_RUNTIME): $(DOCKER_FULL_IMAGE)"
+	$(CONTAINER_RUNTIME) pull $(DOCKER_FULL_IMAGE)
+	@echo "Starting container with $(CONTAINER_RUNTIME)..."
+	$(CONTAINER_RUNTIME) run -it --rm -v $(CURDIR):/workspace $(DOCKER_FULL_IMAGE)
+endif
 
 help:
 	@echo "make"
@@ -602,6 +618,8 @@ help:
 	@echo "      build and push container image to registry"
 	@echo "   docker-build (legacy alias)"
 	@echo "   docker-push (legacy alias)"
+	@echo "   docker-start"
+	@echo "      pull and start container interactively (mounts current dir to /workspace)"
 	@echo "Custom configuration:"
 	@echo "   The makefile includes a file 'config-extra.mak' if it is present."
 	@echo "   This file may contain some custom configuration.  For example to"

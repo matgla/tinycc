@@ -25,7 +25,7 @@ jobs:
           submodules: recursive
 
       - name: Configure
-        run: ./configure --enable-O2 --enable-asan
+        run: ./configure --enable-cross --enable-O2 --enable-asan
 
       - name: Build and test
         shell: bash
