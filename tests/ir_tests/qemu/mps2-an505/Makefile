@@ -78,9 +78,10 @@ ifneq (,$(findstring armv8m-tcc,$(CC)))
 CFLAGS += -I$(LIBC_INCLUDES) -I$(NEWLIB_INCLUDES) -I$(ARM_SYSROOT)/include -I$(TCC_PATH)/include
 LDFLAGS += -B$(TCC_PATH)
 ifeq ($(USE_NEWLIB_BUILD),1)
-LIBC_LIB := $(if $(and $(filter 1,$(DEBUG_LIBC)),$(wildcard $(NEWLIB_LIBC_G))),c_g,c)
-LIBM_LIB := $(if $(and $(filter 1,$(DEBUG_LIBC)),$(wildcard $(NEWLIB_LIBM_G))),m_g,m)
-LDFLAGS += -L$(TCC_PATH)/lib/fp -L$(TCC_PATH) -L$(NEWLIB_DIR) -L$(LIBGLOSS_PATH) -Wl,--start-group -larmv8m-libtcc1.a -llibtcc1-fp-soft-armv8m.a -l$(LIBC_LIB) -llibrdimon.a -l$(LIBM_LIB) $(LIBGCC_PATH) -Wl,--end-group -Wl,-oformat=elf32-littlearm -T$(MAKEFILE_DIR)linker_script.ld -v
+NEWLIB_LIBC_A := $(if $(and $(filter 1,$(DEBUG_LIBC)),$(wildcard $(NEWLIB_LIBC_G))),$(NEWLIB_LIBC_G),$(NEWLIB_DIR)/libc.a)
+NEWLIB_LIBM_A := $(if $(and $(filter 1,$(DEBUG_LIBC)),$(wildcard $(NEWLIB_LIBM_G))),$(NEWLIB_LIBM_G),$(NEWLIB_DIR)/libm.a)
+NEWLIB_LIBRDIMON_A := $(LIBGLOSS_PATH)/librdimon.a
+LDFLAGS += -L$(TCC_PATH)/lib/fp -L$(TCC_PATH) -Wl,--start-group -larmv8m-libtcc1.a -llibtcc1-fp-soft-armv8m.a $(NEWLIB_LIBC_A) $(NEWLIB_LIBRDIMON_A) $(NEWLIB_LIBM_A) $(LIBGCC_PATH) -Wl,--end-group -Wl,-oformat=elf32-littlearm -T$(MAKEFILE_DIR)linker_script.ld -v
 CRT_LIBS = $(CRT_CRTI_PATH) $(LIBGLOSS_PATH)/rdimon-crt0.o $(CRT_CRTEND_PATH) $(CRT_CRTN_PATH)
 else
 LIBC_A_PATH := $(if $(filter 1,$(DEBUG_LIBC)),$(LIBC_G_PATH),$(LIBC_PATH))

@@ -138,6 +138,9 @@ TEST_FILES = [
     # Induction variable strength reduction test
     ("110_iv_strength_reduction.c", 0),
 
+    # MiBench regression (SHA-1 miscompiled under -O1)
+    ("test_mibench_sha.c", 0),
+
     ("../tests2/00_assignment.c", 0),
     ("../tests2/01_comment.c", 0),
     ("../tests2/02_printf.c", 0),
