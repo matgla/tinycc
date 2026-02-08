@@ -1608,7 +1608,15 @@ static const FlagDef options_f[] = {{offsetof(TCCState, char_is_unsigned), 0, "u
                                     {offsetof(TCCState, opt_store_load_fwd), 0, "store-load-fwd"},
                                     {offsetof(TCCState, opt_redundant_store), 0, "redundant-store-elim"},
                                     {offsetof(TCCState, opt_dead_store), 0, "dead-store-elim"},
+                                    {offsetof(TCCState, opt_fp_offset_cache), 0, "fp-offset-cache"},
+                                    {offsetof(TCCState, opt_indexed_memory), 0, "indexed-memory"},
+                                    {offsetof(TCCState, opt_postinc_fusion), 0, "postinc-fusion"},
+                                    {offsetof(TCCState, opt_mla_fusion), 0, "mla-fusion"},
+                                    {offsetof(TCCState, opt_stack_addr_cse), 0, "stack-addr-cse"},
+                                    {offsetof(TCCState, opt_licm), 0, "licm"},
+                                    {offsetof(TCCState, opt_strength_red), 0, "strength-red"},
                                     {offsetof(TCCState, opt_iv_strength_red), 0, "iv-strength-red"},
+                                    {offsetof(TCCState, opt_jump_threading), 0, "jump-threading"},
                                     {0, 0, NULL}};
 
 static const FlagDef options_m[] = {{offsetof(TCCState, ms_bitfields), 0, "ms-bitfields"}, {0, 0, NULL}};
@@ -2081,7 +2089,8 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
         s->opt_dce = 1;
         s->opt_const_prop = 1;
         s->opt_copy_prop = 1;
-        s->opt_cse = 1;
+        /* cse disabled: miscompiles SHA-1 when combined with copy-prop.
+           Can still be enabled manually with -fcse for debugging. */
         s->opt_bool_cse = 1;
         s->opt_bool_idempotent = 1;
         s->opt_bool_simplify = 1;
@@ -2089,10 +2098,12 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
         s->opt_store_load_fwd = 1;
         s->opt_redundant_store = 1;
         s->opt_dead_store = 1;
-        s->opt_indexed_memory = 1;  /* Fuse SHL+ADD+LOAD/STORE into indexed ops */
-        s->opt_postinc_fusion = 1;  /* Fuse LOAD/STORE + ADD into post-increment ops */
-        s->opt_mla_fusion = 1;      /* Fuse MUL+ADD into MLA */
-        s->opt_fp_offset_cache = 1; /* Cache frame pointer offset calculations */
+        s->opt_indexed_memory = 1; /* Fuse SHL+ADD+LOAD/STORE into indexed ops */
+        s->opt_postinc_fusion = 1; /* Fuse LOAD/STORE + ADD into post-increment ops */
+        s->opt_mla_fusion = 1;     /* Fuse MUL+ADD into MLA */
+        /* fp-offset-cache disabled: miscompiles loops when combined with
+           iv-strength-red (e.g. SHA-1 sha_transform).  Can still be
+           enabled manually with -ffp-offset-cache for debugging. */
         s->opt_stack_addr_cse = 1;  /* Hoist repeated stack address computations */
         s->opt_licm = 1;            /* Loop-invariant code motion */
         s->opt_strength_red = 1;    /* Strength reduction for multiply */
