@@ -762,11 +762,8 @@ static int handle_eob(void)
   {
     return bf->buf_ptr[0];
   }
-  else
-  {
-    bf->buf_ptr = bf->buf_end;
-    return CH_EOF;
-  }
+  bf->buf_ptr = bf->buf_end;
+  return CH_EOF;
 }
 
 /* read next char from current input file and handle end of input buffer */
@@ -3803,6 +3800,7 @@ static int peek_file(TokenString *ws_str)
     if (ws_str)
       tok_str_add(ws_str, c);
   }
+  return 0; /* unreachable */
 }
 
 /* peek or read [ws_str == NULL] next token from function macro call,
@@ -3846,6 +3844,7 @@ static int next_argstream(Sym **nested_list, TokenString *ws_str)
       tok = ' ';
     return tok;
   }
+  return 0; /* unreachable */
 }
 
 /* do macro substitution of current token with macro 's' and add
@@ -4028,6 +4027,9 @@ static int macro_subst_tok(TokenString *tok_str, Sym **nested_list, Sym *s)
     }
     return 0;
   }
+  /* unreachable - all branches above return, but TCC's flow analysis
+     needs an explicit return to avoid 'function might return no value' */
+  return 0;
 }
 
 /* do macro substitution of macro_str and add result to
@@ -4209,6 +4211,8 @@ static const char *const target_os_defs =
     "__OpenBSD__\0"
 #elif TARGETOS_YasOS
     "__YasOS__\0"
+    "__linux__\0"
+    "__linux\0"
 #else
     "__linux__\0"
     "__linux\0"

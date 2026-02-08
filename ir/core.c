@@ -682,9 +682,11 @@ void tcc_ir_params_update_tracking(TCCIRState *ir, TCCAbiArgLoc loc_info)
   }
 }
 
-void tcc_ir_params_process_struct(TCCIRState *ir, Sym *sym, CType *type, int size, int align, TCCAbiArgLoc *loc_info, TCCAbiCallLayout *call_layout, int arg_index)
+void tcc_ir_params_process_struct(TCCIRState *ir, Sym *sym, CType *type, int size, int align, TCCAbiArgLoc *loc_info,
+                                  TCCAbiCallLayout *call_layout, int arg_index)
 {
-  const int invisible_ref = (call_layout->arg_flags && (call_layout->arg_flags[arg_index] & TCC_ABI_ARG_FLAG_INVISIBLE_REF));
+  const int invisible_ref =
+      (call_layout->arg_flags && (call_layout->arg_flags[arg_index] & TCC_ABI_ARG_FLAG_INVISIBLE_REF));
   int slot_align = align < 4 ? 4 : align;
   int flags = 0, addr = 0;
 
@@ -1468,10 +1470,8 @@ static void tcc_ir_inline_asms_ensure_capacity(TCCIRState *ir, int needed)
 }
 
 /* Add inline assembly block, return ID */
-int tcc_ir_asm_add(TCCIRState *ir, const char *asm_str, int asm_len,
-                   int must_subst, ASMOperand *operands,
-                   int nb_operands, int nb_outputs, int nb_labels,
-                   const uint8_t *clobber_regs)
+int tcc_ir_asm_add(TCCIRState *ir, const char *asm_str, int asm_len, int must_subst, ASMOperand *operands,
+                   int nb_operands, int nb_outputs, int nb_labels, const uint8_t *clobber_regs)
 {
   if (!ir)
     return -1;
@@ -1544,8 +1544,7 @@ void tcc_ir_asm_put(TCCIRState *ir, int asm_id)
 int tcc_ir_add_inline_asm(TCCIRState *ir, const char *asm_str, int asm_len, int must_subst, ASMOperand *operands,
                           int nb_operands, int nb_outputs, int nb_labels, const uint8_t *clobber_regs)
 {
-  return tcc_ir_asm_add(ir, asm_str, asm_len, must_subst, operands,
-                        nb_operands, nb_outputs, nb_labels, clobber_regs);
+  return tcc_ir_asm_add(ir, asm_str, asm_len, must_subst, operands, nb_operands, nb_outputs, nb_labels, clobber_regs);
 }
 
 /* Legacy wrapper for tcc_ir_asm_put */
@@ -1668,9 +1667,18 @@ static int ir_put_soft_call_fpu_if_needed(TCCIRState *ir, TccIrOp op, SValue *sr
       return 0;
     break;
   case TCCIR_OP_CVT_FTOF:
+  {
+    /* Same-size conversion (e.g., double <-> long double on ARM where both are 8 bytes)
+     * is a no-op - emit ASSIGN instead of a soft-float call. */
+    int src_align, dst_align;
+    int src_size = src1 ? type_size(&src1->type, &src_align) : 0;
+    int dst_size = dest ? type_size(&dest->type, &dst_align) : 0;
+    if (src_size == dst_size)
+      return 0; /* Codegen handles same-size as copy */
     if (is64bit && fpu->has_dtof && fpu->has_ftod)
       return 0;
     break;
+  }
   default:
     return 0;
   }
@@ -1810,4 +1818,5 @@ IRLiveInterval *tcc_ir_get_live_interval(TCCIRState *ir, int vreg)
     fprintf(stderr, "Unknown vreg type %d for vreg %d\n", TCCIR_DECODE_VREG_TYPE(vreg), vreg);
     exit(1);
   }
+  return NULL; /* unreachable, silences -Werror with old compiler */
 }

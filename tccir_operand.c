@@ -28,6 +28,16 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef UINT32_MAX
+#define UINT32_MAX 0xffffffffU
+#endif
+#ifndef INT32_MAX
+#define INT32_MAX 0x7fffffff
+#endif
+#ifndef INT32_MIN
+#define INT32_MIN (-INT32_MAX - 1)
+#endif
+
 /* ============================================================================
  * IROperand pool management - separate pools for cache efficiency
  * ============================================================================

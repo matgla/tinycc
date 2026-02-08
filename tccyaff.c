@@ -450,6 +450,16 @@ ST_FUNC int tcc_output_yaff(TCCState *s1, FILE *f, const char *filename) {
   YaffHashTable imported_symbols_hashtable;
   YaffHashTable exported_symbols_hashtable;
   fflush(stdout);
+
+  /* Materialize lazy sections before accessing their data pointers */
+  section_materialize(s1, text_section);
+  section_materialize(s1, rodata_section);
+  section_materialize(s1, data_section);
+  if (s1->got)
+    section_materialize(s1, s1->got);
+  if (s1->plt)
+    section_materialize(s1, s1->plt);
+
   name = tcc_basename(filename);
 
   file_type = s1->output_type;

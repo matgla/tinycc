@@ -448,7 +448,7 @@ static int branch_fits_t2(int offset)
 static void branch_opt_init(void)
 {
   branch_opt_state.branch_count = 0;
-  branch_opt_state.optimization_enabled = 1;
+  branch_opt_state.optimization_enabled = 0; /* Disabled: dry-run addresses diverge from real pass */
   branch_opt_state.code_size_reduction = 0;
   if (!branch_opt_state.branches)
   {
@@ -506,6 +506,20 @@ static void branch_opt_analyze(uint32_t *ir_to_code_mapping, int mapping_size)
   /* Phase 2: Iterative relaxation
    * Keep trying to convert 32-bit to 16-bit until no more changes.
    * Each conversion shrinks code by 2 bytes, potentially enabling more.
+   *
+   * Each 16-bit branch saves 2 bytes at its source location, shifting all
+   * subsequent addresses back.  For any branch i the real addresses are:
+   *
+   *   real(addr) = addr - 2 * #{16-bit branches whose source < addr}
+   *
+   * Branches are recorded in source-address order, so the source adjustment
+   * for branch i is a running total (cumulative_shrink) of all 16-bit
+   * branches 0..i-1.  The target may be forward (after later 16-bit
+   * branches) or backward, so we scan the full branch array.
+   *
+   * Monotonic convergence is guaranteed: shrinking a branch can only reduce
+   * (or keep equal) the magnitude of other branches' offsets, so no branch
+   * ever needs to be re-widened.
    */
   int changed;
   int iterations = 0;
@@ -520,19 +534,23 @@ static void branch_opt_analyze(uint32_t *ir_to_code_mapping, int mapping_size)
     {
       BranchInfo *b = &branch_opt_state.branches[i];
 
-      /* Adjust addresses for branches after us that already shrunk */
+      /* Source adjustment: running total of 16-bit branches before this source.
+       * cumulative_shrink already accounts for branches 0..i-1 that are 16-bit
+       * (whether converted in this iteration or a previous one). */
       int adjusted_source = b->source_addr - cumulative_shrink;
-      int adjusted_target = b->target_addr;
 
-      /* Adjust target if it's after shrunk branches */
-      for (int j = 0; j < i; j++)
+      /* Target adjustment: count ALL 16-bit branches (any index) whose
+       * original source_addr falls before this branch's target_addr. */
+      int target_shrink = 0;
+      for (int j = 0; j < branch_opt_state.branch_count; j++)
       {
         if (branch_opt_state.branches[j].encoding == BRANCH_ENC_16BIT &&
             branch_opt_state.branches[j].source_addr < b->target_addr)
         {
-          adjusted_target -= 2; /* This branch shrunk by 2 bytes */
+          target_shrink += 2;
         }
       }
+      int adjusted_target = b->target_addr - target_shrink;
 
       /* Compute offset: target - (source + instruction_size)
        * For Thumb: offset = target - source - 4 (pipeline offset) */
@@ -547,9 +565,16 @@ static void branch_opt_analyze(uint32_t *ir_to_code_mapping, int mapping_size)
         if (can_use_16bit)
         {
           b->encoding = BRANCH_ENC_16BIT;
-          cumulative_shrink += 2;
           changed = 1;
         }
+      }
+
+      /* Track cumulative shrink for ALL 16-bit branches (including those
+       * converted in previous iterations) so that subsequent source
+       * adjustments are correct. */
+      if (b->encoding == BRANCH_ENC_16BIT)
+      {
+        cumulative_shrink += 2;
       }
     }
 
@@ -1116,10 +1141,7 @@ const char *default_elfinterp(struct TCCState *s)
   {
     return "/lib/ld-linux-armhf.so";
   }
-  else
-  {
-    return "/lib/ld-linux.so";
-  }
+  return "/lib/ld-linux.so";
 }
 #endif // TCC_ARM_EABI && !CONFIG_TCC_ELFINTERP
 
@@ -2143,6 +2165,14 @@ ST_FUNC void tcc_machine_store_spill_slot(int src_reg, int frame_offset)
     ot_check(th_str_reg(src_reg, base_reg, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     restore_scratch_reg(&rr_alloc);
   }
+}
+
+/* Like tcc_machine_store_spill_slot, but for stack-passed parameters.
+ * Adds offset_to_args (prologue push size) to the frame offset so that
+ * the store targets the correct caller-stack location above FP. */
+ST_FUNC void tcc_machine_store_param_slot(int src_reg, int frame_offset)
+{
+  tcc_machine_store_spill_slot(src_reg, frame_offset + offset_to_args);
 }
 
 static int unalias_ldbl(int btype)
@@ -4089,8 +4119,17 @@ static void thumb_emit_regonly_binop32(IROperand src1, IROperand src2, IROperand
                                        thumb_regonly3_handler_t emitter, const char *ctx)
 {
   int rd = dest.pr0_reg;
+  ScratchRegAlloc rd_alloc = {0};
+  int need_dest_storeback = 0;
+
+  /* If the destination has no physical register (materializer didn't allocate one),
+   * fall back to a scratch register and store the result back to the stack slot. */
   if (rd == PREG_REG_NONE)
-    tcc_error("compiler_error: %s missing destination register", ctx);
+  {
+    rd_alloc = get_scratch_reg_with_save(0);
+    rd = rd_alloc.reg;
+    need_dest_storeback = 1;
+  }
   thumb_require_materialized_reg(ctx, "dest", rd);
 
   /* IR-level tcc_ir_materialize_const_to_reg() now handles constant-to-register
@@ -4130,16 +4169,37 @@ static void thumb_emit_regonly_binop32(IROperand src1, IROperand src2, IROperand
   }
 
   ot_check(emitter((uint32_t)rd, (uint32_t)rn, (uint32_t)rm));
+
+  /* Store result back to stack if we used a scratch for the destination */
+  if (need_dest_storeback)
+  {
+    int frame_offset = irop_get_stack_offset(dest);
+    if (dest.is_param)
+      tcc_machine_store_param_slot(rd, frame_offset);
+    else
+      tcc_machine_store_spill_slot(rd, frame_offset);
+  }
+
   restore_scratch_reg(&rm_alloc);
   restore_scratch_reg(&rn_alloc);
+  restore_scratch_reg(&rd_alloc);
 }
 
 static void thumb_emit_mod32(IROperand src1, IROperand src2, IROperand dest, TccIrOp op,
                              thumb_regonly3_handler_t div_emitter, const char *ctx)
 {
   int dest_reg = dest.pr0_reg;
+  ScratchRegAlloc dest_alloc = {0};
+  int need_dest_storeback = 0;
+
+  /* If the destination has no physical register (materializer didn't allocate one),
+   * fall back to a scratch register and store the result back to the stack slot. */
   if (dest_reg == PREG_REG_NONE)
-    tcc_error("compiler_error: %s missing destination register", ctx);
+  {
+    dest_alloc = get_scratch_reg_with_save(0);
+    dest_reg = dest_alloc.reg;
+    need_dest_storeback = 1;
+  }
   thumb_require_materialized_reg(ctx, "dest", dest_reg);
 
   /* IR-level tcc_ir_materialize_const_to_reg() now handles constant-to-register
@@ -4193,9 +4253,20 @@ static void thumb_emit_mod32(IROperand src1, IROperand src2, IROperand dest, Tcc
   ot_check(th_sub_reg(dest_reg, src1_reg, quotient, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
                       ENFORCE_ENCODING_NONE));
 
+  /* Store result back to stack if we used a scratch for the destination */
+  if (need_dest_storeback)
+  {
+    int frame_offset = irop_get_stack_offset(dest);
+    if (dest.is_param)
+      tcc_machine_store_param_slot(dest_reg, frame_offset);
+    else
+      tcc_machine_store_spill_slot(dest_reg, frame_offset);
+  }
+
   restore_scratch_reg(&quotient_alloc);
   restore_scratch_reg(&src2_alloc);
   restore_scratch_reg(&src1_alloc);
+  restore_scratch_reg(&dest_alloc);
 }
 
 static void thumb_emit_mul32(IROperand src1, IROperand src2, IROperand dest, TccIrOp op)
@@ -4405,6 +4476,8 @@ static void thumb_emit_data_processing_op32(IROperand src1, IROperand src2, IROp
 
   const bool dest_sets_flags = (op == TCCIR_OP_CMP);
   int dest_reg = PREG_NONE;
+  ScratchRegAlloc dest_alloc = {0};
+  int need_dest_storeback = 0;
   if (irop_is_none(dest))
   {
     if (!dest_sets_flags)
@@ -4417,17 +4490,25 @@ static void thumb_emit_data_processing_op32(IROperand src1, IROperand src2, IROp
     dest_reg = dest.pr0_reg;
     if (dest_reg == PREG_REG_NONE)
     {
-      if (!dest_sets_flags)
-        tcc_error("compiler_error: %s missing destination register after materialization", ctx);
-      /* CMP only sets flags; the encoding ignores Rd. Use R0 to keep encoders happy. */
-      dest_reg = R0;
+      if (dest_sets_flags)
+      {
+        /* CMP only sets flags; the encoding ignores Rd. Use R0 to keep encoders happy. */
+        dest_reg = R0;
+      }
+      else
+      {
+        /* Destination has no physical register - allocate a scratch and store back */
+        dest_alloc = get_scratch_reg_with_save(0);
+        dest_reg = dest_alloc.reg;
+        need_dest_storeback = 1;
+      }
     }
     else
     {
       thumb_require_materialized_reg(ctx, "dest", dest_reg);
-      if (thumb_is_hw_reg(dest_reg))
-        exclude_regs |= (1u << dest_reg);
     }
+    if (thumb_is_hw_reg(dest_reg))
+      exclude_regs |= (1u << dest_reg);
   }
 
   /* If src2 is already in a register or cached, exclude it so src1 doesn't clobber it */
@@ -4474,8 +4555,19 @@ static void thumb_emit_data_processing_op32(IROperand src1, IROperand src2, IROp
     const uint32_t imm_val = (uint32_t)irop_get_imm64_ex(tcc_state->ir, src2);
     if (handler.imm_handler && ot(handler.imm_handler(dest_reg, src1_reg, imm_val, flags, ENFORCE_ENCODING_NONE)))
     {
+      /* Store result back to stack if we used a scratch for the destination */
+      if (need_dest_storeback)
+      {
+        int frame_offset = irop_get_stack_offset(dest);
+        if (dest.is_param)
+          tcc_machine_store_param_slot(dest_reg, frame_offset);
+        else
+          tcc_machine_store_spill_slot(dest_reg, frame_offset);
+      }
       if (src1_alloc.reg != 0)
         restore_scratch_reg(&src1_alloc);
+      if (dest_alloc.reg != 0)
+        restore_scratch_reg(&dest_alloc);
       return;
     }
 
@@ -4498,10 +4590,22 @@ static void thumb_emit_data_processing_op32(IROperand src1, IROperand src2, IROp
 
   ot_check(handler.reg_handler(dest_reg, src1_reg, src2_reg, flags, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
 
+  /* Store result back to stack if we used a scratch for the destination */
+  if (need_dest_storeback)
+  {
+    int frame_offset = irop_get_stack_offset(dest);
+    if (dest.is_param)
+      tcc_machine_store_param_slot(dest_reg, frame_offset);
+    else
+      tcc_machine_store_spill_slot(dest_reg, frame_offset);
+  }
+
   if (src2_alloc.reg != 0)
     restore_scratch_reg(&src2_alloc);
   if (src1_alloc.reg != 0)
     restore_scratch_reg(&src1_alloc);
+  if (dest_alloc.reg != 0)
+    restore_scratch_reg(&dest_alloc);
 }
 
 /* Helper to get accumulator operand for MLA instruction (4th operand)

@@ -31,6 +31,29 @@
 /* gnu headers use to #define __attribute__ to empty for non-gcc compilers */
 #ifdef __TINYC__
 #undef __attribute__
+/* TCC does not provide these as true builtins when self-compiling */
+static inline int __builtin_ctz(unsigned int x)
+{
+  int n = 0;
+  if (x == 0)
+    return 32;
+  while (!(x & 1))
+  {
+    n++;
+    x >>= 1;
+  }
+  return n;
+}
+static inline int __builtin_popcount(unsigned int x)
+{
+  int c = 0;
+  while (x)
+  {
+    c += x & 1;
+    x >>= 1;
+  }
+  return c;
+}
 #endif
 #include <errno.h>
 #include <fcntl.h>
@@ -1611,6 +1634,7 @@ ST_FUNC void tccelf_begin_file(TCCState *s1);
 ST_FUNC void tccelf_end_file(TCCState *s1);
 ST_FUNC Section *new_section(TCCState *s1, const char *name, int sh_type, int sh_flags);
 ST_FUNC void section_realloc(Section *sec, unsigned long new_size);
+ST_FUNC void section_materialize(TCCState *s1, Section *sec);
 ST_FUNC size_t section_add(Section *sec, addr_t size, int align);
 ST_FUNC void *section_ptr_add(Section *sec, addr_t size);
 ST_FUNC void section_prealloc(Section *sec, unsigned long size);
@@ -2016,6 +2040,7 @@ ST_FUNC int tcc_machine_can_encode_stack_offset_for_reg(int frame_offset, int de
 ST_FUNC int tcc_machine_can_encode_stack_offset_with_param_adj(int frame_offset, int is_param, int dest_reg);
 ST_FUNC void tcc_machine_load_spill_slot(int dest_reg, int frame_offset);
 ST_FUNC void tcc_machine_store_spill_slot(int src_reg, int frame_offset);
+ST_FUNC void tcc_machine_store_param_slot(int src_reg, int frame_offset);
 ST_FUNC void tcc_machine_addr_of_stack_slot(int dest_reg, int frame_offset, int is_param);
 
 /* Constant/value materialization - load various value types into registers */
@@ -2099,9 +2124,9 @@ ST_FUNC int tcc_has_quadruple_64bit_operand(SValue *src1, SValue *src2, SValue *
 #define DEFAULT_DWARF_VERSION 5
 #endif
 
-/* default dwarf version for "-g". use 0 to emit stab debug infos */
+/* default dwarf version for "-g". Always use DWARF (stabs removed). */
 #ifndef CONFIG_DWARF_VERSION
-#define CONFIG_DWARF_VERSION 0
+#define CONFIG_DWARF_VERSION 5
 #endif
 
 #if defined TCC_TARGET_PE

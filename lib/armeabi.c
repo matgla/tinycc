@@ -130,6 +130,14 @@ void *__aeabi_memmove4(void *dest, const void *src, size_t n)
   return aeabi_memmove_impl(dest, src, n);
 }
 
+/* ARM EABI convenience entrypoint: src/dest are 8-byte aligned and n is a
+ * multiple of 8. TCC generates calls to this for 8-byte aligned struct copies.
+ */
+void *__aeabi_memmove8(void *dest, const void *src, size_t n)
+{
+  return aeabi_memmove_impl(dest, src, n);
+}
+
 void *__aeabi_memset(void *dest, size_t n, int c)
 {
   unsigned char *d = (unsigned char *)dest;

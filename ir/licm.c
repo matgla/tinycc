@@ -859,14 +859,16 @@ static int hoist_const_exprs_from_loop(TCCIRState *ir, IRLoop *loop)
     if (hoisted_exprs[i].is_hoisted)
       continue;
 
-    int orig_idx = hoisted_exprs[i].instr_idx;
+    /* Adjust index: previous insertions in this loop shifted all
+     * instructions after insert_pos forward by total_inserted. */
+    int orig_idx = hoisted_exprs[i].instr_idx + total_inserted;
     IRQuadCompact *orig_q = &ir->compact_instructions[orig_idx];
 
     /* Create a copy of the original instruction with NEW pool entries.
      * We must NOT share operand_base with the original, because
      * tcc_ir_op_set_dest modifies the pool directly, which would
      * corrupt the original instruction's operands. */
-    IRQuadCompact hoist_q;
+    IRQuadCompact hoist_q = {0};
     hoist_q.op = orig_q->op;
 
     /* Read original operands */

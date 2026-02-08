@@ -773,7 +773,6 @@ LIBTCCAPI TCCState *tcc_new(void)
   s->float_abi = ARM_SOFTFP_FLOAT; // use soft abi and prefer hard library as default
   s->fpu_type = ARM_FPU_AUTO;      /* default to auto-detect */
 #if defined(TCC_TARGET_YASOS)
-  printf("Yasos ABI\n");
   s->text_and_data_separation = 1;
   s->pic = 1;
   s->section_align = 4;
@@ -965,7 +964,8 @@ ST_FUNC int tcc_add_file_internal(TCCState *s1, const char *filename, int flags)
   }
 
   s1->current_filename = filename;
-  s1->current_archive_offset = 0; /* Reset archive offset for regular files */
+  s1->current_archive_offset = 0;  /* Reset archive offset for regular files */
+  s1->current_archive_path = NULL; /* Reset archive path for regular files */
   if (flags & AFF_TYPE_BIN)
   {
     ElfW(Ehdr) ehdr;
@@ -1099,7 +1099,6 @@ ST_FUNC int tcc_add_crt(TCCState *s1, const char *filename)
 LIBTCCAPI int tcc_add_library(TCCState *s, const char *libraryname)
 {
   static const char *const libs[] = {"%s/lib%s.so", "%s/lib%s.a", NULL};
-  printf("tcc_add_library: %s, with linking: %d\n", libraryname, s->static_link);
   const char *const *pp = s->static_link ? libs + 1 : libs;
   int flags = s->filetype & AFF_WHOLE_ARCHIVE;
   while (*pp)

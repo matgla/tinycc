@@ -156,6 +156,35 @@
 #define __UINT16_TYPE__ unsigned short
 #define __UINT32_TYPE__ unsigned int
 
+/* Sized integer max/min values needed by stdint.h on some platforms.
+   These are indented with 4 spaces so that c2str stringifies the guards
+   instead of emitting them as real host-preprocessor directives (which
+   would cause the host GCC to strip the blocks). */
+#ifndef __INT8_MAX__
+#define __INT8_MAX__ 0x7f
+#endif
+#ifndef __INT16_MAX__
+#define __INT16_MAX__ 0x7fff
+#endif
+#ifndef __INT32_MAX__
+#define __INT32_MAX__ 0x7fffffff
+#endif
+#ifndef __INT64_MAX__
+#define __INT64_MAX__ 0x7fffffffffffffffLL
+#endif
+#ifndef __UINT8_MAX__
+#define __UINT8_MAX__ 0xff
+#endif
+#ifndef __UINT16_MAX__
+#define __UINT16_MAX__ 0xffff
+#endif
+#ifndef __UINT32_MAX__
+#define __UINT32_MAX__ 0xffffffffU
+#endif
+#ifndef __UINT64_MAX__
+#define __UINT64_MAX__ 0xffffffffffffffffULL
+#endif
+
 #if !defined _WIN32
 /* glibc defines. We do not support __USER_NAME_PREFIX__ */
 #define __REDIRECT(name, proto, alias) name proto __asm__(#alias)
@@ -214,16 +243,13 @@ typedef struct
 void *__va_arg(__builtin_va_list ap, int arg_type, int size, int align);
 #define __builtin_va_start(ap, last) (*(ap) = *(__builtin_va_list)((char *)__builtin_frame_address(0) - 24))
 #define __builtin_va_arg(ap, t) (*(t *)(__va_arg(ap, __builtin_va_arg_types(t), sizeof(t), __alignof__(t))))
-#ifdef TCC_IS_NATIVE
-#ifndef __builtin_va_copy
 #define __builtin_va_copy(dest, src) (*(dest) = *(src))
-#endif
-#endif
 
 #else /* _WIN64 */
 typedef char *__builtin_va_list;
 #define __builtin_va_arg(ap, t)                                                                                        \
   ((sizeof(t) > 8 || (sizeof(t) & (sizeof(t) - 1))) ? **(t **)((ap += 8) - 8) : *(t *)((ap += 8) - 8))
+#define __builtin_va_copy(dest, src) (dest) = (src)
 #endif
 
 #elif defined __arm__
@@ -253,11 +279,7 @@ void *__va_arg(__builtin_va_list ap, int size, int align);
 #define __builtin_va_start(ap, last)                                                                                   \
   __tcc_va_start((ap), &(last), sizeof(last), __alignof__(last), __builtin_frame_address(0))
 #define __builtin_va_arg(ap, type) (*(type *)__va_arg((ap), sizeof(type), __alignof__(type)))
-#ifdef TCC_IS_NATIVE
-#ifndef __builtin_va_copy
 #define __builtin_va_copy(dest, src) (*(dest) = *(src))
-#endif
-#endif
 
 #elif defined __aarch64__
 #if defined __APPLE__
@@ -283,19 +305,16 @@ typedef char *__builtin_va_list;
          ? *(type **)((ap += __va_reg_size) - __va_reg_size)                                                           \
          : (ap = (va_list)(_tcc_align(ap, type) + (sizeof(type) + __va_reg_size - 1) & -__va_reg_size),                \
             (type *)(ap - ((sizeof(type) + __va_reg_size - 1) & -__va_reg_size)))))
+#define __builtin_va_copy(dest, src) (dest) = (src)
 
 #else /* __i386__ */
 typedef char *__builtin_va_list;
 #define __builtin_va_start(ap, last) (ap = ((char *)&(last)) + ((sizeof(last) + 3) & ~3))
 #define __builtin_va_arg(ap, t) (*(t *)((ap += (sizeof(t) + 3) & ~3) - ((sizeof(t) + 3) & ~3)))
+#define __builtin_va_copy(dest, src) (dest) = (src)
 
 #endif
 #define __builtin_va_end(ap) (void)(ap)
-#ifdef TCC_IS_NATIVE
-#ifndef __builtin_va_copy
-#define __builtin_va_copy(dest, src) (dest) = (src)
-#endif
-#endif
 
 /* TCC BBUILTIN AND BOUNDS ALIASES */
 #ifdef __leading_underscore

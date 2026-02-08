@@ -38,7 +38,7 @@ typedef enum TccIrOp : uint8_t
   TCCIR_OP_SUBC_USE,
   TCCIR_OP_SUBC_GEN,
   TCCIR_OP_MUL,
-  TCCIR_OP_MLA,       /* Multiply-Accumulate: dest = src1 * src2 + accum */
+  TCCIR_OP_MLA, /* Multiply-Accumulate: dest = src1 * src2 + accum */
   TCCIR_OP_UMULL,
   TCCIR_OP_DIV,
   TCCIR_OP_UMOD,
@@ -68,16 +68,16 @@ typedef enum TccIrOp : uint8_t
   TCCIR_OP_STORE,
   TCCIR_OP_ASSIGN,
   TCCIR_OP_LEA, /* Load Effective Address: dest = &src1 (compute address without loading) */
-  
+
   /* Indexed memory operations for array access optimization */
   TCCIR_OP_LOAD_INDEXED,  /* dest = *(base + (index << scale)) - ARM LDR rd,[rn,rm,LSL #scale] */
   TCCIR_OP_STORE_INDEXED, /* *(base + (index << scale)) = src - ARM STR rd,[rn,rm,LSL #scale] */
-  
+
   /* Post-increment memory operations for sequential access optimization
    * These combine a load/store with pointer increment: */
   TCCIR_OP_LOAD_POSTINC,  /* dest = *ptr; ptr += offset - ARM LDR rd,[rn],#imm */
   TCCIR_OP_STORE_POSTINC, /* *ptr = src; ptr += offset - ARM STR rd,[rn],#imm */
-  
+
   /* Floating point operations */
   TCCIR_OP_FADD, /* float/double addition */
   TCCIR_OP_FSUB, /* float/double subtraction */
@@ -273,12 +273,13 @@ typedef struct TCCStackLayout
 } TCCStackLayout;
 
 /* Switch table metadata for jump table generation */
-typedef struct TCCIRSwitchTable {
-  int64_t min_val;        /* Minimum case value */
-  int64_t max_val;        /* Maximum case value */
-  int default_target;     /* IR index for default case */
-  int *targets;           /* Array of IR indices [max-min+1] */
-  int num_entries;        /* Size of targets array */
+typedef struct TCCIRSwitchTable
+{
+  int64_t min_val;    /* Minimum case value */
+  int64_t max_val;    /* Maximum case value */
+  int default_target; /* IR index for default case */
+  int *targets;       /* Array of IR indices [max-min+1] */
+  int num_entries;    /* Size of targets array */
 } TCCIRSwitchTable;
 
 typedef struct TCCMachineScratchRegs
@@ -321,6 +322,7 @@ typedef struct TCCMaterializedDest
 {
   uint8_t needs_storeback;
   uint8_t is_64bit;
+  uint8_t is_param; /* storeback target is a stack-passed parameter (needs offset_to_args adjustment) */
   uint8_t original_pr0;
   uint8_t original_pr1;
   unsigned short original_r;
@@ -364,7 +366,7 @@ typedef struct TCCIRState
   uint8_t basic_block_start : 1;
   uint8_t prevent_coalescing;
   int32_t loc;
-  
+
   /* Optimization module data - opaque pointer to keep IR arch-independent */
   TCCFPMatCache *opt_fp_mat_cache;
 
@@ -472,7 +474,6 @@ TCCIRState *tcc_ir_allocate_block();
 /* If the value is an lvalue (memory reference), emit an IR load so the
  * SValue becomes a plain value suitable for arithmetic/indirect calls. */
 
-
 int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *dest);
 
 #ifdef CONFIG_TCC_ASM
@@ -521,7 +522,6 @@ void tcc_ir_print_vreg(int vreg);
 void print_iroperand_short(TCCIRState *ir, IROperand op);
 void tcc_print_quadruple_irop(TCCIRState *ir, IRQuadCompact *q, int pc);
 
-
 /* Machine-independent spill helpers (defined in tccir.c) */
 int tcc_ir_is_spilled(SValue *sv);
 int tcc_ir_is_spilled_ir(const IROperand *op);
@@ -566,6 +566,8 @@ static inline IROperand tcc_ir_op_get_dest(const TCCIRState *ir, const IRQuadCom
 {
   if (!irop_config[q->op].has_dest)
     return IROP_NONE;
+  if (q->operand_base >= (uint32_t)ir->iroperand_pool_count)
+    return IROP_NONE;
   return ir->iroperand_pool[q->operand_base];
 }
 
@@ -573,6 +575,8 @@ static inline IROperand tcc_ir_get_dest(const TCCIRState *ir, int index)
 {
   IRQuadCompact *q = &ir->compact_instructions[index];
   if (!irop_config[q->op].has_dest)
+    return IROP_NONE;
+  if (q->operand_base >= (uint32_t)ir->iroperand_pool_count)
     return IROP_NONE;
   return ir->iroperand_pool[q->operand_base];
 }
@@ -582,6 +586,8 @@ static inline IROperand tcc_ir_op_get_src1(const TCCIRState *ir, const IRQuadCom
   if (!irop_config[q->op].has_src1)
     return IROP_NONE;
   int off = irop_config[q->op].has_dest;
+  if (q->operand_base + off >= (uint32_t)ir->iroperand_pool_count)
+    return IROP_NONE;
   return ir->iroperand_pool[q->operand_base + off];
 }
 
@@ -591,6 +597,8 @@ static inline IROperand tcc_ir_get_src1(const TCCIRState *ir, int index)
   if (!irop_config[q->op].has_src1)
     return IROP_NONE;
   int off = irop_config[q->op].has_dest;
+  if (q->operand_base + off >= (uint32_t)ir->iroperand_pool_count)
+    return IROP_NONE;
   return ir->iroperand_pool[q->operand_base + off];
 }
 
@@ -599,6 +607,8 @@ static inline IROperand tcc_ir_op_get_src2(const TCCIRState *ir, const IRQuadCom
   if (!irop_config[q->op].has_src2)
     return IROP_NONE;
   int off = irop_config[q->op].has_dest + irop_config[q->op].has_src1;
+  if (q->operand_base + off >= (uint32_t)ir->iroperand_pool_count)
+    return IROP_NONE;
   return ir->iroperand_pool[q->operand_base + off];
 }
 
@@ -608,6 +618,8 @@ static inline IROperand tcc_ir_get_src2(const TCCIRState *ir, int index)
   if (!irop_config[q->op].has_src2)
     return IROP_NONE;
   int off = irop_config[q->op].has_dest + irop_config[q->op].has_src1;
+  if (q->operand_base + off >= (uint32_t)ir->iroperand_pool_count)
+    return IROP_NONE;
   return ir->iroperand_pool[q->operand_base + off];
 }
 

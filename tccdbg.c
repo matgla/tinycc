@@ -657,6 +657,10 @@ ST_FUNC void tcc_debug_new(TCCState *s1)
   if (!s1->dState)
     s1->dState = tcc_mallocz(sizeof *s1->dState);
 
+  /* Stabs removed — always use DWARF */
+  if (!s1->dwarf)
+    s1->dwarf = DEFAULT_DWARF_VERSION;
+
 #ifdef CONFIG_TCC_BACKTRACE
   /* include stab info with standalone backtrace support */
   if (s1->do_debug && s1->output_type == TCC_OUTPUT_MEMORY)
@@ -665,78 +669,57 @@ ST_FUNC void tcc_debug_new(TCCState *s1)
     shf = SHF_ALLOC; /* have debug data available at runtime */
 #endif
 
-  if (s1->dwarf)
+  s1->dwlo = s1->nb_sections;
+  dwarf_info_section = new_section(s1, ".debug_info", SHT_PROGBITS, shf);
+  dwarf_abbrev_section = new_section(s1, ".debug_abbrev", SHT_PROGBITS, shf);
+  dwarf_line_section = new_section(s1, ".debug_line", SHT_PROGBITS, shf);
+  dwarf_aranges_section = new_section(s1, ".debug_aranges", SHT_PROGBITS, shf);
+  dwarf_ranges_section = new_section(s1, ".debug_ranges", SHT_PROGBITS, shf);
+  shf |= SHF_MERGE | SHF_STRINGS;
+  dwarf_str_section = new_section(s1, ".debug_str", SHT_PROGBITS, shf);
+  dwarf_str_section->sh_entsize = 1;
+  dwarf_info_section->sh_addralign = dwarf_abbrev_section->sh_addralign = dwarf_line_section->sh_addralign =
+      dwarf_aranges_section->sh_addralign = dwarf_ranges_section->sh_addralign = dwarf_str_section->sh_addralign = 1;
+  if (s1->dwarf >= 5)
   {
-    s1->dwlo = s1->nb_sections;
-    dwarf_info_section = new_section(s1, ".debug_info", SHT_PROGBITS, shf);
-    dwarf_abbrev_section = new_section(s1, ".debug_abbrev", SHT_PROGBITS, shf);
-    dwarf_line_section = new_section(s1, ".debug_line", SHT_PROGBITS, shf);
-    dwarf_aranges_section = new_section(s1, ".debug_aranges", SHT_PROGBITS, shf);
-    dwarf_ranges_section = new_section(s1, ".debug_ranges", SHT_PROGBITS, shf);
-    shf |= SHF_MERGE | SHF_STRINGS;
-    dwarf_str_section = new_section(s1, ".debug_str", SHT_PROGBITS, shf);
-    dwarf_str_section->sh_entsize = 1;
-    dwarf_info_section->sh_addralign = dwarf_abbrev_section->sh_addralign = dwarf_line_section->sh_addralign =
-        dwarf_aranges_section->sh_addralign = dwarf_ranges_section->sh_addralign = dwarf_str_section->sh_addralign = 1;
-    if (s1->dwarf >= 5)
-    {
-      dwarf_line_str_section = new_section(s1, ".debug_line_str", SHT_PROGBITS, shf);
-      dwarf_line_str_section->sh_entsize = 1;
-      dwarf_line_str_section->sh_addralign = 1;
-    }
-    s1->dwhi = s1->nb_sections;
+    dwarf_line_str_section = new_section(s1, ".debug_line_str", SHT_PROGBITS, shf);
+    dwarf_line_str_section->sh_entsize = 1;
+    dwarf_line_str_section->sh_addralign = 1;
   }
-  else
-  {
-    stab_section = new_section(s1, ".stab", SHT_PROGBITS, shf);
-    stab_section->sh_entsize = sizeof(Stab_Sym);
-    stab_section->sh_addralign = sizeof((Stab_Sym *)0)->n_value;
-    stab_section->link = new_section(s1, ".stabstr", SHT_STRTAB, shf);
-    /* put first entry */
-    put_stabs(s1, "", 0, 0, 0, 0);
-  }
+  s1->dwhi = s1->nb_sections;
 }
 
-/* put stab debug information */
+/* put stab debug information — stabs removed, these are no-ops */
 static void put_stabs(TCCState *s1, const char *str, int type, int other, int desc, unsigned long value)
 {
-  Stab_Sym *sym;
-
-  unsigned offset;
-  if (type == N_SLINE && (offset = stab_section->data_offset) &&
-      (sym = (Stab_Sym *)(stab_section->data + offset) - 1) && sym->n_type == type && sym->n_value == value)
-  {
-    /* just update line_number in previous entry */
-    sym->n_desc = desc;
-    return;
-  }
-
-  sym = section_ptr_add(stab_section, sizeof(Stab_Sym));
-  if (str)
-  {
-    sym->n_strx = put_elf_str(stab_section->link, str);
-  }
-  else
-  {
-    sym->n_strx = 0;
-  }
-  sym->n_type = type;
-  sym->n_other = other;
-  sym->n_desc = desc;
-  sym->n_value = value;
+  (void)s1;
+  (void)str;
+  (void)type;
+  (void)other;
+  (void)desc;
+  (void)value;
 }
 
 static void put_stabs_r(TCCState *s1, const char *str, int type, int other, int desc, unsigned long value, Section *sec,
                         int sym_index)
 {
-  put_elf_reloc(symtab_section, stab_section, stab_section->data_offset + 8,
-                sizeof((Stab_Sym *)0)->n_value == PTR_SIZE ? R_DATA_PTR : R_DATA_32, sym_index);
-  put_stabs(s1, str, type, other, desc, value);
+  (void)s1;
+  (void)str;
+  (void)type;
+  (void)other;
+  (void)desc;
+  (void)value;
+  (void)sec;
+  (void)sym_index;
 }
 
 static void put_stabn(TCCState *s1, int type, int other, int desc, int value)
 {
-  put_stabs(s1, NULL, type, other, desc, value);
+  (void)s1;
+  (void)type;
+  (void)other;
+  (void)desc;
+  (void)value;
 }
 
 /* ------------------------------------------------------------------------- */

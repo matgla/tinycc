@@ -28,6 +28,17 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Ensure limit constants are available even with minimal libc headers */
+#ifndef UINT32_MAX
+#define UINT32_MAX 0xFFFFFFFFU
+#endif
+#ifndef INT32_MAX
+#define INT32_MAX 0x7FFFFFFF
+#endif
+#ifndef INT32_MIN
+#define INT32_MIN (-INT32_MAX - 1)
+#endif
+
 /* ============================================================================
  * IROperand pool management - separate pools for cache efficiency
  * ============================================================================

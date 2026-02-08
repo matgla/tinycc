@@ -192,7 +192,10 @@ ST_FUNC int tcc_tool_ar(TCCState *s1, int argc, char **argv)
   }
 
   funcmax = 250;
-  afpos = tcc_realloc(NULL, funcmax * sizeof *afpos); // 250 func
+  {
+    int alloc_sz = funcmax * sizeof *afpos;
+    afpos = tcc_realloc(NULL, alloc_sz);
+  } // 250 func
   memcpy(&arhdro.ar_mode, "100644", 6);
 
   // i_obj = first input object file
@@ -226,12 +229,16 @@ ST_FUNC int tcc_tool_ar(TCCState *s1, int argc, char **argv)
       goto the_end;
     }
 
-    shdr = (ElfW(Shdr) *)(buf + ehdr->e_shoff + ehdr->e_shstrndx * ehdr->e_shentsize);
+    {
+      int shent_off = ehdr->e_shstrndx * ehdr->e_shentsize;
+      shdr = (ElfW(Shdr) *)(buf + ehdr->e_shoff + shent_off);
+    }
     shstr = (char *)(buf + shdr->sh_offset);
     symtab = strtab = NULL;
     for (i = 0; i < ehdr->e_shnum; i++)
     {
-      shdr = (ElfW(Shdr) *)(buf + ehdr->e_shoff + i * ehdr->e_shentsize);
+      int shent_off = i * ehdr->e_shentsize;
+      shdr = (ElfW(Shdr) *)(buf + ehdr->e_shoff + shent_off);
       if (!shdr->sh_offset)
         continue;
       if (shdr->sh_type == SHT_SYMTAB)
@@ -255,7 +262,8 @@ ST_FUNC int tcc_tool_ar(TCCState *s1, int argc, char **argv)
       // printf("symtab: info size shndx name\n");
       for (i = 1; i < nsym; i++)
       {
-        sym = (ElfW(Sym) *)(symtab + i * sizeof(ElfW(Sym)));
+        int sym_off = i * sizeof(ElfW(Sym));
+        sym = (ElfW(Sym) *)(symtab + sym_off);
         if (sym->st_shndx && (sym->st_info == 0x10 || sym->st_info == 0x11 || sym->st_info == 0x12 ||
                               sym->st_info == 0x20 || sym->st_info == 0x21 || sym->st_info == 0x22))
         {
@@ -268,7 +276,10 @@ ST_FUNC int tcc_tool_ar(TCCState *s1, int argc, char **argv)
           if (++funccnt >= funcmax)
           {
             funcmax += 250;
-            afpos = tcc_realloc(afpos, funcmax * sizeof *afpos); // 250 func more
+            {
+              int alloc_sz = funcmax * sizeof *afpos;
+              afpos = tcc_realloc(afpos, alloc_sz);
+            } // 250 func more
           }
           afpos[funccnt] = fpos;
         }
@@ -294,7 +305,10 @@ ST_FUNC int tcc_tool_ar(TCCState *s1, int argc, char **argv)
     if (fpos & 1)
       fputc(0, fo), ++fpos;
   }
-  hofs = 8 + sizeof(arhdr) + strpos + (funccnt + 1) * sizeof(int);
+  {
+    int sym_tbl_sz = (funccnt + 1) * sizeof(int);
+    hofs = 8 + sizeof(arhdr) + strpos + sym_tbl_sz;
+  }
   fpos = 0;
   if ((hofs & 1)) // align
     hofs++, fpos = 1;
@@ -306,13 +320,19 @@ ST_FUNC int tcc_tool_ar(TCCState *s1, int argc, char **argv)
     ret = 0;
     goto the_end;
   }
-  sprintf(stmp, "%-10d", (int)(strpos + (funccnt + 1) * sizeof(int)) + fpos);
+  {
+    int sym_tbl_sz = (funccnt + 1) * sizeof(int);
+    sprintf(stmp, "%-10d", (int)(strpos + sym_tbl_sz) + fpos);
+  }
   memcpy(&arhdr.ar_size, stmp, 10);
   fwrite(&arhdr, sizeof(arhdr), 1, fh);
   afpos[0] = le2belong(funccnt);
   for (i = 1; i <= funccnt; i++)
     afpos[i] = le2belong(afpos[i] + hofs);
-  fwrite(afpos, (funccnt + 1) * sizeof(int), 1, fh);
+  {
+    int sym_tbl_sz = (funccnt + 1) * sizeof(int);
+    fwrite(afpos, sym_tbl_sz, 1, fh);
+  }
   fwrite(anames, strpos, 1, fh);
   if (fpos)
     fwrite("", 1, 1, fh);

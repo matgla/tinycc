@@ -1128,12 +1128,12 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
   int original_leaffunc = ir->leaffunc;
   uint32_t extra_prologue_regs = 0;
 
-#if 1  /* DRY_RUN_ENABLED */
+#if 1 /* DRY_RUN_ENABLED */
   /* Initialize dry-run state and branch optimization */
   tcc_gen_machine_dry_run_init();
   tcc_gen_machine_branch_opt_init();
   tcc_gen_machine_dry_run_start();
-  
+
   /* Reset scratch state for clean dry-run */
   tcc_gen_machine_reset_scratch_state();
   tcc_ir_spill_cache_clear(&ir->spill_cache);
@@ -1152,9 +1152,12 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
     ir->codegen_instruction_idx = i;
     cq = &ir->compact_instructions[i];
 
+    /* Record address mapping for branch optimizer analysis */
+    ir_to_code_mapping[i] = ind;
+
     /* Skip marker ops */
-    if (cq->op == TCCIR_OP_ASM_INPUT || cq->op == TCCIR_OP_ASM_OUTPUT ||
-        cq->op == TCCIR_OP_NOP || cq->op == TCCIR_OP_INLINE_ASM)
+    if (cq->op == TCCIR_OP_ASM_INPUT || cq->op == TCCIR_OP_ASM_OUTPUT || cq->op == TCCIR_OP_NOP ||
+        cq->op == TCCIR_OP_INLINE_ASM)
       continue;
 
     /* Determine materialization needs (same logic as real pass) */
@@ -1276,7 +1279,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
       need_dest_value = true;
       break;
     case TCCIR_OP_SWITCH_TABLE:
-      need_src1_value = true;  /* Index vreg needs materialization */
+      need_src1_value = true; /* Index vreg needs materialization */
       /* src2 contains table_id which is an immediate, not a vreg */
       break;
     default:
@@ -1413,11 +1416,17 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
       tcc_gen_machine_indirect_jump_op(src1_ir);
       break;
     case TCCIR_OP_SWITCH_TABLE:
-      /* Dry-run: approximate TBB/TBH instruction size (4 bytes) + table size */
-      /* Actual table size depends on range, but for dry-run we just need consistency */
-      ind += 4;  /* TBB/TBH instruction */
-      ind += 4;  /* Approximate table size (will be refined in real pass) */
+    {
+      /* Dry-run: compute exact table size so branch offsets are accurate.
+       * The real pass emits TBB/TBH (4 bytes) + 1 or 2 bytes per entry + alignment. */
+      int table_id = (int)irop_get_imm64_ex(ir, src2_ir);
+      TCCIRSwitchTable *table = &ir->switch_tables[table_id];
+      int use_tbh = (table->num_entries > 255);
+      int table_data_size = use_tbh ? table->num_entries * 2 : table->num_entries + (table->num_entries & 1);
+      ind += 4;               /* TBB/TBH instruction */
+      ind += table_data_size; /* Jump table entries + alignment */
       break;
+    }
     case TCCIR_OP_SETIF:
       tcc_gen_machine_setif_op(dest_ir, src1_ir, cq->op);
       break;
@@ -1486,7 +1495,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
     /* LR was pushed in loop - save at prologue instead */
     extra_prologue_regs |= (1 << 14); /* R_LR */
     /* NOTE: We don't modify ir->leaffunc here because optimizations may depend on it.
-     * The extra_prologue_regs will ensure LR is pushed in the prologue, making it 
+     * The extra_prologue_regs will ensure LR is pushed in the prologue, making it
      * available as scratch without push/pop in loops, which is the main goal. */
   }
 
@@ -1495,15 +1504,15 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
   loc = saved_loc;
   ir->call_outgoing_base = saved_call_outgoing_base;
   ir->codegen_instruction_idx = saved_codegen_idx;
-  
+
   /* Reset scratch state for real pass */
   tcc_gen_machine_reset_scratch_state();
-  
+
   /* Clear caches for fresh start - dry-run may have recorded entries
    * but the actual instructions were never emitted */
   tcc_ir_spill_cache_clear(&ir->spill_cache);
   tcc_ir_opt_fp_cache_clear(ir);
-#endif  /* DRY_RUN_DISABLED */
+#endif /* DRY_RUN_DISABLED */
 
   /* ============================================================================
    * REAL CODE GENERATION PASS
@@ -1511,7 +1520,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
    */
 
   // generate prolog (with extra registers if needed)
-  (void)original_leaffunc;  /* May be unused when dry-run is disabled */
+  (void)original_leaffunc; /* May be unused when dry-run is disabled */
   tcc_gen_machine_prolog(ir->leaffunc, ir->ls.dirty_registers, stack_size, extra_prologue_regs);
 
   for (int i = 0; i < ir->next_instruction_index; i++)
@@ -1852,7 +1861,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
        * IR operands: dest, ptr, offset
        * Use dest_ir, src1_ir (ptr), and scale field for offset
        */
-      IROperand ptr_op = src1_ir;  /* pointer register */
+      IROperand ptr_op = src1_ir;                        /* pointer register */
       IROperand offset_op = tcc_ir_op_get_scale(ir, cq); /* offset is in scale position */
       tcc_gen_machine_load_postinc_op(dest_ir, ptr_op, offset_op);
       break;
@@ -1863,8 +1872,8 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
        * IR operands: ptr, src, offset
        * Use dest_ir (ptr), src1_ir (value), and scale field for offset
        */
-      IROperand ptr_op = dest_ir;   /* pointer register */
-      IROperand value_op = src1_ir; /* value to store */
+      IROperand ptr_op = dest_ir;                        /* pointer register */
+      IROperand value_op = src1_ir;                      /* value to store */
       IROperand offset_op = tcc_ir_op_get_scale(ir, cq); /* offset is in scale position */
       tcc_gen_machine_store_postinc_op(ptr_op, value_op, offset_op);
       break;

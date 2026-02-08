@@ -2124,8 +2124,6 @@ static void relocate_section(TCCState *s1, Section *s, Section *sr)
     if (s1->output_type & TCC_OUTPUT_DYN)
     {
       size_t r = (uint8_t *)qrel - sr->data;
-      if (sizeof((Stab_Sym *)0)->n_value < PTR_SIZE && 0 == strcmp(s->name, ".stab"))
-        r = 0; /* cannot apply 64bit relocation to 32bit value */
       sr->data_offset = sr->sh_size = r;
 #ifdef CONFIG_TCC_PIE
       if (r && (s->sh_flags & SHF_EXECINSTR))
@@ -2599,9 +2597,8 @@ ST_FUNC void tcc_add_btstub(TCCState *s1)
   }
   else
   {
-    put_ptr(s1, stab_section, 0);
-    put_ptr(s1, stab_section, -1);
-    put_ptr(s1, stab_section->link, 0);
+    /* stabs removed - emit zeroes as placeholder */
+    section_ptr_add(s, 3 * PTR_SIZE);
   }
 
   /* skip esym_start/esym_end/elf_str (not loaded) */
@@ -2789,20 +2786,20 @@ ST_FUNC void tccelf_add_arm_fp_lib(TCCState *s1)
     case ARM_FPU_VFP:
     case ARM_FPU_VFPV3:
       /* Soft float or older VFP - use soft FP library */
-      snprintf(lib_path, sizeof(lib_path), "libtcc1-fp-soft-%s.a", target);
+      snprintf(lib_path, sizeof(lib_path), "fp/libtcc1-fp-soft-%s.a", target);
       break;
     case ARM_FPU_VFPV4:
     case ARM_FPU_FPV4_SP_D16:
     case ARM_FPU_FPV5_SP_D16:
       /* VFPv4/VFPv5 single-precision - use vfpv4-sp library */
-      snprintf(lib_path, sizeof(lib_path), "libtcc1-fp-vfpv4-sp-%s.a", target);
+      snprintf(lib_path, sizeof(lib_path), "fp/libtcc1-fp-vfpv4-sp-%s.a", target);
       break;
     case ARM_FPU_FPV5_D16:
     case ARM_FPU_NEON:
     case ARM_FPU_NEON_VFPV4:
     case ARM_FPU_NEON_FP_ARMV8:
       /* VFPv5 double-precision - use vfpv5-dp library */
-      snprintf(lib_path, sizeof(lib_path), "libtcc1-fp-vfpv5-dp-%s.a", target);
+      snprintf(lib_path, sizeof(lib_path), "fp/libtcc1-fp-vfpv5-dp-%s.a", target);
       break;
     default:
       return;
@@ -2811,7 +2808,7 @@ ST_FUNC void tccelf_add_arm_fp_lib(TCCState *s1)
   else
   {
     /* Default to soft float if no FPU specified */
-    snprintf(lib_path, sizeof(lib_path), "libtcc1-fp-soft-%s.a", target);
+    snprintf(lib_path, sizeof(lib_path), "fp/libtcc1-fp-soft-%s.a", target);
   }
 
   /* Add the selected FP library */
@@ -3534,8 +3531,6 @@ static ElfW(Phdr) * fill_phdr(ElfW(Phdr) * ph, int type, Section *s)
   {
     ph->p_offset = s->sh_offset;
     ph->p_vaddr = s->sh_addr;
-    printf("fill_phdr: section %s offset %lx addr %lx size %lx\n", s->name, (unsigned long)ph->p_offset,
-           (unsigned long)ph->p_vaddr, (unsigned long)s->sh_size);
     ph->p_filesz = s->sh_size;
     ph->p_align = s->sh_addralign;
   }
@@ -3625,7 +3620,8 @@ static int layout_sections(TCCState *s1, int *sec_order, struct dyn_inf *d)
   {
     for (int mr = 0; mr < s1->ld_script->nb_memory_regions; mr++)
     {
-      mr_addr[mr] = s1->ld_script->memory_regions[mr].origin;
+      LDMemoryRegion *region = &s1->ld_script->memory_regions[mr];
+      mr_addr[mr] = region->origin;
     }
     addr = mr_addr[0];
   }
@@ -3637,8 +3633,10 @@ static int layout_sections(TCCState *s1, int *sec_order, struct dyn_inf *d)
   n = 0;
   for (i = 1; i < s1->nb_sections; i++)
   {
-    s = s1->sections[sec_order[i]];
-    f = sec_order[i + s1->nb_sections];
+    int sec_idx = sec_order[i];
+    int sec_flags_idx = i + s1->nb_sections;
+    s = s1->sections[sec_idx];
+    f = sec_order[sec_flags_idx];
     align = s->sh_addralign - 1;
 
     if (f == 0)
@@ -3657,7 +3655,8 @@ static int layout_sections(TCCState *s1, int *sec_order, struct dyn_inf *d)
       int ld_idx = ld_find_output_section_idx(s1, s->name, &pat_idx);
       if (ld_idx >= 0)
       {
-        int new_mr = s1->ld_script->output_sections[ld_idx].memory_region_idx;
+        LDOutputSection *os = &s1->ld_script->output_sections[ld_idx];
+        int new_mr = os->memory_region_idx;
         if (new_mr >= 0 && new_mr < s1->ld_script->nb_memory_regions)
         {
           if (new_mr != cur_mr)
@@ -3699,7 +3698,8 @@ static int layout_sections(TCCState *s1, int *sec_order, struct dyn_inf *d)
     if (f & 1 << 8)
     {
       /* set new program header */
-      ph = &d->phdr[phfill + n];
+      int ph_idx = phfill + n;
+      ph = &d->phdr[ph_idx];
       ph->p_type = PT_LOAD;
       ph->p_align = s_align;
       ph->p_flags = PF_R;
@@ -3760,19 +3760,31 @@ static int layout_sections(TCCState *s1, int *sec_order, struct dyn_inf *d)
   if (d->note)
     fill_phdr(++ph, PT_NOTE, d->note);
   if (d->dynamic)
-    fill_phdr(++ph, PT_DYNAMIC, d->dynamic)->p_flags |= PF_W;
+  {
+    ElfW(Phdr) *dph = fill_phdr(++ph, PT_DYNAMIC, d->dynamic);
+    dph->p_flags |= PF_W;
+  }
   if (eh_frame_hdr_section)
     fill_phdr(++ph, PT_GNU_EH_FRAME, eh_frame_hdr_section);
   if (d->roinf)
-    fill_phdr(++ph, PT_GNU_RELRO, d->roinf)->p_flags |= PF_W;
+  {
+    ElfW(Phdr) *rph = fill_phdr(++ph, PT_GNU_RELRO, d->roinf);
+    rph->p_flags |= PF_W;
+  }
   if (d->interp)
-    fill_phdr(&d->phdr[1], PT_INTERP, d->interp);
+  {
+    ElfW(Phdr) *iph = &d->phdr[1];
+    fill_phdr(iph, PT_INTERP, d->interp);
+  }
   if (phfill)
   {
     ph = &d->phdr[0];
     ph->p_offset = sizeof(ElfW(Ehdr));
     ph->p_vaddr = base + ph->p_offset;
-    ph->p_filesz = phnum * sizeof(ElfW(Phdr));
+    {
+      int phdr_sz = phnum * sizeof(ElfW(Phdr));
+      ph->p_filesz = phdr_sz;
+    }
     ph->p_align = 4;
     fill_phdr(ph, PT_PHDR, NULL);
   }
@@ -4701,16 +4713,17 @@ ST_FUNC ssize_t full_read(int fd, void *buf, size_t count)
 {
   char *cbuf = buf;
   size_t rnum = 0;
-  while (1)
+  for (;;)
   {
     ssize_t num = read(fd, cbuf, count - rnum);
     if (num < 0)
       return num;
     if (num == 0)
-      return rnum;
+      break;
     rnum += num;
     cbuf += num;
   }
+  return rnum;
 }
 
 ST_FUNC void *load_data(int fd, unsigned long file_offset, unsigned long size)
@@ -4796,7 +4809,9 @@ ST_FUNC int tcc_load_object_file(TCCState *s1, int fd, unsigned long file_offset
   unsigned long size, offset, offseti;
   int i, j, nb_syms, sym_index, ret, seencompressed;
   char *strsec, *strtab;
-  int stab_index, stabstr_index;
+  int stab_index = 0, stabstr_index = 0;
+  (void)stab_index;
+  (void)stabstr_index;
   int *old_to_new_syms;
   char *sh_name, *name;
   SectionMergeInfo *sm_table, *sm;
@@ -4924,13 +4939,7 @@ ST_FUNC int tcc_load_object_file(TCCState *s1, int fd, unsigned long file_offset
           sm_table[i].link_once = 1;
           goto next;
         }
-        if (stab_section)
-        {
-          if (s == stab_section)
-            stab_index = i;
-          if (s == stab_section->link)
-            stabstr_index = i;
-        }
+        /* stab section tracking removed - DWARF only */
         /* Track if this section was merged (original name differs from lookup name) */
         if (strcmp(sh_name, lookup_name))
           sm_table[i].merged_to = lookup_name;
@@ -4993,23 +5002,7 @@ ST_FUNC int tcc_load_object_file(TCCState *s1, int fd, unsigned long file_offset
   next:;
   }
 
-  /* gr relocate stab strings */
-  if (stab_index && stabstr_index)
-  {
-    Stab_Sym *a, *b;
-    unsigned o;
-    s = sm_table[stab_index].s;
-    section_ensure_loaded(s1, s); /* Materialize lazy section before access */
-    a = (Stab_Sym *)(s->data + sm_table[stab_index].offset);
-    b = (Stab_Sym *)(s->data + s->data_offset);
-    o = sm_table[stabstr_index].offset;
-    while (a < b)
-    {
-      if (a->n_strx)
-        a->n_strx += o;
-      a++;
-    }
-  }
+  /* stab string relocation removed - only DWARF debug info supported */
 
   /* second short pass to update sh_link and sh_info fields of new
      sections */
@@ -5280,9 +5273,19 @@ ST_FUNC int tcc_load_archive(TCCState *s1, int fd, int alacarte)
     {
       /* coff symbol table : we handle it */
       if (!strcmp(hdr.ar_name, "/"))
-        return tcc_load_alacarte(s1, fd, size, 4);
+      {
+        int ret = tcc_load_alacarte(s1, fd, size, 4);
+        s1->current_archive_offset = saved_archive_offset;
+        s1->current_archive_path = saved_archive_path;
+        return ret;
+      }
       if (!strcmp(hdr.ar_name, "/SYM64/"))
-        return tcc_load_alacarte(s1, fd, size, 8);
+      {
+        int ret = tcc_load_alacarte(s1, fd, size, 8);
+        s1->current_archive_offset = saved_archive_offset;
+        s1->current_archive_path = saved_archive_path;
+        return ret;
+      }
     }
     else if (tcc_object_type(fd, &ehdr) == AFF_BINTYPE_REL)
     {
@@ -5301,6 +5304,11 @@ ST_FUNC int tcc_load_archive(TCCState *s1, int fd, int alacarte)
     /* align to even */
     file_offset = (file_offset + size + 1) & ~1;
   }
+  /* Unreachable for non-alacarte mode; required to silence
+     'function might return no value' warning in TCC self-build. */
+  s1->current_archive_offset = saved_archive_offset;
+  s1->current_archive_path = saved_archive_path;
+  return 0;
 }
 
 #ifndef ELF_OBJ_ONLY

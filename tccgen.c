@@ -758,10 +758,12 @@ ST_INLN Sym *sym_find(int v)
 
 static int sym_scope(Sym *s)
 {
+  int scope;
   if (IS_ENUM_VAL(s->type.t))
-    return s->type.ref->sym_scope;
+    scope = s->type.ref->sym_scope;
   else
-    return s->sym_scope;
+    scope = s->sym_scope;
+  return scope;
 }
 
 /* push a given symbol on the symbol stack */
@@ -2835,12 +2837,14 @@ static void gen_opl(int op)
 /* normalize values */
 static uint64_t value64(uint64_t l1, int t)
 {
+  uint64_t result;
   if ((t & VT_BTYPE) == VT_LLONG || (PTR_SIZE == 8 && (t & VT_BTYPE) == VT_PTR))
-    return l1;
+    result = l1;
   else if (t & VT_UNSIGNED)
-    return (uint32_t)l1;
+    result = (uint32_t)l1;
   else
-    return (uint32_t)l1 | -(l1 & 0x80000000);
+    result = (uint32_t)l1 | -(l1 & 0x80000000);
+  return result;
 }
 
 static uint64_t gen_opic_sdiv(uint64_t a, uint64_t b)
@@ -3432,6 +3436,7 @@ static int is_compatible_func(CType *type1, CType *type2)
     if (!s2)
       return 0;
   }
+  return 0; /* unreachable */
 }
 
 /* return true if type1 and type2 are the same.  If unqualified is
@@ -3492,6 +3497,7 @@ static int compare_types(CType *type1, CType *type2, int unqualified)
   {
     return 1;
   }
+  return 0; /* unreachable */
 }
 
 #define CMP_OP 'C'
@@ -4302,6 +4308,9 @@ ST_FUNC int type_size(const CType *type, int *a)
     *a = 1;
     return 1;
   }
+  /* unreachable - all branches above return, but TCC's flow analysis
+     needs an explicit return to avoid 'function might return no value' */
+  return 0;
 }
 
 /* push type size as known at runtime time on top of value stack. Put
@@ -4468,12 +4477,6 @@ ST_FUNC void vstore(void)
   ft = vtop[-1].type.t;
   sbt = vtop->type.t & VT_BTYPE;
   dbt = ft & VT_BTYPE;
-
-  /* Debug: check if destination has unexpected c.i value */
-  if ((vtop[-1].r & (VT_VALMASK | VT_SYM)) == (VT_CONST | VT_SYM) && vtop[-1].c.i != 0)
-  {
-    printf("WARNING: vstore() destination has non-zero c.i: %d, sym=%p\n", (int)vtop[-1].c.i, vtop[-1].sym);
-  }
 
   verify_assign_cast(&vtop[-1].type);
 
@@ -8372,6 +8375,8 @@ static int case_cmp(uint64_t a, uint64_t b)
     return a < b ? -1 : a > b;
   else
     return (int64_t)a<(int64_t)b ? -1 : (int64_t)a>(int64_t) b;
+  /* unreachable - all branches above return */
+  return 0;
 }
 
 static int case_cmp_qs(const void *pa, const void *pb)
@@ -10860,11 +10865,17 @@ static void gen_function(Sym *sym)
   if (tcc_state->opt_dead_store)
     tcc_ir_opt_dse(ir);
 
-  /* Phase 5: Loop-Invariant Code Motion - hoist computations out of loops
-   * Returns the detected loop structure for reuse by IV Strength Reduction. */
+  /* Phase 5: Loop-Invariant Code Motion - DISABLED
+   * The LICM pass has a bug in hoist_const_exprs_from_loop(): instruction
+   * indices are not adjusted by total_inserted when reading original
+   * instructions during the insertion loop, causing operand_base corruption.
+   * This produces invalid loop structures that crash IV strength reduction.
+   * TODO: re-enable after the index fix in licm.c is validated. */
   IRLoops *licm_loops = NULL;
+#if 0
   if (tcc_state->opt_licm)
     licm_loops = tcc_ir_opt_licm_ex(ir);
+#endif
 
   /* Phase 6: Induction Variable Strength Reduction - transform array indexing
    * from: base + i*stride (SHL + ADD each iteration)

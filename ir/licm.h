@@ -19,13 +19,14 @@
  * ============================================================================ */
 
 /* Maximum number of loops per function */
-#define LICM_MAX_LOOPS 32
+#define LICM_MAX_LOOPS 128
 
 /* Maximum number of blocks per loop */
 #define LICM_MAX_LOOP_BLOCKS 64
 
 /* Loop structure - simplified for natural loops */
-typedef struct IRLoop {
+typedef struct IRLoop
+{
   int header_idx;           /* Header instruction index */
   int start_idx;            /* First instruction in loop */
   int end_idx;              /* Last instruction in loop */
@@ -37,10 +38,11 @@ typedef struct IRLoop {
 } IRLoop;
 
 /* Loop analysis result */
-typedef struct IRLoops {
-  IRLoop *loops;            /* Array of loops */
-  int num_loops;            /* Number of loops found */
-  int capacity;             /* Capacity of loops array */
+typedef struct IRLoops
+{
+  IRLoop *loops; /* Array of loops */
+  int num_loops; /* Number of loops found */
+  int capacity;  /* Capacity of loops array */
 } IRLoops;
 
 /* ============================================================================
@@ -48,11 +50,12 @@ typedef struct IRLoops {
  * ============================================================================ */
 
 /* Function purity levels for LICM */
-typedef enum TCCFuncPurity {
+typedef enum TCCFuncPurity
+{
   TCC_FUNC_PURITY_UNKNOWN = 0,
-  TCC_FUNC_PURITY_IMPURE = 1,   /* Has side effects or depends on global state */
-  TCC_FUNC_PURITY_PURE = 2,     /* No side effects, result depends only on args */
-  TCC_FUNC_PURITY_CONST = 3,    /* PURE + doesn't read memory (only args) */
+  TCC_FUNC_PURITY_IMPURE = 1, /* Has side effects or depends on global state */
+  TCC_FUNC_PURITY_PURE = 2,   /* No side effects, result depends only on args */
+  TCC_FUNC_PURITY_CONST = 3,  /* PURE + doesn't read memory (only args) */
 } TCCFuncPurity;
 
 /* Infer function purity by analyzing its IR

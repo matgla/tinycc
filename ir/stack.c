@@ -11,6 +11,13 @@
 #define USING_GLOBALS
 #include "ir.h"
 
+/* Fallback: the bootstrapping armv8m-tcc may not predefine __INT32_MAX__,
+   causing <stdint.h>/<limits.h> to omit INT32_MIN.  Provide it here so
+   the build can proceed until the fixed compiler is in place. */
+#ifndef INT32_MIN
+#define INT32_MIN (-2147483647 - 1)
+#endif
+
 #ifndef TCC_STACK_LAYOUT_INIT_CAPACITY
 #define TCC_STACK_LAYOUT_INIT_CAPACITY 16
 #endif
@@ -421,12 +428,16 @@ void tcc_ir_stack_reg_get(TCCIRState *ir, int vreg, int *r0, int *r1)
   IRLiveInterval *interval = tcc_ir_get_live_interval(ir, vreg);
   if (!interval)
   {
-    if (r0) *r0 = PREG_NONE;
-    if (r1) *r1 = PREG_NONE;
+    if (r0)
+      *r0 = PREG_NONE;
+    if (r1)
+      *r1 = PREG_NONE;
     return;
   }
-  if (r0) *r0 = interval->allocation.r0;
-  if (r1) *r1 = interval->allocation.r1;
+  if (r0)
+    *r0 = interval->allocation.r0;
+  if (r1)
+    *r1 = interval->allocation.r1;
 }
 
 /* ============================================================================

@@ -9,8 +9,8 @@
  */
 
 #define USING_GLOBALS
-#include <stdbool.h>
 #include "ir.h"
+#include <stdbool.h>
 
 /* ============================================================================
  * Internal Helper Functions
@@ -644,6 +644,104 @@ void tcc_ir_materialize_dest_ir(TCCIRState *ir, IROperand *op, TCCMaterializedDe
     return;
 
   const int is_64bit = irop_is_64bit(*op);
+
+  /* Stack-passed parameters (is_param && is_local) have pr0_reg == PREG_REG_NONE
+   * without being "spilled" in the traditional sense — they were never in a register.
+   * When used as a destination, we need a scratch register for the computation
+   * and must store the result back to the caller's argument area. */
+  if (op->is_param && op->is_local && !op->pr0_spilled && op->pr0_reg == PREG_REG_NONE)
+  {
+    const int vreg = irop_get_vreg(*op);
+    if (!tcc_ir_vreg_is_valid(ir, vreg))
+      return;
+
+    mat_require_result(result, "materialize_dest_ir(param)");
+
+    const int frame_offset = mat_offset_op(ir, op);
+    unsigned scratch_flags = (ir ? ir->codegen_materialize_scratch_flags : 0);
+    if (is_64bit)
+      scratch_flags |= TCC_MACHINE_SCRATCH_NEEDS_PAIR;
+
+    TCCMachineScratchRegs scratch = {0};
+    tcc_machine_acquire_scratch(&scratch, scratch_flags);
+    if (scratch.reg_count == 0)
+      tcc_error("compiler_error: unable to allocate scratch register for param destination");
+    if (is_64bit && scratch.reg_count < 2)
+      tcc_error("compiler_error: missing register pair for 64-bit param destination");
+
+    result->needs_storeback = 1;
+    result->is_64bit = is_64bit;
+    result->is_param = 1;
+    result->frame_offset = frame_offset;
+    result->original_pr0 = PREG_SPILLED | PREG_REG_NONE;
+    result->original_pr1 = is_64bit ? (PREG_SPILLED | PREG_REG_NONE) : PREG_REG_NONE;
+    result->scratch = scratch;
+
+    op->pr0_reg = scratch.regs[0];
+    op->pr0_spilled = 0;
+    if (is_64bit && scratch.reg_count >= 2)
+    {
+      op->pr1_reg = scratch.regs[1];
+      op->pr1_spilled = 0;
+    }
+    op->is_lval = 0;
+    op->tag = IROP_TAG_VREG;
+    op->is_local = 0;
+    op->is_llocal = 0;
+    op->is_const = 0;
+    op->is_param = 0;
+    op->u.imm32 = 0;
+    return;
+  }
+
+  /* Handle destinations with no physical register allocated. This covers:
+   * - Concrete stack slot destinations (vreg == -1, is_local) where
+   *   tcc_ir_fill_registers_ir() leaves them unallocated.
+   * - Vregs that ended up with r0 == PREG_NONE and offset == 0 after
+   *   register allocation (neither spilled nor in-register).
+   * In both cases we need a scratch register for the computation
+   * and must store the result back. */
+  if (!op->is_param && op->pr0_reg == PREG_REG_NONE && !op->pr0_spilled)
+  {
+    mat_require_result(result, "materialize_dest_ir(stack_slot)");
+
+    const int frame_offset = mat_offset_op(ir, op);
+    unsigned scratch_flags = (ir ? ir->codegen_materialize_scratch_flags : 0);
+    if (is_64bit)
+      scratch_flags |= TCC_MACHINE_SCRATCH_NEEDS_PAIR;
+
+    TCCMachineScratchRegs scratch = {0};
+    tcc_machine_acquire_scratch(&scratch, scratch_flags);
+    if (scratch.reg_count == 0)
+      tcc_error("compiler_error: unable to allocate scratch register for stack slot destination");
+    if (is_64bit && scratch.reg_count < 2)
+      tcc_error("compiler_error: missing register pair for 64-bit stack slot destination");
+
+    result->needs_storeback = 1;
+    result->is_64bit = is_64bit;
+    result->is_param = 0;
+    result->frame_offset = frame_offset;
+    result->original_pr0 = PREG_SPILLED | PREG_REG_NONE;
+    result->original_pr1 = is_64bit ? (PREG_SPILLED | PREG_REG_NONE) : PREG_REG_NONE;
+    result->scratch = scratch;
+
+    op->pr0_reg = scratch.regs[0];
+    op->pr0_spilled = 0;
+    if (is_64bit && scratch.reg_count >= 2)
+    {
+      op->pr1_reg = scratch.regs[1];
+      op->pr1_spilled = 0;
+    }
+    op->is_lval = 0;
+    op->tag = IROP_TAG_VREG;
+    op->is_local = 0;
+    op->is_llocal = 0;
+    op->is_const = 0;
+    op->is_param = 0;
+    op->u.imm32 = 0;
+    return;
+  }
+
   /* Handle case when pr0 is spilled, or when pr1 is spilled for 64-bit values */
   const int needs_materialize = op->pr0_spilled || (is_64bit && op->pr1_spilled);
   if (!needs_materialize)
@@ -731,10 +829,21 @@ void tcc_ir_storeback_materialized_dest_ir(IROperand *op, TCCMaterializedDest *m
   const int pr0_was_spilled = (mat->original_pr0 & PREG_SPILLED) != 0;
   const int pr1_was_spilled = (mat->original_pr1 & PREG_SPILLED) != 0;
 
-  if (pr0_was_spilled)
-    tcc_machine_store_spill_slot(op->pr0_reg, mat->frame_offset);
-  if (mat->is_64bit && pr1_was_spilled)
-    tcc_machine_store_spill_slot(op->pr1_reg, mat->frame_offset + 4);
+  if (mat->is_param)
+  {
+    /* Stack-passed parameters need offset_to_args adjustment in the backend */
+    if (pr0_was_spilled)
+      tcc_machine_store_param_slot(op->pr0_reg, mat->frame_offset);
+    if (mat->is_64bit && pr1_was_spilled)
+      tcc_machine_store_param_slot(op->pr1_reg, mat->frame_offset + 4);
+  }
+  else
+  {
+    if (pr0_was_spilled)
+      tcc_machine_store_spill_slot(op->pr0_reg, mat->frame_offset);
+    if (mat->is_64bit && pr1_was_spilled)
+      tcc_machine_store_spill_slot(op->pr1_reg, mat->frame_offset + 4);
+  }
 
   tcc_machine_release_scratch(&mat->scratch);
 }
