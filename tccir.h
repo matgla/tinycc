@@ -29,7 +29,7 @@
 #define PREG_NONE 0x1F     /* pr0/pr1 not allocated - just the register bits */
 #define PREG_REG_NONE 0x1F /* pr0_reg/pr1_reg not allocated (5-bit field: 31) */
 
-typedef enum TccIrOp : uint8_t
+typedef enum TccIrOp
 {
   TCCIR_OP_ADD,
   TCCIR_OP_ADC_USE,
@@ -361,6 +361,7 @@ typedef struct TCCIRState
   int named_arg_stack_bytes;
 
   uint8_t leaffunc : 1;
+  uint8_t naked : 1;
   uint8_t processing_if : 1;
   uint8_t check_for_backwards_jumps : 1;
   uint8_t basic_block_start : 1;

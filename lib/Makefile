@@ -106,13 +106,20 @@ $(TOP)/bt-exe.o : XFLAGS += -I$(TOP)
 $(X)crt1w.o : crt1.c
 $(X)wincrt1w.o : wincrt1.c
 
-# Build FP libraries for ARM targets
-.PHONY: fp-libs
+# Build FP libraries for ARM targets (static archives)
+.PHONY: fp-libs fp-libs-shared
 fp-libs:
 	$(MAKE) -C fp FPU=soft TARGET=$(T) CC="$(FP_CC)" AR="$(FP_CC) -ar" CFLAGS="$(XFLAGS)"
 	$(MAKE) -C fp FPU=vfpv4-sp TARGET=$(T) CC="$(FP_CC)" AR="$(FP_CC) -ar" CFLAGS="$(XFLAGS)"
 	$(MAKE) -C fp FPU=vfpv5-dp TARGET=$(T) CC="$(FP_CC)" AR="$(FP_CC) -ar" CFLAGS="$(XFLAGS)"
 	$(MAKE) -C fp FPU=rp2350 TARGET=$(T) CC="$(FP_CC)" AR="$(FP_CC) -ar" CFLAGS="$(XFLAGS)"
+
+# Build shared FP libraries for dynamic linking (YasOS runtime)
+fp-libs-shared:
+	$(MAKE) -C fp FPU=soft TARGET=$(T) FP_CC="$(FP_CC)" FP_AR="$(FP_CC) -ar" FP_CFLAGS="$(XFLAGS)" build-shared
+	$(MAKE) -C fp FPU=vfpv4-sp TARGET=$(T) FP_CC="$(FP_CC)" FP_AR="$(FP_CC) -ar" FP_CFLAGS="$(XFLAGS)" build-shared
+	$(MAKE) -C fp FPU=vfpv5-dp TARGET=$(T) FP_CC="$(FP_CC)" FP_AR="$(FP_CC) -ar" FP_CFLAGS="$(XFLAGS)" build-shared
+	$(MAKE) -C fp FPU=rp2350 TARGET=$(T) FP_CC="$(FP_CC)" FP_AR="$(FP_CC) -ar" FP_CFLAGS="$(XFLAGS)" build-shared
 
 # Build armeabi.o which dispatches to correct FP library
 $(X)armeabi.o : armeabi.c $(TCC)
@@ -131,7 +138,10 @@ clean :
 # after clean-fp-libs runs to save as .checksum.saved
 clean-fp-libs:
 	@echo "Cleaning FP libraries for $(CROSS_TARGET)..."
+	@rm -f $(TOP)/lib/fp/libsoftfp.a $(TOP)/lib/fp/libvfpv4sp.a $(TOP)/lib/fp/libvfpv5dp.a $(TOP)/lib/fp/librp2350fp.a
+	@rm -f $(TOP)/lib/fp/libsoftfp.so $(TOP)/lib/fp/libvfpv4sp.so $(TOP)/lib/fp/libvfpv5dp.so $(TOP)/lib/fp/librp2350fp.so
 	@rm -f $(TOP)/lib/fp/libtcc1-fp-*.a
 	@rm -f $(TOP)/lib/fp/build/.$(CROSS_TARGET)-fp-libs.stamp
 	@rm -f $(TOP)/lib/fp/build/.$(CROSS_TARGET)-fp-libs.checksum.saved
 	@rm -rf $(TOP)/lib/fp/build/soft $(TOP)/lib/fp/build/vfpv4-sp $(TOP)/lib/fp/build/vfpv5-dp $(TOP)/lib/fp/build/rp2350
+	@rm -rf $(TOP)/lib/fp/build/soft-pic $(TOP)/lib/fp/build/vfpv4-sp-pic $(TOP)/lib/fp/build/vfpv5-dp-pic $(TOP)/lib/fp/build/rp2350-pic

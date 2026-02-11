@@ -681,7 +681,9 @@ ST_FUNC int tcc_gen_machine_dry_run_is_active(void)
 /* Reset scratch register state between dry-run and real passes */
 ST_FUNC void tcc_gen_machine_reset_scratch_state(void)
 {
-  scratch_global_exclude = 0;
+  /* When text_and_data_separation is active, R9 holds the GOT base and must
+   * NEVER be used as a scratch register. Permanently exclude it. */
+  scratch_global_exclude = text_and_data_separation ? (1u << R9) : 0;
   scratch_push_count = 0;
   memset(scratch_push_stack, 0, sizeof(scratch_push_stack));
 }
@@ -902,7 +904,7 @@ static void restore_all_pushed_scratch_regs(void)
   if (dry_run_state.active)
   {
     scratch_push_count = 0;
-    scratch_global_exclude = 0;
+    scratch_global_exclude = text_and_data_separation ? (1u << R9) : 0;
     return;
   }
 
@@ -917,8 +919,9 @@ static void restore_all_pushed_scratch_regs(void)
     ot_check(th_pop(1 << reg));
   }
   scratch_push_count = 0;
-  /* Also reset global exclude for next IR instruction */
-  scratch_global_exclude = 0;
+  /* Also reset global exclude for next IR instruction.
+   * Keep R9 excluded if text_and_data_separation is active. */
+  scratch_global_exclude = text_and_data_separation ? (1u << R9) : 0;
 }
 
 ST_FUNC void tcc_machine_acquire_scratch(TCCMachineScratchRegs *scratch, unsigned flags)
@@ -1229,6 +1232,12 @@ ST_FUNC void arm_init(struct TCCState *s)
   s->registers_for_allocator = 11;
   caller_saved_registers = (1 << ARM_R0) | (1 << ARM_R1) | (1 << ARM_R2) | (1 << ARM_R3);
 
+  /* On yasos with no-pic-data-is-text-relative, R9 holds the GOT base and is
+   * caller-saved: callees (compiled by other toolchains) may clobber it, so
+   * the compiler must save/restore R9 around every function call. */
+  if (s->text_and_data_separation)
+    caller_saved_registers |= (1 << ARM_R9);
+
   /* For hard float ABI, configure VFP single-precision registers S0-S15 */
   architecture_config.fpu = arm_determine_fpu_config(s);
   if (float_abi == ARM_HARD_FLOAT)
@@ -1243,7 +1252,7 @@ ST_FUNC void arm_init(struct TCCState *s)
     s->float_registers_for_allocator = 0;
   }
 
-  if (!s->pic)
+  if (!s->pic && !s->text_and_data_separation)
   {
     s->registers_map_for_allocator |= (1 << ARM_R9);
     s->registers_for_allocator += 1;
@@ -1832,11 +1841,15 @@ ST_FUNC void tcc_gen_machine_switch_table_op(IROperand src1, TCCIRSwitchTable *t
   int index_reg = src1.pr0_reg;
 
   /* Determine whether to use TBB (byte offsets) or TBH (halfword offsets).
-   * TBB: range <= 255 (byte index max)
-   * TBH: range <= 65535 (halfword index max)
-   * We use TBH if num_entries > 255 since we need more than byte range.
+   * TBB offsets are unsigned bytes (0-255), giving max forward reach of 510 bytes.
+   * TBH offsets are unsigned halfwords (0-65535), giving max forward reach of 131070 bytes.
+   * The offset is (target - table_start) / 2.
+   *
+   * Always use TBH to avoid TBB range overflow issues. TBH costs 1 extra byte per
+   * table entry but is much safer with varying code sizes from literal pools,
+   * R9 caller-save sequences, etc.
    */
-  int use_tbh = (table->num_entries > 255);
+  int use_tbh = 1;
 
   /* Emit TBB/TBH instruction.
    * TBB/TBH reads PC+4, so the table must follow immediately after.
@@ -2663,10 +2676,11 @@ static void load_full_const(int r, int r1, int64_t imm, struct Sym *sym)
   }
   else
   {
+    /* For PIC without a symbol, the literal is a plain constant (e.g. -1).
+     * Must still store the value so the pool emits it correctly. */
+    entry->imm = imm;
     if (sym)
     {
-      /* For PIC relocations, the addend is also needed */
-      entry->imm = imm;
       if (text_and_data_separation)
       {
         // all data except constants in .ro section can be addressed relative to
@@ -3200,7 +3214,24 @@ void load_to_dest_ir(IROperand dest, IROperand src)
     int sign = (frame_offset < 0);
     int abs_offset = sign ? -frame_offset : frame_offset;
 
-    if (src.is_lval)
+    if (src.is_llocal && src.is_lval)
+    {
+      /* Double indirection (VT_LLOCAL): the stack slot holds a POINTER
+       * that must be loaded first, then dereferenced to get the final value.
+       * This occurs when a computed pointer value (e.g. result of *++ptr)
+       * is spilled to the stack.  Without this two-step load the codegen
+       * would read a byte/word directly from the stack slot — giving the
+       * low byte(s) of the pointer itself instead of the pointed-to data.
+       *
+       * Step 1: load the pointer from the stack slot (word-sized).
+       * Step 2: load the actual value through that pointer (btype-sized). */
+      ScratchRegAlloc scratch = get_scratch_reg_with_save(0);
+      load_from_base_ir(scratch.reg, PREG_REG_NONE, IROP_BTYPE_INT32, 0, abs_offset, sign, base_reg);
+      int pr1_for_load = dest.pr1_spilled ? PREG_REG_NONE : dest.pr1_reg;
+      load_from_base_ir(dest.pr0_reg, pr1_for_load, btype, src.is_unsigned, 0, 0, scratch.reg);
+      restore_scratch_reg(&scratch);
+    }
+    else if (src.is_lval)
     {
       /* Load value from stack location */
       int pr1_for_load = dest.pr1_spilled ? PREG_REG_NONE : dest.pr1_reg;
@@ -4795,6 +4826,8 @@ void tcc_gen_machine_data_processing_op(IROperand src1, IROperand src2, IROperan
      * the value it points to before comparing against zero. */
     const int needs_load = thumb_irop_has_immediate_value(src1) || src_lo == PREG_REG_NONE || src1.is_lval ||
                            thumb_irop_needs_value_load(src1) || (is64 && src_hi == PREG_REG_NONE);
+    fprintf(stderr, "TEST_ZERO: is_lval=%d needs_load=%d is64=%d pr0=%d pr1=%d vr=%d btype=%d ind=0x%x\n", src1.is_lval,
+            needs_load, is64, src_lo, src_hi, src1.vr, src1.btype, ind);
 
     if (!is64)
     {
@@ -4931,8 +4964,17 @@ static void gen_softfp_call(IROperand src1, IROperand src2, IROperand dest, TccI
   uint32_t sym_idx = tcc_ir_pool_add_symref(tcc_state->ir, sym, 0, 0);
   func_op = irop_make_symref(-1, sym_idx, 0, 0, 1, IROP_BTYPE_FUNC);
 
+  /* Save R9 (GOT base) before soft-float call if caller-saved.
+   * Push R12 as well to maintain 8-byte SP alignment (AAPCS). */
+  if (text_and_data_separation)
+    ot_check(th_push((uint16_t)((1 << R9) | (1 << R12))));
+
   /* Generate BL to the soft-float function */
   gcall_or_jump_ir(0, func_op);
+
+  /* Restore R9 (GOT base) after soft-float call */
+  if (text_and_data_separation)
+    ot_check(th_pop((uint16_t)((1 << R9) | (1 << R12))));
 
   /* Result is in R0 (float/int) or R0:R1 (double/long) */
   if (op != TCCIR_OP_FCMP)
@@ -5037,7 +5079,17 @@ static void gen_softfp_fcmp(IROperand src1, IROperand src2, int is_double)
   uint32_t sym_idx = tcc_ir_pool_add_symref(tcc_state->ir, sym, 0, 0);
   func_op = irop_make_symref(-1, sym_idx, 0, 0, 1, IROP_BTYPE_FUNC);
 
+  /* Save R9 (GOT base) before soft-float compare call if caller-saved */
+  /* Save R9 (GOT base) before soft-float compare call if caller-saved.
+   * Push R12 as well to maintain 8-byte SP alignment (AAPCS). */
+  if (text_and_data_separation)
+    ot_check(th_push((uint16_t)((1 << R9) | (1 << R12))));
+
   gcall_or_jump_ir(0, func_op);
+
+  /* Restore R9 (GOT base) after soft-float compare call */
+  if (text_and_data_separation)
+    ot_check(th_pop((uint16_t)((1 << R9) | (1 << R12))));
 }
 
 /* Get soft float function name for float<->double conversion */
@@ -7165,6 +7217,17 @@ ST_FUNC void tcc_gen_machine_func_call_op(IROperand func_target, IROperand call_
   int arg_regs_in_use = call_site->registers_map & 0x0F;
   int arg_regs_push_mask = arg_regs_in_use;
   int arg_regs_push_count = __builtin_popcount((unsigned)arg_regs_push_mask);
+
+  /* On yasos with no-pic-data-is-text-relative, R9 holds the GOT base and is
+   * caller-saved.  Save it alongside the nested-call argument registers so it
+   * is restored after the callee returns.  It must be pushed *before* the
+   * stack-argument area is reserved so the callee sees the correct SP layout.
+   */
+  if (text_and_data_separation)
+  {
+    arg_regs_push_mask |= (1 << ARM_R9);
+    arg_regs_push_count++;
+  }
 
   /* AAPCS requires 8-byte SP alignment - pad with R12 if needed */
   if (arg_regs_push_count & 1)

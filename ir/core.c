@@ -1419,6 +1419,15 @@ void tcc_ir_backpatch_to_here(TCCIRState *ir, int t)
   if (!ir)
     return;
   tcc_ir_backpatch(ir, t, ir->next_instruction_index);
+  /* A backpatch target is a new basic block boundary — multiple control flow
+   * paths converge here. Mark it so that tcc_ir_put() does NOT coalesce the
+   * next ASSIGN with the previous instruction, which may belong to a
+   * different branch. Without this, ternary operators like
+   *   var = cond ? true_expr : false_expr
+   * can have their merge-point ASSIGN coalesced into the true-path LOAD,
+   * leaving the false-path result disconnected from the variable. */
+  if (t >= 0)
+    ir->basic_block_start = 1;
 }
 
 void tcc_ir_backpatch_first(TCCIRState *ir, int t, int target_address)

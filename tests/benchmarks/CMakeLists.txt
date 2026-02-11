@@ -74,7 +74,7 @@ if(BENCHMARK_COMPILER STREQUAL "TCC")
     # Find TCC's soft-float runtime library for fair comparison with GCC's libgcc
     # TCC_EXE is typically at <tcc_root>/armv8m-tcc, libs are at <tcc_root>/lib/fp/
     get_filename_component(TCC_DIR ${TCC_EXE} DIRECTORY)
-    set(TCC_FP_LIB "${TCC_DIR}/lib/fp/libtcc1-fp-soft-armv8m.a")
+    set(TCC_FP_LIB "${TCC_DIR}/lib/fp/libsoftfp.a")
     if(EXISTS ${TCC_FP_LIB})
         message(STATUS "Using TCC soft-float runtime: ${TCC_FP_LIB}")
     else()

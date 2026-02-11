@@ -1,0 +1,3 @@
+match: rest='world'
+match: rest='bar'
+no match

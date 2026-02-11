@@ -777,6 +777,7 @@ LIBTCCAPI TCCState *tcc_new(void)
   s->pic = 1;
   s->section_align = 4;
   s->text_addr = 0;
+  s->has_text_addr = 1;
 #else
   s->text_and_data_separation = 0;
 #endif
@@ -847,12 +848,13 @@ LIBTCCAPI void tcc_delete(TCCState *s1)
 LIBTCCAPI int tcc_set_output_type(TCCState *s, int output_type)
 {
 #if defined(CONFIG_TCC_PIE)
-  /* PIE not supported on bare-metal ARM Thumb targets (no dynamic linker) */
   if (output_type == TCC_OUTPUT_EXE)
   {
 #if defined(TCC_TARGET_ARM_THUMB)
-    /* Disable PIE for bare-metal ARM Thumb targets */
-    /* (no dynamic linker available) */
+    /* Disable PIE for ARM Thumb targets - the YAFF format handles
+       data relocations directly from R_ARM_ABS32 entries without
+       needing the full DYN infrastructure (which breaks GOT filling
+       for local symbols) */
 #elif defined(s)
     if (s->no_pie)
     {

@@ -334,7 +334,7 @@ static int apply_patches_to_buffer(Section *sec, int *patch_idx, uint32_t buf_st
       uint32_t buf_offset = offset - buf_start;
       if (buf_offset + 4 <= buf_size)
       {
-        write32le(buffer + buf_offset, sec->reloc_patch_values[i]);
+        add32le(buffer + buf_offset, sec->reloc_patch_values[i]);
         applied++;
       }
     }
@@ -356,6 +356,7 @@ static int section_write_streaming(TCCState *s1, Section *sec, FILE *f)
   unsigned char buffer[1024];
   size_t to_read, n;
   int patch_idx = 0;
+  size_t output_pos = 0; /* Track bytes written within this section */
 
   if (!sec->lazy || sec->materialized)
   {
@@ -376,6 +377,35 @@ static int section_write_streaming(TCCState *s1, Section *sec, FILE *f)
   /* Stream each chunk directly from source file to output */
   for (c = sec->deferred_head; c; c = c->next)
   {
+
+    /* Fill alignment gap before this chunk */
+    if (c->dest_offset > output_pos)
+    {
+      size_t gap = c->dest_offset - output_pos;
+
+      /* Write from sec->data if it covers part of this gap (e.g. data from
+         inline-assembled .S files written directly to the section buffer) */
+      if (sec->data && output_pos < sec->data_allocated)
+      {
+        size_t from_data = sec->data_allocated - output_pos;
+        if (from_data > gap)
+          from_data = gap;
+        fwrite(sec->data + output_pos, 1, from_data, f);
+        output_pos += from_data;
+        gap -= from_data;
+      }
+
+      /* Fill remaining gap with zeros */
+      while (gap > 0)
+      {
+        n = gap < sizeof(buffer) ? gap : sizeof(buffer);
+        memset(buffer, 0, n);
+        fwrite(buffer, 1, n, f);
+        gap -= n;
+      }
+      output_pos = c->dest_offset;
+    }
+
     fd = open(c->source_path, O_RDONLY | O_BINARY);
     if (fd < 0)
     {
@@ -409,22 +439,23 @@ static int section_write_streaming(TCCState *s1, Section *sec, FILE *f)
       chunk_written += n;
       to_read -= n;
     }
+    output_pos += c->size;
     close(fd);
   }
 
-  /* Write padding if needed */
-  if (sec->data_offset > sec->sh_size)
+  /* Fill trailing gap to reach sh_size */
+  if (output_pos < sec->sh_size)
   {
-    size_t padding = sec->data_offset - sec->sh_size;
-    while (padding > 0)
+    size_t gap = sec->sh_size - output_pos;
+
+    while (gap > 0)
     {
-      size_t pad = padding < sizeof(buffer) ? padding : sizeof(buffer);
-      memset(buffer, 0, pad);
-      fwrite(buffer, 1, pad, f);
-      padding -= pad;
+      n = gap < sizeof(buffer) ? gap : sizeof(buffer);
+      memset(buffer, 0, n);
+      fwrite(buffer, 1, n, f);
+      gap -= n;
     }
   }
-
   return 0;
 }
 
@@ -2084,13 +2115,17 @@ static void relocate_section(TCCState *s1, Section *s, Section *sr)
 #if SHT_RELX == SHT_RELA
       tgt += rel->r_addend;
 #endif
-      if (type == R_DATA_32DW && sym->st_shndx >= s1->dwlo && sym->st_shndx < s1->dwhi)
+      if (type == R_DATA_32DW)
       {
-        /* dwarf section relocation - store patch for streaming */
-        uint32_t value = tgt - s1->sections[sym->st_shndx]->sh_addr;
+        uint32_t value;
+        if (sym->st_shndx >= s1->dwlo && sym->st_shndx < s1->dwhi)
+          /* dwarf-to-dwarf section relocation (e.g., .debug_info -> .debug_str) */
+          value = tgt - s1->sections[sym->st_shndx]->sh_addr;
+        else
+          /* code/data reference from debug section (e.g., DW_AT_low_pc -> .text) */
+          value = tgt;
         add_reloc_patch(s, (uint32_t)rel->r_offset, value);
       }
-      /* Other relocation types would require materialization - skip for now */
     }
     return;
   }
@@ -2760,61 +2795,88 @@ ST_FUNC void tccelf_add_crtend(TCCState *s1)
 #endif /* !defined TCC_TARGET_PE && !defined TCC_TARGET_MACHO */
 
 #if defined TCC_TARGET_ARM
-/* Add ARM floating-point library based on compiler flags
- * Selects the correct FP library variant based on -mfpu and -mfloat-abi
+/* Determine the FP library base name (without lib prefix / extension).
+ * Same name is used for both static (.a) and shared (.so) variants.
+ * Returns the name for use with tcc_add_library() or manual path construction.
+ *
+ * Returns NULL if hard float ABI (no FP library needed).
  */
-ST_FUNC void tccelf_add_arm_fp_lib(TCCState *s1)
+static const char *tccelf_get_fp_lib_name(TCCState *s1)
 {
-  static char lib_path[256];
-  const char *target = NULL;
+  if (s1->float_abi == ARM_HARD_FLOAT)
+    return NULL;
 
-  /* Determine target architecture suffix */
-#if defined(TCC_TARGET_ARM_THUMB)
-  target = "armv8m";
-#else
-  target = "arm";
-#endif
-
-  /* Determine which FP library to link based on fpu_type and float_abi */
   if (s1->fpu_type)
   {
-    /* Check FPU type */
     switch (s1->fpu_type)
     {
-    case ARM_FPU_AUTO:
-    case ARM_FPU_NONE:
-    case ARM_FPU_VFP:
-    case ARM_FPU_VFPV3:
-      /* Soft float or older VFP - use soft FP library */
-      snprintf(lib_path, sizeof(lib_path), "fp/libtcc1-fp-soft-%s.a", target);
-      break;
     case ARM_FPU_VFPV4:
     case ARM_FPU_FPV4_SP_D16:
     case ARM_FPU_FPV5_SP_D16:
-      /* VFPv4/VFPv5 single-precision - use vfpv4-sp library */
-      snprintf(lib_path, sizeof(lib_path), "fp/libtcc1-fp-vfpv4-sp-%s.a", target);
-      break;
+      return "vfpv4sp";
     case ARM_FPU_FPV5_D16:
     case ARM_FPU_NEON:
     case ARM_FPU_NEON_VFPV4:
     case ARM_FPU_NEON_FP_ARMV8:
-      /* VFPv5 double-precision - use vfpv5-dp library */
-      snprintf(lib_path, sizeof(lib_path), "fp/libtcc1-fp-vfpv5-dp-%s.a", target);
-      break;
+      return "vfpv5dp";
     default:
-      return;
+      break;
     }
   }
-  else
+
+  return "softfp";
+}
+
+/* Add ARM floating-point library based on compiler flags.
+ * Selects the correct FP library variant based on -mfpu and -mfloat-abi.
+ *
+ * Library names follow the short convention:
+ *   libsoftfp.{a,so}   - Pure software floating point
+ *   libvfpv4sp.{a,so}  - VFPv4 single-precision HW, double SW
+ *   libvfpv5dp.{a,so}  - VFPv5 full double-precision HW
+ *   librp2350fp.{a,so} - RP2350 double coprocessor
+ *
+ * On YasOS native (dynamic linking): uses tcc_add_library() which searches
+ *   library_paths for libsoftfp.so in /usr/lib/, etc.
+ *
+ * On cross-compiler / static: uses tcc_add_dll() with "fp/libsoftfp.a" path,
+ *   resolved relative to tcc_lib_path (CONFIG_TCCDIR), e.g. lib/tcc/fp/.
+ *
+ * Hard float ABI needs no FP library (uses raw FP instructions).
+ */
+ST_FUNC void tccelf_add_arm_fp_lib(TCCState *s1)
+{
+  const char *fp_lib = tccelf_get_fp_lib_name(s1);
+  if (!fp_lib)
   {
-    /* Default to soft float if no FPU specified */
-    snprintf(lib_path, sizeof(lib_path), "fp/libtcc1-fp-soft-%s.a", target);
+    if (s1->verbose)
+      printf("Hard float ABI: no FP library needed\n");
+    return;
   }
 
-  /* Add the selected FP library */
-  if (s1->verbose)
-    printf("Adding ARM FP library: %s\n", lib_path);
-  tcc_add_dll(s1, lib_path, AFF_PRINT_ERROR);
+#if TARGETOS_YasOS && defined(TCC_IS_NATIVE)
+  if (!s1->static_link)
+  {
+    /* YasOS native: search library_paths for libXXX.so then libXXX.a
+     * (e.g. /usr/lib/libsoftfp.so). Only for the on-device compiler;
+     * the cross-compiler (no TCC_IS_NATIVE) uses the static path below. */
+    if (s1->verbose)
+      printf("Adding ARM FP shared library: lib%s\n", fp_lib);
+    tcc_add_library(s1, fp_lib);
+    return;
+  }
+#endif
+
+  /* Cross-compiler or static link: find via tcc lib path (fp/ subdirectory).
+   * tcc_add_dll() searches library_paths which includes {B} = tcc_lib_path,
+   * so "fp/libsoftfp.a" resolves to e.g. lib/tcc/fp/libsoftfp.a */
+  {
+    char fp_path[64];
+    snprintf(fp_path, sizeof(fp_path), "fp/lib%s.a", fp_lib);
+    if (s1->verbose)
+      printf("Adding ARM FP library: %s\n", fp_path);
+    tcc_add_dll(s1, fp_path, AFF_PRINT_ERROR);
+  }
 }
 #endif
 
@@ -2880,6 +2942,24 @@ ST_FUNC void tcc_add_runtime(TCCState *s1)
     if (s1->output_type != TCC_OUTPUT_MEMORY)
       tccelf_add_crtend(s1);
 #endif
+  }
+  else
+  {
+    /* -nostdlib: skip libc/crt, but still add compiler runtime.
+     * These provide __aeabi_* ABI helpers that the compiler emits calls to
+     * (memset, memcpy, softfloat ops). Same as GCC always linking libgcc
+     * even with -nostdlib. Without this, any .so built with -nostdlib
+     * (libc, libm, libncurses...) would be missing these symbols.
+     *
+     * Link order matters for archives (single-pass):
+     *   1. FP lib first (references __aeabi_memset etc. from libtcc1)
+     *   2. libtcc1 second (resolves those back-references)
+     */
+#if defined TCC_TARGET_ARM
+    tccelf_add_arm_fp_lib(s1);
+#endif
+    if (TCC_LIBTCC1[0])
+      tcc_add_support(s1, TCC_LIBTCC1);
   }
 }
 #endif /* ndef TCC_TARGET_PE */
@@ -3208,6 +3288,17 @@ static int set_sec_sizes(TCCState *s1)
             textrel += count;
         }
       }
+#ifdef TCC_TARGET_YAFF
+      else if (s1->output_format == TCC_OUTPUT_FORMAT_YAFF && (s1->sections[s->sh_info]->sh_flags & SHF_ALLOC))
+      {
+        /* Preserve data relocation sections for YAFF output.
+           The YAFF writer needs R_ARM_ABS32 entries to generate
+           data relocations for the dynamic loader. Setting sh_size
+           ensures alloc_sec_names assigns a name, preventing
+           reorder_sections from pruning the section. */
+        s->sh_size = s->data_offset;
+      }
+#endif
     }
     else if ((s->sh_flags & SHF_ALLOC)
 #ifdef TCC_TARGET_ARM
@@ -3586,6 +3677,13 @@ static int layout_sections(TCCState *s1, int *sec_order, struct dyn_inf *d)
   addr = ELF_START_ADDR;
   if (s1->output_type & TCC_OUTPUT_DYN)
     addr = 0;
+
+#ifdef TCC_TARGET_YAFF
+  /* YAFF format uses 0-based offsets for all sections.
+     Force text address to 0 unless the user explicitly set one. */
+  if (s1->output_format == TCC_OUTPUT_FORMAT_YAFF && !s1->has_text_addr)
+    addr = 0;
+#endif
 
   /* Use linker script MEMORY origin if available */
   if (s1->ld_script && s1->ld_script->nb_memory_regions > 0)
@@ -4044,7 +4142,8 @@ static int tcc_output_elf(TCCState *s1, FILE *f, int phnum, ElfW(Phdr) * phdr)
         {
           /* Already materialized, write from memory */
           const int to_write = size < s->data_allocated ? size : s->data_allocated;
-          offset += fwrite(s->data, 1, to_write, f);
+          int written = fwrite(s->data, 1, to_write, f);
+          offset += written;
         }
       }
     }

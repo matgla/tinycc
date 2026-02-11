@@ -25,14 +25,13 @@ typedef int s32;
  *
  * The compiler flags determine which FP library is linked:
  *
- * -mfpu=none (soft float)          → lib/fp/libtcc1-fp-soft-$(TARGET).a
- * -mfpu=fpv4-sp-d16               → lib/fp/libtcc1-fp-vfpv4-sp-$(TARGET).a (float HW, double SW)
- * -mfpu=fpv5-d16                  → lib/fp/libtcc1-fp-vfpv5-dp-$(TARGET).a (both HW)
- * -mfpu=fpv5-sp-d16               → lib/fp/libtcc1-fp-vfpv4-sp-$(TARGET).a (float HW, double SW)
- * -DRP2350_DCP_ENABLED            → lib/fp/libtcc1-fp-rp2350-$(TARGET).a (double HW via DCP)
+ * -mfpu=none (soft float)          → libsoftfp.{a,so}
+ * -mfpu=fpv4-sp-d16               → libvfpv4sp.{a,so} (float HW, double SW)
+ * -mfpu=fpv5-d16                  → libvfpv5dp.{a,so} (both HW)
+ * -mfpu=fpv5-sp-d16               → libvfpv4sp.{a,so} (float HW, double SW)
+ * -DRP2350_DCP_ENABLED            → librp2350fp.{a,so} (double HW via DCP)
  *
- * Where $(TARGET) is the target architecture (e.g., armv8m, arm, etc.)
- *
+ * tcc_add_library() searches for .so first, then .a in library paths.
  * The linker resolves __aeabi_* symbols from the selected library.
  * If multiple FP operations are needed (e.g., float HW + double SW),
  * multiple FP libraries can be linked in order.

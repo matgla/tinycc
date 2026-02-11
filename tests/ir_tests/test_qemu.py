@@ -142,6 +142,10 @@ TEST_FILES = [
     ("test_sha_transform.c", 0),
     ("test_mibench_sha.c", 0),
 
+    # address-of on register-passed parameter (gaddrof() fix)
+    ("bug_addrof_reg_param.c", 0),
+    ("bug_addrof_param_modify.c", 0),
+
     ("../tests2/00_assignment.c", 0),
     ("../tests2/01_comment.c", 0),
     ("../tests2/02_printf.c", 0),

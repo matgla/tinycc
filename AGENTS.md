@@ -378,14 +378,15 @@ The compiler supports multiple FP configurations via `lib/fp/`:
 
 | FPU Type | Library | Description |
 |----------|---------|-------------|
-| Software | `libtcc1-fp-soft-armv8m.a` | Pure C soft-float (no FPU) |
-| VFPv4-sp | `libtcc1-fp-vfpv4-sp-armv8m.a` | Cortex-M4F (single-precision) |
-| VFPv5-dp | `libtcc1-fp-vfpv5-dp-armv8m.a` | Cortex-M7 (double-precision) |
-| RP2350 | `libtcc1-fp-rp2350-armv8m.a` | RP2350 double coprocessor |
+| Software | `libsoftfp.{a,so}` | Pure C soft-float (no FPU) |
+| VFPv4-sp | `libvfpv4sp.{a,so}` | Cortex-M4F (single-precision) |
+| VFPv5-dp | `libvfpv5dp.{a,so}` | Cortex-M7 (double-precision) |
+| RP2350 | `librp2350fp.{a,so}` | RP2350 double coprocessor |
 
 Build specific FP library:
 ```bash
-cd lib/fp && make FPU=vfpv4-sp
+cd lib/fp && make FPU=vfpv4-sp        # static .a
+cd lib/fp && make FPU=vfpv4-sp build-shared  # shared .so
 ```
 
 ## Key Development Notes

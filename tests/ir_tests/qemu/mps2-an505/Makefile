@@ -81,12 +81,12 @@ ifeq ($(USE_NEWLIB_BUILD),1)
 NEWLIB_LIBC_A := $(if $(and $(filter 1,$(DEBUG_LIBC)),$(wildcard $(NEWLIB_LIBC_G))),$(NEWLIB_LIBC_G),$(NEWLIB_DIR)/libc.a)
 NEWLIB_LIBM_A := $(if $(and $(filter 1,$(DEBUG_LIBC)),$(wildcard $(NEWLIB_LIBM_G))),$(NEWLIB_LIBM_G),$(NEWLIB_DIR)/libm.a)
 NEWLIB_LIBRDIMON_A := $(LIBGLOSS_PATH)/librdimon.a
-LDFLAGS += -L$(TCC_PATH)/lib/fp -L$(TCC_PATH) -Wl,--start-group -larmv8m-libtcc1.a -llibtcc1-fp-soft-armv8m.a $(NEWLIB_LIBC_A) $(NEWLIB_LIBRDIMON_A) $(NEWLIB_LIBM_A) $(LIBGCC_PATH) -Wl,--end-group -Wl,-oformat=elf32-littlearm -T$(MAKEFILE_DIR)linker_script.ld -v
+LDFLAGS += -L$(TCC_PATH)/lib/fp -L$(TCC_PATH) -Wl,--start-group -larmv8m-libtcc1.a -lsoftfp $(NEWLIB_LIBC_A) $(NEWLIB_LIBRDIMON_A) $(NEWLIB_LIBM_A) $(LIBGCC_PATH) -Wl,--end-group -Wl,-oformat=elf32-littlearm -T$(MAKEFILE_DIR)linker_script.ld -v
 CRT_LIBS = $(CRT_CRTI_PATH) $(LIBGLOSS_PATH)/rdimon-crt0.o $(CRT_CRTEND_PATH) $(CRT_CRTN_PATH)
 else
 LIBC_A_PATH := $(if $(filter 1,$(DEBUG_LIBC)),$(LIBC_G_PATH),$(LIBC_PATH))
 LIBM_A_PATH := $(if $(filter 1,$(DEBUG_LIBC)),$(LIBM_G_PATH),$(LIBM_PATH))
-LDFLAGS += -L$(TCC_PATH)/lib/fp -L$(TCC_PATH) -Wl,--start-group $(LIBC_A_PATH) $(LIBRDIMON_PATH) -llibtcc1-fp-soft-armv8m.a -larmv8m-libtcc1.a $(LIBM_A_PATH) $(LIBC_A_PATH) $(LIBGCC_PATH) -Wl,--end-group -Wl,-oformat=elf32-littlearm -T$(MAKEFILE_DIR)linker_script.ld -v
+LDFLAGS += -L$(TCC_PATH)/lib/fp -L$(TCC_PATH) -Wl,--start-group $(LIBC_A_PATH) $(LIBRDIMON_PATH) -lsoftfp -larmv8m-libtcc1.a $(LIBM_A_PATH) $(LIBC_A_PATH) $(LIBGCC_PATH) -Wl,--end-group -Wl,-oformat=elf32-littlearm -T$(MAKEFILE_DIR)linker_script.ld -v
 CRT_LIBS = $(CRT_CRTI_PATH) $(RDIMON_CRT0_PATH) $(CRT_CRTEND_PATH) $(CRT_CRTN_PATH)
 endif
 else

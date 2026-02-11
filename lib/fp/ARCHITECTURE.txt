@@ -199,7 +199,7 @@
  * 1. User calls: gcc -march=cortex-m7 -mfpu=fpv5-d16 test.c -o test
  *
  * 2. TCC detects FPU type and selects library:
- *    -mfpu=fpv5-d16 -> FPU=vfpv5-dp -> lib/fp/libtcc1-fp-vfpv5-dp-$(TARGET).a
+ *    -mfpu=fpv5-d16 -> FPU=vfpv5-dp -> libvfpv5dp.{a,so}
  *
  * 3. Code generation emits AEABI function calls:
  *    float c = a + b;  -> __aeabi_fadd(a, b)

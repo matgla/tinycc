@@ -185,6 +185,8 @@ $(FP_LIBS_STAMP_DIR)/.%-fp-libs.stamp: $(FP_LIBS_STAMP_DIR)/.%-tcc.checksum $(FP
 	fi
 	@rm -f $@
 	@$(SAN_ENV) $(MAKE) --no-print-directory -C lib CROSS_TARGET=$* fp-libs && touch $@
+	@# Also build shared FP libraries for YasOS dynamic linking
+	@$(SAN_ENV) $(MAKE) --no-print-directory -C lib CROSS_TARGET=$* fp-libs-shared || true
 	@# Save the checksum that was used for this build
 	@cp $(abspath $(FP_LIBS_STAMP_DIR)/.$*-tcc.checksum) $(abspath $(FP_LIBS_STAMP_DIR)/.$*-fp-libs.checksum.saved)
 
@@ -357,6 +359,10 @@ install-unx:
 	$(call IBw,$(PROGS) *-tcc,"$(bindir)")
 	$(call IFw,$(LIBTCC1) $(EXTRA_O) $(LIBTCC1_U),"$(tccdir)")
 	$(call IFw,$(TOPSRC)/lib/fp/libtcc1-fp-*.a,"$(tccdir)/fp")
+	$(call IFw,$(TOPSRC)/lib/fp/libsoftfp.a $(TOPSRC)/lib/fp/libvfpv4sp.a $(TOPSRC)/lib/fp/libvfpv5dp.a $(TOPSRC)/lib/fp/librp2350fp.a,"$(tccdir)/fp")
+	$(call IFw,$(TOPSRC)/lib/fp/libsoftfp.so $(TOPSRC)/lib/fp/libvfpv4sp.so $(TOPSRC)/lib/fp/libvfpv5dp.so $(TOPSRC)/lib/fp/librp2350fp.so,"$(tccdir)/fp")
+	$(call IFw,$(TOPSRC)/lib/fp/libsoftfp.a $(TOPSRC)/lib/fp/libvfpv4sp.a $(TOPSRC)/lib/fp/libvfpv5dp.a $(TOPSRC)/lib/fp/librp2350fp.a,"$(libdir)")
+	$(call IFw,$(TOPSRC)/lib/fp/libsoftfp.so $(TOPSRC)/lib/fp/libvfpv4sp.so $(TOPSRC)/lib/fp/libvfpv5dp.so $(TOPSRC)/lib/fp/librp2350fp.so,"$(libdir)")
 	$(call IF,$(TOPSRC)/include/*.h $(TOPSRC)/tcclib.h,"$(tccdir)/include")
 	$(call $(if $(findstring .so,$(LIBTCC)),IBw,IFw),$(LIBTCC),"$(libdir)")
 	$(call IF,$(TOPSRC)/libtcc.h,"$(includedir)")

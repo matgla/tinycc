@@ -1690,6 +1690,32 @@ ST_FUNC void gaddrof(void)
     vtop->r = 0; /* Now it's a computed value in a vreg */
     vtop->c.i = 0;
   }
+  else if ((vtop->r & VT_PARAM) && tcc_state->ir && (vtop->r & VT_VALMASK) < VT_CONST)
+  {
+    /* Register-passed parameter without VT_LOCAL: in IR mode, register
+     * parameters are represented as VT_PARAM | VT_LVAL (val_kind = register
+     * number) without VT_LOCAL. When address-of is applied, the parameter
+     * must reside on the stack (addrtaken was already set on the vreg).
+     * Emit a LEA referencing the vreg as VT_LOCAL so the register allocator
+     * assigns a stack slot and the LEA computes its address.
+     */
+    SValue src = *vtop;
+    /* Convert to VT_LOCAL (with VT_PARAM preserved) so svalue_to_iroperand
+     * classifies it as IROP_TAG_STACKOFF with is_param=1. */
+    src.r = VT_LOCAL | VT_PARAM;
+
+    SValue dest;
+    memset(&dest, 0, sizeof(dest));
+    dest.type.t = VT_PTR;
+    dest.type.ref = vtop->type.ref;
+    dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+
+    tcc_ir_put(tcc_state->ir, TCCIR_OP_LEA, &src, NULL, &dest);
+
+    vtop->vr = dest.vr;
+    vtop->r = 0; /* Now it's a computed value in a vreg */
+    vtop->c.i = 0;
+  }
 }
 
 #ifdef CONFIG_TCC_BCHECK
@@ -4719,6 +4745,13 @@ ST_FUNC void vstore(void)
           /* Assignment expression evaluates to the assigned value. For VT_LOCAL
            * destinations with vregs, return the destination vreg (now updated)
            * so later uses see the correct value.
+           *
+           * Preserve VT_LOCAL | VT_LVAL for stack-resident destinations so that
+           * subsequent dereferences (e.g. *++ptr) properly load the pointer
+           * value from the stack slot before dereferencing it.  Without this,
+           * r=0 makes the result look like a register rvalue and indir() skips
+           * the necessary LOAD, generating e.g. ldrb [stack_addr] instead of
+           * ldr tmp,[stack_addr]; ldrb result,[tmp].
            */
           vtop->vr = vtop[-1].vr;
           vtop->r = 0;
@@ -4788,6 +4821,38 @@ ST_FUNC void inc(int post, int c)
   vstore(); /* store value */
   if (post)
     vpop(); /* if post op, return saved value */
+  else if (tcc_state->ir)
+  {
+    /* Pre-increment/decrement: the result of vstore() is the destination vreg
+     * with r=0.  If that vreg corresponds to a local variable (a stack slot),
+     * later dereference via indir() will see {r=0, vr=local_vreg} and, after
+     * the register allocator spills it, generate a single byte/word load
+     * directly from the stack slot instead of the required two-step sequence
+     * (load pointer from slot, then load through pointer).
+     *
+     * Fix: emit an explicit LOAD of the stored value into a fresh temp vreg.
+     * This materializes the value so that subsequent indir() correctly treats
+     * it as a pointer value to dereference, not a stack-slot reference. */
+    SValue *sv = vtop;
+    if (sv->vr >= 0 && (sv->r & VT_VALMASK) == 0)
+    {
+      SValue src;
+      memset(&src, 0, sizeof(src));
+      src.type = sv->type;
+      src.r = VT_LOCAL | VT_LVAL;
+      src.vr = sv->vr;
+      src.c.i = sv->c.i;
+
+      SValue load_dest;
+      memset(&load_dest, 0, sizeof(load_dest));
+      load_dest.type = sv->type;
+      load_dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_LOAD, &src, NULL, &load_dest);
+
+      sv->vr = load_dest.vr;
+      sv->r = 0;
+    }
+  }
 }
 
 ST_FUNC CString *parse_mult_str(const char *msg)
@@ -8913,6 +8978,9 @@ again:
     skip('(');
     gexpr();
     skip(')');
+    fprintf(stderr, "WHILE_COND: file=%s line=%d r=0x%x type=0x%x vr=%d VT_LVAL=%d VT_VALMASK=0x%x btype=0x%x\n",
+            file->filename, file->line_num, vtop->r, vtop->type.t, vtop->vr, (vtop->r & VT_LVAL) ? 1 : 0,
+            vtop->r & VT_VALMASK, vtop->type.t & VT_BTYPE);
     // a = gvtst(1, 0);
     a = tcc_ir_codegen_test_gen(tcc_state->ir, 1, -1);
     b = -1; /* Initialize continue chain with -1 sentinel */
@@ -10663,6 +10731,7 @@ static void gen_function(Sym *sym)
 #endif
   ir = tcc_ir_alloc();
   tcc_state->ir = ir;
+  ir->naked = sym->a.naked;
 
   /* Initialize FP offset cache for code generation optimization */
   if (tcc_state->opt_fp_offset_cache)
@@ -10962,6 +11031,7 @@ static void gen_function(Sym *sym)
   tcc_ir_patch_live_intervals_registers(ir);
   tcc_ir_register_allocation_params(ir);
   tcc_ir_build_stack_layout(ir);
+
   tcc_ir_codegen_generate(ir);
   if (!sym->a.naked)
   {

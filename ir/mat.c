@@ -469,10 +469,18 @@ void tcc_ir_materialize_value_ir(TCCIRState *ir, IROperand *op, TCCMaterializedV
   }
 
   /* Once loaded from spill slot, clear local/llocal flags for stack-origin values.
-   * The value is now in a register, not on the stack. */
+   * The value is now in a register, not on the stack.
+   *
+   * IMPORTANT: For is_llocal (double indirection: pointer stored on stack that
+   * needs dereferencing), loading from the spill slot completes the FIRST level
+   * of indirection (stack -> register), but the SECOND level (pointer dereference)
+   * still needs to happen. So is_lval must be PRESERVED when was_llocal is set.
+   *
+   * Only clear is_lval for simple locals (was_local && !was_llocal), where loading
+   * from the stack gives us the final value directly. */
   const int was_local = op->is_local;
   const int was_llocal = op->is_llocal;
-  if (was_local || was_llocal)
+  if (was_local && !was_llocal)
     op->is_lval = 0;
 
   op->pr0_reg = scratch.regs[0];

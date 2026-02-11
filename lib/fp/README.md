@@ -66,11 +66,25 @@ cd lib/fp && make FPU=rp2350
 cd lib/fp && make all-variants
 ```
 
-Output libraries:
-- `libtcc1-fp-soft-$(TARGET).a` - Software floating point
-- `libtcc1-fp-vfpv4-sp-$(TARGET).a` - VFPv4 single-precision
-- `libtcc1-fp-vfpv5-dp-$(TARGET).a` - VFPv5 double-precision
-- `libtcc1-fp-rp2350-$(TARGET).a` - RP2350 double coprocessor
+Output libraries (short canonical names, usable with `-l` flags):
+- `libsoftfp.a` / `libsoftfp.so` - Software floating point (`-lsoftfp`)
+- `libvfpv4sp.a` / `libvfpv4sp.so` - VFPv4 single-precision (`-lvfpv4sp`)
+- `libvfpv5dp.a` / `libvfpv5dp.so` - VFPv5 double-precision (`-lvfpv5dp`)
+- `librp2350fp.a` / `librp2350fp.so` - RP2350 double coprocessor (`-lrp2350fp`)
+
+Backward-compatible symlinks are also created:
+- `libtcc1-fp-soft-$(TARGET).a` → `libsoftfp.a`
+- `libtcc1-fp-vfpv4-sp-$(TARGET).a` → `libvfpv4sp.a`
+- etc.
+
+### Build shared libraries (for YasOS dynamic linking)
+
+```bash
+cd lib/fp && make FPU=soft build-shared
+cd lib/fp && make FPU=vfpv4-sp build-shared
+# ... or all at once:
+cd lib/fp && make all-shared
+```
 
 (Where `$(TARGET)` is the target architecture specified during build, e.g., `armv8m`, `arm`)
 

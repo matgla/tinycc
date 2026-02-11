@@ -1299,7 +1299,6 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
     if (irop_get_tag(dest_ir) != IROP_TAG_NONE)
       tcc_ir_fill_registers_ir(ir, &dest_ir);
 
-    /* Materialize operands - this is where scratch registers get allocated */
     TCCMaterializedValue mat_src1 = {0};
     TCCMaterializedValue mat_src2 = {0};
     TCCMaterializedAddr mat_src1_addr = {0};
@@ -1521,7 +1520,8 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
 
   // generate prolog (with extra registers if needed)
   (void)original_leaffunc; /* May be unused when dry-run is disabled */
-  tcc_gen_machine_prolog(ir->leaffunc, ir->ls.dirty_registers, stack_size, extra_prologue_regs);
+  if (!ir->naked)
+    tcc_gen_machine_prolog(ir->leaffunc, ir->ls.dirty_registers, stack_size, extra_prologue_regs);
 
   for (int i = 0; i < ir->next_instruction_index; i++)
   {
@@ -1736,6 +1736,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
       tcc_ir_materialize_const_to_reg_ir(ir, &src2_ir, &mat_src2_reg);
     }
 
+    /* Debug: trace all operations in parse_line ternary area */
     switch (cq->op)
     {
     case TCCIR_OP_MUL:
@@ -2017,7 +2018,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
     case TCCIR_OP_INLINE_ASM:
     {
 #ifdef CONFIG_TCC_ASM
-      tcc_ir_codegen_inline_asm_ir(ir, dest_ir);
+      tcc_ir_codegen_inline_asm_ir(ir, src1_ir);
       /* Inline asm may clobber registers/memory: treat as a full barrier. */
       tcc_ir_spill_cache_clear(&ir->spill_cache);
 #else
@@ -2070,7 +2071,8 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
     }
   }
 
-  tcc_gen_machine_epilog(ir->leaffunc);
+  if (!ir->naked)
+    tcc_gen_machine_epilog(ir->leaffunc);
   tcc_ir_codegen_backpatch_jumps(ir, ir_to_code_mapping);
 
   /* Backpatch return jumps to point to epilogue */
