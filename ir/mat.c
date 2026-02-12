@@ -583,8 +583,16 @@ void tcc_ir_materialize_addr_ir(TCCIRState *ir, IROperand *op, TCCMaterializedAd
    * Exclude local/llocal from being treated as spilled pointers. */
   const int is_local_access = op->is_local;
   const int spilled_pointer = !is_local_access && (op->pr0_reg != PREG_REG_NONE) && op->pr0_spilled;
+  /* VT_LLOCAL: a pointer was spilled to the stack and needs double
+   * indirection.  tcc_ir_fill_registers_ir() sets is_llocal=1 when an lvalue
+   * address vreg is spilled.  We must load the pointer from the spill slot
+   * into a scratch register so the subsequent STORE writes through the pointer
+   * instead of directly to the spill slot.
+   * Example: struct field post-increment  gof.argc++  where the address of
+   * gof.argc was computed, spilled, and later used as a STORE destination. */
+  const int llocal_pointer = op->is_llocal;
 
-  if (!wants_stack_address && !spilled_pointer)
+  if (!wants_stack_address && !spilled_pointer && !llocal_pointer)
     return;
 
   /* Optimization: For locals with encodable offsets, skip materialization. */
@@ -636,6 +644,23 @@ void tcc_ir_materialize_addr_ir(TCCIRState *ir, IROperand *op, TCCMaterializedAd
     op->is_local = 0;
     op->is_llocal = 0;
     op->is_const = 0;
+    op->u.imm32 = 0;
+  }
+  else if (llocal_pointer)
+  {
+    /* VT_LLOCAL: the pointer value itself lives in a stack slot (the spill
+     * slot).  Load it into a scratch register so the caller can use it as
+     * a base address for the subsequent LOAD or STORE. */
+    tcc_machine_load_spill_slot(target_reg, frame_offset);
+    op->pr0_reg = target_reg;
+    op->pr0_spilled = 0;
+    op->pr1_reg = PREG_REG_NONE;
+    op->pr1_spilled = 0;
+    op->tag = IROP_TAG_VREG;
+    op->is_local = 0;
+    op->is_llocal = 0;
+    op->is_const = 0;
+    op->is_lval = 1; /* keep lval — caller must dereference this pointer */
     op->u.imm32 = 0;
   }
 

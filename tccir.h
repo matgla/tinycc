@@ -275,11 +275,12 @@ typedef struct TCCStackLayout
 /* Switch table metadata for jump table generation */
 typedef struct TCCIRSwitchTable
 {
-  int64_t min_val;    /* Minimum case value */
-  int64_t max_val;    /* Maximum case value */
-  int default_target; /* IR index for default case */
-  int *targets;       /* Array of IR indices [max-min+1] */
-  int num_entries;    /* Size of targets array */
+  int64_t min_val;     /* Minimum case value */
+  int64_t max_val;     /* Maximum case value */
+  int default_target;  /* IR index for default case */
+  int *targets;        /* Array of IR indices [max-min+1] */
+  int num_entries;     /* Size of targets array */
+  int table_code_addr; /* Code address of start of table data (set during codegen) */
 } TCCIRSwitchTable;
 
 typedef struct TCCMachineScratchRegs

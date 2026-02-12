@@ -174,7 +174,7 @@ $(FP_LIBS_STAMP_DIR)/.%-tcc.checksum: %-tcc$(EXESUF)
 		touch $@; \
 	fi
 
-$(FP_LIBS_STAMP_DIR)/.%-fp-libs.stamp: $(FP_LIBS_STAMP_DIR)/.%-tcc.checksum $(FP_LIBS_SRC_DEPS)
+$(FP_LIBS_STAMP_DIR)/.%-fp-libs.stamp: $(FP_LIBS_STAMP_DIR)/.%-tcc.checksum $(FP_LIBS_SRC_DEPS) %-libtcc1.a
 	@mkdir -p $(FP_LIBS_STAMP_DIR)
 	@# Check if checksum changed - if so, clean and rebuild fplibs
 	@if [ -f $(FP_LIBS_STAMP_DIR)/.$*-fp-libs.checksum.saved ]; then \

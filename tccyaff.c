@@ -277,6 +277,35 @@ static int tcc_yaff_write_symbol_table_relocations(TCCState *s1, FILE *f)
     }
   }
 
+  /* Pre-scan: build a set of symbol indices that have JUMP_SLOT (PLT)
+   * relocations. These are known function symbols. This is needed because
+   * tccelf.c strips STT_FUNC to STT_NOTYPE for undefined symbols in
+   * TCC_OUTPUT_OBJ mode, so the GLOB_DAT handler below can no longer
+   * rely solely on st_info to detect function pointers.  Symbols that
+   * appear in both JUMP_SLOT (direct call) and GLOB_DAT (address taken)
+   * are functions whose GLOB_DAT entry needs a thunk. */
+  int dynsym_count = s1->dynsym->data_offset / sizeof(ElfW(Sym));
+  unsigned char *has_jump_slot = tcc_mallocz(dynsym_count);
+  for (int j = 0; j < s1->nb_sections; ++j)
+  {
+    Section *sec;
+    if (!j)
+      continue;
+    sec = s1->sections[j];
+    if (sec->sh_type != SHT_REL || sec->link != s1->dynsym)
+      continue;
+    ElfW_Rel *r;
+    for_each_elem(sec, 0, r, ElfW_Rel)
+    {
+      if (ELFW(R_TYPE)(r->r_info) == R_ARM_JUMP_SLOT)
+      {
+        int idx = ELFW(R_SYM)(r->r_info);
+        if (idx >= 0 && idx < dynsym_count)
+          has_jump_slot[idx] = 1;
+      }
+    }
+  }
+
   for (i = 0; i < s1->nb_sections; ++i)
   {
     if (i)
@@ -311,7 +340,9 @@ static int tcc_yaff_write_symbol_table_relocations(TCCState *s1, FILE *f)
             int is_exported = (sym->st_shndx != SHN_UNDEF);
             int symbol_table_index = symbol_index - 1;
             int is_function_pointer = 0;
-            if (type == R_ARM_GLOB_DAT && ((sym->st_info & STT_FUNC) != 0))
+            if (type == R_ARM_GLOB_DAT &&
+                (ELFW(ST_TYPE)(sym->st_info) == STT_FUNC ||
+                 (has_jump_slot && symbol_index < dynsym_count && has_jump_slot[symbol_index])))
             {
               is_function_pointer = 1;
             }
@@ -353,6 +384,7 @@ static int tcc_yaff_write_symbol_table_relocations(TCCState *s1, FILE *f)
       }
     }
   }
+  tcc_free(has_jump_slot);
   return number_of_symbol_table_relocations;
 }
 

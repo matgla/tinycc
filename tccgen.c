@@ -8548,6 +8548,7 @@ static int tcc_ir_add_switch_table(TCCIRState *ir, int64_t min_val, int64_t max_
   table->default_target = default_target;
   table->num_entries = (int)(max_val - min_val + 1);
   table->targets = tcc_mallocz(table->num_entries * sizeof(int));
+  table->table_code_addr = 0;
 
   /* Fill with default target initially */
   for (int i = 0; i < table->num_entries; i++)
@@ -8769,7 +8770,7 @@ static void block_cleanup(struct scope *o)
     if (g->prev_tok->r & LABEL_FORWARD)
     {
       Sym *pcl = g->next;
-      if (!jmp)
+      if (jmp < 0)
         jmp = gjmp(-1); /* -1 = no chain */
       tcc_ir_backpatch_to_here(tcc_state->ir, pcl->jnext);
       try_call_scope_cleanup(o->cl.s);
@@ -8978,9 +8979,9 @@ again:
     skip('(');
     gexpr();
     skip(')');
-    fprintf(stderr, "WHILE_COND: file=%s line=%d r=0x%x type=0x%x vr=%d VT_LVAL=%d VT_VALMASK=0x%x btype=0x%x\n",
-            file->filename, file->line_num, vtop->r, vtop->type.t, vtop->vr, (vtop->r & VT_LVAL) ? 1 : 0,
-            vtop->r & VT_VALMASK, vtop->type.t & VT_BTYPE);
+    // fprintf(stderr, "WHILE_COND: file=%s line=%d r=0x%x type=0x%x vr=%d VT_LVAL=%d VT_VALMASK=0x%x btype=0x%x\n",
+    //         file->filename, file->line_num, vtop->r, vtop->type.t, vtop->vr, (vtop->r & VT_LVAL) ? 1 : 0,
+    //         vtop->r & VT_VALMASK, vtop->type.t & VT_BTYPE);
     // a = gvtst(1, 0);
     a = tcc_ir_codegen_test_gen(tcc_state->ir, 1, -1);
     b = -1; /* Initialize continue chain with -1 sentinel */
@@ -10861,13 +10862,14 @@ static void gen_function(Sym *sym)
   if (tcc_state->opt_jump_threading)
   {
     int jump_changes = tcc_ir_opt_jump_threading(ir);
-    if (jump_changes)
-    {
-      /* Eliminate fall-through jumps after threading */
-      jump_changes += tcc_ir_opt_eliminate_fallthrough(ir);
-      if (tcc_state->opt_dce)
-        tcc_ir_opt_dce(ir); /* Clean up any newly unreachable code */
-    }
+    /* Always run fall-through elimination when jump threading is enabled.
+     * Fall-through jumps can appear even without threading changes, e.g.
+     * when DCE turns dead code into NOPs making a JMP target the next
+     * real instruction.  This is essential for dead-code suppression in
+     * tests like 96_nodata_wanted. */
+    jump_changes += tcc_ir_opt_eliminate_fallthrough(ir);
+    if (jump_changes && tcc_state->opt_dce)
+      tcc_ir_opt_dce(ir); /* Clean up any newly unreachable code */
   }
 
   /* Phase 3b: MLA (Multiply-Accumulate) Fusion - fuse MUL + ADD into MLA */

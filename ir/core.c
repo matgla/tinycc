@@ -222,6 +222,17 @@ void tcc_ir_free(TCCIRState *ir)
   /* Free optimization module data */
   tcc_ir_opt_fp_cache_free(ir);
 
+  /* Free switch tables */
+  if (ir->switch_tables)
+  {
+    for (int i = 0; i < ir->num_switch_tables; i++)
+      tcc_free(ir->switch_tables[i].targets);
+    tcc_free(ir->switch_tables);
+    ir->switch_tables = NULL;
+    ir->num_switch_tables = 0;
+    ir->switch_tables_capacity = 0;
+  }
+
   tcc_free(ir);
 }
 
@@ -273,9 +284,15 @@ static int ir_put_soft_call_fpu_if_needed(TCCIRState *ir, TccIrOp op, SValue *sr
 int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *dest)
 {
   {
-    /* Must match CODE_OFF_BIT in tccgen.c */
-    const int IR_CODE_OFF_BIT = 0x20000000;
-    if (nocode_wanted & ~IR_CODE_OFF_BIT)
+    /* Suppress IR emission when nocode_wanted is set, but NOT
+     * when only CODE_OFF_BIT is set.  CODE_OFF_BIT indicates dead code
+     * after unconditional jumps (return/break/goto).  Unlike if(0) dead
+     * branches, these paths may still contain case labels and other
+     * jump targets that need IR instructions to exist for backpatching.
+     * The data/code suppression for if(0) style dead branches is handled
+     * by the string-literal DATA_ONLY_WANTED guard in tccgen.c and
+     * the CODE_OFF in tcc_ir_codegen_test_gen. */
+    if (nocode_wanted & ~0x20000000)
       return -1;
   }
 
@@ -1427,7 +1444,16 @@ void tcc_ir_backpatch_to_here(TCCIRState *ir, int t)
    * can have their merge-point ASSIGN coalesced into the true-path LOAD,
    * leaving the false-path result disconnected from the variable. */
   if (t >= 0)
+  {
     ir->basic_block_start = 1;
+    /* Must match CODE_ON() in tccgen.c: clear the CODE_OFF_BIT so that
+     * subsequent code is not treated as unreachable.  Without this, a
+     * ternary inside a while loop (which uses gjmp → CODE_OFF) leaves the
+     * bit set and causes a following switch statement to skip its entire
+     * dispatch because sw->nocode_wanted is captured as non-zero.  This
+     * mirrors the gsym() function which calls CODE_ON() after patching. */
+    nocode_wanted &= ~0x20000000; /* CODE_OFF_BIT */
+  }
 }
 
 void tcc_ir_backpatch_first(TCCIRState *ir, int t, int target_address)

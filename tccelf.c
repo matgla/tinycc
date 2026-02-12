@@ -1677,11 +1677,18 @@ ST_FUNC void put_elf_reloca(Section *symtab, Section *s, unsigned long offset, i
   Section *sr;
   ElfW_Rel *rel;
 
-  /* Validate symbol index */
-  int num_syms = symtab->data_offset / sizeof(ElfW(Sym));
-  if (symbol < 0 || symbol >= num_syms)
+  /* Validate symbol index.
+     Skip the check for R_RELATIVE relocations to the GOT: put_got_entry()
+     smuggles a symtab_section index through a relocation nominally linked
+     to s1->dynsym, so the index is valid for symtab_section, not for the
+     symtab passed here.  See the "Hack alarm" comment in put_got_entry. */
+  if (type != R_RELATIVE)
   {
-    return; /* Skip invalid symbol index */
+    int num_syms = symtab->data_offset / sizeof(ElfW(Sym));
+    if (symbol < 0 || symbol >= num_syms)
+    {
+      return; /* Skip invalid symbol index */
+    }
   }
 
   sr = s->reloc;
@@ -2943,24 +2950,9 @@ ST_FUNC void tcc_add_runtime(TCCState *s1)
       tccelf_add_crtend(s1);
 #endif
   }
-  else
-  {
-    /* -nostdlib: skip libc/crt, but still add compiler runtime.
-     * These provide __aeabi_* ABI helpers that the compiler emits calls to
-     * (memset, memcpy, softfloat ops). Same as GCC always linking libgcc
-     * even with -nostdlib. Without this, any .so built with -nostdlib
-     * (libc, libm, libncurses...) would be missing these symbols.
-     *
-     * Link order matters for archives (single-pass):
-     *   1. FP lib first (references __aeabi_memset etc. from libtcc1)
-     *   2. libtcc1 second (resolves those back-references)
-     */
-#if defined TCC_TARGET_ARM
-    tccelf_add_arm_fp_lib(s1);
-#endif
-    if (TCC_LIBTCC1[0])
-      tcc_add_support(s1, TCC_LIBTCC1);
-  }
+  /* -nostdlib: skip everything, user links runtime libs explicitly.
+   * -nodefaultlibs: same effect (for building the runtime libs themselves).
+   * This matches GCC behavior where -nostdlib implies no implicit libgcc. */
 }
 #endif /* ndef TCC_TARGET_PE */
 

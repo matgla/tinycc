@@ -882,6 +882,13 @@ int tcc_ir_codegen_test_gen(TCCIRState *ir, int invert, int test)
         dest.r = VT_CONST; /* Mark as constant so jump target is stored in u.imm32 */
         dest.c.i = test;
         test = tcc_ir_put(ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
+        /* Unconditional jump for a compile-time constant condition:
+         * code after this point is unreachable.  Must mirror gjmp_acs()
+         * which calls CODE_OFF() so that data/code suppression works
+         * correctly for dead branches (e.g. if(0) { ... }).
+         * CODE_OFF_BIT = 0x20000000 (defined in tccgen.c). */
+        if (!nocode_wanted)
+          nocode_wanted |= 0x20000000;
       }
     }
     else
@@ -1014,6 +1021,33 @@ static void tcc_ir_codegen_backpatch_jumps(TCCIRState *ir, uint32_t *ir_to_code_
       const int instruction_address = ir_to_code_mapping[i];
       const int target_address = ir_to_code_mapping[target_ir];
       tcc_gen_machine_backpatch_jump(instruction_address, target_address);
+    }
+  }
+
+  /* Backpatch switch table entries.
+   * Table entries are 32-bit signed PC-relative offsets with Thumb bit.
+   * The reference point is (table_start - 2), which is the PC value when
+   * the ADD.W Rt, Rt, PC instruction reads PC (= BX address + 2 = table_start - 2).
+   * Formula: table[i] = (target_addr | 1) - (table_start - 2)
+   * This must happen after all code is generated so forward targets are mapped. */
+  for (int t = 0; t < ir->num_switch_tables; t++)
+  {
+    TCCIRSwitchTable *table = &ir->switch_tables[t];
+    int table_start = table->table_code_addr;
+    if (table_start <= 0)
+      continue;                      /* Table not emitted (e.g. dead code) */
+    int ref_point = table_start - 2; /* PC value at the ADD.W Rt, Rt, PC instruction */
+    for (int j = 0; j < table->num_entries; j++)
+    {
+      int target_ir = table->targets[j];
+      int entry_addr = table_start + j * 4; /* 4 bytes per entry */
+      int target_addr;
+      if (target_ir >= 0 && target_ir < (int)ir->ir_to_code_mapping_size)
+        target_addr = ir_to_code_mapping[target_ir];
+      else
+        target_addr = ir_to_code_mapping[ir->next_instruction_index]; /* epilogue */
+      int32_t offset = (int32_t)((target_addr | 1) - ref_point);
+      write32le(cur_text_section->data + entry_addr, (uint32_t)offset);
     }
   }
 }
@@ -1417,13 +1451,13 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
     case TCCIR_OP_SWITCH_TABLE:
     {
       /* Dry-run: compute exact table size so branch offsets are accurate.
-       * The real pass emits TBB/TBH (4 bytes) + 1 or 2 bytes per entry + alignment. */
+       * Layout: ADD.W(4) + LDR.W(4) + ADD.W(4) + BX(2) = 14 bytes preamble
+       * + 4 bytes per table entry (32-bit signed PC-relative offsets). */
       int table_id = (int)irop_get_imm64_ex(ir, src2_ir);
       TCCIRSwitchTable *table = &ir->switch_tables[table_id];
-      int use_tbh = (table->num_entries > 255);
-      int table_data_size = use_tbh ? table->num_entries * 2 : table->num_entries + (table->num_entries & 1);
-      ind += 4;               /* TBB/TBH instruction */
-      ind += table_data_size; /* Jump table entries + alignment */
+      int table_data_size = table->num_entries * 4; /* 4 bytes per entry */
+      ind += 14;                                    /* preamble instructions */
+      ind += table_data_size;                       /* Jump table entries */
       break;
     }
     case TCCIR_OP_SETIF:

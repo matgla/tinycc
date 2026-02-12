@@ -1276,6 +1276,10 @@ static int tcc_set_linker(TCCState *s, const char *option)
     {
       s->nostdlib = 1;
     }
+    else if (link_option(option, "nodefaultlibs", &p))
+    {
+      s->nodefaultlibs = 1;
+    }
     else if (link_option(option, "e=", &p) || link_option(option, "entry=", &p))
     {
       copy_linker_arg(&s->elf_entryname, p, 0);
@@ -1456,6 +1460,7 @@ enum
   TCC_OPTION_include,
   TCC_OPTION_nostdinc,
   TCC_OPTION_nostdlib,
+  TCC_OPTION_nodefaultlibs,
   TCC_OPTION_print_search_dirs,
   TCC_OPTION_rdynamic,
   TCC_OPTION_pthread,
@@ -1544,6 +1549,7 @@ static const TCCOption tcc_options[] = {
     {"include", TCC_OPTION_include, TCC_OPTION_HAS_ARG},
     {"nostdinc", TCC_OPTION_nostdinc, 0},
     {"nostdlib", TCC_OPTION_nostdlib, 0},
+    {"nodefaultlibs", TCC_OPTION_nodefaultlibs, 0},
     {"print-search-dirs", TCC_OPTION_print_search_dirs, 0},
     {"w", TCC_OPTION_w, 0},
     {"E", TCC_OPTION_E, 0},
@@ -1914,6 +1920,9 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
       break;
     case TCC_OPTION_nostdlib:
       s->nostdlib = 1;
+      break;
+    case TCC_OPTION_nodefaultlibs:
+      s->nodefaultlibs = 1;
       break;
     case TCC_OPTION_v:
       do

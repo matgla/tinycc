@@ -140,6 +140,7 @@ static const char help2[] = "Tiny C Compiler " TCC_VERSION " - More Options\n"
 #endif
                             "-Wl,... linker options:\n"
                             "  -nostdlib                     do not link with standard crt/libs\n"
+                            "  -nodefaultlibs                do not link any default libs (incl. compiler-rt)\n"
                             "  -[no-]whole-archive           load lib(s) fully/only as needed\n"
                             "  -export-all-symbols           same as -rdynamic\n"
                             "  -export-dynamic               same as -rdynamic\n"

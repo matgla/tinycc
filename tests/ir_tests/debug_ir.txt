@@ -1,0 +1,300 @@
+make: Entering directory '/home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/qemu/mps2-an505'
+mkdir -p /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/build
+/home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/../../armv8m-tcc -nostdlib -fvisibility=hidden -mcpu=cortex-m33 -mthumb -mfloat-abi=soft  -ffunction-sections -O1 -dump-ir -I/home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/libc_includes -I/home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/libc_includes/newlib -I/usr/arm-none-eabi/include -I/home/mateusz/repos/yasos.zig/libs/tinycc/include -c /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/qemu/mps2-an505/boot.S -o /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/build/boot.o
+/home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/../../armv8m-tcc -nostdlib -fvisibility=hidden -mcpu=cortex-m33 -mthumb -mfloat-abi=soft  -ffunction-sections -O1 -dump-ir -I/home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/libc_includes -I/home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/libc_includes/newlib -I/usr/arm-none-eabi/include -I/home/mateusz/repos/yasos.zig/libs/tinycc/include /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/debug_range_init.c /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/build/boot.o /usr/lib/gcc/arm-none-eabi/14.2.0/thumb/v8-m.main/nofp/crti.o /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/qemu/mps2-an505/newlib_build/arm-none-eabi/libgloss/arm/rdimon-crt0.o /usr/lib/gcc/arm-none-eabi/14.2.0/thumb/v8-m.main/nofp/crtend.o /usr/lib/gcc/arm-none-eabi/14.2.0/thumb/v8-m.main/nofp/crtn.o -o /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/build/debug_range_init.elf -Wl,--gc-sections -B/home/mateusz/repos/yasos.zig/libs/tinycc -L/home/mateusz/repos/yasos.zig/libs/tinycc/lib/fp -L/home/mateusz/repos/yasos.zig/libs/tinycc -Wl,--start-group -larmv8m-libtcc1.a -lsoftfp /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/qemu/mps2-an505//newlib_build/arm-none-eabi/newlib/libc.a /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/qemu/mps2-an505/newlib_build/arm-none-eabi/libgloss/arm/librdimon.a /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/qemu/mps2-an505//newlib_build/arm-none-eabi/newlib/libm.a /usr/lib/gcc/arm-none-eabi/14.2.0/thumb/v8-m.main/nofp/libgcc.a -Wl,--end-group -Wl,-oformat=elf32-littlearm -T/home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/qemu/mps2-an505/linker_script.ld -v
+tcc version 0.9.28rc 2026-02-11 mob@8c03f4ae* (ARM Linux)
+-> /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/debug_range_init.c
+=== IR BEFORE OPTIMIZATIONS ===
+0000: V0 <-- GlobalSym(1622)***DEREF*** [LOAD]
+0001: T1 <-- V0 [ASSIGN]
+0002: T2 <-- T1 ADD #4
+0003: T3 <-- T2***DEREF*** [ASSIGN]
+0004: T4 <-- T3 ADD #4
+0005: T5 <-- T4***DEREF*** ADD #-1
+0006: T4***DEREF*** <-- T5 [STORE]
+0007: T6 <-- T5 [LOAD]
+0008: CMP T6,#0
+0009: JMP to 16  if ">=S"
+0010: PARAM0[call_0] V0
+0011: T7 <-- V0 [ASSIGN]
+0012: T8 <-- T7 ADD #4
+0013: PARAM1[call_0] T8***DEREF***
+0014: CALL GlobalSym(1882) --> T9
+0015: JMP to 24 
+0016: T10 <-- V0 [ASSIGN]
+0017: T11 <-- T10 ADD #4
+0018: T12 <-- T11***DEREF*** [ASSIGN]
+0019: T13 <-- T12***DEREF*** [ASSIGN]
+0020: T14 <-- T13 ADD #1
+0021: T12***DEREF*** <-- T14 [STORE]
+0022: T15 <-- T13***DEREF*** [LOAD]
+0023: JMP to 25 
+0024: T15 <-- T9 [ASSIGN]
+0025: RETURNVALUE T15
+=== END IR BEFORE OPTIMIZATIONS ===
+=== IR AFTER OPTIMIZATIONS ===
+0000: R4(V0) <-- GlobalSym(1622)***DEREF*** [LOAD]
+0001: R0(T1) <-- R4(V0) [ASSIGN]
+0002: R1(T2) <-- R0(T1) ADD #4
+0003: R0(T3) <-- R1(T2)***DEREF*** [ASSIGN]
+0004: R1(T4) <-- R0(T3) ADD #4
+0005: R0(T5) <-- R1(T4)***DEREF*** ADD #-1
+0006: R1(T4)***DEREF*** <-- R0(T5) [STORE]
+0007: R1(T6) <-- R0(T5) [LOAD]
+0008: CMP R1(T6),#0
+0009: JMP to 16  if ">=S"
+0010: PARAM0[call_0] R4(V0)
+0011: R0(T7) <-- R4(V0) [ASSIGN]
+0012: R5(T8) <-- R0(T7) ADD #4
+0013: PARAM1[call_0] R5(T8)***DEREF***
+0014: CALL GlobalSym(1882) --> R0(T9)
+0015: JMP to 24 
+0016: R1(T10) <-- R4(V0) [ASSIGN]
+0017: R2(T11) <-- R1(T10) ADD #4
+0018: R1(T12) <-- R2(T11)***DEREF*** [ASSIGN]
+0019: R2(T13) <-- R1(T12)***DEREF*** [ASSIGN]
+0020: R3(T14) <-- R2(T13) ADD #1
+0021: R1(T12)***DEREF*** <-- R3(T14) [STORE]
+0022: R1(T15) <-- R2(T13)***DEREF*** [LOAD]
+0023: JMP to 25 
+0024: R1(T15) <-- R0(T9) [ASSIGN]
+0025: RETURNVALUE R1(T15)
+=== END IR AFTER OPTIMIZATIONS ===
+=== IR BEFORE OPTIMIZATIONS ===
+0000: V0 <-- GlobalSym(1622)***DEREF*** [LOAD]
+0001: T1 <-- V0 [ASSIGN]
+0002: T2 <-- T1 ADD #8
+0003: T3 <-- T2***DEREF*** [ASSIGN]
+0004: T4 <-- T3 ADD #8
+0005: T5 <-- T4***DEREF*** ADD #-1
+0006: T4***DEREF*** <-- T5 [STORE]
+0007: T6 <-- T5 [LOAD]
+0008: CMP T6,#0
+0009: JMP to 59  if ">=S"
+0010: T7 <-- V0 [ASSIGN]
+0011: T8 <-- T7 ADD #8
+0012: T9 <-- T8***DEREF*** [ASSIGN]
+0013: T10 <-- T9 ADD #8
+0014: T11 <-- V0 [ASSIGN]
+0015: T12 <-- T11 ADD #8
+0016: T13 <-- T12***DEREF*** [ASSIGN]
+0017: T14 <-- T13 ADD #24
+0018: CMP T10***DEREF***,T14***DEREF***
+0019: JMP to 50  if "<S"
+0020: T15 <-- V0 [ASSIGN]
+0021: T16 <-- T15 ADD #8
+0022: T17 <-- T16***DEREF*** [ASSIGN]
+0023: T18 <-- T17***DEREF*** [ASSIGN]
+0024: T19 <-- P0 [LOAD]
+0025: T18***DEREF*** <-- T19 [STORE]
+0026: T20 <-- V0 [ASSIGN]
+0027: T21 <-- T20 ADD #8
+0028: T22 <-- T21***DEREF*** [ASSIGN]
+0029: T23 <-- T22***DEREF*** [ASSIGN]
+0030: T24 <-- T23***DEREF*** [LOAD]
+0031: CMP T24,#10
+0032: JMP to 41  if "=="
+0033: T25 <-- V0 [ASSIGN]
+0034: T26 <-- T25 ADD #8
+0035: T27 <-- T26***DEREF*** [ASSIGN]
+0036: T28 <-- T27***DEREF*** [ASSIGN]
+0037: T29 <-- T28 ADD #1
+0038: T27***DEREF*** <-- T29 [STORE]
+0039: T30 <-- T28***DEREF*** [LOAD]
+0040: JMP to 48 
+0041: PARAM0[call_0] V0
+0042: PARAM1[call_0] #10
+0043: T31 <-- V0 [ASSIGN]
+0044: T32 <-- T31 ADD #8
+0045: PARAM2[call_0] T32***DEREF***
+0046: CALL GlobalSym(1883) --> T33
+0047: JMP to 49 
+0048: T33 <-- T30 [ASSIGN]
+0049: JMP to 57 
+0050: PARAM0[call_1] V0
+0051: PARAM1[call_1] P0
+0052: T34 <-- V0 [ASSIGN]
+0053: T35 <-- T34 ADD #8
+0054: PARAM2[call_1] T35***DEREF***
+0055: CALL GlobalSym(1883) --> T36
+0056: JMP to 58 
+0057: T36 <-- T33 [ASSIGN]
+0058: JMP to 73 
+0059: T37 <-- V0 [ASSIGN]
+0060: T38 <-- T37 ADD #8
+0061: T39 <-- T38***DEREF*** [ASSIGN]
+0062: T40 <-- T39***DEREF*** [ASSIGN]
+0063: T41 <-- P0 [LOAD]
+0064: T40***DEREF*** <-- T41 [STORE]
+0065: T42 <-- V0 [ASSIGN]
+0066: T43 <-- T42 ADD #8
+0067: T44 <-- T43***DEREF*** [ASSIGN]
+0068: T45 <-- T44***DEREF*** [ASSIGN]
+0069: T46 <-- T45 ADD #1
+0070: T44***DEREF*** <-- T46 [STORE]
+0071: T47 <-- T45***DEREF*** [LOAD]
+0072: JMP to 74 
+0073: T47 <-- T36 [ASSIGN]
+0074: RETURNVALUE T47
+=== END IR BEFORE OPTIMIZATIONS ===
+=== IR AFTER OPTIMIZATIONS ===
+0000: R5(V0) <-- GlobalSym(1622)***DEREF*** [LOAD]
+0001: R0(T1) <-- R5(V0) [ASSIGN]
+0002: R1(T2) <-- R0(T1) ADD #8
+0003: R0(T3) <-- R1(T2)***DEREF*** [ASSIGN]
+0004: R1(T4) <-- R0(T3) ADD #8
+0005: R0(T5) <-- R1(T4)***DEREF*** ADD #-1
+0006: R1(T4)***DEREF*** <-- R0(T5) [STORE]
+0007: R1(T6) <-- R0(T5) [LOAD]
+0008: CMP R1(T6),#0
+0009: JMP to 59  if ">=S"
+0010: R0(T7) <-- R5(V0) [ASSIGN]
+0011: R1(T8) <-- R0(T7) ADD #8
+0012: R0(T9) <-- R1(T8)***DEREF*** [ASSIGN]
+0013: R1(T10) <-- R0(T9) ADD #8
+0014: R0(T11) <-- R5(V0) [ASSIGN]
+0015: R2(T12) <-- R0(T11) ADD #8
+0016: R0(T13) <-- R2(T12)***DEREF*** [ASSIGN]
+0017: R2(T14) <-- R0(T13) ADD #24
+0018: CMP R1(T10)***DEREF***,R2(T14)***DEREF***
+0019: JMP to 50  if "<S"
+0020: R0(T15) <-- R5(V0) [ASSIGN]
+0021: R1(T16) <-- R0(T15) ADD #8
+0022: R0(T17) <-- R1(T16)***DEREF*** [ASSIGN]
+0023: R1(T18) <-- R0(T17)***DEREF*** [ASSIGN]
+0024: R0(T19) <-- R4(P0) [LOAD]
+0025: R1(T18)***DEREF*** <-- R0(T19) [STORE]
+0026: R0(T20) <-- R5(V0) [ASSIGN]
+0027: R1(T21) <-- R0(T20) ADD #8
+0028: R0(T22) <-- R1(T21)***DEREF*** [ASSIGN]
+0029: R1(T23) <-- R0(T22)***DEREF*** [ASSIGN]
+0030: R0(T24) <-- R1(T23)***DEREF*** [LOAD]
+0031: CMP R0(T24),#10
+0032: JMP to 41  if "=="
+0033: R0(T25) <-- R5(V0) [ASSIGN]
+0034: R1(T26) <-- R0(T25) ADD #8
+0035: R0(T27) <-- R1(T26)***DEREF*** [ASSIGN]
+0036: R1(T28) <-- R0(T27)***DEREF*** [ASSIGN]
+0037: R2(T29) <-- R1(T28) ADD #1
+0038: R0(T27)***DEREF*** <-- R2(T29) [STORE]
+0039: R6(T30) <-- R1(T28)***DEREF*** [LOAD]
+0040: JMP to 48 
+0041: PARAM0[call_0] R5(V0)
+0042: PARAM1[call_0] #10
+0043: R0(T31) <-- R5(V0) [ASSIGN]
+0044: R8(T32) <-- R0(T31) ADD #8
+0045: PARAM2[call_0] R8(T32)***DEREF***
+0046: CALL GlobalSym(1883) --> R9(T33)
+0047: JMP to 57 
+0048: R9(T33) <-- R6(T30) [ASSIGN]
+0049: JMP to 57 
+0050: PARAM0[call_1] R5(V0)
+0051: PARAM1[call_1] R4(P0)
+0052: R0(T34) <-- R5(V0) [ASSIGN]
+0053: R6(T35) <-- R0(T34) ADD #8
+0054: PARAM2[call_1] R6(T35)***DEREF***
+0055: CALL GlobalSym(1883) --> R0(T36)
+0056: JMP to 73 
+0057: R0(T36) <-- R9(T33) [ASSIGN]
+0058: JMP to 73 
+0059: R1(T37) <-- R5(V0) [ASSIGN]
+0060: R2(T38) <-- R1(T37) ADD #8
+0061: R1(T39) <-- R2(T38)***DEREF*** [ASSIGN]
+0062: R2(T40) <-- R1(T39)***DEREF*** [ASSIGN]
+0063: R1(T41) <-- R4(P0) [LOAD]
+0064: R2(T40)***DEREF*** <-- R1(T41) [STORE]
+0065: R1(T42) <-- R5(V0) [ASSIGN]
+0066: R2(T43) <-- R1(T42) ADD #8
+0067: R1(T44) <-- R2(T43)***DEREF*** [ASSIGN]
+0068: R2(T45) <-- R1(T44)***DEREF*** [ASSIGN]
+0069: R3(T46) <-- R2(T45) ADD #1
+0070: R1(T44)***DEREF*** <-- R3(T46) [STORE]
+0071: R1(T47) <-- R2(T45)***DEREF*** [LOAD]
+0072: JMP to 74 
+0073: R1(T47) <-- R0(T36) [ASSIGN]
+0074: RETURNVALUE R1(T47)
+=== END IR AFTER OPTIMIZATIONS ===
+=== IR BEFORE OPTIMIZATIONS ===
+0000: V0 <-- #0 [ASSIGN]
+0001: PARAM0[call_0] Addr[StackLoc[-16]]
+0002: PARAM2[call_0] #0
+0003: PARAM1[call_0] #16
+0004: CALL GlobalSym(433) CALL #3
+0005: V0 <-- V0 ADD #1
+0006: T2 <-- V0 [LOAD]
+0007: StackLoc[-16] <-- T2 [STORE]
+0008: T3 <-- StackLoc[-16] [LOAD]
+0009: StackLoc[-12] <-- T3 [STORE]
+0010: V0 <-- V0 ADD #1
+0011: T5 <-- V0 [LOAD]
+0012: StackLoc[-8] <-- T5 [STORE]
+0013: T6 <-- StackLoc[-8] [LOAD]
+0014: StackLoc[-4] <-- T6 [STORE]
+0015: V1 <-- #0 [ASSIGN]
+0016: CMP V1,#4
+0017: JMP to 28  if ">=S"
+0018: JMP to 22 
+0019: T7 <-- V1 [ASSIGN]
+0020: V1 <-- T7 ADD #1
+0021: JMP to 16 
+0022: PARAM0[call_1] GlobalSym(268435461)
+0023: T9 <-- V1 SHL #2
+0024: T10 <-- Addr[StackLoc[-16]] ADD T9
+0025: PARAM1[call_1] T10***DEREF***
+0026: CALL GlobalSym(1699) --> GlobalSym(433)***DEREF***
+0027: JMP to 19 
+0028: PARAM0[call_2] GlobalSym(268435462)
+0029: CALL GlobalSym(1699) --> GlobalSym(433)***DEREF***
+0030: RETURNVALUE #0
+0031: RETURNVALUE #0
+=== END IR BEFORE OPTIMIZATIONS ===
+=== IR AFTER OPTIMIZATIONS ===
+0000: R4(V0) <-- #0 [ASSIGN]
+0001: PARAM0[call_0] Addr[StackLoc[-16]]
+0002: PARAM2[call_0] #0
+0003: PARAM1[call_0] #16
+0004: CALL GlobalSym(433) CALL #3
+0005: R4(V0) <-- R4(V0) ADD #1
+0006: R0(T2) <-- R4(V0)
+0007: StackLoc[-16] <-- R0(T2) [STORE]
+0008: R1(T3) <-- R0(T2) [ASSIGN]
+0009: StackLoc[-12] <-- R1(T3) [STORE]
+0010: NOP 
+0011: R0(T5) <-- R4(V0) [LOAD]
+0012: StackLoc[-8] <-- R0(T5) [STORE]
+0013: R1(T6) <-- R0(T5) [ASSIGN]
+0014: StackLoc[-4] <-- R1(T6) [STORE]
+0015: R4(V1) <-- #0 [ASSIGN]
+0016: CMP R4(V1),#4
+0017: JMP to 28  if ">=S"
+0018: JMP to 22 
+0019: R5(T7) <-- R4(V1) [ASSIGN]
+0020: R4(V1) <-- R5(T7) ADD #1
+0021: JMP to 16 
+0022: PARAM0[call_1] GlobalSym(268435461)
+0023: R0(T9) <-- R4(V1) SHL #2
+0024: R6(T10) <-- Addr[StackLoc[-16]] ADD R0(T9)
+0025: PARAM1[call_1] R6(T10)***DEREF***
+0026: CALL GlobalSym(1699) --> GlobalSym(433)***DEREF***
+0027: JMP to 19 
+0028: PARAM0[call_2] GlobalSym(268435462)
+0029: CALL GlobalSym(1699) --> GlobalSym(433)***DEREF***
+0030: RETURNVALUE #0
+0031: NOP 
+=== END IR AFTER OPTIMIZATIONS ===
+-> /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/build/boot.o
+-> /usr/lib/gcc/arm-none-eabi/14.2.0/thumb/v8-m.main/nofp/crti.o
+-> /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/qemu/mps2-an505/newlib_build/arm-none-eabi/libgloss/arm/rdimon-crt0.o
+-> /usr/lib/gcc/arm-none-eabi/14.2.0/thumb/v8-m.main/nofp/crtend.o
+-> /usr/lib/gcc/arm-none-eabi/14.2.0/thumb/v8-m.main/nofp/crtn.o
+-> /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/qemu/mps2-an505//newlib_build/arm-none-eabi/newlib/libc.a
+-> /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/qemu/mps2-an505/newlib_build/arm-none-eabi/libgloss/arm/librdimon.a
+-> /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/qemu/mps2-an505//newlib_build/arm-none-eabi/newlib/libm.a
+-> /usr/lib/gcc/arm-none-eabi/14.2.0/thumb/v8-m.main/nofp/libgcc.a
+Memory region FLASH: ORIGIN=0x10000000
+Memory region RAM: ORIGIN=0x80000000
+GC: removing unused section '.ARM.exidx.text.__udivmoddi4' (8 bytes)
+<- /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/build/debug_range_init.elf
+Build complete: /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/build/debug_range_init.elf
+make: Leaving directory '/home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/qemu/mps2-an505'
+Running QEMU with file: /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/build/debug_range_init.elf

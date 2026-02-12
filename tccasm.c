@@ -51,6 +51,18 @@ static AsmMacro *asm_macro_find(int name)
   return NULL;
 }
 
+static void asm_macros_free(void)
+{
+  AsmMacro *m, *next;
+  for (m = asm_macros; m; m = next)
+  {
+    next = m->next;
+    tok_str_free(m->body);
+    tcc_free(m);
+  }
+  asm_macros = NULL;
+}
+
 static int asm_get_prefix_name(TCCState *s1, const char *prefix, unsigned int n)
 {
   char buf[64];
@@ -1435,6 +1447,7 @@ ST_FUNC int tcc_assemble(TCCState *s1, int do_preprocess)
   ret = tcc_assemble_internal(s1, do_preprocess, 1);
   cur_text_section->data_offset = ind;
   tcc_debug_end(s1);
+  asm_macros_free();
   return ret;
 }
 

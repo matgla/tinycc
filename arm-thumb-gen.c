@@ -121,10 +121,17 @@ static inline Sym *validate_sym_for_reloc(Sym *sym)
     return NULL;
   /* Type descriptors (SYM_FIELD) should not be used for relocations */
   if (sym->v & SYM_FIELD)
+  {
+    fprintf(stderr, "[TCC-DIAG] validate_sym_for_reloc: sym->v=0x%x has SYM_FIELD, c=%d\n", sym->v, sym->c);
     return NULL;
+  }
   /* Symbols with c < 0 are not properly registered */
   if (sym->c < 0)
+  {
+    const char *name = get_tok_str(sym->v & ~SYM_FIELD, NULL);
+    fprintf(stderr, "[TCC-DIAG] validate_sym_for_reloc: sym '%s' has c=%d (<0)\n", name ? name : "?", sym->c);
     return NULL;
+  }
   return sym;
 }
 
@@ -1822,13 +1829,24 @@ ST_FUNC void tcc_gen_machine_indirect_jump_op(IROperand src1)
 /* ============================================================================
  * Switch Table / Jump Table Generation
  * ============================================================================
- * Generates TBB/TBH instruction followed by a jump table for O(1) switch dispatch.
+ * Generates a PC-relative jump table for O(1) switch dispatch.
+ * Uses 32-bit signed offsets to support both forward and backward targets.
+ *
+ * Generated code sequence (14 bytes + 4*N table entries):
+ *   ADD.W  Rt, PC, Rm, LSL #2    ; 4B  Rt = &table[index] (via PC+4)
+ *   LDR.W  Rt, [Rt, #10]         ; 4B  Rt = table[index] (signed offset)
+ *   ADD.W  Rt, Rt, PC            ; 4B  Rt = target | 1 (offset + PC)
+ *   BX     Rt                    ; 2B  branch to target
+ *   table[0..N-1]                ; 4B each, signed PC-relative offsets
+ *
+ * The reference point for offsets is (table_start - 2), i.e. the BX address + 4.
+ * table[i] = (target_addr | 1) - (table_start - 2)
+ *
  * The index is already bounds-checked and adjusted (index = value - min_case).
  */
 
 ST_FUNC void tcc_gen_machine_switch_table_op(IROperand src1, TCCIRSwitchTable *table, TCCIRState *ir, int ir_idx)
 {
-  (void)ir;     /* Unused for now, may be needed for relocation */
   (void)ir_idx; /* Unused for now, may be needed for debug */
 
   TRACE("'tcc_gen_machine_switch_table_op' table_id=%d entries=%d\n", table - ir->switch_tables, table->num_entries);
@@ -1840,145 +1858,49 @@ ST_FUNC void tcc_gen_machine_switch_table_op(IROperand src1, TCCIRSwitchTable *t
   }
   int index_reg = src1.pr0_reg;
 
-  /* Determine whether to use TBB (byte offsets) or TBH (halfword offsets).
-   * TBB offsets are unsigned bytes (0-255), giving max forward reach of 510 bytes.
-   * TBH offsets are unsigned halfwords (0-65535), giving max forward reach of 131070 bytes.
-   * The offset is (target - table_start) / 2.
-   *
-   * Always use TBH to avoid TBB range overflow issues. TBH costs 1 extra byte per
-   * table entry but is much safer with varying code sizes from literal pools,
-   * R9 caller-save sequences, etc.
-   */
-  int use_tbh = 1;
+  /* Reuse index_reg as scratch - it's dead after SWITCH_TABLE (terminator). */
+  int rt = index_reg;
 
-  /* Emit TBB/TBH instruction.
-   * TBB/TBH reads PC+4, so the table must follow immediately after.
-   * Format: TBB [PC, Rm] or TBH [PC, Rm, LSL #1]
-   * We use PC (R15) as the base register.
-   */
-  if (use_tbh)
-  {
-    /* TBH: halfword table, index shifted left by 1 */
-    ot_check(th_tbb(15 /* PC */, index_reg, 1));
-  }
-  else
-  {
-    /* TBB: byte table */
-    ot_check(th_tbb(15 /* PC */, index_reg, 0));
-  }
+  /* Instruction 1: ADD.W Rt, PC, Rm, LSL #2
+   * Rt = PC + index*4 = (ind+4) + index*4
+   * After this: Rt points index*4 bytes past (ind+4). */
+  thumb_shift lsl2 = {.type = THUMB_SHIFT_LSL, .value = 2, .mode = THUMB_SHIFT_IMMEDIATE};
+  ot_check(th_add_reg(rt, R_PC, index_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, lsl2, ENFORCE_ENCODING_32BIT));
 
-  /* Record the current position as the table start for relocations */
+  /* Instruction 2: LDR.W Rt, [Rt, #10]
+   * Loads from Rt+10 = (ind_prev+4+index*4) + 10.
+   * The table starts at ind_prev + 14 (after all 4 instructions = 4+4+4+2 = 14).
+   * So we load from table_start + index*4. The immediate 10 = 14 - 4 = table_start - prev_ind - 4.
+   */
+  ot_check(th_ldr_imm(rt, rt, 10, 6 /* positive offset */, ENFORCE_ENCODING_32BIT));
+
+  /* Instruction 3: ADD.W Rt, Rt, PC
+   * Rt = offset + PC = offset + (ind+4).
+   * This reconstructs the target address from the PC-relative offset.
+   * Force 32-bit encoding so the layout stays fixed at 14 bytes. */
+  ot_check(th_add_reg(rt, rt, R_PC, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_32BIT));
+
+  /* Instruction 4: BX Rt
+   * Branch to target (Thumb bit already set in offset). */
+  ot_check(th_bx_reg(rt));
+
+  /* Record the current position as the table start */
   int table_start = ind;
 
-  /* Emit jump table entries.
-   * TBB/TBH offsets are relative to the instruction following TBB/TBH,
-   * which is at 'table_start'. Each entry is divided by 2 (halfword aligned).
-   *
-   * For TBB: byte offset = (target - table_start) / 2
-   * For TBH: halfword offset = (target - table_start) / 2
+  /* Emit jump table entries as 32-bit placeholder zeros.
+   * Actual signed offsets are backpatched by tcc_ir_codegen_backpatch_jumps()
+   * after all code is generated and ir_to_code_mapping is complete.
    */
   for (int i = 0; i < table->num_entries; i++)
   {
-    int target_ir = table->targets[i];
-
-    /* Store the target IR index as a relocation entry.
-     * We'll patch the actual offset after all code is generated
-     * using the ir_to_code_mapping.
-     */
-    if (use_tbh)
-    {
-      /* Halfword offset - reserve 2 bytes */
-      /* We'll need to patch this later with the actual offset */
-      g(0);
-      g(0);
-    }
-    else
-    {
-      /* Byte offset - reserve 1 byte */
-      g(0);
-    }
-
-    /* Add a relocation entry for this table slot.
-     * We use the existing relocation infrastructure by treating each
-     * table entry as a small relocation that points to the target IR.
-     */
-    (void)target_ir; /* Will be used for relocation */
+    g(0);
+    g(0);
+    g(0);
+    g(0);
   }
 
-  /* Align to halfword boundary after table if needed (for TBB) */
-  if (!use_tbh && (ind & 1))
-  {
-    g(0); /* Padding byte */
-  }
-
-  /* The table entries need to be patched with actual offsets.
-   * This is done in a second pass after all code is generated,
-   * using the ir_to_code_mapping array which maps IR indices to code addresses.
-   *
-   * For now, we emit placeholder entries that will be fixed up.
-   * The fixup should happen during tcc_ir_codegen_backpatch_jumps or similar.
-   */
-
-  /* Record table relocation info for later patching.
-   * We need to store:
-   *   - table_start: address of first table entry
-   *   - num_entries: number of table entries
-   *   - target IR indices for each entry
-   *
-   * For simplicity, we'll do a runtime patch after code generation
-   * using the ir_to_code_mapping that was built during generation.
-   */
-
-  /* Store the table info for the second pass patching.
-   * We'll access ir->ir_to_code_mapping to get the actual addresses.
-   */
-  if (ir && ir->ir_to_code_mapping)
-  {
-    /* Patch the table entries now that we have the mapping */
-    for (int i = 0; i < table->num_entries; i++)
-    {
-      int target_ir = table->targets[i];
-      int entry_addr = table_start + (use_tbh ? i * 2 : i);
-
-      /* Get target address from the IR-to-code mapping */
-      int target_addr;
-      if (target_ir >= 0 && target_ir < ir->ir_to_code_mapping_size)
-      {
-        target_addr = ir->ir_to_code_mapping[target_ir];
-      }
-      else
-      {
-        /* Default case: point to end of switch (current position) */
-        target_addr = ind;
-      }
-
-      /* Calculate offset: (target - table_start) / 2
-       * TBB/TBH offsets are signed and multiplied by 2 by the hardware.
-       */
-      int offset = (target_addr - table_start) / 2;
-
-      /* Range check */
-      if (use_tbh)
-      {
-        if (offset < -32768 || offset > 32767)
-        {
-          tcc_error("internal error: TBH offset out of range");
-        }
-        /* Patch halfword entry */
-        write16le(cur_text_section->data + entry_addr, (uint16_t)(offset & 0xFFFF));
-      }
-      else
-      {
-        if (offset < -128 || offset > 127)
-        {
-          /* Fall back to TBH if TBB offset out of range */
-          tcc_error("internal error: TBB offset out of range, should have used TBH");
-        }
-        /* Patch byte entry */
-        cur_text_section->data[entry_addr] = (uint8_t)(offset & 0xFF);
-      }
-    }
-  }
+  /* Record the code address of this table for deferred backpatching. */
+  table->table_code_addr = table_start;
 }
 
 void gsym_addr(int t, int a)
@@ -2616,6 +2538,9 @@ static void load_full_const(int r, int r1, int64_t imm, struct Sym *sym)
       if (sym->c <= 0)
       {
         /* Registration failed - symbol can't be externalized */
+        const char *name = get_tok_str(sym->v & ~SYM_FIELD, NULL);
+        fprintf(stderr, "[TCC-DIAG] load_full_const: put_extern_sym failed for '%s', c=%d\n", name ? name : "?",
+                sym->c);
         sym = NULL;
       }
     }
@@ -2683,15 +2608,44 @@ static void load_full_const(int r, int r1, int64_t imm, struct Sym *sym)
     {
       if (text_and_data_separation)
       {
-        // all data except constants in .ro section can be addressed relative to
-        // .got, how can I distinguish that situation?
-        //
-        if (sym->type.t & VT_STATIC && sym_off != cur_text_section->sh_num)
+        /* Relocation strategy for text_and_data_separation + PIC:
+         *
+         * R_ARM_GOTOFF computes (symbol - GOT_addr) and at runtime adds R9.
+         * This only works when symbol and GOT are in the same loadable
+         * segment (i.e. both in data).  With text/data separation, code
+         * (.text) and data (.got) are loaded at independent addresses.
+         *
+         * Static symbols in *data* sections (no SHF_EXECINSTR):
+         *   GOTOFF is fine — symbol and GOT are both in the data segment.
+         *
+         * Everything else (including static functions in other .text.*
+         * sections from -ffunction-sections):
+         *   Use R_ARM_GOT32 — indirect through a GOT slot.  The linker
+         *   creates a GOT entry (put_got_entry → R_RELATIVE for locals),
+         *   fill_local_got_entries writes sym->st_value into the slot,
+         *   and the YAFF writer emits a data relocation so the dynamic
+         *   loader patches the slot to the runtime code address.
+         */
+        int sym_in_code_section = 0;
+        if (sym_off > 0 && sym_off < tcc_state->nb_sections)
         {
+          Section *sym_sec = tcc_state->sections[sym_off];
+          if (sym_sec && (sym_sec->sh_flags & SHF_EXECINSTR))
+            sym_in_code_section = 1;
+        }
+        if (sym->type.t & VT_STATIC && sym_off != cur_text_section->sh_num && !sym_in_code_section)
+        {
+          /* Static data symbol — GOTOFF (same segment as GOT) */
           entry->relocation = R_ARM_GOTOFF;
         }
         else
         {
+          if (sym->type.t & VT_STATIC && sym_off != cur_text_section->sh_num && sym_in_code_section)
+          {
+            const char *sym_name = get_tok_str(sym->v & ~SYM_FIELD, NULL);
+            fprintf(stderr, "[TCC] static code sym '%s' in sec %d (cur %d) -> GOT32\n", sym_name ? sym_name : "?",
+                    sym_off, cur_text_section->sh_num);
+          }
           entry->relocation = R_ARM_GOT32;
         }
       }
@@ -2715,8 +2669,20 @@ static void load_full_const(int r, int r1, int64_t imm, struct Sym *sym)
     {
       if (text_and_data_separation)
       {
-        if (sym->type.t & VT_STATIC && sym_off != cur_text_section->sh_num)
+        /* Mirror the relocation selection above:
+         * - Static data symbol → R_ARM_GOTOFF → add R9
+         * - Everything else    → R_ARM_GOT32  → add R9; ldr [r]; add imm
+         */
+        int sym_in_code_section_cg = 0;
+        if (sym_off > 0 && sym_off < tcc_state->nb_sections)
         {
+          Section *sym_sec = tcc_state->sections[sym_off];
+          if (sym_sec && (sym_sec->sh_flags & SHF_EXECINSTR))
+            sym_in_code_section_cg = 1;
+        }
+        if (sym->type.t & VT_STATIC && sym_off != cur_text_section->sh_num && !sym_in_code_section_cg)
+        {
+          /* Static data symbol — GOTOFF (add R9) */
           ot_check(th_add_reg(r, r, R9, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
         }
         else
@@ -2915,6 +2881,11 @@ ST_FUNC void tcc_machine_load_constant(int dest_reg, int dest_reg_high, int64_t 
       return;
     }
     /* Invalid or missing sym - fall through to treat as plain constant */
+    {
+      const char *name = get_tok_str(sym->v & ~SYM_FIELD, NULL);
+      fprintf(stderr, "[TCC-DIAG] tcc_machine_load_constant: sym '%s' failed validation, loading plain value=%lld\n",
+              name ? name : "?", (long long)value);
+    }
   }
 
   if (is_64bit)
@@ -4826,8 +4797,9 @@ void tcc_gen_machine_data_processing_op(IROperand src1, IROperand src2, IROperan
      * the value it points to before comparing against zero. */
     const int needs_load = thumb_irop_has_immediate_value(src1) || src_lo == PREG_REG_NONE || src1.is_lval ||
                            thumb_irop_needs_value_load(src1) || (is64 && src_hi == PREG_REG_NONE);
-    fprintf(stderr, "TEST_ZERO: is_lval=%d needs_load=%d is64=%d pr0=%d pr1=%d vr=%d btype=%d ind=0x%x\n", src1.is_lval,
-            needs_load, is64, src_lo, src_hi, src1.vr, src1.btype, ind);
+    // fprintf(stderr, "TEST_ZERO: is_lval=%d needs_load=%d is64=%d pr0=%d pr1=%d vr=%d btype=%d ind=0x%x\n",
+    // src1.is_lval,
+    //         needs_load, is64, src_lo, src_hi, src1.vr, src1.btype, ind);
 
     if (!is64)
     {

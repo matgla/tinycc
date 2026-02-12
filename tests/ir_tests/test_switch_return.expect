@@ -1,0 +1,9 @@
+switch_return(0) = 0
+switch_return(1) = 10
+switch_return(2) = 20
+switch_return(3) = 30
+switch_return(4) = 40
+switch_return(5) = 50
+switch_return(6) = 60
+switch_return(7) = 70
+switch_return(8) = 0

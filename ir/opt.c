@@ -122,6 +122,22 @@ int tcc_ir_opt_dce(TCCIRState *ir)
       MARK_REACHABLE((int)dest.u.imm32);
       MARK_REACHABLE(i + 1);
       break;
+    case TCCIR_OP_SWITCH_TABLE:
+    {
+      /* Switch table - all targets are reachable */
+      IROperand src2 = tcc_ir_op_get_src2(ir, q);
+      int table_id = (int)irop_get_imm64_ex(ir, src2);
+      if (table_id >= 0 && table_id < ir->num_switch_tables)
+      {
+        TCCIRSwitchTable *table = &ir->switch_tables[table_id];
+        for (int j = 0; j < table->num_entries; j++)
+          MARK_REACHABLE(table->targets[j]);
+        /* Also mark the default target */
+        MARK_REACHABLE(table->default_target);
+      }
+      /* SWITCH_TABLE is a terminator - no fall-through */
+      break;
+    }
     case TCCIR_OP_IJUMP:
       /* Indirect jump (computed goto).
          The successor set is not statically known, but in typical patterns
@@ -1579,8 +1595,7 @@ int tcc_ir_opt_copy_prop(TCCIRState *ir)
       const int dest_type = TCCIR_DECODE_VREG_TYPE(dest_vr);
       if (dest.is_lval)
         goto skip_invalidation; /* STORE dest is a pointer use, not a redefinition */
-      if (dest_type == TCCIR_VREG_TYPE_VAR || dest_type == TCCIR_VREG_TYPE_PARAM ||
-          dest_type == TCCIR_VREG_TYPE_TEMP)
+      if (dest_type == TCCIR_VREG_TYPE_VAR || dest_type == TCCIR_VREG_TYPE_PARAM || dest_type == TCCIR_VREG_TYPE_TEMP)
       {
         int dest_pos = TCCIR_DECODE_VREG_POSITION(dest_vr);
         SourceInfo *src_info = NULL;
@@ -1600,8 +1615,8 @@ int tcc_ir_opt_copy_prop(TCCIRState *ir)
             if (copy_info[tmp_pos].gen == current_gen && copy_info[tmp_pos].source_vr == dest_vr)
             {
 #ifdef DEBUG_IR_GEN
-              printf("COPY_PROP: Invalidate TMP:%d (source vreg:%d type=%d redefined) at i=%d\n", tmp_pos,
-                     dest_pos, dest_type, i);
+              printf("COPY_PROP: Invalidate TMP:%d (source vreg:%d type=%d redefined) at i=%d\n", tmp_pos, dest_pos,
+                     dest_type, i);
 #endif
               copy_info[tmp_pos].gen = 0;
               if (active_copies > 0)
@@ -1613,7 +1628,7 @@ int tcc_ir_opt_copy_prop(TCCIRState *ir)
         }
       }
     }
-    skip_invalidation:
+  skip_invalidation:
 
     /* Clear all copies at basic block boundaries - O(1) operation */
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF || q->op == TCCIR_OP_FUNCCALLVOID ||
@@ -1640,8 +1655,7 @@ int tcc_ir_opt_copy_prop(TCCIRState *ir)
          * propagate lval sources as that would re-load from potentially stale memory.
          * Also require matching types: e.g. UMULL produces 64-bit T9, then
          * T10 <-- T9 [ASSIGN] truncates to 32-bit; that's NOT a copy. */
-        if (!src_is_const && src1_vr >= 0 && !src1.is_lval &&
-            irop_get_btype(dest) == irop_get_btype(src1) &&
+        if (!src_is_const && src1_vr >= 0 && !src1.is_lval && irop_get_btype(dest) == irop_get_btype(src1) &&
             (src_vreg_type == TCCIR_VREG_TYPE_VAR || src_vreg_type == TCCIR_VREG_TYPE_PARAM ||
              src_vreg_type == TCCIR_VREG_TYPE_TEMP))
         {
@@ -3647,6 +3661,16 @@ int tcc_ir_opt_postinc_fusion(TCCIRState *ir)
     if (!irop_has_vreg(ptr_op))
       continue;
 
+    /* Only fuse when the operand represents a pointer in a register being
+     * dereferenced (TEMP vreg with is_lval, is_local=0).  Skip stack-local
+     * operands (is_local=1): their address is a fixed [FP-offset] computed
+     * by the code-generator, not a value in a GP register.  Fusing a local
+     * variable load (LOAD from VAR, is_local=1) with a later ADD would
+     * incorrectly treat the scalar value as a memory address for
+     * LDR Rd,[Rn],#imm instead of a simple register copy. */
+    if (ptr_op.is_local)
+      continue;
+
     int32_t ptr_vr = irop_get_vreg(ptr_op);
     int32_t orig_ptr_vr = ptr_vr;
     IROperand orig_ptr_op = ptr_op;
@@ -4976,9 +5000,9 @@ typedef struct GCSEExpr
   uint8_t src2_is_const : 1;
   uint8_t src1_is_sym : 1;
   uint8_t src2_is_sym : 1;
-  int32_t result_vr;     /* The vreg holding the computed result */
-  int instr_idx;         /* Instruction index where computed */
-  uint8_t valid : 1;     /* Whether this entry is valid */
+  int32_t result_vr; /* The vreg holding the computed result */
+  int instr_idx;     /* Instruction index where computed */
+  uint8_t valid : 1; /* Whether this entry is valid */
 } GCSEExpr;
 
 /* Available expressions at block entry/exit */
@@ -5132,9 +5156,9 @@ static int gcse_extract_expr(TCCIRState *ir, int instr_idx, GCSEExpr *expr)
   IRQuadCompact *q = &ir->compact_instructions[instr_idx];
 
   /* Only handle arithmetic ops suitable for CSE */
-  if (q->op != TCCIR_OP_ADD && q->op != TCCIR_OP_SUB && q->op != TCCIR_OP_MUL &&
-      q->op != TCCIR_OP_AND && q->op != TCCIR_OP_OR && q->op != TCCIR_OP_XOR &&
-      q->op != TCCIR_OP_SHL && q->op != TCCIR_OP_SHR && q->op != TCCIR_OP_SAR)
+  if (q->op != TCCIR_OP_ADD && q->op != TCCIR_OP_SUB && q->op != TCCIR_OP_MUL && q->op != TCCIR_OP_AND &&
+      q->op != TCCIR_OP_OR && q->op != TCCIR_OP_XOR && q->op != TCCIR_OP_SHL && q->op != TCCIR_OP_SHR &&
+      q->op != TCCIR_OP_SAR)
     return 0;
 
   IROperand src1 = tcc_ir_op_get_src1(ir, q);
@@ -5186,11 +5210,11 @@ typedef struct GCSEBlock
   int start_idx;
   int end_idx;
   int num_succs;
-  int succs[2];  /* JUMP/JUMPIF can have at most 2 successors */
+  int succs[2]; /* JUMP/JUMPIF can have at most 2 successors */
   int num_preds;
-  int preds[8];  /* Arbitrary limit for predecessors */
+  int preds[8]; /* Arbitrary limit for predecessors */
   int visited;
-  int rpo_num;   /* Reverse postorder number */
+  int rpo_num; /* Reverse postorder number */
 } GCSEBlock;
 
 /* Build basic blocks from IR */
@@ -5215,8 +5239,8 @@ static int gcse_build_blocks(TCCIRState *ir, GCSEBlock *blocks, int max_blocks)
       if (i + 1 < n)
         is_block_start[i + 1] = 1;
     }
-    else if (q->op == TCCIR_OP_RETURNVALUE || q->op == TCCIR_OP_RETURNVOID ||
-             q->op == TCCIR_OP_FUNCCALLVOID || q->op == TCCIR_OP_FUNCCALLVAL)
+    else if (q->op == TCCIR_OP_RETURNVALUE || q->op == TCCIR_OP_RETURNVOID || q->op == TCCIR_OP_FUNCCALLVOID ||
+             q->op == TCCIR_OP_FUNCCALLVAL)
     {
       if (i + 1 < n)
         is_block_start[i + 1] = 1;
@@ -5466,8 +5490,8 @@ int tcc_ir_opt_cse_global(TCCIRState *ir)
       gcse_copy(&new_out, &block_in[b]);
 
 #ifdef DEBUG_IR_GEN
-      printf("GLOBAL CSE: Block %d [%d-%d) IN has %d exprs\n",
-             b, blocks[b].start_idx, blocks[b].end_idx, block_in[b].count);
+      printf("GLOBAL CSE: Block %d [%d-%d) IN has %d exprs\n", b, blocks[b].start_idx, blocks[b].end_idx,
+             block_in[b].count);
 #endif
 
       for (int i = blocks[b].start_idx; i < blocks[b].end_idx; i++)

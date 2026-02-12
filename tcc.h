@@ -158,8 +158,10 @@ extern long double strtold(const char *__nptr, char **__endptr);
 
 #ifdef TARGETOS_YasOS
 #define TCC_TARGET_YASOS 1
-#define TCC_TARGET_YAFF 1
 #endif
+
+/* YAFF output format support is always available */
+#define TCC_TARGET_YAFF 1
 
 /* only native compiler supports -run */
 #if defined _WIN32 == defined TCC_TARGET_PE && defined __APPLE__ == defined TCC_TARGET_MACHO
@@ -774,6 +776,7 @@ struct TCCState
   unsigned char verbose;           /* if true, display some information during compilation */
   unsigned char nostdinc;          /* if true, no standard headers are added */
   unsigned char nostdlib;          /* if true, no standard libraries are added */
+  unsigned char nodefaultlibs;     /* if true, no default libraries at all (incl. compiler-rt) */
   unsigned char nocommon;          /* if true, do not use common symbols for .bss data */
   unsigned char static_link;       /* if true, static linking is performed */
   unsigned char rdynamic;          /* if true, all symbols are exported */
