@@ -46,7 +46,7 @@ def compile_code(filepath):
             os.makedirs(output_dir)
         assert compiler is not None, "TEST_CC environment variable must be set to the ARM compiler path."
         result = subprocess.run(
-            [compiler, filepath, "-g", "-nostdlib", "-Wl,-oformat=elf32-littlearm", "-o", output_file],
+            [compiler, filepath, "-g", "-nodefaultlibs", "-Wl,-oformat=elf32-littlearm", "-o", output_file],
             check=True,
             capture_output=True,
             text=True

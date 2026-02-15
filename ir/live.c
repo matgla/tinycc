@@ -350,6 +350,23 @@ void tcc_ir_live_intervals_compute(TCCIRState *ir)
       }
       interval->end = i;
     }
+
+    /* MLA has a hidden 4th operand (accumulator) at operand_base+3.
+     * The standard src1/src2 scan above doesn't see it, so we must
+     * extend liveness for the accumulator vreg explicitly. */
+    if (q->op == TCCIR_OP_MLA)
+    {
+      const IROperand accum = tcc_ir_op_get_accum(ir, q);
+      if (tcc_ir_vreg_is_valid(ir, irop_get_vreg(accum)))
+      {
+        IRLiveInterval *interval = tcc_ir_vreg_live_interval(ir, irop_get_vreg(accum));
+        if (interval->start == INTERVAL_NOT_STARTED)
+        {
+          interval->start = 0;
+        }
+        interval->end = i;
+      }
+    }
   }
 
   /* Handle backward jumps - extend intervals for loop variables */

@@ -2888,17 +2888,31 @@ ST_FUNC void tccelf_add_arm_fp_lib(TCCState *s1)
 #endif
 
 #ifndef TCC_TARGET_PE
-/* add tcc runtime libraries */
+/* add tcc runtime libraries
+ *
+ * Two levels of library suppression (matching GCC semantics):
+ *
+ *   -nostdlib       : skip standard libraries (libc, libpthread, libdl, ...)
+ *                     but still link compiler runtime (libtcc1, softfp, crt).
+ *
+ *   -nodefaultlibs  : skip everything including compiler runtime (libtcc1,
+ *                     softfp, crt).  Used when building the runtime libs
+ *                     themselves to avoid circular dependencies.
+ */
 ST_FUNC void tcc_add_runtime(TCCState *s1)
 {
   s1->filetype = 0;
+
+  /* -nodefaultlibs: skip all implicit libraries and runtime support */
+  if (s1->nodefaultlibs)
+    return;
 
 #ifdef CONFIG_TCC_BCHECK
   tcc_add_bcheck(s1);
 #endif
   tcc_add_pragma_libs(s1);
 
-  /* add libc */
+  /* Standard libraries (skipped by -nostdlib) */
   if (!s1->nostdlib)
   {
     int lpthread = s1->option_pthread;
@@ -2939,20 +2953,21 @@ ST_FUNC void tcc_add_runtime(TCCState *s1)
 #if defined TCC_TARGET_ARM && TARGETOS_FreeBSD
     tcc_add_library(s1, "gcc_s"); // unwind code
 #endif
-    if (TCC_LIBTCC1[0])
-      tcc_add_support(s1, TCC_LIBTCC1);
-#if defined TCC_TARGET_ARM
-    /* Add ARM floating-point library based on -mfpu and -mfloat-abi flags */
-    tccelf_add_arm_fp_lib(s1);
-#endif
-#ifndef TCC_TARGET_MACHO
-    if (s1->output_type != TCC_OUTPUT_MEMORY)
-      tccelf_add_crtend(s1);
-#endif
   }
-  /* -nostdlib: skip everything, user links runtime libs explicitly.
-   * -nodefaultlibs: same effect (for building the runtime libs themselves).
-   * This matches GCC behavior where -nostdlib implies no implicit libgcc. */
+
+  /* Compiler runtime (always linked unless -nodefaultlibs).
+   * Order matters: softfp objects reference libtcc1 symbols (__aeabi_memset,
+   * __aeabi_lcmp, etc.), so the FP library must come first so that its
+   * undefined references exist when libtcc1.a is processed à la carte. */
+#if defined TCC_TARGET_ARM
+  tccelf_add_arm_fp_lib(s1);
+#endif
+  if (TCC_LIBTCC1[0])
+    tcc_add_support(s1, TCC_LIBTCC1);
+#ifndef TCC_TARGET_MACHO
+  if (s1->output_type != TCC_OUTPUT_MEMORY && !s1->nostdlib)
+    tccelf_add_crtend(s1);
+#endif
 }
 #endif /* ndef TCC_TARGET_PE */
 

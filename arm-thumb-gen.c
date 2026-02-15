@@ -1833,14 +1833,19 @@ ST_FUNC void tcc_gen_machine_indirect_jump_op(IROperand src1)
  * Uses 32-bit signed offsets to support both forward and backward targets.
  *
  * Generated code sequence (14 bytes + 4*N table entries):
- *   ADD.W  Rt, PC, Rm, LSL #2    ; 4B  Rt = &table[index] (via PC+4)
- *   LDR.W  Rt, [Rt, #10]         ; 4B  Rt = table[index] (signed offset)
- *   ADD.W  Rt, Rt, PC            ; 4B  Rt = target | 1 (offset + PC)
+ *   LSL.W  Rt, Rm, #2            ; 4B  Rt = index * 4
+ *   ADD    Rt, PC                ; 2B  Rt += PC (16-bit T2, legal with PC on ARMv8-M)
+ *   LDR.W  Rt, [Rt, #6]          ; 4B  Rt = table[index] (signed offset)
+ *   ADD    Rt, PC                ; 2B  Rt += PC (16-bit T2, legal with PC on ARMv8-M)
  *   BX     Rt                    ; 2B  branch to target
  *   table[0..N-1]                ; 4B each, signed PC-relative offsets
  *
- * The reference point for offsets is (table_start - 2), i.e. the BX address + 4.
- * table[i] = (target_addr | 1) - (table_start - 2)
+ * Note: The 32-bit ADD.W (T3 encoding) with PC as Rn or Rm is UNPREDICTABLE
+ * on ARMv8-M. The 16-bit ADD (T2 encoding) "ADD Rdn, Rm" allows PC as Rm.
+ *
+ * The reference point for offsets is table_start, i.e. the PC value at the
+ * second ADD instruction (ind+10 + 4 = ind+14 = table_start).
+ * table[i] = (target_addr | 1) - table_start
  *
  * The index is already bounds-checked and adjusted (index = value - min_case).
  */
@@ -1861,24 +1866,26 @@ ST_FUNC void tcc_gen_machine_switch_table_op(IROperand src1, TCCIRSwitchTable *t
   /* Reuse index_reg as scratch - it's dead after SWITCH_TABLE (terminator). */
   int rt = index_reg;
 
-  /* Instruction 1: ADD.W Rt, PC, Rm, LSL #2
-   * Rt = PC + index*4 = (ind+4) + index*4
-   * After this: Rt points index*4 bytes past (ind+4). */
-  thumb_shift lsl2 = {.type = THUMB_SHIFT_LSL, .value = 2, .mode = THUMB_SHIFT_IMMEDIATE};
-  ot_check(th_add_reg(rt, R_PC, index_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, lsl2, ENFORCE_ENCODING_32BIT));
+  /* Instruction 1a: LSL.W Rt, Rm, #2   (4B at ind+0)
+   * Rt = index * 4 */
+  ot_check(th_lsl_imm(rt, index_reg, 2, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_32BIT));
 
-  /* Instruction 2: LDR.W Rt, [Rt, #10]
-   * Loads from Rt+10 = (ind_prev+4+index*4) + 10.
-   * The table starts at ind_prev + 14 (after all 4 instructions = 4+4+4+2 = 14).
-   * So we load from table_start + index*4. The immediate 10 = 14 - 4 = table_start - prev_ind - 4.
-   */
-  ot_check(th_ldr_imm(rt, rt, 10, 6 /* positive offset */, ENFORCE_ENCODING_32BIT));
+  /* Instruction 1b: ADD Rt, PC          (2B at ind+4, 16-bit T2 encoding)
+   * Rt = Rt + PC = index*4 + (ind+4+4) = index*4 + ind+8
+   * The 16-bit T2 "ADD Rdn, Rm" encoding is legal with PC as Rm on ARMv8-M,
+   * unlike the 32-bit T3 encoding which is UNPREDICTABLE with PC. */
+  ot_check(th_add_reg(rt, rt, R_PC, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
 
-  /* Instruction 3: ADD.W Rt, Rt, PC
-   * Rt = offset + PC = offset + (ind+4).
-   * This reconstructs the target address from the PC-relative offset.
-   * Force 32-bit encoding so the layout stays fixed at 14 bytes. */
-  ot_check(th_add_reg(rt, rt, R_PC, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_32BIT));
+  /* Instruction 2: LDR.W Rt, [Rt, #6]  (4B at ind+6)
+   * Loads from Rt+6 = (index*4 + ind+8) + 6 = ind+14 + index*4 = table_start + index*4.
+   * The table starts at ind+14 (after all instructions: 4+2+4+2+2 = 14 bytes). */
+  ot_check(th_ldr_imm(rt, rt, 6, 6 /* positive offset */, ENFORCE_ENCODING_32BIT));
+
+  /* Instruction 3: ADD Rt, PC           (2B at ind+10, 16-bit T2 encoding)
+   * Rt = offset + PC = offset + (ind+10+4) = offset + ind+14 = offset + table_start.
+   * Reconstructs the target address from the PC-relative offset.
+   * Uses 16-bit T2 encoding which is legal with PC on ARMv8-M. */
+  ot_check(th_add_reg(rt, rt, R_PC, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
 
   /* Instruction 4: BX Rt
    * Branch to target (Thumb bit already set in offset). */
@@ -5775,6 +5782,27 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
     ParamMove *moves = tcc_malloc(sizeof(ParamMove) * max_param_moves);
     int move_count = 0;
 
+    /* Build a bitmask of ALL incoming argument registers (R0-R3) that need
+     * to be saved.  When storing a spilled parameter to the stack at a large
+     * offset, the scratch register allocator must NOT pick any of these
+     * registers — they still hold incoming parameter values.
+     *
+     * Without this mask, storing e.g. R0 to [FP-1028] can use R1 as scratch
+     * for the offset constant, destroying the parameter value in R1.
+     */
+    uint32_t incoming_arg_regs_mask = 0;
+    for (int vreg = 0; vreg < ir->next_parameter; ++vreg)
+    {
+      const int encoded_vreg = (TCCIR_VREG_TYPE_PARAM << 28) | vreg;
+      IRLiveInterval *interval = tcc_ir_get_live_interval(ir, encoded_vreg);
+      if (!interval)
+        continue;
+      if (interval->incoming_reg0 >= 0 && interval->incoming_reg0 < 16)
+        incoming_arg_regs_mask |= (1u << interval->incoming_reg0);
+      if (interval->incoming_reg1 >= 0 && interval->incoming_reg1 < 16)
+        incoming_arg_regs_mask |= (1u << interval->incoming_reg1);
+    }
+
     for (int vreg = 0; vreg < ir->next_parameter; ++vreg)
     {
       const int encoded_vreg = (TCCIR_VREG_TYPE_PARAM << 28) | vreg;
@@ -5802,23 +5830,37 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
 
       /* Stack-home parameters: store incoming regs to their stack slots.
        * IR owns spills; avoid inspecting PREG_SPILLED sentinels here.
+       * Use the incoming_arg_regs_mask to prevent the scratch allocator
+       * from clobbering other incoming argument registers.
        */
       if (interval->allocation.offset != 0)
       {
         const int stack_offset = interval->allocation.offset;
         if (is_64bit && incoming_r1 >= 0)
         {
-          tcc_gen_machine_store_to_stack(incoming_r0, stack_offset);
-          tcc_gen_machine_store_to_stack(incoming_r1, stack_offset + 4);
+          tcc_gen_machine_store_to_stack_ex(incoming_r0, stack_offset, incoming_arg_regs_mask);
+          /* R0 is now saved; remove it from the protection mask */
+          incoming_arg_regs_mask &= ~(1u << incoming_r0);
+          tcc_gen_machine_store_to_stack_ex(incoming_r1, stack_offset + 4, incoming_arg_regs_mask);
+          incoming_arg_regs_mask &= ~(1u << incoming_r1);
         }
         else
         {
-          tcc_gen_machine_store_to_stack(incoming_r0, stack_offset);
+          tcc_gen_machine_store_to_stack_ex(incoming_r0, stack_offset, incoming_arg_regs_mask);
+          incoming_arg_regs_mask &= ~(1u << incoming_r0);
         }
         continue;
       }
 
-      /* Register-allocated parameters: record reg->reg moves (parallel move). */
+      /* Register-allocated parameters: record reg->reg moves (parallel move).
+       *
+       * IMPORTANT: Do NOT remove incoming_r0/r1 from incoming_arg_regs_mask
+       * here!  The reg->reg moves are only COLLECTED now and executed LATER
+       * as a parallel move.  The incoming register still holds the live
+       * parameter value at this point.  If we removed it from the mask, a
+       * subsequent spill-store for another parameter could use it as scratch
+       * and destroy the value before the parallel move consumes it.
+       */
       if (alloc_r0 != PREG_NONE && alloc_r0 >= 0 && alloc_r0 <= R12 && alloc_r0 != incoming_r0)
       {
         moves[move_count++] = (ParamMove){.dst = alloc_r0, .src = incoming_r0};
@@ -6290,6 +6332,16 @@ ST_FUNC int tcc_gen_machine_number_of_registers(void)
  * offset is typically negative (local variables below FP). */
 ST_FUNC void tcc_gen_machine_store_to_stack(int reg, int offset)
 {
+  tcc_gen_machine_store_to_stack_ex(reg, offset, 0);
+}
+
+/* Store a register to a FP-relative stack slot, with additional register
+ * exclusions for the scratch allocator.  The extra_exclude mask prevents
+ * the scratch register allocator from picking registers that still hold
+ * live values (e.g. incoming argument registers during the prologue).
+ */
+ST_FUNC void tcc_gen_machine_store_to_stack_ex(int reg, int offset, uint32_t extra_exclude)
+{
   int sign = (offset < 0);
   int abs_offset = sign ? -offset : offset;
 
@@ -6299,7 +6351,7 @@ ST_FUNC void tcc_gen_machine_store_to_stack(int reg, int offset)
     /* Offset too large, use scratch register */
     /* Don't reuse the source register as offset scratch, otherwise we'd
      * clobber the value before the STR (e.g. store -offset instead of value). */
-    ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(abs_offset, sign, (1u << reg) | (1u << R_FP));
+    ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(abs_offset, sign, (1u << reg) | (1u << R_FP) | extra_exclude);
     int rr = rr_alloc.reg;
     ot_check(th_str_reg(reg, R_FP, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     restore_scratch_reg(&rr_alloc);
@@ -7225,6 +7277,57 @@ ST_FUNC void tcc_gen_machine_func_call_op(IROperand func_target, IROperand call_
   /* === Block R0-R3 from scratch allocation during argument setup === */
   uint32_t saved_scratch_exclude = scratch_global_exclude;
   scratch_global_exclude |= 0x0F; /* R0-R3 */
+
+  /* === Pre-save indirect call target if it resides in an argument register ===
+   *
+   * When a function pointer (e.g. a comparison callback passed as the 5th+
+   * parameter) is allocated to R0-R3 by the register allocator, the argument
+   * placement phase (thumb_emit_parallel_arg_moves / place_stack_arguments)
+   * will overwrite those registers with the actual call arguments.  By the
+   * time gcall_or_jump_ir() tries to materialise the call target from
+   * func_target.pr0_reg, the register contains a stale value — typically a
+   * call argument — causing the indirect BLX to branch to a data address
+   * (HardFault).
+   *
+   * Fix: detect the case and pre-materialise the function pointer into a
+   * register that argument setup will not disturb.  We avoid R12/IP because
+   * place_stack_arguments() uses it as scratch.
+   */
+  {
+    const int ft_tag = irop_get_tag(func_target);
+    const int is_direct = (ft_tag == IROP_TAG_IMM32 || ft_tag == IROP_TAG_SYMREF) && !func_target.is_lval;
+    if (!is_direct && ft_tag == IROP_TAG_VREG && func_target.pr0_reg >= 0 && func_target.pr0_reg <= 3)
+    {
+      /* Find a free register outside R0-R3, R12 (stack-arg scratch), SP, PC. */
+      uint32_t exclude = scratch_global_exclude | (1u << R_IP) | (1u << R_SP) | (1u << R_PC);
+      int safe_reg = PREG_NONE;
+      if (ir)
+        safe_reg = tcc_ls_find_free_scratch_reg(&ir->ls, ir->codegen_instruction_idx, exclude, ir->leaffunc);
+
+      if (safe_reg == PREG_NONE || safe_reg < 0 || safe_reg >= 16 || safe_reg == R_SP || safe_reg == R_PC)
+        tcc_error("compiler_error: func_call_op: cannot find safe register "
+                  "to pre-save indirect call target (R%d)",
+                  func_target.pr0_reg);
+
+      /* gcall_or_jump_ir clears is_lval for BTYPE_FUNC VREGs because the
+       * register already holds the function pointer value, not an address
+       * to one.  Mirror that before our pre-save load. */
+      IROperand ft_for_load = func_target;
+      if (irop_get_btype(ft_for_load) == IROP_BTYPE_FUNC && ft_for_load.is_lval)
+        ft_for_load.is_lval = 0;
+
+      load_to_reg_ir(safe_reg, PREG_NONE, ft_for_load);
+
+      /* Rewrite func_target as a plain VREG in the safe register. */
+      int ft_btype = irop_get_btype(func_target);
+      func_target = irop_make_vreg(-1, ft_btype);
+      func_target.pr0_reg = safe_reg;
+      func_target.pr0_spilled = 0;
+
+      /* Protect the safe register from scratch allocation during arg setup. */
+      scratch_global_exclude |= (1u << safe_reg);
+    }
+  }
 
   /* === Build and execute register argument moves === */
   ThumbArgMove reg_moves[8];

@@ -8651,8 +8651,14 @@ static int gcase(struct case_t **base, int len, int dsym)
     {
       int pos = 0;
       gen_op(TOK_EQ); /* jmp to case when equal */
-      /* If comparison fails, jump to default chain 'dsym' (or fall through when -1). */
-      pos = tcc_ir_codegen_test_gen(tcc_state->ir, 0, dsym);
+      /* Use -1 (not dsym) as target to avoid corrupting the default chain.
+       * tcc_ir_backpatch() follows the jump chain from the target, so passing
+       * dsym here would cause it to walk the entire default chain and patch
+       * every entry to p->ind, destroying the chain for subsequent cases.
+       * With -1, the JUMPIF is independent: on match it is backpatched to
+       * p->ind; on mismatch execution falls through to the next case check
+       * (or the final JUMP(dsym) at the end of the loop). */
+      pos = tcc_ir_codegen_test_gen(tcc_state->ir, 0, -1);
       tcc_ir_backpatch(tcc_state->ir, pos, p->ind);
       // gsym_addr(gvtst(0, 0), p->ind);
     }
@@ -9239,6 +9245,11 @@ again:
     b = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
     // b = gjmp(0); /* jump to first case */
     lblock(&a, NULL);
+    /* If the switch has a default label, no explicit breaks were emitted
+     * (a == -1), and the last case ends with dead code (return/goto/continue),
+     * then ALL paths through the switch exit without reaching code after it.
+     * Must be checked before the implicit break overwrites 'a'. */
+    int switch_exits_all = sw->def_sym && (a == -1) && (nocode_wanted & CODE_OFF_BIT);
     dest.r = VT_CONST; /* Mark as constant so jump target is stored in u.imm32 */
     dest.c.i = a;
     a = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
@@ -9285,6 +9296,11 @@ again:
     /* break label */
     // gsym(a);
     tcc_ir_backpatch_to_here(tcc_state->ir, a);
+    /* If every path through the switch exits (has default, no breaks, last
+     * case is dead code), code after the switch is unreachable. Restore
+     * CODE_OFF so that check_func_return() is not triggered spuriously. */
+    if (switch_exits_all)
+      CODE_OFF();
     end_switch();
   }
   else if (t == TOK_CASE)
@@ -10744,7 +10760,9 @@ static void gen_function(Sym *sym)
   if (!sym->a.naked)
   {
     // gfunc_prolog(sym);
-    tcc_debug_prolog_epilog(tcc_state, 0);
+    // Note: tcc_debug_prolog_epilog(0) is now called from ir/codegen.c
+    // after tcc_gen_machine_prolog() so that the DWARF prologue_end
+    // marker is emitted at the correct PC (after the machine prolog).
   }
 
   local_scope = 0;

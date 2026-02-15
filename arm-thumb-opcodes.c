@@ -474,7 +474,7 @@ thumb_opcode th_add_reg(uint32_t rd, uint32_t rn, uint32_t rm, thumb_flags_behav
   }
   if (rm < 8 && rd < 8 && rn < 8 && encoding != ENFORCE_ENCODING_32BIT && shift.type == THUMB_SHIFT_NONE)
   {
-    // T1
+    // T1: ADD<S> <Rd>, <Rn>, <Rm>  — all low registers, no shift
     THOP_TRACE("add%s %s, %s, %s\n", flags == FLAGS_BEHAVIOUR_SET ? "s" : "", th_reg_name(rd), th_reg_name(rn),
                th_reg_name(rm));
     return (thumb_opcode){
@@ -485,7 +485,7 @@ thumb_opcode th_add_reg(uint32_t rd, uint32_t rn, uint32_t rm, thumb_flags_behav
 
   if (rd == rn && flags != FLAGS_BEHAVIOUR_SET && encoding != ENFORCE_ENCODING_32BIT && shift.type == THUMB_SHIFT_NONE)
   {
-    // T2
+    // T2: ADD <Rdn>, <Rm>  — 16-bit, allows PC/SP as Rm
     const uint16_t DN = (rd >> 3) & 1;
     THOP_TRACE("add %s, %s\n", th_reg_name(rd), th_reg_name(rm));
     return (thumb_opcode){
@@ -493,6 +493,33 @@ thumb_opcode th_add_reg(uint32_t rd, uint32_t rn, uint32_t rm, thumb_flags_behav
         .opcode = 0x4400 | (DN << 7) | ((rm & 0xf) << 3) | (rd & 0x7),
     };
   }
+
+  /* T3: ADD{S}.W <Rd>, <Rn>, <Rm>{, <shift>}  — 32-bit encoding
+   * ARMv8-M constraints: Rd in {13,15} or Rn == 15 or Rm in {13,15} → UNPREDICTABLE.
+   * (Rd==13 is allowed only without shift and S==0, but we reject it for safety.)
+   * If PC is needed as an operand, the caller must use the 16-bit T2 encoding instead. */
+  if (rn == R_PC || rm == R_PC || rm == R_SP)
+  {
+    tcc_error("compiler_error: 'th_add_reg' T3 (32-bit) encoding: "
+              "Rn=PC or Rm in {SP,PC} is UNPREDICTABLE on ARMv8-M "
+              "(rd=r%d, rn=r%d, rm=r%d). Use 16-bit T2 encoding for PC.\n",
+              rd, rn, rm);
+  }
+  if (rd == R_PC && flags != FLAGS_BEHAVIOUR_SET)
+  {
+    tcc_error("compiler_error: 'th_add_reg' T3 (32-bit) encoding: "
+              "Rd=PC with S==0 is UNPREDICTABLE on ARMv8-M "
+              "(rd=r%d, rn=r%d, rm=r%d).\n",
+              rd, rn, rm);
+  }
+  if (rd == R_SP && (shift.type != THUMB_SHIFT_NONE || flags == FLAGS_BEHAVIOUR_SET))
+  {
+    tcc_error("compiler_error: 'th_add_reg' T3 (32-bit) encoding: "
+              "Rd=SP with shift or S==1 is UNPREDICTABLE on ARMv8-M "
+              "(rd=r%d, rn=r%d, rm=r%d).\n",
+              rd, rn, rm);
+  }
+
   THOP_TRACE("add%s %s, %s, %s", flags == FLAGS_BEHAVIOUR_SET ? "s" : "", th_reg_name(rd), th_reg_name(rn),
              th_reg_name(rm));
   th_trace_shift_suffix(shift);

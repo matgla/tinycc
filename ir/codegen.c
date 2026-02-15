@@ -1026,17 +1026,17 @@ static void tcc_ir_codegen_backpatch_jumps(TCCIRState *ir, uint32_t *ir_to_code_
 
   /* Backpatch switch table entries.
    * Table entries are 32-bit signed PC-relative offsets with Thumb bit.
-   * The reference point is (table_start - 2), which is the PC value when
-   * the ADD.W Rt, Rt, PC instruction reads PC (= BX address + 2 = table_start - 2).
-   * Formula: table[i] = (target_addr | 1) - (table_start - 2)
+   * The reference point is table_start, which is the PC value when
+   * the 16-bit ADD Rt, PC instruction at ind+10 reads PC (= ind+10+4 = ind+14 = table_start).
+   * Formula: table[i] = (target_addr | 1) - table_start
    * This must happen after all code is generated so forward targets are mapped. */
   for (int t = 0; t < ir->num_switch_tables; t++)
   {
     TCCIRSwitchTable *table = &ir->switch_tables[t];
     int table_start = table->table_code_addr;
     if (table_start <= 0)
-      continue;                      /* Table not emitted (e.g. dead code) */
-    int ref_point = table_start - 2; /* PC value at the ADD.W Rt, Rt, PC instruction */
+      continue;                  /* Table not emitted (e.g. dead code) */
+    int ref_point = table_start; /* PC value at the 16-bit ADD Rt, PC instruction (at ind+10, PC=ind+14=table_start) */
     for (int j = 0; j < table->num_entries; j++)
     {
       int target_ir = table->targets[j];
@@ -1556,6 +1556,13 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
   (void)original_leaffunc; /* May be unused when dry-run is disabled */
   if (!ir->naked)
     tcc_gen_machine_prolog(ir->leaffunc, ir->ls.dirty_registers, stack_size, extra_prologue_regs);
+
+  /* Emit DWARF prologue_end AFTER machine prolog so the debugger knows
+   * where the prologue ends and sets breakpoints at the correct address.
+   * Previously this was emitted in tccgen.c before any machine code existed,
+   * causing breakpoints to land far from the actual prolog. */
+  if (!ir->naked)
+    tcc_debug_prolog_epilog(tcc_state, 0);
 
   for (int i = 0; i < ir->next_instruction_index; i++)
   {

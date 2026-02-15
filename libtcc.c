@@ -92,7 +92,7 @@ ST_FUNC char *pstrncpy(char *out, const char *in, size_t num)
 /* extract the basename of a file */
 PUB_FUNC char *tcc_basename(const char *name)
 {
-  char *p = strchr(name, 0);
+  char *p = (char *)strchr(name, 0);
   while (p > name && !IS_DIRSEP(p[-1]))
     --p;
   return p;
@@ -898,7 +898,7 @@ LIBTCCAPI int tcc_set_output_type(TCCState *s, int output_type)
 
   /* paths for crt objects */
   tcc_split_path(s, &s->crt_paths, &s->nb_crt_paths, CONFIG_TCC_CRTPREFIX);
-  if (output_type != TCC_OUTPUT_MEMORY && !s->nostdlib)
+  if (output_type != TCC_OUTPUT_MEMORY && !s->nodefaultlibs && !s->nostdlib)
     tccelf_add_crtbegin(s);
   return 0;
 }

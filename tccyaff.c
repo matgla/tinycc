@@ -138,6 +138,96 @@ ST_FUNC int tcc_load_yaff(TCCState *s1, int fd, const char *filename, int level)
   return ret;
 }
 
+/* Write local relocations for GOT entries that reference local symbols.
+ *
+ * When a local (STB_LOCAL) symbol's address is taken, put_got_entry()
+ * creates a GOT slot and an R_RELATIVE relocation in .rel.got.
+ * fill_local_got_entries() resolves these by writing the symbol's final
+ * address into the GOT slot (first 4 bytes) and zeroing the sym_index.
+ *
+ * The dynamic loader needs to know about these GOT entries so it can:
+ *  - Relocate the address at load time (text/data can be loaded anywhere)
+ *  - Wrap function pointers in thunks that set up R9 (GOT base) when the
+ *    function is called back from another module
+ *
+ * We detect "code" vs "data" by checking whether the resolved address
+ * falls within the text section.  Code-section local relocations trigger
+ * thunk generation in the loader.
+ */
+static int tcc_yaff_write_local_relocations(TCCState *s1, FILE *f)
+{
+  ElfW_Rel *rel;
+  int count = 0;
+
+  if (!s1->got || !s1->got->reloc)
+  {
+    fprintf(stderr, "[yaff-local-reloc] no GOT or no GOT relocs (got=%p, reloc=%p)\n", s1->got,
+            s1->got ? s1->got->reloc : NULL);
+    return 0;
+  }
+
+  fprintf(stderr, "[yaff-local-reloc] scanning .rel.got: got->sh_addr=0x%x, text=0x%x..0x%x, rodata=0x%x..0x%x\n",
+          (unsigned)s1->got->sh_addr, (unsigned)text_section->sh_addr,
+          (unsigned)(text_section->sh_addr + text_section->sh_size), (unsigned)rodata_section->sh_addr,
+          (unsigned)(rodata_section->sh_addr + rodata_section->sh_size));
+
+  for_each_elem(s1->got->reloc, 0, rel, ElfW_Rel)
+  {
+    int rtype = ELFW(R_TYPE)(rel->r_info);
+    int rsym = ELFW(R_SYM)(rel->r_info);
+    fprintf(stderr, "[yaff-local-reloc]   rel: r_offset=0x%x, type=%d, sym=%d\n", (unsigned)rel->r_offset, rtype, rsym);
+
+    if (rtype != R_RELATIVE)
+      continue;
+
+    /* GOT entry offset within .got section */
+    uint32_t got_offset = rel->r_offset - s1->got->sh_addr;
+    /* Resolved address written by fill_local_got_entries() */
+    uint32_t sym_value = read32le(s1->got->data + got_offset);
+
+    fprintf(stderr, "[yaff-local-reloc]   R_RELATIVE: got_offset=0x%x, sym_value=0x%x\n", got_offset, sym_value);
+
+    /* Determine which section this address belongs to */
+    int section;
+    uint32_t target_offset;
+    if (sym_value >= text_section->sh_addr && sym_value < text_section->sh_addr + text_section->sh_size)
+    {
+      section = YAFF_SECTION_CODE;
+      target_offset = sym_value - text_section->sh_addr;
+    }
+    else if (sym_value >= rodata_section->sh_addr && sym_value < rodata_section->sh_addr + rodata_section->sh_size)
+    {
+      section = YAFF_SECTION_DATA;
+      target_offset = sym_value - rodata_section->sh_addr;
+    }
+    else if (sym_value >= data_section->sh_addr && sym_value < data_section->sh_addr + data_section->sh_size)
+    {
+      section = YAFF_SECTION_DATA;
+      target_offset = sym_value - data_section->sh_addr + rodata_section->sh_size;
+    }
+    else
+    {
+      fprintf(stderr, "[yaff-local-reloc]   WARNING: sym_value 0x%x doesn't fall in any known section!\n", sym_value);
+      section = YAFF_SECTION_DATA;
+      target_offset = sym_value;
+    }
+
+    fprintf(stderr, "[yaff-local-reloc]   -> section=%s, index=%u, target_offset=0x%x\n",
+            section == YAFF_SECTION_CODE ? "CODE" : "DATA", got_offset / 8, target_offset);
+
+    YaffLocalRelocationEntry entry = {
+        .section = section,
+        .index = got_offset / 8,
+        .target_offset = target_offset,
+    };
+    fwrite(&entry, 1, sizeof(entry), f);
+    ++count;
+  }
+
+  fprintf(stderr, "[yaff-local-reloc] total local relocations: %d\n", count);
+  return count;
+}
+
 static int tcc_yaff_write_data_relocations(TCCState *s1, FILE *f)
 {
   int i;
@@ -150,6 +240,13 @@ static int tcc_yaff_write_data_relocations(TCCState *s1, FILE *f)
       s = s1->sections[i];
       if (s->sh_type == SHT_REL)
       {
+        /* Skip .rel.got — its R_RELATIVE entries are already emitted as
+           local relocations by tcc_yaff_write_local_relocations().
+           Processing them here as well would produce duplicate data
+           relocations that overwrite the thunk addresses the dynamic
+           loader places into GOT slots for function-pointer callbacks. */
+        if (s1->got && s == s1->got->reloc)
+          continue;
         ElfW_Rel *rel;
         for_each_elem(s, 0, rel, ElfW_Rel)
         {
@@ -462,15 +559,14 @@ static int tcc_yaff_write_exported_symbols(TCCState *s1, FILE *f, YaffHeader *h)
     {
       section_code = YAFF_SECTION_CODE;
     }
-    else if (sym->st_shndx == data_section->sh_num ||
-             // add rodata there after verification
+    else if (sym->st_shndx == data_section->sh_num || sym->st_shndx == rodata_section->sh_num ||
              sym->st_shndx == bss_section->sh_num)
     {
       section_code = YAFF_SECTION_DATA;
     }
     else
     {
-      section_code = YAFF_SECTION_CODE; // fix rodata and change to unknown
+      section_code = YAFF_SECTION_CODE;
     }
     offset = sym->st_value;
     if (section_code == YAFF_SECTION_DATA)
@@ -648,6 +744,7 @@ ST_FUNC int tcc_output_yaff(TCCState *s1, FILE *f, const char *filename)
   // tcc_elf_sort_syms(s1, s1->symtab);
   header.relocations_offset = ftell(f);
   header.symbol_table_relocations_amount = tcc_yaff_write_symbol_table_relocations(s1, f);
+  header.local_relocations_amount = tcc_yaff_write_local_relocations(s1, f);
   header.data_relocations_amount = tcc_yaff_write_data_relocations(s1, f);
 
   header.imported_symbols_offset = ftell(f);

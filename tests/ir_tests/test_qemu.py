@@ -149,6 +149,9 @@ TEST_FILES = [
     # struct field post-increment in for-loop (spilled lvalue address fix)
     ("bug_struct_field_postinc.c", 0),
 
+    # const char *const global pointer access (YAFF exported symbol section fix)
+    ("bug_const_ptr_got_deref.c", 0),
+
     ("../tests2/00_assignment.c", 0),
     ("../tests2/01_comment.c", 0),
     ("../tests2/02_printf.c", 0),
@@ -308,6 +311,37 @@ TCC_BUG_TEST_FILES = [
     # Bug: ternary inside while loop before sparse switch causes CODE_OFF_BIT
     # to remain set, making the switch handler skip dispatch generation entirely.
     ("bug_ternary_switch.c", 0),
+
+    # Bug: Function pointer passed as 5th argument is clobbered before blx.
+    # TCC loads the fn ptr into r1, then overwrites r1 with the 2nd call arg.
+    # Reduced from musl libc qsort: fix(a, root, n, sz, cmp) where cmp is
+    # called via blx with a data pointer instead of the comparator address.
+    ("bug_funcptr_fifth_arg.c", 0),
+
+    # Bug: Prologue scratch register clobbers incoming argument register.
+    # When a parameter is spilled to stack at a large offset (>255, due to
+    # char buf[1024]), tcc_gen_machine_store_to_stack uses another arg register
+    # as scratch for the offset constant, destroying its value before it is saved.
+    # Triggered by taking &fmt which forces it to a stack slot.
+    ("bug_param_clobber_large_frame.c", 0),
+
+    # Bug: switch with goto to common label loses large constant in OR.
+    # case TOK_TYPEDEF: g = 0x4000; goto storage; storage: t |= g;
+    # produces t=3 instead of t=0x4003 on native ARM compilation.
+    # Reduced from parse_btype() where typedef/extern/static share a
+    # "storage:" goto label. The constant 0x4000 (VT_TYPEDEF) is lost,
+    # causing typedef declarations to fail with "invalid type for '__stack'".
+    ("bug_switch_goto_or.c", 0),
+
+    # Bug: gcase() single-value JUMPIF corrupts the default jump chain.
+    # When a switch has >8 cases, gcase() builds a binary search tree.
+    # The left subtree returns a JUMP linked to the default chain 'dsym'.
+    # In the right subtree's linear scan, single-value cases passed dsym
+    # to tcc_ir_codegen_test_gen(); tcc_ir_backpatch() then followed the
+    # chain and rewrote the left subtree's fall-through to a case body.
+    # Values not matching any case (e.g. tok='*'=42 in parse_btype) were
+    # routed to a wrong handler instead of default, breaking typedef parsing.
+    ("bug_switch_default_chain.c", 0),
 ]
 
 TEST_FILES_WITH_ARGS = [
@@ -702,4 +736,44 @@ def test_function_sections_bugs(test_file, expected_exit_code, opt_level, tmp_pa
         pytest.fail("test_file is None")
 
     cflags = f"{opt_level} -ffunction-sections"
+    _run_qemu_test(test_file, expected_exit_code, opt_level=cflags, output_dir=tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Tests requiring -mpic-data-is-text-relative (text/data separation PIC mode)
+# ---------------------------------------------------------------------------
+
+PIC_TEXT_DATA_SEP_TEST_FILES = [
+    # Bug: const char *const global in .rodata was classified as YAFF_SECTION_CODE
+    # in tcc_yaff_write_exported_symbols, so the dynamic loader resolved the
+    # GOT entry to a garbage address (text_base + raw link-time VA).
+    ("bug_const_ptr_got_deref.c", 0),
+]
+
+
+def _generate_pic_text_data_sep_params():
+    params = []
+    ids = []
+    for test_file, expected in PIC_TEXT_DATA_SEP_TEST_FILES:
+        for opt in OPT_LEVELS:
+            params.append((test_file, expected, opt))
+            ids.append(f"{_test_id(test_file)}{opt}")
+    return params, ids
+
+
+_PIC_TDS_PARAMS, _PIC_TDS_IDS = _generate_pic_text_data_sep_params() if PIC_TEXT_DATA_SEP_TEST_FILES else ([], [])
+
+
+@pytest.mark.parametrize("test_file,expected_exit_code,opt_level", _PIC_TDS_PARAMS, ids=_PIC_TDS_IDS)
+def test_pic_text_data_separation(test_file, expected_exit_code, opt_level, tmp_path):
+    """Tests compiled with -mpic-data-is-text-relative.
+
+    This flag enables text/data separation mode where R9 holds the GOT base
+    and code/data may be loaded at independent addresses.  Exposes bugs in
+    YAFF symbol/relocation classification for .rodata globals.
+    """
+    if test_file is None:
+        pytest.fail("test_file is None")
+
+    cflags = f"{opt_level} -mpic-data-is-text-relative"
     _run_qemu_test(test_file, expected_exit_code, opt_level=cflags, output_dir=tmp_path)

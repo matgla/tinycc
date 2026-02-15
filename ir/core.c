@@ -998,9 +998,11 @@ TccIrOp tcc_irop_from_token(int token)
   case TOK_ULE:
   case TOK_UGE:
     return TCCIR_OP_CMP;
+  default:
+    fprintf(stderr, "tcc_irop_from_token: unknown token %d(0x%x)\n", token, token);
+    exit(1);
+    return TCCIR_OP_NOP; /* unreachable, silences warning */
   };
-  fprintf(stderr, "tcc_irop_from_token: unknown token %d(0x%x)\n", token, token);
-  exit(1);
 }
 
 /* ============================================================================

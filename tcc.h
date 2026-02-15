@@ -2060,6 +2060,7 @@ ST_FUNC void tcc_gen_machine_store_indexed_op(IROperand base, IROperand index, I
 ST_FUNC void tcc_gen_machine_load_postinc_op(IROperand dest, IROperand ptr, IROperand offset);
 ST_FUNC void tcc_gen_machine_store_postinc_op(IROperand ptr, IROperand value, IROperand offset);
 ST_FUNC void tcc_gen_machine_store_to_stack(int reg, int offset);
+ST_FUNC void tcc_gen_machine_store_to_stack_ex(int reg, int offset, uint32_t extra_exclude);
 ST_FUNC void tcc_gen_machine_store_to_sp(int reg, int offset);
 
 ST_FUNC void tcc_gen_machine_assign_op(IROperand dest, IROperand src, TccIrOp op);

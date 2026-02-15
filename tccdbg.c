@@ -2872,6 +2872,22 @@ ST_FUNC void tcc_debug_prolog_epilog(TCCState *s1, int value)
   if (s1->dwarf)
   {
     dwarf_line_op(s1, value == 0 ? DW_LNS_set_prologue_end : DW_LNS_set_epilogue_begin);
+    /* For prologue end, immediately emit a line table row to materialize
+     * the prologue_end flag at the current PC. Without this, the flag
+     * remains pending and only gets applied to the next line entry, which
+     * may be far into the function body if many instructions share the
+     * same source line as the function declaration. */
+    if (value == 0)
+    {
+      int len_pc = (ind - dwarf_line.last_pc) / DWARF_MIN_INSTR_LEN;
+      if (len_pc > 0)
+      {
+        dwarf_line_op(s1, DW_LNS_advance_pc);
+        dwarf_uleb128_op(s1, len_pc);
+      }
+      dwarf_line_op(s1, DW_LNS_copy);
+      dwarf_line.last_pc = ind;
+    }
   }
 }
 
