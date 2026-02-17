@@ -1,0 +1,14 @@
+OK pool[0].tag = 1
+OK pool[0].payload = 100
+OK pool[1].tag = 7
+OK pool[1].payload = 200
+OK pool[2].tag = 2
+OK pool[2].payload = 65536
+OK pool[3].tag = 5
+OK pool[3].payload = 300
+--- raw vr check ---
+pool[0]: vr=0x00040000 tag_raw=1 tag_field=1
+pool[1]: vr=0x001c0000 tag_raw=7 tag_field=7
+pool[2]: vr=0x00080000 tag_raw=2 tag_field=2
+pool[3]: vr=0x00140000 tag_raw=5 tag_field=5
+ALL PASSED

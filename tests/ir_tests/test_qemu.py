@@ -69,6 +69,8 @@ TEST_FILES = [
     ("bug_ull_mul10_loop.c", 0),
     ("bug_ull_mul10_once.c", 0),
     ("bug_ll_mul10_switch_min.c", 0),
+    ("bug_parse_number_64bit.c", 0),
+    ("bug_ull_mul_int_accum.c", 0),
     # ("bug_ternary_string.c", 0),  # Nested ternary with string literals
     # ("bug_return_else_string.c", 0),  # Return string from else block
     ("test_cleanup_double.c", 0),
@@ -342,6 +344,25 @@ TCC_BUG_TEST_FILES = [
     # Values not matching any case (e.g. tok='*'=42 in parse_btype) were
     # routed to a wrong handler instead of default, breaking typedef parsing.
     ("bug_switch_default_chain.c", 0),
+
+    # Bug: post-increment fusion creates STORE_POSTINC instead of LOAD_POSTINC.
+    # For ch = *p++, the optimizer fuses the STORE that writes back the
+    # incremented pointer to its stack slot with the ADD, producing
+    # str.w r1,[r4],#1 (store pointer to *p) instead of the LOAD from *p.
+    # Corrupts input strings in parse_number, causing "invalid digit" errors.
+    ("bug_postinc_store.c", 0),
+
+    # Bug: Packed struct array stride computed incorrectly.
+    # IR operand STACKOFF encoding stored offset/4 in aux_data, assuming
+    # 4-byte alignment. Packed structs with non-power-of-2 sizes (e.g. 10)
+    # produce non-aligned offsets (e.g. -30) whose lower 2 bits are lost.
+    # Fix: store offset directly in aux_data without /4 compression.
+    ("bug_stride_minimal.c", 0),
+    ("bug_packed10_array.c", 0),
+    ("bug_variant_stride.c", 0),
+    ("bug_packed_sizes.c", 0),
+    ("bug_stride10.c", 0),
+    ("bug_bitfield_packed10.c", 0),
 ]
 
 TEST_FILES_WITH_ARGS = [

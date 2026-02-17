@@ -1,0 +1,4 @@
+read_a(pool, 0) = 100 (expected 100)
+read_a(pool, 1) = 200 (expected 200)
+read_a(pool, 2) = 300 (expected 300)
+read_a(pool, 3) = 400 (expected 400)

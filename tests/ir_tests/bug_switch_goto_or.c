@@ -103,49 +103,89 @@ int main(void)
   /* Test 1: switch/goto/OR with large stack frame - TOK_EXTERN */
   result = test_switch_goto_or(271);
   printf("extern:  t=0x%x (expect 0x1003)\n", result);
-  if (result != 0x1003) { printf("FAIL\n"); pass = 0; }
+  if (result != 0x1003)
+  {
+    printf("FAIL\n");
+    pass = 0;
+  }
 
   /* Test 2: switch/goto/OR with large stack frame - TOK_STATIC */
   result = test_switch_goto_or(272);
   printf("static:  t=0x%x (expect 0x2003)\n", result);
-  if (result != 0x2003) { printf("FAIL\n"); pass = 0; }
+  if (result != 0x2003)
+  {
+    printf("FAIL\n");
+    pass = 0;
+  }
 
   /* Test 3: switch/goto/OR with large stack frame - TOK_TYPEDEF */
   result = test_switch_goto_or(307);
   printf("typedef: t=0x%x (expect 0x4003)\n", result);
-  if (result != 0x4003) { printf("FAIL\n"); pass = 0; }
+  if (result != 0x4003)
+  {
+    printf("FAIL\n");
+    pass = 0;
+  }
 
   /* Test 4: simple version - case 1 (0x1000) */
   result = test_switch_goto_or_simple(1);
   printf("simple1: t=0x%x (expect 0x1003)\n", result);
-  if (result != 0x1003) { printf("FAIL\n"); pass = 0; }
+  if (result != 0x1003)
+  {
+    printf("FAIL\n");
+    pass = 0;
+  }
 
   /* Test 5: simple version - case 2 (0x2000) */
   result = test_switch_goto_or_simple(2);
   printf("simple2: t=0x%x (expect 0x2003)\n", result);
-  if (result != 0x2003) { printf("FAIL\n"); pass = 0; }
+  if (result != 0x2003)
+  {
+    printf("FAIL\n");
+    pass = 0;
+  }
 
   /* Test 6: simple version - case 3 (0x4000) */
   result = test_switch_goto_or_simple(3);
   printf("simple3: t=0x%x (expect 0x4003)\n", result);
-  if (result != 0x4003) { printf("FAIL\n"); pass = 0; }
+  if (result != 0x4003)
+  {
+    printf("FAIL\n");
+    pass = 0;
+  }
 
   /* Test 7-9: direct OR with large constants */
   result = test_or_const(3, 0x1000);
   printf("or1000:  r=0x%x (expect 0x1003)\n", result);
-  if (result != 0x1003) { printf("FAIL\n"); pass = 0; }
+  if (result != 0x1003)
+  {
+    printf("FAIL\n");
+    pass = 0;
+  }
 
   result = test_or_const(3, 0x2000);
   printf("or2000:  r=0x%x (expect 0x2003)\n", result);
-  if (result != 0x2003) { printf("FAIL\n"); pass = 0; }
+  if (result != 0x2003)
+  {
+    printf("FAIL\n");
+    pass = 0;
+  }
 
   result = test_or_const(3, 0x4000);
   printf("or4000:  r=0x%x (expect 0x4003)\n", result);
-  if (result != 0x4003) { printf("FAIL\n"); pass = 0; }
+  if (result != 0x4003)
+  {
+    printf("FAIL\n");
+    pass = 0;
+  }
 
   result = test_or_const(3, 0x8000);
   printf("or8000:  r=0x%x (expect 0x8003)\n", result);
-  if (result != 0x8003) { printf("FAIL\n"); pass = 0; }
+  if (result != 0x8003)
+  {
+    printf("FAIL\n");
+    pass = 0;
+  }
 
   if (pass)
     printf("ALL PASSED\n");

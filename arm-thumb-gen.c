@@ -4152,6 +4152,34 @@ static void thumb_emit_regonly_binop32(IROperand src1, IROperand src2, IROperand
   ScratchRegAlloc rm_alloc = {0};
   uint32_t exclude = (1u << rd);
 
+  /* Pre-exclude already-materialized operand registers before any scratch
+   * allocation.  Without this, get_scratch_reg_with_save() can return a
+   * register that is already occupied by the OTHER operand, causing
+   * load_to_reg_ir() to clobber it.
+   *
+   * Bug history: in parse_number() (tccpp.c), the 64-bit multiply
+   *   n = n * b + t
+   * decomposes into cross-term MULs where one operand lives in a register
+   * and the other is spilled.  Under high register pressure (R9 reserved
+   * as GOT pointer), the scratch allocator picked the SAME register for
+   * the spilled operand as the materialized one, producing
+   *   mul.w r0, r3, r3   (b*b = 100)
+   * instead of
+   *   mul.w r0, r2, r3   (n_hi * b)
+   */
+  if (!(rn == PREG_REG_NONE || src1.is_lval || thumb_irop_needs_value_load(src1) ||
+        thumb_irop_has_immediate_value(src1)))
+  {
+    if (thumb_is_hw_reg(rn))
+      exclude |= (1u << rn);
+  }
+  if (!(rm == PREG_REG_NONE || src2.is_lval || thumb_irop_needs_value_load(src2) ||
+        thumb_irop_has_immediate_value(src2)))
+  {
+    if (thumb_is_hw_reg(rm))
+      exclude |= (1u << rm);
+  }
+
   if (rn == PREG_REG_NONE || src1.is_lval || thumb_irop_needs_value_load(src1) || thumb_irop_has_immediate_value(src1))
   {
     rn_alloc = get_scratch_reg_with_save(exclude);
@@ -4160,10 +4188,6 @@ static void thumb_emit_regonly_binop32(IROperand src1, IROperand src2, IROperand
     IROperand src1_tmp = src1;
     load_to_reg_ir(rn, PREG_NONE, src1_tmp);
   }
-  else
-  {
-    thumb_require_materialized_reg(ctx, "src1", rn);
-  }
 
   if (rm == PREG_REG_NONE || src2.is_lval || thumb_irop_needs_value_load(src2) || thumb_irop_has_immediate_value(src2))
   {
@@ -4171,10 +4195,6 @@ static void thumb_emit_regonly_binop32(IROperand src1, IROperand src2, IROperand
     rm = rm_alloc.reg;
     IROperand src2_tmp = src2;
     load_to_reg_ir(rm, PREG_NONE, src2_tmp);
-  }
-  else
-  {
-    thumb_require_materialized_reg(ctx, "src2", rm);
   }
 
   ot_check(emitter((uint32_t)rd, (uint32_t)rn, (uint32_t)rm));
@@ -4222,6 +4242,21 @@ static void thumb_emit_mod32(IROperand src1, IROperand src2, IROperand dest, Tcc
   ScratchRegAlloc quotient_alloc = {0};
   uint32_t exclude_regs = (1u << dest_reg);
 
+  /* Pre-exclude already-materialized operand registers before any scratch
+   * allocation, same rationale as in thumb_emit_regonly_binop32(). */
+  if (!(src1_reg == PREG_REG_NONE || src1.is_lval || thumb_irop_needs_value_load(src1) ||
+        thumb_irop_has_immediate_value(src1)))
+  {
+    if (thumb_is_hw_reg(src1_reg))
+      exclude_regs |= (1u << src1_reg);
+  }
+  if (!(src2_reg == PREG_REG_NONE || src2.is_lval || thumb_irop_needs_value_load(src2) ||
+        thumb_irop_has_immediate_value(src2)))
+  {
+    if (thumb_is_hw_reg(src2_reg))
+      exclude_regs |= (1u << src2_reg);
+  }
+
   if (src1_reg == PREG_REG_NONE || src1.is_lval || thumb_irop_needs_value_load(src1) ||
       thumb_irop_has_immediate_value(src1))
   {
@@ -4230,11 +4265,6 @@ static void thumb_emit_mod32(IROperand src1, IROperand src2, IROperand dest, Tcc
     exclude_regs |= (1u << src1_reg);
     IROperand src1_tmp = src1;
     load_to_reg_ir(src1_reg, PREG_NONE, src1_tmp);
-  }
-  else
-  {
-    thumb_require_materialized_reg(ctx, "src1", src1_reg);
-    exclude_regs |= (1u << src1_reg);
   }
 
   if (src2_reg == PREG_REG_NONE || src2.is_lval || thumb_irop_needs_value_load(src2) ||
@@ -4245,11 +4275,6 @@ static void thumb_emit_mod32(IROperand src1, IROperand src2, IROperand dest, Tcc
     exclude_regs |= (1u << src2_reg);
     IROperand src2_tmp = src2;
     load_to_reg_ir(src2_reg, PREG_NONE, src2_tmp);
-  }
-  else
-  {
-    thumb_require_materialized_reg(ctx, "src2", src2_reg);
-    exclude_regs |= (1u << src2_reg);
   }
 
   /* quotient = src1 / src2 */
@@ -4295,6 +4320,21 @@ static void thumb_emit_longmul32x32_to64(IROperand src1, IROperand src2, IROpera
 
   uint32_t exclude = 0;
 
+  /* Pre-exclude already-materialized operand registers before any scratch
+   * allocation, same rationale as in thumb_emit_regonly_binop32(). */
+  if (!(rn == PREG_REG_NONE || src1.is_lval || thumb_irop_needs_value_load(src1) ||
+        thumb_irop_has_immediate_value(src1)))
+  {
+    if (thumb_is_hw_reg(rn))
+      exclude |= (1u << rn);
+  }
+  if (!(rm == PREG_REG_NONE || src2.is_lval || thumb_irop_needs_value_load(src2) ||
+        thumb_irop_has_immediate_value(src2)))
+  {
+    if (thumb_is_hw_reg(rm))
+      exclude |= (1u << rm);
+  }
+
   if (rn == PREG_REG_NONE || src1.is_lval || thumb_irop_needs_value_load(src1) || thumb_irop_has_immediate_value(src1))
   {
     rn_alloc = get_scratch_reg_with_save(exclude);
@@ -4302,12 +4342,6 @@ static void thumb_emit_longmul32x32_to64(IROperand src1, IROperand src2, IROpera
     exclude |= (1u << rn);
     IROperand src1_tmp = src1;
     load_to_reg_ir(rn, PREG_NONE, src1_tmp);
-  }
-  else
-  {
-    thumb_require_materialized_reg(ctx, "src1", rn);
-    if (thumb_is_hw_reg(rn))
-      exclude |= (1u << rn);
   }
 
   if (rm == PREG_REG_NONE || src2.is_lval || thumb_irop_needs_value_load(src2) || thumb_irop_has_immediate_value(src2))
@@ -4317,12 +4351,6 @@ static void thumb_emit_longmul32x32_to64(IROperand src1, IROperand src2, IROpera
     exclude |= (1u << rm);
     IROperand src2_tmp = src2;
     load_to_reg_ir(rm, PREG_NONE, src2_tmp);
-  }
-  else
-  {
-    thumb_require_materialized_reg(ctx, "src2", rm);
-    if (thumb_is_hw_reg(rm))
-      exclude |= (1u << rm);
   }
 
   ScratchRegAlloc rd_low_alloc = {0};
@@ -4691,16 +4719,21 @@ void tcc_gen_machine_data_processing_op(IROperand src1, IROperand src2, IROperan
       }
     }
 
-    /* Ensure all operands are in registers */
-    if (src1_reg == PREG_REG_NONE || src2_reg == PREG_REG_NONE || accum_reg == PREG_REG_NONE ||
-        dest_reg == PREG_REG_NONE)
+    /* Helper: check if a register is a valid data register (R0-R12, R14/LR).
+     * Excludes SP (R13), PC (R15), and PREG_REG_NONE. */
+#define IS_VALID_DATA_REG(r) ((r) >= 0 && (r) <= 14 && (r) != 13)
+
+    /* Ensure all operands are in valid data registers.
+     * The live interval lookup for accum can return bogus values (e.g. R15/PC)
+     * when the accumulator was produced by a MUL that spilled its result. */
+    if (!IS_VALID_DATA_REG(src1_reg) || !IS_VALID_DATA_REG(src2_reg) || !IS_VALID_DATA_REG(accum_reg) ||
+        !IS_VALID_DATA_REG(dest_reg))
     {
       /* Fallback: emit MUL then ADD */
       /* First emit MUL: dest = src1 * src2 */
       thumb_emit_mul32(src1, src2, dest, TCCIR_OP_MUL);
       /* Then emit ADD: dest = dest + accum */
-      /* Use th_add_reg if accum is in a register, otherwise th_add_imm */
-      if (accum_reg != PREG_REG_NONE)
+      if (IS_VALID_DATA_REG(accum_reg))
       {
         ot_check(th_add_reg((uint32_t)dest_reg, (uint32_t)dest_reg, (uint32_t)accum_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
                             THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
@@ -4711,8 +4744,32 @@ void tcc_gen_machine_data_processing_op(IROperand src1, IROperand src2, IROperan
         ot_check(th_add_imm((uint32_t)dest_reg, (uint32_t)dest_reg, (uint32_t)imm, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
                             ENFORCE_ENCODING_NONE));
       }
+      else
+      {
+        /* Accumulator is spilled — load from its stack slot via live interval.
+         * Cannot use load_to_reg_ir(accum) because the operand pool entry
+         * has stale pr0_reg from before register allocation. */
+        int loaded = 0;
+        if (accum_vr >= 0)
+        {
+          IRLiveInterval *accum_li = tcc_ir_get_live_interval(ir_state, accum_vr);
+          if (accum_li)
+          {
+            int spill_offset = accum_li->allocation.offset;
+            ScratchRegAlloc accum_scratch = get_scratch_reg_with_save((1u << dest_reg));
+            tcc_machine_load_spill_slot(accum_scratch.reg, spill_offset);
+            ot_check(th_add_reg((uint32_t)dest_reg, (uint32_t)dest_reg, (uint32_t)accum_scratch.reg,
+                                FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+            restore_scratch_reg(&accum_scratch);
+            loaded = 1;
+          }
+        }
+        if (!loaded)
+          tcc_error("compiler_error: MLA accumulator has no register and no spill slot");
+      }
       return;
     }
+#undef IS_VALID_DATA_REG
 
     /* Emit MLA instruction: th_mla(rd, rn, rm, ra) -> rd = rn * rm + ra */
     /* src1 = rn, src2 = rm, accum = ra, dest = rd */

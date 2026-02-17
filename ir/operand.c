@@ -467,10 +467,10 @@ done:
 
     if (tag == IROP_TAG_STACKOFF)
     {
-      /* Stack offset: store offset/4 in aux_data (assumes 4-byte aligned, ±128KB range) */
+      /* Stack offset: store directly in aux_data (±32KB range) */
       int32_t offset = result.u.imm32;
       result.u.s.ctype_idx = (uint16_t)ctype_idx;
-      result.u.s.aux_data = (int16_t)(offset >> 2); /* offset/4 to fit in 16 bits */
+      result.u.s.aux_data = (int16_t)offset; /* store offset directly, no alignment assumption */
     }
     else if (tag == IROP_TAG_SYMREF)
     {
@@ -550,9 +550,9 @@ void iroperand_to_svalue(const TCCIRState *ir, IROperand op, SValue *out)
     /* Restore VT_PARAM from explicit is_param flag */
     if (op.is_param)
       out->r |= VT_PARAM;
-    /* For STRUCT types, offset is stored in aux_data * 4 */
+    /* For STRUCT types, offset is stored directly in aux_data */
     if (irop_bt == IROP_BTYPE_STRUCT)
-      out->c.i = (int64_t)op.u.s.aux_data << 2; /* aux_data * 4 */
+      out->c.i = (int64_t)op.u.s.aux_data; /* offset stored directly */
     else
       out->c.i = (int64_t)op.u.imm32; /* stack offset stored in imm32 */
     break;

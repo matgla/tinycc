@@ -1,0 +1,9 @@
+op[0]: call_id=0 param_idx=0 (raw=0x00000000)
+op[1]: call_id=1 param_idx=0 (raw=0x00010000)
+op[2]: call_id=2 param_idx=0 (raw=0x00020000)
+op[3]: call_id=3 param_idx=0 (raw=0x00030000)
+op[4]: call_id=4 param_idx=0 (raw=0x00040000)
+op[5]: call_id=5 param_idx=0 (raw=0x00050000)
+op[6]: call_id=4 param_idx=1 (raw=0x00040001)
+op[7]: call_id=5 param_idx=1 (raw=0x00050001)
+PASS: all union reads correct

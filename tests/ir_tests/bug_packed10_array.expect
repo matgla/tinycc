@@ -1,0 +1,37 @@
+sizeof(TestOperand) = 10
+OK: pool[0].tag = 1
+OK: pool[1].tag = 7
+OK: pool[2].tag = 2
+OK: pool[3].tag = 1
+OK: pool[4].tag = 7
+OK: pool[5].tag = 2
+OK: get_tag(pool,0,0) = 1
+OK: get_tag(pool,0,1) = 7
+OK: get_tag(pool,0,2) = 2
+OK: get_tag(pool,3,0) = 1
+OK: get_tag(pool,3,1) = 7
+OK: get_tag(pool,3,2) = 2
+OK: pool[2].imm32 raw = 0x10000
+OK: pool[2] call_id = 1
+OK: pool[2] param_idx = 0
+OK: pool[5].imm32 raw = 0x10001
+OK: pool[5] call_id = 1
+OK: pool[5] argc = 1
+OK: returned[2].tag = 2
+OK: returned[2].imm32 = 0x10000
+OK: returned[2].is_const = 1
+OK: returned[5].tag = 2
+OK: returned[5].imm32 = 0x10001
+OK: pool[1].position = 0x5
+OK: pool[0].position = 0xa
+--- backward scan simulation ---
+pool[5]: tag=IMM32 call_id=1 param=1
+pool[4]: tag=7
+pool[3]: tag=1
+pool[2]: tag=IMM32 call_id=1 param=0
+pool[1]: tag=7
+pool[0]: tag=1
+OK: found params for call_id=1 = 2
+OK: pool[2] vr tag bits = 2
+OK: pool[1] vr tag bits = 7
+ALL PASSED

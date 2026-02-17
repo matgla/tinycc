@@ -1,0 +1,6 @@
+VarA (union+bitfield): pool[1].vr offset=10 (expected 10) OK
+VarB (no union):       pool[1].vr offset=10 (expected 10) OK
+VarC (union, no bf):   pool[1].vr offset=10 (expected 10) OK
+VarD sizeof=12
+VarD (non-packed):     pool[1].vr offset=12 (expected 12) OK
+ALL PASSED

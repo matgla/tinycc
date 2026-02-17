@@ -1,0 +1,14 @@
+OK pool[0]: a=0 b=0 c=0 d=10
+OK pool[1]: a=100 b=200 c=1 d=11
+OK pool[2]: a=200 b=400 c=2 d=12
+OK pool[3]: a=300 b=600 c=3 d=13
+OK pool[4]: a=400 b=800 c=4 d=14
+OK pool[5]: a=500 b=1000 c=5 d=15
+--- pointer arithmetic ---
+OK &pool[0] offset=0
+OK &pool[1] offset=10
+OK &pool[2] offset=20
+OK &pool[3] offset=30
+OK &pool[4] offset=40
+OK &pool[5] offset=50
+ALL PASSED

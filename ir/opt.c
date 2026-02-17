@@ -446,10 +446,9 @@ int tcc_ir_opt_const_prop(TCCIRState *ir)
           uint32_t pool_idx = tcc_ir_pool_add_i64(ir, val);
           new_src1 = irop_make_i64(-1, pool_idx, btype);
         }
-        /* Preserve flags from original operand */
-        new_src1.is_lval = src1.is_lval;
-        new_src1.is_llocal = src1.is_llocal;
-        new_src1.is_local = src1.is_local;
+        /* Preserve type flags but NOT memory-access flags.
+         * is_lval/is_llocal/is_local describe stack-slot semantics that
+         * don't apply to an immediate constant value. */
         new_src1.is_unsigned = src1.is_unsigned;
         new_src1.is_static = src1.is_static;
         tcc_ir_set_src1(ir, i, new_src1);
@@ -476,10 +475,7 @@ int tcc_ir_opt_const_prop(TCCIRState *ir)
           uint32_t pool_idx = tcc_ir_pool_add_i64(ir, val);
           new_src2 = irop_make_i64(-1, pool_idx, btype);
         }
-        /* Preserve flags from original operand */
-        new_src2.is_lval = src2.is_lval;
-        new_src2.is_llocal = src2.is_llocal;
-        new_src2.is_local = src2.is_local;
+        /* Preserve type flags but NOT memory-access flags. */
         new_src2.is_unsigned = src2.is_unsigned;
         new_src2.is_static = src2.is_static;
         tcc_ir_set_src2(ir, i, new_src2);
@@ -1249,10 +1245,9 @@ int tcc_ir_opt_const_prop_tmp(TCCIRState *ir)
           uint32_t pool_idx = tcc_ir_pool_add_i64(ir, val);
           new_src1 = irop_make_i64(-1, pool_idx, btype);
         }
-        /* Preserve flags from original operand */
-        new_src1.is_lval = src1.is_lval;
-        new_src1.is_llocal = src1.is_llocal;
-        new_src1.is_local = src1.is_local;
+        /* Preserve type flags but NOT memory-access flags.
+         * is_lval/is_llocal/is_local describe stack-slot semantics that
+         * don't apply to an immediate constant value. */
         new_src1.is_unsigned = src1.is_unsigned;
         new_src1.is_static = src1.is_static;
         tcc_ir_set_src1(ir, i, new_src1);
@@ -1283,10 +1278,7 @@ int tcc_ir_opt_const_prop_tmp(TCCIRState *ir)
           uint32_t pool_idx = tcc_ir_pool_add_i64(ir, val);
           new_src2 = irop_make_i64(-1, pool_idx, btype);
         }
-        /* Preserve flags from original operand */
-        new_src2.is_lval = src2.is_lval;
-        new_src2.is_llocal = src2.is_llocal;
-        new_src2.is_local = src2.is_local;
+        /* Preserve type flags but NOT memory-access flags. */
         new_src2.is_unsigned = src2.is_unsigned;
         new_src2.is_static = src2.is_static;
         tcc_ir_set_src2(ir, i, new_src2);
@@ -3576,48 +3568,6 @@ int tcc_ir_opt_indexed_memory_fusion(TCCIRState *ir)
  * - LOAD/STORE result (for load) must not be the pointer being incremented
  */
 
-/* Helper: Find the ASSIGN instruction that created a given TMP vreg
- * Returns the index of the ASSIGN instruction, or -1 if not found
- */
-static int find_assign_for_tmp(TCCIRState *ir, int32_t tmp_vr, int before_idx)
-{
-  if (!ir || tmp_vr < 0 || before_idx <= 0)
-    return -1;
-
-  /* Only look for TMP vregs */
-  if (TCCIR_DECODE_VREG_TYPE(tmp_vr) != TCCIR_VREG_TYPE_TEMP)
-    return -1;
-
-  for (int i = before_idx - 1; i >= 0; --i)
-  {
-    IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op == TCCIR_OP_NOP)
-      continue;
-    if (q->op == TCCIR_OP_ASSIGN)
-    {
-      IROperand dest = tcc_ir_op_get_dest(ir, q);
-      if (irop_get_vreg(dest) == tmp_vr)
-        return i;
-    }
-  }
-  return -1;
-}
-
-/* Helper: Check if a STORE instruction stores a value to a vreg
- * Returns 1 if store at store_idx stores src_vr to dest_vr
- */
-static int is_store_of_vreg(TCCIRState *ir, int store_idx, int32_t dest_vr, int32_t src_vr)
-{
-  IRQuadCompact *q = &ir->compact_instructions[store_idx];
-  if (q->op != TCCIR_OP_STORE)
-    return 0;
-
-  IROperand q_dest = tcc_ir_op_get_dest(ir, q);
-  IROperand q_src = tcc_ir_op_get_src1(ir, q);
-
-  return (irop_get_vreg(q_dest) == dest_vr && irop_get_vreg(q_src) == src_vr);
-}
-
 int tcc_ir_opt_postinc_fusion(TCCIRState *ir)
 {
   int n = ir->next_instruction_index;
@@ -3630,299 +3580,177 @@ int tcc_ir_opt_postinc_fusion(TCCIRState *ir)
   printf("=== POSTINC FUSION START (n=%d) ===\n", n);
 #endif
 
+  /* ---------------------------------------------------------------------------
+   * Revised post-increment fusion (LOAD-only).
+   *
+   * Previous implementation had three fundamental problems:
+   *
+   * 1. ASSIGN tracing:  tracing through ASSIGN to find an "original pointer"
+   *    allowed the ADD search to match against orig_ptr_vr.  After earlier
+   *    optimisation passes (copy-prop, store-load-fwd, redundant-store-elim)
+   *    rearranged and merged instructions, a LOAD from the first *p++ could
+   *    be incorrectly fused with the ADD from the *second* p++, because both
+   *    ADDs reference the same original variable.
+   *
+   * 2. Implicit writeback not modelled:  ARM LOAD_POSTINC (ldr Rd,[Rn],#imm)
+   *    updates Rn in-place, but the IR has no way to express this side-effect.
+   *    The register allocator treats the pointer operand as input-only, so
+   *    after LOAD_POSTINC the updated value can be lost through spilling or
+   *    register re-use.
+   *
+   * 3. Overly aggressive NOP-ing:  the old code NOPed the ASSIGN (pointer
+   *    copy), ADD (increment) and STORE (writeback) — removing the entire
+   *    pointer update chain.  If the codegen failed to propagate the
+   *    implicit ARM writeback, the pointer was never incremented.
+   *
+   * New rules
+   * =========
+   *
+   * a)  Only fuse LOAD, never STORE.
+   *
+   * b)  The LOAD's pointer must be a TEMP vreg (is_local=0) that holds a
+   *     pointer value to dereference.
+   *
+   * c)  The matching ADD must be *immediately* after the LOAD (the very
+   *     next non-NOP instruction — no search window).  This prevents
+   *     cross-matching between interleaved post-increment operations.
+   *
+   * d)  The ADD's pointer source must be *exactly* ptr_vr (the LOAD's own
+   *     pointer TEMP).  No ASSIGN tracing, no orig_ptr matching.
+   *
+   * e)  Instead of NOP-ing the ADD, transform it into
+   *         ASSIGN  add_result, ptr_vr
+   *     After the ARM LOAD_POSTINC instruction executes, the register
+   *     holding ptr_vr contains ptr+offset.  The ASSIGN propagates that
+   *     updated value to the ADD's original result vreg so that any
+   *     downstream STORE (writing the incremented pointer back to the
+   *     variable's stack slot) still works correctly.
+   *
+   * f)  Never NOP any ASSIGN or STORE instruction.  The original pointer
+   *     copy (ASSIGN tmp, p) and writeback (STORE [p_slot], result) stay
+   *     intact, guaranteeing the pointer update reaches its stack slot.
+   *
+   * Net effect: one fewer instruction executed per post-increment (the ADD
+   * is replaced by a cheaper ASSIGN that the codegen can often elide) and
+   * the ARM post-indexed addressing mode saves a cycle.
+   * ------------------------------------------------------------------------ */
+
   for (int i = 0; i < n - 1; i++)
   {
     IRQuadCompact *mem_q = &ir->compact_instructions[i];
 
-    /* Look for LOAD or STORE instructions */
-    if (mem_q->op != TCCIR_OP_LOAD && mem_q->op != TCCIR_OP_STORE)
+    /* (a) Only fuse LOAD instructions. */
+    if (mem_q->op != TCCIR_OP_LOAD)
       continue;
 
-    int is_store = (mem_q->op == TCCIR_OP_STORE);
+    /* LOAD: src1 is the pointer, dest is the loaded value */
+    IROperand ptr_op = tcc_ir_op_get_src1(ir, mem_q);
+    IROperand loaded_val_op = tcc_ir_op_get_dest(ir, mem_q);
 
-    /* Get the pointer operand */
-    IROperand ptr_op;
-    IROperand loaded_val_op;
-
-    if (is_store)
-    {
-      /* STORE: dest is the pointer, src1 is the value */
-      ptr_op = tcc_ir_op_get_dest(ir, mem_q);
-      loaded_val_op = tcc_ir_op_get_src1(ir, mem_q);
-    }
-    else
-    {
-      /* LOAD: src1 is the pointer, dest is the loaded value */
-      ptr_op = tcc_ir_op_get_src1(ir, mem_q);
-      loaded_val_op = tcc_ir_op_get_dest(ir, mem_q);
-    }
-
-    /* Pointer must be a virtual register */
+    /* (b) Pointer must be a TEMP vreg, not a stack-local variable. */
     if (!irop_has_vreg(ptr_op))
       continue;
-
-    /* Only fuse when the operand represents a pointer in a register being
-     * dereferenced (TEMP vreg with is_lval, is_local=0).  Skip stack-local
-     * operands (is_local=1): their address is a fixed [FP-offset] computed
-     * by the code-generator, not a value in a GP register.  Fusing a local
-     * variable load (LOAD from VAR, is_local=1) with a later ADD would
-     * incorrectly treat the scalar value as a memory address for
-     * LDR Rd,[Rn],#imm instead of a simple register copy. */
     if (ptr_op.is_local)
       continue;
 
     int32_t ptr_vr = irop_get_vreg(ptr_op);
-    int32_t orig_ptr_vr = ptr_vr;
-    IROperand orig_ptr_op = ptr_op;
-    int assign_idx = -1;
 
-    /* For LOAD: loaded value must not be the same as pointer */
-    if (!is_store && irop_has_vreg(loaded_val_op) && irop_get_vreg(loaded_val_op) == ptr_vr)
+    /* Pointer must be a TEMP (register-resident). */
+    if (TCCIR_DECODE_VREG_TYPE(ptr_vr) != TCCIR_VREG_TYPE_TEMP)
       continue;
 
-    /* Check if this is a TMP that came from an ASSIGN (pointer copy pattern)
-     * Pattern: ASSIGN temp, ptr; LOAD dest, temp; ADD ptr, ptr, #imm
-     * We want to fuse this into: LOAD_POSTINC dest, ptr, #imm
-     */
-    if (TCCIR_DECODE_VREG_TYPE(ptr_vr) == TCCIR_VREG_TYPE_TEMP)
-    {
-      assign_idx = find_assign_for_tmp(ir, ptr_vr, i);
-      if (assign_idx >= 0)
-      {
-        IRQuadCompact *assign_q = &ir->compact_instructions[assign_idx];
-        IROperand assign_src = tcc_ir_op_get_src1(ir, assign_q);
-        if (irop_has_vreg(assign_src))
-        {
-          /* Found the original pointer */
-          orig_ptr_vr = irop_get_vreg(assign_src);
-          orig_ptr_op = assign_src;
-#ifdef DEBUG_IR_GEN
-          printf("POSTINC: Found pointer copy pattern: TMP%d <- VR%d\n", TCCIR_DECODE_VREG_POSITION(ptr_vr),
-                 TCCIR_DECODE_VREG_POSITION(orig_ptr_vr));
-#endif
-        }
-        else
-        {
-          assign_idx = -1; /* ASSIGN source is not a vreg, can't use */
-        }
-      }
-    }
+    /* Loaded value must not alias the pointer register. */
+    if (irop_has_vreg(loaded_val_op) && irop_get_vreg(loaded_val_op) == ptr_vr)
+      continue;
 
-    /* Look at the next instructions for ADD that increments the ORIGINAL pointer.
-     * There are two patterns:
-     * 1. ADD orig_ptr, orig_ptr, #imm  (direct update)
-     * 2. ADD tmp, orig_ptr, #imm; STORE orig_ptr, tmp  (via temporary)
-     *
-     * There may be intervening instructions (like ASSIGN for another temp copy)
-     * so we search forward for the ADD instead of just looking at i+1.
-     */
+    /* (c) Find the ADD at exactly i+1 (skip NOPs). */
     int add_idx = -1;
-    int search_limit = (i + 5 < n) ? i + 5 : n; /* Look up to 5 instructions ahead */
-    for (int j = i + 1; j < search_limit; j++)
+    for (int j = i + 1; j < n; j++)
     {
-      IRQuadCompact *qj = &ir->compact_instructions[j];
-      if (qj->op == TCCIR_OP_ADD)
-      {
-        /* Check if this ADD uses our pointer */
-        IROperand add_s1 = tcc_ir_op_get_src1(ir, qj);
-        IROperand add_s2 = tcc_ir_op_get_src2(ir, qj);
-        int s1_vr = irop_get_vreg(add_s1);
-        int s2_vr = irop_get_vreg(add_s2);
-        /* Check if either source is our pointer (original or temp) */
-        if ((irop_has_vreg(add_s1) && (s1_vr == orig_ptr_vr || s1_vr == ptr_vr)) ||
-            (irop_has_vreg(add_s2) && (s2_vr == orig_ptr_vr || s2_vr == ptr_vr)))
-        {
-          add_idx = j;
-          break;
-        }
-        /* Also check if this ADD uses a temp that copies our pointer */
-        if (irop_has_vreg(add_s1) && TCCIR_DECODE_VREG_TYPE(s1_vr) == TCCIR_VREG_TYPE_TEMP)
-        {
-          int asn = find_assign_for_tmp(ir, s1_vr, j);
-          if (asn >= 0)
-          {
-            IROperand asn_src = tcc_ir_op_get_src1(ir, &ir->compact_instructions[asn]);
-            if (irop_get_vreg(asn_src) == orig_ptr_vr)
-            {
-              add_idx = j;
-              break;
-            }
-          }
-        }
-      }
-      /* Stop if we hit a branch or function call */
-      if (qj->op == TCCIR_OP_JUMP || qj->op == TCCIR_OP_JUMPIF || qj->op == TCCIR_OP_FUNCCALLVOID ||
-          qj->op == TCCIR_OP_FUNCCALLVAL)
-        break;
+      if (ir->compact_instructions[j].op == TCCIR_OP_NOP)
+        continue;
+      if (ir->compact_instructions[j].op == TCCIR_OP_ADD)
+        add_idx = j;
+      break; /* first non-NOP: either it's our ADD or we bail */
     }
-
     if (add_idx < 0)
       continue;
 
     IRQuadCompact *add_q = &ir->compact_instructions[add_idx];
 
-    /* Check ADD operands - one should be the original pointer OR the temp copy */
-    IROperand add_dest = tcc_ir_op_get_dest(ir, add_q);
+    /* (d) The ADD must use exactly ptr_vr as one source. */
     IROperand add_src1 = tcc_ir_op_get_src1(ir, add_q);
     IROperand add_src2 = tcc_ir_op_get_src2(ir, add_q);
-
-    int add_src1_vr = irop_get_vreg(add_src1);
-    int add_src2_vr = irop_get_vreg(add_src2);
-    /* Accept either original pointer OR the temp copy as the ADD source */
-    int ptr_is_src1 = (irop_has_vreg(add_src1) && (add_src1_vr == orig_ptr_vr || add_src1_vr == ptr_vr));
-    int ptr_is_src2 = (irop_has_vreg(add_src2) && (add_src2_vr == orig_ptr_vr || add_src2_vr == ptr_vr));
-
+    int s1_vr = irop_get_vreg(add_src1);
+    int s2_vr = irop_get_vreg(add_src2);
+    int ptr_is_src1 = (irop_has_vreg(add_src1) && s1_vr == ptr_vr);
+    int ptr_is_src2 = (irop_has_vreg(add_src2) && s2_vr == ptr_vr);
     if (!ptr_is_src1 && !ptr_is_src2)
       continue;
 
-    /* Check if ADD result goes directly to original pointer (pattern 1) */
-    int add_dest_is_orig = (irop_has_vreg(add_dest) && irop_get_vreg(add_dest) == orig_ptr_vr);
-
-    /* Or check if ADD result is a TMP that gets stored to original pointer (pattern 2) */
-    int add_dest_vr = irop_get_vreg(add_dest);
-    int store_idx = -1;
-
-    if (!add_dest_is_orig && TCCIR_DECODE_VREG_TYPE(add_dest_vr) == TCCIR_VREG_TYPE_TEMP)
-    {
-      /* Look for STORE orig_ptr, add_dest after the ADD */
-      int j = add_idx + 1;
-      while (j < n && ir->compact_instructions[j].op == TCCIR_OP_NOP)
-        j++;
-
-      if (j < n && is_store_of_vreg(ir, j, orig_ptr_vr, add_dest_vr))
-        store_idx = j;
-    }
-
-    /* We need either direct update or store pattern */
-    if (!add_dest_is_orig && store_idx < 0)
-      continue;
-
-    /* The other operand must be an immediate offset */
+    /* The other operand must be an immediate constant in [1..255]. */
     IROperand offset_op = ptr_is_src1 ? add_src2 : add_src1;
-#ifdef DEBUG_IR_GEN
-    printf("POSTINC DEBUG: ptr_is_src1=%d, ptr_is_src2=%d, offset_op.is_const=%d\n", ptr_is_src1, ptr_is_src2,
-           offset_op.is_const);
-#endif
     if (!offset_op.is_const)
-    {
-#ifdef DEBUG_IR_GEN
-      printf("POSTINC DEBUG: offset_op is not const, skipping\n");
-#endif
       continue;
-    }
-
     int offset = offset_op.u.imm32;
-#ifdef DEBUG_IR_GEN
-    printf("POSTINC DEBUG: extracted offset=%d\n", offset);
-#endif
-    /* ARM post-increment supports offsets 1-255 (8-bit unsigned immediate) */
     if (offset < 1 || offset > 255)
       continue;
 
-    /* Check that both instructions are in the same basic block */
-    for (int j = i + 1; j < add_idx; j++)
-    {
-      IRQuadCompact *between = &ir->compact_instructions[j];
-      if (between->op == TCCIR_OP_JUMP || between->op == TCCIR_OP_JUMPIF)
-        goto skip_fusion;
-    }
-
-    /* Check that the TEMP pointer (if used) has no other uses between LOAD/STORE and ADD
-     * and that the ORIGINAL pointer is not modified between the ASSIGN and the ADD */
-    for (int j = (assign_idx >= 0 ? assign_idx + 1 : i + 1); j < add_idx; j++)
-    {
-      IRQuadCompact *qj = &ir->compact_instructions[j];
-      if (qj->op == TCCIR_OP_NOP)
-        continue;
-      /* Check for modifications to original pointer */
-      if (irop_config[qj->op].has_dest)
-      {
-        IROperand qj_dest = tcc_ir_op_get_dest(ir, qj);
-        if (irop_get_vreg(qj_dest) == orig_ptr_vr)
-          goto skip_fusion; /* Original pointer is modified before ADD */
-      }
-    }
-
-    /* If we used an ASSIGN, check that the temp has no other uses */
-    if (assign_idx >= 0)
-    {
-      for (int j = i + 1; j < add_idx; j++)
-      {
-        IRQuadCompact *qj = &ir->compact_instructions[j];
-        if (qj->op == TCCIR_OP_NOP)
-          continue;
-        IROperand s1 = tcc_ir_op_get_src1(ir, qj);
-        IROperand s2 = tcc_ir_op_get_src2(ir, qj);
-        if (irop_get_vreg(s1) == ptr_vr || irop_get_vreg(s2) == ptr_vr)
-          goto skip_fusion;
-      }
-    }
-
-    /* Transform to POSTINC version */
-    /* Allocate new operand space for POSTINC (4 operands: dest/src, ptr, unused, offset)
-     * The offset goes at position 3 (scale field) as expected by tcc_ir_op_get_scale()
-     */
+    /* Ensure the operand pool has room for 4 slots. */
     int new_base_idx = ir->iroperand_pool_count;
     if (new_base_idx + 4 > ir->iroperand_pool_capacity)
-    {
-      /* Not enough space - skip */
       continue;
-    }
 
-    /* Add 4 new operand slots */
+    /* ---- Apply transformation ---- */
+
+    /* Allocate 4 operand slots for LOAD_POSTINC: dest, ptr, unused, offset */
     tcc_ir_pool_add(ir, IROP_NONE);
     tcc_ir_pool_add(ir, IROP_NONE);
     tcc_ir_pool_add(ir, IROP_NONE);
     tcc_ir_pool_add(ir, IROP_NONE);
 
-    /* Update instruction to use new operand base */
     mem_q->operand_base = new_base_idx;
-
-    if (is_store)
+    ir->iroperand_pool[new_base_idx + 0] = loaded_val_op; /* loaded value (dest) */
+    ir->iroperand_pool[new_base_idx + 1] = ptr_op;        /* pointer TEMP (input, updated by HW) */
+    ir->iroperand_pool[new_base_idx + 2] = IROP_NONE;     /* unused */
     {
-      /* STORE_POSTINC: ptr, value, unused, offset */
-      ir->iroperand_pool[new_base_idx + 0] = orig_ptr_op;   /* pointer (gets updated) */
-      ir->iroperand_pool[new_base_idx + 1] = loaded_val_op; /* value to store */
-      ir->iroperand_pool[new_base_idx + 2] = IROP_NONE;     /* unused */
       IROperand offset_imm = IROP_NONE;
       offset_imm.is_const = 1;
       offset_imm.u.imm32 = offset;
-      ir->iroperand_pool[new_base_idx + 3] = offset_imm; /* offset immediate (scale position) */
+      ir->iroperand_pool[new_base_idx + 3] = offset_imm;
     }
-    else
+    mem_q->op = TCCIR_OP_LOAD_POSTINC;
+
+    /* (e) Transform the ADD into ASSIGN add_result := ptr_vr.
+     *     After the ARM post-indexed load, the register holding ptr_vr
+     *     contains ptr + offset.  The ASSIGN propagates that value to
+     *     the original ADD result vreg so downstream code (especially
+     *     the STORE that writes back to the variable's stack slot) sees
+     *     the correct incremented pointer.
+     *
+     *     We reuse the ADD's existing operand slots: overwrite src1 with
+     *     ptr_op (the TEMP pointer) and clear src2. The dest (add_result)
+     *     stays unchanged.
+     */
+    add_q->op = TCCIR_OP_ASSIGN;
     {
-      /* LOAD_POSTINC: load_dest, ptr, unused, offset */
-      ir->iroperand_pool[new_base_idx + 0] = loaded_val_op; /* loaded value dest */
-      ir->iroperand_pool[new_base_idx + 1] = orig_ptr_op;   /* pointer (gets updated) */
-      ir->iroperand_pool[new_base_idx + 2] = IROP_NONE;     /* unused */
-      IROperand offset_imm = IROP_NONE;
-      offset_imm.is_const = 1;
-      offset_imm.u.imm32 = offset;
-      ir->iroperand_pool[new_base_idx + 3] = offset_imm; /* offset immediate (scale position) */
+      /* Build an ASSIGN source from ptr_op that is a plain register value
+       * (not an lvalue dereference).  The original ptr_op comes from the
+       * LOAD's source, which has is_lval=1 (meaning "dereference this
+       * register as a pointer").  For the ASSIGN we want the *register
+       * contents* — the updated pointer value — not another dereference. */
+      IROperand assign_src = ptr_op;
+      assign_src.is_lval = 0;
+      tcc_ir_set_src1(ir, add_idx, assign_src);
     }
-
-    /* Change opcode to POSTINC version */
-    mem_q->op = is_store ? TCCIR_OP_STORE_POSTINC : TCCIR_OP_LOAD_POSTINC;
-
-    /* Mark ADD as NOP (will be removed by DCE) */
-    add_q->op = TCCIR_OP_NOP;
-
-    /* If there was an ASSIGN, mark it as NOP too (the temp is no longer needed) */
-    if (assign_idx >= 0)
-    {
-      ir->compact_instructions[assign_idx].op = TCCIR_OP_NOP;
-    }
-
-    /* If there was a STORE of the ADD result, mark it as NOP too */
-    if (store_idx >= 0)
-    {
-      ir->compact_instructions[store_idx].op = TCCIR_OP_NOP;
-    }
+    /* ASSIGN has no src2 — the old src2 slot is ignored (has_src2=0 for ASSIGN). */
 
     changes++;
 
-  skip_fusion:
-    continue;
+#ifdef DEBUG_IR_GEN
+    printf("POSTINC FUSION: LOAD@%d + ADD@%d -> LOAD_POSTINC + ASSIGN (ptr_vr=%d, offset=%d)\n", i, add_idx, ptr_vr,
+           offset);
+#endif
   }
 
 #ifdef DEBUG_IR_GEN

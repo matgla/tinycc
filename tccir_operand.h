@@ -99,7 +99,7 @@ typedef struct __attribute__((packed)) IROperand
     struct
     {                     /* for STRUCT types - split encoding */
       uint16_t ctype_idx; /* index into pool_ctype (lower 16 bits) */
-      int16_t aux_data;   /* aux: stack offset/4 for STACKOFF, symref_idx for SYMREF */
+      int16_t aux_data;   /* aux: stack offset for STACKOFF, symref_idx for SYMREF */
     } s;
   } u;
   /* Physical register allocation (filled by register allocator for codegen) */
@@ -221,9 +221,9 @@ static inline int64_t irop_get_imm64_ex(const struct TCCIRState *ir, IROperand o
     /* Sign-extend 32-bit immediate to 64-bit */
     return (int64_t)op.u.imm32;
   case IROP_TAG_STACKOFF:
-    /* For STRUCT types, offset is in aux_data * 4; otherwise in imm32 */
+    /* For STRUCT types, offset is stored directly in aux_data; otherwise in imm32 */
     if (op.btype == IROP_BTYPE_STRUCT)
-      return (int64_t)((int32_t)op.u.s.aux_data << 2);
+      return (int64_t)((int32_t)op.u.s.aux_data);
     return (int64_t)op.u.imm32;
   case IROP_TAG_I64:
     /* Look up in pool */
@@ -495,7 +495,7 @@ static inline int irop_has_vreg(const IROperand op)
 static inline int32_t irop_get_stack_offset(const IROperand op)
 {
   if (op.btype == IROP_BTYPE_STRUCT)
-    return (int32_t)op.u.s.aux_data << 2; /* Stored as offset/4 */
+    return (int32_t)op.u.s.aux_data; /* Stored directly */
   return op.u.imm32;
 }
 
