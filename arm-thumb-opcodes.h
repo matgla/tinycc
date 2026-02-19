@@ -241,7 +241,7 @@ thumb_opcode th_sub_imm(uint32_t rd, uint32_t rn, uint32_t imm, thumb_flags_beha
                         thumb_enforce_encoding encoding);
 thumb_opcode th_sub_imm_t4(uint32_t rd, uint32_t rn, uint32_t imm);
 
-thumb_opcode th_push(uint16_t regs);
+thumb_opcode th_push(uint32_t regs);
 int th_ldr_literal_estimate(uint16_t rt, uint32_t imm);
 thumb_opcode th_ldrsh_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw, thumb_enforce_encoding encoding);
 thumb_opcode th_ldrsh_reg(uint32_t rt, uint32_t rn, uint32_t rm, thumb_shift shift, thumb_enforce_encoding encoding);

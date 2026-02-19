@@ -542,5 +542,3 @@ static inline int irop_op_is_const(const IROperand op)
     return 0;
   return op.is_const;
 }
-
-

@@ -925,7 +925,7 @@ thumb_opcode th_sub_imm(uint32_t rd, uint32_t rn, uint32_t imm, thumb_flags_beha
   return th_sub_imm_t4(rd, rn, imm);
 }
 
-thumb_opcode th_push(uint16_t regs)
+thumb_opcode th_push(uint32_t regs)
 {
   // T1 encoding R0-R7 + LR only, all armv-m
   // (T2 in armv8-m - inconsistent naming in reference manual)

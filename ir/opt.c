@@ -2328,8 +2328,18 @@ int tcc_ir_opt_sl_forward(TCCIRState *ir)
     const Sym *local_sym;   /* symbol for VT_LOCAL (NULL for pure stack offsets) */
     IROperand stored_value; /* IROperand of the stored value */
     int instruction_idx;    /* where the store happened */
+    int store_dest_vr;      /* vreg of the store destination (address) */
     struct StoreEntry *next;
   } StoreEntry;
+
+  /* Track last write index for each vreg to detect intervening writes.
+   * When a LOAD's address vreg was written AFTER a matching store,
+   * the store-load forward is invalid because the vreg now holds a
+   * different value than what was stored. */
+  typedef struct {
+    int last_write_idx;  /* instruction index of last write, -1 if none */
+    int gen;             /* generation counter, valid only if gen == current_gen */
+  } VregWriteTracker;
 
   int n = ir->next_instruction_index;
   int changes = 0;
@@ -2346,6 +2356,16 @@ int tcc_ir_opt_sl_forward(TCCIRState *ir)
   entries = tcc_malloc(sizeof(StoreEntry) * n);
   entry_count = 0;
 
+  /* Allocate vreg write trackers for all three vreg types.
+   * Using generation counter so we don't need to clear on block boundaries. */
+  int write_tracker_gen = 1;
+  int max_var = ir->next_local_variable;
+  int max_tmp = ir->next_temporary_variable;
+  int max_par = ir->next_parameter;
+  VregWriteTracker *var_writes = tcc_mallocz(sizeof(VregWriteTracker) * (max_var + 1));
+  VregWriteTracker *tmp_writes = tcc_mallocz(sizeof(VregWriteTracker) * (max_tmp + 1));
+  VregWriteTracker *par_writes = tcc_mallocz(sizeof(VregWriteTracker) * (max_par + 1));
+
 #ifdef DEBUG_IR_GEN
   printf("=== STORE-LOAD FORWARDING START ===\n");
 #endif
@@ -2360,6 +2380,7 @@ int tcc_ir_opt_sl_forward(TCCIRState *ir)
     {
       memset(hash_table, 0, sizeof(hash_table));
       entry_count = 0;
+      write_tracker_gen++;
       continue;
     }
 
@@ -2412,6 +2433,34 @@ int tcc_ir_opt_sl_forward(TCCIRState *ir)
         /* Both are stack locals - match on symbol and offset */
         if (e->local_sym == addr_sym && e->local_offset == addr_offset)
         {
+          /* Safety check: if the LOAD's address vreg was written AFTER the
+           * matching store, the store entry is stale. This happens when:
+           * 1. STORE val → stack_slot[-88]  (records stored_value)
+           * 2. AND/ADD/etc → VARx           (writes to VARx which lives at -88)
+           * 3. LOAD VARx → dest             (should read VARx's register value, not step 1's value)
+           * Without this check, step 3 incorrectly forwards step 1's value. */
+          if (addr_vr >= 0)
+          {
+            int vr_type = TCCIR_DECODE_VREG_TYPE(addr_vr);
+            int vr_pos = TCCIR_DECODE_VREG_POSITION(addr_vr);
+            VregWriteTracker *tracker = NULL;
+            if (vr_type == TCCIR_VREG_TYPE_VAR && vr_pos <= max_var)
+              tracker = &var_writes[vr_pos];
+            else if (vr_type == TCCIR_VREG_TYPE_TEMP && vr_pos <= max_tmp)
+              tracker = &tmp_writes[vr_pos];
+            else if (vr_type == TCCIR_VREG_TYPE_PARAM && vr_pos <= max_par)
+              tracker = &par_writes[vr_pos];
+            if (tracker && tracker->gen == write_tracker_gen &&
+                tracker->last_write_idx > e->instruction_idx)
+            {
+              /* The LOAD's address vreg was written after the store — skip */
+              continue;
+            }
+          }
+#ifdef TCC_REGALLOC_DEBUG
+          fprintf(stderr, "[SL-FWD] i=%d LOAD replaced by ASSIGN from store at i=%d, stored_vr=0x%x, load_addr_vr=0x%x, offset=%lld\n",
+                  i, e->instruction_idx, irop_get_vreg(e->stored_value), addr_vr, (long long)addr_offset);
+#endif
 #ifdef DEBUG_IR_GEN
           printf("OPTIMIZE: Store-load forwarding at i=%d from store at i=%d\n", i, e->instruction_idx);
 #endif
@@ -2497,8 +2546,14 @@ int tcc_ir_opt_sl_forward(TCCIRState *ir)
       new_entry->local_sym = addr_sym;
       new_entry->stored_value = tcc_ir_op_get_src1(ir, q);
       new_entry->instruction_idx = i;
+      new_entry->store_dest_vr = addr_vr;
       new_entry->next = hash_table[h];
       hash_table[h] = new_entry;
+
+#ifdef TCC_REGALLOC_DEBUG
+      fprintf(stderr, "[SL-STORE] i=%d store_val_vr=0x%x store_addr_vr=0x%x offset=%lld n=%d\n",
+              i, irop_get_vreg(new_entry->stored_value), addr_vr, (long long)addr_offset, ir->next_instruction_index);
+#endif
 
 #ifdef DEBUG_IR_GEN
       printf("STORE-LOAD: Track store at i=%d (addrtaken=%d, offset=%lld)\n", i, addr_addrtaken,
@@ -2521,18 +2576,43 @@ int tcc_ir_opt_sl_forward(TCCIRState *ir)
           /* If the stored value vreg is redefined, invalidate */
           if (irop_get_vreg(entries[j].stored_value) == dest_vr)
           {
-#ifdef DEBUG_IR_GEN
-            printf("STORE-LOAD: Invalidate store at i=%d (stored value redefined at i=%d)\n",
-                   entries[j].instruction_idx, i);
+#ifdef TCC_REGALLOC_DEBUG
+            fprintf(stderr, "[SL-INVAL-VAL] i=%d invalidate store at si=%d (stored_val_vr=0x%x redefined) n=%d\n",
+                    i, entries[j].instruction_idx, dest_vr, ir->next_instruction_index);
 #endif
             entries[j].valid = 0;
           }
+        }
+      }
+
+      /* Track this write for the LOAD address vreg safety check.
+       * When a vreg is written by ANY instruction (AND, ADD, ASSIGN, etc.),
+       * a later LOAD using that vreg as its address should NOT be forwarded
+       * from a store that happened BEFORE this write. */
+      if (dest_vr >= 0 && !dest.is_lval)
+      {
+        int vr_type = TCCIR_DECODE_VREG_TYPE(dest_vr);
+        int vr_pos = TCCIR_DECODE_VREG_POSITION(dest_vr);
+        VregWriteTracker *tracker = NULL;
+        if (vr_type == TCCIR_VREG_TYPE_VAR && vr_pos <= max_var)
+          tracker = &var_writes[vr_pos];
+        else if (vr_type == TCCIR_VREG_TYPE_TEMP && vr_pos <= max_tmp)
+          tracker = &tmp_writes[vr_pos];
+        else if (vr_type == TCCIR_VREG_TYPE_PARAM && vr_pos <= max_par)
+          tracker = &par_writes[vr_pos];
+        if (tracker)
+        {
+          tracker->last_write_idx = i;
+          tracker->gen = write_tracker_gen;
         }
       }
     }
   }
 
   tcc_free(entries);
+  tcc_free(var_writes);
+  tcc_free(tmp_writes);
+  tcc_free(par_writes);
 
 #ifdef DEBUG_IR_GEN
   printf("=== STORE-LOAD FORWARDING END: %d changes ===\n", changes);

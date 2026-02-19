@@ -555,6 +555,14 @@ void tcc_ir_params_add(TCCIRState *ir, CType *func_type)
   if ((sym->type.t & VT_BTYPE) == VT_STRUCT)
   {
     tcc_ir_params_add_hidden_sret(ir, func_type);
+    /* If sret was used (func_vc != 0), the hidden pointer consumed r0
+     * per AAPCS. Advance the ABI layout so that explicit arguments
+     * are classified starting from r1, not r0. Without this, all
+     * parameters are off-by-one: the last register param is
+     * misclassified as in-register when it is actually on the stack,
+     * and the backend generates ADD (address) instead of LDR (value). */
+    if (func_vc != 0)
+      call_layout.next_reg = 1;
   }
 
   /* Process function parameters */

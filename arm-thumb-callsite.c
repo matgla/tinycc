@@ -87,6 +87,8 @@ ThumbGenCallSite *thumb_get_call_site_for_id(int call_id)
 int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, int argc_hint, TCCAbiCallLayout *layout,
                                     IROperand **out_args)
 {
+  fprintf(stderr, "[CALLSITE] thumb_build_call_layout_from_ir: call_idx=%d call_id=%d argc_hint=%d total_insns=%d\n",
+          call_idx, call_id, argc_hint, ir ? ir->next_instruction_index : -1);
   if (!ir || !layout || call_idx < 0)
     return -1;
 
@@ -117,6 +119,9 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, i
       {
         const IROperand src2 = tcc_ir_get_src2(ir, j);
         int param_call_id = irop_is_none(src2) ? -1 : TCCIR_DECODE_CALL_ID((uint32_t)src2.u.imm32);
+        fprintf(stderr, "[CALLSITE]   legacy scan j=%d: FUNCPARAMVAL param_call_id=%d (want %d) param_idx=%d\n",
+                j, param_call_id, call_id,
+                irop_is_none(src2) ? -1 : (int)TCCIR_DECODE_PARAM_IDX((uint32_t)src2.u.imm32));
         if (param_call_id == call_id)
         {
           int param_idx = TCCIR_DECODE_PARAM_IDX((uint32_t)src2.u.imm32);
@@ -126,6 +131,7 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, i
       }
     }
     argc = max_arg_index + 1;
+    fprintf(stderr, "[CALLSITE]   legacy scan result: max_arg_index=%d argc=%d\n", max_arg_index, argc);
   }
 
   if (argc <= 0)
@@ -159,6 +165,7 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, i
     args = (IROperand *)tcc_mallocz(sizeof(IROperand) * argc);
   }
 
+  fprintf(stderr, "[CALLSITE] scanning backwards from call_idx=%d for call_id=%d argc=%d\n", call_idx, call_id, argc);
   int found_count = 0;
   for (int j = call_idx - 1; j >= 0 && found_count < argc; --j)
   {
@@ -167,12 +174,17 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, i
     {
       const IROperand src2 = tcc_ir_get_src2(ir, j);
       int param_call_id = !irop_is_none(src2) ? TCCIR_DECODE_CALL_ID((uint32_t)src2.u.imm32) : -1;
+      int param_idx_raw = !irop_is_none(src2) ? (int)TCCIR_DECODE_PARAM_IDX((uint32_t)src2.u.imm32) : -1;
+      fprintf(stderr, "[CALLSITE]   j=%d FUNCPARAMVAL param_call_id=%d param_idx=%d (want call_id=%d)\n",
+              j, param_call_id, param_idx_raw, call_id);
       if (param_call_id == call_id)
       {
         const IROperand src1_irop = tcc_ir_get_src1(ir, j);
         int param_idx = TCCIR_DECODE_PARAM_IDX((uint32_t)src2.u.imm32);
         if (param_idx >= 0 && param_idx < argc && !found[param_idx])
         {
+          fprintf(stderr, "[CALLSITE]     recording arg[%d] btype=%d is_64bit=%d\n",
+                  param_idx, src1_irop.btype, irop_is_64bit(src1_irop));
           /* Collect IROperand if requested */
           if (args)
           {
@@ -220,9 +232,11 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, i
     }
   }
 
+  fprintf(stderr, "[CALLSITE] scan complete: found_count=%d argc=%d\n", found_count, argc);
   /* Verify all parameters were found */
   for (int i = 0; i < argc; ++i)
   {
+    fprintf(stderr, "[CALLSITE]   arg[%d]: found=%d\n", i, found[i]);
     if (!found[i])
     {
       tcc_error("compiler_error: missing FUNCPARAMVAL for call_id=%d arg=%d", call_id, i);

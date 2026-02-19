@@ -215,6 +215,9 @@ void tcc_ir_fill_registers_ir(TCCIRState *ir, IROperand *op)
   if (tcc_ir_vreg_is_valid(ir, vreg))
   {
     IRLiveInterval *interval = tcc_ir_vreg_live_interval(ir, vreg);
+    int32_t old_stackoff = 0;
+    if (op->btype != IROP_BTYPE_STRUCT && irop_get_tag(*op) == IROP_TAG_STACKOFF)
+      old_stackoff = op->u.imm32;
 
     /* Stack-passed parameters: if not allocated to a register, treat them as
      * residing in the incoming argument area (VT_PARAM) rather than forcing a
@@ -266,7 +269,16 @@ void tcc_ir_fill_registers_ir(TCCIRState *ir, IROperand *op)
     }
     else
     {
-      op->u.imm32 = interval->allocation.offset;
+      if ((old_is_local || old_is_llocal) && !old_is_param && interval->original_offset != 0 &&
+          irop_get_tag(*op) == IROP_TAG_STACKOFF)
+      {
+        int32_t delta = old_stackoff - interval->original_offset;
+        op->u.imm32 = interval->allocation.offset + delta;
+      }
+      else
+      {
+        op->u.imm32 = interval->allocation.offset;
+      }
     }
 
     /* Determine if we should preserve is_lval:
@@ -1061,6 +1073,24 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
   IRQuadCompact *cq;
   int drop_return_value = 0;
 
+#ifdef TCC_REGALLOC_DEBUG
+  int _dbg_trace_all = 0;
+  {
+    extern const char *funcname;
+    fprintf(stderr, "[RA-FUNC] %s (insts=%d)\n", funcname ? funcname : "?", ir->next_instruction_index);
+    /* Enable full instruction trace for the target function */
+    if (funcname && ir->next_instruction_index == 295)
+    {
+      const char *_target = "tcc_gen_machine_func_call_op";
+      const char *_fn = funcname;
+      int _match = 1;
+      while (*_target && *_fn) { if (*_target++ != *_fn++) { _match = 0; break; } }
+      if (_match && *_target == 0 && *_fn == 0) _dbg_trace_all = 1;
+    }
+  }
+#endif
+
+#ifdef TCC_REGALLOC_DEBUG
   /* Print vreg statistics for size optimization analysis */
   {
     int local_count = ir->next_local_variable;
@@ -1074,6 +1104,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
                   ? (local_count > temp_count ? local_count : temp_count)
                   : param_count);
   }
+#endif
 
   /* `&&label` stores label positions as IR indices BEFORE DCE/compaction.
    * Build a mapping for original indices, not just the compacted array indices.
@@ -1605,6 +1636,10 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
           IRLiveInterval *li = tcc_ir_get_live_interval(ir, dest_vr);
           if (li && li->allocation.r0 != REG_IRET)
           {
+#ifdef TCC_REGALLOC_DEBUG
+            fprintf(stderr, "[RA-PEEPHOLE] i=%d op=%d dest_vr=0x%x old_r0=%d -> R0 (RETURNVALUE next)\n",
+                    i, cq->op, dest_vr, li->allocation.r0);
+#endif
             li->allocation.r0 = REG_IRET;
             li->allocation.offset = 0;
             if (li->is_llong || li->is_double)
@@ -1621,6 +1656,60 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
       tcc_ir_fill_registers_ir(ir, &src2_ir);
     if (irop_get_tag(dest_ir) != IROP_TAG_NONE)
       tcc_ir_fill_registers_ir(ir, &dest_ir);
+
+#ifdef TCC_REGALLOC_DEBUG
+    /* Full instruction trace for target function */
+    if (_dbg_trace_all)
+    {
+      IROperand raw_s1 = tcc_ir_op_get_src1(ir, cq);
+      IROperand raw_s2 = tcc_ir_op_get_src2(ir, cq);
+      IROperand raw_d = tcc_ir_op_get_dest(ir, cq);
+      fprintf(stderr, "[RA-TRACE] i=%d op=%d s1_vr=0x%x s1_pr0=%d s2_vr=0x%x s2_pr0=%d d_vr=0x%x d_pr0=%d s1_tag=%d d_tag=%d\n",
+              i, cq->op, irop_get_vreg(raw_s1), src1_ir.pr0_reg,
+              irop_get_vreg(raw_s2), src2_ir.pr0_reg,
+              irop_get_vreg(raw_d), dest_ir.pr0_reg,
+              irop_get_tag(src1_ir), irop_get_tag(dest_ir));
+    }
+
+    /* Diagnostic: for LOAD instructions, log ALL source vreg details */
+    if (cq->op == TCCIR_OP_LOAD)
+    {
+      IROperand raw_src1 = tcc_ir_op_get_src1(ir, cq);
+      int raw_tag = irop_get_tag(raw_src1);
+      if (raw_tag == IROP_TAG_VREG || raw_tag == 2 /* IROP_TAG_VREG_LVAL */)
+      {
+        int src_vreg = irop_get_vreg(raw_src1);
+        if (src_vreg > 0)
+        {
+          IRLiveInterval *dbg_li = tcc_ir_get_live_interval(ir, src_vreg);
+          if (dbg_li)
+            fprintf(stderr, "[RA-LOAD] i=%d src_vreg=0x%x alloc.r0=%d pr0_reg=%d dest_pr0=%d tag=%d lval=%d local=%d spill=%d\n",
+                    i, src_vreg, dbg_li->allocation.r0, src1_ir.pr0_reg, dest_ir.pr0_reg,
+                    irop_get_tag(src1_ir), src1_ir.is_lval, src1_ir.is_local, src1_ir.pr0_spilled);
+        }
+      }
+    }
+    /* Also log AND/OR/ADD operations that might show the register mismatch */
+    if (cq->op == TCCIR_OP_AND || cq->op == TCCIR_OP_OR)
+    {
+      IROperand raw_dest = tcc_ir_op_get_dest(ir, cq);
+      IROperand raw_src1 = tcc_ir_op_get_src1(ir, cq);
+      fprintf(stderr, "[RA-ALU] i=%d op=%d src1_pr0=%d src2_pr0=%d dest_pr0=%d src1_tag=%d dest_tag=%d src1_vr=0x%x dest_vr=0x%x\n",
+              i, cq->op, src1_ir.pr0_reg, src2_ir.pr0_reg, dest_ir.pr0_reg,
+              irop_get_tag(src1_ir), irop_get_tag(dest_ir),
+              irop_get_vreg(raw_src1), irop_get_vreg(raw_dest));
+    }
+    /* Log ASSIGN operations */
+    if (cq->op == TCCIR_OP_ASSIGN)
+    {
+      IROperand raw_dest = tcc_ir_op_get_dest(ir, cq);
+      IROperand raw_src1 = tcc_ir_op_get_src1(ir, cq);
+      fprintf(stderr, "[RA-ASSIGN] i=%d src1_pr0=%d dest_pr0=%d src1_tag=%d dest_tag=%d src1_vr=0x%x dest_vr=0x%x\n",
+              i, src1_ir.pr0_reg, dest_ir.pr0_reg,
+              irop_get_tag(src1_ir), irop_get_tag(dest_ir),
+              irop_get_vreg(raw_src1), irop_get_vreg(raw_dest));
+    }
+#endif
 
     bool need_src1_value = false;
     bool need_src2_value = false;

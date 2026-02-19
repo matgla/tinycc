@@ -154,6 +154,9 @@ TEST_FILES = [
     # const char *const global pointer access (YAFF exported symbol section fix)
     ("bug_const_ptr_got_deref.c", 0),
 
+    # mul clobbers base register during struct array indexing (non-power-of-2 element size)
+    ("bug_struct_array_index_mul_clobber.c", 0),
+
     ("../tests2/00_assignment.c", 0),
     ("../tests2/01_comment.c", 0),
     ("../tests2/02_printf.c", 0),
@@ -263,6 +266,9 @@ TEST_FILES = [
     ("test_switch_simple.c", 0),
     ("test_switch_small.c", 0),  # Only 3 cases - won't trigger jump table
     ("test_switch_return.c", 0),  # Switch with direct return from each case (TBH backward targets)
+
+    # sret hidden pointer consuming r0 must advance ABI call_layout.next_reg
+    ("bug_sret_param_layout.c", 0),
 ]
 
 FLOAT_TEST_FILES = [
@@ -363,6 +369,8 @@ TCC_BUG_TEST_FILES = [
     ("bug_packed_sizes.c", 0),
     ("bug_stride10.c", 0),
     ("bug_bitfield_packed10.c", 0),
+
+
 ]
 
 TEST_FILES_WITH_ARGS = [
@@ -769,6 +777,14 @@ PIC_TEXT_DATA_SEP_TEST_FILES = [
     # in tcc_yaff_write_exported_symbols, so the dynamic loader resolved the
     # GOT entry to a garbage address (text_base + raw link-time VA).
     ("bug_const_ptr_got_deref.c", 0),
+
+    # Bug: Register allocator picks wrong source register for local copy after
+    # struct member load + AND mask under PIC text/data separation.  With R9
+    # caller-saved (stmdb/ldmia around every call), register pressure causes
+    # the copy of (call_site->registers_map & 0x0F) to pick the struct pointer
+    # register instead of the AND result.  push_mask ends up with bit 13 (SP)
+    # set → th_push returns {0,0}.
+    ("bug_struct_mask_copy.c", 0),
 ]
 
 

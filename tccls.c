@@ -25,7 +25,7 @@
 #include "tcc.h"
 
 /* Define TCC_LS_DEBUG to enable printing of linear scan state */
-/* #define TCC_LS_DEBUG */
+// #define TCC_LS_DEBUG
 
 #ifdef TCC_LS_DEBUG
 #include <stdio.h>
@@ -773,6 +773,11 @@ void tcc_ls_allocate_registers(LSLiveIntervalState *ls, int used_parameters_regi
       ls->intervals[i].stack_location =
           tcc_ls_next_stack_location_sized(tcc_ls_reg_type_stack_size(ls->intervals[i].reg_type));
       LS_DBG("  Address-taken variable -> spilled to stack at %d", (int)ls->intervals[i].stack_location);
+      /* Clear any precolored register hint: the variable lives on the stack,
+       * the register was never taken from registers_map, so we must not
+       * release it when this interval expires. */
+      ls->intervals[i].r0 = -1;
+      ls->intervals[i].r1 = -1;
       ls->active_set[ls->next_active_index++] = &ls->intervals[i];
       qsort(ls->active_set, ls->next_active_index, sizeof(LSLiveInterval *), sort_endpoints);
       continue;

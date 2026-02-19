@@ -239,6 +239,13 @@ typedef struct CodeGenDryRunState
 
 static CodeGenDryRunState dry_run_state;
 
+/* Known-good IR pointer for use during function call argument handling.
+ * Set by tcc_gen_machine_func_call_op before building/emitting arg moves.
+ * This avoids reading tcc_state->ir (which can be corrupted by GOT-relative
+ * access issues on RP2350) in deeply nested helpers like get_struct_base_addr
+ * and load_to_dest_ir that cannot easily receive ir as a parameter. */
+static TCCIRState *call_arg_ir = NULL;
+
 /* Separate literal pool for dry-run mode to avoid modifying the real pool.
  * This allows accurate code size tracking without affecting the real pass. */
 static ThumbLiteralPoolEntry *dry_run_literal_pool = NULL;
@@ -6678,6 +6685,27 @@ static void thumb_emit_arg_move(const ThumbArgMove *m)
 
   if (m->kind == THUMB_ARG_MOVE_LVAL)
   {
+    /* If the SYMREF was pre-resolved at build time, load directly from the
+     * symbol address without accessing the IR pool.  This avoids a crash
+     * when tcc_state->ir is corrupted between build and emit phases. */
+    if (m->sym && irop_get_tag(m->lval_op) == IROP_TAG_SYMREF && m->lval_op.is_lval)
+    {
+      int btype = irop_get_btype(m->lval_op);
+      int is_unsigned = m->lval_op.is_unsigned;
+      Sym *validated_sym = validate_sym_for_reloc(m->sym);
+      uint32_t exclude = (1u << m->dst_reg);
+      if (m->dst_reg_hi != 0 && m->dst_reg_hi != PREG_REG_NONE)
+        exclude |= (1u << m->dst_reg_hi);
+      ScratchRegAlloc base_alloc = get_scratch_reg_with_save(exclude);
+      tcc_machine_load_constant(base_alloc.reg, PREG_REG_NONE, 0, 0, validated_sym);
+      int addend = (int)m->imm;
+      int sign = (addend < 0);
+      int abs_offset = sign ? -addend : addend;
+      int r1 = (irop_is_64bit(m->lval_op) && m->dst_reg_hi != PREG_REG_NONE) ? m->dst_reg_hi : PREG_REG_NONE;
+      load_from_base_ir(m->dst_reg, r1, btype, is_unsigned, abs_offset, sign, base_alloc.reg);
+      restore_scratch_reg(&base_alloc);
+      return;
+    }
     /* Load value from memory (lvalue) */
     IROperand op = m->lval_op;
     /* Use dst_reg_hi for 64-bit types (double, long long) */
@@ -6893,7 +6921,7 @@ static int get_struct_base_addr(const IROperand *arg, int default_reg)
   }
   else if (tag == IROP_TAG_SYMREF)
   {
-    IRPoolSymref *symref = irop_get_symref_ex(tcc_state->ir, *arg);
+    IRPoolSymref *symref = irop_get_symref_ex(call_arg_ir ? call_arg_ir : tcc_state->ir, *arg);
     Sym *sym = symref ? symref->sym : NULL;
     int32_t addend = symref ? symref->addend : 0;
     load_immediate(base_addr_reg, (uint32_t)addend, sym, false);
@@ -6933,12 +6961,18 @@ static int build_reg_move_struct(ThumbArgMove *moves, int move_count, const IROp
 
 /* Build register move for a 64-bit argument */
 static int build_reg_move_64bit(ThumbArgMove *moves, int move_count, const IROperand *arg, int base_reg,
-                                ThumbGenCallSite *call_site)
+                                ThumbGenCallSite *call_site, TCCIRState *ir)
 {
   if (arg->is_lval)
   {
-    moves[move_count++] =
-        (ThumbArgMove){.kind = THUMB_ARG_MOVE_LVAL, .dst_reg = base_reg, .dst_reg_hi = base_reg + 1, .lval_op = *arg};
+    ThumbArgMove m = {.kind = THUMB_ARG_MOVE_LVAL, .dst_reg = base_reg, .dst_reg_hi = base_reg + 1, .lval_op = *arg};
+    if (irop_get_tag(*arg) == IROP_TAG_SYMREF && ir)
+    {
+      IRPoolSymref *symref = irop_get_symref_ex(ir, *arg);
+      m.sym = symref ? symref->sym : NULL;
+      m.imm = (uint32_t)(symref ? symref->addend : 0);
+    }
+    moves[move_count++] = m;
   }
   else if (arg->pr0_reg != PREG_REG_NONE && arg->pr1_reg != PREG_REG_NONE)
   {
@@ -6950,14 +6984,20 @@ static int build_reg_move_64bit(ThumbArgMove *moves, int move_count, const IROpe
   }
   else if (irop_is_immediate(*arg))
   {
-    const uint64_t imm64 = (uint64_t)irop_get_imm64_ex(tcc_state->ir, *arg);
+    const uint64_t imm64 = (uint64_t)irop_get_imm64_ex(ir, *arg);
     moves[move_count++] =
         (ThumbArgMove){.kind = THUMB_ARG_MOVE_IMM64, .dst_reg = base_reg, .dst_reg_hi = base_reg + 1, .imm64 = imm64};
   }
   else
   {
-    moves[move_count++] =
-        (ThumbArgMove){.kind = THUMB_ARG_MOVE_LVAL, .dst_reg = base_reg, .dst_reg_hi = base_reg + 1, .lval_op = *arg};
+    ThumbArgMove m = {.kind = THUMB_ARG_MOVE_LVAL, .dst_reg = base_reg, .dst_reg_hi = base_reg + 1, .lval_op = *arg};
+    if (irop_get_tag(*arg) == IROP_TAG_SYMREF && ir)
+    {
+      IRPoolSymref *symref = irop_get_symref_ex(ir, *arg);
+      m.sym = symref ? symref->sym : NULL;
+      m.imm = (uint32_t)(symref ? symref->addend : 0);
+    }
+    moves[move_count++] = m;
   }
 
   call_site->registers_map |= (1 << base_reg) | (1 << (base_reg + 1));
@@ -6966,11 +7006,20 @@ static int build_reg_move_64bit(ThumbArgMove *moves, int move_count, const IROpe
 
 /* Build register move for a 32-bit argument */
 static int build_reg_move_32bit(ThumbArgMove *moves, int move_count, const IROperand *arg, int base_reg,
-                                ThumbGenCallSite *call_site)
+                                ThumbGenCallSite *call_site, TCCIRState *ir)
 {
   if (arg->is_lval)
   {
-    moves[move_count++] = (ThumbArgMove){.kind = THUMB_ARG_MOVE_LVAL, .dst_reg = base_reg, .lval_op = *arg};
+    ThumbArgMove m = {.kind = THUMB_ARG_MOVE_LVAL, .dst_reg = base_reg, .lval_op = *arg};
+    /* Pre-resolve SYMREF using the known-good ir pointer to avoid pool
+     * access at emit time (tcc_state->ir can be corrupted on RP2350). */
+    if (irop_get_tag(*arg) == IROP_TAG_SYMREF && ir)
+    {
+      IRPoolSymref *symref = irop_get_symref_ex(ir, *arg);
+      m.sym = symref ? symref->sym : NULL;
+      m.imm = (uint32_t)(symref ? symref->addend : 0);
+    }
+    moves[move_count++] = m;
   }
   else if (arg->pr0_reg != PREG_REG_NONE && !arg->pr0_spilled)
   {
@@ -6979,7 +7028,7 @@ static int build_reg_move_32bit(ThumbArgMove *moves, int move_count, const IROpe
   }
   else if (irop_get_tag(*arg) == IROP_TAG_SYMREF)
   {
-    IRPoolSymref *symref = irop_get_symref_ex(tcc_state->ir, *arg);
+    IRPoolSymref *symref = ir ? irop_get_symref_ex(ir, *arg) : NULL;
     Sym *sym = symref ? symref->sym : NULL;
     int32_t addend = symref ? symref->addend : 0;
     moves[move_count++] =
@@ -6999,7 +7048,15 @@ static int build_reg_move_32bit(ThumbArgMove *moves, int move_count, const IROpe
   }
   else
   {
-    moves[move_count++] = (ThumbArgMove){.kind = THUMB_ARG_MOVE_LVAL, .dst_reg = base_reg, .lval_op = *arg};
+    ThumbArgMove m = {.kind = THUMB_ARG_MOVE_LVAL, .dst_reg = base_reg, .lval_op = *arg};
+    /* Pre-resolve SYMREF here too (fallthrough case). */
+    if (irop_get_tag(*arg) == IROP_TAG_SYMREF && ir)
+    {
+      IRPoolSymref *symref = irop_get_symref_ex(ir, *arg);
+      m.sym = symref ? symref->sym : NULL;
+      m.imm = (uint32_t)(symref ? symref->addend : 0);
+    }
+    moves[move_count++] = m;
   }
 
   call_site->registers_map |= (1 << base_reg);
@@ -7033,7 +7090,7 @@ static void place_stack_arg_struct(const IROperand *arg, const TCCAbiArgLoc *loc
 }
 
 /* Place a 64-bit argument on stack */
-static void place_stack_arg_64bit(const IROperand *arg, int stack_offset)
+static void place_stack_arg_64bit(const IROperand *arg, int stack_offset, TCCIRState *ir)
 {
   int lo_offset = stack_offset;
   int hi_offset = stack_offset + 4;
@@ -7052,7 +7109,7 @@ static void place_stack_arg_64bit(const IROperand *arg, int stack_offset)
   }
   else if (irop_is_immediate(*arg))
   {
-    uint64_t imm64 = (uint64_t)irop_get_imm64_ex(tcc_state->ir, *arg);
+    uint64_t imm64 = (uint64_t)irop_get_imm64_ex(ir, *arg);
     load_immediate(ARM_R12, (uint32_t)imm64, NULL, false);
     store_word_to_stack(ARM_R12, lo_offset);
     load_immediate(ARM_R12, (uint32_t)(imm64 >> 32), NULL, false);
@@ -7077,7 +7134,7 @@ static int compute_local_offset(const IROperand *arg)
 }
 
 /* Place a 32-bit argument on stack */
-static void place_stack_arg_32bit(const IROperand *arg, int stack_offset)
+static void place_stack_arg_32bit(const IROperand *arg, int stack_offset, CallGenContext *ctx)
 {
   if (arg->pr0_reg != PREG_REG_NONE && !arg->pr0_spilled)
   {
@@ -7095,7 +7152,7 @@ static void place_stack_arg_32bit(const IROperand *arg, int stack_offset)
   }
   else if (irop_get_tag(*arg) == IROP_TAG_SYMREF)
   {
-    IRPoolSymref *symref = irop_get_symref_ex(tcc_state->ir, *arg);
+    IRPoolSymref *symref = ctx ? irop_get_symref_ex(tcc_state->ir, *arg) : NULL;
     Sym *sym = symref ? symref->sym : NULL;
     int32_t addend = symref ? symref->addend : 0;
     load_immediate(ARM_R12, (uint32_t)addend, sym, false);
@@ -7183,11 +7240,11 @@ static int build_register_arg_moves(CallGenContext *ctx, ThumbArgMove *reg_moves
     {
       if (loc->reg_count < 2)
         tcc_error("compiler_error: 64-bit register argument has insufficient registers");
-      move_count = build_reg_move_64bit(reg_moves, move_count, arg, base_reg, ctx->call_site);
+      move_count = build_reg_move_64bit(reg_moves, move_count, arg, base_reg, ctx->call_site, tcc_state->ir);
     }
     else
     {
-      move_count = build_reg_move_32bit(reg_moves, move_count, arg, base_reg, ctx->call_site);
+      move_count = build_reg_move_32bit(reg_moves, move_count, arg, base_reg, ctx->call_site, tcc_state->ir);
     }
   }
 
@@ -7233,9 +7290,9 @@ static void place_stack_arguments(CallGenContext *ctx)
     if (bt == IROP_BTYPE_STRUCT)
       place_stack_arg_struct(arg, loc, stack_offset);
     else if (is_64bit)
-      place_stack_arg_64bit(arg, stack_offset);
+      place_stack_arg_64bit(arg, stack_offset, tcc_state->ir);
     else
-      place_stack_arg_32bit(arg, stack_offset);
+      place_stack_arg_32bit(arg, stack_offset, ctx);
   }
 }
 
