@@ -10,3 +10,6 @@
 [submodule "tests/benchmarks/mibench"]
 	path = tests/benchmarks/mibench
 	url = https://github.com/embecosm/mibench.git
+[submodule "tests/gcctestsuite/gcc-testsuite"]
+	path = tests/gcctestsuite/gcc-testsuite
+	url = https://github.com/gcc-mirror/gcc.git

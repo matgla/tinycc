@@ -521,7 +521,44 @@ distclean: clean
 	@rm -vf config.h config.mak config.texi
 	@rm -vf $(TCCDOCS)
 
-.PHONY: all cross fp-libs clean test test-aeabi-host test-legacy tar tags ETAGS doc distclean install uninstall FORCE
+# unified tests2 test suite
+test-tests2: cross test-venv
+	@echo "------------ tests2 test suite ------------"
+	@if [ "$(USE_VENV)" = "1" ]; then \
+		cd $(TOP)/tests && "$(VENV_PY)" run_tests.py --tests2 -v -n auto; \
+	else \
+		cd $(TOP)/tests && $(PYTEST) -v -m tests2 --tb=short -n auto tests/tests2/; \
+	fi
+
+# download GCC torture tests
+download-gcc-tests:
+	@echo "------------ downloading GCC torture tests ------------"
+	@bash $(TOP)/tests/gcctestsuite/download_gcc_tests.sh
+
+# run GCC torture compile tests
+test-gcc-torture-compile: cross test-venv download-gcc-tests
+	@echo "------------ GCC torture compile tests ------------"
+	@if [ "$(USE_VENV)" = "1" ]; then \
+		cd $(TOP)/tests && "$(VENV_PY)" run_tests.py --gcc --compile-only -v -n auto; \
+	else \
+		cd $(TOP)/tests && $(PYTEST) -v -m "gcc_torture and compile_only" --tb=short -n auto tests/gcctestsuite/; \
+	fi
+
+# run full test suite (IR + GCC torture)
+# Note: tests2 tests are included in IR tests via test_qemu.py
+test-full: cross test-aeabi-host test-asm test-venv test-prepare test-gcc-torture-compile
+	@echo "------------ full test suite complete ------------"
+
+# run GCC torture tests using unified runner (default)
+test-all: cross test-venv
+	@echo "------------ unified test runner (GCC torture) ------------"
+	@if [ "$(USE_VENV)" = "1" ]; then \
+		cd $(TOP)/tests && "$(VENV_PY)" run_tests.py -v -n auto; \
+	else \
+		cd $(TOP)/tests && $(PYTEST) -v --tb=short -n auto tests/gcctestsuite/; \
+	fi
+
+.PHONY: all cross fp-libs clean test test-aeabi-host test-legacy test-tests2 test-gcc-torture-compile test-full test-all download-gcc-tests tar tags ETAGS doc distclean install uninstall FORCE
 
 # Container image settings (auto-detect docker or podman)
 DOCKER_REGISTRY ?= ghcr.io

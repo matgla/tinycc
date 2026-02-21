@@ -29,6 +29,14 @@
 
 // #define DEBUG_IR_GEN
 
+/* Debug output for TCCGEN FUNCPARAMVAL processing - disabled by default
+ * Enable with: -DTCCGEN_DEBUG_ENABLED or #define TCCGEN_DEBUG_ENABLED */
+#ifdef TCCGEN_DEBUG_ENABLED
+#define TCCGEN_DEBUG(...) fprintf(stderr, __VA_ARGS__)
+#else
+#define TCCGEN_DEBUG(...) ((void)0)
+#endif
+
 /********************************************************/
 /* global variables */
 
@@ -2560,12 +2568,12 @@ static void gen_opl(int op)
       param_num.r = VT_CONST;
       /* Generate FUNCPARAMVAL for arg1 (param 0) */
       param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
-      fprintf(stderr, "[TCCGEN] FUNCPARAMVAL push: site=llong_helper call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
+      TCCGEN_DEBUG("[TCCGEN] FUNCPARAMVAL push: site=llong_helper call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
               call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)param_num.c.i), vtop[-1].r, vtop[-1].vr);
       tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &param_num, NULL);
       /* Generate FUNCPARAMVAL for arg2 (param 1) */
       param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 1);
-      fprintf(stderr, "[TCCGEN] FUNCPARAMVAL push: site=llong_helper call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
+      TCCGEN_DEBUG("[TCCGEN] FUNCPARAMVAL push: site=llong_helper call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
               call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)param_num.c.i), vtop[0].r, vtop[0].vr);
       tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[0], &param_num, NULL);
       /* Generate FUNCCALLVAL for the function call (returns long long) */
@@ -2808,12 +2816,12 @@ static void gen_opl(int op)
         /* Generate FUNCPARAMVAL for arg1 (param 0) */
         param_num.r = VT_CONST;
         param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
-        fprintf(stderr, "[TCCGEN] FUNCPARAMVAL push: site=aeabi_lcmp call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
+        TCCGEN_DEBUG("[TCCGEN] FUNCPARAMVAL push: site=aeabi_lcmp call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
                 call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)param_num.c.i), vtop[-1].r, vtop[-1].vr);
         tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &param_num, NULL);
         /* Generate FUNCPARAMVAL for arg2 (param 1) */
         param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 1);
-        fprintf(stderr, "[TCCGEN] FUNCPARAMVAL push: site=aeabi_lcmp call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
+        TCCGEN_DEBUG("[TCCGEN] FUNCPARAMVAL push: site=aeabi_lcmp call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
                 call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)param_num.c.i), vtop[0].r, vtop[0].vr);
         tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[0], &param_num, NULL);
         /* Generate FUNCCALLVAL for the function call (returns int: -1, 0, or 1) */
@@ -4573,15 +4581,15 @@ ST_FUNC void vstore(void)
         param_num.r = VT_CONST;
         /* memmove(dest, src, size) */
         param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
-        fprintf(stderr, "[TCCGEN] FUNCPARAMVAL push: site=memmove call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
+        TCCGEN_DEBUG("[TCCGEN] FUNCPARAMVAL push: site=memmove call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
                 call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)param_num.c.i), vtop[-3].r, vtop[-3].vr);
         tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-3], &param_num, NULL);
         param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 1);
-        fprintf(stderr, "[TCCGEN] FUNCPARAMVAL push: site=memmove call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
+        TCCGEN_DEBUG("[TCCGEN] FUNCPARAMVAL push: site=memmove call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
                 call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)param_num.c.i), vtop[-2].r, vtop[-2].vr);
         tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-2], &param_num, NULL);
         param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 2);
-        fprintf(stderr, "[TCCGEN] FUNCPARAMVAL push: site=memmove call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
+        TCCGEN_DEBUG("[TCCGEN] FUNCPARAMVAL push: site=memmove call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
                 call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)param_num.c.i), vtop[-1].r, vtop[-1].vr);
         tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &param_num, NULL);
 
@@ -7523,7 +7531,7 @@ tok_next:
               num.vr = -1;
               num.r = VT_CONST;
               num.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
-              fprintf(stderr,
+              TCCGEN_DEBUG(
                       "[TCCGEN] FUNCPARAMVAL push: site=sret_param0 call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
                       call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)num.c.i), vtop->r, vtop->vr);
               tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL);
@@ -7574,7 +7582,7 @@ tok_next:
             {
               num.r = VT_CONST;
               num.c.i = TCCIR_ENCODE_PARAM(call_id, nb_args);
-              fprintf(stderr,
+              TCCGEN_DEBUG(
                       "[TCCGEN] FUNCPARAMVAL push: site=forward_arg call_id=%d param_idx=%d nb_args=%d vtop_r=0x%x "
                       "vtop_vr=%d\n",
                       call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)num.c.i), nb_args, vtop->r, vtop->vr);
@@ -7616,7 +7624,7 @@ tok_next:
             num.vr = -1;
             num.r = VT_CONST;
             num.c.i = TCCIR_ENCODE_PARAM(call_id, nb_args - 1 - n);
-            fprintf(stderr,
+            TCCGEN_DEBUG(
                     "[TCCGEN] FUNCPARAMVAL push: site=reverse_arg call_id=%d param_idx=%d n=%d nb_args=%d vtop_r=0x%x "
                     "vtop_vr=%d\n",
                     call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)num.c.i), n, nb_args, vtop->r, vtop->vr);
@@ -8775,7 +8783,7 @@ static void try_call_scope_cleanup(Sym *stop)
     src1.vr = -1;
     src1.r = VT_CONST;
     src1.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
-    fprintf(stderr, "[TCCGEN] FUNCPARAMVAL push: site=scope_cleanup call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
+    TCCGEN_DEBUG("[TCCGEN] FUNCPARAMVAL push: site=scope_cleanup call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
             call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)src1.c.i), vtop->r, vtop->vr);
     tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &src1, NULL);
     SValue call_id_sv = tcc_ir_svalue_call_id_argc(call_id, 1);
@@ -9616,15 +9624,15 @@ static void init_putz(init_params *p, unsigned long c, int size)
      * Stack is: dest, c, n */
     src1.r = VT_CONST;
     src1.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
-    fprintf(stderr, "[TCCGEN] FUNCPARAMVAL push: site=init_putz call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
+    TCCGEN_DEBUG("[TCCGEN] FUNCPARAMVAL push: site=init_putz call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
             call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)src1.c.i), vtop[-2].r, vtop[-2].vr);
     tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-2], &src1, NULL);
     src1.c.i = TCCIR_ENCODE_PARAM(call_id, 2);
-    fprintf(stderr, "[TCCGEN] FUNCPARAMVAL push: site=init_putz call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
+    TCCGEN_DEBUG("[TCCGEN] FUNCPARAMVAL push: site=init_putz call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
             call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)src1.c.i), vtop[-1].r, vtop[-1].vr);
     tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &src1, NULL);
     src1.c.i = TCCIR_ENCODE_PARAM(call_id, 1);
-    fprintf(stderr, "[TCCGEN] FUNCPARAMVAL push: site=init_putz call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
+    TCCGEN_DEBUG("[TCCGEN] FUNCPARAMVAL push: site=init_putz call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
             call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)src1.c.i), vtop[0].r, vtop[0].vr);
     tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[0], &src1, NULL);
 

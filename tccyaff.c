@@ -24,6 +24,14 @@
 
 #include "tccyaff.h"
 
+/* Debug output for YAFF local relocations - disabled by default
+ * Enable with: -DYAFF_DEBUG_ENABLED or #define YAFF_DEBUG_ENABLED */
+#ifdef YAFF_DEBUG_ENABLED
+#define YAFF_DEBUG(...) fprintf(stderr, __VA_ARGS__)
+#else
+#define YAFF_DEBUG(...) ((void)0)
+#endif
+
 #define TCC_YAFF_MAX_SYMBOL_ENTRY_SIZE 255
 
 #define SHF_DYNSYM 0x40000000
@@ -161,21 +169,20 @@ static int tcc_yaff_write_local_relocations(TCCState *s1, FILE *f)
 
   if (!s1->got || !s1->got->reloc)
   {
-    fprintf(stderr, "[yaff-local-reloc] no GOT or no GOT relocs (got=%p, reloc=%p)\n", s1->got,
-            s1->got ? s1->got->reloc : NULL);
+    YAFF_DEBUG("[YAFF] no GOT or no GOT relocs (got=%p, reloc=%p)\n", s1->got, s1->got ? s1->got->reloc : NULL);
     return 0;
   }
 
-  fprintf(stderr, "[yaff-local-reloc] scanning .rel.got: got->sh_addr=0x%x, text=0x%x..0x%x, rodata=0x%x..0x%x\n",
-          (unsigned)s1->got->sh_addr, (unsigned)text_section->sh_addr,
-          (unsigned)(text_section->sh_addr + text_section->sh_size), (unsigned)rodata_section->sh_addr,
-          (unsigned)(rodata_section->sh_addr + rodata_section->sh_size));
+  YAFF_DEBUG("[YAFF] scanning .rel.got: got->sh_addr=0x%x, text=0x%x..0x%x, rodata=0x%x..0x%x\n",
+             (unsigned)s1->got->sh_addr, (unsigned)text_section->sh_addr,
+             (unsigned)(text_section->sh_addr + text_section->sh_size), (unsigned)rodata_section->sh_addr,
+             (unsigned)(rodata_section->sh_addr + rodata_section->sh_size));
 
   for_each_elem(s1->got->reloc, 0, rel, ElfW_Rel)
   {
     int rtype = ELFW(R_TYPE)(rel->r_info);
-    int rsym = ELFW(R_SYM)(rel->r_info);
-    fprintf(stderr, "[yaff-local-reloc]   rel: r_offset=0x%x, type=%d, sym=%d\n", (unsigned)rel->r_offset, rtype, rsym);
+    YAFF_DEBUG("[YAFF]   rel: r_offset=0x%x, type=%d, sym=%d\n", (unsigned)rel->r_offset, rtype,
+               ELFW(R_SYM)(rel->r_info));
 
     if (rtype != R_RELATIVE)
       continue;
@@ -185,7 +192,7 @@ static int tcc_yaff_write_local_relocations(TCCState *s1, FILE *f)
     /* Resolved address written by fill_local_got_entries() */
     uint32_t sym_value = read32le(s1->got->data + got_offset);
 
-    fprintf(stderr, "[yaff-local-reloc]   R_RELATIVE: got_offset=0x%x, sym_value=0x%x\n", got_offset, sym_value);
+    YAFF_DEBUG("[YAFF]   R_RELATIVE: got_offset=0x%x, sym_value=0x%x\n", got_offset, sym_value);
 
     /* Determine which section this address belongs to */
     int section;
@@ -207,13 +214,13 @@ static int tcc_yaff_write_local_relocations(TCCState *s1, FILE *f)
     }
     else
     {
-      fprintf(stderr, "[yaff-local-reloc]   WARNING: sym_value 0x%x doesn't fall in any known section!\n", sym_value);
+      YAFF_DEBUG("[YAFF]   WARNING: sym_value 0x%x doesn't fall in any known section!\n", sym_value);
       section = YAFF_SECTION_DATA;
       target_offset = sym_value;
     }
 
-    fprintf(stderr, "[yaff-local-reloc]   -> section=%s, index=%u, target_offset=0x%x\n",
-            section == YAFF_SECTION_CODE ? "CODE" : "DATA", got_offset / 8, target_offset);
+    YAFF_DEBUG("[YAFF]   -> section=%s, index=%u, target_offset=0x%x\n", section == YAFF_SECTION_CODE ? "CODE" : "DATA",
+               got_offset / 8, target_offset);
 
     YaffLocalRelocationEntry entry = {
         .section = section,
@@ -224,7 +231,7 @@ static int tcc_yaff_write_local_relocations(TCCState *s1, FILE *f)
     ++count;
   }
 
-  fprintf(stderr, "[yaff-local-reloc] total local relocations: %d\n", count);
+  YAFF_DEBUG("[YAFF] total local relocations: %d\n", count);
   return count;
 }
 
