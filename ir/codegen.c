@@ -1084,8 +1084,16 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
       const char *_target = "tcc_gen_machine_func_call_op";
       const char *_fn = funcname;
       int _match = 1;
-      while (*_target && *_fn) { if (*_target++ != *_fn++) { _match = 0; break; } }
-      if (_match && *_target == 0 && *_fn == 0) _dbg_trace_all = 1;
+      while (*_target && *_fn)
+      {
+        if (*_target++ != *_fn++)
+        {
+          _match = 0;
+          break;
+        }
+      }
+      if (_match && *_target == 0 && *_fn == 0)
+        _dbg_trace_all = 1;
     }
   }
 #endif
@@ -1192,6 +1200,14 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
    */
   int original_leaffunc = ir->leaffunc;
   uint32_t extra_prologue_regs = 0;
+
+  /* If this function has a static chain (nested function), reserve R10
+   * as callee-saved so the parent's static chain is preserved.
+   * R10 is the static chain register per architecture_config.static_chain_reg. */
+  if (ir->has_static_chain)
+  {
+    extra_prologue_regs |= (1 << architecture_config.static_chain_reg);
+  }
 
 #if 1 /* DRY_RUN_ENABLED */
   /* Initialize dry-run state and branch optimization */
@@ -1501,6 +1517,16 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
     case TCCIR_OP_FUNCCALLVOID:
     case TCCIR_OP_FUNCCALLVAL:
       tcc_gen_machine_func_call_op(src1_ir, src2_ir, dest_ir, 0, ir, i);
+      if (ir->has_static_chain)
+        tcc_gen_machine_restore_chain();
+      break;
+    case TCCIR_OP_SET_CHAIN:
+      /* Static chain setup: move FP to static chain register */
+      tcc_gen_machine_set_chain();
+      break;
+    case TCCIR_OP_INIT_CHAIN_SLOT:
+      /* Store parent FP into chain slot for nested function trampoline */
+      tcc_gen_machine_init_chain_slot(src1_ir);
       break;
     case TCCIR_OP_FUNCPARAMVAL:
     case TCCIR_OP_FUNCPARAMVOID:
@@ -1637,8 +1663,8 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
           if (li && li->allocation.r0 != REG_IRET)
           {
 #ifdef TCC_REGALLOC_DEBUG
-            fprintf(stderr, "[RA-PEEPHOLE] i=%d op=%d dest_vr=0x%x old_r0=%d -> R0 (RETURNVALUE next)\n",
-                    i, cq->op, dest_vr, li->allocation.r0);
+            fprintf(stderr, "[RA-PEEPHOLE] i=%d op=%d dest_vr=0x%x old_r0=%d -> R0 (RETURNVALUE next)\n", i, cq->op,
+                    dest_vr, li->allocation.r0);
 #endif
             li->allocation.r0 = REG_IRET;
             li->allocation.offset = 0;
@@ -1664,11 +1690,10 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
       IROperand raw_s1 = tcc_ir_op_get_src1(ir, cq);
       IROperand raw_s2 = tcc_ir_op_get_src2(ir, cq);
       IROperand raw_d = tcc_ir_op_get_dest(ir, cq);
-      fprintf(stderr, "[RA-TRACE] i=%d op=%d s1_vr=0x%x s1_pr0=%d s2_vr=0x%x s2_pr0=%d d_vr=0x%x d_pr0=%d s1_tag=%d d_tag=%d\n",
-              i, cq->op, irop_get_vreg(raw_s1), src1_ir.pr0_reg,
-              irop_get_vreg(raw_s2), src2_ir.pr0_reg,
-              irop_get_vreg(raw_d), dest_ir.pr0_reg,
-              irop_get_tag(src1_ir), irop_get_tag(dest_ir));
+      fprintf(stderr,
+              "[RA-TRACE] i=%d op=%d s1_vr=0x%x s1_pr0=%d s2_vr=0x%x s2_pr0=%d d_vr=0x%x d_pr0=%d s1_tag=%d d_tag=%d\n",
+              i, cq->op, irop_get_vreg(raw_s1), src1_ir.pr0_reg, irop_get_vreg(raw_s2), src2_ir.pr0_reg,
+              irop_get_vreg(raw_d), dest_ir.pr0_reg, irop_get_tag(src1_ir), irop_get_tag(dest_ir));
     }
 
     /* Diagnostic: for LOAD instructions, log ALL source vreg details */
@@ -1683,9 +1708,11 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
         {
           IRLiveInterval *dbg_li = tcc_ir_get_live_interval(ir, src_vreg);
           if (dbg_li)
-            fprintf(stderr, "[RA-LOAD] i=%d src_vreg=0x%x alloc.r0=%d pr0_reg=%d dest_pr0=%d tag=%d lval=%d local=%d spill=%d\n",
-                    i, src_vreg, dbg_li->allocation.r0, src1_ir.pr0_reg, dest_ir.pr0_reg,
-                    irop_get_tag(src1_ir), src1_ir.is_lval, src1_ir.is_local, src1_ir.pr0_spilled);
+            fprintf(
+                stderr,
+                "[RA-LOAD] i=%d src_vreg=0x%x alloc.r0=%d pr0_reg=%d dest_pr0=%d tag=%d lval=%d local=%d spill=%d\n", i,
+                src_vreg, dbg_li->allocation.r0, src1_ir.pr0_reg, dest_ir.pr0_reg, irop_get_tag(src1_ir),
+                src1_ir.is_lval, src1_ir.is_local, src1_ir.pr0_spilled);
         }
       }
     }
@@ -1694,20 +1721,20 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
     {
       IROperand raw_dest = tcc_ir_op_get_dest(ir, cq);
       IROperand raw_src1 = tcc_ir_op_get_src1(ir, cq);
-      fprintf(stderr, "[RA-ALU] i=%d op=%d src1_pr0=%d src2_pr0=%d dest_pr0=%d src1_tag=%d dest_tag=%d src1_vr=0x%x dest_vr=0x%x\n",
-              i, cq->op, src1_ir.pr0_reg, src2_ir.pr0_reg, dest_ir.pr0_reg,
-              irop_get_tag(src1_ir), irop_get_tag(dest_ir),
-              irop_get_vreg(raw_src1), irop_get_vreg(raw_dest));
+      fprintf(
+          stderr,
+          "[RA-ALU] i=%d op=%d src1_pr0=%d src2_pr0=%d dest_pr0=%d src1_tag=%d dest_tag=%d src1_vr=0x%x dest_vr=0x%x\n",
+          i, cq->op, src1_ir.pr0_reg, src2_ir.pr0_reg, dest_ir.pr0_reg, irop_get_tag(src1_ir), irop_get_tag(dest_ir),
+          irop_get_vreg(raw_src1), irop_get_vreg(raw_dest));
     }
     /* Log ASSIGN operations */
     if (cq->op == TCCIR_OP_ASSIGN)
     {
       IROperand raw_dest = tcc_ir_op_get_dest(ir, cq);
       IROperand raw_src1 = tcc_ir_op_get_src1(ir, cq);
-      fprintf(stderr, "[RA-ASSIGN] i=%d src1_pr0=%d dest_pr0=%d src1_tag=%d dest_tag=%d src1_vr=0x%x dest_vr=0x%x\n",
-              i, src1_ir.pr0_reg, dest_ir.pr0_reg,
-              irop_get_tag(src1_ir), irop_get_tag(dest_ir),
-              irop_get_vreg(raw_src1), irop_get_vreg(raw_dest));
+      fprintf(stderr, "[RA-ASSIGN] i=%d src1_pr0=%d dest_pr0=%d src1_tag=%d dest_tag=%d src1_vr=0x%x dest_vr=0x%x\n", i,
+              src1_ir.pr0_reg, dest_ir.pr0_reg, irop_get_tag(src1_ir), irop_get_tag(dest_ir), irop_get_vreg(raw_src1),
+              irop_get_vreg(raw_dest));
     }
 #endif
 
@@ -2136,10 +2163,22 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
       tcc_gen_machine_func_call_op(src1_ir, src2_ir, dest_ir, drop_return_value, ir, i);
       /* Clear spill cache after function call - callee may have modified memory */
       tcc_ir_spill_cache_clear(&ir->spill_cache);
+      /* Restore R10 after call: trampoline calls for nested functions clobber R10.
+       * Re-load from the chain save slot at [FP, #-4] to keep R10 correct. */
+      if (ir->has_static_chain)
+        tcc_gen_machine_restore_chain();
       break;
     }
     case TCCIR_OP_NOP:
       /* No operation - skip silently */
+      break;
+    case TCCIR_OP_SET_CHAIN:
+      /* Static chain setup: move FP to static chain register */
+      tcc_gen_machine_set_chain();
+      break;
+    case TCCIR_OP_INIT_CHAIN_SLOT:
+      /* Store parent FP into chain slot for nested function trampoline */
+      tcc_gen_machine_init_chain_slot(src1_ir);
       break;
     case TCCIR_OP_ASM_INPUT:
     case TCCIR_OP_ASM_OUTPUT:

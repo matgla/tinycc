@@ -54,6 +54,7 @@ typedef enum TccIrOp
   TCCIR_OP_CMP,
   TCCIR_OP_RETURNVOID,
   TCCIR_OP_RETURNVALUE,
+  TCCIR_OP_SET_CHAIN, /* Set static chain register before nested function call */
   TCCIR_OP_JUMP,
   TCCIR_OP_JUMPIF,
   /* Indirect jump (computed goto): target in src1 */
@@ -122,6 +123,10 @@ typedef enum TccIrOp
   TCCIR_OP_CALLARG_STACK,
   TCCIR_OP_CALLSEQ_END,
 
+  /* Store parent FP (R7) into chain slot for nested function trampoline.
+   * src1.c.i = ELF symbol index of the chain slot in .data */
+  TCCIR_OP_INIT_CHAIN_SLOT,
+
   /* No-operation placeholder for dead instructions */
   TCCIR_OP_NOP,
 
@@ -152,6 +157,8 @@ typedef enum TccIrOp
 
 typedef struct CType CType;
 typedef struct SValue SValue;
+typedef struct NestedFunc NestedFunc;
+typedef struct AttributeDef AttributeDef;
 
 #ifdef CONFIG_TCC_ASM
 typedef struct ASMOperand ASMOperand;
@@ -367,7 +374,19 @@ typedef struct TCCIRState
   uint8_t check_for_backwards_jumps : 1;
   uint8_t basic_block_start : 1;
   uint8_t prevent_coalescing;
+  uint8_t has_static_chain : 1;      /* function uses static chain for nested func */
+  uint8_t needs_chain_save : 1;      /* must save chain at FP-4 for multi-hop child access */
+  int32_t static_chain_vreg;         /* vreg holding static chain pointer (parent FP) */
+  int32_t captured_offsets_list[32]; /* offsets of captured vars (for chain-relative access) */
+  int32_t captured_chain_depths[32]; /* 1 = direct R10, 2+ = multi-hop */
+  int32_t captured_count;            /* number of captured variables */
   int32_t loc;
+  int32_t parent_loc;                 /* parent's loc value (for nested function offset validation) */
+
+  /* Nested function tracking (for parent functions that contain nested functions) */
+  NestedFunc **nested_funcs;          /* array of pointers to nested function descriptors */
+  int32_t nb_nested_funcs;            /* count of nested functions */
+  int32_t nested_funcs_capacity;      /* allocated capacity of nested_funcs array */
 
   /* Optimization module data - opaque pointer to keep IR arch-independent */
   TCCFPMatCache *opt_fp_mat_cache;
@@ -487,6 +506,8 @@ void tcc_ir_put_inline_asm(TCCIRState *ir, int inline_asm_id);
 int tcc_ir_get_vreg_temp(TCCIRState *ir);
 int tcc_ir_get_vreg_var(TCCIRState *ir);
 int tcc_ir_get_vreg_param(TCCIRState *ir);
+/* Allocate static chain vreg for nested functions (live-in at R10) */
+int tcc_ir_get_vreg_static_chain(TCCIRState *ir);
 
 void tcc_ir_set_float_type(TCCIRState *ir, int vreg, int is_float, int is_double);
 void tcc_ir_set_llong_type(TCCIRState *ir, int vreg);

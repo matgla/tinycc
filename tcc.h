@@ -439,7 +439,7 @@ struct SymAttr
 {
   unsigned short aligned : 5, /* alignment as log2+1 (0 == unspecified) */
       packed : 1, weak : 1, visibility : 2, dllexport : 1, nodecorate : 1, dllimport : 1, addrtaken : 1, nodebug : 1,
-      naked : 1, xxxx : 1; /* not used */
+      naked : 1, nested_func : 1; /* nested function flag */
 };
 
 /* function attributes or temporary attributes for parsing */
@@ -713,6 +713,31 @@ typedef struct InlineFunc
   Sym *sym;
   char filename[1];
 } InlineFunc;
+
+/* nested functions */
+#define MAX_CAPTURED_VARS 32
+
+typedef struct NestedFunc
+{
+  TokenString *func_str;                   /* saved token stream of function body */
+  Sym *sym;                                /* function symbol in parent's local scope */
+  CType type;                              /* full function type */
+  AttributeDef ad;                         /* function attributes */
+  int v;                                   /* token id (function name) */
+  char filename[256];                      /* source filename for error messages */
+  int captured_offsets[MAX_CAPTURED_VARS]; /* FP offsets of captured parent vars (resolved after regalloc) */
+  int captured_tokens[MAX_CAPTURED_VARS];  /* token IDs of captured parent vars */
+  int captured_vregs[MAX_CAPTURED_VARS];   /* vreg IDs of captured parent vars (for offset resolution) */
+  CType captured_types[MAX_CAPTURED_VARS]; /* full type of captured vars */
+  int captured_chain_depth[MAX_CAPTURED_VARS]; /* 1 = parent, 2 = grandparent, ... */
+  struct NestedFunc *parent_nf;              /* parent nested function (for multi-level nesting) */
+  int nb_captured;                         /* number of captured parent variables */
+  int needs_chain_save;                    /* 1 if a child func needs multi-hop chain (depth>1) */
+  int compiled;                         /* number of captured parent variables */
+  int trampoline_needed;                   /* address of this nested function was taken */
+  Sym *trampoline_tcc_sym;                 /* TCC symbol for trampoline code (.text) */
+  Sym *chain_slot_tcc_sym;                 /* TCC symbol for chain slot (.data) */
+} NestedFunc;
 
 /* include file cache, used to find files faster and also to eliminate
    inclusion if the include file is protected by #ifndef ... #endif */
@@ -1075,6 +1100,11 @@ struct TCCState
   CString linker_arg; /* collect -Wl options */
   int thumb_func;
   TCCIRState *ir;
+  /* Nested functions - saved token streams for functions defined inside other functions */
+  NestedFunc *nested_funcs;
+  int nb_nested_funcs;
+  int nested_funcs_capacity;
+  NestedFunc *current_nested_func; /* nested func currently being compiled */
   int rt_num_callers;
   int parameters_registers;
   int registers_for_allocator;
@@ -1891,6 +1921,7 @@ typedef struct ArchitectureConfig
   int8_t reg_size;
   int8_t parameter_registers;
   int8_t has_fpu : 1;
+  int8_t static_chain_reg; /* register used for static chain (e.g., R10 for ARM) */
   const FloatingPointConfig *fpu;
 } ArchitectureConfig;
 
@@ -2007,6 +2038,8 @@ ST_FUNC void tcc_debug_newfile(TCCState *s1);
 ST_FUNC void tcc_debug_line(TCCState *s1);
 ST_FUNC void tcc_debug_line_num(TCCState *s1, int line_num);
 ST_FUNC void tcc_add_debug_info(TCCState *s1, int param, Sym *s, Sym *e);
+ST_FUNC void tcc_debug_save_state(TCCState *s1, void **saved_info, void **saved_root);
+ST_FUNC void tcc_debug_restore_state(TCCState *s1, void *saved_info, void *saved_root);
 ST_FUNC void tcc_debug_funcstart(TCCState *s1, Sym *sym);
 ST_FUNC void tcc_debug_prolog_epilog(TCCState *s1, int value);
 ST_FUNC void tcc_debug_funcend(TCCState *s1, int size);
@@ -2081,6 +2114,9 @@ ST_FUNC void tcc_gen_machine_indirect_jump_op(IROperand src1);
 ST_FUNC void tcc_gen_machine_switch_table_op(IROperand src1, struct TCCIRSwitchTable *table, struct TCCIRState *ir,
                                              int ir_idx);
 ST_FUNC void tcc_gen_machine_setif_op(IROperand dest, IROperand src, TccIrOp op);
+ST_FUNC void tcc_gen_machine_set_chain(void);
+ST_FUNC void tcc_gen_machine_restore_chain(void);
+ST_FUNC void tcc_gen_machine_init_chain_slot(IROperand src1);
 ST_FUNC void tcc_gen_machine_bool_op(IROperand dest, IROperand src1, IROperand src2, TccIrOp op);
 ST_FUNC void tcc_gen_machine_backpatch_jump(int address, int offset);
 ST_FUNC void tcc_gen_machine_end_instruction(void);

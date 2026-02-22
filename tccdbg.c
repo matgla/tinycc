@@ -2820,6 +2820,28 @@ ST_FUNC void tcc_add_debug_info(TCCState *s1, int param, Sym *s, Sym *e)
   cstr_free(&debug_str);
 }
 
+/* Save debug state before compiling nested functions */
+ST_FUNC void tcc_debug_save_state(TCCState *s1, void **saved_info, void **saved_root)
+{
+  if (!s1->dState)
+  {
+    *saved_info = NULL;
+    *saved_root = NULL;
+    return;
+  }
+  *saved_info = (void *)debug_info;
+  *saved_root = (void *)debug_info_root;
+}
+
+/* Restore debug state after compiling nested functions */
+ST_FUNC void tcc_debug_restore_state(TCCState *s1, void *saved_info, void *saved_root)
+{
+  if (!s1->dState)
+    return;
+  debug_info = (struct _debug_info *)saved_info;
+  debug_info_root = (struct _debug_info *)saved_root;
+}
+
 /* put function symbol */
 ST_FUNC void tcc_debug_funcstart(TCCState *s1, Sym *sym)
 {

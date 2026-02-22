@@ -87,6 +87,16 @@ TCCIRState *tcc_ir_alloc(void)
   block->basic_block_start = 1;
   block->prevent_coalescing = 0;
 
+  /* Nested function / static chain fields */
+  block->has_static_chain = 0;
+  block->static_chain_vreg = 0;
+  block->parent_loc = 0;
+
+  /* Nested function tracking (for parent functions) */
+  block->nested_funcs = NULL;
+  block->nb_nested_funcs = 0;
+  block->nested_funcs_capacity = 0;
+
   tcc_ir_clear_live_intervals(block);
 
   /* Initialize IROperand pools (i64, f64, symref) */
@@ -231,6 +241,15 @@ void tcc_ir_free(TCCIRState *ir)
     ir->switch_tables = NULL;
     ir->num_switch_tables = 0;
     ir->switch_tables_capacity = 0;
+  }
+
+  /* Free nested_funcs array (note: NestedFunc structs themselves are owned by TCCState) */
+  if (ir->nested_funcs)
+  {
+    tcc_free(ir->nested_funcs);
+    ir->nested_funcs = NULL;
+    ir->nb_nested_funcs = 0;
+    ir->nested_funcs_capacity = 0;
   }
 
   tcc_free(ir);
@@ -1810,6 +1829,8 @@ const IRRegistersConfig irop_config[] = {
     [TCCIR_OP_CALLSEQ_BEGIN] = {0, 1, 1}, [TCCIR_OP_CALLARG_REG] = {0, 1, 1}, [TCCIR_OP_CALLARG_STACK] = {0, 1, 1},
     [TCCIR_OP_CALLSEQ_END] = {0, 1, 1},
 
+    /* Init chain slot: src1 carries the chain slot symbol (SYMREF), no vreg */
+    [TCCIR_OP_INIT_CHAIN_SLOT] = {0, 1, 0},
     /* No-operation */
     [TCCIR_OP_NOP] = {0, 0, 0},
     /* Jump table switch: src1=index vreg, src2=table_id, no dest */

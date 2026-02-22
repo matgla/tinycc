@@ -81,6 +81,14 @@ enum
   TREG_R1,
   TREG_R2,
   TREG_R3,
+  TREG_R4,
+  TREG_R5,
+  TREG_R6,
+  TREG_R7,
+  TREG_R8,
+  TREG_R9,
+  TREG_R10,
+  TREG_R11,
   TREG_R12,
   TREG_F0,
   TREG_F1,
@@ -100,6 +108,9 @@ enum
 #define REG_IRET TREG_R0 /* single word int return register */
 #define REG_IRE2 TREG_R1 /* second word return register (for long long) */
 #define REG_FRET TREG_F0 /* float return register */
+
+/* Static chain register for nested functions */
+#define REG_STATIC_CHAIN TREG_R10
 
 /* Pointer size, in bytes */
 #define PTR_SIZE 4

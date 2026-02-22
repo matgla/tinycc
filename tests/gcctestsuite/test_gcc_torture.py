@@ -21,7 +21,7 @@ from pathlib import Path
 from conftest import (
     GCCTestCase, GCC_TORTURE_PATH, OPT_LEVELS,
     discover_gcc_compile_tests, discover_gcc_execute_tests,
-    should_skip_gcc_test
+    should_skip_gcc_test, is_xfail_test
 )
 
 # Add ir_tests to path for qemu_run
@@ -89,6 +89,10 @@ def _generate_compile_params():
         skip_reason = should_skip_gcc_test(test_case.source)
         if skip_reason:
             test_case.skip_reason = skip_reason
+        
+        xfail_reason = is_xfail_test(test_case.source)
+        if xfail_reason:
+            test_case.xfail_reason = xfail_reason
             
         for opt in OPT_LEVELS:
             params.append((test_case, opt))
@@ -107,6 +111,9 @@ def test_gcc_compile(test_case: GCCTestCase, opt_level: str, tmp_path):
     """Compile GCC torture tests (compile directory)."""
     if test_case.skip_reason:
         pytest.skip(test_case.skip_reason)
+    
+    if test_case.xfail_reason:
+        pytest.xfail(test_case.xfail_reason)
     
     run_compile_test(test_case, opt_level, tmp_path)
 

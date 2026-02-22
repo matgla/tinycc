@@ -146,6 +146,35 @@ int tcc_ir_vreg_alloc_param(TCCIRState *ir)
   return TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_PARAM, next_param_vr);
 }
 
+/* Allocate a static chain virtual register for nested functions.
+ * This allocates a variable vreg (not a parameter) to model the static chain
+ * register (R10 on ARM). The chain vreg is used for liveness tracking and
+ * ensuring R10 is preserved, but it doesn't consume a parameter slot.
+ * 
+ * The static chain is passed in R10 by the parent function (via SET_CHAIN),
+ * and the nested function uses R10 directly when accessing captured variables.
+ * The chain vreg ensures R10 is treated as live-in and preserved if modified.
+ */
+int tcc_ir_vreg_alloc_static_chain(TCCIRState *ir)
+{
+  /* Allocate as a variable vreg (not parameter) to avoid shifting parameter indices */
+  int vreg = tcc_ir_vreg_alloc_var(ir);
+  
+  /* Set the incoming register to the static chain register (R10) */
+  IRLiveInterval *interval = tcc_ir_vreg_live_interval(ir, vreg);
+  if (interval)
+  {
+    /* R10 is the static chain register on ARM */
+    interval->incoming_reg0 = 10;  /* R10 */
+    interval->incoming_reg1 = -1;  /* Not a 64-bit value */
+    /* Mark as live from instruction 0 */
+    interval->start = 0;
+    /* End will be set to last instruction during liveness analysis */
+  }
+  
+  return vreg;
+}
+
 /* Initialize interval start fields */
 static void ir_vreg_intervals_init(IRLiveInterval *intervals, int count)
 {
@@ -395,6 +424,12 @@ int tcc_ir_get_vreg_var(TCCIRState *ir)
 int tcc_ir_get_vreg_param(TCCIRState *ir)
 {
   return tcc_ir_vreg_alloc_param(ir);
+}
+
+/* Allocate static chain vreg - legacy name */
+int tcc_ir_get_vreg_static_chain(TCCIRState *ir)
+{
+  return tcc_ir_vreg_alloc_static_chain(ir);
 }
 
 /* Mark vreg as address-taken - legacy name */

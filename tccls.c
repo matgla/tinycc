@@ -741,6 +741,15 @@ void tcc_ls_allocate_registers(LSLiveIntervalState *ls, int used_parameters_regi
   LS_DBG("Initial integer register map: 0x%llx", (unsigned long long)ls->registers_map);
   LS_DBG("Initial float register map: 0x%llx", (unsigned long long)ls->float_registers_map);
 
+  /* If this function has a static chain (nested function with captured variables),
+   * reserve R10 for the static chain pointer. */
+  if (tcc_state->ir && tcc_state->ir->has_static_chain)
+  {
+    int chain_reg = architecture_config.static_chain_reg;
+    ls->registers_map &= ~((uint64_t)1 << chain_reg);
+    LS_DBG("Reserved static chain register R%d", chain_reg);
+  }
+
   /* R11 is available for normal allocation, but reserved during call argument processing.
    * R12 (IP) is the standard inter-procedure scratch register. */
   /* Note: We used to reserve R0-R3 here, but with parameter pre-coloring, the

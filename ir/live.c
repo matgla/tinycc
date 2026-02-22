@@ -452,7 +452,21 @@ void tcc_ir_live_analysis(TCCIRState *ir)
     {
       start = interval->start;
       end = interval->end;
-      crosses_call = live_has_call_in_range_prefix(call_prefix, start, end, instruction_count);
+      
+      /* Check if this is the static chain vreg (for nested functions) */
+      int is_static_chain = (ir->has_static_chain && encoded_vreg == ir->static_chain_vreg);
+      
+      /* For static chain vreg, extend to end of function */
+      if (is_static_chain)
+      {
+        end = ir->next_instruction_index;
+        crosses_call = 1;  /* Chain vreg crosses all calls */
+      }
+      else
+      {
+        crosses_call = live_has_call_in_range_prefix(call_prefix, start, end, instruction_count);
+      }
+      
       addrtaken = interval->addrtaken;
       reg_type = tcc_ir_vreg_type_get(ir, encoded_vreg);
       if (end < ir->next_instruction_index && (ir->compact_instructions[end].op == TCCIR_OP_FUNCCALLVAL ||
@@ -460,8 +474,16 @@ void tcc_ir_live_analysis(TCCIRState *ir)
       {
         crosses_call = 1;
       }
+      
+      /* Precolor static chain vreg to R10 */
+      int precolored = -1;
+      if (is_static_chain)
+      {
+        precolored = 10;  /* R10 is the static chain register */
+      }
+      
       tcc_ls_add_live_interval(&ir->ls, encoded_vreg, start, end, crosses_call, addrtaken, reg_type,
-                               interval->is_lvalue, -1);
+                               interval->is_lvalue, precolored);
     }
   }
   for (int vreg = 0; vreg < ir->next_temporary_variable; ++vreg)

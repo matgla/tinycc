@@ -28,4 +28,5 @@ ArchitectureConfig architecture_config = {
     .reg_size = 4,
     .parameter_registers = 4,
     .has_fpu = 0,
+    .static_chain_reg = 10,
 };

@@ -212,6 +212,47 @@ typedef struct ScratchRegAlloc
 /* Forward declarations needed by multi-scratch helpers. */
 static ScratchRegAlloc get_scratch_reg_with_save(uint32_t exclude_regs);
 static void restore_scratch_reg(ScratchRegAlloc *alloc);
+static void load_from_base_ir(int r, int r1, int irop_btype, int is_unsigned, int fc, int sign, uint32_t base);
+
+/* Resolve the base register for a captured variable access.
+ * For depth 1, returns R10 directly.
+ * For depth > 1, emits LDR chain to follow ancestor frame pointers
+ * and returns a scratch register holding the target ancestor's FP.
+ * Caller must restore scratch via *out_scratch when done. */
+static int resolve_chain_base(TCCIRState *ir, int ci,
+                              uint32_t exclude_regs,
+                              ScratchRegAlloc *out_scratch,
+                              int *used_scratch)
+{
+  int depth = ir->captured_chain_depths[ci];
+  if (depth <= 1)
+  {
+    *used_scratch = 0;
+    return architecture_config.static_chain_reg;  /* R10 */
+  }
+
+  /* Multi-hop: follow chain through (depth - 1) intermediate frames.
+   * Each frame saves its incoming R10 at [FP - 4] (CHAIN_SLOT_OFFSET). */
+  *out_scratch = get_scratch_reg_with_save(exclude_regs);
+  *used_scratch = 1;
+
+  /* Start from R10 (points to immediate parent's FP) */
+  thumb_shift no_shift = {THUMB_SHIFT_NONE, 0, THUMB_SHIFT_IMMEDIATE};
+  ot_check(th_mov_reg(out_scratch->reg,
+                       architecture_config.static_chain_reg,
+                       FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                       no_shift, ENFORCE_ENCODING_NONE, false));
+
+  for (int hop = 1; hop < depth; hop++)
+  {
+    /* LDR temp, [temp, #-4]  — follow chain link */
+    load_from_base_ir(out_scratch->reg, PREG_REG_NONE,
+                      IROP_BTYPE_INT32, 0,
+                      4 /* abs */, 1 /* sign: negative */,
+                      out_scratch->reg);
+  }
+  return out_scratch->reg;
+}
 
 typedef struct ScratchRegAllocs
 {
@@ -2279,6 +2320,28 @@ static uint32_t th_store_resolve_base_ir(int src_reg, IROperand sv, int btype, i
     return base_reg;
   }
 
+  /* Check if this is a captured variable from parent (accessed via static chain).
+   * Captured variables have vreg == -1 (no vreg in nested function's IR)
+   * and their offset matches one in the captured_offsets_list. */
+  TCCIRState *ir = tcc_state->ir;
+  if (ir && ir->has_static_chain && ir->captured_count > 0 && irop_get_vreg(sv) < 0 && tag == IROP_TAG_STACKOFF)
+  {
+    int32_t stack_off = irop_get_stack_offset(sv);
+    for (int ci = 0; ci < ir->captured_count; ci++)
+    {
+      if (ir->captured_offsets_list[ci] == stack_off)
+      {
+        /* This is a captured variable - resolve chain base (handles multi-hop) */
+        uint32_t exclude_regs = (1u << src_reg);
+        int used_scratch = 0;
+        base_reg = resolve_chain_base(ir, ci, exclude_regs, base_alloc, &used_scratch);
+        if (used_scratch)
+          *has_base_alloc = 1;
+        break;
+      }
+    }
+  }
+
   /* Default: stack/local address (FP-based) for STACKOFF */
   return base_reg;
 }
@@ -3190,6 +3253,26 @@ void load_to_dest_ir(IROperand dest, IROperand src)
     int frame_offset = irop_get_stack_offset(src);
     int base_reg = tcc_state->need_frame_pointer ? R_FP : R_SP;
 
+    /* Check if this is a captured variable from parent (accessed via static chain).
+     * Captured variables use R10 (static chain register) as base instead of FP/SP. */
+    ScratchRegAlloc chain_scratch = {0};
+    int chain_used = 0;
+    {
+      TCCIRState *ir = tcc_state->ir;
+      if (ir && ir->has_static_chain && ir->captured_count > 0)
+      {
+        for (int ci = 0; ci < ir->captured_count; ci++)
+        {
+          if (ir->captured_offsets_list[ci] == frame_offset)
+          {
+            uint32_t exclude_regs = (1u << dest.pr0_reg);
+            base_reg = resolve_chain_base(ir, ci, exclude_regs, &chain_scratch, &chain_used);
+            break;
+          }
+        }
+      }
+    }
+
     /* Apply offset_to_args for stack-passed parameters */
     if (src.is_param && frame_offset >= 0)
     {
@@ -3227,6 +3310,8 @@ void load_to_dest_ir(IROperand dest, IROperand src)
       /* Address-of stack slot: compute FP/SP + offset */
       tcc_machine_addr_of_stack_slot(dest.pr0_reg, irop_get_stack_offset(src), src.is_param);
     }
+    if (chain_used)
+      restore_scratch_reg(&chain_scratch);
     return;
   }
 
@@ -4771,6 +4856,38 @@ void tcc_gen_machine_data_processing_op(IROperand src1, IROperand src2, IROperan
             loaded = 1;
           }
         }
+        /* Handle STACKOFF accumulator (e.g. captured variable via static chain) */
+        if (!loaded && irop_get_tag(accum) == IROP_TAG_STACKOFF && accum.is_lval)
+        {
+          int frame_offset = irop_get_stack_offset(accum);
+          int base_reg = tcc_state->need_frame_pointer ? R_FP : R_SP;
+          /* Check if this is a captured variable — use static chain register */
+          TCCIRState *ir = tcc_state->ir;
+          ScratchRegAlloc chain_scratch = {0};
+          int chain_used = 0;
+          if (ir && ir->has_static_chain && ir->captured_count > 0)
+          {
+            for (int ci = 0; ci < ir->captured_count; ci++)
+            {
+              if (ir->captured_offsets_list[ci] == frame_offset)
+              {
+                uint32_t exclude_regs = (1u << dest_reg);
+                base_reg = resolve_chain_base(ir, ci, exclude_regs, &chain_scratch, &chain_used);
+                break;
+              }
+            }
+          }
+          int sign = (frame_offset < 0);
+          int abs_offset = sign ? -frame_offset : frame_offset;
+          ScratchRegAlloc accum_scratch = get_scratch_reg_with_save((1u << dest_reg) | (chain_used ? (1u << chain_scratch.reg) : 0));
+          load_from_base_ir(accum_scratch.reg, PREG_REG_NONE, IROP_BTYPE_INT32, 0, abs_offset, sign, base_reg);
+          ot_check(th_add_reg((uint32_t)dest_reg, (uint32_t)dest_reg, (uint32_t)accum_scratch.reg,
+                              FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+          restore_scratch_reg(&accum_scratch);
+          if (chain_used)
+            restore_scratch_reg(&chain_scratch);
+          loaded = 1;
+        }
         if (!loaded)
           tcc_error("compiler_error: MLA accumulator has no register and no spill slot");
       }
@@ -5712,6 +5829,17 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
     }
   }
 
+  /* Add static chain register (R10) for nested functions.
+   * This ensures the parent's static chain is preserved across the call. */
+  if (extra_prologue_regs & (1u << ARM_R10))
+  {
+    if (!(registers_to_push & (1u << ARM_R10)))
+    {
+      registers_to_push |= (1u << ARM_R10);
+      registers_count++;
+    }
+  }
+
   /* Variadic functions need a stable FP for va_list setup. */
   if (func_var)
   {
@@ -5784,6 +5912,16 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
   if (stack_size > 0)
   {
     gadd_sp(-stack_size);
+  }
+
+  /* Save incoming static chain (R10) at fixed chain slot [FP - 4].
+   * This allows child nested functions to follow the chain to
+   * grandparent frames via multi-hop LDR sequences.
+   * Saved unconditionally for stability — avoids timing dependency
+   * on needs_chain_save which is discovered late during body parsing. */
+  if (ir && ir->has_static_chain)
+  {
+    tcc_gen_machine_store_to_stack(architecture_config.static_chain_reg, -4);
   }
 
   /* For variadic functions, save incoming r0-r3 in a fixed area at FP-16..FP-4
@@ -6279,6 +6417,10 @@ ST_FUNC void tcc_gen_machine_lea_op(IROperand dest, IROperand src, TccIrOp op)
   int dest_reg = dest.pr0_reg;
   // int src_v = src1->r & VT_VALMASK;
 
+  /* Multi-hop chain tracking for captured variables */
+  ScratchRegAlloc chain_scratch = {0};
+  int chain_used = 0;
+
   /* IR owns spills: LEA destination must already be materialized. */
   thumb_require_materialized_reg(ctx, "dest", dest_reg);
 
@@ -6286,8 +6428,7 @@ ST_FUNC void tcc_gen_machine_lea_op(IROperand dest, IROperand src, TccIrOp op)
   {
     /* Compute address of local: FP + offset */
     int base = R_FP;
-    if (tcc_state->need_frame_pointer == 0)
-      base = R_SP;
+    TCCIRState *ir = tcc_state->ir;
 
     /* For local variables (VAR vregs), use the original offset from c.i.
      * The register allocator may have assigned a different spill slot,
@@ -6297,6 +6438,26 @@ ST_FUNC void tcc_gen_machine_lea_op(IROperand dest, IROperand src, TccIrOp op)
     int offset;
     const int vreg_type = TCCIR_DECODE_VREG_TYPE(src.vr);
     int src_stack_offset = irop_get_stack_offset(src);
+
+    /* Check if this is a captured variable from parent (accessed via static chain).
+     * Captured variables have vreg == -1 (no vreg in nested function's IR)
+     * and their offset matches one in the captured_offsets_list. */
+    if (ir && ir->has_static_chain && ir->captured_count > 0 && irop_get_vreg(src) < 0)
+    {
+      for (int ci = 0; ci < ir->captured_count; ci++)
+      {
+        if (ir->captured_offsets_list[ci] == src_stack_offset)
+        {
+          /* This is a captured variable - resolve chain base (handles multi-hop) */
+          uint32_t exclude_regs = (1u << dest_reg);
+          base = resolve_chain_base(ir, ci, exclude_regs, &chain_scratch, &chain_used);
+          break;
+        }
+      }
+    }
+
+    if (tcc_state->need_frame_pointer == 0 && base == R_FP)
+      base = R_SP;
     if (vreg_type == TCCIR_VREG_TYPE_VAR && src_stack_offset != 0)
     {
       /* VAR vreg with non-zero c.i: use original variable offset */
@@ -6372,6 +6533,8 @@ ST_FUNC void tcc_gen_machine_lea_op(IROperand dest, IROperand src, TccIrOp op)
       tcc_error("compiler_error: LEA on unexpected operand type");
     }
   }
+  if (chain_used)
+    restore_scratch_reg(&chain_scratch);
 }
 
 // r0 - function
@@ -7546,6 +7709,54 @@ ST_FUNC void tcc_gen_machine_setif_op(IROperand dest, IROperand src, TccIrOp op)
   ot_check(th_mov_imm(dest.pr0_reg, 0, FLAGS_BEHAVIOUR_BLOCK, ENFORCE_ENCODING_NONE));
   ot_check(th_it(cond, 0x8)); /* IT <cond> (single instruction) */
   ot_check(th_mov_imm(dest.pr0_reg, 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+}
+
+/* Set static chain register: MOV R10, R7 (FP) */
+ST_FUNC void tcc_gen_machine_set_chain(void)
+{
+  int chain_reg = architecture_config.static_chain_reg;
+  thumb_shift no_shift = {THUMB_SHIFT_NONE, 0, THUMB_SHIFT_IMMEDIATE};
+  /* MOV chain_reg, R_FP (R7 on ARM Thumb) */
+  ot_check(th_mov_reg(chain_reg, R_FP, FLAGS_BEHAVIOUR_NOT_IMPORTANT, no_shift, ENFORCE_ENCODING_NONE, false));
+}
+
+/* Reload static chain register from the chain save slot at [FP - 4].
+ * Called after function calls in nested functions with has_static_chain,
+ * because trampoline calls can clobber R10. */
+ST_FUNC void tcc_gen_machine_restore_chain(void)
+{
+  int chain_reg = architecture_config.static_chain_reg;
+  /* LDR chain_reg, [FP, #-4] */
+  if (!load_word_from_base(chain_reg, R_FP, 4, 1))
+  {
+    /* Fallback for large offset (should not happen for -4) */
+    ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(4, 1, (1u << chain_reg) | (1u << R_FP));
+    int rr = rr_alloc.reg;
+    ot_check(th_ldr_reg(chain_reg, R_FP, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+    restore_scratch_reg(&rr_alloc);
+  }
+}
+
+/* Store parent FP (R7) into chain slot in .data for nested function trampoline.
+ * src1 carries the chain slot symbol via SYMREF so we can emit a relocation. */
+ST_FUNC void tcc_gen_machine_init_chain_slot(IROperand src1)
+{
+  /* Extract the chain slot Sym* from the IROperand */
+  Sym *chain_sym = irop_get_sym(src1);
+  if (!chain_sym)
+    tcc_error("internal error: INIT_CHAIN_SLOT without chain slot symbol");
+
+  /* Get a scratch register to hold the chain slot address */
+  ScratchRegAlloc scratch = get_scratch_reg_with_save(0);
+
+  /* Load chain slot address into scratch register via literal pool */
+  load_full_const(scratch.reg, PREG_NONE, 0, chain_sym);
+
+  /* STR R7, [scratch, #0] — store frame pointer into chain slot */
+  ot_check(th_str_imm(R_FP, scratch.reg, 0, 6, ENFORCE_ENCODING_NONE));
+
+  /* Restore scratch register */
+  restore_scratch_reg(&scratch);
 }
 
 ST_FUNC void tcc_gen_machine_bool_op(IROperand dest, IROperand src1, IROperand src2, TccIrOp op)

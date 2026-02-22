@@ -131,6 +131,27 @@ class SubprocessSUT:
         self.exitstatus = rc
         return rc
 
+    def close(self):
+        """Close the process and set exitstatus."""
+        if self._proc.poll() is None:
+            # Process still running, wait for it
+            try:
+                self._proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                # Force kill if not responding
+                self._proc.terminate()
+                try:
+                    self._proc.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    self._proc.kill()
+                    self._proc.wait()
+        # Set exitstatus from return code
+        rc = self._proc.returncode
+        self.exitstatus = rc if rc is not None else -1
+        # Close stdout pipe
+        if self._proc.stdout:
+            self._proc.stdout.close()
+
 
 @dataclass
 class ProfileConfig:

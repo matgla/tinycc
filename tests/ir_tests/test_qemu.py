@@ -269,6 +269,25 @@ TEST_FILES = [
 
     # sret hidden pointer consuming r0 must advance ABI call_layout.next_reg
     ("bug_sret_param_layout.c", 0),
+    ("nested_basic.c", 0),
+    ("nested_basic_args.c", 0),
+    ("nested_multiple.c", 0),
+    ("nested_capture_multiple.c", 0),
+    ("nested_capture_array.c", 0),
+    ("nested_capture_read.c", 0),
+    ("nested_capture_write.c", 0),
+    ("nested_direct_call_args.c", 0),
+    ("nested_struct_return.c", 0),
+    ("nested_shadowing.c", 0),
+    ("nested_funcptr.c", 0),
+    ("nested_funcptr_indirect.c", 0),
+    ("nested_funcptr_call_twice.c", 0),
+    ("nested_recursive_parent.c", 0),
+    ("nested_multi_level.c", 0),
+]
+
+# Nested function tests expected to fail (not yet implemented)
+NESTED_XFAIL_TEST_FILES = [
 ]
 
 FLOAT_TEST_FILES = [
@@ -613,6 +632,27 @@ def test_qemu_execution(test_file, expected_exit_code, timeout, opt_level, tmp_p
     _run_qemu_test(test_file, expected_exit_code, opt_level=opt_level, output_dir=tmp_path, timeout=timeout)
 
 
+# Nested function xfail tests (not yet implemented)
+def _generate_nested_xfail_params():
+    params = []
+    ids = []
+    for test_file, expected in NESTED_XFAIL_TEST_FILES:
+        for opt in OPT_LEVELS:
+            params.append((test_file, expected, opt))
+            ids.append(f"{_test_id(test_file)}{opt}")
+    return params, ids
+
+
+_NESTED_XFAIL_PARAMS, _NESTED_XFAIL_IDS = _generate_nested_xfail_params()
+
+
+@pytest.mark.parametrize("test_file,expected_exit_code,opt_level", _NESTED_XFAIL_PARAMS, ids=_NESTED_XFAIL_IDS)
+@pytest.mark.xfail(reason="Nested function feature not yet implemented")
+def test_nested_xfail(test_file, expected_exit_code, opt_level, tmp_path):
+    if test_file is None:
+        pytest.fail("test_file is None")
+
+    _run_qemu_test(test_file, expected_exit_code, opt_level=opt_level, output_dir=tmp_path)
 
 
 

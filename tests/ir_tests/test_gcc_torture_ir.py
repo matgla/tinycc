@@ -8,9 +8,9 @@ Tests are discovered from GCC_TORTURE_PATH/execute directory.
 Each test is expected to exit with code 0 for success.
 """
 
-import pexpect
 import pytest
 import sys
+import time
 from pathlib import Path
 
 from qemu_run import run_test, CompileConfig
@@ -23,7 +23,8 @@ if str(GCC_TESTS_DIR) not in sys.path:
 from conftest import (
     GCC_TORTURE_PATH, OPT_LEVELS,
     discover_gcc_execute_tests,
-    should_skip_gcc_test
+    should_skip_gcc_test,
+    is_xfail_test
 )
 
 MACHINE = "mps2-an505"
@@ -41,6 +42,10 @@ def _generate_execute_params():
         skip_reason = should_skip_gcc_test(test_case.source)
         if skip_reason:
             test_case.skip_reason = skip_reason
+        
+        xfail_reason = is_xfail_test(test_case.source)
+        if xfail_reason:
+            test_case.xfail_reason = xfail_reason
 
         for opt in OPT_LEVELS:
             params.append((test_case, opt))
@@ -64,6 +69,9 @@ def test_gcc_execute_ir(test_case, opt_level, tmp_path):
     """
     if test_case.skip_reason:
         pytest.skip(test_case.skip_reason)
+    
+    if test_case.xfail_reason:
+        pytest.xfail(test_case.xfail_reason)
 
     config = CompileConfig(
         extra_cflags=opt_level,
@@ -77,7 +85,12 @@ def test_gcc_execute_ir(test_case, opt_level, tmp_path):
 
     # Wait for program to complete and check exit status
     # GCC torture tests should exit cleanly (exit code 0)
-    sut.expect(pexpect.EOF, timeout=5)
+    # Poll until process exits (max 5 seconds)
+    start = time.monotonic()
+    while time.monotonic() - start < 5:
+        if sut._proc.poll() is not None:
+            break
+        time.sleep(0.01)
     sut.close()
 
     # Exit code 0 means success

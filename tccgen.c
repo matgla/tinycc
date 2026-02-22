@@ -215,6 +215,10 @@ ST_FUNC void gsym(int t)
   }
 }
 
+/* Forward declaration for nested function handling */
+static NestedFunc *find_nested_func_by_sym(Sym *sym);
+static void setup_nested_func_trampoline(Sym *s);
+
 /* Clear 'nocode_wanted' if current pc is a label */
 static int gind()
 {
@@ -1533,9 +1537,21 @@ static void sym_copy_ref(Sym *s, Sym **ps)
     Sym **sp = &s->type.ref;
     for (s = *sp, *sp = NULL; s; s = s->next)
     {
-      Sym *s2 = sym_copy(s, ps);
-      sp = &(*sp = s2)->next;
-      sym_copy_ref(s2, ps);
+      /* For struct types without local scope, don't copy - preserve type identity.
+       * This fixes nested function struct return type mismatches where the struct
+       * type would be copied, creating different ref pointers for the same type. */
+      if ((s->type.t & VT_BTYPE) == VT_STRUCT && !s->sym_scope)
+      {
+        /* Keep the original global struct type, don't copy */
+        *sp = s;
+        sp = &s->next;
+      }
+      else
+      {
+        Sym *s2 = sym_copy(s, ps);
+        sp = &(*sp = s2)->next;
+        sym_copy_ref(s2, ps);
+      }
     }
   }
 }
@@ -2569,12 +2585,12 @@ static void gen_opl(int op)
       /* Generate FUNCPARAMVAL for arg1 (param 0) */
       param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
       TCCGEN_DEBUG("[TCCGEN] FUNCPARAMVAL push: site=llong_helper call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
-              call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)param_num.c.i), vtop[-1].r, vtop[-1].vr);
+                   call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)param_num.c.i), vtop[-1].r, vtop[-1].vr);
       tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &param_num, NULL);
       /* Generate FUNCPARAMVAL for arg2 (param 1) */
       param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 1);
       TCCGEN_DEBUG("[TCCGEN] FUNCPARAMVAL push: site=llong_helper call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
-              call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)param_num.c.i), vtop[0].r, vtop[0].vr);
+                   call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)param_num.c.i), vtop[0].r, vtop[0].vr);
       tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[0], &param_num, NULL);
       /* Generate FUNCCALLVAL for the function call (returns long long) */
       svalue_init(&dest);
@@ -2817,12 +2833,12 @@ static void gen_opl(int op)
         param_num.r = VT_CONST;
         param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
         TCCGEN_DEBUG("[TCCGEN] FUNCPARAMVAL push: site=aeabi_lcmp call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
-                call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)param_num.c.i), vtop[-1].r, vtop[-1].vr);
+                     call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)param_num.c.i), vtop[-1].r, vtop[-1].vr);
         tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &param_num, NULL);
         /* Generate FUNCPARAMVAL for arg2 (param 1) */
         param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 1);
         TCCGEN_DEBUG("[TCCGEN] FUNCPARAMVAL push: site=aeabi_lcmp call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
-                call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)param_num.c.i), vtop[0].r, vtop[0].vr);
+                     call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)param_num.c.i), vtop[0].r, vtop[0].vr);
         tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[0], &param_num, NULL);
         /* Generate FUNCCALLVAL for the function call (returns int: -1, 0, or 1) */
         svalue_init(&dest);
@@ -4582,15 +4598,15 @@ ST_FUNC void vstore(void)
         /* memmove(dest, src, size) */
         param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
         TCCGEN_DEBUG("[TCCGEN] FUNCPARAMVAL push: site=memmove call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
-                call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)param_num.c.i), vtop[-3].r, vtop[-3].vr);
+                     call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)param_num.c.i), vtop[-3].r, vtop[-3].vr);
         tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-3], &param_num, NULL);
         param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 1);
         TCCGEN_DEBUG("[TCCGEN] FUNCPARAMVAL push: site=memmove call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
-                call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)param_num.c.i), vtop[-2].r, vtop[-2].vr);
+                     call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)param_num.c.i), vtop[-2].r, vtop[-2].vr);
         tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-2], &param_num, NULL);
         param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 2);
         TCCGEN_DEBUG("[TCCGEN] FUNCPARAMVAL push: site=memmove call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
-                call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)param_num.c.i), vtop[-1].r, vtop[-1].vr);
+                     call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)param_num.c.i), vtop[-1].r, vtop[-1].vr);
         tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &param_num, NULL);
 
         SValue call_id_sv = tcc_ir_svalue_call_id_argc(call_id, 3);
@@ -6947,6 +6963,13 @@ tok_next:
       vtop->sym->a.addrtaken = 1;
       /* Mark vreg as address-taken in IR so it gets spilled to stack */
       tcc_ir_set_addrtaken(tcc_state->ir, vtop->sym->vreg);
+
+      /* Check if this is a nested function - need trampoline for address-of.
+       * Note: setup_nested_func_trampoline replaces vtop->sym with the
+       * trampoline symbol, so after this call vtop->sym no longer points
+       * to the nested function symbol. */
+      if (vtop->sym->a.nested_func)
+        setup_nested_func_trampoline(vtop->sym);
     }
     mk_pointer(&vtop->type);
     gaddrof();
@@ -7347,6 +7370,31 @@ tok_next:
     s = sym_find(t);
     if (!s || IS_ASM_SYM(s))
     {
+      /* Check if this identifier is a captured variable from an enclosing function */
+      NestedFunc *nf = tcc_state->current_nested_func;
+      if (nf && nf->nb_captured > 0)
+      {
+        /* Search captured_offsets for matching token */
+        for (int i = 0; i < nf->nb_captured; i++)
+        {
+          if (nf->captured_tokens[i] == t)
+          {
+            /* Found a match - create a fake symbol for this captured variable.
+             * The offset is the parent's FP-relative offset (resolved after
+             * parent's register allocation). Access goes through R10 (static chain). */
+            s = sym_malloc();
+            memset(s, 0, sizeof(*s));
+            s->v = t;
+            s->type = nf->captured_types[i]; /* Use actual captured variable type */
+            s->r = VT_LOCAL | VT_LVAL;      /* LOCAL + LVAL so it works as both value and assignment target */
+            s->c = nf->captured_offsets[i]; /* Parent's FP offset */
+            s->vreg = -1;                   /* No vreg in nested function's IR — pure stack offset via chain */
+            s->sym_scope = 0;
+            goto found_captured_var;
+          }
+        }
+      }
+
       const char *name = get_tok_str(t, NULL);
       if (tok != '(')
         tcc_error("'%s' undeclared", name);
@@ -7355,6 +7403,7 @@ tok_next:
       tcc_warning_c(warn_implicit_function_declaration)("implicit declaration of function '%s'", name);
       s = external_global_sym(t, &func_old_type);
     }
+  found_captured_var:
 
     r = s->r;
     /* A symbol that has a register is a local register variable,
@@ -7375,6 +7424,15 @@ tok_next:
     vtop->sym = s;
     vtop->vr = s->vreg;
 
+    /* Array-to-pointer decay for captured variables (nested functions).
+     * Captured arrays have VT_ARRAY type and VT_LVAL set. They need to
+     * decay to pointers for subscript and pointer arithmetic to work. */
+    if ((vtop->type.t & VT_ARRAY) && (vtop->r & VT_LVAL))
+    {
+      gaddrof();
+      vtop->type.t &= ~VT_ARRAY;
+    }
+
     if (r & VT_SYM)
     {
       vtop->c.i = 0;
@@ -7391,6 +7449,12 @@ tok_next:
     {
       vtop->c.i = s->enum_val;
     }
+
+    /* Implicit function-to-pointer: if a nested function name is used in
+     * a non-call context (next token is NOT '('), it needs a trampoline. */
+    if (s->a.nested_func && tok != '(')
+      setup_nested_func_trampoline(s);
+
     break;
   }
 
@@ -7469,8 +7533,55 @@ tok_next:
         vtop->r &= ~VT_LVAL; /* no lvalue */
       }
       /* get return type */
+      /* Save function symbol before switching to type ref - needed for nested_func check */
+      Sym *call_func_sym = vtop->sym;
       s = vtop->type.ref;
       next();
+
+      /* If calling a nested function, emit SET_CHAIN to pass static chain (parent FP).
+       * Only emit when the caller is the callee's PARENT.  When the caller is
+       * itself a nested function (current_nested_func != NULL) and the callee is
+       * a sibling (defined in the same enclosing scope), R10 already holds the
+       * correct chain pointer from our own incoming chain — emitting SET_CHAIN
+       * would clobber it with R7 which may be an unrelated frame pointer. */
+      if (tcc_state->ir && call_func_sym && call_func_sym->a.nested_func)
+      {
+        int emit_set_chain = 1;
+        if (tcc_state->current_nested_func)
+        {
+          /* Caller is a nested function.  Determine if callee is our child
+           * (defined inside our body) or a sibling (defined in the same parent
+           * scope).  Only emit SET_CHAIN for child calls. */
+          NestedFunc *callee_nf = NULL;
+          for (int ni = 0; ni < tcc_state->nb_nested_funcs; ni++)
+          {
+            if (tcc_state->nested_funcs[ni].sym == call_func_sym)
+            {
+              callee_nf = &tcc_state->nested_funcs[ni];
+              break;
+            }
+          }
+          if (callee_nf && callee_nf->parent_nf != tcc_state->current_nested_func)
+          {
+            /* Sibling call: R10 already has the correct parent FP */
+            emit_set_chain = 0;
+          }
+        }
+        if (emit_set_chain)
+        {
+          /* Emit SET_CHAIN: R10 = FP (current frame pointer) */
+          SValue src, dest;
+          svalue_init(&src);
+          svalue_init(&dest);
+          src.type.t = VT_PTR;
+          src.r = 0;
+          src.vr = -1;
+          dest.type.t = VT_PTR;
+          dest.r = 0;
+          dest.vr = -1;
+          tcc_ir_put(tcc_state->ir, TCCIR_OP_SET_CHAIN, &src, NULL, &dest);
+        }
+      }
 
       /* Each IR-level call gets a unique call_id so FUNCPARAM* can be bound
        * without fragile nested-depth scanning.
@@ -7532,8 +7643,8 @@ tok_next:
               num.r = VT_CONST;
               num.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
               TCCGEN_DEBUG(
-                      "[TCCGEN] FUNCPARAMVAL push: site=sret_param0 call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
-                      call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)num.c.i), vtop->r, vtop->vr);
+                  "[TCCGEN] FUNCPARAMVAL push: site=sret_param0 call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
+                  call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)num.c.i), vtop->r, vtop->vr);
               tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL);
             }
             vtop--;
@@ -7583,9 +7694,9 @@ tok_next:
               num.r = VT_CONST;
               num.c.i = TCCIR_ENCODE_PARAM(call_id, nb_args);
               TCCGEN_DEBUG(
-                      "[TCCGEN] FUNCPARAMVAL push: site=forward_arg call_id=%d param_idx=%d nb_args=%d vtop_r=0x%x "
-                      "vtop_vr=%d\n",
-                      call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)num.c.i), nb_args, vtop->r, vtop->vr);
+                  "[TCCGEN] FUNCPARAMVAL push: site=forward_arg call_id=%d param_idx=%d nb_args=%d vtop_r=0x%x "
+                  "vtop_vr=%d\n",
+                  call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)num.c.i), nb_args, vtop->r, vtop->vr);
               tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL);
             }
             vtop--; /* consumed */
@@ -7625,9 +7736,9 @@ tok_next:
             num.r = VT_CONST;
             num.c.i = TCCIR_ENCODE_PARAM(call_id, nb_args - 1 - n);
             TCCGEN_DEBUG(
-                    "[TCCGEN] FUNCPARAMVAL push: site=reverse_arg call_id=%d param_idx=%d n=%d nb_args=%d vtop_r=0x%x "
-                    "vtop_vr=%d\n",
-                    call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)num.c.i), n, nb_args, vtop->r, vtop->vr);
+                "[TCCGEN] FUNCPARAMVAL push: site=reverse_arg call_id=%d param_idx=%d n=%d nb_args=%d vtop_r=0x%x "
+                "vtop_vr=%d\n",
+                call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)num.c.i), n, nb_args, vtop->r, vtop->vr);
             tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL);
           }
           vtop--; /* consumed */
@@ -8784,7 +8895,7 @@ static void try_call_scope_cleanup(Sym *stop)
     src1.r = VT_CONST;
     src1.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
     TCCGEN_DEBUG("[TCCGEN] FUNCPARAMVAL push: site=scope_cleanup call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
-            call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)src1.c.i), vtop->r, vtop->vr);
+                 call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)src1.c.i), vtop->r, vtop->vr);
     tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &src1, NULL);
     SValue call_id_sv = tcc_ir_svalue_call_id_argc(call_id, 1);
     tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[-1], &call_id_sv, NULL);
@@ -9624,16 +9735,16 @@ static void init_putz(init_params *p, unsigned long c, int size)
      * Stack is: dest, c, n */
     src1.r = VT_CONST;
     src1.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
-    TCCGEN_DEBUG("[TCCGEN] FUNCPARAMVAL push: site=init_putz call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
-            call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)src1.c.i), vtop[-2].r, vtop[-2].vr);
+    TCCGEN_DEBUG("[TCCGEN] FUNCPARAMVAL push: site=init_putz call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n", call_id,
+                 TCCIR_DECODE_PARAM_IDX((uint32_t)src1.c.i), vtop[-2].r, vtop[-2].vr);
     tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-2], &src1, NULL);
     src1.c.i = TCCIR_ENCODE_PARAM(call_id, 2);
-    TCCGEN_DEBUG("[TCCGEN] FUNCPARAMVAL push: site=init_putz call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
-            call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)src1.c.i), vtop[-1].r, vtop[-1].vr);
+    TCCGEN_DEBUG("[TCCGEN] FUNCPARAMVAL push: site=init_putz call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n", call_id,
+                 TCCIR_DECODE_PARAM_IDX((uint32_t)src1.c.i), vtop[-1].r, vtop[-1].vr);
     tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &src1, NULL);
     src1.c.i = TCCIR_ENCODE_PARAM(call_id, 1);
-    TCCGEN_DEBUG("[TCCGEN] FUNCPARAMVAL push: site=init_putz call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
-            call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)src1.c.i), vtop[0].r, vtop[0].vr);
+    TCCGEN_DEBUG("[TCCGEN] FUNCPARAMVAL push: site=init_putz call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n", call_id,
+                 TCCIR_DECODE_PARAM_IDX((uint32_t)src1.c.i), vtop[0].r, vtop[0].vr);
     tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[0], &src1, NULL);
 
     vpush_helper_func(TOK_memset);
@@ -10753,6 +10864,482 @@ static void func_vla_arg(Sym *sym)
       func_vla_arg_code(arg->type.ref);
 }
 
+/* Forward declaration for nested function compilation */
+static void gen_function(Sym *sym);
+
+/* Find NestedFunc by function symbol */
+static NestedFunc *find_nested_func_by_sym(Sym *sym)
+{
+  for (int i = 0; i < tcc_state->nb_nested_funcs; i++)
+  {
+    if (tcc_state->nested_funcs[i].sym == sym)
+      return &tcc_state->nested_funcs[i];
+  }
+  return NULL;
+}
+
+/* Set up trampoline for a nested function whose address is being taken.
+ * Creates chain slot and trampoline symbols if not yet created,
+ * emits INIT_CHAIN_SLOT IR to store parent FP into the chain slot,
+ * and replaces vtop->sym with the trampoline symbol. */
+static void setup_nested_func_trampoline(Sym *s)
+{
+  NestedFunc *nf = find_nested_func_by_sym(s);
+  if (!nf)
+    return;
+
+  nf->trampoline_needed = 1;
+
+  /* Get the nested function's ELF name for symbol naming */
+  const char *func_name = get_tok_str(nf->sym->asm_label ? nf->sym->asm_label : nf->sym->v, NULL);
+
+  /* Create chain slot TCC symbol + ELF symbol in .data (if not already created) */
+  if (!nf->chain_slot_tcc_sym)
+  {
+    Section *data_sec = data_section;
+    addr_t offset = section_add(data_sec, 4, 4);
+
+    char chain_name[256];
+    snprintf(chain_name, sizeof(chain_name), "__chain_%s", func_name);
+    int elf_idx =
+        put_elf_sym(symtab_section, offset, 4, ELFW(ST_INFO)(STB_LOCAL, STT_OBJECT), 0, data_sec->sh_num, chain_name);
+
+    /* Initialize to 0 */
+    memset(data_sec->data + offset, 0, 4);
+
+    /* Create a TCC Sym so greloc/load_full_const can work with it */
+    Sym *cs_sym = sym_malloc();
+    memset(cs_sym, 0, sizeof(*cs_sym));
+    cs_sym->v = anon_sym++;
+    cs_sym->type.t = VT_INT;
+    cs_sym->r = VT_CONST | VT_SYM;
+    cs_sym->c = elf_idx;
+    nf->chain_slot_tcc_sym = cs_sym;
+  }
+
+  /* Create trampoline TCC symbol + ELF symbol in .text (if not already created) */
+  if (!nf->trampoline_tcc_sym)
+  {
+    Section *text_sec = cur_text_section;
+    char tramp_name[256];
+    snprintf(tramp_name, sizeof(tramp_name), "__tramp_%s", func_name);
+
+    /* Placeholder: offset will be updated when trampoline code is emitted */
+    int elf_idx =
+        put_elf_sym(symtab_section, 0, 24, ELFW(ST_INFO)(STB_LOCAL, STT_FUNC), 0, text_sec->sh_num, tramp_name);
+
+    Sym *tr_sym = sym_malloc();
+    memset(tr_sym, 0, sizeof(*tr_sym));
+    tr_sym->v = anon_sym++;
+    tr_sym->type.t = VT_FUNC;
+    tr_sym->r = VT_CONST | VT_SYM;
+    tr_sym->c = elf_idx;
+    nf->trampoline_tcc_sym = tr_sym;
+  }
+
+  /* Emit INIT_CHAIN_SLOT IR: store parent FP to chain slot at runtime */
+  if (tcc_state->ir && !NOEVAL_WANTED)
+  {
+    SValue src, dest;
+    svalue_init(&src);
+    svalue_init(&dest);
+    /* src carries the chain slot symbol so the codegen can emit a
+     * LDR + STR sequence with the correct relocation */
+    src.type.t = VT_INT;
+    src.r = VT_CONST | VT_SYM;
+    src.sym = nf->chain_slot_tcc_sym;
+    src.c.i = 0;
+    src.vr = -1;
+    dest.type.t = VT_INT;
+    dest.r = 0;
+    dest.vr = -1;
+    tcc_ir_put(tcc_state->ir, TCCIR_OP_INIT_CHAIN_SLOT, &src, NULL, &dest);
+  }
+
+  /* Replace the function symbol with the trampoline symbol */
+  vtop->sym = nf->trampoline_tcc_sym;
+}
+
+/* Emit trampoline code for a nested function that needs it */
+static void emit_trampoline_for_nested_func(NestedFunc *nf)
+{
+  Section *text_sec = cur_text_section;
+
+  /* Trampoline is 20 bytes: 14 bytes code + 2 bytes NOP + 4+4 literal pool.
+   * Plus up to 3 bytes for alignment padding.
+   * We must ensure the section buffer can hold these bytes. The codegen
+   * sets data_offset = ind at the end, but we're before that point.
+   * Use section_prealloc to extend the buffer without moving data_offset. */
+  section_prealloc(text_sec, 24);
+
+  /* Align ind to 4-byte boundary for the trampoline */
+  while (ind & 3)
+  {
+    text_sec->data[ind++] = 0x00;
+  }
+
+  addr_t tramp_start = ind;
+
+  /* Trampoline layout (20 bytes total, no padding needed):
+   *   +0:  LDR  r10, [pc, #8]   ; r10 = chain_slot address (from +12)
+   *   +4:  LDR  r10, [r10, #0]  ; r10 = *chain_slot = parent FP value
+   *   +8:  LDR  pc, [pc, #4]    ; pc = function address (from +16), tail call
+   *   +12: .word chain_slot_addr ; address of chain slot in .data
+   *   +16: .word function_addr   ; address of nested function in .text
+   *
+   * PC-relative offset calculation (Thumb: PC reads as current + 4):
+   *   LDR at +0: PC=+4, offset=8  → loads from +12 (chain_slot)
+   *   LDR at +8: PC=+12, offset=4 → loads from +16 (function)
+   */
+
+  /* LDR R10, [PC, #8] - Thumb-2 encoding: F8DF A008 */
+  text_sec->data[ind++] = 0xDF;
+  text_sec->data[ind++] = 0xF8;
+  text_sec->data[ind++] = 0x08;
+  text_sec->data[ind++] = 0xA0;
+
+  /* LDR R10, [R10, #0] - Thumb-2 encoding: F8DA A000 */
+  text_sec->data[ind++] = 0xDA;
+  text_sec->data[ind++] = 0xF8;
+  text_sec->data[ind++] = 0x00;
+  text_sec->data[ind++] = 0xA0;
+
+  /* LDR PC, [PC, #4] - Thumb-2 encoding: F8DF F004 */
+  text_sec->data[ind++] = 0xDF;
+  text_sec->data[ind++] = 0xF8;
+  text_sec->data[ind++] = 0x04;
+  text_sec->data[ind++] = 0xF0;
+
+  /* Literal pool entry 1: chain slot address (+12) */
+  greloc(text_sec, nf->chain_slot_tcc_sym, ind, R_ARM_ABS32);
+  text_sec->data[ind++] = 0x00;
+  text_sec->data[ind++] = 0x00;
+  text_sec->data[ind++] = 0x00;
+  text_sec->data[ind++] = 0x00;
+
+  /* Literal pool entry 2: nested function address (+16) */
+  greloc(text_sec, nf->sym, ind, R_ARM_ABS32);
+  text_sec->data[ind++] = 0x00;
+  text_sec->data[ind++] = 0x00;
+  text_sec->data[ind++] = 0x00;
+  text_sec->data[ind++] = 0x00;
+
+  /* Update the ELF symbol for the trampoline to point to actual code location */
+  {
+    ElfSym *esym = elfsym(nf->trampoline_tcc_sym);
+    if (esym)
+    {
+      esym->st_value = tramp_start + 1; /* +1 for Thumb bit */
+      esym->st_size = ind - tramp_start;
+    }
+  }
+
+  /* Sync data_offset so the section knows about the trampoline bytes */
+  text_sec->data_offset = ind;
+}
+
+/* Emit all trampolines needed for nested functions in this parent */
+static void emit_all_trampolines(void)
+{
+  for (int i = 0; i < tcc_state->nb_nested_funcs; i++)
+  {
+    NestedFunc *nf = &tcc_state->nested_funcs[i];
+    if (nf->trampoline_needed)
+    {
+      emit_trampoline_for_nested_func(nf);
+    }
+  }
+}
+
+/* Saved state for parent function when compiling nested functions */
+typedef struct
+{
+  TCCIRState *ir;
+  int loc;
+  int ind;
+  int rsym;
+  int func_ind;
+  const char *funcname;
+  CType func_vt;
+  int func_var;
+  int cur_scope;
+  int root_scope;
+  int loop_scope;
+  Sym *local_stack;
+  Sym *local_label_stack;
+  Sym *global_label_stack;
+  unsigned nocode_wanted;
+  int local_scope_level;
+  int nb_temp_local_vars;
+  /* Use mangled names to avoid macro conflicts */
+  Section *sec_text;
+  struct switch_t *sec_switch;
+  /* Temp local vars array */
+  struct temp_local_variable tmp_vars[MAX_TEMP_LOCAL_VARIABLE_NUMBER];
+} ParentSavedState;
+
+/* Compile all nested functions defined inside a parent function */
+static void compile_nested_functions(Sym *parent_sym)
+{
+  int nb_nested;
+  ParentSavedState saved;
+
+  (void)parent_sym; /* currently unused */
+
+  nb_nested = tcc_state->nb_nested_funcs;
+  if (nb_nested == 0)
+    return;
+
+  /* Save debug state before nested function compilation */
+  void *saved_debug_info, *saved_debug_root;
+  tcc_debug_save_state(tcc_state, &saved_debug_info, &saved_debug_root);
+
+  /* Save ALL parent global state */
+  saved.ir = tcc_state->ir;
+  saved.loc = loc;
+  saved.ind = ind;
+  saved.rsym = rsym;
+  saved.func_ind = func_ind;
+  saved.funcname = funcname;
+  saved.func_vt = func_vt;
+  saved.func_var = func_var;
+  saved.cur_scope = (int)(intptr_t)cur_scope;
+  saved.root_scope = (int)(intptr_t)root_scope;
+  saved.loop_scope = (int)(intptr_t)loop_scope;
+  saved.local_stack = local_stack;
+  saved.local_label_stack = local_label_stack;
+  saved.global_label_stack = global_label_stack;
+  saved.nocode_wanted = nocode_wanted;
+  saved.local_scope_level = local_scope;
+  saved.nb_temp_local_vars = nb_temp_local_vars;
+  saved.sec_text = cur_text_section;
+  saved.sec_switch = cur_switch;
+  memcpy(saved.tmp_vars, arr_temp_local_vars, sizeof(arr_temp_local_vars));
+
+  /* Compile each nested function.
+   * Use a static index that persists across recursive calls.
+   * This ensures each function is compiled exactly once even when
+   * gen_function calls compile_nested_functions recursively. */
+  static int compile_idx = 0;
+  while (compile_idx < tcc_state->nb_nested_funcs)
+  {
+    NestedFunc *nf = &tcc_state->nested_funcs[compile_idx];
+    
+    /* Skip already-compiled functions (safety check) */
+    if (nf->compiled)
+    {
+      compile_idx++;
+      continue;
+    }
+
+    /* For nested function compilation, start with a fresh local_stack.
+     * Captured variable resolution is handled in the identifier lookup code
+     * (see tok_identifier in tccgen.c), which checks current_nested_func. */
+    local_stack = NULL; /* Start fresh - captured vars handled specially */
+    local_scope = 0;
+
+    /* Track current nested function for static chain setup */
+    tcc_state->current_nested_func = nf;
+
+    /* Replay saved token stream (same as inline function expansion) */
+    tccpp_putfile(nf->filename);
+    begin_macro(nf->func_str, 1);
+    next(); /* prime the first token - should be '{' */
+
+    /* Set up text section for nested function (same as regular functions) */
+    if (!cur_text_section)
+      cur_text_section = text_section;
+
+    /* Use the symbol that was already pushed during parsing */
+    /* The symbol was pushed with VT_CONST to mark it as a function */
+
+    /* Mark as compiled BEFORE gen_function to prevent recursive recompilation.
+     * gen_function may discover inner nested functions (e.g., level2 inside level1)
+     * and call compile_nested_functions recursively. If this function isn't marked,
+     * the recursive call would try to compile it again (compile_idx is static). */
+    nf->compiled = 1;
+
+    gen_function(nf->sym);
+
+    /* gen_function() resets cur_text_section=NULL and ind=0 for safety.
+     * Restore them so the next nested function starts at the right offset
+     * and compile_nested_functions can report the correct ind to the parent. */
+    cur_text_section = saved.sec_text;
+    ind = cur_text_section->data_offset;
+
+    /* Clear current nested function */
+    tcc_state->current_nested_func = NULL;
+
+    end_macro();
+
+    /* Continue to next nested function. If new ones were discovered during
+     * compilation, they'll have indices > compile_idx, and we'll get to them
+     * because compile_idx < nb_nested_funcs will still be true. */
+    compile_idx++;
+  }
+
+  /* Restore ALL parent state */
+  tcc_state->ir = saved.ir;
+  loc = saved.loc;
+  /* NOTE: do NOT restore ind - nested func code is in .text and
+     the parent's codegen will emit at the CURRENT ind (after nested funcs) */
+  rsym = saved.rsym;
+  func_ind = saved.func_ind;
+  funcname = saved.funcname;
+  func_vt = saved.func_vt;
+  func_var = saved.func_var;
+  cur_scope = (struct scope *)(intptr_t)saved.cur_scope;
+  root_scope = (struct scope *)(intptr_t)saved.root_scope;
+  loop_scope = (struct scope *)(intptr_t)saved.loop_scope;
+  local_stack = saved.local_stack;
+  local_label_stack = saved.local_label_stack;
+  global_label_stack = saved.global_label_stack;
+  nocode_wanted = saved.nocode_wanted;
+  local_scope = saved.local_scope_level;
+  nb_temp_local_vars = saved.nb_temp_local_vars;
+  cur_text_section = saved.sec_text;
+  cur_switch = saved.sec_switch;
+  memcpy(arr_temp_local_vars, saved.tmp_vars, sizeof(arr_temp_local_vars));
+
+  /* Restore debug state for parent function */
+  tcc_debug_restore_state(tcc_state, saved_debug_info, saved_debug_root);
+
+  /* Emit trampolines for nested functions whose address was taken.
+   * Must be done before clearing the nested funcs list. */
+  emit_all_trampolines();
+
+  /* Clear nested funcs list after compiling */
+  tcc_state->nb_nested_funcs = 0;
+}
+
+/* Track which nested function is currently being prescanned.
+ * This is needed for multi-level nesting to establish parent-child links. */
+static NestedFunc *prescan_current_nf = NULL;
+
+/* Pre-scan a nested function's token stream to identify captured parent variables.
+ * This is called during parsing of the parent function, before the parent's block
+ * generates IR, so that captured variables can be marked address-taken early.
+ * If explicit_parent_nf is non-NULL, it is used as the parent (for nested funcs
+ * discovered during gen_function). Otherwise, prescan_current_nf is used. */
+static void prescan_captured_vars(NestedFunc *nf, Sym *parent_local_stack, NestedFunc *explicit_parent_nf);
+
+/* Pre-scan a nested function's token stream to identify captured parent variables.
+ * This is called during parsing of the parent function, before the parent's block
+ * generates IR, so that captured variables can be marked address-taken early. */
+static void prescan_captured_vars(NestedFunc *nf, Sym *parent_local_stack, NestedFunc *explicit_parent_nf)
+{
+  /* If we're already inside a prescan (prescan_current_nf != NULL), this means
+   * we discovered a nested function during another nested function's prescan.
+   * Skip the prescan of this inner function - it will be handled later when
+   * the outer function is compiled and its tokens are replayed. */
+  if (prescan_current_nf != NULL)
+  {
+    /* Just set the parent link so we know the hierarchy */
+    nf->parent_nf = prescan_current_nf;
+    return;
+  }
+
+  /* Set parent_nf for multi-level nesting support.
+ * If explicit_parent_nf is provided, use it (for nested funcs discovered
+ * during gen_function). Otherwise, use prescan_current_nf (for nested funcs
+ * discovered during prescan). */
+  nf->parent_nf = explicit_parent_nf;
+
+  /* Save and set current */
+  NestedFunc *saved_current = prescan_current_nf;
+  prescan_current_nf = nf;
+  TokenString *tok_str = nf->func_str;
+  const int *tokens;
+  int pos;
+
+  if (!tok_str)
+    return;
+
+  tokens = tok_str_buf(tok_str);
+  pos = 0;
+
+  while (tokens[pos] != TOK_EOF && tokens[pos] != 0)
+  {
+    int t = tokens[pos];
+
+    if (t >= TOK_IDENT)
+    {
+      /* Look up this identifier in parent's local stack */
+      Sym *s = sym_find2(parent_local_stack, t);
+      if (s && ((s->r & VT_VALMASK) == VT_LOCAL || (s->r & VT_PARAM)))
+      {
+        /* Mark as address-taken to force stack allocation */
+        s->a.addrtaken = 1;
+        /* Also mark in IR so register allocator knows to spill to stack */
+        if (tcc_state->ir && s->vreg >= 0)
+          tcc_ir_set_addrtaken(tcc_state->ir, s->vreg);
+
+        /* Record the variable if we haven't already */
+        int i;
+        int already_captured = 0;
+        for (i = 0; i < nf->nb_captured; i++)
+        {
+          if (nf->captured_tokens[i] == t)
+          {
+            already_captured = 1;
+            break;
+          }
+        }
+        if (!already_captured && nf->nb_captured < MAX_CAPTURED_VARS)
+        {
+          nf->captured_vregs[nf->nb_captured] = s->vreg;
+          nf->captured_offsets[nf->nb_captured] = s->c;
+          nf->captured_tokens[nf->nb_captured] = t;
+          nf->captured_types[nf->nb_captured] = s->type;
+          nf->captured_chain_depth[nf->nb_captured] = 1;  /* direct parent */
+          nf->nb_captured++;
+        }
+      }
+      /* Not found in parent locals — search parent's own captured vars.
+       * level1 captured 'a' from main with depth 1, so level2 inherits
+       * it with depth 2. */
+      else if (nf->parent_nf)
+      {
+        NestedFunc *parent_nf = nf->parent_nf;
+        for (int j = 0; j < parent_nf->nb_captured; j++)
+        {
+          if (parent_nf->captured_tokens[j] == t)
+          {
+            /* Guard: check not already captured (e.g. token appears twice) */
+            int dup = 0;
+            for (int k = 0; k < nf->nb_captured; k++)
+              if (nf->captured_tokens[k] == t) { dup = 1; break; }
+            if (dup) break;
+
+            nf->captured_offsets[nf->nb_captured]     = parent_nf->captured_offsets[j];
+            nf->captured_tokens[nf->nb_captured]      = t;
+            nf->captured_types[nf->nb_captured]       = parent_nf->captured_types[j];
+            nf->captured_vregs[nf->nb_captured]       = parent_nf->captured_vregs[j];
+            nf->captured_chain_depth[nf->nb_captured] = parent_nf->captured_chain_depth[j] + 1;
+            /* Child needs multi-hop → parent must save chain at FP-4 */
+            if (nf->captured_chain_depth[nf->nb_captured] > 1)
+            {
+              parent_nf->needs_chain_save = 1;
+              /* Also update parent's IR if it's currently being compiled */
+              if (tcc_state->ir && tcc_state->ir->has_static_chain)
+                tcc_state->ir->needs_chain_save = 1;
+            }
+            nf->nb_captured++;
+            break;
+          }
+        }
+      }
+    }
+    /* Advance past token. Simple approach: just move forward by 1.
+     * A more complete implementation would handle multi-token sequences
+     * (e.g., numbers, strings), but this suffices for basic identifier matching. */
+    pos++;
+  }
+
+  /* Restore previous prescan current */
+  prescan_current_nf = saved_current;
+}
+
 /* parse a function defined by symbol 'sym' and generate its code in
    'cur_text_section' */
 static void gen_function(Sym *sym)
@@ -10802,12 +11389,42 @@ static void gen_function(Sym *sym)
   tcc_state->ir = ir;
   ir->naked = sym->a.naked;
 
+  /* Check if we're compiling a nested function with captured variables */
+  if (tcc_state->current_nested_func && tcc_state->current_nested_func->nb_captured > 0)
+  {
+    NestedFunc *nf = tcc_state->current_nested_func;
+    /* Set up static chain for nested function */
+    ir->has_static_chain = 1;
+    /* Store captured variable offsets for chain-relative addressing */
+    ir->captured_count = nf->nb_captured;
+    for (int j = 0; j < nf->nb_captured && j < 32; j++)
+    {
+      ir->captured_offsets_list[j] = nf->captured_offsets[j];
+      ir->captured_chain_depths[j] = nf->captured_chain_depth[j];
+    }
+    /* Allocate a vreg for the static chain pointer (models R10 as parameter) */
+    ir->static_chain_vreg = tcc_ir_get_vreg_static_chain(ir);
+    /* Propagate needs_chain_save from NestedFunc to IR */
+    ir->needs_chain_save = nf->needs_chain_save;
+  }
+
   /* Initialize FP offset cache for code generation optimization */
   if (tcc_state->opt_fp_offset_cache)
     tcc_ir_opt_fp_cache_init(ir);
 
   local_scope = 1; /* for function parameters */
   tcc_ir_params_add(ir, &sym->type);
+
+  /* Reserve chain save slot at FP-4 AFTER tcc_ir_params_add (which resets loc).
+   * This biases the global `loc` so that no local variable or spill slot
+   * occupies FP-4, which is used to save the incoming static chain (R10)
+   * for multi-level nested function access.
+   * We always reserve FP-4 when has_static_chain is set; the chain save
+   * instruction is only emitted during codegen if needs_chain_save is true.
+   * This is necessary because needs_chain_save may be discovered late (when
+   * inner nested functions are found during body parsing). */
+  if (ir->has_static_chain)
+    loc -= 4;
   nb_temp_local_vars = 0;
   if (!sym->a.naked)
   {
@@ -10991,8 +11608,11 @@ static void gen_function(Sym *sym)
       tcc_ir_opt_dce(ir); /* Clean up unused ops */
 
   /* Phase 4: Store-Load Forwarding - replace loads from recently stored addresses
-   * CONSERVATIVE: Only handles stack locals whose address is not taken */
-  if (tcc_state->opt_store_load_fwd && tcc_ir_opt_sl_forward(ir))
+   * CONSERVATIVE: Only handles stack locals whose address is not taken.
+   * DISABLED for nested functions with static chain: chain-relative captured
+   * variable offsets can numerically match FP-relative local variable offsets,
+   * causing the forwarding to confuse aliased values. */
+  if (tcc_state->opt_store_load_fwd && !ir->has_static_chain && tcc_ir_opt_sl_forward(ir))
     if (tcc_state->opt_dce)
       tcc_ir_opt_dce(ir); /* Clean up forwarded loads */
 
@@ -11055,6 +11675,7 @@ static void gen_function(Sym *sym)
   }
 
   nocode_wanted = 0;
+
   /* reset local stack */
   pop_local_syms(NULL, 0);
 
@@ -11103,6 +11724,36 @@ static void gen_function(Sym *sym)
   tcc_ir_patch_live_intervals_registers(ir);
   tcc_ir_register_allocation_params(ir);
   tcc_ir_build_stack_layout(ir);
+
+  /* Compile nested functions AFTER parent's register allocation.
+   * At this point, captured variables have their final stack locations
+   * assigned by the register allocator (since they're addrtaken, they're spilled).
+   * Nested function code is emitted into .text BEFORE the parent's code. */
+  if (tcc_state->nb_nested_funcs > 0)
+  {
+    /* Resolve captured variable offsets from parent's register allocation */
+    for (int i = 0; i < tcc_state->nb_nested_funcs; i++)
+    {
+      NestedFunc *nf = &tcc_state->nested_funcs[i];
+      for (int j = 0; j < nf->nb_captured; j++)
+      {
+        int vreg = nf->captured_vregs[j];
+        if (vreg >= 0)
+        {
+          /* Get the stack location assigned by register allocator */
+          IRLiveInterval *interval = tcc_ir_get_live_interval(ir, vreg);
+          if (interval && interval->allocation.offset != 0)
+            nf->captured_offsets[j] = interval->allocation.offset;
+        }
+      }
+    }
+    compile_nested_functions(sym);
+
+    /* Update parent's func_ind and ELF symbol to point after nested function code.
+     * ind is now past the nested functions' machine code (not restored). */
+    func_ind = ind;
+    put_extern_sym(sym, cur_text_section, ind + 1, 0);
+  }
 
   tcc_ir_codegen_generate(ir);
   if (!sym->a.naked)
@@ -11389,8 +12040,6 @@ static int decl(int l)
 #endif
       if (tok == '{')
       {
-        if (l != VT_CONST)
-          tcc_error("cannot use local functions");
         if ((type.t & VT_BTYPE) != VT_FUNC)
           expect("function definition");
 
@@ -11407,6 +12056,66 @@ static int decl(int l)
 
         /* apply post-declaraton attributes */
         merge_funcattr(&type.ref->f, &ad.f);
+
+        if (l == VT_LOCAL)
+        {
+          /* ── nested function definition ── */
+
+          /* Grow nested funcs array if needed */
+          if (tcc_state->nb_nested_funcs >= tcc_state->nested_funcs_capacity)
+          {
+            tcc_state->nested_funcs_capacity =
+                tcc_state->nested_funcs_capacity ? tcc_state->nested_funcs_capacity * 2 : 4;
+            tcc_state->nested_funcs =
+                tcc_realloc(tcc_state->nested_funcs, tcc_state->nested_funcs_capacity * sizeof(NestedFunc));
+          }
+
+          /* Get pointer to new nested func slot */
+          NestedFunc *nf = &tcc_state->nested_funcs[tcc_state->nb_nested_funcs];
+          memset(nf, 0, sizeof(*nf));
+
+          /* Store filename for later */
+          pstrncpy(nf->filename, file->filename, sizeof(nf->filename));
+
+          /* Push symbol into LOCAL scope so parent body can reference it */
+          /* Use external_sym to get proper type with valid parameter symbols */
+          type.t &= ~VT_EXTERN;
+          nf->sym = external_sym(v, &type, 0, &ad);
+          /* Mark as nested function for static chain handling.
+           * Note: This flag MUST be set on the symbol returned by external_sym
+           * because that's the symbol that sym_find will return when looking
+           * up the function name in the parent body. */
+          nf->sym->a.nested_func = 1;
+          /* Make nested function STB_LOCAL (not global) */
+          nf->sym->type.t |= VT_STATIC;
+          /* Name mangling: use GCC convention "funcname.N" */
+          {
+            char mangled[256];
+            snprintf(mangled, sizeof(mangled), "%s.%d", get_tok_str(v, NULL), tcc_state->nb_nested_funcs);
+            nf->sym->asm_label = tok_alloc(mangled, strlen(mangled))->tok;
+          }
+
+          /* Create placeholder address for the function */
+          put_extern_sym(nf->sym, cur_text_section, 0, 0);
+
+          /* Save the token stream (function body only, not parameters) */
+          skip_or_save_block(&nf->func_str);
+
+          /* Pre-scan to identify captured parent variables.
+           * If we're inside a nested function's gen_function, current_nested_func
+           * is the parent. Pass it explicitly for multi-level nesting. */
+          prescan_captured_vars(nf, local_stack, tcc_state->current_nested_func);
+
+          /* Increment count */
+          tcc_state->nb_nested_funcs++;
+
+          /* Continue parsing parent body - nested func saved */
+          break;
+        }
+        else if (l != VT_CONST)
+        {
+          tcc_error("cannot use local functions");
+        }
 
         /* put function symbol */
         type.t &= ~VT_EXTERN;
@@ -11444,6 +12153,8 @@ static int decl(int l)
           else if (cur_text_section->sh_num > bss_section->sh_num)
             cur_text_section->sh_flags = text_section->sh_flags;
           gen_function(sym);
+          /* Nested functions are now compiled inside gen_function,
+           * before pop_local_syms, so parent locals are still accessible. */
         }
         break;
       }

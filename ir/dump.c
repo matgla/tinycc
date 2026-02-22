@@ -140,6 +140,10 @@ const char *tcc_ir_get_op_name(TccIrOp op)
     return "CALLSEQ_END";
   case TCCIR_OP_NOP:
     return "NOP";
+  case TCCIR_OP_SET_CHAIN:
+    return "SET_CHAIN";
+  case TCCIR_OP_INIT_CHAIN_SLOT:
+    return "INIT_CHAIN_SLOT";
   case TCCIR_OP_MLA:
     return "MLA";
   case TCCIR_OP_SWITCH_TABLE:
@@ -581,14 +585,14 @@ static char vreg_type_prefix(int vreg)
 {
   switch (TCCIR_DECODE_VREG_TYPE(vreg))
   {
-    case TCCIR_VREG_TYPE_VAR:
-      return 'V';
-    case TCCIR_VREG_TYPE_TEMP:
-      return 'T';
-    case TCCIR_VREG_TYPE_PARAM:
-      return 'P';
-    default:
-      return '?';
+  case TCCIR_VREG_TYPE_VAR:
+    return 'V';
+  case TCCIR_VREG_TYPE_TEMP:
+    return 'T';
+  case TCCIR_VREG_TYPE_PARAM:
+    return 'P';
+  default:
+    return '?';
   }
 }
 
@@ -609,20 +613,26 @@ static int get_vreg_physical_reg(TCCIRState *ir, int32_t vreg, int *spilled, int
 {
   if (vreg == -1 || !ir)
   {
-    if (spilled) *spilled = 0;
-    if (offset) *offset = 0;
+    if (spilled)
+      *spilled = 0;
+    if (offset)
+      *offset = 0;
     return PREG_NONE;
   }
   IRLiveInterval *interval = tcc_ir_vreg_live_interval(ir, vreg);
   if (!interval)
   {
-    if (spilled) *spilled = 0;
-    if (offset) *offset = 0;
+    if (spilled)
+      *spilled = 0;
+    if (offset)
+      *offset = 0;
     return PREG_NONE;
   }
   int r0 = interval->allocation.r0;
-  if (spilled) *spilled = (r0 & PREG_SPILLED) != 0;
-  if (offset) *offset = interval->allocation.offset;
+  if (spilled)
+    *spilled = (r0 & PREG_SPILLED) != 0;
+  if (offset)
+    *offset = interval->allocation.offset;
   return r0 & PREG_REG_NONE;
 }
 
@@ -727,10 +737,10 @@ void print_iroperand_short(TCCIRState *ir, IROperand op)
     int spilled = 0;
     int offset = 0;
     int preg = PREG_NONE;
-    
+
     if (show_physical_regs && vreg != -1)
       preg = get_vreg_physical_reg(ir, vreg, &spilled, &offset);
-    
+
     if (!show_physical_regs || preg == PREG_NONE)
     {
       if (vreg != -1)
@@ -763,7 +773,7 @@ void print_iroperand_short(TCCIRState *ir, IROperand op)
     break;
   }
   }
-}/* Print SValue in short form (moved from tccir.c) */
+} /* Print SValue in short form (moved from tccir.c) */
 void print_svalue_short(SValue *sv)
 {
   int val_loc = sv->r & VT_VALMASK;
@@ -885,6 +895,9 @@ void tcc_print_quadruple_irop(TCCIRState *ir, IRQuadCompact *q, int pc)
   case TCCIR_OP_TEST_ZERO:
   case TCCIR_OP_CMP:
     printf("%s ", tcc_ir_get_op_name((TccIrOp)op));
+    break;
+  case TCCIR_OP_SET_CHAIN:
+    printf("%s /* R10 <- FP */ ", tcc_ir_get_op_name((TccIrOp)op));
     break;
   case TCCIR_OP_FUNCPARAMVAL:
     printf("%s%d[call_%d] ", tcc_ir_get_op_name((TccIrOp)op), TCCIR_DECODE_PARAM_IDX(irop_get_imm64_ex(ir, src2)),
