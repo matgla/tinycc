@@ -37,9 +37,11 @@ GCC_DIR = TESTS_DIR / "gcctestsuite"
 IR_DIR = TESTS_DIR / "ir_tests"
 
 
-def run_pytest(test_dir: Path, markers: str = None, args: list = None, env: dict = None) -> int:
+def run_pytest(test_dir: Path, markers: str = None, args: list = None, env: dict = None, verbose: bool = False) -> int:
     """Run pytest on a test directory."""
-    cmd = ["python", "-m", "pytest", str(test_dir), "-v"]
+    cmd = ["python", "-m", "pytest", str(test_dir)]
+    if verbose:
+        cmd.append("-v")
     
     if markers:
         cmd.extend(["-m", markers])
@@ -160,15 +162,30 @@ Examples:
         print("="*60)
         print("WARNING: Not all tests2 tests may be executable!")
         print("The ir_tests suite runs a curated subset of tests2.\n")
-        code = run_pytest(TESTS2_DIR, marker_expr, pytest_args)
+        code = run_pytest(TESTS2_DIR, marker_expr, pytest_args, verbose=args.verbose)
         exit_codes.append(code)
     
     if run_default or args.gcc:
+        # Compile tests from gcctestsuite
         print("\n" + "="*60)
-        print("Running GCC torture tests")
+        print("Running GCC torture compile tests")
         print("="*60)
-        code = run_pytest(GCC_DIR, marker_expr, pytest_args)
+        compile_markers = "gcc_torture and gcc_compile"
+        if markers:
+            compile_markers = f"({compile_markers}) and ({markers})"
+        code = run_pytest(GCC_DIR, compile_markers, pytest_args, verbose=args.verbose)
         exit_codes.append(code)
+        
+        # Execute tests from ir_tests (need newlib for linking)
+        if not args.compile_only:
+            print("\n" + "="*60)
+            print("Running GCC torture execute tests")
+            print("="*60)
+            execute_markers = "gcc_torture and gcc_execute"
+            if markers:
+                execute_markers = f"({execute_markers}) and ({markers})"
+            code = run_pytest(IR_DIR, execute_markers, pytest_args, verbose=args.verbose)
+            exit_codes.append(code)
     
     if run_default or args.ir:
         print("\n" + "="*60)
@@ -178,7 +195,7 @@ Examples:
         ir_args = pytest_args.copy()
         if args.numprocesses and "-n" not in ir_args:
             ir_args.extend(["-n", args.numprocesses])
-        code = run_pytest(IR_DIR, marker_expr, ir_args)
+        code = run_pytest(IR_DIR, marker_expr, ir_args, verbose=args.verbose)
         exit_codes.append(code)
     
     # Summary

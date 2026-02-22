@@ -62,7 +62,9 @@ def main():
     qemu_command = build_qemu_command(args.machine, file, args=args.args)
     if args.gdb:
         qemu_command += " -s -S"
-    subprocess.run(qemu_command, shell=True)
+    result = subprocess.run(qemu_command, shell=True)
+    print(f"Exit code: {result.returncode}", file=sys.stderr)
+    sys.exit(result.returncode)
 
 if __name__ == "__main__":
     main()

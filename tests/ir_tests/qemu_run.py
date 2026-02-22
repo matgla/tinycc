@@ -203,6 +203,7 @@ class CompileConfig:
     output_dir: Optional[Path] = None  # None = use default build dir
     output_prefix: str = ""  # Prefix to add to output filename (e.g. "O0_")
     output_suffix: str = ""  # Suffix to add to output filename (e.g. "_tag")
+    timeout: int = 60  # Timeout in seconds for compilation (0 = no timeout)
 
     def __post_init__(self):
         if self.compiler is None:
@@ -592,7 +593,7 @@ def compile_testcase(test_file, machine, compiler=None, cflags=None, config=None
 
     # Clean if needed
     if config.clean_before_build and not was_cleaned:
-        result = subprocess.run(make_command + ["clean"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        result = subprocess.run(make_command + ["clean"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
         if result.returncode != 0:
             raise RuntimeError(f"Clean failed with exit code {result.returncode}")
         was_cleaned = True
@@ -600,7 +601,19 @@ def compile_testcase(test_file, machine, compiler=None, cflags=None, config=None
     # Compile
     import time
     start = time.perf_counter()
-    result = subprocess.run(make_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        timeout_val = config.timeout if config.timeout > 0 else None
+        result = subprocess.run(make_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout_val)
+    except subprocess.TimeoutExpired:
+        elapsed = time.perf_counter() - start
+        return CompileResult(
+            success=False,
+            elf_file=get_test_output_file(test_file, output_dir, prefix=config.output_prefix, suffix=config.output_suffix),
+            output_lines=["Compilation timed out"],
+            compile_time_s=elapsed,
+            make_command=make_command,
+            error=f"Compilation timed out after {config.timeout} seconds"
+        )
     elapsed = time.perf_counter() - start
 
     elf_file = get_test_output_file(test_file, output_dir, prefix=config.output_prefix, suffix=config.output_suffix)

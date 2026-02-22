@@ -535,30 +535,59 @@ download-gcc-tests:
 	@echo "------------ downloading GCC torture tests ------------"
 	@bash $(TOP)/tests/gcctestsuite/download_gcc_tests.sh
 
-# run GCC torture compile tests
+# run GCC torture compile tests (using gcctestsuite - compile only)
 test-gcc-torture-compile: cross test-venv download-gcc-tests
 	@echo "------------ GCC torture compile tests ------------"
-	@if [ "$(USE_VENV)" = "1" ]; then \
-		cd $(TOP)/tests && "$(VENV_PY)" run_tests.py --gcc --compile-only -v -n auto; \
+	@if $(PYTEST) --help 2>/dev/null | grep -q timeout; then \
+		PYTEST_TIMEOUT="--timeout=60"; \
 	else \
-		cd $(TOP)/tests && $(PYTEST) -v -m "gcc_torture and compile_only" --tb=short -n auto tests/gcctestsuite/; \
+		PYTEST_TIMEOUT=""; \
+	fi; \
+	if [ "$(USE_VENV)" = "1" ]; then \
+		cd $(TOP)/tests && "$(VENV_PY)" run_tests.py --gcc --compile-only -n auto $$PYTEST_TIMEOUT; \
+	else \
+		cd $(TOP)/tests && $(PYTEST) -m "gcc_torture and gcc_compile" --tb=short -n auto $$PYTEST_TIMEOUT tests/gcctestsuite/; \
 	fi
 
-# run full test suite (IR + GCC torture)
+# run GCC torture execute tests only (via ir_tests framework)
+test-gcc-torture-execute: cross test-venv test-prepare download-gcc-tests
+	@echo "------------ GCC torture execute tests ------------"
+	@if $(PYTEST) --help 2>/dev/null | grep -q timeout; then \
+		PYTEST_TIMEOUT="--timeout=120"; \
+	else \
+		PYTEST_TIMEOUT=""; \
+	fi; \
+	if [ "$(USE_VENV)" = "1" ]; then \
+		cd $(IRTESTS_DIR) && "$(VENV_PY)" -m pytest -m "gcc_execute" --tb=short -n auto $$PYTEST_TIMEOUT test_gcc_torture_ir.py; \
+	else \
+		cd $(IRTESTS_DIR) && $(PYTEST) -m "gcc_execute" --tb=short -n auto $$PYTEST_TIMEOUT test_gcc_torture_ir.py; \
+	fi
+
+# run full GCC torture tests (compile + execute via ir_tests framework)
+test-gcc-torture: cross test-venv test-prepare download-gcc-tests
+	@echo "------------ GCC torture tests (compile + execute) ------------"
+	@if $(PYTEST) --help 2>/dev/null | grep -q timeout; then \
+		PYTEST_TIMEOUT="--timeout=120"; \
+	else \
+		PYTEST_TIMEOUT=""; \
+	fi; \
+	if [ "$(USE_VENV)" = "1" ]; then \
+		cd $(TOP)/tests && "$(VENV_PY)" run_tests.py --gcc -n auto $$PYTEST_TIMEOUT; \
+	else \
+		cd $(TOP)/tests && $(PYTEST) -m "gcc_torture and gcc_compile" --tb=short -n auto $$PYTEST_TIMEOUT tests/gcctestsuite/ && \
+		$(PYTEST) -m "gcc_torture and gcc_execute" --tb=short -n auto $$PYTEST_TIMEOUT $(IRTESTS_DIR)/test_gcc_torture_ir.py; \
+	fi
+
+# run full test suite (IR + GCC torture compile-only)
 # Note: tests2 tests are included in IR tests via test_qemu.py
 test-full: cross test-aeabi-host test-asm test-venv test-prepare test-gcc-torture-compile
 	@echo "------------ full test suite complete ------------"
 
-# run GCC torture tests using unified runner (default)
-test-all: cross test-venv
-	@echo "------------ unified test runner (GCC torture) ------------"
-	@if [ "$(USE_VENV)" = "1" ]; then \
-		cd $(TOP)/tests && "$(VENV_PY)" run_tests.py -v -n auto; \
-	else \
-		cd $(TOP)/tests && $(PYTEST) -v --tb=short -n auto tests/gcctestsuite/; \
-	fi
+# run all tests including full GCC torture (IR + GCC torture compile + execute)
+test-all: cross test-aeabi-host test-asm test-venv test-prepare test-gcc-torture
+	@echo "------------ unified test runner (IR + full GCC torture) ------------"
 
-.PHONY: all cross fp-libs clean test test-aeabi-host test-legacy test-tests2 test-gcc-torture-compile test-full test-all download-gcc-tests tar tags ETAGS doc distclean install uninstall FORCE
+.PHONY: all cross fp-libs clean test test-aeabi-host test-legacy test-tests2 test-gcc-torture test-gcc-torture-compile test-gcc-torture-execute test-full test-all download-gcc-tests tar tags ETAGS doc distclean install uninstall FORCE
 
 # Container image settings (auto-detect docker or podman)
 DOCKER_REGISTRY ?= ghcr.io

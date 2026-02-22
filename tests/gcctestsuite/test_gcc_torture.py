@@ -47,7 +47,8 @@ def run_compile_test(test_case: GCCTestCase, opt_level: str, tmp_path: Path) -> 
         config = CompileConfig(
             extra_cflags=opt_level,
             output_dir=tmp_path,
-            clean_before_build=False
+            clean_before_build=False,
+            timeout=test_case.timeout
         )
         result = compile_testcase([test_case.source], "mps2-an505", config=config)
         assert result.success, f"Compilation failed:\n{result.error}"
@@ -145,27 +146,6 @@ def _generate_execute_params():
 _GCC_EXECUTE_PARAMS, _GCC_EXECUTE_IDS = _generate_execute_params() if GCC_EXECUTE_TESTS else ([], [])
 
 
-@pytest.mark.gcc_torture
-@pytest.mark.gcc_execute
-@pytest.mark.slow
-@pytest.mark.skipif(not GCC_TORTURE_PATH.exists(), reason="GCC torture tests not found")
-@pytest.mark.parametrize("test_case,opt_level", _GCC_EXECUTE_PARAMS, ids=_GCC_EXECUTE_IDS)
-def test_gcc_execute(test_case: GCCTestCase, opt_level: str, tmp_path):
-    """Run GCC torture execute tests.
-    
-    Note: Currently compile-only. Full execution requires expected output handling.
-    """
-    if test_case.skip_reason:
-        pytest.skip(test_case.skip_reason)
-    
-    run_execute_test(test_case, opt_level, tmp_path)
-
-
-# Placeholder when tests not available
-if not GCC_EXECUTE_TESTS:
-    @pytest.mark.gcc_torture
-    @pytest.mark.gcc_execute
-    @pytest.mark.skip(reason="GCC execute tests not available - run 'make download-gcc-tests'")
-    def test_gcc_execute__no_tests():
-        """Placeholder when GCC tests are not available."""
-        pass
+# Note: GCC execute tests are now run via ir_tests/test_gcc_torture_ir.py
+# which uses the QEMU framework for proper linking and execution.
+# This module only handles compile tests.
