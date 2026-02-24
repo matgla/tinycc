@@ -719,24 +719,24 @@ typedef struct InlineFunc
 
 typedef struct NestedFunc
 {
-  TokenString *func_str;                   /* saved token stream of function body */
-  Sym *sym;                                /* function symbol in parent's local scope */
-  CType type;                              /* full function type */
-  AttributeDef ad;                         /* function attributes */
-  int v;                                   /* token id (function name) */
-  char filename[256];                      /* source filename for error messages */
-  int captured_offsets[MAX_CAPTURED_VARS]; /* FP offsets of captured parent vars (resolved after regalloc) */
-  int captured_tokens[MAX_CAPTURED_VARS];  /* token IDs of captured parent vars */
-  int captured_vregs[MAX_CAPTURED_VARS];   /* vreg IDs of captured parent vars (for offset resolution) */
-  CType captured_types[MAX_CAPTURED_VARS]; /* full type of captured vars */
+  TokenString *func_str;                       /* saved token stream of function body */
+  Sym *sym;                                    /* function symbol in parent's local scope */
+  CType type;                                  /* full function type */
+  AttributeDef ad;                             /* function attributes */
+  int v;                                       /* token id (function name) */
+  char filename[256];                          /* source filename for error messages */
+  int captured_offsets[MAX_CAPTURED_VARS];     /* FP offsets of captured parent vars (resolved after regalloc) */
+  int captured_tokens[MAX_CAPTURED_VARS];      /* token IDs of captured parent vars */
+  int captured_vregs[MAX_CAPTURED_VARS];       /* vreg IDs of captured parent vars (for offset resolution) */
+  CType captured_types[MAX_CAPTURED_VARS];     /* full type of captured vars */
   int captured_chain_depth[MAX_CAPTURED_VARS]; /* 1 = parent, 2 = grandparent, ... */
-  struct NestedFunc *parent_nf;              /* parent nested function (for multi-level nesting) */
-  int nb_captured;                         /* number of captured parent variables */
-  int needs_chain_save;                    /* 1 if a child func needs multi-hop chain (depth>1) */
-  int compiled;                         /* number of captured parent variables */
-  int trampoline_needed;                   /* address of this nested function was taken */
-  Sym *trampoline_tcc_sym;                 /* TCC symbol for trampoline code (.text) */
-  Sym *chain_slot_tcc_sym;                 /* TCC symbol for chain slot (.data) */
+  struct NestedFunc *parent_nf;                /* parent nested function (for multi-level nesting) */
+  int nb_captured;                             /* number of captured parent variables */
+  int needs_chain_save;                        /* 1 if a child func needs multi-hop chain (depth>1) */
+  int compiled;                                /* number of captured parent variables */
+  int trampoline_needed;                       /* address of this nested function was taken */
+  Sym *trampoline_tcc_sym;                     /* TCC symbol for trampoline code (.text) */
+  Sym *chain_slot_tcc_sym;                     /* TCC symbol for chain slot (.data) */
 } NestedFunc;
 
 /* include file cache, used to find files faster and also to eliminate

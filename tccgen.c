@@ -7386,9 +7386,9 @@ tok_next:
             memset(s, 0, sizeof(*s));
             s->v = t;
             s->type = nf->captured_types[i]; /* Use actual captured variable type */
-            s->r = VT_LOCAL | VT_LVAL;      /* LOCAL + LVAL so it works as both value and assignment target */
-            s->c = nf->captured_offsets[i]; /* Parent's FP offset */
-            s->vreg = -1;                   /* No vreg in nested function's IR — pure stack offset via chain */
+            s->r = VT_LOCAL | VT_LVAL;       /* LOCAL + LVAL so it works as both value and assignment target */
+            s->c = nf->captured_offsets[i];  /* Parent's FP offset */
+            s->vreg = -1;                    /* No vreg in nested function's IR — pure stack offset via chain */
             s->sym_scope = 0;
             goto found_captured_var;
           }
@@ -11124,7 +11124,7 @@ static void compile_nested_functions(Sym *parent_sym)
   while (compile_idx < tcc_state->nb_nested_funcs)
   {
     NestedFunc *nf = &tcc_state->nested_funcs[compile_idx];
-    
+
     /* Skip already-compiled functions (safety check) */
     if (nf->compiled)
     {
@@ -11240,9 +11240,9 @@ static void prescan_captured_vars(NestedFunc *nf, Sym *parent_local_stack, Neste
   }
 
   /* Set parent_nf for multi-level nesting support.
- * If explicit_parent_nf is provided, use it (for nested funcs discovered
- * during gen_function). Otherwise, use prescan_current_nf (for nested funcs
- * discovered during prescan). */
+   * If explicit_parent_nf is provided, use it (for nested funcs discovered
+   * during gen_function). Otherwise, use prescan_current_nf (for nested funcs
+   * discovered during prescan). */
   nf->parent_nf = explicit_parent_nf;
 
   /* Save and set current */
@@ -11291,7 +11291,7 @@ static void prescan_captured_vars(NestedFunc *nf, Sym *parent_local_stack, Neste
           nf->captured_offsets[nf->nb_captured] = s->c;
           nf->captured_tokens[nf->nb_captured] = t;
           nf->captured_types[nf->nb_captured] = s->type;
-          nf->captured_chain_depth[nf->nb_captured] = 1;  /* direct parent */
+          nf->captured_chain_depth[nf->nb_captured] = 1; /* direct parent */
           nf->nb_captured++;
         }
       }
@@ -11308,13 +11308,18 @@ static void prescan_captured_vars(NestedFunc *nf, Sym *parent_local_stack, Neste
             /* Guard: check not already captured (e.g. token appears twice) */
             int dup = 0;
             for (int k = 0; k < nf->nb_captured; k++)
-              if (nf->captured_tokens[k] == t) { dup = 1; break; }
-            if (dup) break;
+              if (nf->captured_tokens[k] == t)
+              {
+                dup = 1;
+                break;
+              }
+            if (dup)
+              break;
 
-            nf->captured_offsets[nf->nb_captured]     = parent_nf->captured_offsets[j];
-            nf->captured_tokens[nf->nb_captured]      = t;
-            nf->captured_types[nf->nb_captured]       = parent_nf->captured_types[j];
-            nf->captured_vregs[nf->nb_captured]       = parent_nf->captured_vregs[j];
+            nf->captured_offsets[nf->nb_captured] = parent_nf->captured_offsets[j];
+            nf->captured_tokens[nf->nb_captured] = t;
+            nf->captured_types[nf->nb_captured] = parent_nf->captured_types[j];
+            nf->captured_vregs[nf->nb_captured] = parent_nf->captured_vregs[j];
             nf->captured_chain_depth[nf->nb_captured] = parent_nf->captured_chain_depth[j] + 1;
             /* Child needs multi-hop → parent must save chain at FP-4 */
             if (nf->captured_chain_depth[nf->nb_captured] > 1)

@@ -219,16 +219,14 @@ static void load_from_base_ir(int r, int r1, int irop_btype, int is_unsigned, in
  * For depth > 1, emits LDR chain to follow ancestor frame pointers
  * and returns a scratch register holding the target ancestor's FP.
  * Caller must restore scratch via *out_scratch when done. */
-static int resolve_chain_base(TCCIRState *ir, int ci,
-                              uint32_t exclude_regs,
-                              ScratchRegAlloc *out_scratch,
+static int resolve_chain_base(TCCIRState *ir, int ci, uint32_t exclude_regs, ScratchRegAlloc *out_scratch,
                               int *used_scratch)
 {
   int depth = ir->captured_chain_depths[ci];
   if (depth <= 1)
   {
     *used_scratch = 0;
-    return architecture_config.static_chain_reg;  /* R10 */
+    return architecture_config.static_chain_reg; /* R10 */
   }
 
   /* Multi-hop: follow chain through (depth - 1) intermediate frames.
@@ -238,17 +236,13 @@ static int resolve_chain_base(TCCIRState *ir, int ci,
 
   /* Start from R10 (points to immediate parent's FP) */
   thumb_shift no_shift = {THUMB_SHIFT_NONE, 0, THUMB_SHIFT_IMMEDIATE};
-  ot_check(th_mov_reg(out_scratch->reg,
-                       architecture_config.static_chain_reg,
-                       FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                       no_shift, ENFORCE_ENCODING_NONE, false));
+  ot_check(th_mov_reg(out_scratch->reg, architecture_config.static_chain_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, no_shift,
+                      ENFORCE_ENCODING_NONE, false));
 
   for (int hop = 1; hop < depth; hop++)
   {
     /* LDR temp, [temp, #-4]  — follow chain link */
-    load_from_base_ir(out_scratch->reg, PREG_REG_NONE,
-                      IROP_BTYPE_INT32, 0,
-                      4 /* abs */, 1 /* sign: negative */,
+    load_from_base_ir(out_scratch->reg, PREG_REG_NONE, IROP_BTYPE_INT32, 0, 4 /* abs */, 1 /* sign: negative */,
                       out_scratch->reg);
   }
   return out_scratch->reg;
@@ -4879,7 +4873,8 @@ void tcc_gen_machine_data_processing_op(IROperand src1, IROperand src2, IROperan
           }
           int sign = (frame_offset < 0);
           int abs_offset = sign ? -frame_offset : frame_offset;
-          ScratchRegAlloc accum_scratch = get_scratch_reg_with_save((1u << dest_reg) | (chain_used ? (1u << chain_scratch.reg) : 0));
+          ScratchRegAlloc accum_scratch =
+              get_scratch_reg_with_save((1u << dest_reg) | (chain_used ? (1u << chain_scratch.reg) : 0));
           load_from_base_ir(accum_scratch.reg, PREG_REG_NONE, IROP_BTYPE_INT32, 0, abs_offset, sign, base_reg);
           ot_check(th_add_reg((uint32_t)dest_reg, (uint32_t)dest_reg, (uint32_t)accum_scratch.reg,
                               FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));

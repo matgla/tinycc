@@ -381,12 +381,12 @@ typedef struct TCCIRState
   int32_t captured_chain_depths[32]; /* 1 = direct R10, 2+ = multi-hop */
   int32_t captured_count;            /* number of captured variables */
   int32_t loc;
-  int32_t parent_loc;                 /* parent's loc value (for nested function offset validation) */
+  int32_t parent_loc; /* parent's loc value (for nested function offset validation) */
 
   /* Nested function tracking (for parent functions that contain nested functions) */
-  NestedFunc **nested_funcs;          /* array of pointers to nested function descriptors */
-  int32_t nb_nested_funcs;            /* count of nested functions */
-  int32_t nested_funcs_capacity;      /* allocated capacity of nested_funcs array */
+  NestedFunc **nested_funcs;     /* array of pointers to nested function descriptors */
+  int32_t nb_nested_funcs;       /* count of nested functions */
+  int32_t nested_funcs_capacity; /* allocated capacity of nested_funcs array */
 
   /* Optimization module data - opaque pointer to keep IR arch-independent */
   TCCFPMatCache *opt_fp_mat_cache;

@@ -1013,8 +1013,19 @@ int tcc_ir_opt_value_tracking(TCCIRState *ir)
     {
       if (dest_pos >= 0 && dest_pos <= max_vreg)
       {
-        state[dest_pos].is_constant = 1;
-        state[dest_pos].value = irop_get_imm64_ex(ir, src1);
+        /* If the address of this variable is taken, it can be modified
+         * through aliases (e.g. passed as an out-parameter to a function).
+         * Do not track it as constant. */
+        IRLiveInterval *interval = tcc_ir_get_live_interval(ir, dest_vr);
+        if (interval && interval->addrtaken)
+        {
+          state[dest_pos].is_constant = 0;
+        }
+        else
+        {
+          state[dest_pos].is_constant = 1;
+          state[dest_pos].value = irop_get_imm64_ex(ir, src1);
+        }
       }
       continue;
     }
@@ -1036,8 +1047,17 @@ int tcc_ir_opt_value_tracking(TCCIRState *ir)
 
         if (dest_pos >= 0 && dest_pos <= max_vreg)
         {
-          state[dest_pos].is_constant = 1;
-          state[dest_pos].value = result;
+          /* Do not propagate constant through address-taken variables */
+          IRLiveInterval *interval = tcc_ir_get_live_interval(ir, dest_vr);
+          if (interval && interval->addrtaken)
+          {
+            state[dest_pos].is_constant = 0;
+          }
+          else
+          {
+            state[dest_pos].is_constant = 1;
+            state[dest_pos].value = result;
+          }
         }
       }
       else
@@ -1107,6 +1127,22 @@ int tcc_ir_opt_value_tracking(TCCIRState *ir)
         }
       }
       continue;
+    }
+
+    /* Function calls can modify any address-taken variable through pointers.
+     * Invalidate all address-taken variables when we see a call. */
+    if (q->op == TCCIR_OP_FUNCCALLVOID || q->op == TCCIR_OP_FUNCCALLVAL)
+    {
+      for (int v = 0; v <= max_vreg; v++)
+      {
+        if (state[v].is_constant)
+        {
+          int32_t vr = TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_VAR, v);
+          IRLiveInterval *interval = tcc_ir_get_live_interval(ir, vr);
+          if (interval && interval->addrtaken)
+            state[v].is_constant = 0;
+        }
+      }
     }
 
     /* Any other instruction that defines a VAR vreg invalidates the constant */
