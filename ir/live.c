@@ -340,9 +340,10 @@ void tcc_ir_live_intervals_compute(TCCIRState *ir)
 
     /* Process destination operand (definition) */
     const IROperand dest = tcc_ir_op_get_dest(ir, q);
-    if (irop_config[q->op].has_dest == 1 && tcc_ir_vreg_is_valid(ir, dest.vr))
+    int32_t dest_vreg = irop_get_vreg(dest);
+    if (irop_config[q->op].has_dest == 1 && tcc_ir_vreg_is_valid(ir, dest_vreg))
     {
-      IRLiveInterval *interval = tcc_ir_vreg_live_interval(ir, dest.vr);
+      IRLiveInterval *interval = tcc_ir_vreg_live_interval(ir, dest_vreg);
       if (interval->start == INTERVAL_NOT_STARTED)
       {
         /* First time seeing this vreg - it's defined here */
@@ -401,6 +402,9 @@ void tcc_ir_live_analysis(TCCIRState *ir)
         tcc_ir_vreg_type_set_fp(ir, irop_get_vreg(dest), 1, btype == IROP_BTYPE_FLOAT64);
       else if (btype == IROP_BTYPE_INT64)
         tcc_ir_vreg_type_set_64bit(ir, irop_get_vreg(dest));
+      /* Restore complex flag from IROperand (cleared by tcc_ls_clear_live_intervals) */
+      if (dest.is_complex)
+        tcc_ir_vreg_type_set_complex(ir, irop_get_vreg(dest));
     }
     IROperand src1 = tcc_ir_op_get_src1(ir, q);
     if (irop_config[q->op].has_src1 && tcc_ir_vreg_is_valid(ir, irop_get_vreg(src1)))
@@ -410,6 +414,8 @@ void tcc_ir_live_analysis(TCCIRState *ir)
         tcc_ir_vreg_type_set_fp(ir, irop_get_vreg(src1), 1, btype == IROP_BTYPE_FLOAT64);
       else if (btype == IROP_BTYPE_INT64)
         tcc_ir_vreg_type_set_64bit(ir, irop_get_vreg(src1));
+      if (src1.is_complex)
+        tcc_ir_vreg_type_set_complex(ir, irop_get_vreg(src1));
     }
     IROperand src2 = tcc_ir_op_get_src2(ir, q);
     if (irop_config[q->op].has_src2 && tcc_ir_vreg_is_valid(ir, irop_get_vreg(src2)))
@@ -419,6 +425,8 @@ void tcc_ir_live_analysis(TCCIRState *ir)
         tcc_ir_vreg_type_set_fp(ir, irop_get_vreg(src2), 1, btype == IROP_BTYPE_FLOAT64);
       else if (btype == IROP_BTYPE_INT64)
         tcc_ir_vreg_type_set_64bit(ir, irop_get_vreg(src2));
+      if (src2.is_complex)
+        tcc_ir_vreg_type_set_complex(ir, irop_get_vreg(src2));
     }
   }
 
@@ -452,21 +460,21 @@ void tcc_ir_live_analysis(TCCIRState *ir)
     {
       start = interval->start;
       end = interval->end;
-      
+
       /* Check if this is the static chain vreg (for nested functions) */
       int is_static_chain = (ir->has_static_chain && encoded_vreg == ir->static_chain_vreg);
-      
+
       /* For static chain vreg, extend to end of function */
       if (is_static_chain)
       {
         end = ir->next_instruction_index;
-        crosses_call = 1;  /* Chain vreg crosses all calls */
+        crosses_call = 1; /* Chain vreg crosses all calls */
       }
       else
       {
         crosses_call = live_has_call_in_range_prefix(call_prefix, start, end, instruction_count);
       }
-      
+
       addrtaken = interval->addrtaken;
       reg_type = tcc_ir_vreg_type_get(ir, encoded_vreg);
       if (end < ir->next_instruction_index && (ir->compact_instructions[end].op == TCCIR_OP_FUNCCALLVAL ||
@@ -474,14 +482,14 @@ void tcc_ir_live_analysis(TCCIRState *ir)
       {
         crosses_call = 1;
       }
-      
+
       /* Precolor static chain vreg to R10 */
       int precolored = -1;
       if (is_static_chain)
       {
-        precolored = 10;  /* R10 is the static chain register */
+        precolored = 10; /* R10 is the static chain register */
       }
-      
+
       tcc_ls_add_live_interval(&ir->ls, encoded_vreg, start, end, crosses_call, addrtaken, reg_type,
                                interval->is_lvalue, precolored);
     }

@@ -60,6 +60,9 @@ void tcc_ir_vreg_type_set_fp(struct TCCIRState *ir, int vreg, int is_float, int 
 /* Mark vreg as 64-bit (long long or double) */
 void tcc_ir_vreg_type_set_64bit(struct TCCIRState *ir, int vreg);
 
+/* Phase 3: Mark vreg as complex type */
+void tcc_ir_vreg_type_set_complex(struct TCCIRState *ir, int vreg);
+
 /* Set original stack offset for vreg */
 void tcc_ir_vreg_offset_set(struct TCCIRState *ir, int vreg, int offset);
 

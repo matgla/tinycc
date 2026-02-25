@@ -11,10 +11,10 @@ struct CType;
 /* ============================================================================
  * Vreg encoding
  * ============================================================================
- * Vreg encoding: type in top 4 bits, position in bottom 18 bits.
- * Bits 18-27 are used for IROperand tag+flags+btype encoding.
+ * Vreg encoding: type in top 4 bits, position in bottom 17 bits.
+ * Bits 17-27 are used for IROperand tag+flags+btype encoding.
  *
- * 18 bits for position = 262,144 max vregs (plenty for any function)
+ * 17 bits for position = 131,072 max vregs (plenty for any function)
  */
 
 typedef enum TCCIR_VREG_TYPE
@@ -24,7 +24,7 @@ typedef enum TCCIR_VREG_TYPE
   TCCIR_VREG_TYPE_PARAM = 3,
 } TCCIR_VREG_TYPE;
 
-#define TCCIR_VREG_POSITION_MASK 0x3FFFF /* 18 bits for position */
+#define TCCIR_VREG_POSITION_MASK 0x1FFFF /* 17 bits for position */
 #define TCCIR_DECODE_VREG_POSITION(vr) ((vr) & TCCIR_VREG_POSITION_MASK)
 #define TCCIR_DECODE_VREG_TYPE(vr) ((vr) >> 28)
 #define TCCIR_ENCODE_VREG(type, position) (((type) << 28) | ((position) & TCCIR_VREG_POSITION_MASK))
@@ -58,8 +58,8 @@ typedef enum TCCIR_VREG_TYPE
 #define IROP_TAG_F64 6      /* payload.pool_idx: index into pool_f64[] */
 #define IROP_TAG_SYMREF 7   /* payload.pool_idx: index into pool_symref[] */
 
-/* Sentinel for negative vreg encoding - upper 14 bits of position all set */
-#define IROP_NEG_VREG_SENTINEL 0x3FFF0 /* position bits 4-17 all set, bits 0-3 hold neg index */
+/* Sentinel for negative vreg encoding - upper 13 bits of position all set */
+#define IROP_NEG_VREG_SENTINEL 0x1FFF0 /* position bits 4-16 all set, bits 0-3 hold neg index */
 
 /* Compressed basic type (stored in bits 25-27 of vr)
  * This allows reconstruction of type.t during iroperand_to_svalue().
@@ -81,7 +81,8 @@ typedef struct __attribute__((packed)) IROperand
     int32_t vr; /* raw access for encoding/decoding */
     struct
     {
-      uint32_t position : 18; /* vreg position (0-17) */
+      uint32_t position : 17; /* vreg position (0-16) */
+      uint32_t is_complex : 1;/* DONE: Phase 2 - VT_COMPLEX: complex type flag (17) */
       uint32_t tag : 3;       /* IROP_TAG_* (18-20) */
       uint32_t is_lval : 1;   /* VT_LVAL: needs dereference (21) */
       uint32_t is_llocal : 1; /* VT_LLOCAL: double indirection (22) */
@@ -163,13 +164,13 @@ struct CType *irop_get_ctype(IROperand op);
 /* Debug: compare SValue with IROperand and print differences (returns 1 if mismatch) */
 int irop_compare_svalue(const struct TCCIRState *ir, const struct SValue *sv, IROperand op, const char *context);
 
-/* Position sentinel value: max 18-bit value means "no position" */
-#define IROP_POSITION_NONE 0x3FFFF
+/* Position sentinel value: max 17-bit value means "no position" */
+#define IROP_POSITION_NONE 0x1FFFF
 
 /* Check if operand encodes a negative vreg (sentinel pattern) */
 static inline int irop_is_neg_vreg(const IROperand op)
 {
-  return op.vreg_type == 0xF && (op.position & 0x3FFF0) == IROP_NEG_VREG_SENTINEL;
+  return op.vreg_type == 0xF && (op.position & 0x1FFF0) == IROP_NEG_VREG_SENTINEL;
 }
 
 /* Check if operand has no associated vreg */
@@ -199,6 +200,15 @@ static inline int irop_get_btype(const IROperand op)
 /* Check if operand has a 64-bit type */
 static inline int irop_is_64bit(const IROperand op)
 {
+  int btype = irop_get_btype(op);
+  return btype == IROP_BTYPE_INT64 || btype == IROP_BTYPE_FLOAT64;
+}
+
+/* Check if operand needs a register pair (64-bit or complex) */
+static inline int irop_needs_pair(const IROperand op)
+{
+  if (op.is_complex)
+    return 1;
   int btype = irop_get_btype(op);
   return btype == IROP_BTYPE_INT64 || btype == IROP_BTYPE_FLOAT64;
 }

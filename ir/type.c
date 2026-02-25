@@ -33,6 +33,12 @@ int tcc_ir_type_is_double(int t)
 int tcc_ir_type_is_64bit(int t)
 {
   int bt = t & VT_BTYPE;
+  /* Phase 3: Complex types based on float/double are 64-bit (8 bytes) or larger */
+  if (t & VT_COMPLEX)
+  {
+    /* float _Complex = 8 bytes (2 x 4), double _Complex = 16 bytes (2 x 8) */
+    return bt == VT_FLOAT || bt == VT_DOUBLE || bt == VT_LDOUBLE;
+  }
   return bt == VT_DOUBLE || bt == VT_LDOUBLE || bt == VT_LLONG;
 }
 

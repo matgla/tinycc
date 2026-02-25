@@ -221,7 +221,7 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, i
             arg_descs[param_idx].size = (uint16_t)size;
             arg_descs[param_idx].alignment = (uint8_t)align;
           }
-          else if (irop_is_64bit(src1_irop))
+          else if (irop_needs_pair(src1_irop))
           {
             arg_descs[param_idx].kind = TCC_ABI_ARG_SCALAR64;
             arg_descs[param_idx].size = 8;

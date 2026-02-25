@@ -119,7 +119,7 @@ static void tcc_ls_build_live_regs_by_instruction(LSLiveIntervalState *ls)
 
     /* Only track integer register occupancy; skip spilled/stack-only intervals. */
     if (interval->reg_type != LS_REG_TYPE_INT && interval->reg_type != LS_REG_TYPE_LLONG &&
-        interval->reg_type != LS_REG_TYPE_DOUBLE_SOFT)
+        interval->reg_type != LS_REG_TYPE_DOUBLE_SOFT && interval->reg_type != LS_REG_TYPE_COMPLEX_FLOAT)
       continue;
     if (interval->addrtaken || interval->stack_location != 0)
       continue;
@@ -145,7 +145,7 @@ static void tcc_ls_build_live_regs_by_instruction(LSLiveIntervalState *ls)
     const LSLiveInterval *interval = &ls->intervals[i];
 
     if (interval->reg_type != LS_REG_TYPE_INT && interval->reg_type != LS_REG_TYPE_LLONG &&
-        interval->reg_type != LS_REG_TYPE_DOUBLE_SOFT)
+        interval->reg_type != LS_REG_TYPE_DOUBLE_SOFT && interval->reg_type != LS_REG_TYPE_COMPLEX_FLOAT)
       continue;
     if (interval->addrtaken || interval->stack_location != 0)
       continue;
@@ -208,6 +208,9 @@ void tcc_ls_add_live_interval(LSLiveIntervalState *ls, int vreg, int start, int 
     break;
   case LS_REG_TYPE_DOUBLE_SOFT:
     type_str = "DOUBLE_SOFT";
+    break;
+  case LS_REG_TYPE_COMPLEX_FLOAT:
+    type_str = "COMPLEX_FLOAT";
     break;
   default:
     type_str = "UNKNOWN";
@@ -544,7 +547,8 @@ void tcc_ls_expire_old_intervals(LSLiveIntervalState *ls, int current_index)
     {
       /* Integer types (INT, LLONG, DOUBLE_SOFT) */
       if (ls->active_set[i]->r1 >= 0 &&
-          (ls->active_set[i]->reg_type == LS_REG_TYPE_LLONG || ls->active_set[i]->reg_type == LS_REG_TYPE_DOUBLE_SOFT))
+          (ls->active_set[i]->reg_type == LS_REG_TYPE_LLONG || ls->active_set[i]->reg_type == LS_REG_TYPE_DOUBLE_SOFT ||
+           ls->active_set[i]->reg_type == LS_REG_TYPE_COMPLEX_FLOAT))
       {
         LS_DBG("    Releasing register pair R%d:R%d (vreg=%u ended at %d)", ls->active_set[i]->r0,
                ls->active_set[i]->r1, ls->active_set[i]->vreg, ls->active_set[i]->end);
@@ -557,7 +561,8 @@ void tcc_ls_expire_old_intervals(LSLiveIntervalState *ls, int current_index)
       tcc_ls_release_register(ls, ls->active_set[i]->r0);
       /* Release second register for 64-bit types */
       if (ls->active_set[i]->r1 >= 0 &&
-          (ls->active_set[i]->reg_type == LS_REG_TYPE_LLONG || ls->active_set[i]->reg_type == LS_REG_TYPE_DOUBLE_SOFT))
+          (ls->active_set[i]->reg_type == LS_REG_TYPE_LLONG || ls->active_set[i]->reg_type == LS_REG_TYPE_DOUBLE_SOFT ||
+           ls->active_set[i]->reg_type == LS_REG_TYPE_COMPLEX_FLOAT))
       {
         tcc_ls_release_register(ls, ls->active_set[i]->r1);
       }
@@ -827,9 +832,10 @@ void tcc_ls_allocate_registers(LSLiveIntervalState *ls, int used_parameters_regi
         tcc_ls_spill_interval(ls, i);
       }
     }
-    else if (ls->intervals[i].reg_type == LS_REG_TYPE_LLONG || ls->intervals[i].reg_type == LS_REG_TYPE_DOUBLE_SOFT)
+    else if (ls->intervals[i].reg_type == LS_REG_TYPE_LLONG || ls->intervals[i].reg_type == LS_REG_TYPE_DOUBLE_SOFT ||
+             ls->intervals[i].reg_type == LS_REG_TYPE_COMPLEX_FLOAT)
     {
-      /* 64-bit integer type - needs two integer registers */
+      /* 64-bit integer type or complex float - needs two integer registers */
       int r0 = -1, r1 = -1;
       if (ls->intervals[i].r0 == -1)
       {

@@ -876,6 +876,7 @@ struct TCCState
   unsigned char opt_licm;            /* -flicm: loop-invariant code motion */
   unsigned char opt_strength_red;    /* -fstrength-reduce: strength reduction for multiply */
   unsigned char opt_iv_strength_red; /* -fiv-strength-red: IV strength reduction for array access */
+  unsigned char opt_nonneg_fold;     /* -fnonneg-fold: non-negative value branch folding */
   unsigned char opt_jump_threading;  /* -fjump-threading: jump threading optimization */
 
   /* Function purity cache for LICM optimization */
@@ -1114,6 +1115,7 @@ struct TCCState
   uint8_t omit_frame_pointer;
   uint8_t need_frame_pointer;
   uint8_t force_frame_pointer; /* required for VLA/dynamic SP even if omit_frame_pointer */
+  uint8_t force_lr_save;       /* __builtin_return_address needs LR saved even in leaf */
   int stack_location;
 
   /* linker script support */
@@ -1199,7 +1201,8 @@ static inline SValue tcc_ir_svalue_call_id_argc(int call_id, int argc)
 #define VT_STATIC 0x00002000  /* static variable */
 #define VT_TYPEDEF 0x00004000 /* typedef definition */
 #define VT_INLINE 0x00008000  /* inline definition */
-/* currently unused: 0x000[1248]0000  */
+#define VT_COMPLEX 0x00010000 /* Complex type flag (bit 16) */
+/* currently unused: 0x000[248]0000  */
 
 #define VT_STRUCT_SHIFT 20 /* shift for bitfield shift values (32 - 2*6) */
 #define VT_STRUCT_MASK (((1U << (6 + 6)) - 1) << VT_STRUCT_SHIFT | VT_BITFIELD)
@@ -1954,7 +1957,7 @@ ST_FUNC void gen_expr64(ExprValue *pe);
 ST_FUNC void asm_opcode(TCCState *s1, int opcode);
 ST_FUNC int asm_parse_regvar(int t);
 ST_FUNC void asm_compute_constraints(ASMOperand *operands, int nb_operands, int nb_outputs, const uint8_t *clobber_regs,
-                                     int *pout_reg);
+                                     const uint8_t *reserved_regs, int *pout_reg);
 ST_FUNC void subst_asm_operand(CString *add_str, SValue *sv, int modifier);
 ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands, int nb_outputs, int is_output, uint8_t *clobber_regs,
                           int out_reg);
@@ -1963,7 +1966,8 @@ ST_FUNC void asm_clobber(uint8_t *clobber_regs, const char *str);
 /* Emit a fully prepared GCC-style inline asm block.
  * Used by IR codegen to lower TCCIR_OP_INLINE_ASM without relying on front-end load/store helpers. */
 ST_FUNC void tcc_asm_emit_inline(ASMOperand *operands, int nb_operands, int nb_outputs, int nb_labels,
-                                 uint8_t *clobber_regs, const char *asm_str, int asm_len, int must_subst);
+                                 uint8_t *clobber_regs, const uint8_t *reserved_regs, const char *asm_str, int asm_len,
+                                 int must_subst);
 #endif
 
 /* ------------ tccpe.c -------------- */
@@ -2138,6 +2142,9 @@ ST_FUNC int tcc_gen_machine_branch_opt_get_encoding(int ir_index); /* Returns 16
 
 /* VLA / dynamic stack operations */
 ST_FUNC void tcc_gen_machine_vla_op(IROperand dest, IROperand src1, IROperand src2, TccIrOp op);
+
+/* Trap instruction generation */
+ST_FUNC void tcc_gen_machine_trap_op(void);
 
 ST_FUNC const char *tcc_get_abi_softcall_name(SValue *src1, SValue *src2, SValue *dest, TccIrOp op);
 

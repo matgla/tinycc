@@ -196,13 +196,6 @@ static inline int irop_get_btype(const IROperand op)
   return op.btype;
 }
 
-/* Check if operand has a 64-bit type */
-static inline int irop_is_64bit(const IROperand op)
-{
-  int btype = irop_get_btype(op);
-  return btype == IROP_BTYPE_INT64 || btype == IROP_BTYPE_FLOAT64;
-}
-
 /* Check if operand has an immediate value */
 static inline int irop_is_immediate(const IROperand op)
 {

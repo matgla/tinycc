@@ -232,7 +232,7 @@ void tcc_ir_fill_registers_ir(TCCIRState *ir, IROperand *op)
       /* For STRUCT types, preserve ctype_idx in the split encoding */
       if (op->btype == IROP_BTYPE_STRUCT)
       {
-        op->u.s.aux_data = interval->original_offset / 4;
+        op->u.s.aux_data = interval->original_offset;
       }
       else
       {
@@ -265,12 +265,11 @@ void tcc_ir_fill_registers_ir(TCCIRState *ir, IROperand *op)
     /* For STRUCT types, preserve ctype_idx in the split encoding */
     if (op->btype == IROP_BTYPE_STRUCT)
     {
-      op->u.s.aux_data = interval->allocation.offset / 4;
+      op->u.s.aux_data = interval->allocation.offset;
     }
     else
     {
-      if ((old_is_local || old_is_llocal) && !old_is_param && interval->original_offset != 0 &&
-          irop_get_tag(*op) == IROP_TAG_STACKOFF)
+      if ((old_is_local || old_is_llocal) && !old_is_param && irop_get_tag(*op) == IROP_TAG_STACKOFF)
       {
         int32_t delta = old_stackoff - interval->original_offset;
         op->u.imm32 = interval->allocation.offset + delta;
@@ -362,7 +361,7 @@ void tcc_ir_register_allocation_params(TCCIRState *ir)
     IRLiveInterval *interval = tcc_ir_vreg_live_interval(ir, encoded_vreg);
     /* is_double for soft-float (LS_REG_TYPE_DOUBLE_SOFT) or is_llong for 64-bit
      */
-    int is_64bit = interval && (interval->is_double || interval->is_llong);
+    int is_64bit = interval && (interval->is_double || interval->is_llong || interval->is_complex);
 
     /* If the ABI incoming registers were already set (e.g., by the
      * parameter handling in tcc_ir_add_function_parameters), respect them
@@ -469,7 +468,7 @@ void tcc_ir_mark_return_value_incoming_regs(TCCIRState *ir)
 
     /* Mark that this vreg arrives in r0 (or r0+r1 for 64-bit returns) */
     interval->incoming_reg0 = 0; /* r0 */
-    if (interval->is_llong || interval->is_double)
+    if (interval->is_llong || interval->is_double || interval->is_complex)
       interval->incoming_reg1 = 1; /* r1 */
     else
       interval->incoming_reg1 = -1;
@@ -965,6 +964,7 @@ void tcc_ir_codegen_drop_return(TCCIRState *ir)
  * ============================================================================ */
 
 #ifdef CONFIG_TCC_ASM
+
 static void tcc_ir_codegen_inline_asm_by_id(TCCIRState *ir, int id)
 {
   if (!ir)
@@ -999,8 +999,59 @@ static void tcc_ir_codegen_inline_asm_by_id(TCCIRState *ir, int id)
   uint8_t clobber_regs[NB_ASM_REGS];
   memcpy(clobber_regs, ia->clobber_regs, sizeof(clobber_regs));
 
-  tcc_asm_emit_inline(ops, nb_operands, ia->nb_outputs, nb_labels, clobber_regs, ia->asm_str, ia->asm_len,
-                      ia->must_subst);
+  /* Compute reserved_regs: physical registers of vregs that are live at this
+   * INLINE_ASM instruction but are NOT asm operands.  The constraint solver
+   * must avoid these registers when picking registers for "r" constraints,
+   * otherwise the operand load will clobber the live value.
+   *
+   * Unlike clobber_regs, reserved_regs only affect constraint allocation —
+   * they do NOT trigger save/restore in asm_gen_code prolog/epilog. */
+  uint8_t reserved_regs[NB_ASM_REGS];
+  memset(reserved_regs, 0, sizeof(reserved_regs));
+  {
+    int asm_instr_idx = ir->codegen_instruction_idx;
+    struct
+    {
+      IRLiveInterval *intervals;
+      int count;
+    } groups[3] = {
+        {ir->variables_live_intervals, ir->variables_live_intervals_size},
+        {ir->temporary_variables_live_intervals, ir->temporary_variables_live_intervals_size},
+        {ir->parameters_live_intervals, ir->parameters_live_intervals_size},
+    };
+
+    for (int g = 0; g < 3; g++)
+    {
+      for (int j = 0; j < groups[g].count; j++)
+      {
+        IRLiveInterval *interval = &groups[g].intervals[j];
+        if (interval->start == INTERVAL_NOT_STARTED)
+          continue;
+        if ((int)interval->start > asm_instr_idx || (int)interval->end < asm_instr_idx)
+          continue;
+
+        int r0 = interval->allocation.r0;
+        if (r0 & PREG_SPILLED)
+          continue;
+        int phys_reg = r0 & PREG_REG_NONE;
+        if (phys_reg == PREG_REG_NONE)
+          continue;
+        if (phys_reg < NB_ASM_REGS)
+          reserved_regs[phys_reg] = 1;
+
+        int r1 = interval->allocation.r1;
+        if (!(r1 & PREG_SPILLED))
+        {
+          int phys_reg1 = r1 & PREG_REG_NONE;
+          if (phys_reg1 != PREG_REG_NONE && phys_reg1 < NB_ASM_REGS)
+            reserved_regs[phys_reg1] = 1;
+        }
+      }
+    }
+  }
+
+  tcc_asm_emit_inline(ops, nb_operands, ia->nb_outputs, nb_labels, clobber_regs, reserved_regs, ia->asm_str,
+                      ia->asm_len, ia->must_subst);
 }
 
 static void tcc_ir_codegen_inline_asm_ir(TCCIRState *ir, IROperand dest_irop)
@@ -1547,6 +1598,9 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
     case TCCIR_OP_VLA_SP_SAVE:
     case TCCIR_OP_VLA_SP_RESTORE:
       tcc_gen_machine_vla_op(dest_ir, src1_ir, src2_ir, cq->op);
+      break;
+    case TCCIR_OP_TRAP:
+      tcc_gen_machine_trap_op();
       break;
     default:
       /* Unknown op - skip */
@@ -2171,6 +2225,10 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
     }
     case TCCIR_OP_NOP:
       /* No operation - skip silently */
+      break;
+    case TCCIR_OP_TRAP:
+      /* Generate trap instruction */
+      tcc_gen_machine_trap_op();
       break;
     case TCCIR_OP_SET_CHAIN:
       /* Static chain setup: move FP to static chain register */

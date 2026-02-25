@@ -322,8 +322,12 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
   ir_ensure_sym_registered(src2);
   ir_ensure_sym_registered(dest);
 
-  /* Check if we need to use soft-float call instead of native FPU instruction */
-  if (tcc_ir_type_op_needs_fpu(op))
+  /* Check if we need to use soft-float call instead of native FPU instruction.
+   * Skip this for complex operations - they need special handling in the code generator. */
+  if (tcc_ir_type_op_needs_fpu(op) && 
+      !((dest && (dest->type.t & VT_COMPLEX)) || 
+        (src1 && (src1->type.t & VT_COMPLEX)) ||
+        (src2 && (src2->type.t & VT_COMPLEX))))
   {
     if (ir_put_soft_call_fpu_if_needed(ir, op, src1, src2, dest))
     {
@@ -396,6 +400,11 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
       else if ((dest->type.t & VT_BTYPE) == VT_LLONG)
       {
         tcc_ir_vreg_type_set_64bit(ir, dest->vr);
+      }
+      /* Phase 3: Set complex flag for complex types */
+      if (dest->type.t & VT_COMPLEX)
+      {
+        tcc_ir_vreg_type_set_complex(ir, dest->vr);
       }
       dest_interval = tcc_ir_vreg_live_interval(ir, dest->vr);
       int new_is_lvalue;
@@ -518,6 +527,7 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
         new_prev_dest.is_static = prev_dest_irop.is_static;
         new_prev_dest.is_sym = prev_dest_irop.is_sym;
         new_prev_dest.is_param = prev_dest_irop.is_param;
+        new_prev_dest.is_complex = prev_dest_irop.is_complex;  /* Phase 3: preserve complex flag */
         new_prev_dest.u = prev_dest_irop.u;
       }
 
@@ -1144,6 +1154,43 @@ void tcc_ir_gen_f(TCCIRState *ir, int op)
     tcc_ir_put(ir, ir_op, &vtop[0], NULL, &dest);
     vtop->vr = dest.vr;
     vtop->r = 0;
+    return;
+  }
+
+  /* Check if this is a complex addition/subtraction operation */
+  int is_complex_op = ((vtop[-1].type.t & VT_COMPLEX) || (vtop[0].type.t & VT_COMPLEX));
+  
+  if (is_complex_op && (ir_op == TCCIR_OP_FADD || ir_op == TCCIR_OP_FSUB ||
+                        ir_op == TCCIR_OP_FMUL || ir_op == TCCIR_OP_FDIV))
+  {
+    /* Phase 3: Complex addition/subtraction
+     * For complex: (a+bi) + (c+di) = (a+c) + (b+d)i
+     * We generate two FP operations and use a single vr to track the result.
+     * The code generator (arm-thumb-gen.c) will recognize complex operands
+     * and emit two soft-float library calls.
+     */
+    int base_type = vtop[-1].type.t & VT_BTYPE;
+    
+    /* Create destination SValue with complex type */
+    svalue_init(&dest);
+    dest.vr = tcc_ir_get_vreg_temp(ir);
+    dest.r = 0;
+    dest.type.t = (base_type | VT_COMPLEX);
+    
+    /* Mark as float type (not double) for register allocation */
+    is_double = (base_type == VT_DOUBLE || base_type == VT_LDOUBLE);
+    tcc_ir_set_float_type(ir, dest.vr, 1, is_double);
+    /* Phase 3: Mark as complex type so register allocator allocates pairs */
+    tcc_ir_vreg_type_set_complex(ir, dest.vr);
+    
+    /* Generate a single complex operation - the code generator will 
+     * recognize the complex type and emit two soft-float calls */
+    tcc_ir_put(ir, ir_op, &vtop[-1], &vtop[0], &dest);
+    
+    vtop[-1].vr = dest.vr;
+    vtop[-1].r = 0;
+    vtop[-1].type.t = dest.type.t;
+    --vtop;
     return;
   }
 
@@ -1833,6 +1880,8 @@ const IRRegistersConfig irop_config[] = {
     [TCCIR_OP_INIT_CHAIN_SLOT] = {0, 1, 0},
     /* No-operation */
     [TCCIR_OP_NOP] = {0, 0, 0},
+    /* Trap instruction: no operands, no dest */
+    [TCCIR_OP_TRAP] = {0, 0, 0},
     /* Jump table switch: src1=index vreg, src2=table_id, no dest */
     [TCCIR_OP_SWITCH_TABLE] = {0, 1, 1},
 }

@@ -1,0 +1,3 @@
+OK: Complex types work!
+sizeof(_Complex float) = 8
+sizeof(_Complex double) = 16

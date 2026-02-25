@@ -140,6 +140,8 @@ const char *tcc_ir_get_op_name(TccIrOp op)
     return "CALLSEQ_END";
   case TCCIR_OP_NOP:
     return "NOP";
+  case TCCIR_OP_TRAP:
+    return "TRAP";
   case TCCIR_OP_SET_CHAIN:
     return "SET_CHAIN";
   case TCCIR_OP_INIT_CHAIN_SLOT:
@@ -375,6 +377,7 @@ void tcc_dump_quadruple_to(FILE *out, const TACQuadruple *q, int pc)
   switch (op)
   {
   case TCCIR_OP_NOP:
+  case TCCIR_OP_TRAP:
   case TCCIR_OP_RETURNVALUE:
   case TCCIR_OP_RETURNVOID:
   case TCCIR_OP_FUNCCALLVOID:
@@ -887,6 +890,7 @@ void tcc_print_quadruple_irop(TCCIRState *ir, IRQuadCompact *q, int pc)
   switch (op)
   {
   case TCCIR_OP_NOP:
+  case TCCIR_OP_TRAP:
   case TCCIR_OP_RETURNVALUE:
   case TCCIR_OP_RETURNVOID:
   case TCCIR_OP_FUNCCALLVOID:

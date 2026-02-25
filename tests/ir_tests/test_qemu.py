@@ -284,6 +284,13 @@ TEST_FILES = [
     ("nested_funcptr_call_twice.c", 0),
     ("nested_recursive_parent.c", 0),
     ("nested_multi_level.c", 0),
+
+    # Complex number tests
+    ("test_complex_init.c", 0),
+    ("test_complex_mul.c", 0),
+    ("test_complex_simple.c", 0),
+
+    ("111_builtin_printf.c", 0),
 ]
 
 # Nested function tests expected to fail (not yet implemented)

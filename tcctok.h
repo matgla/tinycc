@@ -49,7 +49,8 @@ DEF(TOK_INT, "int")
 DEF(TOK_FLOAT, "float")
 DEF(TOK_DOUBLE, "double")
 DEF(TOK_BOOL, "_Bool")
-DEF(TOK_COMPLEX, "_Complex")
+DEF(TOK_COMPLEX, "_Complex")          /* DONE: Phase 1 */
+DEF(TOK_COMPLEX_GCC, "__complex__")   /* DONE: Phase 1 - GCC extension */
 DEF(TOK_SHORT, "short")
 DEF(TOK_LONG, "long")
 DEF(TOK_STRUCT, "struct")
@@ -67,6 +68,8 @@ DEF(TOK_TYPEOF1, "typeof")
 DEF(TOK_TYPEOF2, "__typeof")
 DEF(TOK_TYPEOF3, "__typeof__")
 DEF(TOK_LABEL, "__label__")
+DEF(TOK_REAL, "__real__")      /* PARTIAL: Phase 4 - parser recognizes, full impl pending */
+DEF(TOK_IMAG, "__imag__")      /* PARTIAL: Phase 4 - parser recognizes, full impl pending */
 
 #ifdef TCC_TARGET_ARM64
 DEF(TOK_UINT128, "__uint128_t")
@@ -176,6 +179,8 @@ DEF(TOK_builtin_frame_address, "__builtin_frame_address")
 DEF(TOK_builtin_return_address, "__builtin_return_address")
 DEF(TOK_builtin_expect, "__builtin_expect")
 DEF(TOK_builtin_unreachable, "__builtin_unreachable")
+DEF(TOK_builtin_printf, "__builtin_printf")
+DEF(TOK_builtin_trap, "__builtin_trap")
 /*DEF(TOK_builtin_va_list, "__builtin_va_list")*/
 #if defined TCC_TARGET_PE && defined TCC_TARGET_X86_64
 DEF(TOK_builtin_va_start, "__builtin_va_start")

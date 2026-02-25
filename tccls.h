@@ -36,6 +36,7 @@
 #define LS_REG_TYPE_DOUBLE_SOFT                                                                                        \
   4 /* double in soft-float - needs 2 int regs                                                                         \
      */
+#define LS_REG_TYPE_COMPLEX_FLOAT 5 /* Phase 3: complex float - needs 2 int regs for real+imag */
 
 /* VFP register marker - add to VFP register number to distinguish from integer
  * registers */

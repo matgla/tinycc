@@ -279,6 +279,16 @@ void tcc_ir_vreg_type_set_64bit(TCCIRState *ir, int vreg)
     interval->is_llong = 1;
 }
 
+/* Phase 3: Mark vreg as complex type */
+void tcc_ir_vreg_type_set_complex(TCCIRState *ir, int vreg)
+{
+  if (vreg < 0 || TCCIR_DECODE_VREG_TYPE(vreg) == 0)
+    return;
+  IRLiveInterval *interval = tcc_ir_vreg_live_interval(ir, vreg);
+  if (interval)
+    interval->is_complex = 1;
+}
+
 /* Set original stack offset for vreg */
 void tcc_ir_vreg_offset_set(TCCIRState *ir, int vreg, int offset)
 {
@@ -304,6 +314,9 @@ int tcc_ir_vreg_type_get(TCCIRState *ir, int vreg)
   {
     if (interval->is_llong)
       return LS_REG_TYPE_LLONG;
+    /* Phase 3: Complex types need register pairs like DOUBLE_SOFT */
+    if (interval->is_complex)
+      return LS_REG_TYPE_COMPLEX_FLOAT;
     if (interval->is_float)
     {
       if (interval->is_double)

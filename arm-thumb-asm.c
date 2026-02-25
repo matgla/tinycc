@@ -100,7 +100,8 @@ ST_FUNC void g(int c)
   if (nocode_wanted)
     return;
   /* During dry-run, don't write to section data, just track position */
-  if (tcc_gen_machine_dry_run_is_active()) {
+  if (tcc_gen_machine_dry_run_is_active())
+  {
     ind++;
     return;
   }
@@ -123,7 +124,8 @@ ST_FUNC void gen_le32(int i)
   if (nocode_wanted)
     return;
   /* During dry-run, don't write to section data, just track position */
-  if (tcc_gen_machine_dry_run_is_active()) {
+  if (tcc_gen_machine_dry_run_is_active())
+  {
     ind += 4;
     return;
   }
@@ -281,7 +283,10 @@ ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands, int nb_outputs,
   { // prolog
     /* generate reg save code */
     if (saved_regset)
-      gen_le32(0xe92d0000 | saved_regset); // push {...}
+    {
+      gen_le16(0xe92d);       /* STMDB SP!, first halfword */
+      gen_le16(saved_regset); /* register list second halfword */
+    }
 
     /* generate load code */
     for (i = 0; i < nb_operands; i++)
@@ -370,7 +375,10 @@ ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands, int nb_outputs,
 
     /* generate reg restore code */
     if (saved_regset)
-      gen_le32(0xe8bd0000 | saved_regset); // pop {...}
+    {
+      gen_le16(0xe8bd);       /* LDMIA SP!, first halfword */
+      gen_le16(saved_regset); /* register list second halfword */
+    }
   }
 }
 
@@ -436,7 +444,7 @@ static const char *skip_constraint_modifiers(const char *p)
 #define is_reg_allocated(reg) (regs_allocated[reg] & reg_mask)
 
 ST_FUNC void asm_compute_constraints(ASMOperand *operands, int nb_operands, int nb_outputs, const uint8_t *clobber_regs,
-                                     int *pout_reg)
+                                     const uint8_t *reserved_regs, int *pout_reg)
 {
   /* overall format: modifier, then ,-seperated list of alternatives; all
    * operands for a single instruction must have the same number of alternatives
@@ -536,6 +544,17 @@ instruction
       regs_allocated[i] = REG_IN_MASK | REG_OUT_MASK;
     else
       regs_allocated[i] = 0;
+  }
+  /* Also mark registers reserved by the IR register allocator (live variables).
+   * These are NOT clobbered (no save/restore in asm_gen_code), but should not be
+   * picked by the constraint solver for "r" operand allocation. */
+  if (reserved_regs)
+  {
+    for (i = 0; i < NB_ASM_REGS; i++)
+    {
+      if (reserved_regs[i])
+        regs_allocated[i] |= REG_IN_MASK | REG_OUT_MASK;
+    }
   }
   /* sp cannot be used */
   regs_allocated[13] = REG_IN_MASK | REG_OUT_MASK;

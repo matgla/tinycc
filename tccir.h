@@ -130,6 +130,9 @@ typedef enum TccIrOp
   /* No-operation placeholder for dead instructions */
   TCCIR_OP_NOP,
 
+  /* Generate a trap instruction (e.g., UDF on ARM) */
+  TCCIR_OP_TRAP,
+
   /* Jump table switch for dense case statements:
    * src1 = index vreg (already adjusted: value - min_case)
    * src2.c.i = table_id (references switch table data)
@@ -210,6 +213,7 @@ typedef struct IRLiveInterval
   uint8_t is_float : 1;        // whether this is a float/double variable
   uint8_t is_double : 1;       // whether this is a double (vs float)
   uint8_t is_llong : 1;        // whether this is a long long (64-bit int)
+  uint8_t is_complex : 1;      // Phase 3: whether this is a complex type
   uint8_t use_vfp : 1;         // whether to use VFP registers (hard float)
   uint8_t is_lvalue : 1;
   uint8_t crosses_call : 1; // whether interval spans a function call

@@ -41,6 +41,47 @@ static inline int tcc_is_float_type(int t)
 }
 
 /**
+ * Check if a type is a complex type
+ * DONE: Phase 1
+ *
+ * @param t Type value
+ * @return Non-zero if type is float _Complex or double _Complex, zero otherwise
+ */
+static inline int tcc_is_complex_type(int t)
+{
+  return (t & VT_COMPLEX) != 0;
+}
+
+/**
+ * Check if a type is float _Complex
+ * DONE: Phase 1
+ */
+static inline int tcc_is_complex_float(int t)
+{
+  return (t & (VT_COMPLEX | VT_BTYPE)) == (VT_COMPLEX | VT_FLOAT);
+}
+
+/**
+ * Check if a type is double _Complex
+ * DONE: Phase 1
+ */
+static inline int tcc_is_complex_double(int t)
+{
+  return (t & (VT_COMPLEX | VT_BTYPE)) == (VT_COMPLEX | VT_DOUBLE);
+}
+
+/**
+ * Get the base type of a complex type (real component type)
+ * DONE: Phase 1
+ */
+static inline int tcc_complex_base_type(int t)
+{
+  if (t & VT_COMPLEX)
+    return t & VT_BTYPE;  /* Returns VT_FLOAT or VT_DOUBLE */
+  return t & VT_BTYPE;
+}
+
+/**
  * Check if a type is an integer type
  *
  * @param t Type value
@@ -106,6 +147,27 @@ static inline int tcc_get_basic_type_size(int t)
   default:
     return -1;
   }
+}
+
+/**
+ * Get the size of a type in bytes, handling complex types
+ * DONE: Phase 1
+ */
+static inline int tcc_get_complex_type_size(int t)
+{
+  int bt = t & VT_BTYPE;
+  
+  /* Handle complex types */
+  if (t & VT_COMPLEX)
+  {
+    if (bt == VT_FLOAT)
+      return 8;   /* float _Complex: 2 x 4 bytes */
+    if (bt == VT_DOUBLE || bt == VT_LDOUBLE)
+      return 16; /* double _Complex: 2 x 8 bytes (ldouble is 8 on ARM) */
+  }
+  
+  /* Use basic type size for non-complex */
+  return tcc_get_basic_type_size(t);
 }
 
 /**

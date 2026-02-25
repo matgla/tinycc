@@ -802,6 +802,9 @@ ST_FUNC Sym *sym_push(int v, CType *type, int r, int c)
       int is_double = (type->t & VT_BTYPE) == VT_DOUBLE || (type->t & VT_BTYPE) == VT_LDOUBLE;
       tcc_ir_set_float_type(tcc_state->ir, vreg, 1, is_double);
     }
+    /* Mark complex parameters - needs register pairs */
+    if (type->t & VT_COMPLEX)
+      tcc_ir_vreg_type_set_complex(tcc_state->ir, vreg);
     /* Mark long long parameters */
     if ((type->t & VT_BTYPE) == VT_LLONG)
     {
@@ -825,6 +828,11 @@ ST_FUNC Sym *sym_push(int v, CType *type, int r, int c)
       {
         int is_double = (type->t & VT_BTYPE) == VT_DOUBLE || (type->t & VT_BTYPE) == VT_LDOUBLE;
         tcc_ir_set_float_type(tcc_state->ir, vreg, 1, is_double);
+      }
+      /* Mark complex variables - needs register pairs */
+      if (type->t & VT_COMPLEX)
+      {
+        tcc_ir_vreg_type_set_complex(tcc_state->ir, vreg);
       }
       /* Mark long long variables */
       if ((type->t & VT_BTYPE) == VT_LLONG)
@@ -3336,102 +3344,115 @@ static void type_to_str(char *buf, int buf_size, CType *type, const char *varstr
   buf_size -= strlen(buf);
   buf += strlen(buf);
 
-  switch (bt)
+  /* DONE: Phase 1 - Handle complex types in type_to_str() */
+  if (t & VT_COMPLEX)
   {
-  case VT_VOID:
-    tstr = "void";
-    goto add_tstr;
-  case VT_BOOL:
-    tstr = "_Bool";
-    goto add_tstr;
-  case VT_BYTE:
-    tstr = "char";
-    goto add_tstr;
-  case VT_SHORT:
-    tstr = "short";
-    goto add_tstr;
-  case VT_INT:
-    tstr = "int";
-    goto maybe_long;
-  case VT_LLONG:
-    tstr = "long long";
-  maybe_long:
-    if (t & VT_LONG)
-      tstr = "long";
-    if (!IS_ENUM(t))
-      goto add_tstr;
-    tstr = "enum ";
-    goto tstruct;
-  case VT_FLOAT:
-    tstr = "float";
-    goto add_tstr;
-  case VT_DOUBLE:
-    tstr = "double";
-    if (!(t & VT_LONG))
-      goto add_tstr;
-  case VT_LDOUBLE:
-    tstr = "long double";
-  add_tstr:
-    pstrcat(buf, buf_size, tstr);
-    break;
-  case VT_STRUCT:
-    tstr = "struct ";
-    if (IS_UNION(t))
-      tstr = "union ";
-  tstruct:
-    pstrcat(buf, buf_size, tstr);
-    v = type->ref->v & ~SYM_STRUCT;
-    if (v >= SYM_FIRST_ANOM)
-      pstrcat(buf, buf_size, "<anonymous>");
+    if (bt == VT_FLOAT)
+      pstrcat(buf, buf_size, "float _Complex");
+    else if (bt == VT_DOUBLE)
+      pstrcat(buf, buf_size, "double _Complex");
+    else if (bt == VT_LDOUBLE)
+      pstrcat(buf, buf_size, "long double _Complex");
     else
-      pstrcat(buf, buf_size, get_tok_str(v, NULL));
-    break;
-  case VT_FUNC:
-    s = type->ref;
-    buf1[0] = 0;
-    if (varstr && '*' == *varstr)
+      pstrcat(buf, buf_size, "_Complex");
+  }
+  else
+    switch (bt)
     {
-      pstrcat(buf1, sizeof(buf1), "(");
-      pstrcat(buf1, sizeof(buf1), varstr);
-      pstrcat(buf1, sizeof(buf1), ")");
-    }
-    pstrcat(buf1, buf_size, "(");
-    sa = s->next;
-    while (sa != NULL)
-    {
-      char buf2[256];
-      type_to_str(buf2, sizeof(buf2), &sa->type, NULL);
-      pstrcat(buf1, sizeof(buf1), buf2);
-      sa = sa->next;
-      if (sa)
-        pstrcat(buf1, sizeof(buf1), ", ");
-    }
-    if (s->f.func_type == FUNC_ELLIPSIS)
-      pstrcat(buf1, sizeof(buf1), ", ...");
-    pstrcat(buf1, sizeof(buf1), ")");
-    type_to_str(buf, buf_size, &s->type, buf1);
-    goto no_var;
-  case VT_PTR:
-    s = type->ref;
-    if (t & (VT_ARRAY | VT_VLA))
-    {
-      if (varstr && '*' == *varstr)
-        snprintf(buf1, sizeof(buf1), "(%s)[%d]", varstr, s->c);
+    case VT_VOID:
+      tstr = "void";
+      goto add_tstr;
+    case VT_BOOL:
+      tstr = "_Bool";
+      goto add_tstr;
+    case VT_BYTE:
+      tstr = "char";
+      goto add_tstr;
+    case VT_SHORT:
+      tstr = "short";
+      goto add_tstr;
+    case VT_INT:
+      tstr = "int";
+      goto maybe_long;
+    case VT_LLONG:
+      tstr = "long long";
+    maybe_long:
+      if (t & VT_LONG)
+        tstr = "long";
+      if (!IS_ENUM(t))
+        goto add_tstr;
+      tstr = "enum ";
+      goto tstruct;
+    case VT_FLOAT:
+      tstr = "float";
+      goto add_tstr;
+    case VT_DOUBLE:
+      tstr = "double";
+      if (!(t & VT_LONG))
+        goto add_tstr;
+    case VT_LDOUBLE:
+      tstr = "long double";
+    add_tstr:
+      pstrcat(buf, buf_size, tstr);
+      break;
+    case VT_STRUCT:
+      tstr = "struct ";
+      if (IS_UNION(t))
+        tstr = "union ";
+    tstruct:
+      pstrcat(buf, buf_size, tstr);
+      v = type->ref->v & ~SYM_STRUCT;
+      if (v >= SYM_FIRST_ANOM)
+        pstrcat(buf, buf_size, "<anonymous>");
       else
-        snprintf(buf1, sizeof(buf1), "%s[%d]", varstr ? varstr : "", s->c);
+        pstrcat(buf, buf_size, get_tok_str(v, NULL));
+      break;
+    case VT_FUNC:
+      s = type->ref;
+      buf1[0] = 0;
+      if (varstr && '*' == *varstr)
+      {
+        pstrcat(buf1, sizeof(buf1), "(");
+        pstrcat(buf1, sizeof(buf1), varstr);
+        pstrcat(buf1, sizeof(buf1), ")");
+      }
+      pstrcat(buf1, buf_size, "(");
+      sa = s->next;
+      while (sa != NULL)
+      {
+        char buf2[256];
+        type_to_str(buf2, sizeof(buf2), &sa->type, NULL);
+        pstrcat(buf1, sizeof(buf1), buf2);
+        sa = sa->next;
+        if (sa)
+          pstrcat(buf1, sizeof(buf1), ", ");
+      }
+      if (s->f.func_type == FUNC_ELLIPSIS)
+        pstrcat(buf1, sizeof(buf1), ", ...");
+      pstrcat(buf1, sizeof(buf1), ")");
+      type_to_str(buf, buf_size, &s->type, buf1);
+      goto no_var;
+    case VT_PTR:
+      s = type->ref;
+      if (t & (VT_ARRAY | VT_VLA))
+      {
+        if (varstr && '*' == *varstr)
+          snprintf(buf1, sizeof(buf1), "(%s)[%d]", varstr, s->c);
+        else
+          snprintf(buf1, sizeof(buf1), "%s[%d]", varstr ? varstr : "", s->c);
+        type_to_str(buf, buf_size, &s->type, buf1);
+        goto no_var;
+      }
+      pstrcpy(buf1, sizeof(buf1), "*");
+      if (t & VT_CONSTANT)
+        pstrcat(buf1, buf_size, "const ");
+      if (t & VT_VOLATILE)
+        pstrcat(buf1, buf_size, "volatile ");
+      if (varstr)
+        pstrcat(buf1, sizeof(buf1), varstr);
       type_to_str(buf, buf_size, &s->type, buf1);
       goto no_var;
     }
-    pstrcpy(buf1, sizeof(buf1), "*");
-    if (t & VT_CONSTANT)
-      pstrcat(buf1, buf_size, "const ");
-    if (t & VT_VOLATILE)
-      pstrcat(buf1, buf_size, "volatile ");
-    if (varstr)
-      pstrcat(buf1, sizeof(buf1), varstr);
-    type_to_str(buf, buf_size, &s->type, buf1);
-    goto no_var;
-  }
   if (varstr)
   {
     pstrcat(buf, buf_size, " ");
@@ -3723,6 +3744,13 @@ static int combine_types(CType *dest, SValue *op1, SValue *op2, int op)
     {
       type.t = VT_FLOAT;
     }
+    /* Phase 3: Propagate VT_COMPLEX flag if either operand is complex.
+     * Complex arithmetic follows usual arithmetic conversions:
+     * - If either operand is complex, the result is complex
+     * - For mixed real/complex: real is converted to complex then operation
+     */
+    if ((t1 & VT_COMPLEX) || (t2 & VT_COMPLEX))
+      type.t |= VT_COMPLEX;
   }
   else if (bt1 == VT_LLONG || bt2 == VT_LLONG)
   {
@@ -4166,9 +4194,16 @@ again:
    change the type and read it still later. */
 #define ALLOW_SUBTYPE_ACCESS 1
 
-    if (ALLOW_SUBTYPE_ACCESS && (vtop->r & VT_LVAL))
+    if (ALLOW_SUBTYPE_ACCESS && (vtop->r & VT_LVAL) && !tcc_state->ir)
     {
-      /* value still in memory */
+      /* value still in memory.
+       * NOTE: This optimization is disabled in IR mode because the IR
+       * backend may promote stack lvalues to registers during register
+       * allocation.  When that happens the byte/halfword memory load
+       * that would have done the extension is replaced by a plain
+       * register-to-register move, silently dropping the extension.
+       * Falling through to the SHL+SAR path below generates explicit
+       * IR instructions for the extension which survive regalloc. */
       if (ds <= ss)
       {
         /* For IR mode: when casting from long long to smaller type,
@@ -4305,6 +4340,22 @@ ST_FUNC int type_size(const CType *type, int *a)
   int bt;
 
   bt = type->t & VT_BTYPE;
+
+  /* DONE: Phase 1 - Handle complex types in type_size() */
+  if (type->t & VT_COMPLEX)
+  {
+    if (bt == VT_FLOAT)
+    {
+      *a = 4;   /* Alignment of float */
+      return 8; /* 2 x 4 bytes */
+    }
+    else if (bt == VT_DOUBLE || bt == VT_LDOUBLE)
+    {
+      *a = 8;    /* Alignment of double */
+      return 16; /* 2 x 8 bytes */
+    }
+  }
+
   if (bt == VT_STRUCT)
   {
     /* struct/union */
@@ -4371,6 +4422,19 @@ ST_FUNC int type_size(const CType *type, int *a)
   }
   /* unreachable - all branches above return, but TCC's flow analysis
      needs an explicit return to avoid 'function might return no value' */
+  return 0;
+}
+
+/* Return 1 if a struct/union type has any VLA (variable-length array)
+   member field that requires dynamic stack allocation. */
+static int struct_has_vla_member(const CType *type)
+{
+  Sym *f;
+  if ((type->t & VT_BTYPE) != VT_STRUCT)
+    return 0;
+  for (f = type->ref->next; f; f = f->next)
+    if (f->type.t & VT_VLA)
+      return 1;
   return 0;
 }
 
@@ -5877,7 +5941,14 @@ static int parse_btype(CType *type, AttributeDef *ad, int ignore_label)
       u = VT_BOOL;
       goto basic_type;
     case TOK_COMPLEX:
-      tcc_error("_Complex is not yet supported");
+    case TOK_COMPLEX_GCC:
+      /* DONE: Phase 1 - Mark that we saw _Complex, will combine with float/double */
+      if (t & VT_COMPLEX)
+        tcc_error("duplicate _Complex specifier");
+      t |= VT_COMPLEX;
+      typespec_found = 1;
+      next();
+      break;
     case TOK_FLOAT:
       u = VT_FLOAT;
       goto basic_type;
@@ -6474,6 +6545,52 @@ static void gfunc_param_typed(Sym *func, Sym *arg)
   func_type = func->f.func_type;
   if (func_type == FUNC_OLD || (func_type == FUNC_ELLIPSIS && arg == NULL))
   {
+    /* ARM EABI AAPCS: Composite types (struct/union) larger than 4 words (16
+     * bytes) must be passed by invisible reference even without a prototype,
+     * since the ABI convention must be followed regardless of whether the
+     * prototype is visible to the caller. */
+    if ((vtop->type.t & VT_BTYPE) == VT_STRUCT)
+    {
+      int align, size = type_size(&vtop->type, &align);
+      if (size > 16)
+      {
+        /* Pass by invisible reference: caller must allocate a temporary copy
+         * and pass a pointer to that copy (AAPCS). Passing the original
+         * object's address would break C's by-value semantics. */
+        if (nocode_wanted)
+          return;
+
+        if (!(vtop->r & VT_LVAL))
+        {
+          /* For now we require an lvalue source; most struct expressions in
+           * TCC are materialized as lvalues already. */
+          tcc_error("cannot pass large struct by value");
+        }
+
+        int temp_vr;
+        int tmp_loc = get_temp_local_var(size, align, &temp_vr);
+
+        /* Store the source struct into the temporary destination.
+         * vstore() will emit a memmove() for struct types. */
+        {
+          SValue dst;
+          memset(&dst, 0, sizeof(dst));
+          dst.type = vtop->type;
+          dst.r = VT_LOCAL | VT_LVAL;
+          dst.vr = temp_vr;
+          dst.c.i = tmp_loc;
+          vpushv(&dst);
+          vswap();
+          vstore();
+        }
+
+        /* Convert the temp lvalue to a pointer argument. */
+        mk_pointer(&vtop->type);
+        gaddrof();
+        return;
+      }
+    }
+
     /* default casting : only need to convert float to double */
     if ((vtop->type.t & VT_BTYPE) == VT_FLOAT)
     {
@@ -6999,6 +7116,91 @@ tok_next:
       gen_op('+');
     }
     break;
+  case TOK_REAL:
+  case TOK_IMAG:
+    /* Phase 4 - __real__ and __imag__ operators */
+    t = tok;
+    next();
+    unary();
+    if (!(vtop->type.t & VT_COMPLEX))
+    {
+      if (t == TOK_REAL)
+      {
+        /* __real__ on non-complex is a no-op */
+      }
+      else
+      {
+        /* __imag__ on non-complex returns 0 */
+        vpop();
+        vpushi(0);
+      }
+    }
+    else
+    {
+      /* Phase 4: Extract real or imaginary part from complex value
+       * Complex float is stored as { real, imag } - two consecutive floats
+       * We need to load the appropriate component
+       */
+      int is_real = (t == TOK_REAL);
+      int base_type = vtop->type.t & VT_BTYPE;
+      int result_type;
+
+      /* Determine the result type (real component type) */
+      if (base_type == VT_DOUBLE)
+        result_type = VT_DOUBLE;
+      else
+        result_type = VT_FLOAT;
+
+      /* The complex value is on the stack, we need to access its components */
+      if ((vtop->r & VT_VALMASK) == VT_LOCAL)
+      {
+        /* Stack variable: adjust offset to access real or imag part */
+        if (!is_real)
+        {
+          /* Imaginary part is at offset +4 for float, +8 for double */
+          int offset = (base_type == VT_DOUBLE) ? 8 : 4;
+          vtop->c.i += offset;
+        }
+        /* Change type to the base floating point type */
+        vtop->type.t = (vtop->type.t & ~VT_BTYPE & ~VT_COMPLEX) | result_type;
+      }
+      else if (vtop->r & VT_LVAL)
+      {
+        /* L-value: dereference and load appropriate component */
+        int offset = is_real ? 0 : ((base_type == VT_DOUBLE) ? 8 : 4);
+
+        /* Add offset to address */
+        if (offset > 0)
+        {
+          vpushi(offset);
+          gen_op('+');
+        }
+
+        /* Load the value */
+        vtop->type.t = (vtop->type.t & ~VT_BTYPE & ~VT_COMPLEX) | result_type | VT_LVAL;
+        vtop->r = (vtop->r & ~VT_VALMASK) | VT_LOCAL;
+      }
+      else
+      {
+        /* For register values, we need special handling */
+        /* Complex values use register pairs: (r0, r1) for float complex */
+        /* Real part is in lower register, imag in higher */
+        if (is_real)
+        {
+          /* Real part is already in pr0_reg, just change type */
+          vtop->type.t = (vtop->type.t & ~VT_BTYPE & ~VT_COMPLEX) | result_type;
+        }
+        else
+        {
+          /* Imaginary part is in pr1_reg, need to move it */
+          vtop->r = (vtop->r & ~VT_VALMASK) | VT_LOCAL; /* Force reload pattern */
+          vtop->type.t = (vtop->type.t & ~VT_BTYPE & ~VT_COMPLEX) | result_type | VT_LVAL;
+          /* For now, mark as needing offset for imag part */
+          vtop->c.i = (base_type == VT_DOUBLE) ? 8 : 4;
+        }
+      }
+    }
+    break;
   case TOK_SIZEOF:
   case TOK_ALIGNOF1:
   case TOK_ALIGNOF2:
@@ -7085,6 +7287,13 @@ tok_next:
     vpush(&type);
     CODE_OFF();
     break;
+  case TOK_builtin_trap:
+    parse_builtin_params(0, ""); /* just skip '()' */
+    /* Generate a trap instruction through the IR */
+    tcc_ir_put(tcc_state->ir, TCCIR_OP_TRAP, NULL, NULL, NULL);
+    type.t = VT_VOID;
+    vpush(&type);
+    break;
   case TOK_builtin_frame_address:
   case TOK_builtin_return_address:
   {
@@ -7098,6 +7307,34 @@ tok_next:
     skip(')');
     type.t = VT_VOID;
     mk_pointer(&type);
+#ifdef TCC_TARGET_ARM
+    if (level > 0)
+    {
+      /* ARM Thumb: frame chain walking for level>0 is not supported.
+       * Return NULL, which is a valid implementation
+       * (GCC torture tests accept NULL for unsupported levels). */
+      vpushi(0);
+      vtop->type = type;
+    }
+    else
+    {
+      /* level == 0: force standard frame record {FP, LR} */
+      tcc_state->force_frame_pointer = 1;
+      if (tok1 == TOK_builtin_return_address)
+        tcc_state->force_lr_save = 1;
+      vset(&type, VT_LOCAL, 0); /* FP value */
+      if (tok1 == TOK_builtin_return_address)
+      {
+        /* LR is at [FP + PTR_SIZE] in the standard frame record */
+        vpushi(PTR_SIZE);
+        gen_op('+');
+        mk_pointer(&vtop->type);
+        indir();
+      }
+    }
+#else
+    /* Non-ARM targets: original chain-walking implementation */
+    tcc_state->force_frame_pointer = 1;
     vset(&type, VT_LOCAL, 0); /* local frame */
     while (level--)
     {
@@ -7110,11 +7347,7 @@ tok_next:
     }
     if (tok1 == TOK_builtin_return_address)
     {
-      // assume return address is just above frame pointer on stack
-#ifdef TCC_TARGET_ARM
-      vpushi(2 * PTR_SIZE);
-      gen_op('+');
-#elif defined TCC_TARGET_RISCV64
+#ifdef TCC_TARGET_RISCV64
       vpushi(PTR_SIZE);
       gen_op('-');
 #else
@@ -7124,6 +7357,7 @@ tok_next:
       mk_pointer(&vtop->type);
       indir();
     }
+#endif
   }
   break;
 #ifdef TCC_TARGET_RISCV64
@@ -10801,6 +11035,94 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has
     cur_scope->vla.loc = addr;
     cur_scope->vla.num++;
   }
+  else if ((r & VT_VALMASK) == VT_LOCAL
+           && struct_has_vla_member(type)
+           && !NODATA_WANTED)
+  {
+    /* The struct contains VLA member(s).  Each VLA field in the struct
+       is represented as a pointer; we must dynamically allocate the
+       backing storage on the stack and store the pointer into the
+       struct field so that subsequent accesses go to valid memory. */
+    Sym *f;
+    int a;
+
+    if (tcc_state->ir)
+      tcc_state->force_frame_pointer = 1;
+
+    for (f = type->ref->next; f; f = f->next)
+    {
+      if (!(f->type.t & VT_VLA))
+        continue;
+
+      /* save before-VLA stack pointer if needed */
+      if (cur_scope->vla.num == 0)
+      {
+        if (cur_scope->prev && cur_scope->prev->vla.num)
+        {
+          cur_scope->vla.locorig = cur_scope->prev->vla.loc;
+        }
+        else
+        {
+          loc -= PTR_SIZE;
+          if (tcc_state->ir)
+          {
+            SValue dst;
+            memset(&dst, 0, sizeof(dst));
+            dst.type.t = VT_PTR;
+            dst.r = VT_LOCAL | VT_LVAL;
+            dst.c.i = loc;
+            dst.vr = -1;
+            tcc_ir_put(tcc_state->ir, TCCIR_OP_VLA_SP_SAVE, NULL, NULL, &dst);
+          }
+          else
+          {
+            gen_vla_sp_save(loc);
+          }
+          cur_scope->vla.locorig = loc;
+        }
+      }
+
+      /* Push VLA runtime size and emit VLA_ALLOC */
+      vpush_type_size(&f->type, &a);
+      if (tcc_state->ir)
+      {
+        SValue size_sv = *vtop;
+        SValue align_sv;
+        memset(&align_sv, 0, sizeof(align_sv));
+        align_sv.type.t = VT_INT;
+        align_sv.r = VT_CONST;
+        align_sv.c.i = a;
+        align_sv.vr = -1;
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_VLA_ALLOC, &size_sv, &align_sv, NULL);
+        vpop();
+      }
+      else
+      {
+        gen_vla_alloc(&f->type, a);
+      }
+
+      /* Save new SP (the VLA data pointer) into the struct field */
+      {
+        int field_addr = addr + f->c;
+        if (tcc_state->ir)
+        {
+          SValue dst;
+          memset(&dst, 0, sizeof(dst));
+          dst.type.t = VT_PTR;
+          dst.r = VT_LOCAL | VT_LVAL;
+          dst.c.i = field_addr;
+          dst.vr = -1;
+          tcc_ir_put(tcc_state->ir, TCCIR_OP_VLA_SP_SAVE, NULL, NULL, &dst);
+        }
+        else
+        {
+          gen_vla_sp_save(field_addr);
+        }
+        cur_scope->vla.loc = field_addr;
+      }
+      cur_scope->vla.num++;
+    }
+  }
   else if (has_init)
   {
     p.sec = sec;
@@ -11359,6 +11681,7 @@ static void gen_function(Sym *sym)
   /* Reset per-function flags */
   tcc_state->force_frame_pointer = 0;
   tcc_state->need_frame_pointer = 0;
+  tcc_state->force_lr_save = 0;
 
   /* Save global label stack position so we only pop labels from this function */
   global_label_stack_start = global_label_stack;
@@ -11495,6 +11818,12 @@ static void gen_function(Sym *sym)
      */
     if (tcc_state->opt_const_prop)
       changes += tcc_ir_opt_value_tracking(ir);
+
+    /* Phase 1e: Non-negative value branch folding - fold soft-float comparisons
+     * of known non-negative values (e.g. fabs(x)) against zero.
+     */
+    if (tcc_state->opt_nonneg_fold)
+      changes += tcc_ir_opt_nonneg_branch_fold(ir);
 
     /* Phase 2: Copy Propagation */
     if (tcc_state->opt_copy_prop)
@@ -11665,6 +11994,9 @@ static void gen_function(Sym *sym)
   /* Recompute leafness after IR optimizations.
    * IR construction marks the function non-leaf as soon as a call op is
    * emitted, but DCE/other passes can delete calls.
+   *
+   * Complex FP operations (FADD/FSUB/FMUL/FDIV on complex operands) are
+   * also non-leaf: they expand to __aeabi_f* calls during code generation.
    */
   {
     ir->leaffunc = 1;
@@ -11675,6 +12007,16 @@ static void gen_function(Sym *sym)
       {
         ir->leaffunc = 0;
         break;
+      }
+      /* Complex FP ops expand to soft-float BL calls during codegen */
+      if (q->op == TCCIR_OP_FADD || q->op == TCCIR_OP_FSUB || q->op == TCCIR_OP_FMUL || q->op == TCCIR_OP_FDIV)
+      {
+        IROperand dest = tcc_ir_op_get_dest(ir, q);
+        if (dest.is_complex)
+        {
+          ir->leaffunc = 0;
+          break;
+        }
       }
     }
   }

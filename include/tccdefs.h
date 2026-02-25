@@ -376,6 +376,8 @@ __BOTH(void *, alloca, (__SIZE_TYPE__))
 __BUILTIN(void *, alloca, (__SIZE_TYPE__))
 #endif
 __BUILTIN(void, abort, (void))
+__BUILTIN(void, exit, (int))
+__BUILTIN(int, printf, (const char *, ...))
 __BOUND(void, longjmp, ())
 #if !defined _WIN32
 __BOUND(void *, mmap, ())

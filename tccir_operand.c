@@ -321,6 +321,7 @@ IROperand svalue_to_iroperand(TCCIRState *ir, const SValue *sv)
   int has_sym = (sv->r & VT_SYM) ? 1 : 0;
   int vt_btype = sv->type.t & VT_BTYPE;
   int irop_bt = vt_btype_to_irop_btype(vt_btype);
+  int is_complex = (sv->type.t & VT_COMPLEX) ? 1 : 0;  /* DONE: Phase 2 */
 
   IROperand result;
 
@@ -396,15 +397,22 @@ IROperand svalue_to_iroperand(TCCIRState *ir, const SValue *sv)
     goto done;
   }
 
-  /* Case 5: Double constant - pool F64 */
-  if (vt_btype == VT_DOUBLE && val_kind == VT_CONST)
+  /* Case 5: Double/Long Double constant - pool F64 */
+  if ((vt_btype == VT_DOUBLE || vt_btype == VT_LDOUBLE) && val_kind == VT_CONST)
   {
     union
     {
       double d;
       uint64_t bits;
     } u;
-    u.d = sv->c.d;
+    /* Handle cross-compilation where host and target have different long double sizes.
+     * If host's long double is larger than target's, cast to double first. */
+    if (vt_btype == VT_LDOUBLE && sizeof(long double) != LDOUBLE_SIZE)
+      u.d = (double)sv->c.ld;
+    else if (vt_btype == VT_LDOUBLE)
+      u.d = (double)sv->c.ld;  /* Same size, but access through double for bit extraction */
+    else
+      u.d = sv->c.d;
     uint32_t idx = tcc_ir_pool_add_f64(ir, u.bits);
     result = irop_make_f64(vr, idx);
     result.is_lval = is_lval;
@@ -458,6 +466,9 @@ IROperand svalue_to_iroperand(TCCIRState *ir, const SValue *sv)
   }
 
 done:
+  /* DONE: Phase 2 - Set complex type flag in IROperand */
+  result.is_complex = is_complex;
+  
   /* For STRUCT types, encode CType pool index + preserve original data in split format */
   if (irop_bt == IROP_BTYPE_STRUCT)
   {
@@ -491,6 +502,9 @@ done:
     /* Other tags (IMM32, etc.) - shouldn't happen for structs, leave as-is */
   }
 
+  /* DONE: Phase 2 - Set complex flag for all paths */
+  result.is_complex = is_complex;
+
   /* Debug: verify round-trip conversion preserves data */
   // irop_compare_svalue(ir, sv, result, "svalue_to_iroperand");
   return result;
@@ -511,6 +525,10 @@ void iroperand_to_svalue(const TCCIRState *ir, IROperand op, SValue *out)
 
   /* Restore type.t from compressed btype (unless overridden below) */
   out->type.t = irop_btype_to_vt_btype(irop_bt);
+  
+  /* DONE: Phase 2 - Restore complex type flag from IROperand to SValue */
+  if (op.is_complex)
+    out->type.t |= VT_COMPLEX;
 
   switch (tag)
   {

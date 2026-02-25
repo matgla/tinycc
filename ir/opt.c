@@ -149,7 +149,8 @@ int tcc_ir_opt_dce(TCCIRState *ir)
       break;
     case TCCIR_OP_RETURNVALUE:
     case TCCIR_OP_RETURNVOID:
-      /* Return - no successor (epilogue is implicit) */
+    case TCCIR_OP_TRAP:
+      /* Return/trap - no successor (epilogue is implicit, trap never returns) */
       break;
     default:
       /* All other instructions fall through to the next */
@@ -340,9 +341,14 @@ int tcc_ir_opt_const_prop(TCCIRState *ir)
         /* If the address of a local is taken, it can be modified through aliases
          * (e.g. passed as an out-parameter). Such variables are not safe for
          * constant propagation even if they are only assigned once.
+         *
+         * Complex types (_Complex float/double) are stored as register pairs
+         * (real, imag) but the constant tracker only records a single scalar
+         * value. Propagating that scalar would replace both halves with the
+         * same value, corrupting the imaginary part.
          */
         IRLiveInterval *interval = tcc_ir_get_live_interval(ir, dest_vr);
-        if (interval && interval->addrtaken)
+        if (interval && (interval->addrtaken || interval->is_complex))
         {
           var_info[pos].def_count++;
           var_info[pos].is_constant = 0;
@@ -2372,9 +2378,10 @@ int tcc_ir_opt_sl_forward(TCCIRState *ir)
    * When a LOAD's address vreg was written AFTER a matching store,
    * the store-load forward is invalid because the vreg now holds a
    * different value than what was stored. */
-  typedef struct {
-    int last_write_idx;  /* instruction index of last write, -1 if none */
-    int gen;             /* generation counter, valid only if gen == current_gen */
+  typedef struct
+  {
+    int last_write_idx; /* instruction index of last write, -1 if none */
+    int gen;            /* generation counter, valid only if gen == current_gen */
   } VregWriteTracker;
 
   int n = ir->next_instruction_index;
@@ -2486,15 +2493,16 @@ int tcc_ir_opt_sl_forward(TCCIRState *ir)
               tracker = &tmp_writes[vr_pos];
             else if (vr_type == TCCIR_VREG_TYPE_PARAM && vr_pos <= max_par)
               tracker = &par_writes[vr_pos];
-            if (tracker && tracker->gen == write_tracker_gen &&
-                tracker->last_write_idx > e->instruction_idx)
+            if (tracker && tracker->gen == write_tracker_gen && tracker->last_write_idx > e->instruction_idx)
             {
               /* The LOAD's address vreg was written after the store — skip */
               continue;
             }
           }
 #ifdef TCC_REGALLOC_DEBUG
-          fprintf(stderr, "[SL-FWD] i=%d LOAD replaced by ASSIGN from store at i=%d, stored_vr=0x%x, load_addr_vr=0x%x, offset=%lld\n",
+          fprintf(stderr,
+                  "[SL-FWD] i=%d LOAD replaced by ASSIGN from store at i=%d, stored_vr=0x%x, load_addr_vr=0x%x, "
+                  "offset=%lld\n",
                   i, e->instruction_idx, irop_get_vreg(e->stored_value), addr_vr, (long long)addr_offset);
 #endif
 #ifdef DEBUG_IR_GEN
@@ -2587,8 +2595,8 @@ int tcc_ir_opt_sl_forward(TCCIRState *ir)
       hash_table[h] = new_entry;
 
 #ifdef TCC_REGALLOC_DEBUG
-      fprintf(stderr, "[SL-STORE] i=%d store_val_vr=0x%x store_addr_vr=0x%x offset=%lld n=%d\n",
-              i, irop_get_vreg(new_entry->stored_value), addr_vr, (long long)addr_offset, ir->next_instruction_index);
+      fprintf(stderr, "[SL-STORE] i=%d store_val_vr=0x%x store_addr_vr=0x%x offset=%lld n=%d\n", i,
+              irop_get_vreg(new_entry->stored_value), addr_vr, (long long)addr_offset, ir->next_instruction_index);
 #endif
 
 #ifdef DEBUG_IR_GEN
@@ -2613,8 +2621,8 @@ int tcc_ir_opt_sl_forward(TCCIRState *ir)
           if (irop_get_vreg(entries[j].stored_value) == dest_vr)
           {
 #ifdef TCC_REGALLOC_DEBUG
-            fprintf(stderr, "[SL-INVAL-VAL] i=%d invalidate store at si=%d (stored_val_vr=0x%x redefined) n=%d\n",
-                    i, entries[j].instruction_idx, dest_vr, ir->next_instruction_index);
+            fprintf(stderr, "[SL-INVAL-VAL] i=%d invalidate store at si=%d (stored_val_vr=0x%x redefined) n=%d\n", i,
+                    entries[j].instruction_idx, dest_vr, ir->next_instruction_index);
 #endif
             entries[j].valid = 0;
           }
@@ -2820,6 +2828,392 @@ int tcc_ir_opt_store_redundant(TCCIRState *ir)
 #ifdef DEBUG_IR_GEN
   printf("=== REDUNDANT STORE ELIMINATION END: %d changes ===\n", changes);
 #endif
+
+  return changes;
+}
+
+/* ============================================================================
+ * Non-Negative Value Tracking & Branch Folding
+ * ============================================================================
+ *
+ * Recognizes that return values of functions like fabs/fabsf/abs/labs are
+ * always >= 0, and uses this to fold soft-float comparisons against zero.
+ *
+ * Pattern (soft-float):
+ *   FUNCPARAMVAL  P0, call_A:0          ; pass argument to fabs
+ *   FUNCCALLVAL   fabs --> V_result     ; V_result is always >= 0
+ *   ...
+ *   FUNCPARAMVAL  V_result, call_B:0    ; first arg to compare
+ *   FUNCPARAMVAL  #0, call_B:1          ; second arg is 0.0
+ *   FUNCCALLVAL   __aeabi_dcmpge        ; compares V_result >= 0.0
+ *   JUMPIF cond, target                 ; can be folded
+ *
+ * The key insight: if one argument to a float comparison is known non-negative
+ * and the other is zero (or negative), certain comparisons have known results:
+ *   fabs(x) >= 0.0  => always true
+ *   fabs(x) <  0.0  => always false
+ *   fabs(x) <= 0.0  => unknown (could be == 0)
+ *   fabs(x) >  0.0  => unknown (could be == 0)
+ *   fabs(x) == 0.0  => unknown
+ *   fabs(x) != 0.0  => unknown
+ */
+
+/* Table of functions known to return non-negative values */
+static const char *nonneg_func_names[] = {
+    "fabs",
+    "fabsf",
+    "abs",
+    "labs",
+    "llabs",
+    "strlen",
+    "sizeof",
+};
+#define NUM_NONNEG_FUNCS (sizeof(nonneg_func_names) / sizeof(nonneg_func_names[0]))
+
+/* Flag-setting soft-float comparison function names.
+ * __aeabi_cdcmple / __aeabi_cfcmple set ARM condition flags for a CMP-like
+ * operation. The subsequent JUMPIF tests those flags with a TOK_* condition.
+ * This is the default path used by TCC's soft-float FCMP lowering.
+ */
+static const char *flag_cmp_funcs[] = {
+    "__aeabi_cdcmple",
+    "__aeabi_cfcmple",
+};
+#define NUM_FLAG_CMP_FUNCS (sizeof(flag_cmp_funcs) / sizeof(flag_cmp_funcs[0]))
+
+/* Maximum number of non-negative vregs to track simultaneously */
+#define MAX_NONNEG_VREGS 32
+
+/* Maximum number of pending call parameters to track */
+#define MAX_PENDING_PARAMS 16
+
+typedef struct
+{
+  int call_id;
+  int param_idx;
+  int32_t vreg;     /* -1 if immediate */
+  int is_immediate; /* 1 if the parameter is an immediate value */
+  int64_t imm_val;  /* immediate value (if is_immediate) */
+} PendingParam;
+
+int tcc_ir_opt_nonneg_branch_fold(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  int changes = 0;
+
+  if (n < 3)
+    return 0;
+
+  /* Phase 1: Identify which vregs hold non-negative values.
+   * We track full 32-bit vreg IDs (type + position). */
+  int32_t nonneg_vregs[MAX_NONNEG_VREGS];
+  int nonneg_count = 0;
+
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_FUNCCALLVAL)
+      continue;
+
+    IROperand src1 = tcc_ir_op_get_src1(ir, q);
+    Sym *callee = irop_get_sym_ex(ir, src1);
+    if (!callee)
+      continue;
+
+    const char *name = get_tok_str(callee->v, NULL);
+    if (!name)
+      continue;
+
+    int is_nonneg = 0;
+    for (size_t j = 0; j < NUM_NONNEG_FUNCS; j++)
+    {
+      if (strcmp(name, nonneg_func_names[j]) == 0)
+      {
+        is_nonneg = 1;
+        break;
+      }
+    }
+
+    if (is_nonneg)
+    {
+      IROperand dest = tcc_ir_op_get_dest(ir, q);
+      int32_t vreg = irop_get_vreg(dest);
+      if (vreg >= 0 && nonneg_count < MAX_NONNEG_VREGS)
+      {
+        nonneg_vregs[nonneg_count++] = vreg;
+#ifdef DEBUG_IR_GEN
+        printf("NONNEG: vreg 0x%x is non-negative from call to '%s' at i=%d\n", vreg, name, i);
+#endif
+      }
+    }
+  }
+
+  if (nonneg_count == 0)
+    return 0;
+
+  /* Phase 2: Find flag-setting soft-float comparison calls
+   * (__aeabi_cdcmple / __aeabi_cfcmple) where:
+   *   - Parameter 0 is a non-negative vreg and parameter 1 is zero (or vice versa)
+   * Then determine the JUMPIF outcome from the condition token.
+   *
+   * cdcmple(a, b) sets flags as if CMP a, b. The JUMPIF condition token
+   * directly encodes the comparison semantics (GE, LT, etc.).
+   *
+   * When a = nonneg >= 0 and b = 0:
+   *   TOK_GE / TOK_UGE: nonneg >= 0 → ALWAYS TRUE  → jump always taken
+   *   TOK_LT / TOK_ULT: nonneg <  0 → ALWAYS FALSE → jump never taken
+   *   Others (EQ, NE, GT, LE): result depends on whether nonneg == 0 → UNKNOWN
+   *
+   * When a = 0 and b = nonneg >= 0 (reversed):
+   *   TOK_LE / TOK_ULE: 0 <= nonneg → ALWAYS TRUE  → jump always taken
+   *   TOK_GT / TOK_UGT: 0 >  nonneg → ALWAYS FALSE → jump never taken
+   *   Others: UNKNOWN
+   */
+
+  PendingParam params[MAX_PENDING_PARAMS];
+  int param_count = 0;
+
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+
+    /* Collect FUNCPARAMVAL instructions */
+    if (q->op == TCCIR_OP_FUNCPARAMVAL)
+    {
+      IROperand src1 = tcc_ir_op_get_src1(ir, q);
+      IROperand src2 = tcc_ir_op_get_src2(ir, q);
+      uint32_t encoded = (uint32_t)irop_get_imm64_ex(ir, src2);
+      int call_id = TCCIR_DECODE_CALL_ID(encoded);
+      int param_idx = TCCIR_DECODE_PARAM_IDX(encoded);
+
+      if (param_count < MAX_PENDING_PARAMS)
+      {
+        PendingParam *pp = &params[param_count++];
+        pp->call_id = call_id;
+        pp->param_idx = param_idx;
+        pp->is_immediate = irop_is_immediate(src1);
+        if (pp->is_immediate)
+        {
+          pp->vreg = -1;
+          pp->imm_val = irop_get_imm64_ex(ir, src1);
+        }
+        else
+        {
+          pp->vreg = irop_get_vreg(src1);
+          pp->imm_val = 0;
+        }
+      }
+      continue;
+    }
+
+    /* Check FUNCCALLVOID for flag-setting soft-float comparison. */
+    if (q->op != TCCIR_OP_FUNCCALLVOID)
+    {
+      if (q->op != TCCIR_OP_FUNCPARAMVOID && q->op != TCCIR_OP_NOP &&
+          q->op != TCCIR_OP_FUNCCALLVAL)
+        param_count = 0;
+      continue;
+    }
+
+    IROperand call_src1 = tcc_ir_op_get_src1(ir, q);
+    IROperand call_src2 = tcc_ir_op_get_src2(ir, q);
+    Sym *callee = irop_get_sym_ex(ir, call_src1);
+    if (!callee)
+    {
+      param_count = 0;
+      continue;
+    }
+
+    const char *cmp_name = get_tok_str(callee->v, NULL);
+    if (!cmp_name)
+    {
+      param_count = 0;
+      continue;
+    }
+
+    /* Check if this is a flag-setting comparison function */
+    int is_flag_cmp = 0;
+    for (size_t j = 0; j < NUM_FLAG_CMP_FUNCS; j++)
+    {
+      if (strcmp(cmp_name, flag_cmp_funcs[j]) == 0)
+      {
+        is_flag_cmp = 1;
+        break;
+      }
+    }
+
+    if (!is_flag_cmp)
+    {
+      param_count = 0;
+      continue;
+    }
+
+    /* Found a flag-setting comparison. Extract call_id to match params. */
+    uint32_t call_encoded = (uint32_t)irop_get_imm64_ex(ir, call_src2);
+    int call_id = TCCIR_DECODE_CALL_ID(call_encoded);
+
+    /* Find param 0 and param 1 for this call_id */
+    PendingParam *p0 = NULL, *p1 = NULL;
+    for (int p = 0; p < param_count; p++)
+    {
+      if (params[p].call_id == call_id)
+      {
+        if (params[p].param_idx == 0)
+          p0 = &params[p];
+        else if (params[p].param_idx == 1)
+          p1 = &params[p];
+      }
+    }
+
+    if (!p0 || !p1)
+    {
+      param_count = 0;
+      continue;
+    }
+
+    /* Determine argument layout: which is nonneg and which is zero */
+    int nonneg_is_arg0 = 0; /* 1 if cdcmple(nonneg, 0), 0 if cdcmple(0, nonneg) */
+    int pattern_found = 0;
+
+    /* Check pattern: param0 is non-negative vreg, param1 is zero */
+    if (!p0->is_immediate && p0->vreg >= 0 && p1->is_immediate && p1->imm_val == 0)
+    {
+      for (int k = 0; k < nonneg_count; k++)
+      {
+        if (nonneg_vregs[k] == p0->vreg)
+        {
+          nonneg_is_arg0 = 1;
+          pattern_found = 1;
+          break;
+        }
+      }
+    }
+    /* Check reverse: param0 is zero, param1 is non-negative vreg */
+    else if (p0->is_immediate && p0->imm_val == 0 && !p1->is_immediate && p1->vreg >= 0)
+    {
+      for (int k = 0; k < nonneg_count; k++)
+      {
+        if (nonneg_vregs[k] == p1->vreg)
+        {
+          nonneg_is_arg0 = 0;
+          pattern_found = 1;
+          break;
+        }
+      }
+    }
+
+    if (!pattern_found)
+    {
+      param_count = 0;
+      continue;
+    }
+
+    /* Find the JUMPIF that follows this FUNCCALLVOID.
+     * It should be the very next non-NOP instruction. */
+    int jumpif_idx = -1;
+    for (int j = i + 1; j < n && j <= i + 3; j++)
+    {
+      if (ir->compact_instructions[j].op == TCCIR_OP_NOP)
+        continue;
+      if (ir->compact_instructions[j].op == TCCIR_OP_JUMPIF)
+      {
+        jumpif_idx = j;
+        break;
+      }
+      break;
+    }
+
+    if (jumpif_idx < 0)
+    {
+      param_count = 0;
+      continue;
+    }
+
+    IRQuadCompact *jump_q = &ir->compact_instructions[jumpif_idx];
+    IROperand jmp_cond = tcc_ir_op_get_src1(ir, jump_q);
+    IROperand jmp_dest = tcc_ir_op_get_dest(ir, jump_q);
+    int cond_tok = (int)irop_get_imm64_ex(ir, jmp_cond);
+
+    /* Determine if the branch is always/never taken based on
+     * the condition token and which argument is non-negative.
+     *
+     * cdcmple(a, b) sets flags for "a CMP b".
+     * JUMPIF condition tests those flags. */
+    int fold_result = -1; /* -1 = unknown, 0 = never taken, 1 = always taken */
+
+    if (nonneg_is_arg0)
+    {
+      /* cdcmple(nonneg, 0): flags for "nonneg CMP 0" */
+      switch (cond_tok)
+      {
+      case TOK_GE:
+      case TOK_UGE:
+        fold_result = 1; /* nonneg >= 0: always true */
+        break;
+      case TOK_LT:
+      case TOK_ULT:
+        fold_result = 0; /* nonneg < 0: always false */
+        break;
+      default:
+        fold_result = -1; /* unknown */
+        break;
+      }
+    }
+    else
+    {
+      /* cdcmple(0, nonneg): flags for "0 CMP nonneg" */
+      switch (cond_tok)
+      {
+      case TOK_LE:
+      case TOK_ULE:
+        fold_result = 1; /* 0 <= nonneg: always true */
+        break;
+      case TOK_GT:
+      case TOK_UGT:
+        fold_result = 0; /* 0 > nonneg: always false */
+        break;
+      default:
+        fold_result = -1;
+        break;
+      }
+    }
+
+    if (fold_result < 0)
+    {
+      param_count = 0;
+      continue;
+    }
+
+    if (fold_result == 1)
+    {
+      /* Branch always taken → convert JUMPIF to unconditional JUMP. */
+      jump_q->op = TCCIR_OP_JUMP;
+      tcc_ir_set_dest(ir, jumpif_idx, jmp_dest);
+#ifdef DEBUG_IR_GEN
+      printf("NONNEG FOLD: %s(nonneg, 0) at i=%d, JUMPIF cond=0x%x at %d "
+             "-> always taken, unconditional JUMP to %d\n",
+             cmp_name, i, cond_tok, jumpif_idx, (int)jmp_dest.u.imm32);
+#endif
+      changes++;
+    }
+    else
+    {
+      /* Branch never taken → NOP out the JUMPIF. */
+      jump_q->op = TCCIR_OP_NOP;
+#ifdef DEBUG_IR_GEN
+      printf("NONNEG FOLD: %s(nonneg, 0) at i=%d, JUMPIF cond=0x%x at %d "
+             "-> never taken, eliminated\n",
+             cmp_name, i, cond_tok, jumpif_idx);
+#endif
+      changes++;
+    }
+
+    param_count = 0;
+  }
+
+  /* Run DCE to clean up dead code after folded branches */
+  if (changes)
+    changes += tcc_ir_opt_dce(ir);
 
   return changes;
 }
@@ -3425,6 +3819,15 @@ int tcc_ir_opt_indexed_memory_fusion(TCCIRState *ir)
       continue;
 
     int32_t addr_vr = irop_get_vreg(addr_op);
+
+    /* Skip when the LOAD source is a VAR vreg (local variable on the stack).
+     * A LOAD from a VAR vreg reads the variable's value from its stack slot,
+     * it does NOT dereference the value as a pointer.  Fusing into LOAD_INDEXED
+     * would incorrectly change the semantics from "read variable" to "dereference
+     * computed address".  Example: returning &array[i] stores the address into
+     * a local and then LOADs it back — the result is the address, not *address. */
+    if (!is_store && TCCIR_DECODE_VREG_TYPE(addr_vr) == TCCIR_VREG_TYPE_VAR)
+      continue;
 
     /* Find the instruction that defines the address (should be ADD) */
     int add_idx = tcc_ir_find_defining_instruction(ir, addr_vr, i);

@@ -177,6 +177,18 @@ thumb_flags_behaviour g_setflags = FLAGS_BEHAVIOUR_SET;
 uint32_t caller_saved_registers;
 uint32_t pushed_registers;
 int allocated_stack_size;
+int callee_push_size = 0;       /* bytes pushed BELOW FP in two-phase push */
+uint32_t callee_saved_regs = 0; /* register mask for second push (below FP) */
+
+/* Adjust a local/spill frame offset when two-phase push is active and
+ * callee-saved regs are pushed below FP.  Only adjusts negative non-param
+ * offsets (locals/spills); positive and param offsets are unchanged. */
+static inline int fp_adjust_local_offset(int frame_offset, int is_param)
+{
+  if (!is_param && frame_offset < 0 && callee_push_size > 0)
+    return frame_offset - callee_push_size;
+  return frame_offset;
+}
 
 /* Additional scratch register exclusions (e.g. to protect argument registers
  * while materializing an indirect call target). Applied on top of per-call
@@ -2081,6 +2093,8 @@ ST_FUNC int tcc_machine_can_encode_stack_offset_for_reg(int frame_offset, int de
    * without requiring a scratch register. This is used to avoid wasteful
    * address materialization when the backend can handle the offset directly.
    * Tests with dest_reg since encoding availability depends on the register. */
+  /* Adjust for callee-saved gap below FP (spill offsets are always locals) */
+  frame_offset = fp_adjust_local_offset(frame_offset, 0);
   const int base_reg = tcc_state->need_frame_pointer ? R_FP : R_SP;
   const int sign = (frame_offset < 0);
   const int abs_offset = sign ? -frame_offset : frame_offset;
@@ -2106,6 +2120,8 @@ ST_FUNC void tcc_machine_load_spill_slot(int dest_reg, int frame_offset)
   if (dest_reg == PREG_REG_NONE)
     tcc_error("compiler_error: load_spill_slot requires a destination register");
 
+  /* Adjust for callee-saved gap below FP (spill slots are always locals) */
+  frame_offset = fp_adjust_local_offset(frame_offset, 0);
   const int base_reg = tcc_state->need_frame_pointer ? R_FP : R_SP;
   const int sign = (frame_offset < 0);
   const int abs_offset = sign ? -frame_offset : frame_offset;
@@ -2124,6 +2140,8 @@ ST_FUNC void tcc_machine_store_spill_slot(int src_reg, int frame_offset)
   if (src_reg == PREG_REG_NONE)
     tcc_error("compiler_error: store_spill_slot requires a source register");
 
+  /* Adjust for callee-saved gap below FP (spill slots are always locals) */
+  frame_offset = fp_adjust_local_offset(frame_offset, 0);
   const int base_reg = tcc_state->need_frame_pointer ? R_FP : R_SP;
   const int sign = (frame_offset < 0);
   const int abs_offset = sign ? -frame_offset : frame_offset;
@@ -2268,21 +2286,15 @@ static uint32_t th_store_resolve_base_ir(int src_reg, IROperand sv, int btype, i
 {
   int tag = irop_get_tag(sv);
   int32_t off = 0;
+  int is_captured = 0;
 
-  /* Get offset from IROperand */
+  /* Get raw offset from IROperand — adjustments applied below after
+   * checking for captured variables. */
   if (tag == IROP_TAG_STACKOFF)
     off = irop_get_stack_offset(sv);
   else if (tag == IROP_TAG_IMM32)
     off = sv.u.imm32;
 
-  if (off >= 0)
-    *sign = 0;
-  else
-  {
-    *sign = 1;
-    off = -off;
-  }
-  *abs_off = off;
   *has_base_alloc = 0;
 
   uint32_t base_reg = R_FP;
@@ -2331,10 +2343,29 @@ static uint32_t th_store_resolve_base_ir(int src_reg, IROperand sv, int btype, i
         base_reg = resolve_chain_base(ir, ci, exclude_regs, base_alloc, &used_scratch);
         if (used_scratch)
           *has_base_alloc = 1;
+        is_captured = 1;
         break;
       }
     }
   }
+
+  /* Apply param/local adjustments for non-captured STACKOFF operands */
+  if (!is_captured && tag == IROP_TAG_STACKOFF)
+  {
+    if (sv.is_param && off >= 0)
+      off += offset_to_args;
+    else
+      off = fp_adjust_local_offset(off, sv.is_param);
+  }
+
+  if (off >= 0)
+    *sign = 0;
+  else
+  {
+    *sign = 1;
+    off = -off;
+  }
+  *abs_off = off;
 
   /* Default: stack/local address (FP-based) for STACKOFF */
   return base_reg;
@@ -2403,7 +2434,7 @@ static void store_ex_ir(int r, IROperand sv, uint32_t extra_exclude)
 
   if (sv.is_lval || sv.is_local)
   {
-    int abs_off, sign;
+    int abs_off = 0, sign = 0;
     ScratchRegAlloc base_alloc = (ScratchRegAlloc){0};
     int has_base_alloc = 0;
     uint32_t base = th_store_resolve_base_ir(r, sv, btype, &abs_off, &sign, &base_alloc, &has_base_alloc);
@@ -2855,9 +2886,12 @@ ST_FUNC void tcc_machine_addr_of_stack_slot(int dest_reg, int frame_offset, int 
     tcc_error("compiler_error: addr_of_stack_slot requires a destination register");
 
   /* Stack parameters live above the saved-register area.
-   * When computing their address, fold in offset_to_args (prologue push size). */
+   * When computing their address, fold in offset_to_args (prologue push size).
+   * Locals/spills need callee-saved gap adjustment. */
   if (is_param)
     frame_offset += offset_to_args;
+  else
+    frame_offset = fp_adjust_local_offset(frame_offset, 0);
 
   const int base_reg = tcc_state->need_frame_pointer ? R_FP : R_SP;
 
@@ -3167,6 +3201,18 @@ void load_to_dest_ir(IROperand dest, IROperand src)
       tcc_error("compiler_error: IROP_TAG_VREG with no physical register");
     }
 
+    /* Sub-component access on register pairs (e.g., __imag__ on _Complex float).
+     * When a STACKOFF operand with a component offset gets rewritten to VREG,
+     * the byte-offset delta is preserved in u.imm32:
+     *   u.imm32 == 0  -> first element  (pr0_reg, e.g. real part)
+     *   u.imm32 > 0   -> second element (pr1_reg, e.g. imaginary part)
+     * Only applies to direct (non-lvalue) accesses with a valid pair register. */
+    if (!src.is_lval && src.pr1_reg != PREG_REG_NONE && src.u.imm32 != 0)
+    {
+      src_reg = src.pr1_reg;
+      src.pr1_reg = PREG_REG_NONE; /* prevent pair move below */
+    }
+
     if (src.is_lval)
     {
       /* Register-indirect load: src_reg holds address */
@@ -3267,10 +3313,15 @@ void load_to_dest_ir(IROperand dest, IROperand src)
       }
     }
 
-    /* Apply offset_to_args for stack-passed parameters */
+    /* Apply offset_to_args for stack-passed parameters,
+     * or callee-saved gap for locals/spills */
     if (src.is_param && frame_offset >= 0)
     {
       frame_offset += offset_to_args;
+    }
+    else if (!chain_used)
+    {
+      frame_offset = fp_adjust_local_offset(frame_offset, src.is_param);
     }
 
     int sign = (frame_offset < 0);
@@ -3588,8 +3639,8 @@ static void thumb_store_dest_pair_if_needed_ir(IROperand dest, int rd_low, int r
       }
       else if (orig_btype == IROP_BTYPE_STRUCT)
       {
-        /* For struct types, offset is stored as aux_data * 4, so add 1 to aux_data */
-        dest_hi.u.s.aux_data += 1; /* +4 bytes = +1 in aux_data units */
+        /* For struct types, aux_data stores byte offset directly */
+        dest_hi.u.s.aux_data += 4; /* +4 bytes */
       }
       else
       {
@@ -4540,6 +4591,324 @@ static void thumb_process_data64_op(IROperand src1, IROperand src2, IROperand de
   return thumb_emit_opcode64_imm_ir(src1, src2, dest, op, context, regular_handler, carry_handler);
 }
 
+/* Generate a call to soft-float library function for complex component operation.
+ * Helper for thumb_process_complex_op.
+ */
+static void gen_softfp_call_for_complex(IROperand src1_comp, IROperand src2_comp, int is_add)
+{
+  Sym *sym;
+  IROperand func_op;
+  const char *func_name = is_add ? "__aeabi_fadd" : "__aeabi_fsub";
+
+  /* Load operands into r0, r1 */
+  if (src1_comp.pr0_reg != R0)
+    ot_check(th_mov_reg(R0, src1_comp.pr0_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                        ENFORCE_ENCODING_NONE, false));
+  if (src2_comp.pr0_reg != R1)
+    ot_check(th_mov_reg(R1, src2_comp.pr0_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                        ENFORCE_ENCODING_NONE, false));
+
+  /* Get or create the external symbol for the soft-float function */
+  sym = external_global_sym(tok_alloc_const(func_name), &func_old_type);
+
+  /* Set up IROperand for the function call */
+  uint32_t sym_idx = tcc_ir_pool_add_symref(tcc_state->ir, sym, 0, 0);
+  func_op = irop_make_symref(-1, sym_idx, 0, 0, 1, IROP_BTYPE_FUNC);
+
+  /* Save R9 (GOT base) before soft-float call if caller-saved */
+  if (text_and_data_separation)
+    ot_check(th_push((uint16_t)((1 << R9) | (1 << R12))));
+
+  /* Generate BL to the soft-float function */
+  gcall_or_jump_ir(0, func_op);
+
+  /* Restore R9 (GOT base) after soft-float call */
+  if (text_and_data_separation)
+    ot_check(th_pop((uint16_t)((1 << R9) | (1 << R12))));
+
+  /* Result is now in R0 */
+}
+
+/* Process complex number operations (addition/subtraction).
+ * DONE: Phase 3 - Complex addition/subtraction implemented.
+ * Complex numbers are stored as consecutive floats (real, imag).
+ * Component-wise FP operations:
+ *   (a+bi) + (c+di) = (a+c) + (b+d)i
+ *   (a+bi) - (c+di) = (a-c) + (b-d)i
+ */
+static void thumb_process_complex_op(IROperand src1, IROperand src2, IROperand dest, TccIrOp op)
+{
+  const int is_add = (op == TCCIR_OP_ADD);
+
+  /* Get physical registers for source and destination components.
+   * Complex float: pr0 = real, pr1 = imag */
+  const int s1_r = src1.pr0_reg;
+  const int s1_i = src1.pr1_reg;
+  const int s2_r = src2.pr0_reg;
+  const int s2_i = src2.pr1_reg;
+  const int d_r = dest.pr0_reg;
+  const int d_i = dest.pr1_reg;
+
+  TRACE("thumb_process_complex_op: %s s1=%d/%d s2=%d/%d d=%d/%d", is_add ? "ADD" : "SUB", s1_r, s1_i, s2_r, s2_i, d_r,
+        d_i);
+
+  /* Stack-based approach: save all 4 inputs to stack, then load pairs
+   * into r0/r1 for each soft-float call. This avoids all register
+   * clobbering issues since __aeabi_fadd/fsub destroys r0-r3.
+   *
+   * Stack layout (16 bytes):
+   *   [sp+12] = s2_i (b.imag)
+   *   [sp+8]  = s2_r (b.real)
+   *   [sp+4]  = s1_i (a.imag)
+   *   [sp+0]  = s1_r (a.real)
+   */
+  ot_check(th_sub_sp_imm(R_SP, 16, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+  ot_check(th_str_imm(s1_r, R_SP, 0, 6, ENFORCE_ENCODING_NONE));
+  ot_check(th_str_imm(s1_i, R_SP, 4, 6, ENFORCE_ENCODING_NONE));
+  ot_check(th_str_imm(s2_r, R_SP, 8, 6, ENFORCE_ENCODING_NONE));
+  ot_check(th_str_imm(s2_i, R_SP, 12, 6, ENFORCE_ENCODING_NONE));
+
+  /* Compute real part: __aeabi_fadd/fsub(a.real, b.real) */
+  ot_check(th_ldr_imm(R0, R_SP, 0, 6, ENFORCE_ENCODING_NONE));
+  ot_check(th_ldr_imm(R1, R_SP, 8, 6, ENFORCE_ENCODING_NONE));
+  gen_softfp_call_for_complex((IROperand){.pr0_reg = R0}, (IROperand){.pr0_reg = R1}, is_add);
+
+  /* Save real result to stack slot 0 (reuse a.real slot) */
+  ot_check(th_str_imm(R0, R_SP, 0, 6, ENFORCE_ENCODING_NONE));
+
+  /* Compute imag part: __aeabi_fadd/fsub(a.imag, b.imag) */
+  ot_check(th_ldr_imm(R0, R_SP, 4, 6, ENFORCE_ENCODING_NONE));
+  ot_check(th_ldr_imm(R1, R_SP, 12, 6, ENFORCE_ENCODING_NONE));
+  gen_softfp_call_for_complex((IROperand){.pr0_reg = R0}, (IROperand){.pr0_reg = R1}, is_add);
+
+  /* r0 = imag result, load real result from stack */
+  int imag_result = R0;
+  ot_check(th_ldr_imm(d_r, R_SP, 0, 6, ENFORCE_ENCODING_NONE)); /* real result -> dest real reg */
+  ot_check(th_add_sp_imm(R_SP, 16, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+
+  /* Move imag result to dest */
+  if (d_i != imag_result)
+    ot_check(
+        th_mov_reg(d_i, imag_result, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
+}
+
+/* Process complex multiplication.
+ * Formula: (a+bi) * (c+di) = (ac-bd) + i(ad+bc)
+ * Phase 3: Complex multiplication - stack-based implementation.
+ *
+ * Safe approach: Use stack for all intermediates. Every __aeabi_fmul call
+ * clobbers r0-r3, so we can't keep intermediates in registers.
+ *
+ * Stack layout (growing downward from original SP):
+ *   [sp+24..27] = saved callee-saved registers (via push)
+ *   --- below are manually allocated slots ---
+ *   [sp+20]     = d  (imag of src2)
+ *   [sp+16]     = c  (real of src2)
+ *   [sp+12]     = b  (imag of src1)
+ *   [sp+8]      = a  (real of src1)
+ *   [sp+4]      = scratch slot 1 (for intermediate results)
+ *   [sp+0]      = scratch slot 0 (for intermediate results)
+ */
+static void thumb_process_complex_mul(IROperand src1, IROperand src2, IROperand dest)
+{
+  const int s1_r = src1.pr0_reg;
+  const int s1_i = src1.pr1_reg;
+  const int s2_r = src2.pr0_reg;
+  const int s2_i = src2.pr1_reg;
+
+  TRACE("thumb_process_complex_mul: s1=%d/%d s2=%d/%d d=%d/%d", s1_r, s1_i, s2_r, s2_i, dest.pr0_reg, dest.pr1_reg);
+
+  /* Allocate 24 bytes on stack: 4 inputs + 2 scratch slots */
+  ot_check(th_sub_sp_imm(R_SP, 24, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+
+  /* Save inputs to stack */
+  ot_check(th_str_imm(s1_r, R_SP, 8, 6, ENFORCE_ENCODING_NONE));  /* a */
+  ot_check(th_str_imm(s1_i, R_SP, 12, 6, ENFORCE_ENCODING_NONE)); /* b */
+  ot_check(th_str_imm(s2_r, R_SP, 16, 6, ENFORCE_ENCODING_NONE)); /* c */
+  ot_check(th_str_imm(s2_i, R_SP, 20, 6, ENFORCE_ENCODING_NONE)); /* d */
+
+  /* Stack offsets */
+  const int off_scratch0 = 0;
+  const int off_scratch1 = 4;
+  const int off_a = 8;
+  const int off_b = 12;
+  const int off_c = 16;
+  const int off_d = 20;
+
+/* Helper: call soft-float function, store result to stack offset */
+#define CALL_FP(func_name, store_off)                                                                                  \
+  do                                                                                                                   \
+  {                                                                                                                    \
+    Sym *_sym = external_global_sym(tok_alloc_const(func_name), &func_old_type);                                       \
+    uint32_t _si = tcc_ir_pool_add_symref(tcc_state->ir, _sym, 0, 0);                                                  \
+    IROperand _fo = irop_make_symref(-1, _si, 0, 0, 1, IROP_BTYPE_FUNC);                                               \
+    if (text_and_data_separation)                                                                                      \
+      ot_check(th_push((uint16_t)((1 << R9) | (1 << R12))));                                                           \
+    gcall_or_jump_ir(0, _fo);                                                                                          \
+    if (text_and_data_separation)                                                                                      \
+      ot_check(th_pop((uint16_t)((1 << R9) | (1 << R12))));                                                            \
+    ot_check(th_str_imm(R0, R_SP, store_off, 6, ENFORCE_ENCODING_NONE));                                               \
+  } while (0)
+
+  /* Step 1: ac = a * c -> scratch0 */
+  ot_check(th_ldr_imm(R0, R_SP, off_a, 6, ENFORCE_ENCODING_NONE));
+  ot_check(th_ldr_imm(R1, R_SP, off_c, 6, ENFORCE_ENCODING_NONE));
+  CALL_FP("__aeabi_fmul", off_scratch0);
+
+  /* Step 2: bd = b * d -> scratch1 */
+  ot_check(th_ldr_imm(R0, R_SP, off_b, 6, ENFORCE_ENCODING_NONE));
+  ot_check(th_ldr_imm(R1, R_SP, off_d, 6, ENFORCE_ENCODING_NONE));
+  CALL_FP("__aeabi_fmul", off_scratch1);
+
+  /* Step 3: real = ac - bd = scratch0 - scratch1 -> scratch0 */
+  ot_check(th_ldr_imm(R0, R_SP, off_scratch0, 6, ENFORCE_ENCODING_NONE));
+  ot_check(th_ldr_imm(R1, R_SP, off_scratch1, 6, ENFORCE_ENCODING_NONE));
+  CALL_FP("__aeabi_fsub", off_scratch0);
+
+  /* Step 4: ad = a * d -> scratch1 */
+  ot_check(th_ldr_imm(R0, R_SP, off_a, 6, ENFORCE_ENCODING_NONE));
+  ot_check(th_ldr_imm(R1, R_SP, off_d, 6, ENFORCE_ENCODING_NONE));
+  CALL_FP("__aeabi_fmul", off_scratch1);
+
+  /* Step 5: bc = b * c -> overwrite off_a (no longer needed) */
+  ot_check(th_ldr_imm(R0, R_SP, off_b, 6, ENFORCE_ENCODING_NONE));
+  ot_check(th_ldr_imm(R1, R_SP, off_c, 6, ENFORCE_ENCODING_NONE));
+  CALL_FP("__aeabi_fmul", off_a);
+
+  /* Step 6: imag = ad + bc = scratch1 + off_a -> scratch1 */
+  ot_check(th_ldr_imm(R0, R_SP, off_scratch1, 6, ENFORCE_ENCODING_NONE));
+  ot_check(th_ldr_imm(R1, R_SP, off_a, 6, ENFORCE_ENCODING_NONE));
+  CALL_FP("__aeabi_fadd", off_scratch1);
+
+#undef CALL_FP
+
+  /* Load results: real from scratch0, imag from scratch1 */
+  ot_check(th_ldr_imm(dest.pr0_reg, R_SP, off_scratch0, 6, ENFORCE_ENCODING_NONE));
+  ot_check(th_ldr_imm(dest.pr1_reg, R_SP, off_scratch1, 6, ENFORCE_ENCODING_NONE));
+
+  /* Deallocate stack frame */
+  ot_check(th_add_sp_imm(R_SP, 24, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+}
+
+/* Process complex division inline using soft-float calls.
+ * Formula: (a+bi)/(c+di) = ((ac+bd) + (bc-ad)i) / (c²+d²)
+ *
+ * Stack layout (28 bytes, padded to 32 for 8-byte alignment):
+ *   [sp+24] = d  (imag of src2)
+ *   [sp+20] = c  (real of src2)
+ *   [sp+16] = b  (imag of src1)
+ *   [sp+12] = a  (real of src1)
+ *   [sp+8]  = scratch2 (denom = c²+d²)
+ *   [sp+4]  = scratch1
+ *   [sp+0]  = scratch0
+ */
+static void thumb_process_complex_div(IROperand src1, IROperand src2, IROperand dest)
+{
+  const int s1_r = src1.pr0_reg;
+  const int s1_i = src1.pr1_reg;
+  const int s2_r = src2.pr0_reg;
+  const int s2_i = src2.pr1_reg;
+
+  TRACE("thumb_process_complex_div: s1=%d/%d s2=%d/%d d=%d/%d", s1_r, s1_i, s2_r, s2_i, dest.pr0_reg, dest.pr1_reg);
+
+  /* Allocate 32 bytes: 4 inputs + 3 scratch slots (padded for alignment) */
+  ot_check(th_sub_sp_imm(R_SP, 32, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+
+  /* Save inputs to stack (safe from clobbering) */
+  ot_check(th_str_imm(s1_r, R_SP, 12, 6, ENFORCE_ENCODING_NONE)); /* a */
+  ot_check(th_str_imm(s1_i, R_SP, 16, 6, ENFORCE_ENCODING_NONE)); /* b */
+  ot_check(th_str_imm(s2_r, R_SP, 20, 6, ENFORCE_ENCODING_NONE)); /* c */
+  ot_check(th_str_imm(s2_i, R_SP, 24, 6, ENFORCE_ENCODING_NONE)); /* d */
+
+  /* Stack offsets */
+  const int off_scratch0 = 0;
+  const int off_scratch1 = 4;
+  const int off_denom = 8;
+  const int off_a = 12;
+  const int off_b = 16;
+  const int off_c = 20;
+  const int off_d = 24;
+
+/* Helper: call soft-float function, store result to stack offset */
+#define CALL_FP(func_name, store_off)                                                                                  \
+  do                                                                                                                   \
+  {                                                                                                                    \
+    Sym *_sym = external_global_sym(tok_alloc_const(func_name), &func_old_type);                                       \
+    uint32_t _si = tcc_ir_pool_add_symref(tcc_state->ir, _sym, 0, 0);                                                  \
+    IROperand _fo = irop_make_symref(-1, _si, 0, 0, 1, IROP_BTYPE_FUNC);                                               \
+    if (text_and_data_separation)                                                                                      \
+      ot_check(th_push((uint16_t)((1 << R9) | (1 << R12))));                                                           \
+    gcall_or_jump_ir(0, _fo);                                                                                          \
+    if (text_and_data_separation)                                                                                      \
+      ot_check(th_pop((uint16_t)((1 << R9) | (1 << R12))));                                                            \
+    ot_check(th_str_imm(R0, R_SP, store_off, 6, ENFORCE_ENCODING_NONE));                                               \
+  } while (0)
+
+  /* Step 1: c*c -> scratch0 */
+  ot_check(th_ldr_imm(R0, R_SP, off_c, 6, ENFORCE_ENCODING_NONE));
+  ot_check(th_ldr_imm(R1, R_SP, off_c, 6, ENFORCE_ENCODING_NONE));
+  CALL_FP("__aeabi_fmul", off_scratch0);
+
+  /* Step 2: d*d -> scratch1 */
+  ot_check(th_ldr_imm(R0, R_SP, off_d, 6, ENFORCE_ENCODING_NONE));
+  ot_check(th_ldr_imm(R1, R_SP, off_d, 6, ENFORCE_ENCODING_NONE));
+  CALL_FP("__aeabi_fmul", off_scratch1);
+
+  /* Step 3: denom = c*c + d*d -> denom */
+  ot_check(th_ldr_imm(R0, R_SP, off_scratch0, 6, ENFORCE_ENCODING_NONE));
+  ot_check(th_ldr_imm(R1, R_SP, off_scratch1, 6, ENFORCE_ENCODING_NONE));
+  CALL_FP("__aeabi_fadd", off_denom);
+
+  /* Step 4: a*c -> scratch0 */
+  ot_check(th_ldr_imm(R0, R_SP, off_a, 6, ENFORCE_ENCODING_NONE));
+  ot_check(th_ldr_imm(R1, R_SP, off_c, 6, ENFORCE_ENCODING_NONE));
+  CALL_FP("__aeabi_fmul", off_scratch0);
+
+  /* Step 5: b*d -> scratch1 */
+  ot_check(th_ldr_imm(R0, R_SP, off_b, 6, ENFORCE_ENCODING_NONE));
+  ot_check(th_ldr_imm(R1, R_SP, off_d, 6, ENFORCE_ENCODING_NONE));
+  CALL_FP("__aeabi_fmul", off_scratch1);
+
+  /* Step 6: numerator_real = a*c + b*d -> scratch0 */
+  ot_check(th_ldr_imm(R0, R_SP, off_scratch0, 6, ENFORCE_ENCODING_NONE));
+  ot_check(th_ldr_imm(R1, R_SP, off_scratch1, 6, ENFORCE_ENCODING_NONE));
+  CALL_FP("__aeabi_fadd", off_scratch0);
+
+  /* Step 7: real = numerator_real / denom -> scratch0 */
+  ot_check(th_ldr_imm(R0, R_SP, off_scratch0, 6, ENFORCE_ENCODING_NONE));
+  ot_check(th_ldr_imm(R1, R_SP, off_denom, 6, ENFORCE_ENCODING_NONE));
+  CALL_FP("__aeabi_fdiv", off_scratch0);
+
+  /* Step 8: b*c -> scratch1 */
+  ot_check(th_ldr_imm(R0, R_SP, off_b, 6, ENFORCE_ENCODING_NONE));
+  ot_check(th_ldr_imm(R1, R_SP, off_c, 6, ENFORCE_ENCODING_NONE));
+  CALL_FP("__aeabi_fmul", off_scratch1);
+
+  /* Step 9: a*d -> overwrite off_a (no longer needed) */
+  ot_check(th_ldr_imm(R0, R_SP, off_a, 6, ENFORCE_ENCODING_NONE));
+  ot_check(th_ldr_imm(R1, R_SP, off_d, 6, ENFORCE_ENCODING_NONE));
+  CALL_FP("__aeabi_fmul", off_a);
+
+  /* Step 10: numerator_imag = b*c - a*d -> scratch1 */
+  ot_check(th_ldr_imm(R0, R_SP, off_scratch1, 6, ENFORCE_ENCODING_NONE));
+  ot_check(th_ldr_imm(R1, R_SP, off_a, 6, ENFORCE_ENCODING_NONE));
+  CALL_FP("__aeabi_fsub", off_scratch1);
+
+  /* Step 11: imag = numerator_imag / denom -> scratch1 */
+  ot_check(th_ldr_imm(R0, R_SP, off_scratch1, 6, ENFORCE_ENCODING_NONE));
+  ot_check(th_ldr_imm(R1, R_SP, off_denom, 6, ENFORCE_ENCODING_NONE));
+  CALL_FP("__aeabi_fdiv", off_scratch1);
+
+#undef CALL_FP
+
+  /* Load results: real from scratch0, imag from scratch1 */
+  ot_check(th_ldr_imm(dest.pr0_reg, R_SP, off_scratch0, 6, ENFORCE_ENCODING_NONE));
+  ot_check(th_ldr_imm(dest.pr1_reg, R_SP, off_scratch1, 6, ENFORCE_ENCODING_NONE));
+
+  /* Deallocate stack frame */
+  ot_check(th_add_sp_imm(R_SP, 32, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+}
+
 /* Helper to check if operand is an address-of-stack (not lval) that might be cached */
 static int is_addr_of_stack_operand(IROperand op)
 {
@@ -4560,6 +4929,8 @@ static int get_cached_stack_addr_reg(IROperand op)
   int frame_offset = irop_get_stack_offset(op);
   if (op.is_param)
     frame_offset += offset_to_args;
+  else
+    frame_offset = fp_adjust_local_offset(frame_offset, 0);
 
   int cached_reg = -1;
   if (tcc_ir_opt_fp_cache_lookup(ir, frame_offset, &cached_reg))
@@ -4751,6 +5122,26 @@ void tcc_gen_machine_data_processing_op(IROperand src1, IROperand src2, IROperan
   ThumbDataProcessingHandler handler;
   thumb_flags_behaviour flags = FLAGS_BEHAVIOUR_NOT_IMPORTANT;
 
+  /* Phase 3 - Check for complex type operations.
+   * Complex operations need component-wise FP operations. */
+  /* Only check is_complex if we have a valid vreg (not sentinel values) */
+  int32_t dest_vr = irop_get_vreg(dest);
+  if (dest_vr >= 0 && dest.is_complex)
+  {
+    if (op == TCCIR_OP_ADD || op == TCCIR_OP_SUB)
+    {
+      return thumb_process_complex_op(src1, src2, dest, op);
+    }
+    else if (op == TCCIR_OP_MUL)
+    {
+      return thumb_process_complex_mul(src1, src2, dest);
+    }
+    else
+    {
+      tcc_error("complex operation not yet implemented: %d", op);
+    }
+  }
+
   /* Check for 64-bit operations.
    * UMULL always produces a 64-bit result from 32-bit inputs, so it must
    * always use the 64-bit handler regardless of the dest type annotation. */
@@ -4871,6 +5262,9 @@ void tcc_gen_machine_data_processing_op(IROperand src1, IROperand src2, IROperan
               }
             }
           }
+          /* Apply callee-saved gap for locals */
+          if (!chain_used)
+            frame_offset = fp_adjust_local_offset(frame_offset, accum.is_param);
           int sign = (frame_offset < 0);
           int abs_offset = sign ? -frame_offset : frame_offset;
           ScratchRegAlloc accum_scratch =
@@ -5298,6 +5692,23 @@ ST_FUNC void tcc_gen_machine_fp_op(IROperand dest, IROperand src1, IROperand src
   // int use_vfp = can_use_vfp(is_double);
   const char *func_name;
 
+  /* Phase 3: Check for complex float operations */
+  if (dest.is_complex)
+  {
+    if (op == TCCIR_OP_FADD || op == TCCIR_OP_FSUB)
+    {
+      return thumb_process_complex_op(src1, src2, dest, op == TCCIR_OP_FADD ? TCCIR_OP_ADD : TCCIR_OP_SUB);
+    }
+    else if (op == TCCIR_OP_FMUL)
+    {
+      return thumb_process_complex_mul(src1, src2, dest);
+    }
+    else if (op == TCCIR_OP_FDIV)
+    {
+      return thumb_process_complex_div(src1, src2, dest);
+    }
+  }
+
   /* VFP hardware path */
   // if (use_vfp)
   // {
@@ -5377,7 +5788,7 @@ ST_FUNC void tcc_gen_machine_fp_op(IROperand dest, IROperand src1, IROperand src
 
 ST_FUNC void tcc_gen_machine_return_value_op(IROperand src, TccIrOp op)
 {
-  const int is_64bit = irop_is_64bit(src);
+  const int is_64bit = irop_needs_pair(src);
 
   /* Constants are not held in a physical register; always materialize them
    * into the return registers, regardless of any (possibly stale) pr0/pr1
@@ -5446,9 +5857,8 @@ ST_FUNC void tcc_gen_machine_store_op(IROperand dest, IROperand src, TccIrOp op)
   TRACE("'tcc_gen_machine_store_op'");
   const char *ctx = "tcc_gen_machine_store_op";
   int src_reg;
-  /* Check for 64-bit types - include VT_LLONG for soft-float doubles and long
-   * long */
-  const int is_64bit = irop_is_64bit(src);
+  /* Check for 64-bit types or complex (register pairs) */
+  const int is_64bit = irop_needs_pair(src);
 
   src_reg = src.pr0_reg;
   ScratchRegAlloc scratch_alloc = {0};
@@ -5798,9 +6208,6 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
    * need to be stored in call_sites_by_id (which uses non-negative IDs).
    * If needed, handle it separately or skip. */
 
-  uint16_t registers_to_push = 0;
-  int registers_count = 0;
-
   thumb_gen_state.generating_function = 1;
   thumb_gen_state.code_size = 0;
   /* Clear global symbol cache at function start */
@@ -5808,81 +6215,127 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
   thumb_gen_state.cached_global_reg = PREG_NONE;
   TCCIRState *ir = tcc_state->ir;
 
-  if (!leaffunc)
-  {
-    registers_to_push |= (1 << R_LR);
-    registers_count++;
-  }
-
-  /* Add extra registers discovered during dry-run (e.g., LR in leaf functions) */
+  /* Determine if LR needs saving */
+  int save_lr = !leaffunc || tcc_state->force_lr_save;
   if (extra_prologue_regs & (1u << R_LR))
-  {
-    if (!(registers_to_push & (1u << R_LR)))
-    {
-      registers_to_push |= (1u << R_LR);
-      registers_count++;
-    }
-  }
-
-  /* Add static chain register (R10) for nested functions.
-   * This ensures the parent's static chain is preserved across the call. */
-  if (extra_prologue_regs & (1u << ARM_R10))
-  {
-    if (!(registers_to_push & (1u << ARM_R10)))
-    {
-      registers_to_push |= (1u << ARM_R10);
-      registers_count++;
-    }
-  }
+    save_lr = 1;
 
   /* Variadic functions need a stable FP for va_list setup. */
   if (func_var)
-  {
     tcc_state->need_frame_pointer = 1;
-  }
 
-  /* Keep FP whenever the function needs any FP-relative stack accesses.
-   * The IR layer sets `need_frame_pointer` when parameters are passed on the
-   * caller stack; locals/spills imply `stack_size > 0`. Don't clobber that
-   * signal here.
-   */
-  {
-    const int need_fp = (tcc_state->force_frame_pointer || tcc_state->need_frame_pointer || (stack_size > 0));
-    tcc_state->need_frame_pointer = need_fp;
-    if (need_fp)
-    {
-      registers_to_push |= (1 << R_FP);
-      registers_count++;
-    }
-  }
+  /* Also force FP when force_lr_save is set (builtin_return_address). */
+  if (tcc_state->force_lr_save)
+    tcc_state->need_frame_pointer = 1;
 
+  const int need_fp = (tcc_state->force_frame_pointer || tcc_state->need_frame_pointer || (stack_size > 0));
+  tcc_state->need_frame_pointer = need_fp;
+
+  /* Use two-phase push (standard frame record) when __builtin_return_address
+   * needs a predictable {FP, LR} layout at [FP+0] and [FP+4]. */
+  const int standard_frame_record = need_fp && tcc_state->force_lr_save;
+
+  /* Collect callee-saved registers */
+  uint16_t callee_regs_local = 0;
+  int callee_count = 0;
   for (int i = R4; i <= R11; ++i)
   {
     if (tcc_state->text_and_data_separation && i == R9)
       continue;
     if (i == R_FP)
-      continue;
+      continue; /* r7 handled separately for FP */
     if (used_registers & (1ULL << i))
     {
-      registers_to_push |= (1 << i);
-      registers_count++;
+      callee_regs_local |= (1 << i);
+      callee_count++;
     }
   }
-  /* Keep the total push size 8-byte aligned (AAPCS). This must not be done by
-   * adding padding below SP (would shift prepared-call stack arguments). */
-  if (registers_count % 2 != 0)
-  {
-    registers_to_push |= (1 << R12);
-    registers_count++;
-  }
-  th_sym_t();
-  offset_to_args = registers_count * 4;
 
-  if (registers_count > 0)
+  /* Add static chain register (R10) for nested functions. */
+  if (extra_prologue_regs & (1u << ARM_R10))
   {
-    ot_check(th_push(registers_to_push));
+    if (!(callee_regs_local & (1u << ARM_R10)))
+    {
+      callee_regs_local |= (1u << ARM_R10);
+      callee_count++;
+    }
   }
-  pushed_registers = registers_to_push;
+
+  if (standard_frame_record)
+  {
+    /* ── Two-phase push: frame record {r7, lr} then callee-saved ──
+     * Layout: [FP+0]=old_FP, [FP+4]=LR, callee-saved below FP. */
+    uint16_t frame_regs = (1 << R_FP);
+    int frame_count = 1;
+    if (save_lr)
+    {
+      frame_regs |= (1 << R_LR);
+      frame_count++;
+    }
+
+    /* Pad total to even count for 8-byte alignment (AAPCS). */
+    int total = frame_count + callee_count;
+    if (total % 2 != 0)
+    {
+      callee_regs_local |= (1 << R12);
+      callee_count++;
+    }
+
+    th_sym_t();
+
+    /* Phase A: push frame record */
+    ot_check(th_push(frame_regs));
+
+    /* MOV r7, sp — FP points at the frame record */
+    if (!ot(th_add_imm(R_FP, R_SP, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE)))
+    {
+      fprintf(stderr, "compiler_error: prolog frame pointer setup failed\n");
+      exit(1);
+    }
+
+    /* Phase B: push callee-saved regs (below FP) */
+    if (callee_count > 0)
+      ot_check(th_push(callee_regs_local));
+
+    callee_push_size = callee_count * 4;
+    callee_saved_regs = callee_regs_local;
+    offset_to_args = frame_count * 4;
+    pushed_registers = frame_regs | callee_regs_local;
+  }
+  else
+  {
+    /* ── Original single-push layout ── */
+    uint16_t registers_to_push = callee_regs_local;
+    int registers_count = callee_count;
+
+    if (save_lr)
+    {
+      registers_to_push |= (1 << R_LR);
+      registers_count++;
+    }
+    if (need_fp)
+    {
+      registers_to_push |= (1 << R_FP);
+      registers_count++;
+    }
+
+    /* Keep the total push size 8-byte aligned (AAPCS). */
+    if (registers_count % 2 != 0)
+    {
+      registers_to_push |= (1 << R12);
+      registers_count++;
+    }
+
+    th_sym_t();
+    offset_to_args = registers_count * 4;
+
+    if (registers_count > 0)
+      ot_check(th_push(registers_to_push));
+
+    pushed_registers = registers_to_push;
+    callee_push_size = 0;
+    callee_saved_regs = 0;
+  }
 
   // allocate stack space for local variables
   /* Variadic save area is reserved in the IR stack layout (loc bias). */
@@ -5893,7 +6346,7 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
   if (stack_size & 7)
     stack_size = (stack_size + 7) & ~7;
   allocated_stack_size = stack_size;
-  if (tcc_state->need_frame_pointer)
+  if (tcc_state->need_frame_pointer && !standard_frame_record)
   {
     if (!ot(th_add_imm(R_FP, R_SP, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE)))
     {
@@ -5909,14 +6362,13 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
     gadd_sp(-stack_size);
   }
 
-  /* Save incoming static chain (R10) at fixed chain slot [FP - 4].
-   * This allows child nested functions to follow the chain to
-   * grandparent frames via multi-hop LDR sequences.
-   * Saved unconditionally for stability — avoids timing dependency
-   * on needs_chain_save which is discovered late during body parsing. */
+  /* Save incoming static chain (R10) at fixed chain slot.
+   * With two-phase push, callee-saved regs are below FP, so the chain
+   * slot is at [FP - callee_push_size - 4] instead of [FP - 4].
+   * The body reads via offset -4 which gets fp_adjust_local_offset applied. */
   if (ir && ir->has_static_chain)
   {
-    tcc_gen_machine_store_to_stack(architecture_config.static_chain_reg, -4);
+    tcc_gen_machine_store_to_stack(architecture_config.static_chain_reg, -(callee_push_size + 4));
   }
 
   /* For variadic functions, save incoming r0-r3 in a fixed area at FP-16..FP-4
@@ -5932,19 +6384,19 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
 
   if (func_var)
   {
-    tcc_gen_machine_store_to_stack(R0, -16);
-    tcc_gen_machine_store_to_stack(R1, -12);
-    tcc_gen_machine_store_to_stack(R2, -8);
-    tcc_gen_machine_store_to_stack(R3, -4);
+    tcc_gen_machine_store_to_stack(R0, -(callee_push_size + 16));
+    tcc_gen_machine_store_to_stack(R1, -(callee_push_size + 12));
+    tcc_gen_machine_store_to_stack(R2, -(callee_push_size + 8));
+    tcc_gen_machine_store_to_stack(R3, -(callee_push_size + 4));
 
     /* stack args start at FP + offset_to_args + named_stack_bytes */
     ot_check(th_add_imm(R12, R_FP, offset_to_args + named_stack_bytes, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
                         ENFORCE_ENCODING_NONE));
-    tcc_gen_machine_store_to_stack(R12, -20);
+    tcc_gen_machine_store_to_stack(R12, -(callee_push_size + 20));
 
     /* store the number of named-arg bytes consumed in r0-r3 */
     tcc_machine_load_constant(R12, PREG_NONE, named_reg_bytes, 0, NULL);
-    tcc_gen_machine_store_to_stack(R12, -24);
+    tcc_gen_machine_store_to_stack(R12, -(callee_push_size + 24));
   }
 
   /* Move parameters from incoming registers to their allocated locations.
@@ -6032,7 +6484,8 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
        */
       if (interval->allocation.offset != 0)
       {
-        const int stack_offset = interval->allocation.offset;
+        /* Adjust for callee-saved gap below FP in two-phase push. */
+        const int stack_offset = fp_adjust_local_offset(interval->allocation.offset, 0);
         if (is_64bit && incoming_r1 >= 0)
         {
           tcc_gen_machine_store_to_stack_ex(incoming_r0, stack_offset, incoming_arg_regs_mask);
@@ -6193,37 +6646,63 @@ ST_FUNC void tcc_gen_machine_epilog(int leaffunc)
 
   int lr_saved = pushed_registers & (1 << R_LR);
 
-  // restore stack pointer
-  if (tcc_state->need_frame_pointer)
+  if (tcc_state->need_frame_pointer && callee_saved_regs)
   {
-    // restore SP from frame pointer
+    /* ── Two-phase pop (mirrors two-phase push) ── */
+    /* Restore SP from FP (works even with alloca/VLA since FP is stable) */
     ot_check(th_mov_reg(R_SP, R_FP, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
+    /* SP = FP; callee-saved regs are below FP. Adjust SP down. */
+    gadd_sp(-callee_push_size);
+    ot_check(th_pop(callee_saved_regs));
+    /* SP is now at FP (pointing at frame record {r7, [lr]}) */
+    if (lr_saved)
+    {
+      ot_check(th_pop((1 << R_FP) | (1 << R_PC)));
+    }
+    else
+    {
+      ot_check(th_pop(1 << R_FP));
+      ot_check(th_bx_reg(R_LR));
+    }
   }
-  else if (allocated_stack_size > 0)
+  else if (tcc_state->need_frame_pointer)
   {
-    // deallocate stack space for local variables
-    gadd_sp(allocated_stack_size);
+    /* ── Original single-push with FP: restore SP from FP, then pop all ── */
+    ot_check(th_mov_reg(R_SP, R_FP, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
+    if (lr_saved)
+    {
+      pushed_registers |= 1 << R_PC;
+      pushed_registers &= ~(1 << R_LR);
+      ot_check(th_pop(pushed_registers));
+    }
+    else
+    {
+      if (pushed_registers > 0)
+        ot_check(th_pop(pushed_registers));
+      ot_check(th_bx_reg(R_LR));
+    }
+  }
+  else
+  {
+    /* ── No frame pointer ── */
+    if (allocated_stack_size > 0)
+      gadd_sp(allocated_stack_size);
+    if (lr_saved)
+    {
+      pushed_registers |= 1 << R_PC;
+      pushed_registers &= ~(1 << R_LR);
+      ot_check(th_pop(pushed_registers));
+    }
+    else
+    {
+      if (pushed_registers > 0)
+        ot_check(th_pop(pushed_registers));
+      ot_check(th_bx_reg(R_LR));
+    }
   }
 
-  if (lr_saved)
-  {
-    pushed_registers |= 1 << R_PC;
-    pushed_registers &= ~(1 << R_LR);
-    ot_check(th_pop(pushed_registers));
-    thumb_gen_state.generating_function = 0;
-    th_literal_pool_generate();
-    thumb_free_call_sites();
-
-    return;
-  }
-  if (pushed_registers > 0)
-  {
-    ot_check(th_pop(pushed_registers));
-  }
   thumb_gen_state.generating_function = 0;
-  ot_check(th_bx_reg(R_LR));
   th_literal_pool_generate();
-
   thumb_free_call_sites();
 }
 
@@ -6302,8 +6781,8 @@ static void assign_op_64bit(IROperand dest, IROperand src)
     IROperand dest_hi = dest_lo;
     if (orig_btype == IROP_BTYPE_STRUCT)
     {
-      /* For struct types, offset is stored as aux_data * 4, so add 1 to aux_data */
-      dest_hi.u.s.aux_data += 1; /* +4 bytes = +1 in aux_data units */
+      /* For struct types, aux_data stores byte offset directly */
+      dest_hi.u.s.aux_data += 4; /* +4 bytes */
     }
     else
     {
@@ -6335,8 +6814,39 @@ ST_FUNC void tcc_gen_machine_assign_op(IROperand dest, IROperand src, TccIrOp op
 {
   const int dest_is_64bit = irop_is_64bit(dest);
 
+  /* Complex destination: if source is effectively a scalar, we need to
+   * zero the imaginary part. Promote scalar to pair {value, 0}.
+   *
+   * A source is "effectively scalar" when it carries VT_COMPLEX from type
+   * promotion (e.g. _Complex float a = 1.0f) but only holds a single value:
+   *  - not marked complex at all, OR
+   *  - an immediate constant (IMM32/F32/I64/F64 — no complex literals exist yet), OR
+   *  - a vreg whose pair register was never allocated (pr1 == PREG_REG_NONE
+   *    and not spilled to a complex stack slot).
+   */
+  int src_tag = irop_get_tag(src);
+  int src_is_imm_const =
+      (src_tag == IROP_TAG_IMM32 || src_tag == IROP_TAG_F32 || src_tag == IROP_TAG_I64 || src_tag == IROP_TAG_F64);
+  int src_effectively_scalar =
+      !src.is_complex || (src.is_complex && (src_is_imm_const || (src.pr1_reg == PREG_REG_NONE && !src.pr1_spilled)));
+  if (dest.is_complex && src_effectively_scalar)
+  {
+    /* Assign real part */
+    IROperand dest_real = dest;
+    dest_real.is_complex = 0;
+    dest_real.pr1_reg = PREG_REG_NONE;
+    tcc_gen_machine_assign_op(dest_real, src, op);
+
+    /* Zero imaginary part */
+    if (dest.pr1_reg != PREG_REG_NONE && !dest.pr1_spilled)
+    {
+      ot_check(th_mov_imm(dest.pr1_reg, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    }
+    return;
+  }
+
   /* 64-bit destination has dedicated handler */
-  if (dest_is_64bit)
+  if (dest_is_64bit || irop_needs_pair(dest))
   {
     assign_op_64bit(dest, src);
     return;
@@ -6471,9 +6981,12 @@ ST_FUNC void tcc_gen_machine_lea_op(IROperand dest, IROperand src, TccIrOp op)
      * When computing their address, fold in offset_to_args (prologue push size).
      * EXCEPTION: Variadic register parameters are saved in the prologue at
      * negative offsets (FP-16 to FP-4), so they're already in our local frame
-     * and should NOT have offset_to_args added. */
+     * and should NOT have offset_to_args added.
+     * Locals/spills need callee-saved gap adjustment. */
     if (src.is_param && offset >= 0)
       offset += offset_to_args;
+    else if (!chain_used)
+      offset = fp_adjust_local_offset(offset, src.is_param);
     int sign = (offset < 0);
     int abs_offset = sign ? -offset : offset;
 
@@ -7058,12 +7571,17 @@ static int get_struct_base_addr(const IROperand *arg, int default_reg)
 
   if (tag == IROP_TAG_STACKOFF && arg->is_local)
   {
-    int local_off = irop_get_stack_offset(*arg);
-    if (arg->is_param && local_off >= 0)
-      local_off += offset_to_args;
+    int raw_off = irop_get_stack_offset(*arg);
 
     if (arg->is_llocal)
     {
+      /* For llocal, compute adjusted offset for the double-indirection load */
+      int local_off = raw_off;
+      if (arg->is_param && local_off >= 0)
+        local_off += offset_to_args;
+      else
+        local_off = fp_adjust_local_offset(local_off, arg->is_param);
+
       int sign = (local_off < 0);
       int abs_off = sign ? -local_off : local_off;
       if (!load_word_from_base(base_addr_reg, ARM_R7, abs_off, sign))
@@ -7074,7 +7592,8 @@ static int get_struct_base_addr(const IROperand *arg, int default_reg)
     }
     else
     {
-      tcc_machine_addr_of_stack_slot(base_addr_reg, local_off, arg->is_param ? 1 : 0);
+      /* tcc_machine_addr_of_stack_slot handles param/local adjustments internally */
+      tcc_machine_addr_of_stack_slot(base_addr_reg, raw_off, arg->is_param ? 1 : 0);
     }
   }
   else if (tag == IROP_TAG_SYMREF)
@@ -7383,7 +7902,7 @@ static int build_register_arg_moves(CallGenContext *ctx, ThumbArgMove *reg_moves
     const TCCAbiArgLoc *loc = &ctx->layout->locs[i];
     const IROperand *arg = &ctx->args[i];
     const int bt = irop_get_btype(*arg);
-    const int is_64bit = irop_is_64bit(*arg);
+    const int is_64bit = irop_needs_pair(*arg);
 
     if (loc->kind != TCC_ABI_LOC_REG && loc->kind != TCC_ABI_LOC_REG_STACK)
       continue;
@@ -7420,7 +7939,7 @@ static void presave_stack_args_from_arg_regs(CallGenContext *ctx)
 
     if (loc->kind == TCC_ABI_LOC_REG)
       continue;
-    if (bt == IROP_BTYPE_STRUCT || irop_is_64bit(*arg))
+    if (bt == IROP_BTYPE_STRUCT || irop_needs_pair(*arg))
       continue;
 
     if (arg->pr0_reg != PREG_REG_NONE && !arg->pr0_spilled && arg->pr0_reg <= ARM_R3)
@@ -7438,7 +7957,7 @@ static void place_stack_arguments(CallGenContext *ctx)
     const TCCAbiArgLoc *loc = &ctx->layout->locs[i];
     const IROperand *arg = &ctx->args[i];
     const int bt = irop_get_btype(*arg);
-    const int is_64bit = irop_is_64bit(*arg);
+    const int is_64bit = irop_needs_pair(*arg);
 
     if (loc->kind == TCC_ABI_LOC_REG)
       continue;
@@ -7466,7 +7985,7 @@ static void handle_return_value(IROperand dest, int drop_value)
                         false));
   }
 
-  if (irop_is_64bit(dest) && dest.pr1_reg != PREG_REG_NONE && dest.pr1_reg != ARM_R1)
+  if (irop_needs_pair(dest) && dest.pr1_reg != PREG_REG_NONE && dest.pr1_reg != ARM_R1)
   {
     ot_check(th_mov_reg(dest.pr1_reg, ARM_R1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE,
                         false));
@@ -7892,6 +8411,12 @@ ST_FUNC void tcc_gen_machine_vla_op(IROperand dest, IROperand src1, IROperand sr
   default:
     tcc_error("compiler_error: tcc_gen_machine_vla_op unsupported op %d", op);
   }
+}
+
+ST_FUNC void tcc_gen_machine_trap_op(void)
+{
+  /* Emit UDF #0xfe - Undefined instruction for trap */
+  ot_check(th_udf(0xfe, ENFORCE_ENCODING_NONE));
 }
 
 ST_FUNC void tcc_gen_machine_backpatch_jump(int address, int offset)

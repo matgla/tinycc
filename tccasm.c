@@ -1587,7 +1587,8 @@ static void subst_asm_operands(ASMOperand *operands, int nb_operands, CString *o
  * This is shared between the classic front-end path and IR codegen.
  */
 ST_FUNC void tcc_asm_emit_inline(ASMOperand *operands, int nb_operands, int nb_outputs, int nb_labels,
-                                 uint8_t *clobber_regs, const char *asm_str, int asm_len, int must_subst)
+                                 uint8_t *clobber_regs, const uint8_t *reserved_regs, const char *asm_str, int asm_len,
+                                 int must_subst)
 {
   int out_reg;
   Section *sec;
@@ -1599,7 +1600,7 @@ ST_FUNC void tcc_asm_emit_inline(ASMOperand *operands, int nb_operands, int nb_o
     tcc_error("tcc_asm_emit_inline: invalid asm string");
 
   /* compute constraints */
-  asm_compute_constraints(operands, nb_operands, nb_outputs, clobber_regs, &out_reg);
+  asm_compute_constraints(operands, nb_operands, nb_outputs, clobber_regs, reserved_regs, &out_reg);
 
   cstr_new_s(&astr);
   cstr_cat(&astr, asm_str, asm_len + 1);
@@ -1647,6 +1648,7 @@ static void parse_asm_operands(ASMOperand *operands, int *nb_operands_ptr, int i
         tcc_error("too many asm operands");
       op = &operands[nb_operands++];
       op->id = 0;
+      op->reg = -1;
       if (tok == '[')
       {
         next();
@@ -1842,7 +1844,7 @@ ST_FUNC void asm_instr(void)
   }
 
   /* compute constraints */
-  asm_compute_constraints(operands, nb_operands, nb_outputs, clobber_regs, &out_reg);
+  asm_compute_constraints(operands, nb_operands, nb_outputs, clobber_regs, NULL, &out_reg);
 
   /* substitute the operands in the asm string. No substitution is
      done if no operands (GCC behaviour) */
