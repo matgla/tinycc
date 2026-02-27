@@ -2860,13 +2860,7 @@ int tcc_ir_opt_store_redundant(TCCIRState *ir)
 
 /* Table of functions known to return non-negative values */
 static const char *nonneg_func_names[] = {
-    "fabs",
-    "fabsf",
-    "abs",
-    "labs",
-    "llabs",
-    "strlen",
-    "sizeof",
+    "fabs", "fabsf", "abs", "labs", "llabs", "strlen", "sizeof",
 };
 #define NUM_NONNEG_FUNCS (sizeof(nonneg_func_names) / sizeof(nonneg_func_names[0]))
 
@@ -3009,8 +3003,7 @@ int tcc_ir_opt_nonneg_branch_fold(TCCIRState *ir)
     /* Check FUNCCALLVOID for flag-setting soft-float comparison. */
     if (q->op != TCCIR_OP_FUNCCALLVOID)
     {
-      if (q->op != TCCIR_OP_FUNCPARAMVOID && q->op != TCCIR_OP_NOP &&
-          q->op != TCCIR_OP_FUNCCALLVAL)
+      if (q->op != TCCIR_OP_FUNCPARAMVOID && q->op != TCCIR_OP_NOP && q->op != TCCIR_OP_FUNCCALLVAL)
         param_count = 0;
       continue;
     }
@@ -3214,6 +3207,378 @@ int tcc_ir_opt_nonneg_branch_fold(TCCIRState *ir)
   /* Run DCE to clean up dead code after folded branches */
   if (changes)
     changes += tcc_ir_opt_dce(ir);
+
+  return changes;
+}
+
+/* ============================================================================
+ * Float Narrowing Optimization
+ * ============================================================================
+ *
+ * Replaces double-precision math function calls with float-precision variants
+ * when the argument was promoted from float and/or the result is demoted back
+ * to float.
+ *
+ * This is valid for functions where (float)func((double)x) == funcf(x) for
+ * all float x. These are "integer-valued" or "magnitude-preserving" functions:
+ *   floor → floorf, ceil → ceilf, trunc → truncf, round → roundf,
+ *   fabs → fabsf, nearbyint → nearbyintf, rint → rintf
+ *
+ * NOT valid for: sin, cos, tan, sqrt, exp, log, pow (precision-dependent).
+ *
+ * Pattern detected in IR (soft-float):
+ *
+ * Case 1: Result demoted back to float
+ *   FUNCPARAMVAL float_arg, [call_A, 0]
+ *   FUNCCALLVAL __aeabi_f2d → T_double      ; float-to-double
+ *   FUNCPARAMVAL T_double, [call_B, 0]
+ *   FUNCCALLVAL floor → T_result            ; double-precision math func
+ *   FUNCPARAMVAL T_result, [call_C, 0]
+ *   FUNCCALLVAL __aeabi_d2f → T_float       ; double-to-float
+ *
+ *   Transformed to:
+ *   FUNCPARAMVAL float_arg, [call_B, 0]
+ *   FUNCCALLVAL floorf → T_float             ; float-precision variant
+ *   (f2d and d2f calls NOP'd out)
+ *
+ * Case 2: Result stays double (e.g., double q1(float a) { return floor(a); })
+ *   FUNCPARAMVAL float_arg, [call_A, 0]
+ *   FUNCCALLVAL __aeabi_f2d → T_double
+ *   FUNCPARAMVAL T_double, [call_B, 0]
+ *   FUNCCALLVAL floor → T_result
+ *
+ *   Transformed by swapping callees (f2d moves after the function):
+ *   FUNCPARAMVAL float_arg, [call_A, 0]
+ *   FUNCCALLVAL floorf → T_float_result      ; now calls floorf
+ *   FUNCPARAMVAL T_float_result, [call_B, 0]
+ *   FUNCCALLVAL __aeabi_f2d → T_result       ; now widens result to double
+ */
+
+/* Table mapping double-precision function names to float-precision equivalents */
+typedef struct
+{
+  const char *double_name;
+  const char *float_name;
+} FloatNarrowEntry;
+
+static const FloatNarrowEntry float_narrow_table[] = {
+    {"floor", "floorf"},
+    {"ceil", "ceilf"},
+    {"trunc", "truncf"},
+    {"round", "roundf"},
+    {"fabs", "fabsf"},
+    {"nearbyint", "nearbyintf"},
+    {"rint", "rintf"},
+};
+#define NUM_FLOAT_NARROW (sizeof(float_narrow_table) / sizeof(float_narrow_table[0]))
+
+/* Tracking structure for f2d / d2f calls */
+typedef struct
+{
+  int param_idx;  /* instruction index of the FUNCPARAMVAL */
+  int call_idx;   /* instruction index of the FUNCCALLVAL */
+  int32_t src_vr; /* original source vreg (float for f2d, double for d2f) */
+  int32_t dst_vr; /* result vreg */
+  int call_id;    /* IR call_id */
+} ConvCallInfo;
+
+#define MAX_CONV_CALLS 32
+
+/* Helper: change the callee symbol of a FUNCCALLVAL/FUNCCALLVOID instruction.
+ * ret_btype is the VT_* return type for correct forward declaration
+ * (e.g. VT_FLOAT for floorf, VT_INT for __aeabi_* helpers). */
+static int change_callee_sym(TCCIRState *ir, int instr_idx, const char *new_name, int ret_btype)
+{
+  IRQuadCompact *q = &ir->compact_instructions[instr_idx];
+  IROperand src1 = tcc_ir_op_get_src1(ir, q);
+  IRPoolSymref *entry = irop_get_symref_ex(ir, src1);
+  if (!entry)
+    return 0;
+
+  /* Build a function type with the correct return type so later definitions
+   * (e.g., "float floorf(float)") don't get a type-incompatible error.
+   * We use FUNC_OLD (K&R) style so that parameter types are unspecified.
+   * IMPORTANT: Push to global_stack, not local_stack, because this symbol
+   * must outlive the current function scope. Using sym_push() would put it
+   * on local_stack which gets freed when the function scope ends. */
+  CType ftype;
+  ftype.t = VT_FUNC;
+  ftype.ref = sym_push2(&global_stack, SYM_FIELD, ret_btype, 0);
+  ftype.ref->f.func_call = FUNC_CDECL;
+  ftype.ref->f.func_type = FUNC_OLD;
+
+  Sym *new_sym = external_global_sym(tok_alloc_const(new_name), &ftype);
+  if (!new_sym)
+    return 0;
+  entry->sym = new_sym;
+  return 1;
+}
+
+int tcc_ir_opt_float_narrowing(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  int changes = 0;
+
+  if (n < 4)
+    return 0;
+
+  /* Phase 1: Collect f2d and d2f conversion calls */
+  ConvCallInfo f2d_calls[MAX_CONV_CALLS];
+  ConvCallInfo d2f_calls[MAX_CONV_CALLS];
+  int num_f2d = 0, num_d2f = 0;
+
+  /* Also track: for each instruction that is a FUNCPARAMVAL, record the
+   * instruction index and the source vreg, keyed by (call_id, param_idx).
+   * We do this in a linear scan. */
+
+  int pending_param_idx = -1;
+  int32_t pending_param_src_vr = -1;
+  int pending_param_call_id = -1;
+
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+
+    if (q->op == TCCIR_OP_FUNCPARAMVAL)
+    {
+      IROperand src1 = tcc_ir_op_get_src1(ir, q);
+      IROperand src2 = tcc_ir_op_get_src2(ir, q);
+      uint32_t encoded = (uint32_t)irop_get_imm64_ex(ir, src2);
+      int param_idx_val = TCCIR_DECODE_PARAM_IDX(encoded);
+
+      if (param_idx_val == 0)
+      {
+        /* Track the most recent param 0 */
+        pending_param_idx = i;
+        pending_param_src_vr = irop_is_immediate(src1) ? -1 : irop_get_vreg(src1);
+        pending_param_call_id = TCCIR_DECODE_CALL_ID(encoded);
+      }
+      continue;
+    }
+
+    if (q->op == TCCIR_OP_FUNCCALLVAL && pending_param_idx >= 0)
+    {
+      IROperand src1 = tcc_ir_op_get_src1(ir, q);
+      IROperand src2 = tcc_ir_op_get_src2(ir, q);
+      Sym *callee = irop_get_sym_ex(ir, src1);
+      if (!callee)
+      {
+        pending_param_idx = -1;
+        continue;
+      }
+
+      const char *name = get_tok_str(callee->v, NULL);
+      if (!name)
+      {
+        pending_param_idx = -1;
+        continue;
+      }
+
+      uint32_t call_encoded = (uint32_t)irop_get_imm64_ex(ir, src2);
+      int this_call_id = TCCIR_DECODE_CALL_ID(call_encoded);
+
+      IROperand dest = tcc_ir_op_get_dest(ir, q);
+      int32_t dst_vr = irop_get_vreg(dest);
+
+      if (strcmp(name, "__aeabi_f2d") == 0 && this_call_id == pending_param_call_id)
+      {
+        if (num_f2d < MAX_CONV_CALLS)
+        {
+          f2d_calls[num_f2d].param_idx = pending_param_idx;
+          f2d_calls[num_f2d].call_idx = i;
+          f2d_calls[num_f2d].src_vr = pending_param_src_vr;
+          f2d_calls[num_f2d].dst_vr = dst_vr;
+          f2d_calls[num_f2d].call_id = this_call_id;
+          num_f2d++;
+        }
+      }
+      else if (strcmp(name, "__aeabi_d2f") == 0 && this_call_id == pending_param_call_id)
+      {
+        if (num_d2f < MAX_CONV_CALLS)
+        {
+          d2f_calls[num_d2f].param_idx = pending_param_idx;
+          d2f_calls[num_d2f].call_idx = i;
+          d2f_calls[num_d2f].src_vr = pending_param_src_vr;
+          d2f_calls[num_d2f].dst_vr = dst_vr;
+          d2f_calls[num_d2f].call_id = this_call_id;
+          num_d2f++;
+        }
+      }
+
+      pending_param_idx = -1;
+      continue;
+    }
+
+    /* Reset pending param tracking on non-param, non-call instructions */
+    if (q->op != TCCIR_OP_NOP)
+      pending_param_idx = -1;
+  }
+
+  if (num_f2d == 0)
+    return 0;
+
+  /* Phase 2: For each narrowable function call, check if:
+   * - Its parameter is an f2d result
+   * - Its result feeds into a d2f (Case 1) or not (Case 2) */
+
+  /* Re-scan for function calls with matching f2d parameters */
+  pending_param_idx = -1;
+  pending_param_src_vr = -1;
+  pending_param_call_id = -1;
+
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+
+    if (q->op == TCCIR_OP_FUNCPARAMVAL)
+    {
+      IROperand src1 = tcc_ir_op_get_src1(ir, q);
+      IROperand src2 = tcc_ir_op_get_src2(ir, q);
+      uint32_t encoded = (uint32_t)irop_get_imm64_ex(ir, src2);
+      int param_idx_val = TCCIR_DECODE_PARAM_IDX(encoded);
+
+      if (param_idx_val == 0)
+      {
+        pending_param_idx = i;
+        pending_param_src_vr = irop_is_immediate(src1) ? -1 : irop_get_vreg(src1);
+        pending_param_call_id = TCCIR_DECODE_CALL_ID(encoded);
+      }
+      continue;
+    }
+
+    if (q->op != TCCIR_OP_FUNCCALLVAL || pending_param_idx < 0)
+    {
+      if (q->op != TCCIR_OP_NOP && q->op != TCCIR_OP_FUNCPARAMVOID)
+        pending_param_idx = -1;
+      continue;
+    }
+
+    IROperand src1 = tcc_ir_op_get_src1(ir, q);
+    IROperand src2 = tcc_ir_op_get_src2(ir, q);
+    Sym *callee = irop_get_sym_ex(ir, src1);
+    if (!callee)
+    {
+      pending_param_idx = -1;
+      continue;
+    }
+
+    const char *name = get_tok_str(callee->v, NULL);
+    if (!name)
+    {
+      pending_param_idx = -1;
+      continue;
+    }
+
+    /* Check if this is a narrowable function */
+    const char *float_name = NULL;
+    for (size_t j = 0; j < NUM_FLOAT_NARROW; j++)
+    {
+      if (strcmp(name, float_narrow_table[j].double_name) == 0)
+      {
+        float_name = float_narrow_table[j].float_name;
+        break;
+      }
+    }
+
+    if (!float_name)
+    {
+      pending_param_idx = -1;
+      continue;
+    }
+
+    /* Check if param 0 comes from an f2d result */
+    ConvCallInfo *f2d_info = NULL;
+    for (int k = 0; k < num_f2d; k++)
+    {
+      if (f2d_calls[k].dst_vr == pending_param_src_vr)
+      {
+        f2d_info = &f2d_calls[k];
+        break;
+      }
+    }
+
+    if (!f2d_info)
+    {
+      pending_param_idx = -1;
+      continue;
+    }
+
+    uint32_t call_encoded = (uint32_t)irop_get_imm64_ex(ir, src2);
+    (void)call_encoded;
+    IROperand func_dest = tcc_ir_op_get_dest(ir, q);
+    int32_t func_result_vr = irop_get_vreg(func_dest);
+    int func_call_idx = i;
+    int func_param_idx = pending_param_idx;
+
+    /* Check if result feeds a d2f (Case 1) */
+    ConvCallInfo *d2f_info = NULL;
+    for (int k = 0; k < num_d2f; k++)
+    {
+      if (d2f_calls[k].src_vr == func_result_vr)
+      {
+        d2f_info = &d2f_calls[k];
+        break;
+      }
+    }
+
+    if (d2f_info)
+    {
+      /* ===== Case 1: f2d → func → d2f =====
+       * Transform to: floorf(original_float) → T_float_result
+       * NOP out the f2d and d2f conversion calls. */
+
+      /* 1. Change func's FUNCPARAMVAL to use the original float arg */
+      IROperand orig_float_param = tcc_ir_op_get_src1(ir,
+          &ir->compact_instructions[f2d_info->param_idx]);
+      tcc_ir_set_src1(ir, func_param_idx, orig_float_param);
+
+      /* 2. Change func's FUNCCALLVAL callee to float variant */
+      change_callee_sym(ir, func_call_idx, float_name, VT_FLOAT);
+
+      /* 3. Change func's FUNCCALLVAL dest to d2f's result vreg */
+      IROperand d2f_dest = tcc_ir_op_get_dest(ir,
+          &ir->compact_instructions[d2f_info->call_idx]);
+      tcc_ir_set_dest(ir, func_call_idx, d2f_dest);
+
+      /* 4. NOP out f2d (param + call) */
+      ir->compact_instructions[f2d_info->param_idx].op = TCCIR_OP_NOP;
+      ir->compact_instructions[f2d_info->call_idx].op = TCCIR_OP_NOP;
+
+      /* 5. NOP out d2f (param + call) */
+      ir->compact_instructions[d2f_info->param_idx].op = TCCIR_OP_NOP;
+      ir->compact_instructions[d2f_info->call_idx].op = TCCIR_OP_NOP;
+
+#ifdef DEBUG_IR_GEN
+      printf("FLOAT NARROW (Case 1): %s → %s at i=%d, NOP'd f2d@%d and d2f@%d\n",
+             name, float_name, func_call_idx, f2d_info->call_idx, d2f_info->call_idx);
+#endif
+      changes++;
+    }
+    else
+    {
+      /* ===== Case 2: f2d → func, result stays double =====
+       * Swap callees: f2d becomes floorf, func becomes f2d.
+       * Before: f2d(float) → T_double → func(T_double) → T_result
+       * After:  floorf(float) → T_float → f2d(T_float) → T_result */
+
+      /* 1. Change f2d's callee to the float variant */
+      change_callee_sym(ir, f2d_info->call_idx, float_name, VT_FLOAT);
+
+      /* 2. Change func's callee to __aeabi_f2d */
+      change_callee_sym(ir, func_call_idx, "__aeabi_f2d", VT_INT);
+
+#ifdef DEBUG_IR_GEN
+      printf("FLOAT NARROW (Case 2): swapped %s↔f2d at i=%d,%d\n",
+             name, f2d_info->call_idx, func_call_idx);
+#endif
+      changes++;
+    }
+
+    /* Invalidate modified f2d entry to prevent double-processing */
+    f2d_info->dst_vr = -1;
+
+    pending_param_idx = -1;
+  }
 
   return changes;
 }

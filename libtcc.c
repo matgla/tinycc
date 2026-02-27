@@ -2120,6 +2120,7 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
         s->opt_strength_red = 1;    /* Strength reduction for multiply */
         s->opt_iv_strength_red = 1; /* IV strength reduction for array loops */
         s->opt_nonneg_fold = 1;     /* Non-negative value branch folding */
+        s->opt_float_narrow = 1;   /* Narrow double math to float when safe */
         s->opt_jump_threading = 1;  /* Jump threading optimization */
       }
       break;

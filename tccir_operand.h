@@ -64,7 +64,7 @@ typedef enum TCCIR_VREG_TYPE
 /* Compressed basic type (stored in bits 25-27 of vr)
  * This allows reconstruction of type.t during iroperand_to_svalue().
  * Preserves byte/short distinction for correct load instruction generation. */
-#define IROP_BTYPE_INT32 0   /* VT_VOID, VT_INT, VT_PTR, VT_BOOL */
+#define IROP_BTYPE_INT32 0   /* VT_VOID, VT_INT, VT_PTR */
 #define IROP_BTYPE_INT64 1   /* VT_LLONG */
 #define IROP_BTYPE_FLOAT32 2 /* VT_FLOAT */
 #define IROP_BTYPE_FLOAT64 3 /* VT_DOUBLE, VT_LDOUBLE */

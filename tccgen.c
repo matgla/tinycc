@@ -27,6 +27,8 @@
 #include "ir/opt.h"
 #include "tccir.h"
 
+#include <math.h>
+
 // #define DEBUG_IR_GEN
 
 /* Debug output for TCCGEN FUNCPARAMVAL processing - disabled by default
@@ -112,6 +114,156 @@ static CString initstr;
 #define VT_SIZE_T (VT_LONG | VT_LLONG | VT_UNSIGNED)
 #define VT_PTRDIFF_T (VT_LONG | VT_LLONG)
 #endif
+
+/* ============================================================================
+ * Constant Folding for Math Builtins
+ * ============================================================================
+ * This allows compile-time evaluation of math functions when all arguments
+ * are constant values, similar to GCC's constant folding for builtins.
+ */
+
+typedef enum
+{
+  FOLD_TYPE_FLOAT,
+  FOLD_TYPE_DOUBLE,
+  FOLD_TYPE_LONG_DOUBLE
+} FoldType;
+
+typedef struct
+{
+  const char *name;  /* Function name (e.g., "sin") */
+  int num_args;      /* Number of arguments (1 or 2) */
+  FoldType arg_type; /* Type of arguments */
+  FoldType ret_type; /* Type of return value */
+  union
+  {
+    double (*f1_d)(double);         /* Single-argument double function */
+    double (*f2_d)(double, double); /* Two-argument double function */
+    float (*f1_f)(float);           /* Single-argument float function */
+    float (*f2_f)(float, float);    /* Two-argument float function */
+  } func;
+} FoldableMathFunc;
+
+/* Table of foldable math functions */
+static const FoldableMathFunc foldable_math_funcs[] = {
+    /* Double-precision functions */
+    {"sin", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = sin}},
+    {"cos", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = cos}},
+    {"tan", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = tan}},
+    {"asin", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = asin}},
+    {"acos", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = acos}},
+    {"atan", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = atan}},
+    {"atan2", 2, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f2_d = atan2}},
+    {"sinh", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = sinh}},
+    {"cosh", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = cosh}},
+    {"tanh", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = tanh}},
+    {"exp", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = exp}},
+    {"log", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = log}},
+    {"log10", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = log10}},
+    {"pow", 2, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f2_d = pow}},
+    {"sqrt", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = sqrt}},
+    {"cbrt", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = cbrt}},
+    {"ceil", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = ceil}},
+    {"floor", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = floor}},
+    {"round", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = round}},
+    {"trunc", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = trunc}},
+    {"fabs", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = fabs}},
+    {"fmod", 2, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f2_d = fmod}},
+    {"remainder", 2, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f2_d = remainder}},
+
+    /* Single-precision functions */
+    {"sinf", 1, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f1_f = sinf}},
+    {"cosf", 1, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f1_f = cosf}},
+    {"tanf", 1, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f1_f = tanf}},
+    {"asinf", 1, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f1_f = asinf}},
+    {"acosf", 1, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f1_f = acosf}},
+    {"atanf", 1, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f1_f = atanf}},
+    {"atan2f", 2, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f2_f = atan2f}},
+    {"sinhf", 1, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f1_f = sinhf}},
+    {"coshf", 1, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f1_f = coshf}},
+    {"tanhf", 1, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f1_f = tanhf}},
+    {"expf", 1, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f1_f = expf}},
+    {"logf", 1, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f1_f = logf}},
+    {"log10f", 1, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f1_f = log10f}},
+    {"powf", 2, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f2_f = powf}},
+    {"sqrtf", 1, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f1_f = sqrtf}},
+    {"cbrtf", 1, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f1_f = cbrtf}},
+    {"ceilf", 1, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f1_f = ceilf}},
+    {"floorf", 1, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f1_f = floorf}},
+    {"roundf", 1, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f1_f = roundf}},
+    {"truncf", 1, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f1_f = truncf}},
+    {"fabsf", 1, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f1_f = fabsf}},
+    {"fmodf", 2, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f2_f = fmodf}},
+    {"remainderf", 2, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f2_f = remainderf}},
+};
+
+#define NUM_FOLDABLE_MATH_FUNCS (sizeof(foldable_math_funcs) / sizeof(foldable_math_funcs[0]))
+
+/* Check if a value is a compile-time constant suitable for folding */
+static int is_const_for_folding(SValue *sv)
+{
+  /* Must be VT_CONST without VT_SYM (symbolic constants can't be folded) */
+  if ((sv->r & (VT_VALMASK | VT_LVAL | VT_SYM)) != VT_CONST)
+    return 0;
+
+  /* Must be a floating point type or integer */
+  int bt = sv->type.t & VT_BTYPE;
+  if (bt != VT_FLOAT && bt != VT_DOUBLE && bt != VT_LDOUBLE && bt != VT_INT && bt != VT_SHORT && bt != VT_BYTE &&
+      bt != VT_LLONG)
+    return 0;
+
+  return 1;
+}
+
+/* Extract double value from SValue */
+static double get_const_double(SValue *sv)
+{
+  int bt = sv->type.t & VT_BTYPE;
+  switch (bt)
+  {
+  case VT_FLOAT:
+    return (double)sv->c.f;
+  case VT_DOUBLE:
+    return sv->c.d;
+  case VT_LDOUBLE:
+    return (double)sv->c.ld;
+  case VT_INT:
+    return (double)(int)sv->c.i;
+  case VT_SHORT:
+    return (double)(short)sv->c.i;
+  case VT_BYTE:
+    return (double)(char)sv->c.i;
+  case VT_LLONG:
+    return (double)(long long)sv->c.i;
+  default:
+    return 0.0;
+  }
+}
+
+/* Extract float value from SValue */
+static float get_const_float(SValue *sv)
+{
+  int bt = sv->type.t & VT_BTYPE;
+  switch (bt)
+  {
+  case VT_FLOAT:
+    return sv->c.f;
+  case VT_DOUBLE:
+    return (float)sv->c.d;
+  case VT_LDOUBLE:
+    return (float)sv->c.ld;
+  case VT_INT:
+    return (float)(int)sv->c.i;
+  case VT_SHORT:
+    return (float)(short)sv->c.i;
+  case VT_BYTE:
+    return (float)(char)sv->c.i;
+  case VT_LLONG:
+    return (float)(long long)sv->c.i;
+  default:
+    return 0.0f;
+  }
+}
 
 const char *get_value_type(int r)
 {
@@ -1094,6 +1246,105 @@ static void vsetc(CType *type, int r, CValue *vc)
   vtop->sym = NULL;
   /* Note: jtrue/jfalse are in a union with c, so we DON'T initialize them here.
      They should only be used when r == VT_CMP, and c is used otherwise. */
+}
+
+/* Try to constant-fold a math function call.
+ * Returns 1 if folding was successful, 0 otherwise.
+ * On success, the function result is pushed onto the value stack.
+ */
+static int try_fold_math_call(const char *func_name, SValue *args, int nb_args)
+{
+  const FoldableMathFunc *fmf = NULL;
+  int i;
+
+  /* Look up the function in our table */
+  for (i = 0; i < NUM_FOLDABLE_MATH_FUNCS; i++)
+  {
+    if (strcmp(foldable_math_funcs[i].name, func_name) == 0)
+    {
+      fmf = &foldable_math_funcs[i];
+      break;
+    }
+  }
+
+  if (!fmf)
+    return 0;
+
+  /* Check argument count */
+  if (nb_args != fmf->num_args)
+    return 0;
+
+  /* Check if all arguments are constants */
+  for (i = 0; i < nb_args; i++)
+  {
+    if (!is_const_for_folding(&args[i]))
+      return 0;
+  }
+
+  /* Evaluate the function at compile time */
+  CValue result;
+  memset(&result, 0, sizeof(result));
+
+  if (fmf->arg_type == FOLD_TYPE_DOUBLE)
+  {
+    if (fmf->num_args == 1)
+    {
+      double arg = get_const_double(&args[0]);
+      double res = fmf->func.f1_d(arg);
+
+      if (fmf->ret_type == FOLD_TYPE_DOUBLE)
+        result.d = res;
+      else if (fmf->ret_type == FOLD_TYPE_FLOAT)
+        result.f = (float)res;
+    }
+    else
+    {
+      double arg1 = get_const_double(&args[0]);
+      double arg2 = get_const_double(&args[1]);
+      double res = fmf->func.f2_d(arg1, arg2);
+
+      if (fmf->ret_type == FOLD_TYPE_DOUBLE)
+        result.d = res;
+      else if (fmf->ret_type == FOLD_TYPE_FLOAT)
+        result.f = (float)res;
+    }
+  }
+  else
+  { /* FOLD_TYPE_FLOAT */
+    if (fmf->num_args == 1)
+    {
+      float arg = get_const_float(&args[0]);
+      float res = fmf->func.f1_f(arg);
+      result.f = res;
+    }
+    else
+    {
+      float arg1 = get_const_float(&args[0]);
+      float arg2 = get_const_float(&args[1]);
+      float res = fmf->func.f2_f(arg1, arg2);
+      result.f = res;
+    }
+  }
+
+  /* Push the result onto the value stack */
+  CType result_type;
+  result_type.ref = NULL;
+
+  if (fmf->ret_type == FOLD_TYPE_DOUBLE)
+    result_type.t = VT_DOUBLE;
+  else if (fmf->ret_type == FOLD_TYPE_FLOAT)
+    result_type.t = VT_FLOAT;
+  else
+    result_type.t = VT_LDOUBLE;
+
+  /* For C standard compliance: only fold finite results */
+  double res_d = (fmf->ret_type == FOLD_TYPE_DOUBLE) ? result.d : (double)result.f;
+  if (!ieee_finite(res_d))
+    return 0;
+
+  vsetc(&result_type, VT_CONST, &result);
+
+  return 1;
 }
 
 ST_FUNC void vswap(void)
@@ -3938,6 +4189,54 @@ redo:
   // Make sure that we have converted to an rvalue:
   // if (vtop->r & VT_LVAL)
   //   gv(is_float(vtop->type.t & VT_BTYPE) ? RC_FLOAT : RC_INT);
+}
+
+/* Try to inline a builtin integer absolute value function (abs/labs/llabs).
+ * Returns 1 if inlined, 0 otherwise.
+ * On success, the result is pushed onto the value stack.
+ * Uses the branchless formula: sign = x >> (N-1); result = (x ^ sign) - sign
+ */
+static int try_inline_builtin_call(const char *func_name, SValue *args, int nb_args)
+{
+  int shift_amount;
+
+  if (nb_args != 1)
+    return 0;
+
+  /* Determine if this is an abs-family function */
+  if (strcmp(func_name, "abs") == 0)
+  {
+    shift_amount = 31; /* int: 32-bit */
+  }
+  else if (strcmp(func_name, "labs") == 0)
+  {
+    shift_amount = 31; /* long: 32-bit on ARM32 */
+  }
+  else if (strcmp(func_name, "llabs") == 0)
+  {
+    shift_amount = 63; /* long long: 64-bit */
+  }
+  else
+  {
+    return 0;
+  }
+
+  /* Push the argument value */
+  vpushv(&args[0]); /* Stack: ... func_ptr x */
+
+  /* Generate: sign = x >> (N-1) */
+  vdup();               /* Stack: ... func_ptr x x */
+  vpushi(shift_amount); /* Stack: ... func_ptr x x shift */
+  gen_op(TOK_SAR);      /* Stack: ... func_ptr x sign */
+
+  /* Generate: result = (x ^ sign) - sign */
+  vdup();      /* Stack: ... func_ptr x sign sign */
+  vrott(3);    /* Stack: ... func_ptr sign x sign */
+  gen_op('^'); /* Stack: ... func_ptr sign (x^sign) */
+  vswap();     /* Stack: ... func_ptr (x^sign) sign */
+  gen_op('-'); /* Stack: ... func_ptr result */
+
+  return 1;
 }
 
 #if defined TCC_TARGET_ARM64 || defined TCC_TARGET_RISCV64 || defined TCC_TARGET_ARM
@@ -7074,7 +7373,22 @@ tok_next:
        there and in function calls. */
     /* arrays can also be used although they are not lvalues */
     if ((vtop->type.t & VT_BTYPE) != VT_FUNC && !(vtop->type.t & (VT_ARRAY | VT_VLA)))
+    {
+      /* If a const global was folded to an immediate (r=VT_CONST, no VT_LVAL),
+       * but the symbol is still available, restore the original lvalue form so
+       * that '&var' correctly takes the address of the global. This handles
+       * cases like 'if (0) return &const_global;' where the read is folded
+       * but the address-of must still be valid. (Only VT_SYM is not in r
+       * because we preserved sym without setting the VT_SYM flag in r.) */
+      if (!(vtop->r & VT_LVAL) && (vtop->r & VT_VALMASK) == VT_CONST && vtop->sym != NULL)
+      {
+        vtop->r = VT_LVAL | VT_CONST | VT_SYM;
+        vtop->c.i = 0;
+        vtop->type = vtop->sym->type;
+        vtop->vr = -1;
+      }
       test_lvalue();
+    }
     if (vtop->sym)
     {
       vtop->sym->a.addrtaken = 1;
@@ -7670,6 +7984,77 @@ tok_next:
     if (r & VT_SYM)
     {
       vtop->c.i = 0;
+
+      /* Fold reads from const-qualified scalar globals with known initializers.
+       * If the variable is const (not volatile), has a simple scalar type,
+       * and the initializer data is available in the section, replace the
+       * lvalue reference with the compile-time constant value. This enables
+       * downstream constant folding (e.g. (int)const_double != 1 -> false). */
+      if (tcc_state->optimize && (s->type.t & VT_CONSTANT) && !(s->type.t & VT_VOLATILE) && !(s->type.t & VT_ARRAY) &&
+          !(s->type.t & VT_VLA) && (s->type.t & VT_BTYPE) != VT_FUNC && (s->type.t & VT_BTYPE) != VT_STRUCT &&
+          (s->type.t & VT_BTYPE) != VT_PTR && s->c > 0)
+      {
+        ElfSym *esym = elfsym(s);
+        if (esym && esym->st_shndx != SHN_UNDEF && esym->st_shndx != SHN_COMMON &&
+            esym->st_shndx < tcc_state->nb_sections)
+        {
+          Section *sec = tcc_state->sections[esym->st_shndx];
+          int btype = s->type.t & VT_BTYPE;
+          int align;
+          int sz = type_size(&s->type, &align);
+          if (sec && sec->data && sz > 0 && esym->st_value + sz <= sec->data_offset)
+          {
+            const unsigned char *ptr = sec->data + esym->st_value;
+            if (btype == VT_DOUBLE || btype == VT_LDOUBLE)
+            {
+              double val;
+              memcpy(&val, ptr, sizeof(double));
+              vtop->c.d = val;
+              vtop->r = VT_CONST;
+              vtop->type.t = (s->type.t & ~(VT_CONSTANT | VT_VOLATILE)) & (VT_BTYPE | VT_UNSIGNED | VT_LONG);
+              /* Preserve sym so &var can restore lvalue form if needed */
+              vtop->vr = -1;
+            }
+            else if (btype == VT_FLOAT)
+            {
+              float val;
+              memcpy(&val, ptr, sizeof(float));
+              vtop->c.f = val;
+              vtop->r = VT_CONST;
+              vtop->type.t = VT_FLOAT;
+              /* Preserve sym so &var can restore lvalue form if needed */
+              vtop->vr = -1;
+            }
+            else if (btype == VT_LLONG)
+            {
+              int64_t val;
+              memcpy(&val, ptr, sizeof(int64_t));
+              vtop->c.i = val;
+              vtop->r = VT_CONST;
+              vtop->type.t = (s->type.t & VT_UNSIGNED) ? (VT_LLONG | VT_UNSIGNED) : VT_LLONG;
+              /* Preserve sym so &var can restore lvalue form if needed */
+              vtop->vr = -1;
+            }
+            else if (btype == VT_INT || btype == VT_BYTE || btype == VT_SHORT || btype == VT_BOOL)
+            {
+              int64_t val = 0;
+              memcpy(&val, ptr, sz);
+              /* Sign-extend for signed types */
+              if (!(s->type.t & VT_UNSIGNED) && sz < 8)
+              {
+                int shift = (8 - sz) * 8;
+                val = (int64_t)(val << shift) >> shift;
+              }
+              vtop->c.i = val;
+              vtop->r = VT_CONST;
+              vtop->type.t = (s->type.t & ~(VT_CONSTANT | VT_VOLATILE)) & (VT_BTYPE | VT_UNSIGNED | VT_LONG);
+              /* Preserve sym so &var can restore lvalue form if needed */
+              vtop->vr = -1;
+            }
+          }
+        }
+      }
+
 #ifdef TCC_TARGET_PE
       if (s->a.dllimport)
       {
@@ -7899,6 +8284,34 @@ tok_next:
         PUT_R_RET(&ret, ret.type.t);
       }
 
+      /* Storage for arguments in case we need to constant-fold */
+      SValue saved_args[8];
+      int saved_arg_count = 0;
+      int can_try_fold = 0;
+      const char *func_name = NULL;
+
+      /* Check if we have a named function that might be foldable */
+      if (call_func_sym && call_func_sym->v >= TOK_IDENT)
+      {
+        func_name = get_tok_str(call_func_sym->v, NULL);
+        /* Quick check if this could be a foldable math function */
+        if (func_name && (func_name[0] == 's' || func_name[0] == 'c' || func_name[0] == 't' || func_name[0] == 'a' ||
+                          func_name[0] == 'e' || func_name[0] == 'l' || func_name[0] == 'p' || func_name[0] == 'f' ||
+                          func_name[0] == 'r' || func_name[0] == 't'))
+        {
+          can_try_fold = 1;
+        }
+      }
+
+      /* Save IR instruction index before argument emission.
+       * If constant folding succeeds we roll back to discard orphaned
+       * FUNCPARAMVAL ops that were already emitted for the arguments. */
+      int ir_idx_before_args = tcc_ir_count(tcc_state->ir);
+      /* Tracks IR position just before the first FUNCPARAMVAL emission.
+       * Used by try_inline_builtin_call to roll back only FUNCPARAMVAL ops
+       * while preserving argument evaluation IR. */
+      int ir_idx_before_first_param = -1;
+
       p = NULL;
       if (tok != ')')
       {
@@ -7923,8 +8336,17 @@ tok_next:
             if (!NOEVAL_WANTED)
               tcc_ir_codegen_cmp_jmp_set(tcc_state->ir);
             gfunc_param_typed(s, sa);
+
+            /* Save argument for potential constant folding */
+            if (can_try_fold && saved_arg_count < 8 && !NOEVAL_WANTED)
+            {
+              saved_args[saved_arg_count++] = *vtop;
+            }
+
             if (!NOEVAL_WANTED)
             {
+              if (ir_idx_before_first_param < 0)
+                ir_idx_before_first_param = tcc_ir_count(tcc_state->ir);
               num.r = VT_CONST;
               num.c.i = TCCIR_ENCODE_PARAM(call_id, nb_args);
               TCCGEN_DEBUG(
@@ -7959,11 +8381,22 @@ tok_next:
           begin_macro(p, 1), next();
           expr_eq();
           gfunc_param_typed(s, sa);
+
+          /* Save argument for potential constant folding (in reverse order for reverse_funcargs) */
+          if (can_try_fold && n < 8 && !NOEVAL_WANTED)
+          {
+            saved_args[nb_args - 1 - n] = *vtop;
+            if (n == 0)
+              saved_arg_count = nb_args;
+          }
+
           /* We evaluate right-to-left; assign 0-based parameter indices
            * corresponding to original left-to-right argument positions.
            */
           if (!NOEVAL_WANTED)
           {
+            if (ir_idx_before_first_param < 0)
+              ir_idx_before_first_param = tcc_ir_count(tcc_state->ir);
             SValue num;
             svalue_init(&num);
             num.vr = -1;
@@ -7983,153 +8416,210 @@ tok_next:
       next();
       // gfunc_call(nb_args);
 
-      int return_vreg = -1;
-      if (NOEVAL_WANTED)
+      /* Try constant folding for math functions */
+      int folded = 0;
+      if (can_try_fold && func_name && saved_arg_count == nb_args && !NOEVAL_WANTED)
       {
-        /* When in sizeof/typeof context, skip IR emission but still handle stack */
-        --vtop;
+        folded = try_fold_math_call(func_name, saved_args, saved_arg_count);
       }
-      else if ((s->type.t & VT_BTYPE) == VT_VOID)
+
+      /* Try inlining builtin integer functions (abs, labs, llabs).
+       * Must roll back FUNCPARAMVAL ops BEFORE generating inline IR,
+       * otherwise the rollback would discard the newly generated code. */
+      int inlined = 0;
+      if (!folded && func_name && saved_arg_count == nb_args && !NOEVAL_WANTED)
       {
-        /* In IR mode, make sure the call target is a VALUE (register/temp),
-         * not an lvalue. Indirect calls like tabl1[i]() produce an lvalue
-         * (memory reference) for tabl1[i]; we must LOAD it to get the actual
-         * function pointer value before emitting FUNCCALL.
-         * NOTE: We check s->type.t (the function's return type), not vtop->type.t
-         * (which is VT_FUNC for function pointers). */
-        SValue call_id_sv = tcc_ir_svalue_call_id_argc(call_id, nb_args);
-        /* Emit FUNCPARAMVOID for 0-arg calls so backend creates a call site */
-        if (nb_args == 0)
+        int builtin_shift = -1;
+        if (saved_arg_count == 1)
         {
-          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVOID, NULL, &call_id_sv, NULL);
+          if (strcmp(func_name, "abs") == 0)
+            builtin_shift = 31;
+          else if (strcmp(func_name, "labs") == 0)
+            builtin_shift = 31;
+          else if (strcmp(func_name, "llabs") == 0)
+            builtin_shift = 63;
         }
-        /* For indirect calls (VT_LVAL set), emit a LOAD to get the function pointer value */
-        SValue call_target = *vtop;
-        if (vtop->r & VT_LVAL)
+        if (builtin_shift >= 0)
         {
-          SValue load_dest;
-          svalue_init(&load_dest);
-          load_dest.type = vtop->type;
-          load_dest.r = 0;
-          load_dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-          tcc_ir_put(tcc_state->ir, TCCIR_OP_LOAD, vtop, NULL, &load_dest);
-          call_target = load_dest;
-          call_target.r &= ~VT_LVAL; /* Clear VT_LVAL since we now have the value */
+          /* Roll back FUNCPARAMVAL ops first, preserving argument eval IR */
+          int rollback_idx = (ir_idx_before_first_param >= 0) ? ir_idx_before_first_param : ir_idx_before_args;
+          tcc_state->ir->next_instruction_index = rollback_idx;
+          /* Generate inline abs code */
+          try_inline_builtin_call(func_name, saved_args, saved_arg_count);
+          /* Move result over function pointer */
+          vtop[-1] = vtop[0];
+          --vtop;
+          inlined = 1;
         }
-        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &call_target, &call_id_sv, NULL);
+      }
+
+      if (folded)
+      {
+        /* Constant folding succeeded – skip IR emission.
+         * try_fold_math_call() pushed the folded result on top of the
+         * function pointer: stack is  [...] [func_ptr] [result].
+         * Move the result over the function pointer and pop the dup. */
+        vtop[-1] = vtop[0];
         --vtop;
+        /* Roll back the IR stream to discard the orphaned FUNCPARAMVAL
+         * ops that were emitted for the (now-folded) arguments. */
+        tcc_state->ir->next_instruction_index = ir_idx_before_args;
+      }
+      else if (inlined)
+      {
+        /* Already handled above */
       }
       else
       {
-        SValue dest;
-        svalue_init(&dest);
-        if (nb_args == 0)
+
+        int return_vreg = -1;
+        if (NOEVAL_WANTED)
         {
-          SValue call_id_sv = tcc_ir_svalue_call_id_argc(call_id, 0);
-          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVOID, NULL, &call_id_sv, NULL);
+          /* When in sizeof/typeof context, skip IR emission but still handle stack */
+          --vtop;
         }
-        /* Use the actual return type so 64-bit/float returns are modeled correctly
-         * (e.g., __aeabi_f2d returns a double in R0:R1). */
-        dest.type = ret.type;
-        dest.r = 0;
-        dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-        return_vreg = dest.vr;
-
-        /* For indirect calls (VT_LVAL set), emit a LOAD to get the function pointer value */
-        SValue call_id_sv = tcc_ir_svalue_call_id_argc(call_id, nb_args);
-        SValue call_target = *vtop;
-        if (vtop->r & VT_LVAL)
+        else if ((s->type.t & VT_BTYPE) == VT_VOID)
         {
-          SValue load_dest;
-          svalue_init(&load_dest);
-          load_dest.type = vtop->type;
-          load_dest.r = 0;
-          load_dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-          tcc_ir_put(tcc_state->ir, TCCIR_OP_LOAD, vtop, NULL, &load_dest);
-          call_target = load_dest;
-          call_target.r &= ~VT_LVAL; /* Clear VT_LVAL since we now have the value */
-        }
-        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &call_target, &call_id_sv, &dest);
-        --vtop;
-      }
-
-      if (ret_nregs < 0)
-      {
-        vsetc(&ret.type, ret.r, &ret.c);
-#ifdef TCC_TARGET_RISCV64
-        arch_transfer_ret_regs(1);
-#endif
-      }
-      else if (ret_nregs == 0)
-      {
-        /* Struct returned via sret pointer: the callee already wrote to the
-         * sret buffer. Just push the buffer location as an lvalue. */
-        vsetc(&ret.type, ret.r, &ret.c);
-        /* Do NOT set vtop->vr = return_vreg - there's no return register for sret */
-      }
-      else
-      {
-        /* return value */
-        n = ret_nregs;
-        while (n > 1)
-        {
-          int rc = reg_classes[ret.r] & ~(RC_INT | RC_FLOAT);
-          /* We assume that when a structure is returned in multiple
-             registers, their classes are consecutive values of the
-             suite s(n) = 2^n */
-          rc <<= --n;
-          for (r = 0; r < NB_REGS; ++r)
-            if (reg_classes[r] & rc)
-              break;
-          vsetc(&ret.type, r, &ret.c);
-          vtop->vr = return_vreg;
-        }
-        vsetc(&ret.type, ret.r, &ret.c);
-        vtop->vr = return_vreg;
-
-        /* handle packed struct return */
-        if (((s->type.t & VT_BTYPE) == VT_STRUCT) && ret_nregs)
-        {
-          int addr, offset;
-
-          size = type_size(&s->type, &align);
-          /* We're writing whole regs often, make sure there's enough
-             space.  Assume register size is power of 2.  */
-          size = (size + regsize - 1) & -regsize;
-          if (ret_align > align)
-            align = ret_align;
-          loc = (loc - size) & -align;
-          addr = loc;
-          offset = 0;
-          for (;;)
+          /* In IR mode, make sure the call target is a VALUE (register/temp),
+           * not an lvalue. Indirect calls like tabl1[i]() produce an lvalue
+           * (memory reference) for tabl1[i]; we must LOAD it to get the actual
+           * function pointer value before emitting FUNCCALL.
+           * NOTE: We check s->type.t (the function's return type), not vtop->type.t
+           * (which is VT_FUNC for function pointers). */
+          SValue call_id_sv = tcc_ir_svalue_call_id_argc(call_id, nb_args);
+          /* Emit FUNCPARAMVOID for 0-arg calls so backend creates a call site */
+          if (nb_args == 0)
           {
-            vset(&ret.type, VT_LOCAL | VT_LVAL, addr + offset);
-            vswap();
-            vstore();
-            vtop--;
-            print_vstack("unary, function call(2)");
-            if (--ret_nregs == 0)
-              break;
-            offset += regsize;
+            tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVOID, NULL, &call_id_sv, NULL);
           }
-          vset(&s->type, VT_LOCAL | VT_LVAL, addr);
+          /* For indirect calls (VT_LVAL set), emit a LOAD to get the function pointer value */
+          SValue call_target = *vtop;
+          if (vtop->r & VT_LVAL)
+          {
+            SValue load_dest;
+            svalue_init(&load_dest);
+            load_dest.type = vtop->type;
+            load_dest.r = 0;
+            load_dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+            tcc_ir_put(tcc_state->ir, TCCIR_OP_LOAD, vtop, NULL, &load_dest);
+            call_target = load_dest;
+            call_target.r &= ~VT_LVAL; /* Clear VT_LVAL since we now have the value */
+          }
+          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &call_target, &call_id_sv, NULL);
+          --vtop;
+        }
+        else
+        {
+          SValue dest;
+          svalue_init(&dest);
+          if (nb_args == 0)
+          {
+            SValue call_id_sv = tcc_ir_svalue_call_id_argc(call_id, 0);
+            tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVOID, NULL, &call_id_sv, NULL);
+          }
+          /* Use the actual return type so 64-bit/float returns are modeled correctly
+           * (e.g., __aeabi_f2d returns a double in R0:R1). */
+          dest.type = ret.type;
+          dest.r = 0;
+          dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+          return_vreg = dest.vr;
+
+          /* For indirect calls (VT_LVAL set), emit a LOAD to get the function pointer value */
+          SValue call_id_sv = tcc_ir_svalue_call_id_argc(call_id, nb_args);
+          SValue call_target = *vtop;
+          if (vtop->r & VT_LVAL)
+          {
+            SValue load_dest;
+            svalue_init(&load_dest);
+            load_dest.type = vtop->type;
+            load_dest.r = 0;
+            load_dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+            tcc_ir_put(tcc_state->ir, TCCIR_OP_LOAD, vtop, NULL, &load_dest);
+            call_target = load_dest;
+            call_target.r &= ~VT_LVAL; /* Clear VT_LVAL since we now have the value */
+          }
+          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &call_target, &call_id_sv, &dest);
+          --vtop;
         }
 
-        /* Promote char/short return values. This is matters only
-           for calling function that were not compiled by TCC and
-           only on some architectures.  For those where it doesn't
-           matter we expect things to be already promoted to int,
-           but not larger.  */
-        t = s->type.t & VT_BTYPE;
-        if (t == VT_BYTE || t == VT_SHORT || t == VT_BOOL)
+        if (ret_nregs < 0)
         {
-#ifdef PROMOTE_RET
-          vtop->r |= BFVAL(VT_MUSTCAST, 1);
-#else
-          vtop->type.t = VT_INT;
+          vsetc(&ret.type, ret.r, &ret.c);
+#ifdef TCC_TARGET_RISCV64
+          arch_transfer_ret_regs(1);
 #endif
         }
-      }
+        else if (ret_nregs == 0)
+        {
+          /* Struct returned via sret pointer: the callee already wrote to the
+           * sret buffer. Just push the buffer location as an lvalue. */
+          vsetc(&ret.type, ret.r, &ret.c);
+          /* Do NOT set vtop->vr = return_vreg - there's no return register for sret */
+        }
+        else
+        {
+          /* return value */
+          n = ret_nregs;
+          while (n > 1)
+          {
+            int rc = reg_classes[ret.r] & ~(RC_INT | RC_FLOAT);
+            /* We assume that when a structure is returned in multiple
+               registers, their classes are consecutive values of the
+               suite s(n) = 2^n */
+            rc <<= --n;
+            for (r = 0; r < NB_REGS; ++r)
+              if (reg_classes[r] & rc)
+                break;
+            vsetc(&ret.type, r, &ret.c);
+            vtop->vr = return_vreg;
+          }
+          vsetc(&ret.type, ret.r, &ret.c);
+          vtop->vr = return_vreg;
+
+          /* handle packed struct return */
+          if (((s->type.t & VT_BTYPE) == VT_STRUCT) && ret_nregs)
+          {
+            int addr, offset;
+
+            size = type_size(&s->type, &align);
+            /* We're writing whole regs often, make sure there's enough
+               space.  Assume register size is power of 2.  */
+            size = (size + regsize - 1) & -regsize;
+            if (ret_align > align)
+              align = ret_align;
+            loc = (loc - size) & -align;
+            addr = loc;
+            offset = 0;
+            for (;;)
+            {
+              vset(&ret.type, VT_LOCAL | VT_LVAL, addr + offset);
+              vswap();
+              vstore();
+              vtop--;
+              print_vstack("unary, function call(2)");
+              if (--ret_nregs == 0)
+                break;
+              offset += regsize;
+            }
+            vset(&s->type, VT_LOCAL | VT_LVAL, addr);
+          }
+
+          /* Promote char/short return values. This is matters only
+             for calling function that were not compiled by TCC and
+             only on some architectures.  For those where it doesn't
+             matter we expect things to be already promoted to int,
+             but not larger.  */
+          t = s->type.t & VT_BTYPE;
+          if (t == VT_BYTE || t == VT_SHORT || t == VT_BOOL)
+          {
+#ifdef PROMOTE_RET
+            vtop->r |= BFVAL(VT_MUSTCAST, 1);
+#else
+            vtop->type.t = VT_INT;
+#endif
+          }
+        }
+      } /* end of else block for non-folded function calls */
       if (s->f.func_noreturn)
       {
         if (debug_modes)
@@ -11035,9 +11525,7 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has
     cur_scope->vla.loc = addr;
     cur_scope->vla.num++;
   }
-  else if ((r & VT_VALMASK) == VT_LOCAL
-           && struct_has_vla_member(type)
-           && !NODATA_WANTED)
+  else if ((r & VT_VALMASK) == VT_LOCAL && struct_has_vla_member(type) && !NODATA_WANTED)
   {
     /* The struct contains VLA member(s).  Each VLA field in the struct
        is represented as a pointer; we must dynamically allocate the
@@ -11824,6 +12312,12 @@ static void gen_function(Sym *sym)
      */
     if (tcc_state->opt_nonneg_fold)
       changes += tcc_ir_opt_nonneg_branch_fold(ir);
+
+    /* Phase 1f: Float narrowing - replace floor((double)float_val) with
+     * floorf(float_val) for integer-valued math functions.
+     */
+    if (tcc_state->opt_float_narrow)
+      changes += tcc_ir_opt_float_narrowing(ir);
 
     /* Phase 2: Copy Propagation */
     if (tcc_state->opt_copy_prop)

@@ -5805,9 +5805,12 @@ ST_FUNC void tcc_gen_machine_return_value_op(IROperand src, TccIrOp op)
       tcc_machine_load_constant(R0, is_64bit ? R1 : PREG_NONE, addend, is_64bit, sym);
       return;
     }
-    /* For plain constants (IMM32, I64, etc.), use the immediate value directly */
+    /* For plain constants (IMM32, I64, etc.), use the immediate value directly.
+     * Must use irop_get_imm64_ex to handle pool-backed 64-bit values (IROP_TAG_I64)
+     * where src.u.pool_idx is a pool index, not the actual value. */
     Sym *sym = irop_get_sym(src);
-    tcc_machine_load_constant(R0, is_64bit ? R1 : PREG_NONE, src.u.imm32, is_64bit, sym);
+    int64_t val = irop_get_imm64_ex(tcc_state->ir, src);
+    tcc_machine_load_constant(R0, is_64bit ? R1 : PREG_NONE, val, is_64bit, sym);
     return;
   }
 

@@ -244,6 +244,7 @@ static int vt_btype_to_irop_btype(int vt_btype)
 {
   switch (vt_btype)
   {
+  case VT_BOOL:
   case VT_BYTE:
     return IROP_BTYPE_INT8;
   case VT_SHORT:
@@ -260,7 +261,7 @@ static int vt_btype_to_irop_btype(int vt_btype)
   case VT_FUNC:
     return IROP_BTYPE_FUNC;
   default:
-    /* VT_VOID, VT_INT, VT_PTR, VT_BOOL -> INT32 */
+    /* VT_VOID, VT_INT, VT_PTR -> INT32 */
     return IROP_BTYPE_INT32;
   }
 }
@@ -300,6 +301,9 @@ static inline void irop_copy_svalue_info(IROperand *op, const SValue *sv)
   op->pr1_reg = sv->pr1_reg;
   op->pr1_spilled = sv->pr1_spilled;
   op->is_unsigned = (sv->type.t & VT_UNSIGNED) ? 1 : 0;
+  /* _Bool is always unsigned (0 or 1) */
+  if ((sv->type.t & VT_BTYPE) == VT_BOOL)
+    op->is_unsigned = 1;
   op->is_static = (sv->type.t & VT_STATIC) ? 1 : 0;
   /* Don't overwrite is_sym, is_const, or is_param - those are set by irop_make_* */
 }

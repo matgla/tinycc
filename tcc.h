@@ -877,6 +877,7 @@ struct TCCState
   unsigned char opt_strength_red;    /* -fstrength-reduce: strength reduction for multiply */
   unsigned char opt_iv_strength_red; /* -fiv-strength-red: IV strength reduction for array access */
   unsigned char opt_nonneg_fold;     /* -fnonneg-fold: non-negative value branch folding */
+  unsigned char opt_float_narrow;    /* -ffloat-narrow: narrow double math to float when safe */
   unsigned char opt_jump_threading;  /* -fjump-threading: jump threading optimization */
 
   /* Function purity cache for LICM optimization */
