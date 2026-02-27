@@ -187,6 +187,9 @@ DEF(TOK_builtin_trap, "__builtin_trap")
 DEF(TOK_builtin_va_start, "__builtin_va_start")
 #elif defined TCC_TARGET_X86_64
 DEF(TOK_builtin_va_arg_types, "__builtin_va_arg_types")
+#elif defined TCC_TARGET_ARM
+DEF(TOK_builtin_va_arg, "__builtin_va_arg")
+DEF(TOK___va_arg, "__va_arg")
 #elif defined TCC_TARGET_ARM64
 DEF(TOK_builtin_va_start, "__builtin_va_start")
 DEF(TOK_builtin_va_arg, "__builtin_va_arg")

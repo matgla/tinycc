@@ -4746,6 +4746,24 @@ static void vpush_type_size(CType *type, int *a)
     type_size(&type->ref->type, a);
     vset(&int_type, VT_LOCAL | VT_LVAL, type->ref->c);
   }
+  else if (struct_has_vla_member(type))
+  {
+    /* Struct with inline VLA member(s): total size = fixed_component +
+       sum of all VLA field runtime byte sizes.  The fixed_component
+       (type->ref->c) already includes all non-VLA field sizes with
+       correct alignment padding from struct_layout(). */
+    Sym *f;
+    int fixed = type_size(type, a);
+    vpushs(fixed);
+    for (f = type->ref->next; f; f = f->next)
+    {
+      if (f->type.t & VT_VLA)
+      {
+        vset(&int_type, VT_LOCAL | VT_LVAL, f->type.ref->c);
+        gen_op('+');
+      }
+    }
+  }
   else
   {
     int size = type_size(type, a);
@@ -4908,6 +4926,8 @@ ST_FUNC void vstore(void)
   {
     /* if structure, only generate pointer */
     /* structure assignment : generate memcpy */
+    int has_vla = struct_has_vla_member(&vtop->type);
+    CType saved_struct_type = vtop->type; /* save before gaddrof destroys it */
     size = type_size(&vtop->type, &align);
     /* destination, keep on stack() as result */
     vpushv(vtop - 1);
@@ -4915,19 +4935,41 @@ ST_FUNC void vstore(void)
     if (vtop->r & VT_MUSTBOUND)
       gbound(); /* check would be wrong after gaddrof() */
 #endif
-    vtop->type.t = VT_PTR;
-    gaddrof();
+    if (has_vla && (vtop->r & VT_VALMASK) == VT_LOCAL)
+    {
+      /* VLA struct stored via pointer indirection: the stack slot
+         contains a pointer to the actual data.  We load that pointer
+         instead of computing its address.
+         Works whether VT_LVAL is already set (normal variable reference)
+         or not (e.g. from declaration context). */
+      vtop->type.t = VT_PTR;
+      vtop->r |= VT_LVAL;
+    }
+    else
+    {
+      vtop->type.t = VT_PTR;
+      gaddrof();
+    }
     /* source */
     vswap();
 #ifdef CONFIG_TCC_BCHECK
     if (vtop->r & VT_MUSTBOUND)
       gbound();
 #endif
-    vtop->type.t = VT_PTR;
-    gaddrof();
+    if (has_vla && (vtop->r & VT_VALMASK) == VT_LOCAL)
+    {
+      vtop->type.t = VT_PTR;
+      vtop->r |= VT_LVAL;
+    }
+    else
+    {
+      vtop->type.t = VT_PTR;
+      gaddrof();
+    }
 
 #ifdef TCC_TARGET_NATIVE_STRUCT_COPY
     if (1
+        && !has_vla
 #ifdef CONFIG_TCC_BCHECK
         && !tcc_state->do_bounds_check
 #endif
@@ -4939,7 +4981,10 @@ ST_FUNC void vstore(void)
 #endif
     {
       /* type size */
-      vpushi(size);
+      if (has_vla)
+        vpush_type_size(&saved_struct_type, &align);
+      else
+        vpushi(size);
       /* Use memmove, rather than memcpy, as dest and src may be same: */
 #ifdef TCC_ARM_EABI
       if (!(align & 7))
@@ -5593,6 +5638,30 @@ static void struct_layout(CType *type, AttributeDef *ad)
 
   for (f = type->ref->next; f; f = f->next)
   {
+    /* VLA fields in structs: data is stored inline, so the field has
+       zero bytes in the fixed (compile-time) size component.  Its runtime
+       size will be added by vpush_type_size at access/sizeof time. */
+    if ((f->type.t & VT_VLA) && type->ref->type.t != VT_UNION)
+    {
+      /* Get element type alignment for the VLA data */
+      int vla_align;
+      type_size(&f->type.ref->type, &vla_align);
+      if (pcc)
+        c += (bit_pos + 7) >> 3;
+      c = (c + vla_align - 1) & -vla_align;
+      offset = c;
+      /* Do NOT add size to c — VLA size is runtime-dependent */
+      bit_pos = 0;
+      prevbt = VT_STRUCT;
+      prev_bit_size = 0;
+      if (vla_align > maxalign)
+        maxalign = vla_align;
+
+      f->c = offset;
+      f->r = 0;
+      continue;
+    }
+
     if (f->type.t & VT_BITFIELD)
       bit_size = BIT_SIZE(f->type.t);
     else
@@ -6851,6 +6920,23 @@ static void gfunc_param_typed(Sym *func, Sym *arg)
     if ((vtop->type.t & VT_BTYPE) == VT_STRUCT)
     {
       int align, size = type_size(&vtop->type, &align);
+
+      /* VLA structs have runtime-determined size (type_size returns 0).
+       * Pass by invisible reference: the VLA struct's stack slot already
+       * contains a pointer to the VLA-allocated data.  Load that pointer
+       * and pass it directly as a pointer argument. */
+      if (struct_has_vla_member(&vtop->type))
+      {
+        if (nocode_wanted)
+          return;
+        /* vtop is VT_LOCAL pointing to the pointer slot.
+         * Setting VT_LVAL makes the backend load the pointer value
+         * stored in that slot, giving us the VLA data address. */
+        vtop->type.t = VT_PTR;
+        vtop->r |= VT_LVAL;
+        return;
+      }
+
       if (size > 16)
       {
         /* Pass by invisible reference: caller must allocate a temporary copy
@@ -7710,6 +7796,102 @@ tok_next:
 #endif
 #endif
 
+#ifdef TCC_TARGET_ARM
+  case TOK_builtin_va_arg:
+  {
+    /* ARM32 __builtin_va_arg intrinsic.
+     * For normal types:   *(type *)__va_arg(ap, sizeof(type), __alignof__(type))
+     * For VLA structs:    *(type *)(*(void **)__va_arg(ap, sizeof(void*), __alignof__(void*)))
+     *
+     * VLA structs are passed by invisible reference (a pointer) by the
+     * caller, so va_arg reads a 4-byte pointer and dereferences it. */
+    parse_builtin_params(0, "et");
+    type = vtop->type;
+    vpop(); /* pop type placeholder; vtop = ap */
+
+    int is_vla_struct = ((type.t & VT_BTYPE) == VT_STRUCT) && struct_has_vla_member(&type);
+    int va_size, va_align;
+
+    if (is_vla_struct)
+    {
+      /* VLA struct: read a pointer (4 bytes) from the va arg area */
+      va_size = PTR_SIZE;
+      va_align = PTR_SIZE;
+    }
+    else
+    {
+      va_size = type_size(&type, &va_align);
+    }
+
+    /* Generate call: __va_arg(ap, size, align) → void*
+     * vstack: [ap] → [ap, size, align, func] */
+    vpushi(va_size);
+    vpushi(va_align);
+    vpush_helper_func(TOK___va_arg);
+    /* vstack: ap=vtop[-3], size=vtop[-2], align=vtop[-1], func=vtop */
+    {
+      SValue param_num;
+      SValue dest;
+      const int call_id = tcc_state->ir->next_call_id++;
+      svalue_init(&param_num);
+      param_num.vr = -1;
+      param_num.r = VT_CONST;
+
+      /* param 0: ap */
+      param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-3], &param_num, NULL);
+      /* param 1: size */
+      param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 1);
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-2], &param_num, NULL);
+      /* param 2: align */
+      param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 2);
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &param_num, NULL);
+
+      /* call → result: void* */
+      svalue_init(&dest);
+      dest.type.t = VT_PTR;
+      dest.r = 0;
+      dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+      SValue call_id_sv = tcc_ir_svalue_call_id_argc(call_id, 3);
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &call_id_sv, &dest);
+
+      /* Pop func + 3 args, push result */
+      vtop -= 3; /* remove ap, size, align; vtop is now func → overwrite */
+      vtop->type.t = VT_PTR;
+      vtop->vr = dest.vr;
+      vtop->r = REG_IRET;
+      vtop->c.i = 0;
+    }
+
+    /* vtop = void* pointing into the va arg area.
+     * For VLA struct: the arg area contains a pointer to the actual data.
+     * For normal types: the arg area contains the data directly. */
+    if (is_vla_struct)
+    {
+      /* Double indirection: read the data pointer from the va arg area,
+       * then dereference it to get the VLA struct data.
+       * Equivalent to: *(type *)(*(void **)result) */
+      mk_pointer(&vtop->type); /* void* → void** */
+      indir();                  /* *(void **) → void* (data ptr), sets VT_LVAL */
+      /* Now vtop->type = void* with VT_LVAL: will load the data pointer.
+       * Change type to (type *) and dereference to get the struct. */
+      vtop->type = type;
+      mk_pointer(&vtop->type);
+      indir(); /* *(type *) → type with VT_LVAL */
+    }
+    else
+    {
+      /* Simple: *(type *)result */
+      vtop->type = type;
+      mk_pointer(&vtop->type);
+      indir();
+    }
+
+    vtop->type = type;
+    break;
+  }
+#endif
+
 #ifdef TCC_TARGET_ARM64
   case TOK_builtin_va_start:
   {
@@ -8097,8 +8279,20 @@ tok_next:
       next();
       s = find_field(&vtop->type, tok, &cumofs);
       /* add field offset to pointer */
-      gaddrof();
-      vtop->type = char_pointer_type; /* change type to 'char *' */
+      if (struct_has_vla_member(&vtop->type) && (vtop->r & VT_VALMASK) == VT_LOCAL)
+      {
+        /* VLA struct stored via pointer indirection: load the data pointer
+           from the pointer slot instead of computing its address.
+           Works whether VT_LVAL is already set (normal variable reference)
+           or not (e.g. from declaration context). */
+        vtop->type = char_pointer_type;
+        vtop->r |= VT_LVAL;
+      }
+      else
+      {
+        gaddrof();
+        vtop->type = char_pointer_type; /* change type to 'char *' */
+      }
       vpushi(cumofs);
       gen_op('+');
       /* change type to field type, and set to lvalue */
@@ -11304,8 +11498,12 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has
     if (!((r & VT_LVAL) && ((type->t & VT_BTYPE) != VT_STRUCT)))
     {
       // allocate stack for variables that are not register allocation
-      // candidates
-      loc = (loc - size) & -align;
+      // candidates.  VLA structs allocate a pointer slot instead of
+      // the full struct — the actual data is VLA_ALLOC'd later.
+      if (struct_has_vla_member(type))
+        loc = (loc - PTR_SIZE) & -PTR_SIZE;
+      else
+        loc = (loc - size) & -align;
     }
     addr = loc;
     p.local_offset = addr + size;
@@ -11527,89 +11725,81 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has
   }
   else if ((r & VT_VALMASK) == VT_LOCAL && struct_has_vla_member(type) && !NODATA_WANTED)
   {
-    /* The struct contains VLA member(s).  Each VLA field in the struct
-       is represented as a pointer; we must dynamically allocate the
-       backing storage on the stack and store the pointer into the
-       struct field so that subsequent accesses go to valid memory. */
-    Sym *f;
+    /* The struct contains VLA member(s) stored inline.  Allocate the
+       entire struct (fixed + VLA portions) dynamically via VLA_ALLOC.
+       The struct is accessed indirectly through a pointer stored at addr. */
     int a;
 
     if (tcc_state->ir)
       tcc_state->force_frame_pointer = 1;
 
-    for (f = type->ref->next; f; f = f->next)
+    /* save before-VLA stack pointer if needed */
+    if (cur_scope->vla.num == 0)
     {
-      if (!(f->type.t & VT_VLA))
-        continue;
-
-      /* save before-VLA stack pointer if needed */
-      if (cur_scope->vla.num == 0)
+      if (cur_scope->prev && cur_scope->prev->vla.num)
       {
-        if (cur_scope->prev && cur_scope->prev->vla.num)
-        {
-          cur_scope->vla.locorig = cur_scope->prev->vla.loc;
-        }
-        else
-        {
-          loc -= PTR_SIZE;
-          if (tcc_state->ir)
-          {
-            SValue dst;
-            memset(&dst, 0, sizeof(dst));
-            dst.type.t = VT_PTR;
-            dst.r = VT_LOCAL | VT_LVAL;
-            dst.c.i = loc;
-            dst.vr = -1;
-            tcc_ir_put(tcc_state->ir, TCCIR_OP_VLA_SP_SAVE, NULL, NULL, &dst);
-          }
-          else
-          {
-            gen_vla_sp_save(loc);
-          }
-          cur_scope->vla.locorig = loc;
-        }
-      }
-
-      /* Push VLA runtime size and emit VLA_ALLOC */
-      vpush_type_size(&f->type, &a);
-      if (tcc_state->ir)
-      {
-        SValue size_sv = *vtop;
-        SValue align_sv;
-        memset(&align_sv, 0, sizeof(align_sv));
-        align_sv.type.t = VT_INT;
-        align_sv.r = VT_CONST;
-        align_sv.c.i = a;
-        align_sv.vr = -1;
-        tcc_ir_put(tcc_state->ir, TCCIR_OP_VLA_ALLOC, &size_sv, &align_sv, NULL);
-        vpop();
+        cur_scope->vla.locorig = cur_scope->prev->vla.loc;
       }
       else
       {
-        gen_vla_alloc(&f->type, a);
-      }
-
-      /* Save new SP (the VLA data pointer) into the struct field */
-      {
-        int field_addr = addr + f->c;
+        loc -= PTR_SIZE;
         if (tcc_state->ir)
         {
           SValue dst;
           memset(&dst, 0, sizeof(dst));
           dst.type.t = VT_PTR;
           dst.r = VT_LOCAL | VT_LVAL;
-          dst.c.i = field_addr;
+          dst.c.i = loc;
           dst.vr = -1;
           tcc_ir_put(tcc_state->ir, TCCIR_OP_VLA_SP_SAVE, NULL, NULL, &dst);
         }
         else
         {
-          gen_vla_sp_save(field_addr);
+          gen_vla_sp_save(loc);
         }
-        cur_scope->vla.loc = field_addr;
+        cur_scope->vla.locorig = loc;
       }
-      cur_scope->vla.num++;
     }
+
+    /* Compute total runtime struct size: fixed_component + sum of VLA sizes */
+    vpush_type_size(type, &a);
+
+    if (tcc_state->ir)
+    {
+      SValue size_sv = *vtop;
+      SValue align_sv;
+      memset(&align_sv, 0, sizeof(align_sv));
+      align_sv.type.t = VT_INT;
+      align_sv.r = VT_CONST;
+      align_sv.c.i = a;
+      align_sv.vr = -1;
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_VLA_ALLOC, &size_sv, &align_sv, NULL);
+      vpop();
+    }
+    else
+    {
+      gen_vla_alloc(type, a);
+    }
+
+    /* Save the allocated address (current SP after VLA_ALLOC) to the
+       struct's addr slot, which was already reserved by loc -= PTR_SIZE
+       at declaration time (addr already points to a PTR_SIZE slot). */
+    if (tcc_state->ir)
+    {
+      SValue dst;
+      memset(&dst, 0, sizeof(dst));
+      dst.type.t = VT_PTR;
+      dst.r = VT_LOCAL | VT_LVAL;
+      dst.c.i = addr;
+      dst.vr = -1;
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_VLA_SP_SAVE, NULL, NULL, &dst);
+    }
+    else
+    {
+      gen_vla_sp_save(addr);
+    }
+    cur_scope->vla.loc = addr;
+    cur_scope->vla.num++;
   }
   else if (has_init)
   {

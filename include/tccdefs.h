@@ -278,7 +278,8 @@ void *__va_arg(__builtin_va_list ap, int size, int align);
 
 #define __builtin_va_start(ap, last)                                                                                   \
   __tcc_va_start((ap), &(last), sizeof(last), __alignof__(last), __builtin_frame_address(0))
-#define __builtin_va_arg(ap, type) (*(type *)__va_arg((ap), sizeof(type), __alignof__(type)))
+/* __builtin_va_arg is handled as a compiler intrinsic (TOK_builtin_va_arg)
+   to support VLA struct types passed by invisible reference. */
 #define __builtin_va_copy(dest, src) (*(dest) = *(src))
 
 #elif defined __aarch64__
@@ -378,6 +379,7 @@ __BUILTIN(void *, alloca, (__SIZE_TYPE__))
 __BUILTIN(void, abort, (void))
 __BUILTIN(void, exit, (int))
 __BUILTIN(int, printf, (const char *, ...))
+__BUILTIN(int, sprintf, (char *, const char *, ...))
 __BOUND(void, longjmp, ())
 #if !defined _WIN32
 __BOUND(void *, mmap, ())

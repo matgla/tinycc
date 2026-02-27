@@ -494,6 +494,8 @@ struct Sym
   };
   struct Sym *prev;     /* prev symbol in stack */
   struct Sym *prev_tok; /* previous symbol for this token */
+  int vla_size_loc;     /* for structs with VLA members: stack offset holding
+                           runtime total struct size (0 = not a VLA struct) */
 };
 
 #include "tccir.h"
