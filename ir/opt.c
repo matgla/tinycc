@@ -3262,13 +3262,8 @@ typedef struct
 } FloatNarrowEntry;
 
 static const FloatNarrowEntry float_narrow_table[] = {
-    {"floor", "floorf"},
-    {"ceil", "ceilf"},
-    {"trunc", "truncf"},
-    {"round", "roundf"},
-    {"fabs", "fabsf"},
-    {"nearbyint", "nearbyintf"},
-    {"rint", "rintf"},
+    {"floor", "floorf"}, {"ceil", "ceilf"},           {"trunc", "truncf"}, {"round", "roundf"},
+    {"fabs", "fabsf"},   {"nearbyint", "nearbyintf"}, {"rint", "rintf"},
 };
 #define NUM_FLOAT_NARROW (sizeof(float_narrow_table) / sizeof(float_narrow_table[0]))
 
@@ -3528,16 +3523,14 @@ int tcc_ir_opt_float_narrowing(TCCIRState *ir)
        * NOP out the f2d and d2f conversion calls. */
 
       /* 1. Change func's FUNCPARAMVAL to use the original float arg */
-      IROperand orig_float_param = tcc_ir_op_get_src1(ir,
-          &ir->compact_instructions[f2d_info->param_idx]);
+      IROperand orig_float_param = tcc_ir_op_get_src1(ir, &ir->compact_instructions[f2d_info->param_idx]);
       tcc_ir_set_src1(ir, func_param_idx, orig_float_param);
 
       /* 2. Change func's FUNCCALLVAL callee to float variant */
       change_callee_sym(ir, func_call_idx, float_name, VT_FLOAT);
 
       /* 3. Change func's FUNCCALLVAL dest to d2f's result vreg */
-      IROperand d2f_dest = tcc_ir_op_get_dest(ir,
-          &ir->compact_instructions[d2f_info->call_idx]);
+      IROperand d2f_dest = tcc_ir_op_get_dest(ir, &ir->compact_instructions[d2f_info->call_idx]);
       tcc_ir_set_dest(ir, func_call_idx, d2f_dest);
 
       /* 4. NOP out f2d (param + call) */
@@ -3549,8 +3542,8 @@ int tcc_ir_opt_float_narrowing(TCCIRState *ir)
       ir->compact_instructions[d2f_info->call_idx].op = TCCIR_OP_NOP;
 
 #ifdef DEBUG_IR_GEN
-      printf("FLOAT NARROW (Case 1): %s → %s at i=%d, NOP'd f2d@%d and d2f@%d\n",
-             name, float_name, func_call_idx, f2d_info->call_idx, d2f_info->call_idx);
+      printf("FLOAT NARROW (Case 1): %s → %s at i=%d, NOP'd f2d@%d and d2f@%d\n", name, float_name, func_call_idx,
+             f2d_info->call_idx, d2f_info->call_idx);
 #endif
       changes++;
     }
@@ -3568,8 +3561,7 @@ int tcc_ir_opt_float_narrowing(TCCIRState *ir)
       change_callee_sym(ir, func_call_idx, "__aeabi_f2d", VT_INT);
 
 #ifdef DEBUG_IR_GEN
-      printf("FLOAT NARROW (Case 2): swapped %s↔f2d at i=%d,%d\n",
-             name, f2d_info->call_idx, func_call_idx);
+      printf("FLOAT NARROW (Case 2): swapped %s↔f2d at i=%d,%d\n", name, f2d_info->call_idx, func_call_idx);
 #endif
       changes++;
     }
@@ -3980,6 +3972,15 @@ int tcc_ir_opt_mla_fusion(TCCIRState *ir)
      * If one operand is a symbol ref and the other is a MUL result,
      * this is likely an address calculation */
     if (irop_get_tag(add_src1) == IROP_TAG_SYMREF || irop_get_tag(add_src2) == IROP_TAG_SYMREF)
+    {
+      continue;
+    }
+
+    /* Check 3b: Accumulator should not be a stack address (STACKOFF with is_lval==0).
+     * STACKOFF + is_lval==0 means the address of a stack variable (LEA), not a loaded
+     * value.  This pattern is an address calculation (e.g. &array[i] = base + i*size)
+     * and the MLA codegen cannot handle raw stack addresses as accumulators. */
+    if (irop_get_tag(accum_op) == IROP_TAG_STACKOFF && !accum_op.is_lval)
     {
       continue;
     }

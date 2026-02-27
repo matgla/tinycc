@@ -5241,8 +5241,8 @@ void tcc_gen_machine_data_processing_op(IROperand src1, IROperand src2, IROperan
             loaded = 1;
           }
         }
-        /* Handle STACKOFF accumulator (e.g. captured variable via static chain) */
-        if (!loaded && irop_get_tag(accum) == IROP_TAG_STACKOFF && accum.is_lval)
+        /* Handle STACKOFF accumulator (address or loaded value from stack) */
+        if (!loaded && irop_get_tag(accum) == IROP_TAG_STACKOFF)
         {
           int frame_offset = irop_get_stack_offset(accum);
           int base_reg = tcc_state->need_frame_pointer ? R_FP : R_SP;
@@ -5269,7 +5269,21 @@ void tcc_gen_machine_data_processing_op(IROperand src1, IROperand src2, IROperan
           int abs_offset = sign ? -frame_offset : frame_offset;
           ScratchRegAlloc accum_scratch =
               get_scratch_reg_with_save((1u << dest_reg) | (chain_used ? (1u << chain_scratch.reg) : 0));
-          load_from_base_ir(accum_scratch.reg, PREG_REG_NONE, IROP_BTYPE_INT32, 0, abs_offset, sign, base_reg);
+          if (accum.is_lval)
+          {
+            /* is_lval: load value from stack slot */
+            load_from_base_ir(accum_scratch.reg, PREG_REG_NONE, IROP_BTYPE_INT32, 0, abs_offset, sign, base_reg);
+          }
+          else
+          {
+            /* !is_lval: compute stack address (LEA) via ADD/SUB */
+            if (sign)
+              ot_check(th_sub_imm(accum_scratch.reg, base_reg, abs_offset, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                                  ENFORCE_ENCODING_NONE));
+            else
+              ot_check(th_add_imm(accum_scratch.reg, base_reg, abs_offset, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                                  ENFORCE_ENCODING_NONE));
+          }
           ot_check(th_add_reg((uint32_t)dest_reg, (uint32_t)dest_reg, (uint32_t)accum_scratch.reg,
                               FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
           restore_scratch_reg(&accum_scratch);
