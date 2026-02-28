@@ -51,6 +51,7 @@ DEF(TOK_DOUBLE, "double")
 DEF(TOK_BOOL, "_Bool")
 DEF(TOK_COMPLEX, "_Complex")          /* DONE: Phase 1 */
 DEF(TOK_COMPLEX_GCC, "__complex__")   /* DONE: Phase 1 - GCC extension */
+DEF(TOK_COMPLEX_GCC2, "__complex")    /* GCC extension alternate form */
 DEF(TOK_SHORT, "short")
 DEF(TOK_LONG, "long")
 DEF(TOK_STRUCT, "struct")
@@ -69,7 +70,9 @@ DEF(TOK_TYPEOF2, "__typeof")
 DEF(TOK_TYPEOF3, "__typeof__")
 DEF(TOK_LABEL, "__label__")
 DEF(TOK_REAL, "__real__")      /* PARTIAL: Phase 4 - parser recognizes, full impl pending */
+DEF(TOK_REAL_GCC, "__real")    /* GCC extension alternate form */
 DEF(TOK_IMAG, "__imag__")      /* PARTIAL: Phase 4 - parser recognizes, full impl pending */
+DEF(TOK_IMAG_GCC, "__imag")    /* GCC extension alternate form */
 
 #ifdef TCC_TARGET_ARM64
 DEF(TOK_UINT128, "__uint128_t")

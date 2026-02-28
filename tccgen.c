@@ -5239,6 +5239,13 @@ ST_FUNC void vstore(void)
       /* If source is a VT_CMP (comparison result stored in flags), we need to
        * materialize it as a 0/1 value before storing. */
       tcc_ir_codegen_cmp_jmp_set(tcc_state->ir);
+      /* In IR mode, ASSIGN is vreg-to-vreg with no implicit truncation
+       * (unlike STORE which uses strb/strh).  If a delayed char/short cast
+       * is pending (VT_MUSTCAST), resolve it now — after comparison results
+       * have been materialized — so the vreg carries the correctly
+       * wrapped value (e.g. unsigned char 0x18+0xe8 → 0x00, not 0x100). */
+      if (op == TCCIR_OP_ASSIGN && (vtop->r & VT_MUSTCAST))
+        force_charshort_cast();
       tcc_ir_put(tcc_state->ir, op, vtop, NULL, &vtop[-1]);
       if (op == TCCIR_OP_ASSIGN)
       {
@@ -6310,6 +6317,7 @@ static int parse_btype(CType *type, AttributeDef *ad, int ignore_label)
       goto basic_type;
     case TOK_COMPLEX:
     case TOK_COMPLEX_GCC:
+    case TOK_COMPLEX_GCC2:
       /* DONE: Phase 1 - Mark that we saw _Complex, will combine with float/double */
       if (t & VT_COMPLEX)
         tcc_error("duplicate _Complex specifier");
@@ -7517,14 +7525,16 @@ tok_next:
     }
     break;
   case TOK_REAL:
+  case TOK_REAL_GCC:
   case TOK_IMAG:
+  case TOK_IMAG_GCC:
     /* Phase 4 - __real__ and __imag__ operators */
     t = tok;
     next();
     unary();
     if (!(vtop->type.t & VT_COMPLEX))
     {
-      if (t == TOK_REAL)
+      if (t == TOK_REAL || t == TOK_REAL_GCC)
       {
         /* __real__ on non-complex is a no-op */
       }

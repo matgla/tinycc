@@ -614,7 +614,7 @@ static void print_vreg_short(int vreg)
  * Also sets *spilled to 1 if the vreg is spilled to stack, *offset to spill location. */
 static int get_vreg_physical_reg(TCCIRState *ir, int32_t vreg, int *spilled, int *offset)
 {
-  if (vreg == -1 || !ir)
+  if (vreg < 0 || !ir)
   {
     if (spilled)
       *spilled = 0;

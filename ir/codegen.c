@@ -1506,6 +1506,11 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
       tcc_gen_machine_lea_op(dest_ir, src1_ir, cq->op);
       break;
     case TCCIR_OP_ASSIGN:
+      fprintf(
+          stderr,
+          "[DBG-ASSIGN] i=%d dest btype=%d pr0=%d pr1=%d is64=%d needs_pair=%d src btype=%d pr0=%d pr1=%d is64=%d\n", i,
+          irop_get_btype(dest_ir), dest_ir.pr0_reg, dest_ir.pr1_reg, irop_is_64bit(dest_ir), irop_needs_pair(dest_ir),
+          irop_get_btype(src1_ir), src1_ir.pr0_reg, src1_ir.pr1_reg, irop_is_64bit(src1_ir));
       tcc_gen_machine_assign_op(dest_ir, src1_ir, cq->op);
       break;
     case TCCIR_OP_RETURNVALUE:

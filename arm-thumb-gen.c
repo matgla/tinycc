@@ -5871,6 +5871,11 @@ ST_FUNC void tcc_gen_machine_store_op(IROperand dest, IROperand src, TccIrOp op)
   {
     tcc_error("compiler_error: NULL dest in tcc_gen_machine_store_op");
   }
+  fprintf(stderr,
+          "[DBG-STORE] dest btype=%d pr0=%d pr1=%d is64=%d needs_pair=%d is_lval=%d is_local=%d | src btype=%d pr0=%d "
+          "pr1=%d is64=%d needs_pair=%d\n",
+          irop_get_btype(dest), dest.pr0_reg, dest.pr1_reg, irop_is_64bit(dest), irop_needs_pair(dest), dest.is_lval,
+          dest.is_local, irop_get_btype(src), src.pr0_reg, src.pr1_reg, irop_is_64bit(src), irop_needs_pair(src));
   TRACE("'tcc_gen_machine_store_op'");
   const char *ctx = "tcc_gen_machine_store_op";
   int src_reg;
@@ -5909,9 +5914,19 @@ ST_FUNC void tcc_gen_machine_store_op(IROperand dest, IROperand src, TccIrOp op)
   {
     if (is_64bit)
     {
-      dest.pr1_reg = src.pr1_reg;
-      dest.pr1_spilled = src.pr1_spilled;
-      const uint8_t pr1_packed = (dest.pr1_spilled ? PREG_SPILLED : 0) | dest.pr1_reg;
+      /* For memory stores (is_lval/is_local), store_ex_ir uses sv.pr1_reg as
+       * the SOURCE high register, so we set it to src's high register.
+       * For register-to-register stores, store_ex_ir uses sv.pr1_reg as the
+       * DESTINATION high register (source high is assumed to be r+1).
+       * We must preserve dest's original pr1_reg in that case. */
+      const int dest_is_mem = dest.is_lval || dest.is_local;
+      if (dest_is_mem)
+      {
+        dest.pr1_reg = src.pr1_reg;
+        dest.pr1_spilled = src.pr1_spilled;
+      }
+      const uint8_t src_pr1 = src.pr1_reg;
+      const uint8_t pr1_packed = (src.pr1_spilled ? PREG_SPILLED : 0) | src_pr1;
       if (pr1_packed != PREG_NONE)
         thumb_require_materialized_reg(ctx, "src.high", pr1_packed);
     }

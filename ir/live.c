@@ -338,16 +338,22 @@ void tcc_ir_live_intervals_compute(TCCIRState *ir)
       interval->end = i;
     }
 
-    /* Process destination operand (definition) */
+    /* Process destination operand (definition or use) */
     const IROperand dest = tcc_ir_op_get_dest(ir, q);
     int32_t dest_vreg = irop_get_vreg(dest);
     if (irop_config[q->op].has_dest == 1 && tcc_ir_vreg_is_valid(ir, dest_vreg))
     {
       IRLiveInterval *interval = tcc_ir_vreg_live_interval(ir, dest_vreg);
+      /* For STORE-like instructions the dest slot holds the target
+       * address (base pointer) which is READ, not written.  Treat it
+       * as a USE so that parameters / earlier definitions keep their
+       * original start and backward-jump extension sees them alive. */
+      int dest_is_use = (q->op == TCCIR_OP_STORE ||
+                         q->op == TCCIR_OP_STORE_INDEXED ||
+                         q->op == TCCIR_OP_STORE_POSTINC);
       if (interval->start == INTERVAL_NOT_STARTED)
       {
-        /* First time seeing this vreg - it's defined here */
-        interval->start = i;
+        interval->start = dest_is_use ? 0 : i;
       }
       interval->end = i;
     }
