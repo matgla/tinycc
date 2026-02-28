@@ -4862,8 +4862,8 @@ static void make_vector_type(CType *out, const CType *elem_type, int vector_byte
   elem_size = type_size(elem_type, &elem_align);
   if (elem_size <= 0 || vector_bytes % elem_size != 0)
     tcc_error("vector_size %d is not a multiple of element size %d", vector_bytes, elem_size);
-  if (!is_integer_btype(elem_type->t & VT_BTYPE))
-    tcc_error("vector element type must be an integer type");
+  if (!is_integer_btype(elem_type->t & VT_BTYPE) && !is_float(elem_type->t))
+    tcc_error("vector element type must be an integer or floating-point type");
 
   /* Sym for the vector: type = element type, c = total bytes, r = alignment */
   s = sym_push(SYM_FIELD, (CType *)elem_type, 0, vector_bytes);

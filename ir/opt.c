@@ -2383,6 +2383,7 @@ int tcc_ir_opt_sl_forward(TCCIRState *ir)
     IROperand stored_value; /* IROperand of the stored value */
     int instruction_idx;    /* where the store happened */
     int store_dest_vr;      /* vreg of the store destination (address) */
+    int store_btype;        /* btype of the store address (access width) */
     struct StoreEntry *next;
   } StoreEntry;
 
@@ -2488,6 +2489,12 @@ int tcc_ir_opt_sl_forward(TCCIRState *ir)
         /* Both are stack locals - match on symbol and offset */
         if (e->local_sym == addr_sym && e->local_offset == addr_offset)
         {
+          /* Width check: don't forward if store and load access different widths.
+           * E.g. a 32-bit store to StackLoc[-8] must not be forwarded to a
+           * 64-bit load from StackLoc[-8] (the load reads additional bytes). */
+          if (e->store_btype != src1.btype)
+            continue;
+
           /* Safety check: if the LOAD's address vreg was written AFTER the
            * matching store, the store entry is stale. This happens when:
            * 1. STORE val → stack_slot[-88]  (records stored_value)
@@ -2603,6 +2610,7 @@ int tcc_ir_opt_sl_forward(TCCIRState *ir)
       new_entry->stored_value = tcc_ir_op_get_src1(ir, q);
       new_entry->instruction_idx = i;
       new_entry->store_dest_vr = addr_vr;
+      new_entry->store_btype = dest.btype;
       new_entry->next = hash_table[h];
       hash_table[h] = new_entry;
 
