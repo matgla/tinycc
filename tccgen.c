@@ -7892,8 +7892,21 @@ tok_next:
       if (vtop->sym->a.nested_func)
         setup_nested_func_trampoline(vtop->sym);
     }
-    mk_pointer(&vtop->type);
-    gaddrof();
+    {
+      /* Check for VLA struct local BEFORE mk_pointer changes the type.
+       * VLA struct locals store a pointer to the actual data in their
+       * stack slot.  &a must return that data pointer (by loading it),
+       * not the address of the pointer slot itself. */
+      int is_vla_struct_local = struct_has_vla_member(&vtop->type)
+                                && (vtop->r & VT_VALMASK) == VT_LOCAL;
+      mk_pointer(&vtop->type);
+      if (is_vla_struct_local) {
+        /* Leave VT_LVAL set so the pointer value stored in the
+         * stack slot is loaded when the result is materialized. */
+      } else {
+        gaddrof();
+      }
+    }
     break;
   case '!':
     next();
