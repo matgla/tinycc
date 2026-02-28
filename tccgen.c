@@ -4372,9 +4372,37 @@ again:
         if (sf)
         {
           if (dbt & VT_UNSIGNED)
-            vtop->c.i = (uint64_t)vtop->c.ld;
+          {
+            /* Saturate: match ARM VCVT unsigned semantics */
+            if (vtop->c.ld < 0)
+              vtop->c.i = 0;
+            else if (dbt_bt == VT_LLONG)
+              vtop->c.i = (vtop->c.ld > 18446744073709551615.0L) ? 0xFFFFFFFFFFFFFFFFULL : (uint64_t)vtop->c.ld;
+            else
+              vtop->c.i = (vtop->c.ld > 4294967295.0L) ? 0xFFFFFFFFU : (uint64_t)vtop->c.ld;
+          }
           else
-            vtop->c.i = (int64_t)vtop->c.ld;
+          {
+            /* Saturate: match ARM VCVT signed semantics */
+            if (dbt_bt == VT_LLONG)
+            {
+              if (vtop->c.ld > 9223372036854775807.0L)
+                vtop->c.i = 0x7FFFFFFFFFFFFFFFLL;
+              else if (vtop->c.ld < -9223372036854775808.0L)
+                vtop->c.i = 0x8000000000000000ULL;
+              else
+                vtop->c.i = (int64_t)vtop->c.ld;
+            }
+            else
+            {
+              if (vtop->c.ld > 2147483647.0L)
+                vtop->c.i = 0x7FFFFFFF;
+              else if (vtop->c.ld < -2147483648.0L)
+                vtop->c.i = (uint64_t)(int64_t)-2147483648LL;
+              else
+                vtop->c.i = (int64_t)vtop->c.ld;
+            }
+          }
         }
         else if (sbt_bt == VT_LLONG || (PTR_SIZE == 8 && sbt == VT_PTR))
           ;
