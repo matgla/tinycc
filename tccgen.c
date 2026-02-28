@@ -7468,6 +7468,8 @@ static void parse_builtin_params(int nc, const char *args)
     switch (c)
     {
     case 'e':
+      /* Apply array-to-pointer and function-to-function-pointer decay */
+      convert_parameter_type(&vtop->type);
       continue;
     case 'V':
       type.t = VT_CONSTANT;
@@ -7629,6 +7631,59 @@ static void parse_atomic(int atok)
     vswap();
     vstore();
   }
+}
+
+/* GCC __builtin_classify_type return values (C mode) */
+#define GCC_TYPE_CLASS_VOID      0
+#define GCC_TYPE_CLASS_INTEGER   1
+#define GCC_TYPE_CLASS_POINTER   5
+#define GCC_TYPE_CLASS_REAL      8
+#define GCC_TYPE_CLASS_COMPLEX   9
+#define GCC_TYPE_CLASS_FUNCTION  10
+#define GCC_TYPE_CLASS_STRUCT    12
+#define GCC_TYPE_CLASS_UNION     13
+#define GCC_TYPE_CLASS_ARRAY     14
+#define GCC_TYPE_CLASS_VECTOR    18
+
+static int gcc_classify_type(CType *type)
+{
+    int bt = type->t & VT_BTYPE;
+    int t = type->t;
+
+    switch (bt) {
+    case VT_VOID:
+        return GCC_TYPE_CLASS_VOID;
+
+    case VT_BYTE:
+    case VT_SHORT:
+    case VT_INT:
+    case VT_LLONG:
+    case VT_BOOL:
+        return GCC_TYPE_CLASS_INTEGER;
+
+    case VT_PTR:
+        if (t & VT_ARRAY)
+            return GCC_TYPE_CLASS_ARRAY;
+        return GCC_TYPE_CLASS_POINTER;
+
+    case VT_FUNC:
+        return GCC_TYPE_CLASS_FUNCTION;
+
+    case VT_STRUCT:
+        if (IS_UNION(t))
+            return GCC_TYPE_CLASS_UNION;
+        return GCC_TYPE_CLASS_STRUCT;
+
+    case VT_FLOAT:
+    case VT_DOUBLE:
+    case VT_LDOUBLE:
+        if (t & VT_COMPLEX)
+            return GCC_TYPE_CLASS_COMPLEX;
+        return GCC_TYPE_CLASS_REAL;
+
+    default:
+        return GCC_TYPE_CLASS_INTEGER; /* fallback */
+    }
 }
 
 ST_FUNC void unary(void)
@@ -8044,6 +8099,12 @@ tok_next:
     tcc_ir_put(tcc_state->ir, TCCIR_OP_TRAP, NULL, NULL, NULL);
     type.t = VT_VOID;
     vpush(&type);
+    break;
+  case TOK_builtin_classify_type:
+    parse_builtin_params(1, "e");   /* nc=1: nocode, "e": one expression */
+    n = gcc_classify_type(&vtop->type);
+    vtop--;
+    vpushi(n);
     break;
   case TOK_builtin_frame_address:
   case TOK_builtin_return_address:

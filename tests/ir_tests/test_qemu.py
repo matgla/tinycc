@@ -239,6 +239,10 @@ TEST_FILES = [
     ("../tests2/103_implicit_memmove.c", 0),
     (["../tests2/104_inline.c", "../tests2/104+_inline.c"], 0),
     ("../tests2/105_local_extern.c", 0),
+
+    # __builtin_classify_type tests
+    ("140_builtin_classify_type.c", 0),
+
     # ("../tests2/106_versym.c", 0),
     ("../tests2/108_constructor.c", 0),
     # ("../tests2/112_backtrace.c", 0),

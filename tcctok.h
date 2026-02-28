@@ -188,6 +188,7 @@ DEF(TOK_builtin_unreachable, "__builtin_unreachable")
 DEF(TOK_builtin_printf, "__builtin_printf")
 DEF(TOK_builtin_sprintf, "__builtin_sprintf")
 DEF(TOK_builtin_trap, "__builtin_trap")
+DEF(TOK_builtin_classify_type, "__builtin_classify_type")
 /*DEF(TOK_builtin_va_list, "__builtin_va_list")*/
 #if defined TCC_TARGET_PE && defined TCC_TARGET_X86_64
 DEF(TOK_builtin_va_start, "__builtin_va_start")
