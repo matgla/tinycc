@@ -84,6 +84,10 @@ int tcc_ir_opt_stack_addr_cse(struct TCCIRState *ir);
 /* Non-negative value tracking & branch folding */
 int tcc_ir_opt_nonneg_branch_fold(struct TCCIRState *ir);
 
+/* Value Range Propagation: derive range constraints from branch fall-through
+ * paths and fold comparisons whose outcome is determined by the range. */
+int tcc_ir_opt_vrp(struct TCCIRState *ir);
+
 /* Float narrowing - replace double-precision math with float when safe */
 int tcc_ir_opt_float_narrowing(struct TCCIRState *ir);
 

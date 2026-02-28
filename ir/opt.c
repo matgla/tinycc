@@ -869,17 +869,17 @@ int tcc_ir_opt_const_prop(TCCIRState *ir)
     case 0x9f: /* TOK_GT */
       result = (val1 > val2) ? 1 : 0;
       break;
-    case 0x96: /* TOK_ULT (unsigned <) */
-      result = ((uint64_t)val1 < (uint64_t)val2) ? 1 : 0;
+    case 0x92: /* TOK_ULT (unsigned <) */
+      result = ((uint64_t)(uint32_t)val1 < (uint64_t)(uint32_t)val2) ? 1 : 0;
       break;
-    case 0x97: /* TOK_UGE (unsigned >=) */
-      result = ((uint64_t)val1 >= (uint64_t)val2) ? 1 : 0;
+    case 0x93: /* TOK_UGE (unsigned >=) */
+      result = ((uint64_t)(uint32_t)val1 >= (uint64_t)(uint32_t)val2) ? 1 : 0;
       break;
-    case 0x98: /* TOK_ULE (unsigned <=) */
-      result = ((uint64_t)val1 <= (uint64_t)val2) ? 1 : 0;
+    case 0x96: /* TOK_ULE (unsigned <=) */
+      result = ((uint64_t)(uint32_t)val1 <= (uint64_t)(uint32_t)val2) ? 1 : 0;
       break;
-    case 0x99: /* TOK_UGT (unsigned >) */
-      result = ((uint64_t)val1 > (uint64_t)val2) ? 1 : 0;
+    case 0x97: /* TOK_UGT (unsigned >) */
+      result = ((uint64_t)(uint32_t)val1 > (uint64_t)(uint32_t)val2) ? 1 : 0;
       break;
     default:
       /* Unknown condition, don't fold */
@@ -1180,6 +1180,392 @@ int tcc_ir_opt_value_tracking(TCCIRState *ir)
   return changes;
 }
 
+/* ============================================================================
+ * VRP (Value Range Propagation)
+ * ============================================================================
+ *
+ * Tracks integer value ranges for PARAM and TEMP vregs through the IR.
+ * Derives range constraints from conditional branch fall-through paths,
+ * propagates constraints through arithmetic, and folds subsequent comparisons
+ * when the range fully determines the outcome.
+ *
+ * Example:
+ *   CMP P0, #0
+ *   JMP to X if "<=S"     ; fall-through: P0 > 0, i.e. P0 in [1, INT32_MAX]
+ *   T0 = P0 - #1          ; T0 in [0, INT32_MAX-1]
+ *   CMP T0, #-1           ; -1 == UINT32_MAX as unsigned
+ *   JMP to X if "<U"      ; T0 <U UINT32_MAX always true → fold to unconditional JUMP
+ *
+ * The second branch is always taken (T0 >= 0 implies T0 <U UINT32_MAX),
+ * enabling dead code elimination of the otherwise-unreachable block.
+ */
+
+/* Maximum vreg positions tracked per type */
+#define VRP_MAX_POS 256
+
+/* Range state for a single vreg slot */
+typedef struct
+{
+  int valid;
+  int64_t min_val;
+  int64_t max_val;
+} VRPRange;
+
+/* Map (vreg_type, position) to a flat slot index.
+ * PARAM positions 0..VRP_MAX_POS-1 → slots 0..VRP_MAX_POS-1
+ * TEMP  positions 0..VRP_MAX_POS-1 → slots VRP_MAX_POS..2*VRP_MAX_POS-1
+ * Returns -1 if not tracked. */
+static int vrp_get_slot(int vr_type, int pos)
+{
+  if (pos < 0 || pos >= VRP_MAX_POS)
+    return -1;
+  if (vr_type == TCCIR_VREG_TYPE_PARAM)
+    return pos;
+  if (vr_type == TCCIR_VREG_TYPE_TEMP)
+    return VRP_MAX_POS + pos;
+  return -1;
+}
+
+/* Check whether a comparison yields a constant result over [rmin, rmax].
+ * Returns 1 if always taken, 0 if never taken, -1 if undetermined.
+ * For unsigned comparisons, only safe when both endpoints have the same sign
+ * (both >= 0 or both < 0 as int64), so the uint32 ordering is monotone. */
+static int vrp_fold_cmp(int64_t rmin, int64_t rmax, int64_t cmp_val, int tok)
+{
+  int res_min = evaluate_compare_condition(rmin, cmp_val, tok);
+  int res_max = evaluate_compare_condition(rmax, cmp_val, tok);
+  if (res_min < 0 || res_max < 0 || res_min != res_max)
+    return -1;
+  return res_min;
+}
+
+int tcc_ir_opt_vrp(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  int changes = 0;
+
+  if (n < 3)
+    return 0;
+
+#ifdef CONFIG_TCC_DEBUG
+  if (tcc_state->dump_ir)
+    printf("VRP: starting on function with %d instructions\n", n);
+#endif
+
+  /* Precompute merge points (multiple predecessors or back-edge targets) */
+  uint8_t *is_merge = tcc_mallocz((n + 7) / 8);
+  int *pred_count = tcc_mallocz(n * sizeof(int));
+
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
+    {
+      IROperand dest = tcc_ir_op_get_dest(ir, q);
+      int target = (int)dest.u.imm32;
+      if (target >= 0 && target < n)
+      {
+        pred_count[target]++;
+        if (i > target) /* back-edge */
+          is_merge[target / 8] |= (1 << (target % 8));
+      }
+    }
+    if (i + 1 < n && q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_NOP &&
+        q->op != TCCIR_OP_RETURNVALUE && q->op != TCCIR_OP_RETURNVOID)
+    {
+      pred_count[i + 1]++;
+    }
+  }
+  for (int i = 0; i < n; i++)
+  {
+    if (pred_count[i] > 1)
+      is_merge[i / 8] |= (1 << (i % 8));
+  }
+  tcc_free(pred_count);
+
+  /* Range table: PARAM in slots 0..VRP_MAX_POS-1, TEMP in VRP_MAX_POS..2*VRP_MAX_POS-1 */
+  VRPRange ranges[VRP_MAX_POS * 2];
+  memset(ranges, 0, sizeof(ranges));
+
+  /* Pending fall-through constraint: applied at instruction pending_apply_at */
+  int pending_apply_at = -1;
+  int pending_slot = -1;
+  int64_t pending_min = 0;
+  int64_t pending_max = 0;
+
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+
+    /* At merge points: clear all ranges and discard pending constraint */
+    if (is_merge[i / 8] & (1 << (i % 8)))
+    {
+      memset(ranges, 0, sizeof(ranges));
+      pending_apply_at = -1;
+      pending_slot = -1;
+    }
+    else if (pending_apply_at == i && pending_slot >= 0)
+    {
+      /* Apply fall-through constraint (intersect with any existing range) */
+      VRPRange *r = &ranges[pending_slot];
+      if (r->valid)
+      {
+        pending_min = pending_min > r->min_val ? pending_min : r->min_val;
+        pending_max = pending_max < r->max_val ? pending_max : r->max_val;
+      }
+      if (pending_min <= pending_max)
+      {
+        r->valid = 1;
+        r->min_val = pending_min;
+        r->max_val = pending_max;
+#ifdef CONFIG_TCC_DEBUG
+        if (tcc_state->dump_ir)
+          printf("VRP: Apply constraint at i=%d: slot=%d range=[%lld,%lld]\n",
+                 i, pending_slot, (long long)pending_min, (long long)pending_max);
+#endif
+      }
+      pending_apply_at = -1;
+      pending_slot = -1;
+    }
+
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+
+    IROperand dest = tcc_ir_op_get_dest(ir, q);
+    IROperand src1 = tcc_ir_op_get_src1(ir, q);
+    IROperand src2 = tcc_ir_op_get_src2(ir, q);
+
+    /* Track arithmetic: T/P_dest = T/P_src1 +/- #imm → propagate range */
+    if ((q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_SUB) && irop_is_immediate(src2))
+    {
+      int32_t src1_vr = irop_get_vreg(src1);
+      int32_t dest_vr = irop_get_vreg(dest);
+      if (src1_vr >= 0 && dest_vr >= 0)
+      {
+        int src_slot = vrp_get_slot(TCCIR_DECODE_VREG_TYPE(src1_vr),
+                                    TCCIR_DECODE_VREG_POSITION(src1_vr));
+        int dst_slot = vrp_get_slot(TCCIR_DECODE_VREG_TYPE(dest_vr),
+                                    TCCIR_DECODE_VREG_POSITION(dest_vr));
+        if (src_slot >= 0 && ranges[src_slot].valid && dst_slot >= 0)
+        {
+          int64_t imm = irop_get_imm64_ex(ir, src2);
+          int64_t new_min = (q->op == TCCIR_OP_ADD) ? ranges[src_slot].min_val + imm
+                                                     : ranges[src_slot].min_val - imm;
+          int64_t new_max = (q->op == TCCIR_OP_ADD) ? ranges[src_slot].max_val + imm
+                                                     : ranges[src_slot].max_val - imm;
+          /* Clamp to int32 range to stay within 32-bit value semantics */
+          if (new_min < (int64_t)INT32_MIN)
+            new_min = INT32_MIN;
+          if (new_max > (int64_t)INT32_MAX)
+            new_max = INT32_MAX;
+          ranges[dst_slot].valid = 1;
+          ranges[dst_slot].min_val = new_min;
+          ranges[dst_slot].max_val = new_max;
+#ifdef CONFIG_TCC_DEBUG
+          if (tcc_state->dump_ir)
+            printf("VRP: ARITH at i=%d: src_slot=%d [%lld,%lld] -> dst_slot=%d [%lld,%lld]\n",
+                   i, src_slot, (long long)ranges[src_slot].min_val, (long long)ranges[src_slot].max_val,
+                   dst_slot, (long long)new_min, (long long)new_max);
+#endif
+        }
+        else if (dst_slot >= 0)
+        {
+          ranges[dst_slot].valid = 0;
+        }
+      }
+      continue;
+    }
+
+    /* CMP + JUMPIF: try to fold using range, or derive fall-through constraint */
+    if (q->op == TCCIR_OP_CMP && i + 1 < n)
+    {
+      IRQuadCompact *jump_q = &ir->compact_instructions[i + 1];
+      if (jump_q->op == TCCIR_OP_JUMPIF && irop_is_immediate(src2))
+      {
+        int32_t src1_vr = irop_get_vreg(src1);
+        if (src1_vr >= 0)
+        {
+          int src_slot = vrp_get_slot(TCCIR_DECODE_VREG_TYPE(src1_vr),
+                                      TCCIR_DECODE_VREG_POSITION(src1_vr));
+          int64_t cmp_val = irop_get_imm64_ex(ir, src2);
+          IROperand cond_op = tcc_ir_op_get_src1(ir, jump_q);
+          int tok = (int)irop_get_imm64_ex(ir, cond_op);
+          IROperand jmp_dest = tcc_ir_op_get_dest(ir, jump_q);
+
+#ifdef CONFIG_TCC_DEBUG
+          if (tcc_state->dump_ir)
+            printf("VRP: CMP at i=%d: src_slot=%d valid=%d cmp_val=%lld tok=0x%x\n",
+                   i, src_slot, (src_slot >= 0 ? ranges[src_slot].valid : -1),
+                   (long long)cmp_val, tok);
+#endif
+
+          /* Try to fold using known range */
+          if (src_slot >= 0 && ranges[src_slot].valid)
+          {
+            int64_t rmin = ranges[src_slot].min_val;
+            int64_t rmax = ranges[src_slot].max_val;
+            int fold_result = -1;
+            /* Monotone signed conditions: checking endpoints suffices */
+            int is_monotone_signed = (tok == 0x9c || tok == 0x9d || tok == 0x9e ||
+                                      tok == 0x9f);
+            /* TOK_ULT=0x92, TOK_UGE=0x93, TOK_ULE=0x96, TOK_UGT=0x97 per tcc.h */
+            int is_unsigned_cond = (tok == 0x92 || tok == 0x93 ||
+                                     tok == 0x96 || tok == 0x97);
+            /* EQ/NE are NOT monotone — special handling below */
+            int is_eq_ne = (tok == 0x94 || tok == 0x95);
+
+            if (is_monotone_signed)
+            {
+              fold_result = vrp_fold_cmp(rmin, rmax, cmp_val, tok);
+            }
+            else if (is_unsigned_cond && rmin >= 0 && rmax >= 0)
+            {
+              /* Both endpoints non-negative: uint32 ordering matches int64 ordering */
+              fold_result = vrp_fold_cmp(rmin, rmax, cmp_val, tok);
+            }
+            else if (is_unsigned_cond && rmin < 0 && rmax < 0)
+            {
+              /* Both endpoints negative as int32: uint32 ordering preserved in int64.
+               * (For two negative int32 a < b: uint32(a) = a+2^32 < uint32(b) = b+2^32,
+               * and uint64(int64(a)) = a+2^64 < uint64(int64(b)) = b+2^64 — same order.) */
+              fold_result = vrp_fold_cmp(rmin, rmax, cmp_val, tok);
+            }
+            else if (is_eq_ne)
+            {
+              /* For == and !=, endpoint checking alone is insufficient since
+               * these are not monotone. We can only fold when:
+               * (a) cmp_val is outside [rmin, rmax] → value can never/always match
+               * (b) rmin == rmax → singleton range, exact comparison */
+              if (cmp_val < rmin || cmp_val > rmax)
+              {
+                /* cmp_val outside range: == is never true, != is always true */
+                fold_result = (tok == 0x95) ? 1 : 0;
+              }
+              else if (rmin == rmax)
+              {
+                /* Singleton: cmp_val == rmin, so == is true, != is false */
+                fold_result = (tok == 0x94) ? 1 : 0;
+              }
+            }
+
+            if (fold_result == 1)
+            {
+              /* Branch always taken → unconditional JUMP */
+              q->op = TCCIR_OP_NOP;
+              jump_q->op = TCCIR_OP_JUMP;
+              tcc_ir_set_dest(ir, i + 1, jmp_dest);
+              changes++;
+#ifdef CONFIG_TCC_DEBUG
+              if (tcc_state->dump_ir)
+                printf("VRP: CMP range[%lld,%lld],#%lld tok=0x%x -> always taken, JUMP to %d\n",
+                       (long long)rmin, (long long)rmax, (long long)cmp_val, tok,
+                       (int)jmp_dest.u.imm32);
+#endif
+              continue;
+            }
+            else if (fold_result == 0)
+            {
+              /* Branch never taken → NOP both */
+              q->op = TCCIR_OP_NOP;
+              jump_q->op = TCCIR_OP_NOP;
+              changes++;
+#ifdef CONFIG_TCC_DEBUG
+              if (tcc_state->dump_ir)
+                printf("VRP: CMP range[%lld,%lld],#%lld tok=0x%x -> never taken, NOP\n",
+                       (long long)rmin, (long long)rmax, (long long)cmp_val, tok);
+#endif
+              continue;
+            }
+          }
+
+          /* Set pending fall-through constraint: NOT(cond) holds after JUMPIF not-taken */
+          if (src_slot >= 0 && i + 2 < n)
+          {
+            int64_t new_min = INT32_MIN;
+            int64_t new_max = INT32_MAX;
+            int set_constraint = 0;
+
+            /* Fall-through means cond is FALSE for (src1 vs cmp_val) */
+            switch (tok)
+            {
+            case 0x9e: /* TOK_LE (<=S): fall-through: src1 > cmp_val */
+              if (cmp_val < (int64_t)INT32_MAX)
+              {
+                new_min = cmp_val + 1;
+                new_max = INT32_MAX;
+                set_constraint = 1;
+              }
+              break;
+            case 0x9c: /* TOK_LT (<S): fall-through: src1 >= cmp_val */
+              new_min = cmp_val < (int64_t)INT32_MIN ? INT32_MIN : cmp_val;
+              new_max = INT32_MAX;
+              set_constraint = 1;
+              break;
+            case 0x9d: /* TOK_GE (>=S): fall-through: src1 < cmp_val */
+              new_min = INT32_MIN;
+              new_max = cmp_val > (int64_t)INT32_MAX ? INT32_MAX : cmp_val - 1;
+              set_constraint = (new_max >= (int64_t)INT32_MIN);
+              break;
+            case 0x9f: /* TOK_GT (>S): fall-through: src1 <= cmp_val */
+              new_min = INT32_MIN;
+              new_max = cmp_val > (int64_t)INT32_MAX ? INT32_MAX : cmp_val;
+              set_constraint = 1;
+              break;
+            case 0x95: /* TOK_NE (!=): fall-through: src1 == cmp_val */
+              new_min = cmp_val;
+              new_max = cmp_val;
+              set_constraint = (cmp_val >= INT32_MIN && cmp_val <= INT32_MAX);
+              break;
+            default:
+              break;
+            }
+
+            if (set_constraint && new_min <= new_max)
+            {
+              /* Schedule constraint application at instruction i+2 (after the JUMPIF) */
+              pending_apply_at = i + 2;
+              pending_slot = src_slot;
+              pending_min = new_min;
+              pending_max = new_max;
+            }
+          }
+        }
+      }
+      continue;
+    }
+
+    /* Any other instruction writing to a tracked slot invalidates its range */
+    int32_t dest_vr = irop_get_vreg(dest);
+    if (dest_vr >= 0 && irop_config[q->op].has_dest)
+    {
+      int dst_slot = vrp_get_slot(TCCIR_DECODE_VREG_TYPE(dest_vr),
+                                   TCCIR_DECODE_VREG_POSITION(dest_vr));
+      if (dst_slot >= 0)
+        ranges[dst_slot].valid = 0;
+    }
+
+    /* After instructions with no fall-through (JUMP, RETURN), clear all ranges
+     * and discard pending constraints. The next linear instruction (if any) is
+     * only reachable via its own predecessors, not from here. Without this,
+     * constraints from one path leak to dead code or to instructions reached
+     * from a different branch. */
+    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_RETURNVALUE ||
+        q->op == TCCIR_OP_RETURNVOID)
+    {
+      memset(ranges, 0, sizeof(ranges));
+      pending_apply_at = -1;
+      pending_slot = -1;
+    }
+  }
+
+  tcc_free(is_merge);
+
+  if (changes)
+    changes += tcc_ir_opt_dce(ir);
+
+  return changes;
+}
+
 /* TMP Constant Propagation
  * After constant folding may create TMP <- #const instructions,
  * propagate these constants to uses of the TMP within the same basic block.
@@ -1281,8 +1667,12 @@ int tcc_ir_opt_const_prop_tmp(TCCIRState *ir)
     IROperand src1 = tcc_ir_op_get_src1(ir, q);
     int32_t src1_vr = irop_get_vreg(src1);
 
-    /* Propagate TMP constants to src1 */
-    if (irop_config[q->op].has_src1 && TCCIR_DECODE_VREG_TYPE(src1_vr) == TCCIR_VREG_TYPE_TEMP)
+    /* Propagate TMP constants to src1.
+     * Skip SWITCH_TABLE and IJUMP: their src1 (the index / target address)
+     * must remain in a register — the ARM code generator cannot handle an
+     * immediate operand there. */
+    if (irop_config[q->op].has_src1 && TCCIR_DECODE_VREG_TYPE(src1_vr) == TCCIR_VREG_TYPE_TEMP &&
+        q->op != TCCIR_OP_SWITCH_TABLE && q->op != TCCIR_OP_IJUMP)
     {
       const int pos = TCCIR_DECODE_VREG_POSITION(src1_vr);
       if (pos <= max_tmp_pos && tmp_info[pos].gen == current_gen)
@@ -4759,14 +5149,14 @@ static int evaluate_compare_condition(int64_t val1, int64_t val2, int cond_token
     return val1 <= val2;
   case 0x9f: /* TOK_GT */
     return val1 > val2;
-  case 0x96: /* TOK_ULT (unsigned <) */
-    return (uint64_t)val1 < (uint64_t)val2;
-  case 0x97: /* TOK_UGE (unsigned >=) */
-    return (uint64_t)val1 >= (uint64_t)val2;
-  case 0x98: /* TOK_ULE (unsigned <=) */
-    return (uint64_t)val1 <= (uint64_t)val2;
-  case 0x99: /* TOK_UGT (unsigned >) */
-    return (uint64_t)val1 > (uint64_t)val2;
+  case 0x92: /* TOK_ULT (unsigned <) */
+    return (uint64_t)(uint32_t)val1 < (uint64_t)(uint32_t)val2;
+  case 0x93: /* TOK_UGE (unsigned >=) */
+    return (uint64_t)(uint32_t)val1 >= (uint64_t)(uint32_t)val2;
+  case 0x96: /* TOK_ULE (unsigned <=) */
+    return (uint64_t)(uint32_t)val1 <= (uint64_t)(uint32_t)val2;
+  case 0x97: /* TOK_UGT (unsigned >) */
+    return (uint64_t)(uint32_t)val1 > (uint64_t)(uint32_t)val2;
   default:
     return -1; /* Unknown condition */
   }

@@ -12911,6 +12911,14 @@ static void gen_function(Sym *sym)
     if (tcc_state->opt_nonneg_fold)
       changes += tcc_ir_opt_nonneg_branch_fold(ir);
 
+    /* Phase 1e2: Value Range Propagation - fold branches whose outcome is
+     * fully determined by value ranges derived from earlier branches.
+     * Example: after "var > 0" branch, var-1 is non-negative, so
+     * (var-1) <U UINT_MAX is always true.
+     */
+    if (tcc_state->opt_vrp)
+      changes += tcc_ir_opt_vrp(ir);
+
     /* Phase 1f: Float narrowing - replace floor((double)float_val) with
      * floorf(float_val) for integer-valued math functions.
      */
