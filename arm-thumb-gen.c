@@ -5871,12 +5871,10 @@ ST_FUNC void tcc_gen_machine_store_op(IROperand dest, IROperand src, TccIrOp op)
   {
     tcc_error("compiler_error: NULL dest in tcc_gen_machine_store_op");
   }
-  fprintf(stderr,
-          "[DBG-STORE] dest btype=%d pr0=%d pr1=%d is64=%d needs_pair=%d is_lval=%d is_local=%d | src btype=%d pr0=%d "
-          "pr1=%d is64=%d needs_pair=%d\n",
-          irop_get_btype(dest), dest.pr0_reg, dest.pr1_reg, irop_is_64bit(dest), irop_needs_pair(dest), dest.is_lval,
-          dest.is_local, irop_get_btype(src), src.pr0_reg, src.pr1_reg, irop_is_64bit(src), irop_needs_pair(src));
-  TRACE("'tcc_gen_machine_store_op'");
+  TCC_MACH_DBG("[DBG-STORE] dest btype=%d pr0=%d pr1=%d is64=%d needs_pair=%d is_lval=%d is_local=%d | src btype=%d pr0=%d "
+               "pr1=%d is64=%d needs_pair=%d\n",
+               irop_get_btype(dest), dest.pr0_reg, dest.pr1_reg, irop_is_64bit(dest), irop_needs_pair(dest), dest.is_lval,
+               dest.is_local, irop_get_btype(src), src.pr0_reg, src.pr1_reg, irop_is_64bit(src), irop_needs_pair(src));
   const char *ctx = "tcc_gen_machine_store_op";
   int src_reg;
   /* Check for 64-bit types or complex (register pairs) */

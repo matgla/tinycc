@@ -121,6 +121,22 @@ extern long double strtold(const char *__nptr, char **__endptr);
 /* #define MEM_DEBUG 1,2,3 */
 /* assembler debug */
 /* #define ASM_DEBUG */
+/* machine-level debug (store/assign operations) */
+/* #define TCC_MACHINE_DEBUG */
+
+/* Machine-level debug output macro */
+#ifndef TCC_MACHINE_DEBUG
+#define TCC_MACHINE_DEBUG 0
+#endif
+
+#if TCC_MACHINE_DEBUG
+#define TCC_MACH_DBG(...) fprintf(stderr, __VA_ARGS__)
+#else
+#define TCC_MACH_DBG(...)                                                                                              \
+  do                                                                                                                   \
+  {                                                                                                                    \
+  } while (0)
+#endif
 
 /* target selection */
 /* #define TCC_TARGET_I386   */    /* i386 code generator */

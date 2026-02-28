@@ -2791,6 +2791,11 @@ static void gv_dup(void)
     return;
   }
 #endif
+  if (t & VT_BITFIELD)
+  {
+    gv(RC_INT);
+    t = vtop->type.t;
+  }
   sv.type.t = VT_INT;
   sv.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
   sv.r = 0;
@@ -12287,18 +12292,48 @@ static void prescan_captured_vars(NestedFunc *nf, Sym *parent_local_stack, Neste
   NestedFunc *saved_current = prescan_current_nf;
   prescan_current_nf = nf;
   TokenString *tok_str = nf->func_str;
-  const int *tokens;
-  int pos;
 
   if (!tok_str)
     return;
 
-  tokens = tok_str_buf(tok_str);
-  pos = 0;
+  const int *p = tok_str_buf(tok_str);
 
-  while (tokens[pos] != TOK_EOF && tokens[pos] != 0)
+  while (*p != TOK_EOF && *p != 0)
   {
-    int t = tokens[pos];
+    int t = *p++;
+
+    /* Skip past token payload for multi-int tokens */
+    switch (t) {
+    case TOK_CINT: case TOK_CCHAR: case TOK_LCHAR: case TOK_LINENUM:
+    case TOK_CUINT: case TOK_CFLOAT:
+#if LONG_SIZE == 4
+    case TOK_CLONG: case TOK_CULONG:
+#endif
+      p++; /* 1 extra int */
+      break;
+    case TOK_CDOUBLE: case TOK_CLLONG: case TOK_CULLONG:
+#if LONG_SIZE == 8
+    case TOK_CLONG: case TOK_CULONG:
+#endif
+      p += 2; /* 2 extra ints */
+      break;
+    case TOK_CLDOUBLE:
+#if LDOUBLE_SIZE == 8 || defined TCC_USING_DOUBLE_FOR_LDOUBLE
+      p += 2;
+#elif LDOUBLE_SIZE == 12
+      p += 3;
+#elif LDOUBLE_SIZE == 16
+      p += 4;
+#endif
+      break;
+    case TOK_STR: case TOK_LSTR: case TOK_PPNUM: case TOK_PPSTR: {
+      int sz = *p++;
+      p += (sz + sizeof(int) - 1) / sizeof(int);
+      break;
+    }
+    default:
+      break;
+    }
 
     if (t >= TOK_IDENT)
     {
@@ -12373,10 +12408,6 @@ static void prescan_captured_vars(NestedFunc *nf, Sym *parent_local_stack, Neste
         }
       }
     }
-    /* Advance past token. Simple approach: just move forward by 1.
-     * A more complete implementation would handle multi-token sequences
-     * (e.g., numbers, strings), but this suffices for basic identifier matching. */
-    pos++;
   }
 
   /* Restore previous prescan current */
