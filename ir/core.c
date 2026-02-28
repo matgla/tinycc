@@ -514,6 +514,22 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
       {
         new_prev_dest = prev_dest_irop;
         irop_set_vreg(&new_prev_dest, new_dest_vr);
+        /* Temp locals and concrete stack slots (negative vregs) are not
+         * tracked by the register allocator.  Their destinations need
+         * the STACKOFF tag and frame offset from the ASSIGN's dest so
+         * that fill_registers_ir recognises them as stack-relative and
+         * materialize_dest_ir can compute the correct storeback offset.
+         * Without this the coalesced dest keeps VREG / is_local=0 and
+         * the storeback writes to frame offset 0 instead of the real
+         * stack location. */
+        if (new_dest_vr < 0 && irop_get_tag(dest_irop) == IROP_TAG_STACKOFF)
+        {
+          new_prev_dest.tag = dest_irop.tag;
+          new_prev_dest.is_local = dest_irop.is_local;
+          new_prev_dest.is_llocal = dest_irop.is_llocal;
+          new_prev_dest.is_lval = dest_irop.is_lval;
+          new_prev_dest.u = dest_irop.u;
+        }
       }
       else
       {

@@ -167,9 +167,12 @@ int irop_compare_svalue(const struct TCCIRState *ir, const struct SValue *sv, IR
 /* Position sentinel value: max 17-bit value means "no position" */
 #define IROP_POSITION_NONE 0x1FFFF
 
-/* Check if operand encodes a negative vreg (sentinel pattern) */
+/* Check if operand encodes a negative vreg (sentinel pattern).
+ * Excludes IROP_NONE (vr == -1) which also matches the sentinel bit pattern. */
 static inline int irop_is_neg_vreg(const IROperand op)
 {
+  if (op.vr == -1)
+    return 0; /* IROP_NONE, not a negative vreg */
   return op.vreg_type == 0xF && (op.position & 0x1FFF0) == IROP_NEG_VREG_SENTINEL;
 }
 
@@ -183,6 +186,9 @@ static inline int irop_has_no_vreg(const IROperand op)
 /* Extract tag from operand (using bitfield) */
 static inline int irop_get_tag(const IROperand op)
 {
+  /* IROP_NONE has vr == -1 (all bits set), return TAG_NONE for it */
+  if (op.vr == -1)
+    return IROP_TAG_NONE;
   /* For negative vregs (encoded with sentinel), tag is still valid in bitfield */
   if (op.position == IROP_POSITION_NONE && op.vreg_type == 0)
     return IROP_TAG_NONE;
@@ -192,6 +198,8 @@ static inline int irop_get_tag(const IROperand op)
 /* Extract btype from operand (using bitfield) */
 static inline int irop_get_btype(const IROperand op)
 {
+  if (op.vr == -1)
+    return IROP_BTYPE_INT32; /* IROP_NONE default */
   if (op.position == IROP_POSITION_NONE && op.vreg_type == 0)
     return IROP_BTYPE_INT32; /* default */
   return op.btype;
@@ -296,17 +304,22 @@ static inline IRPoolSymref *irop_get_symref_ex(const struct TCCIRState *ir, IROp
 /* Extract clean vreg value (type + position, for IR passes) */
 static inline int32_t irop_get_vreg(const IROperand op)
 {
-  /* Check for negative vreg sentinel: vreg_type=0xF and position bits 4-17 all set */
-  if (op.vreg_type == 0xF && (op.position & 0x3FFF0) == IROP_NEG_VREG_SENTINEL)
+  /* IROP_NONE (vr == -1, all bits set) must return -1 before the negative vreg
+   * sentinel check, because its bit pattern also matches the sentinel. */
+  if (op.vr == -1)
+    return -1;
+  /* Check for negative vreg sentinel: vreg_type=0xF and position bits match sentinel */
+  if (op.vreg_type == 0xF && (op.position & IROP_NEG_VREG_SENTINEL) == IROP_NEG_VREG_SENTINEL)
   {
-    /* Decode negative vreg: idx 0 -> -1, idx 1 -> -2, etc. */
+    /* Decode negative vreg: idx 0 -> -1, idx 1 -> -2, etc.
+     * Matches irop_set_vreg which encodes: neg_idx = (-vreg) - 1 */
     int neg_idx = op.position & 0xF;
     return -(neg_idx + 1);
   }
   /* Position == max sentinel with vreg_type 0 means no vreg (-1) */
   if (op.position == IROP_POSITION_NONE && op.vreg_type == 0)
     return -1;
-  /* Reconstruct vreg: type in bits 28-31, position in bits 0-17 */
+  /* Reconstruct vreg: type in bits 28-31, position in bits 0-16 */
   return (op.vreg_type << 28) | op.position;
 }
 

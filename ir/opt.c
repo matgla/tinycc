@@ -88,6 +88,18 @@ int tcc_ir_opt_dce(TCCIRState *ir)
   if (n == 0)
     return 0;
 
+  /* If the function contains any IJUMP (computed goto / indirect jump),
+   * skip DCE entirely.  The targets of an IJUMP are determined at runtime
+   * (typically via labels-as-values stored in arrays), so we cannot
+   * statically determine which basic blocks are reachable from them.
+   * Attempting to do DCE would incorrectly eliminate label target blocks
+   * that are only reachable through the computed goto. */
+  for (int i = 0; i < n; i++)
+  {
+    if (ir->compact_instructions[i].op == TCCIR_OP_IJUMP)
+      return 0;
+  }
+
   uint8_t *reachable = tcc_mallocz((n + 7) / 8);
   int *worklist = tcc_malloc(n * sizeof(int));
   int worklist_head = 0, worklist_tail = 0;

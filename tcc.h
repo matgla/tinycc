@@ -721,7 +721,8 @@ typedef struct AttributeDef
   Sym *cleanup_func;
   int alias_target; /* token */
   int asm_label;    /* associated asm label */
-  char attr_mode;   /* __attribute__((__mode__(...))) */
+  char attr_mode;    /* __attribute__((__mode__(...))) */
+  int vector_size;   /* __attribute__((vector_size(N))) — total bytes, 0 if not a vector */
 } AttributeDef;
 
 /* inline functions */
@@ -1221,7 +1222,8 @@ static inline SValue tcc_ir_svalue_call_id_argc(int call_id, int argc)
 #define VT_TYPEDEF 0x00004000 /* typedef definition */
 #define VT_INLINE 0x00008000  /* inline definition */
 #define VT_COMPLEX 0x00010000 /* Complex type flag (bit 16) */
-/* currently unused: 0x000[248]0000  */
+#define VT_VECTOR 0x00020000  /* GCC vector type flag (bit 17): element type in sym->type, total bytes in sym->c */
+/* currently unused: 0x000[48]0000  */
 
 #define VT_STRUCT_SHIFT 20 /* shift for bitfield shift values (32 - 2*6) */
 #define VT_STRUCT_MASK (((1U << (6 + 6)) - 1) << VT_STRUCT_SHIFT | VT_BITFIELD)

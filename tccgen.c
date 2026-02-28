@@ -330,6 +330,10 @@ static void block(int flags);
 
 static void gen_cast(CType *type);
 static void gen_cast_s(int t);
+static int is_vector_type(const CType *type);
+static void gen_op_vector(int op);
+static void gen_vec_subscript(void);
+static void gen_cast_vector(CType *type);
 static inline CType *pointed_type(CType *type);
 static int is_compatible_types(CType *type1, CType *type2);
 static int parse_btype(CType *type, AttributeDef *ad, int ignore_label);
@@ -1679,6 +1683,8 @@ static void merge_attr(AttributeDef *ad, AttributeDef *ad1)
     ad->asm_label = ad1->asm_label;
   if (ad1->attr_mode)
     ad->attr_mode = ad1->attr_mode;
+  if (ad1->vector_size)
+    ad->vector_size = ad1->vector_size;
 }
 
 /* Merge some type attributes.  */
@@ -4053,6 +4059,13 @@ redo:
   bt1 = t1 & VT_BTYPE;
   bt2 = t2 & VT_BTYPE;
 
+  /* GCC vector extension: dispatch to element-wise scalar lowering */
+  if ((t1 & VT_VECTOR) || (t2 & VT_VECTOR))
+  {
+    gen_op_vector(op);
+    return;
+  }
+
   if (bt1 == VT_FUNC || bt2 == VT_FUNC)
   {
     if (bt2 == VT_FUNC)
@@ -4293,6 +4306,63 @@ static void gen_cast_s(int t)
   gen_cast(&type);
 }
 
+/* Reinterpret-cast involving at least one GCC vector type.
+ * GCC vector casts are always bitwise reinterpretations; sizes must match.
+ * Three sub-cases:
+ *   vec  → vec    (e.g. V2USI→V2SI):   pure type relabeling, same lvalue
+ *   vec  → scalar (e.g. V2SI→long long): type relabeling, source already in mem
+ *   scalar → vec  (e.g. 0LL→V2SI):     store scalar to temp, return vec lvalue
+ */
+static void gen_cast_vector(CType *dst_type)
+{
+  int src_is_vec = is_vector_type(&vtop->type);
+  int src_align, dst_align;
+  int src_size = type_size(&vtop->type, &src_align);
+  int dst_size = type_size(dst_type, &dst_align);
+
+  if (src_size != dst_size)
+    tcc_error("cannot reinterpret-cast vector/scalar of different sizes (%d vs %d bytes)",
+              src_size, dst_size);
+
+  if (src_is_vec)
+  {
+    /* vec→vec or vec→scalar: source is already an lvalue in memory.
+     * Just relabel the type; the subsequent LOAD (if any) uses the new width. */
+    vtop->type = *dst_type;
+    return;
+  }
+
+  /* scalar→vec: must materialise the scalar value into a stack slot and
+   * hand it back as a vector lvalue.  Skip code emission during size-only
+   * passes (DIF_SIZE_ONLY) — a pure type relabel is enough there. */
+  if (nocode_wanted)
+  {
+    vtop->type = *dst_type;
+    return;
+  }
+
+  int vr_tmp;
+  int loc = get_temp_local_var(dst_size, dst_size > 8 ? 8 : dst_size, &vr_tmp);
+
+  /* Push a destination SValue typed as the *scalar* source so vstore() emits
+   * the correct-width STORE instruction. */
+  SValue dst_sv;
+  memset(&dst_sv, 0, sizeof(dst_sv));
+  dst_sv.type = vtop->type; /* scalar type — correct store width */
+  dst_sv.r    = VT_LOCAL | VT_LVAL;
+  dst_sv.vr   = vr_tmp;
+  dst_sv.c.i  = loc;
+
+  vpushv(&dst_sv); /* stack: ..., scalar, temp_dst  */
+  vswap();         /* stack: ..., temp_dst, scalar   */
+  vstore();        /* emit STORE scalar→temp; stack: ..., scalar */
+  vtop--;          /* drop scalar; stack: ...        */
+
+  /* Return the temp slot as a vector lvalue. */
+  dst_sv.type = *dst_type;
+  vpushv(&dst_sv);
+}
+
 /* cast 'vtop' to 'type'. Casting to bitfields is forbidden. */
 static void gen_cast(CType *type)
 {
@@ -4309,6 +4379,15 @@ static void gen_cast(CType *type)
 
   if (IS_ENUM(type->t) && type->ref->c < 0)
     tcc_error("cast to incomplete type");
+
+  /* GCC vector reinterpret cast: handle before the scalar btype machinery.
+   * Skip void casts — (void)vec is handled by the normal path (just pops). */
+  if ((type->t & VT_BTYPE) != VT_VOID &&
+      (is_vector_type(&vtop->type) || is_vector_type(type)))
+  {
+    gen_cast_vector(type);
+    return;
+  }
 
   dbt = type->t & (VT_BTYPE | VT_UNSIGNED);
   sbt = vtop->type.t & (VT_BTYPE | VT_UNSIGNED);
@@ -4757,6 +4836,208 @@ ST_FUNC int type_size(const CType *type, int *a)
   return 0;
 }
 
+/* -------- GCC vector extension helpers -------- */
+
+/* Returns 1 if the type has the VT_VECTOR flag (GCC vector extension). */
+static int is_vector_type(const CType *type)
+{
+  return (type->t & VT_VECTOR) != 0;
+}
+
+/* Returns number of elements in a vector type. */
+static int vector_elem_count(const CType *vec)
+{
+  int align, elem_size;
+  elem_size = type_size(&vec->ref->type, &align);
+  return vec->ref->c / elem_size;
+}
+
+/* Build a vector CType: elem_type elements packed into vector_bytes bytes.
+ * Sets *out to the resulting VT_STRUCT | VT_VECTOR type. */
+static void make_vector_type(CType *out, const CType *elem_type, int vector_bytes)
+{
+  int elem_align, elem_size;
+  Sym *s;
+
+  elem_size = type_size(elem_type, &elem_align);
+  if (elem_size <= 0 || vector_bytes % elem_size != 0)
+    tcc_error("vector_size %d is not a multiple of element size %d", vector_bytes, elem_size);
+  if (!is_integer_btype(elem_type->t & VT_BTYPE))
+    tcc_error("vector element type must be an integer type");
+
+  /* Sym for the vector: type = element type, c = total bytes, r = alignment */
+  s = sym_push(SYM_FIELD, (CType *)elem_type, 0, vector_bytes);
+  s->r = vector_bytes; /* alignment = total size (for 8/16-byte vectors) */
+  s->c = vector_bytes; /* total byte size */
+
+  out->t = VT_STRUCT | VT_VECTOR;
+  out->ref = s;
+}
+
+/* -------- end vector helpers -------- */
+
+/* Generate element-wise binary vector operation.
+ * vtop[-1] = left operand (vector or scalar broadcast),
+ * vtop[0]  = right operand (vector or scalar broadcast).
+ * At least one must have VT_VECTOR set.  Result is same vector type. */
+static void gen_op_vector(int op)
+{
+  CType vec_type, elem_type;
+  int elem_size, elem_align, elem_count, vec_size;
+  int res_vr, res_loc;
+  int i;
+  int is_cmp;
+  int scalar_left, scalar_right;
+  SValue left_sv, right_sv;
+
+  /* Determine which operand carries the vector type */
+  if (is_vector_type(&vtop[-1].type))
+    vec_type = vtop[-1].type;
+  else
+    vec_type = vtop[0].type;
+
+  scalar_left  = !is_vector_type(&vtop[-1].type);
+  scalar_right = !is_vector_type(&vtop[0].type);
+
+  elem_type  = vec_type.ref->type;
+  elem_size  = type_size(&elem_type, &elem_align);
+  elem_count = vector_elem_count(&vec_type);
+  vec_size   = vec_type.ref->c;
+
+  /* Classify op: comparison ops yield -1 (true) or 0 (false) per element */
+  is_cmp = (op == TOK_EQ || op == TOK_NE ||
+             op == TOK_LT || op == TOK_GE || op == TOK_LE || op == TOK_GT ||
+             op == TOK_ULT || op == TOK_UGE || op == TOK_ULE || op == TOK_UGT);
+
+  /* Save both operands and pop them off the value stack */
+  right_sv = vtop[0];
+  left_sv  = vtop[-1];
+  vtop -= 2;
+
+  /* Allocate a temp stack slot for the result vector */
+  res_loc = get_temp_local_var(vec_size, vec_size > 8 ? 8 : vec_size, &res_vr);
+
+  /* Emit element-wise operations (unrolled: elem_count is compile-time constant) */
+  for (i = 0; i < elem_count; i++)
+  {
+    int offset = i * elem_size;
+    SValue res_base_sv;
+
+    /* ---- Load left element [i] ---- */
+    if (scalar_left)
+    {
+      /* Scalar: broadcast — push the same scalar value every iteration */
+      vpushv(&left_sv);
+    }
+    else
+    {
+      /* Vector: pointer-arithmetic access to element [i] */
+      vpushv(&left_sv);
+      gaddrof();
+      vtop->type = char_pointer_type;
+      vpushi(offset);
+      gen_op('+');
+      vtop->type = elem_type;
+      vtop->r |= VT_LVAL;
+    }
+
+    /* ---- Load right element [i] ---- */
+    if (scalar_right)
+    {
+      vpushv(&right_sv);
+    }
+    else
+    {
+      vpushv(&right_sv);
+      gaddrof();
+      vtop->type = char_pointer_type;
+      vpushi(offset);
+      gen_op('+');
+      vtop->type = elem_type;
+      vtop->r |= VT_LVAL;
+    }
+
+    /* ---- Apply scalar operation on the two elements ---- */
+    gen_op(op);
+
+    /* ---- For comparison ops: convert VT_CMP result to -1/0 integer ---- */
+    if (is_cmp)
+    {
+      /* SETIF materialises VT_CMP as 0 (false) or 1 (true) in a vreg */
+      tcc_ir_codegen_cmp_jmp_set(tcc_state->ir);
+      /* GCC vector semantics: true → all bits set (-1), false → 0 */
+      vpushi(0);
+      vswap();
+      gen_op('-');  /* 0 - (0 or 1) = 0 or -1 */
+    }
+
+    /* ---- Store computed value into result[i] via pointer arithmetic ---- */
+    /* Build address of result element using LEA + byte-offset addition */
+    memset(&res_base_sv, 0, sizeof(res_base_sv));
+    res_base_sv.type  = vec_type;
+    res_base_sv.r     = VT_LOCAL | VT_LVAL;
+    res_base_sv.vr    = res_vr;
+    res_base_sv.c.i   = res_loc;
+
+    vpushv(&res_base_sv);    /* push result vector lvalue */
+    gaddrof();               /* LEA: result base address in a new vreg */
+    vtop->type = char_pointer_type;
+    vpushi(offset);
+    gen_op('+');             /* char* + byte-offset = element address */
+    vtop->type = elem_type;
+    vtop->r |= VT_LVAL;     /* lvalue: *element_address */
+
+    /* Stack is now: vtop[-1] = computed_value, vtop = result[i] lvalue */
+    vswap();                 /* vtop[-1] = result[i] lvalue, vtop = computed_value */
+    vstore();                /* STORE: computed_value → *result[i] */
+    vpop();                  /* discard the assigned value left on stack */
+  }
+
+  /* Push the result vector as a local lvalue */
+  {
+    SValue result;
+    memset(&result, 0, sizeof(result));
+    result.type = vec_type;
+    result.r    = VT_LOCAL | VT_LVAL;
+    result.vr   = res_vr;
+    result.c.i  = res_loc;
+    vpushv(&result);
+  }
+}
+
+/* Generate vector element subscript access: vec[index] → element lvalue.
+ * Called from the postfix '[]' handler when the base (vtop[-1]) is a
+ * GCC vector type.  vtop[-1] = vector lvalue, vtop[0] = integer index.
+ * Replaces both with a scalar lvalue of the vector's element type. */
+static void gen_vec_subscript(void)
+{
+  CType elem_type;
+  int elem_size, elem_align;
+
+  elem_type = vtop[-1].type.ref->type;
+  elem_size = type_size(&elem_type, &elem_align);
+
+  /* Scale index by element size to get a byte offset */
+  if (elem_size > 1)
+  {
+    vpushi(elem_size);
+    gen_op('*');   /* vtop[0] = index * elem_size (byte offset) */
+  }
+
+  /* Stack: vtop[-1] = vector lvalue, vtop[0] = byte_offset */
+  /* Swap so the vector is on top, then take its address */
+  vswap();
+  gaddrof();                      /* LEA: address of vector base in a vreg */
+  vtop->type = char_pointer_type; /* treat as char* for byte arithmetic */
+  vswap();                        /* restore: vtop[-1]=char*, vtop[0]=byte_offset */
+
+  gen_op('+');                    /* char* + byte_offset = element address */
+
+  /* Change pointer to element-type lvalue (dereferences the address) */
+  vtop->type = elem_type;
+  vtop->r |= VT_LVAL;
+}
+
 /* Return 1 if a struct/union type has any VLA (variable-length array)
    member field that requires dynamic stack allocation. */
 static int struct_has_vla_member(const CType *type)
@@ -4929,6 +5210,11 @@ static void verify_assign_cast(CType *dt)
     break;
   case VT_STRUCT:
   case_VT_STRUCT:
+    /* Allow reinterpret assignment/cast between GCC vector types of the
+     * same total byte size (e.g. v4si <-> v4ui, v8hi <-> v4si). */
+    if ((dt->t & VT_VECTOR) && (st->t & VT_BTYPE) == VT_STRUCT &&
+        (st->t & VT_VECTOR) && dt->ref->c == st->ref->c)
+      break;
     if (!is_compatible_unqualified_types(dt, st))
     {
     error:
@@ -5545,6 +5831,15 @@ redo:
       ad->f.func_call = FUNC_THISCALL;
       break;
 #endif
+    case TOK_VECTOR_SIZE1:
+    case TOK_VECTOR_SIZE2:
+      skip('(');
+      n = expr_const();
+      if (n < 2 || n > 64 || (n & (n - 1)) != 0)
+        tcc_error("vector_size must be a power of 2 between 2 and 64 bytes");
+      ad->vector_size = n;
+      skip(')');
+      break;
     case TOK_MODE:
       skip('(');
       switch (tok)
@@ -6536,6 +6831,19 @@ the_end:
     t = (t & ~(VT_BTYPE | VT_LONG)) | (VT_DOUBLE | VT_LONG);
 #endif
   type->t = t;
+
+  /* Apply __attribute__((vector_size(N))) if present.
+   * Wrap the just-parsed base type into a vector type.
+   * Guard against re-application when a vector typedef is looked up (in that
+   * case the type is already VT_STRUCT|VT_VECTOR and ad->vector_size would be
+   * 0 anyway since sym_to_attr doesn't copy it, but be defensive). */
+  if (ad->vector_size && !(type->t & VT_VECTOR)) {
+    int storage = t & VT_STORAGE; /* remember VT_TYPEDEF / VT_EXTERN etc. */
+    CType elem = { t & ~VT_STORAGE, type->ref };
+    make_vector_type(type, &elem, ad->vector_size);
+    type->t |= storage; /* make_vector_type overwrites type->t; restore flags */
+  }
+
   return type_found;
 }
 
@@ -8357,8 +8665,16 @@ tok_next:
     {
       next();
       gexpr();
-      gen_op('+');
-      indir();
+      if (is_vector_type(&vtop[-1].type))
+      {
+        /* GCC vector subscript: vec[i] -> element of the vector. */
+        gen_vec_subscript();
+      }
+      else
+      {
+        gen_op('+');
+        indir();
+      }
       skip(']');
     }
     else if (tok == '(')
@@ -11344,6 +11660,29 @@ static void decl_initializer(init_params *p, CType *type, unsigned long c, int f
   {
     goto one_elem;
   }
+  else if ((type->t & VT_BTYPE) == VT_STRUCT && (type->t & VT_VECTOR))
+  {
+    /* GCC vector type: initialise element-wise, reusing the VT_ARRAY path.
+     * Build a temporary fake array CType with the same element type and
+     * element count, then recurse so the brace-enclosed list is processed
+     * element by element (including designators and DIF_CLEAR handling). */
+    CType elem_type, arr_type;
+    Sym arr_sym;
+    int elem_align_dummy, elem_sz, n_elems;
+
+    elem_type = type->ref->type;
+    elem_sz   = type_size(&elem_type, &elem_align_dummy);
+    n_elems   = type->ref->c / elem_sz;
+
+    memset(&arr_sym, 0, sizeof(arr_sym));
+    arr_sym.type = elem_type;  /* element type (pointed-to for VT_PTR|VT_ARRAY) */
+    arr_sym.c    = n_elems;    /* element count */
+
+    arr_type.t   = VT_PTR | VT_ARRAY;
+    arr_type.ref = &arr_sym;
+
+    decl_initializer(p, &arr_type, c, flags, vreg);
+  }
   else if ((type->t & VT_BTYPE) == VT_STRUCT)
   {
     no_oblock = 1;
@@ -13069,6 +13408,16 @@ static int decl(int l)
       type = btype;
       ad = adbase;
       type_decl(&type, &ad, &v, TYPE_DIRECT);
+      /* Apply __attribute__((vector_size(N))) if it appeared after the declarator
+       * name (e.g. "typedef int V2SI __attribute__((vector_size(8)))").
+       * decl_spec_type handles it when the attribute precedes the name;
+       * this covers the post-declarator position. */
+      if (ad.vector_size && !(type.t & VT_VECTOR)) {
+        int storage = type.t & VT_STORAGE;
+        CType elem = { type.t & ~VT_STORAGE, type.ref };
+        make_vector_type(&type, &elem, ad.vector_size);
+        type.t |= storage;
+      }
 #if 0
             {
                 char buf[500];

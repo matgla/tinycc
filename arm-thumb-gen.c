@@ -1843,7 +1843,19 @@ ST_FUNC void tcc_gen_machine_indirect_jump_op(IROperand src1)
    * and we need to load the actual target address before jumping. */
   if (src1.pr0_reg == PREG_REG_NONE)
   {
-    tcc_error("internal error: IJUMP target not in a register");
+    /* Source has no physical register (e.g. a global symbol reference such as
+     * 'goto *(table[i])' where the array is a static variable).
+     * Materialize the target address into a scratch register via load_to_dest_ir,
+     * which handles SYMREF+LVAL, STACKOFF+LVAL, and other non-register operands. */
+    ScratchRegAlloc mat_scratch = get_scratch_reg_with_save(0);
+    IROperand dest = irop_make_none();
+    dest.pr0_reg = mat_scratch.reg;
+    dest.pr0_spilled = 0;
+    load_to_dest_ir(dest, src1);
+    ot_check(th_bx_reg((uint16_t)mat_scratch.reg));
+    if (mat_scratch.saved)
+      ot_check(th_pop(1u << mat_scratch.reg));
+    return;
   }
 
   int target_reg = src1.pr0_reg;
@@ -4035,6 +4047,9 @@ static void thumb_emit_logical64_op(IROperand src1, IROperand src2, IROperand de
   const bool src1_is64 = irop_is_64bit(src1);
   const bool src2_is64 = irop_is_64bit(src2);
 
+  thumb_prepare_dest_pair_for_64bit_op_ir(ctx, &dest, &rd_low, &rd_high, &rd_low_alloc, &rd_high_alloc, &store_low,
+                                          &store_high, &dest_exclude);
+
   int src1_lo = src1.pr0_reg;
   int src1_hi = src1.pr1_reg;
   int src2_lo = src2.pr0_reg;
@@ -4043,7 +4058,7 @@ static void thumb_emit_logical64_op(IROperand src1, IROperand src2, IROperand de
   ScratchRegAlloc src1_hi_alloc = {0};
   ScratchRegAlloc src2_lo_alloc = {0};
   ScratchRegAlloc src2_hi_alloc = {0};
-  uint32_t src_exclude = 0;
+  uint32_t src_exclude = dest_exclude;
 
   thumb_materialize_src1_for_64op(ctx, src1, src1_is64, rd_low, rd_high, &src1_lo, &src1_hi, &src1_lo_alloc,
                                   &src1_hi_alloc, &src_exclude);

@@ -156,6 +156,9 @@ DEF(TOK_ALWAYS_INLINE1, "always_inline")
 DEF(TOK_ALWAYS_INLINE2, "__always_inline__")
 DEF(TOK_NAKED1, "naked")
 
+DEF(TOK_VECTOR_SIZE1, "vector_size")
+DEF(TOK_VECTOR_SIZE2, "__vector_size__")
+
 DEF(TOK_MODE, "__mode__")
 DEF(TOK_MODE_QI, "__QI__")
 DEF(TOK_MODE_DI, "__DI__")

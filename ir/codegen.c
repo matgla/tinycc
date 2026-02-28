@@ -199,11 +199,13 @@ void tcc_ir_fill_registers_ir(TCCIRState *ir, IROperand *op)
 
   /* VT_LOCAL/VT_LLOCAL operands can mean either:
    * - a concrete stack slot (vr == -1), e.g. VLA save slots, or
-   * - a logical local tracked as a vreg by the IR (vr != -1).
+   * - a temp local for type-punning casts (vr <= -2, VR_TEMP_LOCAL), or
+   * - a logical local tracked as a vreg by the IR (vr > 0).
    *
-   * For concrete stack slots, do not rewrite them into registers here; doing
-   * so can create uninitialized register reads at runtime. */
-  if ((old_is_local || old_is_llocal) && vreg == -1)
+   * For concrete stack slots and temp locals, do not rewrite them into
+   * registers here; doing so can create uninitialized register reads
+   * at runtime. */
+  if ((old_is_local || old_is_llocal) && vreg < 0)
   {
     op->pr0_reg = PREG_REG_NONE;
     op->pr0_spilled = 0;
