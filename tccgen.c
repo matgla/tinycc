@@ -1139,6 +1139,31 @@ ST_FUNC void label_pop(Sym **ptop, Sym *slast, int keep)
     {
       if (s->c)
       {
+        /* In IR mode, label_pop for local labels runs at scope exit BEFORE
+           codegen, so orig_ir_to_code_mapping is NULL.  Defer resolution of
+           addr-taken labels by moving them to global_label_stack, which is
+           popped AFTER codegen when the mapping is available. */
+        if (addr_taken && tcc_state->ir && !tcc_state->ir->orig_ir_to_code_mapping && ptop != &global_label_stack)
+        {
+          /* Unlink from table_ident now (function scope is ending) */
+          if (s->r != LABEL_GONE)
+            table_ident[s->v - TOK_IDENT]->sym_label = s->prev_tok;
+          s->r = LABEL_GONE;
+          /* Create ELF symbol NOW with placeholder value (0) so that
+             relocations emitted during codegen reference a valid symbol.
+             Use put_extern_sym2 directly to bypass nocode_wanted check.
+             After codegen the global label_pop will UPDATE this symbol
+             with the correct code offset via orig_ir_to_code_mapping. */
+          if (s->c == -3)
+            s->c = 0; /* Reset marker so put_extern_sym2 creates new symbol */
+          put_extern_sym2(s, cur_text_section->sh_num, 0, 1, 1);
+          /* Push onto global_label_stack for deferred value update.
+             s->c is now a valid ELF symbol index (> 0). */
+          s->prev = global_label_stack;
+          global_label_stack = s;
+          continue;
+        }
+
         /* Define corresponding symbol for &&label.
            In IR mode, the label position is recorded as an IR instruction index
            (s->jind) BEFORE DCE/IR compaction, so we must translate it using the
@@ -4321,8 +4346,7 @@ static void gen_cast_vector(CType *dst_type)
   int dst_size = type_size(dst_type, &dst_align);
 
   if (src_size != dst_size)
-    tcc_error("cannot reinterpret-cast vector/scalar of different sizes (%d vs %d bytes)",
-              src_size, dst_size);
+    tcc_error("cannot reinterpret-cast vector/scalar of different sizes (%d vs %d bytes)", src_size, dst_size);
 
   if (src_is_vec)
   {
@@ -4349,9 +4373,9 @@ static void gen_cast_vector(CType *dst_type)
   SValue dst_sv;
   memset(&dst_sv, 0, sizeof(dst_sv));
   dst_sv.type = vtop->type; /* scalar type — correct store width */
-  dst_sv.r    = VT_LOCAL | VT_LVAL;
-  dst_sv.vr   = vr_tmp;
-  dst_sv.c.i  = loc;
+  dst_sv.r = VT_LOCAL | VT_LVAL;
+  dst_sv.vr = vr_tmp;
+  dst_sv.c.i = loc;
 
   vpushv(&dst_sv); /* stack: ..., scalar, temp_dst  */
   vswap();         /* stack: ..., temp_dst, scalar   */
@@ -4382,8 +4406,7 @@ static void gen_cast(CType *type)
 
   /* GCC vector reinterpret cast: handle before the scalar btype machinery.
    * Skip void casts — (void)vec is handled by the normal path (just pops). */
-  if ((type->t & VT_BTYPE) != VT_VOID &&
-      (is_vector_type(&vtop->type) || is_vector_type(type)))
+  if ((type->t & VT_BTYPE) != VT_VOID && (is_vector_type(&vtop->type) || is_vector_type(type)))
   {
     gen_cast_vector(type);
     return;
@@ -4896,22 +4919,21 @@ static void gen_op_vector(int op)
   else
     vec_type = vtop[0].type;
 
-  scalar_left  = !is_vector_type(&vtop[-1].type);
+  scalar_left = !is_vector_type(&vtop[-1].type);
   scalar_right = !is_vector_type(&vtop[0].type);
 
-  elem_type  = vec_type.ref->type;
-  elem_size  = type_size(&elem_type, &elem_align);
+  elem_type = vec_type.ref->type;
+  elem_size = type_size(&elem_type, &elem_align);
   elem_count = vector_elem_count(&vec_type);
-  vec_size   = vec_type.ref->c;
+  vec_size = vec_type.ref->c;
 
   /* Classify op: comparison ops yield -1 (true) or 0 (false) per element */
-  is_cmp = (op == TOK_EQ || op == TOK_NE ||
-             op == TOK_LT || op == TOK_GE || op == TOK_LE || op == TOK_GT ||
-             op == TOK_ULT || op == TOK_UGE || op == TOK_ULE || op == TOK_UGT);
+  is_cmp = (op == TOK_EQ || op == TOK_NE || op == TOK_LT || op == TOK_GE || op == TOK_LE || op == TOK_GT ||
+            op == TOK_ULT || op == TOK_UGE || op == TOK_ULE || op == TOK_UGT);
 
   /* Save both operands and pop them off the value stack */
   right_sv = vtop[0];
-  left_sv  = vtop[-1];
+  left_sv = vtop[-1];
   vtop -= 2;
 
   /* Allocate a temp stack slot for the result vector */
@@ -4968,29 +4990,29 @@ static void gen_op_vector(int op)
       /* GCC vector semantics: true → all bits set (-1), false → 0 */
       vpushi(0);
       vswap();
-      gen_op('-');  /* 0 - (0 or 1) = 0 or -1 */
+      gen_op('-'); /* 0 - (0 or 1) = 0 or -1 */
     }
 
     /* ---- Store computed value into result[i] via pointer arithmetic ---- */
     /* Build address of result element using LEA + byte-offset addition */
     memset(&res_base_sv, 0, sizeof(res_base_sv));
-    res_base_sv.type  = vec_type;
-    res_base_sv.r     = VT_LOCAL | VT_LVAL;
-    res_base_sv.vr    = res_vr;
-    res_base_sv.c.i   = res_loc;
+    res_base_sv.type = vec_type;
+    res_base_sv.r = VT_LOCAL | VT_LVAL;
+    res_base_sv.vr = res_vr;
+    res_base_sv.c.i = res_loc;
 
-    vpushv(&res_base_sv);    /* push result vector lvalue */
-    gaddrof();               /* LEA: result base address in a new vreg */
+    vpushv(&res_base_sv); /* push result vector lvalue */
+    gaddrof();            /* LEA: result base address in a new vreg */
     vtop->type = char_pointer_type;
     vpushi(offset);
-    gen_op('+');             /* char* + byte-offset = element address */
+    gen_op('+'); /* char* + byte-offset = element address */
     vtop->type = elem_type;
-    vtop->r |= VT_LVAL;     /* lvalue: *element_address */
+    vtop->r |= VT_LVAL; /* lvalue: *element_address */
 
     /* Stack is now: vtop[-1] = computed_value, vtop = result[i] lvalue */
-    vswap();                 /* vtop[-1] = result[i] lvalue, vtop = computed_value */
-    vstore();                /* STORE: computed_value → *result[i] */
-    vpop();                  /* discard the assigned value left on stack */
+    vswap();  /* vtop[-1] = result[i] lvalue, vtop = computed_value */
+    vstore(); /* STORE: computed_value → *result[i] */
+    vpop();   /* discard the assigned value left on stack */
   }
 
   /* Push the result vector as a local lvalue */
@@ -4998,9 +5020,9 @@ static void gen_op_vector(int op)
     SValue result;
     memset(&result, 0, sizeof(result));
     result.type = vec_type;
-    result.r    = VT_LOCAL | VT_LVAL;
-    result.vr   = res_vr;
-    result.c.i  = res_loc;
+    result.r = VT_LOCAL | VT_LVAL;
+    result.vr = res_vr;
+    result.c.i = res_loc;
     vpushv(&result);
   }
 }
@@ -5021,7 +5043,7 @@ static void gen_vec_subscript(void)
   if (elem_size > 1)
   {
     vpushi(elem_size);
-    gen_op('*');   /* vtop[0] = index * elem_size (byte offset) */
+    gen_op('*'); /* vtop[0] = index * elem_size (byte offset) */
   }
 
   /* Stack: vtop[-1] = vector lvalue, vtop[0] = byte_offset */
@@ -5031,7 +5053,7 @@ static void gen_vec_subscript(void)
   vtop->type = char_pointer_type; /* treat as char* for byte arithmetic */
   vswap();                        /* restore: vtop[-1]=char*, vtop[0]=byte_offset */
 
-  gen_op('+');                    /* char* + byte_offset = element address */
+  gen_op('+'); /* char* + byte_offset = element address */
 
   /* Change pointer to element-type lvalue (dereferences the address) */
   vtop->type = elem_type;
@@ -5212,8 +5234,7 @@ static void verify_assign_cast(CType *dt)
   case_VT_STRUCT:
     /* Allow reinterpret assignment/cast between GCC vector types of the
      * same total byte size (e.g. v4si <-> v4ui, v8hi <-> v4si). */
-    if ((dt->t & VT_VECTOR) && (st->t & VT_BTYPE) == VT_STRUCT &&
-        (st->t & VT_VECTOR) && dt->ref->c == st->ref->c)
+    if ((dt->t & VT_VECTOR) && (st->t & VT_BTYPE) == VT_STRUCT && (st->t & VT_VECTOR) && dt->ref->c == st->ref->c)
       break;
     if (!is_compatible_unqualified_types(dt, st))
     {
@@ -5287,8 +5308,7 @@ ST_FUNC void vstore(void)
     }
 
 #ifdef TCC_TARGET_NATIVE_STRUCT_COPY
-    if (1
-        && !has_vla
+    if (1 && !has_vla
 #ifdef CONFIG_TCC_BCHECK
         && !tcc_state->do_bounds_check
 #endif
@@ -6837,9 +6857,10 @@ the_end:
    * Guard against re-application when a vector typedef is looked up (in that
    * case the type is already VT_STRUCT|VT_VECTOR and ad->vector_size would be
    * 0 anyway since sym_to_attr doesn't copy it, but be defensive). */
-  if (ad->vector_size && !(type->t & VT_VECTOR)) {
+  if (ad->vector_size && !(type->t & VT_VECTOR))
+  {
     int storage = t & VT_STORAGE; /* remember VT_TYPEDEF / VT_EXTERN etc. */
-    CType elem = { t & ~VT_STORAGE, type->ref };
+    CType elem = {t & ~VT_STORAGE, type->ref};
     make_vector_type(type, &elem, ad->vector_size);
     type->t |= storage; /* make_vector_type overwrites type->t; restore flags */
   }
@@ -7634,56 +7655,57 @@ static void parse_atomic(int atok)
 }
 
 /* GCC __builtin_classify_type return values (C mode) */
-#define GCC_TYPE_CLASS_VOID      0
-#define GCC_TYPE_CLASS_INTEGER   1
-#define GCC_TYPE_CLASS_POINTER   5
-#define GCC_TYPE_CLASS_REAL      8
-#define GCC_TYPE_CLASS_COMPLEX   9
-#define GCC_TYPE_CLASS_FUNCTION  10
-#define GCC_TYPE_CLASS_STRUCT    12
-#define GCC_TYPE_CLASS_UNION     13
-#define GCC_TYPE_CLASS_ARRAY     14
-#define GCC_TYPE_CLASS_VECTOR    18
+#define GCC_TYPE_CLASS_VOID 0
+#define GCC_TYPE_CLASS_INTEGER 1
+#define GCC_TYPE_CLASS_POINTER 5
+#define GCC_TYPE_CLASS_REAL 8
+#define GCC_TYPE_CLASS_COMPLEX 9
+#define GCC_TYPE_CLASS_FUNCTION 10
+#define GCC_TYPE_CLASS_STRUCT 12
+#define GCC_TYPE_CLASS_UNION 13
+#define GCC_TYPE_CLASS_ARRAY 14
+#define GCC_TYPE_CLASS_VECTOR 18
 
 static int gcc_classify_type(CType *type)
 {
-    int bt = type->t & VT_BTYPE;
-    int t = type->t;
+  int bt = type->t & VT_BTYPE;
+  int t = type->t;
 
-    switch (bt) {
-    case VT_VOID:
-        return GCC_TYPE_CLASS_VOID;
+  switch (bt)
+  {
+  case VT_VOID:
+    return GCC_TYPE_CLASS_VOID;
 
-    case VT_BYTE:
-    case VT_SHORT:
-    case VT_INT:
-    case VT_LLONG:
-    case VT_BOOL:
-        return GCC_TYPE_CLASS_INTEGER;
+  case VT_BYTE:
+  case VT_SHORT:
+  case VT_INT:
+  case VT_LLONG:
+  case VT_BOOL:
+    return GCC_TYPE_CLASS_INTEGER;
 
-    case VT_PTR:
-        if (t & VT_ARRAY)
-            return GCC_TYPE_CLASS_ARRAY;
-        return GCC_TYPE_CLASS_POINTER;
+  case VT_PTR:
+    if (t & VT_ARRAY)
+      return GCC_TYPE_CLASS_ARRAY;
+    return GCC_TYPE_CLASS_POINTER;
 
-    case VT_FUNC:
-        return GCC_TYPE_CLASS_FUNCTION;
+  case VT_FUNC:
+    return GCC_TYPE_CLASS_FUNCTION;
 
-    case VT_STRUCT:
-        if (IS_UNION(t))
-            return GCC_TYPE_CLASS_UNION;
-        return GCC_TYPE_CLASS_STRUCT;
+  case VT_STRUCT:
+    if (IS_UNION(t))
+      return GCC_TYPE_CLASS_UNION;
+    return GCC_TYPE_CLASS_STRUCT;
 
-    case VT_FLOAT:
-    case VT_DOUBLE:
-    case VT_LDOUBLE:
-        if (t & VT_COMPLEX)
-            return GCC_TYPE_CLASS_COMPLEX;
-        return GCC_TYPE_CLASS_REAL;
+  case VT_FLOAT:
+  case VT_DOUBLE:
+  case VT_LDOUBLE:
+    if (t & VT_COMPLEX)
+      return GCC_TYPE_CLASS_COMPLEX;
+    return GCC_TYPE_CLASS_REAL;
 
-    default:
-        return GCC_TYPE_CLASS_INTEGER; /* fallback */
-    }
+  default:
+    return GCC_TYPE_CLASS_INTEGER; /* fallback */
+  }
 }
 
 ST_FUNC void unary(void)
@@ -7778,10 +7800,25 @@ tok_next:
     memset(&ad, 0, sizeof(AttributeDef));
     ad.section = rodata_section;
     {
-      /* String literals must always emit data, even in nocode_wanted paths.
-       * The IR backend defers code generation, so string data must exist
-       * when code is later emitted. Force DATA_ONLY_WANTED to ensure
-       * allocation proceeds regardless of nocode_wanted state. */
+      /* Force DATA_ONLY_WANTED so the IR backend (which defers code generation)
+       * can still allocate the string in rodata now, before the actual code
+       * referring to it is emitted.
+       *
+       * In a dead code path (NODATA_WANTED is already set), redirect the string
+       * data to a separate ".rodata.dead" section instead of the main rodata.
+       * This keeps the symbol properly defined (no linker "undefined symbol"
+       * error) while preventing dead-block string data from appearing between
+       * nodata measurement markers (ds1/de1).  The ".rodata.dead" section has
+       * no live references (all IR instructions using these strings are DCE'd)
+       * so the linker's --gc-sections will remove it entirely.
+       */
+      if (NODATA_WANTED)
+      {
+        Section *dead_sec = find_section(tcc_state, ".rodata.dead");
+        if (!dead_sec)
+          dead_sec = new_section(tcc_state, ".rodata.dead", SHT_PROGBITS, SHF_ALLOC);
+        ad.section = dead_sec;
+      }
       int saved_nocode = nocode_wanted;
       nocode_wanted |= DATA_ONLY_WANTED;
       decl_initializer_alloc(&type, &ad, VT_CONST, 2, 0, 0);
@@ -7897,13 +7934,15 @@ tok_next:
        * VLA struct locals store a pointer to the actual data in their
        * stack slot.  &a must return that data pointer (by loading it),
        * not the address of the pointer slot itself. */
-      int is_vla_struct_local = struct_has_vla_member(&vtop->type)
-                                && (vtop->r & VT_VALMASK) == VT_LOCAL;
+      int is_vla_struct_local = struct_has_vla_member(&vtop->type) && (vtop->r & VT_VALMASK) == VT_LOCAL;
       mk_pointer(&vtop->type);
-      if (is_vla_struct_local) {
+      if (is_vla_struct_local)
+      {
         /* Leave VT_LVAL set so the pointer value stored in the
          * stack slot is loaded when the result is materialized. */
-      } else {
+      }
+      else
+      {
         gaddrof();
       }
     }
@@ -8114,7 +8153,7 @@ tok_next:
     vpush(&type);
     break;
   case TOK_builtin_classify_type:
-    parse_builtin_params(1, "e");   /* nc=1: nocode, "e": one expression */
+    parse_builtin_params(1, "e"); /* nc=1: nocode, "e": one expression */
     n = gcc_classify_type(&vtop->type);
     vtop--;
     vpushi(n);
@@ -8297,7 +8336,7 @@ tok_next:
        * then dereference it to get the VLA struct data.
        * Equivalent to: *(type *)(*(void **)result) */
       mk_pointer(&vtop->type); /* void* → void** */
-      indir();                  /* *(void **) → void* (data ptr), sets VT_LVAL */
+      indir();                 /* *(void **) → void* (data ptr), sets VT_LVAL */
       /* Now vtop->type = void* with VT_LVAL: will load the data pointer.
        * Change type to (type *) and dereference to get the struct. */
       vtop->type = type;
@@ -11745,14 +11784,14 @@ static void decl_initializer(init_params *p, CType *type, unsigned long c, int f
     int elem_align_dummy, elem_sz, n_elems;
 
     elem_type = type->ref->type;
-    elem_sz   = type_size(&elem_type, &elem_align_dummy);
-    n_elems   = type->ref->c / elem_sz;
+    elem_sz = type_size(&elem_type, &elem_align_dummy);
+    n_elems = type->ref->c / elem_sz;
 
     memset(&arr_sym, 0, sizeof(arr_sym));
-    arr_sym.type = elem_type;  /* element type (pointed-to for VT_PTR|VT_ARRAY) */
-    arr_sym.c    = n_elems;    /* element count */
+    arr_sym.type = elem_type; /* element type (pointed-to for VT_PTR|VT_ARRAY) */
+    arr_sym.c = n_elems;      /* element count */
 
-    arr_type.t   = VT_PTR | VT_ARRAY;
+    arr_type.t = VT_PTR | VT_ARRAY;
     arr_type.ref = &arr_sym;
 
     decl_initializer(p, &arr_type, c, flags, vreg);
@@ -12573,10 +12612,10 @@ static void compile_nested_functions(Sym *parent_sym)
   memcpy(saved.tmp_vars, arr_temp_local_vars, sizeof(arr_temp_local_vars));
 
   /* Compile each nested function.
-   * Use a static index that persists across recursive calls.
-   * This ensures each function is compiled exactly once even when
-   * gen_function calls compile_nested_functions recursively. */
-  static int compile_idx = 0;
+   * Reset compile_idx each time; the 'compiled' flag on each NestedFunc
+   * prevents re-compilation when gen_function calls compile_nested_functions
+   * recursively (for multi-level nesting). */
+  int compile_idx = 0;
   while (compile_idx < tcc_state->nb_nested_funcs)
   {
     NestedFunc *nf = &tcc_state->nested_funcs[compile_idx];
@@ -12716,17 +12755,26 @@ static void prescan_captured_vars(NestedFunc *nf, Sym *parent_local_stack, Neste
     int t = *p++;
 
     /* Skip past token payload for multi-int tokens */
-    switch (t) {
-    case TOK_CINT: case TOK_CCHAR: case TOK_LCHAR: case TOK_LINENUM:
-    case TOK_CUINT: case TOK_CFLOAT:
+    switch (t)
+    {
+    case TOK_CINT:
+    case TOK_CCHAR:
+    case TOK_LCHAR:
+    case TOK_LINENUM:
+    case TOK_CUINT:
+    case TOK_CFLOAT:
 #if LONG_SIZE == 4
-    case TOK_CLONG: case TOK_CULONG:
+    case TOK_CLONG:
+    case TOK_CULONG:
 #endif
       p++; /* 1 extra int */
       break;
-    case TOK_CDOUBLE: case TOK_CLLONG: case TOK_CULLONG:
+    case TOK_CDOUBLE:
+    case TOK_CLLONG:
+    case TOK_CULLONG:
 #if LONG_SIZE == 8
-    case TOK_CLONG: case TOK_CULONG:
+    case TOK_CLONG:
+    case TOK_CULONG:
 #endif
       p += 2; /* 2 extra ints */
       break;
@@ -12739,7 +12787,11 @@ static void prescan_captured_vars(NestedFunc *nf, Sym *parent_local_stack, Neste
       p += 4;
 #endif
       break;
-    case TOK_STR: case TOK_LSTR: case TOK_PPNUM: case TOK_PPSTR: {
+    case TOK_STR:
+    case TOK_LSTR:
+    case TOK_PPNUM:
+    case TOK_PPSTR:
+    {
       int sz = *p++;
       p += (sz + sizeof(int) - 1) / sizeof(int);
       break;
@@ -13494,9 +13546,10 @@ static int decl(int l)
        * name (e.g. "typedef int V2SI __attribute__((vector_size(8)))").
        * decl_spec_type handles it when the attribute precedes the name;
        * this covers the post-declarator position. */
-      if (ad.vector_size && !(type.t & VT_VECTOR)) {
+      if (ad.vector_size && !(type.t & VT_VECTOR))
+      {
         int storage = type.t & VT_STORAGE;
-        CType elem = { type.t & ~VT_STORAGE, type.ref };
+        CType elem = {type.t & ~VT_STORAGE, type.ref};
         make_vector_type(&type, &elem, ad.vector_size);
         type.t |= storage;
       }
@@ -13608,21 +13661,29 @@ static int decl(int l)
           /* Store filename for later */
           pstrncpy(nf->filename, file->filename, sizeof(nf->filename));
 
-          /* Push symbol into LOCAL scope so parent body can reference it */
-          /* Use external_sym to get proper type with valid parameter symbols */
+          /* Push symbol into global scope, bypassing external_sym to avoid
+           * redefinition errors when multiple parent functions each define
+           * a nested function with the same name (e.g. "nested" in foo and bar). */
           type.t &= ~VT_EXTERN;
-          nf->sym = external_sym(v, &type, 0, &ad);
+          type.t |= VT_STATIC; /* nested functions are always local */
+          nf->sym = global_identifier_push(v, type.t, 0);
+          nf->sym->r = VT_CONST | VT_SYM;
+          nf->sym->a = ad.a;
+          nf->sym->type.ref = type.ref;
+          if (local_stack)
+            sym_copy_ref(nf->sym, &global_stack);
           /* Mark as nested function for static chain handling.
-           * Note: This flag MUST be set on the symbol returned by external_sym
-           * because that's the symbol that sym_find will return when looking
-           * up the function name in the parent body. */
+           * Note: This flag MUST be set on the symbol so that sym_find
+           * will identify it as a nested function when looking up the
+           * function name in the parent body. */
           nf->sym->a.nested_func = 1;
-          /* Make nested function STB_LOCAL (not global) */
-          nf->sym->type.t |= VT_STATIC;
-          /* Name mangling: use GCC convention "funcname.N" */
+          /* Name mangling: use "parent.nested.N" to ensure global uniqueness.
+           * Use a persistent counter so names don't collide across parent functions
+           * (nb_nested_funcs resets per parent, but this counter does not). */
           {
+            static int nested_func_uid = 0;
             char mangled[256];
-            snprintf(mangled, sizeof(mangled), "%s.%d", get_tok_str(v, NULL), tcc_state->nb_nested_funcs);
+            snprintf(mangled, sizeof(mangled), "%s.%d", get_tok_str(v, NULL), nested_func_uid++);
             nf->sym->asm_label = tok_alloc(mangled, strlen(mangled))->tok;
           }
 

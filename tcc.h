@@ -514,6 +514,7 @@ struct Sym
                            runtime total struct size (0 = not a VLA struct) */
 };
 
+#include "ir/machine_op.h"
 #include "tccir.h"
 
 /* Relocation patch for lazy sections - stores a single relocation modification
@@ -721,8 +722,8 @@ typedef struct AttributeDef
   Sym *cleanup_func;
   int alias_target; /* token */
   int asm_label;    /* associated asm label */
-  char attr_mode;    /* __attribute__((__mode__(...))) */
-  int vector_size;   /* __attribute__((vector_size(N))) — total bytes, 0 if not a vector */
+  char attr_mode;   /* __attribute__((__mode__(...))) */
+  int vector_size;  /* __attribute__((vector_size(N))) — total bytes, 0 if not a vector */
 } AttributeDef;
 
 /* inline functions */
@@ -2111,6 +2112,23 @@ ST_FUNC void tcc_machine_load_cmp_result(int dest_reg, int condition_code);
 ST_FUNC void tcc_machine_load_jmp_result(int dest_reg, int jmp_addr, int invert);
 
 ST_FUNC void tcc_gen_machine_data_processing_op(IROperand src1, IROperand src2, IROperand dest, TccIrOp op);
+ST_FUNC void tcc_gen_machine_data_processing_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest,
+                                                 TccIrOp op);
+ST_FUNC void tcc_gen_machine_assign_mop(MachineOperand src, MachineOperand dest, TccIrOp op);
+ST_FUNC void tcc_gen_machine_setif_mop(MachineOperand src, MachineOperand dest, TccIrOp op);
+ST_FUNC void tcc_gen_machine_bool_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest, TccIrOp op);
+ST_FUNC void tcc_gen_machine_load_mop(MachineOperand src, MachineOperand dest, TccIrOp op);
+ST_FUNC void tcc_gen_machine_store_mop(MachineOperand dest, MachineOperand src, TccIrOp op);
+ST_FUNC void tcc_gen_machine_load_indexed_mop(MachineOperand dest, MachineOperand base, MachineOperand index,
+                                              MachineOperand scale, TccIrOp op);
+ST_FUNC void tcc_gen_machine_store_indexed_mop(MachineOperand base, MachineOperand index, MachineOperand scale,
+                                               MachineOperand value, TccIrOp op);
+ST_FUNC void tcc_gen_machine_load_postinc_mop(MachineOperand dest, MachineOperand ptr, MachineOperand offset,
+                                              TccIrOp op);
+ST_FUNC void tcc_gen_machine_store_postinc_mop(MachineOperand ptr, MachineOperand value, MachineOperand offset,
+                                               TccIrOp op);
+ST_FUNC void tcc_gen_machine_indirect_jump_mop(MachineOperand src, TccIrOp op);
+ST_FUNC void tcc_gen_machine_func_parameter_mop(MachineOperand src1, MachineOperand src2_enc, TccIrOp op);
 ST_FUNC void tcc_gen_machine_fp_op(IROperand dest, IROperand src1, IROperand src2, TccIrOp op);
 ST_FUNC void tcc_gen_machine_load_op(IROperand dest, IROperand src);
 ST_FUNC void tcc_gen_machine_store_op(IROperand dest, IROperand src, TccIrOp op);
@@ -2155,6 +2173,13 @@ ST_FUNC int tcc_gen_machine_dry_run_get_lr_push_count(void);
 ST_FUNC uint32_t tcc_gen_machine_dry_run_get_scratch_regs_pushed(void);
 ST_FUNC void tcc_gen_machine_reset_scratch_state(void);
 ST_FUNC int tcc_gen_machine_dry_run_is_active(void);
+/* Phase-3 per-instruction scratch constraint recording.
+ * Call reset before each mop-dispatched instruction (in both dry-run and
+ * real-emit passes); call count after to read how many scratch registers the
+ * instruction allocated.  In debug builds the two passes should agree. */
+ST_FUNC void tcc_gen_machine_insn_scratch_reset(void);
+ST_FUNC int tcc_gen_machine_insn_scratch_count(void);
+ST_FUNC uint16_t tcc_gen_machine_insn_scratch_saves_mask(void);
 ST_FUNC void tcc_gen_machine_func_parameter_op(IROperand src1, IROperand src2, TccIrOp op);
 
 /* Branch optimization interface */

@@ -222,7 +222,7 @@ typedef struct IRLiveInterval
   IRVregReplacement allocation;
   int8_t incoming_reg0;    // for params: which register arg arrives in (-1 if stack)
   int8_t incoming_reg1;    // for doubles: second register (-1 if not double or stack)
-  int16_t original_offset; // for params: original offset from function entry point
+  int32_t original_offset; // for params: original offset from function entry point
   int stack_slot_index;    // index into stack layout (-1 if not stack-backed)
 } IRLiveInterval;
 
@@ -264,8 +264,6 @@ typedef struct TCCStackSlot
   int offset;    // frame-pointer relative offset (bytes)
   int size;      // slot size in bytes
   int alignment; // required alignment in bytes (power of two)
-  uint8_t live_across_calls;
-  uint8_t addressable; // non-zero if slot must remain addressable (addr taken)
 } TCCStackSlot;
 
 typedef struct TCCStackLayout
@@ -308,39 +306,6 @@ typedef struct TCCMachineScratchRegs
 #define TCC_MACHINE_SCRATCH_AVOID_CALL_ARG_REGS (1u << 3)
 /* Exclude "permanent scratch" regs (e.g. R11/R12 on ARM) from scratch allocation. */
 #define TCC_MACHINE_SCRATCH_AVOID_PERM_SCRATCH (1u << 4)
-
-typedef struct TCCMaterializedValue
-{
-  uint8_t used_scratch;
-  uint8_t is_64bit;
-  uint8_t original_pr0;
-  uint8_t original_pr1;
-  unsigned short original_r;
-  uint64_t original_c_i;
-  TCCMachineScratchRegs scratch;
-} TCCMaterializedValue;
-
-typedef struct TCCMaterializedAddr
-{
-  uint8_t used_scratch;
-  uint8_t original_pr0;
-  uint8_t original_pr1;
-  unsigned short original_r;
-  uint64_t original_c_i;
-  TCCMachineScratchRegs scratch;
-} TCCMaterializedAddr;
-
-typedef struct TCCMaterializedDest
-{
-  uint8_t needs_storeback;
-  uint8_t is_64bit;
-  uint8_t is_param; /* storeback target is a stack-passed parameter (needs offset_to_args adjustment) */
-  uint8_t original_pr0;
-  uint8_t original_pr1;
-  unsigned short original_r;
-  int frame_offset;
-  TCCMachineScratchRegs scratch;
-} TCCMaterializedDest;
 
 /* Compact IR instruction - stores operand indices instead of full SValues */
 typedef struct IRQuadCompact
@@ -528,11 +493,6 @@ void tcc_ir_avoid_spilling_stack_passed_params(TCCIRState *ir);
 void tcc_ir_build_stack_layout(TCCIRState *ir);
 const TCCStackSlot *tcc_ir_stack_slot_by_vreg(const TCCIRState *ir, int vreg);
 const TCCStackSlot *tcc_ir_stack_slot_by_offset(const TCCIRState *ir, int frame_offset);
-void tcc_ir_materialize_value(TCCIRState *ir, SValue *sv, TCCMaterializedValue *result);
-void tcc_ir_materialize_const_to_reg(TCCIRState *ir, SValue *sv, TCCMaterializedValue *result);
-void tcc_ir_materialize_addr(TCCIRState *ir, SValue *sv, TCCMaterializedAddr *result, int dest_reg);
-void tcc_ir_materialize_dest(TCCIRState *ir, SValue *dest, TCCMaterializedDest *result);
-
 void tcc_ir_assign_physical_register(TCCIRState *ir, int vreg, int offset, int r0, int r1);
 const char *tcc_ir_get_op_name(TccIrOp op);
 void tcc_ir_show(TCCIRState *ir);
@@ -551,15 +511,10 @@ void tcc_print_quadruple_irop(TCCIRState *ir, IRQuadCompact *q, int pc);
 
 /* Machine-independent spill helpers (defined in tccir.c) */
 int tcc_ir_is_spilled(SValue *sv);
-int tcc_ir_is_spilled_ir(const IROperand *op);
 int tcc_ir_is_64bit(int t);
 
-/* IROperand-based materialization functions (defined in tccir.c) */
+/* IROperand-based register fill (defined in ir/codegen.c) */
 void tcc_ir_fill_registers_ir(TCCIRState *ir, IROperand *op);
-void tcc_ir_materialize_value_ir(TCCIRState *ir, IROperand *op, TCCMaterializedValue *result);
-void tcc_ir_materialize_const_to_reg_ir(TCCIRState *ir, IROperand *op, TCCMaterializedValue *result);
-void tcc_ir_materialize_addr_ir(TCCIRState *ir, IROperand *op, TCCMaterializedAddr *result, int dest_reg);
-void tcc_ir_materialize_dest_ir(TCCIRState *ir, IROperand *op, TCCMaterializedDest *result);
 
 /* Machine-dependent spill handling (defined in machine-specific code, e.g., arm-thumb-gen.c) */
 

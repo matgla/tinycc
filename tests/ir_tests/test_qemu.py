@@ -728,19 +728,6 @@ def test_qemu_tagged_execution(test_file, tag, expected_lines, expected_exit_cod
     if test_file is None:
         pytest.fail("test_file is None")
 
-    # The IR backend must allocate string/data for dead code blocks because IR
-    # instructions (even in if(0) paths) are emitted to support labels reachable
-    # by goto.  The data referenced by those IR instructions must exist at link
-    # time.  This makes data suppression inside if(0) architecturally impossible
-    # without major refactoring (lazy/deferred data allocation).
-    # Additionally, at -O0 code suppression does not work because DCE and
-    # fall-through elimination are only enabled at -O1+.
-    # This test was never passing before: the original code could not compile
-    # &&label (label-as-value) expressions, so the test runner silently
-    # returned success on compilation failure.
-    if tag == "test_data_suppression_on":
-        pytest.xfail("IR backend cannot suppress data in dead code blocks (pre-existing limitation)")
-
     _run_tagged_qemu_test(test_file, tag, expected_lines, expected_exit_code, opt_level=opt_level, output_dir=tmp_path)
 
 

@@ -235,7 +235,7 @@ LIB-$(TR) ?= {B}:/usr/$(TRIPLET-$T)/lib:/usr/lib/$(MARCH-$T)
 INC-$(TR) ?= {B}/include:/usr/$(TRIPLET-$T)/include:/usr/include
 endif
 
-IR_FILES = ir/type.c ir/pool.c ir/vreg.c ir/stack.c ir/live.c ir/mat.c ir/dump.c ir/codegen.c ir/opt.c ir/opt_jump_thread.c ir/licm.c ir/core.c
+IR_FILES = ir/type.c ir/pool.c ir/vreg.c ir/stack.c ir/live.c ir/dump.c ir/codegen.c ir/opt.c ir/opt_jump_thread.c ir/licm.c ir/core.c ir/machine_op.c
 CORE_FILES = tccir_operand.c tccls.c tcc.c tcctools.c libtcc.c tccpp.c tccgen.c tccdbg.c tccelf.c tccasm.c tccyaff.c tccld.c tccdebug.c svalue.c tccmachine.c tccopt.c $(IR_FILES)
 CORE_FILES += tcc.h config.h libtcc.h tcctok.h tccir.h tccir_operand.h tccld.h tccmachine.h tccopt.h
 CORE_FILES += $(wildcard ir/*.h)

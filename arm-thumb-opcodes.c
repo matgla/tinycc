@@ -720,11 +720,14 @@ thumb_opcode th_sub_reg(uint32_t rd, uint32_t rn, uint32_t rm, thumb_flags_behav
     };
   }
 #ifndef TCC_TARGET_ARM_ARCHV6M
-  else if (rd != R_SP && rd != R_PC && rn != R_SP && rn != R_PC)
+  else if (rd != R_SP && rd != R_PC && rn != R_PC)
   {
     const uint32_t imm3 = (shift.value >> 2) & 0x7;
     const uint32_t imm2 = shift.value & 0x3;
     const uint32_t s = (flags == FLAGS_BEHAVIOUR_SET) ? 1 : 0;
+    /* rn == R_SP uses opcode 0xeba0 (SUB.W Rd, SP, Rm), otherwise 0xeba0 with
+     * the full rn field. Both emit the same 32-bit T2 encoding - the opcode
+     * base already encodes SP when rn=13. */
     THOP_TRACE("sub%s %s, %s, %s", s ? "s" : "", th_reg_name(rd), th_reg_name(rn), th_reg_name(rm));
     th_trace_shift_suffix(shift);
     THOP_TRACE("\n");

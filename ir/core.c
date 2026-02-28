@@ -709,7 +709,7 @@ void tcc_ir_params_process_single(TCCIRState *ir, Sym *sym, int arg_index, TCCAb
   }
 
   TCCAbiArgLoc loc_info = tcc_abi_classify_argument(call_layout, arg_index, &desc);
-  tcc_ir_params_update_tracking(ir, loc_info);
+  tcc_ir_params_update_tracking(ir, loc_info, call_layout);
 
   if (loc_info.kind == TCC_ABI_LOC_STACK || loc_info.kind == TCC_ABI_LOC_REG_STACK)
     tcc_state->need_frame_pointer = 1;
@@ -724,7 +724,7 @@ void tcc_ir_params_process_single(TCCIRState *ir, Sym *sym, int arg_index, TCCAb
   }
 }
 
-void tcc_ir_params_update_tracking(TCCIRState *ir, TCCAbiArgLoc loc_info)
+void tcc_ir_params_update_tracking(TCCIRState *ir, TCCAbiArgLoc loc_info, TCCAbiCallLayout *layout)
 {
   if (!ir)
     return;
@@ -749,6 +749,18 @@ void tcc_ir_params_update_tracking(TCCIRState *ir, TCCAbiArgLoc loc_info)
     int end = loc_info.stack_off + loc_info.size;
     if (end > ir->named_arg_stack_bytes)
       ir->named_arg_stack_bytes = end;
+  }
+
+  /* Also account for registers consumed (or skipped) by alignment.
+   * When e.g. a long long causes r3 to be skipped (AAPCS 8-byte alignment),
+   * the argument goes to stack but next_reg advances to 4.  Without this,
+   * named_arg_reg_bytes would be too low and va_start would incorrectly
+   * try to read the skipped register slot as a variadic argument. */
+  if (layout)
+  {
+    int consumed = layout->next_reg * 4;
+    if (consumed > ir->named_arg_reg_bytes)
+      ir->named_arg_reg_bytes = consumed;
   }
 }
 

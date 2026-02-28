@@ -203,6 +203,9 @@ static uint32_t scratch_global_exclude = 0;
 static int scratch_push_stack[128];
 static int scratch_push_count = 0;
 
+/* Debug tracking: current IR opcode being processed (set by codegen.c) */
+int g_debug_current_op = -1;
+
 int is_valid_opcode(thumb_opcode op);
 int ot(thumb_opcode op);
 int ot_check(thumb_opcode op);
@@ -217,8 +220,9 @@ int th_patch_call(int t, int a);
 /* Structure to track scratch register allocation with potential save/restore */
 typedef struct ScratchRegAlloc
 {
-  int reg : 31;       /* The allocated scratch register */
-  uint32_t saved : 1; /* Whether the register was saved to stack */
+  int reg : 30;            /* The allocated scratch register (range 0-15 for ARM) */
+  uint32_t saved : 1;      /* Whether the register was pushed to stack (real emit only) */
+  uint32_t would_save : 1; /* Whether a push was needed (set in both dry-run and real emit) */
 } ScratchRegAlloc;
 
 /* Forward declarations needed by multi-scratch helpers. */
@@ -266,6 +270,252 @@ typedef struct ScratchRegAllocs
   int count;           /* Number of registers allocated */
   uint32_t saved_mask; /* Bitmask of registers that were saved (pushed) */
 } ScratchRegAllocs;
+
+/* ============================================================
+ * MachineCodegenContext — per-instruction scratch-register tracker
+ * ============================================================
+ * Used by the MachineOperand-based (_mop) code-generation path.
+ * Callers allocate scratches via mach_alloc_scratch(), then call
+ * mach_release_all() at the end of the instruction to pop them in LIFO order.
+ */
+
+/* Forward declarations needed by the mach_* helpers (defined later in this file). */
+typedef thumb_opcode (*thumb_imm_handler_t)(uint32_t rd, uint32_t rn, uint32_t imm,
+                                            thumb_flags_behaviour flags_behaviour,
+                                            thumb_enforce_encoding enforce_encoding);
+int store_word_to_base(int ir, int base, int fc, int sign);
+
+#define MACH_CTX_MAX_SCRATCH 12
+
+typedef struct MachineCodegenContext
+{
+  ScratchRegAlloc scratches[MACH_CTX_MAX_SCRATCH];
+  int n_scratch;
+} MachineCodegenContext;
+
+/* Phase-3 per-instruction scratch constraint counters.
+ * Incremented/set by mach_alloc_scratch(); reset and read via the
+ * tcc_gen_machine_insn_scratch_*() public functions.
+ * Declared here (before mach_alloc_scratch) to avoid a forward-reference to
+ * dry_run_state which is defined later in the file. */
+static int g_insn_scratch_allocs = 0;     /* total scratch allocs this instruction */
+static uint16_t g_insn_scratch_saves = 0; /* registers that required PUSH this instruction */
+
+/* Allocate a scratch register for the current instruction.
+ * excl: bitmask of registers that must not be chosen.
+ * The allocation is recorded in ctx so mach_release_all() can free it. */
+static int mach_alloc_scratch(MachineCodegenContext *ctx, uint32_t excl)
+{
+  if (ctx->n_scratch >= MACH_CTX_MAX_SCRATCH)
+    tcc_error("compiler_error: mach_alloc_scratch: per-instruction scratch limit exceeded");
+  ScratchRegAlloc alloc = get_scratch_reg_with_save(excl);
+  ctx->scratches[ctx->n_scratch++] = alloc;
+  /* Phase-3 constraint recording: track count and save-mask per instruction.
+   * Reset with tcc_gen_machine_insn_scratch_reset() before each dispatch call;
+   * read back with the tcc_gen_machine_insn_scratch_*() accessors after it. */
+  g_insn_scratch_allocs++;
+  if (alloc.would_save)
+    g_insn_scratch_saves |= (uint16_t)(1u << (unsigned)alloc.reg);
+  return alloc.reg;
+}
+
+/* Release all scratch registers allocated for the current instruction in
+ * reverse (LIFO) order — required because ARM push/pop works by register
+ * number, so the last-pushed register must be popped first. */
+static void mach_release_all(MachineCodegenContext *ctx)
+{
+  for (int i = ctx->n_scratch - 1; i >= 0; i--)
+    restore_scratch_reg(&ctx->scratches[i]);
+  ctx->n_scratch = 0;
+}
+
+/* Ensure a MachineOperand is in a physical register and return that register.
+ *
+ * For MACH_OP_REG without needs_deref: returns the register directly (no code).
+ * For all other kinds (SPILL, IMM, FRAME_ADDR, SYMBOL, PARAM_STACK) or
+ * MACH_OP_REG with needs_deref: allocates a scratch register, emits the
+ * necessary load instructions, and returns the scratch register.
+ *
+ * excl: bitmask of registers that must not be used for any scratch. */
+static int mach_ensure_in_reg(MachineCodegenContext *ctx, const MachineOperand *op, uint32_t excl)
+{
+  switch (op->kind)
+  {
+  case MACH_OP_REG:
+    if (!op->needs_deref)
+      return op->u.reg.r0;
+    {
+      /* Register-indirect: op->u.reg.r0 is an address; load the value. */
+      int r = mach_alloc_scratch(ctx, excl | (1u << (uint32_t)op->u.reg.r0));
+      load_from_base_ir(r, PREG_REG_NONE, op->btype, (int)op->is_unsigned, 0, 0, (uint32_t)op->u.reg.r0);
+      return r;
+    }
+
+  case MACH_OP_SPILL:
+    if (!op->needs_deref)
+    {
+      /* Simple spill: load the word-sized register value from the spill slot. */
+      int r = mach_alloc_scratch(ctx, excl);
+      tcc_machine_load_spill_slot(r, op->u.spill.offset);
+      return r;
+    }
+    else
+    {
+      /* Double indirection (VT_LLOCAL): the spill slot holds a pointer.
+       * Step 1: load the pointer from the spill slot.
+       * Step 2: dereference the pointer to get the actual value. */
+      int ptr_r = mach_alloc_scratch(ctx, excl);
+      tcc_machine_load_spill_slot(ptr_r, op->u.spill.offset);
+      int val_r = mach_alloc_scratch(ctx, excl | (1u << (uint32_t)ptr_r));
+      load_from_base_ir(val_r, PREG_REG_NONE, op->btype, (int)op->is_unsigned, 0, 0, (uint32_t)ptr_r);
+      return val_r;
+    }
+
+  case MACH_OP_IMM:
+  {
+    int r = mach_alloc_scratch(ctx, excl);
+    tcc_machine_load_constant(r, PREG_REG_NONE, op->u.imm.val, 0, NULL);
+    return r;
+  }
+
+  case MACH_OP_FRAME_ADDR:
+  {
+    /* Compute the address FP + offset (address-of a local variable). */
+    int r = mach_alloc_scratch(ctx, excl);
+    tcc_machine_addr_of_stack_slot(r, op->u.frame.offset, 0 /* not param */);
+    return r;
+  }
+
+  case MACH_OP_SYMBOL:
+  {
+    int r = mach_alloc_scratch(ctx, excl);
+    Sym *sym = op->u.sym.sym ? validate_sym_for_reloc(op->u.sym.sym) : NULL;
+    if (!op->needs_deref)
+    {
+      /* Load symbol address (with addend baked in). */
+      tcc_machine_load_constant(r, PREG_REG_NONE, op->u.sym.addend, 0, sym);
+    }
+    else
+    {
+      /* Load symbol address into a scratch base reg, then dereference. */
+      int base = mach_alloc_scratch(ctx, excl | (1u << (uint32_t)r));
+      tcc_machine_load_constant(base, PREG_REG_NONE, 0, 0, sym);
+      const int32_t addend = op->u.sym.addend;
+      load_from_base_ir(r, PREG_REG_NONE, op->btype, (int)op->is_unsigned, addend < 0 ? (int)(-addend) : (int)addend,
+                        addend < 0 ? 1 : 0, (uint32_t)base);
+    }
+    return r;
+  }
+
+  case MACH_OP_PARAM_STACK:
+  {
+    /* Stack-passed parameter: load from (FP + offset_to_args + param offset). */
+    int r = mach_alloc_scratch(ctx, excl);
+    const int adjusted = op->u.param.offset + offset_to_args;
+    const int base_reg = tcc_state->need_frame_pointer ? R_FP : R_SP;
+    const int sign = (adjusted < 0);
+    const int abs_off = sign ? -adjusted : adjusted;
+    load_from_base_ir(r, PREG_REG_NONE, op->btype, (int)op->is_unsigned, abs_off, sign, (uint32_t)base_reg);
+    return r;
+  }
+
+  default:
+    tcc_error("compiler_error: mach_ensure_in_reg: unhandled kind %d", (int)op->kind);
+    return PREG_REG_NONE;
+  }
+}
+
+/* Try to emit an immediate-form instruction for src2; if the encoding succeeds,
+ * sets *imm_emitted=true and returns PREG_REG_NONE.  Otherwise loads src2 into
+ * a scratch register and returns it (like mach_ensure_in_reg). */
+static int mach_ensure_imm_or_reg(MachineCodegenContext *ctx, const MachineOperand *op, uint32_t excl,
+                                  thumb_imm_handler_t imm_handler, int dest_reg, int src1_reg,
+                                  thumb_flags_behaviour flags, bool *imm_emitted)
+{
+  *imm_emitted = false;
+  if (op->kind == MACH_OP_IMM && imm_handler)
+  {
+    const uint32_t imm_val = (uint32_t)op->u.imm.val;
+    if (ot(imm_handler((uint32_t)dest_reg, (uint32_t)src1_reg, imm_val, flags, ENFORCE_ENCODING_NONE)))
+    {
+      *imm_emitted = true;
+      return PREG_REG_NONE;
+    }
+  }
+  return mach_ensure_in_reg(ctx, op, excl);
+}
+
+/* Determine (or allocate) the destination register for the current instruction.
+ * Returns the physical register that should hold the result.
+ * If the destination is a spill slot or needs pointer write-back, allocates a
+ * scratch; call mach_writeback_dest() after emitting the instruction. */
+static int mach_get_dest_reg(MachineCodegenContext *ctx, const MachineOperand *op, uint32_t excl)
+{
+  if (!op || op->kind == MACH_OP_NONE)
+    return R0; /* CMP / flag-setting ops: Rd is ignored. */
+
+  switch (op->kind)
+  {
+  case MACH_OP_REG:
+    if (!op->needs_deref && op->u.reg.r0 != (int)PREG_REG_NONE)
+      return op->u.reg.r0;
+    /* No pre-allocated register or store-through-pointer: need scratch. */
+    return mach_alloc_scratch(ctx, excl);
+
+  case MACH_OP_SPILL:
+  case MACH_OP_PARAM_STACK:
+    return mach_alloc_scratch(ctx, excl);
+
+  default:
+    tcc_error("compiler_error: mach_get_dest_reg: unexpected kind %d", (int)op->kind);
+    return PREG_REG_NONE;
+  }
+}
+
+/* Store the result in 'reg' back to the destination described by *op.
+ * Only needed when the destination was a spill slot, stack parameter, or an
+ * lvalue (store-through-pointer). Must be called after mach_get_dest_reg()
+ * allocated a scratch for those cases. */
+static void mach_writeback_dest(const MachineOperand *op, int reg)
+{
+  if (!op || op->kind == MACH_OP_NONE)
+    return;
+
+  switch (op->kind)
+  {
+  case MACH_OP_REG:
+    if (!op->needs_deref)
+    {
+      if (reg != op->u.reg.r0 && op->u.reg.r0 != (int)PREG_REG_NONE)
+        ot_check(th_mov_reg((uint32_t)op->u.reg.r0, (uint32_t)reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                            ENFORCE_ENCODING_NONE, false));
+    }
+    else
+    {
+      /* Store through pointer. */
+      if (!store_word_to_base(reg, op->u.reg.r0, 0, 0))
+      {
+        uint32_t excl = (1u << (uint32_t)reg) | (1u << (uint32_t)op->u.reg.r0);
+        ScratchRegAlloc rr = get_scratch_reg_with_save(excl);
+        ot_check(th_str_reg((uint32_t)reg, (uint32_t)op->u.reg.r0, (uint32_t)rr.reg, THUMB_SHIFT_DEFAULT,
+                            ENFORCE_ENCODING_NONE));
+        restore_scratch_reg(&rr);
+      }
+    }
+    break;
+
+  case MACH_OP_SPILL:
+    tcc_machine_store_spill_slot(reg, op->u.spill.offset);
+    break;
+
+  case MACH_OP_PARAM_STACK:
+    tcc_machine_store_param_slot(reg, op->u.param.offset);
+    break;
+
+  default:
+    tcc_error("compiler_error: mach_writeback_dest: unexpected kind %d", (int)op->kind);
+  }
+}
 
 /* ============================================================
  * Dry-Run Code Generation State
@@ -749,6 +999,29 @@ ST_FUNC void tcc_gen_machine_reset_scratch_state(void)
   memset(scratch_push_stack, 0, sizeof(scratch_push_stack));
 }
 
+/* Per-instruction scratch tracking (Phase 3 constraint collection).
+ * Call reset before each mop dispatched instruction; call count after to
+ * retrieve the number of scratch registers allocated for that instruction.
+ * Works in both dry-run and real-emit passes so the two can be compared. */
+ST_FUNC void tcc_gen_machine_insn_scratch_reset(void)
+{
+  g_insn_scratch_allocs = 0;
+  g_insn_scratch_saves = 0;
+}
+
+ST_FUNC int tcc_gen_machine_insn_scratch_count(void)
+{
+  return g_insn_scratch_allocs;
+}
+
+/* Returns a bitmask of registers that required PUSH during the most recent
+ * instruction (i.e., no free scratch register was available and one had to
+ * be saved to the stack).  Works in both dry-run and real-emit modes. */
+ST_FUNC uint16_t tcc_gen_machine_insn_scratch_saves_mask(void)
+{
+  return g_insn_scratch_saves;
+}
+
 ScratchRegAlloc th_offset_to_reg(int offset, int sign);
 
 /* Get a free scratch register using liveness information.
@@ -866,6 +1139,7 @@ no_free_reg:
     /* Return as if it's free for consistent allocation decisions */
     result.reg = reg_to_save;
     result.saved = 0;
+    result.would_save = 1; /* Phase 3: flag that a push would be needed */
     scratch_global_exclude |= (1u << reg_to_save);
     return result;
   }
@@ -873,6 +1147,7 @@ no_free_reg:
   ot_check(th_push(1 << reg_to_save));
   result.reg = reg_to_save;
   result.saved = 1;
+  result.would_save = 1; /* Phase 3: push was needed */
   /* Track push ORDER - we must POP in reverse order since ARM POP with register
    * lists pops in register-number order, not stack order. */
   if (scratch_push_count < 128)
@@ -1063,6 +1338,7 @@ int ot_check(thumb_opcode op)
 {
   if (!is_valid_opcode(op))
   {
+    fprintf(stderr, "[ot_check FAIL] opcode=0x%x ind=0x%x ir_op=%d\n", op.opcode, (unsigned)ind, g_debug_current_op);
     tcc_error("compiler_error: received invalid opcode: 0x%x\n", op.opcode);
   }
   return ot(op);
@@ -1892,6 +2168,20 @@ ST_FUNC void tcc_gen_machine_indirect_jump_op(IROperand src1)
   }
 }
 
+/* tcc_gen_machine_indirect_jump_mop: MachineOperand-based entry point for
+ * indirect jump (IJUMP / computed goto).  Materializes src into a register
+ * using mach_ensure_in_reg (handles REG, REG-deref, SPILL, SYMBOL, FRAME_ADDR,
+ * PARAM_STACK) then emits BX Rt.
+ */
+ST_FUNC void tcc_gen_machine_indirect_jump_mop(MachineOperand src, TccIrOp op)
+{
+  (void)op;
+  MachineCodegenContext ctx = {0};
+  int target = mach_ensure_in_reg(&ctx, &src, 0);
+  ot_check(th_bx_reg((uint16_t)target));
+  mach_release_all(&ctx);
+}
+
 /* ============================================================================
  * Switch Table / Jump Table Generation
  * ============================================================================
@@ -2316,6 +2606,29 @@ static uint32_t th_store_resolve_base_ir(int src_reg, IROperand sv, int btype, i
   {
     base_reg = sv.pr0_reg;
     thumb_require_materialized_reg("store", "address base", base_reg);
+    *abs_off = 0;
+    *sign = 0;
+    return base_reg;
+  }
+
+  /* Double indirection (LLOCAL): spilled pointer that needs dereferencing.
+   * The stack slot contains a POINTER, not the store target itself.
+   * Load the pointer from the spill slot, then use it as the base. */
+  if (sv.is_llocal && sv.is_lval && tag == IROP_TAG_STACKOFF)
+  {
+    int32_t ptr_off = irop_get_stack_offset(sv);
+    if (sv.is_param && ptr_off >= 0)
+      ptr_off += offset_to_args;
+    else
+      ptr_off = fp_adjust_local_offset(ptr_off, sv.is_param);
+    int ptr_sign = (ptr_off < 0);
+    int ptr_abs = ptr_sign ? -ptr_off : ptr_off;
+
+    uint32_t exclude_regs = (1u << src_reg);
+    *base_alloc = get_scratch_reg_with_save(exclude_regs);
+    base_reg = base_alloc->reg;
+    *has_base_alloc = 1;
+    load_from_base_ir(base_reg, PREG_REG_NONE, IROP_BTYPE_INT32, 0, ptr_abs, ptr_sign, R_FP);
     *abs_off = 0;
     *sign = 0;
     return base_reg;
@@ -3083,13 +3396,15 @@ static void load_from_base_ir(int r, int r1, int irop_btype, int is_unsigned, in
   {
     /* 64-bit value (double float or long long) - load to register pair */
     int ir_high = r1;
+    ScratchRegAlloc ir_high_alloc = {0};
     if (ir_high < 0 || ir_high == PREG_REG_NONE)
     {
-      ir_high = r + 1;
-      if (ir_high == R_SP || ir_high == R_PC)
-      {
-        tcc_error("compiler_error: cannot load 64-bit value - no valid high register");
-      }
+      /* No explicit high register — always use scratch to avoid clobbering
+       * r+1 which may be allocated to another live variable.  The old r+1
+       * fallback was only safe when mat.c pre-materialized into scratch
+       * registers (ip:lr pair) before the handler. */
+      ir_high_alloc = get_scratch_reg_with_save((1u << r) | (1u << base));
+      ir_high = ir_high_alloc.reg;
     }
 
     /* If base overlaps with destination, preserve it */
@@ -3127,6 +3442,8 @@ static void load_from_base_ir(int r, int r1, int irop_btype, int is_unsigned, in
 
     if (base_alloc.saved)
       restore_scratch_reg(&base_alloc);
+    if (ir_high_alloc.saved)
+      restore_scratch_reg(&ir_high_alloc);
     return;
   }
 
@@ -3191,6 +3508,92 @@ void load_to_dest_ir(IROperand dest, IROperand src)
   {
     thumb_gen_state.cached_global_sym = NULL;
     thumb_gen_state.cached_global_reg = PREG_NONE;
+  }
+
+  /* Handle spilled / no-physical-register destination:
+   * Allocate a scratch register, load into it, then store back to the
+   * destination's stack slot.  This allows callers to pass an unfilled
+   * (STACKOFF) dest without first calling tcc_ir_materialize_dest_ir. */
+  if (dest.pr0_reg == (int)PREG_REG_NONE && (dest.is_local || dest.is_llocal || dest.pr0_spilled))
+  {
+    const int is_64bit_dest = irop_is_64bit(dest);
+    const unsigned need_pair = is_64bit_dest ? TCC_MACHINE_SCRATCH_NEEDS_PAIR : 0;
+    TCCMachineScratchRegs scratch = {0};
+    tcc_machine_acquire_scratch(&scratch, need_pair);
+    if (scratch.reg_count == 0)
+      tcc_error("compiler_error: load_to_dest_ir: no scratch for spilled dest");
+
+    IROperand dest_with_reg = dest;
+    dest_with_reg.pr0_reg = scratch.regs[0];
+    dest_with_reg.pr0_spilled = 0;
+    dest_with_reg.is_local = 0;
+    dest_with_reg.is_llocal = 0;
+    dest_with_reg.is_lval = 0;
+    dest_with_reg.tag = IROP_TAG_VREG;
+    dest_with_reg.u.imm32 = 0;
+    if (is_64bit_dest && scratch.reg_count >= 2)
+    {
+      dest_with_reg.pr1_reg = scratch.regs[1];
+      dest_with_reg.pr1_spilled = 0;
+    }
+
+    /* Recurse with a valid destination register */
+    load_to_dest_ir(dest_with_reg, src);
+
+    /* Store result back to the original stack slot.
+     * For 64-bit values, issue two 32-bit stores so that store_ir does not
+     * attempt to read dest.pr1_reg as the source high register. */
+    if (is_64bit_dest && scratch.reg_count >= 2)
+    {
+      IROperand dest_lo = dest;
+      dest_lo.btype = IROP_BTYPE_INT32;
+      IROperand dest_hi = dest;
+      dest_hi.btype = IROP_BTYPE_INT32;
+      dest_hi.u.imm32 += 4;
+      store_ex_ir(scratch.regs[0], dest_lo, (1u << scratch.regs[1]));
+      store_ir(scratch.regs[1], dest_hi);
+    }
+    else
+    {
+      /* Spill slots are always 32-bit words.  Force btype to INT32 so that
+       * store_ex_ir uses a 32-bit STR regardless of the original narrow type
+       * (e.g. INT16/INT8).  Without this, a narrow store (STRH/STRB) would
+       * leave garbage in the upper bits that get read back by the 32-bit
+       * reload (LDR). */
+      IROperand dest_spill = dest;
+      dest_spill.btype = IROP_BTYPE_INT32;
+      store_ir(scratch.regs[0], dest_spill);
+    }
+
+    tcc_machine_release_scratch(&scratch);
+    return;
+  }
+
+  /* Handle pr1-spilled 64-bit destination:
+   * pr0 is in a physical register but pr1 was spilled to the stack.
+   * Allocate a scratch for the high word, recurse to load the full 64-bit
+   * value, then store the high word back to the spill slot. */
+  if (dest.pr0_reg != (int)PREG_REG_NONE && dest.pr1_spilled && irop_is_64bit(dest))
+  {
+    ScratchRegAlloc hi_scratch = get_scratch_reg_with_save((1u << dest.pr0_reg));
+
+    IROperand dest_with_hi = dest;
+    dest_with_hi.pr1_reg = hi_scratch.reg;
+    dest_with_hi.pr1_spilled = 0;
+
+    /* Recurse with a valid high register */
+    load_to_dest_ir(dest_with_hi, src);
+
+    /* Store the high word back to the spill slot (+4 bytes from low word) */
+    IROperand dest_hi = dest;
+    dest_hi.btype = IROP_BTYPE_INT32;
+    dest_hi.pr1_reg = PREG_REG_NONE;
+    dest_hi.pr1_spilled = 0;
+    dest_hi.u.imm32 += 4;
+    store_ir(hi_scratch.reg, dest_hi);
+
+    restore_scratch_reg(&hi_scratch);
+    return;
   }
 
   /* Check if it's a float type based on btype */
@@ -3481,9 +3884,6 @@ int th_has_immediate_value(int r)
   return (r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST;
 }
 
-typedef thumb_opcode (*thumb_imm_handler_t)(uint32_t rd, uint32_t rn, uint32_t imm,
-                                            thumb_flags_behaviour flags_behaviour,
-                                            thumb_enforce_encoding enforce_encoding);
 typedef thumb_opcode (*thumb_reg_handler_t)(uint32_t rd, uint32_t rn, uint32_t rm,
                                             thumb_flags_behaviour flags_behaviour, thumb_shift shift_type,
                                             thumb_enforce_encoding enforce_encoding);
@@ -5467,6 +5867,704 @@ void tcc_gen_machine_data_processing_op(IROperand src1, IROperand src2, IROperan
   thumb_emit_data_processing_op32(src1, src2, dest, op, handler, flags);
 }
 
+/* ============================================================
+ * MachineOperand-based data processing (_mop path)
+ * ============================================================
+ * thumb_emit_data_processing_mop32: simplified version of
+ * thumb_emit_data_processing_op32 using MachineOperand instead of IROperand.
+ * Handles 32-bit non-complex arithmetic/logic ops via the mach_* helpers,
+ * eliminating the two-layer materialization present in the old path.
+ */
+static void thumb_emit_data_processing_mop32(const MachineOperand *src1, const MachineOperand *src2,
+                                             const MachineOperand *dest, TccIrOp op, ThumbDataProcessingHandler handler,
+                                             thumb_flags_behaviour flags)
+{
+  const bool dest_sets_flags = (op == TCCIR_OP_CMP);
+  MachineCodegenContext mctx = {0};
+
+  /* 1. Determine dest register (allocate scratch for spills/param/no-reg).
+   * CMP and other flag-setting ops don't write a result register, so we
+   * use R0 as a dummy (Rd field is architecturally ignored). */
+  int dest_reg;
+  if (dest_sets_flags)
+    dest_reg = R0;
+  else
+    dest_reg = mach_get_dest_reg(&mctx, dest, 0);
+
+  uint32_t excl = thumb_is_hw_reg(dest_reg) ? (1u << (uint32_t)dest_reg) : 0;
+
+  /* 2. Ensure src1 is in a register; add it to the exclusion mask. */
+  int src1_reg = mach_ensure_in_reg(&mctx, src1, excl);
+  if (thumb_is_hw_reg(src1_reg))
+    excl |= (1u << (uint32_t)src1_reg);
+
+  /* 3. Try immediate form for src2; fall back to register if needed. */
+  bool imm_emitted = false;
+  int src2_reg =
+      mach_ensure_imm_or_reg(&mctx, src2, excl, handler.imm_handler, dest_reg, src1_reg, flags, &imm_emitted);
+  if (!imm_emitted)
+  {
+    /* Immediate form didn't fit (or src2 isn't an immediate): emit reg form. */
+    ot_check(handler.reg_handler((uint32_t)dest_reg, (uint32_t)src1_reg, (uint32_t)src2_reg, flags, THUMB_SHIFT_DEFAULT,
+                                 ENFORCE_ENCODING_NONE));
+  }
+
+  /* 4. Write result back to spill slot / stack param / pointer-dest. */
+  if (!dest_sets_flags && dest && dest->kind != MACH_OP_NONE)
+  {
+    const bool needs_wb = dest->kind == MACH_OP_SPILL || dest->kind == MACH_OP_PARAM_STACK ||
+                          (dest->kind == MACH_OP_REG && (dest->needs_deref || dest->u.reg.r0 == (int)PREG_REG_NONE));
+    if (needs_wb)
+      mach_writeback_dest(dest, dest_reg);
+  }
+
+  /* 5. Release all scratches in LIFO order. */
+  mach_release_all(&mctx);
+}
+
+/* tcc_gen_machine_data_processing_mop: MachineOperand-based entry point for
+ * simple 32-bit arithmetic/logic operations.  Called from ir/codegen.c instead
+ * of tcc_gen_machine_data_processing_op when:
+ *   - The op is one of ADD/SUB/CMP/SHL/SHR/SAR/AND/OR/XOR/ADC_GEN/ADC_USE, AND
+ *   - dest is NOT a 64-bit or complex type (those still use the old path).
+ */
+void tcc_gen_machine_data_processing_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest, TccIrOp op)
+{
+  ThumbDataProcessingHandler handler;
+  thumb_flags_behaviour flags = FLAGS_BEHAVIOUR_NOT_IMPORTANT;
+
+  switch (op)
+  {
+  case TCCIR_OP_ADD:
+    handler.imm_handler = th_add_imm;
+    handler.reg_handler = th_add_reg;
+    break;
+  case TCCIR_OP_SUB:
+    handler.imm_handler = th_sub_imm;
+    handler.reg_handler = th_sub_reg;
+    break;
+  case TCCIR_OP_CMP:
+    handler.imm_handler = th_cmp_imm;
+    handler.reg_handler = th_cmp_reg;
+    break;
+  case TCCIR_OP_SHL:
+    handler.imm_handler = th_lsl_imm;
+    handler.reg_handler = th_lsl_reg;
+    break;
+  case TCCIR_OP_SHR:
+    handler.imm_handler = th_lsr_imm;
+    handler.reg_handler = th_lsr_reg;
+    break;
+  case TCCIR_OP_SAR:
+    handler.imm_handler = th_asr_imm;
+    handler.reg_handler = th_asr_reg;
+    break;
+  case TCCIR_OP_OR:
+    handler.imm_handler = th_orr_imm;
+    handler.reg_handler = th_orr_reg;
+    break;
+  case TCCIR_OP_AND:
+    handler.imm_handler = th_and_imm;
+    handler.reg_handler = th_and_reg;
+    break;
+  case TCCIR_OP_XOR:
+    handler.imm_handler = th_eor_imm;
+    handler.reg_handler = th_eor_reg;
+    break;
+  case TCCIR_OP_ADC_GEN:
+    flags = FLAGS_BEHAVIOUR_SET;
+    /* fall through */
+  case TCCIR_OP_ADC_USE:
+    handler.imm_handler = th_adc_imm;
+    handler.reg_handler = th_adc_reg;
+    break;
+  default:
+    tcc_error("compiler_error: tcc_gen_machine_data_processing_mop: unhandled op %d", (int)op);
+    return;
+  }
+
+  thumb_emit_data_processing_mop32(&src1, &src2, &dest, op, handler, flags);
+}
+
+/* tcc_gen_machine_assign_mop: MachineOperand-based entry point for simple
+ * 32-bit value assignment.  Called from ir/codegen.c instead of
+ * tcc_gen_machine_assign_op when:
+ *   - Neither dest nor src requires a 64-bit or complex register pair, AND
+ *   - The function does not use a static chain.
+ *
+ * Handles all destination kinds: MACH_OP_REG (direct), MACH_OP_SPILL
+ * (via mach_get_dest_reg + mach_writeback_dest → tcc_machine_store_spill_slot),
+ * and MACH_OP_PARAM_STACK (via mach_writeback_dest → tcc_machine_store_param_slot).
+ *
+ * Strategy: load src directly into dest_reg; use mach_ensure_in_reg only
+ * as a fallback for unhandled source kinds.
+ */
+ST_FUNC void tcc_gen_machine_assign_mop(MachineOperand src, MachineOperand dest, TccIrOp op)
+{
+  (void)op;
+  MachineCodegenContext mctx = {0};
+
+  /* --- Fast path: source is already in a register (no dereference) ---
+   * Write it directly to the destination via mach_writeback_dest without
+   * allocating any scratch.  This covers REG→REG (MOV or NOP) and
+   * REG→SPILL/PARAM_STACK (direct store from src register). */
+  if (src.kind == MACH_OP_REG && !src.needs_deref)
+  {
+    mach_writeback_dest(&dest, src.u.reg.r0);
+    return;
+  }
+
+  /* --- Determine destination register ---
+   * For REG destinations, reuse the pre-allocated register (0 scratch).
+   * For SPILL/PARAM_STACK/REG(deref) destinations, allocate a scratch. */
+  int dest_reg;
+  bool need_writeback;
+  if (dest.kind == MACH_OP_REG && !dest.needs_deref && dest.u.reg.r0 != (int)PREG_REG_NONE)
+  {
+    dest_reg = dest.u.reg.r0;
+    need_writeback = false;
+  }
+  else
+  {
+    dest_reg = mach_get_dest_reg(&mctx, &dest, 0);
+    need_writeback = true;
+  }
+
+  /* --- Load source value directly into dest_reg --- */
+  switch (src.kind)
+  {
+  case MACH_OP_REG:
+    /* Only the needs_deref case reaches here (non-deref handled above).
+     * Load from [src_reg] directly into dest_reg. */
+    load_from_base_ir(dest_reg, PREG_REG_NONE, src.btype, (int)src.is_unsigned, 0, 0, (uint32_t)src.u.reg.r0);
+    break;
+
+  case MACH_OP_IMM:
+    tcc_machine_load_constant(dest_reg, PREG_REG_NONE, src.u.imm.val, 0, NULL);
+    break;
+
+  case MACH_OP_SPILL:
+    tcc_machine_load_spill_slot(dest_reg, src.u.spill.offset);
+    if (src.needs_deref)
+    {
+      /* Double indirection: dest_reg now holds a pointer; dereference it. */
+      load_from_base_ir(dest_reg, PREG_REG_NONE, src.btype, (int)src.is_unsigned, 0, 0, (uint32_t)dest_reg);
+    }
+    break;
+
+  case MACH_OP_SYMBOL:
+  {
+    Sym *sym = src.u.sym.sym ? validate_sym_for_reloc(src.u.sym.sym) : NULL;
+    if (!src.needs_deref)
+    {
+      tcc_machine_load_constant(dest_reg, PREG_REG_NONE, src.u.sym.addend, 0, sym);
+    }
+    else
+    {
+      /* Load symbol address into dest_reg, then dereference through it. */
+      tcc_machine_load_constant(dest_reg, PREG_REG_NONE, 0, 0, sym);
+      const int32_t addend = src.u.sym.addend;
+      load_from_base_ir(dest_reg, PREG_REG_NONE, src.btype, (int)src.is_unsigned,
+                        addend < 0 ? (int)(-addend) : (int)addend, addend < 0 ? 1 : 0, (uint32_t)dest_reg);
+    }
+    break;
+  }
+
+  case MACH_OP_FRAME_ADDR:
+    tcc_machine_addr_of_stack_slot(dest_reg, src.u.frame.offset, 0);
+    break;
+
+  case MACH_OP_PARAM_STACK:
+  {
+    const int adjusted = src.u.param.offset + offset_to_args;
+    const int base_reg = tcc_state->need_frame_pointer ? R_FP : R_SP;
+    const int sign = (adjusted < 0);
+    const int abs_off = sign ? -adjusted : adjusted;
+    load_from_base_ir(dest_reg, PREG_REG_NONE, src.btype, (int)src.is_unsigned, abs_off, sign, (uint32_t)base_reg);
+    break;
+  }
+
+  default:
+  {
+    /* Fallback: generic mach_ensure_in_reg + MOV. */
+    uint32_t excl = thumb_is_hw_reg(dest_reg) ? (1u << (uint32_t)dest_reg) : 0;
+    int src_reg = mach_ensure_in_reg(&mctx, &src, excl);
+    if (src_reg != dest_reg)
+      ot_check(th_mov_reg((uint32_t)dest_reg, (uint32_t)src_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                          ENFORCE_ENCODING_NONE, false));
+    break;
+  }
+  }
+
+  if (need_writeback)
+    mach_writeback_dest(&dest, dest_reg);
+
+  mach_release_all(&mctx);
+}
+
+/* tcc_gen_machine_setif_mop: MachineOperand-based entry point for SETIF.
+ * src must be MACH_OP_IMM carrying the raw condition code in u.imm.val.
+ * Emits:  MOV dest, #0
+ *         IT  <cond>
+ *         MOV dest, #1
+ */
+ST_FUNC void tcc_gen_machine_setif_mop(MachineOperand src, MachineOperand dest, TccIrOp op)
+{
+  (void)op;
+  MachineCodegenContext mctx = {0};
+
+  const int cond = mapcc((int)src.u.imm.val);
+
+  int dest_reg = mach_get_dest_reg(&mctx, &dest, 0);
+
+  ot_check(th_mov_imm(dest_reg, 0, FLAGS_BEHAVIOUR_BLOCK, ENFORCE_ENCODING_NONE));
+  ot_check(th_it(cond, 0x8)); /* IT <cond> — single conditioned instruction */
+  ot_check(th_mov_imm(dest_reg, 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+
+  mach_writeback_dest(&dest, dest_reg);
+  mach_release_all(&mctx);
+}
+
+/* tcc_gen_machine_bool_mop: MachineOperand-based entry point for
+ * BOOL_OR / BOOL_AND.  Called from ir/codegen.c for simple 32-bit
+ * non-complex boolean operations.
+ *
+ * BOOL_OR:   ORRS dest, src1, src2   (sets Z flag)
+ *            MOV  dest, #0           (flag-preserving)
+ *            IT   NE
+ *            MOV  dest, #1
+ *
+ * BOOL_AND:  CMP  src1, #0
+ *            IT   NE
+ *            CMP  src2, #0           (only if src1 != 0)
+ *            MOV  dest, #0           (flag-preserving)
+ *            IT   NE
+ *            MOV  dest, #1
+ */
+ST_FUNC void tcc_gen_machine_bool_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest, TccIrOp op)
+{
+  MachineCodegenContext mctx = {0};
+
+  int dest_reg = mach_get_dest_reg(&mctx, &dest, 0);
+  uint32_t excl = thumb_is_hw_reg(dest_reg) ? (1u << (uint32_t)dest_reg) : 0;
+
+  int src1_reg = mach_ensure_in_reg(&mctx, &src1, excl);
+  if (thumb_is_hw_reg(src1_reg))
+    excl |= (1u << (uint32_t)src1_reg);
+
+  int src2_reg = mach_ensure_in_reg(&mctx, &src2, excl);
+
+  if (op == TCCIR_OP_BOOL_OR)
+  {
+    ot_check(th_orr_reg(dest_reg, src1_reg, src2_reg, FLAGS_BEHAVIOUR_SET, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+    ot_check(th_mov_imm(dest_reg, 0, FLAGS_BEHAVIOUR_BLOCK, ENFORCE_ENCODING_NONE));
+    ot_check(th_it(0x1, 0x8)); /* IT NE */
+    ot_check(th_mov_imm(dest_reg, 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+  }
+  else /* TCCIR_OP_BOOL_AND */
+  {
+    ot_check(th_cmp_imm(0, src1_reg, 0, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE));
+    ot_check(th_it(0x1, 0x8));                                                        /* IT NE */
+    ot_check(th_cmp_imm(0, src2_reg, 0, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE)); /* CMPne src2, #0 */
+    ot_check(th_mov_imm(dest_reg, 0, FLAGS_BEHAVIOUR_BLOCK, ENFORCE_ENCODING_NONE));
+    ot_check(th_it(0x1, 0x8)); /* IT NE */
+    ot_check(th_mov_imm(dest_reg, 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+  }
+
+  mach_writeback_dest(&dest, dest_reg);
+  mach_release_all(&mctx);
+}
+
+/* tcc_gen_machine_load_mop: MachineOperand-based entry point for TCCIR_OP_LOAD.
+ *
+ * dest must be MACH_OP_REG (non-spilled, non-pair) — other dest kinds fall back
+ * to the old tcc_gen_machine_load_op() path in codegen.c.
+ *
+ * src encodes the memory address:
+ *   MACH_OP_REG + needs_deref=true  → LDR dest, [src_reg]
+ *   MACH_OP_SPILL                   → LDR dest, [FP + fp_adjust(offset)]
+ *   MACH_OP_SPILL + needs_deref=true → LLOCAL: LDR ptr,[FP+off]; LDR dest,[ptr]
+ *   MACH_OP_PARAM_STACK             → LDR dest, [FP + param_off + offset_to_args]
+ *   MACH_OP_SYMBOL                  → LDR_literal addr; LDR dest, [addr]
+ *   MACH_OP_IMM                     → tcc_machine_load_constant (constant load)
+ */
+ST_FUNC void tcc_gen_machine_load_mop(MachineOperand src, MachineOperand dest, TccIrOp op)
+{
+  MachineCodegenContext ctx = {0};
+  (void)op;
+
+  const int dest_reg = dest.u.reg.r0;
+  const int dest_r1 = dest.is_64bit ? dest.u.reg.r1 : PREG_REG_NONE;
+  const int btype = src.btype;
+  const int is_unsigned = (int)src.is_unsigned;
+
+  switch (src.kind)
+  {
+  case MACH_OP_REG:
+    if (src.needs_deref)
+    {
+      /* Register-indirect: LDR dest, [src_reg] */
+      load_from_base_ir(dest_reg, dest_r1, btype, is_unsigned, 0, 0, (uint32_t)src.u.reg.r0);
+    }
+    else
+    {
+      /* Direct register-to-register (treat as MOV — should be ASSIGN, not LOAD) */
+      if (dest_reg != src.u.reg.r0)
+        ot_check(th_mov_reg((uint32_t)dest_reg, (uint32_t)src.u.reg.r0, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                            THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
+    }
+    break;
+
+  case MACH_OP_SPILL:
+  {
+    const int adj = fp_adjust_local_offset(src.u.spill.offset, 0);
+    const int sign = (adj < 0), abs_off = sign ? -adj : adj;
+    const uint32_t base = (uint32_t)(tcc_state->need_frame_pointer ? R_FP : R_SP);
+    if (!src.needs_deref)
+    {
+      /* Load value directly from spill/local slot */
+      load_from_base_ir(dest_reg, dest_r1, btype, is_unsigned, abs_off, sign, base);
+    }
+    else
+    {
+      /* LLOCAL: spill slot holds a pointer; load ptr, then dereference */
+      int ptr_r = mach_alloc_scratch(&ctx, ((uint32_t)1u << (uint32_t)dest_reg) | ((uint32_t)1u << base));
+      if (!load_word_from_base(ptr_r, (int)base, abs_off, sign))
+      {
+        ScratchRegAlloc rr = th_offset_to_reg_ex(abs_off, sign, ((uint32_t)1u << ptr_r) | ((uint32_t)1u << base));
+        ot_check(th_ldr_reg((uint32_t)ptr_r, base, (uint32_t)rr.reg, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+        restore_scratch_reg(&rr);
+      }
+      load_from_base_ir(dest_reg, dest_r1, btype, is_unsigned, 0, 0, (uint32_t)ptr_r);
+    }
+    break;
+  }
+
+  case MACH_OP_PARAM_STACK:
+  {
+    const int adj = src.u.param.offset + offset_to_args;
+    const int sign = (adj < 0), abs_off = sign ? -adj : adj;
+    const uint32_t base = (uint32_t)(tcc_state->need_frame_pointer ? R_FP : R_SP);
+    load_from_base_ir(dest_reg, dest_r1, btype, is_unsigned, abs_off, sign, base);
+    break;
+  }
+
+  case MACH_OP_SYMBOL:
+  {
+    Sym *sym = src.u.sym.sym ? validate_sym_for_reloc(src.u.sym.sym) : NULL;
+    const int32_t addend = src.u.sym.addend;
+    if (!src.needs_deref)
+    {
+      /* Load symbol address (+ addend) into dest — no dereference.
+       * Matches load_to_dest_ir SYMREF !is_lval path. */
+      tcc_machine_load_constant(dest_reg, dest_r1, (int64_t)addend, (int)dest.is_64bit, sym);
+      break;
+    }
+    /* needs_deref: load symbol address into scratch, then dereference. */
+    int addr_r = mach_alloc_scratch(&ctx, (uint32_t)1u << (uint32_t)dest_reg);
+    tcc_machine_load_constant(addr_r, PREG_REG_NONE, 0, 0, sym);
+    load_from_base_ir(dest_reg, dest_r1, btype, is_unsigned, addend < 0 ? (int)(-addend) : (int)addend,
+                      addend < 0 ? 1 : 0, (uint32_t)addr_r);
+    break;
+  }
+
+  case MACH_OP_IMM:
+    /* Treat as constant load (e.g. loading from address 0 — rare but handle gracefully) */
+    tcc_machine_load_constant(dest_reg, dest_r1, src.u.imm.val, (int)dest.is_64bit, NULL);
+    break;
+
+  default:
+    tcc_error("compiler_error: load_mop: unhandled src kind %d", (int)src.kind);
+  }
+
+  mach_release_all(&ctx);
+}
+
+/* tcc_gen_machine_store_mop: MachineOperand-based entry point for TCCIR_OP_STORE.
+ *
+ * dest encodes the destination address (memory location to write to).
+ * src encodes the value to store.
+ * Store width is determined by dest.btype.
+ *
+ * dest kinds handled:
+ *   MACH_OP_REG + needs_deref=true  → STR src, [dest_reg]
+ *   MACH_OP_REG (no deref)          → MOV dest_reg, src (reg-to-reg)
+ *   MACH_OP_SPILL                   → STR src, [FP + fp_adjust(offset)]
+ *   MACH_OP_PARAM_STACK             → STR src, [FP + param_off + offset_to_args]
+ *   MACH_OP_SYMBOL                  → load addr, STR src, [addr + addend]
+ */
+ST_FUNC void tcc_gen_machine_store_mop(MachineOperand dest, MachineOperand src, TccIrOp op)
+{
+  MachineCodegenContext ctx = {0};
+  (void)op;
+
+  const int btype = dest.btype; /* Store width from destination type */
+
+  /* Get source value register — may allocate a scratch if spilled/const */
+  const int src_reg = mach_ensure_in_reg(&ctx, &src, 0);
+
+  switch (dest.kind)
+  {
+  case MACH_OP_REG:
+    if (dest.needs_deref)
+    {
+      /* Store through pointer: STR src, [dest_reg] */
+      const uint32_t base = (uint32_t)dest.u.reg.r0;
+      if (btype == IROP_BTYPE_INT8)
+        th_store8_imm_or_reg(src_reg, base, 0, 0);
+      else if (btype == IROP_BTYPE_INT16)
+        th_store16_imm_or_reg(src_reg, base, 0, 0);
+      else
+        th_store32_imm_or_reg_ex(src_reg, base, 0, 0, (uint32_t)1u << (uint32_t)src_reg);
+    }
+    else
+    {
+      /* Register-to-register store (MOV) */
+      const int dreg = dest.u.reg.r0;
+      if (dreg != src_reg && dreg != (int)PREG_REG_NONE)
+        ot_check(th_mov_reg((uint32_t)dreg, (uint32_t)src_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                            ENFORCE_ENCODING_NONE, false));
+    }
+    break;
+
+  case MACH_OP_SPILL:
+  {
+    const int adj = fp_adjust_local_offset(dest.u.spill.offset, 0);
+    const int sign = (adj < 0), abs_off = sign ? -adj : adj;
+    const uint32_t base = (uint32_t)(tcc_state->need_frame_pointer ? R_FP : R_SP);
+    if (btype == IROP_BTYPE_INT8)
+      th_store8_imm_or_reg(src_reg, base, abs_off, sign);
+    else if (btype == IROP_BTYPE_INT16)
+      th_store16_imm_or_reg(src_reg, base, abs_off, sign);
+    else
+      th_store32_imm_or_reg_ex(src_reg, base, abs_off, sign, (uint32_t)1u << (uint32_t)src_reg);
+    break;
+  }
+
+  case MACH_OP_PARAM_STACK:
+  {
+    const int adj = dest.u.param.offset + offset_to_args;
+    const int sign = (adj < 0), abs_off = sign ? -adj : adj;
+    const uint32_t base = (uint32_t)(tcc_state->need_frame_pointer ? R_FP : R_SP);
+    if (btype == IROP_BTYPE_INT8)
+      th_store8_imm_or_reg(src_reg, base, abs_off, sign);
+    else if (btype == IROP_BTYPE_INT16)
+      th_store16_imm_or_reg(src_reg, base, abs_off, sign);
+    else
+      th_store32_imm_or_reg_ex(src_reg, base, abs_off, sign, (uint32_t)1u << (uint32_t)src_reg);
+    break;
+  }
+
+  case MACH_OP_SYMBOL:
+  {
+    Sym *sym = dest.u.sym.sym ? validate_sym_for_reloc(dest.u.sym.sym) : NULL;
+    int addr_r = mach_alloc_scratch(&ctx, (uint32_t)1u << (uint32_t)src_reg);
+    tcc_machine_load_constant(addr_r, PREG_REG_NONE, 0, 0, sym);
+    const int32_t addend = dest.u.sym.addend;
+    const int abs_off = addend < 0 ? (int)(-addend) : (int)addend;
+    const int sign = addend < 0 ? 1 : 0;
+    if (btype == IROP_BTYPE_INT8)
+      th_store8_imm_or_reg(src_reg, (uint32_t)addr_r, abs_off, sign);
+    else if (btype == IROP_BTYPE_INT16)
+      th_store16_imm_or_reg(src_reg, (uint32_t)addr_r, abs_off, sign);
+    else
+      th_store32_imm_or_reg_ex(src_reg, (uint32_t)addr_r, abs_off, sign, (uint32_t)1u << (uint32_t)src_reg);
+    break;
+  }
+
+  case MACH_OP_IMM:
+  {
+    /* Store to an absolute address — e.g. *(volatile uint32_t*)0xABCD = val */
+    int addr_r = mach_alloc_scratch(&ctx, (uint32_t)1u << (uint32_t)src_reg);
+    tcc_machine_load_constant(addr_r, PREG_REG_NONE, dest.u.imm.val, 0, NULL);
+    if (btype == IROP_BTYPE_INT8)
+      th_store8_imm_or_reg(src_reg, (uint32_t)addr_r, 0, 0);
+    else if (btype == IROP_BTYPE_INT16)
+      th_store16_imm_or_reg(src_reg, (uint32_t)addr_r, 0, 0);
+    else
+      th_store32_imm_or_reg_ex(src_reg, (uint32_t)addr_r, 0, 0, (uint32_t)1u << (uint32_t)src_reg);
+    break;
+  }
+
+  case MACH_OP_FRAME_ADDR:
+  {
+    /* Store to a frame-relative address; equivalent to MACH_OP_SPILL but via addr computation */
+    int addr_r = mach_alloc_scratch(&ctx, (uint32_t)1u << (uint32_t)src_reg);
+    tcc_machine_addr_of_stack_slot(addr_r, dest.u.frame.offset, 0 /* not param */);
+    if (btype == IROP_BTYPE_INT8)
+      th_store8_imm_or_reg(src_reg, (uint32_t)addr_r, 0, 0);
+    else if (btype == IROP_BTYPE_INT16)
+      th_store16_imm_or_reg(src_reg, (uint32_t)addr_r, 0, 0);
+    else
+      th_store32_imm_or_reg_ex(src_reg, (uint32_t)addr_r, 0, 0, (uint32_t)1u << (uint32_t)src_reg);
+    break;
+  }
+
+  default:
+    tcc_error("compiler_error: store_mop: unhandled dest kind %d", (int)dest.kind);
+  }
+
+  mach_release_all(&ctx);
+}
+
+/* Indexed load: dest = *(base + (index << scale))
+ * Generates: LDR dest, [base, index, LSL #scale]
+ */
+ST_FUNC void tcc_gen_machine_load_indexed_mop(MachineOperand dest, MachineOperand base, MachineOperand index,
+                                              MachineOperand scale, TccIrOp op)
+{
+  MachineCodegenContext ctx = {0};
+  (void)op;
+
+  const int dest_reg = dest.u.reg.r0;
+  const int btype = dest.btype;
+  const int is_unsigned = (int)dest.is_unsigned;
+
+  uint32_t excl = (1u << (uint32_t)dest_reg);
+  int base_reg = mach_ensure_in_reg(&ctx, &base, excl);
+  excl |= (1u << (uint32_t)base_reg);
+  int index_reg = mach_ensure_in_reg(&ctx, &index, excl);
+
+  int shift_amount = (scale.kind == MACH_OP_IMM) ? (int)scale.u.imm.val : 2;
+  if (shift_amount < 0 || shift_amount > 31)
+    shift_amount = 2;
+  thumb_shift shift = {.type = THUMB_SHIFT_LSL, .value = (uint32_t)shift_amount, .mode = THUMB_SHIFT_IMMEDIATE};
+
+  if (btype == IROP_BTYPE_INT8)
+  {
+    if (is_unsigned)
+      ot_check(th_ldrb_reg(dest_reg, base_reg, index_reg, shift, ENFORCE_ENCODING_NONE));
+    else
+      ot_check(th_ldrsb_reg(dest_reg, base_reg, index_reg, shift, ENFORCE_ENCODING_NONE));
+  }
+  else if (btype == IROP_BTYPE_INT16)
+  {
+    if (is_unsigned)
+      ot_check(th_ldrh_reg(dest_reg, base_reg, index_reg, shift, ENFORCE_ENCODING_NONE));
+    else
+      ot_check(th_ldrsh_reg(dest_reg, base_reg, index_reg, shift, ENFORCE_ENCODING_NONE));
+  }
+  else
+  {
+    ot_check(th_ldr_reg(dest_reg, base_reg, index_reg, shift, ENFORCE_ENCODING_NONE));
+  }
+  mach_release_all(&ctx);
+}
+
+/* Indexed store: *(base + (index << scale)) = value
+ * Generates: STR value, [base, index, LSL #scale]
+ */
+ST_FUNC void tcc_gen_machine_store_indexed_mop(MachineOperand base, MachineOperand index, MachineOperand scale,
+                                               MachineOperand value, TccIrOp op)
+{
+  MachineCodegenContext ctx = {0};
+  (void)op;
+
+  const int btype = value.btype;
+
+  int value_reg = mach_ensure_in_reg(&ctx, &value, 0);
+  uint32_t excl = (1u << (uint32_t)value_reg);
+  int base_reg = mach_ensure_in_reg(&ctx, &base, excl);
+  excl |= (1u << (uint32_t)base_reg);
+  int index_reg = mach_ensure_in_reg(&ctx, &index, excl);
+
+  int shift_amount = (scale.kind == MACH_OP_IMM) ? (int)scale.u.imm.val : 2;
+  if (shift_amount < 0 || shift_amount > 31)
+    shift_amount = 2;
+  thumb_shift shift = {.type = THUMB_SHIFT_LSL, .value = (uint32_t)shift_amount, .mode = THUMB_SHIFT_IMMEDIATE};
+
+  if (btype == IROP_BTYPE_INT8)
+    ot_check(th_strb_reg(value_reg, base_reg, index_reg, shift, ENFORCE_ENCODING_NONE));
+  else if (btype == IROP_BTYPE_INT16)
+    ot_check(th_strh_reg(value_reg, base_reg, index_reg, shift, ENFORCE_ENCODING_NONE));
+  else
+    ot_check(th_str_reg(value_reg, base_reg, index_reg, shift, ENFORCE_ENCODING_NONE));
+
+  mach_release_all(&ctx);
+}
+
+/* Post-increment load: dest = *ptr; ptr += offset
+ * Generates: LDR dest, [ptr], #offset  (puw=3: post-index, add, writeback)
+ */
+ST_FUNC void tcc_gen_machine_load_postinc_mop(MachineOperand dest, MachineOperand ptr, MachineOperand offset,
+                                              TccIrOp op)
+{
+  MachineCodegenContext ctx = {0};
+  (void)op;
+
+  const int dest_reg = dest.u.reg.r0;
+  const int btype = dest.btype;
+  const int is_unsigned = (int)dest.is_unsigned;
+
+  uint32_t excl = (1u << (uint32_t)dest_reg);
+  int ptr_reg = mach_ensure_in_reg(&ctx, &ptr, excl);
+
+  int offset_imm = (offset.kind == MACH_OP_IMM) ? (int)offset.u.imm.val : 4;
+  if (offset_imm < 0 || offset_imm > 255)
+  {
+    mach_release_all(&ctx);
+    tcc_error("compiler_error: post-increment offset %d out of range (0-255)", offset_imm);
+    return;
+  }
+
+  const uint32_t puw = 3; /* post-index (p=0), add (u=1), writeback (w=1) */
+
+  if (btype == IROP_BTYPE_INT8)
+  {
+    if (is_unsigned)
+      ot_check(th_ldrb_imm(dest_reg, ptr_reg, offset_imm, puw, ENFORCE_ENCODING_NONE));
+    else
+      ot_check(th_ldrsb_imm(dest_reg, ptr_reg, offset_imm, puw, ENFORCE_ENCODING_NONE));
+  }
+  else if (btype == IROP_BTYPE_INT16)
+  {
+    if (is_unsigned)
+      ot_check(th_ldrh_imm(dest_reg, ptr_reg, offset_imm, puw, ENFORCE_ENCODING_NONE));
+    else
+      ot_check(th_ldrsh_imm(dest_reg, ptr_reg, offset_imm, puw, ENFORCE_ENCODING_NONE));
+  }
+  else
+  {
+    ot_check(th_ldr_imm(dest_reg, ptr_reg, offset_imm, puw, ENFORCE_ENCODING_NONE));
+  }
+  mach_release_all(&ctx);
+}
+
+/* Post-increment store: *ptr = value; ptr += offset
+ * Generates: STR value, [ptr], #offset  (puw=3: post-index, add, writeback)
+ */
+ST_FUNC void tcc_gen_machine_store_postinc_mop(MachineOperand ptr, MachineOperand value, MachineOperand offset,
+                                               TccIrOp op)
+{
+  MachineCodegenContext ctx = {0};
+  (void)op;
+
+  const int btype = value.btype;
+
+  int value_reg = mach_ensure_in_reg(&ctx, &value, 0);
+  uint32_t excl = (1u << (uint32_t)value_reg);
+  int ptr_reg = mach_ensure_in_reg(&ctx, &ptr, excl);
+
+  int offset_imm = (offset.kind == MACH_OP_IMM) ? (int)offset.u.imm.val : 4;
+  if (offset_imm < 0 || offset_imm > 255)
+  {
+    mach_release_all(&ctx);
+    tcc_error("compiler_error: post-increment offset %d out of range (0-255)", offset_imm);
+    return;
+  }
+
+  const uint32_t puw = 3; /* post-index (p=0), add (u=1), writeback (w=1) */
+
+  if (btype == IROP_BTYPE_INT8)
+    ot_check(th_strb_imm(value_reg, ptr_reg, offset_imm, puw, ENFORCE_ENCODING_NONE));
+  else if (btype == IROP_BTYPE_INT16)
+    ot_check(th_strh_imm(value_reg, ptr_reg, offset_imm, puw, ENFORCE_ENCODING_NONE));
+  else
+    ot_check(th_str_imm(value_reg, ptr_reg, offset_imm, puw, ENFORCE_ENCODING_NONE));
+
+  mach_release_all(&ctx);
+}
+
 /* Get the soft float library function name for an FP operation */
 static const char *get_softfp_func_name(TccIrOp op, int is_double)
 {
@@ -5886,10 +6984,11 @@ ST_FUNC void tcc_gen_machine_store_op(IROperand dest, IROperand src, TccIrOp op)
   {
     tcc_error("compiler_error: NULL dest in tcc_gen_machine_store_op");
   }
-  TCC_MACH_DBG("[DBG-STORE] dest btype=%d pr0=%d pr1=%d is64=%d needs_pair=%d is_lval=%d is_local=%d | src btype=%d pr0=%d "
-               "pr1=%d is64=%d needs_pair=%d\n",
-               irop_get_btype(dest), dest.pr0_reg, dest.pr1_reg, irop_is_64bit(dest), irop_needs_pair(dest), dest.is_lval,
-               dest.is_local, irop_get_btype(src), src.pr0_reg, src.pr1_reg, irop_is_64bit(src), irop_needs_pair(src));
+  TCC_MACH_DBG(
+      "[DBG-STORE] dest btype=%d pr0=%d pr1=%d is64=%d needs_pair=%d is_lval=%d is_local=%d | src btype=%d pr0=%d "
+      "pr1=%d is64=%d needs_pair=%d\n",
+      irop_get_btype(dest), dest.pr0_reg, dest.pr1_reg, irop_is_64bit(dest), irop_needs_pair(dest), dest.is_lval,
+      dest.is_local, irop_get_btype(src), src.pr0_reg, src.pr1_reg, irop_is_64bit(src), irop_needs_pair(src));
   const char *ctx = "tcc_gen_machine_store_op";
   int src_reg;
   /* Check for 64-bit types or complex (register pairs) */
@@ -6793,7 +7892,10 @@ static void assign_op_64bit(IROperand dest, IROperand src)
     else
     {
       load_to_reg_ir(src_lo_alloc.reg, PREG_REG_NONE, src);
-      src_hi = PREG_REG_NONE;
+      /* Dest is 64-bit but source is 32-bit: zero-extend high word */
+      src_hi_alloc = get_scratch_reg_with_save(exclude | (1u << src_lo_alloc.reg));
+      ot_check(th_mov_imm(src_hi_alloc.reg, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+      src_hi = src_hi_alloc.reg;
     }
     src_lo = src_lo_alloc.reg;
   }
@@ -6952,6 +8054,13 @@ ST_FUNC void tcc_gen_machine_assign_op(IROperand dest, IROperand src, TccIrOp op
   if (dest.pr0_reg == src.pr0_reg && dest.pr0_spilled == src.pr0_spilled)
     return;
 
+  /* Dest is on the stack (spilled vreg): store src register to dest's stack location */
+  if (dest.pr0_reg == (int)PREG_REG_NONE || (dest.is_lval && dest.is_local))
+  {
+    store_ir(src.pr0_reg, dest);
+    return;
+  }
+
   /* Register to register move */
   ot_check(th_mov_reg(dest.pr0_reg, src.pr0_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
                       ENFORCE_ENCODING_NONE, false));
@@ -6966,6 +8075,22 @@ ST_FUNC void tcc_gen_machine_lea_op(IROperand dest, IROperand src, TccIrOp op)
   const char *ctx = "tcc_gen_machine_lea_op";
   int dest_reg = dest.pr0_reg;
   // int src_v = src1->r & VT_VALMASK;
+
+  /* Handle spilled destination: allocate scratch, emit LEA into it, then store back. */
+  if (dest_reg == (int)PREG_REG_NONE && (dest.is_local || dest.is_llocal || dest.pr0_spilled))
+  {
+    ScratchRegAlloc dest_alloc = get_scratch_reg_with_save(0);
+    IROperand scratch_dest = dest;
+    scratch_dest.pr0_reg = dest_alloc.reg;
+    scratch_dest.pr0_spilled = 0;
+    scratch_dest.is_lval = 0;
+    scratch_dest.is_local = 0;
+    scratch_dest.is_llocal = 0;
+    tcc_gen_machine_lea_op(scratch_dest, src, op);
+    store_ir(dest_alloc.reg, dest);
+    restore_scratch_reg(&dest_alloc);
+    return;
+  }
 
   /* Multi-hop chain tracking for captured variables */
   ScratchRegAlloc chain_scratch = {0};
@@ -8024,7 +9149,19 @@ static void handle_return_value(IROperand dest, int drop_value)
   if (drop_value)
     return;
 
-  if (dest.pr0_reg != PREG_REG_NONE && dest.pr0_reg != ARM_R0)
+  /* When dest is spilled (pr0_reg == PREG_REG_NONE), the return value in R0
+   * (and R1 for 64-bit) must be stored directly to the spill slot.
+   * Previously tcc_ir_materialize_dest_ir would allocate a scratch, and
+   * tcc_ir_storeback_materialized_dest_ir would write it back; with those
+   * removed, this handler must do the storeback itself. */
+  if (dest.pr0_reg == PREG_REG_NONE)
+  {
+    /* Dest is spilled or has no register — store R0 to the stack slot */
+    store_ir(ARM_R0, dest);
+    return;
+  }
+
+  if (dest.pr0_reg != ARM_R0)
   {
     ot_check(th_mov_reg(dest.pr0_reg, ARM_R0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE,
                         false));
@@ -8179,7 +9316,6 @@ ST_FUNC void tcc_gen_machine_func_call_op(IROperand func_target, IROperand call_
 
   /* === Emit call === */
   gcall_or_jump_ir(0, func_target);
-
   /* Restore scratch register exclusion */
   scratch_global_exclude = saved_scratch_exclude;
 
@@ -8261,13 +9397,34 @@ ST_FUNC void tcc_gen_machine_conditional_jump_op(IROperand src, TccIrOp op, IROp
 
 ST_FUNC void tcc_gen_machine_setif_op(IROperand dest, IROperand src, TccIrOp op)
 {
-  if (dest.pr0_reg >= 15)
-    tcc_error("compiler_error: setif_op destination register is invalid (%d)", dest.pr0_reg);
+  /* Allocate destination register (scratch if spilled/no register) */
+  int dest_reg = dest.pr0_reg;
+  ScratchRegAlloc dest_alloc = {0};
+  int need_dest_storeback = 0;
+  if (dest_reg == PREG_REG_NONE)
+  {
+    dest_alloc = get_scratch_reg_with_save(0);
+    dest_reg = dest_alloc.reg;
+    need_dest_storeback = 1;
+  }
+  if (dest_reg >= 15)
+    tcc_error("compiler_error: setif_op destination register is invalid (%d)", dest_reg);
+
   const int cond = mapcc(src.u.imm32);
 
-  ot_check(th_mov_imm(dest.pr0_reg, 0, FLAGS_BEHAVIOUR_BLOCK, ENFORCE_ENCODING_NONE));
+  ot_check(th_mov_imm(dest_reg, 0, FLAGS_BEHAVIOUR_BLOCK, ENFORCE_ENCODING_NONE));
   ot_check(th_it(cond, 0x8)); /* IT <cond> (single instruction) */
-  ot_check(th_mov_imm(dest.pr0_reg, 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+  ot_check(th_mov_imm(dest_reg, 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+
+  if (need_dest_storeback)
+  {
+    int frame_offset = irop_get_stack_offset(dest);
+    if (dest.is_param)
+      tcc_machine_store_param_slot(dest_reg, frame_offset);
+    else
+      tcc_machine_store_spill_slot(dest_reg, frame_offset);
+  }
+  restore_scratch_reg(&dest_alloc);
 }
 
 /* Set static chain register: MOV R10, R7 (FP) */
@@ -8320,33 +9477,57 @@ ST_FUNC void tcc_gen_machine_init_chain_slot(IROperand src1)
 
 ST_FUNC void tcc_gen_machine_bool_op(IROperand dest, IROperand src1, IROperand src2, TccIrOp op)
 {
-  /* Optimized boolean OR/AND operations:
-   * For BOOL_OR (x || y):
-   *   ORRS Rd, Rsrc1, Rsrc2   ; Rd = src1 | src2, sets Z flag
-   *   ITE ne
-   *   MOVNE Rd, #1            ; if result non-zero, set to 1
-   *   MOVEQ Rd, #0            ; if result zero, set to 0
-   *
-   * For BOOL_AND (x && y):
-   *   CMP Rsrc1, #0           ; check if src1 is zero
-   *   IT eq
-   *   CMPEQ Rsrc2, #0         ; if src1 == 0, force EQ (compare 0 with anything)
-   *   Actually... use CBZ or simpler approach:
-   *
-   *   Better for AND:
-   *   SUBS temp, src1, #0    ; temp = src1, sets Z if src1==0, preserves NE if src1!=0
-   *   IT ne
-   *   SUBSNE temp, src2, #0  ; if src1!=0, check src2 - sets NE if src2!=0
-   *   ITE ne
-   *   MOVNE dest, #1
-   *   MOVEQ dest, #0
+  /* Optimized boolean OR/AND operations.
+   * Handles spilled operands by allocating scratch registers and using
+   * load_to_reg_ir to load from spill slots / memory as needed.
    */
-  const int dest_reg = dest.pr0_reg;
-  const int src1_reg = src1.pr0_reg;
-  const int src2_reg = src2.pr0_reg;
 
+  /* Allocate destination register (scratch if spilled/no register) */
+  int dest_reg = dest.pr0_reg;
+  ScratchRegAlloc dest_alloc = {0};
+  int need_dest_storeback = 0;
+  if (dest_reg == PREG_REG_NONE)
+  {
+    dest_alloc = get_scratch_reg_with_save(0);
+    dest_reg = dest_alloc.reg;
+    need_dest_storeback = 1;
+  }
   if (dest_reg >= 15)
     tcc_error("compiler_error: bool_op destination register is invalid (%d)", dest_reg);
+
+  uint32_t excl = (uint32_t)(1u << dest_reg);
+
+  /* Ensure src1 is in a register */
+  int src1_reg = src1.pr0_reg;
+  ScratchRegAlloc src1_alloc = {0};
+  if (src1_reg == PREG_REG_NONE || src1.is_lval || thumb_irop_needs_value_load(src1) ||
+      thumb_irop_has_immediate_value(src1))
+  {
+    /* Pre-exclude src2's register if it is already materialized */
+    uint32_t src2_excl = excl;
+    if (src2.pr0_reg != (int)PREG_REG_NONE && !src2.is_lval && !thumb_irop_needs_value_load(src2) &&
+        thumb_is_hw_reg(src2.pr0_reg))
+      src2_excl |= (1u << (uint32_t)src2.pr0_reg);
+    src1_alloc = get_scratch_reg_with_save(src2_excl);
+    src1_reg = src1_alloc.reg;
+    excl |= (1u << (uint32_t)src1_reg);
+    load_to_reg_ir(src1_reg, PREG_NONE, src1);
+  }
+  else
+  {
+    excl |= (1u << (uint32_t)src1_reg);
+  }
+
+  /* Ensure src2 is in a register */
+  int src2_reg = src2.pr0_reg;
+  ScratchRegAlloc src2_alloc = {0};
+  if (src2_reg == PREG_REG_NONE || src2.is_lval || thumb_irop_needs_value_load(src2) ||
+      thumb_irop_has_immediate_value(src2))
+  {
+    src2_alloc = get_scratch_reg_with_save(excl);
+    src2_reg = src2_alloc.reg;
+    load_to_reg_ir(src2_reg, PREG_NONE, src2);
+  }
 
   if (op == TCCIR_OP_BOOL_OR)
   {
@@ -8380,6 +9561,20 @@ ST_FUNC void tcc_gen_machine_bool_op(IROperand dest, IROperand src1, IROperand s
     ot_check(th_it(0x1, 0x8)); /* IT NE */
     ot_check(th_mov_imm(dest_reg, 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
   }
+
+  /* Store result back to spill slot if dest was not pre-allocated */
+  if (need_dest_storeback)
+  {
+    int frame_offset = irop_get_stack_offset(dest);
+    if (dest.is_param)
+      tcc_machine_store_param_slot(dest_reg, frame_offset);
+    else
+      tcc_machine_store_spill_slot(dest_reg, frame_offset);
+  }
+
+  restore_scratch_reg(&src2_alloc);
+  restore_scratch_reg(&src1_alloc);
+  restore_scratch_reg(&dest_alloc);
 }
 
 /* Called at end of each IR instruction to clean up scratch register state.
@@ -8632,6 +9827,55 @@ ST_FUNC void tcc_gen_machine_func_parameter_op(IROperand src1, IROperand src2, T
    * raw low 32 bits to preserve the bit-packing contract.
    */
   const uint32_t encoded = (uint32_t)irop_get_imm64_ex(tcc_state->ir, src2);
+  int call_id = TCCIR_DECODE_CALL_ID(encoded);
+  int param_index = TCCIR_DECODE_PARAM_IDX(encoded);
+
+  /* Find or create call site for this call_id */
+  ThumbGenCallSite *call_site = thumb_get_or_create_call_site(call_id);
+  if (call_site == NULL)
+  {
+    tcc_error("compiler_error: failed to allocate call site for call_id=%d", call_id);
+    return;
+  }
+
+  /* FUNCPARAMVOID is a marker for a 0-argument call.
+   * Ensure the call site exists, but do not create a fake argument entry. */
+  if (op == TCCIR_OP_FUNCPARAMVOID)
+    return;
+
+  /* During dry-run, don't modify the argument list - it causes memory leaks
+   * when we restore the call sites after dry-run. The argument list is not
+   * needed for scratch register tracking anyway. */
+  if (dry_run_state.active)
+    return;
+
+  /* Expand argument list if needed */
+  if (param_index >= call_site->function_argument_count)
+  {
+    int new_count = param_index + 1;
+    call_site->function_argument_list = (int *)tcc_realloc(call_site->function_argument_list, new_count * sizeof(int));
+    /* Initialize new slots */
+    for (int i = call_site->function_argument_count; i < new_count; i++)
+    {
+      call_site->function_argument_list[i] = -1;
+    }
+    call_site->function_argument_count = new_count;
+  }
+
+  /* Store parameter information - for now just mark as present */
+  call_site->function_argument_list[param_index] = 1; /* Mark parameter as present */
+}
+
+/* tcc_gen_machine_func_parameter_mop: MachineOperand-based entry point for
+ * FUNCPARAMVAL / FUNCPARAMVOID.  src2_enc must be MACH_OP_IMM holding the
+ * packed call_id / param_idx value (same encoding as irop_get_imm64_ex).
+ * src1 is the value being passed (unused here — handled by the call-site ABI).
+ */
+ST_FUNC void tcc_gen_machine_func_parameter_mop(MachineOperand src1, MachineOperand src2_enc, TccIrOp op)
+{
+  (void)src1;
+
+  const uint32_t encoded = (uint32_t)src2_enc.u.imm.val;
   int call_id = TCCIR_DECODE_CALL_ID(encoded);
   int param_index = TCCIR_DECODE_PARAM_IDX(encoded);
 

@@ -45,22 +45,6 @@ const struct TCCStackSlot *tcc_ir_stack_slot_by_index(struct TCCIRState *ir, int
 int tcc_ir_stack_slot_count(struct TCCIRState *ir);
 
 /* ============================================================================
- * Materialization Queries
- * ============================================================================ */
-
-/* Get stack slot for materializing SValue */
-const struct TCCStackSlot *tcc_ir_mat_slot_sv(const struct TCCIRState *ir, const struct SValue *sv);
-
-/* Get frame offset for materializing SValue */
-int tcc_ir_mat_offset_sv(const struct TCCIRState *ir, const struct SValue *sv);
-
-/* Get stack slot for materializing IROperand */
-const struct TCCStackSlot *tcc_ir_mat_slot_op(const struct TCCIRState *ir, const struct IROperand *op);
-
-/* Get frame offset for materializing IROperand */
-int tcc_ir_mat_offset_op(const struct TCCIRState *ir, const struct IROperand *op);
-
-/* ============================================================================
  * Physical Register Assignment
  * ============================================================================ */
 
