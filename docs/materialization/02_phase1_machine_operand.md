@@ -1,6 +1,6 @@
 # Phase 1: New Operand Representation — `MachineOperand`
 
-> **Status: 🔄 Partial** — `MachineOperand` type and `machine_op_from_ir()` fully implemented. Used on the MOP dispatch path for data-processing ops (Phase 2). `fill_registers_ir` still runs as prerequisite before `machine_op_from_ir` is called. Full removal of `fill_registers_ir` is blocked pending replication of its semantic transforms (see §Remaining Work).
+> **Status: ✅ Done** — `MachineOperand` type and `machine_op_from_ir()` fully implemented. Used exclusively on all dispatch paths (Phases 2–5q complete). `machine_op_from_ir` takes `const IROperand *op` and reads the interval table directly — no `fill_registers_ir` dependency. `fill_registers_ir` fully deleted (Phase 5m). `pr0_reg`/`pr1_reg`/`pr0_spilled`/`pr1_spilled` removed from `IROperand` (Phases 5l + 5p). All legacy `_ir` wrapper functions deleted (Phase 5q). `IROperand` is now 9 bytes packed.
 
 ## Goal
 
@@ -8,16 +8,14 @@ Replace the overloaded `IROperand` flags with a clear machine-level operand type
 
 ## Current State
 
-`IROperand` (defined in `ir/operand.h`, 10 bytes packed) encodes materialization state via a fragile combination of bit flags:
+`IROperand` (defined in `tccir_operand.h`, 9 bytes packed) encodes operand state. After Phases 5l–5q, the codegen-time fields (`pr0_reg`, `pr1_reg`, `pr0_spilled`, `pr1_spilled`) have been removed. Remaining fields:
 
 | Flag | Meaning | Set By |
 |---|---|---|
-| `pr0_reg` / `pr1_reg` | Physical register assignment | `tcc_ir_fill_registers_ir()` |
-| `pr0_spilled` / `pr1_spilled` | Value is spilled to stack | `tcc_ir_fill_registers_ir()` |
-| `is_local` | Stack-relative (frame offset in payload) | `tcc_ir_fill_registers_ir()` |
-| `is_llocal` | Double indirection (spilled pointer) | `tcc_ir_fill_registers_ir()` |
-| `is_lval` | Needs load through address | `tcc_ir_fill_registers_ir()` |
-| `is_param` | Stack-passed function parameter | `tcc_ir_fill_registers_ir()` |
+| `is_local` | Stack-relative (frame offset in payload) | IR construction (`tccgen.c`) |
+| `is_llocal` | Double indirection (spilled pointer) | IR construction (`tccgen.c`) |
+| `is_lval` | Needs load through address | IR construction (`tccgen.c`) |
+| `is_param` | Stack-passed function parameter | IR construction (`tccgen.c`) |
 | `is_const` | Immediate constant | IR construction |
 | `tag` | IROP_TAG_VREG/IMM32/STACKOFF/etc. | IR construction |
 
@@ -187,7 +185,7 @@ The flags encode *allocation state* (which register, whether spilled) mixed with
 
 ### Why a separate struct instead of extending IROperand?
 
-`IROperand` is packed to 10 bytes for cache efficiency during IR passes. `MachineOperand` is only created during codegen (one instruction at a time) and can afford to be larger and clearer.
+`IROperand` is packed to 9 bytes for cache efficiency during IR passes. `MachineOperand` is only created during codegen (one instruction at a time) and can afford to be larger and clearer.
 
 ### Why not just pass allocation metadata separately?
 
@@ -200,25 +198,25 @@ The whole point is to avoid the "test 5 flags in combination" pattern. A single 
 - [x] `ir/machine_op.c` added to build (included via `libtcc.c`)
 - [x] `make cross` compiles without warnings
 - [x] `make test -j16` passes (no behavior change — MOP path parallel to old path)
-- [ ] `fill_registers_ir` removed from MOP path (blocked — see Remaining Work below)
+- [x] `fill_registers_ir` removed from MOP path — ✅ done (Phase 5m: `fill_registers_ir` fully deleted)
 
-## Remaining Work
+## Historical Notes: `fill_registers_ir` Removal
 
-### Why `fill_registers_ir` still runs before `machine_op_from_ir`
+> **All items below are resolved.** Kept for historical reference on the design decisions made during the refactor.
 
-`fill_registers_ir` does **more** than just copy `allocation.r0` into `pr0_reg`. It also:
+### Why `fill_registers_ir` was problematic
 
-1. **Transforms `is_lval`/`is_local`/`is_param` flags** — register-resident params get `is_lval` cleared; pointer-deref operands keep it.
-2. **Applies VLA stack-offset deltas** — when `is_local && is_llocal && IROP_TAG_STACKOFF`, the payload offset is adjusted by `old_stackoff - interval->original_offset`.
-3. **Handles struct types** — stores `interval->allocation.offset` into `op->u.s.aux_data` instead of `op->u.imm32`.
-4. **Stack-passed parameter detection** — sets tag to `IROP_TAG_STACKOFF` + `is_param=1` + `is_local=1` for params where `incoming_reg0 < 0 && allocation.r0 == PREG_NONE`.
+`fill_registers_ir` did **more** than just copy `allocation.r0` into `pr0_reg`. It also:
 
-`machine_op_from_ir` currently reads the **already-filled** IROperand (i.e., `fill_registers_ir` has already run). The "case 0 direct VREG lookup" added to `machine_op_from_ir` is **inert** in the current flow — by the time `machine_op_from_ir` is called, `fill_registers_ir` has already changed the tag from `IROP_TAG_VREG` to either `IROP_TAG_STACKOFF` (spilled) or set `pr0_reg != PREG_REG_NONE` (in-register), so case 0 is never triggered.
+1. **Transformed `is_lval`/`is_local`/`is_param` flags** — register-resident params got `is_lval` cleared; pointer-deref operands kept it.
+2. **Applied VLA stack-offset deltas** — when `is_local && is_llocal && IROP_TAG_STACKOFF`, the payload offset was adjusted by `old_stackoff - interval->original_offset`.
+3. **Handled struct types** — stored `interval->allocation.offset` into `op->u.s.aux_data` instead of `op->u.imm32`.
+4. **Stack-passed parameter detection** — set tag to `IROP_TAG_STACKOFF` + `is_param=1` + `is_local=1` for params where `incoming_reg0 < 0 && allocation.r0 == PREG_NONE`.
 
-### Path to removing `fill_registers_ir` from MOP path
+### Key discovery: non-idempotent fill
 
-Option A (correct but complex): Replicate all four transforms above inside `machine_op_from_ir` case 0, then skip `fill_registers_ir` for MOP ops. Requires careful handling of struct types, VLA delta, and param area detection edge cases.
+`fill_registers_ir` was **NOT** idempotent. For `IROP_TAG_STACKOFF` operands it applied a delta `old_stackoff - interval->original_offset` to `op->u.imm32`. Calling fill twice doubled this delta → 30 test failures. This was discovered during Phase 5a (failed attempt to internalize fill inside `machine_op_from_ir`).
 
-Option B (simpler): Keep `fill_registers_ir` running unconditionally. `machine_op_from_ir` builds `MachineOperand` from the already-filled IROperand. This works correctly and removes the need to replicate the semantic transforms. The benefit of this approach is that `fill_registers_ir` becomes the "conversion kernel" and `machine_op_from_ir` becomes a clean structuring step on top. Full deletion of `fill_registers_ir` is deferred to when ALL instruction paths use MOP (end of Phase 2), at which point the entire fill step disappears.
+### Resolution
 
-**Current approach:** Option B. `fill_registers_ir` is called unconditionally; `machine_op_from_ir` converts the result into a `MachineOperand`. The case 0 direct-lookup code is dead and should be removed in the next cleanup commit.
+Phase 5b removed dispatch-level fills, Phase 5f rewrote `machine_op_from_ir` to read the interval table directly (taking `const IROperand *op` — no mutation), and Phase 5m deleted `fill_registers_ir` entirely. All transforms are now handled inside `machine_op_from_ir` via direct interval-table reads.

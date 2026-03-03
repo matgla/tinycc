@@ -1270,8 +1270,8 @@ int tcc_ir_opt_vrp(TCCIRState *ir)
           is_merge[target / 8] |= (1 << (target % 8));
       }
     }
-    if (i + 1 < n && q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_NOP &&
-        q->op != TCCIR_OP_RETURNVALUE && q->op != TCCIR_OP_RETURNVOID)
+    if (i + 1 < n && q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_NOP && q->op != TCCIR_OP_RETURNVALUE &&
+        q->op != TCCIR_OP_RETURNVOID)
     {
       pred_count[i + 1]++;
     }
@@ -1320,8 +1320,8 @@ int tcc_ir_opt_vrp(TCCIRState *ir)
         r->max_val = pending_max;
 #ifdef CONFIG_TCC_DEBUG
         if (tcc_state->dump_ir)
-          printf("VRP: Apply constraint at i=%d: slot=%d range=[%lld,%lld]\n",
-                 i, pending_slot, (long long)pending_min, (long long)pending_max);
+          printf("VRP: Apply constraint at i=%d: slot=%d range=[%lld,%lld]\n", i, pending_slot, (long long)pending_min,
+                 (long long)pending_max);
 #endif
       }
       pending_apply_at = -1;
@@ -1342,17 +1342,13 @@ int tcc_ir_opt_vrp(TCCIRState *ir)
       int32_t dest_vr = irop_get_vreg(dest);
       if (src1_vr >= 0 && dest_vr >= 0)
       {
-        int src_slot = vrp_get_slot(TCCIR_DECODE_VREG_TYPE(src1_vr),
-                                    TCCIR_DECODE_VREG_POSITION(src1_vr));
-        int dst_slot = vrp_get_slot(TCCIR_DECODE_VREG_TYPE(dest_vr),
-                                    TCCIR_DECODE_VREG_POSITION(dest_vr));
+        int src_slot = vrp_get_slot(TCCIR_DECODE_VREG_TYPE(src1_vr), TCCIR_DECODE_VREG_POSITION(src1_vr));
+        int dst_slot = vrp_get_slot(TCCIR_DECODE_VREG_TYPE(dest_vr), TCCIR_DECODE_VREG_POSITION(dest_vr));
         if (src_slot >= 0 && ranges[src_slot].valid && dst_slot >= 0)
         {
           int64_t imm = irop_get_imm64_ex(ir, src2);
-          int64_t new_min = (q->op == TCCIR_OP_ADD) ? ranges[src_slot].min_val + imm
-                                                     : ranges[src_slot].min_val - imm;
-          int64_t new_max = (q->op == TCCIR_OP_ADD) ? ranges[src_slot].max_val + imm
-                                                     : ranges[src_slot].max_val - imm;
+          int64_t new_min = (q->op == TCCIR_OP_ADD) ? ranges[src_slot].min_val + imm : ranges[src_slot].min_val - imm;
+          int64_t new_max = (q->op == TCCIR_OP_ADD) ? ranges[src_slot].max_val + imm : ranges[src_slot].max_val - imm;
           /* Clamp to int32 range to stay within 32-bit value semantics */
           if (new_min < (int64_t)INT32_MIN)
             new_min = INT32_MIN;
@@ -1363,9 +1359,9 @@ int tcc_ir_opt_vrp(TCCIRState *ir)
           ranges[dst_slot].max_val = new_max;
 #ifdef CONFIG_TCC_DEBUG
           if (tcc_state->dump_ir)
-            printf("VRP: ARITH at i=%d: src_slot=%d [%lld,%lld] -> dst_slot=%d [%lld,%lld]\n",
-                   i, src_slot, (long long)ranges[src_slot].min_val, (long long)ranges[src_slot].max_val,
-                   dst_slot, (long long)new_min, (long long)new_max);
+            printf("VRP: ARITH at i=%d: src_slot=%d [%lld,%lld] -> dst_slot=%d [%lld,%lld]\n", i, src_slot,
+                   (long long)ranges[src_slot].min_val, (long long)ranges[src_slot].max_val, dst_slot,
+                   (long long)new_min, (long long)new_max);
 #endif
         }
         else if (dst_slot >= 0)
@@ -1385,8 +1381,7 @@ int tcc_ir_opt_vrp(TCCIRState *ir)
         int32_t src1_vr = irop_get_vreg(src1);
         if (src1_vr >= 0)
         {
-          int src_slot = vrp_get_slot(TCCIR_DECODE_VREG_TYPE(src1_vr),
-                                      TCCIR_DECODE_VREG_POSITION(src1_vr));
+          int src_slot = vrp_get_slot(TCCIR_DECODE_VREG_TYPE(src1_vr), TCCIR_DECODE_VREG_POSITION(src1_vr));
           int64_t cmp_val = irop_get_imm64_ex(ir, src2);
           IROperand cond_op = tcc_ir_op_get_src1(ir, jump_q);
           int tok = (int)irop_get_imm64_ex(ir, cond_op);
@@ -1394,9 +1389,8 @@ int tcc_ir_opt_vrp(TCCIRState *ir)
 
 #ifdef CONFIG_TCC_DEBUG
           if (tcc_state->dump_ir)
-            printf("VRP: CMP at i=%d: src_slot=%d valid=%d cmp_val=%lld tok=0x%x\n",
-                   i, src_slot, (src_slot >= 0 ? ranges[src_slot].valid : -1),
-                   (long long)cmp_val, tok);
+            printf("VRP: CMP at i=%d: src_slot=%d valid=%d cmp_val=%lld tok=0x%x\n", i, src_slot,
+                   (src_slot >= 0 ? ranges[src_slot].valid : -1), (long long)cmp_val, tok);
 #endif
 
           /* Try to fold using known range */
@@ -1406,11 +1400,9 @@ int tcc_ir_opt_vrp(TCCIRState *ir)
             int64_t rmax = ranges[src_slot].max_val;
             int fold_result = -1;
             /* Monotone signed conditions: checking endpoints suffices */
-            int is_monotone_signed = (tok == 0x9c || tok == 0x9d || tok == 0x9e ||
-                                      tok == 0x9f);
+            int is_monotone_signed = (tok == 0x9c || tok == 0x9d || tok == 0x9e || tok == 0x9f);
             /* TOK_ULT=0x92, TOK_UGE=0x93, TOK_ULE=0x96, TOK_UGT=0x97 per tcc.h */
-            int is_unsigned_cond = (tok == 0x92 || tok == 0x93 ||
-                                     tok == 0x96 || tok == 0x97);
+            int is_unsigned_cond = (tok == 0x92 || tok == 0x93 || tok == 0x96 || tok == 0x97);
             /* EQ/NE are NOT monotone — special handling below */
             int is_eq_ne = (tok == 0x94 || tok == 0x95);
 
@@ -1457,9 +1449,8 @@ int tcc_ir_opt_vrp(TCCIRState *ir)
               changes++;
 #ifdef CONFIG_TCC_DEBUG
               if (tcc_state->dump_ir)
-                printf("VRP: CMP range[%lld,%lld],#%lld tok=0x%x -> always taken, JUMP to %d\n",
-                       (long long)rmin, (long long)rmax, (long long)cmp_val, tok,
-                       (int)jmp_dest.u.imm32);
+                printf("VRP: CMP range[%lld,%lld],#%lld tok=0x%x -> always taken, JUMP to %d\n", (long long)rmin,
+                       (long long)rmax, (long long)cmp_val, tok, (int)jmp_dest.u.imm32);
 #endif
               continue;
             }
@@ -1471,8 +1462,8 @@ int tcc_ir_opt_vrp(TCCIRState *ir)
               changes++;
 #ifdef CONFIG_TCC_DEBUG
               if (tcc_state->dump_ir)
-                printf("VRP: CMP range[%lld,%lld],#%lld tok=0x%x -> never taken, NOP\n",
-                       (long long)rmin, (long long)rmax, (long long)cmp_val, tok);
+                printf("VRP: CMP range[%lld,%lld],#%lld tok=0x%x -> never taken, NOP\n", (long long)rmin,
+                       (long long)rmax, (long long)cmp_val, tok);
 #endif
               continue;
             }
@@ -1538,8 +1529,7 @@ int tcc_ir_opt_vrp(TCCIRState *ir)
     int32_t dest_vr = irop_get_vreg(dest);
     if (dest_vr >= 0 && irop_config[q->op].has_dest)
     {
-      int dst_slot = vrp_get_slot(TCCIR_DECODE_VREG_TYPE(dest_vr),
-                                   TCCIR_DECODE_VREG_POSITION(dest_vr));
+      int dst_slot = vrp_get_slot(TCCIR_DECODE_VREG_TYPE(dest_vr), TCCIR_DECODE_VREG_POSITION(dest_vr));
       if (dst_slot >= 0)
         ranges[dst_slot].valid = 0;
     }
@@ -1549,8 +1539,7 @@ int tcc_ir_opt_vrp(TCCIRState *ir)
      * only reachable via its own predecessors, not from here. Without this,
      * constraints from one path leak to dead code or to instructions reached
      * from a different branch. */
-    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_RETURNVALUE ||
-        q->op == TCCIR_OP_RETURNVOID)
+    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_RETURNVALUE || q->op == TCCIR_OP_RETURNVOID)
     {
       memset(ranges, 0, sizeof(ranges));
       pending_apply_at = -1;
@@ -4808,11 +4797,10 @@ int tcc_ir_opt_indexed_memory_fusion(TCCIRState *ir)
       ir->iroperand_pool[new_base_idx + 0] = base_op_clean;  /* base address */
       ir->iroperand_pool[new_base_idx + 1] = orig_src1;      /* value to store (original src1) */
       ir->iroperand_pool[new_base_idx + 2] = index_op_clean; /* index register */
-      /* scale as immediate operand */
-      IROperand scale_op = IROP_NONE;
-      scale_op.is_const = 1;
-      scale_op.u.imm32 = shift_amount;
-      ir->iroperand_pool[new_base_idx + 3] = scale_op;
+      /* scale as immediate operand — must use irop_make_imm32 so the tag is
+       * IROP_TAG_IMM32; an IROP_NONE-based operand has vr=-1 which causes
+       * machine_op_from_ir to return MACH_OP_NONE, losing the scale value. */
+      ir->iroperand_pool[new_base_idx + 3] = irop_make_imm32(0, shift_amount, IROP_BTYPE_INT32);
     }
     else
     {
@@ -4820,11 +4808,7 @@ int tcc_ir_opt_indexed_memory_fusion(TCCIRState *ir)
       ir->iroperand_pool[new_base_idx + 0] = orig_dest;      /* dest (original) */
       ir->iroperand_pool[new_base_idx + 1] = base_op_clean;  /* base address */
       ir->iroperand_pool[new_base_idx + 2] = index_op_clean; /* index register */
-      /* scale as immediate operand */
-      IROperand scale_op = IROP_NONE;
-      scale_op.is_const = 1;
-      scale_op.u.imm32 = shift_amount;
-      ir->iroperand_pool[new_base_idx + 3] = scale_op;
+      ir->iroperand_pool[new_base_idx + 3] = irop_make_imm32(0, shift_amount, IROP_BTYPE_INT32);
     }
 
     /* Mark SHL and ADD as NOP */

@@ -96,7 +96,7 @@ Internal IR modules — included via `ir/ir.h`, not part of public API. Public I
 | `ir/core.c` | IR construction and manipulation |
 | `ir/live.c` | Liveness analysis for register allocation |
 | `ir/mat.c` | Value materialization (reg/memory allocation) |
-| `ir/codegen.c` | Codegen helpers (IR → machine instruction mapping) |
+| `ir/codegen.c` | Central dispatch: unified two-pass loop (dry-run + real-run) routing IR ops to backend `_mop` handlers |
 | `ir/vreg.c` | Virtual register management |
 | `ir/stack.c` | Stack frame layout |
 

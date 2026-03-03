@@ -31,9 +31,9 @@
 #include "tcc.h"
 #include "tccir.h"
 
-/* Forward declarations for IR-based load/store from arm-thumb-gen.c */
-void load_to_dest_ir(IROperand dest, IROperand src);
-void store_ir(int r, IROperand sv);
+/* Forward declarations for MOP-based load/store from arm-thumb-gen.c */
+void tcc_gen_mach_load_to_reg(int dest_reg, const MachineOperand *op);
+void tcc_gen_mach_store_from_reg(int src_reg, const MachineOperand *op);
 
 enum
 {
@@ -304,25 +304,15 @@ ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands, int nb_outputs,
           src.is_llocal = 0;
           src.is_lval = 1;
           src.btype = IROP_BTYPE_INT32; /* pointers are 32-bit on ARMv8-M */
-          IROperand dest = irop_make_none();
-          dest.pr0_reg = op->reg;
-          dest.pr0_spilled = 0;
-          dest.pr1_reg = PREG_REG_NONE;
-          dest.pr1_spilled = 0;
-          dest.btype = src.btype;
-          load_to_dest_ir(dest, src);
+          MachineOperand mop = machine_op_from_ir(tcc_state->ir, &src);
+          tcc_gen_mach_load_to_reg(op->reg, &mop);
         }
         else if (i >= nb_outputs || op->is_rw)
         { // not write-only
           /* load value in register */
           IROperand src = svalue_to_iroperand(tcc_state->ir, op->vt);
-          IROperand dest = irop_make_none();
-          dest.pr0_reg = op->reg;
-          dest.pr0_spilled = 0;
-          dest.pr1_reg = PREG_REG_NONE;
-          dest.pr1_spilled = 0;
-          dest.btype = src.btype;
-          load_to_dest_ir(dest, src);
+          MachineOperand mop = machine_op_from_ir(tcc_state->ir, &src);
+          tcc_gen_mach_load_to_reg(op->reg, &mop);
           if (op->is_llong)
             tcc_error("long long not implemented");
         }
@@ -348,25 +338,26 @@ ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands, int nb_outputs,
             IROperand addr = ir_op;
             addr.is_llocal = 0;
             addr.btype = IROP_BTYPE_INT32;
-            IROperand dest = irop_make_none();
-            dest.pr0_reg = out_reg;
-            dest.pr0_spilled = 0;
-            dest.btype = addr.btype;
-            load_to_dest_ir(dest, addr);
+            MachineOperand addr_mop = machine_op_from_ir(tcc_state->ir, &addr);
+            tcc_gen_mach_load_to_reg(out_reg, &addr_mop);
 
             /* Store op->reg through the pointer now in out_reg */
-            IROperand store_dest = irop_make_vreg(irop_get_vreg(ir_op), irop_get_btype(ir_op));
-            store_dest.is_lval = ir_op.is_lval;
-            store_dest.is_unsigned = ir_op.is_unsigned;
-            store_dest.pr0_reg = out_reg;
-            store_dest.pr0_spilled = 0;
-            store_ir(op->reg, store_dest);
+            MachineOperand store_mop;
+            memset(&store_mop, 0, sizeof(store_mop));
+            store_mop.kind = MACH_OP_REG;
+            store_mop.btype = irop_get_btype(ir_op);
+            store_mop.is_unsigned = ir_op.is_unsigned;
+            store_mop.u.reg.r0 = out_reg;
+            store_mop.u.reg.r1 = -1;
+            store_mop.needs_deref = true;
+            tcc_gen_mach_store_from_reg(op->reg, &store_mop);
           }
         }
         else
         {
           IROperand ir_op = svalue_to_iroperand(tcc_state->ir, op->vt);
-          store_ir(op->reg, ir_op);
+          MachineOperand mop = machine_op_from_ir(tcc_state->ir, &ir_op);
+          tcc_gen_mach_store_from_reg(op->reg, &mop);
           if (op->is_llong)
             tcc_error("long long not implemented");
         }

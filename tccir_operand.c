@@ -295,10 +295,6 @@ int irop_btype_to_vt_btype(int irop_btype)
  */
 static inline void irop_copy_svalue_info(IROperand *op, const SValue *sv)
 {
-  op->pr0_reg = sv->pr0_reg;
-  op->pr0_spilled = sv->pr0_spilled;
-  op->pr1_reg = sv->pr1_reg;
-  op->pr1_spilled = sv->pr1_spilled;
   op->is_unsigned = (sv->type.t & VT_UNSIGNED) ? 1 : 0;
   /* _Bool is always unsigned (0 or 1) */
   if ((sv->type.t & VT_BTYPE) == VT_BOOL)
@@ -325,7 +321,7 @@ IROperand svalue_to_iroperand(TCCIRState *ir, const SValue *sv)
   int has_sym = (sv->r & VT_SYM) ? 1 : 0;
   int vt_btype = sv->type.t & VT_BTYPE;
   int irop_bt = vt_btype_to_irop_btype(vt_btype);
-  int is_complex = (sv->type.t & VT_COMPLEX) ? 1 : 0;  /* DONE: Phase 2 */
+  int is_complex = (sv->type.t & VT_COMPLEX) ? 1 : 0; /* DONE: Phase 2 */
 
   IROperand result;
 
@@ -343,7 +339,12 @@ IROperand svalue_to_iroperand(TCCIRState *ir, const SValue *sv)
     irop_copy_svalue_info(&result, sv);
     /* Capture physical register from VT_VALMASK if it's a register number */
     if (val_kind < VT_CONST && val_kind < 32) /* Physical register in VT_VALMASK */
-      result.pr0_reg = val_kind;
+    {
+      /* Do NOT set u.imm32 here — u.imm32 is used by load_to_dest_ir for
+       * sub-component access (complex imaginary part).  Only vreg=-1 (Case 1b)
+       * needs the IROP_VREG_PHYS encoding in u.imm32.
+       * For vreg >= 0, the physical register comes from the interval table. */
+    }
     goto done;
   }
 
@@ -358,7 +359,7 @@ IROperand svalue_to_iroperand(TCCIRState *ir, const SValue *sv)
     result.is_lval = is_reg_param ? 0 : is_lval;
     result.is_param = (sv->r & VT_PARAM) ? 1 : 0; /* Preserve VT_PARAM for register params */
     irop_copy_svalue_info(&result, sv);
-    result.pr0_reg = val_kind; /* Physical register in VT_VALMASK */
+    result.u.imm32 = IROP_VREG_PHYS_VALID | (val_kind & IROP_VREG_PHYS_MASK);
     goto done;
   }
 
@@ -414,7 +415,7 @@ IROperand svalue_to_iroperand(TCCIRState *ir, const SValue *sv)
     if (vt_btype == VT_LDOUBLE && sizeof(long double) != LDOUBLE_SIZE)
       u.d = (double)sv->c.ld;
     else if (vt_btype == VT_LDOUBLE)
-      u.d = (double)sv->c.ld;  /* Same size, but access through double for bit extraction */
+      u.d = (double)sv->c.ld; /* Same size, but access through double for bit extraction */
     else
       u.d = sv->c.d;
     uint32_t idx = tcc_ir_pool_add_f64(ir, u.bits);
@@ -472,7 +473,7 @@ IROperand svalue_to_iroperand(TCCIRState *ir, const SValue *sv)
 done:
   /* DONE: Phase 2 - Set complex type flag in IROperand */
   result.is_complex = is_complex;
-  
+
   /* For STRUCT types, encode CType pool index + preserve original data in split format */
   if (irop_bt == IROP_BTYPE_STRUCT)
   {
@@ -529,7 +530,7 @@ void iroperand_to_svalue(const TCCIRState *ir, IROperand op, SValue *out)
 
   /* Restore type.t from compressed btype (unless overridden below) */
   out->type.t = irop_btype_to_vt_btype(irop_bt);
-  
+
   /* DONE: Phase 2 - Restore complex type flag from IROperand to SValue */
   if (op.is_complex)
     out->type.t |= VT_COMPLEX;
@@ -542,8 +543,12 @@ void iroperand_to_svalue(const TCCIRState *ir, IROperand op, SValue *out)
 
   case IROP_TAG_VREG:
     /* vreg - value is in a register, or register-indirect if lval set */
-    /* Restore physical register from pr0_reg if allocated (non-zero or explicitly r0) */
-    out->r = op.pr0_reg; /* Physical register in VT_VALMASK */
+    /* Physical register info is no longer stored in IROperand (removed in Phase 5p).
+     * For vreg=-1, read from IROP_VREG_PHYS encoding; for vreg>=0, set 0 (unknown). */
+    if (irop_get_vreg(op) < 0 && (op.u.imm32 & IROP_VREG_PHYS_VALID))
+      out->r = op.u.imm32 & IROP_VREG_PHYS_MASK;
+    else
+      out->r = 0;
     if (op.is_lval)
       out->r |= VT_LVAL;
     break;
@@ -653,11 +658,12 @@ void iroperand_to_svalue(const TCCIRState *ir, IROperand op, SValue *out)
     break;
   }
 
-  /* Restore physical register allocation from IROperand */
-  out->pr0_reg = op.pr0_reg;
-  out->pr0_spilled = op.pr0_spilled;
-  out->pr1_reg = op.pr1_reg;
-  out->pr1_spilled = op.pr1_spilled;
+  /* Physical register info is no longer stored in IROperand (removed in Phase 5p).
+   * Set defaults on SValue; during codegen, registers come from the interval table. */
+  out->pr0_reg = PREG_REG_NONE;
+  out->pr0_spilled = 0;
+  out->pr1_reg = PREG_REG_NONE;
+  out->pr1_spilled = 0;
 
   /* Restore type flags */
   if (op.is_unsigned)
@@ -691,34 +697,8 @@ int irop_compare_svalue(const TCCIRState *ir, const SValue *sv, IROperand op, co
 
   int mismatch = 0;
 
-  /* Compare individual fields and report differences */
-  if (reconstructed.pr0_reg != sv->pr0_reg)
-  {
-    fprintf(stderr, "%s: pr0_reg mismatch: reconstructed=%d, expected=%d\n", context, reconstructed.pr0_reg,
-            sv->pr0_reg);
-    mismatch = 1;
-  }
-
-  if (reconstructed.pr0_spilled != sv->pr0_spilled)
-  {
-    fprintf(stderr, "%s: pr0_spilled mismatch: reconstructed=%d, expected=%d\n", context, reconstructed.pr0_spilled,
-            sv->pr0_spilled);
-    mismatch = 1;
-  }
-
-  if (reconstructed.pr1_reg != sv->pr1_reg)
-  {
-    fprintf(stderr, "%s: pr1_reg mismatch: reconstructed=%d, expected=%d\n", context, reconstructed.pr1_reg,
-            sv->pr1_reg);
-    mismatch = 1;
-  }
-
-  if (reconstructed.pr1_spilled != sv->pr1_spilled)
-  {
-    fprintf(stderr, "%s: pr1_spilled mismatch: reconstructed=%d, expected=%d\n", context, reconstructed.pr1_spilled,
-            sv->pr1_spilled);
-    mismatch = 1;
-  }
+  /* Compare individual fields and report differences.
+   * NOTE: pr0_reg/pr1_reg removed from IROperand in Phase 5p — no longer compared. */
 
   if (reconstructed.r != sv->r)
   {

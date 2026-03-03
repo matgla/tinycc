@@ -2111,7 +2111,6 @@ ST_FUNC void tcc_machine_load_constant(int dest_reg, int dest_reg_high, int64_t 
 ST_FUNC void tcc_machine_load_cmp_result(int dest_reg, int condition_code);
 ST_FUNC void tcc_machine_load_jmp_result(int dest_reg, int jmp_addr, int invert);
 
-ST_FUNC void tcc_gen_machine_data_processing_op(IROperand src1, IROperand src2, IROperand dest, TccIrOp op);
 ST_FUNC void tcc_gen_machine_data_processing_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest,
                                                  TccIrOp op);
 ST_FUNC void tcc_gen_machine_assign_mop(MachineOperand src, MachineOperand dest, TccIrOp op);
@@ -2129,39 +2128,35 @@ ST_FUNC void tcc_gen_machine_store_postinc_mop(MachineOperand ptr, MachineOperan
                                                TccIrOp op);
 ST_FUNC void tcc_gen_machine_indirect_jump_mop(MachineOperand src, TccIrOp op);
 ST_FUNC void tcc_gen_machine_func_parameter_mop(MachineOperand src1, MachineOperand src2_enc, TccIrOp op);
-ST_FUNC void tcc_gen_machine_fp_op(IROperand dest, IROperand src1, IROperand src2, TccIrOp op);
-ST_FUNC void tcc_gen_machine_load_op(IROperand dest, IROperand src);
-ST_FUNC void tcc_gen_machine_store_op(IROperand dest, IROperand src, TccIrOp op);
-ST_FUNC void tcc_gen_machine_load_indexed_op(IROperand dest, IROperand base, IROperand index, IROperand scale);
-ST_FUNC void tcc_gen_machine_store_indexed_op(IROperand base, IROperand index, IROperand scale, IROperand value);
-ST_FUNC void tcc_gen_machine_load_postinc_op(IROperand dest, IROperand ptr, IROperand offset);
-ST_FUNC void tcc_gen_machine_store_postinc_op(IROperand ptr, IROperand value, IROperand offset);
 ST_FUNC void tcc_gen_machine_store_to_stack(int reg, int offset);
 ST_FUNC void tcc_gen_machine_store_to_stack_ex(int reg, int offset, uint32_t extra_exclude);
 ST_FUNC void tcc_gen_machine_store_to_sp(int reg, int offset);
 
-ST_FUNC void tcc_gen_machine_assign_op(IROperand dest, IROperand src, TccIrOp op);
-ST_FUNC void tcc_gen_machine_lea_op(IROperand dest, IROperand src, TccIrOp op);
+ST_FUNC void tcc_gen_machine_lea_mop(MachineOperand dest, MachineOperand src);
 ST_FUNC int tcc_gen_machine_number_of_registers(void);
-ST_FUNC void tcc_gen_machine_return_value_op(IROperand src, TccIrOp op);
+ST_FUNC void tcc_gen_machine_return_value_mop(MachineOperand src, TccIrOp op);
+ST_FUNC void tcc_gen_machine_muldiv_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest, TccIrOp op);
+ST_FUNC void tcc_gen_machine_mla_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest,
+                                     MachineOperand accum);
+ST_FUNC void tcc_gen_machine_umull_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest);
+ST_FUNC void tcc_gen_machine_fp_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest, TccIrOp op,
+                                    int is_complex);
+ST_FUNC void tcc_gen_machine_vla_mop(MachineOperand dest, MachineOperand src1, MachineOperand src2, TccIrOp op);
 ST_FUNC void tcc_gen_machine_epilog(int leaffunc);
 ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int stack_size,
                                     uint32_t extra_prologue_regs);
-ST_FUNC void tcc_gen_machine_func_call_op(IROperand func_target, IROperand call_id, IROperand dest, int drop_value,
-                                          TCCIRState *ir, int call_idx);
+ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand call_id, MachineOperand dest,
+                                           int drop_value, TCCIRState *ir, int call_idx);
 ST_FUNC int tcc_gen_machine_abi_assign_call_args(const TCCAbiArgDesc *args, int argc, TCCAbiCallLayout *out_layout);
 ST_FUNC void tcc_gen_machine_save_call_context(void);
 ST_FUNC void tcc_gen_machine_restore_call_context(void);
-ST_FUNC void tcc_gen_machine_jump_op(TccIrOp op, IROperand dest, int ir_idx);
-ST_FUNC void tcc_gen_machine_conditional_jump_op(IROperand src, TccIrOp op, IROperand dest, int ir_idx);
-ST_FUNC void tcc_gen_machine_indirect_jump_op(IROperand src1);
-ST_FUNC void tcc_gen_machine_switch_table_op(IROperand src1, struct TCCIRSwitchTable *table, struct TCCIRState *ir,
-                                             int ir_idx);
-ST_FUNC void tcc_gen_machine_setif_op(IROperand dest, IROperand src, TccIrOp op);
+ST_FUNC void tcc_gen_machine_jump_mop(TccIrOp op, int32_t target_ir, int ir_idx);
+ST_FUNC void tcc_gen_machine_conditional_jump_mop(int32_t condition, TccIrOp op, int32_t target_ir, int ir_idx);
+ST_FUNC void tcc_gen_machine_switch_table_mop(MachineOperand src, struct TCCIRSwitchTable *table, struct TCCIRState *ir,
+                                              int ir_idx);
 ST_FUNC void tcc_gen_machine_set_chain(void);
 ST_FUNC void tcc_gen_machine_restore_chain(void);
 ST_FUNC void tcc_gen_machine_init_chain_slot(IROperand src1);
-ST_FUNC void tcc_gen_machine_bool_op(IROperand dest, IROperand src1, IROperand src2, TccIrOp op);
 ST_FUNC void tcc_gen_machine_backpatch_jump(int address, int offset);
 ST_FUNC void tcc_gen_machine_end_instruction(void);
 
@@ -2180,18 +2175,18 @@ ST_FUNC int tcc_gen_machine_dry_run_is_active(void);
 ST_FUNC void tcc_gen_machine_insn_scratch_reset(void);
 ST_FUNC int tcc_gen_machine_insn_scratch_count(void);
 ST_FUNC uint16_t tcc_gen_machine_insn_scratch_saves_mask(void);
-ST_FUNC void tcc_gen_machine_func_parameter_op(IROperand src1, IROperand src2, TccIrOp op);
 
 /* Branch optimization interface */
 ST_FUNC void tcc_gen_machine_branch_opt_init(void);
 ST_FUNC void tcc_gen_machine_branch_opt_analyze(uint32_t *ir_to_code_mapping, int mapping_size);
 ST_FUNC int tcc_gen_machine_branch_opt_get_encoding(int ir_index); /* Returns 16 or 32 */
 
-/* VLA / dynamic stack operations */
-ST_FUNC void tcc_gen_machine_vla_op(IROperand dest, IROperand src1, IROperand src2, TccIrOp op);
-
 /* Trap instruction generation */
-ST_FUNC void tcc_gen_machine_trap_op(void);
+ST_FUNC void tcc_gen_machine_trap_mop(void);
+
+/* MachineOperand load/store into specific physical registers (for inline asm) */
+void tcc_gen_mach_load_to_reg(int dest_reg, const MachineOperand *op);
+void tcc_gen_mach_store_from_reg(int src_reg, const MachineOperand *op);
 
 ST_FUNC const char *tcc_get_abi_softcall_name(SValue *src1, SValue *src2, SValue *dest, TccIrOp op);
 

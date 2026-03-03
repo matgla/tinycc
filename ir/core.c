@@ -324,10 +324,8 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
 
   /* Check if we need to use soft-float call instead of native FPU instruction.
    * Skip this for complex operations - they need special handling in the code generator. */
-  if (tcc_ir_type_op_needs_fpu(op) && 
-      !((dest && (dest->type.t & VT_COMPLEX)) || 
-        (src1 && (src1->type.t & VT_COMPLEX)) ||
-        (src2 && (src2->type.t & VT_COMPLEX))))
+  if (tcc_ir_type_op_needs_fpu(op) && !((dest && (dest->type.t & VT_COMPLEX)) ||
+                                        (src1 && (src1->type.t & VT_COMPLEX)) || (src2 && (src2->type.t & VT_COMPLEX))))
   {
     if (ir_put_soft_call_fpu_if_needed(ir, op, src1, src2, dest))
     {
@@ -420,10 +418,6 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
       dest_interval->is_lvalue = new_is_lvalue;
     }
 
-    dest->pr0_reg = PREG_REG_NONE;
-    dest->pr0_spilled = 0;
-    dest->pr1_reg = PREG_REG_NONE;
-    dest->pr1_spilled = 0;
     IROperand dest_irop = svalue_to_iroperand(ir, dest);
     tcc_ir_pool_add(ir, dest_irop);
   }
@@ -436,10 +430,6 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
       fprintf(stderr, "tcc_ir_put: src1 is NULL for op %s\n", tcc_ir_dump_op_name(op));
       exit(1);
     }
-    src1->pr0_reg = PREG_REG_NONE;
-    src1->pr0_spilled = 0;
-    src1->pr1_reg = PREG_REG_NONE;
-    src1->pr1_spilled = 0;
     IROperand src1_irop = svalue_to_iroperand(ir, src1);
     tcc_ir_pool_add(ir, src1_irop);
   }
@@ -452,10 +442,6 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
       fprintf(stderr, "tcc_ir_put: src2 is NULL for op %s\n", tcc_ir_dump_op_name(op));
       exit(1);
     }
-    src2->pr0_reg = PREG_REG_NONE;
-    src2->pr0_spilled = 0;
-    src2->pr1_reg = PREG_REG_NONE;
-    src2->pr1_spilled = 0;
     IROperand src2_irop = svalue_to_iroperand(ir, src2);
     tcc_ir_pool_add(ir, src2_irop);
   }
@@ -543,7 +529,7 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
         new_prev_dest.is_static = prev_dest_irop.is_static;
         new_prev_dest.is_sym = prev_dest_irop.is_sym;
         new_prev_dest.is_param = prev_dest_irop.is_param;
-        new_prev_dest.is_complex = prev_dest_irop.is_complex;  /* Phase 3: preserve complex flag */
+        new_prev_dest.is_complex = prev_dest_irop.is_complex; /* Phase 3: preserve complex flag */
         new_prev_dest.u = prev_dest_irop.u;
       }
 
@@ -1187,9 +1173,9 @@ void tcc_ir_gen_f(TCCIRState *ir, int op)
 
   /* Check if this is a complex addition/subtraction operation */
   int is_complex_op = ((vtop[-1].type.t & VT_COMPLEX) || (vtop[0].type.t & VT_COMPLEX));
-  
-  if (is_complex_op && (ir_op == TCCIR_OP_FADD || ir_op == TCCIR_OP_FSUB ||
-                        ir_op == TCCIR_OP_FMUL || ir_op == TCCIR_OP_FDIV))
+
+  if (is_complex_op &&
+      (ir_op == TCCIR_OP_FADD || ir_op == TCCIR_OP_FSUB || ir_op == TCCIR_OP_FMUL || ir_op == TCCIR_OP_FDIV))
   {
     /* Phase 3: Complex addition/subtraction
      * For complex: (a+bi) + (c+di) = (a+c) + (b+d)i
@@ -1198,23 +1184,23 @@ void tcc_ir_gen_f(TCCIRState *ir, int op)
      * and emit two soft-float library calls.
      */
     int base_type = vtop[-1].type.t & VT_BTYPE;
-    
+
     /* Create destination SValue with complex type */
     svalue_init(&dest);
     dest.vr = tcc_ir_get_vreg_temp(ir);
     dest.r = 0;
     dest.type.t = (base_type | VT_COMPLEX);
-    
+
     /* Mark as float type (not double) for register allocation */
     is_double = (base_type == VT_DOUBLE || base_type == VT_LDOUBLE);
     tcc_ir_set_float_type(ir, dest.vr, 1, is_double);
     /* Phase 3: Mark as complex type so register allocator allocates pairs */
     tcc_ir_vreg_type_set_complex(ir, dest.vr);
-    
-    /* Generate a single complex operation - the code generator will 
+
+    /* Generate a single complex operation - the code generator will
      * recognize the complex type and emit two soft-float calls */
     tcc_ir_put(ir, ir_op, &vtop[-1], &vtop[0], &dest);
-    
+
     vtop[-1].vr = dest.vr;
     vtop[-1].r = 0;
     vtop[-1].type.t = dest.type.t;

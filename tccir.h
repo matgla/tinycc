@@ -513,9 +513,6 @@ void tcc_print_quadruple_irop(TCCIRState *ir, IRQuadCompact *q, int pc);
 int tcc_ir_is_spilled(SValue *sv);
 int tcc_ir_is_64bit(int t);
 
-/* IROperand-based register fill (defined in ir/codegen.c) */
-void tcc_ir_fill_registers_ir(TCCIRState *ir, IROperand *op);
-
 /* Machine-dependent spill handling (defined in machine-specific code, e.g., arm-thumb-gen.c) */
 
 /* Spill cache management for avoiding redundant loads */

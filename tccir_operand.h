@@ -58,6 +58,14 @@ typedef enum TCCIR_VREG_TYPE
 #define IROP_TAG_F64 6      /* payload.pool_idx: index into pool_f64[] */
 #define IROP_TAG_SYMREF 7   /* payload.pool_idx: index into pool_symref[] */
 
+/* For IROP_TAG_VREG operands with vreg=-1: u.imm32 encodes a pinned physical
+ * register.  Bit 8 is the validity flag; bits 0-4 hold the ARM register number
+ * (0-15).  When bit 8 is clear (u.imm32 == 0, the irop_make_vreg default), no
+ * physical register is pinned.  machine_op_from_ir() and irop_phys_r0() read
+ * this encoding. */
+#define IROP_VREG_PHYS_VALID 0x100u /* validity flag for pinned phys reg */
+#define IROP_VREG_PHYS_MASK 0x1Fu   /* bits 0-4: register number */
+
 /* Sentinel for negative vreg encoding - upper 13 bits of position all set */
 #define IROP_NEG_VREG_SENTINEL 0x1FFF0 /* position bits 4-16 all set, bits 0-3 hold neg index */
 
@@ -81,15 +89,15 @@ typedef struct __attribute__((packed)) IROperand
     int32_t vr; /* raw access for encoding/decoding */
     struct
     {
-      uint32_t position : 17; /* vreg position (0-16) */
-      uint32_t is_complex : 1;/* DONE: Phase 2 - VT_COMPLEX: complex type flag (17) */
-      uint32_t tag : 3;       /* IROP_TAG_* (18-20) */
-      uint32_t is_lval : 1;   /* VT_LVAL: needs dereference (21) */
-      uint32_t is_llocal : 1; /* VT_LLOCAL: double indirection (22) */
-      uint32_t is_local : 1;  /* VT_LOCAL: stack-relative (23) */
-      uint32_t is_const : 1;  /* VT_CONST: constant value (24) */
-      uint32_t btype : 3;     /* IROP_BTYPE_* (25-27) */
-      uint32_t vreg_type : 4; /* TCCIR_VREG_TYPE_* (28-31) */
+      uint32_t position : 17;  /* vreg position (0-16) */
+      uint32_t is_complex : 1; /* DONE: Phase 2 - VT_COMPLEX: complex type flag (17) */
+      uint32_t tag : 3;        /* IROP_TAG_* (18-20) */
+      uint32_t is_lval : 1;    /* VT_LVAL: needs dereference (21) */
+      uint32_t is_llocal : 1;  /* VT_LLOCAL: double indirection (22) */
+      uint32_t is_local : 1;   /* VT_LOCAL: stack-relative (23) */
+      uint32_t is_const : 1;   /* VT_CONST: constant value (24) */
+      uint32_t btype : 3;      /* IROP_BTYPE_* (25-27) */
+      uint32_t vreg_type : 4;  /* TCCIR_VREG_TYPE_* (28-31) */
     };
   };
   union
@@ -103,18 +111,15 @@ typedef struct __attribute__((packed)) IROperand
       int16_t aux_data;   /* aux: stack offset for STACKOFF, symref_idx for SYMREF */
     } s;
   } u;
-  /* Physical register allocation (filled by register allocator for codegen) */
-  uint8_t pr0_reg : 5;     /* Physical register 0 (0-15 for ARM, 31=PREG_REG_NONE) */
-  uint8_t pr0_spilled : 1; /* pr0 spilled to stack */
+  /* Type flags (filled during IR construction) */
   uint8_t is_unsigned : 1; /* VT_UNSIGNED flag */
   uint8_t is_static : 1;   /* VT_STATIC flag */
-  uint8_t pr1_reg : 5;     /* Physical register 1 for 64-bit values */
-  uint8_t pr1_spilled : 1; /* pr1 spilled to stack */
   uint8_t is_sym : 1;      /* VT_SYM: has associated symbol */
   uint8_t is_param : 1;    /* VT_PARAM: stack-passed parameter (needs offset_to_args) */
+  uint8_t _pad : 4;        /* unused — available for future flags */
 } IROperand;
 
-_Static_assert(sizeof(IROperand) == 10, "IROperand must be 10 bytes");
+_Static_assert(sizeof(IROperand) == 9, "IROperand must be 9 bytes");
 
 /* ============================================================================
  * Pool entry types - separate arrays for cache efficiency
@@ -325,28 +330,16 @@ static inline int32_t irop_get_vreg(const IROperand op)
 
 /* Sentinel for "no operand" */
 #define IROP_NONE                                                                                                      \
-  ((IROperand){.vr = -1,                                                                                               \
-               .u = {.imm32 = 0},                                                                                      \
-               .pr0_reg = 0x1F,                                                                                        \
-               .pr0_spilled = 0,                                                                                       \
-               .is_unsigned = 0,                                                                                       \
-               .is_static = 0,                                                                                         \
-               .pr1_reg = 0x1F,                                                                                        \
-               .pr1_spilled = 0,                                                                                       \
-               .is_sym = 0,                                                                                            \
-               .is_param = 0})
+  ((IROperand){.vr = -1, .u = {.imm32 = 0}, .is_unsigned = 0, .is_static = 0, .is_sym = 0, .is_param = 0, ._pad = 0})
 
-/* Helper to initialize physical reg fields to defaults */
+/* Helper to initialize type-flag byte to defaults */
 static inline void irop_init_phys_regs(IROperand *op)
 {
-  op->pr0_reg = 0x1F; /* PREG_REG_NONE */
-  op->pr0_spilled = 0;
   op->is_unsigned = 0;
   op->is_static = 0;
-  op->pr1_reg = 0x1F; /* PREG_REG_NONE */
-  op->pr1_spilled = 0;
   op->is_sym = 0;
   op->is_param = 0;
+  op->_pad = 0;
 }
 
 /* Helper to set vreg fields from a vreg value.

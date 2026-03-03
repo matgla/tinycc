@@ -90,10 +90,11 @@ ThumbGenCallSite *thumb_get_call_site_for_id(int call_id)
  * Scans backwards from call_idx to find all FUNCPARAMVAL operations for this call.
  * argc_hint: if >= 0, use this as the known argument count (from FUNCCALL encoding).
  * out_args: if non-NULL, will be allocated and filled with argument IROperands.
+ * out_mops: if non-NULL, will be allocated and filled with MachineOperands.
  * Returns the number of arguments found, or -1 on error.
  */
 int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, int argc_hint, TCCAbiCallLayout *layout,
-                                    IROperand **out_args)
+                                    IROperand **out_args, MachineOperand **out_mops)
 {
   CALLSITE_DEBUG("[CALLSITE] thumb_build_call_layout_from_ir: call_idx=%d call_id=%d argc_hint=%d total_insns=%d\n",
           call_idx, call_id, argc_hint, ir ? ir->next_instruction_index : -1);
@@ -108,6 +109,7 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, i
   TCCAbiArgDesc *arg_descs = NULL;
   uint8_t *found = NULL;
   IROperand *args = NULL;
+  MachineOperand *mops = NULL;
 
   /* If argc_hint is provided and valid, use it directly (O(argc) scan only).
    * Otherwise, fall back to scanning to find max_arg_index (O(n) scan). */
@@ -148,6 +150,8 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, i
     layout->stack_size = 0;
     if (out_args)
       *out_args = NULL;
+    if (out_mops)
+      *out_mops = NULL;
     return 0;
   }
 
@@ -171,6 +175,12 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, i
   if (out_args)
   {
     args = (IROperand *)tcc_mallocz(sizeof(IROperand) * argc);
+  }
+
+  /* Allocate MachineOperand array if caller wants them */
+  if (out_mops)
+  {
+    mops = (MachineOperand *)tcc_mallocz(sizeof(MachineOperand) * argc);
   }
 
   CALLSITE_DEBUG("[CALLSITE] scanning backwards from call_idx=%d for call_id=%d argc=%d\n", call_idx, call_id, argc);
@@ -198,8 +208,11 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, i
           if (args)
           {
             args[param_idx] = src1_irop;
-            /* Apply register allocation to the operand */
-            tcc_ir_fill_registers_ir(ir, &args[param_idx]);
+          }
+          /* Collect MachineOperand if requested */
+          if (mops)
+          {
+            mops[param_idx] = machine_op_from_ir(ir, &src1_irop);
           }
           /* Determine argument type and size */
           if (irop_is_none(src1_irop))
@@ -271,6 +284,12 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, i
     *out_args = args;
   }
 
+  /* Return mops to caller if requested */
+  if (out_mops)
+  {
+    *out_mops = mops;
+  }
+
   /* Free heap-allocated arrays if used */
   if (argc > MAX_INLINE_ARGS)
   {
@@ -288,6 +307,10 @@ cleanup_error:
   if (args)
   {
     tcc_free(args);
+  }
+  if (mops)
+  {
+    tcc_free(mops);
   }
   if (layout->locs)
   {

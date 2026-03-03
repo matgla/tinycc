@@ -1,13 +1,17 @@
 # Plan Review: Materialization Refactor
 
-> **Note (2026-03-03):** Much of this review describes findings made *before* implementation started. Several items are now moot:
+> **Note (2026-03-06):** Much of this review describes findings made *before* implementation started. Several items are now moot:
 > - `ir/mat.c` (1096 lines) — **deleted** (Phase 4 ✅)
 > - `ir/operand.h` + `ir/operand.c` — **deleted** (Phase 4 ✅)
 > - SValue materialization path — **deleted** (Phase 0 ✅)
-> - `tcc_ir_codegen_generate()` at 2331 lines — now 2200 lines (still shrinking as Phase 2 progresses)
+> - `tcc_ir_codegen_generate()` at 2331 lines — now **1767 lines** after Phase 6 consolidated dispatch loops
 > - Dry-run constraint collection — **implemented** as `dry_insn_scratch[]`/`dry_insn_saves[]` arrays (Phase 3 ✅)
+> - Dispatch loop consolidation — **done** (Phase 6 ✅): single `for (pass=0; pass<2)` loop; −339 lines (~16%)
+> - All backend handlers now use `_mop` variants exclusively (Phase 5o ✅)
+> - `pr0_reg`/`pr1_reg` fields removed from `IROperand` (Phase 5p ✅): struct shrunk from 10→9 bytes; `irop_phys_r0()`/`irop_phys_r1()` helpers read interval table
+> - All legacy `_ir` wrapper functions deleted (Phase 5q ✅): `load_to_dest_ir`, `store_ex_ir`, `store_ir`, `th_store_resolve_base_ir`, `irop_phys_r0`/`irop_phys_r1`; `tcc_gen_mach_load_to_reg` rewritten for direct-dest loading
 
-Review of `plan.md` against the actual codebase state (original analysis). Based on reading `ir/mat.c` (1096 lines), `ir/codegen.c` (2331 lines), `arm-thumb-gen.c` (8672 lines), `ir/operand.h`, `tccir_operand.h`, `svalue.h`, and `ir/stack.h`.
+Review of `plan.md` against the actual codebase state (original analysis). Based on reading `ir/codegen.c` (1767 lines), `arm-thumb-gen.c` (8055 lines), `tccir_operand.h` (560 lines), `tccir_operand.c` (844 lines), `ir/machine_op.c` (328 lines), `svalue.h`, and `ir/stack.h`. *(Note: `ir/mat.c`, `ir/operand.h` deleted in Phase 4.)*
 
 ---
 

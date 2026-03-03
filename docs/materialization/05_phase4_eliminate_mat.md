@@ -111,7 +111,7 @@ make test-gcc-torture-compile
 - `ir/machine_op.c` + `ir/machine_op.h` — the new `MachineOperand`-based conversion module
 
 ### Expected size reduction
-The `ir/codegen.c` line count reduction is blocked until Phase 2 completes (all instruction handlers on MOP path). Currently `fill_registers_ir` still exists in `ir/codegen.c` because it is still required by all non-MOP instruction handlers.
+`ir/codegen.c` was reduced from ~2331 to 1767 lines (Phase 5m deleted `fill_registers_ir` ~256 lines; Phase 6 consolidated dispatch loops −339 lines).
 
 ## Verification Checklist
 
@@ -120,5 +120,5 @@ The `ir/codegen.c` line count reduction is blocked until Phase 2 completes (all 
 - [x] `ir/operand.h` deleted
 - [x] Build compiles without those files
 - [x] `make test -j16` passes
-- [ ] `tcc_ir_fill_registers_ir()` deleted from `ir/codegen.c` (blocked until Phase 2 complete)
-- [ ] `ir/codegen.c` reduced by ~1700 lines (blocked until Phase 2 complete)
+- [x] `tcc_ir_fill_registers_ir()` deleted from `ir/codegen.c` — ✅ done (Phase 5m)
+- [x] `ir/codegen.c` reduced from ~2331 to 1767 lines (Phase 5m + Phase 6 dispatch consolidation)

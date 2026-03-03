@@ -60,9 +60,10 @@ typedef enum
   MACH_OP_FRAME_ADDR,  /* Address = FP + offset (address-of local variable) */
   MACH_OP_SYMBOL,      /* Symbol reference (global/extern/function) */
   MACH_OP_PARAM_STACK, /* Stack-passed parameter in caller's argument frame */
+  MACH_OP_CHAIN_REL,   /* Captured variable: chain_index + FP-relative offset in parent */
 } MachineOperandKind;
 
-typedef struct
+typedef struct MachineOperand
 {
   MachineOperandKind kind; /* How to materialize this operand */
   int btype;               /* IROP_BTYPE_* — compressed base type */
@@ -98,18 +99,23 @@ typedef struct
     {
       int32_t offset; /* Byte offset from start of the caller argument area */
     } param;          /* MACH_OP_PARAM_STACK */
+    struct
+    {
+      int32_t offset;      /* Parent-frame byte offset of the captured variable */
+      int32_t chain_index; /* Index into ir->captured_offsets_list */
+    } chain;               /* MACH_OP_CHAIN_REL */
   } u;
 } MachineOperand;
 
 /* ============================================================================
- * machine_op_from_ir: Convert a filled IROperand to a MachineOperand
+ * machine_op_from_ir: Convert an IROperand to a MachineOperand
  * ============================================================================
  *
- * The input operand *op must have already been processed by
- * tcc_ir_fill_registers_ir() so that pr0_reg / pr0_spilled / tag / flags all
- * reflect the final register-allocation decision.
+ * Reads the raw (unfilled) IROperand and the register-allocation interval
+ * table to produce a MachineOperand directly.  Does NOT call
+ * tcc_ir_fill_registers_ir — the IROperand is not mutated.
  *
- * This is a pure, side-effect-free mapping function: it does not allocate
- * scratch registers, emit instructions, or modify *op.
+ * Callers may pass the same operand to multiple calls without worrying about
+ * fill ordering or double-fill issues.
  */
 MachineOperand machine_op_from_ir(struct TCCIRState *ir, const struct IROperand *op);

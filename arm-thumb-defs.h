@@ -8,6 +8,7 @@
 
 /* Forward declaration */
 typedef struct Sym Sym;
+typedef struct MachineOperand MachineOperand;
 
 #ifndef ST_FUNC
 #define ST_FUNC
@@ -224,7 +225,8 @@ ST_FUNC void thumb_free_call_sites(void);
 ST_FUNC ThumbGenCallSite *thumb_get_or_create_call_site(int call_id);
 ST_FUNC ThumbGenCallSite *thumb_get_call_site_for_id(int call_id);
 ST_FUNC int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, int argc_hint,
-                                            TCCAbiCallLayout *layout, IROperand **out_args);
+                                            TCCAbiCallLayout *layout, IROperand **out_args,
+                                            MachineOperand **out_mops);
 
 ST_FUNC void g(int c);
 ST_FUNC void gen_le16(int c);

@@ -185,163 +185,6 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
   }
 }
 
-void tcc_ir_fill_registers_ir(TCCIRState *ir, IROperand *op)
-{
-  const int old_is_local = op->is_local;
-  const int old_is_llocal = op->is_llocal;
-  const int old_is_const = op->is_const;
-  const int old_is_lval = op->is_lval;
-  const int old_is_param = op->is_param;
-
-  const int vreg = irop_get_vreg(*op);
-
-  /* VT_LOCAL/VT_LLOCAL operands can mean either:
-   * - a concrete stack slot (vr == -1), e.g. VLA save slots, or
-   * - a temp local for type-punning casts (vr <= -2, VR_TEMP_LOCAL), or
-   * - a logical local tracked as a vreg by the IR (vr > 0).
-   *
-   * For concrete stack slots and temp locals, do not rewrite them into
-   * registers here; doing so can create uninitialized register reads
-   * at runtime. */
-  if ((old_is_local || old_is_llocal) && vreg < 0)
-  {
-    op->pr0_reg = PREG_REG_NONE;
-    op->pr0_spilled = 0;
-    op->pr1_reg = PREG_REG_NONE;
-    op->pr1_spilled = 0;
-    return;
-  }
-
-  if (tcc_ir_vreg_is_valid(ir, vreg))
-  {
-    IRLiveInterval *interval = tcc_ir_vreg_live_interval(ir, vreg);
-    int32_t old_stackoff = 0;
-    if (op->btype != IROP_BTYPE_STRUCT && irop_get_tag(*op) == IROP_TAG_STACKOFF)
-      old_stackoff = op->u.imm32;
-
-    /* Stack-passed parameters: if not allocated to a register, treat them as
-     * residing in the incoming argument area (VT_PARAM) rather than forcing a
-     * separate local spill slot. */
-    if (TCCIR_DECODE_VREG_TYPE(vreg) == TCCIR_VREG_TYPE_PARAM && interval && interval->incoming_reg0 < 0 &&
-        interval->allocation.r0 == PREG_NONE && interval->allocation.offset == 0)
-    {
-      op->pr0_reg = PREG_REG_NONE;
-      op->pr0_spilled = 0;
-      op->pr1_reg = PREG_REG_NONE;
-      op->pr1_spilled = 0;
-      /* For STRUCT types, preserve ctype_idx in the split encoding */
-      if (op->btype == IROP_BTYPE_STRUCT)
-      {
-        op->u.s.aux_data = interval->original_offset;
-      }
-      else
-      {
-        op->u.imm32 = interval->original_offset;
-      }
-      op->tag = IROP_TAG_STACKOFF;
-
-      int need_lval = old_is_lval;
-      /* old_v < VT_CONST && old_v != VT_LOCAL && old_v != VT_LLOCAL → reg kind operand */
-      if (!old_is_const && !old_is_local && !old_is_llocal && interval->is_lvalue)
-        need_lval = 1;
-
-      op->is_local = 1;
-      op->is_llocal = 0;
-      op->is_const = 0;
-      op->is_lval = need_lval;
-      op->is_param = 1;
-      return;
-    }
-
-    /* Register-passed parameters: if allocated to a register (not spilled),
-     * clear VT_LVAL. The value is already in the register, no dereference needed. */
-    int is_register_param =
-        (TCCIR_DECODE_VREG_TYPE(vreg) == TCCIR_VREG_TYPE_PARAM && interval && interval->incoming_reg0 >= 0);
-
-    op->pr0_reg = interval->allocation.r0 & PREG_REG_NONE;
-    op->pr0_spilled = (interval->allocation.r0 & PREG_SPILLED) != 0;
-    op->pr1_reg = interval->allocation.r1 & PREG_REG_NONE;
-    op->pr1_spilled = (interval->allocation.r1 & PREG_SPILLED) != 0;
-    /* For STRUCT types, preserve ctype_idx in the split encoding */
-    if (op->btype == IROP_BTYPE_STRUCT)
-    {
-      op->u.s.aux_data = interval->allocation.offset;
-    }
-    else
-    {
-      if ((old_is_local || old_is_llocal) && !old_is_param && irop_get_tag(*op) == IROP_TAG_STACKOFF)
-      {
-        int32_t delta = old_stackoff - interval->original_offset;
-        op->u.imm32 = interval->allocation.offset + delta;
-      }
-      else
-      {
-        op->u.imm32 = interval->allocation.offset;
-      }
-    }
-
-    /* Determine if we should preserve is_lval:
-     * - If was local|lval and now in register, do NOT preserve is_lval
-     * - If was lval with reg-kind operand (pointer deref), preserve is_lval
-     * - Register parameters: do NOT preserve is_lval when in register */
-    int preserve_param = old_is_param;
-    int preserve_lval = 0;
-    if (old_is_lval && !old_is_const && !old_is_local && !old_is_llocal && !is_register_param)
-    {
-      preserve_lval = 1;
-    }
-
-    if ((interval->allocation.r0 & PREG_SPILLED) || interval->allocation.offset != 0)
-    {
-      /* Spilled to stack */
-      int need_lval;
-      if (old_is_local || old_is_llocal)
-      {
-        need_lval = old_is_lval;
-      }
-      else
-      {
-        /* Computed value (was in register): always need lval to load from spill */
-        need_lval = 1;
-      }
-
-      int use_llocal = 0;
-      if (old_is_lval && !old_is_local && !old_is_llocal)
-      {
-        /* Double indirection: spilled pointer that needs dereferencing */
-        use_llocal = 1;
-      }
-
-      /* Only preserve is_param for stack-passed parameters (incoming_reg0 < 0).
-       * Register-passed parameters spilled to local stack should NOT have is_param. */
-      int spilled_param = 0;
-      if (old_is_param && interval->incoming_reg0 < 0)
-      {
-        spilled_param = 1;
-      }
-
-      op->is_local = 1;
-      op->is_llocal = use_llocal;
-      op->is_const = 0;
-      op->is_lval = need_lval;
-      op->is_param = spilled_param;
-      op->tag = IROP_TAG_STACKOFF;
-    }
-    else if (interval->allocation.r0 != PREG_NONE)
-    {
-      /* In a register */
-      op->is_local = 0;
-      op->is_llocal = 0;
-      op->is_const = 0;
-      op->is_lval = preserve_lval;
-      op->is_param = preserve_param;
-      op->tag = IROP_TAG_VREG;
-    }
-  }
-  /* No valid vreg: constants, symbols, etc. - IROperand already has the right encoding
-   * from the pool. Nothing to do for register allocation. */
-}
-
 /* ============================================================================
  * Parameter Register Allocation
  * ============================================================================ */
@@ -1160,7 +1003,7 @@ static int try_reassign_scratch_conflict(TCCIRState *ir, int r, int insn_i)
 
   /* --- Apply the reassignment --- */
 
-  /* 1. Update the IRLiveInterval (read by tcc_ir_fill_registers_ir). */
+  /* 1. Update the IRLiveInterval (read by machine_op_from_ir). */
   ir_iv->allocation.r0 = (uint16_t)new_r;
 
   /* 2. Update the LSLiveInterval (read by tcc_ls_build_live_regs_by_instruction
@@ -1184,6 +1027,124 @@ static int try_reassign_scratch_conflict(TCCIRState *ir, int r, int insn_i)
 }
 
 /* ============================================================================
+ * Helper: sub-component fixup for register-pair operands used as LOAD/STORE
+ * sources.  When a local STACKOFF operand accesses a sub-component of a 64-bit
+ * pair (e.g., __imag__ on _Complex float), the original operand's byte offset
+ * differs from the interval's base offset.  In that case, rewrite the
+ * MachineOperand to use r1 (second register of the pair) instead of r0.
+ *
+ * This MUST NOT be applied to DP/ASSIGN operands — a 64-bit pair allocated as
+ * a register pair can also have a non-zero delta, but that is not a
+ * sub-component access.
+ * ============================================================================ */
+static void mop_fixup_subcomponent(MachineOperand *mop, const IROperand *op, TCCIRState *ir)
+{
+  if (mop->kind != MACH_OP_REG || mop->needs_deref || mop->u.reg.r1 < 0)
+    return;
+  int vreg = irop_get_vreg(*op);
+  if (vreg <= 0 || irop_get_tag(*op) != IROP_TAG_STACKOFF || op->btype == IROP_BTYPE_STRUCT)
+    return;
+  IRLiveInterval *interval = tcc_ir_get_live_interval(ir, vreg);
+  if (!interval)
+    return;
+  int32_t delta = op->u.imm32 - interval->original_offset;
+  if (delta != 0)
+  {
+    mop->u.reg.r0 = mop->u.reg.r1;
+    mop->u.reg.r1 = -1;
+    mop->needs_deref = false;
+  }
+}
+
+/* ============================================================================
+ * Before-Return Peephole
+ *
+ * When a LOAD, LOAD_INDEXED, or ASSIGN is immediately followed by a
+ * RETURNVALUE on the same vreg (with no intervening jump target), patch the
+ * dest vreg's allocation to R0 (R0+R1 for 64-bit) and construct a synthetic
+ * MACH_OP_REG MachineOperand.  This eliminates the extra move that
+ * RETURNVALUE would otherwise emit.
+ *
+ * Called from both dry-run and real-run dispatch loops so that scratch
+ * accounting stays consistent.
+ * ============================================================================ */
+static bool ir_codegen_before_ret_peephole(TCCIRState *ir, int i, const IROperand *dest_ir,
+                                           const uint8_t *has_incoming_jump, MachineOperand *out_mop_dest)
+{
+  if (i + 1 >= ir->next_instruction_index)
+    return false;
+
+  const IRQuadCompact *nq = &ir->compact_instructions[i + 1];
+  if (nq->op != TCCIR_OP_RETURNVALUE || has_incoming_jump[i + 1])
+    return false;
+
+  IROperand nq_src1 = tcc_ir_op_get_src1(ir, nq);
+  int next_vr = irop_get_vreg(nq_src1);
+  int dest_vr = irop_get_vreg(*dest_ir);
+  if (next_vr != dest_vr || dest_vr < 0)
+    return false;
+
+  IRLiveInterval *li = tcc_ir_get_live_interval(ir, dest_vr);
+  if (li)
+  {
+    li->allocation.r0 = REG_IRET;
+    li->allocation.offset = 0;
+    if (irop_is_64bit(*dest_ir))
+      li->allocation.r1 = REG_IRE2;
+  }
+
+  *out_mop_dest = (MachineOperand){.kind = MACH_OP_REG,
+                                   .btype = irop_get_btype(*dest_ir),
+                                   .vreg = dest_vr,
+                                   .is_64bit = irop_is_64bit(*dest_ir),
+                                   .is_unsigned = dest_ir->is_unsigned,
+                                   .needs_deref = false,
+                                   .u.reg = {.r0 = REG_IRET, .r1 = irop_is_64bit(*dest_ir) ? (int)REG_IRE2 : -1}};
+  return true;
+}
+
+/* ============================================================================
+ * Scratch Recording / Checking
+ *
+ * During dry-run: record how many scratch registers each instruction used.
+ * During real-run: verify the count matches (under TCC_LS_DEBUG).
+ *
+ * Consolidates 16 dry-run recording sites and 16 real-run checking sites
+ * into a single inline helper.
+ * ============================================================================ */
+static inline void ir_codegen_record_scratch(int i, int *dry_insn_scratch, uint16_t *dry_insn_saves)
+{
+  dry_insn_scratch[i] = tcc_gen_machine_insn_scratch_count();
+  dry_insn_saves[i] = tcc_gen_machine_insn_scratch_saves_mask();
+}
+
+static inline void ir_codegen_check_scratch(int i, TccIrOp op, const int *dry_insn_scratch,
+                                            const uint16_t *dry_insn_saves)
+{
+#ifdef TCC_LS_DEBUG
+  int real_scratch = tcc_gen_machine_insn_scratch_count();
+  if (real_scratch != dry_insn_scratch[i] && dry_insn_saves[i] == 0)
+    fprintf(stderr, "[insn-scratch] i=%d op=%d dry=%d real=%d MISMATCH\n", i, (int)op, dry_insn_scratch[i],
+            real_scratch);
+#else
+  (void)i;
+  (void)op;
+  (void)dry_insn_scratch;
+  (void)dry_insn_saves;
+#endif
+}
+
+/* Unified scratch tracking: records during dry-run, checks during real-run. */
+static inline void ir_codegen_track_scratch(int is_dry_run, int i, TccIrOp op, int *dry_insn_scratch,
+                                            uint16_t *dry_insn_saves)
+{
+  if (is_dry_run)
+    ir_codegen_record_scratch(i, dry_insn_scratch, dry_insn_saves);
+  else
+    ir_codegen_check_scratch(i, op, dry_insn_scratch, dry_insn_saves);
+}
+
+/* ============================================================================
  * Main Code Generation Loop
  * ============================================================================ */
 
@@ -1191,31 +1152,6 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
 {
   IRQuadCompact *cq;
   int drop_return_value = 0;
-
-#ifdef TCC_REGALLOC_DEBUG
-  int _dbg_trace_all = 0;
-  {
-    extern const char *funcname;
-    fprintf(stderr, "[RA-FUNC] %s (insts=%d)\n", funcname ? funcname : "?", ir->next_instruction_index);
-    /* Enable full instruction trace for the target function */
-    if (funcname && ir->next_instruction_index == 295)
-    {
-      const char *_target = "tcc_gen_machine_func_call_op";
-      const char *_fn = funcname;
-      int _match = 1;
-      while (*_target && *_fn)
-      {
-        if (*_target++ != *_fn++)
-        {
-          _match = 0;
-          break;
-        }
-      }
-      if (_match && *_target == 0 && *_fn == 0)
-        _dbg_trace_all = 1;
-    }
-  }
-#endif
 
 #ifdef TCC_REGALLOC_DEBUG
   /* Print vreg statistics for size optimization analysis */
@@ -1336,1017 +1272,189 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
   int *dry_insn_scratch = tcc_mallocz(ir->next_instruction_index * sizeof(int));
   uint16_t *dry_insn_saves = tcc_mallocz(ir->next_instruction_index * sizeof(uint16_t));
 
-#if 1 /* DRY_RUN_ENABLED */
-
-  /* Initialize dry-run state and branch optimization */
-  tcc_gen_machine_dry_run_init();
-  tcc_gen_machine_branch_opt_init();
-  tcc_gen_machine_dry_run_start();
-
-  /* Reset scratch state for clean dry-run */
-  tcc_gen_machine_reset_scratch_state();
-  tcc_ir_spill_cache_clear(&ir->spill_cache);
-
-  /* Save state that will be modified during dry run */
-  int saved_ind = ind;
-  int saved_codegen_idx = ir->codegen_instruction_idx;
-  int saved_loc = loc;
-  int saved_call_outgoing_base = ir->call_outgoing_base;
-
-  /* Run through all instructions without emitting.
-   * We call the actual codegen functions, but ot() is a no-op during dry-run.
-   * This ensures we exercise the exact same code paths for scratch allocation. */
-  for (int i = 0; i < ir->next_instruction_index; i++)
+  /* ============================================================================
+   * TWO-PASS CODE GENERATION
+   * ============================================================================
+   * Pass 0 (dry-run): Discover scratch register needs without emitting code.
+   *   - ot() is a no-op; ind advances but no bytes are written.
+   *   - Records per-instruction scratch counts in dry_insn_scratch[].
+   *   - Branch optimizer collects offset data.
+   * Pass 1 (real-run): Emit actual Thumb-2 machine code.
+   *   - Uses dry-run data for scratch consistency checks.
+   *   - Emits debug info, epilogue jumps, inline asm.
+   * ============================================================================ */
+  for (int pass = 0; pass < 2; pass++)
   {
-    ir->codegen_instruction_idx = i;
-    cq = &ir->compact_instructions[i];
+    const int is_dry_run = (pass == 0);
 
-    /* Debug tracking: update current op for ot_check failure reporting */
-    g_debug_current_op = (int)cq->op;
-
-    /* Record address mapping for branch optimizer analysis */
-    ir_to_code_mapping[i] = ind;
-
-    /* Skip marker ops */
-    if (cq->op == TCCIR_OP_ASM_INPUT || cq->op == TCCIR_OP_ASM_OUTPUT || cq->op == TCCIR_OP_NOP ||
-        cq->op == TCCIR_OP_INLINE_ASM)
-      continue;
-
-    /* Get operand copies from iroperand_pool */
-    IROperand src1_ir = tcc_ir_op_get_src1(ir, cq);
-    IROperand src2_ir = tcc_ir_op_get_src2(ir, cq);
-    IROperand dest_ir = tcc_ir_op_get_dest(ir, cq);
-
-    /* Apply register allocation to operands */
-    if (irop_get_tag(src1_ir) != IROP_TAG_NONE)
-      tcc_ir_fill_registers_ir(ir, &src1_ir);
-    if (irop_get_tag(src2_ir) != IROP_TAG_NONE)
-      tcc_ir_fill_registers_ir(ir, &src2_ir);
-    if (irop_get_tag(dest_ir) != IROP_TAG_NONE)
-      tcc_ir_fill_registers_ir(ir, &dest_ir);
-
-    /* Mop path: use MachineOperand-based dispatch for simple 32-bit ops;
-     * the mach_* helpers in arm-thumb-gen.c handle all materialization. */
-    bool use_mop_dp = false;
-    bool use_mop_assign = false;
-    bool use_mop_setif = false;
-    bool use_mop_bool = false;
-    bool use_mop_load = false;
-    bool use_mop_store = false;
-    bool use_mop_load_indexed = false;
-    bool use_mop_store_indexed = false;
-    bool use_mop_load_postinc = false;
-    bool use_mop_store_postinc = false;
-    bool use_mop_ijump = false;
-    bool use_mop_funcparam = false;
-    switch (cq->op)
+    /* ---- Pass-specific initialisation ---- */
+    if (is_dry_run)
     {
-    case TCCIR_OP_ADD:
-    case TCCIR_OP_SUB:
-    case TCCIR_OP_CMP:
-    case TCCIR_OP_SHL:
-    case TCCIR_OP_SHR:
-    case TCCIR_OP_SAR:
-    case TCCIR_OP_AND:
-    case TCCIR_OP_OR:
-    case TCCIR_OP_XOR:
-    case TCCIR_OP_ADC_GEN:
-    case TCCIR_OP_ADC_USE:
-      if (!irop_needs_pair(dest_ir) && !ir->has_static_chain)
-        use_mop_dp = true;
-      break;
-    case TCCIR_OP_ASSIGN:
-      if (!irop_needs_pair(dest_ir) && !irop_needs_pair(src1_ir) && !ir->has_static_chain)
-        use_mop_assign = true;
-      break;
-    case TCCIR_OP_SETIF:
-      if (!irop_needs_pair(dest_ir) && !ir->has_static_chain)
-        use_mop_setif = true;
-      break;
-    case TCCIR_OP_BOOL_OR:
-    case TCCIR_OP_BOOL_AND:
-      if (!irop_needs_pair(dest_ir) && !irop_needs_pair(src1_ir) && !irop_needs_pair(src2_ir) && !ir->has_static_chain)
-        use_mop_bool = true;
-      break;
-    case TCCIR_OP_LOAD:
-      if (!irop_needs_pair(dest_ir) && !irop_needs_pair(src1_ir) && !ir->has_static_chain)
-        use_mop_load = true;
-      break;
-    case TCCIR_OP_STORE:
-      if (!irop_needs_pair(src1_ir) && !ir->has_static_chain)
-        use_mop_store = true;
-      break;
-    case TCCIR_OP_LOAD_INDEXED:
-      if (!irop_needs_pair(dest_ir) && !ir->has_static_chain)
-        use_mop_load_indexed = true;
-      break;
-    case TCCIR_OP_STORE_INDEXED:
-      if (!irop_needs_pair(src1_ir) && !ir->has_static_chain)
-        use_mop_store_indexed = true;
-      break;
-    case TCCIR_OP_LOAD_POSTINC:
-      if (!irop_needs_pair(dest_ir) && !ir->has_static_chain)
-        use_mop_load_postinc = true;
-      break;
-    case TCCIR_OP_STORE_POSTINC:
-      if (!irop_needs_pair(src1_ir) && !ir->has_static_chain)
-        use_mop_store_postinc = true;
-      break;
-    case TCCIR_OP_IJUMP:
-      if (!ir->has_static_chain)
-        use_mop_ijump = true;
-      break;
-    case TCCIR_OP_FUNCPARAMVAL:
-    case TCCIR_OP_FUNCPARAMVOID:
-      use_mop_funcparam = true;
-      break;
-    default:
-      break;
+      tcc_gen_machine_dry_run_init();
+      tcc_gen_machine_branch_opt_init();
+      tcc_gen_machine_dry_run_start();
+      tcc_gen_machine_reset_scratch_state();
+      tcc_ir_spill_cache_clear(&ir->spill_cache);
     }
 
-    /* Call the actual codegen function - ot() will be a no-op in dry-run mode,
-     * but scratch allocation inside these functions will still be recorded */
-    switch (cq->op)
-    {
-    case TCCIR_OP_LOAD:
-    {
-      bool load_before_ret = false;
-      {
-        const IRQuadCompact *nq = (i + 1 < ir->next_instruction_index) ? &ir->compact_instructions[i + 1] : NULL;
-        if (nq && nq->op == TCCIR_OP_RETURNVALUE && !has_incoming_jump[i + 1])
-        {
-          IROperand nq_src1 = tcc_ir_op_get_src1(ir, nq);
-          load_before_ret = (irop_get_vreg(nq_src1) == irop_get_vreg(dest_ir));
-        }
-      }
-      if (use_mop_load && !load_before_ret)
-      {
-        MachineOperand mop_src = machine_op_from_ir(ir, &src1_ir);
-        MachineOperand mop_dest = machine_op_from_ir(ir, &dest_ir);
+    /* Save state before dry-run so we can restore for real-run. */
+    int saved_ind = ind;
+    int saved_codegen_idx = ir->codegen_instruction_idx;
+    int saved_loc = loc;
+    int saved_call_outgoing_base = ir->call_outgoing_base;
 
-        /* Sub-component access on register pairs (e.g., __imag__ on _Complex float).
-         * When a STACKOFF operand with a component offset gets rewritten to VREG by
-         * fill_registers_ir, the byte-offset delta is preserved in u.imm32:
-         *   u.imm32 == 0  → first element  (pr0_reg, e.g. real part)
-         *   u.imm32 > 0   → second element (pr1_reg, e.g. imaginary part)
-         * This ONLY applies to LOAD sources — DP/ASSIGN operands must not be
-         * rewritten because a 64-bit interval allocated as a register pair
-         * can also have pr1_reg set with a non-zero u.imm32 (delta from
-         * fill_registers_ir), which is not a sub-component access. */
-        if (mop_src.kind == MACH_OP_REG && !src1_ir.is_lval && src1_ir.pr1_reg != (int)PREG_REG_NONE &&
-            src1_ir.u.imm32 != 0)
-        {
-          mop_src.u.reg.r0 = (int)src1_ir.pr1_reg;
-          mop_src.u.reg.r1 = -1;
-          mop_src.needs_deref = false;
-        }
-
-        if (mop_dest.kind == MACH_OP_REG && !mop_dest.needs_deref && mop_dest.u.reg.r0 != (int)PREG_REG_NONE)
-        {
-          tcc_gen_machine_insn_scratch_reset();
-          tcc_gen_machine_load_mop(mop_src, mop_dest, cq->op);
-          dry_insn_scratch[i] = tcc_gen_machine_insn_scratch_count();
-          dry_insn_saves[i] = tcc_gen_machine_insn_scratch_saves_mask();
-        }
-        else
-        {
-          tcc_gen_machine_load_op(dest_ir, src1_ir);
-        }
-      }
-      else
-      {
-        tcc_gen_machine_load_op(dest_ir, src1_ir);
-      }
-      break;
-    }
-    case TCCIR_OP_STORE:
-    {
-      if (use_mop_store)
-      {
-        MachineOperand mop_dest_s = machine_op_from_ir(ir, &dest_ir);
-        MachineOperand mop_src_s = machine_op_from_ir(ir, &src1_ir);
-        /* Sub-component fixup for STORE value — same logic as LOAD source. */
-        if (mop_src_s.kind == MACH_OP_REG && !src1_ir.is_lval && src1_ir.pr1_reg != (int)PREG_REG_NONE &&
-            src1_ir.u.imm32 != 0)
-        {
-          mop_src_s.u.reg.r0 = (int)src1_ir.pr1_reg;
-          mop_src_s.u.reg.r1 = -1;
-          mop_src_s.needs_deref = false;
-        }
-        tcc_gen_machine_insn_scratch_reset();
-        tcc_gen_machine_store_mop(mop_dest_s, mop_src_s, cq->op);
-        dry_insn_scratch[i] = tcc_gen_machine_insn_scratch_count();
-        dry_insn_saves[i] = tcc_gen_machine_insn_scratch_saves_mask();
-      }
-      else
-      {
-        tcc_gen_machine_store_op(dest_ir, src1_ir, cq->op);
-      }
-      break;
-    }
-    case TCCIR_OP_LOAD_INDEXED:
-    {
-      bool load_indexed_before_ret = false;
-      {
-        const IRQuadCompact *nq = (i + 1 < ir->next_instruction_index) ? &ir->compact_instructions[i + 1] : NULL;
-        if (nq && nq->op == TCCIR_OP_RETURNVALUE && !has_incoming_jump[i + 1])
-        {
-          IROperand nq_src1 = tcc_ir_op_get_src1(ir, nq);
-          load_indexed_before_ret = (irop_get_vreg(nq_src1) == irop_get_vreg(dest_ir));
-        }
-      }
-      if (use_mop_load_indexed && !load_indexed_before_ret)
-      {
-        IROperand scale_raw = tcc_ir_op_get_scale(ir, cq);
-        MachineOperand mop_dest = machine_op_from_ir(ir, &dest_ir);
-        MachineOperand mop_base = machine_op_from_ir(ir, &src1_ir);
-        MachineOperand mop_index = machine_op_from_ir(ir, &src2_ir);
-        MachineOperand mop_scale = machine_op_from_ir(ir, &scale_raw);
-        tcc_gen_machine_insn_scratch_reset();
-        tcc_gen_machine_load_indexed_mop(mop_dest, mop_base, mop_index, mop_scale, cq->op);
-        dry_insn_scratch[i] = tcc_gen_machine_insn_scratch_count();
-        dry_insn_saves[i] = tcc_gen_machine_insn_scratch_saves_mask();
-      }
-      else
-      {
-        IROperand base_op = src1_ir;
-        IROperand index_op = src2_ir;
-        IROperand scale_op = tcc_ir_op_get_scale(ir, cq);
-        tcc_gen_machine_load_indexed_op(dest_ir, base_op, index_op, scale_op);
-      }
-      break;
-    }
-    case TCCIR_OP_STORE_INDEXED:
-    {
-      if (use_mop_store_indexed)
-      {
-        IROperand scale_raw = tcc_ir_op_get_scale(ir, cq);
-        MachineOperand mop_base = machine_op_from_ir(ir, &dest_ir);
-        MachineOperand mop_index = machine_op_from_ir(ir, &src2_ir);
-        MachineOperand mop_scale = machine_op_from_ir(ir, &scale_raw);
-        MachineOperand mop_value = machine_op_from_ir(ir, &src1_ir);
-        tcc_gen_machine_insn_scratch_reset();
-        tcc_gen_machine_store_indexed_mop(mop_base, mop_index, mop_scale, mop_value, cq->op);
-        dry_insn_scratch[i] = tcc_gen_machine_insn_scratch_count();
-        dry_insn_saves[i] = tcc_gen_machine_insn_scratch_saves_mask();
-      }
-      else
-      {
-        IROperand base_op = dest_ir;
-        IROperand index_op = src2_ir;
-        IROperand scale_op = tcc_ir_op_get_scale(ir, cq);
-        tcc_gen_machine_store_indexed_op(base_op, index_op, scale_op, src1_ir);
-      }
-      break;
-    }
-    case TCCIR_OP_LOAD_POSTINC:
-    {
-      if (use_mop_load_postinc)
-      {
-        IROperand offset_raw = tcc_ir_op_get_scale(ir, cq);
-        MachineOperand mop_dest = machine_op_from_ir(ir, &dest_ir);
-        MachineOperand mop_ptr = machine_op_from_ir(ir, &src1_ir);
-        MachineOperand mop_offset = machine_op_from_ir(ir, &offset_raw);
-        tcc_gen_machine_insn_scratch_reset();
-        tcc_gen_machine_load_postinc_mop(mop_dest, mop_ptr, mop_offset, cq->op);
-        dry_insn_scratch[i] = tcc_gen_machine_insn_scratch_count();
-        dry_insn_saves[i] = tcc_gen_machine_insn_scratch_saves_mask();
-      }
-      else
-      {
-        IROperand ptr_op = src1_ir;
-        IROperand offset_op = tcc_ir_op_get_scale(ir, cq);
-        tcc_gen_machine_load_postinc_op(dest_ir, ptr_op, offset_op);
-      }
-      break;
-    }
-    case TCCIR_OP_STORE_POSTINC:
-    {
-      if (use_mop_store_postinc)
-      {
-        IROperand offset_raw = tcc_ir_op_get_scale(ir, cq);
-        MachineOperand mop_ptr = machine_op_from_ir(ir, &dest_ir);
-        MachineOperand mop_value = machine_op_from_ir(ir, &src1_ir);
-        MachineOperand mop_offset = machine_op_from_ir(ir, &offset_raw);
-        tcc_gen_machine_insn_scratch_reset();
-        tcc_gen_machine_store_postinc_mop(mop_ptr, mop_value, mop_offset, cq->op);
-        dry_insn_scratch[i] = tcc_gen_machine_insn_scratch_count();
-        dry_insn_saves[i] = tcc_gen_machine_insn_scratch_saves_mask();
-      }
-      else
-      {
-        IROperand ptr_op = dest_ir;
-        IROperand value_op = src1_ir;
-        IROperand offset_op = tcc_ir_op_get_scale(ir, cq);
-        tcc_gen_machine_store_postinc_op(ptr_op, value_op, offset_op);
-      }
-      break;
-    }
-    case TCCIR_OP_LEA:
-      tcc_gen_machine_lea_op(dest_ir, src1_ir, cq->op);
-      break;
-    case TCCIR_OP_ASSIGN:
-    {
-      /* Skip MOP path when next instruction is RETURNVALUE targeting same vreg,
-       * because the real-run applies a peephole (dest→R0) that doesn't exist in
-       * the dry-run — the resulting dry/real scratch mismatch would corrupt the
-       * Phase-3 fixup.  The has_incoming_jump guard mirrors the real-run peephole
-       * condition so both passes make the same MOP/legacy decision. */
-      bool assign_before_ret = false;
-      {
-        const IRQuadCompact *nq = (i + 1 < ir->next_instruction_index) ? &ir->compact_instructions[i + 1] : NULL;
-        if (nq && nq->op == TCCIR_OP_RETURNVALUE && !has_incoming_jump[i + 1])
-        {
-          IROperand nq_src1 = tcc_ir_op_get_src1(ir, nq);
-          assign_before_ret = (irop_get_vreg(nq_src1) == irop_get_vreg(dest_ir));
-        }
-      }
-      if (use_mop_assign && !assign_before_ret)
-      {
-        MachineOperand mop_src = machine_op_from_ir(ir, &src1_ir);
-        MachineOperand mop_dest = machine_op_from_ir(ir, &dest_ir);
-        tcc_gen_machine_insn_scratch_reset();
-        tcc_gen_machine_assign_mop(mop_src, mop_dest, cq->op);
-        dry_insn_scratch[i] = tcc_gen_machine_insn_scratch_count();
-        dry_insn_saves[i] = tcc_gen_machine_insn_scratch_saves_mask();
-      }
-      else
-      {
-        TCC_MACH_DBG(
-            "[DBG-ASSIGN] i=%d dest btype=%d pr0=%d pr1=%d is64=%d needs_pair=%d src btype=%d pr0=%d pr1=%d is64=%d\n",
-            i, irop_get_btype(dest_ir), dest_ir.pr0_reg, dest_ir.pr1_reg, irop_is_64bit(dest_ir),
-            irop_needs_pair(dest_ir), irop_get_btype(src1_ir), src1_ir.pr0_reg, src1_ir.pr1_reg,
-            irop_is_64bit(src1_ir));
-        tcc_gen_machine_assign_op(dest_ir, src1_ir, cq->op);
-      }
-      break;
-    }
-    case TCCIR_OP_RETURNVALUE:
-      tcc_gen_machine_return_value_op(src1_ir, cq->op);
-      break;
-    case TCCIR_OP_RETURNVOID:
-      /* No scratch allocation needed */
-      break;
-    case TCCIR_OP_JUMP:
-      /* Record branch for optimization analysis (ot() is no-op during dry-run) */
-      tcc_gen_machine_jump_op(cq->op, dest_ir, i);
-      break;
-    case TCCIR_OP_JUMPIF:
-      /* Record branch for optimization analysis (ot() is no-op during dry-run) */
-      tcc_gen_machine_conditional_jump_op(src1_ir, cq->op, dest_ir, i);
-      break;
-    case TCCIR_OP_MUL:
-    case TCCIR_OP_MLA:
-    case TCCIR_OP_TEST_ZERO:
-    case TCCIR_OP_DIV:
-    case TCCIR_OP_UDIV:
-    case TCCIR_OP_IMOD:
-    case TCCIR_OP_UMOD:
-    case TCCIR_OP_UMULL:
-      tcc_gen_machine_data_processing_op(src1_ir, src2_ir, dest_ir, cq->op);
-      break;
-    case TCCIR_OP_ADD:
-    case TCCIR_OP_SUB:
-    case TCCIR_OP_CMP:
-    case TCCIR_OP_SHL:
-    case TCCIR_OP_SHR:
-    case TCCIR_OP_SAR:
-    case TCCIR_OP_OR:
-    case TCCIR_OP_AND:
-    case TCCIR_OP_XOR:
-    case TCCIR_OP_ADC_GEN:
-    case TCCIR_OP_ADC_USE:
-      if (use_mop_dp)
-      {
-        MachineOperand mop_src1 = machine_op_from_ir(ir, &src1_ir);
-        MachineOperand mop_src2 = machine_op_from_ir(ir, &src2_ir);
-        MachineOperand mop_dest = machine_op_from_ir(ir, &dest_ir);
-        tcc_gen_machine_insn_scratch_reset();
-        tcc_gen_machine_data_processing_mop(mop_src1, mop_src2, mop_dest, cq->op);
-        dry_insn_scratch[i] = tcc_gen_machine_insn_scratch_count();
-        dry_insn_saves[i] = tcc_gen_machine_insn_scratch_saves_mask();
-      }
-      else
-      {
-        tcc_gen_machine_data_processing_op(src1_ir, src2_ir, dest_ir, cq->op);
-      }
-      break;
-    case TCCIR_OP_IJUMP:
-      if (use_mop_ijump)
-      {
-        MachineOperand mop_src = machine_op_from_ir(ir, &src1_ir);
-        tcc_gen_machine_insn_scratch_reset();
-        tcc_gen_machine_indirect_jump_mop(mop_src, cq->op);
-        dry_insn_scratch[i] = tcc_gen_machine_insn_scratch_count();
-        dry_insn_saves[i] = tcc_gen_machine_insn_scratch_saves_mask();
-      }
-      else
-      {
-        tcc_gen_machine_indirect_jump_op(src1_ir);
-      }
-      break;
-    case TCCIR_OP_SWITCH_TABLE:
-    {
-      /* Dry-run: compute exact table size so branch offsets are accurate.
-       * Layout: ADD.W(4) + LDR.W(4) + ADD.W(4) + BX(2) = 14 bytes preamble
-       * + 4 bytes per table entry (32-bit signed PC-relative offsets). */
-      int table_id = (int)irop_get_imm64_ex(ir, src2_ir);
-      TCCIRSwitchTable *table = &ir->switch_tables[table_id];
-      int table_data_size = table->num_entries * 4; /* 4 bytes per entry */
-      ind += 14;                                    /* preamble instructions */
-      ind += table_data_size;                       /* Jump table entries */
-      break;
-    }
-    case TCCIR_OP_SETIF:
-      if (use_mop_setif)
-      {
-        MachineOperand mop_src = machine_op_from_ir(ir, &src1_ir);
-        MachineOperand mop_dest = machine_op_from_ir(ir, &dest_ir);
-        tcc_gen_machine_insn_scratch_reset();
-        tcc_gen_machine_setif_mop(mop_src, mop_dest, cq->op);
-        dry_insn_scratch[i] = tcc_gen_machine_insn_scratch_count();
-        dry_insn_saves[i] = tcc_gen_machine_insn_scratch_saves_mask();
-      }
-      else
-      {
-        tcc_gen_machine_setif_op(dest_ir, src1_ir, cq->op);
-      }
-      break;
-    case TCCIR_OP_BOOL_OR:
-    case TCCIR_OP_BOOL_AND:
-      if (use_mop_bool)
-      {
-        MachineOperand mop_src1 = machine_op_from_ir(ir, &src1_ir);
-        MachineOperand mop_src2 = machine_op_from_ir(ir, &src2_ir);
-        MachineOperand mop_dest = machine_op_from_ir(ir, &dest_ir);
-        tcc_gen_machine_insn_scratch_reset();
-        tcc_gen_machine_bool_mop(mop_src1, mop_src2, mop_dest, cq->op);
-        dry_insn_scratch[i] = tcc_gen_machine_insn_scratch_count();
-        dry_insn_saves[i] = tcc_gen_machine_insn_scratch_saves_mask();
-      }
-      else
-      {
-        tcc_gen_machine_bool_op(dest_ir, src1_ir, src2_ir, cq->op);
-      }
-      break;
-    case TCCIR_OP_FUNCCALLVOID:
-    case TCCIR_OP_FUNCCALLVAL:
-      tcc_gen_machine_func_call_op(src1_ir, src2_ir, dest_ir, 0, ir, i);
-      if (ir->has_static_chain)
-        tcc_gen_machine_restore_chain();
-      break;
-    case TCCIR_OP_SET_CHAIN:
-      /* Static chain setup: move FP to static chain register */
-      tcc_gen_machine_set_chain();
-      break;
-    case TCCIR_OP_INIT_CHAIN_SLOT:
-      /* Store parent FP into chain slot for nested function trampoline */
-      tcc_gen_machine_init_chain_slot(src1_ir);
-      break;
-    case TCCIR_OP_FUNCPARAMVAL:
-    case TCCIR_OP_FUNCPARAMVOID:
-      if (use_mop_funcparam)
-      {
-        MachineOperand mop_src1 = machine_op_from_ir(ir, &src1_ir);
-        MachineOperand mop_src2 = machine_op_from_ir(ir, &src2_ir);
-        /* No scratch tracking: FUNCPARAM does not allocate scratch registers */
-        tcc_gen_machine_func_parameter_mop(mop_src1, mop_src2, cq->op);
-      }
-      else
-      {
-        tcc_gen_machine_func_parameter_op(src1_ir, src2_ir, cq->op);
-      }
-      break;
-    case TCCIR_OP_FADD:
-    case TCCIR_OP_FSUB:
-    case TCCIR_OP_FMUL:
-    case TCCIR_OP_FDIV:
-    case TCCIR_OP_FNEG:
-    case TCCIR_OP_FCMP:
-    case TCCIR_OP_CVT_FTOF:
-    case TCCIR_OP_CVT_ITOF:
-    case TCCIR_OP_CVT_FTOI:
-      tcc_gen_machine_fp_op(dest_ir, src1_ir, src2_ir, cq->op);
-      break;
-    case TCCIR_OP_VLA_ALLOC:
-    case TCCIR_OP_VLA_SP_SAVE:
-    case TCCIR_OP_VLA_SP_RESTORE:
-      tcc_gen_machine_vla_op(dest_ir, src1_ir, src2_ir, cq->op);
-      break;
-    case TCCIR_OP_TRAP:
-      tcc_gen_machine_trap_op();
-      break;
-    default:
-      /* Unknown op - skip */
-      break;
-    }
-
-    /* Clean up scratch register state */
-    tcc_gen_machine_end_instruction();
-  }
-
-  /* End dry-run and analyze results */
-  tcc_gen_machine_dry_run_end();
-
-  /* Analyze branch offsets and select optimal encodings */
-  tcc_gen_machine_branch_opt_analyze(ir_to_code_mapping, ir->next_instruction_index);
-
-  /* Check if LR was pushed during dry run in a leaf function */
-  if (original_leaffunc && tcc_gen_machine_dry_run_get_lr_push_count() > 0)
-  {
-    /* LR was pushed in loop - save at prologue instead */
-    extra_prologue_regs |= (1 << 14); /* R_LR */
-    /* NOTE: We don't modify ir->leaffunc here because optimizations may depend on it.
-     * The extra_prologue_regs will ensure LR is pushed in the prologue, making it
-     * available as scratch without push/pop in loops, which is the main goal. */
-  }
-
-  /* Restore state for real code generation */
-  ind = saved_ind;
-  loc = saved_loc;
-  ir->call_outgoing_base = saved_call_outgoing_base;
-  ir->codegen_instruction_idx = saved_codegen_idx;
-
-  /* Phase-3 scratch conflict fixup.
-   * For each mop instruction where the dry run needed to PUSH a register
-   * (because no caller-saved scratch was free), try to move the blocking vreg
-   * to a free callee-saved register.  This eliminates the push/pop at that
-   * instruction at the cost of one extra callee-saved register in the prologue.
-   */
-  {
-    int any_fixup = 0;
+    /* ---- Instruction loop ---- */
     for (int i = 0; i < ir->next_instruction_index; i++)
     {
-      uint16_t saves = dry_insn_saves[i];
-      if (!saves)
-        continue;
-      while (saves)
+      drop_return_value = 0;
+      cq = &ir->compact_instructions[i];
+
+      /* Default: no extra scratch constraints for this instruction. */
+      ir->codegen_materialize_scratch_flags = 0;
+
+      /* Track current instruction for scratch register allocation */
+      ir->codegen_instruction_idx = i;
+
+      /* Debug tracking: update current op for ot_check failure reporting */
+      g_debug_current_op = (int)cq->op;
+
+      ir_to_code_mapping[i] = ind;
+
+      /* Real-run only: record original-index mapping and emit debug line info */
+      if (!is_dry_run)
       {
-        int r = (int)__builtin_ctz(saves);
-        saves = (uint16_t)(saves & (saves - 1u));
-        int new_r = try_reassign_scratch_conflict(ir, r, i);
-        if (new_r >= 0)
-        {
-          /* Clear the recorded dry-run scratch count for this instruction so
-           * the debug consistency check accepts the improved real-emit count. */
-          dry_insn_scratch[i] = 0;
-          any_fixup = 1;
-        }
+        if (cq->orig_index >= 0 && cq->orig_index < ir->orig_ir_to_code_mapping_size)
+          orig_ir_to_code_mapping[cq->orig_index] = ind;
+        tcc_debug_line_num(tcc_state, cq->line_num);
       }
-    }
-    if (any_fixup)
-    {
-      /* Invalidate the liveness cache so real-emit sees the new assignments. */
-      tcc_ls_reset_scratch_cache(&ir->ls);
-    }
-  }
 
-  /* Reset scratch state for real pass */
-  tcc_gen_machine_reset_scratch_state();
+      /* Get operand copies from iroperand_pool (compact representation) */
+      IROperand src1_ir = tcc_ir_op_get_src1(ir, cq);
+      IROperand src2_ir = tcc_ir_op_get_src2(ir, cq);
+      IROperand dest_ir = tcc_ir_op_get_dest(ir, cq);
 
-  /* Clear caches for fresh start - dry-run may have recorded entries
-   * but the actual instructions were never emitted */
-  tcc_ir_spill_cache_clear(&ir->spill_cache);
-  tcc_ir_opt_fp_cache_clear(ir);
-#endif /* DRY_RUN_DISABLED */
+      /* Operands are NOT filled here. machine_op_from_ir reads the interval
+       * table directly from the raw operand.  All dispatch sites now use
+       * MachineOperand-based (_mop) handlers unconditionally. */
 
-  /* ============================================================================
-   * REAL CODE GENERATION PASS
-   * ============================================================================
-   */
-
-  // generate prolog (with extra registers if needed)
-  (void)original_leaffunc; /* May be unused when dry-run is disabled */
-  if (!ir->naked)
-    tcc_gen_machine_prolog(ir->leaffunc, ir->ls.dirty_registers, stack_size, extra_prologue_regs);
-
-  /* Emit DWARF prologue_end AFTER machine prolog so the debugger knows
-   * where the prologue ends and sets breakpoints at the correct address.
-   * Previously this was emitted in tccgen.c before any machine code existed,
-   * causing breakpoints to land far from the actual prolog. */
-  if (!ir->naked)
-    tcc_debug_prolog_epilog(tcc_state, 0);
-
-  for (int i = 0; i < ir->next_instruction_index; i++)
-  {
-    drop_return_value = 0;
-    cq = &ir->compact_instructions[i];
-
-    /* Default: no extra scratch constraints for this instruction. */
-    ir->codegen_materialize_scratch_flags = 0;
-
-    /* Track current instruction for scratch register allocation */
-    ir->codegen_instruction_idx = i;
-
-    /* Debug tracking: let ot_check print the current IR op on failure */
-    g_debug_current_op = (int)cq->op;
-
-    ir_to_code_mapping[i] = ind;
-
-    if (cq->orig_index >= 0 && cq->orig_index < ir->orig_ir_to_code_mapping_size)
-      orig_ir_to_code_mapping[cq->orig_index] = ind;
-
-    // emit debug line info for this IR instruction AFTER recording ind
-    tcc_debug_line_num(tcc_state, cq->line_num);
-
-    /* Get operand copies from iroperand_pool (compact representation) */
-    IROperand src1_ir = tcc_ir_op_get_src1(ir, cq);
-    IROperand src2_ir = tcc_ir_op_get_src2(ir, cq);
-    IROperand dest_ir = tcc_ir_op_get_dest(ir, cq);
-
-    /* Peephole for LOAD/ASSIGN/LOAD_INDEXED followed by RETURNVALUE:
-     * Update the live interval to use R0 BEFORE register allocation.
-     * This ensures the load result goes directly to the return register.
-     */
-    if (cq->op == TCCIR_OP_LOAD || cq->op == TCCIR_OP_ASSIGN || cq->op == TCCIR_OP_LOAD_INDEXED)
-    {
-      const IRQuadCompact *ir_next = (i + 1 < ir->next_instruction_index) ? &ir->compact_instructions[i + 1] : NULL;
-      if (ir_next && ir_next->op == TCCIR_OP_RETURNVALUE && !has_incoming_jump[i + 1])
+      switch (cq->op)
       {
-        IROperand next_src1 = tcc_ir_op_get_src1(ir, ir_next);
-        int next_vr = irop_get_vreg(next_src1);
-        int dest_vr = irop_get_vreg(dest_ir);
-        if (next_vr == dest_vr && next_vr >= 0)
-        {
-          IRLiveInterval *li = tcc_ir_get_live_interval(ir, dest_vr);
-          if (li && li->allocation.r0 != REG_IRET)
-          {
-#ifdef TCC_REGALLOC_DEBUG
-            fprintf(stderr, "[RA-PEEPHOLE] i=%d op=%d dest_vr=0x%x old_r0=%d -> R0 (RETURNVALUE next)\n", i, cq->op,
-                    dest_vr, li->allocation.r0);
-#endif
-            li->allocation.r0 = REG_IRET;
-            li->allocation.offset = 0;
-            if (li->is_llong || li->is_double)
-              li->allocation.r1 = REG_IRE2;
-          }
-        }
-      }
-    }
-
-    /* Apply register allocation to operands */
-    if (irop_get_tag(src1_ir) != IROP_TAG_NONE)
-      tcc_ir_fill_registers_ir(ir, &src1_ir);
-    if (irop_get_tag(src2_ir) != IROP_TAG_NONE)
-      tcc_ir_fill_registers_ir(ir, &src2_ir);
-    if (irop_get_tag(dest_ir) != IROP_TAG_NONE)
-      tcc_ir_fill_registers_ir(ir, &dest_ir);
-
-    /* Mop path: use MachineOperand-based dispatch for simple 32-bit ops;
-     * the mach_* helpers in arm-thumb-gen.c handle all materialization. */
-    bool use_mop_dp = false;
-    bool use_mop_assign = false;
-    bool use_mop_setif = false;
-    bool use_mop_bool = false;
-    bool use_mop_load = false;
-    bool use_mop_store = false;
-    bool use_mop_load_indexed = false;
-    bool use_mop_store_indexed = false;
-    bool use_mop_load_postinc = false;
-    bool use_mop_store_postinc = false;
-    bool use_mop_ijump = false;
-    bool use_mop_funcparam = false;
-    switch (cq->op)
-    {
-    case TCCIR_OP_ADD:
-    case TCCIR_OP_SUB:
-    case TCCIR_OP_CMP:
-    case TCCIR_OP_SHL:
-    case TCCIR_OP_SHR:
-    case TCCIR_OP_SAR:
-    case TCCIR_OP_AND:
-    case TCCIR_OP_OR:
-    case TCCIR_OP_XOR:
-    case TCCIR_OP_ADC_GEN:
-    case TCCIR_OP_ADC_USE:
-      if (!irop_needs_pair(dest_ir) && !ir->has_static_chain)
-        use_mop_dp = true;
-      break;
-    case TCCIR_OP_ASSIGN:
-      if (!irop_needs_pair(dest_ir) && !irop_needs_pair(src1_ir) && !ir->has_static_chain)
-        use_mop_assign = true;
-      break;
-    case TCCIR_OP_SETIF:
-      if (!irop_needs_pair(dest_ir) && !ir->has_static_chain)
-        use_mop_setif = true;
-      break;
-    case TCCIR_OP_BOOL_OR:
-    case TCCIR_OP_BOOL_AND:
-      if (!irop_needs_pair(dest_ir) && !irop_needs_pair(src1_ir) && !irop_needs_pair(src2_ir) && !ir->has_static_chain)
-        use_mop_bool = true;
-      break;
-    case TCCIR_OP_LOAD:
-      if (!irop_needs_pair(dest_ir) && !irop_needs_pair(src1_ir) && !ir->has_static_chain)
-        use_mop_load = true;
-      break;
-    case TCCIR_OP_STORE:
-      if (!irop_needs_pair(src1_ir) && !ir->has_static_chain)
-        use_mop_store = true;
-      break;
-    case TCCIR_OP_LOAD_INDEXED:
-      if (!irop_needs_pair(dest_ir) && !ir->has_static_chain)
-        use_mop_load_indexed = true;
-      break;
-    case TCCIR_OP_STORE_INDEXED:
-      if (!irop_needs_pair(src1_ir) && !ir->has_static_chain)
-        use_mop_store_indexed = true;
-      break;
-    case TCCIR_OP_LOAD_POSTINC:
-      if (!irop_needs_pair(dest_ir) && !ir->has_static_chain)
-        use_mop_load_postinc = true;
-      break;
-    case TCCIR_OP_STORE_POSTINC:
-      if (!irop_needs_pair(src1_ir) && !ir->has_static_chain)
-        use_mop_store_postinc = true;
-      break;
-    case TCCIR_OP_IJUMP:
-      if (!ir->has_static_chain)
-        use_mop_ijump = true;
-      break;
-    case TCCIR_OP_FUNCPARAMVAL:
-    case TCCIR_OP_FUNCPARAMVOID:
-      use_mop_funcparam = true;
-      break;
-    default:
-      break;
-    }
-
-#ifdef TCC_REGALLOC_DEBUG
-    /* Full instruction trace for target function */
-    if (_dbg_trace_all)
-    {
-      IROperand raw_s1 = tcc_ir_op_get_src1(ir, cq);
-      IROperand raw_s2 = tcc_ir_op_get_src2(ir, cq);
-      IROperand raw_d = tcc_ir_op_get_dest(ir, cq);
-      fprintf(stderr,
-              "[RA-TRACE] i=%d op=%d s1_vr=0x%x s1_pr0=%d s2_vr=0x%x s2_pr0=%d d_vr=0x%x d_pr0=%d s1_tag=%d d_tag=%d\n",
-              i, cq->op, irop_get_vreg(raw_s1), src1_ir.pr0_reg, irop_get_vreg(raw_s2), src2_ir.pr0_reg,
-              irop_get_vreg(raw_d), dest_ir.pr0_reg, irop_get_tag(src1_ir), irop_get_tag(dest_ir));
-    }
-
-    /* Diagnostic: for LOAD instructions, log ALL source vreg details */
-    if (cq->op == TCCIR_OP_LOAD)
-    {
-      IROperand raw_src1 = tcc_ir_op_get_src1(ir, cq);
-      int raw_tag = irop_get_tag(raw_src1);
-      if (raw_tag == IROP_TAG_VREG || raw_tag == 2 /* IROP_TAG_VREG_LVAL */)
+      case TCCIR_OP_MUL:
+      case TCCIR_OP_DIV:
+      case TCCIR_OP_UDIV:
+      case TCCIR_OP_IMOD:
+      case TCCIR_OP_UMOD:
+      case TCCIR_OP_TEST_ZERO:
       {
-        int src_vreg = irop_get_vreg(raw_src1);
-        if (src_vreg > 0)
-        {
-          IRLiveInterval *dbg_li = tcc_ir_get_live_interval(ir, src_vreg);
-          if (dbg_li)
-            fprintf(
-                stderr,
-                "[RA-LOAD] i=%d src_vreg=0x%x alloc.r0=%d pr0_reg=%d dest_pr0=%d tag=%d lval=%d local=%d spill=%d\n", i,
-                src_vreg, dbg_li->allocation.r0, src1_ir.pr0_reg, dest_ir.pr0_reg, irop_get_tag(src1_ir),
-                src1_ir.is_lval, src1_ir.is_local, src1_ir.pr0_spilled);
-        }
+        MachineOperand mop_src1 = machine_op_from_ir(ir, &src1_ir);
+        MachineOperand mop_src2 = machine_op_from_ir(ir, &src2_ir);
+        MachineOperand mop_dest = machine_op_from_ir(ir, &dest_ir);
+        tcc_gen_machine_insn_scratch_reset();
+        tcc_gen_machine_muldiv_mop(mop_src1, mop_src2, mop_dest, cq->op);
+        ir_codegen_track_scratch(is_dry_run, i, cq->op, dry_insn_scratch, dry_insn_saves);
+        break;
       }
-    }
-    /* Also log AND/OR/ADD operations that might show the register mismatch */
-    if (cq->op == TCCIR_OP_AND || cq->op == TCCIR_OP_OR)
-    {
-      IROperand raw_dest = tcc_ir_op_get_dest(ir, cq);
-      IROperand raw_src1 = tcc_ir_op_get_src1(ir, cq);
-      fprintf(
-          stderr,
-          "[RA-ALU] i=%d op=%d src1_pr0=%d src2_pr0=%d dest_pr0=%d src1_tag=%d dest_tag=%d src1_vr=0x%x dest_vr=0x%x\n",
-          i, cq->op, src1_ir.pr0_reg, src2_ir.pr0_reg, dest_ir.pr0_reg, irop_get_tag(src1_ir), irop_get_tag(dest_ir),
-          irop_get_vreg(raw_src1), irop_get_vreg(raw_dest));
-    }
-    /* Log ASSIGN operations */
-    if (cq->op == TCCIR_OP_ASSIGN)
-    {
-      IROperand raw_dest = tcc_ir_op_get_dest(ir, cq);
-      IROperand raw_src1 = tcc_ir_op_get_src1(ir, cq);
-      fprintf(stderr, "[RA-ASSIGN] i=%d src1_pr0=%d dest_pr0=%d src1_tag=%d dest_tag=%d src1_vr=0x%x dest_vr=0x%x\n", i,
-              src1_ir.pr0_reg, dest_ir.pr0_reg, irop_get_tag(src1_ir), irop_get_tag(dest_ir), irop_get_vreg(raw_src1),
-              irop_get_vreg(raw_dest));
-    }
-#endif
-
-    switch (cq->op)
-    {
-    case TCCIR_OP_MUL:
-    case TCCIR_OP_MLA:
-    case TCCIR_OP_TEST_ZERO:
-    case TCCIR_OP_DIV:
-    case TCCIR_OP_UDIV:
-    case TCCIR_OP_IMOD:
-    case TCCIR_OP_UMOD:
-    case TCCIR_OP_UMULL:
-      tcc_gen_machine_data_processing_op(src1_ir, src2_ir, dest_ir, cq->op);
-      break;
-    case TCCIR_OP_ADD:
-    case TCCIR_OP_SUB:
-    case TCCIR_OP_CMP:
-    case TCCIR_OP_SHL:
-    case TCCIR_OP_SHR:
-    case TCCIR_OP_SAR:
-    case TCCIR_OP_OR:
-    case TCCIR_OP_AND:
-    case TCCIR_OP_XOR:
-    case TCCIR_OP_ADC_GEN:
-    case TCCIR_OP_ADC_USE:
-      if (use_mop_dp)
+      case TCCIR_OP_MLA:
+      {
+        IROperand accum_ir = ir->iroperand_pool[cq->operand_base + 3];
+        MachineOperand mop_src1 = machine_op_from_ir(ir, &src1_ir);
+        MachineOperand mop_src2 = machine_op_from_ir(ir, &src2_ir);
+        MachineOperand mop_dest = machine_op_from_ir(ir, &dest_ir);
+        MachineOperand mop_accum = machine_op_from_ir(ir, &accum_ir);
+        tcc_gen_machine_insn_scratch_reset();
+        tcc_gen_machine_mla_mop(mop_src1, mop_src2, mop_dest, mop_accum);
+        ir_codegen_track_scratch(is_dry_run, i, cq->op, dry_insn_scratch, dry_insn_saves);
+        break;
+      }
+      case TCCIR_OP_UMULL:
+      {
+        MachineOperand mop_src1 = machine_op_from_ir(ir, &src1_ir);
+        MachineOperand mop_src2 = machine_op_from_ir(ir, &src2_ir);
+        MachineOperand mop_dest = machine_op_from_ir(ir, &dest_ir);
+        tcc_gen_machine_insn_scratch_reset();
+        tcc_gen_machine_umull_mop(mop_src1, mop_src2, mop_dest);
+        ir_codegen_track_scratch(is_dry_run, i, cq->op, dry_insn_scratch, dry_insn_saves);
+        break;
+      }
+      case TCCIR_OP_ADD:
+      case TCCIR_OP_SUB:
+      case TCCIR_OP_CMP:
+      case TCCIR_OP_SHL:
+      case TCCIR_OP_SHR:
+      case TCCIR_OP_SAR:
+      case TCCIR_OP_OR:
+      case TCCIR_OP_AND:
+      case TCCIR_OP_XOR:
+      case TCCIR_OP_ADC_GEN:
+      case TCCIR_OP_ADC_USE:
       {
         MachineOperand mop_src1 = machine_op_from_ir(ir, &src1_ir);
         MachineOperand mop_src2 = machine_op_from_ir(ir, &src2_ir);
         MachineOperand mop_dest = machine_op_from_ir(ir, &dest_ir);
         tcc_gen_machine_insn_scratch_reset();
         tcc_gen_machine_data_processing_mop(mop_src1, mop_src2, mop_dest, cq->op);
-#ifdef TCC_LS_DEBUG
-        /* Phase-3 consistency check: dry-run and real-emit scratch counts must agree.
-         * A mismatch is expected (and acceptable) for instructions where the scratch
-         * conflict fixup was applied (dry_insn_saves != 0 means fixup was attempted). */
-        {
-          int real_scratch = tcc_gen_machine_insn_scratch_count();
-          if (real_scratch != dry_insn_scratch[i] && dry_insn_saves[i] == 0)
-            fprintf(stderr, "[insn-scratch] i=%d op=%d dry=%d real=%d MISMATCH\n", i, (int)cq->op, dry_insn_scratch[i],
-                    real_scratch);
-        }
-#endif
+        ir_codegen_track_scratch(is_dry_run, i, cq->op, dry_insn_scratch, dry_insn_saves);
+        break;
       }
-      else
+      case TCCIR_OP_FADD:
+      case TCCIR_OP_FSUB:
+      case TCCIR_OP_FMUL:
+      case TCCIR_OP_FDIV:
+      case TCCIR_OP_FNEG:
+      case TCCIR_OP_FCMP:
+      case TCCIR_OP_CVT_FTOF:
+      case TCCIR_OP_CVT_ITOF:
+      case TCCIR_OP_CVT_FTOI:
       {
-        tcc_gen_machine_data_processing_op(src1_ir, src2_ir, dest_ir, cq->op);
-      }
-      break;
-    case TCCIR_OP_FADD:
-    case TCCIR_OP_FSUB:
-    case TCCIR_OP_FMUL:
-    case TCCIR_OP_FDIV:
-    case TCCIR_OP_FNEG:
-    case TCCIR_OP_FCMP:
-    case TCCIR_OP_CVT_FTOF:
-    case TCCIR_OP_CVT_ITOF:
-    case TCCIR_OP_CVT_FTOI:
-      tcc_gen_machine_fp_op(dest_ir, src1_ir, src2_ir, cq->op);
-      break;
-    case TCCIR_OP_LOAD:
-    {
-      bool load_before_ret = false;
-      {
-        const IRQuadCompact *nq = (i + 1 < ir->next_instruction_index) ? &ir->compact_instructions[i + 1] : NULL;
-        if (nq && nq->op == TCCIR_OP_RETURNVALUE && !has_incoming_jump[i + 1])
-        {
-          IROperand nq_src1 = tcc_ir_op_get_src1(ir, nq);
-          load_before_ret = (irop_get_vreg(nq_src1) == irop_get_vreg(dest_ir));
-        }
-      }
-      if (use_mop_load && !load_before_ret)
-      {
-        MachineOperand mop_src = machine_op_from_ir(ir, &src1_ir);
+        MachineOperand mop_src1 = machine_op_from_ir(ir, &src1_ir);
+        MachineOperand mop_src2 = machine_op_from_ir(ir, &src2_ir);
         MachineOperand mop_dest = machine_op_from_ir(ir, &dest_ir);
-
-        /* Sub-component fixup for LOAD sources — see dry-run comment above. */
-        if (mop_src.kind == MACH_OP_REG && !src1_ir.is_lval && src1_ir.pr1_reg != (int)PREG_REG_NONE &&
-            src1_ir.u.imm32 != 0)
-        {
-          mop_src.u.reg.r0 = (int)src1_ir.pr1_reg;
-          mop_src.u.reg.r1 = -1;
-          mop_src.needs_deref = false;
-        }
-
-        if (mop_dest.kind == MACH_OP_REG && !mop_dest.needs_deref && mop_dest.u.reg.r0 != (int)PREG_REG_NONE)
-        {
-          tcc_gen_machine_insn_scratch_reset();
-          tcc_gen_machine_load_mop(mop_src, mop_dest, cq->op);
-#ifdef TCC_LS_DEBUG
-          {
-            int real_scratch = tcc_gen_machine_insn_scratch_count();
-            if (real_scratch != dry_insn_scratch[i] && dry_insn_saves[i] == 0)
-              fprintf(stderr, "[insn-scratch] i=%d op=%d dry=%d real=%d MISMATCH\n", i, (int)cq->op,
-                      dry_insn_scratch[i], real_scratch);
-          }
-#endif
-        }
-        else
-        {
-          /* Dest not a simple register: fall back to old path. */
-          tcc_gen_machine_load_op(dest_ir, src1_ir);
-        }
+        tcc_gen_machine_fp_mop(mop_src1, mop_src2, mop_dest, cq->op, src1_ir.is_complex || dest_ir.is_complex);
+        break;
       }
-      else
+      case TCCIR_OP_LOAD:
       {
-        /* Old path with RETURNVALUE peephole */
-        const IRQuadCompact *ir_next = (i + 1 < ir->next_instruction_index) ? &ir->compact_instructions[i + 1] : NULL;
-        int ir_next_src1_vr = -1;
-        if (ir_next && ir_next->op == TCCIR_OP_RETURNVALUE)
-        {
-          IROperand next_src1_irop = tcc_ir_op_get_src1(ir, ir_next);
-          ir_next_src1_vr = irop_get_vreg(next_src1_irop);
-        }
-        const int dest_vreg = irop_get_vreg(dest_ir);
-        int is_64bit_load = irop_is_64bit(dest_ir);
-        if (ir_next && ir_next->op == TCCIR_OP_RETURNVALUE && ir_next_src1_vr == dest_vreg && !has_incoming_jump[i + 1])
-        {
-          dest_ir.pr0_reg = REG_IRET; /* R0 */
-          dest_ir.pr0_spilled = 0;
-          if (is_64bit_load)
-          {
-            dest_ir.pr1_reg = REG_IRE2; /* R1 */
-            dest_ir.pr1_spilled = 0;
-          }
-          /* Also update the interval allocation so that RETURNVALUE's src1 gets the same registers */
-          IRLiveInterval *interval = tcc_ir_get_live_interval(ir, dest_vreg);
-          if (interval)
-          {
-            interval->allocation.r0 = REG_IRET;
-            if (is_64bit_load)
-              interval->allocation.r1 = REG_IRE2;
-          }
-        }
-        tcc_gen_machine_load_op(dest_ir, src1_ir);
+        MachineOperand mop_dest;
+        if (!ir_codegen_before_ret_peephole(ir, i, &dest_ir, has_incoming_jump, &mop_dest))
+          mop_dest = machine_op_from_ir(ir, &dest_ir);
+        MachineOperand mop_src = machine_op_from_ir(ir, &src1_ir);
+        mop_fixup_subcomponent(&mop_src, &src1_ir, ir);
+        if (mop_dest.kind == MACH_OP_NONE || mop_src.kind == MACH_OP_NONE)
+          tcc_error("compiler_error: LOAD operand produced MACH_OP_NONE (i=%d dest_kind=%d src_kind=%d)", i,
+                    mop_dest.kind, mop_src.kind);
+        tcc_gen_machine_insn_scratch_reset();
+        tcc_gen_machine_load_mop(mop_src, mop_dest, cq->op);
+        ir_codegen_track_scratch(is_dry_run, i, cq->op, dry_insn_scratch, dry_insn_saves);
+        break;
       }
-      break;
-    }
-    case TCCIR_OP_STORE:
-    {
-      if (use_mop_store)
+      case TCCIR_OP_STORE:
       {
         MachineOperand mop_dest_s = machine_op_from_ir(ir, &dest_ir);
         MachineOperand mop_src_s = machine_op_from_ir(ir, &src1_ir);
-        /* Sub-component fixup for STORE value — same logic as LOAD source. */
-        if (mop_src_s.kind == MACH_OP_REG && !src1_ir.is_lval && src1_ir.pr1_reg != (int)PREG_REG_NONE &&
-            src1_ir.u.imm32 != 0)
-        {
-          mop_src_s.u.reg.r0 = (int)src1_ir.pr1_reg;
-          mop_src_s.u.reg.r1 = -1;
-          mop_src_s.needs_deref = false;
-        }
+        mop_fixup_subcomponent(&mop_src_s, &src1_ir, ir);
+        if (mop_dest_s.kind == MACH_OP_NONE || mop_src_s.kind == MACH_OP_NONE)
+          tcc_error("compiler_error: STORE operand produced MACH_OP_NONE (i=%d dest_kind=%d src_kind=%d)", i,
+                    mop_dest_s.kind, mop_src_s.kind);
         tcc_gen_machine_insn_scratch_reset();
         tcc_gen_machine_store_mop(mop_dest_s, mop_src_s, cq->op);
-#ifdef TCC_LS_DEBUG
-        {
-          int real_scratch = tcc_gen_machine_insn_scratch_count();
-          if (real_scratch != dry_insn_scratch[i] && dry_insn_saves[i] == 0)
-            fprintf(stderr, "[insn-scratch] i=%d op=%d dry=%d real=%d MISMATCH\n", i, (int)cq->op, dry_insn_scratch[i],
-                    real_scratch);
-        }
-#endif
+        ir_codegen_track_scratch(is_dry_run, i, cq->op, dry_insn_scratch, dry_insn_saves);
+        break;
       }
-      else
+      case TCCIR_OP_LOAD_INDEXED:
       {
-        tcc_gen_machine_store_op(dest_ir, src1_ir, cq->op);
-      }
-      break;
-    }
-    case TCCIR_OP_LOAD_INDEXED:
-    {
-      /* LOAD_INDEXED: dest = *(base + (index << scale)) */
-      bool load_indexed_before_ret = false;
-      {
-        const IRQuadCompact *ir_next = (i + 1 < ir->next_instruction_index) ? &ir->compact_instructions[i + 1] : NULL;
-        if (ir_next && ir_next->op == TCCIR_OP_RETURNVALUE && !has_incoming_jump[i + 1])
-        {
-          IROperand nq_src1 = tcc_ir_op_get_src1(ir, ir_next);
-          load_indexed_before_ret = (irop_get_vreg(nq_src1) == irop_get_vreg(dest_ir));
-        }
-      }
-      if (use_mop_load_indexed && !load_indexed_before_ret)
-      {
+        MachineOperand mop_dest;
+        if (!ir_codegen_before_ret_peephole(ir, i, &dest_ir, has_incoming_jump, &mop_dest))
+          mop_dest = machine_op_from_ir(ir, &dest_ir);
         IROperand scale_raw = tcc_ir_op_get_scale(ir, cq);
-        MachineOperand mop_dest = machine_op_from_ir(ir, &dest_ir);
         MachineOperand mop_base = machine_op_from_ir(ir, &src1_ir);
         MachineOperand mop_index = machine_op_from_ir(ir, &src2_ir);
         MachineOperand mop_scale = machine_op_from_ir(ir, &scale_raw);
         tcc_gen_machine_insn_scratch_reset();
         tcc_gen_machine_load_indexed_mop(mop_dest, mop_base, mop_index, mop_scale, cq->op);
-#ifdef TCC_LS_DEBUG
-        {
-          int real_scratch = tcc_gen_machine_insn_scratch_count();
-          if (real_scratch != dry_insn_scratch[i] && dry_insn_saves[i] == 0)
-            fprintf(stderr, "[insn-scratch] i=%d op=%d dry=%d real=%d MISMATCH\n", i, (int)cq->op, dry_insn_scratch[i],
-                    real_scratch);
-        }
-#endif
+        ir_codegen_track_scratch(is_dry_run, i, cq->op, dry_insn_scratch, dry_insn_saves);
+        break;
       }
-      else
-      {
-        /* Old path with RETURNVALUE peephole — load directly into R0 if next is RETURNVALUE */
-        IROperand base_op = src1_ir;
-        IROperand index_op = src2_ir;
-        IROperand scale_op = tcc_ir_op_get_scale(ir, cq);
-        const IRQuadCompact *ir_next = (i + 1 < ir->next_instruction_index) ? &ir->compact_instructions[i + 1] : NULL;
-        const int dest_vreg = irop_get_vreg(dest_ir);
-        if (ir_next && ir_next->op == TCCIR_OP_RETURNVALUE && load_indexed_before_ret && !has_incoming_jump[i + 1])
-        {
-          dest_ir.pr0_reg = REG_IRET;
-          dest_ir.pr0_spilled = 0;
-          IRLiveInterval *interval = tcc_ir_get_live_interval(ir, dest_vreg);
-          if (interval)
-            interval->allocation.r0 = REG_IRET;
-        }
-        tcc_gen_machine_load_indexed_op(dest_ir, base_op, index_op, scale_op);
-      }
-      break;
-    }
-    case TCCIR_OP_STORE_INDEXED:
-    {
-      /* STORE_INDEXED: *(base + (index << scale)) = value */
-      if (use_mop_store_indexed)
+      case TCCIR_OP_STORE_INDEXED:
       {
         IROperand scale_raw = tcc_ir_op_get_scale(ir, cq);
         MachineOperand mop_base = machine_op_from_ir(ir, &dest_ir);
@@ -2355,29 +1463,10 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
         MachineOperand mop_value = machine_op_from_ir(ir, &src1_ir);
         tcc_gen_machine_insn_scratch_reset();
         tcc_gen_machine_store_indexed_mop(mop_base, mop_index, mop_scale, mop_value, cq->op);
-#ifdef TCC_LS_DEBUG
-        {
-          int real_scratch = tcc_gen_machine_insn_scratch_count();
-          if (real_scratch != dry_insn_scratch[i] && dry_insn_saves[i] == 0)
-            fprintf(stderr, "[insn-scratch] i=%d op=%d dry=%d real=%d MISMATCH\n", i, (int)cq->op, dry_insn_scratch[i],
-                    real_scratch);
-        }
-#endif
+        ir_codegen_track_scratch(is_dry_run, i, cq->op, dry_insn_scratch, dry_insn_saves);
+        break;
       }
-      else
-      {
-        IROperand base_op = dest_ir;
-        IROperand value_op = src1_ir;
-        IROperand index_op = src2_ir;
-        IROperand scale_op = tcc_ir_op_get_scale(ir, cq);
-        tcc_gen_machine_store_indexed_op(base_op, index_op, scale_op, value_op);
-      }
-      break;
-    }
-    case TCCIR_OP_LOAD_POSTINC:
-    {
-      /* LOAD_POSTINC: dest = *ptr; ptr += offset */
-      if (use_mop_load_postinc)
+      case TCCIR_OP_LOAD_POSTINC:
       {
         IROperand offset_raw = tcc_ir_op_get_scale(ir, cq);
         MachineOperand mop_dest = machine_op_from_ir(ir, &dest_ir);
@@ -2385,27 +1474,10 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
         MachineOperand mop_offset = machine_op_from_ir(ir, &offset_raw);
         tcc_gen_machine_insn_scratch_reset();
         tcc_gen_machine_load_postinc_mop(mop_dest, mop_ptr, mop_offset, cq->op);
-#ifdef TCC_LS_DEBUG
-        {
-          int real_scratch = tcc_gen_machine_insn_scratch_count();
-          if (real_scratch != dry_insn_scratch[i] && dry_insn_saves[i] == 0)
-            fprintf(stderr, "[insn-scratch] i=%d op=%d dry=%d real=%d MISMATCH\n", i, (int)cq->op, dry_insn_scratch[i],
-                    real_scratch);
-        }
-#endif
+        ir_codegen_track_scratch(is_dry_run, i, cq->op, dry_insn_scratch, dry_insn_saves);
+        break;
       }
-      else
-      {
-        IROperand ptr_op = src1_ir;
-        IROperand offset_op = tcc_ir_op_get_scale(ir, cq);
-        tcc_gen_machine_load_postinc_op(dest_ir, ptr_op, offset_op);
-      }
-      break;
-    }
-    case TCCIR_OP_STORE_POSTINC:
-    {
-      /* STORE_POSTINC: *ptr = value; ptr += offset */
-      if (use_mop_store_postinc)
+      case TCCIR_OP_STORE_POSTINC:
       {
         IROperand offset_raw = tcc_ir_op_get_scale(ir, cq);
         MachineOperand mop_ptr = machine_op_from_ir(ir, &dest_ir);
@@ -2413,296 +1485,245 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
         MachineOperand mop_offset = machine_op_from_ir(ir, &offset_raw);
         tcc_gen_machine_insn_scratch_reset();
         tcc_gen_machine_store_postinc_mop(mop_ptr, mop_value, mop_offset, cq->op);
-#ifdef TCC_LS_DEBUG
-        {
-          int real_scratch = tcc_gen_machine_insn_scratch_count();
-          if (real_scratch != dry_insn_scratch[i] && dry_insn_saves[i] == 0)
-            fprintf(stderr, "[insn-scratch] i=%d op=%d dry=%d real=%d MISMATCH\n", i, (int)cq->op, dry_insn_scratch[i],
-                    real_scratch);
-        }
-#endif
+        ir_codegen_track_scratch(is_dry_run, i, cq->op, dry_insn_scratch, dry_insn_saves);
+        break;
       }
-      else
-      {
-        IROperand ptr_op = dest_ir;
-        IROperand value_op = src1_ir;
-        IROperand offset_op = tcc_ir_op_get_scale(ir, cq);
-        tcc_gen_machine_store_postinc_op(ptr_op, value_op, offset_op);
-      }
-      break;
-    }
-    case TCCIR_OP_RETURNVALUE:
-    {
-      /* Peephole: if previous instruction was LOAD/ASSIGN that already loaded to R0,
-       * skip the return value copy.
-       * Check the interval allocation (updated by LOAD/ASSIGN peepholes) instead of
-       * pool entries, since we work with local IROperand copies. */
-      const IRQuadCompact *ir_prev = (i > 0) ? &ir->compact_instructions[i - 1] : NULL;
-      int skip_copy = 0;
-      if (!has_incoming_jump[i] && ir_prev && (ir_prev->op == TCCIR_OP_LOAD || ir_prev->op == TCCIR_OP_ASSIGN))
-      {
-        IROperand prev_dest_irop = tcc_ir_op_get_dest(ir, ir_prev);
-        const int prev_dest_vreg = irop_get_vreg(prev_dest_irop);
-        const int src1_vreg = irop_get_vreg(src1_ir);
-        if (prev_dest_vreg == src1_vreg)
-        {
-          /* Check if the LOAD/ASSIGN peephole updated the interval to R0 */
-          IRLiveInterval *prev_interval = tcc_ir_get_live_interval(ir, prev_dest_vreg);
-          if (prev_interval && prev_interval->allocation.r0 == REG_IRET)
-            skip_copy = 1;
-        }
-      }
-      if (!skip_copy)
-      {
-        tcc_gen_machine_return_value_op(src1_ir, cq->op);
-      }
-    }
-    case TCCIR_OP_RETURNVOID:
-      /* Emit jump to epilogue (will be backpatched later) */
-      /* if return is last instruction, then jump is not needed */
-      if (i != ir->next_instruction_index - 1)
-      {
-        return_jump_addrs[num_return_jumps++] = ind;
-        /* Return jumps target the epilogue (-1 indicates no IR target) */
-        tcc_gen_machine_jump_op(cq->op, dest_ir, i);
-      }
-      break;
-    case TCCIR_OP_ASSIGN:
-    {
-      /* Peephole: if next instruction is RETURNVALUE using this ASSIGN's dest,
-       * assign directly to R0 to avoid an extra move */
-      const IRQuadCompact *ir_next = (i + 1 < ir->next_instruction_index) ? &ir->compact_instructions[i + 1] : NULL;
-      int ir_next_src1_vr = -1;
-      if (ir_next && ir_next->op == TCCIR_OP_RETURNVALUE)
-      {
-        IROperand next_src1_irop = tcc_ir_op_get_src1(ir, ir_next);
-        ir_next_src1_vr = irop_get_vreg(next_src1_irop);
-      }
-      const int assign_dest_vreg = irop_get_vreg(dest_ir);
-      if (ir_next && ir_next->op == TCCIR_OP_RETURNVALUE && ir_next_src1_vr == assign_dest_vreg &&
-          !has_incoming_jump[i + 1])
-      {
-        dest_ir.pr0_reg = REG_IRET; /* R0 */
-        dest_ir.pr0_spilled = 0;
-        if (irop_is_64bit(dest_ir))
-        {
-          dest_ir.pr1_reg = REG_IRE2; /* R1 */
-          dest_ir.pr1_spilled = 0;
-        }
-        /* Update the interval allocation so RETURNVALUE sees the change */
-        IRLiveInterval *interval = tcc_ir_get_live_interval(ir, assign_dest_vreg);
-        if (interval)
-        {
-          interval->allocation.r0 = REG_IRET;
-          if (irop_is_64bit(dest_ir))
-            interval->allocation.r1 = REG_IRE2;
-        }
-      }
-      /* Same assign_before_ret guard as the dry-run: keep both passes consistent. */
-      bool assign_before_ret = false;
-      {
-        const IRQuadCompact *nq = (i + 1 < ir->next_instruction_index) ? &ir->compact_instructions[i + 1] : NULL;
-        if (nq && nq->op == TCCIR_OP_RETURNVALUE && !has_incoming_jump[i + 1])
-        {
-          IROperand nq_src1 = tcc_ir_op_get_src1(ir, nq);
-          assign_before_ret = (irop_get_vreg(nq_src1) == assign_dest_vreg);
-        }
-      }
-      if (use_mop_assign && !assign_before_ret)
+      case TCCIR_OP_RETURNVALUE:
       {
         MachineOperand mop_src = machine_op_from_ir(ir, &src1_ir);
-        MachineOperand mop_dest = machine_op_from_ir(ir, &dest_ir);
+        tcc_gen_machine_insn_scratch_reset();
+        tcc_gen_machine_return_value_mop(mop_src, cq->op);
+        ir_codegen_track_scratch(is_dry_run, i, cq->op, dry_insn_scratch, dry_insn_saves);
+      }
+      /* fall through to RETURNVOID */
+      case TCCIR_OP_RETURNVOID:
+        /* Real-run: emit jump to epilogue (backpatched later).
+         * Dry-run: no-op (we don't track return_jump_addrs). */
+        if (!is_dry_run && i != ir->next_instruction_index - 1)
+        {
+          return_jump_addrs[num_return_jumps++] = ind;
+          tcc_gen_machine_jump_mop(cq->op, irop_get_imm32(dest_ir), i);
+        }
+        break;
+      case TCCIR_OP_ASSIGN:
+      {
+        MachineOperand mop_dest;
+        if (!ir_codegen_before_ret_peephole(ir, i, &dest_ir, has_incoming_jump, &mop_dest))
+          mop_dest = machine_op_from_ir(ir, &dest_ir);
+        MachineOperand mop_src = machine_op_from_ir(ir, &src1_ir);
         tcc_gen_machine_insn_scratch_reset();
         tcc_gen_machine_assign_mop(mop_src, mop_dest, cq->op);
-#ifdef TCC_LS_DEBUG
-        {
-          int real_scratch = tcc_gen_machine_insn_scratch_count();
-          if (real_scratch != dry_insn_scratch[i] && dry_insn_saves[i] == 0)
-            fprintf(stderr, "[insn-scratch] i=%d op=%d dry=%d real=%d MISMATCH\n", i, (int)cq->op,
-                    dry_insn_scratch[i], real_scratch);
-        }
-#endif
+        ir_codegen_track_scratch(is_dry_run, i, cq->op, dry_insn_scratch, dry_insn_saves);
+        break;
       }
-      else
+      case TCCIR_OP_LEA:
       {
-        tcc_gen_machine_assign_op(dest_ir, src1_ir, cq->op);
+        MachineOperand mop_dest = machine_op_from_ir(ir, &dest_ir);
+        MachineOperand mop_src = machine_op_from_ir(ir, &src1_ir);
+        tcc_gen_machine_insn_scratch_reset();
+        tcc_gen_machine_lea_mop(mop_dest, mop_src);
+        ir_codegen_track_scratch(is_dry_run, i, cq->op, dry_insn_scratch, dry_insn_saves);
+        break;
       }
-      break;
-    }
-    case TCCIR_OP_LEA:
-      /* Load Effective Address: compute address of src1 into dest */
-      tcc_gen_machine_lea_op(dest_ir, src1_ir, cq->op);
-      break;
-    case TCCIR_OP_FUNCPARAMVAL:
-    case TCCIR_OP_FUNCPARAMVOID:
-    {
-      if (use_mop_funcparam)
+      case TCCIR_OP_FUNCPARAMVAL:
+      case TCCIR_OP_FUNCPARAMVOID:
       {
         MachineOperand mop_src1 = machine_op_from_ir(ir, &src1_ir);
         MachineOperand mop_src2 = machine_op_from_ir(ir, &src2_ir);
-        /* No scratch tracking: FUNCPARAM does not allocate scratch registers */
         tcc_gen_machine_func_parameter_mop(mop_src1, mop_src2, cq->op);
+        break;
       }
-      else
-      {
-        tcc_gen_machine_func_parameter_op(src1_ir, src2_ir, cq->op);
-      }
-      break;
-    }
-    case TCCIR_OP_JUMP:
-      tcc_gen_machine_jump_op(cq->op, dest_ir, i);
-      /* Update mapping to actual instruction address (may have shifted due to literal pool) */
-      ir_to_code_mapping[i] = ind - (tcc_gen_machine_branch_opt_get_encoding(i) == 16 ? 2 : 4);
-      /* Clear spill cache at branch - value may come from different path */
-      tcc_ir_spill_cache_clear(&ir->spill_cache);
-      break;
-    case TCCIR_OP_JUMPIF:
-      tcc_gen_machine_conditional_jump_op(src1_ir, cq->op, dest_ir, i);
-      /* Update mapping to actual instruction address (may have shifted due to literal pool) */
-      ir_to_code_mapping[i] = ind - (tcc_gen_machine_branch_opt_get_encoding(i) == 16 ? 2 : 4);
-      /* Clear spill cache at conditional branch - target may have different values */
-      tcc_ir_spill_cache_clear(&ir->spill_cache);
-      break;
-    case TCCIR_OP_IJUMP:
-      if (use_mop_ijump)
+      case TCCIR_OP_JUMP:
+        tcc_gen_machine_jump_mop(cq->op, irop_get_imm32(dest_ir), i);
+        if (!is_dry_run)
+          ir_to_code_mapping[i] = ind - (tcc_gen_machine_branch_opt_get_encoding(i) == 16 ? 2 : 4);
+        tcc_ir_spill_cache_clear(&ir->spill_cache);
+        break;
+      case TCCIR_OP_JUMPIF:
+        tcc_gen_machine_conditional_jump_mop(src1_ir.u.imm32, cq->op, irop_get_imm32(dest_ir), i);
+        if (!is_dry_run)
+          ir_to_code_mapping[i] = ind - (tcc_gen_machine_branch_opt_get_encoding(i) == 16 ? 2 : 4);
+        tcc_ir_spill_cache_clear(&ir->spill_cache);
+        break;
+      case TCCIR_OP_IJUMP:
       {
         MachineOperand mop_src = machine_op_from_ir(ir, &src1_ir);
         tcc_gen_machine_insn_scratch_reset();
         tcc_gen_machine_indirect_jump_mop(mop_src, cq->op);
-#ifdef TCC_LS_DEBUG
-        {
-          int real_scratch = tcc_gen_machine_insn_scratch_count();
-          if (real_scratch != dry_insn_scratch[i] && dry_insn_saves[i] == 0)
-            fprintf(stderr, "[insn-scratch] i=%d op=%d dry=%d real=%d MISMATCH\n", i, (int)cq->op,
-                    dry_insn_scratch[i], real_scratch);
-        }
-#endif
+        ir_codegen_track_scratch(is_dry_run, i, cq->op, dry_insn_scratch, dry_insn_saves);
+        tcc_ir_spill_cache_clear(&ir->spill_cache);
+        break;
       }
-      else
+      case TCCIR_OP_SWITCH_TABLE:
       {
-        tcc_gen_machine_indirect_jump_op(src1_ir);
+        int table_id = (int)irop_get_imm64_ex(ir, src2_ir);
+        TCCIRSwitchTable *table = &ir->switch_tables[table_id];
+        if (is_dry_run)
+        {
+          /* Compute exact table size so branch offsets are accurate.
+           * Layout: ADD.W(4) + LDR.W(4) + ADD.W(4) + BX(2) = 14 bytes preamble
+           * + 4 bytes per table entry (32-bit signed PC-relative offsets). */
+          int table_data_size = table->num_entries * 4;
+          ind += 14;
+          ind += table_data_size;
+        }
+        else
+        {
+          MachineOperand mop_idx = machine_op_from_ir(ir, &src1_ir);
+          tcc_gen_machine_insn_scratch_reset();
+          tcc_gen_machine_switch_table_mop(mop_idx, table, ir, i);
+        }
+        tcc_ir_spill_cache_clear(&ir->spill_cache);
+        break;
       }
-      tcc_ir_spill_cache_clear(&ir->spill_cache);
-      break;
-    case TCCIR_OP_SWITCH_TABLE:
-    {
-      int table_id = (int)irop_get_imm64_ex(ir, src2_ir);
-      TCCIRSwitchTable *table = &ir->switch_tables[table_id];
-      tcc_gen_machine_switch_table_op(src1_ir, table, ir, i);
-      tcc_ir_spill_cache_clear(&ir->spill_cache);
-      break;
-    }
-    case TCCIR_OP_SETIF:
-      if (use_mop_setif)
+      case TCCIR_OP_SETIF:
       {
         MachineOperand mop_src = machine_op_from_ir(ir, &src1_ir);
         MachineOperand mop_dest = machine_op_from_ir(ir, &dest_ir);
         tcc_gen_machine_insn_scratch_reset();
         tcc_gen_machine_setif_mop(mop_src, mop_dest, cq->op);
-#ifdef TCC_LS_DEBUG
-        {
-          int real_scratch = tcc_gen_machine_insn_scratch_count();
-          if (real_scratch != dry_insn_scratch[i] && dry_insn_saves[i] == 0)
-            fprintf(stderr, "[insn-scratch] i=%d op=%d dry=%d real=%d MISMATCH\n", i, (int)cq->op, dry_insn_scratch[i],
-                    real_scratch);
-        }
-#endif
+        ir_codegen_track_scratch(is_dry_run, i, cq->op, dry_insn_scratch, dry_insn_saves);
+        break;
       }
-      else
-      {
-        tcc_gen_machine_setif_op(dest_ir, src1_ir, cq->op);
-      }
-      break;
-    case TCCIR_OP_BOOL_OR:
-    case TCCIR_OP_BOOL_AND:
-      if (use_mop_bool)
+      case TCCIR_OP_BOOL_OR:
+      case TCCIR_OP_BOOL_AND:
       {
         MachineOperand mop_src1 = machine_op_from_ir(ir, &src1_ir);
         MachineOperand mop_src2 = machine_op_from_ir(ir, &src2_ir);
         MachineOperand mop_dest = machine_op_from_ir(ir, &dest_ir);
         tcc_gen_machine_insn_scratch_reset();
         tcc_gen_machine_bool_mop(mop_src1, mop_src2, mop_dest, cq->op);
-#ifdef TCC_LS_DEBUG
+        ir_codegen_track_scratch(is_dry_run, i, cq->op, dry_insn_scratch, dry_insn_saves);
+        break;
+      }
+      case TCCIR_OP_VLA_ALLOC:
+      case TCCIR_OP_VLA_SP_SAVE:
+      case TCCIR_OP_VLA_SP_RESTORE:
+      {
+        MachineOperand mop_dest = machine_op_from_ir(ir, &dest_ir);
+        MachineOperand mop_src1 = machine_op_from_ir(ir, &src1_ir);
+        MachineOperand mop_src2 = machine_op_from_ir(ir, &src2_ir);
+        tcc_gen_machine_vla_mop(mop_dest, mop_src1, mop_src2, cq->op);
+        break;
+      }
+      case TCCIR_OP_FUNCCALLVOID:
+        drop_return_value = 1;
+        /* fall through */
+      case TCCIR_OP_FUNCCALLVAL:
+      {
+        MachineOperand func_mop = machine_op_from_ir(ir, &src1_ir);
+        MachineOperand mop_dest = machine_op_from_ir(ir, &dest_ir);
+        tcc_gen_machine_func_call_mop(func_mop, src2_ir, mop_dest, drop_return_value, ir, i);
+        tcc_ir_spill_cache_clear(&ir->spill_cache);
+        if (ir->has_static_chain)
+          tcc_gen_machine_restore_chain();
+        break;
+      }
+      case TCCIR_OP_NOP:
+        break;
+      case TCCIR_OP_TRAP:
+        tcc_gen_machine_trap_mop();
+        break;
+      case TCCIR_OP_SET_CHAIN:
+        tcc_gen_machine_set_chain();
+        break;
+      case TCCIR_OP_INIT_CHAIN_SLOT:
+        tcc_gen_machine_init_chain_slot(src1_ir);
+        break;
+      case TCCIR_OP_ASM_INPUT:
+      case TCCIR_OP_ASM_OUTPUT:
+        break;
+      case TCCIR_OP_INLINE_ASM:
+        if (!is_dry_run)
         {
-          int real_scratch = tcc_gen_machine_insn_scratch_count();
-          if (real_scratch != dry_insn_scratch[i] && dry_insn_saves[i] == 0)
-            fprintf(stderr, "[insn-scratch] i=%d op=%d dry=%d real=%d MISMATCH\n", i, (int)cq->op, dry_insn_scratch[i],
-                    real_scratch);
-        }
-#endif
-      }
-      else
-      {
-        tcc_gen_machine_bool_op(dest_ir, src1_ir, src2_ir, cq->op);
-      }
-      break;
-
-    case TCCIR_OP_VLA_ALLOC:
-    case TCCIR_OP_VLA_SP_SAVE:
-    case TCCIR_OP_VLA_SP_RESTORE:
-      tcc_gen_machine_vla_op(dest_ir, src1_ir, src2_ir, cq->op);
-      break;
-    case TCCIR_OP_FUNCCALLVOID:
-      drop_return_value = 1;
-      /* fall through */
-    case TCCIR_OP_FUNCCALLVAL:
-    {
-      tcc_gen_machine_func_call_op(src1_ir, src2_ir, dest_ir, drop_return_value, ir, i);
-      /* Clear spill cache after function call - callee may have modified memory */
-      tcc_ir_spill_cache_clear(&ir->spill_cache);
-      /* Restore R10 after call: trampoline calls for nested functions clobber R10.
-       * Re-load from the chain save slot at [FP, #-4] to keep R10 correct. */
-      if (ir->has_static_chain)
-        tcc_gen_machine_restore_chain();
-      break;
-    }
-    case TCCIR_OP_NOP:
-      /* No operation - skip silently */
-      break;
-    case TCCIR_OP_TRAP:
-      /* Generate trap instruction */
-      tcc_gen_machine_trap_op();
-      break;
-    case TCCIR_OP_SET_CHAIN:
-      /* Static chain setup: move FP to static chain register */
-      tcc_gen_machine_set_chain();
-      break;
-    case TCCIR_OP_INIT_CHAIN_SLOT:
-      /* Store parent FP into chain slot for nested function trampoline */
-      tcc_gen_machine_init_chain_slot(src1_ir);
-      break;
-    case TCCIR_OP_ASM_INPUT:
-    case TCCIR_OP_ASM_OUTPUT:
-      /* Marker ops only: regalloc/liveness uses them, codegen emits nothing. */
-      break;
-    case TCCIR_OP_INLINE_ASM:
-    {
 #ifdef CONFIG_TCC_ASM
-      tcc_ir_codegen_inline_asm_ir(ir, src1_ir);
-      /* Inline asm may clobber registers/memory: treat as a full barrier. */
-      tcc_ir_spill_cache_clear(&ir->spill_cache);
+          tcc_ir_codegen_inline_asm_ir(ir, src1_ir);
+          tcc_ir_spill_cache_clear(&ir->spill_cache);
 #else
-      tcc_error("inline asm not supported");
+          tcc_error("inline asm not supported");
 #endif
-      break;
-    }
-    default:
-    {
-      printf("Unsupported operation in tcc_generate_code: %s\n", tcc_ir_get_op_name(cq->op));
-      if (ir->ir_to_code_mapping)
-      {
-        tcc_free(ir->ir_to_code_mapping);
-        ir->ir_to_code_mapping = NULL;
-        ir->ir_to_code_mapping_size = 0;
-      }
-      tcc_free(return_jump_addrs);
-      exit(1);
-    }
-    };
+        }
+        break;
+      default:
+        if (!is_dry_run)
+        {
+          printf("Unsupported operation in tcc_generate_code: %s\n", tcc_ir_get_op_name(cq->op));
+          if (ir->ir_to_code_mapping)
+          {
+            tcc_free(ir->ir_to_code_mapping);
+            ir->ir_to_code_mapping = NULL;
+            ir->ir_to_code_mapping_size = 0;
+          }
+          tcc_free(return_jump_addrs);
+          exit(1);
+        }
+        break;
+      };
 
-    /* Clean up scratch register state at end of each IR instruction.
-     * This restores any pushed scratch registers and resets the global exclude mask. */
-    tcc_gen_machine_end_instruction();
+      /* Clean up scratch register state at end of each IR instruction.
+       * This restores any pushed scratch registers and resets the global exclude mask. */
+      tcc_gen_machine_end_instruction();
+    }
+
+    /* ---- Pass-specific finalisation ---- */
+    if (is_dry_run)
+    {
+      /* End dry-run and analyze results */
+      tcc_gen_machine_dry_run_end();
+
+      /* Analyze branch offsets and select optimal encodings */
+      tcc_gen_machine_branch_opt_analyze(ir_to_code_mapping, ir->next_instruction_index);
+
+      /* Check if LR was pushed during dry run in a leaf function */
+      if (original_leaffunc && tcc_gen_machine_dry_run_get_lr_push_count() > 0)
+      {
+        extra_prologue_regs |= (1 << 14); /* R_LR */
+      }
+
+      /* Restore state for real code generation */
+      ind = saved_ind;
+      loc = saved_loc;
+      ir->call_outgoing_base = saved_call_outgoing_base;
+      ir->codegen_instruction_idx = saved_codegen_idx;
+
+      /* Phase-3 scratch conflict fixup.
+       * For each instruction where the dry run needed to PUSH a register,
+       * try to move the blocking vreg to a free callee-saved register. */
+      {
+        int any_fixup = 0;
+        for (int i = 0; i < ir->next_instruction_index; i++)
+        {
+          uint16_t saves = dry_insn_saves[i];
+          if (!saves)
+            continue;
+          while (saves)
+          {
+            int r = (int)__builtin_ctz(saves);
+            saves = (uint16_t)(saves & (saves - 1u));
+            int new_r = try_reassign_scratch_conflict(ir, r, i);
+            if (new_r >= 0)
+            {
+              dry_insn_scratch[i] = 0;
+              any_fixup = 1;
+            }
+          }
+        }
+        if (any_fixup)
+          tcc_ls_reset_scratch_cache(&ir->ls);
+      }
+
+      /* Reset scratch state for real pass */
+      tcc_gen_machine_reset_scratch_state();
+      tcc_ir_spill_cache_clear(&ir->spill_cache);
+      tcc_ir_opt_fp_cache_clear(ir);
+
+      /* Emit prologue before real pass */
+      (void)original_leaffunc;
+      if (!ir->naked)
+        tcc_gen_machine_prolog(ir->leaffunc, ir->ls.dirty_registers, stack_size, extra_prologue_regs);
+      if (!ir->naked)
+        tcc_debug_prolog_epilog(tcc_state, 0);
+    }
   }
 
   ir_to_code_mapping[ir->next_instruction_index] = ind;
