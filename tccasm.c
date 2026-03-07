@@ -1743,6 +1743,8 @@ ST_FUNC void asm_instr(void)
           {
             if (tok == ':')
               break;
+            if (tok == ')')
+              break;
             if (tok != TOK_STR)
               expect("string constant");
             asm_clobber(clobber_regs, tokc.str.data);

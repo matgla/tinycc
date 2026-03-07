@@ -385,6 +385,18 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
         }
       }
 
+      /* For ASSIGN (simple copy), the destination must match the source's
+       * float nature.  When the caller provides a non-float dest type
+       * (e.g. VT_INT for a double value), inherit the source type so that
+       * the backend generates a correctly-sized load/move.
+       * Note: we do NOT do this for 64-bit integer (LLONG) sources because
+       * TCC can emit ASSIGN for intentional LLONG-to-INT truncation. */
+      if (op == TCCIR_OP_ASSIGN && src1)
+      {
+        if (tcc_ir_type_is_float(src1->type.t) && !tcc_ir_type_is_float(dest->type.t))
+          dest->type = src1->type;
+      }
+
       if ((op == TCCIR_OP_SHL || op == TCCIR_OP_SHR || op == TCCIR_OP_SAR) && src1 &&
           tcc_ir_type_is_64bit(src1->type.t))
       {
@@ -582,8 +594,8 @@ void tcc_ir_params_add(TCCIRState *ir, CType *func_type)
   loc = variadic ? -28 : 0;
   func_vc = 0;
 
-  /* Handle hidden sret pointer for struct returns */
-  if ((sym->type.t & VT_BTYPE) == VT_STRUCT)
+  /* Handle hidden sret pointer for struct/complex returns */
+  if ((sym->type.t & VT_BTYPE) == VT_STRUCT || (sym->type.t & VT_COMPLEX))
   {
     tcc_ir_params_add_hidden_sret(ir, func_type);
     /* If sret was used (func_vc != 0), the hidden pointer consumed r0
@@ -678,7 +690,18 @@ void tcc_ir_params_process_single(TCCIRState *ir, Sym *sym, int arg_index, TCCAb
   if ((type->t & VT_BTYPE) == VT_STRUCT)
   {
     desc.kind = TCC_ABI_ARG_STRUCT_BYVAL;
-    desc.size = (uint16_t)size;
+    desc.size = (uint32_t)size;
+    /* Use AAPCS natural alignment (based on member types) for register
+     * double-word alignment rule (even-register requirement). */
+    int aapcs_align = ctype_aapcs_alignment(type);
+    desc.alignment = (uint8_t)(aapcs_align < align ? aapcs_align : align);
+  }
+  else if (type->t & VT_COMPLEX)
+  {
+    /* Complex types are passed like composites (AAPCS treats them as
+     * arrays of two elements): complex float = 8 bytes, complex double = 16 bytes. */
+    desc.kind = TCC_ABI_ARG_STRUCT_BYVAL;
+    desc.size = (uint32_t)size;
     desc.alignment = (uint8_t)align;
   }
   else if (tcc_ir_type_is_64bit(type->t))
@@ -700,7 +723,7 @@ void tcc_ir_params_process_single(TCCIRState *ir, Sym *sym, int arg_index, TCCAb
   if (loc_info.kind == TCC_ABI_LOC_STACK || loc_info.kind == TCC_ABI_LOC_REG_STACK)
     tcc_state->need_frame_pointer = 1;
 
-  if ((type->t & VT_BTYPE) == VT_STRUCT)
+  if ((type->t & VT_BTYPE) == VT_STRUCT || (type->t & VT_COMPLEX))
   {
     tcc_ir_params_process_struct(ir, sym, type, size, align, &loc_info, call_layout, arg_index);
   }
@@ -765,6 +788,28 @@ void tcc_ir_params_process_struct(TCCIRState *ir, Sym *sym, CType *type, int siz
     const int ptr_slot = loc;
     const int ptr_param_vr = tcc_ir_get_vreg_param(ir);
 
+    IRLiveInterval *ptr_iv = tcc_ir_vreg_live_interval(ir, ptr_param_vr);
+    if (ptr_iv)
+    {
+      if (loc_info->kind == TCC_ABI_LOC_REG)
+      {
+        /* Invisible-ref pointer passed in a register.
+         * Set incoming register so tcc_ir_mark_param_incoming_regs skips
+         * this vreg and doesn't re-assign it based on sequential argno. */
+        ptr_iv->incoming_reg0 = loc_info->reg_base;
+        ptr_iv->incoming_reg1 = -1;
+      }
+      else
+      {
+        /* Invisible-ref pointer passed on the stack (all argument registers
+         * exhausted).  Mark as stack-passed and record the caller-frame
+         * offset so PARAM_STACK materialisation picks it up correctly. */
+        ptr_iv->incoming_reg0 = -1;
+        ptr_iv->incoming_reg1 = -1;
+        tcc_ir_set_original_offset(ir, ptr_param_vr, loc_info->stack_off);
+      }
+    }
+
     SValue src, dst;
     memset(&src, 0, sizeof(src));
     memset(&dst, 0, sizeof(dst));
@@ -779,7 +824,12 @@ void tcc_ir_params_process_struct(TCCIRState *ir, Sym *sym, CType *type, int siz
 
     flags = VT_LVAL | VT_LLOCAL;
     addr = ptr_slot;
-    sym_push(sym->v & ~SYM_FIELD, type, flags, addr);
+    {
+      int v = sym->v & ~SYM_FIELD;
+      if (!v)
+        v = anon_sym++;
+      sym_push(v, type, flags, addr);
+    }
     return;
   }
 
@@ -794,6 +844,17 @@ void tcc_ir_params_process_struct(TCCIRState *ir, Sym *sym, CType *type, int siz
     for (int w = 0; w < word_count; ++w)
     {
       const int word_param_vr = tcc_ir_get_vreg_param(ir);
+
+      /* Set incoming register so tcc_ir_mark_param_incoming_regs skips
+       * this vreg.  The AAPCS even-register rule may have skipped a
+       * register, so reg_base may not match the sequential argno. */
+      IRLiveInterval *word_iv = tcc_ir_vreg_live_interval(ir, word_param_vr);
+      if (word_iv)
+      {
+        word_iv->incoming_reg0 = loc_info->reg_base + w;
+        word_iv->incoming_reg1 = -1;
+      }
+
       SValue src, dst;
       memset(&src, 0, sizeof(src));
       memset(&dst, 0, sizeof(dst));
@@ -809,7 +870,12 @@ void tcc_ir_params_process_struct(TCCIRState *ir, Sym *sym, CType *type, int siz
 
     flags = VT_LVAL | VT_LOCAL;
     addr = struct_slot;
-    sym_push(sym->v & ~SYM_FIELD, type, flags, addr);
+    {
+      int v = sym->v & ~SYM_FIELD;
+      if (!v)
+        v = anon_sym++;
+      sym_push(v, type, flags, addr);
+    }
     return;
   }
 
@@ -827,6 +893,15 @@ void tcc_ir_params_process_struct(TCCIRState *ir, Sym *sym, CType *type, int siz
     for (int w = 0; w < reg_words; ++w)
     {
       const int word_param_vr = tcc_ir_get_vreg_param(ir);
+
+      /* Set incoming register — see REG case above. */
+      IRLiveInterval *word_iv = tcc_ir_vreg_live_interval(ir, word_param_vr);
+      if (word_iv)
+      {
+        word_iv->incoming_reg0 = loc_info->reg_base + w;
+        word_iv->incoming_reg1 = -1;
+      }
+
       SValue src, dst;
       memset(&src, 0, sizeof(src));
       memset(&dst, 0, sizeof(dst));
@@ -872,14 +947,24 @@ void tcc_ir_params_process_struct(TCCIRState *ir, Sym *sym, CType *type, int siz
 
     flags = VT_LVAL | VT_LOCAL;
     addr = struct_slot;
-    sym_push(sym->v & ~SYM_FIELD, type, flags, addr);
+    {
+      int v = sym->v & ~SYM_FIELD;
+      if (!v)
+        v = anon_sym++;
+      sym_push(v, type, flags, addr);
+    }
     return;
   }
 
   /* Struct passed on stack */
   flags = VT_PARAM | VT_LVAL | VT_LOCAL;
   addr = loc_info->stack_off;
-  sym_push(sym->v & ~SYM_FIELD, type, flags, addr);
+  {
+    int v = sym->v & ~SYM_FIELD;
+    if (!v)
+      v = anon_sym++;
+    sym_push(v, type, flags, addr);
+  }
 }
 
 void tcc_ir_params_process_scalar(TCCIRState *ir, Sym *sym, CType *type, TCCAbiArgLoc *loc_info)
@@ -907,7 +992,11 @@ void tcc_ir_params_process_scalar(TCCIRState *ir, Sym *sym, CType *type, TCCAbiA
   }
 
   sym->r |= ~(VT_LVAL | VT_LLOCAL);
-  sym_push(sym->v & ~SYM_FIELD, type, flags, addr);
+  /* For unnamed parameters (GNU C / C23), use anonymous symbol */
+  int v = sym->v & ~SYM_FIELD;
+  if (!v)
+    v = anon_sym++;
+  sym_push(v, type, flags, addr);
 }
 
 int tcc_ir_local_add(TCCIRState *ir, Sym *sym, int stack_offset)
@@ -1128,6 +1217,7 @@ void tcc_ir_gen_f(TCCIRState *ir, int op)
     vtop->cmp_op = TOK_LT; /* default, will be fixed up later */
     vtop->jfalse = -1;     /* -1 = no chain */
     vtop->jtrue = -1;      /* -1 = no chain */
+    vtop->vr = -1;         /* clear stale vreg so gv() materializes the CMP result */
     return;
   case 't': /* float-to-float conversion */
     ir_op = TCCIR_OP_CVT_FTOF;
@@ -1149,6 +1239,7 @@ void tcc_ir_gen_f(TCCIRState *ir, int op)
       vtop->cmp_op = op;
       vtop->jfalse = -1; /* -1 = no chain */
       vtop->jtrue = -1;  /* -1 = no chain */
+      vtop->vr = -1;     /* clear stale vreg so gv() materializes the CMP result */
       return;
     }
     tcc_error("tcc_ir_gen_f: unknown floating point operation: 0x%x", op);
@@ -1894,10 +1985,25 @@ const IRRegistersConfig irop_config[] = {
     [TCCIR_OP_INIT_CHAIN_SLOT] = {0, 1, 0},
     /* No-operation */
     [TCCIR_OP_NOP] = {0, 0, 0},
+    /* Prefetch: src1=address vreg, src2=rw hint (in c.i), no dest */
+    [TCCIR_OP_PREFETCH] = {0, 1, 1},
     /* Trap instruction: no operands, no dest */
     [TCCIR_OP_TRAP] = {0, 0, 0},
+    /* Setjmp: dest=return value (0 or 1), src1=buffer pointer vreg */
+    [TCCIR_OP_SETJMP] = {1, 1, 0},
+    /* Longjmp: src1=buffer pointer vreg, no dest (does not return) */
+    [TCCIR_OP_LONGJMP] = {0, 1, 0},
+    /* Non-local goto setjmp/longjmp: full callee-saved save/restore (40-byte buffer) */
+    [TCCIR_OP_NL_SETJMP] = {1, 1, 0},
+    [TCCIR_OP_NL_LONGJMP] = {0, 1, 0},
     /* Jump table switch: src1=index vreg, src2=table_id, no dest */
     [TCCIR_OP_SWITCH_TABLE] = {0, 1, 1},
+    /* __builtin_apply_args: dest=pointer to saved arg block, no sources */
+    [TCCIR_OP_BUILTIN_APPLY_ARGS] = {1, 0, 0},
+    /* __builtin_apply: dest=return value, src1=fn_ptr, src2=args_block_ptr */
+    [TCCIR_OP_BUILTIN_APPLY] = {1, 1, 1},
+    /* __builtin_return: src1=result_ptr, no dest (does not return) */
+    [TCCIR_OP_BUILTIN_RETURN] = {0, 1, 0},
 }
 ;
 // clang-format on

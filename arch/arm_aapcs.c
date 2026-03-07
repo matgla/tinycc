@@ -18,8 +18,8 @@
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
-#include "tccabi.h"
 #include "../tcc.h"
+#include "tccabi.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -59,7 +59,7 @@ TCCAbiArgLoc tcc_abi_classify_argument(TCCAbiCallLayout *layout, int arg_index, 
   if (align < 4)
     align = 4;
 
-  loc.size = (uint16_t)size;
+  loc.size = (uint32_t)size;
   loc.reg_base = 0;
   loc.reg_count = 0;
   loc.stack_off = 0;
@@ -90,13 +90,23 @@ TCCAbiArgLoc tcc_abi_classify_argument(TCCAbiCallLayout *layout, int arg_index, 
     const int slot_sz = tcc_abi_align_up_int(size, 4);
     const int regs_needed = (slot_sz + 3) / 4;
 
-    /* AAPCS: Composite types > 4 words (16 bytes) are passed by invisible reference.
-     * The caller passes a pointer in a register, callee dereferences. */
-    if (size > 16)
+    /* Invisible reference for large composites (> 16 bytes).
+     *
+     * This is used only on the callee side (where arg_flags is allocated
+     * by tcc_abi_call_layout_ensure_capacity).  On the caller/call-site
+     * side, arg_flags is NULL and large structs are classified as normal
+     * by-value composites — the frontend (gfunc_param_typed) handles the
+     * invisible-reference conversion for prototyped calls, while variadic
+     * anonymous arguments must be passed by value for va_arg to work.
+     *
+     * NOTE: The invisible-reference check must come BEFORE the 8-byte
+     * alignment padding below.  When passed by invisible reference the
+     * argument is a 4-byte pointer, so the struct's natural alignment
+     * is irrelevant for register assignment and must not cause the NCRN
+     * to skip a register. */
+    if (size > 16 && layout->arg_flags)
     {
-      /* Mark as invisible reference */
-      if (layout->arg_flags)
-        layout->arg_flags[arg_index] |= TCC_ABI_ARG_FLAG_INVISIBLE_REF;
+      layout->arg_flags[arg_index] |= TCC_ABI_ARG_FLAG_INVISIBLE_REF;
       /* Pass the pointer in a register (like a scalar) */
       if (layout->next_reg <= 3)
       {
@@ -114,35 +124,45 @@ TCCAbiArgLoc tcc_abi_classify_argument(TCCAbiCallLayout *layout, int arg_index, 
         layout->next_stack_off += 4;
       }
     }
-    else if ((int)layout->next_reg + regs_needed <= 4)
-    {
-      loc.kind = TCC_ABI_LOC_REG;
-      loc.reg_base = layout->next_reg;
-      loc.reg_count = (uint8_t)regs_needed;
-      layout->next_reg = (uint8_t)(layout->next_reg + regs_needed);
-    }
-    else if (layout->next_reg <= 3)
-    {
-      /* AAPCS: Struct straddles registers and stack.
-       * Put first word(s) in remaining registers, rest on stack. */
-      int regs_avail = 4 - layout->next_reg;
-      int words_on_stack = regs_needed - regs_avail;
-      loc.kind = TCC_ABI_LOC_REG_STACK;
-      loc.reg_base = layout->next_reg;
-      loc.reg_count = (uint8_t)regs_avail;
-      layout->next_stack_off = tcc_abi_align_up_int(layout->next_stack_off, align);
-      loc.stack_off = layout->next_stack_off;
-      loc.stack_size = (uint16_t)(words_on_stack * 4);
-      layout->next_stack_off += words_on_stack * 4;
-      layout->next_reg = 4;
-    }
     else
     {
-      layout->next_stack_off = tcc_abi_align_up_int(layout->next_stack_off, align);
-      loc.kind = TCC_ABI_LOC_STACK;
-      loc.stack_off = layout->next_stack_off;
-      layout->next_stack_off += slot_sz;
-      layout->next_reg = 4;
+      /* AAPCS: Composite types with 8-byte natural alignment require
+       * double-word alignment — the NCRN must be rounded up to the
+       * next even register number before allocation.  This only applies
+       * to by-value composites, not invisible references (handled above). */
+      if (align >= 8 && (layout->next_reg & 1))
+        layout->next_reg++;
+
+      if ((int)layout->next_reg + regs_needed <= 4)
+      {
+        loc.kind = TCC_ABI_LOC_REG;
+        loc.reg_base = layout->next_reg;
+        loc.reg_count = (uint8_t)regs_needed;
+        layout->next_reg = (uint8_t)(layout->next_reg + regs_needed);
+      }
+      else if (layout->next_reg <= 3)
+      {
+        /* AAPCS: Struct straddles registers and stack.
+         * Put first word(s) in remaining registers, rest on stack. */
+        int regs_avail = 4 - layout->next_reg;
+        int words_on_stack = regs_needed - regs_avail;
+        loc.kind = TCC_ABI_LOC_REG_STACK;
+        loc.reg_base = layout->next_reg;
+        loc.reg_count = (uint8_t)regs_avail;
+        layout->next_stack_off = tcc_abi_align_up_int(layout->next_stack_off, align);
+        loc.stack_off = layout->next_stack_off;
+        loc.stack_size = (uint32_t)(words_on_stack * 4);
+        layout->next_stack_off += words_on_stack * 4;
+        layout->next_reg = 4;
+      }
+      else
+      {
+        layout->next_stack_off = tcc_abi_align_up_int(layout->next_stack_off, align);
+        loc.kind = TCC_ABI_LOC_STACK;
+        loc.stack_off = layout->next_stack_off;
+        layout->next_stack_off += slot_sz;
+        layout->next_reg = 4;
+      }
     }
   }
   else

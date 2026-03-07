@@ -1625,6 +1625,7 @@ static const FlagDef options_f[] = {{offsetof(TCCState, char_is_unsigned), 0, "u
                                     {offsetof(TCCState, opt_strength_red), 0, "strength-red"},
                                     {offsetof(TCCState, opt_iv_strength_red), 0, "iv-strength-red"},
                                     {offsetof(TCCState, opt_jump_threading), 0, "jump-threading"},
+                                    {offsetof(TCCState, instrument_functions), 0, "instrument-functions"},
                                     {0, 0, NULL}};
 
 static const FlagDef options_m[] = {{offsetof(TCCState, ms_bitfields), 0, "ms-bitfields"}, {0, 0, NULL}};

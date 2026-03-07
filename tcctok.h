@@ -49,9 +49,12 @@ DEF(TOK_INT, "int")
 DEF(TOK_FLOAT, "float")
 DEF(TOK_DOUBLE, "double")
 DEF(TOK_BOOL, "_Bool")
-DEF(TOK_COMPLEX, "_Complex")          /* DONE: Phase 1 */
-DEF(TOK_COMPLEX_GCC, "__complex__")   /* DONE: Phase 1 - GCC extension */
-DEF(TOK_COMPLEX_GCC2, "__complex")    /* GCC extension alternate form */
+DEF(TOK_COMPLEX, "_Complex")        /* DONE: Phase 1 */
+DEF(TOK_COMPLEX_GCC, "__complex__") /* DONE: Phase 1 - GCC extension */
+DEF(TOK_COMPLEX_GCC2, "__complex")  /* GCC extension alternate form */
+DEF(TOK_DECIMAL32, "_Decimal32")    /* C2x decimal FP (mapped to float) */
+DEF(TOK_DECIMAL64, "_Decimal64")    /* C2x decimal FP (mapped to double) */
+DEF(TOK_DECIMAL128, "_Decimal128")  /* C2x decimal FP (mapped to long double) */
 DEF(TOK_SHORT, "short")
 DEF(TOK_LONG, "long")
 DEF(TOK_STRUCT, "struct")
@@ -69,10 +72,10 @@ DEF(TOK_TYPEOF1, "typeof")
 DEF(TOK_TYPEOF2, "__typeof")
 DEF(TOK_TYPEOF3, "__typeof__")
 DEF(TOK_LABEL, "__label__")
-DEF(TOK_REAL, "__real__")      /* PARTIAL: Phase 4 - parser recognizes, full impl pending */
-DEF(TOK_REAL_GCC, "__real")    /* GCC extension alternate form */
-DEF(TOK_IMAG, "__imag__")      /* PARTIAL: Phase 4 - parser recognizes, full impl pending */
-DEF(TOK_IMAG_GCC, "__imag")    /* GCC extension alternate form */
+DEF(TOK_REAL, "__real__")   /* PARTIAL: Phase 4 - parser recognizes, full impl pending */
+DEF(TOK_REAL_GCC, "__real") /* GCC extension alternate form */
+DEF(TOK_IMAG, "__imag__")   /* PARTIAL: Phase 4 - parser recognizes, full impl pending */
+DEF(TOK_IMAG_GCC, "__imag") /* GCC extension alternate form */
 
 #ifdef TCC_TARGET_ARM64
 DEF(TOK_UINT128, "__uint128_t")
@@ -159,12 +162,18 @@ DEF(TOK_NAKED1, "naked")
 DEF(TOK_VECTOR_SIZE1, "vector_size")
 DEF(TOK_VECTOR_SIZE2, "__vector_size__")
 
-DEF(TOK_MODE, "__mode__")
-DEF(TOK_MODE_QI, "__QI__")
-DEF(TOK_MODE_DI, "__DI__")
-DEF(TOK_MODE_HI, "__HI__")
-DEF(TOK_MODE_SI, "__SI__")
-DEF(TOK_MODE_word, "__word__")
+DEF(TOK_MODE1, "mode")
+DEF(TOK_MODE2, "__mode__")
+DEF(TOK_MODE_QI1, "QI")
+DEF(TOK_MODE_QI2, "__QI__")
+DEF(TOK_MODE_DI1, "DI")
+DEF(TOK_MODE_DI2, "__DI__")
+DEF(TOK_MODE_HI1, "HI")
+DEF(TOK_MODE_HI2, "__HI__")
+DEF(TOK_MODE_SI1, "SI")
+DEF(TOK_MODE_SI2, "__SI__")
+DEF(TOK_MODE_word1, "word")
+DEF(TOK_MODE_word2, "__word__")
 
 DEF(TOK_DLLEXPORT, "dllexport")
 DEF(TOK_DLLIMPORT, "dllimport")
@@ -177,18 +186,59 @@ DEF(TOK_PURE2, "__pure__")
 /* Note: TOK_CONST1/2/3 already defined for const keyword */
 DEF(TOK_VISIBILITY1, "visibility")
 DEF(TOK_VISIBILITY2, "__visibility__")
+DEF(TOK_SCALAR_STORAGE_ORDER1, "scalar_storage_order")
+DEF(TOK_SCALAR_STORAGE_ORDER2, "__scalar_storage_order__")
 
 DEF(TOK_builtin_types_compatible_p, "__builtin_types_compatible_p")
 DEF(TOK_builtin_choose_expr, "__builtin_choose_expr")
 DEF(TOK_builtin_constant_p, "__builtin_constant_p")
+DEF(TOK_builtin_va_arg_pack, "__builtin_va_arg_pack")
+DEF(TOK_builtin_va_arg_pack_len, "__builtin_va_arg_pack_len")
 DEF(TOK_builtin_frame_address, "__builtin_frame_address")
 DEF(TOK_builtin_return_address, "__builtin_return_address")
 DEF(TOK_builtin_expect, "__builtin_expect")
+DEF(TOK_builtin_abs, "__builtin_abs")
 DEF(TOK_builtin_unreachable, "__builtin_unreachable")
 DEF(TOK_builtin_printf, "__builtin_printf")
 DEF(TOK_builtin_sprintf, "__builtin_sprintf")
+DEF(TOK_builtin_snprintf, "__builtin_snprintf")
 DEF(TOK_builtin_trap, "__builtin_trap")
 DEF(TOK_builtin_classify_type, "__builtin_classify_type")
+DEF(TOK_builtin_signbit, "__builtin_signbit")
+DEF(TOK_builtin_signbitf, "__builtin_signbitf")
+DEF(TOK_builtin_isinf, "__builtin_isinf")
+DEF(TOK_builtin_isinff, "__builtin_isinff")
+DEF(TOK_builtin_isinfl, "__builtin_isinfl")
+DEF(TOK_builtin_copysign, "__builtin_copysign")
+DEF(TOK_builtin_copysignf, "__builtin_copysignf")
+DEF(TOK_builtin_bswap16, "__builtin_bswap16")
+DEF(TOK_builtin_bswap32, "__builtin_bswap32")
+DEF(TOK_builtin_bswap64, "__builtin_bswap64")
+DEF(TOK_builtin_prefetch, "__builtin_prefetch")
+DEF(TOK_builtin_setjmp, "__builtin_setjmp")
+DEF(TOK_builtin_longjmp, "__builtin_longjmp")
+DEF(TOK_builtin_alloca, "__builtin_alloca")
+DEF(TOK_builtin_apply_args, "__builtin_apply_args")
+DEF(TOK_builtin_apply, "__builtin_apply")
+DEF(TOK_builtin_return, "__builtin_return")
+DEF(TOK_builtin_add_overflow, "__builtin_add_overflow")
+DEF(TOK_builtin_sub_overflow, "__builtin_sub_overflow")
+DEF(TOK_builtin_mul_overflow, "__builtin_mul_overflow")
+DEF(TOK_builtin_sadd_overflow, "__builtin_sadd_overflow")
+DEF(TOK_builtin_uadd_overflow, "__builtin_uadd_overflow")
+DEF(TOK_builtin_ssub_overflow, "__builtin_ssub_overflow")
+DEF(TOK_builtin_usub_overflow, "__builtin_usub_overflow")
+DEF(TOK_builtin_smul_overflow, "__builtin_smul_overflow")
+DEF(TOK_builtin_umul_overflow, "__builtin_umul_overflow")
+DEF(TOK_builtin_add_overflow_p, "__builtin_add_overflow_p")
+DEF(TOK_builtin_sub_overflow_p, "__builtin_sub_overflow_p")
+DEF(TOK_builtin_mul_overflow_p, "__builtin_mul_overflow_p")
+DEF(TOK_builtin_shuffle, "__builtin_shuffle")
+DEF(TOK_builtin_conjf, "__builtin_conjf")
+DEF(TOK_builtin_conj, "__builtin_conj")
+DEF(TOK_builtin_conjl, "__builtin_conjl")
+DEF(TOK___copysign, "copysign")
+DEF(TOK___copysignf, "copysignf")
 /*DEF(TOK_builtin_va_list, "__builtin_va_list")*/
 #if defined TCC_TARGET_PE && defined TCC_TARGET_X86_64
 DEF(TOK_builtin_va_start, "__builtin_va_start")
@@ -196,7 +246,9 @@ DEF(TOK_builtin_va_start, "__builtin_va_start")
 DEF(TOK_builtin_va_arg_types, "__builtin_va_arg_types")
 #elif defined TCC_TARGET_ARM
 DEF(TOK_builtin_va_arg, "__builtin_va_arg")
-DEF(TOK___va_arg, "__va_arg")
+DEF(TOK___tcc_va_arg, "__tcc_va_arg")
+DEF(TOK_NOINSTRUMENT1, "no_instrument_function")
+DEF(TOK_NOINSTRUMENT2, "__no_instrument_function__")
 #elif defined TCC_TARGET_ARM64
 DEF(TOK_builtin_va_start, "__builtin_va_start")
 DEF(TOK_builtin_va_arg, "__builtin_va_arg")
@@ -259,6 +311,8 @@ DEF(TOK___fixunsxfdi, "__fixunsxfdi")
 DEF(TOK___fixunssfdi, "__fixunssfdi")
 DEF(TOK___fixunsdfdi, "__fixunsdfdi")
 #endif
+DEF(TOK___bswapdi3, "__bswapdi3")
+DEF(TOK___bswapsi2, "__bswapsi2")
 
 #if defined TCC_TARGET_ARM
 #ifdef TCC_ARM_EABI

@@ -63,6 +63,11 @@ static Sym *all_cleanups, *pending_gotos;
 static int local_scope;
 ST_DATA char debug_modes;
 
+/* Pending label-difference symbols for &&lab1 - &&lab0 in static initializers.
+   Set in gen_opic, consumed in init_putv. */
+static Sym *pending_label_diff_plus;
+static Sym *pending_label_diff_minus;
+
 ST_DATA SValue *vtop;
 ST_DATA SValue _vstack[1 + VSTACK_SIZE];
 #define vstack (_vstack + 1)
@@ -598,6 +603,11 @@ ST_FUNC void tccgen_finish(TCCState *s1)
   free_inline_functions(s1);
   sym_pop(&global_stack, NULL, 0);
   sym_pop(&local_stack, NULL, 0);
+  /* free nested functions array */
+  tcc_free(s1->nested_funcs);
+  s1->nested_funcs = NULL;
+  s1->nb_nested_funcs = 0;
+  s1->nested_funcs_capacity = 0;
   /* free preprocessor macros */
   free_defines(NULL);
   /* free sym_pools */
@@ -970,7 +980,7 @@ ST_FUNC Sym *sym_push(int v, CType *type, int r, int c)
   else
   {
     if (((valmask == VT_LOCAL) || (valmask == VT_LLOCAL)) && (r & VT_LVAL) && ((type->t & VT_BTYPE) != VT_STRUCT) &&
-        !(type->t & (VT_ARRAY | VT_VLA)))
+        !(type->t & (VT_ARRAY | VT_VLA | VT_COMPLEX)))
     {
       vreg = tcc_ir_get_vreg_var(tcc_state->ir);
       /* Set the variable's stack offset so LEA operations can find it */
@@ -1126,7 +1136,8 @@ ST_FUNC void label_pop(Sym **ptop, Sym *slast, int keep)
   for (s = *ptop; s != slast; s = s1)
   {
     s1 = s->prev;
-    int addr_taken = (s->c == -3 || s->c > 0); /* Remember if address was taken before modifying s->c */
+    int addr_taken =
+        (s->c == -3 || s->c > 0 || s->a.addrtaken); /* Remember if address was taken before modifying s->c */
     if (s->r == LABEL_DECLARED)
     {
       tcc_warning_c(warn_all)("label '%s' declared but not used", get_tok_str(s->v, NULL));
@@ -1692,6 +1703,8 @@ static void merge_funcattr(struct FuncAttr *fa, struct FuncAttr *fa1)
     fa->func_pure = 1;
   if (fa1->func_const)
     fa->func_const = 1;
+  if (fa1->func_no_instrument)
+    fa->func_no_instrument = 1;
 }
 
 /* Merge attributes.  */
@@ -1824,6 +1837,10 @@ static void sym_copy_ref(Sym *s, Sym **ps)
   int bt = s->type.t & VT_BTYPE;
   if (bt == VT_FUNC || bt == VT_PTR || (bt == VT_STRUCT && s->sym_scope))
   {
+    /* For VLA array types, the SYM_FIELD's next/vla_array_str union may
+       contain a token stream pointer (set in post_type for TYPE_NEST),
+       not a valid Sym* chain.  Don't follow next in that case. */
+    int is_vla = s->type.t & VT_VLA;
     Sym **sp = &s->type.ref;
     for (s = *sp, *sp = NULL; s; s = s->next)
     {
@@ -1841,6 +1858,14 @@ static void sym_copy_ref(Sym *s, Sym **ps)
         Sym *s2 = sym_copy(s, ps);
         sp = &(*sp = s2)->next;
         sym_copy_ref(s2, ps);
+      }
+      if (is_vla)
+      {
+        /* Stop after the first field — s2->next is in a union with
+           vla_array_str and may hold a token stream pointer, not a
+           valid Sym*. Do NOT clear *sp because it points to the
+           next/vla_array_str union and we must preserve vla_array_str. */
+        break;
       }
     }
   }
@@ -2275,10 +2300,18 @@ ST_FUNC int gv(int rc)
   int vreg = -1;
 
   /* For IR mode: if we already have a valid vreg computed, no need to do anything.
-     Valid vregs have type 1, 2, or 3 in the upper 4 bits. Type 0 is invalid. */
-  if (tcc_state->ir && TCCIR_DECODE_VREG_TYPE(vtop->vr) > 0 && !(vtop->r & VT_LVAL))
+     Valid vregs have type 1, 2, or 3 in the upper 4 bits. Type 0 is invalid.
+     Exception: bitfield values still need extraction (shift/mask) even when
+     they already have a vreg — skip the early return for them.
+     Exception: VT_CMP/VT_JMP/VT_JMPI values must be materialized into a 0/1
+     vreg even when the stale left-operand vreg is still set after a CMP. */
   {
-    return vtop->r & VT_VALMASK;
+    int vv = vtop->r & VT_VALMASK;
+    if (tcc_state->ir && TCCIR_DECODE_VREG_TYPE(vtop->vr) > 0 && !(vtop->r & VT_LVAL) &&
+        !(vtop->type.t & VT_BITFIELD) && vv != VT_CMP && vv != VT_JMP && vv != VT_JMPI)
+    {
+      return vv;
+    }
   }
 
   /* NOTE: get_reg can modify vstack[] */
@@ -2396,6 +2429,19 @@ ST_FUNC int gv(int rc)
           tcc_ir_set_llong_type(tcc_state->ir, vreg);
         }
 
+        /* If vtop is VT_CMP/VT_JMP/VT_JMPI (e.g. a comparison result restored
+         * from a saved SValue in a ternary expression), materialize it
+         * into a 0/1 vreg via cmp_jmp_set instead of trying to LOAD from
+         * a jump chain (which svalue_to_iroperand cannot encode). */
+        {
+          int vv = vtop->r & VT_VALMASK;
+          if (vv == VT_CMP || vv == VT_JMP || vv == VT_JMPI)
+          {
+            tcc_ir_codegen_cmp_jmp_set(tcc_state->ir);
+            return 0;
+          }
+        }
+
         vset_VT_JMP();
         SValue dest;
         svalue_init(&dest);
@@ -2426,6 +2472,16 @@ ST_FUNC int gv(int rc)
       else if ((vtop->type.t & VT_BTYPE) == VT_LLONG)
       {
         tcc_ir_set_llong_type(tcc_state->ir, vreg);
+      }
+
+      /* Same guard as above: materialize VT_CMP/VT_JMP via cmp_jmp_set. */
+      {
+        int vv = vtop->r & VT_VALMASK;
+        if (vv == VT_CMP || vv == VT_JMP || vv == VT_JMPI)
+        {
+          tcc_ir_codegen_cmp_jmp_set(tcc_state->ir);
+          return 0;
+        }
       }
 
       vset_VT_JMP();
@@ -2798,6 +2854,40 @@ static void gv_dup(void)
   SValue sv;
 
   t = vtop->type.t;
+
+  /* GCC vector types: vectors are multi-word values that don't fit in a
+   * single register.  Duplicate by copying the entire vector to a temp
+   * stack slot via memcpy (struct copy), then push the temp as an lvalue.
+   * Without this, the scalar ASSIGN below would only copy the first 4
+   * bytes and gen_op_vector would misinterpret the loaded data as a
+   * pointer when accessing individual elements. */
+  if (t & VT_VECTOR)
+  {
+    int size, align, res_vr, res_loc;
+    CType vec_type = vtop->type;
+    size = type_size(&vec_type, &align);
+    res_loc = get_temp_local_var(size, align > 8 ? 8 : align, &res_vr);
+
+    /* Build destination: temp stack slot lvalue */
+    SValue dst;
+    memset(&dst, 0, sizeof(dst));
+    dst.type = vec_type;
+    dst.r = VT_LOCAL | VT_LVAL;
+    dst.vr = res_vr;
+    dst.c.i = res_loc;
+
+    /* Copy vector from source (vtop) to temp slot via struct store (memcpy) */
+    vpushv(&dst); /* push destination lvalue */
+    vswap();      /* stack: dst, src */
+    vstore();     /* struct copy: src → dst */
+    vpop();       /* pop assigned value */
+
+    /* Replace vtop with temp slot lvalue and duplicate */
+    vpushv(&dst);
+    vdup();
+    return;
+  }
+
 #if PTR_SIZE == 4
   if ((t & VT_BTYPE) == VT_LLONG)
   {
@@ -3184,6 +3274,16 @@ static void gen_opl(int op)
         gen_op(TOK_NE);
         break;
       }
+
+      /* Materialize VT_CMP immediately so the SETIF IR instruction is
+       * emitted right after the CMP. Without this, the SETIF would be
+       * deferred until the value is consumed, and a subsequent function
+       * call (e.g. another __aeabi_lcmp for a second comparison) would
+       * clobber the ARM flags register before the SETIF reads them. */
+      if (tcc_state->ir && (vtop->r & VT_VALMASK) == VT_CMP)
+      {
+        gv(RC_INT);
+      }
     }
     break;
   }
@@ -3194,7 +3294,10 @@ static void gen_opl(int op)
 static uint64_t value64(uint64_t l1, int t)
 {
   uint64_t result;
-  if ((t & VT_BTYPE) == VT_LLONG || (PTR_SIZE == 8 && (t & VT_BTYPE) == VT_PTR))
+  /* Complex integer types pack both real and imaginary parts into 64 bits
+   * (e.g. _Complex int: real in low 32, imag in high 32).  Preserve the
+   * full 64-bit packed representation regardless of the base type. */
+  if ((t & VT_COMPLEX) || (t & VT_BTYPE) == VT_LLONG || (PTR_SIZE == 8 && (t & VT_BTYPE) == VT_PTR))
     result = l1;
   else if (t & VT_UNSIGNED)
     result = (uint32_t)l1;
@@ -3228,6 +3331,52 @@ static void gen_opic(int op)
   uint64_t l2 = c2 ? value64(v2->c.i, v2->type.t) : 0;
   int shm = (t1 == VT_LLONG) ? 63 : 31;
   int r;
+
+  /* Complex integer constant folding: operate component-wise */
+  if (c1 && c2 && ((v1->type.t | v2->type.t) & VT_COMPLEX))
+  {
+    /* Both should be the same complex type at this point (after gen_cast_s) */
+    int bt = t1; /* base type (e.g., VT_INT) */
+    int shift = btype_size(bt) * 8;
+    uint64_t mask = (bt == VT_LLONG) ? 0xFFFFFFFFFFFFFFFFULL : ((1ULL << shift) - 1);
+    int64_t real1 = (int64_t)(l1 & mask);
+    int64_t imag1 = (int64_t)((l1 >> shift) & mask);
+    int64_t real2 = (int64_t)(l2 & mask);
+    int64_t imag2 = (int64_t)((l2 >> shift) & mask);
+    int64_t rr, ri;
+
+    switch (op)
+    {
+    case '+':
+      rr = real1 + real2;
+      ri = imag1 + imag2;
+      break;
+    case '-':
+      rr = real1 - real2;
+      ri = imag1 - imag2;
+      break;
+    case '*':
+      rr = real1 * real2 - imag1 * imag2;
+      ri = real1 * imag2 + imag1 * real2;
+      break;
+    case TOK_EQ:
+      v1->c.i = (real1 == real2) && (imag1 == imag2);
+      v1->r |= v2->r & VT_NONCONST;
+      vtop--;
+      return;
+    case TOK_NE:
+      v1->c.i = (real1 != real2) || (imag1 != imag2);
+      v1->r |= v2->r & VT_NONCONST;
+      vtop--;
+      return;
+    default:
+      goto general_case;
+    }
+    v1->c.i = ((uint64_t)(rr & mask)) | (((uint64_t)(ri & mask)) << shift);
+    v1->r |= v2->r & VT_NONCONST;
+    vtop--;
+    return;
+  }
 
   if (c1 && c2)
   {
@@ -3406,6 +3555,20 @@ static void gen_opic(int op)
       print_vstack("gen_opic(3)");
       vtop->c.i = l2;
     }
+    else if (op == '-' && CONST_WANTED &&
+             (v1->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == (VT_CONST | VT_SYM) &&
+             (v2->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == (VT_CONST | VT_SYM))
+    {
+      /* Label difference in constant context: &&lab1 - &&lab0.
+         Record the two symbols for deferred resolution after codegen,
+         produce a pure VT_CONST result with the addend difference. */
+      pending_label_diff_plus = v1->sym;
+      pending_label_diff_minus = v2->sym;
+      v1->c.i = v1->c.i - v2->c.i;
+      v1->r = VT_CONST;
+      v1->sym = NULL;
+      vtop--;
+    }
     else
     {
     general_case:
@@ -3477,6 +3640,109 @@ static void gen_opif(int op)
   /* currently, we cannot do computations with forward symbols */
   c1 = (v1->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST;
   c2 = (v2->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST;
+
+  /* Complex float/double constant folding: operate component-wise */
+  if (c1 && c2 && ((v1->type.t | v2->type.t) & VT_COMPLEX))
+  {
+    double r1 = 0, i1 = 0, r2 = 0, i2 = 0, rr, ri;
+
+    /* Extract components from v1 */
+    if (bt == VT_FLOAT)
+    {
+      union
+      {
+        float f;
+        uint32_t u;
+      } a, b;
+      a.u = (uint32_t)(v1->c.i & 0xFFFFFFFF);
+      b.u = (uint32_t)(v1->c.i >> 32);
+      r1 = a.f;
+      i1 = b.f;
+    }
+    else
+    {
+      memcpy(&r1, &v1->c, 8);
+      memcpy(&i1, (char *)&v1->c + 8, 8);
+    }
+
+    /* Extract components from v2 */
+    int bt2v = v2->type.t & VT_BTYPE;
+    if (bt2v == VT_FLOAT)
+    {
+      union
+      {
+        float f;
+        uint32_t u;
+      } a, b;
+      a.u = (uint32_t)(v2->c.i & 0xFFFFFFFF);
+      b.u = (uint32_t)(v2->c.i >> 32);
+      r2 = a.f;
+      i2 = b.f;
+    }
+    else
+    {
+      memcpy(&r2, &v2->c, 8);
+      memcpy(&i2, (char *)&v2->c + 8, 8);
+    }
+
+    switch (op)
+    {
+    case '+':
+      rr = r1 + r2;
+      ri = i1 + i2;
+      break;
+    case '-':
+      rr = r1 - r2;
+      ri = i1 - i2;
+      break;
+    case '*':
+      rr = r1 * r2 - i1 * i2;
+      ri = r1 * i2 + i1 * r2;
+      break;
+    case '/':
+    {
+      double denom = r2 * r2 + i2 * i2;
+      rr = (r1 * r2 + i1 * i2) / denom;
+      ri = (i1 * r2 - r1 * i2) / denom;
+      break;
+    }
+    case TOK_EQ:
+      i = (r1 == r2) && (i1 == i2);
+      vtop -= 2;
+      vpushi(i);
+      return;
+    case TOK_NE:
+      i = (r1 != r2) || (i1 != i2);
+      vtop -= 2;
+      vpushi(i);
+      return;
+    default:
+      goto general_case;
+    }
+
+    vtop--;
+    /* Pack result */
+    memset(&v1->c, 0, sizeof(CValue));
+    if (bt == VT_FLOAT)
+    {
+      union
+      {
+        float f;
+        uint32_t u;
+      } a, b;
+      a.f = (float)rr;
+      b.f = (float)ri;
+      v1->c.i = (uint64_t)a.u | ((uint64_t)b.u << 32);
+    }
+    else
+    {
+      double dr = rr, di = ri;
+      memcpy(&v1->c, &dr, 8);
+      memcpy((char *)&v1->c + 8, &di, 8);
+    }
+    return;
+  }
+
   if (c1 && c2)
   {
     if (bt == VT_FLOAT)
@@ -4051,6 +4317,9 @@ static int combine_types(CType *dest, SValue *op1, SValue *op2, int op)
     if ((t1 & (VT_BTYPE | VT_UNSIGNED)) == (VT_LLONG | VT_UNSIGNED) ||
         (t2 & (VT_BTYPE | VT_UNSIGNED)) == (VT_LLONG | VT_UNSIGNED))
       type.t |= VT_UNSIGNED;
+    /* Propagate VT_COMPLEX for integer complex types */
+    if ((t1 & VT_COMPLEX) || (t2 & VT_COMPLEX))
+      type.t |= VT_COMPLEX;
   }
   else
   {
@@ -4060,10 +4329,809 @@ static int combine_types(CType *dest, SValue *op1, SValue *op2, int op)
     if ((t1 & (VT_BTYPE | VT_UNSIGNED)) == (VT_INT | VT_UNSIGNED) ||
         (t2 & (VT_BTYPE | VT_UNSIGNED)) == (VT_INT | VT_UNSIGNED))
       type.t |= VT_UNSIGNED;
+    /* Propagate VT_COMPLEX for integer complex types */
+    if ((t1 & VT_COMPLEX) || (t2 & VT_COMPLEX))
+      type.t |= VT_COMPLEX;
   }
   if (dest)
     *dest = type;
   return ret;
+}
+
+/* Decompose complex integer == / != into component-wise comparisons.
+ *
+ * Stack on entry:  [... lhs rhs]   (both have VT_COMPLEX set, integer base types)
+ * Stack on exit:   [... result]    (int 0 or 1)
+ *
+ * For !=: (__real__ a != __real__ b) || (__imag__ a != __imag__ b)
+ * For ==: (__real__ a == __real__ b) && (__imag__ a == __imag__ b)
+ *
+ * We avoid the usual arithmetic promotion to _Complex int because the runtime
+ * cast from _Complex char/short to _Complex int is not implemented (it would
+ * need to unpack/repack the components).  Instead we compare each component
+ * individually, promoting component types via the normal integer rules.
+ */
+static void gen_complex_int_cmp(int op)
+{
+  int lbt = vtop[-1].type.t & VT_BTYPE;
+  int rbt = vtop[0].type.t & VT_BTYPE;
+  int l_elem = btype_size(lbt);
+  int r_elem = btype_size(rbt);
+
+  int l_const = (vtop[-1].r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST;
+  int r_const = (vtop[0].r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST;
+
+  /* Extract constant component values via the packed representation:
+   * _Complex char packs as (imag << 8 | real) in 16 bits,
+   * _Complex int  packs as (imag << 32 | real) in 64 bits, etc. */
+  SValue saved_rhs;
+  uint64_t l_real_c = 0, l_imag_c = 0, r_real_c = 0, r_imag_c = 0;
+
+  if (r_const)
+  {
+    int shift = r_elem * 8;
+    uint64_t mask = (shift >= 64) ? ~0ULL : (1ULL << shift) - 1;
+    r_real_c = vtop[0].c.i & mask;
+    r_imag_c = (shift >= 64) ? 0 : ((vtop[0].c.i >> shift) & mask);
+  }
+  if (l_const)
+  {
+    int shift = l_elem * 8;
+    uint64_t mask = (shift >= 64) ? ~0ULL : (1ULL << shift) - 1;
+    l_real_c = vtop[-1].c.i & mask;
+    l_imag_c = (shift >= 64) ? 0 : ((vtop[-1].c.i >> shift) & mask);
+  }
+
+  /* Save SValues so we can push them again after popping.
+   * For lvalues this is safe because they reference memory, not registers. */
+  saved_rhs = *vtop;
+
+  /* Pop rhs */
+  vpop();
+  /* Stack: [... lhs] */
+
+  /* --- Compare real parts --- */
+  /* Push real(lhs) */
+  if (l_const)
+  {
+    vpop(); /* remove lhs */
+    vpush64(VT_INT, l_real_c);
+  }
+  else
+  {
+    vdup(); /* [... lhs lhs_copy] */
+    /* Change copy to base scalar type (strips VT_COMPLEX, keeps lvalue) */
+    vtop->type.t = (vtop->type.t & ~VT_BTYPE & ~VT_COMPLEX) | lbt;
+  }
+
+  /* Push real(rhs) */
+  if (r_const)
+  {
+    vpush64(VT_INT, r_real_c);
+  }
+  else
+  {
+    vpushv(&saved_rhs);
+    vtop->type.t = (vtop->type.t & ~VT_BTYPE & ~VT_COMPLEX) | rbt;
+  }
+
+  /* Compare real parts (normal integer promotion handles char→int etc.) */
+  gen_op(op);
+
+  /* Stack: [... lhs result_real]  (if lhs non-const)
+   *    or: [... result_real]      (if lhs const) */
+
+  if (!l_const)
+    vswap(); /* [... result_real lhs] */
+
+  /* --- Compare imaginary parts --- */
+  /* Push imag(lhs) */
+  if (l_const)
+  {
+    vpush64(VT_INT, l_imag_c);
+  }
+  else
+  {
+    /* The original lhs is still on the vstack as an lvalue.
+     * Strip VT_COMPLEX so the load uses the base type size,
+     * then use incr_offset to advance to the imaginary component.
+     * incr_offset takes the address, adds the offset, and re-marks
+     * the result as an lvalue — this properly generates an ADD in the IR. */
+    vtop->type.t = (vtop->type.t & ~VT_BTYPE & ~VT_COMPLEX) | lbt;
+    if (l_elem > 0)
+      incr_offset(l_elem);
+  }
+
+  /* Push imag(rhs) */
+  if (r_const)
+  {
+    vpush64(VT_INT, r_imag_c);
+  }
+  else
+  {
+    vpushv(&saved_rhs);
+    vtop->type.t = (vtop->type.t & ~VT_BTYPE & ~VT_COMPLEX) | rbt;
+    if (r_elem > 0)
+      incr_offset(r_elem);
+  }
+
+  /* Compare imaginary parts */
+  gen_op(op);
+
+  /* Stack: [... result_real result_imag] */
+
+  /* Combine: && for EQ  (both must match),  || for NE  (either differs) */
+  gen_op(op == TOK_EQ ? '&' : '|');
+}
+
+/* Decompose complex floating-point == / != into component-wise comparisons.
+ *
+ * Stack on entry:  [... lhs rhs]   (both have VT_COMPLEX set, float base types)
+ * Stack on exit:   [... result]    (int 0 or 1)
+ *
+ * For !=: (__real__ a != __real__ b) || (__imag__ a != __imag__ b)
+ * For ==: (__real__ a == __real__ b) && (__imag__ a == __imag__ b)
+ *
+ * Complex float: real at offset 0 (4B), imag at offset 4 (4B).
+ * Complex double: real at offset 0 (8B), imag at offset 8 (8B).
+ */
+static void gen_complex_float_cmp(int op)
+{
+  int l_bt = vtop[-1].type.t & VT_BTYPE;
+  int r_bt = vtop[0].type.t & VT_BTYPE;
+  int l_elem_size = (l_bt == VT_DOUBLE || l_bt == VT_LDOUBLE) ? 8 : 4;
+  int r_elem_size = (r_bt == VT_DOUBLE || r_bt == VT_LDOUBLE) ? 8 : 4;
+
+  int l_const = (vtop[-1].r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST;
+  int r_const = (vtop[0].r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST;
+
+  /* Extract constant float/double component values.
+   * Use each operand's OWN base type for extraction. */
+  CValue l_real_cv, l_imag_cv, r_real_cv, r_imag_cv;
+  int l_push_bt = l_bt, r_push_bt = r_bt;
+  memset(&l_real_cv, 0, sizeof(CValue));
+  memset(&l_imag_cv, 0, sizeof(CValue));
+  memset(&r_real_cv, 0, sizeof(CValue));
+  memset(&r_imag_cv, 0, sizeof(CValue));
+
+  if (r_const)
+  {
+    if (!is_float(r_bt))
+    {
+      /* Integer promoted to complex: real = cast to float/double, imag = 0. */
+      r_push_bt = VT_DOUBLE;
+      r_real_cv.d = (double)vtop[0].c.i;
+    }
+    else if (r_bt == VT_FLOAT)
+    {
+      union
+      {
+        float f;
+        uint32_t u;
+      } a, b;
+      a.u = (uint32_t)(vtop[0].c.i & 0xFFFFFFFF);
+      b.u = (uint32_t)(vtop[0].c.i >> 32);
+      r_real_cv.f = a.f;
+      r_imag_cv.f = b.f;
+    }
+    else
+    {
+      memcpy(&r_real_cv.d, &vtop[0].c, 8);
+      memcpy(&r_imag_cv.d, (char *)&vtop[0].c + 8, 8);
+    }
+  }
+  if (l_const)
+  {
+    if (!is_float(l_bt))
+    {
+      l_push_bt = VT_DOUBLE;
+      l_real_cv.d = (double)vtop[-1].c.i;
+    }
+    else if (l_bt == VT_FLOAT)
+    {
+      union
+      {
+        float f;
+        uint32_t u;
+      } a, b;
+      a.u = (uint32_t)(vtop[-1].c.i & 0xFFFFFFFF);
+      b.u = (uint32_t)(vtop[-1].c.i >> 32);
+      l_real_cv.f = a.f;
+      l_imag_cv.f = b.f;
+    }
+    else
+    {
+      memcpy(&l_real_cv.d, &vtop[-1].c, 8);
+      memcpy(&l_imag_cv.d, (char *)&vtop[-1].c + 8, 8);
+    }
+  }
+
+  SValue saved_rhs = *vtop;
+
+  /* Pop rhs */
+  vpop();
+  /* Stack: [... lhs] */
+
+  /* --- Compare real parts --- */
+  if (l_const)
+  {
+    vpop(); /* remove lhs */
+    CType ctype = {0};
+    ctype.t = l_push_bt;
+    vsetc(&ctype, VT_CONST, &l_real_cv);
+  }
+  else
+  {
+    vdup(); /* [... lhs lhs_copy] */
+    vtop->type.t &= ~VT_COMPLEX;
+  }
+
+  if (r_const)
+  {
+    CType ctype = {0};
+    ctype.t = r_push_bt;
+    vsetc(&ctype, VT_CONST, &r_real_cv);
+  }
+  else
+  {
+    vpushv(&saved_rhs);
+    vtop->type.t &= ~VT_COMPLEX;
+  }
+
+  /* Compare real parts (scalar comparison — gen_op handles type promotion) */
+  gen_op(op);
+
+  if (!l_const)
+    vswap();
+
+  /* --- Compare imaginary parts --- */
+  if (l_const)
+  {
+    CType ctype = {0};
+    ctype.t = l_push_bt;
+    vsetc(&ctype, VT_CONST, &l_imag_cv);
+  }
+  else
+  {
+    vtop->type.t &= ~VT_COMPLEX;
+    incr_offset(l_elem_size);
+  }
+
+  if (r_const)
+  {
+    CType ctype = {0};
+    ctype.t = r_push_bt;
+    vsetc(&ctype, VT_CONST, &r_imag_cv);
+  }
+  else
+  {
+    vpushv(&saved_rhs);
+    vtop->type.t &= ~VT_COMPLEX;
+    incr_offset(r_elem_size);
+  }
+
+  /* Compare imaginary parts */
+  gen_op(op);
+
+  /* Combine: && for EQ  (both must match),  || for NE  (either differs) */
+  gen_op(op == TOK_EQ ? '&' : '|');
+}
+
+/* Decompose complex integer +, -, *, / into component-wise scalar operations.
+ *
+ * Stack on entry:  [... lhs rhs]   (both have VT_COMPLEX set, integer base types)
+ * Stack on exit:   [... result]    (complex integer lvalue in temp local)
+ *
+ * For +: result.real = a.real + b.real, result.imag = a.imag + b.imag
+ * For -: result.real = a.real - b.real, result.imag = a.imag - b.imag
+ * For *: (a+bi)(c+di) = (ac-bd) + (ad+bc)i
+ * For /: (a+bi)/(c+di) = ((ac+bd) + (bc-ad)i) / (cc+dd)
+ *
+ * Complex int:   real at offset +0, imag at offset +elem_size.
+ * Constant complex ints are packed into 64 bits: real in low, imag in high.
+ *
+ * Before decomposition, both operands must be promoted to the same base type
+ * via the usual arithmetic conversions so that elem_size is consistent.
+ */
+static void gen_complex_int_arith(int op)
+{
+  int t1 = vtop[-1].type.t;
+  int t2 = vtop[0].type.t;
+  int was_complex_lhs = (t1 & VT_COMPLEX) != 0;
+  int was_complex_rhs = (t2 & VT_COMPLEX) != 0;
+
+  /* Determine promoted base type via usual arithmetic conversions.
+   * Both operands should already have the same type from gen_cast_s
+   * in the caller, but handle any remaining differences. */
+  int bt1 = t1 & VT_BTYPE;
+  int bt2 = t2 & VT_BTYPE;
+  int bt;
+  if (bt1 == VT_LLONG || bt2 == VT_LLONG)
+    bt = VT_LLONG;
+  else
+    bt = VT_INT; /* C integer promotion: at least int */
+  int elem_size = btype_size(bt);
+  int complex_size = elem_size * 2;
+  int is_unsigned = (t1 | t2) & VT_UNSIGNED;
+
+  /* Element type: promoted scalar type (no VT_COMPLEX). */
+  CType elem_type;
+  elem_type.t = bt | (is_unsigned ? VT_UNSIGNED : 0);
+  elem_type.ref = NULL;
+
+  /* Cast both operands to the promoted type (strip VT_COMPLEX for cast,
+   * but retain the complex flag on the SValue for component extraction). */
+  vswap();
+  if ((vtop->type.t & VT_BTYPE) != bt)
+    gen_cast_s(elem_type.t);
+  vtop->type.t |= VT_COMPLEX;
+  vswap();
+  if ((vtop->type.t & VT_BTYPE) != bt)
+    gen_cast_s(elem_type.t);
+  vtop->type.t |= VT_COMPLEX;
+
+  int l_const = (vtop[-1].r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST;
+  int r_const = (vtop[0].r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST;
+
+  SValue saved_lhs = vtop[-1];
+  SValue saved_rhs = vtop[0];
+  vpop();
+  vpop();
+
+  /* Allocate temp local for result. */
+  int res_vr;
+  int res_loc = get_temp_local_var(complex_size, elem_size, &res_vr);
+
+  /* ---- Helper macros to push/store components ---- */
+#define PUSH_COMP(sv, is_const, was_cplx, comp)                                                                        \
+  do                                                                                                                   \
+  {                                                                                                                    \
+    if (!(was_cplx))                                                                                                   \
+    {                                                                                                                  \
+      if ((comp) == 0)                                                                                                 \
+      {                                                                                                                \
+        vpushv(&(sv));                                                                                                 \
+        vtop->type.t &= ~VT_COMPLEX;                                                                                   \
+      }                                                                                                                \
+      else                                                                                                             \
+      {                                                                                                                \
+        vpushi(0);                                                                                                     \
+        vtop->type = elem_type;                                                                                        \
+      }                                                                                                                \
+    }                                                                                                                  \
+    else if (is_const)                                                                                                 \
+    {                                                                                                                  \
+      int shift_ = elem_size * 8;                                                                                      \
+      uint64_t mask_ = (elem_size == 8) ? ~0ULL : ((1ULL << shift_) - 1);                                              \
+      uint64_t val_ = (sv).c.i;                                                                                        \
+      vpushi(0);                                                                                                       \
+      vtop->c.i = (int64_t)(((comp) == 0) ? (val_ & mask_) : ((val_ >> shift_) & mask_));                              \
+      vtop->type = elem_type;                                                                                          \
+    }                                                                                                                  \
+    else                                                                                                               \
+    {                                                                                                                  \
+      vpushv(&(sv));                                                                                                   \
+      vtop->type.t &= ~VT_COMPLEX;                                                                                     \
+      if ((comp) == 1)                                                                                                 \
+        incr_offset(elem_size);                                                                                        \
+    }                                                                                                                  \
+  } while (0)
+
+#define STORE_COMP(comp)                                                                                               \
+  do                                                                                                                   \
+  {                                                                                                                    \
+    SValue dst_;                                                                                                       \
+    memset(&dst_, 0, sizeof(dst_));                                                                                    \
+    dst_.type = elem_type;                                                                                             \
+    dst_.r = VT_LOCAL | VT_LVAL;                                                                                       \
+    dst_.vr = res_vr;                                                                                                  \
+    dst_.c.i = res_loc + (comp) * elem_size;                                                                           \
+    vpushv(&dst_);                                                                                                     \
+    vswap();                                                                                                           \
+    vstore();                                                                                                          \
+    vpop();                                                                                                            \
+  } while (0)
+
+  switch (op)
+  {
+  case '+':
+  case '-':
+    /* real = a.real op b.real */
+    PUSH_COMP(saved_lhs, l_const, was_complex_lhs, 0);
+    PUSH_COMP(saved_rhs, r_const, was_complex_rhs, 0);
+    gen_op(op);
+    STORE_COMP(0);
+    /* imag = a.imag op b.imag */
+    PUSH_COMP(saved_lhs, l_const, was_complex_lhs, 1);
+    PUSH_COMP(saved_rhs, r_const, was_complex_rhs, 1);
+    gen_op(op);
+    STORE_COMP(1);
+    break;
+
+  case '*':
+    /* real = a.real * b.real - a.imag * b.imag */
+    PUSH_COMP(saved_lhs, l_const, was_complex_lhs, 0);
+    PUSH_COMP(saved_rhs, r_const, was_complex_rhs, 0);
+    gen_op('*');
+    PUSH_COMP(saved_lhs, l_const, was_complex_lhs, 1);
+    PUSH_COMP(saved_rhs, r_const, was_complex_rhs, 1);
+    gen_op('*');
+    gen_op('-');
+    STORE_COMP(0);
+    /* imag = a.real * b.imag + a.imag * b.real */
+    PUSH_COMP(saved_lhs, l_const, was_complex_lhs, 0);
+    PUSH_COMP(saved_rhs, r_const, was_complex_rhs, 1);
+    gen_op('*');
+    PUSH_COMP(saved_lhs, l_const, was_complex_lhs, 1);
+    PUSH_COMP(saved_rhs, r_const, was_complex_rhs, 0);
+    gen_op('*');
+    gen_op('+');
+    STORE_COMP(1);
+    break;
+
+  case '/':
+  {
+    /* Compute denom = c.real^2 + c.imag^2 inline for each component
+     * to avoid temp variable reuse issues. */
+
+    /* real = (a.real * c.real + a.imag * c.imag) / (c.real^2 + c.imag^2) */
+    PUSH_COMP(saved_lhs, l_const, was_complex_lhs, 0);
+    PUSH_COMP(saved_rhs, r_const, was_complex_rhs, 0);
+    gen_op('*');
+    PUSH_COMP(saved_lhs, l_const, was_complex_lhs, 1);
+    PUSH_COMP(saved_rhs, r_const, was_complex_rhs, 1);
+    gen_op('*');
+    gen_op('+');
+    /* denom */
+    PUSH_COMP(saved_rhs, r_const, was_complex_rhs, 0);
+    PUSH_COMP(saved_rhs, r_const, was_complex_rhs, 0);
+    gen_op('*');
+    PUSH_COMP(saved_rhs, r_const, was_complex_rhs, 1);
+    PUSH_COMP(saved_rhs, r_const, was_complex_rhs, 1);
+    gen_op('*');
+    gen_op('+');
+    gen_op('/');
+    STORE_COMP(0);
+
+    /* imag = (a.imag * c.real - a.real * c.imag) / (c.real^2 + c.imag^2) */
+    PUSH_COMP(saved_lhs, l_const, was_complex_lhs, 1);
+    PUSH_COMP(saved_rhs, r_const, was_complex_rhs, 0);
+    gen_op('*');
+    PUSH_COMP(saved_lhs, l_const, was_complex_lhs, 0);
+    PUSH_COMP(saved_rhs, r_const, was_complex_rhs, 1);
+    gen_op('*');
+    gen_op('-');
+    /* denom again */
+    PUSH_COMP(saved_rhs, r_const, was_complex_rhs, 0);
+    PUSH_COMP(saved_rhs, r_const, was_complex_rhs, 0);
+    gen_op('*');
+    PUSH_COMP(saved_rhs, r_const, was_complex_rhs, 1);
+    PUSH_COMP(saved_rhs, r_const, was_complex_rhs, 1);
+    gen_op('*');
+    gen_op('+');
+    gen_op('/');
+    STORE_COMP(1);
+    break;
+  }
+  default:
+    tcc_error("unsupported complex integer operation");
+  }
+
+#undef PUSH_COMP
+#undef STORE_COMP
+
+  /* Push result as complex lvalue. */
+  {
+    SValue result;
+    memset(&result, 0, sizeof(result));
+    result.type.t = bt | VT_COMPLEX | (is_unsigned ? VT_UNSIGNED : 0);
+    result.r = VT_LOCAL | VT_LVAL;
+    result.vr = res_vr;
+    result.c.i = res_loc;
+    vpushv(&result);
+  }
+}
+
+/* Decompose complex floating-point +/- into component-wise operations.
+ *
+ * Stack on entry:  [... lhs rhs]   (both have VT_COMPLEX set, float base types)
+ * Stack on exit:   [... result]    (complex float/double lvalue in temp local)
+ *
+ * For +: result.real = lhs.real + rhs.real, result.imag = lhs.imag + rhs.imag
+ * For -: result.real = lhs.real - rhs.real, result.imag = lhs.imag - rhs.imag
+ *
+ * Complex float:  real at offset +0 (4 B), imag at offset +4 (4 B).
+ * Complex double: real at offset +0 (8 B), imag at offset +8 (8 B).
+ *
+ * This decomposition is necessary because complex double (128 bits) does not
+ * fit in a register pair (64 bits max), so the IR/register allocator cannot
+ * handle it as a single value.  Complex float also uses this path for
+ * consistency.
+ */
+
+/* Generate complex conjugate: negate the imaginary part.
+ * Works for both float and integer complex types.
+ * Expects vtop to hold a complex value. */
+static void gen_complex_conjugate(void)
+{
+  int base_type = vtop->type.t & VT_BTYPE;
+  int is_int_complex = !is_float(base_type);
+  int elem_size;
+
+  if (is_int_complex)
+    elem_size = btype_size(base_type);
+  else if (base_type == VT_DOUBLE || base_type == VT_LDOUBLE)
+    elem_size = 8;
+  else
+    elem_size = 4; /* float */
+
+  int result_size = elem_size * 2;
+  int res_vr;
+  int res_loc = get_temp_local_var(result_size, result_size > 8 ? 8 : result_size, &res_vr);
+
+  /* Element type: strip VT_COMPLEX from the type */
+  CType elem_type;
+  elem_type = vtop->type;
+  elem_type.t &= ~VT_COMPLEX;
+  if (!is_int_complex)
+  {
+    if (elem_size == 4)
+      elem_type.t = (elem_type.t & ~VT_BTYPE) | VT_FLOAT;
+    else
+      elem_type.t = (elem_type.t & ~VT_BTYPE) | VT_DOUBLE;
+  }
+
+  /* Save the original complex value */
+  SValue orig_val = *vtop;
+  vpop();
+
+  /* Extract real part */
+  vpushv(&orig_val);
+  if ((orig_val.r & VT_VALMASK) == VT_LOCAL)
+  {
+    vtop->type.t = (vtop->type.t & ~VT_BTYPE & ~VT_COMPLEX) | (elem_type.t & VT_BTYPE);
+  }
+  else if (orig_val.r & VT_LVAL)
+  {
+    vtop->type.t = (vtop->type.t & ~VT_BTYPE & ~VT_COMPLEX) | (elem_type.t & VT_BTYPE) | VT_LVAL;
+    indir();
+  }
+  else
+  {
+    vtop->type.t = (vtop->type.t & ~VT_BTYPE & ~VT_COMPLEX) | (elem_type.t & VT_BTYPE);
+  }
+
+  /* Store real part to result[0] */
+  SValue res_addr;
+  memset(&res_addr, 0, sizeof(res_addr));
+  res_addr.type = elem_type;
+  res_addr.r = VT_LOCAL | VT_LVAL;
+  res_addr.vr = res_vr;
+  res_addr.c.i = res_loc;
+
+  vpushv(&res_addr);
+  vswap();
+  vstore();
+  vpop();
+
+  /* Extract imaginary part */
+  vpushv(&orig_val);
+  if ((orig_val.r & VT_VALMASK) == VT_LOCAL)
+  {
+    vtop->c.i += elem_size;
+    vtop->type.t = (vtop->type.t & ~VT_BTYPE & ~VT_COMPLEX) | (elem_type.t & VT_BTYPE);
+  }
+  else if (orig_val.r & VT_LVAL)
+  {
+    vpushi(elem_size);
+    gen_op('+');
+    vtop->type.t = (orig_val.type.t & ~VT_BTYPE & ~VT_COMPLEX) | (elem_type.t & VT_BTYPE) | VT_LVAL;
+    indir();
+  }
+  else
+  {
+    tcc_error("complex conjugate: register complex values not yet supported");
+  }
+
+  /* Negate the imaginary part */
+  if (is_int_complex)
+  {
+    vpushi(0);
+    vswap();
+    gen_op('-');
+  }
+  else
+  {
+    gen_opif(TOK_NEG);
+  }
+
+  /* Store negated imaginary part */
+  res_addr.c.i = res_loc + elem_size;
+  vpushv(&res_addr);
+  vswap();
+  vstore();
+  vpop();
+
+  /* Push result as complex type */
+  memset(&res_addr, 0, sizeof(res_addr));
+  res_addr.type = orig_val.type;
+  res_addr.r = VT_LOCAL | VT_LVAL;
+  res_addr.vr = res_vr;
+  res_addr.c.i = res_loc;
+  vpushv(&res_addr);
+}
+
+static void gen_complex_float_arith(int op)
+{
+  int bt = vtop[-1].type.t & VT_BTYPE;
+  int elem_size = (bt == VT_DOUBLE || bt == VT_LDOUBLE) ? 8 : 4;
+  int complex_size = elem_size * 2;
+
+  int l_const = (vtop[-1].r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST;
+  int r_const = (vtop[0].r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST;
+
+  /* Extract constant float/double component values. */
+  CValue l_real_cv, l_imag_cv, r_real_cv, r_imag_cv;
+  memset(&l_real_cv, 0, sizeof(CValue));
+  memset(&l_imag_cv, 0, sizeof(CValue));
+  memset(&r_real_cv, 0, sizeof(CValue));
+  memset(&r_imag_cv, 0, sizeof(CValue));
+
+  if (r_const)
+  {
+    int r_bt = vtop[0].type.t & VT_BTYPE;
+    if (!is_float(r_bt))
+    {
+      if (bt == VT_FLOAT)
+        r_real_cv.f = (float)vtop[0].c.i;
+      else
+        r_real_cv.d = (double)vtop[0].c.i;
+    }
+    else if (bt == VT_FLOAT)
+    {
+      union
+      {
+        float f;
+        uint32_t u;
+      } a, b;
+      a.u = (uint32_t)(vtop[0].c.i & 0xFFFFFFFF);
+      b.u = (uint32_t)(vtop[0].c.i >> 32);
+      r_real_cv.f = a.f;
+      r_imag_cv.f = b.f;
+    }
+    else
+    {
+      memcpy(&r_real_cv.d, &vtop[0].c, 8);
+      memcpy(&r_imag_cv.d, (char *)&vtop[0].c + 8, 8);
+    }
+  }
+  if (l_const)
+  {
+    int l_bt = vtop[-1].type.t & VT_BTYPE;
+    if (!is_float(l_bt))
+    {
+      if (bt == VT_FLOAT)
+        l_real_cv.f = (float)vtop[-1].c.i;
+      else
+        l_real_cv.d = (double)vtop[-1].c.i;
+    }
+    else if (bt == VT_FLOAT)
+    {
+      union
+      {
+        float f;
+        uint32_t u;
+      } a, b;
+      a.u = (uint32_t)(vtop[-1].c.i & 0xFFFFFFFF);
+      b.u = (uint32_t)(vtop[-1].c.i >> 32);
+      l_real_cv.f = a.f;
+      l_imag_cv.f = b.f;
+    }
+    else
+    {
+      memcpy(&l_real_cv.d, &vtop[-1].c, 8);
+      memcpy(&l_imag_cv.d, (char *)&vtop[-1].c + 8, 8);
+    }
+  }
+  SValue saved_lhs = vtop[-1];
+  SValue saved_rhs = vtop[0];
+  vpop();
+  vpop();
+
+  /* Allocate a temp local for the complex result. */
+  int res_vr;
+  int res_loc = get_temp_local_var(complex_size, elem_size > 8 ? 8 : elem_size, &res_vr);
+
+  /* --- Compute real parts --- */
+  if (l_const)
+  {
+    CType ct = {0};
+    ct.t = bt;
+    vsetc(&ct, VT_CONST, &l_real_cv);
+  }
+  else
+  {
+    vpushv(&saved_lhs);
+    vtop->type.t &= ~VT_COMPLEX;
+  }
+  if (r_const)
+  {
+    CType ct = {0};
+    ct.t = bt;
+    vsetc(&ct, VT_CONST, &r_real_cv);
+  }
+  else
+  {
+    vpushv(&saved_rhs);
+    vtop->type.t &= ~VT_COMPLEX;
+  }
+  /* result.real = lhs.real op rhs.real (scalar float/double) */
+  gen_op(op);
+  /* Store to result temp at offset 0 (real part) */
+  {
+    SValue dst;
+    memset(&dst, 0, sizeof(dst));
+    dst.type.t = bt;
+    dst.r = VT_LOCAL | VT_LVAL;
+    dst.vr = res_vr;
+    dst.c.i = res_loc;
+    vpushv(&dst);
+    vswap();
+    vstore();
+    vpop();
+  }
+
+  /* --- Compute imaginary parts --- */
+  if (l_const)
+  {
+    CType ct = {0};
+    ct.t = bt;
+    vsetc(&ct, VT_CONST, &l_imag_cv);
+  }
+  else
+  {
+    vpushv(&saved_lhs);
+    vtop->type.t &= ~VT_COMPLEX;
+    incr_offset(elem_size);
+  }
+  if (r_const)
+  {
+    CType ct = {0};
+    ct.t = bt;
+    vsetc(&ct, VT_CONST, &r_imag_cv);
+  }
+  else
+  {
+    vpushv(&saved_rhs);
+    vtop->type.t &= ~VT_COMPLEX;
+    incr_offset(elem_size);
+  }
+  /* result.imag = lhs.imag op rhs.imag (scalar float/double) */
+  gen_op(op);
+  /* Store to result temp at offset +elem_size (imag part) */
+  {
+    SValue dst;
+    memset(&dst, 0, sizeof(dst));
+    dst.type.t = bt;
+    dst.r = VT_LOCAL | VT_LVAL;
+    dst.vr = res_vr;
+    dst.c.i = res_loc + elem_size;
+    vpushv(&dst);
+    vswap();
+    vstore();
+    vpop();
+  }
+
+  /* Push result as complex lvalue. */
+  {
+    SValue result;
+    memset(&result, 0, sizeof(result));
+    result.type.t = bt | VT_COMPLEX;
+    result.r = VT_LOCAL | VT_LVAL;
+    result.vr = res_vr;
+    result.c.i = res_loc;
+    vpushv(&result);
+  }
 }
 
 /* generic gen_op: handles types problems */
@@ -4072,6 +5140,7 @@ ST_FUNC void gen_op(int op)
   int t1, t2, bt1, bt2, t;
   CType type1, combtype;
   int op_class = op;
+  int bf_trunc_size = 0;
 
   if (op == TOK_SHR || op == TOK_SAR || op == TOK_SHL)
     op_class = SHIFT_OP;
@@ -4083,6 +5152,102 @@ redo:
   t2 = vtop[0].type.t;
   bt1 = t1 & VT_BTYPE;
   bt2 = t2 & VT_BTYPE;
+
+  /* Complex integer == and != : decompose into per-component comparisons
+   * before the usual arithmetic conversions.  We do this early because the
+   * runtime cast from a narrow complex type (_Complex char/short) to a wider
+   * one (_Complex int) is not implemented – it would naïvely sign-extend
+   * just the low byte, losing the packed imaginary part. */
+  if ((op == TOK_EQ || op == TOK_NE) && ((t1 | t2) & VT_COMPLEX) && !is_float(bt1) && !is_float(bt2))
+  {
+    /* Promote a non-complex operand to complex (imag = 0) so the
+     * decomposition helper always sees VT_COMPLEX on both sides. */
+    if (!(t1 & VT_COMPLEX))
+    {
+      /* lhs is real: rewrite as _Complex with base type = bt1 */
+      vtop[-1].type.t |= VT_COMPLEX;
+      /* For constants: mask to only the real part so the imaginary
+       * (high) bits are zero.  A sign-extended c.i (e.g. -1 stored
+       * as 0xFFFFFFFFFFFFFFFF) would otherwise look like imag = -1. */
+      if ((vtop[-1].r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST && btype_size(bt1) < 8)
+        vtop[-1].c.i &= (1ULL << (btype_size(bt1) * 8)) - 1;
+    }
+    if (!(t2 & VT_COMPLEX))
+    {
+      vtop[0].type.t |= VT_COMPLEX;
+      /* Same masking for rhs constants. */
+      if ((vtop[0].r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST && btype_size(bt2) < 8)
+        vtop[0].c.i &= (1ULL << (btype_size(bt2) * 8)) - 1;
+    }
+    gen_complex_int_cmp(op);
+    return;
+  }
+
+  /* Complex float/double == and != : decompose into per-component comparisons.
+   * The FCMP backend only compares the real (lo) half, so we split the
+   * comparison into two scalar float/double comparisons here. */
+  if ((op == TOK_EQ || op == TOK_NE) && ((t1 | t2) & VT_COMPLEX) && (is_float(bt1) || is_float(bt2)))
+  {
+    if (!(t1 & VT_COMPLEX))
+      vtop[-1].type.t |= VT_COMPLEX;
+    if (!(t2 & VT_COMPLEX))
+      vtop[0].type.t |= VT_COMPLEX;
+
+    gen_complex_float_cmp(op);
+    return;
+  }
+
+  /* Complex float/double +/- : decompose into per-component scalar operations.
+   * Complex double (128 bits) does not fit in a register pair (64 bits max),
+   * so we decompose at the front-end level. Complex float also uses this
+   * path for consistency. Skip when both are constant (gen_opif folds). */
+  if ((op == '+' || op == '-') && (t1 & VT_COMPLEX) && (t2 & VT_COMPLEX) && (is_float(bt1) || is_float(bt2)))
+  {
+    int l_c = (vtop[-1].r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST;
+    int r_c = (vtop[0].r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST;
+    if (!(l_c && r_c))
+    {
+      gen_complex_float_arith(op);
+      return;
+    }
+  }
+
+  /* Complex integer +, -, *, / : decompose into component-wise scalar operations.
+   * Complex integers don't fit in a single 32-bit register, so non-constant
+   * operations must be decomposed into real/imag scalar operations.
+   * Skip when both are constant (gen_opic constant-folds those). */
+  if ((op == '+' || op == '-' || op == '*' || op == '/') && ((t1 | t2) & VT_COMPLEX) && !is_float(bt1) &&
+      !is_float(bt2))
+  {
+    int l_c = (vtop[-1].r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST;
+    int r_c = (vtop[0].r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST;
+    if (!(l_c && r_c))
+    {
+      /* Don't set VT_COMPLEX on non-complex operands here;
+       * gen_complex_int_arith needs to know which were originally complex
+       * to correctly extract imaginary parts (0 for real operands). */
+      gen_complex_int_arith(op);
+      return;
+    }
+  }
+
+  /* C11 6.7.2.1p10: a bit-field has an integer type of the specified width.
+     For unsigned long long bit-fields narrower than 64 bits but wider than
+     32, arithmetic must wrap at the bit-field width, not at 64 bits.
+     Track the effective width here so we can truncate after the operation. */
+  bf_trunc_size = 0;
+  if ((t1 & VT_BITFIELD) && (t1 & VT_UNSIGNED) && bt1 == VT_LLONG)
+  {
+    int bs = BIT_SIZE(t1);
+    if (bs > 32 && bs < 64)
+      bf_trunc_size = bs;
+  }
+  if ((t2 & VT_BITFIELD) && (t2 & VT_UNSIGNED) && bt2 == VT_LLONG)
+  {
+    int bs = BIT_SIZE(t2);
+    if (bs > 32 && bs < 64 && bs > bf_trunc_size)
+      bf_trunc_size = bs;
+  }
 
   /* GCC vector extension: dispatch to element-wise scalar lowering */
   if ((t1 & VT_VECTOR) || (t2 & VT_VECTOR))
@@ -4215,6 +5380,15 @@ redo:
       gen_opif(op);
     else
       gen_opic(op);
+    /* Truncate result for wide unsigned bit-field arithmetic (C11 6.7.2.1p10).
+       Bit-fields wider than int but narrower than their base type have their
+       own effective integer type; arithmetic must wrap at the bit-field width,
+       not the full long long width. */
+    if (bf_trunc_size > 0 && op_class != CMP_OP)
+    {
+      vpush64(VT_LLONG | VT_UNSIGNED, (1ULL << bf_trunc_size) - 1);
+      gen_opic('&');
+    }
     if (op_class == CMP_OP)
     {
       /* relational op: the result is an int */
@@ -4232,6 +5406,43 @@ redo:
   // Make sure that we have converted to an rvalue:
   // if (vtop->r & VT_LVAL)
   //   gv(is_float(vtop->type.t & VT_BTYPE) ? RC_FLOAT : RC_INT);
+}
+
+/* Try to extract a compile-time constant string from an SValue.
+ * Returns the string pointer if the SValue refers to a constant string literal
+ * in a data section, NULL otherwise. Sets *out_len to the string length. */
+static const char *try_get_constant_string(SValue *sv, int *out_len)
+{
+  ElfSym *esym;
+  Section *sec;
+  const char *str;
+  addr_t offset;
+
+  /* Must be a constant symbol reference */
+  if ((sv->r & (VT_VALMASK | VT_SYM)) != (VT_CONST | VT_SYM))
+    return NULL;
+  if (!sv->sym)
+    return NULL;
+
+  esym = elfsym(sv->sym);
+  if (!esym)
+    return NULL;
+
+  if (esym->st_shndx == SHN_UNDEF || esym->st_shndx >= (unsigned)tcc_state->nb_sections)
+    return NULL;
+
+  sec = tcc_state->sections[esym->st_shndx];
+  if (!sec || !sec->data)
+    return NULL;
+
+  offset = esym->st_value + sv->c.i;
+  if (offset >= sec->data_offset)
+    return NULL;
+
+  str = (const char *)(sec->data + offset);
+  if (out_len)
+    *out_len = strlen(str);
+  return str;
 }
 
 /* Try to inline a builtin integer absolute value function (abs/labs/llabs).
@@ -4282,6 +5493,169 @@ static int try_inline_builtin_call(const char *func_name, SValue *args, int nb_a
   return 1;
 }
 
+/* Suppress error output during speculative inline evaluation */
+static void inline_eval_suppress_error(void *opaque, const char *msg)
+{
+  (void)opaque;
+  (void)msg;
+}
+
+/* Try to evaluate a small inline function at compile time with constant arguments.
+ * Only handles trivial function bodies of the form: { return expr; }
+ * This enables __builtin_constant_p to see through inlined calls, e.g.:
+ *   inline int f(int x) { return __builtin_constant_p(x); }
+ *   int g(void) { return f(1); } // should return 1 at -O1
+ * Returns 1 on success (result pushed on vtop), 0 on failure.
+ */
+static int try_inline_const_eval(Sym *func_sym, SValue *args, int nb_args)
+{
+  struct InlineFunc *fn;
+  Sym *param, *func_type_ref;
+  int i, param_count, saved_nocode_wanted, saved_tok;
+  CValue saved_tokc;
+  Sym *saved_local_stack;
+  SValue *saved_vtop;
+  SValue result;
+  TokenString *ts;
+  int success = 0;
+  jmp_buf saved_jmp_buf;
+  int saved_nb_errors;
+  void (*saved_error_func)(void *opaque, const char *msg);
+  void *saved_error_opaque;
+
+  if (!tcc_state->optimize || !func_sym || !(func_sym->type.t & VT_INLINE))
+    return 0;
+
+  /* All arguments must be compile-time integer constants */
+  for (i = 0; i < nb_args; i++)
+  {
+    if ((args[i].r & (VT_VALMASK | VT_LVAL)) != VT_CONST || (args[i].r & VT_SYM))
+      return 0;
+  }
+
+  /* Find the InlineFunc for this symbol */
+  fn = NULL;
+  for (i = 0; i < tcc_state->nb_inline_fns; i++)
+  {
+    if (tcc_state->inline_fns[i]->sym == func_sym)
+    {
+      fn = tcc_state->inline_fns[i];
+      break;
+    }
+  }
+  if (!fn || !fn->func_str)
+    return 0;
+
+  /* Get function parameter list */
+  func_type_ref = func_sym->type.ref;
+  if (!func_type_ref)
+    return 0;
+
+  /* Count and verify parameters */
+  param_count = 0;
+  for (param = func_type_ref->next; param; param = param->next)
+    param_count++;
+  if (param_count != nb_args || nb_args > 8)
+    return 0;
+
+  /* Verify all params have valid identifier names */
+  for (param = func_type_ref->next; param; param = param->next)
+  {
+    if ((param->v & ~SYM_FIELD) < TOK_IDENT)
+      return 0;
+  }
+
+  /* Save state */
+  saved_nocode_wanted = nocode_wanted;
+  saved_local_stack = local_stack;
+  saved_tok = tok;
+  saved_tokc = tokc;
+  saved_vtop = vtop;
+
+  /* Push parameter symbols as compile-time constants */
+  param = func_type_ref->next;
+  for (i = 0; i < nb_args; i++, param = param->next)
+  {
+    Sym *s = sym_push(param->v & ~SYM_FIELD, &param->type, VT_CONST, (int)args[i].c.i);
+    s->vreg = -1;
+  }
+
+  /* Suppress code generation during evaluation */
+  nocode_wanted++;
+
+  /* Create a non-owning wrapper TokenString to replay the inline body.
+   * Use alloc=2 so end_macro() nulls data.str without freeing the original. */
+  ts = tok_str_alloc();
+  ts->data.str = tok_str_buf(fn->func_str);
+  ts->allocated_len = 1; /* pretend heap so tok_str_buf returns data.str */
+  ts->len = fn->func_str->len;
+  begin_macro(ts, 2);
+
+  /* Set up error recovery: expressions like x++ on a constant parameter
+   * will trigger tcc_error("lvalue expected"). Catch and treat as failure. */
+  saved_nb_errors = tcc_state->nb_errors;
+  saved_error_func = tcc_state->error_func;
+  saved_error_opaque = tcc_state->error_opaque;
+  memcpy(saved_jmp_buf, tcc_state->error_jmp_buf, sizeof(jmp_buf));
+  tcc_state->error_func = inline_eval_suppress_error;
+  tcc_state->error_opaque = NULL;
+
+  if (setjmp(tcc_state->error_jmp_buf) != 0)
+  {
+    /* Error occurred during speculative evaluation — not a constant */
+    success = 0;
+    goto cleanup;
+  }
+
+  next();
+
+  /* Expect: { return expr ; } */
+  if (tok == '{')
+  {
+    next();
+    if (tok == TOK_RETURN)
+    {
+      next();
+      expr_eq();
+      /* Check if the result is a compile-time constant */
+      if ((vtop->r & (VT_VALMASK | VT_LVAL)) == VT_CONST && !(vtop->r & VT_SYM))
+      {
+        result = *vtop;
+        success = 1;
+      }
+      vtop--; /* pop the result (or failed non-const) */
+    }
+  }
+
+cleanup:
+  /* Restore error handling */
+  memcpy(tcc_state->error_jmp_buf, saved_jmp_buf, sizeof(jmp_buf));
+  tcc_state->error_func = saved_error_func;
+  tcc_state->error_opaque = saved_error_opaque;
+  tcc_state->nb_errors = saved_nb_errors;
+
+  /* Clean up: end macro replay */
+  end_macro();
+
+  /* Restore state */
+  nocode_wanted = saved_nocode_wanted;
+  tok = saved_tok;
+  tokc = saved_tokc;
+
+  /* Pop parameter symbols */
+  sym_pop(&local_stack, saved_local_stack, 0);
+
+  /* Restore vtop to what it was before (in case partial parsing left junk) */
+  vtop = saved_vtop;
+
+  if (success)
+  {
+    vpushv(&result);
+    return 1;
+  }
+  return 0;
+}
+
 #if defined TCC_TARGET_ARM64 || defined TCC_TARGET_RISCV64 || defined TCC_TARGET_ARM
 #define gen_cvt_itof1 gen_cvt_itof
 #else
@@ -4315,9 +5689,14 @@ static void gen_cvt_itof1(int t)
 /* special delayed cast for char/short */
 static void force_charshort_cast(void)
 {
-  int sbt = BFGET(vtop->r, VT_MUSTCAST) == 2 ? VT_LLONG : VT_INT;
+  /* VT_MUSTCAST uses bits VT_MUSTCAST (0x0100) and VT_MUSTCAST<<1 (0x0200)
+   * as a 2-bit field: value 1 = from int, value 2 = from long long.
+   * BFGET(vtop->r, VT_MUSTCAST) doesn't work correctly for the 1-bit mask
+   * when the value is 2, so extract manually. */
+  int mustcast_bits = (vtop->r & (VT_MUSTCAST | (VT_MUSTCAST << 1)));
+  int sbt = (mustcast_bits == BFVAL(VT_MUSTCAST, 2)) ? VT_LLONG : VT_INT;
   int dbt = vtop->type.t;
-  vtop->r &= ~VT_MUSTCAST;
+  vtop->r &= ~(VT_MUSTCAST | (VT_MUSTCAST << 1));
   vtop->type.t = sbt;
   gen_cast_s(dbt == VT_BOOL ? VT_BYTE | VT_UNSIGNED : dbt);
   vtop->type.t = dbt;
@@ -4394,7 +5773,7 @@ static void gen_cast(CType *type)
   int dbt_bt, sbt_bt, ds, ss, bits, trunc;
 
   /* special delayed cast for char/short */
-  if (vtop->r & VT_MUSTCAST)
+  if (vtop->r & (VT_MUSTCAST | (VT_MUSTCAST << 1)))
     force_charshort_cast();
 
   /* bitfields first get cast to ints */
@@ -4417,9 +5796,91 @@ static void gen_cast(CType *type)
   if (sbt == VT_FUNC)
     sbt = VT_PTR;
 
+  /* Constant complex float/double cast: intercept before sbt==dbt shortcut.
+   * When VT_COMPLEX flag changes but base type is the same (e.g. double → _Complex double),
+   * we still need to repack the CValue. Force entry into the main cast body. */
+  if (sbt == dbt && ((vtop->type.t ^ type->t) & VT_COMPLEX) &&
+      (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST && is_float(sbt))
+  {
+    /* Force sbt != dbt so we enter the main cast body below,
+     * where the complex constant cast handler will pick this up. */
+    goto process_cast;
+  }
+
+  /* Non-constant integer to/from complex integer cast:
+   * When VT_COMPLEX flag changes but the base type is the same (e.g. int → _Complex int),
+   * we need to materialize/extract the complex value.  The sbt==dbt shortcut below
+   * would just update the type flag without generating any code, leaving the
+   * imaginary part uninitialized. */
+  if (sbt == dbt && ((vtop->type.t ^ type->t) & VT_COMPLEX) && !is_float(sbt & VT_BTYPE))
+  {
+    int is_const = (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST;
+    if (is_const)
+      goto process_cast; /* constant case handled in the main cast body */
+
+    int src_complex = (vtop->type.t & VT_COMPLEX) != 0;
+    int dst_complex = (type->t & VT_COMPLEX) != 0;
+    int elem_sz = btype_size(sbt & VT_BTYPE);
+
+    if (!src_complex && dst_complex)
+    {
+      /* scalar → _Complex: allocate temp, store scalar as real, store 0 as imag */
+      int complex_sz = elem_sz * 2;
+      CType scalar_type;
+      scalar_type.t = sbt;
+      scalar_type.ref = NULL;
+
+      int tmp_vr;
+      int tmp_loc = get_temp_local_var(complex_sz, elem_sz, &tmp_vr);
+
+      /* Store real part = scalar value */
+      {
+        SValue dst;
+        memset(&dst, 0, sizeof(dst));
+        dst.type = scalar_type;
+        dst.r = VT_LOCAL | VT_LVAL;
+        dst.vr = tmp_vr;
+        dst.c.i = tmp_loc;
+        vpushv(&dst);
+        vswap();
+        vstore();
+        vpop();
+      }
+
+      /* Store imaginary part = 0 */
+      {
+        SValue dst;
+        memset(&dst, 0, sizeof(dst));
+        dst.type = scalar_type;
+        dst.r = VT_LOCAL | VT_LVAL;
+        dst.vr = tmp_vr;
+        dst.c.i = tmp_loc + elem_sz;
+        vpushv(&dst);
+        vpushi(0);
+        vtop->type = scalar_type;
+        vstore();
+        vpop();
+      }
+
+      /* Replace vtop with complex temp lvalue */
+      vtop->type = *type;
+      vtop->r = VT_LOCAL | VT_LVAL;
+      vtop->vr = tmp_vr;
+      vtop->c.i = tmp_loc;
+      return;
+    }
+    else if (src_complex && !dst_complex)
+    {
+      /* _Complex → scalar: extract real part (at offset 0), discard imaginary */
+      vtop->type = *type;
+      return;
+    }
+  }
+
 again:
   if (sbt != dbt)
   {
+  process_cast:
     sf = is_float(sbt);
     df = is_float(dbt);
     dbt_bt = dbt & VT_BTYPE;
@@ -4439,6 +5900,135 @@ again:
     if (dbt_bt == VT_LDOUBLE && !nocode_wanted && (sf || vtop->c.i != 0))
       c = 0;
 #endif
+
+    /* Handle complex integer constant casts */
+    if (c && ((vtop->type.t & VT_COMPLEX) || (type->t & VT_COMPLEX)) && !is_float(vtop->type.t & VT_BTYPE) &&
+        !is_float(type->t & VT_BTYPE))
+    {
+      int src_complex = (vtop->type.t & VT_COMPLEX) != 0;
+      int dst_complex = (type->t & VT_COMPLEX) != 0;
+      int src_bt = vtop->type.t & VT_BTYPE;
+      int dst_bt = type->t & VT_BTYPE;
+
+      if (!src_complex && dst_complex)
+      {
+        /* int → _Complex int: real = value, imag = 0 */
+        uint64_t mask = (dst_bt == VT_LLONG) ? 0xFFFFFFFFFFFFFFFFULL : ((1ULL << (btype_size(dst_bt) * 8)) - 1);
+        uint64_t real_val = vtop->c.i & mask;
+        vtop->c.i = real_val; /* imag = 0, real = truncated value */
+      }
+      else if (src_complex && dst_complex)
+      {
+        /* _Complex int → _Complex int (different sizes): extract, truncate, repack */
+        int src_shift = btype_size(src_bt) * 8;
+        int dst_shift = btype_size(dst_bt) * 8;
+        uint64_t src_mask = (src_bt == VT_LLONG) ? 0xFFFFFFFFFFFFFFFFULL : ((1ULL << src_shift) - 1);
+        uint64_t dst_mask = (dst_bt == VT_LLONG) ? 0xFFFFFFFFFFFFFFFFULL : ((1ULL << dst_shift) - 1);
+        uint64_t real_val = vtop->c.i & src_mask;
+        uint64_t imag_val = (vtop->c.i >> src_shift) & src_mask;
+        real_val &= dst_mask;
+        imag_val &= dst_mask;
+        vtop->c.i = (imag_val << dst_shift) | real_val;
+      }
+      else if (src_complex && !dst_complex)
+      {
+        /* _Complex int → int: extract real part only */
+        int src_shift = btype_size(src_bt) * 8;
+        uint64_t src_mask = (src_bt == VT_LLONG) ? 0xFFFFFFFFFFFFFFFFULL : ((1ULL << src_shift) - 1);
+        vtop->c.i = vtop->c.i & src_mask;
+      }
+      vtop->type = *type;
+      goto done;
+    }
+
+    /* Handle complex float/double constant casts.
+     * Complex float is packed as {real_bits, imag_bits} in CValue.i (64 bits).
+     * Complex double is packed as {real, imag} in CValue bytes [0:7] and [8:15].
+     * This must be handled before the scalar constant folding code which would
+     * corrupt the packed representation. */
+    if (c && ((vtop->type.t & VT_COMPLEX) || (type->t & VT_COMPLEX)) &&
+        (is_float(vtop->type.t & VT_BTYPE) || is_float(type->t & VT_BTYPE)))
+    {
+      int src_complex = (vtop->type.t & VT_COMPLEX) != 0;
+      int dst_complex = (type->t & VT_COMPLEX) != 0;
+      int src_bt = vtop->type.t & VT_BTYPE;
+      int dst_bt = type->t & VT_BTYPE;
+
+      /* Helper: extract real and imaginary parts as doubles from source CValue */
+      double src_real = 0.0, src_imag = 0.0;
+      if (src_complex)
+      {
+        if (src_bt == VT_FLOAT)
+        {
+          /* Complex float: packed as {float_real, float_imag} in CValue.i */
+          union
+          {
+            float f;
+            uint32_t u;
+          } r, i;
+          r.u = (uint32_t)(vtop->c.i & 0xFFFFFFFF);
+          i.u = (uint32_t)(vtop->c.i >> 32);
+          src_real = r.f;
+          src_imag = i.f;
+        }
+        else
+        {
+          /* Complex double: bytes [0:7] = real, [8:15] = imag */
+          memcpy(&src_real, &vtop->c, 8);
+          memcpy(&src_imag, (char *)&vtop->c + 8, 8);
+        }
+      }
+      else
+      {
+        /* Real scalar → complex: imag = 0 */
+        if (src_bt == VT_FLOAT)
+          src_real = vtop->c.f;
+        else if (src_bt == VT_DOUBLE)
+          src_real = vtop->c.d;
+        else if (src_bt == VT_LDOUBLE)
+          src_real = (double)vtop->c.ld;
+        else
+          src_real = (double)(int64_t)vtop->c.i; /* integer to real */
+        src_imag = 0.0;
+      }
+
+      if (dst_complex)
+      {
+        /* Pack into destination complex format */
+        memset(&vtop->c, 0, sizeof(CValue));
+        if (dst_bt == VT_FLOAT)
+        {
+          union
+          {
+            float f;
+            uint32_t u;
+          } r, i;
+          r.f = (float)src_real;
+          i.f = (float)src_imag;
+          vtop->c.i = (uint64_t)r.u | ((uint64_t)i.u << 32);
+        }
+        else
+        {
+          /* Complex double: pack as {real, imag} in CValue */
+          double dr = src_real, di = src_imag;
+          memcpy(&vtop->c, &dr, 8);
+          memcpy((char *)&vtop->c + 8, &di, 8);
+        }
+      }
+      else
+      {
+        /* Complex → real scalar: extract real part only */
+        if (dst_bt == VT_FLOAT)
+          vtop->c.f = (float)src_real;
+        else if (dst_bt == VT_DOUBLE)
+          vtop->c.d = src_real;
+        else
+          vtop->c.ld = (long double)src_real;
+      }
+      vtop->type = *type;
+      goto done;
+    }
+
     if (c)
     {
       /* constant case: we can do it now */
@@ -4695,6 +6285,12 @@ again:
         tcc_state->ir->prevent_coalescing = 1;
         tcc_ir_put(tcc_state->ir, TCCIR_OP_ASSIGN, vtop, NULL, &low32);
         tcc_state->ir->prevent_coalescing = old_prevent_coalescing;
+        /* Prevent the NEXT ASSIGN from coalescing with this truncation.
+         * Without this, a subsequent gv_dup() (e.g. from gen_cast widening
+         * in __builtin_mul_overflow) would coalesce its ASSIGN with the
+         * truncation ASSIGN, erasing low32's vreg definition while other
+         * vstack entries still reference it. */
+        tcc_state->ir->basic_block_start = 1;
         vtop->type.t = low32.type.t;
         vtop->vr = low32.vr;
         vtop->r = 0;
@@ -4767,6 +6363,48 @@ done:
   vtop->type.t &= ~(VT_CONSTANT | VT_VOLATILE | VT_ARRAY);
 }
 
+#ifdef TCC_TARGET_ARM
+/* Compute AAPCS "natural alignment" for parameter passing.
+ * For composites, this is the max alignment of fundamental data type
+ * members.  Crucially, __attribute__((aligned)) on the struct does NOT
+ * increase this, and __attribute__((packed)) DOES reduce member alignment
+ * to 1.  This alignment determines whether register double-word alignment
+ * (even-register rule) applies for function calls and va_arg. */
+static int compute_aapcs_natural_alignment(const CType *type)
+{
+  int bt = type->t & VT_BTYPE;
+  if (bt != VT_STRUCT)
+  {
+    int align;
+    type_size(type, &align);
+    return align > 0 ? align : 1;
+  }
+  Sym *s = type->ref;
+  if (!s)
+    return 4;
+  int max_align = 1;
+  for (Sym *f = s->next; f; f = f->next)
+  {
+    int member_align;
+    if ((f->type.t & VT_BTYPE) == VT_STRUCT)
+      member_align = compute_aapcs_natural_alignment(&f->type);
+    else if (f->type.t & VT_BITFIELD)
+    {
+      CType base_type = f->type;
+      base_type.t &= ~VT_BITFIELD;
+      type_size(&base_type, &member_align);
+    }
+    else
+      type_size(&f->type, &member_align);
+    if (f->a.packed || s->a.packed)
+      member_align = 1;
+    if (member_align > max_align)
+      max_align = member_align;
+  }
+  return max_align;
+}
+#endif
+
 /* return type size as known at compile time. Put alignment at 'a' */
 ST_FUNC int type_size(const CType *type, int *a)
 {
@@ -4787,6 +6425,17 @@ ST_FUNC int type_size(const CType *type, int *a)
     {
       *a = 8;    /* Alignment of double */
       return 16; /* 2 x 8 bytes */
+    }
+    else
+    {
+      /* Complex integer types (GCC extension): _Complex char/short/int/long long */
+      int base_size, base_align;
+      CType base_type;
+      base_type.t = bt;
+      base_type.ref = NULL;
+      base_size = type_size(&base_type, &base_align);
+      *a = base_align;
+      return 2 * base_size;
     }
   }
 
@@ -5262,6 +6911,336 @@ ST_FUNC void vstore(void)
 
   verify_assign_cast(&vtop[-1].type);
 
+  /* If destination is complex but source is not, cast source to complex first
+   * so the complex store path below handles both components (real + imag). */
+  if ((ft & VT_COMPLEX) && !(vtop->type.t & VT_COMPLEX))
+    gen_cast(&vtop[-1].type);
+
+  /* Complex-to-complex assignment: decompose into component-wise stores.
+   * When base types differ (e.g. float complex → double complex), each
+   * component is individually cast.  When they match, we use memcpy.
+   * When base types differ, first convert to a local temp, then memcpy.
+   * When the source is a constant, decompose into two scalar stores
+   * to avoid gaddrof() on a constant (which can't produce a valid address). */
+  if ((ft & VT_COMPLEX) && (vtop->type.t & VT_COMPLEX))
+  {
+    int src_bt = vtop->type.t & VT_BTYPE;
+    int dst_bt = ft & VT_BTYPE;
+    int src_is_const = (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST;
+
+    /* Constant complex float/double: materialize to a temp local first,
+     * then let the memcpy path below copy it to the destination.
+     * We can't gaddrof() a VT_CONST complex directly. */
+    if (src_is_const && is_float(src_bt))
+    {
+      double src_real = 0.0, src_imag = 0.0;
+      int src_elem_size = (src_bt == VT_DOUBLE || src_bt == VT_LDOUBLE) ? 8 : 4;
+      int src_total = src_elem_size * 2;
+
+      /* Extract components from constant */
+      if (src_bt == VT_FLOAT)
+      {
+        union
+        {
+          float f;
+          uint32_t u;
+        } r, im;
+        r.u = (uint32_t)(vtop->c.i & 0xFFFFFFFF);
+        im.u = (uint32_t)(vtop->c.i >> 32);
+        src_real = r.f;
+        src_imag = im.f;
+      }
+      else
+      {
+        memcpy(&src_real, &vtop->c, 8);
+        memcpy(&src_imag, (char *)&vtop->c + 8, 8);
+      }
+
+      /* Allocate a temp local to hold the complex constant */
+      int tmp_vr;
+      int tmp_loc = get_temp_local_var(src_total, src_elem_size, &tmp_vr);
+
+      /* Replace vtop (the constant) with two scalar stores into the temp */
+      vpop(); /* remove the complex constant */
+
+      /* Store real part to temp */
+      {
+        CType elem_type;
+        elem_type.t = src_bt;
+        elem_type.ref = NULL;
+        SValue tmp_dst;
+        memset(&tmp_dst, 0, sizeof(tmp_dst));
+        tmp_dst.type = elem_type;
+        tmp_dst.r = VT_LOCAL | VT_LVAL;
+        tmp_dst.vr = tmp_vr;
+        tmp_dst.c.i = tmp_loc;
+        vpushv(&tmp_dst);
+        CValue cv;
+        memset(&cv, 0, sizeof(cv));
+        if (src_bt == VT_FLOAT)
+          cv.f = (float)src_real;
+        else
+          cv.d = src_real;
+        vsetc(&elem_type, VT_CONST, &cv);
+        vstore();
+        vpop();
+      }
+
+      /* Store imag part to temp+offset */
+      {
+        CType elem_type;
+        elem_type.t = src_bt;
+        elem_type.ref = NULL;
+        SValue tmp_dst;
+        memset(&tmp_dst, 0, sizeof(tmp_dst));
+        tmp_dst.type = elem_type;
+        tmp_dst.r = VT_LOCAL | VT_LVAL;
+        tmp_dst.vr = tmp_vr;
+        tmp_dst.c.i = tmp_loc + src_elem_size;
+        vpushv(&tmp_dst);
+        CValue cv;
+        memset(&cv, 0, sizeof(cv));
+        if (src_bt == VT_FLOAT)
+          cv.f = (float)src_imag;
+        else
+          cv.d = src_imag;
+        vsetc(&elem_type, VT_CONST, &cv);
+        vstore();
+        vpop();
+      }
+
+      /* Push temp local as the new source (complex lvalue) */
+      {
+        SValue src_sv;
+        memset(&src_sv, 0, sizeof(src_sv));
+        src_sv.type = vtop->type; /* use dest type since they match at this point */
+        src_sv.type.t = (src_sv.type.t & ~VT_BTYPE) | src_bt | VT_COMPLEX;
+        src_sv.r = VT_LOCAL | VT_LVAL;
+        src_sv.vr = tmp_vr;
+        src_sv.c.i = tmp_loc;
+        vpushv(&src_sv);
+      }
+      /* Fall through to the memcpy path below with the temp as source */
+    }
+
+    /* Constant complex integer: materialize to a temp local first,
+     * then let the memcpy path below copy it to the destination.
+     * We can't gaddrof() a VT_CONST integer complex directly. */
+    if (src_is_const && !is_float(src_bt))
+    {
+      int src_elem_size = btype_size(src_bt);
+      int src_total = src_elem_size * 2;
+      int shift = src_elem_size * 8;
+      uint64_t packed = vtop->c.i;
+      uint64_t mask = (src_bt == VT_LLONG) ? 0xFFFFFFFFFFFFFFFFULL : ((1ULL << shift) - 1);
+      int64_t src_real = (int64_t)(packed & mask);
+      int64_t src_imag = (int64_t)((packed >> shift) & mask);
+
+      /* Allocate a temp local to hold the complex constant */
+      int tmp_vr;
+      int tmp_loc = get_temp_local_var(src_total, src_elem_size, &tmp_vr);
+
+      /* Replace vtop (the constant) with two scalar stores into the temp */
+      vpop(); /* remove the complex constant */
+
+      /* Store real part to temp */
+      {
+        CType elem_type;
+        elem_type.t = src_bt;
+        elem_type.ref = NULL;
+        SValue tmp_dst;
+        memset(&tmp_dst, 0, sizeof(tmp_dst));
+        tmp_dst.type = elem_type;
+        tmp_dst.r = VT_LOCAL | VT_LVAL;
+        tmp_dst.vr = tmp_vr;
+        tmp_dst.c.i = tmp_loc;
+        vpushv(&tmp_dst);
+        CValue cv;
+        memset(&cv, 0, sizeof(cv));
+        cv.i = src_real;
+        vsetc(&elem_type, VT_CONST, &cv);
+        vstore();
+        vpop();
+      }
+
+      /* Store imag part to temp+offset */
+      {
+        CType elem_type;
+        elem_type.t = src_bt;
+        elem_type.ref = NULL;
+        SValue tmp_dst;
+        memset(&tmp_dst, 0, sizeof(tmp_dst));
+        tmp_dst.type = elem_type;
+        tmp_dst.r = VT_LOCAL | VT_LVAL;
+        tmp_dst.vr = tmp_vr;
+        tmp_dst.c.i = tmp_loc + src_elem_size;
+        vpushv(&tmp_dst);
+        CValue cv;
+        memset(&cv, 0, sizeof(cv));
+        cv.i = src_imag;
+        vsetc(&elem_type, VT_CONST, &cv);
+        vstore();
+        vpop();
+      }
+
+      /* Push temp local as the new source (complex lvalue) */
+      {
+        SValue src_sv;
+        memset(&src_sv, 0, sizeof(src_sv));
+        src_sv.type = vtop->type; /* use dest type since they match at this point */
+        src_sv.type.t = (src_sv.type.t & ~VT_BTYPE) | src_bt | VT_COMPLEX;
+        src_sv.r = VT_LOCAL | VT_LVAL;
+        src_sv.vr = tmp_vr;
+        src_sv.c.i = tmp_loc;
+        vpushv(&src_sv);
+      }
+      /* Fall through to the memcpy path below with the temp as source */
+    }
+
+    /* Non-lvalue complex vreg source (computed expression, e.g., a + b):
+     * The value lives in a register pair, not in memory. We can't take
+     * its address for memcpy. Generate a direct STORE/ASSIGN instead.
+     * The backend's STORE handler already supports 64-bit pair stores. */
+    if (!(vtop->r & VT_LVAL) && !src_is_const && is_float(src_bt) && src_bt == dst_bt)
+    {
+      int op = TCCIR_OP_STORE;
+      if ((vtop[-1].r & VT_VALMASK) == VT_LOCAL && vtop[-1].vr != -1)
+        op = TCCIR_OP_ASSIGN;
+
+      /* Ensure destination type matches for a complex pair store. */
+      vtop[-1].type.t = (vtop[-1].type.t & ~VT_BTYPE) | src_bt;
+
+      tcc_ir_put(tcc_state->ir, op, vtop, NULL, &vtop[-1]);
+
+      if (op == TCCIR_OP_ASSIGN)
+      {
+        vtop->vr = vtop[-1].vr;
+        vtop->r = 0;
+      }
+      vswap();
+      vtop--; /* remove destination, keep assignment result */
+      return;
+    }
+
+    /* If base types differ, convert component-wise into a temp first */
+    if (src_bt != dst_bt)
+    {
+      int src_elem_size = (src_bt == VT_DOUBLE || src_bt == VT_LDOUBLE) ? 8 : 4;
+      int dst_elem_size = (dst_bt == VT_DOUBLE || dst_bt == VT_LDOUBLE) ? 8 : 4;
+      int dst_total = dst_elem_size * 2;
+
+      CType src_elem_type;
+      src_elem_type.t = (vtop->type.t & ~VT_BTYPE & ~VT_COMPLEX) | src_bt;
+      src_elem_type.ref = vtop->type.ref;
+
+      CType dst_elem_type;
+      dst_elem_type.t = (ft & ~VT_BTYPE & ~VT_COMPLEX) | dst_bt;
+      dst_elem_type.ref = vtop[-1].type.ref;
+
+      CType dst_complex_type;
+      dst_complex_type.t = (ft & ~VT_BTYPE) | dst_bt; /* keeps VT_COMPLEX */
+      dst_complex_type.ref = vtop[-1].type.ref;
+
+      /* Allocate temporary for the converted complex value */
+      int res_vr;
+      int res_loc = get_temp_local_var(dst_total, dst_elem_size, &res_vr);
+
+      /* Save original source */
+      SValue orig_src = *vtop;
+      vpop();
+
+      /* Convert real part */
+      vpushv(&orig_src);
+      vtop->type = src_elem_type;
+      gen_cast(&dst_elem_type);
+      {
+        SValue tmp_dst;
+        memset(&tmp_dst, 0, sizeof(tmp_dst));
+        tmp_dst.type = dst_elem_type;
+        tmp_dst.r = VT_LOCAL | VT_LVAL;
+        tmp_dst.vr = res_vr;
+        tmp_dst.c.i = res_loc;
+        vpushv(&tmp_dst);
+        vswap();
+        vstore();
+        vpop();
+      }
+
+      /* Convert imag part */
+      vpushv(&orig_src);
+      vtop->type = src_elem_type;
+      vtop->c.i += src_elem_size;
+      gen_cast(&dst_elem_type);
+      {
+        SValue tmp_dst;
+        memset(&tmp_dst, 0, sizeof(tmp_dst));
+        tmp_dst.type = dst_elem_type;
+        tmp_dst.r = VT_LOCAL | VT_LVAL;
+        tmp_dst.vr = res_vr;
+        tmp_dst.c.i = res_loc + dst_elem_size;
+        vpushv(&tmp_dst);
+        vswap();
+        vstore();
+        vpop();
+      }
+
+      /* Replace source with the converted temp */
+      SValue conv_src;
+      memset(&conv_src, 0, sizeof(conv_src));
+      conv_src.type = dst_complex_type;
+      conv_src.r = VT_LOCAL | VT_LVAL;
+      conv_src.vr = res_vr;
+      conv_src.c.i = res_loc;
+      vpushv(&conv_src);
+      /* Fall through: now src and dst have the same base type,
+       * use the struct-copy path below. */
+    }
+
+    /* Same base type: use memcpy (struct-copy path).
+     * Complex types are laid out as {real, imag} in memory, so
+     * a byte-for-byte copy is correct. */
+    {
+      int complex_size, complex_align;
+      complex_size = type_size(&vtop->type, &complex_align);
+
+      /* destination */
+      vpushv(vtop - 1);
+      vtop->type.t = VT_PTR;
+      gaddrof();
+      /* source */
+      vswap();
+      vtop->type.t = VT_PTR;
+      gaddrof();
+      /* size */
+      vpushi(complex_size);
+#ifdef TCC_ARM_EABI
+      if (!(complex_align & 3))
+        vpush_helper_func(TOK_memmove4);
+      else
+#endif
+        vpush_helper_func(TOK_memmove);
+      {
+        SValue param_num;
+        const int call_id = tcc_state->ir ? tcc_state->ir->next_call_id++ : 0;
+        svalue_init(&param_num);
+        param_num.vr = -1;
+        param_num.r = VT_CONST;
+
+        param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-3], &param_num, NULL);
+        param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 1);
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-2], &param_num, NULL);
+        param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 2);
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &param_num, NULL);
+
+        SValue call_id_sv = tcc_ir_svalue_call_id_argc(call_id, 3);
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[0], &call_id_sv, NULL);
+        vtop -= 4;
+      }
+    }
+    return;
+  }
+
   if (sbt == VT_STRUCT)
   {
     /* if structure, only generate pointer */
@@ -5429,11 +7408,22 @@ ST_FUNC void vstore(void)
   }
   else
   {
+    /* If the source is a bitfield lvalue in IR mode, extract the bitfield
+       value (SHL/SAR shifts) now — before the delayed-cast or gen_cast paths
+       overwrite vtop->type with the destination type, which loses VT_BITFIELD
+       and the bit position/size information needed for the extraction. */
+    if (tcc_state->ir && (vtop->type.t & VT_BITFIELD))
+    {
+      gv(RC_INT);
+      /* After extraction, vtop is a plain int value; recompute sbt. */
+      sbt = vtop->type.t & VT_BTYPE;
+    }
+
     /* optimize char/short casts */
     delayed_cast = 0;
     if ((dbt == VT_BYTE || dbt == VT_SHORT) && is_integer_btype(sbt))
     {
-      if ((vtop->r & VT_MUSTCAST) && btype_size(dbt) > btype_size(sbt))
+      if ((vtop->r & (VT_MUSTCAST | (VT_MUSTCAST << 1))) && btype_size(dbt) > btype_size(sbt))
         force_charshort_cast();
       delayed_cast = 1;
     }
@@ -5566,14 +7556,39 @@ ST_FUNC void vstore(void)
        * handle it implicitly; that loses the load and can store garbage/zero. */
       if (vtop->r & VT_LVAL)
       {
+        /* Save the delayed char/short cast bits before clearing r.
+         * BFVAL(VT_MUSTCAST, 2) uses bit 0x0200 (for long long source)
+         * in addition to 0x0100 (for int source), so preserve both. */
+        int saved_mustcast = vtop->r & (VT_MUSTCAST | (VT_MUSTCAST << 1));
+
+        /* When delayed_cast is active, vtop->type was already changed to
+         * the destination type (e.g. unsigned short) while the actual
+         * memory being loaded is still the original source type (e.g.
+         * unsigned char).  The LOAD source operand must carry the original
+         * type so the backend selects the correct load width (LDRB vs
+         * LDRH vs LDR).  Temporarily restore the original source type for
+         * the LOAD instruction, then switch back. */
+        CType saved_type;
+        int restore_type = 0;
+        if (delayed_cast && (sbt & VT_BTYPE) != (vtop->type.t & VT_BTYPE))
+        {
+          saved_type = vtop->type;
+          vtop->type.t = (vtop->type.t & ~(VT_BTYPE | VT_UNSIGNED)) | (sbt & (VT_BTYPE | VT_UNSIGNED));
+          restore_type = 1;
+        }
+
         SValue load_dest;
         load_dest.type = vtop->type;
         load_dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
         load_dest.r = 0;
         load_dest.c.i = 0;
         tcc_ir_put(tcc_state->ir, TCCIR_OP_LOAD, vtop, NULL, &load_dest);
+
+        if (restore_type)
+          vtop->type = saved_type;
+
         vtop->vr = load_dest.vr;
-        vtop->r = 0; /* no longer an lvalue */
+        vtop->r = saved_mustcast; /* no longer an lvalue; keep delayed char/short cast */
       }
       /* If source is a VT_CMP (comparison result stored in flags), we need to
        * materialize it as a 0/1 value before storing. */
@@ -5582,8 +7597,10 @@ ST_FUNC void vstore(void)
        * (unlike STORE which uses strb/strh).  If a delayed char/short cast
        * is pending (VT_MUSTCAST), resolve it now — after comparison results
        * have been materialized — so the vreg carries the correctly
-       * wrapped value (e.g. unsigned char 0x18+0xe8 → 0x00, not 0x100). */
-      if (op == TCCIR_OP_ASSIGN && (vtop->r & VT_MUSTCAST))
+       * wrapped value (e.g. unsigned char 0x18+0xe8 → 0x00, not 0x100).
+       * Note: MUSTCAST=2 (from long long) stores in the bit above VT_MUSTCAST,
+       * so check both bits. */
+      if (op == TCCIR_OP_ASSIGN && (vtop->r & (VT_MUSTCAST | (VT_MUSTCAST << 1))))
         force_charshort_cast();
       tcc_ir_put(tcc_state->ir, op, vtop, NULL, &vtop[-1]);
       if (op == TCCIR_OP_ASSIGN)
@@ -5613,9 +7630,28 @@ ST_FUNC void inc(int post, int c)
   /* add constant */
   vpushi(c - TOK_MID);
   gen_op('+');
+
+  /* For pre-increment on captured variables (nested functions): save the new
+   * value before vstore(), because vstore() uses STORE (not ASSIGN) for
+   * captured vars (vr == -1), leaving the destination lvalue on vtop instead
+   * of the stored value.  We restore the saved value after the store. */
+  SValue saved_new_value;
+  int captured_preinc = 0;
+  if (!post && tcc_state->ir && (vtop[-1].r & VT_VALMASK) == VT_LOCAL && vtop[-1].vr == -1 && (vtop[-1].r & VT_LVAL))
+  {
+    saved_new_value = *vtop; /* save computed new value (N+1 / N-1) */
+    captured_preinc = 1;
+  }
+
   vstore(); /* store value */
   if (post)
     vpop(); /* if post op, return saved value */
+  else if (captured_preinc)
+  {
+    /* Replace the destination lvalue left by vstore() with the saved new
+     * value so the expression evaluates to the incremented result. */
+    *vtop = saved_new_value;
+  }
   else if (tcc_state->ir)
   {
     /* Pre-increment/decrement: the result of vstore() is the destination vreg
@@ -5682,6 +7718,42 @@ ST_FUNC int exact_log2p1(int i)
   if (i >= 1 << 1)
     ret++;
   return ret;
+}
+
+/* Parse C23 [[ ... ]] standard attribute syntax.
+   Currently we skip/ignore these attributes since TCC does not
+   perform interprocedural optimizations. Known attributes like
+   [[noreturn]] are mapped to their equivalent effect. */
+/* Parse C23 [[ ... ]] standard attributes.  Returns 1 if at least one
+   attribute was consumed, 0 if the current '[' is not part of a C23
+   attribute (token stream is left unchanged in that case). */
+static int parse_c23_attribute(AttributeDef *ad)
+{
+  int found = 0;
+  while (tok == '[')
+  {
+    next();
+    if (tok != '[')
+    {
+      /* Not a C23 attribute — put '[' back */
+      unget_tok('[');
+      break;
+    }
+    /* skip the second '[' */
+    next();
+    found = 1;
+    /* parse the attribute contents: handle balanced brackets */
+    int brackets = 2;
+    while (brackets > 0 && tok != TOK_EOF)
+    {
+      if (tok == '[')
+        brackets++;
+      else if (tok == ']')
+        brackets--;
+      next();
+    }
+  }
+  return found;
 }
 
 /* Parse __attribute__((...)) GNUC extension. */
@@ -5809,6 +7881,10 @@ redo:
     case TOK_NORETURN2:
       ad->f.func_noreturn = 1;
       break;
+    case TOK_NOINSTRUMENT1:
+    case TOK_NOINSTRUMENT2:
+      ad->f.func_no_instrument = 1;
+      break;
     case TOK_PURE1:
     case TOK_PURE2:
       ad->f.func_pure = 1;
@@ -5860,21 +7936,27 @@ redo:
       ad->vector_size = n;
       skip(')');
       break;
-    case TOK_MODE:
+    case TOK_MODE1:
+    case TOK_MODE2:
       skip('(');
       switch (tok)
       {
-      case TOK_MODE_DI:
+      case TOK_MODE_DI1:
+      case TOK_MODE_DI2:
         ad->attr_mode = VT_LLONG + 1;
         break;
-      case TOK_MODE_QI:
+      case TOK_MODE_QI1:
+      case TOK_MODE_QI2:
         ad->attr_mode = VT_BYTE + 1;
         break;
-      case TOK_MODE_HI:
+      case TOK_MODE_HI1:
+      case TOK_MODE_HI2:
         ad->attr_mode = VT_SHORT + 1;
         break;
-      case TOK_MODE_SI:
-      case TOK_MODE_word:
+      case TOK_MODE_SI1:
+      case TOK_MODE_SI2:
+      case TOK_MODE_word1:
+      case TOK_MODE_word2:
         ad->attr_mode = VT_INT + 1;
         break;
       default:
@@ -5892,6 +7974,18 @@ redo:
       break;
     case TOK_DLLIMPORT:
       ad->a.dllimport = 1;
+      break;
+    case TOK_SCALAR_STORAGE_ORDER1:
+    case TOK_SCALAR_STORAGE_ORDER2:
+      skip('(');
+      astr = parse_mult_str("scalar_storage_order(\"big-endian|little-endian\")")->data;
+      if (!strcmp(astr, "big-endian"))
+        ad->a.sso_be = 1;
+      else if (!strcmp(astr, "little-endian"))
+        ad->a.sso_be = 0;
+      else
+        tcc_error("scalar_storage_order must be one of \"big-endian\" or \"little-endian\"");
+      skip(')');
       break;
     default:
       tcc_warning_c(warn_unsupported)("'%s' attribute ignored", get_tok_str(t, NULL));
@@ -6183,6 +8277,108 @@ static void struct_layout(CType *type, AttributeDef *ad)
   printf("struct size %-2d align %-2d\n\n", c, a), fflush(stdout);
 #endif
 
+  /* For big-endian scalar_storage_order: convert LE bit positions to BE.
+     Must run BEFORE the bitfield fixup loop so that field offsets are still
+     in their original (pre-fixup) positions. All fields in a storage unit
+     share the same base offset and use the widest type for access.
+     Note: PCC layout may split fields across byte boundaries (e.g. char
+     fields at offset 1 within a 2-byte short-based unit), so we group by
+     overlapping byte ranges, not by exact offset. */
+  if (ad->a.sso_be)
+  {
+    type->ref->a.sso_be = 1;
+    Sym *group_start = NULL;
+    int group_start_off = 0;
+    int group_end_off = 0; /* exclusive: first byte outside the group */
+    int group_unit_bits = 0;
+    int group_base_type = VT_BYTE;
+
+    for (f = type->ref->next; f; f = f->next)
+    {
+      if (!(f->type.t & VT_BITFIELD) || BIT_SIZE(f->type.t) == 0)
+      {
+        if (group_start)
+          goto sso_flush;
+        continue;
+      }
+      int fsize, falign;
+      fsize = type_size(&f->type, &falign);
+      int field_end = f->c + fsize;
+
+      if (!group_start || f->c >= group_end_off)
+      {
+        if (group_start)
+        {
+        sso_flush:;
+          /* Flush current group: convert each field's LE position to BE.
+             Compute absolute bit offset from the group's start, then flip. */
+          Sym *g;
+          int ubytes = group_unit_bits / 8;
+          for (g = group_start; g != f; g = g->next)
+          {
+            if (!(g->type.t & VT_BITFIELD) || BIT_SIZE(g->type.t) == 0)
+              continue;
+            int abs_bp = (g->c - group_start_off) * 8 + BIT_POS(g->type.t);
+            int bs = BIT_SIZE(g->type.t);
+            int be_bp = group_unit_bits - abs_bp - bs;
+            g->c = group_start_off;
+            g->type.t = (g->type.t & ~(0x3f << VT_STRUCT_SHIFT)) | (be_bp << VT_STRUCT_SHIFT);
+            g->type.ref = g;
+            g->a.sso_be = 1;
+            g->r = ubytes;
+            if ((g->type.t & VT_BTYPE) != group_base_type)
+              g->auxtype = group_base_type;
+            else
+              g->auxtype = -1;
+          }
+          group_start = NULL;
+          if (!(f->type.t & VT_BITFIELD) || BIT_SIZE(f->type.t) == 0)
+            continue;
+        }
+        /* Start new group */
+        group_start = f;
+        group_start_off = f->c;
+        group_end_off = field_end;
+        group_unit_bits = fsize * 8;
+        group_base_type = f->type.t & VT_BTYPE;
+      }
+      else
+      {
+        /* Extend group */
+        if (field_end > group_end_off)
+          group_end_off = field_end;
+        if (fsize * 8 > group_unit_bits)
+        {
+          group_unit_bits = fsize * 8;
+          group_base_type = f->type.t & VT_BTYPE;
+        }
+      }
+    }
+    /* Flush last group */
+    if (group_start)
+    {
+      Sym *g;
+      int ubytes = group_unit_bits / 8;
+      for (g = group_start; g; g = g->next)
+      {
+        if (!(g->type.t & VT_BITFIELD) || BIT_SIZE(g->type.t) == 0)
+          continue;
+        int abs_bp = (g->c - group_start_off) * 8 + BIT_POS(g->type.t);
+        int bs = BIT_SIZE(g->type.t);
+        int be_bp = group_unit_bits - abs_bp - bs;
+        g->c = group_start_off;
+        g->type.t = (g->type.t & ~(0x3f << VT_STRUCT_SHIFT)) | (be_bp << VT_STRUCT_SHIFT);
+        g->type.ref = g;
+        g->a.sso_be = 1;
+        g->r = ubytes;
+        if ((g->type.t & VT_BTYPE) != group_base_type)
+          g->auxtype = group_base_type;
+        else
+          g->auxtype = -1;
+      }
+    }
+  }
+
   /* check whether we can access bitfields by their type */
   for (f = type->ref->next; f; f = f->next)
   {
@@ -6191,6 +8387,15 @@ static void struct_layout(CType *type, AttributeDef *ad)
 
     if (0 == (f->type.t & VT_BITFIELD))
       continue;
+    /* Skip SSO bitfields — they use full storage unit access with byte-swap */
+    if (f->a.sso_be)
+    {
+      if (!f->type.ref)
+        f->type.ref = f;
+      if (f->auxtype == 0)
+        f->auxtype = -1;
+      continue;
+    }
     f->type.ref = f;
     f->auxtype = -1;
     bit_size = BIT_SIZE(f->type.t);
@@ -6673,6 +8878,18 @@ static int parse_btype(CType *type, AttributeDef *ad, int ignore_label)
       typespec_found = 1;
       next();
       break;
+    case TOK_DECIMAL32:
+      tcc_warning_c(warn_all)("_Decimal32 is approximated by binary float");
+      u = VT_FLOAT;
+      goto basic_type;
+    case TOK_DECIMAL64:
+      tcc_warning_c(warn_all)("_Decimal64 is approximated by binary double");
+      u = VT_DOUBLE;
+      goto basic_type;
+    case TOK_DECIMAL128:
+      tcc_warning_c(warn_all)("_Decimal128 is approximated by binary long double");
+      u = VT_LDOUBLE;
+      goto basic_type;
     case TOK_FLOAT:
       u = VT_FLOAT;
       goto basic_type;
@@ -6793,6 +9010,11 @@ static int parse_btype(CType *type, AttributeDef *ad, int ignore_label)
         t = (t & ~(VT_BTYPE | VT_LONG)) | u;
       }
       continue;
+    case '[':
+      /* C23 [[ ... ]] standard attribute */
+      if (parse_c23_attribute(ad))
+        continue;
+      goto the_end;
       /* GNUC typeof */
     case TOK_TYPEOF1:
     case TOK_TYPEOF2:
@@ -6919,10 +9141,16 @@ static int post_type(CType *type, AttributeDef *ad, int storage, int td)
   {
     /* function type, or recursive declarator (return if so) */
     next();
-    if (TYPE_DIRECT == (td & (TYPE_DIRECT | TYPE_ABSTRACT)))
+    if (TYPE_DIRECT == (td & (TYPE_DIRECT | TYPE_ABSTRACT)) && tok != TOK_DOTS)
       return 0;
     if (tok == ')')
       l = 0;
+    else if (tok == TOK_DOTS)
+    {
+      /* C23: f(...) — variadic function with no named parameters */
+      l = FUNC_ELLIPSIS;
+      next();
+    }
     else if (parse_btype(&pt, &ad1, 0))
       l = FUNC_NEW;
     else if (td & (TYPE_DIRECT | TYPE_ABSTRACT))
@@ -6937,7 +9165,7 @@ static int post_type(CType *type, AttributeDef *ad, int storage, int td)
     plast = &first;
     arg_size = 0;
     ++local_scope;
-    if (l)
+    if (l && l != FUNC_ELLIPSIS)
     {
       for (;;)
       {
@@ -6982,7 +9210,7 @@ static int post_type(CType *type, AttributeDef *ad, int storage, int td)
           tcc_error("invalid type");
       }
     }
-    else
+    else if (l != FUNC_ELLIPSIS)
       /* if no parameters, then old type prototype */
       l = FUNC_OLD;
     skip(')');
@@ -7050,8 +9278,8 @@ static int post_type(CType *type, AttributeDef *ad, int storage, int td)
           nocode_wanted = 1;
           skip_or_save_block(&vla_array_tok);
           unget_tok(0);
-          vla_array_str = tok_str_buf(vla_array_tok);
-          vla_array_str_on_heap = vla_array_tok->allocated_len > 0;
+          vla_array_str = tok_str_ensure_heap(vla_array_tok);
+          vla_array_str_on_heap = 1;
           begin_macro(vla_array_tok, 2);
           next();
           gexpr();
@@ -7135,6 +9363,18 @@ static int post_type(CType *type, AttributeDef *ad, int storage, int td)
       /* for function args, the top dimension is converted to pointer */
       if ((t1 & VT_VLA) && (td & TYPE_NEST))
         s->vla_array_str = vla_array_str;
+      else if ((t1 & VT_VLA) && (td & TYPE_PARAM))
+      {
+        /* Outermost VLA dimension of a function param: save the token string
+           separately in TCCState. We can't use s->vla_array_str because it's
+           in a union with s->next, and sym_copy_ref would follow it as a
+           Sym pointer, causing corruption. */
+        int i = tcc_state->nb_vla_param_exprs++;
+        tcc_state->vla_param_exprs = tcc_realloc(tcc_state->vla_param_exprs,
+                                                 tcc_state->nb_vla_param_exprs * sizeof(*tcc_state->vla_param_exprs));
+        tcc_state->vla_param_exprs[i].param = s;
+        tcc_state->vla_param_exprs[i].tokens = vla_array_str;
+      }
       else if (vla_array_str_on_heap)
         tok_str_free_str(vla_array_str);
       /* else: inline buffer, will be freed with TokenString struct */
@@ -7283,10 +9523,7 @@ static void gfunc_param_typed(Sym *func, Sym *arg)
   func_type = func->f.func_type;
   if (func_type == FUNC_OLD || (func_type == FUNC_ELLIPSIS && arg == NULL))
   {
-    /* ARM EABI AAPCS: Composite types (struct/union) larger than 4 words (16
-     * bytes) must be passed by invisible reference even without a prototype,
-     * since the ABI convention must be followed regardless of whether the
-     * prototype is visible to the caller. */
+    /* Handle struct/union arguments for unprototyped/variadic calls. */
     if ((vtop->type.t & VT_BTYPE) == VT_STRUCT)
     {
       int align, size = type_size(&vtop->type, &align);
@@ -7309,21 +9546,22 @@ static void gfunc_param_typed(Sym *func, Sym *arg)
 
       if (size > 16)
       {
-        /* Pass by invisible reference: caller must allocate a temporary copy
-         * and pass a pointer to that copy (AAPCS). Passing the original
-         * object's address would break C's by-value semantics. */
         if (nocode_wanted)
           return;
 
         if (!(vtop->r & VT_LVAL))
         {
-          /* For now we require an lvalue source; most struct expressions in
-           * TCC are materialized as lvalues already. */
           tcc_error("cannot pass large struct by value");
         }
 
-        int temp_vr;
-        int tmp_loc = get_temp_local_var(size, align, &temp_vr);
+        /* Always allocate a fresh stack slot for the struct copy.
+         * Do NOT use get_temp_local_var() here: after gaddrof() converts
+         * the lvalue to a pointer, the VR_TEMP_LOCAL marker is lost from
+         * vstack, causing get_temp_local_var() to reuse the same slot for
+         * a subsequent struct argument in the same call.  This would make
+         * both struct copies alias the same memory.  (See GCC PR 67226.) */
+        loc = (loc - size) & -align;
+        int tmp_loc = loc;
 
         /* Store the source struct into the temporary destination.
          * vstore() will emit a memmove() for struct types. */
@@ -7332,14 +9570,24 @@ static void gfunc_param_typed(Sym *func, Sym *arg)
           memset(&dst, 0, sizeof(dst));
           dst.type = vtop->type;
           dst.r = VT_LOCAL | VT_LVAL;
-          dst.vr = temp_vr;
+          dst.vr = -1;
           dst.c.i = tmp_loc;
           vpushv(&dst);
           vswap();
           vstore();
         }
 
-        /* Convert the temp lvalue to a pointer argument. */
+        if (func_type == FUNC_ELLIPSIS)
+        {
+          /* Variadic anonymous argument: keep as struct lvalue so the
+           * backend decomposes it into words for register/stack placement.
+           * va_arg reads the raw data from the va area, not a pointer. */
+          return;
+        }
+
+        /* Unprototyped (FUNC_OLD) call: the callee may have been compiled
+         * with a prototype and expect invisible reference (pointer) for
+         * structs > 16 bytes.  Convert the temp copy to a pointer arg. */
         mk_pointer(&vtop->type);
         gaddrof();
         return;
@@ -7347,7 +9595,8 @@ static void gfunc_param_typed(Sym *func, Sym *arg)
     }
 
     /* default casting : only need to convert float to double */
-    if ((vtop->type.t & VT_BTYPE) == VT_FLOAT)
+    /* Complex types are NOT promoted (treated like composites per AAPCS) */
+    if ((vtop->type.t & VT_BTYPE) == VT_FLOAT && !(vtop->type.t & VT_COMPLEX))
     {
       gen_cast_s(VT_DOUBLE);
     }
@@ -7357,7 +9606,7 @@ static void gfunc_param_typed(Sym *func, Sym *arg)
       type.ref = vtop->type.ref;
       gen_cast(&type);
     }
-    else if (vtop->r & VT_MUSTCAST)
+    else if (vtop->r & (VT_MUSTCAST | (VT_MUSTCAST << 1)))
     {
       force_charshort_cast();
     }
@@ -7394,8 +9643,14 @@ static void gfunc_param_typed(Sym *func, Sym *arg)
           tcc_error("cannot pass large struct by value");
         }
 
-        int temp_vr;
-        int tmp_loc = get_temp_local_var(size, align, &temp_vr);
+        /* Always allocate a fresh stack slot for the struct copy.
+         * Do NOT use get_temp_local_var() here: after gaddrof() converts
+         * the lvalue to a pointer, the VR_TEMP_LOCAL marker is lost from
+         * vstack, causing get_temp_local_var() to reuse the same slot for
+         * a subsequent struct argument in the same call.  This would make
+         * both struct copies alias the same memory.  (See GCC PR 67226.) */
+        loc = (loc - size) & -align;
+        int tmp_loc = loc;
 
         /* Store the source struct into the temporary destination.
          * vstore() will emit a memmove() for struct types.
@@ -7405,7 +9660,7 @@ static void gfunc_param_typed(Sym *func, Sym *arg)
           memset(&dst, 0, sizeof(dst));
           dst.type = type;
           dst.r = VT_LOCAL | VT_LVAL;
-          dst.vr = temp_vr;
+          dst.vr = -1;
           dst.c.i = tmp_loc;
           vpushv(&dst);
           vswap();
@@ -7741,6 +9996,71 @@ tok_next:
     vsetc(&type, VT_CONST, &tokc);
     next();
     break;
+  case TOK_CINT_I:
+  {
+    /* GNU extension: integer imaginary constant (e.g., 200i).
+     * Creates a _Complex int constant with real=0, imag=value.
+     * Packed representation: real in low 32, imag in high 32 bits of CValue.i */
+    CValue cv;
+    cv.i = (uint64_t)(uint32_t)tokc.i << 32;
+    type.t = VT_INT | VT_COMPLEX;
+    vsetc(&type, VT_CONST, &cv);
+    next();
+    break;
+  }
+  case TOK_CFLOAT_I:
+  {
+    /* GNU extension: float imaginary constant (e.g., 1.0fi).
+     * Creates a _Complex float constant with real=0, imag=value.
+     * Packed: two floats in CValue.i (real at low 32, imag at high 32) */
+    CValue cv;
+    union
+    {
+      float f;
+      uint32_t u;
+    } imag_bits;
+    imag_bits.f = tokc.f;
+    cv.i = (uint64_t)imag_bits.u << 32;
+    type.t = VT_FLOAT | VT_COMPLEX;
+    vsetc(&type, VT_CONST, &cv);
+    next();
+    break;
+  }
+  case TOK_CDOUBLE_I:
+  {
+    /* GNU extension: double imaginary constant (e.g., 1.0i).
+     * Creates a _Complex double with real=0.0, imag=value.
+     * Packed representation: bytes [0:7] = real (double), bytes [8:15] = imag (double).
+     * This matches the C memory layout {real, imag} and fits in CValue (16 bytes on x86_64). */
+    CValue cv;
+    memset(&cv, 0, sizeof(cv));
+    double _real = 0.0, _imag = tokc.d;
+    memcpy(&cv, &_real, 8);
+    memcpy((char *)&cv + 8, &_imag, 8);
+    type.t = VT_DOUBLE | VT_COMPLEX;
+    vsetc(&type, VT_CONST, &cv);
+    next();
+    break;
+  }
+  case TOK_CLDOUBLE_I:
+  {
+    CValue cv;
+    memset(&cv, 0, sizeof(cv));
+#ifdef TCC_USING_DOUBLE_FOR_LDOUBLE
+    {
+      double _real = 0.0, _imag = tokc.d;
+      memcpy(&cv, &_real, 8);
+      memcpy((char *)&cv + 8, &_imag, 8);
+    }
+    type.t = VT_DOUBLE | VT_LONG | VT_COMPLEX;
+#else
+    cv.ld = tokc.ld;
+    type.t = VT_LDOUBLE | VT_COMPLEX;
+#endif
+    vsetc(&type, VT_CONST, &cv);
+    next();
+    break;
+  }
   case TOK_CUINT:
     t = VT_INT | VT_UNSIGNED;
     goto push_tokc;
@@ -7853,6 +10173,49 @@ tok_next:
         vpush(&type);
         return;
       }
+      else if (IS_UNION(type.t))
+      {
+        /* GCC extension: (union_type) scalar_expr
+         * Allocate a local temp for the union, store the scalar into
+         * the first union member whose type is compatible, and push
+         * the union temp as an lvalue. */
+        unary();
+
+        if (nocode_wanted)
+        {
+          vtop->type = type;
+        }
+        else
+        {
+          int u_align;
+          int u_size = type_size(&type, &u_align);
+          int vr_tmp;
+          int tmp_loc = get_temp_local_var(u_size, u_align, &vr_tmp);
+
+          /* Find the first union member and cast the scalar to its type */
+          Sym *field = type.ref->next;
+          if (field)
+            gen_cast(&field->type);
+
+          /* Push destination typed as the scalar/member type so vstore()
+           * emits the correct-width STORE instruction. */
+          SValue dst_sv;
+          memset(&dst_sv, 0, sizeof(dst_sv));
+          dst_sv.type = vtop->type;
+          dst_sv.r = VT_LOCAL | VT_LVAL;
+          dst_sv.vr = vr_tmp;
+          dst_sv.c.i = tmp_loc;
+
+          vpushv(&dst_sv);
+          vswap();
+          vstore();
+          vtop--;
+
+          /* Return the temp slot as a union lvalue. */
+          dst_sv.type = type;
+          vpushv(&dst_sv);
+        }
+      }
       else
       {
         unary();
@@ -7955,8 +10318,16 @@ tok_next:
   case '~':
     next();
     unary();
-    vpushi(-1);
-    gen_op('^');
+    if (vtop->type.t & VT_COMPLEX)
+    {
+      /* GCC extension: ~ on complex types means complex conjugate */
+      gen_complex_conjugate();
+    }
+    else
+    {
+      vpushi(-1);
+      gen_op('^');
+    }
     break;
   case '+':
     next();
@@ -7995,66 +10366,85 @@ tok_next:
     }
     else
     {
-      /* Phase 4: Extract real or imaginary part from complex value
-       * Complex float is stored as { real, imag } - two consecutive floats
-       * We need to load the appropriate component
-       */
-      int is_real = (t == TOK_REAL);
+      /* Extract real or imaginary part from complex value.
+       * Complex types are stored as { real, imag } — two consecutive
+       * elements of the base type in memory. */
+      int is_real = (t == TOK_REAL || t == TOK_REAL_GCC);
       int base_type = vtop->type.t & VT_BTYPE;
       int result_type;
+      int elem_size;
+      int is_int_complex = !is_float(base_type);
 
-      /* Determine the result type (real component type) */
-      if (base_type == VT_DOUBLE)
-        result_type = VT_DOUBLE;
+      /* Determine the result type (scalar component type) */
+      if (is_int_complex)
+      {
+        /* Integer complex: _Complex char → char, _Complex int → int, etc. */
+        result_type = base_type;
+        elem_size = btype_size(base_type);
+      }
+      else if (base_type == VT_DOUBLE || base_type == VT_LDOUBLE)
+      {
+        result_type = base_type;
+        elem_size = 8;
+      }
       else
+      {
         result_type = VT_FLOAT;
+        elem_size = 4;
+      }
 
+      /* Handle constant complex integers: extract component from packed value */
+      if (is_int_complex && (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST)
+      {
+        int shift = elem_size * 8;
+        uint64_t mask = (shift >= 64) ? ~0ULL : (1ULL << shift) - 1;
+        if (is_real)
+          vtop->c.i = vtop->c.i & mask;
+        else
+          vtop->c.i = (shift >= 64) ? 0 : ((vtop->c.i >> shift) & mask);
+        vtop->type.t = (vtop->type.t & ~VT_BTYPE & ~VT_COMPLEX) | result_type;
+      }
       /* The complex value is on the stack, we need to access its components */
-      if ((vtop->r & VT_VALMASK) == VT_LOCAL)
+      else if ((vtop->r & VT_VALMASK) == VT_LOCAL)
       {
         /* Stack variable: adjust offset to access real or imag part */
         if (!is_real)
-        {
-          /* Imaginary part is at offset +4 for float, +8 for double */
-          int offset = (base_type == VT_DOUBLE) ? 8 : 4;
-          vtop->c.i += offset;
-        }
-        /* Change type to the base floating point type */
+          vtop->c.i += elem_size;
+        /* Change type to the base scalar type */
         vtop->type.t = (vtop->type.t & ~VT_BTYPE & ~VT_COMPLEX) | result_type;
       }
       else if (vtop->r & VT_LVAL)
       {
-        /* L-value: dereference and load appropriate component */
-        int offset = is_real ? 0 : ((base_type == VT_DOUBLE) ? 8 : 4);
+        /* L-value (global or indirect): adjust offset to access real or imag part.
+         * Complex types are { real, imag } in memory. For imag, add elem_size
+         * to the address offset directly (not via gen_op which would do float math). */
+        if (!is_real)
+          vtop->c.i += elem_size;
 
-        /* Add offset to address */
-        if (offset > 0)
-        {
-          vpushi(offset);
-          gen_op('+');
-        }
-
-        /* Load the value */
-        vtop->type.t = (vtop->type.t & ~VT_BTYPE & ~VT_COMPLEX) | result_type | VT_LVAL;
-        vtop->r = (vtop->r & ~VT_VALMASK) | VT_LOCAL;
+        /* Change type to the base scalar type */
+        vtop->type.t = (vtop->type.t & ~VT_BTYPE & ~VT_COMPLEX) | result_type;
       }
       else
       {
-        /* For register values, we need special handling */
-        /* Complex values use register pairs: (r0, r1) for float complex */
-        /* Real part is in lower register, imag in higher */
+        /* Register value: the complex value is packed in a single register
+         * (for small types like _Complex char or _Complex short that fit
+         * in 4 bytes) or in a register pair.  On ARM32 with gfunc_sret()
+         * returning ret_nregs=1 for sizes <= 4, the value is packed:
+         *   real part in the low bits, imag part in the upper bits.
+         * Extract __imag__ by shifting right by elem_size*8. */
         if (is_real)
         {
-          /* Real part is already in pr0_reg, just change type */
+          /* Real part is in the low bits — just change type to scalar */
           vtop->type.t = (vtop->type.t & ~VT_BTYPE & ~VT_COMPLEX) | result_type;
         }
         else
         {
-          /* Imaginary part is in pr1_reg, need to move it */
-          vtop->r = (vtop->r & ~VT_VALMASK) | VT_LOCAL; /* Force reload pattern */
-          vtop->type.t = (vtop->type.t & ~VT_BTYPE & ~VT_COMPLEX) | result_type | VT_LVAL;
-          /* For now, mark as needing offset for imag part */
-          vtop->c.i = (base_type == VT_DOUBLE) ? 8 : 4;
+          /* Imaginary part: shift right by elem_size*8 bits to
+           * bring imag to the low bits, then truncate to base type. */
+          vtop->type.t = (vtop->type.t & ~VT_BTYPE & ~VT_COMPLEX) | VT_INT;
+          vpushi(elem_size * 8);
+          gen_op(TOK_SHR);
+          vtop->type.t = (vtop->type.t & ~VT_BTYPE) | result_type;
         }
       }
     }
@@ -8090,6 +10480,31 @@ tok_next:
     parse_builtin_params(0, "ee");
     vpop();
     break;
+  case TOK_builtin_abs:
+  {
+    /* __builtin_abs(int x) - compute absolute value using branchless formula:
+     * sign = x >> 31; result = (x ^ sign) - sign
+     */
+    parse_builtin_params(0, "e");
+    /* vtop now holds the argument x */
+    /* If x is a condition code (VT_CMP), materialize it into a register
+     * first. The abs formula uses x twice (via vdup), and intervening
+     * operations (like SAR) would clobber the CPU flags before the
+     * second use. */
+    if ((vtop->r & VT_VALMASK) == VT_CMP)
+      gv(RC_INT);
+    /* Generate: sign = x >> 31 */
+    vdup();          /* Stack: x x */
+    vpushi(31);      /* Stack: x x 31 */
+    gen_op(TOK_SAR); /* Stack: x sign (sign = x >> 31) */
+    /* Generate: result = (x ^ sign) - sign */
+    vdup();      /* Stack: x sign sign */
+    vrott(3);    /* Stack: sign x sign */
+    gen_op('^'); /* Stack: sign (x ^ sign) */
+    vswap();     /* Stack: (x ^ sign) sign */
+    gen_op('-'); /* Stack: result */
+    break;
+  }
   case TOK_builtin_types_compatible_p:
     parse_builtin_params(0, "tt");
     vtop[-1].type.t &= ~(VT_CONSTANT | VT_VOLATILE);
@@ -8135,6 +10550,60 @@ tok_next:
     n = 1;
     if ((vtop->r & (VT_VALMASK | VT_LVAL)) != VT_CONST || ((vtop->r & VT_SYM) && vtop->sym->a.addrtaken))
       n = 0;
+    /* Recognize compile-time-constant lvalue accesses to read-only data.
+     * For example, string literal subscript "hi"[0] is a compile-time
+     * constant even though it presents as an lvalue (VT_LVAL set). */
+    if (n == 0 && (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == (VT_CONST | VT_LVAL | VT_SYM) && vtop->sym)
+    {
+      ElfSym *esym = elfsym(vtop->sym);
+      if (esym && esym->st_shndx > 0 && esym->st_shndx < tcc_state->nb_sections)
+      {
+        Section *sec = tcc_state->sections[esym->st_shndx];
+        if (sec && !(sec->sh_flags & SHF_WRITE))
+        {
+          /* Constant-indexed access to read-only section data */
+          long offset = esym->st_value + vtop->c.i;
+          int sz, al;
+          sz = type_size(&vtop->type, &al);
+          if (sz > 0 && offset >= 0 && (unsigned long)(offset + sz) <= sec->data_offset && sec->data)
+            n = 1;
+        }
+      }
+    }
+    /* When optimizing in IR mode, check if a local variable's vreg has
+     * exactly one definition and that definition is a constant.  This
+     * lets __builtin_constant_p see through simple cases like:
+     *   int size = sizeof(int);  // single constant assignment
+     *   __builtin_constant_p(size) -> 1
+     * Only valid when the variable's address is never taken (no aliasing). */
+    if (n == 0 && tcc_state->ir && tcc_state->optimize && vtop->vr >= 0 && (!vtop->sym || !vtop->sym->a.addrtaken))
+    {
+      TCCIRState *ir = tcc_state->ir;
+      int target_vr = vtop->vr;
+      int def_count = 0;
+      int is_const_def = 0;
+      for (int i = 0; i < ir->next_instruction_index; i++)
+      {
+        IRQuadCompact *q = &ir->compact_instructions[i];
+        if (!irop_config[q->op].has_dest)
+          continue;
+        IROperand dest = tcc_ir_op_get_dest(ir, q);
+        if (irop_get_vreg(dest) != target_vr)
+          continue;
+        def_count++;
+        if (def_count > 1)
+          break; /* multiple definitions — not provably constant */
+        if (q->op == TCCIR_OP_ASSIGN)
+        {
+          IROperand src1 = tcc_ir_op_get_src1(ir, q);
+          if (src1.tag == IROP_TAG_IMM32 || src1.tag == IROP_TAG_I64 || src1.tag == IROP_TAG_F32 ||
+              src1.tag == IROP_TAG_F64)
+            is_const_def = 1;
+        }
+      }
+      if (def_count == 1 && is_const_def)
+        n = 1;
+    }
     vtop--;
     print_vstack("unary, builtin_constant_p");
     vpushi(n);
@@ -8152,12 +10621,1753 @@ tok_next:
     type.t = VT_VOID;
     vpush(&type);
     break;
+  case TOK_builtin_setjmp:
+  {
+    /* __builtin_setjmp(void **buf) - returns 0 on initial call, 1 on longjmp return */
+    parse_builtin_params(0, "e");
+    /* buf is now on vtop - emit SETJMP IR instruction.
+     * The backend saves callee-saved registers, SP, FP, and a resume address
+     * into the buffer.  On the normal path dest receives 0; when longjmp
+     * jumps to the resume address the backend writes 1 into dest.
+     */
+    SValue dest;
+    dest.type.t = VT_INT;
+    dest.type.ref = NULL;
+    dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+    dest.r = 0;
+    dest.c.i = 0;
+    tcc_ir_put(tcc_state->ir, TCCIR_OP_SETJMP, vtop, NULL, &dest);
+    vtop->vr = dest.vr;
+    vtop->r = 0;
+    vtop->type.t = VT_INT;
+    vtop->type.ref = NULL;
+    vtop->c.i = 0;
+    break;
+  }
+  case TOK_builtin_longjmp:
+  {
+    /* __builtin_longjmp(void **buf, int val) - does not return */
+    parse_builtin_params(0, "ee");
+    /* Stack: buf, val (val is on top).  val is ignored (__builtin_longjmp
+     * always forces the return value to 1). */
+    vpop(); /* pop val */
+    /* vtop now has buf - emit LONGJMP IR instruction */
+    tcc_ir_put(tcc_state->ir, TCCIR_OP_LONGJMP, vtop, NULL, NULL);
+    vpop(); /* pop buf */
+    /* longjmp does not return - mark as void and noreturn */
+    type.t = VT_VOID;
+    vpush(&type);
+    CODE_OFF();
+    break;
+  }
+  case TOK_builtin_alloca:
+  {
+    /* __builtin_alloca(size) — allocate memory on the stack.
+     * The allocation persists until function return (epilogue restores SP
+     * from the frame pointer). */
+    parse_builtin_params(0, "e"); /* size argument on vtop */
+    if (tcc_state->ir)
+    {
+      tcc_state->force_frame_pointer = 1;
+
+      /* Emit VLA_ALLOC: adjusts SP down by size and aligns to 8 bytes. */
+      SValue size_sv = *vtop;
+      SValue align_sv;
+      memset(&align_sv, 0, sizeof(align_sv));
+      align_sv.type.t = VT_INT;
+      align_sv.r = VT_CONST;
+      align_sv.c.i = 8; /* 8-byte alignment */
+      align_sv.vr = -1;
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_VLA_ALLOC, &size_sv, &align_sv, NULL);
+      vpop(); /* pop size */
+
+      /* Allocate a local slot to capture the resulting SP (= alloca pointer). */
+      loc -= PTR_SIZE;
+      int alloca_slot = loc;
+      SValue dst;
+      memset(&dst, 0, sizeof(dst));
+      dst.type.t = VT_PTR;
+      dst.r = VT_LOCAL | VT_LVAL;
+      dst.c.i = alloca_slot;
+      dst.vr = -1;
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_VLA_SP_SAVE, NULL, NULL, &dst);
+
+      /* Push the saved pointer as the return value (void *). */
+      type.t = VT_VOID;
+      mk_pointer(&type);
+      vset(&type, VT_LOCAL | VT_LVAL, alloca_slot);
+      vtop->vr = -1;
+    }
+    break;
+  }
+  case TOK_builtin_apply_args:
+  {
+    /* __builtin_apply_args() — save incoming argument registers and return
+     * a pointer to the saved block: [stack_args_ptr, r0, r1, r2, r3]. */
+    parse_builtin_params(0, "");
+    if (tcc_state->ir)
+    {
+      tcc_state->func_save_apply_args = 1;
+      tcc_state->force_frame_pointer = 1;
+
+      /* Allocate 20 bytes: [stack_args_ptr(4), r0(4), r1(4), r2(4), r3(4)] */
+      loc = (loc - 20) & ~3;
+      tcc_state->apply_args_offset = loc;
+
+      /* Emit BUILTIN_APPLY_ARGS IR: dest vreg = address of saved block */
+      SValue dest;
+      memset(&dest, 0, sizeof(dest));
+      dest.type.t = VT_PTR;
+      dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+      dest.r = 0;
+      dest.c.i = loc; /* encode stack offset for the backend */
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_BUILTIN_APPLY_ARGS, NULL, NULL, &dest);
+
+      /* Push result as void* */
+      type.t = VT_VOID;
+      mk_pointer(&type);
+      vpush(&type);
+      vtop->vr = dest.vr;
+      vtop->r = 0;
+      vtop->c.i = 0;
+    }
+    break;
+  }
+  case TOK_builtin_apply:
+  {
+    /* __builtin_apply(fn, args, size) — call fn with saved argument block.
+     * Restores r0-r3 from args, optionally copies stack args, calls fn. */
+    parse_builtin_params(0, "eee");
+    if (tcc_state->ir)
+    {
+      /* Stack: vtop[-2]=fn, vtop[-1]=args, vtop[0]=size */
+      vpop(); /* pop size (stack copy not needed for register-only args) */
+
+      /* Allocate 8 bytes for return value block (r0 + r1) */
+      loc = (loc - 8) & ~3;
+      int retval_slot = loc;
+
+      /* Emit BUILTIN_APPLY: dest = temp vreg (call result r0),
+       * src1 = fn, src2 = args */
+      SValue dest;
+      memset(&dest, 0, sizeof(dest));
+      dest.type.t = VT_INT;
+      dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+      dest.r = 0;
+      dest.c.i = 0;
+
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_BUILTIN_APPLY, &vtop[-1], &vtop[0], &dest);
+      vpop(); /* pop args */
+      vpop(); /* pop fn */
+
+      /* Store call result to retval block */
+      SValue result_sv;
+      memset(&result_sv, 0, sizeof(result_sv));
+      result_sv.type.t = VT_INT;
+      result_sv.vr = dest.vr;
+      result_sv.r = 0;
+      result_sv.c.i = 0;
+
+      SValue store_dst;
+      memset(&store_dst, 0, sizeof(store_dst));
+      store_dst.type.t = VT_INT;
+      store_dst.r = VT_LOCAL | VT_LVAL;
+      store_dst.c.i = retval_slot;
+      store_dst.vr = -1;
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_STORE, &result_sv, NULL, &store_dst);
+
+      /* Push address of retval block as void* */
+      type.t = VT_VOID;
+      mk_pointer(&type);
+      vset(&type, VT_LOCAL, retval_slot);
+    }
+    break;
+  }
+  case TOK_builtin_return:
+  {
+    /* __builtin_return(result) — return from function with value from
+     * the return-value block produced by __builtin_apply. */
+    parse_builtin_params(0, "e");
+    if (tcc_state->ir)
+    {
+      /* vtop = result (void* to return value block) */
+      /* Cast to int*, dereference, and return the value */
+      vtop->type.t = VT_INT;
+      mk_pointer(&vtop->type);
+      indir();
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_RETURNVALUE, vtop, NULL, NULL);
+      vpop();
+    }
+    type.t = VT_VOID;
+    vpush(&type);
+    CODE_OFF();
+    break;
+  }
   case TOK_builtin_classify_type:
     parse_builtin_params(1, "e"); /* nc=1: nocode, "e": one expression */
     n = gcc_classify_type(&vtop->type);
     vtop--;
     vpushi(n);
     break;
+  case TOK_builtin_signbit:
+  case TOK_builtin_signbitf:
+  {
+    int tok1 = tok;
+    parse_builtin_params(1, "e");
+
+    /* Check if argument is a compile-time constant floating point value */
+    int bt = vtop->type.t & VT_BTYPE;
+    if ((vtop->r & (VT_VALMASK | VT_LVAL)) == VT_CONST && !(vtop->r & VT_SYM) &&
+        (bt == VT_FLOAT || bt == VT_DOUBLE || bt == VT_LDOUBLE))
+    {
+      /* For constants, extract the sign bit from the raw representation */
+      int sign_set = 0;
+      if (bt == VT_FLOAT)
+      {
+        union
+        {
+          float f;
+          uint32_t i;
+        } u;
+        u.f = vtop->c.f;
+        sign_set = (u.i >> 31) & 1;
+      }
+      else if (bt == VT_DOUBLE)
+      {
+        union
+        {
+          double d;
+          uint64_t i;
+        } u;
+        u.d = vtop->c.d;
+        sign_set = (u.i >> 63) & 1;
+      }
+      else /* VT_LDOUBLE */
+      {
+        /* For long double, check if value is negative (including -0.0) */
+        sign_set = (vtop->c.ld < 0.0L) || (1.0L / vtop->c.ld < 0.0L);
+      }
+      vtop--;
+      vpushi(sign_set);
+    }
+    else
+    {
+      /* For runtime values, extract the sign bit directly from the
+       * IEEE 754 representation via type-punning through a stack temp.
+       * A simple "x < 0.0" comparison would fail for -0.0 because
+       * IEEE 754 says -0.0 == +0.0 numerically. */
+      int arg_bt = vtop->type.t & VT_BTYPE;
+      int fp_size, fp_align, high_word_offset;
+
+      if (tok1 == TOK_builtin_signbitf || arg_bt == VT_FLOAT)
+      {
+        fp_size = 4;
+        fp_align = 4;
+        high_word_offset = 0; /* sign bit is bit 31 of the only word */
+      }
+      else
+      {
+        /* double (or long double treated as double on ARM) */
+        fp_size = 8;
+        fp_align = 8;
+        high_word_offset = 4; /* little-endian: sign bit is bit 31 of high word at +4 */
+      }
+
+      /* Ensure the value has the right floating-point type */
+      if (tok1 == TOK_builtin_signbitf && arg_bt != VT_FLOAT)
+      {
+        CType ft;
+        ft.t = VT_FLOAT;
+        ft.ref = NULL;
+        gen_cast(&ft);
+      }
+      else if (tok1 != TOK_builtin_signbitf && arg_bt == VT_FLOAT)
+      {
+        CType dt;
+        dt.t = VT_DOUBLE;
+        dt.ref = NULL;
+        gen_cast(&dt);
+        fp_size = 8;
+        fp_align = 8;
+        high_word_offset = 4;
+      }
+
+      /* Allocate a temp local to store the float/double */
+      int vr_tmp;
+      int tmp_loc = get_temp_local_var(fp_size, fp_align, &vr_tmp);
+
+      /* Store the float/double to the temp local */
+      SValue dst_sv;
+      memset(&dst_sv, 0, sizeof(dst_sv));
+      dst_sv.type = vtop->type;
+      dst_sv.r = VT_LOCAL | VT_LVAL;
+      dst_sv.vr = vr_tmp;
+      dst_sv.c.i = tmp_loc;
+
+      vpushv(&dst_sv);
+      vswap();
+      vstore();
+      vtop--; /* pop the store result */
+
+      /* Load the word containing the sign bit as an unsigned integer */
+      CType uint_type;
+      uint_type.t = VT_INT | VT_UNSIGNED;
+      uint_type.ref = NULL;
+      vset(&uint_type, VT_LOCAL | VT_LVAL, tmp_loc + high_word_offset);
+      vtop->vr = vr_tmp;
+
+      /* Unsigned right shift by 31 to isolate the sign bit (0 or 1) */
+      vpushi(31);
+      gen_op(TOK_SHR);
+    }
+    break;
+  }
+  case TOK_builtin_isinf:
+  case TOK_builtin_isinff:
+  case TOK_builtin_isinfl:
+  {
+    int tok1 = tok;
+    parse_builtin_params(0, "e");
+
+    /* Check if argument is a compile-time constant floating point value */
+    int bt = vtop->type.t & VT_BTYPE;
+    if ((vtop->r & (VT_VALMASK | VT_LVAL)) == VT_CONST && !(vtop->r & VT_SYM) &&
+        (bt == VT_FLOAT || bt == VT_DOUBLE || bt == VT_LDOUBLE))
+    {
+      /* For constants, check if value is infinity */
+      int isinf_result = 0;
+      if (bt == VT_FLOAT)
+      {
+        union
+        {
+          float f;
+          uint32_t i;
+        } u;
+        u.f = vtop->c.f;
+        uint32_t exponent = (u.i >> 23) & 0xFF;
+        uint32_t mantissa = u.i & 0x7FFFFF;
+        if (exponent == 0xFF && mantissa == 0)
+          isinf_result = (u.i >> 31) ? -1 : 1;
+      }
+      else if (bt == VT_DOUBLE)
+      {
+        union
+        {
+          double d;
+          uint64_t i;
+        } u;
+        u.d = vtop->c.d;
+        uint64_t exponent = (u.i >> 52) & 0x7FF;
+        uint64_t mantissa = u.i & 0xFFFFFFFFFFFFFLL;
+        if (exponent == 0x7FF && mantissa == 0)
+          isinf_result = (u.i >> 63) ? -1 : 1;
+      }
+      else /* VT_LDOUBLE */
+      {
+        /* For cross-compilation where host long double has more range than
+         * target's (e.g. x86_64 host 80-bit -> ARM target 64-bit), convert
+         * to the target representation first, then check IEEE 754 bits. */
+        if (LDOUBLE_SIZE == 8)
+        {
+          /* Target long double is double-precision (64-bit) */
+          union
+          {
+            double d;
+            uint64_t i;
+          } u;
+          u.d = (double)vtop->c.ld;
+          uint64_t exponent = (u.i >> 52) & 0x7FF;
+          uint64_t mantissa = u.i & 0xFFFFFFFFFFFFFLL;
+          if (exponent == 0x7FF && mantissa == 0)
+            isinf_result = (u.i >> 63) ? -1 : 1;
+        }
+        else
+        {
+          /* Host and target long double are the same size */
+          long double ld = vtop->c.ld;
+          if (ld != 0.0L && ld == ld + ld)
+            isinf_result = (ld < 0.0L) ? -1 : 1;
+        }
+      }
+      vtop--;
+      vpushi(isinf_result);
+    }
+    else
+    {
+      /* For runtime values, generate a call to isinf/isinff from libm.
+       * Note: On ARM, long double is the same as double, so __builtin_isinfl
+       * also calls isinf (not isinfl which may not be available). */
+      int arg_bt = vtop->type.t & VT_BTYPE;
+      int is_float = (arg_bt == VT_FLOAT) || (tok1 == TOK_builtin_isinff);
+      const char *func_name = is_float ? "isinff" : "isinf";
+
+      /* Ensure the value has the right floating-point type */
+      if (tok1 == TOK_builtin_isinff && arg_bt != VT_FLOAT)
+      {
+        CType ft;
+        ft.t = VT_FLOAT;
+        ft.ref = NULL;
+        gen_cast(&ft);
+      }
+      else if (tok1 != TOK_builtin_isinff && arg_bt == VT_FLOAT)
+      {
+        CType dt;
+        dt.t = VT_DOUBLE;
+        dt.ref = NULL;
+        gen_cast(&dt);
+      }
+
+      /* Create call ID and encode parameters */
+      const int new_call_id = tcc_state->ir->next_call_id++;
+      SValue param_num;
+      svalue_init(&param_num);
+      param_num.vr = -1;
+      param_num.r = VT_CONST;
+
+      /* Parameter 0: the float/double argument */
+      param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &param_num, NULL);
+
+      /* Push the helper function */
+      vpush_helper_func(tok_alloc_const(func_name));
+
+      /* Generate the function call */
+      SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 1);
+      SValue dest;
+      svalue_init(&dest);
+      dest.type.t = VT_INT; /* isinf returns int */
+      dest.r = 0;
+      dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &call_id_sv, &dest);
+
+      /* Pop function and argument (func, arg), push result */
+      vtop -= 2;
+      vpushi(0);
+      vtop->type.t = VT_INT;
+      vtop->vr = dest.vr;
+      vtop->r = TREG_R0; /* Return value in R0 */
+    }
+    break;
+  }
+  case TOK_builtin_copysign:
+  case TOK_builtin_copysignf:
+  {
+    int tok1 = tok;
+    parse_builtin_params(0, "ee");
+
+    /* For __builtin_copysign(x, y), we need to call copysign(x, y)
+     * which returns a value with the magnitude of x and the sign of y.
+     * We generate a call to the standard library function. */
+
+    /* Get the type of the first argument to determine which variant to use */
+    int arg_bt = vtop[-1].type.t & VT_BTYPE;
+    int is_float = (arg_bt == VT_FLOAT) || (tok1 == TOK_builtin_copysignf);
+
+    /* Create call ID and encode parameters */
+    const int new_call_id = tcc_state->ir->next_call_id++;
+    SValue param_num;
+    svalue_init(&param_num);
+    param_num.vr = -1;
+    param_num.r = VT_CONST;
+
+    /* Parameter 0: x (magnitude) - first argument on stack */
+    param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
+    tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &param_num, NULL);
+
+    /* Parameter 1: y (sign) - second argument on stack */
+    param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 1);
+    tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[0], &param_num, NULL);
+
+    /* Push the helper function */
+    if (is_float)
+    {
+      vpush_helper_func(TOK___copysignf);
+    }
+    else
+    {
+      vpush_helper_func(TOK___copysign);
+    }
+
+    /* Generate the function call */
+    SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 2);
+    SValue dest;
+    svalue_init(&dest);
+    dest.type.t = is_float ? VT_FLOAT : VT_DOUBLE;
+    dest.r = 0;
+    dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+    tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &call_id_sv, &dest);
+
+    /* Pop function and arguments (func, y, x), push result */
+    vtop -= 3;
+    vpushi(0);
+    vtop->type.t = is_float ? VT_FLOAT : VT_DOUBLE;
+    vtop->vr = dest.vr;
+    vtop->r = TREG_R0; /* Return value in R0 */
+    break;
+  }
+  case TOK_builtin_bswap16:
+  case TOK_builtin_bswap32:
+  case TOK_builtin_bswap64:
+  {
+    int tok1 = tok;
+    parse_builtin_params(0, "e");
+
+    /* Get the swap size based on builtin type */
+    int size = 8; /* default to 64-bit for bswap64 */
+    if (tok1 == TOK_builtin_bswap16)
+      size = 2;
+    else if (tok1 == TOK_builtin_bswap32)
+      size = 4;
+
+    /* Check if argument is a compile-time constant */
+    if ((vtop->r & (VT_VALMASK | VT_LVAL)) == VT_CONST && !(vtop->r & VT_SYM))
+    {
+      uint64_t val;
+      int bt = vtop->type.t & VT_BTYPE;
+
+      /* Extract the constant value based on type */
+      if (bt == VT_LLONG)
+      {
+        val = vtop->c.i;
+      }
+      else if (bt == VT_INT)
+      {
+        val = (uint32_t)vtop->c.i;
+      }
+      else if (bt == VT_SHORT)
+      {
+        val = (uint16_t)vtop->c.i;
+      }
+      else
+      {
+        val = (uint64_t)vtop->c.i;
+      }
+
+      /* Perform byte swap */
+      uint64_t result = 0;
+      if (size == 2)
+      {
+        result = ((val & 0x00FF) << 8) | ((val & 0xFF00) >> 8);
+        result = (uint16_t)result;
+      }
+      else if (size == 4)
+      {
+        result = ((val & 0x000000FF) << 24) | ((val & 0x0000FF00) << 8) | ((val & 0x00FF0000) >> 8) |
+                 ((val & 0xFF000000) >> 24);
+        result = (uint32_t)result;
+      }
+      else
+      {
+        result = ((val & 0x00000000000000FFULL) << 56) | ((val & 0x000000000000FF00ULL) << 40) |
+                 ((val & 0x0000000000FF0000ULL) << 24) | ((val & 0x00000000FF000000ULL) << 8) |
+                 ((val & 0x000000FF00000000ULL) >> 8) | ((val & 0x0000FF0000000000ULL) >> 24) |
+                 ((val & 0x00FF000000000000ULL) >> 40) | ((val & 0xFF00000000000000ULL) >> 56);
+      }
+
+      vtop--;
+
+      /* Push result with appropriate type */
+      CType result_type;
+      result_type.t = (size == 2)   ? (VT_SHORT | VT_UNSIGNED)
+                      : (size == 4) ? (VT_INT | VT_UNSIGNED)
+                                    : (VT_LLONG | VT_UNSIGNED);
+      result_type.ref = NULL;
+      vpush(&result_type);
+      vtop->r = VT_CONST;
+      vtop->c.i = result;
+    }
+    else
+    {
+      /* For runtime values, generate inline byte swap using shifts and ORs */
+      CType result_type;
+      if (size == 2)
+      {
+        result_type.t = VT_SHORT | VT_UNSIGNED;
+      }
+      else if (size == 4)
+      {
+        result_type.t = VT_INT | VT_UNSIGNED;
+      }
+      else
+      {
+        result_type.t = VT_LLONG | VT_UNSIGNED;
+      }
+      result_type.ref = NULL;
+
+      /* Cast to appropriate unsigned type */
+      gen_cast(&result_type);
+
+      if (size == 2)
+      {
+        /* bswap16: call __bswapsi2 and mask to 16 bits, or implement inline */
+        /* For now, use library call via __bswapsi2 (which handles 32-bit) and mask */
+        /* First extend to 32-bit, swap, then mask */
+        CType uint32_type;
+        uint32_type.t = VT_INT | VT_UNSIGNED;
+        uint32_type.ref = NULL;
+        gen_cast(&uint32_type);
+
+        /* Call __bswapsi2 library function using IR */
+        vpush_helper_func(TOK___bswapsi2);
+        vrott(2);
+        /* Stack after vrott(2): func, arg (arg is at vtop) */
+        {
+          SValue param_num;
+          SValue dest;
+          const int call_id = tcc_state->ir ? tcc_state->ir->next_call_id++ : 0;
+          svalue_init(&param_num);
+          param_num.vr = -1;
+          param_num.r = VT_CONST;
+          /* Generate FUNCPARAMVAL for arg (param 0) */
+          param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
+          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[0], &param_num, NULL);
+          /* Generate FUNCCALLVAL for the function call (returns 32-bit) */
+          svalue_init(&dest);
+          dest.type.t = VT_INT | VT_UNSIGNED;
+          dest.r = 0;
+          dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+          SValue call_id_sv = tcc_ir_svalue_call_id_argc(call_id, 1);
+          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[-1], &call_id_sv, &dest);
+          /* Pop all 2 values (arg, func) and push result */
+          vtop -= 2;
+          vpushi(0);
+          vtop->type.t = VT_INT | VT_UNSIGNED;
+          vtop->vr = dest.vr;
+          vtop->r = TREG_R0; /* Return value in R0 */
+        }
+
+        /* Shift right by 16 to get the swapped 16-bit value in the low bits */
+        /* Actually, for a 16-bit value 0xABCD, bswap32 gives 0xCDAB0000,
+           so we need to shift right by 16 to get 0x0000CDAB */
+        vpushi(16);
+        gen_op(TOK_SHR);
+
+        /* Cast back to uint16 */
+        gen_cast(&result_type);
+      }
+      else if (size == 4)
+      {
+        /* bswap32: call __bswapsi2 library function */
+        vpush_helper_func(TOK___bswapsi2);
+        vrott(2);
+        /* Stack after vrott(2): func, arg (arg is at vtop) */
+        {
+          SValue param_num;
+          SValue dest;
+          const int call_id = tcc_state->ir ? tcc_state->ir->next_call_id++ : 0;
+          svalue_init(&param_num);
+          param_num.vr = -1;
+          param_num.r = VT_CONST;
+          /* Generate FUNCPARAMVAL for arg (param 0) */
+          param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
+          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[0], &param_num, NULL);
+          /* Generate FUNCCALLVAL for the function call (returns 32-bit) */
+          svalue_init(&dest);
+          dest.type.t = VT_INT | VT_UNSIGNED;
+          dest.r = 0;
+          dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+          SValue call_id_sv = tcc_ir_svalue_call_id_argc(call_id, 1);
+          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[-1], &call_id_sv, &dest);
+          /* Pop all 2 values (arg, func) and push result */
+          vtop -= 2;
+          vpushi(0);
+          vtop->type.t = VT_INT | VT_UNSIGNED;
+          vtop->vr = dest.vr;
+          vtop->r = TREG_R0; /* Return value in R0 */
+        }
+      }
+      else
+      {
+        /* bswap64: emit as library call (complex on 32-bit ARM) */
+        /* Call __bswapdi3 library function using IR */
+        vpush_helper_func(TOK___bswapdi3);
+        vrott(2);
+        /* Stack after vrott(2): func, arg (arg is at vtop) */
+        {
+          SValue param_num;
+          SValue dest;
+          const int call_id = tcc_state->ir ? tcc_state->ir->next_call_id++ : 0;
+          svalue_init(&param_num);
+          param_num.vr = -1;
+          param_num.r = VT_CONST;
+          /* Generate FUNCPARAMVAL for arg (param 0) */
+          param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
+          TCCGEN_DEBUG("[TCCGEN] FUNCPARAMVAL push: site=bswap64 call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
+                       call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)param_num.c.i), vtop[0].r, vtop[0].vr);
+          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[0], &param_num, NULL);
+          /* Generate FUNCCALLVAL for the function call (returns 64-bit) */
+          svalue_init(&dest);
+          dest.type.t = VT_LLONG | VT_UNSIGNED;
+          dest.r = 0;
+          dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+          SValue call_id_sv = tcc_ir_svalue_call_id_argc(call_id, 1);
+          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[-1], &call_id_sv, &dest);
+          /* Pop all 2 values (arg, func) and push result */
+          vtop -= 2;
+          vpushi(0);
+          vtop->type.t = VT_LLONG | VT_UNSIGNED;
+          vtop->vr = dest.vr;
+          vtop->r = TREG_R0; /* Return value in R0:R1 */
+        }
+      }
+    }
+    break;
+  }
+  case TOK_builtin_add_overflow:
+  case TOK_builtin_sub_overflow:
+  case TOK_builtin_mul_overflow:
+  case TOK_builtin_sadd_overflow:
+  case TOK_builtin_uadd_overflow:
+  case TOK_builtin_ssub_overflow:
+  case TOK_builtin_usub_overflow:
+  case TOK_builtin_umul_overflow:
+  {
+    /* __builtin_{add,sub,mul}_overflow(a, b, *res) — type-generic
+     * __builtin_{s,u}{add,sub,mul}_overflow(T a, T b, T *res) — typed (int)
+     *
+     * Implementation for result types <= 32 bits: widen operands to
+     * long long, perform the operation, truncate to the result type,
+     * store through the pointer, then sign/zero-extend the truncated
+     * value back and compare with the wide result to detect overflow. */
+    int op_tok = tok;
+    CType res_type;
+
+    next();
+    skip('(');
+    expr_eq();
+    convert_parameter_type(&vtop->type);
+    skip(',');
+    expr_eq();
+    convert_parameter_type(&vtop->type);
+    skip(',');
+    expr_eq();
+    convert_parameter_type(&vtop->type);
+    skip(')');
+
+    /* Stack: a  b  res_ptr */
+
+    if (!(vtop->type.t & VT_PTR))
+      tcc_error("third argument to overflow builtin must be a pointer");
+    res_type = *pointed_type(&vtop->type);
+    int res_bt = res_type.t & VT_BTYPE;
+    int is_unsigned;
+
+    switch (op_tok)
+    {
+    case TOK_builtin_uadd_overflow:
+    case TOK_builtin_usub_overflow:
+    case TOK_builtin_umul_overflow:
+      is_unsigned = 1;
+      break;
+    case TOK_builtin_sadd_overflow:
+    case TOK_builtin_ssub_overflow:
+    case TOK_builtin_smul_overflow:
+      is_unsigned = 0;
+      break;
+    default:
+      is_unsigned = (res_type.t & VT_UNSIGNED) != 0;
+      break;
+    }
+
+    int arith_tok;
+    switch (op_tok)
+    {
+    case TOK_builtin_add_overflow:
+    case TOK_builtin_sadd_overflow:
+    case TOK_builtin_uadd_overflow:
+      arith_tok = '+';
+      break;
+    case TOK_builtin_sub_overflow:
+    case TOK_builtin_ssub_overflow:
+    case TOK_builtin_usub_overflow:
+      arith_tok = '-';
+      break;
+    default:
+      arith_tok = '*';
+      break;
+    }
+
+    if (res_bt == VT_LLONG)
+    {
+      /* 64-bit result: can't widen further on 32-bit target.
+       * Use arithmetic overflow checks instead. */
+
+      /* Stack: a  b  res_ptr → res_ptr  a  b */
+      vrott(3);
+
+      /* For the type-generic __builtin_mul_overflow with unsigned 64-bit
+       * result but signed inputs that fit in 32 bits, the infinite-precision
+       * product always fits in signed long long.  Overflow into unsigned
+       * long long means the signed product is negative.  Use signed
+       * multiplication so we can test the sign bit afterwards. */
+      int a_bt = vtop[-1].type.t & VT_BTYPE;
+      int b_bt = vtop[0].type.t & VT_BTYPE;
+      int a_signed = !(vtop[-1].type.t & VT_UNSIGNED);
+      int b_signed = !(vtop[0].type.t & VT_UNSIGNED);
+      int signed_to_unsigned_mul = is_unsigned && arith_tok == '*' && op_tok == TOK_builtin_mul_overflow &&
+                                   (a_signed || b_signed) && (a_bt <= VT_INT && b_bt <= VT_INT);
+
+      CType ll_type;
+      ll_type.ref = NULL;
+      if (signed_to_unsigned_mul)
+        ll_type.t = VT_LLONG; /* signed — preserve sign for overflow check */
+      else
+        ll_type.t = is_unsigned ? (VT_LLONG | VT_UNSIGNED) : VT_LLONG;
+      gen_cast(&ll_type); /* cast b */
+      vswap();
+      gen_cast(&ll_type); /* cast a */
+      vswap();
+      /* Stack: res_ptr  a  b */
+
+      /* Save copies of a and b for the overflow check. */
+      vpushv(vtop);     /* Stack: res_ptr  a  b  b2 */
+      vrott(4);         /* Stack: b2  res_ptr  a  b */
+      vpushv(vtop - 1); /* Stack: b2  res_ptr  a  b  a2 */
+      vrott(5);         /* Stack: a2  b2  res_ptr  a  b */
+
+      gen_op(arith_tok); /* Stack: a2  b2  res_ptr  result */
+
+      /* For all cases except pure-unsigned mul, save a result copy. */
+      int need_result = !(is_unsigned && arith_tok == '*') || signed_to_unsigned_mul;
+      if (need_result)
+      {
+        vpushv(vtop); /* Stack: a2  b2  res_ptr  result  r2 */
+        vrott(3);     /* Stack: a2  b2  r2  res_ptr  result */
+      }
+
+      /* Store result through pointer. */
+      vswap();  /* ...  result  res_ptr */
+      indir();  /* ...  result  *res_ptr */
+      vswap();  /* ...  *res_ptr  result */
+      vstore(); /* pops rvalue, lvalue remains */
+      vpop();   /* discard lvalue leftover */
+
+      /* After store:
+       *   need_result true:  a2  b2  r2
+       *   need_result false: a2  b2
+       */
+
+      if (is_unsigned && arith_tok == '+')
+      {
+        /* unsigned add overflow: result < a
+         * Stack: a2  b2  r2 */
+        vswap();        /* a2  r2  b2 */
+        vpop();         /* a2  r2 */
+        vswap();        /* r2  a2 */
+        gen_op(TOK_LT); /* r2 < a2 */
+      }
+      else if (is_unsigned && arith_tok == '-')
+      {
+        /* unsigned sub overflow: a < result
+         * Stack: a2  b2  r2 */
+        vswap();        /* a2  r2  b2 */
+        vpop();         /* a2  r2 */
+        gen_op(TOK_LT); /* a2 < r2 */
+      }
+      else if (!is_unsigned && arith_tok == '+')
+      {
+        /* signed add overflow: ((a ^ r) & (b ^ r)) < 0
+         *
+         * Compute (b ^ r) first (like sub computes (a ^ b)),
+         * then (a ^ r), then AND. Stack: a2  b2  r2 */
+
+        /* Push b2 (at vtop-1 before any pushes) */
+        vpushv(vtop - 1);
+        /* Now vtop = b2copy, vtop-1 = r2. Push r2 for (b ^ r). */
+        vpushv(vtop - 1);
+        gen_op('^'); /* a2  b2  r2  (b ^ r) */
+
+        /* For (a ^ r), need a2 and r2.
+         * Stack: a2  b2  r2  xor_br
+         * vtop = xor_br, vtop-1 = r2, vtop-2 = b2, vtop-3 = a2 */
+        vpushv(vtop - 3); /* ...  xor_br  a4  (vtop-3 = a2) */
+        vpushv(vtop - 2); /* ...  xor_br  a4  r4  (vtop-2 = r2) */
+        gen_op('^');      /* a2  b2  r2  xor_br  xor_ar */
+
+        gen_op('&'); /* a2  b2  r2  (xor_br & xor_ar) */
+
+        vpushi(0);
+        gen_op(TOK_LT); /* overflow_flag  a2  b2  r2 */
+
+        /* Discard unused copies */
+        vrott(4);
+        vpop();
+        vpop();
+        vpop(); /* overflow_flag */
+      }
+      else if (!is_unsigned && arith_tok == '-')
+      {
+        /* signed sub overflow: ((a ^ b) & (a ^ result)) < 0
+         * Stack: a2  b2  r2 */
+
+        /* Need copies of a2 for both XORs. */
+        vpushv(vtop - 2); /* a2  b2  r2  a3  (vtop-2 = a2) */
+        vpushv(vtop - 2); /* a2  b2  r2  a3  b3  (vtop-2 = b2) */
+
+        /* Compute a ^ b: a3  b3 on top */
+        gen_op('^'); /* a2  b2  r2  (a3^b3) = xor_ab */
+
+        /* Compute a ^ result: need a2 and r2 copies */
+        vpushv(vtop - 3); /* ...  xor_ab  a4  (vtop-3 = a2) */
+        vpushv(vtop - 2); /* ...  xor_ab  a4  r3  (vtop-2 = r2) */
+        gen_op('^');      /* a2  b2  r2  xor_ab  (a4^r3) = xor_ar */
+
+        gen_op('&'); /* a2  b2  r2  (xor_ab & xor_ar) */
+
+        vpushi(0);
+        gen_op(TOK_LT); /* combined < 0 */
+
+        /* Stack: a2  b2  r2  overflow_flag — discard unused copies */
+        vrott(4); /* overflow_flag  a2  b2  r2 */
+        vpop();
+        vpop();
+        vpop(); /* overflow_flag */
+      }
+      else if (signed_to_unsigned_mul)
+      {
+        /* Signed inputs multiplied into unsigned 64-bit result.
+         * Both inputs are ≤ 32-bit, so the signed product always fits
+         * in signed long long.  Overflow into unsigned long long
+         * simply means the signed product is negative.
+         * Stack: a2  b2  r2 */
+        vrott(3); /* r2  a2  b2 */
+        vpop();
+        vpop(); /* r2 */
+
+        {
+          CType sll;
+          sll.t = VT_LLONG;
+          sll.ref = NULL;
+          vpushi(0);
+          gen_cast(&sll);
+        }
+        gen_op(TOK_LT); /* r2 < 0  →  overflow_flag */
+      }
+      else if (is_unsigned && arith_tok == '*')
+      {
+        /* unsigned mul overflow: UINT64_MAX / (a | (a==0)) < b
+         * Stack: a2  b2
+         * Use safe_a = a | (a==0) to avoid division by zero. */
+
+        /* Compute a == 0 */
+        vpushv(vtop - 1); /* a2  b2  a3 */
+        vpushi(0);
+        gen_cast(&ll_type);
+        gen_op(TOK_EQ); /* a2  b2  (a3==0) */
+
+        /* Compute a3 | (a3==0) = safe_a */
+        vpushv(vtop - 2); /* a2  b2  (a==0)  a4  (vtop-2 = a2) */
+        gen_op('|');      /* a2  b2  ((a==0)|a4) = safe_a */
+
+        /* Push UINT64_MAX */
+        {
+          CType ull_type;
+          ull_type.t = VT_LLONG | VT_UNSIGNED;
+          ull_type.ref = NULL;
+          vpush(&ull_type);
+          vtop->r = VT_CONST;
+          vtop->c.i = -1; /* UINT64_MAX */
+        }
+        /* Stack: a2  b2  safe_a  UINT64_MAX */
+
+        vswap();     /* a2  b2  UINT64_MAX  safe_a */
+        gen_op('/'); /* a2  b2  limit */
+
+        /* Check limit < b */
+        vswap();        /* a2  limit  b2 */
+        gen_op(TOK_LT); /* a2  (limit < b2) */
+
+        /* Discard a2 */
+        vswap();
+        vpop(); /* overflow_flag */
+      }
+      else
+      {
+        /* signed mul overflow: branchless division round-trip.
+         *
+         * safe_a = a + (a==0) + 2*(a==-1)   [maps 0→1, -1→1, else unchanged]
+         * div_check = (result / safe_a != b)
+         * a_normal  = (a != 0) & (a != -1)
+         * base_ovf  = div_check & a_normal
+         * edge1 = (a == -1) & (b == LLONG_MIN)
+         * edge2 = (b == -1) & (a == LLONG_MIN)
+         * overflow = base_ovf | edge1 | edge2
+         *
+         * Stack: a2  b2  r2 */
+
+        /* --- Compute safe_a = a + (a==0) + 2*(a==-1) --- */
+        vpushv(vtop - 2); /* ...  a3 */
+        vpushi(0);
+        gen_cast(&ll_type);
+        gen_op(TOK_EQ); /* ...  (a==0) */
+
+        vpushv(vtop - 3); /* ...  (a==0)  a4   (vtop-3 = a2) */
+        {
+          CType sll;
+          sll.t = VT_LLONG;
+          sll.ref = NULL;
+          vpush(&sll);
+          vtop->r = VT_CONST;
+          vtop->c.i = -1;
+        } /* ...  (a==0)  a4  -1LL */
+        gen_op(TOK_EQ); /* ...  (a==0)  (a4==-1) */
+
+        vpushi(2);
+        gen_op('*'); /* ...  (a==0)  2*(a==-1) */
+        gen_op('+'); /* ...  ((a==0) + 2*(a==-1)) = adjustment */
+
+        vpushv(vtop - 3); /* ...  adj  a5   (vtop-3 = a2) */
+        gen_op('+');      /* ...  (a5 + adj) = safe_a */
+
+        /* Stack: a2  b2  r2  safe_a */
+
+        /* --- Compute div_check = (r2 / safe_a != b2) --- */
+        vpushv(vtop - 1); /* ...  safe_a  r3   (vtop-1 = r2) */
+        vswap();          /* ...  r3  safe_a */
+        gen_op('/');      /* ...  (r3 / safe_a) = quot */
+
+        vpushv(vtop - 2); /* ...  quot  b3   (vtop-2 = b2) */
+        gen_op(TOK_NE);   /* ...  (quot != b3) = div_check */
+
+        /* Stack: a2  b2  r2  div_check */
+
+        /* --- Compute a_normal = (a != 0) & (a != -1) --- */
+        vpushv(vtop - 3); /* ...  div_check  a6   (vtop-3 = a2) */
+        vpushi(0);
+        gen_cast(&ll_type);
+        gen_op(TOK_NE); /* (a6 != 0) */
+
+        vpushv(vtop - 4); /* ...  (a!=0)  a7   (vtop-4 = a2) */
+        {
+          CType sll;
+          sll.t = VT_LLONG;
+          sll.ref = NULL;
+          vpush(&sll);
+          vtop->r = VT_CONST;
+          vtop->c.i = -1;
+        }
+        gen_op(TOK_NE); /* (a7 != -1) */
+        gen_op('&');    /* a_normal = (a!=0) & (a!=-1) */
+
+        /* Stack: a2  b2  r2  div_check  a_normal */
+        gen_op('&'); /* base_ovf = div_check & a_normal */
+
+        /* Stack: a2  b2  r2  base_ovf */
+
+        /* --- edge1 = (a == -1) & (b == LLONG_MIN) --- */
+        vpushv(vtop - 3); /* ...  base_ovf  a8   (vtop-3 = a2) */
+        {
+          CType sll;
+          sll.t = VT_LLONG;
+          sll.ref = NULL;
+          vpush(&sll);
+          vtop->r = VT_CONST;
+          vtop->c.i = -1;
+        }
+        gen_op(TOK_EQ); /* (a8 == -1) */
+
+        vpushv(vtop - 3); /* ...  (a==-1)  b4   (vtop-3 = b2) */
+        {
+          CType sll;
+          sll.t = VT_LLONG;
+          sll.ref = NULL;
+          vpush(&sll);
+          vtop->r = VT_CONST;
+          vtop->c.i = (int64_t)((uint64_t)1 << 63); /* LLONG_MIN */
+        }
+        gen_op(TOK_EQ); /* (b4 == LLONG_MIN) */
+        gen_op('&');    /* edge1 */
+
+        /* Stack: a2  b2  r2  base_ovf  edge1 */
+        gen_op('|'); /* base_ovf | edge1 */
+
+        /* --- edge2 = (b == -1) & (a == LLONG_MIN) --- */
+        vpushv(vtop - 2); /* ...  (base|e1)  b5   (vtop-2 = b2) */
+        {
+          CType sll;
+          sll.t = VT_LLONG;
+          sll.ref = NULL;
+          vpush(&sll);
+          vtop->r = VT_CONST;
+          vtop->c.i = -1;
+        }
+        gen_op(TOK_EQ); /* (b5 == -1) */
+
+        vpushv(vtop - 4); /* ...  (b==-1)  a9   (vtop-4 = a2) */
+        {
+          CType sll;
+          sll.t = VT_LLONG;
+          sll.ref = NULL;
+          vpush(&sll);
+          vtop->r = VT_CONST;
+          vtop->c.i = (int64_t)((uint64_t)1 << 63);
+        }
+        gen_op(TOK_EQ); /* (a9 == LLONG_MIN) */
+        gen_op('&');    /* edge2 */
+
+        /* Stack: a2  b2  r2  (base|e1)  edge2 */
+        gen_op('|'); /* overflow = (base|e1) | edge2 */
+
+        /* Stack: a2  b2  r2  overflow_flag — discard unused copies */
+        vrott(4);
+        vpop();
+        vpop();
+        vpop(); /* overflow_flag */
+      }
+
+      break;
+    }
+
+    /* 32-bit or smaller result: widen to long long, compute, truncate, compare */
+    vrott(3); /* → res_ptr  a  b */
+
+    /* Widen both operands to (unsigned) long long */
+    CType wide_type;
+    wide_type.ref = NULL;
+    wide_type.t = is_unsigned ? (VT_LLONG | VT_UNSIGNED) : VT_LLONG;
+
+    gen_cast(&wide_type); /* cast b */
+    vswap();
+    gen_cast(&wide_type); /* cast a */
+    vswap();
+    /* Stack: res_ptr  a_wide  b_wide */
+
+    gen_op(arith_tok);
+    /* Stack: res_ptr  wide_result */
+
+    vpushv(vtop); /* dup wide_result */
+    /* Stack: res_ptr  wide_result  wide_result2 */
+
+    gen_cast(&res_type); /* truncate copy to result type */
+    /* Stack: res_ptr  wide_result  truncated */
+
+    vpushv(vtop); /* dup truncated */
+    /* Stack: res_ptr  wide_result  truncated  truncated2 */
+
+    gen_cast(&wide_type); /* re-extend for comparison */
+    /* Stack: res_ptr  wide_result  truncated  extended */
+
+    /* Bring wide_result next to extended for comparison.
+     * vrotb(3) moves vtop[-2] to vtop within the top 3:
+     * [wide_result  truncated  extended] → [truncated  extended  wide_result] */
+    vrotb(3);
+    /* Stack: res_ptr  truncated  extended  wide_result */
+
+    gen_op(TOK_NE);
+    /* Stack: res_ptr  truncated  overflow_flag */
+
+    /* Rearrange to store truncated through res_ptr.
+     * Need: [overflow_flag ... *res_ptr  truncated] for vstore. */
+    vrott(3);
+    /* Stack: overflow_flag  res_ptr  truncated */
+
+    vswap();
+    /* Stack: overflow_flag  truncated  res_ptr */
+
+    indir(); /* res_ptr → *res_ptr (lvalue) */
+    /* Stack: overflow_flag  truncated  *res_ptr */
+
+    vswap();
+    /* Stack: overflow_flag  *res_ptr  truncated */
+
+    vstore();
+    /* vstore pops rvalue; lvalue remains → Stack: overflow_flag  *res_ptr' */
+
+    vpop(); /* discard the store result */
+    /* Stack: overflow_flag — this is our return value */
+
+    break;
+  }
+  case TOK_builtin_add_overflow_p:
+  case TOK_builtin_sub_overflow_p:
+  case TOK_builtin_mul_overflow_p:
+  {
+    /* __builtin_{add,sub,mul}_overflow_p(a, b, dummy) — type-generic predicate
+     *
+     * Similar to the _overflow builtins, but instead of storing the result
+     * through a pointer, this just returns whether overflow would occur.
+     * The third argument is a dummy value of the result type (not a pointer).
+     *
+     * Implementation: widen operands to long long, perform the operation,
+     * truncate to the result type, sign/zero-extend back and compare with
+     * the wide result to detect overflow. */
+    int op_tok = tok;
+    CType dummy_type;
+
+    next();
+    skip('(');
+    expr_eq();
+    convert_parameter_type(&vtop->type);
+    skip(',');
+    expr_eq();
+    convert_parameter_type(&vtop->type);
+    skip(',');
+    expr_eq();
+    convert_parameter_type(&vtop->type);
+    skip(')');
+
+    /* Stack: a  b  dummy */
+
+    /* Get the result type from the dummy argument (it's a value, not a pointer) */
+    dummy_type = vtop->type;
+    int res_bt = dummy_type.t & VT_BTYPE;
+    int is_unsigned = (dummy_type.t & VT_UNSIGNED) != 0;
+
+    /* Pop the dummy value - we only need its type */
+    vpop();
+    /* Stack: a  b */
+
+    int arith_tok;
+    switch (op_tok)
+    {
+    case TOK_builtin_add_overflow_p:
+      arith_tok = '+';
+      break;
+    case TOK_builtin_sub_overflow_p:
+      arith_tok = '-';
+      break;
+    default:
+      arith_tok = '*';
+      break;
+    }
+
+    if (res_bt == VT_LLONG)
+    {
+      /* 64-bit result: can't widen further on 32-bit target.
+       * Use arithmetic overflow checks. */
+
+      /* Stack: a  b */
+      CType ll_type;
+      ll_type.ref = NULL;
+      ll_type.t = is_unsigned ? (VT_LLONG | VT_UNSIGNED) : VT_LLONG;
+      gen_cast(&ll_type); /* cast b */
+      vswap();
+      gen_cast(&ll_type); /* cast a */
+      vswap();
+      /* Stack: a  b (both widened) */
+
+      /* Save copies of a and b for the overflow check. */
+      vpushv(vtop);     /* Stack: a  b  b2 */
+      vrott(3);         /* Stack: b2  a  b */
+      vpushv(vtop - 1); /* Stack: b2  a  b  a2 */
+      vrott(4);         /* Stack: a2  b2  a  b */
+
+      gen_op(arith_tok); /* Stack: a2  b2  result */
+
+      /* For all cases except pure-unsigned mul, save a result copy. */
+      int need_result = !(is_unsigned && arith_tok == '*');
+      if (need_result)
+      {
+        vpushv(vtop); /* Stack: a2  b2  result  r2 */
+        vrott(3);     /* Stack: a2  b2  r2  result */
+      }
+
+      /* Discard the result (we don't store it for _overflow_p) */
+      vpop();
+      /* After pop:
+       *   need_result true:  a2  b2  r2
+       *   need_result false: a2  b2
+       */
+
+      if (is_unsigned && arith_tok == '+')
+      {
+        /* unsigned add overflow: result < a */
+        vswap();        /* a2  r2  b2 */
+        vpop();         /* a2  r2 */
+        vswap();        /* r2  a2 */
+        gen_op(TOK_LT); /* r2 < a2 */
+      }
+      else if (is_unsigned && arith_tok == '-')
+      {
+        /* unsigned sub overflow: a < result */
+        vswap();        /* a2  r2  b2 */
+        vpop();         /* a2  r2 */
+        gen_op(TOK_LT); /* a2 < r2 */
+      }
+      else if (!is_unsigned && arith_tok == '+')
+      {
+        /* signed add overflow: ((a ^ result) & (b ^ result)) < 0
+         *
+         * Note: after vrott(3)+vpop above, the actual stack layout is
+         *   a2  r2  b2  (vrott moves top to deepest in the 3-group).
+         * Indices below account for that layout. */
+        vpushv(vtop - 1); /* a2  r2  b2  r2copy */
+        vpushv(vtop - 1); /* a2  r2  b2  r2copy  b2copy */
+        gen_op('^');      /* a2  r2  b2  (r ^ b)  [== (b ^ r)] */
+        vpushv(vtop - 3); /* ...  (b^r)  a2 */
+        vpushv(vtop - 3); /* ...  (b^r)  a2  r2 */
+        gen_op('^');      /* a2  r2  b2  (b^r)  (a^r) */
+        gen_op('&');      /* a2  r2  b2  ((b^r) & (a^r)) */
+        vpushi(0);
+        gen_op(TOK_LT); /* a2  r2  b2  overflow_flag */
+        /* Discard unused copies */
+        vrott(4);
+        vpop();
+        vpop();
+        vpop();
+      }
+      else if (!is_unsigned && arith_tok == '-')
+      {
+        /* signed sub overflow: ((a ^ b) & (a ^ result)) < 0 */
+        vpushv(vtop - 2); /* a2  b2  r2  a3 */
+        vpushv(vtop - 2); /* a2  b2  r2  a3  b3 */
+        gen_op('^');      /* a2  b2  r2  xor_ab */
+        vpushv(vtop - 3); /* ...  xor_ab  a4 */
+        vpushv(vtop - 2); /* ...  xor_ab  a4  r3 */
+        gen_op('^');      /* a2  b2  r2  xor_ab  xor_ar */
+        gen_op('&');      /* a2  b2  r2  (xor_ab & xor_ar) */
+        vpushi(0);
+        gen_op(TOK_LT); /* overflow_flag  a2  b2  r2 */
+        /* Discard unused copies */
+        vrott(4);
+        vpop();
+        vpop();
+        vpop();
+      }
+      else if (is_unsigned && arith_tok == '*')
+      {
+        /* unsigned mul overflow: UINT64_MAX / (a | (a==0)) < b */
+        /* Stack: a2  b2 */
+        /* Compute a == 0 */
+        vpushv(vtop - 1); /* a2  b2  a3 */
+        vpushi(0);
+        gen_cast(&ll_type);
+        gen_op(TOK_EQ); /* a2  b2  (a3==0) */
+        /* Compute a3 | (a3==0) = safe_a */
+        vpushv(vtop - 2); /* a2  b2  (a==0)  a4 */
+        gen_op('|');      /* a2  b2  safe_a */
+        /* Push UINT64_MAX */
+        {
+          CType ull_type;
+          ull_type.t = VT_LLONG | VT_UNSIGNED;
+          ull_type.ref = NULL;
+          vpush(&ull_type);
+          vtop->r = VT_CONST;
+          vtop->c.i = -1;
+        }
+        /* Stack: a2  b2  safe_a  UINT64_MAX */
+        vswap();     /* a2  b2  UINT64_MAX  safe_a */
+        gen_op('/'); /* a2  b2  limit */
+        /* Check limit < b */
+        vswap();        /* a2  limit  b2 */
+        gen_op(TOK_LT); /* a2  (limit < b2) */
+        /* Discard a2 */
+        vswap();
+        vpop();
+      }
+      else
+      {
+        /* signed mul overflow: branchless division round-trip. */
+        CType sll;
+        sll.t = VT_LLONG;
+        sll.ref = NULL;
+
+        /* --- Compute safe_a = a + (a==0) + 2*(a==-1) --- */
+        /* Note: actual stack is a2  r2  b2 (vrott moves top to deepest) */
+        vpushv(vtop - 2); /* ...  a3 */
+        vpushi(0);
+        gen_cast(&sll);
+        gen_op(TOK_EQ);   /* ...  (a==0) */
+        vpushv(vtop - 3); /* ...  (a==0)  a4 */
+        vpush(&sll);
+        vtop->r = VT_CONST;
+        vtop->c.i = -1;
+        gen_op(TOK_EQ); /* ...  (a==0)  (a4==-1) */
+        vpushi(2);
+        gen_op('*');      /* ...  (a==0)  2*(a==-1) */
+        gen_op('+');      /* ...  adjustment */
+        vpushv(vtop - 3); /* ...  adj  a5 */
+        gen_op('+');      /* ...  safe_a */
+        /* Stack: a2  b2  r2  safe_a */
+
+        /* --- Compute div_check = (r2 / safe_a != b2) --- */
+        vpushv(vtop - 2); /* ...  safe_a  r3 */
+        vswap();          /* ...  r3  safe_a */
+        gen_op('/');      /* ...  quot */
+        vpushv(vtop - 1); /* ...  quot  b3 */
+        gen_op(TOK_NE);   /* ...  div_check */
+        /* Stack: a2  b2  r2  div_check */
+
+        /* --- Compute a_normal = (a != 0) & (a != -1) --- */
+        vpushv(vtop - 3); /* ...  div_check  a6 */
+        vpushi(0);
+        gen_cast(&sll);
+        gen_op(TOK_NE);   /* (a6 != 0) */
+        vpushv(vtop - 4); /* ...  (a!=0)  a7 */
+        vpush(&sll);
+        vtop->r = VT_CONST;
+        vtop->c.i = -1;
+        gen_op(TOK_NE); /* (a7 != -1) */
+        gen_op('&');    /* a_normal */
+        /* Stack: a2  b2  r2  div_check  a_normal */
+        gen_op('&'); /* base_ovf */
+        /* Stack: a2  b2  r2  base_ovf */
+
+        /* --- edge1 = (a == -1) & (b == LLONG_MIN) --- */
+        vpushv(vtop - 3); /* ...  base_ovf  a8 */
+        vpush(&sll);
+        vtop->r = VT_CONST;
+        vtop->c.i = -1;
+        gen_op(TOK_EQ);   /* (a8 == -1) */
+        vpushv(vtop - 2); /* ...  (a==-1)  b4 */
+        vpush(&sll);
+        vtop->r = VT_CONST;
+        vtop->c.i = (int64_t)((uint64_t)1 << 63); /* LLONG_MIN */
+        gen_op(TOK_EQ);                           /* (b4 == LLONG_MIN) */
+        gen_op('&');                              /* edge1 */
+        /* Stack: a2  r2  b2  base_ovf  edge1 */
+        gen_op('|');
+
+        /* --- edge2 = (b == -1) & (a == LLONG_MIN) --- */
+        vpushv(vtop - 1); /* ...  (base|e1)  b5 */
+        vpush(&sll);
+        vtop->r = VT_CONST;
+        vtop->c.i = -1;
+        gen_op(TOK_EQ);   /* (b5 == -1) */
+        vpushv(vtop - 4); /* ...  (b==-1)  a9 */
+        vpush(&sll);
+        vtop->r = VT_CONST;
+        vtop->c.i = (int64_t)((uint64_t)1 << 63);
+        gen_op(TOK_EQ); /* (a9 == LLONG_MIN) */
+        gen_op('&');    /* edge2 */
+        /* Stack: a2  b2  r2  (base|e1)  edge2 */
+        gen_op('|'); /* overflow */
+        /* Discard unused copies */
+        vrott(4);
+        vpop();
+        vpop();
+        vpop();
+      }
+
+      break;
+    }
+
+    /* 32-bit or smaller result: widen to long long, compute, truncate, compare */
+    /* Widen both operands to (unsigned) long long */
+    CType wide_type;
+    wide_type.ref = NULL;
+    wide_type.t = is_unsigned ? (VT_LLONG | VT_UNSIGNED) : VT_LLONG;
+
+    gen_cast(&wide_type); /* cast b */
+    vswap();
+    gen_cast(&wide_type); /* cast a */
+    vswap();
+    /* Stack: a_wide  b_wide */
+
+    gen_op(arith_tok);
+    /* Stack: wide_result */
+
+    vpushv(vtop); /* dup wide_result */
+    /* Stack: wide_result  wide_result2 */
+
+    gen_cast(&dummy_type); /* truncate copy to result type */
+    /* Stack: wide_result  truncated */
+
+    gen_cast(&wide_type); /* re-extend for comparison */
+    /* Stack: wide_result  extended */
+
+    gen_op(TOK_NE);
+    /* Stack: overflow_flag - this is our return value */
+
+    break;
+  }
+  case TOK_builtin_shuffle:
+  {
+    /* __builtin_shuffle(vec, mask) — 2-arg shuffle
+     * __builtin_shuffle(vec1, vec2, mask) — 3-arg shuffle
+     *
+     * Returns a vector where result[i] = source[mask[i] % N].
+     * For 3-arg form, source is the concatenation of vec1 and vec2 (size 2N),
+     * and mask values are taken modulo 2N.
+     */
+    next();
+    skip('(');
+    expr_eq(); /* first vector (vec1) */
+    skip(',');
+    expr_eq(); /* second arg (vec2 or mask) */
+
+    int has_two_sources = 0;
+    if (tok == ',')
+    {
+      has_two_sources = 1;
+      skip(',');
+      expr_eq(); /* third arg (mask) */
+    }
+    skip(')');
+
+    /* Pop args from vstack */
+    SValue mask_sv, vec1_sv, vec2_sv;
+    mask_sv = *vtop;
+    vtop--;
+    if (has_two_sources)
+    {
+      vec2_sv = *vtop;
+      vtop--;
+    }
+    vec1_sv = *vtop;
+    vtop--;
+
+    /* Type validation */
+    if (!is_vector_type(&vec1_sv.type))
+      tcc_error("__builtin_shuffle arguments must be vectors");
+    if (has_two_sources && !is_vector_type(&vec2_sv.type))
+      tcc_error("__builtin_shuffle argument vectors must be of the same type");
+    if (!is_vector_type(&mask_sv.type))
+      tcc_error("__builtin_shuffle last argument must be an integer vector");
+
+    CType src_vec_type = vec1_sv.type;
+    CType src_elem_type = src_vec_type.ref->type;
+    int src_elem_size, src_elem_align;
+    src_elem_size = type_size(&src_elem_type, &src_elem_align);
+    int elem_count = vector_elem_count(&src_vec_type);
+    int vec_size = src_vec_type.ref->c;
+
+    CType mask_elem_type = mask_sv.type.ref->type;
+    int mask_elem_size, mask_elem_align;
+    mask_elem_size = type_size(&mask_elem_type, &mask_elem_align);
+    int mask_elem_count = vector_elem_count(&mask_sv.type);
+
+    if (elem_count != mask_elem_count)
+      tcc_error("__builtin_shuffle element count mismatch");
+
+    int total_src_elems = has_two_sources ? elem_count * 2 : elem_count;
+
+    /* For 3-arg form: concatenate vec1 and vec2 into a contiguous temp */
+    SValue concat_sv;
+    int concat_vr = 0;
+    if (has_two_sources)
+    {
+      int concat_loc;
+      int concat_size = vec_size * 2;
+      concat_loc = get_temp_local_var(concat_size, concat_size > 8 ? 8 : concat_size, &concat_vr);
+
+      memset(&concat_sv, 0, sizeof(concat_sv));
+      concat_sv.type = src_vec_type;
+      concat_sv.r = VT_LOCAL | VT_LVAL;
+      concat_sv.vr = concat_vr;
+      concat_sv.c.i = concat_loc;
+
+      /* Copy vec1 elements to concat[0..N-1] */
+      for (int i = 0; i < elem_count; i++)
+      {
+        vpushv(&vec1_sv);
+        gaddrof();
+        vtop->type = char_pointer_type;
+        vpushi(i * src_elem_size);
+        gen_op('+');
+        vtop->type = src_elem_type;
+        vtop->r |= VT_LVAL;
+
+        vpushv(&concat_sv);
+        gaddrof();
+        vtop->type = char_pointer_type;
+        vpushi(i * src_elem_size);
+        gen_op('+');
+        vtop->type = src_elem_type;
+        vtop->r |= VT_LVAL;
+
+        vswap();
+        vstore();
+        vpop();
+      }
+
+      /* Copy vec2 elements to concat[N..2N-1] */
+      for (int i = 0; i < elem_count; i++)
+      {
+        vpushv(&vec2_sv);
+        gaddrof();
+        vtop->type = char_pointer_type;
+        vpushi(i * src_elem_size);
+        gen_op('+');
+        vtop->type = src_elem_type;
+        vtop->r |= VT_LVAL;
+
+        vpushv(&concat_sv);
+        gaddrof();
+        vtop->type = char_pointer_type;
+        vpushi((elem_count + i) * src_elem_size);
+        gen_op('+');
+        vtop->type = src_elem_type;
+        vtop->r |= VT_LVAL;
+
+        vswap();
+        vstore();
+        vpop();
+      }
+    }
+
+    /* Allocate result vector temp */
+    int res_vr, res_loc;
+    res_loc = get_temp_local_var(vec_size, vec_size > 8 ? 8 : vec_size, &res_vr);
+
+    /* For each output element i: result[i] = source[mask[i] % total_src_elems] */
+    for (int i = 0; i < elem_count; i++)
+    {
+      /* Load mask[i] */
+      vpushv(&mask_sv);
+      gaddrof();
+      vtop->type = char_pointer_type;
+      vpushi(i * mask_elem_size);
+      gen_op('+');
+      vtop->type = mask_elem_type;
+      vtop->r |= VT_LVAL;
+
+      /* Cast to unsigned int for index computation */
+      {
+        CType uint_type;
+        uint_type.t = VT_INT | VT_UNSIGNED;
+        uint_type.ref = NULL;
+        gen_cast(&uint_type);
+      }
+
+      /* Compute index = mask_val & (total_src_elems - 1)
+       * This is equivalent to % total_src_elems when total_src_elems is
+       * a power of 2, which is always the case for GCC vector types. */
+      vpushi(total_src_elems - 1);
+      gen_op('&');
+
+      /* Compute byte_offset = index * src_elem_size */
+      if (src_elem_size > 1)
+      {
+        vpushi(src_elem_size);
+        gen_op('*');
+      }
+      /* vtop = byte_offset */
+
+      /* Compute source base address + byte_offset */
+      if (has_two_sources)
+      {
+        vpushv(&concat_sv);
+        gaddrof();
+        vtop->type = char_pointer_type;
+      }
+      else
+      {
+        vpushv(&vec1_sv);
+        gaddrof();
+        vtop->type = char_pointer_type;
+      }
+      /* Stack: byte_offset, base_addr */
+      vswap();
+      gen_op('+');
+      vtop->type = src_elem_type;
+      vtop->r |= VT_LVAL;
+      /* vtop = source[index] (lvalue) */
+
+      /* Store to result[i] */
+      {
+        SValue res_base;
+        memset(&res_base, 0, sizeof(res_base));
+        res_base.type = src_vec_type;
+        res_base.r = VT_LOCAL | VT_LVAL;
+        res_base.vr = res_vr;
+        res_base.c.i = res_loc;
+
+        vpushv(&res_base);
+        gaddrof();
+        vtop->type = char_pointer_type;
+        vpushi(i * src_elem_size);
+        gen_op('+');
+        vtop->type = src_elem_type;
+        vtop->r |= VT_LVAL;
+      }
+
+      vswap();
+      vstore();
+      vpop();
+    }
+
+    /* Push result vector as a local lvalue */
+    {
+      SValue result;
+      memset(&result, 0, sizeof(result));
+      result.type = src_vec_type;
+      result.r = VT_LOCAL | VT_LVAL;
+      result.vr = res_vr;
+      result.c.i = res_loc;
+      vpushv(&result);
+    }
+    break;
+  }
+  case TOK_builtin_conjf:
+  case TOK_builtin_conj:
+  case TOK_builtin_conjl:
+  {
+    int tok1 = tok;
+    parse_builtin_params(0, "e");
+
+    /* Verify the argument is a complex type */
+    if (!(vtop->type.t & VT_COMPLEX))
+    {
+      tcc_error("__builtin_conj%s expects a complex argument", (tok1 == TOK_builtin_conjf)   ? "f"
+                                                               : (tok1 == TOK_builtin_conjl) ? "l"
+                                                                                             : "");
+    }
+
+    gen_complex_conjugate();
+    break;
+  }
+  case TOK_builtin_prefetch:
+  {
+    /* __builtin_prefetch(address, rw, locality)
+     *   address: pointer to memory to prefetch
+     *   rw: 0 for read (default), 1 for write
+     *   locality: 0-3, with 3 being highest locality (default)
+     *
+     * On ARM, we emit PLD (Preload Data) for read hints and PLDW (Preload Data with
+     * intent to Write) for write hints. The locality hint is currently ignored
+     * as ARM PLD/PLDW don't have locality levels like x86.
+     */
+    next();
+    skip('(');
+    expr_eq(); /* address - required */
+
+    int rw = 0;       /* default: read */
+    int locality = 3; /* default: high locality */
+
+    if (tok == ',')
+    {
+      next();
+      expr_eq(); /* rw - optional */
+      rw = vtop->c.i != 0;
+      vpop();
+    }
+    if (tok == ',')
+    {
+      next();
+      expr_eq(); /* locality - optional */
+      locality = (int)vtop->c.i;
+      if (locality < 0)
+        locality = 0;
+      if (locality > 3)
+        locality = 3;
+      vpop();
+    }
+    skip(')');
+
+    /* Ensure address is a pointer type */
+    convert_parameter_type(&vtop->type);
+
+    if (tcc_state->ir)
+    {
+      /* Emit PREFETCH IR instruction - backend will generate PLD/PLDW */
+      /* Store rw hint in src2.c.i (0=read, 1=write) */
+      SValue rw_hint;
+      svalue_init(&rw_hint);
+      rw_hint.type.t = VT_INT;
+      rw_hint.r = VT_CONST;
+      rw_hint.c.i = rw;
+      rw_hint.vr = -1;
+
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_PREFETCH, vtop, &rw_hint, NULL);
+    }
+
+    /* Pop the address and push void (prefetch returns nothing) */
+    vpop();
+    type.t = VT_VOID;
+    vpush(&type);
+    break;
+  }
   case TOK_builtin_frame_address:
   case TOK_builtin_return_address:
   {
@@ -8264,14 +12474,20 @@ tok_next:
   case TOK_builtin_va_arg:
   {
     /* ARM32 __builtin_va_arg intrinsic.
-     * For normal types:   *(type *)__va_arg(ap, sizeof(type), __alignof__(type))
-     * For VLA structs:    *(type *)(*(void **)__va_arg(ap, sizeof(void*), __alignof__(void*)))
+     * va_list is now a simple char pointer (GCC-compatible ABI).
+     * For normal types:   *(type *)__tcc_va_arg(&ap, sizeof(type), __alignof__(type))
+     * For VLA structs:    *(type *)(*(void **)__tcc_va_arg(&ap, sizeof(void*), __alignof__(void*)))
      *
      * VLA structs are passed by invisible reference (a pointer) by the
      * caller, so va_arg reads a 4-byte pointer and dereferences it. */
     parse_builtin_params(0, "et");
     type = vtop->type;
     vpop(); /* pop type placeholder; vtop = ap */
+
+    /* Take address of ap: va_list is char*, so &ap gives char**.
+     * __tcc_va_arg needs char** to advance the pointer. */
+    mk_pointer(&vtop->type);
+    gaddrof();
 
     int is_vla_struct = ((type.t & VT_BTYPE) == VT_STRUCT) && struct_has_vla_member(&type);
     int va_size, va_align;
@@ -8285,14 +12501,18 @@ tok_next:
     else
     {
       va_size = type_size(&type, &va_align);
+      /* Use AAPCS natural alignment for va_arg — only the alignment
+       * coming from fundamental member types counts for double-word
+       * alignment, not __attribute__((aligned)) on the struct. */
+      va_align = compute_aapcs_natural_alignment(&type);
     }
 
-    /* Generate call: __va_arg(ap, size, align) → void*
-     * vstack: [ap] → [ap, size, align, func] */
+    /* Generate call: __tcc_va_arg(&ap, size, align) → void*
+     * vstack: [&ap] → [&ap, size, align, func] */
     vpushi(va_size);
     vpushi(va_align);
-    vpush_helper_func(TOK___va_arg);
-    /* vstack: ap=vtop[-3], size=vtop[-2], align=vtop[-1], func=vtop */
+    vpush_helper_func(TOK___tcc_va_arg);
+    /* vstack: &ap=vtop[-3], size=vtop[-2], align=vtop[-1], func=vtop */
     {
       SValue param_num;
       SValue dest;
@@ -8301,7 +12521,7 @@ tok_next:
       param_num.vr = -1;
       param_num.r = VT_CONST;
 
-      /* param 0: ap */
+      /* param 0: &ap */
       param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
       tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-3], &param_num, NULL);
       /* param 1: size */
@@ -8320,7 +12540,7 @@ tok_next:
       tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &call_id_sv, &dest);
 
       /* Pop func + 3 args, push result */
-      vtop -= 3; /* remove ap, size, align; vtop is now func → overwrite */
+      vtop -= 3; /* remove &ap, size, align; vtop is now func → overwrite */
       vtop->type.t = VT_PTR;
       vtop->vr = dest.vr;
       vtop->r = REG_IRET;
@@ -8741,6 +12961,7 @@ tok_next:
       test_lvalue();
       /* expect pointer on structure */
       next();
+      CType struct_type = vtop->type; /* save before find_field/type changes */
       s = find_field(&vtop->type, tok, &cumofs);
       /* add field offset to pointer */
       if (struct_has_vla_member(&vtop->type) && (vtop->r & VT_VALMASK) == VT_LOCAL)
@@ -8757,13 +12978,87 @@ tok_next:
         gaddrof();
         vtop->type = char_pointer_type; /* change type to 'char *' */
       }
-      vpushi(cumofs);
-      gen_op('+');
+      /* Check if any VLA field precedes the target field.  If so, the
+         compile-time cumofs does not account for VLA field sizes and we
+         must compute the full offset dynamically at runtime. */
+      {
+        int has_preceding_vla = 0;
+        if ((struct_type.t & VT_BTYPE) == VT_STRUCT && struct_has_vla_member(&struct_type) &&
+            struct_type.ref->type.t != VT_UNION)
+        {
+          Sym *f;
+          for (f = struct_type.ref->next; f && f != s; f = f->next)
+          {
+            if (f->type.t & VT_VLA)
+            {
+              has_preceding_vla = 1;
+              break;
+            }
+          }
+        }
+        if (has_preceding_vla)
+        {
+          /* Walk all fields in order, computing the cumulative byte
+             offset at runtime.  For each field we align to its
+             required alignment, then (unless it is the target) add
+             its runtime or compile-time size. */
+          Sym *f;
+          vpushi(0); /* running integer offset */
+          for (f = struct_type.ref->next; f; f = f->next)
+          {
+            int f_align, f_size;
+            if (f->type.t & VT_VLA)
+            {
+              f_size = 0; /* determined at runtime */
+              type_size(&f->type.ref->type, &f_align);
+            }
+            else
+            {
+              f_size = type_size(&f->type, &f_align);
+              if (f_size < 0)
+                f_size = 0;
+            }
+            /* honour explicit alignment attribute on the field */
+            if (f->a.aligned)
+            {
+              int ea = 1 << (f->a.aligned - 1);
+              if (ea > f_align)
+                f_align = ea;
+            }
+            /* runtime: offset = (offset + align-1) & -align */
+            if (f_align > 1)
+            {
+              vpushi(f_align - 1);
+              gen_op('+');
+              vpushi(~(f_align - 1));
+              gen_op('&');
+            }
+            if (f == s)
+              break; /* aligned to target field — done */
+            /* add this field's size to the running offset */
+            if (f->type.t & VT_VLA)
+            {
+              vset(&int_type, VT_LOCAL | VT_LVAL, f->type.ref->c);
+            }
+            else
+            {
+              vpushi(f_size);
+            }
+            gen_op('+');
+          }
+          gen_op('+'); /* pointer + computed_offset */
+        }
+        else
+        {
+          vpushi(cumofs);
+          gen_op('+');
+        }
+      }
       /* change type to field type, and set to lvalue */
       vtop->type = s->type;
       vtop->type.t |= qualifiers;
-      /* an array is never an lvalue */
-      if (!(vtop->type.t & VT_ARRAY))
+      /* an array (or VLA) is never an lvalue */
+      if (!(vtop->type.t & (VT_ARRAY | VT_VLA)))
       {
         vtop->r |= VT_LVAL;
 #ifdef CONFIG_TCC_BCHECK
@@ -8877,8 +13172,8 @@ tok_next:
 
       sa = s->next; /* first parameter */
       nb_args = regsize = 0;
-      /* compute first implicit argument if a structure is returned */
-      if ((s->type.t & VT_BTYPE) == VT_STRUCT)
+      /* compute first implicit argument if a composite type is returned */
+      if ((s->type.t & VT_BTYPE) == VT_STRUCT || (s->type.t & VT_COMPLEX))
       {
         variadic = (s->f.func_type == FUNC_ELLIPSIS);
         ret_nregs = gfunc_sret(&s->type, variadic, &ret.type, &ret_align, &regsize);
@@ -8954,18 +13249,109 @@ tok_next:
       SValue saved_args[8];
       int saved_arg_count = 0;
       int can_try_fold = 0;
+      int can_inline_eval = 0;
       const char *func_name = NULL;
 
       /* Check if we have a named function that might be foldable */
       if (call_func_sym && call_func_sym->v >= TOK_IDENT)
       {
         func_name = get_tok_str(call_func_sym->v, NULL);
+
+        /* Calling alloca() (library version) modifies SP; the caller
+         * needs a frame pointer so the epilogue can restore SP. */
+        if (func_name && strcmp(func_name, "alloca") == 0 && tcc_state->ir)
+          tcc_state->force_frame_pointer = 1;
+
         /* Quick check if this could be a foldable math function */
         if (func_name && (func_name[0] == 's' || func_name[0] == 'c' || func_name[0] == 't' || func_name[0] == 'a' ||
                           func_name[0] == 'e' || func_name[0] == 'l' || func_name[0] == 'p' || func_name[0] == 'f' ||
                           func_name[0] == 'r' || func_name[0] == 't'))
         {
           can_try_fold = 1;
+        }
+      }
+
+      /* Check if the callee is a small inline function we might evaluate */
+      if (call_func_sym && (call_func_sym->type.t & VT_INLINE) && tcc_state->optimize)
+        can_inline_eval = 1;
+
+      /* Detect printf-family functions that can be optimized.
+       * We recognize standard (printf, fprintf), v-variants (vprintf, vfprintf),
+       * and fortified (_chk) variants.
+       * For each, we track the index of key arguments in saved_args[].
+       * For v-variants, varargs are in a va_list (opaque), so pf_vararg_idx is
+       * set past the arg count to prevent %s/%c optimization — only constant
+       * format strings without specifiers can be optimized. */
+      int can_optimize_printf_family = 0;
+      int pf_fmt_idx = -1;    /* index of the format string in saved_args[] */
+      int pf_file_idx = -1;   /* index of FILE* arg, or -1 for stdout */
+      int pf_vararg_idx = -1; /* index of first vararg in saved_args[], or high value for va_list fns */
+      int pf_min_args = 0;    /* minimum number of args for a valid call */
+      if (func_name && tcc_state->optimize > 0)
+      {
+        /* --- printf family (stdout, variadic) --- */
+        if (strcmp(func_name, "printf") == 0)
+        {
+          can_optimize_printf_family = 1;
+          pf_fmt_idx = 0;
+          pf_vararg_idx = 1;
+          pf_min_args = 1;
+        }
+        else if (strcmp(func_name, "__printf_chk") == 0)
+        {
+          can_optimize_printf_family = 1;
+          pf_fmt_idx = 1; /* [0]=flag */
+          pf_vararg_idx = 2;
+          pf_min_args = 2;
+        }
+        /* --- fprintf family (FILE*, variadic) --- */
+        else if (strcmp(func_name, "fprintf") == 0)
+        {
+          can_optimize_printf_family = 1;
+          pf_file_idx = 0;
+          pf_fmt_idx = 1;
+          pf_vararg_idx = 2;
+          pf_min_args = 2;
+        }
+        else if (strcmp(func_name, "__fprintf_chk") == 0)
+        {
+          can_optimize_printf_family = 1;
+          pf_file_idx = 0;
+          pf_fmt_idx = 2; /* [1]=flag */
+          pf_vararg_idx = 3;
+          pf_min_args = 3;
+        }
+        /* --- vprintf family (stdout, va_list — no vararg access) --- */
+        else if (strcmp(func_name, "vprintf") == 0)
+        {
+          can_optimize_printf_family = 1;
+          pf_fmt_idx = 0;
+          pf_vararg_idx = 99; /* va_list: varargs inaccessible */
+          pf_min_args = 2;    /* fmt + va_list */
+        }
+        else if (strcmp(func_name, "__vprintf_chk") == 0)
+        {
+          can_optimize_printf_family = 1;
+          pf_fmt_idx = 1; /* [0]=flag */
+          pf_vararg_idx = 99;
+          pf_min_args = 3; /* flag + fmt + va_list */
+        }
+        /* --- vfprintf family (FILE*, va_list — no vararg access) --- */
+        else if (strcmp(func_name, "vfprintf") == 0)
+        {
+          can_optimize_printf_family = 1;
+          pf_file_idx = 0;
+          pf_fmt_idx = 1;
+          pf_vararg_idx = 99;
+          pf_min_args = 3; /* file + fmt + va_list */
+        }
+        else if (strcmp(func_name, "__vfprintf_chk") == 0)
+        {
+          can_optimize_printf_family = 1;
+          pf_file_idx = 0;
+          pf_fmt_idx = 2; /* [1]=flag */
+          pf_vararg_idx = 99;
+          pf_min_args = 4; /* file + flag + fmt + va_list */
         }
       }
 
@@ -8977,6 +13363,271 @@ tok_next:
        * Used by try_inline_builtin_call to roll back only FUNCPARAMVAL ops
        * while preserving argument evaluation IR. */
       int ir_idx_before_first_param = -1;
+
+      /* __builtin_va_arg_pack() expansion: if the callee is an always_inline
+       * function that uses __builtin_va_arg_pack(), we must create a specialized
+       * clone for this call site with the variadic args baked in.
+       *
+       * Strategy:
+       * 1. Save all argument tokens from the call site
+       * 2. Count named (fixed) parameters of the callee
+       * 3. Split into fixed arg tokens and variadic arg tokens
+       * 4. Create a clone of the inline function's token stream with
+       *    __builtin_va_arg_pack() replaced by the variadic arg tokens
+       * 5. Register the clone as a new inline function
+       * 6. Change the call target to the clone
+       * 7. Replay only the fixed arg tokens for normal call parsing
+       */
+      if (call_func_sym && call_func_sym->type.ref && call_func_sym->type.ref->f.func_va_arg_pack &&
+          (call_func_sym->type.t & VT_INLINE))
+      {
+        /* Find the InlineFunc for this symbol */
+        struct InlineFunc *orig_fn = NULL;
+        for (int fi = 0; fi < tcc_state->nb_inline_fns; fi++)
+        {
+          if (tcc_state->inline_fns[fi]->sym == call_func_sym)
+          {
+            orig_fn = tcc_state->inline_fns[fi];
+            break;
+          }
+        }
+
+        if (orig_fn && orig_fn->func_str)
+        {
+          /* Count named params */
+          int n_named = 0;
+          Sym *param;
+          for (param = call_func_sym->type.ref->next; param; param = param->next)
+            n_named++;
+
+          /* Save all argument tokens (everything until matching ')') */
+          TokenString *all_args = tok_str_alloc();
+          int paren_depth = 0;
+          while (tok != ')' || paren_depth > 0)
+          {
+            if (tok == '(')
+              paren_depth++;
+            else if (tok == ')')
+              paren_depth--;
+            if (tok == TOK_EOF)
+              tcc_error("unexpected end of file in function call");
+            tok_str_add_tok(all_args);
+            next();
+          }
+          tok_str_add(all_args, TOK_EOF);
+          /* tok is now ')' - don't consume it; file position is past ')' */
+
+          /* Split into fixed args and variadic args.
+           * Fixed args are separated by commas at depth 0. */
+          const int *ap = tok_str_buf(all_args);
+          TokenString *fixed_args = tok_str_alloc();
+          TokenString *va_args = tok_str_alloc();
+
+          int arg_idx = 0;
+          int depth = 0;
+
+          if (n_named == 0)
+          {
+            /* All args are variadic, no fixed args */
+            const int *cp = tok_str_buf(all_args);
+            while (1)
+            {
+              int t;
+              CValue cv;
+              tok_get(&t, &cp, &cv);
+              if (t == TOK_EOF || t == 0)
+                break;
+              tok_str_add2(va_args, t, &cv);
+            }
+          }
+          else
+          {
+            while (1)
+            {
+              int t;
+              CValue cv;
+              tok_get(&t, &ap, &cv);
+
+              if (t == TOK_EOF || t == 0)
+                break;
+
+              if (t == '(' || t == '[')
+                depth++;
+              else if (t == ')' || t == ']')
+                depth--;
+
+              if (t == ',' && depth == 0)
+              {
+                arg_idx++;
+                if (arg_idx == n_named)
+                {
+                  /* Everything after this comma is variadic args */
+                  while (1)
+                  {
+                    tok_get(&t, &ap, &cv);
+                    if (t == TOK_EOF || t == 0)
+                      break;
+                    tok_str_add2(va_args, t, &cv);
+                  }
+                  break;
+                }
+                /* Copy the comma to fixed_args */
+                tok_str_add2(fixed_args, t, &cv);
+                continue;
+              }
+
+              if (arg_idx < n_named)
+                tok_str_add2(fixed_args, t, &cv);
+            }
+          }
+
+          /* Terminate fixed_args with ')' and 0 (macro end marker).
+           * The arg parsing loop will see ')' and break.
+           * Then next() will read 0, triggering end_macro() which
+           * restores reading from the source file (positioned after ')'). */
+          tok_str_add(fixed_args, ')');
+          tok_str_add(fixed_args, 0);
+          tok_str_add(va_args, TOK_EOF);
+
+          /* Check if variadic args are empty */
+          int va_args_empty = 1;
+          {
+            const int *vcheck = tok_str_buf(va_args);
+            int vt;
+            CValue vcv;
+            tok_get(&vt, &vcheck, &vcv);
+            if (vt != TOK_EOF && vt != 0)
+              va_args_empty = 0;
+          }
+
+          /* Create clone body: copy orig_fn->func_str, replacing
+           * __builtin_va_arg_pack ( ) with variadic arg tokens.
+           * When variadic args are empty, also remove the preceding comma. */
+          TokenString *clone_body = tok_str_alloc();
+          const int *bp = tok_str_buf(orig_fn->func_str);
+          int last_comma_len = -1; /* clone_body->len before last ',' was added */
+          while (1)
+          {
+            int t;
+            CValue cv;
+            tok_get(&t, &bp, &cv);
+            if (t == TOK_EOF || t == 0)
+              break;
+
+            if (t == TOK_builtin_va_arg_pack)
+            {
+              /* Skip the following '(' and ')' tokens */
+              int t2;
+              CValue cv2;
+              tok_get(&t2, &bp, &cv2); /* skip '(' */
+              tok_get(&t2, &bp, &cv2); /* skip ')' */
+
+              if (va_args_empty)
+              {
+                /* Remove preceding comma if present */
+                if (last_comma_len >= 0)
+                  clone_body->len = last_comma_len;
+              }
+              else
+              {
+                /* Insert variadic arg tokens */
+                const int *vp = tok_str_buf(va_args);
+                while (1)
+                {
+                  int vt;
+                  CValue vcv;
+                  tok_get(&vt, &vp, &vcv);
+                  if (vt == TOK_EOF || vt == 0)
+                    break;
+                  tok_str_add2(clone_body, vt, &vcv);
+                }
+              }
+              last_comma_len = -1;
+              continue;
+            }
+
+            if (t == ',')
+              last_comma_len = clone_body->len;
+            else
+              last_comma_len = -1;
+
+            tok_str_add2(clone_body, t, &cv);
+          }
+          tok_str_add(clone_body, TOK_EOF);
+
+          /* Create a unique symbol for the clone */
+          static int va_pack_clone_id = 0;
+          char clone_name[256];
+          snprintf(clone_name, sizeof(clone_name), "__va_pack_%s_%d", get_tok_str(call_func_sym->v, NULL),
+                   va_pack_clone_id++);
+          int clone_tok_id = tok_alloc(clone_name, strlen(clone_name))->tok;
+
+          /* Create clone function type: same as original but non-variadic */
+          CType clone_type;
+          clone_type = call_func_sym->type;
+
+          /* Create a new type ref with FUNC_NEW (non-variadic) */
+          Sym *orig_ref = call_func_sym->type.ref;
+          Sym *clone_ref = sym_push2(&global_stack, SYM_FIELD, orig_ref->type.t, 0);
+          clone_ref->type = orig_ref->type;
+          clone_ref->f = orig_ref->f;
+          clone_ref->f.func_type = FUNC_NEW; /* non-variadic */
+          clone_ref->f.func_va_arg_pack = 0;
+
+          /* Copy named parameters */
+          Sym **pparam = &clone_ref->next;
+          for (param = orig_ref->next; param; param = param->next)
+          {
+            Sym *new_param = sym_push2(&global_stack, param->v, param->type.t, param->c);
+            new_param->type = param->type;
+            *pparam = new_param;
+            pparam = &new_param->next;
+          }
+          *pparam = NULL;
+
+          clone_type.ref = clone_ref;
+          clone_type.t &= ~VT_EXTERN;
+          clone_type.t |= VT_STATIC;
+
+          /* Create clone symbol */
+          AttributeDef clone_ad;
+          memset(&clone_ad, 0, sizeof(clone_ad));
+          Sym *clone_sym = external_sym(clone_tok_id, &clone_type, 0, &clone_ad);
+          clone_sym->type.t |= VT_INLINE;
+
+          /* Register clone as inline function */
+          struct InlineFunc *clone_fn;
+          clone_fn = tcc_malloc(sizeof *clone_fn + strlen(orig_fn->filename));
+          strcpy(clone_fn->filename, orig_fn->filename);
+          clone_fn->sym = clone_sym;
+          clone_fn->func_str = clone_body;
+          dynarray_add(&tcc_state->inline_fns, &tcc_state->nb_inline_fns, clone_fn);
+
+          /* Mark the clone as used so gen_inline_functions compiles it */
+          if (!clone_sym->c)
+            put_extern_sym(clone_sym, cur_text_section ? cur_text_section : text_section, 0, 0);
+
+          /* Switch call target: replace vtop (function pointer) with clone */
+          vtop->type = clone_type;
+          vtop->sym = clone_sym;
+          vtop->r = VT_CONST | VT_SYM;
+          vtop->c.i = 0;
+
+          /* Update s (callee type ref) for argument parsing */
+          s = clone_ref;
+          sa = s->next;
+          call_func_sym = clone_sym;
+
+          /* Replay fixed args + ')' via macro so normal call parsing handles them.
+           * When the macro ends (0 marker), next() restores file-level reading
+           * at the position just past the original ')'. */
+          begin_macro(fixed_args, 1);
+          next(); /* prime first token from fixed_args */
+
+          tok_str_free(all_args);
+          tok_str_free(va_args);
+        }
+      }
 
       p = NULL;
       if (tok != ')')
@@ -9003,8 +13654,9 @@ tok_next:
               tcc_ir_codegen_cmp_jmp_set(tcc_state->ir);
             gfunc_param_typed(s, sa);
 
-            /* Save argument for potential constant folding */
-            if (can_try_fold && saved_arg_count < 8 && !NOEVAL_WANTED)
+            /* Save argument for potential constant folding or inline evaluation */
+            if ((can_try_fold || can_inline_eval || can_optimize_printf_family) && saved_arg_count < 8 &&
+                !NOEVAL_WANTED)
             {
               saved_args[saved_arg_count++] = *vtop;
             }
@@ -9048,8 +13700,9 @@ tok_next:
           expr_eq();
           gfunc_param_typed(s, sa);
 
-          /* Save argument for potential constant folding (in reverse order for reverse_funcargs) */
-          if (can_try_fold && n < 8 && !NOEVAL_WANTED)
+          /* Save argument for potential constant folding or inline evaluation (in reverse order for reverse_funcargs)
+           */
+          if ((can_try_fold || can_inline_eval || can_optimize_printf_family) && n < 8 && !NOEVAL_WANTED)
           {
             saved_args[nb_args - 1 - n] = *vtop;
             if (n == 0)
@@ -9119,6 +13772,345 @@ tok_next:
         }
       }
 
+      /* Try compile-time evaluation of small inline functions called with
+       * constant arguments.  This enables patterns like:
+       *   inline int f(int x) { return __builtin_constant_p(x); }
+       *   int g(void) { return f(1); }  // returns 1 at -O1
+       */
+      int inline_evaled = 0;
+      if (!folded && !inlined && call_func_sym && saved_arg_count == nb_args && !NOEVAL_WANTED)
+      {
+        if (try_inline_const_eval(call_func_sym, saved_args, saved_arg_count))
+        {
+          /* Result is on vtop; move over function pointer and roll back IR */
+          vtop[-1] = vtop[0];
+          --vtop;
+          tcc_state->ir->next_instruction_index = ir_idx_before_args;
+          inline_evaled = 1;
+        }
+      }
+
+      /* Try optimizing printf-family calls with simple constant format strings.
+       * GCC optimizes these patterns when the return value is not used:
+       *   printf/fprintf("literal")      → puts/fwrite (no specifiers)
+       *   printf/fprintf("%s", str)      → puts/fwrite (constant string)
+       *   printf/fprintf("%c", ch)       → putchar/fputc
+       *   printf("%s\n", str)            → puts(str)
+       * Also handles __printf_chk/__fprintf_chk (extra flag argument).
+       * Only optimize in void context (next token is ';'). */
+      int printf_family_optimized = 0;
+      if (!folded && !inlined && !inline_evaled && can_optimize_printf_family && saved_arg_count == nb_args &&
+          nb_args >= pf_min_args && !nocode_wanted && tok == ';')
+      {
+        int fmt_len = 0;
+        const char *fmt = try_get_constant_string(&saved_args[pf_fmt_idx], &fmt_len);
+        if (fmt)
+        {
+          int has_file = (pf_file_idx >= 0); /* fprintf-family vs printf-family */
+          int has_varargs = (nb_args > pf_vararg_idx);
+
+          /* Classify the format pattern:
+           *  PF_OPT_NOP           = empty output
+           *  PF_OPT_PUTCHAR_CONST = putchar/fputc with a constant char
+           *  PF_OPT_FWRITE        = fwrite (fprintf-family) or puts (printf-family, trailing \n)
+           *  PF_OPT_PUTCHAR_ARG   = putchar/fputc from %c vararg
+           *  PF_OPT_PUTS_ARG      = puts from %s\n vararg */
+          enum
+          {
+            PF_OPT_NONE = 0,
+            PF_OPT_NOP,
+            PF_OPT_PUTCHAR_CONST,
+            PF_OPT_FWRITE,
+            PF_OPT_PUTS_CHOPPED,
+            PF_OPT_PUTCHAR_ARG,
+            PF_OPT_PUTS_ARG
+          };
+          int opt_kind = PF_OPT_NONE;
+          int putchar_val = 0;
+          /* For fwrite: which SValue to write and its known length */
+          SValue *write_str_sv = NULL;
+          int write_len = 0;
+          /* For puts with trailing-\n chopped: the string to analyze */
+          const char *puts_src = NULL;
+          int puts_src_len = 0;
+
+          if (strchr(fmt, '%') == NULL)
+          {
+            /* No format specifiers — output is the format string itself */
+            if (fmt_len == 0)
+            {
+              opt_kind = PF_OPT_NOP;
+            }
+            else if (has_file)
+            {
+              opt_kind = PF_OPT_FWRITE;
+              write_str_sv = &saved_args[pf_fmt_idx];
+              write_len = fmt_len;
+            }
+            else if (fmt_len == 1)
+            {
+              opt_kind = PF_OPT_PUTCHAR_CONST;
+              putchar_val = (unsigned char)fmt[0];
+            }
+            else if (fmt[fmt_len - 1] == '\n')
+            {
+              opt_kind = PF_OPT_PUTS_CHOPPED;
+              puts_src = fmt;
+              puts_src_len = fmt_len;
+            }
+            /* else: multi-char without trailing \n to stdout → not optimized */
+          }
+          else if (strcmp(fmt, "%s") == 0 && has_varargs)
+          {
+            int slen = 0;
+            const char *sval = try_get_constant_string(&saved_args[pf_vararg_idx], &slen);
+            if (sval)
+            {
+              if (slen == 0)
+              {
+                opt_kind = PF_OPT_NOP;
+              }
+              else if (has_file)
+              {
+                opt_kind = PF_OPT_FWRITE;
+                write_str_sv = &saved_args[pf_vararg_idx];
+                write_len = slen;
+              }
+              else if (slen == 1)
+              {
+                opt_kind = PF_OPT_PUTCHAR_CONST;
+                putchar_val = (unsigned char)sval[0];
+              }
+              else if (sval[slen - 1] == '\n')
+              {
+                opt_kind = PF_OPT_PUTS_CHOPPED;
+                puts_src = sval;
+                puts_src_len = slen;
+              }
+            }
+            /* non-constant string → skip */
+          }
+          else if (strcmp(fmt, "%c") == 0 && has_varargs)
+          {
+            opt_kind = PF_OPT_PUTCHAR_ARG;
+          }
+          else if (!has_file && strcmp(fmt, "%s\n") == 0 && has_varargs)
+          {
+            opt_kind = PF_OPT_PUTS_ARG; /* puts appends \n automatically */
+          }
+
+          if (opt_kind != PF_OPT_NONE)
+          {
+            /* Remove FUNCPARAMVAL ops while preserving argument-evaluation IR.
+             * With forward args, arg-evaluation IR for args 1+ is interleaved
+             * with FUNCPARAMVALs.  A blanket rollback of next_instruction_index
+             * would also erase those definitions (e.g. LEA for &a[1]), leaving
+             * dangling vreg references.  Instead, NOP out only the FUNCPARAMVAL
+             * instructions for the original call. */
+            if (ir_idx_before_first_param >= 0)
+            {
+              int current_end = tcc_state->ir->next_instruction_index;
+              for (int i = ir_idx_before_first_param; i < current_end; i++)
+              {
+                if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
+                {
+                  /* Only NOP FUNCPARAMVALs belonging to the original call_id,
+                   * not those from nested calls (e.g., memcmp inside printf). */
+                  IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
+                  int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
+                  if (encoded_call_id == call_id)
+                    tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
+                }
+              }
+            }
+            else
+            {
+              tcc_state->ir->next_instruction_index = ir_idx_before_args;
+            }
+
+            if (opt_kind == PF_OPT_NOP)
+            {
+              /* Empty output — no call needed, push dummy result */
+              vpushi(0);
+              vtop[-1] = vtop[0];
+              --vtop;
+            }
+            else if (opt_kind == PF_OPT_PUTCHAR_CONST)
+            {
+              /* putchar(constant_char) or fputc(constant_char, f) */
+              SValue param_num;
+              const int new_call_id = tcc_state->ir->next_call_id++;
+              svalue_init(&param_num);
+              param_num.vr = -1;
+              param_num.r = VT_CONST;
+
+              SValue ch_sv;
+              svalue_init(&ch_sv);
+              ch_sv.r = VT_CONST;
+              ch_sv.c.i = putchar_val;
+              ch_sv.type.t = VT_INT;
+              ch_sv.vr = -1;
+
+              param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
+              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &ch_sv, &param_num, NULL);
+
+              if (has_file)
+              {
+                param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 1);
+                tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[pf_file_idx], &param_num, NULL);
+                vpush_helper_func(tok_alloc_const("fputc"));
+                SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 2);
+                tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[0], &call_id_sv, NULL);
+              }
+              else
+              {
+                vpush_helper_func(tok_alloc_const("putchar"));
+                SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 1);
+                tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[0], &call_id_sv, NULL);
+              }
+              --vtop;
+              vpushi(0);
+              vtop[-1] = vtop[0];
+              --vtop;
+            }
+            else if (opt_kind == PF_OPT_FWRITE)
+            {
+              /* fwrite(str, 1, len, f) — always goes to a FILE* */
+              SValue param_num;
+              const int new_call_id = tcc_state->ir->next_call_id++;
+              svalue_init(&param_num);
+              param_num.vr = -1;
+              param_num.r = VT_CONST;
+
+              /* param 0: const char *str */
+              param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
+              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, write_str_sv, &param_num, NULL);
+              /* param 1: size_t size = 1 */
+              SValue one_sv;
+              svalue_init(&one_sv);
+              one_sv.r = VT_CONST;
+              one_sv.c.i = 1;
+              one_sv.type.t = VT_INT;
+              one_sv.vr = -1;
+              param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 1);
+              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &one_sv, &param_num, NULL);
+              /* param 2: size_t count = write_len */
+              SValue len_sv;
+              svalue_init(&len_sv);
+              len_sv.r = VT_CONST;
+              len_sv.c.i = write_len;
+              len_sv.type.t = VT_INT;
+              len_sv.vr = -1;
+              param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 2);
+              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &len_sv, &param_num, NULL);
+              /* param 3: FILE *f */
+              param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 3);
+              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[pf_file_idx], &param_num, NULL);
+
+              vpush_helper_func(tok_alloc_const("fwrite"));
+              SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 4);
+              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[0], &call_id_sv, NULL);
+              --vtop;
+              vpushi(0);
+              vtop[-1] = vtop[0];
+              --vtop;
+            }
+            else if (opt_kind == PF_OPT_PUTS_CHOPPED)
+            {
+              /* puts(string_without_trailing_newline)
+               * Create a new string constant in rodata with the trailing \n removed.
+               * Copy puts_src first because it may point into rodata_section->data
+               * and section_ptr_add can reallocate that buffer. */
+              int new_len = puts_src_len - 1;
+              char *puts_copy = tcc_malloc(new_len);
+              memcpy(puts_copy, puts_src, new_len);
+              addr_t new_off = rodata_section->data_offset;
+              char *new_ptr = section_ptr_add(rodata_section, new_len + 1);
+              memcpy(new_ptr, puts_copy, new_len);
+              tcc_free(puts_copy);
+              new_ptr[new_len] = '\0';
+
+              SValue new_str_sv;
+              svalue_init(&new_str_sv);
+              new_str_sv.type = char_pointer_type;
+              new_str_sv.r = VT_CONST | VT_SYM;
+              new_str_sv.sym = get_sym_ref(&char_type, rodata_section, new_off, new_len + 1);
+              new_str_sv.c.i = 0;
+              new_str_sv.vr = -1;
+
+              SValue param_num;
+              const int new_call_id = tcc_state->ir->next_call_id++;
+              svalue_init(&param_num);
+              param_num.vr = -1;
+              param_num.r = VT_CONST;
+
+              param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
+              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &new_str_sv, &param_num, NULL);
+
+              vpush_helper_func(tok_alloc_const("puts"));
+              SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 1);
+              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[0], &call_id_sv, NULL);
+              --vtop;
+              vpushi(0);
+              vtop[-1] = vtop[0];
+              --vtop;
+            }
+            else if (opt_kind == PF_OPT_PUTCHAR_ARG)
+            {
+              /* putchar(arg) or fputc(arg, f) — for "%c" format */
+              SValue param_num;
+              const int new_call_id = tcc_state->ir->next_call_id++;
+              svalue_init(&param_num);
+              param_num.vr = -1;
+              param_num.r = VT_CONST;
+
+              param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
+              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[pf_vararg_idx], &param_num, NULL);
+
+              if (has_file)
+              {
+                param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 1);
+                tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[pf_file_idx], &param_num, NULL);
+                vpush_helper_func(tok_alloc_const("fputc"));
+                SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 2);
+                tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[0], &call_id_sv, NULL);
+              }
+              else
+              {
+                vpush_helper_func(tok_alloc_const("putchar"));
+                SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 1);
+                tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[0], &call_id_sv, NULL);
+              }
+              --vtop;
+              vpushi(0);
+              vtop[-1] = vtop[0];
+              --vtop;
+            }
+            else if (opt_kind == PF_OPT_PUTS_ARG)
+            {
+              /* puts(arg) — for "%s\n" format. puts() appends \n automatically. */
+              SValue param_num;
+              const int new_call_id = tcc_state->ir->next_call_id++;
+              svalue_init(&param_num);
+              param_num.vr = -1;
+              param_num.r = VT_CONST;
+
+              param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
+              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[pf_vararg_idx], &param_num, NULL);
+
+              vpush_helper_func(tok_alloc_const("puts"));
+              SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 1);
+              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[0], &call_id_sv, NULL);
+              --vtop;
+              vpushi(0);
+              vtop[-1] = vtop[0];
+              --vtop;
+            }
+            printf_family_optimized = 1;
+          }
+        }
+      }
+
       if (folded)
       {
         /* Constant folding succeeded – skip IR emission.
@@ -9131,12 +14123,187 @@ tok_next:
          * ops that were emitted for the (now-folded) arguments. */
         tcc_state->ir->next_instruction_index = ir_idx_before_args;
       }
-      else if (inlined)
+      else if (inlined || inline_evaled || printf_family_optimized)
       {
         /* Already handled above */
       }
+      else if (can_inline_eval && !NOEVAL_WANTED && call_func_sym && saved_arg_count == nb_args && tcc_state->ir &&
+               !tcc_state->in_inline_expansion)
+      {
+        /* ---- Token-level inline expansion ----
+         * Only expand inline functions whose body contains address-of-label
+         * (&&label).  This is the specific case where call-site inlining
+         * is required: each expansion must get unique label addresses.
+         * General inlining of all inline functions is left to
+         * gen_inline_functions() which compiles them as standalone funcs. */
+        struct InlineFunc *inline_fn = NULL;
+        for (int fi = 0; fi < tcc_state->nb_inline_fns; fi++)
+        {
+          if (tcc_state->inline_fns[fi]->sym == call_func_sym)
+          {
+            inline_fn = tcc_state->inline_fns[fi];
+            break;
+          }
+        }
+        /* Check if the body contains &&label (TOK_LAND followed by identifier) */
+        int has_addr_of_label = 0;
+        if (inline_fn && inline_fn->func_str)
+        {
+          const int *tp = tok_str_buf(inline_fn->func_str);
+          int prev_tok_val = 0;
+          while (*tp)
+          {
+            int tv;
+            CValue tcv;
+            tok_get(&tv, &tp, &tcv);
+            if (prev_tok_val == TOK_LAND && tv >= TOK_UIDENT)
+            {
+              has_addr_of_label = 1;
+              break;
+            }
+            prev_tok_val = tv;
+          }
+        }
+        if (inline_fn && inline_fn->func_str && has_addr_of_label)
+        {
+          /* --- 1. NOP out FUNCPARAMVALs for this call --- */
+          if (ir_idx_before_first_param >= 0)
+          {
+            int current_end = tcc_state->ir->next_instruction_index;
+            for (int ii = ir_idx_before_first_param; ii < current_end; ii++)
+            {
+              if (tcc_state->ir->compact_instructions[ii].op == TCCIR_OP_FUNCPARAMVAL)
+              {
+                IROperand src2 = tcc_ir_get_src2(tcc_state->ir, ii);
+                if (TCCIR_DECODE_CALL_ID(src2.u.imm32) == call_id)
+                  tcc_state->ir->compact_instructions[ii].op = TCCIR_OP_NOP;
+              }
+            }
+          }
+          else
+          {
+            /* No args — just roll back any FUNCPARAMVOID */
+            tcc_state->ir->next_instruction_index = ir_idx_before_args;
+          }
+
+          /* --- 2. Create parameter locals and store arguments --- */
+          Sym *saved_local = local_stack;
+          int saved_local_scope = local_scope;
+          ++local_scope;            /* shadow caller's same-named variables */
+          Sym *param_sym = s->next; /* first parameter from function type */
+          for (int pi = 0; pi < nb_args && param_sym; pi++, param_sym = param_sym->next)
+          {
+            int psize, palign;
+            psize = type_size(&param_sym->type, &palign);
+            if (psize < 4)
+              psize = 4;
+            if (palign < 4)
+              palign = 4;
+            loc = (loc - psize) & -palign;
+
+            /* Push parameter symbol FIRST so it gets a vreg assigned */
+            Sym *psym = sym_push(param_sym->v & ~SYM_FIELD, &param_sym->type, VT_LOCAL | VT_LVAL, loc);
+
+            /* Store argument to local via IR */
+            SValue store_dst;
+            svalue_init(&store_dst);
+            store_dst.type = param_sym->type;
+            store_dst.r = VT_LOCAL | VT_LVAL;
+            store_dst.vr = psym->vreg;
+            store_dst.c.i = loc;
+            tcc_ir_put(tcc_state->ir, TCCIR_OP_STORE, &saved_args[pi], NULL, &store_dst);
+          }
+
+          /* --- 3. Save parser/codegen state --- */
+          CType saved_func_vt = func_vt;
+          int saved_func_var = func_var;
+          int saved_rsym = rsym;
+          const char *saved_funcname = funcname;
+          struct scope *saved_root_scope = root_scope;
+
+          /* Set up inline function context */
+          func_vt = s->type; /* return type */
+          func_var = (s->f.func_type == FUNC_ELLIPSIS);
+          rsym = -1; /* fresh return-jump chain */
+
+          /* Allocate return value local for non-void functions */
+          int is_void_inline = ((func_vt.t & VT_BTYPE) == VT_VOID);
+          int inline_ret_loc = 0;
+          if (!is_void_inline)
+          {
+            int rsize, ralign;
+            rsize = type_size(&func_vt, &ralign);
+            if (rsize < 4)
+              rsize = 4;
+            if (ralign < 4)
+              ralign = 4;
+            loc = (loc - rsize) & -ralign;
+            inline_ret_loc = loc;
+          }
+
+          /* Set inline expansion flags */
+          tcc_state->in_inline_expansion = 1;
+          tcc_state->inline_return_loc = inline_ret_loc;
+          root_scope = cur_scope;
+
+          /* --- 4. Replay inline function body --- */
+          int saved_tok = tok;
+          CValue saved_tokc = tokc;
+
+          TokenString *inline_ts = tok_str_alloc();
+          inline_ts->data.str = tok_str_buf(inline_fn->func_str);
+          inline_ts->allocated_len = 1;
+          inline_ts->len = inline_fn->func_str->len;
+          begin_macro(inline_ts, 2);
+          next();
+          block(0);
+          end_macro();
+
+          tok = saved_tok;
+          tokc = saved_tokc;
+
+          /* --- 5. Backpatch return jumps --- */
+          tcc_ir_backpatch_to_here(tcc_state->ir, rsym);
+
+          /* --- 6. Restore state --- */
+          tcc_state->in_inline_expansion = 0;
+          func_vt = saved_func_vt;
+          func_var = saved_func_var;
+          rsym = saved_rsym;
+          funcname = saved_funcname;
+          root_scope = saved_root_scope;
+          sym_pop(&local_stack, saved_local, 0);
+          local_scope = saved_local_scope;
+
+          /* --- 7. Handle result on vstack --- */
+          if (is_void_inline)
+          {
+            /* Replace function pointer with void placeholder */
+            vtop->type.t = VT_VOID;
+            vtop->type.ref = NULL;
+            vtop->r = VT_CONST;
+            vtop->vr = -1;
+            vtop->c.i = 0;
+          }
+          else
+          {
+            /* Replace function pointer with return value lvalue */
+            vtop->type = s->type;
+            vtop->r = VT_LOCAL | VT_LVAL;
+            vtop->vr = -1;
+            vtop->c.i = inline_ret_loc;
+          }
+          inlined = 1;
+        }
+        else
+        {
+          /* No &&label found, or InlineFunc not found - normal call */
+          goto normal_call;
+        }
+      }
       else
       {
+      normal_call:;
 
         int return_vreg = -1;
         if (NOEVAL_WANTED)
@@ -9283,6 +14450,18 @@ tok_next:
 #else
             vtop->type.t = VT_INT;
 #endif
+          }
+
+          /* Restore VT_COMPLEX for complex types returned in registers.
+           * gfunc_sret() sets ret.type to VT_INT for small types (size <= 4),
+           * but the caller needs VT_COMPLEX to properly handle __real__/__imag__
+           * extraction.  The value in the register is packed:
+           *   _Complex char:  byte 0 = real, byte 1 = imag  (total 2 bytes in r0)
+           *   _Complex short: low 16 = real, high 16 = imag  (total 4 bytes in r0)
+           */
+          if (s->type.t & VT_COMPLEX)
+          {
+            vtop->type = s->type;
           }
         }
       } /* end of else block for non-folded function calls */
@@ -9557,6 +14736,37 @@ static void expr_landor(int op)
       tcc_ir_backpatch_to_here(tcc_state->ir, t);
     }
     nocode_wanted -= f;
+  }
+  else if (tcc_state->ir != NULL && i == 0 && (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST)
+  {
+    /* IR mode, || only: the last operand is a compile-time constant false
+     * but earlier operands were runtime values (cc=0, f=0).
+     *
+     * gvtst_set() would create a synthetic VT_CMP(TOK_EQ) with no real
+     * CMP instruction, causing the next JUMPIF to reuse stale condition
+     * flags from a prior comparison — producing the wrong branch direction.
+     *
+     * For ||, the chain 't' holds "jump-when-true" entries.  A constant-
+     * false last operand means the overall result depends solely on
+     * whether a prior operand was true → encode as VT_JMP with chain t.
+     *
+     * (For &&, i==1, the synthetic VT_CMP(TOK_NE) from gvtst_set happens
+     * to match the stale flags correctly on the fallthrough path, so the
+     * original codepath is valid and must not be replaced.)
+     */
+    int const_val = (vtop->c.i != 0);
+    vpop();
+    if (const_val == 0)
+    {
+      /* false || … — outcome depends on chain only. */
+      vseti(VT_JMP, t);
+    }
+    else
+    {
+      /* true || … — always true. */
+      vpushi(1);
+      tcc_ir_backpatch_to_here(tcc_state->ir, t);
+    }
   }
   else
   {
@@ -9875,7 +15085,11 @@ ST_FUNC int expr_const(void)
 #ifndef TCC_TARGET_ARM64
 static void gfunc_return(CType *func_type)
 {
-  if ((func_type->t & VT_BTYPE) == VT_STRUCT)
+  /* Complex types are composite (two elements) and must follow the same
+   * return convention as structs — via hidden pointer or packed registers
+   * depending on gfunc_sret().  Check VT_COMPLEX first since their VT_BTYPE
+   * is VT_FLOAT/VT_DOUBLE, not VT_STRUCT. */
+  if ((func_type->t & VT_BTYPE) == VT_STRUCT || (func_type->t & VT_COMPLEX))
   {
     CType type, ret_type;
     int ret_align, ret_nregs, regsize;
@@ -9888,15 +15102,128 @@ static void gfunc_return(CType *func_type)
     }
     else if (0 == ret_nregs)
     {
-      /* if returning structure, must copy it to implicit
-         first pointer arg location */
-      type = *func_type;
-      mk_pointer(&type);
-      vset(&type, VT_LOCAL | VT_LVAL, func_vc);
-      indir();
-      vswap();
-      /* copy structure value to pointer */
-      vstore();
+      if (func_type->t & VT_COMPLEX)
+      {
+        /* Complex sret return: copy the complex value to the caller's
+         * return buffer via memmove(sret_ptr, src_addr, complex_size).
+         *
+         * If vtop is an lval (already in memory — e.g. a local variable),
+         * we can take its address directly.  This is critical for complex
+         * types larger than 8 bytes (e.g. _Complex long long, _Complex
+         * double) because TCCIR_OP_STORE only handles up to 64-bit values
+         * and would silently truncate 16-byte complex types.
+         *
+         * If vtop is an rvalue in a register pair (e.g. result of complex
+         * float arithmetic), we spill to a temp local first.
+         */
+        int complex_size, complex_align;
+        complex_size = type_size(func_type, &complex_align);
+
+        SValue src_addr;
+        memset(&src_addr, 0, sizeof(src_addr));
+        src_addr.type.t = VT_PTR;
+        src_addr.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+        src_addr.r = 0;
+
+        if (vtop->r & VT_LVAL)
+        {
+          /* Source is already in memory — compute its address directly */
+          SValue src_mem;
+          memset(&src_mem, 0, sizeof(src_mem));
+          src_mem.type.t = VT_PTR;
+          src_mem.r = vtop->r & ~VT_LVAL; /* keep VT_LOCAL etc, clear VT_LVAL */
+          src_mem.vr = vtop->vr;
+          src_mem.c.i = vtop->c.i;
+          src_mem.sym = vtop->sym; /* preserve symbol for global variables */
+          tcc_ir_put(tcc_state->ir, TCCIR_OP_LEA, &src_mem, NULL, &src_addr);
+        }
+        else
+        {
+          /* Source is an rvalue (register pair) — spill to temp local.
+           * This path handles _Complex float/int (8 bytes) which can fit
+           * in a register pair and be stored via a single 64-bit STORE. */
+          loc = (loc - complex_size) & -complex_align;
+          int tmp_loc = loc;
+
+          SValue tmp_dst;
+          memset(&tmp_dst, 0, sizeof(tmp_dst));
+          tmp_dst.type = vtop->type;
+          tmp_dst.r = VT_LOCAL | VT_LVAL;
+          tmp_dst.vr = -1;
+          tmp_dst.c.i = tmp_loc;
+          tcc_ir_put(tcc_state->ir, TCCIR_OP_STORE, vtop, NULL, &tmp_dst);
+
+          SValue tmp_addr_src;
+          memset(&tmp_addr_src, 0, sizeof(tmp_addr_src));
+          tmp_addr_src.type.t = VT_PTR;
+          tmp_addr_src.r = VT_LOCAL;
+          tmp_addr_src.vr = -1;
+          tmp_addr_src.c.i = tmp_loc;
+          tcc_ir_put(tcc_state->ir, TCCIR_OP_LEA, &tmp_addr_src, NULL, &src_addr);
+        }
+
+        /* Load the sret pointer from func_vc.
+         * func_vc is a stack slot holding the hidden sret pointer passed in r0. */
+        SValue sret_slot;
+        memset(&sret_slot, 0, sizeof(sret_slot));
+        sret_slot.type.t = VT_PTR;
+        sret_slot.r = VT_LOCAL | VT_LVAL;
+        sret_slot.vr = -1;
+        sret_slot.c.i = func_vc;
+
+        SValue sret_ptr;
+        memset(&sret_ptr, 0, sizeof(sret_ptr));
+        sret_ptr.type.t = VT_PTR;
+        sret_ptr.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+        sret_ptr.r = 0;
+
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_ASSIGN, &sret_slot, NULL, &sret_ptr);
+
+        /* Generate memmove(sret_ptr, src_addr, complex_size) */
+        SValue size_sv;
+        memset(&size_sv, 0, sizeof(size_sv));
+        size_sv.type.t = VT_INT;
+        size_sv.r = VT_CONST;
+        size_sv.vr = -1;
+        size_sv.c.i = complex_size;
+
+        vpush_helper_func(
+#ifdef TCC_ARM_EABI
+            (!(complex_align & 3)) ? TOK_memmove4 : TOK_memmove
+#else
+            TOK_memmove
+#endif
+        );
+
+        SValue param_num;
+        const int call_id = tcc_state->ir->next_call_id++;
+        svalue_init(&param_num);
+        param_num.vr = -1;
+        param_num.r = VT_CONST;
+
+        param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &sret_ptr, &param_num, NULL);
+        param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 1);
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &src_addr, &param_num, NULL);
+        param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 2);
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &size_sv, &param_num, NULL);
+
+        SValue call_id_sv = tcc_ir_svalue_call_id_argc(call_id, 3);
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[0], &call_id_sv, NULL);
+        vpop(); /* pop helper func */
+      }
+      else
+      {
+        /* if returning structure, must copy it to implicit
+           first pointer arg location */
+        type = *func_type;
+        mk_pointer(&type);
+        vset(&type, VT_LOCAL | VT_LVAL, func_vc);
+        indir();
+        vswap();
+        /* copy structure value to pointer */
+        vstore();
+      }
     }
     else
     {
@@ -10565,7 +15892,17 @@ again:
         next();
         if (tok < TOK_UIDENT)
           expect("label identifier");
-        label_push(&local_label_stack, tok, LABEL_DECLARED);
+        Sym *lbl = label_push(&local_label_stack, tok, LABEL_DECLARED);
+        /* Allocate a 40-byte nonlocal-goto jmp_buf on the stack for each
+         * __label__. The buffer stores 10 words for non-local goto:
+         *   [0-28]: r4-r11 (callee-saved regs), [32]: SP, [36]: resume_addr.
+         * This ensures longjmp from a nested function restores all register
+         * state correctly, not just FP/SP. */
+        if (tcc_state->ir)
+        {
+          loc = (loc - 40) & ~7; /* 40 bytes, 8-byte aligned */
+          lbl->c = loc;          /* store buffer FP offset in label sym */
+        }
         next();
       } while (tok == ',');
       skip(';');
@@ -10622,7 +15959,25 @@ again:
     }
     leave_scope(root_scope);
     if (b)
-      gfunc_return(&func_vt);
+    {
+      if (tcc_state->in_inline_expansion)
+      {
+        /* Inside inline expansion: store return value to local slot
+         * instead of emitting RETURNVALUE IR op. */
+        SValue ret_dst;
+        svalue_init(&ret_dst);
+        ret_dst.type = func_vt;
+        ret_dst.r = VT_LOCAL | VT_LVAL;
+        ret_dst.vr = -1;
+        ret_dst.c.i = tcc_state->inline_return_loc;
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_STORE, vtop, NULL, &ret_dst);
+        vtop--;
+      }
+      else
+      {
+        gfunc_return(&func_vt);
+      }
+    }
     skip(';');
     /* jump unless last stmt in top-level block */
     if (tok != '}' || local_scope != 1)
@@ -10823,8 +16178,10 @@ again:
     vtop->r = 0;
     /* Build case jump chain; start with empty default chain (-1).
      * Use jump table for dense switches, otherwise fall back to binary search. */
+    int switch_table_id = -1;
     if (switch_can_use_jump_table(sw))
     {
+      switch_table_id = tcc_state->ir->num_switch_tables; /* ID of the table about to be created */
       d = gcase_jump_table(sw, -1);
     }
     else
@@ -10834,10 +16191,32 @@ again:
     vpop();
 
     tcc_ir_backpatch(tcc_state->ir, b, c);
+    int def_target;
     if (sw->def_sym)
+    {
       tcc_ir_backpatch(tcc_state->ir, d, sw->def_sym);
+      def_target = sw->def_sym;
+    }
     else
+    {
       tcc_ir_backpatch_to_here(tcc_state->ir, d);
+      def_target = tcc_state->ir->next_instruction_index;
+    }
+    /* Resolve switch table default entries: gcase_jump_table() initially sets
+     * default entries to -1 (unresolved forward reference).  Now that the
+     * default label is known, update those entries so the codegen backpatcher
+     * can emit correct PC-relative offsets instead of falling back to the
+     * epilogue address. */
+    if (switch_table_id >= 0)
+    {
+      TCCIRSwitchTable *table = &tcc_state->ir->switch_tables[switch_table_id];
+      table->default_target = def_target;
+      for (int k = 0; k < table->num_entries; k++)
+      {
+        if (table->targets[k] < 0)
+          table->targets[k] = def_target;
+      }
+    }
     // gsym(d);
   skip_switch:
     /* break label */
@@ -10897,37 +16276,75 @@ again:
     }
     else if (tok >= TOK_UIDENT)
     {
-      s = label_find(tok);
-      /* put forward definition if needed */
-      if (!s)
-        s = label_push(&global_label_stack, tok, LABEL_FORWARD);
-      else if (s->r == LABEL_DECLARED)
-        s->r = LABEL_FORWARD;
-
-      if (s->r & LABEL_FORWARD)
+      /* Check for non-local goto from nested function to parent __label__ */
+      NestedFunc *cur_nf = tcc_state->current_nested_func;
+      int is_nonlocal_goto = 0;
+      if (cur_nf && tcc_state->ir)
       {
-        /* start new goto chain for cleanups, linked via label->next */
-        if (cur_scope->cl.s && !nocode_wanted)
+        for (int ngi = 0; ngi < cur_nf->nb_nlgotos; ngi++)
         {
-          sym_push2(&pending_gotos, SYM_FIELD, 0, cur_scope->cl.n);
-          pending_gotos->prev_tok = s;
-          s = sym_push2(&s->next, SYM_FIELD, 0, 0);
-          pending_gotos->next = s;
+          if (cur_nf->nlgoto_label_tokens[ngi] == tok)
+          {
+            /* This is a non-local goto - emit longjmp to parent's jmp_buf.
+             * The jmp_buf is accessed as a captured variable via the static chain. */
+            int buf_off = cur_nf->nlgoto_buf_offsets[ngi];
+
+            /* Create SValue for buffer address via chain-relative access.
+             * vreg=-1 + VT_LOCAL + is_lval=false → MACH_OP_CHAIN_REL with no deref,
+             * giving us the address of the buffer in the parent's frame. */
+            SValue buf_sv;
+            svalue_init(&buf_sv);
+            buf_sv.type.t = VT_INT;
+            buf_sv.type.ref = NULL;
+            buf_sv.r = VT_LOCAL;  /* FP-relative in parent, becomes chain-relative */
+            buf_sv.c.i = buf_off; /* parent's FP offset of the jmp_buf */
+            buf_sv.vr = -1;       /* no vreg = pure stack offset → triggers CHAIN_REL */
+
+            /* Emit NL_LONGJMP: restores callee-saved regs, SP from 40-byte buffer and jumps to resume addr */
+            tcc_ir_put(tcc_state->ir, TCCIR_OP_NL_LONGJMP, &buf_sv, NULL, NULL);
+            /* longjmp doesn't return - mark code as dead */
+            CODE_OFF();
+            is_nonlocal_goto = 1;
+            next();
+            break;
+          }
         }
-        s->jnext = gjmp(s->jnext);
       }
-      else
+
+      if (!is_nonlocal_goto)
       {
-        SValue dest;
-        svalue_init(&dest);
-        try_call_cleanup_goto(s->cleanupstate);
-        dest.vr = -1;
-        dest.r = VT_CONST; /* Mark as constant so jump target is stored in u.imm32 */
-        dest.c.i = s->jind;
-        // gjmp_addr(s->jind);
-        tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
-      }
-      next();
+        s = label_find(tok);
+        /* put forward definition if needed */
+        if (!s)
+          s = label_push(&global_label_stack, tok, LABEL_FORWARD);
+        else if (s->r == LABEL_DECLARED)
+          s->r = LABEL_FORWARD;
+
+        if (s->r & LABEL_FORWARD)
+        {
+          /* start new goto chain for cleanups, linked via label->next */
+          if (cur_scope->cl.s && !nocode_wanted)
+          {
+            sym_push2(&pending_gotos, SYM_FIELD, 0, cur_scope->cl.n);
+            pending_gotos->prev_tok = s;
+            s = sym_push2(&s->next, SYM_FIELD, 0, 0);
+            pending_gotos->next = s;
+          }
+          s->jnext = gjmp(s->jnext);
+        }
+        else
+        {
+          SValue dest;
+          svalue_init(&dest);
+          try_call_cleanup_goto(s->cleanupstate);
+          dest.vr = -1;
+          dest.r = VT_CONST; /* Mark as constant so jump target is stored in u.imm32 */
+          dest.c.i = s->jind;
+          // gjmp_addr(s->jind);
+          tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
+        }
+        next();
+      } /* !is_nonlocal_goto */
     }
     else
     {
@@ -11469,6 +16886,21 @@ static void init_putv(init_params *p, CType *type, unsigned long c, int vreg)
           bits += n, bit_size -= n, bit_pos = 0, ++p;
         }
       }
+      else if (type->t & VT_COMPLEX)
+      {
+        /* Complex integer types: write packed representation directly.
+         * The value is packed as [real | imag] in CValue.i,
+         * matching little-endian memory layout. */
+        int complex_size = type_size(type, &align);
+        if (complex_size == 2)
+          write16le(ptr, val);
+        else if (complex_size == 4)
+          write32le(ptr, val);
+        else if (complex_size == 8)
+          write64le(ptr, val);
+        else
+          memcpy(ptr, &vtop->c, complex_size);
+      }
       else
         switch (bt)
         {
@@ -11547,6 +16979,19 @@ static void init_putv(init_params *p, CType *type, unsigned long c, int vreg)
             greloc(sec, vtop->sym, c, R_DATA_PTR);
           }
           write32le(ptr, val);
+          /* Record deferred label-difference fixup (&&lab1 - &&lab0) if pending */
+          if (pending_label_diff_plus)
+          {
+            LabelDiffFixup *fixup = tcc_malloc(sizeof(LabelDiffFixup));
+            fixup->sec = sec;
+            fixup->offset = c;
+            fixup->sym_plus = pending_label_diff_plus;
+            fixup->sym_minus = pending_label_diff_minus;
+            fixup->next = tcc_state->label_diff_fixups;
+            tcc_state->label_diff_fixups = fixup;
+            pending_label_diff_plus = NULL;
+            pending_label_diff_minus = NULL;
+          }
           break;
 #endif
         default:
@@ -11583,6 +17028,121 @@ static void init_putv(init_params *p, CType *type, unsigned long c, int vreg)
   }
 }
 
+/* Byte-swap bitfield storage units for big-endian scalar_storage_order structs.
+   Called after all fields have been initialized with LE byte order.
+   Swaps the bytes of each bitfield storage unit to produce BE layout. */
+static void sso_swap_struct_init(init_params *p, CType *type, unsigned long c)
+{
+  Sym *s = type->ref;
+  int last_offset = -1;
+  Sym *f;
+
+  for (f = s->next; f; f = f->next)
+  {
+    if (!(f->type.t & VT_BITFIELD) || !f->a.sso_be || BIT_SIZE(f->type.t) == 0)
+      continue;
+    int unit_bytes = f->r;
+    if (unit_bytes <= 1)
+      continue;
+    /* Only swap each storage unit once (skip fields sharing the same offset) */
+    if (f->c == last_offset)
+      continue;
+    last_offset = f->c;
+    unsigned long addr = c + f->c;
+
+    if (p->sec)
+    {
+      /* Section case: directly swap bytes in section data */
+      unsigned char *ptr = p->sec->data + addr;
+      int i;
+      for (i = 0; i < unit_bytes / 2; i++)
+      {
+        unsigned char tmp = ptr[i];
+        ptr[i] = ptr[unit_bytes - 1 - i];
+        ptr[unit_bytes - 1 - i] = tmp;
+      }
+    }
+    else
+    {
+      /* Local variable case: generate code to byte-swap at runtime */
+      if (unit_bytes == 2)
+      {
+        CType ushort_type;
+        ushort_type.t = VT_SHORT | VT_UNSIGNED;
+        ushort_type.ref = NULL;
+
+        /* Load 16-bit value, byte-swap, store back:
+         *(uint16_t*)addr = ((val >> 8) & 0xFF) | ((val & 0xFF) << 8) */
+        vset(&ushort_type, VT_LOCAL | VT_LVAL, addr);
+        vdup();
+        /* (val >> 8) & 0xFF */
+        vpushi(8);
+        gen_op(TOK_SHR);
+        vpushi(0xFF);
+        gen_op('&');
+        vswap();
+        /* (val & 0xFF) << 8 */
+        vpushi(0xFF);
+        gen_op('&');
+        vpushi(8);
+        gen_op(TOK_SHL);
+        /* combine */
+        gen_op('|');
+        /* store back */
+        vset(&ushort_type, VT_LOCAL | VT_LVAL, addr);
+        vswap();
+        vstore();
+        vpop();
+      }
+      else if (unit_bytes == 4)
+      {
+        CType uint_type;
+        uint_type.t = VT_INT | VT_UNSIGNED;
+        uint_type.ref = NULL;
+
+        /* 32-bit byte swap:
+           result = ((val >> 24) & 0xFF) | ((val >> 8) & 0xFF00)
+                  | ((val << 8) & 0xFF0000) | ((val << 24) & 0xFF000000) */
+        vset(&uint_type, VT_LOCAL | VT_LVAL, addr);
+        /* val >> 24 */
+        vdup();
+        vpushi(24);
+        gen_op(TOK_SHR);
+        vpushi(0xFF);
+        gen_op('&');
+        vswap();
+        /* val >> 8 & 0xFF00 */
+        vdup();
+        vpushi(8);
+        gen_op(TOK_SHR);
+        vpushi(0xFF00);
+        gen_op('&');
+        vrotb(3);
+        gen_op('|');
+        vswap();
+        /* val << 8 & 0xFF0000 */
+        vdup();
+        vpushi(8);
+        gen_op(TOK_SHL);
+        vpushi(0xFF0000);
+        gen_op('&');
+        vrotb(3);
+        gen_op('|');
+        vswap();
+        /* val << 24 */
+        vpushi(24);
+        gen_op(TOK_SHL);
+        gen_op('|');
+        /* store back */
+        vset(&uint_type, VT_LOCAL | VT_LVAL, addr);
+        vswap();
+        vstore();
+        vpop();
+      }
+    }
+  }
+}
+
 /* 't' contains the type and storage info. 'c' is the offset of the
    object in section 'sec'. If 'sec' is NULL, it means stack based
    allocation. 'flags & DIF_FIRST' is true if array '{' must be read (multi
@@ -11592,6 +17152,7 @@ static void decl_initializer(init_params *p, CType *type, unsigned long c, int f
 {
   int len, n, no_oblock, i;
   int size1, align1;
+  int need_sso_swap = 0;
   Sym *s, *f;
   Sym indexsym;
   CType *t1;
@@ -11673,6 +17234,7 @@ static void decl_initializer(init_params *p, CType *type, unsigned long c, int f
       decl_design_flex(p, s, len);
       if (!(flags & DIF_SIZE_ONLY))
       {
+        n = s->c; /* re-read after flex array expansion */
         int nb = n, ch;
         if (len < nb)
           nb = len;
@@ -11764,6 +17326,12 @@ static void decl_initializer(init_params *p, CType *type, unsigned long c, int f
     }
     if (!no_oblock)
       skip('}');
+    /* Byte-swap storage units for big-endian scalar_storage_order structs.
+       After all bitfield values have been stored with LE byte order (using
+       BE bit positions), swap bytes of each storage unit to produce the
+       correct big-endian memory layout. */
+    if (need_sso_swap && !(flags & DIF_SIZE_ONLY) && !NODATA_WANTED)
+      sso_swap_struct_init(p, type, c);
   }
   else if ((flags & DIF_HAVE_ELEM)
            /* Use i_c_parameter_t, to strip toplevel qualifiers.
@@ -11808,6 +17376,8 @@ static void decl_initializer(init_params *p, CType *type, unsigned long c, int f
     f = s->next;
     n = s->c;
     size1 = 1;
+    if (s->a.sso_be)
+      need_sso_swap = 1;
     goto do_init_list;
   }
   else if (tok == '{')
@@ -11922,6 +17492,31 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has
         size = -1;
       }
     }
+    /* For unions: if any member is a struct with a flexible array
+       member, set flex_array_ref so the FAM can be initialized.
+       The union already provides backing storage, so no dry-run
+       size computation is needed. */
+    if (!flexible_array && IS_UNION(type->ref->type.t))
+    {
+      Sym *member;
+      for (member = type->ref->next; member; member = member->next)
+      {
+        if ((member->type.t & VT_BTYPE) == VT_STRUCT)
+        {
+          Sym *mf = member->type.ref->next;
+          if (mf)
+          {
+            while (mf->next)
+              mf = mf->next;
+            if (mf->type.t & VT_ARRAY && mf->type.ref->c < 0)
+            {
+              p.flex_array_ref = mf->type.ref;
+              break;
+            }
+          }
+        }
+      }
+    }
   }
 
   if (size < 0)
@@ -11990,10 +17585,20 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has
       loc -= align;
     }
 #endif
-    if (!((r & VT_LVAL) && ((type->t & VT_BTYPE) != VT_STRUCT)))
+    if (type->t & VT_VLA)
+    {
+      /* VLA types need a pointer-sized slot for the alloca'd data pointer.
+       * The VLA byte-size was already stored in a separate slot allocated
+       * during type parsing (post_type); do not reuse that slot. */
+      loc = (loc - PTR_SIZE) & -PTR_SIZE;
+    }
+    else if (!((r & VT_LVAL) && ((type->t & VT_BTYPE) != VT_STRUCT) && !(type->t & VT_COMPLEX)))
     {
       // allocate stack for variables that are not register allocation
-      // candidates.  VLA structs allocate a pointer slot instead of
+      // candidates.  Complex types need explicit stack allocation since
+      // they are too large for single vregs and use offset-based access
+      // via __real__/__imag__.
+      // VLA structs allocate a pointer slot instead of
       // the full struct — the actual data is VLA_ALLOC'd later.
       if (struct_has_vla_member(type))
         loc = (loc - PTR_SIZE) & -PTR_SIZE;
@@ -12347,6 +17952,9 @@ static void func_vla_arg_code(Sym *arg)
     vswap();
     vstore();
     vpop();
+    /* Free the VLA expression token buffer now that it's been evaluated */
+    tcc_free(arg->type.ref->vla_array_str);
+    arg->type.ref->vla_array_str = NULL;
   }
 }
 
@@ -12355,8 +17963,42 @@ static void func_vla_arg(Sym *sym)
   Sym *arg;
 
   for (arg = sym->type.ref->next; arg; arg = arg->next)
-    if ((arg->type.t & VT_BTYPE) == VT_PTR && (arg->type.ref->type.t & VT_VLA))
+  {
+    if ((arg->type.t & VT_BTYPE) != VT_PTR)
+      continue;
+    /* Evaluate nested (inner) VLA dimension expressions */
+    if (arg->type.ref->type.t & VT_VLA)
       func_vla_arg_code(arg->type.ref);
+    /* Evaluate outermost VLA dimension expressions for side effects.
+       These are stored in tcc_state->vla_param_exprs because the sym union
+       (vla_array_str/next) can't be used without corrupting the type chain. */
+    for (int i = 0; i < tcc_state->nb_vla_param_exprs; i++)
+    {
+      if (tcc_state->vla_param_exprs[i].param == arg->type.ref)
+      {
+        TokenString *vla_array_tok = tok_str_alloc();
+        vla_array_tok->data.str = tcc_state->vla_param_exprs[i].tokens;
+        vla_array_tok->allocated_len = 1;
+        unget_tok(0);
+        begin_macro(vla_array_tok, 2); /* alloc=2: don't free borrowed buffer */
+        next();
+        gexpr();
+        end_macro();
+        next();
+        vpop(); /* discard result, only side effects matter */
+        break;
+      }
+    }
+  }
+  /* Free the VLA param expression list for this function */
+  if (tcc_state->nb_vla_param_exprs)
+  {
+    for (int i = 0; i < tcc_state->nb_vla_param_exprs; i++)
+      tcc_free(tcc_state->vla_param_exprs[i].tokens);
+    tcc_free(tcc_state->vla_param_exprs);
+    tcc_state->vla_param_exprs = NULL;
+    tcc_state->nb_vla_param_exprs = 0;
+  }
 }
 
 /* Forward declaration for nested function compilation */
@@ -12654,7 +18296,23 @@ static void compile_nested_functions(Sym *parent_sym)
      * the recursive call would try to compile it again (compile_idx is static). */
     nf->compiled = 1;
 
+    /* Temporarily add parent addr-taken labels to the hash table so that
+     * &&label references inside the nested function can find them. */
+    for (int j = 0; j < nf->nb_addr_labels; j++)
+    {
+      Sym *lbl = nf->addr_label_syms[j];
+      lbl->prev_tok = table_ident[lbl->v - TOK_IDENT]->sym_label;
+      table_ident[lbl->v - TOK_IDENT]->sym_label = lbl;
+    }
+
     gen_function(nf->sym);
+
+    /* Remove parent addr-taken labels from hash table after compilation. */
+    for (int j = 0; j < nf->nb_addr_labels; j++)
+    {
+      Sym *lbl = nf->addr_label_syms[j];
+      table_ident[lbl->v - TOK_IDENT]->sym_label = lbl->prev_tok;
+    }
 
     /* gen_function() resets cur_text_section=NULL and ind=0 for safety.
      * Restore them so the next nested function starts at the right offset
@@ -12749,6 +18407,7 @@ static void prescan_captured_vars(NestedFunc *nf, Sym *parent_local_stack, Neste
     return;
 
   const int *p = tok_str_buf(tok_str);
+  int prev_tok = 0; /* track previous token for goto detection */
 
   while (*p != TOK_EOF && *p != 0)
   {
@@ -12763,6 +18422,8 @@ static void prescan_captured_vars(NestedFunc *nf, Sym *parent_local_stack, Neste
     case TOK_LINENUM:
     case TOK_CUINT:
     case TOK_CFLOAT:
+    case TOK_CFLOAT_I:
+    case TOK_CINT_I:
 #if LONG_SIZE == 4
     case TOK_CLONG:
     case TOK_CULONG:
@@ -12770,6 +18431,7 @@ static void prescan_captured_vars(NestedFunc *nf, Sym *parent_local_stack, Neste
       p++; /* 1 extra int */
       break;
     case TOK_CDOUBLE:
+    case TOK_CDOUBLE_I:
     case TOK_CLLONG:
     case TOK_CULLONG:
 #if LONG_SIZE == 8
@@ -12779,6 +18441,7 @@ static void prescan_captured_vars(NestedFunc *nf, Sym *parent_local_stack, Neste
       p += 2; /* 2 extra ints */
       break;
     case TOK_CLDOUBLE:
+    case TOK_CLDOUBLE_I:
 #if LDOUBLE_SIZE == 8 || defined TCC_USING_DOUBLE_FOR_LDOUBLE
       p += 2;
 #elif LDOUBLE_SIZE == 12
@@ -12872,11 +18535,264 @@ static void prescan_captured_vars(NestedFunc *nf, Sym *parent_local_stack, Neste
           }
         }
       }
+
+      /* Non-local goto detection: if previous token was TOK_GOTO
+       * and this identifier matches a __label__ in the parent scope,
+       * record it as a non-local goto target. */
+      if (prev_tok == TOK_GOTO)
+      {
+        /* Search parent's local_label_stack for this token */
+        Sym *lbl;
+        for (lbl = local_label_stack; lbl; lbl = lbl->prev)
+        {
+          if (lbl->v == t && (lbl->r == LABEL_DECLARED || lbl->r == LABEL_FORWARD || lbl->r == LABEL_DEFINED))
+          {
+            /* Found a matching __label__ in parent - record as non-local goto target */
+            if (nf->nb_nlgotos < MAX_NONLOCAL_GOTOS)
+            {
+              /* Check for duplicate */
+              int dup = 0;
+              for (int k = 0; k < nf->nb_nlgotos; k++)
+              {
+                if (nf->nlgoto_label_tokens[k] == t)
+                {
+                  dup = 1;
+                  break;
+                }
+              }
+              if (!dup)
+              {
+                nf->nlgoto_label_tokens[nf->nb_nlgotos] = t;
+                nf->nlgoto_buf_offsets[nf->nb_nlgotos] = lbl->c; /* jmp_buf FP offset from __label__ alloc */
+                nf->nb_nlgotos++;
+                /* Also add the jmp_buf as a captured variable so the nested function
+                 * can access it via the static chain. Use a synthetic token that won't
+                 * collide with real variables. We use negative token values. */
+                if (nf->nb_captured < MAX_CAPTURED_VARS)
+                {
+                  nf->captured_vregs[nf->nb_captured] = -1;
+                  nf->captured_offsets[nf->nb_captured] = lbl->c;
+                  /* Use the label token itself as captured token - it won't collide with
+                   * variables because labels and variables are in different namespaces */
+                  nf->captured_tokens[nf->nb_captured] = -t; /* negative = non-local goto buf */
+                  CType buf_type;
+                  buf_type.t = VT_INT; /* placeholder type for the buffer */
+                  buf_type.ref = NULL;
+                  nf->captured_types[nf->nb_captured] = buf_type;
+                  nf->captured_chain_depth[nf->nb_captured] = 1; /* direct parent */
+                  nf->nb_captured++;
+                }
+              }
+            }
+            break;
+          }
+        }
+      }
+
+      /* Address-of-label detection: if previous token was TOK_LAND (&&)
+       * and this identifier matches a __label__ in the parent scope,
+       * mark the label as addr-taken so it persists through label_pop
+       * and record it so compile_nested_functions can make it visible. */
+      if (prev_tok == TOK_LAND)
+      {
+        Sym *lbl;
+        for (lbl = local_label_stack; lbl; lbl = lbl->prev)
+        {
+          if (lbl->v == t && (lbl->r == LABEL_DECLARED || lbl->r == LABEL_FORWARD || lbl->r == LABEL_DEFINED))
+          {
+            lbl->a.addrtaken = 1;
+            if (nf->nb_addr_labels < MAX_NONLOCAL_GOTOS)
+            {
+              /* Check for duplicate */
+              int dup = 0;
+              for (int k = 0; k < nf->nb_addr_labels; k++)
+              {
+                if (nf->addr_label_syms[k] == lbl)
+                {
+                  dup = 1;
+                  break;
+                }
+              }
+              if (!dup)
+                nf->addr_label_syms[nf->nb_addr_labels++] = lbl;
+            }
+            break;
+          }
+        }
+      }
     }
+    prev_tok = t;
   }
 
   /* Restore previous prescan current */
   prescan_current_nf = saved_current;
+}
+
+/* Scan a raw token buffer (int*) for identifiers that reference captured parent
+ * variables. Used to capture variables referenced in VLA expression tokens
+ * (vla_array_str) which are not part of the nested function body token stream. */
+static void prescan_token_buf_for_captures(NestedFunc *nf, const int *p, Sym *parent_local_stack)
+{
+  while (*p != TOK_EOF && *p != 0)
+  {
+    int t = *p++;
+    switch (t)
+    {
+    case TOK_CINT:
+    case TOK_CCHAR:
+    case TOK_LCHAR:
+    case TOK_LINENUM:
+    case TOK_CUINT:
+    case TOK_CFLOAT:
+    case TOK_CFLOAT_I:
+    case TOK_CINT_I:
+#if LONG_SIZE == 4
+    case TOK_CLONG:
+    case TOK_CULONG:
+#endif
+      p++;
+      break;
+    case TOK_CDOUBLE:
+    case TOK_CDOUBLE_I:
+    case TOK_CLLONG:
+    case TOK_CULLONG:
+#if LONG_SIZE == 8
+    case TOK_CLONG:
+    case TOK_CULONG:
+#endif
+      p += 2;
+      break;
+    case TOK_CLDOUBLE:
+    case TOK_CLDOUBLE_I:
+#if LDOUBLE_SIZE == 8 || defined TCC_USING_DOUBLE_FOR_LDOUBLE
+      p += 2;
+#elif LDOUBLE_SIZE == 12
+      p += 3;
+#elif LDOUBLE_SIZE == 16
+      p += 4;
+#endif
+      break;
+    case TOK_STR:
+    case TOK_LSTR:
+    case TOK_PPNUM:
+    case TOK_PPSTR:
+    {
+      int sz = *p++;
+      p += (sz + sizeof(int) - 1) / sizeof(int);
+      break;
+    }
+    default:
+      break;
+    }
+    if (t >= TOK_IDENT)
+    {
+      Sym *s = sym_find2(parent_local_stack, t);
+      if (s && ((s->r & VT_VALMASK) == VT_LOCAL || (s->r & VT_PARAM)))
+      {
+        s->a.addrtaken = 1;
+        if (tcc_state->ir && s->vreg >= 0)
+          tcc_ir_set_addrtaken(tcc_state->ir, s->vreg);
+        int already = 0;
+        for (int i = 0; i < nf->nb_captured; i++)
+          if (nf->captured_tokens[i] == t)
+          {
+            already = 1;
+            break;
+          }
+        if (!already && nf->nb_captured < MAX_CAPTURED_VARS)
+        {
+          nf->captured_vregs[nf->nb_captured] = s->vreg;
+          nf->captured_offsets[nf->nb_captured] = s->c;
+          nf->captured_tokens[nf->nb_captured] = t;
+          nf->captured_types[nf->nb_captured] = s->type;
+          nf->captured_chain_depth[nf->nb_captured] = 1;
+          nf->nb_captured++;
+        }
+      }
+    }
+  }
+}
+
+/* Walk a nested function's parameter types to find VLA expression token streams
+ * and scan them for captured parent variables. VLA expressions are stored in
+ * vla_array_str (inner dimensions) and vla_param_exprs (outermost dimension),
+ * which are NOT part of the function body token stream scanned by prescan_captured_vars. */
+static void prescan_vla_param_captured_vars(NestedFunc *nf, Sym *parent_local_stack)
+{
+  Sym *func_type = nf->sym->type.ref;
+  if (!func_type)
+    return;
+  for (Sym *arg = func_type->next; arg; arg = arg->next)
+  {
+    if ((arg->type.t & VT_BTYPE) != VT_PTR)
+      continue;
+    /* Walk the array dimension chain looking for VLA expressions */
+    for (Sym *field = arg->type.ref; field;)
+    {
+      if ((field->type.t & VT_VLA) && field->type.ref)
+      {
+        /* The inner field may have vla_array_str set (TYPE_NEST dimensions) */
+        Sym *inner = field->type.ref;
+        if (inner->vla_array_str)
+          prescan_token_buf_for_captures(nf, inner->vla_array_str, parent_local_stack);
+        /* Continue to inner dimensions */
+        field = inner;
+      }
+      else
+        break;
+    }
+    /* Also check vla_param_exprs for outermost dimension tokens */
+    for (int i = 0; i < tcc_state->nb_vla_param_exprs; i++)
+    {
+      if (tcc_state->vla_param_exprs[i].param == arg->type.ref)
+        prescan_token_buf_for_captures(nf, tcc_state->vla_param_exprs[i].tokens, parent_local_stack);
+    }
+  }
+}
+
+/* Emit a call to __cyg_profile_func_enter or __cyg_profile_func_exit.
+ * Used for -finstrument-functions support.
+ * Arguments: (void *this_fn, void *call_site) */
+static void gen_instrument_call(Sym *cur_func_sym, const char *hook_name)
+{
+  CType void_ptr_type;
+  void_ptr_type.t = VT_VOID;
+  void_ptr_type.ref = NULL;
+  mk_pointer(&void_ptr_type);
+
+  /* arg0: address of current function */
+  vpushsym(&void_ptr_type, cur_func_sym);
+
+  /* arg1: return address (call site) = __builtin_return_address(0)
+   * LR is saved at [FP + PTR_SIZE] in the standard frame record */
+  CType ptr_type;
+  ptr_type.t = VT_VOID;
+  ptr_type.ref = NULL;
+  mk_pointer(&ptr_type);
+  vset(&ptr_type, VT_LOCAL, 0); /* FP value */
+  vpushi(PTR_SIZE);
+  gen_op('+');
+  mk_pointer(&vtop->type);
+  indir();
+
+  /* Push the hook function */
+  vpush_helper_func(tok_alloc_const(hook_name));
+
+  /* Emit IR for 2-arg void call: hook(this_fn, call_site) */
+  const int call_id = tcc_state->ir->next_call_id++;
+  SValue param_num;
+  svalue_init(&param_num);
+  param_num.vr = -1;
+  param_num.r = VT_CONST;
+
+  param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
+  tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-2], &param_num, NULL);
+  param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 1);
+  tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &param_num, NULL);
+
+  SValue call_id_sv = tcc_ir_svalue_call_id_argc(call_id, 2);
+  tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[0], &call_id_sv, NULL);
+  vtop -= 3; /* pop 2 args + func */
 }
 
 /* parse a function defined by symbol 'sym' and generate its code in
@@ -12894,6 +18810,8 @@ static void gen_function(Sym *sym)
   tcc_state->force_frame_pointer = 0;
   tcc_state->need_frame_pointer = 0;
   tcc_state->force_lr_save = 0;
+  tcc_state->func_save_apply_args = 0;
+  tcc_state->apply_args_offset = 0;
 
   /* Save global label stack position so we only pop labels from this function */
   global_label_stack_start = global_label_stack;
@@ -12976,10 +18894,25 @@ static void gen_function(Sym *sym)
 
   local_scope = 0;
   rsym = -1; /* Initialize return symbol chain with -1 sentinel */
+
+  /* -finstrument-functions: emit entry hook call before function body */
+  if (tcc_state->instrument_functions && !sym->type.ref->f.func_no_instrument)
+  {
+    tcc_state->force_frame_pointer = 1;
+    tcc_state->force_lr_save = 1;
+    gen_instrument_call(sym, "__cyg_profile_func_enter");
+  }
+
   func_vla_arg(sym);
   block(0);
   /* Backpatch all return jumps to point to the epilogue (past the end of IR) */
   tcc_ir_backpatch_to_here(ir, rsym);
+
+  /* -finstrument-functions: emit exit hook call at the common return point */
+  if (tcc_state->instrument_functions && !sym->type.ref->f.func_no_instrument)
+  {
+    gen_instrument_call(sym, "__cyg_profile_func_exit");
+  }
 
 #ifdef CONFIG_TCC_DEBUG
   if (tcc_state->dump_ir)
@@ -13173,8 +19106,18 @@ static void gen_function(Sym *sym)
    * variable offsets can numerically match FP-relative local variable offsets,
    * causing the forwarding to confuse aliased values. */
   if (tcc_state->opt_store_load_fwd && !ir->has_static_chain && tcc_ir_opt_sl_forward(ir))
+  {
     if (tcc_state->opt_dce)
       tcc_ir_opt_dce(ir); /* Clean up forwarded loads */
+    /* SL forwarding may expose constant operands in TEST_ZERO/CMP.
+     * Re-run branch folding + DCE to eliminate dead branches. */
+    if (tcc_state->opt_const_prop)
+    {
+      tcc_ir_opt_branch_folding(ir);
+      if (tcc_state->opt_dce)
+        tcc_ir_opt_dce(ir);
+    }
+  }
 
   /* Phase 4: Redundant Store Elimination - remove stores overwritten before read
    * CONSERVATIVE: Only handles stack locals whose address is not taken */
@@ -13229,7 +19172,7 @@ static void gen_function(Sym *sym)
     for (int i = 0; i < ir->next_instruction_index; ++i)
     {
       const IRQuadCompact *q = &ir->compact_instructions[i];
-      if (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID)
+      if (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID || q->op == TCCIR_OP_BUILTIN_APPLY)
       {
         ir->leaffunc = 0;
         break;
@@ -13328,6 +19271,23 @@ static void gen_function(Sym *sym)
     put_extern_sym(sym, cur_text_section, ind + 1, 0);
   }
 
+  /* Before codegen, create placeholder ELF symbols for addr-taken labels
+   * (&&label) that are still on global_label_stack with c == -3.
+   * During codegen, the backend will emit relocations referencing these
+   * symbols.  After codegen, label_pop will UPDATE them with real offsets
+   * from the IR-to-code mapping. */
+  {
+    Sym *lbl;
+    for (lbl = global_label_stack; lbl && lbl != global_label_stack_start; lbl = lbl->prev)
+    {
+      if (lbl->c == -3)
+      {
+        lbl->c = 0; /* Reset marker so put_extern_sym2 creates new symbol */
+        put_extern_sym2(lbl, cur_text_section->sh_num, 0, 1, 1);
+      }
+    }
+  }
+
   tcc_ir_codegen_generate(ir);
   if (!sym->a.naked)
   {
@@ -13367,6 +19327,27 @@ static void gen_function(Sym *sym)
   local_scope = 0;
   /* Only pop labels defined in this function - use saved stack position */
   label_pop(&global_label_stack, global_label_stack_start, 0);
+
+  /* Resolve deferred label-difference fixups now that label ELF symbols
+     have their final code offsets from label_pop above. */
+  {
+    LabelDiffFixup *f = tcc_state->label_diff_fixups;
+    while (f)
+    {
+      LabelDiffFixup *next = f->next;
+      ElfSym *esym_plus = elfsym(f->sym_plus);
+      ElfSym *esym_minus = elfsym(f->sym_minus);
+      if (esym_plus && esym_minus)
+      {
+        int32_t diff = (int32_t)esym_plus->st_value - (int32_t)esym_minus->st_value;
+        add32le(f->sec->data + f->offset, diff);
+      }
+      tcc_free(f);
+      f = next;
+    }
+    tcc_state->label_diff_fixups = NULL;
+  }
+
   if (ir && ir->ir_to_code_mapping)
   {
     tcc_free(ir->ir_to_code_mapping);
@@ -13408,6 +19389,9 @@ static void gen_inline_functions(TCCState *s)
       sym = fn->sym;
       if (sym && (sym->c || !(sym->type.t & VT_INLINE)))
       {
+        /* Skip original va_arg_pack functions - only their clones get compiled */
+        if (sym->type.ref && sym->type.ref->f.func_va_arg_pack)
+          continue;
         /* the function was used or forced (and then not internal):
            generate its code and convert it to a normal function */
         fn->sym = NULL;
@@ -13627,12 +19611,14 @@ static int decl(int l)
         if ((type.t & VT_BTYPE) != VT_FUNC)
           expect("function definition");
 
-        /* reject abstract declarators in function definition
-           make old style params without decl have int type */
+        /* reject abstract declarators in old-style function definition
+           make old style params without decl have int type.
+           New-style (FUNC_NEW/FUNC_ELLIPSIS) unnamed params are valid
+           in GNU C and C23. */
         sym = type.ref;
         while ((sym = sym->next) != NULL)
         {
-          if (!(sym->v & ~SYM_FIELD))
+          if (!(sym->v & ~SYM_FIELD) && type.ref->f.func_type == FUNC_OLD)
             expect("identifier");
           if (sym->type.t == VT_VOID)
             sym->type = int_type;
@@ -13698,6 +19684,93 @@ static int decl(int l)
            * is the parent. Pass it explicitly for multi-level nesting. */
           prescan_captured_vars(nf, local_stack, tcc_state->current_nested_func);
 
+          /* Also scan VLA parameter expressions for captured variables.
+           * VLA expressions (vla_array_str) are not part of the function body
+           * token stream, so prescan_captured_vars won't find them. */
+          prescan_vla_param_captured_vars(nf, local_stack);
+
+          /* Non-local goto: emit setjmp for each __label__ targeted by this nested function.
+           * For each target label, we:
+           *   1. Emit SETJMP(buf) where buf is the 12-byte jmp_buf allocated during __label__ processing
+           *   2. If setjmp returns nonzero (longjmp occurred), emit a forward goto to the label
+           * This allows the nested function to longjmp back to the parent's label. */
+          if (tcc_state->ir && nf->nb_nlgotos > 0)
+          {
+            /* Force a frame pointer since longjmp restores FP */
+            tcc_state->force_frame_pointer = 1;
+
+            /* Force all local variables and parameters to be stack-resident.
+             * NL_SETJMP saves callee-saved registers at this point (the nested
+             * function definition site), but locals may be modified between the
+             * setjmp and the nested function call.  NL_LONGJMP restores registers
+             * to the setjmp-time values, which would overwrite those modifications.
+             * By marking every local/parameter as address-taken we ensure their
+             * live values reside on the stack, where NL_LONGJMP cannot corrupt them. */
+            for (Sym *s = local_stack; s; s = s->prev)
+            {
+              if ((s->r & VT_VALMASK) == VT_LOCAL || (s->r & VT_PARAM))
+              {
+                s->a.addrtaken = 1;
+                if (s->vreg >= 0)
+                  tcc_ir_set_addrtaken(tcc_state->ir, s->vreg);
+              }
+            }
+
+            for (int ngi = 0; ngi < nf->nb_nlgotos; ngi++)
+            {
+              int lbl_tok = nf->nlgoto_label_tokens[ngi];
+              int buf_off = nf->nlgoto_buf_offsets[ngi];
+
+              /* Create SValue for buffer address (FP-relative, no deref = address) */
+              SValue buf_sv;
+              svalue_init(&buf_sv);
+              buf_sv.type.t = VT_INT;
+              buf_sv.type.ref = NULL;
+              buf_sv.r = VT_LOCAL;
+              buf_sv.c.i = buf_off;
+              buf_sv.vr = -1;
+
+              /* Create dest SValue for setjmp return value */
+              SValue dest_sv;
+              svalue_init(&dest_sv);
+              dest_sv.type.t = VT_INT;
+              dest_sv.type.ref = NULL;
+              dest_sv.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+              dest_sv.r = 0;
+              dest_sv.c.i = 0;
+
+              /* Emit NL_SETJMP: saves r4-r11, SP, resume_addr into 40-byte buf */
+              tcc_ir_put(tcc_state->ir, TCCIR_OP_NL_SETJMP, &buf_sv, NULL, &dest_sv);
+
+              /* Push setjmp result on vstack and test if nonzero */
+              vpushi(0);
+              vtop->vr = dest_sv.vr;
+              vtop->r = 0;
+              vtop->type.t = VT_INT;
+              vtop->type.ref = NULL;
+              vtop->c.i = 0;
+
+              /* Compare with 0: result != 0 means longjmp return */
+              vpushi(0);
+              gen_op(TOK_NE);
+
+              /* Conditional forward jump to the label */
+              int jump_chain = tcc_ir_codegen_test_gen(tcc_state->ir, 0, -1);
+
+              /* Find or create the label symbol for forward reference */
+              Sym *lbl_s = label_find(lbl_tok);
+              if (!lbl_s)
+                lbl_s = label_push(&global_label_stack, lbl_tok, LABEL_FORWARD);
+              else if (lbl_s->r == LABEL_DECLARED)
+                lbl_s->r = LABEL_FORWARD;
+
+              /* Chain the conditional jump to the label's forward chain */
+              if (lbl_s->jnext >= 0)
+                tcc_ir_backpatch_first(tcc_state->ir, lbl_s->jnext, jump_chain);
+              lbl_s->jnext = jump_chain;
+            }
+          }
+
           /* Increment count */
           tcc_state->nb_nested_funcs++;
 
@@ -13724,6 +19797,71 @@ static int decl(int l)
           fn->sym = sym;
           dynarray_add(&tcc_state->inline_fns, &tcc_state->nb_inline_fns, fn);
           skip_or_save_block(&fn->func_str);
+
+          /* Scan saved token stream for __builtin_va_arg_pack() usage.
+           * If found, mark the function so call sites can expand it. */
+          if (fn->func_str && sym->type.ref)
+          {
+            const int *p = tok_str_buf(fn->func_str);
+            while (*p != TOK_EOF && *p != 0)
+            {
+              if (*p == TOK_builtin_va_arg_pack)
+              {
+                sym->type.ref->f.func_va_arg_pack = 1;
+                break;
+              }
+              /* Skip token payload */
+              int t = *p++;
+              switch (t)
+              {
+              case TOK_CINT:
+              case TOK_CUINT:
+              case TOK_CCHAR:
+              case TOK_LCHAR:
+              case TOK_CFLOAT:
+              case TOK_CFLOAT_I:
+              case TOK_CINT_I:
+              case TOK_LINENUM:
+#if LONG_SIZE == 4
+              case TOK_CLONG:
+              case TOK_CULONG:
+#endif
+                p++;
+                break;
+              case TOK_CDOUBLE:
+              case TOK_CDOUBLE_I:
+              case TOK_CLLONG:
+              case TOK_CULLONG:
+#if LONG_SIZE == 8
+              case TOK_CLONG:
+              case TOK_CULONG:
+#endif
+                p += 2;
+                break;
+              case TOK_CLDOUBLE:
+              case TOK_CLDOUBLE_I:
+#if LDOUBLE_SIZE == 8 || defined TCC_USING_DOUBLE_FOR_LDOUBLE
+                p += 2;
+#elif LDOUBLE_SIZE == 12
+                p += 3;
+#elif LDOUBLE_SIZE == 16
+                p += 4;
+#endif
+                break;
+              case TOK_STR:
+              case TOK_LSTR:
+              case TOK_PPNUM:
+              case TOK_PPSTR:
+              {
+                int sz = *p++;
+                p += (sz + sizeof(int) - 1) / sizeof(int);
+                break;
+              }
+              default:
+                break;
+              }
+            }
+          }
         }
         else
         {
@@ -13765,6 +19903,13 @@ static int decl(int l)
           if (sym->type.t != VT_VOID)
             tcc_error("redefinition of parameter '%s'", get_tok_str(v, NULL));
           convert_parameter_type(&type);
+          /* K&R default argument promotion: float parameters are received
+             as double because callers apply default argument promotions
+             (C89 6.5.4.2).  Without a prototype, float is promoted to
+             double at the call site, so the function must receive the
+             parameter as double. */
+          if ((type.t & VT_BTYPE) == VT_FLOAT)
+            type.t = (type.t & ~VT_BTYPE) | VT_DOUBLE;
           sym->type = type;
         }
         else if (type.t & VT_TYPEDEF)

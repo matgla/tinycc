@@ -1,7 +1,7 @@
 import pytest
 import re
 from pathlib import Path
-from qemu_run import run_test, compile_testcase, CompileConfig, prepare_test
+from qemu_run import run_test, compile_testcase, CompileConfig, prepare_test, ASAN_ENABLED, VALGRIND_ENABLED
 
 
 # When expected output contains floating point literals, match numerically and
@@ -243,6 +243,15 @@ TEST_FILES = [
     # __builtin_classify_type tests
     ("140_builtin_classify_type.c", 0),
 
+    # __builtin_bswap16, __builtin_bswap32, __builtin_bswap64 tests
+    ("145_builtin_bswap.c", 0),
+
+    # __builtin_add_overflow, __builtin_sub_overflow, __builtin_mul_overflow tests
+    ("165_builtin_add_overflow.c", 0),
+
+    # __builtin_add_overflow_p, __builtin_sub_overflow_p, __builtin_mul_overflow_p tests
+    ("166_builtin_mul_overflow_p.c", 0),
+
     # ("../tests2/106_versym.c", 0),
     ("../tests2/108_constructor.c", 0),
     # ("../tests2/112_backtrace.c", 0),
@@ -295,6 +304,7 @@ TEST_FILES = [
     ("test_complex_simple.c", 0),
 
     ("111_builtin_printf.c", 0),
+    ("112_builtin_puts.c", 0),
 ]
 
 # Nested function tests expected to fail (not yet implemented)
@@ -635,10 +645,19 @@ def _generate_matrix_params(test_list):
 _MATRIX_PARAMS, _MATRIX_IDS = _generate_matrix_params(TEST_FILES)
 
 
+# Tests too slow under instrumentation (ASan / valgrind) — skip to avoid timeouts.
+SLOW_UNDER_INSTRUMENTATION = {
+    "../tests2/101_cleanup.c",
+}
+
+
 @pytest.mark.parametrize("test_file,expected_exit_code,timeout,opt_level", _MATRIX_PARAMS, ids=_MATRIX_IDS)
 def test_qemu_execution(test_file, expected_exit_code, timeout, opt_level, tmp_path):
     if test_file is None:
         pytest.fail("test_file is None")
+    primary = _primary_test_file(test_file) if isinstance(test_file, list) else test_file
+    if (ASAN_ENABLED or VALGRIND_ENABLED) and primary in SLOW_UNDER_INSTRUMENTATION:
+        pytest.skip("Skipped under ASan/valgrind (too slow)")
 
     _run_qemu_test(test_file, expected_exit_code, opt_level=opt_level, output_dir=tmp_path, timeout=timeout)
 

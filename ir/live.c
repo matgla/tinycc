@@ -17,6 +17,47 @@
  * Internal Helper Functions
  * ============================================================================ */
 
+/* Check if a FP IR instruction remaining in the IR will be lowered to a
+ * soft-float library call (BL) by the backend.  This is needed so the
+ * register allocator treats these instructions as call-sites and avoids
+ * placing live values in caller-saved registers across them.
+ *
+ * When no hardware FPU flag is set for an operation, all remaining
+ * instances of that IR opcode are guaranteed to be lowered to library
+ * calls (non-complex instances were already converted to FUNCCALLVAL/
+ * FUNCCALLVOID by ir_put_soft_call_fpu_if_needed; complex instances
+ * bypass that conversion but are still calls in the backend).
+ */
+static int ir_op_is_implicit_call(TccIrOp op)
+{
+  const FloatingPointConfig *fpu = architecture_config.fpu;
+  if (!fpu)
+    return 0;
+  switch (op)
+  {
+  case TCCIR_OP_FADD:
+    return !(fpu->has_fadd && fpu->has_dadd);
+  case TCCIR_OP_FSUB:
+    return !(fpu->has_fsub && fpu->has_dsub);
+  case TCCIR_OP_FMUL:
+    return !(fpu->has_fmul && fpu->has_dmul);
+  case TCCIR_OP_FDIV:
+    return !(fpu->has_fdiv && fpu->has_ddiv);
+  case TCCIR_OP_FNEG:
+    return !(fpu->has_fneg && fpu->has_dneg);
+  case TCCIR_OP_FCMP:
+    return !(fpu->has_fcmp && fpu->has_dcmp);
+  case TCCIR_OP_CVT_FTOF:
+    return !(fpu->has_ftof && fpu->has_dtof);
+  case TCCIR_OP_CVT_ITOF:
+    return !(fpu->has_itof && fpu->has_itod);
+  case TCCIR_OP_CVT_FTOI:
+    return !(fpu->has_ftoi && fpu->has_dtoi);
+  default:
+    return 0;
+  }
+}
+
 /* Check if there's a call instruction in range using prefix sum array */
 static int live_has_call_in_range_prefix(const int *call_prefix, int start, int end, int instruction_count)
 {
@@ -145,15 +186,51 @@ static void live_extend_intervals_for_backward_jumps(TCCIRState *ir)
   for (int i = 0; i < n; ++i)
   {
     const IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF)
-      continue;
-    const int target = tcc_ir_op_get_dest(ir, q).u.imm32;
-    if (target < 0 || target >= n)
-      continue;
-    if (target >= i)
-      continue;
-    if (extend_to[target] < i)
-      extend_to[target] = i;
+    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
+    {
+      const int target = tcc_ir_op_get_dest(ir, q).u.imm32;
+      if (target >= 0 && target < n && target < i)
+      {
+        if (extend_to[target] < i)
+          extend_to[target] = i;
+      }
+    }
+    else if (q->op == TCCIR_OP_SWITCH_TABLE)
+    {
+      /* SWITCH_TABLE can jump backward to any of its case targets */
+      IROperand src2 = tcc_ir_op_get_src2(ir, q);
+      int table_id = (int)irop_get_imm64_ex(ir, src2);
+      if (table_id >= 0 && table_id < ir->num_switch_tables)
+      {
+        TCCIRSwitchTable *table = &ir->switch_tables[table_id];
+        for (int j = 0; j < table->num_entries; j++)
+        {
+          int target = table->targets[j];
+          if (target >= 0 && target < n && target < i)
+          {
+            if (extend_to[target] < i)
+              extend_to[target] = i;
+          }
+        }
+        int dtarget = table->default_target;
+        if (dtarget >= 0 && dtarget < n && dtarget < i)
+        {
+          if (extend_to[dtarget] < i)
+            extend_to[dtarget] = i;
+        }
+      }
+    }
+    else if (q->op == TCCIR_OP_IJUMP)
+    {
+      /* IJUMP (computed goto) can target any label in the function.
+       * Since targets are determined at runtime, conservatively treat it
+       * as a backward edge to instruction 0. */
+      if (i > 0)
+      {
+        if (extend_to[0] < i)
+          extend_to[0] = i;
+      }
+    }
   }
 
   int target_count = 0;
@@ -167,10 +244,34 @@ static void live_extend_intervals_for_backward_jumps(TCCIRState *ir)
   }
 
   int *targets = (int *)tcc_malloc(sizeof(int) * target_count);
+  int *is_ijmp_target = (int *)tcc_malloc(sizeof(int) * target_count);
   int out = 0;
   for (int t = 0; t < n; ++t)
     if (extend_to[t] >= 0)
-      targets[out++] = t;
+    {
+      targets[out] = t;
+      is_ijmp_target[out] = 0;
+      out++;
+    }
+
+  /* Mark targets that originate from IJMP (computed goto).  IJMP targets
+   * are conservatively set to instruction 0, so check if any IJMP exists. */
+  {
+    int has_ijmp = 0;
+    for (int i = 0; i < n && !has_ijmp; ++i)
+    {
+      if (ir->compact_instructions[i].op == TCCIR_OP_IJUMP)
+        has_ijmp = 1;
+    }
+    if (has_ijmp)
+    {
+      for (int ti = 0; ti < target_count; ++ti)
+      {
+        if (targets[ti] == 0)
+          is_ijmp_target[ti] = 1;
+      }
+    }
+  }
 
   const int local_count = ir->next_local_variable;
   const int temp_count = ir->next_temporary_variable;
@@ -238,8 +339,14 @@ static void live_extend_intervals_for_backward_jumps(TCCIRState *ir)
     if (jump_end < 0)
       continue;
 
-    /* Advance scan position and add intervals that start in [scan_pos, target]. */
-    for (; scan_pos <= target && scan_pos < n; ++scan_pos)
+    const int ijmp = is_ijmp_target[ti];
+
+    /* For IJMP (computed goto) targets, scan the entire loop body [target, jump_end]
+     * because IJMP can target any label and variables defined inside the loop body
+     * may be live across the backward edge.  For regular backward jumps, only scan
+     * up to the target — variables live at the loop header are sufficient. */
+    const int scan_limit = ijmp ? jump_end : target;
+    for (; scan_pos <= scan_limit && scan_pos < n; ++scan_pos)
     {
       for (int node = start_head[scan_pos]; node != -1; node = start_next[node])
       {
@@ -247,7 +354,10 @@ static void live_extend_intervals_for_backward_jumps(TCCIRState *ir)
       }
     }
 
-    /* Compact active set to intervals that are live at 'target'. */
+    /* Compact active set.  For IJMP targets, keep intervals that overlap
+     * [target, jump_end] — the entire loop body — because the runtime target
+     * is unknown.  For regular backward jumps, keep only intervals live at
+     * the specific target (the original, tighter filter). */
     int w = 0;
     for (int i = 0; i < active_count; ++i)
     {
@@ -256,15 +366,27 @@ static void live_extend_intervals_for_backward_jumps(TCCIRState *ir)
         continue;
       if (interval->start == INTERVAL_NOT_STARTED)
         continue;
-      if ((int)interval->start > target)
-        continue;
-      if ((int)interval->end < target)
-        continue;
+      if (ijmp)
+      {
+        /* Broad filter: overlaps [target, jump_end] */
+        if ((int)interval->start > jump_end)
+          continue;
+        if ((int)interval->end < target)
+          continue;
+      }
+      else
+      {
+        /* Original tight filter: live at target */
+        if ((int)interval->start > target)
+          continue;
+        if ((int)interval->end < target)
+          continue;
+      }
       active[w++] = interval;
     }
     active_count = w;
 
-    /* Extend all intervals live at the jump target. */
+    /* Extend all matching intervals to cover through the jump source. */
     for (int i = 0; i < active_count; ++i)
     {
       IRLiveInterval *interval = active[i];
@@ -274,9 +396,163 @@ static void live_extend_intervals_for_backward_jumps(TCCIRState *ir)
   }
 
   tcc_free(active);
+  tcc_free(is_ijmp_target);
   tcc_free(start_interval);
   tcc_free(start_next);
   tcc_free(start_head);
+
+  /* Second pass: extend starts for variables live at backward jump sources.
+   * When a variable is defined inside a loop but used after the loop exits
+   * (or in subsequent iterations), its value must survive through the
+   * back-edge.  We extend the start of such intervals to the loop target
+   * so they're considered live throughout the loop body.
+   *
+   * Example: variable V defined at 16, used at 21.  Back-edge 17->6.
+   * V is live at 17 (the jump source) but starts at 16 > 6 (the target).
+   * Without this fix, a temporary at instruction 9 could reuse V's register
+   * since the allocator thinks V isn't live yet at 9. */
+
+  /* Collect all backward edges as (source, target) pairs. */
+  int back_edge_count = 0;
+  for (int i = 0; i < n; ++i)
+  {
+    const IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
+    {
+      const int target = tcc_ir_op_get_dest(ir, q).u.imm32;
+      if (target >= 0 && target < n && target < i)
+        back_edge_count++;
+    }
+    else if (q->op == TCCIR_OP_SWITCH_TABLE)
+    {
+      IROperand src2 = tcc_ir_op_get_src2(ir, q);
+      int table_id = (int)irop_get_imm64_ex(ir, src2);
+      if (table_id >= 0 && table_id < ir->num_switch_tables)
+      {
+        TCCIRSwitchTable *table = &ir->switch_tables[table_id];
+        for (int j = 0; j < table->num_entries; j++)
+        {
+          if (table->targets[j] >= 0 && table->targets[j] < n && table->targets[j] < i)
+            back_edge_count++;
+        }
+        if (table->default_target >= 0 && table->default_target < n && table->default_target < i)
+          back_edge_count++;
+      }
+    }
+    else if (q->op == TCCIR_OP_IJUMP)
+    {
+      if (i > 0)
+        back_edge_count++;
+    }
+  }
+
+  if (back_edge_count > 0)
+  {
+    int *be_src = (int *)tcc_malloc(sizeof(int) * back_edge_count);
+    int *be_tgt = (int *)tcc_malloc(sizeof(int) * back_edge_count);
+    int bei = 0;
+    for (int i = 0; i < n; ++i)
+    {
+      const IRQuadCompact *q = &ir->compact_instructions[i];
+      if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
+      {
+        const int target = tcc_ir_op_get_dest(ir, q).u.imm32;
+        if (target >= 0 && target < n && target < i)
+        {
+          be_src[bei] = i;
+          be_tgt[bei] = target;
+          bei++;
+        }
+      }
+      else if (q->op == TCCIR_OP_SWITCH_TABLE)
+      {
+        IROperand src2 = tcc_ir_op_get_src2(ir, q);
+        int table_id = (int)irop_get_imm64_ex(ir, src2);
+        if (table_id >= 0 && table_id < ir->num_switch_tables)
+        {
+          TCCIRSwitchTable *table = &ir->switch_tables[table_id];
+          for (int j = 0; j < table->num_entries; j++)
+          {
+            int target = table->targets[j];
+            if (target >= 0 && target < n && target < i)
+            {
+              be_src[bei] = i;
+              be_tgt[bei] = target;
+              bei++;
+            }
+          }
+          int dtarget = table->default_target;
+          if (dtarget >= 0 && dtarget < n && dtarget < i)
+          {
+            be_src[bei] = i;
+            be_tgt[bei] = dtarget;
+            bei++;
+          }
+        }
+      }
+      else if (q->op == TCCIR_OP_IJUMP)
+      {
+        if (i > 0)
+        {
+          be_src[bei] = i;
+          be_tgt[bei] = 0;
+          bei++;
+        }
+      }
+    }
+
+    /* Iterate until stable — extending one interval's start may make it
+     * live at another back-edge source, requiring further extension
+     * (e.g. nested loops). */
+    int changed = 1;
+    while (changed)
+    {
+      changed = 0;
+      for (int b = 0; b < back_edge_count; ++b)
+      {
+        const int J = be_src[b]; /* jump source */
+        const int T = be_tgt[b]; /* jump target */
+
+        for (int v = 0; v < local_count; ++v)
+        {
+          IRLiveInterval *iv = &ir->variables_live_intervals[v];
+          if (iv->start == INTERVAL_NOT_STARTED)
+            continue;
+          if ((int)iv->start <= J && (int)iv->end >= J && (int)iv->start > T)
+          {
+            iv->start = (uint32_t)T;
+            changed = 1;
+          }
+        }
+        for (int v = 0; v < temp_count; ++v)
+        {
+          IRLiveInterval *iv = &ir->temporary_variables_live_intervals[v];
+          if (iv->start == INTERVAL_NOT_STARTED)
+            continue;
+          if ((int)iv->start <= J && (int)iv->end >= J && (int)iv->start > T)
+          {
+            iv->start = (uint32_t)T;
+            changed = 1;
+          }
+        }
+        for (int v = 0; v < param_count; ++v)
+        {
+          IRLiveInterval *iv = &ir->parameters_live_intervals[v];
+          if (iv->start == INTERVAL_NOT_STARTED)
+            continue;
+          if ((int)iv->start <= J && (int)iv->end >= J && (int)iv->start > T)
+          {
+            iv->start = (uint32_t)T;
+            changed = 1;
+          }
+        }
+      }
+    }
+
+    tcc_free(be_src);
+    tcc_free(be_tgt);
+  }
+
   tcc_free(targets);
   tcc_free(extend_to);
 }
@@ -348,9 +624,7 @@ void tcc_ir_live_intervals_compute(TCCIRState *ir)
        * address (base pointer) which is READ, not written.  Treat it
        * as a USE so that parameters / earlier definitions keep their
        * original start and backward-jump extension sees them alive. */
-      int dest_is_use = (q->op == TCCIR_OP_STORE ||
-                         q->op == TCCIR_OP_STORE_INDEXED ||
-                         q->op == TCCIR_OP_STORE_POSTINC);
+      int dest_is_use = (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED || q->op == TCCIR_OP_STORE_POSTINC);
       if (interval->start == INTERVAL_NOT_STARTED)
       {
         interval->start = dest_is_use ? 0 : i;
@@ -445,7 +719,10 @@ void tcc_ir_live_analysis(TCCIRState *ir)
     for (int i = 0; i < instruction_count; ++i)
     {
       const TccIrOp op = ir->compact_instructions[i].op;
-      const int is_call = (op == TCCIR_OP_FUNCCALLVOID || op == TCCIR_OP_FUNCCALLVAL) ? 1 : 0;
+      const int is_call = (op == TCCIR_OP_FUNCCALLVOID || op == TCCIR_OP_FUNCCALLVAL || op == TCCIR_OP_BUILTIN_APPLY ||
+                           ir_op_is_implicit_call(op))
+                              ? 1
+                              : 0;
       call_prefix[i + 1] = call_prefix[i] + is_call;
     }
   }
@@ -536,7 +813,14 @@ void tcc_ir_live_analysis(TCCIRState *ir)
     crosses_call = (call_prefix && end > 0) ? (call_prefix[end] != 0) : 0;
     addrtaken = interval->addrtaken;
     reg_type = tcc_ir_vreg_type_get(ir, vreg_encoded);
-    int precolored = (vreg < 4 && !crosses_call) ? vreg : -1;
+    /* Only precolor parameters that actually arrive in a register.
+     * Stack-passed parameters (incoming_reg0 < 0) must NOT be precolored,
+     * even if their vreg index < 4 — e.g. when AAPCS 8-byte alignment
+     * skips a register, the parameter indices no longer match register
+     * numbers and a stack-passed struct could get a false precoloring. */
+    int precolored = -1;
+    if (vreg < 4 && !crosses_call && interval->incoming_reg0 >= 0)
+      precolored = interval->incoming_reg0;
     tcc_ls_add_live_interval(&ir->ls, vreg_encoded, start, end, crosses_call, addrtaken, reg_type, interval->is_lvalue,
                              precolored);
   }
@@ -633,7 +917,10 @@ int tcc_ir_live_has_call_in_range(TCCIRState *ir, int start, int end)
     for (int i = 0; i < instruction_count; ++i)
     {
       const TccIrOp op = ir->compact_instructions[i].op;
-      const int is_call = (op == TCCIR_OP_FUNCCALLVOID || op == TCCIR_OP_FUNCCALLVAL) ? 1 : 0;
+      const int is_call = (op == TCCIR_OP_FUNCCALLVOID || op == TCCIR_OP_FUNCCALLVAL || op == TCCIR_OP_BUILTIN_APPLY ||
+                           ir_op_is_implicit_call(op))
+                              ? 1
+                              : 0;
       call_prefix[i + 1] = call_prefix[i] + is_call;
     }
     result = live_has_call_in_range_prefix(call_prefix, start, end, instruction_count);

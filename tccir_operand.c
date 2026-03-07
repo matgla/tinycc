@@ -464,7 +464,11 @@ IROperand svalue_to_iroperand(TCCIRState *ir, const SValue *sv)
       pool_flags |= IRPOOL_SYMREF_LVAL;
     if (is_local)
       pool_flags |= IRPOOL_SYMREF_LOCAL;
-    uint32_t idx = tcc_ir_pool_add_symref(ir, sv->sym, (int32_t)sv->c.i, pool_flags);
+    /* Only store sv->sym if VT_SYM is actually set; otherwise the pointer may be stale garbage.
+     * SValues that reach this fallback (e.g. VT_CMP results) may have an uninitialized
+     * sym field from a previous vstack operation. */
+    Sym *fallback_sym = has_sym ? sv->sym : NULL;
+    uint32_t idx = tcc_ir_pool_add_symref(ir, fallback_sym, (int32_t)sv->c.i, pool_flags);
     result = irop_make_symref(vr, idx, is_lval, is_local, is_const, irop_bt);
     result.is_sym = has_sym; /* Only set if original had VT_SYM */
     irop_copy_svalue_info(&result, sv);
@@ -499,6 +503,20 @@ done:
       /* Pure vreg: u is unused, just store ctype_idx */
       result.u.s.ctype_idx = (uint16_t)ctype_idx;
       result.u.s.aux_data = 0;
+    }
+    else if (tag == IROP_TAG_IMM32)
+    {
+      /* Immediate constant (e.g. GCC union cast): store imm32 in aux_data (±32K range) */
+      int32_t imm_val = result.u.imm32;
+      result.u.s.ctype_idx = (uint16_t)ctype_idx;
+      result.u.s.aux_data = (int16_t)imm_val;
+    }
+    else if (tag == IROP_TAG_I64)
+    {
+      /* 64-bit integer constant: store pool index in aux_data */
+      uint32_t i64_idx = result.u.pool_idx;
+      result.u.s.ctype_idx = (uint16_t)ctype_idx;
+      result.u.s.aux_data = (int16_t)i64_idx;
     }
     else
     {
@@ -557,11 +575,22 @@ void iroperand_to_svalue(const TCCIRState *ir, IROperand op, SValue *out)
     out->r = op.is_const ? VT_CONST : 0;
     if (op.is_lval)
       out->r |= VT_LVAL;
-    /* Zero-extend for unsigned types, sign-extend for signed */
-    if (op.is_unsigned)
-      out->c.i = (int64_t)(uint32_t)op.u.imm32;
+    /* For STRUCT types, imm32 is stored in aux_data (split encoding) */
+    if (irop_bt == IROP_BTYPE_STRUCT)
+    {
+      if (op.is_unsigned)
+        out->c.i = (int64_t)(uint16_t)op.u.s.aux_data;
+      else
+        out->c.i = (int64_t)op.u.s.aux_data;
+    }
     else
-      out->c.i = (int64_t)op.u.imm32;
+    {
+      /* Zero-extend for unsigned types, sign-extend for signed */
+      if (op.is_unsigned)
+        out->c.i = (int64_t)(uint32_t)op.u.imm32;
+      else
+        out->c.i = (int64_t)op.u.imm32;
+    }
     break;
 
   case IROP_TAG_STACKOFF:
@@ -602,7 +631,8 @@ void iroperand_to_svalue(const TCCIRState *ir, IROperand op, SValue *out)
 
   case IROP_TAG_I64:
   {
-    uint32_t idx = op.u.pool_idx;
+    /* For STRUCT types, pool_idx is stored in aux_data (split encoding) */
+    uint32_t idx = (irop_bt == IROP_BTYPE_STRUCT) ? (uint32_t)(uint16_t)op.u.s.aux_data : op.u.pool_idx;
     out->r = VT_CONST;
     if (op.is_lval)
       out->r |= VT_LVAL;
@@ -842,4 +872,79 @@ int irop_type_size_align(IROperand op, int *align_out)
   if (align_out)
     *align_out = align;
   return 0; // Unknown size
+}
+
+/* Compute the AAPCS "natural alignment" of a struct for parameter passing.
+ * AAPCS defines composite alignment as the max alignment of fundamental
+ * data type members.  This differs from the struct's storage alignment
+ * because __attribute__((aligned)) on the struct itself does NOT affect
+ * parameter passing, and __attribute__((packed)) DOES reduce it.
+ * Returns the natural alignment (minimum 1). */
+static int compute_aapcs_member_alignment(CType *ct);
+
+int ctype_aapcs_alignment(CType *ct)
+{
+  return compute_aapcs_member_alignment(ct);
+}
+
+static int compute_aapcs_member_alignment(CType *ct)
+{
+  if (!ct)
+    return 4;
+  int bt = ct->t & VT_BTYPE;
+  if (bt != VT_STRUCT)
+  {
+    /* Fundamental type — use its natural alignment */
+    int align;
+    type_size(ct, &align);
+    return align > 0 ? align : 1;
+  }
+  /* Walk struct/union members and find max alignment recursively */
+  Sym *s = ct->ref;
+  if (!s)
+    return 4;
+  int max_align = 1;
+  for (Sym *f = s->next; f; f = f->next)
+  {
+    int member_align;
+    if ((f->type.t & VT_BTYPE) == VT_STRUCT)
+    {
+      /* Recurse into nested structs */
+      member_align = compute_aapcs_member_alignment(&f->type);
+    }
+    else if (f->type.t & VT_BITFIELD)
+    {
+      /* Bitfields: use underlying type alignment */
+      CType base_type = f->type;
+      base_type.t &= ~VT_BITFIELD;
+      type_size(&base_type, &member_align);
+    }
+    else
+    {
+      type_size(&f->type, &member_align);
+    }
+    /* If the member or the struct is packed, the member's effective
+     * alignment is 1 (packed overrides natural alignment). */
+    if (f->a.packed || s->a.packed)
+      member_align = 1;
+    if (member_align > max_align)
+      max_align = member_align;
+  }
+  return max_align;
+}
+
+/* Get the AAPCS parameter-passing alignment for an IROperand.
+ * For structs, walks members to compute natural alignment (ignoring
+ * __attribute__((aligned)) on the struct itself).
+ * For scalars, returns the type's natural alignment. */
+int irop_aapcs_alignment(IROperand op)
+{
+  if (op.btype == IROP_BTYPE_STRUCT)
+  {
+    CType *ct = tcc_ir_pool_get_ctype_ptr(tcc_state->ir, op.u.s.ctype_idx);
+    return compute_aapcs_member_alignment(ct);
+  }
+  int align;
+  irop_type_size_align(op, &align);
+  return align;
 }

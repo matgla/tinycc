@@ -163,6 +163,13 @@ int irop_btype_to_vt_btype(int irop_btype);
 int irop_type_size(IROperand op);
 int irop_type_size_align(IROperand op, int *align_out);
 
+/* AAPCS natural alignment for parameter passing (walks struct members,
+ * ignoring __attribute__((aligned)) on the struct itself). */
+int irop_aapcs_alignment(IROperand op);
+
+/* AAPCS natural alignment from CType (for callee-side parameter layout). */
+int ctype_aapcs_alignment(struct CType *ct);
+
 /* Get CType for struct operands (returns NULL for non-struct types) */
 struct CType *irop_get_ctype(IROperand op);
 

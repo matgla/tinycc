@@ -130,8 +130,37 @@ typedef enum TccIrOp
   /* No-operation placeholder for dead instructions */
   TCCIR_OP_NOP,
 
+  /* Prefetch data cache hint (PLD/PLI on ARM) - __builtin_prefetch */
+  TCCIR_OP_PREFETCH,
+
   /* Generate a trap instruction (e.g., UDF on ARM) */
   TCCIR_OP_TRAP,
+
+  /* Setjmp/longjmp for non-local exits:
+   * SETJMP: src1 = jump buffer pointer, dest = return value (0 on first call, 1 on longjmp)
+   * LONGJMP: src1 = jump buffer pointer, src2.c.i = return value (forced to 1)
+   */
+  TCCIR_OP_SETJMP,
+  TCCIR_OP_LONGJMP,
+
+  /* Non-local goto setjmp/longjmp: saves/restores ALL callee-saved registers
+   * (r4-r11) plus SP and resume address in a 40-byte buffer.
+   * Used for nested function non-local goto (__label__ + goto from nested func).
+   * NL_SETJMP: src1 = jump buffer pointer (40 bytes), dest = return value
+   * NL_LONGJMP: src1 = jump buffer pointer (40 bytes)
+   */
+  TCCIR_OP_NL_SETJMP,
+  TCCIR_OP_NL_LONGJMP,
+
+  /* __builtin_apply_args / __builtin_apply / __builtin_return support:
+   * BUILTIN_APPLY_ARGS: dest = pointer to saved incoming arg registers (r0-r3)
+   * BUILTIN_APPLY: dest = pointer to return-value block;
+   *                src1 = function pointer, src2 = args block (from apply_args)
+   * BUILTIN_RETURN: src1 = pointer to return-value block (from apply)
+   */
+  TCCIR_OP_BUILTIN_APPLY_ARGS,
+  TCCIR_OP_BUILTIN_APPLY,
+  TCCIR_OP_BUILTIN_RETURN,
 
   /* Jump table switch for dense case statements:
    * src1 = index vreg (already adjusted: value - min_case)

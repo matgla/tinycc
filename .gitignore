@@ -27,6 +27,7 @@ config*.h
 config*.mak
 config.texi
 conftest*
+!**/conftest.py
 c2str
 tags
 TAGS

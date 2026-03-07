@@ -62,6 +62,7 @@ MachineOperand machine_op_from_ir(TCCIRState *ir, const IROperand *op)
   m.btype = irop_get_btype(*op);
   m.is_unsigned = (bool)op->is_unsigned;
   m.is_64bit = (bool)irop_needs_pair(*op);
+  m.is_complex = (bool)op->is_complex;
   m.vreg = (int)irop_get_vreg(*op);
 
   const int tag = irop_get_tag(*op);

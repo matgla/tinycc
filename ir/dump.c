@@ -140,6 +140,8 @@ const char *tcc_ir_get_op_name(TccIrOp op)
     return "CALLSEQ_END";
   case TCCIR_OP_NOP:
     return "NOP";
+  case TCCIR_OP_PREFETCH:
+    return "PREFETCH";
   case TCCIR_OP_TRAP:
     return "TRAP";
   case TCCIR_OP_SET_CHAIN:
@@ -150,6 +152,20 @@ const char *tcc_ir_get_op_name(TccIrOp op)
     return "MLA";
   case TCCIR_OP_SWITCH_TABLE:
     return "SWITCH_TABLE";
+  case TCCIR_OP_BUILTIN_APPLY_ARGS:
+    return "BUILTIN_APPLY_ARGS";
+  case TCCIR_OP_BUILTIN_APPLY:
+    return "BUILTIN_APPLY";
+  case TCCIR_OP_BUILTIN_RETURN:
+    return "BUILTIN_RETURN";
+  case TCCIR_OP_SETJMP:
+    return "SETJMP";
+  case TCCIR_OP_LONGJMP:
+    return "LONGJMP";
+  case TCCIR_OP_NL_SETJMP:
+    return "NL_SETJMP";
+  case TCCIR_OP_NL_LONGJMP:
+    return "NL_LONGJMP";
   default:
     return "UNKNOWN_OP";
   }
@@ -377,6 +393,7 @@ void tcc_dump_quadruple_to(FILE *out, const TACQuadruple *q, int pc)
   switch (op)
   {
   case TCCIR_OP_NOP:
+  case TCCIR_OP_PREFETCH:
   case TCCIR_OP_TRAP:
   case TCCIR_OP_RETURNVALUE:
   case TCCIR_OP_RETURNVOID:
@@ -890,6 +907,7 @@ void tcc_print_quadruple_irop(TCCIRState *ir, IRQuadCompact *q, int pc)
   switch (op)
   {
   case TCCIR_OP_NOP:
+  case TCCIR_OP_PREFETCH:
   case TCCIR_OP_TRAP:
   case TCCIR_OP_RETURNVALUE:
   case TCCIR_OP_RETURNVOID:

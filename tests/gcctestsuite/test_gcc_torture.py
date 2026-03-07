@@ -8,7 +8,7 @@ Run with:
     pytest tests/gcctestsuite/ -v              # All GCC tests
     pytest tests/gcctestsuite/ -v -m gcc_compile   # Compile-only tests
     pytest tests/gcctestsuite/ -v -m gcc_execute   # Execute tests
-    
+
 Environment:
     GCC_TORTURE_PATH    Path to GCC torture tests
 """
@@ -21,7 +21,7 @@ from pathlib import Path
 from conftest import (
     GCCTestCase, GCC_TORTURE_PATH, OPT_LEVELS,
     discover_gcc_compile_tests, discover_gcc_execute_tests,
-    should_skip_gcc_test, is_xfail_test
+    should_skip_gcc_test, is_xfail_test, parse_dg_options
 )
 
 # Add ir_tests to path for qemu_run
@@ -43,9 +43,12 @@ except ImportError:
 
 def run_compile_test(test_case: GCCTestCase, opt_level: str, tmp_path: Path) -> None:
     """Run a compile-only test."""
+    extra_flags = opt_level
+    if test_case.dg_options:
+        extra_flags = f"{opt_level} {test_case.dg_options}"
     if QEMU_AVAILABLE:
         config = CompileConfig(
-            extra_cflags=opt_level,
+            extra_cflags=extra_flags,
             output_dir=tmp_path,
             clean_before_build=False,
             timeout=test_case.timeout
@@ -60,7 +63,7 @@ def run_compile_test(test_case: GCCTestCase, opt_level: str, tmp_path: Path) -> 
             opt_level,
             "-c",
             str(test_case.source),
-            "-o", 
+            "-o",
             str(tmp_path / "test.o")
         ]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=test_case.timeout)
@@ -89,11 +92,11 @@ def _generate_compile_params():
         skip_reason = should_skip_gcc_test(test_case.source)
         if skip_reason:
             test_case.skip_reason = skip_reason
-        
+
         xfail_reason = is_xfail_test(test_case.source)
         if xfail_reason:
             test_case.xfail_reason = xfail_reason
-            
+
         for opt in OPT_LEVELS:
             params.append((test_case, opt))
             ids.append(f"{test_case.source.stem}{opt}")
@@ -111,10 +114,10 @@ def test_gcc_compile(test_case: GCCTestCase, opt_level: str, tmp_path):
     """Compile GCC torture tests (compile directory)."""
     if test_case.skip_reason:
         pytest.skip(test_case.skip_reason)
-    
+
     if test_case.xfail_reason:
         pytest.xfail(test_case.xfail_reason)
-    
+
     run_compile_test(test_case, opt_level, tmp_path)
 
 
@@ -143,7 +146,7 @@ def _generate_execute_params():
         skip_reason = should_skip_gcc_test(test_case.source)
         if skip_reason:
             test_case.skip_reason = skip_reason
-            
+
         for opt in OPT_LEVELS:
             params.append((test_case, opt))
             ids.append(f"{test_case.source.stem}{opt}")

@@ -62,6 +62,9 @@ extern int tcc_ir_vreg_has_single_use(TCCIRState *ir, int32_t vreg, int exclude_
 #define TCCIR_VREG_TYPE_NONE 0
 #endif
 
+/* Forward declaration (defined in branch_folding section below) */
+static int evaluate_compare_condition(int64_t val1, int64_t val2, int cond_token);
+
 /* ============================================================================
  * Boolean Optimization Helpers
  * ============================================================================ */
@@ -329,8 +332,73 @@ int tcc_ir_opt_const_prop(TCCIRState *ir)
     }
   }
 
+  /* Identity comparison folding: fold CMP+JUMPIF and CMP+SETIF when both CMP
+   * operands are the same vreg.  Comparing a value to itself always yields
+   * equality, so == is true, != is false, <= and >= are true, etc.
+   * Runs before the VAR-centric passes so it works even when there are no VAR
+   * vregs (e.g. functions that only use parameters). */
+  for (i = 0; i < n - 1; i++)
+  {
+    IRQuadCompact *cmp_q = &ir->compact_instructions[i];
+    if (cmp_q->op != TCCIR_OP_CMP)
+      continue;
+
+    IROperand cmp_src1 = tcc_ir_op_get_src1(ir, cmp_q);
+    IROperand cmp_src2 = tcc_ir_op_get_src2(ir, cmp_q);
+
+    /* Check if both operands refer to the same vreg (identity comparison) */
+    int32_t vr1 = irop_get_vreg(cmp_src1);
+    int32_t vr2 = irop_get_vreg(cmp_src2);
+    if (vr1 < 0 || vr2 < 0 || vr1 != vr2)
+      continue;
+
+    IRQuadCompact *next_q = &ir->compact_instructions[i + 1];
+
+    if (next_q->op == TCCIR_OP_JUMPIF)
+    {
+      IROperand cond = tcc_ir_op_get_src1(ir, next_q);
+      int tok = (int)irop_get_imm64_ex(ir, cond);
+      /* evaluate_compare_condition(x, x, cond) — use 0,0 as representative */
+      int result = evaluate_compare_condition(0, 0, tok);
+      if (result < 0)
+        continue;
+
+      IROperand jmp_dest = tcc_ir_op_get_dest(ir, next_q);
+      if (result)
+      {
+        /* Branch always taken — convert CMP to NOP, JUMPIF to unconditional JUMP */
+        cmp_q->op = TCCIR_OP_NOP;
+        next_q->op = TCCIR_OP_JUMP;
+        tcc_ir_set_dest(ir, i + 1, jmp_dest);
+      }
+      else
+      {
+        /* Branch never taken — eliminate both */
+        cmp_q->op = TCCIR_OP_NOP;
+        next_q->op = TCCIR_OP_NOP;
+      }
+      changes++;
+    }
+    else if (next_q->op == TCCIR_OP_SETIF)
+    {
+      IROperand setif_src1 = tcc_ir_op_get_src1(ir, next_q);
+      int tok = (int)irop_get_imm64_ex(ir, setif_src1);
+      int result = evaluate_compare_condition(0, 0, tok);
+      if (result < 0)
+        continue;
+
+      int btype = irop_get_btype(setif_src1);
+      cmp_q->op = TCCIR_OP_NOP;
+      next_q->op = TCCIR_OP_ASSIGN;
+      IROperand new_src1 = irop_make_imm32(-1, result, btype);
+      tcc_ir_set_src1(ir, i + 1, new_src1);
+      tcc_ir_set_src2(ir, i + 1, IROP_NONE);
+      changes++;
+    }
+  }
+
   if (max_var_pos == 0)
-    return 0;
+    return changes;
 
   var_info = tcc_mallocz(sizeof(VarConstInfo) * (max_var_pos + 1));
 
@@ -579,7 +647,10 @@ int tcc_ir_opt_const_prop(TCCIRState *ir)
         result = val1 << val2;
         break;
       case TCCIR_OP_SHR:
-        result = (uint64_t)val1 >> val2;
+        if (btype == IROP_BTYPE_INT64)
+          result = (uint64_t)val1 >> val2;
+        else
+          result = (uint32_t)val1 >> val2;
         break;
       case TCCIR_OP_SAR:
         result = val1 >> val2;
@@ -613,7 +684,10 @@ int tcc_ir_opt_const_prop(TCCIRState *ir)
       case TCCIR_OP_UDIV:
         if (val2 != 0)
         {
-          result = (uint64_t)val1 / (uint64_t)val2;
+          if (btype == IROP_BTYPE_INT64)
+            result = (uint64_t)val1 / (uint64_t)val2;
+          else
+            result = (uint32_t)val1 / (uint32_t)val2;
         }
         else
         {
@@ -623,7 +697,10 @@ int tcc_ir_opt_const_prop(TCCIRState *ir)
       case TCCIR_OP_UMOD:
         if (val2 != 0)
         {
-          result = (uint64_t)val1 % (uint64_t)val2;
+          if (btype == IROP_BTYPE_INT64)
+            result = (uint64_t)val1 % (uint64_t)val2;
+          else
+            result = (uint32_t)val1 % (uint32_t)val2;
         }
         else
         {
@@ -684,7 +761,7 @@ int tcc_ir_opt_const_prop(TCCIRState *ir)
       case TCCIR_OP_OR:
         if (c == 0)
           simplify = 1; /* X | 0 = X */
-        else if (c == -1 || c == 0xFFFFFFFF)
+        else if (c == -1 || (btype != IROP_BTYPE_INT64 && c == 0xFFFFFFFF))
         {
           replace_with_const = 1; /* X | -1 = -1 */
           const_value = -1;
@@ -710,7 +787,7 @@ int tcc_ir_opt_const_prop(TCCIRState *ir)
       case TCCIR_OP_AND:
         if (c == 0)
           replace_with_zero = 1; /* X & 0 = 0 */
-        else if (c == -1 || c == 0xFFFFFFFF)
+        else if (c == -1 || (btype != IROP_BTYPE_INT64 && c == 0xFFFFFFFF))
           simplify = 1; /* X & -1 = X */
         break;
       default:
@@ -930,9 +1007,6 @@ typedef struct
   int is_constant; /* 1 = value is known constant */
   int64_t value;   /* The constant value */
 } VRegConstState;
-
-/* Forward declaration - defined later in branch_folding section */
-static int evaluate_compare_condition(int64_t val1, int64_t val2, int cond_token);
 
 int tcc_ir_opt_value_tracking(TCCIRState *ir)
 {
@@ -1239,6 +1313,93 @@ static int vrp_fold_cmp(int64_t rmin, int64_t rmax, int64_t cmp_val, int tok)
   return res_min;
 }
 
+/* Negate a comparison condition token: return the complement condition.
+ * E.g. negate(EQ) = NE, negate(LT) = GE, etc. Returns -1 on unknown. */
+static int vrp_negate_cmp_tok(int tok)
+{
+  switch (tok)
+  {
+  case TOK_EQ:
+    return TOK_NE;
+  case TOK_NE:
+    return TOK_EQ;
+  case TOK_LT:
+    return TOK_GE;
+  case TOK_GE:
+    return TOK_LT;
+  case TOK_LE:
+    return TOK_GT;
+  case TOK_GT:
+    return TOK_LE;
+  case TOK_ULT:
+    return TOK_UGE;
+  case TOK_UGE:
+    return TOK_ULT;
+  case TOK_ULE:
+    return TOK_UGT;
+  case TOK_UGT:
+    return TOK_ULE;
+  default:
+    return -1;
+  }
+}
+
+/* Swap a comparison condition for reversed operands.
+ * If CMP A,B has condition c, then CMP B,A has condition swap(c).
+ * E.g. swap(LT) = GT, swap(EQ) = EQ, etc. Returns -1 on unknown. */
+static int vrp_swap_cmp_tok(int tok)
+{
+  switch (tok)
+  {
+  case TOK_EQ:
+    return TOK_EQ;
+  case TOK_NE:
+    return TOK_NE;
+  case TOK_LT:
+    return TOK_GT;
+  case TOK_GT:
+    return TOK_LT;
+  case TOK_LE:
+    return TOK_GE;
+  case TOK_GE:
+    return TOK_LE;
+  case TOK_ULT:
+    return TOK_UGT;
+  case TOK_UGT:
+    return TOK_ULT;
+  case TOK_ULE:
+    return TOK_UGE;
+  case TOK_UGE:
+    return TOK_ULE;
+  default:
+    return -1;
+  }
+}
+
+/* Check if knowing 'known_true' condition holds for (A, B) implies that
+ * 'check' condition also holds for (A, B).
+ * Returns 1 if implied, 0 otherwise. */
+static int vrp_cmp_implies(int known_true, int check)
+{
+  if (known_true == check)
+    return 1;
+  switch (known_true)
+  {
+  case TOK_EQ: /* A == B implies: A <= B, A >= B, A <=U B, A >=U B */
+    return (check == TOK_LE || check == TOK_GE || check == TOK_ULE || check == TOK_UGE);
+  case TOK_LT: /* A < B implies: A <= B, A != B */
+    return (check == TOK_LE || check == TOK_NE);
+  case TOK_GT: /* A > B implies: A >= B, A != B */
+    return (check == TOK_GE || check == TOK_NE);
+  case TOK_ULT: /* A <U B implies: A <=U B, A != B */
+    return (check == TOK_ULE || check == TOK_NE);
+  case TOK_UGT: /* A >U B implies: A >=U B, A != B */
+    return (check == TOK_UGE || check == TOK_NE);
+  default:
+    return 0;
+  }
+}
+
 int tcc_ir_opt_vrp(TCCIRState *ir)
 {
   int n = ir->next_instruction_index;
@@ -1518,6 +1679,78 @@ int tcc_ir_opt_vrp(TCCIRState *ir)
               pending_slot = src_slot;
               pending_min = new_min;
               pending_max = new_max;
+            }
+          }
+        }
+      }
+      /* Register-register comparison constraint propagation.
+       * Pattern: CMP A,B; JUMPIF c1 (falls through → !c1 holds for A vs B)
+       *          CMP A,B; JUMPIF c2 (or CMP B,A; JUMPIF c2)
+       * If !c1 implies c2 → second branch always taken → unconditional JUMP.
+       * If !c1 implies !c2 → second branch never taken → NOP both. */
+      else if (jump_q->op == TCCIR_OP_JUMPIF)
+      {
+        int32_t cmp_vr1 = irop_get_vreg(src1);
+        int32_t cmp_vr2 = irop_get_vreg(src2);
+        if (cmp_vr1 >= 0 && cmp_vr2 >= 0 && i + 3 < n)
+        {
+          IROperand cond_op = tcc_ir_op_get_src1(ir, jump_q);
+          int tok1 = (int)irop_get_imm64_ex(ir, cond_op);
+          int known_fact = vrp_negate_cmp_tok(tok1);
+
+          /* Only proceed if the fall-through target is not a merge point */
+          if (known_fact >= 0 && !(is_merge[(i + 2) / 8] & (1 << ((i + 2) % 8))))
+          {
+            IRQuadCompact *cmp2 = &ir->compact_instructions[i + 2];
+            if (cmp2->op == TCCIR_OP_CMP)
+            {
+              IRQuadCompact *jump2 = &ir->compact_instructions[i + 3];
+              if (jump2->op == TCCIR_OP_JUMPIF)
+              {
+                IROperand cmp2_src1 = tcc_ir_op_get_src1(ir, cmp2);
+                IROperand cmp2_src2 = tcc_ir_op_get_src2(ir, cmp2);
+                int32_t cmp2_vr1 = irop_get_vreg(cmp2_src1);
+                int32_t cmp2_vr2 = irop_get_vreg(cmp2_src2);
+
+                IROperand cond2_op = tcc_ir_op_get_src1(ir, jump2);
+                int tok2 = (int)irop_get_imm64_ex(ir, cond2_op);
+                IROperand jmp2_dest = tcc_ir_op_get_dest(ir, jump2);
+
+                int effective_tok2 = -1;
+                if (cmp2_vr1 == cmp_vr1 && cmp2_vr2 == cmp_vr2)
+                  effective_tok2 = tok2; /* same operand order */
+                else if (cmp2_vr1 == cmp_vr2 && cmp2_vr2 == cmp_vr1)
+                  effective_tok2 = vrp_swap_cmp_tok(tok2); /* swapped operands */
+
+                if (effective_tok2 >= 0)
+                {
+                  if (vrp_cmp_implies(known_fact, effective_tok2))
+                  {
+                    /* Second branch always taken → unconditional JUMP */
+                    cmp2->op = TCCIR_OP_NOP;
+                    jump2->op = TCCIR_OP_JUMP;
+                    tcc_ir_set_dest(ir, i + 3, jmp2_dest);
+                    changes++;
+#ifdef CONFIG_TCC_DEBUG
+                    if (tcc_state->dump_ir)
+                      printf("VRP: reg-reg CMP at i=%d: !%02x implies %02x -> always taken, JUMP to %d\n", i, tok1,
+                             effective_tok2, (int)jmp2_dest.u.imm32);
+#endif
+                  }
+                  else if (vrp_cmp_implies(known_fact, vrp_negate_cmp_tok(effective_tok2)))
+                  {
+                    /* Second branch never taken → NOP both */
+                    cmp2->op = TCCIR_OP_NOP;
+                    jump2->op = TCCIR_OP_NOP;
+                    changes++;
+#ifdef CONFIG_TCC_DEBUG
+                    if (tcc_state->dump_ir)
+                      printf("VRP: reg-reg CMP at i=%d: !%02x implies !%02x -> never taken, NOP\n", i, tok1,
+                             effective_tok2);
+#endif
+                  }
+                }
+              }
             }
           }
         }
@@ -2809,13 +3042,59 @@ int tcc_ir_opt_sl_forward(TCCIRState *ir)
   {
     q = &ir->compact_instructions[i];
 
-    /* Clear all stores at basic block boundaries and function calls */
-    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF || q->op == TCCIR_OP_FUNCCALLVOID ||
-        q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_RETURNVALUE || q->op == TCCIR_OP_RETURNVOID)
+    /* Clear all stores at basic block boundaries */
+    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF || q->op == TCCIR_OP_RETURNVALUE ||
+        q->op == TCCIR_OP_RETURNVOID)
     {
       memset(hash_table, 0, sizeof(hash_table));
       entry_count = 0;
       write_tracker_gen++;
+      continue;
+    }
+
+    /* Function calls: only invalidate stores to escaped locals (addrtaken).
+     * Stack locals whose address has NOT been taken cannot be modified
+     * by any function call since no external code has a pointer to them. */
+    if (q->op == TCCIR_OP_FUNCCALLVOID || q->op == TCCIR_OP_FUNCCALLVAL)
+    {
+      int j;
+      for (j = 0; j < entry_count; j++)
+      {
+        if (entries[j].valid && entries[j].addr_addrtaken)
+          entries[j].valid = 0;
+      }
+      /* For FUNCCALLVAL, the dest vreg is redefined — invalidate stores
+       * whose stored_value was that vreg and track the write. */
+      if (q->op == TCCIR_OP_FUNCCALLVAL)
+      {
+        IROperand call_dest = tcc_ir_op_get_dest(ir, q);
+        int32_t call_dest_vr = irop_get_vreg(call_dest);
+        if (call_dest_vr >= 0)
+        {
+          for (j = 0; j < entry_count; j++)
+          {
+            if (entries[j].valid && irop_get_vreg(entries[j].stored_value) == call_dest_vr)
+              entries[j].valid = 0;
+          }
+          if (!call_dest.is_lval)
+          {
+            int vr_type = TCCIR_DECODE_VREG_TYPE(call_dest_vr);
+            int vr_pos = TCCIR_DECODE_VREG_POSITION(call_dest_vr);
+            VregWriteTracker *tracker = NULL;
+            if (vr_type == TCCIR_VREG_TYPE_VAR && vr_pos <= max_var)
+              tracker = &var_writes[vr_pos];
+            else if (vr_type == TCCIR_VREG_TYPE_TEMP && vr_pos <= max_tmp)
+              tracker = &tmp_writes[vr_pos];
+            else if (vr_type == TCCIR_VREG_TYPE_PARAM && vr_pos <= max_par)
+              tracker = &par_writes[vr_pos];
+            if (tracker)
+            {
+              tracker->last_write_idx = i;
+              tracker->gen = write_tracker_gen;
+            }
+          }
+        }
+      }
       continue;
     }
 
@@ -2916,6 +3195,78 @@ int tcc_ir_opt_sl_forward(TCCIRState *ir)
         }
       }
     }
+    /* Process TEST_ZERO / CMP with memory operands: forward stored values.
+     * TEST_ZERO StackLoc[X] implicitly loads from the stack location.
+     * If we have a tracked store to that location, replace the memory
+     * operand with the stored value (e.g. TEST_ZERO #0). */
+    else if (q->op == TCCIR_OP_TEST_ZERO)
+    {
+      IROperand src1 = tcc_ir_op_get_src1(ir, q);
+      int32_t addr_vr = irop_get_vreg(src1);
+
+      if (src1.is_local)
+      {
+        const Sym *addr_sym;
+        int64_t addr_offset;
+
+        /* Skip if address is taken */
+        if (addr_vr >= 0)
+        {
+          IRLiveInterval *interval = tcc_ir_get_live_interval(ir, addr_vr);
+          if (interval && interval->addrtaken)
+            goto skip_test_zero_fwd;
+        }
+
+        if (irop_get_tag(src1) == IROP_TAG_SYMREF)
+        {
+          IRPoolSymref *sr = irop_get_symref_ex(ir, src1);
+          addr_sym = sr ? sr->sym : NULL;
+          addr_offset = sr ? sr->addend : 0;
+        }
+        else
+        {
+          addr_sym = NULL;
+          addr_offset = irop_get_imm64_ex(ir, src1);
+        }
+
+        uint32_t h = ((uintptr_t)addr_sym * 31 + (uint32_t)addr_offset * 17) % 128;
+        StoreEntry *e;
+        for (e = hash_table[h]; e != NULL; e = e->next)
+        {
+          if (!e->valid || e->addr_addrtaken)
+            continue;
+          if (e->local_sym == addr_sym && e->local_offset == addr_offset)
+          {
+            if (e->store_btype != src1.btype)
+              continue;
+            /* Vreg write safety check (same as LOAD path) */
+            if (addr_vr >= 0)
+            {
+              int vr_type = TCCIR_DECODE_VREG_TYPE(addr_vr);
+              int vr_pos = TCCIR_DECODE_VREG_POSITION(addr_vr);
+              VregWriteTracker *tracker = NULL;
+              if (vr_type == TCCIR_VREG_TYPE_VAR && vr_pos <= max_var)
+                tracker = &var_writes[vr_pos];
+              else if (vr_type == TCCIR_VREG_TYPE_TEMP && vr_pos <= max_tmp)
+                tracker = &tmp_writes[vr_pos];
+              else if (vr_type == TCCIR_VREG_TYPE_PARAM && vr_pos <= max_par)
+                tracker = &par_writes[vr_pos];
+              if (tracker && tracker->gen == write_tracker_gen && tracker->last_write_idx > e->instruction_idx)
+                continue;
+            }
+#ifdef DEBUG_IR_GEN
+            printf("OPTIMIZE: TEST_ZERO store-forward at i=%d from store at i=%d\n", i, e->instruction_idx);
+#endif
+            /* Replace TEST_ZERO's memory src1 with the stored value */
+            int pool_off = q->operand_base; /* TEST_ZERO: has_dest=0, src1 at base */
+            ir->iroperand_pool[pool_off] = e->stored_value;
+            changes++;
+            break;
+          }
+        }
+      }
+    skip_test_zero_fwd:;
+    }
     /* Process STORE instructions: track them for later forwarding */
     else if (q->op == TCCIR_OP_STORE)
     {
@@ -2933,14 +3284,16 @@ int tcc_ir_opt_sl_forward(TCCIRState *ir)
       /* CONSERVATIVE: Only track stack locals for forwarding */
       if (!dest.is_local)
       {
-        /* Non-local store - must invalidate ALL tracked stores since it could alias */
+        /* Non-local store (through a pointer) - must invalidate ALL tracked stores
+         * since the pointer could alias any stack location (e.g. array element
+         * access via a[i] where i is unknown at compile time). */
         for (j = 0; j < entry_count; j++)
         {
-          if (entries[j].valid && entries[j].addr_addrtaken)
+          if (entries[j].valid)
           {
 #ifdef DEBUG_IR_GEN
-            printf("STORE-LOAD: Invalidate addr-taken local at i=%d due to pointer store at i=%d\n",
-                   entries[j].instruction_idx, i);
+            printf("STORE-LOAD: Invalidate local at i=%d due to pointer store at i=%d\n", entries[j].instruction_idx,
+                   i);
 #endif
             entries[j].valid = 0;
           }
@@ -4784,12 +5137,15 @@ int tcc_ir_opt_indexed_memory_fusion(TCCIRState *ir)
     /* Update the instruction to use the new operand base */
     load_q->operand_base = new_base_idx;
 
-    /* Clear is_lval on base and index operands - they should be used as
-     * register values, not dereferenced, in indexed addressing mode */
+    /* Clear is_lval on the base operand - it provides the base address for
+     * the indexed addressing mode and should not be dereferenced.
+     * Preserve is_lval on the index operand: when the original SHL source was
+     * a dereferenced pointer (e.g. bi->word_no via LEA+deref), the backend
+     * needs needs_deref=true so mach_ensure_in_reg loads the value from the
+     * address before using it as the index register. */
     IROperand base_op_clean = base_op;
     IROperand index_op_clean = index_op;
     base_op_clean.is_lval = 0;
-    index_op_clean.is_lval = 0;
 
     if (is_store)
     {

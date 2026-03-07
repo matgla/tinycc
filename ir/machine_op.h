@@ -71,6 +71,7 @@ typedef struct MachineOperand
   bool needs_deref;        /* Emit a load through this address (VT_LVAL) */
   bool is_64bit;           /* Two-register value (INT64 or FLOAT64) */
   bool is_unsigned;        /* Unsigned type (VT_UNSIGNED) */
+  bool is_complex;         /* Complex type (VT_COMPLEX) */
   union
   {
     struct

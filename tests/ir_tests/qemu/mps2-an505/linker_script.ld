@@ -34,6 +34,13 @@ SECTIONS
         KEEP(*(.fini))
     } > FLASH
 
+    /* ARM exception index/table symbols needed by libgcc unwinder.
+       The actual .ARM.exidx/.ARM.extab sections from libgcc are orphan
+       sections handled by TCC's linker automatically. We just need
+       the boundary symbols to satisfy the unwinder references. */
+    __exidx_start = 0;
+    __exidx_end = 0;
+
     .preinit_array :
     {
         PROVIDE_HIDDEN(__preinit_array_start = .);

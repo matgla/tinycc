@@ -25,7 +25,7 @@ typedef enum TCCAbiArgKind
 typedef struct TCCAbiArgDesc
 {
   TCCAbiArgKind kind;
-  uint16_t size;     /* bytes (struct actual size; scalars: 4/8) */
+  uint32_t size;     /* bytes (struct actual size; scalars: 4/8) */
   uint8_t alignment; /* bytes (power of two); use at least 4 */
 } TCCAbiArgDesc;
 
@@ -42,8 +42,8 @@ typedef struct TCCAbiArgLoc
   uint8_t reg_base;    /* first arg register index (0 == R0 on ARM) */
   uint8_t reg_count;   /* number of consecutive arg registers */
   int32_t stack_off;   /* outgoing stack offset in bytes (from outgoing area base) */
-  uint16_t size;       /* bytes copied/passed */
-  uint16_t stack_size; /* bytes on stack (for REG_STACK split) */
+  uint32_t size;       /* bytes copied/passed */
+  uint32_t stack_size; /* bytes on stack (for REG_STACK split) */
 } TCCAbiArgLoc;
 
 typedef struct TCCAbiCallLayout

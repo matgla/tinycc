@@ -162,3 +162,45 @@ int __builtin_parity(unsigned int x) __attribute__((alias("__tcc_builtin_parity"
 int __builtin_parityl(unsigned long x) __attribute__((alias("__tcc_builtin_parityl")));
 int __builtin_parityll(unsigned long long x) __attribute__((alias("__tcc_builtin_parityll")));
 #endif
+
+/* ---------------------------------------------- */
+/* Byte swap builtins: __builtin_bswap16, __builtin_bswap32, __builtin_bswap64 */
+
+static inline unsigned short bswap16_impl(unsigned short x)
+{
+    return ((x & 0x00FF) << 8) | ((x & 0xFF00) >> 8);
+}
+
+static inline unsigned int bswap32_impl(unsigned int x)
+{
+    return ((x & 0x000000FFU) << 24) |
+           ((x & 0x0000FF00U) << 8) |
+           ((x & 0x00FF0000U) >> 8) |
+           ((x & 0xFF000000U) >> 24);
+}
+
+static inline unsigned long long bswap64_impl(unsigned long long x)
+{
+    return ((x & 0x00000000000000FFULL) << 56) |
+           ((x & 0x000000000000FF00ULL) << 40) |
+           ((x & 0x0000000000FF0000ULL) << 24) |
+           ((x & 0x00000000FF000000ULL) << 8) |
+           ((x & 0x000000FF00000000ULL) >> 8) |
+           ((x & 0x0000FF0000000000ULL) >> 24) |
+           ((x & 0x00FF000000000000ULL) >> 40) |
+           ((x & 0xFF00000000000000ULL) >> 56);
+}
+
+unsigned short BUILTIN(bswap16)(unsigned short x) { return bswap16_impl(x); }
+unsigned int BUILTIN(bswap32)(unsigned int x) { return bswap32_impl(x); }
+unsigned long long BUILTIN(bswap64)(unsigned long long x) { return bswap64_impl(x); }
+
+/* Runtime library functions for 64-bit byte swap (used by compiler) */
+unsigned long long __bswapdi3(unsigned long long x) { return bswap64_impl(x); }
+unsigned int __bswapsi2(unsigned int x) { return bswap32_impl(x); }
+
+#ifndef __TINYC__
+unsigned short __builtin_bswap16(unsigned short x) __attribute__((alias("__tcc_builtin_bswap16")));
+unsigned int __builtin_bswap32(unsigned int x) __attribute__((alias("__tcc_builtin_bswap32")));
+unsigned long long __builtin_bswap64(unsigned long long x) __attribute__((alias("__tcc_builtin_bswap64")));
+#endif

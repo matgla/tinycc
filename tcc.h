@@ -453,24 +453,27 @@ typedef union CValue
 /* symbol attributes */
 struct SymAttr
 {
-  unsigned short aligned : 5, /* alignment as log2+1 (0 == unspecified) */
+  unsigned aligned : 5, /* alignment as log2+1 (0 == unspecified) */
       packed : 1, weak : 1, visibility : 2, dllexport : 1, nodecorate : 1, dllimport : 1, addrtaken : 1, nodebug : 1,
-      naked : 1, nested_func : 1; /* nested function flag */
+      naked : 1, nested_func : 1, /* nested function flag */
+      sso_be : 1;                 /* scalar_storage_order("big-endian") */
 };
 
 /* function attributes or temporary attributes for parsing */
 struct FuncAttr
 {
-  unsigned func_call : 3, /* calling convention (0..5), see below */
-      func_type : 2,      /* FUNC_OLD/NEW/ELLIPSIS */
-      func_noreturn : 1,  /* attribute((noreturn)) */
-      func_ctor : 1,      /* attribute((constructor)) */
-      func_dtor : 1,      /* attribute((destructor)) */
-      func_args : 8,      /* PE __stdcall args */
-      func_alwinl : 1,    /* always_inline */
-      func_pure : 1,      /* attribute((pure)) - no side effects, reads memory */
-      func_const : 1,     /* attribute((const)) - no side effects, no memory reads */
-      xxxx : 13;
+  unsigned func_call : 3,     /* calling convention (0..5), see below */
+      func_type : 2,          /* FUNC_OLD/NEW/ELLIPSIS */
+      func_noreturn : 1,      /* attribute((noreturn)) */
+      func_ctor : 1,          /* attribute((constructor)) */
+      func_dtor : 1,          /* attribute((destructor)) */
+      func_args : 8,          /* PE __stdcall args */
+      func_alwinl : 1,        /* always_inline */
+      func_pure : 1,          /* attribute((pure)) - no side effects, reads memory */
+      func_const : 1,         /* attribute((const)) - no side effects, no memory reads */
+      func_no_instrument : 1, /* attribute((no_instrument_function)) */
+      func_va_arg_pack : 1,   /* uses __builtin_va_arg_pack() */
+      xxxx : 11;
 };
 
 /* symbol management */
@@ -736,6 +739,7 @@ typedef struct InlineFunc
 
 /* nested functions */
 #define MAX_CAPTURED_VARS 32
+#define MAX_NONLOCAL_GOTOS 8
 
 typedef struct NestedFunc
 {
@@ -757,6 +761,13 @@ typedef struct NestedFunc
   int trampoline_needed;                       /* address of this nested function was taken */
   Sym *trampoline_tcc_sym;                     /* TCC symbol for trampoline code (.text) */
   Sym *chain_slot_tcc_sym;                     /* TCC symbol for chain slot (.data) */
+  /* Non-local goto support: nested function does 'goto label' targeting parent __label__ */
+  int nlgoto_label_tokens[MAX_NONLOCAL_GOTOS]; /* token IDs of parent labels targeted by goto */
+  int nlgoto_buf_offsets[MAX_NONLOCAL_GOTOS];  /* FP-relative offset of 12-byte jmp_buf in parent frame */
+  int nb_nlgotos;                              /* number of non-local goto targets */
+  /* Address-taken parent labels: nested function uses &&label referencing parent __label__ */
+  Sym *addr_label_syms[MAX_NONLOCAL_GOTOS]; /* parent label syms referenced via &&label */
+  int nb_addr_labels;                       /* number of addr-taken parent labels */
 } NestedFunc;
 
 /* include file cache, used to find files faster and also to eliminate
@@ -877,29 +888,30 @@ struct TCCState
   unsigned char test_coverage; /* generate test coverage code */
 
   /* IR optimization flags (-f options) */
-  unsigned char opt_dce;             /* -fdce: dead code elimination */
-  unsigned char opt_const_prop;      /* -fconst-prop: constant propagation */
-  unsigned char opt_copy_prop;       /* -fcopy-prop: copy propagation */
-  unsigned char opt_cse;             /* -fcse: common subexpression elimination */
-  unsigned char opt_bool_cse;        /* -fbool-cse: boolean CSE */
-  unsigned char opt_bool_idempotent; /* -fbool-idempotent: boolean idempotent simplification */
-  unsigned char opt_bool_simplify;   /* -fbool-simplify: boolean expression simplification */
-  unsigned char opt_return_value;    /* -freturn-value-opt: return value optimization */
-  unsigned char opt_store_load_fwd;  /* -fstore-load-fwd: store-load forwarding */
-  unsigned char opt_redundant_store; /* -fredundant-store-elim: redundant store elimination */
-  unsigned char opt_dead_store;      /* -fdead-store-elim: dead store elimination */
-  unsigned char opt_fp_offset_cache; /* -ffp-offset-cache: frame pointer offset caching */
-  unsigned char opt_indexed_memory;  /* -findexed-memory: indexed load/store fusion */
-  unsigned char opt_postinc_fusion;  /* -fpostinc-fusion: post-increment load/store fusion */
-  unsigned char opt_mla_fusion;      /* -fmla-fusion: multiply-accumulate fusion */
-  unsigned char opt_stack_addr_cse;  /* -fstack-addr-cse: stack address CSE */
-  unsigned char opt_licm;            /* -flicm: loop-invariant code motion */
-  unsigned char opt_strength_red;    /* -fstrength-reduce: strength reduction for multiply */
-  unsigned char opt_iv_strength_red; /* -fiv-strength-red: IV strength reduction for array access */
-  unsigned char opt_nonneg_fold;     /* -fnonneg-fold: non-negative value branch folding */
-  unsigned char opt_vrp;             /* -fvrp: value range propagation branch folding */
-  unsigned char opt_float_narrow;    /* -ffloat-narrow: narrow double math to float when safe */
-  unsigned char opt_jump_threading;  /* -fjump-threading: jump threading optimization */
+  unsigned char opt_dce;              /* -fdce: dead code elimination */
+  unsigned char opt_const_prop;       /* -fconst-prop: constant propagation */
+  unsigned char opt_copy_prop;        /* -fcopy-prop: copy propagation */
+  unsigned char opt_cse;              /* -fcse: common subexpression elimination */
+  unsigned char opt_bool_cse;         /* -fbool-cse: boolean CSE */
+  unsigned char opt_bool_idempotent;  /* -fbool-idempotent: boolean idempotent simplification */
+  unsigned char opt_bool_simplify;    /* -fbool-simplify: boolean expression simplification */
+  unsigned char opt_return_value;     /* -freturn-value-opt: return value optimization */
+  unsigned char opt_store_load_fwd;   /* -fstore-load-fwd: store-load forwarding */
+  unsigned char opt_redundant_store;  /* -fredundant-store-elim: redundant store elimination */
+  unsigned char opt_dead_store;       /* -fdead-store-elim: dead store elimination */
+  unsigned char opt_fp_offset_cache;  /* -ffp-offset-cache: frame pointer offset caching */
+  unsigned char opt_indexed_memory;   /* -findexed-memory: indexed load/store fusion */
+  unsigned char opt_postinc_fusion;   /* -fpostinc-fusion: post-increment load/store fusion */
+  unsigned char opt_mla_fusion;       /* -fmla-fusion: multiply-accumulate fusion */
+  unsigned char opt_stack_addr_cse;   /* -fstack-addr-cse: stack address CSE */
+  unsigned char opt_licm;             /* -flicm: loop-invariant code motion */
+  unsigned char opt_strength_red;     /* -fstrength-reduce: strength reduction for multiply */
+  unsigned char opt_iv_strength_red;  /* -fiv-strength-red: IV strength reduction for array access */
+  unsigned char opt_nonneg_fold;      /* -fnonneg-fold: non-negative value branch folding */
+  unsigned char opt_vrp;              /* -fvrp: value range propagation branch folding */
+  unsigned char opt_float_narrow;     /* -ffloat-narrow: narrow double math to float when safe */
+  unsigned char opt_jump_threading;   /* -fjump-threading: jump threading optimization */
+  unsigned char instrument_functions; /* -finstrument-functions */
 
   /* Function purity cache for LICM optimization */
   /* Cache stores inferred purity for functions in the current translation unit */
@@ -1019,6 +1031,12 @@ struct TCCState
   struct InlineFunc **inline_fns;
   int nb_inline_fns;
 
+  /* __builtin_va_arg_pack() context: when expanding a clone of an
+     always_inline variadic function, this points to the token stream
+     of the caller's variadic arguments (comma-separated).  NULL when
+     not inside such an expansion. */
+  TokenString *va_arg_pack_tokens;
+
   /* sections */
   Section **sections;
   int nb_sections; /* number of sections, including first dummy section */
@@ -1136,14 +1154,50 @@ struct TCCState
   uint64_t float_registers_map_for_allocator;
   uint8_t omit_frame_pointer;
   uint8_t need_frame_pointer;
-  uint8_t force_frame_pointer; /* required for VLA/dynamic SP even if omit_frame_pointer */
-  uint8_t force_lr_save;       /* __builtin_return_address needs LR saved even in leaf */
+  uint8_t force_frame_pointer;  /* required for VLA/dynamic SP even if omit_frame_pointer */
+  uint8_t force_lr_save;        /* __builtin_return_address needs LR saved even in leaf */
+  uint8_t func_save_apply_args; /* __builtin_apply_args: save r0-r3 in prologue */
+  int apply_args_offset;        /* stack offset of saved r0-r3 block for apply_args */
   int stack_location;
+
+  /* Inline expansion state: when replaying an inline function's token
+     stream at a call site, these track the return value destination. */
+  uint8_t in_inline_expansion; /* nonzero while expanding inline body */
+  int inline_return_loc;       /* stack offset for storing return value */
+
+  /* Outermost VLA parameter expressions: saved token streams for evaluating
+     side effects at function entry (C11 6.9.1p10). Stored separately from Sym
+     because the sym union field (vla_array_str/next) would corrupt the type chain. */
+  struct VlaParamExpr
+  {
+    Sym *param;  /* the parameter sym (used for identification) */
+    int *tokens; /* heap-allocated token stream */
+  } *vla_param_exprs;
+  int nb_vla_param_exprs;
 
   /* linker script support */
   char *linker_script;        /* path to linker script file (-T option) */
   struct LDScript *ld_script; /* parsed linker script */
+
+  /* Deferred label-difference fixups for static initializers like
+     static int b[] = { &&lab1 - &&lab0, ... };
+     These are recorded during parsing and resolved after codegen
+     when label ELF symbol values are known. */
+  struct LabelDiffFixup *label_diff_fixups;
 };
+
+/* A deferred fixup for a label-difference expression (&&sym1 - &&sym2)
+   used in a static initializer.  Recorded during parsing, resolved
+   after code generation when both label symbols have their final
+   code offsets. */
+typedef struct LabelDiffFixup
+{
+  Section *sec;                /* data section containing the value */
+  unsigned long offset;        /* byte offset within sec->data */
+  struct Sym *sym_plus;        /* positive label symbol (&&lab1) */
+  struct Sym *sym_minus;       /* negative label symbol (&&lab0) */
+  struct LabelDiffFixup *next;
+} LabelDiffFixup;
 
 /* Forward declaration for linker script */
 struct LDScript;
@@ -1327,12 +1381,16 @@ static inline SValue tcc_ir_svalue_call_id_argc(int call_id, int argc)
 #define TOK_CULONG 0xc7  /* unsigned long constant */
 #define TOK_STR 0xc8     /* pointer to string in tokc */
 #define TOK_LSTR 0xc9
-#define TOK_CFLOAT 0xca   /* float constant */
-#define TOK_CDOUBLE 0xcb  /* double constant */
-#define TOK_CLDOUBLE 0xcc /* long double constant */
-#define TOK_PPNUM 0xcd    /* preprocessor number */
-#define TOK_PPSTR 0xce    /* preprocessor string */
-#define TOK_LINENUM 0xcf  /* line number info */
+#define TOK_CFLOAT 0xca     /* float constant */
+#define TOK_CDOUBLE 0xcb    /* double constant */
+#define TOK_CLDOUBLE 0xcc   /* long double constant */
+#define TOK_CFLOAT_I 0xcd   /* imaginary float constant (GNU ext) */
+#define TOK_CDOUBLE_I 0xce  /* imaginary double constant (GNU ext) */
+#define TOK_CLDOUBLE_I 0xcf /* imaginary long double constant (GNU ext) */
+#define TOK_CINT_I 0xd0     /* imaginary integer constant (GNU ext) */
+#define TOK_PPNUM 0xd1      /* preprocessor number */
+#define TOK_PPSTR 0xd2      /* preprocessor string */
+#define TOK_LINENUM 0xd3    /* line number info */
 
 #define TOK_HAS_VALUE(t) (t >= TOK_CCHAR && t <= TOK_LINENUM)
 
@@ -1533,8 +1591,11 @@ ST_INLN void tok_str_new(TokenString *s);
 ST_FUNC TokenString *tok_str_alloc(void);
 ST_FUNC void tok_str_free(TokenString *s);
 ST_FUNC void tok_str_free_str(int *str);
+ST_FUNC int *tok_str_ensure_heap(TokenString *s);
 ST_FUNC void tok_str_add(TokenString *s, int t);
+ST_FUNC void tok_str_add2(TokenString *s, int t, CValue *cv);
 ST_FUNC void tok_str_add_tok(TokenString *s);
+ST_FUNC void tok_get(int *t, const int **pp, CValue *cv);
 ST_INLN void define_push(int v, int macro_type, int *str, Sym *first_arg);
 ST_FUNC void define_undef(Sym *s);
 ST_INLN Sym *define_find(int v);
@@ -2183,6 +2244,19 @@ ST_FUNC int tcc_gen_machine_branch_opt_get_encoding(int ir_index); /* Returns 16
 
 /* Trap instruction generation */
 ST_FUNC void tcc_gen_machine_trap_mop(void);
+
+/* Prefetch instruction generation - rw: 0=read (PLD), 1=write (PLDW) */
+ST_FUNC void tcc_gen_machine_prefetch_mop(MachineOperand addr, int rw);
+
+/* Setjmp/longjmp instruction generation */
+ST_FUNC void tcc_gen_machine_setjmp_mop(MachineOperand buf, MachineOperand dest);
+ST_FUNC void tcc_gen_machine_longjmp_mop(MachineOperand buf);
+ST_FUNC void tcc_gen_machine_nl_setjmp_mop(MachineOperand buf, MachineOperand dest);
+ST_FUNC void tcc_gen_machine_nl_longjmp_mop(MachineOperand buf);
+
+/* __builtin_apply_args / __builtin_apply instruction generation */
+ST_FUNC void tcc_gen_machine_builtin_apply_args_mop(MachineOperand dest);
+ST_FUNC void tcc_gen_machine_builtin_apply_mop(MachineOperand fn, MachineOperand args, MachineOperand dest);
 
 /* MachineOperand load/store into specific physical registers (for inline asm) */
 void tcc_gen_mach_load_to_reg(int dest_reg, const MachineOperand *op);

@@ -46,8 +46,11 @@
 #define __INT64_TYPE__ long long
 #endif
 #endif
+#define __SIZEOF_SHORT__ 2
 #define __SIZEOF_INT__ 4
 #define __INT_MAX__ 0x7fffffff
+    #define __SCHAR_MAX__ 0x7f
+    #define __SHRT_MAX__ 0x7fff
 #if __SIZEOF_LONG__ == 4
 #define __LONG_MAX__ 0x7fffffffL
 #else
@@ -156,6 +159,24 @@
 #define __UINT16_TYPE__ unsigned short
 #define __UINT32_TYPE__ unsigned int
 
+/* Least-width integer types (C99 stdint.h, GCC predefined macros) */
+#define __INT_LEAST8_TYPE__ signed char
+#define __INT_LEAST16_TYPE__ short
+#define __INT_LEAST32_TYPE__ int
+#define __INT_LEAST64_TYPE__ long long
+#define __UINT_LEAST8_TYPE__ unsigned char
+#define __UINT_LEAST16_TYPE__ unsigned short
+#define __UINT_LEAST32_TYPE__ unsigned int
+#define __UINT_LEAST64_TYPE__ unsigned long long
+#define __INT_LEAST8_MAX__ 0x7f
+#define __INT_LEAST16_MAX__ 0x7fff
+#define __INT_LEAST32_MAX__ 0x7fffffff
+#define __INT_LEAST64_MAX__ 0x7fffffffffffffffLL
+#define __UINT_LEAST8_MAX__ 0xff
+#define __UINT_LEAST16_MAX__ 0xffff
+#define __UINT_LEAST32_MAX__ 0xffffffffU
+#define __UINT_LEAST64_MAX__ 0xffffffffffffffffULL
+
 /* Sized integer max/min values needed by stdint.h on some platforms.
    These are indented with 4 spaces so that c2str stringifies the guards
    instead of emitting them as real host-preprocessor directives (which
@@ -184,6 +205,29 @@
 #ifndef __UINT64_MAX__
 #define __UINT64_MAX__ 0xffffffffffffffffULL
 #endif
+
+/* Floating point limits (IEEE 754). These match include/float.h values. */
+#define __FLT_MAX__ 3.40282347e+38F
+#define __FLT_MIN__ 1.17549435e-38F
+#define __FLT_EPSILON__ 1.19209290e-07F
+#define __FLT_DIG__ 6
+#define __FLT_MANT_DIG__ 24
+#define __FLT_MAX_EXP__ 128
+#define __FLT_MIN_EXP__ (-125)
+#define __DBL_MAX__ 1.7976931348623157e+308
+#define __DBL_MIN__ 2.2250738585072014e-308
+#define __DBL_EPSILON__ 2.2204460492503131e-16
+#define __DBL_DIG__ 15
+#define __DBL_MANT_DIG__ 53
+#define __DBL_MAX_EXP__ 1024
+#define __DBL_MIN_EXP__ (-1021)
+#define __LDBL_MAX__ 1.7976931348623157e+308L
+#define __LDBL_MIN__ 2.2250738585072014e-308L
+#define __LDBL_EPSILON__ 2.2204460492503131e-16L
+#define __LDBL_DIG__ 15
+#define __LDBL_MANT_DIG__ 53
+#define __LDBL_MAX_EXP__ 1024
+#define __LDBL_MIN_EXP__ (-1021)
 
 #if !defined _WIN32
 /* glibc defines. We do not support __USER_NAME_PREFIX__ */
@@ -253,34 +297,17 @@ typedef char *__builtin_va_list;
 #endif
 
 #elif defined __arm__
-/* ARM EABI va_list support.
-   Kept in sync with lib/va_list.c helpers. */
-#if defined __ARM_PCS_VFP
-typedef struct
-{
-  void *__stack;
-  void *__gr_top;
-  void *__vr_top;
-  int __gr_offs;
-  int __vr_offs;
-} __builtin_va_list[1];
-#else
-typedef struct
-{
-  void *__stack;
-  void *__gr_top;
-  int __gr_offs;
-} __builtin_va_list[1];
-#endif
+/* ARM EABI va_list: simple char pointer (GCC-compatible ABI).
+   Runtime helpers in lib/va_list.c. */
+typedef char *__builtin_va_list;
 
-void __tcc_va_start(__builtin_va_list ap, void *last, int size, int align, void *fp);
-void *__va_arg(__builtin_va_list ap, int size, int align);
+void __tcc_va_start(char **ap_ptr, void *fp);
+void *__tcc_va_arg(char **ap_ptr, int size, int align);
 
-#define __builtin_va_start(ap, last)                                                                                   \
-  __tcc_va_start((ap), &(last), sizeof(last), __alignof__(last), __builtin_frame_address(0))
+#define __builtin_va_start(ap, ...) __tcc_va_start(&(ap), __builtin_frame_address(0))
 /* __builtin_va_arg is handled as a compiler intrinsic (TOK_builtin_va_arg)
    to support VLA struct types passed by invisible reference. */
-#define __builtin_va_copy(dest, src) (*(dest) = *(src))
+#define __builtin_va_copy(dest, src) (dest) = (src)
 
 #elif defined __aarch64__
 #if defined __APPLE__
@@ -379,7 +406,9 @@ __BUILTIN(void *, alloca, (__SIZE_TYPE__))
 __BUILTIN(void, abort, (void))
 __BUILTIN(void, exit, (int))
 __BUILTIN(int, printf, (const char *, ...))
+__BUILTIN(int, puts, (const char *))
 __BUILTIN(int, sprintf, (char *, const char *, ...))
+__BUILTIN(int, snprintf, (char *, __SIZE_TYPE__, const char *, ...))
 __BOUND(void, longjmp, ())
 #if !defined _WIN32
 __BOUND(void *, mmap, ())

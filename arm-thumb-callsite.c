@@ -97,7 +97,7 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, i
                                     IROperand **out_args, MachineOperand **out_mops)
 {
   CALLSITE_DEBUG("[CALLSITE] thumb_build_call_layout_from_ir: call_idx=%d call_id=%d argc_hint=%d total_insns=%d\n",
-          call_idx, call_id, argc_hint, ir ? ir->next_instruction_index : -1);
+                 call_idx, call_id, argc_hint, ir ? ir->next_instruction_index : -1);
   if (!ir || !layout || call_idx < 0)
     return -1;
 
@@ -129,9 +129,9 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, i
       {
         const IROperand src2 = tcc_ir_get_src2(ir, j);
         int param_call_id = irop_is_none(src2) ? -1 : TCCIR_DECODE_CALL_ID((uint32_t)src2.u.imm32);
-        CALLSITE_DEBUG("[CALLSITE]   legacy scan j=%d: FUNCPARAMVAL param_call_id=%d (want %d) param_idx=%d\n",
-                j, param_call_id, call_id,
-                irop_is_none(src2) ? -1 : (int)TCCIR_DECODE_PARAM_IDX((uint32_t)src2.u.imm32));
+        CALLSITE_DEBUG("[CALLSITE]   legacy scan j=%d: FUNCPARAMVAL param_call_id=%d (want %d) param_idx=%d\n", j,
+                       param_call_id, call_id,
+                       irop_is_none(src2) ? -1 : (int)TCCIR_DECODE_PARAM_IDX((uint32_t)src2.u.imm32));
         if (param_call_id == call_id)
         {
           int param_idx = TCCIR_DECODE_PARAM_IDX((uint32_t)src2.u.imm32);
@@ -194,16 +194,16 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, i
       int param_call_id = !irop_is_none(src2) ? TCCIR_DECODE_CALL_ID((uint32_t)src2.u.imm32) : -1;
       int param_idx_raw = !irop_is_none(src2) ? (int)TCCIR_DECODE_PARAM_IDX((uint32_t)src2.u.imm32) : -1;
       (void)param_idx_raw; /* only used by CALLSITE_DEBUG */
-      CALLSITE_DEBUG("[CALLSITE]   j=%d FUNCPARAMVAL param_call_id=%d param_idx=%d (want call_id=%d)\n",
-              j, param_call_id, param_idx_raw, call_id);
+      CALLSITE_DEBUG("[CALLSITE]   j=%d FUNCPARAMVAL param_call_id=%d param_idx=%d (want call_id=%d)\n", j,
+                     param_call_id, param_idx_raw, call_id);
       if (param_call_id == call_id)
       {
         const IROperand src1_irop = tcc_ir_get_src1(ir, j);
         int param_idx = TCCIR_DECODE_PARAM_IDX((uint32_t)src2.u.imm32);
         if (param_idx >= 0 && param_idx < argc && !found[param_idx])
         {
-          CALLSITE_DEBUG("[CALLSITE]     recording arg[%d] btype=%d is_64bit=%d\n",
-                  param_idx, src1_irop.btype, irop_is_64bit(src1_irop));
+          CALLSITE_DEBUG("[CALLSITE]     recording arg[%d] btype=%d is_64bit=%d\n", param_idx, src1_irop.btype,
+                         irop_is_64bit(src1_irop));
           /* Collect IROperand if requested */
           if (args)
           {
@@ -232,7 +232,21 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, i
               align = 1;
             arg_descs[param_idx].kind = TCC_ABI_ARG_STRUCT_BYVAL;
             arg_descs[param_idx].size = (uint16_t)size;
-            arg_descs[param_idx].alignment = (uint8_t)align;
+            /* Use AAPCS natural alignment (based on member types, not
+             * __attribute__((aligned)) on the struct). This determines
+             * register alignment (even-register rule for 8-byte aligned). */
+            int aapcs_align = irop_aapcs_alignment(src1_irop);
+            arg_descs[param_idx].alignment = (uint8_t)(aapcs_align < align ? aapcs_align : align);
+          }
+          else if (src1_irop.is_complex)
+          {
+            /* Complex types are passed like composites (AAPCS):
+             * complex float = 8 bytes (2 regs), complex double = 16 bytes (4 regs). */
+            int elem_size = irop_is_64bit(src1_irop) ? 8 : 4;
+            int total_size = elem_size * 2;
+            arg_descs[param_idx].kind = TCC_ABI_ARG_STRUCT_BYVAL;
+            arg_descs[param_idx].size = (uint16_t)total_size;
+            arg_descs[param_idx].alignment = (uint8_t)elem_size;
           }
           else if (irop_needs_pair(src1_irop))
           {

@@ -312,7 +312,7 @@ int tcc_ir_vreg_type_get(TCCIRState *ir, int vreg)
       return LS_REG_TYPE_LLONG;
     /* Phase 3: Complex types need register pairs like DOUBLE_SOFT */
     if (interval->is_complex)
-      return LS_REG_TYPE_COMPLEX_FLOAT;
+      return interval->is_double ? LS_REG_TYPE_COMPLEX_DOUBLE : LS_REG_TYPE_COMPLEX_FLOAT;
     if (interval->is_float)
     {
       if (interval->is_double)

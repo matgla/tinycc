@@ -34,6 +34,29 @@ CURRENT_DIR = Path(__file__).parent
 was_cleaned = False
 
 
+def _detect_asan():
+    """Check if the compiler was built with AddressSanitizer by inspecting config.mak."""
+    config_mak = CURRENT_DIR / "../../config.mak"
+    try:
+        text = config_mak.read_text()
+        return "CONFIG_asan=yes" in text
+    except OSError:
+        return False
+
+
+ASAN_ENABLED = _detect_asan()
+ASAN_TIMEOUT_MULTIPLIER = 3 if ASAN_ENABLED else 1
+
+
+def _detect_valgrind():
+    """Check if CC_WRAPPER contains valgrind (set by make VALGRIND=1)."""
+    return "valgrind" in os.environ.get("CC_WRAPPER", "")
+
+
+VALGRIND_ENABLED = _detect_valgrind()
+VALGRIND_TIMEOUT_MULTIPLIER = 10 if VALGRIND_ENABLED else 1
+
+
 class SubprocessSUT:
     """Minimal pexpect-like interface for reading QEMU output without PTYs.
 
@@ -224,7 +247,7 @@ class CompileConfig:
     output_dir: Optional[Path] = None  # None = use default build dir
     output_prefix: str = ""  # Prefix to add to output filename (e.g. "O0_")
     output_suffix: str = ""  # Suffix to add to output filename (e.g. "_tag")
-    timeout: int = 60  # Timeout in seconds for compilation (0 = no timeout)
+    timeout: int = 60 * ASAN_TIMEOUT_MULTIPLIER * VALGRIND_TIMEOUT_MULTIPLIER  # Timeout in seconds for compilation (0 = no timeout)
 
     def __post_init__(self):
         if self.compiler is None:

@@ -1,0 +1,17 @@
+PASS: __builtin_add_overflow_p(3, 4) = false
+PASS: __builtin_add_overflow_p(INT_MAX, 1) = true
+PASS: __builtin_sub_overflow_p(10, 3) = false
+PASS: __builtin_sub_overflow_p(INT_MIN, 1) = true
+PASS: __builtin_mul_overflow_p(6, 7) = false
+PASS: __builtin_mul_overflow_p(INT_MAX, 2) = true
+PASS: __builtin_mul_overflow_p(0, INT_MAX) = false
+PASS: __builtin_add_overflow_p(UINT_MAX, 1u) = true
+PASS: __builtin_sub_overflow_p(0u, 1u) = true
+PASS: __builtin_add_overflow_p(LLONG_MAX, 1LL) = true
+PASS: __builtin_sub_overflow_p(LLONG_MIN, 1LL) = true
+PASS: __builtin_mul_overflow_p(LLONG_MAX, 2LL) = true
+PASS: __builtin_add_overflow_p(ULLONG_MAX, 1ULL) = true
+PASS: __builtin_mul_overflow_p(ULLONG_MAX, 2ULL) = true
+PASS: __builtin_mul_overflow_p(-1, LLONG_MIN) = true
+PASS: __builtin_mul_overflow_p(100, 200) = false
+All tests passed!

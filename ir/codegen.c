@@ -208,11 +208,18 @@ void tcc_ir_register_allocation_params(TCCIRState *ir)
 
     /* If the ABI incoming registers were already set (e.g., by the
      * parameter handling in tcc_ir_add_function_parameters), respect them
-     * and only advance argno for subsequent parameters.
-     */
+     * and advance argno past the actual registers used. */
     if (interval && (interval->incoming_reg0 >= 0 || interval->incoming_reg1 >= 0))
     {
-      argno += is_64bit ? 2 : 1;
+      /* Advance argno to the register AFTER the highest one used by this
+       * parameter.  This correctly accounts for alignment-induced register
+       * gaps (e.g. AAPCS 8-byte alignment skipping from r1 to r2). */
+      int highest = interval->incoming_reg0;
+      if (interval->incoming_reg1 > highest)
+        highest = interval->incoming_reg1;
+      int next = highest + 1;
+      if (next > argno)
+        argno = next;
       continue;
     }
 
@@ -702,6 +709,11 @@ int tcc_ir_codegen_test_gen(TCCIRState *ir, int invert, int test)
        * Otherwise we end up testing the address, which is almost always non-zero
        * and can lead to invalid indirect calls.
        */
+      /* Bit-fields must be extracted (shift/mask) before testing;
+       * TEST_ZERO on the raw word would test all 32 bits, not just
+       * the bit-field slice (e.g. a 1-bit field at position 0). */
+      if (vtop->type.t & VT_BITFIELD)
+        gv(RC_INT);
       tcc_ir_put(ir, TCCIR_OP_TEST_ZERO, &vtop[0], NULL, NULL);
       vtop->r = VT_CMP;
       vtop->cmp_op = TOK_NE;
@@ -1085,21 +1097,22 @@ static bool ir_codegen_before_ret_peephole(TCCIRState *ir, int i, const IROperan
     return false;
 
   IRLiveInterval *li = tcc_ir_get_live_interval(ir, dest_vr);
+  const int needs_pair = irop_needs_pair(*dest_ir);
   if (li)
   {
     li->allocation.r0 = REG_IRET;
     li->allocation.offset = 0;
-    if (irop_is_64bit(*dest_ir))
+    if (needs_pair)
       li->allocation.r1 = REG_IRE2;
   }
 
   *out_mop_dest = (MachineOperand){.kind = MACH_OP_REG,
                                    .btype = irop_get_btype(*dest_ir),
                                    .vreg = dest_vr,
-                                   .is_64bit = irop_is_64bit(*dest_ir),
+                                   .is_64bit = needs_pair,
                                    .is_unsigned = dest_ir->is_unsigned,
                                    .needs_deref = false,
-                                   .u.reg = {.r0 = REG_IRET, .r1 = irop_is_64bit(*dest_ir) ? (int)REG_IRE2 : -1}};
+                                   .u.reg = {.r0 = REG_IRET, .r1 = needs_pair ? (int)REG_IRE2 : -1}};
   return true;
 }
 
@@ -1621,8 +1634,74 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
       }
       case TCCIR_OP_NOP:
         break;
+      case TCCIR_OP_PREFETCH:
+      {
+        MachineOperand mop_addr = machine_op_from_ir(ir, &src1_ir);
+        /* src2 holds the rw hint: 0 = read (PLD), 1 = write (PLDW) */
+        int rw = (int)irop_get_imm64_ex(ir, src2_ir);
+        tcc_gen_machine_insn_scratch_reset();
+        tcc_gen_machine_prefetch_mop(mop_addr, rw);
+        ir_codegen_track_scratch(is_dry_run, i, cq->op, dry_insn_scratch, dry_insn_saves);
+        break;
+      }
       case TCCIR_OP_TRAP:
         tcc_gen_machine_trap_mop();
+        break;
+      case TCCIR_OP_SETJMP:
+      {
+        MachineOperand mop_buf = machine_op_from_ir(ir, &src1_ir);
+        MachineOperand mop_dest = machine_op_from_ir(ir, &dest_ir);
+        tcc_gen_machine_insn_scratch_reset();
+        tcc_gen_machine_setjmp_mop(mop_buf, mop_dest);
+        ir_codegen_track_scratch(is_dry_run, i, cq->op, dry_insn_scratch, dry_insn_saves);
+        break;
+      }
+      case TCCIR_OP_LONGJMP:
+      {
+        MachineOperand mop_buf = machine_op_from_ir(ir, &src1_ir);
+        tcc_gen_machine_insn_scratch_reset();
+        tcc_gen_machine_longjmp_mop(mop_buf);
+        ir_codegen_track_scratch(is_dry_run, i, cq->op, dry_insn_scratch, dry_insn_saves);
+        break;
+      }
+      case TCCIR_OP_NL_SETJMP:
+      {
+        MachineOperand mop_buf = machine_op_from_ir(ir, &src1_ir);
+        MachineOperand mop_dest = machine_op_from_ir(ir, &dest_ir);
+        tcc_gen_machine_insn_scratch_reset();
+        tcc_gen_machine_nl_setjmp_mop(mop_buf, mop_dest);
+        ir_codegen_track_scratch(is_dry_run, i, cq->op, dry_insn_scratch, dry_insn_saves);
+        break;
+      }
+      case TCCIR_OP_NL_LONGJMP:
+      {
+        MachineOperand mop_buf = machine_op_from_ir(ir, &src1_ir);
+        tcc_gen_machine_insn_scratch_reset();
+        tcc_gen_machine_nl_longjmp_mop(mop_buf);
+        ir_codegen_track_scratch(is_dry_run, i, cq->op, dry_insn_scratch, dry_insn_saves);
+        break;
+      }
+      case TCCIR_OP_BUILTIN_APPLY_ARGS:
+      {
+        MachineOperand mop_dest = machine_op_from_ir(ir, &dest_ir);
+        tcc_gen_machine_insn_scratch_reset();
+        tcc_gen_machine_builtin_apply_args_mop(mop_dest);
+        ir_codegen_track_scratch(is_dry_run, i, cq->op, dry_insn_scratch, dry_insn_saves);
+        break;
+      }
+      case TCCIR_OP_BUILTIN_APPLY:
+      {
+        MachineOperand mop_fn = machine_op_from_ir(ir, &src1_ir);
+        MachineOperand mop_args = machine_op_from_ir(ir, &src2_ir);
+        MachineOperand mop_dest = machine_op_from_ir(ir, &dest_ir);
+        tcc_gen_machine_insn_scratch_reset();
+        tcc_gen_machine_builtin_apply_mop(mop_fn, mop_args, mop_dest);
+        ir_codegen_track_scratch(is_dry_run, i, cq->op, dry_insn_scratch, dry_insn_saves);
+        tcc_ir_spill_cache_clear(&ir->spill_cache);
+        break;
+      }
+      case TCCIR_OP_BUILTIN_RETURN:
+        /* Handled as RETURNVALUE by the parser; should not reach here */
         break;
       case TCCIR_OP_SET_CHAIN:
         tcc_gen_machine_set_chain();

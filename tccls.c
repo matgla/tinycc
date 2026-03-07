@@ -212,6 +212,9 @@ void tcc_ls_add_live_interval(LSLiveIntervalState *ls, int vreg, int start, int 
   case LS_REG_TYPE_COMPLEX_FLOAT:
     type_str = "COMPLEX_FLOAT";
     break;
+  case LS_REG_TYPE_COMPLEX_DOUBLE:
+    type_str = "COMPLEX_DOUBLE";
+    break;
   default:
     type_str = "UNKNOWN";
     break;
@@ -627,7 +630,10 @@ static int tcc_ls_reg_type_stack_size(int reg_type)
   case LS_REG_TYPE_LLONG:
   case LS_REG_TYPE_DOUBLE:
   case LS_REG_TYPE_DOUBLE_SOFT:
+  case LS_REG_TYPE_COMPLEX_FLOAT:
     return 8;
+  case LS_REG_TYPE_COMPLEX_DOUBLE:
+    return 16;
   default:
     return 4;
   }
@@ -917,6 +923,12 @@ void tcc_ls_allocate_registers(LSLiveIntervalState *ls, int used_parameters_regi
         LS_DBG("  Assigned register pair R%d:R%d%s", ls->intervals[i].r0, ls->intervals[i].r1,
                ls->intervals[i].crosses_call ? " (callee-saved)" : "");
       }
+    }
+    else if (ls->intervals[i].reg_type == LS_REG_TYPE_COMPLEX_DOUBLE)
+    {
+      /* 128-bit complex double: always spill (cannot fit in a register pair) */
+      LS_DBG("  Complex double (128-bit): force-spilling to stack");
+      tcc_ls_spill_interval_sized(ls, i, 16); /* 128-bit = 16 bytes */
     }
     else
     {
