@@ -3132,8 +3132,8 @@ ST_FUNC void tcc_machine_load_jmp_result(int dest_reg, int jmp_addr, int invert)
 static void load_from_base(int r, int r1, int irop_btype, int is_unsigned, int fc, int sign, uint32_t base)
 {
   int success = 0;
-  const int is_64bit = (irop_btype == IROP_BTYPE_INT64 || irop_btype == IROP_BTYPE_FLOAT64 ||
-                        (r1 >= 0 && r1 != PREG_REG_NONE));
+  const int is_64bit =
+      (irop_btype == IROP_BTYPE_INT64 || irop_btype == IROP_BTYPE_FLOAT64 || (r1 >= 0 && r1 != PREG_REG_NONE));
 
   TRACE("load_from_base: r=%d, r1=%d, irop_btype=%d, is_unsigned=%d, fc=%d, sign=%d, base=%d", r, r1, irop_btype,
         is_unsigned, fc, sign, base);

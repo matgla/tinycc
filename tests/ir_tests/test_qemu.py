@@ -305,6 +305,7 @@ TEST_FILES = [
 
     ("111_builtin_printf.c", 0),
     ("112_builtin_puts.c", 0),
+    ("150_builtin_fp.c", 0),
 ]
 
 # Nested function tests expected to fail (not yet implemented)

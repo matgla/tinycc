@@ -545,8 +545,8 @@ download-gcc-tests:
 	@echo "------------ downloading GCC torture tests ------------"
 	@bash $(TOP)/tests/gcctestsuite/download_gcc_tests.sh
 
-# run GCC torture compile tests (using gcctestsuite - compile only)
-test-gcc-torture-compile: cross test-venv download-gcc-tests
+# run GCC torture compile tests (compile only, via ir_tests framework)
+test-gcc-torture-compile: cross test-venv test-prepare download-gcc-tests
 	@echo "------------ GCC torture compile tests ------------"
 	@if $(PYTEST) --help 2>/dev/null | grep -q timeout; then \
 		PYTEST_TIMEOUT="--timeout=60"; \
@@ -554,9 +554,9 @@ test-gcc-torture-compile: cross test-venv download-gcc-tests
 		PYTEST_TIMEOUT=""; \
 	fi; \
 	if [ "$(USE_VENV)" = "1" ]; then \
-		cd $(TOP)/tests && "$(VENV_PY)" run_tests.py --gcc --compile-only -n $(J) $$PYTEST_TIMEOUT; \
+		cd $(IRTESTS_DIR) && "$(VENV_PY)" -m pytest -m "gcc_compile" --tb=short -n $(J) $$PYTEST_TIMEOUT test_gcc_torture_ir.py; \
 	else \
-		cd $(TOP)/tests && $(PYTEST) -m "gcc_torture and gcc_compile" --tb=short -n $(J) $$PYTEST_TIMEOUT tests/gcctestsuite/; \
+		cd $(IRTESTS_DIR) && $(PYTEST) -m "gcc_compile" --tb=short -n $(J) $$PYTEST_TIMEOUT test_gcc_torture_ir.py; \
 	fi
 
 # run GCC torture execute tests only (via ir_tests framework)
@@ -582,10 +582,9 @@ test-gcc-torture: cross test-venv test-prepare download-gcc-tests
 		PYTEST_TIMEOUT=""; \
 	fi; \
 	if [ "$(USE_VENV)" = "1" ]; then \
-		cd $(TOP)/tests && "$(VENV_PY)" run_tests.py --gcc -n $(J) $$PYTEST_TIMEOUT; \
+		cd $(IRTESTS_DIR) && "$(VENV_PY)" -m pytest -m "gcc_torture" --tb=short -n $(J) $$PYTEST_TIMEOUT test_gcc_torture_ir.py; \
 	else \
-		cd $(TOP)/tests && $(PYTEST) -m "gcc_torture and gcc_compile" --tb=short -n $(J) $$PYTEST_TIMEOUT tests/gcctestsuite/ && \
-		$(PYTEST) -m "gcc_torture and gcc_execute" --tb=short -n $(J) $$PYTEST_TIMEOUT $(IRTESTS_DIR)/test_gcc_torture_ir.py; \
+		cd $(IRTESTS_DIR) && $(PYTEST) -m "gcc_torture" --tb=short -n $(J) $$PYTEST_TIMEOUT test_gcc_torture_ir.py; \
 	fi
 
 # run full test suite (IR + GCC torture compile-only)

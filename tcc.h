@@ -1192,10 +1192,10 @@ struct TCCState
    code offsets. */
 typedef struct LabelDiffFixup
 {
-  Section *sec;                /* data section containing the value */
-  unsigned long offset;        /* byte offset within sec->data */
-  struct Sym *sym_plus;        /* positive label symbol (&&lab1) */
-  struct Sym *sym_minus;       /* negative label symbol (&&lab0) */
+  Section *sec;          /* data section containing the value */
+  unsigned long offset;  /* byte offset within sec->data */
+  struct Sym *sym_plus;  /* positive label symbol (&&lab1) */
+  struct Sym *sym_minus; /* negative label symbol (&&lab0) */
   struct LabelDiffFixup *next;
 } LabelDiffFixup;
 

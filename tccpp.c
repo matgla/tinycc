@@ -4465,6 +4465,16 @@ static void tcc_predefs(TCCState *s1, CString *cs, int is_asm)
     putdef(cs, "__leading_underscore");
   cstr_printf(cs, "#define __SIZEOF_POINTER__ %d\n", PTR_SIZE);
   cstr_printf(cs, "#define __SIZEOF_LONG__ %d\n", LONG_SIZE);
+  cstr_printf(cs, "#define __SIZEOF_INT__ 4\n");
+  cstr_printf(cs, "#define __SIZEOF_SHORT__ 2\n");
+  cstr_printf(cs, "#define __SIZEOF_LONG_LONG__ 8\n");
+  cstr_printf(cs, "#define __SIZEOF_FLOAT__ 4\n");
+  cstr_printf(cs, "#define __SIZEOF_DOUBLE__ 8\n");
+  cstr_printf(cs, "#define __SIZEOF_LONG_DOUBLE__ %d\n", LDOUBLE_SIZE);
+  cstr_printf(cs, "#define __SIZEOF_WCHAR_T__ 4\n");
+  cstr_printf(cs, "#define __SIZEOF_WINT_T__ 4\n");
+  cstr_printf(cs, "#define __SIZEOF_SIZE_T__ %d\n", PTR_SIZE);
+  cstr_printf(cs, "#define __SIZEOF_PTRDIFF_T__ %d\n", PTR_SIZE);
   if (!is_asm)
   {
     putdef(cs, "__STDC__");

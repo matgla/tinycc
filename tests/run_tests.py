@@ -42,19 +42,19 @@ def run_pytest(test_dir: Path, markers: str = None, args: list = None, env: dict
     cmd = ["python", "-m", "pytest", str(test_dir)]
     if verbose:
         cmd.append("-v")
-    
+
     if markers:
         cmd.extend(["-m", markers])
-    
+
     if args:
         cmd.extend(args)
-    
+
     env = env or os.environ.copy()
-    
+
     print(f"\n{'='*60}")
     print(f"Running: {' '.join(cmd)}")
     print(f"{'='*60}\n")
-    
+
     result = subprocess.run(cmd, env=env)
     return result.returncode
 
@@ -65,7 +65,7 @@ def download_gcc_tests() -> bool:
     if not download_script.exists():
         print(f"Download script not found: {download_script}")
         return False
-    
+
     print("Downloading GCC torture tests...")
     result = subprocess.run(["bash", str(download_script)])
     return result.returncode == 0
@@ -84,7 +84,7 @@ Examples:
   python run_tests.py --tests2             # Run tests2 (WARNING: not all executable!)
         """
     )
-    
+
     # Test selection
     parser.add_argument("--tests2", action="store_true",
                         help="Run tests2 tests")
@@ -94,13 +94,13 @@ Examples:
                         help="Run IR tests")
     parser.add_argument("--download-gcc", action="store_true",
                         help="Download GCC torture tests first")
-    
+
     # Test type filters
     parser.add_argument("--compile-only", action="store_true",
                         help="Run only compile tests")
     parser.add_argument("--execute", action="store_true",
                         help="Run only execute tests")
-    
+
     # Pytest passthrough options
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Verbose output")
@@ -114,19 +114,19 @@ Examples:
                         help="Number of parallel processes")
     parser.add_argument("--timeout", type=int, default=None,
                         help="Test timeout in seconds (requires pytest-timeout)")
-    
+
     args, extra_args = parser.parse_known_args()
-    
+
     # If no specific test suite selected, run GCC torture tests only
     # Note: tests2 tests are executed via ir_tests, not directly
     run_default = not (args.tests2 or args.gcc or args.ir)
-    
+
     # Download GCC tests if requested
     if args.download_gcc:
         if not download_gcc_tests():
             print("Failed to download GCC tests")
             return 1
-    
+
     # Build pytest arguments
     pytest_args = []
     if args.verbose:
@@ -142,7 +142,7 @@ Examples:
     if args.timeout is not None:
         pytest_args.extend(["--timeout", str(args.timeout)])
     pytest_args.extend(extra_args)
-    
+
     # Determine markers
     markers = []
     if args.compile_only:
@@ -150,10 +150,10 @@ Examples:
     if args.execute:
         markers.append("execute")
     marker_expr = " and ".join(markers) if markers else None
-    
+
     # Run tests
     exit_codes = []
-    
+
     # tests2 tests are executed via ir_tests/test_qemu.py, not directly here
     # They can still be run explicitly with --tests2 flag
     if args.tests2:
@@ -164,19 +164,20 @@ Examples:
         print("The ir_tests suite runs a curated subset of tests2.\n")
         code = run_pytest(TESTS2_DIR, marker_expr, pytest_args, verbose=args.verbose)
         exit_codes.append(code)
-    
+
     if run_default or args.gcc:
-        # Compile tests from gcctestsuite
+        # All GCC torture tests (compile + execute) are now in test_gcc_torture_ir.py
+        gcc_torture_file = IR_DIR / "test_gcc_torture_ir.py"
         print("\n" + "="*60)
         print("Running GCC torture compile tests")
         print("="*60)
         compile_markers = "gcc_torture and gcc_compile"
         if markers:
             compile_markers = f"({compile_markers}) and ({markers})"
-        code = run_pytest(GCC_DIR, compile_markers, pytest_args, verbose=args.verbose)
+        code = run_pytest(gcc_torture_file, compile_markers, pytest_args, verbose=args.verbose)
         exit_codes.append(code)
-        
-        # Execute tests from ir_tests (need newlib for linking)
+
+        # Execute tests (need newlib for linking)
         if not args.compile_only:
             print("\n" + "="*60)
             print("Running GCC torture execute tests")
@@ -184,9 +185,9 @@ Examples:
             execute_markers = "gcc_torture and gcc_execute"
             if markers:
                 execute_markers = f"({execute_markers}) and ({markers})"
-            code = run_pytest(IR_DIR, execute_markers, pytest_args, verbose=args.verbose)
+            code = run_pytest(gcc_torture_file, execute_markers, pytest_args, verbose=args.verbose)
             exit_codes.append(code)
-    
+
     if run_default or args.ir:
         print("\n" + "="*60)
         print("Running IR tests")
@@ -197,14 +198,14 @@ Examples:
             ir_args.extend(["-n", args.numprocesses])
         code = run_pytest(IR_DIR, marker_expr, ir_args, verbose=args.verbose)
         exit_codes.append(code)
-    
+
     # Summary
     print("\n" + "="*60)
     print("Test Run Summary")
     print("="*60)
     print(f"Test suites run: {len([c for c in exit_codes if c is not None])}")
     print(f"Failures: {sum(1 for c in exit_codes if c != 0)}")
-    
+
     return max(exit_codes) if exit_codes else 0
 
 
