@@ -483,6 +483,7 @@ static int mach_get_dest_reg(MachineCodegenContext *ctx, const MachineOperand *o
 
   case MACH_OP_SPILL:
   case MACH_OP_PARAM_STACK:
+  case MACH_OP_SYMBOL:
     return mach_alloc_scratch(ctx, excl);
 
   default:
@@ -549,6 +550,26 @@ static void mach_writeback_dest(const MachineOperand *op, int reg)
     }
     if (chain_used)
       restore_scratch_reg(&chain_scratch);
+    break;
+  }
+
+  case MACH_OP_SYMBOL:
+  {
+    /* Global variable: load symbol address, then store through it. */
+    Sym *sym = op->u.sym.sym ? validate_sym_for_reloc(op->u.sym.sym) : NULL;
+    uint32_t excl = (1u << (uint32_t)reg);
+    ScratchRegAlloc rr = get_scratch_reg_with_save(excl);
+    tcc_machine_load_constant(rr.reg, PREG_REG_NONE, 0, 0, sym);
+    const int32_t addend = op->u.sym.addend;
+    const int abs_off = addend < 0 ? (int)(-addend) : (int)addend;
+    const int sign = addend < 0 ? 1 : 0;
+    if (!store_word_to_base(reg, rr.reg, abs_off, sign))
+    {
+      ScratchRegAlloc rr2 = th_offset_to_reg_ex(abs_off, sign, excl | (1u << (uint32_t)rr.reg));
+      ot_check(th_str_reg((uint32_t)reg, (uint32_t)rr.reg, (uint32_t)rr2.reg, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+      restore_scratch_reg(&rr2);
+    }
+    restore_scratch_reg(&rr);
     break;
   }
 

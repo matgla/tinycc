@@ -10581,6 +10581,27 @@ tok_next:
     gen_op('-'); /* Stack: result */
     break;
   }
+  case TOK_builtin_labs:
+  case TOK_builtin_llabs:
+  case TOK_builtin_imaxabs:
+  {
+    /* Redirect to library functions */
+    const char *func_name;
+    switch (tok) {
+      case TOK_builtin_labs:     func_name = "labs"; break;
+      case TOK_builtin_llabs:    func_name = "llabs"; break;
+      case TOK_builtin_imaxabs:  func_name = "imaxabs"; break;
+      default:                   func_name = NULL; break;
+    }
+    if (func_name) {
+      Sym *sym = external_helper_sym(tok_alloc(func_name, strlen(func_name))->tok);
+      if (!sym->c)
+        put_extern_sym(sym, NULL, 0, 0);
+      vpushsym(&sym->type, sym);
+    }
+    next();
+    break;
+  }
   case TOK_builtin_types_compatible_p:
     parse_builtin_params(0, "tt");
     vtop[-1].type.t &= ~(VT_CONSTANT | VT_VOLATILE);
@@ -13898,6 +13919,193 @@ tok_next:
     break;
   }
 #endif
+
+  /* __builtin_object_size(ptr, type) - returns size of object, or (size_t)-1 if unknown
+   * For now, we always return (size_t)-1 (unknown size) which causes chk functions
+   * to fall back to regular library calls */
+  case TOK_builtin_object_size:
+  {
+    parse_builtin_params(0, "ee");
+    vpop(); /* pop the type argument */
+    vpop(); /* pop the pointer argument */
+    vpushs(-1); /* return SIZE_MAX (unknown size) */
+    break;
+  }
+
+  /* Memory allocation builtins - redirect to library functions */
+  case TOK_builtin_abort:
+  case TOK_builtin_malloc:
+  case TOK_builtin_free:
+  case TOK_builtin_calloc:
+  case TOK_builtin_realloc:
+  {
+    const char *func_name;
+    switch (tok) {
+      case TOK_builtin_abort:    func_name = "abort"; break;
+      case TOK_builtin_malloc:   func_name = "malloc"; break;
+      case TOK_builtin_free:     func_name = "free"; break;
+      case TOK_builtin_calloc:   func_name = "calloc"; break;
+      case TOK_builtin_realloc:  func_name = "realloc"; break;
+      default:                   func_name = NULL; break;
+    }
+    if (func_name) {
+      int func_tok = tok_alloc_const(func_name);
+      vpush_helper_func(func_tok);
+    }
+    next();
+    break;
+  }
+
+  /* Bit manipulation builtins - map to library functions */
+  case TOK_builtin_ffs:
+  case TOK_builtin_ffsl:
+  case TOK_builtin_ffsll:
+  case TOK_builtin_clz:
+  case TOK_builtin_clzl:
+  case TOK_builtin_clzll:
+  case TOK_builtin_ctz:
+  case TOK_builtin_ctzl:
+  case TOK_builtin_ctzll:
+  case TOK_builtin_popcount:
+  case TOK_builtin_popcountl:
+  case TOK_builtin_popcountll:
+  case TOK_builtin_parity:
+  case TOK_builtin_parityl:
+  case TOK_builtin_parityll:
+  {
+    const char *func_name;
+    switch (tok) {
+      case TOK_builtin_ffs:         func_name = "ffs"; break;
+      case TOK_builtin_ffsl:        func_name = "ffsl"; break;
+      case TOK_builtin_ffsll:       func_name = "ffsll"; break;
+      case TOK_builtin_clz:         func_name = "__clzsi2"; break;
+      case TOK_builtin_clzl:        func_name = "__clzsi2"; break;
+      case TOK_builtin_clzll:       func_name = "__clzdi2"; break;
+      case TOK_builtin_ctz:         func_name = "__ctzsi2"; break;
+      case TOK_builtin_ctzl:        func_name = "__ctzsi2"; break;
+      case TOK_builtin_ctzll:       func_name = "__ctzdi2"; break;
+      case TOK_builtin_popcount:    func_name = "__popcountsi2"; break;
+      case TOK_builtin_popcountl:   func_name = "__popcountsi2"; break;
+      case TOK_builtin_popcountll:  func_name = "__popcountdi2"; break;
+      case TOK_builtin_parity:      func_name = "__paritysi2"; break;
+      case TOK_builtin_parityl:     func_name = "__paritysi2"; break;
+      case TOK_builtin_parityll:    func_name = "__paritydi2"; break;
+      default:                      func_name = NULL; break;
+    }
+    if (func_name) {
+      int func_tok = tok_alloc_const(func_name);
+      vpush_helper_func(func_tok);
+    }
+    next();
+    break;
+  }
+
+  /* Fortified/chk variants - ignore size check and call regular function */
+  case TOK_builtin___memcpy_chk:
+  case TOK_builtin___memmove_chk:
+  case TOK_builtin___memset_chk:
+  case TOK_builtin___mempcpy_chk:
+  case TOK_builtin___strcpy_chk:
+  case TOK_builtin___stpcpy_chk:
+  case TOK_builtin___strcat_chk:
+  case TOK_builtin___strncpy_chk:
+  case TOK_builtin___stpncpy_chk:
+  case TOK_builtin___strncat_chk:
+  case TOK_builtin___sprintf_chk:
+  case TOK_builtin___snprintf_chk:
+  case TOK_builtin___vsprintf_chk:
+  case TOK_builtin___vsnprintf_chk:
+  {
+    /* Map chk builtin to corresponding library function name */
+    const char *func_name;
+    switch (tok) {
+      case TOK_builtin___memcpy_chk:     func_name = "memcpy"; break;
+      case TOK_builtin___memmove_chk:    func_name = "memmove"; break;
+      case TOK_builtin___memset_chk:     func_name = "memset"; break;
+      case TOK_builtin___mempcpy_chk:    func_name = "mempcpy"; break;
+      case TOK_builtin___strcpy_chk:     func_name = "strcpy"; break;
+      case TOK_builtin___stpcpy_chk:     func_name = "stpcpy"; break;
+      case TOK_builtin___strcat_chk:     func_name = "strcat"; break;
+      case TOK_builtin___strncpy_chk:    func_name = "strncpy"; break;
+      case TOK_builtin___stpncpy_chk:    func_name = "stpncpy"; break;
+      case TOK_builtin___strncat_chk:    func_name = "strncat"; break;
+      case TOK_builtin___sprintf_chk:    func_name = "sprintf"; break;
+      case TOK_builtin___snprintf_chk:   func_name = "snprintf"; break;
+      case TOK_builtin___vsprintf_chk:   func_name = "vsprintf"; break;
+      case TOK_builtin___vsnprintf_chk:  func_name = "vsnprintf"; break;
+      default:                           func_name = NULL; break;
+    }
+    if (func_name) {
+      int func_tok = tok_alloc_const(func_name);
+      vpush_helper_func(func_tok);
+    }
+    next();
+    break;
+  }
+
+  /* String and memory builtins - redirect to library functions */
+  case TOK_builtin_strlen:
+  case TOK_builtin_strcpy:
+  case TOK_builtin_strncpy:
+  case TOK_builtin_strcat:
+  case TOK_builtin_strncat:
+  case TOK_builtin_strcmp:
+  case TOK_builtin_strncmp:
+  case TOK_builtin_memcpy:
+  case TOK_builtin_memmove:
+  case TOK_builtin_memset:
+  case TOK_builtin_memcmp:
+  case TOK_builtin_memchr:
+  case TOK_builtin_strchr:
+  case TOK_builtin_strrchr:
+  case TOK_builtin_strstr:
+  case TOK_builtin_strpbrk:
+  case TOK_builtin_strspn:
+  case TOK_builtin_strcspn:
+  case TOK_builtin_strnlen:
+  case TOK_builtin_mempcpy:
+  case TOK_builtin_stpcpy:
+  case TOK_builtin_stpncpy:
+  case TOK_builtin_fputs:
+  case TOK_builtin_fprintf:
+  {
+    /* Map builtin to corresponding library function name */
+    const char *func_name;
+    switch (tok) {
+      case TOK_builtin_strlen:   func_name = "strlen"; break;
+      case TOK_builtin_strcpy:   func_name = "strcpy"; break;
+      case TOK_builtin_strncpy:  func_name = "strncpy"; break;
+      case TOK_builtin_strcat:   func_name = "strcat"; break;
+      case TOK_builtin_strncat:  func_name = "strncat"; break;
+      case TOK_builtin_strcmp:   func_name = "strcmp"; break;
+      case TOK_builtin_strncmp:  func_name = "strncmp"; break;
+      case TOK_builtin_memcpy:   func_name = "memcpy"; break;
+      case TOK_builtin_memmove:  func_name = "memmove"; break;
+      case TOK_builtin_memset:   func_name = "memset"; break;
+      case TOK_builtin_memcmp:   func_name = "memcmp"; break;
+      case TOK_builtin_memchr:   func_name = "memchr"; break;
+      case TOK_builtin_strchr:   func_name = "strchr"; break;
+      case TOK_builtin_strrchr:  func_name = "strrchr"; break;
+      case TOK_builtin_strstr:   func_name = "strstr"; break;
+      case TOK_builtin_strpbrk:  func_name = "strpbrk"; break;
+      case TOK_builtin_strspn:   func_name = "strspn"; break;
+      case TOK_builtin_strcspn:  func_name = "strcspn"; break;
+      case TOK_builtin_strnlen:  func_name = "strnlen"; break;
+      case TOK_builtin_mempcpy:  func_name = "mempcpy"; break;
+      case TOK_builtin_stpcpy:   func_name = "stpcpy"; break;
+      case TOK_builtin_stpncpy:  func_name = "stpncpy"; break;
+      case TOK_builtin_fputs:    func_name = "fputs"; break;
+      case TOK_builtin_fprintf:  func_name = "fprintf"; break;
+      default:                   func_name = NULL; break;
+    }
+    if (func_name) {
+      int func_tok = tok_alloc_const(func_name);
+      vpush_helper_func(func_tok);
+    }
+    /* Consume the builtin token; the caller will handle the following '(' */
+    next();
+    break;
+  }
 
   /* atomic operations */
   case TOK___atomic_store:
