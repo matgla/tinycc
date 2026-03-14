@@ -42,6 +42,9 @@ OPT_LEVELS = ["-O0", "-O1"]
 # Entries can be plain stems ("test_name") or directory-prefixed ("ieee/test_name")
 # to disambiguate tests with the same name in different directories.
 GCC_XFAIL_TESTS = {
+    # execute/ tests — setjmp/longjmp relocation errors (R_ARM_THM_JUMP11)
+    "20210505-1",
+    "pr56982",
     # ieee/ tests — IEEE floating-point edge cases, long double, NaN/Inf handling
     "ieee/20000320-1",
     "ieee/cdivchkd",
@@ -214,6 +217,9 @@ GCC_SKIP_TESTS = {
     "pr23135", # __uint128 - not supported
     "pr93213", # __uint128 - not supported
     "pr84748", # __int128 - not supported
+    # execute/ tests — require mmap (not available on bare-metal ARM)
+    "loop-2f", # requires mmap, includes <sys/mman.h>
+    "loop-2g", # requires mmap, includes <sys/mman.h>
     # compile/ tests — timeouts
     "compile/limits-fndefn", # compilation timeout (>10s)
     # compile/ tests — x86-only or GCC-internal (not applicable to ARM target)
@@ -310,6 +316,10 @@ def should_skip_gcc_test(test_path: Path) -> Optional[str]:
             arm_patterns = ['arm', 'aarch64', 'thumb']
             if not any(p in targets.lower() for p in arm_patterns):
                 return f"dg-skip-if: test restricted to non-ARM targets ({targets.strip()})"
+
+        # Tests requiring mmap are not available on bare-metal ARM
+        if "dg-require-effective-target mmap" in content:
+            return "Requires mmap (not available on bare-metal ARM)"
 
         # Tests requiring trampolines (nested functions) are now supported
         # if "dg-require-effective-target trampolines" in content:

@@ -60,8 +60,8 @@ VALGRIND_TIMEOUT_MULTIPLIER = 10 if VALGRIND_ENABLED else 1
 class SubprocessSUT:
     """Minimal pexpect-like interface for reading QEMU output without PTYs.
 
-    This avoids Python 3.13+ warnings (and potential flakiness) around
-    forkpty() in multi-threaded processes on macOS.
+    This avoids forkpty()-related warnings and potential flakiness in
+    multi-threaded test runners.
     """
 
     def __init__(self, command: str):
@@ -728,17 +728,15 @@ def compile_testcase(test_file, machine, compiler=None, cflags=None, config=None
 
 def prepare_test(machine, kernel_file, args=None):
     qemu_command = build_qemu_command(machine, kernel_file, args)
-    # Prefer pipe-based execution when possible.
+    # Prefer pipe-based execution by default.
     #
-    # - On macOS we avoid pty.forkpty() warnings/flakiness in multi-threaded
-    #   processes (Python 3.13+).
-    # - On Python 3.14+ a DeprecationWarning is emitted when forkpty() is used
-    #   from a multi-threaded process (common under pytest), so avoid PTYs by
-    #   default there as well.
+    # Python distributions have started warning about pty.forkpty() in
+    # multi-threaded processes, and pytest/xdist commonly creates that setup.
+    # The pipe-based wrapper provides the subset of pexpect API used by these
+    # tests, so keep PTYs as an opt-in fallback for local debugging only.
     force_pexpect = os.environ.get("TINYCC_IRTEST_USE_PEXPECT", "")
     if force_pexpect.strip() not in {"1", "true", "TRUE"}:
-        if sys.platform == "darwin" or sys.version_info >= (3, 14):
-            return SubprocessSUT(qemu_command)
+        return SubprocessSUT(qemu_command)
 
     # Otherwise, use a wide pseudo-terminal so long lines aren't wrapped.
     sut = pexpect.spawn(qemu_command)

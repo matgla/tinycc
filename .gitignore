@@ -81,3 +81,5 @@ lib/fp/soft/test_aeabi_all
 lib/fp/soft/test_dmul_host
 lib/fp/soft/test_host
 tmp/
+
+.venv

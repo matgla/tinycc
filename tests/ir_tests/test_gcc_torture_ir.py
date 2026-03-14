@@ -77,6 +77,14 @@ SLOW_UNDER_INSTRUMENTATION = {
 GCC_EXECUTE_TESTS = discover_gcc_execute_tests()
 
 
+def _sut_has_exited(sut):
+    if hasattr(sut, "_proc"):
+        return sut._proc.poll() is not None
+    if hasattr(sut, "isalive"):
+        return not sut.isalive()
+    return getattr(sut, "exitstatus", None) is not None
+
+
 def _test_id(test_case, opt_level):
     """Generate a unique test ID including subdirectory prefix."""
     execute_dir = GCC_TORTURE_PATH / "execute"
@@ -153,7 +161,7 @@ def test_gcc_execute_ir(test_case, opt_level, tmp_path):
     # Poll until process exits (max 5 seconds)
     start = time.monotonic()
     while time.monotonic() - start < 5:
-        if sut._proc.poll() is not None:
+        if _sut_has_exited(sut):
             break
         time.sleep(0.01)
     sut.close()
@@ -219,9 +227,23 @@ def test_gcc_compile_ir(test_case, opt_level, tmp_path):
         pytest.xfail(test_case.xfail_reason)
 
     compiler = CURRENT_DIR / "../../armv8m-tcc"
+    project_root = (CURRENT_DIR / "../..").resolve()
+    libc_includes = CURRENT_DIR / "libc_includes"
+    libc_imports = CURRENT_DIR / "libc_imports"
+    newlib_includes = libc_includes / "newlib"
     output_obj = tmp_path / f"{test_case.source.stem}.o"
 
-    cmd = [str(compiler), "-c", str(test_case.source), "-o", str(output_obj), opt_level]
+    cmd = [
+        str(compiler),
+        f"-B{project_root}",
+        f"-I{libc_includes}",
+        f"-I{libc_imports}",
+        f"-I{newlib_includes}",
+        f"-I{project_root / 'include'}",
+        "-c", str(test_case.source),
+        "-o", str(output_obj),
+        opt_level,
+    ]
     if test_case.dg_options:
         cmd.extend(test_case.dg_options.split())
 

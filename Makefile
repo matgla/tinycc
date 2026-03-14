@@ -483,14 +483,20 @@ test-prepare:
 ASMTESTS_DIR := tests/thumb/armv8m
 
 .PHONY: test-asm
-test-asm: cross
+test-asm: cross test-venv
 	@echo "------------ assembler tests (pytest) ------------"
-	@cd $(ASMTESTS_DIR) && \
-		TEST_CC="$(CURDIR)/armv8m-tcc" \
-		TEST_COMPARE_CC="arm-none-eabi-gcc" \
-		TEST_OBJDUMP="arm-none-eabi-objdump" \
-		TEST_OBJCOPY="arm-none-eabi-objcopy" \
-		$(PYTEST) --tb=short -q .
+	@set -e; \
+	cd $(ASMTESTS_DIR) && \
+		TEST_CC="$(CURDIR)/armv8m-tcc"; \
+		TEST_COMPARE_CC="arm-none-eabi-gcc"; \
+		TEST_OBJDUMP="arm-none-eabi-objdump"; \
+		TEST_OBJCOPY="arm-none-eabi-objcopy"; \
+		export TEST_CC TEST_COMPARE_CC TEST_OBJDUMP TEST_OBJCOPY; \
+		if [ "$(USE_VENV)" = "1" ]; then \
+			"$(VENV_PY)" -m pytest --tb=short -q -n $(J) .; \
+		else \
+			$(PYTEST) --tb=short -q -n $(J) .; \
+		fi
 
 # run IR tests via pytest (preferred)
 test: cross test-aeabi-host test-asm test-venv test-prepare
