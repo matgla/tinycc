@@ -6017,17 +6017,24 @@ static void thumb_process_complex_mul_mop(MachineOperand src1, MachineOperand sr
   complex_pair_writeback(&d_real, R0, &d_imag, R1);
 }
 
-/* Process complex division via MachineOperands.
- * (a+bi)/(c+di) = ((ac+bd) + (bc-ad)i) / (c²+d²)
+/* Process complex float division via MachineOperands.
+ * Calls __divsc3 from libgcc for numerically robust division.
  *
- * Stack layout (32 bytes, 8-byte aligned):
- *   [sp+24] = d  (imag of src2)
- *   [sp+20] = c  (real of src2)
- *   [sp+16] = b  (imag of src1)
- *   [sp+12] = a  (real of src1)
- *   [sp+8]  = denom (c²+d²)
- *   [sp+4]  = scratch1
- *   [sp+0]  = scratch0
+ * __divsc3 calling convention (soft-float AAPCS, hidden return pointer):
+ *   R0       = hidden return pointer (8-byte buffer for result)
+ *   R1       = a_re (float)
+ *   R2       = a_im (float)
+ *   R3       = b_re (float)
+ *   [sp+0]   = b_im (float, on stack)
+ *   Result written to [R0+0..3] = real, [R0+4..7] = imag
+ *
+ * Stack layout (24 bytes, 8-byte aligned):
+ *   [sp+0]   = b_im for __divsc3 stack arg  (4 bytes)
+ *   [sp+4]   = a_re staging                 (4 bytes)
+ *   [sp+8]   = a_im staging                 (4 bytes)
+ *   [sp+12]  = b_re staging                 (4 bytes)
+ *   [sp+16]  = result buffer: real part      (4 bytes)
+ *   [sp+20]  = result buffer: imag part      (4 bytes)
  */
 static void thumb_process_complex_div_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest)
 {
@@ -6036,99 +6043,37 @@ static void thumb_process_complex_div_mop(MachineOperand src1, MachineOperand sr
   MachineOperand s2_real = mach_make_lo_half(&src2);
   MachineOperand s2_imag = mach_make_hi_half(&src2);
 
-  /* Allocate 32 bytes */
-  ot_check(th_sub_sp_imm(R_SP, 32, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+  /* Allocate 24 bytes (8-byte aligned). */
+  ot_check(th_sub_sp_imm(R_SP, 24, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
 
-  /* Save inputs to stack */
-  fp_mop_load_arg(R0, &s1_real);
-  ot_check(th_str_imm(R0, R_SP, 12, 6, ENFORCE_ENCODING_NONE)); /* a */
-  fp_mop_load_arg(R0, &s1_imag);
-  ot_check(th_str_imm(R0, R_SP, 16, 6, ENFORCE_ENCODING_NONE)); /* b */
-  fp_mop_load_arg(R0, &s2_real);
-  ot_check(th_str_imm(R0, R_SP, 20, 6, ENFORCE_ENCODING_NONE)); /* c */
+  /* Stage all four operands to stack via R0 to avoid clobbering. */
   fp_mop_load_arg(R0, &s2_imag);
-  ot_check(th_str_imm(R0, R_SP, 24, 6, ENFORCE_ENCODING_NONE)); /* d */
+  ot_check(th_str_imm(R0, R_SP, 0, 6, ENFORCE_ENCODING_NONE)); /* b_im → [sp+0] (stack arg) */
+  fp_mop_load_arg(R0, &s1_real);
+  ot_check(th_str_imm(R0, R_SP, 4, 6, ENFORCE_ENCODING_NONE)); /* a_re → [sp+4] */
+  fp_mop_load_arg(R0, &s1_imag);
+  ot_check(th_str_imm(R0, R_SP, 8, 6, ENFORCE_ENCODING_NONE)); /* a_im → [sp+8] */
+  fp_mop_load_arg(R0, &s2_real);
+  ot_check(th_str_imm(R0, R_SP, 12, 6, ENFORCE_ENCODING_NONE)); /* b_re → [sp+12] */
 
-  const int off_scratch0 = 0;
-  const int off_scratch1 = 4;
-  const int off_denom = 8;
-  const int off_a = 12;
-  const int off_b = 16;
-  const int off_c = 20;
-  const int off_d = 24;
+  /* Load register args from staging area. */
+  ot_check(th_ldr_imm(R1, R_SP, 4, 6, ENFORCE_ENCODING_NONE));  /* R1 = a_re */
+  ot_check(th_ldr_imm(R2, R_SP, 8, 6, ENFORCE_ENCODING_NONE));  /* R2 = a_im */
+  ot_check(th_ldr_imm(R3, R_SP, 12, 6, ENFORCE_ENCODING_NONE)); /* R3 = b_re */
 
-  /* Step 1: c*c → scratch0 */
-  ot_check(th_ldr_imm(R0, R_SP, off_c, 6, ENFORCE_ENCODING_NONE));
-  ot_check(th_ldr_imm(R1, R_SP, off_c, 6, ENFORCE_ENCODING_NONE));
-  fp_mop_do_bl("__aeabi_fmul");
-  ot_check(th_str_imm(R0, R_SP, off_scratch0, 6, ENFORCE_ENCODING_NONE));
+  /* R0 = pointer to result buffer at [sp+16]. */
+  ot_check(th_add_sp_imm(R0, 16, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
 
-  /* Step 2: d*d → scratch1 */
-  ot_check(th_ldr_imm(R0, R_SP, off_d, 6, ENFORCE_ENCODING_NONE));
-  ot_check(th_ldr_imm(R1, R_SP, off_d, 6, ENFORCE_ENCODING_NONE));
-  fp_mop_do_bl("__aeabi_fmul");
-  ot_check(th_str_imm(R0, R_SP, off_scratch1, 6, ENFORCE_ENCODING_NONE));
+  /* Call __divsc3. */
+  fp_mop_do_bl("__divsc3");
 
-  /* Step 3: denom = c*c + d*d → denom */
-  ot_check(th_ldr_imm(R0, R_SP, off_scratch0, 6, ENFORCE_ENCODING_NONE));
-  ot_check(th_ldr_imm(R1, R_SP, off_scratch1, 6, ENFORCE_ENCODING_NONE));
-  fp_mop_do_bl("__aeabi_fadd");
-  ot_check(th_str_imm(R0, R_SP, off_denom, 6, ENFORCE_ENCODING_NONE));
-
-  /* Step 4: a*c → scratch0 */
-  ot_check(th_ldr_imm(R0, R_SP, off_a, 6, ENFORCE_ENCODING_NONE));
-  ot_check(th_ldr_imm(R1, R_SP, off_c, 6, ENFORCE_ENCODING_NONE));
-  fp_mop_do_bl("__aeabi_fmul");
-  ot_check(th_str_imm(R0, R_SP, off_scratch0, 6, ENFORCE_ENCODING_NONE));
-
-  /* Step 5: b*d → scratch1 */
-  ot_check(th_ldr_imm(R0, R_SP, off_b, 6, ENFORCE_ENCODING_NONE));
-  ot_check(th_ldr_imm(R1, R_SP, off_d, 6, ENFORCE_ENCODING_NONE));
-  fp_mop_do_bl("__aeabi_fmul");
-  ot_check(th_str_imm(R0, R_SP, off_scratch1, 6, ENFORCE_ENCODING_NONE));
-
-  /* Step 6: numerator_real = a*c + b*d → scratch0 */
-  ot_check(th_ldr_imm(R0, R_SP, off_scratch0, 6, ENFORCE_ENCODING_NONE));
-  ot_check(th_ldr_imm(R1, R_SP, off_scratch1, 6, ENFORCE_ENCODING_NONE));
-  fp_mop_do_bl("__aeabi_fadd");
-  ot_check(th_str_imm(R0, R_SP, off_scratch0, 6, ENFORCE_ENCODING_NONE));
-
-  /* Step 7: real = numerator_real / denom → scratch0 */
-  ot_check(th_ldr_imm(R0, R_SP, off_scratch0, 6, ENFORCE_ENCODING_NONE));
-  ot_check(th_ldr_imm(R1, R_SP, off_denom, 6, ENFORCE_ENCODING_NONE));
-  fp_mop_do_bl("__aeabi_fdiv");
-  ot_check(th_str_imm(R0, R_SP, off_scratch0, 6, ENFORCE_ENCODING_NONE));
-
-  /* Step 8: b*c → scratch1 */
-  ot_check(th_ldr_imm(R0, R_SP, off_b, 6, ENFORCE_ENCODING_NONE));
-  ot_check(th_ldr_imm(R1, R_SP, off_c, 6, ENFORCE_ENCODING_NONE));
-  fp_mop_do_bl("__aeabi_fmul");
-  ot_check(th_str_imm(R0, R_SP, off_scratch1, 6, ENFORCE_ENCODING_NONE));
-
-  /* Step 9: a*d → off_a (no longer needed) */
-  ot_check(th_ldr_imm(R0, R_SP, off_a, 6, ENFORCE_ENCODING_NONE));
-  ot_check(th_ldr_imm(R1, R_SP, off_d, 6, ENFORCE_ENCODING_NONE));
-  fp_mop_do_bl("__aeabi_fmul");
-  ot_check(th_str_imm(R0, R_SP, off_a, 6, ENFORCE_ENCODING_NONE));
-
-  /* Step 10: numerator_imag = b*c - a*d → scratch1 */
-  ot_check(th_ldr_imm(R0, R_SP, off_scratch1, 6, ENFORCE_ENCODING_NONE));
-  ot_check(th_ldr_imm(R1, R_SP, off_a, 6, ENFORCE_ENCODING_NONE));
-  fp_mop_do_bl("__aeabi_fsub");
-  ot_check(th_str_imm(R0, R_SP, off_scratch1, 6, ENFORCE_ENCODING_NONE));
-
-  /* Step 11: imag = numerator_imag / denom → scratch1 */
-  ot_check(th_ldr_imm(R0, R_SP, off_scratch1, 6, ENFORCE_ENCODING_NONE));
-  ot_check(th_ldr_imm(R1, R_SP, off_denom, 6, ENFORCE_ENCODING_NONE));
-  fp_mop_do_bl("__aeabi_fdiv");
-  ot_check(th_str_imm(R0, R_SP, off_scratch1, 6, ENFORCE_ENCODING_NONE));
-
-  /* Load results and write back */
+  /* Read result from buffer and write back to dest. */
   MachineOperand d_real = mach_make_lo_half(&dest);
   MachineOperand d_imag = mach_make_hi_half(&dest);
-  ot_check(th_ldr_imm(R0, R_SP, off_scratch0, 6, ENFORCE_ENCODING_NONE)); /* real */
-  ot_check(th_ldr_imm(R1, R_SP, off_scratch1, 6, ENFORCE_ENCODING_NONE)); /* imag */
-  ot_check(th_add_sp_imm(R_SP, 32, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+  ot_check(th_ldr_imm(R0, R_SP, 16, 6, ENFORCE_ENCODING_NONE)); /* real */
+  ot_check(th_ldr_imm(R1, R_SP, 20, 6, ENFORCE_ENCODING_NONE)); /* imag */
+
+  ot_check(th_add_sp_imm(R_SP, 24, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
 
   complex_pair_writeback(&d_real, R0, &d_imag, R1);
 }
@@ -8992,8 +8937,20 @@ ST_FUNC const char *tcc_get_abi_softcall_name(SValue *src1, SValue *src2, SValue
   break;
   case TCCIR_OP_CVT_ITOF:
   {
-    /* Integer to double */
+    /* Integer to float/double conversion.
+     * Need to distinguish 32-bit int vs 64-bit long long sources:
+     *  - 32-bit: __aeabi_{ui,i}2{d,f}
+     *  - 64-bit: __aeabi_{ul,l}2{d,f}
+     */
     int is_unsigned = (src1->type.t & VT_UNSIGNED) ? 1 : 0;
+    if (src1_size == 8)
+    {
+      /* 64-bit integer source (long long / unsigned long long) */
+      if (is_unsigned)
+        return dest_64bit ? "__aeabi_ul2d" : "__aeabi_ul2f";
+      return dest_64bit ? "__aeabi_l2d" : "__aeabi_l2f";
+    }
+    /* 32-bit integer source (int / unsigned int) */
     if (is_unsigned)
       return dest_64bit ? "__aeabi_ui2d" : "__aeabi_ui2f";
     return dest_64bit ? "__aeabi_i2d" : "__aeabi_i2f";

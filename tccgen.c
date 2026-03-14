@@ -3744,6 +3744,56 @@ static void gen_opif(int op)
     return;
   }
 
+  /* IEEE 754: any ordered comparison with NaN yields false,
+     unordered (!=) yields true.  If exactly one operand is a
+     compile-time NaN constant, fold the comparison. */
+  if ((c1 || c2) && !(c1 && c2))
+  {
+    int is_cmp = (op == TOK_EQ || op == TOK_NE || op == TOK_LT ||
+                  op == TOK_LE || op == TOK_GT || op == TOK_GE);
+    if (is_cmp)
+    {
+      SValue *cv = c1 ? v1 : v2;
+      long double fv;
+      if (bt == VT_FLOAT)
+        fv = cv->c.f;
+      else if (bt == VT_DOUBLE)
+        fv = cv->c.d;
+      else
+        fv = cv->c.ld;
+      /* NaN is the only value where fv != fv */
+      if (fv != fv)
+      {
+        i = (op == TOK_NE) ? 1 : 0;
+        vtop -= 2;
+        vpushi(i);
+        return;
+      }
+      /* Strict comparison beyond infinity is always false:
+         x > +inf, +inf < x, x < -inf, -inf > x */
+      if (!ieee_finite(fv))
+      {
+        int fold = 0;
+        if (fv > 0)
+        { /* +inf */
+          if ((c2 && op == TOK_GT) || (c1 && op == TOK_LT))
+            fold = 1;
+        }
+        else
+        { /* -inf */
+          if ((c2 && op == TOK_LT) || (c1 && op == TOK_GT))
+            fold = 1;
+        }
+        if (fold)
+        {
+          vtop -= 2;
+          vpushi(0);
+          return;
+        }
+      }
+    }
+  }
+
   if (c1 && c2)
   {
     if (bt == VT_FLOAT)
@@ -3762,9 +3812,14 @@ static void gen_opif(int op)
       f2 = v2->c.ld;
     }
     /* NOTE: we only do constant propagation if finite number (not
-       NaN or infinity) (ANSI spec) */
-    if (!(ieee_finite(f1) || !ieee_finite(f2)) && !CONST_WANTED)
-      goto general_case;
+       NaN or infinity) (ANSI spec).  Comparison operators are safe
+       to fold with NaN/Inf since they don't raise FP exceptions. */
+    if (!(ieee_finite(f1) || !ieee_finite(f2)) && !CONST_WANTED) {
+      int is_cmp = (op == TOK_EQ || op == TOK_NE || op == TOK_LT ||
+                    op == TOK_LE || op == TOK_GT || op == TOK_GE);
+      if (!is_cmp)
+        goto general_case;
+    }
     switch (op)
     {
     case '+':
@@ -4123,7 +4178,13 @@ static int compare_types(CType *type1, CType *type2, int unqualified)
   }
   else if (bt1 == VT_STRUCT)
   {
-    return (type1->ref == type2->ref);
+    if (type1->ref == type2->ref)
+      return 1;
+    /* Two vector types with different Sym*: compare structurally.
+       (t1 already verified equal to t2, so both have VT_VECTOR.) */
+    if (t1 & VT_VECTOR)
+      return type1->ref->c == type2->ref->c && compare_types(&type1->ref->type, &type2->ref->type, unqualified);
+    return 0;
   }
   else if (bt1 == VT_FUNC)
   {
@@ -6581,6 +6642,20 @@ static void gen_op_vector(int op)
   is_cmp = (op == TOK_EQ || op == TOK_NE || op == TOK_LT || op == TOK_GE || op == TOK_LE || op == TOK_GT ||
             op == TOK_ULT || op == TOK_UGE || op == TOK_ULE || op == TOK_UGT);
 
+  /* For comparison ops on float vectors, the result is an integer vector
+   * of the same total size (GCC vector semantics).  Build the appropriate
+   * integer vector type and use its element type for storing results. */
+  CType cmp_vec_type = vec_type;
+  CType store_elem_type = elem_type;
+  if (is_cmp && is_float(elem_type.t))
+  {
+    CType int_elem;
+    int_elem.t = (elem_size == 8) ? VT_LLONG : VT_INT;
+    int_elem.ref = NULL;
+    make_vector_type(&cmp_vec_type, &int_elem, vec_size);
+    store_elem_type = int_elem;
+  }
+
   /* Save both operands and pop them off the value stack */
   right_sv = vtop[0];
   left_sv = vtop[-1];
@@ -6646,7 +6721,7 @@ static void gen_op_vector(int op)
     /* ---- Store computed value into result[i] via pointer arithmetic ---- */
     /* Build address of result element using LEA + byte-offset addition */
     memset(&res_base_sv, 0, sizeof(res_base_sv));
-    res_base_sv.type = vec_type;
+    res_base_sv.type = is_cmp ? cmp_vec_type : vec_type;
     res_base_sv.r = VT_LOCAL | VT_LVAL;
     res_base_sv.vr = res_vr;
     res_base_sv.c.i = res_loc;
@@ -6656,7 +6731,7 @@ static void gen_op_vector(int op)
     vtop->type = char_pointer_type;
     vpushi(offset);
     gen_op('+'); /* char* + byte-offset = element address */
-    vtop->type = elem_type;
+    vtop->type = is_cmp ? store_elem_type : elem_type;
     vtop->r |= VT_LVAL; /* lvalue: *element_address */
 
     /* Stack is now: vtop[-1] = computed_value, vtop = result[i] lvalue */
@@ -6669,7 +6744,7 @@ static void gen_op_vector(int op)
   {
     SValue result;
     memset(&result, 0, sizeof(result));
-    result.type = vec_type;
+    result.type = is_cmp ? cmp_vec_type : vec_type;
     result.r = VT_LOCAL | VT_LVAL;
     result.vr = res_vr;
     result.c.i = res_loc;
@@ -11544,10 +11619,8 @@ tok_next:
        * so we OR them and invert, avoiding VT_CMP materialization
        * issues that arise from gen_op on floats. */
 
-      int is_double = ((vtop[-1].type.t & VT_BTYPE) == VT_DOUBLE) ||
-                      ((vtop[-1].type.t & VT_BTYPE) == VT_LDOUBLE) ||
-                      ((vtop[0].type.t & VT_BTYPE) == VT_DOUBLE) ||
-                      ((vtop[0].type.t & VT_BTYPE) == VT_LDOUBLE);
+      int is_double = ((vtop[-1].type.t & VT_BTYPE) == VT_DOUBLE) || ((vtop[-1].type.t & VT_BTYPE) == VT_LDOUBLE) ||
+                      ((vtop[0].type.t & VT_BTYPE) == VT_DOUBLE) || ((vtop[0].type.t & VT_BTYPE) == VT_LDOUBLE);
 
       /* Promote float args to double if needed for consistent calling */
       if (is_double)
@@ -11638,9 +11711,9 @@ tok_next:
 
       /* Result = !(unordered | equal) = (unordered == 0) && (equal == 0)
        * Use bitwise OR then == 0 check for branchless code. */
-      gen_op('|');      /* unordered | equal */
+      gen_op('|'); /* unordered | equal */
       vpushi(0);
-      gen_op(TOK_EQ);  /* (unordered | equal) == 0 */
+      gen_op(TOK_EQ); /* (unordered | equal) == 0 */
     }
     break;
   }
@@ -11954,17 +12027,20 @@ tok_next:
     break;
   }
 
-  /* __builtin_fmax / __builtin_fmaxf / __builtin_fmin / __builtin_fminf */
+  /* __builtin_fmax / __builtin_fmaxf / __builtin_fmaxl / __builtin_fmin / __builtin_fminf / __builtin_fminl */
   case TOK_builtin_fmax:
   case TOK_builtin_fmaxf:
+  case TOK_builtin_fmaxl:
   case TOK_builtin_fmin:
   case TOK_builtin_fminf:
+  case TOK_builtin_fminl:
   {
     int tok1 = tok;
     parse_builtin_params(0, "ee");
 
     int is_float = (tok1 == TOK_builtin_fmaxf || tok1 == TOK_builtin_fminf);
-    int is_max = (tok1 == TOK_builtin_fmax || tok1 == TOK_builtin_fmaxf);
+    int is_max = (tok1 == TOK_builtin_fmax || tok1 == TOK_builtin_fmaxf ||
+                  tok1 == TOK_builtin_fmaxl);
 
     /* Check if both arguments are constants */
     int bt_x = vtop[-1].type.t & VT_BTYPE;
@@ -12068,6 +12144,12 @@ tok_next:
         func_tok = is_float ? TOK___fmaxf : TOK___fmax;
       else
         func_tok = is_float ? TOK___fminf : TOK___fmin;
+      /* For long double variants, use the 'l' runtime functions.
+       * On ARM (long double == double), these are equivalent to double versions. */
+      if (tok1 == TOK_builtin_fmaxl)
+        func_tok = TOK___fmaxl;
+      else if (tok1 == TOK_builtin_fminl)
+        func_tok = TOK___fminl;
       vpush_helper_func(func_tok);
 
       SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 2);

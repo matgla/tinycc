@@ -198,7 +198,16 @@ MachineOperand machine_op_from_ir(TCCIRState *ir, const IROperand *op)
       interval->allocation.r0 == PREG_NONE && interval->allocation.offset == 0)
   {
     m.kind = MACH_OP_PARAM_STACK;
-    m.u.param.offset = interval->original_offset;
+    /* Use actual operand offset when available (tag == STACKOFF).
+     * Sub-component access (e.g. __imag__ on a complex double param)
+     * adjusts the stack offset via c.i += elem_size, producing a
+     * different offset than the param's original_offset.  Without
+     * this, __imag__ of a stack-passed complex double would read the
+     * real part instead of the imaginary part. */
+    if (tag == IROP_TAG_STACKOFF)
+      m.u.param.offset = irop_get_stack_offset(*op);
+    else
+      m.u.param.offset = interval->original_offset;
     int need_lval = op->is_lval;
     if (!op->is_const && !op->is_local && !op->is_llocal && interval->is_lvalue)
       need_lval = 1;

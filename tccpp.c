@@ -2742,6 +2742,7 @@ static void parse_number(const char *p)
       else
         shift = 1;
       bn_zero(bn);
+      int bn_used_bits = 0;
       q = token_buf;
       while (1)
       {
@@ -2763,6 +2764,7 @@ static void parse_number(const char *p)
           t = t - '0';
         }
         bn_lshift(bn, shift, t);
+        bn_used_bits += shift;
       }
       frac_bits = 0;
       if (ch == '.')
@@ -2789,8 +2791,16 @@ static void parse_number(const char *p)
           }
           if (t >= b)
             tcc_error("invalid digit");
-          bn_lshift(bn, shift, t);
-          frac_bits += shift;
+          /* Only accumulate digits that fit in the bignum.  Excess
+             fractional digits beyond BN_SIZE*32 bits would overflow
+             the fixed-width bignum and corrupt the result.  Silently
+             ignore them (they are beyond double precision anyway). */
+          if (bn_used_bits + shift <= BN_SIZE * 32)
+          {
+            bn_lshift(bn, shift, t);
+            frac_bits += shift;
+            bn_used_bits += shift;
+          }
           ch = *p++;
         }
       }

@@ -33,6 +33,7 @@ discover_gcc_execute_tests = _gcc_conftest.discover_gcc_execute_tests
 discover_gcc_compile_tests = _gcc_conftest.discover_gcc_compile_tests
 should_skip_gcc_test = _gcc_conftest.should_skip_gcc_test
 is_xfail_test = _gcc_conftest.is_xfail_test
+is_xfail_o1_test = _gcc_conftest.is_xfail_o1_test
 
 MACHINE = "mps2-an505"
 CURRENT_DIR = Path(__file__).parent
@@ -138,6 +139,12 @@ def test_gcc_execute_ir(test_case, opt_level, tmp_path):
 
     if test_case.xfail_reason:
         pytest.xfail(test_case.xfail_reason)
+
+    # O1-only xfails: tests that pass at -O0 but need advanced optimizations
+    if opt_level == "-O1":
+        o1_reason = is_xfail_o1_test(test_case.source)
+        if o1_reason:
+            pytest.xfail(o1_reason)
 
     extra_flags = opt_level
     if test_case.dg_options:

@@ -42,30 +42,6 @@ OPT_LEVELS = ["-O0", "-O1"]
 # Entries can be plain stems ("test_name") or directory-prefixed ("ieee/test_name")
 # to disambiguate tests with the same name in different directories.
 GCC_XFAIL_TESTS = {
-    "ieee/cdivchkd",
-    "ieee/cdivchkf",
-    "ieee/cdivchkld",
-    "ieee/compare-fp-1",
-    "ieee/compare-fp-3",
-    "ieee/copysign2",
-    "ieee/fp-cmp-4",
-    "ieee/fp-cmp-4f",
-    "ieee/fp-cmp-4l",
-    "ieee/fp-cmp-5",
-    "ieee/fp-cmp-6",
-    "ieee/fp-cmp-7",
-    "ieee/fp-cmp-8",
-    "ieee/fp-cmp-8f",
-    "ieee/fp-cmp-8l",
-    "ieee/fp-cmp-9",
-    "ieee/fp-cmp-cond-1",
-    "ieee/mzero3",
-    "ieee/pr109386",
-    "ieee/pr38016",
-    "ieee/pr50310",
-    "ieee/pr72824",
-    "ieee/pr72824-2",
-    "ieee/rbug",
     # builtins/ tests — builtin override tests requiring lib/main.c framework
     "builtins/abs-1",
     "builtins/abs-2",
@@ -202,6 +178,13 @@ GCC_XFAIL_TESTS = {
     "compile/vector-2",
     "compile/vector-3",
     "compile/vector-shift-1",
+}
+
+# GCC Torture tests expected to fail only at -O1
+# These pass at -O0 but require advanced optimizations (e.g., contradictory
+# condition elimination) that TCC does not implement.
+GCC_XFAIL_O1_TESTS = {
+    "ieee/compare-fp-3",  # needs (x==y)&&(x!=y) → false simplification
 }
 
 # GCC Torture tests to skip entirely
@@ -357,6 +340,17 @@ def is_xfail_test(test_path: Path) -> Optional[str]:
     test_name = test_path.stem
     if test_name in GCC_XFAIL_TESTS:
         return f"Known failure: {test_name}"
+    return None
+
+
+def is_xfail_o1_test(test_path: Path) -> Optional[str]:
+    """Check if a GCC test is expected to fail only at -O1. Returns reason or None."""
+    key = _test_key(test_path)
+    if key in GCC_XFAIL_O1_TESTS:
+        return f"Known failure at -O1: {key}"
+    test_name = test_path.stem
+    if test_name in GCC_XFAIL_O1_TESTS:
+        return f"Known failure at -O1: {test_name}"
     return None
 
 
