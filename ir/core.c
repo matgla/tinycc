@@ -1233,10 +1233,34 @@ void tcc_ir_gen_f(TCCIRState *ir, int op)
     if (op >= TOK_ULT && op <= TOK_GT)
     {
       ir_op = TCCIR_OP_FCMP;
+
+      /* IEEE 754 NaN fix: __aeabi_cdcmple(a,b) / __aeabi_cfcmple(a,b)
+       * only set correct CPSR flags for LE/LT/EQ/NE conditions.  For
+       * GT/GE the NaN "unordered" flag mapping makes the condition
+       * evaluate TRUE instead of FALSE.
+       *
+       * Fix: for GT/GE, swap operands so that cdcmple(b,a) is called,
+       * then test with the mirrored condition (LT/LE).  This produces
+       * the correct result for all cases including NaN.
+       *   a >  b  →  cdcmple(b, a), test LT
+       *   a >= b  →  cdcmple(b, a), test LE
+       */
+      int cmp_op = op;
+      if (op == TOK_GT || op == TOK_UGT)
+      {
+        vswap();
+        cmp_op = (op == TOK_GT) ? TOK_LT : TOK_ULT;
+      }
+      else if (op == TOK_GE || op == TOK_UGE)
+      {
+        vswap();
+        cmp_op = (op == TOK_GE) ? TOK_LE : TOK_ULE;
+      }
+
       tcc_ir_put(ir, ir_op, &vtop[-1], &vtop[0], NULL);
       --vtop;
       vtop->r = VT_CMP;
-      vtop->cmp_op = op;
+      vtop->cmp_op = cmp_op;
       vtop->jfalse = -1; /* -1 = no chain */
       vtop->jtrue = -1;  /* -1 = no chain */
       vtop->vr = -1;     /* clear stale vreg so gv() materializes the CMP result */

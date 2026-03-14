@@ -64,5 +64,46 @@ int main(void)
   double cs = __builtin_copysign(3.14, -1.0);
   printf("copysign(3.14, -1.0): %f\n", cs);
 
+  /* __builtin_copysignl (long double == double on ARM) */
+  long double csl = __builtin_copysignl(2.71L, -1.0L);
+  printf("copysignl(2.71, -1.0): %f\n", (double)csl);
+
+  /* __builtin_isfinite */
+  printf("isfinite(1.0): %d\n", __builtin_isfinite(1.0) != 0);
+  printf("isfinite(inf): %d\n", __builtin_isfinite(inf_d) != 0);
+  printf("isfinite(nan): %d\n", __builtin_isfinite(nan_d) != 0);
+  /* Constant-folded variants */
+  printf("isfinite(const 1.0): %d\n", __builtin_isfinite(1.0) != 0);
+  printf("isfinite(const inf): %d\n", __builtin_isfinite(__builtin_inf()) != 0);
+  printf("isfinite(const nan): %d\n", __builtin_isfinite(__builtin_nan("")) != 0);
+
+  /* __builtin_isinf_sign */
+  printf("isinf_sign(+inf): %d\n", __builtin_isinf_sign(__builtin_inf()));
+  printf("isinf_sign(-inf): %d\n", __builtin_isinf_sign(-__builtin_inf()));
+  printf("isinf_sign(1.0): %d\n", __builtin_isinf_sign(1.0));
+  printf("isinf_sign(nan): %d\n", __builtin_isinf_sign(__builtin_nan("")));
+
+  /* __builtin_fmax / __builtin_fmin */
+  printf("fmax_a: %f\n", __builtin_fmax(1.5, 2.5));
+  printf("fmax_b: %f\n", __builtin_fmax(3.0, -1.0));
+  printf("fmin_a: %f\n", __builtin_fmin(1.5, 2.5));
+  printf("fmin_b: %f\n", __builtin_fmin(3.0, -1.0));
+  /* Runtime variants */
+  volatile double v1 = 1.5, v2 = 2.5;
+  printf("fmax_rt: %f\n", __builtin_fmax(v1, v2));
+  printf("fmin_rt: %f\n", __builtin_fmin(v1, v2));
+
+  /* __builtin_isnormal */
+  printf("isnormal(1.0): %d\n", __builtin_isnormal(1.0) != 0);
+  printf("isnormal(0.0): %d\n", __builtin_isnormal(0.0) != 0);
+  printf("isnormal(inf): %d\n", __builtin_isnormal(__builtin_inf()) != 0);
+  printf("isnormal(nan): %d\n", __builtin_isnormal(__builtin_nan("")) != 0);
+
+  /* __builtin_fpclassify (compile-time constant args) */
+  printf("fpclassify(1.0): %d\n", __builtin_fpclassify(0, 1, 2, 3, 4, 1.0));
+  printf("fpclassify(inf): %d\n", __builtin_fpclassify(0, 1, 2, 3, 4, __builtin_inf()));
+  printf("fpclassify(nan): %d\n", __builtin_fpclassify(0, 1, 2, 3, 4, __builtin_nan("")));
+  printf("fpclassify(0.0): %d\n", __builtin_fpclassify(0, 1, 2, 3, 4, 0.0));
+
   return 0;
 }

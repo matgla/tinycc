@@ -26,3 +26,28 @@ isgreaterequal(1.0, 1.0): 1
 signbit(-1.0): 1
 signbit(1.0): 0
 copysign(3.14, -1.0): -3.140000
+copysignl(2.71, -1.0): -2.710000
+isfinite(1.0): 1
+isfinite(inf): 0
+isfinite(nan): 0
+isfinite(const 1.0): 1
+isfinite(const inf): 0
+isfinite(const nan): 0
+isinf_sign(+inf): 1
+isinf_sign(-inf): -1
+isinf_sign(1.0): 0
+isinf_sign(nan): 0
+fmax_a: 2.500000
+fmax_b: 3.000000
+fmin_a: 1.500000
+fmin_b: -1.000000
+fmax_rt: 2.500000
+fmin_rt: 1.500000
+isnormal(1.0): 1
+isnormal(0.0): 0
+isnormal(inf): 0
+isnormal(nan): 0
+fpclassify(1.0): 2
+fpclassify(inf): 1
+fpclassify(nan): 0
+fpclassify(0.0): 4

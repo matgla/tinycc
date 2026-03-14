@@ -3590,8 +3590,10 @@ static void gen_opic(int op)
 #elif defined TCC_TARGET_ARM
 void gen_negf(int op)
 {
-  /* arm will detect 0-x and replace by vneg */
-  vpushi(0), vswap(), gen_op('-');
+  /* IEEE 754: negate(x) must flip the sign bit, not compute 0-x.
+   * 0-x produces +0 for -0 input and vice-versa, and also differs
+   * for NaN payloads.  Use IR FNEG which XORs the sign bit. */
+  tcc_ir_gen_f(tcc_state->ir, 'n');
 }
 #else
 /* XXX: implement in gen_opf() for other backends too */
@@ -11000,15 +11002,17 @@ tok_next:
       int is_float = (arg_bt == VT_FLOAT) || (tok1 == TOK_builtin_isinff);
       const char *func_name = is_float ? "isinff" : "isinf";
 
-      /* Ensure the value has the right floating-point type */
-      if (tok1 == TOK_builtin_isinff && arg_bt != VT_FLOAT)
+      /* Ensure the argument type matches the helper we will call.
+       * is_float already accounts for both the argument's type and the
+       * specific builtin variant (__builtin_isinff forces float). */
+      if (is_float && arg_bt != VT_FLOAT)
       {
         CType ft;
         ft.t = VT_FLOAT;
         ft.ref = NULL;
         gen_cast(&ft);
       }
-      else if (tok1 != TOK_builtin_isinff && arg_bt == VT_FLOAT)
+      else if (!is_float && arg_bt == VT_FLOAT)
       {
         CType dt;
         dt.t = VT_DOUBLE;
@@ -11061,6 +11065,39 @@ tok_next:
     /* Get the type of the first argument to determine which variant to use */
     int arg_bt = vtop[-1].type.t & VT_BTYPE;
     int is_float = (arg_bt == VT_FLOAT) || (tok1 == TOK_builtin_copysignf);
+
+    /* Ensure both arguments match the target precision.  For
+     * __builtin_copysignf the standard says the result is float, so both
+     * operands must be narrowed to float before the call; without this,
+     * a double argument (e.g. the literal 1.0) is passed with its raw
+     * 64-bit representation and the 32-bit __copysignf helper produces
+     * a wrong result. Similarly, widen float args to double for copysign. */
+    if (is_float)
+    {
+      CType ft = {0};
+      ft.t = VT_FLOAT;
+      if ((vtop[-1].type.t & VT_BTYPE) != VT_FLOAT)
+      {
+        vswap();
+        gen_cast(&ft);
+        vswap();
+      }
+      if ((vtop[0].type.t & VT_BTYPE) != VT_FLOAT)
+        gen_cast(&ft);
+    }
+    else
+    {
+      CType dt = {0};
+      dt.t = VT_DOUBLE;
+      if ((vtop[-1].type.t & VT_BTYPE) != VT_DOUBLE)
+      {
+        vswap();
+        gen_cast(&dt);
+        vswap();
+      }
+      if ((vtop[0].type.t & VT_BTYPE) != VT_DOUBLE)
+        gen_cast(&dt);
+    }
 
     /* Create call ID and encode parameters */
     const int new_call_id = tcc_state->ir->next_call_id++;
@@ -11121,7 +11158,11 @@ tok_next:
       int isnan_result = 0;
       if (bt == VT_FLOAT)
       {
-        union { float f; uint32_t i; } u;
+        union
+        {
+          float f;
+          uint32_t i;
+        } u;
         u.f = vtop->c.f;
         uint32_t exp = (u.i >> 23) & 0xFF;
         uint32_t man = u.i & 0x7FFFFF;
@@ -11129,7 +11170,11 @@ tok_next:
       }
       else
       {
-        union { double d; uint64_t i; } u;
+        union
+        {
+          double d;
+          uint64_t i;
+        } u;
         u.d = (bt == VT_LDOUBLE) ? (double)vtop->c.ld : vtop->c.d;
         uint64_t exp = (u.i >> 52) & 0x7FF;
         uint64_t man = u.i & 0xFFFFFFFFFFFFFULL;
@@ -11146,12 +11191,16 @@ tok_next:
 
       if (tok1 == TOK_builtin_isnanf && arg_bt != VT_FLOAT)
       {
-        CType ft; ft.t = VT_FLOAT; ft.ref = NULL;
+        CType ft;
+        ft.t = VT_FLOAT;
+        ft.ref = NULL;
         gen_cast(&ft);
       }
       else if (tok1 != TOK_builtin_isnanf && arg_bt == VT_FLOAT)
       {
-        CType dt; dt.t = VT_DOUBLE; dt.ref = NULL;
+        CType dt;
+        dt.t = VT_DOUBLE;
+        dt.ref = NULL;
         gen_cast(&dt);
         is_float = 0;
       }
@@ -11195,9 +11244,15 @@ tok_next:
 
     if (tok1 == TOK_builtin_inff)
     {
-      union { float f; uint32_t i; } u;
+      union
+      {
+        float f;
+        uint32_t i;
+      } u;
       u.i = 0x7F800000U; /* +Inf float */
-      CType ft; ft.t = VT_FLOAT; ft.ref = NULL;
+      CType ft;
+      ft.t = VT_FLOAT;
+      ft.ref = NULL;
       vpush(&ft);
       vtop->r = VT_CONST;
       vtop->c.f = u.f;
@@ -11205,9 +11260,15 @@ tok_next:
     else
     {
       /* double or long double (same as double on ARM) */
-      union { double d; uint64_t i; } u;
+      union
+      {
+        double d;
+        uint64_t i;
+      } u;
       u.i = 0x7FF0000000000000ULL; /* +Inf double */
-      CType dt; dt.t = (tok1 == TOK_builtin_infl) ? VT_LDOUBLE : VT_DOUBLE; dt.ref = NULL;
+      CType dt;
+      dt.t = (tok1 == TOK_builtin_infl) ? VT_LDOUBLE : VT_DOUBLE;
+      dt.ref = NULL;
       vpush(&dt);
       vtop->r = VT_CONST;
       vtop->c.d = u.d;
@@ -11245,20 +11306,32 @@ tok_next:
 
     if (tok1 == TOK_builtin_nanf)
     {
-      union { float f; uint32_t i; } u;
+      union
+      {
+        float f;
+        uint32_t i;
+      } u;
       /* Quiet NaN: exponent all 1s, mantissa MSB set */
       u.i = 0x7FC00000U | (uint32_t)(payload & 0x3FFFFF);
-      CType ft; ft.t = VT_FLOAT; ft.ref = NULL;
+      CType ft;
+      ft.t = VT_FLOAT;
+      ft.ref = NULL;
       vpush(&ft);
       vtop->r = VT_CONST;
       vtop->c.f = u.f;
     }
     else
     {
-      union { double d; uint64_t i; } u;
+      union
+      {
+        double d;
+        uint64_t i;
+      } u;
       /* Quiet NaN: exponent all 1s, mantissa MSB set */
       u.i = 0x7FF8000000000000ULL | (payload & 0x7FFFFFFFFFFFFULL);
-      CType dt; dt.t = (tok1 == TOK_builtin_nanl) ? VT_LDOUBLE : VT_DOUBLE; dt.ref = NULL;
+      CType dt;
+      dt.t = (tok1 == TOK_builtin_nanl) ? VT_LDOUBLE : VT_DOUBLE;
+      dt.ref = NULL;
       vpush(&dt);
       vtop->r = VT_CONST;
       vtop->c.d = u.d;
@@ -11280,18 +11353,30 @@ tok_next:
 
     if (tok1 == TOK_builtin_huge_valf)
     {
-      union { float f; uint32_t i; } u;
+      union
+      {
+        float f;
+        uint32_t i;
+      } u;
       u.i = 0x7F800000U;
-      CType ft; ft.t = VT_FLOAT; ft.ref = NULL;
+      CType ft;
+      ft.t = VT_FLOAT;
+      ft.ref = NULL;
       vpush(&ft);
       vtop->r = VT_CONST;
       vtop->c.f = u.f;
     }
     else
     {
-      union { double d; uint64_t i; } u;
+      union
+      {
+        double d;
+        uint64_t i;
+      } u;
       u.i = 0x7FF0000000000000ULL;
-      CType dt; dt.t = (tok1 == TOK_builtin_huge_vall) ? VT_LDOUBLE : VT_DOUBLE; dt.ref = NULL;
+      CType dt;
+      dt.t = (tok1 == TOK_builtin_huge_vall) ? VT_LDOUBLE : VT_DOUBLE;
+      dt.ref = NULL;
       vpush(&dt);
       vtop->r = VT_CONST;
       vtop->c.d = u.d;
@@ -11332,14 +11417,18 @@ tok_next:
       {
         SValue tmp = vtop[0];
         vtop[0] = vtop[-1]; /* temporarily put x on top */
-        CType dt; dt.t = VT_DOUBLE; dt.ref = NULL;
+        CType dt;
+        dt.t = VT_DOUBLE;
+        dt.ref = NULL;
         gen_cast(&dt);
         vtop[-1] = vtop[0]; /* put converted x back */
         vtop[0] = tmp;      /* restore y */
       }
       if ((vtop[0].type.t & VT_BTYPE) == VT_FLOAT)
       {
-        CType dt; dt.t = VT_DOUBLE; dt.ref = NULL;
+        CType dt;
+        dt.t = VT_DOUBLE;
+        dt.ref = NULL;
         gen_cast(&dt);
       }
 
@@ -11418,13 +11507,24 @@ tok_next:
 
     /* Determine the comparison operator */
     int cmp_op;
-    switch (tok1) {
-    case TOK_builtin_isless: cmp_op = TOK_LT; break;
-    case TOK_builtin_isgreater: cmp_op = TOK_GT; break;
-    case TOK_builtin_islessequal: cmp_op = TOK_LE; break;
-    case TOK_builtin_isgreaterequal: cmp_op = TOK_GE; break;
+    switch (tok1)
+    {
+    case TOK_builtin_isless:
+      cmp_op = TOK_LT;
+      break;
+    case TOK_builtin_isgreater:
+      cmp_op = TOK_GT;
+      break;
+    case TOK_builtin_islessequal:
+      cmp_op = TOK_LE;
+      break;
+    case TOK_builtin_isgreaterequal:
+      cmp_op = TOK_GE;
+      break;
     case TOK_builtin_islessgreater:
-    default: cmp_op = 0; break; /* special: x < y || x > y */
+    default:
+      cmp_op = 0;
+      break; /* special: x < y || x > y */
     }
 
     if (cmp_op != 0)
@@ -11434,16 +11534,113 @@ tok_next:
     }
     else
     {
-      /* islessgreater: (x < y) || (x > y) — false if equal or unordered */
-      /* Duplicate both operands */
-      SValue y_save, x_save;
-      y_save = vtop[0];
-      x_save = vtop[-1];
-      gen_op(TOK_LT);       /* x < y */
+      /* islessgreater(x, y): true iff x < y or x > y — false if equal
+       * or if either operand is NaN.
+       *
+       * Implement as: !(dcmpun(x,y) || dcmpeq(x,y))
+       * i.e. the values are ordered AND not equal.
+       *
+       * Both __aeabi_dcmpun and __aeabi_dcmpeq return plain int 0/1,
+       * so we OR them and invert, avoiding VT_CMP materialization
+       * issues that arise from gen_op on floats. */
+
+      int is_double = ((vtop[-1].type.t & VT_BTYPE) == VT_DOUBLE) ||
+                      ((vtop[-1].type.t & VT_BTYPE) == VT_LDOUBLE) ||
+                      ((vtop[0].type.t & VT_BTYPE) == VT_DOUBLE) ||
+                      ((vtop[0].type.t & VT_BTYPE) == VT_LDOUBLE);
+
+      /* Promote float args to double if needed for consistent calling */
+      if (is_double)
+      {
+        if ((vtop[-1].type.t & VT_BTYPE) == VT_FLOAT)
+        {
+          vswap();
+          CType dt = {0};
+          dt.t = VT_DOUBLE;
+          gen_cast(&dt);
+          vswap();
+        }
+        if ((vtop[0].type.t & VT_BTYPE) == VT_FLOAT)
+        {
+          CType dt = {0};
+          dt.t = VT_DOUBLE;
+          gen_cast(&dt);
+        }
+      }
+
+      /* Save both operands — they'll be used twice (once per call) */
+      SValue y_save = vtop[0];
+      SValue x_save = vtop[-1];
+
+      /* --- Call 1: dcmpun(x, y) → int (1 if NaN, 0 if ordered) --- */
+      {
+        const int cid = tcc_state->ir->next_call_id++;
+        SValue pn;
+        svalue_init(&pn);
+        pn.vr = -1;
+        pn.r = VT_CONST;
+        pn.c.i = TCCIR_ENCODE_PARAM(cid, 0);
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &pn, NULL);
+        pn.c.i = TCCIR_ENCODE_PARAM(cid, 1);
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[0], &pn, NULL);
+
+        vpush_helper_func(tok_alloc_const(is_double ? "__aeabi_dcmpun" : "__aeabi_fcmpun"));
+
+        SValue cs = tcc_ir_svalue_call_id_argc(cid, 2);
+        SValue d;
+        svalue_init(&d);
+        d.type.t = VT_INT;
+        d.r = 0;
+        d.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &cs, &d);
+
+        /* Pop func + y + x, push unordered_result */
+        vtop -= 3;
+        vpushi(0);
+        vtop->type.t = VT_INT;
+        vtop->vr = d.vr;
+        vtop->r = 0;
+      }
+      /* Stack: ... unordered_int */
+
+      /* --- Call 2: dcmpeq(x, y) → int (1 if equal, 0 if not) --- */
       vpushv(&x_save);
       vpushv(&y_save);
-      gen_op(TOK_GT);       /* x > y */
-      gen_op('|');       /* (x < y) | (x > y) */
+      {
+        const int cid = tcc_state->ir->next_call_id++;
+        SValue pn;
+        svalue_init(&pn);
+        pn.vr = -1;
+        pn.r = VT_CONST;
+        pn.c.i = TCCIR_ENCODE_PARAM(cid, 0);
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &pn, NULL);
+        pn.c.i = TCCIR_ENCODE_PARAM(cid, 1);
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[0], &pn, NULL);
+
+        vpush_helper_func(tok_alloc_const(is_double ? "__aeabi_dcmpeq" : "__aeabi_fcmpeq"));
+
+        SValue cs = tcc_ir_svalue_call_id_argc(cid, 2);
+        SValue d;
+        svalue_init(&d);
+        d.type.t = VT_INT;
+        d.r = 0;
+        d.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &cs, &d);
+
+        /* Pop func + y + x, push equal_result */
+        vtop -= 3;
+        vpushi(0);
+        vtop->type.t = VT_INT;
+        vtop->vr = d.vr;
+        vtop->r = 0;
+      }
+      /* Stack: ... unordered_int equal_int */
+
+      /* Result = !(unordered | equal) = (unordered == 0) && (equal == 0)
+       * Use bitwise OR then == 0 check for branchless code. */
+      gen_op('|');      /* unordered | equal */
+      vpushi(0);
+      gen_op(TOK_EQ);  /* (unordered | equal) == 0 */
     }
     break;
   }
@@ -11463,14 +11660,22 @@ tok_next:
     {
       if (bt == VT_FLOAT)
       {
-        union { float f; uint32_t i; } u;
+        union
+        {
+          float f;
+          uint32_t i;
+        } u;
         u.f = vtop->c.f;
         u.i &= 0x7FFFFFFFU;
         vtop->c.f = u.f;
       }
       else
       {
-        union { double d; uint64_t i; } u;
+        union
+        {
+          double d;
+          uint64_t i;
+        } u;
         u.d = (bt == VT_LDOUBLE) ? (double)vtop->c.ld : vtop->c.d;
         u.i &= 0x7FFFFFFFFFFFFFFFULL;
         vtop->c.d = u.d;
@@ -11486,12 +11691,16 @@ tok_next:
 
       if (tok1 == TOK_builtin_fabsf && arg_bt != VT_FLOAT)
       {
-        CType ft; ft.t = VT_FLOAT; ft.ref = NULL;
+        CType ft;
+        ft.t = VT_FLOAT;
+        ft.ref = NULL;
         gen_cast(&ft);
       }
       else if (tok1 != TOK_builtin_fabsf && arg_bt == VT_FLOAT)
       {
-        CType dt; dt.t = VT_DOUBLE; dt.ref = NULL;
+        CType dt;
+        dt.t = VT_DOUBLE;
+        dt.ref = NULL;
         gen_cast(&dt);
         is_float = 0;
       }
@@ -11519,6 +11728,590 @@ tok_next:
       vtop->type.t = is_float ? VT_FLOAT : VT_DOUBLE;
       vtop->vr = dest.vr;
       vtop->r = TREG_R0;
+    }
+    break;
+  }
+
+  /* __builtin_copysignl — long double variant (on ARM, same as double) */
+  case TOK_builtin_copysignl:
+  {
+    parse_builtin_params(0, "ee");
+
+    /* On ARM, long double == double, so just call copysign */
+    const int new_call_id = tcc_state->ir->next_call_id++;
+    SValue param_num;
+    svalue_init(&param_num);
+    param_num.vr = -1;
+    param_num.r = VT_CONST;
+
+    /* Ensure both args are doubles */
+    if ((vtop[-1].type.t & VT_BTYPE) == VT_FLOAT)
+    {
+      SValue tmp = vtop[0];
+      vtop[0] = vtop[-1];
+      CType dt;
+      dt.t = VT_DOUBLE;
+      dt.ref = NULL;
+      gen_cast(&dt);
+      vtop[-1] = vtop[0];
+      vtop[0] = tmp;
+    }
+    if ((vtop[0].type.t & VT_BTYPE) == VT_FLOAT)
+    {
+      CType dt;
+      dt.t = VT_DOUBLE;
+      dt.ref = NULL;
+      gen_cast(&dt);
+    }
+
+    param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
+    tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &param_num, NULL);
+    param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 1);
+    tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[0], &param_num, NULL);
+
+    vpush_helper_func(TOK___copysign);
+
+    SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 2);
+    SValue dest;
+    svalue_init(&dest);
+    dest.type.t = VT_LDOUBLE;
+    dest.r = 0;
+    dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+    tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &call_id_sv, &dest);
+
+    vtop -= 3;
+    vpushi(0);
+    vtop->type.t = VT_LDOUBLE;
+    vtop->vr = dest.vr;
+    vtop->r = TREG_R0;
+    break;
+  }
+
+  /* __builtin_isfinite / __builtin_isfinitef — true if not NaN and not Inf */
+  case TOK_builtin_isfinite:
+  case TOK_builtin_isfinitef:
+  {
+    int tok1 = tok;
+    parse_builtin_params(0, "e");
+
+    int bt = vtop->type.t & VT_BTYPE;
+    if ((vtop->r & (VT_VALMASK | VT_LVAL)) == VT_CONST && !(vtop->r & VT_SYM) &&
+        (bt == VT_FLOAT || bt == VT_DOUBLE || bt == VT_LDOUBLE))
+    {
+      int result;
+      if (bt == VT_FLOAT)
+      {
+        union
+        {
+          float f;
+          uint32_t i;
+        } u;
+        u.f = vtop->c.f;
+        uint32_t exp = (u.i >> 23) & 0xFF;
+        result = (exp != 0xFF);
+      }
+      else
+      {
+        union
+        {
+          double d;
+          uint64_t i;
+        } u;
+        u.d = (bt == VT_LDOUBLE) ? (double)vtop->c.ld : vtop->c.d;
+        uint64_t exp = (u.i >> 52) & 0x7FF;
+        result = (exp != 0x7FF);
+      }
+      vtop--;
+      vpushi(result);
+    }
+    else
+    {
+      /* Runtime: finite(x) or finitef(x) — returns non-zero if finite */
+      int arg_bt = vtop->type.t & VT_BTYPE;
+      int is_float = (arg_bt == VT_FLOAT) || (tok1 == TOK_builtin_isfinitef);
+
+      if (!is_float && arg_bt == VT_FLOAT)
+      {
+        CType dt;
+        dt.t = VT_DOUBLE;
+        dt.ref = NULL;
+        gen_cast(&dt);
+        is_float = 0;
+      }
+      else if (is_float && arg_bt != VT_FLOAT)
+      {
+        CType ft;
+        ft.t = VT_FLOAT;
+        ft.ref = NULL;
+        gen_cast(&ft);
+      }
+
+      const int new_call_id = tcc_state->ir->next_call_id++;
+      SValue param_num;
+      svalue_init(&param_num);
+      param_num.vr = -1;
+      param_num.r = VT_CONST;
+      param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &param_num, NULL);
+
+      vpush_helper_func(is_float ? TOK___finitef : TOK___finite);
+
+      SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 1);
+      SValue dest;
+      svalue_init(&dest);
+      dest.type.t = VT_INT;
+      dest.r = 0;
+      dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &call_id_sv, &dest);
+
+      vtop -= 2;
+      vpushi(0);
+      vtop->type.t = VT_INT;
+      vtop->vr = dest.vr;
+      vtop->r = TREG_R0;
+    }
+    break;
+  }
+
+  /* __builtin_isinf_sign — returns +1 for +Inf, -1 for -Inf, 0 otherwise */
+  case TOK_builtin_isinf_sign:
+  {
+    parse_builtin_params(0, "e");
+
+    int bt = vtop->type.t & VT_BTYPE;
+    if ((vtop->r & (VT_VALMASK | VT_LVAL)) == VT_CONST && !(vtop->r & VT_SYM) &&
+        (bt == VT_FLOAT || bt == VT_DOUBLE || bt == VT_LDOUBLE))
+    {
+      int result = 0;
+      if (bt == VT_FLOAT)
+      {
+        union
+        {
+          float f;
+          uint32_t i;
+        } u;
+        u.f = vtop->c.f;
+        if ((u.i & 0x7FFFFFFF) == 0x7F800000)
+          result = (u.i & 0x80000000) ? -1 : 1;
+      }
+      else
+      {
+        union
+        {
+          double d;
+          uint64_t i;
+        } u;
+        u.d = (bt == VT_LDOUBLE) ? (double)vtop->c.ld : vtop->c.d;
+        if ((u.i & 0x7FFFFFFFFFFFFFFFULL) == 0x7FF0000000000000ULL)
+          result = (u.i & 0x8000000000000000ULL) ? -1 : 1;
+      }
+      vtop--;
+      vpushi(result);
+    }
+    else
+    {
+      /* Runtime: call isinf then check sign.
+       * isinf returns non-zero if infinite. We need +1/-1/0.
+       * Implement as: isinf(x) ? (signbit(x) ? -1 : 1) : 0
+       * For simplicity, call isinf and multiply by sign. Actually,
+       * just call isinf() which on newlib returns +1/-1/0 already. */
+      int arg_bt = vtop->type.t & VT_BTYPE;
+      int is_float = (arg_bt == VT_FLOAT);
+
+      if (arg_bt == VT_FLOAT)
+      {
+        CType dt;
+        dt.t = VT_DOUBLE;
+        dt.ref = NULL;
+        gen_cast(&dt);
+        is_float = 0;
+      }
+
+      const int new_call_id = tcc_state->ir->next_call_id++;
+      SValue param_num;
+      svalue_init(&param_num);
+      param_num.vr = -1;
+      param_num.r = VT_CONST;
+      param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &param_num, NULL);
+
+      vpush_helper_func(is_float ? TOK___isinff : TOK___isinf);
+
+      SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 1);
+      SValue dest;
+      svalue_init(&dest);
+      dest.type.t = VT_INT;
+      dest.r = 0;
+      dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &call_id_sv, &dest);
+
+      vtop -= 2;
+      vpushi(0);
+      vtop->type.t = VT_INT;
+      vtop->vr = dest.vr;
+      vtop->r = TREG_R0;
+    }
+    break;
+  }
+
+  /* __builtin_fmax / __builtin_fmaxf / __builtin_fmin / __builtin_fminf */
+  case TOK_builtin_fmax:
+  case TOK_builtin_fmaxf:
+  case TOK_builtin_fmin:
+  case TOK_builtin_fminf:
+  {
+    int tok1 = tok;
+    parse_builtin_params(0, "ee");
+
+    int is_float = (tok1 == TOK_builtin_fmaxf || tok1 == TOK_builtin_fminf);
+    int is_max = (tok1 == TOK_builtin_fmax || tok1 == TOK_builtin_fmaxf);
+
+    /* Check if both arguments are constants */
+    int bt_x = vtop[-1].type.t & VT_BTYPE;
+    int bt_y = vtop[0].type.t & VT_BTYPE;
+    if ((vtop[-1].r & (VT_VALMASK | VT_LVAL)) == VT_CONST && !(vtop[-1].r & VT_SYM) &&
+        (vtop[0].r & (VT_VALMASK | VT_LVAL)) == VT_CONST && !(vtop[0].r & VT_SYM) &&
+        (bt_x == VT_FLOAT || bt_x == VT_DOUBLE || bt_x == VT_LDOUBLE) &&
+        (bt_y == VT_FLOAT || bt_y == VT_DOUBLE || bt_y == VT_LDOUBLE))
+    {
+      double x = (bt_x == VT_FLOAT) ? (double)vtop[-1].c.f : vtop[-1].c.d;
+      double y = (bt_y == VT_FLOAT) ? (double)vtop[0].c.f : vtop[0].c.d;
+      double result;
+      /* fmax: if either is NaN, return the other. If both NaN, return NaN */
+      if (x != x)
+        result = y;
+      else if (y != y)
+        result = x;
+      else
+        result = is_max ? (x > y ? x : y) : (x < y ? x : y);
+
+      vtop -= 2;
+      if (is_float)
+      {
+        CType ft;
+        ft.t = VT_FLOAT;
+        ft.ref = NULL;
+        vpush(&ft);
+        vtop->r = VT_CONST;
+        vtop->c.f = (float)result;
+      }
+      else
+      {
+        CType dt;
+        dt.t = VT_DOUBLE;
+        dt.ref = NULL;
+        vpush(&dt);
+        vtop->r = VT_CONST;
+        vtop->c.d = result;
+      }
+    }
+    else
+    {
+      /* Runtime: call fmax/fmaxf/fmin/fminf */
+      /* Ensure type consistency */
+      if (is_float)
+      {
+        if ((vtop[-1].type.t & VT_BTYPE) != VT_FLOAT)
+        {
+          SValue tmp = vtop[0];
+          vtop[0] = vtop[-1];
+          CType ft;
+          ft.t = VT_FLOAT;
+          ft.ref = NULL;
+          gen_cast(&ft);
+          vtop[-1] = vtop[0];
+          vtop[0] = tmp;
+        }
+        if ((vtop[0].type.t & VT_BTYPE) != VT_FLOAT)
+        {
+          CType ft;
+          ft.t = VT_FLOAT;
+          ft.ref = NULL;
+          gen_cast(&ft);
+        }
+      }
+      else
+      {
+        if ((vtop[-1].type.t & VT_BTYPE) == VT_FLOAT)
+        {
+          SValue tmp = vtop[0];
+          vtop[0] = vtop[-1];
+          CType dt;
+          dt.t = VT_DOUBLE;
+          dt.ref = NULL;
+          gen_cast(&dt);
+          vtop[-1] = vtop[0];
+          vtop[0] = tmp;
+        }
+        if ((vtop[0].type.t & VT_BTYPE) == VT_FLOAT)
+        {
+          CType dt;
+          dt.t = VT_DOUBLE;
+          dt.ref = NULL;
+          gen_cast(&dt);
+        }
+      }
+
+      const int new_call_id = tcc_state->ir->next_call_id++;
+      SValue param_num;
+      svalue_init(&param_num);
+      param_num.vr = -1;
+      param_num.r = VT_CONST;
+
+      param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &param_num, NULL);
+      param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 1);
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[0], &param_num, NULL);
+
+      int func_tok;
+      if (is_max)
+        func_tok = is_float ? TOK___fmaxf : TOK___fmax;
+      else
+        func_tok = is_float ? TOK___fminf : TOK___fmin;
+      vpush_helper_func(func_tok);
+
+      SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 2);
+      SValue dest;
+      svalue_init(&dest);
+      dest.type.t = is_float ? VT_FLOAT : VT_DOUBLE;
+      dest.r = 0;
+      dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &call_id_sv, &dest);
+
+      vtop -= 3;
+      vpushi(0);
+      vtop->type.t = is_float ? VT_FLOAT : VT_DOUBLE;
+      vtop->vr = dest.vr;
+      vtop->r = TREG_R0;
+    }
+    break;
+  }
+
+  /* __builtin_isnormal — true if value is a normal (not zero, subnormal, inf, or NaN) */
+  case TOK_builtin_isnormal:
+  {
+    parse_builtin_params(0, "e");
+
+    int bt = vtop->type.t & VT_BTYPE;
+    if ((vtop->r & (VT_VALMASK | VT_LVAL)) == VT_CONST && !(vtop->r & VT_SYM) &&
+        (bt == VT_FLOAT || bt == VT_DOUBLE || bt == VT_LDOUBLE))
+    {
+      int result;
+      if (bt == VT_FLOAT)
+      {
+        union
+        {
+          float f;
+          uint32_t i;
+        } u;
+        u.f = vtop->c.f;
+        uint32_t exp = (u.i >> 23) & 0xFF;
+        result = (exp != 0 && exp != 0xFF);
+      }
+      else
+      {
+        union
+        {
+          double d;
+          uint64_t i;
+        } u;
+        u.d = (bt == VT_LDOUBLE) ? (double)vtop->c.ld : vtop->c.d;
+        uint64_t exp = (u.i >> 52) & 0x7FF;
+        result = (exp != 0 && exp != 0x7FF);
+      }
+      vtop--;
+      vpushi(result);
+    }
+    else
+    {
+      /* Runtime: isfinite(x) && x != 0.0 && !issubnormal(x)
+       * Simplify: call finite(x), then check exponent is non-zero.
+       * For soft-float, we can use: finite(x) && (bits & exp_mask) != 0
+       * Easiest approach: call finite(x), then compare x != 0 and check
+       * But that's complex. Just use: !isnan(x) && !isinf(x) && x != 0 && exp != 0
+       * For simplicity, call finite(x) as first check, and generate comparison != 0 */
+      int arg_bt = vtop->type.t & VT_BTYPE;
+      int is_float = (arg_bt == VT_FLOAT);
+
+      if (!is_float && arg_bt == VT_FLOAT)
+      {
+        CType dt;
+        dt.t = VT_DOUBLE;
+        dt.ref = NULL;
+        gen_cast(&dt);
+      }
+
+      /* Save the value for subnormal check */
+      SValue val_save = *vtop;
+
+      /* Call finite(x) */
+      const int call_id1 = tcc_state->ir->next_call_id++;
+      SValue param_num;
+      svalue_init(&param_num);
+      param_num.vr = -1;
+      param_num.r = VT_CONST;
+      param_num.c.i = TCCIR_ENCODE_PARAM(call_id1, 0);
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &param_num, NULL);
+
+      vpush_helper_func(is_float ? TOK___finitef : TOK___finite);
+
+      SValue call_id_sv1 = tcc_ir_svalue_call_id_argc(call_id1, 1);
+      SValue dest1;
+      svalue_init(&dest1);
+      dest1.type.t = VT_INT;
+      dest1.r = 0;
+      dest1.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &call_id_sv1, &dest1);
+
+      vtop -= 2; /* pop func and x */
+      vpushi(0);
+      vtop->type.t = VT_INT;
+      vtop->vr = dest1.vr;
+      vtop->r = TREG_R0;
+
+      /* Now we need: finite_result && x != 0.0 (approximately, ignoring subnormals for now)
+       * Actually, isnormal is: exponent != 0 && exponent != all-1s.
+       * finite checks exponent != all-1s. We still need exponent != 0.
+       * Compare x with 0: won't work for subnormals (they compare != 0).
+       * For a proper implementation we'd need bit manipulation, which is complex in this IR.
+       * For now: finite(x) && fabs(x) >= FLT_MIN (or DBL_MIN) */
+
+      /* Simpler approach: call fabs, compare with minimum normal */
+      SValue finite_result = *vtop--;
+
+      vpushv(&val_save);
+
+      /* Call fabs on the saved value */
+      const int call_id2 = tcc_state->ir->next_call_id++;
+      param_num.c.i = TCCIR_ENCODE_PARAM(call_id2, 0);
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &param_num, NULL);
+
+      vpush_helper_func(is_float ? TOK___fabsf : TOK___fabs);
+
+      SValue call_id_sv2 = tcc_ir_svalue_call_id_argc(call_id2, 1);
+      SValue dest2;
+      svalue_init(&dest2);
+      dest2.type.t = is_float ? VT_FLOAT : VT_DOUBLE;
+      dest2.r = 0;
+      dest2.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &call_id_sv2, &dest2);
+
+      vtop -= 2; /* pop func and val */
+      vpushi(0);
+      vtop->type.t = is_float ? VT_FLOAT : VT_DOUBLE;
+      vtop->vr = dest2.vr;
+      vtop->r = TREG_R0;
+
+      /* Compare fabs(x) >= min_normal */
+      if (is_float)
+      {
+        CType ft;
+        ft.t = VT_FLOAT;
+        ft.ref = NULL;
+        vpush(&ft);
+        vtop->r = VT_CONST;
+        vtop->c.f = 1.17549435e-38f; /* FLT_MIN */
+      }
+      else
+      {
+        CType dt;
+        dt.t = VT_DOUBLE;
+        dt.ref = NULL;
+        vpush(&dt);
+        vtop->r = VT_CONST;
+        vtop->c.d = 2.2250738585072014e-308; /* DBL_MIN */
+      }
+      gen_op(TOK_GE); /* fabs(x) >= min_normal */
+
+      /* AND with finite result */
+      vpushv(&finite_result);
+      vswap();
+      gen_op('&');
+    }
+    break;
+  }
+
+  /* __builtin_fpclassify(FP_NAN, FP_INFINITE, FP_NORMAL, FP_SUBNORMAL, FP_ZERO, x) */
+  case TOK_builtin_fpclassify:
+  {
+    next();
+    skip('(');
+    /* Parse 5 integer constants and 1 floating-point expression */
+    int fp_nan_val = expr_const();
+    skip(',');
+    int fp_inf_val = expr_const();
+    skip(',');
+    int fp_normal_val = expr_const();
+    skip(',');
+    int fp_subnormal_val = expr_const();
+    skip(',');
+    int fp_zero_val = expr_const();
+    skip(',');
+    expr_eq(); /* the floating-point value */
+    skip(')');
+
+    int bt = vtop->type.t & VT_BTYPE;
+    if ((vtop->r & (VT_VALMASK | VT_LVAL)) == VT_CONST && !(vtop->r & VT_SYM) &&
+        (bt == VT_FLOAT || bt == VT_DOUBLE || bt == VT_LDOUBLE))
+    {
+      int result;
+      if (bt == VT_FLOAT)
+      {
+        union
+        {
+          float f;
+          uint32_t i;
+        } u;
+        u.f = vtop->c.f;
+        uint32_t exp = (u.i >> 23) & 0xFF;
+        uint32_t man = u.i & 0x7FFFFF;
+        if (exp == 0xFF && man != 0)
+          result = fp_nan_val;
+        else if (exp == 0xFF && man == 0)
+          result = fp_inf_val;
+        else if (exp == 0 && man == 0)
+          result = fp_zero_val;
+        else if (exp == 0)
+          result = fp_subnormal_val;
+        else
+          result = fp_normal_val;
+      }
+      else
+      {
+        union
+        {
+          double d;
+          uint64_t i;
+        } u;
+        u.d = (bt == VT_LDOUBLE) ? (double)vtop->c.ld : vtop->c.d;
+        uint64_t exp = (u.i >> 52) & 0x7FF;
+        uint64_t man = u.i & 0xFFFFFFFFFFFFFULL;
+        if (exp == 0x7FF && man != 0)
+          result = fp_nan_val;
+        else if (exp == 0x7FF && man == 0)
+          result = fp_inf_val;
+        else if (exp == 0 && man == 0)
+          result = fp_zero_val;
+        else if (exp == 0)
+          result = fp_subnormal_val;
+        else
+          result = fp_normal_val;
+      }
+      vtop--;
+      vpushi(result);
+    }
+    else
+    {
+      /* Runtime: use a series of calls: isnan, isinf, finite, then classify.
+       * This is complex at runtime. For now, just call __fpclassifyf/__fpclassifyd
+       * which returns FP_NAN=0, FP_INFINITE=1, FP_NORMAL=4, FP_SUBNORMAL=3, FP_ZERO=2
+       * and then map via a lookup. But there's no standard __fpclassify on newlib.
+       *
+       * Alternative: emit isnan(x) ? nan_val : isinf(x) ? inf_val : x == 0 ? zero_val : isnormal(x) ? normal_val :
+       * subnormal_val This is very complex for the vstack. For now, just emit 0 as a fallback. */
+      tcc_warning("__builtin_fpclassify with non-constant argument not fully supported");
+      vtop--;
+      vpushi(0);
     }
     break;
   }

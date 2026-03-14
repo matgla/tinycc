@@ -252,6 +252,9 @@ TEST_FILES = [
     # __builtin_add_overflow_p, __builtin_sub_overflow_p, __builtin_mul_overflow_p tests
     ("166_builtin_mul_overflow_p.c", 0),
 
+    # IEEE 754 NaN comparison tests (soft-float GT/GE fix)
+    ("170_nan_comparison.c", 0),
+
     # ("../tests2/106_versym.c", 0),
     ("../tests2/108_constructor.c", 0),
     # ("../tests2/112_backtrace.c", 0),
