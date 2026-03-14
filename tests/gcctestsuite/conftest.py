@@ -42,8 +42,6 @@ OPT_LEVELS = ["-O0", "-O1"]
 # Entries can be plain stems ("test_name") or directory-prefixed ("ieee/test_name")
 # to disambiguate tests with the same name in different directories.
 GCC_XFAIL_TESTS = {
-    # ieee/ tests — IEEE floating-point edge cases, long double, NaN/Inf handling
-    "ieee/20000320-1",
     "ieee/cdivchkd",
     "ieee/cdivchkf",
     "ieee/cdivchkld",

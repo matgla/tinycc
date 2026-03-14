@@ -148,6 +148,7 @@ ST_DATA const char *const target_machine_defs = "__arm__\0"
                                                 "__ARM_ARCH_EXT_IDIV__\0"
                                                 "__thumb__\0"
 #endif // TCC_TARGET_ARM_ARCHV8M
+                                                "__VFP_FP__\0"
                                                 "__ARMEL__\0"
                                                 "__APCS_32__\0"
 #if defined TCC_ARM_EABI
@@ -6132,6 +6133,65 @@ static void thumb_process_complex_div_mop(MachineOperand src1, MachineOperand sr
   complex_pair_writeback(&d_real, R0, &d_imag, R1);
 }
 
+/* Process complex double division via MachineOperands.
+ * Calls __divdc3 from libgcc for numerically robust division.
+ *
+ * __divdc3 calling convention (soft-float AAPCS, hidden return pointer):
+ *   R0       = hidden return pointer (16-byte buffer for result)
+ *   R2:R3    = a_re (first double, even-aligned)
+ *   [sp+0]   = a_im (second double, on stack)
+ *   [sp+8]   = b_re (third double, on stack)
+ *   [sp+16]  = b_im (fourth double, on stack)
+ *   Result written to [R0+0..7] = real, [R0+8..15] = imag
+ *
+ * Stack layout (40 bytes, 8-byte aligned):
+ *   [sp+0]   = a_im for __divdc3 stack arg  (8 bytes)
+ *   [sp+8]   = b_re for __divdc3 stack arg  (8 bytes)
+ *   [sp+16]  = b_im for __divdc3 stack arg  (8 bytes)
+ *   [sp+24]  = result buffer: real part      (8 bytes)
+ *   [sp+32]  = result buffer: imag part      (8 bytes)
+ */
+static void thumb_process_complex_div_double_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest)
+{
+  MachineOperand s1_real = mach_make_complex_real(&src1);
+  MachineOperand s1_imag = mach_make_complex_imag(&src1);
+  MachineOperand s2_real = mach_make_complex_real(&src2);
+  MachineOperand s2_imag = mach_make_complex_imag(&src2);
+  MachineOperand d_real = mach_make_complex_real(&dest);
+  MachineOperand d_imag = mach_make_complex_imag(&dest);
+
+  /* Allocate 40 bytes (8-byte aligned). */
+  ot_check(th_sub_sp_imm(R_SP, 40, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+
+  /* Set up __divdc3 stack args (must be at lowest sp offsets). */
+  /* [sp+16] = b_im (src2 imag). */
+  fp_mop_load_double_arg(R0, R1, &s2_imag);
+  fp_mop_save_double_to_sp(16);
+  /* [sp+8] = b_re (src2 real). */
+  fp_mop_load_double_arg(R0, R1, &s2_real);
+  fp_mop_save_double_to_sp(8);
+  /* [sp+0] = a_im (src1 imag). */
+  fp_mop_load_double_arg(R0, R1, &s1_imag);
+  fp_mop_save_double_to_sp(0);
+
+  /* R2:R3 = a_re (src1 real) — first double arg in even register pair. */
+  fp_mop_load_double_arg(R2, R3, &s1_real);
+
+  /* R0 = pointer to result buffer at [sp+24]. */
+  ot_check(th_add_sp_imm(R0, 24, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+
+  /* Call __divdc3. */
+  fp_mop_do_bl("__divdc3");
+
+  /* Read result from buffer and write back to dest. */
+  fp_mop_load_double_from_sp(R0, R1, 24);
+  fp_mop_writeback_result(&d_real, 1);
+  fp_mop_load_double_from_sp(R0, R1, 32);
+  fp_mop_writeback_result(&d_imag, 1);
+
+  ot_check(th_add_sp_imm(R_SP, 40, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+}
+
 /* tcc_gen_machine_fp_mop: MachineOperand-based entry point for floating-point
  * operations via soft-float EABI library calls.
  * Handles single-precision, double-precision, and complex float operations.
@@ -6167,7 +6227,7 @@ ST_FUNC void tcc_gen_machine_fp_mop(MachineOperand src1, MachineOperand src2, Ma
     else if (op == TCCIR_OP_FDIV)
     {
       if (complex_is_double)
-        tcc_error("compiler_error: complex double FDIV not yet implemented");
+        return thumb_process_complex_div_double_mop(src1, src2, dest);
       return thumb_process_complex_div_mop(src1, src2, dest);
     }
     /* Other ops (FNEG, FCMP, CVT_*) on complex types: fall through to

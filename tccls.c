@@ -669,6 +669,16 @@ void tcc_ls_spill_interval_sized(LSLiveIntervalState *ls, int interval_index, in
 {
   LSLiveInterval *interval = &ls->intervals[interval_index];
   LS_DBG("  Spilling interval vreg=%u: trying to find register by spilling another", interval->vreg);
+
+  /* 128-bit complex doubles cannot fit in any register (pair).
+   * Always spill to stack without trying to steal a register. */
+  if (size > 8)
+  {
+    interval->stack_location = tcc_ls_next_stack_location_sized(size);
+    LS_DBG("    %d-bit type: spilled directly to stack at %d", size * 8, (int)interval->stack_location);
+    return;
+  }
+
   /* If no active intervals, just spill to stack */
   if (ls->next_active_index == 0)
   {
