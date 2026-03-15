@@ -1976,6 +1976,9 @@ ST_FUNC void gaddrof(void)
   /* tricky: if saved lvalue, then we can go back to lvalue */
   if ((vtop->r & VT_VALMASK) == VT_LLOCAL)
   {
+    if (nocode_wanted)
+      return;
+
     /* VT_LLOCAL means the pointer is stored at the local/param location.
      * We need to load that pointer value into a temporary. */
     SValue ptr_location = *vtop; // Save the location where the pointer is stored
@@ -2007,6 +2010,12 @@ ST_FUNC void gaddrof(void)
   }
   else if ((vtop->r & VT_VALMASK) == VT_LOCAL && tcc_state->ir)
   {
+    /* In nocode_wanted mode (e.g. __builtin_object_size), preserve the
+     * VT_LOCAL address + c.i offset for compile-time analysis instead
+     * of emitting LEA that destroys this information. */
+    if (nocode_wanted)
+      return;
+
     /* VT_LOCAL without VT_LVAL means "address of local variable".
      * In IR mode, emit explicit LEA to compute FP+offset into a vreg.
      * This avoids ambiguity where VT_LOCAL alone could be misinterpreted
@@ -2034,6 +2043,9 @@ ST_FUNC void gaddrof(void)
   }
   else if ((vtop->r & VT_PARAM) && tcc_state->ir && (vtop->r & VT_VALMASK) < VT_CONST)
   {
+    if (nocode_wanted)
+      return;
+
     /* Register-passed parameter without VT_LOCAL: in IR mode, register
      * parameters are represented as VT_PARAM | VT_LVAL (val_kind = register
      * number) without VT_LOCAL. When address-of is applied, the parameter
@@ -10585,21 +10597,20 @@ tok_next:
   case TOK_builtin_llabs:
   case TOK_builtin_imaxabs:
   {
-    /* Redirect to library functions */
-    const char *func_name;
-    switch (tok) {
-      case TOK_builtin_labs:     func_name = "labs"; break;
-      case TOK_builtin_llabs:    func_name = "llabs"; break;
-      case TOK_builtin_imaxabs:  func_name = "imaxabs"; break;
-      default:                   func_name = NULL; break;
-    }
-    if (func_name) {
-      Sym *sym = external_helper_sym(tok_alloc(func_name, strlen(func_name))->tok);
-      if (!sym->c)
-        put_extern_sym(sym, NULL, 0, 0);
-      vpushsym(&sym->type, sym);
-    }
-    next();
+    /* Inline abs for long/long long/intmax_t — same branchless formula as
+       __builtin_abs but with a type-dependent shift count. */
+    parse_builtin_params(0, "e");
+    if ((vtop->r & VT_VALMASK) == VT_CMP)
+      gv(RC_INT);
+    int shift = (vtop->type.t & VT_BTYPE) == VT_LLONG ? 63 : 31;
+    vdup();
+    vpushi(shift);
+    gen_op(TOK_SAR);
+    vdup();
+    vrott(3);
+    gen_op('^');
+    vswap();
+    gen_op('-');
     break;
   }
   case TOK_builtin_types_compatible_p:
@@ -13920,15 +13931,151 @@ tok_next:
   }
 #endif
 
-  /* __builtin_object_size(ptr, type) - returns size of object, or (size_t)-1 if unknown
-   * For now, we always return (size_t)-1 (unknown size) which causes chk functions
-   * to fall back to regular library calls */
+  /* __builtin_object_size(ptr, type) — compute remaining bytes from ptr to end
+   * of its enclosing object.  Returns (size_t)-1 when the size cannot be
+   * determined at compile time. */
   case TOK_builtin_object_size:
   {
-    parse_builtin_params(0, "ee");
-    vpop(); /* pop the type argument */
-    vpop(); /* pop the pointer argument */
-    vpushs(-1); /* return SIZE_MAX (unknown size) */
+    int obj_type_val;
+    addr_t result = (addr_t)-1; /* default: unknown */
+
+    next(); /* consume __builtin_object_size token */
+    skip('(');
+
+    /* Evaluate ptr expression without generating IR so we can inspect
+     * the SValue for type/offset info. */
+    nocode_wanted++;
+    expr_eq();
+
+    /* Capture ptr SValue before any decay */
+    SValue ptr_sv = *vtop;
+    CType ptr_type = vtop->type;
+    int ptr_r = vtop->r;
+
+    vpop();
+    nocode_wanted--;
+
+    skip(',');
+
+    /* Parse the type argument (0, 1, 2, or 3) — must be a constant */
+    nocode_wanted++;
+    expr_eq();
+    if ((vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST)
+      obj_type_val = vtop->c.i;
+    else
+      obj_type_val = 0;
+    vpop();
+    nocode_wanted--;
+
+    skip(')');
+
+    /* --- Compute object size --- */
+    /* Only mode 0 (max remaining in outermost object) is implemented;
+     * modes 1-3 fall back to -1 (unknown). */
+    if (obj_type_val == 0 || obj_type_val == 1)
+    {
+      /* Helper: search local_stack for the outermost variable that
+       * contains a given frame-pointer offset.  Returns remaining
+       * bytes from that offset to end of the variable, or -1. */
+      #define FIND_LOCAL_OBJSIZE(target_off, out_size)                 \
+        do {                                                           \
+          Sym *_s;                                                     \
+          (out_size) = (addr_t)-1;                                     \
+          for (_s = local_stack; _s; _s = _s->prev) {                  \
+            if ((_s->r & VT_VALMASK) != VT_LOCAL) continue;           \
+            /* Skip field/struct-tag namespace symbols */               \
+            if (_s->v & (SYM_FIELD | SYM_STRUCT)) continue;           \
+            /* Skip vreg-managed scalars: their sym->c is not a real   \
+             * stack offset (register allocator assigns the actual     \
+             * location). Only arrays, structs, VLAs keep permanent    \
+             * frame offsets assigned by the front-end. */             \
+            if ((_s->r & VT_LVAL)                                     \
+                && ((_s->type.t & VT_BTYPE) != VT_STRUCT)             \
+                && !(_s->type.t & (VT_ARRAY | VT_VLA)))               \
+              continue;                                                \
+            int _align;                                                \
+            int _sz = type_size(&_s->type, &_align);                   \
+            if (_sz <= 0) continue;                                    \
+            /* Use int for signed frame-offset arithmetic (sym->c is   \
+             * a signed FP-relative offset; addr_t is unsigned and     \
+             * would break the range check on 64-bit hosts). */        \
+            int _base = (int)_s->c;                                    \
+            int _end = _base + _sz;                                    \
+            int _tgt = (int)(target_off);                              \
+            if (_tgt >= _base && _tgt < _end) {                        \
+              (out_size) = (addr_t)(_end - _tgt);                      \
+              break;                                                   \
+            }                                                          \
+          }                                                            \
+        } while (0)
+
+      /* All VT_LOCAL cases (both lval and non-lval, with or without
+       * array type) use the same local variable search for mode 0. */
+      if ((ptr_r & VT_VALMASK) == VT_LOCAL)
+      {
+        int target_offset = (int)ptr_sv.c.i;
+
+        if ((ptr_type.t & VT_ARRAY) && ptr_type.ref && obj_type_val == 0)
+        {
+          /* Array type still present — might be a sub-array of a larger
+           * struct.  Search for the outermost enclosing variable. */
+          addr_t outer;
+          FIND_LOCAL_OBJSIZE(target_offset, outer);
+          if (outer != (addr_t)-1)
+            result = outer;
+          else
+          {
+            /* No enclosing variable found (shouldn't happen for locals),
+             * fall back to the array's own size. */
+            int align;
+            result = type_size(&ptr_type, &align);
+          }
+        }
+        else if ((ptr_type.t & VT_ARRAY) && ptr_type.ref && obj_type_val == 1)
+        {
+          /* Mode 1: innermost subobject = the array itself */
+          int align;
+          result = type_size(&ptr_type, &align);
+        }
+        else
+        {
+          /* Pointer, pointer-to-struct, or address-of result.
+           * Search for enclosing variable. */
+          FIND_LOCAL_OBJSIZE(target_offset, result);
+          if (result != (addr_t)-1 && obj_type_val == 1)
+          {
+            /* Mode 1: remaining in the innermost subobject.
+             * If the type is known, use that; otherwise keep outer. */
+            if (ptr_r & VT_LVAL)
+            {
+              int align;
+              int inner_sz = type_size(&ptr_type, &align);
+              if (inner_sz > 0)
+                result = inner_sz;
+            }
+          }
+        }
+      }
+      /* Global/static symbol with known section size.
+       * VT_LVAL means we'd need to load the value (i.e. a pointer variable),
+       * not an array whose address we already have. Pointer variables have
+       * st_size = sizeof(pointer) which is NOT the pointed-to object size. */
+      else if ((ptr_r & (VT_VALMASK | VT_SYM)) == (VT_CONST | VT_SYM)
+               && !(ptr_r & VT_LVAL) && ptr_sv.sym)
+      {
+        ElfSym *esym = elfsym(ptr_sv.sym);
+        if (esym && esym->st_size > 0)
+        {
+          addr_t offset_in_sym = ptr_sv.c.i;
+          if (offset_in_sym >= 0 && (addr_t)offset_in_sym < esym->st_size)
+            result = esym->st_size - offset_in_sym;
+        }
+      }
+
+      #undef FIND_LOCAL_OBJSIZE
+    }
+
+    vpushs(result);
     break;
   }
 
@@ -14000,7 +14147,23 @@ tok_next:
     break;
   }
 
-  /* Fortified/chk variants - ignore size check and call regular function */
+  /* ================================================================
+   * Fortified/chk builtins — table-driven handler.
+   *
+   * __builtin___memcpy_chk(dst, src, n, objsize) etc.
+   *
+   * Categories:
+   *   SIMPLE  — n_prefix normal args, then 1 trailing objsize arg to drop
+   *             e.g. memcpy_chk(d,s,n, SIZE) → memcpy(d,s,n) or __memcpy_chk(d,s,n,SIZE)
+   *   FORMAT  — n_prefix normal args, then 2 args (flag, objsize) to drop,
+   *             then format string + variadic args
+   *             e.g. sprintf_chk(buf, FLAG, SIZE, fmt, ...) → sprintf(buf, fmt, ...)
+   *
+   * Decision logic after parsing:
+   *   objsize == -1           → call base function (compiler can't check)
+   *   objsize known, n const  → if n ≤ objsize: call base; else: call __*_chk
+   *   objsize known, n runtime→ call __*_chk for runtime bounds check
+   * ================================================================ */
   case TOK_builtin___memcpy_chk:
   case TOK_builtin___memmove_chk:
   case TOK_builtin___memset_chk:
@@ -14016,32 +14179,280 @@ tok_next:
   case TOK_builtin___vsprintf_chk:
   case TOK_builtin___vsnprintf_chk:
   {
-    /* Map chk builtin to corresponding library function name */
-    const char *func_name;
-    switch (tok) {
-      case TOK_builtin___memcpy_chk:     func_name = "memcpy"; break;
-      case TOK_builtin___memmove_chk:    func_name = "memmove"; break;
-      case TOK_builtin___memset_chk:     func_name = "memset"; break;
-      case TOK_builtin___mempcpy_chk:    func_name = "mempcpy"; break;
-      case TOK_builtin___strcpy_chk:     func_name = "strcpy"; break;
-      case TOK_builtin___stpcpy_chk:     func_name = "stpcpy"; break;
-      case TOK_builtin___strcat_chk:     func_name = "strcat"; break;
-      case TOK_builtin___strncpy_chk:    func_name = "strncpy"; break;
-      case TOK_builtin___stpncpy_chk:    func_name = "stpncpy"; break;
-      case TOK_builtin___strncat_chk:    func_name = "strncat"; break;
-      case TOK_builtin___sprintf_chk:    func_name = "sprintf"; break;
-      case TOK_builtin___snprintf_chk:   func_name = "snprintf"; break;
-      case TOK_builtin___vsprintf_chk:   func_name = "vsprintf"; break;
-      case TOK_builtin___vsnprintf_chk:  func_name = "vsnprintf"; break;
-      default:                           func_name = NULL; break;
+    /* --- Descriptor table ---
+     * base_func: function to call when objsize is -1 or statically safe
+     * chk_func:  runtime checking function when objsize is known
+     * n_prefix:  number of leading args kept in both base and chk calls
+     * n_drop:    number of args after prefix to drop for base call (kept for chk)
+     * has_varargs: 1 if format string + varargs follow the dropped args
+     * returns_ptr: 1 if function returns a pointer (void*), 0 for int */
+    struct chk_desc
+    {
+      int tok;
+      const char *base_func;
+      const char *chk_func;
+      int n_prefix;
+      int n_drop;
+      int has_varargs;
+      int returns_ptr;
+    };
+    static const struct chk_desc chk_table[] = {
+      { TOK_builtin___memcpy_chk,    "memcpy",     "__memcpy_chk",     3, 1, 0, 1 },
+      { TOK_builtin___memmove_chk,   "memmove",    "__memmove_chk",    3, 1, 0, 1 },
+      { TOK_builtin___memset_chk,    "memset",     "__memset_chk",     3, 1, 0, 1 },
+      { TOK_builtin___mempcpy_chk,   "mempcpy",    "__mempcpy_chk",    3, 1, 0, 1 },
+      { TOK_builtin___strcpy_chk,    "strcpy",     "__strcpy_chk",     2, 1, 0, 1 },
+      { TOK_builtin___stpcpy_chk,    "stpcpy",     "__stpcpy_chk",     2, 1, 0, 1 },
+      { TOK_builtin___strcat_chk,    "strcat",     "__strcat_chk",     2, 1, 0, 1 },
+      { TOK_builtin___strncpy_chk,   "strncpy",    "__strncpy_chk",    3, 1, 0, 1 },
+      { TOK_builtin___stpncpy_chk,   "stpncpy",    "__stpncpy_chk",    3, 1, 0, 1 },
+      { TOK_builtin___strncat_chk,   "strncat",    "__strncat_chk",    3, 1, 0, 1 },
+      { TOK_builtin___sprintf_chk,   "sprintf",    "__sprintf_chk",    1, 2, 1, 0 },
+      { TOK_builtin___snprintf_chk,  "snprintf",   "__snprintf_chk",   2, 2, 1, 0 },
+      { TOK_builtin___vsprintf_chk,  "vsprintf",   "__vsprintf_chk",   1, 2, 1, 0 },
+      { TOK_builtin___vsnprintf_chk, "vsnprintf",  "__vsnprintf_chk",  2, 2, 1, 0 },
+    };
+
+    /* Look up descriptor */
+    const struct chk_desc *desc = NULL;
+    for (int ci = 0; ci < (int)(sizeof(chk_table) / sizeof(chk_table[0])); ci++)
+    {
+      if (chk_table[ci].tok == tok)
+      {
+        desc = &chk_table[ci];
+        break;
+      }
     }
-    if (func_name) {
-      int func_tok = tok_alloc_const(func_name);
-      vpush_helper_func(func_tok);
+    /* Shouldn't happen — the switch cases match the table exactly */
+    if (!desc)
+      tcc_error("internal: unhandled chk builtin");
+
+    next(); /* consume __builtin___*_chk token */
+    skip('(');
+
+    /* Parse and save ALL arguments on the vstack.
+     * Layout: prefix_args..., [varargs...] (dropped args stored separately) */
+    int all_args_cap = 32;
+    SValue *all_args = tcc_malloc(all_args_cap * sizeof(SValue));
+    int total_args = 0;
+
+    /* Parse prefix args */
+    for (int i = 0; i < desc->n_prefix; i++)
+    {
+      if (i > 0)
+        skip(',');
+      expr_eq();
+      convert_parameter_type(&vtop->type);
+      if (!NOEVAL_WANTED)
+        tcc_ir_codegen_cmp_jmp_set(tcc_state->ir);
+      if (total_args >= all_args_cap) {
+        all_args_cap *= 2;
+        all_args = tcc_realloc(all_args, all_args_cap * sizeof(SValue));
+      }
+      all_args[total_args] = *vtop;
+      total_args++;
+      vpop();
     }
-    next();
+
+    /* Parse dropped args (flag and/or objsize) */
+    SValue dropped_args[2];
+    for (int i = 0; i < desc->n_drop; i++)
+    {
+      skip(',');
+      expr_eq();
+      convert_parameter_type(&vtop->type);
+      if (!NOEVAL_WANTED)
+        tcc_ir_codegen_cmp_jmp_set(tcc_state->ir);
+      dropped_args[i] = *vtop;
+      vpop();
+    }
+
+    /* The last dropped arg is always the objsize */
+    SValue size_sv = dropped_args[desc->n_drop - 1];
+
+    /* Parse remaining args (format string + varargs for format builtins, nothing for simple) */
+    if (desc->has_varargs)
+    {
+      /* At least the format string follows */
+      while (tok != ')')
+      {
+        skip(',');
+        expr_eq();
+        convert_parameter_type(&vtop->type);
+        if (!NOEVAL_WANTED)
+          tcc_ir_codegen_cmp_jmp_set(tcc_state->ir);
+        if (total_args >= all_args_cap) {
+          all_args_cap *= 2;
+          all_args = tcc_realloc(all_args, all_args_cap * sizeof(SValue));
+        }
+        all_args[total_args] = *vtop;
+        total_args++;
+        vpop();
+      }
+    }
+
+    skip(')');
+
+    if (NOEVAL_WANTED)
+    {
+      /* In sizeof/typeof/nocode context, just push a dummy result */
+      tcc_free(all_args);
+      if (desc->returns_ptr)
+      {
+        vpushi(0);
+        vtop->type = char_pointer_type;
+      }
+      else
+      {
+        vpushi(0);
+      }
+      break;
+    }
+
+    /* --- Decision logic ---
+     * Determine whether to call the base function (stripped args) or
+     * the runtime __*_chk function (all args including objsize). */
+    int use_chk = 0; /* 0 = base func, 1 = __*_chk runtime func */
+    int size_is_const = ((size_sv.r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST);
+    addr_t objsize = size_is_const ? (addr_t)size_sv.c.i : 0;
+
+    if (size_is_const && objsize == (addr_t)-1)
+    {
+      /* objsize unknown — compiler can't check, call base function */
+      use_chk = 0;
+    }
+    else if (size_is_const)
+    {
+      /* objsize known — check if we can resolve statically or need runtime check.
+       * For simple builtins, the "n" (length) is the last prefix arg.
+       * For str* builtins (strcpy, strcat, stpcpy), length is unknown. */
+      if (!desc->has_varargs && desc->n_prefix >= 3)
+      {
+        /* Simple builtins with explicit length: n is last prefix arg */
+        SValue *n_sv = &all_args[desc->n_prefix - 1];
+        int n_is_const = ((n_sv->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST);
+        if (n_is_const)
+        {
+          addr_t n_val = (addr_t)n_sv->c.i;
+          if (n_val <= objsize)
+            use_chk = 0; /* statically safe */
+          else
+            use_chk = 1; /* will overflow — call __*_chk for runtime abort */
+        }
+        else
+        {
+          use_chk = 1; /* length unknown at compile time, need runtime check */
+        }
+      }
+      else if (!desc->has_varargs && desc->n_prefix == 2)
+      {
+        /* strcpy/stpcpy/strcat variants — can't determine string length
+         * at compile time in general, use runtime check */
+        use_chk = 1;
+      }
+      else
+      {
+        /* Format string builtins — need runtime check */
+        use_chk = 1;
+      }
+    }
+    else
+    {
+      /* objsize not constant — would need runtime check, but since we don't
+       * know objsize we can't even do that. Just call base function. */
+      use_chk = 0;
+    }
+
+    /* --- Emit IR call --- */
+    const char *call_func = use_chk ? desc->chk_func : desc->base_func;
+    int call_id = tcc_state->ir->next_call_id++;
+    SValue param_num;
+    svalue_init(&param_num);
+    param_num.vr = -1;
+    param_num.r = VT_CONST;
+
+    int out_param_idx = 0;
+
+    if (use_chk)
+    {
+      /* Emit ALL original args in order: prefix, dropped (flag+objsize),
+       * [varargs] */
+      /* First: prefix args */
+      for (int i = 0; i < desc->n_prefix && i < total_args; i++)
+      {
+        param_num.c.i = TCCIR_ENCODE_PARAM(call_id, out_param_idx);
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &all_args[i], &param_num, NULL);
+        out_param_idx++;
+      }
+      /* Then: dropped args (flag and objsize) */
+      for (int i = 0; i < desc->n_drop; i++)
+      {
+        param_num.c.i = TCCIR_ENCODE_PARAM(call_id, out_param_idx);
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &dropped_args[i], &param_num, NULL);
+        out_param_idx++;
+      }
+      /* Then: remaining args (varargs) */
+      for (int i = desc->n_prefix; i < total_args; i++)
+      {
+        param_num.c.i = TCCIR_ENCODE_PARAM(call_id, out_param_idx);
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &all_args[i], &param_num, NULL);
+        out_param_idx++;
+      }
+    }
+    else
+    {
+      /* Emit only kept args: prefix + [varargs], dropping flag/objsize */
+      for (int i = 0; i < desc->n_prefix && i < total_args; i++)
+      {
+        param_num.c.i = TCCIR_ENCODE_PARAM(call_id, out_param_idx);
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &all_args[i], &param_num, NULL);
+        out_param_idx++;
+      }
+      /* Remaining args (varargs) */
+      for (int i = desc->n_prefix; i < total_args; i++)
+      {
+        param_num.c.i = TCCIR_ENCODE_PARAM(call_id, out_param_idx);
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &all_args[i], &param_num, NULL);
+        out_param_idx++;
+      }
+    }
+
+    /* Push the target function and emit the call */
+    vpush_helper_func(tok_alloc_const(call_func));
+
+    SValue call_id_sv = tcc_ir_svalue_call_id_argc(call_id, out_param_idx);
+    if (desc->returns_ptr)
+    {
+      SValue dest;
+      svalue_init(&dest);
+      dest.type.t = VT_PTR;
+      dest.r = 0;
+      dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &call_id_sv, &dest);
+      --vtop; /* pop function symbol */
+      vpushi(0);
+      vtop->type = char_pointer_type;
+      vtop->vr = dest.vr;
+      vtop->r = TREG_R0;
+    }
+    else
+    {
+      SValue dest;
+      svalue_init(&dest);
+      dest.type.t = VT_INT;
+      dest.r = 0;
+      dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &call_id_sv, &dest);
+      --vtop; /* pop function symbol */
+      vpushi(0);
+      vtop->type.t = VT_INT;
+      vtop->vr = dest.vr;
+      vtop->r = TREG_R0;
+    }
+    tcc_free(all_args);
     break;
   }
+
 
   /* String and memory builtins - redirect to library functions */
   case TOK_builtin_strlen:

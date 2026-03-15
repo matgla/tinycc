@@ -29,12 +29,16 @@
 #endif
 #define __ILP32__ 1
 #define __INT64_TYPE__ long long
+#define __INTMAX_TYPE__ long long
+#define __UINTMAX_TYPE__ unsigned long long
 #elif __SIZEOF_LONG__ == 4
 /* 64bit Windows. */
 #define __SIZE_TYPE__ unsigned long long
 #define __PTRDIFF_TYPE__ long long
 #define __LLP64__ 1
 #define __INT64_TYPE__ long long
+#define __INTMAX_TYPE__ long long
+#define __UINTMAX_TYPE__ unsigned long long
 #else
 /* Other 64bit systems. */
 #define __SIZE_TYPE__ unsigned long
@@ -42,8 +46,12 @@
 #define __LP64__ 1
 #if defined __linux__
 #define __INT64_TYPE__ long
+#define __INTMAX_TYPE__ long
+#define __UINTMAX_TYPE__ unsigned long
 #else /* APPLE, BSD */
 #define __INT64_TYPE__ long long
+#define __INTMAX_TYPE__ long long
+#define __UINTMAX_TYPE__ unsigned long long
 #endif
 #endif
 #define __SIZEOF_SHORT__ 2
@@ -58,6 +66,18 @@
 #endif
 #define __SIZEOF_LONG_LONG__ 8
 #define __LONG_LONG_MAX__ 0x7fffffffffffffffLL
+#define __INTMAX_MAX__ 0x7fffffffffffffffLL
+#define __INTMAX_WIDTH__ 64
+#if __SIZEOF_POINTER__ == 4
+#define __PTRDIFF_MAX__ 0x7fffffff
+#define __SIZE_MAX__ 0xffffffffU
+#elif __SIZEOF_LONG__ == 4
+#define __PTRDIFF_MAX__ 0x7fffffffffffffffLL
+#define __SIZE_MAX__ 0xffffffffffffffffULL
+#else
+#define __PTRDIFF_MAX__ 0x7fffffffffffffffL
+#define __SIZE_MAX__ 0xffffffffffffffffUL
+#endif
 #define __CHAR_BIT__ 8
 #define __ORDER_LITTLE_ENDIAN__ 1234
 #define __ORDER_BIG_ENDIAN__ 4321
@@ -229,8 +249,13 @@
 #define __LDBL_MAX_EXP__ 1024
 #define __LDBL_MIN_EXP__ (-1021)
 
+#ifdef __leading_underscore
+#define __USER_LABEL_PREFIX__ _
+#else
+#define __USER_LABEL_PREFIX__
+#endif
 #if !defined _WIN32
-/* glibc defines. We do not support __USER_NAME_PREFIX__ */
+/* glibc defines */
 #define __REDIRECT(name, proto, alias) name proto __asm__(#alias)
 #define __REDIRECT_NTH(name, proto, alias) name proto __asm__(#alias) __THROW
 #define __REDIRECT_NTHNL(name, proto, alias) name proto __asm__(#alias) __THROWNL
@@ -407,8 +432,22 @@ __BUILTIN(void, abort, (void))
 __BUILTIN(void, exit, (int))
 __BUILTIN(int, printf, (const char *, ...))
 __BUILTIN(int, puts, (const char *))
+__BUILTIN(int, putchar, (int))
+__BUILTIN(int, fputc, (int, void *))
+__BUILTIN(__SIZE_TYPE__, fwrite, (const void *, __SIZE_TYPE__, __SIZE_TYPE__, void *))
 __BUILTIN(int, sprintf, (char *, const char *, ...))
 __BUILTIN(int, snprintf, (char *, __SIZE_TYPE__, const char *, ...))
+char *__builtin_index(const char *, int) __RENAME("strchr");
+char *__builtin_rindex(const char *, int) __RENAME("strrchr");
+void __builtin_bcopy(const void *, void *, __SIZE_TYPE__) __RENAME("bcopy");
+void __builtin_bzero(void *, __SIZE_TYPE__) __RENAME("bzero");
+int __builtin_printf_unlocked(const char *, ...) __RENAME("printf_unlocked");
+int __builtin_fprintf_unlocked(void *, const char *, ...) __RENAME("fprintf_unlocked");
+int __builtin_fputs_unlocked(const char *, void *) __RENAME("fputs_unlocked");
+unsigned int __builtin_uabs(int) __RENAME("uabs");
+unsigned long __builtin_ulabs(long) __RENAME("ulabs");
+unsigned long long __builtin_ullabs(long long) __RENAME("ullabs");
+unsigned long long __builtin_umaxabs(long long) __RENAME("umaxabs");
 __BOUND(void, longjmp, ())
 #if !defined _WIN32
 __BOUND(void *, mmap, ())

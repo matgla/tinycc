@@ -43,45 +43,11 @@ OPT_LEVELS = ["-O0", "-O1"]
 # to disambiguate tests with the same name in different directories.
 GCC_XFAIL_TESTS = {
     # builtins/ tests — builtin override tests requiring lib/main.c framework
-    "builtins/abs-1",
-    "builtins/abs-2",
-    "builtins/abs-3",
-    "builtins/complex-1",
-    "builtins/fprintf",
-    "builtins/fputs",
-    "builtins/memchr",
-    "builtins/memcmp",
-    "builtins/memchr",
-    "builtins/memcmp",
-    "builtins/memcpy",
-    "builtins/memmove",
-    "builtins/memmove-2",
-    "builtins/memops-asm",
-    "builtins/mempcpy",
-    "builtins/mempcpy-2",
-    "builtins/printf",
-    "builtins/sprintf",
-    "builtins/strcat",
-    "builtins/strchr",
-    "builtins/strcmp",
-    "builtins/strcpy",
-    "builtins/strcpy-2",
-    "builtins/strcspn",
-    "builtins/strncat",
-    "builtins/strncmp",
-    "builtins/strncmp-2",
-    "builtins/strncpy",
-    "builtins/strlen",
-    "builtins/strlen-2",
-    "builtins/strlen-3",
-    "builtins/strnlen",
-    "builtins/strpbrk",
-    "builtins/strrchr",
-    "builtins/strstr",
-    "builtins/strstr-asm",
-    "builtins/uabs-1",
-    "builtins/uabs-2",
-    "builtins/uabs-3",
+    "builtins/abs-1",       # needs constant-folding of labs(0) at -O0
+    "builtins/complex-1",   # complex conjugate not implemented
+    "builtins/memops-asm",  # struct copy emits memcpy call to abort-wrapper
+    "builtins/strncmp",     # custom strncmp has UB when n=0 (uninitialized vars)
+    "builtins/uabs-1",     # needs constant-folding of ulabs(0) at -O0
     # compile/ tests — compilation failures (parser, type system, unsupported features)
     "compile/20000120-2",
     "compile/20001222-1",
@@ -170,26 +136,58 @@ GCC_XFAIL_TESTS = {
 # condition elimination) that TCC does not implement.
 GCC_XFAIL_O1_TESTS = {
     "ieee/compare-fp-3",  # needs (x==y)&&(x!=y) → false simplification
-    # builtins/ tests — require compiler inlining of __builtin___*_chk calls
-    # At -O1, __OPTIMIZE__ is defined, so the lib overrides abort() when called
-    # directly. GCC inlines these; TCC does not.
-    "builtins/memcpy-chk",
-    "builtins/memmove-chk",
-    "builtins/mempcpy-chk",
-    "builtins/memset-chk",
-    "builtins/pr23484-chk",
-    "builtins/pr93262-chk",
-    "builtins/snprintf-chk",
-    "builtins/sprintf-chk",
-    "builtins/stpcpy-chk",
-    "builtins/stpncpy-chk",
-    "builtins/strcat-chk",
-    "builtins/strcpy-chk",
-    "builtins/strncat-chk",
-    "builtins/strncpy-chk",
-    "builtins/strpcpy",
-    "builtins/vsnprintf-chk",
-    "builtins/vsprintf-chk",
+    # builtins/ tests — TCC doesn't constant-fold builtin calls at -O1, so the
+    # custom override functions (which abort when __OPTIMIZE__ && inside_main)
+    # get called instead of being optimized away.
+    "builtins/abs-2",
+    "builtins/abs-3",
+    "builtins/fprintf",
+    "builtins/fputs",
+    "builtins/memchr",
+    "builtins/memcmp",
+    "builtins/memmove",
+    "builtins/memmove-2",
+    "builtins/mempcpy",
+    "builtins/printf",
+    "builtins/sprintf",
+    "builtins/strcat",
+    "builtins/strchr",
+    "builtins/strcmp",
+    "builtins/strcpy",
+    "builtins/strcpy-2",
+    "builtins/strcspn",
+    "builtins/strncat",
+    "builtins/strncpy",
+    "builtins/strlen",
+    "builtins/strlen-2",
+    "builtins/strlen-3",
+    "builtins/strnlen",
+    "builtins/strpbrk",
+    "builtins/strrchr",
+    "builtins/strstr",
+    "builtins/strstr-asm",
+    "builtins/uabs-2",
+    "builtins/uabs-3",
+    # builtins/ tests — require GCC-level optimizations beyond chk inlining:
+    # inline stores (_disallowed checks), value range analysis, conditional
+    # pointer tracking. TCC inlines __builtin___*_chk but can't optimize away
+    # the underlying library calls or prove value bounds.
+    "builtins/memcpy-chk",    # test3: conditional ptr tracking + value range
+    "builtins/memmove-chk",   # test1: memmove_disallowed (unconditional on ARM)
+    "builtins/mempcpy-chk",   # test2: mempcpy_disallowed (unconditional)
+    "builtins/memset-chk",    # test1: memset_disallowed (unconditional)
+    "builtins/pr23484-chk",   # ternary length requires value range analysis
+    "builtins/snprintf-chk",  # test2: conditional ptr tracking + value range
+    "builtins/sprintf-chk",   # test1: sprintf_disallowed (unconditional)
+    "builtins/stpcpy-chk",    # test1: stpcpy_disallowed (x86); test3: cond ptr
+    "builtins/stpncpy-chk",   # test1: stpncpy_disallowed (unconditional)
+    "builtins/strcat-chk",    # test1: strcat_disallowed (unconditional)
+    "builtins/strcpy-chk",    # test1: strcpy_disallowed (non-Os)
+    "builtins/strncat-chk",   # test1: strncat_disallowed (unconditional)
+    "builtins/strncpy-chk",   # test1: strncpy_disallowed (unconditional)
+    "builtins/strpcpy",       # __builtin_stpcpy not implemented
+    "builtins/vsnprintf-chk", # test2: conditional ptr tracking + value range
+    "builtins/vsprintf-chk",  # test1: vsprintf_disallowed (unconditional)
 }
 
 # GCC Torture tests to skip entirely
