@@ -566,7 +566,8 @@ static void mach_writeback_dest(const MachineOperand *op, int reg)
     if (!store_word_to_base(reg, rr.reg, abs_off, sign))
     {
       ScratchRegAlloc rr2 = th_offset_to_reg_ex(abs_off, sign, excl | (1u << (uint32_t)rr.reg));
-      ot_check(th_str_reg((uint32_t)reg, (uint32_t)rr.reg, (uint32_t)rr2.reg, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+      ot_check(
+          th_str_reg((uint32_t)reg, (uint32_t)rr.reg, (uint32_t)rr2.reg, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
       restore_scratch_reg(&rr2);
     }
     restore_scratch_reg(&rr);
@@ -2029,6 +2030,19 @@ static void th_literal_pool_generate(void)
   generating_pool = 0;
   /* Clear the hash table after flushing pool */
   literal_pool_hash_clear(literal_pool_hash);
+}
+
+static void th_literal_pool_reserve_upcoming_bytes(int upcoming_bytes)
+{
+  if (!thumb_gen_state.generating_function)
+    return;
+
+  int pool_count = dry_run_state.active ? dry_run_literal_pool_count : thumb_gen_state.literal_pool_count;
+  if (pool_count == 0)
+    return;
+
+  if (thumb_gen_state.code_size + pool_count * 4 + upcoming_bytes >= 1020)
+    th_literal_pool_generate();
 }
 
 int is_valid_opcode(thumb_opcode op)
@@ -4171,6 +4185,7 @@ ST_FUNC void tcc_gen_machine_muldiv_mop(MachineOperand src1, MachineOperand src2
         excl |= (1u << (uint32_t)r_lo);
       int r_hi = mach_ensure_in_reg(&ctx, &hi, excl);
       ot_check(th_cmp_imm(0, r_lo, 0, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE));
+      th_literal_pool_reserve_upcoming_bytes(6);
       ot_check(th_it(mapcc(TOK_EQ), 0x8)); /* IT EQ (single instruction) */
       ot_check(th_cmp_imm(0, r_hi, 0, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE));
     }
@@ -4507,6 +4522,7 @@ ST_FUNC void tcc_gen_machine_setif_mop(MachineOperand src, MachineOperand dest, 
 
     /* Emit SETIF sequence for lo word. */
     ot_check(th_mov_imm(lo_reg, 0, FLAGS_BEHAVIOUR_BLOCK, ENFORCE_ENCODING_NONE));
+    th_literal_pool_reserve_upcoming_bytes(6);
     ot_check(th_it(cond, 0x8)); /* IT <cond> — single conditioned instruction */
     ot_check(th_mov_imm(lo_reg, 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
     /* Hi word is always 0 — boolean result never exceeds 1 (i.e. fits in 32-bit lo). */
@@ -4520,6 +4536,7 @@ ST_FUNC void tcc_gen_machine_setif_mop(MachineOperand src, MachineOperand dest, 
     int dest_reg = mach_get_dest_reg(&mctx, &dest, 0);
 
     ot_check(th_mov_imm(dest_reg, 0, FLAGS_BEHAVIOUR_BLOCK, ENFORCE_ENCODING_NONE));
+    th_literal_pool_reserve_upcoming_bytes(6);
     ot_check(th_it(cond, 0x8)); /* IT <cond> — single conditioned instruction */
     ot_check(th_mov_imm(dest_reg, 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
 
@@ -4600,15 +4617,18 @@ ST_FUNC void tcc_gen_machine_bool_mop(MachineOperand src1, MachineOperand src2, 
     {
       ot_check(th_orr_reg(dest_reg, r1, r2, FLAGS_BEHAVIOUR_SET, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
       ot_check(th_mov_imm(dest_reg, 0, FLAGS_BEHAVIOUR_BLOCK, ENFORCE_ENCODING_NONE));
+      th_literal_pool_reserve_upcoming_bytes(6);
       ot_check(th_it(0x1, 0x8)); /* IT NE */
       ot_check(th_mov_imm(dest_reg, 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
     }
     else /* TCCIR_OP_BOOL_AND */
     {
       ot_check(th_cmp_imm(0, r1, 0, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE));
+      th_literal_pool_reserve_upcoming_bytes(6);
       ot_check(th_it(0x1, 0x8));                                                  /* IT NE */
       ot_check(th_cmp_imm(0, r2, 0, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE)); /* CMPne r2, #0 */
       ot_check(th_mov_imm(dest_reg, 0, FLAGS_BEHAVIOUR_BLOCK, ENFORCE_ENCODING_NONE));
+      th_literal_pool_reserve_upcoming_bytes(6);
       ot_check(th_it(0x1, 0x8)); /* IT NE */
       ot_check(th_mov_imm(dest_reg, 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
     }
@@ -4631,15 +4651,18 @@ ST_FUNC void tcc_gen_machine_bool_mop(MachineOperand src1, MachineOperand src2, 
   {
     ot_check(th_orr_reg(dest_reg, src1_reg, src2_reg, FLAGS_BEHAVIOUR_SET, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     ot_check(th_mov_imm(dest_reg, 0, FLAGS_BEHAVIOUR_BLOCK, ENFORCE_ENCODING_NONE));
+    th_literal_pool_reserve_upcoming_bytes(6);
     ot_check(th_it(0x1, 0x8)); /* IT NE */
     ot_check(th_mov_imm(dest_reg, 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
   }
   else /* TCCIR_OP_BOOL_AND */
   {
     ot_check(th_cmp_imm(0, src1_reg, 0, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE));
+    th_literal_pool_reserve_upcoming_bytes(6);
     ot_check(th_it(0x1, 0x8));                                                        /* IT NE */
     ot_check(th_cmp_imm(0, src2_reg, 0, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE)); /* CMPne src2, #0 */
     ot_check(th_mov_imm(dest_reg, 0, FLAGS_BEHAVIOUR_BLOCK, ENFORCE_ENCODING_NONE));
+    th_literal_pool_reserve_upcoming_bytes(6);
     ot_check(th_it(0x1, 0x8)); /* IT NE */
     ot_check(th_mov_imm(dest_reg, 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
   }
@@ -5892,6 +5915,66 @@ static void complex_pair_writeback(MachineOperand *d_lo, int lo_reg, MachineOper
   }
 }
 
+/* Process complex double addition/subtraction via MachineOperands.
+ * (a+bi) + (c+di) = (a+c) + (b+d)i
+ * (a+bi) - (c+di) = (a-c) + (b-d)i
+ * Uses __aeabi_dadd/__aeabi_dsub for double-precision.
+ * Double AEABI calling convention: R0:R1 = arg1, R2:R3 = arg2, result in R0:R1.
+ */
+static void thumb_process_complex_op_double_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest,
+                                                TccIrOp op)
+{
+  const int is_add = (op == TCCIR_OP_ADD);
+  const char *func_name = is_add ? "__aeabi_dadd" : "__aeabi_dsub";
+
+  MachineOperand s1_real = mach_make_complex_real(&src1);
+  MachineOperand s1_imag = mach_make_complex_imag(&src1);
+  MachineOperand s2_real = mach_make_complex_real(&src2);
+  MachineOperand s2_imag = mach_make_complex_imag(&src2);
+  MachineOperand d_real = mach_make_complex_real(&dest);
+  MachineOperand d_imag = mach_make_complex_imag(&dest);
+
+  /* Stack layout (32 bytes):
+   *   [sp+24] = s2_imag (8 bytes)
+   *   [sp+16] = s2_real (8 bytes)
+   *   [sp+8]  = s1_imag (8 bytes)
+   *   [sp+0]  = s1_real (8 bytes)
+   */
+  ot_check(th_sub_sp_imm(R_SP, 32, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+
+  /* Save all 4 components to stack. */
+  fp_mop_load_double_arg(R0, R1, &s1_real);
+  fp_mop_save_double_to_sp(0);
+  fp_mop_load_double_arg(R0, R1, &s1_imag);
+  fp_mop_save_double_to_sp(8);
+  fp_mop_load_double_arg(R0, R1, &s2_real);
+  fp_mop_save_double_to_sp(16);
+  fp_mop_load_double_arg(R0, R1, &s2_imag);
+  fp_mop_save_double_to_sp(24);
+
+  /* Compute real part: func(a.real, b.real) */
+  fp_mop_load_double_from_sp(R0, R1, 0);
+  fp_mop_load_double_from_sp(R2, R3, 16);
+  fp_mop_do_bl(func_name);
+  /* Save real result to stack slot 0 */
+  fp_mop_save_double_to_sp(0);
+
+  /* Compute imag part: func(a.imag, b.imag) */
+  fp_mop_load_double_from_sp(R0, R1, 8);
+  fp_mop_load_double_from_sp(R2, R3, 24);
+  fp_mop_do_bl(func_name);
+  /* R0:R1 = imag result. Load real result from stack. */
+  fp_mop_save_double_to_sp(8); /* save imag to slot 8 */
+
+  /* Write results back to dest. */
+  fp_mop_load_double_from_sp(R0, R1, 0);
+  fp_mop_writeback_result(&d_real, 1);
+  fp_mop_load_double_from_sp(R0, R1, 8);
+  fp_mop_writeback_result(&d_imag, 1);
+
+  ot_check(th_add_sp_imm(R_SP, 32, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+}
+
 /* Process complex addition/subtraction via MachineOperands.
  * (a+bi) + (c+di) = (a+c) + (b+d)i
  * (a+bi) - (c+di) = (a-c) + (b-d)i
@@ -6181,7 +6264,7 @@ ST_FUNC void tcc_gen_machine_fp_mop(MachineOperand src1, MachineOperand src2, Ma
     if (op == TCCIR_OP_FADD || op == TCCIR_OP_FSUB)
     {
       if (complex_is_double)
-        tcc_error("compiler_error: complex double FADD/FSUB not yet implemented");
+        return thumb_process_complex_op_double_mop(src1, src2, dest, op == TCCIR_OP_FADD ? TCCIR_OP_ADD : TCCIR_OP_SUB);
       return thumb_process_complex_op_mop(src1, src2, dest, op == TCCIR_OP_FADD ? TCCIR_OP_ADD : TCCIR_OP_SUB);
     }
     else if (op == TCCIR_OP_FMUL)

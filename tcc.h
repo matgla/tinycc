@@ -109,6 +109,14 @@ extern long double strtold(const char *__nptr, char **__endptr);
 
 #define LDOUBLE_SIZE 8
 
+/* Target uses 8-byte long double (same as double).
+ * This must be set whenever LDOUBLE_SIZE == sizeof(double) so that
+ * constant folding code stores long double values as doubles, avoiding
+ * host/target long double size mismatches during cross-compilation. */
+#ifndef TCC_USING_DOUBLE_FOR_LDOUBLE
+#define TCC_USING_DOUBLE_FOR_LDOUBLE 1
+#endif
+
 /* -------------------------------------------- */
 
 /* parser debug */
@@ -462,18 +470,19 @@ struct SymAttr
 /* function attributes or temporary attributes for parsing */
 struct FuncAttr
 {
-  unsigned func_call : 3,     /* calling convention (0..5), see below */
-      func_type : 2,          /* FUNC_OLD/NEW/ELLIPSIS */
-      func_noreturn : 1,      /* attribute((noreturn)) */
-      func_ctor : 1,          /* attribute((constructor)) */
-      func_dtor : 1,          /* attribute((destructor)) */
-      func_args : 8,          /* PE __stdcall args */
-      func_alwinl : 1,        /* always_inline */
-      func_pure : 1,          /* attribute((pure)) - no side effects, reads memory */
-      func_const : 1,         /* attribute((const)) - no side effects, no memory reads */
-      func_no_instrument : 1, /* attribute((no_instrument_function)) */
-      func_va_arg_pack : 1,   /* uses __builtin_va_arg_pack() */
-      xxxx : 11;
+  unsigned func_call : 3,               /* calling convention (0..5), see below */
+      func_type : 2,                    /* FUNC_OLD/NEW/ELLIPSIS */
+      func_noreturn : 1,                /* attribute((noreturn)) */
+      func_ctor : 1,                    /* attribute((constructor)) */
+      func_dtor : 1,                    /* attribute((destructor)) */
+      func_args : 8,                    /* PE __stdcall args */
+      func_alwinl : 1,                  /* always_inline */
+      func_pure : 1,                    /* attribute((pure)) - no side effects, reads memory */
+      func_const : 1,                   /* attribute((const)) - no side effects, no memory reads */
+      func_no_instrument : 1,           /* attribute((no_instrument_function)) */
+      func_va_arg_pack : 1,             /* uses __builtin_va_arg_pack() */
+      func_rewritten_extern_inline : 1, /* extern inline rewritten to non-extern inline-only def */
+      xxxx : 10;
 };
 
 /* symbol management */
@@ -768,6 +777,15 @@ typedef struct NestedFunc
   /* Address-taken parent labels: nested function uses &&label referencing parent __label__ */
   Sym *addr_label_syms[MAX_NONLOCAL_GOTOS]; /* parent label syms referenced via &&label */
   int nb_addr_labels;                       /* number of addr-taken parent labels */
+  /* Parent scope typedefs visible to nested function body */
+  int parent_typedef_tokens[MAX_CAPTURED_VARS];  /* token IDs */
+  CType parent_typedef_types[MAX_CAPTURED_VARS]; /* saved types */
+  int nb_parent_typedefs;                        /* count of saved typedefs */
+  /* Parent scope struct/union/enum tags visible to nested function body.
+   * We store pointers to the original Sym (which survives pop_local_syms
+   * because completed struct tags have c != 0). */
+  Sym *parent_struct_tag_syms[MAX_CAPTURED_VARS]; /* original struct tag syms */
+  int nb_parent_struct_tags;                      /* count of saved struct tags */
 } NestedFunc;
 
 /* include file cache, used to find files faster and also to eliminate
@@ -858,6 +876,16 @@ struct TCCState
   unsigned char reverse_funcargs;       /* if true, evaluate last function arg first */
   unsigned char gnu89_inline;           /* treat 'extern inline' like 'static inline' */
   unsigned char unwind_tables;          /* create eh_frame section */
+
+  /* -fno-builtin-<func> bitmask: disable individual builtin inlining */
+#define NO_BUILTIN_ABS (1u << 0)
+#define NO_BUILTIN_LABS (1u << 1)
+#define NO_BUILTIN_LLABS (1u << 2)
+#define NO_BUILTIN_UABS (1u << 3)
+#define NO_BUILTIN_ULABS (1u << 4)
+#define NO_BUILTIN_ULLABS (1u << 5)
+#define NO_BUILTIN_UMAXABS (1u << 6)
+  unsigned int no_builtin_funcs;
 
   /* warning switches */
   unsigned char warn_none;
@@ -1720,6 +1748,7 @@ ST_FUNC CString *parse_asm_str(void);
 ST_FUNC void indir(void);
 ST_FUNC void unary(void);
 ST_FUNC void gexpr(void);
+ST_FUNC int64_t expr_const64(void);
 ST_FUNC int expr_const(void);
 #if defined CONFIG_TCC_BCHECK || defined TCC_TARGET_C67
 ST_FUNC Sym *get_sym_ref(CType *type, Section *sec, unsigned long offset, unsigned long size);

@@ -14,6 +14,7 @@ Environment:
 """
 
 import pytest
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -21,7 +22,7 @@ from pathlib import Path
 from conftest import (
     GCCTestCase, GCC_TORTURE_PATH, OPT_LEVELS,
     discover_gcc_compile_tests, discover_gcc_execute_tests,
-    should_skip_gcc_test, is_xfail_test, parse_dg_options
+    should_skip_gcc_test, is_xfail_test
 )
 
 # Add ir_tests to path for qemu_run
@@ -41,8 +42,8 @@ except ImportError:
 # Test Execution Functions
 # ============================================================================
 
-def run_compile_test(test_case: GCCTestCase, opt_level: str, tmp_path: Path) -> None:
-    """Run a compile-only test."""
+def _compile_test(test_case: GCCTestCase, opt_level: str, tmp_path: Path) -> tuple[bool, str]:
+    """Compile a test and return `(success, compiler_output)`."""
     extra_flags = opt_level
     if test_case.dg_options:
         extra_flags = f"{opt_level} {test_case.dg_options}"
@@ -54,7 +55,8 @@ def run_compile_test(test_case: GCCTestCase, opt_level: str, tmp_path: Path) -> 
             timeout=test_case.timeout
         )
         result = compile_testcase([test_case.source], "mps2-an505", config=config)
-        assert result.success, f"Compilation failed:\n{result.error}"
+        output = result.error if result.error else "\n".join(result.output_lines)
+        return result.success, output
     else:
         # Fallback to direct compiler invocation
         compiler = Path(__file__).parent.parent.parent / "bin" / "armv8m-tcc"
@@ -67,7 +69,38 @@ def run_compile_test(test_case: GCCTestCase, opt_level: str, tmp_path: Path) -> 
             str(tmp_path / "test.o")
         ]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=test_case.timeout)
-        assert result.returncode == 0, f"Compilation failed:\n{result.stderr}"
+        return result.returncode == 0, (result.stderr or "") + (result.stdout or "")
+
+
+def _assert_expected_diagnostics(test_case: GCCTestCase, output: str) -> None:
+    """Validate that expected dg-error regexes are present in compiler output."""
+    expected_patterns = sorted({pattern for pattern in test_case.expected_error_patterns if pattern})
+    if not expected_patterns:
+        return
+
+    missing = []
+    for pattern in expected_patterns:
+        actual_count = len(list(re.finditer(pattern, output, re.MULTILINE)))
+        if actual_count < 1:
+            missing.append(f"{pattern!r} (expected at least 1 match, found 0)")
+
+    assert not missing, (
+        "Compilation failed, but expected diagnostics were missing:\n"
+        + "\n".join(missing)
+        + "\n\nCompiler output:\n"
+        + output
+    )
+
+
+def run_compile_test(test_case: GCCTestCase, opt_level: str, tmp_path: Path) -> None:
+    """Run a compile-only test, including expected-failure tests."""
+    success, output = _compile_test(test_case, opt_level, tmp_path)
+
+    if test_case.expected_compile_failure:
+        assert not success, "Compilation unexpectedly succeeded for expected-failure test"
+        _assert_expected_diagnostics(test_case, output)
+    else:
+        assert success, f"Compilation failed:\n{output}"
 
 
 def run_execute_test(test_case: GCCTestCase, opt_level: str, tmp_path: Path) -> None:

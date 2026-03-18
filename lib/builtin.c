@@ -1,10 +1,10 @@
 /* uses alias to allow building with gcc/clang */
 #ifdef __TINYC__
-#define	BUILTIN(x)	__builtin_##x
-#define	BUILTINN(x)	"__builtin_" # x
+#define BUILTIN(x) __builtin_##x
+#define BUILTINN(x) "__builtin_" #x
 #else
-#define	BUILTIN(x)	__tcc_builtin_##x
-#define	BUILTINN(x)	"__tcc_builtin_" # x
+#define BUILTIN(x) __tcc_builtin_##x
+#define BUILTINN(x) "__tcc_builtin_" #x
 #endif
 
 /* ---------------------------------------------- */
@@ -18,118 +18,148 @@
  * for int, long and long long
  */
 
-static const unsigned char table_1_32[] = {
-     0,  1, 28,  2, 29, 14, 24,  3, 30, 22, 20, 15, 25, 17,  4,  8, 
-    31, 27, 13, 23, 21, 19, 16,  7, 26, 12, 18,  6, 11,  5, 10,  9
-};
-static const unsigned char table_2_32[32] = {
-    31, 22, 30, 21, 18, 10, 29,  2, 20, 17, 15, 13,  9,  6, 28,  1,
-    23, 19, 11,  3, 16, 14,  7, 24, 12,  4,  8, 25,  5, 26, 27,  0
-};
-static const unsigned char table_1_64[] = {
-     0,  1,  2, 53,  3,  7, 54, 27,  4, 38, 41,  8, 34, 55, 48, 28,
-    62,  5, 39, 46, 44, 42, 22,  9, 24, 35, 59, 56, 49, 18, 29, 11,
-    63, 52,  6, 26, 37, 40, 33, 47, 61, 45, 43, 21, 23, 58, 17, 10,
-    51, 25, 36, 32, 60, 20, 57, 16, 50, 31, 19, 15, 30, 14, 13, 12
-};
-static const unsigned char table_2_64[] = {
-    63, 16, 62,  7, 15, 36, 61,  3,  6, 14, 22, 26, 35, 47, 60,  2,
-     9,  5, 28, 11, 13, 21, 42, 19, 25, 31, 34, 40, 46, 52, 59,  1,
-    17,  8, 37,  4, 23, 27, 48, 10, 29, 12, 43, 20, 32, 41, 53, 18,
-    38, 24, 49, 30, 44, 33, 54, 39, 50, 45, 55, 51, 56, 57, 58,  0
-};
+static const unsigned char table_1_32[] = {0,  1,  28, 2,  29, 14, 24, 3, 30, 22, 20, 15, 25, 17, 4,  8,
+                                           31, 27, 13, 23, 21, 19, 16, 7, 26, 12, 18, 6,  11, 5,  10, 9};
+static const unsigned char table_2_32[32] = {31, 22, 30, 21, 18, 10, 29, 2,  20, 17, 15, 13, 9, 6,  28, 1,
+                                             23, 19, 11, 3,  16, 14, 7,  24, 12, 4,  8,  25, 5, 26, 27, 0};
+static const unsigned char table_1_64[] = {0,  1,  2,  53, 3,  7,  54, 27, 4,  38, 41, 8,  34, 55, 48, 28,
+                                           62, 5,  39, 46, 44, 42, 22, 9,  24, 35, 59, 56, 49, 18, 29, 11,
+                                           63, 52, 6,  26, 37, 40, 33, 47, 61, 45, 43, 21, 23, 58, 17, 10,
+                                           51, 25, 36, 32, 60, 20, 57, 16, 50, 31, 19, 15, 30, 14, 13, 12};
+static const unsigned char table_2_64[] = {63, 16, 62, 7,  15, 36, 61, 3,  6,  14, 22, 26, 35, 47, 60, 2,
+                                           9,  5,  28, 11, 13, 21, 42, 19, 25, 31, 34, 40, 46, 52, 59, 1,
+                                           17, 8,  37, 4,  23, 27, 48, 10, 29, 12, 43, 20, 32, 41, 53, 18,
+                                           38, 24, 49, 30, 44, 33, 54, 39, 50, 45, 55, 51, 56, 57, 58, 0};
 
-#define FFSI(x) \
-    return table_1_32[((x & -x) * 0x077cb531u) >> 27] + (x != 0);
-#define FFSL(x) \
-    return table_1_64[((x & -x) * 0x022fdd63cc95386dull) >> 58] + (x != 0);
-#define CTZI(x) \
-    return table_1_32[((x & -x) * 0x077cb531u) >> 27];
-#define CTZL(x) \
-    return table_1_64[((x & -x) * 0x022fdd63cc95386dull) >> 58];
-#define CLZI(x)   \
-    x |= x >> 1;  \
-    x |= x >> 2;  \
-    x |= x >> 4;  \
-    x |= x >> 8;  \
-    x |= x >> 16; \
-    return table_2_32[(x * 0x07c4acddu) >> 27];
-#define CLZL(x)   \
-    x |= x >> 1;  \
-    x |= x >> 2;  \
-    x |= x >> 4;  \
-    x |= x >> 8;  \
-    x |= x >> 16; \
-    x |= x >> 32; \
-    return table_2_64[x * 0x03f79d71b4cb0a89ull >> 58];
-#define POPCOUNTI(x, m)                                                   \
-    x = x - ((x >> 1) & 0x55555555);                                      \
-    x = (x & 0x33333333) + ((x >> 2) & 0x33333333);                       \
-    x = (x + (x >> 4)) & 0xf0f0f0f;                                       \
-    return ((x * 0x01010101) >> 24) & m; 
-#define POPCOUNTL(x, m)                                                   \
-    x = x - ((x >> 1) & 0x5555555555555555ull);                           \
-    x = (x & 0x3333333333333333ull) + ((x >> 2) & 0x3333333333333333ull); \
-    x = (x + (x >> 4)) & 0xf0f0f0f0f0f0f0full;                            \
-    return ((x * 0x0101010101010101ull) >> 56) & m;
+#define FFSI(x) return table_1_32[((x & -x) * 0x077cb531u) >> 27] + (x != 0);
+#define FFSL(x) return table_1_64[((x & -x) * 0x022fdd63cc95386dull) >> 58] + (x != 0);
+#define CTZI(x) return table_1_32[((x & -x) * 0x077cb531u) >> 27];
+#define CTZL(x) return table_1_64[((x & -x) * 0x022fdd63cc95386dull) >> 58];
+#define CLZI(x)                                                                                                        \
+  x |= x >> 1;                                                                                                         \
+  x |= x >> 2;                                                                                                         \
+  x |= x >> 4;                                                                                                         \
+  x |= x >> 8;                                                                                                         \
+  x |= x >> 16;                                                                                                        \
+  return table_2_32[(x * 0x07c4acddu) >> 27];
+#define CLZL(x)                                                                                                        \
+  x |= x >> 1;                                                                                                         \
+  x |= x >> 2;                                                                                                         \
+  x |= x >> 4;                                                                                                         \
+  x |= x >> 8;                                                                                                         \
+  x |= x >> 16;                                                                                                        \
+  x |= x >> 32;                                                                                                        \
+  return table_2_64[x * 0x03f79d71b4cb0a89ull >> 58];
+#define POPCOUNTI(x, m)                                                                                                \
+  x = x - ((x >> 1) & 0x55555555);                                                                                     \
+  x = (x & 0x33333333) + ((x >> 2) & 0x33333333);                                                                      \
+  x = (x + (x >> 4)) & 0xf0f0f0f;                                                                                      \
+  return ((x * 0x01010101) >> 24) & m;
+#define POPCOUNTL(x, m)                                                                                                \
+  x = x - ((x >> 1) & 0x5555555555555555ull);                                                                          \
+  x = (x & 0x3333333333333333ull) + ((x >> 2) & 0x3333333333333333ull);                                                \
+  x = (x + (x >> 4)) & 0xf0f0f0f0f0f0f0full;                                                                           \
+  return ((x * 0x0101010101010101ull) >> 56) & m;
 
 /* Returns one plus the index of the least significant 1-bit of x,
    or if x is zero, returns zero. */
-int BUILTIN(ffs) (int x) { FFSI(x) }
-int BUILTIN(ffsll) (long long x) { FFSL(x) }
+int BUILTIN(ffs)(int x)
+{
+  FFSI(x)
+}
+int BUILTIN(ffsll)(long long x)
+{
+  FFSL(x)
+}
 #if __SIZEOF_LONG__ == 4
-int BUILTIN(ffsl) (long x) __attribute__((alias(BUILTINN(ffs))));
+int BUILTIN(ffsl)(long x) __attribute__((alias(BUILTINN(ffs))));
 #else
-int BUILTIN(ffsl) (long x) __attribute__((alias(BUILTINN(ffsll))));
+int BUILTIN(ffsl)(long x) __attribute__((alias(BUILTINN(ffsll))));
 #endif
 
 /* Returns the number of leading 0-bits in x, starting at the most significant
    bit position. If x is 0, the result is undefined.  */
-int BUILTIN(clz) (unsigned int x) { CLZI(x) }
-int BUILTIN(clzll) (unsigned long long x) { CLZL(x) }
+int BUILTIN(clz)(unsigned int x)
+{
+  CLZI(x)
+}
+int BUILTIN(clzll)(unsigned long long x)
+{
+  CLZL(x)
+}
 #if __SIZEOF_LONG__ == 4
-int BUILTIN(clzl) (unsigned long x) __attribute__((alias(BUILTINN(clz))));
+int BUILTIN(clzl)(unsigned long x) __attribute__((alias(BUILTINN(clz))));
 #else
-int BUILTIN(clzl) (unsigned long x) __attribute__((alias(BUILTINN(clzll))));
+int BUILTIN(clzl)(unsigned long x) __attribute__((alias(BUILTINN(clzll))));
 #endif
 
 /* Returns the number of trailing 0-bits in x, starting at the least
    significant bit position. If x is 0, the result is undefined. */
-int BUILTIN(ctz) (unsigned int x) { CTZI(x) }
-int BUILTIN(ctzll) (unsigned long long x) { CTZL(x) }
+int BUILTIN(ctz)(unsigned int x)
+{
+  CTZI(x)
+}
+int BUILTIN(ctzll)(unsigned long long x)
+{
+  CTZL(x)
+}
 #if __SIZEOF_LONG__ == 4
-int BUILTIN(ctzl) (unsigned long x) __attribute__((alias(BUILTINN(ctz))));
+int BUILTIN(ctzl)(unsigned long x) __attribute__((alias(BUILTINN(ctz))));
 #else
-int BUILTIN(ctzl) (unsigned long x) __attribute__((alias(BUILTINN(ctzll))));
+int BUILTIN(ctzl)(unsigned long x) __attribute__((alias(BUILTINN(ctzll))));
 #endif
 
 /* Returns the number of leading redundant sign bits in x, i.e. the number
    of bits following the most significant bit that are identical to it.
    There are no special cases for 0 or other values. */
-int BUILTIN(clrsb) (int x) { if (x < 0) x = ~x; x <<= 1; CLZI(x) }
-int BUILTIN(clrsbll) (long long x) { if (x < 0) x = ~x; x <<= 1; CLZL(x) }
+int BUILTIN(clrsb)(int x)
+{
+  if (x < 0)
+    x = ~x;
+  x <<= 1;
+  CLZI(x)
+}
+int BUILTIN(clrsbll)(long long x)
+{
+  if (x < 0)
+    x = ~x;
+  x <<= 1;
+  CLZL(x)
+}
 #if __SIZEOF_LONG__ == 4
-int BUILTIN(clrsbl) (long x) __attribute__((alias(BUILTINN(clrsb))));
+int BUILTIN(clrsbl)(long x) __attribute__((alias(BUILTINN(clrsb))));
 #else
-int BUILTIN(clrsbl) (long x) __attribute__((alias(BUILTINN(clrsbll))));
+int BUILTIN(clrsbl)(long x) __attribute__((alias(BUILTINN(clrsbll))));
 #endif
 
 /* Returns the number of 1-bits in x.*/
-int BUILTIN(popcount) (unsigned int x) { POPCOUNTI(x, 0x3f) }
-int BUILTIN(popcountll) (unsigned long long x) { POPCOUNTL(x, 0x7f) }
+int BUILTIN(popcount)(unsigned int x)
+{
+  POPCOUNTI(x, 0x3f)
+}
+int BUILTIN(popcountll)(unsigned long long x)
+{
+  POPCOUNTL(x, 0x7f)
+}
 #if __SIZEOF_LONG__ == 4
-int BUILTIN(popcountl) (unsigned long x) __attribute__((alias(BUILTINN(popcount))));
+int BUILTIN(popcountl)(unsigned long x) __attribute__((alias(BUILTINN(popcount))));
 #else
-int BUILTIN(popcountl ) (unsigned long x) __attribute__((alias(BUILTINN(popcountll))));
+int BUILTIN(popcountl)(unsigned long x) __attribute__((alias(BUILTINN(popcountll))));
 #endif
 
 /* Returns the parity of x, i.e. the number of 1-bits in x modulo 2. */
-int BUILTIN(parity) (unsigned int x) { POPCOUNTI(x, 0x01) }
-int BUILTIN(parityll) (unsigned long long x) { POPCOUNTL(x, 0x01) }
+int BUILTIN(parity)(unsigned int x)
+{
+  POPCOUNTI(x, 0x01)
+}
+int BUILTIN(parityll)(unsigned long long x)
+{
+  POPCOUNTL(x, 0x01)
+}
 #if __SIZEOF_LONG__ == 4
-int BUILTIN(parityl) (unsigned long x) __attribute__((alias(BUILTINN(parity))));
+int BUILTIN(parityl)(unsigned long x) __attribute__((alias(BUILTINN(parity))));
 #else
-int BUILTIN(parityl) (unsigned long x) __attribute__((alias(BUILTINN(parityll))));
+int BUILTIN(parityl)(unsigned long x) __attribute__((alias(BUILTINN(parityll))));
 #endif
 
 #ifndef __TINYC__
@@ -164,40 +194,61 @@ int __builtin_parityll(unsigned long long x) __attribute__((alias("__tcc_builtin
 #endif
 
 /* ---------------------------------------------- */
+/* Unsigned absolute-value helpers used by the compiler for 64-bit lowering. */
+
+unsigned long long __tcc_ullabsu(long long x)
+{
+  return x < 0 ? -(unsigned long long)x : (unsigned long long)x;
+}
+
+unsigned long long __tcc_umaxabsu(long long x)
+{
+  return x < 0 ? -(unsigned long long)x : (unsigned long long)x;
+}
+
+/* ---------------------------------------------- */
 /* Byte swap builtins: __builtin_bswap16, __builtin_bswap32, __builtin_bswap64 */
 
 static inline unsigned short bswap16_impl(unsigned short x)
 {
-    return ((x & 0x00FF) << 8) | ((x & 0xFF00) >> 8);
+  return ((x & 0x00FF) << 8) | ((x & 0xFF00) >> 8);
 }
 
 static inline unsigned int bswap32_impl(unsigned int x)
 {
-    return ((x & 0x000000FFU) << 24) |
-           ((x & 0x0000FF00U) << 8) |
-           ((x & 0x00FF0000U) >> 8) |
-           ((x & 0xFF000000U) >> 24);
+  return ((x & 0x000000FFU) << 24) | ((x & 0x0000FF00U) << 8) | ((x & 0x00FF0000U) >> 8) | ((x & 0xFF000000U) >> 24);
 }
 
 static inline unsigned long long bswap64_impl(unsigned long long x)
 {
-    return ((x & 0x00000000000000FFULL) << 56) |
-           ((x & 0x000000000000FF00ULL) << 40) |
-           ((x & 0x0000000000FF0000ULL) << 24) |
-           ((x & 0x00000000FF000000ULL) << 8) |
-           ((x & 0x000000FF00000000ULL) >> 8) |
-           ((x & 0x0000FF0000000000ULL) >> 24) |
-           ((x & 0x00FF000000000000ULL) >> 40) |
-           ((x & 0xFF00000000000000ULL) >> 56);
+  return ((x & 0x00000000000000FFULL) << 56) | ((x & 0x000000000000FF00ULL) << 40) |
+         ((x & 0x0000000000FF0000ULL) << 24) | ((x & 0x00000000FF000000ULL) << 8) | ((x & 0x000000FF00000000ULL) >> 8) |
+         ((x & 0x0000FF0000000000ULL) >> 24) | ((x & 0x00FF000000000000ULL) >> 40) |
+         ((x & 0xFF00000000000000ULL) >> 56);
 }
 
-unsigned short BUILTIN(bswap16)(unsigned short x) { return bswap16_impl(x); }
-unsigned int BUILTIN(bswap32)(unsigned int x) { return bswap32_impl(x); }
-unsigned long long BUILTIN(bswap64)(unsigned long long x) { return bswap64_impl(x); }
+unsigned short BUILTIN(bswap16)(unsigned short x)
+{
+  return bswap16_impl(x);
+}
+unsigned int BUILTIN(bswap32)(unsigned int x)
+{
+  return bswap32_impl(x);
+}
+unsigned long long BUILTIN(bswap64)(unsigned long long x)
+{
+  return bswap64_impl(x);
+}
 
 /* Runtime library functions for 64-bit byte swap (used by compiler) */
-unsigned long long __bswapdi3(unsigned long long x) { return bswap64_impl(x); }
-unsigned int __bswapsi2(unsigned int x) { return bswap32_impl(x); }
+unsigned long long __bswapdi3(unsigned long long x)
+{
+  return bswap64_impl(x);
+}
+unsigned int __bswapsi2(unsigned int x)
+{
+  return bswap32_impl(x);
+}
 
 #ifndef __TINYC__
 unsigned short __builtin_bswap16(unsigned short x) __attribute__((alias("__tcc_builtin_bswap16")));

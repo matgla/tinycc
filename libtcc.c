@@ -1932,6 +1932,27 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
       ++noaction;
       break;
     case TCC_OPTION_f:
+      /* Handle -fno-builtin-<name> flags */
+      if (!strncmp(optarg, "no-builtin-", 11))
+      {
+        const char *bname = optarg + 11;
+        if (!strcmp(bname, "abs"))
+          s->no_builtin_funcs |= NO_BUILTIN_ABS;
+        else if (!strcmp(bname, "labs"))
+          s->no_builtin_funcs |= NO_BUILTIN_LABS;
+        else if (!strcmp(bname, "llabs"))
+          s->no_builtin_funcs |= NO_BUILTIN_LLABS;
+        else if (!strcmp(bname, "uabs"))
+          s->no_builtin_funcs |= NO_BUILTIN_UABS;
+        else if (!strcmp(bname, "ulabs"))
+          s->no_builtin_funcs |= NO_BUILTIN_ULABS;
+        else if (!strcmp(bname, "ullabs"))
+          s->no_builtin_funcs |= NO_BUILTIN_ULLABS;
+        else if (!strcmp(bname, "umaxabs"))
+          s->no_builtin_funcs |= NO_BUILTIN_UMAXABS;
+        /* Silently accept other -fno-builtin-<name> flags */
+        break;
+      }
       if (set_flag(s, options_f, optarg) < 0)
         goto unsupported_option;
       break;
@@ -2122,7 +2143,7 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
         s->opt_iv_strength_red = 1; /* IV strength reduction for array loops */
         s->opt_nonneg_fold = 1;     /* Non-negative value branch folding */
         s->opt_vrp = 1;             /* Value range propagation branch folding */
-        s->opt_float_narrow = 1;   /* Narrow double math to float when safe */
+        s->opt_float_narrow = 1;    /* Narrow double math to float when safe */
         s->opt_jump_threading = 1;  /* Jump threading optimization */
       }
       break;

@@ -6,6 +6,8 @@ This module provides test discovery and configuration for GCC torture tests.
 
 import pytest
 import os
+import re
+import shlex
 import sys
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -43,32 +45,7 @@ OPT_LEVELS = ["-O0", "-O1"]
 # to disambiguate tests with the same name in different directories.
 GCC_XFAIL_TESTS = {
     # builtins/ tests — builtin override tests requiring lib/main.c framework
-    "builtins/abs-1",       # needs constant-folding of labs(0) at -O0
-    "builtins/complex-1",   # complex conjugate not implemented
-    "builtins/memops-asm",  # struct copy emits memcpy call to abort-wrapper
-    "builtins/strncmp",     # custom strncmp has UB when n=0 (uninitialized vars)
-    "builtins/uabs-1",     # needs constant-folding of ulabs(0) at -O0
     # compile/ tests — compilation failures (parser, type system, unsupported features)
-    "compile/20000120-2",
-    "compile/20001222-1",
-    "compile/20010605-1",
-    "compile/20010605-2",
-    "compile/20010714-1",
-    "compile/20011106-1",
-    "compile/20011119-2",
-    "compile/20011219-1",
-    "compile/20020210-1",
-    "compile/20020330-1",
-    "compile/20021120-1",
-    "compile/20021120-2",
-    "compile/20030305-1",
-    "compile/20031023-4",
-    "compile/20050215-1",
-    "compile/20050215-2",
-    "compile/20050215-3",
-    "compile/920520-1",
-    "compile/920521-1",
-    "compile/930525-1",
     "compile/950919-1",
     "compile/asmgoto-2",
     "compile/asmgoto-3",
@@ -139,6 +116,7 @@ GCC_XFAIL_O1_TESTS = {
     # builtins/ tests — TCC doesn't constant-fold builtin calls at -O1, so the
     # custom override functions (which abort when __OPTIMIZE__ && inside_main)
     # get called instead of being optimized away.
+    "builtins/strncmp",
     "builtins/abs-2",
     "builtins/abs-3",
     "builtins/fprintf",
@@ -198,6 +176,9 @@ GCC_SKIP_TESTS = {
     "pr23135", # __uint128 - not supported
     "pr93213", # __uint128 - not supported
     "pr84748", # __int128 - not supported
+    "compile/20050215-1", # test infrastructure: compile-only test with no main(), current harness links and fails
+    "compile/920520-1", # ARM GCC also rejects operand-only inline asm after %0 substitution (bad instruction 'rN')
+    "compile/920521-1", # ARM GCC also rejects bare literal inline asm templates ('f' / 'g')
     # execute/ tests — require mmap (not available on bare-metal ARM)
     "loop-2f", # requires mmap, includes <sys/mman.h>
     "loop-2g", # requires mmap, includes <sys/mman.h>
@@ -229,6 +210,8 @@ class GCCTestCase:
     xfail_reason: Optional[str] = None
     dg_options: str = ""  # Extra flags from /* { dg-options "..." } */
     extra_sources: List[Path] = field(default_factory=list)  # Additional source files (e.g., builtins lib files)
+    expected_compile_failure: bool = False
+    expected_error_patterns: List[str] = field(default_factory=list)
 
 
 # Compiler flags from dg-options that TCC supports
@@ -241,25 +224,101 @@ TCC_SUPPORTED_DG_FLAGS = {
     "-finstrument-functions",
 }
 
+# Prefix patterns for dg-options flags that TCC supports (matched with startswith)
+TCC_SUPPORTED_DG_FLAG_PREFIXES = (
+    "-fno-builtin-",
+)
+
+# Per-test flag overrides for cases where GCC torture semantics depend on
+# specific dg-options and we want that behavior applied unconditionally.
+GCC_TEST_FLAG_OVERRIDES = {
+    "compile/20021120-1": "-fgnu89-inline",
+    "compile/20021120-2": "-fgnu89-inline",
+    "compile/20021120-3": "-fgnu89-inline",
+}
+
+
+def _is_supported_dg_flag(flag: str) -> bool:
+    """Check if a dg-options flag is supported by TCC."""
+    if flag in TCC_SUPPORTED_DG_FLAGS:
+        return True
+    return any(flag.startswith(p) for p in TCC_SUPPORTED_DG_FLAG_PREFIXES)
+
+
+def parse_x_file(test_path: Path) -> str:
+    """Parse a .x companion file for additional compiler flags.
+
+    GCC torture tests use .x files (Tcl scripts) to specify extra flags:
+        set additional_flags -fno-builtin-abs
+    Returns supported flags as a space-separated string.
+    """
+    import re
+    x_file = test_path.with_suffix('.x')
+    if not x_file.exists():
+        return ""
+    try:
+        content = x_file.read_text()
+        m = re.search(r'set\s+additional_flags\s+(.*)', content)
+        if m:
+            raw_flags = m.group(1).strip()
+            try:
+                all_flags = shlex.split(raw_flags)
+            except ValueError:
+                all_flags = raw_flags.split()
+            supported = [f for f in all_flags if _is_supported_dg_flag(f)]
+            return " ".join(supported)
+    except:
+        pass
+    return ""
+
 
 def parse_dg_options(test_path: Path) -> str:
-    """Parse dg-options from a GCC torture test file.
+    """Parse dg-options from a GCC torture test file and its .x companion.
 
-    Extracts flags from: /* { dg-options "flags" } */
+    Extracts flags from: /* { dg-options "flags" } */ in the .c file,
+    and from 'set additional_flags ...' in a companion .x file.
     Only returns flags that TCC supports.
     """
     import re
+    flags = []
     try:
         with open(test_path, 'r') as f:
             content = f.read(4096)
         m = re.search(r'dg-options\s+"([^"]+)"', content)
         if m:
             all_flags = m.group(1).split()
-            supported = [f for f in all_flags if f in TCC_SUPPORTED_DG_FLAGS]
-            return " ".join(supported)
+            flags.extend(f for f in all_flags if _is_supported_dg_flag(f))
     except:
         pass
-    return ""
+    # Also parse companion .x file for additional_flags
+    x_flags = parse_x_file(test_path)
+    if x_flags:
+        flags.extend(x_flags.split())
+
+    override_flags = GCC_TEST_FLAG_OVERRIDES.get(_test_key(test_path), "")
+    if override_flags:
+        for flag in override_flags.split():
+            if flag not in flags:
+                flags.append(flag)
+
+    return " ".join(flags)
+
+
+def parse_dg_errors(test_path: Path) -> List[str]:
+    """Parse dg-error directives from a GCC torture test file.
+
+    Returns the regex patterns from comments like:
+        /* { dg-error "pattern" } */
+
+    Empty patterns are preserved to indicate a compile-fail expectation even
+    when the test doesn't care about the exact diagnostic text.
+    """
+    try:
+        content = test_path.read_text()
+    except OSError:
+        return []
+
+    return [m.group(1) for m in re.finditer(r'dg-error\s+"([^"]*)"', content)]
 
 
 def should_skip_gcc_test(test_path: Path) -> Optional[str]:
@@ -366,11 +425,15 @@ def discover_gcc_compile_tests() -> List[GCCTestCase]:
     compile_dir = GCC_TORTURE_PATH / "compile"
     if compile_dir.exists():
         for c_file in sorted(compile_dir.glob("*.c")):
+            dg_errors = parse_dg_errors(c_file)
             tests.append(GCCTestCase(
                 source=c_file,
                 category="gcc_compile",
                 timeout=30,
-                dg_options=parse_dg_options(c_file)
+                dg_options=parse_dg_options(c_file),
+                expected_compile_failure=bool(dg_errors),
+                expected_error_patterns=dg_errors,
+                expected_exit_code=1 if dg_errors else 0,
             ))
 
     return tests

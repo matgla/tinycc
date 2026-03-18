@@ -387,6 +387,58 @@ IROperand svalue_to_iroperand(TCCIRState *ir, const SValue *sv)
     goto done;
   }
 
+  /* Case 3b: Complex constant — pack full value before scalar float/double cases.
+   * Complex float (VT_FLOAT + VT_COMPLEX): 64-bit packed {real_u32, imag_u32} in CValue.i.
+   * Complex double/ldouble (VT_DOUBLE/VT_LDOUBLE + VT_COMPLEX): 128-bit packed
+   *   {real_f64, imag_f64} in CValue bytes [0:15].  We store each half in two
+   *   I64 pool slots and link them together via the primary pool entry.
+   *
+   * For float complex: stored as single I64 pool entry.
+   * For double complex: stored as I64 for the real part; the imag part is
+   *   materialized at the use site (callsite/vstore) from the second pool entry.
+   *   TODO: for now, complex double constants should already be materialized to
+   *   a stack local before reaching function calls (tccgen.c handles this). */
+  if (is_complex && val_kind == VT_CONST && is_float(vt_btype))
+  {
+    if (vt_btype == VT_FLOAT)
+    {
+      /* Float complex: the two 32-bit floats are packed into CValue.i */
+      uint64_t packed = (uint64_t)sv->c.i;
+      uint32_t idx = tcc_ir_pool_add_i64(ir, (int64_t)packed);
+      result = irop_make_i64(vr, idx, irop_bt);
+      result.is_lval = is_lval;
+      irop_copy_svalue_info(&result, sv);
+      goto done;
+    }
+    /* Double/LDouble complex: 128-bit value.
+     * The real part is in bytes [0:7], imaginary in [8:15].
+     * Store the full 128-bit value as two I64 pool entries.
+     * We use the real part as the primary pooled value and store
+     * the imaginary part in a second pool entry whose index is
+     * communicated via the linked-pair convention. */
+    {
+      double real_d, imag_d;
+      memcpy(&real_d, &sv->c, 8);
+      memcpy(&imag_d, (char *)&sv->c + 8, 8);
+      union
+      {
+        double d;
+        uint64_t bits;
+      } ur, ui;
+      ur.d = real_d;
+      ui.d = imag_d;
+      /* Store both halves: primary = real, secondary = imag.
+       * The caller (callsite / conjugate / etc.) will retrieve both
+       * via irop_get_imm64_ex on the primary, and the secondary is at idx+1. */
+      uint32_t idx_real = tcc_ir_pool_add_f64(ir, ur.bits);
+      tcc_ir_pool_add_f64(ir, ui.bits); /* idx_real + 1 */
+      result = irop_make_f64(vr, idx_real);
+      result.is_lval = is_lval;
+      irop_copy_svalue_info(&result, sv);
+      goto done;
+    }
+  }
+
   /* Case 4: Float constant - inline F32 */
   if (vt_btype == VT_FLOAT && val_kind == VT_CONST)
   {
@@ -882,6 +934,24 @@ int irop_type_size_align(IROperand op, int *align_out)
  * Returns the natural alignment (minimum 1). */
 static int compute_aapcs_member_alignment(CType *ct);
 
+static int is_plausible_sym_ptr(const Sym *s)
+{
+  uintptr_t p = (uintptr_t)s;
+
+  if (!p)
+    return 0;
+  if (p & (sizeof(void *) - 1))
+    return 0;
+#if UINTPTR_MAX > 0xffffffffU
+  /* User-space pointers on supported hosts should stay in the canonical
+   * lower address range.  Garbage-packed values seen from stale CType refs
+   * in old-style struct-by-value calls trip this check. */
+  if (p >= (1ULL << 47))
+    return 0;
+#endif
+  return 1;
+}
+
 int ctype_aapcs_alignment(CType *ct)
 {
   return compute_aapcs_member_alignment(ct);
@@ -901,12 +971,18 @@ static int compute_aapcs_member_alignment(CType *ct)
   }
   /* Walk struct/union members and find max alignment recursively */
   Sym *s = ct->ref;
-  if (!s)
+  if (!is_plausible_sym_ptr(s))
     return 4;
   int max_align = 1;
-  for (Sym *f = s->next; f; f = f->next)
+  for (Sym *f = s->next; f;)
   {
     int member_align;
+    Sym *next = NULL;
+
+    if (!is_plausible_sym_ptr(f))
+      return 4;
+
+    next = is_plausible_sym_ptr(f->next) ? f->next : NULL;
     if ((f->type.t & VT_BTYPE) == VT_STRUCT)
     {
       /* Recurse into nested structs */
@@ -929,6 +1005,7 @@ static int compute_aapcs_member_alignment(CType *ct)
       member_align = 1;
     if (member_align > max_align)
       max_align = member_align;
+    f = next;
   }
   return max_align;
 }

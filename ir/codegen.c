@@ -738,6 +738,11 @@ void tcc_ir_codegen_bb_start(TCCIRState *ir)
 
 void tcc_ir_codegen_drop_return(TCCIRState *ir)
 {
+  if (!ir)
+  {
+    return;
+  }
+
   if (ir->next_instruction_index == 0)
   {
     return;
@@ -853,6 +858,19 @@ static void tcc_ir_codegen_inline_asm_by_id(TCCIRState *ir, int id)
             reserved_regs[phys_reg1] = 1;
         }
       }
+    }
+
+    /* Asm operands themselves are allowed to reuse their currently assigned
+     * physical registers.  Only non-operand live values need to remain
+     * reserved from the constraint solver.  Without this, an inline asm that
+     * already has several live register operands can spuriously run out of
+     * allocatable "r" registers in IR mode. */
+    for (int i = 0; i < nb_operands; ++i)
+    {
+      if (!vals[i].pr0_spilled && vals[i].pr0_reg != PREG_REG_NONE && vals[i].pr0_reg < NB_ASM_REGS)
+        reserved_regs[vals[i].pr0_reg] = 0;
+      if (!vals[i].pr1_spilled && vals[i].pr1_reg != PREG_REG_NONE && vals[i].pr1_reg < NB_ASM_REGS)
+        reserved_regs[vals[i].pr1_reg] = 0;
     }
   }
 

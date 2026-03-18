@@ -103,6 +103,7 @@ TEST_FILES = [
     ("102_pure_func_strcmp.c", 0),
     ("103_pure_func_multiple.c", 0),
     ("104_pure_func_variant.c", 0),
+    ("105_builtin_strncmp_zero_count.c", 0),
 
     # Single-precision float tests
     ("72_float_result.c", 1),  # Returns 1 on success (non-standard convention)
@@ -154,8 +155,23 @@ TEST_FILES = [
     # const char *const global pointer access (YAFF exported symbol section fix)
     ("bug_const_ptr_got_deref.c", 0),
 
+    # union self-cast through typedef should not take the scalar-to-union extension path
+    ("bug_union_self_cast_typedef.c", 0),
+
+    # inline asm operands may reuse their own live registers in IR mode
+    ("bug_inline_asm_reserved_regs.c", 0),
+
     # mul clobbers base register during struct array indexing (non-power-of-2 element size)
     ("bug_struct_array_index_mul_clobber.c", 0),
+
+    # GNU attributes may prefix a declarator after a comma in a declaration list
+    ("bug_decl_attr_after_comma.c", 0),
+
+    # `__attribute__((alias(...)))` supports direct, asm-label, and forward targets
+    ("bug_alias_attribute.c", 0),
+
+    # comma expressions in sizeof must safely drop unused results without IR
+    ("bug_sizeof_comma_func_decay.c", 0),
 
     ("../tests2/00_assignment.c", 0),
     ("../tests2/01_comment.c", 0),
@@ -302,6 +318,7 @@ TEST_FILES = [
     ("nested_multi_level.c", 0),
 
     # Complex number tests
+    ("test_complex_fold.c", 0),
     ("test_complex_init.c", 0),
     ("test_complex_mul.c", 0),
     ("test_complex_simple.c", 0),
@@ -826,6 +843,41 @@ def test_function_sections_bugs(test_file, expected_exit_code, opt_level, tmp_pa
         pytest.fail("test_file is None")
 
     cflags = f"{opt_level} -ffunction-sections"
+    _run_qemu_test(test_file, expected_exit_code, opt_level=cflags, output_dir=tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Tests requiring -fgnu89-inline
+# ---------------------------------------------------------------------------
+
+GNU89_INLINE_TEST_FILES = [
+    # Regression: inline asm inside an `extern inline` function must still be
+    # parsed, emitted, and callable when GNU89 inline semantics rewrite it to a
+    # local out-of-line definition.
+    ("bug_gnu89_inline_asm.c", 0),
+]
+
+
+def _generate_gnu89_inline_params():
+    params = []
+    ids = []
+    for test_file, expected in GNU89_INLINE_TEST_FILES:
+        for opt in OPT_LEVELS:
+            params.append((test_file, expected, opt))
+            ids.append(f"{_test_id(test_file)}{opt}")
+    return params, ids
+
+
+_GNU89_INLINE_PARAMS, _GNU89_INLINE_IDS = _generate_gnu89_inline_params() if GNU89_INLINE_TEST_FILES else ([], [])
+
+
+@pytest.mark.parametrize("test_file,expected_exit_code,opt_level", _GNU89_INLINE_PARAMS, ids=_GNU89_INLINE_IDS)
+def test_gnu89_inline_bugs(test_file, expected_exit_code, opt_level, tmp_path):
+    """Tests compiled with -fgnu89-inline to exercise GNU89 extern-inline semantics."""
+    if test_file is None:
+        pytest.fail("test_file is None")
+
+    cflags = f"{opt_level} -fgnu89-inline"
     _run_qemu_test(test_file, expected_exit_code, opt_level=cflags, output_dir=tmp_path)
 
 

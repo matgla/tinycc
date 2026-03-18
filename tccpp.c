@@ -1766,7 +1766,8 @@ static int parse_include(TCCState *s1, int do_next, int test)
 /* eval an expression for #if/#elif */
 static int expr_preprocess(TCCState *s1)
 {
-  int c, t;
+  int t;
+  int64_t c;
   int t0 = tok;
   TokenString *str;
 
@@ -1835,7 +1836,7 @@ static int expr_preprocess(TCCState *s1)
   /* now evaluate C constant expression */
   begin_macro(str, 1);
   next();
-  c = expr_const();
+  c = expr_const64();
   if (tok != TOK_EOF)
     tcc_error("...");
   pp_expr = 0;
@@ -3114,15 +3115,26 @@ static void parse_number(const char *p)
     if (ov)
       tcc_warning("integer constant overflow");
 
-    tok = TOK_CINT;
-    if (lcount)
+    if (pp_expr)
     {
-      tok = TOK_CLONG;
-      if (lcount == 2)
-        tok = TOK_CLLONG;
+      /* C preprocessor integer arithmetic uses intmax_t / uintmax_t
+         semantics, not the target's narrower int/long widths.  Keep
+         only signedness from the suffix and evaluate everything as
+         64-bit signed/unsigned integers. */
+      tok = ucount ? TOK_CULLONG : TOK_CLLONG;
     }
-    if (ucount)
-      ++tok; /* TOK_CU... */
+    else
+    {
+      tok = TOK_CINT;
+      if (lcount)
+      {
+        tok = TOK_CLONG;
+        if (lcount == 2)
+          tok = TOK_CLLONG;
+      }
+      if (ucount)
+        ++tok; /* TOK_CU... */
+    }
     tokc.i = n;
 
     /* GNU imaginary suffix: i, I, j, J on integer constants */

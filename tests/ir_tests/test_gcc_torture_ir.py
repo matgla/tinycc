@@ -13,6 +13,7 @@ Compile tests only verify successful compilation (no linking/execution).
 """
 
 import pytest
+import re
 import subprocess
 import sys
 import time
@@ -247,19 +248,39 @@ def test_gcc_compile_ir(test_case, opt_level, tmp_path):
         f"-I{libc_imports}",
         f"-I{newlib_includes}",
         f"-I{project_root / 'include'}",
-        "-c", str(test_case.source),
-        "-o", str(output_obj),
         opt_level,
     ]
     if test_case.dg_options:
         cmd.extend(test_case.dg_options.split())
+    cmd.extend([
+        "-c", str(test_case.source),
+        "-o", str(output_obj),
+    ])
 
     try:
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=test_case.timeout)
     except subprocess.TimeoutExpired:
         pytest.fail(f"Compilation timed out after {test_case.timeout}s")
-    stderr = result.stderr.decode(errors="replace").strip()
-    assert result.returncode == 0, f"Compilation failed (exit {result.returncode}):\n{stderr}"
+    output = ((result.stderr.decode(errors="replace") if result.stderr else "")
+              + (result.stdout.decode(errors="replace") if result.stdout else "")).strip()
+
+    if getattr(test_case, "expected_compile_failure", False):
+        assert result.returncode != 0, "Compilation unexpectedly succeeded for expected-failure test"
+
+        expected_patterns = sorted({p for p in getattr(test_case, "expected_error_patterns", []) if p})
+        missing = []
+        for pattern in expected_patterns:
+            if not re.search(pattern, output, re.MULTILINE):
+                missing.append(pattern)
+
+        assert not missing, (
+            "Compilation failed, but expected diagnostics were missing:\n"
+            + "\n".join(repr(p) for p in missing)
+            + "\n\nCompiler output:\n"
+            + output
+        )
+    else:
+        assert result.returncode == 0, f"Compilation failed (exit {result.returncode}):\n{output}"
 
 
 # Placeholder when compile tests not available
@@ -270,3 +291,46 @@ if not GCC_COMPILE_TESTS:
     def test_gcc_compile_ir__no_tests():
         """Placeholder when GCC compile tests are not available."""
         pass
+
+
+@pytest.mark.gcc_torture
+@pytest.mark.gcc_compile
+@pytest.mark.skipif(not GCC_TORTURE_PATH.exists(), reason="GCC torture tests not found")
+@pytest.mark.parametrize(
+    "source_name,extra_args,expected_pattern,output_name",
+    [
+        (
+            "20050215-2.c",
+            [],
+            r"redefinition of ['‘`]?f2['’`]?",
+            "20050215-2.o",
+        ),
+        (
+            "920520-1.c",
+            ["-std=gnu89"],
+            r"known instruction expected",
+            "920520-1.o",
+        ),
+    ],
+    ids=["20050215-2", "920520-1"],
+)
+def test_gcc_compile_ir_reports_known_diagnostics(tmp_path, source_name, extra_args, expected_pattern, output_name):
+    """Verify selected failing GCC compile tests report stable diagnostics."""
+    compiler = CURRENT_DIR / "../../armv8m-tcc"
+    source = GCC_TORTURE_PATH / "compile" / source_name
+    output_obj = tmp_path / output_name
+
+    result = subprocess.run(
+        [str(compiler), *extra_args, "-c", str(source), "-o", str(output_obj)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+    )
+
+    output = ((result.stderr.decode(errors="replace") if result.stderr else "")
+              + (result.stdout.decode(errors="replace") if result.stdout else "")).strip()
+
+    assert result.returncode != 0, "Compilation unexpectedly succeeded"
+    assert re.search(expected_pattern, output, re.MULTILINE), (
+        "Expected diagnostic was missing:\n\n" + output
+    )

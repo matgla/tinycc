@@ -61,7 +61,17 @@ static int nb_sym_pools;
 
 static Sym *all_cleanups, *pending_gotos;
 static int local_scope;
+static int func_param_decl_depth;
 ST_DATA char debug_modes;
+
+typedef struct PendingAliasDef
+{
+  Sym *alias_sym;
+  int target_tok;
+} PendingAliasDef;
+
+static PendingAliasDef *pending_aliases;
+static int nb_pending_aliases;
 
 /* Pending label-difference symbols for &&lab1 - &&lab0 in static initializers.
    Set in gen_opic, consumed in init_putv. */
@@ -106,7 +116,8 @@ ST_DATA int func_var;    /* true if current function is variadic (used by return
 ST_DATA int func_vc;
 ST_DATA int func_ind;
 ST_DATA const char *funcname;
-ST_DATA CType int_type, func_old_type, char_type, char_pointer_type;
+ST_DATA CType int_type, func_old_type, func_old_void_type, func_old_char_pointer_type, func_old_void_pointer_type,
+    func_old_size_t_type, char_type, char_pointer_type;
 static CString initstr;
 
 #if PTR_SIZE == 4
@@ -351,7 +362,7 @@ static int decl(int l);
 static void expr_eq(void);
 static void vpush_type_size(CType *type, int *a);
 static int is_compatible_unqualified_types(CType *type1, CType *type2);
-static inline int64_t expr_const64(void);
+ST_FUNC int64_t expr_const64(void);
 static void vpush64(int ty, unsigned long long v);
 static void vpush(CType *type);
 static void gen_inline_functions(TCCState *s);
@@ -359,6 +370,8 @@ static void free_inline_functions(TCCState *s);
 static void skip_or_save_block(TokenString **str);
 static void gv_dup(void);
 static int get_temp_local_var(int size, int align, int *vr_out);
+static void resolve_pending_aliases(void);
+static void apply_alias_attribute(Sym *alias_sym, int target_tok);
 static void cast_error(CType *st, CType *dt);
 static void end_switch(void);
 static void do_Static_assert(void);
@@ -535,6 +548,8 @@ void dbg_print_vstack(const char *msg, const char *file, int line) {
 /* initialize vstack and types.  This must be done also for tcc -E */
 ST_FUNC void tccgen_init(TCCState *s1)
 {
+  CType size_t_type, void_type, void_pointer_type;
+
   vtop = vstack - 1;
   memset(vtop, 0, sizeof *vtop);
 
@@ -547,10 +562,39 @@ ST_FUNC void tccgen_init(TCCState *s1)
   char_pointer_type = char_type;
   mk_pointer(&char_pointer_type);
 
+  size_t_type.t = VT_SIZE_T;
+  size_t_type.ref = NULL;
+
+  void_type.t = VT_VOID;
+  void_type.ref = NULL;
+
+  void_pointer_type = void_type;
+  mk_pointer(&void_pointer_type);
+
   func_old_type.t = VT_FUNC;
   func_old_type.ref = sym_push(SYM_FIELD, &int_type, 0, 0);
   func_old_type.ref->f.func_call = FUNC_CDECL;
   func_old_type.ref->f.func_type = FUNC_OLD;
+
+  func_old_void_type.t = VT_FUNC;
+  func_old_void_type.ref = sym_push(SYM_FIELD, &void_type, 0, 0);
+  func_old_void_type.ref->f.func_call = FUNC_CDECL;
+  func_old_void_type.ref->f.func_type = FUNC_OLD;
+
+  func_old_char_pointer_type.t = VT_FUNC;
+  func_old_char_pointer_type.ref = sym_push(SYM_FIELD, &char_pointer_type, 0, 0);
+  func_old_char_pointer_type.ref->f.func_call = FUNC_CDECL;
+  func_old_char_pointer_type.ref->f.func_type = FUNC_OLD;
+
+  func_old_void_pointer_type.t = VT_FUNC;
+  func_old_void_pointer_type.ref = sym_push(SYM_FIELD, &void_pointer_type, 0, 0);
+  func_old_void_pointer_type.ref->f.func_call = FUNC_CDECL;
+  func_old_void_pointer_type.ref->f.func_type = FUNC_OLD;
+
+  func_old_size_t_type.t = VT_FUNC;
+  func_old_size_t_type.ref = sym_push(SYM_FIELD, &size_t_type, 0, 0);
+  func_old_size_t_type.ref->f.func_call = FUNC_CDECL;
+  func_old_size_t_type.ref->f.func_type = FUNC_OLD;
 #ifdef precedence_parser
   init_prec();
 #endif
@@ -562,6 +606,8 @@ ST_FUNC int tccgen_compile(TCCState *s1)
   funcname = "";
   func_ind = -1;
   anon_sym = SYM_FIRST_ANOM;
+  pending_aliases = NULL;
+  nb_pending_aliases = 0;
   nocode_wanted = DATA_ONLY_WANTED; /* no code outside of functions */
   debug_modes = (s1->do_debug ? 1 : 0) | s1->test_coverage << 1;
 
@@ -577,6 +623,7 @@ ST_FUNC int tccgen_compile(TCCState *s1)
   next();
   decl(VT_CONST);
   gen_inline_functions(s1);
+  resolve_pending_aliases();
   check_vstack();
   /* end of translation unit info */
 #if TCC_EH_FRAME
@@ -590,6 +637,10 @@ ST_FUNC int tccgen_compile(TCCState *s1)
 ST_FUNC void tccgen_finish(TCCState *s1)
 {
   tcc_debug_end(s1); /* just in case of errors: free memory */
+
+  tcc_free(pending_aliases);
+  pending_aliases = NULL;
+  nb_pending_aliases = 0;
 
   /* If compilation aborted while generating a function, the per-function IR
      block allocated in gen_function() may not have been released (because we
@@ -1387,6 +1438,145 @@ static int try_fold_math_call(const char *func_name, SValue *args, int nb_args)
   return 1;
 }
 
+/* Constant-fold complex-number library calls: conj{f,,l}, creal{f,,l}, cimag{f,,l}.
+ * Returns 1 if folded (result pushed onto vstack), 0 otherwise. */
+static int try_fold_complex_call(const char *func_name, SValue *args, int nb_args)
+{
+  if (nb_args != 1)
+    return 0;
+
+  /* Determine operation and type variant */
+  enum
+  {
+    CFOLD_CONJ,
+    CFOLD_CREAL,
+    CFOLD_CIMAG
+  } op;
+  int bt; /* base type: VT_FLOAT, VT_DOUBLE, or VT_LDOUBLE */
+
+  if (strcmp(func_name, "conjf") == 0 || strcmp(func_name, "__builtin_conjf") == 0)
+  {
+    op = CFOLD_CONJ;
+    bt = VT_FLOAT;
+  }
+  else if (strcmp(func_name, "conj") == 0 || strcmp(func_name, "__builtin_conj") == 0)
+  {
+    op = CFOLD_CONJ;
+    bt = VT_DOUBLE;
+  }
+  else if (strcmp(func_name, "conjl") == 0 || strcmp(func_name, "__builtin_conjl") == 0)
+  {
+    op = CFOLD_CONJ;
+    bt = VT_LDOUBLE;
+  }
+  else if (strcmp(func_name, "crealf") == 0 || strcmp(func_name, "__builtin_crealf") == 0)
+  {
+    op = CFOLD_CREAL;
+    bt = VT_FLOAT;
+  }
+  else if (strcmp(func_name, "creal") == 0 || strcmp(func_name, "__builtin_creal") == 0)
+  {
+    op = CFOLD_CREAL;
+    bt = VT_DOUBLE;
+  }
+  else if (strcmp(func_name, "creall") == 0 || strcmp(func_name, "__builtin_creall") == 0)
+  {
+    op = CFOLD_CREAL;
+    bt = VT_LDOUBLE;
+  }
+  else if (strcmp(func_name, "cimagf") == 0 || strcmp(func_name, "__builtin_cimagf") == 0)
+  {
+    op = CFOLD_CIMAG;
+    bt = VT_FLOAT;
+  }
+  else if (strcmp(func_name, "cimag") == 0 || strcmp(func_name, "__builtin_cimag") == 0)
+  {
+    op = CFOLD_CIMAG;
+    bt = VT_DOUBLE;
+  }
+  else if (strcmp(func_name, "cimagl") == 0 || strcmp(func_name, "__builtin_cimagl") == 0)
+  {
+    op = CFOLD_CIMAG;
+    bt = VT_LDOUBLE;
+  }
+  else
+    return 0;
+
+  /* Argument must be a constant */
+  SValue *arg = &args[0];
+  if ((arg->r & (VT_VALMASK | VT_LVAL | VT_SYM)) != VT_CONST)
+    return 0;
+
+  CValue result;
+  memset(&result, 0, sizeof(result));
+  CType result_type;
+  result_type.ref = NULL;
+
+  if (bt == VT_FLOAT)
+  {
+    union
+    {
+      float f;
+      uint32_t u;
+    } r, im;
+    r.u = (uint32_t)(arg->c.i & 0xFFFFFFFF);
+    im.u = (uint32_t)(arg->c.i >> 32);
+
+    if (op == CFOLD_CONJ)
+    {
+      im.f = -im.f;
+      result.i = (uint64_t)r.u | ((uint64_t)im.u << 32);
+      result_type.t = VT_FLOAT | VT_COMPLEX;
+    }
+    else if (op == CFOLD_CREAL)
+    {
+      result.f = r.f;
+      result_type.t = VT_FLOAT;
+    }
+    else
+    {
+      result.f = im.f;
+      result_type.t = VT_FLOAT;
+    }
+  }
+  else
+  {
+    /* double / long double (both 8-byte on target) */
+    double src_real, src_imag;
+    memcpy(&src_real, &arg->c, 8);
+    memcpy(&src_imag, (char *)&arg->c + 8, 8);
+
+    if (op == CFOLD_CONJ)
+    {
+      src_imag = -src_imag;
+      memcpy(&result, &src_real, 8);
+      memcpy((char *)&result + 8, &src_imag, 8);
+      result_type.t = bt | VT_COMPLEX;
+    }
+    else if (op == CFOLD_CREAL)
+    {
+      result.d = src_real;
+      result_type.t = bt;
+    }
+    else
+    {
+      result.d = src_imag;
+      result_type.t = bt;
+    }
+  }
+
+#ifdef TCC_USING_DOUBLE_FOR_LDOUBLE
+  /* On ARM target, long double == double. Normalize so that the folded
+   * result type matches what the parser produces for 1.0L literals
+   * (VT_DOUBLE rather than VT_LDOUBLE). */
+  if ((result_type.t & VT_BTYPE) == VT_LDOUBLE)
+    result_type.t = (result_type.t & ~VT_BTYPE) | VT_DOUBLE;
+#endif
+
+  vsetc(&result_type, VT_CONST, &result);
+  return 1;
+}
+
 ST_FUNC void vswap(void)
 {
   SValue tmp;
@@ -1599,6 +1789,12 @@ static void gen_test_zero(int op)
   }
 }
 
+static void check_nonvoid_value(void)
+{
+  if ((vtop->type.t & VT_BTYPE) == VT_VOID)
+    tcc_error("void value not ignored as it ought to be");
+}
+
 /* ------------------------------------------------------------------------- */
 /* push a symbol value of TYPE */
 ST_FUNC void vpushsym(CType *type, Sym *sym)
@@ -1663,6 +1859,12 @@ ST_FUNC void vpush_helper_func(int v)
   vpushsym(&func_old_type, external_helper_sym(v));
 }
 
+/* push a reference to a helper/library function with a specific return type */
+ST_FUNC void vpush_typed_helper_func(int v, CType *type)
+{
+  vpushsym(type, external_global_sym(v, type));
+}
+
 /* Merge symbol attributes.  */
 static void merge_symattr(struct SymAttr *sa, struct SymAttr *sa1)
 {
@@ -1705,6 +1907,9 @@ static void merge_funcattr(struct FuncAttr *fa, struct FuncAttr *fa1)
     fa->func_const = 1;
   if (fa1->func_no_instrument)
     fa->func_no_instrument = 1;
+  /* func_rewritten_extern_inline is parser provenance for one specific
+     definition and should not be inherited by a later replacement
+     definition. */
 }
 
 /* Merge attributes.  */
@@ -1728,10 +1933,27 @@ static void merge_attr(AttributeDef *ad, AttributeDef *ad1)
 /* Merge some type attributes.  */
 static void patch_type(Sym *sym, CType *type)
 {
+  int old_rewritten_extern_inline = 0;
+  int new_rewritten_extern_inline = 0;
+
+  if ((sym->type.t & VT_BTYPE) == VT_FUNC && sym->type.ref)
+    old_rewritten_extern_inline = sym->type.ref->f.func_rewritten_extern_inline;
+  if ((type->t & VT_BTYPE) == VT_FUNC && type->ref)
+    new_rewritten_extern_inline = type->ref->f.func_rewritten_extern_inline;
+
   if (!(type->t & VT_EXTERN) || IS_ENUM_VAL(sym->type.t))
   {
     if (!(sym->type.t & VT_EXTERN))
-      tcc_error("redefinition of '%s'", get_tok_str(sym->v, NULL));
+    {
+      /* A rewritten 'extern inline' definition behaves like an inline-only
+         body and may be replaced once by a later real definition (plain,
+         inline, or static inline).  Another rewritten extern-inline is still
+         a duplicate definition and must be rejected. */
+      if (old_rewritten_extern_inline && !new_rewritten_extern_inline)
+        sym->type.t &= ~(VT_STATIC | VT_INLINE);
+      else
+        tcc_error("redefinition of '%s'", get_tok_str(sym->v, NULL));
+    }
     sym->type.t &= ~VT_EXTERN;
   }
 
@@ -1774,6 +1996,7 @@ static void patch_type(Sym *sym, CType *type)
       sym->type.t = (type->t & ~(VT_STATIC | VT_INLINE)) | static_proto;
       sym->type.ref = type->ref;
       merge_funcattr(&sym->type.ref->f, &f);
+      sym->type.ref->f.func_rewritten_extern_inline = new_rewritten_extern_inline;
     }
     else
     {
@@ -1907,6 +2130,95 @@ static Sym *external_sym(int v, CType *type, int r, AttributeDef *ad)
   if (local_stack && (s->type.t & VT_BTYPE) != VT_FUNC)
     s = sym_copy(s, &local_stack);
   return s;
+}
+
+static Sym *find_global_alias_target_sym(int target_tok)
+{
+  Sym *s;
+
+  s = sym_find(target_tok);
+  while (s && s->sym_scope)
+    s = s->prev_tok;
+  if (s)
+    return s;
+
+  for (s = global_stack; s; s = s->prev)
+  {
+    if (!s->sym_scope && s->asm_label == target_tok)
+      return s;
+  }
+
+  return NULL;
+}
+
+static int resolve_alias_symbol(Sym *alias_sym, int target_tok, int report_error)
+{
+  Sym *target_sym;
+  ElfSym *esym;
+
+  target_sym = find_global_alias_target_sym(target_tok);
+  if (target_sym == alias_sym)
+    tcc_error("'%s' is part of alias cycle", get_tok_str(alias_sym->v, NULL));
+  if (!target_sym || target_sym->c <= 0)
+    goto not_found;
+
+  esym = elfsym(target_sym);
+  if (!esym || esym->st_shndx == SHN_UNDEF)
+    goto not_found;
+
+  put_extern_sym2(alias_sym, esym->st_shndx, esym->st_value, esym->st_size, 1);
+  return 1;
+
+not_found:
+  if (report_error)
+  {
+    tcc_error("'%s' aliased to undefined symbol '%s'", get_tok_str(alias_sym->v, NULL), get_tok_str(target_tok, NULL));
+  }
+  return 0;
+}
+
+static void queue_alias_symbol(Sym *alias_sym, int target_tok)
+{
+  pending_aliases = tcc_realloc(pending_aliases, (nb_pending_aliases + 1) * sizeof(*pending_aliases));
+  pending_aliases[nb_pending_aliases].alias_sym = alias_sym;
+  pending_aliases[nb_pending_aliases].target_tok = target_tok;
+  ++nb_pending_aliases;
+}
+
+static void apply_alias_attribute(Sym *alias_sym, int target_tok)
+{
+  if (!resolve_alias_symbol(alias_sym, target_tok, 0))
+    queue_alias_symbol(alias_sym, target_tok);
+}
+
+static void resolve_pending_aliases(void)
+{
+  int i, write_idx, progress;
+
+  do
+  {
+    progress = 0;
+    write_idx = 0;
+    for (i = 0; i < nb_pending_aliases; ++i)
+    {
+      if (resolve_alias_symbol(pending_aliases[i].alias_sym, pending_aliases[i].target_tok, 0))
+      {
+        progress = 1;
+      }
+      else
+      {
+        pending_aliases[write_idx++] = pending_aliases[i];
+      }
+    }
+    nb_pending_aliases = write_idx;
+  } while (progress && nb_pending_aliases > 0);
+
+  for (i = 0; i < nb_pending_aliases; ++i)
+    resolve_alias_symbol(pending_aliases[i].alias_sym, pending_aliases[i].target_tok, 1);
+
+  tcc_free(pending_aliases);
+  pending_aliases = NULL;
+  nb_pending_aliases = 0;
 }
 
 /* Legacy register spilling helpers removed: IR owns spilling. */
@@ -3761,8 +4073,7 @@ static void gen_opif(int op)
      compile-time NaN constant, fold the comparison. */
   if ((c1 || c2) && !(c1 && c2))
   {
-    int is_cmp = (op == TOK_EQ || op == TOK_NE || op == TOK_LT ||
-                  op == TOK_LE || op == TOK_GT || op == TOK_GE);
+    int is_cmp = (op == TOK_EQ || op == TOK_NE || op == TOK_LT || op == TOK_LE || op == TOK_GT || op == TOK_GE);
     if (is_cmp)
     {
       SValue *cv = c1 ? v1 : v2;
@@ -3826,9 +4137,9 @@ static void gen_opif(int op)
     /* NOTE: we only do constant propagation if finite number (not
        NaN or infinity) (ANSI spec).  Comparison operators are safe
        to fold with NaN/Inf since they don't raise FP exceptions. */
-    if (!(ieee_finite(f1) || !ieee_finite(f2)) && !CONST_WANTED) {
-      int is_cmp = (op == TOK_EQ || op == TOK_NE || op == TOK_LT ||
-                    op == TOK_LE || op == TOK_GT || op == TOK_GE);
+    if (!(ieee_finite(f1) || !ieee_finite(f2)) && !CONST_WANTED)
+    {
+      int is_cmp = (op == TOK_EQ || op == TOK_NE || op == TOK_LT || op == TOK_LE || op == TOK_GT || op == TOK_GE);
       if (!is_cmp)
         goto general_case;
     }
@@ -4939,6 +5250,45 @@ static void gen_complex_conjugate(void)
   else
     elem_size = 4; /* float */
 
+  /* Constant-folding fast path: if both parts are known at compile time,
+   * produce the conjugate as a new constant without emitting any code. */
+  if ((vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST)
+  {
+    if (is_int_complex)
+    {
+      int shift = elem_size * 8;
+      uint64_t mask = (shift >= 64) ? ~0ULL : (1ULL << shift) - 1;
+      int64_t real_part = (int64_t)(vtop->c.i & mask);
+      int64_t imag_part = (shift >= 64) ? 0 : (int64_t)((vtop->c.i >> shift) & mask);
+      imag_part = -imag_part;
+      vtop->c.i = (uint64_t)(real_part & mask) | ((uint64_t)(imag_part & mask) << shift);
+      return;
+    }
+    if (base_type == VT_FLOAT)
+    {
+      union
+      {
+        float f;
+        uint32_t u;
+      } r, im;
+      r.u = (uint32_t)(vtop->c.i & 0xFFFFFFFF);
+      im.u = (uint32_t)(vtop->c.i >> 32);
+      im.f = -im.f;
+      vtop->c.i = (uint64_t)r.u | ((uint64_t)im.u << 32);
+      return;
+    }
+    /* double / ldouble complex */
+    {
+      double src_real, src_imag;
+      memcpy(&src_real, &vtop->c, 8);
+      memcpy(&src_imag, (char *)&vtop->c + 8, 8);
+      src_imag = -src_imag;
+      memcpy(&vtop->c, &src_real, 8);
+      memcpy((char *)&vtop->c + 8, &src_imag, 8);
+      return;
+    }
+  }
+
   int result_size = elem_size * 2;
   int res_vr;
   int res_loc = get_temp_local_var(result_size, result_size > 8 ? 8 : result_size, &res_vr);
@@ -4955,7 +5305,145 @@ static void gen_complex_conjugate(void)
       elem_type.t = (elem_type.t & ~VT_BTYPE) | VT_DOUBLE;
   }
 
-  /* Save the original complex value */
+  /* If the value is not already a local or lvalue (e.g. VT_CONST),
+   * materialize it to a temp local so extraction below works uniformly. */
+  if ((vtop->r & VT_VALMASK) != VT_LOCAL && !(vtop->r & VT_LVAL))
+  {
+    int mat_vr;
+    int mat_loc = get_temp_local_var(result_size, result_size > 8 ? 8 : result_size, &mat_vr);
+
+    CType orig_ctype = vtop->type;
+    int is_const = (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST;
+
+    if (is_const && is_float(base_type))
+    {
+      /* Constant complex float/double: unpack and store each component */
+      double src_real = 0.0, src_imag = 0.0;
+      if (base_type == VT_FLOAT)
+      {
+        union
+        {
+          float f;
+          uint32_t u;
+        } r, im;
+        r.u = (uint32_t)(vtop->c.i & 0xFFFFFFFF);
+        im.u = (uint32_t)(vtop->c.i >> 32);
+        src_real = r.f;
+        src_imag = im.f;
+      }
+      else
+      {
+        memcpy(&src_real, &vtop->c, 8);
+        memcpy(&src_imag, (char *)&vtop->c + 8, 8);
+      }
+      vpop();
+
+      /* Store real part */
+      {
+        SValue dst;
+        memset(&dst, 0, sizeof(dst));
+        dst.type = elem_type;
+        dst.r = VT_LOCAL | VT_LVAL;
+        dst.vr = mat_vr;
+        dst.c.i = mat_loc;
+        vpushv(&dst);
+        CValue cv;
+        memset(&cv, 0, sizeof(cv));
+        if (base_type == VT_FLOAT)
+          cv.f = (float)src_real;
+        else
+          cv.d = src_real;
+        vsetc(&elem_type, VT_CONST, &cv);
+        vstore();
+        vpop();
+      }
+      /* Store imag part */
+      {
+        SValue dst;
+        memset(&dst, 0, sizeof(dst));
+        dst.type = elem_type;
+        dst.r = VT_LOCAL | VT_LVAL;
+        dst.vr = mat_vr;
+        dst.c.i = mat_loc + elem_size;
+        vpushv(&dst);
+        CValue cv;
+        memset(&cv, 0, sizeof(cv));
+        if (base_type == VT_FLOAT)
+          cv.f = (float)src_imag;
+        else
+          cv.d = src_imag;
+        vsetc(&elem_type, VT_CONST, &cv);
+        vstore();
+        vpop();
+      }
+    }
+    else if (is_const && !is_float(base_type))
+    {
+      /* Constant complex integer: unpack and store each component */
+      int shift = elem_size * 8;
+      uint64_t packed = vtop->c.i;
+      uint64_t mask = (base_type == VT_LLONG) ? 0xFFFFFFFFFFFFFFFFULL : ((1ULL << shift) - 1);
+      int64_t src_real = (int64_t)(packed & mask);
+      int64_t src_imag = (int64_t)((packed >> shift) & mask);
+      vpop();
+
+      /* Store real part */
+      {
+        SValue dst;
+        memset(&dst, 0, sizeof(dst));
+        dst.type = elem_type;
+        dst.r = VT_LOCAL | VT_LVAL;
+        dst.vr = mat_vr;
+        dst.c.i = mat_loc;
+        vpushv(&dst);
+        vpushi(src_real);
+        if (elem_size > 4)
+          vtop->type.t = VT_LLONG;
+        vstore();
+        vpop();
+      }
+      /* Store imag part */
+      {
+        SValue dst;
+        memset(&dst, 0, sizeof(dst));
+        dst.type = elem_type;
+        dst.r = VT_LOCAL | VT_LVAL;
+        dst.vr = mat_vr;
+        dst.c.i = mat_loc + elem_size;
+        vpushv(&dst);
+        vpushi(src_imag);
+        if (elem_size > 4)
+          vtop->type.t = VT_LLONG;
+        vstore();
+        vpop();
+      }
+    }
+    else
+    {
+      /* Register or other non-const complex: store via temp */
+      SValue mat_sv;
+      memset(&mat_sv, 0, sizeof(mat_sv));
+      mat_sv.type = orig_ctype;
+      mat_sv.r = VT_LOCAL | VT_LVAL;
+      mat_sv.vr = mat_vr;
+      mat_sv.c.i = mat_loc;
+      vpushv(&mat_sv);
+      vswap();
+      vstore();
+      vpop();
+    }
+
+    /* Replace vtop with the materialized local */
+    SValue mat_sv;
+    memset(&mat_sv, 0, sizeof(mat_sv));
+    mat_sv.type = orig_ctype;
+    mat_sv.r = VT_LOCAL | VT_LVAL;
+    mat_sv.vr = mat_vr;
+    mat_sv.c.i = mat_loc;
+    vpushv(&mat_sv);
+  }
+
+  /* Save the original complex value (now guaranteed VT_LOCAL or VT_LVAL) */
   SValue orig_val = *vtop;
   vpop();
 
@@ -4969,10 +5457,6 @@ static void gen_complex_conjugate(void)
   {
     vtop->type.t = (vtop->type.t & ~VT_BTYPE & ~VT_COMPLEX) | (elem_type.t & VT_BTYPE) | VT_LVAL;
     indir();
-  }
-  else
-  {
-    vtop->type.t = (vtop->type.t & ~VT_BTYPE & ~VT_COMPLEX) | (elem_type.t & VT_BTYPE);
   }
 
   /* Store real part to result[0] */
@@ -5001,10 +5485,6 @@ static void gen_complex_conjugate(void)
     gen_op('+');
     vtop->type.t = (orig_val.type.t & ~VT_BTYPE & ~VT_COMPLEX) | (elem_type.t & VT_BTYPE) | VT_LVAL;
     indir();
-  }
-  else
-  {
-    tcc_error("complex conjugate: register complex values not yet supported");
   }
 
   /* Negate the imaginary part */
@@ -5519,50 +5999,130 @@ static const char *try_get_constant_string(SValue *sv, int *out_len)
   return str;
 }
 
-/* Try to inline a builtin integer absolute value function (abs/labs/llabs).
+static int is_zero_length_builtin_compare(SValue *sv)
+{
+  return ((sv->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST) && sv->c.i == 0;
+}
+
+static int get_builtin_abs_info(const char *func_name, int *is_unsigned)
+{
+  *is_unsigned = 0;
+
+  if (strcmp(func_name, "abs") == 0 || strcmp(func_name, "labs") == 0 || strcmp(func_name, "llabs") == 0 ||
+      strcmp(func_name, "imaxabs") == 0)
+    return 1;
+
+  if (strcmp(func_name, "uabs") == 0 || strcmp(func_name, "ulabs") == 0 || strcmp(func_name, "ullabs") == 0 ||
+      strcmp(func_name, "umaxabs") == 0)
+  {
+    *is_unsigned = 1;
+    return 1;
+  }
+
+  return 0;
+}
+
+/* Try to inline a builtin integer absolute value function.
  * Returns 1 if inlined, 0 otherwise.
  * On success, the result is pushed onto the value stack.
  * Uses the branchless formula: sign = x >> (N-1); result = (x ^ sign) - sign
  */
+static void gen_inline_abs_from_vtop(int shift_amount, int is_unsigned)
+{
+  CType unsigned_type;
+
+  if (is_unsigned && shift_amount == 63)
+  {
+    /* The generic inline 64-bit bit-twiddling path is still unreliable for
+     * runtime values at -O0 on ARM.  Use a tiny runtime helper instead. */
+    SValue param_num;
+    SValue dest;
+    const int call_id = tcc_state->ir ? tcc_state->ir->next_call_id++ : 0;
+
+    vpush_helper_func(tok_alloc_const("__tcc_ullabsu"));
+    vrott(2);
+
+    svalue_init(&param_num);
+    param_num.vr = -1;
+    param_num.r = VT_CONST;
+    param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
+    tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[0], &param_num, NULL);
+
+    svalue_init(&dest);
+    dest.type.t = VT_LLONG | VT_UNSIGNED;
+    dest.type.ref = NULL;
+    dest.r = 0;
+    dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+    {
+      SValue call_id_sv = tcc_ir_svalue_call_id_argc(call_id, 1);
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[-1], &call_id_sv, &dest);
+    }
+
+    vtop -= 2;
+    vpushi(0);
+    vtop->type.t = VT_LLONG | VT_UNSIGNED;
+    vtop->type.ref = NULL;
+    vtop->vr = dest.vr;
+    vtop->r = TREG_R0;
+    return;
+  }
+
+  if (is_unsigned)
+  {
+    unsigned_type.ref = NULL;
+    unsigned_type.t = (vtop->type.t & VT_BTYPE) | VT_UNSIGNED;
+
+    /* Compute unsigned abs without signed overflow:
+     *   ux = (unsigned T)x;
+     *   mask = 0 - (ux >> (N - 1));   // 0 or all-ones
+     *   result = (ux ^ mask) - mask;
+     */
+    gen_cast(&unsigned_type); /* Stack: ... ux */
+    vdup();                   /* Stack: ... ux ux */
+    vpushi(shift_amount);     /* Stack: ... ux ux shift */
+    gen_op(TOK_SHR);          /* Stack: ... ux bit */
+    vpushi(0);                /* Stack: ... ux bit 0 */
+    vswap();                  /* Stack: ... ux 0 bit */
+    gen_op('-');              /* Stack: ... ux mask */
+    vdup();                   /* Stack: ... ux mask mask */
+    vrott(3);                 /* Stack: ... mask ux mask */
+    gen_op('^');              /* Stack: ... mask (ux^mask) */
+    vswap();                  /* Stack: ... (ux^mask) mask */
+    gen_op('-');              /* Stack: ... result */
+    vtop->type = unsigned_type;
+    return;
+  }
+
+  /* Generate: sign = x >> (N-1) */
+  vdup();               /* Stack: ... x x */
+  vpushi(shift_amount); /* Stack: ... x x shift */
+  gen_op(TOK_SAR);      /* Stack: ... x sign */
+
+  /* Generate: result = (x ^ sign) - sign */
+  vdup();      /* Stack: ... x sign sign */
+  vrott(3);    /* Stack: ... sign x sign */
+  gen_op('^'); /* Stack: ... sign (x^sign) */
+  vswap();     /* Stack: ... (x^sign) sign */
+  gen_op('-'); /* Stack: ... result */
+}
+
 static int try_inline_builtin_call(const char *func_name, SValue *args, int nb_args)
 {
-  int shift_amount;
+  int shift_amount, is_unsigned;
+  int bt;
 
   if (nb_args != 1)
     return 0;
 
-  /* Determine if this is an abs-family function */
-  if (strcmp(func_name, "abs") == 0)
-  {
-    shift_amount = 31; /* int: 32-bit */
-  }
-  else if (strcmp(func_name, "labs") == 0)
-  {
-    shift_amount = 31; /* long: 32-bit on ARM32 */
-  }
-  else if (strcmp(func_name, "llabs") == 0)
-  {
-    shift_amount = 63; /* long long: 64-bit */
-  }
-  else
-  {
+  if (!get_builtin_abs_info(func_name, &is_unsigned))
     return 0;
-  }
+
+  bt = args[0].type.t & VT_BTYPE;
+  shift_amount = (bt == VT_LLONG) ? 63 : 31;
 
   /* Push the argument value */
   vpushv(&args[0]); /* Stack: ... func_ptr x */
-
-  /* Generate: sign = x >> (N-1) */
-  vdup();               /* Stack: ... func_ptr x x */
-  vpushi(shift_amount); /* Stack: ... func_ptr x x shift */
-  gen_op(TOK_SAR);      /* Stack: ... func_ptr x sign */
-
-  /* Generate: result = (x ^ sign) - sign */
-  vdup();      /* Stack: ... func_ptr x sign sign */
-  vrott(3);    /* Stack: ... func_ptr sign x sign */
-  gen_op('^'); /* Stack: ... func_ptr sign (x^sign) */
-  vswap();     /* Stack: ... func_ptr (x^sign) sign */
-  gen_op('-'); /* Stack: ... func_ptr result */
+  gen_inline_abs_from_vtop(shift_amount, is_unsigned);
 
   return 1;
 }
@@ -5585,7 +6145,7 @@ static int try_inline_const_eval(Sym *func_sym, SValue *args, int nb_args)
 {
   struct InlineFunc *fn;
   Sym *param, *func_type_ref;
-  int i, param_count, saved_nocode_wanted, saved_tok;
+  int i, param_count, saved_nocode_wanted, saved_tok, saved_local_scope;
   CValue saved_tokc;
   Sym *saved_local_stack;
   SValue *saved_vtop;
@@ -5642,9 +6202,14 @@ static int try_inline_const_eval(Sym *func_sym, SValue *args, int nb_args)
   /* Save state */
   saved_nocode_wanted = nocode_wanted;
   saved_local_stack = local_stack;
+  saved_local_scope = local_scope;
   saved_tok = tok;
   saved_tokc = tokc;
   saved_vtop = vtop;
+
+  /* Evaluate in a nested local scope so inline parameters/body locals do not
+   * conflict with caller locals that may share the same identifier names. */
+  ++local_scope;
 
   /* Push parameter symbols as compile-time constants */
   param = func_type_ref->next;
@@ -5718,6 +6283,7 @@ cleanup:
 
   /* Pop parameter symbols */
   sym_pop(&local_stack, saved_local_stack, 0);
+  local_scope = saved_local_scope;
 
   /* Restore vtop to what it was before (in case partial parsing left junk) */
   vtop = saved_vtop;
@@ -5970,8 +6536,12 @@ again:
     c = (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST;
 #if !defined TCC_IS_NATIVE && !defined TCC_IS_NATIVE_387
     /* don't try to convert to ldouble when cross-compiling
-       (except when it's '0' which is needed for arm:gen_negf()) */
-    if (dbt_bt == VT_LDOUBLE && !nocode_wanted && (sf || vtop->c.i != 0))
+       (except when it's '0' which is needed for arm:gen_negf())
+       Exception: complex constant casts use memcpy-based repacking that
+       doesn't depend on the host's long double representation, so keep
+       c=1 for those to avoid falling into the scalar float-to-float path
+       which would corrupt the packed {real,imag} CValue. */
+    if (dbt_bt == VT_LDOUBLE && !nocode_wanted && (sf || vtop->c.i != 0) && !((vtop->type.t | type->t) & VT_COMPLEX))
       c = 0;
 #endif
 
@@ -8101,6 +8671,21 @@ redo:
   goto redo;
 }
 
+static void parse_decl_attributes(AttributeDef *ad)
+{
+  while (1)
+  {
+    if (tok == TOK_ATTRIBUTE1 || tok == TOK_ATTRIBUTE2)
+    {
+      parse_attribute(ad);
+      continue;
+    }
+    if (tok == '[' && parse_c23_attribute(ad))
+      continue;
+    break;
+  }
+}
+
 static Sym *find_field(CType *type, int v, int *cumofs)
 {
   Sym *s = type->ref;
@@ -9255,6 +9840,7 @@ static int post_type(CType *type, AttributeDef *ad, int storage, int td)
     ++local_scope;
     if (l && l != FUNC_ELLIPSIS)
     {
+      func_param_decl_depth++;
       for (;;)
       {
         /* read param name and compute offset */
@@ -9297,6 +9883,7 @@ static int post_type(CType *type, AttributeDef *ad, int storage, int td)
         if (l == FUNC_NEW && !parse_btype(&pt, &ad1, 0))
           tcc_error("invalid type");
       }
+      func_param_decl_depth--;
     }
     else if (l != FUNC_ELLIPSIS)
       /* if no parameters, then old type prototype */
@@ -9377,6 +9964,24 @@ static int post_type(CType *type, AttributeDef *ad, int storage, int td)
         }
         break;
       }
+    else if (func_param_decl_depth && tok != ']')
+    {
+      /* GNU C accepts variably modified types declared within function
+         parameter scope, including array members inside parameter-local
+         struct definitions.  As with parameter VLAs, defer evaluation to
+         function entry by saving the bound expression tokens now. */
+      nocode_wanted = 1;
+      skip_or_save_block(&vla_array_tok);
+      unget_tok(0);
+      vla_array_str = tok_str_ensure_heap(vla_array_tok);
+      vla_array_str_on_heap = 1;
+      begin_macro(vla_array_tok, 2);
+      next();
+      gexpr();
+      end_macro();
+      next();
+      goto check;
+    }
     else if (tok != ']')
     {
       if (!local_stack || (storage & VT_STATIC))
@@ -9449,7 +10054,7 @@ static int post_type(CType *type, AttributeDef *ad, int storage, int td)
     if (vla_array_str)
     {
       /* for function args, the top dimension is converted to pointer */
-      if ((t1 & VT_VLA) && (td & TYPE_NEST))
+      if ((t1 & VT_VLA) && ((td & TYPE_NEST) || (func_param_decl_depth && !(td & TYPE_PARAM))))
         s->vla_array_str = vla_array_str;
       else if ((t1 & VT_VLA) && (td & TYPE_PARAM))
       {
@@ -9487,6 +10092,11 @@ static CType *type_decl(CType *type, AttributeDef *ad, int *v, int td)
   storage = type->t & VT_STORAGE;
   type->t &= ~VT_STORAGE;
   post = ret = type;
+
+  /* Attributes may prefix a declarator inside a declaration list, e.g.
+     'int a, __attribute__((unused)) b;'.  Consume them before looking for
+     pointer or direct-declarator syntax. */
+  parse_decl_attributes(ad);
 
   while (tok == '*')
   {
@@ -10269,7 +10879,14 @@ tok_next:
          * the union temp as an lvalue. */
         unary();
 
-        if (nocode_wanted)
+        /* Standard casts between compatible union types must keep the
+         * usual cast semantics.  Only apply the GCC scalar-to-union
+         * extension when the source is not already a struct/union value. */
+        if ((vtop->type.t & VT_BTYPE) == VT_STRUCT || (vtop->type.t & (VT_ARRAY | VT_VLA)))
+        {
+          gen_cast(&type);
+        }
+        else if (nocode_wanted)
         {
           vtop->type = type;
         }
@@ -10596,21 +11213,22 @@ tok_next:
   case TOK_builtin_labs:
   case TOK_builtin_llabs:
   case TOK_builtin_imaxabs:
+  case TOK_builtin_uabs:
+  case TOK_builtin_ulabs:
+  case TOK_builtin_ullabs:
+  case TOK_builtin_umaxabs:
   {
-    /* Inline abs for long/long long/intmax_t — same branchless formula as
-       __builtin_abs but with a type-dependent shift count. */
+    int builtin_tok = tok;
+
+    /* Inline signed and unsigned abs-family builtins using the same
+       branchless formula as __builtin_abs, with a type-dependent shift. */
     parse_builtin_params(0, "e");
     if ((vtop->r & VT_VALMASK) == VT_CMP)
       gv(RC_INT);
     int shift = (vtop->type.t & VT_BTYPE) == VT_LLONG ? 63 : 31;
-    vdup();
-    vpushi(shift);
-    gen_op(TOK_SAR);
-    vdup();
-    vrott(3);
-    gen_op('^');
-    vswap();
-    gen_op('-');
+    int is_unsigned = (builtin_tok == TOK_builtin_uabs || builtin_tok == TOK_builtin_ulabs ||
+                       builtin_tok == TOK_builtin_ullabs || builtin_tok == TOK_builtin_umaxabs);
+    gen_inline_abs_from_vtop(shift, is_unsigned);
     break;
   }
   case TOK_builtin_types_compatible_p:
@@ -12071,8 +12689,7 @@ tok_next:
     parse_builtin_params(0, "ee");
 
     int is_float = (tok1 == TOK_builtin_fmaxf || tok1 == TOK_builtin_fminf);
-    int is_max = (tok1 == TOK_builtin_fmax || tok1 == TOK_builtin_fmaxf ||
-                  tok1 == TOK_builtin_fmaxl);
+    int is_max = (tok1 == TOK_builtin_fmax || tok1 == TOK_builtin_fmaxf || tok1 == TOK_builtin_fmaxl);
 
     /* Check if both arguments are constants */
     int bt_x = vtop[-1].type.t & VT_BTYPE;
@@ -13632,6 +14249,139 @@ tok_next:
     gen_complex_conjugate();
     break;
   }
+  case TOK_builtin_crealf:
+  case TOK_builtin_creal:
+  case TOK_builtin_creall:
+  case TOK_builtin_cimagf:
+  case TOK_builtin_cimag:
+  case TOK_builtin_cimagl:
+  {
+    int tok1 = tok;
+    int is_real = (tok1 == TOK_builtin_crealf || tok1 == TOK_builtin_creal || tok1 == TOK_builtin_creall);
+    parse_builtin_params(0, "e");
+
+    if (!(vtop->type.t & VT_COMPLEX))
+    {
+      if (is_real)
+      {
+        /* creal on non-complex is identity */
+      }
+      else
+      {
+        /* cimag on non-complex returns 0 */
+        vpop();
+        vpushi(0);
+      }
+    }
+    else
+    {
+      /* Reuse the __real__ / __imag__ logic via the unary operator handler.
+       * We push a synthetic TOK_REAL or TOK_IMAG operation on the vtop value. */
+      int base_type = vtop->type.t & VT_BTYPE;
+      int is_int_complex = !is_float(base_type);
+      int elem_size, result_type;
+
+      if (is_int_complex)
+      {
+        result_type = base_type;
+        elem_size = btype_size(base_type);
+      }
+      else if (base_type == VT_DOUBLE || base_type == VT_LDOUBLE)
+      {
+        result_type = base_type;
+        elem_size = 8;
+      }
+      else
+      {
+        result_type = VT_FLOAT;
+        elem_size = 4;
+      }
+
+      /* Handle constant complex integers */
+      if (is_int_complex && (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST)
+      {
+        int shift = elem_size * 8;
+        uint64_t mask = (shift >= 64) ? ~0ULL : (1ULL << shift) - 1;
+        if (is_real)
+          vtop->c.i = vtop->c.i & mask;
+        else
+          vtop->c.i = (shift >= 64) ? 0 : ((vtop->c.i >> shift) & mask);
+        vtop->type.t = (vtop->type.t & ~VT_BTYPE & ~VT_COMPLEX) | result_type;
+      }
+      else if ((vtop->r & VT_VALMASK) == VT_LOCAL)
+      {
+        if (!is_real)
+          vtop->c.i += elem_size;
+        vtop->type.t = (vtop->type.t & ~VT_BTYPE & ~VT_COMPLEX) | result_type;
+      }
+      else if (vtop->r & VT_LVAL)
+      {
+        if (!is_real)
+          vtop->c.i += elem_size;
+        vtop->type.t = (vtop->type.t & ~VT_BTYPE & ~VT_COMPLEX) | result_type;
+      }
+      else
+      {
+        /* Handle constant complex floats */
+        int is_const = (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST;
+        if (is_const && is_float(base_type))
+        {
+          CValue cv;
+          memset(&cv, 0, sizeof(cv));
+          if (base_type == VT_FLOAT)
+          {
+            union
+            {
+              float f;
+              uint32_t u;
+            } r, im;
+            r.u = (uint32_t)(vtop->c.i & 0xFFFFFFFF);
+            im.u = (uint32_t)(vtop->c.i >> 32);
+            if (is_real)
+              cv.f = r.f;
+            else
+              cv.f = im.f;
+            vpop();
+            CType ft;
+            ft.t = VT_FLOAT;
+            ft.ref = NULL;
+            vsetc(&ft, VT_CONST, &cv);
+          }
+          else
+          {
+            double src_real, src_imag;
+            memcpy(&src_real, &vtop->c, 8);
+            memcpy(&src_imag, (char *)&vtop->c + 8, 8);
+            if (is_real)
+              cv.d = src_real;
+            else
+              cv.d = src_imag;
+            vpop();
+            CType dt;
+            dt.t = base_type;
+            dt.ref = NULL;
+            vsetc(&dt, VT_CONST, &cv);
+          }
+        }
+        else
+        {
+          /* Register value: small integer complex packed in register */
+          if (is_real)
+          {
+            vtop->type.t = (vtop->type.t & ~VT_BTYPE & ~VT_COMPLEX) | result_type;
+          }
+          else
+          {
+            vtop->type.t = (vtop->type.t & ~VT_BTYPE & ~VT_COMPLEX) | VT_INT;
+            vpushi(elem_size * 8);
+            gen_op(TOK_SHR);
+            vtop->type.t = (vtop->type.t & ~VT_BTYPE) | result_type;
+          }
+        }
+      }
+    }
+    break;
+  }
   case TOK_builtin_prefetch:
   {
     /* __builtin_prefetch(address, rw, locality)
@@ -13809,6 +14559,12 @@ tok_next:
     type = vtop->type;
     vpop(); /* pop type placeholder; vtop = ap */
 
+    {
+      int type_align_dummy;
+      if ((type.t & VT_BTYPE) == VT_VOID || type_size(&type, &type_align_dummy) < 0)
+        tcc_error("second argument to 'va_arg' is of incomplete type 'void'");
+    }
+
     /* Take address of ap: va_list is char*, so &ap gives char**.
      * __tcc_va_arg needs char** to advance the pointer. */
     mk_pointer(&vtop->type);
@@ -13974,40 +14730,44 @@ tok_next:
      * modes 1-3 fall back to -1 (unknown). */
     if (obj_type_val == 0 || obj_type_val == 1)
     {
-      /* Helper: search local_stack for the outermost variable that
-       * contains a given frame-pointer offset.  Returns remaining
-       * bytes from that offset to end of the variable, or -1. */
-      #define FIND_LOCAL_OBJSIZE(target_off, out_size)                 \
-        do {                                                           \
-          Sym *_s;                                                     \
-          (out_size) = (addr_t)-1;                                     \
-          for (_s = local_stack; _s; _s = _s->prev) {                  \
-            if ((_s->r & VT_VALMASK) != VT_LOCAL) continue;           \
-            /* Skip field/struct-tag namespace symbols */               \
-            if (_s->v & (SYM_FIELD | SYM_STRUCT)) continue;           \
-            /* Skip vreg-managed scalars: their sym->c is not a real   \
-             * stack offset (register allocator assigns the actual     \
-             * location). Only arrays, structs, VLAs keep permanent    \
-             * frame offsets assigned by the front-end. */             \
-            if ((_s->r & VT_LVAL)                                     \
-                && ((_s->type.t & VT_BTYPE) != VT_STRUCT)             \
-                && !(_s->type.t & (VT_ARRAY | VT_VLA)))               \
-              continue;                                                \
-            int _align;                                                \
-            int _sz = type_size(&_s->type, &_align);                   \
-            if (_sz <= 0) continue;                                    \
-            /* Use int for signed frame-offset arithmetic (sym->c is   \
-             * a signed FP-relative offset; addr_t is unsigned and     \
-             * would break the range check on 64-bit hosts). */        \
-            int _base = (int)_s->c;                                    \
-            int _end = _base + _sz;                                    \
-            int _tgt = (int)(target_off);                              \
-            if (_tgt >= _base && _tgt < _end) {                        \
-              (out_size) = (addr_t)(_end - _tgt);                      \
-              break;                                                   \
-            }                                                          \
-          }                                                            \
-        } while (0)
+/* Helper: search local_stack for the outermost variable that
+ * contains a given frame-pointer offset.  Returns remaining
+ * bytes from that offset to end of the variable, or -1. */
+#define FIND_LOCAL_OBJSIZE(target_off, out_size)                                                                       \
+  do                                                                                                                   \
+  {                                                                                                                    \
+    Sym *_s;                                                                                                           \
+    (out_size) = (addr_t) - 1;                                                                                         \
+    for (_s = local_stack; _s; _s = _s->prev)                                                                          \
+    {                                                                                                                  \
+      if ((_s->r & VT_VALMASK) != VT_LOCAL)                                                                            \
+        continue;                                                                                                      \
+      /* Skip field/struct-tag namespace symbols */                                                                    \
+      if (_s->v & (SYM_FIELD | SYM_STRUCT))                                                                            \
+        continue;                                                                                                      \
+      /* Skip vreg-managed scalars: their sym->c is not a real                                                         \
+       * stack offset (register allocator assigns the actual                                                           \
+       * location). Only arrays, structs, VLAs keep permanent                                                          \
+       * frame offsets assigned by the front-end. */                                                                   \
+      if ((_s->r & VT_LVAL) && ((_s->type.t & VT_BTYPE) != VT_STRUCT) && !(_s->type.t & (VT_ARRAY | VT_VLA)))          \
+        continue;                                                                                                      \
+      int _align;                                                                                                      \
+      int _sz = type_size(&_s->type, &_align);                                                                         \
+      if (_sz <= 0)                                                                                                    \
+        continue;                                                                                                      \
+      /* Use int for signed frame-offset arithmetic (sym->c is                                                         \
+       * a signed FP-relative offset; addr_t is unsigned and                                                           \
+       * would break the range check on 64-bit hosts). */                                                              \
+      int _base = (int)_s->c;                                                                                          \
+      int _end = _base + _sz;                                                                                          \
+      int _tgt = (int)(target_off);                                                                                    \
+      if (_tgt >= _base && _tgt < _end)                                                                                \
+      {                                                                                                                \
+        (out_size) = (addr_t)(_end - _tgt);                                                                            \
+        break;                                                                                                         \
+      }                                                                                                                \
+    }                                                                                                                  \
+  } while (0)
 
       /* All VT_LOCAL cases (both lval and non-lval, with or without
        * array type) use the same local variable search for mode 0. */
@@ -14060,8 +14820,7 @@ tok_next:
        * VT_LVAL means we'd need to load the value (i.e. a pointer variable),
        * not an array whose address we already have. Pointer variables have
        * st_size = sizeof(pointer) which is NOT the pointed-to object size. */
-      else if ((ptr_r & (VT_VALMASK | VT_SYM)) == (VT_CONST | VT_SYM)
-               && !(ptr_r & VT_LVAL) && ptr_sv.sym)
+      else if ((ptr_r & (VT_VALMASK | VT_SYM)) == (VT_CONST | VT_SYM) && !(ptr_r & VT_LVAL) && ptr_sv.sym)
       {
         ElfSym *esym = elfsym(ptr_sv.sym);
         if (esym && esym->st_size > 0)
@@ -14072,7 +14831,7 @@ tok_next:
         }
       }
 
-      #undef FIND_LOCAL_OBJSIZE
+#undef FIND_LOCAL_OBJSIZE
     }
 
     vpushs(result);
@@ -14087,15 +14846,29 @@ tok_next:
   case TOK_builtin_realloc:
   {
     const char *func_name;
-    switch (tok) {
-      case TOK_builtin_abort:    func_name = "abort"; break;
-      case TOK_builtin_malloc:   func_name = "malloc"; break;
-      case TOK_builtin_free:     func_name = "free"; break;
-      case TOK_builtin_calloc:   func_name = "calloc"; break;
-      case TOK_builtin_realloc:  func_name = "realloc"; break;
-      default:                   func_name = NULL; break;
+    switch (tok)
+    {
+    case TOK_builtin_abort:
+      func_name = "abort";
+      break;
+    case TOK_builtin_malloc:
+      func_name = "malloc";
+      break;
+    case TOK_builtin_free:
+      func_name = "free";
+      break;
+    case TOK_builtin_calloc:
+      func_name = "calloc";
+      break;
+    case TOK_builtin_realloc:
+      func_name = "realloc";
+      break;
+    default:
+      func_name = NULL;
+      break;
     }
-    if (func_name) {
+    if (func_name)
+    {
       int func_tok = tok_alloc_const(func_name);
       vpush_helper_func(func_tok);
     }
@@ -14121,25 +14894,59 @@ tok_next:
   case TOK_builtin_parityll:
   {
     const char *func_name;
-    switch (tok) {
-      case TOK_builtin_ffs:         func_name = "ffs"; break;
-      case TOK_builtin_ffsl:        func_name = "ffsl"; break;
-      case TOK_builtin_ffsll:       func_name = "ffsll"; break;
-      case TOK_builtin_clz:         func_name = "__clzsi2"; break;
-      case TOK_builtin_clzl:        func_name = "__clzsi2"; break;
-      case TOK_builtin_clzll:       func_name = "__clzdi2"; break;
-      case TOK_builtin_ctz:         func_name = "__ctzsi2"; break;
-      case TOK_builtin_ctzl:        func_name = "__ctzsi2"; break;
-      case TOK_builtin_ctzll:       func_name = "__ctzdi2"; break;
-      case TOK_builtin_popcount:    func_name = "__popcountsi2"; break;
-      case TOK_builtin_popcountl:   func_name = "__popcountsi2"; break;
-      case TOK_builtin_popcountll:  func_name = "__popcountdi2"; break;
-      case TOK_builtin_parity:      func_name = "__paritysi2"; break;
-      case TOK_builtin_parityl:     func_name = "__paritysi2"; break;
-      case TOK_builtin_parityll:    func_name = "__paritydi2"; break;
-      default:                      func_name = NULL; break;
+    switch (tok)
+    {
+    case TOK_builtin_ffs:
+      func_name = "ffs";
+      break;
+    case TOK_builtin_ffsl:
+      func_name = "ffsl";
+      break;
+    case TOK_builtin_ffsll:
+      func_name = "ffsll";
+      break;
+    case TOK_builtin_clz:
+      func_name = "__clzsi2";
+      break;
+    case TOK_builtin_clzl:
+      func_name = "__clzsi2";
+      break;
+    case TOK_builtin_clzll:
+      func_name = "__clzdi2";
+      break;
+    case TOK_builtin_ctz:
+      func_name = "__ctzsi2";
+      break;
+    case TOK_builtin_ctzl:
+      func_name = "__ctzsi2";
+      break;
+    case TOK_builtin_ctzll:
+      func_name = "__ctzdi2";
+      break;
+    case TOK_builtin_popcount:
+      func_name = "__popcountsi2";
+      break;
+    case TOK_builtin_popcountl:
+      func_name = "__popcountsi2";
+      break;
+    case TOK_builtin_popcountll:
+      func_name = "__popcountdi2";
+      break;
+    case TOK_builtin_parity:
+      func_name = "__paritysi2";
+      break;
+    case TOK_builtin_parityl:
+      func_name = "__paritysi2";
+      break;
+    case TOK_builtin_parityll:
+      func_name = "__paritydi2";
+      break;
+    default:
+      func_name = NULL;
+      break;
     }
-    if (func_name) {
+    if (func_name)
+    {
       int func_tok = tok_alloc_const(func_name);
       vpush_helper_func(func_tok);
     }
@@ -14197,20 +15004,20 @@ tok_next:
       int returns_ptr;
     };
     static const struct chk_desc chk_table[] = {
-      { TOK_builtin___memcpy_chk,    "memcpy",     "__memcpy_chk",     3, 1, 0, 1 },
-      { TOK_builtin___memmove_chk,   "memmove",    "__memmove_chk",    3, 1, 0, 1 },
-      { TOK_builtin___memset_chk,    "memset",     "__memset_chk",     3, 1, 0, 1 },
-      { TOK_builtin___mempcpy_chk,   "mempcpy",    "__mempcpy_chk",    3, 1, 0, 1 },
-      { TOK_builtin___strcpy_chk,    "strcpy",     "__strcpy_chk",     2, 1, 0, 1 },
-      { TOK_builtin___stpcpy_chk,    "stpcpy",     "__stpcpy_chk",     2, 1, 0, 1 },
-      { TOK_builtin___strcat_chk,    "strcat",     "__strcat_chk",     2, 1, 0, 1 },
-      { TOK_builtin___strncpy_chk,   "strncpy",    "__strncpy_chk",    3, 1, 0, 1 },
-      { TOK_builtin___stpncpy_chk,   "stpncpy",    "__stpncpy_chk",    3, 1, 0, 1 },
-      { TOK_builtin___strncat_chk,   "strncat",    "__strncat_chk",    3, 1, 0, 1 },
-      { TOK_builtin___sprintf_chk,   "sprintf",    "__sprintf_chk",    1, 2, 1, 0 },
-      { TOK_builtin___snprintf_chk,  "snprintf",   "__snprintf_chk",   2, 2, 1, 0 },
-      { TOK_builtin___vsprintf_chk,  "vsprintf",   "__vsprintf_chk",   1, 2, 1, 0 },
-      { TOK_builtin___vsnprintf_chk, "vsnprintf",  "__vsnprintf_chk",  2, 2, 1, 0 },
+        {TOK_builtin___memcpy_chk, "memcpy", "__memcpy_chk", 3, 1, 0, 1},
+        {TOK_builtin___memmove_chk, "memmove", "__memmove_chk", 3, 1, 0, 1},
+        {TOK_builtin___memset_chk, "memset", "__memset_chk", 3, 1, 0, 1},
+        {TOK_builtin___mempcpy_chk, "mempcpy", "__mempcpy_chk", 3, 1, 0, 1},
+        {TOK_builtin___strcpy_chk, "strcpy", "__strcpy_chk", 2, 1, 0, 1},
+        {TOK_builtin___stpcpy_chk, "stpcpy", "__stpcpy_chk", 2, 1, 0, 1},
+        {TOK_builtin___strcat_chk, "strcat", "__strcat_chk", 2, 1, 0, 1},
+        {TOK_builtin___strncpy_chk, "strncpy", "__strncpy_chk", 3, 1, 0, 1},
+        {TOK_builtin___stpncpy_chk, "stpncpy", "__stpncpy_chk", 3, 1, 0, 1},
+        {TOK_builtin___strncat_chk, "strncat", "__strncat_chk", 3, 1, 0, 1},
+        {TOK_builtin___sprintf_chk, "sprintf", "__sprintf_chk", 1, 2, 1, 0},
+        {TOK_builtin___snprintf_chk, "snprintf", "__snprintf_chk", 2, 2, 1, 0},
+        {TOK_builtin___vsprintf_chk, "vsprintf", "__vsprintf_chk", 1, 2, 1, 0},
+        {TOK_builtin___vsnprintf_chk, "vsnprintf", "__vsnprintf_chk", 2, 2, 1, 0},
     };
 
     /* Look up descriptor */
@@ -14245,7 +15052,8 @@ tok_next:
       convert_parameter_type(&vtop->type);
       if (!NOEVAL_WANTED)
         tcc_ir_codegen_cmp_jmp_set(tcc_state->ir);
-      if (total_args >= all_args_cap) {
+      if (total_args >= all_args_cap)
+      {
         all_args_cap *= 2;
         all_args = tcc_realloc(all_args, all_args_cap * sizeof(SValue));
       }
@@ -14281,7 +15089,8 @@ tok_next:
         convert_parameter_type(&vtop->type);
         if (!NOEVAL_WANTED)
           tcc_ir_codegen_cmp_jmp_set(tcc_state->ir);
-        if (total_args >= all_args_cap) {
+        if (total_args >= all_args_cap)
+        {
           all_args_cap *= 2;
           all_args = tcc_realloc(all_args, all_args_cap * sizeof(SValue));
         }
@@ -14453,7 +15262,6 @@ tok_next:
     break;
   }
 
-
   /* String and memory builtins - redirect to library functions */
   case TOK_builtin_strlen:
   case TOK_builtin_strcpy:
@@ -14465,6 +15273,7 @@ tok_next:
   case TOK_builtin_memcpy:
   case TOK_builtin_memmove:
   case TOK_builtin_memset:
+  case TOK_builtin_bzero:
   case TOK_builtin_memcmp:
   case TOK_builtin_memchr:
   case TOK_builtin_strchr:
@@ -14482,36 +15291,112 @@ tok_next:
   {
     /* Map builtin to corresponding library function name */
     const char *func_name;
-    switch (tok) {
-      case TOK_builtin_strlen:   func_name = "strlen"; break;
-      case TOK_builtin_strcpy:   func_name = "strcpy"; break;
-      case TOK_builtin_strncpy:  func_name = "strncpy"; break;
-      case TOK_builtin_strcat:   func_name = "strcat"; break;
-      case TOK_builtin_strncat:  func_name = "strncat"; break;
-      case TOK_builtin_strcmp:   func_name = "strcmp"; break;
-      case TOK_builtin_strncmp:  func_name = "strncmp"; break;
-      case TOK_builtin_memcpy:   func_name = "memcpy"; break;
-      case TOK_builtin_memmove:  func_name = "memmove"; break;
-      case TOK_builtin_memset:   func_name = "memset"; break;
-      case TOK_builtin_memcmp:   func_name = "memcmp"; break;
-      case TOK_builtin_memchr:   func_name = "memchr"; break;
-      case TOK_builtin_strchr:   func_name = "strchr"; break;
-      case TOK_builtin_strrchr:  func_name = "strrchr"; break;
-      case TOK_builtin_strstr:   func_name = "strstr"; break;
-      case TOK_builtin_strpbrk:  func_name = "strpbrk"; break;
-      case TOK_builtin_strspn:   func_name = "strspn"; break;
-      case TOK_builtin_strcspn:  func_name = "strcspn"; break;
-      case TOK_builtin_strnlen:  func_name = "strnlen"; break;
-      case TOK_builtin_mempcpy:  func_name = "mempcpy"; break;
-      case TOK_builtin_stpcpy:   func_name = "stpcpy"; break;
-      case TOK_builtin_stpncpy:  func_name = "stpncpy"; break;
-      case TOK_builtin_fputs:    func_name = "fputs"; break;
-      case TOK_builtin_fprintf:  func_name = "fprintf"; break;
-      default:                   func_name = NULL; break;
+    CType *func_type = &func_old_type;
+    switch (tok)
+    {
+    case TOK_builtin_strlen:
+      func_name = "strlen";
+      func_type = &func_old_size_t_type;
+      break;
+    case TOK_builtin_strcpy:
+      func_name = "strcpy";
+      func_type = &func_old_char_pointer_type;
+      break;
+    case TOK_builtin_strncpy:
+      func_name = "strncpy";
+      func_type = &func_old_char_pointer_type;
+      break;
+    case TOK_builtin_strcat:
+      func_name = "strcat";
+      func_type = &func_old_char_pointer_type;
+      break;
+    case TOK_builtin_strncat:
+      func_name = "strncat";
+      func_type = &func_old_char_pointer_type;
+      break;
+    case TOK_builtin_strcmp:
+      func_name = "strcmp";
+      break;
+    case TOK_builtin_strncmp:
+      func_name = "strncmp";
+      break;
+    case TOK_builtin_memcpy:
+      func_name = "memcpy";
+      func_type = &func_old_void_pointer_type;
+      break;
+    case TOK_builtin_memmove:
+      func_name = "memmove";
+      func_type = &func_old_void_pointer_type;
+      break;
+    case TOK_builtin_memset:
+      func_name = "memset";
+      func_type = &func_old_void_pointer_type;
+      break;
+    case TOK_builtin_bzero:
+      func_name = "bzero";
+      func_type = &func_old_void_type;
+      break;
+    case TOK_builtin_memcmp:
+      func_name = "memcmp";
+      break;
+    case TOK_builtin_memchr:
+      func_name = "memchr";
+      func_type = &func_old_void_pointer_type;
+      break;
+    case TOK_builtin_strchr:
+      func_name = "strchr";
+      func_type = &func_old_char_pointer_type;
+      break;
+    case TOK_builtin_strrchr:
+      func_name = "strrchr";
+      func_type = &func_old_char_pointer_type;
+      break;
+    case TOK_builtin_strstr:
+      func_name = "strstr";
+      func_type = &func_old_char_pointer_type;
+      break;
+    case TOK_builtin_strpbrk:
+      func_name = "strpbrk";
+      func_type = &func_old_char_pointer_type;
+      break;
+    case TOK_builtin_strspn:
+      func_name = "strspn";
+      func_type = &func_old_size_t_type;
+      break;
+    case TOK_builtin_strcspn:
+      func_name = "strcspn";
+      func_type = &func_old_size_t_type;
+      break;
+    case TOK_builtin_strnlen:
+      func_name = "strnlen";
+      func_type = &func_old_size_t_type;
+      break;
+    case TOK_builtin_mempcpy:
+      func_name = "mempcpy";
+      func_type = &func_old_void_pointer_type;
+      break;
+    case TOK_builtin_stpcpy:
+      func_name = "stpcpy";
+      func_type = &func_old_char_pointer_type;
+      break;
+    case TOK_builtin_stpncpy:
+      func_name = "stpncpy";
+      func_type = &func_old_char_pointer_type;
+      break;
+    case TOK_builtin_fputs:
+      func_name = "fputs";
+      break;
+    case TOK_builtin_fprintf:
+      func_name = "fprintf";
+      break;
+    default:
+      func_name = NULL;
+      break;
     }
-    if (func_name) {
+    if (func_name)
+    {
       int func_tok = tok_alloc_const(func_name);
-      vpush_helper_func(func_tok);
+      vpush_typed_helper_func(func_tok, func_type);
     }
     /* Consume the builtin token; the caller will handle the following '(' */
     next();
@@ -15084,6 +15969,7 @@ tok_next:
 
       sa = s->next; /* first parameter */
       nb_args = regsize = 0;
+      int nb_implicit_args = 0; /* sret pointer counted in nb_args but not saved_arg_count */
       /* compute first implicit argument if a composite type is returned */
       if ((s->type.t & VT_BTYPE) == VT_STRUCT || (s->type.t & VT_COMPLEX))
       {
@@ -15141,6 +16027,7 @@ tok_next:
             }
             vtop--;
             nb_args++;
+            nb_implicit_args++;
           }
         }
       }
@@ -15161,6 +16048,7 @@ tok_next:
       SValue saved_args[8];
       int saved_arg_count = 0;
       int can_try_fold = 0;
+      int can_inline_builtin = 0;
       int can_inline_eval = 0;
       const char *func_name = NULL;
 
@@ -15180,6 +16068,11 @@ tok_next:
                           func_name[0] == 'r' || func_name[0] == 't'))
         {
           can_try_fold = 1;
+        }
+
+        {
+          int is_unsigned;
+          can_inline_builtin = get_builtin_abs_info(func_name, &is_unsigned);
         }
       }
 
@@ -15566,11 +16459,79 @@ tok_next:
               tcc_ir_codegen_cmp_jmp_set(tcc_state->ir);
             gfunc_param_typed(s, sa);
 
-            /* Save argument for potential constant folding or inline evaluation */
-            if ((can_try_fold || can_inline_eval || can_optimize_printf_family) && saved_arg_count < 8 &&
-                !NOEVAL_WANTED)
+            /* Save argument for potential constant folding or inline evaluation.
+             * This must happen BEFORE the double-complex materialization below,
+             * which converts VT_CONST to VT_LOCAL. */
+            if ((can_try_fold || can_inline_builtin || can_inline_eval || can_optimize_printf_family) &&
+                saved_arg_count < 8 && !NOEVAL_WANTED)
             {
               saved_args[saved_arg_count++] = *vtop;
+            }
+
+            /* Materialize constant complex double/ldouble to a temp local.
+             * These are 128-bit values that cannot be represented as a single
+             * MachineOperand immediate.  The callsite's struct-byval copy path
+             * handles memory operands transparently. */
+            if (!NOEVAL_WANTED && (vtop->type.t & VT_COMPLEX) &&
+                ((vtop->type.t & VT_BTYPE) == VT_DOUBLE || (vtop->type.t & VT_BTYPE) == VT_LDOUBLE) &&
+                (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST)
+            {
+              int elem_size = 8;
+              int complex_size = elem_size * 2;
+              CType elem_type;
+              elem_type.t = VT_DOUBLE;
+              elem_type.ref = NULL;
+
+              double src_real, src_imag;
+              memcpy(&src_real, &vtop->c, 8);
+              memcpy(&src_imag, (char *)&vtop->c + 8, 8);
+              CType orig_type = vtop->type;
+              vpop();
+
+              int mat_vr;
+              int mat_loc = get_temp_local_var(complex_size, 8, &mat_vr);
+
+              /* Store real part */
+              {
+                SValue dst;
+                memset(&dst, 0, sizeof(dst));
+                dst.type = elem_type;
+                dst.r = VT_LOCAL | VT_LVAL;
+                dst.vr = mat_vr;
+                dst.c.i = mat_loc;
+                vpushv(&dst);
+                CValue cv;
+                memset(&cv, 0, sizeof(cv));
+                cv.d = src_real;
+                vsetc(&elem_type, VT_CONST, &cv);
+                vstore();
+                vpop();
+              }
+              /* Store imag part */
+              {
+                SValue dst;
+                memset(&dst, 0, sizeof(dst));
+                dst.type = elem_type;
+                dst.r = VT_LOCAL | VT_LVAL;
+                dst.vr = mat_vr;
+                dst.c.i = mat_loc + elem_size;
+                vpushv(&dst);
+                CValue cv;
+                memset(&cv, 0, sizeof(cv));
+                cv.d = src_imag;
+                vsetc(&elem_type, VT_CONST, &cv);
+                vstore();
+                vpop();
+              }
+
+              /* Push materialized local as the complex value */
+              SValue mat_sv;
+              memset(&mat_sv, 0, sizeof(mat_sv));
+              mat_sv.type = orig_type;
+              mat_sv.r = VT_LOCAL | VT_LVAL;
+              mat_sv.vr = mat_vr;
+              mat_sv.c.i = mat_loc;
+              vpushv(&mat_sv);
             }
 
             if (!NOEVAL_WANTED)
@@ -15614,7 +16575,8 @@ tok_next:
 
           /* Save argument for potential constant folding or inline evaluation (in reverse order for reverse_funcargs)
            */
-          if ((can_try_fold || can_inline_eval || can_optimize_printf_family) && n < 8 && !NOEVAL_WANTED)
+          if ((can_try_fold || can_inline_builtin || can_inline_eval || can_optimize_printf_family) && n < 8 &&
+              !NOEVAL_WANTED)
           {
             saved_args[nb_args - 1 - n] = *vtop;
             if (n == 0)
@@ -15649,28 +16611,41 @@ tok_next:
 
       /* Try constant folding for math functions */
       int folded = 0;
-      if (can_try_fold && func_name && saved_arg_count == nb_args && !NOEVAL_WANTED)
+      int nb_real_args = nb_args - nb_implicit_args;
+      if (can_try_fold && func_name && saved_arg_count == nb_real_args && !NOEVAL_WANTED)
       {
         folded = try_fold_math_call(func_name, saved_args, saved_arg_count);
+        if (!folded)
+          folded = try_fold_complex_call(func_name, saved_args, saved_arg_count);
       }
 
-      /* Try inlining builtin integer functions (abs, labs, llabs).
+      /* Try inlining builtin integer functions (signed and unsigned abs family).
        * Must roll back FUNCPARAMVAL ops BEFORE generating inline IR,
        * otherwise the rollback would discard the newly generated code. */
       int inlined = 0;
-      if (!folded && func_name && saved_arg_count == nb_args && !NOEVAL_WANTED)
+      if (!folded && func_name && saved_arg_count == nb_real_args && !NOEVAL_WANTED)
       {
-        int builtin_shift = -1;
+        int builtin_ok = 0;
         if (saved_arg_count == 1)
         {
-          if (strcmp(func_name, "abs") == 0)
-            builtin_shift = 31;
-          else if (strcmp(func_name, "labs") == 0)
-            builtin_shift = 31;
-          else if (strcmp(func_name, "llabs") == 0)
-            builtin_shift = 63;
+          if (strcmp(func_name, "abs") == 0 && !(tcc_state->no_builtin_funcs & NO_BUILTIN_ABS))
+            builtin_ok = 1;
+          else if (strcmp(func_name, "labs") == 0 && !(tcc_state->no_builtin_funcs & NO_BUILTIN_LABS))
+            builtin_ok = 1;
+          else if (strcmp(func_name, "llabs") == 0 && !(tcc_state->no_builtin_funcs & NO_BUILTIN_LLABS))
+            builtin_ok = 1;
+          else if (strcmp(func_name, "imaxabs") == 0)
+            builtin_ok = 1;
+          else if (strcmp(func_name, "uabs") == 0 && !(tcc_state->no_builtin_funcs & NO_BUILTIN_UABS))
+            builtin_ok = 1;
+          else if (strcmp(func_name, "ulabs") == 0 && !(tcc_state->no_builtin_funcs & NO_BUILTIN_ULABS))
+            builtin_ok = 1;
+          else if (strcmp(func_name, "ullabs") == 0 && !(tcc_state->no_builtin_funcs & NO_BUILTIN_ULLABS))
+            builtin_ok = 1;
+          else if (strcmp(func_name, "umaxabs") == 0 && !(tcc_state->no_builtin_funcs & NO_BUILTIN_UMAXABS))
+            builtin_ok = 1;
         }
-        if (builtin_shift >= 0)
+        if (builtin_ok)
         {
           /* Roll back FUNCPARAMVAL ops first, preserving argument eval IR */
           int rollback_idx = (ir_idx_before_first_param >= 0) ? ir_idx_before_first_param : ir_idx_before_args;
@@ -15690,7 +16665,7 @@ tok_next:
        *   int g(void) { return f(1); }  // returns 1 at -O1
        */
       int inline_evaled = 0;
-      if (!folded && !inlined && call_func_sym && saved_arg_count == nb_args && !NOEVAL_WANTED)
+      if (!folded && !inlined && call_func_sym && saved_arg_count == nb_real_args && !NOEVAL_WANTED)
       {
         if (try_inline_const_eval(call_func_sym, saved_args, saved_arg_count))
         {
@@ -15711,7 +16686,7 @@ tok_next:
        * Also handles __printf_chk/__fprintf_chk (extra flag argument).
        * Only optimize in void context (next token is ';'). */
       int printf_family_optimized = 0;
-      if (!folded && !inlined && !inline_evaled && can_optimize_printf_family && saved_arg_count == nb_args &&
+      if (!folded && !inlined && !inline_evaled && can_optimize_printf_family && saved_arg_count == nb_real_args &&
           nb_args >= pf_min_args && !nocode_wanted && tok == ';')
       {
         int fmt_len = 0;
@@ -16023,6 +16998,55 @@ tok_next:
         }
       }
 
+      /* Fold zero-length string/memory compares even without global optimization.
+       * This matches GCC builtin semantics for cases like:
+       *   strncmp(++p, ++q, 0)
+       * where the call result is known to be 0, but argument side effects
+       * still must be preserved exactly once. */
+      int string_builtin_optimized = 0;
+      if (!folded && !inlined && !inline_evaled && !printf_family_optimized && func_name &&
+          saved_arg_count == nb_real_args && !NOEVAL_WANTED)
+      {
+        int folded_result = 0;
+        int can_fold_result = 0;
+
+        if (nb_real_args == 3 && is_zero_length_builtin_compare(&saved_args[2]))
+        {
+          if (strcmp(func_name, "strncmp") == 0 || strcmp(func_name, "memcmp") == 0)
+          {
+            folded_result = 0;
+            can_fold_result = 1;
+          }
+        }
+
+        if (can_fold_result)
+        {
+          if (ir_idx_before_first_param >= 0)
+          {
+            int current_end = tcc_state->ir->next_instruction_index;
+            for (int i = ir_idx_before_first_param; i < current_end; i++)
+            {
+              if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
+              {
+                IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
+                int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
+                if (encoded_call_id == call_id)
+                  tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
+              }
+            }
+          }
+          else
+          {
+            tcc_state->ir->next_instruction_index = ir_idx_before_args;
+          }
+
+          vpushi(folded_result);
+          vtop[-1] = vtop[0];
+          --vtop;
+          string_builtin_optimized = 1;
+        }
+      }
+
       if (folded)
       {
         /* Constant folding succeeded – skip IR emission.
@@ -16035,11 +17059,11 @@ tok_next:
          * ops that were emitted for the (now-folded) arguments. */
         tcc_state->ir->next_instruction_index = ir_idx_before_args;
       }
-      else if (inlined || inline_evaled || printf_family_optimized)
+      else if (inlined || inline_evaled || printf_family_optimized || string_builtin_optimized)
       {
         /* Already handled above */
       }
-      else if (can_inline_eval && !NOEVAL_WANTED && call_func_sym && saved_arg_count == nb_args && tcc_state->ir &&
+      else if (can_inline_eval && !NOEVAL_WANTED && call_func_sym && saved_arg_count == nb_real_args && tcc_state->ir &&
                !tcc_state->in_inline_expansion)
       {
         /* ---- Token-level inline expansion ----
@@ -16969,7 +17993,7 @@ static void expr_const1(void)
 }
 
 /* parse an integer constant and return its value. */
-static inline int64_t expr_const64(void)
+ST_FUNC int64_t expr_const64(void)
 {
   int64_t c;
   expr_const1();
@@ -17738,6 +18762,7 @@ again:
     new_scope_s(&o);
     skip('(');
     gexpr();
+    check_nonvoid_value();
     skip(')');
     a = tcc_ir_codegen_test_gen(tcc_state->ir, 1, -1);
     block(0);
@@ -17770,6 +18795,7 @@ again:
     d = gind();
     skip('(');
     gexpr();
+    check_nonvoid_value();
     skip(')');
     // fprintf(stderr, "WHILE_COND: file=%s line=%d r=0x%x type=0x%x vr=%d VT_LVAL=%d VT_VALMASK=0x%x btype=0x%x\n",
     //         file->filename, file->line_num, vtop->r, vtop->type.t, vtop->vr, (vtop->r & VT_LVAL) ? 1 : 0,
@@ -17961,6 +18987,7 @@ again:
     if (tok != ';')
     {
       gexpr();
+      check_nonvoid_value();
       a = tcc_ir_codegen_test_gen(tcc_state->ir, 1, -1);
     }
     skip(';');
@@ -18020,6 +19047,7 @@ again:
     skip(TOK_WHILE);
     skip('(');
     gexpr();
+    check_nonvoid_value();
     skip(')');
     skip(';');
     // c = gvtst(0, 0);
@@ -18526,7 +19554,11 @@ static void decl_design_flex(init_params *p, Sym *ref, int index)
       ref->c = index + 1;
   }
   else if (ref->c < 0)
+  {
+    if (p->flex_array_ref)
+      tcc_error("initialization of flexible array member in a nested context");
     tcc_error("flexible array has zero size in this context");
+  }
 }
 
 /* t is the array or struct type. c is the array or struct
@@ -20217,6 +21249,53 @@ static void compile_nested_functions(Sym *parent_sym)
       table_ident[lbl->v - TOK_IDENT]->sym_label = lbl;
     }
 
+    /* Temporarily push parent-scope typedefs into the symbol table so the
+     * nested function body can reference them.
+     * We allocate Sym entries on a separate stack (not local_stack)
+     * so gen_function's pop_local_syms does not free them.
+     * We manually link them into table_ident and remove them after. */
+    Sym *typedef_syms[MAX_CAPTURED_VARS];
+    Sym *typedef_sym_storage = NULL; /* separate linked list for our syms */
+    int nb_typedef_syms = 0;
+    for (int j = 0; j < nf->nb_parent_typedefs; j++)
+    {
+      int tv = nf->parent_typedef_tokens[j];
+      CType *ttype = &nf->parent_typedef_types[j];
+      Sym *ts_sym;
+      /* Allocate sym on a separate stack, not local_stack */
+      ts_sym = sym_push2(&typedef_sym_storage, tv, ttype->t, 0);
+      ts_sym->type.ref = ttype->ref;
+      ts_sym->sym_scope = 0;
+      /* Typedef — link into sym_identifier namespace */
+      int ident_idx = tv - TOK_IDENT;
+      if ((unsigned)ident_idx < (unsigned)(tok_ident - TOK_IDENT))
+      {
+        ts_sym->prev_tok = table_ident[ident_idx]->sym_identifier;
+        table_ident[ident_idx]->sym_identifier = ts_sym;
+      }
+      typedef_syms[nb_typedef_syms++] = ts_sym;
+    }
+
+    /* Temporarily re-link parent struct/union/enum tag syms into the
+     * sym_struct hash table.  These are the original Sym pointers which
+     * survive pop_local_syms (completed struct tags have c != 0). */
+    Sym *saved_struct_prev[MAX_CAPTURED_VARS]; /* save old hash entries */
+    for (int j = 0; j < nf->nb_parent_struct_tags; j++)
+    {
+      Sym *tag = nf->parent_struct_tag_syms[j];
+      int ident_idx = (tag->v & ~SYM_STRUCT) - TOK_IDENT;
+      if ((unsigned)ident_idx < (unsigned)(tok_ident - TOK_IDENT))
+      {
+        saved_struct_prev[j] = table_ident[ident_idx]->sym_struct;
+        tag->prev_tok = saved_struct_prev[j];
+        table_ident[ident_idx]->sym_struct = tag;
+      }
+      else
+      {
+        saved_struct_prev[j] = NULL;
+      }
+    }
+
     gen_function(nf->sym);
 
     /* Remove parent addr-taken labels from hash table after compilation. */
@@ -20224,6 +21303,41 @@ static void compile_nested_functions(Sym *parent_sym)
     {
       Sym *lbl = nf->addr_label_syms[j];
       table_ident[lbl->v - TOK_IDENT]->sym_label = lbl->prev_tok;
+    }
+
+    /* Remove parent struct tags from hash table */
+    for (int j = nf->nb_parent_struct_tags - 1; j >= 0; j--)
+    {
+      Sym *tag = nf->parent_struct_tag_syms[j];
+      int ident_idx = (tag->v & ~SYM_STRUCT) - TOK_IDENT;
+      if ((unsigned)ident_idx < (unsigned)(tok_ident - TOK_IDENT))
+      {
+        if (table_ident[ident_idx]->sym_struct == tag)
+          table_ident[ident_idx]->sym_struct = saved_struct_prev[j];
+      }
+    }
+
+    /* Remove parent typedefs that we injected and free them. */
+    for (int j = nb_typedef_syms - 1; j >= 0; j--)
+    {
+      Sym *ts_sym = typedef_syms[j];
+      int tv = ts_sym->v;
+      if (!(tv & SYM_FIELD) && (tv & ~SYM_STRUCT) < SYM_FIRST_ANOM)
+      {
+        TokenSym *tsi = table_ident[(tv & ~SYM_STRUCT) - TOK_IDENT];
+        if (tsi->sym_identifier == ts_sym)
+          tsi->sym_identifier = ts_sym->prev_tok;
+      }
+    }
+    /* Free the temporary typedef sym storage */
+    {
+      Sym *s = typedef_sym_storage;
+      while (s)
+      {
+        Sym *next = s->prev;
+        sym_free(s);
+        s = next;
+      }
     }
 
     /* gen_function() resets cur_text_section=NULL and ind=0 for safety.
@@ -21368,11 +22482,10 @@ static void do_Static_assert(void)
    or VT_JMP if parsing c99 for decl: for (int i = 0, ...) */
 static int decl(int l)
 {
-  int v, has_init, r, oldint;
+  int v, has_init, r, oldint, align;
   CType type, btype;
   Sym *sym;
   AttributeDef ad, adbase;
-  ElfSym *esym;
 
   while (1)
   {
@@ -21476,7 +22589,10 @@ static int decl(int l)
              inline, i.e. GNU inline semantics for those.  Rewrite
              them into static inline.  */
           if (tcc_state->gnu89_inline || sym->f.func_alwinl)
+          {
             type.t = (type.t & ~VT_EXTERN) | VT_STATIC;
+            type.ref->f.func_rewritten_extern_inline = 1;
+          }
           else
             type.t &= ~VT_INLINE; /* always compile otherwise */
         }
@@ -21600,6 +22716,73 @@ static int decl(int l)
            * VLA expressions (vla_array_str) are not part of the function body
            * token stream, so prescan_captured_vars won't find them. */
           prescan_vla_param_captured_vars(nf, local_stack);
+
+          /* Capture parent-scope typedefs and struct/union/enum tags so the
+           * nested function body can reference them.  Walk the local_stack
+           * which is still live at this point (before pop_local_syms). */
+          nf->nb_parent_typedefs = 0;
+          nf->nb_parent_struct_tags = 0;
+          for (Sym *ts = local_stack; ts; ts = ts->prev)
+          {
+            if (ts->type.t & VT_TYPEDEF)
+            {
+              if (nf->nb_parent_typedefs >= MAX_CAPTURED_VARS)
+                continue;
+              /* Save typedef: token id + full type */
+              nf->parent_typedef_tokens[nf->nb_parent_typedefs] = ts->v;
+              nf->parent_typedef_types[nf->nb_parent_typedefs] = ts->type;
+              nf->nb_parent_typedefs++;
+            }
+            else if ((ts->v & SYM_STRUCT) && ts->c != 0)
+            {
+              if (nf->nb_parent_struct_tags >= MAX_CAPTURED_VARS)
+                continue;
+              /* Save pointer to original struct tag sym (survives pop_local_syms
+               * because completed struct tags have c != 0 so sym_pop won't free them) */
+              nf->parent_struct_tag_syms[nf->nb_parent_struct_tags] = ts;
+              nf->nb_parent_struct_tags++;
+            }
+          }
+
+          /* Pin struct field Syms reachable from captured typedefs/struct tags.
+           * pop_local_syms frees Syms with c==0 (which includes struct fields
+           * at offset 0).  Setting VT_SYM in r prevents sym_pop from freeing
+           * them, keeping the struct type's field chain valid for the nested
+           * function.  Also pin VLA-related Syms in the field type chain.
+           * For VLA-only structs, the struct tag itself has c==0 (compile-time
+           * size is 0) and must also be pinned. */
+          for (int ti = 0; ti < nf->nb_parent_typedefs; ti++)
+          {
+            CType *ct = &nf->parent_typedef_types[ti];
+            if ((ct->t & VT_BTYPE) == VT_STRUCT && ct->ref)
+            {
+              /* Pin the struct tag if its compile-time size is 0 */
+              if (ct->ref->c == 0)
+                ct->ref->r |= VT_SYM;
+              for (Sym *f = ct->ref->next; f; f = f->next)
+              {
+                if (f->c == 0)
+                  f->r |= VT_SYM;
+                /* Also pin the VLA ref Sym if present */
+                if ((f->type.t & VT_VLA) && f->type.ref && f->type.ref->c == 0)
+                  f->type.ref->r |= VT_SYM;
+              }
+            }
+          }
+          for (int si = 0; si < nf->nb_parent_struct_tags; si++)
+          {
+            Sym *ss = nf->parent_struct_tag_syms[si];
+            if (ss)
+            {
+              for (Sym *f = ss->next; f; f = f->next)
+              {
+                if (f->c == 0)
+                  f->r |= VT_SYM;
+                if ((f->type.t & VT_VLA) && f->type.ref && f->type.ref->c == 0)
+                  f->type.ref->r |= VT_SYM;
+              }
+            }
+          }
 
           /* Non-local goto: emit setjmp for each __label__ targeted by this nested function.
            * For each target label, we:
@@ -21867,11 +23050,16 @@ static int decl(int l)
           if (has_init && (type.t & VT_VLA))
             tcc_error("variable length array cannot be initialized");
 
-          if (((type.t & VT_EXTERN) && (!has_init || l != VT_CONST)) ||
+           if (((type.t & VT_EXTERN) && (!has_init || l != VT_CONST)) ||
               (type.t & VT_BTYPE) == VT_FUNC
               /* as with GCC, uninitialized global arrays with no size
-                 are considered extern: */
-              || ((type.t & VT_ARRAY) && !has_init && l == VT_CONST && type.ref->c < 0))
+                are considered extern: */
+              || ((type.t & VT_ARRAY) && !has_init && l == VT_CONST && type.ref->c < 0)
+              /* likewise, accept tentative file-scope declarations of
+                incomplete struct/union objects and let a later complete
+                definition provide the storage. */
+              || (!has_init && l == VT_CONST && !(type.t & VT_STATIC) &&
+                (type.t & VT_BTYPE) == VT_STRUCT && type_size(&type, &align) < 0))
           {
             /* external variable or function */
             type.t |= VT_EXTERN;
@@ -21892,17 +23080,7 @@ static int decl(int l)
           }
 
           if (ad.alias_target && l == VT_CONST)
-          {
-            /* Aliases need to be emitted when their target symbol
-               is emitted, even if perhaps unreferenced.
-               We only support the case where the base is already
-               defined, otherwise we would need deferring to emit
-               the aliases until the end of the compile unit.  */
-            esym = elfsym(sym_find(ad.alias_target));
-            if (!esym)
-              tcc_error("unsupported forward __alias__ attribute");
-            put_extern_sym2(sym_find(v), esym->st_shndx, esym->st_value, esym->st_size, 1);
-          }
+            apply_alias_attribute(sym_find(v), ad.alias_target);
         }
         if (tok != ',')
         {
