@@ -352,6 +352,7 @@ static void gen_vec_subscript(void);
 static void gen_cast_vector(CType *type);
 static inline CType *pointed_type(CType *type);
 static int is_compatible_types(CType *type1, CType *type2);
+static int compare_types(CType *type1, CType *type2, int unqualified);
 static int parse_btype(CType *type, AttributeDef *ad, int ignore_label);
 static CType *type_decl(CType *type, AttributeDef *ad, int *v, int td);
 static void parse_expr_type(CType *type);
@@ -993,6 +994,35 @@ static int sym_scope(Sym *s)
   else
     scope = s->sym_scope;
   return scope;
+}
+
+static int token_stream_references_local_object(const int *p)
+{
+  while (1)
+  {
+    int t;
+    int bt;
+    CValue cv;
+    Sym *s;
+
+    tok_get(&t, &p, &cv);
+    if (t == TOK_EOF || t == 0)
+      break;
+    if (t < TOK_IDENT)
+      continue;
+
+    s = sym_find(t);
+    if (!s || !sym_scope(s))
+      continue;
+
+    bt = s->type.t & VT_BTYPE;
+    if ((s->type.t & VT_TYPEDEF) || IS_ENUM_VAL(s->type.t) || bt == VT_FUNC)
+      continue;
+
+    return 1;
+  }
+
+  return 0;
 }
 
 /* push a given symbol on the symbol stack */
@@ -1884,6 +1914,7 @@ static void merge_symattr(struct SymAttr *sa, struct SymAttr *sa1)
   sa->nodecorate |= sa1->nodecorate;
   sa->dllimport |= sa1->dllimport;
   sa->naked |= sa1->naked;
+  sa->transparent_union |= sa1->transparent_union;
 }
 
 /* Merge function attributes.  */
@@ -1895,6 +1926,8 @@ static void merge_funcattr(struct FuncAttr *fa, struct FuncAttr *fa1)
     fa->func_type = fa1->func_type;
   if (fa1->func_args && !fa->func_args)
     fa->func_args = fa1->func_args;
+  if (fa1->func_alwinl)
+    fa->func_alwinl = 1;
   if (fa1->func_noreturn)
     fa->func_noreturn = 1;
   if (fa1->func_ctor)
@@ -4439,6 +4472,10 @@ static int is_compatible_func(CType *type1, CType *type2)
     return 0;
   for (;;)
   {
+    if (s1->a.transparent_union && s1->type.ref)
+      s1->type.ref->a.transparent_union = 1;
+    if (s2->a.transparent_union && s2->type.ref)
+      s2->type.ref->a.transparent_union = 1;
     if (!is_compatible_unqualified_types(&s1->type, &s2->type))
       return 0;
     if (s1->f.func_type == FUNC_OLD || s2->f.func_type == FUNC_OLD)
@@ -4451,6 +4488,93 @@ static int is_compatible_func(CType *type1, CType *type2)
       return 0;
   }
   return 0; /* unreachable */
+}
+
+static int is_transparent_union_type(CType *type)
+{
+  return (type->t & VT_BTYPE) == VT_STRUCT && type->ref && type->ref->a.transparent_union &&
+         type->ref->type.t == VT_UNION;
+}
+
+static CType *find_transparent_union_compatible_member(CType *type, CType *other, int unqualified)
+{
+  Sym *field;
+
+  if (!is_transparent_union_type(type))
+    return NULL;
+
+  for (field = type->ref->next; field; field = field->next)
+  {
+    if ((unqualified && compare_types(&field->type, other, 1)) ||
+        (!unqualified && is_compatible_types(&field->type, other)))
+      return &field->type;
+  }
+
+  return NULL;
+}
+
+static int is_assign_compatible_pointer_types(CType *dt, CType *st)
+{
+  CType *type1, *type2;
+  int dbt, sbt, lvl;
+
+  dbt = dt->t & VT_BTYPE;
+  sbt = st->t & VT_BTYPE;
+  if (dbt != VT_PTR)
+    return 0;
+
+  type1 = pointed_type(dt);
+  if (sbt == VT_PTR)
+    type2 = pointed_type(st);
+  else if (sbt == VT_FUNC)
+    type2 = st;
+  else
+    return 0;
+
+  if (is_compatible_types(type1, type2))
+    return 1;
+
+  for (lvl = 0;; ++lvl)
+  {
+    dbt = type1->t & (VT_BTYPE | VT_LONG);
+    sbt = type2->t & (VT_BTYPE | VT_LONG);
+    if (dbt != VT_PTR || sbt != VT_PTR)
+      break;
+    type1 = pointed_type(type1);
+    type2 = pointed_type(type2);
+  }
+
+  if (!is_compatible_unqualified_types(type1, type2))
+  {
+    if ((dbt == VT_VOID || sbt == VT_VOID) && lvl == 0)
+      return 1;
+    if (dbt == sbt && is_integer_btype(sbt & VT_BTYPE) &&
+        IS_ENUM(type1->t) + IS_ENUM(type2->t) + !!((type1->t ^ type2->t) & VT_UNSIGNED) < 2)
+      return 1;
+    return 0;
+  }
+
+  return 1;
+}
+
+static CType *find_assignable_transparent_union_member(CType *type)
+{
+  Sym *field;
+
+  if (!is_transparent_union_type(type))
+    return NULL;
+
+  for (field = type->ref->next; field; field = field->next)
+  {
+    int fbt = field->type.t & VT_BTYPE;
+
+    if (is_compatible_unqualified_types(&field->type, &vtop->type))
+      return &field->type;
+    if (fbt == VT_PTR && (is_null_pointer(vtop) || is_assign_compatible_pointer_types(&field->type, &vtop->type)))
+      return &field->type;
+  }
+
+  return NULL;
 }
 
 /* return true if type1 and type2 are the same.  If unqualified is
@@ -4468,6 +4592,10 @@ static int compare_types(CType *type1, CType *type2, int unqualified)
   }
   else if (IS_ENUM(type2->t))
     type2 = &type2->ref->type;
+
+  if (find_transparent_union_compatible_member(type1, type2, unqualified) ||
+      find_transparent_union_compatible_member(type2, type1, unqualified))
+    return 1;
 
   t1 = type1->t & VT_TYPE;
   t2 = type2->t & VT_TYPE;
@@ -5973,7 +6101,7 @@ static const char *try_get_constant_string(SValue *sv, int *out_len)
   addr_t offset;
 
   /* Must be a constant symbol reference */
-  if ((sv->r & (VT_VALMASK | VT_SYM)) != (VT_CONST | VT_SYM))
+  if ((sv->r & (VT_VALMASK | VT_SYM | VT_LVAL)) != (VT_CONST | VT_SYM))
     return NULL;
   if (!sv->sym)
     return NULL;
@@ -6004,6 +6132,47 @@ static int is_zero_length_builtin_compare(SValue *sv)
   return ((sv->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST) && sv->c.i == 0;
 }
 
+static int try_get_constant_size_t(SValue *sv, size_t *out)
+{
+  if (!sv || !out)
+    return 0;
+
+  if ((sv->r & (VT_VALMASK | VT_LVAL | VT_SYM)) != VT_CONST)
+    return 0;
+
+  *out = (size_t)sv->c.i;
+  return 1;
+}
+
+static int fold_builtin_strcmp_result(const char *s1, const char *s2)
+{
+  while ((unsigned char)*s1 == (unsigned char)*s2)
+  {
+    if (*s1 == '\0')
+      return 0;
+    ++s1;
+    ++s2;
+  }
+
+  return (int)(unsigned char)*s1 - (int)(unsigned char)*s2;
+}
+
+static int fold_builtin_strncmp_result(const char *s1, const char *s2, size_t n)
+{
+  if (n == 0)
+    return 0;
+
+  while (n-- > 0)
+  {
+    unsigned char c1 = (unsigned char)*s1++;
+    unsigned char c2 = (unsigned char)*s2++;
+    if (c1 != c2 || c1 == '\0')
+      return (int)c1 - (int)c2;
+  }
+
+  return 0;
+}
+
 static int get_builtin_abs_info(const char *func_name, int *is_unsigned)
 {
   *is_unsigned = 0;
@@ -6020,6 +6189,65 @@ static int get_builtin_abs_info(const char *func_name, int *is_unsigned)
   }
 
   return 0;
+}
+
+static int builtin_abs_decl_matches(Sym *func_sym, const char *func_name)
+{
+  int expected_ret_t;
+  int expected_param_t;
+  CType ret_type;
+  Sym *func_ref;
+  Sym *param;
+
+  if (!func_sym || !func_sym->type.ref || !func_name)
+    return 1;
+
+  if (strcmp(func_name, "abs") == 0)
+  {
+    expected_ret_t = VT_INT;
+    expected_param_t = VT_INT;
+  }
+  else if (strcmp(func_name, "labs") == 0)
+  {
+    expected_ret_t = VT_INT | VT_LONG;
+    expected_param_t = VT_INT | VT_LONG;
+  }
+  else if (strcmp(func_name, "llabs") == 0 || strcmp(func_name, "imaxabs") == 0)
+  {
+    expected_ret_t = VT_LLONG;
+    expected_param_t = VT_LLONG;
+  }
+  else if (strcmp(func_name, "uabs") == 0)
+  {
+    expected_ret_t = VT_INT | VT_UNSIGNED;
+    expected_param_t = VT_INT;
+  }
+  else if (strcmp(func_name, "ulabs") == 0)
+  {
+    expected_ret_t = VT_INT | VT_LONG | VT_UNSIGNED;
+    expected_param_t = VT_INT | VT_LONG;
+  }
+  else if (strcmp(func_name, "ullabs") == 0 || strcmp(func_name, "umaxabs") == 0)
+  {
+    expected_ret_t = VT_LLONG | VT_UNSIGNED;
+    expected_param_t = VT_LLONG;
+  }
+  else
+    return 0;
+
+  func_ref = func_sym->type.ref;
+  ret_type = func_ref->type;
+  if ((ret_type.t & (VT_BTYPE | VT_LONG | VT_UNSIGNED)) != expected_ret_t)
+    return 0;
+
+  if (func_ref->f.func_type == FUNC_OLD)
+    return 1;
+
+  param = func_ref->next;
+  if (!param || param->next)
+    return 0;
+
+  return (param->type.t & (VT_BTYPE | VT_LONG | VT_UNSIGNED)) == expected_param_t;
 }
 
 /* Try to inline a builtin integer absolute value function.
@@ -6125,6 +6353,137 @@ static int try_inline_builtin_call(const char *func_name, SValue *args, int nb_a
   gen_inline_abs_from_vtop(shift_amount, is_unsigned);
 
   return 1;
+}
+
+static int inline_body_has_return_stmt(TokenString *func_str)
+{
+  const int *tp;
+
+  if (!func_str)
+    return 0;
+
+  tp = tok_str_buf(func_str);
+  while (*tp)
+  {
+    int tv;
+    CValue tcv;
+
+    tok_get(&tv, &tp, &tcv);
+    if (tv == TOK_RETURN)
+      return 1;
+    if (tv == TOK_EOF || tv == 0)
+      break;
+  }
+
+  return 0;
+}
+
+static void inline_scan_body_features(TokenString *func_str, int *has_addr_of_label, int *has_inline_asm)
+{
+  const int *tp;
+  int prev_tok_val = 0;
+
+  *has_addr_of_label = 0;
+  *has_inline_asm = 0;
+  if (!func_str)
+    return;
+
+  tp = tok_str_buf(func_str);
+  while (*tp)
+  {
+    int tv;
+    CValue tcv;
+
+    tok_get(&tv, &tp, &tcv);
+    if (prev_tok_val == TOK_LAND && tv >= TOK_UIDENT)
+      *has_addr_of_label = 1;
+    if (tv == TOK_ASM1 || tv == TOK_ASM2 || tv == TOK_ASM3)
+      *has_inline_asm = 1;
+    if (*has_addr_of_label && *has_inline_asm)
+      break;
+    if (tv == TOK_EOF || tv == 0)
+      break;
+    prev_tok_val = tv;
+  }
+}
+
+static int inline_collect_ident_tokens(TokenString *func_str, int **tokens_out)
+{
+  const int *tp;
+  int *tokens = NULL;
+  int count = 0;
+  int capacity = 0;
+
+  *tokens_out = NULL;
+  if (!func_str)
+    return 0;
+
+  tp = tok_str_buf(func_str);
+  while (*tp)
+  {
+    int tv;
+    CValue tcv;
+
+    tok_get(&tv, &tp, &tcv);
+    if (tv >= TOK_UIDENT)
+    {
+      int i;
+      for (i = 0; i < count; ++i)
+        if (tokens[i] == tv)
+          break;
+      if (i == count)
+      {
+        if (count >= capacity)
+        {
+          capacity = capacity ? capacity * 2 : 16;
+          tokens = tcc_realloc(tokens, capacity * sizeof(*tokens));
+        }
+        tokens[count++] = tv;
+      }
+    }
+    if (tv == TOK_EOF || tv == 0)
+      break;
+  }
+
+  *tokens_out = tokens;
+  return count;
+}
+
+static Sym **inline_hide_label_bindings(TokenString *func_str, int **tokens_out, int *count_out)
+{
+  int *tokens;
+  int count;
+  Sym **saved_labels;
+
+  *tokens_out = NULL;
+  *count_out = 0;
+
+  count = inline_collect_ident_tokens(func_str, &tokens);
+  if (count <= 0)
+    return NULL;
+
+  saved_labels = tcc_malloc(count * sizeof(*saved_labels));
+  for (int i = 0; i < count; ++i)
+  {
+    int ident_idx = tokens[i] - TOK_IDENT;
+    saved_labels[i] = table_ident[ident_idx]->sym_label;
+    table_ident[ident_idx]->sym_label = NULL;
+  }
+
+  *tokens_out = tokens;
+  *count_out = count;
+  return saved_labels;
+}
+
+static void inline_restore_label_bindings(int *tokens, Sym **saved_labels, int count)
+{
+  for (int i = 0; i < count; ++i)
+  {
+    int ident_idx = tokens[i] - TOK_IDENT;
+    table_ident[ident_idx]->sym_label = saved_labels[i];
+  }
+  tcc_free(saved_labels);
+  tcc_free(tokens);
 }
 
 /* Suppress error output during speculative inline evaluation */
@@ -6296,6 +6655,11 @@ cleanup:
   return 0;
 }
 
+static int inline_arg_is_constant_like(const SValue *sv)
+{
+  return (sv->r & (VT_VALMASK | VT_LVAL)) == VT_CONST;
+}
+
 #if defined TCC_TARGET_ARM64 || defined TCC_TARGET_RISCV64 || defined TCC_TARGET_ARM
 #define gen_cvt_itof1 gen_cvt_itof
 #else
@@ -6411,6 +6775,16 @@ static void gen_cast(CType *type)
 {
   int sbt, dbt, sf, df, c;
   int dbt_bt, sbt_bt, ds, ss, bits, trunc;
+
+  if (is_transparent_union_type(type))
+  {
+    CType *member_type = find_assignable_transparent_union_member(type);
+    if (member_type)
+    {
+      gen_cast(member_type);
+      return;
+    }
+  }
 
   /* special delayed cast for char/short */
   if (vtop->r & (VT_MUSTCAST | (VT_MUSTCAST << 1)))
@@ -7539,6 +7913,8 @@ static void verify_assign_cast(CType *dt)
     break;
   case VT_STRUCT:
   case_VT_STRUCT:
+    if (is_transparent_union_type(dt) && find_assignable_transparent_union_member(dt))
+      break;
     /* Allow reinterpret assignment/cast between GCC vector types of the
      * same total byte size (e.g. v4si <-> v4ui, v8hi <-> v4si). */
     if ((dt->t & VT_VECTOR) && (st->t & VT_BTYPE) == VT_STRUCT && (st->t & VT_VECTOR) && dt->ref->c == st->ref->c)
@@ -8589,8 +8965,8 @@ redo:
     case TOK_VECTOR_SIZE2:
       skip('(');
       n = expr_const();
-      if (n < 2 || n > 64 || (n & (n - 1)) != 0)
-        tcc_error("vector_size must be a power of 2 between 2 and 64 bytes");
+      if (n < 1 || (n & (n - 1)) != 0)
+        tcc_error("vector_size must be a positive power of 2");
       ad->vector_size = n;
       skip(')');
       break;
@@ -8646,6 +9022,14 @@ redo:
       skip(')');
       break;
     default:
+    {
+      const char *attr = get_tok_str(t, NULL);
+      if (attr && (!strcmp(attr, "transparent_union") || !strcmp(attr, "__transparent_union__")))
+      {
+        ad->a.transparent_union = 1;
+        break;
+      }
+    }
       tcc_warning_c(warn_unsupported)("'%s' attribute ignored", get_tok_str(t, NULL));
       /* skip parameters */
       if (tok == '(')
@@ -9202,6 +9586,7 @@ static void struct_decl(CType *type, int u)
 do_decl:
   type->t = s->type.t;
   type->ref = s;
+  merge_symattr(&s->a, &ad.a);
 
   if (tok == '{')
   {
@@ -9394,11 +9779,14 @@ do_decl:
             *ps = ss;
             ps = &ss->next;
           }
-          if (tok == ';' || tok == TOK_EOF)
+          if (tok == ';' || tok == '}' || tok == TOK_EOF)
             break;
           skip(',');
         }
-        skip(';');
+        if (tok == ';')
+          next();
+        else if (tok != '}')
+          skip(';');
       }
       skip('}');
       parse_attribute(&ad);
@@ -9408,6 +9796,7 @@ do_decl:
       }
       check_fields(type, 1);
       check_fields(type, 0);
+      merge_symattr(&type->ref->a, &ad.a);
       struct_layout(type, &ad);
       if (debug_modes)
         tcc_debug_fix_anon(tcc_state, type);
@@ -9702,8 +10091,31 @@ static int parse_btype(CType *type, AttributeDef *ad, int ignore_label)
     case TOK_THREAD_LOCAL:
       tcc_error("_Thread_local is not implemented");
     default:
+      if (tok >= TOK_IDENT)
+      {
+        const char *tok_str = get_tok_str(tok, NULL);
+        if (tok_str && strcmp(tok_str, "__thread") == 0)
+        {
+          next();
+          break;
+        }
+      }
+
       if (typespec_found)
         goto the_end;
+
+      if (tok >= TOK_IDENT && tcc_state->cversion > 201710)
+      {
+        const char *tok_str = get_tok_str(tok, NULL);
+        if (tok_str && strcmp(tok_str, "bool") == 0)
+        {
+          u = VT_BOOL;
+          next();
+          typespec_found = 1;
+          break;
+        }
+      }
+
       s = sym_find(tok);
       if (!s || !(s->type.t & VT_TYPEDEF))
         goto the_end;
@@ -9725,6 +10137,8 @@ static int parse_btype(CType *type, AttributeDef *ad, int ignore_label)
       t = type->t;
       /* get attributes from typedef */
       sym_to_attr(ad, s);
+      if (s->a.transparent_union && type->ref)
+        type->ref->a.transparent_union = 1;
       typespec_found = 1;
       st = bt = -2;
       break;
@@ -10317,6 +10731,18 @@ static void gfunc_param_typed(Sym *func, Sym *arg)
   {
     type = arg->type;
     type.t &= ~VT_CONSTANT; /* need to do that to avoid false warning */
+    if (arg->a.transparent_union && type.ref)
+      type.ref->a.transparent_union = 1;
+
+    if (is_transparent_union_type(&type))
+    {
+      CType *member_type = find_assignable_transparent_union_member(&type);
+      if (member_type)
+      {
+        gen_assign_cast(member_type);
+        return;
+      }
+    }
 
     /* ARM EABI AAPCS: Composite types (struct/union) larger than 4 words (16 bytes)
      * must be passed by invisible reference - the caller passes a pointer.
@@ -10583,11 +11009,49 @@ static void parse_atomic(int atok)
 
   sprintf(buf, "%s_%d", get_tok_str(atok, 0), size);
   vpush_helper_func(tok_alloc_const(buf));
-  vrott(arg - save + 1);
-  // gfunc_call(arg - save);
-  tcc_error("7 implement me");
-  vpush(&ct);
-  PUT_R_RET(vtop, ct.t);
+  {
+    int call_argc = arg - save;
+    int stack_count = call_argc + 1;
+    const int call_id = tcc_state->ir ? tcc_state->ir->next_call_id++ : 0;
+    SValue param_num;
+    SValue call_id_sv;
+    vrott(stack_count);
+
+    svalue_init(&param_num);
+    param_num.vr = -1;
+    param_num.r = VT_CONST;
+    for (t = 0; t < call_argc; ++t)
+    {
+      param_num.c.i = TCCIR_ENCODE_PARAM(call_id, t);
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-call_argc + 1 + t], &param_num, NULL);
+    }
+
+    call_id_sv = tcc_ir_svalue_call_id_argc(call_id, call_argc);
+    if ((ct.t & VT_BTYPE) == VT_VOID)
+    {
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[-call_argc], &call_id_sv, NULL);
+      vtop -= stack_count;
+      vpushi(0);
+      vtop->type = ct;
+      vtop->r = VT_CONST;
+      return;
+    }
+    else
+    {
+      SValue dest;
+      svalue_init(&dest);
+      dest.type = ct;
+      dest.r = 0;
+      dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[-call_argc], &call_id_sv, &dest);
+
+      vtop -= stack_count;
+      vpushi(0);
+      vtop->type = ct;
+      vtop->vr = dest.vr;
+      PUT_R_RET(vtop, ct.t);
+    }
+  }
   t = ct.t & VT_BTYPE;
   if (t == VT_BYTE || t == VT_SHORT || t == VT_BOOL)
   {
@@ -14014,7 +14478,9 @@ tok_next:
     break;
   }
   case TOK_builtin_shuffle:
+  case TOK_builtin_shufflevector:
   {
+    int tok1 = tok;
     /* __builtin_shuffle(vec, mask) — 2-arg shuffle
      * __builtin_shuffle(vec1, vec2, mask) — 3-arg shuffle
      *
@@ -14027,6 +14493,123 @@ tok_next:
     expr_eq(); /* first vector (vec1) */
     skip(',');
     expr_eq(); /* second arg (vec2 or mask) */
+
+    if (tok1 == TOK_builtin_shufflevector)
+    {
+      SValue vec1_sv, vec2_sv;
+      CType vec1_type, vec2_type, src_elem_type, result_vec_type;
+      int src_elem_size, src_elem_align;
+      int vec1_elem_count, vec2_elem_count;
+      int total_src_elems, result_elem_count;
+      int result_size, res_vr, res_loc;
+      int indices[64];
+      int i;
+
+      result_elem_count = 0;
+      while (tok == ',')
+      {
+        if (result_elem_count >= (int)(sizeof(indices) / sizeof(indices[0])))
+          tcc_error("too many __builtin_shufflevector indices");
+        skip(',');
+        indices[result_elem_count++] = expr_const();
+      }
+      skip(')');
+
+      vec2_sv = *vtop;
+      vtop--;
+      vec1_sv = *vtop;
+      vtop--;
+
+      if (!is_vector_type(&vec1_sv.type) || !is_vector_type(&vec2_sv.type))
+        tcc_error("__builtin_shufflevector arguments must be vectors");
+
+      vec1_type = vec1_sv.type;
+      vec2_type = vec2_sv.type;
+      if (!is_compatible_unqualified_types(&vec1_type.ref->type, &vec2_type.ref->type))
+        tcc_error("__builtin_shufflevector argument vectors must have the same element type");
+
+      src_elem_type = vec1_type.ref->type;
+      src_elem_size = type_size(&src_elem_type, &src_elem_align);
+      vec1_elem_count = vector_elem_count(&vec1_type);
+      vec2_elem_count = vector_elem_count(&vec2_type);
+      total_src_elems = vec1_elem_count + vec2_elem_count;
+
+      if (result_elem_count < 1 || (result_elem_count & (result_elem_count - 1)) != 0)
+        tcc_error("__builtin_shufflevector result element count must be a power of two");
+
+      result_size = result_elem_count * src_elem_size;
+      if (result_size > 64)
+        tcc_error("__builtin_shufflevector result too large");
+
+      make_vector_type(&result_vec_type, &src_elem_type, result_size);
+      res_loc = get_temp_local_var(result_size, result_size > 8 ? 8 : result_size, &res_vr);
+
+      for (i = 0; i < result_elem_count; ++i)
+      {
+        int src_index = indices[i];
+
+        if (src_index < -1 || src_index >= total_src_elems)
+          tcc_error("__builtin_shufflevector index %d is out of range", src_index);
+
+        if (src_index == -1)
+        {
+          vpushi(0);
+          gen_cast(&src_elem_type);
+        }
+        else if (src_index < vec1_elem_count)
+        {
+          vpushv(&vec1_sv);
+          gaddrof();
+          vtop->type = char_pointer_type;
+          vpushi(src_index * src_elem_size);
+          gen_op('+');
+          vtop->type = src_elem_type;
+          vtop->r |= VT_LVAL;
+        }
+        else
+        {
+          vpushv(&vec2_sv);
+          gaddrof();
+          vtop->type = char_pointer_type;
+          vpushi((src_index - vec1_elem_count) * src_elem_size);
+          gen_op('+');
+          vtop->type = src_elem_type;
+          vtop->r |= VT_LVAL;
+        }
+
+        {
+          SValue res_base;
+          memset(&res_base, 0, sizeof(res_base));
+          res_base.type = result_vec_type;
+          res_base.r = VT_LOCAL | VT_LVAL;
+          res_base.vr = res_vr;
+          res_base.c.i = res_loc;
+
+          vpushv(&res_base);
+          gaddrof();
+          vtop->type = char_pointer_type;
+          vpushi(i * src_elem_size);
+          gen_op('+');
+          vtop->type = src_elem_type;
+          vtop->r |= VT_LVAL;
+        }
+
+        vswap();
+        vstore();
+        vpop();
+      }
+
+      {
+        SValue result;
+        memset(&result, 0, sizeof(result));
+        result.type = result_vec_type;
+        result.r = VT_LOCAL | VT_LVAL;
+        result.vr = res_vr;
+        result.c.i = res_loc;
+        vpushv(&result);
+      }
+      break;
+    }
 
     int has_two_sources = 0;
     if (tok == ',')
@@ -15651,10 +16234,11 @@ tok_next:
       /* Fold reads from const-qualified scalar globals with known initializers.
        * If the variable is const (not volatile), has a simple scalar type,
        * and the initializer data is available in the section, replace the
-       * lvalue reference with the compile-time constant value. This enables
-       * downstream constant folding (e.g. (int)const_double != 1 -> false). */
-      if (tcc_state->optimize && (s->type.t & VT_CONSTANT) && !(s->type.t & VT_VOLATILE) && !(s->type.t & VT_ARRAY) &&
-          !(s->type.t & VT_VLA) && (s->type.t & VT_BTYPE) != VT_FUNC && (s->type.t & VT_BTYPE) != VT_STRUCT &&
+       * lvalue reference with the compile-time constant value. This is needed
+       * even at -O0 for constant-evaluation contexts such as static
+       * initializers. */
+      if ((s->type.t & VT_CONSTANT) && !(s->type.t & VT_VOLATILE) && !(s->type.t & VT_ARRAY) && !(s->type.t & VT_VLA) &&
+          (s->type.t & VT_BTYPE) != VT_FUNC && (s->type.t & VT_BTYPE) != VT_STRUCT &&
           (s->type.t & VT_BTYPE) != VT_PTR && s->c > 0)
       {
         ElfSym *esym = elfsym(s);
@@ -16072,7 +16656,8 @@ tok_next:
 
         {
           int is_unsigned;
-          can_inline_builtin = get_builtin_abs_info(func_name, &is_unsigned);
+          can_inline_builtin =
+              get_builtin_abs_info(func_name, &is_unsigned) && builtin_abs_decl_matches(call_func_sym, func_name);
         }
       }
 
@@ -16294,6 +16879,33 @@ tok_next:
           tok_str_add(fixed_args, 0);
           tok_str_add(va_args, TOK_EOF);
 
+          if (token_stream_references_local_object(tok_str_buf(va_args)))
+          {
+            TokenString *replay_args = tok_str_alloc();
+            const int *rp = tok_str_buf(all_args);
+
+            while (1)
+            {
+              int t;
+              CValue cv;
+
+              tok_get(&t, &rp, &cv);
+              if (t == TOK_EOF || t == 0)
+                break;
+              tok_str_add2(replay_args, t, &cv);
+            }
+            tok_str_add(replay_args, ')');
+            tok_str_add(replay_args, 0);
+
+            tok_str_free(all_args);
+            tok_str_free(fixed_args);
+            tok_str_free(va_args);
+
+            begin_macro(replay_args, 1);
+            next();
+            goto va_arg_pack_done;
+          }
+
           /* Check if variadic args are empty */
           int va_args_empty = 1;
           {
@@ -16433,6 +17045,7 @@ tok_next:
           tok_str_free(va_args);
         }
       }
+    va_arg_pack_done:
 
       p = NULL;
       if (tok != ')')
@@ -16556,7 +17169,7 @@ tok_next:
           skip(',');
         }
       }
-      if (sa)
+      if (sa && s->f.func_type != FUNC_OLD)
         tcc_error("too few arguments to function");
 
       if (p)
@@ -16645,7 +17258,7 @@ tok_next:
           else if (strcmp(func_name, "umaxabs") == 0 && !(tcc_state->no_builtin_funcs & NO_BUILTIN_UMAXABS))
             builtin_ok = 1;
         }
-        if (builtin_ok)
+        if (builtin_ok && builtin_abs_decl_matches(call_func_sym, func_name))
         {
           /* Roll back FUNCPARAMVAL ops first, preserving argument eval IR */
           int rollback_idx = (ir_idx_before_first_param >= 0) ? ir_idx_before_first_param : ir_idx_before_args;
@@ -17009,8 +17622,35 @@ tok_next:
       {
         int folded_result = 0;
         int can_fold_result = 0;
+        int lhs_len = 0;
+        int rhs_len = 0;
+        const char *lhs_str = NULL;
+        const char *rhs_str = NULL;
+        size_t n_const = 0;
 
-        if (nb_real_args == 3 && is_zero_length_builtin_compare(&saved_args[2]))
+        if (nb_real_args == 2 && strcmp(func_name, "strcmp") == 0)
+        {
+          lhs_str = try_get_constant_string(&saved_args[0], &lhs_len);
+          rhs_str = try_get_constant_string(&saved_args[1], &rhs_len);
+          if (lhs_str && rhs_str)
+          {
+            folded_result = fold_builtin_strcmp_result(lhs_str, rhs_str);
+            can_fold_result = 1;
+          }
+        }
+
+        if (!can_fold_result && nb_real_args == 3 && strcmp(func_name, "strncmp") == 0)
+        {
+          lhs_str = try_get_constant_string(&saved_args[0], &lhs_len);
+          rhs_str = try_get_constant_string(&saved_args[1], &rhs_len);
+          if (lhs_str && rhs_str && try_get_constant_size_t(&saved_args[2], &n_const))
+          {
+            folded_result = fold_builtin_strncmp_result(lhs_str, rhs_str, n_const);
+            can_fold_result = 1;
+          }
+        }
+
+        if (!can_fold_result && nb_real_args == 3 && is_zero_length_builtin_compare(&saved_args[2]))
         {
           if (strcmp(func_name, "strncmp") == 0 || strcmp(func_name, "memcmp") == 0)
           {
@@ -17070,9 +17710,15 @@ tok_next:
          * Only expand inline functions whose body contains address-of-label
          * (&&label).  This is the specific case where call-site inlining
          * is required: each expansion must get unique label addresses.
-         * General inlining of all inline functions is left to
+         * Also expand always_inline functions at the call site when their
+         * body contains inline asm, so asm constraints are checked against
+         * caller-provided operands rather than abstract parameters.
+         * General inlining of all other inline functions is left to
          * gen_inline_functions() which compiles them as standalone funcs. */
         struct InlineFunc *inline_fn = NULL;
+        int force_always_inline = 0;
+        int has_addr_of_label = 0;
+        int has_inline_asm = 0;
         for (int fi = 0; fi < tcc_state->nb_inline_fns; fi++)
         {
           if (tcc_state->inline_fns[fi]->sym == call_func_sym)
@@ -17081,26 +17727,19 @@ tok_next:
             break;
           }
         }
-        /* Check if the body contains &&label (TOK_LAND followed by identifier) */
-        int has_addr_of_label = 0;
         if (inline_fn && inline_fn->func_str)
+          inline_scan_body_features(inline_fn->func_str, &has_addr_of_label, &has_inline_asm);
+        if (call_func_sym->type.ref && call_func_sym->type.ref->f.func_alwinl && has_inline_asm)
+          force_always_inline = 1;
+        if (force_always_inline && inline_fn && ((call_func_sym->type.ref->type.t & VT_BTYPE) != VT_VOID) &&
+            !inline_body_has_return_stmt(inline_fn->func_str))
         {
-          const int *tp = tok_str_buf(inline_fn->func_str);
-          int prev_tok_val = 0;
-          while (*tp)
-          {
-            int tv;
-            CValue tcv;
-            tok_get(&tv, &tp, &tcv);
-            if (prev_tok_val == TOK_LAND && tv >= TOK_UIDENT)
-            {
-              has_addr_of_label = 1;
-              break;
-            }
-            prev_tok_val = tv;
-          }
+          /* A non-void always_inline body that falls through without any
+           * explicit return cannot currently be replayed safely at the call
+           * site. Keep it as a normal inline call so we warn but don't crash. */
+          force_always_inline = 0;
         }
-        if (inline_fn && inline_fn->func_str && has_addr_of_label)
+        if (inline_fn && inline_fn->func_str && (has_addr_of_label || force_always_inline))
         {
           /* --- 1. NOP out FUNCPARAMVALs for this call --- */
           if (ir_idx_before_first_param >= 0)
@@ -17125,6 +17764,8 @@ tok_next:
           /* --- 2. Create parameter locals and store arguments --- */
           Sym *saved_local = local_stack;
           int saved_local_scope = local_scope;
+          int saved_inline_const_arg_count = tcc_state->inline_const_arg_count;
+          tcc_state->inline_const_arg_count = 0;
           ++local_scope;            /* shadow caller's same-named variables */
           Sym *param_sym = s->next; /* first parameter from function type */
           for (int pi = 0; pi < nb_args && param_sym; pi++, param_sym = param_sym->next)
@@ -17139,6 +17780,15 @@ tok_next:
 
             /* Push parameter symbol FIRST so it gets a vreg assigned */
             Sym *psym = sym_push(param_sym->v & ~SYM_FIELD, &param_sym->type, VT_LOCAL | VT_LVAL, loc);
+
+            if (force_always_inline && inline_arg_is_constant_like(&saved_args[pi]) &&
+                tcc_state->inline_const_arg_count < countof(tcc_state->inline_const_args))
+            {
+              int map_idx = tcc_state->inline_const_arg_count++;
+              tcc_state->inline_const_args[map_idx].vreg = psym->vreg;
+              tcc_state->inline_const_args[map_idx].stack_offset = loc;
+              tcc_state->inline_const_args[map_idx].value = saved_args[pi];
+            }
 
             /* Store argument to local via IR */
             SValue store_dst;
@@ -17185,6 +17835,10 @@ tok_next:
           /* --- 4. Replay inline function body --- */
           int saved_tok = tok;
           CValue saved_tokc = tokc;
+          int *inline_label_tokens = NULL;
+          int nb_inline_label_tokens = 0;
+          Sym **saved_inline_labels =
+              inline_hide_label_bindings(inline_fn->func_str, &inline_label_tokens, &nb_inline_label_tokens);
 
           TokenString *inline_ts = tok_str_alloc();
           inline_ts->data.str = tok_str_buf(inline_fn->func_str);
@@ -17194,6 +17848,7 @@ tok_next:
           next();
           block(0);
           end_macro();
+          inline_restore_label_bindings(inline_label_tokens, saved_inline_labels, nb_inline_label_tokens);
 
           tok = saved_tok;
           tokc = saved_tokc;
@@ -17208,6 +17863,7 @@ tok_next:
           rsym = saved_rsym;
           funcname = saved_funcname;
           root_scope = saved_root_scope;
+          tcc_state->inline_const_arg_count = saved_inline_const_arg_count;
           sym_pop(&local_stack, saved_local, 0);
           local_scope = saved_local_scope;
 
@@ -17233,13 +17889,18 @@ tok_next:
         }
         else
         {
-          /* No &&label found, or InlineFunc not found - normal call */
+          /* No special call-site inline requirement found, or InlineFunc not found - normal call */
           goto normal_call;
         }
       }
       else
       {
       normal_call:;
+
+        if (call_func_sym && call_func_sym->type.ref && call_func_sym->type.ref->f.func_alwinl)
+        {
+          call_func_sym->type.ref->f.func_outofline_needed = 1;
+        }
 
         int return_vreg = -1;
         if (NOEVAL_WANTED)
@@ -20114,8 +20775,10 @@ static void decl_initializer(init_params *p, CType *type, unsigned long c, int f
        /* a struct may be initialized from a struct of same type, as in
                struct {int x,y;} a = {1,2}, b = {3,4}, c[] = {a,b};
           In that case we need to parse the element in order to check
-          it for compatibility below */
-       || (type->t & VT_BTYPE) == VT_STRUCT))
+         it for compatibility below.  Likewise, an array may be
+         initialized from a compound-literal expression such as
+         '(const unsigned short[]){ ... }'. */
+       || (type->t & VT_ARRAY) || (type->t & VT_BTYPE) == VT_STRUCT))
   {
     int ncw_prev = nocode_wanted;
     if ((flags & DIF_SIZE_ONLY) && !p->sec)
@@ -20127,6 +20790,13 @@ static void decl_initializer(init_params *p, CType *type, unsigned long c, int f
 
   if (type->t & VT_ARRAY)
   {
+    if ((flags & DIF_HAVE_ELEM) && is_compatible_unqualified_types(type, &vtop->type))
+    {
+      if ((flags & DIF_SIZE_ONLY) && type->ref->c < 0 && (vtop->type.t & VT_ARRAY) && vtop->type.ref->c > 0)
+        decl_design_flex(p, type->ref, vtop->type.ref->c - 1);
+      goto one_elem;
+    }
+
     no_oblock = 1;
     if (((flags & DIF_FIRST) && tok != TOK_LSTR && tok != TOK_STR) || tok == '{')
     {
@@ -21976,6 +22646,12 @@ static void gen_function(Sym *sym)
     if (tcc_state->opt_const_prop)
       changes += tcc_ir_opt_const_prop_tmp(ir);
 
+    /* Phase 1b1: fold constant string builtin calls after argument/address
+     * propagation exposes literal-backed pointers in the IR.
+     */
+    if (tcc_state->opt_const_prop)
+      changes += tcc_ir_opt_const_string_calls(ir);
+
     /* Phase 1c: Constant Branch Folding - fold branches with constant conditions
      * This is critical for optimizing conditionals where values are constants.
      * Must run after constant propagation to maximize folding opportunities.
@@ -21995,6 +22671,12 @@ static void gen_function(Sym *sym)
      */
     if (tcc_state->opt_nonneg_fold)
       changes += tcc_ir_opt_nonneg_branch_fold(ir);
+
+    /* Phase 1e1: Float comparison branch folding - fold repeated FCMP and
+     * duplicated pure boolean tests on the fall-through path.
+     */
+    if (tcc_state->opt_vrp)
+      changes += tcc_ir_opt_float_branch_fold(ir);
 
     /* Phase 1e2: Value Range Propagation - fold branches whose outcome is
      * fully determined by value ranges derived from earlier branches.
@@ -22413,6 +23095,9 @@ static void gen_inline_functions(TCCState *s)
     {
       fn = s->inline_fns[i];
       sym = fn->sym;
+      if (sym && (sym->type.t & VT_INLINE) && sym->type.ref && sym->type.ref->f.func_alwinl && !sym->a.addrtaken &&
+          !sym->type.ref->f.func_outofline_needed)
+        continue;
       if (sym && (sym->c || !(sym->type.t & VT_INLINE)))
       {
         /* Skip original va_arg_pack functions - only their clones get compiled */
@@ -22514,10 +23199,12 @@ static int decl(int l)
         asm_global_instr();
         continue;
       }
-      if (tok >= TOK_UIDENT)
+      if (tok >= TOK_UIDENT || tok == '*' || tok == '(')
       {
         /* special test for old K&R protos without explicit int
-           type. Only accepted when defining global data */
+           type. Only accepted when defining global data, including
+           pointer or parenthesized declarators such as '*p;' or
+           '(*fp)();'. */
         btype.t = VT_INT;
         oldint = 1;
       }
@@ -22551,11 +23238,16 @@ static int decl(int l)
       type = btype;
       ad = adbase;
       type_decl(&type, &ad, &v, TYPE_DIRECT);
+      if (ad.attr_mode && !(type.t & VT_VECTOR) && (btype.t & (VT_BTYPE | VT_LONG)) != (ad.attr_mode - 1))
+      {
+        int u = ad.attr_mode - 1;
+        type.t = (type.t & ~(VT_BTYPE | VT_LONG)) | u;
+      }
       /* Apply __attribute__((vector_size(N))) if it appeared after the declarator
        * name (e.g. "typedef int V2SI __attribute__((vector_size(8)))").
        * decl_spec_type handles it when the attribute precedes the name;
        * this covers the post-declarator position. */
-      if (ad.vector_size && !(type.t & VT_VECTOR))
+      if (ad.vector_size && !(btype.t & VT_VECTOR) && !(type.t & VT_VECTOR))
       {
         int storage = type.t & VT_STORAGE;
         CType elem = {type.t & ~VT_STORAGE, type.ref};
@@ -22578,8 +23270,17 @@ static int decl(int l)
         sym = type.ref;
         if (sym->f.func_type == FUNC_OLD && l == VT_CONST)
         {
+          CType saved_func_vt = func_vt;
           func_vt = type;
           decl(VT_CMP);
+          func_vt = saved_func_vt;
+        }
+        else if (sym->f.func_type == FUNC_OLD && l == VT_LOCAL && tok != '{')
+        {
+          CType saved_func_vt = func_vt;
+          func_vt = type;
+          decl(VT_CMP);
+          func_vt = saved_func_vt;
         }
 
         if ((type.t & (VT_EXTERN | VT_INLINE)) == (VT_EXTERN | VT_INLINE))
@@ -23050,7 +23751,7 @@ static int decl(int l)
           if (has_init && (type.t & VT_VLA))
             tcc_error("variable length array cannot be initialized");
 
-           if (((type.t & VT_EXTERN) && (!has_init || l != VT_CONST)) ||
+          if (((type.t & VT_EXTERN) && (!has_init || l != VT_CONST)) ||
               (type.t & VT_BTYPE) == VT_FUNC
               /* as with GCC, uninitialized global arrays with no size
                 are considered extern: */
@@ -23058,8 +23759,8 @@ static int decl(int l)
               /* likewise, accept tentative file-scope declarations of
                 incomplete struct/union objects and let a later complete
                 definition provide the storage. */
-              || (!has_init && l == VT_CONST && !(type.t & VT_STATIC) &&
-                (type.t & VT_BTYPE) == VT_STRUCT && type_size(&type, &align) < 0))
+              || (!has_init && l == VT_CONST && !(type.t & VT_STATIC) && (type.t & VT_BTYPE) == VT_STRUCT &&
+                  type_size(&type, &align) < 0))
           {
             /* external variable or function */
             type.t |= VT_EXTERN;

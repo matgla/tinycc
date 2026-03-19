@@ -14,6 +14,7 @@ Compile tests only verify successful compilation (no linking/execution).
 
 import pytest
 import re
+import resource
 import subprocess
 import sys
 import time
@@ -257,8 +258,22 @@ def test_gcc_compile_ir(test_case, opt_level, tmp_path):
         "-o", str(output_obj),
     ])
 
+    def _raise_stack_limit():
+        try:
+            soft, hard = resource.getrlimit(resource.RLIMIT_STACK)
+            target = hard if hard != resource.RLIM_INFINITY else resource.RLIM_INFINITY
+            resource.setrlimit(resource.RLIMIT_STACK, (target, hard))
+        except Exception:
+            pass
+
     try:
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=test_case.timeout)
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=test_case.timeout,
+            preexec_fn=_raise_stack_limit,
+        )
     except subprocess.TimeoutExpired:
         pytest.fail(f"Compilation timed out after {test_case.timeout}s")
     output = ((result.stderr.decode(errors="replace") if result.stderr else "")

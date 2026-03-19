@@ -1763,6 +1763,76 @@ static int parse_include(TCCState *s1, int do_next, int test)
   return 1;
 }
 
+static int pp_assertion_macro_defined(const char *name)
+{
+  int tok;
+  char buf[256];
+  int len;
+
+  len = strlen(name);
+  tok = tok_alloc(name, len)->tok;
+  if (define_find(tok))
+    return 1;
+
+  if (len + 4 >= sizeof(buf))
+    return 0;
+
+  buf[0] = '_';
+  buf[1] = '_';
+  memcpy(buf + 2, name, len);
+  memcpy(buf + 2 + len, "__", 3);
+  tok = tok_alloc(buf, len + 4)->tok;
+  if (define_find(tok))
+    return 1;
+
+  buf[2 + len] = '\0';
+  tok = tok_alloc(buf, len + 2)->tok;
+  return define_find(tok) != NULL;
+}
+
+static int pp_assertion_value(int kind_tok, int value_tok)
+{
+  const char *kind;
+  const char *value;
+
+  if (kind_tok < TOK_IDENT || value_tok < TOK_IDENT)
+    return 0;
+
+  kind = table_ident[kind_tok - TOK_IDENT]->str;
+  value = table_ident[value_tok - TOK_IDENT]->str;
+
+  if (!strcmp(kind, "cpu") || !strcmp(kind, "machine") || !strcmp(kind, "system"))
+    return pp_assertion_macro_defined(value);
+
+  return 0;
+}
+
+static void pp_parse_assertion(void)
+{
+  int kind_tok, value_tok;
+
+  next();
+  kind_tok = tok;
+  if (kind_tok < TOK_IDENT)
+    expect("identifier after '#'");
+
+  next();
+  if (tok != '(')
+    expect("'(' after preprocessor assertion");
+
+  next();
+  value_tok = tok;
+  if (value_tok < TOK_IDENT)
+    expect("identifier in preprocessor assertion");
+
+  next();
+  if (tok != ')')
+    expect("')'");
+
+  tok = TOK_CINT;
+  tokc.i = pp_assertion_value(kind_tok, value_tok);
+}
+
 /* eval an expression for #if/#elif */
 static int expr_preprocess(TCCState *s1)
 {
@@ -1777,7 +1847,11 @@ static int expr_preprocess(TCCState *s1)
   {
     next(); /* do macro subst */
     t = tok;
-    if (tok < TOK_IDENT)
+    if (tok == '#')
+    {
+      pp_parse_assertion();
+    }
+    else if (tok < TOK_IDENT)
     {
       if (tok == TOK_LINEFEED || tok == TOK_EOF)
         break;

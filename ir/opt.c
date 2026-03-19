@@ -1400,6 +1400,832 @@ static int vrp_cmp_implies(int known_true, int check)
   }
 }
 
+static uint8_t *ir_opt_build_merge_bitmap(TCCIRState *ir, int n)
+{
+  uint8_t *is_merge = tcc_mallocz((n + 7) / 8);
+  int *pred_count = tcc_mallocz(n * sizeof(int));
+
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
+    {
+      IROperand dest = tcc_ir_op_get_dest(ir, q);
+      int target = (int)dest.u.imm32;
+      if (target >= 0 && target < n)
+      {
+        pred_count[target]++;
+        if (i > target)
+          is_merge[target / 8] |= (1 << (target % 8));
+      }
+    }
+    if (i + 1 < n && q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_NOP && q->op != TCCIR_OP_RETURNVALUE &&
+        q->op != TCCIR_OP_RETURNVOID)
+    {
+      pred_count[i + 1]++;
+    }
+  }
+
+  for (int i = 0; i < n; i++)
+  {
+    if (pred_count[i] > 1)
+      is_merge[i / 8] |= (1 << (i % 8));
+  }
+
+  tcc_free(pred_count);
+  return is_merge;
+}
+
+static int fcmp_cmp_implies(int known_true, int check)
+{
+  if (known_true == check)
+    return 1;
+
+  switch (known_true)
+  {
+  case TOK_EQ:
+    return (check == TOK_LE || check == TOK_GE);
+  case TOK_NE:
+    return (check == TOK_NE);
+  case TOK_LT:
+  case TOK_ULT:
+    return (check == TOK_LE || check == TOK_NE || check == TOK_ULE);
+  case TOK_GT:
+  case TOK_UGT:
+    return (check == TOK_GE || check == TOK_NE || check == TOK_UGE);
+  default:
+    return 0;
+  }
+}
+
+static int ir_opt_next_non_nop(TCCIRState *ir, int start)
+{
+  int n = ir->next_instruction_index;
+  for (int i = start; i < n; ++i)
+  {
+    if (ir->compact_instructions[i].op != TCCIR_OP_NOP)
+      return i;
+  }
+  return -1;
+}
+
+static int ir_opt_is_pure_helper_name(const char *name)
+{
+  if (!name)
+    return 0;
+
+  return strcmp(name, "isnan") == 0 || strcmp(name, "__isnan") == 0 || strcmp(name, "__isnanf") == 0 ||
+         strcmp(name, "__aeabi_f2d") == 0 || strcmp(name, "__aeabi_d2f") == 0;
+}
+
+static int ir_opt_is_flag_cmp_helper_name(const char *name)
+{
+  if (!name)
+    return 0;
+
+  return strcmp(name, "__aeabi_cfcmple") == 0 || strcmp(name, "__aeabi_cdcmple") == 0;
+}
+
+static int ir_opt_get_call_param_operand(TCCIRState *ir, int call_idx, int param_idx, IROperand *out)
+{
+  IRQuadCompact *call_q;
+  IROperand call_src2;
+  int call_id;
+
+  if (!ir || call_idx < 0 || call_idx >= ir->next_instruction_index || !out)
+    return 0;
+
+  call_q = &ir->compact_instructions[call_idx];
+  if (call_q->op != TCCIR_OP_FUNCCALLVAL && call_q->op != TCCIR_OP_FUNCCALLVOID)
+    return 0;
+
+  call_src2 = tcc_ir_op_get_src2(ir, call_q);
+  call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, call_src2));
+
+  for (int i = call_idx - 1; i >= 0; --i)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    if (q->op != TCCIR_OP_FUNCPARAMVAL && q->op != TCCIR_OP_FUNCPARAMVOID)
+      continue;
+
+    IROperand enc = tcc_ir_op_get_src2(ir, q);
+    uint32_t encoded = (uint32_t)irop_get_imm64_ex(ir, enc);
+    if (TCCIR_DECODE_CALL_ID(encoded) != call_id)
+      continue;
+    if (TCCIR_DECODE_PARAM_IDX(encoded) != param_idx)
+      continue;
+
+    *out = tcc_ir_op_get_src1(ir, q);
+    return 1;
+  }
+
+  return 0;
+}
+
+static void ir_opt_nop_call_params(TCCIRState *ir, int call_idx)
+{
+  IRQuadCompact *call_q;
+  int call_id;
+
+  if (!ir || call_idx < 0 || call_idx >= ir->next_instruction_index)
+    return;
+
+  call_q = &ir->compact_instructions[call_idx];
+  if (call_q->op != TCCIR_OP_FUNCCALLVAL && call_q->op != TCCIR_OP_FUNCCALLVOID)
+    return;
+
+  call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, call_q)));
+  for (int i = call_idx - 1; i >= 0; --i)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    IROperand enc;
+    uint32_t encoded;
+
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    if (q->op != TCCIR_OP_FUNCPARAMVAL && q->op != TCCIR_OP_FUNCPARAMVOID)
+      continue;
+
+    enc = tcc_ir_op_get_src2(ir, q);
+    encoded = (uint32_t)irop_get_imm64_ex(ir, enc);
+    if (TCCIR_DECODE_CALL_ID(encoded) == call_id)
+      q->op = TCCIR_OP_NOP;
+  }
+}
+
+static int ir_opt_vreg_address_taken_between(TCCIRState *ir, int32_t vreg, int start_idx, int end_idx)
+{
+  if (!ir)
+    return 0;
+
+  for (int i = start_idx + 1; i < end_idx; ++i)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_LEA && irop_get_vreg(tcc_ir_op_get_src1(ir, q)) == vreg)
+      return 1;
+  }
+
+  return 0;
+}
+
+static const char *ir_opt_get_constant_string_from_symref(TCCIRState *ir, IROperand op)
+{
+  IRPoolSymref *symref;
+  Sym *sym;
+  ElfSym *esym;
+  Section *sec;
+  addr_t offset;
+
+  if (!ir || irop_get_tag(op) != IROP_TAG_SYMREF)
+    return NULL;
+
+  symref = irop_get_symref_ex(ir, op);
+  if (!symref || symref->addend < 0)
+    return NULL;
+  if (symref->flags & IRPOOL_SYMREF_LVAL)
+    return NULL;
+
+  sym = symref->sym;
+  if (!sym)
+    return NULL;
+
+  esym = elfsym(sym);
+  if (!esym)
+    return NULL;
+  if (esym->st_shndx == SHN_UNDEF || esym->st_shndx >= (unsigned)tcc_state->nb_sections)
+    return NULL;
+
+  sec = tcc_state->sections[esym->st_shndx];
+  if (!sec || !sec->data)
+    return NULL;
+
+  offset = esym->st_value + (addr_t)symref->addend;
+  if (offset >= sec->data_offset)
+    return NULL;
+
+  return (const char *)(sec->data + offset);
+}
+
+static int ir_opt_eval_const_u64(TCCIRState *ir, IROperand op, int use_idx, uint64_t *out, int depth)
+{
+  int32_t vr;
+  int def_idx;
+  IRQuadCompact *q;
+
+  if (!ir || !out || depth > 12)
+    return 0;
+
+  if (irop_is_immediate(op))
+  {
+    *out = (uint64_t)irop_get_imm64_ex(ir, op);
+    return 1;
+  }
+
+  vr = irop_get_vreg(op);
+  if (vr < 0)
+    return 0;
+
+  if (ir_opt_vreg_address_taken_between(ir, vr, 0, use_idx))
+    return 0;
+
+  def_idx = tcc_ir_find_defining_instruction(ir, vr, use_idx);
+  if (def_idx < 0)
+    return 0;
+
+  q = &ir->compact_instructions[def_idx];
+  switch (q->op)
+  {
+  case TCCIR_OP_ASSIGN:
+  case TCCIR_OP_LOAD:
+    return ir_opt_eval_const_u64(ir, tcc_ir_op_get_src1(ir, q), def_idx, out, depth + 1);
+  default:
+    return 0;
+  }
+}
+
+static int ir_opt_eval_const_string(TCCIRState *ir, IROperand op, int use_idx, const char **out, int depth)
+{
+  const char *base;
+  int32_t vr;
+  int def_idx;
+  IRQuadCompact *q;
+
+  if (!ir || !out || depth > 16)
+    return 0;
+
+  base = ir_opt_get_constant_string_from_symref(ir, op);
+  if (base)
+  {
+    *out = base;
+    return 1;
+  }
+
+  vr = irop_get_vreg(op);
+  if (vr < 0)
+    return 0;
+
+  if (ir_opt_vreg_address_taken_between(ir, vr, 0, use_idx))
+    return 0;
+
+  def_idx = tcc_ir_find_defining_instruction(ir, vr, use_idx);
+  if (def_idx < 0)
+    return 0;
+
+  q = &ir->compact_instructions[def_idx];
+  switch (q->op)
+  {
+  case TCCIR_OP_ASSIGN:
+  case TCCIR_OP_LOAD:
+    return ir_opt_eval_const_string(ir, tcc_ir_op_get_src1(ir, q), def_idx, out, depth + 1);
+  case TCCIR_OP_ADD:
+  {
+    uint64_t addend;
+    if (ir_opt_eval_const_string(ir, tcc_ir_op_get_src1(ir, q), def_idx, out, depth + 1) &&
+        ir_opt_eval_const_u64(ir, tcc_ir_op_get_src2(ir, q), def_idx, &addend, depth + 1))
+    {
+      *out += addend;
+      return 1;
+    }
+    if (ir_opt_eval_const_string(ir, tcc_ir_op_get_src2(ir, q), def_idx, out, depth + 1) &&
+        ir_opt_eval_const_u64(ir, tcc_ir_op_get_src1(ir, q), def_idx, &addend, depth + 1))
+    {
+      *out += addend;
+      return 1;
+    }
+    return 0;
+  }
+  default:
+    return 0;
+  }
+}
+
+static int ir_opt_fold_strcmp_result(const char *s1, const char *s2)
+{
+  while ((unsigned char)*s1 == (unsigned char)*s2)
+  {
+    if (*s1 == '\0')
+      return 0;
+    ++s1;
+    ++s2;
+  }
+
+  return (int)(unsigned char)*s1 - (int)(unsigned char)*s2;
+}
+
+static int ir_opt_fold_strncmp_result(const char *s1, const char *s2, uint64_t n)
+{
+  if (n == 0)
+    return 0;
+
+  while (n-- > 0)
+  {
+    unsigned char c1 = (unsigned char)*s1++;
+    unsigned char c2 = (unsigned char)*s2++;
+    if (c1 != c2 || c1 == '\0')
+      return (int)c1 - (int)c2;
+  }
+
+  return 0;
+}
+
+int tcc_ir_opt_const_string_calls(TCCIRState *ir)
+{
+  int changes = 0;
+
+  if (!ir)
+    return 0;
+
+  for (int i = 0; i < ir->next_instruction_index; ++i)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    Sym *callee;
+    const char *name;
+    IROperand arg0;
+    IROperand arg1;
+    const char *s1;
+    const char *s2;
+    int folded_result;
+
+    if (q->op != TCCIR_OP_FUNCCALLVAL)
+      continue;
+
+    callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+    if (!callee)
+      continue;
+
+    name = get_tok_str(callee->v, NULL);
+    if (!name || (strcmp(name, "strcmp") != 0 && strcmp(name, "strncmp") != 0))
+      continue;
+
+    if (!ir_opt_get_call_param_operand(ir, i, 0, &arg0) || !ir_opt_get_call_param_operand(ir, i, 1, &arg1))
+      continue;
+
+    if (!ir_opt_eval_const_string(ir, arg0, i, &s1, 0) || !ir_opt_eval_const_string(ir, arg1, i, &s2, 0))
+    {
+      continue;
+    }
+
+    if (strcmp(name, "strcmp") == 0)
+    {
+      folded_result = ir_opt_fold_strcmp_result(s1, s2);
+    }
+    else
+    {
+      IROperand arg2;
+      uint64_t n;
+      if (!ir_opt_get_call_param_operand(ir, i, 2, &arg2) || !ir_opt_eval_const_u64(ir, arg2, i, &n, 0))
+        continue;
+      folded_result = ir_opt_fold_strncmp_result(s1, s2, n);
+    }
+
+    ir_opt_nop_call_params(ir, i);
+    q->op = TCCIR_OP_ASSIGN;
+    tcc_ir_set_src1(ir, i, irop_make_imm32(-1, folded_result, VT_INT));
+    tcc_ir_set_src2(ir, i, IROP_NONE);
+    changes++;
+  }
+
+  return changes;
+}
+
+static int ir_opt_pure_expr_equal(TCCIRState *ir, IROperand a, int a_use_idx, IROperand b, int b_use_idx, int depth);
+
+static int ir_opt_pure_def_equal(TCCIRState *ir, int a_def_idx, int b_def_idx, int depth)
+{
+  IRQuadCompact *qa;
+  IRQuadCompact *qb;
+
+  if (a_def_idx < 0 || b_def_idx < 0)
+    return 0;
+  if (depth > 12)
+    return 0;
+
+  qa = &ir->compact_instructions[a_def_idx];
+  qb = &ir->compact_instructions[b_def_idx];
+
+  if (qa->op != qb->op)
+    return 0;
+
+  switch (qa->op)
+  {
+  case TCCIR_OP_ASSIGN:
+    return ir_opt_pure_expr_equal(ir, tcc_ir_op_get_src1(ir, qa), a_def_idx, tcc_ir_op_get_src1(ir, qb), b_def_idx,
+                                  depth + 1);
+  case TCCIR_OP_OR:
+  case TCCIR_OP_AND:
+  case TCCIR_OP_XOR:
+  case TCCIR_OP_BOOL_OR:
+  case TCCIR_OP_BOOL_AND:
+  {
+    IROperand a1 = tcc_ir_op_get_src1(ir, qa);
+    IROperand a2 = tcc_ir_op_get_src2(ir, qa);
+    IROperand b1 = tcc_ir_op_get_src1(ir, qb);
+    IROperand b2 = tcc_ir_op_get_src2(ir, qb);
+    return ((ir_opt_pure_expr_equal(ir, a1, a_def_idx, b1, b_def_idx, depth + 1) &&
+             ir_opt_pure_expr_equal(ir, a2, a_def_idx, b2, b_def_idx, depth + 1)) ||
+            (ir_opt_pure_expr_equal(ir, a1, a_def_idx, b2, b_def_idx, depth + 1) &&
+             ir_opt_pure_expr_equal(ir, a2, a_def_idx, b1, b_def_idx, depth + 1)));
+  }
+  case TCCIR_OP_FUNCCALLVAL:
+  {
+    IROperand a_callee_op = tcc_ir_op_get_src1(ir, qa);
+    IROperand b_callee_op = tcc_ir_op_get_src1(ir, qb);
+    Sym *a_callee = irop_get_sym_ex(ir, a_callee_op);
+    Sym *b_callee = irop_get_sym_ex(ir, b_callee_op);
+    const char *a_name;
+    const char *b_name;
+    IROperand a_call_meta = tcc_ir_op_get_src2(ir, qa);
+    IROperand b_call_meta = tcc_ir_op_get_src2(ir, qb);
+    int argc;
+
+    if (!a_callee || !b_callee)
+      return 0;
+
+    a_name = get_tok_str(a_callee->v, NULL);
+    b_name = get_tok_str(b_callee->v, NULL);
+    if (!ir_opt_is_pure_helper_name(a_name) || !b_name || strcmp(a_name, b_name) != 0)
+      return 0;
+
+    argc = TCCIR_DECODE_CALL_ARGC((uint32_t)irop_get_imm64_ex(ir, a_call_meta));
+    if (argc != TCCIR_DECODE_CALL_ARGC((uint32_t)irop_get_imm64_ex(ir, b_call_meta)))
+      return 0;
+
+    for (int param_idx = 0; param_idx < argc; ++param_idx)
+    {
+      IROperand a_arg;
+      IROperand b_arg;
+      if (!ir_opt_get_call_param_operand(ir, a_def_idx, param_idx, &a_arg) ||
+          !ir_opt_get_call_param_operand(ir, b_def_idx, param_idx, &b_arg))
+      {
+        return 0;
+      }
+      if (!ir_opt_pure_expr_equal(ir, a_arg, a_def_idx, b_arg, b_def_idx, depth + 1))
+        return 0;
+    }
+
+    return 1;
+  }
+  default:
+    return 0;
+  }
+}
+
+static int ir_opt_pure_expr_equal(TCCIRState *ir, IROperand a, int a_use_idx, IROperand b, int b_use_idx, int depth)
+{
+  int32_t a_vr;
+  int32_t b_vr;
+  int a_def_idx;
+  int b_def_idx;
+
+  if (depth > 12)
+    return 0;
+
+  if (irop_is_immediate(a) || irop_is_immediate(b))
+  {
+    if (!irop_is_immediate(a) || !irop_is_immediate(b))
+      return 0;
+    return irop_get_imm64_ex(ir, a) == irop_get_imm64_ex(ir, b);
+  }
+
+  a_vr = irop_get_vreg(a);
+  b_vr = irop_get_vreg(b);
+  if (a_vr < 0 || b_vr < 0)
+  {
+    if (a_vr != b_vr)
+      return 0;
+    return a.vr == b.vr && a.u.imm32 == b.u.imm32 && a.is_unsigned == b.is_unsigned && a.is_static == b.is_static &&
+           a.is_sym == b.is_sym && a.is_param == b.is_param;
+  }
+
+  a_def_idx = tcc_ir_find_defining_instruction(ir, a_vr, a_use_idx);
+  b_def_idx = tcc_ir_find_defining_instruction(ir, b_vr, b_use_idx);
+
+  if (a_def_idx < 0 || b_def_idx < 0)
+    return a_vr == b_vr && a_def_idx == b_def_idx;
+
+  if (a_def_idx == b_def_idx)
+    return 1;
+
+  return ir_opt_pure_def_equal(ir, a_def_idx, b_def_idx, depth + 1);
+}
+
+static int ir_opt_is_pure_fallthrough_instruction(TCCIRState *ir, int idx)
+{
+  IRQuadCompact *q;
+  Sym *callee;
+  const char *name;
+
+  if (!ir || idx < 0 || idx >= ir->next_instruction_index)
+    return 0;
+
+  q = &ir->compact_instructions[idx];
+  switch (q->op)
+  {
+  case TCCIR_OP_NOP:
+  case TCCIR_OP_ASSIGN:
+  case TCCIR_OP_OR:
+  case TCCIR_OP_AND:
+  case TCCIR_OP_XOR:
+  case TCCIR_OP_BOOL_OR:
+  case TCCIR_OP_BOOL_AND:
+  case TCCIR_OP_FUNCPARAMVAL:
+  case TCCIR_OP_FUNCPARAMVOID:
+    return 1;
+  case TCCIR_OP_FUNCCALLVAL:
+    callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+    if (!callee)
+      return 0;
+    name = get_tok_str(callee->v, NULL);
+    return ir_opt_is_pure_helper_name(name);
+  default:
+    return 0;
+  }
+}
+
+static int ir_opt_match_zero_test(TCCIRState *ir, int idx, IROperand *expr_out)
+{
+  IRQuadCompact *q;
+  IROperand src1;
+  IROperand src2;
+
+  if (!ir || idx < 0 || idx >= ir->next_instruction_index || !expr_out)
+    return 0;
+
+  q = &ir->compact_instructions[idx];
+  if (q->op == TCCIR_OP_TEST_ZERO)
+  {
+    *expr_out = tcc_ir_op_get_src1(ir, q);
+    return 1;
+  }
+
+  if (q->op != TCCIR_OP_CMP)
+    return 0;
+
+  src1 = tcc_ir_op_get_src1(ir, q);
+  src2 = tcc_ir_op_get_src2(ir, q);
+  if (irop_is_immediate(src2) && irop_get_imm64_ex(ir, src2) == 0)
+  {
+    *expr_out = src1;
+    return 1;
+  }
+  if (irop_is_immediate(src1) && irop_get_imm64_ex(ir, src1) == 0)
+  {
+    *expr_out = src2;
+    return 1;
+  }
+
+  return 0;
+}
+
+int tcc_ir_opt_float_branch_fold(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  int changes = 0;
+  uint8_t *is_merge;
+
+  if (n < 4)
+    return 0;
+
+  is_merge = ir_opt_build_merge_bitmap(ir, n);
+
+  for (int i = 0; i < n; ++i)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+
+    if (q->op == TCCIR_OP_FUNCCALLVOID || q->op == TCCIR_OP_FUNCCALLVAL)
+    {
+      Sym *callee;
+      const char *name;
+      int jump1_idx = ir_opt_next_non_nop(ir, i + 1);
+      int cmp2_idx;
+      int jump2_idx;
+      IRQuadCompact *jump1;
+      IRQuadCompact *cmp2;
+      IRQuadCompact *jump2;
+      IROperand arg0;
+      IROperand arg1;
+      IROperand cmp2_arg0;
+      IROperand cmp2_arg1;
+      int tok1;
+      int tok2;
+      int known_fact;
+      int effective_tok2 = -1;
+      int is_swapped = 0;
+
+      callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+      if (!callee)
+        continue;
+      name = get_tok_str(callee->v, NULL);
+      if (!ir_opt_is_flag_cmp_helper_name(name))
+        continue;
+      if (!ir_opt_get_call_param_operand(ir, i, 0, &arg0) || !ir_opt_get_call_param_operand(ir, i, 1, &arg1))
+        continue;
+
+      if (jump1_idx < 0)
+        continue;
+      jump1 = &ir->compact_instructions[jump1_idx];
+      if (jump1->op != TCCIR_OP_JUMPIF)
+        continue;
+
+      cmp2_idx = -1;
+      jump2_idx = -1;
+      for (int scan_idx = ir_opt_next_non_nop(ir, jump1_idx + 1); scan_idx >= 0 && scan_idx < n;
+           scan_idx = ir_opt_next_non_nop(ir, scan_idx + 1))
+      {
+        IRQuadCompact *scan_q;
+        Sym *scan_callee;
+        const char *scan_name;
+
+        if (is_merge[scan_idx / 8] & (1 << (scan_idx % 8)))
+          break;
+
+        scan_q = &ir->compact_instructions[scan_idx];
+        if (scan_q->op != TCCIR_OP_FUNCCALLVOID && scan_q->op != TCCIR_OP_FUNCCALLVAL)
+        {
+          if (!ir_opt_is_pure_fallthrough_instruction(ir, scan_idx))
+            break;
+          continue;
+        }
+
+        scan_callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, scan_q));
+        scan_name = scan_callee ? get_tok_str(scan_callee->v, NULL) : NULL;
+        if (!ir_opt_is_flag_cmp_helper_name(scan_name))
+        {
+          if (!ir_opt_is_pure_fallthrough_instruction(ir, scan_idx))
+            break;
+          continue;
+        }
+
+        cmp2_idx = scan_idx;
+        jump2_idx = ir_opt_next_non_nop(ir, cmp2_idx + 1);
+        break;
+      }
+
+      if (cmp2_idx < 0 || jump2_idx < 0)
+        continue;
+
+      cmp2 = &ir->compact_instructions[cmp2_idx];
+      jump2 = &ir->compact_instructions[jump2_idx];
+      if (jump2->op != TCCIR_OP_JUMPIF)
+        continue;
+
+      callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, cmp2));
+      if (!callee)
+        continue;
+      name = get_tok_str(callee->v, NULL);
+      if (!ir_opt_is_flag_cmp_helper_name(name))
+        continue;
+      if (!ir_opt_get_call_param_operand(ir, cmp2_idx, 0, &cmp2_arg0) ||
+          !ir_opt_get_call_param_operand(ir, cmp2_idx, 1, &cmp2_arg1))
+      {
+        continue;
+      }
+
+      tok1 = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src1(ir, jump1));
+      tok2 = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src1(ir, jump2));
+      known_fact = vrp_negate_cmp_tok(tok1);
+      if (known_fact < 0)
+        continue;
+
+      if (ir_opt_pure_expr_equal(ir, arg0, i, cmp2_arg0, cmp2_idx, 0) &&
+          ir_opt_pure_expr_equal(ir, arg1, i, cmp2_arg1, cmp2_idx, 0))
+        effective_tok2 = tok2;
+      else if (ir_opt_pure_expr_equal(ir, arg0, i, cmp2_arg1, cmp2_idx, 0) &&
+               ir_opt_pure_expr_equal(ir, arg1, i, cmp2_arg0, cmp2_idx, 0))
+      {
+        is_swapped = 1;
+        effective_tok2 = vrp_swap_cmp_tok(tok2);
+      }
+
+      if (effective_tok2 < 0)
+        continue;
+
+      if (is_swapped)
+      {
+        IROperand jmp1_dest = tcc_ir_op_get_dest(ir, jump1);
+        IROperand jmp2_dest = tcc_ir_op_get_dest(ir, jump2);
+        if (jmp1_dest.u.imm32 != jmp2_dest.u.imm32)
+        {
+          switch (known_fact)
+          {
+          case TOK_LT:
+          case TOK_GT:
+          case TOK_ULT:
+          case TOK_UGT:
+            break;
+          default:
+            continue;
+          }
+        }
+      }
+
+      if (fcmp_cmp_implies(known_fact, effective_tok2))
+      {
+        IROperand jmp2_dest = tcc_ir_op_get_dest(ir, jump2);
+        cmp2->op = TCCIR_OP_NOP;
+        jump2->op = TCCIR_OP_JUMP;
+        tcc_ir_set_dest(ir, jump2_idx, jmp2_dest);
+        changes++;
+      }
+      else if (fcmp_cmp_implies(known_fact, vrp_negate_cmp_tok(effective_tok2)))
+      {
+        cmp2->op = TCCIR_OP_NOP;
+        jump2->op = TCCIR_OP_NOP;
+        changes++;
+      }
+
+      continue;
+    }
+
+    if (q->op == TCCIR_OP_TEST_ZERO || q->op == TCCIR_OP_CMP)
+    {
+      IRQuadCompact *jump1;
+      int jump1_idx = ir_opt_next_non_nop(ir, i + 1);
+      int known_zero = -1;
+      IROperand expr1;
+
+      if (!ir_opt_match_zero_test(ir, i, &expr1))
+        continue;
+
+      if (jump1_idx < 0)
+        continue;
+      jump1 = &ir->compact_instructions[jump1_idx];
+      if (jump1->op != TCCIR_OP_JUMPIF)
+        continue;
+
+      switch ((int)irop_get_imm64_ex(ir, tcc_ir_op_get_src1(ir, jump1)))
+      {
+      case TOK_NE:
+        known_zero = 1;
+        break;
+      case TOK_EQ:
+        known_zero = 0;
+        break;
+      default:
+        break;
+      }
+      if (known_zero < 0)
+        continue;
+
+      for (int test2_idx = ir_opt_next_non_nop(ir, jump1_idx + 1); test2_idx >= 0 && test2_idx + 1 < n;
+           test2_idx = ir_opt_next_non_nop(ir, test2_idx + 1))
+      {
+        IRQuadCompact *test2;
+        IRQuadCompact *jump2;
+        int jump2_idx;
+        int tok2;
+        IROperand expr2;
+        int is_zero_test_candidate;
+
+        if (is_merge[test2_idx / 8] & (1 << (test2_idx % 8)))
+          break;
+
+        test2 = &ir->compact_instructions[test2_idx];
+        is_zero_test_candidate = ir_opt_match_zero_test(ir, test2_idx, &expr2);
+        if (!is_zero_test_candidate)
+        {
+          if (!ir_opt_is_pure_fallthrough_instruction(ir, test2_idx))
+            break;
+          continue;
+        }
+
+        jump2_idx = ir_opt_next_non_nop(ir, test2_idx + 1);
+        if (jump2_idx < 0)
+          break;
+
+        jump2 = &ir->compact_instructions[jump2_idx];
+        if (jump2->op != TCCIR_OP_JUMPIF)
+          break;
+
+        if (!ir_opt_pure_expr_equal(ir, expr1, i, expr2, test2_idx, 0))
+          continue;
+
+        tok2 = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src1(ir, jump2));
+        if ((known_zero && tok2 == TOK_EQ) || (!known_zero && tok2 == TOK_NE))
+        {
+          IROperand jmp2_dest = tcc_ir_op_get_dest(ir, jump2);
+          test2->op = TCCIR_OP_NOP;
+          jump2->op = TCCIR_OP_JUMP;
+          tcc_ir_set_dest(ir, jump2_idx, jmp2_dest);
+          changes++;
+        }
+        else if ((known_zero && tok2 == TOK_NE) || (!known_zero && tok2 == TOK_EQ))
+        {
+          test2->op = TCCIR_OP_NOP;
+          jump2->op = TCCIR_OP_NOP;
+          changes++;
+        }
+        break;
+      }
+    }
+  }
+
+  tcc_free(is_merge);
+  return changes;
+}
+
 int tcc_ir_opt_vrp(TCCIRState *ir)
 {
   int n = ir->next_instruction_index;
@@ -1414,35 +2240,7 @@ int tcc_ir_opt_vrp(TCCIRState *ir)
 #endif
 
   /* Precompute merge points (multiple predecessors or back-edge targets) */
-  uint8_t *is_merge = tcc_mallocz((n + 7) / 8);
-  int *pred_count = tcc_mallocz(n * sizeof(int));
-
-  for (int i = 0; i < n; i++)
-  {
-    IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
-    {
-      IROperand dest = tcc_ir_op_get_dest(ir, q);
-      int target = (int)dest.u.imm32;
-      if (target >= 0 && target < n)
-      {
-        pred_count[target]++;
-        if (i > target) /* back-edge */
-          is_merge[target / 8] |= (1 << (target % 8));
-      }
-    }
-    if (i + 1 < n && q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_NOP && q->op != TCCIR_OP_RETURNVALUE &&
-        q->op != TCCIR_OP_RETURNVOID)
-    {
-      pred_count[i + 1]++;
-    }
-  }
-  for (int i = 0; i < n; i++)
-  {
-    if (pred_count[i] > 1)
-      is_merge[i / 8] |= (1 << (i % 8));
-  }
-  tcc_free(pred_count);
+  uint8_t *is_merge = ir_opt_build_merge_bitmap(ir, n);
 
   /* Range table: PARAM in slots 0..VRP_MAX_POS-1, TEMP in VRP_MAX_POS..2*VRP_MAX_POS-1 */
   VRPRange ranges[VRP_MAX_POS * 2];

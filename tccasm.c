@@ -1639,6 +1639,23 @@ static void parse_asm_operands(ASMOperand *operands, int *nb_operands_ptr, int i
   int nb_operands;
   char *astr;
 
+  auto void maybe_substitute_inline_const_arg(SValue * sv)
+  {
+    if (!tcc_state->in_inline_expansion)
+      return;
+    if ((sv->r & (VT_VALMASK | VT_LVAL)) != (VT_LOCAL | VT_LVAL))
+      return;
+
+    for (int i = 0; i < tcc_state->inline_const_arg_count; i++)
+    {
+      if (tcc_state->inline_const_args[i].vreg == sv->vr && tcc_state->inline_const_args[i].stack_offset == sv->c.i)
+      {
+        *sv = tcc_state->inline_const_args[i].value;
+        return;
+      }
+    }
+  }
+
   if (tok != ':')
   {
     nb_operands = *nb_operands_ptr;
@@ -1662,6 +1679,7 @@ static void parse_asm_operands(ASMOperand *operands, int *nb_operands_ptr, int i
       pstrcpy(op->constraint, sizeof op->constraint, astr);
       skip('(');
       gexpr();
+      maybe_substitute_inline_const_arg(vtop);
       if (is_output)
       {
         if (!(vtop->type.t & VT_ARRAY))

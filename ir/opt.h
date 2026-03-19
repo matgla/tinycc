@@ -30,6 +30,9 @@ int tcc_ir_opt_const_prop(struct TCCIRState *ir);
 /* Constant Propagation (temporary variables only) */
 int tcc_ir_opt_const_prop_tmp(struct TCCIRState *ir);
 
+/* Constant fold string builtin calls such as `strcmp` and `strncmp` */
+int tcc_ir_opt_const_string_calls(struct TCCIRState *ir);
+
 /* Value Tracking through Arithmetic - track constants through ADD/SUB */
 int tcc_ir_opt_value_tracking(struct TCCIRState *ir);
 
@@ -83,6 +86,9 @@ int tcc_ir_opt_stack_addr_cse(struct TCCIRState *ir);
 
 /* Non-negative value tracking & branch folding */
 int tcc_ir_opt_nonneg_branch_fold(struct TCCIRState *ir);
+
+/* Float comparison / pure boolean branch folding */
+int tcc_ir_opt_float_branch_fold(struct TCCIRState *ir);
 
 /* Value Range Propagation: derive range constraints from branch fall-through
  * paths and fold comparisons whose outcome is determined by the range. */

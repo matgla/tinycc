@@ -46,77 +46,16 @@ OPT_LEVELS = ["-O0", "-O1"]
 GCC_XFAIL_TESTS = {
     # builtins/ tests — builtin override tests requiring lib/main.c framework
     # compile/ tests — compilation failures (parser, type system, unsupported features)
-    "compile/950919-1",
-    "compile/asmgoto-2",
-    "compile/asmgoto-3",
-    "compile/asmgoto-4",
-    "compile/attr-complex-method",
-    "compile/attr-complex-method-2",
-
-    "compile/dce-inline-asm-1",
-    "compile/dce-inline-asm-2",
-    "compile/dll",
-    "compile/ex",
-    "compile/limits-exprparen",
-    "compile/pr103682",
-    "compile/pr108237",
-    "compile/pr108892",
-    "compile/pr111059-10",
-    "compile/pr111059-11",
-    "compile/pr111059-12",
-    "compile/pr111059-7",
-    "compile/pr111059-8",
-    "compile/pr111059-9",
-    "compile/pr111911-2",
-
-    "compile/pr123365",
-    "compile/pr123703",
-    "compile/pr27341-2",
-    "compile/pr27528",
-    "compile/pr27889",
-    "compile/pr28865",
-    "compile/pr30132",
-    "compile/pr34885",
-    "compile/pr35318",
-    "compile/pr37669",
-    "compile/pr41987",
-    "compile/pr44197",
-    "compile/pr46534",
-    "compile/pr46866",
-    "compile/pr48517",
-    "compile/pr51694",
-    "compile/pr54559",
-    "compile/pr54713-3",
-    "compile/pr65680",
-    "compile/pr72802",
-    "compile/pr77754-6",
-    "compile/pr78694",
-    "compile/pr82564",
-    "compile/pr83222",
-    "compile/pr85401",
-    "compile/pr92449",
-    "compile/pr93335",
-    "compile/pr96998",
-    "compile/pr98096",
-    "compile/pr99324",
-    "compile/simd-1",
-    "compile/sizeof-macros-1",  # test infrastructure: no main(), link fails
-    "compile/uuarg",
-    "compile/vector-1",
-    "compile/vector-2",
-    "compile/vector-3",
-    "compile/vector-shift-1",
+    # always_inline related failures (need proper fix for inline expansion)
 }
 
 # GCC Torture tests expected to fail only at -O1
 # These pass at -O0 but require advanced optimizations (e.g., contradictory
 # condition elimination) that TCC does not implement.
 GCC_XFAIL_O1_TESTS = {
-    "ieee/compare-fp-3",  # needs (x==y)&&(x!=y) → false simplification
     # builtins/ tests — TCC doesn't constant-fold builtin calls at -O1, so the
     # custom override functions (which abort when __OPTIMIZE__ && inside_main)
     # get called instead of being optimized away.
-    "builtins/strncmp",
     "builtins/abs-2",
     "builtins/abs-3",
     "builtins/fprintf",
@@ -227,6 +166,7 @@ TCC_SUPPORTED_DG_FLAGS = {
 # Prefix patterns for dg-options flags that TCC supports (matched with startswith)
 TCC_SUPPORTED_DG_FLAG_PREFIXES = (
     "-fno-builtin-",
+    "-std=",
 )
 
 # Per-test flag overrides for cases where GCC torture semantics depend on
@@ -275,7 +215,8 @@ def parse_x_file(test_path: Path) -> str:
 def parse_dg_options(test_path: Path) -> str:
     """Parse dg-options from a GCC torture test file and its .x companion.
 
-    Extracts flags from: /* { dg-options "flags" } */ in the .c file,
+    Extracts flags from: /* { dg-options "flags" } */ and
+    /* { dg-additional-options "flags" } */ in the .c file,
     and from 'set additional_flags ...' in a companion .x file.
     Only returns flags that TCC supports.
     """
@@ -284,8 +225,7 @@ def parse_dg_options(test_path: Path) -> str:
     try:
         with open(test_path, 'r') as f:
             content = f.read(4096)
-        m = re.search(r'dg-options\s+"([^"]+)"', content)
-        if m:
+        for m in re.finditer(r'dg-(?:additional-)?options\s+"([^"]+)"', content):
             all_flags = m.group(1).split()
             flags.extend(f for f in all_flags if _is_supported_dg_flag(f))
     except:
@@ -304,6 +244,33 @@ def parse_dg_options(test_path: Path) -> str:
     return " ".join(flags)
 
 
+def _effective_target_matches(target_expr: Optional[str]) -> bool:
+    """Evaluate a small subset of GCC effective-target expressions.
+
+    The ARMv8-M torture harness is ILP32, not LP64.
+    """
+    if not target_expr:
+        return True
+
+    expr = target_expr.replace("{", " ").replace("}", " ").strip()
+    expr = " ".join(expr.split())
+    simple_targets = {
+        "size32plus": True,
+        "lp64": False,
+        "ilp32": True,
+        "int128": False,
+        "asm_goto_with_outputs": False,
+    }
+
+    if expr.startswith("!"):
+        return not _effective_target_matches(expr[1:].strip())
+
+    if expr in simple_targets:
+        return simple_targets[expr]
+
+    return True
+
+
 def parse_dg_errors(test_path: Path) -> List[str]:
     """Parse dg-error directives from a GCC torture test file.
 
@@ -318,7 +285,15 @@ def parse_dg_errors(test_path: Path) -> List[str]:
     except OSError:
         return []
 
-    return [m.group(1) for m in re.finditer(r'dg-error\s+"([^"]*)"', content)]
+    patterns = []
+    dg_error_re = re.compile(
+        r'dg-error\s+"([^"]*)"(?:\s+"[^"]*")?(?:\s+\{\s*target\s+\{\s*([^}]*)\s*\}\s*\})?'
+    )
+    for m in dg_error_re.finditer(content):
+        if _effective_target_matches(m.group(2)):
+            patterns.append(m.group(1))
+
+    return patterns
 
 
 def should_skip_gcc_test(test_path: Path) -> Optional[str]:
@@ -357,9 +332,32 @@ def should_skip_gcc_test(test_path: Path) -> Optional[str]:
             if not any(p in targets.lower() for p in arm_patterns):
                 return f"dg-skip-if: test restricted to non-ARM targets ({targets.strip()})"
 
+        # Handle explicit dg-do target restrictions such as:
+        #   /* { dg-do compile { target i?86-*-* x86_64-*-* } } */
+        # These are target-selection directives rather than feature tests, so
+        # x86-only cases should be skipped in the ARM harness.
+        dg_do_target = _re.search(r'dg-do\s+\w+\s+\{\s*target\s+(.+?)\s*\}\s*\*/', content)
+        if dg_do_target:
+            targets = dg_do_target.group(1).strip()
+            targets_lower = targets.lower()
+            arm_patterns = ['arm', 'aarch64', 'thumb']
+            triplet_markers = ['-*-', 'i?86', 'x86_64', 'ia32', 'powerpc', 'mips', 'riscv', 'sparc', 'alpha']
+            if any(marker in targets_lower for marker in triplet_markers) and not any(
+                p in targets_lower for p in arm_patterns
+            ):
+                return f"dg-do target: test restricted to non-ARM targets ({targets})"
+            if not any(marker in targets_lower for marker in triplet_markers) and not _effective_target_matches(targets):
+                return f"dg-do target: test requires unsupported target predicate ({targets})"
+
         # Tests requiring mmap are not available on bare-metal ARM
         if "dg-require-effective-target mmap" in content:
             return "Requires mmap (not available on bare-metal ARM)"
+
+        # Tests requiring DLL import/export semantics are PE/COFF-specific.
+        # The ARMv8-M harness targets ELF bare-metal, so these should be
+        # skipped rather than treated as compiler failures.
+        if "dg-require-dll" in content:
+            return "Requires DLL target support (not available on ARM ELF)"
 
         # Tests requiring trampolines (nested functions) are now supported
         # if "dg-require-effective-target trampolines" in content:

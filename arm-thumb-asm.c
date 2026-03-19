@@ -389,6 +389,8 @@ static inline int constraint_priority(const char *str)
     str++;
     switch (c)
     {
+    case ',':
+      continue;
     case 'l': // in ARM mode, that's  an alias for 'r' [ARM].
     case 'r': // register [general]
     case 'p': // valid memory address for load,store [general]
@@ -397,11 +399,15 @@ static inline int constraint_priority(const char *str)
     case 'M': // integer constant for shifts [ARM]
     case 'I': // integer valid for data processing instruction immediate
     case 'J': // integer in range -4095...4095
+    case 'n': // immediate integer operand with a known numeric value
 
     case 'i': // immediate integer operand, including symbolic constants
+    case 's': // immediate integer operand whose value is not an explicit integer
               // [general]
+    case 'Q': // memory reference with a single base register [ARM]
     case 'm': // memory operand [general]
     case 'g': // general-purpose-register, memory, immediate integer [general]
+    case 'X': // any operand whatsoever [general]
       pr = 4;
       break;
     default:
@@ -584,6 +590,8 @@ instruction
     c = *str++;
     switch (c)
     {
+    case ',':
+      goto try_next;
     case '=': // Operand is written-to
       goto try_next;
     case '+': // Operand is both READ and written-to
@@ -621,7 +629,9 @@ instruction
               // complement)
     case 'L': // integer that satisfies constraint I when inverted (two's
               // complement)
+    case 'n': // immediate integer operand with a known numeric value
     case 'i': // immediate integer operand, including symbolic constants
+    case 's': // immediate integer operand whose value is not an explicit integer
       if (!((op->vt->r & (VT_VALMASK | VT_LVAL)) == VT_CONST))
         goto try_next;
       break;
@@ -629,8 +639,10 @@ instruction
       if (!((op->vt->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST))
         goto try_next;
       break;
+    case 'Q': // simple memory operand [ARM]
     case 'm': // memory operand
     case 'g':
+    case 'X':
       /* nothing special to do because the operand is already in
          memory, except if the pointer itself is stored in a
          memory variable (VT_LLOCAL case) */

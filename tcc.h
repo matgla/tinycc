@@ -464,7 +464,8 @@ struct SymAttr
   unsigned aligned : 5, /* alignment as log2+1 (0 == unspecified) */
       packed : 1, weak : 1, visibility : 2, dllexport : 1, nodecorate : 1, dllimport : 1, addrtaken : 1, nodebug : 1,
       naked : 1, nested_func : 1, /* nested function flag */
-      sso_be : 1;                 /* scalar_storage_order("big-endian") */
+      sso_be : 1,                 /* scalar_storage_order("big-endian") */
+      transparent_union : 1;      /* __attribute__((transparent_union)) */
 };
 
 /* function attributes or temporary attributes for parsing */
@@ -482,7 +483,8 @@ struct FuncAttr
       func_no_instrument : 1,           /* attribute((no_instrument_function)) */
       func_va_arg_pack : 1,             /* uses __builtin_va_arg_pack() */
       func_rewritten_extern_inline : 1, /* extern inline rewritten to non-extern inline-only def */
-      xxxx : 10;
+      func_outofline_needed : 1,        /* always_inline call could not stay call-site-only */
+      xxxx : 9;
 };
 
 /* symbol management */
@@ -709,8 +711,8 @@ typedef struct TokenString
   char alloc;
   signed char need_spc;         /* space insertion state: -1, 0, 1, 2, 3 */
   unsigned short last_line_num; /* last recorded line number (0 = none) */
-  unsigned short allocated_len; /* 0 = inline, >0 = heap capacity */
   unsigned short save_line_num; /* saved line number for macro */
+  int allocated_len;            /* 0 = inline, >0 = heap capacity (in ints) */
   int len;                      /* current length in ints */
   /* used to chain token-strings with begin/end_macro() */
   const int *prev_ptr;
@@ -1192,6 +1194,13 @@ struct TCCState
      stream at a call site, these track the return value destination. */
   uint8_t in_inline_expansion; /* nonzero while expanding inline body */
   int inline_return_loc;       /* stack offset for storing return value */
+  int inline_const_arg_count;  /* constant-like current inline params */
+  struct
+  {
+    int vreg;
+    int stack_offset;
+    SValue value;
+  } inline_const_args[16];
 
   /* Outermost VLA parameter expressions: saved token streams for evaluating
      side effects at function entry (C11 6.9.1p10). Stored separately from Sym

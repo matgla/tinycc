@@ -482,7 +482,9 @@ static int mach_get_dest_reg(MachineCodegenContext *ctx, const MachineOperand *o
     return mach_alloc_scratch(ctx, excl);
 
   case MACH_OP_SPILL:
+  case MACH_OP_FRAME_ADDR:
   case MACH_OP_PARAM_STACK:
+  case MACH_OP_CHAIN_REL:
   case MACH_OP_SYMBOL:
     return mach_alloc_scratch(ctx, excl);
 
@@ -526,6 +528,12 @@ static void mach_writeback_dest(const MachineOperand *op, int reg)
 
   case MACH_OP_SPILL:
     tcc_machine_store_spill_slot(reg, op->u.spill.offset);
+    break;
+
+  case MACH_OP_FRAME_ADDR:
+    /* Local stack slot address used as an lvalue destination.  Write the
+     * result back to the underlying frame slot. */
+    tcc_machine_store_spill_slot(reg, op->u.frame.offset);
     break;
 
   case MACH_OP_PARAM_STACK:

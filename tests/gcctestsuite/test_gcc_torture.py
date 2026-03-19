@@ -15,6 +15,7 @@ Environment:
 
 import pytest
 import re
+import resource
 import subprocess
 import sys
 from pathlib import Path
@@ -47,7 +48,11 @@ def _compile_test(test_case: GCCTestCase, opt_level: str, tmp_path: Path) -> tup
     extra_flags = opt_level
     if test_case.dg_options:
         extra_flags = f"{opt_level} {test_case.dg_options}"
-    if QEMU_AVAILABLE:
+    # Compile-only torture tests should only check frontend/codegen acceptance.
+    # They often intentionally omit `main()`, so routing them through the QEMU
+    # helper (which links a full ELF) turns valid compile tests into spurious
+    # link failures.
+    if QEMU_AVAILABLE and test_case.category != "gcc_compile":
         config = CompileConfig(
             extra_cflags=extra_flags,
             output_dir=tmp_path,
@@ -58,17 +63,34 @@ def _compile_test(test_case: GCCTestCase, opt_level: str, tmp_path: Path) -> tup
         output = result.error if result.error else "\n".join(result.output_lines)
         return result.success, output
     else:
-        # Fallback to direct compiler invocation
-        compiler = Path(__file__).parent.parent.parent / "bin" / "armv8m-tcc"
+        # Direct compiler invocation for compile-only tests and as a fallback.
+        compiler = Path(__file__).parent.parent.parent / "armv8m-tcc"
+        if not compiler.exists():
+            compiler = Path(__file__).parent.parent.parent / "bin" / "armv8m-tcc"
         cmd = [
             str(compiler),
-            opt_level,
+            *extra_flags.split(),
             "-c",
             str(test_case.source),
             "-o",
             str(tmp_path / "test.o")
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=test_case.timeout)
+
+        def _raise_stack_limit():
+            try:
+                soft, hard = resource.getrlimit(resource.RLIMIT_STACK)
+                target = hard if hard != resource.RLIM_INFINITY else resource.RLIM_INFINITY
+                resource.setrlimit(resource.RLIMIT_STACK, (target, hard))
+            except Exception:
+                pass
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=test_case.timeout,
+            preexec_fn=_raise_stack_limit,
+        )
         return result.returncode == 0, (result.stderr or "") + (result.stdout or "")
 
 

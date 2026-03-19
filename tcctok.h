@@ -235,6 +235,7 @@ DEF(TOK_builtin_stpcpy, "__builtin_stpcpy")
 DEF(TOK_builtin_stpncpy, "__builtin_stpncpy")
 DEF(TOK_builtin_fputs, "__builtin_fputs")
 DEF(TOK_builtin_fprintf, "__builtin_fprintf")
+DEF(TOK_builtin_shufflevector, "__builtin_shufflevector")
 /* Fortified/chk variants */
 DEF(TOK_builtin___memcpy_chk, "__builtin___memcpy_chk")
 DEF(TOK_builtin___memmove_chk, "__builtin___memmove_chk")
