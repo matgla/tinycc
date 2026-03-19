@@ -74,7 +74,14 @@ if(BENCHMARK_COMPILER STREQUAL "TCC")
     # Find TCC's soft-float runtime library for fair comparison with GCC's libgcc
     # TCC_EXE is typically at <tcc_root>/armv8m-tcc, libs are at <tcc_root>/lib/fp/
     get_filename_component(TCC_DIR ${TCC_EXE} DIRECTORY)
+    set(TCC_RUNTIME_LIB "${TCC_DIR}/armv8m-libtcc1.a")
     set(TCC_FP_LIB "${TCC_DIR}/lib/fp/libsoftfp.a")
+    if(EXISTS ${TCC_RUNTIME_LIB})
+        message(STATUS "Using TCC runtime library: ${TCC_RUNTIME_LIB}")
+    else()
+        message(WARNING "TCC runtime library not found at ${TCC_RUNTIME_LIB}")
+        set(TCC_RUNTIME_LIB "")
+    endif()
     if(EXISTS ${TCC_FP_LIB})
         message(STATUS "Using TCC soft-float runtime: ${TCC_FP_LIB}")
     else()
@@ -167,13 +174,14 @@ target_link_libraries(minimal_uart_picosdk${BENCHMARK_EXECUTABLE_SUFFIX}
 # (instead of Pico SDK's optimized pico_float library)
 pico_set_float_implementation(minimal_uart_picosdk${BENCHMARK_EXECUTABLE_SUFFIX} compiler)
 
-# For TCC builds, also link TCC's soft-float runtime library explicitly
-if(BENCHMARK_COMPILER STREQUAL "TCC" AND TCC_FP_LIB)
-    # Use --whole-archive to ensure TCC's soft-float symbols take precedence
+# For TCC builds, also link TCC's runtime libraries explicitly.
+# TCC-generated objects can reference helper symbols from armv8m-libtcc1.a
+# and software floating-point entry points from libsoftfp.a.
+if(BENCHMARK_COMPILER STREQUAL "TCC" AND (TCC_RUNTIME_LIB OR TCC_FP_LIB))
     target_link_libraries(minimal_uart_picosdk${BENCHMARK_EXECUTABLE_SUFFIX}
-        -Wl,--whole-archive ${TCC_FP_LIB} -Wl,--no-whole-archive
+        -Wl,--start-group ${TCC_RUNTIME_LIB} ${TCC_FP_LIB} -Wl,--end-group
     )
-    message(STATUS "Linked TCC soft-float runtime for fair comparison with GCC libgcc")
+    message(STATUS "Linked TCC runtime libraries for benchmark build")
 endif()
 
 target_compile_definitions(minimal_uart_picosdk${BENCHMARK_EXECUTABLE_SUFFIX}

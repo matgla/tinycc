@@ -56,55 +56,10 @@ GCC_XFAIL_O1_TESTS = {
     # builtins/ tests — TCC doesn't constant-fold builtin calls at -O1, so the
     # custom override functions (which abort when __OPTIMIZE__ && inside_main)
     # get called instead of being optimized away.
-    "builtins/abs-2",
-    "builtins/abs-3",
-    "builtins/fprintf",
-    "builtins/fputs",
-    "builtins/memchr",
-    "builtins/memcmp",
-    "builtins/memmove",
-    "builtins/memmove-2",
-    "builtins/mempcpy",
-    "builtins/printf",
-    "builtins/sprintf",
-    "builtins/strcat",
-    "builtins/strchr",
-    "builtins/strcmp",
-    "builtins/strcpy",
-    "builtins/strcpy-2",
-    "builtins/strcspn",
-    "builtins/strncat",
-    "builtins/strncpy",
-    "builtins/strlen",
-    "builtins/strlen-2",
-    "builtins/strlen-3",
-    "builtins/strnlen",
-    "builtins/strpbrk",
-    "builtins/strrchr",
-    "builtins/strstr",
-    "builtins/strstr-asm",
-    "builtins/uabs-2",
-    "builtins/uabs-3",
     # builtins/ tests — require GCC-level optimizations beyond chk inlining:
     # inline stores (_disallowed checks), value range analysis, conditional
     # pointer tracking. TCC inlines __builtin___*_chk but can't optimize away
     # the underlying library calls or prove value bounds.
-    "builtins/memcpy-chk",    # test3: conditional ptr tracking + value range
-    "builtins/memmove-chk",   # test1: memmove_disallowed (unconditional on ARM)
-    "builtins/mempcpy-chk",   # test2: mempcpy_disallowed (unconditional)
-    "builtins/memset-chk",    # test1: memset_disallowed (unconditional)
-    "builtins/pr23484-chk",   # ternary length requires value range analysis
-    "builtins/snprintf-chk",  # test2: conditional ptr tracking + value range
-    "builtins/sprintf-chk",   # test1: sprintf_disallowed (unconditional)
-    "builtins/stpcpy-chk",    # test1: stpcpy_disallowed (x86); test3: cond ptr
-    "builtins/stpncpy-chk",   # test1: stpncpy_disallowed (unconditional)
-    "builtins/strcat-chk",    # test1: strcat_disallowed (unconditional)
-    "builtins/strcpy-chk",    # test1: strcpy_disallowed (non-Os)
-    "builtins/strncat-chk",   # test1: strncat_disallowed (unconditional)
-    "builtins/strncpy-chk",   # test1: strncpy_disallowed (unconditional)
-    "builtins/strpcpy",       # __builtin_stpcpy not implemented
-    "builtins/vsnprintf-chk", # test2: conditional ptr tracking + value range
-    "builtins/vsprintf-chk",  # test1: vsprintf_disallowed (unconditional)
 }
 
 # GCC Torture tests to skip entirely

@@ -196,6 +196,16 @@ int __builtin_parityll(unsigned long long x) __attribute__((alias("__tcc_builtin
 /* ---------------------------------------------- */
 /* Unsigned absolute-value helpers used by the compiler for 64-bit lowering. */
 
+unsigned int __tcc_uabsu(int x)
+{
+  return x < 0 ? -(unsigned int)x : (unsigned int)x;
+}
+
+unsigned long __tcc_ulabsu(long x)
+{
+  return x < 0 ? -(unsigned long)x : (unsigned long)x;
+}
+
 unsigned long long __tcc_ullabsu(long long x)
 {
   return x < 0 ? -(unsigned long long)x : (unsigned long long)x;
@@ -204,6 +214,362 @@ unsigned long long __tcc_ullabsu(long long x)
 unsigned long long __tcc_umaxabsu(long long x)
 {
   return x < 0 ? -(unsigned long long)x : (unsigned long long)x;
+}
+
+int __tcc_memcmp1(const void *lhs, const void *rhs)
+{
+  const unsigned char *a = (const unsigned char *)lhs;
+  const unsigned char *b = (const unsigned char *)rhs;
+  return (int)a[0] - (int)b[0];
+}
+
+int __tcc_strncmp(const char *lhs, const char *rhs, unsigned long n)
+{
+  const unsigned char *a = (const unsigned char *)lhs;
+  const unsigned char *b = (const unsigned char *)rhs;
+
+  while (n > 0)
+  {
+    unsigned char ca = *a++;
+    unsigned char cb = *b++;
+    if (ca == '\0' || ca != cb)
+      return (int)ca - (int)cb;
+    --n;
+  }
+
+  return 0;
+}
+
+void *__tcc_memmove(void *dst, const void *src, unsigned long n)
+{
+  unsigned char *dstp = (unsigned char *)dst;
+  const unsigned char *srcp = (const unsigned char *)src;
+
+  if (srcp < dstp)
+  {
+    while (n-- != 0)
+      dstp[n] = srcp[n];
+  }
+  else
+  {
+    while (n-- != 0)
+      *dstp++ = *srcp++;
+  }
+
+  return dst;
+}
+
+void __tcc_bcopy(const void *src, void *dst, unsigned long n)
+{
+  __tcc_memmove(dst, src, n);
+}
+
+void *__tcc_mempcpy(void *dst, const void *src, unsigned long n)
+{
+  unsigned char *dstp = (unsigned char *)dst;
+  const unsigned char *srcp = (const unsigned char *)src;
+
+  while (n-- != 0)
+    *dstp++ = *srcp++;
+
+  return dstp;
+}
+
+int __tcc_strcpy_count(char *dst, const char *src)
+{
+  char *start = dst;
+
+  for (;;)
+  {
+    char ch = *src++;
+    *dst++ = ch;
+    if (ch == '\0')
+      return (int)(dst - start - 1);
+  }
+}
+
+char *__tcc_strcat(char *dst, const char *src)
+{
+  char *p = dst;
+
+  while (*p)
+    p++;
+  while ((*p++ = *src++) != '\0')
+    ;
+
+  return dst;
+}
+
+char *__tcc_strchr(const char *s, int c)
+{
+  for (;;)
+  {
+    if (*s == c)
+      return (char *)s;
+    if (*s == '\0')
+      return 0;
+    s++;
+  }
+}
+
+int __tcc_strcmp(const char *s1, const char *s2)
+{
+  while (*s1 != 0 && *s1 == *s2)
+    s1++, s2++;
+
+  if (*s1 == 0 || *s2 == 0)
+    return (unsigned char)*s1 - (unsigned char)*s2;
+  return *s1 - *s2;
+}
+
+unsigned long __tcc_strlen(const char *s)
+{
+  const char *p = s;
+
+  while (*p)
+    p++;
+
+  return (unsigned long)(p - s);
+}
+
+extern volatile int chk_calls __attribute__((weak));
+extern void __chk_fail(void) __attribute__((weak));
+extern void abort(void);
+
+static void __tcc_chk_record_call(void)
+{
+  if (&chk_calls != 0)
+    ++chk_calls;
+}
+
+static void __tcc_chk_fail_or_abort(void)
+{
+  if (__chk_fail)
+    __chk_fail();
+  abort();
+}
+
+unsigned long __tcc_strnlen(const char *s, unsigned long n)
+{
+  unsigned long len = 0;
+
+  while (len < n && s[len] != '\0')
+    len++;
+
+  return len;
+}
+
+char *__tcc_strpbrk(const char *s1, const char *s2)
+{
+  while (*s1)
+  {
+    const char *p;
+
+    for (p = s2; *p; p++)
+      if (*s1 == *p)
+        return (char *)s1;
+    s1++;
+  }
+
+  return 0;
+}
+
+char *__tcc_strrchr(const char *s, int c)
+{
+  const char *last = 0;
+
+  do
+  {
+    if (*s == c)
+      last = s;
+  } while (*s++ != '\0');
+
+  return (char *)last;
+}
+
+char *__tcc_strstr(const char *haystack, const char *needle)
+{
+  if (*needle == '\0')
+    return (char *)haystack;
+
+  for (; *haystack; haystack++)
+  {
+    const char *h = haystack;
+    const char *n = needle;
+
+    while (*n && *h == *n)
+    {
+      h++;
+      n++;
+    }
+
+    if (*n == '\0')
+      return (char *)haystack;
+  }
+
+  return 0;
+}
+
+unsigned long __tcc_strcspn(const char *s1, const char *s2)
+{
+  const char *p;
+
+  for (p = s1; *p; p++)
+  {
+    const char *q;
+
+    for (q = s2; *q; q++)
+      if (*p == *q)
+        return (unsigned long)(p - s1);
+  }
+
+  return (unsigned long)(p - s1);
+}
+
+char *__tcc_strncpy(char *dst, const char *src, unsigned long n)
+{
+  char *ret = dst;
+
+  while (*src && n)
+  {
+    *dst++ = *src++;
+    --n;
+  }
+
+  while (n)
+  {
+    *dst++ = '\0';
+    --n;
+  }
+
+  return ret;
+}
+
+char *__tcc_strncat(char *dst, const char *src, unsigned long n)
+{
+  char *ret = dst;
+
+  while (*dst)
+    dst++;
+
+  while (n > 0)
+  {
+    char ch = *src++;
+    *dst++ = ch;
+    if (ch == '\0')
+      return ret;
+    --n;
+  }
+
+  *dst = '\0';
+  return ret;
+}
+
+char *__tcc_strcpy(char *d, const char *s)
+{
+  char *r = d;
+
+  while ((*d++ = *s++) != '\0')
+    ;
+
+  return r;
+}
+
+char *__tcc_stpcpy(char *dst, const char *src)
+{
+  while (*src != '\0')
+    *dst++ = *src++;
+
+  *dst = '\0';
+  return dst;
+}
+
+char *__tcc_stpncpy(char *dst, const char *src, unsigned long n)
+{
+  while (*src != '\0' && n != 0)
+  {
+    *dst++ = *src++;
+    --n;
+  }
+
+  char *ret = dst;
+
+  while (n-- != 0)
+    *dst++ = '\0';
+
+  return ret;
+}
+
+char *__tcc_strcpy_chk(char *d, const char *s, unsigned long size)
+{
+  if (size == (unsigned long)-1)
+    __tcc_chk_fail_or_abort();
+  __tcc_chk_record_call();
+  if (__tcc_strlen(s) >= size)
+    __tcc_chk_fail_or_abort();
+  return __tcc_strcpy(d, s);
+}
+
+char *__tcc_stpcpy_chk(char *d, const char *s, unsigned long size)
+{
+  if (size == (unsigned long)-1)
+    __tcc_chk_fail_or_abort();
+  __tcc_chk_record_call();
+  if (__tcc_strlen(s) >= size)
+    __tcc_chk_fail_or_abort();
+  return __tcc_stpcpy(d, s);
+}
+
+char *__tcc_stpncpy_chk(char *s1, const char *s2, unsigned long n, unsigned long size)
+{
+  if (size == (unsigned long)-1)
+    __tcc_chk_fail_or_abort();
+  __tcc_chk_record_call();
+  if (n > size)
+    __tcc_chk_fail_or_abort();
+  return __tcc_stpncpy(s1, s2, n);
+}
+
+char *__tcc_strncpy_chk(char *s1, const char *s2, unsigned long n, unsigned long size)
+{
+  if (size == (unsigned long)-1)
+    __tcc_chk_fail_or_abort();
+  __tcc_chk_record_call();
+  if (n > size)
+    __tcc_chk_fail_or_abort();
+  return __tcc_strncpy(s1, s2, n);
+}
+
+char *__tcc_strcat_chk(char *d, const char *s, unsigned long size)
+{
+  if (size == (unsigned long)-1)
+    __tcc_chk_fail_or_abort();
+  __tcc_chk_record_call();
+  if (__tcc_strlen(d) + __tcc_strlen(s) >= size)
+    __tcc_chk_fail_or_abort();
+  return __tcc_strcat(d, s);
+}
+
+char *__tcc_strncat_chk(char *d, const char *s, unsigned long n, unsigned long size)
+{
+  unsigned long len = __tcc_strlen(d);
+  unsigned long n1 = n;
+  const char *s1 = s;
+
+  if (size == (unsigned long)-1)
+    __tcc_chk_fail_or_abort();
+  __tcc_chk_record_call();
+  while (len < size && n1 > 0)
+  {
+    if (*s1++ == '\0')
+      break;
+    ++len;
+    --n1;
+  }
+
+  if (len >= size)
+    __tcc_chk_fail_or_abort();
+  return __tcc_strncat(d, s, n);
 }
 
 /* ---------------------------------------------- */

@@ -57,8 +57,8 @@
 #define __SIZEOF_SHORT__ 2
 #define __SIZEOF_INT__ 4
 #define __INT_MAX__ 0x7fffffff
-    #define __SCHAR_MAX__ 0x7f
-    #define __SHRT_MAX__ 0x7fff
+#define __SCHAR_MAX__ 0x7f
+#define __SHRT_MAX__ 0x7fff
 #if __SIZEOF_LONG__ == 4
 #define __LONG_MAX__ 0x7fffffffL
 #else
@@ -438,7 +438,7 @@ __BUILTIN(__SIZE_TYPE__, fwrite, (const void *, __SIZE_TYPE__, __SIZE_TYPE__, vo
 __BUILTIN(int, sprintf, (char *, const char *, ...))
 __BUILTIN(int, snprintf, (char *, __SIZE_TYPE__, const char *, ...))
 char *__builtin_index(const char *, int) __RENAME("strchr");
-char *__builtin_rindex(const char *, int) __RENAME("strrchr");
+char *__builtin_rindex(const char *, int) __RENAME("__tcc_strrchr");
 void __builtin_bcopy(const void *, void *, __SIZE_TYPE__) __RENAME("bcopy");
 void __builtin_bzero(void *, __SIZE_TYPE__) __RENAME("bzero");
 int __builtin_printf_unlocked(const char *, ...) __RENAME("printf_unlocked");

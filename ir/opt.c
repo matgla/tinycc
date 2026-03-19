@@ -64,6 +64,8 @@ extern int tcc_ir_vreg_has_single_use(TCCIRState *ir, int32_t vreg, int exclude_
 
 /* Forward declaration (defined in branch_folding section below) */
 static int evaluate_compare_condition(int64_t val1, int64_t val2, int cond_token);
+static int change_callee_sym(TCCIRState *ir, int instr_idx, const char *new_name, int ret_btype);
+static int change_callee_sym_keep_type(TCCIRState *ir, int instr_idx, const char *new_name);
 
 /* ============================================================================
  * Boolean Optimization Helpers
@@ -1555,6 +1557,55 @@ static void ir_opt_nop_call_params(TCCIRState *ir, int call_idx)
   }
 }
 
+static void ir_opt_nop_call_param(TCCIRState *ir, int call_idx, int param_idx)
+{
+  IRQuadCompact *call_q;
+  int call_id;
+
+  if (!ir || call_idx < 0 || call_idx >= ir->next_instruction_index)
+    return;
+
+  call_q = &ir->compact_instructions[call_idx];
+  if (call_q->op != TCCIR_OP_FUNCCALLVAL && call_q->op != TCCIR_OP_FUNCCALLVOID)
+    return;
+
+  call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, call_q)));
+  for (int i = call_idx - 1; i >= 0; --i)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    IROperand enc;
+    uint32_t encoded;
+
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    if (q->op != TCCIR_OP_FUNCPARAMVAL && q->op != TCCIR_OP_FUNCPARAMVOID)
+      continue;
+
+    enc = tcc_ir_op_get_src2(ir, q);
+    encoded = (uint32_t)irop_get_imm64_ex(ir, enc);
+    if (TCCIR_DECODE_CALL_ID(encoded) == call_id && TCCIR_DECODE_PARAM_IDX(encoded) == param_idx)
+      q->op = TCCIR_OP_NOP;
+  }
+}
+
+static void ir_opt_change_call_argc(TCCIRState *ir, int call_idx, int argc)
+{
+  IRQuadCompact *call_q;
+  uint32_t encoded;
+  int call_id;
+
+  if (!ir || call_idx < 0 || call_idx >= ir->next_instruction_index)
+    return;
+
+  call_q = &ir->compact_instructions[call_idx];
+  if (call_q->op != TCCIR_OP_FUNCCALLVAL && call_q->op != TCCIR_OP_FUNCCALLVOID)
+    return;
+
+  encoded = (uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, call_q));
+  call_id = TCCIR_DECODE_CALL_ID(encoded);
+  tcc_ir_set_src2(ir, call_idx, irop_make_imm32(-1, (int32_t)TCCIR_ENCODE_CALL(call_id, argc), IROP_BTYPE_INT32));
+}
+
 static int ir_opt_vreg_address_taken_between(TCCIRState *ir, int32_t vreg, int start_idx, int end_idx)
 {
   if (!ir)
@@ -1576,7 +1627,10 @@ static const char *ir_opt_get_constant_string_from_symref(TCCIRState *ir, IROper
   Sym *sym;
   ElfSym *esym;
   Section *sec;
+  const char *str;
+  const char *nul;
   addr_t offset;
+  size_t remaining;
 
   if (!ir || irop_get_tag(op) != IROP_TAG_SYMREF)
     return NULL;
@@ -1600,12 +1654,22 @@ static const char *ir_opt_get_constant_string_from_symref(TCCIRState *ir, IROper
   sec = tcc_state->sections[esym->st_shndx];
   if (!sec || !sec->data)
     return NULL;
+  if (sec->sh_flags & SHF_WRITE)
+    return NULL;
+  if (esym->st_size == 0 || (addr_t)symref->addend >= esym->st_size)
+    return NULL;
 
   offset = esym->st_value + (addr_t)symref->addend;
   if (offset >= sec->data_offset)
     return NULL;
 
-  return (const char *)(sec->data + offset);
+  str = (const char *)(sec->data + offset);
+  remaining = (size_t)(esym->st_size - (addr_t)symref->addend);
+  nul = memchr(str, '\0', remaining);
+  if (!nul)
+    return NULL;
+
+  return str;
 }
 
 static int ir_opt_eval_const_u64(TCCIRState *ir, IROperand op, int use_idx, uint64_t *out, int depth)
@@ -1701,6 +1765,70 @@ static int ir_opt_eval_const_string(TCCIRState *ir, IROperand op, int use_idx, c
   }
 }
 
+static int ir_opt_eval_const_string_operand(TCCIRState *ir, IROperand op, int use_idx, IROperand *out, int depth)
+{
+  int32_t vr;
+  int def_idx;
+  IRQuadCompact *q;
+
+  if (!ir || !out || depth > 16)
+    return 0;
+
+  if (ir_opt_get_constant_string_from_symref(ir, op))
+  {
+    *out = op;
+    return 1;
+  }
+
+  vr = irop_get_vreg(op);
+  if (vr < 0)
+    return 0;
+
+  if (ir_opt_vreg_address_taken_between(ir, vr, 0, use_idx))
+    return 0;
+
+  def_idx = tcc_ir_find_defining_instruction(ir, vr, use_idx);
+  if (def_idx < 0)
+    return 0;
+
+  q = &ir->compact_instructions[def_idx];
+  switch (q->op)
+  {
+  case TCCIR_OP_ASSIGN:
+  case TCCIR_OP_LOAD:
+    return ir_opt_eval_const_string_operand(ir, tcc_ir_op_get_src1(ir, q), def_idx, out, depth + 1);
+  case TCCIR_OP_ADD:
+  {
+    IROperand base_op;
+    uint64_t addend;
+    IRPoolSymref *symref;
+    uint32_t new_idx;
+
+    if (!ir_opt_eval_const_string_operand(ir, tcc_ir_op_get_src1(ir, q), def_idx, &base_op, depth + 1) ||
+        !ir_opt_eval_const_u64(ir, tcc_ir_op_get_src2(ir, q), def_idx, &addend, depth + 1))
+    {
+      if (!ir_opt_eval_const_string_operand(ir, tcc_ir_op_get_src2(ir, q), def_idx, &base_op, depth + 1) ||
+          !ir_opt_eval_const_u64(ir, tcc_ir_op_get_src1(ir, q), def_idx, &addend, depth + 1))
+        return 0;
+    }
+
+    if (irop_get_tag(base_op) != IROP_TAG_SYMREF)
+      return 0;
+
+    symref = irop_get_symref_ex(ir, base_op);
+    if (!symref)
+      return 0;
+
+    new_idx = tcc_ir_pool_add_symref(ir, symref->sym, symref->addend + (int32_t)addend, symref->flags);
+    *out = irop_make_symref(irop_get_vreg(base_op), new_idx, base_op.is_lval, base_op.is_local, base_op.is_const,
+                            irop_get_btype(base_op));
+    return 1;
+  }
+  default:
+    return 0;
+  }
+}
+
 static int ir_opt_fold_strcmp_result(const char *s1, const char *s2)
 {
   while ((unsigned char)*s1 == (unsigned char)*s2)
@@ -1730,6 +1858,41 @@ static int ir_opt_fold_strncmp_result(const char *s1, const char *s2, uint64_t n
   return 0;
 }
 
+static int ir_opt_fold_memcmp_result(const char *s1, const char *s2, uint64_t n)
+{
+  uint64_t i;
+
+  for (i = 0; i < n; ++i)
+  {
+    unsigned char c1 = (unsigned char)s1[i];
+    unsigned char c2 = (unsigned char)s2[i];
+    if (c1 != c2)
+      return (int)c1 - (int)c2;
+  }
+
+  return 0;
+}
+
+static int ir_opt_fold_memchr_offset(const char *s, unsigned char c, uint64_t n, int *out_offset)
+{
+  uint64_t i;
+
+  if (!out_offset)
+    return 0;
+
+  for (i = 0; i < n; ++i)
+  {
+    if ((unsigned char)s[i] == c)
+    {
+      *out_offset = (int)i;
+      return 1;
+    }
+  }
+
+  *out_offset = -1;
+  return 1;
+}
+
 int tcc_ir_opt_const_string_calls(TCCIRState *ir)
 {
   int changes = 0;
@@ -1746,9 +1909,12 @@ int tcc_ir_opt_const_string_calls(TCCIRState *ir)
     IROperand arg1;
     const char *s1;
     const char *s2;
+    IROperand base_op;
     int folded_result;
+    int arg0_is_const_string = 0;
+    int arg1_is_const_string = 0;
 
-    if (q->op != TCCIR_OP_FUNCCALLVAL)
+    if (q->op != TCCIR_OP_FUNCCALLVAL && q->op != TCCIR_OP_FUNCCALLVOID)
       continue;
 
     callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
@@ -1756,28 +1922,256 @@ int tcc_ir_opt_const_string_calls(TCCIRState *ir)
       continue;
 
     name = get_tok_str(callee->v, NULL);
-    if (!name || (strcmp(name, "strcmp") != 0 && strcmp(name, "strncmp") != 0))
+    if (!name || (strcmp(name, "strcmp") != 0 && strcmp(name, "strncmp") != 0 && strcmp(name, "memchr") != 0 &&
+                  strcmp(name, "memcmp") != 0 && strcmp(name, "memmove") != 0 && strcmp(name, "bcopy") != 0 &&
+                  strcmp(name, "mempcpy") != 0 && strcmp(name, "strcat") != 0 && strcmp(name, "strchr") != 0 &&
+                  strcmp(name, "index") != 0 && strcmp(name, "__builtin_index") != 0 && strcmp(name, "strcpy") != 0 &&
+                  strcmp(name, "__builtin_strcpy") != 0))
+      continue;
+
+    if (strcmp(name, "memmove") == 0)
+    {
+      if (change_callee_sym_keep_type(ir, i, "__tcc_memmove"))
+        changes++;
+      continue;
+    }
+
+    if (strcmp(name, "bcopy") == 0)
+    {
+      if (change_callee_sym_keep_type(ir, i, "__tcc_bcopy"))
+        changes++;
+      continue;
+    }
+
+    if (strcmp(name, "mempcpy") == 0)
+    {
+      if (change_callee_sym_keep_type(ir, i, "__tcc_mempcpy"))
+        changes++;
+      continue;
+    }
+
+    if (strcmp(name, "strcat") == 0)
+    {
+      if (change_callee_sym_keep_type(ir, i, "__tcc_strcat"))
+        changes++;
+      continue;
+    }
+
+    if (strcmp(name, "strchr") == 0 || strcmp(name, "index") == 0 || strcmp(name, "__builtin_index") == 0)
+    {
+      if (change_callee_sym_keep_type(ir, i, "__tcc_strchr"))
+        changes++;
+      continue;
+    }
+
+    if (strcmp(name, "strcpy") == 0 || strcmp(name, "__builtin_strcpy") == 0)
+    {
+      if (change_callee_sym_keep_type(ir, i, "__tcc_strcpy"))
+        changes++;
+      continue;
+    }
+
+    if (strcmp(name, "stpcpy") == 0 || strcmp(name, "__builtin_stpcpy") == 0)
+    {
+      if (change_callee_sym_keep_type(ir, i, "__tcc_stpcpy"))
+        changes++;
+      continue;
+    }
+
+    if (strcmp(name, "stpncpy") == 0 || strcmp(name, "__builtin_stpncpy") == 0)
+    {
+      if (change_callee_sym_keep_type(ir, i, "__tcc_stpncpy"))
+        changes++;
+      continue;
+    }
+
+    if (strcmp(name, "strlen") == 0 || strcmp(name, "__builtin_strlen") == 0)
+    {
+      if (change_callee_sym_keep_type(ir, i, "__tcc_strlen"))
+        changes++;
+      continue;
+    }
+
+    if (strcmp(name, "strnlen") == 0 || strcmp(name, "__builtin_strnlen") == 0)
+    {
+      if (change_callee_sym_keep_type(ir, i, "__tcc_strnlen"))
+        changes++;
+      continue;
+    }
+
+    if (strcmp(name, "strpbrk") == 0 || strcmp(name, "__builtin_strpbrk") == 0)
+    {
+      if (change_callee_sym_keep_type(ir, i, "__tcc_strpbrk"))
+        changes++;
+      continue;
+    }
+
+    if (strcmp(name, "strrchr") == 0 || strcmp(name, "rindex") == 0 || strcmp(name, "__builtin_strrchr") == 0 ||
+        strcmp(name, "__builtin_rindex") == 0)
+    {
+      if (change_callee_sym_keep_type(ir, i, "__tcc_strrchr"))
+        changes++;
+      continue;
+    }
+
+    if (strcmp(name, "strstr") == 0 || strcmp(name, "__builtin_strstr") == 0)
+    {
+      if (change_callee_sym_keep_type(ir, i, "__tcc_strstr"))
+        changes++;
+      continue;
+    }
+
+    if (strcmp(name, "strcspn") == 0 || strcmp(name, "__builtin_strcspn") == 0)
+    {
+      if (change_callee_sym_keep_type(ir, i, "__tcc_strcspn"))
+        changes++;
+      continue;
+    }
+
+    if (strcmp(name, "strncpy") == 0 || strcmp(name, "__builtin_strncpy") == 0)
+    {
+      if (change_callee_sym_keep_type(ir, i, "__tcc_strncpy"))
+        changes++;
+      continue;
+    }
+
+    if (strcmp(name, "strncat") == 0 || strcmp(name, "__builtin_strncat") == 0)
+    {
+      if (change_callee_sym_keep_type(ir, i, "__tcc_strncat"))
+        changes++;
+      continue;
+    }
+
+    if (q->op != TCCIR_OP_FUNCCALLVAL)
       continue;
 
     if (!ir_opt_get_call_param_operand(ir, i, 0, &arg0) || !ir_opt_get_call_param_operand(ir, i, 1, &arg1))
       continue;
 
-    if (!ir_opt_eval_const_string(ir, arg0, i, &s1, 0) || !ir_opt_eval_const_string(ir, arg1, i, &s2, 0))
+    if (strcmp(name, "memchr") == 0)
     {
+      IROperand arg2;
+      uint64_t n;
+      int match_offset;
+      uint64_t needle_u64;
+      if (!ir_opt_get_call_param_operand(ir, i, 2, &arg2) || !ir_opt_eval_const_u64(ir, arg2, i, &n, 0) ||
+          !ir_opt_eval_const_string(ir, arg0, i, &s1, 0) ||
+          !ir_opt_eval_const_string_operand(ir, arg0, i, &base_op, 0) ||
+          !ir_opt_eval_const_u64(ir, arg1, i, &needle_u64, 0))
+        continue;
+      if (n > (uint64_t)strlen(s1) + 1)
+        continue;
+
+      if (!ir_opt_fold_memchr_offset(s1, (unsigned char)needle_u64, n, &match_offset))
+        continue;
+
+      ir_opt_nop_call_params(ir, i);
+      q->op = TCCIR_OP_ASSIGN;
+      if (match_offset < 0)
+      {
+        tcc_ir_set_src1(ir, i, irop_make_imm32(-1, 0, IROP_BTYPE_INT32));
+      }
+      else
+      {
+        IRPoolSymref *symref = irop_get_symref_ex(ir, base_op);
+        uint32_t new_idx = tcc_ir_pool_add_symref(ir, symref->sym, symref->addend + match_offset, symref->flags);
+        tcc_ir_set_src1(ir, i,
+                        irop_make_symref(irop_get_vreg(base_op), new_idx, base_op.is_lval, base_op.is_local,
+                                         base_op.is_const, irop_get_btype(base_op)));
+      }
+      tcc_ir_set_src2(ir, i, IROP_NONE);
+      changes++;
       continue;
     }
 
-    if (strcmp(name, "strcmp") == 0)
+    if (strcmp(name, "memcmp") == 0)
     {
-      folded_result = ir_opt_fold_strcmp_result(s1, s2);
+      IROperand arg2;
+      uint64_t n;
+
+      if (!ir_opt_get_call_param_operand(ir, i, 2, &arg2) || !ir_opt_eval_const_u64(ir, arg2, i, &n, 0))
+        continue;
+
+      if (n == 0)
+      {
+        ir_opt_nop_call_params(ir, i);
+        q->op = TCCIR_OP_ASSIGN;
+        tcc_ir_set_src1(ir, i, irop_make_imm32(-1, 0, VT_INT));
+        tcc_ir_set_src2(ir, i, IROP_NONE);
+        changes++;
+        continue;
+      }
+
+      if (n == 1)
+      {
+        ir_opt_nop_call_param(ir, i, 2);
+        if (!change_callee_sym(ir, i, "__tcc_memcmp1", VT_INT))
+          continue;
+        ir_opt_change_call_argc(ir, i, 2);
+        changes++;
+        continue;
+      }
     }
+
+    if (strcmp(name, "strncmp") == 0)
+    {
+      IROperand arg2;
+      uint64_t n;
+
+      if (!ir_opt_get_call_param_operand(ir, i, 2, &arg2) || !ir_opt_eval_const_u64(ir, arg2, i, &n, 0))
+        continue;
+
+      if (n == 0)
+      {
+        ir_opt_nop_call_params(ir, i);
+        q->op = TCCIR_OP_ASSIGN;
+        tcc_ir_set_src1(ir, i, irop_make_imm32(-1, 0, VT_INT));
+        tcc_ir_set_src2(ir, i, IROP_NONE);
+        changes++;
+        continue;
+      }
+
+      arg0_is_const_string = ir_opt_eval_const_string(ir, arg0, i, &s1, 0);
+      arg1_is_const_string = ir_opt_eval_const_string(ir, arg1, i, &s2, 0);
+
+      if (!(arg0_is_const_string && arg1_is_const_string))
+      {
+        if (!change_callee_sym(ir, i, "__tcc_strncmp", VT_INT))
+          continue;
+        changes++;
+        continue;
+      }
+    }
+
+    if (!arg0_is_const_string)
+      arg0_is_const_string = ir_opt_eval_const_string(ir, arg0, i, &s1, 0);
+    if (!arg1_is_const_string)
+      arg1_is_const_string = ir_opt_eval_const_string(ir, arg1, i, &s2, 0);
+
+    if (strcmp(name, "strcmp") == 0 && !(arg0_is_const_string && arg1_is_const_string))
+    {
+      if (change_callee_sym_keep_type(ir, i, "__tcc_strcmp"))
+        changes++;
+      continue;
+    }
+
+    if (!arg0_is_const_string || !arg1_is_const_string)
+      continue;
+
+    if (strcmp(name, "strcmp") == 0)
+      folded_result = ir_opt_fold_strcmp_result(s1, s2);
     else
     {
       IROperand arg2;
       uint64_t n;
       if (!ir_opt_get_call_param_operand(ir, i, 2, &arg2) || !ir_opt_eval_const_u64(ir, arg2, i, &n, 0))
         continue;
-      folded_result = ir_opt_fold_strncmp_result(s1, s2, n);
+      if (n > (uint64_t)strlen(s1) + 1 || n > (uint64_t)strlen(s2) + 1)
+        continue;
+      if (strcmp(name, "strncmp") == 0)
+        folded_result = ir_opt_fold_strncmp_result(s1, s2, n);
+      else
+        folded_result = ir_opt_fold_memcmp_result(s1, s2, n);
     }
 
     ir_opt_nop_call_params(ir, i);
@@ -4855,6 +5249,24 @@ static int change_callee_sym(TCCIRState *ir, int instr_idx, const char *new_name
   Sym *new_sym = external_global_sym(tok_alloc_const(new_name), &ftype);
   if (!new_sym)
     return 0;
+  entry->sym = new_sym;
+  return 1;
+}
+
+static int change_callee_sym_keep_type(TCCIRState *ir, int instr_idx, const char *new_name)
+{
+  IRQuadCompact *q = &ir->compact_instructions[instr_idx];
+  IROperand src1 = tcc_ir_op_get_src1(ir, q);
+  IRPoolSymref *entry = irop_get_symref_ex(ir, src1);
+  Sym *new_sym;
+
+  if (!entry || !entry->sym)
+    return 0;
+
+  new_sym = external_global_sym(tok_alloc_const(new_name), &entry->sym->type);
+  if (!new_sym)
+    return 0;
+
   entry->sym = new_sym;
   return 1;
 }

@@ -522,10 +522,14 @@ struct Sym
     struct Sym *cleanupstate; /* in defined labels */
     int *vla_array_str;       /* vla array code */
   };
-  struct Sym *prev;     /* prev symbol in stack */
-  struct Sym *prev_tok; /* previous symbol for this token */
-  int vla_size_loc;     /* for structs with VLA members: stack offset holding
-                           runtime total struct size (0 = not a VLA struct) */
+  struct Sym *prev;                        /* prev symbol in stack */
+  struct Sym *prev_tok;                    /* previous symbol for this token */
+  int vla_size_loc;                        /* for structs with VLA members: stack offset holding
+                                              runtime total struct size (0 = not a VLA struct) */
+  unsigned long long objsize_max_value;    /* conservative max scalar value assigned locally */
+  unsigned long long objsize_strlen_value; /* conservative max NUL-terminated string bytes */
+  unsigned char objsize_max_valid;
+  unsigned char objsize_strlen_valid;
 };
 
 #include "ir/machine_op.h"
