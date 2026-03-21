@@ -173,6 +173,9 @@ TEST_FILES = [
     # comma expressions in sizeof must safely drop unused results without IR
     ("bug_sizeof_comma_func_decay.c", 0),
 
+    # 64-bit left-shift in a loop clobbers adjacent pointer register/spill slot
+    ("bug_ll_shift_ptr_clobber.c", 0),
+
     ("../tests2/00_assignment.c", 0),
     ("../tests2/01_comment.c", 0),
     ("../tests2/02_printf.c", 0),

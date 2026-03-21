@@ -2058,10 +2058,78 @@ int is_valid_opcode(thumb_opcode op)
   return (op.size == 2 || op.size == 4);
 }
 
+/* Check whether a Thumb/Thumb-2 instruction writes to R9.
+ * Returns the destination register number if it can be decoded, or -1.
+ * Only checks data-processing / move / load instructions, NOT push/pop/stm/ldm
+ * (those legitimately reference R9 for save/restore around calls). */
+static int thumb_decode_dest_reg(thumb_opcode op)
+{
+  uint32_t w = op.opcode;
+
+  if (op.size == 2)
+  {
+    uint16_t hw = (uint16_t)(w & 0xFFFF);
+    /* 16-bit MOV (high registers): 0100 0110 D Rm4 Rd3
+     * Bits [15:8]=0x46, D=bit7 of lower byte, Rd3=bits[2:0] */
+    if ((hw >> 8) == 0x46)
+      return ((hw >> 4) & 0x08) | (hw & 0x07);
+    /* 16-bit ADD (high registers): 0100 0100 D Rm4 Rd3 */
+    if ((hw >> 8) == 0x44)
+      return ((hw >> 4) & 0x08) | (hw & 0x07);
+    /* 16-bit CMP (high registers): 0100 0101 — no dest write, skip */
+    /* Low-register forms (R0-R7 only) can't reach R9 */
+    return -1;
+  }
+
+  if (op.size == 4)
+  {
+    uint16_t hi = (uint16_t)(w >> 16);
+    uint16_t lo = (uint16_t)(w & 0xFFFF);
+    /* Thumb-2 data-processing (modified immediate): 1111 0x0x xxxx xxxx | 0xxx xxxx xxxx xxxx
+     * Rd = bits [11:8] of low halfword */
+    if ((hi & 0xFA00) == 0xF000 && (lo & 0x8000) == 0)
+      return (lo >> 8) & 0x0F;
+    /* Thumb-2 data-processing (plain binary immediate): 1111 0x1x xxxx xxxx | 0xxx xxxx xxxx xxxx
+     * Rd = bits [11:8] of low halfword */
+    if ((hi & 0xFA00) == 0xF200 && (lo & 0x8000) == 0)
+      return (lo >> 8) & 0x0F;
+    /* Thumb-2 LDR/STR (immediate): 1111 1000 xxxx xxxx | xxxx xxxx xxxx xxxx
+     * Rt = bits [15:12] of low halfword — for LDR, Rt is the dest */
+    if ((hi & 0xFE00) == 0xF800)
+    {
+      int L = (hi >> 4) & 1; /* L=1 for loads */
+      if (L)
+        return (lo >> 12) & 0x0F;
+    }
+    /* Thumb-2 load word: 1111 1000 0101 xxxx | xxxx xxxx xxxx xxxx */
+    if ((hi & 0xFFF0) == 0xF850)
+      return (lo >> 12) & 0x0F;
+    /* Thumb-2 MOVW/MOVT: 1111 0x10 x100 xxxx | 0xxx xxxx xxxx xxxx */
+    if ((hi & 0xFBF0) == 0xF240 && (lo & 0x8000) == 0) /* MOVW */
+      return (lo >> 8) & 0x0F;
+    if ((hi & 0xFBF0) == 0xF2C0 && (lo & 0x8000) == 0) /* MOVT */
+      return (lo >> 8) & 0x0F;
+  }
+
+  return -1;
+}
+
 int ot(thumb_opcode op)
 {
   if (op.size == 0)
     return op.size;
+
+  /* Detect instructions that write to R9 when it's reserved for GOT pointer.
+   * Exclude push/pop/stmdb/ldmia which legitimately save/restore R9. */
+  if (text_and_data_separation)
+  {
+    int dest = thumb_decode_dest_reg(op);
+    if (dest == R9)
+    {
+      tcc_error("instruction 0x%0*x (size=%d) writes to R9 (GOT pointer) at ind=0x%x ir_op=%d", op.size == 4 ? 8 : 4,
+                op.opcode, op.size, (unsigned)ind, g_debug_current_op);
+    }
+  }
 
   /* Dry run: don't emit actual opcodes, but still track code size and
    * handle literal pool generation to ensure code addresses match real pass. */
@@ -3457,9 +3525,15 @@ static MachineOperand mach_make_hi_half(const MachineOperand *op)
   switch (hi.kind)
   {
   case MACH_OP_REG:
-    /* r1 holds the high register for 64-bit pairs. Fall back to r0+1 if
-     * r1 is not a valid hardware register (e.g. PREG_REG_NONE = 31). */
-    hi.u.reg.r0 = thumb_is_hw_reg(op->u.reg.r1) ? op->u.reg.r1 : (op->u.reg.r0 + 1);
+    /* r1 holds the high register for 64-bit pairs.  If r1 is not a valid
+     * hardware register the allocator failed to produce a proper pair —
+     * error out instead of silently using r0+1 which can clobber reserved
+     * registers (e.g. R9 = GOT base). */
+    if (!thumb_is_hw_reg(op->u.reg.r1))
+      tcc_error("mach_make_hi_half: 64-bit REG operand has invalid r1=%d (r0=%d) — "
+                "register allocator must produce a valid pair",
+                op->u.reg.r1, op->u.reg.r0);
+    hi.u.reg.r0 = op->u.reg.r1;
     hi.u.reg.r1 = -1;
     break;
   case MACH_OP_SPILL:
@@ -5251,7 +5325,11 @@ ST_FUNC void tcc_gen_machine_load_indexed_mop(MachineOperand dest, MachineOperan
   if (dest.is_64bit)
   {
     const int dest_lo = dest.u.reg.r0;
-    const int dest_hi = thumb_is_hw_reg(dest.u.reg.r1) ? dest.u.reg.r1 : (dest_lo + 1);
+    if (!thumb_is_hw_reg(dest.u.reg.r1))
+      tcc_error("load_indexed_mop: 64-bit dest has invalid r1=%d (r0=%d) — "
+                "register allocator must produce a valid pair",
+                dest.u.reg.r1, dest.u.reg.r0);
+    const int dest_hi = dest.u.reg.r1;
     uint32_t excl = (1u << (uint32_t)dest_lo) | (1u << (uint32_t)dest_hi);
     int base_reg = mach_ensure_in_reg(&ctx, &base, excl);
     excl |= (1u << (uint32_t)base_reg);
@@ -5372,7 +5450,11 @@ ST_FUNC void tcc_gen_machine_load_postinc_mop(MachineOperand dest, MachineOperan
   if (dest.is_64bit)
   {
     const int dest_lo = dest.u.reg.r0;
-    const int dest_hi = thumb_is_hw_reg(dest.u.reg.r1) ? dest.u.reg.r1 : (dest_lo + 1);
+    if (!thumb_is_hw_reg(dest.u.reg.r1))
+      tcc_error("load_postinc_mop: 64-bit dest has invalid r1=%d (r0=%d) — "
+                "register allocator must produce a valid pair",
+                dest.u.reg.r1, dest.u.reg.r0);
+    const int dest_hi = dest.u.reg.r1;
     uint32_t excl = (1u << (uint32_t)dest_lo) | (1u << (uint32_t)dest_hi);
     int ptr_reg = mach_ensure_in_reg(&ctx, &ptr, excl);
     ot_check(

@@ -76,7 +76,8 @@ ST_FUNC int tcc_tool_ar(TCCState *s1, int argc, char **argv)
   int *afpos = NULL;
   int istrlen, strpos = 0, fpos = 0, funccnt = 0, funcmax, hofs;
   char tfile[260], stmp[20];
-  char *file, *name;
+  char *file;
+  const char *name;
   int ret = 2;
   const char *ops_conflict = "habdiopN"; // unsupported but destructive if ignored.
   int extract = 0;

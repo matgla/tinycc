@@ -409,6 +409,12 @@ typedef struct
 
 /* Table of foldable math functions */
 static const FoldableMathFunc foldable_math_funcs[] = {
+#ifdef TARGETOS_YasOS
+    /* Keep self-hosted folding aligned with the currently shipped YasOS libm. */
+    {"sin", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = sin}},
+    {"fabs", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = fabs}},
+    {"sinf", 1, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f1_f = sinf}},
+#else
     /* Double-precision functions */
     {"sin", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = sin}},
     {"cos", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = cos}},
@@ -458,6 +464,7 @@ static const FoldableMathFunc foldable_math_funcs[] = {
     {"fabsf", 1, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f1_f = fabsf}},
     {"fmodf", 2, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f2_f = fmodf}},
     {"remainderf", 2, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f2_f = remainderf}},
+#endif
 };
 
 #define NUM_FOLDABLE_MATH_FUNCS (sizeof(foldable_math_funcs) / sizeof(foldable_math_funcs[0]))
@@ -11493,6 +11500,100 @@ static int gcc_classify_type(CType *type)
   }
 }
 
+/* Emit an IR function call to a library helper for a builtin.
+ * Arguments are already on the vstack (1 or 2 args).
+ * func_tok: TOK_xxx or tok_alloc_const("name") for the target function
+ * argc: number of arguments (1 or 2), already on vstack
+ * ret_type: VT_INT, VT_FLOAT, VT_DOUBLE, etc.
+ * Pops argc args from vstack, pushes the result. */
+static void gen_builtin_libcall(int func_tok, int argc, int ret_type)
+{
+  const int new_call_id = tcc_state->ir->next_call_id++;
+  SValue param_num;
+  svalue_init(&param_num);
+  param_num.vr = -1;
+  param_num.r = VT_CONST;
+
+  for (int i = 0; i < argc; i++)
+  {
+    param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, i);
+    tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[i - (argc - 1)], &param_num, NULL);
+  }
+
+  vpush_helper_func(func_tok);
+
+  SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, argc);
+  SValue dest;
+  svalue_init(&dest);
+  dest.type.t = ret_type;
+  dest.r = 0;
+  dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+  tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &call_id_sv, &dest);
+
+  vtop -= (argc + 1); /* pop func + args */
+  vpushi(0);
+  vtop->type.t = ret_type;
+  vtop->vr = dest.vr;
+  vtop->r = TREG_R0;
+}
+
+/* Emit an IR function call with arguments from an SValue array (not from vstack).
+ * args[0..argc-1] are the arguments.
+ * Pushes the result onto the vstack with the given return type. */
+static void gen_ir_call_args(SValue *args, int argc, int func_tok, CType *ret_ctype)
+{
+  const int new_call_id = tcc_state->ir->next_call_id++;
+  SValue param_num;
+  svalue_init(&param_num);
+  param_num.vr = -1;
+  param_num.r = VT_CONST;
+
+  for (int i = 0; i < argc; i++)
+  {
+    param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, i);
+    tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &args[i], &param_num, NULL);
+  }
+
+  vpush_helper_func(func_tok);
+
+  SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, argc);
+  SValue dest;
+  svalue_init(&dest);
+  dest.type = *ret_ctype;
+  dest.r = 0;
+  dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+  tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &call_id_sv, &dest);
+
+  --vtop; /* pop function */
+  vpushi(0);
+  vtop->type = dest.type;
+  vtop->vr = dest.vr;
+  vtop->r = TREG_R0;
+}
+
+/* Emit an IR void function call with arguments from an SValue array.
+ * args[0..argc-1] are the arguments. Does not push a result. */
+static void gen_ir_void_call_args(SValue *args, int argc, int func_tok)
+{
+  const int new_call_id = tcc_state->ir->next_call_id++;
+  SValue param_num;
+  svalue_init(&param_num);
+  param_num.vr = -1;
+  param_num.r = VT_CONST;
+
+  for (int i = 0; i < argc; i++)
+  {
+    param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, i);
+    tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &args[i], &param_num, NULL);
+  }
+
+  vpush_helper_func(func_tok);
+
+  SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, argc);
+  tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[0], &call_id_sv, NULL);
+  --vtop;
+}
+
 ST_FUNC void unary(void)
 {
   int n, t, align, size, r;
@@ -12577,35 +12678,7 @@ tok_next:
         gen_cast(&dt);
       }
 
-      /* Create call ID and encode parameters */
-      const int new_call_id = tcc_state->ir->next_call_id++;
-      SValue param_num;
-      svalue_init(&param_num);
-      param_num.vr = -1;
-      param_num.r = VT_CONST;
-
-      /* Parameter 0: the float/double argument */
-      param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
-      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &param_num, NULL);
-
-      /* Push the helper function */
-      vpush_helper_func(tok_alloc_const(func_name));
-
-      /* Generate the function call */
-      SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 1);
-      SValue dest;
-      svalue_init(&dest);
-      dest.type.t = VT_INT; /* isinf returns int */
-      dest.r = 0;
-      dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &call_id_sv, &dest);
-
-      /* Pop function and argument (func, arg), push result */
-      vtop -= 2;
-      vpushi(0);
-      vtop->type.t = VT_INT;
-      vtop->vr = dest.vr;
-      vtop->r = TREG_R0; /* Return value in R0 */
+      gen_builtin_libcall(tok_alloc_const(func_name), 1, VT_INT);
     }
     break;
   }
@@ -12656,46 +12729,7 @@ tok_next:
         gen_cast(&dt);
     }
 
-    /* Create call ID and encode parameters */
-    const int new_call_id = tcc_state->ir->next_call_id++;
-    SValue param_num;
-    svalue_init(&param_num);
-    param_num.vr = -1;
-    param_num.r = VT_CONST;
-
-    /* Parameter 0: x (magnitude) - first argument on stack */
-    param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
-    tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &param_num, NULL);
-
-    /* Parameter 1: y (sign) - second argument on stack */
-    param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 1);
-    tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[0], &param_num, NULL);
-
-    /* Push the helper function */
-    if (is_float)
-    {
-      vpush_helper_func(TOK___copysignf);
-    }
-    else
-    {
-      vpush_helper_func(TOK___copysign);
-    }
-
-    /* Generate the function call */
-    SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 2);
-    SValue dest;
-    svalue_init(&dest);
-    dest.type.t = is_float ? VT_FLOAT : VT_DOUBLE;
-    dest.r = 0;
-    dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-    tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &call_id_sv, &dest);
-
-    /* Pop function and arguments (func, y, x), push result */
-    vtop -= 3;
-    vpushi(0);
-    vtop->type.t = is_float ? VT_FLOAT : VT_DOUBLE;
-    vtop->vr = dest.vr;
-    vtop->r = TREG_R0; /* Return value in R0 */
+    gen_builtin_libcall(is_float ? TOK___copysignf : TOK___copysign, 2, is_float ? VT_FLOAT : VT_DOUBLE);
     break;
   }
 
@@ -12762,29 +12796,7 @@ tok_next:
         is_float = 0;
       }
 
-      const int new_call_id = tcc_state->ir->next_call_id++;
-      SValue param_num;
-      svalue_init(&param_num);
-      param_num.vr = -1;
-      param_num.r = VT_CONST;
-      param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
-      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &param_num, NULL);
-
-      vpush_helper_func(is_float ? TOK___isnanf : TOK___isnan);
-
-      SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 1);
-      SValue dest;
-      svalue_init(&dest);
-      dest.type.t = VT_INT;
-      dest.r = 0;
-      dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &call_id_sv, &dest);
-
-      vtop -= 2;
-      vpushi(0);
-      vtop->type.t = VT_INT;
-      vtop->vr = dest.vr;
-      vtop->r = TREG_R0;
+      gen_builtin_libcall(is_float ? TOK___isnanf : TOK___isnan, 1, VT_INT);
     }
     break;
   }
@@ -12993,53 +13005,13 @@ tok_next:
       SValue y_save = vtop[0];
       vtop--; /* remove y temporarily */
 
-      const int call_id_x = tcc_state->ir->next_call_id++;
-      SValue param_num;
-      svalue_init(&param_num);
-      param_num.vr = -1;
-      param_num.r = VT_CONST;
-      param_num.c.i = TCCIR_ENCODE_PARAM(call_id_x, 0);
-      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &param_num, NULL);
-
-      vpush_helper_func(TOK___isnan);
-
-      SValue call_id_sv_x = tcc_ir_svalue_call_id_argc(call_id_x, 1);
-      SValue dest_x;
-      svalue_init(&dest_x);
-      dest_x.type.t = VT_INT;
-      dest_x.r = 0;
-      dest_x.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &call_id_sv_x, &dest_x);
-
-      vtop -= 2; /* pop func and x */
-      vpushi(0);
-      vtop->type.t = VT_INT;
-      vtop->vr = dest_x.vr;
-      vtop->r = TREG_R0;
+      gen_builtin_libcall(TOK___isnan, 1, VT_INT);
 
       /* Save isnan_x result and push y for isnan(y) call */
       SValue isnan_x = *vtop--;
       vpushv(&y_save);
 
-      const int call_id_y = tcc_state->ir->next_call_id++;
-      param_num.c.i = TCCIR_ENCODE_PARAM(call_id_y, 0);
-      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &param_num, NULL);
-
-      vpush_helper_func(TOK___isnan);
-
-      SValue call_id_sv_y = tcc_ir_svalue_call_id_argc(call_id_y, 1);
-      SValue dest_y;
-      svalue_init(&dest_y);
-      dest_y.type.t = VT_INT;
-      dest_y.r = 0;
-      dest_y.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &call_id_sv_y, &dest_y);
-
-      vtop -= 2; /* pop func and y */
-      vpushi(0);
-      vtop->type.t = VT_INT;
-      vtop->vr = dest_y.vr;
-      vtop->r = TREG_R0;
+      gen_builtin_libcall(TOK___isnan, 1, VT_INT);
 
       /* OR the two results: isnan_x | isnan_y */
       vpushv(&isnan_x);
@@ -13128,67 +13100,13 @@ tok_next:
       SValue x_save = vtop[-1];
 
       /* --- Call 1: dcmpun(x, y) → int (1 if NaN, 0 if ordered) --- */
-      {
-        const int cid = tcc_state->ir->next_call_id++;
-        SValue pn;
-        svalue_init(&pn);
-        pn.vr = -1;
-        pn.r = VT_CONST;
-        pn.c.i = TCCIR_ENCODE_PARAM(cid, 0);
-        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &pn, NULL);
-        pn.c.i = TCCIR_ENCODE_PARAM(cid, 1);
-        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[0], &pn, NULL);
-
-        vpush_helper_func(tok_alloc_const(is_double ? "__aeabi_dcmpun" : "__aeabi_fcmpun"));
-
-        SValue cs = tcc_ir_svalue_call_id_argc(cid, 2);
-        SValue d;
-        svalue_init(&d);
-        d.type.t = VT_INT;
-        d.r = 0;
-        d.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &cs, &d);
-
-        /* Pop func + y + x, push unordered_result */
-        vtop -= 3;
-        vpushi(0);
-        vtop->type.t = VT_INT;
-        vtop->vr = d.vr;
-        vtop->r = 0;
-      }
+      gen_builtin_libcall(tok_alloc_const(is_double ? "__aeabi_dcmpun" : "__aeabi_fcmpun"), 2, VT_INT);
       /* Stack: ... unordered_int */
 
       /* --- Call 2: dcmpeq(x, y) → int (1 if equal, 0 if not) --- */
       vpushv(&x_save);
       vpushv(&y_save);
-      {
-        const int cid = tcc_state->ir->next_call_id++;
-        SValue pn;
-        svalue_init(&pn);
-        pn.vr = -1;
-        pn.r = VT_CONST;
-        pn.c.i = TCCIR_ENCODE_PARAM(cid, 0);
-        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &pn, NULL);
-        pn.c.i = TCCIR_ENCODE_PARAM(cid, 1);
-        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[0], &pn, NULL);
-
-        vpush_helper_func(tok_alloc_const(is_double ? "__aeabi_dcmpeq" : "__aeabi_fcmpeq"));
-
-        SValue cs = tcc_ir_svalue_call_id_argc(cid, 2);
-        SValue d;
-        svalue_init(&d);
-        d.type.t = VT_INT;
-        d.r = 0;
-        d.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &cs, &d);
-
-        /* Pop func + y + x, push equal_result */
-        vtop -= 3;
-        vpushi(0);
-        vtop->type.t = VT_INT;
-        vtop->vr = d.vr;
-        vtop->r = 0;
-      }
+      gen_builtin_libcall(tok_alloc_const(is_double ? "__aeabi_dcmpeq" : "__aeabi_fcmpeq"), 2, VT_INT);
       /* Stack: ... unordered_int equal_int */
 
       /* Result = !(unordered | equal) = (unordered == 0) && (equal == 0)
@@ -13260,29 +13178,7 @@ tok_next:
         is_float = 0;
       }
 
-      const int new_call_id = tcc_state->ir->next_call_id++;
-      SValue param_num;
-      svalue_init(&param_num);
-      param_num.vr = -1;
-      param_num.r = VT_CONST;
-      param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
-      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &param_num, NULL);
-
-      vpush_helper_func(is_float ? TOK___fabsf : TOK___fabs);
-
-      SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 1);
-      SValue dest;
-      svalue_init(&dest);
-      dest.type.t = is_float ? VT_FLOAT : VT_DOUBLE;
-      dest.r = 0;
-      dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &call_id_sv, &dest);
-
-      vtop -= 2;
-      vpushi(0);
-      vtop->type.t = is_float ? VT_FLOAT : VT_DOUBLE;
-      vtop->vr = dest.vr;
-      vtop->r = TREG_R0;
+      gen_builtin_libcall(is_float ? TOK___fabsf : TOK___fabs, 1, is_float ? VT_FLOAT : VT_DOUBLE);
     }
     break;
   }
@@ -13293,11 +13189,6 @@ tok_next:
     parse_builtin_params(0, "ee");
 
     /* On ARM, long double == double, so just call copysign */
-    const int new_call_id = tcc_state->ir->next_call_id++;
-    SValue param_num;
-    svalue_init(&param_num);
-    param_num.vr = -1;
-    param_num.r = VT_CONST;
 
     /* Ensure both args are doubles */
     if ((vtop[-1].type.t & VT_BTYPE) == VT_FLOAT)
@@ -13319,26 +13210,7 @@ tok_next:
       gen_cast(&dt);
     }
 
-    param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
-    tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &param_num, NULL);
-    param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 1);
-    tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[0], &param_num, NULL);
-
-    vpush_helper_func(TOK___copysign);
-
-    SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 2);
-    SValue dest;
-    svalue_init(&dest);
-    dest.type.t = VT_LDOUBLE;
-    dest.r = 0;
-    dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-    tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &call_id_sv, &dest);
-
-    vtop -= 3;
-    vpushi(0);
-    vtop->type.t = VT_LDOUBLE;
-    vtop->vr = dest.vr;
-    vtop->r = TREG_R0;
+    gen_builtin_libcall(TOK___copysign, 2, VT_LDOUBLE);
     break;
   }
 
@@ -13401,29 +13273,7 @@ tok_next:
         gen_cast(&ft);
       }
 
-      const int new_call_id = tcc_state->ir->next_call_id++;
-      SValue param_num;
-      svalue_init(&param_num);
-      param_num.vr = -1;
-      param_num.r = VT_CONST;
-      param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
-      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &param_num, NULL);
-
-      vpush_helper_func(is_float ? TOK___finitef : TOK___finite);
-
-      SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 1);
-      SValue dest;
-      svalue_init(&dest);
-      dest.type.t = VT_INT;
-      dest.r = 0;
-      dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &call_id_sv, &dest);
-
-      vtop -= 2;
-      vpushi(0);
-      vtop->type.t = VT_INT;
-      vtop->vr = dest.vr;
-      vtop->r = TREG_R0;
+      gen_builtin_libcall(is_float ? TOK___finitef : TOK___finite, 1, VT_INT);
     }
     break;
   }
@@ -13482,29 +13332,7 @@ tok_next:
         is_float = 0;
       }
 
-      const int new_call_id = tcc_state->ir->next_call_id++;
-      SValue param_num;
-      svalue_init(&param_num);
-      param_num.vr = -1;
-      param_num.r = VT_CONST;
-      param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
-      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &param_num, NULL);
-
-      vpush_helper_func(is_float ? TOK___isinff : TOK___isinf);
-
-      SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 1);
-      SValue dest;
-      svalue_init(&dest);
-      dest.type.t = VT_INT;
-      dest.r = 0;
-      dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &call_id_sv, &dest);
-
-      vtop -= 2;
-      vpushi(0);
-      vtop->type.t = VT_INT;
-      vtop->vr = dest.vr;
-      vtop->r = TREG_R0;
+      gen_builtin_libcall(is_float ? TOK___isinff : TOK___isinf, 1, VT_INT);
     }
     break;
   }
@@ -13609,17 +13437,6 @@ tok_next:
         }
       }
 
-      const int new_call_id = tcc_state->ir->next_call_id++;
-      SValue param_num;
-      svalue_init(&param_num);
-      param_num.vr = -1;
-      param_num.r = VT_CONST;
-
-      param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
-      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &param_num, NULL);
-      param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 1);
-      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[0], &param_num, NULL);
-
       int func_tok;
       if (is_max)
         func_tok = is_float ? TOK___fmaxf : TOK___fmax;
@@ -13631,21 +13448,8 @@ tok_next:
         func_tok = TOK___fmaxl;
       else if (tok1 == TOK_builtin_fminl)
         func_tok = TOK___fminl;
-      vpush_helper_func(func_tok);
 
-      SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 2);
-      SValue dest;
-      svalue_init(&dest);
-      dest.type.t = is_float ? VT_FLOAT : VT_DOUBLE;
-      dest.r = 0;
-      dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &call_id_sv, &dest);
-
-      vtop -= 3;
-      vpushi(0);
-      vtop->type.t = is_float ? VT_FLOAT : VT_DOUBLE;
-      vtop->vr = dest.vr;
-      vtop->r = TREG_R0;
+      gen_builtin_libcall(func_tok, 2, is_float ? VT_FLOAT : VT_DOUBLE);
     }
     break;
   }
@@ -13708,29 +13512,7 @@ tok_next:
       SValue val_save = *vtop;
 
       /* Call finite(x) */
-      const int call_id1 = tcc_state->ir->next_call_id++;
-      SValue param_num;
-      svalue_init(&param_num);
-      param_num.vr = -1;
-      param_num.r = VT_CONST;
-      param_num.c.i = TCCIR_ENCODE_PARAM(call_id1, 0);
-      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &param_num, NULL);
-
-      vpush_helper_func(is_float ? TOK___finitef : TOK___finite);
-
-      SValue call_id_sv1 = tcc_ir_svalue_call_id_argc(call_id1, 1);
-      SValue dest1;
-      svalue_init(&dest1);
-      dest1.type.t = VT_INT;
-      dest1.r = 0;
-      dest1.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &call_id_sv1, &dest1);
-
-      vtop -= 2; /* pop func and x */
-      vpushi(0);
-      vtop->type.t = VT_INT;
-      vtop->vr = dest1.vr;
-      vtop->r = TREG_R0;
+      gen_builtin_libcall(is_float ? TOK___finitef : TOK___finite, 1, VT_INT);
 
       /* Now we need: finite_result && x != 0.0 (approximately, ignoring subnormals for now)
        * Actually, isnormal is: exponent != 0 && exponent != all-1s.
@@ -13745,25 +13527,7 @@ tok_next:
       vpushv(&val_save);
 
       /* Call fabs on the saved value */
-      const int call_id2 = tcc_state->ir->next_call_id++;
-      param_num.c.i = TCCIR_ENCODE_PARAM(call_id2, 0);
-      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &param_num, NULL);
-
-      vpush_helper_func(is_float ? TOK___fabsf : TOK___fabs);
-
-      SValue call_id_sv2 = tcc_ir_svalue_call_id_argc(call_id2, 1);
-      SValue dest2;
-      svalue_init(&dest2);
-      dest2.type.t = is_float ? VT_FLOAT : VT_DOUBLE;
-      dest2.r = 0;
-      dest2.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &call_id_sv2, &dest2);
-
-      vtop -= 2; /* pop func and val */
-      vpushi(0);
-      vtop->type.t = is_float ? VT_FLOAT : VT_DOUBLE;
-      vtop->vr = dest2.vr;
-      vtop->r = TREG_R0;
+      gen_builtin_libcall(is_float ? TOK___fabsf : TOK___fabs, 1, is_float ? VT_FLOAT : VT_DOUBLE);
 
       /* Compare fabs(x) >= min_normal */
       if (is_float)
@@ -13982,33 +13746,7 @@ tok_next:
         gen_cast(&uint32_type);
 
         /* Call __bswapsi2 library function using IR */
-        vpush_helper_func(TOK___bswapsi2);
-        vrott(2);
-        /* Stack after vrott(2): func, arg (arg is at vtop) */
-        {
-          SValue param_num;
-          SValue dest;
-          const int call_id = tcc_state->ir ? tcc_state->ir->next_call_id++ : 0;
-          svalue_init(&param_num);
-          param_num.vr = -1;
-          param_num.r = VT_CONST;
-          /* Generate FUNCPARAMVAL for arg (param 0) */
-          param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
-          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[0], &param_num, NULL);
-          /* Generate FUNCCALLVAL for the function call (returns 32-bit) */
-          svalue_init(&dest);
-          dest.type.t = VT_INT | VT_UNSIGNED;
-          dest.r = 0;
-          dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-          SValue call_id_sv = tcc_ir_svalue_call_id_argc(call_id, 1);
-          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[-1], &call_id_sv, &dest);
-          /* Pop all 2 values (arg, func) and push result */
-          vtop -= 2;
-          vpushi(0);
-          vtop->type.t = VT_INT | VT_UNSIGNED;
-          vtop->vr = dest.vr;
-          vtop->r = TREG_R0; /* Return value in R0 */
-        }
+        gen_builtin_libcall(TOK___bswapsi2, 1, VT_INT | VT_UNSIGNED);
 
         /* Shift right by 16 to get the swapped 16-bit value in the low bits */
         /* Actually, for a 16-bit value 0xABCD, bswap32 gives 0xCDAB0000,
@@ -14022,67 +13760,13 @@ tok_next:
       else if (size == 4)
       {
         /* bswap32: call __bswapsi2 library function */
-        vpush_helper_func(TOK___bswapsi2);
-        vrott(2);
-        /* Stack after vrott(2): func, arg (arg is at vtop) */
-        {
-          SValue param_num;
-          SValue dest;
-          const int call_id = tcc_state->ir ? tcc_state->ir->next_call_id++ : 0;
-          svalue_init(&param_num);
-          param_num.vr = -1;
-          param_num.r = VT_CONST;
-          /* Generate FUNCPARAMVAL for arg (param 0) */
-          param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
-          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[0], &param_num, NULL);
-          /* Generate FUNCCALLVAL for the function call (returns 32-bit) */
-          svalue_init(&dest);
-          dest.type.t = VT_INT | VT_UNSIGNED;
-          dest.r = 0;
-          dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-          SValue call_id_sv = tcc_ir_svalue_call_id_argc(call_id, 1);
-          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[-1], &call_id_sv, &dest);
-          /* Pop all 2 values (arg, func) and push result */
-          vtop -= 2;
-          vpushi(0);
-          vtop->type.t = VT_INT | VT_UNSIGNED;
-          vtop->vr = dest.vr;
-          vtop->r = TREG_R0; /* Return value in R0 */
-        }
+        gen_builtin_libcall(TOK___bswapsi2, 1, VT_INT | VT_UNSIGNED);
       }
       else
       {
         /* bswap64: emit as library call (complex on 32-bit ARM) */
         /* Call __bswapdi3 library function using IR */
-        vpush_helper_func(TOK___bswapdi3);
-        vrott(2);
-        /* Stack after vrott(2): func, arg (arg is at vtop) */
-        {
-          SValue param_num;
-          SValue dest;
-          const int call_id = tcc_state->ir ? tcc_state->ir->next_call_id++ : 0;
-          svalue_init(&param_num);
-          param_num.vr = -1;
-          param_num.r = VT_CONST;
-          /* Generate FUNCPARAMVAL for arg (param 0) */
-          param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
-          TCCGEN_DEBUG("[TCCGEN] FUNCPARAMVAL push: site=bswap64 call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
-                       call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)param_num.c.i), vtop[0].r, vtop[0].vr);
-          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[0], &param_num, NULL);
-          /* Generate FUNCCALLVAL for the function call (returns 64-bit) */
-          svalue_init(&dest);
-          dest.type.t = VT_LLONG | VT_UNSIGNED;
-          dest.r = 0;
-          dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-          SValue call_id_sv = tcc_ir_svalue_call_id_argc(call_id, 1);
-          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[-1], &call_id_sv, &dest);
-          /* Pop all 2 values (arg, func) and push result */
-          vtop -= 2;
-          vpushi(0);
-          vtop->type.t = VT_LLONG | VT_UNSIGNED;
-          vtop->vr = dest.vr;
-          vtop->r = TREG_R0; /* Return value in R0:R1 */
-        }
+        gen_builtin_libcall(TOK___bswapdi3, 1, VT_LLONG | VT_UNSIGNED);
       }
     }
     break;
@@ -14870,13 +14554,13 @@ tok_next:
       int vec1_elem_count, vec2_elem_count;
       int total_src_elems, result_elem_count;
       int result_size, res_vr, res_loc;
-      int indices[64];
+      int *indices = tcc_malloc(64 * sizeof(int));
       int i;
 
       result_elem_count = 0;
       while (tok == ',')
       {
-        if (result_elem_count >= (int)(sizeof(indices) / sizeof(indices[0])))
+        if (result_elem_count >= 64)
           tcc_error("too many __builtin_shufflevector indices");
         skip(',');
         indices[result_elem_count++] = expr_const();
@@ -14976,6 +14660,7 @@ tok_next:
         result.c.i = res_loc;
         vpushv(&result);
       }
+      tcc_free(indices);
       break;
     }
 
@@ -17066,8 +16751,11 @@ tok_next:
         PUT_R_RET(&ret, ret.type.t);
       }
 
-      /* Storage for arguments in case we need to constant-fold */
-      SValue saved_args[8];
+      /* Storage for arguments in case we need to constant-fold.
+       * Heap-allocated to reduce unary()'s stack frame — this 320-byte array
+       * would otherwise bloat every recursive call (TCC allocates all block-scoped
+       * locals at function entry). */
+      SValue *saved_args = tcc_mallocz(8 * sizeof(SValue));
       int saved_arg_count = 0;
       int can_try_fold = 0;
       int can_inline_builtin = 0;
@@ -17414,10 +17102,10 @@ tok_next:
 
           /* Create a unique symbol for the clone */
           static int va_pack_clone_id = 0;
-          char clone_name[256];
-          snprintf(clone_name, sizeof(clone_name), "__va_pack_%s_%d", get_tok_str(call_func_sym->v, NULL),
-                   va_pack_clone_id++);
+          char *clone_name = tcc_malloc(256);
+          snprintf(clone_name, 256, "__va_pack_%s_%d", get_tok_str(call_func_sym->v, NULL), va_pack_clone_id++);
           int clone_tok_id = tok_alloc(clone_name, strlen(clone_name))->tok;
+          tcc_free(clone_name);
 
           /* Create clone function type: same as original but non-variadic */
           CType clone_type;
@@ -17778,38 +17466,11 @@ tok_next:
           }
 
           {
-            SValue param_num;
-            SValue dest;
-            const int new_call_id = tcc_state->ir->next_call_id++;
-
-            svalue_init(&param_num);
-            param_num.vr = -1;
-            param_num.r = VT_CONST;
-
-            param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
-            tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[0], &param_num, NULL);
-
-            param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 1);
-            tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, copy_src_sv, &param_num, NULL);
-
-            vpush_helper_func(tok_alloc_const("__tcc_strcpy_count"));
-
-            svalue_init(&dest);
-            dest.type.t = VT_INT;
-            dest.type.ref = NULL;
-            dest.r = 0;
-            dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-            {
-              SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 2);
-              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &call_id_sv, &dest);
-            }
-
-            --vtop;
-            vpushi(0);
-            vtop->type.t = VT_INT;
-            vtop->type.ref = NULL;
-            vtop->vr = dest.vr;
-            vtop->r = TREG_R0;
+            SValue sc_args[2];
+            sc_args[0] = saved_args[0];
+            sc_args[1] = *copy_src_sv;
+            CType rt = {VT_INT, NULL};
+            gen_ir_call_args(sc_args, 2, tok_alloc_const("__tcc_strcpy_count"), &rt);
             vtop[-1] = vtop[0];
             --vtop;
             sprintf_family_optimized = 1;
@@ -17971,12 +17632,6 @@ tok_next:
             else if (opt_kind == PF_OPT_PUTCHAR_CONST)
             {
               /* putchar(constant_char) or fputc(constant_char, f) */
-              SValue param_num;
-              const int new_call_id = tcc_state->ir->next_call_id++;
-              svalue_init(&param_num);
-              param_num.vr = -1;
-              param_num.r = VT_CONST;
-
               SValue ch_sv;
               svalue_init(&ch_sv);
               ch_sv.r = VT_CONST;
@@ -17984,24 +17639,17 @@ tok_next:
               ch_sv.type.t = VT_INT;
               ch_sv.vr = -1;
 
-              param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
-              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &ch_sv, &param_num, NULL);
-
               if (has_file)
               {
-                param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 1);
-                tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[pf_file_idx], &param_num, NULL);
-                vpush_helper_func(tok_alloc_const("fputc"));
-                SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 2);
-                tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[0], &call_id_sv, NULL);
+                SValue pf_args[2];
+                pf_args[0] = ch_sv;
+                pf_args[1] = saved_args[pf_file_idx];
+                gen_ir_void_call_args(pf_args, 2, tok_alloc_const("fputc"));
               }
               else
               {
-                vpush_helper_func(tok_alloc_const("putchar"));
-                SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 1);
-                tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[0], &call_id_sv, NULL);
+                gen_ir_void_call_args(&ch_sv, 1, tok_alloc_const("putchar"));
               }
-              --vtop;
               vpushi(1);
               vtop[-1] = vtop[0];
               --vtop;
@@ -18009,41 +17657,20 @@ tok_next:
             else if (opt_kind == PF_OPT_FWRITE)
             {
               /* fwrite(str, 1, len, f) — always goes to a FILE* */
-              SValue param_num;
-              const int new_call_id = tcc_state->ir->next_call_id++;
-              svalue_init(&param_num);
-              param_num.vr = -1;
-              param_num.r = VT_CONST;
-
-              /* param 0: const char *str */
-              param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
-              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, write_str_sv, &param_num, NULL);
-              /* param 1: size_t size = 1 */
-              SValue one_sv;
-              svalue_init(&one_sv);
-              one_sv.r = VT_CONST;
-              one_sv.c.i = 1;
-              one_sv.type.t = VT_INT;
-              one_sv.vr = -1;
-              param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 1);
-              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &one_sv, &param_num, NULL);
-              /* param 2: size_t count = write_len */
-              SValue len_sv;
-              svalue_init(&len_sv);
-              len_sv.r = VT_CONST;
-              len_sv.c.i = write_len;
-              len_sv.type.t = VT_INT;
-              len_sv.vr = -1;
-              param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 2);
-              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &len_sv, &param_num, NULL);
-              /* param 3: FILE *f */
-              param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 3);
-              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[pf_file_idx], &param_num, NULL);
-
-              vpush_helper_func(tok_alloc_const("fwrite"));
-              SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 4);
-              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[0], &call_id_sv, NULL);
-              --vtop;
+              SValue fw_args[4];
+              fw_args[0] = *write_str_sv;
+              svalue_init(&fw_args[1]);
+              fw_args[1].r = VT_CONST;
+              fw_args[1].c.i = 1;
+              fw_args[1].type.t = VT_INT;
+              fw_args[1].vr = -1;
+              svalue_init(&fw_args[2]);
+              fw_args[2].r = VT_CONST;
+              fw_args[2].c.i = write_len;
+              fw_args[2].type.t = VT_INT;
+              fw_args[2].vr = -1;
+              fw_args[3] = saved_args[pf_file_idx];
+              gen_ir_void_call_args(fw_args, 4, tok_alloc_const("fwrite"));
               vpushi(write_len);
               vtop[-1] = vtop[0];
               --vtop;
@@ -18071,19 +17698,7 @@ tok_next:
               new_str_sv.c.i = 0;
               new_str_sv.vr = -1;
 
-              SValue param_num;
-              const int new_call_id = tcc_state->ir->next_call_id++;
-              svalue_init(&param_num);
-              param_num.vr = -1;
-              param_num.r = VT_CONST;
-
-              param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
-              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &new_str_sv, &param_num, NULL);
-
-              vpush_helper_func(tok_alloc_const("puts"));
-              SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 1);
-              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[0], &call_id_sv, NULL);
-              --vtop;
+              gen_ir_void_call_args(&new_str_sv, 1, tok_alloc_const("puts"));
               vpushi(puts_src_len);
               vtop[-1] = vtop[0];
               --vtop;
@@ -18091,30 +17706,17 @@ tok_next:
             else if (opt_kind == PF_OPT_PUTCHAR_ARG)
             {
               /* putchar(arg) or fputc(arg, f) — for "%c" format */
-              SValue param_num;
-              const int new_call_id = tcc_state->ir->next_call_id++;
-              svalue_init(&param_num);
-              param_num.vr = -1;
-              param_num.r = VT_CONST;
-
-              param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
-              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[pf_vararg_idx], &param_num, NULL);
-
               if (has_file)
               {
-                param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 1);
-                tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[pf_file_idx], &param_num, NULL);
-                vpush_helper_func(tok_alloc_const("fputc"));
-                SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 2);
-                tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[0], &call_id_sv, NULL);
+                SValue pf_args[2];
+                pf_args[0] = saved_args[pf_vararg_idx];
+                pf_args[1] = saved_args[pf_file_idx];
+                gen_ir_void_call_args(pf_args, 2, tok_alloc_const("fputc"));
               }
               else
               {
-                vpush_helper_func(tok_alloc_const("putchar"));
-                SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 1);
-                tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[0], &call_id_sv, NULL);
+                gen_ir_void_call_args(&saved_args[pf_vararg_idx], 1, tok_alloc_const("putchar"));
               }
-              --vtop;
               vpushi(1);
               vtop[-1] = vtop[0];
               --vtop;
@@ -18122,22 +17724,10 @@ tok_next:
             else if (opt_kind == PF_OPT_FPUTS_ARG)
             {
               /* fputs(arg, f) — for fprintf-family "%s" format. */
-              SValue param_num;
-              const int new_call_id = tcc_state->ir->next_call_id++;
-              svalue_init(&param_num);
-              param_num.vr = -1;
-              param_num.r = VT_CONST;
-
-              param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
-              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[pf_vararg_idx], &param_num, NULL);
-
-              param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 1);
-              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[pf_file_idx], &param_num, NULL);
-
-              vpush_helper_func(tok_alloc_const("fputs"));
-              SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 2);
-              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[0], &call_id_sv, NULL);
-              --vtop;
+              SValue pf_args[2];
+              pf_args[0] = saved_args[pf_vararg_idx];
+              pf_args[1] = saved_args[pf_file_idx];
+              gen_ir_void_call_args(pf_args, 2, tok_alloc_const("fputs"));
               vpushi(0);
               vtop[-1] = vtop[0];
               --vtop;
@@ -18145,19 +17735,7 @@ tok_next:
             else if (opt_kind == PF_OPT_PUTS_ARG)
             {
               /* puts(arg) — for "%s\n" format. puts() appends \n automatically. */
-              SValue param_num;
-              const int new_call_id = tcc_state->ir->next_call_id++;
-              svalue_init(&param_num);
-              param_num.vr = -1;
-              param_num.r = VT_CONST;
-
-              param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
-              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[pf_vararg_idx], &param_num, NULL);
-
-              vpush_helper_func(tok_alloc_const("puts"));
-              SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 1);
-              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[0], &call_id_sv, NULL);
-              --vtop;
+              gen_ir_void_call_args(&saved_args[pf_vararg_idx], 1, tok_alloc_const("puts"));
               vpushi(0);
               vtop[-1] = vtop[0];
               --vtop;
@@ -18308,38 +17886,8 @@ tok_next:
           }
 
           {
-            SValue param_num;
-            SValue dest;
-            const int new_call_id = tcc_state->ir->next_call_id++;
-
-            svalue_init(&param_num);
-            param_num.vr = -1;
-            param_num.r = VT_CONST;
-
-            param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
-            tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[0], &param_num, NULL);
-
-            param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 1);
-            tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[1], &param_num, NULL);
-
-            vpush_helper_func(tok_alloc_const("__tcc_strcmp"));
-
-            svalue_init(&dest);
-            dest.type.t = VT_INT;
-            dest.type.ref = NULL;
-            dest.r = 0;
-            dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-            {
-              SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 2);
-              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &call_id_sv, &dest);
-            }
-
-            --vtop;
-            vpushi(0);
-            vtop->type.t = VT_INT;
-            vtop->type.ref = NULL;
-            vtop->vr = dest.vr;
-            vtop->r = TREG_R0;
+            CType rt = {VT_INT, NULL};
+            gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_strcmp"), &rt);
             vtop[-1] = vtop[0];
             --vtop;
             string_builtin_optimized = 1;
@@ -18369,36 +17917,7 @@ tok_next:
           }
 
           {
-            SValue param_num;
-            SValue dest;
-            const int new_call_id = tcc_state->ir->next_call_id++;
-
-            svalue_init(&param_num);
-            param_num.vr = -1;
-            param_num.r = VT_CONST;
-
-            param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
-            tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[0], &param_num, NULL);
-
-            param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 1);
-            tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[1], &param_num, NULL);
-
-            vpush_helper_func(tok_alloc_const("__tcc_strcpy"));
-
-            svalue_init(&dest);
-            dest.type = saved_args[0].type;
-            dest.r = 0;
-            dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-            {
-              SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 2);
-              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &call_id_sv, &dest);
-            }
-
-            --vtop;
-            vpushi(0);
-            vtop->type = dest.type;
-            vtop->vr = dest.vr;
-            vtop->r = TREG_R0;
+            gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_strcpy"), &saved_args[0].type);
             vtop[-1] = vtop[0];
             --vtop;
             string_builtin_optimized = 1;
@@ -18430,36 +17949,7 @@ tok_next:
           }
 
           {
-            SValue param_num;
-            SValue dest;
-            const int new_call_id = tcc_state->ir->next_call_id++;
-
-            svalue_init(&param_num);
-            param_num.vr = -1;
-            param_num.r = VT_CONST;
-
-            param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
-            tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[0], &param_num, NULL);
-
-            param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 1);
-            tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[1], &param_num, NULL);
-
-            vpush_helper_func(tok_alloc_const("__tcc_stpcpy"));
-
-            svalue_init(&dest);
-            dest.type = result_type;
-            dest.r = 0;
-            dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-            {
-              SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 2);
-              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &call_id_sv, &dest);
-            }
-
-            --vtop;
-            vpushi(0);
-            vtop->type = dest.type;
-            vtop->vr = dest.vr;
-            vtop->r = TREG_R0;
+            gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_stpcpy"), &result_type);
             vtop[-1] = vtop[0];
             --vtop;
             string_builtin_optimized = 1;
@@ -18491,33 +17981,7 @@ tok_next:
           }
 
           {
-            SValue param_num;
-            SValue dest;
-            const int new_call_id = tcc_state->ir->next_call_id++;
-
-            svalue_init(&param_num);
-            param_num.vr = -1;
-            param_num.r = VT_CONST;
-
-            param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
-            tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[0], &param_num, NULL);
-
-            vpush_helper_func(tok_alloc_const("__tcc_strlen"));
-
-            svalue_init(&dest);
-            dest.type = result_type;
-            dest.r = 0;
-            dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-            {
-              SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 1);
-              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &call_id_sv, &dest);
-            }
-
-            --vtop;
-            vpushi(0);
-            vtop->type = dest.type;
-            vtop->vr = dest.vr;
-            vtop->r = TREG_R0;
+            gen_ir_call_args(saved_args, 1, tok_alloc_const("__tcc_strlen"), &result_type);
             vtop[-1] = vtop[0];
             --vtop;
             string_builtin_optimized = 1;
@@ -18549,36 +18013,7 @@ tok_next:
           }
 
           {
-            SValue param_num;
-            SValue dest;
-            const int new_call_id = tcc_state->ir->next_call_id++;
-
-            svalue_init(&param_num);
-            param_num.vr = -1;
-            param_num.r = VT_CONST;
-
-            param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
-            tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[0], &param_num, NULL);
-
-            param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 1);
-            tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[1], &param_num, NULL);
-
-            vpush_helper_func(tok_alloc_const("__tcc_strnlen"));
-
-            svalue_init(&dest);
-            dest.type = result_type;
-            dest.r = 0;
-            dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-            {
-              SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 2);
-              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &call_id_sv, &dest);
-            }
-
-            --vtop;
-            vpushi(0);
-            vtop->type = dest.type;
-            vtop->vr = dest.vr;
-            vtop->r = TREG_R0;
+            gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_strnlen"), &result_type);
             vtop[-1] = vtop[0];
             --vtop;
             string_builtin_optimized = 1;
@@ -18610,36 +18045,7 @@ tok_next:
           }
 
           {
-            SValue param_num;
-            SValue dest;
-            const int new_call_id = tcc_state->ir->next_call_id++;
-
-            svalue_init(&param_num);
-            param_num.vr = -1;
-            param_num.r = VT_CONST;
-
-            param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
-            tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[0], &param_num, NULL);
-
-            param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 1);
-            tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[1], &param_num, NULL);
-
-            vpush_helper_func(tok_alloc_const("__tcc_strpbrk"));
-
-            svalue_init(&dest);
-            dest.type = result_type;
-            dest.r = 0;
-            dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-            {
-              SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 2);
-              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &call_id_sv, &dest);
-            }
-
-            --vtop;
-            vpushi(0);
-            vtop->type = dest.type;
-            vtop->vr = dest.vr;
-            vtop->r = TREG_R0;
+            gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_strpbrk"), &result_type);
             vtop[-1] = vtop[0];
             --vtop;
             string_builtin_optimized = 1;
@@ -18672,36 +18078,7 @@ tok_next:
           }
 
           {
-            SValue param_num;
-            SValue dest;
-            const int new_call_id = tcc_state->ir->next_call_id++;
-
-            svalue_init(&param_num);
-            param_num.vr = -1;
-            param_num.r = VT_CONST;
-
-            param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
-            tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[0], &param_num, NULL);
-
-            param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 1);
-            tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[1], &param_num, NULL);
-
-            vpush_helper_func(tok_alloc_const("__tcc_strrchr"));
-
-            svalue_init(&dest);
-            dest.type = result_type;
-            dest.r = 0;
-            dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-            {
-              SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 2);
-              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &call_id_sv, &dest);
-            }
-
-            --vtop;
-            vpushi(0);
-            vtop->type = dest.type;
-            vtop->vr = dest.vr;
-            vtop->r = TREG_R0;
+            gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_strrchr"), &result_type);
             vtop[-1] = vtop[0];
             --vtop;
             string_builtin_optimized = 1;
@@ -18733,36 +18110,7 @@ tok_next:
           }
 
           {
-            SValue param_num;
-            SValue dest;
-            const int new_call_id = tcc_state->ir->next_call_id++;
-
-            svalue_init(&param_num);
-            param_num.vr = -1;
-            param_num.r = VT_CONST;
-
-            param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
-            tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[0], &param_num, NULL);
-
-            param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 1);
-            tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[1], &param_num, NULL);
-
-            vpush_helper_func(tok_alloc_const("__tcc_strstr"));
-
-            svalue_init(&dest);
-            dest.type = result_type;
-            dest.r = 0;
-            dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-            {
-              SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 2);
-              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &call_id_sv, &dest);
-            }
-
-            --vtop;
-            vpushi(0);
-            vtop->type = dest.type;
-            vtop->vr = dest.vr;
-            vtop->r = TREG_R0;
+            gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_strstr"), &result_type);
             vtop[-1] = vtop[0];
             --vtop;
             string_builtin_optimized = 1;
@@ -18794,36 +18142,7 @@ tok_next:
           }
 
           {
-            SValue param_num;
-            SValue dest;
-            const int new_call_id = tcc_state->ir->next_call_id++;
-
-            svalue_init(&param_num);
-            param_num.vr = -1;
-            param_num.r = VT_CONST;
-
-            param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
-            tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[0], &param_num, NULL);
-
-            param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 1);
-            tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[1], &param_num, NULL);
-
-            vpush_helper_func(tok_alloc_const("__tcc_strcspn"));
-
-            svalue_init(&dest);
-            dest.type = result_type;
-            dest.r = 0;
-            dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-            {
-              SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 2);
-              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &call_id_sv, &dest);
-            }
-
-            --vtop;
-            vpushi(0);
-            vtop->type = dest.type;
-            vtop->vr = dest.vr;
-            vtop->r = TREG_R0;
+            gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_strcspn"), &result_type);
             vtop[-1] = vtop[0];
             --vtop;
             string_builtin_optimized = 1;
@@ -18855,39 +18174,7 @@ tok_next:
           }
 
           {
-            SValue param_num;
-            SValue dest;
-            const int new_call_id = tcc_state->ir->next_call_id++;
-
-            svalue_init(&param_num);
-            param_num.vr = -1;
-            param_num.r = VT_CONST;
-
-            param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
-            tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[0], &param_num, NULL);
-
-            param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 1);
-            tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[1], &param_num, NULL);
-
-            param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 2);
-            tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[2], &param_num, NULL);
-
-            vpush_helper_func(tok_alloc_const("__tcc_strncpy"));
-
-            svalue_init(&dest);
-            dest.type = result_type;
-            dest.r = 0;
-            dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-            {
-              SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 3);
-              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &call_id_sv, &dest);
-            }
-
-            --vtop;
-            vpushi(0);
-            vtop->type = dest.type;
-            vtop->vr = dest.vr;
-            vtop->r = TREG_R0;
+            gen_ir_call_args(saved_args, 3, tok_alloc_const("__tcc_strncpy"), &result_type);
             vtop[-1] = vtop[0];
             --vtop;
             string_builtin_optimized = 1;
@@ -18919,39 +18206,7 @@ tok_next:
           }
 
           {
-            SValue param_num;
-            SValue dest;
-            const int new_call_id = tcc_state->ir->next_call_id++;
-
-            svalue_init(&param_num);
-            param_num.vr = -1;
-            param_num.r = VT_CONST;
-
-            param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
-            tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[0], &param_num, NULL);
-
-            param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 1);
-            tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[1], &param_num, NULL);
-
-            param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 2);
-            tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[2], &param_num, NULL);
-
-            vpush_helper_func(tok_alloc_const("__tcc_strncat"));
-
-            svalue_init(&dest);
-            dest.type = result_type;
-            dest.r = 0;
-            dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-            {
-              SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 3);
-              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &call_id_sv, &dest);
-            }
-
-            --vtop;
-            vpushi(0);
-            vtop->type = dest.type;
-            vtop->vr = dest.vr;
-            vtop->r = TREG_R0;
+            gen_ir_call_args(saved_args, 3, tok_alloc_const("__tcc_strncat"), &result_type);
             vtop[-1] = vtop[0];
             --vtop;
             string_builtin_optimized = 1;
@@ -19012,38 +18267,8 @@ tok_next:
             }
 
             {
-              SValue param_num;
-              SValue dest;
-              const int new_call_id = tcc_state->ir->next_call_id++;
-
-              svalue_init(&param_num);
-              param_num.vr = -1;
-              param_num.r = VT_CONST;
-
-              param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
-              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[0], &param_num, NULL);
-
-              param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 1);
-              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[1], &param_num, NULL);
-
-              vpush_helper_func(tok_alloc_const("__tcc_memcmp1"));
-
-              svalue_init(&dest);
-              dest.type.t = VT_INT;
-              dest.type.ref = NULL;
-              dest.r = 0;
-              dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-              {
-                SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 2);
-                tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &call_id_sv, &dest);
-              }
-
-              --vtop;
-              vpushi(0);
-              vtop->type.t = VT_INT;
-              vtop->type.ref = NULL;
-              vtop->vr = dest.vr;
-              vtop->r = TREG_R0;
+              CType rt = {VT_INT, NULL};
+              gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_memcmp1"), &rt);
               vtop[-1] = vtop[0];
               --vtop;
               string_builtin_optimized = 1;
@@ -19165,41 +18390,8 @@ tok_next:
           }
 
           {
-            SValue param_num;
-            SValue dest;
-            const int new_call_id = tcc_state->ir->next_call_id++;
-
-            svalue_init(&param_num);
-            param_num.vr = -1;
-            param_num.r = VT_CONST;
-
-            param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
-            tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[0], &param_num, NULL);
-
-            param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 1);
-            tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[1], &param_num, NULL);
-
-            param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 2);
-            tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[2], &param_num, NULL);
-
-            vpush_helper_func(tok_alloc_const("__tcc_strncmp"));
-
-            svalue_init(&dest);
-            dest.type.t = VT_INT;
-            dest.type.ref = NULL;
-            dest.r = 0;
-            dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-            {
-              SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 3);
-              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &call_id_sv, &dest);
-            }
-
-            --vtop;
-            vpushi(0);
-            vtop->type.t = VT_INT;
-            vtop->type.ref = NULL;
-            vtop->vr = dest.vr;
-            vtop->r = TREG_R0;
+            CType rt = {VT_INT, NULL};
+            gen_ir_call_args(saved_args, 3, tok_alloc_const("__tcc_strncmp"), &rt);
             vtop[-1] = vtop[0];
             --vtop;
             string_builtin_optimized = 1;
@@ -19285,36 +18477,7 @@ tok_next:
           }
 
           {
-            SValue param_num;
-            SValue dest;
-            const int new_call_id = tcc_state->ir->next_call_id++;
-
-            svalue_init(&param_num);
-            param_num.vr = -1;
-            param_num.r = VT_CONST;
-
-            param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
-            tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[0], &param_num, NULL);
-
-            param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 1);
-            tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[1], &param_num, NULL);
-
-            vpush_helper_func(tok_alloc_const("__tcc_strchr"));
-
-            svalue_init(&dest);
-            dest.type = saved_args[0].type;
-            dest.r = 0;
-            dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-            {
-              SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 2);
-              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &call_id_sv, &dest);
-            }
-
-            --vtop;
-            vpushi(0);
-            vtop->type = dest.type;
-            vtop->vr = dest.vr;
-            vtop->r = TREG_R0;
+            gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_strchr"), &saved_args[0].type);
             vtop[-1] = vtop[0];
             --vtop;
             string_builtin_optimized = 1;
@@ -19725,6 +18888,7 @@ tok_next:
           }
         }
       } /* end of else block for non-folded function calls */
+      tcc_free(saved_args);
       if (s->f.func_noreturn)
       {
         if (debug_modes)

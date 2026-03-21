@@ -104,9 +104,9 @@ PUB_FUNC char *tcc_basename(const char *name)
  */
 PUB_FUNC char *tcc_fileextension(const char *name)
 {
-  char *b = tcc_basename(name);
-  char *e = strrchr(b, '.');
-  return e ? e : strchr(b, 0);
+  const char *b = tcc_basename(name);
+  const char *e = strrchr(b, '.');
+  return (char *)(e ? e : strchr(b, 0));
 }
 
 ST_FUNC char *tcc_load_text(int fd)
@@ -770,7 +770,7 @@ LIBTCCAPI TCCState *tcc_new(void)
   s->pic = 0;
   s->no_pie = 0;
 #if defined(TCC_TARGET_ARM) || defined(TCC_TARGET_ARM_THUMB)
-  s->float_abi = ARM_SOFTFP_FLOAT; // use soft abi and prefer hard library as default
+  s->float_abi = ARM_SOFTFP_FLOAT;
   s->fpu_type = ARM_FPU_AUTO;      /* default to auto-detect */
 #if defined(TCC_TARGET_YASOS)
   s->text_and_data_separation = 1;

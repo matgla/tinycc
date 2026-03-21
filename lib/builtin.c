@@ -99,6 +99,12 @@ int BUILTIN(ctz)(unsigned int x)
 {
   CTZI(x)
 }
+
+int __ctzsi2(unsigned int x)
+{
+  CTZI(x)
+}
+
 int BUILTIN(ctzll)(unsigned long long x)
 {
   CTZL(x)
@@ -137,6 +143,12 @@ int BUILTIN(popcount)(unsigned int x)
 {
   POPCOUNTI(x, 0x3f)
 }
+
+int __popcountsi2(unsigned int x)
+{
+  POPCOUNTI(x, 0x3f)
+}
+
 int BUILTIN(popcountll)(unsigned long long x)
 {
   POPCOUNTL(x, 0x7f)
@@ -205,6 +217,189 @@ unsigned long __tcc_ulabsu(long x)
 {
   return x < 0 ? -(unsigned long)x : (unsigned long)x;
 }
+
+/* ---------------------------------------------- */
+/* Soft-float FP classification and manipulation functions.
+ * Override newlib/libm versions that have ABI issues with TCC soft-float.
+ * Uses pure integer bit manipulation — no FP instructions needed.
+ */
+#if defined(__TINYC__) && defined(__arm__)
+
+int isnan(double x)
+{
+  union { double d; unsigned long long u; } v;
+  v.d = x;
+  unsigned long long exp = (v.u >> 52) & 0x7FF;
+  unsigned long long mant = v.u & 0x000FFFFFFFFFFFFFULL;
+  return (exp == 0x7FF && mant != 0);
+}
+
+int isnanf(float x)
+{
+  union { float f; unsigned int u; } v;
+  v.f = x;
+  unsigned int exp = (v.u >> 23) & 0xFF;
+  unsigned int mant = v.u & 0x7FFFFF;
+  return (exp == 0xFF && mant != 0);
+}
+
+int isinf(double x)
+{
+  union { double d; unsigned long long u; } v;
+  v.d = x;
+  unsigned long long exp = (v.u >> 52) & 0x7FF;
+  unsigned long long mant = v.u & 0x000FFFFFFFFFFFFFULL;
+  return (exp == 0x7FF && mant == 0);
+}
+
+int isinff(float x)
+{
+  union { float f; unsigned int u; } v;
+  v.f = x;
+  unsigned int exp = (v.u >> 23) & 0xFF;
+  unsigned int mant = v.u & 0x7FFFFF;
+  return (exp == 0xFF && mant == 0);
+}
+
+int finite(double x)
+{
+  union { double d; unsigned long long u; } v;
+  v.d = x;
+  unsigned long long exp = (v.u >> 52) & 0x7FF;
+  return (exp != 0x7FF);
+}
+
+int finitef(float x)
+{
+  union { float f; unsigned int u; } v;
+  v.f = x;
+  unsigned int exp = (v.u >> 23) & 0xFF;
+  return (exp != 0xFF);
+}
+
+double copysign(double x, double y)
+{
+  union { double d; unsigned long long u; } vx, vy;
+  vx.d = x;
+  vy.d = y;
+  vx.u = (vx.u & 0x7FFFFFFFFFFFFFFFULL) | (vy.u & 0x8000000000000000ULL);
+  return vx.d;
+}
+
+float copysignf(float x, float y)
+{
+  union { float f; unsigned int u; } vx, vy;
+  vx.f = x;
+  vy.f = y;
+  vx.u = (vx.u & 0x7FFFFFFF) | (vy.u & 0x80000000);
+  return vx.f;
+}
+
+double fabs(double x)
+{
+  union { double d; unsigned long long u; } v;
+  v.d = x;
+  v.u &= 0x7FFFFFFFFFFFFFFFULL;
+  return v.d;
+}
+
+float fabsf(float x)
+{
+  union { float f; unsigned int u; } v;
+  v.f = x;
+  v.u &= 0x7FFFFFFF;
+  return v.f;
+}
+
+double fmax(double x, double y)
+{
+  if (isnan(x)) return y;
+  if (isnan(y)) return x;
+  if (x > y) return x;
+  return y;
+}
+
+double fmin(double x, double y)
+{
+  if (isnan(x)) return y;
+  if (isnan(y)) return x;
+  if (x < y) return x;
+  return y;
+}
+
+float fmaxf(float x, float y)
+{
+  if (isnanf(x)) return y;
+  if (isnanf(y)) return x;
+  if (x > y) return x;
+  return y;
+}
+
+float fminf(float x, float y)
+{
+  if (isnanf(x)) return y;
+  if (isnanf(y)) return x;
+  if (x < y) return x;
+  return y;
+}
+
+double floor(double x)
+{
+  union { double d; unsigned long long u; } v;
+  v.d = x;
+  int exp = (int)((v.u >> 52) & 0x7FF) - 1023;
+  int sign = (int)(v.u >> 63);
+
+  /* NaN or Inf — return as-is */
+  if (exp == 1024) return x;
+  /* Already an integer (|x| >= 2^52) */
+  if (exp >= 52) return x;
+  /* |x| < 1 */
+  if (exp < 0) {
+    if (sign) return -1.0;
+    return 0.0;
+  }
+
+  unsigned long long mask = ~((1ULL << (52 - exp)) - 1);
+  unsigned long long truncated = v.u & mask;
+
+  if (truncated == v.u) return x; /* no fractional part */
+
+  /* For negative numbers, floor rounds towards -infinity */
+  if (sign)
+    truncated += (1ULL << (52 - exp));
+
+  v.u = truncated;
+  return v.d;
+}
+
+float floorf(float x)
+{
+  union { float f; unsigned int u; } v;
+  v.f = x;
+  int exp = (int)((v.u >> 23) & 0xFF) - 127;
+  int sign = (int)(v.u >> 31);
+
+  if (exp == 128) return x;
+  if (exp >= 23) return x;
+  if (exp < 0) {
+    if (sign) return -1.0f;
+    return 0.0f;
+  }
+
+  unsigned int mask = ~((1u << (23 - exp)) - 1);
+  unsigned int truncated = v.u & mask;
+
+  if (truncated == v.u) return x;
+
+  if (sign)
+    truncated += (1u << (23 - exp));
+
+  v.u = truncated;
+  return v.f;
+}
+
+#endif /* __TINYC__ && __arm__ */
 
 unsigned long long __tcc_ullabsu(long long x)
 {

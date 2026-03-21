@@ -972,7 +972,10 @@ static int try_reassign_scratch_conflict(TCCIRState *ir, int r, int insn_i)
    */
   const uint32_t ALL_CALLEE_SAVED = 0x0FF0u;
   const uint32_t ARM_FP_REG = 7u;         /* R_FP = R7, defined in arm-thumb-opcodes.h */
+  const uint32_t ARM_R9 = 9u;             /* R9 = GOT base pointer when text_and_data_separation */
   uint32_t reserved = (1u << ARM_FP_REG); /* always exclude frame pointer */
+  if (tcc_state->text_and_data_separation)
+    reserved |= (1u << ARM_R9); /* R9 holds GOT base — must not be clobbered */
   if (ir->has_static_chain)
     reserved |= (1u << (uint32_t)architecture_config.static_chain_reg);
   const uint32_t CALLEE_SAVED = ALL_CALLEE_SAVED & ~reserved;
