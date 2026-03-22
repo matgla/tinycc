@@ -499,7 +499,7 @@ test-asm: cross test-venv
 		fi
 
 # run IR tests via pytest (preferred)
-test: cross test-aeabi-host test-asm test-venv test-prepare
+test: cross test-aeabi-host test-asm test-venv test-prepare download-gcc-tests
 	@echo "------------ ir_tests (pytest) ------------"
 	@if [ "$(USE_VENV)" = "1" ]; then \
 		cd $(IRTESTS_DIR) && "$(VENV_PY)" -m pytest -s -n $(J); \
@@ -667,7 +667,7 @@ help:
 	@echo "   $(wordlist 1,8,$(TCC_X))"
 	@echo "   $(wordlist 9,99,$(TCC_X))"
 	@echo "make test"
-	@echo "   rebuild + run pytest in tests/ir_tests"
+	@echo "   rebuild + initialize GCC testsuite + run pytest in tests/ir_tests"
 	@echo "make test-legacy"
 	@echo "   run legacy make-based tests (tests/Makefile)"
 	@echo "make tests2.all / make tests2.37 / make tests2.37+"
