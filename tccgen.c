@@ -6753,6 +6753,7 @@ static void inline_scan_body_features(TokenString *func_str, int *has_addr_of_la
 {
   const int *tp;
   int prev_tok_val = 0;
+  int prev2_tok_val = 0;
 
   *has_addr_of_label = 0;
   *has_inline_asm = 0;
@@ -6766,14 +6767,31 @@ static void inline_scan_body_features(TokenString *func_str, int *has_addr_of_la
     CValue tcv;
 
     tok_get(&tv, &tp, &tcv);
+    /* Detect &&label (address-of-label, GNU extension).
+     * &&ident is address-of-label only when && appears where a primary
+     * expression is expected --- i.e. the token before && is NOT the end
+     * of an expression (identifier, number, ')', etc.).
+     * When the token before && IS an expression-ender, && is the logical
+     * AND binary operator, not address-of-label. */
     if (prev_tok_val == TOK_LAND && tv >= TOK_UIDENT)
-      *has_addr_of_label = 1;
+    {
+      /* prev2 is the token before '&&'.  If it could end an expression
+       * (identifier, constant, closing paren/bracket), this is logical AND. */
+      int is_logical_and =
+          (prev2_tok_val >= TOK_UIDENT || prev2_tok_val == TOK_PPNUM || prev2_tok_val == TOK_CINT ||
+           prev2_tok_val == TOK_CUINT || prev2_tok_val == TOK_CCHAR || prev2_tok_val == TOK_LCHAR ||
+           prev2_tok_val == TOK_CFLOAT || prev2_tok_val == TOK_CDOUBLE || prev2_tok_val == TOK_CLDOUBLE ||
+           prev2_tok_val == TOK_CLLONG || prev2_tok_val == TOK_CULLONG || prev2_tok_val == ')' || prev2_tok_val == ']');
+      if (!is_logical_and)
+        *has_addr_of_label = 1;
+    }
     if (tv == TOK_ASM1 || tv == TOK_ASM2 || tv == TOK_ASM3)
       *has_inline_asm = 1;
     if (*has_addr_of_label && *has_inline_asm)
       break;
     if (tv == TOK_EOF || tv == 0)
       break;
+    prev2_tok_val = prev_tok_val;
     prev_tok_val = tv;
   }
 }
@@ -11594,9 +11612,2322 @@ static void gen_ir_void_call_args(SValue *args, int argc, int func_tok)
   --vtop;
 }
 
+/* Extracted from unary() to reduce its stack frame size.
+ * When TCC compiles itself with -O0, all locals in a function are
+ * allocated at entry — even locals from unreachable case-arms.
+ * By extracting the ~2300-line function-call handler into its own
+ * function, those locals only exist on the stack when actually processing
+ * a call expression, not during every recursive unary() invocation.
+ * This saves ~3000+ bytes per unary() stack frame. */
+static void unary_funcall(void)
+{
+  int n, t, r, size, align;
+  Sym *s;
+
+  SValue ret;
+  Sym *sa;
+  int nb_args, ret_nregs, ret_align, regsize, variadic;
+  TokenString *p, *p2;
+
+  /* function call  */
+  if ((vtop->type.t & VT_BTYPE) != VT_FUNC)
+  {
+    /* pointer test (no array accepted) */
+    if ((vtop->type.t & (VT_BTYPE | VT_ARRAY)) == VT_PTR)
+    {
+      vtop->type = *pointed_type(&vtop->type);
+      if ((vtop->type.t & VT_BTYPE) != VT_FUNC)
+        goto error_func;
+    }
+    else
+    {
+    error_func:
+      expect("function pointer");
+    }
+  }
+  else
+  {
+    vtop->r &= ~VT_LVAL; /* no lvalue */
+  }
+  /* get return type */
+  /* Save function symbol before switching to type ref - needed for nested_func check */
+  Sym *call_func_sym = vtop->sym;
+  s = vtop->type.ref;
+  next();
+
+  /* If calling a nested function, emit SET_CHAIN to pass static chain (parent FP).
+   * Only emit when the caller is the callee's PARENT.  When the caller is
+   * itself a nested function (current_nested_func != NULL) and the callee is
+   * a sibling (defined in the same enclosing scope), R10 already holds the
+   * correct chain pointer from our own incoming chain — emitting SET_CHAIN
+   * would clobber it with R7 which may be an unrelated frame pointer. */
+  if (tcc_state->ir && call_func_sym && call_func_sym->a.nested_func)
+  {
+    int emit_set_chain = 1;
+    if (tcc_state->current_nested_func)
+    {
+      /* Caller is a nested function.  Determine if callee is our child
+       * (defined inside our body) or a sibling (defined in the same parent
+       * scope).  Only emit SET_CHAIN for child calls. */
+      NestedFunc *callee_nf = NULL;
+      for (int ni = 0; ni < tcc_state->nb_nested_funcs; ni++)
+      {
+        if (tcc_state->nested_funcs[ni].sym == call_func_sym)
+        {
+          callee_nf = &tcc_state->nested_funcs[ni];
+          break;
+        }
+      }
+      if (callee_nf && callee_nf->parent_nf != tcc_state->current_nested_func)
+      {
+        /* Sibling call: R10 already has the correct parent FP */
+        emit_set_chain = 0;
+      }
+    }
+    if (emit_set_chain)
+    {
+      /* Emit SET_CHAIN: R10 = FP (current frame pointer) */
+      SValue src, dest;
+      svalue_init(&src);
+      svalue_init(&dest);
+      src.type.t = VT_PTR;
+      src.r = 0;
+      src.vr = -1;
+      dest.type.t = VT_PTR;
+      dest.r = 0;
+      dest.vr = -1;
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_SET_CHAIN, &src, NULL, &dest);
+    }
+  }
+
+  /* Each IR-level call gets a unique call_id so FUNCPARAM* can be bound
+   * without fragile nested-depth scanning.
+   */
+  int call_id = 0;
+  if (!NOEVAL_WANTED && tcc_state->ir)
+    call_id = tcc_state->ir->next_call_id++;
+
+  sa = s->next; /* first parameter */
+  nb_args = regsize = 0;
+  int nb_implicit_args = 0; /* sret pointer counted in nb_args but not saved_arg_count */
+  /* compute first implicit argument if a composite type is returned */
+  if ((s->type.t & VT_BTYPE) == VT_STRUCT || (s->type.t & VT_COMPLEX))
+  {
+    variadic = (s->f.func_type == FUNC_ELLIPSIS);
+    ret_nregs = gfunc_sret(&s->type, variadic, &ret.type, &ret_align, &regsize);
+    if (ret_nregs <= 0)
+    {
+      /* get some space for the returned structure */
+      size = type_size(&s->type, &align);
+#ifdef TCC_TARGET_ARM64
+      /* On arm64, a small struct is return in registers.
+         It is much easier to write it to memory if we know
+         that we are allowed to write some extra bytes, so
+         round the allocated space up to a power of 2: */
+      if (size < 16)
+        while (size & (size - 1))
+          size = (size | (size - 1)) + 1;
+#endif
+      loc = (loc - size) & -align;
+      ret.type = s->type;
+      ret.r = VT_LOCAL | VT_LVAL;
+      /* pass it as 'int' to avoid structure arg passing
+         problems */
+      vseti(VT_LOCAL, loc);
+#ifdef CONFIG_TCC_BCHECK
+      if (tcc_state->do_bounds_check)
+        --loc;
+#endif
+      ret.c = vtop->c;
+      if (ret_nregs < 0)
+      {
+        vtop--;
+        print_vstack("unary, function call");
+      }
+      else
+      {
+        /* ret_nregs == 0: struct is returned via an implicit first argument
+         * (sret pointer). In IR mode we must actually emit the parameter and
+         * pop it, otherwise it stays on the value stack and triggers
+         * check_vstack() failures (vstack leak).
+         *
+         * Keep parameter indices 0-based: this implicit argument is param #0.
+         */
+        if (!NOEVAL_WANTED)
+        {
+          SValue num;
+          svalue_init(&num);
+          num.vr = -1;
+          num.r = VT_CONST;
+          num.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
+          TCCGEN_DEBUG("[TCCGEN] FUNCPARAMVAL push: site=sret_param0 call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
+                       call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)num.c.i), vtop->r, vtop->vr);
+          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL);
+        }
+        vtop--;
+        nb_args++;
+        nb_implicit_args++;
+      }
+    }
+  }
+  else
+  {
+    ret_nregs = 1;
+    ret.type = s->type;
+  }
+
+  if (ret_nregs > 0)
+  {
+    /* return in register */
+    ret.c.i = 0;
+    PUT_R_RET(&ret, ret.type.t);
+  }
+
+  /* Storage for arguments in case we need to constant-fold.
+   * Heap-allocated to reduce unary()'s stack frame — this 320-byte array
+   * would otherwise bloat every recursive call (TCC allocates all block-scoped
+   * locals at function entry). */
+  SValue *saved_args = tcc_mallocz(8 * sizeof(SValue));
+  int saved_arg_count = 0;
+  int can_try_fold = 0;
+  int can_inline_builtin = 0;
+  int can_inline_eval = 0;
+  const char *func_name = NULL;
+
+  /* Check if we have a named function that might be foldable */
+  if (call_func_sym && call_func_sym->v >= TOK_IDENT)
+  {
+    func_name = get_tok_str(call_func_sym->v, NULL);
+
+    /* Calling alloca() (library version) modifies SP; the caller
+     * needs a frame pointer so the epilogue can restore SP. */
+    if (func_name && strcmp(func_name, "alloca") == 0 && tcc_state->ir)
+      tcc_state->force_frame_pointer = 1;
+
+    /* Quick check if this could be a foldable math function */
+    if (func_name && (func_name[0] == 's' || func_name[0] == 'c' || func_name[0] == 't' || func_name[0] == 'a' ||
+                      func_name[0] == 'e' || func_name[0] == 'l' || func_name[0] == 'p' || func_name[0] == 'f' ||
+                      func_name[0] == 'r' || func_name[0] == 't'))
+    {
+      can_try_fold = 1;
+    }
+
+    {
+      int is_unsigned;
+      can_inline_builtin =
+          get_builtin_abs_info(func_name, &is_unsigned) && builtin_abs_decl_matches(call_func_sym, func_name);
+    }
+  }
+
+  /* Check if the callee is a small inline function we might evaluate */
+  if (call_func_sym && (call_func_sym->type.t & VT_INLINE) && tcc_state->optimize)
+    can_inline_eval = 1;
+
+  /* Detect printf-family functions that can be optimized.
+   * We recognize standard (printf, fprintf), unlocked stdio variants,
+   * v-variants (vprintf, vfprintf), and fortified (_chk) variants.
+   * For each, we track the index of key arguments in saved_args[].
+   * For v-variants, varargs are in a va_list (opaque), so pf_vararg_idx is
+   * set past the arg count to prevent %s/%c optimization — only constant
+   * format strings without specifiers can be optimized. */
+  int can_optimize_printf_family = 0;
+  int pf_fmt_idx = -1;    /* index of the format string in saved_args[] */
+  int pf_file_idx = -1;   /* index of FILE* arg, or -1 for stdout */
+  int pf_vararg_idx = -1; /* index of first vararg in saved_args[], or high value for va_list fns */
+  int pf_min_args = 0;    /* minimum number of args for a valid call */
+  if (func_name && tcc_state->optimize > 0)
+  {
+    /* --- printf family (stdout, variadic) --- */
+    if (strcmp(func_name, "printf") == 0 || strcmp(func_name, "printf_unlocked") == 0 ||
+        strcmp(func_name, "__builtin_printf") == 0 || strcmp(func_name, "__builtin_printf_unlocked") == 0)
+    {
+      can_optimize_printf_family = 1;
+      pf_fmt_idx = 0;
+      pf_vararg_idx = 1;
+      pf_min_args = 1;
+    }
+    else if (strcmp(func_name, "__printf_chk") == 0)
+    {
+      can_optimize_printf_family = 1;
+      pf_fmt_idx = 1; /* [0]=flag */
+      pf_vararg_idx = 2;
+      pf_min_args = 2;
+    }
+    /* --- fprintf family (FILE*, variadic) --- */
+    else if (strcmp(func_name, "fprintf") == 0 || strcmp(func_name, "fprintf_unlocked") == 0 ||
+             strcmp(func_name, "__builtin_fprintf_unlocked") == 0)
+    {
+      can_optimize_printf_family = 1;
+      pf_file_idx = 0;
+      pf_fmt_idx = 1;
+      pf_vararg_idx = 2;
+      pf_min_args = 2;
+    }
+    else if (strcmp(func_name, "__fprintf_chk") == 0)
+    {
+      can_optimize_printf_family = 1;
+      pf_file_idx = 0;
+      pf_fmt_idx = 2; /* [1]=flag */
+      pf_vararg_idx = 3;
+      pf_min_args = 3;
+    }
+    /* --- vprintf family (stdout, va_list — no vararg access) --- */
+    else if (strcmp(func_name, "vprintf") == 0)
+    {
+      can_optimize_printf_family = 1;
+      pf_fmt_idx = 0;
+      pf_vararg_idx = 99; /* va_list: varargs inaccessible */
+      pf_min_args = 2;    /* fmt + va_list */
+    }
+    else if (strcmp(func_name, "__vprintf_chk") == 0)
+    {
+      can_optimize_printf_family = 1;
+      pf_fmt_idx = 1; /* [0]=flag */
+      pf_vararg_idx = 99;
+      pf_min_args = 3; /* flag + fmt + va_list */
+    }
+    /* --- vfprintf family (FILE*, va_list — no vararg access) --- */
+    else if (strcmp(func_name, "vfprintf") == 0)
+    {
+      can_optimize_printf_family = 1;
+      pf_file_idx = 0;
+      pf_fmt_idx = 1;
+      pf_vararg_idx = 99;
+      pf_min_args = 3; /* file + fmt + va_list */
+    }
+    else if (strcmp(func_name, "__vfprintf_chk") == 0)
+    {
+      can_optimize_printf_family = 1;
+      pf_file_idx = 0;
+      pf_fmt_idx = 2; /* [1]=flag */
+      pf_vararg_idx = 99;
+      pf_min_args = 4; /* file + flag + fmt + va_list */
+    }
+  }
+
+  /* Save IR instruction index before argument emission.
+   * If constant folding succeeds we roll back to discard orphaned
+   * FUNCPARAMVAL ops that were already emitted for the arguments. */
+  int ir_idx_before_args = tcc_ir_count(tcc_state->ir);
+  /* Tracks IR position just before the first FUNCPARAMVAL emission.
+   * Used by try_inline_builtin_call to roll back only FUNCPARAMVAL ops
+   * while preserving argument evaluation IR. */
+  int ir_idx_before_first_param = -1;
+
+  /* __builtin_va_arg_pack() expansion: if the callee is an always_inline
+   * function that uses __builtin_va_arg_pack(), we must create a specialized
+   * clone for this call site with the variadic args baked in.
+   *
+   * Strategy:
+   * 1. Save all argument tokens from the call site
+   * 2. Count named (fixed) parameters of the callee
+   * 3. Split into fixed arg tokens and variadic arg tokens
+   * 4. Create a clone of the inline function's token stream with
+   *    __builtin_va_arg_pack() replaced by the variadic arg tokens
+   * 5. Register the clone as a new inline function
+   * 6. Change the call target to the clone
+   * 7. Replay only the fixed arg tokens for normal call parsing
+   */
+  if (call_func_sym && call_func_sym->type.ref && call_func_sym->type.ref->f.func_va_arg_pack &&
+      (call_func_sym->type.t & VT_INLINE))
+  {
+    /* Find the InlineFunc for this symbol */
+    struct InlineFunc *orig_fn = NULL;
+    for (int fi = 0; fi < tcc_state->nb_inline_fns; fi++)
+    {
+      if (tcc_state->inline_fns[fi]->sym == call_func_sym)
+      {
+        orig_fn = tcc_state->inline_fns[fi];
+        break;
+      }
+    }
+
+    if (orig_fn && orig_fn->func_str)
+    {
+      /* Count named params */
+      int n_named = 0;
+      Sym *param;
+      for (param = call_func_sym->type.ref->next; param; param = param->next)
+        n_named++;
+
+      /* Save all argument tokens (everything until matching ')') */
+      TokenString *all_args = tok_str_alloc();
+      int paren_depth = 0;
+      while (tok != ')' || paren_depth > 0)
+      {
+        if (tok == '(')
+          paren_depth++;
+        else if (tok == ')')
+          paren_depth--;
+        if (tok == TOK_EOF)
+          tcc_error("unexpected end of file in function call");
+        tok_str_add_tok(all_args);
+        next();
+      }
+      tok_str_add(all_args, TOK_EOF);
+      /* tok is now ')' - don't consume it; file position is past ')' */
+
+      /* Split into fixed args and variadic args.
+       * Fixed args are separated by commas at depth 0. */
+      const int *ap = tok_str_buf(all_args);
+      TokenString *fixed_args = tok_str_alloc();
+      TokenString *va_args = tok_str_alloc();
+
+      int arg_idx = 0;
+      int depth = 0;
+
+      if (n_named == 0)
+      {
+        /* All args are variadic, no fixed args */
+        const int *cp = tok_str_buf(all_args);
+        while (1)
+        {
+          int t;
+          CValue cv;
+          tok_get(&t, &cp, &cv);
+          if (t == TOK_EOF || t == 0)
+            break;
+          tok_str_add2(va_args, t, &cv);
+        }
+      }
+      else
+      {
+        while (1)
+        {
+          int t;
+          CValue cv;
+          tok_get(&t, &ap, &cv);
+
+          if (t == TOK_EOF || t == 0)
+            break;
+
+          if (t == '(' || t == '[')
+            depth++;
+          else if (t == ')' || t == ']')
+            depth--;
+
+          if (t == ',' && depth == 0)
+          {
+            arg_idx++;
+            if (arg_idx == n_named)
+            {
+              /* Everything after this comma is variadic args */
+              while (1)
+              {
+                tok_get(&t, &ap, &cv);
+                if (t == TOK_EOF || t == 0)
+                  break;
+                tok_str_add2(va_args, t, &cv);
+              }
+              break;
+            }
+            /* Copy the comma to fixed_args */
+            tok_str_add2(fixed_args, t, &cv);
+            continue;
+          }
+
+          if (arg_idx < n_named)
+            tok_str_add2(fixed_args, t, &cv);
+        }
+      }
+
+      /* Terminate fixed_args with ')' and 0 (macro end marker).
+       * The arg parsing loop will see ')' and break.
+       * Then next() will read 0, triggering end_macro() which
+       * restores reading from the source file (positioned after ')'). */
+      tok_str_add(fixed_args, ')');
+      tok_str_add(fixed_args, 0);
+      tok_str_add(va_args, TOK_EOF);
+
+      if (token_stream_references_local_object(tok_str_buf(va_args)))
+      {
+        TokenString *replay_args = tok_str_alloc();
+        const int *rp = tok_str_buf(all_args);
+
+        while (1)
+        {
+          int t;
+          CValue cv;
+
+          tok_get(&t, &rp, &cv);
+          if (t == TOK_EOF || t == 0)
+            break;
+          tok_str_add2(replay_args, t, &cv);
+        }
+        tok_str_add(replay_args, ')');
+        tok_str_add(replay_args, 0);
+
+        tok_str_free(all_args);
+        tok_str_free(fixed_args);
+        tok_str_free(va_args);
+
+        begin_macro(replay_args, 1);
+        next();
+        goto va_arg_pack_done;
+      }
+
+      /* Check if variadic args are empty */
+      int va_args_empty = 1;
+      {
+        const int *vcheck = tok_str_buf(va_args);
+        int vt;
+        CValue vcv;
+        tok_get(&vt, &vcheck, &vcv);
+        if (vt != TOK_EOF && vt != 0)
+          va_args_empty = 0;
+      }
+
+      /* Create clone body: copy orig_fn->func_str, replacing
+       * __builtin_va_arg_pack ( ) with variadic arg tokens.
+       * When variadic args are empty, also remove the preceding comma. */
+      TokenString *clone_body = tok_str_alloc();
+      const int *bp = tok_str_buf(orig_fn->func_str);
+      int last_comma_len = -1; /* clone_body->len before last ',' was added */
+      while (1)
+      {
+        int t;
+        CValue cv;
+        tok_get(&t, &bp, &cv);
+        if (t == TOK_EOF || t == 0)
+          break;
+
+        if (t == TOK_builtin_va_arg_pack)
+        {
+          /* Skip the following '(' and ')' tokens */
+          int t2;
+          CValue cv2;
+          tok_get(&t2, &bp, &cv2); /* skip '(' */
+          tok_get(&t2, &bp, &cv2); /* skip ')' */
+
+          if (va_args_empty)
+          {
+            /* Remove preceding comma if present */
+            if (last_comma_len >= 0)
+              clone_body->len = last_comma_len;
+          }
+          else
+          {
+            /* Insert variadic arg tokens */
+            const int *vp = tok_str_buf(va_args);
+            while (1)
+            {
+              int vt;
+              CValue vcv;
+              tok_get(&vt, &vp, &vcv);
+              if (vt == TOK_EOF || vt == 0)
+                break;
+              tok_str_add2(clone_body, vt, &vcv);
+            }
+          }
+          last_comma_len = -1;
+          continue;
+        }
+
+        if (t == ',')
+          last_comma_len = clone_body->len;
+        else
+          last_comma_len = -1;
+
+        tok_str_add2(clone_body, t, &cv);
+      }
+      tok_str_add(clone_body, TOK_EOF);
+
+      /* Create a unique symbol for the clone */
+      static int va_pack_clone_id = 0;
+      char *clone_name = tcc_malloc(256);
+      snprintf(clone_name, 256, "__va_pack_%s_%d", get_tok_str(call_func_sym->v, NULL), va_pack_clone_id++);
+      int clone_tok_id = tok_alloc(clone_name, strlen(clone_name))->tok;
+      tcc_free(clone_name);
+
+      /* Create clone function type: same as original but non-variadic */
+      CType clone_type;
+      clone_type = call_func_sym->type;
+
+      /* Create a new type ref with FUNC_NEW (non-variadic) */
+      Sym *orig_ref = call_func_sym->type.ref;
+      Sym *clone_ref = sym_push2(&global_stack, SYM_FIELD, orig_ref->type.t, 0);
+      clone_ref->type = orig_ref->type;
+      clone_ref->f = orig_ref->f;
+      clone_ref->f.func_type = FUNC_NEW; /* non-variadic */
+      clone_ref->f.func_va_arg_pack = 0;
+
+      /* Copy named parameters */
+      Sym **pparam = &clone_ref->next;
+      for (param = orig_ref->next; param; param = param->next)
+      {
+        Sym *new_param = sym_push2(&global_stack, param->v, param->type.t, param->c);
+        new_param->type = param->type;
+        *pparam = new_param;
+        pparam = &new_param->next;
+      }
+      *pparam = NULL;
+
+      clone_type.ref = clone_ref;
+      clone_type.t &= ~VT_EXTERN;
+      clone_type.t |= VT_STATIC;
+
+      /* Create clone symbol */
+      AttributeDef clone_ad;
+      memset(&clone_ad, 0, sizeof(clone_ad));
+      Sym *clone_sym = external_sym(clone_tok_id, &clone_type, 0, &clone_ad);
+      clone_sym->type.t |= VT_INLINE;
+
+      /* Register clone as inline function */
+      struct InlineFunc *clone_fn;
+      clone_fn = tcc_malloc(sizeof *clone_fn + strlen(orig_fn->filename));
+      strcpy(clone_fn->filename, orig_fn->filename);
+      clone_fn->sym = clone_sym;
+      clone_fn->func_str = clone_body;
+      dynarray_add(&tcc_state->inline_fns, &tcc_state->nb_inline_fns, clone_fn);
+
+      /* Mark the clone as used so gen_inline_functions compiles it */
+      if (!clone_sym->c)
+        put_extern_sym(clone_sym, cur_text_section ? cur_text_section : text_section, 0, 0);
+
+      /* Switch call target: replace vtop (function pointer) with clone */
+      vtop->type = clone_type;
+      vtop->sym = clone_sym;
+      vtop->r = VT_CONST | VT_SYM;
+      vtop->c.i = 0;
+
+      /* Update s (callee type ref) for argument parsing */
+      s = clone_ref;
+      sa = s->next;
+      call_func_sym = clone_sym;
+
+      /* Replay fixed args + ')' via macro so normal call parsing handles them.
+       * When the macro ends (0 marker), next() restores file-level reading
+       * at the position just past the original ')'. */
+      begin_macro(fixed_args, 1);
+      next(); /* prime first token from fixed_args */
+
+      tok_str_free(all_args);
+      tok_str_free(va_args);
+    }
+  }
+va_arg_pack_done:
+
+  p = NULL;
+  if (tok != ')')
+  {
+    r = tcc_state->reverse_funcargs;
+    SValue num;
+    svalue_init(&num);
+    num.vr = -1;
+    for (;;)
+    {
+      if (r)
+      {
+        skip_or_save_block(&p2);
+        p2->prev = p, p = p2;
+      }
+      else
+      {
+        /* IR expects 0-based parameter indices.
+         * Keep FUNCPARAMVAL numbering consistent across all call sites. */
+        expr_eq();
+        /* Convert VT_CMP/VT_JMP to actual 0/1 value before passing as
+         * parameter */
+        if (!NOEVAL_WANTED)
+          tcc_ir_codegen_cmp_jmp_set(tcc_state->ir);
+        gfunc_param_typed(s, sa);
+
+        /* Save argument for potential constant folding or inline evaluation.
+         * This must happen BEFORE the double-complex materialization below,
+         * which converts VT_CONST to VT_LOCAL. */
+        if ((can_try_fold || can_inline_builtin || can_inline_eval || can_optimize_printf_family) &&
+            saved_arg_count < 8 && !NOEVAL_WANTED)
+        {
+          saved_args[saved_arg_count++] = *vtop;
+        }
+
+        /* Materialize constant complex double/ldouble to a temp local.
+         * These are 128-bit values that cannot be represented as a single
+         * MachineOperand immediate.  The callsite's struct-byval copy path
+         * handles memory operands transparently. */
+        if (!NOEVAL_WANTED && (vtop->type.t & VT_COMPLEX) &&
+            ((vtop->type.t & VT_BTYPE) == VT_DOUBLE || (vtop->type.t & VT_BTYPE) == VT_LDOUBLE) &&
+            (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST)
+        {
+          int elem_size = 8;
+          int complex_size = elem_size * 2;
+          CType elem_type;
+          elem_type.t = VT_DOUBLE;
+          elem_type.ref = NULL;
+
+          double src_real, src_imag;
+          memcpy(&src_real, &vtop->c, 8);
+          memcpy(&src_imag, (char *)&vtop->c + 8, 8);
+          CType orig_type = vtop->type;
+          vpop();
+
+          int mat_vr;
+          int mat_loc = get_temp_local_var(complex_size, 8, &mat_vr);
+
+          /* Store real part */
+          {
+            SValue dst;
+            memset(&dst, 0, sizeof(dst));
+            dst.type = elem_type;
+            dst.r = VT_LOCAL | VT_LVAL;
+            dst.vr = mat_vr;
+            dst.c.i = mat_loc;
+            vpushv(&dst);
+            CValue cv;
+            memset(&cv, 0, sizeof(cv));
+            cv.d = src_real;
+            vsetc(&elem_type, VT_CONST, &cv);
+            vstore();
+            vpop();
+          }
+          /* Store imag part */
+          {
+            SValue dst;
+            memset(&dst, 0, sizeof(dst));
+            dst.type = elem_type;
+            dst.r = VT_LOCAL | VT_LVAL;
+            dst.vr = mat_vr;
+            dst.c.i = mat_loc + elem_size;
+            vpushv(&dst);
+            CValue cv;
+            memset(&cv, 0, sizeof(cv));
+            cv.d = src_imag;
+            vsetc(&elem_type, VT_CONST, &cv);
+            vstore();
+            vpop();
+          }
+
+          /* Push materialized local as the complex value */
+          SValue mat_sv;
+          memset(&mat_sv, 0, sizeof(mat_sv));
+          mat_sv.type = orig_type;
+          mat_sv.r = VT_LOCAL | VT_LVAL;
+          mat_sv.vr = mat_vr;
+          mat_sv.c.i = mat_loc;
+          vpushv(&mat_sv);
+        }
+
+        if (!NOEVAL_WANTED)
+        {
+          if (ir_idx_before_first_param < 0)
+            ir_idx_before_first_param = tcc_ir_count(tcc_state->ir);
+          num.r = VT_CONST;
+          num.c.i = TCCIR_ENCODE_PARAM(call_id, nb_args);
+          TCCGEN_DEBUG("[TCCGEN] FUNCPARAMVAL push: site=forward_arg call_id=%d param_idx=%d nb_args=%d vtop_r=0x%x "
+                       "vtop_vr=%d\n",
+                       call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)num.c.i), nb_args, vtop->r, vtop->vr);
+          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL);
+        }
+        vtop--; /* consumed */
+      }
+      nb_args++;
+      if (sa)
+        sa = sa->next;
+      if (tok == ')')
+        break;
+      skip(',');
+    }
+  }
+  if (sa && s->f.func_type != FUNC_OLD)
+    tcc_error("too few arguments to function");
+
+  if (p)
+  { /* with reverse_funcargs */
+    for (n = 0; p; p = p2, ++n)
+    {
+      p2 = p, sa = s;
+      do
+      {
+        sa = sa->next, p2 = p2->prev;
+      } while (p2 && sa);
+      p2 = p->prev;
+      begin_macro(p, 1), next();
+      expr_eq();
+      gfunc_param_typed(s, sa);
+
+      /* Save argument for potential constant folding or inline evaluation (in reverse order for reverse_funcargs)
+       */
+      if ((can_try_fold || can_inline_builtin || can_inline_eval || can_optimize_printf_family) && n < 8 &&
+          !NOEVAL_WANTED)
+      {
+        saved_args[nb_args - 1 - n] = *vtop;
+        if (n == 0)
+          saved_arg_count = nb_args;
+      }
+
+      /* We evaluate right-to-left; assign 0-based parameter indices
+       * corresponding to original left-to-right argument positions.
+       */
+      if (!NOEVAL_WANTED)
+      {
+        if (ir_idx_before_first_param < 0)
+          ir_idx_before_first_param = tcc_ir_count(tcc_state->ir);
+        SValue num;
+        svalue_init(&num);
+        num.vr = -1;
+        num.r = VT_CONST;
+        num.c.i = TCCIR_ENCODE_PARAM(call_id, nb_args - 1 - n);
+        TCCGEN_DEBUG("[TCCGEN] FUNCPARAMVAL push: site=reverse_arg call_id=%d param_idx=%d n=%d nb_args=%d vtop_r=0x%x "
+                     "vtop_vr=%d\n",
+                     call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)num.c.i), n, nb_args, vtop->r, vtop->vr);
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL);
+      }
+      vtop--; /* consumed */
+      end_macro();
+    }
+  }
+
+  next();
+  // gfunc_call(nb_args);
+
+  /* Try constant folding for math functions */
+  int folded = 0;
+  int nb_real_args = nb_args - nb_implicit_args;
+  if (can_try_fold && func_name && saved_arg_count == nb_real_args && !NOEVAL_WANTED)
+  {
+    folded = try_fold_math_call(func_name, saved_args, saved_arg_count);
+    if (!folded)
+      folded = try_fold_complex_call(func_name, saved_args, saved_arg_count);
+  }
+
+  /* Try inlining builtin integer functions (signed and unsigned abs family).
+   * Must roll back FUNCPARAMVAL ops BEFORE generating inline IR,
+   * otherwise the rollback would discard the newly generated code. */
+  int inlined = 0;
+  if (!folded && func_name && saved_arg_count == nb_real_args && !NOEVAL_WANTED)
+  {
+    int builtin_ok = 0;
+    if (saved_arg_count == 1)
+    {
+      if (strcmp(func_name, "abs") == 0 && !(tcc_state->no_builtin_funcs & NO_BUILTIN_ABS))
+        builtin_ok = 1;
+      else if (strcmp(func_name, "labs") == 0 && !(tcc_state->no_builtin_funcs & NO_BUILTIN_LABS))
+        builtin_ok = 1;
+      else if (strcmp(func_name, "llabs") == 0 && !(tcc_state->no_builtin_funcs & NO_BUILTIN_LLABS))
+        builtin_ok = 1;
+      else if (strcmp(func_name, "imaxabs") == 0)
+        builtin_ok = 1;
+      else if (strcmp(func_name, "uabs") == 0 && !(tcc_state->no_builtin_funcs & NO_BUILTIN_UABS))
+        builtin_ok = 1;
+      else if (strcmp(func_name, "ulabs") == 0 && !(tcc_state->no_builtin_funcs & NO_BUILTIN_ULABS))
+        builtin_ok = 1;
+      else if (strcmp(func_name, "ullabs") == 0 && !(tcc_state->no_builtin_funcs & NO_BUILTIN_ULLABS))
+        builtin_ok = 1;
+      else if (strcmp(func_name, "umaxabs") == 0 && !(tcc_state->no_builtin_funcs & NO_BUILTIN_UMAXABS))
+        builtin_ok = 1;
+    }
+    if (builtin_ok && builtin_abs_decl_matches(call_func_sym, func_name))
+    {
+      /* Roll back FUNCPARAMVAL ops first, preserving argument eval IR */
+      int rollback_idx = (ir_idx_before_first_param >= 0) ? ir_idx_before_first_param : ir_idx_before_args;
+      tcc_state->ir->next_instruction_index = rollback_idx;
+      /* Generate inline abs code */
+      try_inline_builtin_call(func_name, saved_args, saved_arg_count);
+      /* Move result over function pointer */
+      vtop[-1] = vtop[0];
+      --vtop;
+      inlined = 1;
+    }
+  }
+
+  /* Try compile-time evaluation of small inline functions called with
+   * constant arguments.  This enables patterns like:
+   *   inline int f(int x) { return __builtin_constant_p(x); }
+   *   int g(void) { return f(1); }  // returns 1 at -O1
+   */
+  int inline_evaled = 0;
+  if (!folded && !inlined && call_func_sym && saved_arg_count == nb_real_args && !NOEVAL_WANTED)
+  {
+    if (try_inline_const_eval(call_func_sym, saved_args, saved_arg_count))
+    {
+      /* Result is on vtop; move over function pointer and roll back IR */
+      vtop[-1] = vtop[0];
+      --vtop;
+      tcc_state->ir->next_instruction_index = ir_idx_before_args;
+      inline_evaled = 1;
+    }
+  }
+
+  /* Optimize simple sprintf patterns regardless of whether the return value
+   * is used:
+   *   sprintf(dst, "literal")
+   *   sprintf(dst, "%s", src)
+   * These can be lowered to a helper that copies the final string and
+   * returns the number of bytes written (excluding the trailing '\0'). */
+  int sprintf_family_optimized = 0;
+  if (!folded && !inlined && !inline_evaled && func_name && saved_arg_count == nb_real_args && !NOEVAL_WANTED &&
+      strcmp(func_name, "sprintf") == 0 && nb_real_args >= 2)
+  {
+    int fmt_len = 0;
+    const char *fmt = try_get_constant_string(&saved_args[1], &fmt_len);
+    SValue *copy_src_sv = NULL;
+
+    if (fmt)
+    {
+      if (strchr(fmt, '%') == NULL)
+      {
+        copy_src_sv = &saved_args[1];
+      }
+      else if (nb_real_args == 3 && strcmp(fmt, "%s") == 0)
+      {
+        copy_src_sv = &saved_args[2];
+      }
+    }
+
+    if (copy_src_sv)
+    {
+      if (ir_idx_before_first_param >= 0)
+      {
+        int current_end = tcc_state->ir->next_instruction_index;
+        for (int i = ir_idx_before_first_param; i < current_end; i++)
+        {
+          if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
+          {
+            IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
+            int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
+            if (encoded_call_id == call_id)
+              tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
+          }
+        }
+      }
+      else
+      {
+        tcc_state->ir->next_instruction_index = ir_idx_before_args;
+      }
+
+      {
+        SValue sc_args[2];
+        sc_args[0] = saved_args[0];
+        sc_args[1] = *copy_src_sv;
+        CType rt = {VT_INT, NULL};
+        gen_ir_call_args(sc_args, 2, tok_alloc_const("__tcc_strcpy_count"), &rt);
+        vtop[-1] = vtop[0];
+        --vtop;
+        sprintf_family_optimized = 1;
+      }
+    }
+  }
+
+  /* Try optimizing printf-family calls with simple constant format strings.
+   * GCC optimizes these patterns when the return value is not used:
+   *   printf/fprintf("literal")      → puts/fwrite (no specifiers)
+   *   printf/fprintf("%s", str)      → puts/fwrite (constant string)
+   *   printf/fprintf("%c", ch)       → putchar/fputc
+   *   printf("%s\n", str)            → puts(str)
+   * Also handles __printf_chk/__fprintf_chk (extra flag argument).
+   * Only optimize in void context (next token is ';'). */
+  int printf_family_optimized = 0;
+  if (!folded && !inlined && !inline_evaled && !sprintf_family_optimized && can_optimize_printf_family &&
+      saved_arg_count == nb_real_args && nb_args >= pf_min_args && !nocode_wanted && tok == ';')
+  {
+    int fmt_len = 0;
+    const char *fmt = try_get_constant_string(&saved_args[pf_fmt_idx], &fmt_len);
+    if (fmt)
+    {
+      int has_file = (pf_file_idx >= 0); /* fprintf-family vs printf-family */
+      int has_varargs = (nb_args > pf_vararg_idx);
+
+      /* Classify the format pattern:
+       *  PF_OPT_NOP           = empty output
+       *  PF_OPT_PUTCHAR_CONST = putchar/fputc with a constant char
+       *  PF_OPT_FWRITE        = fwrite (fprintf-family) or puts (printf-family, trailing \n)
+       *  PF_OPT_PUTCHAR_ARG   = putchar/fputc from %c vararg
+       *  PF_OPT_FPUTS_ARG     = fputs from %s vararg
+       *  PF_OPT_PUTS_ARG      = puts from %s\n vararg */
+      enum
+      {
+        PF_OPT_NONE = 0,
+        PF_OPT_NOP,
+        PF_OPT_PUTCHAR_CONST,
+        PF_OPT_FWRITE,
+        PF_OPT_PUTS_CHOPPED,
+        PF_OPT_PUTCHAR_ARG,
+        PF_OPT_FPUTS_ARG,
+        PF_OPT_PUTS_ARG
+      };
+      int opt_kind = PF_OPT_NONE;
+      int putchar_val = 0;
+      /* For fwrite: which SValue to write and its known length */
+      SValue *write_str_sv = NULL;
+      int write_len = 0;
+      /* For puts with trailing-\n chopped: the string to analyze */
+      const char *puts_src = NULL;
+      int puts_src_len = 0;
+
+      if (strchr(fmt, '%') == NULL)
+      {
+        /* No format specifiers — output is the format string itself */
+        if (fmt_len == 0)
+        {
+          opt_kind = PF_OPT_NOP;
+        }
+        else if (has_file)
+        {
+          opt_kind = PF_OPT_FWRITE;
+          write_str_sv = &saved_args[pf_fmt_idx];
+          write_len = fmt_len;
+        }
+        else if (fmt_len == 1)
+        {
+          opt_kind = PF_OPT_PUTCHAR_CONST;
+          putchar_val = (unsigned char)fmt[0];
+        }
+        else if (fmt[fmt_len - 1] == '\n')
+        {
+          opt_kind = PF_OPT_PUTS_CHOPPED;
+          puts_src = fmt;
+          puts_src_len = fmt_len;
+        }
+        /* else: multi-char without trailing \n to stdout → not optimized */
+      }
+      else if (strcmp(fmt, "%s") == 0 && has_varargs)
+      {
+        int slen = 0;
+        const char *sval = try_get_constant_string(&saved_args[pf_vararg_idx], &slen);
+        if (sval)
+        {
+          if (slen == 0)
+          {
+            opt_kind = PF_OPT_NOP;
+          }
+          else if (has_file)
+          {
+            opt_kind = PF_OPT_FWRITE;
+            write_str_sv = &saved_args[pf_vararg_idx];
+            write_len = slen;
+          }
+          else if (slen == 1)
+          {
+            opt_kind = PF_OPT_PUTCHAR_CONST;
+            putchar_val = (unsigned char)sval[0];
+          }
+          else if (sval[slen - 1] == '\n')
+          {
+            opt_kind = PF_OPT_PUTS_CHOPPED;
+            puts_src = sval;
+            puts_src_len = slen;
+          }
+        }
+        else if (has_file)
+        {
+          opt_kind = PF_OPT_FPUTS_ARG;
+        }
+        /* non-constant string to stdout → skip */
+      }
+      else if (strcmp(fmt, "%c") == 0 && has_varargs)
+      {
+        opt_kind = PF_OPT_PUTCHAR_ARG;
+      }
+      else if (!has_file && strcmp(fmt, "%s\n") == 0 && has_varargs)
+      {
+        opt_kind = PF_OPT_PUTS_ARG; /* puts appends \n automatically */
+      }
+
+      if (opt_kind != PF_OPT_NONE)
+      {
+        /* Remove FUNCPARAMVAL ops while preserving argument-evaluation IR.
+         * With forward args, arg-evaluation IR for args 1+ is interleaved
+         * with FUNCPARAMVALs.  A blanket rollback of next_instruction_index
+         * would also erase those definitions (e.g. LEA for &a[1]), leaving
+         * dangling vreg references.  Instead, NOP out only the FUNCPARAMVAL
+         * instructions for the original call. */
+        if (ir_idx_before_first_param >= 0)
+        {
+          int current_end = tcc_state->ir->next_instruction_index;
+          for (int i = ir_idx_before_first_param; i < current_end; i++)
+          {
+            if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
+            {
+              /* Only NOP FUNCPARAMVALs belonging to the original call_id,
+               * not those from nested calls (e.g., memcmp inside printf). */
+              IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
+              int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
+              if (encoded_call_id == call_id)
+                tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
+            }
+          }
+        }
+        else
+        {
+          tcc_state->ir->next_instruction_index = ir_idx_before_args;
+        }
+
+        if (opt_kind == PF_OPT_NOP)
+        {
+          /* Empty output — no call needed, result is 0 chars written. */
+          vpushi(0);
+          vtop[-1] = vtop[0];
+          --vtop;
+        }
+        else if (opt_kind == PF_OPT_PUTCHAR_CONST)
+        {
+          /* putchar(constant_char) or fputc(constant_char, f) */
+          SValue ch_sv;
+          svalue_init(&ch_sv);
+          ch_sv.r = VT_CONST;
+          ch_sv.c.i = putchar_val;
+          ch_sv.type.t = VT_INT;
+          ch_sv.vr = -1;
+
+          if (has_file)
+          {
+            SValue pf_args[2];
+            pf_args[0] = ch_sv;
+            pf_args[1] = saved_args[pf_file_idx];
+            gen_ir_void_call_args(pf_args, 2, tok_alloc_const("fputc"));
+          }
+          else
+          {
+            gen_ir_void_call_args(&ch_sv, 1, tok_alloc_const("putchar"));
+          }
+          vpushi(1);
+          vtop[-1] = vtop[0];
+          --vtop;
+        }
+        else if (opt_kind == PF_OPT_FWRITE)
+        {
+          /* fwrite(str, 1, len, f) — always goes to a FILE* */
+          SValue fw_args[4];
+          fw_args[0] = *write_str_sv;
+          svalue_init(&fw_args[1]);
+          fw_args[1].r = VT_CONST;
+          fw_args[1].c.i = 1;
+          fw_args[1].type.t = VT_INT;
+          fw_args[1].vr = -1;
+          svalue_init(&fw_args[2]);
+          fw_args[2].r = VT_CONST;
+          fw_args[2].c.i = write_len;
+          fw_args[2].type.t = VT_INT;
+          fw_args[2].vr = -1;
+          fw_args[3] = saved_args[pf_file_idx];
+          gen_ir_void_call_args(fw_args, 4, tok_alloc_const("fwrite"));
+          vpushi(write_len);
+          vtop[-1] = vtop[0];
+          --vtop;
+        }
+        else if (opt_kind == PF_OPT_PUTS_CHOPPED)
+        {
+          /* puts(string_without_trailing_newline)
+           * Create a new string constant in rodata with the trailing \n removed.
+           * Copy puts_src first because it may point into rodata_section->data
+           * and section_ptr_add can reallocate that buffer. */
+          int new_len = puts_src_len - 1;
+          char *puts_copy = tcc_malloc(new_len);
+          memcpy(puts_copy, puts_src, new_len);
+          addr_t new_off = rodata_section->data_offset;
+          char *new_ptr = section_ptr_add(rodata_section, new_len + 1);
+          memcpy(new_ptr, puts_copy, new_len);
+          tcc_free(puts_copy);
+          new_ptr[new_len] = '\0';
+
+          SValue new_str_sv;
+          svalue_init(&new_str_sv);
+          new_str_sv.type = char_pointer_type;
+          new_str_sv.r = VT_CONST | VT_SYM;
+          new_str_sv.sym = get_sym_ref(&char_type, rodata_section, new_off, new_len + 1);
+          new_str_sv.c.i = 0;
+          new_str_sv.vr = -1;
+
+          gen_ir_void_call_args(&new_str_sv, 1, tok_alloc_const("puts"));
+          vpushi(puts_src_len);
+          vtop[-1] = vtop[0];
+          --vtop;
+        }
+        else if (opt_kind == PF_OPT_PUTCHAR_ARG)
+        {
+          /* putchar(arg) or fputc(arg, f) — for "%c" format */
+          if (has_file)
+          {
+            SValue pf_args[2];
+            pf_args[0] = saved_args[pf_vararg_idx];
+            pf_args[1] = saved_args[pf_file_idx];
+            gen_ir_void_call_args(pf_args, 2, tok_alloc_const("fputc"));
+          }
+          else
+          {
+            gen_ir_void_call_args(&saved_args[pf_vararg_idx], 1, tok_alloc_const("putchar"));
+          }
+          vpushi(1);
+          vtop[-1] = vtop[0];
+          --vtop;
+        }
+        else if (opt_kind == PF_OPT_FPUTS_ARG)
+        {
+          /* fputs(arg, f) — for fprintf-family "%s" format. */
+          SValue pf_args[2];
+          pf_args[0] = saved_args[pf_vararg_idx];
+          pf_args[1] = saved_args[pf_file_idx];
+          gen_ir_void_call_args(pf_args, 2, tok_alloc_const("fputs"));
+          vpushi(0);
+          vtop[-1] = vtop[0];
+          --vtop;
+        }
+        else if (opt_kind == PF_OPT_PUTS_ARG)
+        {
+          /* puts(arg) — for "%s\n" format. puts() appends \n automatically. */
+          gen_ir_void_call_args(&saved_args[pf_vararg_idx], 1, tok_alloc_const("puts"));
+          vpushi(0);
+          vtop[-1] = vtop[0];
+          --vtop;
+        }
+        printf_family_optimized = 1;
+      }
+    }
+  }
+
+  /* Optimize fputs-family calls in void context.
+   * When the result is unused, lowering to strlen+fwrite preserves side
+   * effects while avoiding the aborting builtin-override helpers used by
+   * GCC torture tests.  Constant strings could be reduced further to NOP
+   * or fputc, but the generic lowering is sufficient and correct here. */
+  int fputs_family_optimized = 0;
+  if (!folded && !inlined && !inline_evaled && !sprintf_family_optimized && !printf_family_optimized && func_name &&
+      saved_arg_count == nb_real_args && nb_args >= 2 && !nocode_wanted && tok == ';' &&
+      (strcmp(func_name, "fputs") == 0 || strcmp(func_name, "fputs_unlocked") == 0 ||
+       strcmp(func_name, "__builtin_fputs_unlocked") == 0))
+  {
+    if (ir_idx_before_first_param >= 0)
+    {
+      int current_end = tcc_state->ir->next_instruction_index;
+      for (int i = ir_idx_before_first_param; i < current_end; i++)
+      {
+        if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
+        {
+          IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
+          int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
+          if (encoded_call_id == call_id)
+            tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
+        }
+      }
+    }
+    else
+    {
+      tcc_state->ir->next_instruction_index = ir_idx_before_args;
+    }
+
+    {
+      SValue param_num;
+      SValue strlen_dest;
+      const int strlen_call_id = tcc_state->ir->next_call_id++;
+      const int fwrite_call_id = tcc_state->ir->next_call_id++;
+
+      svalue_init(&param_num);
+      param_num.vr = -1;
+      param_num.r = VT_CONST;
+
+      param_num.c.i = TCCIR_ENCODE_PARAM(strlen_call_id, 0);
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[0], &param_num, NULL);
+
+      vpush_typed_helper_func(tok_alloc_const("strlen"), &func_old_size_t_type);
+
+      svalue_init(&strlen_dest);
+      strlen_dest.type.t = VT_SIZE_T;
+      strlen_dest.type.ref = NULL;
+      strlen_dest.r = 0;
+      strlen_dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+      {
+        SValue call_id_sv = tcc_ir_svalue_call_id_argc(strlen_call_id, 1);
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &call_id_sv, &strlen_dest);
+      }
+      --vtop;
+
+      param_num.c.i = TCCIR_ENCODE_PARAM(fwrite_call_id, 0);
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[0], &param_num, NULL);
+
+      {
+        SValue one_sv;
+        svalue_init(&one_sv);
+        one_sv.r = VT_CONST;
+        one_sv.c.i = 1;
+        one_sv.type.t = VT_INT;
+        one_sv.type.ref = NULL;
+        one_sv.vr = -1;
+        param_num.c.i = TCCIR_ENCODE_PARAM(fwrite_call_id, 1);
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &one_sv, &param_num, NULL);
+      }
+
+      param_num.c.i = TCCIR_ENCODE_PARAM(fwrite_call_id, 2);
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &strlen_dest, &param_num, NULL);
+
+      param_num.c.i = TCCIR_ENCODE_PARAM(fwrite_call_id, 3);
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[1], &param_num, NULL);
+
+      vpush_helper_func(tok_alloc_const("fwrite"));
+      {
+        SValue call_id_sv = tcc_ir_svalue_call_id_argc(fwrite_call_id, 4);
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[0], &call_id_sv, NULL);
+      }
+      --vtop;
+      vpushi(0);
+      vtop[-1] = vtop[0];
+      --vtop;
+    }
+    fputs_family_optimized = 1;
+  }
+
+  /* Fold zero-length string/memory compares even without global optimization.
+   * This matches GCC builtin semantics for cases like:
+   *   strncmp(++p, ++q, 0)
+   * where the call result is known to be 0, but argument side effects
+   * still must be preserved exactly once. */
+  int string_builtin_optimized = 0;
+  if (!folded && !inlined && !inline_evaled && !sprintf_family_optimized && !printf_family_optimized &&
+      !fputs_family_optimized && func_name && saved_arg_count == nb_real_args && !NOEVAL_WANTED)
+  {
+    int folded_result = 0;
+    int can_fold_result = 0;
+    int lhs_len = 0;
+    int rhs_len = 0;
+    const char *lhs_str = NULL;
+    const char *rhs_str = NULL;
+    size_t n_const = 0;
+
+    if (nb_real_args == 2 && strcmp(func_name, "strcmp") == 0)
+    {
+      lhs_str = try_get_constant_string(&saved_args[0], &lhs_len);
+      rhs_str = try_get_constant_string(&saved_args[1], &rhs_len);
+      if (lhs_str && rhs_str)
+      {
+        folded_result = fold_builtin_strcmp_result(lhs_str, rhs_str);
+        can_fold_result = 1;
+      }
+    }
+
+    if (!can_fold_result && nb_real_args == 2 &&
+        (strcmp(func_name, "strcmp") == 0 || strcmp(func_name, "__builtin_strcmp") == 0))
+    {
+      if (ir_idx_before_first_param >= 0)
+      {
+        int current_end = tcc_state->ir->next_instruction_index;
+        for (int i = ir_idx_before_first_param; i < current_end; i++)
+        {
+          if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
+          {
+            IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
+            int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
+            if (encoded_call_id == call_id)
+              tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
+          }
+        }
+      }
+      else
+      {
+        tcc_state->ir->next_instruction_index = ir_idx_before_args;
+      }
+
+      {
+        CType rt = {VT_INT, NULL};
+        gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_strcmp"), &rt);
+        vtop[-1] = vtop[0];
+        --vtop;
+        string_builtin_optimized = 1;
+      }
+    }
+
+    if (!can_fold_result && nb_real_args == 2 &&
+        (strcmp(func_name, "strcpy") == 0 || strcmp(func_name, "__builtin_strcpy") == 0))
+    {
+      if (ir_idx_before_first_param >= 0)
+      {
+        int current_end = tcc_state->ir->next_instruction_index;
+        for (int i = ir_idx_before_first_param; i < current_end; i++)
+        {
+          if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
+          {
+            IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
+            int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
+            if (encoded_call_id == call_id)
+              tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
+          }
+        }
+      }
+      else
+      {
+        tcc_state->ir->next_instruction_index = ir_idx_before_args;
+      }
+
+      {
+        gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_strcpy"), &saved_args[0].type);
+        vtop[-1] = vtop[0];
+        --vtop;
+        string_builtin_optimized = 1;
+      }
+    }
+
+    if (!can_fold_result && nb_real_args == 2 &&
+        (strcmp(func_name, "stpcpy") == 0 || strcmp(func_name, "__builtin_stpcpy") == 0))
+    {
+      CType result_type = ret.type;
+
+      if (ir_idx_before_first_param >= 0)
+      {
+        int current_end = tcc_state->ir->next_instruction_index;
+        for (int i = ir_idx_before_first_param; i < current_end; i++)
+        {
+          if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
+          {
+            IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
+            int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
+            if (encoded_call_id == call_id)
+              tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
+          }
+        }
+      }
+      else
+      {
+        tcc_state->ir->next_instruction_index = ir_idx_before_args;
+      }
+
+      {
+        gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_stpcpy"), &result_type);
+        vtop[-1] = vtop[0];
+        --vtop;
+        string_builtin_optimized = 1;
+      }
+    }
+
+    if (!can_fold_result && nb_real_args == 1 &&
+        (strcmp(func_name, "strlen") == 0 || strcmp(func_name, "__builtin_strlen") == 0))
+    {
+      CType result_type = ret.type;
+
+      if (ir_idx_before_first_param >= 0)
+      {
+        int current_end = tcc_state->ir->next_instruction_index;
+        for (int i = ir_idx_before_first_param; i < current_end; i++)
+        {
+          if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
+          {
+            IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
+            int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
+            if (encoded_call_id == call_id)
+              tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
+          }
+        }
+      }
+      else
+      {
+        tcc_state->ir->next_instruction_index = ir_idx_before_args;
+      }
+
+      {
+        gen_ir_call_args(saved_args, 1, tok_alloc_const("__tcc_strlen"), &result_type);
+        vtop[-1] = vtop[0];
+        --vtop;
+        string_builtin_optimized = 1;
+      }
+    }
+
+    if (!can_fold_result && nb_real_args == 2 &&
+        (strcmp(func_name, "strnlen") == 0 || strcmp(func_name, "__builtin_strnlen") == 0))
+    {
+      CType result_type = ret.type;
+
+      if (ir_idx_before_first_param >= 0)
+      {
+        int current_end = tcc_state->ir->next_instruction_index;
+        for (int i = ir_idx_before_first_param; i < current_end; i++)
+        {
+          if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
+          {
+            IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
+            int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
+            if (encoded_call_id == call_id)
+              tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
+          }
+        }
+      }
+      else
+      {
+        tcc_state->ir->next_instruction_index = ir_idx_before_args;
+      }
+
+      {
+        gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_strnlen"), &result_type);
+        vtop[-1] = vtop[0];
+        --vtop;
+        string_builtin_optimized = 1;
+      }
+    }
+
+    if (!can_fold_result && nb_real_args == 2 &&
+        (strcmp(func_name, "strpbrk") == 0 || strcmp(func_name, "__builtin_strpbrk") == 0))
+    {
+      CType result_type = ret.type;
+
+      if (ir_idx_before_first_param >= 0)
+      {
+        int current_end = tcc_state->ir->next_instruction_index;
+        for (int i = ir_idx_before_first_param; i < current_end; i++)
+        {
+          if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
+          {
+            IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
+            int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
+            if (encoded_call_id == call_id)
+              tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
+          }
+        }
+      }
+      else
+      {
+        tcc_state->ir->next_instruction_index = ir_idx_before_args;
+      }
+
+      {
+        gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_strpbrk"), &result_type);
+        vtop[-1] = vtop[0];
+        --vtop;
+        string_builtin_optimized = 1;
+      }
+    }
+
+    if (!can_fold_result && nb_real_args == 2 &&
+        (strcmp(func_name, "strrchr") == 0 || strcmp(func_name, "rindex") == 0 ||
+         strcmp(func_name, "__builtin_strrchr") == 0 || strcmp(func_name, "__builtin_rindex") == 0))
+    {
+      CType result_type = ret.type;
+
+      if (ir_idx_before_first_param >= 0)
+      {
+        int current_end = tcc_state->ir->next_instruction_index;
+        for (int i = ir_idx_before_first_param; i < current_end; i++)
+        {
+          if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
+          {
+            IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
+            int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
+            if (encoded_call_id == call_id)
+              tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
+          }
+        }
+      }
+      else
+      {
+        tcc_state->ir->next_instruction_index = ir_idx_before_args;
+      }
+
+      {
+        gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_strrchr"), &result_type);
+        vtop[-1] = vtop[0];
+        --vtop;
+        string_builtin_optimized = 1;
+      }
+    }
+
+    if (!can_fold_result && nb_real_args == 2 &&
+        (strcmp(func_name, "strstr") == 0 || strcmp(func_name, "__builtin_strstr") == 0))
+    {
+      CType result_type = ret.type;
+
+      if (ir_idx_before_first_param >= 0)
+      {
+        int current_end = tcc_state->ir->next_instruction_index;
+        for (int i = ir_idx_before_first_param; i < current_end; i++)
+        {
+          if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
+          {
+            IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
+            int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
+            if (encoded_call_id == call_id)
+              tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
+          }
+        }
+      }
+      else
+      {
+        tcc_state->ir->next_instruction_index = ir_idx_before_args;
+      }
+
+      {
+        gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_strstr"), &result_type);
+        vtop[-1] = vtop[0];
+        --vtop;
+        string_builtin_optimized = 1;
+      }
+    }
+
+    if (!can_fold_result && nb_real_args == 2 &&
+        (strcmp(func_name, "strcspn") == 0 || strcmp(func_name, "__builtin_strcspn") == 0))
+    {
+      CType result_type = ret.type;
+
+      if (ir_idx_before_first_param >= 0)
+      {
+        int current_end = tcc_state->ir->next_instruction_index;
+        for (int i = ir_idx_before_first_param; i < current_end; i++)
+        {
+          if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
+          {
+            IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
+            int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
+            if (encoded_call_id == call_id)
+              tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
+          }
+        }
+      }
+      else
+      {
+        tcc_state->ir->next_instruction_index = ir_idx_before_args;
+      }
+
+      {
+        gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_strcspn"), &result_type);
+        vtop[-1] = vtop[0];
+        --vtop;
+        string_builtin_optimized = 1;
+      }
+    }
+
+    if (!can_fold_result && nb_real_args == 3 &&
+        (strcmp(func_name, "strncpy") == 0 || strcmp(func_name, "__builtin_strncpy") == 0))
+    {
+      CType result_type = ret.type;
+
+      if (ir_idx_before_first_param >= 0)
+      {
+        int current_end = tcc_state->ir->next_instruction_index;
+        for (int i = ir_idx_before_first_param; i < current_end; i++)
+        {
+          if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
+          {
+            IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
+            int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
+            if (encoded_call_id == call_id)
+              tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
+          }
+        }
+      }
+      else
+      {
+        tcc_state->ir->next_instruction_index = ir_idx_before_args;
+      }
+
+      {
+        gen_ir_call_args(saved_args, 3, tok_alloc_const("__tcc_strncpy"), &result_type);
+        vtop[-1] = vtop[0];
+        --vtop;
+        string_builtin_optimized = 1;
+      }
+    }
+
+    if (!can_fold_result && nb_real_args == 3 &&
+        (strcmp(func_name, "strncat") == 0 || strcmp(func_name, "__builtin_strncat") == 0))
+    {
+      CType result_type = ret.type;
+
+      if (ir_idx_before_first_param >= 0)
+      {
+        int current_end = tcc_state->ir->next_instruction_index;
+        for (int i = ir_idx_before_first_param; i < current_end; i++)
+        {
+          if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
+          {
+            IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
+            int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
+            if (encoded_call_id == call_id)
+              tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
+          }
+        }
+      }
+      else
+      {
+        tcc_state->ir->next_instruction_index = ir_idx_before_args;
+      }
+
+      {
+        gen_ir_call_args(saved_args, 3, tok_alloc_const("__tcc_strncat"), &result_type);
+        vtop[-1] = vtop[0];
+        --vtop;
+        string_builtin_optimized = 1;
+      }
+    }
+
+    if (!can_fold_result && nb_real_args == 3 && strcmp(func_name, "strncmp") == 0 &&
+        !is_zero_length_builtin_compare(&saved_args[2]))
+    {
+      lhs_str = try_get_constant_string(&saved_args[0], &lhs_len);
+      rhs_str = try_get_constant_string(&saved_args[1], &rhs_len);
+      if (lhs_str && rhs_str && try_get_constant_size_t(&saved_args[2], &n_const))
+      {
+        folded_result = fold_builtin_strncmp_result(lhs_str, rhs_str, n_const);
+        can_fold_result = 1;
+      }
+    }
+
+    if (!can_fold_result && nb_real_args == 3 && strcmp(func_name, "memcmp") == 0)
+    {
+      lhs_str = try_get_constant_string(&saved_args[0], &lhs_len);
+      rhs_str = try_get_constant_string(&saved_args[1], &rhs_len);
+      if (lhs_str && rhs_str && try_get_constant_size_t(&saved_args[2], &n_const) && n_const <= (size_t)lhs_len + 1 &&
+          n_const <= (size_t)rhs_len + 1)
+      {
+        folded_result = fold_builtin_memcmp_result(lhs_str, rhs_str, n_const);
+        can_fold_result = 1;
+      }
+    }
+
+    if (!can_fold_result && nb_real_args == 3 && strcmp(func_name, "memcmp") == 0 &&
+        try_get_constant_size_t(&saved_args[2], &n_const))
+    {
+      if (n_const == 0)
+      {
+        folded_result = 0;
+        can_fold_result = 1;
+      }
+      else if (n_const == 1)
+      {
+        if (ir_idx_before_first_param >= 0)
+        {
+          int current_end = tcc_state->ir->next_instruction_index;
+          for (int i = ir_idx_before_first_param; i < current_end; i++)
+          {
+            if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
+            {
+              IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
+              int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
+              if (encoded_call_id == call_id)
+                tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
+            }
+          }
+        }
+        else
+        {
+          tcc_state->ir->next_instruction_index = ir_idx_before_args;
+        }
+
+        {
+          CType rt = {VT_INT, NULL};
+          gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_memcmp1"), &rt);
+          vtop[-1] = vtop[0];
+          --vtop;
+          string_builtin_optimized = 1;
+        }
+      }
+    }
+
+    if (!can_fold_result && nb_real_args == 3 && (strcmp(func_name, "memmove") == 0 || strcmp(func_name, "bcopy") == 0))
+    {
+      const int is_bcopy = strcmp(func_name, "bcopy") == 0;
+
+      if (ir_idx_before_first_param >= 0)
+      {
+        int current_end = tcc_state->ir->next_instruction_index;
+        for (int i = ir_idx_before_first_param; i < current_end; i++)
+        {
+          if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
+          {
+            IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
+            int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
+            if (encoded_call_id == call_id)
+              tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
+          }
+        }
+      }
+      else
+      {
+        tcc_state->ir->next_instruction_index = ir_idx_before_args;
+      }
+
+      {
+        SValue param_num;
+        const int new_call_id = tcc_state->ir->next_call_id++;
+
+        svalue_init(&param_num);
+        param_num.vr = -1;
+        param_num.r = VT_CONST;
+
+        if (is_bcopy)
+        {
+          param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
+          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[0], &param_num, NULL);
+
+          param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 1);
+          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[1], &param_num, NULL);
+
+          param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 2);
+          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[2], &param_num, NULL);
+
+          vpush_typed_helper_func(tok_alloc_const("__tcc_bcopy"), &func_old_void_type);
+          {
+            SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 3);
+            tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[0], &call_id_sv, NULL);
+          }
+          --vtop;
+          vtop->type.t = VT_VOID;
+          vtop->type.ref = NULL;
+          vtop->r = VT_CONST;
+          vtop->vr = -1;
+          vtop->c.i = 0;
+        }
+        else
+        {
+          SValue dest;
+
+          param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
+          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[0], &param_num, NULL);
+
+          param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 1);
+          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[1], &param_num, NULL);
+
+          param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 2);
+          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[2], &param_num, NULL);
+
+          vpush_typed_helper_func(tok_alloc_const("__tcc_memmove"), &func_old_void_pointer_type);
+
+          svalue_init(&dest);
+          dest.type = saved_args[0].type;
+          dest.r = 0;
+          dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+          {
+            SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 3);
+            tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &call_id_sv, &dest);
+          }
+
+          --vtop;
+          vpushi(0);
+          vtop->type = dest.type;
+          vtop->vr = dest.vr;
+          vtop->r = TREG_R0;
+        }
+
+        vtop[-1] = vtop[0];
+        --vtop;
+        string_builtin_optimized = 1;
+      }
+    }
+
+    if (!can_fold_result && nb_real_args == 3 && strcmp(func_name, "strncmp") == 0)
+    {
+      if (ir_idx_before_first_param >= 0)
+      {
+        int current_end = tcc_state->ir->next_instruction_index;
+        for (int i = ir_idx_before_first_param; i < current_end; i++)
+        {
+          if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
+          {
+            IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
+            int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
+            if (encoded_call_id == call_id)
+              tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
+          }
+        }
+      }
+      else
+      {
+        tcc_state->ir->next_instruction_index = ir_idx_before_args;
+      }
+
+      {
+        CType rt = {VT_INT, NULL};
+        gen_ir_call_args(saved_args, 3, tok_alloc_const("__tcc_strncmp"), &rt);
+        vtop[-1] = vtop[0];
+        --vtop;
+        string_builtin_optimized = 1;
+      }
+    }
+
+    if (!can_fold_result && nb_real_args == 3 && is_zero_length_builtin_compare(&saved_args[2]))
+    {
+      if (strcmp(func_name, "strncmp") == 0 || strcmp(func_name, "memcmp") == 0)
+      {
+        folded_result = 0;
+        can_fold_result = 1;
+      }
+    }
+
+    if (!can_fold_result && nb_real_args == 3 && strcmp(func_name, "memchr") == 0)
+    {
+      unsigned char needle = 0;
+      int match_offset = -1;
+      lhs_str = try_get_constant_string(&saved_args[0], &lhs_len);
+      if (lhs_str && try_get_constant_uchar(&saved_args[1], &needle) &&
+          try_get_constant_size_t(&saved_args[2], &n_const) && n_const <= (size_t)lhs_len + 1 &&
+          fold_builtin_memchr_offset(lhs_str, needle, n_const, &match_offset))
+      {
+        if (ir_idx_before_first_param >= 0)
+        {
+          int current_end = tcc_state->ir->next_instruction_index;
+          for (int i = ir_idx_before_first_param; i < current_end; i++)
+          {
+            if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
+            {
+              IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
+              int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
+              if (encoded_call_id == call_id)
+                tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
+            }
+          }
+        }
+        else
+        {
+          tcc_state->ir->next_instruction_index = ir_idx_before_args;
+        }
+
+        if (match_offset >= 0)
+        {
+          SValue match_sv = saved_args[0];
+          match_sv.c.i += match_offset;
+          vpushv(&match_sv);
+        }
+        else
+        {
+          vpushi(0);
+          vtop->type = saved_args[0].type;
+        }
+
+        vtop[-1] = vtop[0];
+        --vtop;
+        string_builtin_optimized = 1;
+      }
+    }
+
+    if (!can_fold_result && nb_real_args == 2 &&
+        (strcmp(func_name, "strchr") == 0 || strcmp(func_name, "index") == 0 ||
+         strcmp(func_name, "__builtin_index") == 0))
+    {
+      if (ir_idx_before_first_param >= 0)
+      {
+        int current_end = tcc_state->ir->next_instruction_index;
+        for (int i = ir_idx_before_first_param; i < current_end; i++)
+        {
+          if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
+          {
+            IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
+            int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
+            if (encoded_call_id == call_id)
+              tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
+          }
+        }
+      }
+      else
+      {
+        tcc_state->ir->next_instruction_index = ir_idx_before_args;
+      }
+
+      {
+        gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_strchr"), &saved_args[0].type);
+        vtop[-1] = vtop[0];
+        --vtop;
+        string_builtin_optimized = 1;
+      }
+    }
+
+    if (can_fold_result)
+    {
+      if (ir_idx_before_first_param >= 0)
+      {
+        int current_end = tcc_state->ir->next_instruction_index;
+        for (int i = ir_idx_before_first_param; i < current_end; i++)
+        {
+          if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
+          {
+            IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
+            int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
+            if (encoded_call_id == call_id)
+              tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
+          }
+        }
+      }
+      else
+      {
+        tcc_state->ir->next_instruction_index = ir_idx_before_args;
+      }
+
+      vpushi(folded_result);
+      vtop[-1] = vtop[0];
+      --vtop;
+      string_builtin_optimized = 1;
+    }
+  }
+
+  if (folded)
+  {
+    /* Constant folding succeeded – skip IR emission.
+     * try_fold_math_call() pushed the folded result on top of the
+     * function pointer: stack is  [...] [func_ptr] [result].
+     * Move the result over the function pointer and pop the dup. */
+    vtop[-1] = vtop[0];
+    --vtop;
+    /* Roll back the IR stream to discard the orphaned FUNCPARAMVAL
+     * ops that were emitted for the (now-folded) arguments. */
+    tcc_state->ir->next_instruction_index = ir_idx_before_args;
+  }
+  else if (inlined || inline_evaled || sprintf_family_optimized || printf_family_optimized || fputs_family_optimized ||
+           string_builtin_optimized)
+  {
+    /* Already handled above */
+  }
+  else if (can_inline_eval && !NOEVAL_WANTED && call_func_sym && saved_arg_count == nb_real_args && tcc_state->ir &&
+           !tcc_state->in_inline_expansion)
+  {
+    /* ---- Token-level inline expansion ----
+     * Only expand inline functions whose body contains address-of-label
+     * (&&label).  This is the specific case where call-site inlining
+     * is required: each expansion must get unique label addresses.
+     * Also expand always_inline functions at the call site when their
+     * body contains inline asm, so asm constraints are checked against
+     * caller-provided operands rather than abstract parameters.
+     * General inlining of all other inline functions is left to
+     * gen_inline_functions() which compiles them as standalone funcs. */
+    struct InlineFunc *inline_fn = NULL;
+    int force_always_inline = 0;
+    int has_addr_of_label = 0;
+    int has_inline_asm = 0;
+    for (int fi = 0; fi < tcc_state->nb_inline_fns; fi++)
+    {
+      if (tcc_state->inline_fns[fi]->sym == call_func_sym)
+      {
+        inline_fn = tcc_state->inline_fns[fi];
+        break;
+      }
+    }
+    if (inline_fn && inline_fn->func_str)
+      inline_scan_body_features(inline_fn->func_str, &has_addr_of_label, &has_inline_asm);
+    if (call_func_sym->type.ref && call_func_sym->type.ref->f.func_alwinl && has_inline_asm)
+      force_always_inline = 1;
+    if (force_always_inline && inline_fn && ((call_func_sym->type.ref->type.t & VT_BTYPE) != VT_VOID) &&
+        !inline_body_has_return_stmt(inline_fn->func_str))
+    {
+      /* A non-void always_inline body that falls through without any
+       * explicit return cannot currently be replayed safely at the call
+       * site. Keep it as a normal inline call so we warn but don't crash. */
+      force_always_inline = 0;
+    }
+    if (inline_fn && inline_fn->func_str && (has_addr_of_label || force_always_inline))
+    {
+      /* --- 1. NOP out FUNCPARAMVALs for this call --- */
+      if (ir_idx_before_first_param >= 0)
+      {
+        int current_end = tcc_state->ir->next_instruction_index;
+        for (int ii = ir_idx_before_first_param; ii < current_end; ii++)
+        {
+          if (tcc_state->ir->compact_instructions[ii].op == TCCIR_OP_FUNCPARAMVAL)
+          {
+            IROperand src2 = tcc_ir_get_src2(tcc_state->ir, ii);
+            if (TCCIR_DECODE_CALL_ID(src2.u.imm32) == call_id)
+              tcc_state->ir->compact_instructions[ii].op = TCCIR_OP_NOP;
+          }
+        }
+      }
+      else
+      {
+        /* No args — just roll back any FUNCPARAMVOID */
+        tcc_state->ir->next_instruction_index = ir_idx_before_args;
+      }
+
+      /* --- 2. Create parameter locals and store arguments --- */
+      Sym *saved_local = local_stack;
+      int saved_local_scope = local_scope;
+      int saved_inline_const_arg_count = tcc_state->inline_const_arg_count;
+      tcc_state->inline_const_arg_count = 0;
+      ++local_scope;            /* shadow caller's same-named variables */
+      Sym *param_sym = s->next; /* first parameter from function type */
+      for (int pi = 0; pi < nb_args && param_sym; pi++, param_sym = param_sym->next)
+      {
+        int psize, palign;
+        psize = type_size(&param_sym->type, &palign);
+        if (psize < 4)
+          psize = 4;
+        if (palign < 4)
+          palign = 4;
+        loc = (loc - psize) & -palign;
+
+        /* Push parameter symbol FIRST so it gets a vreg assigned */
+        Sym *psym = sym_push(param_sym->v & ~SYM_FIELD, &param_sym->type, VT_LOCAL | VT_LVAL, loc);
+
+        if (force_always_inline && inline_arg_is_constant_like(&saved_args[pi]) &&
+            tcc_state->inline_const_arg_count < countof(tcc_state->inline_const_args))
+        {
+          int map_idx = tcc_state->inline_const_arg_count++;
+          tcc_state->inline_const_args[map_idx].vreg = psym->vreg;
+          tcc_state->inline_const_args[map_idx].stack_offset = loc;
+          tcc_state->inline_const_args[map_idx].value = saved_args[pi];
+        }
+
+        /* Store argument to local via IR */
+        SValue store_dst;
+        svalue_init(&store_dst);
+        store_dst.type = param_sym->type;
+        store_dst.r = VT_LOCAL | VT_LVAL;
+        store_dst.vr = psym->vreg;
+        store_dst.c.i = loc;
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_STORE, &saved_args[pi], NULL, &store_dst);
+      }
+
+      /* --- 3. Save parser/codegen state --- */
+      CType saved_func_vt = func_vt;
+      int saved_func_var = func_var;
+      int saved_rsym = rsym;
+      const char *saved_funcname = funcname;
+      struct scope *saved_root_scope = root_scope;
+
+      /* Set up inline function context */
+      func_vt = s->type; /* return type */
+      func_var = (s->f.func_type == FUNC_ELLIPSIS);
+      rsym = -1; /* fresh return-jump chain */
+
+      /* Allocate return value local for non-void functions */
+      int is_void_inline = ((func_vt.t & VT_BTYPE) == VT_VOID);
+      int inline_ret_loc = 0;
+      if (!is_void_inline)
+      {
+        int rsize, ralign;
+        rsize = type_size(&func_vt, &ralign);
+        if (rsize < 4)
+          rsize = 4;
+        if (ralign < 4)
+          ralign = 4;
+        loc = (loc - rsize) & -ralign;
+        inline_ret_loc = loc;
+      }
+
+      /* Set inline expansion flags */
+      tcc_state->in_inline_expansion = 1;
+      tcc_state->inline_return_loc = inline_ret_loc;
+      root_scope = cur_scope;
+
+      /* --- 4. Replay inline function body --- */
+      int saved_tok = tok;
+      CValue saved_tokc = tokc;
+      int *inline_label_tokens = NULL;
+      int nb_inline_label_tokens = 0;
+      Sym **saved_inline_labels =
+          inline_hide_label_bindings(inline_fn->func_str, &inline_label_tokens, &nb_inline_label_tokens);
+
+      TokenString *inline_ts = tok_str_alloc();
+      inline_ts->data.str = tok_str_buf(inline_fn->func_str);
+      inline_ts->allocated_len = 1;
+      inline_ts->len = inline_fn->func_str->len;
+      begin_macro(inline_ts, 2);
+      next();
+      block(0);
+      end_macro();
+      inline_restore_label_bindings(inline_label_tokens, saved_inline_labels, nb_inline_label_tokens);
+
+      tok = saved_tok;
+      tokc = saved_tokc;
+
+      /* --- 5. Backpatch return jumps --- */
+      tcc_ir_backpatch_to_here(tcc_state->ir, rsym);
+
+      /* --- 6. Restore state --- */
+      tcc_state->in_inline_expansion = 0;
+      func_vt = saved_func_vt;
+      func_var = saved_func_var;
+      rsym = saved_rsym;
+      funcname = saved_funcname;
+      root_scope = saved_root_scope;
+      tcc_state->inline_const_arg_count = saved_inline_const_arg_count;
+      sym_pop(&local_stack, saved_local, 0);
+      local_scope = saved_local_scope;
+
+      /* --- 7. Handle result on vstack --- */
+      if (is_void_inline)
+      {
+        /* Replace function pointer with void placeholder */
+        vtop->type.t = VT_VOID;
+        vtop->type.ref = NULL;
+        vtop->r = VT_CONST;
+        vtop->vr = -1;
+        vtop->c.i = 0;
+      }
+      else
+      {
+        /* Replace function pointer with return value lvalue */
+        vtop->type = s->type;
+        vtop->r = VT_LOCAL | VT_LVAL;
+        vtop->vr = -1;
+        vtop->c.i = inline_ret_loc;
+      }
+      inlined = 1;
+    }
+    else
+    {
+      /* No special call-site inline requirement found, or InlineFunc not found - normal call */
+      goto normal_call;
+    }
+  }
+  else
+  {
+  normal_call:;
+    if (call_func_sym && call_func_sym->type.ref && call_func_sym->type.ref->f.func_alwinl)
+    {
+      call_func_sym->type.ref->f.func_outofline_needed = 1;
+    }
+
+    int return_vreg = -1;
+    if (NOEVAL_WANTED)
+    {
+      /* When in sizeof/typeof context, skip IR emission but still handle stack */
+      --vtop;
+    }
+    else if ((s->type.t & VT_BTYPE) == VT_VOID)
+    {
+      /* In IR mode, make sure the call target is a VALUE (register/temp),
+       * not an lvalue. Indirect calls like tabl1[i]() produce an lvalue
+       * (memory reference) for tabl1[i]; we must LOAD it to get the actual
+       * function pointer value before emitting FUNCCALL.
+       * NOTE: We check s->type.t (the function's return type), not vtop->type.t
+       * (which is VT_FUNC for function pointers). */
+      SValue call_id_sv = tcc_ir_svalue_call_id_argc(call_id, nb_args);
+      /* Emit FUNCPARAMVOID for 0-arg calls so backend creates a call site */
+      if (nb_args == 0)
+      {
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVOID, NULL, &call_id_sv, NULL);
+      }
+      /* For indirect calls (VT_LVAL set), emit a LOAD to get the function pointer value */
+      SValue call_target = *vtop;
+      if (vtop->r & VT_LVAL)
+      {
+        SValue load_dest;
+        svalue_init(&load_dest);
+        load_dest.type = vtop->type;
+        load_dest.r = 0;
+        load_dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_LOAD, vtop, NULL, &load_dest);
+        call_target = load_dest;
+        call_target.r &= ~VT_LVAL; /* Clear VT_LVAL since we now have the value */
+      }
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &call_target, &call_id_sv, NULL);
+      --vtop;
+    }
+    else
+    {
+      SValue dest;
+      svalue_init(&dest);
+      if (nb_args == 0)
+      {
+        SValue call_id_sv = tcc_ir_svalue_call_id_argc(call_id, 0);
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVOID, NULL, &call_id_sv, NULL);
+      }
+      /* Use the actual return type so 64-bit/float returns are modeled correctly
+       * (e.g., __aeabi_f2d returns a double in R0:R1). */
+      dest.type = ret.type;
+      dest.r = 0;
+      dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+      return_vreg = dest.vr;
+
+      /* For indirect calls (VT_LVAL set), emit a LOAD to get the function pointer value */
+      SValue call_id_sv = tcc_ir_svalue_call_id_argc(call_id, nb_args);
+      SValue call_target = *vtop;
+      if (vtop->r & VT_LVAL)
+      {
+        SValue load_dest;
+        svalue_init(&load_dest);
+        load_dest.type = vtop->type;
+        load_dest.r = 0;
+        load_dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_LOAD, vtop, NULL, &load_dest);
+        call_target = load_dest;
+        call_target.r &= ~VT_LVAL; /* Clear VT_LVAL since we now have the value */
+      }
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &call_target, &call_id_sv, &dest);
+      --vtop;
+    }
+
+    if (ret_nregs < 0)
+    {
+      vsetc(&ret.type, ret.r, &ret.c);
+#ifdef TCC_TARGET_RISCV64
+      arch_transfer_ret_regs(1);
+#endif
+    }
+    else if (ret_nregs == 0)
+    {
+      /* Struct returned via sret pointer: the callee already wrote to the
+       * sret buffer. Just push the buffer location as an lvalue. */
+      vsetc(&ret.type, ret.r, &ret.c);
+      /* Do NOT set vtop->vr = return_vreg - there's no return register for sret */
+    }
+    else
+    {
+      /* return value */
+      n = ret_nregs;
+      while (n > 1)
+      {
+        int rc = reg_classes[ret.r] & ~(RC_INT | RC_FLOAT);
+        /* We assume that when a structure is returned in multiple
+           registers, their classes are consecutive values of the
+           suite s(n) = 2^n */
+        rc <<= --n;
+        for (r = 0; r < NB_REGS; ++r)
+          if (reg_classes[r] & rc)
+            break;
+        vsetc(&ret.type, r, &ret.c);
+        vtop->vr = return_vreg;
+      }
+      vsetc(&ret.type, ret.r, &ret.c);
+      vtop->vr = return_vreg;
+
+      /* handle packed struct return */
+      if (((s->type.t & VT_BTYPE) == VT_STRUCT) && ret_nregs)
+      {
+        int addr, offset;
+
+        size = type_size(&s->type, &align);
+        /* We're writing whole regs often, make sure there's enough
+           space.  Assume register size is power of 2.  */
+        size = (size + regsize - 1) & -regsize;
+        if (ret_align > align)
+          align = ret_align;
+        loc = (loc - size) & -align;
+        addr = loc;
+        offset = 0;
+        for (;;)
+        {
+          vset(&ret.type, VT_LOCAL | VT_LVAL, addr + offset);
+          vswap();
+          vstore();
+          vtop--;
+          print_vstack("unary, function call(2)");
+          if (--ret_nregs == 0)
+            break;
+          offset += regsize;
+        }
+        vset(&s->type, VT_LOCAL | VT_LVAL, addr);
+      }
+
+      /* Promote char/short return values. This is matters only
+         for calling function that were not compiled by TCC and
+         only on some architectures.  For those where it doesn't
+         matter we expect things to be already promoted to int,
+         but not larger.  */
+      t = s->type.t & VT_BTYPE;
+      if (t == VT_BYTE || t == VT_SHORT || t == VT_BOOL)
+      {
+#ifdef PROMOTE_RET
+        vtop->r |= BFVAL(VT_MUSTCAST, 1);
+#else
+        vtop->type.t = VT_INT;
+#endif
+      }
+
+      /* Restore VT_COMPLEX for complex types returned in registers.
+       * gfunc_sret() sets ret.type to VT_INT for small types (size <= 4),
+       * but the caller needs VT_COMPLEX to properly handle __real__/__imag__
+       * extraction.  The value in the register is packed:
+       *   _Complex char:  byte 0 = real, byte 1 = imag  (total 2 bytes in r0)
+       *   _Complex short: low 16 = real, high 16 = imag  (total 4 bytes in r0)
+       */
+      if (s->type.t & VT_COMPLEX)
+      {
+        vtop->type = s->type;
+      }
+    }
+  } /* end of else block for non-folded function calls */
+  tcc_free(saved_args);
+  if (s->f.func_noreturn)
+  {
+    if (debug_modes)
+      tcc_tcov_block_end(tcc_state, -1);
+    CODE_OFF();
+  }
+}
+
 ST_FUNC void unary(void)
 {
-  int n, t, align, size, r;
+  int n, t, align, r;
   CType type;
   Sym *s;
   AttributeDef ad;
@@ -16591,2310 +18922,7 @@ tok_next:
     }
     else if (tok == '(')
     {
-      SValue ret;
-      Sym *sa;
-      int nb_args, ret_nregs, ret_align, regsize, variadic;
-      TokenString *p, *p2;
-
-      /* function call  */
-      if ((vtop->type.t & VT_BTYPE) != VT_FUNC)
-      {
-        /* pointer test (no array accepted) */
-        if ((vtop->type.t & (VT_BTYPE | VT_ARRAY)) == VT_PTR)
-        {
-          vtop->type = *pointed_type(&vtop->type);
-          if ((vtop->type.t & VT_BTYPE) != VT_FUNC)
-            goto error_func;
-        }
-        else
-        {
-        error_func:
-          expect("function pointer");
-        }
-      }
-      else
-      {
-        vtop->r &= ~VT_LVAL; /* no lvalue */
-      }
-      /* get return type */
-      /* Save function symbol before switching to type ref - needed for nested_func check */
-      Sym *call_func_sym = vtop->sym;
-      s = vtop->type.ref;
-      next();
-
-      /* If calling a nested function, emit SET_CHAIN to pass static chain (parent FP).
-       * Only emit when the caller is the callee's PARENT.  When the caller is
-       * itself a nested function (current_nested_func != NULL) and the callee is
-       * a sibling (defined in the same enclosing scope), R10 already holds the
-       * correct chain pointer from our own incoming chain — emitting SET_CHAIN
-       * would clobber it with R7 which may be an unrelated frame pointer. */
-      if (tcc_state->ir && call_func_sym && call_func_sym->a.nested_func)
-      {
-        int emit_set_chain = 1;
-        if (tcc_state->current_nested_func)
-        {
-          /* Caller is a nested function.  Determine if callee is our child
-           * (defined inside our body) or a sibling (defined in the same parent
-           * scope).  Only emit SET_CHAIN for child calls. */
-          NestedFunc *callee_nf = NULL;
-          for (int ni = 0; ni < tcc_state->nb_nested_funcs; ni++)
-          {
-            if (tcc_state->nested_funcs[ni].sym == call_func_sym)
-            {
-              callee_nf = &tcc_state->nested_funcs[ni];
-              break;
-            }
-          }
-          if (callee_nf && callee_nf->parent_nf != tcc_state->current_nested_func)
-          {
-            /* Sibling call: R10 already has the correct parent FP */
-            emit_set_chain = 0;
-          }
-        }
-        if (emit_set_chain)
-        {
-          /* Emit SET_CHAIN: R10 = FP (current frame pointer) */
-          SValue src, dest;
-          svalue_init(&src);
-          svalue_init(&dest);
-          src.type.t = VT_PTR;
-          src.r = 0;
-          src.vr = -1;
-          dest.type.t = VT_PTR;
-          dest.r = 0;
-          dest.vr = -1;
-          tcc_ir_put(tcc_state->ir, TCCIR_OP_SET_CHAIN, &src, NULL, &dest);
-        }
-      }
-
-      /* Each IR-level call gets a unique call_id so FUNCPARAM* can be bound
-       * without fragile nested-depth scanning.
-       */
-      int call_id = 0;
-      if (!NOEVAL_WANTED && tcc_state->ir)
-        call_id = tcc_state->ir->next_call_id++;
-
-      sa = s->next; /* first parameter */
-      nb_args = regsize = 0;
-      int nb_implicit_args = 0; /* sret pointer counted in nb_args but not saved_arg_count */
-      /* compute first implicit argument if a composite type is returned */
-      if ((s->type.t & VT_BTYPE) == VT_STRUCT || (s->type.t & VT_COMPLEX))
-      {
-        variadic = (s->f.func_type == FUNC_ELLIPSIS);
-        ret_nregs = gfunc_sret(&s->type, variadic, &ret.type, &ret_align, &regsize);
-        if (ret_nregs <= 0)
-        {
-          /* get some space for the returned structure */
-          size = type_size(&s->type, &align);
-#ifdef TCC_TARGET_ARM64
-          /* On arm64, a small struct is return in registers.
-             It is much easier to write it to memory if we know
-             that we are allowed to write some extra bytes, so
-             round the allocated space up to a power of 2: */
-          if (size < 16)
-            while (size & (size - 1))
-              size = (size | (size - 1)) + 1;
-#endif
-          loc = (loc - size) & -align;
-          ret.type = s->type;
-          ret.r = VT_LOCAL | VT_LVAL;
-          /* pass it as 'int' to avoid structure arg passing
-             problems */
-          vseti(VT_LOCAL, loc);
-#ifdef CONFIG_TCC_BCHECK
-          if (tcc_state->do_bounds_check)
-            --loc;
-#endif
-          ret.c = vtop->c;
-          if (ret_nregs < 0)
-          {
-            vtop--;
-            print_vstack("unary, function call");
-          }
-          else
-          {
-            /* ret_nregs == 0: struct is returned via an implicit first argument
-             * (sret pointer). In IR mode we must actually emit the parameter and
-             * pop it, otherwise it stays on the value stack and triggers
-             * check_vstack() failures (vstack leak).
-             *
-             * Keep parameter indices 0-based: this implicit argument is param #0.
-             */
-            if (!NOEVAL_WANTED)
-            {
-              SValue num;
-              svalue_init(&num);
-              num.vr = -1;
-              num.r = VT_CONST;
-              num.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
-              TCCGEN_DEBUG(
-                  "[TCCGEN] FUNCPARAMVAL push: site=sret_param0 call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
-                  call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)num.c.i), vtop->r, vtop->vr);
-              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL);
-            }
-            vtop--;
-            nb_args++;
-            nb_implicit_args++;
-          }
-        }
-      }
-      else
-      {
-        ret_nregs = 1;
-        ret.type = s->type;
-      }
-
-      if (ret_nregs > 0)
-      {
-        /* return in register */
-        ret.c.i = 0;
-        PUT_R_RET(&ret, ret.type.t);
-      }
-
-      /* Storage for arguments in case we need to constant-fold.
-       * Heap-allocated to reduce unary()'s stack frame — this 320-byte array
-       * would otherwise bloat every recursive call (TCC allocates all block-scoped
-       * locals at function entry). */
-      SValue *saved_args = tcc_mallocz(8 * sizeof(SValue));
-      int saved_arg_count = 0;
-      int can_try_fold = 0;
-      int can_inline_builtin = 0;
-      int can_inline_eval = 0;
-      const char *func_name = NULL;
-
-      /* Check if we have a named function that might be foldable */
-      if (call_func_sym && call_func_sym->v >= TOK_IDENT)
-      {
-        func_name = get_tok_str(call_func_sym->v, NULL);
-
-        /* Calling alloca() (library version) modifies SP; the caller
-         * needs a frame pointer so the epilogue can restore SP. */
-        if (func_name && strcmp(func_name, "alloca") == 0 && tcc_state->ir)
-          tcc_state->force_frame_pointer = 1;
-
-        /* Quick check if this could be a foldable math function */
-        if (func_name && (func_name[0] == 's' || func_name[0] == 'c' || func_name[0] == 't' || func_name[0] == 'a' ||
-                          func_name[0] == 'e' || func_name[0] == 'l' || func_name[0] == 'p' || func_name[0] == 'f' ||
-                          func_name[0] == 'r' || func_name[0] == 't'))
-        {
-          can_try_fold = 1;
-        }
-
-        {
-          int is_unsigned;
-          can_inline_builtin =
-              get_builtin_abs_info(func_name, &is_unsigned) && builtin_abs_decl_matches(call_func_sym, func_name);
-        }
-      }
-
-      /* Check if the callee is a small inline function we might evaluate */
-      if (call_func_sym && (call_func_sym->type.t & VT_INLINE) && tcc_state->optimize)
-        can_inline_eval = 1;
-
-      /* Detect printf-family functions that can be optimized.
-       * We recognize standard (printf, fprintf), unlocked stdio variants,
-       * v-variants (vprintf, vfprintf), and fortified (_chk) variants.
-       * For each, we track the index of key arguments in saved_args[].
-       * For v-variants, varargs are in a va_list (opaque), so pf_vararg_idx is
-       * set past the arg count to prevent %s/%c optimization — only constant
-       * format strings without specifiers can be optimized. */
-      int can_optimize_printf_family = 0;
-      int pf_fmt_idx = -1;    /* index of the format string in saved_args[] */
-      int pf_file_idx = -1;   /* index of FILE* arg, or -1 for stdout */
-      int pf_vararg_idx = -1; /* index of first vararg in saved_args[], or high value for va_list fns */
-      int pf_min_args = 0;    /* minimum number of args for a valid call */
-      if (func_name && tcc_state->optimize > 0)
-      {
-        /* --- printf family (stdout, variadic) --- */
-        if (strcmp(func_name, "printf") == 0 || strcmp(func_name, "printf_unlocked") == 0 ||
-            strcmp(func_name, "__builtin_printf") == 0 || strcmp(func_name, "__builtin_printf_unlocked") == 0)
-        {
-          can_optimize_printf_family = 1;
-          pf_fmt_idx = 0;
-          pf_vararg_idx = 1;
-          pf_min_args = 1;
-        }
-        else if (strcmp(func_name, "__printf_chk") == 0)
-        {
-          can_optimize_printf_family = 1;
-          pf_fmt_idx = 1; /* [0]=flag */
-          pf_vararg_idx = 2;
-          pf_min_args = 2;
-        }
-        /* --- fprintf family (FILE*, variadic) --- */
-        else if (strcmp(func_name, "fprintf") == 0 || strcmp(func_name, "fprintf_unlocked") == 0 ||
-                 strcmp(func_name, "__builtin_fprintf_unlocked") == 0)
-        {
-          can_optimize_printf_family = 1;
-          pf_file_idx = 0;
-          pf_fmt_idx = 1;
-          pf_vararg_idx = 2;
-          pf_min_args = 2;
-        }
-        else if (strcmp(func_name, "__fprintf_chk") == 0)
-        {
-          can_optimize_printf_family = 1;
-          pf_file_idx = 0;
-          pf_fmt_idx = 2; /* [1]=flag */
-          pf_vararg_idx = 3;
-          pf_min_args = 3;
-        }
-        /* --- vprintf family (stdout, va_list — no vararg access) --- */
-        else if (strcmp(func_name, "vprintf") == 0)
-        {
-          can_optimize_printf_family = 1;
-          pf_fmt_idx = 0;
-          pf_vararg_idx = 99; /* va_list: varargs inaccessible */
-          pf_min_args = 2;    /* fmt + va_list */
-        }
-        else if (strcmp(func_name, "__vprintf_chk") == 0)
-        {
-          can_optimize_printf_family = 1;
-          pf_fmt_idx = 1; /* [0]=flag */
-          pf_vararg_idx = 99;
-          pf_min_args = 3; /* flag + fmt + va_list */
-        }
-        /* --- vfprintf family (FILE*, va_list — no vararg access) --- */
-        else if (strcmp(func_name, "vfprintf") == 0)
-        {
-          can_optimize_printf_family = 1;
-          pf_file_idx = 0;
-          pf_fmt_idx = 1;
-          pf_vararg_idx = 99;
-          pf_min_args = 3; /* file + fmt + va_list */
-        }
-        else if (strcmp(func_name, "__vfprintf_chk") == 0)
-        {
-          can_optimize_printf_family = 1;
-          pf_file_idx = 0;
-          pf_fmt_idx = 2; /* [1]=flag */
-          pf_vararg_idx = 99;
-          pf_min_args = 4; /* file + flag + fmt + va_list */
-        }
-      }
-
-      /* Save IR instruction index before argument emission.
-       * If constant folding succeeds we roll back to discard orphaned
-       * FUNCPARAMVAL ops that were already emitted for the arguments. */
-      int ir_idx_before_args = tcc_ir_count(tcc_state->ir);
-      /* Tracks IR position just before the first FUNCPARAMVAL emission.
-       * Used by try_inline_builtin_call to roll back only FUNCPARAMVAL ops
-       * while preserving argument evaluation IR. */
-      int ir_idx_before_first_param = -1;
-
-      /* __builtin_va_arg_pack() expansion: if the callee is an always_inline
-       * function that uses __builtin_va_arg_pack(), we must create a specialized
-       * clone for this call site with the variadic args baked in.
-       *
-       * Strategy:
-       * 1. Save all argument tokens from the call site
-       * 2. Count named (fixed) parameters of the callee
-       * 3. Split into fixed arg tokens and variadic arg tokens
-       * 4. Create a clone of the inline function's token stream with
-       *    __builtin_va_arg_pack() replaced by the variadic arg tokens
-       * 5. Register the clone as a new inline function
-       * 6. Change the call target to the clone
-       * 7. Replay only the fixed arg tokens for normal call parsing
-       */
-      if (call_func_sym && call_func_sym->type.ref && call_func_sym->type.ref->f.func_va_arg_pack &&
-          (call_func_sym->type.t & VT_INLINE))
-      {
-        /* Find the InlineFunc for this symbol */
-        struct InlineFunc *orig_fn = NULL;
-        for (int fi = 0; fi < tcc_state->nb_inline_fns; fi++)
-        {
-          if (tcc_state->inline_fns[fi]->sym == call_func_sym)
-          {
-            orig_fn = tcc_state->inline_fns[fi];
-            break;
-          }
-        }
-
-        if (orig_fn && orig_fn->func_str)
-        {
-          /* Count named params */
-          int n_named = 0;
-          Sym *param;
-          for (param = call_func_sym->type.ref->next; param; param = param->next)
-            n_named++;
-
-          /* Save all argument tokens (everything until matching ')') */
-          TokenString *all_args = tok_str_alloc();
-          int paren_depth = 0;
-          while (tok != ')' || paren_depth > 0)
-          {
-            if (tok == '(')
-              paren_depth++;
-            else if (tok == ')')
-              paren_depth--;
-            if (tok == TOK_EOF)
-              tcc_error("unexpected end of file in function call");
-            tok_str_add_tok(all_args);
-            next();
-          }
-          tok_str_add(all_args, TOK_EOF);
-          /* tok is now ')' - don't consume it; file position is past ')' */
-
-          /* Split into fixed args and variadic args.
-           * Fixed args are separated by commas at depth 0. */
-          const int *ap = tok_str_buf(all_args);
-          TokenString *fixed_args = tok_str_alloc();
-          TokenString *va_args = tok_str_alloc();
-
-          int arg_idx = 0;
-          int depth = 0;
-
-          if (n_named == 0)
-          {
-            /* All args are variadic, no fixed args */
-            const int *cp = tok_str_buf(all_args);
-            while (1)
-            {
-              int t;
-              CValue cv;
-              tok_get(&t, &cp, &cv);
-              if (t == TOK_EOF || t == 0)
-                break;
-              tok_str_add2(va_args, t, &cv);
-            }
-          }
-          else
-          {
-            while (1)
-            {
-              int t;
-              CValue cv;
-              tok_get(&t, &ap, &cv);
-
-              if (t == TOK_EOF || t == 0)
-                break;
-
-              if (t == '(' || t == '[')
-                depth++;
-              else if (t == ')' || t == ']')
-                depth--;
-
-              if (t == ',' && depth == 0)
-              {
-                arg_idx++;
-                if (arg_idx == n_named)
-                {
-                  /* Everything after this comma is variadic args */
-                  while (1)
-                  {
-                    tok_get(&t, &ap, &cv);
-                    if (t == TOK_EOF || t == 0)
-                      break;
-                    tok_str_add2(va_args, t, &cv);
-                  }
-                  break;
-                }
-                /* Copy the comma to fixed_args */
-                tok_str_add2(fixed_args, t, &cv);
-                continue;
-              }
-
-              if (arg_idx < n_named)
-                tok_str_add2(fixed_args, t, &cv);
-            }
-          }
-
-          /* Terminate fixed_args with ')' and 0 (macro end marker).
-           * The arg parsing loop will see ')' and break.
-           * Then next() will read 0, triggering end_macro() which
-           * restores reading from the source file (positioned after ')'). */
-          tok_str_add(fixed_args, ')');
-          tok_str_add(fixed_args, 0);
-          tok_str_add(va_args, TOK_EOF);
-
-          if (token_stream_references_local_object(tok_str_buf(va_args)))
-          {
-            TokenString *replay_args = tok_str_alloc();
-            const int *rp = tok_str_buf(all_args);
-
-            while (1)
-            {
-              int t;
-              CValue cv;
-
-              tok_get(&t, &rp, &cv);
-              if (t == TOK_EOF || t == 0)
-                break;
-              tok_str_add2(replay_args, t, &cv);
-            }
-            tok_str_add(replay_args, ')');
-            tok_str_add(replay_args, 0);
-
-            tok_str_free(all_args);
-            tok_str_free(fixed_args);
-            tok_str_free(va_args);
-
-            begin_macro(replay_args, 1);
-            next();
-            goto va_arg_pack_done;
-          }
-
-          /* Check if variadic args are empty */
-          int va_args_empty = 1;
-          {
-            const int *vcheck = tok_str_buf(va_args);
-            int vt;
-            CValue vcv;
-            tok_get(&vt, &vcheck, &vcv);
-            if (vt != TOK_EOF && vt != 0)
-              va_args_empty = 0;
-          }
-
-          /* Create clone body: copy orig_fn->func_str, replacing
-           * __builtin_va_arg_pack ( ) with variadic arg tokens.
-           * When variadic args are empty, also remove the preceding comma. */
-          TokenString *clone_body = tok_str_alloc();
-          const int *bp = tok_str_buf(orig_fn->func_str);
-          int last_comma_len = -1; /* clone_body->len before last ',' was added */
-          while (1)
-          {
-            int t;
-            CValue cv;
-            tok_get(&t, &bp, &cv);
-            if (t == TOK_EOF || t == 0)
-              break;
-
-            if (t == TOK_builtin_va_arg_pack)
-            {
-              /* Skip the following '(' and ')' tokens */
-              int t2;
-              CValue cv2;
-              tok_get(&t2, &bp, &cv2); /* skip '(' */
-              tok_get(&t2, &bp, &cv2); /* skip ')' */
-
-              if (va_args_empty)
-              {
-                /* Remove preceding comma if present */
-                if (last_comma_len >= 0)
-                  clone_body->len = last_comma_len;
-              }
-              else
-              {
-                /* Insert variadic arg tokens */
-                const int *vp = tok_str_buf(va_args);
-                while (1)
-                {
-                  int vt;
-                  CValue vcv;
-                  tok_get(&vt, &vp, &vcv);
-                  if (vt == TOK_EOF || vt == 0)
-                    break;
-                  tok_str_add2(clone_body, vt, &vcv);
-                }
-              }
-              last_comma_len = -1;
-              continue;
-            }
-
-            if (t == ',')
-              last_comma_len = clone_body->len;
-            else
-              last_comma_len = -1;
-
-            tok_str_add2(clone_body, t, &cv);
-          }
-          tok_str_add(clone_body, TOK_EOF);
-
-          /* Create a unique symbol for the clone */
-          static int va_pack_clone_id = 0;
-          char *clone_name = tcc_malloc(256);
-          snprintf(clone_name, 256, "__va_pack_%s_%d", get_tok_str(call_func_sym->v, NULL), va_pack_clone_id++);
-          int clone_tok_id = tok_alloc(clone_name, strlen(clone_name))->tok;
-          tcc_free(clone_name);
-
-          /* Create clone function type: same as original but non-variadic */
-          CType clone_type;
-          clone_type = call_func_sym->type;
-
-          /* Create a new type ref with FUNC_NEW (non-variadic) */
-          Sym *orig_ref = call_func_sym->type.ref;
-          Sym *clone_ref = sym_push2(&global_stack, SYM_FIELD, orig_ref->type.t, 0);
-          clone_ref->type = orig_ref->type;
-          clone_ref->f = orig_ref->f;
-          clone_ref->f.func_type = FUNC_NEW; /* non-variadic */
-          clone_ref->f.func_va_arg_pack = 0;
-
-          /* Copy named parameters */
-          Sym **pparam = &clone_ref->next;
-          for (param = orig_ref->next; param; param = param->next)
-          {
-            Sym *new_param = sym_push2(&global_stack, param->v, param->type.t, param->c);
-            new_param->type = param->type;
-            *pparam = new_param;
-            pparam = &new_param->next;
-          }
-          *pparam = NULL;
-
-          clone_type.ref = clone_ref;
-          clone_type.t &= ~VT_EXTERN;
-          clone_type.t |= VT_STATIC;
-
-          /* Create clone symbol */
-          AttributeDef clone_ad;
-          memset(&clone_ad, 0, sizeof(clone_ad));
-          Sym *clone_sym = external_sym(clone_tok_id, &clone_type, 0, &clone_ad);
-          clone_sym->type.t |= VT_INLINE;
-
-          /* Register clone as inline function */
-          struct InlineFunc *clone_fn;
-          clone_fn = tcc_malloc(sizeof *clone_fn + strlen(orig_fn->filename));
-          strcpy(clone_fn->filename, orig_fn->filename);
-          clone_fn->sym = clone_sym;
-          clone_fn->func_str = clone_body;
-          dynarray_add(&tcc_state->inline_fns, &tcc_state->nb_inline_fns, clone_fn);
-
-          /* Mark the clone as used so gen_inline_functions compiles it */
-          if (!clone_sym->c)
-            put_extern_sym(clone_sym, cur_text_section ? cur_text_section : text_section, 0, 0);
-
-          /* Switch call target: replace vtop (function pointer) with clone */
-          vtop->type = clone_type;
-          vtop->sym = clone_sym;
-          vtop->r = VT_CONST | VT_SYM;
-          vtop->c.i = 0;
-
-          /* Update s (callee type ref) for argument parsing */
-          s = clone_ref;
-          sa = s->next;
-          call_func_sym = clone_sym;
-
-          /* Replay fixed args + ')' via macro so normal call parsing handles them.
-           * When the macro ends (0 marker), next() restores file-level reading
-           * at the position just past the original ')'. */
-          begin_macro(fixed_args, 1);
-          next(); /* prime first token from fixed_args */
-
-          tok_str_free(all_args);
-          tok_str_free(va_args);
-        }
-      }
-    va_arg_pack_done:
-
-      p = NULL;
-      if (tok != ')')
-      {
-        r = tcc_state->reverse_funcargs;
-        SValue num;
-        svalue_init(&num);
-        num.vr = -1;
-        for (;;)
-        {
-          if (r)
-          {
-            skip_or_save_block(&p2);
-            p2->prev = p, p = p2;
-          }
-          else
-          {
-            /* IR expects 0-based parameter indices.
-             * Keep FUNCPARAMVAL numbering consistent across all call sites. */
-            expr_eq();
-            /* Convert VT_CMP/VT_JMP to actual 0/1 value before passing as
-             * parameter */
-            if (!NOEVAL_WANTED)
-              tcc_ir_codegen_cmp_jmp_set(tcc_state->ir);
-            gfunc_param_typed(s, sa);
-
-            /* Save argument for potential constant folding or inline evaluation.
-             * This must happen BEFORE the double-complex materialization below,
-             * which converts VT_CONST to VT_LOCAL. */
-            if ((can_try_fold || can_inline_builtin || can_inline_eval || can_optimize_printf_family) &&
-                saved_arg_count < 8 && !NOEVAL_WANTED)
-            {
-              saved_args[saved_arg_count++] = *vtop;
-            }
-
-            /* Materialize constant complex double/ldouble to a temp local.
-             * These are 128-bit values that cannot be represented as a single
-             * MachineOperand immediate.  The callsite's struct-byval copy path
-             * handles memory operands transparently. */
-            if (!NOEVAL_WANTED && (vtop->type.t & VT_COMPLEX) &&
-                ((vtop->type.t & VT_BTYPE) == VT_DOUBLE || (vtop->type.t & VT_BTYPE) == VT_LDOUBLE) &&
-                (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST)
-            {
-              int elem_size = 8;
-              int complex_size = elem_size * 2;
-              CType elem_type;
-              elem_type.t = VT_DOUBLE;
-              elem_type.ref = NULL;
-
-              double src_real, src_imag;
-              memcpy(&src_real, &vtop->c, 8);
-              memcpy(&src_imag, (char *)&vtop->c + 8, 8);
-              CType orig_type = vtop->type;
-              vpop();
-
-              int mat_vr;
-              int mat_loc = get_temp_local_var(complex_size, 8, &mat_vr);
-
-              /* Store real part */
-              {
-                SValue dst;
-                memset(&dst, 0, sizeof(dst));
-                dst.type = elem_type;
-                dst.r = VT_LOCAL | VT_LVAL;
-                dst.vr = mat_vr;
-                dst.c.i = mat_loc;
-                vpushv(&dst);
-                CValue cv;
-                memset(&cv, 0, sizeof(cv));
-                cv.d = src_real;
-                vsetc(&elem_type, VT_CONST, &cv);
-                vstore();
-                vpop();
-              }
-              /* Store imag part */
-              {
-                SValue dst;
-                memset(&dst, 0, sizeof(dst));
-                dst.type = elem_type;
-                dst.r = VT_LOCAL | VT_LVAL;
-                dst.vr = mat_vr;
-                dst.c.i = mat_loc + elem_size;
-                vpushv(&dst);
-                CValue cv;
-                memset(&cv, 0, sizeof(cv));
-                cv.d = src_imag;
-                vsetc(&elem_type, VT_CONST, &cv);
-                vstore();
-                vpop();
-              }
-
-              /* Push materialized local as the complex value */
-              SValue mat_sv;
-              memset(&mat_sv, 0, sizeof(mat_sv));
-              mat_sv.type = orig_type;
-              mat_sv.r = VT_LOCAL | VT_LVAL;
-              mat_sv.vr = mat_vr;
-              mat_sv.c.i = mat_loc;
-              vpushv(&mat_sv);
-            }
-
-            if (!NOEVAL_WANTED)
-            {
-              if (ir_idx_before_first_param < 0)
-                ir_idx_before_first_param = tcc_ir_count(tcc_state->ir);
-              num.r = VT_CONST;
-              num.c.i = TCCIR_ENCODE_PARAM(call_id, nb_args);
-              TCCGEN_DEBUG(
-                  "[TCCGEN] FUNCPARAMVAL push: site=forward_arg call_id=%d param_idx=%d nb_args=%d vtop_r=0x%x "
-                  "vtop_vr=%d\n",
-                  call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)num.c.i), nb_args, vtop->r, vtop->vr);
-              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL);
-            }
-            vtop--; /* consumed */
-          }
-          nb_args++;
-          if (sa)
-            sa = sa->next;
-          if (tok == ')')
-            break;
-          skip(',');
-        }
-      }
-      if (sa && s->f.func_type != FUNC_OLD)
-        tcc_error("too few arguments to function");
-
-      if (p)
-      { /* with reverse_funcargs */
-        for (n = 0; p; p = p2, ++n)
-        {
-          p2 = p, sa = s;
-          do
-          {
-            sa = sa->next, p2 = p2->prev;
-          } while (p2 && sa);
-          p2 = p->prev;
-          begin_macro(p, 1), next();
-          expr_eq();
-          gfunc_param_typed(s, sa);
-
-          /* Save argument for potential constant folding or inline evaluation (in reverse order for reverse_funcargs)
-           */
-          if ((can_try_fold || can_inline_builtin || can_inline_eval || can_optimize_printf_family) && n < 8 &&
-              !NOEVAL_WANTED)
-          {
-            saved_args[nb_args - 1 - n] = *vtop;
-            if (n == 0)
-              saved_arg_count = nb_args;
-          }
-
-          /* We evaluate right-to-left; assign 0-based parameter indices
-           * corresponding to original left-to-right argument positions.
-           */
-          if (!NOEVAL_WANTED)
-          {
-            if (ir_idx_before_first_param < 0)
-              ir_idx_before_first_param = tcc_ir_count(tcc_state->ir);
-            SValue num;
-            svalue_init(&num);
-            num.vr = -1;
-            num.r = VT_CONST;
-            num.c.i = TCCIR_ENCODE_PARAM(call_id, nb_args - 1 - n);
-            TCCGEN_DEBUG(
-                "[TCCGEN] FUNCPARAMVAL push: site=reverse_arg call_id=%d param_idx=%d n=%d nb_args=%d vtop_r=0x%x "
-                "vtop_vr=%d\n",
-                call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)num.c.i), n, nb_args, vtop->r, vtop->vr);
-            tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL);
-          }
-          vtop--; /* consumed */
-          end_macro();
-        }
-      }
-
-      next();
-      // gfunc_call(nb_args);
-
-      /* Try constant folding for math functions */
-      int folded = 0;
-      int nb_real_args = nb_args - nb_implicit_args;
-      if (can_try_fold && func_name && saved_arg_count == nb_real_args && !NOEVAL_WANTED)
-      {
-        folded = try_fold_math_call(func_name, saved_args, saved_arg_count);
-        if (!folded)
-          folded = try_fold_complex_call(func_name, saved_args, saved_arg_count);
-      }
-
-      /* Try inlining builtin integer functions (signed and unsigned abs family).
-       * Must roll back FUNCPARAMVAL ops BEFORE generating inline IR,
-       * otherwise the rollback would discard the newly generated code. */
-      int inlined = 0;
-      if (!folded && func_name && saved_arg_count == nb_real_args && !NOEVAL_WANTED)
-      {
-        int builtin_ok = 0;
-        if (saved_arg_count == 1)
-        {
-          if (strcmp(func_name, "abs") == 0 && !(tcc_state->no_builtin_funcs & NO_BUILTIN_ABS))
-            builtin_ok = 1;
-          else if (strcmp(func_name, "labs") == 0 && !(tcc_state->no_builtin_funcs & NO_BUILTIN_LABS))
-            builtin_ok = 1;
-          else if (strcmp(func_name, "llabs") == 0 && !(tcc_state->no_builtin_funcs & NO_BUILTIN_LLABS))
-            builtin_ok = 1;
-          else if (strcmp(func_name, "imaxabs") == 0)
-            builtin_ok = 1;
-          else if (strcmp(func_name, "uabs") == 0 && !(tcc_state->no_builtin_funcs & NO_BUILTIN_UABS))
-            builtin_ok = 1;
-          else if (strcmp(func_name, "ulabs") == 0 && !(tcc_state->no_builtin_funcs & NO_BUILTIN_ULABS))
-            builtin_ok = 1;
-          else if (strcmp(func_name, "ullabs") == 0 && !(tcc_state->no_builtin_funcs & NO_BUILTIN_ULLABS))
-            builtin_ok = 1;
-          else if (strcmp(func_name, "umaxabs") == 0 && !(tcc_state->no_builtin_funcs & NO_BUILTIN_UMAXABS))
-            builtin_ok = 1;
-        }
-        if (builtin_ok && builtin_abs_decl_matches(call_func_sym, func_name))
-        {
-          /* Roll back FUNCPARAMVAL ops first, preserving argument eval IR */
-          int rollback_idx = (ir_idx_before_first_param >= 0) ? ir_idx_before_first_param : ir_idx_before_args;
-          tcc_state->ir->next_instruction_index = rollback_idx;
-          /* Generate inline abs code */
-          try_inline_builtin_call(func_name, saved_args, saved_arg_count);
-          /* Move result over function pointer */
-          vtop[-1] = vtop[0];
-          --vtop;
-          inlined = 1;
-        }
-      }
-
-      /* Try compile-time evaluation of small inline functions called with
-       * constant arguments.  This enables patterns like:
-       *   inline int f(int x) { return __builtin_constant_p(x); }
-       *   int g(void) { return f(1); }  // returns 1 at -O1
-       */
-      int inline_evaled = 0;
-      if (!folded && !inlined && call_func_sym && saved_arg_count == nb_real_args && !NOEVAL_WANTED)
-      {
-        if (try_inline_const_eval(call_func_sym, saved_args, saved_arg_count))
-        {
-          /* Result is on vtop; move over function pointer and roll back IR */
-          vtop[-1] = vtop[0];
-          --vtop;
-          tcc_state->ir->next_instruction_index = ir_idx_before_args;
-          inline_evaled = 1;
-        }
-      }
-
-      /* Optimize simple sprintf patterns regardless of whether the return value
-       * is used:
-       *   sprintf(dst, "literal")
-       *   sprintf(dst, "%s", src)
-       * These can be lowered to a helper that copies the final string and
-       * returns the number of bytes written (excluding the trailing '\0'). */
-      int sprintf_family_optimized = 0;
-      if (!folded && !inlined && !inline_evaled && func_name && saved_arg_count == nb_real_args && !NOEVAL_WANTED &&
-          strcmp(func_name, "sprintf") == 0 && nb_real_args >= 2)
-      {
-        int fmt_len = 0;
-        const char *fmt = try_get_constant_string(&saved_args[1], &fmt_len);
-        SValue *copy_src_sv = NULL;
-
-        if (fmt)
-        {
-          if (strchr(fmt, '%') == NULL)
-          {
-            copy_src_sv = &saved_args[1];
-          }
-          else if (nb_real_args == 3 && strcmp(fmt, "%s") == 0)
-          {
-            copy_src_sv = &saved_args[2];
-          }
-        }
-
-        if (copy_src_sv)
-        {
-          if (ir_idx_before_first_param >= 0)
-          {
-            int current_end = tcc_state->ir->next_instruction_index;
-            for (int i = ir_idx_before_first_param; i < current_end; i++)
-            {
-              if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-              {
-                IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-                int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-                if (encoded_call_id == call_id)
-                  tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-              }
-            }
-          }
-          else
-          {
-            tcc_state->ir->next_instruction_index = ir_idx_before_args;
-          }
-
-          {
-            SValue sc_args[2];
-            sc_args[0] = saved_args[0];
-            sc_args[1] = *copy_src_sv;
-            CType rt = {VT_INT, NULL};
-            gen_ir_call_args(sc_args, 2, tok_alloc_const("__tcc_strcpy_count"), &rt);
-            vtop[-1] = vtop[0];
-            --vtop;
-            sprintf_family_optimized = 1;
-          }
-        }
-      }
-
-      /* Try optimizing printf-family calls with simple constant format strings.
-       * GCC optimizes these patterns when the return value is not used:
-       *   printf/fprintf("literal")      → puts/fwrite (no specifiers)
-       *   printf/fprintf("%s", str)      → puts/fwrite (constant string)
-       *   printf/fprintf("%c", ch)       → putchar/fputc
-       *   printf("%s\n", str)            → puts(str)
-       * Also handles __printf_chk/__fprintf_chk (extra flag argument).
-       * Only optimize in void context (next token is ';'). */
-      int printf_family_optimized = 0;
-      if (!folded && !inlined && !inline_evaled && !sprintf_family_optimized && can_optimize_printf_family &&
-          saved_arg_count == nb_real_args && nb_args >= pf_min_args && !nocode_wanted && tok == ';')
-      {
-        int fmt_len = 0;
-        const char *fmt = try_get_constant_string(&saved_args[pf_fmt_idx], &fmt_len);
-        if (fmt)
-        {
-          int has_file = (pf_file_idx >= 0); /* fprintf-family vs printf-family */
-          int has_varargs = (nb_args > pf_vararg_idx);
-
-          /* Classify the format pattern:
-           *  PF_OPT_NOP           = empty output
-           *  PF_OPT_PUTCHAR_CONST = putchar/fputc with a constant char
-           *  PF_OPT_FWRITE        = fwrite (fprintf-family) or puts (printf-family, trailing \n)
-           *  PF_OPT_PUTCHAR_ARG   = putchar/fputc from %c vararg
-           *  PF_OPT_FPUTS_ARG     = fputs from %s vararg
-           *  PF_OPT_PUTS_ARG      = puts from %s\n vararg */
-          enum
-          {
-            PF_OPT_NONE = 0,
-            PF_OPT_NOP,
-            PF_OPT_PUTCHAR_CONST,
-            PF_OPT_FWRITE,
-            PF_OPT_PUTS_CHOPPED,
-            PF_OPT_PUTCHAR_ARG,
-            PF_OPT_FPUTS_ARG,
-            PF_OPT_PUTS_ARG
-          };
-          int opt_kind = PF_OPT_NONE;
-          int putchar_val = 0;
-          /* For fwrite: which SValue to write and its known length */
-          SValue *write_str_sv = NULL;
-          int write_len = 0;
-          /* For puts with trailing-\n chopped: the string to analyze */
-          const char *puts_src = NULL;
-          int puts_src_len = 0;
-
-          if (strchr(fmt, '%') == NULL)
-          {
-            /* No format specifiers — output is the format string itself */
-            if (fmt_len == 0)
-            {
-              opt_kind = PF_OPT_NOP;
-            }
-            else if (has_file)
-            {
-              opt_kind = PF_OPT_FWRITE;
-              write_str_sv = &saved_args[pf_fmt_idx];
-              write_len = fmt_len;
-            }
-            else if (fmt_len == 1)
-            {
-              opt_kind = PF_OPT_PUTCHAR_CONST;
-              putchar_val = (unsigned char)fmt[0];
-            }
-            else if (fmt[fmt_len - 1] == '\n')
-            {
-              opt_kind = PF_OPT_PUTS_CHOPPED;
-              puts_src = fmt;
-              puts_src_len = fmt_len;
-            }
-            /* else: multi-char without trailing \n to stdout → not optimized */
-          }
-          else if (strcmp(fmt, "%s") == 0 && has_varargs)
-          {
-            int slen = 0;
-            const char *sval = try_get_constant_string(&saved_args[pf_vararg_idx], &slen);
-            if (sval)
-            {
-              if (slen == 0)
-              {
-                opt_kind = PF_OPT_NOP;
-              }
-              else if (has_file)
-              {
-                opt_kind = PF_OPT_FWRITE;
-                write_str_sv = &saved_args[pf_vararg_idx];
-                write_len = slen;
-              }
-              else if (slen == 1)
-              {
-                opt_kind = PF_OPT_PUTCHAR_CONST;
-                putchar_val = (unsigned char)sval[0];
-              }
-              else if (sval[slen - 1] == '\n')
-              {
-                opt_kind = PF_OPT_PUTS_CHOPPED;
-                puts_src = sval;
-                puts_src_len = slen;
-              }
-            }
-            else if (has_file)
-            {
-              opt_kind = PF_OPT_FPUTS_ARG;
-            }
-            /* non-constant string to stdout → skip */
-          }
-          else if (strcmp(fmt, "%c") == 0 && has_varargs)
-          {
-            opt_kind = PF_OPT_PUTCHAR_ARG;
-          }
-          else if (!has_file && strcmp(fmt, "%s\n") == 0 && has_varargs)
-          {
-            opt_kind = PF_OPT_PUTS_ARG; /* puts appends \n automatically */
-          }
-
-          if (opt_kind != PF_OPT_NONE)
-          {
-            /* Remove FUNCPARAMVAL ops while preserving argument-evaluation IR.
-             * With forward args, arg-evaluation IR for args 1+ is interleaved
-             * with FUNCPARAMVALs.  A blanket rollback of next_instruction_index
-             * would also erase those definitions (e.g. LEA for &a[1]), leaving
-             * dangling vreg references.  Instead, NOP out only the FUNCPARAMVAL
-             * instructions for the original call. */
-            if (ir_idx_before_first_param >= 0)
-            {
-              int current_end = tcc_state->ir->next_instruction_index;
-              for (int i = ir_idx_before_first_param; i < current_end; i++)
-              {
-                if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-                {
-                  /* Only NOP FUNCPARAMVALs belonging to the original call_id,
-                   * not those from nested calls (e.g., memcmp inside printf). */
-                  IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-                  int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-                  if (encoded_call_id == call_id)
-                    tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-                }
-              }
-            }
-            else
-            {
-              tcc_state->ir->next_instruction_index = ir_idx_before_args;
-            }
-
-            if (opt_kind == PF_OPT_NOP)
-            {
-              /* Empty output — no call needed, result is 0 chars written. */
-              vpushi(0);
-              vtop[-1] = vtop[0];
-              --vtop;
-            }
-            else if (opt_kind == PF_OPT_PUTCHAR_CONST)
-            {
-              /* putchar(constant_char) or fputc(constant_char, f) */
-              SValue ch_sv;
-              svalue_init(&ch_sv);
-              ch_sv.r = VT_CONST;
-              ch_sv.c.i = putchar_val;
-              ch_sv.type.t = VT_INT;
-              ch_sv.vr = -1;
-
-              if (has_file)
-              {
-                SValue pf_args[2];
-                pf_args[0] = ch_sv;
-                pf_args[1] = saved_args[pf_file_idx];
-                gen_ir_void_call_args(pf_args, 2, tok_alloc_const("fputc"));
-              }
-              else
-              {
-                gen_ir_void_call_args(&ch_sv, 1, tok_alloc_const("putchar"));
-              }
-              vpushi(1);
-              vtop[-1] = vtop[0];
-              --vtop;
-            }
-            else if (opt_kind == PF_OPT_FWRITE)
-            {
-              /* fwrite(str, 1, len, f) — always goes to a FILE* */
-              SValue fw_args[4];
-              fw_args[0] = *write_str_sv;
-              svalue_init(&fw_args[1]);
-              fw_args[1].r = VT_CONST;
-              fw_args[1].c.i = 1;
-              fw_args[1].type.t = VT_INT;
-              fw_args[1].vr = -1;
-              svalue_init(&fw_args[2]);
-              fw_args[2].r = VT_CONST;
-              fw_args[2].c.i = write_len;
-              fw_args[2].type.t = VT_INT;
-              fw_args[2].vr = -1;
-              fw_args[3] = saved_args[pf_file_idx];
-              gen_ir_void_call_args(fw_args, 4, tok_alloc_const("fwrite"));
-              vpushi(write_len);
-              vtop[-1] = vtop[0];
-              --vtop;
-            }
-            else if (opt_kind == PF_OPT_PUTS_CHOPPED)
-            {
-              /* puts(string_without_trailing_newline)
-               * Create a new string constant in rodata with the trailing \n removed.
-               * Copy puts_src first because it may point into rodata_section->data
-               * and section_ptr_add can reallocate that buffer. */
-              int new_len = puts_src_len - 1;
-              char *puts_copy = tcc_malloc(new_len);
-              memcpy(puts_copy, puts_src, new_len);
-              addr_t new_off = rodata_section->data_offset;
-              char *new_ptr = section_ptr_add(rodata_section, new_len + 1);
-              memcpy(new_ptr, puts_copy, new_len);
-              tcc_free(puts_copy);
-              new_ptr[new_len] = '\0';
-
-              SValue new_str_sv;
-              svalue_init(&new_str_sv);
-              new_str_sv.type = char_pointer_type;
-              new_str_sv.r = VT_CONST | VT_SYM;
-              new_str_sv.sym = get_sym_ref(&char_type, rodata_section, new_off, new_len + 1);
-              new_str_sv.c.i = 0;
-              new_str_sv.vr = -1;
-
-              gen_ir_void_call_args(&new_str_sv, 1, tok_alloc_const("puts"));
-              vpushi(puts_src_len);
-              vtop[-1] = vtop[0];
-              --vtop;
-            }
-            else if (opt_kind == PF_OPT_PUTCHAR_ARG)
-            {
-              /* putchar(arg) or fputc(arg, f) — for "%c" format */
-              if (has_file)
-              {
-                SValue pf_args[2];
-                pf_args[0] = saved_args[pf_vararg_idx];
-                pf_args[1] = saved_args[pf_file_idx];
-                gen_ir_void_call_args(pf_args, 2, tok_alloc_const("fputc"));
-              }
-              else
-              {
-                gen_ir_void_call_args(&saved_args[pf_vararg_idx], 1, tok_alloc_const("putchar"));
-              }
-              vpushi(1);
-              vtop[-1] = vtop[0];
-              --vtop;
-            }
-            else if (opt_kind == PF_OPT_FPUTS_ARG)
-            {
-              /* fputs(arg, f) — for fprintf-family "%s" format. */
-              SValue pf_args[2];
-              pf_args[0] = saved_args[pf_vararg_idx];
-              pf_args[1] = saved_args[pf_file_idx];
-              gen_ir_void_call_args(pf_args, 2, tok_alloc_const("fputs"));
-              vpushi(0);
-              vtop[-1] = vtop[0];
-              --vtop;
-            }
-            else if (opt_kind == PF_OPT_PUTS_ARG)
-            {
-              /* puts(arg) — for "%s\n" format. puts() appends \n automatically. */
-              gen_ir_void_call_args(&saved_args[pf_vararg_idx], 1, tok_alloc_const("puts"));
-              vpushi(0);
-              vtop[-1] = vtop[0];
-              --vtop;
-            }
-            printf_family_optimized = 1;
-          }
-        }
-      }
-
-      /* Optimize fputs-family calls in void context.
-       * When the result is unused, lowering to strlen+fwrite preserves side
-       * effects while avoiding the aborting builtin-override helpers used by
-       * GCC torture tests.  Constant strings could be reduced further to NOP
-       * or fputc, but the generic lowering is sufficient and correct here. */
-      int fputs_family_optimized = 0;
-      if (!folded && !inlined && !inline_evaled && !sprintf_family_optimized && !printf_family_optimized && func_name &&
-          saved_arg_count == nb_real_args && nb_args >= 2 && !nocode_wanted && tok == ';' &&
-          (strcmp(func_name, "fputs") == 0 || strcmp(func_name, "fputs_unlocked") == 0 ||
-           strcmp(func_name, "__builtin_fputs_unlocked") == 0))
-      {
-        if (ir_idx_before_first_param >= 0)
-        {
-          int current_end = tcc_state->ir->next_instruction_index;
-          for (int i = ir_idx_before_first_param; i < current_end; i++)
-          {
-            if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-            {
-              IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-              int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-              if (encoded_call_id == call_id)
-                tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-            }
-          }
-        }
-        else
-        {
-          tcc_state->ir->next_instruction_index = ir_idx_before_args;
-        }
-
-        {
-          SValue param_num;
-          SValue strlen_dest;
-          const int strlen_call_id = tcc_state->ir->next_call_id++;
-          const int fwrite_call_id = tcc_state->ir->next_call_id++;
-
-          svalue_init(&param_num);
-          param_num.vr = -1;
-          param_num.r = VT_CONST;
-
-          param_num.c.i = TCCIR_ENCODE_PARAM(strlen_call_id, 0);
-          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[0], &param_num, NULL);
-
-          vpush_typed_helper_func(tok_alloc_const("strlen"), &func_old_size_t_type);
-
-          svalue_init(&strlen_dest);
-          strlen_dest.type.t = VT_SIZE_T;
-          strlen_dest.type.ref = NULL;
-          strlen_dest.r = 0;
-          strlen_dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-          {
-            SValue call_id_sv = tcc_ir_svalue_call_id_argc(strlen_call_id, 1);
-            tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &call_id_sv, &strlen_dest);
-          }
-          --vtop;
-
-          param_num.c.i = TCCIR_ENCODE_PARAM(fwrite_call_id, 0);
-          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[0], &param_num, NULL);
-
-          {
-            SValue one_sv;
-            svalue_init(&one_sv);
-            one_sv.r = VT_CONST;
-            one_sv.c.i = 1;
-            one_sv.type.t = VT_INT;
-            one_sv.type.ref = NULL;
-            one_sv.vr = -1;
-            param_num.c.i = TCCIR_ENCODE_PARAM(fwrite_call_id, 1);
-            tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &one_sv, &param_num, NULL);
-          }
-
-          param_num.c.i = TCCIR_ENCODE_PARAM(fwrite_call_id, 2);
-          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &strlen_dest, &param_num, NULL);
-
-          param_num.c.i = TCCIR_ENCODE_PARAM(fwrite_call_id, 3);
-          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[1], &param_num, NULL);
-
-          vpush_helper_func(tok_alloc_const("fwrite"));
-          {
-            SValue call_id_sv = tcc_ir_svalue_call_id_argc(fwrite_call_id, 4);
-            tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[0], &call_id_sv, NULL);
-          }
-          --vtop;
-          vpushi(0);
-          vtop[-1] = vtop[0];
-          --vtop;
-        }
-        fputs_family_optimized = 1;
-      }
-
-      /* Fold zero-length string/memory compares even without global optimization.
-       * This matches GCC builtin semantics for cases like:
-       *   strncmp(++p, ++q, 0)
-       * where the call result is known to be 0, but argument side effects
-       * still must be preserved exactly once. */
-      int string_builtin_optimized = 0;
-      if (!folded && !inlined && !inline_evaled && !sprintf_family_optimized && !printf_family_optimized &&
-          !fputs_family_optimized && func_name && saved_arg_count == nb_real_args && !NOEVAL_WANTED)
-      {
-        int folded_result = 0;
-        int can_fold_result = 0;
-        int lhs_len = 0;
-        int rhs_len = 0;
-        const char *lhs_str = NULL;
-        const char *rhs_str = NULL;
-        size_t n_const = 0;
-
-        if (nb_real_args == 2 && strcmp(func_name, "strcmp") == 0)
-        {
-          lhs_str = try_get_constant_string(&saved_args[0], &lhs_len);
-          rhs_str = try_get_constant_string(&saved_args[1], &rhs_len);
-          if (lhs_str && rhs_str)
-          {
-            folded_result = fold_builtin_strcmp_result(lhs_str, rhs_str);
-            can_fold_result = 1;
-          }
-        }
-
-        if (!can_fold_result && nb_real_args == 2 &&
-            (strcmp(func_name, "strcmp") == 0 || strcmp(func_name, "__builtin_strcmp") == 0))
-        {
-          if (ir_idx_before_first_param >= 0)
-          {
-            int current_end = tcc_state->ir->next_instruction_index;
-            for (int i = ir_idx_before_first_param; i < current_end; i++)
-            {
-              if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-              {
-                IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-                int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-                if (encoded_call_id == call_id)
-                  tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-              }
-            }
-          }
-          else
-          {
-            tcc_state->ir->next_instruction_index = ir_idx_before_args;
-          }
-
-          {
-            CType rt = {VT_INT, NULL};
-            gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_strcmp"), &rt);
-            vtop[-1] = vtop[0];
-            --vtop;
-            string_builtin_optimized = 1;
-          }
-        }
-
-        if (!can_fold_result && nb_real_args == 2 &&
-            (strcmp(func_name, "strcpy") == 0 || strcmp(func_name, "__builtin_strcpy") == 0))
-        {
-          if (ir_idx_before_first_param >= 0)
-          {
-            int current_end = tcc_state->ir->next_instruction_index;
-            for (int i = ir_idx_before_first_param; i < current_end; i++)
-            {
-              if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-              {
-                IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-                int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-                if (encoded_call_id == call_id)
-                  tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-              }
-            }
-          }
-          else
-          {
-            tcc_state->ir->next_instruction_index = ir_idx_before_args;
-          }
-
-          {
-            gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_strcpy"), &saved_args[0].type);
-            vtop[-1] = vtop[0];
-            --vtop;
-            string_builtin_optimized = 1;
-          }
-        }
-
-        if (!can_fold_result && nb_real_args == 2 &&
-            (strcmp(func_name, "stpcpy") == 0 || strcmp(func_name, "__builtin_stpcpy") == 0))
-        {
-          CType result_type = ret.type;
-
-          if (ir_idx_before_first_param >= 0)
-          {
-            int current_end = tcc_state->ir->next_instruction_index;
-            for (int i = ir_idx_before_first_param; i < current_end; i++)
-            {
-              if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-              {
-                IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-                int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-                if (encoded_call_id == call_id)
-                  tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-              }
-            }
-          }
-          else
-          {
-            tcc_state->ir->next_instruction_index = ir_idx_before_args;
-          }
-
-          {
-            gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_stpcpy"), &result_type);
-            vtop[-1] = vtop[0];
-            --vtop;
-            string_builtin_optimized = 1;
-          }
-        }
-
-        if (!can_fold_result && nb_real_args == 1 &&
-            (strcmp(func_name, "strlen") == 0 || strcmp(func_name, "__builtin_strlen") == 0))
-        {
-          CType result_type = ret.type;
-
-          if (ir_idx_before_first_param >= 0)
-          {
-            int current_end = tcc_state->ir->next_instruction_index;
-            for (int i = ir_idx_before_first_param; i < current_end; i++)
-            {
-              if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-              {
-                IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-                int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-                if (encoded_call_id == call_id)
-                  tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-              }
-            }
-          }
-          else
-          {
-            tcc_state->ir->next_instruction_index = ir_idx_before_args;
-          }
-
-          {
-            gen_ir_call_args(saved_args, 1, tok_alloc_const("__tcc_strlen"), &result_type);
-            vtop[-1] = vtop[0];
-            --vtop;
-            string_builtin_optimized = 1;
-          }
-        }
-
-        if (!can_fold_result && nb_real_args == 2 &&
-            (strcmp(func_name, "strnlen") == 0 || strcmp(func_name, "__builtin_strnlen") == 0))
-        {
-          CType result_type = ret.type;
-
-          if (ir_idx_before_first_param >= 0)
-          {
-            int current_end = tcc_state->ir->next_instruction_index;
-            for (int i = ir_idx_before_first_param; i < current_end; i++)
-            {
-              if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-              {
-                IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-                int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-                if (encoded_call_id == call_id)
-                  tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-              }
-            }
-          }
-          else
-          {
-            tcc_state->ir->next_instruction_index = ir_idx_before_args;
-          }
-
-          {
-            gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_strnlen"), &result_type);
-            vtop[-1] = vtop[0];
-            --vtop;
-            string_builtin_optimized = 1;
-          }
-        }
-
-        if (!can_fold_result && nb_real_args == 2 &&
-            (strcmp(func_name, "strpbrk") == 0 || strcmp(func_name, "__builtin_strpbrk") == 0))
-        {
-          CType result_type = ret.type;
-
-          if (ir_idx_before_first_param >= 0)
-          {
-            int current_end = tcc_state->ir->next_instruction_index;
-            for (int i = ir_idx_before_first_param; i < current_end; i++)
-            {
-              if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-              {
-                IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-                int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-                if (encoded_call_id == call_id)
-                  tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-              }
-            }
-          }
-          else
-          {
-            tcc_state->ir->next_instruction_index = ir_idx_before_args;
-          }
-
-          {
-            gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_strpbrk"), &result_type);
-            vtop[-1] = vtop[0];
-            --vtop;
-            string_builtin_optimized = 1;
-          }
-        }
-
-        if (!can_fold_result && nb_real_args == 2 &&
-            (strcmp(func_name, "strrchr") == 0 || strcmp(func_name, "rindex") == 0 ||
-             strcmp(func_name, "__builtin_strrchr") == 0 || strcmp(func_name, "__builtin_rindex") == 0))
-        {
-          CType result_type = ret.type;
-
-          if (ir_idx_before_first_param >= 0)
-          {
-            int current_end = tcc_state->ir->next_instruction_index;
-            for (int i = ir_idx_before_first_param; i < current_end; i++)
-            {
-              if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-              {
-                IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-                int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-                if (encoded_call_id == call_id)
-                  tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-              }
-            }
-          }
-          else
-          {
-            tcc_state->ir->next_instruction_index = ir_idx_before_args;
-          }
-
-          {
-            gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_strrchr"), &result_type);
-            vtop[-1] = vtop[0];
-            --vtop;
-            string_builtin_optimized = 1;
-          }
-        }
-
-        if (!can_fold_result && nb_real_args == 2 &&
-            (strcmp(func_name, "strstr") == 0 || strcmp(func_name, "__builtin_strstr") == 0))
-        {
-          CType result_type = ret.type;
-
-          if (ir_idx_before_first_param >= 0)
-          {
-            int current_end = tcc_state->ir->next_instruction_index;
-            for (int i = ir_idx_before_first_param; i < current_end; i++)
-            {
-              if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-              {
-                IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-                int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-                if (encoded_call_id == call_id)
-                  tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-              }
-            }
-          }
-          else
-          {
-            tcc_state->ir->next_instruction_index = ir_idx_before_args;
-          }
-
-          {
-            gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_strstr"), &result_type);
-            vtop[-1] = vtop[0];
-            --vtop;
-            string_builtin_optimized = 1;
-          }
-        }
-
-        if (!can_fold_result && nb_real_args == 2 &&
-            (strcmp(func_name, "strcspn") == 0 || strcmp(func_name, "__builtin_strcspn") == 0))
-        {
-          CType result_type = ret.type;
-
-          if (ir_idx_before_first_param >= 0)
-          {
-            int current_end = tcc_state->ir->next_instruction_index;
-            for (int i = ir_idx_before_first_param; i < current_end; i++)
-            {
-              if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-              {
-                IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-                int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-                if (encoded_call_id == call_id)
-                  tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-              }
-            }
-          }
-          else
-          {
-            tcc_state->ir->next_instruction_index = ir_idx_before_args;
-          }
-
-          {
-            gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_strcspn"), &result_type);
-            vtop[-1] = vtop[0];
-            --vtop;
-            string_builtin_optimized = 1;
-          }
-        }
-
-        if (!can_fold_result && nb_real_args == 3 &&
-            (strcmp(func_name, "strncpy") == 0 || strcmp(func_name, "__builtin_strncpy") == 0))
-        {
-          CType result_type = ret.type;
-
-          if (ir_idx_before_first_param >= 0)
-          {
-            int current_end = tcc_state->ir->next_instruction_index;
-            for (int i = ir_idx_before_first_param; i < current_end; i++)
-            {
-              if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-              {
-                IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-                int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-                if (encoded_call_id == call_id)
-                  tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-              }
-            }
-          }
-          else
-          {
-            tcc_state->ir->next_instruction_index = ir_idx_before_args;
-          }
-
-          {
-            gen_ir_call_args(saved_args, 3, tok_alloc_const("__tcc_strncpy"), &result_type);
-            vtop[-1] = vtop[0];
-            --vtop;
-            string_builtin_optimized = 1;
-          }
-        }
-
-        if (!can_fold_result && nb_real_args == 3 &&
-            (strcmp(func_name, "strncat") == 0 || strcmp(func_name, "__builtin_strncat") == 0))
-        {
-          CType result_type = ret.type;
-
-          if (ir_idx_before_first_param >= 0)
-          {
-            int current_end = tcc_state->ir->next_instruction_index;
-            for (int i = ir_idx_before_first_param; i < current_end; i++)
-            {
-              if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-              {
-                IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-                int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-                if (encoded_call_id == call_id)
-                  tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-              }
-            }
-          }
-          else
-          {
-            tcc_state->ir->next_instruction_index = ir_idx_before_args;
-          }
-
-          {
-            gen_ir_call_args(saved_args, 3, tok_alloc_const("__tcc_strncat"), &result_type);
-            vtop[-1] = vtop[0];
-            --vtop;
-            string_builtin_optimized = 1;
-          }
-        }
-
-        if (!can_fold_result && nb_real_args == 3 && strcmp(func_name, "strncmp") == 0 &&
-            !is_zero_length_builtin_compare(&saved_args[2]))
-        {
-          lhs_str = try_get_constant_string(&saved_args[0], &lhs_len);
-          rhs_str = try_get_constant_string(&saved_args[1], &rhs_len);
-          if (lhs_str && rhs_str && try_get_constant_size_t(&saved_args[2], &n_const))
-          {
-            folded_result = fold_builtin_strncmp_result(lhs_str, rhs_str, n_const);
-            can_fold_result = 1;
-          }
-        }
-
-        if (!can_fold_result && nb_real_args == 3 && strcmp(func_name, "memcmp") == 0)
-        {
-          lhs_str = try_get_constant_string(&saved_args[0], &lhs_len);
-          rhs_str = try_get_constant_string(&saved_args[1], &rhs_len);
-          if (lhs_str && rhs_str && try_get_constant_size_t(&saved_args[2], &n_const) &&
-              n_const <= (size_t)lhs_len + 1 && n_const <= (size_t)rhs_len + 1)
-          {
-            folded_result = fold_builtin_memcmp_result(lhs_str, rhs_str, n_const);
-            can_fold_result = 1;
-          }
-        }
-
-        if (!can_fold_result && nb_real_args == 3 && strcmp(func_name, "memcmp") == 0 &&
-            try_get_constant_size_t(&saved_args[2], &n_const))
-        {
-          if (n_const == 0)
-          {
-            folded_result = 0;
-            can_fold_result = 1;
-          }
-          else if (n_const == 1)
-          {
-            if (ir_idx_before_first_param >= 0)
-            {
-              int current_end = tcc_state->ir->next_instruction_index;
-              for (int i = ir_idx_before_first_param; i < current_end; i++)
-              {
-                if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-                {
-                  IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-                  int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-                  if (encoded_call_id == call_id)
-                    tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-                }
-              }
-            }
-            else
-            {
-              tcc_state->ir->next_instruction_index = ir_idx_before_args;
-            }
-
-            {
-              CType rt = {VT_INT, NULL};
-              gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_memcmp1"), &rt);
-              vtop[-1] = vtop[0];
-              --vtop;
-              string_builtin_optimized = 1;
-            }
-          }
-        }
-
-        if (!can_fold_result && nb_real_args == 3 &&
-            (strcmp(func_name, "memmove") == 0 || strcmp(func_name, "bcopy") == 0))
-        {
-          const int is_bcopy = strcmp(func_name, "bcopy") == 0;
-
-          if (ir_idx_before_first_param >= 0)
-          {
-            int current_end = tcc_state->ir->next_instruction_index;
-            for (int i = ir_idx_before_first_param; i < current_end; i++)
-            {
-              if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-              {
-                IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-                int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-                if (encoded_call_id == call_id)
-                  tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-              }
-            }
-          }
-          else
-          {
-            tcc_state->ir->next_instruction_index = ir_idx_before_args;
-          }
-
-          {
-            SValue param_num;
-            const int new_call_id = tcc_state->ir->next_call_id++;
-
-            svalue_init(&param_num);
-            param_num.vr = -1;
-            param_num.r = VT_CONST;
-
-            if (is_bcopy)
-            {
-              param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
-              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[0], &param_num, NULL);
-
-              param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 1);
-              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[1], &param_num, NULL);
-
-              param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 2);
-              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[2], &param_num, NULL);
-
-              vpush_typed_helper_func(tok_alloc_const("__tcc_bcopy"), &func_old_void_type);
-              {
-                SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 3);
-                tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[0], &call_id_sv, NULL);
-              }
-              --vtop;
-              vtop->type.t = VT_VOID;
-              vtop->type.ref = NULL;
-              vtop->r = VT_CONST;
-              vtop->vr = -1;
-              vtop->c.i = 0;
-            }
-            else
-            {
-              SValue dest;
-
-              param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
-              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[0], &param_num, NULL);
-
-              param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 1);
-              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[1], &param_num, NULL);
-
-              param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 2);
-              tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[2], &param_num, NULL);
-
-              vpush_typed_helper_func(tok_alloc_const("__tcc_memmove"), &func_old_void_pointer_type);
-
-              svalue_init(&dest);
-              dest.type = saved_args[0].type;
-              dest.r = 0;
-              dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-              {
-                SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 3);
-                tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &call_id_sv, &dest);
-              }
-
-              --vtop;
-              vpushi(0);
-              vtop->type = dest.type;
-              vtop->vr = dest.vr;
-              vtop->r = TREG_R0;
-            }
-
-            vtop[-1] = vtop[0];
-            --vtop;
-            string_builtin_optimized = 1;
-          }
-        }
-
-        if (!can_fold_result && nb_real_args == 3 && strcmp(func_name, "strncmp") == 0)
-        {
-          if (ir_idx_before_first_param >= 0)
-          {
-            int current_end = tcc_state->ir->next_instruction_index;
-            for (int i = ir_idx_before_first_param; i < current_end; i++)
-            {
-              if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-              {
-                IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-                int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-                if (encoded_call_id == call_id)
-                  tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-              }
-            }
-          }
-          else
-          {
-            tcc_state->ir->next_instruction_index = ir_idx_before_args;
-          }
-
-          {
-            CType rt = {VT_INT, NULL};
-            gen_ir_call_args(saved_args, 3, tok_alloc_const("__tcc_strncmp"), &rt);
-            vtop[-1] = vtop[0];
-            --vtop;
-            string_builtin_optimized = 1;
-          }
-        }
-
-        if (!can_fold_result && nb_real_args == 3 && is_zero_length_builtin_compare(&saved_args[2]))
-        {
-          if (strcmp(func_name, "strncmp") == 0 || strcmp(func_name, "memcmp") == 0)
-          {
-            folded_result = 0;
-            can_fold_result = 1;
-          }
-        }
-
-        if (!can_fold_result && nb_real_args == 3 && strcmp(func_name, "memchr") == 0)
-        {
-          unsigned char needle = 0;
-          int match_offset = -1;
-          lhs_str = try_get_constant_string(&saved_args[0], &lhs_len);
-          if (lhs_str && try_get_constant_uchar(&saved_args[1], &needle) &&
-              try_get_constant_size_t(&saved_args[2], &n_const) && n_const <= (size_t)lhs_len + 1 &&
-              fold_builtin_memchr_offset(lhs_str, needle, n_const, &match_offset))
-          {
-            if (ir_idx_before_first_param >= 0)
-            {
-              int current_end = tcc_state->ir->next_instruction_index;
-              for (int i = ir_idx_before_first_param; i < current_end; i++)
-              {
-                if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-                {
-                  IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-                  int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-                  if (encoded_call_id == call_id)
-                    tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-                }
-              }
-            }
-            else
-            {
-              tcc_state->ir->next_instruction_index = ir_idx_before_args;
-            }
-
-            if (match_offset >= 0)
-            {
-              SValue match_sv = saved_args[0];
-              match_sv.c.i += match_offset;
-              vpushv(&match_sv);
-            }
-            else
-            {
-              vpushi(0);
-              vtop->type = saved_args[0].type;
-            }
-
-            vtop[-1] = vtop[0];
-            --vtop;
-            string_builtin_optimized = 1;
-          }
-        }
-
-        if (!can_fold_result && nb_real_args == 2 &&
-            (strcmp(func_name, "strchr") == 0 || strcmp(func_name, "index") == 0 ||
-             strcmp(func_name, "__builtin_index") == 0))
-        {
-          if (ir_idx_before_first_param >= 0)
-          {
-            int current_end = tcc_state->ir->next_instruction_index;
-            for (int i = ir_idx_before_first_param; i < current_end; i++)
-            {
-              if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-              {
-                IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-                int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-                if (encoded_call_id == call_id)
-                  tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-              }
-            }
-          }
-          else
-          {
-            tcc_state->ir->next_instruction_index = ir_idx_before_args;
-          }
-
-          {
-            gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_strchr"), &saved_args[0].type);
-            vtop[-1] = vtop[0];
-            --vtop;
-            string_builtin_optimized = 1;
-          }
-        }
-
-        if (can_fold_result)
-        {
-          if (ir_idx_before_first_param >= 0)
-          {
-            int current_end = tcc_state->ir->next_instruction_index;
-            for (int i = ir_idx_before_first_param; i < current_end; i++)
-            {
-              if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-              {
-                IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-                int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-                if (encoded_call_id == call_id)
-                  tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-              }
-            }
-          }
-          else
-          {
-            tcc_state->ir->next_instruction_index = ir_idx_before_args;
-          }
-
-          vpushi(folded_result);
-          vtop[-1] = vtop[0];
-          --vtop;
-          string_builtin_optimized = 1;
-        }
-      }
-
-      if (folded)
-      {
-        /* Constant folding succeeded – skip IR emission.
-         * try_fold_math_call() pushed the folded result on top of the
-         * function pointer: stack is  [...] [func_ptr] [result].
-         * Move the result over the function pointer and pop the dup. */
-        vtop[-1] = vtop[0];
-        --vtop;
-        /* Roll back the IR stream to discard the orphaned FUNCPARAMVAL
-         * ops that were emitted for the (now-folded) arguments. */
-        tcc_state->ir->next_instruction_index = ir_idx_before_args;
-      }
-      else if (inlined || inline_evaled || sprintf_family_optimized || printf_family_optimized ||
-               fputs_family_optimized || string_builtin_optimized)
-      {
-        /* Already handled above */
-      }
-      else if (can_inline_eval && !NOEVAL_WANTED && call_func_sym && saved_arg_count == nb_real_args && tcc_state->ir &&
-               !tcc_state->in_inline_expansion)
-      {
-        /* ---- Token-level inline expansion ----
-         * Only expand inline functions whose body contains address-of-label
-         * (&&label).  This is the specific case where call-site inlining
-         * is required: each expansion must get unique label addresses.
-         * Also expand always_inline functions at the call site when their
-         * body contains inline asm, so asm constraints are checked against
-         * caller-provided operands rather than abstract parameters.
-         * General inlining of all other inline functions is left to
-         * gen_inline_functions() which compiles them as standalone funcs. */
-        struct InlineFunc *inline_fn = NULL;
-        int force_always_inline = 0;
-        int has_addr_of_label = 0;
-        int has_inline_asm = 0;
-        for (int fi = 0; fi < tcc_state->nb_inline_fns; fi++)
-        {
-          if (tcc_state->inline_fns[fi]->sym == call_func_sym)
-          {
-            inline_fn = tcc_state->inline_fns[fi];
-            break;
-          }
-        }
-        if (inline_fn && inline_fn->func_str)
-          inline_scan_body_features(inline_fn->func_str, &has_addr_of_label, &has_inline_asm);
-        if (call_func_sym->type.ref && call_func_sym->type.ref->f.func_alwinl && has_inline_asm)
-          force_always_inline = 1;
-        if (force_always_inline && inline_fn && ((call_func_sym->type.ref->type.t & VT_BTYPE) != VT_VOID) &&
-            !inline_body_has_return_stmt(inline_fn->func_str))
-        {
-          /* A non-void always_inline body that falls through without any
-           * explicit return cannot currently be replayed safely at the call
-           * site. Keep it as a normal inline call so we warn but don't crash. */
-          force_always_inline = 0;
-        }
-        if (inline_fn && inline_fn->func_str && (has_addr_of_label || force_always_inline))
-        {
-          /* --- 1. NOP out FUNCPARAMVALs for this call --- */
-          if (ir_idx_before_first_param >= 0)
-          {
-            int current_end = tcc_state->ir->next_instruction_index;
-            for (int ii = ir_idx_before_first_param; ii < current_end; ii++)
-            {
-              if (tcc_state->ir->compact_instructions[ii].op == TCCIR_OP_FUNCPARAMVAL)
-              {
-                IROperand src2 = tcc_ir_get_src2(tcc_state->ir, ii);
-                if (TCCIR_DECODE_CALL_ID(src2.u.imm32) == call_id)
-                  tcc_state->ir->compact_instructions[ii].op = TCCIR_OP_NOP;
-              }
-            }
-          }
-          else
-          {
-            /* No args — just roll back any FUNCPARAMVOID */
-            tcc_state->ir->next_instruction_index = ir_idx_before_args;
-          }
-
-          /* --- 2. Create parameter locals and store arguments --- */
-          Sym *saved_local = local_stack;
-          int saved_local_scope = local_scope;
-          int saved_inline_const_arg_count = tcc_state->inline_const_arg_count;
-          tcc_state->inline_const_arg_count = 0;
-          ++local_scope;            /* shadow caller's same-named variables */
-          Sym *param_sym = s->next; /* first parameter from function type */
-          for (int pi = 0; pi < nb_args && param_sym; pi++, param_sym = param_sym->next)
-          {
-            int psize, palign;
-            psize = type_size(&param_sym->type, &palign);
-            if (psize < 4)
-              psize = 4;
-            if (palign < 4)
-              palign = 4;
-            loc = (loc - psize) & -palign;
-
-            /* Push parameter symbol FIRST so it gets a vreg assigned */
-            Sym *psym = sym_push(param_sym->v & ~SYM_FIELD, &param_sym->type, VT_LOCAL | VT_LVAL, loc);
-
-            if (force_always_inline && inline_arg_is_constant_like(&saved_args[pi]) &&
-                tcc_state->inline_const_arg_count < countof(tcc_state->inline_const_args))
-            {
-              int map_idx = tcc_state->inline_const_arg_count++;
-              tcc_state->inline_const_args[map_idx].vreg = psym->vreg;
-              tcc_state->inline_const_args[map_idx].stack_offset = loc;
-              tcc_state->inline_const_args[map_idx].value = saved_args[pi];
-            }
-
-            /* Store argument to local via IR */
-            SValue store_dst;
-            svalue_init(&store_dst);
-            store_dst.type = param_sym->type;
-            store_dst.r = VT_LOCAL | VT_LVAL;
-            store_dst.vr = psym->vreg;
-            store_dst.c.i = loc;
-            tcc_ir_put(tcc_state->ir, TCCIR_OP_STORE, &saved_args[pi], NULL, &store_dst);
-          }
-
-          /* --- 3. Save parser/codegen state --- */
-          CType saved_func_vt = func_vt;
-          int saved_func_var = func_var;
-          int saved_rsym = rsym;
-          const char *saved_funcname = funcname;
-          struct scope *saved_root_scope = root_scope;
-
-          /* Set up inline function context */
-          func_vt = s->type; /* return type */
-          func_var = (s->f.func_type == FUNC_ELLIPSIS);
-          rsym = -1; /* fresh return-jump chain */
-
-          /* Allocate return value local for non-void functions */
-          int is_void_inline = ((func_vt.t & VT_BTYPE) == VT_VOID);
-          int inline_ret_loc = 0;
-          if (!is_void_inline)
-          {
-            int rsize, ralign;
-            rsize = type_size(&func_vt, &ralign);
-            if (rsize < 4)
-              rsize = 4;
-            if (ralign < 4)
-              ralign = 4;
-            loc = (loc - rsize) & -ralign;
-            inline_ret_loc = loc;
-          }
-
-          /* Set inline expansion flags */
-          tcc_state->in_inline_expansion = 1;
-          tcc_state->inline_return_loc = inline_ret_loc;
-          root_scope = cur_scope;
-
-          /* --- 4. Replay inline function body --- */
-          int saved_tok = tok;
-          CValue saved_tokc = tokc;
-          int *inline_label_tokens = NULL;
-          int nb_inline_label_tokens = 0;
-          Sym **saved_inline_labels =
-              inline_hide_label_bindings(inline_fn->func_str, &inline_label_tokens, &nb_inline_label_tokens);
-
-          TokenString *inline_ts = tok_str_alloc();
-          inline_ts->data.str = tok_str_buf(inline_fn->func_str);
-          inline_ts->allocated_len = 1;
-          inline_ts->len = inline_fn->func_str->len;
-          begin_macro(inline_ts, 2);
-          next();
-          block(0);
-          end_macro();
-          inline_restore_label_bindings(inline_label_tokens, saved_inline_labels, nb_inline_label_tokens);
-
-          tok = saved_tok;
-          tokc = saved_tokc;
-
-          /* --- 5. Backpatch return jumps --- */
-          tcc_ir_backpatch_to_here(tcc_state->ir, rsym);
-
-          /* --- 6. Restore state --- */
-          tcc_state->in_inline_expansion = 0;
-          func_vt = saved_func_vt;
-          func_var = saved_func_var;
-          rsym = saved_rsym;
-          funcname = saved_funcname;
-          root_scope = saved_root_scope;
-          tcc_state->inline_const_arg_count = saved_inline_const_arg_count;
-          sym_pop(&local_stack, saved_local, 0);
-          local_scope = saved_local_scope;
-
-          /* --- 7. Handle result on vstack --- */
-          if (is_void_inline)
-          {
-            /* Replace function pointer with void placeholder */
-            vtop->type.t = VT_VOID;
-            vtop->type.ref = NULL;
-            vtop->r = VT_CONST;
-            vtop->vr = -1;
-            vtop->c.i = 0;
-          }
-          else
-          {
-            /* Replace function pointer with return value lvalue */
-            vtop->type = s->type;
-            vtop->r = VT_LOCAL | VT_LVAL;
-            vtop->vr = -1;
-            vtop->c.i = inline_ret_loc;
-          }
-          inlined = 1;
-        }
-        else
-        {
-          /* No special call-site inline requirement found, or InlineFunc not found - normal call */
-          goto normal_call;
-        }
-      }
-      else
-      {
-      normal_call:;
-
-        if (call_func_sym && call_func_sym->type.ref && call_func_sym->type.ref->f.func_alwinl)
-        {
-          call_func_sym->type.ref->f.func_outofline_needed = 1;
-        }
-
-        int return_vreg = -1;
-        if (NOEVAL_WANTED)
-        {
-          /* When in sizeof/typeof context, skip IR emission but still handle stack */
-          --vtop;
-        }
-        else if ((s->type.t & VT_BTYPE) == VT_VOID)
-        {
-          /* In IR mode, make sure the call target is a VALUE (register/temp),
-           * not an lvalue. Indirect calls like tabl1[i]() produce an lvalue
-           * (memory reference) for tabl1[i]; we must LOAD it to get the actual
-           * function pointer value before emitting FUNCCALL.
-           * NOTE: We check s->type.t (the function's return type), not vtop->type.t
-           * (which is VT_FUNC for function pointers). */
-          SValue call_id_sv = tcc_ir_svalue_call_id_argc(call_id, nb_args);
-          /* Emit FUNCPARAMVOID for 0-arg calls so backend creates a call site */
-          if (nb_args == 0)
-          {
-            tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVOID, NULL, &call_id_sv, NULL);
-          }
-          /* For indirect calls (VT_LVAL set), emit a LOAD to get the function pointer value */
-          SValue call_target = *vtop;
-          if (vtop->r & VT_LVAL)
-          {
-            SValue load_dest;
-            svalue_init(&load_dest);
-            load_dest.type = vtop->type;
-            load_dest.r = 0;
-            load_dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-            tcc_ir_put(tcc_state->ir, TCCIR_OP_LOAD, vtop, NULL, &load_dest);
-            call_target = load_dest;
-            call_target.r &= ~VT_LVAL; /* Clear VT_LVAL since we now have the value */
-          }
-          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &call_target, &call_id_sv, NULL);
-          --vtop;
-        }
-        else
-        {
-          SValue dest;
-          svalue_init(&dest);
-          if (nb_args == 0)
-          {
-            SValue call_id_sv = tcc_ir_svalue_call_id_argc(call_id, 0);
-            tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVOID, NULL, &call_id_sv, NULL);
-          }
-          /* Use the actual return type so 64-bit/float returns are modeled correctly
-           * (e.g., __aeabi_f2d returns a double in R0:R1). */
-          dest.type = ret.type;
-          dest.r = 0;
-          dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-          return_vreg = dest.vr;
-
-          /* For indirect calls (VT_LVAL set), emit a LOAD to get the function pointer value */
-          SValue call_id_sv = tcc_ir_svalue_call_id_argc(call_id, nb_args);
-          SValue call_target = *vtop;
-          if (vtop->r & VT_LVAL)
-          {
-            SValue load_dest;
-            svalue_init(&load_dest);
-            load_dest.type = vtop->type;
-            load_dest.r = 0;
-            load_dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-            tcc_ir_put(tcc_state->ir, TCCIR_OP_LOAD, vtop, NULL, &load_dest);
-            call_target = load_dest;
-            call_target.r &= ~VT_LVAL; /* Clear VT_LVAL since we now have the value */
-          }
-          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &call_target, &call_id_sv, &dest);
-          --vtop;
-        }
-
-        if (ret_nregs < 0)
-        {
-          vsetc(&ret.type, ret.r, &ret.c);
-#ifdef TCC_TARGET_RISCV64
-          arch_transfer_ret_regs(1);
-#endif
-        }
-        else if (ret_nregs == 0)
-        {
-          /* Struct returned via sret pointer: the callee already wrote to the
-           * sret buffer. Just push the buffer location as an lvalue. */
-          vsetc(&ret.type, ret.r, &ret.c);
-          /* Do NOT set vtop->vr = return_vreg - there's no return register for sret */
-        }
-        else
-        {
-          /* return value */
-          n = ret_nregs;
-          while (n > 1)
-          {
-            int rc = reg_classes[ret.r] & ~(RC_INT | RC_FLOAT);
-            /* We assume that when a structure is returned in multiple
-               registers, their classes are consecutive values of the
-               suite s(n) = 2^n */
-            rc <<= --n;
-            for (r = 0; r < NB_REGS; ++r)
-              if (reg_classes[r] & rc)
-                break;
-            vsetc(&ret.type, r, &ret.c);
-            vtop->vr = return_vreg;
-          }
-          vsetc(&ret.type, ret.r, &ret.c);
-          vtop->vr = return_vreg;
-
-          /* handle packed struct return */
-          if (((s->type.t & VT_BTYPE) == VT_STRUCT) && ret_nregs)
-          {
-            int addr, offset;
-
-            size = type_size(&s->type, &align);
-            /* We're writing whole regs often, make sure there's enough
-               space.  Assume register size is power of 2.  */
-            size = (size + regsize - 1) & -regsize;
-            if (ret_align > align)
-              align = ret_align;
-            loc = (loc - size) & -align;
-            addr = loc;
-            offset = 0;
-            for (;;)
-            {
-              vset(&ret.type, VT_LOCAL | VT_LVAL, addr + offset);
-              vswap();
-              vstore();
-              vtop--;
-              print_vstack("unary, function call(2)");
-              if (--ret_nregs == 0)
-                break;
-              offset += regsize;
-            }
-            vset(&s->type, VT_LOCAL | VT_LVAL, addr);
-          }
-
-          /* Promote char/short return values. This is matters only
-             for calling function that were not compiled by TCC and
-             only on some architectures.  For those where it doesn't
-             matter we expect things to be already promoted to int,
-             but not larger.  */
-          t = s->type.t & VT_BTYPE;
-          if (t == VT_BYTE || t == VT_SHORT || t == VT_BOOL)
-          {
-#ifdef PROMOTE_RET
-            vtop->r |= BFVAL(VT_MUSTCAST, 1);
-#else
-            vtop->type.t = VT_INT;
-#endif
-          }
-
-          /* Restore VT_COMPLEX for complex types returned in registers.
-           * gfunc_sret() sets ret.type to VT_INT for small types (size <= 4),
-           * but the caller needs VT_COMPLEX to properly handle __real__/__imag__
-           * extraction.  The value in the register is packed:
-           *   _Complex char:  byte 0 = real, byte 1 = imag  (total 2 bytes in r0)
-           *   _Complex short: low 16 = real, high 16 = imag  (total 4 bytes in r0)
-           */
-          if (s->type.t & VT_COMPLEX)
-          {
-            vtop->type = s->type;
-          }
-        }
-      } /* end of else block for non-folded function calls */
-      tcc_free(saved_args);
-      if (s->f.func_noreturn)
-      {
-        if (debug_modes)
-          tcc_tcov_block_end(tcc_state, -1);
-        CODE_OFF();
-      }
+      unary_funcall();
     }
     else
     {

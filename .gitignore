@@ -84,3 +84,4 @@ lib/fp/soft/test_host
 tmp/
 
 .venv
+bin/

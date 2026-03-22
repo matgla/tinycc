@@ -4647,8 +4647,22 @@ ST_FUNC void tccpp_new(TCCState *s)
   const char *p, *r;
 
   /* init isid table */
+  /* Note: written as if-else chain instead of nested ternary to work around
+     a TCC ARM codegen bug at -O1 where nested ternaries in a for-loop body
+     cause the loop increment to be lost. */
   for (i = CH_EOF; i < 128; i++)
-    set_idnum(i, is_space(i) ? IS_SPC : isid(i) ? IS_ID : isnum(i) ? IS_NUM : 0);
+  {
+    int val;
+    if (is_space(i))
+      val = IS_SPC;
+    else if (isid(i))
+      val = IS_ID;
+    else if (isnum(i))
+      val = IS_NUM;
+    else
+      val = 0;
+    set_idnum(i, val);
+  }
 
   for (i = 128; i < 256; i++)
     set_idnum(i, IS_ID);

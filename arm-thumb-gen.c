@@ -48,7 +48,17 @@
 #include "tccls.h"
 #include "tcctype.h"
 
-static void load_full_const(int r, int r1, int64_t imm, struct Sym *sym);
+static void load_full_const(int r, int r1, uint32_t imm_lo, uint32_t imm_hi);
+
+/* Workaround for TCC ARM ABI bugs:
+ * 1. int64_t args miscount register pairs  2. 5th+ args not correctly pushed to stack
+ * By passing sym through a file-scope global, load_full_const stays at 4 register args.
+ * Set _lfc_sym before calling load_full_const; it is consumed and reset to NULL inside. */
+static struct Sym *_lfc_sym;
+
+/* Helper macro: split a 64-bit value into (lo, hi) uint32_t pair for load_full_const.
+ * Avoids int64_t in function signatures — TCC ARM codegen miscounts int64_t register pairs. */
+#define LFC_SPLIT(v) (uint32_t)((uint64_t)(v)), (uint32_t)((uint64_t)(v) >> 32)
 
 ThumbGeneratorState thumb_gen_state;
 
@@ -389,7 +399,8 @@ static int mach_ensure_in_reg(MachineCodegenContext *ctx, const MachineOperand *
   case MACH_OP_SYMBOL:
   {
     int r = mach_alloc_scratch(ctx, excl);
-    Sym *sym = op->u.sym.sym ? validate_sym_for_reloc(op->u.sym.sym) : NULL;
+    Sym *raw_sym = op->u.sym.sym;
+    Sym *sym = raw_sym ? validate_sym_for_reloc(raw_sym) : NULL;
     if (!op->needs_deref)
     {
       /* Load symbol address (with addend baked in). */
@@ -2262,7 +2273,7 @@ static ScratchRegAlloc th_offset_to_reg_ex(int off, int sign, uint32_t exclude_r
   /* If mov is not possible then load from data */
   if (!ot(th_generic_mov_imm(rr, off)))
   {
-    load_full_const(rr, PREG_NONE, sign ? -off : off, NULL);
+    load_full_const(rr, PREG_NONE, LFC_SPLIT(sign ? -off : off));
     return alloc;
   }
 
@@ -2338,7 +2349,7 @@ static void gadd_sp(int val)
     }
 
     /* Large adjustment: materialize value into IP and add via register form. */
-    load_full_const(R_IP, PREG_NONE, (int64_t)val, NULL);
+    load_full_const(R_IP, PREG_NONE, (uint32_t)val, 0);
     ot_check(th_add_sp_reg(R_SP, R_IP, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE, THUMB_SHIFT_DEFAULT));
     return;
   }
@@ -2352,7 +2363,7 @@ static void gadd_sp(int val)
     return;
   }
 
-  load_full_const(R_IP, PREG_NONE, (int64_t)sub, NULL);
+  load_full_const(R_IP, PREG_NONE, (uint32_t)sub, 0);
   ot_check(th_sub_sp_reg(R_SP, R_IP, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
 }
 
@@ -2451,7 +2462,7 @@ ST_FUNC void gen_vla_alloc(CType *type, int align)
       int mask_reg = mask_alloc.reg;
       if (!ot(th_generic_mov_imm(mask_reg, align - 1)))
       {
-        load_full_const(mask_reg, PREG_NONE, align - 1, NULL);
+        load_full_const(mask_reg, PREG_NONE, LFC_SPLIT(align - 1));
       }
       ot_check(th_bic_reg(r, r, mask_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
       if (mask_alloc.saved)
@@ -2793,8 +2804,11 @@ static ThumbLiteralPoolEntry *th_literal_pool_find_or_allocate(Sym *sym, int64_t
   return entry;
 }
 
-static void load_full_const(int r, int r1, int64_t imm, struct Sym *sym)
+static void load_full_const(int r, int r1, uint32_t imm_lo, uint32_t imm_hi)
 {
+  struct Sym *sym = _lfc_sym;
+  _lfc_sym = NULL;
+  int64_t imm = (int64_t)((uint64_t)imm_hi << 32 | (uint64_t)imm_lo);
   ElfSym *esym = NULL;
   ThumbLiteralPoolEntry *entry;
   int sym_off = 0;
@@ -3135,7 +3149,7 @@ ST_FUNC void tcc_machine_addr_of_stack_slot(int dest_reg, int frame_offset, int 
     offset_reg = offset_alloc.reg;
   }
 
-  load_full_const(offset_reg, PREG_NONE, frame_offset, NULL);
+  load_full_const(offset_reg, PREG_NONE, LFC_SPLIT(frame_offset));
   ot_check(th_add_reg(dest_reg, base_reg, offset_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
                       ENFORCE_ENCODING_NONE));
 
@@ -3164,7 +3178,8 @@ ST_FUNC void tcc_machine_load_constant(int dest_reg, int dest_reg_high, int64_t 
     Sym *validated_sym = validate_sym_for_reloc(sym);
     if (validated_sym)
     {
-      load_full_const(dest_reg, dest_reg_high, value, validated_sym);
+      _lfc_sym = validated_sym;
+      load_full_const(dest_reg, dest_reg_high, LFC_SPLIT(value));
       return;
     }
     /* Invalid or missing sym - fall through to treat as plain constant */
@@ -3193,13 +3208,13 @@ ST_FUNC void tcc_machine_load_constant(int dest_reg, int dest_reg_high, int64_t 
     }
 
     /* At least one half needs literal pool - use combined 64-bit load */
-    load_full_const(dest_reg, dest_reg_high, value, NULL);
+    load_full_const(dest_reg, dest_reg_high, LFC_SPLIT(value));
     return;
   }
 
   /* 32-bit constant */
   if (!ot(th_generic_mov_imm(dest_reg, (uint32_t)value)))
-    load_full_const(dest_reg, PREG_NONE, value, NULL);
+    load_full_const(dest_reg, PREG_NONE, LFC_SPLIT(value));
 }
 
 /* Load comparison result (0 or 1) based on condition flags.
@@ -6389,7 +6404,7 @@ ST_FUNC void tcc_gen_machine_fp_mop(MachineOperand src1, MachineOperand src2, Ma
       /* f64: load pair into R0:R1, flip sign bit of hi word (R1) only */
       fp_mop_load_double_arg(R0, R1, &src1);
       scr = get_scratch_reg_with_save((1u << R0) | (1u << R1));
-      load_full_const(scr.reg, PREG_NONE, 0x80000000, NULL);
+      load_full_const(scr.reg, PREG_NONE, 0x80000000, 0);
       ot_check(th_eor_reg(R1, R1, scr.reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
       restore_scratch_reg(&scr);
       fp_mop_writeback_result(&dest, 1);
@@ -6399,7 +6414,7 @@ ST_FUNC void tcc_gen_machine_fp_mop(MachineOperand src1, MachineOperand src2, Ma
       /* f32: R0 ^= 0x80000000 */
       fp_mop_load_arg(R0, &src1);
       scr = get_scratch_reg_with_save(1u << R0);
-      load_full_const(scr.reg, PREG_NONE, 0x80000000, NULL);
+      load_full_const(scr.reg, PREG_NONE, 0x80000000, 0);
       ot_check(th_eor_reg(R0, R0, scr.reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
       restore_scratch_reg(&scr);
       mach_writeback_dest(&dest, R0);
@@ -7212,7 +7227,7 @@ ST_FUNC void tcc_gen_machine_lea_mop(MachineOperand dest, MachineOperand src)
       {
         /* Large offset: load into a scratch and use register ADD/SUB */
         ScratchRegAlloc off_sc = get_scratch_reg_with_save(excl | (1u << (uint32_t)r) | (1u << (uint32_t)base));
-        load_full_const(off_sc.reg, PREG_NONE, abs_off, NULL);
+        load_full_const(off_sc.reg, PREG_NONE, LFC_SPLIT(abs_off));
         ot_check(sign ? th_sub_reg(r, base, off_sc.reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
                                    ENFORCE_ENCODING_NONE)
                       : th_add_reg(r, base, off_sc.reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
@@ -7411,7 +7426,8 @@ static void load_immediate(int reg, uint32_t imm, Sym *sym, int update_flags)
   /* If there's a symbol, always use literal pool for relocations */
   if (sym)
   {
-    load_full_const(reg, PREG_NONE, imm, sym);
+    _lfc_sym = sym;
+    load_full_const(reg, PREG_NONE, imm, 0);
     return;
   }
 
@@ -7419,7 +7435,7 @@ static void load_immediate(int reg, uint32_t imm, Sym *sym, int update_flags)
   if (!ot(th_generic_mov_imm(reg, imm)))
   {
     /* Value doesn't fit in immediate encoding, use literal pool */
-    load_full_const(reg, PREG_NONE, imm, NULL);
+    load_full_const(reg, PREG_NONE, imm, 0);
   }
 }
 
@@ -8500,8 +8516,9 @@ ST_FUNC void tcc_gen_machine_init_chain_slot(IROperand src1)
   /* Get a scratch register to hold the chain slot address */
   ScratchRegAlloc scratch = get_scratch_reg_with_save(0);
 
-  /* Load chain slot address into scratch register via literal pool */
-  load_full_const(scratch.reg, PREG_NONE, 0, chain_sym);
+  /* Load chain slot address into scratch register via literal pool. */
+  _lfc_sym = chain_sym;
+  load_full_const(scratch.reg, PREG_NONE, 0, 0);
 
   /* STR R7, [scratch, #0] — store frame pointer into chain slot */
   ot_check(th_str_imm(R_FP, scratch.reg, 0, 6, ENFORCE_ENCODING_NONE));
@@ -8556,7 +8573,7 @@ ST_FUNC void tcc_gen_machine_vla_mop(MachineOperand dest, MachineOperand src1, M
         /* Fallback: materialize mask in a scratch register. */
         int mask_reg = mach_alloc_scratch(&ctx, 1u << (uint32_t)r);
         if (!ot(th_generic_mov_imm(mask_reg, align - 1)))
-          load_full_const(mask_reg, PREG_NONE, align - 1, NULL);
+          load_full_const(mask_reg, PREG_NONE, LFC_SPLIT(align - 1));
         ot_check(th_bic_reg(r, r, mask_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
       }
     }
@@ -8620,7 +8637,7 @@ ST_FUNC void tcc_gen_machine_prefetch_mop(MachineOperand addr, int rw)
     int32_t offset = addr.u.spill.offset;
     if (offset != 0)
     {
-      load_full_const(ARM_R12, PREG_NONE, offset, NULL);
+      load_full_const(ARM_R12, PREG_NONE, LFC_SPLIT(offset));
       ot_check(th_add_reg(ARM_R12, R_FP, ARM_R12, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
                           ENFORCE_ENCODING_NONE));
       ot_check(th_pld_imm(ARM_R12, 0, 0));
@@ -8635,14 +8652,15 @@ ST_FUNC void tcc_gen_machine_prefetch_mop(MachineOperand addr, int rw)
   {
     /* For immediate addresses, load into a register first */
     /* Use R12 (IP) as scratch since it's caller-saved */
-    load_full_const(ARM_R12, PREG_NONE, addr.u.imm.val, NULL);
+    load_full_const(ARM_R12, PREG_NONE, LFC_SPLIT(addr.u.imm.val));
     ot_check(th_pld_imm(ARM_R12, 0, 0));
     break;
   }
   case MACH_OP_SYMBOL:
   {
     /* For symbol addresses, load into a register first */
-    load_full_const(ARM_R12, PREG_NONE, addr.u.sym.addend, addr.u.sym.sym);
+    _lfc_sym = addr.u.sym.sym;
+    load_full_const(ARM_R12, PREG_NONE, LFC_SPLIT(addr.u.sym.addend));
     ot_check(th_pld_imm(ARM_R12, 0, 0));
     break;
   }
@@ -8652,7 +8670,7 @@ ST_FUNC void tcc_gen_machine_prefetch_mop(MachineOperand addr, int rw)
     int32_t offset = addr.u.frame.offset;
     if (offset != 0)
     {
-      load_full_const(ARM_R12, PREG_NONE, offset, NULL);
+      load_full_const(ARM_R12, PREG_NONE, LFC_SPLIT(offset));
       ot_check(th_add_reg(ARM_R12, R_FP, ARM_R12, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
                           ENFORCE_ENCODING_NONE));
       ot_check(th_pld_imm(ARM_R12, 0, 0));
@@ -8873,7 +8891,7 @@ ST_FUNC void tcc_gen_machine_nl_longjmp_mop(MachineOperand buf)
       else
       {
         ScratchRegAlloc off_sc = get_scratch_reg_with_save(excl | (1u << (uint32_t)buf_reg) | (1u << (uint32_t)base));
-        load_full_const(off_sc.reg, PREG_NONE, abs_off, NULL);
+        load_full_const(off_sc.reg, PREG_NONE, LFC_SPLIT(abs_off));
         ot_check(sign ? th_sub_reg(buf_reg, base, off_sc.reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
                                    ENFORCE_ENCODING_NONE)
                       : th_add_reg(buf_reg, base, off_sc.reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,

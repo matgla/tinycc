@@ -227,7 +227,11 @@ unsigned long __tcc_ulabsu(long x)
 
 int isnan(double x)
 {
-  union { double d; unsigned long long u; } v;
+  union
+  {
+    double d;
+    unsigned long long u;
+  } v;
   v.d = x;
   unsigned long long exp = (v.u >> 52) & 0x7FF;
   unsigned long long mant = v.u & 0x000FFFFFFFFFFFFFULL;
@@ -236,7 +240,11 @@ int isnan(double x)
 
 int isnanf(float x)
 {
-  union { float f; unsigned int u; } v;
+  union
+  {
+    float f;
+    unsigned int u;
+  } v;
   v.f = x;
   unsigned int exp = (v.u >> 23) & 0xFF;
   unsigned int mant = v.u & 0x7FFFFF;
@@ -245,7 +253,11 @@ int isnanf(float x)
 
 int isinf(double x)
 {
-  union { double d; unsigned long long u; } v;
+  union
+  {
+    double d;
+    unsigned long long u;
+  } v;
   v.d = x;
   unsigned long long exp = (v.u >> 52) & 0x7FF;
   unsigned long long mant = v.u & 0x000FFFFFFFFFFFFFULL;
@@ -254,7 +266,11 @@ int isinf(double x)
 
 int isinff(float x)
 {
-  union { float f; unsigned int u; } v;
+  union
+  {
+    float f;
+    unsigned int u;
+  } v;
   v.f = x;
   unsigned int exp = (v.u >> 23) & 0xFF;
   unsigned int mant = v.u & 0x7FFFFF;
@@ -263,7 +279,11 @@ int isinff(float x)
 
 int finite(double x)
 {
-  union { double d; unsigned long long u; } v;
+  union
+  {
+    double d;
+    unsigned long long u;
+  } v;
   v.d = x;
   unsigned long long exp = (v.u >> 52) & 0x7FF;
   return (exp != 0x7FF);
@@ -271,7 +291,11 @@ int finite(double x)
 
 int finitef(float x)
 {
-  union { float f; unsigned int u; } v;
+  union
+  {
+    float f;
+    unsigned int u;
+  } v;
   v.f = x;
   unsigned int exp = (v.u >> 23) & 0xFF;
   return (exp != 0xFF);
@@ -279,7 +303,11 @@ int finitef(float x)
 
 double copysign(double x, double y)
 {
-  union { double d; unsigned long long u; } vx, vy;
+  union
+  {
+    double d;
+    unsigned long long u;
+  } vx, vy;
   vx.d = x;
   vy.d = y;
   vx.u = (vx.u & 0x7FFFFFFFFFFFFFFFULL) | (vy.u & 0x8000000000000000ULL);
@@ -288,7 +316,11 @@ double copysign(double x, double y)
 
 float copysignf(float x, float y)
 {
-  union { float f; unsigned int u; } vx, vy;
+  union
+  {
+    float f;
+    unsigned int u;
+  } vx, vy;
   vx.f = x;
   vy.f = y;
   vx.u = (vx.u & 0x7FFFFFFF) | (vy.u & 0x80000000);
@@ -297,7 +329,11 @@ float copysignf(float x, float y)
 
 double fabs(double x)
 {
-  union { double d; unsigned long long u; } v;
+  union
+  {
+    double d;
+    unsigned long long u;
+  } v;
   v.d = x;
   v.u &= 0x7FFFFFFFFFFFFFFFULL;
   return v.d;
@@ -305,7 +341,11 @@ double fabs(double x)
 
 float fabsf(float x)
 {
-  union { float f; unsigned int u; } v;
+  union
+  {
+    float f;
+    unsigned int u;
+  } v;
   v.f = x;
   v.u &= 0x7FFFFFFF;
   return v.f;
@@ -313,57 +353,78 @@ float fabsf(float x)
 
 double fmax(double x, double y)
 {
-  if (isnan(x)) return y;
-  if (isnan(y)) return x;
-  if (x > y) return x;
+  if (isnan(x))
+    return y;
+  if (isnan(y))
+    return x;
+  if (x > y)
+    return x;
   return y;
 }
 
 double fmin(double x, double y)
 {
-  if (isnan(x)) return y;
-  if (isnan(y)) return x;
-  if (x < y) return x;
+  if (isnan(x))
+    return y;
+  if (isnan(y))
+    return x;
+  if (x < y)
+    return x;
   return y;
 }
 
 float fmaxf(float x, float y)
 {
-  if (isnanf(x)) return y;
-  if (isnanf(y)) return x;
-  if (x > y) return x;
+  if (isnanf(x))
+    return y;
+  if (isnanf(y))
+    return x;
+  if (x > y)
+    return x;
   return y;
 }
 
 float fminf(float x, float y)
 {
-  if (isnanf(x)) return y;
-  if (isnanf(y)) return x;
-  if (x < y) return x;
+  if (isnanf(x))
+    return y;
+  if (isnanf(y))
+    return x;
+  if (x < y)
+    return x;
   return y;
 }
 
 double floor(double x)
 {
-  union { double d; unsigned long long u; } v;
+  union
+  {
+    double d;
+    unsigned long long u;
+  } v;
   v.d = x;
   int exp = (int)((v.u >> 52) & 0x7FF) - 1023;
   int sign = (int)(v.u >> 63);
 
   /* NaN or Inf — return as-is */
-  if (exp == 1024) return x;
+  if (exp == 1024)
+    return x;
   /* Already an integer (|x| >= 2^52) */
-  if (exp >= 52) return x;
+  if (exp >= 52)
+    return x;
   /* |x| < 1 */
-  if (exp < 0) {
-    if (sign) return -1.0;
+  if (exp < 0)
+  {
+    if (sign)
+      return -1.0;
     return 0.0;
   }
 
   unsigned long long mask = ~((1ULL << (52 - exp)) - 1);
   unsigned long long truncated = v.u & mask;
 
-  if (truncated == v.u) return x; /* no fractional part */
+  if (truncated == v.u)
+    return x; /* no fractional part */
 
   /* For negative numbers, floor rounds towards -infinity */
   if (sign)
@@ -375,22 +436,31 @@ double floor(double x)
 
 float floorf(float x)
 {
-  union { float f; unsigned int u; } v;
+  union
+  {
+    float f;
+    unsigned int u;
+  } v;
   v.f = x;
   int exp = (int)((v.u >> 23) & 0xFF) - 127;
   int sign = (int)(v.u >> 31);
 
-  if (exp == 128) return x;
-  if (exp >= 23) return x;
-  if (exp < 0) {
-    if (sign) return -1.0f;
+  if (exp == 128)
+    return x;
+  if (exp >= 23)
+    return x;
+  if (exp < 0)
+  {
+    if (sign)
+      return -1.0f;
     return 0.0f;
   }
 
   unsigned int mask = ~((1u << (23 - exp)) - 1);
   unsigned int truncated = v.u & mask;
 
-  if (truncated == v.u) return x;
+  if (truncated == v.u)
+    return x;
 
   if (sign)
     truncated += (1u << (23 - exp));

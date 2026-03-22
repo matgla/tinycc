@@ -74,11 +74,16 @@ build:
 # Objects are rebuilt with -fPIC in a separate directory
 # Uses -nodefaultlibs (not -nostdlib) since this IS the compiler runtime;
 # we don't want tcc to try linking libtcc1/softfp into softfp itself.
+# armeabi.c is compiled and linked in because yasld symbol resolution only
+# searches self + children (not parent modules), so __aeabi_memset,
+# __aeabi_lcmp, etc. must be statically included in the shared library.
 build-shared:
 	@echo "Building shared FP library for $(FPU)..."
 	@mkdir -p $(BUILD_DIR)/$(FPU)-pic
 	$(MAKE) -C $(TARGET_DIR) BUILD_DIR=$(CURDIR)/$(BUILD_DIR)/$(FPU)-pic \
 		FP_CC="$(FP_CC)" FP_CFLAGS="$(FP_CFLAGS) -I$(CURDIR)/../../include -fPIC -fpic"
+	$(FP_CC) $(FP_CFLAGS) -I$(CURDIR)/../../include -fPIC -fpic \
+		-c $(CURDIR)/../armeabi.c -o $(BUILD_DIR)/$(FPU)-pic/armeabi.o
 	$(FP_CC) -shared -fPIC -nodefaultlibs -Wl,-Ttext=0x0 -Wl,-section-alignment=0x4 \
 		-Wl,-oformat=yaff \
 		-o $(TARGET_SO) $(BUILD_DIR)/$(FPU)-pic/*.o

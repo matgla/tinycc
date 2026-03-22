@@ -176,6 +176,9 @@ TEST_FILES = [
     # 64-bit left-shift in a loop clobbers adjacent pointer register/spill slot
     ("bug_ll_shift_ptr_clobber.c", 0),
 
+    # for-loop increment lost when body has nested ternary chain as function arg
+    ("bug_for_ternary_chain.c", 0),
+
     ("../tests2/00_assignment.c", 0),
     ("../tests2/01_comment.c", 0),
     ("../tests2/02_printf.c", 0),

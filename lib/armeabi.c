@@ -526,12 +526,32 @@ float __aeabi_fneg(float a)
 static int armeabi_clz32(u32 x)
 {
   int n = 0;
-  if (x == 0) return 32;
-  if ((x & 0xFFFF0000u) == 0) { n += 16; x <<= 16; }
-  if ((x & 0xFF000000u) == 0) { n += 8; x <<= 8; }
-  if ((x & 0xF0000000u) == 0) { n += 4; x <<= 4; }
-  if ((x & 0xC0000000u) == 0) { n += 2; x <<= 2; }
-  if ((x & 0x80000000u) == 0) { n += 1; }
+  if (x == 0)
+    return 32;
+  if ((x & 0xFFFF0000u) == 0)
+  {
+    n += 16;
+    x <<= 16;
+  }
+  if ((x & 0xFF000000u) == 0)
+  {
+    n += 8;
+    x <<= 8;
+  }
+  if ((x & 0xF0000000u) == 0)
+  {
+    n += 4;
+    x <<= 4;
+  }
+  if ((x & 0xC0000000u) == 0)
+  {
+    n += 2;
+    x <<= 2;
+  }
+  if ((x & 0x80000000u) == 0)
+  {
+    n += 1;
+  }
   return n;
 }
 
@@ -552,9 +572,14 @@ static int armeabi_msb64(unsigned long long a)
 
 float __aeabi_ul2f(unsigned long long a)
 {
-  union { float f; u32 u; } r;
+  union
+  {
+    float f;
+    u32 u;
+  } r;
 
-  if (a == 0) {
+  if (a == 0)
+  {
     r.u = 0;
     return r.f;
   }
@@ -562,7 +587,8 @@ float __aeabi_ul2f(unsigned long long a)
   int msb = armeabi_msb64(a);
   int exp = 127 + msb;
 
-  if (msb <= 23) {
+  if (msb <= 23)
+  {
     /* Exact: value fits in 24-bit mantissa */
     u32 mant = ((u32)a << (23 - msb)) & 0x7FFFFFu;
     r.u = ((u32)exp << 23) | mant;
@@ -578,9 +604,11 @@ float __aeabi_ul2f(unsigned long long a)
   unsigned long long dropped = a & dropped_mask;
   unsigned long long half = 1ULL << (shift - 1);
 
-  if (dropped > half || (dropped == half && (mant & 1))) {
+  if (dropped > half || (dropped == half && (mant & 1)))
+  {
     mant++;
-    if (mant == (1u << 24)) {
+    if (mant == (1u << 24))
+    {
       mant = (1u << 23);
       exp++;
     }
@@ -593,9 +621,14 @@ float __aeabi_ul2f(unsigned long long a)
 
 double __aeabi_ul2d(unsigned long long a)
 {
-  union { double d; unsigned long long u; } r;
+  union
+  {
+    double d;
+    unsigned long long u;
+  } r;
 
-  if (a == 0) {
+  if (a == 0)
+  {
     r.u = 0;
     return r.d;
   }
@@ -603,7 +636,8 @@ double __aeabi_ul2d(unsigned long long a)
   int msb = armeabi_msb64(a);
   int exp = 1023 + msb;
 
-  if (msb <= 52) {
+  if (msb <= 52)
+  {
     /* Exact: value fits in 53-bit mantissa */
     unsigned long long mant = (a << (52 - msb)) & 0xFFFFFFFFFFFFFULL;
     r.u = ((unsigned long long)exp << 52) | mant;
@@ -619,9 +653,11 @@ double __aeabi_ul2d(unsigned long long a)
   unsigned long long dropped = a & dropped_mask;
   unsigned long long half = 1ULL << (shift - 1);
 
-  if (dropped > half || (dropped == half && (mant & 1))) {
+  if (dropped > half || (dropped == half && (mant & 1)))
+  {
     mant++;
-    if (mant == (1ULL << 53)) {
+    if (mant == (1ULL << 53))
+    {
       mant = (1ULL << 52);
       exp++;
     }
@@ -634,26 +670,35 @@ double __aeabi_ul2d(unsigned long long a)
 
 float __aeabi_l2f(long long a)
 {
-  union { float f; u32 u; } r;
+  union
+  {
+    float f;
+    u32 u;
+  } r;
 
-  if (a == 0) {
+  if (a == 0)
+  {
     r.u = 0;
     return r.f;
   }
 
   u32 sign = 0;
   unsigned long long mag;
-  if (a < 0) {
+  if (a < 0)
+  {
     sign = 0x80000000u;
     mag = -(unsigned long long)a;
-  } else {
+  }
+  else
+  {
     mag = (unsigned long long)a;
   }
 
   int msb = armeabi_msb64(mag);
   int exp = 127 + msb;
 
-  if (msb <= 23) {
+  if (msb <= 23)
+  {
     u32 mant = ((u32)mag << (23 - msb)) & 0x7FFFFFu;
     r.u = sign | ((u32)exp << 23) | mant;
     return r.f;
@@ -666,9 +711,11 @@ float __aeabi_l2f(long long a)
   unsigned long long dropped = mag & dropped_mask;
   unsigned long long half = 1ULL << (shift - 1);
 
-  if (dropped > half || (dropped == half && (mant & 1))) {
+  if (dropped > half || (dropped == half && (mant & 1)))
+  {
     mant++;
-    if (mant == (1u << 24)) {
+    if (mant == (1u << 24))
+    {
       mant = (1u << 23);
       exp++;
     }
@@ -681,26 +728,35 @@ float __aeabi_l2f(long long a)
 
 double __aeabi_l2d(long long a)
 {
-  union { double d; unsigned long long u; } r;
+  union
+  {
+    double d;
+    unsigned long long u;
+  } r;
 
-  if (a == 0) {
+  if (a == 0)
+  {
     r.u = 0;
     return r.d;
   }
 
   unsigned long long sign = 0;
   unsigned long long mag;
-  if (a < 0) {
+  if (a < 0)
+  {
     sign = 0x8000000000000000ULL;
     mag = -(unsigned long long)a;
-  } else {
+  }
+  else
+  {
     mag = (unsigned long long)a;
   }
 
   int msb = armeabi_msb64(mag);
   int exp = 1023 + msb;
 
-  if (msb <= 52) {
+  if (msb <= 52)
+  {
     unsigned long long mant = (mag << (52 - msb)) & 0xFFFFFFFFFFFFFULL;
     r.u = sign | ((unsigned long long)exp << 52) | mant;
     return r.d;
@@ -713,9 +769,11 @@ double __aeabi_l2d(long long a)
   unsigned long long dropped = mag & dropped_mask;
   unsigned long long half = 1ULL << (shift - 1);
 
-  if (dropped > half || (dropped == half && (mant & 1))) {
+  if (dropped > half || (dropped == half && (mant & 1)))
+  {
     mant++;
-    if (mant == (1ULL << 53)) {
+    if (mant == (1ULL << 53))
+    {
       mant = (1ULL << 52);
       exp++;
     }
