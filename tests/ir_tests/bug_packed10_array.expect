@@ -1,4 +1,4 @@
-sizeof(TestOperand) = 10
+sizeof(TestOperand) = 9
 OK: pool[0].tag = 1
 OK: pool[1].tag = 7
 OK: pool[2].tag = 2

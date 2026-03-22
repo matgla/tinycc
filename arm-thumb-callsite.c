@@ -11,6 +11,14 @@
 #include "tcctype.h"
 #include <limits.h>
 
+/* Debug output for callsite processing - disabled by default
+ * Enable with: -DCALLSITE_DEBUG_ENABLED or #define CALLSITE_DEBUG_ENABLED */
+#ifdef CALLSITE_DEBUG_ENABLED
+#define CALLSITE_DEBUG(...) fprintf(stderr, __VA_ARGS__)
+#else
+#define CALLSITE_DEBUG(...) ((void)0)
+#endif
+
 void thumb_free_call_sites(void)
 {
   if (thumb_gen_state.call_sites_by_id)
@@ -82,13 +90,14 @@ ThumbGenCallSite *thumb_get_call_site_for_id(int call_id)
  * Scans backwards from call_idx to find all FUNCPARAMVAL operations for this call.
  * argc_hint: if >= 0, use this as the known argument count (from FUNCCALL encoding).
  * out_args: if non-NULL, will be allocated and filled with argument IROperands.
+ * out_mops: if non-NULL, will be allocated and filled with MachineOperands.
  * Returns the number of arguments found, or -1 on error.
  */
 int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, int argc_hint, TCCAbiCallLayout *layout,
-                                    IROperand **out_args)
+                                    IROperand **out_args, MachineOperand **out_mops)
 {
-  fprintf(stderr, "[CALLSITE] thumb_build_call_layout_from_ir: call_idx=%d call_id=%d argc_hint=%d total_insns=%d\n",
-          call_idx, call_id, argc_hint, ir ? ir->next_instruction_index : -1);
+  CALLSITE_DEBUG("[CALLSITE] thumb_build_call_layout_from_ir: call_idx=%d call_id=%d argc_hint=%d total_insns=%d\n",
+                 call_idx, call_id, argc_hint, ir ? ir->next_instruction_index : -1);
   if (!ir || !layout || call_idx < 0)
     return -1;
 
@@ -100,6 +109,7 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, i
   TCCAbiArgDesc *arg_descs = NULL;
   uint8_t *found = NULL;
   IROperand *args = NULL;
+  MachineOperand *mops = NULL;
 
   /* If argc_hint is provided and valid, use it directly (O(argc) scan only).
    * Otherwise, fall back to scanning to find max_arg_index (O(n) scan). */
@@ -119,9 +129,9 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, i
       {
         const IROperand src2 = tcc_ir_get_src2(ir, j);
         int param_call_id = irop_is_none(src2) ? -1 : TCCIR_DECODE_CALL_ID((uint32_t)src2.u.imm32);
-        fprintf(stderr, "[CALLSITE]   legacy scan j=%d: FUNCPARAMVAL param_call_id=%d (want %d) param_idx=%d\n",
-                j, param_call_id, call_id,
-                irop_is_none(src2) ? -1 : (int)TCCIR_DECODE_PARAM_IDX((uint32_t)src2.u.imm32));
+        CALLSITE_DEBUG("[CALLSITE]   legacy scan j=%d: FUNCPARAMVAL param_call_id=%d (want %d) param_idx=%d\n", j,
+                       param_call_id, call_id,
+                       irop_is_none(src2) ? -1 : (int)TCCIR_DECODE_PARAM_IDX((uint32_t)src2.u.imm32));
         if (param_call_id == call_id)
         {
           int param_idx = TCCIR_DECODE_PARAM_IDX((uint32_t)src2.u.imm32);
@@ -131,7 +141,7 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, i
       }
     }
     argc = max_arg_index + 1;
-    fprintf(stderr, "[CALLSITE]   legacy scan result: max_arg_index=%d argc=%d\n", max_arg_index, argc);
+    CALLSITE_DEBUG("[CALLSITE]   legacy scan result: max_arg_index=%d argc=%d\n", max_arg_index, argc);
   }
 
   if (argc <= 0)
@@ -140,6 +150,8 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, i
     layout->stack_size = 0;
     if (out_args)
       *out_args = NULL;
+    if (out_mops)
+      *out_mops = NULL;
     return 0;
   }
 
@@ -165,7 +177,13 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, i
     args = (IROperand *)tcc_mallocz(sizeof(IROperand) * argc);
   }
 
-  fprintf(stderr, "[CALLSITE] scanning backwards from call_idx=%d for call_id=%d argc=%d\n", call_idx, call_id, argc);
+  /* Allocate MachineOperand array if caller wants them */
+  if (out_mops)
+  {
+    mops = (MachineOperand *)tcc_mallocz(sizeof(MachineOperand) * argc);
+  }
+
+  CALLSITE_DEBUG("[CALLSITE] scanning backwards from call_idx=%d for call_id=%d argc=%d\n", call_idx, call_id, argc);
   int found_count = 0;
   for (int j = call_idx - 1; j >= 0 && found_count < argc; --j)
   {
@@ -175,22 +193,26 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, i
       const IROperand src2 = tcc_ir_get_src2(ir, j);
       int param_call_id = !irop_is_none(src2) ? TCCIR_DECODE_CALL_ID((uint32_t)src2.u.imm32) : -1;
       int param_idx_raw = !irop_is_none(src2) ? (int)TCCIR_DECODE_PARAM_IDX((uint32_t)src2.u.imm32) : -1;
-      fprintf(stderr, "[CALLSITE]   j=%d FUNCPARAMVAL param_call_id=%d param_idx=%d (want call_id=%d)\n",
-              j, param_call_id, param_idx_raw, call_id);
+      (void)param_idx_raw; /* only used by CALLSITE_DEBUG */
+      CALLSITE_DEBUG("[CALLSITE]   j=%d FUNCPARAMVAL param_call_id=%d param_idx=%d (want call_id=%d)\n", j,
+                     param_call_id, param_idx_raw, call_id);
       if (param_call_id == call_id)
       {
         const IROperand src1_irop = tcc_ir_get_src1(ir, j);
         int param_idx = TCCIR_DECODE_PARAM_IDX((uint32_t)src2.u.imm32);
         if (param_idx >= 0 && param_idx < argc && !found[param_idx])
         {
-          fprintf(stderr, "[CALLSITE]     recording arg[%d] btype=%d is_64bit=%d\n",
-                  param_idx, src1_irop.btype, irop_is_64bit(src1_irop));
+          CALLSITE_DEBUG("[CALLSITE]     recording arg[%d] btype=%d is_64bit=%d\n", param_idx, src1_irop.btype,
+                         irop_is_64bit(src1_irop));
           /* Collect IROperand if requested */
           if (args)
           {
             args[param_idx] = src1_irop;
-            /* Apply register allocation to the operand */
-            tcc_ir_fill_registers_ir(ir, &args[param_idx]);
+          }
+          /* Collect MachineOperand if requested */
+          if (mops)
+          {
+            mops[param_idx] = machine_op_from_ir(ir, &src1_irop);
           }
           /* Determine argument type and size */
           if (irop_is_none(src1_irop))
@@ -210,9 +232,23 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, i
               align = 1;
             arg_descs[param_idx].kind = TCC_ABI_ARG_STRUCT_BYVAL;
             arg_descs[param_idx].size = (uint16_t)size;
-            arg_descs[param_idx].alignment = (uint8_t)align;
+            /* Use AAPCS natural alignment (based on member types, not
+             * __attribute__((aligned)) on the struct). This determines
+             * register alignment (even-register rule for 8-byte aligned). */
+            int aapcs_align = irop_aapcs_alignment(src1_irop);
+            arg_descs[param_idx].alignment = (uint8_t)(aapcs_align < align ? aapcs_align : align);
           }
-          else if (irop_is_64bit(src1_irop))
+          else if (src1_irop.is_complex)
+          {
+            /* Complex types are passed like composites (AAPCS):
+             * complex float = 8 bytes (2 regs), complex double = 16 bytes (4 regs). */
+            int elem_size = irop_is_64bit(src1_irop) ? 8 : 4;
+            int total_size = elem_size * 2;
+            arg_descs[param_idx].kind = TCC_ABI_ARG_STRUCT_BYVAL;
+            arg_descs[param_idx].size = (uint16_t)total_size;
+            arg_descs[param_idx].alignment = (uint8_t)elem_size;
+          }
+          else if (irop_needs_pair(src1_irop))
           {
             arg_descs[param_idx].kind = TCC_ABI_ARG_SCALAR64;
             arg_descs[param_idx].size = 8;
@@ -232,11 +268,11 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, i
     }
   }
 
-  fprintf(stderr, "[CALLSITE] scan complete: found_count=%d argc=%d\n", found_count, argc);
+  CALLSITE_DEBUG("[CALLSITE] scan complete: found_count=%d argc=%d\n", found_count, argc);
   /* Verify all parameters were found */
   for (int i = 0; i < argc; ++i)
   {
-    fprintf(stderr, "[CALLSITE]   arg[%d]: found=%d\n", i, found[i]);
+    CALLSITE_DEBUG("[CALLSITE]   arg[%d]: found=%d\n", i, found[i]);
     if (!found[i])
     {
       tcc_error("compiler_error: missing FUNCPARAMVAL for call_id=%d arg=%d", call_id, i);
@@ -262,6 +298,12 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, i
     *out_args = args;
   }
 
+  /* Return mops to caller if requested */
+  if (out_mops)
+  {
+    *out_mops = mops;
+  }
+
   /* Free heap-allocated arrays if used */
   if (argc > MAX_INLINE_ARGS)
   {
@@ -279,6 +321,10 @@ cleanup_error:
   if (args)
   {
     tcc_free(args);
+  }
+  if (mops)
+  {
+    tcc_free(mops);
   }
   if (layout->locs)
   {

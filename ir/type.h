@@ -71,4 +71,8 @@ int tcc_ir_is_64bit(int t);
 /* Returns true if operation requires FPU */
 int tcc_ir_type_op_needs_fpu(TccIrOp op);
 
+/* Check if an SValue operand needs dereferencing to get the actual value.
+ * Returns true when the operand holds an address that must be loaded through. */
+bool tcc_ir_operand_needs_dereference(struct SValue *sv);
+
 #endif /* TCC_IR_TYPE_H */

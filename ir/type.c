@@ -33,6 +33,12 @@ int tcc_ir_type_is_double(int t)
 int tcc_ir_type_is_64bit(int t)
 {
   int bt = t & VT_BTYPE;
+  /* Phase 3: Complex types based on float/double are 64-bit (8 bytes) or larger */
+  if (t & VT_COMPLEX)
+  {
+    /* float _Complex = 8 bytes (2 x 4), double _Complex = 16 bytes (2 x 8) */
+    return bt == VT_FLOAT || bt == VT_DOUBLE || bt == VT_LDOUBLE;
+  }
   return bt == VT_DOUBLE || bt == VT_LDOUBLE || bt == VT_LLONG;
 }
 
@@ -138,5 +144,36 @@ int tcc_ir_type_op_needs_fpu(TccIrOp op)
       return 1;
     default:
       return 0;
+  }
+}
+
+/* ============================================================================
+ * Operand Dereference Detection
+ * ============================================================================ */
+
+/* Check if an SValue operand needs dereferencing to get the actual value. */
+bool tcc_ir_operand_needs_dereference(SValue *sv)
+{
+  const int val_loc = sv->r & VT_VALMASK;
+  switch (val_loc)
+  {
+  case VT_CONST:
+  case VT_LOCAL:
+    /* VT_CONST with VT_LVAL means we're loading through a global symbol address.
+     * For example: a.x where 'a' is a static struct - the address is a constant
+     * (global symbol) but we need to dereference it to get the value. */
+    return (sv->r & VT_LVAL) != 0;
+  case VT_LLOCAL:
+  case VT_CMP:
+  case VT_JMP:
+  case VT_JMPI:
+    return false;
+  default: /* must be temporary vreg */
+    /* Register parameters (VT_PARAM without VT_LOCAL) have VT_LVAL set to allow
+     * taking their address (&param), but the register holds the VALUE directly,
+     * not a pointer. So VT_LVAL does NOT mean dereference for these. */
+    if ((sv->r & VT_PARAM) && !(sv->r & VT_LOCAL))
+      return false;
+    return (sv->r & VT_LVAL) != 0;
   }
 }

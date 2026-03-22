@@ -22,14 +22,14 @@ int tcc_ir_vreg_is_valid(TCCIRState *ir, int vr)
   const int position = TCCIR_DECODE_VREG_POSITION(vr);
   switch (type)
   {
-    case TCCIR_VREG_TYPE_VAR:
-      return position < ir->variables_live_intervals_size;
-    case TCCIR_VREG_TYPE_TEMP:
-      return position < ir->temporary_variables_live_intervals_size;
-    case TCCIR_VREG_TYPE_PARAM:
-      return position < ir->parameters_live_intervals_size;
-    default:
-      return 0;
+  case TCCIR_VREG_TYPE_VAR:
+    return position < ir->variables_live_intervals_size;
+  case TCCIR_VREG_TYPE_TEMP:
+    return position < ir->temporary_variables_live_intervals_size;
+  case TCCIR_VREG_TYPE_PARAM:
+    return position < ir->parameters_live_intervals_size;
+  default:
+    return 0;
   }
 }
 
@@ -43,30 +43,30 @@ int tcc_ir_vreg_is_ignored(TCCIRState *ir, int vreg)
 
   const int position = TCCIR_DECODE_VREG_POSITION(vreg);
   const int type = TCCIR_DECODE_VREG_TYPE(vreg);
-  
+
   int type_bit;
   switch (type)
   {
-    case TCCIR_VREG_TYPE_VAR:
-      type_bit = IGNORED_VREG_LOCAL_VAR_BIT;
-      break;
-    case TCCIR_VREG_TYPE_TEMP:
-      type_bit = IGNORED_VREG_TEMP_BIT;
-      break;
-    case TCCIR_VREG_TYPE_PARAM:
-      type_bit = IGNORED_VREG_PARAM_BIT;
-      break;
-    default:
-      return 0;
+  case TCCIR_VREG_TYPE_VAR:
+    type_bit = IGNORED_VREG_LOCAL_VAR_BIT;
+    break;
+  case TCCIR_VREG_TYPE_TEMP:
+    type_bit = IGNORED_VREG_TEMP_BIT;
+    break;
+  case TCCIR_VREG_TYPE_PARAM:
+    type_bit = IGNORED_VREG_PARAM_BIT;
+    break;
+  default:
+    return 0;
   }
-  
+
   const int bit_offset = position * IGNORED_VREG_BITS_PER_ENTRY + type_bit;
   const int index = bit_offset / 32;
   const int bit = bit_offset % 32;
-  
+
   if (ir->ignored_vregs == NULL || index >= ir->ignored_vregs_size)
     return 0;
-  
+
   return (ir->ignored_vregs[index] & (1 << bit)) != 0;
 }
 
@@ -82,20 +82,19 @@ int tcc_ir_vreg_alloc_temp(TCCIRState *ir)
 {
   if (ir == NULL)
     return -1;
-    
+
   if (ir->next_temporary_variable >= ir->temporary_variables_live_intervals_size)
   {
     const int used = ir->temporary_variables_live_intervals_size;
     ir->temporary_variables_live_intervals_size <<= 1;
     ir->temporary_variables_live_intervals = (IRLiveInterval *)tcc_realloc(
-        ir->temporary_variables_live_intervals, 
-        sizeof(IRLiveInterval) * ir->temporary_variables_live_intervals_size);
+        ir->temporary_variables_live_intervals, sizeof(IRLiveInterval) * ir->temporary_variables_live_intervals_size);
     memset(&ir->temporary_variables_live_intervals[used], 0,
            sizeof(IRLiveInterval) * (ir->temporary_variables_live_intervals_size - used));
     ir_vreg_intervals_init(&ir->temporary_variables_live_intervals[used],
                            ir->temporary_variables_live_intervals_size - used);
   }
-  
+
   const int next_temp_vr = ir->next_temporary_variable;
   ++ir->next_temporary_variable;
   return TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_TEMP, next_temp_vr);
@@ -106,20 +105,17 @@ int tcc_ir_vreg_alloc_var(TCCIRState *ir)
 {
   if (ir == NULL)
     return -1;
-    
+
   if (ir->next_local_variable >= ir->variables_live_intervals_size)
   {
     const int used = ir->variables_live_intervals_size;
     ir->variables_live_intervals_size <<= 1;
     ir->variables_live_intervals = (IRLiveInterval *)tcc_realloc(
-        ir->variables_live_intervals, 
-        sizeof(IRLiveInterval) * ir->variables_live_intervals_size);
-    memset(&ir->variables_live_intervals[used], 0, 
-           sizeof(IRLiveInterval) * (ir->variables_live_intervals_size - used));
-    ir_vreg_intervals_init(&ir->variables_live_intervals[used], 
-                           ir->variables_live_intervals_size - used);
+        ir->variables_live_intervals, sizeof(IRLiveInterval) * ir->variables_live_intervals_size);
+    memset(&ir->variables_live_intervals[used], 0, sizeof(IRLiveInterval) * (ir->variables_live_intervals_size - used));
+    ir_vreg_intervals_init(&ir->variables_live_intervals[used], ir->variables_live_intervals_size - used);
   }
-  
+
   const int next_var_vr = ir->next_local_variable;
   ++ir->next_local_variable;
   return TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_VAR, next_var_vr);
@@ -133,17 +129,44 @@ int tcc_ir_vreg_alloc_param(TCCIRState *ir)
     const int used = ir->parameters_live_intervals_size;
     ir->parameters_live_intervals_size <<= 1;
     ir->parameters_live_intervals = (IRLiveInterval *)tcc_realloc(
-        ir->parameters_live_intervals, 
-        sizeof(IRLiveInterval) * ir->parameters_live_intervals_size);
+        ir->parameters_live_intervals, sizeof(IRLiveInterval) * ir->parameters_live_intervals_size);
     memset(&ir->parameters_live_intervals[used], 0,
            sizeof(IRLiveInterval) * (ir->parameters_live_intervals_size - used));
-    ir_vreg_intervals_init(&ir->parameters_live_intervals[used], 
-                           ir->parameters_live_intervals_size - used);
+    ir_vreg_intervals_init(&ir->parameters_live_intervals[used], ir->parameters_live_intervals_size - used);
   }
-  
+
   const int next_param_vr = ir->next_parameter;
   ++ir->next_parameter;
   return TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_PARAM, next_param_vr);
+}
+
+/* Allocate a static chain virtual register for nested functions.
+ * This allocates a variable vreg (not a parameter) to model the static chain
+ * register (R10 on ARM). The chain vreg is used for liveness tracking and
+ * ensuring R10 is preserved, but it doesn't consume a parameter slot.
+ *
+ * The static chain is passed in R10 by the parent function (via SET_CHAIN),
+ * and the nested function uses R10 directly when accessing captured variables.
+ * The chain vreg ensures R10 is treated as live-in and preserved if modified.
+ */
+int tcc_ir_vreg_alloc_static_chain(TCCIRState *ir)
+{
+  /* Allocate as a variable vreg (not parameter) to avoid shifting parameter indices */
+  int vreg = tcc_ir_vreg_alloc_var(ir);
+
+  /* Set the incoming register to the static chain register (R10) */
+  IRLiveInterval *interval = tcc_ir_vreg_live_interval(ir, vreg);
+  if (interval)
+  {
+    /* R10 is the static chain register on ARM */
+    interval->incoming_reg0 = 10; /* R10 */
+    interval->incoming_reg1 = -1; /* Not a 64-bit value */
+    /* Mark as live from instruction 0 */
+    interval->start = 0;
+    /* End will be set to last instruction during liveness analysis */
+  }
+
+  return vreg;
 }
 
 /* Initialize interval start fields */
@@ -173,41 +196,41 @@ IRLiveInterval *tcc_ir_vreg_live_interval(TCCIRState *ir, int vreg)
     fprintf(stderr, "tcc_ir_vreg_live_interval: invalid vreg: %d\n", vreg);
     exit(1);
   }
-  
+
   int decoded_vreg_position = TCCIR_DECODE_VREG_POSITION(vreg);
   switch (TCCIR_DECODE_VREG_TYPE(vreg))
   {
-    case TCCIR_VREG_TYPE_VAR:
+  case TCCIR_VREG_TYPE_VAR:
+  {
+    if (decoded_vreg_position >= ir->variables_live_intervals_size)
     {
-      if (decoded_vreg_position >= ir->variables_live_intervals_size)
-      {
-        fprintf(stderr, "Getting out of bounds live interval for vreg %d\n", vreg);
-        exit(1);
-      }
-      return &ir->variables_live_intervals[decoded_vreg_position];
-    }
-    case TCCIR_VREG_TYPE_TEMP:
-    {
-      if (decoded_vreg_position >= ir->temporary_variables_live_intervals_size)
-      {
-        fprintf(stderr, "Getting out of bounds live interval for vreg %d\n", vreg);
-        exit(1);
-      }
-      return &ir->temporary_variables_live_intervals[decoded_vreg_position];
-    }
-    case TCCIR_VREG_TYPE_PARAM:
-    {
-      if (decoded_vreg_position >= ir->parameters_live_intervals_size)
-      {
-        fprintf(stderr, "Getting out of bounds live interval for vreg %d\n", vreg);
-        exit(1);
-      }
-      return &ir->parameters_live_intervals[decoded_vreg_position];
-    }
-    default:
-      fprintf(stderr, "tcc_ir_vreg_live_interval: unknown vreg type %d, for vreg: %d\n", 
-              TCCIR_DECODE_VREG_TYPE(vreg), vreg);
+      fprintf(stderr, "Getting out of bounds live interval for vreg %d\n", vreg);
       exit(1);
+    }
+    return &ir->variables_live_intervals[decoded_vreg_position];
+  }
+  case TCCIR_VREG_TYPE_TEMP:
+  {
+    if (decoded_vreg_position >= ir->temporary_variables_live_intervals_size)
+    {
+      fprintf(stderr, "Getting out of bounds live interval for vreg %d\n", vreg);
+      exit(1);
+    }
+    return &ir->temporary_variables_live_intervals[decoded_vreg_position];
+  }
+  case TCCIR_VREG_TYPE_PARAM:
+  {
+    if (decoded_vreg_position >= ir->parameters_live_intervals_size)
+    {
+      fprintf(stderr, "Getting out of bounds live interval for vreg %d\n", vreg);
+      exit(1);
+    }
+    return &ir->parameters_live_intervals[decoded_vreg_position];
+  }
+  default:
+    fprintf(stderr, "tcc_ir_vreg_live_interval: unknown vreg type %d, for vreg: %d\n", TCCIR_DECODE_VREG_TYPE(vreg),
+            vreg);
+    exit(1);
   }
   return NULL;
 }
@@ -250,6 +273,16 @@ void tcc_ir_vreg_type_set_64bit(TCCIRState *ir, int vreg)
     interval->is_llong = 1;
 }
 
+/* Phase 3: Mark vreg as complex type */
+void tcc_ir_vreg_type_set_complex(TCCIRState *ir, int vreg)
+{
+  if (vreg < 0 || TCCIR_DECODE_VREG_TYPE(vreg) == 0)
+    return;
+  IRLiveInterval *interval = tcc_ir_vreg_live_interval(ir, vreg);
+  if (interval)
+    interval->is_complex = 1;
+}
+
 /* Set original stack offset for vreg */
 void tcc_ir_vreg_offset_set(TCCIRState *ir, int vreg, int offset)
 {
@@ -257,7 +290,9 @@ void tcc_ir_vreg_offset_set(TCCIRState *ir, int vreg, int offset)
     return;
   IRLiveInterval *interval = tcc_ir_vreg_live_interval(ir, vreg);
   if (interval)
+  {
     interval->original_offset = offset;
+  }
 }
 
 /* ============================================================================
@@ -269,12 +304,15 @@ int tcc_ir_vreg_type_get(TCCIRState *ir, int vreg)
 {
   if (vreg < 0 || TCCIR_DECODE_VREG_TYPE(vreg) == 0)
     return LS_REG_TYPE_INT;
-  
+
   IRLiveInterval *interval = tcc_ir_vreg_live_interval(ir, vreg);
   if (interval)
   {
     if (interval->is_llong)
       return LS_REG_TYPE_LLONG;
+    /* Phase 3: Complex types need register pairs like DOUBLE_SOFT */
+    if (interval->is_complex)
+      return interval->is_double ? LS_REG_TYPE_COMPLEX_DOUBLE : LS_REG_TYPE_COMPLEX_FLOAT;
     if (interval->is_float)
     {
       if (interval->is_double)
@@ -290,14 +328,14 @@ const char *tcc_ir_vreg_type_string(int vreg)
 {
   switch (TCCIR_DECODE_VREG_TYPE(vreg))
   {
-    case TCCIR_VREG_TYPE_VAR:
-      return "VAR";
-    case TCCIR_VREG_TYPE_TEMP:
-      return "TMP";
-    case TCCIR_VREG_TYPE_PARAM:
-      return "PAR";
-    default:
-      return "UNK";
+  case TCCIR_VREG_TYPE_VAR:
+    return "VAR";
+  case TCCIR_VREG_TYPE_TEMP:
+    return "TMP";
+  case TCCIR_VREG_TYPE_PARAM:
+    return "PAR";
+  default:
+    return "UNK";
   }
 }
 
@@ -395,6 +433,12 @@ int tcc_ir_get_vreg_var(TCCIRState *ir)
 int tcc_ir_get_vreg_param(TCCIRState *ir)
 {
   return tcc_ir_vreg_alloc_param(ir);
+}
+
+/* Allocate static chain vreg - legacy name */
+int tcc_ir_get_vreg_static_chain(TCCIRState *ir)
+{
+  return tcc_ir_vreg_alloc_static_chain(ir);
 }
 
 /* Mark vreg as address-taken - legacy name */

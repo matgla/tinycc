@@ -104,9 +104,9 @@ PUB_FUNC char *tcc_basename(const char *name)
  */
 PUB_FUNC char *tcc_fileextension(const char *name)
 {
-  char *b = tcc_basename(name);
-  char *e = strrchr(b, '.');
-  return e ? e : strchr(b, 0);
+  const char *b = tcc_basename(name);
+  const char *e = strrchr(b, '.');
+  return (char *)(e ? e : strchr(b, 0));
 }
 
 ST_FUNC char *tcc_load_text(int fd)
@@ -770,7 +770,7 @@ LIBTCCAPI TCCState *tcc_new(void)
   s->pic = 0;
   s->no_pie = 0;
 #if defined(TCC_TARGET_ARM) || defined(TCC_TARGET_ARM_THUMB)
-  s->float_abi = ARM_SOFTFP_FLOAT; // use soft abi and prefer hard library as default
+  s->float_abi = ARM_SOFTFP_FLOAT;
   s->fpu_type = ARM_FPU_AUTO;      /* default to auto-detect */
 #if defined(TCC_TARGET_YASOS)
   s->text_and_data_separation = 1;
@@ -1625,6 +1625,7 @@ static const FlagDef options_f[] = {{offsetof(TCCState, char_is_unsigned), 0, "u
                                     {offsetof(TCCState, opt_strength_red), 0, "strength-red"},
                                     {offsetof(TCCState, opt_iv_strength_red), 0, "iv-strength-red"},
                                     {offsetof(TCCState, opt_jump_threading), 0, "jump-threading"},
+                                    {offsetof(TCCState, instrument_functions), 0, "instrument-functions"},
                                     {0, 0, NULL}};
 
 static const FlagDef options_m[] = {{offsetof(TCCState, ms_bitfields), 0, "ms-bitfields"}, {0, 0, NULL}};
@@ -1889,6 +1890,12 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
     case TCC_OPTION_std:
       if (strcmp(optarg, "=c11") == 0 || strcmp(optarg, "=gnu11") == 0)
         s->cversion = 201112;
+      else if (strcmp(optarg, "=c17") == 0 || strcmp(optarg, "=gnu17") == 0 || strcmp(optarg, "=c18") == 0 ||
+               strcmp(optarg, "=gnu18") == 0)
+        s->cversion = 201710;
+      else if (strcmp(optarg, "=c23") == 0 || strcmp(optarg, "=gnu23") == 0 || strcmp(optarg, "=c2x") == 0 ||
+               strcmp(optarg, "=gnu2x") == 0)
+        s->cversion = 202311;
       break;
     case TCC_OPTION_shared:
       x = TCC_OUTPUT_DLL;
@@ -1931,6 +1938,27 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
       ++noaction;
       break;
     case TCC_OPTION_f:
+      /* Handle -fno-builtin-<name> flags */
+      if (!strncmp(optarg, "no-builtin-", 11))
+      {
+        const char *bname = optarg + 11;
+        if (!strcmp(bname, "abs"))
+          s->no_builtin_funcs |= NO_BUILTIN_ABS;
+        else if (!strcmp(bname, "labs"))
+          s->no_builtin_funcs |= NO_BUILTIN_LABS;
+        else if (!strcmp(bname, "llabs"))
+          s->no_builtin_funcs |= NO_BUILTIN_LLABS;
+        else if (!strcmp(bname, "uabs"))
+          s->no_builtin_funcs |= NO_BUILTIN_UABS;
+        else if (!strcmp(bname, "ulabs"))
+          s->no_builtin_funcs |= NO_BUILTIN_ULABS;
+        else if (!strcmp(bname, "ullabs"))
+          s->no_builtin_funcs |= NO_BUILTIN_ULLABS;
+        else if (!strcmp(bname, "umaxabs"))
+          s->no_builtin_funcs |= NO_BUILTIN_UMAXABS;
+        /* Silently accept other -fno-builtin-<name> flags */
+        break;
+      }
       if (set_flag(s, options_f, optarg) < 0)
         goto unsupported_option;
       break;
@@ -2119,6 +2147,9 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
         s->opt_licm = 1;            /* Loop-invariant code motion */
         s->opt_strength_red = 1;    /* Strength reduction for multiply */
         s->opt_iv_strength_red = 1; /* IV strength reduction for array loops */
+        s->opt_nonneg_fold = 1;     /* Non-negative value branch folding */
+        s->opt_vrp = 1;             /* Value range propagation branch folding */
+        s->opt_float_narrow = 1;    /* Narrow double math to float when safe */
         s->opt_jump_threading = 1;  /* Jump threading optimization */
       }
       break;

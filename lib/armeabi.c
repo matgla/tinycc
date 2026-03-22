@@ -20,6 +20,32 @@
 typedef unsigned int u32;
 typedef int s32;
 
+static float aeabi_fneg_impl(float a)
+{
+  union
+  {
+    float f;
+    u32 u;
+  } v;
+
+  v.f = a;
+  v.u ^= 0x80000000u;
+  return v.f;
+}
+
+static double aeabi_dneg_impl(double a)
+{
+  union
+  {
+    double d;
+    unsigned long long u;
+  } v;
+
+  v.d = a;
+  v.u ^= 0x8000000000000000ULL;
+  return v.d;
+}
+
 /* FP Library Selection
  * ====================
  *
@@ -491,6 +517,271 @@ long long __aeabi_lasr(long long a, int b)
   return u.ll;
 }
 
-/* Floating point conversions are provided by lib/fp/ libraries */
+float __aeabi_fneg(float a)
+{
+  return aeabi_fneg_impl(a);
+}
+
+/* Count leading zeros in 32-bit value */
+static int armeabi_clz32(u32 x)
+{
+  int n = 0;
+  if (x == 0)
+    return 32;
+  if ((x & 0xFFFF0000u) == 0)
+  {
+    n += 16;
+    x <<= 16;
+  }
+  if ((x & 0xFF000000u) == 0)
+  {
+    n += 8;
+    x <<= 8;
+  }
+  if ((x & 0xF0000000u) == 0)
+  {
+    n += 4;
+    x <<= 4;
+  }
+  if ((x & 0xC0000000u) == 0)
+  {
+    n += 2;
+    x <<= 2;
+  }
+  if ((x & 0x80000000u) == 0)
+  {
+    n += 1;
+  }
+  return n;
+}
+
+/* Find MSB position (0-63) for a non-zero 64-bit value */
+static int armeabi_msb64(unsigned long long a)
+{
+  u32 hi = (u32)(a >> 32);
+  if (hi != 0)
+    return 63 - armeabi_clz32(hi);
+  return 31 - armeabi_clz32((u32)a);
+}
+
+/*
+ * Pure bit-manipulation IEEE 754 conversions with round-to-nearest-even.
+ * These MUST NOT use float/double casts (TCC would turn those into recursive
+ * calls back to these very functions).
+ */
+
+float __aeabi_ul2f(unsigned long long a)
+{
+  union
+  {
+    float f;
+    u32 u;
+  } r;
+
+  if (a == 0)
+  {
+    r.u = 0;
+    return r.f;
+  }
+
+  int msb = armeabi_msb64(a);
+  int exp = 127 + msb;
+
+  if (msb <= 23)
+  {
+    /* Exact: value fits in 24-bit mantissa */
+    u32 mant = ((u32)a << (23 - msb)) & 0x7FFFFFu;
+    r.u = ((u32)exp << 23) | mant;
+    return r.f;
+  }
+
+  /* Need rounding */
+  int shift = msb - 23;
+  u32 mant = (u32)(a >> shift);
+
+  /* IEEE 754 round-to-nearest-even */
+  unsigned long long dropped_mask = (1ULL << shift) - 1;
+  unsigned long long dropped = a & dropped_mask;
+  unsigned long long half = 1ULL << (shift - 1);
+
+  if (dropped > half || (dropped == half && (mant & 1)))
+  {
+    mant++;
+    if (mant == (1u << 24))
+    {
+      mant = (1u << 23);
+      exp++;
+    }
+  }
+
+  mant &= 0x7FFFFFu;
+  r.u = ((u32)exp << 23) | mant;
+  return r.f;
+}
+
+double __aeabi_ul2d(unsigned long long a)
+{
+  union
+  {
+    double d;
+    unsigned long long u;
+  } r;
+
+  if (a == 0)
+  {
+    r.u = 0;
+    return r.d;
+  }
+
+  int msb = armeabi_msb64(a);
+  int exp = 1023 + msb;
+
+  if (msb <= 52)
+  {
+    /* Exact: value fits in 53-bit mantissa */
+    unsigned long long mant = (a << (52 - msb)) & 0xFFFFFFFFFFFFFULL;
+    r.u = ((unsigned long long)exp << 52) | mant;
+    return r.d;
+  }
+
+  /* Need rounding */
+  int shift = msb - 52;
+  unsigned long long mant = a >> shift;
+
+  /* IEEE 754 round-to-nearest-even */
+  unsigned long long dropped_mask = (1ULL << shift) - 1;
+  unsigned long long dropped = a & dropped_mask;
+  unsigned long long half = 1ULL << (shift - 1);
+
+  if (dropped > half || (dropped == half && (mant & 1)))
+  {
+    mant++;
+    if (mant == (1ULL << 53))
+    {
+      mant = (1ULL << 52);
+      exp++;
+    }
+  }
+
+  mant &= 0xFFFFFFFFFFFFFULL;
+  r.u = ((unsigned long long)exp << 52) | mant;
+  return r.d;
+}
+
+float __aeabi_l2f(long long a)
+{
+  union
+  {
+    float f;
+    u32 u;
+  } r;
+
+  if (a == 0)
+  {
+    r.u = 0;
+    return r.f;
+  }
+
+  u32 sign = 0;
+  unsigned long long mag;
+  if (a < 0)
+  {
+    sign = 0x80000000u;
+    mag = -(unsigned long long)a;
+  }
+  else
+  {
+    mag = (unsigned long long)a;
+  }
+
+  int msb = armeabi_msb64(mag);
+  int exp = 127 + msb;
+
+  if (msb <= 23)
+  {
+    u32 mant = ((u32)mag << (23 - msb)) & 0x7FFFFFu;
+    r.u = sign | ((u32)exp << 23) | mant;
+    return r.f;
+  }
+
+  int shift = msb - 23;
+  u32 mant = (u32)(mag >> shift);
+
+  unsigned long long dropped_mask = (1ULL << shift) - 1;
+  unsigned long long dropped = mag & dropped_mask;
+  unsigned long long half = 1ULL << (shift - 1);
+
+  if (dropped > half || (dropped == half && (mant & 1)))
+  {
+    mant++;
+    if (mant == (1u << 24))
+    {
+      mant = (1u << 23);
+      exp++;
+    }
+  }
+
+  mant &= 0x7FFFFFu;
+  r.u = sign | ((u32)exp << 23) | mant;
+  return r.f;
+}
+
+double __aeabi_l2d(long long a)
+{
+  union
+  {
+    double d;
+    unsigned long long u;
+  } r;
+
+  if (a == 0)
+  {
+    r.u = 0;
+    return r.d;
+  }
+
+  unsigned long long sign = 0;
+  unsigned long long mag;
+  if (a < 0)
+  {
+    sign = 0x8000000000000000ULL;
+    mag = -(unsigned long long)a;
+  }
+  else
+  {
+    mag = (unsigned long long)a;
+  }
+
+  int msb = armeabi_msb64(mag);
+  int exp = 1023 + msb;
+
+  if (msb <= 52)
+  {
+    unsigned long long mant = (mag << (52 - msb)) & 0xFFFFFFFFFFFFFULL;
+    r.u = sign | ((unsigned long long)exp << 52) | mant;
+    return r.d;
+  }
+
+  int shift = msb - 52;
+  unsigned long long mant = mag >> shift;
+
+  unsigned long long dropped_mask = (1ULL << shift) - 1;
+  unsigned long long dropped = mag & dropped_mask;
+  unsigned long long half = 1ULL << (shift - 1);
+
+  if (dropped > half || (dropped == half && (mant & 1)))
+  {
+    mant++;
+    if (mant == (1ULL << 53))
+    {
+      mant = (1ULL << 52);
+      exp++;
+    }
+  }
+
+  mant &= 0xFFFFFFFFFFFFFULL;
+  r.u = sign | ((unsigned long long)exp << 52) | mant;
+  return r.d;
+}
 
 #endif /* __ARM_EABI__ */

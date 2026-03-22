@@ -1,0 +1,4 @@
+Hello from __builtin_printf!
+Return value: 29
+Multiple args: 42, test, X
+Return value: 27

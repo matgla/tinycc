@@ -1,0 +1,87 @@
+
+gcc_nested.o:     file format elf32-littlearm
+
+
+Disassembly of section .text:
+
+00000000 <inc.0>:
+   0:	b480      	push	{r7}
+   2:	b083      	sub	sp, #12
+   4:	af00      	add	r7, sp, #0
+   6:	6078      	str	r0, [r7, #4]
+   8:	4663      	mov	r3, ip
+   a:	f8c7 c000 	str.w	ip, [r7]
+   e:	681a      	ldr	r2, [r3, #0]
+  10:	687b      	ldr	r3, [r7, #4]
+  12:	4413      	add	r3, r2
+  14:	4618      	mov	r0, r3
+  16:	370c      	adds	r7, #12
+  18:	46bd      	mov	sp, r7
+  1a:	bc80      	pop	{r7}
+  1c:	4770      	bx	lr
+
+0000001e <main>:
+  1e:	b580      	push	{r7, lr}
+  20:	b082      	sub	sp, #8
+  22:	af00      	add	r7, sp, #0
+  24:	f107 0310 	add.w	r3, r7, #16
+  28:	607b      	str	r3, [r7, #4]
+  2a:	2364      	movs	r3, #100	@ 0x64
+  2c:	603b      	str	r3, [r7, #0]
+  2e:	463b      	mov	r3, r7
+  30:	469c      	mov	ip, r3
+  32:	2005      	movs	r0, #5
+  34:	f7ff ffe4 	bl	0 <inc.0>
+  38:	4603      	mov	r3, r0
+  3a:	4619      	mov	r1, r3
+  3c:	4813      	ldr	r0, [pc, #76]	@ (8c <main+0x6e>)
+  3e:	f7ff fffe 	bl	0 <printf>
+  42:	463b      	mov	r3, r7
+  44:	469c      	mov	ip, r3
+  46:	2005      	movs	r0, #5
+  48:	f000 f822 	bl	90 <dec.1>
+  4c:	4603      	mov	r3, r0
+  4e:	4619      	mov	r1, r3
+  50:	480e      	ldr	r0, [pc, #56]	@ (8c <main+0x6e>)
+  52:	f7ff fffe 	bl	0 <printf>
+  56:	23c8      	movs	r3, #200	@ 0xc8
+  58:	603b      	str	r3, [r7, #0]
+  5a:	463b      	mov	r3, r7
+  5c:	469c      	mov	ip, r3
+  5e:	2005      	movs	r0, #5
+  60:	f7ff ffce 	bl	0 <inc.0>
+  64:	4603      	mov	r3, r0
+  66:	4619      	mov	r1, r3
+  68:	4808      	ldr	r0, [pc, #32]	@ (8c <main+0x6e>)
+  6a:	f7ff fffe 	bl	0 <printf>
+  6e:	463b      	mov	r3, r7
+  70:	469c      	mov	ip, r3
+  72:	2005      	movs	r0, #5
+  74:	f000 f80c 	bl	90 <dec.1>
+  78:	4603      	mov	r3, r0
+  7a:	4619      	mov	r1, r3
+  7c:	4803      	ldr	r0, [pc, #12]	@ (8c <main+0x6e>)
+  7e:	f7ff fffe 	bl	0 <printf>
+  82:	2300      	movs	r3, #0
+  84:	4618      	mov	r0, r3
+  86:	3708      	adds	r7, #8
+  88:	46bd      	mov	sp, r7
+  8a:	bd80      	pop	{r7, pc}
+  8c:	00000000 	.word	0x00000000
+
+00000090 <dec.1>:
+  90:	b480      	push	{r7}
+  92:	b083      	sub	sp, #12
+  94:	af00      	add	r7, sp, #0
+  96:	6078      	str	r0, [r7, #4]
+  98:	4663      	mov	r3, ip
+  9a:	f8c7 c000 	str.w	ip, [r7]
+  9e:	681a      	ldr	r2, [r3, #0]
+  a0:	687b      	ldr	r3, [r7, #4]
+  a2:	1ad3      	subs	r3, r2, r3
+  a4:	4618      	mov	r0, r3
+  a6:	370c      	adds	r7, #12
+  a8:	46bd      	mov	sp, r7
+  aa:	bc80      	pop	{r7}
+  ac:	4770      	bx	lr
+  ae:	bf00      	nop

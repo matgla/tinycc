@@ -119,7 +119,7 @@ static void tcc_ls_build_live_regs_by_instruction(LSLiveIntervalState *ls)
 
     /* Only track integer register occupancy; skip spilled/stack-only intervals. */
     if (interval->reg_type != LS_REG_TYPE_INT && interval->reg_type != LS_REG_TYPE_LLONG &&
-        interval->reg_type != LS_REG_TYPE_DOUBLE_SOFT)
+        interval->reg_type != LS_REG_TYPE_DOUBLE_SOFT && interval->reg_type != LS_REG_TYPE_COMPLEX_FLOAT)
       continue;
     if (interval->addrtaken || interval->stack_location != 0)
       continue;
@@ -145,7 +145,7 @@ static void tcc_ls_build_live_regs_by_instruction(LSLiveIntervalState *ls)
     const LSLiveInterval *interval = &ls->intervals[i];
 
     if (interval->reg_type != LS_REG_TYPE_INT && interval->reg_type != LS_REG_TYPE_LLONG &&
-        interval->reg_type != LS_REG_TYPE_DOUBLE_SOFT)
+        interval->reg_type != LS_REG_TYPE_DOUBLE_SOFT && interval->reg_type != LS_REG_TYPE_COMPLEX_FLOAT)
       continue;
     if (interval->addrtaken || interval->stack_location != 0)
       continue;
@@ -208,6 +208,12 @@ void tcc_ls_add_live_interval(LSLiveIntervalState *ls, int vreg, int start, int 
     break;
   case LS_REG_TYPE_DOUBLE_SOFT:
     type_str = "DOUBLE_SOFT";
+    break;
+  case LS_REG_TYPE_COMPLEX_FLOAT:
+    type_str = "COMPLEX_FLOAT";
+    break;
+  case LS_REG_TYPE_COMPLEX_DOUBLE:
+    type_str = "COMPLEX_DOUBLE";
     break;
   default:
     type_str = "UNKNOWN";
@@ -544,7 +550,8 @@ void tcc_ls_expire_old_intervals(LSLiveIntervalState *ls, int current_index)
     {
       /* Integer types (INT, LLONG, DOUBLE_SOFT) */
       if (ls->active_set[i]->r1 >= 0 &&
-          (ls->active_set[i]->reg_type == LS_REG_TYPE_LLONG || ls->active_set[i]->reg_type == LS_REG_TYPE_DOUBLE_SOFT))
+          (ls->active_set[i]->reg_type == LS_REG_TYPE_LLONG || ls->active_set[i]->reg_type == LS_REG_TYPE_DOUBLE_SOFT ||
+           ls->active_set[i]->reg_type == LS_REG_TYPE_COMPLEX_FLOAT))
       {
         LS_DBG("    Releasing register pair R%d:R%d (vreg=%u ended at %d)", ls->active_set[i]->r0,
                ls->active_set[i]->r1, ls->active_set[i]->vreg, ls->active_set[i]->end);
@@ -557,7 +564,8 @@ void tcc_ls_expire_old_intervals(LSLiveIntervalState *ls, int current_index)
       tcc_ls_release_register(ls, ls->active_set[i]->r0);
       /* Release second register for 64-bit types */
       if (ls->active_set[i]->r1 >= 0 &&
-          (ls->active_set[i]->reg_type == LS_REG_TYPE_LLONG || ls->active_set[i]->reg_type == LS_REG_TYPE_DOUBLE_SOFT))
+          (ls->active_set[i]->reg_type == LS_REG_TYPE_LLONG || ls->active_set[i]->reg_type == LS_REG_TYPE_DOUBLE_SOFT ||
+           ls->active_set[i]->reg_type == LS_REG_TYPE_COMPLEX_FLOAT))
       {
         tcc_ls_release_register(ls, ls->active_set[i]->r1);
       }
@@ -622,7 +630,10 @@ static int tcc_ls_reg_type_stack_size(int reg_type)
   case LS_REG_TYPE_LLONG:
   case LS_REG_TYPE_DOUBLE:
   case LS_REG_TYPE_DOUBLE_SOFT:
+  case LS_REG_TYPE_COMPLEX_FLOAT:
     return 8;
+  case LS_REG_TYPE_COMPLEX_DOUBLE:
+    return 16;
   default:
     return 4;
   }
@@ -658,6 +669,16 @@ void tcc_ls_spill_interval_sized(LSLiveIntervalState *ls, int interval_index, in
 {
   LSLiveInterval *interval = &ls->intervals[interval_index];
   LS_DBG("  Spilling interval vreg=%u: trying to find register by spilling another", interval->vreg);
+
+  /* 128-bit complex doubles cannot fit in any register (pair).
+   * Always spill to stack without trying to steal a register. */
+  if (size > 8)
+  {
+    interval->stack_location = tcc_ls_next_stack_location_sized(size);
+    LS_DBG("    %d-bit type: spilled directly to stack at %d", size * 8, (int)interval->stack_location);
+    return;
+  }
+
   /* If no active intervals, just spill to stack */
   if (ls->next_active_index == 0)
   {
@@ -741,6 +762,15 @@ void tcc_ls_allocate_registers(LSLiveIntervalState *ls, int used_parameters_regi
   LS_DBG("Initial integer register map: 0x%llx", (unsigned long long)ls->registers_map);
   LS_DBG("Initial float register map: 0x%llx", (unsigned long long)ls->float_registers_map);
 
+  /* If this function has a static chain (nested function with captured variables),
+   * reserve R10 for the static chain pointer. */
+  if (tcc_state->ir && tcc_state->ir->has_static_chain)
+  {
+    int chain_reg = architecture_config.static_chain_reg;
+    ls->registers_map &= ~((uint64_t)1 << chain_reg);
+    LS_DBG("Reserved static chain register R%d", chain_reg);
+  }
+
   /* R11 is available for normal allocation, but reserved during call argument processing.
    * R12 (IP) is the standard inter-procedure scratch register. */
   /* Note: We used to reserve R0-R3 here, but with parameter pre-coloring, the
@@ -818,9 +848,10 @@ void tcc_ls_allocate_registers(LSLiveIntervalState *ls, int used_parameters_regi
         tcc_ls_spill_interval(ls, i);
       }
     }
-    else if (ls->intervals[i].reg_type == LS_REG_TYPE_LLONG || ls->intervals[i].reg_type == LS_REG_TYPE_DOUBLE_SOFT)
+    else if (ls->intervals[i].reg_type == LS_REG_TYPE_LLONG || ls->intervals[i].reg_type == LS_REG_TYPE_DOUBLE_SOFT ||
+             ls->intervals[i].reg_type == LS_REG_TYPE_COMPLEX_FLOAT)
     {
-      /* 64-bit integer type - needs two integer registers */
+      /* 64-bit integer type or complex float - needs two integer registers */
       int r0 = -1, r1 = -1;
       if (ls->intervals[i].r0 == -1)
       {
@@ -902,6 +933,12 @@ void tcc_ls_allocate_registers(LSLiveIntervalState *ls, int used_parameters_regi
         LS_DBG("  Assigned register pair R%d:R%d%s", ls->intervals[i].r0, ls->intervals[i].r1,
                ls->intervals[i].crosses_call ? " (callee-saved)" : "");
       }
+    }
+    else if (ls->intervals[i].reg_type == LS_REG_TYPE_COMPLEX_DOUBLE)
+    {
+      /* 128-bit complex double: always spill (cannot fit in a register pair) */
+      LS_DBG("  Complex double (128-bit): force-spilling to stack");
+      tcc_ls_spill_interval_sized(ls, i, 16); /* 128-bit = 16 bytes */
     }
     else
     {

@@ -144,9 +144,9 @@ int bar (const char *(*g)()) // should match this 'g' argument
   g();
   return 42;
 }
-int foo(int ())              // abstract decl is wrong in definitions
-{
-  return 0;
+int foo(int ()) { return 0; } // unnamed params in defs valid (GNU C / C23)
+int main(void) { return foo(0); }
+
 #elif defined test_invalid_1
 void f(char*);
 void g(void) {

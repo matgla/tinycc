@@ -208,19 +208,30 @@ The project uses multiple testing frameworks:
    - Tests are numbered: `01_hello_world.c`, `20_op_add.c`, etc.
    - Each `.c` file has a corresponding `.expect` file with expected output
 
-2. **Assembly Tests** (`tests/thumb/armv8m/`): pytest-based assembler tests
+2. **GCC Torture Tests** (`tests/gcctestsuite/`): GCC c-torture test suite
+   - ~2000 compile tests and ~1700 execute tests from GCC
+   - Git submodule at `tests/gcctestsuite/gcc-testsuite`
+   - Run via `make test-all` or `pytest tests/gcctestsuite/`
+
+3. **Assembly Tests** (`tests/thumb/armv8m/`): pytest-based assembler tests
    - Test individual Thumb-2 instructions
    - Compares TCC output against `arm-none-eabi-gcc`
 
-3. **Legacy Tests** (`tests/tests2/`, `tests/pp/`): Makefile-based tests
-   - C language compliance tests
+4. **Legacy Tests** (`tests/tests2/`, `tests/pp/`): Makefile-based tests
+   - C language compliance tests (curated subset run via IR tests)
    - Preprocessor tests
 
 ### Running Tests
 
 ```bash
-# Full test suite (requires ARM cross toolchain, use -j16 for parallel execution)
+# Initialize GCC testsuite submodule (one-time)
+git submodule update --init --depth 1 tests/gcctestsuite/gcc-testsuite
+
+# Run IR tests (includes curated tests2)
 make test -j16
+
+# Run GCC torture tests
+make test-all
 
 # Run only IR tests
 make test-venv test-prepare

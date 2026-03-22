@@ -296,8 +296,6 @@ void tcc_ir_stack_build(TCCIRState *ir)
     slot->alignment = (size >= 8) ? 8 : 4;
     slot->kind = kind;
     slot->vreg = (int)ls_it->vreg;
-    slot->live_across_calls = ls_it->crosses_call;
-    slot->addressable = ls_it->addrtaken ? 1 : 0;
 
     /* Insert into hash table for fast lookup. */
     tcc_ir_stack_layout_offset_hash_insert(layout, offset, slot_idx);
@@ -348,53 +346,6 @@ const TCCStackSlot *tcc_ir_stack_slot_by_index(TCCIRState *ir, int idx)
 int tcc_ir_stack_slot_count(TCCIRState *ir)
 {
   return ir ? ir->stack_layout.slot_count : 0;
-}
-
-/* ============================================================================
- * Materialization Helpers (internal)
- * ============================================================================ */
-
-static const TCCStackSlot *tcc_ir_mat_slot_internal(const TCCIRState *ir, int vreg)
-{
-  if (!ir || !tcc_ir_vreg_is_valid((TCCIRState *)ir, vreg))
-    return NULL;
-  return tcc_ir_stack_slot_by_vreg(ir, vreg);
-}
-
-static int tcc_ir_mat_offset_internal(const TCCIRState *ir, int vreg)
-{
-  const TCCStackSlot *slot = tcc_ir_mat_slot_internal(ir, vreg);
-  if (!slot)
-    return 0;
-  return slot->offset;
-}
-
-const TCCStackSlot *tcc_ir_mat_slot_sv(const TCCIRState *ir, const SValue *sv)
-{
-  if (!ir || !sv)
-    return NULL;
-  return tcc_ir_mat_slot_internal(ir, sv->vr);
-}
-
-int tcc_ir_mat_offset_sv(const TCCIRState *ir, const SValue *sv)
-{
-  if (!ir || !sv)
-    return 0;
-  return tcc_ir_mat_offset_internal(ir, sv->vr);
-}
-
-const TCCStackSlot *tcc_ir_mat_slot_op(const TCCIRState *ir, const IROperand *op)
-{
-  if (!ir || !op)
-    return NULL;
-  return tcc_ir_mat_slot_internal(ir, op->vr);
-}
-
-int tcc_ir_mat_offset_op(const TCCIRState *ir, const IROperand *op)
-{
-  if (!ir || !op)
-    return 0;
-  return tcc_ir_mat_offset_internal(ir, op->vr);
 }
 
 /* ============================================================================

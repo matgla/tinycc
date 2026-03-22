@@ -2188,6 +2188,15 @@ ST_FUNC void relocate_sections(TCCState *s1)
     if (sr->sh_type != SHT_RELX)
       continue;
     s = s1->sections[sr->sh_info];
+#ifdef TCC_TARGET_ARM
+    /* Skip relocations for suppressed ARM exception index sections.
+       set_sec_sizes() clears SHF_ALLOC on .ARM.exidx (stack unwinding
+       not used on bare-metal), but relocation sections survive.  If we
+       still process them, R_ARM_PREL31 entries that reference orphan
+       .ARM.extab (placed far away in RAM) overflow the 31-bit range. */
+    if (s->sh_type == SHT_ARM_EXIDX && !(s->sh_flags & SHF_ALLOC))
+      continue;
+#endif
 #ifndef TCC_TARGET_MACHO
     if (s != s1->got || s1->static_link || s1->output_type == TCC_OUTPUT_MEMORY)
 #endif

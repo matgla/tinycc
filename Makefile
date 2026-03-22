@@ -235,7 +235,7 @@ LIB-$(TR) ?= {B}:/usr/$(TRIPLET-$T)/lib:/usr/lib/$(MARCH-$T)
 INC-$(TR) ?= {B}/include:/usr/$(TRIPLET-$T)/include:/usr/include
 endif
 
-IR_FILES = ir/type.c ir/pool.c ir/vreg.c ir/stack.c ir/live.c ir/mat.c ir/dump.c ir/codegen.c ir/opt.c ir/opt_jump_thread.c ir/licm.c ir/core.c
+IR_FILES = ir/type.c ir/pool.c ir/vreg.c ir/stack.c ir/live.c ir/dump.c ir/codegen.c ir/opt.c ir/opt_jump_thread.c ir/licm.c ir/core.c ir/machine_op.c
 CORE_FILES = tccir_operand.c tccls.c tcc.c tcctools.c libtcc.c tccpp.c tccgen.c tccdbg.c tccelf.c tccasm.c tccyaff.c tccld.c tccdebug.c svalue.c tccmachine.c tccopt.c $(IR_FILES)
 CORE_FILES += tcc.h config.h libtcc.h tcctok.h tccir.h tccir_operand.h tccld.h tccmachine.h tccopt.h
 CORE_FILES += $(wildcard ir/*.h)
@@ -415,6 +415,16 @@ config.mak:
 PYTHON ?= python3
 PYTEST ?= pytest
 
+# Pytest parallel workers: make test J=16 → pytest -n 16 (default: auto)
+J ?= auto
+
+# If set to 1, wrap compiler invocations with valgrind to detect memory errors.
+# Usage: make test VALGRIND=1
+VALGRIND ?= 0
+ifeq ($(VALGRIND),1)
+export CC_WRAPPER := valgrind --error-exitcode=99 --errors-for-leak-kinds=none --leak-check=no --track-origins=yes -q
+endif
+
 # If set to 1 (default), `make test` will create a local virtualenv and install
 # Python requirements for tests/ir_tests before invoking pytest.
 USE_VENV ?= 1
@@ -473,22 +483,28 @@ test-prepare:
 ASMTESTS_DIR := tests/thumb/armv8m
 
 .PHONY: test-asm
-test-asm: cross
+test-asm: cross test-venv
 	@echo "------------ assembler tests (pytest) ------------"
-	@cd $(ASMTESTS_DIR) && \
-		TEST_CC="$(CURDIR)/armv8m-tcc" \
-		TEST_COMPARE_CC="arm-none-eabi-gcc" \
-		TEST_OBJDUMP="arm-none-eabi-objdump" \
-		TEST_OBJCOPY="arm-none-eabi-objcopy" \
-		$(PYTEST) --tb=short -q .
+	@set -e; \
+	cd $(ASMTESTS_DIR) && \
+		TEST_CC="$(CURDIR)/armv8m-tcc"; \
+		TEST_COMPARE_CC="arm-none-eabi-gcc"; \
+		TEST_OBJDUMP="arm-none-eabi-objdump"; \
+		TEST_OBJCOPY="arm-none-eabi-objcopy"; \
+		export TEST_CC TEST_COMPARE_CC TEST_OBJDUMP TEST_OBJCOPY; \
+		if [ "$(USE_VENV)" = "1" ]; then \
+			"$(VENV_PY)" -m pytest --tb=short -q -n $(J) .; \
+		else \
+			$(PYTEST) --tb=short -q -n $(J) .; \
+		fi
 
 # run IR tests via pytest (preferred)
-test: cross test-aeabi-host test-asm test-venv test-prepare
+test: cross test-aeabi-host test-asm test-venv test-prepare download-gcc-tests
 	@echo "------------ ir_tests (pytest) ------------"
 	@if [ "$(USE_VENV)" = "1" ]; then \
-		cd $(IRTESTS_DIR) && "$(VENV_PY)" -m pytest -s -n auto; \
+		cd $(IRTESTS_DIR) && "$(VENV_PY)" -m pytest -s -n $(J); \
 	else \
-		cd $(IRTESTS_DIR) && $(PYTEST) -s -n auto; \
+		cd $(IRTESTS_DIR) && $(PYTEST) -s -n $(J); \
 	fi
 
 # legacy tests (kept for reference)
@@ -521,7 +537,76 @@ distclean: clean
 	@rm -vf config.h config.mak config.texi
 	@rm -vf $(TCCDOCS)
 
-.PHONY: all cross fp-libs clean test test-aeabi-host test-legacy tar tags ETAGS doc distclean install uninstall FORCE
+# unified tests2 test suite
+test-tests2: cross test-venv
+	@echo "------------ tests2 test suite ------------"
+	@if [ "$(USE_VENV)" = "1" ]; then \
+		cd $(TOP)/tests && "$(VENV_PY)" run_tests.py --tests2 -v -n $(J); \
+	else \
+		cd $(TOP)/tests && $(PYTEST) -v -m tests2 --tb=short -n $(J) tests/tests2/; \
+	fi
+
+# download GCC torture tests
+download-gcc-tests:
+	@echo "------------ downloading GCC torture tests ------------"
+	@bash $(TOP)/tests/gcctestsuite/download_gcc_tests.sh
+
+# run GCC torture compile tests (compile only, via ir_tests framework)
+test-gcc-torture-compile: cross test-venv test-prepare download-gcc-tests
+	@echo "------------ GCC torture compile tests ------------"
+	@if $(PYTEST) --help 2>/dev/null | grep -q timeout; then \
+		PYTEST_TIMEOUT="--timeout=60"; \
+	else \
+		PYTEST_TIMEOUT=""; \
+	fi; \
+	if [ "$(USE_VENV)" = "1" ]; then \
+		cd $(IRTESTS_DIR) && "$(VENV_PY)" -m pytest -m "gcc_compile" --tb=short -n $(J) $$PYTEST_TIMEOUT test_gcc_torture_ir.py; \
+	else \
+		cd $(IRTESTS_DIR) && $(PYTEST) -m "gcc_compile" --tb=short -n $(J) $$PYTEST_TIMEOUT test_gcc_torture_ir.py; \
+	fi
+
+# run GCC torture execute tests only (via ir_tests framework)
+test-gcc-torture-execute: cross test-venv test-prepare download-gcc-tests
+	@echo "------------ GCC torture execute tests ------------"
+	@if $(PYTEST) --help 2>/dev/null | grep -q timeout; then \
+		PYTEST_TIMEOUT="--timeout=120"; \
+	else \
+		PYTEST_TIMEOUT=""; \
+	fi; \
+	if [ "$(USE_VENV)" = "1" ]; then \
+		cd $(IRTESTS_DIR) && "$(VENV_PY)" -m pytest -m "gcc_execute" --tb=short -n $(J) $$PYTEST_TIMEOUT test_gcc_torture_ir.py; \
+	else \
+		cd $(IRTESTS_DIR) && $(PYTEST) -m "gcc_execute" --tb=short -n $(J) $$PYTEST_TIMEOUT test_gcc_torture_ir.py; \
+	fi
+
+# run full GCC torture tests (compile + execute via ir_tests framework)
+test-gcc-torture: cross test-venv test-prepare download-gcc-tests
+	@echo "------------ GCC torture tests (compile + execute) ------------"
+	@if $(PYTEST) --help 2>/dev/null | grep -q timeout; then \
+		PYTEST_TIMEOUT="--timeout=120"; \
+	else \
+		PYTEST_TIMEOUT=""; \
+	fi; \
+	if [ "$(USE_VENV)" = "1" ]; then \
+		cd $(IRTESTS_DIR) && "$(VENV_PY)" -m pytest -m "gcc_torture" --tb=short -n $(J) $$PYTEST_TIMEOUT test_gcc_torture_ir.py; \
+	else \
+		cd $(IRTESTS_DIR) && $(PYTEST) -m "gcc_torture" --tb=short -n $(J) $$PYTEST_TIMEOUT test_gcc_torture_ir.py; \
+	fi
+
+# run full test suite (IR + GCC torture compile-only)
+# Note: tests2 tests are included in IR tests via test_qemu.py
+test-full: cross test-aeabi-host test-asm test-venv test-prepare test-gcc-torture-compile
+	@echo "------------ full test suite complete ------------"
+
+# run all tests including full GCC torture (IR + GCC torture compile + execute)
+test-all: cross test-aeabi-host test-asm test-venv test-prepare test-gcc-torture
+	@echo "------------ unified test runner (IR + full GCC torture) ------------"
+
+# convenience: run IR tests under valgrind
+test-valgrind:
+	$(MAKE) test VALGRIND=1
+
+.PHONY: all cross fp-libs clean test test-valgrind test-aeabi-host test-legacy test-tests2 test-gcc-torture test-gcc-torture-compile test-gcc-torture-execute test-full test-all download-gcc-tests tar tags ETAGS doc distclean install uninstall FORCE
 
 # Container image settings (auto-detect docker or podman)
 DOCKER_REGISTRY ?= ghcr.io
@@ -582,7 +667,7 @@ help:
 	@echo "   $(wordlist 1,8,$(TCC_X))"
 	@echo "   $(wordlist 9,99,$(TCC_X))"
 	@echo "make test"
-	@echo "   rebuild + run pytest in tests/ir_tests"
+	@echo "   rebuild + initialize GCC testsuite + run pytest in tests/ir_tests"
 	@echo "make test-legacy"
 	@echo "   run legacy make-based tests (tests/Makefile)"
 	@echo "make tests2.all / make tests2.37 / make tests2.37+"

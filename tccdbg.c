@@ -2503,8 +2503,13 @@ static int tcc_get_dwarf_info(TCCState *s1, Sym *s)
       dwarf_data1(dwarf_info_section, DWARF_ABBREV_BASE_TYPE);
       dwarf_uleb128(dwarf_info_section, default_debug[i - 1].size);
       dwarf_data1(dwarf_info_section, default_debug[i - 1].encoding);
+      char *colon;
+
       strncpy(name, default_debug[i - 1].name, sizeof(name) - 1);
-      *strchr(name, ':') = 0;
+      name[sizeof(name) - 1] = 0;
+      colon = (char *)strchr(name, ':');
+      if (colon)
+        *colon = 0;
       dwarf_strp(dwarf_info_section, name);
       dwarf_info.base_type_used[i - 1] = debug_type;
     }
@@ -2818,6 +2823,28 @@ ST_FUNC void tcc_add_debug_info(TCCState *s1, int param, Sym *s, Sym *e)
     }
   }
   cstr_free(&debug_str);
+}
+
+/* Save debug state before compiling nested functions */
+ST_FUNC void tcc_debug_save_state(TCCState *s1, void **saved_info, void **saved_root)
+{
+  if (!s1->dState)
+  {
+    *saved_info = NULL;
+    *saved_root = NULL;
+    return;
+  }
+  *saved_info = (void *)debug_info;
+  *saved_root = (void *)debug_info_root;
+}
+
+/* Restore debug state after compiling nested functions */
+ST_FUNC void tcc_debug_restore_state(TCCState *s1, void *saved_info, void *saved_root)
+{
+  if (!s1->dState)
+    return;
+  debug_info = (struct _debug_info *)saved_info;
+  debug_info_root = (struct _debug_info *)saved_root;
 }
 
 /* put function symbol */

@@ -11,10 +11,10 @@ struct CType;
 /* ============================================================================
  * Vreg encoding
  * ============================================================================
- * Vreg encoding: type in top 4 bits, position in bottom 18 bits.
- * Bits 18-27 are used for IROperand tag+flags+btype encoding.
+ * Vreg encoding: type in top 4 bits, position in bottom 17 bits.
+ * Bits 17-27 are used for IROperand tag+flags+btype encoding.
  *
- * 18 bits for position = 262,144 max vregs (plenty for any function)
+ * 17 bits for position = 131,072 max vregs (plenty for any function)
  */
 
 typedef enum TCCIR_VREG_TYPE
@@ -24,7 +24,7 @@ typedef enum TCCIR_VREG_TYPE
   TCCIR_VREG_TYPE_PARAM = 3,
 } TCCIR_VREG_TYPE;
 
-#define TCCIR_VREG_POSITION_MASK 0x3FFFF /* 18 bits for position */
+#define TCCIR_VREG_POSITION_MASK 0x1FFFF /* 17 bits for position */
 #define TCCIR_DECODE_VREG_POSITION(vr) ((vr) & TCCIR_VREG_POSITION_MASK)
 #define TCCIR_DECODE_VREG_TYPE(vr) ((vr) >> 28)
 #define TCCIR_ENCODE_VREG(type, position) (((type) << 28) | ((position) & TCCIR_VREG_POSITION_MASK))
@@ -58,13 +58,21 @@ typedef enum TCCIR_VREG_TYPE
 #define IROP_TAG_F64 6      /* payload.pool_idx: index into pool_f64[] */
 #define IROP_TAG_SYMREF 7   /* payload.pool_idx: index into pool_symref[] */
 
-/* Sentinel for negative vreg encoding - upper 14 bits of position all set */
-#define IROP_NEG_VREG_SENTINEL 0x3FFF0 /* position bits 4-17 all set, bits 0-3 hold neg index */
+/* For IROP_TAG_VREG operands with vreg=-1: u.imm32 encodes a pinned physical
+ * register.  Bit 8 is the validity flag; bits 0-4 hold the ARM register number
+ * (0-15).  When bit 8 is clear (u.imm32 == 0, the irop_make_vreg default), no
+ * physical register is pinned.  machine_op_from_ir() and irop_phys_r0() read
+ * this encoding. */
+#define IROP_VREG_PHYS_VALID 0x100u /* validity flag for pinned phys reg */
+#define IROP_VREG_PHYS_MASK 0x1Fu   /* bits 0-4: register number */
+
+/* Sentinel for negative vreg encoding - upper 13 bits of position all set */
+#define IROP_NEG_VREG_SENTINEL 0x1FFF0 /* position bits 4-16 all set, bits 0-3 hold neg index */
 
 /* Compressed basic type (stored in bits 25-27 of vr)
  * This allows reconstruction of type.t during iroperand_to_svalue().
  * Preserves byte/short distinction for correct load instruction generation. */
-#define IROP_BTYPE_INT32 0   /* VT_VOID, VT_INT, VT_PTR, VT_BOOL */
+#define IROP_BTYPE_INT32 0   /* VT_VOID, VT_INT, VT_PTR */
 #define IROP_BTYPE_INT64 1   /* VT_LLONG */
 #define IROP_BTYPE_FLOAT32 2 /* VT_FLOAT */
 #define IROP_BTYPE_FLOAT64 3 /* VT_DOUBLE, VT_LDOUBLE */
@@ -81,14 +89,15 @@ typedef struct __attribute__((packed)) IROperand
     int32_t vr; /* raw access for encoding/decoding */
     struct
     {
-      uint32_t position : 18; /* vreg position (0-17) */
-      uint32_t tag : 3;       /* IROP_TAG_* (18-20) */
-      uint32_t is_lval : 1;   /* VT_LVAL: needs dereference (21) */
-      uint32_t is_llocal : 1; /* VT_LLOCAL: double indirection (22) */
-      uint32_t is_local : 1;  /* VT_LOCAL: stack-relative (23) */
-      uint32_t is_const : 1;  /* VT_CONST: constant value (24) */
-      uint32_t btype : 3;     /* IROP_BTYPE_* (25-27) */
-      uint32_t vreg_type : 4; /* TCCIR_VREG_TYPE_* (28-31) */
+      uint32_t position : 17;  /* vreg position (0-16) */
+      uint32_t is_complex : 1; /* DONE: Phase 2 - VT_COMPLEX: complex type flag (17) */
+      uint32_t tag : 3;        /* IROP_TAG_* (18-20) */
+      uint32_t is_lval : 1;    /* VT_LVAL: needs dereference (21) */
+      uint32_t is_llocal : 1;  /* VT_LLOCAL: double indirection (22) */
+      uint32_t is_local : 1;   /* VT_LOCAL: stack-relative (23) */
+      uint32_t is_const : 1;   /* VT_CONST: constant value (24) */
+      uint32_t btype : 3;      /* IROP_BTYPE_* (25-27) */
+      uint32_t vreg_type : 4;  /* TCCIR_VREG_TYPE_* (28-31) */
     };
   };
   union
@@ -102,18 +111,15 @@ typedef struct __attribute__((packed)) IROperand
       int16_t aux_data;   /* aux: stack offset for STACKOFF, symref_idx for SYMREF */
     } s;
   } u;
-  /* Physical register allocation (filled by register allocator for codegen) */
-  uint8_t pr0_reg : 5;     /* Physical register 0 (0-15 for ARM, 31=PREG_REG_NONE) */
-  uint8_t pr0_spilled : 1; /* pr0 spilled to stack */
+  /* Type flags (filled during IR construction) */
   uint8_t is_unsigned : 1; /* VT_UNSIGNED flag */
   uint8_t is_static : 1;   /* VT_STATIC flag */
-  uint8_t pr1_reg : 5;     /* Physical register 1 for 64-bit values */
-  uint8_t pr1_spilled : 1; /* pr1 spilled to stack */
   uint8_t is_sym : 1;      /* VT_SYM: has associated symbol */
   uint8_t is_param : 1;    /* VT_PARAM: stack-passed parameter (needs offset_to_args) */
+  uint8_t _pad : 4;        /* unused — available for future flags */
 } IROperand;
 
-_Static_assert(sizeof(IROperand) == 10, "IROperand must be 10 bytes");
+_Static_assert(sizeof(IROperand) == 9, "IROperand must be 9 bytes");
 
 /* ============================================================================
  * Pool entry types - separate arrays for cache efficiency
@@ -157,19 +163,29 @@ int irop_btype_to_vt_btype(int irop_btype);
 int irop_type_size(IROperand op);
 int irop_type_size_align(IROperand op, int *align_out);
 
+/* AAPCS natural alignment for parameter passing (walks struct members,
+ * ignoring __attribute__((aligned)) on the struct itself). */
+int irop_aapcs_alignment(IROperand op);
+
+/* AAPCS natural alignment from CType (for callee-side parameter layout). */
+int ctype_aapcs_alignment(struct CType *ct);
+
 /* Get CType for struct operands (returns NULL for non-struct types) */
 struct CType *irop_get_ctype(IROperand op);
 
 /* Debug: compare SValue with IROperand and print differences (returns 1 if mismatch) */
 int irop_compare_svalue(const struct TCCIRState *ir, const struct SValue *sv, IROperand op, const char *context);
 
-/* Position sentinel value: max 18-bit value means "no position" */
-#define IROP_POSITION_NONE 0x3FFFF
+/* Position sentinel value: max 17-bit value means "no position" */
+#define IROP_POSITION_NONE 0x1FFFF
 
-/* Check if operand encodes a negative vreg (sentinel pattern) */
+/* Check if operand encodes a negative vreg (sentinel pattern).
+ * Excludes IROP_NONE (vr == -1) which also matches the sentinel bit pattern. */
 static inline int irop_is_neg_vreg(const IROperand op)
 {
-  return op.vreg_type == 0xF && (op.position & 0x3FFF0) == IROP_NEG_VREG_SENTINEL;
+  if (op.vr == -1)
+    return 0; /* IROP_NONE, not a negative vreg */
+  return op.vreg_type == 0xF && (op.position & 0x1FFF0) == IROP_NEG_VREG_SENTINEL;
 }
 
 /* Check if operand has no associated vreg */
@@ -182,6 +198,9 @@ static inline int irop_has_no_vreg(const IROperand op)
 /* Extract tag from operand (using bitfield) */
 static inline int irop_get_tag(const IROperand op)
 {
+  /* IROP_NONE has vr == -1 (all bits set), return TAG_NONE for it */
+  if (op.vr == -1)
+    return IROP_TAG_NONE;
   /* For negative vregs (encoded with sentinel), tag is still valid in bitfield */
   if (op.position == IROP_POSITION_NONE && op.vreg_type == 0)
     return IROP_TAG_NONE;
@@ -191,6 +210,8 @@ static inline int irop_get_tag(const IROperand op)
 /* Extract btype from operand (using bitfield) */
 static inline int irop_get_btype(const IROperand op)
 {
+  if (op.vr == -1)
+    return IROP_BTYPE_INT32; /* IROP_NONE default */
   if (op.position == IROP_POSITION_NONE && op.vreg_type == 0)
     return IROP_BTYPE_INT32; /* default */
   return op.btype;
@@ -199,6 +220,15 @@ static inline int irop_get_btype(const IROperand op)
 /* Check if operand has a 64-bit type */
 static inline int irop_is_64bit(const IROperand op)
 {
+  int btype = irop_get_btype(op);
+  return btype == IROP_BTYPE_INT64 || btype == IROP_BTYPE_FLOAT64;
+}
+
+/* Check if operand needs a register pair (64-bit or complex) */
+static inline int irop_needs_pair(const IROperand op)
+{
+  if (op.is_complex)
+    return 1;
   int btype = irop_get_btype(op);
   return btype == IROP_BTYPE_INT64 || btype == IROP_BTYPE_FLOAT64;
 }
@@ -286,44 +316,37 @@ static inline IRPoolSymref *irop_get_symref_ex(const struct TCCIRState *ir, IROp
 /* Extract clean vreg value (type + position, for IR passes) */
 static inline int32_t irop_get_vreg(const IROperand op)
 {
-  /* Check for negative vreg sentinel: vreg_type=0xF and position bits 4-17 all set */
-  if (op.vreg_type == 0xF && (op.position & 0x3FFF0) == IROP_NEG_VREG_SENTINEL)
+  /* IROP_NONE (vr == -1, all bits set) must return -1 before the negative vreg
+   * sentinel check, because its bit pattern also matches the sentinel. */
+  if (op.vr == -1)
+    return -1;
+  /* Check for negative vreg sentinel: vreg_type=0xF and position bits match sentinel */
+  if (op.vreg_type == 0xF && (op.position & IROP_NEG_VREG_SENTINEL) == IROP_NEG_VREG_SENTINEL)
   {
-    /* Decode negative vreg: idx 0 -> -1, idx 1 -> -2, etc. */
+    /* Decode negative vreg: idx 0 -> -1, idx 1 -> -2, etc.
+     * Matches irop_set_vreg which encodes: neg_idx = (-vreg) - 1 */
     int neg_idx = op.position & 0xF;
     return -(neg_idx + 1);
   }
   /* Position == max sentinel with vreg_type 0 means no vreg (-1) */
   if (op.position == IROP_POSITION_NONE && op.vreg_type == 0)
     return -1;
-  /* Reconstruct vreg: type in bits 28-31, position in bits 0-17 */
+  /* Reconstruct vreg: type in bits 28-31, position in bits 0-16 */
   return (op.vreg_type << 28) | op.position;
 }
 
 /* Sentinel for "no operand" */
 #define IROP_NONE                                                                                                      \
-  ((IROperand){.vr = -1,                                                                                               \
-               .u = {.imm32 = 0},                                                                                      \
-               .pr0_reg = 0x1F,                                                                                        \
-               .pr0_spilled = 0,                                                                                       \
-               .is_unsigned = 0,                                                                                       \
-               .is_static = 0,                                                                                         \
-               .pr1_reg = 0x1F,                                                                                        \
-               .pr1_spilled = 0,                                                                                       \
-               .is_sym = 0,                                                                                            \
-               .is_param = 0})
+  ((IROperand){.vr = -1, .u = {.imm32 = 0}, .is_unsigned = 0, .is_static = 0, .is_sym = 0, .is_param = 0, ._pad = 0})
 
-/* Helper to initialize physical reg fields to defaults */
+/* Helper to initialize type-flag byte to defaults */
 static inline void irop_init_phys_regs(IROperand *op)
 {
-  op->pr0_reg = 0x1F; /* PREG_REG_NONE */
-  op->pr0_spilled = 0;
   op->is_unsigned = 0;
   op->is_static = 0;
-  op->pr1_reg = 0x1F; /* PREG_REG_NONE */
-  op->pr1_spilled = 0;
   op->is_sym = 0;
   op->is_param = 0;
+  op->_pad = 0;
 }
 
 /* Helper to set vreg fields from a vreg value.

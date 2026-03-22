@@ -31,9 +31,9 @@
 #include "tcc.h"
 #include "tccir.h"
 
-/* Forward declarations for IR-based load/store from arm-thumb-gen.c */
-void load_to_dest_ir(IROperand dest, IROperand src);
-void store_ir(int r, IROperand sv);
+/* Forward declarations for MOP-based load/store from arm-thumb-gen.c */
+void tcc_gen_mach_load_to_reg(int dest_reg, const MachineOperand *op);
+void tcc_gen_mach_store_from_reg(int src_reg, const MachineOperand *op);
 
 enum
 {
@@ -100,7 +100,8 @@ ST_FUNC void g(int c)
   if (nocode_wanted)
     return;
   /* During dry-run, don't write to section data, just track position */
-  if (tcc_gen_machine_dry_run_is_active()) {
+  if (tcc_gen_machine_dry_run_is_active())
+  {
     ind++;
     return;
   }
@@ -123,7 +124,8 @@ ST_FUNC void gen_le32(int i)
   if (nocode_wanted)
     return;
   /* During dry-run, don't write to section data, just track position */
-  if (tcc_gen_machine_dry_run_is_active()) {
+  if (tcc_gen_machine_dry_run_is_active())
+  {
     ind += 4;
     return;
   }
@@ -281,7 +283,10 @@ ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands, int nb_outputs,
   { // prolog
     /* generate reg save code */
     if (saved_regset)
-      gen_le32(0xe92d0000 | saved_regset); // push {...}
+    {
+      gen_le16(0xe92d);       /* STMDB SP!, first halfword */
+      gen_le16(saved_regset); /* register list second halfword */
+    }
 
     /* generate load code */
     for (i = 0; i < nb_operands; i++)
@@ -299,25 +304,15 @@ ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands, int nb_outputs,
           src.is_llocal = 0;
           src.is_lval = 1;
           src.btype = IROP_BTYPE_INT32; /* pointers are 32-bit on ARMv8-M */
-          IROperand dest = irop_make_none();
-          dest.pr0_reg = op->reg;
-          dest.pr0_spilled = 0;
-          dest.pr1_reg = PREG_REG_NONE;
-          dest.pr1_spilled = 0;
-          dest.btype = src.btype;
-          load_to_dest_ir(dest, src);
+          MachineOperand mop = machine_op_from_ir(tcc_state->ir, &src);
+          tcc_gen_mach_load_to_reg(op->reg, &mop);
         }
         else if (i >= nb_outputs || op->is_rw)
         { // not write-only
           /* load value in register */
           IROperand src = svalue_to_iroperand(tcc_state->ir, op->vt);
-          IROperand dest = irop_make_none();
-          dest.pr0_reg = op->reg;
-          dest.pr0_spilled = 0;
-          dest.pr1_reg = PREG_REG_NONE;
-          dest.pr1_spilled = 0;
-          dest.btype = src.btype;
-          load_to_dest_ir(dest, src);
+          MachineOperand mop = machine_op_from_ir(tcc_state->ir, &src);
+          tcc_gen_mach_load_to_reg(op->reg, &mop);
           if (op->is_llong)
             tcc_error("long long not implemented");
         }
@@ -343,25 +338,26 @@ ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands, int nb_outputs,
             IROperand addr = ir_op;
             addr.is_llocal = 0;
             addr.btype = IROP_BTYPE_INT32;
-            IROperand dest = irop_make_none();
-            dest.pr0_reg = out_reg;
-            dest.pr0_spilled = 0;
-            dest.btype = addr.btype;
-            load_to_dest_ir(dest, addr);
+            MachineOperand addr_mop = machine_op_from_ir(tcc_state->ir, &addr);
+            tcc_gen_mach_load_to_reg(out_reg, &addr_mop);
 
             /* Store op->reg through the pointer now in out_reg */
-            IROperand store_dest = irop_make_vreg(irop_get_vreg(ir_op), irop_get_btype(ir_op));
-            store_dest.is_lval = ir_op.is_lval;
-            store_dest.is_unsigned = ir_op.is_unsigned;
-            store_dest.pr0_reg = out_reg;
-            store_dest.pr0_spilled = 0;
-            store_ir(op->reg, store_dest);
+            MachineOperand store_mop;
+            memset(&store_mop, 0, sizeof(store_mop));
+            store_mop.kind = MACH_OP_REG;
+            store_mop.btype = irop_get_btype(ir_op);
+            store_mop.is_unsigned = ir_op.is_unsigned;
+            store_mop.u.reg.r0 = out_reg;
+            store_mop.u.reg.r1 = -1;
+            store_mop.needs_deref = true;
+            tcc_gen_mach_store_from_reg(op->reg, &store_mop);
           }
         }
         else
         {
           IROperand ir_op = svalue_to_iroperand(tcc_state->ir, op->vt);
-          store_ir(op->reg, ir_op);
+          MachineOperand mop = machine_op_from_ir(tcc_state->ir, &ir_op);
+          tcc_gen_mach_store_from_reg(op->reg, &mop);
           if (op->is_llong)
             tcc_error("long long not implemented");
         }
@@ -370,7 +366,10 @@ ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands, int nb_outputs,
 
     /* generate reg restore code */
     if (saved_regset)
-      gen_le32(0xe8bd0000 | saved_regset); // pop {...}
+    {
+      gen_le16(0xe8bd);       /* LDMIA SP!, first halfword */
+      gen_le16(saved_regset); /* register list second halfword */
+    }
   }
 }
 
@@ -390,6 +389,8 @@ static inline int constraint_priority(const char *str)
     str++;
     switch (c)
     {
+    case ',':
+      continue;
     case 'l': // in ARM mode, that's  an alias for 'r' [ARM].
     case 'r': // register [general]
     case 'p': // valid memory address for load,store [general]
@@ -398,11 +399,15 @@ static inline int constraint_priority(const char *str)
     case 'M': // integer constant for shifts [ARM]
     case 'I': // integer valid for data processing instruction immediate
     case 'J': // integer in range -4095...4095
+    case 'n': // immediate integer operand with a known numeric value
 
     case 'i': // immediate integer operand, including symbolic constants
+    case 's': // immediate integer operand whose value is not an explicit integer
               // [general]
+    case 'Q': // memory reference with a single base register [ARM]
     case 'm': // memory operand [general]
     case 'g': // general-purpose-register, memory, immediate integer [general]
+    case 'X': // any operand whatsoever [general]
       pr = 4;
       break;
     default:
@@ -436,7 +441,7 @@ static const char *skip_constraint_modifiers(const char *p)
 #define is_reg_allocated(reg) (regs_allocated[reg] & reg_mask)
 
 ST_FUNC void asm_compute_constraints(ASMOperand *operands, int nb_operands, int nb_outputs, const uint8_t *clobber_regs,
-                                     int *pout_reg)
+                                     const uint8_t *reserved_regs, int *pout_reg)
 {
   /* overall format: modifier, then ,-seperated list of alternatives; all
    * operands for a single instruction must have the same number of alternatives
@@ -537,6 +542,17 @@ instruction
     else
       regs_allocated[i] = 0;
   }
+  /* Also mark registers reserved by the IR register allocator (live variables).
+   * These are NOT clobbered (no save/restore in asm_gen_code), but should not be
+   * picked by the constraint solver for "r" operand allocation. */
+  if (reserved_regs)
+  {
+    for (i = 0; i < NB_ASM_REGS; i++)
+    {
+      if (reserved_regs[i])
+        regs_allocated[i] |= REG_IN_MASK | REG_OUT_MASK;
+    }
+  }
   /* sp cannot be used */
   regs_allocated[13] = REG_IN_MASK | REG_OUT_MASK;
   /* fp cannot be used yet */
@@ -574,6 +590,8 @@ instruction
     c = *str++;
     switch (c)
     {
+    case ',':
+      goto try_next;
     case '=': // Operand is written-to
       goto try_next;
     case '+': // Operand is both READ and written-to
@@ -611,7 +629,9 @@ instruction
               // complement)
     case 'L': // integer that satisfies constraint I when inverted (two's
               // complement)
+    case 'n': // immediate integer operand with a known numeric value
     case 'i': // immediate integer operand, including symbolic constants
+    case 's': // immediate integer operand whose value is not an explicit integer
       if (!((op->vt->r & (VT_VALMASK | VT_LVAL)) == VT_CONST))
         goto try_next;
       break;
@@ -619,8 +639,10 @@ instruction
       if (!((op->vt->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST))
         goto try_next;
       break;
+    case 'Q': // simple memory operand [ARM]
     case 'm': // memory operand
     case 'g':
+    case 'X':
       /* nothing special to do because the operand is already in
          memory, except if the pointer itself is stored in a
          memory variable (VT_LLOCAL case) */

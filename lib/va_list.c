@@ -71,66 +71,51 @@ void *__va_arg(__builtin_va_list ap, int arg_type, int size, int align)
 #endif
 
 #if defined __arm__
-/* ARM EABI va_list support (AAPCS). */
-extern void abort(void);
+/* ARM EABI va_list: pointer-based (GCC-compatible ABI).
+ *
+ * va_list is typedef char *__builtin_va_list — a simple pointer that
+ * advances through a contiguous area of register-saved + stack arguments.
+ *
+ * The prologue pushes r0-r3 so they are contiguous with caller stack args.
+ * Frame layout at FP:
+ *   FP - 20: gr_top   (char*) — end of pushed r0-r3 = start of stack args
+ *   FP - 24: reg_bytes (int)  — bytes of named args occupying r0-r3
+ *   FP - 28: named_stack_bytes (int) — bytes of named args on stack
+ */
 
-static inline char *tcc_align_ptr(char *p, int align)
-{
-  if (align < 4)
-    align = 4;
-  return (char *)(((unsigned)p + (unsigned)align - 1u) & ~((unsigned)align - 1u));
-}
-
-void __tcc_va_start(__builtin_va_list ap, void *last, int size, int align, void *fp)
+void __tcc_va_start(char **ap_ptr, void *fp)
 {
   char *frame = (char *)fp;
-  char *reg_save = frame - 16;               /* r0-r3 saved at FP-16..FP-4 */
-  char *stack_base = *(char **)(frame - 20); /* stored by prolog */
-  int reg_bytes = *(int *)(frame - 24);      /* bytes of named args in r0-r3 */
+  char *gr_top = *(char **)(frame - 20);
+  int reg_bytes = *(int *)(frame - 24);
+  int named_stack_bytes = *(int *)(frame - 28);
 
   if (reg_bytes < 0)
     reg_bytes = 0;
   if (reg_bytes > 16)
     reg_bytes = 16;
 
-  ap->__gr_top = reg_save + 16;
-  /* GCC-compatible: __gr_offs is a negative offset from __gr_top. */
-  ap->__gr_offs = reg_bytes - 16;
-  ap->__stack = stack_base ? stack_base : frame;
-
-#ifdef __ARM_PCS_VFP
-  /* We do not currently save VFP argument registers for varargs.
-     Initialize VFP fields so GCC-style va_arg falls back to core/stack. */
-  ap->__vr_top = 0;
-  ap->__vr_offs = 0;
-#endif
+  /* Point ap to the first anonymous argument.
+   * gr_top - 16 is the start of the pushed r0-r3 area.
+   * Skip past named args in registers and on the stack. */
+  *ap_ptr = (gr_top - 16) + reg_bytes + named_stack_bytes;
 }
 
-void *__va_arg(__builtin_va_list ap, int size, int align)
+void *__tcc_va_arg(char **ap_ptr, int size, int align)
 {
-  int sz = size;
-  if (align > 4)
-    sz = (sz + align - 1) & ~(align - 1);
-  else
-    sz = (sz + 3) & ~3;
+  char *ap = *ap_ptr;
 
-  int reg_align = align;
-  if (reg_align < 4)
-    reg_align = 4;
+  if (align < 4)
+    align = 4;
 
-  /* __gr_offs is a negative offset from __gr_top. Align toward 0. */
-  int reg_offs = (ap->__gr_offs + reg_align - 1) & ~(reg_align - 1);
+  /* Align the current pointer */
+  ap = (char *)(((unsigned)ap + (unsigned)align - 1u) & ~((unsigned)align - 1u));
 
-  if (reg_offs + sz <= 0)
-  {
-    char *p = (char *)ap->__gr_top + reg_offs;
-    ap->__gr_offs = reg_offs + sz;
-    return p;
-  }
+  /* Round size up to word boundary */
+  int sz = (size + 3) & ~3;
 
-  ap->__stack = tcc_align_ptr(ap->__stack, align);
-  void *res = ap->__stack;
-  ap->__stack += sz;
-  return res;
+  void *result = ap;
+  *ap_ptr = ap + sz;
+  return result;
 }
 #endif

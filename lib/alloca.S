@@ -75,12 +75,10 @@ p3:
 	.global	alloca
 	.type	alloca, %function
 alloca:
-    mov r1, sp
-	rsb r0, r0, r1
-    bic r1, r1, #7
-    mov sp, r1
-    movs r0, r1
-	mov	pc, lr
+	sub	r0, sp, r0	/* r0 = SP - size */
+	bic	r0, r0, #7	/* align down to 8 bytes */
+	mov	sp, r0		/* lower the stack pointer */
+	bx	lr		/* return r0 = allocated address */
 	.size	alloca, .-alloca
 
 /* ---------------------------------------------- */

@@ -34,11 +34,34 @@ CURRENT_DIR = Path(__file__).parent
 was_cleaned = False
 
 
+def _detect_asan():
+    """Check if the compiler was built with AddressSanitizer by inspecting config.mak."""
+    config_mak = CURRENT_DIR / "../../config.mak"
+    try:
+        text = config_mak.read_text()
+        return "CONFIG_asan=yes" in text
+    except OSError:
+        return False
+
+
+ASAN_ENABLED = _detect_asan()
+ASAN_TIMEOUT_MULTIPLIER = 3 if ASAN_ENABLED else 1
+
+
+def _detect_valgrind():
+    """Check if CC_WRAPPER contains valgrind (set by make VALGRIND=1)."""
+    return "valgrind" in os.environ.get("CC_WRAPPER", "")
+
+
+VALGRIND_ENABLED = _detect_valgrind()
+VALGRIND_TIMEOUT_MULTIPLIER = 10 if VALGRIND_ENABLED else 1
+
+
 class SubprocessSUT:
     """Minimal pexpect-like interface for reading QEMU output without PTYs.
 
-    This avoids Python 3.13+ warnings (and potential flakiness) around
-    forkpty() in multi-threaded processes on macOS.
+    This avoids forkpty()-related warnings and potential flakiness in
+    multi-threaded test runners.
     """
 
     def __init__(self, command: str):
@@ -131,6 +154,27 @@ class SubprocessSUT:
         self.exitstatus = rc
         return rc
 
+    def close(self):
+        """Close the process and set exitstatus."""
+        if self._proc.poll() is None:
+            # Process still running, wait for it
+            try:
+                self._proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                # Force kill if not responding
+                self._proc.terminate()
+                try:
+                    self._proc.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    self._proc.kill()
+                    self._proc.wait()
+        # Set exitstatus from return code
+        rc = self._proc.returncode
+        self.exitstatus = rc if rc is not None else -1
+        # Close stdout pipe
+        if self._proc.stdout:
+            self._proc.stdout.close()
+
 
 @dataclass
 class ProfileConfig:
@@ -203,6 +247,7 @@ class CompileConfig:
     output_dir: Optional[Path] = None  # None = use default build dir
     output_prefix: str = ""  # Prefix to add to output filename (e.g. "O0_")
     output_suffix: str = ""  # Suffix to add to output filename (e.g. "_tag")
+    timeout: int = 60 * ASAN_TIMEOUT_MULTIPLIER * VALGRIND_TIMEOUT_MULTIPLIER  # Timeout in seconds for compilation (0 = no timeout)
 
     def __post_init__(self):
         if self.compiler is None:
@@ -592,7 +637,7 @@ def compile_testcase(test_file, machine, compiler=None, cflags=None, config=None
 
     # Clean if needed
     if config.clean_before_build and not was_cleaned:
-        result = subprocess.run(make_command + ["clean"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        result = subprocess.run(make_command + ["clean"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
         if result.returncode != 0:
             raise RuntimeError(f"Clean failed with exit code {result.returncode}")
         was_cleaned = True
@@ -600,7 +645,19 @@ def compile_testcase(test_file, machine, compiler=None, cflags=None, config=None
     # Compile
     import time
     start = time.perf_counter()
-    result = subprocess.run(make_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        timeout_val = config.timeout if config.timeout > 0 else None
+        result = subprocess.run(make_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout_val)
+    except subprocess.TimeoutExpired:
+        elapsed = time.perf_counter() - start
+        return CompileResult(
+            success=False,
+            elf_file=get_test_output_file(test_file, output_dir, prefix=config.output_prefix, suffix=config.output_suffix),
+            output_lines=["Compilation timed out"],
+            compile_time_s=elapsed,
+            make_command=make_command,
+            error=f"Compilation timed out after {config.timeout} seconds"
+        )
     elapsed = time.perf_counter() - start
 
     elf_file = get_test_output_file(test_file, output_dir, prefix=config.output_prefix, suffix=config.output_suffix)
@@ -671,17 +728,15 @@ def compile_testcase(test_file, machine, compiler=None, cflags=None, config=None
 
 def prepare_test(machine, kernel_file, args=None):
     qemu_command = build_qemu_command(machine, kernel_file, args)
-    # Prefer pipe-based execution when possible.
+    # Prefer pipe-based execution by default.
     #
-    # - On macOS we avoid pty.forkpty() warnings/flakiness in multi-threaded
-    #   processes (Python 3.13+).
-    # - On Python 3.14+ a DeprecationWarning is emitted when forkpty() is used
-    #   from a multi-threaded process (common under pytest), so avoid PTYs by
-    #   default there as well.
+    # Python distributions have started warning about pty.forkpty() in
+    # multi-threaded processes, and pytest/xdist commonly creates that setup.
+    # The pipe-based wrapper provides the subset of pexpect API used by these
+    # tests, so keep PTYs as an opt-in fallback for local debugging only.
     force_pexpect = os.environ.get("TINYCC_IRTEST_USE_PEXPECT", "")
     if force_pexpect.strip() not in {"1", "true", "TRUE"}:
-        if sys.platform == "darwin" or sys.version_info >= (3, 14):
-            return SubprocessSUT(qemu_command)
+        return SubprocessSUT(qemu_command)
 
     # Otherwise, use a wide pseudo-terminal so long lines aren't wrapped.
     sut = pexpect.spawn(qemu_command)

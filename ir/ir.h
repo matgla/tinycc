@@ -26,15 +26,15 @@
  * ============================================================================ */
 
 /* Note: tccir.h and tccir_operand.h are already included via tcc.h */
-#include "type.h"
-#include "pool.h"
-#include "vreg.h"
-#include "live.h"
-#include "stack.h"
-#include "mat.h"
-#include "opt.h"
 #include "codegen.h"
-#include "dump.h"
 #include "core.h"
+#include "dump.h"
+#include "live.h"
+#include "machine_op.h"
+#include "opt.h"
+#include "pool.h"
+#include "stack.h"
+#include "type.h"
+#include "vreg.h"
 
 #endif /* TCC_IR_INTERNAL_H */

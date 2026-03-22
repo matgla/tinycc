@@ -1,16 +1,16 @@
 /*
- * Reproducer: 10-byte packed struct array indexing + bitfield access.
+ * Reproducer: 9-byte packed struct array indexing + bitfield access.
  *
- * Tests the exact IROperand layout: 10-byte packed struct with bitfield
- * union in first 4 bytes, payload union in next 4 bytes, and 2 bytes
- * of packed bitfield flags. Array indexing with stride 10 (non-power-of-2)
+ * Tests the exact IROperand layout: 9-byte packed struct with bitfield
+ * union in first 4 bytes, payload union in next 4 bytes, and 1 byte
+ * of packed bitfield flags. Array indexing with stride 9 (non-power-of-2)
  * combined with bitfield reads is a likely cross-TCC codegen failure point.
  *
  * The native TCC bug manifests as tag=7 (SYMREF) when tag=2 (IMM32) was
  * stored, suggesting either:
- *   - Array index * 10 multiplication is wrong
+ *   - Array index * 9 multiplication is wrong
  *   - Bitfield extraction from the vr word is wrong
- *   - Struct return/copy of 10-byte packed struct is wrong
+ *   - Struct return/copy of 9-byte packed struct is wrong
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -55,19 +55,16 @@ typedef struct __attribute__((packed)) TestOperand
       int16_t aux_data;
     } s;
   } u;
-  /* Last 2 bytes: packed flag bitfields */
-  uint8_t pr0_reg : 5;
-  uint8_t pr0_spilled : 1;
+  /* Last 1 byte: packed flag bitfields */
   uint8_t is_unsigned : 1;
   uint8_t is_static : 1;
-  uint8_t pr1_reg : 5;
-  uint8_t pr1_spilled : 1;
   uint8_t is_sym : 1;
   uint8_t is_param : 1;
+  uint8_t _pad : 4;
 } TestOperand;
 
-/* Verify struct is 10 bytes */
-_Static_assert(sizeof(TestOperand) == 10, "TestOperand must be 10 bytes");
+/* Verify struct is 9 bytes */
+_Static_assert(sizeof(TestOperand) == 9, "TestOperand must be 9 bytes");
 
 /* Create an IMM32 operand - mirrors irop_make_imm32 */
 static TestOperand make_imm32(int32_t val)
@@ -80,8 +77,6 @@ static TestOperand make_imm32(int32_t val)
   op.is_const = 1;
   op.btype = 0;
   op.u.imm32 = val;
-  op.pr0_reg = 31;
-  op.pr1_reg = 31;
   return op;
 }
 
@@ -96,8 +91,6 @@ static TestOperand make_symref(uint32_t pidx)
   op.is_const = 1;
   op.btype = 0;
   op.u.pool_idx = pidx;
-  op.pr0_reg = 31;
-  op.pr1_reg = 31;
   return op;
 }
 
@@ -110,8 +103,6 @@ static TestOperand make_vreg(int pos)
   op.position = pos;
   op.tag = TAG_VREG;
   op.btype = 0;
-  op.pr0_reg = 31;
-  op.pr1_reg = 31;
   return op;
 }
 

@@ -31,10 +31,42 @@ args.add_argument(
 )
 args, _ = args.parse_known_args()
 
+
+def expand_gcc_builtin_sources(sources):
+    expanded = []
+    seen = set()
+
+    for source in sources:
+        if source not in seen:
+            expanded.append(source)
+            seen.add(source)
+
+        if source.name.endswith("-lib.c"):
+            continue
+
+        parent = source.parent
+        if parent.name != "builtins":
+            continue
+        if parent.parent.name != "execute":
+            continue
+        if parent.parent.parent.name != "gcc.c-torture":
+            continue
+
+        lib_file = source.with_name(f"{source.stem}-lib.c")
+        builtins_main = parent / "lib" / "main.c"
+
+        for extra in (lib_file, builtins_main):
+            if extra.exists() and extra not in seen:
+                expanded.append(extra)
+                seen.add(extra)
+
+    return expanded
+
 def main():
     file = None
     if args.compile:
         sources = [Path(p).resolve() for p in args.compile]
+        sources = expand_gcc_builtin_sources(sources)
         compiler_kwargs = {}
         if args.gcc:
             print(f"Using custom compiler: {args.gcc}")
@@ -62,7 +94,9 @@ def main():
     qemu_command = build_qemu_command(args.machine, file, args=args.args)
     if args.gdb:
         qemu_command += " -s -S"
-    subprocess.run(qemu_command, shell=True)
+    result = subprocess.run(qemu_command, shell=True)
+    print(f"Exit code: {result.returncode}", file=sys.stderr)
+    sys.exit(result.returncode)
 
 if __name__ == "__main__":
     main()

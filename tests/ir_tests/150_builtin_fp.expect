@@ -1,0 +1,53 @@
+inf_d > 1e308: 1
+inf_f > 1e38f: 1
+huge_d > 1e308: 1
+huge_f > 1e38f: 1
+nan_d != nan_d: 1
+nan_f != nan_f: 1
+isnan(nan_d): 1
+isnan(1.0): 0
+isnan(inf_d): 0
+isnanf(nan_f): 1
+isnanf(1.0f): 0
+isinf(inf_d): 1
+isinf(nan_d): 0
+isinf(1.0): 0
+fabs(-3.14): 3.140000
+fabsf(-2.5f): 2.500000
+isunordered(1.0, 2.0): 0
+isunordered(nan_d, 1.0): 1
+isunordered(1.0, nan_d): 1
+isless(1.0, 2.0): 1
+isless(2.0, 1.0): 0
+isgreater(2.0, 1.0): 1
+isgreater(1.0, 2.0): 0
+islessequal(1.0, 1.0): 1
+isgreaterequal(1.0, 1.0): 1
+signbit(-1.0): 1
+signbit(1.0): 0
+copysign(3.14, -1.0): -3.140000
+copysignl(2.71, -1.0): -2.710000
+isfinite(1.0): 1
+isfinite(inf): 0
+isfinite(nan): 0
+isfinite(const 1.0): 1
+isfinite(const inf): 0
+isfinite(const nan): 0
+isinf_sign(+inf): 1
+isinf_sign(-inf): -1
+isinf_sign(1.0): 0
+isinf_sign(nan): 0
+fmax_a: 2.500000
+fmax_b: 3.000000
+fmin_a: 1.500000
+fmin_b: -1.000000
+fmax_rt: 2.500000
+fmin_rt: 1.500000
+isnormal(1.0): 1
+isnormal(0.0): 0
+isnormal(inf): 0
+isnormal(nan): 0
+fpclassify(1.0): 2
+fpclassify(inf): 1
+fpclassify(nan): 0
+fpclassify(0.0): 4

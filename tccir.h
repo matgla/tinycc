@@ -54,6 +54,7 @@ typedef enum TccIrOp
   TCCIR_OP_CMP,
   TCCIR_OP_RETURNVOID,
   TCCIR_OP_RETURNVALUE,
+  TCCIR_OP_SET_CHAIN, /* Set static chain register before nested function call */
   TCCIR_OP_JUMP,
   TCCIR_OP_JUMPIF,
   /* Indirect jump (computed goto): target in src1 */
@@ -122,8 +123,44 @@ typedef enum TccIrOp
   TCCIR_OP_CALLARG_STACK,
   TCCIR_OP_CALLSEQ_END,
 
+  /* Store parent FP (R7) into chain slot for nested function trampoline.
+   * src1.c.i = ELF symbol index of the chain slot in .data */
+  TCCIR_OP_INIT_CHAIN_SLOT,
+
   /* No-operation placeholder for dead instructions */
   TCCIR_OP_NOP,
+
+  /* Prefetch data cache hint (PLD/PLI on ARM) - __builtin_prefetch */
+  TCCIR_OP_PREFETCH,
+
+  /* Generate a trap instruction (e.g., UDF on ARM) */
+  TCCIR_OP_TRAP,
+
+  /* Setjmp/longjmp for non-local exits:
+   * SETJMP: src1 = jump buffer pointer, dest = return value (0 on first call, 1 on longjmp)
+   * LONGJMP: src1 = jump buffer pointer, src2.c.i = return value (forced to 1)
+   */
+  TCCIR_OP_SETJMP,
+  TCCIR_OP_LONGJMP,
+
+  /* Non-local goto setjmp/longjmp: saves/restores ALL callee-saved registers
+   * (r4-r11) plus SP and resume address in a 40-byte buffer.
+   * Used for nested function non-local goto (__label__ + goto from nested func).
+   * NL_SETJMP: src1 = jump buffer pointer (40 bytes), dest = return value
+   * NL_LONGJMP: src1 = jump buffer pointer (40 bytes)
+   */
+  TCCIR_OP_NL_SETJMP,
+  TCCIR_OP_NL_LONGJMP,
+
+  /* __builtin_apply_args / __builtin_apply / __builtin_return support:
+   * BUILTIN_APPLY_ARGS: dest = pointer to saved incoming arg registers (r0-r3)
+   * BUILTIN_APPLY: dest = pointer to return-value block;
+   *                src1 = function pointer, src2 = args block (from apply_args)
+   * BUILTIN_RETURN: src1 = pointer to return-value block (from apply)
+   */
+  TCCIR_OP_BUILTIN_APPLY_ARGS,
+  TCCIR_OP_BUILTIN_APPLY,
+  TCCIR_OP_BUILTIN_RETURN,
 
   /* Jump table switch for dense case statements:
    * src1 = index vreg (already adjusted: value - min_case)
@@ -152,6 +189,8 @@ typedef enum TccIrOp
 
 typedef struct CType CType;
 typedef struct SValue SValue;
+typedef struct NestedFunc NestedFunc;
+typedef struct AttributeDef AttributeDef;
 
 #ifdef CONFIG_TCC_ASM
 typedef struct ASMOperand ASMOperand;
@@ -203,6 +242,7 @@ typedef struct IRLiveInterval
   uint8_t is_float : 1;        // whether this is a float/double variable
   uint8_t is_double : 1;       // whether this is a double (vs float)
   uint8_t is_llong : 1;        // whether this is a long long (64-bit int)
+  uint8_t is_complex : 1;      // Phase 3: whether this is a complex type
   uint8_t use_vfp : 1;         // whether to use VFP registers (hard float)
   uint8_t is_lvalue : 1;
   uint8_t crosses_call : 1; // whether interval spans a function call
@@ -211,7 +251,7 @@ typedef struct IRLiveInterval
   IRVregReplacement allocation;
   int8_t incoming_reg0;    // for params: which register arg arrives in (-1 if stack)
   int8_t incoming_reg1;    // for doubles: second register (-1 if not double or stack)
-  int16_t original_offset; // for params: original offset from function entry point
+  int32_t original_offset; // for params: original offset from function entry point
   int stack_slot_index;    // index into stack layout (-1 if not stack-backed)
 } IRLiveInterval;
 
@@ -253,8 +293,6 @@ typedef struct TCCStackSlot
   int offset;    // frame-pointer relative offset (bytes)
   int size;      // slot size in bytes
   int alignment; // required alignment in bytes (power of two)
-  uint8_t live_across_calls;
-  uint8_t addressable; // non-zero if slot must remain addressable (addr taken)
 } TCCStackSlot;
 
 typedef struct TCCStackLayout
@@ -298,39 +336,6 @@ typedef struct TCCMachineScratchRegs
 /* Exclude "permanent scratch" regs (e.g. R11/R12 on ARM) from scratch allocation. */
 #define TCC_MACHINE_SCRATCH_AVOID_PERM_SCRATCH (1u << 4)
 
-typedef struct TCCMaterializedValue
-{
-  uint8_t used_scratch;
-  uint8_t is_64bit;
-  uint8_t original_pr0;
-  uint8_t original_pr1;
-  unsigned short original_r;
-  uint64_t original_c_i;
-  TCCMachineScratchRegs scratch;
-} TCCMaterializedValue;
-
-typedef struct TCCMaterializedAddr
-{
-  uint8_t used_scratch;
-  uint8_t original_pr0;
-  uint8_t original_pr1;
-  unsigned short original_r;
-  uint64_t original_c_i;
-  TCCMachineScratchRegs scratch;
-} TCCMaterializedAddr;
-
-typedef struct TCCMaterializedDest
-{
-  uint8_t needs_storeback;
-  uint8_t is_64bit;
-  uint8_t is_param; /* storeback target is a stack-passed parameter (needs offset_to_args adjustment) */
-  uint8_t original_pr0;
-  uint8_t original_pr1;
-  unsigned short original_r;
-  int frame_offset;
-  TCCMachineScratchRegs scratch;
-} TCCMaterializedDest;
-
 /* Compact IR instruction - stores operand indices instead of full SValues */
 typedef struct IRQuadCompact
 {
@@ -367,7 +372,19 @@ typedef struct TCCIRState
   uint8_t check_for_backwards_jumps : 1;
   uint8_t basic_block_start : 1;
   uint8_t prevent_coalescing;
+  uint8_t has_static_chain : 1;      /* function uses static chain for nested func */
+  uint8_t needs_chain_save : 1;      /* must save chain at FP-4 for multi-hop child access */
+  int32_t static_chain_vreg;         /* vreg holding static chain pointer (parent FP) */
+  int32_t captured_offsets_list[32]; /* offsets of captured vars (for chain-relative access) */
+  int32_t captured_chain_depths[32]; /* 1 = direct R10, 2+ = multi-hop */
+  int32_t captured_count;            /* number of captured variables */
   int32_t loc;
+  int32_t parent_loc; /* parent's loc value (for nested function offset validation) */
+
+  /* Nested function tracking (for parent functions that contain nested functions) */
+  NestedFunc **nested_funcs;     /* array of pointers to nested function descriptors */
+  int32_t nb_nested_funcs;       /* count of nested functions */
+  int32_t nested_funcs_capacity; /* allocated capacity of nested_funcs array */
 
   /* Optimization module data - opaque pointer to keep IR arch-independent */
   TCCFPMatCache *opt_fp_mat_cache;
@@ -487,6 +504,8 @@ void tcc_ir_put_inline_asm(TCCIRState *ir, int inline_asm_id);
 int tcc_ir_get_vreg_temp(TCCIRState *ir);
 int tcc_ir_get_vreg_var(TCCIRState *ir);
 int tcc_ir_get_vreg_param(TCCIRState *ir);
+/* Allocate static chain vreg for nested functions (live-in at R10) */
+int tcc_ir_get_vreg_static_chain(TCCIRState *ir);
 
 void tcc_ir_set_float_type(TCCIRState *ir, int vreg, int is_float, int is_double);
 void tcc_ir_set_llong_type(TCCIRState *ir, int vreg);
@@ -503,11 +522,6 @@ void tcc_ir_avoid_spilling_stack_passed_params(TCCIRState *ir);
 void tcc_ir_build_stack_layout(TCCIRState *ir);
 const TCCStackSlot *tcc_ir_stack_slot_by_vreg(const TCCIRState *ir, int vreg);
 const TCCStackSlot *tcc_ir_stack_slot_by_offset(const TCCIRState *ir, int frame_offset);
-void tcc_ir_materialize_value(TCCIRState *ir, SValue *sv, TCCMaterializedValue *result);
-void tcc_ir_materialize_const_to_reg(TCCIRState *ir, SValue *sv, TCCMaterializedValue *result);
-void tcc_ir_materialize_addr(TCCIRState *ir, SValue *sv, TCCMaterializedAddr *result, int dest_reg);
-void tcc_ir_materialize_dest(TCCIRState *ir, SValue *dest, TCCMaterializedDest *result);
-
 void tcc_ir_assign_physical_register(TCCIRState *ir, int vreg, int offset, int r0, int r1);
 const char *tcc_ir_get_op_name(TccIrOp op);
 void tcc_ir_show(TCCIRState *ir);
@@ -526,15 +540,7 @@ void tcc_print_quadruple_irop(TCCIRState *ir, IRQuadCompact *q, int pc);
 
 /* Machine-independent spill helpers (defined in tccir.c) */
 int tcc_ir_is_spilled(SValue *sv);
-int tcc_ir_is_spilled_ir(const IROperand *op);
 int tcc_ir_is_64bit(int t);
-
-/* IROperand-based materialization functions (defined in tccir.c) */
-void tcc_ir_fill_registers_ir(TCCIRState *ir, IROperand *op);
-void tcc_ir_materialize_value_ir(TCCIRState *ir, IROperand *op, TCCMaterializedValue *result);
-void tcc_ir_materialize_const_to_reg_ir(TCCIRState *ir, IROperand *op, TCCMaterializedValue *result);
-void tcc_ir_materialize_addr_ir(TCCIRState *ir, IROperand *op, TCCMaterializedAddr *result, int dest_reg);
-void tcc_ir_materialize_dest_ir(TCCIRState *ir, IROperand *op, TCCMaterializedDest *result);
 
 /* Machine-dependent spill handling (defined in machine-specific code, e.g., arm-thumb-gen.c) */
 

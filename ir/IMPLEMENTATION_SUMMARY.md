@@ -124,7 +124,16 @@ See individual header files in `ir/` for complete API documentation:
 ## Testing
 
 All tests pass:
-- IR tests: 480/480 ✓
+- IR tests: 606/606 ✓ (+ GCC torture: 3310 passed, 79 skipped, 582 xfailed)
 - Assembler tests: 156/156 ✓
 - Internal tests: 63/63 ✓
 - AEABI tests: 13/13 ✓
+
+## Codegen Architecture
+
+`ir/codegen.c` uses a single unified two-pass loop (`for (pass = 0; pass < 2; pass++)`):
+- **Pass 0 (dry-run)**: discovers scratch register needs, collects branch offsets — `ot()` is a no-op.
+- **Inter-pass**: analyzes branch encodings, checks LR usage, runs scratch conflict fixup, emits prologue.
+- **Pass 1 (real-run)**: emits actual Thumb-2 machine code using dry-run data for consistency checks.
+
+Both passes share a single `switch (cq->op)` dispatch. Pass-specific behavior uses `if (is_dry_run)` / `if (!is_dry_run)` guards. Adding a new IR op requires adding only one `case`.

@@ -11,6 +11,7 @@
 *.lib
 *.exp
 *.log
+vgcore.*
 *.bz2
 *.zip
 .gdb_history
@@ -27,6 +28,7 @@ config*.h
 config*.mak
 config.texi
 conftest*
+!**/conftest.py
 c2str
 tags
 TAGS
@@ -79,3 +81,7 @@ tests/ir_tests/profile_baselines
 lib/fp/soft/test_aeabi_all
 lib/fp/soft/test_dmul_host
 lib/fp/soft/test_host
+tmp/
+
+.venv
+bin/

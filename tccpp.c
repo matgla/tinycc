@@ -663,6 +663,14 @@ ST_FUNC const char *get_tok_str(int v, CValue *cv)
     return strcpy(p, "<double>");
   case TOK_CLDOUBLE:
     return strcpy(p, "<long double>");
+  case TOK_CFLOAT_I:
+    return strcpy(p, "<imaginary float>");
+  case TOK_CDOUBLE_I:
+    return strcpy(p, "<imaginary double>");
+  case TOK_CLDOUBLE_I:
+    return strcpy(p, "<imaginary long double>");
+  case TOK_CINT_I:
+    return strcpy(p, "<imaginary int>");
   case TOK_LINENUM:
     return strcpy(p, "<linenumber>");
 
@@ -1170,7 +1178,7 @@ ST_FUNC void tok_str_free(TokenString *str)
 /* Ensure the TokenString buffer is heap-allocated.
    Returns the heap buffer pointer. Used when storing buffer refs in Sym->d/e.
    For empty buffers, returns NULL (safe to tok_str_free_str). */
-static int *tok_str_ensure_heap(TokenString *s)
+ST_FUNC int *tok_str_ensure_heap(TokenString *s)
 {
   if (s->len == 0)
     return NULL;
@@ -1278,7 +1286,7 @@ ST_FUNC void end_macro(void)
   }
 }
 
-static void tok_str_add2(TokenString *s, int t, CValue *cv)
+ST_FUNC void tok_str_add2(TokenString *s, int t, CValue *cv)
 {
   int len, *str;
   int nb_words;
@@ -1296,6 +1304,8 @@ static void tok_str_add2(TokenString *s, int t, CValue *cv)
   case TOK_CCHAR:
   case TOK_LCHAR:
   case TOK_CFLOAT:
+  case TOK_CFLOAT_I:
+  case TOK_CINT_I:
   case TOK_LINENUM:
 #if LONG_SIZE == 4
   case TOK_CLONG:
@@ -1304,6 +1314,7 @@ static void tok_str_add2(TokenString *s, int t, CValue *cv)
     nb_words = 2;
     break;
   case TOK_CDOUBLE:
+  case TOK_CDOUBLE_I:
   case TOK_CLLONG:
   case TOK_CULLONG:
 #if LONG_SIZE == 8
@@ -1313,6 +1324,7 @@ static void tok_str_add2(TokenString *s, int t, CValue *cv)
     nb_words = 3;
     break;
   case TOK_CLDOUBLE:
+  case TOK_CLDOUBLE_I:
 #if LDOUBLE_SIZE == 8 || defined TCC_USING_DOUBLE_FOR_LDOUBLE
     nb_words = 3;
 #elif LDOUBLE_SIZE == 12
@@ -1344,6 +1356,8 @@ static void tok_str_add2(TokenString *s, int t, CValue *cv)
   case TOK_CCHAR:
   case TOK_LCHAR:
   case TOK_CFLOAT:
+  case TOK_CFLOAT_I:
+  case TOK_CINT_I:
   case TOK_LINENUM:
 #if LONG_SIZE == 4
   case TOK_CLONG:
@@ -1364,6 +1378,7 @@ static void tok_str_add2(TokenString *s, int t, CValue *cv)
   }
   break;
   case TOK_CDOUBLE:
+  case TOK_CDOUBLE_I:
   case TOK_CLLONG:
   case TOK_CULLONG:
 #if LONG_SIZE == 8
@@ -1374,9 +1389,30 @@ static void tok_str_add2(TokenString *s, int t, CValue *cv)
     str[len++] = cv->tab[1];
     break;
   case TOK_CLDOUBLE:
+  case TOK_CLDOUBLE_I:
 #if LDOUBLE_SIZE == 8 || defined TCC_USING_DOUBLE_FOR_LDOUBLE
-    str[len++] = cv->tab[0];
-    str[len++] = cv->tab[1];
+    /* When cross-compiling with LDOUBLE_SIZE == 8 (target long double is double)
+     * but host long double is wider (e.g. 80-bit x87), we must convert to double
+     * before saving, because cv->tab[0..1] only cover the first 8 bytes of the
+     * host long double (the significand), losing the exponent. */
+#if LDOUBLE_SIZE == 8 && !defined TCC_USING_DOUBLE_FOR_LDOUBLE && LDOUBLE_SIZE < 16
+    if (sizeof(long double) > LDOUBLE_SIZE)
+    {
+      union
+      {
+        double d;
+        int tab[2];
+      } tmp;
+      tmp.d = (double)cv->ld;
+      str[len++] = tmp.tab[0];
+      str[len++] = tmp.tab[1];
+    }
+    else
+#endif
+    {
+      str[len++] = cv->tab[0];
+      str[len++] = cv->tab[1];
+    }
 #elif LDOUBLE_SIZE == 12
     str[len++] = cv->tab[0];
     str[len++] = cv->tab[1];
@@ -1421,7 +1457,7 @@ static void tok_str_add2_spc(TokenString *s, int t, CValue *cv)
 }
 
 /* get a token from an integer array and increment pointer. */
-static inline void tok_get(int *t, const int **pp, CValue *cv)
+ST_FUNC void tok_get(int *t, const int **pp, CValue *cv)
 {
   const int *p = *pp;
   int n, *tab;
@@ -1435,6 +1471,7 @@ static inline void tok_get(int *t, const int **pp, CValue *cv)
   case TOK_CINT:
   case TOK_CCHAR:
   case TOK_LCHAR:
+  case TOK_CINT_I:
   case TOK_LINENUM:
     cv->i = *p++;
     break;
@@ -1445,6 +1482,7 @@ static inline void tok_get(int *t, const int **pp, CValue *cv)
     cv->i = (unsigned)*p++;
     break;
   case TOK_CFLOAT:
+  case TOK_CFLOAT_I:
     tab[0] = *p++;
     break;
   case TOK_STR:
@@ -1456,6 +1494,7 @@ static inline void tok_get(int *t, const int **pp, CValue *cv)
     p += (cv->str.size + sizeof(int) - 1) / sizeof(int);
     break;
   case TOK_CDOUBLE:
+  case TOK_CDOUBLE_I:
   case TOK_CLLONG:
   case TOK_CULLONG:
 #if LONG_SIZE == 8
@@ -1465,12 +1504,24 @@ static inline void tok_get(int *t, const int **pp, CValue *cv)
     n = 2;
     goto copy;
   case TOK_CLDOUBLE:
+  case TOK_CLDOUBLE_I:
 #if LDOUBLE_SIZE == 8 || defined TCC_USING_DOUBLE_FOR_LDOUBLE
-    n = 2;
+    /* Restore 2 words (double).  When the host long double is wider than
+     * the target's (cross-compilation), the save side converted ld→double,
+     * so we must convert back double→ld here. */
+    *tab++ = *p++;
+    *tab++ = *p++;
+#if LDOUBLE_SIZE == 8 && !defined TCC_USING_DOUBLE_FOR_LDOUBLE && LDOUBLE_SIZE < 16
+    if (sizeof(long double) > LDOUBLE_SIZE)
+      cv->ld = (long double)cv->d;
+#endif
+    break;
 #elif LDOUBLE_SIZE == 12
     n = 3;
+    goto copy;
 #elif LDOUBLE_SIZE == 16
     n = 4;
+    goto copy;
 #else
 #error add long double size support
 #endif
@@ -1712,10 +1763,81 @@ static int parse_include(TCCState *s1, int do_next, int test)
   return 1;
 }
 
+static int pp_assertion_macro_defined(const char *name)
+{
+  int tok;
+  char buf[256];
+  int len;
+
+  len = strlen(name);
+  tok = tok_alloc(name, len)->tok;
+  if (define_find(tok))
+    return 1;
+
+  if (len + 4 >= sizeof(buf))
+    return 0;
+
+  buf[0] = '_';
+  buf[1] = '_';
+  memcpy(buf + 2, name, len);
+  memcpy(buf + 2 + len, "__", 3);
+  tok = tok_alloc(buf, len + 4)->tok;
+  if (define_find(tok))
+    return 1;
+
+  buf[2 + len] = '\0';
+  tok = tok_alloc(buf, len + 2)->tok;
+  return define_find(tok) != NULL;
+}
+
+static int pp_assertion_value(int kind_tok, int value_tok)
+{
+  const char *kind;
+  const char *value;
+
+  if (kind_tok < TOK_IDENT || value_tok < TOK_IDENT)
+    return 0;
+
+  kind = table_ident[kind_tok - TOK_IDENT]->str;
+  value = table_ident[value_tok - TOK_IDENT]->str;
+
+  if (!strcmp(kind, "cpu") || !strcmp(kind, "machine") || !strcmp(kind, "system"))
+    return pp_assertion_macro_defined(value);
+
+  return 0;
+}
+
+static void pp_parse_assertion(void)
+{
+  int kind_tok, value_tok;
+
+  next();
+  kind_tok = tok;
+  if (kind_tok < TOK_IDENT)
+    expect("identifier after '#'");
+
+  next();
+  if (tok != '(')
+    expect("'(' after preprocessor assertion");
+
+  next();
+  value_tok = tok;
+  if (value_tok < TOK_IDENT)
+    expect("identifier in preprocessor assertion");
+
+  next();
+  if (tok != ')')
+    expect("')'");
+
+  tok = TOK_CINT;
+  tokc.i = pp_assertion_value(kind_tok, value_tok);
+}
+
 /* eval an expression for #if/#elif */
 static int expr_preprocess(TCCState *s1)
 {
-  int c, t;
+  int t;
+  int64_t c;
   int t0 = tok;
   TokenString *str;
 
@@ -1725,7 +1847,11 @@ static int expr_preprocess(TCCState *s1)
   {
     next(); /* do macro subst */
     t = tok;
-    if (tok < TOK_IDENT)
+    if (tok == '#')
+    {
+      pp_parse_assertion();
+    }
+    else if (tok < TOK_IDENT)
     {
       if (tok == TOK_LINEFEED || tok == TOK_EOF)
         break;
@@ -1784,7 +1910,7 @@ static int expr_preprocess(TCCState *s1)
   /* now evaluate C constant expression */
   begin_macro(str, 1);
   next();
-  c = expr_const();
+  c = expr_const64();
   if (tok != TOK_EOF)
     tcc_error("...");
   pp_expr = 0;
@@ -2691,6 +2817,7 @@ static void parse_number(const char *p)
       else
         shift = 1;
       bn_zero(bn);
+      int bn_used_bits = 0;
       q = token_buf;
       while (1)
       {
@@ -2712,6 +2839,7 @@ static void parse_number(const char *p)
           t = t - '0';
         }
         bn_lshift(bn, shift, t);
+        bn_used_bits += shift;
       }
       frac_bits = 0;
       if (ch == '.')
@@ -2738,8 +2866,16 @@ static void parse_number(const char *p)
           }
           if (t >= b)
             tcc_error("invalid digit");
-          bn_lshift(bn, shift, t);
-          frac_bits += shift;
+          /* Only accumulate digits that fit in the bignum.  Excess
+             fractional digits beyond BN_SIZE*32 bits would overflow
+             the fixed-width bignum and corrupt the result.  Silently
+             ignore them (they are beyond double precision anyway). */
+          if (bn_used_bits + shift <= BN_SIZE * 32)
+          {
+            bn_lshift(bn, shift, t);
+            frac_bits += shift;
+            bn_used_bits += shift;
+          }
           ch = *p++;
         }
       }
@@ -2788,6 +2924,36 @@ static void parse_number(const char *p)
         /* XXX: not large enough */
         tokc.ld = (long double)d;
 #endif
+      }
+      else if (t == 'D')
+      {
+        /* C2x decimal float suffixes: DF, DD, DL (approximated with binary FP) */
+        ch = *p++;
+        t = toup(ch);
+        if (t == 'F')
+        {
+          ch = *p++;
+          tok = TOK_CFLOAT;
+          tokc.f = (float)d;
+        }
+        else if (t == 'L')
+        {
+          ch = *p++;
+          tok = TOK_CLDOUBLE;
+#ifdef TCC_USING_DOUBLE_FOR_LDOUBLE
+          tokc.d = d;
+#else
+          tokc.ld = (long double)d;
+#endif
+        }
+        else
+        {
+          /* DD suffix or bare D */
+          if (t == 'D')
+            ch = *p++;
+          tok = TOK_CDOUBLE;
+          tokc.d = d;
+        }
       }
       else
       {
@@ -2855,10 +3021,79 @@ static void parse_number(const char *p)
         tokc.ld = strtold(token_buf, NULL);
 #endif
       }
+      else if (t == 'D')
+      {
+        /* C2x decimal float suffixes: DF, DD, DL (approximated with binary FP) */
+        ch = *p++;
+        t = toup(ch);
+        if (t == 'F')
+        {
+          ch = *p++;
+          tok = TOK_CFLOAT;
+          tokc.f = strtof(token_buf, NULL);
+        }
+        else if (t == 'L')
+        {
+          ch = *p++;
+          tok = TOK_CLDOUBLE;
+#ifdef TCC_USING_DOUBLE_FOR_LDOUBLE
+          tokc.d = strtod(token_buf, NULL);
+#else
+          tokc.ld = strtold(token_buf, NULL);
+#endif
+        }
+        else
+        {
+          /* DD suffix or bare D */
+          if (t == 'D')
+            ch = *p++;
+          tok = TOK_CDOUBLE;
+          tokc.d = strtod(token_buf, NULL);
+        }
+      }
       else
       {
         tok = TOK_CDOUBLE;
         tokc.d = strtod(token_buf, NULL);
+      }
+      /* GNU imaginary suffix: i, I, j, J
+       * Can appear before or after type suffix (F/L).
+       * e.g. 1.0Fi, 1.0iF, 1.0i, 1.0Li, 1.0iL */
+      t = toup(ch);
+      if (t == 'I' || t == 'J')
+      {
+        ch = *p++;
+        /* Check for type suffix after imaginary suffix: iF, iL */
+        if (tok == TOK_CDOUBLE)
+        {
+          int t2 = toup(ch);
+          if (t2 == 'F')
+          {
+            ch = *p++;
+            tok = TOK_CFLOAT_I;
+            tokc.f = strtof(token_buf, NULL);
+          }
+          else if (t2 == 'L')
+          {
+            ch = *p++;
+            tok = TOK_CLDOUBLE_I;
+#ifdef TCC_USING_DOUBLE_FOR_LDOUBLE
+            tokc.d = strtod(token_buf, NULL);
+#else
+            tokc.ld = strtold(token_buf, NULL);
+#endif
+          }
+          else
+          {
+            tok = TOK_CDOUBLE_I;
+          }
+        }
+        else if (tok == TOK_CFLOAT)
+          tok = TOK_CFLOAT_I;
+        else if (tok == TOK_CLDOUBLE)
+          tok = TOK_CLDOUBLE_I;
+        else
+          tok = TOK_CDOUBLE_I;
       }
     }
   }
@@ -2954,16 +3189,38 @@ static void parse_number(const char *p)
     if (ov)
       tcc_warning("integer constant overflow");
 
-    tok = TOK_CINT;
-    if (lcount)
+    if (pp_expr)
     {
-      tok = TOK_CLONG;
-      if (lcount == 2)
-        tok = TOK_CLLONG;
+      /* C preprocessor integer arithmetic uses intmax_t / uintmax_t
+         semantics, not the target's narrower int/long widths.  Keep
+         only signedness from the suffix and evaluate everything as
+         64-bit signed/unsigned integers. */
+      tok = ucount ? TOK_CULLONG : TOK_CLLONG;
     }
-    if (ucount)
-      ++tok; /* TOK_CU... */
+    else
+    {
+      tok = TOK_CINT;
+      if (lcount)
+      {
+        tok = TOK_CLONG;
+        if (lcount == 2)
+          tok = TOK_CLLONG;
+      }
+      if (ucount)
+        ++tok; /* TOK_CU... */
+    }
     tokc.i = n;
+
+    /* GNU imaginary suffix: i, I, j, J on integer constants */
+    t = toup(ch);
+    if (t == 'I' || t == 'J')
+    {
+      ch = *p++;
+      /* Integer imaginary: keep the integer value, mark as imaginary.
+       * The value is the magnitude of the imaginary part. */
+      tok = TOK_CINT_I;
+      tokc.i = n;
+    }
   }
   if (ch)
     tcc_error("invalid number");
@@ -4304,6 +4561,16 @@ static void tcc_predefs(TCCState *s1, CString *cs, int is_asm)
     putdef(cs, "__leading_underscore");
   cstr_printf(cs, "#define __SIZEOF_POINTER__ %d\n", PTR_SIZE);
   cstr_printf(cs, "#define __SIZEOF_LONG__ %d\n", LONG_SIZE);
+  cstr_printf(cs, "#define __SIZEOF_INT__ 4\n");
+  cstr_printf(cs, "#define __SIZEOF_SHORT__ 2\n");
+  cstr_printf(cs, "#define __SIZEOF_LONG_LONG__ 8\n");
+  cstr_printf(cs, "#define __SIZEOF_FLOAT__ 4\n");
+  cstr_printf(cs, "#define __SIZEOF_DOUBLE__ 8\n");
+  cstr_printf(cs, "#define __SIZEOF_LONG_DOUBLE__ %d\n", LDOUBLE_SIZE);
+  cstr_printf(cs, "#define __SIZEOF_WCHAR_T__ 4\n");
+  cstr_printf(cs, "#define __SIZEOF_WINT_T__ 4\n");
+  cstr_printf(cs, "#define __SIZEOF_SIZE_T__ %d\n", PTR_SIZE);
+  cstr_printf(cs, "#define __SIZEOF_PTRDIFF_T__ %d\n", PTR_SIZE);
   if (!is_asm)
   {
     putdef(cs, "__STDC__");
@@ -4380,8 +4647,22 @@ ST_FUNC void tccpp_new(TCCState *s)
   const char *p, *r;
 
   /* init isid table */
+  /* Note: written as if-else chain instead of nested ternary to work around
+     a TCC ARM codegen bug at -O1 where nested ternaries in a for-loop body
+     cause the loop increment to be lost. */
   for (i = CH_EOF; i < 128; i++)
-    set_idnum(i, is_space(i) ? IS_SPC : isid(i) ? IS_ID : isnum(i) ? IS_NUM : 0);
+  {
+    int val;
+    if (is_space(i))
+      val = IS_SPC;
+    else if (isid(i))
+      val = IS_ID;
+    else if (isnum(i))
+      val = IS_NUM;
+    else
+      val = 0;
+    set_idnum(i, val);
+  }
 
   for (i = 128; i < 256; i++)
     set_idnum(i, IS_ID);

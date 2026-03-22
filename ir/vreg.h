@@ -28,6 +28,12 @@ int tcc_ir_vreg_alloc_var(struct TCCIRState *ir);
 /* Allocate a parameter virtual register */
 int tcc_ir_vreg_alloc_param(struct TCCIRState *ir);
 
+/* Allocate a static chain virtual register for nested functions.
+ * This is a special vreg that models the static chain register (R10 on ARM)
+ * as a parameter-like entity. It is live-in at function entry with
+ * incoming_reg0 set to the static chain register. */
+int tcc_ir_vreg_alloc_static_chain(struct TCCIRState *ir);
+
 /* ============================================================================
  * Virtual Register Queries
  * ============================================================================ */
@@ -53,6 +59,9 @@ void tcc_ir_vreg_type_set_fp(struct TCCIRState *ir, int vreg, int is_float, int 
 
 /* Mark vreg as 64-bit (long long or double) */
 void tcc_ir_vreg_type_set_64bit(struct TCCIRState *ir, int vreg);
+
+/* Phase 3: Mark vreg as complex type */
+void tcc_ir_vreg_type_set_complex(struct TCCIRState *ir, int vreg);
 
 /* Set original stack offset for vreg */
 void tcc_ir_vreg_offset_set(struct TCCIRState *ir, int vreg, int offset);

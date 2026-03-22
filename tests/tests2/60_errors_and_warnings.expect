@@ -65,7 +65,6 @@
 60_errors_and_warnings.c:138: error: redeclaration of 'L'
 
 [test_abstract_decls]
-60_errors_and_warnings.c:148: error: identifier expected
 
 [test_invalid_1]
 60_errors_and_warnings.c:153: error: expression expected before ','
@@ -101,7 +100,7 @@
 60_errors_and_warnings.c:202: error: _Static_assert fail
 
 [test_static_assert_empty_string]
-60_errors_and_warnings.c:205: error: 
+60_errors_and_warnings.c:205: error:
 
 [test_void_array]
 60_errors_and_warnings.c:208: error: declaration of an array of incomplete type elements
@@ -164,7 +163,7 @@ bar  : 3 ; 3
 \n
 
 [test_var_array]
-60_errors_and_warnings.c:348: error: flexible array has zero size in this context
+60_errors_and_warnings.c:348: error: initialization of flexible array member in a nested context
 
 [test_var_array2]
 60_errors_and_warnings.c:358: error: flexible array has zero size in this context

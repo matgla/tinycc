@@ -1,7 +1,7 @@
 import pytest
 import re
 from pathlib import Path
-from qemu_run import run_test, compile_testcase, CompileConfig, prepare_test
+from qemu_run import run_test, compile_testcase, CompileConfig, prepare_test, ASAN_ENABLED, VALGRIND_ENABLED
 
 
 # When expected output contains floating point literals, match numerically and
@@ -103,6 +103,7 @@ TEST_FILES = [
     ("102_pure_func_strcmp.c", 0),
     ("103_pure_func_multiple.c", 0),
     ("104_pure_func_variant.c", 0),
+    ("105_builtin_strncmp_zero_count.c", 0),
 
     # Single-precision float tests
     ("72_float_result.c", 1),  # Returns 1 on success (non-standard convention)
@@ -154,8 +155,29 @@ TEST_FILES = [
     # const char *const global pointer access (YAFF exported symbol section fix)
     ("bug_const_ptr_got_deref.c", 0),
 
+    # union self-cast through typedef should not take the scalar-to-union extension path
+    ("bug_union_self_cast_typedef.c", 0),
+
+    # inline asm operands may reuse their own live registers in IR mode
+    ("bug_inline_asm_reserved_regs.c", 0),
+
     # mul clobbers base register during struct array indexing (non-power-of-2 element size)
     ("bug_struct_array_index_mul_clobber.c", 0),
+
+    # GNU attributes may prefix a declarator after a comma in a declaration list
+    ("bug_decl_attr_after_comma.c", 0),
+
+    # `__attribute__((alias(...)))` supports direct, asm-label, and forward targets
+    ("bug_alias_attribute.c", 0),
+
+    # comma expressions in sizeof must safely drop unused results without IR
+    ("bug_sizeof_comma_func_decay.c", 0),
+
+    # 64-bit left-shift in a loop clobbers adjacent pointer register/spill slot
+    ("bug_ll_shift_ptr_clobber.c", 0),
+
+    # for-loop increment lost when body has nested ternary chain as function arg
+    ("bug_for_ternary_chain.c", 0),
 
     ("../tests2/00_assignment.c", 0),
     ("../tests2/01_comment.c", 0),
@@ -239,6 +261,22 @@ TEST_FILES = [
     ("../tests2/103_implicit_memmove.c", 0),
     (["../tests2/104_inline.c", "../tests2/104+_inline.c"], 0),
     ("../tests2/105_local_extern.c", 0),
+
+    # __builtin_classify_type tests
+    ("140_builtin_classify_type.c", 0),
+
+    # __builtin_bswap16, __builtin_bswap32, __builtin_bswap64 tests
+    ("145_builtin_bswap.c", 0),
+
+    # __builtin_add_overflow, __builtin_sub_overflow, __builtin_mul_overflow tests
+    ("165_builtin_add_overflow.c", 0),
+
+    # __builtin_add_overflow_p, __builtin_sub_overflow_p, __builtin_mul_overflow_p tests
+    ("166_builtin_mul_overflow_p.c", 0),
+
+    # IEEE 754 NaN comparison tests (soft-float GT/GE fix)
+    ("170_nan_comparison.c", 0),
+
     # ("../tests2/106_versym.c", 0),
     ("../tests2/108_constructor.c", 0),
     # ("../tests2/112_backtrace.c", 0),
@@ -269,6 +307,35 @@ TEST_FILES = [
 
     # sret hidden pointer consuming r0 must advance ABI call_layout.next_reg
     ("bug_sret_param_layout.c", 0),
+    ("nested_basic.c", 0),
+    ("nested_basic_args.c", 0),
+    ("nested_multiple.c", 0),
+    ("nested_capture_multiple.c", 0),
+    ("nested_capture_array.c", 0),
+    ("nested_capture_read.c", 0),
+    ("nested_capture_write.c", 0),
+    ("nested_direct_call_args.c", 0),
+    ("nested_struct_return.c", 0),
+    ("nested_shadowing.c", 0),
+    ("nested_funcptr.c", 0),
+    ("nested_funcptr_indirect.c", 0),
+    ("nested_funcptr_call_twice.c", 0),
+    ("nested_recursive_parent.c", 0),
+    ("nested_multi_level.c", 0),
+
+    # Complex number tests
+    ("test_complex_fold.c", 0),
+    ("test_complex_init.c", 0),
+    ("test_complex_mul.c", 0),
+    ("test_complex_simple.c", 0),
+
+    ("111_builtin_printf.c", 0),
+    ("112_builtin_puts.c", 0),
+    ("150_builtin_fp.c", 0),
+]
+
+# Nested function tests expected to fail (not yet implemented)
+NESTED_XFAIL_TEST_FILES = [
 ]
 
 FLOAT_TEST_FILES = [
@@ -605,14 +672,44 @@ def _generate_matrix_params(test_list):
 _MATRIX_PARAMS, _MATRIX_IDS = _generate_matrix_params(TEST_FILES)
 
 
+# Tests too slow under instrumentation (ASan / valgrind) — skip to avoid timeouts.
+SLOW_UNDER_INSTRUMENTATION = {
+    "../tests2/101_cleanup.c",
+}
+
+
 @pytest.mark.parametrize("test_file,expected_exit_code,timeout,opt_level", _MATRIX_PARAMS, ids=_MATRIX_IDS)
 def test_qemu_execution(test_file, expected_exit_code, timeout, opt_level, tmp_path):
     if test_file is None:
         pytest.fail("test_file is None")
+    primary = _primary_test_file(test_file) if isinstance(test_file, list) else test_file
+    if (ASAN_ENABLED or VALGRIND_ENABLED) and primary in SLOW_UNDER_INSTRUMENTATION:
+        pytest.skip("Skipped under ASan/valgrind (too slow)")
 
     _run_qemu_test(test_file, expected_exit_code, opt_level=opt_level, output_dir=tmp_path, timeout=timeout)
 
 
+# Nested function xfail tests (not yet implemented)
+def _generate_nested_xfail_params():
+    params = []
+    ids = []
+    for test_file, expected in NESTED_XFAIL_TEST_FILES:
+        for opt in OPT_LEVELS:
+            params.append((test_file, expected, opt))
+            ids.append(f"{_test_id(test_file)}{opt}")
+    return params, ids
+
+
+_NESTED_XFAIL_PARAMS, _NESTED_XFAIL_IDS = _generate_nested_xfail_params()
+
+
+@pytest.mark.parametrize("test_file,expected_exit_code,opt_level", _NESTED_XFAIL_PARAMS, ids=_NESTED_XFAIL_IDS)
+@pytest.mark.xfail(reason="Nested function feature not yet implemented")
+def test_nested_xfail(test_file, expected_exit_code, opt_level, tmp_path):
+    if test_file is None:
+        pytest.fail("test_file is None")
+
+    _run_qemu_test(test_file, expected_exit_code, opt_level=opt_level, output_dir=tmp_path)
 
 
 
@@ -676,19 +773,6 @@ _TAGGED_MATRIX_PARAMS, _TAGGED_MATRIX_IDS = _generate_tagged_matrix_params(_TAGG
 def test_qemu_tagged_execution(test_file, tag, expected_lines, expected_exit_code,opt_level, tmp_path):
     if test_file is None:
         pytest.fail("test_file is None")
-
-    # The IR backend must allocate string/data for dead code blocks because IR
-    # instructions (even in if(0) paths) are emitted to support labels reachable
-    # by goto.  The data referenced by those IR instructions must exist at link
-    # time.  This makes data suppression inside if(0) architecturally impossible
-    # without major refactoring (lazy/deferred data allocation).
-    # Additionally, at -O0 code suppression does not work because DCE and
-    # fall-through elimination are only enabled at -O1+.
-    # This test was never passing before: the original code could not compile
-    # &&label (label-as-value) expressions, so the test runner silently
-    # returned success on compilation failure.
-    if tag == "test_data_suppression_on":
-        pytest.xfail("IR backend cannot suppress data in dead code blocks (pre-existing limitation)")
 
     _run_tagged_qemu_test(test_file, tag, expected_lines, expected_exit_code, opt_level=opt_level, output_dir=tmp_path)
 
@@ -765,6 +849,41 @@ def test_function_sections_bugs(test_file, expected_exit_code, opt_level, tmp_pa
         pytest.fail("test_file is None")
 
     cflags = f"{opt_level} -ffunction-sections"
+    _run_qemu_test(test_file, expected_exit_code, opt_level=cflags, output_dir=tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Tests requiring -fgnu89-inline
+# ---------------------------------------------------------------------------
+
+GNU89_INLINE_TEST_FILES = [
+    # Regression: inline asm inside an `extern inline` function must still be
+    # parsed, emitted, and callable when GNU89 inline semantics rewrite it to a
+    # local out-of-line definition.
+    ("bug_gnu89_inline_asm.c", 0),
+]
+
+
+def _generate_gnu89_inline_params():
+    params = []
+    ids = []
+    for test_file, expected in GNU89_INLINE_TEST_FILES:
+        for opt in OPT_LEVELS:
+            params.append((test_file, expected, opt))
+            ids.append(f"{_test_id(test_file)}{opt}")
+    return params, ids
+
+
+_GNU89_INLINE_PARAMS, _GNU89_INLINE_IDS = _generate_gnu89_inline_params() if GNU89_INLINE_TEST_FILES else ([], [])
+
+
+@pytest.mark.parametrize("test_file,expected_exit_code,opt_level", _GNU89_INLINE_PARAMS, ids=_GNU89_INLINE_IDS)
+def test_gnu89_inline_bugs(test_file, expected_exit_code, opt_level, tmp_path):
+    """Tests compiled with -fgnu89-inline to exercise GNU89 extern-inline semantics."""
+    if test_file is None:
+        pytest.fail("test_file is None")
+
+    cflags = f"{opt_level} -fgnu89-inline"
     _run_qemu_test(test_file, expected_exit_code, opt_level=cflags, output_dir=tmp_path)
 
 

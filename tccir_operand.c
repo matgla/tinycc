@@ -243,6 +243,7 @@ static int vt_btype_to_irop_btype(int vt_btype)
 {
   switch (vt_btype)
   {
+  case VT_BOOL:
   case VT_BYTE:
     return IROP_BTYPE_INT8;
   case VT_SHORT:
@@ -259,7 +260,7 @@ static int vt_btype_to_irop_btype(int vt_btype)
   case VT_FUNC:
     return IROP_BTYPE_FUNC;
   default:
-    /* VT_VOID, VT_INT, VT_PTR, VT_BOOL -> INT32 */
+    /* VT_VOID, VT_INT, VT_PTR -> INT32 */
     return IROP_BTYPE_INT32;
   }
 }
@@ -294,11 +295,10 @@ int irop_btype_to_vt_btype(int irop_btype)
  */
 static inline void irop_copy_svalue_info(IROperand *op, const SValue *sv)
 {
-  op->pr0_reg = sv->pr0_reg;
-  op->pr0_spilled = sv->pr0_spilled;
-  op->pr1_reg = sv->pr1_reg;
-  op->pr1_spilled = sv->pr1_spilled;
   op->is_unsigned = (sv->type.t & VT_UNSIGNED) ? 1 : 0;
+  /* _Bool is always unsigned (0 or 1) */
+  if ((sv->type.t & VT_BTYPE) == VT_BOOL)
+    op->is_unsigned = 1;
   op->is_static = (sv->type.t & VT_STATIC) ? 1 : 0;
   /* Don't overwrite is_sym, is_const, or is_param - those are set by irop_make_* */
 }
@@ -321,6 +321,7 @@ IROperand svalue_to_iroperand(TCCIRState *ir, const SValue *sv)
   int has_sym = (sv->r & VT_SYM) ? 1 : 0;
   int vt_btype = sv->type.t & VT_BTYPE;
   int irop_bt = vt_btype_to_irop_btype(vt_btype);
+  int is_complex = (sv->type.t & VT_COMPLEX) ? 1 : 0; /* DONE: Phase 2 */
 
   IROperand result;
 
@@ -338,7 +339,12 @@ IROperand svalue_to_iroperand(TCCIRState *ir, const SValue *sv)
     irop_copy_svalue_info(&result, sv);
     /* Capture physical register from VT_VALMASK if it's a register number */
     if (val_kind < VT_CONST && val_kind < 32) /* Physical register in VT_VALMASK */
-      result.pr0_reg = val_kind;
+    {
+      /* Do NOT set u.imm32 here — u.imm32 is used by load_to_dest_ir for
+       * sub-component access (complex imaginary part).  Only vreg=-1 (Case 1b)
+       * needs the IROP_VREG_PHYS encoding in u.imm32.
+       * For vreg >= 0, the physical register comes from the interval table. */
+    }
     goto done;
   }
 
@@ -353,7 +359,7 @@ IROperand svalue_to_iroperand(TCCIRState *ir, const SValue *sv)
     result.is_lval = is_reg_param ? 0 : is_lval;
     result.is_param = (sv->r & VT_PARAM) ? 1 : 0; /* Preserve VT_PARAM for register params */
     irop_copy_svalue_info(&result, sv);
-    result.pr0_reg = val_kind; /* Physical register in VT_VALMASK */
+    result.u.imm32 = IROP_VREG_PHYS_VALID | (val_kind & IROP_VREG_PHYS_MASK);
     goto done;
   }
 
@@ -381,6 +387,58 @@ IROperand svalue_to_iroperand(TCCIRState *ir, const SValue *sv)
     goto done;
   }
 
+  /* Case 3b: Complex constant — pack full value before scalar float/double cases.
+   * Complex float (VT_FLOAT + VT_COMPLEX): 64-bit packed {real_u32, imag_u32} in CValue.i.
+   * Complex double/ldouble (VT_DOUBLE/VT_LDOUBLE + VT_COMPLEX): 128-bit packed
+   *   {real_f64, imag_f64} in CValue bytes [0:15].  We store each half in two
+   *   I64 pool slots and link them together via the primary pool entry.
+   *
+   * For float complex: stored as single I64 pool entry.
+   * For double complex: stored as I64 for the real part; the imag part is
+   *   materialized at the use site (callsite/vstore) from the second pool entry.
+   *   TODO: for now, complex double constants should already be materialized to
+   *   a stack local before reaching function calls (tccgen.c handles this). */
+  if (is_complex && val_kind == VT_CONST && is_float(vt_btype))
+  {
+    if (vt_btype == VT_FLOAT)
+    {
+      /* Float complex: the two 32-bit floats are packed into CValue.i */
+      uint64_t packed = (uint64_t)sv->c.i;
+      uint32_t idx = tcc_ir_pool_add_i64(ir, (int64_t)packed);
+      result = irop_make_i64(vr, idx, irop_bt);
+      result.is_lval = is_lval;
+      irop_copy_svalue_info(&result, sv);
+      goto done;
+    }
+    /* Double/LDouble complex: 128-bit value.
+     * The real part is in bytes [0:7], imaginary in [8:15].
+     * Store the full 128-bit value as two I64 pool entries.
+     * We use the real part as the primary pooled value and store
+     * the imaginary part in a second pool entry whose index is
+     * communicated via the linked-pair convention. */
+    {
+      double real_d, imag_d;
+      memcpy(&real_d, &sv->c, 8);
+      memcpy(&imag_d, (char *)&sv->c + 8, 8);
+      union
+      {
+        double d;
+        uint64_t bits;
+      } ur, ui;
+      ur.d = real_d;
+      ui.d = imag_d;
+      /* Store both halves: primary = real, secondary = imag.
+       * The caller (callsite / conjugate / etc.) will retrieve both
+       * via irop_get_imm64_ex on the primary, and the secondary is at idx+1. */
+      uint32_t idx_real = tcc_ir_pool_add_f64(ir, ur.bits);
+      tcc_ir_pool_add_f64(ir, ui.bits); /* idx_real + 1 */
+      result = irop_make_f64(vr, idx_real);
+      result.is_lval = is_lval;
+      irop_copy_svalue_info(&result, sv);
+      goto done;
+    }
+  }
+
   /* Case 4: Float constant - inline F32 */
   if (vt_btype == VT_FLOAT && val_kind == VT_CONST)
   {
@@ -396,15 +454,22 @@ IROperand svalue_to_iroperand(TCCIRState *ir, const SValue *sv)
     goto done;
   }
 
-  /* Case 5: Double constant - pool F64 */
-  if (vt_btype == VT_DOUBLE && val_kind == VT_CONST)
+  /* Case 5: Double/Long Double constant - pool F64 */
+  if ((vt_btype == VT_DOUBLE || vt_btype == VT_LDOUBLE) && val_kind == VT_CONST)
   {
     union
     {
       double d;
       uint64_t bits;
     } u;
-    u.d = sv->c.d;
+    /* Handle cross-compilation where host and target have different long double sizes.
+     * If host's long double is larger than target's, cast to double first. */
+    if (vt_btype == VT_LDOUBLE && sizeof(long double) != LDOUBLE_SIZE)
+      u.d = (double)sv->c.ld;
+    else if (vt_btype == VT_LDOUBLE)
+      u.d = (double)sv->c.ld; /* Same size, but access through double for bit extraction */
+    else
+      u.d = sv->c.d;
     uint32_t idx = tcc_ir_pool_add_f64(ir, u.bits);
     result = irop_make_f64(vr, idx);
     result.is_lval = is_lval;
@@ -451,13 +516,20 @@ IROperand svalue_to_iroperand(TCCIRState *ir, const SValue *sv)
       pool_flags |= IRPOOL_SYMREF_LVAL;
     if (is_local)
       pool_flags |= IRPOOL_SYMREF_LOCAL;
-    uint32_t idx = tcc_ir_pool_add_symref(ir, sv->sym, (int32_t)sv->c.i, pool_flags);
+    /* Only store sv->sym if VT_SYM is actually set; otherwise the pointer may be stale garbage.
+     * SValues that reach this fallback (e.g. VT_CMP results) may have an uninitialized
+     * sym field from a previous vstack operation. */
+    Sym *fallback_sym = has_sym ? sv->sym : NULL;
+    uint32_t idx = tcc_ir_pool_add_symref(ir, fallback_sym, (int32_t)sv->c.i, pool_flags);
     result = irop_make_symref(vr, idx, is_lval, is_local, is_const, irop_bt);
     result.is_sym = has_sym; /* Only set if original had VT_SYM */
     irop_copy_svalue_info(&result, sv);
   }
 
 done:
+  /* DONE: Phase 2 - Set complex type flag in IROperand */
+  result.is_complex = is_complex;
+
   /* For STRUCT types, encode CType pool index + preserve original data in split format */
   if (irop_bt == IROP_BTYPE_STRUCT)
   {
@@ -484,12 +556,29 @@ done:
       result.u.s.ctype_idx = (uint16_t)ctype_idx;
       result.u.s.aux_data = 0;
     }
+    else if (tag == IROP_TAG_IMM32)
+    {
+      /* Immediate constant (e.g. GCC union cast): store imm32 in aux_data (±32K range) */
+      int32_t imm_val = result.u.imm32;
+      result.u.s.ctype_idx = (uint16_t)ctype_idx;
+      result.u.s.aux_data = (int16_t)imm_val;
+    }
+    else if (tag == IROP_TAG_I64)
+    {
+      /* 64-bit integer constant: store pool index in aux_data */
+      uint32_t i64_idx = result.u.pool_idx;
+      result.u.s.ctype_idx = (uint16_t)ctype_idx;
+      result.u.s.aux_data = (int16_t)i64_idx;
+    }
     else
     {
       tcc_error("UNHANDLED TAG=%d! u.imm32=%d u.pool_idx=%u\n", tag, result.u.imm32, result.u.pool_idx);
     }
     /* Other tags (IMM32, etc.) - shouldn't happen for structs, leave as-is */
   }
+
+  /* DONE: Phase 2 - Set complex flag for all paths */
+  result.is_complex = is_complex;
 
   /* Debug: verify round-trip conversion preserves data */
   // irop_compare_svalue(ir, sv, result, "svalue_to_iroperand");
@@ -512,6 +601,10 @@ void iroperand_to_svalue(const TCCIRState *ir, IROperand op, SValue *out)
   /* Restore type.t from compressed btype (unless overridden below) */
   out->type.t = irop_btype_to_vt_btype(irop_bt);
 
+  /* DONE: Phase 2 - Restore complex type flag from IROperand to SValue */
+  if (op.is_complex)
+    out->type.t |= VT_COMPLEX;
+
   switch (tag)
   {
   case IROP_TAG_NONE:
@@ -520,8 +613,12 @@ void iroperand_to_svalue(const TCCIRState *ir, IROperand op, SValue *out)
 
   case IROP_TAG_VREG:
     /* vreg - value is in a register, or register-indirect if lval set */
-    /* Restore physical register from pr0_reg if allocated (non-zero or explicitly r0) */
-    out->r = op.pr0_reg; /* Physical register in VT_VALMASK */
+    /* Physical register info is no longer stored in IROperand (removed in Phase 5p).
+     * For vreg=-1, read from IROP_VREG_PHYS encoding; for vreg>=0, set 0 (unknown). */
+    if (irop_get_vreg(op) < 0 && (op.u.imm32 & IROP_VREG_PHYS_VALID))
+      out->r = op.u.imm32 & IROP_VREG_PHYS_MASK;
+    else
+      out->r = 0;
     if (op.is_lval)
       out->r |= VT_LVAL;
     break;
@@ -530,11 +627,22 @@ void iroperand_to_svalue(const TCCIRState *ir, IROperand op, SValue *out)
     out->r = op.is_const ? VT_CONST : 0;
     if (op.is_lval)
       out->r |= VT_LVAL;
-    /* Zero-extend for unsigned types, sign-extend for signed */
-    if (op.is_unsigned)
-      out->c.i = (int64_t)(uint32_t)op.u.imm32;
+    /* For STRUCT types, imm32 is stored in aux_data (split encoding) */
+    if (irop_bt == IROP_BTYPE_STRUCT)
+    {
+      if (op.is_unsigned)
+        out->c.i = (int64_t)(uint16_t)op.u.s.aux_data;
+      else
+        out->c.i = (int64_t)op.u.s.aux_data;
+    }
     else
-      out->c.i = (int64_t)op.u.imm32;
+    {
+      /* Zero-extend for unsigned types, sign-extend for signed */
+      if (op.is_unsigned)
+        out->c.i = (int64_t)(uint32_t)op.u.imm32;
+      else
+        out->c.i = (int64_t)op.u.imm32;
+    }
     break;
 
   case IROP_TAG_STACKOFF:
@@ -575,7 +683,8 @@ void iroperand_to_svalue(const TCCIRState *ir, IROperand op, SValue *out)
 
   case IROP_TAG_I64:
   {
-    uint32_t idx = op.u.pool_idx;
+    /* For STRUCT types, pool_idx is stored in aux_data (split encoding) */
+    uint32_t idx = (irop_bt == IROP_BTYPE_STRUCT) ? (uint32_t)(uint16_t)op.u.s.aux_data : op.u.pool_idx;
     out->r = VT_CONST;
     if (op.is_lval)
       out->r |= VT_LVAL;
@@ -631,11 +740,12 @@ void iroperand_to_svalue(const TCCIRState *ir, IROperand op, SValue *out)
     break;
   }
 
-  /* Restore physical register allocation from IROperand */
-  out->pr0_reg = op.pr0_reg;
-  out->pr0_spilled = op.pr0_spilled;
-  out->pr1_reg = op.pr1_reg;
-  out->pr1_spilled = op.pr1_spilled;
+  /* Physical register info is no longer stored in IROperand (removed in Phase 5p).
+   * Set defaults on SValue; during codegen, registers come from the interval table. */
+  out->pr0_reg = PREG_REG_NONE;
+  out->pr0_spilled = 0;
+  out->pr1_reg = PREG_REG_NONE;
+  out->pr1_spilled = 0;
 
   /* Restore type flags */
   if (op.is_unsigned)
@@ -669,34 +779,8 @@ int irop_compare_svalue(const TCCIRState *ir, const SValue *sv, IROperand op, co
 
   int mismatch = 0;
 
-  /* Compare individual fields and report differences */
-  if (reconstructed.pr0_reg != sv->pr0_reg)
-  {
-    fprintf(stderr, "%s: pr0_reg mismatch: reconstructed=%d, expected=%d\n", context, reconstructed.pr0_reg,
-            sv->pr0_reg);
-    mismatch = 1;
-  }
-
-  if (reconstructed.pr0_spilled != sv->pr0_spilled)
-  {
-    fprintf(stderr, "%s: pr0_spilled mismatch: reconstructed=%d, expected=%d\n", context, reconstructed.pr0_spilled,
-            sv->pr0_spilled);
-    mismatch = 1;
-  }
-
-  if (reconstructed.pr1_reg != sv->pr1_reg)
-  {
-    fprintf(stderr, "%s: pr1_reg mismatch: reconstructed=%d, expected=%d\n", context, reconstructed.pr1_reg,
-            sv->pr1_reg);
-    mismatch = 1;
-  }
-
-  if (reconstructed.pr1_spilled != sv->pr1_spilled)
-  {
-    fprintf(stderr, "%s: pr1_spilled mismatch: reconstructed=%d, expected=%d\n", context, reconstructed.pr1_spilled,
-            sv->pr1_spilled);
-    mismatch = 1;
-  }
+  /* Compare individual fields and report differences.
+   * NOTE: pr0_reg/pr1_reg removed from IROperand in Phase 5p — no longer compared. */
 
   if (reconstructed.r != sv->r)
   {
@@ -840,4 +924,104 @@ int irop_type_size_align(IROperand op, int *align_out)
   if (align_out)
     *align_out = align;
   return 0; // Unknown size
+}
+
+/* Compute the AAPCS "natural alignment" of a struct for parameter passing.
+ * AAPCS defines composite alignment as the max alignment of fundamental
+ * data type members.  This differs from the struct's storage alignment
+ * because __attribute__((aligned)) on the struct itself does NOT affect
+ * parameter passing, and __attribute__((packed)) DOES reduce it.
+ * Returns the natural alignment (minimum 1). */
+static int compute_aapcs_member_alignment(CType *ct);
+
+static int is_plausible_sym_ptr(const Sym *s)
+{
+  uintptr_t p = (uintptr_t)s;
+
+  if (!p)
+    return 0;
+  if (p & (sizeof(void *) - 1))
+    return 0;
+#if UINTPTR_MAX > 0xffffffffU
+  /* User-space pointers on supported hosts should stay in the canonical
+   * lower address range.  Garbage-packed values seen from stale CType refs
+   * in old-style struct-by-value calls trip this check. */
+  if (p >= (1ULL << 47))
+    return 0;
+#endif
+  return 1;
+}
+
+int ctype_aapcs_alignment(CType *ct)
+{
+  return compute_aapcs_member_alignment(ct);
+}
+
+static int compute_aapcs_member_alignment(CType *ct)
+{
+  if (!ct)
+    return 4;
+  int bt = ct->t & VT_BTYPE;
+  if (bt != VT_STRUCT)
+  {
+    /* Fundamental type — use its natural alignment */
+    int align;
+    type_size(ct, &align);
+    return align > 0 ? align : 1;
+  }
+  /* Walk struct/union members and find max alignment recursively */
+  Sym *s = ct->ref;
+  if (!is_plausible_sym_ptr(s))
+    return 4;
+  int max_align = 1;
+  for (Sym *f = s->next; f;)
+  {
+    int member_align;
+    Sym *next = NULL;
+
+    if (!is_plausible_sym_ptr(f))
+      return 4;
+
+    next = is_plausible_sym_ptr(f->next) ? f->next : NULL;
+    if ((f->type.t & VT_BTYPE) == VT_STRUCT)
+    {
+      /* Recurse into nested structs */
+      member_align = compute_aapcs_member_alignment(&f->type);
+    }
+    else if (f->type.t & VT_BITFIELD)
+    {
+      /* Bitfields: use underlying type alignment */
+      CType base_type = f->type;
+      base_type.t &= ~VT_BITFIELD;
+      type_size(&base_type, &member_align);
+    }
+    else
+    {
+      type_size(&f->type, &member_align);
+    }
+    /* If the member or the struct is packed, the member's effective
+     * alignment is 1 (packed overrides natural alignment). */
+    if (f->a.packed || s->a.packed)
+      member_align = 1;
+    if (member_align > max_align)
+      max_align = member_align;
+    f = next;
+  }
+  return max_align;
+}
+
+/* Get the AAPCS parameter-passing alignment for an IROperand.
+ * For structs, walks members to compute natural alignment (ignoring
+ * __attribute__((aligned)) on the struct itself).
+ * For scalars, returns the type's natural alignment. */
+int irop_aapcs_alignment(IROperand op)
+{
+  if (op.btype == IROP_BTYPE_STRUCT)
+  {
+    CType *ct = tcc_ir_pool_get_ctype_ptr(tcc_state->ir, op.u.s.ctype_idx);
+    return compute_aapcs_member_alignment(ct);
+  }
+  int align;
+  irop_type_size_align(op, &align);
+  return align;
 }

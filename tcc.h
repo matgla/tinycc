@@ -109,6 +109,14 @@ extern long double strtold(const char *__nptr, char **__endptr);
 
 #define LDOUBLE_SIZE 8
 
+/* Target uses 8-byte long double (same as double).
+ * This must be set whenever LDOUBLE_SIZE == sizeof(double) so that
+ * constant folding code stores long double values as doubles, avoiding
+ * host/target long double size mismatches during cross-compilation. */
+#ifndef TCC_USING_DOUBLE_FOR_LDOUBLE
+#define TCC_USING_DOUBLE_FOR_LDOUBLE 1
+#endif
+
 /* -------------------------------------------- */
 
 /* parser debug */
@@ -121,6 +129,22 @@ extern long double strtold(const char *__nptr, char **__endptr);
 /* #define MEM_DEBUG 1,2,3 */
 /* assembler debug */
 /* #define ASM_DEBUG */
+/* machine-level debug (store/assign operations) */
+/* #define TCC_MACHINE_DEBUG */
+
+/* Machine-level debug output macro */
+#ifndef TCC_MACHINE_DEBUG
+#define TCC_MACHINE_DEBUG 0
+#endif
+
+#if TCC_MACHINE_DEBUG
+#define TCC_MACH_DBG(...) fprintf(stderr, __VA_ARGS__)
+#else
+#define TCC_MACH_DBG(...)                                                                                              \
+  do                                                                                                                   \
+  {                                                                                                                    \
+  } while (0)
+#endif
 
 /* target selection */
 /* #define TCC_TARGET_I386   */    /* i386 code generator */
@@ -437,24 +461,30 @@ typedef union CValue
 /* symbol attributes */
 struct SymAttr
 {
-  unsigned short aligned : 5, /* alignment as log2+1 (0 == unspecified) */
+  unsigned aligned : 5, /* alignment as log2+1 (0 == unspecified) */
       packed : 1, weak : 1, visibility : 2, dllexport : 1, nodecorate : 1, dllimport : 1, addrtaken : 1, nodebug : 1,
-      naked : 1, xxxx : 1; /* not used */
+      naked : 1, nested_func : 1, /* nested function flag */
+      sso_be : 1,                 /* scalar_storage_order("big-endian") */
+      transparent_union : 1;      /* __attribute__((transparent_union)) */
 };
 
 /* function attributes or temporary attributes for parsing */
 struct FuncAttr
 {
-  unsigned func_call : 3, /* calling convention (0..5), see below */
-      func_type : 2,      /* FUNC_OLD/NEW/ELLIPSIS */
-      func_noreturn : 1,  /* attribute((noreturn)) */
-      func_ctor : 1,      /* attribute((constructor)) */
-      func_dtor : 1,      /* attribute((destructor)) */
-      func_args : 8,      /* PE __stdcall args */
-      func_alwinl : 1,    /* always_inline */
-      func_pure : 1,      /* attribute((pure)) - no side effects, reads memory */
-      func_const : 1,     /* attribute((const)) - no side effects, no memory reads */
-      xxxx : 13;
+  unsigned func_call : 3,               /* calling convention (0..5), see below */
+      func_type : 2,                    /* FUNC_OLD/NEW/ELLIPSIS */
+      func_noreturn : 1,                /* attribute((noreturn)) */
+      func_ctor : 1,                    /* attribute((constructor)) */
+      func_dtor : 1,                    /* attribute((destructor)) */
+      func_args : 8,                    /* PE __stdcall args */
+      func_alwinl : 1,                  /* always_inline */
+      func_pure : 1,                    /* attribute((pure)) - no side effects, reads memory */
+      func_const : 1,                   /* attribute((const)) - no side effects, no memory reads */
+      func_no_instrument : 1,           /* attribute((no_instrument_function)) */
+      func_va_arg_pack : 1,             /* uses __builtin_va_arg_pack() */
+      func_rewritten_extern_inline : 1, /* extern inline rewritten to non-extern inline-only def */
+      func_outofline_needed : 1,        /* always_inline call could not stay call-site-only */
+      xxxx : 9;
 };
 
 /* symbol management */
@@ -492,10 +522,17 @@ struct Sym
     struct Sym *cleanupstate; /* in defined labels */
     int *vla_array_str;       /* vla array code */
   };
-  struct Sym *prev;     /* prev symbol in stack */
-  struct Sym *prev_tok; /* previous symbol for this token */
+  struct Sym *prev;                        /* prev symbol in stack */
+  struct Sym *prev_tok;                    /* previous symbol for this token */
+  int vla_size_loc;                        /* for structs with VLA members: stack offset holding
+                                              runtime total struct size (0 = not a VLA struct) */
+  unsigned long long objsize_max_value;    /* conservative max scalar value assigned locally */
+  unsigned long long objsize_strlen_value; /* conservative max NUL-terminated string bytes */
+  unsigned char objsize_max_valid;
+  unsigned char objsize_strlen_valid;
 };
 
+#include "ir/machine_op.h"
 #include "tccir.h"
 
 /* Relocation patch for lazy sections - stores a single relocation modification
@@ -678,8 +715,8 @@ typedef struct TokenString
   char alloc;
   signed char need_spc;         /* space insertion state: -1, 0, 1, 2, 3 */
   unsigned short last_line_num; /* last recorded line number (0 = none) */
-  unsigned short allocated_len; /* 0 = inline, >0 = heap capacity */
   unsigned short save_line_num; /* saved line number for macro */
+  int allocated_len;            /* 0 = inline, >0 = heap capacity (in ints) */
   int len;                      /* current length in ints */
   /* used to chain token-strings with begin/end_macro() */
   const int *prev_ptr;
@@ -704,6 +741,7 @@ typedef struct AttributeDef
   int alias_target; /* token */
   int asm_label;    /* associated asm label */
   char attr_mode;   /* __attribute__((__mode__(...))) */
+  int vector_size;  /* __attribute__((vector_size(N))) — total bytes, 0 if not a vector */
 } AttributeDef;
 
 /* inline functions */
@@ -713,6 +751,48 @@ typedef struct InlineFunc
   Sym *sym;
   char filename[1];
 } InlineFunc;
+
+/* nested functions */
+#define MAX_CAPTURED_VARS 32
+#define MAX_NONLOCAL_GOTOS 8
+
+typedef struct NestedFunc
+{
+  TokenString *func_str;                       /* saved token stream of function body */
+  Sym *sym;                                    /* function symbol in parent's local scope */
+  CType type;                                  /* full function type */
+  AttributeDef ad;                             /* function attributes */
+  int v;                                       /* token id (function name) */
+  char filename[256];                          /* source filename for error messages */
+  int captured_offsets[MAX_CAPTURED_VARS];     /* FP offsets of captured parent vars (resolved after regalloc) */
+  int captured_tokens[MAX_CAPTURED_VARS];      /* token IDs of captured parent vars */
+  int captured_vregs[MAX_CAPTURED_VARS];       /* vreg IDs of captured parent vars (for offset resolution) */
+  CType captured_types[MAX_CAPTURED_VARS];     /* full type of captured vars */
+  int captured_chain_depth[MAX_CAPTURED_VARS]; /* 1 = parent, 2 = grandparent, ... */
+  struct NestedFunc *parent_nf;                /* parent nested function (for multi-level nesting) */
+  int nb_captured;                             /* number of captured parent variables */
+  int needs_chain_save;                        /* 1 if a child func needs multi-hop chain (depth>1) */
+  int compiled;                                /* number of captured parent variables */
+  int trampoline_needed;                       /* address of this nested function was taken */
+  Sym *trampoline_tcc_sym;                     /* TCC symbol for trampoline code (.text) */
+  Sym *chain_slot_tcc_sym;                     /* TCC symbol for chain slot (.data) */
+  /* Non-local goto support: nested function does 'goto label' targeting parent __label__ */
+  int nlgoto_label_tokens[MAX_NONLOCAL_GOTOS]; /* token IDs of parent labels targeted by goto */
+  int nlgoto_buf_offsets[MAX_NONLOCAL_GOTOS];  /* FP-relative offset of 12-byte jmp_buf in parent frame */
+  int nb_nlgotos;                              /* number of non-local goto targets */
+  /* Address-taken parent labels: nested function uses &&label referencing parent __label__ */
+  Sym *addr_label_syms[MAX_NONLOCAL_GOTOS]; /* parent label syms referenced via &&label */
+  int nb_addr_labels;                       /* number of addr-taken parent labels */
+  /* Parent scope typedefs visible to nested function body */
+  int parent_typedef_tokens[MAX_CAPTURED_VARS];  /* token IDs */
+  CType parent_typedef_types[MAX_CAPTURED_VARS]; /* saved types */
+  int nb_parent_typedefs;                        /* count of saved typedefs */
+  /* Parent scope struct/union/enum tags visible to nested function body.
+   * We store pointers to the original Sym (which survives pop_local_syms
+   * because completed struct tags have c != 0). */
+  Sym *parent_struct_tag_syms[MAX_CAPTURED_VARS]; /* original struct tag syms */
+  int nb_parent_struct_tags;                      /* count of saved struct tags */
+} NestedFunc;
 
 /* include file cache, used to find files faster and also to eliminate
    inclusion if the include file is protected by #ifndef ... #endif */
@@ -803,6 +883,16 @@ struct TCCState
   unsigned char gnu89_inline;           /* treat 'extern inline' like 'static inline' */
   unsigned char unwind_tables;          /* create eh_frame section */
 
+  /* -fno-builtin-<func> bitmask: disable individual builtin inlining */
+#define NO_BUILTIN_ABS (1u << 0)
+#define NO_BUILTIN_LABS (1u << 1)
+#define NO_BUILTIN_LLABS (1u << 2)
+#define NO_BUILTIN_UABS (1u << 3)
+#define NO_BUILTIN_ULABS (1u << 4)
+#define NO_BUILTIN_ULLABS (1u << 5)
+#define NO_BUILTIN_UMAXABS (1u << 6)
+  unsigned int no_builtin_funcs;
+
   /* warning switches */
   unsigned char warn_none;
   unsigned char warn_all;
@@ -832,26 +922,30 @@ struct TCCState
   unsigned char test_coverage; /* generate test coverage code */
 
   /* IR optimization flags (-f options) */
-  unsigned char opt_dce;             /* -fdce: dead code elimination */
-  unsigned char opt_const_prop;      /* -fconst-prop: constant propagation */
-  unsigned char opt_copy_prop;       /* -fcopy-prop: copy propagation */
-  unsigned char opt_cse;             /* -fcse: common subexpression elimination */
-  unsigned char opt_bool_cse;        /* -fbool-cse: boolean CSE */
-  unsigned char opt_bool_idempotent; /* -fbool-idempotent: boolean idempotent simplification */
-  unsigned char opt_bool_simplify;   /* -fbool-simplify: boolean expression simplification */
-  unsigned char opt_return_value;    /* -freturn-value-opt: return value optimization */
-  unsigned char opt_store_load_fwd;  /* -fstore-load-fwd: store-load forwarding */
-  unsigned char opt_redundant_store; /* -fredundant-store-elim: redundant store elimination */
-  unsigned char opt_dead_store;      /* -fdead-store-elim: dead store elimination */
-  unsigned char opt_fp_offset_cache; /* -ffp-offset-cache: frame pointer offset caching */
-  unsigned char opt_indexed_memory;  /* -findexed-memory: indexed load/store fusion */
-  unsigned char opt_postinc_fusion;  /* -fpostinc-fusion: post-increment load/store fusion */
-  unsigned char opt_mla_fusion;      /* -fmla-fusion: multiply-accumulate fusion */
-  unsigned char opt_stack_addr_cse;  /* -fstack-addr-cse: stack address CSE */
-  unsigned char opt_licm;            /* -flicm: loop-invariant code motion */
-  unsigned char opt_strength_red;    /* -fstrength-reduce: strength reduction for multiply */
-  unsigned char opt_iv_strength_red; /* -fiv-strength-red: IV strength reduction for array access */
-  unsigned char opt_jump_threading;  /* -fjump-threading: jump threading optimization */
+  unsigned char opt_dce;              /* -fdce: dead code elimination */
+  unsigned char opt_const_prop;       /* -fconst-prop: constant propagation */
+  unsigned char opt_copy_prop;        /* -fcopy-prop: copy propagation */
+  unsigned char opt_cse;              /* -fcse: common subexpression elimination */
+  unsigned char opt_bool_cse;         /* -fbool-cse: boolean CSE */
+  unsigned char opt_bool_idempotent;  /* -fbool-idempotent: boolean idempotent simplification */
+  unsigned char opt_bool_simplify;    /* -fbool-simplify: boolean expression simplification */
+  unsigned char opt_return_value;     /* -freturn-value-opt: return value optimization */
+  unsigned char opt_store_load_fwd;   /* -fstore-load-fwd: store-load forwarding */
+  unsigned char opt_redundant_store;  /* -fredundant-store-elim: redundant store elimination */
+  unsigned char opt_dead_store;       /* -fdead-store-elim: dead store elimination */
+  unsigned char opt_fp_offset_cache;  /* -ffp-offset-cache: frame pointer offset caching */
+  unsigned char opt_indexed_memory;   /* -findexed-memory: indexed load/store fusion */
+  unsigned char opt_postinc_fusion;   /* -fpostinc-fusion: post-increment load/store fusion */
+  unsigned char opt_mla_fusion;       /* -fmla-fusion: multiply-accumulate fusion */
+  unsigned char opt_stack_addr_cse;   /* -fstack-addr-cse: stack address CSE */
+  unsigned char opt_licm;             /* -flicm: loop-invariant code motion */
+  unsigned char opt_strength_red;     /* -fstrength-reduce: strength reduction for multiply */
+  unsigned char opt_iv_strength_red;  /* -fiv-strength-red: IV strength reduction for array access */
+  unsigned char opt_nonneg_fold;      /* -fnonneg-fold: non-negative value branch folding */
+  unsigned char opt_vrp;              /* -fvrp: value range propagation branch folding */
+  unsigned char opt_float_narrow;     /* -ffloat-narrow: narrow double math to float when safe */
+  unsigned char opt_jump_threading;   /* -fjump-threading: jump threading optimization */
+  unsigned char instrument_functions; /* -finstrument-functions */
 
   /* Function purity cache for LICM optimization */
   /* Cache stores inferred purity for functions in the current translation unit */
@@ -971,6 +1065,12 @@ struct TCCState
   struct InlineFunc **inline_fns;
   int nb_inline_fns;
 
+  /* __builtin_va_arg_pack() context: when expanding a clone of an
+     always_inline variadic function, this points to the token stream
+     of the caller's variadic arguments (comma-separated).  NULL when
+     not inside such an expansion. */
+  TokenString *va_arg_pack_tokens;
+
   /* sections */
   Section **sections;
   int nb_sections; /* number of sections, including first dummy section */
@@ -1075,6 +1175,11 @@ struct TCCState
   CString linker_arg; /* collect -Wl options */
   int thumb_func;
   TCCIRState *ir;
+  /* Nested functions - saved token streams for functions defined inside other functions */
+  NestedFunc *nested_funcs;
+  int nb_nested_funcs;
+  int nested_funcs_capacity;
+  NestedFunc *current_nested_func; /* nested func currently being compiled */
   int rt_num_callers;
   int parameters_registers;
   int registers_for_allocator;
@@ -1083,13 +1188,57 @@ struct TCCState
   uint64_t float_registers_map_for_allocator;
   uint8_t omit_frame_pointer;
   uint8_t need_frame_pointer;
-  uint8_t force_frame_pointer; /* required for VLA/dynamic SP even if omit_frame_pointer */
+  uint8_t force_frame_pointer;  /* required for VLA/dynamic SP even if omit_frame_pointer */
+  uint8_t force_lr_save;        /* __builtin_return_address needs LR saved even in leaf */
+  uint8_t func_save_apply_args; /* __builtin_apply_args: save r0-r3 in prologue */
+  int apply_args_offset;        /* stack offset of saved r0-r3 block for apply_args */
   int stack_location;
+
+  /* Inline expansion state: when replaying an inline function's token
+     stream at a call site, these track the return value destination. */
+  uint8_t in_inline_expansion; /* nonzero while expanding inline body */
+  int inline_return_loc;       /* stack offset for storing return value */
+  int inline_const_arg_count;  /* constant-like current inline params */
+  struct
+  {
+    int vreg;
+    int stack_offset;
+    SValue value;
+  } inline_const_args[16];
+
+  /* Outermost VLA parameter expressions: saved token streams for evaluating
+     side effects at function entry (C11 6.9.1p10). Stored separately from Sym
+     because the sym union field (vla_array_str/next) would corrupt the type chain. */
+  struct VlaParamExpr
+  {
+    Sym *param;  /* the parameter sym (used for identification) */
+    int *tokens; /* heap-allocated token stream */
+  } *vla_param_exprs;
+  int nb_vla_param_exprs;
 
   /* linker script support */
   char *linker_script;        /* path to linker script file (-T option) */
   struct LDScript *ld_script; /* parsed linker script */
+
+  /* Deferred label-difference fixups for static initializers like
+     static int b[] = { &&lab1 - &&lab0, ... };
+     These are recorded during parsing and resolved after codegen
+     when label ELF symbol values are known. */
+  struct LabelDiffFixup *label_diff_fixups;
 };
+
+/* A deferred fixup for a label-difference expression (&&sym1 - &&sym2)
+   used in a static initializer.  Recorded during parsing, resolved
+   after code generation when both label symbols have their final
+   code offsets. */
+typedef struct LabelDiffFixup
+{
+  Section *sec;          /* data section containing the value */
+  unsigned long offset;  /* byte offset within sec->data */
+  struct Sym *sym_plus;  /* positive label symbol (&&lab1) */
+  struct Sym *sym_minus; /* negative label symbol (&&lab0) */
+  struct LabelDiffFixup *next;
+} LabelDiffFixup;
 
 /* Forward declaration for linker script */
 struct LDScript;
@@ -1169,7 +1318,9 @@ static inline SValue tcc_ir_svalue_call_id_argc(int call_id, int argc)
 #define VT_STATIC 0x00002000  /* static variable */
 #define VT_TYPEDEF 0x00004000 /* typedef definition */
 #define VT_INLINE 0x00008000  /* inline definition */
-/* currently unused: 0x000[1248]0000  */
+#define VT_COMPLEX 0x00010000 /* Complex type flag (bit 16) */
+#define VT_VECTOR 0x00020000  /* GCC vector type flag (bit 17): element type in sym->type, total bytes in sym->c */
+/* currently unused: 0x000[48]0000  */
 
 #define VT_STRUCT_SHIFT 20 /* shift for bitfield shift values (32 - 2*6) */
 #define VT_STRUCT_MASK (((1U << (6 + 6)) - 1) << VT_STRUCT_SHIFT | VT_BITFIELD)
@@ -1271,12 +1422,16 @@ static inline SValue tcc_ir_svalue_call_id_argc(int call_id, int argc)
 #define TOK_CULONG 0xc7  /* unsigned long constant */
 #define TOK_STR 0xc8     /* pointer to string in tokc */
 #define TOK_LSTR 0xc9
-#define TOK_CFLOAT 0xca   /* float constant */
-#define TOK_CDOUBLE 0xcb  /* double constant */
-#define TOK_CLDOUBLE 0xcc /* long double constant */
-#define TOK_PPNUM 0xcd    /* preprocessor number */
-#define TOK_PPSTR 0xce    /* preprocessor string */
-#define TOK_LINENUM 0xcf  /* line number info */
+#define TOK_CFLOAT 0xca     /* float constant */
+#define TOK_CDOUBLE 0xcb    /* double constant */
+#define TOK_CLDOUBLE 0xcc   /* long double constant */
+#define TOK_CFLOAT_I 0xcd   /* imaginary float constant (GNU ext) */
+#define TOK_CDOUBLE_I 0xce  /* imaginary double constant (GNU ext) */
+#define TOK_CLDOUBLE_I 0xcf /* imaginary long double constant (GNU ext) */
+#define TOK_CINT_I 0xd0     /* imaginary integer constant (GNU ext) */
+#define TOK_PPNUM 0xd1      /* preprocessor number */
+#define TOK_PPSTR 0xd2      /* preprocessor string */
+#define TOK_LINENUM 0xd3    /* line number info */
 
 #define TOK_HAS_VALUE(t) (t >= TOK_CCHAR && t <= TOK_LINENUM)
 
@@ -1477,8 +1632,11 @@ ST_INLN void tok_str_new(TokenString *s);
 ST_FUNC TokenString *tok_str_alloc(void);
 ST_FUNC void tok_str_free(TokenString *s);
 ST_FUNC void tok_str_free_str(int *str);
+ST_FUNC int *tok_str_ensure_heap(TokenString *s);
 ST_FUNC void tok_str_add(TokenString *s, int t);
+ST_FUNC void tok_str_add2(TokenString *s, int t, CValue *cv);
 ST_FUNC void tok_str_add_tok(TokenString *s);
+ST_FUNC void tok_get(int *t, const int **pp, CValue *cv);
 ST_INLN void define_push(int v, int macro_type, int *str, Sym *first_arg);
 ST_FUNC void define_undef(Sym *s);
 ST_INLN Sym *define_find(int v);
@@ -1603,6 +1761,7 @@ ST_FUNC CString *parse_asm_str(void);
 ST_FUNC void indir(void);
 ST_FUNC void unary(void);
 ST_FUNC void gexpr(void);
+ST_FUNC int64_t expr_const64(void);
 ST_FUNC int expr_const(void);
 #if defined CONFIG_TCC_BCHECK || defined TCC_TARGET_C67
 ST_FUNC Sym *get_sym_ref(CType *type, Section *sec, unsigned long offset, unsigned long size);
@@ -1891,6 +2050,7 @@ typedef struct ArchitectureConfig
   int8_t reg_size;
   int8_t parameter_registers;
   int8_t has_fpu : 1;
+  int8_t static_chain_reg; /* register used for static chain (e.g., R10 for ARM) */
   const FloatingPointConfig *fpu;
 } ArchitectureConfig;
 
@@ -1923,7 +2083,7 @@ ST_FUNC void gen_expr64(ExprValue *pe);
 ST_FUNC void asm_opcode(TCCState *s1, int opcode);
 ST_FUNC int asm_parse_regvar(int t);
 ST_FUNC void asm_compute_constraints(ASMOperand *operands, int nb_operands, int nb_outputs, const uint8_t *clobber_regs,
-                                     int *pout_reg);
+                                     const uint8_t *reserved_regs, int *pout_reg);
 ST_FUNC void subst_asm_operand(CString *add_str, SValue *sv, int modifier);
 ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands, int nb_outputs, int is_output, uint8_t *clobber_regs,
                           int out_reg);
@@ -1932,7 +2092,8 @@ ST_FUNC void asm_clobber(uint8_t *clobber_regs, const char *str);
 /* Emit a fully prepared GCC-style inline asm block.
  * Used by IR codegen to lower TCCIR_OP_INLINE_ASM without relying on front-end load/store helpers. */
 ST_FUNC void tcc_asm_emit_inline(ASMOperand *operands, int nb_operands, int nb_outputs, int nb_labels,
-                                 uint8_t *clobber_regs, const char *asm_str, int asm_len, int must_subst);
+                                 uint8_t *clobber_regs, const uint8_t *reserved_regs, const char *asm_str, int asm_len,
+                                 int must_subst);
 #endif
 
 /* ------------ tccpe.c -------------- */
@@ -2007,6 +2168,8 @@ ST_FUNC void tcc_debug_newfile(TCCState *s1);
 ST_FUNC void tcc_debug_line(TCCState *s1);
 ST_FUNC void tcc_debug_line_num(TCCState *s1, int line_num);
 ST_FUNC void tcc_add_debug_info(TCCState *s1, int param, Sym *s, Sym *e);
+ST_FUNC void tcc_debug_save_state(TCCState *s1, void **saved_info, void **saved_root);
+ST_FUNC void tcc_debug_restore_state(TCCState *s1, void *saved_info, void *saved_root);
 ST_FUNC void tcc_debug_funcstart(TCCState *s1, Sym *sym);
 ST_FUNC void tcc_debug_prolog_epilog(TCCState *s1, int value);
 ST_FUNC void tcc_debug_funcend(TCCState *s1, int size);
@@ -2051,37 +2214,52 @@ ST_FUNC void tcc_machine_load_constant(int dest_reg, int dest_reg_high, int64_t 
 ST_FUNC void tcc_machine_load_cmp_result(int dest_reg, int condition_code);
 ST_FUNC void tcc_machine_load_jmp_result(int dest_reg, int jmp_addr, int invert);
 
-ST_FUNC void tcc_gen_machine_data_processing_op(IROperand src1, IROperand src2, IROperand dest, TccIrOp op);
-ST_FUNC void tcc_gen_machine_fp_op(IROperand dest, IROperand src1, IROperand src2, TccIrOp op);
-ST_FUNC void tcc_gen_machine_load_op(IROperand dest, IROperand src);
-ST_FUNC void tcc_gen_machine_store_op(IROperand dest, IROperand src, TccIrOp op);
-ST_FUNC void tcc_gen_machine_load_indexed_op(IROperand dest, IROperand base, IROperand index, IROperand scale);
-ST_FUNC void tcc_gen_machine_store_indexed_op(IROperand base, IROperand index, IROperand scale, IROperand value);
-ST_FUNC void tcc_gen_machine_load_postinc_op(IROperand dest, IROperand ptr, IROperand offset);
-ST_FUNC void tcc_gen_machine_store_postinc_op(IROperand ptr, IROperand value, IROperand offset);
+ST_FUNC void tcc_gen_machine_data_processing_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest,
+                                                 TccIrOp op);
+ST_FUNC void tcc_gen_machine_assign_mop(MachineOperand src, MachineOperand dest, TccIrOp op);
+ST_FUNC void tcc_gen_machine_setif_mop(MachineOperand src, MachineOperand dest, TccIrOp op);
+ST_FUNC void tcc_gen_machine_bool_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest, TccIrOp op);
+ST_FUNC void tcc_gen_machine_load_mop(MachineOperand src, MachineOperand dest, TccIrOp op);
+ST_FUNC void tcc_gen_machine_store_mop(MachineOperand dest, MachineOperand src, TccIrOp op);
+ST_FUNC void tcc_gen_machine_load_indexed_mop(MachineOperand dest, MachineOperand base, MachineOperand index,
+                                              MachineOperand scale, TccIrOp op);
+ST_FUNC void tcc_gen_machine_store_indexed_mop(MachineOperand base, MachineOperand index, MachineOperand scale,
+                                               MachineOperand value, TccIrOp op);
+ST_FUNC void tcc_gen_machine_load_postinc_mop(MachineOperand dest, MachineOperand ptr, MachineOperand offset,
+                                              TccIrOp op);
+ST_FUNC void tcc_gen_machine_store_postinc_mop(MachineOperand ptr, MachineOperand value, MachineOperand offset,
+                                               TccIrOp op);
+ST_FUNC void tcc_gen_machine_indirect_jump_mop(MachineOperand src, TccIrOp op);
+ST_FUNC void tcc_gen_machine_func_parameter_mop(MachineOperand src1, MachineOperand src2_enc, TccIrOp op);
 ST_FUNC void tcc_gen_machine_store_to_stack(int reg, int offset);
 ST_FUNC void tcc_gen_machine_store_to_stack_ex(int reg, int offset, uint32_t extra_exclude);
 ST_FUNC void tcc_gen_machine_store_to_sp(int reg, int offset);
 
-ST_FUNC void tcc_gen_machine_assign_op(IROperand dest, IROperand src, TccIrOp op);
-ST_FUNC void tcc_gen_machine_lea_op(IROperand dest, IROperand src, TccIrOp op);
+ST_FUNC void tcc_gen_machine_lea_mop(MachineOperand dest, MachineOperand src);
 ST_FUNC int tcc_gen_machine_number_of_registers(void);
-ST_FUNC void tcc_gen_machine_return_value_op(IROperand src, TccIrOp op);
+ST_FUNC void tcc_gen_machine_return_value_mop(MachineOperand src, TccIrOp op);
+ST_FUNC void tcc_gen_machine_muldiv_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest, TccIrOp op);
+ST_FUNC void tcc_gen_machine_mla_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest,
+                                     MachineOperand accum);
+ST_FUNC void tcc_gen_machine_umull_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest);
+ST_FUNC void tcc_gen_machine_fp_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest, TccIrOp op,
+                                    int is_complex);
+ST_FUNC void tcc_gen_machine_vla_mop(MachineOperand dest, MachineOperand src1, MachineOperand src2, TccIrOp op);
 ST_FUNC void tcc_gen_machine_epilog(int leaffunc);
 ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int stack_size,
                                     uint32_t extra_prologue_regs);
-ST_FUNC void tcc_gen_machine_func_call_op(IROperand func_target, IROperand call_id, IROperand dest, int drop_value,
-                                          TCCIRState *ir, int call_idx);
+ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand call_id, MachineOperand dest,
+                                           int drop_value, TCCIRState *ir, int call_idx);
 ST_FUNC int tcc_gen_machine_abi_assign_call_args(const TCCAbiArgDesc *args, int argc, TCCAbiCallLayout *out_layout);
 ST_FUNC void tcc_gen_machine_save_call_context(void);
 ST_FUNC void tcc_gen_machine_restore_call_context(void);
-ST_FUNC void tcc_gen_machine_jump_op(TccIrOp op, IROperand dest, int ir_idx);
-ST_FUNC void tcc_gen_machine_conditional_jump_op(IROperand src, TccIrOp op, IROperand dest, int ir_idx);
-ST_FUNC void tcc_gen_machine_indirect_jump_op(IROperand src1);
-ST_FUNC void tcc_gen_machine_switch_table_op(IROperand src1, struct TCCIRSwitchTable *table, struct TCCIRState *ir,
-                                             int ir_idx);
-ST_FUNC void tcc_gen_machine_setif_op(IROperand dest, IROperand src, TccIrOp op);
-ST_FUNC void tcc_gen_machine_bool_op(IROperand dest, IROperand src1, IROperand src2, TccIrOp op);
+ST_FUNC void tcc_gen_machine_jump_mop(TccIrOp op, int32_t target_ir, int ir_idx);
+ST_FUNC void tcc_gen_machine_conditional_jump_mop(int32_t condition, TccIrOp op, int32_t target_ir, int ir_idx);
+ST_FUNC void tcc_gen_machine_switch_table_mop(MachineOperand src, struct TCCIRSwitchTable *table, struct TCCIRState *ir,
+                                              int ir_idx);
+ST_FUNC void tcc_gen_machine_set_chain(void);
+ST_FUNC void tcc_gen_machine_restore_chain(void);
+ST_FUNC void tcc_gen_machine_init_chain_slot(IROperand src1);
 ST_FUNC void tcc_gen_machine_backpatch_jump(int address, int offset);
 ST_FUNC void tcc_gen_machine_end_instruction(void);
 
@@ -2093,15 +2271,38 @@ ST_FUNC int tcc_gen_machine_dry_run_get_lr_push_count(void);
 ST_FUNC uint32_t tcc_gen_machine_dry_run_get_scratch_regs_pushed(void);
 ST_FUNC void tcc_gen_machine_reset_scratch_state(void);
 ST_FUNC int tcc_gen_machine_dry_run_is_active(void);
-ST_FUNC void tcc_gen_machine_func_parameter_op(IROperand src1, IROperand src2, TccIrOp op);
+/* Phase-3 per-instruction scratch constraint recording.
+ * Call reset before each mop-dispatched instruction (in both dry-run and
+ * real-emit passes); call count after to read how many scratch registers the
+ * instruction allocated.  In debug builds the two passes should agree. */
+ST_FUNC void tcc_gen_machine_insn_scratch_reset(void);
+ST_FUNC int tcc_gen_machine_insn_scratch_count(void);
+ST_FUNC uint16_t tcc_gen_machine_insn_scratch_saves_mask(void);
 
 /* Branch optimization interface */
 ST_FUNC void tcc_gen_machine_branch_opt_init(void);
 ST_FUNC void tcc_gen_machine_branch_opt_analyze(uint32_t *ir_to_code_mapping, int mapping_size);
 ST_FUNC int tcc_gen_machine_branch_opt_get_encoding(int ir_index); /* Returns 16 or 32 */
 
-/* VLA / dynamic stack operations */
-ST_FUNC void tcc_gen_machine_vla_op(IROperand dest, IROperand src1, IROperand src2, TccIrOp op);
+/* Trap instruction generation */
+ST_FUNC void tcc_gen_machine_trap_mop(void);
+
+/* Prefetch instruction generation - rw: 0=read (PLD), 1=write (PLDW) */
+ST_FUNC void tcc_gen_machine_prefetch_mop(MachineOperand addr, int rw);
+
+/* Setjmp/longjmp instruction generation */
+ST_FUNC void tcc_gen_machine_setjmp_mop(MachineOperand buf, MachineOperand dest);
+ST_FUNC void tcc_gen_machine_longjmp_mop(MachineOperand buf);
+ST_FUNC void tcc_gen_machine_nl_setjmp_mop(MachineOperand buf, MachineOperand dest);
+ST_FUNC void tcc_gen_machine_nl_longjmp_mop(MachineOperand buf);
+
+/* __builtin_apply_args / __builtin_apply instruction generation */
+ST_FUNC void tcc_gen_machine_builtin_apply_args_mop(MachineOperand dest);
+ST_FUNC void tcc_gen_machine_builtin_apply_mop(MachineOperand fn, MachineOperand args, MachineOperand dest);
+
+/* MachineOperand load/store into specific physical registers (for inline asm) */
+void tcc_gen_mach_load_to_reg(int dest_reg, const MachineOperand *op);
+void tcc_gen_mach_store_from_reg(int src_reg, const MachineOperand *op);
 
 ST_FUNC const char *tcc_get_abi_softcall_name(SValue *src1, SValue *src2, SValue *dest, TccIrOp op);
 
