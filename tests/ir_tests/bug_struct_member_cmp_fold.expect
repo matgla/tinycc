@@ -1,0 +1,6 @@
+PASS: no grow for first 4 entries
+PASS: exactly 1 grow after 5th entry
+PASS: pool state correct (count=5, size=8)
+PASS: still 1 grow after 8 entries
+PASS: exactly 2 grows after 9th entry
+All struct member comparison tests passed!

@@ -179,6 +179,9 @@ TEST_FILES = [
     # for-loop increment lost when body has nested ternary chain as function arg
     ("bug_for_ternary_chain.c", 0),
 
+    # identity comparison fold eliminates struct member comparisons with different addends
+    ("bug_struct_member_cmp_fold.c", 0),
+
     ("../tests2/00_assignment.c", 0),
     ("../tests2/01_comment.c", 0),
     ("../tests2/02_printf.c", 0),

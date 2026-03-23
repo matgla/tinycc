@@ -354,6 +354,21 @@ int tcc_ir_opt_const_prop(TCCIRState *ir)
     if (vr1 < 0 || vr2 < 0 || vr1 != vr2)
       continue;
 
+    /* Symbol reference operands with the same vreg may still refer to different
+     * memory locations when their addends differ (e.g. different fields of the
+     * same struct).  Only fold when both operands are truly identical. */
+    if (cmp_src1.is_sym || cmp_src2.is_sym)
+    {
+      if (cmp_src1.is_sym != cmp_src2.is_sym)
+        continue; /* one is sym, other is not — can't be identical */
+      IRPoolSymref *ref1 = irop_get_symref_ex(ir, cmp_src1);
+      IRPoolSymref *ref2 = irop_get_symref_ex(ir, cmp_src2);
+      if (!ref1 || !ref2)
+        continue;
+      if (ref1->sym != ref2->sym || ref1->addend != ref2->addend)
+        continue;
+    }
+
     IRQuadCompact *next_q = &ir->compact_instructions[i + 1];
 
     if (next_q->op == TCCIR_OP_JUMPIF)
