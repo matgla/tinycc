@@ -27,7 +27,8 @@ TCC_ELF = CURRENT_DIR / "../../bin/armv8m-tcc.elf"
 # catch regressions that could cause stack overflow on target.
 FRAME_BUDGETS = {
     "unary":                    2500,  # was 7312, reduced to 2328 by extracting builtins
-    "unary_builtin_fp":         2100,  # extracted: signbit/isinf/copysign/isnan/fabs etc
+    "unary_builtin_fp":         1500,  # extracted: signbit/isinf/copysign/isnan etc
+    "unary_builtin_fp2":        1500,  # extracted: fabs/fmax/fmin/bswap/fpclassify etc
     "unary_builtin_shuffle":    1100,  # extracted: shuffle/shufflevector
     "unary_builtin_chk":        1100,  # extracted: object_size + __*_chk builtins
     "unary_builtin_alloca":      350,  # extracted: alloca/apply_args/apply/return

@@ -13929,7 +13929,8 @@ va_arg_pack_done:
 static void __attribute__((noinline)) unary_builtin_alloca(void)
 {
   CType type;
-  switch(tok) {
+  switch (tok)
+  {
   case TOK_builtin_alloca:
   {
     /* __builtin_alloca(size) — allocate memory on the stack.
@@ -14079,7 +14080,8 @@ static void __attribute__((noinline)) unary_builtin_alloca(void)
 /* Extracted from unary() to reduce stack frame size. */
 static void __attribute__((noinline)) unary_builtin_fp(void)
 {
-  switch(tok) {
+  switch (tok)
+  {
   case TOK_builtin_signbit:
   case TOK_builtin_signbitf:
   {
@@ -14729,7 +14731,14 @@ static void __attribute__((noinline)) unary_builtin_fp(void)
     }
     break;
   }
+  }
+}
 
+/* Extracted from unary_builtin_fp() to reduce stack frame size. */
+static void __attribute__((noinline)) unary_builtin_fp2(void)
+{
+  switch (tok)
+  {
   /* __builtin_fabs / __builtin_fabsf / __builtin_fabsl */
   case TOK_builtin_fabs:
   case TOK_builtin_fabsf:
@@ -15389,7 +15398,8 @@ static void __attribute__((noinline)) unary_builtin_fp(void)
 /* Extracted from unary() to reduce stack frame size. */
 static void __attribute__((noinline)) unary_builtin_overflow(void)
 {
-  switch(tok) {
+  switch (tok)
+  {
   case TOK_builtin_add_overflow:
   case TOK_builtin_sub_overflow:
   case TOK_builtin_mul_overflow:
@@ -16154,7 +16164,8 @@ static void __attribute__((noinline)) unary_builtin_overflow(void)
 /* Extracted from unary() to reduce stack frame size. */
 static void __attribute__((noinline)) unary_builtin_shuffle(void)
 {
-  switch(tok) {
+  switch (tok)
+  {
   case TOK_builtin_shuffle:
   case TOK_builtin_shufflevector:
   {
@@ -16499,7 +16510,8 @@ static void __attribute__((noinline)) unary_builtin_shuffle(void)
 /* Extracted from unary() to reduce stack frame size. */
 static void __attribute__((noinline)) unary_builtin_chk(void)
 {
-  switch(tok) {
+  switch (tok)
+  {
   case TOK_builtin_object_size:
   {
     int obj_type_val;
@@ -17906,6 +17918,8 @@ tok_next:
   case TOK_builtin_islessequal:
   case TOK_builtin_isgreaterequal:
   case TOK_builtin_islessgreater:
+    unary_builtin_fp();
+    break;
   case TOK_builtin_fabs:
   case TOK_builtin_fabsf:
   case TOK_builtin_fabsl:
@@ -17924,7 +17938,7 @@ tok_next:
   case TOK_builtin_bswap16:
   case TOK_builtin_bswap32:
   case TOK_builtin_bswap64:
-    unary_builtin_fp();
+    unary_builtin_fp2();
     break;
   case TOK_builtin_add_overflow:
   case TOK_builtin_sub_overflow:
