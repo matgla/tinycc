@@ -3730,7 +3730,44 @@ static void gen_opl(int op)
   case TOK_SAR:
   case TOK_SHR:
   case TOK_SHL:
-    if ((vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST)
+    if (tcc_state->ir && (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST)
+    {
+      /* IR mode: generate a single 64-bit shift instruction directly.
+       * The lexpand/lbuild decomposition produces intermediate 32-bit values
+       * that lbuild then recombines via SHL-by-32 + OR, but that inner SHL
+       * has a 32-bit source operand causing incorrect codegen on ARM Thumb
+       * (32-bit LSL by 32 produces zero).  Emitting the shift as a native
+       * 64-bit IR op lets the backend handle it correctly. */
+      t = vtop[-1].type.t;
+      c = (int)vtop->c.i;
+      int dest_type = VT_LLONG | (t & VT_UNSIGNED);
+      TccIrOp ir_op;
+      switch (op)
+      {
+      case TOK_SHL:
+        ir_op = TCCIR_OP_SHL;
+        break;
+      case TOK_SHR:
+        ir_op = TCCIR_OP_SHR;
+        break;
+      default: /* TOK_SAR */
+        ir_op = TCCIR_OP_SAR;
+        break;
+      }
+      SValue dest;
+      svalue_init(&dest);
+      dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+      dest.type.t = dest_type;
+      dest.r = 0;
+      if ((dest_type & VT_BTYPE) == VT_LLONG)
+        tcc_ir_set_llong_type(tcc_state->ir, dest.vr);
+      tcc_ir_put(tcc_state->ir, ir_op, &vtop[-1], &vtop[0], &dest);
+      vtop--;
+      vtop->vr = dest.vr;
+      vtop->type.t = dest_type;
+      vtop->r = 0;
+    }
+    else if ((vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST)
     {
       t = vtop[-1].type.t;
       vswap();
@@ -11612,6 +11649,686 @@ static void gen_ir_void_call_args(SValue *args, int argc, int func_tok)
   --vtop;
 }
 
+/* Extracted from unary_funcall() to reduce its stack frame size.
+ * String/memory builtin optimizations (strlen, strcmp, strcpy, memcpy, etc.).
+ * Keeping this in a separate noinline function prevents TCC from allocating
+ * all these locals in unary_funcall()'s frame (TCC does not reuse stack
+ * slots across scopes), saving ~2KB on the constrained RP2350 target.
+ * Returns 1 if optimization was applied, 0 otherwise. */
+static int __attribute__((noinline)) unary_funcall_opt_string_builtins(const char *func_name, SValue *saved_args,
+                                                                       int nb_real_args, int call_id,
+                                                                       int ir_idx_before_first_param,
+                                                                       int ir_idx_before_args, const CType *ret_type)
+{
+  int optimized = 0;
+  int folded_result = 0;
+  int can_fold_result = 0;
+  int lhs_len = 0;
+  int rhs_len = 0;
+  const char *lhs_str = NULL;
+  const char *rhs_str = NULL;
+  size_t n_const = 0;
+
+  if (nb_real_args == 2 && strcmp(func_name, "strcmp") == 0)
+  {
+    lhs_str = try_get_constant_string(&saved_args[0], &lhs_len);
+    rhs_str = try_get_constant_string(&saved_args[1], &rhs_len);
+    if (lhs_str && rhs_str)
+    {
+      folded_result = fold_builtin_strcmp_result(lhs_str, rhs_str);
+      can_fold_result = 1;
+    }
+  }
+
+  if (!can_fold_result && nb_real_args == 2 &&
+      (strcmp(func_name, "strcmp") == 0 || strcmp(func_name, "__builtin_strcmp") == 0))
+  {
+    if (ir_idx_before_first_param >= 0)
+    {
+      int current_end = tcc_state->ir->next_instruction_index;
+      for (int i = ir_idx_before_first_param; i < current_end; i++)
+      {
+        if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
+        {
+          IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
+          int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
+          if (encoded_call_id == call_id)
+            tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
+        }
+      }
+    }
+    else
+    {
+      tcc_state->ir->next_instruction_index = ir_idx_before_args;
+    }
+
+    {
+      CType rt = {VT_INT, NULL};
+      gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_strcmp"), &rt);
+      vtop[-1] = vtop[0];
+      --vtop;
+      optimized = 1;
+    }
+  }
+
+  if (!can_fold_result && nb_real_args == 2 &&
+      (strcmp(func_name, "strcpy") == 0 || strcmp(func_name, "__builtin_strcpy") == 0))
+  {
+    if (ir_idx_before_first_param >= 0)
+    {
+      int current_end = tcc_state->ir->next_instruction_index;
+      for (int i = ir_idx_before_first_param; i < current_end; i++)
+      {
+        if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
+        {
+          IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
+          int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
+          if (encoded_call_id == call_id)
+            tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
+        }
+      }
+    }
+    else
+    {
+      tcc_state->ir->next_instruction_index = ir_idx_before_args;
+    }
+
+    {
+      gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_strcpy"), &saved_args[0].type);
+      vtop[-1] = vtop[0];
+      --vtop;
+      optimized = 1;
+    }
+  }
+
+  if (!can_fold_result && nb_real_args == 2 &&
+      (strcmp(func_name, "stpcpy") == 0 || strcmp(func_name, "__builtin_stpcpy") == 0))
+  {
+    CType result_type = *ret_type;
+
+    if (ir_idx_before_first_param >= 0)
+    {
+      int current_end = tcc_state->ir->next_instruction_index;
+      for (int i = ir_idx_before_first_param; i < current_end; i++)
+      {
+        if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
+        {
+          IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
+          int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
+          if (encoded_call_id == call_id)
+            tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
+        }
+      }
+    }
+    else
+    {
+      tcc_state->ir->next_instruction_index = ir_idx_before_args;
+    }
+
+    {
+      gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_stpcpy"), &result_type);
+      vtop[-1] = vtop[0];
+      --vtop;
+      optimized = 1;
+    }
+  }
+
+  if (!can_fold_result && nb_real_args == 1 &&
+      (strcmp(func_name, "strlen") == 0 || strcmp(func_name, "__builtin_strlen") == 0))
+  {
+    CType result_type = *ret_type;
+
+    if (ir_idx_before_first_param >= 0)
+    {
+      int current_end = tcc_state->ir->next_instruction_index;
+      for (int i = ir_idx_before_first_param; i < current_end; i++)
+      {
+        if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
+        {
+          IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
+          int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
+          if (encoded_call_id == call_id)
+            tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
+        }
+      }
+    }
+    else
+    {
+      tcc_state->ir->next_instruction_index = ir_idx_before_args;
+    }
+
+    {
+      gen_ir_call_args(saved_args, 1, tok_alloc_const("__tcc_strlen"), &result_type);
+      vtop[-1] = vtop[0];
+      --vtop;
+      optimized = 1;
+    }
+  }
+
+  if (!can_fold_result && nb_real_args == 2 &&
+      (strcmp(func_name, "strnlen") == 0 || strcmp(func_name, "__builtin_strnlen") == 0))
+  {
+    CType result_type = *ret_type;
+
+    if (ir_idx_before_first_param >= 0)
+    {
+      int current_end = tcc_state->ir->next_instruction_index;
+      for (int i = ir_idx_before_first_param; i < current_end; i++)
+      {
+        if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
+        {
+          IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
+          int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
+          if (encoded_call_id == call_id)
+            tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
+        }
+      }
+    }
+    else
+    {
+      tcc_state->ir->next_instruction_index = ir_idx_before_args;
+    }
+
+    {
+      gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_strnlen"), &result_type);
+      vtop[-1] = vtop[0];
+      --vtop;
+      optimized = 1;
+    }
+  }
+
+  if (!can_fold_result && nb_real_args == 2 &&
+      (strcmp(func_name, "strpbrk") == 0 || strcmp(func_name, "__builtin_strpbrk") == 0))
+  {
+    CType result_type = *ret_type;
+
+    if (ir_idx_before_first_param >= 0)
+    {
+      int current_end = tcc_state->ir->next_instruction_index;
+      for (int i = ir_idx_before_first_param; i < current_end; i++)
+      {
+        if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
+        {
+          IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
+          int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
+          if (encoded_call_id == call_id)
+            tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
+        }
+      }
+    }
+    else
+    {
+      tcc_state->ir->next_instruction_index = ir_idx_before_args;
+    }
+
+    {
+      gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_strpbrk"), &result_type);
+      vtop[-1] = vtop[0];
+      --vtop;
+      optimized = 1;
+    }
+  }
+
+  if (!can_fold_result && nb_real_args == 2 &&
+      (strcmp(func_name, "strrchr") == 0 || strcmp(func_name, "rindex") == 0 ||
+       strcmp(func_name, "__builtin_strrchr") == 0 || strcmp(func_name, "__builtin_rindex") == 0))
+  {
+    CType result_type = *ret_type;
+
+    if (ir_idx_before_first_param >= 0)
+    {
+      int current_end = tcc_state->ir->next_instruction_index;
+      for (int i = ir_idx_before_first_param; i < current_end; i++)
+      {
+        if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
+        {
+          IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
+          int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
+          if (encoded_call_id == call_id)
+            tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
+        }
+      }
+    }
+    else
+    {
+      tcc_state->ir->next_instruction_index = ir_idx_before_args;
+    }
+
+    {
+      gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_strrchr"), &result_type);
+      vtop[-1] = vtop[0];
+      --vtop;
+      optimized = 1;
+    }
+  }
+
+  if (!can_fold_result && nb_real_args == 2 &&
+      (strcmp(func_name, "strstr") == 0 || strcmp(func_name, "__builtin_strstr") == 0))
+  {
+    CType result_type = *ret_type;
+
+    if (ir_idx_before_first_param >= 0)
+    {
+      int current_end = tcc_state->ir->next_instruction_index;
+      for (int i = ir_idx_before_first_param; i < current_end; i++)
+      {
+        if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
+        {
+          IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
+          int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
+          if (encoded_call_id == call_id)
+            tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
+        }
+      }
+    }
+    else
+    {
+      tcc_state->ir->next_instruction_index = ir_idx_before_args;
+    }
+
+    {
+      gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_strstr"), &result_type);
+      vtop[-1] = vtop[0];
+      --vtop;
+      optimized = 1;
+    }
+  }
+
+  if (!can_fold_result && nb_real_args == 2 &&
+      (strcmp(func_name, "strcspn") == 0 || strcmp(func_name, "__builtin_strcspn") == 0))
+  {
+    CType result_type = *ret_type;
+
+    if (ir_idx_before_first_param >= 0)
+    {
+      int current_end = tcc_state->ir->next_instruction_index;
+      for (int i = ir_idx_before_first_param; i < current_end; i++)
+      {
+        if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
+        {
+          IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
+          int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
+          if (encoded_call_id == call_id)
+            tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
+        }
+      }
+    }
+    else
+    {
+      tcc_state->ir->next_instruction_index = ir_idx_before_args;
+    }
+
+    {
+      gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_strcspn"), &result_type);
+      vtop[-1] = vtop[0];
+      --vtop;
+      optimized = 1;
+    }
+  }
+
+  if (!can_fold_result && nb_real_args == 3 &&
+      (strcmp(func_name, "strncpy") == 0 || strcmp(func_name, "__builtin_strncpy") == 0))
+  {
+    CType result_type = *ret_type;
+
+    if (ir_idx_before_first_param >= 0)
+    {
+      int current_end = tcc_state->ir->next_instruction_index;
+      for (int i = ir_idx_before_first_param; i < current_end; i++)
+      {
+        if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
+        {
+          IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
+          int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
+          if (encoded_call_id == call_id)
+            tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
+        }
+      }
+    }
+    else
+    {
+      tcc_state->ir->next_instruction_index = ir_idx_before_args;
+    }
+
+    {
+      gen_ir_call_args(saved_args, 3, tok_alloc_const("__tcc_strncpy"), &result_type);
+      vtop[-1] = vtop[0];
+      --vtop;
+      optimized = 1;
+    }
+  }
+
+  if (!can_fold_result && nb_real_args == 3 &&
+      (strcmp(func_name, "strncat") == 0 || strcmp(func_name, "__builtin_strncat") == 0))
+  {
+    CType result_type = *ret_type;
+
+    if (ir_idx_before_first_param >= 0)
+    {
+      int current_end = tcc_state->ir->next_instruction_index;
+      for (int i = ir_idx_before_first_param; i < current_end; i++)
+      {
+        if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
+        {
+          IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
+          int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
+          if (encoded_call_id == call_id)
+            tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
+        }
+      }
+    }
+    else
+    {
+      tcc_state->ir->next_instruction_index = ir_idx_before_args;
+    }
+
+    {
+      gen_ir_call_args(saved_args, 3, tok_alloc_const("__tcc_strncat"), &result_type);
+      vtop[-1] = vtop[0];
+      --vtop;
+      optimized = 1;
+    }
+  }
+
+  if (!can_fold_result && nb_real_args == 3 && strcmp(func_name, "strncmp") == 0 &&
+      !is_zero_length_builtin_compare(&saved_args[2]))
+  {
+    lhs_str = try_get_constant_string(&saved_args[0], &lhs_len);
+    rhs_str = try_get_constant_string(&saved_args[1], &rhs_len);
+    if (lhs_str && rhs_str && try_get_constant_size_t(&saved_args[2], &n_const))
+    {
+      folded_result = fold_builtin_strncmp_result(lhs_str, rhs_str, n_const);
+      can_fold_result = 1;
+    }
+  }
+
+  if (!can_fold_result && nb_real_args == 3 && strcmp(func_name, "memcmp") == 0)
+  {
+    lhs_str = try_get_constant_string(&saved_args[0], &lhs_len);
+    rhs_str = try_get_constant_string(&saved_args[1], &rhs_len);
+    if (lhs_str && rhs_str && try_get_constant_size_t(&saved_args[2], &n_const) && n_const <= (size_t)lhs_len + 1 &&
+        n_const <= (size_t)rhs_len + 1)
+    {
+      folded_result = fold_builtin_memcmp_result(lhs_str, rhs_str, n_const);
+      can_fold_result = 1;
+    }
+  }
+
+  if (!can_fold_result && nb_real_args == 3 && strcmp(func_name, "memcmp") == 0 &&
+      try_get_constant_size_t(&saved_args[2], &n_const))
+  {
+    if (n_const == 0)
+    {
+      folded_result = 0;
+      can_fold_result = 1;
+    }
+    else if (n_const == 1)
+    {
+      if (ir_idx_before_first_param >= 0)
+      {
+        int current_end = tcc_state->ir->next_instruction_index;
+        for (int i = ir_idx_before_first_param; i < current_end; i++)
+        {
+          if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
+          {
+            IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
+            int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
+            if (encoded_call_id == call_id)
+              tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
+          }
+        }
+      }
+      else
+      {
+        tcc_state->ir->next_instruction_index = ir_idx_before_args;
+      }
+
+      {
+        CType rt = {VT_INT, NULL};
+        gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_memcmp1"), &rt);
+        vtop[-1] = vtop[0];
+        --vtop;
+        optimized = 1;
+      }
+    }
+  }
+
+  if (!can_fold_result && nb_real_args == 3 && (strcmp(func_name, "memmove") == 0 || strcmp(func_name, "bcopy") == 0))
+  {
+    const int is_bcopy = strcmp(func_name, "bcopy") == 0;
+
+    if (ir_idx_before_first_param >= 0)
+    {
+      int current_end = tcc_state->ir->next_instruction_index;
+      for (int i = ir_idx_before_first_param; i < current_end; i++)
+      {
+        if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
+        {
+          IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
+          int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
+          if (encoded_call_id == call_id)
+            tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
+        }
+      }
+    }
+    else
+    {
+      tcc_state->ir->next_instruction_index = ir_idx_before_args;
+    }
+
+    {
+      SValue param_num;
+      const int new_call_id = tcc_state->ir->next_call_id++;
+
+      svalue_init(&param_num);
+      param_num.vr = -1;
+      param_num.r = VT_CONST;
+
+      if (is_bcopy)
+      {
+        param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[0], &param_num, NULL);
+
+        param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 1);
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[1], &param_num, NULL);
+
+        param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 2);
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[2], &param_num, NULL);
+
+        vpush_typed_helper_func(tok_alloc_const("__tcc_bcopy"), &func_old_void_type);
+        {
+          SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 3);
+          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[0], &call_id_sv, NULL);
+        }
+        --vtop;
+        vtop->type.t = VT_VOID;
+        vtop->type.ref = NULL;
+        vtop->r = VT_CONST;
+        vtop->vr = -1;
+        vtop->c.i = 0;
+      }
+      else
+      {
+        SValue dest;
+
+        param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[0], &param_num, NULL);
+
+        param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 1);
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[1], &param_num, NULL);
+
+        param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 2);
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[2], &param_num, NULL);
+
+        vpush_typed_helper_func(tok_alloc_const("__tcc_memmove"), &func_old_void_pointer_type);
+
+        svalue_init(&dest);
+        dest.type = saved_args[0].type;
+        dest.r = 0;
+        dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+        {
+          SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 3);
+          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &call_id_sv, &dest);
+        }
+
+        --vtop;
+        vpushi(0);
+        vtop->type = dest.type;
+        vtop->vr = dest.vr;
+        vtop->r = TREG_R0;
+      }
+
+      vtop[-1] = vtop[0];
+      --vtop;
+      optimized = 1;
+    }
+  }
+
+  if (!can_fold_result && nb_real_args == 3 && strcmp(func_name, "strncmp") == 0)
+  {
+    if (ir_idx_before_first_param >= 0)
+    {
+      int current_end = tcc_state->ir->next_instruction_index;
+      for (int i = ir_idx_before_first_param; i < current_end; i++)
+      {
+        if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
+        {
+          IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
+          int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
+          if (encoded_call_id == call_id)
+            tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
+        }
+      }
+    }
+    else
+    {
+      tcc_state->ir->next_instruction_index = ir_idx_before_args;
+    }
+
+    {
+      CType rt = {VT_INT, NULL};
+      gen_ir_call_args(saved_args, 3, tok_alloc_const("__tcc_strncmp"), &rt);
+      vtop[-1] = vtop[0];
+      --vtop;
+      optimized = 1;
+    }
+  }
+
+  if (!can_fold_result && nb_real_args == 3 && is_zero_length_builtin_compare(&saved_args[2]))
+  {
+    if (strcmp(func_name, "strncmp") == 0 || strcmp(func_name, "memcmp") == 0)
+    {
+      folded_result = 0;
+      can_fold_result = 1;
+    }
+  }
+
+  if (!can_fold_result && nb_real_args == 3 && strcmp(func_name, "memchr") == 0)
+  {
+    unsigned char needle = 0;
+    int match_offset = -1;
+    lhs_str = try_get_constant_string(&saved_args[0], &lhs_len);
+    if (lhs_str && try_get_constant_uchar(&saved_args[1], &needle) &&
+        try_get_constant_size_t(&saved_args[2], &n_const) && n_const <= (size_t)lhs_len + 1 &&
+        fold_builtin_memchr_offset(lhs_str, needle, n_const, &match_offset))
+    {
+      if (ir_idx_before_first_param >= 0)
+      {
+        int current_end = tcc_state->ir->next_instruction_index;
+        for (int i = ir_idx_before_first_param; i < current_end; i++)
+        {
+          if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
+          {
+            IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
+            int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
+            if (encoded_call_id == call_id)
+              tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
+          }
+        }
+      }
+      else
+      {
+        tcc_state->ir->next_instruction_index = ir_idx_before_args;
+      }
+
+      if (match_offset >= 0)
+      {
+        SValue match_sv = saved_args[0];
+        match_sv.c.i += match_offset;
+        vpushv(&match_sv);
+      }
+      else
+      {
+        vpushi(0);
+        vtop->type = saved_args[0].type;
+      }
+
+      vtop[-1] = vtop[0];
+      --vtop;
+      optimized = 1;
+    }
+  }
+
+  if (!can_fold_result && nb_real_args == 2 &&
+      (strcmp(func_name, "strchr") == 0 || strcmp(func_name, "index") == 0 ||
+       strcmp(func_name, "__builtin_index") == 0))
+  {
+    if (ir_idx_before_first_param >= 0)
+    {
+      int current_end = tcc_state->ir->next_instruction_index;
+      for (int i = ir_idx_before_first_param; i < current_end; i++)
+      {
+        if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
+        {
+          IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
+          int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
+          if (encoded_call_id == call_id)
+            tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
+        }
+      }
+    }
+    else
+    {
+      tcc_state->ir->next_instruction_index = ir_idx_before_args;
+    }
+
+    {
+      gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_strchr"), &saved_args[0].type);
+      vtop[-1] = vtop[0];
+      --vtop;
+      optimized = 1;
+    }
+  }
+
+  if (can_fold_result)
+  {
+    if (ir_idx_before_first_param >= 0)
+    {
+      int current_end = tcc_state->ir->next_instruction_index;
+      for (int i = ir_idx_before_first_param; i < current_end; i++)
+      {
+        if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
+        {
+          IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
+          int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
+          if (encoded_call_id == call_id)
+            tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
+        }
+      }
+    }
+    else
+    {
+      tcc_state->ir->next_instruction_index = ir_idx_before_args;
+    }
+
+    vpushi(folded_result);
+    vtop[-1] = vtop[0];
+    --vtop;
+    optimized = 1;
+  }
+  return optimized;
+}
+
 /* Extracted from unary() to reduce its stack frame size.
  * When TCC compiles itself with -O0, all locals in a function are
  * allocated at entry — even locals from unreachable case-arms.
@@ -12865,682 +13582,13 @@ va_arg_pack_done:
     fputs_family_optimized = 1;
   }
 
-  /* Fold zero-length string/memory compares even without global optimization.
-   * This matches GCC builtin semantics for cases like:
-   *   strncmp(++p, ++q, 0)
-   * where the call result is known to be 0, but argument side effects
-   * still must be preserved exactly once. */
   int string_builtin_optimized = 0;
   if (!folded && !inlined && !inline_evaled && !sprintf_family_optimized && !printf_family_optimized &&
       !fputs_family_optimized && func_name && saved_arg_count == nb_real_args && !NOEVAL_WANTED)
   {
-    int folded_result = 0;
-    int can_fold_result = 0;
-    int lhs_len = 0;
-    int rhs_len = 0;
-    const char *lhs_str = NULL;
-    const char *rhs_str = NULL;
-    size_t n_const = 0;
-
-    if (nb_real_args == 2 && strcmp(func_name, "strcmp") == 0)
-    {
-      lhs_str = try_get_constant_string(&saved_args[0], &lhs_len);
-      rhs_str = try_get_constant_string(&saved_args[1], &rhs_len);
-      if (lhs_str && rhs_str)
-      {
-        folded_result = fold_builtin_strcmp_result(lhs_str, rhs_str);
-        can_fold_result = 1;
-      }
-    }
-
-    if (!can_fold_result && nb_real_args == 2 &&
-        (strcmp(func_name, "strcmp") == 0 || strcmp(func_name, "__builtin_strcmp") == 0))
-    {
-      if (ir_idx_before_first_param >= 0)
-      {
-        int current_end = tcc_state->ir->next_instruction_index;
-        for (int i = ir_idx_before_first_param; i < current_end; i++)
-        {
-          if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-          {
-            IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-            int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-            if (encoded_call_id == call_id)
-              tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-          }
-        }
-      }
-      else
-      {
-        tcc_state->ir->next_instruction_index = ir_idx_before_args;
-      }
-
-      {
-        CType rt = {VT_INT, NULL};
-        gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_strcmp"), &rt);
-        vtop[-1] = vtop[0];
-        --vtop;
-        string_builtin_optimized = 1;
-      }
-    }
-
-    if (!can_fold_result && nb_real_args == 2 &&
-        (strcmp(func_name, "strcpy") == 0 || strcmp(func_name, "__builtin_strcpy") == 0))
-    {
-      if (ir_idx_before_first_param >= 0)
-      {
-        int current_end = tcc_state->ir->next_instruction_index;
-        for (int i = ir_idx_before_first_param; i < current_end; i++)
-        {
-          if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-          {
-            IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-            int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-            if (encoded_call_id == call_id)
-              tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-          }
-        }
-      }
-      else
-      {
-        tcc_state->ir->next_instruction_index = ir_idx_before_args;
-      }
-
-      {
-        gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_strcpy"), &saved_args[0].type);
-        vtop[-1] = vtop[0];
-        --vtop;
-        string_builtin_optimized = 1;
-      }
-    }
-
-    if (!can_fold_result && nb_real_args == 2 &&
-        (strcmp(func_name, "stpcpy") == 0 || strcmp(func_name, "__builtin_stpcpy") == 0))
-    {
-      CType result_type = ret.type;
-
-      if (ir_idx_before_first_param >= 0)
-      {
-        int current_end = tcc_state->ir->next_instruction_index;
-        for (int i = ir_idx_before_first_param; i < current_end; i++)
-        {
-          if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-          {
-            IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-            int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-            if (encoded_call_id == call_id)
-              tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-          }
-        }
-      }
-      else
-      {
-        tcc_state->ir->next_instruction_index = ir_idx_before_args;
-      }
-
-      {
-        gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_stpcpy"), &result_type);
-        vtop[-1] = vtop[0];
-        --vtop;
-        string_builtin_optimized = 1;
-      }
-    }
-
-    if (!can_fold_result && nb_real_args == 1 &&
-        (strcmp(func_name, "strlen") == 0 || strcmp(func_name, "__builtin_strlen") == 0))
-    {
-      CType result_type = ret.type;
-
-      if (ir_idx_before_first_param >= 0)
-      {
-        int current_end = tcc_state->ir->next_instruction_index;
-        for (int i = ir_idx_before_first_param; i < current_end; i++)
-        {
-          if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-          {
-            IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-            int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-            if (encoded_call_id == call_id)
-              tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-          }
-        }
-      }
-      else
-      {
-        tcc_state->ir->next_instruction_index = ir_idx_before_args;
-      }
-
-      {
-        gen_ir_call_args(saved_args, 1, tok_alloc_const("__tcc_strlen"), &result_type);
-        vtop[-1] = vtop[0];
-        --vtop;
-        string_builtin_optimized = 1;
-      }
-    }
-
-    if (!can_fold_result && nb_real_args == 2 &&
-        (strcmp(func_name, "strnlen") == 0 || strcmp(func_name, "__builtin_strnlen") == 0))
-    {
-      CType result_type = ret.type;
-
-      if (ir_idx_before_first_param >= 0)
-      {
-        int current_end = tcc_state->ir->next_instruction_index;
-        for (int i = ir_idx_before_first_param; i < current_end; i++)
-        {
-          if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-          {
-            IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-            int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-            if (encoded_call_id == call_id)
-              tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-          }
-        }
-      }
-      else
-      {
-        tcc_state->ir->next_instruction_index = ir_idx_before_args;
-      }
-
-      {
-        gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_strnlen"), &result_type);
-        vtop[-1] = vtop[0];
-        --vtop;
-        string_builtin_optimized = 1;
-      }
-    }
-
-    if (!can_fold_result && nb_real_args == 2 &&
-        (strcmp(func_name, "strpbrk") == 0 || strcmp(func_name, "__builtin_strpbrk") == 0))
-    {
-      CType result_type = ret.type;
-
-      if (ir_idx_before_first_param >= 0)
-      {
-        int current_end = tcc_state->ir->next_instruction_index;
-        for (int i = ir_idx_before_first_param; i < current_end; i++)
-        {
-          if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-          {
-            IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-            int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-            if (encoded_call_id == call_id)
-              tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-          }
-        }
-      }
-      else
-      {
-        tcc_state->ir->next_instruction_index = ir_idx_before_args;
-      }
-
-      {
-        gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_strpbrk"), &result_type);
-        vtop[-1] = vtop[0];
-        --vtop;
-        string_builtin_optimized = 1;
-      }
-    }
-
-    if (!can_fold_result && nb_real_args == 2 &&
-        (strcmp(func_name, "strrchr") == 0 || strcmp(func_name, "rindex") == 0 ||
-         strcmp(func_name, "__builtin_strrchr") == 0 || strcmp(func_name, "__builtin_rindex") == 0))
-    {
-      CType result_type = ret.type;
-
-      if (ir_idx_before_first_param >= 0)
-      {
-        int current_end = tcc_state->ir->next_instruction_index;
-        for (int i = ir_idx_before_first_param; i < current_end; i++)
-        {
-          if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-          {
-            IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-            int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-            if (encoded_call_id == call_id)
-              tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-          }
-        }
-      }
-      else
-      {
-        tcc_state->ir->next_instruction_index = ir_idx_before_args;
-      }
-
-      {
-        gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_strrchr"), &result_type);
-        vtop[-1] = vtop[0];
-        --vtop;
-        string_builtin_optimized = 1;
-      }
-    }
-
-    if (!can_fold_result && nb_real_args == 2 &&
-        (strcmp(func_name, "strstr") == 0 || strcmp(func_name, "__builtin_strstr") == 0))
-    {
-      CType result_type = ret.type;
-
-      if (ir_idx_before_first_param >= 0)
-      {
-        int current_end = tcc_state->ir->next_instruction_index;
-        for (int i = ir_idx_before_first_param; i < current_end; i++)
-        {
-          if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-          {
-            IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-            int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-            if (encoded_call_id == call_id)
-              tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-          }
-        }
-      }
-      else
-      {
-        tcc_state->ir->next_instruction_index = ir_idx_before_args;
-      }
-
-      {
-        gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_strstr"), &result_type);
-        vtop[-1] = vtop[0];
-        --vtop;
-        string_builtin_optimized = 1;
-      }
-    }
-
-    if (!can_fold_result && nb_real_args == 2 &&
-        (strcmp(func_name, "strcspn") == 0 || strcmp(func_name, "__builtin_strcspn") == 0))
-    {
-      CType result_type = ret.type;
-
-      if (ir_idx_before_first_param >= 0)
-      {
-        int current_end = tcc_state->ir->next_instruction_index;
-        for (int i = ir_idx_before_first_param; i < current_end; i++)
-        {
-          if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-          {
-            IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-            int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-            if (encoded_call_id == call_id)
-              tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-          }
-        }
-      }
-      else
-      {
-        tcc_state->ir->next_instruction_index = ir_idx_before_args;
-      }
-
-      {
-        gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_strcspn"), &result_type);
-        vtop[-1] = vtop[0];
-        --vtop;
-        string_builtin_optimized = 1;
-      }
-    }
-
-    if (!can_fold_result && nb_real_args == 3 &&
-        (strcmp(func_name, "strncpy") == 0 || strcmp(func_name, "__builtin_strncpy") == 0))
-    {
-      CType result_type = ret.type;
-
-      if (ir_idx_before_first_param >= 0)
-      {
-        int current_end = tcc_state->ir->next_instruction_index;
-        for (int i = ir_idx_before_first_param; i < current_end; i++)
-        {
-          if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-          {
-            IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-            int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-            if (encoded_call_id == call_id)
-              tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-          }
-        }
-      }
-      else
-      {
-        tcc_state->ir->next_instruction_index = ir_idx_before_args;
-      }
-
-      {
-        gen_ir_call_args(saved_args, 3, tok_alloc_const("__tcc_strncpy"), &result_type);
-        vtop[-1] = vtop[0];
-        --vtop;
-        string_builtin_optimized = 1;
-      }
-    }
-
-    if (!can_fold_result && nb_real_args == 3 &&
-        (strcmp(func_name, "strncat") == 0 || strcmp(func_name, "__builtin_strncat") == 0))
-    {
-      CType result_type = ret.type;
-
-      if (ir_idx_before_first_param >= 0)
-      {
-        int current_end = tcc_state->ir->next_instruction_index;
-        for (int i = ir_idx_before_first_param; i < current_end; i++)
-        {
-          if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-          {
-            IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-            int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-            if (encoded_call_id == call_id)
-              tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-          }
-        }
-      }
-      else
-      {
-        tcc_state->ir->next_instruction_index = ir_idx_before_args;
-      }
-
-      {
-        gen_ir_call_args(saved_args, 3, tok_alloc_const("__tcc_strncat"), &result_type);
-        vtop[-1] = vtop[0];
-        --vtop;
-        string_builtin_optimized = 1;
-      }
-    }
-
-    if (!can_fold_result && nb_real_args == 3 && strcmp(func_name, "strncmp") == 0 &&
-        !is_zero_length_builtin_compare(&saved_args[2]))
-    {
-      lhs_str = try_get_constant_string(&saved_args[0], &lhs_len);
-      rhs_str = try_get_constant_string(&saved_args[1], &rhs_len);
-      if (lhs_str && rhs_str && try_get_constant_size_t(&saved_args[2], &n_const))
-      {
-        folded_result = fold_builtin_strncmp_result(lhs_str, rhs_str, n_const);
-        can_fold_result = 1;
-      }
-    }
-
-    if (!can_fold_result && nb_real_args == 3 && strcmp(func_name, "memcmp") == 0)
-    {
-      lhs_str = try_get_constant_string(&saved_args[0], &lhs_len);
-      rhs_str = try_get_constant_string(&saved_args[1], &rhs_len);
-      if (lhs_str && rhs_str && try_get_constant_size_t(&saved_args[2], &n_const) && n_const <= (size_t)lhs_len + 1 &&
-          n_const <= (size_t)rhs_len + 1)
-      {
-        folded_result = fold_builtin_memcmp_result(lhs_str, rhs_str, n_const);
-        can_fold_result = 1;
-      }
-    }
-
-    if (!can_fold_result && nb_real_args == 3 && strcmp(func_name, "memcmp") == 0 &&
-        try_get_constant_size_t(&saved_args[2], &n_const))
-    {
-      if (n_const == 0)
-      {
-        folded_result = 0;
-        can_fold_result = 1;
-      }
-      else if (n_const == 1)
-      {
-        if (ir_idx_before_first_param >= 0)
-        {
-          int current_end = tcc_state->ir->next_instruction_index;
-          for (int i = ir_idx_before_first_param; i < current_end; i++)
-          {
-            if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-            {
-              IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-              int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-              if (encoded_call_id == call_id)
-                tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-            }
-          }
-        }
-        else
-        {
-          tcc_state->ir->next_instruction_index = ir_idx_before_args;
-        }
-
-        {
-          CType rt = {VT_INT, NULL};
-          gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_memcmp1"), &rt);
-          vtop[-1] = vtop[0];
-          --vtop;
-          string_builtin_optimized = 1;
-        }
-      }
-    }
-
-    if (!can_fold_result && nb_real_args == 3 && (strcmp(func_name, "memmove") == 0 || strcmp(func_name, "bcopy") == 0))
-    {
-      const int is_bcopy = strcmp(func_name, "bcopy") == 0;
-
-      if (ir_idx_before_first_param >= 0)
-      {
-        int current_end = tcc_state->ir->next_instruction_index;
-        for (int i = ir_idx_before_first_param; i < current_end; i++)
-        {
-          if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-          {
-            IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-            int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-            if (encoded_call_id == call_id)
-              tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-          }
-        }
-      }
-      else
-      {
-        tcc_state->ir->next_instruction_index = ir_idx_before_args;
-      }
-
-      {
-        SValue param_num;
-        const int new_call_id = tcc_state->ir->next_call_id++;
-
-        svalue_init(&param_num);
-        param_num.vr = -1;
-        param_num.r = VT_CONST;
-
-        if (is_bcopy)
-        {
-          param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
-          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[0], &param_num, NULL);
-
-          param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 1);
-          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[1], &param_num, NULL);
-
-          param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 2);
-          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[2], &param_num, NULL);
-
-          vpush_typed_helper_func(tok_alloc_const("__tcc_bcopy"), &func_old_void_type);
-          {
-            SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 3);
-            tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[0], &call_id_sv, NULL);
-          }
-          --vtop;
-          vtop->type.t = VT_VOID;
-          vtop->type.ref = NULL;
-          vtop->r = VT_CONST;
-          vtop->vr = -1;
-          vtop->c.i = 0;
-        }
-        else
-        {
-          SValue dest;
-
-          param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
-          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[0], &param_num, NULL);
-
-          param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 1);
-          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[1], &param_num, NULL);
-
-          param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 2);
-          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[2], &param_num, NULL);
-
-          vpush_typed_helper_func(tok_alloc_const("__tcc_memmove"), &func_old_void_pointer_type);
-
-          svalue_init(&dest);
-          dest.type = saved_args[0].type;
-          dest.r = 0;
-          dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-          {
-            SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 3);
-            tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[0], &call_id_sv, &dest);
-          }
-
-          --vtop;
-          vpushi(0);
-          vtop->type = dest.type;
-          vtop->vr = dest.vr;
-          vtop->r = TREG_R0;
-        }
-
-        vtop[-1] = vtop[0];
-        --vtop;
-        string_builtin_optimized = 1;
-      }
-    }
-
-    if (!can_fold_result && nb_real_args == 3 && strcmp(func_name, "strncmp") == 0)
-    {
-      if (ir_idx_before_first_param >= 0)
-      {
-        int current_end = tcc_state->ir->next_instruction_index;
-        for (int i = ir_idx_before_first_param; i < current_end; i++)
-        {
-          if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-          {
-            IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-            int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-            if (encoded_call_id == call_id)
-              tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-          }
-        }
-      }
-      else
-      {
-        tcc_state->ir->next_instruction_index = ir_idx_before_args;
-      }
-
-      {
-        CType rt = {VT_INT, NULL};
-        gen_ir_call_args(saved_args, 3, tok_alloc_const("__tcc_strncmp"), &rt);
-        vtop[-1] = vtop[0];
-        --vtop;
-        string_builtin_optimized = 1;
-      }
-    }
-
-    if (!can_fold_result && nb_real_args == 3 && is_zero_length_builtin_compare(&saved_args[2]))
-    {
-      if (strcmp(func_name, "strncmp") == 0 || strcmp(func_name, "memcmp") == 0)
-      {
-        folded_result = 0;
-        can_fold_result = 1;
-      }
-    }
-
-    if (!can_fold_result && nb_real_args == 3 && strcmp(func_name, "memchr") == 0)
-    {
-      unsigned char needle = 0;
-      int match_offset = -1;
-      lhs_str = try_get_constant_string(&saved_args[0], &lhs_len);
-      if (lhs_str && try_get_constant_uchar(&saved_args[1], &needle) &&
-          try_get_constant_size_t(&saved_args[2], &n_const) && n_const <= (size_t)lhs_len + 1 &&
-          fold_builtin_memchr_offset(lhs_str, needle, n_const, &match_offset))
-      {
-        if (ir_idx_before_first_param >= 0)
-        {
-          int current_end = tcc_state->ir->next_instruction_index;
-          for (int i = ir_idx_before_first_param; i < current_end; i++)
-          {
-            if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-            {
-              IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-              int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-              if (encoded_call_id == call_id)
-                tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-            }
-          }
-        }
-        else
-        {
-          tcc_state->ir->next_instruction_index = ir_idx_before_args;
-        }
-
-        if (match_offset >= 0)
-        {
-          SValue match_sv = saved_args[0];
-          match_sv.c.i += match_offset;
-          vpushv(&match_sv);
-        }
-        else
-        {
-          vpushi(0);
-          vtop->type = saved_args[0].type;
-        }
-
-        vtop[-1] = vtop[0];
-        --vtop;
-        string_builtin_optimized = 1;
-      }
-    }
-
-    if (!can_fold_result && nb_real_args == 2 &&
-        (strcmp(func_name, "strchr") == 0 || strcmp(func_name, "index") == 0 ||
-         strcmp(func_name, "__builtin_index") == 0))
-    {
-      if (ir_idx_before_first_param >= 0)
-      {
-        int current_end = tcc_state->ir->next_instruction_index;
-        for (int i = ir_idx_before_first_param; i < current_end; i++)
-        {
-          if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-          {
-            IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-            int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-            if (encoded_call_id == call_id)
-              tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-          }
-        }
-      }
-      else
-      {
-        tcc_state->ir->next_instruction_index = ir_idx_before_args;
-      }
-
-      {
-        gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_strchr"), &saved_args[0].type);
-        vtop[-1] = vtop[0];
-        --vtop;
-        string_builtin_optimized = 1;
-      }
-    }
-
-    if (can_fold_result)
-    {
-      if (ir_idx_before_first_param >= 0)
-      {
-        int current_end = tcc_state->ir->next_instruction_index;
-        for (int i = ir_idx_before_first_param; i < current_end; i++)
-        {
-          if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-          {
-            IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-            int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-            if (encoded_call_id == call_id)
-              tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-          }
-        }
-      }
-      else
-      {
-        tcc_state->ir->next_instruction_index = ir_idx_before_args;
-      }
-
-      vpushi(folded_result);
-      vtop[-1] = vtop[0];
-      --vtop;
-      string_builtin_optimized = 1;
-    }
+    string_builtin_optimized = unary_funcall_opt_string_builtins(
+        func_name, saved_args, nb_real_args, call_id, ir_idx_before_first_param, ir_idx_before_args, &ret.type);
   }
-
   if (folded)
   {
     /* Constant folding succeeded – skip IR emission.
@@ -17315,23 +17363,7 @@ tok_next:
     {
       /* Force DATA_ONLY_WANTED so the IR backend (which defers code generation)
        * can still allocate the string in rodata now, before the actual code
-       * referring to it is emitted.
-       *
-       * In a dead code path (NODATA_WANTED is already set), redirect the string
-       * data to a separate ".rodata.dead" section instead of the main rodata.
-       * This keeps the symbol properly defined (no linker "undefined symbol"
-       * error) while preventing dead-block string data from appearing between
-       * nodata measurement markers (ds1/de1).  The ".rodata.dead" section has
-       * no live references (all IR instructions using these strings are DCE'd)
-       * so the linker's --gc-sections will remove it entirely.
-       */
-      if (NODATA_WANTED)
-      {
-        Section *dead_sec = find_section(tcc_state, ".rodata.dead");
-        if (!dead_sec)
-          dead_sec = new_section(tcc_state, ".rodata.dead", SHT_PROGBITS, SHF_ALLOC);
-        ad.section = dead_sec;
-      }
+       * referring to it is emitted. */
       int saved_nocode = nocode_wanted;
       nocode_wanted |= DATA_ONLY_WANTED;
       decl_initializer_alloc(&type, &ad, VT_CONST, 2, 0, 0);
@@ -20450,7 +20482,9 @@ again:
     block(0);
     if (tok == TOK_ELSE)
     {
+      int if_nocode, else_nocode;
       SValue dest;
+      if_nocode = nocode_wanted; /* save reachability after if-body */
       svalue_init(&dest);
       dest.vr = -1;
       dest.r = VT_CONST; /* Mark as constant so jump target is stored in u.imm32 */
@@ -20460,8 +20494,14 @@ again:
       CODE_ON(); /* Code after if-branch is reachable via else path */
       next();
       block(0);
+      else_nocode = nocode_wanted; /* save reachability after else-body */
       tcc_ir_backpatch_to_here(tcc_state->ir, d);
-      CODE_ON(); /* Code after if-else is reachable from both paths */
+      /* If both branches are unreachable (both returned/broke),
+         code after the if-else is also unreachable */
+      if ((if_nocode & else_nocode) & CODE_OFF_BIT)
+        nocode_wanted |= CODE_OFF_BIT;
+      else
+        CODE_ON();
     }
     else
     {
@@ -20714,6 +20754,10 @@ again:
     }
     tcc_ir_backpatch_to_here(tcc_state->ir, a);
     tcc_ir_backpatch(tcc_state->ir, b, c);
+    /* If there was no exit condition and no break (a == -1 after lblock),
+       the loop is infinite and code after it is unreachable. */
+    if (a == -1)
+      nocode_wanted |= CODE_OFF_BIT;
     // gsym_addr(b, d);
     // gsym(a);
     prev_scope(&o, 0);
@@ -20798,6 +20842,15 @@ again:
     tcc_ir_put(tcc_state->ir, TCCIR_OP_ASSIGN, vtop, NULL, &dest);
     vtop->vr = dest.vr;
     vtop->r = 0;
+    /* Force bitfield extraction before switch comparison / jump table.
+     * The ASSIGN above copies the raw containing word into the temp vreg;
+     * the bitfield bits must be extracted (SHL+SAR) now so that ALL
+     * subsequent uses — bounds check AND SWITCH_TABLE — operate on the
+     * extracted integer, not the full word.  Without this, the bounds
+     * check extracts on a duplicated copy while SWITCH_TABLE still sees
+     * the unextracted full word, causing a wild jump. */
+    if (vtop->type.t & VT_BITFIELD)
+      gv(RC_INT);
     /* Build case jump chain; start with empty default chain (-1).
      * Use jump table for dense switches, otherwise fall back to binary search. */
     int switch_table_id = -1;

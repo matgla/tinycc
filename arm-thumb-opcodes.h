@@ -79,7 +79,6 @@
   printf("\n")
 #endif
 
-
 #define ceil_div(x, d) ((x + (d - 1)) / d)
 
 #define R0 0
@@ -146,11 +145,12 @@ typedef struct thumb_shift
   thumb_shift_mode mode;
 } thumb_shift;
 
-#define THUMB_SHIFT_DEFAULT                                                                                            \
-  (thumb_shift)                                                                                                        \
-  {                                                                                                                    \
-    .type = THUMB_SHIFT_NONE, .value = 0, .mode = THUMB_SHIFT_IMMEDIATE                                                \
-  }
+/* Use a named global instead of a compound literal to avoid TCC codegen
+   issues with stack-allocated compound literal struct arguments.  The
+   compound literal form was corrupted on ARM when passed through the stack
+   (shift.type arrived as a stale code address instead of THUMB_SHIFT_NONE). */
+static const thumb_shift _thumb_shift_default_val = {THUMB_SHIFT_NONE, 0, THUMB_SHIFT_IMMEDIATE};
+#define THUMB_SHIFT_DEFAULT _thumb_shift_default_val
 
 uint32_t th_packimm_10_11_0(uint32_t imm);
 uint32_t th_packimm_3_8_1(uint32_t imm);

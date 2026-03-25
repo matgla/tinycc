@@ -806,6 +806,7 @@ ST_FUNC int tcc_output_yaff(TCCState *s1, FILE *f, const char *filename)
     fwrite(s1->plt->data, 1, s1->plt->sh_size, f);
     header.plt_length = s1->plt->sh_size;
   }
+
   fwrite(rodata_section->data, 1, rodata_section->sh_size, f);
   fwrite(data_section->data, 1, data_section->sh_size, f);
   fwrite(s1->got->data, 1, s1->got->sh_size, f);

@@ -85,6 +85,7 @@ enum Armv8mRegisters
 #define USING_GLOBALS
 #include "tcc.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 
 /* Target ABI hook: AAPCS-like argument assignment for ARM (R0-R3 + stack).
@@ -3383,6 +3384,44 @@ typedef struct ThumbDataProcessingHandler
   thumb_reg_handler_t reg_handler;
 } ThumbDataProcessingHandler;
 
+/* Dispatch a reg_handler call through a direct call instead of an indirect
+ * (function pointer) call.  This works around a code-generation bug where
+ * struct-by-value arguments (thumb_shift) get corrupted when passed through
+ * indirect calls that also use sret return (thumb_opcode is 8 bytes).
+ * By comparing the function pointer and branching to a direct call, the
+ * cross-compiler generates correct struct passing code. */
+static thumb_opcode thumb_call_reg_handler(thumb_reg_handler_t fn, uint32_t rd, uint32_t rn, uint32_t rm,
+                                           thumb_flags_behaviour flags, thumb_shift shift,
+                                           thumb_enforce_encoding encoding)
+{
+  if (fn == th_add_reg)
+    return th_add_reg(rd, rn, rm, flags, shift, encoding);
+  if (fn == th_sub_reg)
+    return th_sub_reg(rd, rn, rm, flags, shift, encoding);
+  if (fn == th_adc_reg)
+    return th_adc_reg(rd, rn, rm, flags, shift, encoding);
+  if (fn == th_sbc_reg)
+    return th_sbc_reg(rd, rn, rm, flags, shift, encoding);
+  if (fn == th_cmp_reg)
+    return th_cmp_reg(rd, rn, rm, flags, shift, encoding);
+  if (fn == th_lsl_reg)
+    return th_lsl_reg(rd, rn, rm, flags, shift, encoding);
+  if (fn == th_lsr_reg)
+    return th_lsr_reg(rd, rn, rm, flags, shift, encoding);
+  if (fn == th_asr_reg)
+    return th_asr_reg(rd, rn, rm, flags, shift, encoding);
+  if (fn == th_orr_reg)
+    return th_orr_reg(rd, rn, rm, flags, shift, encoding);
+  if (fn == th_and_reg)
+    return th_and_reg(rd, rn, rm, flags, shift, encoding);
+  if (fn == th_eor_reg)
+    return th_eor_reg(rd, rn, rm, flags, shift, encoding);
+  if (fn == th_bic_reg)
+    return th_bic_reg(rd, rn, rm, flags, shift, encoding);
+  /* Unreachable for known handlers — fallback to direct call. */
+  return fn(rd, rn, rm, flags, shift, encoding);
+}
+
 static void thumb_require_materialized_reg(const char *ctx, const char *operand, int reg)
 {
   const bool reg_is_hw = (reg >= 0) && (reg <= 15);
@@ -3422,7 +3461,8 @@ static void thumb_emit_op_imm_fallback(int rd, int rn, uint32_t imm, thumb_flags
       exclude |= (1u << rn);
     ScratchRegAlloc scratch = get_scratch_reg_with_save(exclude);
     tcc_machine_load_constant(scratch.reg, PREG_NONE, (int32_t)imm, 0, NULL);
-    ot_check(handler.reg_handler(rd, rn, scratch.reg, flags, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+    ot_check(thumb_call_reg_handler(handler.reg_handler, rd, rn, scratch.reg, flags, THUMB_SHIFT_DEFAULT,
+                                    ENFORCE_ENCODING_NONE));
     restore_scratch_reg(&scratch);
   }
   else
@@ -3688,10 +3728,12 @@ static void thumb_emit_data_processing_mop64(const MachineOperand *src1, const M
       rm_hi = mach_alloc_scratch(&mctx, excl);
       ot_check(th_mov_imm((uint32_t)rm_hi, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
     }
-    ot_check(regular.reg_handler((uint32_t)rd_lo, (uint32_t)rn_lo, (uint32_t)rm_lo, lo_flags, THUMB_SHIFT_DEFAULT,
-                                 ENFORCE_ENCODING_NONE));
-    ot_check(carry_h.reg_handler((uint32_t)rd_hi, (uint32_t)rn_hi, (uint32_t)rm_hi, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                                 THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+    {
+      ot_check(thumb_call_reg_handler(regular.reg_handler, (uint32_t)rd_lo, (uint32_t)rn_lo, (uint32_t)rm_lo, lo_flags,
+                                      THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+      ot_check(thumb_call_reg_handler(carry_h.reg_handler, (uint32_t)rd_hi, (uint32_t)rn_hi, (uint32_t)rm_hi,
+                                      FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+    }
   }
 
   /* 4. Write results back to spill/param slots if dest was not pre-allocated. */
@@ -3828,25 +3870,53 @@ static void thumb_emit_shift64_mop(const MachineOperand *src1, const MachineOper
     ScratchRegAlloc tmp = get_scratch_reg_with_save(thumb_exclude_mask_for_regs(4, regs) | excl);
     if (is_left)
     {
-      ot_check(
-          dst_lo_shift((uint32_t)dst_lo, (uint32_t)src_lo, sh, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+      /* Compute the cross-shift into tmp BEFORE any destination is written,
+       * because dst_lo/dst_hi may alias src_lo/src_hi. */
       ot_check(cross_shift((uint32_t)tmp.reg, (uint32_t)src_lo, 32 - sh, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
                            ENFORCE_ENCODING_NONE));
-      ot_check(
-          dst_hi_shift((uint32_t)dst_hi, (uint32_t)src_hi, sh, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+      if (dst_hi == src_lo)
+      {
+        /* dst_hi aliases src_lo — compute dst_lo first (needs src_lo). */
+        ot_check(
+            dst_lo_shift((uint32_t)dst_lo, (uint32_t)src_lo, sh, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+        ot_check(
+            dst_hi_shift((uint32_t)dst_hi, (uint32_t)src_hi, sh, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+      }
+      else
+      {
+        /* Default order: dst_hi first to avoid clobbering src_hi via dst_lo. */
+        ot_check(
+            dst_hi_shift((uint32_t)dst_hi, (uint32_t)src_hi, sh, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+        ot_check(
+            dst_lo_shift((uint32_t)dst_lo, (uint32_t)src_lo, sh, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+      }
       ot_check(th_orr_reg((uint32_t)dst_hi, (uint32_t)dst_hi, (uint32_t)tmp.reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
                           THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     }
     else
     {
+      /* Compute the cross-shift into tmp BEFORE any destination is written,
+       * because dst_lo/dst_hi may alias src_lo/src_hi. */
       ot_check(cross_shift((uint32_t)tmp.reg, (uint32_t)src_hi, 32 - sh, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
                            ENFORCE_ENCODING_NONE));
-      ot_check(
-          th_lsr_imm((uint32_t)dst_lo, (uint32_t)src_lo, sh, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+      if (dst_lo == src_hi)
+      {
+        /* dst_lo aliases src_hi — compute dst_hi first (needs src_hi). */
+        ot_check(
+            dst_hi_shift((uint32_t)dst_hi, (uint32_t)src_hi, sh, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+        ot_check(
+            th_lsr_imm((uint32_t)dst_lo, (uint32_t)src_lo, sh, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+      }
+      else
+      {
+        /* Default order: dst_lo first to avoid clobbering src_lo via dst_hi. */
+        ot_check(
+            th_lsr_imm((uint32_t)dst_lo, (uint32_t)src_lo, sh, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+        ot_check(
+            dst_hi_shift((uint32_t)dst_hi, (uint32_t)src_hi, sh, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+      }
       ot_check(th_orr_reg((uint32_t)dst_lo, (uint32_t)dst_lo, (uint32_t)tmp.reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
                           THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-      ot_check(
-          dst_hi_shift((uint32_t)dst_hi, (uint32_t)src_hi, sh, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
     }
     restore_scratch_reg(&tmp);
   }
@@ -3854,12 +3924,14 @@ static void thumb_emit_shift64_mop(const MachineOperand *src1, const MachineOper
   {
     if (is_left)
     {
-      ot_check(th_mov_imm((uint32_t)dst_lo, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+      /* Emit MOV dst_hi first: dst_lo may alias src_lo. */
       ot_check(th_mov_reg((uint32_t)dst_hi, (uint32_t)src_lo, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
                           ENFORCE_ENCODING_NONE, false));
+      ot_check(th_mov_imm((uint32_t)dst_lo, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
     }
     else
     {
+      /* Emit MOV dst_lo first: dst_hi may alias src_hi. */
       ot_check(th_mov_reg((uint32_t)dst_lo, (uint32_t)src_hi, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
                           ENFORCE_ENCODING_NONE, false));
       if (arith_right)
@@ -3873,19 +3945,32 @@ static void thumb_emit_shift64_mop(const MachineOperand *src1, const MachineOper
   {
     if (is_left)
     {
-      ot_check(th_mov_imm((uint32_t)dst_lo, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+      /* Emit shift into dst_hi first: dst_lo may alias src_lo. */
       ot_check(dst_hi_shift((uint32_t)dst_hi, (uint32_t)src_lo, sh - 32, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
                             ENFORCE_ENCODING_NONE));
+      ot_check(th_mov_imm((uint32_t)dst_lo, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
     }
     else
     {
-      ot_check(dst_hi_shift((uint32_t)dst_lo, (uint32_t)src_hi, sh - 32, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                            ENFORCE_ENCODING_NONE));
-      if (arith_right)
+      if (arith_right && dst_lo == src_hi)
+      {
+        /* dst_lo aliases src_hi — compute dst_hi (sign extension) first
+         * while src_hi is still intact, then shift into dst_lo. */
         ot_check(
             th_asr_imm((uint32_t)dst_hi, (uint32_t)src_hi, 31, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+        ot_check(dst_hi_shift((uint32_t)dst_lo, (uint32_t)src_hi, sh - 32, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                              ENFORCE_ENCODING_NONE));
+      }
       else
-        ot_check(th_mov_imm((uint32_t)dst_hi, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+      {
+        ot_check(dst_hi_shift((uint32_t)dst_lo, (uint32_t)src_hi, sh - 32, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                              ENFORCE_ENCODING_NONE));
+        if (arith_right)
+          ot_check(
+              th_asr_imm((uint32_t)dst_hi, (uint32_t)src_hi, 31, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+        else
+          ot_check(th_mov_imm((uint32_t)dst_hi, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+      }
     }
   }
   else /* sh >= 64 */
@@ -3963,8 +4048,8 @@ static void thumb_emit_data_processing_mop32(const MachineOperand *src1, const M
   if (!imm_emitted)
   {
     /* Immediate form didn't fit (or src2 isn't an immediate): emit reg form. */
-    ot_check(handler.reg_handler((uint32_t)dest_reg, (uint32_t)src1_reg, (uint32_t)src2_reg, flags, THUMB_SHIFT_DEFAULT,
-                                 ENFORCE_ENCODING_NONE));
+    ot_check(thumb_call_reg_handler(handler.reg_handler, (uint32_t)dest_reg, (uint32_t)src1_reg, (uint32_t)src2_reg,
+                                    flags, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
   }
 
   /* 4. Write result back to spill slot / stack param / pointer-dest. */
@@ -7956,6 +8041,10 @@ static void place_stack_arg_64bit(const MachineOperand *mop, int stack_offset, T
 
   if (mop->kind == MACH_OP_REG && !mop->needs_deref && thumb_is_hw_reg(mop->u.reg.r0) && thumb_is_hw_reg(mop->u.reg.r1))
   {
+    /* If either register is R0-R3, the value was already stored by
+     * presave_stack_args_from_arg_regs before the register shuffle. */
+    if (mop->u.reg.r0 <= ARM_R3 || mop->u.reg.r1 <= ARM_R3)
+      return;
     store_word_to_stack(mop->u.reg.r0, lo_offset);
     store_word_to_stack(mop->u.reg.r1, hi_offset);
   }
@@ -8165,13 +8254,35 @@ static void presave_stack_args_from_arg_regs(CallGenContext *ctx)
 
     if (loc->kind == TCC_ABI_LOC_REG)
       continue;
-    if (bt == IROP_BTYPE_STRUCT || mop->is_64bit || mop->is_complex)
+    if (bt == IROP_BTYPE_STRUCT || mop->is_complex)
+      continue;
+    if (mop->kind != MACH_OP_REG || mop->needs_deref)
       continue;
 
-    /* Only pre-save if operand is in R0-R3 (arg registers that get overwritten). */
-    if (mop->kind == MACH_OP_REG && !mop->needs_deref && mop->u.reg.r0 <= ARM_R3)
+    if (mop->is_64bit)
     {
-      store_word_to_stack(mop->u.reg.r0, loc->stack_off);
+      /* Pre-save 64-bit register pair if either register is in R0-R3.
+       * The register arg shuffle will overwrite R0-R3, so both halves
+       * must be stored to the stack before that happens. */
+      int r0 = mop->u.reg.r0;
+      int r1 = mop->u.reg.r1;
+      if ((thumb_is_hw_reg(r0) && r0 <= ARM_R3) ||
+          (thumb_is_hw_reg(r1) && r1 <= ARM_R3))
+      {
+        int stack_offset = loc->stack_off;
+        if (thumb_is_hw_reg(r0))
+          store_word_to_stack(r0, stack_offset);
+        if (thumb_is_hw_reg(r1))
+          store_word_to_stack(r1, stack_offset + 4);
+      }
+    }
+    else
+    {
+      /* Only pre-save if operand is in R0-R3 (arg registers that get overwritten). */
+      if (mop->u.reg.r0 <= ARM_R3)
+      {
+        store_word_to_stack(mop->u.reg.r0, loc->stack_off);
+      }
     }
   }
 }

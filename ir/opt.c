@@ -964,16 +964,16 @@ int tcc_ir_opt_const_prop(TCCIRState *ir)
       result = (val1 > val2) ? 1 : 0;
       break;
     case 0x92: /* TOK_ULT (unsigned <) */
-      result = ((uint64_t)(uint32_t)val1 < (uint64_t)(uint32_t)val2) ? 1 : 0;
+      result = ((uint64_t)val1 < (uint64_t)val2) ? 1 : 0;
       break;
     case 0x93: /* TOK_UGE (unsigned >=) */
-      result = ((uint64_t)(uint32_t)val1 >= (uint64_t)(uint32_t)val2) ? 1 : 0;
+      result = ((uint64_t)val1 >= (uint64_t)val2) ? 1 : 0;
       break;
     case 0x96: /* TOK_ULE (unsigned <=) */
-      result = ((uint64_t)(uint32_t)val1 <= (uint64_t)(uint32_t)val2) ? 1 : 0;
+      result = ((uint64_t)val1 <= (uint64_t)val2) ? 1 : 0;
       break;
     case 0x97: /* TOK_UGT (unsigned >) */
-      result = ((uint64_t)(uint32_t)val1 > (uint64_t)(uint32_t)val2) ? 1 : 0;
+      result = ((uint64_t)val1 > (uint64_t)val2) ? 1 : 0;
       break;
     default:
       /* Unknown condition, don't fold */
@@ -6715,13 +6715,13 @@ static int evaluate_compare_condition(int64_t val1, int64_t val2, int cond_token
   case 0x9f: /* TOK_GT */
     return val1 > val2;
   case 0x92: /* TOK_ULT (unsigned <) */
-    return (uint64_t)(uint32_t)val1 < (uint64_t)(uint32_t)val2;
+    return (uint64_t)val1 < (uint64_t)val2;
   case 0x93: /* TOK_UGE (unsigned >=) */
-    return (uint64_t)(uint32_t)val1 >= (uint64_t)(uint32_t)val2;
+    return (uint64_t)val1 >= (uint64_t)val2;
   case 0x96: /* TOK_ULE (unsigned <=) */
-    return (uint64_t)(uint32_t)val1 <= (uint64_t)(uint32_t)val2;
+    return (uint64_t)val1 <= (uint64_t)val2;
   case 0x97: /* TOK_UGT (unsigned >) */
-    return (uint64_t)(uint32_t)val1 > (uint64_t)(uint32_t)val2;
+    return (uint64_t)val1 > (uint64_t)val2;
   default:
     return -1; /* Unknown condition */
   }

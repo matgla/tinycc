@@ -498,8 +498,44 @@ test-asm: cross test-venv
 			$(PYTEST) --tb=short -q -n $(J) .; \
 		fi
 
+# Check that cross-compilation produces no unexpected warnings or errors.
+# Rebuilds libtcc1.a and compiles test files with -c, failing on any
+# "warning:" or "error:" in stderr.
+WARN_CHECK_SRCS = \
+	tests/tests2/15_recursion.c \
+	tests/tests2/14_if.c \
+	tests/tests2/04_for.c \
+	tests/tests2/08_while.c \
+	tests/tests2/09_do_while.c \
+	tests/tests2/06_case.c \
+	tests/tests2/07_function.c
+
+.PHONY: warn-check
+warn-check: armv8m-tcc$(EXESUF)
+	@echo "------------ warn-check: libtcc1.a build ------------"
+	@rm -f armv8m-libtcc1.a
+	@log=$$($(MAKE) --no-print-directory armv8m-libtcc1.a 2>&1) ; \
+	warns=$$(echo "$$log" | grep -c -E 'warning:|error:') ; \
+	if [ "$$warns" -ne 0 ]; then \
+		echo "FAIL: unexpected warnings/errors building libtcc1.a:" ; \
+		echo "$$log" | grep -E 'warning:|error:' ; \
+		exit 1 ; \
+	fi
+	@echo "------------ warn-check: test file compilation ------------"
+	@fail=0 ; \
+	for f in $(WARN_CHECK_SRCS); do \
+		out=$$(./armv8m-tcc$(EXESUF) -c "$$f" -o /dev/null 2>&1) ; \
+		if echo "$$out" | grep -qE 'warning:|error:'; then \
+			echo "FAIL: $$f:" ; \
+			echo "$$out" | grep -E 'warning:|error:' ; \
+			fail=1 ; \
+		fi ; \
+	done ; \
+	if [ "$$fail" -ne 0 ]; then exit 1; fi
+	@echo "------------ warn-check: passed ------------"
+
 # run IR tests via pytest (preferred)
-test: cross test-aeabi-host test-asm test-venv test-prepare download-gcc-tests
+test: cross test-aeabi-host test-asm warn-check test-venv test-prepare download-gcc-tests
 	@echo "------------ ir_tests (pytest) ------------"
 	@if [ "$(USE_VENV)" = "1" ]; then \
 		cd $(IRTESTS_DIR) && "$(VENV_PY)" -m pytest -s -n $(J); \

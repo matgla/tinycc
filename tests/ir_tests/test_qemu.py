@@ -439,6 +439,7 @@ TCC_BUG_TEST_FILES = [
     ("bug_packed_sizes.c", 0),
     ("bug_stride10.c", 0),
     ("bug_bitfield_packed10.c", 0),
+    ("bug_switch_bitfield.c", 0),
 
 
 ]
