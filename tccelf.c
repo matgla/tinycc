@@ -1303,13 +1303,14 @@ ST_FUNC int put_elf_sym(Section *s, addr_t value, unsigned long size, int info, 
   ElfW(Sym) * sym;
   Section *hs;
 
-  /* Validate name pointer - catch garbage early */
+  /* Validate name pointer - catch garbage early.
+     Accept printable ASCII and valid UTF-8 lead bytes (0xC2-0xF4).
+     Reject control characters and bare continuation bytes. */
   if (name && name[0])
   {
     unsigned char first = (unsigned char)name[0];
-    if (first < 0x20 || first > 0x7e)
+    if (first < 0x20 || (first > 0x7e && first < 0xc2) || first > 0xf4)
     {
-      /* name pointer contains garbage - treat as unnamed */
       name = NULL;
     }
   }

@@ -4182,6 +4182,7 @@ static void gen_opic(int op)
     {
       /* treat (0 << x), (0 >> x) and (-1 >> x) as constant */
       vpop();
+      vtop->r |= VT_NONCONST;
     }
     else if (c2 && ((l2 == 0 && (op == '&' || op == '*')) ||
                     (op == '|' && (l2 == -1 || (l2 == 0xFFFFFFFF && t2 != VT_LLONG))) ||
@@ -4192,6 +4193,7 @@ static void gen_opic(int op)
         vtop->c.i = 0;
       vswap();
       vtop--;
+      vtop->r |= VT_NONCONST;
       print_vstack("gen_opic(1)");
     }
     else if (c2 &&
@@ -7239,6 +7241,7 @@ static void gen_cast(CType *type)
   int sbt, dbt, sf, df, c;
   int dbt_bt, sbt_bt, ds, ss, bits, trunc;
 
+
   if (is_transparent_union_type(type))
   {
     CType *member_type = find_assignable_transparent_union_member(type);
@@ -7250,7 +7253,13 @@ static void gen_cast(CType *type)
   }
 
   /* special delayed cast for char/short */
-  if (vtop->r & (VT_MUSTCAST | (VT_MUSTCAST << 1)))
+  /* VT_MUSTCAST uses bits 0x100-0x200 as a 2-bit field, but VT_NONCONST
+     also occupies bit 0x200.  VT_MUSTCAST only applies to register values
+     (char/short stored in int registers), never to VT_CONST values.
+     Skip when the value is a constant to avoid misinterpreting VT_NONCONST
+     as part of the VT_MUSTCAST field. */
+  if ((vtop->r & (VT_MUSTCAST | (VT_MUSTCAST << 1))) &&
+      (vtop->r & VT_VALMASK) != VT_CONST)
     force_charshort_cast();
 
   /* bitfields first get cast to ints */

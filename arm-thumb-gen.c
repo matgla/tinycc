@@ -4979,6 +4979,23 @@ ST_FUNC void tcc_gen_machine_load_mop(MachineOperand src, MachineOperand dest, T
     tcc_machine_load_constant(dest_reg, dest_r1, src.u.imm.val, (int)dest.is_64bit, NULL);
     break;
 
+  case MACH_OP_FRAME_ADDR:
+  {
+    if (!src.needs_deref)
+    {
+      /* Load the frame-slot address itself (LEA semantics). */
+      tcc_machine_addr_of_stack_slot(dest_reg, src.u.frame.offset, 0);
+    }
+    else
+    {
+      /* Frame address is a pointer to data — compute addr, then dereference. */
+      int addr_r = mach_alloc_scratch(&ctx, (uint32_t)1u << (uint32_t)dest_reg);
+      tcc_machine_addr_of_stack_slot(addr_r, src.u.frame.offset, 0);
+      load_from_base(dest_reg, dest_r1, btype, is_unsigned, 0, 0, (uint32_t)addr_r);
+    }
+    break;
+  }
+
   case MACH_OP_CHAIN_REL:
   {
     /* Captured variable: load from parent frame via static chain. */

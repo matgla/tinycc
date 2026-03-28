@@ -283,6 +283,52 @@ static int tcc_yaff_write_data_relocations(TCCState *s1, FILE *f)
             uint32_t original_offset = 0;
             bool towards_code = false;
             YaffDataRelocationEntry entry;
+
+            /* Check for imported symbol (e.g. fprintfptr = &fprintf).
+               For imported symbols, the inline .data value is 0 because
+               relocate() skips patching for dynamic symbols.  Emit a
+               GOT-indirect data relocation (section=UNKNOWN) so the
+               loader can resolve through the GOT entry and create a
+               thunk for cross-module function pointers. */
+            {
+              int sym_idx = ELFW(R_SYM)(rel->r_info);
+              if (sym_idx != 0 && s->link)
+              {
+                ElfW(Sym) *rel_sym = &((ElfW(Sym) *)s->link->data)[sym_idx];
+                if (rel_sym->st_shndx == SHN_UNDEF)
+                {
+                  uint32_t imp_to = rel->r_offset;
+                  if (!(s->sh_flags & SHF_ALLOC))
+                  {
+                    Section *target_sec = s1->sections[s->sh_info];
+                    imp_to += target_sec->sh_addr;
+                  }
+                  imp_to -= rodata_section->sh_addr;
+
+                  struct sym_attr *attr = get_sym_attr(s1, sym_idx, 0);
+                  uint32_t got_offset = 0;
+                  if (attr->got_offset)
+                  {
+                    got_offset = attr->got_offset;
+                  }
+                  else if (attr->plt_offset)
+                  {
+                    got_offset = read32le(s1->plt->data + attr->plt_offset + 4);
+                  }
+                  uint32_t got_index = got_offset / (PTR_SIZE * 2);
+
+                  entry = (YaffDataRelocationEntry){
+                      .to = imp_to,
+                      .section = YAFF_SECTION_UNKNOWN, /* GOT-indirect */
+                      .from = got_index,
+                  };
+                  fwrite(&entry, 1, sizeof(entry), f);
+                  ++number_of_data_relocations;
+                  break;
+                }
+              }
+            }
+
             /* If the relocation section does not have SHF_ALLOC,
                r_offset is section-relative. Convert to absolute
                virtual address by adding the target section base. */
