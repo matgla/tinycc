@@ -410,10 +410,12 @@ typedef struct
 /* Table of foldable math functions */
 static const FoldableMathFunc foldable_math_funcs[] = {
 #ifdef TARGETOS_YasOS
-    /* Keep self-hosted folding aligned with the currently shipped YasOS libm. */
-    {"sin", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = sin}},
-    {"fabs", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = fabs}},
-    {"sinf", 1, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f1_f = sinf}},
+    /* On YasOS the dynamic loader (yasld) does not relocate function pointers
+       stored in static data initialisers.  Keep only metadata here; the actual
+       function pointers are resolved at runtime in try_fold_math_call(). */
+    {"sin", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = 0}},
+    {"fabs", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = 0}},
+    {"sinf", 1, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f1_f = 0}},
 #else
     /* Double-precision functions */
     {"sin", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = sin}},
@@ -1645,6 +1647,33 @@ static int try_fold_math_call(const char *func_name, SValue *args, int nb_args)
   if (!fmf)
     return 0;
 
+#ifdef TARGETOS_YasOS
+  /* On YasOS, function pointers in static data are not relocated by yasld.
+     Resolve them here at runtime via direct calls instead. */
+  union
+  {
+    double (*f1_d)(double);
+    float (*f1_f)(float);
+  } rt_func;
+
+  if (fmf->arg_type == FOLD_TYPE_DOUBLE)
+  {
+    if (strcmp(func_name, "sin") == 0)
+      rt_func.f1_d = sin;
+    else if (strcmp(func_name, "fabs") == 0)
+      rt_func.f1_d = fabs;
+    else
+      return 0;
+  }
+  else
+  {
+    if (strcmp(func_name, "sinf") == 0)
+      rt_func.f1_f = sinf;
+    else
+      return 0;
+  }
+#endif
+
   /* Check argument count */
   if (nb_args != fmf->num_args)
     return 0;
@@ -1665,7 +1694,11 @@ static int try_fold_math_call(const char *func_name, SValue *args, int nb_args)
     if (fmf->num_args == 1)
     {
       double arg = get_const_double(&args[0]);
+#ifdef TARGETOS_YasOS
+      double res = rt_func.f1_d(arg);
+#else
       double res = fmf->func.f1_d(arg);
+#endif
 
       if (fmf->ret_type == FOLD_TYPE_DOUBLE)
         result.d = res;
@@ -1689,7 +1722,11 @@ static int try_fold_math_call(const char *func_name, SValue *args, int nb_args)
     if (fmf->num_args == 1)
     {
       float arg = get_const_float(&args[0]);
+#ifdef TARGETOS_YasOS
+      float res = rt_func.f1_f(arg);
+#else
       float res = fmf->func.f1_f(arg);
+#endif
       result.f = res;
     }
     else
@@ -17204,16 +17241,195 @@ static void __attribute__((noinline)) unary_builtin_chk(void)
   }
 }
 
-ST_FUNC void unary(void)
+/* Parenthesized expression, cast, compound literal, or statement expression.
+   Extracted from unary_primary() to keep its locals out of the main frame.
+   Returns 1 for sizeof/alignof type-only operand (early return), 0 otherwise. */
+static __attribute__((noinline)) int unary_paren(void)
+{
+  int t, n, r;
+  CType type;
+  AttributeDef ad;
+
+  type.ref = NULL;
+  t = tok;
+  next();
+  /* cast ? */
+  if (parse_btype(&type, &ad, 0))
+  {
+    type_decl(&type, &ad, &n, TYPE_ABSTRACT);
+    skip(')');
+    /* check ISOC99 compound literal */
+    if (tok == '{')
+    {
+      /* data is allocated locally by default */
+      if (global_expr)
+        r = VT_CONST;
+      else
+        r = VT_LOCAL;
+      /* all except arrays are lvalues */
+      if (!(type.t & VT_ARRAY))
+        r |= VT_LVAL;
+      memset(&ad, 0, sizeof(AttributeDef));
+      decl_initializer_alloc(&type, &ad, r, 1, 0, 0);
+    }
+    else if (t == TOK_SOTYPE)
+    { /* from sizeof/alignof (...) */
+      vpush(&type);
+      return 1; /* early return - skip postfix ops */
+    }
+    else if (IS_UNION(type.t))
+    {
+      /* GCC extension: (union_type) scalar_expr */
+      unary();
+
+      if ((vtop->type.t & VT_BTYPE) == VT_STRUCT || (vtop->type.t & (VT_ARRAY | VT_VLA)))
+      {
+        gen_cast(&type);
+      }
+      else if (nocode_wanted)
+      {
+        vtop->type = type;
+      }
+      else
+      {
+        int u_align;
+        int u_size = type_size(&type, &u_align);
+        int vr_tmp;
+        int tmp_loc = get_temp_local_var(u_size, u_align, &vr_tmp);
+
+        Sym *field = type.ref->next;
+        if (field)
+          gen_cast(&field->type);
+
+        SValue dst_sv;
+        memset(&dst_sv, 0, sizeof(dst_sv));
+        dst_sv.type = vtop->type;
+        dst_sv.r = VT_LOCAL | VT_LVAL;
+        dst_sv.vr = vr_tmp;
+        dst_sv.c.i = tmp_loc;
+
+        vpushv(&dst_sv);
+        vswap();
+        vstore();
+        vtop--;
+
+        dst_sv.type = type;
+        vpushv(&dst_sv);
+      }
+    }
+    else
+    {
+      unary();
+      gen_cast(&type);
+    }
+  }
+  else if (tok == '{')
+  {
+    int saved_nocode_wanted = nocode_wanted;
+    if (CONST_WANTED && !NOEVAL_WANTED)
+      expect("constant");
+    if (0 == local_scope)
+      tcc_error("statement expression outside of function");
+    block(STMT_EXPR);
+    if (saved_nocode_wanted)
+      nocode_wanted = saved_nocode_wanted;
+    skip(')');
+  }
+  else
+  {
+    gexpr();
+    skip(')');
+  }
+  return 0;
+}
+
+/* _Generic() expression parser - extracted to reduce unary_primary() frame. */
+static __attribute__((noinline)) void unary_generic(void)
+{
+  CType controlling_type;
+  int has_default = 0;
+  int has_match = 0;
+  int learn = 0;
+  TokenString *str = NULL;
+  int saved_nocode_wanted = nocode_wanted;
+  nocode_wanted &= ~CONST_WANTED_MASK;
+
+  next();
+  skip('(');
+  expr_type(&controlling_type, expr_eq);
+  convert_parameter_type(&controlling_type);
+
+  nocode_wanted = saved_nocode_wanted;
+
+  for (;;)
+  {
+    learn = 0;
+    skip(',');
+    if (tok == TOK_DEFAULT)
+    {
+      if (has_default)
+        tcc_error("too many 'default'");
+      has_default = 1;
+      if (!has_match)
+        learn = 1;
+      next();
+    }
+    else
+    {
+      AttributeDef ad_tmp;
+      int itmp;
+      CType cur_type;
+
+      parse_btype(&cur_type, &ad_tmp, 0);
+      type_decl(&cur_type, &ad_tmp, &itmp, TYPE_ABSTRACT);
+      if (compare_types(&controlling_type, &cur_type, 0))
+      {
+        if (has_match)
+        {
+          tcc_error("type match twice");
+        }
+        has_match = 1;
+        learn = 1;
+      }
+    }
+    skip(':');
+    if (learn)
+    {
+      if (str)
+        tok_str_free(str);
+      skip_or_save_block(&str);
+    }
+    else
+    {
+      skip_or_save_block(NULL);
+    }
+    if (tok == ')')
+      break;
+  }
+  if (!str)
+  {
+    char buf[60];
+    type_to_str(buf, sizeof buf, &controlling_type, NULL);
+    tcc_error("type '%s' does not match any association", buf);
+  }
+  begin_macro(str, 1);
+  next();
+  expr_eq();
+  if (tok != TOK_EOF)
+    expect(",");
+  end_macro();
+  next();
+}
+
+/* Primary expression parser - extracted from unary() to reduce stack frame
+   size on the recursive path.  Returns 1 for early-return (sizeof/alignof
+   type-only operand), 0 otherwise. */
+static __attribute__((noinline)) int unary_primary(void)
 {
   int n, t, align, r;
   CType type;
   Sym *s;
   AttributeDef ad;
-
-  /* generate line number info */
-  if (debug_modes)
-    tcc_debug_line(tcc_state), tcc_tcov_check_line(tcc_state, 1);
 
   type.ref = NULL;
   /* XXX: GCC 2.95.3 does not generate a table although it should be
@@ -17372,114 +17588,8 @@ tok_next:
     break;
   case TOK_SOTYPE:
   case '(':
-    t = tok;
-    next();
-    /* cast ? */
-    if (parse_btype(&type, &ad, 0))
-    {
-      type_decl(&type, &ad, &n, TYPE_ABSTRACT);
-      skip(')');
-      /* check ISOC99 compound literal */
-      if (tok == '{')
-      {
-        /* data is allocated locally by default */
-        if (global_expr)
-          r = VT_CONST;
-        else
-          r = VT_LOCAL;
-        /* all except arrays are lvalues */
-        if (!(type.t & VT_ARRAY))
-          r |= VT_LVAL;
-        memset(&ad, 0, sizeof(AttributeDef));
-        decl_initializer_alloc(&type, &ad, r, 1, 0, 0);
-      }
-      else if (t == TOK_SOTYPE)
-      { /* from sizeof/alignof (...) */
-        vpush(&type);
-        return;
-      }
-      else if (IS_UNION(type.t))
-      {
-        /* GCC extension: (union_type) scalar_expr
-         * Allocate a local temp for the union, store the scalar into
-         * the first union member whose type is compatible, and push
-         * the union temp as an lvalue. */
-        unary();
-
-        /* Standard casts between compatible union types must keep the
-         * usual cast semantics.  Only apply the GCC scalar-to-union
-         * extension when the source is not already a struct/union value. */
-        if ((vtop->type.t & VT_BTYPE) == VT_STRUCT || (vtop->type.t & (VT_ARRAY | VT_VLA)))
-        {
-          gen_cast(&type);
-        }
-        else if (nocode_wanted)
-        {
-          vtop->type = type;
-        }
-        else
-        {
-          int u_align;
-          int u_size = type_size(&type, &u_align);
-          int vr_tmp;
-          int tmp_loc = get_temp_local_var(u_size, u_align, &vr_tmp);
-
-          /* Find the first union member and cast the scalar to its type */
-          Sym *field = type.ref->next;
-          if (field)
-            gen_cast(&field->type);
-
-          /* Push destination typed as the scalar/member type so vstore()
-           * emits the correct-width STORE instruction. */
-          SValue dst_sv;
-          memset(&dst_sv, 0, sizeof(dst_sv));
-          dst_sv.type = vtop->type;
-          dst_sv.r = VT_LOCAL | VT_LVAL;
-          dst_sv.vr = vr_tmp;
-          dst_sv.c.i = tmp_loc;
-
-          vpushv(&dst_sv);
-          vswap();
-          vstore();
-          vtop--;
-
-          /* Return the temp slot as a union lvalue. */
-          dst_sv.type = type;
-          vpushv(&dst_sv);
-        }
-      }
-      else
-      {
-        unary();
-        gen_cast(&type);
-      }
-    }
-    else if (tok == '{')
-    {
-      int saved_nocode_wanted = nocode_wanted;
-      if (CONST_WANTED && !NOEVAL_WANTED)
-        expect("constant");
-      if (0 == local_scope)
-        tcc_error("statement expression outside of function");
-      /* statement expression : we do not accept break/continue
-         inside as GCC does.  We do retain the nocode_wanted state,
-         as statement expressions can't ever be entered from the
-         outside, so any reactivation of code emission (from labels
-         or loop heads) can be disabled again after the end of it. */
-      block(STMT_EXPR);
-      /* If the statement expr can be entered, then we retain the current
-         nocode_wanted state (from e.g. a 'return 0;' in the stmt-expr).
-         If it can't be entered then the state is that from before the
-         statement expression.  */
-      if (saved_nocode_wanted)
-        nocode_wanted = saved_nocode_wanted;
-      skip(')');
-    }
-    else
-    {
-      gexpr();
-      skip(')');
-    }
+    if (unary_paren())
+      return 1;
     break;
   case '*':
     next();
@@ -18705,82 +18815,8 @@ tok_next:
     break;
 
   case TOK_GENERIC:
-  {
-    CType controlling_type;
-    int has_default = 0;
-    int has_match = 0;
-    int learn = 0;
-    TokenString *str = NULL;
-    int saved_nocode_wanted = nocode_wanted;
-    nocode_wanted &= ~CONST_WANTED_MASK;
-
-    next();
-    skip('(');
-    expr_type(&controlling_type, expr_eq);
-    convert_parameter_type(&controlling_type);
-
-    nocode_wanted = saved_nocode_wanted;
-
-    for (;;)
-    {
-      learn = 0;
-      skip(',');
-      if (tok == TOK_DEFAULT)
-      {
-        if (has_default)
-          tcc_error("too many 'default'");
-        has_default = 1;
-        if (!has_match)
-          learn = 1;
-        next();
-      }
-      else
-      {
-        AttributeDef ad_tmp;
-        int itmp;
-        CType cur_type;
-
-        parse_btype(&cur_type, &ad_tmp, 0);
-        type_decl(&cur_type, &ad_tmp, &itmp, TYPE_ABSTRACT);
-        if (compare_types(&controlling_type, &cur_type, 0))
-        {
-          if (has_match)
-          {
-            tcc_error("type match twice");
-          }
-          has_match = 1;
-          learn = 1;
-        }
-      }
-      skip(':');
-      if (learn)
-      {
-        if (str)
-          tok_str_free(str);
-        skip_or_save_block(&str);
-      }
-      else
-      {
-        skip_or_save_block(NULL);
-      }
-      if (tok == ')')
-        break;
-    }
-    if (!str)
-    {
-      char buf[60];
-      type_to_str(buf, sizeof buf, &controlling_type, NULL);
-      tcc_error("type '%s' does not match any association", buf);
-    }
-    begin_macro(str, 1);
-    next();
-    expr_eq();
-    if (tok != TOK_EOF)
-      expect(",");
-    end_macro();
-    next();
+    unary_generic();
     break;
-  }
   // special qnan , snan and infinity values
   case TOK___NAN__:
     n = 0x7fc00000;
@@ -18964,7 +19000,121 @@ tok_next:
 
     break;
   }
+  return 0;
+}
 
+ST_FUNC void unary(void)
+{
+  Sym *s;
+
+  /* generate line number info */
+  if (debug_modes)
+    tcc_debug_line(tcc_state), tcc_tcov_check_line(tcc_state, 1);
+
+  /* Handle simple prefix operators directly to avoid entering
+     unary_primary()'s large stack frame on the recursive path. */
+  switch (tok)
+  {
+  case '*':
+    next();
+    unary();
+    indir();
+    goto postfix;
+  case '!':
+    next();
+    unary();
+    gen_test_zero(TOK_EQ);
+    goto postfix;
+  case TOK_INC:
+  case TOK_DEC:
+  {
+    int t = tok;
+    next();
+    unary();
+    inc(0, t);
+  }
+    goto postfix;
+  case '-':
+    next();
+    unary();
+    if (is_float(vtop->type.t))
+    {
+      gen_opif(TOK_NEG);
+    }
+    else
+    {
+      vpushi(0);
+      vswap();
+      gen_op('-');
+    }
+    goto postfix;
+  case '~':
+    next();
+    unary();
+    if (vtop->type.t & VT_COMPLEX)
+    {
+      gen_complex_conjugate();
+    }
+    else
+    {
+      vpushi(-1);
+      gen_op('^');
+    }
+    goto postfix;
+  case '+':
+    next();
+    unary();
+    if ((vtop->type.t & VT_BTYPE) == VT_PTR)
+      tcc_error("pointer not accepted for unary plus");
+    if (!is_float(vtop->type.t))
+    {
+      vpushi(0);
+      gen_op('+');
+    }
+    goto postfix;
+  case '&':
+    next();
+    unary();
+    if ((vtop->type.t & VT_BTYPE) != VT_FUNC && !(vtop->type.t & (VT_ARRAY | VT_VLA)))
+    {
+      if (!(vtop->r & VT_LVAL) && (vtop->r & VT_VALMASK) == VT_CONST && vtop->sym != NULL)
+      {
+        vtop->r = VT_LVAL | VT_CONST | VT_SYM;
+        vtop->c.i = 0;
+        vtop->type = vtop->sym->type;
+        vtop->vr = -1;
+      }
+      test_lvalue();
+    }
+    if (vtop->sym)
+    {
+      vtop->sym->a.addrtaken = 1;
+      tcc_ir_set_addrtaken(tcc_state->ir, vtop->sym->vreg);
+      if (vtop->sym->a.nested_func)
+        setup_nested_func_trampoline(vtop->sym);
+    }
+    {
+      int is_vla_struct_local = struct_has_vla_member(&vtop->type) && (vtop->r & VT_VALMASK) == VT_LOCAL;
+      mk_pointer(&vtop->type);
+      if (!is_vla_struct_local)
+      {
+        gaddrof();
+      }
+    }
+    goto postfix;
+  case TOK_SOTYPE:
+  case '(':
+    if (unary_paren())
+      return;
+    goto postfix;
+  default:
+    break;
+  }
+
+  if (unary_primary())
+    return;
+
+postfix:
   /* post operations */
   while (1)
   {
@@ -19426,7 +19576,12 @@ static int is_cond_bool(SValue *sv)
   return 0;
 }
 
-static void expr_cond(void)
+static void expr_cond(void);
+
+/* Ternary conditional (?:) handler - extracted from expr_cond() to reduce
+   stack frame size on the recursive path. Called after '?' has been seen
+   and next() consumed it. */
+static __attribute__((noinline)) void expr_cond_ternary(void)
 {
   int tt, u, r1, r2, rc, t1, t2, islv, c, g;
   SValue sv;
@@ -19434,222 +19589,227 @@ static void expr_cond(void)
   unsigned long long false_max = 0, false_strlen = 0, true_max = 0, true_strlen = 0;
   int false_max_valid = 0, false_strlen_valid = 0, true_max_valid = 0, true_strlen_valid = 0;
 
+  c = condition_3way();
+  g = (tok == ':' && gnu_ext);
+  tt = -1; /* -1 = no chain */
+  if (!g)
+  {
+    if (c < 0)
+    {
+      tt = tcc_ir_codegen_test_gen(tcc_state->ir, 1, -1);
+    }
+    else
+    {
+      vpop();
+    }
+  }
+  else if (c < 0)
+  {
+    /* needed to avoid having different registers saved in
+       each branch */
+    gv_dup();
+    tt = tcc_ir_codegen_test_gen(tcc_state->ir, 0, -1);
+  }
+
+  if (c == 0)
+    nocode_wanted++;
+  if (!g)
+    gexpr();
+
+  if ((vtop->type.t & VT_BTYPE) == VT_FUNC)
+    mk_pointer(&vtop->type);
+  sv = *vtop; /* save value to handle it later */
+  vtop--;     /* no vpop so that FP stack is not flushed */
+  print_vstack("expr_cond");
+
+  if (g)
+  {
+    u = tt;
+  }
+  else if (c < 0)
+  {
+    u = gjmp(-1); /* -1 = no chain */
+    tcc_ir_backpatch_to_here(tcc_state->ir, tt);
+  }
+  else
+    u = -1; /* -1 = no chain */
+
+  if (c == 0)
+    nocode_wanted--;
+  if (c == 1)
+    nocode_wanted++;
+  skip(':');
+  expr_cond();
+
+  if ((vtop->type.t & VT_BTYPE) == VT_FUNC)
+    mk_pointer(&vtop->type);
+
+  /* cast operands to correct type according to ISOC rules */
+  if (!combine_types(&type, &sv, vtop, '?'))
+    type_incompatibility_error(&sv.type, &vtop->type, "type mismatch in conditional expression (have '%s' and '%s')");
+
+  if (c < 0 && is_cond_bool(vtop) && is_cond_bool(&sv))
+  {
+    /* optimize "if (f ? a > b : c || d) ..." for example, where normally
+       "a < b" and "c || d" would be forced to "(int)0/1" first, whereas
+       this code jumps directly to the if's then/else branches. */
+    t1 = tcc_ir_codegen_test_gen(tcc_state->ir, 0, -1);
+    t2 = gjmp(-1); /* -1 = no chain */
+    tcc_ir_backpatch_to_here(tcc_state->ir, u);
+    vpushv(&sv);
+    /* combine jump targets of 2nd op with VT_CMP of 1st op */
+    gvtst_set(0, t1);
+    gvtst_set(1, t2);
+    gen_cast(&type);
+    //  tcc_warning("two conditions expr_cond");
+    return;
+  }
+
+  /* keep structs lvalue by transforming `(expr ? a : b)` to `*(expr ? &a :
+    &b)` so that `(expr ? a : b).mem` does not error with "lvalue expected".
+    If the condition is statically false (c == 0), the expression reduces to
+    the selected operand and is already a proper lvalue, so skip this
+    transformation (otherwise we'd call indir() on a non-pointer). */
+  islv = (c != 0) && (vtop->r & VT_LVAL) && (sv.r & VT_LVAL) && VT_STRUCT == (type.t & VT_BTYPE);
+
+  if (c != 0)
+  {
+    /* Arrays must decay to pointers BEFORE gen_cast overwrites the type.
+       gen_cast converts array type to pointer type but doesn't compute the
+       address. If we don't decay here, the VT_ARRAY flag is lost and later
+       gv() won't recognize it needs to call gaddrof().
+
+       Note: Local arrays are stored without VT_LVAL in the symbol table
+       (they decay to pointers immediately). So we check for VT_ARRAY
+       regardless of VT_LVAL for locals. */
+    int is_local_array = ((vtop->r & VT_VALMASK) == VT_LOCAL) && (vtop->type.t & VT_ARRAY);
+    int is_lval_array = (vtop->r & VT_LVAL) && (vtop->type.t & VT_ARRAY);
+    if (is_lval_array || is_local_array)
+    {
+      /* For local arrays without VT_LVAL, temporarily set it for gaddrof */
+      if (is_local_array && !(vtop->r & VT_LVAL))
+        vtop->r |= VT_LVAL;
+      gaddrof();
+      vtop->type.t &= ~VT_ARRAY;
+    }
+    gen_cast(&type);
+    if (islv)
+    {
+      mk_pointer(&vtop->type);
+      gaddrof();
+    }
+    else if (VT_STRUCT == (vtop->type.t & VT_BTYPE))
+      gaddrof();
+  }
+  else
+  {
+    /* Even if the condition is a compile-time constant, the conditional
+       operator's result type is determined from both operands.
+       Do not reduce `0 ? a : b` to just `b`'s type; this breaks sizeof/_Generic.
+       Cast the selected (false) operand to the combined result type.
+       Keep struct lvalues untouched (no &/ * transformation) in this case. */
+    /* Arrays must decay here too */
+    if ((vtop->r & VT_LVAL) && (vtop->type.t & VT_ARRAY))
+    {
+      gaddrof();
+      vtop->type.t &= ~VT_ARRAY;
+    }
+    gen_cast(&type);
+  }
+
+  rc = RC_TYPE(type.t);
+
+  tt = r2 = 0;
+  int false_vreg = 0; /* Save false branch vreg for IR mode */
+  if (c < 0)
+  {
+    false_max_valid = svalue_get_conservative_max_u64(vtop, &false_max);
+    false_strlen_valid = svalue_get_conservative_string_bytes_u64(vtop, &false_strlen);
+    r2 = gv(rc);
+    false_vreg = vtop->vr; /* Save the false branch's vreg */
+    tt = gjmp(-1);         /* -1 = no chain */
+  }
+  tcc_ir_backpatch_to_here(tcc_state->ir, u);
+  if (c == 1)
+    nocode_wanted--;
+
+  /* this is horrible, but we must also convert first
+     operand */
+  if (c != 0)
+  {
+    *vtop = sv;
+    /* Arrays must decay to pointers BEFORE gen_cast overwrites the type.
+       Same logic as for the false branch - handle local arrays without VT_LVAL. */
+    int is_local_array = ((vtop->r & VT_VALMASK) == VT_LOCAL) && (vtop->type.t & VT_ARRAY);
+    int is_lval_array = (vtop->r & VT_LVAL) && (vtop->type.t & VT_ARRAY);
+    if (is_lval_array || is_local_array)
+    {
+      /* For local arrays without VT_LVAL, temporarily set it for gaddrof */
+      if (is_local_array && !(vtop->r & VT_LVAL))
+        vtop->r |= VT_LVAL;
+      gaddrof();
+      vtop->type.t &= ~VT_ARRAY;
+    }
+    gen_cast(&type);
+    if (islv)
+    {
+      mk_pointer(&vtop->type);
+      gaddrof();
+    }
+    else if (VT_STRUCT == (vtop->type.t & VT_BTYPE))
+      gaddrof();
+  }
+
+  if (c < 0)
+  {
+    true_max_valid = svalue_get_conservative_max_u64(vtop, &true_max);
+    true_strlen_valid = svalue_get_conservative_string_bytes_u64(vtop, &true_strlen);
+    r1 = gv(rc);
+    /* For IR mode: after both branches are materialized, we need to ensure
+     * they converge to the same vreg at the merge point.
+     * Generate ASSIGN from true_vreg to false_vreg (which is used at merge). */
+    int true_vreg = vtop->vr;
+    int true_vreg_valid =
+        (true_vreg != -1) && (TCCIR_DECODE_VREG_TYPE(true_vreg) >= 1) && (TCCIR_DECODE_VREG_TYPE(true_vreg) <= 3);
+    int false_vreg_valid =
+        (false_vreg != -1) && (TCCIR_DECODE_VREG_TYPE(false_vreg) >= 1) && (TCCIR_DECODE_VREG_TYPE(false_vreg) <= 3);
+    if (tcc_state->ir && true_vreg_valid && false_vreg_valid && true_vreg != false_vreg)
+    {
+      /* Copy true branch result to false branch's vreg so both paths use same vreg */
+      SValue src, dest;
+      svalue_init(&src);
+      svalue_init(&dest);
+      src.vr = true_vreg;
+      src.type = vtop->type;
+      dest.vr = false_vreg;
+      dest.type = vtop->type;
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_ASSIGN, &src, NULL, &dest);
+      vtop->vr = false_vreg;
+    }
+    if (!tcc_state->ir)
+    {
+      move_reg(r2, r1, islv ? VT_PTR : type.t);
+      vtop->r = r2;
+    }
+
+    objsize_vreg_fact_record(tcc_state ? tcc_state->ir : NULL, vtop->vr, true_max_valid && false_max_valid,
+                             true_max > false_max ? true_max : false_max, true_strlen_valid && false_strlen_valid,
+                             true_strlen > false_strlen ? true_strlen : false_strlen);
+
+    tcc_ir_backpatch_to_here(tcc_state->ir, tt);
+  }
+
+  if (islv)
+    indir();
+}
+
+static void expr_cond(void)
+{
   expr_lor();
   if (tok == '?')
   {
     next();
-    c = condition_3way();
-    g = (tok == ':' && gnu_ext);
-    tt = -1; /* -1 = no chain */
-    if (!g)
-    {
-      if (c < 0)
-      {
-        tt = tcc_ir_codegen_test_gen(tcc_state->ir, 1, -1);
-      }
-      else
-      {
-        vpop();
-      }
-    }
-    else if (c < 0)
-    {
-      /* needed to avoid having different registers saved in
-         each branch */
-      gv_dup();
-      tt = tcc_ir_codegen_test_gen(tcc_state->ir, 0, -1);
-    }
-
-    if (c == 0)
-      nocode_wanted++;
-    if (!g)
-      gexpr();
-
-    if ((vtop->type.t & VT_BTYPE) == VT_FUNC)
-      mk_pointer(&vtop->type);
-    sv = *vtop; /* save value to handle it later */
-    vtop--;     /* no vpop so that FP stack is not flushed */
-    print_vstack("expr_cond");
-
-    if (g)
-    {
-      u = tt;
-    }
-    else if (c < 0)
-    {
-      u = gjmp(-1); /* -1 = no chain */
-      tcc_ir_backpatch_to_here(tcc_state->ir, tt);
-    }
-    else
-      u = -1; /* -1 = no chain */
-
-    if (c == 0)
-      nocode_wanted--;
-    if (c == 1)
-      nocode_wanted++;
-    skip(':');
-    expr_cond();
-
-    if ((vtop->type.t & VT_BTYPE) == VT_FUNC)
-      mk_pointer(&vtop->type);
-
-    /* cast operands to correct type according to ISOC rules */
-    if (!combine_types(&type, &sv, vtop, '?'))
-      type_incompatibility_error(&sv.type, &vtop->type, "type mismatch in conditional expression (have '%s' and '%s')");
-
-    if (c < 0 && is_cond_bool(vtop) && is_cond_bool(&sv))
-    {
-      /* optimize "if (f ? a > b : c || d) ..." for example, where normally
-         "a < b" and "c || d" would be forced to "(int)0/1" first, whereas
-         this code jumps directly to the if's then/else branches. */
-      t1 = tcc_ir_codegen_test_gen(tcc_state->ir, 0, -1);
-      t2 = gjmp(-1); /* -1 = no chain */
-      tcc_ir_backpatch_to_here(tcc_state->ir, u);
-      vpushv(&sv);
-      /* combine jump targets of 2nd op with VT_CMP of 1st op */
-      gvtst_set(0, t1);
-      gvtst_set(1, t2);
-      gen_cast(&type);
-      //  tcc_warning("two conditions expr_cond");
-      return;
-    }
-
-    /* keep structs lvalue by transforming `(expr ? a : b)` to `*(expr ? &a :
-      &b)` so that `(expr ? a : b).mem` does not error with "lvalue expected".
-      If the condition is statically false (c == 0), the expression reduces to
-      the selected operand and is already a proper lvalue, so skip this
-      transformation (otherwise we'd call indir() on a non-pointer). */
-    islv = (c != 0) && (vtop->r & VT_LVAL) && (sv.r & VT_LVAL) && VT_STRUCT == (type.t & VT_BTYPE);
-
-    if (c != 0)
-    {
-      /* Arrays must decay to pointers BEFORE gen_cast overwrites the type.
-         gen_cast converts array type to pointer type but doesn't compute the
-         address. If we don't decay here, the VT_ARRAY flag is lost and later
-         gv() won't recognize it needs to call gaddrof().
-
-         Note: Local arrays are stored without VT_LVAL in the symbol table
-         (they decay to pointers immediately). So we check for VT_ARRAY
-         regardless of VT_LVAL for locals. */
-      int is_local_array = ((vtop->r & VT_VALMASK) == VT_LOCAL) && (vtop->type.t & VT_ARRAY);
-      int is_lval_array = (vtop->r & VT_LVAL) && (vtop->type.t & VT_ARRAY);
-      if (is_lval_array || is_local_array)
-      {
-        /* For local arrays without VT_LVAL, temporarily set it for gaddrof */
-        if (is_local_array && !(vtop->r & VT_LVAL))
-          vtop->r |= VT_LVAL;
-        gaddrof();
-        vtop->type.t &= ~VT_ARRAY;
-      }
-      gen_cast(&type);
-      if (islv)
-      {
-        mk_pointer(&vtop->type);
-        gaddrof();
-      }
-      else if (VT_STRUCT == (vtop->type.t & VT_BTYPE))
-        gaddrof();
-    }
-    else
-    {
-      /* Even if the condition is a compile-time constant, the conditional
-         operator's result type is determined from both operands.
-         Do not reduce `0 ? a : b` to just `b`'s type; this breaks sizeof/_Generic.
-         Cast the selected (false) operand to the combined result type.
-         Keep struct lvalues untouched (no &/ * transformation) in this case. */
-      /* Arrays must decay here too */
-      if ((vtop->r & VT_LVAL) && (vtop->type.t & VT_ARRAY))
-      {
-        gaddrof();
-        vtop->type.t &= ~VT_ARRAY;
-      }
-      gen_cast(&type);
-    }
-
-    rc = RC_TYPE(type.t);
-
-    tt = r2 = 0;
-    int false_vreg = 0; /* Save false branch vreg for IR mode */
-    if (c < 0)
-    {
-      false_max_valid = svalue_get_conservative_max_u64(vtop, &false_max);
-      false_strlen_valid = svalue_get_conservative_string_bytes_u64(vtop, &false_strlen);
-      r2 = gv(rc);
-      false_vreg = vtop->vr; /* Save the false branch's vreg */
-      tt = gjmp(-1);         /* -1 = no chain */
-    }
-    tcc_ir_backpatch_to_here(tcc_state->ir, u);
-    if (c == 1)
-      nocode_wanted--;
-
-    /* this is horrible, but we must also convert first
-       operand */
-    if (c != 0)
-    {
-      *vtop = sv;
-      /* Arrays must decay to pointers BEFORE gen_cast overwrites the type.
-         Same logic as for the false branch - handle local arrays without VT_LVAL. */
-      int is_local_array = ((vtop->r & VT_VALMASK) == VT_LOCAL) && (vtop->type.t & VT_ARRAY);
-      int is_lval_array = (vtop->r & VT_LVAL) && (vtop->type.t & VT_ARRAY);
-      if (is_lval_array || is_local_array)
-      {
-        /* For local arrays without VT_LVAL, temporarily set it for gaddrof */
-        if (is_local_array && !(vtop->r & VT_LVAL))
-          vtop->r |= VT_LVAL;
-        gaddrof();
-        vtop->type.t &= ~VT_ARRAY;
-      }
-      gen_cast(&type);
-      if (islv)
-      {
-        mk_pointer(&vtop->type);
-        gaddrof();
-      }
-      else if (VT_STRUCT == (vtop->type.t & VT_BTYPE))
-        gaddrof();
-    }
-
-    if (c < 0)
-    {
-      true_max_valid = svalue_get_conservative_max_u64(vtop, &true_max);
-      true_strlen_valid = svalue_get_conservative_string_bytes_u64(vtop, &true_strlen);
-      r1 = gv(rc);
-      /* For IR mode: after both branches are materialized, we need to ensure
-       * they converge to the same vreg at the merge point.
-       * Generate ASSIGN from true_vreg to false_vreg (which is used at merge). */
-      int true_vreg = vtop->vr;
-      int true_vreg_valid =
-          (true_vreg != -1) && (TCCIR_DECODE_VREG_TYPE(true_vreg) >= 1) && (TCCIR_DECODE_VREG_TYPE(true_vreg) <= 3);
-      int false_vreg_valid =
-          (false_vreg != -1) && (TCCIR_DECODE_VREG_TYPE(false_vreg) >= 1) && (TCCIR_DECODE_VREG_TYPE(false_vreg) <= 3);
-      if (tcc_state->ir && true_vreg_valid && false_vreg_valid && true_vreg != false_vreg)
-      {
-        /* Copy true branch result to false branch's vreg so both paths use same vreg */
-        SValue src, dest;
-        svalue_init(&src);
-        svalue_init(&dest);
-        src.vr = true_vreg;
-        src.type = vtop->type;
-        dest.vr = false_vreg;
-        dest.type = vtop->type;
-        tcc_ir_put(tcc_state->ir, TCCIR_OP_ASSIGN, &src, NULL, &dest);
-        vtop->vr = false_vreg;
-      }
-      if (!tcc_state->ir)
-      {
-        move_reg(r2, r1, islv ? VT_PTR : type.t);
-        vtop->r = r2;
-      }
-
-      objsize_vreg_fact_record(tcc_state ? tcc_state->ir : NULL, vtop->vr, true_max_valid && false_max_valid,
-                               true_max > false_max ? true_max : false_max, true_strlen_valid && false_strlen_valid,
-                               true_strlen > false_strlen ? true_strlen : false_strlen);
-
-      tcc_ir_backpatch_to_here(tcc_state->ir, tt);
-    }
-
-    if (islv)
-      indir();
+    expr_cond_ternary();
   }
 }
 
@@ -19909,6 +20069,11 @@ static void gfunc_return(CType *func_type)
       }
       gv(rc);
       vtop -= ret_nregs - 1;
+      /* Emit RETURNVALUE so the IR codegen knows to place the loaded
+         value into the return register (r0).  Without this the vreg
+         produced by gv() is never connected to the physical return
+         register and the caller receives garbage. */
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_RETURNVALUE, vtop, NULL, NULL);
     }
   }
   else

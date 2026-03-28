@@ -78,6 +78,7 @@ typedef struct __attribute__((packed)) YaffLookupEntry {
 
 typedef struct __attribute__((packed)) YaffSymbolEntry {
   uint32_t section : 2;
-  uint32_t offset : 30;
+  uint32_t weak : 1;
+  uint32_t offset : 29;
   char name[0];
 } YaffSymbolEntry;

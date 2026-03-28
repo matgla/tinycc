@@ -135,7 +135,8 @@ ST_FUNC int tcc_load_yaff(TCCState *s1, int fd, const char *filename, int level)
     {
       return tcc_error_noabort("symbol entry too long");
     }
-    set_elf_sym(s1->dynsymtab_section, entry->offset, 1, STB_GLOBAL << 4, STV_DEFAULT, 1, entry->name);
+    set_elf_sym(s1->dynsymtab_section, entry->offset, 1, (entry->weak ? STB_WEAK : STB_GLOBAL) << 4, STV_DEFAULT, 1,
+                entry->name);
     offset += sizeof(uint32_t) + len + 1;
     offset = tcc_yaff_align(&header, offset);
   }
@@ -191,8 +192,10 @@ static int tcc_yaff_write_local_relocations(TCCState *s1, FILE *f)
     uint32_t got_offset = rel->r_offset - s1->got->sh_addr;
     /* Resolved address written by fill_local_got_entries() */
     uint32_t sym_value = read32le(s1->got->data + got_offset);
+    /* Symbol type saved by fill_local_got_entries() in the second word */
+    uint32_t sym_type = read32le(s1->got->data + got_offset + PTR_SIZE);
 
-    YAFF_DEBUG("[YAFF]   R_RELATIVE: got_offset=0x%x, sym_value=0x%x\n", got_offset, sym_value);
+    YAFF_DEBUG("[YAFF]   R_RELATIVE: got_offset=0x%x, sym_value=0x%x, sym_type=%u\n", got_offset, sym_value, sym_type);
 
     /* Determine which section this address belongs to */
     int section;
@@ -217,6 +220,17 @@ static int tcc_yaff_write_local_relocations(TCCState *s1, FILE *f)
       YAFF_DEBUG("[YAFF]   WARNING: sym_value 0x%x doesn't fall in any known section!\n", sym_value);
       section = YAFF_SECTION_DATA;
       target_offset = sym_value;
+    }
+
+    /* Code-section entries that are NOT function pointers (e.g. labels from
+       goto *&&label) must not be wrapped in thunks by the dynamic loader.
+       Skip emitting a local relocation for them — the loader's Phase A
+       (GOT value resolution) will resolve the raw file offset stored in
+       the GOT data and set the Thumb bit for code addresses. */
+    if (section == YAFF_SECTION_CODE && sym_type != STT_FUNC)
+    {
+      YAFF_DEBUG("[YAFF]   skipping non-function code address (sym_type=%u) for GOT[%u]\n", sym_type, got_offset / 8);
+      continue;
     }
 
     YAFF_DEBUG("[YAFF]   -> section=%s, index=%u, target_offset=0x%x\n", section == YAFF_SECTION_CODE ? "CODE" : "DATA",
@@ -369,15 +383,35 @@ static int tcc_yaff_write_symbol_table_relocations(TCCState *s1, FILE *f)
 {
   int i;
   Section *s;
-  ElfW(Sym) * sym;
   int number_of_symbol_table_relocations = 0;
-  int number_of_imported_symbols = 0;
 
-  for_each_elem(s1->dynsym, 1, sym, ElfW(Sym))
+  int dynsym_count = s1->dynsym->data_offset / sizeof(ElfW(Sym));
+
+  /* Pre-build index maps: for each dynsym entry, compute its 1-based
+   * index in the imported or exported symbols table.  This correctly
+   * handles interleaved import/export ordering in dynsym, where the
+   * old formula (symbol_index - 1 - number_of_imported) assumed all
+   * imports precede all exports. */
+  int *imported_idx = tcc_mallocz(dynsym_count * sizeof(int));
+  int *exported_idx = tcc_mallocz(dynsym_count * sizeof(int));
   {
-    if (sym->st_shndx == SHN_UNDEF)
+    int imp_count = 0, exp_count = 0;
+    for (int idx = 1; idx < dynsym_count; idx++)
     {
-      ++number_of_imported_symbols;
+      ElfW(Sym) *ds = &((ElfW(Sym) *)s1->dynsym->data)[idx];
+      if (ds->st_shndx == SHN_UNDEF)
+      {
+        imported_idx[idx] = ++imp_count;
+      }
+      else
+      {
+        unsigned vis = ELFW(ST_VISIBILITY)(ds->st_other);
+        unsigned bind = ELFW(ST_BIND)(ds->st_info);
+        if ((bind == STB_GLOBAL || bind == STB_WEAK) && (vis == STV_DEFAULT || vis == STV_PROTECTED))
+        {
+          exported_idx[idx] = ++exp_count;
+        }
+      }
     }
   }
 
@@ -387,8 +421,13 @@ static int tcc_yaff_write_symbol_table_relocations(TCCState *s1, FILE *f)
    * TCC_OUTPUT_OBJ mode, so the GLOB_DAT handler below can no longer
    * rely solely on st_info to detect function pointers.  Symbols that
    * appear in both JUMP_SLOT (direct call) and GLOB_DAT (address taken)
-   * are functions whose GLOB_DAT entry needs a thunk. */
-  int dynsym_count = s1->dynsym->data_offset / sizeof(ElfW(Sym));
+   * are functions whose GLOB_DAT entry needs a thunk.
+   *
+   * NOTE: This heuristic is only applied to imported (undefined) symbols.
+   * Exported symbols retain their correct st_info type, so STT_FUNC alone
+   * suffices.  Without this guard, linker boundary symbols (__start_xxx,
+   * __stop_xxx) which are STT_NOTYPE but may share a dynsym index space
+   * with JUMP_SLOT entries get incorrectly marked as function pointers. */
   unsigned char *has_jump_slot = tcc_mallocz(dynsym_count);
   for (int j = 0; j < s1->nb_sections; ++j)
   {
@@ -442,23 +481,18 @@ static int tcc_yaff_write_symbol_table_relocations(TCCState *s1, FILE *f)
           {
             // this is exported symbol
             int is_exported = (sym->st_shndx != SHN_UNDEF);
-            int symbol_table_index = symbol_index - 1;
             int is_function_pointer = 0;
             if (type == R_ARM_GLOB_DAT &&
                 (ELFW(ST_TYPE)(sym->st_info) == STT_FUNC ||
-                 (has_jump_slot && symbol_index < dynsym_count && has_jump_slot[symbol_index])))
+                 (!is_exported && has_jump_slot && symbol_index < dynsym_count && has_jump_slot[symbol_index])))
             {
               is_function_pointer = 1;
-            }
-            if (is_exported)
-            {
-              symbol_table_index = symbol_index - 1 - number_of_imported_symbols;
             }
             entry = (YaffSymbolTableRelocationEntry){
                 .is_exported_symbol = is_exported,
                 .index = (rel->r_offset - s1->got->sh_addr) / 8,
                 .function_pointer = is_function_pointer,
-                .symbol_index = symbol_table_index + 1,
+                .symbol_index = is_exported ? exported_idx[symbol_index] : imported_idx[symbol_index],
             };
             fwrite(&entry, 1, sizeof(entry), f);
             ++number_of_symbol_table_relocations;
@@ -489,6 +523,8 @@ static int tcc_yaff_write_symbol_table_relocations(TCCState *s1, FILE *f)
     }
   }
   tcc_free(has_jump_slot);
+  tcc_free(imported_idx);
+  tcc_free(exported_idx);
   return number_of_symbol_table_relocations;
 }
 
@@ -517,6 +553,7 @@ static int tcc_yaff_write_imported_symbols(TCCState *s1, FILE *f, YaffHeader *h)
     }
     entry = (YaffSymbolEntry){
         .section = 0,
+        .weak = (ELFW(ST_BIND)(sym->st_info) == STB_WEAK) ? 1 : 0,
         .offset = sym->st_value,
     };
 
@@ -582,6 +619,7 @@ static int tcc_yaff_write_exported_symbols(TCCState *s1, FILE *f, YaffHeader *h)
     }
     entry = (YaffSymbolEntry){
         .section = section_code,
+        .weak = (bind == STB_WEAK) ? 1 : 0,
         .offset = offset,
     };
     number_of_exported_symbols++;
@@ -659,6 +697,147 @@ static void tcc_yaff_write_exported_symbols_lookup(TCCState *s1, FILE *f, YaffHe
     aligned_name_len = tcc_yaff_align(h, name_len);
     current_offset += sizeof(uint32_t) + aligned_name_len;
     fwrite(&entry, sizeof(entry), 1, f);
+  }
+}
+
+/* Merge .init_array and .fini_array sections into .data for YAFF output.
+ *
+ * After relocate_sections() has resolved all relocations, the .init_array
+ * and .fini_array sections contain absolute ELF virtual addresses of
+ * constructor/destructor functions.  We append this data to the .data
+ * section so that:
+ *  1. The existing YAFF data-relocation mechanism produces runtime fixups
+ *     for each function pointer.
+ *  2. Boundary symbols (__init_array_start/end, __fini_array_start/end)
+ *     let the CRT iterate the arrays at startup/shutdown.
+ */
+/* Merge .init_array / .fini_array into .data BEFORE GOT building and
+ * relocation so that:
+ *   - relocations are applied naturally by relocate_sections()
+ *   - YAFF data relocation entries are generated automatically
+ *   - the __yaff_initfini symbol uses the R_RELATIVE (local) GOT path
+ *
+ * Layout appended to data_section:
+ *   [uint32_t init_count][uint32_t fini_count][init func ptrs...][fini func ptrs...]
+ *
+ * A LOCAL symbol __yaff_initfini is defined pointing to this struct so that
+ * crt1.c can find it via a GOT-indirect access through a local relocation. */
+ST_FUNC void tcc_yaff_prepare_init_fini(TCCState *s1)
+{
+  Section *ia = NULL, *fa = NULL;
+  int i;
+
+  /* Find .init_array / .fini_array by section type */
+  for (i = 1; i < s1->nb_sections; ++i)
+  {
+    if (s1->sections[i]->sh_type == SHT_INIT_ARRAY)
+      ia = s1->sections[i];
+    else if (s1->sections[i]->sh_type == SHT_FINI_ARRAY)
+      fa = s1->sections[i];
+  }
+
+  uint32_t ia_count = ia ? ia->data_offset / PTR_SIZE : 0;
+  uint32_t fa_count = fa ? fa->data_offset / PTR_SIZE : 0;
+
+  /* Record where the struct will land inside data_section */
+  uint32_t struct_offset = data_section->data_offset;
+
+  /* Write header: init_count, fini_count */
+  {
+    uint8_t *hdr = section_ptr_add(data_section, 2 * sizeof(uint32_t));
+    write32le(hdr, ia_count);
+    write32le(hdr + sizeof(uint32_t), fa_count);
+  }
+
+  /* Append .init_array function pointers */
+  uint32_t init_data_offset = data_section->data_offset;
+  if (ia && ia->data_offset)
+  {
+    uint8_t *dst = section_ptr_add(data_section, ia->data_offset);
+    memcpy(dst, ia->data, ia->data_offset);
+    /* Copy relocations with adjusted offsets */
+    if (ia->reloc)
+    {
+      ElfW_Rel *rel;
+      for_each_elem(ia->reloc, 0, rel, ElfW_Rel)
+      {
+        put_elf_reloc(s1->symtab, data_section, init_data_offset + rel->r_offset, ELFW(R_TYPE)(rel->r_info),
+                      ELFW(R_SYM)(rel->r_info));
+      }
+    }
+  }
+
+  /* Append .fini_array function pointers */
+  uint32_t fini_data_offset = data_section->data_offset;
+  if (fa && fa->data_offset)
+  {
+    uint8_t *dst = section_ptr_add(data_section, fa->data_offset);
+    memcpy(dst, fa->data, fa->data_offset);
+    if (fa->reloc)
+    {
+      ElfW_Rel *rel;
+      for_each_elem(fa->reloc, 0, rel, ElfW_Rel)
+      {
+        put_elf_reloc(s1->symtab, data_section, fini_data_offset + rel->r_offset, ELFW(R_TYPE)(rel->r_info),
+                      ELFW(R_SYM)(rel->r_info));
+      }
+    }
+  }
+
+  /* Define __yaff_initfini as a LOCAL symbol in symtab.
+   * If crt1.o already declared it as extern (STB_GLOBAL, SHN_UNDEF),
+   * convert it to LOCAL + defined so that build_got_entries() will
+   * use the R_RELATIVE (local relocation) path for its GOT entry.
+   *
+   * We do a linear scan instead of find_elf_sym() because the hash
+   * table only indexes non-LOCAL symbols and we need to catch every
+   * entry (there may be more than one if multiple object files
+   * reference the name). */
+  {
+    int nb_syms = s1->symtab->data_offset / sizeof(ElfW(Sym));
+    int found = 0;
+    for (i = 1; i < nb_syms; ++i)
+    {
+      ElfW(Sym) *sym = &((ElfW(Sym) *)s1->symtab->data)[i];
+      const char *sname = (char *)s1->symtab->link->data + sym->st_name;
+      if (!strcmp(sname, "__yaff_initfini"))
+      {
+        sym->st_info = ELFW(ST_INFO)(STB_LOCAL, STT_OBJECT);
+        sym->st_value = struct_offset;
+        sym->st_size = data_section->data_offset - struct_offset;
+        sym->st_shndx = data_section->sh_num;
+        found = 1;
+      }
+    }
+    if (!found)
+    {
+      put_elf_sym(s1->symtab, struct_offset, data_section->data_offset - struct_offset,
+                  ELFW(ST_INFO)(STB_LOCAL, STT_OBJECT), 0, data_section->sh_num, "__yaff_initfini");
+    }
+  }
+
+  /* Suppress the original .init_array / .fini_array sections so they
+   * don't get laid out or produce duplicate relocations.  Clear the
+   * type so they're ignored by section iterators. */
+  if (ia)
+  {
+    ia->sh_type = SHT_NULL;
+    ia->sh_flags = 0;
+    if (ia->reloc)
+    {
+      ia->reloc->sh_type = SHT_NULL;
+      ia->reloc->sh_flags = 0;
+    }
+  }
+  if (fa)
+  {
+    fa->sh_type = SHT_NULL;
+    fa->sh_flags = 0;
+    if (fa->reloc)
+    {
+      fa->reloc->sh_type = SHT_NULL;
+      fa->reloc->sh_flags = 0;
+    }
   }
 }
 

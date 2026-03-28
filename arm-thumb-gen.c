@@ -134,17 +134,10 @@ static inline Sym *validate_sym_for_reloc(Sym *sym)
     return NULL;
   /* Type descriptors (SYM_FIELD) should not be used for relocations */
   if (sym->v & SYM_FIELD)
-  {
-    fprintf(stderr, "[TCC-DIAG] validate_sym_for_reloc: sym->v=0x%x has SYM_FIELD, c=%d\n", sym->v, sym->c);
     return NULL;
-  }
   /* Symbols with c < 0 are not properly registered */
   if (sym->c < 0)
-  {
-    const char *name = get_tok_str(sym->v & ~SYM_FIELD, NULL);
-    fprintf(stderr, "[TCC-DIAG] validate_sym_for_reloc: sym '%s' has c=%d (<0)\n", name ? name : "?", sym->c);
     return NULL;
-  }
   return sym;
 }
 
@@ -2831,9 +2824,6 @@ static void load_full_const(int r, int r1, uint32_t imm_lo, uint32_t imm_hi)
       if (sym->c <= 0)
       {
         /* Registration failed - symbol can't be externalized */
-        const char *name = get_tok_str(sym->v & ~SYM_FIELD, NULL);
-        fprintf(stderr, "[TCC-DIAG] load_full_const: put_extern_sym failed for '%s', c=%d\n", name ? name : "?",
-                sym->c);
         sym = NULL;
       }
     }
@@ -2932,19 +2922,17 @@ static void load_full_const(int r, int r1, uint32_t imm_lo, uint32_t imm_hi)
           if (sym_sec && (sym_sec->sh_flags & SHF_EXECINSTR))
             sym_in_code_section = 1;
         }
-        if (sym->type.t & VT_STATIC && sym_off != cur_text_section->sh_num && !sym_in_code_section)
+        if (sym->type.t & VT_STATIC && sym_off != SHN_UNDEF && sym_off != cur_text_section->sh_num &&
+            !sym_in_code_section)
         {
-          /* Static data symbol — GOTOFF (same segment as GOT) */
+          /* Static data symbol — GOTOFF (same segment as GOT).
+           * sym_off == SHN_UNDEF means the function is forward-declared
+           * but not yet defined — we don't know its section, so we must
+           * use GOT32 (safe indirect path) instead of GOTOFF. */
           entry->relocation = R_ARM_GOTOFF;
         }
         else
         {
-          if (sym->type.t & VT_STATIC && sym_off != cur_text_section->sh_num && sym_in_code_section)
-          {
-            const char *sym_name = get_tok_str(sym->v & ~SYM_FIELD, NULL);
-            fprintf(stderr, "[TCC] static code sym '%s' in sec %d (cur %d) -> GOT32\n", sym_name ? sym_name : "?",
-                    sym_off, cur_text_section->sh_num);
-          }
           entry->relocation = R_ARM_GOT32;
         }
       }
@@ -2979,7 +2967,8 @@ static void load_full_const(int r, int r1, uint32_t imm_lo, uint32_t imm_hi)
           if (sym_sec && (sym_sec->sh_flags & SHF_EXECINSTR))
             sym_in_code_section_cg = 1;
         }
-        if (sym->type.t & VT_STATIC && sym_off != cur_text_section->sh_num && !sym_in_code_section_cg)
+        if (sym->type.t & VT_STATIC && sym_off != SHN_UNDEF && sym_off != cur_text_section->sh_num &&
+            !sym_in_code_section_cg)
         {
           /* Static data symbol — GOTOFF (add R9) */
           ot_check(th_add_reg(r, r, R9, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
@@ -3184,11 +3173,6 @@ ST_FUNC void tcc_machine_load_constant(int dest_reg, int dest_reg_high, int64_t 
       return;
     }
     /* Invalid or missing sym - fall through to treat as plain constant */
-    {
-      const char *name = get_tok_str(sym->v & ~SYM_FIELD, NULL);
-      fprintf(stderr, "[TCC-DIAG] tcc_machine_load_constant: sym '%s' failed validation, loading plain value=%lld\n",
-              name ? name : "?", (long long)value);
-    }
   }
 
   if (is_64bit)
@@ -8266,8 +8250,7 @@ static void presave_stack_args_from_arg_regs(CallGenContext *ctx)
        * must be stored to the stack before that happens. */
       int r0 = mop->u.reg.r0;
       int r1 = mop->u.reg.r1;
-      if ((thumb_is_hw_reg(r0) && r0 <= ARM_R3) ||
-          (thumb_is_hw_reg(r1) && r1 <= ARM_R3))
+      if ((thumb_is_hw_reg(r0) && r0 <= ARM_R3) || (thumb_is_hw_reg(r1) && r1 <= ARM_R3))
       {
         int stack_offset = loc->stack_off;
         if (thumb_is_hw_reg(r0))

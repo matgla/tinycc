@@ -85,6 +85,10 @@ build-shared:
 	$(FP_CC) $(FP_CFLAGS) -I$(CURDIR)/../../include -fPIC -fpic \
 		-c $(CURDIR)/../armeabi.c -o $(BUILD_DIR)/$(FPU)-pic/armeabi.o
 	$(FP_CC) -shared -fPIC -nodefaultlibs -Wl,-Ttext=0x0 -Wl,-section-alignment=0x4 \
+		-Wl,-oformat=elf32-littlearm \
+		-o $(TARGET_SO).elf $(BUILD_DIR)/$(FPU)-pic/*.o
+	@echo "Created $(TARGET_SO).elf"
+	$(FP_CC) -shared -fPIC -nodefaultlibs -Wl,-Ttext=0x0 -Wl,-section-alignment=0x4 \
 		-Wl,-oformat=yaff \
 		-o $(TARGET_SO) $(BUILD_DIR)/$(FPU)-pic/*.o
 	@echo "Created $(TARGET_SO)"
@@ -112,6 +116,7 @@ clean:
 	# Remove archives, shared libs, and compat symlinks
 	rm -f libsoftfp.a libvfpv4sp.a libvfpv5dp.a librp2350fp.a
 	rm -f libsoftfp.so libvfpv4sp.so libvfpv5dp.so librp2350fp.so
+	rm -f libsoftfp.so.elf libvfpv4sp.so.elf libvfpv5dp.so.elf librp2350fp.so.elf
 	rm -f libtcc1-fp-*.a
 
 .PHONY: all build build-shared all-variants all-shared clean

@@ -2950,6 +2950,7 @@ ST_FUNC void tcc_add_runtime(TCCState *s1)
     if (lpthread)
       tcc_add_library(s1, "pthread");
     tcc_add_library(s1, "c");
+    tcc_add_library(s1, "m");
 #ifdef TCC_LIBGCC
     if (!s1->static_link)
     {
@@ -3120,6 +3121,11 @@ static void fill_local_got_entries(TCCState *s1)
       unsigned offset = attr->got_offset;
       if (offset != rel->r_offset - s1->got->sh_addr)
         tcc_error_noabort("fill_local_got_entries: huh?");
+      /* Store the ELF symbol type (e.g. STT_FUNC vs STT_NOTYPE) in the
+         second word of the 8-byte GOT entry.  The YAFF writer reads this
+         to distinguish function pointers (which need thunks) from plain
+         code addresses such as labels used by goto *&&label.  */
+      write32le(s1->got->data + offset + PTR_SIZE, ELFW(ST_TYPE)(sym->st_info));
       rel->r_info = ELFW(R_INFO)(0, R_RELATIVE);
 #if SHT_RELX == SHT_RELA
       rel->r_addend = sym->st_value;
@@ -4549,6 +4555,15 @@ static int elf_output_file(TCCState *s1, const char *filename)
   /* if linking, also link in runtime libraries (libc, libgcc, etc.) */
   tcc_add_runtime(s1);
   resolve_common_syms(s1);
+
+#ifdef TCC_TARGET_YAFF
+  /* Merge .init_array / .fini_array into .data early — before
+     build_got_entries() — so that the __yaff_initfini symbol uses the
+     R_RELATIVE (local) GOT path, and relocations pointing into the
+     merged data are resolved naturally by relocate_sections(). */
+  if (s1->output_format == TCC_OUTPUT_FORMAT_YAFF)
+    tcc_yaff_prepare_init_fini(s1);
+#endif
 
   /* Phase 2: Garbage Collection During Loading - mark and load referenced sections */
   if (s1->gc_sections_aggressive)

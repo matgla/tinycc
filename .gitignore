@@ -3,6 +3,7 @@
 .#*
 *.o
 *.so
+*.elf
 *.a
 *.exe
 *.dll

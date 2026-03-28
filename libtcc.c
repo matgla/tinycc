@@ -771,7 +771,7 @@ LIBTCCAPI TCCState *tcc_new(void)
   s->no_pie = 0;
 #if defined(TCC_TARGET_ARM) || defined(TCC_TARGET_ARM_THUMB)
   s->float_abi = ARM_SOFTFP_FLOAT;
-  s->fpu_type = ARM_FPU_AUTO;      /* default to auto-detect */
+  s->fpu_type = ARM_FPU_AUTO; /* default to auto-detect */
 #if defined(TCC_TARGET_YASOS)
   s->text_and_data_separation = 1;
   s->pic = 1;

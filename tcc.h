@@ -2128,6 +2128,7 @@ ST_FUNC const char *macho_tbd_soname(const char *filename);
 /* ------------ tccyaff.c ------------ */
 #ifdef TCC_TARGET_YAFF
 ST_FUNC int tcc_output_yaff(TCCState *s1, FILE *f, const char *filename);
+ST_FUNC void tcc_yaff_prepare_init_fini(TCCState *s1);
 #endif
 /* ------------ tccrun.c ----------------- */
 #ifdef TCC_IS_NATIVE2
