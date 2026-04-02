@@ -1439,6 +1439,7 @@ static int tcc_assemble_internal(TCCState *s1, int do_preprocess, int global)
 ST_FUNC int tcc_assemble(TCCState *s1, int do_preprocess)
 {
   int ret;
+  arm_init(s1);
   tcc_debug_start(s1);
   /* default section is text */
   cur_text_section = text_section;

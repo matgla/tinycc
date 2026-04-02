@@ -29,16 +29,6 @@
 
 #include <math.h>
 
-// #define DEBUG_IR_GEN
-
-/* Debug output for TCCGEN FUNCPARAMVAL processing - disabled by default
- * Enable with: -DTCCGEN_DEBUG_ENABLED or #define TCCGEN_DEBUG_ENABLED */
-#ifdef TCCGEN_DEBUG_ENABLED
-#define TCCGEN_DEBUG(...) fprintf(stderr, __VA_ARGS__)
-#else
-#define TCCGEN_DEBUG(...) ((void)0)
-#endif
-
 /********************************************************/
 /* global variables */
 
@@ -115,6 +105,7 @@ ST_DATA int func_var;    /* true if current function is variadic (used by return
                             instruction) */
 ST_DATA int func_vc;
 ST_DATA int func_ind;
+ST_DATA int func_has_label_addr;
 ST_DATA const char *funcname;
 ST_DATA CType int_type, func_old_type, func_old_void_type, func_old_char_pointer_type, func_old_void_pointer_type,
     func_old_size_t_type, char_type, char_pointer_type;
@@ -409,14 +400,6 @@ typedef struct
 
 /* Table of foldable math functions */
 static const FoldableMathFunc foldable_math_funcs[] = {
-#ifdef TARGETOS_YasOS
-    /* On YasOS the dynamic loader (yasld) does not relocate function pointers
-       stored in static data initialisers.  Keep only metadata here; the actual
-       function pointers are resolved at runtime in try_fold_math_call(). */
-    {"sin", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = 0}},
-    {"fabs", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = 0}},
-    {"sinf", 1, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f1_f = 0}},
-#else
     /* Double-precision functions */
     {"sin", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = sin}},
     {"cos", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = cos}},
@@ -466,7 +449,6 @@ static const FoldableMathFunc foldable_math_funcs[] = {
     {"fabsf", 1, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f1_f = fabsf}},
     {"fmodf", 2, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f2_f = fmodf}},
     {"remainderf", 2, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f2_f = remainderf}},
-#endif
 };
 
 #define NUM_FOLDABLE_MATH_FUNCS (sizeof(foldable_math_funcs) / sizeof(foldable_math_funcs[0]))
@@ -889,6 +871,16 @@ ST_FUNC int tccgen_compile(TCCState *s1)
   tcc_debug_end(s1);
   tcc_tcov_end(s1);
   return 0;
+}
+
+static void tcc_bench_log_phase(TCCState *s1, const char *operation, const char *name, unsigned *total_time,
+                                unsigned *count, unsigned elapsed)
+{
+  if (!s1 || !s1->do_bench)
+    return;
+  *total_time += elapsed;
+  (*count)++;
+  tcc_bench_log(s1, operation, name, elapsed);
 }
 
 ST_FUNC void tccgen_finish(TCCState *s1)
@@ -1647,33 +1639,6 @@ static int try_fold_math_call(const char *func_name, SValue *args, int nb_args)
   if (!fmf)
     return 0;
 
-#ifdef TARGETOS_YasOS
-  /* On YasOS, function pointers in static data are not relocated by yasld.
-     Resolve them here at runtime via direct calls instead. */
-  union
-  {
-    double (*f1_d)(double);
-    float (*f1_f)(float);
-  } rt_func;
-
-  if (fmf->arg_type == FOLD_TYPE_DOUBLE)
-  {
-    if (strcmp(func_name, "sin") == 0)
-      rt_func.f1_d = sin;
-    else if (strcmp(func_name, "fabs") == 0)
-      rt_func.f1_d = fabs;
-    else
-      return 0;
-  }
-  else
-  {
-    if (strcmp(func_name, "sinf") == 0)
-      rt_func.f1_f = sinf;
-    else
-      return 0;
-  }
-#endif
-
   /* Check argument count */
   if (nb_args != fmf->num_args)
     return 0;
@@ -1694,11 +1659,7 @@ static int try_fold_math_call(const char *func_name, SValue *args, int nb_args)
     if (fmf->num_args == 1)
     {
       double arg = get_const_double(&args[0]);
-#ifdef TARGETOS_YasOS
-      double res = rt_func.f1_d(arg);
-#else
       double res = fmf->func.f1_d(arg);
-#endif
 
       if (fmf->ret_type == FOLD_TYPE_DOUBLE)
         result.d = res;
@@ -1722,11 +1683,7 @@ static int try_fold_math_call(const char *func_name, SValue *args, int nb_args)
     if (fmf->num_args == 1)
     {
       float arg = get_const_float(&args[0]);
-#ifdef TARGETOS_YasOS
-      float res = rt_func.f1_f(arg);
-#else
       float res = fmf->func.f1_f(arg);
-#endif
       result.f = res;
     }
     else
@@ -2135,7 +2092,14 @@ ST_FUNC Sym *get_sym_ref(CType *type, Section *sec, unsigned long offset, unsign
   v = anon_sym++;
   sym = sym_push(v, type, VT_CONST | VT_SYM, 0);
   sym->type.t |= VT_STATIC;
-  put_extern_sym(sym, sec, offset, size);
+  /* Use put_extern_sym2 directly to bypass the nocode_wanted guard in
+   * put_extern_sym.  Anonymous data symbols (string literals, float
+   * constants) must always have a valid ELF entry because the IR
+   * backend emits instructions under CODE_OFF_BIT that may reference
+   * them.  Those IR instructions are later removed by DCE, but the
+   * symbol must exist during compilation.  Under NODATA_WANTED the
+   * caller passes size=0, so no section data is wasted. */
+  put_extern_sym2(sym, sec ? sec->sh_num : SHN_UNDEF, offset, size, 1);
   return sym;
 }
 
@@ -2229,6 +2193,8 @@ static void merge_funcattr(struct FuncAttr *fa, struct FuncAttr *fa1)
     fa->func_pure = 1;
   if (fa1->func_const)
     fa->func_const = 1;
+  if (fa1->func_noinline)
+    fa->func_noinline = 1;
   if (fa1->func_no_instrument)
     fa->func_no_instrument = 1;
   /* func_rewritten_extern_inline is parser provenance for one specific
@@ -2327,7 +2293,8 @@ static void patch_type(Sym *sym, CType *type)
       sym->type.t &= ~VT_INLINE | static_proto;
     }
 
-    if (sym->type.ref->f.func_type == FUNC_OLD && type->ref->f.func_type != FUNC_OLD)
+    if (sym->type.ref->f.func_type == FUNC_OLD && type->ref->f.func_type != FUNC_OLD
+        && !local_scope)
     {
       sym->type.ref = type->ref;
     }
@@ -3617,13 +3584,13 @@ static void gen_opl(int op)
       param_num.r = VT_CONST;
       /* Generate FUNCPARAMVAL for arg1 (param 0) */
       param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
-      TCCGEN_DEBUG("[TCCGEN] FUNCPARAMVAL push: site=llong_helper call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
-                   call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)param_num.c.i), vtop[-1].r, vtop[-1].vr);
+      LOG_CODEGEN("FUNCPARAMVAL push: site=llong_helper call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d", call_id,
+                  TCCIR_DECODE_PARAM_IDX((uint32_t)param_num.c.i), vtop[-1].r, vtop[-1].vr);
       tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &param_num, NULL);
       /* Generate FUNCPARAMVAL for arg2 (param 1) */
       param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 1);
-      TCCGEN_DEBUG("[TCCGEN] FUNCPARAMVAL push: site=llong_helper call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
-                   call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)param_num.c.i), vtop[0].r, vtop[0].vr);
+      LOG_CODEGEN("FUNCPARAMVAL push: site=llong_helper call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d", call_id,
+                  TCCIR_DECODE_PARAM_IDX((uint32_t)param_num.c.i), vtop[0].r, vtop[0].vr);
       tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[0], &param_num, NULL);
       /* Generate FUNCCALLVAL for the function call (returns long long) */
       svalue_init(&dest);
@@ -3677,7 +3644,7 @@ static void gen_opl(int op)
         dest.r = 0;
         if ((dest_type & VT_BTYPE) == VT_LLONG)
           tcc_ir_set_llong_type(tcc_state->ir, dest.vr);
-        TccIrOp ir_op;
+        TccIrOp ir_op = TCCIR_OP_NOP;
         switch (op)
         {
         case '^':
@@ -3883,89 +3850,128 @@ static void gen_opl(int op)
     }
     break;
   default:
-    /* compare operations - use __aeabi_lcmp/__aeabi_ulcmp for ARM EABI */
+    /* 64-bit compare operations */
     t = vtop->type.t;
+    if (tcc_state->ir)
+    {
+      /* Inline 64-bit comparison via CMP+SBCS.
+       *
+       * CMP+SBCS correctly sets N/V/C flags for the full 64-bit comparison,
+       * so LT, GE, ULT, UGE conditions work directly.
+       *
+       * GT, LE, UGT, ULE also depend on the Z flag, which SBCS sets only
+       * for the high-word result (not the full 64-bit equality).  We handle
+       * these by swapping operands: GT(a,b)=LT(b,a), LE(a,b)=GE(b,a), etc.
+       *
+       * EQ/NE: decompose into (a ^ b) then test if the 64-bit result is 0
+       * by splitting into lo|hi and doing a 32-bit comparison.
+       */
+      int cmp_op = op;
+      if (op == TOK_EQ || op == TOK_NE)
+      {
+        /* EQ/NE: emit 64-bit CMP directly.
+         * The backend emits CMP hi,hi; IT EQ; CMPEQ lo,lo
+         * which correctly sets Z for full 64-bit equality. */
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_CMP, &vtop[-1], &vtop[0], NULL);
+        vtop--;
+        vtop->r = VT_CMP;
+        vtop->cmp_op = op;
+        vtop->jfalse = -1;
+        vtop->jtrue = -1;
+      }
+      else
+      {
+        if (op == TOK_GT || op == TOK_LE || op == TOK_UGT || op == TOK_ULE)
+        {
+          vswap();
+          switch (op)
+          {
+          case TOK_GT:
+            cmp_op = TOK_LT;
+            break;
+          case TOK_LE:
+            cmp_op = TOK_GE;
+            break;
+          case TOK_UGT:
+            cmp_op = TOK_ULT;
+            break;
+          case TOK_ULE:
+            cmp_op = TOK_UGE;
+            break;
+          }
+        }
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_CMP, &vtop[-1], &vtop[0], NULL);
+        vtop--;
+        vtop->r = VT_CMP;
+        vtop->cmp_op = cmp_op;
+        vtop->jfalse = -1;
+        vtop->jtrue = -1;
+      }
+      /* Materialize VT_CMP immediately so the SETIF IR instruction is
+       * emitted right after the CMP. Without this, the SETIF would be
+       * deferred until the value is consumed, and a subsequent
+       * comparison would clobber the ARM flags register. */
+      if ((vtop->r & VT_VALMASK) == VT_CMP)
+      {
+        gv(RC_INT);
+      }
+    }
+    else
     {
       int is_unsigned = (op == TOK_ULT || op == TOK_ULE || op == TOK_UGT || op == TOK_UGE);
       func = is_unsigned ? TOK___aeabi_ulcmp : TOK___aeabi_lcmp;
-
-      /* Call the comparison helper function */
       vpush_helper_func(func);
       vrott(3);
-      /* Stack after vrott(3): func, arg1, arg2 (arg2 is at vtop) */
       {
         SValue param_num;
         SValue dest;
-        const int call_id = tcc_state->ir ? tcc_state->ir->next_call_id++ : 0;
+        const int call_id = 0;
         svalue_init(&param_num);
         param_num.vr = -1;
-        /* Generate FUNCPARAMVAL for arg1 (param 0) */
         param_num.r = VT_CONST;
         param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
-        TCCGEN_DEBUG("[TCCGEN] FUNCPARAMVAL push: site=aeabi_lcmp call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
-                     call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)param_num.c.i), vtop[-1].r, vtop[-1].vr);
         tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &param_num, NULL);
-        /* Generate FUNCPARAMVAL for arg2 (param 1) */
         param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 1);
-        TCCGEN_DEBUG("[TCCGEN] FUNCPARAMVAL push: site=aeabi_lcmp call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
-                     call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)param_num.c.i), vtop[0].r, vtop[0].vr);
         tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[0], &param_num, NULL);
-        /* Generate FUNCCALLVAL for the function call (returns int: -1, 0, or 1) */
         svalue_init(&dest);
         dest.type.t = VT_INT;
         dest.r = 0;
         dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
         SValue call_id_sv = tcc_ir_svalue_call_id_argc(call_id, 2);
         tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &vtop[-2], &call_id_sv, &dest);
-        /* Pop all 3 values (arg1, arg2, func) and push result */
         vtop -= 3;
         vpushi(0);
         vtop->type.t = VT_INT;
         vtop->vr = dest.vr;
         vtop->r = REG_IRET;
       }
-
-      /* Now compare the result (in r0) against 0 using the appropriate comparison */
-      /* __aeabi_lcmp returns: <0 if a<b, 0 if a==b, >0 if a>b */
       vpushi(0);
       switch (op)
       {
       case TOK_LT:
       case TOK_ULT:
-        /* result < 0 means a < b */
         gen_op(TOK_LT);
         break;
       case TOK_LE:
       case TOK_ULE:
-        /* result <= 0 means a <= b */
         gen_op(TOK_LE);
         break;
       case TOK_GT:
       case TOK_UGT:
-        /* result > 0 means a > b */
         gen_op(TOK_GT);
         break;
       case TOK_GE:
       case TOK_UGE:
-        /* result >= 0 means a >= b */
         gen_op(TOK_GE);
         break;
       case TOK_EQ:
-        /* result == 0 means a == b */
         gen_op(TOK_EQ);
         break;
       case TOK_NE:
-        /* result != 0 means a != b */
         gen_op(TOK_NE);
         break;
       }
-
-      /* Materialize VT_CMP immediately so the SETIF IR instruction is
-       * emitted right after the CMP. Without this, the SETIF would be
-       * deferred until the value is consumed, and a subsequent function
-       * call (e.g. another __aeabi_lcmp for a second comparison) would
-       * clobber the ARM flags register before the SETIF reads them. */
-      if (tcc_state->ir && (vtop->r & VT_VALMASK) == VT_CMP)
+      if ((vtop->r & VT_VALMASK) == VT_CMP)
       {
         gv(RC_INT);
       }
@@ -4909,6 +4915,61 @@ static CType *find_assignable_transparent_union_member(CType *type)
   }
 
   return NULL;
+}
+
+/* Structural type comparison for typedef redefinition checking.
+   Unlike compare_types(), this compares struct/union types by their
+   layout (size, field offsets, field types) rather than by Sym* identity.
+   This is needed because PCH replay can create new Sym* instances for
+   structurally identical types. */
+static int compare_types_structural(CType *type1, CType *type2)
+{
+  int bt1, t1, t2;
+
+  t1 = type1->t & VT_TYPE;
+  t2 = type2->t & VT_TYPE;
+
+  if ((t1 & VT_BTYPE) != VT_BYTE)
+  {
+    t1 &= ~VT_DEFSIGN;
+    t2 &= ~VT_DEFSIGN;
+  }
+
+  if (t1 != t2)
+    return 0;
+
+  if ((t1 & VT_ARRAY) && !(type1->ref->c < 0 || type2->ref->c < 0 || type1->ref->c == type2->ref->c))
+    return 0;
+
+  bt1 = t1 & VT_BTYPE;
+  if (bt1 == VT_PTR)
+  {
+    type1 = pointed_type(type1);
+    type2 = pointed_type(type2);
+    return compare_types_structural(type1, type2);
+  }
+  else if (bt1 == VT_STRUCT)
+  {
+    Sym *s1 = type1->ref, *s2 = type2->ref;
+    Sym *f1, *f2;
+    if (s1 == s2)
+      return 1;
+    if (s1->c != s2->c)
+      return 0;
+    for (f1 = s1->next, f2 = s2->next; f1 && f2; f1 = f1->next, f2 = f2->next)
+    {
+      if (f1->c != f2->c)
+        return 0;
+      if (!compare_types_structural(&f1->type, &f2->type))
+        return 0;
+    }
+    return !f1 && !f2;
+  }
+  else if (bt1 == VT_FUNC)
+  {
+    return is_compatible_func(type1, type2);
+  }
+  return 1;
 }
 
 /* return true if type1 and type2 are the same.  If unqualified is
@@ -6151,7 +6212,7 @@ static void gen_complex_float_arith(int op)
 }
 
 /* generic gen_op: handles types problems */
-ST_FUNC void gen_op(int op)
+ST_FUNC HOT void gen_op(int op)
 {
   int t1, t2, bt1, bt2, t;
   CType type1, combtype;
@@ -6802,6 +6863,110 @@ static int try_inline_builtin_call(const char *func_name, SValue *args, int nb_a
   return 1;
 }
 
+/* Returns 1 if the type is safe for auto-inline parameter passing (TCCIR_OP_STORE)
+ * and return value storage.  Single-register scalars and VT_LLONG are accepted
+ * (the IR STORE handles 64-bit integer values natively).  VT_DOUBLE / VT_LDOUBLE
+ * and VT_STRUCT parameters still need a multi-register or memory ABI that
+ * the inline expansion doesn't handle. */
+static int auto_inline_type_ok(int type_t)
+{
+  switch (type_t & VT_BTYPE)
+  {
+  case VT_VOID:
+  case VT_BYTE:
+  case VT_SHORT:
+  case VT_INT:
+  case VT_LLONG:
+  case VT_PTR:
+  case VT_FLOAT:
+  case VT_BOOL:
+  case VT_STRUCT:
+    return 1;
+  default:
+    return 0;
+  }
+}
+
+/* Returns 1 if all types in the function signature (return + params) are safe
+ * for auto-inlining. */
+static int auto_inline_sig_ok(Sym *func_sym)
+{
+  Sym *ref = func_sym->type.ref;
+  Sym *p;
+  if (!ref)
+    return 0;
+  /* Allow struct return types: the inline expansion handles them via vstore()
+   * which generates a memcpy to the return slot.  Struct *parameters* are
+   * still rejected (they need ABI-specific passing that STORE can't handle). */
+  int ret_btype = ref->type.t & VT_BTYPE;
+  if (ref->type.t & VT_COMPLEX)
+    return 0;
+  if (!auto_inline_type_ok(ref->type.t) && ret_btype != VT_STRUCT)
+  {
+    LOG_INLINE_STRUCT("[auto-inline-sig] REJECT ret_btype=%d for %s", ret_btype,
+                      get_tok_str(func_sym->v & ~SYM_FIELD, NULL));
+    return 0;
+  }
+  int has_llong_param = 0;
+  for (p = ref->next; p; p = p->next)
+  {
+    /* (void) parameter list: single VT_VOID param with no next */
+    if ((p->type.t & VT_BTYPE) == VT_VOID && !p->next)
+      break;
+    if (!auto_inline_type_ok(p->type.t))
+      return 0;
+    if (p->type.t & VT_COMPLEX)
+      return 0;
+    /* Only inline small plain structs (≤16 bytes) for static functions.
+     * Non-static functions with struct params can have complex aliasing
+     * (pointer members aliasing other params) that the optimizer mishandles
+     * after inlining.  Vector types and large structs are always rejected. */
+    if ((p->type.t & VT_BTYPE) == VT_STRUCT)
+    {
+      if (p->type.t & VT_VECTOR)
+        return 0;
+      int sz, al;
+      sz = type_size(&p->type, &al);
+      if (sz > 16)
+        return 0;
+      if (!(func_sym->type.t & VT_STATIC))
+        return 0;
+    }
+    /* Unnamed parameters (v == 0) crash sym_push during inline expansion
+     * because table_ident[0 - TOK_IDENT] is out of bounds. */
+    if (p->v == 0)
+      return 0;
+    if ((p->type.t & VT_BTYPE) == VT_LLONG)
+      has_llong_param = 1;
+  }
+  if (ret_btype == VT_VOID && has_llong_param)
+    return 2;
+  LOG_INLINE_STRUCT("[auto-inline-sig] ACCEPT %s (ret_btype=%d)", get_tok_str(func_sym->v & ~SYM_FIELD, NULL),
+                    ret_btype);
+  return 1;
+}
+
+/* Count the number of non-void parameters in a function's type.
+ * Returns -1 if any parameter has a VLA type (side effects in parameter
+ * declarations that the inline expansion cannot replay). */
+static int auto_inline_param_count(Sym *func_sym)
+{
+  Sym *ref = func_sym->type.ref;
+  Sym *p;
+  int count = 0;
+  if (!ref)
+    return 0;
+  for (p = ref->next; p; p = p->next)
+  {
+    if ((p->type.t & VT_BTYPE) == VT_VOID && !p->next)
+      break;
+    if (p->type.t & VT_VLA)
+      return -1;
+    count++;
+  }
+  return count;
+}
+
 static int inline_body_has_return_stmt(TokenString *func_str)
 {
   const int *tp;
@@ -6823,6 +6988,502 @@ static int inline_body_has_return_stmt(TokenString *func_str)
   }
 
   return 0;
+}
+
+/* Return 1 if the function body uses __builtin_apply_args().
+ * That builtin captures the *calling* function's argument register block.
+ * Inlining such a function changes whose frame is captured, producing wrong
+ * results (pr47237). */
+static int inline_body_has_apply_args(TokenString *func_str)
+{
+  const int *tp;
+
+  if (!func_str)
+    return 0;
+
+  tp = tok_str_buf(func_str);
+  while (*tp)
+  {
+    int tv;
+    CValue tcv;
+
+    tok_get(&tv, &tp, &tcv);
+    if (tv == TOK_builtin_apply_args || tv == TOK_builtin_longjmp || tv == TOK_builtin_setjmp)
+      return 1;
+    if (tv == TOK_EOF || tv == 0)
+      break;
+  }
+
+  return 0;
+}
+
+/* Return 1 if the function body contains tokens that would produce observable
+ * side effects when the body is speculatively evaluated with nocode_wanted.
+ * We conservatively reject:
+ *   - pre/post increment/decrement (they modify an lvalue)
+ *   - compound assignment operators (+=, -=, *= …)
+ *   - plain '=' (an assignment statement would be skipped silently — unsafe)
+ * '=' also appears in initializers of local declarations, which we do need
+ * to support. We walk the body and ignore '=' until the first ';' boundary
+ * of a statement that looks like a declaration: this heuristic preserves
+ * const-initialized locals while rejecting assignment statements.
+ * Function calls are handled indirectly by rejecting any unknown identifier
+ * sequence that looks like a call; if a body calls a function, we also drop
+ * its side effects, so we conservatively reject token pair <ident> '('. */
+static int inline_body_has_side_effects(TokenString *func_str)
+{
+  const int *tp;
+  int depth = 0;
+  int brace_depth = 0; /* nesting of { } only — side-effect checks apply only at the body's top level */
+  int at_stmt_start = 1;
+  int in_decl = 0; /* set when current stmt starts with a type-like token */
+  int in_for_header = 0; /* inside for(...) header — skip mutation checks (local vars) */
+  int for_paren_depth = 0; /* depth at which the for-header '(' was seen */
+  int prev_tv = 0;
+  int dbg = TCC_LOG_INLINE_STRUCT;
+
+  if (!func_str)
+    return 0;
+
+  tp = tok_str_buf(func_str);
+  while (*tp)
+  {
+    int tv;
+    CValue tcv;
+    tok_get(&tv, &tp, &tcv);
+    if (tv == TOK_EOF || tv == 0)
+      break;
+    /* TOK_LINENUM is a debug-info pseudo-token inserted between real tokens;
+     * it must be invisible to the statement/declaration tracker. */
+    if (tv == TOK_LINENUM)
+      continue;
+
+    if (tv == '{')
+    {
+      depth++;
+      brace_depth++;
+    }
+    else if (tv == '(' || tv == '[')
+    {
+      depth++;
+      if (prev_tv == TOK_FOR && tv == '(' && brace_depth == 1)
+      {
+        in_for_header = 1;
+        for_paren_depth = depth;
+      }
+    }
+    else if (tv == '}')
+    {
+      if (depth > 0)
+        depth--;
+      if (brace_depth > 0)
+        brace_depth--;
+      /* Closing brace of a nested statement-block (if/while/for/etc.) at
+       * the function-body level means the NEXT token starts a fresh
+       * top-level statement.  Without this the declaration-init heuristic
+       * misclassifies `} unsigned int x = ...;` — it falls through to the
+       * default `at_stmt_start=0` branch below, so the `=` fires the plain-
+       * assignment check and rejects the whole body as having side effects. */
+      if (brace_depth == 1 && depth == 1)
+      {
+        at_stmt_start = 1;
+        in_decl = 0;
+        prev_tv = tv;
+        continue;
+      }
+    }
+    else if (tv == ')' || tv == ']')
+    {
+      if (in_for_header && tv == ')' && depth == for_paren_depth)
+        in_for_header = 0;
+      if (depth > 0)
+        depth--;
+    }
+
+    /* Side-effect checks apply only at the function body's top level
+     * (brace_depth == 1). Nested subblocks — e.g. the bodies of `if`
+     * statements — are left to the parser in try_inline_const_eval: it
+     * either skips them (when the `if` condition is compile-time false)
+     * or bails out, so side effects there cannot silently execute. */
+    if (brace_depth == 1 && !in_for_header)
+    {
+      if (tv == TOK_INC || tv == TOK_DEC)
+      {
+        if (dbg)
+          LOG_INLINE_STRUCT("[side_eff] fire INC/DEC tv=%d", tv);
+        return 1;
+      }
+      if (TOK_ASSIGN(tv))
+      {
+        if (dbg)
+          LOG_INLINE_STRUCT("[side_eff] fire TOK_ASSIGN tv=%d", tv);
+        return 1;
+      }
+    }
+
+    /* A '{' inside the body is either the body opener (transition to depth 1)
+     * or a compound statement (e.g. block inside an if). Either way, the
+     * NEXT token starts a new statement. */
+    if (tv == '{')
+    {
+      at_stmt_start = 1;
+      in_decl = 0;
+      prev_tv = tv;
+      continue;
+    }
+
+    /* Function call pattern: user identifier immediately followed by '('.
+     * Keywords (TOK_IDENT..TOK_UIDENT-1) aren't callables — things like
+     * `return(expr)` or `sizeof(x)` are structural, not function calls.
+     * Known pure compile-time builtins (e.g. __builtin_constant_p, which
+     * never evaluates its argument) are whitelisted: their "call" shape
+     * has no runtime effect and their inner argument side effects, if any,
+     * are flagged separately by the mutation checks above. */
+    if (brace_depth == 1 && tv == '(' && prev_tv >= TOK_UIDENT)
+    {
+      switch (prev_tv)
+      {
+      case TOK_builtin_constant_p:
+      case TOK_builtin_types_compatible_p:
+      case TOK_builtin_choose_expr:
+      case TOK_builtin_expect:
+        break;
+      default:
+        if (dbg)
+          LOG_INLINE_STRUCT("[side_eff] fire CALL prev_tv=%d(%s)", prev_tv, get_tok_str(prev_tv, NULL));
+        return 1;
+      }
+    }
+
+    /* Plain '=' handling at body top level:
+     *   - inside a declaration statement at depth 1 (declarator init): OK
+     *   - anywhere else: unsafe (nested assignment inside an init expr, or
+     *     a plain assignment statement) */
+    if (brace_depth == 1 && !in_for_header && tv == '=')
+    {
+      if (!(in_decl && depth == 1))
+      {
+        if (dbg)
+          LOG_INLINE_STRUCT("[side_eff] fire = in_decl=%d depth=%d prev_tv=%d(%s)", in_decl, depth, prev_tv,
+                            prev_tv >= TOK_IDENT ? get_tok_str(prev_tv, NULL) : "<op>");
+        return 1;
+      }
+    }
+
+    if (dbg && brace_depth >= 1)
+      LOG_INLINE_STRUCT("[side_eff] tok tv=%d(%s) bd=%d d=%d at_stmt=%d in_decl=%d", tv,
+                        tv >= TOK_IDENT ? get_tok_str(tv, NULL) : "<op>", brace_depth, depth, at_stmt_start, in_decl);
+    if (at_stmt_start && depth == 1)
+    {
+      /* Heuristic: a statement starting with a type keyword is a declaration. */
+      switch (tv)
+      {
+      case TOK_VOID:
+      case TOK_CHAR:
+      case TOK_SHORT:
+      case TOK_INT:
+      case TOK_LONG:
+      case TOK_SIGNED1:
+      case TOK_SIGNED2:
+      case TOK_SIGNED3:
+      case TOK_UNSIGNED:
+      case TOK_FLOAT:
+      case TOK_DOUBLE:
+      case TOK_BOOL:
+      case TOK_CONST1:
+      case TOK_CONST2:
+      case TOK_CONST3:
+      case TOK_VOLATILE1:
+      case TOK_VOLATILE2:
+      case TOK_VOLATILE3:
+      case TOK_STATIC:
+      case TOK_EXTERN:
+      case TOK_AUTO:
+      case TOK_REGISTER:
+      case TOK_TYPEDEF:
+        in_decl = 1;
+        break;
+      default:
+        in_decl = 0;
+        break;
+      }
+      at_stmt_start = 0;
+    }
+    if (tv == ';' && depth == 1)
+    {
+      at_stmt_start = 1;
+      in_decl = 0;
+    }
+
+    prev_tv = tv;
+  }
+  return 0;
+}
+
+/* Return 1 if the function body references any identifier that is shadowed
+ * by a local variable in the caller's scope.  Token-replay inline expansion
+ * resolves identifiers in the caller's scope, so a local `int i` in the
+ * caller would shadow a global `int i` that the callee intended to read. */
+static int inline_body_has_shadowed_ident(TokenString *func_str)
+{
+  const int *tp;
+  if (!func_str)
+    return 0;
+  tp = tok_str_buf(func_str);
+  while (*tp)
+  {
+    int tv;
+    CValue tcv;
+    tok_get(&tv, &tp, &tcv);
+    if (tv == TOK_EOF || tv == 0)
+      break;
+    /* Check identifiers (not keywords, not constants) */
+    if (tv >= TOK_IDENT)
+    {
+      TokenSym *ts = table_ident[tv - TOK_IDENT];
+      if (ts && ts->sym_identifier)
+      {
+        Sym *s = ts->sym_identifier;
+        /* If the identifier resolves to a local and there's also a global
+         * with the same name, the local shadows the global. */
+        if (sym_scope(s) > 0 && s->prev_tok)
+          return 1;
+      }
+    }
+  }
+  return 0;
+}
+
+/* Return 1 if the function body contains tokens that are unsafe for
+ * token-replay inline expansion:
+ * - TOK_STATIC: creates a new copy of each static variable per inline site
+ * - __FUNCTION__/__func__: evaluates to the caller's name instead of the
+ *   original function name when token-replayed in the caller's context.
+ * We decline to auto-inline such functions. */
+static int inline_body_has_static_local(TokenString *func_str)
+{
+  const int *tp;
+
+  if (!func_str)
+    return 0;
+
+  tp = tok_str_buf(func_str);
+  while (*tp)
+  {
+    int tv;
+    CValue tcv;
+
+    tok_get(&tv, &tp, &tcv);
+    if (tv == TOK_STATIC || tv == TOK___FUNCTION__ || tv == TOK___FUNC__)
+      return 1;
+    if (tv == TOK_EOF || tv == 0)
+      break;
+  }
+
+  return 0;
+}
+
+/* Return 1 if the function body contains any loop statement (for/while/do).
+ * Token-replay inline expansion does not correctly handle backward jumps in
+ * some expression contexts (e.g. for-loop condition), so we decline to
+ * always_inline such functions. */
+static int inline_body_has_loops(TokenString *func_str)
+{
+  const int *tp;
+
+  if (!func_str)
+    return 0;
+
+  tp = tok_str_buf(func_str);
+  while (*tp)
+  {
+    int tv;
+    CValue tcv;
+
+    tok_get(&tv, &tp, &tcv);
+    if (tv == TOK_WHILE || tv == TOK_FOR || tv == TOK_DO)
+      return 1;
+    if (tv == TOK_EOF || tv == 0)
+      break;
+  }
+
+  return 0;
+}
+
+/* Check if a nested function has genuine captures (parent variables that are
+ * actually accessed through the static chain, not shadowed by parameters or
+ * local declarations).  Returns 1 if any capture is genuine, 0 if all are
+ * shadowed.  Safe for inlining only when this returns 0. */
+static int nested_has_genuine_capture(NestedFunc *nf)
+{
+  if (nf->nb_captured == 0)
+    return 0;
+  for (int ci = 0; ci < nf->nb_captured; ci++)
+  {
+    int ctok = nf->captured_tokens[ci];
+    int shadowed = 0;
+    /* Check if this captured token is a function parameter */
+    Sym *ref = nf->sym->type.ref;
+    if (ref)
+    {
+      for (Sym *p = ref->next; p; p = p->next)
+      {
+        if ((p->v & ~SYM_FIELD) == ctok)
+        {
+          shadowed = 1;
+          break;
+        }
+      }
+    }
+    if (!shadowed && nf->func_str)
+    {
+      /* Check if the body declares a local with the same name (type keyword
+       * immediately before the captured token).  This detects patterns like
+       * "int x = 99;" where x shadows the parent's captured x. */
+      const int *tp = tok_str_buf(nf->func_str);
+      int prev = 0;
+      while (*tp)
+      {
+        int tv;
+        CValue tcv;
+        tok_get(&tv, &tp, &tcv);
+        if (tv == TOK_EOF || tv == 0)
+          break;
+        if (tv == ctok && (prev == TOK_INT || prev == TOK_CHAR || prev == TOK_SHORT ||
+                           prev == TOK_LONG || prev == TOK_VOID || prev == TOK_FLOAT ||
+                           prev == TOK_DOUBLE || prev == TOK_UNSIGNED || prev == TOK_SIGNED1 ||
+                           prev == TOK_BOOL))
+        {
+          shadowed = 1;
+          break;
+        }
+        prev = tv;
+      }
+    }
+    if (!shadowed)
+      return 1;
+  }
+  return 0;
+}
+
+/* Look up a callee in the nested function table and return whether it has
+ * genuine captures from the parent scope. */
+static int nested_callee_has_genuine_capture(TCCState *s, Sym *call_func_sym)
+{
+  for (int ni = 0; ni < s->nb_nested_funcs; ni++) {
+    if (s->nested_funcs[ni].sym == call_func_sym)
+      return nested_has_genuine_capture(&s->nested_funcs[ni]);
+  }
+  return 0;
+}
+
+/* Check if a nested function with genuine captures only reads them (never
+ * writes or takes their address).  When true, token-replay inlining is safe:
+ * the inlined body will reference the parent's locals directly, and since it
+ * only reads them the "VAR-to-VAR IR pattern" concern does not apply. */
+static int nested_capture_is_read_only(NestedFunc *nf)
+{
+  if (nf->nb_captured == 0)
+    return 1;
+  if (!nf->func_str)
+    return 0;
+
+  /* Reject if any parameter has VLA dimensions — VLA expressions can contain
+   * side effects on captured variables (e.g. N++) that are not visible in the
+   * function body token stream. */
+  Sym *fref = nf->sym->type.ref;
+  if (fref) {
+    for (Sym *p = fref->next; p; p = p->next) {
+      if ((p->type.t & VT_VLA) || ((p->type.t & VT_BTYPE) == VT_PTR && p->type.ref &&
+                                    (p->type.ref->type.t & VT_VLA)))
+        return 0;
+    }
+  }
+
+  /* Collect the set of genuinely captured tokens (same logic as
+   * nested_has_genuine_capture, but we store the tokens). */
+  int genuine[MAX_CAPTURED_VARS];
+  int ng = 0;
+  for (int ci = 0; ci < nf->nb_captured; ci++) {
+    int ctok = nf->captured_tokens[ci];
+    int shadowed = 0;
+    Sym *ref = nf->sym->type.ref;
+    if (ref) {
+      for (Sym *p = ref->next; p; p = p->next) {
+        if ((p->v & ~SYM_FIELD) == ctok) {
+          shadowed = 1;
+          break;
+        }
+      }
+    }
+    if (!shadowed && nf->func_str) {
+      const int *tp = tok_str_buf(nf->func_str);
+      int prev = 0;
+      while (*tp) {
+        int tv;
+        CValue tcv;
+        tok_get(&tv, &tp, &tcv);
+        if (tv == TOK_EOF || tv == 0)
+          break;
+        if (tv == ctok && (prev == TOK_INT || prev == TOK_CHAR || prev == TOK_SHORT ||
+                           prev == TOK_LONG || prev == TOK_VOID || prev == TOK_FLOAT ||
+                           prev == TOK_DOUBLE || prev == TOK_UNSIGNED || prev == TOK_SIGNED1 ||
+                           prev == TOK_BOOL)) {
+          shadowed = 1;
+          break;
+        }
+        prev = tv;
+      }
+    }
+    if (!shadowed) {
+      if (ng >= MAX_CAPTURED_VARS)
+        return 0;
+      genuine[ng++] = ctok;
+    }
+  }
+  if (ng == 0)
+    return 1;
+
+  /* Scan the token stream looking for writes to any genuine capture:
+   *   capture = ...       capture += ...  (and other compound assigns)
+   *   capture++  capture-- ++capture  --capture
+   *   &capture            (address taken — could be used for indirect write) */
+  const int *tp = tok_str_buf(nf->func_str);
+  int prev = 0;
+  while (*tp) {
+    int tv;
+    CValue tcv;
+    tok_get(&tv, &tp, &tcv);
+    if (tv == TOK_EOF || tv == 0)
+      break;
+
+    for (int g = 0; g < ng; g++) {
+      if (tv != genuine[g])
+        continue;
+      /* This token is a genuine capture.  Peek at the next token. */
+      const int *peek = tp;
+      int next_tv = 0;
+      if (*peek) {
+        CValue dummy;
+        tok_get(&next_tv, &peek, &dummy);
+      }
+      /* Write: capture = expr, capture += expr, ... */
+      if (next_tv == '=' || TOK_ASSIGN(next_tv))
+        return 0;
+      /* Post-increment/decrement: capture++, capture-- */
+      if (next_tv == TOK_INC || next_tv == TOK_DEC)
+        return 0;
+      /* Pre-increment/decrement: ++capture, --capture */
+      if (prev == TOK_INC || prev == TOK_DEC)
+        return 0;
+      /* Address-of: &capture */
+      if (prev == '&')
+        return 0;
+      break;
+    }
+    prev = tv;
+  }
+  return 1;
 }
 
 static void inline_scan_body_features(TokenString *func_str, int *has_addr_of_label, int *has_inline_asm)
@@ -6980,15 +7641,83 @@ static int try_inline_const_eval(Sym *func_sym, SValue *args, int nb_args)
   int saved_nb_errors;
   void (*saved_error_func)(void *opaque, const char *msg);
   void *saved_error_opaque;
+  int saved_overlay_n;
 
-  if (!tcc_state->optimize || !func_sym || !(func_sym->type.t & VT_INLINE))
+  if (!tcc_state->optimize || !func_sym)
     return 0;
+  /* Accept either an explicit `inline` function, a static auto-inline
+   * candidate (selected by the body-size heuristic), or an eval-only
+   * candidate (larger but pure — body saved solely for const-fold, not
+   * regular inlining). */
+  if (!(func_sym->type.t & VT_INLINE) &&
+      !(func_sym->type.ref && (func_sym->type.ref->f.func_auto_inline || func_sym->type.ref->f.func_eval_only_inline)))
+    return 0;
+  if (TCC_LOG_INLINE_STRUCT)
+    fprintf(stderr, "[inline-eval] TRY %s nb_args=%d\n", get_tok_str(func_sym->v & ~SYM_FIELD, NULL), nb_args);
 
-  /* All arguments must be compile-time integer constants */
+  /* Work on a local copy of args[]: the caller's buffer (saved_args[]) is
+   * reused by the non-CTE inlining fall-through path, so in-place mutation
+   * here (e.g. pre-folding `*&g` to a constant) would corrupt that path. */
+  SValue *local_args = tcc_malloc(nb_args * sizeof(SValue));
+  for (i = 0; i < nb_args; i++)
+    local_args[i] = args[i];
+  args = local_args;
+
+  /* All arguments must be compile-time constants. Symbol-valued pointer
+   * constants (e.g. string literals) are permitted only for pointer-typed
+   * params: if the body ever flows such a value into the return, the tag
+   * survives via vtop->sym and the final VT_SYM check below rejects the
+   * fold. Non-pointer args must be pure integer/float constants. */
   for (i = 0; i < nb_args; i++)
   {
-    if ((args[i].r & (VT_VALMASK | VT_LVAL)) != VT_CONST || (args[i].r & VT_SYM))
+    /* Pre-fold `*&g` args where g is a static scalar with an init and no
+     * observed writes. Pointer globals are excluded: their section bytes
+     * are typically zero with a pending relocation (e.g. static T *p = &x),
+     * so reading raw bytes would yield a bogus null value. */
+    if ((args[i].r & (VT_VALMASK | VT_SYM | VT_LVAL)) == (VT_CONST | VT_SYM | VT_LVAL) && args[i].sym &&
+        !args[i].sym->a.possibly_written && !(args[i].type.t & (VT_ARRAY | VT_VLA)))
+    {
+      int btype = args[i].type.t & VT_BTYPE;
+      if (btype == VT_BYTE || btype == VT_SHORT || btype == VT_INT || btype == VT_LLONG || btype == VT_BOOL)
+      {
+        ElfSym *esym = elfsym(args[i].sym);
+        if (esym && esym->st_shndx != SHN_UNDEF && esym->st_shndx != SHN_COMMON &&
+            esym->st_shndx < tcc_state->nb_sections)
+        {
+          Section *sec = tcc_state->sections[esym->st_shndx];
+          int align;
+          int sz = type_size(&args[i].type, &align);
+          unsigned long off = (unsigned long)(esym->st_value + (unsigned long long)args[i].c.i);
+          if (sec && sec->data && sz > 0 && off + (unsigned long)sz <= sec->data_offset)
+          {
+            const unsigned char *ptr = sec->data + off;
+            int64_t val = 0;
+            if (sz == 8)
+              memcpy(&val, ptr, 8);
+            else
+            {
+              memcpy(&val, ptr, sz);
+              if (!(args[i].type.t & VT_UNSIGNED) && sz < 8)
+              {
+                int shift = (8 - sz) * 8;
+                val = (int64_t)(val << shift) >> shift;
+              }
+            }
+            args[i].c.i = val;
+            args[i].r = VT_CONST;
+            args[i].sym = NULL;
+          }
+        }
+      }
+    }
+    if ((args[i].r & (VT_VALMASK | VT_LVAL)) != VT_CONST)
+    {
+      if (TCC_LOG_INLINE_STRUCT)
+        fprintf(stderr, "[inline-eval] FAIL %s: arg[%d].r=0x%x not VT_CONST\n",
+                get_tok_str(func_sym->v & ~SYM_FIELD, NULL), i, args[i].r);
+      tcc_free(local_args);
       return 0;
+    }
   }
 
   /* Find the InlineFunc for this symbol */
@@ -7002,25 +7731,123 @@ static int try_inline_const_eval(Sym *func_sym, SValue *args, int nb_args)
     }
   }
   if (!fn || !fn->func_str)
+  {
+    if (TCC_LOG_INLINE_STRUCT)
+      fprintf(stderr, "[inline-eval] FAIL %s: no InlineFunc/func_str (fn=%p)\n",
+              get_tok_str(func_sym->v & ~SYM_FIELD, NULL), (void *)fn);
+    tcc_free(local_args);
     return 0;
+  }
+
+  /* Reject bodies with mutation ops, compound assignments, or function
+   * calls — speculative evaluation with nocode_wanted silently drops such
+   * side effects and would return a value inconsistent with real execution
+   * (e.g. `w++` in the body must increment the global w at runtime). */
+  if (inline_body_has_side_effects(fn->func_str))
+  {
+    if (TCC_LOG_INLINE_STRUCT)
+      fprintf(stderr, "[inline-eval] FAIL %s: body has side effects\n", get_tok_str(func_sym->v & ~SYM_FIELD, NULL));
+    tcc_free(local_args);
+    return 0;
+  }
 
   /* Get function parameter list */
   func_type_ref = func_sym->type.ref;
   if (!func_type_ref)
+  {
+    tcc_free(local_args);
     return 0;
+  }
 
   /* Count and verify parameters */
   param_count = 0;
   for (param = func_type_ref->next; param; param = param->next)
     param_count++;
-  if (param_count != nb_args || nb_args > 8)
-    return 0;
-
-  /* Verify all params have valid identifier names */
-  for (param = func_type_ref->next; param; param = param->next)
+  if (param_count != nb_args)
   {
-    if ((param->v & ~SYM_FIELD) < TOK_IDENT)
+    tcc_free(local_args);
+    return 0;
+  }
+
+  /* Verify all params have valid identifier names and are not vector/struct
+   * /complex/floating types — we only fold scalar integer/pointer values.
+   * FP is rejected because speculative evaluation under nocode_wanted does
+   * not perform real FP arithmetic (int-to-double casts and FP division
+   * lower to runtime calls that are suppressed), so results would diverge
+   * silently from real execution.
+   * A VT_SYM-tagged arg is only safe when bound to a pointer-typed param;
+   * otherwise stripping VT_SYM would turn a symbol reference into a bogus
+   * integer. */
+  {
+    int pi = 0;
+    for (param = func_type_ref->next; param; param = param->next, pi++)
+    {
+      int pbt;
+      if ((param->v & ~SYM_FIELD) < TOK_IDENT)
+      {
+        tcc_free(local_args);
+        return 0;
+      }
+      pbt = param->type.t & VT_BTYPE;
+      if (pbt == VT_STRUCT || (param->type.t & (VT_VECTOR | VT_COMPLEX)))
+      {
+        tcc_free(local_args);
+        return 0;
+      }
+      if (is_float(param->type.t))
+      {
+        tcc_free(local_args);
+        return 0;
+      }
+      if ((args[pi].r & VT_SYM) && pbt != VT_PTR)
+      {
+        tcc_free(local_args);
+        return 0;
+      }
+    }
+  }
+
+  /* Reject non-scalar / floating return types: structs, complex, and vectors
+   * all need real codegen (memcpy-style returns or composite construction)
+   * that speculative const evaluation cannot produce; FP returns cannot be
+   * trusted because runtime FP calls are suppressed under nocode_wanted. */
+  {
+    CType *rt = &func_type_ref->type;
+    int rbt = rt->t & VT_BTYPE;
+    if (rbt == VT_STRUCT || (rt->t & (VT_VECTOR | VT_COMPLEX)))
+    {
+      tcc_free(local_args);
       return 0;
+    }
+    if (is_float(rt->t))
+    {
+      tcc_free(local_args);
+      return 0;
+    }
+  }
+
+  /* Reject bodies that mention float/double anywhere — including local
+   * variable declarations and explicit casts. Even with integer params
+   * and return, an internal `(double) x / y` would fold to an int divide
+   * because FP helper calls are suppressed under nocode_wanted. */
+  {
+    const int *tp2 = tok_str_buf(fn->func_str);
+    while (*tp2)
+    {
+      int tv2;
+      CValue tcv2;
+      tok_get(&tv2, &tp2, &tcv2);
+      if (tv2 == TOK_EOF || tv2 == 0)
+        break;
+      if (tv2 == TOK_FLOAT || tv2 == TOK_DOUBLE)
+      {
+        if (TCC_LOG_INLINE_STRUCT)
+          fprintf(stderr, "[inline-eval] FAIL %s: body contains FP type\n",
+                  get_tok_str(func_sym->v & ~SYM_FIELD, NULL));
+        tcc_free(local_args);
+        return 0;
+      }
+    }
   }
 
   /* Save state */
@@ -7030,16 +7857,58 @@ static int try_inline_const_eval(Sym *func_sym, SValue *args, int nb_args)
   saved_tok = tok;
   saved_tokc = tokc;
   saved_vtop = vtop;
+  saved_overlay_n = tcc_state->inline_eval_overlay_n;
+
+  /* Populate the param-to-arg overlay. Identifier resolution (unary's
+   * default branch) substitutes these SValues when a token matches, giving
+   * the body direct access to VT_SYM pointer args so `*p` can later fold to
+   * the underlying global's initializer. Overlay is a fixed-size cache
+   * (up to 8 entries); remaining params are resolved via sym_push below. */
+  {
+    int oi = 0;
+    Sym *p2 = func_type_ref->next;
+    for (; oi < nb_args && p2 && oi < 8; oi++, p2 = p2->next)
+    {
+      tcc_state->inline_eval_overlay_tok[oi] = p2->v & ~SYM_FIELD;
+      tcc_state->inline_eval_overlay_sv[oi] = args[oi];
+    }
+    tcc_state->inline_eval_overlay_n = oi;
+  }
 
   /* Evaluate in a nested local scope so inline parameters/body locals do not
    * conflict with caller locals that may share the same identifier names. */
   ++local_scope;
 
-  /* Push parameter symbols as compile-time constants */
+  /* Push parameter symbols as compile-time constants. For 64-bit args we
+   * cannot fit the value in Sym::c (int). Piggy-back on the enum-constant
+   * mechanism: VT_ENUM_VAL on the param type makes identifier lookup pull
+   * the full 64-bit value from Sym::enum_val (see tccgen.c identifier
+   * resolution path for IS_ENUM_VAL). */
   param = func_type_ref->next;
   for (i = 0; i < nb_args; i++, param = param->next)
   {
-    Sym *s = sym_push(param->v & ~SYM_FIELD, &param->type, VT_CONST, (int)args[i].c.i);
+    int btype = param->type.t & VT_BTYPE;
+    Sym *s;
+    if (btype == VT_LLONG)
+    {
+      CType et = param->type;
+      et.t |= VT_ENUM_VAL;
+      s = sym_push(param->v & ~SYM_FIELD, &et, VT_CONST, 0);
+      s->enum_val = args[i].c.i;
+    }
+    else if (args[i].r & VT_SYM)
+    {
+      /* Pointer-typed VT_SYM arg: push the param with VT_SYM set so any
+       * identifier lookup produces a symbol-tagged SValue. If the body
+       * flows this param into the return, the top-level VT_SYM check
+       * rejects the fold. Safe because we never emit code under
+       * nocode_wanted. */
+      s = sym_push(param->v & ~SYM_FIELD, &param->type, VT_CONST | VT_SYM, 0);
+    }
+    else
+    {
+      s = sym_push(param->v & ~SYM_FIELD, &param->type, VT_CONST, (int)args[i].c.i);
+    }
     s->vreg = -1;
   }
 
@@ -7072,19 +7941,194 @@ static int try_inline_const_eval(Sym *func_sym, SValue *args, int nb_args)
 
   next();
 
-  /* Expect: { return expr ; } */
+  /* Expect: { [local-decl;]* return expr ; }
+   * Local declarations must have compile-time-constant initializers; we
+   * treat them like additional parameters so subsequent uses fold. */
   if (tok == '{')
   {
     next();
+
+    /* Parse a sequence of local declarations and compile-time-dead
+     * if-statements of the form
+     *   T name = const-expr [, name = const-expr]* ;
+     *   if (const-false-cond) stmt          // skipped entirely
+     * Anything else breaks out to the return check. */
+    while (tok != TOK_RETURN)
+    {
+      CType btype;
+      AttributeDef ad;
+
+      /* Handle `if (cond) then-stmt [else else-stmt]`.
+       *   - cond must evaluate to a compile-time constant.
+       *   - cond == 0: skip then-stmt (tokens only; no parsing of side-
+       *     effecting statements under nocode_wanted). If there's an
+       *     `else`, bail for now — handling it would require parsing the
+       *     else-stmt as the taken path.
+       *   - cond != 0: bail — parsing the then-stmt under nocode_wanted
+       *     would silently drop any side effects it contains. */
+      if (tok == TOK_IF)
+      {
+        int cond_val;
+        next();
+        if (tok != '(')
+        {
+          success = 0;
+          goto cleanup;
+        }
+        next();
+        expr_eq();
+        if (tok != ')' || (vtop->r & (VT_VALMASK | VT_LVAL)) != VT_CONST || (vtop->r & VT_SYM))
+        {
+          if (vtop >= saved_vtop + 1)
+            vtop--;
+          success = 0;
+          goto cleanup;
+        }
+        cond_val = (vtop->c.i != 0);
+        vtop--;
+        next(); /* past ')' */
+
+        if (cond_val)
+        {
+          success = 0;
+          goto cleanup;
+        }
+
+        /* Skip the then-stmt without parsing, using brace/bracket/paren
+         * depth so structure inside the block is respected. */
+        if (tok == '{')
+        {
+          int bdepth = 0;
+          do
+          {
+            if (tok == '{')
+              bdepth++;
+            else if (tok == '}')
+              bdepth--;
+            next();
+          } while (bdepth > 0 && tok != TOK_EOF);
+        }
+        else
+        {
+          int pdepth = 0;
+          while (!(pdepth == 0 && tok == ';') && tok != TOK_EOF)
+          {
+            if (tok == '(' || tok == '[' || tok == '{')
+              pdepth++;
+            else if (tok == ')' || tok == ']' || tok == '}')
+            {
+              if (pdepth > 0)
+                pdepth--;
+            }
+            next();
+          }
+          if (tok == ';')
+            next();
+        }
+
+        if (tok == TOK_ELSE)
+        {
+          success = 0;
+          goto cleanup;
+        }
+        continue;
+      }
+
+      if (!parse_btype(&btype, &ad, 0))
+        break; /* not a declaration — let the return check handle it */
+
+      /* Storage classes inside a speculative body are not supported. */
+      if (btype.t & (VT_EXTERN | VT_STATIC | VT_TYPEDEF))
+      {
+        success = 0;
+        goto cleanup;
+      }
+
+      while (1)
+      {
+        CType type = btype;
+        int name_tok = 0;
+        type_decl(&type, &ad, &name_tok, TYPE_DIRECT);
+
+        /* Must be a plain scalar with a name and a const initializer. */
+        if (name_tok == 0 || (type.t & VT_BTYPE) == VT_FUNC || (type.t & VT_ARRAY))
+        {
+          success = 0;
+          goto cleanup;
+        }
+        if (tok != '=')
+        {
+          success = 0;
+          goto cleanup;
+        }
+        next();
+        expr_eq();
+        if ((vtop->r & (VT_VALMASK | VT_LVAL)) != VT_CONST || (vtop->r & VT_SYM))
+        {
+          vtop--;
+          success = 0;
+          goto cleanup;
+        }
+
+        {
+          int ltype = type.t & VT_BTYPE;
+          Sym *s;
+          if (ltype == VT_LLONG)
+          {
+            CType et = type;
+            et.t |= VT_ENUM_VAL;
+            s = sym_push(name_tok & ~SYM_FIELD, &et, VT_CONST, 0);
+            s->enum_val = vtop->c.i;
+          }
+          else
+          {
+            s = sym_push(name_tok & ~SYM_FIELD, &type, VT_CONST, (int)vtop->c.i);
+          }
+          s->vreg = -1;
+        }
+        vtop--;
+
+        if (tok != ',')
+          break;
+        next();
+      }
+
+      if (tok != ';')
+      {
+        success = 0;
+        goto cleanup;
+      }
+      next();
+    }
+
     if (tok == TOK_RETURN)
     {
       next();
       expr_eq();
+      /* Apply the implicit conversion to the function's declared return
+       * type — gfunc_return does the same in a real epilogue, and without
+       * it narrowing types (e.g. u8 mode(QI)) leak promoted int values out
+       * of the inlined body. */
+      if (func_sym->type.ref)
+      {
+        CType ret_type = func_sym->type.ref->type;
+        if ((ret_type.t & VT_BTYPE) != VT_VOID && (ret_type.t & VT_BTYPE) != VT_STRUCT && !(ret_type.t & VT_COMPLEX))
+          gen_cast(&ret_type);
+      }
       /* Check if the result is a compile-time constant */
       if ((vtop->r & (VT_VALMASK | VT_LVAL)) == VT_CONST && !(vtop->r & VT_SYM))
       {
         result = *vtop;
+        /* Strip VT_ENUM_VAL inherited from 64-bit param lookups so the
+         * caller doesn't see the return value tagged as an enum. */
+        if ((result.type.t & VT_STRUCT_MASK) == VT_ENUM_VAL)
+          result.type.t &= ~VT_STRUCT_MASK;
         success = 1;
+      }
+      else if (TCC_LOG_INLINE_STRUCT)
+      {
+        fprintf(stderr, "[inline-eval] FAIL %s: return not VT_CONST vtop->r=0x%x\n",
+                get_tok_str(func_sym->v & ~SYM_FIELD, NULL), vtop->r);
       }
       vtop--; /* pop the result (or failed non-const) */
     }
@@ -7097,8 +8141,14 @@ cleanup:
   tcc_state->error_opaque = saved_error_opaque;
   tcc_state->nb_errors = saved_nb_errors;
 
-  /* Clean up: end macro replay */
-  end_macro();
+  /* Restore inline-eval overlay count (supports nested inline-eval). */
+  tcc_state->inline_eval_overlay_n = saved_overlay_n;
+
+  /* Clean up: end macro replay.
+   * Use end_macro_to() instead of end_macro() because speculative parsing
+   * (e.g. string literals via decl_initializer_alloc) may push extra macro
+   * stack entries (unget_tok) that aren't popped before we reach cleanup. */
+  end_macro_to(ts);
 
   /* Restore state */
   nocode_wanted = saved_nocode_wanted;
@@ -7112,11 +8162,16 @@ cleanup:
   /* Restore vtop to what it was before (in case partial parsing left junk) */
   vtop = saved_vtop;
 
+  tcc_free(local_args);
   if (success)
   {
     vpushv(&result);
+    if (TCC_LOG_INLINE_STRUCT)
+      fprintf(stderr, "[inline-eval] OK %s\n", get_tok_str(func_sym->v & ~SYM_FIELD, NULL));
     return 1;
   }
+  if (TCC_LOG_INLINE_STRUCT)
+    fprintf(stderr, "[inline-eval] FAIL %s: cleanup (success=0)\n", get_tok_str(func_sym->v & ~SYM_FIELD, NULL));
   return 0;
 }
 
@@ -7241,7 +8296,6 @@ static void gen_cast(CType *type)
   int sbt, dbt, sf, df, c;
   int dbt_bt, sbt_bt, ds, ss, bits, trunc;
 
-
   if (is_transparent_union_type(type))
   {
     CType *member_type = find_assignable_transparent_union_member(type);
@@ -7258,8 +8312,7 @@ static void gen_cast(CType *type)
      (char/short stored in int registers), never to VT_CONST values.
      Skip when the value is a constant to avoid misinterpreting VT_NONCONST
      as part of the VT_MUSTCAST field. */
-  if ((vtop->r & (VT_MUSTCAST | (VT_MUSTCAST << 1))) &&
-      (vtop->r & VT_VALMASK) != VT_CONST)
+  if ((vtop->r & (VT_MUSTCAST | (VT_MUSTCAST << 1))) && (vtop->r & VT_VALMASK) != VT_CONST)
     force_charshort_cast();
 
   /* bitfields first get cast to ints */
@@ -8413,6 +9466,25 @@ ST_FUNC void vstore(void)
   SValue orig_src = *vtop;
   SValue orig_dst = vtop[-1];
 
+  /* Track writes to static-storage globals so that inline-eval can decide
+   * whether `*&g` in a callee body may fold to the initializer. Two cases
+   * poison a sym g for future folds:
+   *   (a) a direct store whose lvalue still carries VT_SYM → g
+   *   (b) &g is stored into a non-const pointer lvalue — the pointer
+   *       could later be used to write g indirectly. */
+  if (!nocode_wanted)
+  {
+    if ((vtop[-1].r & VT_SYM) && vtop[-1].sym && (vtop[-1].r & VT_VALMASK) == VT_CONST)
+      vtop[-1].sym->a.possibly_written = 1;
+    if ((vtop->r & (VT_VALMASK | VT_SYM | VT_LVAL)) == (VT_CONST | VT_SYM) && vtop->sym &&
+        (vtop[-1].type.t & VT_BTYPE) == VT_PTR)
+    {
+      CType *pointed = pointed_type(&vtop[-1].type);
+      if (pointed && !(pointed->t & VT_CONSTANT))
+        vtop->sym->a.possibly_written = 1;
+    }
+  }
+
   ft = vtop[-1].type.t;
   sbt = vtop->type.t & VT_BTYPE;
   dbt = ft & VT_BTYPE;
@@ -8756,6 +9828,54 @@ ST_FUNC void vstore(void)
     int has_vla = struct_has_vla_member(&vtop->type);
     CType saved_struct_type = vtop->type; /* save before gaddrof destroys it */
     size = type_size(&vtop->type, &align);
+
+    /* For small, word-aligned struct copies between stack locals, expand
+     * to individual word LOAD/STORE pairs in the IR.  This makes the
+     * stores visible to the optimizer (store-load forwarding, constant
+     * propagation, DCE) instead of hiding them behind an opaque memmove
+     * call.  Fall through to the memmove path for large, misaligned,
+     * VLA, or non-local structs. */
+    if (tcc_state->ir && !has_vla && size <= 32 && !(size & 3) && !(align & 3) &&
+        (vtop[0].r & (VT_VALMASK | VT_LVAL)) == (VT_LOCAL | VT_LVAL) &&
+        (vtop[-1].r & (VT_VALMASK | VT_LVAL)) == (VT_LOCAL | VT_LVAL) && !NOEVAL_WANTED)
+    {
+      SValue src = vtop[0];
+      SValue dst = vtop[-1];
+      vtop--; /* pop src; vtop = dst (kept as result lvalue) */
+
+      CType word_type;
+      word_type.t = VT_INT;
+      word_type.ref = NULL;
+
+      for (int off = 0; off < size; off += 4)
+      {
+        SValue s, d, tmp;
+        svalue_init(&s);
+        s.type = word_type;
+        s.r = VT_LOCAL | VT_LVAL;
+        s.vr = src.vr;
+        s.c.i = src.c.i + off;
+
+        svalue_init(&tmp);
+        tmp.type = word_type;
+        tmp.r = 0;
+        tmp.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_LOAD, &s, NULL, &tmp);
+
+        svalue_init(&d);
+        d.type = word_type;
+        d.r = VT_LOCAL | VT_LVAL;
+        d.vr = dst.vr;
+        d.c.i = dst.c.i + off;
+
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_STORE, &tmp, NULL, &d);
+      }
+
+      vtop->type = saved_struct_type;
+      goto vstore_done;
+    }
+
     /* destination, keep on stack() as result */
     vpushv(vtop - 1);
 #ifdef CONFIG_TCC_BCHECK
@@ -8831,16 +9951,16 @@ ST_FUNC void vstore(void)
         param_num.r = VT_CONST;
         /* memmove(dest, src, size) */
         param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
-        TCCGEN_DEBUG("[TCCGEN] FUNCPARAMVAL push: site=memmove call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
-                     call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)param_num.c.i), vtop[-3].r, vtop[-3].vr);
+        LOG_CODEGEN("FUNCPARAMVAL push: site=memmove call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d", call_id,
+                    TCCIR_DECODE_PARAM_IDX((uint32_t)param_num.c.i), vtop[-3].r, vtop[-3].vr);
         tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-3], &param_num, NULL);
         param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 1);
-        TCCGEN_DEBUG("[TCCGEN] FUNCPARAMVAL push: site=memmove call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
-                     call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)param_num.c.i), vtop[-2].r, vtop[-2].vr);
+        LOG_CODEGEN("FUNCPARAMVAL push: site=memmove call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d", call_id,
+                    TCCIR_DECODE_PARAM_IDX((uint32_t)param_num.c.i), vtop[-2].r, vtop[-2].vr);
         tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-2], &param_num, NULL);
         param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 2);
-        TCCGEN_DEBUG("[TCCGEN] FUNCPARAMVAL push: site=memmove call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
-                     call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)param_num.c.i), vtop[-1].r, vtop[-1].vr);
+        LOG_CODEGEN("FUNCPARAMVAL push: site=memmove call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d", call_id,
+                    TCCIR_DECODE_PARAM_IDX((uint32_t)param_num.c.i), vtop[-1].r, vtop[-1].vr);
         tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &param_num, NULL);
 
         SValue call_id_sv = tcc_ir_svalue_call_id_argc(call_id, 3);
@@ -8849,6 +9969,7 @@ ST_FUNC void vstore(void)
         vtop -= 4;
       }
     }
+  vstore_done:;
   }
   else if (ft & VT_BITFIELD)
   {
@@ -9173,9 +10294,14 @@ ST_FUNC void inc(int post, int c)
      *
      * Fix: emit an explicit LOAD of the stored value into a fresh temp vreg.
      * This materializes the value so that subsequent indir() correctly treats
-     * it as a pointer value to dereference, not a stack-slot reference. */
+     * it as a pointer value to dereference, not a stack-slot reference.
+     *
+     * Only do this for VAR vregs (local variables with stack slots).
+     * TEMP vregs already hold the computed value in a register and don't
+     * need reloading — emitting a LOAD for them would incorrectly treat
+     * the integer value as a memory address (crashes on global pre-dec). */
     SValue *sv = vtop;
-    if (sv->vr >= 0 && (sv->r & VT_VALMASK) == 0)
+    if (sv->vr >= 0 && (sv->r & VT_VALMASK) == 0 && TCCIR_DECODE_VREG_TYPE(sv->vr) == TCCIR_VREG_TYPE_VAR)
     {
       SValue src;
       memset(&src, 0, sizeof(src));
@@ -9317,6 +10443,12 @@ redo:
     case TOK_ALWAYS_INLINE1:
     case TOK_ALWAYS_INLINE2:
       ad->f.func_alwinl = 1;
+      break;
+    case TOK_NOINLINE1:
+    case TOK_NOINLINE2:
+    case TOK_NOIPA1:
+    case TOK_NOIPA2:
+      ad->f.func_noinline = 1;
       break;
     case TOK_SECTION1:
     case TOK_SECTION2:
@@ -10570,7 +11702,7 @@ static int parse_btype(CType *type, AttributeDef *ad, int ignore_label)
       if (tok >= TOK_IDENT)
       {
         const char *tok_str = get_tok_str(tok, NULL);
-        if (tok_str && strcmp(tok_str, "__thread") == 0)
+        if (tok_str && tok_str[0] == '_' && strcmp(tok_str, "__thread") == 0)
         {
           next();
           break;
@@ -10583,7 +11715,7 @@ static int parse_btype(CType *type, AttributeDef *ad, int ignore_label)
       if (tok >= TOK_IDENT && tcc_state->cversion > 201710)
       {
         const char *tok_str = get_tok_str(tok, NULL);
-        if (tok_str && strcmp(tok_str, "bool") == 0)
+        if (tok_str && tok_str[0] == 'b' && strcmp(tok_str, "bool") == 0)
         {
           u = VT_BOOL;
           next();
@@ -11100,6 +12232,48 @@ ST_FUNC void indir(void)
       vtop->r |= VT_MUSTBOUND;
 #endif
   }
+
+  /* Inline-eval fold: `*&g` where g is a static with a known initializer and
+   * no observed writes becomes a VT_CONST of the initializer value. Applies
+   * only under nocode_wanted (speculative try_inline_const_eval) so regular
+   * code generation is unaffected. */
+  if (nocode_wanted && (vtop->r & (VT_VALMASK | VT_SYM | VT_LVAL)) == (VT_CONST | VT_SYM | VT_LVAL) && vtop->sym &&
+      !vtop->sym->a.possibly_written && !(vtop->type.t & (VT_ARRAY | VT_VLA)))
+  {
+    int btype = vtop->type.t & VT_BTYPE;
+    if (btype == VT_BYTE || btype == VT_SHORT || btype == VT_INT || btype == VT_LLONG || btype == VT_BOOL ||
+        btype == VT_PTR)
+    {
+      ElfSym *esym = elfsym(vtop->sym);
+      if (esym && esym->st_shndx != SHN_UNDEF && esym->st_shndx != SHN_COMMON &&
+          esym->st_shndx < tcc_state->nb_sections)
+      {
+        Section *sec = tcc_state->sections[esym->st_shndx];
+        int align;
+        int sz = type_size(&vtop->type, &align);
+        unsigned long off = (unsigned long)(esym->st_value + (unsigned long long)vtop->c.i);
+        if (sec && sec->data && sz > 0 && off + (unsigned long)sz <= sec->data_offset)
+        {
+          const unsigned char *ptr = sec->data + off;
+          int64_t val = 0;
+          if (sz == 8)
+            memcpy(&val, ptr, 8);
+          else
+          {
+            memcpy(&val, ptr, sz);
+            if (!(vtop->type.t & VT_UNSIGNED) && sz < 8)
+            {
+              int shift = (8 - sz) * 8;
+              val = (int64_t)(val << shift) >> shift;
+            }
+          }
+          vtop->c.i = val;
+          vtop->r = VT_CONST;
+          /* Preserve sym so a later & operator can restore the lvalue form. */
+        }
+      }
+    }
+  }
 }
 
 /* pass a parameter to a function and do type checking and casting */
@@ -11107,6 +12281,16 @@ static void gfunc_param_typed(Sym *func, Sym *arg)
 {
   int func_type;
   CType type;
+
+  /* If &g is being bound to a non-const pointer param, the callee may write
+   * through it — poison g so inline-eval won't fold `*&g` to its initializer. */
+  if (!nocode_wanted && arg && vtop->sym && (vtop->r & (VT_VALMASK | VT_SYM | VT_LVAL)) == (VT_CONST | VT_SYM) &&
+      (arg->type.t & VT_BTYPE) == VT_PTR)
+  {
+    CType *pointed = pointed_type(&arg->type);
+    if (pointed && !(pointed->t & VT_CONSTANT))
+      vtop->sym->a.possibly_written = 1;
+  }
 
   func_type = func->f.func_type;
   if (func_type == FUNC_OLD || (func_type == FUNC_ELLIPSIS && arg == NULL))
@@ -11701,9 +12885,45 @@ static void gen_ir_void_call_args(SValue *args, int argc, int func_tok)
  * all these locals in unary_funcall()'s frame (TCC does not reuse stack
  * slots across scopes), saving ~2KB on the constrained RP2350 target.
  * Returns 1 if optimization was applied, 0 otherwise. */
-static int __attribute__((noinline)) unary_funcall_opt_string_builtins(const char *func_name, SValue *saved_args,
-                                                                       int nb_real_args, int call_id,
-                                                                       int ir_idx_before_first_param,
+
+/* NOP all FUNCPARAMVAL instructions belonging to call_id, or roll back the IR
+ * stream to ir_idx_before_args if no params were emitted yet. */
+static void nop_or_rollback_call_params(int call_id, int ir_idx_before_first_param, int ir_idx_before_args)
+{
+  if (ir_idx_before_first_param >= 0)
+  {
+    int current_end = tcc_state->ir->next_instruction_index;
+    for (int i = ir_idx_before_first_param; i < current_end; i++)
+    {
+      if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
+      {
+        IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
+        int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
+        if (encoded_call_id == call_id)
+          tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
+      }
+    }
+  }
+  else
+  {
+    tcc_state->ir->next_instruction_index = ir_idx_before_args;
+  }
+}
+
+/* Redirect a call to a __tcc_* helper: NOP old params, emit new call via gen_ir_call_args. */
+static int redirect_call_to_tcc_helper(SValue *saved_args, int nargs, const char *helper_name, CType *result_type,
+                                       int call_id, int ir_idx_before_first_param, int ir_idx_before_args)
+{
+  nop_or_rollback_call_params(call_id, ir_idx_before_first_param, ir_idx_before_args);
+  gen_ir_call_args(saved_args, nargs, tok_alloc_const(helper_name), result_type);
+  vtop[-1] = vtop[0];
+  --vtop;
+  return 1;
+}
+
+static int __attribute__((noinline)) unary_funcall_opt_string_builtins(int func_tok, const char *func_name,
+                                                                       SValue *saved_args, int nb_real_args,
+                                                                       int call_id, int ir_idx_before_first_param,
                                                                        int ir_idx_before_args, const CType *ret_type)
 {
   int optimized = 0;
@@ -11715,7 +12935,23 @@ static int __attribute__((noinline)) unary_funcall_opt_string_builtins(const cha
   const char *rhs_str = NULL;
   size_t n_const = 0;
 
-  if (nb_real_args == 2 && strcmp(func_name, "strcmp") == 0)
+  const int id = resolve_str_builtin_id(func_tok, func_name);
+  if (id == STRBI_UNKNOWN)
+    return 0;
+
+  /* --- Constant folding: try to evaluate at compile time --- */
+
+  if (nb_real_args == 1 && id == STRBI_STRLEN)
+  {
+    lhs_str = try_get_constant_string(&saved_args[0], &lhs_len);
+    if (lhs_str)
+    {
+      folded_result = lhs_len;
+      can_fold_result = 1;
+    }
+  }
+
+  if (nb_real_args == 2 && id == STRBI_STRCMP)
   {
     lhs_str = try_get_constant_string(&saved_args[0], &lhs_len);
     rhs_str = try_get_constant_string(&saved_args[1], &rhs_len);
@@ -11726,358 +12962,7 @@ static int __attribute__((noinline)) unary_funcall_opt_string_builtins(const cha
     }
   }
 
-  if (!can_fold_result && nb_real_args == 2 &&
-      (strcmp(func_name, "strcmp") == 0 || strcmp(func_name, "__builtin_strcmp") == 0))
-  {
-    if (ir_idx_before_first_param >= 0)
-    {
-      int current_end = tcc_state->ir->next_instruction_index;
-      for (int i = ir_idx_before_first_param; i < current_end; i++)
-      {
-        if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-        {
-          IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-          int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-          if (encoded_call_id == call_id)
-            tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-        }
-      }
-    }
-    else
-    {
-      tcc_state->ir->next_instruction_index = ir_idx_before_args;
-    }
-
-    {
-      CType rt = {VT_INT, NULL};
-      gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_strcmp"), &rt);
-      vtop[-1] = vtop[0];
-      --vtop;
-      optimized = 1;
-    }
-  }
-
-  if (!can_fold_result && nb_real_args == 2 &&
-      (strcmp(func_name, "strcpy") == 0 || strcmp(func_name, "__builtin_strcpy") == 0))
-  {
-    if (ir_idx_before_first_param >= 0)
-    {
-      int current_end = tcc_state->ir->next_instruction_index;
-      for (int i = ir_idx_before_first_param; i < current_end; i++)
-      {
-        if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-        {
-          IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-          int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-          if (encoded_call_id == call_id)
-            tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-        }
-      }
-    }
-    else
-    {
-      tcc_state->ir->next_instruction_index = ir_idx_before_args;
-    }
-
-    {
-      gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_strcpy"), &saved_args[0].type);
-      vtop[-1] = vtop[0];
-      --vtop;
-      optimized = 1;
-    }
-  }
-
-  if (!can_fold_result && nb_real_args == 2 &&
-      (strcmp(func_name, "stpcpy") == 0 || strcmp(func_name, "__builtin_stpcpy") == 0))
-  {
-    CType result_type = *ret_type;
-
-    if (ir_idx_before_first_param >= 0)
-    {
-      int current_end = tcc_state->ir->next_instruction_index;
-      for (int i = ir_idx_before_first_param; i < current_end; i++)
-      {
-        if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-        {
-          IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-          int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-          if (encoded_call_id == call_id)
-            tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-        }
-      }
-    }
-    else
-    {
-      tcc_state->ir->next_instruction_index = ir_idx_before_args;
-    }
-
-    {
-      gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_stpcpy"), &result_type);
-      vtop[-1] = vtop[0];
-      --vtop;
-      optimized = 1;
-    }
-  }
-
-  if (!can_fold_result && nb_real_args == 1 &&
-      (strcmp(func_name, "strlen") == 0 || strcmp(func_name, "__builtin_strlen") == 0))
-  {
-    CType result_type = *ret_type;
-
-    if (ir_idx_before_first_param >= 0)
-    {
-      int current_end = tcc_state->ir->next_instruction_index;
-      for (int i = ir_idx_before_first_param; i < current_end; i++)
-      {
-        if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-        {
-          IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-          int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-          if (encoded_call_id == call_id)
-            tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-        }
-      }
-    }
-    else
-    {
-      tcc_state->ir->next_instruction_index = ir_idx_before_args;
-    }
-
-    {
-      gen_ir_call_args(saved_args, 1, tok_alloc_const("__tcc_strlen"), &result_type);
-      vtop[-1] = vtop[0];
-      --vtop;
-      optimized = 1;
-    }
-  }
-
-  if (!can_fold_result && nb_real_args == 2 &&
-      (strcmp(func_name, "strnlen") == 0 || strcmp(func_name, "__builtin_strnlen") == 0))
-  {
-    CType result_type = *ret_type;
-
-    if (ir_idx_before_first_param >= 0)
-    {
-      int current_end = tcc_state->ir->next_instruction_index;
-      for (int i = ir_idx_before_first_param; i < current_end; i++)
-      {
-        if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-        {
-          IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-          int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-          if (encoded_call_id == call_id)
-            tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-        }
-      }
-    }
-    else
-    {
-      tcc_state->ir->next_instruction_index = ir_idx_before_args;
-    }
-
-    {
-      gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_strnlen"), &result_type);
-      vtop[-1] = vtop[0];
-      --vtop;
-      optimized = 1;
-    }
-  }
-
-  if (!can_fold_result && nb_real_args == 2 &&
-      (strcmp(func_name, "strpbrk") == 0 || strcmp(func_name, "__builtin_strpbrk") == 0))
-  {
-    CType result_type = *ret_type;
-
-    if (ir_idx_before_first_param >= 0)
-    {
-      int current_end = tcc_state->ir->next_instruction_index;
-      for (int i = ir_idx_before_first_param; i < current_end; i++)
-      {
-        if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-        {
-          IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-          int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-          if (encoded_call_id == call_id)
-            tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-        }
-      }
-    }
-    else
-    {
-      tcc_state->ir->next_instruction_index = ir_idx_before_args;
-    }
-
-    {
-      gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_strpbrk"), &result_type);
-      vtop[-1] = vtop[0];
-      --vtop;
-      optimized = 1;
-    }
-  }
-
-  if (!can_fold_result && nb_real_args == 2 &&
-      (strcmp(func_name, "strrchr") == 0 || strcmp(func_name, "rindex") == 0 ||
-       strcmp(func_name, "__builtin_strrchr") == 0 || strcmp(func_name, "__builtin_rindex") == 0))
-  {
-    CType result_type = *ret_type;
-
-    if (ir_idx_before_first_param >= 0)
-    {
-      int current_end = tcc_state->ir->next_instruction_index;
-      for (int i = ir_idx_before_first_param; i < current_end; i++)
-      {
-        if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-        {
-          IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-          int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-          if (encoded_call_id == call_id)
-            tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-        }
-      }
-    }
-    else
-    {
-      tcc_state->ir->next_instruction_index = ir_idx_before_args;
-    }
-
-    {
-      gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_strrchr"), &result_type);
-      vtop[-1] = vtop[0];
-      --vtop;
-      optimized = 1;
-    }
-  }
-
-  if (!can_fold_result && nb_real_args == 2 &&
-      (strcmp(func_name, "strstr") == 0 || strcmp(func_name, "__builtin_strstr") == 0))
-  {
-    CType result_type = *ret_type;
-
-    if (ir_idx_before_first_param >= 0)
-    {
-      int current_end = tcc_state->ir->next_instruction_index;
-      for (int i = ir_idx_before_first_param; i < current_end; i++)
-      {
-        if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-        {
-          IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-          int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-          if (encoded_call_id == call_id)
-            tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-        }
-      }
-    }
-    else
-    {
-      tcc_state->ir->next_instruction_index = ir_idx_before_args;
-    }
-
-    {
-      gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_strstr"), &result_type);
-      vtop[-1] = vtop[0];
-      --vtop;
-      optimized = 1;
-    }
-  }
-
-  if (!can_fold_result && nb_real_args == 2 &&
-      (strcmp(func_name, "strcspn") == 0 || strcmp(func_name, "__builtin_strcspn") == 0))
-  {
-    CType result_type = *ret_type;
-
-    if (ir_idx_before_first_param >= 0)
-    {
-      int current_end = tcc_state->ir->next_instruction_index;
-      for (int i = ir_idx_before_first_param; i < current_end; i++)
-      {
-        if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-        {
-          IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-          int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-          if (encoded_call_id == call_id)
-            tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-        }
-      }
-    }
-    else
-    {
-      tcc_state->ir->next_instruction_index = ir_idx_before_args;
-    }
-
-    {
-      gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_strcspn"), &result_type);
-      vtop[-1] = vtop[0];
-      --vtop;
-      optimized = 1;
-    }
-  }
-
-  if (!can_fold_result && nb_real_args == 3 &&
-      (strcmp(func_name, "strncpy") == 0 || strcmp(func_name, "__builtin_strncpy") == 0))
-  {
-    CType result_type = *ret_type;
-
-    if (ir_idx_before_first_param >= 0)
-    {
-      int current_end = tcc_state->ir->next_instruction_index;
-      for (int i = ir_idx_before_first_param; i < current_end; i++)
-      {
-        if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-        {
-          IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-          int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-          if (encoded_call_id == call_id)
-            tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-        }
-      }
-    }
-    else
-    {
-      tcc_state->ir->next_instruction_index = ir_idx_before_args;
-    }
-
-    {
-      gen_ir_call_args(saved_args, 3, tok_alloc_const("__tcc_strncpy"), &result_type);
-      vtop[-1] = vtop[0];
-      --vtop;
-      optimized = 1;
-    }
-  }
-
-  if (!can_fold_result && nb_real_args == 3 &&
-      (strcmp(func_name, "strncat") == 0 || strcmp(func_name, "__builtin_strncat") == 0))
-  {
-    CType result_type = *ret_type;
-
-    if (ir_idx_before_first_param >= 0)
-    {
-      int current_end = tcc_state->ir->next_instruction_index;
-      for (int i = ir_idx_before_first_param; i < current_end; i++)
-      {
-        if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-        {
-          IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-          int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-          if (encoded_call_id == call_id)
-            tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-        }
-      }
-    }
-    else
-    {
-      tcc_state->ir->next_instruction_index = ir_idx_before_args;
-    }
-
-    {
-      gen_ir_call_args(saved_args, 3, tok_alloc_const("__tcc_strncat"), &result_type);
-      vtop[-1] = vtop[0];
-      --vtop;
-      optimized = 1;
-    }
-  }
-
-  if (!can_fold_result && nb_real_args == 3 && strcmp(func_name, "strncmp") == 0 &&
-      !is_zero_length_builtin_compare(&saved_args[2]))
+  if (!can_fold_result && nb_real_args == 3 && id == STRBI_STRNCMP && !is_zero_length_builtin_compare(&saved_args[2]))
   {
     lhs_str = try_get_constant_string(&saved_args[0], &lhs_len);
     rhs_str = try_get_constant_string(&saved_args[1], &rhs_len);
@@ -12088,7 +12973,7 @@ static int __attribute__((noinline)) unary_funcall_opt_string_builtins(const cha
     }
   }
 
-  if (!can_fold_result && nb_real_args == 3 && strcmp(func_name, "memcmp") == 0)
+  if (!can_fold_result && nb_real_args == 3 && id == STRBI_MEMCMP)
   {
     lhs_str = try_get_constant_string(&saved_args[0], &lhs_len);
     rhs_str = try_get_constant_string(&saved_args[1], &rhs_len);
@@ -12100,8 +12985,7 @@ static int __attribute__((noinline)) unary_funcall_opt_string_builtins(const cha
     }
   }
 
-  if (!can_fold_result && nb_real_args == 3 && strcmp(func_name, "memcmp") == 0 &&
-      try_get_constant_size_t(&saved_args[2], &n_const))
+  if (!can_fold_result && nb_real_args == 3 && id == STRBI_MEMCMP && try_get_constant_size_t(&saved_args[2], &n_const))
   {
     if (n_const == 0)
     {
@@ -12110,57 +12994,55 @@ static int __attribute__((noinline)) unary_funcall_opt_string_builtins(const cha
     }
     else if (n_const == 1)
     {
-      if (ir_idx_before_first_param >= 0)
-      {
-        int current_end = tcc_state->ir->next_instruction_index;
-        for (int i = ir_idx_before_first_param; i < current_end; i++)
-        {
-          if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-          {
-            IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-            int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-            if (encoded_call_id == call_id)
-              tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-          }
-        }
-      }
-      else
-      {
-        tcc_state->ir->next_instruction_index = ir_idx_before_args;
-      }
-
-      {
-        CType rt = {VT_INT, NULL};
-        gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_memcmp1"), &rt);
-        vtop[-1] = vtop[0];
-        --vtop;
-        optimized = 1;
-      }
+      CType rt = {VT_INT, NULL};
+      optimized = redirect_call_to_tcc_helper(saved_args, 2, "__tcc_memcmp1", &rt, call_id, ir_idx_before_first_param,
+                                              ir_idx_before_args);
     }
   }
 
-  if (!can_fold_result && nb_real_args == 3 && (strcmp(func_name, "memmove") == 0 || strcmp(func_name, "bcopy") == 0))
+  if (!can_fold_result && nb_real_args == 3 && is_zero_length_builtin_compare(&saved_args[2]))
   {
-    const int is_bcopy = strcmp(func_name, "bcopy") == 0;
+    if (id == STRBI_STRNCMP || id == STRBI_MEMCMP)
+    {
+      folded_result = 0;
+      can_fold_result = 1;
+    }
+  }
 
-    if (ir_idx_before_first_param >= 0)
+  if (!can_fold_result && nb_real_args == 3 && id == STRBI_MEMCHR)
+  {
+    unsigned char needle = 0;
+    int match_offset = -1;
+    lhs_str = try_get_constant_string(&saved_args[0], &lhs_len);
+    if (lhs_str && try_get_constant_uchar(&saved_args[1], &needle) &&
+        try_get_constant_size_t(&saved_args[2], &n_const) && n_const <= (size_t)lhs_len + 1 &&
+        fold_builtin_memchr_offset(lhs_str, needle, n_const, &match_offset))
     {
-      int current_end = tcc_state->ir->next_instruction_index;
-      for (int i = ir_idx_before_first_param; i < current_end; i++)
+      nop_or_rollback_call_params(call_id, ir_idx_before_first_param, ir_idx_before_args);
+
+      if (match_offset >= 0)
       {
-        if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-        {
-          IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-          int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-          if (encoded_call_id == call_id)
-            tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-        }
+        SValue match_sv = saved_args[0];
+        match_sv.c.i += match_offset;
+        vpushv(&match_sv);
       }
+      else
+      {
+        vpushi(0);
+        vtop->type = saved_args[0].type;
+      }
+
+      vtop[-1] = vtop[0];
+      --vtop;
+      optimized = 1;
     }
-    else
-    {
-      tcc_state->ir->next_instruction_index = ir_idx_before_args;
-    }
+  }
+
+  /* --- Redirect to __tcc_* helpers (non-foldable cases) --- */
+
+  if (!can_fold_result && !optimized && nb_real_args == 3 && (id == STRBI_MEMMOVE || id == STRBI_BCOPY))
+  {
+    nop_or_rollback_call_params(call_id, ir_idx_before_first_param, ir_idx_before_args);
 
     {
       SValue param_num;
@@ -12170,7 +13052,7 @@ static int __attribute__((noinline)) unary_funcall_opt_string_builtins(const cha
       param_num.vr = -1;
       param_num.r = VT_CONST;
 
-      if (is_bcopy)
+      if (id == STRBI_BCOPY)
       {
         param_num.c.i = TCCIR_ENCODE_PARAM(new_call_id, 0);
         tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[0], &param_num, NULL);
@@ -12230,143 +13112,128 @@ static int __attribute__((noinline)) unary_funcall_opt_string_builtins(const cha
     }
   }
 
-  if (!can_fold_result && nb_real_args == 3 && strcmp(func_name, "strncmp") == 0)
+  /* Simple redirects: NOP old call, emit __tcc_* replacement */
+  if (!can_fold_result && !optimized)
   {
-    if (ir_idx_before_first_param >= 0)
+    const char *helper = NULL;
+    int nargs = 0;
+    CType result_type = *ret_type;
+
+    switch (id)
     {
-      int current_end = tcc_state->ir->next_instruction_index;
-      for (int i = ir_idx_before_first_param; i < current_end; i++)
+    case STRBI_STRCMP:
+      if (nb_real_args == 2)
       {
-        if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-        {
-          IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-          int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-          if (encoded_call_id == call_id)
-            tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-        }
+        helper = "__tcc_strcmp";
+        nargs = 2;
+        result_type.t = VT_INT;
+        result_type.ref = NULL;
       }
-    }
-    else
-    {
-      tcc_state->ir->next_instruction_index = ir_idx_before_args;
+      break;
+    case STRBI_STRCPY:
+      if (nb_real_args == 2)
+      {
+        helper = "__tcc_strcpy";
+        nargs = 2;
+        result_type = saved_args[0].type;
+      }
+      break;
+    case STRBI_STPCPY:
+      if (nb_real_args == 2)
+      {
+        helper = "__tcc_stpcpy";
+        nargs = 2;
+      }
+      break;
+    case STRBI_STRLEN:
+      if (nb_real_args == 1)
+      {
+        helper = "__tcc_strlen";
+        nargs = 1;
+      }
+      break;
+    case STRBI_STRNLEN:
+      if (nb_real_args == 2)
+      {
+        helper = "__tcc_strnlen";
+        nargs = 2;
+      }
+      break;
+    case STRBI_STRPBRK:
+      if (nb_real_args == 2)
+      {
+        helper = "__tcc_strpbrk";
+        nargs = 2;
+      }
+      break;
+    case STRBI_STRRCHR:
+    case STRBI_RINDEX:
+      if (nb_real_args == 2)
+      {
+        helper = "__tcc_strrchr";
+        nargs = 2;
+      }
+      break;
+    case STRBI_STRSTR:
+      if (nb_real_args == 2)
+      {
+        helper = "__tcc_strstr";
+        nargs = 2;
+      }
+      break;
+    case STRBI_STRCSPN:
+      if (nb_real_args == 2)
+      {
+        helper = "__tcc_strcspn";
+        nargs = 2;
+      }
+      break;
+    case STRBI_STRNCPY:
+      if (nb_real_args == 3)
+      {
+        helper = "__tcc_strncpy";
+        nargs = 3;
+      }
+      break;
+    case STRBI_STRNCAT:
+      if (nb_real_args == 3)
+      {
+        helper = "__tcc_strncat";
+        nargs = 3;
+      }
+      break;
+    case STRBI_STRNCMP:
+      if (nb_real_args == 3)
+      {
+        helper = "__tcc_strncmp";
+        nargs = 3;
+        result_type.t = VT_INT;
+        result_type.ref = NULL;
+      }
+      break;
+    case STRBI_STRCHR:
+    case STRBI_INDEX:
+      if (nb_real_args == 2)
+      {
+        helper = "__tcc_strchr";
+        nargs = 2;
+        result_type = saved_args[0].type;
+      }
+      break;
+    default:
+      break;
     }
 
-    {
-      CType rt = {VT_INT, NULL};
-      gen_ir_call_args(saved_args, 3, tok_alloc_const("__tcc_strncmp"), &rt);
-      vtop[-1] = vtop[0];
-      --vtop;
-      optimized = 1;
-    }
+    if (helper)
+      optimized = redirect_call_to_tcc_helper(saved_args, nargs, helper, &result_type, call_id,
+                                              ir_idx_before_first_param, ir_idx_before_args);
   }
 
-  if (!can_fold_result && nb_real_args == 3 && is_zero_length_builtin_compare(&saved_args[2]))
-  {
-    if (strcmp(func_name, "strncmp") == 0 || strcmp(func_name, "memcmp") == 0)
-    {
-      folded_result = 0;
-      can_fold_result = 1;
-    }
-  }
-
-  if (!can_fold_result && nb_real_args == 3 && strcmp(func_name, "memchr") == 0)
-  {
-    unsigned char needle = 0;
-    int match_offset = -1;
-    lhs_str = try_get_constant_string(&saved_args[0], &lhs_len);
-    if (lhs_str && try_get_constant_uchar(&saved_args[1], &needle) &&
-        try_get_constant_size_t(&saved_args[2], &n_const) && n_const <= (size_t)lhs_len + 1 &&
-        fold_builtin_memchr_offset(lhs_str, needle, n_const, &match_offset))
-    {
-      if (ir_idx_before_first_param >= 0)
-      {
-        int current_end = tcc_state->ir->next_instruction_index;
-        for (int i = ir_idx_before_first_param; i < current_end; i++)
-        {
-          if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-          {
-            IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-            int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-            if (encoded_call_id == call_id)
-              tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-          }
-        }
-      }
-      else
-      {
-        tcc_state->ir->next_instruction_index = ir_idx_before_args;
-      }
-
-      if (match_offset >= 0)
-      {
-        SValue match_sv = saved_args[0];
-        match_sv.c.i += match_offset;
-        vpushv(&match_sv);
-      }
-      else
-      {
-        vpushi(0);
-        vtop->type = saved_args[0].type;
-      }
-
-      vtop[-1] = vtop[0];
-      --vtop;
-      optimized = 1;
-    }
-  }
-
-  if (!can_fold_result && nb_real_args == 2 &&
-      (strcmp(func_name, "strchr") == 0 || strcmp(func_name, "index") == 0 ||
-       strcmp(func_name, "__builtin_index") == 0))
-  {
-    if (ir_idx_before_first_param >= 0)
-    {
-      int current_end = tcc_state->ir->next_instruction_index;
-      for (int i = ir_idx_before_first_param; i < current_end; i++)
-      {
-        if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-        {
-          IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-          int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-          if (encoded_call_id == call_id)
-            tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-        }
-      }
-    }
-    else
-    {
-      tcc_state->ir->next_instruction_index = ir_idx_before_args;
-    }
-
-    {
-      gen_ir_call_args(saved_args, 2, tok_alloc_const("__tcc_strchr"), &saved_args[0].type);
-      vtop[-1] = vtop[0];
-      --vtop;
-      optimized = 1;
-    }
-  }
+  /* --- Emit folded constant --- */
 
   if (can_fold_result)
   {
-    if (ir_idx_before_first_param >= 0)
-    {
-      int current_end = tcc_state->ir->next_instruction_index;
-      for (int i = ir_idx_before_first_param; i < current_end; i++)
-      {
-        if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-        {
-          IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-          int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-          if (encoded_call_id == call_id)
-            tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-        }
-      }
-    }
-    else
-    {
-      tcc_state->ir->next_instruction_index = ir_idx_before_args;
-    }
-
+    nop_or_rollback_call_params(call_id, ir_idx_before_first_param, ir_idx_before_args);
     vpushi(folded_result);
     vtop[-1] = vtop[0];
     --vtop;
@@ -12424,6 +13291,7 @@ static void unary_funcall(void)
    * a sibling (defined in the same enclosing scope), R10 already holds the
    * correct chain pointer from our own incoming chain — emitting SET_CHAIN
    * would clobber it with R7 which may be an unrelated frame pointer. */
+  int set_chain_ir_idx = -1;
   if (tcc_state->ir && call_func_sym && call_func_sym->a.nested_func)
   {
     int emit_set_chain = 1;
@@ -12459,6 +13327,7 @@ static void unary_funcall(void)
       dest.type.t = VT_PTR;
       dest.r = 0;
       dest.vr = -1;
+      set_chain_ir_idx = tcc_ir_count(tcc_state->ir);
       tcc_ir_put(tcc_state->ir, TCCIR_OP_SET_CHAIN, &src, NULL, &dest);
     }
   }
@@ -12523,8 +13392,8 @@ static void unary_funcall(void)
           num.vr = -1;
           num.r = VT_CONST;
           num.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
-          TCCGEN_DEBUG("[TCCGEN] FUNCPARAMVAL push: site=sret_param0 call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
-                       call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)num.c.i), vtop->r, vtop->vr);
+          LOG_CODEGEN("FUNCPARAMVAL push: site=sret_param0 call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d", call_id,
+                      TCCIR_DECODE_PARAM_IDX((uint32_t)num.c.i), vtop->r, vtop->vr);
           tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL);
         }
         vtop--;
@@ -12547,10 +13416,16 @@ static void unary_funcall(void)
   }
 
   /* Storage for arguments in case we need to constant-fold.
-   * Heap-allocated to reduce unary()'s stack frame — this 320-byte array
-   * would otherwise bloat every recursive call (TCC allocates all block-scoped
-   * locals at function entry). */
-  SValue *saved_args = tcc_mallocz(8 * sizeof(SValue));
+   * Heap-allocated to reduce unary()'s stack frame.
+   * Size based on parameter count so we can inline functions with >8 params. */
+  int saved_args_cap = 8;
+  if (call_func_sym && call_func_sym->type.ref)
+  {
+    int pc = auto_inline_param_count(call_func_sym);
+    if (pc > saved_args_cap)
+      saved_args_cap = pc;
+  }
+  SValue *saved_args = tcc_mallocz(saved_args_cap * sizeof(SValue));
   int saved_arg_count = 0;
   int can_try_fold = 0;
   int can_inline_builtin = 0;
@@ -12582,8 +13457,14 @@ static void unary_funcall(void)
     }
   }
 
-  /* Check if the callee is a small inline function we might evaluate */
-  if (call_func_sym && (call_func_sym->type.t & VT_INLINE) && tcc_state->optimize)
+  /* Check if the callee is a small inline function we might evaluate.
+   * Also enter this path for non-static auto-inline candidates: they don't
+   * have VT_INLINE (needed for correct ELF linkage) but should still be
+   * inlined at call sites within this translation unit. */
+  if (call_func_sym && tcc_state->optimize &&
+      ((call_func_sym->type.t & VT_INLINE) ||
+       (call_func_sym->type.ref &&
+        (call_func_sym->type.ref->f.func_auto_inline || call_func_sym->type.ref->f.func_eval_only_inline))))
     can_inline_eval = 1;
 
   /* Detect printf-family functions that can be optimized.
@@ -12999,7 +13880,7 @@ va_arg_pack_done:
          * This must happen BEFORE the double-complex materialization below,
          * which converts VT_CONST to VT_LOCAL. */
         if ((can_try_fold || can_inline_builtin || can_inline_eval || can_optimize_printf_family) &&
-            saved_arg_count < 8 && !NOEVAL_WANTED)
+            saved_arg_count < saved_args_cap && !NOEVAL_WANTED)
         {
           saved_args[saved_arg_count++] = *vtop;
         }
@@ -13076,9 +13957,9 @@ va_arg_pack_done:
             ir_idx_before_first_param = tcc_ir_count(tcc_state->ir);
           num.r = VT_CONST;
           num.c.i = TCCIR_ENCODE_PARAM(call_id, nb_args);
-          TCCGEN_DEBUG("[TCCGEN] FUNCPARAMVAL push: site=forward_arg call_id=%d param_idx=%d nb_args=%d vtop_r=0x%x "
-                       "vtop_vr=%d\n",
-                       call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)num.c.i), nb_args, vtop->r, vtop->vr);
+          LOG_CODEGEN("FUNCPARAMVAL push: site=forward_arg call_id=%d param_idx=%d nb_args=%d vtop_r=0x%x "
+                      "vtop_vr=%d",
+                      call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)num.c.i), nb_args, vtop->r, vtop->vr);
           tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL);
         }
         vtop--; /* consumed */
@@ -13110,8 +13991,8 @@ va_arg_pack_done:
 
       /* Save argument for potential constant folding or inline evaluation (in reverse order for reverse_funcargs)
        */
-      if ((can_try_fold || can_inline_builtin || can_inline_eval || can_optimize_printf_family) && n < 8 &&
-          !NOEVAL_WANTED)
+      if ((can_try_fold || can_inline_builtin || can_inline_eval || can_optimize_printf_family) && n < saved_args_cap &&
+          (nb_args - 1 - n) < saved_args_cap && !NOEVAL_WANTED)
       {
         saved_args[nb_args - 1 - n] = *vtop;
         if (n == 0)
@@ -13130,9 +14011,9 @@ va_arg_pack_done:
         num.vr = -1;
         num.r = VT_CONST;
         num.c.i = TCCIR_ENCODE_PARAM(call_id, nb_args - 1 - n);
-        TCCGEN_DEBUG("[TCCGEN] FUNCPARAMVAL push: site=reverse_arg call_id=%d param_idx=%d n=%d nb_args=%d vtop_r=0x%x "
-                     "vtop_vr=%d\n",
-                     call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)num.c.i), n, nb_args, vtop->r, vtop->vr);
+        LOG_CODEGEN("FUNCPARAMVAL push: site=reverse_arg call_id=%d param_idx=%d n=%d nb_args=%d vtop_r=0x%x "
+                    "vtop_vr=%d",
+                    call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)num.c.i), n, nb_args, vtop->r, vtop->vr);
         tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL);
       }
       vtop--; /* consumed */
@@ -13207,6 +14088,8 @@ va_arg_pack_done:
       vtop[-1] = vtop[0];
       --vtop;
       tcc_state->ir->next_instruction_index = ir_idx_before_args;
+      if (set_chain_ir_idx >= 0 && tcc_state->ir)
+        tcc_state->ir->compact_instructions[set_chain_ir_idx].op = TCCIR_OP_NOP;
       inline_evaled = 1;
     }
   }
@@ -13632,8 +14515,9 @@ va_arg_pack_done:
   if (!folded && !inlined && !inline_evaled && !sprintf_family_optimized && !printf_family_optimized &&
       !fputs_family_optimized && func_name && saved_arg_count == nb_real_args && !NOEVAL_WANTED)
   {
-    string_builtin_optimized = unary_funcall_opt_string_builtins(
-        func_name, saved_args, nb_real_args, call_id, ir_idx_before_first_param, ir_idx_before_args, &ret.type);
+    string_builtin_optimized =
+        unary_funcall_opt_string_builtins(call_func_sym ? call_func_sym->v : 0, func_name, saved_args, nb_real_args,
+                                          call_id, ir_idx_before_first_param, ir_idx_before_args, &ret.type);
   }
   if (folded)
   {
@@ -13656,14 +14540,10 @@ va_arg_pack_done:
            !tcc_state->in_inline_expansion)
   {
     /* ---- Token-level inline expansion ----
-     * Only expand inline functions whose body contains address-of-label
-     * (&&label).  This is the specific case where call-site inlining
-     * is required: each expansion must get unique label addresses.
-     * Also expand always_inline functions at the call site when their
-     * body contains inline asm, so asm constraints are checked against
-     * caller-provided operands rather than abstract parameters.
-     * General inlining of all other inline functions is left to
-     * gen_inline_functions() which compiles them as standalone funcs. */
+     * Expand inline functions at the call site in these cases:
+     *  1. Body contains address-of-label (&&label) — required for correctness.
+     *  2. always_inline attribute — user-requested inlining.
+     *  3. Auto-inline candidate (small static/inline function) at -O1/-O2. */
     struct InlineFunc *inline_fn = NULL;
     int force_always_inline = 0;
     int has_addr_of_label = 0;
@@ -13678,8 +14558,16 @@ va_arg_pack_done:
     }
     if (inline_fn && inline_fn->func_str)
       inline_scan_body_features(inline_fn->func_str, &has_addr_of_label, &has_inline_asm);
-    if (call_func_sym->type.ref && call_func_sym->type.ref->f.func_alwinl && has_inline_asm)
+    if (call_func_sym->type.ref && call_func_sym->type.ref->f.func_alwinl &&
+        !(inline_fn && inline_fn->func_str && inline_body_has_loops(inline_fn->func_str)))
       force_always_inline = 1;
+    /* Note: has_inline_asm no longer blocks always_inline expansion.
+     * tccasm.c's maybe_substitute_inline_const_arg() substitutes constant
+     * arguments for 'n'/'i' asm constraints during inline replay, so
+     * always_inline+asm functions with constant call-site arguments work
+     * correctly (e.g. pr27528: insn1(2), insn1(400), insn1(__LINE__)).
+     * For non-constant arguments, the constraint check still reports an error
+     * at the call site — the same behaviour as GCC always_inline. */
     if (force_always_inline && inline_fn && ((call_func_sym->type.ref->type.t & VT_BTYPE) != VT_VOID) &&
         !inline_body_has_return_stmt(inline_fn->func_str))
     {
@@ -13687,6 +14575,141 @@ va_arg_pack_done:
        * explicit return cannot currently be replayed safely at the call
        * site. Keep it as a normal inline call so we warn but don't crash. */
       force_always_inline = 0;
+    }
+    /* Eval-only candidates (func_eval_only_inline=1): body is larger than
+     * the inline-expansion threshold but small enough to keep for constant
+     * evaluation.  At a call site where every argument is a compile-time
+     * constant, post-inline const-prop + DCE will collapse the body to
+     * roughly the same code that try_inline_const_eval would have produced
+     * — and without struct-return CTFE support, this is the only way to
+     * fold struct-returning helpers like `Opcode make_opcode(...)`.
+     * Reuse the existing inline-expansion machinery by treating eval-only
+     * functions as auto-inlineable when all real args are VT_CONST. */
+    /* Eval-only callees (body > auto-inline threshold but within the eval-
+     * only cap) can still be inline-expanded at a given call site when every
+     * argument is a compile-time constant: post-inline const-prop + DCE
+     * collapses the body the same way CTFE would, and covers struct-return
+     * helpers that CTFE currently skips (no composite-return support).
+     *
+     * saved_args[0..saved_arg_count-1] holds the user-visible args only —
+     * sret-implicit args are consumed before the arg-parsing loop. */
+    int eval_only_all_const = 0;
+    /* When every call-site argument is a compile-time constant, allow
+     * inlining larger bodies: post-inline const-prop + DCE will collapse
+     * the expanded code.  This applies to any function whose token stream
+     * was saved (func_auto_inline, func_eval_only_inline, or post-opt
+     * retained), not just eval-only candidates. */
+    if (!force_always_inline && call_func_sym && call_func_sym->type.ref &&
+        !call_func_sym->type.ref->f.func_auto_inline &&
+        saved_arg_count == nb_real_args && saved_arg_count > 0 &&
+        inline_fn && inline_fn->func_str)
+    {
+      int all_const = 1;
+      for (int ai = 0; ai < saved_arg_count; ai++)
+      {
+        if ((saved_args[ai].r & (VT_VALMASK | VT_LVAL)) != VT_CONST)
+        {
+          all_const = 0;
+          break;
+        }
+      }
+      eval_only_all_const = all_const;
+    }
+
+    /* Skip inline expansion for eval-only functions whose constant result
+     * is already cached by IPC — the original body creates merge points
+     * that hurt value tracking in the caller.  Let IPC replace the call. */
+    int skip_ipc_cached = 0;
+    if (call_func_sym && call_func_sym->type.ref &&
+        call_func_sym->type.ref->f.func_eval_only_inline && tcc_state->opt_ipc)
+    {
+      int64_t _v; int _b;
+      if (tcc_ir_lookup_const_result(tcc_state, call_func_sym->v, &_v, &_b))
+        skip_ipc_cached = 1;
+    }
+
+    /* Auto-inline: expand small static/inline functions at -O1/-O2 when safe.
+     * Don't auto-inline into functions that use computed gotos (&&label):
+     * inlining increases register pressure which can force the IJMP codegen
+     * to spill via push/bx without a matching pop, corrupting the stack.
+     * Don't auto-inline functions that the IR optimizer would redirect to
+     * __tcc_* helpers (mempcpy, memcpy, strcpy, etc.) — inlining them
+     * prevents the redirect and preserves test-harness abort checks that
+     * should be bypassed. */
+    if (!force_always_inline && !has_addr_of_label && inline_fn && inline_fn->func_str && !has_inline_asm &&
+        !func_has_label_addr && call_func_sym->type.ref && !skip_ipc_cached &&
+        (call_func_sym->type.ref->f.func_auto_inline || eval_only_all_const) &&
+        !call_func_sym->type.ref->f.func_noinline && (tcc_state->opt_inline_functions || tcc_state->opt_inline_small) &&
+        !strbi_is_redirect_target(resolve_str_builtin_id(0, func_name)) &&
+        /* Don't inline a nested function with parent-scope captures into a
+         * sibling nested function — the captured variables won't be in scope. */
+        !(call_func_sym->a.nested_func && tcc_state->current_nested_func &&
+          nested_callee_has_genuine_capture(tcc_state, call_func_sym)) &&
+        /* Only inline functions whose signature is safe: scalar/pointer params
+         * that fit in 32-bit registers, and scalar or struct return types.
+         * 64-bit types and struct *parameters* are not handled. */
+        auto_inline_sig_ok(call_func_sym) &&
+        /* Don't inline if call-site argument count doesn't match the function's
+         * actual parameter count.  This can happen when calling through a cast
+         * to an incompatible function pointer type (e.g. ((int(*)(int))bar)(x)
+         * where bar takes void).  Use nb_real_args to exclude the implicit sret
+         * pointer that struct-returning calls add to nb_args. */
+        auto_inline_param_count(call_func_sym) == (nb_args - nb_implicit_args) &&
+        ((call_func_sym->type.ref->type.t & VT_BTYPE) == VT_VOID || inline_body_has_return_stmt(inline_fn->func_str)))
+    {
+      /* Safety: if the current outer macro stream is already reading from this
+       * function's own func_str buffer, inlining would corrupt the stream after
+       * end_macro() restores macro_ptr to a position inside func_str.  This can
+       * happen when the call site is inside the standalone compile_ts replay of
+       * the same function.  Fall back to a normal call in that case. */
+      int *_fsb = tok_str_buf(inline_fn->func_str);
+      int _fsl = inline_fn->func_str->len;
+      if ((!macro_ptr || macro_ptr < _fsb || macro_ptr >= _fsb + _fsl) &&
+          !inline_body_has_shadowed_ident(inline_fn->func_str) && !inline_body_has_static_local(inline_fn->func_str) &&
+          !inline_body_has_apply_args(inline_fn->func_str))
+      {
+        if (TCC_LOG_INLINE_STRUCT)
+          fprintf(stderr, "[auto-inline] callsite: inlining %s\n", get_tok_str(call_func_sym->v & ~SYM_FIELD, NULL));
+        LOG_INLINE_STRUCT("[auto-inline] callsite: INLINING %s (ret_btype=%d nb_args=%d nb_implicit=%d)",
+                          get_tok_str(call_func_sym->v & ~SYM_FIELD, NULL),
+                          call_func_sym->type.ref ? (call_func_sym->type.ref->type.t & VT_BTYPE) : -1, nb_args,
+                          nb_implicit_args);
+        force_always_inline = 1;
+      }
+      else if (TCC_LOG_INLINE_STRUCT)
+      {
+        fprintf(stderr,
+                "[auto-inline] callsite: skipping inline of %s "
+                "(outer macro reads from its own func_str)\n",
+                get_tok_str(call_func_sym->v & ~SYM_FIELD, NULL));
+      }
+    }
+    else if (!force_always_inline && !has_addr_of_label && call_func_sym->type.ref &&
+             call_func_sym->type.ref->f.func_auto_inline)
+    {
+      if (TCC_LOG_INLINE_STRUCT)
+        fprintf(stderr,
+                "[auto-inline] callsite: NOT inlining %s: inline_fn=%p func_str=%p opt=%d/%d sig_ok=%d void=%d "
+                "has_ret=%d\n",
+                get_tok_str(call_func_sym->v & ~SYM_FIELD, NULL), (void *)inline_fn,
+                inline_fn ? (void *)inline_fn->func_str : NULL, tcc_state->opt_inline_functions,
+                tcc_state->opt_inline_small, auto_inline_sig_ok(call_func_sym),
+                (call_func_sym->type.ref->type.t & VT_BTYPE) == VT_VOID,
+                inline_fn && inline_fn->func_str ? inline_body_has_return_stmt(inline_fn->func_str) : -1);
+      LOG_INLINE_STRUCT("[auto-inline] callsite: NOT inlining %s: inline_fn=%p func_str=%p opt=%d/%d sig_ok=%d "
+                        "void=%d has_ret=%d auto_inline=%d",
+                        get_tok_str(call_func_sym->v & ~SYM_FIELD, NULL), (void *)inline_fn,
+                        inline_fn ? (void *)inline_fn->func_str : NULL, tcc_state->opt_inline_functions,
+                        tcc_state->opt_inline_small, auto_inline_sig_ok(call_func_sym),
+                        (call_func_sym->type.ref->type.t & VT_BTYPE) == VT_VOID,
+                        inline_fn && inline_fn->func_str ? inline_body_has_return_stmt(inline_fn->func_str) : -1,
+                        call_func_sym->type.ref->f.func_auto_inline);
+    }
+    else if (!force_always_inline && call_func_sym && call_func_sym->type.ref)
+    {
+      LOG_INLINE_STRUCT("[auto-inline] callsite: SKIP %s: has_addr_of_label=%d func_auto_inline=%d",
+                        get_tok_str(call_func_sym->v & ~SYM_FIELD, NULL), has_addr_of_label,
+                        call_func_sym->type.ref->f.func_auto_inline);
     }
     if (inline_fn && inline_fn->func_str && (has_addr_of_label || force_always_inline))
     {
@@ -13710,6 +14733,11 @@ va_arg_pack_done:
         tcc_state->ir->next_instruction_index = ir_idx_before_args;
       }
 
+      /* NOP out SET_CHAIN when inlining a nested function call —
+       * the inlined body accesses parent variables directly. */
+      if (set_chain_ir_idx >= 0 && tcc_state->ir)
+        tcc_state->ir->compact_instructions[set_chain_ir_idx].op = TCCIR_OP_NOP;
+
       /* --- 2. Create parameter locals and store arguments --- */
       Sym *saved_local = local_stack;
       int saved_local_scope = local_scope;
@@ -13727,8 +14755,14 @@ va_arg_pack_done:
           palign = 4;
         loc = (loc - psize) & -palign;
 
-        /* Push parameter symbol FIRST so it gets a vreg assigned */
-        Sym *psym = sym_push(param_sym->v & ~SYM_FIELD, &param_sym->type, VT_LOCAL | VT_LVAL, loc);
+        /* Push parameter symbol FIRST so it gets a vreg assigned.
+         * Unnamed parameters (v == 0) would crash sym_push because
+         * table_ident[0 - TOK_IDENT] is out of bounds.  Use an
+         * anonymous symbol index so they bypass the token table. */
+        int pv = param_sym->v & ~SYM_FIELD;
+        if (pv == 0)
+          pv = anon_sym++;
+        Sym *psym = sym_push(pv, &param_sym->type, VT_LOCAL | VT_LVAL, loc);
 
         if (force_always_inline && inline_arg_is_constant_like(&saved_args[pi]) &&
             tcc_state->inline_const_arg_count < countof(tcc_state->inline_const_args))
@@ -13739,19 +14773,57 @@ va_arg_pack_done:
           tcc_state->inline_const_args[map_idx].value = saved_args[pi];
         }
 
-        /* Store argument to local via IR */
+        /* Store argument to local via IR.  If the argument is a 64-bit
+         * lval (e.g. a local long long or a dereferenced long long*),
+         * emit an explicit LOAD into a temp first.  The 64-bit STORE
+         * backend cannot split a DEREF source via mach_make_hi_half
+         * (it needs a register pair, not a pointer). */
+        SValue arg_val = saved_args[pi];
+        if ((arg_val.r & VT_LVAL) && (arg_val.type.t & VT_BTYPE) == VT_LLONG)
+        {
+          SValue load_dst;
+          svalue_init(&load_dst);
+          load_dst.type = arg_val.type;
+          load_dst.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+          load_dst.r = 0;
+          load_dst.c.i = 0;
+          tcc_ir_put(tcc_state->ir, TCCIR_OP_LOAD, &arg_val, NULL, &load_dst);
+          arg_val.vr = load_dst.vr;
+          arg_val.r = 0;
+        }
         SValue store_dst;
         svalue_init(&store_dst);
         store_dst.type = param_sym->type;
         store_dst.r = VT_LOCAL | VT_LVAL;
         store_dst.vr = psym->vreg;
         store_dst.c.i = loc;
-        tcc_ir_put(tcc_state->ir, TCCIR_OP_STORE, &saved_args[pi], NULL, &store_dst);
+        if ((param_sym->type.t & VT_BTYPE) == VT_STRUCT && !(param_sym->type.t & VT_VECTOR))
+        {
+          int psz, pal;
+          psz = type_size(&param_sym->type, &pal);
+          if (psz <= 16)
+          {
+            vset(&store_dst.type, store_dst.r, store_dst.c.i);
+            vtop->vr = store_dst.vr;
+            vpushv(&arg_val);
+            vstore();
+            vtop--;
+          }
+          else
+          {
+            tcc_ir_put(tcc_state->ir, TCCIR_OP_STORE, &arg_val, NULL, &store_dst);
+          }
+        }
+        else
+        {
+          tcc_ir_put(tcc_state->ir, TCCIR_OP_STORE, &arg_val, NULL, &store_dst);
+        }
       }
 
       /* --- 3. Save parser/codegen state --- */
       CType saved_func_vt = func_vt;
       int saved_func_var = func_var;
+      int saved_func_has_label_addr = func_has_label_addr;
       int saved_rsym = rsym;
       const char *saved_funcname = funcname;
       struct scope *saved_root_scope = root_scope;
@@ -13766,18 +14838,33 @@ va_arg_pack_done:
       int inline_ret_loc = 0;
       if (!is_void_inline)
       {
-        int rsize, ralign;
-        rsize = type_size(&func_vt, &ralign);
-        if (rsize < 4)
-          rsize = 4;
-        if (ralign < 4)
-          ralign = 4;
-        loc = (loc - rsize) & -ralign;
-        inline_ret_loc = loc;
+        if (ret_nregs == 0)
+        {
+          /* Struct return via sret: reuse the sret buffer that was already
+           * allocated (at ret.c.i) instead of allocating a separate slot.
+           * This avoids a redundant memmove from inline_ret_loc → sret. */
+          inline_ret_loc = ret.c.i;
+          LOG_INLINE_STRUCT("[inline-struct] reusing sret buffer at %d as inline_ret_loc", (int)ret.c.i);
+        }
+        else
+        {
+          int rsize, ralign;
+          rsize = type_size(&func_vt, &ralign);
+          if (rsize < 4)
+            rsize = 4;
+          if (ralign < 4)
+            ralign = 4;
+          loc = (loc - rsize) & -ralign;
+          inline_ret_loc = loc;
+        }
       }
 
-      /* Set inline expansion flags */
-      tcc_state->in_inline_expansion = 1;
+      /* Set inline expansion flags.
+       * Store the current local_scope level (= saved_local_scope + 1 after the
+       * ++local_scope above).  The compound-block '}' handler uses this to
+       * suppress next() ONLY for the outermost function-body '}' of the inline
+       * expansion and NOT for nested '{...}' blocks inside the inline body. */
+      tcc_state->in_inline_expansion = local_scope;
       tcc_state->inline_return_loc = inline_ret_loc;
       root_scope = cur_scope;
 
@@ -13806,9 +14893,13 @@ va_arg_pack_done:
       tcc_ir_backpatch_to_here(tcc_state->ir, rsym);
 
       /* --- 6. Restore state --- */
+      /* Read back inline_return_loc: the struct return handler may have
+       * redirected it to point at the source local (skipping a memmove). */
+      inline_ret_loc = tcc_state->inline_return_loc;
       tcc_state->in_inline_expansion = 0;
       func_vt = saved_func_vt;
       func_var = saved_func_var;
+      func_has_label_addr = saved_func_has_label_addr;
       rsym = saved_rsym;
       funcname = saved_funcname;
       root_scope = saved_root_scope;
@@ -13828,11 +14919,16 @@ va_arg_pack_done:
       }
       else
       {
-        /* Replace function pointer with return value lvalue */
+        /* Replace function pointer with return value lvalue.
+         * Clear sym: the original entry had sym=call_func_sym (the inlined
+         * function).  If left non-NULL it would be visible to downstream
+         * call processing (e.g. (*foo())->bar(0) would see sym=foo when
+         * processing the bar call), triggering a spurious second inline. */
         vtop->type = s->type;
         vtop->r = VT_LOCAL | VT_LVAL;
         vtop->vr = -1;
         vtop->c.i = inline_ret_loc;
+        vtop->sym = NULL;
       }
       inlined = 1;
     }
@@ -13849,6 +14945,9 @@ va_arg_pack_done:
     {
       call_func_sym->type.ref->f.func_outofline_needed = 1;
     }
+    if (TCC_LOG_INLINE_STRUCT && call_func_sym && call_func_sym->type.ref &&
+        call_func_sym->type.ref->f.func_auto_inline)
+      fprintf(stderr, "[auto-inline] normal_call: NOT inlined %s\n", get_tok_str(call_func_sym->v & ~SYM_FIELD, NULL));
 
     int return_vreg = -1;
     if (NOEVAL_WANTED)
@@ -14025,6 +15124,9 @@ static void __attribute__((noinline)) unary_builtin_alloca(void)
   CType type;
   switch (tok)
   {
+#ifdef TOK_alloca
+  case TOK_alloca:
+#endif
   case TOK_builtin_alloca:
   {
     /* __builtin_alloca(size) — allocate memory on the stack.
@@ -14276,16 +15378,26 @@ static void __attribute__((noinline)) unary_builtin_fp(void)
       vstore();
       vtop--; /* pop the store result */
 
-      /* Load the word containing the sign bit as an unsigned integer */
+      /* Load the word containing the sign bit as an unsigned integer. */
       CType uint_type;
       uint_type.t = VT_INT | VT_UNSIGNED;
       uint_type.ref = NULL;
       vset(&uint_type, VT_LOCAL | VT_LVAL, tmp_loc + high_word_offset);
       vtop->vr = vr_tmp;
 
-      /* Unsigned right shift by 31 to isolate the sign bit (0 or 1) */
-      vpushi(31);
-      gen_op(TOK_SHR);
+      if (fp_size == 4)
+      {
+        /* Match GCC __builtin_signbitf runtime behavior: return the raw
+         * sign mask (0x80000000) for negative float values. */
+        vpushi(0x80000000u);
+        gen_op('&');
+      }
+      else
+      {
+        /* Runtime double stays normalized to 0/1. */
+        vpushi(31);
+        gen_op(TOK_SHR);
+      }
     }
     break;
   }
@@ -15069,10 +16181,11 @@ static void __attribute__((noinline)) unary_builtin_fp2(void)
     /* Check if both arguments are constants */
     int bt_x = vtop[-1].type.t & VT_BTYPE;
     int bt_y = vtop[0].type.t & VT_BTYPE;
-    if ((vtop[-1].r & (VT_VALMASK | VT_LVAL)) == VT_CONST && !(vtop[-1].r & VT_SYM) &&
-        (vtop[0].r & (VT_VALMASK | VT_LVAL)) == VT_CONST && !(vtop[0].r & VT_SYM) &&
-        (bt_x == VT_FLOAT || bt_x == VT_DOUBLE || bt_x == VT_LDOUBLE) &&
-        (bt_y == VT_FLOAT || bt_y == VT_DOUBLE || bt_y == VT_LDOUBLE))
+    int x_is_const = (vtop[-1].r & (VT_VALMASK | VT_LVAL)) == VT_CONST && !(vtop[-1].r & VT_SYM);
+    int y_is_const = (vtop[0].r & (VT_VALMASK | VT_LVAL)) == VT_CONST && !(vtop[0].r & VT_SYM);
+    int x_is_fp = (bt_x == VT_FLOAT || bt_x == VT_DOUBLE || bt_x == VT_LDOUBLE);
+    int y_is_fp = (bt_y == VT_FLOAT || bt_y == VT_DOUBLE || bt_y == VT_LDOUBLE);
+    if (x_is_const && y_is_const && x_is_fp && y_is_fp)
     {
       double x = (bt_x == VT_FLOAT) ? (double)vtop[-1].c.f : vtop[-1].c.d;
       double y = (bt_y == VT_FLOAT) ? (double)vtop[0].c.f : vtop[0].c.d;
@@ -17588,9 +18701,19 @@ tok_next:
     {
       /* Force DATA_ONLY_WANTED so the IR backend (which defers code generation)
        * can still allocate the string in rodata now, before the actual code
-       * referring to it is emitted. */
+       * referring to it is emitted.
+       *
+       * However, do NOT set DATA_ONLY_WANTED when CODE_OFF_BIT is active
+       * (dead code after unconditional jump / if(0)).  DATA_ONLY_WANTED
+       * (0x80000000) combined with CODE_OFF_BIT (0x20000000) gives 0xA0000000
+       * which is negative, defeating NODATA_WANTED (nocode_wanted > 0) and
+       * causing string data to leak into rodata for dead branches.  With
+       * CODE_OFF_BIT alone, NODATA_WANTED is already true so
+       * decl_initializer_alloc correctly allocates size=0.  The dead IR
+       * instructions that reference these symbols are removed by DCE. */
       int saved_nocode = nocode_wanted;
-      nocode_wanted |= DATA_ONLY_WANTED;
+      if (!(nocode_wanted & CODE_OFF_BIT))
+        nocode_wanted |= DATA_ONLY_WANTED;
       decl_initializer_alloc(&type, &ad, VT_CONST, 2, 0, 0);
       nocode_wanted = saved_nocode;
     }
@@ -17630,7 +18753,7 @@ tok_next:
       }
       test_lvalue();
     }
-    if (vtop->sym)
+    if (vtop->sym && ((vtop->r & VT_SYM) || (vtop->r & VT_LOCAL) || (vtop->r & VT_PARAM)))
     {
       vtop->sym->a.addrtaken = 1;
       /* Mark vreg as address-taken in IR so it gets spilled to stack */
@@ -18032,6 +19155,9 @@ tok_next:
     CODE_OFF();
     break;
   }
+#ifdef TOK_alloca
+  case TOK_alloca:
+#endif
   case TOK_builtin_alloca:
   case TOK_builtin_apply_args:
   case TOK_builtin_apply:
@@ -18813,6 +19939,7 @@ tok_next:
        Only set if not already marked/having an ELF symbol. */
     if (s->c <= 0)
       s->c = -3; /* LABEL_ADDR_TAKEN marker */
+    func_has_label_addr = 1;
     if ((s->type.t & VT_BTYPE) != VT_PTR)
     {
       s->type.t = VT_VOID;
@@ -18847,6 +19974,25 @@ tok_next:
       tcc_error("expression expected before '%s'", get_tok_str(tok, &tokc));
     t = tok;
     next();
+    /* Inline-eval overlay: if we're inside try_inline_const_eval and t is
+     * a parameter token, push the caller's SValue directly. This preserves
+     * the original sym reference + offset + type, which is essential for
+     * VT_SYM pointer args so that `*p` can fold to the underlying global's
+     * initializer later in the body. */
+    if (tcc_state->inline_eval_overlay_n > 0)
+    {
+      int oi2;
+      for (oi2 = 0; oi2 < tcc_state->inline_eval_overlay_n; oi2++)
+      {
+        if (tcc_state->inline_eval_overlay_tok[oi2] == t)
+        {
+          vpushv(&tcc_state->inline_eval_overlay_sv[oi2]);
+          break;
+        }
+      }
+      if (oi2 < tcc_state->inline_eval_overlay_n)
+        break;
+    }
     s = sym_find(t);
     if (!s || IS_ASM_SYM(s))
     {
@@ -19012,7 +20158,7 @@ tok_next:
   return 0;
 }
 
-ST_FUNC void unary(void)
+ST_FUNC HOT void unary(void)
 {
   Sym *s;
 
@@ -19095,7 +20241,7 @@ ST_FUNC void unary(void)
       }
       test_lvalue();
     }
-    if (vtop->sym)
+    if (vtop->sym && ((vtop->r & VT_SYM) || (vtop->r & VT_LOCAL) || (vtop->r & VT_PARAM)))
     {
       vtop->sym->a.addrtaken = 1;
       tcc_ir_set_addrtaken(tcc_state->ir, vtop->sym->vreg);
@@ -19261,6 +20407,23 @@ postfix:
       }
       else
       {
+        /* A subscript `base[idx]` on a VT_SYM global (array or pointer) is
+         * treated as a potential write path: gen_op('+') below will often
+         * materialize the base into a register, stripping VT_SYM from the
+         * resulting lvalue, so vstore's sym-based poisoning can't catch a
+         * later store through this lvalue.  Poison here if the pointee is
+         * non-const.  Cost: blocks `*&g` scalar folds for syms that are
+         * also subscripted — but scalar syms aren't subscripted. */
+        if (!nocode_wanted && (vtop[-1].r & (VT_VALMASK | VT_SYM)) == (VT_CONST | VT_SYM) && vtop[-1].sym)
+        {
+          CType *pointed = NULL;
+          if (vtop[-1].type.t & VT_ARRAY)
+            pointed = &vtop[-1].type; /* array element type */
+          else if ((vtop[-1].type.t & VT_BTYPE) == VT_PTR)
+            pointed = pointed_type(&vtop[-1].type);
+          if (pointed && !(pointed->t & VT_CONSTANT))
+            vtop[-1].sym->a.possibly_written = 1;
+        }
         gen_op('+');
         indir();
       }
@@ -20435,8 +21598,8 @@ static void try_call_scope_cleanup(Sym *stop)
     src1.vr = -1;
     src1.r = VT_CONST;
     src1.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
-    TCCGEN_DEBUG("[TCCGEN] FUNCPARAMVAL push: site=scope_cleanup call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n",
-                 call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)src1.c.i), vtop->r, vtop->vr);
+    LOG_CODEGEN("FUNCPARAMVAL push: site=scope_cleanup call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d", call_id,
+                TCCIR_DECODE_PARAM_IDX((uint32_t)src1.c.i), vtop->r, vtop->vr);
     tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &src1, NULL);
     SValue call_id_sv = tcc_ir_svalue_call_id_argc(call_id, 1);
     tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[-1], &call_id_sv, NULL);
@@ -20756,9 +21919,14 @@ again:
     prev_scope(&o, flags & STMT_EXPR);
     if (debug_modes)
       tcc_debug_stabn(tcc_state, N_RBRAC, ind - func_ind);
-    if (local_scope)
+    /* Suppress next() only for the outermost '}' of an inline expansion body.
+     * For nested '{...}' blocks inside the inline body, next() must fire so
+     * that the enclosing while(tok != '}') loop can continue correctly.
+     * in_inline_expansion stores the local_scope level of the inline entry;
+     * the outermost '}' is exactly when local_scope equals that level. */
+    if (local_scope && !(tcc_state->in_inline_expansion && local_scope == tcc_state->in_inline_expansion))
       next();
-    else
+    else if (!local_scope)
     {
       /* For main(), always generate return 0 even if nocode_wanted is set
        * (which can happen due to control flow analysis after if/else etc.) */
@@ -20796,16 +21964,71 @@ again:
     {
       if (tcc_state->in_inline_expansion)
       {
-        /* Inside inline expansion: store return value to local slot
-         * instead of emitting RETURNVALUE IR op. */
-        SValue ret_dst;
-        svalue_init(&ret_dst);
-        ret_dst.type = func_vt;
-        ret_dst.r = VT_LOCAL | VT_LVAL;
-        ret_dst.vr = -1;
-        ret_dst.c.i = tcc_state->inline_return_loc;
-        tcc_ir_put(tcc_state->ir, TCCIR_OP_STORE, vtop, NULL, &ret_dst);
-        vtop--;
+        if ((func_vt.t & VT_BTYPE) == VT_STRUCT)
+        {
+          /* Struct return in inline expansion: instead of copying to the
+           * return slot, redirect inline_return_loc to point at the source
+           * if it's a simple stack local.  This eliminates one memmove —
+           * the caller's assignment will copy directly from the inlined
+           * function's local variable. */
+          if ((vtop->r & (VT_LOCAL | VT_LVAL)) == (VT_LOCAL | VT_LVAL) && vtop->vr == -1)
+          {
+            LOG_INLINE_STRUCT("[inline-struct] redirect return: loc %d -> %d", (int)tcc_state->inline_return_loc,
+                              (int)vtop->c.i);
+            tcc_state->inline_return_loc = vtop->c.i;
+            vtop--;
+          }
+          else
+          {
+            /* Fallback: copy via vstore() when source is not a simple local */
+            SValue src_save = *vtop;
+            vtop--;
+            CValue ret_cv;
+            ret_cv.i = tcc_state->inline_return_loc;
+            vsetc(&func_vt, VT_LOCAL | VT_LVAL, &ret_cv);
+            vtop->vr = -1;
+            vpushv(&src_save);
+            vstore();
+            vtop--;
+          }
+        }
+        else
+        {
+          /* Inside inline expansion: store return value to local slot
+           * instead of emitting RETURNVALUE IR op.
+           * Must materialize VT_CMP/VT_JMP (comparison flags) into a 0/1
+           * register value before the STORE, just like gfunc_return does
+           * via tcc_ir_codegen_cmp_jmp_set.  Without this, a return of a
+           * comparison expression (e.g. "return a >= b;") would store the
+           * raw operand register instead of the boolean result. */
+          tcc_ir_codegen_cmp_jmp_set(tcc_state->ir);
+          /* If vtop is an lval (e.g. "return *p;" or "return x;" where x is
+           * a local), emit an explicit LOAD into a temp first.  Without this
+           * the resulting STORE would carry a DEREF source operand, which
+           * the 64-bit store backend cannot split via mach_make_hi_half
+           * (it expects a register pair, not a pointer).  Mirrors the
+           * LOAD step in gfunc_return for the non-inline return path. */
+          if (vtop->r & VT_LVAL)
+          {
+            SValue load_dst;
+            svalue_init(&load_dst);
+            load_dst.type = vtop->type;
+            load_dst.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+            load_dst.r = 0;
+            load_dst.c.i = 0;
+            tcc_ir_put(tcc_state->ir, TCCIR_OP_LOAD, vtop, NULL, &load_dst);
+            vtop->vr = load_dst.vr;
+            vtop->r = 0;
+          }
+          SValue ret_dst;
+          svalue_init(&ret_dst);
+          ret_dst.type = func_vt;
+          ret_dst.r = VT_LOCAL | VT_LVAL;
+          ret_dst.vr = -1;
+          ret_dst.c.i = tcc_state->inline_return_loc;
+          tcc_ir_put(tcc_state->ir, TCCIR_OP_STORE, vtop, NULL, &ret_dst);
+          vtop--;
+        }
       }
       else
       {
@@ -20879,7 +22102,7 @@ again:
     }
     skip(';');
     a = b = -1; /* Initialize break/continue chains with -1 sentinel */
-    c = d = tcc_state->ir->next_instruction_index;
+    c = d = gind();
     if (tok != ';')
     {
       gexpr();
@@ -21374,6 +22597,33 @@ static void init_putz(init_params *p, unsigned long c, int size)
   {
     /* nothing to do because globals are already set to zero */
   }
+  else if (tcc_state->ir && size <= 32 && !(size & 3))
+  {
+    /* Small, word-aligned zero-init: expand to individual word stores
+     * of #0 so the optimizer can see (and eliminate) them when
+     * subsequent field stores overwrite every word. */
+    CType word_type;
+    word_type.t = VT_INT;
+    word_type.ref = NULL;
+
+    SValue zero;
+    svalue_init(&zero);
+    zero.type = word_type;
+    zero.r = VT_CONST;
+    zero.vr = -1;
+    zero.c.i = 0;
+
+    for (int off = 0; off < size; off += 4)
+    {
+      SValue d;
+      svalue_init(&d);
+      d.type = word_type;
+      d.r = VT_LOCAL | VT_LVAL;
+      d.vr = -1;
+      d.c.i = c + off;
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_STORE, &zero, NULL, &d);
+    }
+  }
   else
   {
     SValue src1;
@@ -21391,16 +22641,16 @@ static void init_putz(init_params *p, unsigned long c, int size)
      * Stack is: dest, c, n */
     src1.r = VT_CONST;
     src1.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
-    TCCGEN_DEBUG("[TCCGEN] FUNCPARAMVAL push: site=init_putz call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n", call_id,
-                 TCCIR_DECODE_PARAM_IDX((uint32_t)src1.c.i), vtop[-2].r, vtop[-2].vr);
+    LOG_CODEGEN("FUNCPARAMVAL push: site=init_putz call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d", call_id,
+                TCCIR_DECODE_PARAM_IDX((uint32_t)src1.c.i), vtop[-2].r, vtop[-2].vr);
     tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-2], &src1, NULL);
     src1.c.i = TCCIR_ENCODE_PARAM(call_id, 2);
-    TCCGEN_DEBUG("[TCCGEN] FUNCPARAMVAL push: site=init_putz call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n", call_id,
-                 TCCIR_DECODE_PARAM_IDX((uint32_t)src1.c.i), vtop[-1].r, vtop[-1].vr);
+    LOG_CODEGEN("FUNCPARAMVAL push: site=init_putz call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d", call_id,
+                TCCIR_DECODE_PARAM_IDX((uint32_t)src1.c.i), vtop[-1].r, vtop[-1].vr);
     tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &src1, NULL);
     src1.c.i = TCCIR_ENCODE_PARAM(call_id, 1);
-    TCCGEN_DEBUG("[TCCGEN] FUNCPARAMVAL push: site=init_putz call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d\n", call_id,
-                 TCCIR_DECODE_PARAM_IDX((uint32_t)src1.c.i), vtop[0].r, vtop[0].vr);
+    LOG_CODEGEN("FUNCPARAMVAL push: site=init_putz call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d", call_id,
+                TCCIR_DECODE_PARAM_IDX((uint32_t)src1.c.i), vtop[0].r, vtop[0].vr);
     tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[0], &src1, NULL);
 
     vpush_helper_func(TOK_memset);
@@ -22110,6 +23360,45 @@ static void decl_initializer(init_params *p, CType *type, unsigned long c, int f
           init_assert(p, c + nb);
           if (!NODATA_WANTED)
             memcpy(p->sec->data + c, initstr.data, nb);
+        }
+        else if (tcc_state->ir && size1 == 1 && nb >= 8 && !NODATA_WANTED)
+        {
+          /* Bulk copy string literal from .rodata instead of byte-by-byte stores.
+           * Matches GCC: memcpy(dest, .rodata, str_len) + memset(trailing, 0, rem) */
+          int copy_len = (nb < n) ? nb + 1 : nb;
+          addr_t rodata_off = section_add(rodata_section, copy_len, 4);
+          unsigned char *rodata_ptr = rodata_section->data + rodata_off;
+          memcpy(rodata_ptr, initstr.data, copy_len);
+
+          Sym *rodata_sym = get_sym_ref(&char_type, rodata_section, rodata_off, copy_len);
+
+          SValue args[3];
+
+          svalue_init(&args[0]);
+          args[0].type = char_pointer_type;
+          args[0].r = VT_LOCAL;
+          args[0].c.i = c;
+          args[0].vr = -1;
+
+          svalue_init(&args[1]);
+          args[1].type = char_pointer_type;
+          args[1].r = VT_CONST | VT_SYM;
+          args[1].sym = rodata_sym;
+          args[1].c.i = 0;
+          args[1].vr = -1;
+
+          svalue_init(&args[2]);
+          args[2].type.t = VT_INT;
+          args[2].type.ref = NULL;
+          args[2].r = VT_CONST;
+          args[2].c.i = copy_len;
+          args[2].vr = -1;
+
+          gen_ir_void_call_args(args, 3, TOK_memcpy);
+
+          int remaining = n - copy_len;
+          if (remaining > 0 && !(flags & DIF_CLEAR))
+            init_putz(p, c + copy_len, remaining);
         }
         else
         {
@@ -22923,9 +24212,9 @@ static void setup_nested_func_trampoline(Sym *s)
     char tramp_name[256];
     snprintf(tramp_name, sizeof(tramp_name), "__tramp_%s", func_name);
 
-    /* Placeholder: offset will be updated when trampoline code is emitted */
+    /* Placeholder: offset and size will be updated when trampoline code is emitted */
     int elf_idx =
-        put_elf_sym(symtab_section, 0, 24, ELFW(ST_INFO)(STB_LOCAL, STT_FUNC), 0, text_sec->sh_num, tramp_name);
+        put_elf_sym(symtab_section, 0, 0, ELFW(ST_INFO)(STB_LOCAL, STT_FUNC), 0, text_sec->sh_num, tramp_name);
 
     Sym *tr_sym = sym_malloc();
     memset(tr_sym, 0, sizeof(*tr_sym));
@@ -22962,79 +24251,19 @@ static void setup_nested_func_trampoline(Sym *s)
 /* Emit trampoline code for a nested function that needs it */
 static void emit_trampoline_for_nested_func(NestedFunc *nf)
 {
-  Section *text_sec = cur_text_section;
-
-  /* Trampoline is 20 bytes: 14 bytes code + 2 bytes NOP + 4+4 literal pool.
-   * Plus up to 3 bytes for alignment padding.
-   * We must ensure the section buffer can hold these bytes. The codegen
-   * sets data_offset = ind at the end, but we're before that point.
-   * Use section_prealloc to extend the buffer without moving data_offset. */
-  section_prealloc(text_sec, 24);
-
-  /* Align ind to 4-byte boundary for the trampoline */
-  while (ind & 3)
-  {
-    text_sec->data[ind++] = 0x00;
-  }
-
-  addr_t tramp_start = ind;
-
-  /* Trampoline layout (20 bytes total, no padding needed):
-   *   +0:  LDR  r10, [pc, #8]   ; r10 = chain_slot address (from +12)
-   *   +4:  LDR  r10, [r10, #0]  ; r10 = *chain_slot = parent FP value
-   *   +8:  LDR  pc, [pc, #4]    ; pc = function address (from +16), tail call
-   *   +12: .word chain_slot_addr ; address of chain slot in .data
-   *   +16: .word function_addr   ; address of nested function in .text
-   *
-   * PC-relative offset calculation (Thumb: PC reads as current + 4):
-   *   LDR at +0: PC=+4, offset=8  → loads from +12 (chain_slot)
-   *   LDR at +8: PC=+12, offset=4 → loads from +16 (function)
-   */
-
-  /* LDR R10, [PC, #8] - Thumb-2 encoding: F8DF A008 */
-  text_sec->data[ind++] = 0xDF;
-  text_sec->data[ind++] = 0xF8;
-  text_sec->data[ind++] = 0x08;
-  text_sec->data[ind++] = 0xA0;
-
-  /* LDR R10, [R10, #0] - Thumb-2 encoding: F8DA A000 */
-  text_sec->data[ind++] = 0xDA;
-  text_sec->data[ind++] = 0xF8;
-  text_sec->data[ind++] = 0x00;
-  text_sec->data[ind++] = 0xA0;
-
-  /* LDR PC, [PC, #4] - Thumb-2 encoding: F8DF F004 */
-  text_sec->data[ind++] = 0xDF;
-  text_sec->data[ind++] = 0xF8;
-  text_sec->data[ind++] = 0x04;
-  text_sec->data[ind++] = 0xF0;
-
-  /* Literal pool entry 1: chain slot address (+12) */
-  greloc(text_sec, nf->chain_slot_tcc_sym, ind, R_ARM_ABS32);
-  text_sec->data[ind++] = 0x00;
-  text_sec->data[ind++] = 0x00;
-  text_sec->data[ind++] = 0x00;
-  text_sec->data[ind++] = 0x00;
-
-  /* Literal pool entry 2: nested function address (+16) */
-  greloc(text_sec, nf->sym, ind, R_ARM_ABS32);
-  text_sec->data[ind++] = 0x00;
-  text_sec->data[ind++] = 0x00;
-  text_sec->data[ind++] = 0x00;
-  text_sec->data[ind++] = 0x00;
+  /* Arch-specific: emit trampoline machine code + relocations.
+   * Returns the entry address (may include arch-specific bits, e.g. Thumb). */
+  addr_t entry_addr = gen_nested_func_trampoline(nf->chain_slot_tcc_sym, nf->sym);
 
   /* Update the ELF symbol for the trampoline to point to actual code location */
   {
     ElfSym *esym = elfsym(nf->trampoline_tcc_sym);
     if (esym)
     {
-      esym->st_value = tramp_start + 1; /* +1 for Thumb bit */
-      esym->st_size = ind - tramp_start;
+      esym->st_value = entry_addr;
+      esym->st_size = ind - (entry_addr & ~1u);
     }
   }
-
-  /* Sync data_offset so the section knows about the trampoline bytes */
-  text_sec->data_offset = ind;
 }
 
 /* Emit all trampolines needed for nested functions in this parent */
@@ -23061,6 +24290,7 @@ typedef struct
   const char *funcname;
   CType func_vt;
   int func_var;
+  int func_has_label_addr;
   int cur_scope;
   int root_scope;
   int loop_scope;
@@ -23102,6 +24332,7 @@ static void compile_nested_functions(Sym *parent_sym)
   saved.funcname = funcname;
   saved.func_vt = func_vt;
   saved.func_var = func_var;
+  saved.func_has_label_addr = func_has_label_addr;
   saved.cur_scope = (int)(intptr_t)cur_scope;
   saved.root_scope = (int)(intptr_t)root_scope;
   saved.loop_scope = (int)(intptr_t)loop_scope;
@@ -23285,6 +24516,7 @@ static void compile_nested_functions(Sym *parent_sym)
   funcname = saved.funcname;
   func_vt = saved.func_vt;
   func_var = saved.func_var;
+  func_has_label_addr = saved.func_has_label_addr;
   cur_scope = (struct scope *)(intptr_t)saved.cur_scope;
   root_scope = (struct scope *)(intptr_t)saved.root_scope;
   loop_scope = (struct scope *)(intptr_t)saved.loop_scope;
@@ -23350,6 +24582,73 @@ static void prescan_captured_vars(NestedFunc *nf, Sym *parent_local_stack, Neste
   if (!tok_str)
     return;
 
+  /* Build a set of tokens that are shadowed by the nested function's own
+   * parameters or by local declarations in the body (type_keyword identifier).
+   * These are NOT genuine captures — the nested function's parameter or local
+   * will shadow the parent's variable of the same name. */
+  int shadowed_toks[MAX_CAPTURED_VARS];
+  int nb_shadowed = 0;
+  /* Parameter names shadow parent variables of the same name */
+  {
+    Sym *ref = nf->sym ? nf->sym->type.ref : NULL;
+    if (ref)
+    {
+      for (Sym *param = ref->next; param; param = param->next)
+      {
+        int pv = param->v & ~SYM_FIELD;
+        if (pv >= TOK_IDENT && nb_shadowed < MAX_CAPTURED_VARS)
+          shadowed_toks[nb_shadowed++] = pv;
+      }
+    }
+  }
+  /* Scan body for local declarations: type_keyword followed by identifier */
+  {
+    const int *tp = tok_str_buf(tok_str);
+    int prev = 0;
+    while (*tp != TOK_EOF && *tp != 0)
+    {
+      int tv = *tp++;
+      switch (tv)
+      {
+      case TOK_CINT: case TOK_CCHAR: case TOK_LCHAR: case TOK_LINENUM:
+      case TOK_CUINT: case TOK_CFLOAT: case TOK_CFLOAT_I: case TOK_CINT_I:
+#if LONG_SIZE == 4
+      case TOK_CLONG: case TOK_CULONG:
+#endif
+        tp++; break;
+      case TOK_CDOUBLE: case TOK_CDOUBLE_I: case TOK_CLLONG: case TOK_CULLONG:
+#if LONG_SIZE == 8
+      case TOK_CLONG: case TOK_CULONG:
+#endif
+        tp += 2; break;
+      case TOK_CLDOUBLE: case TOK_CLDOUBLE_I:
+#if LDOUBLE_SIZE == 8 || defined TCC_USING_DOUBLE_FOR_LDOUBLE
+        tp += 2;
+#elif LDOUBLE_SIZE == 12
+        tp += 3;
+#elif LDOUBLE_SIZE == 16
+        tp += 4;
+#endif
+        break;
+      case TOK_STR: case TOK_LSTR: case TOK_PPNUM: case TOK_PPSTR:
+      { int sz = *tp++; tp += (sz + sizeof(int) - 1) / sizeof(int); break; }
+      default: break;
+      }
+      if (tv >= TOK_IDENT && (prev == TOK_INT || prev == TOK_CHAR || prev == TOK_SHORT ||
+                               prev == TOK_LONG || prev == TOK_VOID || prev == TOK_FLOAT ||
+                               prev == TOK_DOUBLE || prev == TOK_UNSIGNED || prev == TOK_SIGNED1 ||
+                               prev == TOK_BOOL))
+      {
+        int already = 0;
+        for (int si = 0; si < nb_shadowed; si++)
+          if (shadowed_toks[si] == tv) { already = 1; break; }
+        if (!already && nb_shadowed < MAX_CAPTURED_VARS)
+          shadowed_toks[nb_shadowed++] = tv;
+      }
+      prev = tv;
+    }
+  }
+
   const int *p = tok_str_buf(tok_str);
   int prev_tok = 0; /* track previous token for goto detection */
 
@@ -23409,8 +24708,14 @@ static void prescan_captured_vars(NestedFunc *nf, Sym *parent_local_stack, Neste
 
     if (t >= TOK_IDENT)
     {
+      /* Skip tokens that are shadowed by parameters or local declarations —
+       * these are NOT genuine captures of parent variables. */
+      int is_shadowed = 0;
+      for (int si = 0; si < nb_shadowed; si++)
+        if (shadowed_toks[si] == t) { is_shadowed = 1; break; }
+
       /* Look up this identifier in parent's local stack */
-      Sym *s = sym_find2(parent_local_stack, t);
+      Sym *s = !is_shadowed ? sym_find2(parent_local_stack, t) : NULL;
       if (s && ((s->r & VT_VALMASK) == VT_LOCAL || (s->r & VT_PARAM)))
       {
         /* Mark as address-taken to force stack allocation */
@@ -23746,6 +25051,7 @@ static void gen_function(Sym *sym)
   struct scope f = {0};
   TCCIRState *ir;
   Sym *global_label_stack_start; /* save global label stack at function start */
+  unsigned phase_start = 0;
   cur_scope = root_scope = &f;
   nocode_wanted = 0;
 
@@ -23770,6 +25076,7 @@ static void gen_function(Sym *sym)
   func_ind = ind;
   func_vt = sym->type.ref->type;
   func_var = sym->type.ref->f.func_type == FUNC_ELLIPSIS;
+  func_has_label_addr = 0;
 
   /* NOTE: we patch the symbol size later */
   put_extern_sym(sym, cur_text_section, ind + 1, 0);
@@ -23784,9 +25091,7 @@ static void gen_function(Sym *sym)
 
   /* push a dummy symbol to enable local sym storage */
   sym_push2(&local_stack, SYM_FIELD, 0, 0);
-#ifdef DEBUG_IR_GEN
-  printf("Generating IR for function %s\n", funcname);
-#endif
+  LOG_IR_GEN("Generating IR for function %s", funcname);
   ir = tcc_ir_alloc();
   tcc_state->ir = ir;
   ir->naked = sym->a.naked;
@@ -23848,14 +25153,111 @@ static void gen_function(Sym *sym)
   }
 
   func_vla_arg(sym);
+  if (tcc_state->do_bench)
+    phase_start = tcc_getclock_ms();
   block(0);
   /* Backpatch all return jumps to point to the epilogue (past the end of IR) */
   tcc_ir_backpatch_to_here(ir, rsym);
+
+  /* Clear addrtaken on captured variables for auto-inlined nested functions
+   * whose standalone copy has no callers (no sibling references, no trampoline).
+   * Must run after block(0) so all nested functions are registered. */
+  if (ir && tcc_state->nb_nested_funcs > 0) {
+    for (int ni = 0; ni < tcc_state->nb_nested_funcs; ni++) {
+      NestedFunc *nf = &tcc_state->nested_funcs[ni];
+      if (!nf->sym || !nf->sym->type.ref || !nf->sym->type.ref->f.func_auto_inline)
+        continue;
+      if (nf->trampoline_needed || nf->nb_captured == 0)
+        continue;
+      int called_by_sibling = 0;
+      int func_tok = nf->sym->v & ~SYM_FIELD;
+      for (int si = 0; si < tcc_state->nb_nested_funcs && !called_by_sibling; si++) {
+        NestedFunc *sib = &tcc_state->nested_funcs[si];
+        if (sib == nf || !sib->func_str)
+          continue;
+        const int *tp = tok_str_buf(sib->func_str);
+        while (*tp) {
+          int tv;
+          CValue tcv;
+          tok_get(&tv, &tp, &tcv);
+          if (tv == TOK_EOF || tv == 0) break;
+          if (tv == func_tok) { called_by_sibling = 1; break; }
+        }
+      }
+      if (!called_by_sibling) {
+        for (int ci = 0; ci < nf->nb_captured; ci++) {
+          int vreg = nf->captured_vregs[ci];
+          if (vreg >= 0) {
+            int keep_addrtaken = 0;
+            for (int oi = 0; oi < tcc_state->nb_nested_funcs && !keep_addrtaken; oi++) {
+              NestedFunc *other = &tcc_state->nested_funcs[oi];
+              if (other == nf || other->nb_captured == 0)
+                continue;
+
+              int captures_vreg = 0;
+              for (int oc = 0; oc < other->nb_captured; oc++) {
+                if (other->captured_vregs[oc] == vreg) {
+                  captures_vreg = 1;
+                  break;
+                }
+              }
+              if (!captures_vreg)
+                continue;
+
+              if (!other->sym || !other->sym->type.ref || other->trampoline_needed ||
+                  !other->sym->type.ref->f.func_auto_inline) {
+                keep_addrtaken = 1;
+                break;
+              }
+
+              {
+                int other_called_by_sibling = 0;
+                int other_func_tok = other->sym->v & ~SYM_FIELD;
+                for (int si = 0; si < tcc_state->nb_nested_funcs && !other_called_by_sibling; si++) {
+                  NestedFunc *sib = &tcc_state->nested_funcs[si];
+                  if (sib == other || !sib->func_str)
+                    continue;
+                  const int *tp = tok_str_buf(sib->func_str);
+                  while (*tp) {
+                    int tv;
+                    CValue tcv;
+                    tok_get(&tv, &tp, &tcv);
+                    if (tv == TOK_EOF || tv == 0)
+                      break;
+                    if (tv == other_func_tok) {
+                      other_called_by_sibling = 1;
+                      break;
+                    }
+                  }
+                }
+                if (other_called_by_sibling)
+                  keep_addrtaken = 1;
+              }
+            }
+
+            if (!keep_addrtaken) {
+              IRLiveInterval *interval = tcc_ir_get_live_interval(ir, vreg);
+              if (interval)
+                interval->addrtaken = 0;
+            }
+          }
+        }
+      }
+    }
+  }
 
   /* -finstrument-functions: emit exit hook call at the common return point */
   if (tcc_state->instrument_functions && !sym->type.ref->f.func_no_instrument)
   {
     gen_instrument_call(sym, "__cyg_profile_func_exit");
+  }
+
+  if (tcc_state->do_bench)
+  {
+    unsigned now = tcc_getclock_ms();
+    tcc_bench_log_phase(tcc_state, "func-body", funcname, &tcc_state->bench_function_body_time,
+                        &tcc_state->bench_function_body_count, now - phase_start);
+    phase_start = now;
   }
 
 #ifdef CONFIG_TCC_DEBUG
@@ -23867,6 +25269,16 @@ static void gen_function(Sym *sym)
     printf("=== END IR BEFORE OPTIMIZATIONS ===\n");
   }
 #endif
+
+  /* Block copy init: replace memset(0) + consecutive stores with BLOCK_COPY
+   * from a pre-built rodata block.  Run once before the iterative loop. */
+  tcc_ir_opt_block_copy_init(ir);
+
+  /* Interprocedural constant propagation: replace calls to functions known
+   * to return a constant with ASSIGN #const.  Runs before the iterative
+   * loop so existing passes cascade the constant through the caller. */
+  if (tcc_state->opt_ipc)
+    tcc_ir_opt_const_call_replace(ir);
 
   /* Iterative optimization loop
    * Runs optimization passes until no more changes are made,
@@ -23890,9 +25302,17 @@ static void gen_function(Sym *sym)
     if (tcc_state->opt_const_prop)
       changes += tcc_ir_opt_const_prop(ir);
 
+
+    /* Phase 1a: Fold LOAD of a static global whose initializer is known and
+     * has not been clobbered into ASSIGN #imm.  Feeds subsequent const_prop
+     * + branch_folding; error arms guarded by `g != initial` collapse. */
+    if (tcc_state->opt_const_prop)
+      changes += tcc_ir_opt_global_init_prop(ir);
+
     /* Phase 1b: TMP Constant Propagation - propagate constants from folded expressions */
     if (tcc_state->opt_const_prop)
       changes += tcc_ir_opt_const_prop_tmp(ir);
+
 
     /* Phase 1b1: fold constant string builtin calls after argument/address
      * propagation exposes literal-backed pointers in the IR.
@@ -23906,6 +25326,36 @@ static void gen_function(Sym *sym)
      */
     if (tcc_state->opt_const_prop)
       changes += tcc_ir_opt_branch_folding(ir);
+    if (tcc_state->opt_const_prop)
+      changes += tcc_ir_opt_stack_addr_nonnull_fold(ir);
+
+    /* Phase 1c2: Boolean materialization peephole. Fuse
+     * CMP+SETIF+TEST_ZERO+JUMPIF into CMP+JUMPIF when the materialized
+     * boolean is single-use. */
+    if (tcc_state->opt_const_prop)
+      changes += tcc_ir_opt_setif_branch_fuse(ir);
+
+    /* Phase 1c3: Stack-Boolean-Diamond. Collapse STORE/JUMP/STORE/TEST_ZERO/
+     * JUMPIF written to a single-use stack slot into two direct branches. */
+    if (tcc_state->opt_const_prop)
+      changes += tcc_ir_opt_stack_bool_diamond(ir);
+
+    /* Phase 1c4: VAR → TMP local forwarding. Reroute in-BB uses of a VAR
+     * just written from a TEMP to use the TEMP directly (no reload). */
+    if (tcc_state->opt_const_prop)
+      changes += tcc_ir_opt_var_tmp_fwd(ir);
+
+    /* Phase 1c4b: Local load CSE — currently disabled.
+     * While the direct use-substitution approach correctly preserves DEREF
+     * flags, merging VAR loads extends TEMP live ranges, increasing register
+     * pressure on ARM's limited register file and causing net regressions
+     * from additional spills. Needs register-pressure-aware heuristics. */
+
+    /* Phase 1c5: Single-BB VAR→TMP promotion. Converts a non-addressed VAR
+     * with a single def and only lval-ASSIGN reads into a fresh TEMP,
+     * feeding copy_prop so the reload round-trip disappears. */
+    if (tcc_state->opt_copy_prop)
+      changes += tcc_ir_opt_var_to_tmp(ir);
 
     /* Phase 1d: Value Tracking through Arithmetic - track constants through ADD/SUB
      * This enables folding comparisons like "CMP V0, #1000000" when V0 has a
@@ -23948,7 +25398,49 @@ static void gen_function(Sym *sym)
     if (tcc_state->opt_cse)
       changes += tcc_ir_opt_cse_arith(ir);
 
+    /* Phase 3a: Global LOAD value CSE — deduplicate loads from the same global
+     * within a basic block.  Enables same-vreg comparison folds after inlining. */
+    if (tcc_state->opt_const_prop)
+      changes += tcc_ir_opt_cse_global_load(ir);
+
+    /* Phase 3b: Deref forwarding — reuse a just-loaded deref value in an
+     * adjacent CMP instead of re-reading from memory.  Fires after inlining
+     * of check functions that save a value for an error path then compare. */
+    if (tcc_state->opt_const_prop)
+      changes += tcc_ir_opt_deref_fwd(ir);
+
   } while (changes > 0 && iteration < max_iterations);
+
+  /* Post-loop cleanup: when the iterative loop exhausted max_iterations,
+   * cascading folds (e.g. bswap→SHR→AND→CMP) may have made more VARs
+   * single-def constants.  One final DCE+const_prop+branch_folding round
+   * catches the remaining opportunities without raising max_iterations. */
+  if (iteration >= max_iterations && tcc_state->opt_const_prop)
+  {
+    if (tcc_state->opt_dce)
+      tcc_ir_opt_dce(ir);
+    tcc_ir_opt_const_prop(ir);
+    tcc_ir_opt_const_prop_tmp(ir);
+    tcc_ir_opt_branch_folding(ir);
+    if (tcc_state->opt_dce)
+      tcc_ir_opt_dce(ir);
+  }
+
+  /* Narrow CSE: deduplicate PARAM/VAR + #constant expressions.
+   * Safe and independent — not gated by opt_cse. */
+  if (tcc_state->optimize >= 1)
+    tcc_ir_opt_cse_param_add(ir);
+
+  /* GlobalSym CSE: hoist repeated global symbol addresses to TEMPs.
+   * Must run before compact_nops since it reuses NOP slots.
+   * Not gated by opt_cse (which is disabled due to cse_arith SHA-1 bug)
+   * because this pass is independent and safe. */
+  if (tcc_state->optimize >= 1)
+    tcc_ir_opt_globalsym_cse(ir);
+
+  /* Compact NOPs accumulated during the iterative loop.
+   * All subsequent passes benefit from a smaller instruction array. */
+  tcc_ir_opt_compact_nops(ir);
 
   /* Phase 3b: Global CSE - eliminate redundant computations across basic blocks
    * This catches cases like address calculations in if/else branches where
@@ -23956,7 +25448,7 @@ static void gen_function(Sym *sym)
    * NOTE: Currently disabled due to issues with complex control flow (gotos/labels)
    */
   (void)tcc_ir_opt_cse_global;
-  // #if 0
+#if 0
   if (tcc_state->opt_cse)
   {
     int gcse_changes = tcc_ir_opt_cse_global(ir);
@@ -23983,14 +25475,9 @@ static void gen_function(Sym *sym)
       }
     }
   }
-  // #endif
-
-#ifdef DEBUG_IR_GEN
-  if (iteration > 1)
-  {
-    printf("OPTIMIZE: Ran %d optimization iterations\n", iteration);
-  }
 #endif
+
+  LOG_IR_GEN("OPTIMIZE: Ran %d optimization iterations", iteration);
 
   /* Phase 2c: Jump Threading - forward jump targets through NOPs and chains
    * This eliminates unnecessary jumps and simplifies control flow.
@@ -24008,94 +25495,268 @@ static void gen_function(Sym *sym)
       tcc_ir_opt_dce(ir); /* Clean up any newly unreachable code */
   }
 
-  /* Phase 3b: MLA (Multiply-Accumulate) Fusion - fuse MUL + ADD into MLA */
-  /* This should run after CSE so we have clean MUL+ADD patterns */
-  if (tcc_state->opt_mla_fusion && tcc_ir_opt_mla_fusion(ir))
-    if (tcc_state->opt_dce)
-      tcc_ir_opt_dce(ir); /* Clean up any newly unreachable code */
-
-  /* Phase 3c: Stack Address CSE - hoist repeated stack address computations
-   * This enables indexed memory fusion for stack-allocated arrays by
-   * creating a vreg to hold the base address instead of recomputing it.
+  /* Phases 3b–4b: Fusion and boolean passes.
+   * None of these passes change control flow — they only NOP individual
+   * instructions via pattern matching.  A single DCE at the end (line below)
+   * is therefore sufficient; running DCE after each individual pass would be
+   * a no-op and wastes O(n) work per pass.
+   *
+   * Ordering constraints:
+   *   mla_fusion      should run before indexed/postinc (cleaner patterns)
    */
-  if (tcc_state->opt_stack_addr_cse && tcc_ir_opt_stack_addr_cse(ir))
-    if (tcc_state->opt_dce)
-      tcc_ir_opt_dce(ir); /* Clean up any newly unreachable code */
+  /* Combined fusion pass: MLA + indexed memory in one loop with shared def/use table. */
+  if (tcc_state->opt_mla_fusion || tcc_state->opt_indexed_memory)
+    tcc_ir_opt_fusion_pass(ir, tcc_state->opt_mla_fusion, tcc_state->opt_indexed_memory);
 
-  /* Phase 4: Indexed Load/Store Fusion - fuse SHL + ADD + LOAD/STORE
-   * Pattern: arr[index] -> uses ARM's LDR/STR with scaled register offset
-   */
-  if (tcc_state->opt_indexed_memory && tcc_ir_opt_indexed_memory_fusion(ir))
-    if (tcc_state->opt_dce)
-      tcc_ir_opt_dce(ir); /* Clean up any newly unreachable code */
+  /* Deref-in-ALU indexed fusion: extract deref operands in ALU instructions
+   * (e.g. XOR with table lookup) into LOAD_INDEXED when the address is
+   * computed by SHL+ADD.  Runs after regular indexed fusion to catch the
+   * remaining patterns where the load is embedded in an ALU operand. */
+  if (tcc_state->opt_indexed_memory)
+    tcc_ir_opt_deref_indexed_fusion(ir);
 
-  /* Phase 4b: Post-Increment Load/Store Fusion - fuse LOAD/STORE + ADD
-   * Pattern: *ptr++; -> uses ARM's LDR/STR with post-increment
-   */
-  if (tcc_state->opt_postinc_fusion && tcc_ir_opt_postinc_fusion(ir))
-    if (tcc_state->opt_dce)
-      tcc_ir_opt_dce(ir); /* Clean up any newly unreachable code */
+  /* Displacement load/store fusion - fuse ADD(base, #imm) + LOAD/STORE/ASSIGN-lval
+   * into a single LOAD_INDEXED/STORE_INDEXED with scale=0 and immediate index.
+   * Must follow the SHL+ADD fusion above (disjoint patterns, but ordering keeps
+   * the def/use table interpretation clean after NOPs are inserted). */
+  if (tcc_state->opt_disp_fusion)
+    tcc_ir_opt_disp_fusion(ir);
 
-  /* Common subexpression elimination for commutative boolean ops */
-  if (tcc_state->opt_bool_cse && tcc_ir_opt_cse_bool(ir))
-    if (tcc_state->opt_dce)
-      tcc_ir_opt_dce(ir); /* Clean up unused ops */
+  /* ADD+deref fold - fuse ADD(base, #imm) where the result is used as an
+   * lval (implicit deref) in CMP/ADD/etc into LOAD_INDEXED + plain use.
+   * Catches patterns that disp_fusion misses (lval embedded in non-LOAD ops). */
+  if (tcc_state->opt_disp_fusion)
+    tcc_ir_opt_add_deref_fold(ir);
 
-  /* Idempotent boolean simplification: BOOL_OP(x, x) -> x */
-  if (tcc_state->opt_bool_idempotent && tcc_ir_opt_bool_idempotent(ir))
-    if (tcc_state->opt_dce)
-      tcc_ir_opt_dce(ir); /* Clean up unused ops */
+  /* LEA+deref fold - collapse `LEA Addr[StackLoc[-N]] + [ADD #K] + deref-use`
+   * into a direct StackLoc access.  Runs after disp-fusion so any surviving
+   * LEA+ADD pairs still have a chance to be folded here. */
+  if (tcc_state->opt_lea_fold)
+    tcc_ir_opt_lea_fold(ir);
 
-  /* Boolean expression simplification - eliminate redundant BOOL_OR/BOOL_AND */
-  if (tcc_state->opt_bool_simplify && tcc_ir_opt_bool_simplify(ir))
-    if (tcc_state->opt_dce)
-      tcc_ir_opt_dce(ir); /* Clean up unused ops */
+  /* Post-Increment Load/Store Fusion - fuse LOAD/STORE + ADD
+   * Pattern: *ptr++; -> ARM LDR/STR with post-increment */
+  if (tcc_state->opt_postinc_fusion)
+    tcc_ir_opt_postinc_fusion(ir);
+
+  /* Combined boolean pass: CSE + idempotent in one loop. */
+  if (tcc_state->opt_bool_cse || tcc_state->opt_bool_idempotent)
+    tcc_ir_opt_bool_pass(ir, tcc_state->opt_bool_idempotent, tcc_state->opt_bool_cse);
+  if (tcc_state->opt_bool_simplify)
+    tcc_ir_opt_bool_simplify(ir);
 
   /* Return value optimization - fold LOAD -> RETURNVALUE */
-  if (tcc_state->opt_return_value && tcc_ir_opt_return(ir))
-    if (tcc_state->opt_dce)
-      tcc_ir_opt_dce(ir); /* Clean up unused ops */
+  if (tcc_state->opt_return_value)
+    tcc_ir_opt_return(ir);
+
+  /* Compact NOPs before the store-load forwarding loop (up to 12 iterations). */
+  tcc_ir_opt_compact_nops(ir);
+
+  /* Entry-block store propagation: forward struct field constants initialized
+   * before loops into deref operands inside loops.  Runs before SL-FWD because
+   * it ignores BB boundaries (entry-BB stores dominate all code), enabling
+   * forwarding that SL-FWD's multi-pred reset would block. */
+  if (tcc_state->opt_store_load_fwd && !ir->has_static_chain)
+  {
+    for (int esp_iter = 0; esp_iter < 3; esp_iter++)
+    {
+      int esp_ch = tcc_ir_opt_entry_store_prop(ir);
+      if (esp_ch <= 0)
+        break;
+      tcc_ir_opt_const_prop(ir);
+      tcc_ir_opt_const_prop_tmp(ir);
+      tcc_ir_opt_const_var_prop(ir);
+      tcc_ir_opt_branch_folding(ir);
+      tcc_ir_opt_stack_addr_nonnull_fold(ir);
+      tcc_ir_opt_redundant_loop_check(ir);
+      tcc_ir_opt_dce(ir);
+      tcc_ir_opt_compact_nops(ir);
+      tcc_ir_opt_sl_forward(ir);
+      tcc_ir_opt_copy_prop(ir);
+      tcc_ir_opt_stack_addr_nonnull_fold(ir);
+      tcc_ir_opt_branch_folding(ir);
+      tcc_ir_opt_dce(ir);
+      tcc_ir_opt_dead_var_store_elim(ir);
+      tcc_ir_opt_const_var_prop(ir);
+      tcc_ir_opt_branch_folding(ir);
+      tcc_ir_opt_dce(ir);
+      tcc_ir_opt_compact_nops(ir);
+    }
+  }
 
   /* Phase 4: Store-Load Forwarding - replace loads from recently stored addresses
    * CONSERVATIVE: Only handles stack locals whose address is not taken.
    * DISABLED for nested functions with static chain: chain-relative captured
    * variable offsets can numerically match FP-relative local variable offsets,
    * causing the forwarding to confuse aliased values. */
-  if (tcc_state->opt_store_load_fwd && !ir->has_static_chain && tcc_ir_opt_sl_forward(ir))
+  /* Iterate store-load forwarding + const prop + branch folding + DCE.
+   * Each round may fold branches (e.g. CMP #7,#7 → always true), removing
+   * basic-block boundaries and exposing more store-load forwarding opportunities
+   * for the next round.  This is critical for struct field accesses where each
+   * check1() call creates a branch between consecutive field reads. */
+  for (int sl_iter = 0; sl_iter < 12; sl_iter++)
   {
-    if (tcc_state->opt_dce)
-      tcc_ir_opt_dce(ir); /* Clean up forwarded loads */
-    /* SL forwarding may expose constant operands in TEST_ZERO/CMP.
-     * Re-run branch folding + DCE to eliminate dead branches. */
+    if (!(tcc_state->opt_store_load_fwd && !ir->has_static_chain && tcc_ir_opt_sl_forward(ir)))
+      break;
+    /* Global LOAD CSE after SL_FWD: forwarding may expose redundant global
+     * loads (e.g. arr[0]=g1; *p→g1 forwarded, then check_u64 reloads g1). */
+    tcc_ir_opt_cse_global_load(ir);
+    /* Copy propagation EARLY: collapse TEMP→TEMP ASSIGN chains created by
+     * SL_FWD (e.g. T5←T4←T0) and global LOAD CSE (T6←T0) so that
+     * const_prop's same-vreg comparison fold can see matching vregs. */
+    if (tcc_state->opt_copy_prop)
+      tcc_ir_opt_copy_prop(ir);
     if (tcc_state->opt_const_prop)
     {
+      /* Iteratively propagate and fold constants: each round may turn a
+       * two-const ALU op into a single constant, which feeds the next round.
+       * A 4-operand chain (a+b+c+d) needs 3 rounds to fully collapse. */
+      for (int cp_iter = 0; cp_iter < 4; cp_iter++)
+      {
+        int cp_ch = 0;
+        cp_ch += tcc_ir_opt_const_prop(ir);
+        cp_ch += tcc_ir_opt_const_prop_tmp(ir);
+        cp_ch += tcc_ir_opt_const_var_prop(ir);
+        if (!cp_ch)
+          break;
+      }
+      tcc_ir_opt_value_tracking(ir);
+      tcc_ir_opt_const_prop_tmp(ir);
       tcc_ir_opt_branch_folding(ir);
+      tcc_ir_opt_branch_folding(ir);
+      tcc_ir_opt_stack_addr_nonnull_fold(ir);
+      tcc_ir_opt_setif_branch_fuse(ir);
+      tcc_ir_opt_stack_bool_diamond(ir);
+      tcc_ir_opt_var_tmp_fwd(ir);
+      /* DCE first: unreachable code after branch folding (e.g. dead error
+       * paths) must be NOP'd before fallthrough elimination can see that
+       * a JMP to its nearby target is a simple fallthrough over NOPs. */
       if (tcc_state->opt_dce)
         tcc_ir_opt_dce(ir);
+      /* Remove unconditional jumps that became fallthrough after branch folding
+       * + DCE.  This eliminates BB boundaries so the next store-load round can
+       * see stores across previously separated blocks (e.g. struct field
+       * accesses separated by check1() calls). */
+      if (tcc_state->opt_jump_threading)
+      {
+        tcc_ir_opt_jump_threading(ir);
+        tcc_ir_opt_eliminate_fallthrough(ir);
+      }
+      /* Compact NOPs so the next SL-FWD iteration sees clean BB boundaries.
+       * Dead code from DCE + eliminated fallthroughs create NOP chains that
+       * inflate pred_count (NOP is not a terminator → implicit fallthrough),
+       * causing the SL-FWD to unnecessarily reset its hash table at merge
+       * points.  Compacting removes these phantom predecessors. */
+      tcc_ir_opt_compact_nops(ir);
     }
+  }
+
+  /* Post-SL_FWD cleanup: the SL_FWD loop's DCE may have killed dead branches
+   * that were the only remaining defs of a VAR (e.g. `fail = 1` in a dead
+   * printf path).  Re-run const_prop + branch_folding + DCE so the now-
+   * single-def VAR gets propagated into its uses and any resulting trivial
+   * branches (`CMP #0, #0; BNE`) fold away. */
+  if (tcc_state->opt_const_prop)
+  {
+    tcc_ir_opt_const_prop(ir);
+    tcc_ir_opt_const_prop_tmp(ir);
+    /* Value tracking with lcmp same-vreg fold: runs after SL_FWD has
+     * converted LOADs to ASSIGNs so the chain resolution can match. */
+    tcc_ir_opt_value_tracking(ir);
+    tcc_ir_opt_const_prop_tmp(ir);
+    tcc_ir_opt_branch_folding(ir);
+    tcc_ir_opt_stack_addr_nonnull_fold(ir);
+    if (tcc_state->opt_dce)
+      tcc_ir_opt_dce(ir);
   }
 
   /* Phase 4: Redundant Store Elimination - remove stores overwritten before read
    * CONSERVATIVE: Only handles stack locals whose address is not taken */
-  if (tcc_state->opt_redundant_store && tcc_ir_opt_store_redundant(ir))
-    if (tcc_state->opt_dce)
-      tcc_ir_opt_dce(ir); /* Clean up dead stores */
+  if (tcc_state->opt_redundant_store)
+    tcc_ir_opt_store_redundant(ir);
 
   /* Dead store elimination - remove unused ASSIGN instructions */
   if (tcc_state->opt_dead_store)
     tcc_ir_opt_dse(ir);
 
+  /* Dead VAR store elimination (post-SL_FWD): after DSE kills dead TMPs,
+   * VARs that were only read by those TMPs become dead.  Typical pattern:
+   * SL_FWD forwards struct field loads, making the address computation
+   * dead (e.g. T15 = V3; T16 = T15+16 → both dead after forwarding).
+   * DSE kills T15/T16, then dead_var_store_elim kills V3's store.
+   * Cascade with DSE to kill the now-dead source TMPs of eliminated VAR stores. */
+  if (tcc_state->opt_dead_store)
+  {
+    tcc_ir_opt_dead_var_store_elim(ir);
+  }
+
+  /* Dead address-taken VAR elimination - remove writes to VARs with no live reads.
+   * Must run after value tracking + DCE have eliminated all uses of overflow results. */
+  if (tcc_state->opt_dead_store)
+  {
+    if (tcc_ir_opt_dead_addrvar_elim(ir))
+      tcc_ir_opt_dse(ir);
+  }
+
+  /* Redundant VAR ASSIGN elimination - kill assigns overwritten before next read.
+   * Must run after dead_addrvar_elim to catch newly-exposed redundant assigns. */
+  if (tcc_state->opt_dead_store)
+    tcc_ir_opt_redundant_var_assign(ir);
+
+  /* Phase 4c: Loop Rotation - convert top-tested (while) loops to
+   * bottom-tested (do-while) to eliminate 2 branches per iteration.
+   * Must run before loop unrolling so unrolling sees cleaner patterns,
+   * and before IV strength reduction which benefits from rotated layout. */
+  if (tcc_state->opt_loop_rotation)
+    tcc_ir_opt_loop_rotation(ir);
+
+  /* Phase 5a: Loop Unrolling - fully unroll small constant-trip-count loops.
+   * After unrolling, re-run iterative constant propagation + DCE to collapse
+   * the expanded constant arithmetic (e.g. 0+5+5+5+5+5 → 25). */
+  if (tcc_state->opt_loop_unroll)
+  {
+    int unrolled = tcc_ir_opt_loop_unroll(ir);
+    if (unrolled > 0)
+    {
+      /* Compact NOPs before post-unroll iterative optimization. */
+      tcc_ir_opt_compact_nops(ir);
+      int iter2 = 0, ch2;
+      do
+      {
+        ch2 = 0;
+        if (tcc_state->opt_dce)
+          ch2 += tcc_ir_opt_dce(ir);
+        if (tcc_state->opt_dead_store)
+          ch2 += tcc_ir_opt_dse(ir);
+        if (tcc_state->opt_const_prop)
+          ch2 += tcc_ir_opt_const_prop(ir);
+        if (tcc_state->opt_const_prop)
+          ch2 += tcc_ir_opt_const_prop_tmp(ir);
+        if (tcc_state->opt_const_prop)
+          ch2 += tcc_ir_opt_branch_folding(ir);
+        if (tcc_state->opt_const_prop)
+          ch2 += tcc_ir_opt_stack_addr_nonnull_fold(ir);
+        if (tcc_state->opt_const_prop)
+          ch2 += tcc_ir_opt_setif_branch_fuse(ir);
+        if (tcc_state->opt_const_prop)
+          ch2 += tcc_ir_opt_stack_bool_diamond(ir);
+        if (tcc_state->opt_const_prop)
+          ch2 += tcc_ir_opt_var_tmp_fwd(ir);
+        if (tcc_state->opt_const_prop)
+          ch2 += tcc_ir_opt_value_tracking(ir);
+      } while (ch2 > 0 && ++iter2 < 10);
+    }
+  }
   /* Phase 5: Loop-Invariant Code Motion - DISABLED
    * The LICM pass has a bug in hoist_const_exprs_from_loop(): instruction
    * indices are not adjusted by total_inserted when reading original
    * instructions during the insertion loop, causing operand_base corruption.
    * This produces invalid loop structures that crash IV strength reduction.
    * TODO: re-enable after the index fix in licm.c is validated. */
+  /* Phase 5: Loop-Invariant Code Motion */
   IRLoops *licm_loops = NULL;
-#if 0
   if (tcc_state->opt_licm)
     licm_loops = tcc_ir_opt_licm_ex(ir);
-#endif
 
   /* Phase 6: Induction Variable Strength Reduction - transform array indexing
    * from: base + i*stride (SHL + ADD each iteration)
@@ -24114,7 +25775,146 @@ static void gen_function(Sym *sym)
   if (tcc_state->opt_strength_red)
     tcc_ir_opt_strength_reduction(ir);
 
+  /* Late copy propagation + dead store elimination.
+   * Late passes (IV strength reduction, loop rotation) may introduce
+   * redundant ASSIGN copies (e.g., T1=V1; V1=T1+1 instead of V1=V1+1).
+   * Clean them up before final DCE and code generation. */
+  if (tcc_state->opt_copy_prop)
+  {
+    int late_cp = tcc_ir_opt_copy_prop(ir);
+    if (late_cp > 0 && tcc_state->opt_dead_store)
+      tcc_ir_opt_dse(ir);
+  }
+
+  /* Late deref forwarding — var_tmp_fwd may have expanded VARs back to
+   * their defining deref expressions, creating STORE+CMP deref pairs. */
+  if (tcc_state->opt_const_prop)
+    tcc_ir_opt_deref_fwd(ir);
+
+  /* Late VAR→TMP forwarding is deferred to after final compact_nops +
+   * eliminate_fallthrough (below), because the forward scan needs clean
+   * basic block boundaries without stale fallthrough JMPs. */
+
+  /* Stack Address CSE - eliminate redundant stack address computations.
+   * Must run AFTER IV strength reduction (which creates the ASSIGN+ADD
+   * pattern for end pointers) and after late copy propagation. */
+  if (tcc_state->opt_stack_addr_cse)
+    tcc_ir_opt_stack_addr_cse(ir);
+
+  /* Post-increment assign folding — fold T=V[lval]; V=T OP x into V=V OP x.
+   * Must run AFTER the iterative loop, not inside it.  The lval ASSIGN acts
+   * as an opacity barrier for constant propagation; folding it away inside
+   * the loop lets const prop incorrectly propagate constants through loop
+   * back-edges (e.g., IJMP).  Running it late avoids this because const prop
+   * does not run again after this point. */
+  if (tcc_state->opt_copy_prop)
+    tcc_ir_opt_postinc_assign_fold(ir);
+
+  /* Loop-aware post-increment fusion — fuse embedded deref in loop body with
+   * latch pointer increment into LOAD_POSTINC.  Must run after IV strength
+   * reduction (Phase 6) which creates the latch ADD pattern. */
+  if (tcc_state->opt_postinc_fusion)
+    tcc_ir_opt_loop_postinc_fusion(ir);
+
+  /* Loop Bound Rematerialization - recompute SP-relative end pointers inside
+   * the loop instead of keeping them in callee-saved registers.
+   * Must run AFTER loop_postinc_fusion to avoid breaking the latch ADD pattern. */
+  if (tcc_state->opt_iv_strength_red)
+    tcc_ir_opt_loop_bound_remat(ir);
+
+  /* Decrement-to-Zero - transform count-up loops to count-down-to-zero.
+   * Must run late, after IV-SR has eliminated body uses of loop counters. */
+  tcc_ir_opt_decrement_to_zero(ir);
+
+  /* Redundant Init Elimination - remove function-entry VAR inits that are
+   * always killed before use. Must run after decrement-to-zero (which NOPs
+   * pre-test guards, simplifying the control flow). */
+  if (tcc_state->opt_dead_store)
+    tcc_ir_opt_redundant_init_elim(ir);
+
+  /* Dead Loop Elimination - remove loops whose body has no side effects and
+   * whose result VARs have constant values.  Must run late, after all loop
+   * transformations and constant propagation have simplified loop bodies. */
+  if (tcc_state->opt_dce)
+  {
+    int dle_changes = tcc_ir_opt_dead_loop_elim(ir);
+    if (dle_changes > 0)
+    {
+      tcc_ir_opt_value_tracking(ir);
+      tcc_ir_opt_const_prop_tmp(ir);
+      tcc_ir_opt_branch_folding(ir);
+      tcc_ir_opt_dce(ir);
+      tcc_ir_opt_dse(ir);
+      tcc_ir_opt_compact_nops(ir);
+    }
+  }
+
   tcc_ir_opt_dce(ir); /* Final pass to mark unreachable code as NOP */
+
+  tcc_ir_opt_compact_nops(ir);
+
+  /* Re-run fall-through elimination after the final DCE.
+   * Later passes (loop unrolling + branch folding, strength reduction)
+   * can NOP instructions between a JUMP and its target, creating new
+   * fall-through jumps that the earlier Phase 2c pass could not see. */
+  if (tcc_state->opt_jump_threading)
+    tcc_ir_opt_eliminate_fallthrough(ir);
+
+  /* Late VAR→TMP forwarding: after final compact_nops + eliminate_fallthrough,
+   * BB boundaries are clean.  IV-SR creates new TMP chains (e.g., T66 running
+   * pointer) that got copy-propagated into VAR defs (V2 = T66).  Forward
+   * V2→T66 into subsequent TMP copies (T21 = V2 → T21 = T66), then re-run
+   * copy_prop to propagate TMP→TMP copies into DEREF uses (PARAM2 T21***DEREF***
+   * → PARAM2 T66***DEREF***), eliminating both ASSIGN MOVs and ip→param MOVs. */
+  if (tcc_state->opt_copy_prop)
+  {
+    if (tcc_ir_opt_var_tmp_fwd(ir))
+    {
+      if (tcc_state->opt_dead_store)
+      {
+        tcc_ir_opt_dead_var_store_elim(ir);
+        tcc_ir_opt_dse(ir);
+      }
+      if (tcc_ir_opt_copy_prop(ir) && tcc_state->opt_dead_store)
+        tcc_ir_opt_dse(ir);
+    }
+  }
+
+  /* ADD-immediate + DEREF fold into LOAD_INDEXED — DISABLED.
+   * The fold moves the memory load from the DEREF use site to the ADD
+   * site, which can violate memory ordering even with FUNCPARAMVAL-only
+   * restriction (35 GCC torture test failures).  Needs investigation of
+   * the interaction between LOAD_INDEXED codegen and call-site setup. */
+
+  /* Late loop rotation: retry rotation for loops whose bodies were too
+   * complex earlier (had conditional branches from inlined code / checks
+   * that DCE + branch folding have since eliminated). */
+  if (tcc_state->opt_loop_rotation)
+  {
+    if (tcc_ir_opt_loop_rotation(ir))
+    {
+      /* The guard CMP+JUMPIF may be dead (e.g. init=0, limit=4: 0>=4 is
+       * always false).  Run value tracking + branch folding + DCE to
+       * eliminate the dead guard and clean up. */
+      if (tcc_state->opt_const_prop)
+      {
+        tcc_ir_opt_value_tracking(ir);
+        tcc_ir_opt_const_prop(ir);
+        tcc_ir_opt_const_prop_tmp(ir);
+        tcc_ir_opt_branch_folding(ir);
+      }
+      if (tcc_state->opt_dce)
+        tcc_ir_opt_dce(ir);
+      tcc_ir_opt_compact_nops(ir);
+      if (tcc_state->opt_jump_threading)
+        tcc_ir_opt_eliminate_fallthrough(ir);
+    }
+  }
+
+  /* Phase 8: Conditional Select - replace if/else diamonds with SELECT.
+   * Must run late, after all other optimizations have simplified the IR,
+   * so we see the cleanest diamond patterns. */
+  tcc_ir_opt_select(ir);
 
   /* Recompute leafness after IR optimizations.
    * IR construction marks the function non-leaf as soon as a call op is
@@ -24146,6 +25946,14 @@ static void gen_function(Sym *sym)
     }
   }
 
+  if (tcc_state->do_bench)
+  {
+    unsigned now = tcc_getclock_ms();
+    tcc_bench_log_phase(tcc_state, "func-opt", funcname, &tcc_state->bench_function_opt_time,
+                        &tcc_state->bench_function_opt_count, now - phase_start);
+    phase_start = now;
+  }
+
   nocode_wanted = 0;
 
   /* reset local stack */
@@ -24160,8 +25968,172 @@ static void gen_function(Sym *sym)
    * so the allocator knows they arrive in r0 and can optimize accordingly */
   tcc_ir_mark_return_value_incoming_regs(ir);
 
+  /* Compact local stack after IR optimization.
+   * The frontend pre-allocates locals (decrementing `loc`) during parsing,
+   * but optimization may eliminate all references to those locals (e.g.,
+   * constant propagation replaces StackLoc loads with immediates and DSE
+   * removes the stores).  Scan the optimized IR for the most-negative
+   * STACKOFF reference still in use and shrink `loc` accordingly. */
+  {
+    int min_stack_ref = 0;
+    for (int i = 0; i < ir->next_instruction_index; i++)
+    {
+      const IRQuadCompact *q = &ir->compact_instructions[i];
+      if (q->op == TCCIR_OP_NOP)
+        continue;
+      IROperand ops[3];
+      ops[0] = tcc_ir_op_get_dest(ir, q);
+      ops[1] = tcc_ir_get_src1(ir, i);
+      ops[2] = tcc_ir_get_src2(ir, i);
+      for (int j = 0; j < 3; j++)
+      {
+        if (ops[j].tag == IROP_TAG_STACKOFF)
+        {
+          int off = irop_get_stack_offset(ops[j]);
+          if (off < min_stack_ref)
+            min_stack_ref = off;
+        }
+      }
+    }
+    if (min_stack_ref > loc)
+    {
+      loc = min_stack_ref;
+    }
+  }
+
+  /* Disable R12 allocation for functions with computed gotos (IJMP).
+   * Changing register allocation can alter instruction encoding sizes
+   * (16-bit vs 32-bit for high registers), shifting code layout and
+   * breaking position-dependent label offset computations. */
+  int saved_regs_for_alloc = tcc_state->registers_for_allocator;
+  {
+    int has_ijmp = 0;
+    for (int i = 0; i < ir->next_instruction_index; i++)
+    {
+      if (ir->compact_instructions[i].op == TCCIR_OP_IJUMP)
+      {
+        has_ijmp = 1;
+        break;
+      }
+    }
+    if (has_ijmp && tcc_state->registers_for_allocator > 12)
+      tcc_state->registers_for_allocator = 12;
+  }
+  /* Also disable R12 allocation at -O0 — unoptimized code has more
+   * scratch-heavy codegen paths with R12 encoding edge cases. */
+  if (tcc_state->optimize < 1 && tcc_state->registers_for_allocator > 12)
+    tcc_state->registers_for_allocator = 12;
+
   /* TODO: track float_parameters_count separately for hard float ABI */
   tcc_ls_allocate_registers(&ir->ls, ir->parameters_count, 0, loc);
+
+  tcc_state->registers_for_allocator = saved_regs_for_alloc;
+
+  /* Post-allocation swap: if a return-value VAR vreg missed its preferred
+   * register (r0), try to swap with the blocker if safe.
+   * Only at -O1+ to avoid -O0 codegen edge cases with R12 encoding.
+   *
+   * Safety constraints:
+   * - Only VAR vregs (long-lived accumulators), not TEMPs
+   * - Neither interval crosses a function call
+   * - Neither is a 64-bit pair
+   * - Neither is spilled
+   * - Blocker is not a precolored PARAM
+   * - No other interval in the swap-target register overlaps the blocker */
+  for (int hi = 0; hi < ir->ls.next_interval_index; hi++)
+  {
+    LSLiveInterval *hint_li = &ir->ls.intervals[hi];
+    if (hint_li->r0 < 0 || hint_li->r1 >= 0 || hint_li->crosses_call)
+      continue;
+
+    /* Only VAR vregs — TEMPs are handled by the codegen peephole */
+    if (TCCIR_DECODE_VREG_TYPE(hint_li->vreg) != TCCIR_VREG_TYPE_VAR)
+      continue;
+
+    IRLiveInterval *hint_iri = tcc_ir_vreg_live_interval(ir, hint_li->vreg);
+    if (!hint_iri || hint_iri->incoming_reg0 < 0)
+      continue;
+
+    int wanted_reg = hint_iri->incoming_reg0;
+    if (hint_li->r0 == wanted_reg)
+      continue;
+
+    int have_reg = hint_li->r0;
+
+    /* Find the blocker: interval holding wanted_reg that overlaps hint */
+    LSLiveInterval *blocker = NULL;
+    for (int bi = 0; bi < ir->ls.next_interval_index; bi++)
+    {
+      LSLiveInterval *b = &ir->ls.intervals[bi];
+      if (b->r0 != wanted_reg || b->r1 >= 0 || b->crosses_call)
+        continue;
+      if (b->start > hint_li->end || b->end < hint_li->start)
+        continue;
+      /* Don't evict precolored PARAMs */
+      if (TCCIR_DECODE_VREG_TYPE(b->vreg) == TCCIR_VREG_TYPE_PARAM)
+      {
+        blocker = NULL;
+        break;
+      }
+      blocker = b;
+      break;
+    }
+    if (!blocker)
+      continue;
+
+    /* Safety check: can blocker use have_reg for its entire range?
+     * Also check: can hint use wanted_reg for its entire range?
+     * Use strict less-than: intervals touching at a single instruction
+     * boundary (one ends, other starts) can share a register since
+     * the ending value is consumed before the starting value is produced. */
+    int safe = 1;
+    for (int ci = 0; ci < ir->ls.next_interval_index; ci++)
+    {
+      LSLiveInterval *c = &ir->ls.intervals[ci];
+      if (c == hint_li || c == blocker)
+        continue;
+      if (c->r0 == have_reg &&
+          c->start < blocker->end && c->end > blocker->start)
+      {
+        safe = 0;
+        break;
+      }
+      if (c->r0 == wanted_reg &&
+          c->start < hint_li->end && c->end > hint_li->start)
+      {
+        safe = 0;
+        break;
+      }
+    }
+    if (!safe)
+      continue;
+
+    /* Swap registers and update dirty bitmap + liveness bitmap */
+    hint_li->r0 = wanted_reg;
+    blocker->r0 = have_reg;
+    ir->ls.dirty_registers |= (1ull << wanted_reg) | (1ull << have_reg);
+
+    /* Update live_regs_by_instruction atomically for both intervals.
+     * They may overlap — sequential clear/set would clobber one
+     * interval's bit in the overlapping region. */
+    if (ir->ls.live_regs_by_instruction)
+    {
+      int lim = ir->ls.live_regs_by_instruction_size;
+      uint32_t have_mask = (1u << have_reg);
+      uint32_t want_mask = (1u << wanted_reg);
+      int lo = (int)(hint_li->start < blocker->start ? hint_li->start : blocker->start);
+      int hi = (int)(hint_li->end > blocker->end ? hint_li->end : blocker->end);
+      for (int k = lo; k <= hi && k < lim; k++)
+      {
+        int in_hint = (k >= (int)hint_li->start && k <= (int)hint_li->end);
+        int in_blocker = (k >= (int)blocker->start && k <= (int)blocker->end);
+        ir->ls.live_regs_by_instruction[k] &= ~(have_mask | want_mask);
+        if (in_hint) ir->ls.live_regs_by_instruction[k] |= want_mask;
+        if (in_blocker) ir->ls.live_regs_by_instruction[k] |= have_mask;
+      }
+    }
+    break;
+  }
 
   /* Reset scratch register cache before codegen */
   tcc_ls_reset_scratch_cache(&ir->ls);
@@ -24172,6 +26144,40 @@ static void gen_function(Sym *sym)
    * Must run before we extend `loc` based on spill slots.
    */
   tcc_ir_avoid_spilling_stack_passed_params(ir);
+
+  /* Shrink frame: after optimization (DCE, constant folding), some locals may
+   * have been eliminated.  Scan the optimized IR for actually-referenced local
+   * frame offsets and shrink loc to only cover the slots still in use. */
+  {
+    int min_local_offset = 0;
+    int stackoff_count = 0;
+    for (int i = 0; i < ir->next_instruction_index; i++)
+    {
+      const IRQuadCompact *q = &ir->compact_instructions[i];
+      if (q->op == TCCIR_OP_NOP)
+        continue;
+      IROperand ops[3];
+      ops[0] = tcc_ir_op_get_dest(ir, q);
+      ops[1] = tcc_ir_op_get_src1(ir, q);
+      ops[2] = tcc_ir_op_get_src2(ir, q);
+      for (int j = 0; j < 3; j++)
+      {
+        if (irop_is_none(ops[j]))
+          continue;
+        if (irop_get_tag(ops[j]) == IROP_TAG_STACKOFF)
+        {
+          int32_t off = irop_get_stack_offset(ops[j]);
+          stackoff_count++;
+          if (off < min_local_offset)
+            min_local_offset = off;
+        }
+      }
+    }
+    if (min_local_offset > loc)
+    {
+      loc = min_local_offset;
+    }
+  }
 
   /* We may have removed a lot of spill slots (stack-passed params). Repack the
    * remaining spill slots so other spills don't keep huge negative offsets. */
@@ -24190,8 +26196,12 @@ static void gen_function(Sym *sym)
         min_stack_loc = sl;
     }
     if (min_stack_loc < loc)
+    {
       loc = min_stack_loc;
+    }
   }
+
+  tcc_ir_move_coalescing(ir);
 
   tcc_ir_patch_live_intervals_registers(ir);
   tcc_ir_register_allocation_params(ir);
@@ -24219,12 +26229,46 @@ static void gen_function(Sym *sym)
         }
       }
     }
+    uint8_t saved_need_fp = tcc_state->need_frame_pointer;
+    uint8_t saved_force_fp = tcc_state->force_frame_pointer;
+    uint8_t saved_force_lr = tcc_state->force_lr_save;
+    /* Check if any nested function needs the parent's frame pointer BEFORE
+     * compile_nested_functions clears the nested funcs list.  The parent
+     * needs FP when a nested function uses the static chain at runtime:
+     * - trampoline_needed: address was taken, trampoline references parent FP
+     * - nb_captured > 0 and NOT eligible for inlining: compiled separately,
+     *   accesses parent vars via FP-relative chain offsets */
+    /* Determine if any nested function needs the parent's FP at runtime.
+     * Safe to clear FP only when there's a single inlineable nested function
+     * with no trampoline — multi-level nesting or non-inlineable functions
+     * need the parent's FP for static chain access. */
+    int can_omit_fp = 0;
+    if (tcc_state->nb_nested_funcs == 1)
+    {
+      NestedFunc *nf = &tcc_state->nested_funcs[0];
+      if (!nf->trampoline_needed &&
+          nf->sym && nf->sym->type.ref &&
+          nf->sym->type.ref->f.func_auto_inline)
+        can_omit_fp = 1;
+    }
+    int needs_fp_for_nested = !can_omit_fp;
     compile_nested_functions(sym);
+    tcc_state->force_frame_pointer = saved_force_fp;
+    tcc_state->force_lr_save = saved_force_lr;
+    tcc_state->need_frame_pointer = needs_fp_for_nested ? tcc_state->need_frame_pointer : saved_need_fp;
 
     /* Update parent's func_ind and ELF symbol to point after nested function code.
      * ind is now past the nested functions' machine code (not restored). */
     func_ind = ind;
     put_extern_sym(sym, cur_text_section, ind + 1, 0);
+  }
+
+  if (tcc_state->do_bench)
+  {
+    unsigned now = tcc_getclock_ms();
+    tcc_bench_log_phase(tcc_state, "func-alloc", funcname, &tcc_state->bench_function_alloc_time,
+                        &tcc_state->bench_function_alloc_count, now - phase_start);
+    phase_start = now;
   }
 
   /* Before codegen, create placeholder ELF symbols for addr-taken labels
@@ -24251,6 +26295,13 @@ static void gen_function(Sym *sym)
     // gfunc_epilog();
   }
 
+  if (tcc_state->do_bench)
+  {
+    unsigned now = tcc_getclock_ms();
+    tcc_bench_log_phase(tcc_state, "func-codegen", funcname, &tcc_state->bench_function_codegen_time,
+                        &tcc_state->bench_function_codegen_count, now - phase_start);
+  }
+
 #ifdef CONFIG_TCC_DEBUG
   if (tcc_state->dump_ir)
   {
@@ -24271,6 +26322,26 @@ static void gen_function(Sym *sym)
 
     TCCFuncPurity purity = tcc_ir_infer_func_purity(ir, sym);
     tcc_ir_cache_func_purity(tcc_state, sym->v, purity);
+  }
+
+  if (tcc_state->opt_ipc && ir && sym)
+  {
+    int64_t const_val;
+    int const_btype;
+    if (tcc_ir_detect_const_result(ir, &const_val, &const_btype))
+      tcc_ir_cache_const_result(tcc_state, sym->v, const_val, const_btype);
+  }
+
+  /* Post-optimization re-inlining: if the optimized IR is trivial,
+   * retroactively mark the function for auto-inlining so future callers
+   * inline it via the existing token-replay mechanism.
+   * Skip nested functions: marking them auto_inline causes the parent
+   * to omit the frame pointer, breaking static chain access. */
+  if (ir && sym && !sym->type.ref->f.func_auto_inline &&
+      !sym->a.nested_func &&
+      ir->next_instruction_index <= 8)
+  {
+    sym->type.ref->f.func_auto_inline = 1;
   }
 
   /* end of function */
@@ -24346,6 +26417,21 @@ static void gen_inline_functions(TCCState *s)
       if (sym && (sym->type.t & VT_INLINE) && sym->type.ref && sym->type.ref->f.func_alwinl && !sym->a.addrtaken &&
           !sym->type.ref->f.func_outofline_needed)
         continue;
+      if (sym && sym->type.ref && (sym->type.ref->f.func_auto_inline || sym->type.ref->f.func_eval_only_inline))
+      {
+        /* All auto-inline and eval-only-inline functions (static and
+         * non-static) are compiled immediately at definition time.
+         * Skip here — never re-emit. */
+        if (s->verbose >= 2)
+          fprintf(stderr, "[auto-inline] gen_inline_functions: skipping %s (compiled at definition)\n",
+                  get_tok_str(sym->v & ~SYM_FIELD, NULL));
+        continue;
+      }
+      if (s->verbose >= 2)
+        fprintf(stderr, "[gen_inline] sym=%s sym->c=%d VT_INLINE=%d addrtaken=%d auto_inline=%d\n",
+                sym ? get_tok_str(sym->v & ~SYM_FIELD, NULL) : "<null>", sym ? sym->c : -1,
+                sym ? !!(sym->type.t & VT_INLINE) : -1, (sym && sym->a.addrtaken) ? 1 : 0,
+                (sym && sym->type.ref && sym->type.ref->f.func_auto_inline) ? 1 : 0);
       if (sym && (sym->c || !(sym->type.t & VT_INLINE)))
       {
         /* Skip original va_arg_pack functions - only their clones get compiled */
@@ -24666,6 +26752,44 @@ static int decl(int l)
            * token stream, so prescan_captured_vars won't find them. */
           prescan_vla_param_captured_vars(nf, local_stack);
 
+          /* Register small nested functions as auto-inline candidates so
+           * call sites in the parent can inline them via token replay.
+           * Safe when captures are either all shadowed (no genuine captures)
+           * or all genuine captures are read-only (never written or
+           * address-taken).  Write captures produce VAR-to-VAR IR patterns
+           * the optimizer can mishandle after inlining. */
+          if (tcc_state->ir && nf->func_str &&
+              (tcc_state->opt_inline_functions || tcc_state->opt_inline_small) &&
+              auto_inline_sig_ok(nf->sym) && nf->nb_nlgotos == 0 &&
+              nf->nb_addr_labels == 0 &&
+              (!nested_has_genuine_capture(nf) || nested_capture_is_read_only(nf)))
+          {
+            int body_len = nf->func_str->len;
+            int threshold = tcc_state->opt_inline_limit > 0 ? tcc_state->opt_inline_limit
+                                                            : (tcc_state->opt_inline_functions ? 60 : 30);
+            if (body_len <= threshold && !inline_body_has_apply_args(nf->func_str) &&
+                !inline_body_has_static_local(nf->func_str) && !inline_body_has_loops(nf->func_str))
+            {
+              nf->sym->type.ref->f.func_auto_inline = 1;
+              struct InlineFunc *fn = tcc_malloc(sizeof *fn + strlen(file->filename));
+              strcpy(fn->filename, file->filename);
+              fn->sym = nf->sym;
+              /* Copy the token stream — nf->func_str is freed by end_macro()
+               * during compile_nested_functions, so InlineFunc needs its own. */
+              fn->func_str = tok_str_alloc();
+              if (body_len > 0)
+              {
+                int *buf = tcc_malloc(body_len * sizeof(int));
+                memcpy(buf, tok_str_buf(nf->func_str), body_len * sizeof(int));
+                fn->func_str->data.str = buf;
+                fn->func_str->allocated_len = body_len;
+                fn->func_str->len = body_len;
+              }
+              dynarray_add(&tcc_state->inline_fns, &tcc_state->nb_inline_fns, fn);
+
+            }
+          }
+
           /* Capture parent-scope typedefs and struct/union/enum tags so the
            * nested function body can reference them.  Walk the local_stack
            * which is still live at this point (before pop_local_syms). */
@@ -24817,6 +26941,7 @@ static int decl(int l)
 
           /* Increment count */
           tcc_state->nb_nested_funcs++;
+          tcc_state->had_nested_funcs = 1;
 
           /* Continue parsing parent body - nested func saved */
           break;
@@ -24907,6 +27032,222 @@ static int decl(int l)
             }
           }
         }
+        else if (sym->type.ref && sym->type.ref->f.func_type != FUNC_ELLIPSIS && !sym->type.ref->f.func_alwinl &&
+                 !sym->type.ref->f.func_noinline &&
+                 /* Only auto-inline functions whose signature is safe: scalar/pointer
+                  * params that fit in 32-bit registers, and scalar or struct return
+                  * types.  64-bit types and struct *parameters* are not handled.
+                  * Returns 2 for void+llong signatures (body-length gated below). */
+                 auto_inline_sig_ok(sym) && (tcc_state->opt_inline_functions || tcc_state->opt_inline_small) &&
+                 /* Don't auto-inline functions with VLA parameters: the VLA size
+                  * expressions (which may have side effects like i++) are evaluated
+                  * during function prolog, outside the saved body token stream.
+                  * Inlining would replay only the body, losing those side effects. */
+                 tcc_state->nb_vla_param_exprs == 0)
+        {
+          /* Auto-inline candidate: save the body as a token stream so call
+           * sites within this TU can replay it.
+           *
+           * Static functions: defer standalone compilation; suppress it entirely
+           *   if all call sites are inlined and address not taken. We set
+           *   VT_INLINE so gen_inline_functions handles deferred emission.
+           *
+           * Non-static functions: MUST always have a globally-visible symbol for
+           *   other TUs. We compile the standalone definition immediately via
+           *   token-stream replay (same mechanism as gen_inline_functions), then
+           *   keep the token stream in inline_fns for call-site inlining within
+           *   this TU. VT_INLINE is NOT set so ELF linkage stays global. */
+          struct InlineFunc *fn;
+          fn = tcc_malloc(sizeof *fn + strlen(file->filename));
+          strcpy(fn->filename, file->filename);
+          fn->sym = sym;
+          fn->func_str = NULL;
+          skip_or_save_block(&fn->func_str);
+
+          int threshold = tcc_state->opt_inline_limit > 0 ? tcc_state->opt_inline_limit
+                                                          : (tcc_state->opt_inline_functions ? 60 : 30);
+          int is_static = !!(sym->type.t & VT_STATIC);
+          int body_len = fn->func_str ? fn->func_str->len : 0;
+
+          if (TCC_LOG_INLINE_STRUCT)
+            fprintf(stderr, "[auto-inline] candidate: %s  static=%d  len=%d  threshold=%d\n",
+                    get_tok_str(sym->v & ~SYM_FIELD, NULL), is_static, body_len, threshold);
+          LOG_INLINE_STRUCT("[auto-inline] candidate: %s  static=%d  len=%d  threshold=%d  ret_btype=%d",
+                            get_tok_str(sym->v & ~SYM_FIELD, NULL), is_static, body_len, threshold,
+                            sym->type.ref ? (sym->type.ref->type.t & VT_BTYPE) : -1);
+
+          Section *saved_text = cur_text_section;
+          cur_text_section = ad.section ? ad.section : text_section;
+          if (cur_text_section->sh_num > bss_section->sh_num)
+            cur_text_section->sh_flags = text_section->sh_flags;
+
+          /* Void-returning functions with 64-bit params: only inline very
+           * short bodies (≤ 15 tokens) — longer bodies may trigger an IR
+           * coalescing bug with narrowed locals. */
+          int void_llong_limit = (auto_inline_sig_ok(sym) == 2) ? 15 : threshold;
+          if (fn->func_str && body_len <= void_llong_limit && !inline_body_has_apply_args(fn->func_str))
+          {
+            if (TCC_LOG_INLINE_STRUCT)
+              fprintf(stderr, "[auto-inline] SMALL: registering %s as inline candidate\n",
+                      get_tok_str(sym->v & ~SYM_FIELD, NULL));
+
+            /* Small enough: register as inline candidate for call-site replay.
+             *
+             * We compile the standalone definition immediately for BOTH static
+             * and non-static functions.  We deliberately do NOT set VT_INLINE:
+             *   - Setting VT_INLINE would defer compilation to gen_inline_functions,
+             *     but alias attributes and other code may reference sym->c before
+             *     gen_inline_functions runs, causing "aliased to undefined symbol"
+             *     errors and similar failures.
+             *   - The standalone definition is always emitted; we rely on the
+             *     linker's --gc-sections to drop unused static definitions.
+             *
+             * fn->func_str is preserved (not consumed) so call-site replay
+             * can still inline the body later.  The compilation uses an owning
+             * COPY of the token stream.
+             *
+             * Save/restore tok+tokc: the replay leaves tok=TOK_EOF which would
+             * cause the outer decl() loop to stop parsing prematurely. */
+            sym->type.ref->f.func_auto_inline = 1;
+            /* Set VT_INLINE for static functions so can_inline_eval=1 at call sites.
+             * Non-static functions must NOT get VT_INLINE — their standalone definition
+             * must remain globally visible for other translation units. */
+            if (is_static)
+              sym->type.t |= VT_INLINE;
+            dynarray_add(&tcc_state->inline_fns, &tcc_state->nb_inline_fns, fn);
+
+            TokenString *compile_ts = tok_str_alloc();
+            if (body_len > 0)
+            {
+              int *buf = tcc_malloc(body_len * sizeof(int));
+              memcpy(buf, tok_str_buf(fn->func_str), body_len * sizeof(int));
+              compile_ts->data.str = buf;
+              compile_ts->allocated_len = body_len;
+              compile_ts->len = body_len;
+            }
+            int saved_outer_tok = tok;
+            CValue saved_outer_tokc = tokc;
+            if (TCC_LOG_INLINE_STRUCT)
+              fprintf(stderr, "[auto-inline] SMALL: compiling standalone for %s\n",
+                      get_tok_str(sym->v & ~SYM_FIELD, NULL));
+            tcc_state->had_nested_funcs = 0;
+            begin_macro(compile_ts, 1); /* owning: compile_ts freed on end_macro */
+            next();
+            gen_function(sym);
+            end_macro();
+            tok = saved_outer_tok;
+            tokc = saved_outer_tokc;
+            /* Revoke auto-inline for functions that contain nested function
+             * definitions — their closure/trampoline semantics cannot be
+             * replicated by token-replay inline expansion. */
+            if (tcc_state->had_nested_funcs)
+            {
+              sym->type.ref->f.func_auto_inline = 0;
+              if (is_static)
+                sym->type.t &= ~VT_INLINE;
+            }
+            /* gen_function's post-opt check will revoke auto_inline
+             * if the compiled IR exceeds 8 instructions. */
+            if (TCC_LOG_INLINE_STRUCT)
+              fprintf(stderr, "[auto-inline] SMALL: done compiling %s sym->c=%d\n",
+                      get_tok_str(sym->v & ~SYM_FIELD, NULL), sym->c);
+          }
+          else
+          {
+            /* Too large to inline-expand, but if the body is pure and under
+             * a higher eval-only cap, keep the token stream so
+             * try_inline_const_eval can still fold all-constant calls.
+             * Regular inline-expansion paths skip functions tagged
+             * func_eval_only_inline. */
+            const int eval_only_cap = 160;
+            int has_apply = fn->func_str ? inline_body_has_apply_args(fn->func_str) : 0;
+            int has_side = fn->func_str ? inline_body_has_side_effects(fn->func_str) : 1;
+            int eval_only_candidate = fn->func_str && body_len <= eval_only_cap && !has_apply && !has_side;
+
+            if (TCC_LOG_INLINE_STRUCT)
+              fprintf(
+                  stderr,
+                  "[auto-inline] TOO LARGE: compiling %s normally (len=%d > threshold=%d) cap=%d apply=%d side=%d%s\n",
+                  get_tok_str(sym->v & ~SYM_FIELD, NULL), body_len, threshold, eval_only_cap, has_apply, has_side,
+                  eval_only_candidate ? " (eval-only retained)" : "");
+
+            if (eval_only_candidate)
+            {
+              sym->type.ref->f.func_eval_only_inline = 1;
+              if (is_static)
+                sym->type.t |= VT_INLINE;
+              dynarray_add(&tcc_state->inline_fns, &tcc_state->nb_inline_fns, fn);
+
+              TokenString *compile_ts = tok_str_alloc();
+              int *buf = tcc_malloc(body_len * sizeof(int));
+              memcpy(buf, tok_str_buf(fn->func_str), body_len * sizeof(int));
+              compile_ts->data.str = buf;
+              compile_ts->allocated_len = body_len;
+              compile_ts->len = body_len;
+
+              int saved_outer_tok = tok;
+              CValue saved_outer_tokc = tokc;
+              begin_macro(compile_ts, 1);
+              next();
+              gen_function(sym);
+              end_macro();
+              tok = saved_outer_tok;
+              tokc = saved_outer_tokc;
+            }
+            else if (fn->func_str)
+            {
+              int saved_outer_tok = tok;
+              CValue saved_outer_tokc = tokc;
+              const int post_opt_inline_cap = 512;
+              if (body_len <= post_opt_inline_cap)
+              {
+                /* Preserve token stream for post-optimization re-inlining.
+                 * Compile from a copy (same pattern as the small-function path). */
+                dynarray_add(&tcc_state->inline_fns, &tcc_state->nb_inline_fns, fn);
+                TokenString *compile_ts = tok_str_alloc();
+                int *buf = tcc_malloc(body_len * sizeof(int));
+                memcpy(buf, tok_str_buf(fn->func_str), body_len * sizeof(int));
+                compile_ts->data.str = buf;
+                compile_ts->allocated_len = body_len;
+                compile_ts->len = body_len;
+                begin_macro(compile_ts, 1);
+                next();
+                gen_function(sym);
+                end_macro();
+                if (sym->type.ref->f.func_auto_inline) {
+                  /* Retroactively promoted: convert to eval-only so callsite
+                   * inlining only fires when ALL args are compile-time constants.
+                   * The original body is too large for unconditional inlining. */
+                  sym->type.ref->f.func_auto_inline = 0;
+                  sym->type.ref->f.func_eval_only_inline = 1;
+                } else {
+                  /* Not promoted: prevent gen_inline_functions re-compilation. */
+                  tok_str_free(fn->func_str);
+                  fn->func_str = NULL;
+                  fn->sym = NULL;
+                }
+              }
+              else
+              {
+                TokenString *ts = fn->func_str;
+                fn->func_str = NULL;
+                begin_macro(ts, 1);
+                next();
+                gen_function(sym);
+                end_macro();
+                tcc_free(fn);
+              }
+              tok = saved_outer_tok;
+              tokc = saved_outer_tokc;
+            }
+            else
+            {
+              tcc_free(fn);
+            }
+          }
+
+          cur_text_section = saved_text;
+        }
         else
         {
           /* compute text section */
@@ -24964,8 +27305,19 @@ static int decl(int l)
           if (sym && sym->sym_scope == local_scope)
           {
             if (!is_compatible_types(&sym->type, &type) || !(sym->type.t & VT_TYPEDEF))
-              tcc_error("incompatible redefinition of '%s'", get_tok_str(v, NULL));
-            sym->type = type;
+            {
+              /* Fallback: structural comparison for identical struct/union
+                 typedefs that have different Sym* pointers.  This happens
+                 when multiple auto-PCH replays define the same typedef. */
+              if (!(sym->type.t & VT_TYPEDEF) || !compare_types_structural(&sym->type, &type))
+                tcc_error("incompatible redefinition of '%s'", get_tok_str(v, NULL));
+              /* Structurally identical; keep existing type to preserve
+                 Sym* identity for earlier references. */
+            }
+            else
+            {
+              sym->type = type;
+            }
           }
           else
           {

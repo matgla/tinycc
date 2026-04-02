@@ -38,24 +38,30 @@ int get_benchmark_verify_status(const char *name);
 /* Get expected result for a benchmark */
 int get_benchmark_expected_result(const char *name);
 
-/* Compiler identification - defined in benchmark library (bench_math.c) */
+/* Compiler identification - defined in compiler_id.c (benchmark library) */
 extern const char *benchmark_compiler_name;
 extern const int benchmark_compiler_sig;
 extern const char *benchmark_compiler_id;
+extern const int benchmark_opt_level;
 
 /* External declarations for all benchmarks */
 int bench_integer_math(int iterations);
 int bench_float_math(int iterations);
 int bench_array_sum(int iterations);
+int bench_bitwise_mix(int iterations);
 int bench_function_calls(int iterations);
 int bench_conditionals(int iterations);
 int bench_switch(int iterations);
+int bench_indirect_calls(int iterations);
 int bench_strcpy(int iterations);
 int bench_memcpy(int iterations);
 int bench_strcmp(int iterations);
+int bench_strlen_scan(int iterations);
 int bench_fibonacci(int iterations);
 int bench_bubble_sort(int iterations);
 int bench_linked_list(int iterations);
+int bench_binary_search(int iterations);
+int bench_matrix_mul(int iterations);
 
 /* Registration functions */
 void init_math_benchmarks(void);

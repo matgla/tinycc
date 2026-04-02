@@ -11,11 +11,11 @@ BUILD_DIR ?= build
 OBJS = $(addprefix $(BUILD_DIR)/,$(SRCS:.c=.o))
 OBJS := $(OBJS:.S=.o)
 
-FP_CFLAGS += -O2 -Wall -Wextra -I../.. -I../../../include
+override FP_CFLAGS += -O2 -Wall -Wextra -I../.. -I../../../include
 
 # Architecture flags for ARM cross-compilation
 ARCH_FLAGS = -mcpu=cortex-m33 -mthumb
-FP_CFLAGS += $(ARCH_FLAGS)
+override FP_CFLAGS += $(ARCH_FLAGS)
 
 all: $(BUILD_DIR) $(OBJS)
 

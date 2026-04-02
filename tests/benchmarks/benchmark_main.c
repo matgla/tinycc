@@ -19,11 +19,17 @@ extern void enable_cycle_counter(void);
 extern uint64_t get_cycle_count(void);
 extern int using_dwt_counter(void);
 
+/* Defined in hardfault_handler.c — used by both HardFault and watchdog */
+extern volatile const char *current_benchmark_name;
+extern volatile const char *current_benchmark_phase;
+extern void benchmark_watchdog_start(void);
+extern void benchmark_watchdog_stop(void);
+
 /* Benchmark function type */
 typedef int (*benchmark_func_t)(int iterations);
 
 /* Benchmark registration */
-#define MAX_BENCHMARKS 16
+#define MAX_BENCHMARKS 24
 
 typedef struct
 {
@@ -90,8 +96,8 @@ int get_benchmark_expected_result(const char *name)
   return 0;
 }
 
-/* Run a single benchmark and return cycle count */
-static uint64_t run_benchmark_cycles(const benchmark_t *bench, int iterations)
+/* Run a single benchmark and return cycle count plus measured result */
+static uint64_t run_benchmark_cycles(const benchmark_t *bench, int iterations, int *out_result)
 {
   volatile int result = 0; /* Prevent optimization */
 
@@ -103,6 +109,10 @@ static uint64_t run_benchmark_cycles(const benchmark_t *bench, int iterations)
 
   /* Use result to prevent optimization */
   (void)result;
+  if (out_result)
+  {
+    *out_result = result;
+  }
 
   return end - start;
 }
@@ -134,11 +144,10 @@ int benchmark_main(void)
   printf("ARMv8-M Benchmark Suite\n");
   printf("Compiler: %s (sig=0x%06X)\n", benchmark_compiler_name, benchmark_compiler_sig);
   printf("Build: %s\n", benchmark_compiler_id);
-#ifdef __OPTIMIZE__
-  printf("Optimization: O1\n");
-#else
-  printf("Optimization: O0\n");
-#endif
+  if (benchmark_opt_level >= 0)
+    printf("Optimization: O%d\n", benchmark_opt_level);
+  else
+    printf("Optimization: unknown\n");
   printf("Target: ARM Cortex-M33 (ARMv8-M)\n");
   printf("========================================\n\n");
 
@@ -166,6 +175,12 @@ int benchmark_main(void)
   {
     benchmark_t *bench = &benchmarks[i];
 
+    current_benchmark_name = bench->name;
+    current_benchmark_phase = "verify";
+    printf("[verify %d/%d] %s\n", i + 1, num_benchmarks, bench->name);
+    fflush(stdout);
+    benchmark_watchdog_start();
+
     if (bench->expected_result != NO_EXPECTED_RESULT)
     {
       /* Run with registered iteration count to verify result */
@@ -187,6 +202,7 @@ int benchmark_main(void)
       bench->verify_status = VERIFY_NOT_CHECKED;
       verify_skipped++;
     }
+    benchmark_watchdog_stop();
   }
 
   if (verify_failed > 0)
@@ -225,6 +241,12 @@ int benchmark_main(void)
     const benchmark_t *bench = &benchmarks[i];
     int iterations = bench->iterations;
 
+    current_benchmark_name = bench->name;
+    current_benchmark_phase = "run";
+    printf("[run %d/%d] %s\n", i + 1, num_benchmarks, bench->name);
+    fflush(stdout);
+    benchmark_watchdog_start();
+
     /* Avoid complex ternary chain - TCC may have codegen issues with it */
     const char *verify_str;
     if (bench->verify_status == VERIFY_PASS)
@@ -247,8 +269,8 @@ int benchmark_main(void)
     if (have_cycle_counter)
     {
       /* Run with registered iteration count */
-      uint64_t cycles = run_benchmark_cycles(bench, iterations);
-      int result = bench->func(1);
+      int result = 0;
+      uint64_t cycles = run_benchmark_cycles(bench, iterations, &result);
       /* Small delay after TCC function returns */
       for (volatile int delay = 0; delay < 100000; delay++)
       {
@@ -272,6 +294,7 @@ int benchmark_main(void)
       printf("%-20s %12d %12d %8s\n", bench->name, iterations, result, verify_str);
       fflush(stdout);
     }
+    benchmark_watchdog_stop();
   }
 
   printf("\n========================================\n");

@@ -49,6 +49,44 @@ static unsigned long le2belong(unsigned long ul)
   return ((ul & 0xFF0000) >> 8) + ((ul & 0xFF000000) >> 24) + ((ul & 0xFF) << 24) + ((ul & 0xFF00) << 8);
 }
 
+uint16_t read16le(unsigned char *p)
+{
+  return p[0] | (uint16_t)p[1] << 8;
+}
+
+void write16le(unsigned char *p, uint16_t x)
+{
+  p[0] = x & 255;
+  p[1] = x >> 8 & 255;
+}
+
+uint32_t read32le(unsigned char *p)
+{
+  return read16le(p) | (uint32_t)read16le(p + 2) << 16;
+}
+
+void write32le(unsigned char *p, uint32_t x)
+{
+  write16le(p, x);
+  write16le(p + 2, x >> 16);
+}
+
+void add32le(unsigned char *p, int32_t x)
+{
+  write32le(p, read32le(p) + x);
+}
+
+uint64_t read64le(unsigned char *p)
+{
+  return read32le(p) | (uint64_t)read32le(p + 4) << 32;
+}
+
+void write64le(unsigned char *p, uint64_t x)
+{
+  write32le(p, x);
+  write32le(p + 4, x >> 32);
+}
+
 static int ar_usage(int ret)
 {
   fprintf(stderr, "usage: tcc -ar [crstvx] lib [files]\n");

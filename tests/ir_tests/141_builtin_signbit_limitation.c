@@ -3,12 +3,10 @@
 /*
  * This test documents a known limitation of __builtin_signbit:
  * 
- * The current implementation uses x < 0.0 comparison for runtime values,
- * which returns 0 for -0.0. However, according to IEEE 754 and GCC behavior,
- * signbit(-0.0) should return 1 (non-zero) because -0.0 has the sign bit set.
+ * GCC returns the raw float sign mask for runtime __builtin_signbitf values,
+ * while runtime double and constant-folded cases are normalized to 1.
  * 
- * This limitation only affects runtime values. Compile-time constants
- * are handled correctly by extracting the sign bit from the raw representation.
+ * This test documents the mixed native behavior so TCC can match it.
  */
 
 int main(void)
@@ -18,7 +16,7 @@ int main(void)
     
     int r;
     
-    /* These should return 1 (non-zero) according to IEEE 754, but return 0 */
+    /* GCC returns the raw sign mask for float runtime values. */
     r = __builtin_signbitf(neg_zero_f);
     printf("signbitf(-0.0f) at runtime: %d (expected: 1)\n", r);
     

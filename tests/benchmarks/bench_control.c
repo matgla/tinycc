@@ -23,6 +23,21 @@ static int NOINLINE func_c(int x)
   return (x << 2) + 1;
 }
 
+static int NOINLINE func_ptr_add(int x)
+{
+  return x + 11;
+}
+
+static int NOINLINE func_ptr_mul(int x)
+{
+  return x * 3;
+}
+
+static int NOINLINE func_ptr_xor(int x)
+{
+  return x ^ 0x55AA;
+}
+
 /* Function call benchmark - deterministic result */
 int bench_function_calls(int iterations)
 {
@@ -124,6 +139,20 @@ int bench_switch(int iterations)
   return r;
 }
 
+/* Indirect call benchmark - deterministic result */
+int bench_indirect_calls(int iterations)
+{
+  benchmark_func_t ops[4] = {func_ptr_add, func_ptr_mul, func_ptr_xor, func_ptr_add};
+  int value = 7;
+
+  for (int n = 0; n < iterations; n++)
+  {
+    value = ops[n & 3](value);
+  }
+
+  return value & 0x7FFFFFFF;
+}
+
 /* Register benchmark with expected results */
 void init_control_benchmarks(void)
 {
@@ -132,4 +161,5 @@ void init_control_benchmarks(void)
   register_benchmark_ex("conditionals", bench_conditionals, 1000, "If-else branches", 1192);
   /* switch_stmt: case 7: (1000 ^ 0xFF) ^ 0xFF = 1000 */
   register_benchmark_ex("switch_stmt", bench_switch, 1000, "Switch statement", 1000);
+  register_benchmark_ex("indirect_calls", bench_indirect_calls, 1000, "Function pointer dispatch", 365365191);
 }

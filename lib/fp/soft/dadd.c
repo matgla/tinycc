@@ -56,7 +56,14 @@ double __aeabi_dadd(double a, double b)
     return ur.d;
   }
 
-  /* Handle zero */
+  /* Handle zero.
+   * IEEE 754 §6.3: when both operands are zero, the result is +0 unless
+   * both are negative (round-to-nearest mode). */
+  if (is_zero_bits(a_bits) && is_zero_bits(b_bits))
+  {
+    ur.u = (a_sign && b_sign) ? DOUBLE_SIGN_BIT : 0;
+    return ur.d;
+  }
   if (is_zero_bits(a_bits))
   {
     ur.u = b_bits;

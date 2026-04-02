@@ -1,0 +1,1033 @@
+make: Entering directory '/home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/qemu/mps2-an505'
+mkdir -p /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/build
+/home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/../../armv8m-tcc -nostdlib -fvisibility=hidden -mcpu=cortex-m33 -mthumb -mfloat-abi=soft  -ffunction-sections -O2 -g -dump-ir -I/home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/libc_includes -I/home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/libc_imports -I/home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/libc_includes/newlib -I/usr/arm-none-eabi/include -I/home/mateusz/repos/yasos.zig/libs/tinycc/include -c /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/qemu/mps2-an505/boot.S -o /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/build/boot.o
+make: Entering directory '/home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/qemu/mps2-an505'
+mkdir -p /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/build
+/home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/../../armv8m-tcc -nostdlib -fvisibility=hidden -mcpu=cortex-m33 -mthumb -mfloat-abi=soft  -ffunction-sections -O2 -g -dump-ir -I/home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/libc_includes -I/home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/libc_imports -I/home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/libc_includes/newlib -I/usr/arm-none-eabi/include -I/home/mateusz/repos/yasos.zig/libs/tinycc/include -c /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/qemu/mps2-an505/boot.S -o /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/build/boot.o
+/home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/../../armv8m-tcc -nostdlib -fvisibility=hidden -mcpu=cortex-m33 -mthumb -mfloat-abi=soft  -ffunction-sections -O2 -g -dump-ir -I/home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/libc_includes -I/home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/libc_imports -I/home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/libc_includes/newlib -I/usr/arm-none-eabi/include -I/home/mateusz/repos/yasos.zig/libs/tinycc/include /home/mateusz/repos/yasos.zig/libs/tinycc/tests/tests2/79_vla_continue.c /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/build/boot.o /usr/lib/gcc/arm-none-eabi/14.2.0/thumb/v8-m.main/nofp/crti.o /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/qemu/mps2-an505/newlib_build/arm-none-eabi/libgloss/arm/rdimon-crt0.o /usr/lib/gcc/arm-none-eabi/14.2.0/thumb/v8-m.main/nofp/crtend.o /usr/lib/gcc/arm-none-eabi/14.2.0/thumb/v8-m.main/nofp/crtn.o -o /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/build/79_vla_continue.elf -Wl,--gc-sections -B/home/mateusz/repos/yasos.zig/libs/tinycc -L/home/mateusz/repos/yasos.zig/libs/tinycc/lib -L/home/mateusz/repos/yasos.zig/libs/tinycc/lib/fp -L/home/mateusz/repos/yasos.zig/libs/tinycc -Wl,--start-group -larmv8m-libtcc1.a -lsoftfp /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/qemu/mps2-an505//newlib_build/arm-none-eabi/newlib/libc.a /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/qemu/mps2-an505/newlib_build/arm-none-eabi/libgloss/arm/librdimon.a /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/qemu/mps2-an505//newlib_build/arm-none-eabi/newlib/libm.a /usr/lib/gcc/arm-none-eabi/14.2.0/thumb/v8-m.main/nofp/libgcc.a -Wl,--end-group -Wl,-oformat=elf32-littlearm -T/home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/qemu/mps2-an505/linker_script.ld -v
+tcc version 0.9.28rc 2026-04-30 fixesForYasos2@20e15847* (ARM Linux)
+-> /home/mateusz/repos/yasos.zig/libs/tinycc/tests/tests2/79_vla_continue.c
+=== IR BEFORE OPTIMIZATIONS ===
+0000: V0 <-- GlobalSym(1854)***DEREF*** [LOAD]
+0001: T1 <-- V0 [ASSIGN]
+0002: T2 <-- T1 ADD #4
+0003: T3 <-- T2***DEREF*** [ASSIGN]
+0004: T4 <-- T3 ADD #4
+0005: T5 <-- T4***DEREF*** ADD #-1
+0006: T4***DEREF*** <-- T5 [STORE]
+0007: CMP T5,#0
+0008: JMP to 15  if ">=S"
+0009: PARAM0[call_0] V0
+0010: T6 <-- V0 [ASSIGN]
+0011: T7 <-- T6 ADD #4
+0012: PARAM1[call_0] T7***DEREF***
+0013: CALL GlobalSym(2107) --> T8
+/home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/../../armv8m-tcc -nostdlib -fvisibility=hidden -mcpu=cortex-m33 -mthumb -mfloat-abi=soft  -ffunction-sections -O2 -g -dump-ir -I/home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/libc_includes -I/home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/libc_imports -I/home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/libc_includes/newlib -I/usr/arm-none-eabi/include -I/home/mateusz/repos/yasos.zig/libs/tinycc/include /home/mateusz/repos/yasos.zig/libs/tinycc/tests/tests2/79_vla_continue.c /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/build/boot.o /usr/lib/gcc/arm-none-eabi/14.2.0/thumb/v8-m.main/nofp/crti.o /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/qemu/mps2-an505/newlib_build/arm-none-eabi/libgloss/arm/rdimon-crt0.o /usr/lib/gcc/arm-none-eabi/14.2.0/thumb/v8-m.main/nofp/crtend.o /usr/lib/gcc/arm-none-eabi/14.2.0/thumb/v8-m.main/nofp/crtn.o -o /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/build/79_vla_continue.elf -Wl,--gc-sections -B/home/mateusz/repos/yasos.zig/libs/tinycc -L/home/mateusz/repos/yasos.zig/libs/tinycc/lib -L/home/mateusz/repos/yasos.zig/libs/tinycc/lib/fp -L/home/mateusz/repos/yasos.zig/libs/tinycc -Wl,--start-group -larmv8m-libtcc1.a -lsoftfp /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/qemu/mps2-an505//newlib_build/arm-none-eabi/newlib/libc.a /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/qemu/mps2-an505/newlib_build/arm-none-eabi/libgloss/arm/librdimon.a /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/qemu/mps2-an505//newlib_build/arm-none-eabi/newlib/libm.a /usr/lib/gcc/arm-none-eabi/14.2.0/thumb/v8-m.main/nofp/libgcc.a -Wl,--end-group -Wl,-oformat=elf32-littlearm -T/home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/qemu/mps2-an505/linker_script.ld -v
+tcc version 0.9.28rc 2026-04-30 fixesForYasos2@20e15847* (ARM Linux)
+-> /home/mateusz/repos/yasos.zig/libs/tinycc/tests/tests2/79_vla_continue.c
+=== IR BEFORE OPTIMIZATIONS ===
+0000: V0 <-- GlobalSym(1854)***DEREF*** [LOAD]
+0001: T1 <-- V0 [ASSIGN]
+0002: T2 <-- T1 ADD #4
+0003: T3 <-- T2***DEREF*** [ASSIGN]
+0004: T4 <-- T3 ADD #4
+0005: T5 <-- T4***DEREF*** ADD #-1
+0006: T4***DEREF*** <-- T5 [STORE]
+0007: CMP T5,#0
+0008: JMP to 15  if ">=S"
+0009: PARAM0[call_0] V0
+0010: T6 <-- V0 [ASSIGN]
+0011: T7 <-- T6 ADD #4
+0012: PARAM1[call_0] T7***DEREF***
+0013: CALL GlobalSym(2107) --> T8
+0014: JMP to 23 
+0015: T9 <-- V0 [ASSIGN]
+0016: T10 <-- T9 ADD #4
+0017: T11 <-- T10***DEREF*** [ASSIGN]
+0018: T12 <-- T11***DEREF*** [ASSIGN]
+0019: T13 <-- T12 ADD #1
+0014: JMP to 23 
+0015: T9 <-- V0 [ASSIGN]
+0016: T10 <-- T9 ADD #4
+0017: T11 <-- T10***DEREF*** [ASSIGN]
+0018: T12 <-- T11***DEREF*** [ASSIGN]
+0019: T13 <-- T12 ADD #1
+0020: T11***DEREF*** <-- T13 [STORE]
+0021: T14 <-- T12***DEREF*** [LOAD]
+0022: JMP to 24 
+0020: T11***DEREF*** <-- T13 [STORE]
+0021: T14 <-- T12***DEREF*** [LOAD]
+0022: JMP to 24 
+0023: T14 <-- T8 [ASSIGN]
+0024: RETURNVALUE T14
+=== END IR BEFORE OPTIMIZATIONS ===
+0023: T14 <-- T8 [ASSIGN]
+0024: RETURNVALUE T14
+=== END IR BEFORE OPTIMIZATIONS ===
+=== IR AFTER OPTIMIZATIONS ===
+0000: R4(V0) <-- GlobalSym(1854)***DEREF*** [LOAD]
+0001: R0(T1) <-- R4(V0) [ASSIGN]
+=== IR AFTER OPTIMIZATIONS ===
+0000: R4(V0) <-- GlobalSym(1854)***DEREF*** [LOAD]
+0001: R0(T1) <-- R4(V0) [ASSIGN]
+0002: R1(T3) <-- R0(T1) LOAD_INDEXED #4
+0003: R0(T4) <-- R1(T3) ADD #4
+0002: R1(T3) <-- R0(T1) LOAD_INDEXED #4
+0003: R0(T4) <-- R1(T3) ADD #4
+0004: R1(T5) <-- R0(T4)***DEREF*** ADD #-1
+0005: R0(T4)***DEREF*** <-- R1(T5) [STORE]
+0006: CMP R1(T5),#0
+0004: R1(T5) <-- R0(T4)***DEREF*** ADD #-1
+0005: R0(T4)***DEREF*** <-- R1(T5) [STORE]
+0006: CMP R1(T5),#0
+0007: JMP to 14  if ">=S"
+0008: PARAM0[call_0] R4(V0)
+0009: R0(T6) <-- R4(V0) [ASSIGN]
+0007: JMP to 14  if ">=S"
+0008: PARAM0[call_0] R4(V0)
+0009: R0(T6) <-- R4(V0) [ASSIGN]
+0010: R5(T7) <-- R0(T6) ADD #4
+0011: PARAM1[call_0] R5(T7)***DEREF***
+0012: CALL GlobalSym(2107) --> R0(T8)
+0010: R5(T7) <-- R0(T6) ADD #4
+0011: PARAM1[call_0] R5(T7)***DEREF***
+0012: CALL GlobalSym(2107) --> R0(T8)
+0013: JMP to 21 
+0014: R1(T9) <-- R4(V0) [ASSIGN]
+0013: JMP to 21 
+0014: R1(T9) <-- R4(V0) [ASSIGN]
+0015: R2(T11) <-- R1(T9) LOAD_INDEXED #4
+0016: R1(T12) <-- R2(T11)***DEREF*** [ASSIGN]
+0017: R3(T13) <-- R1(T12) ADD #1
+0018: R2(T11)***DEREF*** <-- R3(T13) [STORE]
+0019: R2(T14) <-- R1(T12)***DEREF*** [LOAD]
+0015: R2(T11) <-- R1(T9) LOAD_INDEXED #4
+0016: R1(T12) <-- R2(T11)***DEREF*** [ASSIGN]
+0017: R3(T13) <-- R1(T12) ADD #1
+0018: R2(T11)***DEREF*** <-- R3(T13) [STORE]
+0019: R2(T14) <-- R1(T12)***DEREF*** [LOAD]
+0020: JMP to 22 
+0021: R2(T14) <-- R0(T8) [ASSIGN]
+0022: RETURNVALUE R2(T14)
+0020: JMP to 22 
+0021: R2(T14) <-- R0(T8) [ASSIGN]
+0022: RETURNVALUE R2(T14)
+=== END IR AFTER OPTIMIZATIONS ===
+=== IR BEFORE OPTIMIZATIONS ===
+=== END IR AFTER OPTIMIZATIONS ===
+=== IR BEFORE OPTIMIZATIONS ===
+0000: V0 <-- GlobalSym(1854)***DEREF*** [LOAD]
+0001: T1 <-- V0 [ASSIGN]
+0002: T2 <-- T1 ADD #8
+0000: V0 <-- GlobalSym(1854)***DEREF*** [LOAD]
+0001: T1 <-- V0 [ASSIGN]
+0002: T2 <-- T1 ADD #8
+0003: T3 <-- T2***DEREF*** [ASSIGN]
+0004: T4 <-- T3 ADD #8
+0005: T5 <-- T4***DEREF*** ADD #-1
+0003: T3 <-- T2***DEREF*** [ASSIGN]
+0004: T4 <-- T3 ADD #8
+0005: T5 <-- T4***DEREF*** ADD #-1
+0006: T4***DEREF*** <-- T5 [STORE]
+0007: CMP T5,#0
+0008: JMP to 58  if ">=S"
+0006: T4***DEREF*** <-- T5 [STORE]
+0007: CMP T5,#0
+0008: JMP to 58  if ">=S"
+0009: T6 <-- V0 [ASSIGN]
+0010: T7 <-- T6 ADD #8
+0009: T6 <-- V0 [ASSIGN]
+0010: T7 <-- T6 ADD #8
+0011: T8 <-- T7***DEREF*** [ASSIGN]
+0012: T9 <-- T8 ADD #8
+0013: T10 <-- V0 [ASSIGN]
+0011: T8 <-- T7***DEREF*** [ASSIGN]
+0012: T9 <-- T8 ADD #8
+0013: T10 <-- V0 [ASSIGN]
+0014: T11 <-- T10 ADD #8
+0015: T12 <-- T11***DEREF*** [ASSIGN]
+0016: T13 <-- T12 ADD #24
+0014: T11 <-- T10 ADD #8
+0015: T12 <-- T11***DEREF*** [ASSIGN]
+0016: T13 <-- T12 ADD #24
+0017: CMP T9***DEREF***,T13***DEREF***
+0018: JMP to 49  if "<S"
+0019: T14 <-- V0 [ASSIGN]
+0017: CMP T9***DEREF***,T13***DEREF***
+0018: JMP to 49  if "<S"
+0019: T14 <-- V0 [ASSIGN]
+0020: T15 <-- T14 ADD #8
+0021: T16 <-- T15***DEREF*** [ASSIGN]
+0020: T15 <-- T14 ADD #8
+0021: T16 <-- T15***DEREF*** [ASSIGN]
+0022: T17 <-- T16***DEREF*** [ASSIGN]
+0023: T18 <-- P0 [LOAD]
+0024: T17***DEREF*** <-- T18 [STORE]
+0022: T17 <-- T16***DEREF*** [ASSIGN]
+0023: T18 <-- P0 [LOAD]
+0024: T17***DEREF*** <-- T18 [STORE]
+0025: T19 <-- V0 [ASSIGN]
+0026: T20 <-- T19 ADD #8
+0027: T21 <-- T20***DEREF*** [ASSIGN]
+0025: T19 <-- V0 [ASSIGN]
+0026: T20 <-- T19 ADD #8
+0027: T21 <-- T20***DEREF*** [ASSIGN]
+0028: T22 <-- T21***DEREF*** [ASSIGN]
+0029: T23 <-- T22***DEREF*** [LOAD]
+0030: CMP T23,#10
+0028: T22 <-- T21***DEREF*** [ASSIGN]
+0029: T23 <-- T22***DEREF*** [LOAD]
+0030: CMP T23,#10
+0031: JMP to 40  if "=="
+0032: T24 <-- V0 [ASSIGN]
+0033: T25 <-- T24 ADD #8
+0031: JMP to 40  if "=="
+0032: T24 <-- V0 [ASSIGN]
+0033: T25 <-- T24 ADD #8
+0034: T26 <-- T25***DEREF*** [ASSIGN]
+0035: T27 <-- T26***DEREF*** [ASSIGN]
+0034: T26 <-- T25***DEREF*** [ASSIGN]
+0035: T27 <-- T26***DEREF*** [ASSIGN]
+0036: T28 <-- T27 ADD #1
+0037: T26***DEREF*** <-- T28 [STORE]
+0038: T29 <-- T27***DEREF*** [LOAD]
+0036: T28 <-- T27 ADD #1
+0037: T26***DEREF*** <-- T28 [STORE]
+0038: T29 <-- T27***DEREF*** [LOAD]
+0039: JMP to 47 
+0040: PARAM0[call_0] V0
+0041: PARAM1[call_0] #10
+0039: JMP to 47 
+0040: PARAM0[call_0] V0
+0041: PARAM1[call_0] #10
+0042: T30 <-- V0 [ASSIGN]
+0043: T31 <-- T30 ADD #8
+0044: PARAM2[call_0] T31***DEREF***
+0042: T30 <-- V0 [ASSIGN]
+0043: T31 <-- T30 ADD #8
+0044: PARAM2[call_0] T31***DEREF***
+0045: CALL GlobalSym(2108) --> T32
+0046: JMP to 48 
+0045: CALL GlobalSym(2108) --> T32
+0046: JMP to 48 
+0047: T32 <-- T29 [ASSIGN]
+0048: JMP to 56 
+0049: PARAM0[call_1] V0
+0047: T32 <-- T29 [ASSIGN]
+0048: JMP to 56 
+0049: PARAM0[call_1] V0
+0050: PARAM1[call_1] P0
+0051: T33 <-- V0 [ASSIGN]
+0052: T34 <-- T33 ADD #8
+0050: PARAM1[call_1] P0
+0051: T33 <-- V0 [ASSIGN]
+0052: T34 <-- T33 ADD #8
+0053: PARAM2[call_1] T34***DEREF***
+0054: CALL GlobalSym(2108) --> T35
+0055: JMP to 57 
+0053: PARAM2[call_1] T34***DEREF***
+0054: CALL GlobalSym(2108) --> T35
+0055: JMP to 57 
+0056: T35 <-- T32 [ASSIGN]
+0057: JMP to 72 
+0058: T36 <-- V0 [ASSIGN]
+0056: T35 <-- T32 [ASSIGN]
+0057: JMP to 72 
+0058: T36 <-- V0 [ASSIGN]
+0059: T37 <-- T36 ADD #8
+0060: T38 <-- T37***DEREF*** [ASSIGN]
+0061: T39 <-- T38***DEREF*** [ASSIGN]
+0062: T40 <-- P0 [LOAD]
+0059: T37 <-- T36 ADD #8
+0060: T38 <-- T37***DEREF*** [ASSIGN]
+0061: T39 <-- T38***DEREF*** [ASSIGN]
+0062: T40 <-- P0 [LOAD]
+0063: T39***DEREF*** <-- T40 [STORE]
+0064: T41 <-- V0 [ASSIGN]
+0065: T42 <-- T41 ADD #8
+0063: T39***DEREF*** <-- T40 [STORE]
+0064: T41 <-- V0 [ASSIGN]
+0065: T42 <-- T41 ADD #8
+0066: T43 <-- T42***DEREF*** [ASSIGN]
+0067: T44 <-- T43***DEREF*** [ASSIGN]
+0068: T45 <-- T44 ADD #1
+0066: T43 <-- T42***DEREF*** [ASSIGN]
+0067: T44 <-- T43***DEREF*** [ASSIGN]
+0068: T45 <-- T44 ADD #1
+0069: T43***DEREF*** <-- T45 [STORE]
+0070: T46 <-- T44***DEREF*** [LOAD]
+0069: T43***DEREF*** <-- T45 [STORE]
+0070: T46 <-- T44***DEREF*** [LOAD]
+0071: JMP to 73 
+0072: T46 <-- T35 [ASSIGN]
+0073: RETURNVALUE T46
+0071: JMP to 73 
+0072: T46 <-- T35 [ASSIGN]
+0073: RETURNVALUE T46
+=== END IR BEFORE OPTIMIZATIONS ===
+=== IR AFTER OPTIMIZATIONS ===
+0000: R5(V0) <-- GlobalSym(1854)***DEREF*** [LOAD]
+=== END IR BEFORE OPTIMIZATIONS ===
+=== IR AFTER OPTIMIZATIONS ===
+0000: R5(V0) <-- GlobalSym(1854)***DEREF*** [LOAD]
+0001: R0(T1) <-- R5(V0) [ASSIGN]
+0002: R1(T3) <-- R0(T1) LOAD_INDEXED #8
+0003: R0(T4) <-- R1(T3) ADD #8
+0001: R0(T1) <-- R5(V0) [ASSIGN]
+0002: R1(T3) <-- R0(T1) LOAD_INDEXED #8
+0003: R0(T4) <-- R1(T3) ADD #8
+0004: R1(T5) <-- R0(T4)***DEREF*** ADD #-1
+0005: R0(T4)***DEREF*** <-- R1(T5) [STORE]
+0004: R1(T5) <-- R0(T4)***DEREF*** ADD #-1
+0005: R0(T4)***DEREF*** <-- R1(T5) [STORE]
+0006: CMP R1(T5),#0
+0007: JMP to 52  if ">=S"
+0008: R0(T6) <-- R5(V0) [ASSIGN]
+0006: CMP R1(T5),#0
+0007: JMP to 52  if ">=S"
+0008: R0(T6) <-- R5(V0) [ASSIGN]
+0009: R1(T8) <-- R0(T6) LOAD_INDEXED #8
+0010: R0(T9) <-- R1(T8) ADD #8
+0011: R1(T10) <-- R5(V0) [ASSIGN]
+0009: R1(T8) <-- R0(T6) LOAD_INDEXED #8
+0010: R0(T9) <-- R1(T8) ADD #8
+0011: R1(T10) <-- R5(V0) [ASSIGN]
+0012: R2(T12) <-- R1(T10) LOAD_INDEXED #8
+0013: R1(T13) <-- R2(T12) ADD #24
+0014: CMP R0(T9)***DEREF***,R1(T13)***DEREF***
+0012: R2(T12) <-- R1(T10) LOAD_INDEXED #8
+0013: R1(T13) <-- R2(T12) ADD #24
+0014: CMP R0(T9)***DEREF***,R1(T13)***DEREF***
+0015: JMP to 43  if "<S"
+0016: R0(T14) <-- R5(V0) [ASSIGN]
+0015: JMP to 43  if "<S"
+0016: R0(T14) <-- R5(V0) [ASSIGN]
+0017: R0(T16) <-- R0(T14) LOAD_INDEXED #8
+0018: R0(T17) <-- R0(T16)***DEREF*** [ASSIGN]
+0019: R1(T18) <-- R4(P0) [LOAD]
+0017: R0(T16) <-- R0(T14) LOAD_INDEXED #8
+0018: R0(T17) <-- R0(T16)***DEREF*** [ASSIGN]
+0019: R1(T18) <-- R4(P0) [LOAD]
+0020: R0(T17)***DEREF*** <-- R1(T18) [STORE]
+0021: R0(T19) <-- R5(V0) [ASSIGN]
+0022: R0(T21) <-- R0(T19) LOAD_INDEXED #8
+0020: R0(T17)***DEREF*** <-- R1(T18) [STORE]
+0021: R0(T19) <-- R5(V0) [ASSIGN]
+0022: R0(T21) <-- R0(T19) LOAD_INDEXED #8
+0023: R0(T22) <-- R0(T21)***DEREF*** [ASSIGN]
+0024: R1(T23) <-- R0(T22)***DEREF*** [LOAD]
+0025: CMP R1(T23),#10
+0023: R0(T22) <-- R0(T21)***DEREF*** [ASSIGN]
+0024: R1(T23) <-- R0(T22)***DEREF*** [LOAD]
+0025: CMP R1(T23),#10
+0026: JMP to 34  if "=="
+0027: R0(T24) <-- R5(V0) [ASSIGN]
+0026: JMP to 34  if "=="
+0027: R0(T24) <-- R5(V0) [ASSIGN]
+0028: R1(T26) <-- R0(T24) LOAD_INDEXED #8
+0029: R0(T27) <-- R1(T26)***DEREF*** [ASSIGN]
+0030: R2(T28) <-- R0(T27) ADD #1
+0028: R1(T26) <-- R0(T24) LOAD_INDEXED #8
+0029: R0(T27) <-- R1(T26)***DEREF*** [ASSIGN]
+0030: R2(T28) <-- R0(T27) ADD #1
+0031: R1(T26)***DEREF*** <-- R2(T28) [STORE]
+0032: R6(T29) <-- R0(T27)***DEREF*** [LOAD]
+0033: JMP to 41 
+0031: R1(T26)***DEREF*** <-- R2(T28) [STORE]
+0032: R6(T29) <-- R0(T27)***DEREF*** [LOAD]
+0033: JMP to 41 
+0034: PARAM0[call_0] R5(V0)
+0035: PARAM1[call_0] #10
+0036: R0(T30) <-- R5(V0) [ASSIGN]
+0034: PARAM0[call_0] R5(V0)
+0035: PARAM1[call_0] #10
+0036: R0(T30) <-- R5(V0) [ASSIGN]
+0037: R8(T31) <-- R0(T30) ADD #8
+0038: PARAM2[call_0] R8(T31)***DEREF***
+0037: R8(T31) <-- R0(T30) ADD #8
+0038: PARAM2[call_0] R8(T31)***DEREF***
+0039: CALL GlobalSym(2108) --> R9(T32)
+0040: JMP to 50 
+0041: R9(T32) <-- R6(T29) [ASSIGN]
+0039: CALL GlobalSym(2108) --> R9(T32)
+0040: JMP to 50 
+0041: R9(T32) <-- R6(T29) [ASSIGN]
+0042: JMP to 50 
+0043: PARAM0[call_1] R5(V0)
+0044: PARAM1[call_1] R4(P0)
+0042: JMP to 50 
+0043: PARAM0[call_1] R5(V0)
+0044: PARAM1[call_1] R4(P0)
+0045: R0(T33) <-- R5(V0) [ASSIGN]
+0046: R6(T34) <-- R0(T33) ADD #8
+0047: PARAM2[call_1] R6(T34)***DEREF***
+0048: CALL GlobalSym(2108) --> R0(T35)
+0045: R0(T33) <-- R5(V0) [ASSIGN]
+0046: R6(T34) <-- R0(T33) ADD #8
+0047: PARAM2[call_1] R6(T34)***DEREF***
+0048: CALL GlobalSym(2108) --> R0(T35)
+0049: JMP to 64 
+0050: R0(T35) <-- R9(T32) [ASSIGN]
+0051: JMP to 64 
+0049: JMP to 64 
+0050: R0(T35) <-- R9(T32) [ASSIGN]
+0051: JMP to 64 
+0052: R1(T36) <-- R5(V0) [ASSIGN]
+0053: R1(T38) <-- R1(T36) LOAD_INDEXED #8
+0054: R1(T39) <-- R1(T38)***DEREF*** [ASSIGN]
+0052: R1(T36) <-- R5(V0) [ASSIGN]
+0053: R1(T38) <-- R1(T36) LOAD_INDEXED #8
+0054: R1(T39) <-- R1(T38)***DEREF*** [ASSIGN]
+0055: R2(T40) <-- R4(P0) [LOAD]
+0056: R1(T39)***DEREF*** <-- R2(T40) [STORE]
+0057: R1(T41) <-- R5(V0) [ASSIGN]
+0055: R2(T40) <-- R4(P0) [LOAD]
+0056: R1(T39)***DEREF*** <-- R2(T40) [STORE]
+0057: R1(T41) <-- R5(V0) [ASSIGN]
+0058: R2(T43) <-- R1(T41) LOAD_INDEXED #8
+0059: R1(T44) <-- R2(T43)***DEREF*** [ASSIGN]
+0058: R2(T43) <-- R1(T41) LOAD_INDEXED #8
+0059: R1(T44) <-- R2(T43)***DEREF*** [ASSIGN]
+0060: R3(T45) <-- R1(T44) ADD #1
+0061: R2(T43)***DEREF*** <-- R3(T45) [STORE]
+0062: R2(T46) <-- R1(T44)***DEREF*** [LOAD]
+0060: R3(T45) <-- R1(T44) ADD #1
+0061: R2(T43)***DEREF*** <-- R3(T45) [STORE]
+0062: R2(T46) <-- R1(T44)***DEREF*** [LOAD]
+0063: JMP to 65 
+0064: R2(T46) <-- R0(T35) [ASSIGN]
+0065: RETURNVALUE R2(T46)
+0063: JMP to 65 
+0064: R2(T46) <-- R0(T35) [ASSIGN]
+0065: RETURNVALUE R2(T46)
+=== END IR AFTER OPTIMIZATIONS ===
+=== IR BEFORE OPTIMIZATIONS ===
+0000: RETURNVALUE #5
+=== END IR AFTER OPTIMIZATIONS ===
+=== IR BEFORE OPTIMIZATIONS ===
+0000: RETURNVALUE #5
+=== END IR BEFORE OPTIMIZATIONS ===
+=== IR AFTER OPTIMIZATIONS ===
+=== END IR BEFORE OPTIMIZATIONS ===
+=== IR AFTER OPTIMIZATIONS ===
+0000: RETURNVALUE #5
+=== END IR AFTER OPTIMIZATIONS ===
+=== IR BEFORE OPTIMIZATIONS ===
+0000: RETURNVALUE #5
+=== END IR AFTER OPTIMIZATIONS ===
+=== IR BEFORE OPTIMIZATIONS ===
+0000: V0 <-- #10 [ASSIGN]
+0001: T0 <-- V0 [ASSIGN]
+0002: V0 <-- T0 ADD #-1
+0000: V0 <-- #10 [ASSIGN]
+0001: T0 <-- V0 [ASSIGN]
+0002: V0 <-- T0 ADD #-1
+0003: TEST_ZERO T0
+0004: JMP to 10  if "=="
+0005: T2 <-- V0 SHL #2
+0003: TEST_ZERO T0
+0004: JMP to 10  if "=="
+0005: T2 <-- V0 SHL #2
+0006: T3 <-- Addr[StackLoc[-40]] ADD T2
+0007: T3***DEREF*** <-- Addr[StackLoc[-60]] [STORE]
+0008: JMP to 1 
+0006: T3 <-- Addr[StackLoc[-40]] ADD T2
+0007: T3***DEREF*** <-- Addr[StackLoc[-60]] [STORE]
+0008: JMP to 1 
+0009: JMP to 1 
+0010: CMP StackLoc[-4],StackLoc[-40]
+0009: JMP to 1 
+0010: CMP StackLoc[-4],StackLoc[-40]
+0011: JMP to 16  if "!="
+0012: NOP 
+0013: PARAM0[call_2] GlobalSym(268435462)
+0011: JMP to 16  if "!="
+0012: NOP 
+0013: PARAM0[call_2] GlobalSym(268435462)
+0014: CALL GlobalSym(1137) CALL #131073
+0015: JMP to 19 
+0016: NOP 
+0014: CALL GlobalSym(1137) CALL #131073
+0015: JMP to 19 
+0016: NOP 
+0017: PARAM0[call_4] GlobalSym(268435464)
+0018: CALL GlobalSym(1137) CALL #262145
+0017: PARAM0[call_4] GlobalSym(268435464)
+0018: CALL GlobalSym(1137) CALL #262145
+=== END IR BEFORE OPTIMIZATIONS ===
+=== IR AFTER OPTIMIZATIONS ===
+0000: R0(V0) <-- #10 [ASSIGN]
+=== END IR BEFORE OPTIMIZATIONS ===
+=== IR AFTER OPTIMIZATIONS ===
+0000: R0(V0) <-- #10 [ASSIGN]
+0001: R1(T4) <-- Addr[StackLoc[0]] [ASSIGN]
+0002: R2(T0) <-- R0(V0) [ASSIGN]
+0003: R0(V0) <-- R2(T0) ADD #-1
+0001: R1(T4) <-- Addr[StackLoc[0]] [ASSIGN]
+0002: R2(T0) <-- R0(V0) [ASSIGN]
+0003: R0(V0) <-- R2(T0) ADD #-1
+0004: R1(T4) <-- R1(T4) ADD #-4
+0005: TEST_ZERO R2(T0)
+0006: JMP to 9  if "=="
+0004: R1(T4) <-- R1(T4) ADD #-4
+0005: TEST_ZERO R2(T0)
+0006: JMP to 9  if "=="
+0007: R1(T4)***DEREF*** <-- Addr[StackLoc[-60]] [STORE]
+0008: JMP to 2 
+0007: R1(T4)***DEREF*** <-- Addr[StackLoc[-60]] [STORE]
+0008: JMP to 2 
+0009: CMP StackLoc[-4],StackLoc[-40]
+0010: R0(T5) <-- GlobalSym(268435462) SELECT GlobalSym(268435464) [SELECT]
+0011: NOP 
+0009: CMP StackLoc[-4],StackLoc[-40]
+0010: R0(T5) <-- GlobalSym(268435462) SELECT GlobalSym(268435464) [SELECT]
+0011: NOP 
+0012: NOP 
+0013: NOP 
+0014: PARAM0[call_4] R0(T5)
+0012: NOP 
+0013: NOP 
+0014: PARAM0[call_4] R0(T5)
+0015: CALL GlobalSym(1137) CALL #262145
+=== END IR AFTER OPTIMIZATIONS ===
+=== IR BEFORE OPTIMIZATIONS ===
+0000: V0 <-- #10 [ASSIGN]
+0015: CALL GlobalSym(1137) CALL #262145
+=== END IR AFTER OPTIMIZATIONS ===
+=== IR BEFORE OPTIMIZATIONS ===
+0000: V0 <-- #10 [ASSIGN]
+0001: T0 <-- V0 SHL #2
+0002: StackLoc[-4] <-- T0 [STORE]
+0003: StackLoc[-12] <-- 
+0001: T0 <-- V0 SHL #2
+0002: StackLoc[-4] <-- T0 [STORE]
+0003: StackLoc[-12] <-- 
+0004: VReg? <-- StackLoc[-4] VLA_ALLOC #4
+0005: StackLoc[-8] <-- 
+0006: T1 <-- V0 [ASSIGN]
+0004: VReg? <-- StackLoc[-4] VLA_ALLOC #4
+0005: StackLoc[-8] <-- 
+0006: T1 <-- V0 [ASSIGN]
+0007: V0 <-- T1 ADD #-1
+0008: TEST_ZERO T1
+0009: JMP to 15  if "=="
+0007: V0 <-- T1 ADD #-1
+0008: TEST_ZERO T1
+0009: JMP to 15  if "=="
+0010: T3 <-- V0 SHL #2
+0011: T4 <-- StackLoc[-8] ADD T3
+0012: T4***DEREF*** <-- Addr[StackLoc[-32]] [STORE]
+0010: T3 <-- V0 SHL #2
+0011: T4 <-- StackLoc[-8] ADD T3
+0012: T4***DEREF*** <-- Addr[StackLoc[-32]] [STORE]
+0013: JMP to 6 
+0014: JMP to 6 
+0013: JMP to 6 
+0014: JMP to 6 
+0015: T5 <-- StackLoc[-8] ADD #36
+0016: T6 <-- StackLoc[-8] [ASSIGN]
+0017: CMP T5***DEREF***,T6***DEREF***
+0015: T5 <-- StackLoc[-8] ADD #36
+0016: T6 <-- StackLoc[-8] [ASSIGN]
+0017: CMP T5***DEREF***,T6***DEREF***
+0018: JMP to 23  if "!="
+0019: NOP 
+0020: PARAM0[call_2] GlobalSym(268435466)
+0018: JMP to 23  if "!="
+0019: NOP 
+0020: PARAM0[call_2] GlobalSym(268435466)
+0021: CALL GlobalSym(1137) CALL #131073
+0022: JMP to 26 
+0023: NOP 
+0021: CALL GlobalSym(1137) CALL #131073
+0022: JMP to 26 
+0023: NOP 
+0024: PARAM0[call_4] GlobalSym(268435468)
+0025: CALL GlobalSym(1137) CALL #262145
+0024: PARAM0[call_4] GlobalSym(268435468)
+0025: CALL GlobalSym(1137) CALL #262145
+0026: VReg? <-- StackLoc[-12]
+=== END IR BEFORE OPTIMIZATIONS ===
+=== IR AFTER OPTIMIZATIONS ===
+0026: VReg? <-- StackLoc[-12]
+=== END IR BEFORE OPTIMIZATIONS ===
+=== IR AFTER OPTIMIZATIONS ===
+0000: R0(V0) <-- #10 [ASSIGN]
+0001: StackLoc[-4] <-- #40 [STORE]
+0002: StackLoc[-12] <-- 
+0000: R0(V0) <-- #10 [ASSIGN]
+0001: StackLoc[-4] <-- #40 [STORE]
+0002: StackLoc[-12] <-- 
+0003: VReg? <-- StackLoc[-4] VLA_ALLOC #4
+0004: StackLoc[-8] <-- 
+0005: R1(T7) <-- StackLoc[-8] [ASSIGN]
+0003: VReg? <-- StackLoc[-4] VLA_ALLOC #4
+0004: StackLoc[-8] <-- 
+0005: R1(T7) <-- StackLoc[-8] [ASSIGN]
+0006: R1(T7) <-- R1(T7) ADD #40
+0007: R2(T1) <-- R0(V0) [ASSIGN]
+0006: R1(T7) <-- R1(T7) ADD #40
+0007: R2(T1) <-- R0(V0) [ASSIGN]
+0008: R0(V0) <-- R2(T1) ADD #-1
+0009: R1(T7) <-- R1(T7) ADD #-4
+0010: TEST_ZERO R2(T1)
+0008: R0(V0) <-- R2(T1) ADD #-1
+0009: R1(T7) <-- R1(T7) ADD #-4
+0010: TEST_ZERO R2(T1)
+0011: JMP to 14  if "=="
+0012: R1(T7)***DEREF*** <-- Addr[StackLoc[-32]] [STORE]
+0013: JMP to 7 
+0011: JMP to 14  if "=="
+0012: R1(T7)***DEREF*** <-- Addr[StackLoc[-32]] [STORE]
+0013: JMP to 7 
+0014: R0(T5) <-- StackLoc[-8] ADD #36
+0015: R1(T6) <-- StackLoc[-8] [ASSIGN]
+0016: CMP R0(T5)***DEREF***,R1(T6)***DEREF***
+0014: R0(T5) <-- StackLoc[-8] ADD #36
+0015: R1(T6) <-- StackLoc[-8] [ASSIGN]
+0016: CMP R0(T5)***DEREF***,R1(T6)***DEREF***
+0017: R0(T8) <-- GlobalSym(268435466) SELECT GlobalSym(268435468) [SELECT]
+0018: NOP 
+0017: R0(T8) <-- GlobalSym(268435466) SELECT GlobalSym(268435468) [SELECT]
+0018: NOP 
+0019: NOP 
+0020: NOP 
+0021: PARAM0[call_4] R0(T8)
+0019: NOP 
+0020: NOP 
+0021: PARAM0[call_4] R0(T8)
+0022: CALL GlobalSym(1137) CALL #262145
+0023: VReg? <-- StackLoc[-12]
+=== END IR AFTER OPTIMIZATIONS ===
+0022: CALL GlobalSym(1137) CALL #262145
+0023: VReg? <-- StackLoc[-12]
+=== END IR AFTER OPTIMIZATIONS ===
+=== IR BEFORE OPTIMIZATIONS ===
+0000: V0 <-- #10 [ASSIGN]
+0001: T0 <-- V0 SHL #2
+=== IR BEFORE OPTIMIZATIONS ===
+0000: V0 <-- #10 [ASSIGN]
+0001: T0 <-- V0 SHL #2
+0002: StackLoc[-4] <-- T0 [STORE]
+0003: StackLoc[-12] <-- 
+0002: StackLoc[-4] <-- T0 [STORE]
+0003: StackLoc[-12] <-- 
+0004: VReg? <-- StackLoc[-4] VLA_ALLOC #4
+0005: StackLoc[-8] <-- 
+0006: T1 <-- V0 [ASSIGN]
+0004: VReg? <-- StackLoc[-4] VLA_ALLOC #4
+0005: StackLoc[-8] <-- 
+0006: T1 <-- V0 [ASSIGN]
+0007: V0 <-- T1 ADD #-1
+0008: TEST_ZERO T1
+0009: JMP to 17  if "=="
+0007: V0 <-- T1 ADD #-1
+0008: TEST_ZERO T1
+0009: JMP to 17  if "=="
+0010: CMP V0,#0
+0011: JMP to 16  if "<S"
+0012: T3 <-- V0 SHL #2
+0013: T4 <-- StackLoc[-8] ADD T3
+0014: T4***DEREF*** <-- Addr[StackLoc[-52]] [STORE]
+0010: CMP V0,#0
+0011: JMP to 16  if "<S"
+0012: T3 <-- V0 SHL #2
+0013: T4 <-- StackLoc[-8] ADD T3
+0014: T4***DEREF*** <-- Addr[StackLoc[-52]] [STORE]
+0015: JMP to 16 
+0016: JMP to 6 
+0017: T5 <-- StackLoc[-8] ADD #36
+0015: JMP to 16 
+0016: JMP to 6 
+0017: T5 <-- StackLoc[-8] ADD #36
+0018: T6 <-- StackLoc[-8] [ASSIGN]
+0019: CMP T5***DEREF***,T6***DEREF***
+0020: JMP to 25  if "!="
+0018: T6 <-- StackLoc[-8] [ASSIGN]
+0019: CMP T5***DEREF***,T6***DEREF***
+0020: JMP to 25  if "!="
+0021: NOP 
+0022: PARAM0[call_3] GlobalSym(268435470)
+0021: NOP 
+0022: PARAM0[call_3] GlobalSym(268435470)
+0023: CALL GlobalSym(1137) CALL #196609
+0024: JMP to 28 
+0025: NOP 
+0023: CALL GlobalSym(1137) CALL #196609
+0024: JMP to 28 
+0025: NOP 
+0026: PARAM0[call_5] GlobalSym(268435472)
+0027: CALL GlobalSym(1137) CALL #327681
+0028: VReg? <-- StackLoc[-12]
+0026: PARAM0[call_5] GlobalSym(268435472)
+0027: CALL GlobalSym(1137) CALL #327681
+0028: VReg? <-- StackLoc[-12]
+=== END IR BEFORE OPTIMIZATIONS ===
+=== IR AFTER OPTIMIZATIONS ===
+0000: StackLoc[-4] <-- #40 [STORE]
+=== END IR BEFORE OPTIMIZATIONS ===
+=== IR AFTER OPTIMIZATIONS ===
+0000: StackLoc[-4] <-- #40 [STORE]
+0001: StackLoc[-12] <-- 
+0002: VReg? <-- StackLoc[-4] VLA_ALLOC #4
+0003: StackLoc[-8] <-- 
+0001: StackLoc[-12] <-- 
+0002: VReg? <-- StackLoc[-4] VLA_ALLOC #4
+0003: StackLoc[-8] <-- 
+0004: R1(T7) <-- StackLoc[-8] [ASSIGN]
+0005: R1(T7) <-- R1(T7) ADD #40
+0006: R2(T8) <-- StackLoc[-8] [ASSIGN]
+0004: R1(T7) <-- StackLoc[-8] [ASSIGN]
+0005: R1(T7) <-- R1(T7) ADD #40
+0006: R2(T8) <-- StackLoc[-8] [ASSIGN]
+0007: R1(T7) <-- R1(T7) ADD #-4
+0008: TEST_ZERO R0(T1)
+0009: JMP to 14  if "=="
+0007: R1(T7) <-- R1(T7) ADD #-4
+0008: TEST_ZERO R0(T1)
+0009: JMP to 14  if "=="
+0010: CMP R1(T7),R2(T8)
+0011: JMP to 7  if "<U"
+0012: R1(T7)***DEREF*** <-- Addr[StackLoc[-52]] [STORE]
+0010: CMP R1(T7),R2(T8)
+0011: JMP to 7  if "<U"
+0012: R1(T7)***DEREF*** <-- Addr[StackLoc[-52]] [STORE]
+0013: JMP to 7 
+0014: R0(T5) <-- StackLoc[-8] ADD #36
+0015: R1(T6) <-- StackLoc[-8] [ASSIGN]
+0013: JMP to 7 
+0014: R0(T5) <-- StackLoc[-8] ADD #36
+0015: R1(T6) <-- StackLoc[-8] [ASSIGN]
+0016: CMP R0(T5)***DEREF***,R1(T6)***DEREF***
+0017: R0(T9) <-- GlobalSym(268435470) SELECT GlobalSym(268435472) [SELECT]
+0018: NOP 
+0016: CMP R0(T5)***DEREF***,R1(T6)***DEREF***
+0017: R0(T9) <-- GlobalSym(268435470) SELECT GlobalSym(268435472) [SELECT]
+0018: NOP 
+0019: NOP 
+0020: NOP 
+0021: PARAM0[call_5] R0(T9)
+0019: NOP 
+0020: NOP 
+0021: PARAM0[call_5] R0(T9)
+0022: CALL GlobalSym(1137) CALL #327681
+0023: VReg? <-- StackLoc[-12]
+=== END IR AFTER OPTIMIZATIONS ===
+0022: CALL GlobalSym(1137) CALL #327681
+0023: VReg? <-- StackLoc[-12]
+=== END IR AFTER OPTIMIZATIONS ===
+=== IR BEFORE OPTIMIZATIONS ===
+0000: V0 <-- #10 [ASSIGN]
+0001: T0 <-- V0 SHL #2
+=== IR BEFORE OPTIMIZATIONS ===
+0000: V0 <-- #10 [ASSIGN]
+0001: T0 <-- V0 SHL #2
+0002: StackLoc[-4] <-- T0 [STORE]
+0003: StackLoc[-12] <-- 
+0002: StackLoc[-4] <-- T0 [STORE]
+0003: StackLoc[-12] <-- 
+0004: VReg? <-- StackLoc[-4] VLA_ALLOC #4
+0005: StackLoc[-8] <-- 
+0006: V0 <-- V0 ADD #-1
+0004: VReg? <-- StackLoc[-4] VLA_ALLOC #4
+0005: StackLoc[-8] <-- 
+0006: V0 <-- V0 ADD #-1
+0007: T2 <-- V0 [LOAD]
+0008: T3 <-- T2 SHL #2
+0009: T4 <-- StackLoc[-8] ADD T3
+0007: T2 <-- V0 [LOAD]
+0008: T3 <-- T2 SHL #2
+0009: T4 <-- StackLoc[-8] ADD T3
+0010: T4***DEREF*** <-- Addr[StackLoc[-32]] [STORE]
+0011: JMP to 12 
+0012: TEST_ZERO V0
+0010: T4***DEREF*** <-- Addr[StackLoc[-32]] [STORE]
+0011: JMP to 12 
+0012: TEST_ZERO V0
+0013: JMP to 6  if "!="
+0014: T5 <-- StackLoc[-8] ADD #36
+0015: T6 <-- StackLoc[-8] [ASSIGN]
+0013: JMP to 6  if "!="
+0014: T5 <-- StackLoc[-8] ADD #36
+0015: T6 <-- StackLoc[-8] [ASSIGN]
+0016: CMP T5***DEREF***,T6***DEREF***
+0017: JMP to 22  if "!="
+0018: NOP 
+0016: CMP T5***DEREF***,T6***DEREF***
+0017: JMP to 22  if "!="
+0018: NOP 
+0019: PARAM0[call_2] GlobalSym(268435474)
+0020: CALL GlobalSym(1137) CALL #131073
+0021: JMP to 25 
+0019: PARAM0[call_2] GlobalSym(268435474)
+0020: CALL GlobalSym(1137) CALL #131073
+0021: JMP to 25 
+0022: NOP 
+0023: PARAM0[call_4] GlobalSym(268435476)
+0024: CALL GlobalSym(1137) CALL #262145
+0025: VReg? <-- StackLoc[-12]
+=== END IR BEFORE OPTIMIZATIONS ===
+=== IR AFTER OPTIMIZATIONS ===
+0000: R0(V0) <-- #10 [ASSIGN]
+0001: StackLoc[-4] <-- #40 [STORE]
+0002: StackLoc[-12] <-- 
+0003: VReg? <-- StackLoc[-4] VLA_ALLOC #4
+0022: NOP 
+0023: PARAM0[call_4] GlobalSym(268435476)
+0024: CALL GlobalSym(1137) CALL #262145
+0025: VReg? <-- StackLoc[-12]
+=== END IR BEFORE OPTIMIZATIONS ===
+=== IR AFTER OPTIMIZATIONS ===
+0000: R0(V0) <-- #10 [ASSIGN]
+0001: StackLoc[-4] <-- #40 [STORE]
+0002: StackLoc[-12] <-- 
+0003: VReg? <-- StackLoc[-4] VLA_ALLOC #4
+0004: StackLoc[-8] <-- 
+0005: R0(V0) <-- R0(V0) ADD #-1
+0006: R1(T2) <-- R0(V0) [LOAD]
+0004: StackLoc[-8] <-- 
+0005: R0(V0) <-- R0(V0) ADD #-1
+0006: R1(T2) <-- R0(V0) [LOAD]
+0007: R2(T3) <-- R1(T2) SHL #2
+0008: R1(T4) <-- StackLoc[-8] ADD R2(T3)
+0009: R1(T4)***DEREF*** <-- Addr[StackLoc[-32]] [STORE]
+0007: R2(T3) <-- R1(T2) SHL #2
+0008: R1(T4) <-- StackLoc[-8] ADD R2(T3)
+0009: R1(T4)***DEREF*** <-- Addr[StackLoc[-32]] [STORE]
+0010: TEST_ZERO R0(V0)
+0011: JMP to 5  if "!="
+0012: R0(T5) <-- StackLoc[-8] ADD #36
+0010: TEST_ZERO R0(V0)
+0011: JMP to 5  if "!="
+0012: R0(T5) <-- StackLoc[-8] ADD #36
+0013: R1(T6) <-- StackLoc[-8] [ASSIGN]
+0014: CMP R0(T5)***DEREF***,R1(T6)***DEREF***
+0015: R0(T7) <-- GlobalSym(268435474) SELECT GlobalSym(268435476) [SELECT]
+0013: R1(T6) <-- StackLoc[-8] [ASSIGN]
+0014: CMP R0(T5)***DEREF***,R1(T6)***DEREF***
+0015: R0(T7) <-- GlobalSym(268435474) SELECT GlobalSym(268435476) [SELECT]
+0016: NOP 
+0017: NOP 
+0018: NOP 
+0016: NOP 
+0017: NOP 
+0018: NOP 
+0019: PARAM0[call_4] R0(T7)
+0020: CALL GlobalSym(1137) CALL #262145
+0021: VReg? <-- StackLoc[-12]
+0019: PARAM0[call_4] R0(T7)
+0020: CALL GlobalSym(1137) CALL #262145
+0021: VReg? <-- StackLoc[-12]
+=== END IR AFTER OPTIMIZATIONS ===
+=== IR BEFORE OPTIMIZATIONS ===
+0000: V0 <-- #10 [ASSIGN]
+=== END IR AFTER OPTIMIZATIONS ===
+=== IR BEFORE OPTIMIZATIONS ===
+0000: V0 <-- #10 [ASSIGN]
+0001: StackLoc[-40] <-- #42 [STORE]
+0002: T0 <-- V0 [ASSIGN]
+0003: V0 <-- T0 ADD #-1
+0001: StackLoc[-40] <-- #42 [STORE]
+0002: T0 <-- V0 [ASSIGN]
+0003: V0 <-- T0 ADD #-1
+0004: TEST_ZERO T0
+0005: JMP to 19  if "=="
+0006: V1 <-- #0 [ASSIGN]
+0004: TEST_ZERO T0
+0005: JMP to 19  if "=="
+0006: V1 <-- #0 [ASSIGN]
+0007: CMP V1,#5
+0008: JMP to 18  if ">=S"
+0007: CMP V1,#5
+0008: JMP to 18  if ">=S"
+0009: JMP to 13 
+0010: T2 <-- V1 [ASSIGN]
+0011: V1 <-- T2 ADD #1
+0009: JMP to 13 
+0010: T2 <-- V1 [ASSIGN]
+0011: V1 <-- T2 ADD #1
+0012: JMP to 7 
+0013: T4 <-- V1 SHL #2
+0014: T5 <-- Addr[StackLoc[-60]] ADD T4
+0012: JMP to 7 
+0013: T4 <-- V1 SHL #2
+0014: T5 <-- Addr[StackLoc[-60]] ADD T4
+0015: T6 <-- V0 [LOAD]
+0016: T5***DEREF*** <-- T6 [STORE]
+0017: JMP to 10 
+0015: T6 <-- V0 [LOAD]
+0016: T5***DEREF*** <-- T6 [STORE]
+0017: JMP to 10 
+0018: JMP to 2 
+0019: CMP StackLoc[-40],#42
+0020: JMP to 25  if "!="
+0018: JMP to 2 
+0019: CMP StackLoc[-40],#42
+0020: JMP to 25  if "!="
+0021: NOP 
+0022: PARAM0[call_5] GlobalSym(268435478)
+0023: CALL GlobalSym(1137) CALL #327681
+0021: NOP 
+0022: PARAM0[call_5] GlobalSym(268435478)
+0023: CALL GlobalSym(1137) CALL #327681
+0024: JMP to 28 
+0025: NOP 
+0026: PARAM0[call_7] GlobalSym(268435480)
+0024: JMP to 28 
+0025: NOP 
+0026: PARAM0[call_7] GlobalSym(268435480)
+0027: CALL GlobalSym(1137) CALL #458753
+=== END IR BEFORE OPTIMIZATIONS ===
+=== IR AFTER OPTIMIZATIONS ===
+0027: CALL GlobalSym(1137) CALL #458753
+=== END IR BEFORE OPTIMIZATIONS ===
+=== IR AFTER OPTIMIZATIONS ===
+0000: R0(V0) <-- #10 [ASSIGN]
+0001: StackLoc[-40] <-- #42 [STORE]
+0002: R2(T0) <-- R0(V0) [ASSIGN]
+0000: R0(V0) <-- #10 [ASSIGN]
+0001: StackLoc[-40] <-- #42 [STORE]
+0002: R2(T0) <-- R0(V0) [ASSIGN]
+0003: R0(V0) <-- R2(T0) ADD #-1
+0004: TEST_ZERO R2(T0)
+0005: JMP to 16  if "=="
+0003: R0(V0) <-- R2(T0) ADD #-1
+0004: TEST_ZERO R2(T0)
+0005: JMP to 16  if "=="
+0006: R1(V1) <-- #0 [ASSIGN]
+0007: CMP R1(V1),#5
+0008: JMP to 2  if ">=S"
+0006: R1(V1) <-- #0 [ASSIGN]
+0007: CMP R1(V1),#5
+0008: JMP to 2  if ">=S"
+0009: R2(T4) <-- R1(V1) SHL #2
+0010: R3(T5) <-- Addr[StackLoc[-60]] ADD R2(T4)
+0011: R12(T6) <-- R0(V0) [LOAD]
+0012: R3(T5)***DEREF*** <-- R12(T6) [STORE]
+0009: R2(T4) <-- R1(V1) SHL #2
+0010: R3(T5) <-- Addr[StackLoc[-60]] ADD R2(T4)
+0011: R12(T6) <-- R0(V0) [LOAD]
+0012: R3(T5)***DEREF*** <-- R12(T6) [STORE]
+0013: R1(V1) <-- R1(V1) ADD #1
+0014: CMP R1(V1),#5
+0015: JMP to 9  if "<S"
+0013: R1(V1) <-- R1(V1) ADD #1
+0014: CMP R1(V1),#5
+0015: JMP to 9  if "<S"
+0016: CMP StackLoc[-40],#42
+0017: R0(T7) <-- GlobalSym(268435478) SELECT GlobalSym(268435480) [SELECT]
+0018: NOP 
+0016: CMP StackLoc[-40],#42
+0017: R0(T7) <-- GlobalSym(268435478) SELECT GlobalSym(268435480) [SELECT]
+0018: NOP 
+0019: NOP 
+0020: NOP 
+0021: PARAM0[call_7] R0(T7)
+0019: NOP 
+0020: NOP 
+0021: PARAM0[call_7] R0(T7)
+0022: CALL GlobalSym(1137) CALL #458753
+=== END IR AFTER OPTIMIZATIONS ===
+=== IR BEFORE OPTIMIZATIONS ===
+0022: CALL GlobalSym(1137) CALL #458753
+=== END IR AFTER OPTIMIZATIONS ===
+=== IR BEFORE OPTIMIZATIONS ===
+0000: FUNCPARAMVOID  FUNCPARAMVOID #0
+0001: CALL GlobalSym(2143) CALL #0
+0002: FUNCPARAMVOID  FUNCPARAMVOID #65536
+0000: FUNCPARAMVOID  FUNCPARAMVOID #0
+0001: CALL GlobalSym(2143) CALL #0
+0002: FUNCPARAMVOID  FUNCPARAMVOID #65536
+0003: CALL GlobalSym(2146) CALL #65536
+0004: FUNCPARAMVOID  FUNCPARAMVOID #131072
+0005: CALL GlobalSym(2147) CALL #131072
+0003: CALL GlobalSym(2146) CALL #65536
+0004: FUNCPARAMVOID  FUNCPARAMVOID #131072
+0005: CALL GlobalSym(2147) CALL #131072
+0006: FUNCPARAMVOID  FUNCPARAMVOID #196608
+0007: CALL GlobalSym(2148) CALL #196608
+0008: FUNCPARAMVOID  FUNCPARAMVOID #262144
+0006: FUNCPARAMVOID  FUNCPARAMVOID #196608
+0007: CALL GlobalSym(2148) CALL #196608
+0008: FUNCPARAMVOID  FUNCPARAMVOID #262144
+0009: CALL GlobalSym(2149) CALL #262144
+0010: RETURNVALUE #0
+0011: RETURNVALUE #0
+0009: CALL GlobalSym(2149) CALL #262144
+0010: RETURNVALUE #0
+0011: RETURNVALUE #0
+=== END IR BEFORE OPTIMIZATIONS ===
+=== IR AFTER OPTIMIZATIONS ===
+=== END IR BEFORE OPTIMIZATIONS ===
+=== IR AFTER OPTIMIZATIONS ===
+0000: FUNCPARAMVOID  FUNCPARAMVOID #0
+0001: CALL GlobalSym(2143) CALL #0
+0002: FUNCPARAMVOID  FUNCPARAMVOID #65536
+0000: FUNCPARAMVOID  FUNCPARAMVOID #0
+0001: CALL GlobalSym(2143) CALL #0
+0002: FUNCPARAMVOID  FUNCPARAMVOID #65536
+0003: CALL GlobalSym(2146) CALL #65536
+0004: FUNCPARAMVOID  FUNCPARAMVOID #131072
+0005: CALL GlobalSym(2147) CALL #131072
+0003: CALL GlobalSym(2146) CALL #65536
+0004: FUNCPARAMVOID  FUNCPARAMVOID #131072
+0005: CALL GlobalSym(2147) CALL #131072
+0006: FUNCPARAMVOID  FUNCPARAMVOID #196608
+0007: CALL GlobalSym(2148) CALL #196608
+0008: FUNCPARAMVOID  FUNCPARAMVOID #262144
+0006: FUNCPARAMVOID  FUNCPARAMVOID #196608
+0007: CALL GlobalSym(2148) CALL #196608
+0008: FUNCPARAMVOID  FUNCPARAMVOID #262144
+0009: CALL GlobalSym(2149) CALL #262144
+0010: RETURNVALUE #0
+=== END IR AFTER OPTIMIZATIONS ===
+0009: CALL GlobalSym(2149) CALL #262144
+0010: RETURNVALUE #0
+=== END IR AFTER OPTIMIZATIONS ===
+-> /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/build/boot.o
+-> /usr/lib/gcc/arm-none-eabi/14.2.0/thumb/v8-m.main/nofp/crti.o
+-> /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/qemu/mps2-an505/newlib_build/arm-none-eabi/libgloss/arm/rdimon-crt0.o
+-> /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/build/boot.o
+-> /usr/lib/gcc/arm-none-eabi/14.2.0/thumb/v8-m.main/nofp/crti.o
+-> /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/qemu/mps2-an505/newlib_build/arm-none-eabi/libgloss/arm/rdimon-crt0.o
+-> /usr/lib/gcc/arm-none-eabi/14.2.0/thumb/v8-m.main/nofp/crtend.o
+-> /usr/lib/gcc/arm-none-eabi/14.2.0/thumb/v8-m.main/nofp/crtn.o
+-> /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/qemu/mps2-an505//newlib_build/arm-none-eabi/newlib/libc.a
+-> /usr/lib/gcc/arm-none-eabi/14.2.0/thumb/v8-m.main/nofp/crtend.o
+-> /usr/lib/gcc/arm-none-eabi/14.2.0/thumb/v8-m.main/nofp/crtn.o
+-> /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/qemu/mps2-an505//newlib_build/arm-none-eabi/newlib/libc.a
+-> /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/qemu/mps2-an505/newlib_build/arm-none-eabi/libgloss/arm/librdimon.a
+-> /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/qemu/mps2-an505//newlib_build/arm-none-eabi/newlib/libm.a
+-> /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/qemu/mps2-an505/newlib_build/arm-none-eabi/libgloss/arm/librdimon.a
+-> /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/qemu/mps2-an505//newlib_build/arm-none-eabi/newlib/libm.a
+-> /usr/lib/gcc/arm-none-eabi/14.2.0/thumb/v8-m.main/nofp/libgcc.a
+Memory region FLASH: ORIGIN=0x10000000
+Memory region RAM: ORIGIN=0x80000000
+Adding ARM FP library: fp/libsoftfp.a
+<- /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/build/79_vla_continue.elf
+-> /usr/lib/gcc/arm-none-eabi/14.2.0/thumb/v8-m.main/nofp/libgcc.a
+Memory region FLASH: ORIGIN=0x10000000
+Memory region RAM: ORIGIN=0x80000000
+Adding ARM FP library: fp/libsoftfp.a
+<- /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/build/79_vla_continue.elf
+Build complete: /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/build/79_vla_continue.elf
+make: Leaving directory '/home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/qemu/mps2-an505'
+Build complete: /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/build/79_vla_continue.elf
+make: Leaving directory '/home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/qemu/mps2-an505'
+Running QEMU with file: /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/build/79_vla_continue.elf
+Running QEMU with file: /home/mateusz/repos/yasos.zig/libs/tinycc/tests/ir_tests/build/79_vla_continue.elf
+OK
+OK
+HardFault: PC=0xHardFault: PC=0x1100013500013500
+
+CFSR=CFSR=0x0xUsing CFLAGS: -O2 -g -dump-ir
+00008200
+HFSR=0x40000000
+BFAR=0xFFFFFFFC
+MMFAR=0x00000000
+Exit code: 1
+00008200
+HFSR=0x40000000
+BFAR=0xFFFFFFFC
+MMFAR=0x00000000
+Exit code: 1

@@ -29,12 +29,12 @@ FRAME_BUDGETS = {
     "unary":                    2500,  # was 7312, reduced to 2328 by extracting builtins
     "unary_builtin_fp":         1500,  # extracted: signbit/isinf/copysign/isnan etc
     "unary_builtin_fp2":        1500,  # extracted: fabs/fmax/fmin/bswap/fpclassify etc
-    "unary_builtin_shuffle":    1100,  # extracted: shuffle/shufflevector
-    "unary_builtin_chk":        1100,  # extracted: object_size + __*_chk builtins
+    "unary_builtin_shuffle":    1500,  # extracted: shuffle/shufflevector (increased: auto-inline inlines helpers)
+    "unary_builtin_chk":        1300,  # extracted: object_size + __*_chk builtins (increased: auto-inline)
     "unary_builtin_alloca":      350,  # extracted: alloca/apply_args/apply/return
-    "unary_builtin_overflow":    250,  # extracted: add/sub/mul_overflow
-    "decl":                     1200,  # was 1040
-    "block":                     800,  # was 632  — recursive (nested blocks)
+    "unary_builtin_overflow":    950,  # extracted: add/sub/mul_overflow (increased: auto-inline inlines helpers)
+    "decl":                     1400,  # was 1040, increased by auto-inline candidate tracking locals
+    "block":                    1500,  # was 632  — recursive (nested blocks), increased by auto-inline
     "decl_initializer_alloc":    550,
     "tcc_preprocess":            550,
     "expr_cond":                 450,  # recursive (ternary chains)

@@ -79,6 +79,11 @@ typedef enum TccIrOp
   TCCIR_OP_LOAD_POSTINC,  /* dest = *ptr; ptr += offset - ARM LDR rd,[rn],#imm */
   TCCIR_OP_STORE_POSTINC, /* *ptr = src; ptr += offset - ARM STR rd,[rn],#imm */
 
+  /* Unsigned bitfield extract: dest = (src1 >> lsb) & ((1<<width)-1)
+   * src2 encodes lsb (bits 0-4) and width (bits 5-9): src2 = lsb | (width << 5)
+   * ARM: UBFX Rd, Rn, #lsb, #width */
+  TCCIR_OP_UBFX,
+
   /* Floating point operations */
   TCCIR_OP_FADD, /* float/double addition */
   TCCIR_OP_FSUB, /* float/double subtraction */
@@ -168,6 +173,26 @@ typedef enum TccIrOp
    * no dest - this instruction branches directly
    */
   TCCIR_OP_SWITCH_TABLE,
+
+  /* Block copy from const data section to stack:
+   * dest = STACKOFF destination (local stack offset, is_local=1)
+   * src1 = SYMREF source (anonymous symbol in rodata section)
+   * src2 = IMM32 size in bytes
+   * No vreg uses/defs - operates on fixed stack locations and symbols.
+   * Backend should generate LDM/STM for optimal ARM Thumb-2 code.
+   */
+  TCCIR_OP_BLOCK_COPY,
+
+  /* Conditional select (if-then-else without branches):
+   * dest = (condition) ? src1 : src2
+   * dest = result vreg
+   * src1 = "then" value (vreg, IMM32, or SYMREF)
+   * src2 = "else" value (vreg, IMM32, or SYMREF)
+   * pool[operand_base+3] = IMM32 condition code (ARM cond nibble 0-0xD)
+   * Must be preceded by a CMP that sets condition flags.
+   * Backend emits ITE cond; MOV/LDR dest, src1; MOV/LDR dest, src2.
+   */
+  TCCIR_OP_SELECT,
 } TccIrOp;
 
 /* FUNCPARAMVAL encoding helpers:
@@ -339,10 +364,11 @@ typedef struct TCCMachineScratchRegs
 /* Compact IR instruction - stores operand indices instead of full SValues */
 typedef struct IRQuadCompact
 {
-  int orig_index;        /* Original IR index (stable across DCE) */
-  TccIrOp op;            /* Operation code */
-  uint32_t operand_base; /* Index into svalue_pool */
-  int line_num;          /* Source line for debug info */
+  int orig_index;               /* Original IR index (stable across DCE) */
+  TccIrOp op;                   /* Operation code */
+  uint32_t operand_base;        /* Index into svalue_pool */
+  uint32_t line_num : 31;       /* Source line for debug info (non-negative, 31 bits = up to 2B lines) */
+  uint32_t is_jump_target : 1;  /* Set when at least one JUMP/JUMPIF targets this instruction */
 } IRQuadCompact;
 
 /* Per-operation operand configuration (defined in tccir.c) */
@@ -434,6 +460,8 @@ typedef struct TCCIRState
   int next_live_interval_index;
   int instructions_size;
   int next_instruction_index;
+  int max_orig_index;           /* Highest orig_index ever assigned; updated in tcc_ir_put */
+  int next_insn_is_jump_target; /* Pending flag: next tcc_ir_put must set is_jump_target=1 */
 
   /* Monotonic ID for binding FUNCPARAM* instructions to their owning FUNCCALL*.
    * Encoded in instruction operands for those ops.
@@ -449,6 +477,18 @@ typedef struct TCCIRState
    */
   int call_outgoing_base; /* frame offset (typically negative) */
   int call_outgoing_size; /* bytes reserved (may include alignment padding) */
+
+  /* Nested-call register save area: reserved in the frame for saving R0-R3
+   * (and R9/R12 for alignment) across nested function calls without PUSH/POP.
+   * Sits above the outgoing area in the frame layout. */
+  int call_nested_save_base; /* frame offset (typically negative) */
+  int call_nested_save_size; /* bytes reserved (0 if no nested calls possible) */
+
+  /* Scratch register save area: reserved when FP is omitted so that
+   * get_scratch_reg_with_save() can use STR/LDR instead of PUSH/POP.
+   * This prevents SP movement that would break SP-relative addressing. */
+  int scratch_save_base; /* frame offset (typically negative) */
+  int scratch_save_size; /* bytes reserved (0 when FP is used) */
 
   uint32_t *ignored_vregs;
   int ignored_vregs_size;
@@ -481,6 +521,9 @@ typedef struct TCCIRState
 
   /* Extra scratch allocation flags to apply during materialization for the current IR instruction. */
   unsigned codegen_materialize_scratch_flags;
+
+  /* Set between CMP and JUMPIF emission so the backend uses flag-preserving encodings. */
+  int codegen_flags_live;
 
   /* Switch tables for jump table generation */
   TCCIRSwitchTable *switch_tables;
@@ -653,6 +696,18 @@ static inline IROperand tcc_ir_op_get_accum(const TCCIRState *ir, const IRQuadCo
   int accum_idx = q->operand_base + 3;
   if (accum_idx >= 0 && accum_idx < ir->iroperand_pool_count)
     return ir->iroperand_pool[accum_idx];
+  return IROP_NONE;
+}
+
+/* Get the 4th operand (condition code) for SELECT operations.
+ * SELECT: dest = (cond) ? src1 : src2
+ * Condition is stored at operand_base + 3 as IMM32 (ARM cond nibble).
+ */
+static inline IROperand tcc_ir_op_get_cond(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  int cond_idx = q->operand_base + 3;
+  if (cond_idx >= 0 && cond_idx < ir->iroperand_pool_count)
+    return ir->iroperand_pool[cond_idx];
   return IROP_NONE;
 }
 

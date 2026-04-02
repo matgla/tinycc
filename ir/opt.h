@@ -12,6 +12,7 @@
 #define TCC_IR_OPT_H
 
 struct TCCIRState;
+struct TCCState;
 struct IRLoops;
 
 /* ============================================================================
@@ -21,8 +22,19 @@ struct IRLoops;
 /* Dead Code Elimination - remove unreachable instructions */
 int tcc_ir_opt_dce(struct TCCIRState *ir);
 
+/* NOP Compaction - remove NOP instructions, shrink array, fix jump targets.
+ * Returns number of NOPs removed. */
+int tcc_ir_opt_compact_nops(struct TCCIRState *ir);
+
 /* Dead Store Elimination - remove stores to dead variables */
 int tcc_ir_opt_dse(struct TCCIRState *ir);
+
+/* Dead address-taken VAR elimination - remove writes to VARs with no live reads */
+int tcc_ir_opt_dead_addrvar_elim(struct TCCIRState *ir);
+int tcc_ir_opt_dead_var_store_elim(struct TCCIRState *ir);
+
+/* Redundant VAR ASSIGN elimination - kill assigns overwritten before next read */
+int tcc_ir_opt_redundant_var_assign(struct TCCIRState *ir);
 
 /* Constant Propagation - fold constant expressions */
 int tcc_ir_opt_const_prop(struct TCCIRState *ir);
@@ -39,11 +51,44 @@ int tcc_ir_opt_value_tracking(struct TCCIRState *ir);
 /* Constant Branch Folding - fold branches with constant conditions */
 int tcc_ir_opt_branch_folding(struct TCCIRState *ir);
 
+/* Boolean Materialization Peephole - fuse CMP+SETIF+TEST_ZERO+JUMPIF into CMP+JUMPIF */
+int tcc_ir_opt_setif_branch_fuse(struct TCCIRState *ir);
+
+/* Stack-Boolean-Diamond Peephole - collapse STORE/JUMP/STORE/TEST_ZERO/JUMPIF
+ * written to a single-use stack slot into two direct branches. */
+int tcc_ir_opt_stack_bool_diamond(struct TCCIRState *ir);
+
+/* VAR → TMP local forwarding. After STORE V ← T, rewrite subsequent reads of
+ * V within the same BB to use T directly, avoiding the spill/reload round-trip. */
+int tcc_ir_opt_var_tmp_fwd(struct TCCIRState *ir);
+
+/* Local Load CSE. Within a basic block, when a VAR/PARAM is loaded twice into
+ * different TEMPs, the second load is replaced with a copy of the first TEMP. */
+int tcc_ir_opt_local_load_cse(struct TCCIRState *ir);
+
+/* Single-BB VAR → TMP promotion. For a non-address-taken VAR with exactly one
+ * def and in-BB lval-ASSIGN reads only, redirect the def's dest to a fresh
+ * TEMP and rewrite each read into a pure register copy. Copy prop + DCE then
+ * collapse the remaining chain. */
+int tcc_ir_opt_var_to_tmp(struct TCCIRState *ir);
+
 /* Copy Propagation - replace copies with originals */
 int tcc_ir_opt_copy_prop(struct TCCIRState *ir);
 
 /* Legacy copy propagation function - wrapper for tcc_ir_opt_copy_prop */
 int tcc_ir_copy_propagation(struct TCCIRState *ir);
+
+/* Global LOAD value CSE - deduplicate loads from the same global within a BB */
+int tcc_ir_opt_cse_global_load(struct TCCIRState *ir);
+
+/* GlobalSym CSE - hoist repeated global symbol addresses to a single TEMP */
+int tcc_ir_opt_globalsym_cse(struct TCCIRState *ir);
+
+/* Narrow CSE: deduplicate PARAM/VAR + #constant expressions */
+int tcc_ir_opt_cse_param_add(struct TCCIRState *ir);
+
+/* Deref forwarding - reuse loaded deref value in adjacent CMP */
+int tcc_ir_opt_deref_fwd(struct TCCIRState *ir);
 
 /* Arithmetic CSE - eliminate redundant arithmetic */
 int tcc_ir_opt_cse_arith(struct TCCIRState *ir);
@@ -69,6 +114,14 @@ int tcc_ir_opt_return(struct TCCIRState *ir);
 /* Store-Load Forwarding */
 int tcc_ir_opt_sl_forward(struct TCCIRState *ir);
 
+/* Constant VAR Propagation - propagate constant VARs exposed by store-load forwarding */
+int tcc_ir_opt_const_var_prop(struct TCCIRState *ir);
+
+/* Global-initializer constant propagation - replace LOAD of a static global
+ * whose initializer is known and has not been written with ASSIGN of the
+ * constant value. */
+int tcc_ir_opt_global_init_prop(struct TCCIRState *ir);
+
 /* Redundant Store Elimination */
 int tcc_ir_opt_store_redundant(struct TCCIRState *ir);
 
@@ -78,11 +131,39 @@ int tcc_ir_opt_mla_fusion(struct TCCIRState *ir);
 /* Indexed Load/Store Fusion - fuse SHL + ADD + LOAD/STORE into indexed memory op */
 int tcc_ir_opt_indexed_memory_fusion(struct TCCIRState *ir);
 
+/* Displacement Load/Store Fusion - fuse ADD(base, #imm) + LOAD/STORE/ASSIGN-lval
+ * into indexed memory op with constant index and scale=0. */
+int tcc_ir_opt_disp_fusion(struct TCCIRState *ir);
+
+/* LEA + deref fold - collapse `LEA Addr[StackLoc[-N]] + [ADD #K] + deref-use`
+ * into a direct StackLoc access, eliminating the address-materialization op. */
+int tcc_ir_opt_lea_fold(struct TCCIRState *ir);
+int tcc_ir_opt_add_deref_fold(struct TCCIRState *ir);
+
+/* Combined fusion pass: mla_fusion + indexed_memory_fusion in one loop (shared IROptDU) */
+int tcc_ir_opt_fusion_pass(struct TCCIRState *ir, int do_mla, int do_indexed);
+
+/* Deref-in-ALU indexed fusion: extract deref operands into LOAD_INDEXED when
+ * the address is computed by SHL+ADD (array table lookup pattern). */
+int tcc_ir_opt_deref_indexed_fusion(struct TCCIRState *ir);
+
+/* Combined boolean pass: cse_bool + bool_idempotent in one loop */
+int tcc_ir_opt_bool_pass(struct TCCIRState *ir, int do_idempotent, int do_cse);
+
 /* Post-Increment Load/Store Fusion - fuse LOAD/STORE + ADD into post-increment op */
 int tcc_ir_opt_postinc_fusion(struct TCCIRState *ir);
 
+/* Loop-Aware Post-Increment Fusion - fuse embedded deref + latch ADD across basic blocks */
+int tcc_ir_opt_loop_postinc_fusion(struct TCCIRState *ir);
+
 /* Stack Address CSE - hoist repeated stack address computations */
 int tcc_ir_opt_stack_addr_cse(struct TCCIRState *ir);
+
+/* Stack address non-null branch folding - fold CMP(Addr[StackLoc], 0) + JUMPIF */
+int tcc_ir_opt_stack_addr_nonnull_fold(struct TCCIRState *ir);
+
+/* Entry-block store propagation - forward struct field constants across loops */
+int tcc_ir_opt_entry_store_prop(struct TCCIRState *ir);
 
 /* Non-negative value tracking & branch folding */
 int tcc_ir_opt_nonneg_branch_fold(struct TCCIRState *ir);
@@ -94,14 +175,33 @@ int tcc_ir_opt_float_branch_fold(struct TCCIRState *ir);
  * paths and fold comparisons whose outcome is determined by the range. */
 int tcc_ir_opt_vrp(struct TCCIRState *ir);
 
+/* Redundant loop check elimination - fold CMP+JUMPIF in loop body when
+ * implied by the loop exit condition */
+int tcc_ir_opt_redundant_loop_check(struct TCCIRState *ir);
+
 /* Float narrowing - replace double-precision math with float when safe */
 int tcc_ir_opt_float_narrowing(struct TCCIRState *ir);
 
 /* Jump Threading - forward jump targets through NOPs and jump chains */
 int tcc_ir_opt_jump_threading(struct TCCIRState *ir);
 
+/* Block Copy Init - replace memset(0)+stores pattern with BLOCK_COPY from rodata */
+int tcc_ir_opt_block_copy_init(struct TCCIRState *ir);
+
+/* Post-Increment Assign Folding - fold T=V[lval]; V=T OP x into V=V OP x */
+int tcc_ir_opt_postinc_assign_fold(struct TCCIRState *ir);
+
+/* Conditional Select - replace if/else diamond with SELECT (ITE on ARM) */
+int tcc_ir_opt_select(struct TCCIRState *ir);
+
 /* Eliminate Fall-Through Jumps - remove redundant unconditional jumps */
 int tcc_ir_opt_eliminate_fallthrough(struct TCCIRState *ir);
+
+/* Decrement-to-Zero - transform count-up loops to count-down-to-zero */
+int tcc_ir_opt_decrement_to_zero(struct TCCIRState *ir);
+
+/* Redundant Init Elimination - remove function-entry VAR inits killed before use */
+int tcc_ir_opt_redundant_init_elim(struct TCCIRState *ir);
 
 /* ============================================================================
  * Optimization Driver
@@ -189,5 +289,34 @@ int tcc_ir_opt_iv_strength_reduction(struct TCCIRState *ir);
 /* IV strength reduction with pre-detected loops from LICM.
  * This avoids re-detecting loops and ensures correct indices after LICM hoisting. */
 int tcc_ir_opt_iv_strength_reduction_with_loops(struct TCCIRState *ir, struct IRLoops *loops);
+
+/* Loop Bound Rematerialization - recompute SP-relative loop bounds inside
+ * the loop instead of hoisting them into callee-saved registers.
+ * Returns number of rematerialized loop bounds. */
+int tcc_ir_opt_loop_bound_remat(struct TCCIRState *ir);
+
+/* Loop Unrolling - fully unroll small constant-trip-count loops.
+ * Returns number of loops unrolled. */
+int tcc_ir_opt_loop_unroll(struct TCCIRState *ir);
+
+/* Loop Rotation - convert top-tested (while) loops to bottom-tested (do-while).
+ * Eliminates 2 branches per iteration. Returns number of loops rotated. */
+int tcc_ir_opt_loop_rotation(struct TCCIRState *ir);
+
+/* Dead Loop Elimination - remove loops whose body has no side effects and
+ * whose result VARs have constant values. Returns number of loops eliminated. */
+int tcc_ir_opt_dead_loop_elim(struct TCCIRState *ir);
+
+/* Detect whether optimized IR reduces to a constant return value.
+ * Returns 1 and fills value/btype if the function is a constant. */
+int tcc_ir_detect_const_result(struct TCCIRState *ir, int64_t *value, int *btype);
+
+/* Cache/lookup constant function results for interprocedural constant propagation. */
+void tcc_ir_cache_const_result(struct TCCState *s, int func_token, int64_t value, int btype);
+int tcc_ir_lookup_const_result(struct TCCState *s, int func_token, int64_t *value, int *btype);
+
+/* Replace calls to known-constant functions with their return value.
+ * Returns number of calls replaced. */
+int tcc_ir_opt_const_call_replace(struct TCCIRState *ir);
 
 #endif /* TCC_IR_OPT_H */

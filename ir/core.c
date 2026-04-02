@@ -351,6 +351,13 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
   memset(cq, 0, sizeof(IRQuadCompact));
   cq->op = (uint8_t)op;
   cq->orig_index = pos;
+  if (pos > ir->max_orig_index)
+    ir->max_orig_index = pos;
+  if (ir->next_insn_is_jump_target)
+  {
+    cq->is_jump_target = 1;
+    ir->next_insn_is_jump_target = 0;
+  }
   cq->operand_base = ir->iroperand_pool_count;
 
   /* Handle destination operand */
@@ -720,8 +727,8 @@ void tcc_ir_params_process_single(TCCIRState *ir, Sym *sym, int arg_index, TCCAb
   TCCAbiArgLoc loc_info = tcc_abi_classify_argument(call_layout, arg_index, &desc);
   tcc_ir_params_update_tracking(ir, loc_info, call_layout);
 
-  if (loc_info.kind == TCC_ABI_LOC_STACK || loc_info.kind == TCC_ABI_LOC_REG_STACK)
-    tcc_state->need_frame_pointer = 1;
+  /* With the pre-reserved outgoing call area, stack args no longer require
+   * a frame pointer — SP stays fixed across calls. */
 
   if ((type->t & VT_BTYPE) == VT_STRUCT || (type->t & VT_COMPLEX))
   {
@@ -1629,6 +1636,15 @@ void tcc_ir_backpatch(TCCIRState *ir, int t, int target_address)
     const int pool_off = ir->compact_instructions[t].operand_base;
     ir->iroperand_pool[pool_off] = cur;
 
+    /* Mark the target instruction as a jump target.
+     * If it already exists, set the flag directly.
+     * If it is the next-to-be-created slot (tcc_ir_backpatch_to_here pattern),
+     * set a pending flag that tcc_ir_put picks up on creation. */
+    if (target_address >= 0 && target_address < ir->next_instruction_index)
+      ir->compact_instructions[target_address].is_jump_target = 1;
+    else if (target_address == ir->next_instruction_index)
+      ir->next_insn_is_jump_target = 1;
+
     /* Chain ends when next is -1 (sentinel), out of range, or already patched */
     if (next < 0 || next >= ir->next_instruction_index || next == target_address)
       break;
@@ -1976,6 +1992,7 @@ const IRRegistersConfig irop_config[] = {
     [TCCIR_OP_LOAD_POSTINC] = {1, 1, 0},   /* dest = *ptr; ptr += offset */
     [TCCIR_OP_STORE_POSTINC] = {1, 1, 0},  /* *ptr = src; ptr += offset */
     [TCCIR_OP_TEST_ZERO] = {0, 1, 0},
+    [TCCIR_OP_UBFX] = {1, 1, 1},  /* dest = (src1 >> lsb) & ((1<<width)-1); src2 = lsb|(width<<5) */
     /* Floating point operations */
     [TCCIR_OP_FADD] = {1, 1, 1}, [TCCIR_OP_FSUB] = {1, 1, 1}, [TCCIR_OP_FMUL] = {1, 1, 1}, [TCCIR_OP_FDIV] = {1, 1, 1},
     [TCCIR_OP_FNEG] = {1, 1, 0}, /* unary: src1=input, dest */
@@ -2028,6 +2045,10 @@ const IRRegistersConfig irop_config[] = {
     [TCCIR_OP_BUILTIN_APPLY] = {1, 1, 1},
     /* __builtin_return: src1=result_ptr, no dest (does not return) */
     [TCCIR_OP_BUILTIN_RETURN] = {0, 1, 0},
+    /* Block copy: dest=stack dest, src1=symbol src, src2=size */
+    [TCCIR_OP_BLOCK_COPY] = {1, 1, 1},
+    /* SELECT: dest=result, src1=then_val, src2=else_val, pool[+3]=condition */
+    [TCCIR_OP_SELECT] = {1, 1, 1},
 }
 ;
 // clang-format on

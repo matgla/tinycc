@@ -21,6 +21,8 @@
 #define USING_GLOBALS
 #include "tcc.h"
 
+#include <sys/stat.h>
+
 #ifdef TCC_TARGET_ARM_ARCHV8M
 #include "arm-thumb-defs.h"
 #endif
@@ -48,6 +50,17 @@ ST_DATA int pp_expr;
 /* ------------------------------------------------------------------------- */
 
 static TokenSym *hash_ident[TOK_HASH_SIZE];
+typedef struct TokenLookupCacheEntry
+{
+  TokenSym *ts;
+  unsigned int hash;
+  int len;
+} TokenLookupCacheEntry;
+
+#define TOK_LOOKUP_CACHE_SIZE 8
+#define TOK_IDENT_PREALLOC 8192
+static TokenLookupCacheEntry token_lookup_cache[TOK_LOOKUP_CACHE_SIZE];
+static int table_ident_alloc;
 static char token_buf[STRING_MAX_SIZE + 1];
 static CString cstr_buf;
 static TokenString tokstr_buf;
@@ -59,11 +72,46 @@ static void tok_print(const int *str, const char *msg, ...);
 static void next_nomacro(void);
 static void parse_number(const char *p);
 static void parse_string(const char *p, int len);
+static void tcc_pch_capture_reset(TCCState *s1);
+static int tcc_pch_in_root_closure(BufferedFile *bf);
+static void tcc_pch_flush_replay_tokens(TCCState *s1);
+static void tcc_pch_add_replay_record(TCCState *s1, int kind, unsigned arg0, unsigned arg1);
+static void tcc_pch_record_pack(TCCState *s1, int kind, int value);
+static void tcc_pch_try_auto_include(TCCState *s1, const char *filename);
+static uint64_t tcc_pch_hash_init(void);
+static uint64_t tcc_pch_hash_bytes(uint64_t hash, const void *data, size_t len);
+static inline uint32_t tcc_pch_usec(void);
 
 static struct TinyAlloc *toksym_alloc;
 static struct TinyAlloc *tokstr_alloc;
 
 static TokenString *macro_stack;
+
+static void token_lookup_cache_clear(void)
+{
+  memset(token_lookup_cache, 0, sizeof(token_lookup_cache));
+}
+
+static TokenSym *token_lookup_cache_find(unsigned int hash, const char *str, int len)
+{
+  TokenLookupCacheEntry *entry = &token_lookup_cache[hash & (TOK_LOOKUP_CACHE_SIZE - 1)];
+  TokenSym *ts = entry->ts;
+
+  if (!ts || entry->hash != hash || entry->len != len)
+    return NULL;
+  if (ts->len != len || memcmp(ts->str, str, len))
+    return NULL;
+  return ts;
+}
+
+static void token_lookup_cache_store(unsigned int hash, int len, TokenSym *ts)
+{
+  TokenLookupCacheEntry *entry = &token_lookup_cache[hash & (TOK_LOOKUP_CACHE_SIZE - 1)];
+
+  entry->ts = ts;
+  entry->hash = hash;
+  entry->len = len;
+}
 
 static const char tcc_keywords[] =
 #define DEF(id, str) str "\0"
@@ -508,10 +556,14 @@ static TokenSym *tok_alloc_new(TokenSym **pts, const char *str, int len)
 
   /* expand token table if needed */
   i = tok_ident - TOK_IDENT;
-  if ((i % TOK_ALLOC_INCR) == 0)
+  if (i >= table_ident_alloc)
   {
-    ptable = tcc_realloc(table_ident, (i + TOK_ALLOC_INCR) * sizeof(TokenSym *));
+    int new_alloc = table_ident_alloc ? table_ident_alloc : TOK_IDENT_PREALLOC;
+    while (new_alloc <= i)
+      new_alloc <<= 1;
+    ptable = tcc_realloc(table_ident, new_alloc * sizeof(TokenSym *));
     table_ident = ptable;
+    table_ident_alloc = new_alloc;
   }
 
   ts = tal_realloc(toksym_alloc, 0, sizeof(TokenSym) + len);
@@ -538,7 +590,7 @@ ST_FUNC TokenSym *tok_alloc(const char *str, int len)
 {
   TokenSym *ts, **pts;
   int i;
-  unsigned int h;
+  unsigned int h, full_hash;
 
   h = TOK_HASH_INIT;
 
@@ -546,6 +598,11 @@ ST_FUNC TokenSym *tok_alloc(const char *str, int len)
   {
     h = TOK_HASH_FUNC(h, ((unsigned char *)str)[i]);
   }
+
+  full_hash = h;
+  ts = token_lookup_cache_find(full_hash, str, len);
+  if (ts)
+    return ts;
 
   h &= (TOK_HASH_SIZE - 1);
 
@@ -556,7 +613,10 @@ ST_FUNC TokenSym *tok_alloc(const char *str, int len)
     if (!ts)
       break;
     if (ts->len == len && !memcmp(ts->str, str, len))
+    {
+      token_lookup_cache_store(full_hash, len, ts);
       return ts;
+    }
     pts = &(ts->hash_next);
   }
 
@@ -593,7 +653,9 @@ ST_FUNC TokenSym *tok_alloc(const char *str, int len)
   }
 #endif
 
-  return tok_alloc_new(pts, str, len);
+  ts = tok_alloc_new(pts, str, len);
+  token_lookup_cache_store(full_hash, len, ts);
+  return ts;
 }
 
 ST_FUNC int tok_alloc_const(const char *str)
@@ -889,24 +951,55 @@ static uint8_t *parse_comment(uint8_t *p)
   int c;
   for (;;)
   {
-    /* fast skip loop */
-    for (;;)
+    uint8_t *q, *r;
+    size_t len;
+
+    q = p + 1;
+    if (q < file->buf_end)
     {
-      c = *++p;
-    redo:
-      if (c == '\n' || c == '*' || c == '\\')
-        break;
-      c = *++p;
-      if (c == '\n' || c == '*' || c == '\\')
-        break;
+      uint8_t *found = file->buf_end;
+
+      len = file->buf_end - q;
+      r = memchr(q, '\n', len);
+      if (r && r < found)
+        found = r;
+      r = memchr(q, '*', len);
+      if (r && r < found)
+        found = r;
+      r = memchr(q, '\\', len);
+      if (r && r < found)
+        found = r;
+      p = found;
+      c = (found < file->buf_end) ? *p : '\\';
     }
-    /* now we can handle all the cases */
+    else
+    {
+      p = file->buf_end;
+      c = '\\';
+    }
+
     if (c == '\n')
     {
       file->line_num++;
+      continue;
     }
-    else if (c == '*')
+    else if (c != '*')
     {
+      c = handle_bs(&p);
+      if (c == CH_EOF)
+        tcc_error("unexpected end of file in comment");
+      if (c == '\n')
+      {
+        file->line_num++;
+      }
+      else if (c == '*')
+      {
+        goto star;
+      }
+    }
+    else
+    {
+    star:
       do
       {
         c = *++p;
@@ -915,16 +1008,16 @@ static uint8_t *parse_comment(uint8_t *p)
         c = handle_bs(&p);
       if (c == '/')
         break;
-      goto check_eof;
-    }
-    else
-    {
-      c = handle_bs(&p);
-    check_eof:
       if (c == CH_EOF)
         tcc_error("unexpected end of file in comment");
-      if (c != '\\')
-        goto redo;
+      if (c == '\n')
+      {
+        file->line_num++;
+      }
+      else if (c == '*')
+      {
+        goto star;
+      }
     }
   }
   return p + 1;
@@ -1205,9 +1298,9 @@ ST_FUNC int *tok_str_realloc(TokenString *s, int new_size)
   if (s->allocated_len == 0)
   {
     /* Allocate new heap buffer and copy inline data */
-    size = 8;
+    size = TOKSTR_SMALL_BUFSIZE << 1;
     while (size < new_size)
-      size = size + (size >> 1); /* 1.5x growth */
+      size <<= 1;
     str = tcc_malloc(size * sizeof(int));
     if (s->len > 0)
       memcpy(str, s->data.small_buf, s->len * sizeof(int));
@@ -1219,7 +1312,7 @@ ST_FUNC int *tok_str_realloc(TokenString *s, int new_size)
   /* Already using heap buffer - grow if needed */
   size = s->allocated_len;
   while (size < new_size)
-    size = size + (size >> 1); /* 1.5x growth instead of 2x */
+    size <<= 1;
   if (size > s->allocated_len)
   {
     str = tcc_realloc(s->data.str, size * sizeof(int));
@@ -1234,7 +1327,7 @@ ST_FUNC int *tok_str_realloc(TokenString *s, int new_size)
 static void tok_str_shrink(TokenString *s)
 {
   int exact = s->len;
-  if (exact > 0 && s->allocated_len > exact + 4)
+  if (exact > 0 && s->allocated_len > exact * 2 && s->allocated_len - exact > TOKSTR_SMALL_BUFSIZE)
   {
     int *ns = tcc_realloc(s->data.str, exact * sizeof(int));
     if (ns)
@@ -1243,6 +1336,83 @@ static void tok_str_shrink(TokenString *s)
       s->allocated_len = exact;
     }
   }
+}
+
+static int tok_str_word_count(const int *p)
+{
+  int t = *p;
+
+  if (!TOK_HAS_VALUE(t))
+    return 1;
+
+  switch (t)
+  {
+#if LONG_SIZE == 4
+  case TOK_CLONG:
+#endif
+  case TOK_CINT:
+  case TOK_CCHAR:
+  case TOK_LCHAR:
+  case TOK_CINT_I:
+  case TOK_LINENUM:
+#if LONG_SIZE == 4
+  case TOK_CULONG:
+#endif
+  case TOK_CUINT:
+  case TOK_CFLOAT:
+  case TOK_CFLOAT_I:
+    return 2;
+  case TOK_STR:
+  case TOK_LSTR:
+  case TOK_PPNUM:
+  case TOK_PPSTR:
+    return 2 + (p[1] + sizeof(int) - 1) / sizeof(int);
+  case TOK_CDOUBLE:
+  case TOK_CDOUBLE_I:
+  case TOK_CLLONG:
+  case TOK_CULLONG:
+#if LONG_SIZE == 8
+  case TOK_CLONG:
+  case TOK_CULONG:
+#endif
+    return 3;
+  case TOK_CLDOUBLE:
+  case TOK_CLDOUBLE_I:
+#if LDOUBLE_SIZE == 8 || defined TCC_USING_DOUBLE_FOR_LDOUBLE
+    return 3;
+#elif LDOUBLE_SIZE == 12
+    return 4;
+#elif LDOUBLE_SIZE == 16
+    return 5;
+#else
+#error add long double size support
+#endif
+  default:
+    return 1;
+  }
+}
+
+static void tok_str_add_words(TokenString *s, const int *src, int words)
+{
+  int len = s->len;
+  int capacity = s->allocated_len > 0 ? s->allocated_len : TOKSTR_SMALL_BUFSIZE;
+  int *dst = tok_str_buf(s);
+
+  if (words <= 0)
+    return;
+  if (len + words > capacity)
+    dst = tok_str_realloc(s, len + words);
+  memcpy(dst + len, src, words * sizeof(int));
+  s->len = len + words;
+}
+
+static void tok_str_add_tokstream(TokenString *s, const int *src)
+{
+  const int *p = src;
+
+  while (*p != TOK_EOF)
+    p += tok_str_word_count(p);
+  tok_str_add_words(s, src, p - src);
 }
 
 ST_FUNC void tok_str_add(TokenString *s, int t)
@@ -1286,6 +1456,18 @@ ST_FUNC void end_macro(void)
   }
 }
 
+/* Pop macro stack entries until 'target' is on top, then pop it too.
+ * Used by try_inline_const_eval cleanup: speculative expression parsing
+ * may push extra macro entries (e.g. unget_tok in decl_initializer_alloc),
+ * so a single end_macro() isn't enough to unwind back to the expected state. */
+ST_FUNC void end_macro_to(TokenString *target)
+{
+  while (macro_stack && macro_stack != target)
+    end_macro();
+  if (macro_stack == target)
+    end_macro();
+}
+
 ST_FUNC void tok_str_add2(TokenString *s, int t, CValue *cv)
 {
   int len, *str;
@@ -1295,6 +1477,15 @@ ST_FUNC void tok_str_add2(TokenString *s, int t, CValue *cv)
   len = s->len;
   str = tok_str_buf(s);
   capacity = s->allocated_len > 0 ? s->allocated_len : TOKSTR_SMALL_BUFSIZE;
+
+  if (!TOK_HAS_VALUE(t))
+  {
+    if (len >= capacity)
+      str = tok_str_realloc(s, len + 1);
+    str[len++] = t;
+    s->len = len;
+    return;
+  }
 
   /* compute exact size needed based on token type */
   switch (t)
@@ -1450,6 +1641,21 @@ ST_FUNC void tok_str_add_tok(TokenString *s)
 /* like tok_str_add2(), add a space if needed */
 static void tok_str_add2_spc(TokenString *s, int t, CValue *cv)
 {
+  if (s->need_spc == 3 && !TOK_HAS_VALUE(t))
+  {
+    int len = s->len;
+    int capacity = s->allocated_len > 0 ? s->allocated_len : TOKSTR_SMALL_BUFSIZE;
+    int *str = tok_str_buf(s);
+
+    if (len + 2 > capacity)
+      str = tok_str_realloc(s, len + 2);
+    str[len++] = ' ';
+    str[len++] = t;
+    s->len = len;
+    s->need_spc = 2;
+    return;
+  }
+
   if (s->need_spc == 3)
     tok_str_add(s, ' ');
   s->need_spc = 2;
@@ -1457,7 +1663,7 @@ static void tok_str_add2_spc(TokenString *s, int t, CValue *cv)
 }
 
 /* get a token from an integer array and increment pointer. */
-ST_FUNC void tok_get(int *t, const int **pp, CValue *cv)
+ST_FUNC HOT void tok_get(int *t, const int **pp, CValue *cv)
 {
   const int *p = *pp;
   int n, *tab;
@@ -1606,6 +1812,26 @@ ST_INLN Sym *define_find(int v)
   return table_ident[v]->sym_define;
 }
 
+static uint8_t *skip_logical_line(uint8_t *p)
+{
+  for (;;)
+  {
+    uint8_t *q = p + 1, *bs, *nl;
+    size_t len = file->buf_end - q;
+    int c;
+
+    nl = memchr(q, '\n', len);
+    bs = memchr(q, '\\', len);
+    if (!bs || (nl && nl < bs))
+      return nl ? nl : file->buf_end;
+
+    p = bs;
+    c = handle_bs(&p);
+    if (c == CH_EOF || c == '\n')
+      return p;
+  }
+}
+
 /* free define stack until top reaches 'b' */
 ST_FUNC void free_defines(Sym *b)
 {
@@ -1640,11 +1866,13 @@ ST_FUNC void skip_to_eol(int warn)
     return;
   if (warn)
     tcc_warning("extra tokens after directive");
-  file->buf_ptr = parse_line_comment(file->buf_ptr - 1);
+  file->buf_ptr = skip_logical_line(file->buf_ptr - 1);
   tok = TOK_LINEFEED;
 }
 
 static CachedInclude *search_cached_include(TCCState *s1, const char *filename, int add);
+static int tcc_pch_begin_include(TCCState *s1, const char *filename, int include_next_index);
+static int tcc_pch_next_replay_token(TCCState *s1);
 
 static int parse_include(TCCState *s1, int do_next, int test)
 {
@@ -1720,6 +1948,10 @@ static int parse_include(TCCState *s1, int do_next, int test)
     }
     pstrcat(buf, sizeof buf, name);
     e = search_cached_include(s1, buf, 0);
+    if (!test && (!e || (!define_find(e->ifndef_macro) && !e->once)))
+      tcc_pch_try_auto_include(s1, buf);
+    if (!test && tcc_pch_begin_include(s1, buf, i))
+      return 1;
     if (e && (define_find(e->ifndef_macro) || e->once))
     {
       /* no need to parse the include because the 'ifndef macro'
@@ -1741,6 +1973,11 @@ static int parse_include(TCCState *s1, int do_next, int test)
   {
     if (s1->include_stack_ptr >= s1->include_stack + INCLUDE_STACK_SIZE)
       tcc_error("#include recursion too deep");
+    if (s1->output_type == TCC_OUTPUT_PCH && tcc_pch_in_root_closure(file))
+    {
+      search_cached_include(s1, file->true_filename, 1);
+      dynarray_add(&s1->target_deps, &s1->nb_target_deps, tcc_strdup(file->true_filename));
+    }
     /* push previous file on stack */
     *s1->include_stack_ptr++ = file->prev;
     file->include_next_index = i;
@@ -1860,12 +2097,10 @@ static int expr_preprocess(TCCState *s1)
     }
     else if (tok == TOK_DEFINED)
     {
-      parse_flags &= ~PARSE_FLAG_PREPROCESS; /* no macro subst */
-      next();
+      next_nomacro();
       t = tok;
       if (t == '(')
-        next();
-      parse_flags |= PARSE_FLAG_PREPROCESS;
+        next_nomacro();
       if (tok < TOK_IDENT)
         expect("identifier after 'defined'");
       if (s1->run_test)
@@ -1875,7 +2110,7 @@ static int expr_preprocess(TCCState *s1)
         c = 1;
       if (t == '(')
       {
-        next();
+        next_nomacro();
         if (tok != ')')
           expect("')'");
       }
@@ -2095,6 +2330,8 @@ static int pragma_parse(TCCState *s1)
       while (NULL == (s = define_find(v)))
         define_push(v, 0, NULL, NULL);
       s->type.ref = s; /* set push boundary */
+      if (s1->output_type == TCC_OUTPUT_PCH && tcc_pch_in_root_closure(file))
+        s1->pch_macro_depth++;
     }
     else
     {
@@ -2107,10 +2344,17 @@ static int pragma_parse(TCCState *s1)
     }
     if (s)
     {
+      if (t == TOK_pop_macro && s1->output_type == TCC_OUTPUT_PCH && tcc_pch_in_root_closure(file))
+        s1->pch_macro_depth--;
       table_ident[v - TOK_IDENT]->sym_define = s->d ? s : NULL;
     }
     else
-      tcc_warning("unbalanced #pragma pop_macro");
+    {
+      if (s1->output_type == TCC_OUTPUT_PCH && tcc_pch_in_root_closure(file))
+        tcc_error("unbalanced #pragma pop_macro is not supported in PCH generation");
+      else
+        tcc_warning("unbalanced #pragma pop_macro");
+    }
     pp_debug_tok = t, pp_debug_symv = v;
   }
   else if (tok == TOK_once)
@@ -2128,6 +2372,8 @@ static int pragma_parse(TCCState *s1)
   }
   else if (tok == TOK_pack)
   {
+    int rec_kind = 0;
+    int rec_value = 0;
     /* This may be:
        #pragma pack(1) // set
        #pragma pack() // reset to default
@@ -2145,6 +2391,7 @@ static int pragma_parse(TCCState *s1)
         tcc_error("out of pack stack");
       }
       s1->pack_stack_ptr--;
+      rec_kind = TCC_PCH_REPLAY_PACK_POP;
     }
     else
     {
@@ -2157,6 +2404,7 @@ static int pragma_parse(TCCState *s1)
           if (s1->pack_stack_ptr >= s1->pack_stack + PACK_STACK_SIZE - 1)
             goto stk_error;
           val = *s1->pack_stack_ptr++;
+          rec_kind = TCC_PCH_REPLAY_PACK_PUSH;
           if (tok != ',')
             goto pack_set;
           next();
@@ -2170,9 +2418,14 @@ static int pragma_parse(TCCState *s1)
       }
     pack_set:
       *s1->pack_stack_ptr = val;
+      if (!rec_kind)
+        rec_kind = TCC_PCH_REPLAY_PACK_SET;
+      rec_value = val;
     }
     if (tok != ')')
       goto pragma_err;
+    if (s1->output_type == TCC_OUTPUT_PCH)
+      tcc_pch_record_pack(s1, rec_kind, rec_value);
   }
   else if (tok == TOK_comment)
   {
@@ -2196,7 +2449,11 @@ static int pragma_parse(TCCState *s1)
     else
     {
       if (t == TOK_option)
+      {
+        if (s1->output_type == TCC_OUTPUT_PCH && tcc_pch_in_root_closure(file))
+          tcc_error("#pragma option is not supported in PCH generation");
         tcc_set_options(s1, p);
+      }
       tcc_free(p);
     }
   }
@@ -3292,7 +3549,18 @@ redo_no_start:
       else if (s1->include_stack_ptr == s1->include_stack)
       {
         /* no include left : end of file. */
+        if (s1->output_type == TCC_OUTPUT_PCH && (tok_flags & TOK_FLAG_ENDIF) && tcc_pch_in_root_closure(file))
+          search_cached_include(s1, file->true_filename, 1)->ifndef_macro = file->ifndef_macro_saved;
         tok = TOK_EOF;
+      }
+      else if (s1->pch && s1->pch->replay_active && s1->pch->replay_file == file)
+      {
+        /* PCH replay buffer file hit EOF — don't pop it here.
+           Return to next() which will inject replay tokens, then
+           tcc_pch_finish_replay() will close this file. */
+        file->buf_ptr = p;
+        tok = TOK_LINEFEED;
+        goto keep_tok_flags;
       }
       else
       {
@@ -3436,21 +3704,29 @@ redo_no_start:
     if (c != '\\')
     {
       TokenSym **pts;
+      unsigned int h_full;
 
       /* fast case : no stray found, so we have the full token
          and we have already hashed it */
-      h &= (TOK_HASH_SIZE - 1);
-      pts = &hash_ident[h];
-      for (;;)
-      {
-        ts = *pts;
-        if (!ts)
-          break;
-        if (ts->len == len && !memcmp(ts->str, p1, len))
-          goto token_found;
-        pts = &(ts->hash_next);
+      h_full = h;
+      ts = token_lookup_cache_find(h_full, (char *)p1, len);
+      if (!ts) {
+        h &= (TOK_HASH_SIZE - 1);
+        pts = &hash_ident[h];
+        for (;;)
+        {
+          ts = *pts;
+          if (!ts)
+            break;
+          if (ts->len == len && !memcmp(ts->str, p1, len)) {
+            token_lookup_cache_store(h_full, len, ts);
+            goto token_found;
+          }
+          pts = &(ts->hash_next);
+        }
+        ts = tok_alloc_new(pts, (char *)p1, len);
+        token_lookup_cache_store(h_full, len, ts);
       }
-      ts = tok_alloc_new(pts, (char *)p1, len);
     token_found:;
     }
     else
@@ -3803,25 +4079,41 @@ static void pp_print(const char *msg, int v, const int *str)
 
 static int macro_subst(TokenString *tok_str, Sym **nested_list, const int *macro_str);
 
+typedef struct MacroArg
+{
+  int v;
+  unsigned char is_vaargs;
+  int *d;
+  int *e;
+} MacroArg;
+
+static MacroArg *macro_arg_find(MacroArg *args, int nb_args, int tok)
+{
+  int i;
+
+  for (i = 0; i < nb_args; ++i)
+  {
+    if (args[i].v == tok)
+      return &args[i];
+  }
+  return NULL;
+}
+
 /* substitute arguments in replacement lists in macro_str by the values in
    args (field d) and return allocated string */
-static int *macro_arg_subst(Sym **nested_list, const int *macro_str, Sym *args)
+static int *macro_arg_subst(Sym **nested_list, const int *macro_str, MacroArg *args, int nb_args)
 {
   int t, t0, t1, t2, n;
   const int *st;
-  Sym *s;
+  MacroArg *arg;
   CValue cval;
   TokenString str;
 
 #ifdef PP_DEBUG
   PP_PRINT(("asubst:", 0, macro_str));
-  for (s = args, n = 0; s; s = s->prev, ++n)
-    ;
-  while (n--)
+  for (n = 0; n < nb_args; ++n)
   {
-    for (s = args, t = 0; t < n; s = s->prev, ++t)
-      ;
-    tok_print(s->d, "%*s - arg: %s:", indent, "", get_tok_str(s->v, 0));
+    tok_print(args[n].d, "%*s - arg: %s:", indent, "", get_tok_str(args[n].v, 0));
   }
 #endif
 
@@ -3838,12 +4130,12 @@ static int *macro_arg_subst(Sym **nested_list, const int *macro_str, Sym *args)
       do
         t = *macro_str++;
       while (t == ' ');
-      s = sym_find2(args, t);
-      if (s)
+      arg = macro_arg_find(args, nb_args, t);
+      if (arg)
       {
         cstr_reset(&tokcstr);
         cstr_ccat(&tokcstr, '\"');
-        st = s->d;
+        st = arg->d;
         while (*st != TOK_EOF)
         {
           const char *s;
@@ -3873,10 +4165,10 @@ static int *macro_arg_subst(Sym **nested_list, const int *macro_str, Sym *args)
     }
     else if (t >= TOK_IDENT)
     {
-      s = sym_find2(args, t);
-      if (s)
+      arg = macro_arg_find(args, nb_args, t);
+      if (arg)
       {
-        st = s->d;
+        st = arg->d;
         n = 0;
         while ((t2 = macro_str[n]) == ' ')
           ++n;
@@ -3885,7 +4177,7 @@ static int *macro_arg_subst(Sym **nested_list, const int *macro_str, Sym *args)
         {
           /* special case for var arg macros : ## eats the ','
              if empty VA_ARGS variable. */
-          if (t1 == TOK_PPJOIN && t0 == ',' && gnu_ext && s->type.t)
+          if (t1 == TOK_PPJOIN && t0 == ',' && gnu_ext && arg->is_vaargs)
           {
             int *str_buf = tok_str_buf(&str);
             int c = str_buf[str.len - 1];
@@ -3914,7 +4206,7 @@ static int *macro_arg_subst(Sym **nested_list, const int *macro_str, Sym *args)
         else
         {
         add_var:
-          if (!s->e)
+          if (!arg->e)
           {
             /* Expand arguments tokens and store them.  In most
                cases we could also re-expand each argument if
@@ -3924,15 +4216,11 @@ static int *macro_arg_subst(Sym **nested_list, const int *macro_str, Sym *args)
             tok_str_new(&str2);
             macro_subst(&str2, nested_list, st);
             tok_str_add(&str2, TOK_EOF);
-            s->e = tok_str_ensure_heap(&str2);
+            arg->e = tok_str_ensure_heap(&str2);
           }
-          st = s->e;
+          st = arg->e;
         }
-        while (*st != TOK_EOF)
-        {
-          TOK_GET(&t2, &st, &cval);
-          tok_str_add2(&str, t2, &cval);
-        }
+        tok_str_add_tokstream(&str, st);
       }
       else
       {
@@ -4126,8 +4414,9 @@ static int macro_subst_tok(TokenString *tok_str, Sym **nested_list, Sym *s)
     {
       int saved_parse_flags = parse_flags;
       TokenString str;
-      int parlevel, i;
-      Sym *sa1, *args;
+      int arg_index, nb_args, parlevel, i;
+      MacroArg *args;
+      Sym *param;
 
       parse_flags |= PARSE_FLAG_SPACES | PARSE_FLAG_LINEFEED | PARSE_FLAG_ACCEPT_STRAYS;
 
@@ -4143,8 +4432,7 @@ static int macro_subst_tok(TokenString *tok_str, Sym **nested_list, Sym *s)
         parse_flags = saved_parse_flags;
         tok_str_add2_spc(tok_str, v, 0);
         if (parse_flags & PARSE_FLAG_SPACES)
-          for (i = 0; i < str.len; i++)
-            tok_str_add(tok_str, tok_str_buf(&str)[i]);
+          tok_str_add_words(tok_str, tok_str_buf(&str), str.len);
         if (str.allocated_len > 0)
           tok_str_free_str(str.data.str);
         return 0;
@@ -4156,8 +4444,12 @@ static int macro_subst_tok(TokenString *tok_str, Sym **nested_list, Sym *s)
       }
 
       /* argument macro */
-      args = NULL;
+      nb_args = 0;
+      for (param = s->next; param; param = param->next)
+        ++nb_args;
+      args = nb_args ? tcc_mallocz(nb_args * sizeof(*args)) : NULL;
       sa = s->next;
+      arg_index = 0;
       /* NOTE: empty args are allowed, except if no args */
       i = 2; /* eat '(' */
       for (;;)
@@ -4192,8 +4484,10 @@ static int macro_subst_tok(TokenString *tok_str, Sym **nested_list, Sym *s)
           t = next_argstream(nested_list, NULL);
         }
         tok_str_add(&str, TOK_EOF);
-        sa1 = sym_push2(&args, sa->v & ~SYM_FIELD, sa->type.t, 0);
-        sa1->d = tok_str_ensure_heap(&str);
+        args[arg_index].v = sa->v & ~SYM_FIELD;
+        args[arg_index].is_vaargs = sa->type.t != 0;
+        args[arg_index].d = tok_str_ensure_heap(&str);
+        arg_index++;
         sa = sa->next;
         if (t == ')')
         {
@@ -4209,18 +4503,15 @@ static int macro_subst_tok(TokenString *tok_str, Sym **nested_list, Sym *s)
       }
 
       /* now subst each arg */
-      mstr = macro_arg_subst(nested_list, mstr, args);
+      mstr = macro_arg_subst(nested_list, mstr, args, arg_index);
 
       /* free memory */
-      sa = args;
-      while (sa)
+      for (i = 0; i < arg_index; ++i)
       {
-        sa1 = sa->prev;
-        tok_str_free_str(sa->d);
-        tok_str_free_str(sa->e);
-        sym_free(sa);
-        sa = sa1;
+        tok_str_free_str(args[i].d);
+        tok_str_free_str(args[i].e);
       }
+      tcc_free(args);
       parse_flags = saved_parse_flags;
     }
 
@@ -4234,7 +4525,6 @@ static int macro_subst_tok(TokenString *tok_str, Sym **nested_list, Sym *s)
     /* pop nested defined symbol */
     if (sa == *nested_list)
       *nested_list = sa->prev, sym_free(sa);
-
     if (jstr != mstr)
       tok_str_free_str(jstr);
     if (mstr != s->d)
@@ -4297,7 +4587,7 @@ static int macro_subst(TokenString *tok_str, Sym **nested_list, const int *macro
   Sym *s;
   int t, nosubst = 0;
   CValue cval;
-  TokenString *str;
+  TokenString macro_view;
 
 #ifdef PP_DEBUG
   int tlen = tok_str->len;
@@ -4321,12 +4611,12 @@ static int macro_subst(TokenString *tok_str, Sym **nested_list, const int *macro
         t |= SYM_FIELD;
         goto no_subst;
       }
-      str = tok_str_alloc();
-      str->data.str = (int *)macro_str; /* setup stream for possible arguments */
-      str->allocated_len = 1;           /* indicate heap buffer (read-only view) */
-      begin_macro(str, 2);
+      tok_str_new(&macro_view);
+      macro_view.data.str = (int *)macro_str; /* setup stream for possible arguments */
+      macro_view.allocated_len = 1;           /* indicate heap buffer (read-only view) */
+      begin_macro(&macro_view, 0);
       nosubst = macro_subst_tok(tok_str, nested_list, s);
-      if (macro_stack != str)
+      if (macro_stack != &macro_view)
       {
         /* already finished by reading function macro arguments */
         break;
@@ -4359,9 +4649,14 @@ static int macro_subst(TokenString *tok_str, Sym **nested_list, const int *macro
 }
 
 /* return next token with macro substitution */
-ST_FUNC void next(void)
+ST_FUNC HOT void next(void)
 {
   int t;
+  TCCState *s1 = tcc_state;
+
+retry_from_pch:
+  if (tcc_pch_next_replay_token(s1))
+    goto retry_from_pch;
   while (macro_ptr)
   {
   redo:
@@ -4400,7 +4695,14 @@ ST_FUNC void next(void)
     return;
   }
 
+  if (s1->pch && s1->pch->replay_active)
+    goto retry_from_pch;
+
   next_nomacro();
+  /* If PCH replay was activated during preprocess() inside next_nomacro(),
+     discard the dummy token and let the replay inject its tokens first. */
+  if (s1->pch && s1->pch->replay_active)
+    goto retry_from_pch;
   t = tok;
   if (t >= TOK_IDENT && (parse_flags & PARSE_FLAG_PREPROCESS))
   {
@@ -4498,7 +4800,7 @@ static void putdefs(CString *cs, const char *p)
     putdef(cs, p), p = strchr(p, 0) + 1;
 }
 
-static void tcc_predefs(TCCState *s1, CString *cs, int is_asm)
+static void tcc_predefs_base(TCCState *s1, CString *cs, int is_asm, int include_base_file)
 {
   cstr_printf(cs, "#define __TINYC__ 9%.2s\n", *&TCC_VERSION + 4);
   putdefs(cs, target_machine_defs);
@@ -4584,7 +4886,8 @@ static void tcc_predefs(TCCState *s1, CString *cs, int is_asm)
 #endif
              , -1);
   }
-  cstr_printf(cs, "#define __BASE_FILE__ \"%s\"\n", file->filename);
+  if (include_base_file)
+    cstr_printf(cs, "#define __BASE_FILE__ \"%s\"\n", file->filename);
 }
 
 ST_FUNC void preprocess_start(TCCState *s1, int filetype)
@@ -4592,6 +4895,8 @@ ST_FUNC void preprocess_start(TCCState *s1, int filetype)
   int is_asm = !!(filetype & (AFF_TYPE_ASM | AFF_TYPE_ASMPP));
 
   tccpp_new(s1);
+  tcc_pch_free(s1);
+  tcc_pch_capture_reset(s1);
 
   s1->include_stack_ptr = s1->include_stack;
   s1->ifdef_stack_ptr = s1->ifdef_stack;
@@ -4601,6 +4906,9 @@ ST_FUNC void preprocess_start(TCCState *s1, int filetype)
   pp_debug_tok = pp_debug_symv = 0;
   s1->pack_stack[0] = 0;
   s1->pack_stack_ptr = s1->pack_stack;
+  s1->pch_ident_start = tok_ident;
+  s1->pch_filetype = filetype;
+  tcc_pch_try_load(s1, filetype);
 
   set_idnum('$', !is_asm && s1->dollars_in_identifiers ? IS_ID : 0);
   set_idnum('.', is_asm ? IS_ID : 0);
@@ -4609,11 +4917,23 @@ ST_FUNC void preprocess_start(TCCState *s1, int filetype)
   {
     CString cstr;
     cstr_new(&cstr);
-    tcc_predefs(s1, &cstr, is_asm);
-    if (s1->cmdline_defs.size)
-      cstr_cat(&cstr, s1->cmdline_defs.data, s1->cmdline_defs.size);
-    if (s1->cmdline_incl.size)
-      cstr_cat(&cstr, s1->cmdline_incl.data, s1->cmdline_incl.size);
+    /* Build predefines WITHOUT __BASE_FILE__ first so we can hash
+       the content for PCH validation before appending the per-file part. */
+    {
+      tcc_predefs_base(s1, &cstr, is_asm, 0);
+      if (s1->cmdline_defs.size)
+        cstr_cat(&cstr, s1->cmdline_defs.data, s1->cmdline_defs.size);
+      if (s1->cmdline_incl.size)
+        cstr_cat(&cstr, s1->cmdline_incl.data, s1->cmdline_incl.size);
+      /* Cache predefines hash now to avoid regenerating during PCH load. */
+      if (!s1->pch_predefines_hash_valid)
+      {
+        s1->pch_predefines_hash_cached = tcc_pch_hash_bytes(tcc_pch_hash_init(), cstr.data, cstr.size);
+        s1->pch_predefines_hash_valid = 1;
+      }
+    }
+    /* Now append __BASE_FILE__ for actual preprocessing. */
+    cstr_printf(&cstr, "#define __BASE_FILE__ \"%s\"\n", file->filename);
     // printf("%.*s\n", cstr.size, (char*)cstr.data);
     *s1->include_stack_ptr++ = file;
     tcc_open_bf(s1, "<command line>", cstr.size);
@@ -4631,6 +4951,8 @@ ST_FUNC void preprocess_end(TCCState *s1)
   macro_ptr = NULL;
   while (file)
     tcc_close();
+  tcc_pch_free(s1);
+  tcc_pch_capture_reset(s1);
   tccpp_delete(s1);
 }
 
@@ -4671,6 +4993,9 @@ ST_FUNC void tccpp_new(TCCState *s)
   tal_new(&toksym_alloc, TOKSYM_TAL_LIMIT, TOKSYM_TAL_SIZE);
   tal_new(&tokstr_alloc, TOKSTR_TAL_LIMIT, TOKSTR_TAL_SIZE);
 
+  table_ident_alloc = TOK_IDENT_PREALLOC;
+  table_ident = tcc_malloc(table_ident_alloc * sizeof(TokenSym *));
+  token_lookup_cache_clear();
   memset(hash_ident, 0, TOK_HASH_SIZE * sizeof(TokenSym *));
   memset(s->cached_includes_hash, 0, sizeof s->cached_includes_hash);
 
@@ -4719,6 +5044,8 @@ ST_FUNC void tccpp_delete(TCCState *s)
     tal_free(toksym_alloc, table_ident[i]);
   tcc_free(table_ident);
   table_ident = NULL;
+  table_ident_alloc = 0;
+  token_lookup_cache_clear();
 
   /* String token statistics disabled
   if (str_total_added > 0) {
@@ -4746,6 +5073,1385 @@ ST_FUNC void tccpp_delete(TCCState *s)
   toksym_alloc = NULL;
   tal_delete(tokstr_alloc);
   tokstr_alloc = NULL;
+}
+
+static void tcc_pch_capture_reset(TCCState *s1)
+{
+  if (s1->pch_token_blob.allocated_len > 0)
+    tok_str_free_str(s1->pch_token_blob.data.str);
+  tok_str_new(&s1->pch_token_blob);
+  tcc_free(s1->pch_replay_records);
+  s1->pch_replay_records = NULL;
+  s1->nb_pch_replay_records = 0;
+  s1->alloc_pch_replay_records = 0;
+  s1->pch_replay_token_start = 0;
+  s1->pch_macro_depth = 0;
+}
+
+static int tcc_pch_in_root_closure(BufferedFile *bf)
+{
+  while (bf)
+  {
+    if (!strcmp(bf->filename, "<command line>"))
+      return 0;
+    bf = bf->prev;
+  }
+  return 1;
+}
+
+static void tcc_pch_flush_replay_tokens(TCCState *s1)
+{
+  int len = s1->pch_token_blob.len - s1->pch_replay_token_start;
+
+  if (len <= 0)
+    return;
+  tcc_pch_add_replay_record(s1, TCC_PCH_REPLAY_TOKENS, s1->pch_replay_token_start, len);
+  s1->pch_replay_token_start = s1->pch_token_blob.len;
+}
+
+static void tcc_pch_add_replay_record(TCCState *s1, int kind, unsigned arg0, unsigned arg1)
+{
+  TCCPCHReplayRecord *rec;
+
+  if (s1->nb_pch_replay_records >= s1->alloc_pch_replay_records)
+  {
+    int new_alloc = s1->alloc_pch_replay_records ? s1->alloc_pch_replay_records << 1 : 16;
+    s1->pch_replay_records = tcc_realloc(s1->pch_replay_records, new_alloc * sizeof(*s1->pch_replay_records));
+    s1->alloc_pch_replay_records = new_alloc;
+  }
+  rec = &s1->pch_replay_records[s1->nb_pch_replay_records++];
+  rec->kind = kind;
+  rec->arg0 = arg0;
+  rec->arg1 = arg1;
+}
+
+static void tcc_pch_record_pack(TCCState *s1, int kind, int value)
+{
+  if (!tcc_pch_in_root_closure(file))
+    return;
+  tcc_pch_flush_replay_tokens(s1);
+  tcc_pch_add_replay_record(s1, kind, value, 0);
+}
+
+/* Microsecond timestamp for PCH timing diagnostics. */
+static inline uint32_t tcc_pch_usec(void)
+{
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  return (uint32_t)(tv.tv_sec * 1000000u + tv.tv_usec);
+}
+
+static uint64_t tcc_pch_hash_init(void)
+{
+  return 14695981039346656037ULL;
+}
+
+static uint64_t tcc_pch_hash_bytes(uint64_t hash, const void *data, size_t len)
+{
+  const unsigned char *p = data;
+
+  while (len--)
+  {
+    hash ^= *p++;
+    hash *= 1099511628211ULL;
+  }
+  return hash;
+}
+
+static uint64_t tcc_pch_hash_cstr(uint64_t hash, const char *str)
+{
+  return tcc_pch_hash_bytes(hash, str, strlen(str) + 1);
+}
+
+static uint32_t tcc_pch_host_endianness(void)
+{
+  const uint16_t value = 0x0102;
+  return *(const unsigned char *)&value == 0x02 ? 1 : 2;
+}
+
+/* When cross-compiling with a non-trivial sysroot, strip the sysroot
+   prefix from a resolved path so that PCH files store target-relative
+   paths and hashes that match the native target compiler. */
+static const char *tcc_pch_strip_sysroot(const char *path)
+{
+#ifdef CONFIG_SYSROOT
+  static const char sysroot[] = CONFIG_SYSROOT;
+  size_t len = sizeof(sysroot) - 1;
+  if (len > 1 && strncmp(path, sysroot, len) == 0 && (path[len] == '/' || path[len] == '\0'))
+    return path + len;
+#endif
+  return path;
+}
+
+/* Normalize a resolved path for PCH include-path hashing.  Replaces the
+   tcc_lib_path prefix with the canonical "{B}" placeholder and strips
+   CONFIG_SYSROOT from remaining paths.  This ensures cross-compiled and
+   native PCH files produce identical include-path hashes. */
+static const char *tcc_pch_normalize_for_hash(const char *resolved,
+                                              const char *resolved_lib,
+                                              size_t resolved_lib_len,
+                                              char *buf, size_t buf_size)
+{
+  if (resolved_lib_len > 0 &&
+      strncmp(resolved, resolved_lib, resolved_lib_len) == 0 &&
+      (resolved[resolved_lib_len] == '/' || resolved[resolved_lib_len] == '\0'))
+  {
+    snprintf(buf, buf_size, "{B}%s", resolved + resolved_lib_len);
+    return buf;
+  }
+  return tcc_pch_strip_sysroot(resolved);
+}
+
+static uint64_t tcc_pch_hash_include_paths(TCCState *s1)
+{
+  uint64_t hash;
+  int i;
+  size_t lib_len;
+  char norm_buf[1024];
+
+  if (s1->pch_include_path_hash_valid)
+    return s1->pch_include_path_hash_cached;
+
+  hash = tcc_pch_hash_init();
+  lib_len = s1->tcc_lib_path ? strlen(s1->tcc_lib_path) : 0;
+
+  /* Hash a canonical placeholder for tcc_lib_path so that cross-compiled
+     and native PCH files produce identical hashes. */
+  hash = tcc_pch_hash_cstr(hash, "{B}");
+  if (s1->pch_verbose)
+    fprintf(stderr, "pch: include path hash: tcc_lib_path='%s'\n",
+      s1->tcc_lib_path ? s1->tcc_lib_path : "(null)");
+
+  /* Normalize paths using direct string matching against tcc_lib_path
+     and CONFIG_SYSROOT instead of expensive realpath() syscalls.
+     The include paths are already absolute (set by configure/Makefile)
+     and {B} was substituted with tcc_lib_path by tcc_split_path(),
+     so string prefix matching produces the same canonical result. */
+  for (i = 0; i < s1->nb_include_paths; ++i) {
+    const char *norm = tcc_pch_normalize_for_hash(s1->include_paths[i],
+                                 s1->tcc_lib_path, lib_len,
+                                 norm_buf, sizeof(norm_buf));
+    if (s1->pch_verbose)
+      fprintf(stderr, "pch:   include[%d] raw='%s' norm='%s'\n", i, s1->include_paths[i], norm);
+    hash = tcc_pch_hash_cstr(hash, norm);
+  }
+  for (i = 0; i < s1->nb_sysinclude_paths; ++i) {
+    const char *norm = tcc_pch_normalize_for_hash(s1->sysinclude_paths[i],
+                                 s1->tcc_lib_path, lib_len,
+                                 norm_buf, sizeof(norm_buf));
+    if (s1->pch_verbose)
+      fprintf(stderr, "pch:   sysinclude[%d] raw='%s' norm='%s'\n", i, s1->sysinclude_paths[i], norm);
+    hash = tcc_pch_hash_cstr(hash, norm);
+  }
+  s1->pch_include_path_hash_cached = hash;
+  s1->pch_include_path_hash_valid = 1;
+  return hash;
+}
+
+static uint64_t tcc_pch_hash_predefines(TCCState *s1, int filetype)
+{
+  int is_asm;
+  CString cstr;
+  uint64_t hash;
+
+  if (s1->pch_predefines_hash_valid)
+    return s1->pch_predefines_hash_cached;
+
+  is_asm = !!(filetype & (AFF_TYPE_ASM | AFF_TYPE_ASMPP));
+  cstr_new(&cstr);
+  tcc_predefs_base(s1, &cstr, is_asm, 0);
+  if (s1->cmdline_defs.size)
+    cstr_cat(&cstr, s1->cmdline_defs.data, s1->cmdline_defs.size);
+  if (s1->cmdline_incl.size)
+    cstr_cat(&cstr, s1->cmdline_incl.data, s1->cmdline_incl.size);
+  hash = tcc_pch_hash_bytes(tcc_pch_hash_init(), cstr.data, cstr.size);
+  if (s1->pch_verbose)
+    fprintf(stderr, "pch: predefines (%d bytes):\n%.*s\n", (int)cstr.size, (int)cstr.size, (const char *)cstr.data);
+  cstr_free(&cstr);
+  s1->pch_predefines_hash_cached = hash;
+  s1->pch_predefines_hash_valid = 1;
+  return hash;
+}
+
+static int tcc_pch_tokstream_words(const int *str)
+{
+  const int *start = str;
+  CValue cv;
+  int t;
+
+  if (!str)
+    return 0;
+  for (;;)
+  {
+    TOK_GET(&t, &str, &cv);
+    if (t == 0)
+      break;
+  }
+  return str - start;
+}
+
+static uint64_t tcc_pch_stat_mtime_nsec(const struct stat *st)
+{
+#if defined(__APPLE__) && defined(__MACH__)
+  return st->st_mtimespec.tv_nsec;
+#elif defined(__linux__)
+  return st->st_mtim.tv_nsec;
+#else
+  (void)st;
+  return 0;
+#endif
+}
+
+static uint32_t tcc_pch_add_string(CString *strings, const char *str)
+{
+  uint32_t off = strings->size;
+  cstr_cat(strings, str, strlen(str) + 1);
+  return off;
+}
+
+static void tcc_pch_append_bytes(CString *sec, const void *data, size_t size)
+{
+  if (size)
+    cstr_cat(sec, data, size);
+}
+
+static const char *tcc_pch_get_string(const TCCPCHState *pch, uint32_t off)
+{
+  if (!pch || off >= (uint32_t)pch->strings_size)
+    return NULL;
+  return pch->strings + off;
+}
+
+static int tcc_pch_validate_string(const char *strings, int strings_size, uint32_t off, uint32_t len)
+{
+  const char *str;
+  size_t remain;
+  const char *end;
+
+  if (off >= (uint32_t)strings_size)
+    return 0;
+  str = strings + off;
+  remain = strings_size - off;
+  end = memchr(str, '\0', remain);
+  if (!end)
+    return 0;
+  if (len != (uint32_t)(end - str))
+    return 0;
+  return 1;
+}
+
+static int tcc_pch_validate_cstr_off(const char *strings, int strings_size, uint32_t off)
+{
+  if (off >= (uint32_t)strings_size)
+    return 0;
+  return memchr(strings + off, '\0', strings_size - off) != NULL;
+}
+
+static int tcc_pch_remap_token(int *token_map, int token_map_len, int tok)
+{
+  int sym_field = tok & SYM_FIELD;
+  int base = tok & ~SYM_FIELD;
+  int idx = base - TOK_IDENT;
+
+  if ((unsigned)idx < (unsigned)token_map_len && token_map[idx])
+    base = token_map[idx];
+  return base | sym_field;
+}
+
+static void tcc_pch_remap_tokstream(int *dst, const int *src, int words, int *token_map, int token_map_len)
+{
+  int *p, *end;
+
+  /* Bulk copy, then remap identifier tokens in-place */
+  memcpy(dst, src, words * sizeof(int));
+  p = dst;
+  end = dst + words;
+  while (p < end)
+  {
+    int t = *p;
+    if ((t & ~SYM_FIELD) >= TOK_IDENT)
+      *p = tcc_pch_remap_token(token_map, token_map_len, t);
+    p += tok_str_word_count(p);
+  }
+}
+
+static void tcc_pch_state_delete(TCCPCHState *pch)
+{
+  if (!pch)
+    return;
+  tcc_free(pch->filename);
+  tcc_free(pch->root_filename);
+  tcc_free(pch->generator_version);
+  /* After tcc_pch_apply(), token_blob is a separate allocation (remapped
+     copy).  Before apply, it aliases into raw and must NOT be freed.  The
+     applied flag distinguishes the two cases. */
+  if (pch->applied)
+    tcc_free(pch->token_blob);
+  tcc_free(pch->raw);
+  tcc_free(pch);
+}
+
+ST_FUNC void tcc_pch_free(TCCState *s1)
+{
+  tcc_pch_state_delete(s1->pch);
+  s1->pch = NULL;
+  s1->pch_is_auto = 0;
+}
+
+ST_FUNC void tcc_pch_auto_reset(TCCState *s1)
+{
+  int i;
+
+  if (s1->pch_is_auto)
+    tcc_pch_free(s1);
+  for (i = 0; i < s1->nb_auto_pch_entries; ++i)
+  {
+    tcc_free(s1->auto_pch_entries[i].header_path);
+    tcc_free(s1->auto_pch_entries[i].pch_name);
+  }
+  tcc_free(s1->auto_pch_entries);
+  s1->auto_pch_entries = NULL;
+  s1->nb_auto_pch_entries = 0;
+  s1->pch_auto_index_loaded = 0;
+}
+
+static int tcc_pch_section_expected_size(uint32_t actual, uint32_t count, size_t elem_size)
+{
+  return actual == count * elem_size;
+}
+
+static const char *tcc_pch_auto_subdir(void)
+{
+#ifdef CONFIG_TCC_CROSSPREFIX
+  return CONFIG_TCC_CROSSPREFIX;
+#else
+  return "native";
+#endif
+}
+
+static int tcc_pch_is_auto_common_header(const char *filename)
+{
+  static const char *const common_headers[] = {"stdio.h", "stdlib.h", "string.h", NULL};
+  const char *name = tcc_basename(filename);
+  int i;
+
+  for (i = 0; common_headers[i]; ++i)
+    if (!PATHCMP(name, common_headers[i]))
+      return 1;
+  return 0;
+}
+
+static void tcc_pch_auto_index_path(TCCState *s1, char *buf, size_t buf_size)
+{
+  snprintf(buf, buf_size, "%s/pch/%s/auto.index", s1->tcc_lib_path, tcc_pch_auto_subdir());
+}
+
+static void tcc_pch_auto_file_path(TCCState *s1, const char *pch_name, char *buf, size_t buf_size)
+{
+  snprintf(buf, buf_size, "%s/pch/%s/%s", s1->tcc_lib_path, tcc_pch_auto_subdir(), pch_name);
+}
+
+static void tcc_pch_auto_add_entry(TCCState *s1, const char *header_path, const char *pch_name)
+{
+  int idx = s1->nb_auto_pch_entries++;
+  s1->auto_pch_entries = tcc_realloc(s1->auto_pch_entries, s1->nb_auto_pch_entries * sizeof(*s1->auto_pch_entries));
+  s1->auto_pch_entries[idx].header_path = tcc_strdup(header_path);
+  s1->auto_pch_entries[idx].pch_name = tcc_strdup(pch_name);
+  s1->auto_pch_entries[idx].disabled = 0;
+}
+
+static int tcc_pch_auto_load_index(TCCState *s1)
+{
+  char index_path[1024];
+  FILE *fp;
+  char line[4096];
+
+  if (s1->pch_auto_index_loaded)
+    return s1->nb_auto_pch_entries != 0;
+
+  s1->pch_auto_index_loaded = 1;
+  tcc_pch_auto_index_path(s1, index_path, sizeof(index_path));
+  fp = fopen(index_path, "r");
+  if (!fp)
+    return 0;
+
+  while (fgets(line, sizeof(line), fp))
+  {
+    char *header_path;
+    char *sep;
+    char *end;
+
+    for (header_path = line; *header_path == ' ' || *header_path == '\t'; ++header_path)
+      ;
+    if (*header_path == '\0' || *header_path == '\n' || *header_path == '#')
+      continue;
+    for (sep = header_path; *sep && *sep != '\t'; ++sep)
+      ;
+    if (*sep != '\t')
+      continue;
+    *sep++ = '\0';
+    for (end = sep; *end && *end != '\r' && *end != '\n'; ++end)
+      ;
+    if (*end)
+      *end = '\0';
+    if (!*sep)
+      continue;
+    tcc_pch_auto_add_entry(s1, header_path, sep);
+  }
+  fclose(fp);
+  return s1->nb_auto_pch_entries != 0;
+}
+
+static int tcc_pch_try_load_file(TCCState *s1, const char *filename, int filetype)
+{
+  char *saved = s1->pch_infile;
+  int ret;
+
+  s1->pch_infile = (char *)filename;
+  ret = tcc_pch_try_load(s1, filetype);
+  s1->pch_infile = saved;
+  return ret;
+}
+
+/* Compare two paths ignoring redundant slashes (e.g. "//usr" == "/usr"). */
+static int tcc_pch_pathcmp(const char *a, const char *b)
+{
+  for (;;) {
+    while (*a == '/' && a[1] == '/') ++a;
+    while (*b == '/' && b[1] == '/') ++b;
+    if (*a != *b) return (unsigned char)*a - (unsigned char)*b;
+    if (*a == '\0') return 0;
+    ++a; ++b;
+  }
+}
+
+static void tcc_pch_try_auto_include(TCCState *s1, const char *filename)
+{
+  char pch_path[1024];
+  char *resolved_filename = NULL;
+  int i;
+  if (!s1->pch_auto_enabled || (s1->pch_infile && *s1->pch_infile) || !tcc_pch_is_auto_common_header(filename))
+    return;
+  if (s1->pch_filetype & (AFF_TYPE_ASM | AFF_TYPE_ASMPP))
+    return;
+  if (s1->pch)
+  {
+    if (s1->pch->replay_active || !s1->pch->consumed)
+      return;
+    if (!s1->pch_is_auto)
+      return;
+    tcc_pch_free(s1);
+  }
+  if (!tcc_pch_auto_load_index(s1))
+  {
+    if (s1->pch_verbose)
+      fprintf(stderr, "pch: no auto.index found for '%s'\n", filename);
+    return;
+  }
+
+  for (i = 0; i < s1->nb_auto_pch_entries; ++i)
+  {
+    TCCAutoPCHEntry *entry = &s1->auto_pch_entries[i];
+
+    if (entry->disabled)
+      continue;
+    if (tcc_pch_pathcmp(entry->header_path, filename))
+    {
+      if (!resolved_filename)
+        resolved_filename = realpath(filename, NULL);
+      if (!resolved_filename || tcc_pch_pathcmp(entry->header_path, resolved_filename))
+      {
+        if (s1->pch_verbose)
+          fprintf(stderr, "pch: path mismatch: entry='%s' file='%s' resolved='%s'\n",
+            entry->header_path, filename, resolved_filename ? resolved_filename : "(null)");
+        continue;
+      }
+    }
+    tcc_pch_auto_file_path(s1, entry->pch_name, pch_path, sizeof(pch_path));
+    if (s1->pch_verbose)
+      fprintf(stderr, "pch: trying '%s' for '%s'\n", pch_path, filename);
+    if (!tcc_pch_try_load_file(s1, pch_path, s1->pch_filetype))
+    {
+      entry->disabled = 1;
+      continue;
+    }
+    if (!s1->pch)
+    {
+      entry->disabled = 1;
+      continue;
+    }
+    if (tcc_pch_pathcmp(s1->pch->root_filename, filename))
+    {
+      if (!resolved_filename)
+        resolved_filename = realpath(filename, NULL);
+      if (!resolved_filename || tcc_pch_pathcmp(s1->pch->root_filename, resolved_filename))
+      {
+        entry->disabled = 1;
+        tcc_pch_free(s1);
+        continue;
+      }
+    }
+    s1->pch_is_auto = 1;
+    libc_free(resolved_filename);
+    return;
+  }
+  libc_free(resolved_filename);
+}
+
+ST_FUNC int tcc_pch_try_load(TCCState *s1, int filetype)
+{
+  static const uint32_t section_kinds[] = {
+      TCC_PCH_SEC_STRINGS,      TCC_PCH_SEC_IDENTS,      TCC_PCH_SEC_TOKEN_BLOBS, TCC_PCH_SEC_MACROS,
+      TCC_PCH_SEC_MACRO_ARGS,   TCC_PCH_SEC_REPLAY_RECORDS, TCC_PCH_SEC_CACHED_INCLUDES,
+      TCC_PCH_SEC_DEPENDENCIES, TCC_PCH_SEC_PRAGMA_LIBS, TCC_PCH_SEC_MANIFEST,
+  };
+  TCCPCHFileHeader hdr;
+  TCCPCHSectionHeader dirs[sizeof(section_kinds) / sizeof(section_kinds[0])];
+  TCCPCHManifestRecord manifest;
+  TCCPCHState *pch = NULL;
+  unsigned char *raw = NULL;
+  FILE *fp = NULL;
+  size_t raw_size;
+  long raw_size_l;
+  uint64_t dependency_hash = tcc_pch_hash_init();
+  int expected_builtin_count = s1->pch_ident_start - TOK_IDENT;
+  int builtin_token_delta = 0;
+  int max_token;
+  int i;
+
+  tcc_pch_free(s1);
+  if (!s1->pch_infile || !*s1->pch_infile)
+    return 0;
+
+  fp = fopen(s1->pch_infile, "rb");
+  if (!fp)
+  {
+    tcc_warning("ignoring PCH '%s': could not open file", s1->pch_infile);
+    return 0;
+  }
+  if (fseek(fp, 0, SEEK_END) != 0 || (raw_size_l = ftell(fp)) < 0 || fseek(fp, 0, SEEK_SET) != 0)
+  {
+    tcc_warning("ignoring PCH '%s': could not read file size", s1->pch_infile);
+    fclose(fp);
+    return 0;
+  }
+  raw_size = (size_t)raw_size_l;
+  if (raw_size < sizeof(hdr) + sizeof(dirs))
+  {
+    tcc_warning("ignoring PCH '%s': file too small", s1->pch_infile);
+    fclose(fp);
+    return 0;
+  }
+
+  raw = tcc_malloc(raw_size);
+  if (fread(raw, raw_size, 1, fp) != 1)
+  {
+    tcc_warning("ignoring PCH '%s': could not read file", s1->pch_infile);
+    fclose(fp);
+    tcc_free(raw);
+    return 0;
+  }
+  fclose(fp);
+  fp = NULL;
+
+  memcpy(&hdr, raw, sizeof(hdr));
+  memcpy(dirs, raw + sizeof(hdr), sizeof(dirs));
+
+  if (hdr.magic != TCC_PCH_MAGIC)
+    goto ignore_bad_magic;
+  if (hdr.version != TCC_PCH_VERSION || hdr.header_size != sizeof(hdr))
+  {
+    tcc_warning("ignoring PCH '%s': unsupported format version", s1->pch_infile);
+    goto fail;
+  }
+  if (hdr.section_count != sizeof(section_kinds) / sizeof(section_kinds[0]))
+  {
+    tcc_warning("ignoring PCH '%s': unexpected section count", s1->pch_infile);
+    goto fail;
+  }
+  if (hdr.endianness != tcc_pch_host_endianness() || hdr.sizeof_int != sizeof(int) || hdr.long_size != LONG_SIZE ||
+      hdr.ldouble_size != LDOUBLE_SIZE || hdr.ptr_size != PTR_SIZE || hdr.tok_ident_value != TOK_IDENT)
+  {
+    if (s1->pch_verbose)
+      fprintf(stderr, "pch: ABI mismatch: endian=%u/%u sizeof_int=%u/%zu long=%u/%d ldouble=%u/%d ptr=%u/%d tok_ident=%u/%d\n",
+        hdr.endianness, tcc_pch_host_endianness(), hdr.sizeof_int, sizeof(int),
+        hdr.long_size, LONG_SIZE, hdr.ldouble_size, LDOUBLE_SIZE,
+        hdr.ptr_size, PTR_SIZE, hdr.tok_ident_value, TOK_IDENT);
+    tcc_warning("ignoring PCH '%s': ABI mismatch", s1->pch_infile);
+    goto fail;
+  }
+  {
+    uint64_t local_kw_hash = tcc_pch_hash_bytes(tcc_pch_hash_init(), tcc_keywords, sizeof(tcc_keywords));
+    if (hdr.keywords_hash != local_kw_hash)
+    {
+      if (s1->pch_verbose)
+        fprintf(stderr, "pch: keyword hash: pch=0x%016llx local=0x%016llx sizeof_keywords=%lu\n",
+          (unsigned long long)hdr.keywords_hash, (unsigned long long)local_kw_hash, (unsigned long)sizeof(tcc_keywords));
+      tcc_warning("ignoring PCH '%s': keyword table mismatch", s1->pch_infile);
+      goto fail;
+    }
+  }
+  builtin_token_delta = expected_builtin_count - (int)hdr.builtin_ident_count;
+  if (hdr.filetype != (uint32_t)(filetype & AFF_TYPE_MASK))
+  {
+    tcc_warning("ignoring PCH '%s': file type mismatch", s1->pch_infile);
+    goto fail;
+  }
+#if defined(TCC_TARGET_ARM) || defined(TCC_TARGET_ARM_THUMB)
+  if (hdr.float_abi != (uint32_t)s1->float_abi || hdr.fpu_type != (uint32_t)s1->fpu_type)
+  {
+    tcc_warning("ignoring PCH '%s': float ABI mismatch", s1->pch_infile);
+    goto fail;
+  }
+#endif
+  if (hdr.predefines_hash != tcc_pch_hash_predefines(s1, filetype))
+  {
+    if (s1->pch_verbose)
+      fprintf(stderr, "pch: predefines hash: pch=0x%016llx local=0x%016llx\n",
+        (unsigned long long)hdr.predefines_hash,
+        (unsigned long long)tcc_pch_hash_predefines(s1, filetype));
+    tcc_warning("ignoring PCH '%s': predefined macro state mismatch", s1->pch_infile);
+    goto fail;
+  }
+  if (hdr.include_path_hash != tcc_pch_hash_include_paths(s1))
+  {
+    if (s1->pch_verbose)
+      fprintf(stderr, "pch: include path hash: pch=0x%016llx local=0x%016llx\n",
+        (unsigned long long)hdr.include_path_hash,
+        (unsigned long long)tcc_pch_hash_include_paths(s1));
+    tcc_warning("ignoring PCH '%s': include path mismatch", s1->pch_infile);
+    goto fail;
+  }
+
+  pch = tcc_mallocz(sizeof(*pch));
+  pch->filename = tcc_strdup(s1->pch_infile);
+  pch->counter_delta = hdr.counter_delta;
+  pch->filetype = hdr.filetype;
+  pch->builtin_token_delta = builtin_token_delta;
+  pch->nb_idents = hdr.ident_count;
+  pch->nb_macros = hdr.macro_count;
+  pch->nb_macro_args = hdr.macro_arg_count;
+  pch->nb_replay_records = hdr.replay_count;
+  pch->nb_cached_includes = hdr.include_count;
+  pch->nb_dependencies = hdr.dependency_count;
+  pch->nb_pragma_libs = hdr.pragma_lib_count;
+
+  for (i = 0; i < (int)(sizeof(section_kinds) / sizeof(section_kinds[0])); ++i)
+  {
+    size_t end_off = (size_t)dirs[i].offset + dirs[i].size;
+    if (dirs[i].kind != section_kinds[i] || end_off < dirs[i].offset || end_off > raw_size)
+    {
+      tcc_warning("ignoring PCH '%s': malformed section directory", s1->pch_infile);
+      goto fail;
+    }
+  }
+
+  pch->strings_size = dirs[0].size;
+  pch->strings = pch->strings_size ? (char *)(raw + dirs[0].offset) : NULL;
+
+  if (!tcc_pch_section_expected_size(dirs[1].size, hdr.ident_count, sizeof(TCCPCHIdentRecord)) ||
+      !tcc_pch_section_expected_size(dirs[3].size, hdr.macro_count, sizeof(TCCPCHMacroRecord)) ||
+      !tcc_pch_section_expected_size(dirs[4].size, hdr.macro_arg_count, sizeof(TCCPCHMacroArgRecord)) ||
+      !tcc_pch_section_expected_size(dirs[5].size, hdr.replay_count, sizeof(TCCPCHReplayRecord)) ||
+      !tcc_pch_section_expected_size(dirs[6].size, hdr.include_count, sizeof(TCCPCHCachedIncludeRecord)) ||
+      !tcc_pch_section_expected_size(dirs[7].size, hdr.dependency_count, sizeof(TCCPCHDependencyRecord)) ||
+      !tcc_pch_section_expected_size(dirs[8].size, hdr.pragma_lib_count, sizeof(TCCPCHPragmaLibRecord)) ||
+      dirs[9].size != sizeof(TCCPCHManifestRecord) || (dirs[2].size & (sizeof(int) - 1)))
+  {
+    tcc_warning("ignoring PCH '%s': malformed section sizes", s1->pch_infile);
+    goto fail;
+  }
+
+  /* Point section pointers directly into the raw buffer to avoid
+     malloc+memcpy overhead for each section. */
+  if (hdr.ident_count)
+    pch->idents = (TCCPCHIdentRecord *)(raw + dirs[1].offset);
+  pch->token_blob_words = dirs[2].size / sizeof(int);
+  if (dirs[2].size)
+    pch->token_blob = (int *)(raw + dirs[2].offset);
+  if (hdr.macro_count)
+    pch->macros = (TCCPCHMacroRecord *)(raw + dirs[3].offset);
+  if (hdr.macro_arg_count)
+    pch->macro_args = (TCCPCHMacroArgRecord *)(raw + dirs[4].offset);
+  if (hdr.replay_count)
+    pch->replay_records = (TCCPCHReplayRecord *)(raw + dirs[5].offset);
+  if (hdr.include_count)
+    pch->cached_includes = (TCCPCHCachedIncludeRecord *)(raw + dirs[6].offset);
+  if (hdr.dependency_count)
+    pch->dependencies = (TCCPCHDependencyRecord *)(raw + dirs[7].offset);
+  if (hdr.pragma_lib_count)
+    pch->pragma_libs = (TCCPCHPragmaLibRecord *)(raw + dirs[8].offset);
+  memcpy(&manifest, raw + dirs[9].offset, sizeof(manifest));
+
+  if (!tcc_pch_validate_cstr_off(pch->strings, pch->strings_size, manifest.root_filename_off) ||
+      !tcc_pch_validate_cstr_off(pch->strings, pch->strings_size, manifest.generator_version_off))
+  {
+    tcc_warning("ignoring PCH '%s': malformed manifest strings", s1->pch_infile);
+    goto fail;
+  }
+  pch->root_filename = tcc_strdup(pch->strings + manifest.root_filename_off);
+  pch->generator_version = tcc_strdup(pch->strings + manifest.generator_version_off);
+
+  max_token = TOK_IDENT + hdr.builtin_ident_count + hdr.ident_count;
+  for (i = 0; i < pch->nb_idents; ++i)
+  {
+    TCCPCHIdentRecord *rec = &pch->idents[i];
+    if (rec->token != (uint32_t)(TOK_IDENT + hdr.builtin_ident_count + i) ||
+        !tcc_pch_validate_string(pch->strings, pch->strings_size, rec->string_off, rec->len))
+    {
+      tcc_warning("ignoring PCH '%s': malformed identifier table", s1->pch_infile);
+      goto fail;
+    }
+  }
+  for (i = 0; i < pch->nb_macro_args; ++i)
+  {
+    TCCPCHMacroArgRecord *arg = &pch->macro_args[i];
+    if (arg->token < TOK_IDENT || arg->token >= (uint32_t)max_token || arg->is_vaargs > 1)
+    {
+      tcc_warning("ignoring PCH '%s': malformed macro argument table", s1->pch_infile);
+      goto fail;
+    }
+  }
+  for (i = 0; i < pch->nb_macros; ++i)
+  {
+    TCCPCHMacroRecord *rec = &pch->macros[i];
+    if (rec->name_token < TOK_IDENT || rec->name_token >= (uint32_t)max_token ||
+        (rec->macro_type & ~(MACRO_FUNC | MACRO_JOIN)) != 0 ||
+        rec->arg_start + rec->arg_count > (uint32_t)pch->nb_macro_args ||
+        rec->tok_blob_off_words + rec->tok_blob_len_words > (uint32_t)pch->token_blob_words)
+    {
+      tcc_warning("ignoring PCH '%s': malformed macro table", s1->pch_infile);
+      goto fail;
+    }
+  }
+  for (i = 0; i < pch->nb_replay_records; ++i)
+  {
+    TCCPCHReplayRecord *rec = &pch->replay_records[i];
+    switch (rec->kind)
+    {
+    case TCC_PCH_REPLAY_TOKENS:
+      if (!rec->arg1 || rec->arg0 + rec->arg1 > (uint32_t)pch->token_blob_words)
+      {
+        tcc_warning("ignoring PCH '%s': malformed replay token range", s1->pch_infile);
+        goto fail;
+      }
+      break;
+    case TCC_PCH_REPLAY_PACK_SET:
+    case TCC_PCH_REPLAY_PACK_PUSH:
+      if (rec->arg0 > 16)
+      {
+        tcc_warning("ignoring PCH '%s': malformed replay pack record", s1->pch_infile);
+        goto fail;
+      }
+      break;
+    case TCC_PCH_REPLAY_PACK_POP:
+      break;
+    default:
+      tcc_warning("ignoring PCH '%s': unsupported replay record kind", s1->pch_infile);
+      goto fail;
+    }
+  }
+  for (i = 0; i < pch->nb_cached_includes; ++i)
+  {
+    TCCPCHCachedIncludeRecord *rec = &pch->cached_includes[i];
+    if (!tcc_pch_validate_cstr_off(pch->strings, pch->strings_size, rec->filename_off) ||
+        (rec->ifndef_macro != 0xffffffffu && (rec->ifndef_macro < TOK_IDENT || rec->ifndef_macro >= (uint32_t)max_token)))
+    {
+      tcc_warning("ignoring PCH '%s': malformed cached-include table", s1->pch_infile);
+      goto fail;
+    }
+  }
+  for (i = 0; i < pch->nb_dependencies; ++i)
+  {
+    TCCPCHDependencyRecord *rec = &pch->dependencies[i];
+    struct stat st;
+    const char *dep;
+
+    if (!tcc_pch_validate_cstr_off(pch->strings, pch->strings_size, rec->filename_off))
+    {
+      tcc_warning("ignoring PCH '%s': malformed dependency table", s1->pch_infile);
+      goto fail;
+    }
+    dep = pch->strings + rec->filename_off;
+    /* When mtime is zero the PCH was cross-generated; on a read-only
+       rootfs the files cannot change, so skip the expensive stat()
+       call and trust the stored values for the dependency hash. */
+    if (rec->mtime_sec != 0)
+    {
+      /* Dependency paths are stored normalized: sysroot-stripped for
+         system headers, or with {B} placeholder for tcc lib paths.
+         Resolve to real filesystem paths for stat(). */
+      char dep_buf[1024];
+      const char *dep_path = dep;
+      if (strncmp(dep, "{B}", 3) == 0) {
+        snprintf(dep_buf, sizeof(dep_buf), "%s%s", s1->tcc_lib_path, dep + 3);
+        dep_path = dep_buf;
+      }
+#ifdef CONFIG_SYSROOT
+      else {
+        static const char sysroot[] = CONFIG_SYSROOT;
+        if (sizeof(sysroot) > 2 && dep[0] == '/') {
+          snprintf(dep_buf, sizeof(dep_buf), "%s%s", sysroot, dep);
+          dep_path = dep_buf;
+        }
+      }
+#endif
+      if (stat(dep_path, &st) < 0)
+      {
+        tcc_warning("ignoring PCH '%s': dependency '%s' is missing", s1->pch_infile, dep);
+        goto fail;
+      }
+      if ((uint64_t)st.st_size != rec->size ||
+          (uint64_t)st.st_mtime != rec->mtime_sec ||
+          tcc_pch_stat_mtime_nsec(&st) != rec->mtime_nsec)
+      {
+        tcc_warning("ignoring PCH '%s': dependency '%s' changed", s1->pch_infile, dep);
+        goto fail;
+      }
+    }
+    dependency_hash = tcc_pch_hash_cstr(dependency_hash, dep);
+    dependency_hash = tcc_pch_hash_bytes(dependency_hash, &rec->size, sizeof(rec->size));
+    dependency_hash = tcc_pch_hash_bytes(dependency_hash, &rec->mtime_sec, sizeof(rec->mtime_sec));
+    dependency_hash = tcc_pch_hash_bytes(dependency_hash, &rec->mtime_nsec, sizeof(rec->mtime_nsec));
+  }
+  if (dependency_hash != hdr.dependency_hash)
+  {
+    if (s1->pch_verbose)
+      fprintf(stderr, "pch: dependency hash: pch=0x%016llx local=0x%016llx\n",
+        (unsigned long long)hdr.dependency_hash,
+        (unsigned long long)dependency_hash);
+    tcc_warning("ignoring PCH '%s': dependency hash mismatch", s1->pch_infile);
+    goto fail;
+  }
+  for (i = 0; i < pch->nb_pragma_libs; ++i)
+  {
+    if (!tcc_pch_validate_cstr_off(pch->strings, pch->strings_size, pch->pragma_libs[i].string_off))
+    {
+      tcc_warning("ignoring PCH '%s': malformed pragma-lib table", s1->pch_infile);
+      goto fail;
+    }
+  }
+
+  pch->raw = raw;
+  s1->pch = pch;
+  return 1;
+
+ignore_bad_magic:
+  tcc_warning("ignoring PCH '%s': bad magic", s1->pch_infile);
+fail:
+  if (fp)
+    fclose(fp);
+  tcc_free(raw);
+  tcc_pch_state_delete(pch);
+  return 0;
+}
+
+static int tcc_pch_apply(TCCState *s1)
+{
+  TCCPCHState *pch = s1->pch;
+  unsigned char *macro_present = NULL;
+  int *token_map = NULL;
+  int token_map_len;
+  int i;
+
+  if (!pch || pch->applied)
+    return 1;
+
+  token_map_len = s1->pch_ident_start - TOK_IDENT + pch->nb_idents;
+  token_map = tcc_mallocz(token_map_len * sizeof(*token_map));
+  for (i = 0; i < pch->nb_idents; ++i)
+  {
+    TCCPCHIdentRecord *rec = &pch->idents[i];
+    const char *name = tcc_pch_get_string(pch, rec->string_off);
+    int toknum;
+    int map_index = rec->token - TOK_IDENT + pch->builtin_token_delta;
+
+    if (!name || (unsigned)map_index >= (unsigned)token_map_len)
+      goto apply_fail;
+    toknum = tok_alloc(name, rec->len)->tok;
+    token_map[map_index] = toknum;
+  }
+
+  if (pch->token_blob_words)
+  {
+    int *remapped_blob = tcc_malloc(pch->token_blob_words * sizeof(int));
+    tcc_pch_remap_tokstream(remapped_blob, pch->token_blob, pch->token_blob_words, token_map, token_map_len);
+    /* token_blob aliases into pch->raw, so don't free it; raw is freed
+       with the pch state.  Just redirect the pointer. */
+    pch->token_blob = remapped_blob;
+  }
+  for (i = 0; i < pch->nb_macros; ++i)
+    pch->macros[i].name_token = tcc_pch_remap_token(token_map, token_map_len, pch->macros[i].name_token);
+  for (i = 0; i < pch->nb_macro_args; ++i)
+    pch->macro_args[i].token = tcc_pch_remap_token(token_map, token_map_len, pch->macro_args[i].token);
+  for (i = 0; i < pch->nb_cached_includes; ++i)
+    if (pch->cached_includes[i].ifndef_macro != 0xffffffffu)
+      pch->cached_includes[i].ifndef_macro =
+          tcc_pch_remap_token(token_map, token_map_len, pch->cached_includes[i].ifndef_macro);
+
+  if (!s1->pch_is_auto)
+  {
+    /* For explicit PCH the header is the first thing included, so
+       we can safely clear all macros not carried by the PCH.  For
+       auto-PCH other headers may have been included first -- their
+       macros (e.g.  INT_MAX from <limits.h>) must survive. */
+    macro_present = tcc_mallocz(tok_ident - TOK_IDENT);
+    for (i = 0; i < pch->nb_macros; ++i)
+      macro_present[pch->macros[i].name_token - TOK_IDENT] = 1;
+    for (i = TOK_IDENT; i < tok_ident; ++i)
+    {
+      Sym *s = define_find(i);
+      if (s && !macro_present[i - TOK_IDENT]
+          /* Preserve special predefined macros that are expanded at
+             preprocessing time and never captured in PCH files. */
+          && i != TOK___LINE__ && i != TOK___FILE__
+          && i != TOK___DATE__ && i != TOK___TIME__
+          && i != TOK___COUNTER__)
+        define_undef(s);
+    }
+    tcc_free(macro_present);
+    macro_present = NULL;
+  }
+
+  for (i = 0; i < pch->nb_macros; ++i)
+  {
+    TCCPCHMacroRecord *rec = &pch->macros[i];
+    Sym *first = NULL;
+    Sym **ps = &first;
+    uint32_t j;
+    int *body = NULL;
+    Sym *macro;
+
+    for (j = 0; j < rec->arg_count; ++j)
+    {
+      TCCPCHMacroArgRecord *arg_rec = &pch->macro_args[rec->arg_start + j];
+      Sym *arg = sym_push2(&define_stack, arg_rec->token | SYM_FIELD, arg_rec->is_vaargs, 0);
+      *ps = arg;
+      ps = &arg->next;
+    }
+    if (rec->tok_blob_len_words)
+    {
+      body = tcc_malloc(rec->tok_blob_len_words * sizeof(int));
+      memcpy(body, pch->token_blob + rec->tok_blob_off_words, rec->tok_blob_len_words * sizeof(int));
+    }
+    macro = sym_push2(&define_stack, rec->name_token, rec->macro_type, 0);
+    macro->d = body;
+    macro->next = first;
+    table_ident[rec->name_token - TOK_IDENT]->sym_define = macro;
+  }
+
+  if (!s1->pch_is_auto)
+  {
+    /* Explicit PCH: replace all cached includes with PCH state. */
+    dynarray_reset(&s1->cached_includes, &s1->nb_cached_includes);
+    memset(s1->cached_includes_hash, 0, sizeof s1->cached_includes_hash);
+  }
+  for (i = 0; i < pch->nb_cached_includes; ++i)
+  {
+    TCCPCHCachedIncludeRecord *rec = &pch->cached_includes[i];
+    CachedInclude *inc = search_cached_include(s1, tcc_pch_get_string(pch, rec->filename_off), 1);
+    inc->ifndef_macro = rec->ifndef_macro == 0xffffffffu ? 0 : rec->ifndef_macro;
+    inc->once = rec->once != 0;
+  }
+
+  dynarray_reset(&s1->pragma_libs, &s1->nb_pragma_libs);
+  for (i = 0; i < pch->nb_pragma_libs; ++i)
+    dynarray_add(&s1->pragma_libs, &s1->nb_pragma_libs, tcc_strdup(tcc_pch_get_string(pch, pch->pragma_libs[i].string_off)));
+
+  pp_counter += pch->counter_delta;
+  pch->applied = 1;
+  tcc_free(token_map);
+  return 1;
+
+apply_fail:
+  tcc_warning("ignoring PCH '%s': could not remap identifier table", pch->filename);
+  tcc_free(macro_present);
+  tcc_free(token_map);
+  return 0;
+}
+
+static void tcc_pch_finish_replay(TCCState *s1)
+{
+  TCCPCHState *pch = s1->pch;
+  int free_auto = s1->pch_is_auto;
+
+  if (!pch)
+    return;
+  pch->replay_active = 0;
+  pch->replay_ptr = NULL;
+  pch->replay_end = NULL;
+  pch->replay_index = pch->nb_replay_records;
+  if (pch->replay_file == file)
+  {
+    tcc_debug_eincl(s1);
+    tcc_close();
+    if (s1->include_stack_ptr != s1->include_stack)
+      s1->include_stack_ptr--;
+  }
+  pch->replay_file = NULL;
+  if (free_auto)
+    tcc_pch_free(s1);
+}
+
+static void tcc_pch_start_replay(TCCState *s1, const char *filename, int include_next_index)
+{
+  TCCPCHState *pch = s1->pch;
+
+  if (s1->include_stack_ptr >= s1->include_stack + INCLUDE_STACK_SIZE)
+    tcc_error("#include recursion too deep");
+
+  tcc_open_bf(s1, filename, 0);
+  *s1->include_stack_ptr++ = file->prev;
+  file->include_next_index = include_next_index;
+  pch->replay_file = file;
+
+  pch->replay_active = 1;
+  pch->replay_index = 0;
+  pch->replay_ptr = NULL;
+  pch->replay_end = NULL;
+
+  tcc_debug_bincl(s1);
+}
+
+static int tcc_pch_next_replay_token(TCCState *s1)
+{
+  TCCPCHState *pch = s1->pch;
+
+  while (pch && pch->replay_active && !macro_ptr)
+  {
+    if (pch->replay_index >= pch->nb_replay_records)
+    {
+      tcc_pch_finish_replay(s1);
+      return 1;
+    }
+
+    switch (pch->replay_records[pch->replay_index].kind)
+    {
+    case TCC_PCH_REPLAY_TOKENS:
+    {
+      TokenString *str = tok_str_alloc();
+      const int *src = pch->token_blob + pch->replay_records[pch->replay_index].arg0;
+      int len = pch->replay_records[pch->replay_index].arg1;
+      tok_str_add_words(str, src, len);
+      if (str->len && tok_str_buf(str)[str->len - 1] == TOK_EOF)
+        tok_str_buf(str)[str->len - 1] = 0;
+      else
+        tok_str_add(str, 0);
+      begin_macro(str, 1);
+      break;
+    }
+    case TCC_PCH_REPLAY_PACK_SET:
+      *s1->pack_stack_ptr = pch->replay_records[pch->replay_index].arg0;
+      break;
+    case TCC_PCH_REPLAY_PACK_PUSH:
+      if (s1->pack_stack_ptr >= s1->pack_stack + PACK_STACK_SIZE - 1)
+        tcc_error("out of pack stack during PCH replay");
+      *++s1->pack_stack_ptr = pch->replay_records[pch->replay_index].arg0;
+      break;
+    case TCC_PCH_REPLAY_PACK_POP:
+      if (s1->pack_stack_ptr <= s1->pack_stack)
+        tcc_error("out of pack stack during PCH replay");
+      s1->pack_stack_ptr--;
+      break;
+    default:
+      tcc_error("unsupported PCH replay record");
+    }
+    ++pch->replay_index;
+    return 1;
+  }
+  return 0;
+}
+
+static int tcc_pch_begin_include(TCCState *s1, const char *filename, int include_next_index)
+{
+  if (!s1->pch || s1->pch->consumed ||
+      (PATHCMP(filename, s1->pch->root_filename) && normalized_PATHCMP(filename, s1->pch->root_filename)))
+    return 0;
+  if (macro_ptr || unget_buf.len)
+  {
+    tcc_warning("ignoring PCH '%s': include is not at a clean preprocessor boundary", s1->pch->filename);
+    tcc_pch_free(s1);
+    return 0;
+  }
+  if (!tcc_pch_apply(s1))
+  {
+    tcc_pch_free(s1);
+    return 0;
+  }
+  if (s1->gen_deps)
+    dynarray_add(&s1->target_deps, &s1->nb_target_deps, tcc_strdup(filename));
+  s1->pch->consumed = 1;
+  tcc_pch_start_replay(s1, filename, include_next_index);
+  return 1;
+}
+
+static int tcc_pch_write_file(TCCState *s1, const char *root_filename, int filetype)
+{
+  static const uint32_t section_kinds[] = {
+      TCC_PCH_SEC_STRINGS,        TCC_PCH_SEC_IDENTS,      TCC_PCH_SEC_TOKEN_BLOBS,   TCC_PCH_SEC_MACROS,
+      TCC_PCH_SEC_MACRO_ARGS,     TCC_PCH_SEC_REPLAY_RECORDS, TCC_PCH_SEC_CACHED_INCLUDES,
+      TCC_PCH_SEC_DEPENDENCIES,   TCC_PCH_SEC_PRAGMA_LIBS, TCC_PCH_SEC_MANIFEST,
+  };
+  CString sections[sizeof(section_kinds) / sizeof(section_kinds[0])];
+  TCCPCHFileHeader hdr;
+  TCCPCHSectionHeader dirs[sizeof(section_kinds) / sizeof(section_kinds[0])];
+  TCCPCHManifestRecord manifest;
+  uint64_t dependency_hash = tcc_pch_hash_init();
+  FILE *fp = NULL;
+  uint32_t root_filename_off;
+  int ret = -1;
+  int i;
+
+  if (!s1->outfile)
+  {
+    tcc_error_noabort("missing output filename for -generate-pch");
+    return -1;
+  }
+
+  for (i = 0; i < (int)(sizeof(sections) / sizeof(sections[0])); ++i)
+    cstr_new(&sections[i]);
+
+  {
+    char *resolved_root = realpath(root_filename, NULL);
+    const char *stored_root = resolved_root ? resolved_root : root_filename;
+    stored_root = tcc_pch_strip_sysroot(stored_root);
+    root_filename_off = tcc_pch_add_string(&sections[0], stored_root);
+    libc_free(resolved_root);
+  }
+  manifest.root_filename_off = root_filename_off;
+  manifest.generator_version_off = tcc_pch_add_string(&sections[0], TCC_VERSION);
+
+  for (i = s1->pch_ident_start; i < tok_ident; ++i)
+  {
+    TCCPCHIdentRecord rec;
+    TokenSym *ts = table_ident[i - TOK_IDENT];
+
+    rec.token = i;
+    rec.string_off = tcc_pch_add_string(&sections[0], ts->str);
+    rec.len = ts->len;
+    tcc_pch_append_bytes(&sections[1], &rec, sizeof(rec));
+  }
+
+  tcc_pch_append_bytes(&sections[2], tok_str_buf(&s1->pch_token_blob), s1->pch_token_blob.len * sizeof(int));
+
+  for (i = TOK_IDENT; i < tok_ident; ++i)
+  {
+    Sym *macro = define_find(i);
+    TCCPCHMacroRecord rec;
+    Sym *arg;
+    int arg_count = 0;
+    int words;
+
+    if (!macro || !macro->d)
+      continue;
+
+    for (arg = macro->next; arg; arg = arg->next)
+    {
+      TCCPCHMacroArgRecord arg_rec;
+
+      arg_rec.token = arg->v & ~SYM_FIELD;
+      arg_rec.is_vaargs = arg->r;
+      tcc_pch_append_bytes(&sections[4], &arg_rec, sizeof(arg_rec));
+      ++arg_count;
+    }
+
+    words = tcc_pch_tokstream_words(macro->d);
+    rec.name_token = i;
+    rec.macro_type = macro->type.t & (MACRO_FUNC | MACRO_JOIN);
+    rec.arg_start = sections[4].size / sizeof(TCCPCHMacroArgRecord) - arg_count;
+    rec.arg_count = arg_count;
+    rec.tok_blob_off_words = sections[2].size / sizeof(int);
+    rec.tok_blob_len_words = words;
+    tcc_pch_append_bytes(&sections[2], macro->d, words * sizeof(int));
+    tcc_pch_append_bytes(&sections[3], &rec, sizeof(rec));
+  }
+
+  if (s1->nb_pch_replay_records)
+    tcc_pch_append_bytes(&sections[5], s1->pch_replay_records, s1->nb_pch_replay_records * sizeof(*s1->pch_replay_records));
+
+  for (i = 0; i < s1->nb_cached_includes; ++i)
+  {
+    TCCPCHCachedIncludeRecord rec;
+    CachedInclude *inc = s1->cached_includes[i];
+
+    rec.filename_off = tcc_pch_add_string(&sections[0], tcc_pch_strip_sysroot(inc->filename));
+    rec.ifndef_macro = inc->ifndef_macro ? inc->ifndef_macro : 0xffffffffu;
+    rec.once = inc->once;
+    tcc_pch_append_bytes(&sections[6], &rec, sizeof(rec));
+  }
+
+  for (i = 0; i < s1->nb_target_deps; ++i)
+  {
+    struct stat st;
+    TCCPCHDependencyRecord rec;
+    int dup = 0;
+    int j;
+
+    for (j = 0; j < i; ++j)
+      if (!strcmp(s1->target_deps[i], s1->target_deps[j]))
+      {
+        dup = 1;
+        break;
+      }
+    if (dup)
+      continue;
+    if (stat(s1->target_deps[i], &st) < 0)
+    {
+      tcc_error_noabort("could not stat '%s' for PCH generation", s1->target_deps[i]);
+      goto cleanup;
+    }
+    {
+      char *resolved_dep = realpath(s1->target_deps[i], NULL);
+      const char *dep_name = resolved_dep ? resolved_dep : s1->target_deps[i];
+      char norm_buf[1024];
+      char *resolved_lib = s1->tcc_lib_path ? realpath(s1->tcc_lib_path, NULL) : NULL;
+      size_t resolved_lib_len = resolved_lib ? strlen(resolved_lib) : 0;
+      dep_name = tcc_pch_normalize_for_hash(dep_name, resolved_lib, resolved_lib_len,
+                                             norm_buf, sizeof(norm_buf));
+      rec.filename_off = tcc_pch_add_string(&sections[0], dep_name);
+      rec.reserved = 0;
+      rec.size = st.st_size;
+      rec.mtime_sec = 0;
+      rec.mtime_nsec = 0;
+      dependency_hash = tcc_pch_hash_cstr(dependency_hash, dep_name);
+      libc_free(resolved_lib);
+      libc_free(resolved_dep);
+    }
+    dependency_hash = tcc_pch_hash_bytes(dependency_hash, &rec.size, sizeof(rec.size));
+    dependency_hash = tcc_pch_hash_bytes(dependency_hash, &rec.mtime_sec, sizeof(rec.mtime_sec));
+    dependency_hash = tcc_pch_hash_bytes(dependency_hash, &rec.mtime_nsec, sizeof(rec.mtime_nsec));
+    tcc_pch_append_bytes(&sections[7], &rec, sizeof(rec));
+  }
+
+  for (i = 0; i < s1->nb_pragma_libs; ++i)
+  {
+    TCCPCHPragmaLibRecord rec;
+
+    rec.string_off = tcc_pch_add_string(&sections[0], s1->pragma_libs[i]);
+    tcc_pch_append_bytes(&sections[8], &rec, sizeof(rec));
+  }
+
+  tcc_pch_append_bytes(&sections[9], &manifest, sizeof(manifest));
+
+  memset(&hdr, 0, sizeof(hdr));
+  hdr.magic = TCC_PCH_MAGIC;
+  hdr.version = TCC_PCH_VERSION;
+  hdr.header_size = sizeof(hdr);
+  hdr.section_count = sizeof(section_kinds) / sizeof(section_kinds[0]);
+  hdr.endianness = tcc_pch_host_endianness();
+  hdr.sizeof_int = sizeof(int);
+  hdr.long_size = LONG_SIZE;
+  hdr.ldouble_size = LDOUBLE_SIZE;
+  hdr.ptr_size = PTR_SIZE;
+  hdr.tok_ident_value = TOK_IDENT;
+  hdr.builtin_ident_count = s1->pch_ident_start - TOK_IDENT;
+  hdr.keywords_hash = tcc_pch_hash_bytes(tcc_pch_hash_init(), tcc_keywords, sizeof(tcc_keywords));
+  hdr.filetype = filetype & AFF_TYPE_MASK;
+#if defined(TCC_TARGET_ARM) || defined(TCC_TARGET_ARM_THUMB)
+  hdr.float_abi = s1->float_abi;
+  hdr.fpu_type = s1->fpu_type;
+#endif
+  hdr.predefines_hash = tcc_pch_hash_predefines(s1, filetype);
+  hdr.include_path_hash = tcc_pch_hash_include_paths(s1);
+  hdr.dependency_hash = dependency_hash;
+  hdr.ident_count = sections[1].size / sizeof(TCCPCHIdentRecord);
+  hdr.macro_count = sections[3].size / sizeof(TCCPCHMacroRecord);
+  hdr.macro_arg_count = sections[4].size / sizeof(TCCPCHMacroArgRecord);
+  hdr.replay_count = sections[5].size / sizeof(TCCPCHReplayRecord);
+  hdr.include_count = sections[6].size / sizeof(TCCPCHCachedIncludeRecord);
+  hdr.pragma_lib_count = sections[8].size / sizeof(TCCPCHPragmaLibRecord);
+  hdr.dependency_count = sections[7].size / sizeof(TCCPCHDependencyRecord);
+  hdr.counter_delta = pp_counter;
+
+  {
+    uint32_t off = sizeof(hdr) + sizeof(dirs);
+
+    for (i = 0; i < (int)(sizeof(dirs) / sizeof(dirs[0])); ++i)
+    {
+      dirs[i].kind = section_kinds[i];
+      dirs[i].offset = off;
+      dirs[i].size = sections[i].size;
+      off += sections[i].size;
+    }
+  }
+
+  fp = fopen(s1->outfile, "wb");
+  if (!fp)
+  {
+    tcc_error_noabort("could not write '%s'", s1->outfile);
+    goto cleanup;
+  }
+  if (1 != fwrite(&hdr, sizeof(hdr), 1, fp) || 1 != fwrite(dirs, sizeof(dirs), 1, fp))
+  {
+    tcc_error_noabort("could not write '%s'", s1->outfile);
+    goto cleanup;
+  }
+  for (i = 0; i < (int)(sizeof(sections) / sizeof(sections[0])); ++i)
+  {
+    if (sections[i].size && fwrite(sections[i].data, sections[i].size, 1, fp) != 1)
+    {
+      tcc_error_noabort("could not write '%s'", s1->outfile);
+      goto cleanup;
+    }
+  }
+  if (fclose(fp) != 0)
+  {
+    fp = NULL;
+    tcc_error_noabort("could not finalize '%s'", s1->outfile);
+    goto cleanup;
+  }
+  fp = NULL;
+  ret = 0;
+
+cleanup:
+  if (fp)
+    fclose(fp);
+  if (ret < 0)
+    remove(s1->outfile);
+  for (i = 0; i < (int)(sizeof(sections) / sizeof(sections[0])); ++i)
+    cstr_free(&sections[i]);
+  return ret;
+}
+
+ST_FUNC int tcc_pch_generate(TCCState *s1, const char *filename, int filetype)
+{
+  BufferedFile *root_file;
+  const char *root_filename;
+
+  (void)filename;
+  if (filetype & (AFF_TYPE_ASM | AFF_TYPE_ASMPP))
+  {
+    tcc_error_noabort("PCH generation only supports C headers");
+    return -1;
+  }
+
+  root_file = s1->include_stack_ptr != s1->include_stack ? s1->include_stack[0] : file;
+  root_filename = root_file->true_filename;
+  dynarray_add(&s1->target_deps, &s1->nb_target_deps, tcc_strdup(root_filename));
+
+  parse_flags = PARSE_FLAG_PREPROCESS | PARSE_FLAG_TOK_NUM | PARSE_FLAG_TOK_STR;
+  tok_str_new(&s1->pch_token_blob);
+  s1->pch_replay_token_start = 0;
+
+  for (;;)
+  {
+    next();
+    if (tok == TOK_EOF)
+      break;
+    if (!tcc_pch_in_root_closure(file))
+      continue;
+    tok_str_add_tok(&s1->pch_token_blob);
+  }
+
+  tok_str_add(&s1->pch_token_blob, TOK_EOF);
+  tcc_pch_flush_replay_tokens(s1);
+
+  if (s1->pch_macro_depth != 0)
+  {
+    tcc_error_noabort("PCH generation requires balanced #pragma push_macro/pop_macro");
+    return -1;
+  }
+  return tcc_pch_write_file(s1, root_filename, filetype);
 }
 
 /* ------------------------------------------------------------------------- */

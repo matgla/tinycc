@@ -33,6 +33,9 @@ def test_add_imm():
 def test_adr():
     utils.perform_test_for_file("test_adr.S")
 
+def test_adr_extern_label():
+    utils.perform_test_for_file("adr_extern_label.S")
+
 def test_bfc():
     utils.perform_test_for_file("test_bfc.S")
 
@@ -125,6 +128,15 @@ def test_orr_reg():
 
 def test_pkhbt_imm():
     utils.perform_test_for_file("test_pkhbt.S")
+
+def test_uadd8():
+    utils.perform_test_for_file("test_uadd8.S")
+
+def test_usub8():
+    utils.perform_test_for_file("test_usub8.S")
+
+def test_sel():
+    utils.perform_test_for_file("test_sel.S")
 
 def test_pld_literal():
     utils.perform_test_for_file("test_pld_literal.S")

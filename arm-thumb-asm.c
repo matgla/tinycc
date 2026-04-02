@@ -27,7 +27,32 @@
 #include <ctype.h>
 #include <string.h>
 
-#include "arm-thumb-opcodes.h"
+#include "arch/arm/thumb/thop_adr.h"
+#include "arch/arm/thumb/thop_alu_imm.h"
+#include "arch/arm/thumb/thop_alu_reg.h"
+#include "arch/arm/thumb/thop_bitfield.h"
+#include "arch/arm/thumb/thop_block.h"
+#include "arch/arm/thumb/thop_branch.h"
+#include "arch/arm/thumb/thop_cmp.h"
+#include "arch/arm/thumb/thop_dsp.h"
+#include "arch/arm/thumb/thop_extend.h"
+#include "arch/arm/thumb/thop_ldaex.h"
+#include "arch/arm/thumb/thop_ldrd.h"
+#include "arch/arm/thumb/thop_ldrex.h"
+#include "arch/arm/thumb/thop_mem_exclusive.h"
+#include "arch/arm/thumb/thop_mem_imm.h"
+#include "arch/arm/thumb/thop_mem_reg.h"
+#include "arch/arm/thumb/thop_mem_unpriv.h"
+#include "arch/arm/thumb/thop_mov.h"
+#include "arch/arm/thumb/thop_mrs.h"
+#include "arch/arm/thumb/thop_mul.h"
+#include "arch/arm/thumb/thop_mvn.h"
+#include "arch/arm/thumb/thop_pld.h"
+#include "arch/arm/thumb/thop_rev.h"
+#include "arch/arm/thumb/thop_system.h"
+#include "arch/arm/thumb/thop_tbb.h"
+#include "arch/arm/thumb/thop_vfp.h"
+#include "arch/arm/thumb/thumb.h"
 #include "tcc.h"
 #include "tccir.h"
 
@@ -1547,13 +1572,13 @@ thumb_opcode thumb_generate_opcode_for_data_processing(int token, thumb_shift sh
       {
         if (token == TOK_ASM_addw)
         {
-          return th_add_sp_imm_t4(ops[0].reg, ops[2].e.v, setflags, encoding);
+          return th_addw(ops[0].reg, R_SP, ops[2].e.v);
         }
-        return th_add_sp_imm(ops[0].reg, ops[2].e.v, setflags, encoding);
+        return th_add_imm(ops[0].reg, R_SP, ops[2].e.v, setflags, encoding);
       }
       if (token == TOK_ASM_addw)
       {
-        return th_add_imm_t4(ops[0].reg, ops[1].reg, ops[2].e.v);
+        return th_addw(ops[0].reg, ops[1].reg, ops[2].e.v);
       }
 
       if (token == TOK_ASM_add && thumb_conditional_scope == 0)
@@ -1568,10 +1593,6 @@ thumb_opcode thumb_generate_opcode_for_data_processing(int token, thumb_shift sh
 
     if (thumb_operand_is_register(ops[2].type))
     {
-      if (ops[1].reg == R_SP)
-      {
-        return th_add_sp_reg(ops[0].reg, ops[2].reg, setflags, encoding, shift);
-      }
       return th_add_reg(ops[0].reg, ops[1].reg, ops[2].reg, setflags, shift, encoding);
     }
   }
@@ -1599,7 +1620,7 @@ thumb_opcode thumb_generate_opcode_for_data_processing(int token, thumb_shift sh
   {
     if (thumb_operand_is_immediate(ops[2].type))
     {
-      return th_cmp_imm(0, ops[1].reg, ops[2].e.v, FLAGS_BEHAVIOUR_SET, encoding);
+      return th_cmp_imm(ops[1].reg, ops[2].e.v, FLAGS_BEHAVIOUR_SET, encoding);
     }
     return th_cmp_reg(0, ops[1].reg, ops[2].reg, FLAGS_BEHAVIOUR_SET, shift, encoding);
   }
@@ -1609,7 +1630,7 @@ thumb_opcode thumb_generate_opcode_for_data_processing(int token, thumb_shift sh
 
     if (thumb_operand_is_immediate(ops[2].type))
     {
-      return th_cmn_imm(ops[1].reg, ops[2].e.v);
+      return th_cmn_imm(ops[1].reg, ops[2].e.v, FLAGS_BEHAVIOUR_SET, encoding);
     }
 
     if (thumb_operand_is_register(ops[2].type))
@@ -1618,7 +1639,7 @@ thumb_opcode thumb_generate_opcode_for_data_processing(int token, thumb_shift sh
       {
         encoding = ENFORCE_ENCODING_32BIT;
       }
-      return th_cmn_reg(ops[1].reg, ops[2].reg, shift, encoding);
+      return th_cmn_reg(ops[1].reg, ops[2].reg, FLAGS_BEHAVIOUR_SET, shift, encoding);
     }
   }
   case TOK_ASM_eors:
@@ -1726,13 +1747,13 @@ thumb_opcode thumb_generate_opcode_for_data_processing(int token, thumb_shift sh
       {
         if (token == TOK_ASM_subw)
         {
-          return th_sub_sp_imm_t3(ops[0].reg, ops[2].e.v, setflags, encoding);
+          return th_subw(ops[0].reg, R_SP, ops[2].e.v);
         }
-        return th_sub_sp_imm(ops[0].reg, ops[2].e.v, setflags, encoding);
+        return th_sub_imm(ops[0].reg, R_SP, ops[2].e.v, setflags, encoding);
       }
       if (token == TOK_ASM_subw)
       {
-        return th_sub_imm_t4(ops[0].reg, ops[1].reg, ops[2].e.v);
+        return th_subw(ops[0].reg, ops[1].reg, ops[2].e.v);
       }
 
       if (token == TOK_ASM_sub && thumb_conditional_scope == 0)
@@ -1749,7 +1770,7 @@ thumb_opcode thumb_generate_opcode_for_data_processing(int token, thumb_shift sh
     {
       if (ops[1].reg == R_SP)
       {
-        return th_sub_sp_reg(ops[0].reg, ops[2].reg, setflags, shift, encoding);
+        return th_sub_reg(ops[0].reg, R_SP, ops[2].reg, setflags, shift, encoding);
       }
       return th_sub_reg(ops[0].reg, ops[1].reg, ops[2].reg, setflags, shift, encoding);
     }
@@ -1759,13 +1780,19 @@ thumb_opcode thumb_generate_opcode_for_data_processing(int token, thumb_shift sh
   case TOK_ASM_sxth:
     return th_sxth(ops[1].reg, ops[2].reg, shift, encoding);
   case TOK_ASM_teq:
-    return th_teq(ops[1].reg, ops[2].e.v);
+    return th_teq_imm(ops[1].reg, ops[2].e.v, FLAGS_BEHAVIOUR_SET, encoding);
   case TOK_ASM_tst:
     if (thumb_operand_is_register(ops[2].type))
-      return th_tst_reg(ops[1].reg, ops[2].reg, shift, encoding);
-    return th_tst_imm(ops[1].reg, ops[2].e.v);
+      return th_tst_reg(ops[1].reg, ops[2].reg, FLAGS_BEHAVIOUR_SET, shift, encoding);
+    return th_tst_imm(ops[1].reg, ops[2].e.v, FLAGS_BEHAVIOUR_SET, encoding);
   case TOK_ASM_udiv:
     return th_udiv(ops[0].reg, ops[1].reg, ops[2].reg);
+  case TOK_ASM_uadd8:
+    return th_uadd8(ops[0].reg, ops[1].reg, ops[2].reg);
+  case TOK_ASM_usub8:
+    return th_usub8(ops[0].reg, ops[1].reg, ops[2].reg);
+  case TOK_ASM_sel:
+    return th_sel(ops[0].reg, ops[1].reg, ops[2].reg);
   case TOK_ASM_uxtb:
     return th_uxtb(ops[1].reg, ops[2].reg, shift, encoding);
   case TOK_ASM_uxth:
@@ -1822,7 +1849,7 @@ static thumb_opcode thumb_single_memory_transfer_literal_opcode(TCCState *s1, in
   case TOK_ASM_ldrb:
     return th_ldrb_imm(op0.reg, R_PC, jump_addr, puw, encoding);
   case TOK_ASM_ldrd:
-    return th_ldrd_imm(op0.reg, op1.reg, R_PC, jump_addr, puw, encoding);
+    return th_ldrd_imm(op0.reg, op1.reg, R_PC, jump_addr, puw);
   case TOK_ASM_ldrh:
     return th_ldrh_imm(op0.reg, R_PC, jump_addr, puw, encoding);
   case TOK_ASM_ldrsb:
@@ -1830,7 +1857,7 @@ static thumb_opcode thumb_single_memory_transfer_literal_opcode(TCCState *s1, in
   case TOK_ASM_ldrsh:
     return th_ldrsh_imm(op0.reg, R_PC, jump_addr, puw, encoding);
   case TOK_ASM_strd:
-    return th_strd_imm(op0.reg, op1.reg, R_PC, jump_addr, puw, encoding);
+    return th_strd_imm(op0.reg, op1.reg, R_PC, jump_addr, puw);
   };
   return (thumb_opcode){0, 0};
 }
@@ -2119,7 +2146,7 @@ static void thumb_single_memory_transfer_opcode(TCCState *s1, int token)
         thumb_emit_opcode(th_ldrb_imm(ops[0].reg, ops[1].reg, imm, puw, encoding));
         return;
       case TOK_ASM_ldrd:
-        thumb_emit_opcode(th_ldrd_imm(ops[0].reg, op2reg.reg, ops[1].reg, imm, puw, encoding));
+        thumb_emit_opcode(th_ldrd_imm(ops[0].reg, op2reg.reg, ops[1].reg, imm, puw));
         return;
       case TOK_ASM_ldrex:
         thumb_emit_opcode(th_ldrex(ops[0].reg, ops[1].reg, imm));
@@ -2146,7 +2173,7 @@ static void thumb_single_memory_transfer_opcode(TCCState *s1, int token)
         thumb_emit_opcode(th_strb_imm(ops[0].reg, ops[1].reg, imm, puw, encoding));
         return;
       case TOK_ASM_strd:
-        thumb_emit_opcode(th_strd_imm(ops[0].reg, op2reg.reg, ops[1].reg, imm, puw, encoding));
+        thumb_emit_opcode(th_strd_imm(ops[0].reg, op2reg.reg, ops[1].reg, imm, puw));
         return;
       case TOK_ASM_strex:
         thumb_emit_opcode(th_strex(ops[0].reg, op2reg.reg, ops[1].reg, imm));
@@ -3413,6 +3440,9 @@ ST_FUNC void asm_opcode(TCCState *s1, int token)
   case TOK_ASM_teq:
   case TOK_ASM_tst:
   case TOK_ASM_udiv:
+  case TOK_ASM_uadd8:
+  case TOK_ASM_usub8:
+  case TOK_ASM_sel:
   case TOK_ASM_uxtb:
   case TOK_ASM_uxth:
     return thumb_data_processing_opcode(s1, token);

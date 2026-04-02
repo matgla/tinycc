@@ -24,14 +24,6 @@
 
 #include "tccyaff.h"
 
-/* Debug output for YAFF local relocations - disabled by default
- * Enable with: -DYAFF_DEBUG_ENABLED or #define YAFF_DEBUG_ENABLED */
-#ifdef YAFF_DEBUG_ENABLED
-#define YAFF_DEBUG(...) fprintf(stderr, __VA_ARGS__)
-#else
-#define YAFF_DEBUG(...) ((void)0)
-#endif
-
 #define TCC_YAFF_MAX_SYMBOL_ENTRY_SIZE 255
 
 #define SHF_DYNSYM 0x40000000
@@ -135,8 +127,17 @@ ST_FUNC int tcc_load_yaff(TCCState *s1, int fd, const char *filename, int level)
     {
       return tcc_error_noabort("symbol entry too long");
     }
-    set_elf_sym(s1->dynsymtab_section, entry->offset, 1, (entry->weak ? STB_WEAK : STB_GLOBAL) << 4, STV_DEFAULT, 1,
-                entry->name);
+    {
+      /* Use STT_FUNC for code symbols so PLT entries are created correctly.
+         Keep STT_NOTYPE for data symbols to avoid triggering R_ARM_COPY in
+         bind_exe_dynsyms — YAFF resolves data imports via GOT at load time,
+         so BSS copies are unnecessary and would break import/export
+         classification in the YAFF writer. */
+      int sym_type = entry->section == YAFF_SECTION_CODE ? STT_FUNC : STT_NOTYPE;
+      set_elf_sym(s1->dynsymtab_section, entry->offset, 1,
+                  ELFW(ST_INFO)(entry->weak ? STB_WEAK : STB_GLOBAL, sym_type),
+                  STV_DEFAULT, 1, entry->name);
+    }
     offset += sizeof(uint32_t) + len + 1;
     offset = tcc_yaff_align(&header, offset);
   }
@@ -170,11 +171,11 @@ static int tcc_yaff_write_local_relocations(TCCState *s1, FILE *f)
 
   if (!s1->got || !s1->got->reloc)
   {
-    YAFF_DEBUG("[YAFF] no GOT or no GOT relocs (got=%p, reloc=%p)\n", s1->got, s1->got ? s1->got->reloc : NULL);
+    LOG_YAFF("no GOT or no GOT relocs (got=%p, reloc=%p)", s1->got, s1->got ? s1->got->reloc : NULL);
     return 0;
   }
 
-  YAFF_DEBUG("[YAFF] scanning .rel.got: got->sh_addr=0x%x, text=0x%x..0x%x, rodata=0x%x..0x%x\n",
+  LOG_YAFF("scanning .rel.got: got->sh_addr=0x%x, text=0x%x..0x%x, rodata=0x%x..0x%x",
              (unsigned)s1->got->sh_addr, (unsigned)text_section->sh_addr,
              (unsigned)(text_section->sh_addr + text_section->sh_size), (unsigned)rodata_section->sh_addr,
              (unsigned)(rodata_section->sh_addr + rodata_section->sh_size));
@@ -182,7 +183,7 @@ static int tcc_yaff_write_local_relocations(TCCState *s1, FILE *f)
   for_each_elem(s1->got->reloc, 0, rel, ElfW_Rel)
   {
     int rtype = ELFW(R_TYPE)(rel->r_info);
-    YAFF_DEBUG("[YAFF]   rel: r_offset=0x%x, type=%d, sym=%d\n", (unsigned)rel->r_offset, rtype,
+    LOG_YAFF("rel: r_offset=0x%x, type=%d, sym=%d", (unsigned)rel->r_offset, rtype,
                ELFW(R_SYM)(rel->r_info));
 
     if (rtype != R_RELATIVE)
@@ -195,7 +196,7 @@ static int tcc_yaff_write_local_relocations(TCCState *s1, FILE *f)
     /* Symbol type saved by fill_local_got_entries() in the second word */
     uint32_t sym_type = read32le(s1->got->data + got_offset + PTR_SIZE);
 
-    YAFF_DEBUG("[YAFF]   R_RELATIVE: got_offset=0x%x, sym_value=0x%x, sym_type=%u\n", got_offset, sym_value, sym_type);
+    LOG_YAFF("R_RELATIVE: got_offset=0x%x, sym_value=0x%x, sym_type=%u", got_offset, sym_value, sym_type);
 
     /* Determine which section this address belongs to */
     int section;
@@ -215,9 +216,14 @@ static int tcc_yaff_write_local_relocations(TCCState *s1, FILE *f)
       section = YAFF_SECTION_DATA;
       target_offset = sym_value - data_section->sh_addr + rodata_section->sh_size;
     }
+    else if (sym_value >= bss_section->sh_addr && sym_value < bss_section->sh_addr + bss_section->sh_size)
+    {
+      section = YAFF_SECTION_DATA;
+      target_offset = sym_value - bss_section->sh_addr + rodata_section->sh_size + data_section->sh_size;
+    }
     else
     {
-      YAFF_DEBUG("[YAFF]   WARNING: sym_value 0x%x doesn't fall in any known section!\n", sym_value);
+      LOG_YAFF("WARNING: sym_value 0x%x doesn't fall in any known section!", sym_value);
       section = YAFF_SECTION_DATA;
       target_offset = sym_value;
     }
@@ -229,11 +235,11 @@ static int tcc_yaff_write_local_relocations(TCCState *s1, FILE *f)
        the GOT data and set the Thumb bit for code addresses. */
     if (section == YAFF_SECTION_CODE && sym_type != STT_FUNC)
     {
-      YAFF_DEBUG("[YAFF]   skipping non-function code address (sym_type=%u) for GOT[%u]\n", sym_type, got_offset / 8);
+      LOG_YAFF("skipping non-function code address (sym_type=%u) for GOT[%u]", sym_type, got_offset / 8);
       continue;
     }
 
-    YAFF_DEBUG("[YAFF]   -> section=%s, index=%u, target_offset=0x%x\n", section == YAFF_SECTION_CODE ? "CODE" : "DATA",
+    LOG_YAFF("-> section=%s, index=%u, target_offset=0x%x", section == YAFF_SECTION_CODE ? "CODE" : "DATA",
                got_offset / 8, target_offset);
 
     YaffLocalRelocationEntry entry = {
@@ -245,7 +251,7 @@ static int tcc_yaff_write_local_relocations(TCCState *s1, FILE *f)
     ++count;
   }
 
-  YAFF_DEBUG("[YAFF] total local relocations: %d\n", count);
+  LOG_YAFF("total local relocations: %d", count);
   return count;
 }
 
@@ -279,7 +285,8 @@ static int tcc_yaff_write_data_relocations(TCCState *s1, FILE *f)
           case R_ARM_RELATIVE:
           {
             // first data section is rodata
-            uint32_t from_address = rel->r_offset;
+            uint32_t abs_from_address = rel->r_offset;
+            uint32_t from_address;
             uint32_t original_offset = 0;
             bool towards_code = false;
             YaffDataRelocationEntry entry;
@@ -303,7 +310,18 @@ static int tcc_yaff_write_data_relocations(TCCState *s1, FILE *f)
                     Section *target_sec = s1->sections[s->sh_info];
                     imp_to += target_sec->sh_addr;
                   }
-                  imp_to -= rodata_section->sh_addr;
+                  if (imp_to >= data_section->sh_addr && imp_to < data_section->sh_addr + data_section->sh_size)
+                  {
+                    imp_to = (imp_to - data_section->sh_addr) + rodata_section->sh_size;
+                  }
+                  else if (imp_to >= bss_section->sh_addr && imp_to < bss_section->sh_addr + bss_section->sh_size)
+                  {
+                    imp_to = (imp_to - bss_section->sh_addr) + rodata_section->sh_size + data_section->sh_size;
+                  }
+                  else
+                  {
+                    imp_to -= rodata_section->sh_addr;
+                  }
 
                   struct sym_attr *attr = get_sym_attr(s1, sym_idx, 0);
                   uint32_t got_offset = 0;
@@ -335,38 +353,61 @@ static int tcc_yaff_write_data_relocations(TCCState *s1, FILE *f)
             if (!(s->sh_flags & SHF_ALLOC))
             {
               Section *target_sec = s1->sections[s->sh_info];
-              from_address += target_sec->sh_addr;
+              abs_from_address += target_sec->sh_addr;
             }
-            if (from_address < rodata_section->sh_addr)
+            if (abs_from_address < rodata_section->sh_addr)
             {
               tcc_error_noabort("R_ARM_ABS32 relocation outside of data sections");
+              continue;
             }
-            from_address -= rodata_section->sh_addr;
-            if (from_address < rodata_section->sh_size)
+            from_address = abs_from_address - rodata_section->sh_addr;
+            if (abs_from_address < rodata_section->sh_addr + rodata_section->sh_size)
             {
               // relocation inside .rodata
               original_offset = *(uint32_t *)(rodata_section->data + from_address);
             }
-            else if (from_address < rodata_section->sh_size + data_section->sh_size)
+            else if (abs_from_address >= data_section->sh_addr && abs_from_address < data_section->sh_addr + data_section->sh_size)
             {
-
-              original_offset = *(uint32_t *)(data_section->data + from_address - rodata_section->sh_size);
+              original_offset = *(uint32_t *)(data_section->data + (abs_from_address - data_section->sh_addr));
+              from_address = (abs_from_address - data_section->sh_addr) + rodata_section->sh_size;
             }
-            else if (from_address <
-                     rodata_section->sh_size + data_section->sh_size + bss_section->sh_size + s1->got->sh_size)
+            else if (abs_from_address >= bss_section->sh_addr && abs_from_address < bss_section->sh_addr + bss_section->sh_size)
             {
-              original_offset = *(uint32_t *)(s1->got->data + rel->r_offset - s1->got->sh_addr);
+              tcc_error_noabort("R_ARM_ABS32 relocation inside bss");
+              continue;
+            }
+            else if (abs_from_address < s1->got->sh_addr + s1->got->sh_size)
+            {
+              uint32_t got_data_offset = abs_from_address - s1->got->sh_addr;
+              if (got_data_offset + sizeof(uint32_t) > s1->got->data_offset)
+              {
+                tcc_error_noabort("R_ARM_ABS32 relocation outside allocated GOT data");
+                continue;
+              }
+              original_offset = *(uint32_t *)(s1->got->data + got_data_offset);
             }
             else
             {
               tcc_error_noabort("R_ARM_ABS32 relocation outside of data "
-                                "sections or inside bss");
+                                "sections or GOT");
+              continue;
             }
 
             towards_code = original_offset < rodata_section->sh_addr;
             if (!towards_code)
             {
-              original_offset -= rodata_section->sh_addr;
+              if (original_offset >= bss_section->sh_addr && original_offset < bss_section->sh_addr + bss_section->sh_size)
+              {
+                original_offset = (original_offset - bss_section->sh_addr) + rodata_section->sh_size + data_section->sh_size;
+              }
+              else if (original_offset >= data_section->sh_addr && original_offset < data_section->sh_addr + data_section->sh_size)
+              {
+                original_offset = (original_offset - data_section->sh_addr) + rodata_section->sh_size;
+              }
+              else
+              {
+                original_offset -= rodata_section->sh_addr;
+              }
             }
 
             entry = (YaffDataRelocationEntry){
@@ -534,10 +575,12 @@ static int tcc_yaff_write_symbol_table_relocations(TCCState *s1, FILE *f)
             {
               is_function_pointer = 1;
             }
+            int is_plt_call = (type == R_ARM_JUMP_SLOT) ? 1 : 0;
             entry = (YaffSymbolTableRelocationEntry){
                 .is_exported_symbol = is_exported,
                 .index = (rel->r_offset - s1->got->sh_addr) / 8,
                 .function_pointer = is_function_pointer,
+                .plt_call = is_plt_call,
                 .symbol_index = is_exported ? exported_idx[symbol_index] : imported_idx[symbol_index],
             };
             fwrite(&entry, 1, sizeof(entry), f);
@@ -550,6 +593,7 @@ static int tcc_yaff_write_symbol_table_relocations(TCCState *s1, FILE *f)
           case R_ARM_JUMP24:
           case R_ARM_THM_JUMP24:
           case R_ARM_ABS32:
+          case R_ARM_COPY:
           case R_ARM_PREL31:
           case R_ARM_TARGET1:
           case R_ARM_NONE:
@@ -661,7 +705,18 @@ static int tcc_yaff_write_exported_symbols(TCCState *s1, FILE *f, YaffHeader *h)
     offset = sym->st_value;
     if (section_code == YAFF_SECTION_DATA)
     {
-      offset -= rodata_section->sh_addr;
+      if (sym->st_shndx == bss_section->sh_num)
+      {
+        offset = (offset - bss_section->sh_addr) + rodata_section->sh_size + data_section->sh_size;
+      }
+      else if (sym->st_shndx == data_section->sh_num)
+      {
+        offset = (offset - data_section->sh_addr) + rodata_section->sh_size;
+      }
+      else
+      {
+        offset -= rodata_section->sh_addr;
+      }
     }
     entry = (YaffSymbolEntry){
         .section = section_code,
@@ -934,8 +989,28 @@ ST_FUNC int tcc_output_yaff(TCCState *s1, FILE *f, const char *filename)
   header.arch = 1;
   header.code_length = text_section->sh_size;
   header.init_length = 0;
-  header.data_length = data_section->sh_size + rodata_section->sh_size;
-  header.bss_length = bss_section->sh_size;
+  /* data_length must include any alignment padding between rodata and data
+   * so that GOTOFF offsets remain consistent at runtime. */
+  {
+    addr_t rodata_end = rodata_section->sh_addr + rodata_section->sh_size;
+    addr_t data_start = data_section->sh_addr;
+    addr_t rd_padding = (data_start > rodata_end) ? (data_start - rodata_end) : 0;
+    header.data_length = rodata_section->sh_size + rd_padding + data_section->sh_size;
+  }
+  /* bss_length must include any alignment padding between data and bss,
+   * AND between bss and GOT, so that the loader reproduces the exact
+   * same distance between rodata and GOT that the linker used for
+   * R_ARM_GOTOFF relocations. */
+  {
+    addr_t data_end = data_section->sh_addr + data_section->sh_size;
+    addr_t bss_start = bss_section->sh_addr;
+    addr_t bss_end = bss_section->sh_addr + bss_section->sh_size;
+    addr_t got_start = s1->got->sh_addr;
+    addr_t pad_before_bss = (bss_start > data_end) ? (bss_start - data_end) : 0;
+    addr_t pad_after_bss = (got_start > bss_end) ? (got_start - bss_end) : 0;
+    header.bss_length = pad_before_bss + bss_section->sh_size + pad_after_bss;
+  }
+
   header.external_libraries_amount = 0;
   header.alignment = 4;
   header.version_major = 0;
@@ -978,6 +1053,7 @@ ST_FUNC int tcc_output_yaff(TCCState *s1, FILE *f, const char *filename)
   header.symbol_table_relocations_amount = tcc_yaff_write_symbol_table_relocations(s1, f);
   header.local_relocations_amount = tcc_yaff_write_local_relocations(s1, f);
   header.data_relocations_amount = tcc_yaff_write_data_relocations(s1, f);
+  header.copy_relocations_amount = 0;
 
   header.imported_symbols_offset = ftell(f);
   header.imported_symbols_amount = tcc_yaff_write_imported_symbols(s1, f, &header);
@@ -1033,7 +1109,20 @@ ST_FUNC int tcc_output_yaff(TCCState *s1, FILE *f, const char *filename)
   }
 
   fwrite(rodata_section->data, 1, rodata_section->sh_size, f);
+  /* Write alignment padding between rodata and data (if any) */
+  {
+    addr_t rodata_end = rodata_section->sh_addr + rodata_section->sh_size;
+    addr_t data_start = data_section->sh_addr;
+    if (data_start > rodata_end) {
+      unsigned pad = (unsigned)(data_start - rodata_end);
+      for (i = 0; i < pad; ++i)
+        fputc(0, f);
+    }
+  }
   fwrite(data_section->data, 1, data_section->sh_size, f);
+  /* No file padding between data and GOT — the bss region (including
+   * any alignment padding before it) is zero-initialized by the loader.
+   * bss_length already accounts for the alignment gap. */
   fwrite(s1->got->data, 1, s1->got->sh_size, f);
   fseek(f, 0, SEEK_SET);
   fwrite(&header, 1, sizeof(YaffHeader), f);

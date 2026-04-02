@@ -1,4 +1,4 @@
-signbitf(-0.0f) at runtime: 1 (expected: 1)
+signbitf(-0.0f) at runtime: -2147483648 (expected: 1)
 signbit(-0.0) at runtime: 1 (expected: 1)
 signbitf(-0.0f) const: 1 (expected: 1)
 signbit(-0.0) const: 1 (expected: 1)

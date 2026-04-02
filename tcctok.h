@@ -180,6 +180,10 @@ DEF(TOK_DLLIMPORT, "dllimport")
 DEF(TOK_NODECORATE, "nodecorate")
 DEF(TOK_NORETURN1, "noreturn")
 DEF(TOK_NORETURN2, "__noreturn__")
+DEF(TOK_NOINLINE1, "noinline")
+DEF(TOK_NOINLINE2, "__noinline__")
+DEF(TOK_NOIPA1, "noipa")
+DEF(TOK_NOIPA2, "__noipa__")
 DEF(TOK_NORETURN3, "_Noreturn")
 DEF(TOK_PURE1, "pure")
 DEF(TOK_PURE2, "__pure__")
@@ -499,7 +503,7 @@ DEF(TOK___fixdfdi, "__fixdfdi")
 DEF(TOK___fixxfdi, "__fixxfdi")
 #endif
 
-#if defined TCC_TARGET_I386 || defined TCC_TARGET_X86_64
+#if defined TCC_TARGET_I386 || defined TCC_TARGET_X86_64 || defined TCC_TARGET_ARM
 DEF(TOK_alloca, "alloca")
 #endif
 

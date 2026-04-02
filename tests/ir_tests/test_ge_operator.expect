@@ -1,4 +1,48 @@
 Testing >= operator bug:
+
+Test 0: 7 >= 7
+  Expected: 1
+  Direct >=: 1 PASS
+  Workaround: 1 PASS
+Test 1: 6 >= 7
+  Expected: 0
+  Direct >=: 0 PASS
+  Workaround: 0 PASS
+Test 2: 8 >= 7
+  Expected: 1
+  Direct >=: 1 PASS
+  Workaround: 1 PASS
+Test 3: 0 >= 0
+  Expected: 1
+  Direct >=: 1 PASS
+  Workaround: 1 PASS
+Test 4: 0 >= 1
+  Expected: 0
+  Direct >=: 0 PASS
+  Workaround: 0 PASS
+Test 5: 100 >= 50
+  Expected: 1
+  Direct >=: 1 PASS
+  Workaround: 1 PASS
+Test 6: 50 >= 100
+  Expected: 0
+  Direct >=: 0 PASS
+  Workaround: 0 PASS
+Test 7: 4294967295 >= 4294967295
+  Expected: 1
+  Direct >=: 1 PASS
+  Workaround: 1 PASS
+Test 8: 4294967295 >= 0
+  Expected: 1
+  Direct >=: 1 PASS
+  Workaround: 1 PASS
+Test 9: 0 >= 4294967295
+  Expected: 0
+  Direct >=: 0 PASS
+  Workaround: 0 PASS
+
 Results:
 Direct >= operator: 10/10 tests passed
 Workaround method: 10/10 tests passed
+
+✓ The >= operator bug is FIXED!

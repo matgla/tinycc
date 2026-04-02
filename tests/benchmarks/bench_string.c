@@ -68,10 +68,36 @@ int bench_strcmp(int iterations)
   return result + 100;
 }
 
+/* String length scan benchmark - deterministic */
+int bench_strlen_scan(int iterations)
+{
+  static const char *words[] = {
+      "benchmark",
+      "tinycc",
+      "cortex-m33",
+      "rp2350",
+      "deterministic",
+      "verification",
+  };
+  int total = 0;
+
+  for (int n = 0; n < iterations; n++)
+  {
+    total = 0;
+    for (int i = 0; i < 6; i++)
+    {
+      total += (int)strlen(words[i]) * (i + 3);
+    }
+  }
+
+  return total;
+}
+
 /* Register benchmark with expected results */
 void init_string_benchmarks(void)
 {
   register_benchmark_ex("strcpy", bench_strcpy, 1000, "String copy operations", 122);
   register_benchmark_ex("memcpy", bench_memcpy, 1000, "Memory copy operations", 32640);
   register_benchmark_ex("strcmp", bench_strcmp, 1000, "String comparisons", 99);
+  register_benchmark_ex("strlen_scan", bench_strlen_scan, 2000, "Repeated strlen scans", 324);
 }

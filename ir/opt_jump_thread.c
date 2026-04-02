@@ -108,9 +108,7 @@ int tcc_ir_opt_jump_threading(TCCIRState *ir)
   if (n == 0)
     return 0;
 
-#ifdef DEBUG_IR_GEN
-  printf("=== JUMP THREADING START ===\n");
-#endif
+  LOG_IR_GEN("=== JUMP THREADING START ===");
 
   /* Allocate visited array for cycle detection */
   uint8_t *visited = tcc_mallocz(n);
@@ -147,18 +145,14 @@ int tcc_ir_opt_jump_threading(TCCIRState *ir)
       new_dest.u.imm32 = new_target;
       tcc_ir_op_set_dest(ir, q, new_dest);
 
-#ifdef DEBUG_IR_GEN
-      printf("JUMP_THREAD: %d -> %d (was %d)\n", i, new_target, target);
-#endif
+      LOG_IR_GEN("JUMP_THREAD: %d -> %d (was %d)", i, new_target, target);
       changes++;
     }
   }
 
   tcc_free(visited);
 
-#ifdef DEBUG_IR_GEN
-  printf("=== JUMP THREADING END: %d jumps threaded ===\n", changes);
-#endif
+  LOG_IR_GEN("=== JUMP THREADING END: %d jumps threaded ===", changes);
 
   return changes;
 }
@@ -178,9 +172,7 @@ int tcc_ir_opt_eliminate_fallthrough(TCCIRState *ir)
   if (n == 0)
     return 0;
 
-#ifdef DEBUG_IR_GEN
-  printf("=== ELIMINATE FALL-THROUGH START ===\n");
-#endif
+  LOG_IR_GEN("=== ELIMINATE FALL-THROUGH START ===");
 
   for (int i = 0; i < n - 1; i++)
   {
@@ -200,16 +192,12 @@ int tcc_ir_opt_eliminate_fallthrough(TCCIRState *ir)
     {
       q->op = TCCIR_OP_NOP;
 
-#ifdef DEBUG_IR_GEN
-      printf("FALLTHROUGH: Eliminated JUMP at %d (target %d)\n", i, target);
-#endif
+      LOG_IR_GEN("FALLTHROUGH: Eliminated JUMP at %d (target %d)", i, target);
       changes++;
     }
   }
 
-#ifdef DEBUG_IR_GEN
-  printf("=== ELIMINATE FALL-THROUGH END: %d jumps eliminated ===\n", changes);
-#endif
+  LOG_IR_GEN("=== ELIMINATE FALL-THROUGH END: %d jumps eliminated ===", changes);
 
   return changes;
 }

@@ -53,7 +53,14 @@ float __aeabi_fadd(float a, float b)
     return ur.f;
   }
 
-  /* Handle zero */
+  /* Handle zero.
+   * IEEE 754 §6.3: when both operands are zero, the result is +0 unless
+   * both are negative (round-to-nearest mode). */
+  if (is_zero_f(a_bits) && is_zero_f(b_bits))
+  {
+    ur.u = (a_sign && b_sign) ? FLOAT_SIGN_BIT : 0;
+    return ur.f;
+  }
   if (is_zero_f(a_bits))
   {
     ur.u = b_bits;

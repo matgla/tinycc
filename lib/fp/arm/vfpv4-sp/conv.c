@@ -53,22 +53,3 @@ float __aeabi_ui2f(unsigned int a)
   return result;
 }
 
-/* Convert float to double (single-to-double precision) */
-double __aeabi_f2d(float a)
-{
-  double result;
-  uint32_t r0, r1;
-  __asm__ volatile("vmov    s0, %2        \n\t" /* Move a to s0 */
-                   "vcvt.f64.f32 d0, s0   \n\t" /* Convert f32 to f64 in d0 */
-                   "vmov    %0, %1, d0    \n\t" /* Move d0 to r0 (low), r1 (high) */
-                   : "=r"(r0), "=r"(r1)
-                   : "r"(a));
-  /* Cast the two 32-bit registers back to double */
-  result = *(const double *)&(union {
-              uint32_t u[2];
-              double d;
-            }){
-      .u = {r0,
-            r1}}.d;
-  return result;
-}

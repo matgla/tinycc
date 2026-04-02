@@ -1,0 +1,4 @@
+buf = tinycc-armv8m
+strlen_sum = 104
+strcmp_sum = 0
+PASS

@@ -4,7 +4,7 @@
  * CRC32 checksum computation benchmark.
  */
 
-#include "benchmarks.h"
+#include "../benchmarks.h"
 
 /* CRC32 implementation from MiBench */
 typedef unsigned long DWORD;

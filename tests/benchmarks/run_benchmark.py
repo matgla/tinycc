@@ -13,9 +13,10 @@ import os
 import subprocess
 import sys
 import re
+import json
 import tempfile
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from typing import Optional, Dict, List, Tuple
 
 try:
@@ -42,6 +43,51 @@ class CompilerResult:
     build_size: Dict[str, int]
     benchmarks: List[BenchmarkResult]
     raw_output: str
+    raw_serial_output: str = ""
+
+
+def normalize_benchmark_output(output: str) -> str:
+    """Normalize noisy serial output into a parser-friendly text stream."""
+    output = output.replace('\r\n', '\n').replace('\r', '\n').replace('\x00', '')
+    output = re.sub(r'\x1b\[[0-9;?]*[ -/]*[@-~]', '', output)
+    output = ''.join(ch for ch in output if ch == '\n' or ch == '\t' or ch.isprintable())
+    return output
+
+
+def save_results_json(path: str, results: Dict[str, Optional['CompilerResult']]):
+    """Save benchmark results to JSON for later reuse."""
+    data = {}
+    for key, result in results.items():
+        if result is not None:
+            data[key] = {
+                'compiler': result.compiler,
+                'build_success': result.build_success,
+                'build_size': result.build_size,
+                'benchmarks': [asdict(b) for b in result.benchmarks],
+                'raw_output': result.raw_output,
+                'raw_serial_output': result.raw_serial_output,
+            }
+    with open(path, 'w') as f:
+        json.dump(data, f, indent=2)
+    print(f"Results saved to: {path}")
+
+
+def load_results_json(path: str) -> Dict[str, 'CompilerResult']:
+    """Load benchmark results from JSON."""
+    with open(path, 'r') as f:
+        data = json.load(f)
+    results = {}
+    for key, d in data.items():
+        results[key] = CompilerResult(
+            compiler=d['compiler'],
+            build_success=d['build_success'],
+            build_size=d['build_size'],
+            benchmarks=[BenchmarkResult(**b) for b in d['benchmarks']],
+            raw_output=d['raw_output'],
+            raw_serial_output=d.get('raw_serial_output', ""),
+        )
+    print(f"Loaded {len(results)} result(s) from: {path}")
+    return results
 
 
 def run_command(cmd: List[str], cwd: Optional[Path] = None, capture: bool = True,
@@ -211,6 +257,7 @@ def parse_benchmark_output(output: str) -> List[BenchmarkResult]:
     Only parses benchmarks from the LAST complete run in the output,
     ignoring any leftover data from previous runs in the serial buffer.
     """
+    output = normalize_benchmark_output(output)
     results = []
 
     # Find the LAST occurrence of the benchmark header to ignore stale data
@@ -240,6 +287,8 @@ def parse_benchmark_output(output: str) -> List[BenchmarkResult]:
 
         # Stop at end markers
         if 'benchmark stopped' in line.lower() or 'Benchmark completed' in line:
+            break
+        if '!!! HARDFAULT !!!' in line or '!!! BENCHMARK TIMEOUT !!!' in line:
             break
 
         # Match benchmark result lines with cycle counter (5 columns)
@@ -291,9 +340,36 @@ def parse_benchmark_output(output: str) -> List[BenchmarkResult]:
     return results
 
 
+def extract_benchmark_results(output: str, raw_serial_output: str) -> List[BenchmarkResult]:
+    """Parse benchmark results, falling back to raw serial output if needed."""
+    benchmarks = parse_benchmark_output(output)
+    if benchmarks:
+        return benchmarks
+
+    if raw_serial_output:
+        raw_benchmarks = parse_benchmark_output(raw_serial_output)
+        if raw_benchmarks:
+            return raw_benchmarks
+
+    return []
+
+
+def _print_hardfault_details(serial_output: str):
+    """Extract and print HardFault/timeout diagnostic info from serial output."""
+    in_fault = False
+    for line in serial_output.split('\n'):
+        line = line.strip()
+        if '!!! HARDFAULT !!!' in line or '!!! BENCHMARK TIMEOUT !!!' in line:
+            in_fault = True
+        if in_fault:
+            print(f"  {line}")
+            if 'benchmark stopped' in line.lower():
+                break
+
+
 def upload_and_run(elf_path: Path, host: str, port: int = 22,
                    username: str = "mateusz", identity: Optional[str] = None,
-                   password: Optional[str] = None) -> Tuple[bool, str]:
+                   password: Optional[str] = None) -> Tuple[bool, str, str]:
     """Upload and run ELF on target via SSH using OpenOCD."""
 
     print(f"\nConnecting to {username}@{host}...")
@@ -321,24 +397,53 @@ def upload_and_run(elf_path: Path, host: str, port: int = 22,
     print(f"Uploading {elf_path.name} to {remote_elf}...")
     sftp.put(str(elf_path), remote_elf)
 
-    # Find serial port
-    stdin, stdout, stderr = ssh.exec_command("ls /dev/ttyACM* 2>/dev/null | head -1")
+    # Probe serial port up front for logging, but let the remote script
+    # detect it again at runtime so we don't bake in stale paths.
+    detect_serial_cmd = r'''
+for dev in /dev/serial/by-id/* /dev/serial/by-path/* /dev/ttyACM* /dev/ttyUSB*; do
+    if [ -e "$dev" ]; then
+        printf "%s\n" "$dev"
+        exit 0
+    fi
+done
+exit 1
+'''
+    stdin, stdout, stderr = ssh.exec_command(detect_serial_cmd)
     serial_port = stdout.read().decode().strip()
-    if not serial_port:
-        stdin, stdout, stderr = ssh.exec_command("ls /dev/ttyUSB* 2>/dev/null | head -1")
-        serial_port = stdout.read().decode().strip()
-    if not serial_port:
-        print("Warning: No serial port found, trying /dev/ttyACM0")
-        serial_port = "/dev/ttyACM0"
-    else:
+    if serial_port:
         print(f"Using serial port: {serial_port}")
+    else:
+        print("Warning: no serial port detected before launch; remote script will probe again")
 
     # Create run script - now waits for "benchmark stopped" signal
     combined_script = f'''#!/bin/bash
 set -e
 
-SERIAL="{serial_port}"
-ELF="{remote_elf}"
+    SERIAL="{serial_port}"
+    ELF="{remote_elf}"
+
+detect_serial_port() {{
+    if [ -n "$SERIAL" ] && [ -e "$SERIAL" ]; then
+        return 0
+    fi
+
+    for dev in /dev/serial/by-id/* /dev/serial/by-path/* /dev/ttyACM* /dev/ttyUSB*; do
+        if [ -e "$dev" ]; then
+            SERIAL="$dev"
+            return 0
+        fi
+    done
+
+    return 1
+}}
+
+if ! detect_serial_port; then
+    echo "ERROR: No serial port found on remote host" >&2
+    ls -1 /dev/serial/by-id /dev/serial/by-path /dev/ttyACM* /dev/ttyUSB* 2>/dev/null || true
+    exit 1
+fi
+
+echo "Using serial port: $SERIAL"
 
 echo "Configuring serial port..."
 # Configure serial port with proper flush settings
@@ -376,18 +481,65 @@ SERIAL_PID=$!
 sleep 0.2
 
 echo "Running OpenOCD with reset..."
-# Run OpenOCD - reset target first, then program and run
-openocd -f interface/cmsis-dap.cfg -f target/rp2350.cfg \
-    -c "adapter speed 5000" \\
-    -c "init" \\
-    -c "reset halt" \\
-    -c "reset" \\
-    -c "sleep 100" \\
-    -c "program $ELF verify" \\
-    -c "reset run" \\
-    -c "shutdown" 2>&1 &
 
-OPENOCD_PID=$!
+INTERFACE_CFG="interface/cmsis-dap.cfg"
+TARGET_CFG="target/rp2350.cfg"
+ADAPTER_SPEED=5000
+
+openocd_rescue_reset() {{
+    # Use the RP2350 rescue debug port to force-halt the chip.
+    # This works even when the CPU is stuck running bad firmware.
+    local rescue_cfg="target/rp2350-rescue.cfg"
+    if ! openocd -f "$INTERFACE_CFG" -f "$rescue_cfg" \
+        -c "adapter speed 5000" -c "init" -c "exit" 2>&1; then
+        echo "rescue DP reset failed" >&2
+        return 1
+    fi
+    sleep 1
+    return 0
+}}
+
+openocd_reset_halt() {{
+    if openocd -f "$INTERFACE_CFG" -f "$TARGET_CFG" \
+        -c "adapter speed $ADAPTER_SPEED" \
+        -c "init" -c "reset halt" -c "exit" 2>/dev/null; then
+        return 0
+    fi
+    echo "reset halt failed, trying rescue DP..." >&2
+    openocd_rescue_reset
+}}
+
+# Rescue DP reset first to clear any QSPI Quad I/O mode left by
+# previous firmware — avoids CRC checksum mismatches during verify.
+openocd_rescue_reset 2>/dev/null || true
+
+# Flash with retry logic
+FLASH_OK=0
+for FLASH_ATTEMPT in 1 2 3; do
+    if openocd -f "$INTERFACE_CFG" -f "$TARGET_CFG" \
+        -c "adapter speed $ADAPTER_SPEED" \\
+        -c "init" \\
+        -c "reset halt" \\
+        -c "program $ELF verify" \\
+        -c "reset run" \\
+        -c "shutdown" 2>&1; then
+        FLASH_OK=1
+        break
+    fi
+    echo "Flash attempt $FLASH_ATTEMPT failed, resetting target and retrying..." >&2
+    if [ $FLASH_ATTEMPT -eq 1 ]; then
+        echo "Trying rescue DP reset..." >&2
+        openocd_rescue_reset
+    elif [ $FLASH_ATTEMPT -eq 2 ]; then
+        sleep 2
+        openocd_rescue_reset
+    fi
+done
+
+if [ $FLASH_OK -ne 1 ]; then
+    echo "ERROR: flashing failed after 3 attempts" >&2
+    exit 1
+fi
 
 # Wait for benchmark completion signals (300s timeout - increased for longer benchmarks)
 echo "Waiting for benchmark output..."
@@ -412,16 +564,9 @@ while [ $ELAPSED -lt $TIMEOUT ]; do
         COMPLETED=1
         break
     fi
-
-    # Check if OpenOCD is still running
-    if ! kill -0 $OPENOCD_PID 2>/dev/null; then
-        # OpenOCD exited, give a bit more time to capture output
-        sleep 1
-        # Check one more time for completion
-        if grep -qE "(benchmark stopped|Benchmark completed|Benchmark failed)" /tmp/serial_raw.txt 2>/dev/null; then
-            echo "✓ Benchmark finished!"
-            COMPLETED=1
-        fi
+    if grep -q "HARDFAULT\|BENCHMARK TIMEOUT" /tmp/serial_raw.txt 2>/dev/null; then
+        echo "✗ HARDFAULT or TIMEOUT detected on target!"
+        COMPLETED=1
         break
     fi
 
@@ -452,10 +597,6 @@ sleep 0.5
 kill $SERIAL_PID 2>/dev/null || true
 wait $SERIAL_PID 2>/dev/null || true
 
-# Kill OpenOCD if still running
-kill $OPENOCD_PID 2>/dev/null || true
-wait $OPENOCD_PID 2>/dev/null || true
-
 # Extract clean output: everything after ===SYNC_START=== marker
 # This discards any garbage from power-up or previous runs
 echo ""
@@ -469,6 +610,10 @@ else
     cat /tmp/serial_raw.txt 2>/dev/null
 fi
 echo "===SERIAL_OUTPUT_END==="
+echo ""
+echo "===SERIAL_RAW_OUTPUT_START==="
+cat /tmp/serial_raw.txt 2>/dev/null
+echo "===SERIAL_RAW_OUTPUT_END==="
 '''
     remote_combined = "/tmp/run_test.sh"
     sftp.putfo(__import__("io").BytesIO(combined_script.encode()), remote_combined)
@@ -489,6 +634,11 @@ echo "===SERIAL_OUTPUT_END==="
         ocd_output = output
         serial_part = ""
 
+    if "===SERIAL_RAW_OUTPUT_START===" in output:
+        raw_serial_part = output.split("===SERIAL_RAW_OUTPUT_START===", 1)[1].split("===SERIAL_RAW_OUTPUT_END===", 1)[0]
+    else:
+        raw_serial_part = serial_part
+
     # Check for issues
     success = True
     if "Resource busy" in ocd_output:
@@ -497,15 +647,52 @@ echo "===SERIAL_OUTPUT_END==="
         success = False
     elif "Error:" in ocd_output and "completed" not in ocd_output:
         print("!!! OpenOCD reported errors !!!")
+    if "No benchmarks registered!" in serial_part:
+        print("!!! Benchmark registration failed on target !!!")
+        success = False
+    elif "Benchmark failed!" in serial_part:
+        print("!!! Benchmark firmware reported failure !!!")
+        success = False
+    if "!!! HARDFAULT !!!" in serial_part or "!!! BENCHMARK TIMEOUT !!!" in serial_part:
+        if "HARDFAULT" in serial_part:
+            print("!!! HARDFAULT detected on target !!!")
+        else:
+            print("!!! BENCHMARK TIMEOUT detected on target (likely infinite loop) !!!")
+        _print_hardfault_details(serial_part)
+        success = False
 
     # Cleanup
     sftp.close()
     ssh.close()
 
     if serial_part:
-        return success, serial_part
+        return success, serial_part, raw_serial_part
     else:
-        return False, ocd_output + "\n" + errors
+        return False, ocd_output + "\n" + errors, raw_serial_part
+
+
+def save_serial_log(path: str, args_opt_level: str, results: Dict[str, Optional[CompilerResult]]):
+    with open(path, 'w') as f:
+        f.write("="*80 + "\n")
+        f.write("RP2350 Benchmark Raw Serial Log\n")
+        f.write("="*80 + "\n\n")
+
+        if args_opt_level == "all":
+            ordered_keys = ["tcc_o0", "tcc_o1", "tcc_o2", "gcc_o0", "gcc_o1", "gcc_o2"]
+        elif args_opt_level == "both":
+            ordered_keys = ["tcc_o0", "tcc_o1", "gcc_o0", "gcc_o1"]
+        else:
+            ordered_keys = ["tcc", "gcc"]
+
+        for key in ordered_keys:
+            result = results.get(key)
+            if not result:
+                continue
+            f.write(f"--- {result.compiler} Raw Serial Output ---\n")
+            f.write(result.raw_serial_output)
+            if result.raw_serial_output and not result.raw_serial_output.endswith("\n"):
+                f.write("\n")
+            f.write("\n")
 
 
 def print_opt_comparison(compiler_name: str, o0_result: CompilerResult, o1_result: CompilerResult):
@@ -863,6 +1050,85 @@ def print_four_way_comparison_tcc_o1_vs_gcc_o0(tcc_o1: CompilerResult, gcc_o0: C
     print("="*100)
 
 
+def print_six_way_comparison(tcc_o0: CompilerResult, tcc_o1: CompilerResult, tcc_o2: CompilerResult,
+                              gcc_o0: CompilerResult, gcc_o1: CompilerResult, gcc_o2: CompilerResult):
+    """Print comparison table of TCC and GCC at -O0, -O1, and -O2."""
+    print("\n" + "="*140)
+    print("COMPREHENSIVE COMPARISON: TCC-O0 vs TCC-O1 vs TCC-O2 vs GCC-O0 vs GCC-O1 vs GCC-O2")
+    print("="*140)
+
+    # Binary sizes
+    print("\n--- Binary Size Comparison ---")
+    print(f"{'Section':<15} {'TCC-O0':>12} {'TCC-O1':>12} {'TCC-O2':>12} {'GCC-O0':>12} {'GCC-O1':>12} {'GCC-O2':>12} {'TCC-O2/GCC-O2':>14}")
+    print(f"{'-'*15} {'-'*12} {'-'*12} {'-'*12} {'-'*12} {'-'*12} {'-'*12} {'-'*14}")
+
+    for section in ['text', 'data', 'bss', 'dec']:
+        sizes = [r.build_size.get(section, 0) for r in [tcc_o0, tcc_o1, tcc_o2, gcc_o0, gcc_o1, gcc_o2]]
+        ratio = (sizes[2] / sizes[5] * 100) if sizes[5] > 0 else 0
+        print(f"{section:<15} {sizes[0]:>12} {sizes[1]:>12} {sizes[2]:>12} {sizes[3]:>12} {sizes[4]:>12} {sizes[5]:>12} {ratio:>13.1f}%")
+
+    # TCC optimization improvement
+    print("\n--- TCC Optimization Improvement ---")
+    for section in ['text', 'dec']:
+        o0_size = tcc_o0.build_size.get(section, 0)
+        o1_size = tcc_o1.build_size.get(section, 0)
+        o2_size = tcc_o2.build_size.get(section, 0)
+        if o0_size > 0:
+            r1 = ((o0_size - o1_size) / o0_size * 100)
+            r2 = ((o0_size - o2_size) / o0_size * 100)
+            print(f"{section}: O0={o0_size} -> O1={o1_size} ({r1:.1f}% reduction) -> O2={o2_size} ({r2:.1f}% reduction)")
+
+    # Performance comparison
+    print("\n--- Performance Comparison (cycles per iteration) ---")
+    print(f"{'Benchmark':<25} {'TCC-O0':>12} {'TCC-O1':>12} {'TCC-O2':>12} {'GCC-O0':>12} {'GCC-O1':>12} {'GCC-O2':>12} {'TCC-O2/GCC-O2':>14}")
+    print(f"{'-'*25} {'-'*12} {'-'*12} {'-'*12} {'-'*12} {'-'*12} {'-'*12} {'-'*14}")
+
+    all_results = [tcc_o0, tcc_o1, tcc_o2, gcc_o0, gcc_o1, gcc_o2]
+    bench_dicts = [{b.name: b for b in r.benchmarks} for r in all_results]
+    all_names = sorted(set().union(*(d.keys() for d in bench_dicts)))
+
+    totals = [0.0] * 6
+
+    for name in all_names:
+        cycles = []
+        strs = []
+        for bd in bench_dicts:
+            b = bd.get(name)
+            c = b.cycles_per_iter if b else 0
+            cycles.append(c)
+            strs.append(f"{c:.2f}" if b else "N/A")
+
+        if cycles[2] > 0 and cycles[5] > 0:
+            ratio = (cycles[2] / cycles[5] * 100)
+            ratio_str = f"{ratio:.1f}%"
+            for i in range(6):
+                totals[i] += cycles[i]
+        else:
+            ratio_str = "N/A"
+
+        print(f"{name:<25} {strs[0]:>12} {strs[1]:>12} {strs[2]:>12} {strs[3]:>12} {strs[4]:>12} {strs[5]:>12} {ratio_str:>14}")
+
+    print(f"{'-'*25} {'-'*12} {'-'*12} {'-'*12} {'-'*12} {'-'*12} {'-'*12} {'-'*14}")
+
+    # Overall summary
+    if totals[2] > 0 and totals[5] > 0:
+        overall_ratio = (totals[2] / totals[5] * 100)
+        print(f"\n{'OVERALL':<25} {totals[0]:>12.2f} {totals[1]:>12.2f} {totals[2]:>12.2f} {totals[3]:>12.2f} {totals[4]:>12.2f} {totals[5]:>12.2f} {overall_ratio:>13.1f}%")
+
+    print(f"\n--- Summary ---")
+    if totals[0] > 0 and totals[1] > 0:
+        print(f"TCC -O0 vs -O1: {(totals[1]/totals[0]*100):.1f}% cycles (lower is better)")
+    if totals[0] > 0 and totals[2] > 0:
+        print(f"TCC -O0 vs -O2: {(totals[2]/totals[0]*100):.1f}% cycles (lower is better)")
+    if totals[3] > 0 and totals[5] > 0:
+        print(f"GCC -O0 vs -O2: {(totals[5]/totals[3]*100):.1f}% cycles (lower is better)")
+    if totals[2] > 0 and totals[5] > 0:
+        print(f"TCC-O2 vs GCC-O2: {(totals[2]/totals[5]*100):.1f}% (lower is better for TCC)")
+    if totals[1] > 0 and totals[3] > 0:
+        print(f"TCC-O1 vs GCC-O0: {(totals[1]/totals[3]*100):.1f}% (lower is better for TCC)")
+    print("="*140)
+
+
 def print_comparison(tcc_result: CompilerResult, gcc_result: CompilerResult):
     """Print comparison table of TCC vs GCC results with verification status."""
     print("\n" + "="*80)
@@ -990,17 +1256,72 @@ def main():
     parser = argparse.ArgumentParser(
         description="Build, run and compare TCC vs GCC benchmarks on RP2350"
     )
-    parser.add_argument("host", help="Target host IP or hostname (optionally user@host)")
+    parser.add_argument("host", nargs='?', default=None,
+                        help="Target host IP or hostname (optionally user@host). "
+                             "Not required when using --load-data.")
     parser.add_argument("--port", "-p", type=int, default=22, help="SSH port (default: 22)")
     parser.add_argument("--identity", "-i", help="SSH identity file")
     parser.add_argument("--password", help="SSH password")
     parser.add_argument("--skip-build", action="store_true", help="Skip build, use existing binaries")
     parser.add_argument("--only", choices=["tcc", "gcc"], help="Only run one compiler")
     parser.add_argument("--output", "-o", help="Save comparison to file")
-    parser.add_argument("--opt-level", "-O", choices=["0", "1", "both"], default="1",
-                        help="Optimization level: 0, 1, or 'both' to compare (default: 1)")
+    parser.add_argument("--serial-log", help="Save full raw UART/serial log to file")
+    parser.add_argument("--opt-level", "-O", choices=["0", "1", "2", "both", "all"], default="1",
+                        help="Optimization level: 0, 1, 2, 'both' (O0+O1), or 'all' (O0+O1+O2) (default: 1)")
+    parser.add_argument("--save-data", help="Save raw results to JSON for later reuse")
+    parser.add_argument("--load-data", help="Load results from JSON instead of running on hardware")
 
     args = parser.parse_args()
+
+    # Handle --load-data mode: just load JSON and print tables
+    if args.load_data:
+        loaded = load_results_json(args.load_data)
+        if args.opt_level == "all":
+            tcc_o0 = loaded.get('tcc_o0')
+            tcc_o1 = loaded.get('tcc_o1')
+            tcc_o2 = loaded.get('tcc_o2')
+            gcc_o0 = loaded.get('gcc_o0')
+            gcc_o1 = loaded.get('gcc_o1')
+            gcc_o2 = loaded.get('gcc_o2')
+            if tcc_o0 and tcc_o1 and tcc_o2 and gcc_o0 and gcc_o1 and gcc_o2:
+                print_six_way_comparison(tcc_o0, tcc_o1, tcc_o2, gcc_o0, gcc_o1, gcc_o2)
+            elif tcc_o0 and tcc_o1 and gcc_o0 and gcc_o1:
+                print_four_way_comparison(tcc_o0, tcc_o1, gcc_o0, gcc_o1)
+            else:
+                for key, result in loaded.items():
+                    print(f"\n{key}: {len(result.benchmarks)} benchmarks")
+                    for b in result.benchmarks:
+                        print(f"  {b.name}: {b.cycles_per_iter:.2f} cycles/iter [{b.verify}]")
+        elif args.opt_level == "both":
+            tcc_o0 = loaded.get('tcc_o0')
+            tcc_o1 = loaded.get('tcc_o1')
+            gcc_o0 = loaded.get('gcc_o0')
+            gcc_o1 = loaded.get('gcc_o1')
+            if tcc_o0 and tcc_o1 and gcc_o0 and gcc_o1:
+                print_four_way_comparison(tcc_o0, tcc_o1, gcc_o0, gcc_o1)
+            elif tcc_o1 and gcc_o0 and gcc_o1:
+                print_three_way_comparison(tcc_o1, gcc_o0, gcc_o1)
+            else:
+                for key, result in loaded.items():
+                    print(f"\n{key}: {len(result.benchmarks)} benchmarks")
+                    for b in result.benchmarks:
+                        print(f"  {b.name}: {b.cycles_per_iter:.2f} cycles/iter [{b.verify}]")
+        else:
+            tcc_result = loaded.get(f'tcc_o{args.opt_level}') or loaded.get('tcc')
+            gcc_result = loaded.get(f'gcc_o{args.opt_level}') or loaded.get('gcc')
+            if tcc_result and gcc_result:
+                print_comparison(tcc_result, gcc_result)
+            else:
+                for key, result in loaded.items():
+                    print(f"\n{key}: {len(result.benchmarks)} benchmarks")
+                    for b in result.benchmarks:
+                        print(f"  {b.name}: {b.cycles_per_iter:.2f} cycles/iter [{b.verify}]")
+        print("\nDone!")
+        return
+
+    # Validate host is provided for hardware runs
+    if not args.host:
+        parser.error("host is required when not using --load-data")
 
     # Parse host
     if "@" in args.host:
@@ -1031,23 +1352,30 @@ def main():
                 size_info = get_binary_size(elf_path)
 
             if elf_path and elf_path.exists():
-                success, output = upload_and_run(
+                success, output, raw_serial_output = upload_and_run(
                     elf_path, hostname, args.port, username, args.identity, args.password
                 )
-                benchmarks = parse_benchmark_output(output) if success else []
+                benchmarks = extract_benchmark_results(output, raw_serial_output)
+                if success and not benchmarks and "Running" in normalize_benchmark_output(output + "\n" + raw_serial_output):
+                    print("\n!!! Benchmark output was present, but no result rows were parsed !!!")
+                    success = False
+                hardfault = "!!! HARDFAULT !!!" in (output + raw_serial_output) or "!!! BENCHMARK TIMEOUT !!!" in (output + raw_serial_output)
                 tcc_result = CompilerResult(
                     compiler=f"TCC-O{opt_level}",
                     build_success=success,
                     build_size=size_info,
                     benchmarks=benchmarks,
-                    raw_output=output
+                    raw_output=output,
+                    raw_serial_output=raw_serial_output
                 )
 
-                if success:
+                if success or (hardfault and benchmarks):
                     print(f"\nTCC-O{opt_level} Benchmarks ({len(benchmarks)} found):")
                     for b in benchmarks:
                         print(f"  {b.name}: {b.cycles_per_iter:.2f} cycles/iter")
-                    if "TIMEOUT" in output:
+                    if hardfault:
+                        print("\n⚠ HARDFAULT: Target crashed during benchmark execution!")
+                    elif "TIMEOUT" in output:
                         print("\n⚠ WARNING: Benchmark timeout occurred!")
                 else:
                     print(f"\nTCC run failed:\n{output[:1000]}")
@@ -1067,23 +1395,30 @@ def main():
                 size_info = get_binary_size(elf_path)
 
             if elf_path and elf_path.exists():
-                success, output = upload_and_run(
+                success, output, raw_serial_output = upload_and_run(
                     elf_path, hostname, args.port, username, args.identity, args.password
                 )
-                benchmarks = parse_benchmark_output(output) if success else []
+                benchmarks = extract_benchmark_results(output, raw_serial_output)
+                if success and not benchmarks and "Running" in normalize_benchmark_output(output + "\n" + raw_serial_output):
+                    print("\n!!! Benchmark output was present, but no result rows were parsed !!!")
+                    success = False
+                hardfault = "!!! HARDFAULT !!!" in (output + raw_serial_output) or "!!! BENCHMARK TIMEOUT !!!" in (output + raw_serial_output)
                 gcc_result = CompilerResult(
                     compiler=f"GCC-O{opt_level}",
                     build_success=success,
                     build_size=size_info,
                     benchmarks=benchmarks,
-                    raw_output=output
+                    raw_output=output,
+                    raw_serial_output=raw_serial_output
                 )
 
-                if success:
+                if success or (hardfault and benchmarks):
                     print(f"\nGCC-O{opt_level} Benchmarks ({len(benchmarks)} found):")
                     for b in benchmarks:
                         print(f"  {b.name}: {b.cycles_per_iter:.2f} cycles/iter")
-                    if "TIMEOUT" in output:
+                    if hardfault:
+                        print("\n⚠ HARDFAULT: Target crashed during benchmark execution!")
+                    elif "TIMEOUT" in output:
                         print("\n⚠ WARNING: Benchmark timeout occurred!")
                 else:
                     print(f"\nGCC run failed:\n{output[:1000]}")
@@ -1099,19 +1434,35 @@ def main():
     print("")
 
     # Run based on optimization level selection
-    if args.opt_level == "both":
-        # Run TCC-O0, TCC-O1, GCC-O0, and GCC-O1 for comprehensive comparison
+    if args.opt_level == "all":
+        # Run -O0, -O1, -O2 for both compilers = 6 hardware flashes
+        print("="*80)
+        print("Running comprehensive comparison: TCC-O0, TCC-O1, TCC-O2, GCC-O0, GCC-O1, GCC-O2")
+        print("="*80)
+
+        tcc_o0, gcc_o0 = run_single_opt("0", " (1/3) - O0")
+        print("\n")
+        tcc_o1, gcc_o1 = run_single_opt("1", " (2/3) - O1")
+        print("\n")
+        tcc_o2, gcc_o2 = run_single_opt("2", " (3/3) - O2")
+
+        # Print comprehensive comparison
+        if tcc_o0 and tcc_o1 and tcc_o2 and gcc_o0 and gcc_o1 and gcc_o2:
+            print("\n")
+            print_six_way_comparison(tcc_o0, tcc_o1, tcc_o2, gcc_o0, gcc_o1, gcc_o2)
+        elif tcc_o0 and tcc_o1 and gcc_o0 and gcc_o1:
+            print("\n")
+            print_four_way_comparison(tcc_o0, tcc_o1, gcc_o0, gcc_o1)
+    elif args.opt_level == "both":
+        # Run -O0 once (gets both TCC and GCC), then -O1 once (gets both)
+        # This is 4 hardware flashes instead of 8
         print("="*80)
         print("Running comprehensive comparison: TCC-O0, TCC-O1, GCC-O0, GCC-O1")
         print("="*80)
-        
-        tcc_o0, _ = run_single_opt("0", " (1/4) - TCC-O0")
+
+        tcc_o0, gcc_o0 = run_single_opt("0", " (1/2) - O0")
         print("\n")
-        tcc_o1, _ = run_single_opt("1", " (2/4) - TCC-O1")
-        print("\n")
-        _, gcc_o0 = run_single_opt("0", " (3/4) - GCC-O0")
-        print("\n")
-        _, gcc_o1 = run_single_opt("1", " (4/4) - GCC-O1")
+        tcc_o1, gcc_o1 = run_single_opt("1", " (2/2) - O1")
 
         # Print comprehensive comparison
         if tcc_o0 and tcc_o1 and gcc_o0 and gcc_o1:
@@ -1132,24 +1483,20 @@ def main():
             f.write("TCC vs GCC Benchmark Results\n")
             f.write("="*80 + "\n\n")
 
-            if args.opt_level == "both":
+            if args.opt_level in ("both", "all"):
                 # Save results from comprehensive comparison
-                if tcc_o0:
-                    f.write(f"--- TCC -O0 Raw Output ---\n")
-                    f.write(tcc_o0.raw_output)
-                    f.write("\n\n")
-                if tcc_o1:
-                    f.write(f"--- TCC -O1 Raw Output ---\n")
-                    f.write(tcc_o1.raw_output)
-                    f.write("\n\n")
-                if gcc_o0:
-                    f.write(f"--- GCC -O0 Raw Output ---\n")
-                    f.write(gcc_o0.raw_output)
-                    f.write("\n\n")
-                if gcc_o1:
-                    f.write(f"--- GCC -O1 Raw Output ---\n")
-                    f.write(gcc_o1.raw_output)
-                    f.write("\n\n")
+                for label, result in [("TCC -O0", tcc_o0), ("TCC -O1", tcc_o1),
+                                       ("GCC -O0", gcc_o0), ("GCC -O1", gcc_o1)]:
+                    if result:
+                        f.write(f"--- {label} Raw Output ---\n")
+                        f.write(result.raw_output)
+                        f.write("\n\n")
+                if args.opt_level == "all":
+                    for label, result in [("TCC -O2", tcc_o2), ("GCC -O2", gcc_o2)]:
+                        if result:
+                            f.write(f"--- {label} Raw Output ---\n")
+                            f.write(result.raw_output)
+                            f.write("\n\n")
             else:
                 # Save single optimization level results
                 if tcc_result:
@@ -1161,6 +1508,46 @@ def main():
                     f.write(gcc_result.raw_output)
                     f.write("\n\n")
         print(f"\nResults saved to: {args.output}")
+
+    if args.serial_log:
+        save_dict = {}
+        if args.opt_level == "all":
+            if tcc_o0: save_dict['tcc_o0'] = tcc_o0
+            if tcc_o1: save_dict['tcc_o1'] = tcc_o1
+            if tcc_o2: save_dict['tcc_o2'] = tcc_o2
+            if gcc_o0: save_dict['gcc_o0'] = gcc_o0
+            if gcc_o1: save_dict['gcc_o1'] = gcc_o1
+            if gcc_o2: save_dict['gcc_o2'] = gcc_o2
+        elif args.opt_level == "both":
+            if tcc_o0: save_dict['tcc_o0'] = tcc_o0
+            if tcc_o1: save_dict['tcc_o1'] = tcc_o1
+            if gcc_o0: save_dict['gcc_o0'] = gcc_o0
+            if gcc_o1: save_dict['gcc_o1'] = gcc_o1
+        else:
+            if tcc_result: save_dict['tcc'] = tcc_result
+            if gcc_result: save_dict['gcc'] = gcc_result
+        save_serial_log(args.serial_log, args.opt_level, save_dict)
+        print(f"\nRaw serial log saved to: {args.serial_log}")
+
+    # Save structured data for reuse (--save-data)
+    if args.save_data:
+        save_dict = {}
+        if args.opt_level == "all":
+            if tcc_o0: save_dict['tcc_o0'] = tcc_o0
+            if tcc_o1: save_dict['tcc_o1'] = tcc_o1
+            if tcc_o2: save_dict['tcc_o2'] = tcc_o2
+            if gcc_o0: save_dict['gcc_o0'] = gcc_o0
+            if gcc_o1: save_dict['gcc_o1'] = gcc_o1
+            if gcc_o2: save_dict['gcc_o2'] = gcc_o2
+        elif args.opt_level == "both":
+            if tcc_o0: save_dict['tcc_o0'] = tcc_o0
+            if tcc_o1: save_dict['tcc_o1'] = tcc_o1
+            if gcc_o0: save_dict['gcc_o0'] = gcc_o0
+            if gcc_o1: save_dict['gcc_o1'] = gcc_o1
+        else:
+            if tcc_result: save_dict[f'tcc_o{args.opt_level}'] = tcc_result
+            if gcc_result: save_dict[f'gcc_o{args.opt_level}'] = gcc_result
+        save_results_json(args.save_data, save_dict)
 
     print("\nDone!")
 

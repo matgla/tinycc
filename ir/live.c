@@ -730,6 +730,50 @@ void tcc_ir_live_analysis(TCCIRState *ir)
   /* Compute live intervals from the IR after optimizations */
   tcc_ir_live_intervals_compute(ir);
 
+  /* Compute per-vreg use counts for spill cost heuristic */
+  {
+    const int lc = ir->next_local_variable;
+    const int tc = ir->next_temporary_variable;
+    const int pc = ir->next_parameter;
+    const int total = lc + tc + pc;
+    uint16_t *uc = (uint16_t *)tcc_mallocz(sizeof(uint16_t) * (total > 0 ? total : 1));
+    for (int i = 0; i < instruction_count; ++i)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      if (q->op == TCCIR_OP_NOP) continue;
+      const IROperand s1 = tcc_ir_op_get_src1(ir, q);
+      if (irop_config[q->op].has_src1 && tcc_ir_vreg_is_valid(ir, s1.vr))
+      {
+        int t = TCCIR_DECODE_VREG_TYPE(s1.vr), p = TCCIR_DECODE_VREG_POSITION(s1.vr);
+        int idx = (t == TCCIR_VREG_TYPE_VAR && p < lc) ? p :
+                  (t == TCCIR_VREG_TYPE_TEMP && p < tc) ? lc + p :
+                  (t == TCCIR_VREG_TYPE_PARAM && p < pc) ? lc + tc + p : -1;
+        if (idx >= 0 && uc[idx] < 65535) uc[idx]++;
+      }
+      const IROperand s2 = tcc_ir_op_get_src2(ir, q);
+      if (irop_config[q->op].has_src2 && tcc_ir_vreg_is_valid(ir, s2.vr))
+      {
+        int t = TCCIR_DECODE_VREG_TYPE(s2.vr), p = TCCIR_DECODE_VREG_POSITION(s2.vr);
+        int idx = (t == TCCIR_VREG_TYPE_VAR && p < lc) ? p :
+                  (t == TCCIR_VREG_TYPE_TEMP && p < tc) ? lc + p :
+                  (t == TCCIR_VREG_TYPE_PARAM && p < pc) ? lc + tc + p : -1;
+        if (idx >= 0 && uc[idx] < 65535) uc[idx]++;
+      }
+    }
+    /* Build use count array in interval order (vars, temps, params) */
+    int ic = 0;
+    for (int v = 0; v < lc; v++) { if (!tcc_ir_vreg_is_ignored(ir, (TCCIR_VREG_TYPE_VAR<<28)|v) && ir->variables_live_intervals[v].start != INTERVAL_NOT_STARTED) ic++; }
+    for (int v = 0; v < tc; v++) { if (!tcc_ir_vreg_is_ignored(ir, (TCCIR_VREG_TYPE_TEMP<<28)|v) && ir->temporary_variables_live_intervals[v].start != INTERVAL_NOT_STARTED) ic++; }
+    ic += pc;
+    uint16_t *w = (uint16_t *)tcc_malloc(sizeof(uint16_t) * (ic > 0 ? ic : 1));
+    int wi = 0;
+    for (int v = 0; v < lc; v++) { if (!tcc_ir_vreg_is_ignored(ir, (TCCIR_VREG_TYPE_VAR<<28)|v) && ir->variables_live_intervals[v].start != INTERVAL_NOT_STARTED) { w[wi++] = uc[v]; } }
+    for (int v = 0; v < tc; v++) { if (!tcc_ir_vreg_is_ignored(ir, (TCCIR_VREG_TYPE_TEMP<<28)|v) && ir->temporary_variables_live_intervals[v].start != INTERVAL_NOT_STARTED) { w[wi++] = uc[lc+v]; } }
+    for (int v = 0; v < pc; v++) { w[wi++] = uc[lc+tc+v]; }
+    tcc_free(uc);
+    tcc_ls_set_use_counts(w, wi);
+  }
+
   /* Now populate the linear scan allocator with the computed intervals */
   for (int vreg = 0; vreg < ir->next_local_variable; ++vreg)
   {
@@ -962,4 +1006,70 @@ void tcc_ir_liveness_analysis(TCCIRState *ir)
 void tcc_ir_patch_live_intervals_registers(TCCIRState *ir)
 {
   tcc_ir_live_intervals_patch(ir);
+}
+
+int tcc_ir_move_coalescing(TCCIRState *ir)
+{
+  LSLiveIntervalState *ls = &ir->ls;
+  if (!ls->live_regs_by_instruction || ls->live_regs_by_instruction_size <= 0)
+    return 0;
+
+  int coalesced = 0;
+  const int n = ir->next_instruction_index;
+  const int tbl_size = ls->live_regs_by_instruction_size;
+
+  for (int i = 0; i < n; ++i)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_ASSIGN)
+      continue;
+
+    const IROperand src1 = tcc_ir_op_get_src1(ir, q);
+    const IROperand dest = tcc_ir_op_get_dest(ir, q);
+    if (!irop_config[q->op].has_src1 || !tcc_ir_vreg_is_valid(ir, src1.vr))
+      continue;
+    int32_t dv = irop_get_vreg(dest);
+    if (!irop_config[q->op].has_dest || !tcc_ir_vreg_is_valid(ir, dv))
+      continue;
+
+    LSLiveInterval *src_iv = NULL, *dst_iv = NULL;
+    for (int j = 0; j < ls->next_interval_index; ++j)
+    {
+      if (ls->intervals[j].vreg == (uint32_t)src1.vr) src_iv = &ls->intervals[j];
+      if (ls->intervals[j].vreg == (uint32_t)dv) dst_iv = &ls->intervals[j];
+      if (src_iv && dst_iv) break;
+    }
+    if (!src_iv || !dst_iv) continue;
+    if (src_iv->r0 < 0 || dst_iv->r0 < 0) continue;
+    if (src_iv->stack_location != 0 || dst_iv->stack_location != 0) continue;
+    if (src_iv->r0 == dst_iv->r0) continue;
+    if (src_iv->end != (uint32_t)i) continue;
+
+    int src_reg = src_iv->r0;
+    int conflict = 0;
+    for (int k = i + 1; k <= (int)dst_iv->end && k < tbl_size; ++k)
+    {
+      if (ls->live_regs_by_instruction[k] & (1u << src_reg))
+      {
+        conflict = 1;
+        break;
+      }
+    }
+    if (conflict) continue;
+
+    int old_reg = dst_iv->r0;
+    dst_iv->r0 = src_reg;
+
+    for (int k = (int)dst_iv->start; k <= (int)dst_iv->end && k < tbl_size; ++k)
+    {
+      ls->live_regs_by_instruction[k] &= ~(1u << old_reg);
+      ls->live_regs_by_instruction[k] |= (1u << src_reg);
+    }
+    coalesced++;
+  }
+
+  if (coalesced > 0)
+    tcc_ls_recompute_dirty_registers(ls);
+
+  return coalesced;
 }

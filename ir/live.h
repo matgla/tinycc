@@ -27,6 +27,9 @@ void tcc_ir_live_intervals_compute(struct TCCIRState *ir);
 /* Patch live intervals with assigned physical registers */
 void tcc_ir_live_intervals_patch(struct TCCIRState *ir);
 
+/* Post-allocation move coalescing */
+int tcc_ir_move_coalescing(struct TCCIRState *ir);
+
 /* Clear all live intervals */
 void tcc_ir_live_intervals_clear(struct TCCIRState *ir);
 

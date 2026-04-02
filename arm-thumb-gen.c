@@ -41,8 +41,10 @@
 #define CONFIG_TCC_CPUVER 5
 #endif
 
+#include "arch/arm/arm.h"
 #include "arm-thumb-defs.h"
 #include "ir/opt.h"
+#include "tcc-chained-hash.h"
 #include "tcc.h"
 #include "tccir.h"
 #include "tccls.h"
@@ -121,11 +123,37 @@ ST_FUNC int tcc_gen_machine_abi_assign_call_args(const TCCAbiArgDesc *args, int 
 }
 
 #include "arch/fpu/arm/fpv5-sp-d16.h"
-#include "arm-thumb-opcodes.h"
+#include "arch/fpu/arm/fpv5-d16.h"
+#include "arch/arm/thumb/thumb.h"
+#include "arch/arm/thumb/thop_adr.h"
+#include "arch/arm/thumb/thop_alu_imm.h"
+#include "arch/arm/thumb/thop_alu_reg.h"
+#include "arch/arm/thumb/thop_block.h"
+#include "arch/arm/thumb/thop_branch.h"
+#include "arch/arm/thumb/thop_cmp.h"
+#include "arch/arm/thumb/thop_extend.h"
+#include "arch/arm/thumb/thop_ldr_literal.h"
+#include "arch/arm/thumb/thop_ldrd.h"
+#include "arch/arm/thumb/thop_mem_imm.h"
+#include "arch/arm/thumb/thop_mem_reg.h"
+#include "arch/arm/thumb/thop_mov.h"
+#include "arch/arm/thumb/thop_mul.h"
+#include "arch/arm/thumb/thop_mvn.h"
+#include "arch/arm/thumb/thop_pld.h"
+#include "arch/arm/thumb/thop_shift_imm.h"
+#include "arch/arm/thumb/thop_shift_reg.h"
+#include "arch/arm/thumb/thop_system.h"
 
 #include <inttypes.h>
 
 int load_word_from_base(int ir, int base, int fc, int sign);
+
+static inline thumb_flags_behaviour flags_safe(void)
+{
+  if (tcc_state->ir && tcc_state->ir->codegen_flags_live)
+    return FLAGS_BEHAVIOUR_BLOCK;
+  return FLAGS_BEHAVIOUR_NOT_IMPORTANT;
+}
 
 /* Helper to validate a Sym pointer - returns NULL if invalid/unusable for relocation */
 static inline Sym *validate_sym_for_reloc(Sym *sym)
@@ -171,6 +199,7 @@ ST_DATA const int reg_classes[NB_REGS] = {
 
 enum float_abi float_abi;
 unsigned char text_and_data_separation;
+unsigned char allow_r9_write;
 unsigned char pic;
 
 int offset_to_args = 0;
@@ -180,17 +209,36 @@ thumb_flags_behaviour g_setflags = FLAGS_BEHAVIOUR_SET;
 uint32_t caller_saved_registers;
 uint32_t pushed_registers;
 int allocated_stack_size;
+int epilogue_stack_dealloc;     /* total SUB SP amount to restore in epilogue (includes alignment pad) */
 int callee_push_size = 0;       /* bytes pushed BELOW FP in two-phase push */
 uint32_t callee_saved_regs = 0; /* register mask for second push (below FP) */
 int vararg_push_size = 0;       /* bytes pushed for variadic r0-r3 save (16 or 0) */
 
-/* Adjust a local/spill frame offset when two-phase push is active and
- * callee-saved regs are pushed below FP.  Only adjusts negative non-param
- * offsets (locals/spills); positive and param offsets are unchanged. */
+/* Adjust a local/spill frame offset.
+ *
+ * When FP is used with two-phase push: adjusts by callee_push_size (regs
+ * pushed below FP).
+ *
+ * When FP is omitted: converts FP-relative negative offsets to SP-relative
+ * positive offsets.  The alignment pad sits at the top of the SUB SP region
+ * (right below pushed regs), so locals are addressed relative to
+ * allocated_stack_size (without pad):
+ * FP + frame_offset = SP + allocated_stack_size + frame_offset. */
 static inline int fp_adjust_local_offset(int frame_offset, int is_param)
 {
-  if (!is_param && frame_offset < 0 && callee_push_size > 0)
+  if (is_param)
+    return frame_offset;
+
+  if (!tcc_state->need_frame_pointer && frame_offset <= 0)
+  {
+    /* Convert FP-relative (negative) to SP-relative (positive).
+     * FP + frame_offset = SP + allocated_stack_size + frame_offset. */
+    return allocated_stack_size + frame_offset;
+  }
+
+  if (frame_offset < 0 && callee_push_size > 0)
     return frame_offset - callee_push_size;
+
   return frame_offset;
 }
 
@@ -205,7 +253,17 @@ static uint32_t scratch_global_exclude = 0;
  * Size 128 since same register can be pushed multiple times for complex ops like
  * function calls with many arguments. */
 static int scratch_push_stack[128];
+static int scratch_push_type[128]; /* 1 = PUSH, 2 = STR to scratch area */
 static int scratch_push_count = 0;
+
+/* Flag: set to 1 when a real-run (non-dry-run) scratch PUSH is emitted.
+ * Used by codegen to detect when FP omission caused SP-corrupting pushes
+ * and trigger recompilation with FP enabled. */
+static int real_run_scratch_push_detected = 0;
+
+/* Current slot index within the scratch save area (0-based).
+ * Incremented on save, decremented on restore. */
+static int scratch_save_slot = 0;
 
 /* Debug tracking: current IR opcode being processed (set by codegen.c) */
 int g_debug_current_op = -1;
@@ -213,6 +271,12 @@ int g_debug_current_op = -1;
 int is_valid_opcode(thumb_opcode op);
 int ot(thumb_opcode op);
 int ot_check(thumb_opcode op);
+static int ot_check_mov_reg(uint32_t rd, uint32_t rm, thumb_flags_behaviour flags, thumb_shift shift,
+                            thumb_enforce_encoding enc, bool in_it);
+static int ot_check_ldr_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw, thumb_enforce_encoding enc);
+static int ot_check_str_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw, thumb_enforce_encoding enc);
+static void mov_equiv_reset_all(void);
+static void strldr_cache_reset(void);
 static void thumb_require_materialized_reg(const char *ctx, const char *operand, int reg);
 static bool thumb_is_hw_reg(int reg);
 static int get_struct_base_addr_mop(const MachineOperand *mop, int default_reg);
@@ -222,8 +286,8 @@ int th_patch_call(int t, int a);
 /* Structure to track scratch register allocation with potential save/restore */
 typedef struct ScratchRegAlloc
 {
-  int reg : 30;            /* The allocated scratch register (range 0-15 for ARM) */
-  uint32_t saved : 1;      /* Whether the register was pushed to stack (real emit only) */
+  int reg : 29;            /* The allocated scratch register (range 0-15 for ARM) */
+  uint32_t saved : 2;      /* 0=not saved, 1=PUSH to stack, 2=STR to scratch area */
   uint32_t would_save : 1; /* Whether a push was needed (set in both dry-run and real emit) */
 } ScratchRegAlloc;
 
@@ -255,8 +319,8 @@ static int resolve_chain_base(TCCIRState *ir, int ci, uint32_t exclude_regs, Scr
 
   /* Start from R10 (points to immediate parent's FP) */
   thumb_shift no_shift = {THUMB_SHIFT_NONE, 0, THUMB_SHIFT_IMMEDIATE};
-  ot_check(th_mov_reg(out_scratch->reg, architecture_config.static_chain_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, no_shift,
-                      ENFORCE_ENCODING_NONE, false));
+  ot_check_mov_reg(out_scratch->reg, architecture_config.static_chain_reg, flags_safe(), no_shift,
+                   ENFORCE_ENCODING_NONE, false);
 
   for (int hop = 1; hop < depth; hop++)
   {
@@ -305,6 +369,7 @@ typedef struct MachineCodegenContext
 static int g_insn_scratch_allocs = 0;     /* total scratch allocs this instruction */
 static uint16_t g_insn_scratch_saves = 0; /* registers that required PUSH this instruction */
 
+
 /* Allocate a scratch register for the current instruction.
  * excl: bitmask of registers that must not be chosen.
  * The allocation is recorded in ctx so mach_release_all() can free it. */
@@ -345,6 +410,16 @@ static int mach_ensure_in_reg(MachineCodegenContext *ctx, const MachineOperand *
 {
   switch (op->kind)
   {
+  case MACH_OP_NONE:
+    /* Unresolved operand: vreg has no register allocation (dead path,
+     * uninitialized variable, etc.).  Return a scratch register loaded
+     * with zero — the value is undefined but we must not crash. */
+    {
+      int r = mach_alloc_scratch(ctx, excl);
+      tcc_machine_load_constant(r, PREG_REG_NONE, 0, 0, NULL);
+      return r;
+    }
+
   case MACH_OP_REG:
     if (!op->needs_deref)
       return op->u.reg.r0;
@@ -392,24 +467,26 @@ static int mach_ensure_in_reg(MachineCodegenContext *ctx, const MachineOperand *
 
   case MACH_OP_SYMBOL:
   {
-    int r = mach_alloc_scratch(ctx, excl);
     Sym *raw_sym = op->u.sym.sym;
     Sym *sym = raw_sym ? validate_sym_for_reloc(raw_sym) : NULL;
     if (!op->needs_deref)
     {
       /* Load symbol address (with addend baked in). */
+      int r = mach_alloc_scratch(ctx, excl);
       tcc_machine_load_constant(r, PREG_REG_NONE, op->u.sym.addend, 0, sym);
+      return r;
     }
     else
     {
       /* Load symbol address into a scratch base reg, then dereference. */
+      int r = mach_alloc_scratch(ctx, excl);
       int base = mach_alloc_scratch(ctx, excl | (1u << (uint32_t)r));
       tcc_machine_load_constant(base, PREG_REG_NONE, 0, 0, sym);
       const int32_t addend = op->u.sym.addend;
       load_from_base(r, PREG_REG_NONE, op->btype, (int)op->is_unsigned, addend < 0 ? (int)(-addend) : (int)addend,
                      addend < 0 ? 1 : 0, (uint32_t)base);
+      return r;
     }
-    return r;
   }
 
   case MACH_OP_PARAM_STACK:
@@ -514,8 +591,8 @@ static void mach_writeback_dest(const MachineOperand *op, int reg)
     if (!op->needs_deref)
     {
       if (reg != op->u.reg.r0 && op->u.reg.r0 != (int)PREG_REG_NONE)
-        ot_check(th_mov_reg((uint32_t)op->u.reg.r0, (uint32_t)reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                            ENFORCE_ENCODING_NONE, false));
+        ot_check_mov_reg((uint32_t)op->u.reg.r0, (uint32_t)reg, flags_safe(), THUMB_SHIFT_DEFAULT,
+                         ENFORCE_ENCODING_NONE, false);
     }
     else
     {
@@ -607,8 +684,8 @@ void tcc_gen_mach_load_to_reg(int dest_reg, const MachineOperand *op)
     if (!op->needs_deref)
     {
       if (op->u.reg.r0 != dest_reg)
-        ot_check(th_mov_reg((uint32_t)dest_reg, (uint32_t)op->u.reg.r0, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                            THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
+        ot_check_mov_reg((uint32_t)dest_reg, (uint32_t)op->u.reg.r0, flags_safe(), THUMB_SHIFT_DEFAULT,
+                         ENFORCE_ENCODING_NONE, false);
       return;
     }
     /* Register-indirect: r0 is an address, load [r0] into dest_reg. */
@@ -691,8 +768,8 @@ void tcc_gen_mach_load_to_reg(int dest_reg, const MachineOperand *op)
     MachineCodegenContext ctx = {{}, 0};
     int r = mach_ensure_in_reg(&ctx, op, (1u << (uint32_t)dest_reg));
     if (r != dest_reg)
-      ot_check(th_mov_reg((uint32_t)dest_reg, (uint32_t)r, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                          ENFORCE_ENCODING_NONE, false));
+      ot_check_mov_reg((uint32_t)dest_reg, (uint32_t)r, flags_safe(), THUMB_SHIFT_DEFAULT,
+                       ENFORCE_ENCODING_NONE, false);
     mach_release_all(&ctx);
     return;
   }
@@ -729,75 +806,89 @@ static ThumbLiteralPoolEntry *dry_run_literal_pool = NULL;
 static int dry_run_literal_pool_count = 0;
 static int dry_run_literal_pool_size = 0;
 
-/* Hash table for O(1) literal pool lookups instead of O(n) linear search.
- * Key: (sym, imm), Value: index into literal pool array.
- * Using open addressing with linear probing. */
-#define LITERAL_POOL_HASH_SIZE 256 /* Power of 2 for fast modulo */
-typedef struct LiteralPoolHashEntry
+/* Literal pool dedup uses the same bucket+chain scheme as TinyCC's ELF hashes.
+ * We only hash entries created through th_literal_pool_find_or_allocate(), so
+ * plain th_literal_pool_allocate() users stay distinct. */
+#define LITERAL_POOL_HASH_BUCKET_COUNT 512
+#define LITERAL_POOL_LOOKUP_CACHE_SIZE 16
+
+typedef struct LiteralPoolLookupCacheEntry
 {
   Sym *sym;
   int64_t imm;
-  int pool_index; /* Index into literal pool array, or -1 if empty */
-  int valid;      /* 1 if this slot contains a valid entry, 0 if empty */
-} LiteralPoolHashEntry;
+  int pool_index;
+  uint32_t hash;
+  int valid;
+} LiteralPoolLookupCacheEntry;
 
-static LiteralPoolHashEntry literal_pool_hash[LITERAL_POOL_HASH_SIZE];
-static LiteralPoolHashEntry dry_run_literal_pool_hash[LITERAL_POOL_HASH_SIZE];
+typedef struct LiteralPoolLookupCache
+{
+  LiteralPoolLookupCacheEntry entries[LITERAL_POOL_LOOKUP_CACHE_SIZE];
+} LiteralPoolLookupCache;
+
+static TCCChainedHash literal_pool_hash;
+static LiteralPoolLookupCache literal_pool_last_lookup;
 
 static inline uint32_t literal_pool_hash_func(Sym *sym, int64_t imm)
 {
-  /* Simple hash combining pointer and immediate value */
-  uint64_t h = (uint64_t)(uintptr_t)sym;
-  h ^= (uint64_t)imm;
-  h ^= h >> 33;
-  h *= 0xff51afd7ed558ccdULL;
-  h ^= h >> 33;
-  return (uint32_t)(h & (LITERAL_POOL_HASH_SIZE - 1));
+  /* 32-bit hash to avoid expensive 64-bit multiply on Cortex-M */
+  uint32_t h = (uint32_t)(uintptr_t)sym;
+  h ^= (uint32_t)imm;
+  h ^= (uint32_t)((uint64_t)imm >> 32);
+  h ^= h >> 16;
+  h *= 0x45d9f3bU;
+  h ^= h >> 16;
+  return h;
 }
 
-static void literal_pool_hash_clear(LiteralPoolHashEntry *hash)
+static void literal_pool_hash_clear(TCCChainedHash *hash)
 {
-  for (int i = 0; i < LITERAL_POOL_HASH_SIZE; i++)
-  {
-    hash[i].valid = 0;
-    hash[i].pool_index = -1;
-  }
+  tcc_chained_hash_clear(hash);
 }
 
-static int literal_pool_hash_find(LiteralPoolHashEntry *hash, Sym *sym, int64_t imm)
+static void literal_pool_lookup_cache_clear(LiteralPoolLookupCache *cache)
 {
-  uint32_t idx = literal_pool_hash_func(sym, imm);
-  for (int i = 0; i < LITERAL_POOL_HASH_SIZE; i++)
-  {
-    uint32_t probe = (idx + i) & (LITERAL_POOL_HASH_SIZE - 1);
-    if (!hash[probe].valid)
-    {
-      return -1; /* Empty slot - not found */
-    }
-    if (hash[probe].sym == sym && hash[probe].imm == imm)
-    {
-      return hash[probe].pool_index;
-    }
-  }
-  return -1; /* Table full, not found */
+  memset(cache, 0, sizeof(*cache));
 }
 
-static void literal_pool_hash_insert(LiteralPoolHashEntry *hash, Sym *sym, int64_t imm, int pool_index)
+static inline int literal_pool_lookup_cache_find(LiteralPoolLookupCache *cache, uint32_t full_hash, Sym *sym,
+                                                 int64_t imm)
 {
-  uint32_t idx = literal_pool_hash_func(sym, imm);
-  for (int i = 0; i < LITERAL_POOL_HASH_SIZE; i++)
+  LiteralPoolLookupCacheEntry *entry = &cache->entries[full_hash & (LITERAL_POOL_LOOKUP_CACHE_SIZE - 1)];
+  if (entry->valid && entry->hash == full_hash && entry->sym == sym && entry->imm == imm)
+    return entry->pool_index;
+  return -1;
+}
+
+static inline void literal_pool_lookup_cache_insert(LiteralPoolLookupCache *cache, uint32_t full_hash, Sym *sym,
+                                                    int64_t imm, int pool_index)
+{
+  LiteralPoolLookupCacheEntry *entry = &cache->entries[full_hash & (LITERAL_POOL_LOOKUP_CACHE_SIZE - 1)];
+  entry->sym = sym;
+  entry->imm = imm;
+  entry->pool_index = pool_index;
+  entry->hash = full_hash;
+  entry->valid = 1;
+}
+
+static inline int literal_pool_hash_find(TCCChainedHash *hash, ThumbLiteralPoolEntry *pool, uint32_t full_hash,
+                                         Sym *sym, int64_t imm)
+{
+  uint32_t slot = tcc_chained_hash_bucket_head(hash, full_hash);
+  while (slot)
   {
-    uint32_t probe = (idx + i) & (LITERAL_POOL_HASH_SIZE - 1);
-    if (!hash[probe].valid)
-    {
-      hash[probe].sym = sym;
-      hash[probe].imm = imm;
-      hash[probe].pool_index = pool_index;
-      hash[probe].valid = 1;
-      return;
-    }
+    int pool_index = (int)tcc_chained_hash_slot_to_index(slot);
+    if (tcc_chained_hash_entry_hash(hash, (uint32_t)pool_index) == full_hash && pool[pool_index].sym == sym &&
+        pool[pool_index].imm == imm)
+      return pool_index;
+    slot = tcc_chained_hash_next_slot(hash, slot);
   }
-  /* Table full - this shouldn't happen with reasonable pool sizes */
+  return -1;
+}
+
+static inline void literal_pool_hash_insert(TCCChainedHash *hash, uint32_t full_hash, int pool_index)
+{
+  tcc_chained_hash_insert_head(hash, full_hash, (uint32_t)pool_index);
 }
 
 static void dry_run_init(void)
@@ -939,7 +1030,8 @@ static int branch_fits_t2(int offset)
 static void branch_opt_init(void)
 {
   branch_opt_state.branch_count = 0;
-  branch_opt_state.optimization_enabled = 0; /* Disabled: dry-run addresses diverge from real pass */
+  branch_opt_state.optimization_enabled =
+      0; /* Dry-run analysis disabled: use real-time backward branch narrowing instead */
   branch_opt_state.code_size_reduction = 0;
   if (!branch_opt_state.branches)
   {
@@ -948,8 +1040,8 @@ static void branch_opt_init(void)
   }
 }
 
-/* Record a branch for later optimization analysis */
-static void branch_opt_record(int ir_index, int source_addr, int target_ir, int is_conditional)
+/* Record a branch for later optimization analysis (used by dry-run analysis path) */
+static void __attribute__((unused)) branch_opt_record(int ir_index, int source_addr, int target_ir, int is_conditional)
 {
   if (!branch_opt_state.optimization_enabled)
     return;
@@ -1082,18 +1174,13 @@ static void branch_opt_analyze(uint32_t *ir_to_code_mapping, int mapping_size)
     }
   }
 
-#ifdef DEBUG_BRANCH_OPT
-  fprintf(stderr,
-          "[BRANCH_OPT] %d branches, %d converted to 16-bit, "
-          "%d bytes saved, %d iterations\n",
-          branch_opt_state.branch_count, branch_opt_state.code_size_reduction / 2, branch_opt_state.code_size_reduction,
-          iterations);
-#endif
+  LOG_BRANCH_OPT("%d branches, %d converted to 16-bit, %d bytes saved, %d iterations", branch_opt_state.branch_count,
+                 branch_opt_state.code_size_reduction / 2, branch_opt_state.code_size_reduction, iterations);
 }
 
 /* Lookup encoding decision for a given IR index */
-/* Local version that returns the enum type */
-static BranchEncoding branch_opt_get_encoding(int ir_index)
+/* Local version that returns the enum type (used by dry-run analysis path) */
+static BranchEncoding __attribute__((unused)) branch_opt_get_encoding(int ir_index)
 {
   for (int i = 0; i < branch_opt_state.branch_count; i++)
   {
@@ -1116,6 +1203,18 @@ ST_FUNC void tcc_gen_machine_branch_opt_init(void)
   branch_opt_init();
 }
 
+/* Reset the MOV-coalescing and STR->LDR redundant-reload caches.  Called
+ * at IR instruction boundaries because any IR op can be the target of a
+ * branch from elsewhere: arriving via jump, the runtime register and
+ * memory state is not what the emission-order state would predict, so
+ * cross-IR matching is unsafe.  Within a single IR op the backend emits
+ * straight-line code and both peepholes are sound. */
+ST_FUNC void tcc_gen_machine_mov_coalesce_reset(void)
+{
+  mov_equiv_reset_all();
+  strldr_cache_reset();
+}
+
 /* Public interface for dry-run code generation */
 ST_FUNC void tcc_gen_machine_dry_run_init(void)
 {
@@ -1132,8 +1231,9 @@ ST_FUNC void tcc_gen_machine_dry_run_start(void)
     dry_run_literal_pool = tcc_malloc(dry_run_literal_pool_size * sizeof(ThumbLiteralPoolEntry));
   }
   dry_run_literal_pool_count = 0;
-  /* Clear the dry-run hash table */
-  literal_pool_hash_clear(dry_run_literal_pool_hash);
+  /* Clear the shared hash table for dry-run pass */
+  literal_pool_hash_clear(&literal_pool_hash);
+  literal_pool_lookup_cache_clear(&literal_pool_last_lookup);
   /* Save thumb_gen_state before dry-run */
   thumb_gen_state_snapshot_save(&dry_run_snapshot);
   /* Reset state that should start fresh for dry-run */
@@ -1150,6 +1250,10 @@ ST_FUNC void tcc_gen_machine_dry_run_end(void)
   dry_run_state.active = 0;
   /* Restore thumb_gen_state after dry-run */
   thumb_gen_state_snapshot_restore(&dry_run_snapshot);
+  /* Clear the literal pool hash table so that stale dry-run indices
+   * don't cause real-pass entries to be misidentified as shared. */
+  literal_pool_hash_clear(&literal_pool_hash);
+  literal_pool_lookup_cache_clear(&literal_pool_last_lookup);
   /* Note: we keep dry_run_literal_pool allocated for reuse */
 }
 
@@ -1176,7 +1280,16 @@ ST_FUNC void tcc_gen_machine_reset_scratch_state(void)
    * NEVER be used as a scratch register. Permanently exclude it. */
   scratch_global_exclude = text_and_data_separation ? (1u << R9) : 0;
   scratch_push_count = 0;
+  scratch_save_slot = 0;
   memset(scratch_push_stack, 0, sizeof(scratch_push_stack));
+  memset(scratch_push_type, 0, sizeof(scratch_push_type));
+  real_run_scratch_push_detected = 0;
+}
+
+/* Returns 1 if any scratch PUSH was emitted during the real run. */
+ST_FUNC int tcc_gen_machine_real_run_had_scratch_push(void)
+{
+  return real_run_scratch_push_detected;
 }
 
 /* Per-instruction scratch tracking (Phase 3 constraint collection).
@@ -1214,10 +1327,7 @@ static ScratchRegAlloc get_scratch_reg_with_save(uint32_t exclude_regs)
   ScratchRegAlloc result = {0};
   TCCIRState *ir = tcc_state->ir;
 
-#ifdef ARM_THUMB_DEBUG_SCRATCH
-  fprintf(stderr, "[SCRATCH] get_scratch_reg: input_exclude=0x%x global_exclude=0x%x\n", exclude_regs,
-          scratch_global_exclude);
-#endif
+  LOG_SCRATCH("get_scratch_reg: input_exclude=0x%x global_exclude=0x%x", exclude_regs, scratch_global_exclude);
 
   exclude_regs |= scratch_global_exclude;
 
@@ -1232,9 +1342,7 @@ static ScratchRegAlloc get_scratch_reg_with_save(uint32_t exclude_regs)
       /* Never use SP or PC as scratch registers. */
       if (reg == R_SP || reg == R_PC)
         goto no_free_reg;
-#ifdef ARM_THUMB_DEBUG_SCRATCH
-      fprintf(stderr, "[SCRATCH] -> returning reg=%d (free) exclude=0x%x\n", reg, exclude_regs);
-#endif
+      LOG_SCRATCH("-> returning reg=%d (free) exclude=0x%x", reg, exclude_regs);
       result.reg = reg;
       result.saved = 0;
       /* Update global exclude so subsequent calls won't return the same register.
@@ -1265,28 +1373,26 @@ no_free_reg:
     return result;
   }
 
-  /* No free register found - we need to save one to the stack */
-  /* Prefer R_IP (R12) as it's the inter-procedure scratch register */
-  if (!(exclude_regs & (1 << R_IP)))
+  /* No free register found - we need to save one to the stack.
+   * Prefer R0-R3: PUSH/POP and most ALU ops use 16-bit Thumb encoding,
+   * whereas R_IP (R12) forces 32-bit encoding for every instruction. */
+  for (int r = 0; r <= 3; ++r)
   {
-    reg_to_save = R_IP;
+    if (!(exclude_regs & (1 << r)))
+    {
+      reg_to_save = r;
+      break;
+    }
   }
-  else if (ir && ir->leaffunc && !(exclude_regs & (1 << R_LR)))
+
+  if (reg_to_save < 0 && ir && ir->leaffunc && !(exclude_regs & (1 << R_LR)))
   {
-    /* R_IP is excluded, try R_LR if we're in a leaf function */
     reg_to_save = R_LR;
   }
-  else
+
+  if (reg_to_save < 0 && !(exclude_regs & (1 << R_IP)))
   {
-    /* Try R0-R3 */
-    for (int r = 0; r <= 3; ++r)
-    {
-      if (!(exclude_regs & (1 << r)))
-      {
-        reg_to_save = r;
-        break;
-      }
-    }
+    reg_to_save = R_IP;
   }
 
   if (reg_to_save < 0)
@@ -1308,9 +1414,7 @@ no_free_reg:
   }
 
   /* No free register found - save one to the stack */
-#ifdef ARM_THUMB_DEBUG_SCRATCH
-  fprintf(stderr, "[SCRATCH] WARNING: no free scratch register! Saving r%d to stack\n", reg_to_save);
-#endif
+  LOG_SCRATCH("WARNING: no free scratch register! Saving r%d to stack", reg_to_save);
 
   /* Dry run: record what we would push, but don't emit */
   if (dry_run_state.active)
@@ -1324,7 +1428,29 @@ no_free_reg:
     return result;
   }
 
+  /* When FP is omitted, use STR to the pre-reserved scratch save area instead
+   * of PUSH, to avoid moving SP (which would break SP-relative addressing). */
+  if (!tcc_state->need_frame_pointer && ir && ir->scratch_save_size > 0 &&
+      scratch_save_slot < (ir->scratch_save_size / 4))
+  {
+    int frame_offset = ir->scratch_save_base + (scratch_save_slot * 4);
+    int sp_offset = allocated_stack_size + frame_offset;
+    if (!store_word_to_base(reg_to_save, R_SP, sp_offset, 0))
+      tcc_error("compiler_error: scratch save STR failed (offset %d)", sp_offset);
+    result.reg = reg_to_save;
+    result.saved = 2; /* 2 = saved to scratch area (not PUSH) */
+    result.would_save = 1;
+    if (scratch_push_count < 128)
+    {
+      scratch_push_type[scratch_push_count] = 2;
+      scratch_push_stack[scratch_push_count++] = reg_to_save;
+    }
+    scratch_save_slot++;
+    return result;
+  }
+
   ot_check(th_push(1 << reg_to_save));
+  real_run_scratch_push_detected = 1;
   result.reg = reg_to_save;
   result.saved = 1;
   result.would_save = 1; /* Phase 3: push was needed */
@@ -1332,6 +1458,7 @@ no_free_reg:
    * lists pops in register-number order, not stack order. */
   if (scratch_push_count < 128)
   {
+    scratch_push_type[scratch_push_count] = 1;
     scratch_push_stack[scratch_push_count++] = reg_to_save;
   }
   else
@@ -1367,7 +1494,22 @@ static void restore_scratch_reg(ScratchRegAlloc *alloc)
     return;
   }
 
-  if (alloc->saved)
+  if (alloc->saved == 2)
+  {
+    /* Saved to scratch area (FP omitted path): restore via LDR */
+    TCCIRState *ir = tcc_state->ir;
+    if (scratch_save_slot > 0)
+      scratch_save_slot--;
+    int frame_offset = ir->scratch_save_base + (scratch_save_slot * 4);
+    int sp_offset = allocated_stack_size + frame_offset;
+    if (!load_word_from_base(alloc->reg, R_SP, sp_offset, 0))
+      tcc_error("compiler_error: scratch restore LDR failed (offset %d)", sp_offset);
+    alloc->saved = 0;
+    if (scratch_push_count > 0 && scratch_push_stack[scratch_push_count - 1] == alloc->reg)
+      scratch_push_count--;
+    scratch_global_exclude &= ~(1u << alloc->reg);
+  }
+  else if (alloc->saved == 1)
   {
     /* We MUST restore in strict LIFO order.
      * An out-of-order POP corrupts SP (and can crash under QEMU).
@@ -1386,19 +1528,13 @@ static void restore_scratch_reg(ScratchRegAlloc *alloc)
     {
       if (scratch_push_count > 0)
       {
-#ifdef ARM_THUMB_DEBUG_SCRATCH
-        fprintf(stderr,
-                "[SCRATCH] WARNING: restore_scratch_reg out of order; deferring POP "
-                "reg=%d (top=%d)\n",
-                alloc->reg, scratch_push_stack[scratch_push_count - 1]);
-#endif
+        LOG_SCRATCH("WARNING: restore_scratch_reg out of order; deferring POP "
+                    "reg=%d (top=%d)",
+                    alloc->reg, scratch_push_stack[scratch_push_count - 1]);
       }
       else
       {
-#ifdef ARM_THUMB_DEBUG_SCRATCH
-        fprintf(stderr, "[SCRATCH] WARNING: restore_scratch_reg with empty push stack; deferring POP reg=%d\n",
-                alloc->reg);
-#endif
+        LOG_SCRATCH("WARNING: restore_scratch_reg with empty push stack; deferring POP reg=%d", alloc->reg);
       }
       return;
     }
@@ -1420,19 +1556,32 @@ static void restore_all_pushed_scratch_regs(void)
   if (dry_run_state.active)
   {
     scratch_push_count = 0;
+    scratch_save_slot = 0;
     scratch_global_exclude = text_and_data_separation ? (1u << R9) : 0;
     return;
   }
 
-  /* Pop in reverse order - ARM POP with register lists pops in register-number
-   * order, so we must issue individual POPs in reverse push order */
+  /* Restore in reverse order */
   for (int i = scratch_push_count - 1; i >= 0; i--)
   {
     int reg = scratch_push_stack[i];
-#ifdef ARM_THUMB_DEBUG_SCRATCH
-    fprintf(stderr, "[SCRATCH] auto-restoring r%d (push order %d)\n", reg, i);
-#endif
-    ot_check(th_pop(1 << reg));
+    LOG_SCRATCH("auto-restoring r%d (push order %d, type %d)", reg, i, scratch_push_type[i]);
+    if (scratch_push_type[i] == 2)
+    {
+      /* Saved to scratch area: restore via LDR */
+      TCCIRState *ir = tcc_state->ir;
+      if (scratch_save_slot > 0)
+        scratch_save_slot--;
+      int frame_offset = ir->scratch_save_base + (scratch_save_slot * 4);
+      int sp_offset = allocated_stack_size + frame_offset;
+      if (!load_word_from_base(reg, R_SP, sp_offset, 0))
+        tcc_error("compiler_error: scratch auto-restore LDR failed (offset %d)", sp_offset);
+    }
+    else
+    {
+      /* Saved via PUSH: restore via POP */
+      ot_check(th_pop(1 << reg));
+    }
   }
   scratch_push_count = 0;
   /* Also reset global exclude for next IR instruction.
@@ -1518,7 +1667,7 @@ int ot_check(thumb_opcode op)
 {
   if (!is_valid_opcode(op))
   {
-    fprintf(stderr, "[ot_check FAIL] opcode=0x%x ind=0x%x ir_op=%d\n", op.opcode, (unsigned)ind, g_debug_current_op);
+    LOG_SCRATCH("ot_check FAIL: opcode=0x%x ind=0x%x ir_op=%d", op.opcode, (unsigned)ind, g_debug_current_op);
     tcc_error("compiler_error: received invalid opcode: 0x%x\n", op.opcode);
   }
   return ot(op);
@@ -1613,6 +1762,335 @@ ST_FUNC void gen_fill_nops(int bytes)
   }
 }
 
+/* ---------------------------------------------------------------------------
+ * Redundant MOV reg coalescing
+ *
+ * Tracks which physical registers currently hold the same value and drops
+ * `MOV Rd, Rm` when Rd is already known to equal Rm.  Equivalence classes
+ * are represented by each register's class-representative in mov_equiv[];
+ * two registers are equal iff their representatives match.
+ *
+ * Updates:
+ *   MOV Rd, Rm             -> mov_equiv[Rd] := mov_equiv[Rm]   (Rd joins Rm)
+ *   any other write to Rc  -> mov_equiv[Rc] := Rc              (Rc new class)
+ *   unclassified opcode    -> full reset                       (conservative)
+ *
+ * Only applies to plain `MOV Rd, Rm` with no shift and no flag-setting (the
+ * T1 16-bit encoding and the no-shift/no-flags T2 32-bit encoding).  Any
+ * shifted / flag-setting MOV reads flags or transforms Rm and is left alone.
+ * --------------------------------------------------------------------------- */
+
+static uint8_t mov_equiv[16];
+
+/* Count of conditional instructions still pending inside an IT/ITx/ITxy/ITxyz
+ * block.  While this is non-zero the opcode stream seen by ot() is
+ * conditionally executed; cache updates must treat destinations as "may or
+ * may not be written", not as guaranteed assignments. */
+static int mov_equiv_it_pending;
+
+static void mov_equiv_reset_all(void)
+{
+  for (int i = 0; i < 16; i++)
+    mov_equiv[i] = (uint8_t)i;
+  mov_equiv_it_pending = 0;
+}
+
+/* Decode the IT instruction (Thumb-2 16-bit, opcode 0xBF<cond><mask>) and
+ * return the number of instructions that will execute conditionally after
+ * it — 1..4 depending on which bit of the mask is lowest-set.  Returns 0
+ * when the opcode is not an IT (mask == 0 is a plain NOP/hint). */
+static int mov_equiv_it_block_length(thumb_opcode op)
+{
+  if (op.size != 2)
+    return 0;
+  uint16_t hw = (uint16_t)(op.opcode & 0xFFFF);
+  if ((hw & 0xFF00) != 0xBF00)
+    return 0;
+  uint16_t mask = hw & 0x0F;
+  if (mask == 0)
+    return 0; /* NOP-hint encodings (NOP, YIELD, WFE, ...) */
+  if (mask & 0x1)
+    return 4;
+  if (mask & 0x2)
+    return 3;
+  if (mask & 0x4)
+    return 2;
+  return 1; /* mask & 0x8 */
+}
+
+static void mov_equiv_invalidate_reg(int reg)
+{
+  if (reg < 0 || reg >= 16)
+    return;
+  /* Any other register whose representative was `reg` becomes independent
+   * of reg's new (unknown) value.  Give each such register its own class. */
+  uint8_t old_rep = mov_equiv[reg];
+  for (int i = 0; i < 16; i++)
+  {
+    if (i != reg && mov_equiv[i] == old_rep)
+      mov_equiv[i] = (uint8_t)i;
+  }
+  mov_equiv[reg] = (uint8_t)reg;
+}
+
+static void mov_equiv_record_mov(int rd, int rm)
+{
+  if (rd < 0 || rd >= 16 || rm < 0 || rm >= 16)
+  {
+    mov_equiv_reset_all();
+    return;
+  }
+  /* First invalidate Rd's old equivalences (Rd stops being equal to whatever
+   * it was before), then merge into Rm's class. */
+  mov_equiv_invalidate_reg(rd);
+  mov_equiv[rd] = mov_equiv[rm];
+}
+
+/* Emit `MOV Rd, Rm` unless the register-equivalence cache already says
+ * Rd currently holds the same value as Rm, in which case the MOV is a
+ * no-op and nothing is emitted.  Only the no-shift / no-flag-set forms
+ * participate in coalescing (identical to decode_mov_reg_plain); any
+ * caller passing a shift, setting flags, or using IT-conditional forms
+ * always emits through ot_check so that the semantics of those MOVs is
+ * preserved. */
+static int ot_check_mov_reg(uint32_t rd, uint32_t rm, thumb_flags_behaviour flags, thumb_shift shift,
+                            thumb_enforce_encoding enc, bool in_it)
+{
+  const int coalesceable = (flags != FLAGS_BEHAVIOUR_SET) && !in_it && (shift.type == THUMB_SHIFT_NONE) && (rd < 16) &&
+                           (rm < 16) && thumb_gen_state.generating_function;
+  if (coalesceable && (rd == rm || mov_equiv[rd] == mov_equiv[rm]))
+  {
+    /* Elided at the call site: ot() is never reached, so ind and code_size
+     * only reflect instructions that really got emitted.  The cache is
+     * already consistent (rd is equal to rm), so no update is needed. */
+    return 0;
+  }
+  thumb_opcode mov_op = th_mov_reg(rd, rm, flags, shift, enc, in_it);
+  return ot_check(mov_op);
+}
+
+/* Return 1 if `op` is a plain MOV Rd, Rm with no shift and no flag set,
+ * filling *rd_out / *rm_out.  Accepts the 16-bit T1 high-register form and
+ * the 32-bit T2 form when shift/flags are zero. */
+static int decode_mov_reg_plain(thumb_opcode op, int *rd_out, int *rm_out)
+{
+  if (op.size == 2)
+  {
+    uint16_t hw = (uint16_t)(op.opcode & 0xFFFF);
+    /* T1 MOV high-register: 0100 0110 D Rm4 Rd3 */
+    if ((hw & 0xFF00) == 0x4600)
+    {
+      int rd = ((hw >> 4) & 0x08) | (hw & 0x07);
+      int rm = (hw >> 3) & 0x0F;
+      *rd_out = rd;
+      *rm_out = rm;
+      return 1;
+    }
+    return 0;
+  }
+  if (op.size == 4)
+  {
+    uint16_t hi = (uint16_t)((op.opcode >> 16) & 0xFFFF);
+    uint16_t lo = (uint16_t)(op.opcode & 0xFFFF);
+    /* T2 MOV register, no shift, no flag set: EA4F 0<rd>0<rm>.
+     * Opcode layout (ARM ARM): 11101010 0100 1111 | 0 imm3 Rd imm2 type Rm
+     * For plain MOV (no shift): imm3 = 0, imm2 = 0, type = 00 (LSL).
+     * S bit distinguishes MOV/MOVS: hi[20] = 0 for MOV, 1 for MOVS. */
+    if (hi == 0xEA4F && (lo & 0x70F0) == 0)
+    {
+      int rd = (lo >> 8) & 0x0F;
+      int rm = lo & 0x0F;
+      *rd_out = rd;
+      *rm_out = rm;
+      return 1;
+    }
+    return 0;
+  }
+  return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * STR -> LDR redundant-reload peephole
+ *
+ * Tracks recent immediate-offset STR Rt, [Rn, #imm] emissions and skips the
+ * subsequent LDR Rt, [Rn, #imm] at the call site when Rt is still known to
+ * hold the stored value.  The cache is reset at every IR instruction
+ * boundary (via tcc_gen_machine_mov_coalesce_reset, same hook as plan C)
+ * so that cross-IR equivalences cannot be exploited — any IR op may be a
+ * branch target, and the runtime register/memory state on an entry-by-jump
+ * path is not what the emission-order state predicts.
+ *
+ * Only puw == 6 (P=1, U=1, W=0 — no writeback) STR/LDR forms are tracked.
+ * The classifier below recognises the T1 16-bit, T2 16-bit SP-relative, and
+ * T3 32-bit encodings (those that cover the common stack-spill path).
+ * --------------------------------------------------------------------------- */
+
+typedef struct StrLdrCacheEntry
+{
+  uint8_t valid;
+  uint8_t rt;
+  uint8_t rn;
+  uint8_t size; /* 2 or 4 */
+  int imm;
+  uint32_t puw;
+} StrLdrCacheEntry;
+
+#define STRLDR_CACHE_CAPACITY 8
+static StrLdrCacheEntry strldr_cache[STRLDR_CACHE_CAPACITY];
+static int strldr_cache_count;
+
+static void strldr_cache_reset(void)
+{
+  strldr_cache_count = 0;
+}
+
+/* Invalidate entries where the given register is either the stored value
+ * (Rt) or the base register (Rn).  Called when a subsequent instruction
+ * writes to that register. */
+static void strldr_cache_invalidate_reg(int reg)
+{
+  for (int i = 0; i < strldr_cache_count; i++)
+  {
+    StrLdrCacheEntry *e = &strldr_cache[i];
+    if (e->valid && (e->rt == reg || e->rn == reg))
+      e->valid = 0;
+  }
+}
+
+static void strldr_cache_record_str(int rt, int rn, int imm, uint32_t puw, int size)
+{
+  if (puw != 6)
+  {
+    strldr_cache_reset();
+    return;
+  }
+  /* Overwriting the same slot invalidates any prior cache entry for it. */
+  for (int i = 0; i < strldr_cache_count; i++)
+  {
+    StrLdrCacheEntry *e = &strldr_cache[i];
+    if (e->valid && e->rn == rn && e->imm == imm)
+      e->valid = 0;
+  }
+  if (strldr_cache_count >= STRLDR_CACHE_CAPACITY)
+  {
+    strldr_cache_reset();
+  }
+  StrLdrCacheEntry *e = &strldr_cache[strldr_cache_count++];
+  e->valid = 1;
+  e->rt = (uint8_t)rt;
+  e->rn = (uint8_t)rn;
+  e->imm = imm;
+  e->puw = puw;
+  e->size = (uint8_t)size;
+}
+
+/* Return 1 when a matching unclobbered STR entry exists that makes this
+ * LDR redundant.  Matches on all fields so a 16-bit LDR won't be elided
+ * against a 32-bit STR (and vice versa) — the encodings might pick
+ * different scale semantics. */
+static int strldr_cache_try_match_ldr(int rt, int rn, int imm, uint32_t puw, int size)
+{
+  if (puw != 6)
+    return 0;
+  for (int i = 0; i < strldr_cache_count; i++)
+  {
+    StrLdrCacheEntry *e = &strldr_cache[i];
+    if (!e->valid)
+      continue;
+    if (e->rt == rt && e->rn == rn && e->imm == imm && e->puw == puw && e->size == size)
+      return 1;
+  }
+  return 0;
+}
+
+/* Decode T1/T2/T3 STR/LDR immediate-offset forms with no writeback.
+ * Returns 1 and fills outputs when the opcode matches, 0 otherwise.
+ * *is_str_out is 1 for STR, 0 for LDR. */
+static int decode_str_ldr_imm(thumb_opcode op, int *is_str_out, int *rt_out, int *rn_out, int *imm_out,
+                              uint32_t *puw_out)
+{
+  if (op.size == 2)
+  {
+    uint16_t hw = (uint16_t)(op.opcode & 0xFFFF);
+    /* T1: 0b01100 = STR, 0b01101 = LDR (imm5 word-scaled, rn<8, rt<8). */
+    if ((hw & 0xF000) == 0x6000)
+    {
+      int is_ldr = (hw >> 11) & 1;
+      *is_str_out = !is_ldr;
+      *rt_out = hw & 0x7;
+      *rn_out = (hw >> 3) & 0x7;
+      *imm_out = ((hw >> 6) & 0x1F) << 2;
+      *puw_out = 6;
+      return 1;
+    }
+    /* T2: SP-relative. 0b10010 = STR, 0b10011 = LDR (imm8 word-scaled). */
+    if ((hw & 0xF000) == 0x9000)
+    {
+      int is_ldr = (hw >> 11) & 1;
+      *is_str_out = !is_ldr;
+      *rt_out = (hw >> 8) & 0x7;
+      *rn_out = R_SP;
+      *imm_out = (hw & 0xFF) << 2;
+      *puw_out = 6;
+      return 1;
+    }
+    return 0;
+  }
+  if (op.size == 4)
+  {
+    uint16_t hi = (uint16_t)((op.opcode >> 16) & 0xFFFF);
+    uint16_t lo = (uint16_t)(op.opcode & 0xFFFF);
+    /* T3: STR 0xF8Cx, LDR 0xF8Dx (imm12, puw=6).  Exclude PC-relative. */
+    if ((hi & 0xFFF0) == 0xF8C0 || (hi & 0xFFF0) == 0xF8D0)
+    {
+      int is_ldr = ((hi & 0xFFF0) == 0xF8D0);
+      int rn = hi & 0xF;
+      if (rn == 0xF)
+        return 0; /* PC-relative literal load; skip. */
+      *is_str_out = !is_ldr;
+      *rn_out = rn;
+      *rt_out = (lo >> 12) & 0xF;
+      *imm_out = lo & 0xFFF;
+      *puw_out = 6;
+      return 1;
+    }
+    return 0;
+  }
+  return 0;
+}
+
+/* Emit LDR Rt, [Rn, #imm] unless the STR-cache already knows Rt still
+ * holds [Rn+imm] from an unclobbered earlier STR, in which case emission
+ * is skipped entirely.  ot() is never called in the elided path, so `ind`
+ * and code_size only advance for real emissions — same contract as the
+ * MOV coalescing helper. */
+static int ot_check_ldr_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw, thumb_enforce_encoding enc)
+{
+  thumb_opcode ins = th_ldr_imm(rt, rn, imm, puw, enc);
+  if (thumb_gen_state.generating_function && puw == 6 && ins.size != 0 &&
+      strldr_cache_try_match_ldr((int)rt, (int)rn, imm, puw, ins.size))
+  {
+    /* Redundant reload: Rt still holds [Rn+imm] from an earlier STR that
+     * has not been clobbered.  No emission, no cache update needed — the
+     * existing entry remains accurate. */
+    return 0;
+  }
+  return ot_check(ins);
+}
+
+/* Emit STR Rt, [Rn, #imm].  Always emits (STR cannot be elided); the
+ * cache-record side effect happens inside ot() once the opcode is
+ * classified, so there is nothing extra to do here other than go through
+ * the standard ot_check path.  Kept as a dedicated helper only for
+ * symmetry with ot_check_ldr_imm — callers use it so future refinements
+ * (e.g. dropping a dead store that follows another store to the same
+ * slot) can land in one place. */
+static int ot_check_str_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw, thumb_enforce_encoding enc)
+{
+  thumb_opcode ins = th_str_imm(rt, rn, imm, puw, enc);
+  return ot_check(ins);
+}
+
 static uint32_t mapcc(int cc)
 {
   /* In most places we carry high-level TOK_* comparisons (TOK_EQ, TOK_LT, ...).
@@ -1679,12 +2157,17 @@ static void th_literal_pool_init()
     tcc_free(thumb_gen_state.literal_pool);
   }
   thumb_gen_state.literal_pool = tcc_mallocz(sizeof(ThumbLiteralPoolEntry) * thumb_gen_state.literal_pool_size);
+  if (!literal_pool_hash.buckets)
+    tcc_chained_hash_init(&literal_pool_hash, LITERAL_POOL_HASH_BUCKET_COUNT, thumb_gen_state.literal_pool_size);
+  else
+    tcc_chained_hash_reserve(&literal_pool_hash, thumb_gen_state.literal_pool_size);
   thumb_gen_state.generating_function = 0;
   thumb_gen_state.code_size = 0;
   thumb_gen_state.cached_global_sym = NULL;
   thumb_gen_state.cached_global_reg = PREG_NONE;
   /* Clear the hash table for O(1) lookups */
-  literal_pool_hash_clear(literal_pool_hash);
+  literal_pool_hash_clear(&literal_pool_hash);
+  literal_pool_lookup_cache_clear(&literal_pool_last_lookup);
 }
 
 const FloatingPointConfig arm_soft_fpu_config = {
@@ -1710,6 +2193,23 @@ const FloatingPointConfig arm_soft_fpu_config = {
     .has_dtoi = 0,
 };
 
+static const char *arm_fpu_type_to_mfpu_str(unsigned char fpu_type)
+{
+  switch (fpu_type)
+  {
+  case ARM_FPU_FPV4_SP_D16:
+    return "fpv4-sp-d16";
+  case ARM_FPU_FPV5_SP_D16:
+    return "fpv5-sp-d16";
+  case ARM_FPU_FPV5_D16:
+    return "fpv5-d16";
+  case ARM_FPU_NONE:
+    return "none";
+  default:
+    return NULL;
+  }
+}
+
 const FloatingPointConfig *arm_determine_fpu_config(struct TCCState *s)
 {
   if (s->fpu_type == 0 || s->fpu_type == ARM_FPU_NONE)
@@ -1719,8 +2219,11 @@ const FloatingPointConfig *arm_determine_fpu_config(struct TCCState *s)
 
   switch (s->fpu_type)
   {
+  case ARM_FPU_FPV4_SP_D16:
   case ARM_FPU_FPV5_SP_D16:
     return &arm_fpv5_sp_d16_fpu_config;
+  case ARM_FPU_FPV5_D16:
+    return &arm_fpv5_d16_fpu_config;
   default:
     fprintf(stderr, "unsupported FPU type: %d for ARM architecture", s->fpu_type);
     exit(1);
@@ -1730,6 +2233,8 @@ const FloatingPointConfig *arm_determine_fpu_config(struct TCCState *s)
 
 ST_FUNC void arm_init(struct TCCState *s)
 {
+  arm_target_init(s->march_str, arm_fpu_type_to_mfpu_str(s->fpu_type), NULL, 0);
+
   float_type.t = VT_FLOAT;
   double_type.t = VT_DOUBLE;
   func_float_type.t = VT_FUNC;
@@ -1746,8 +2251,8 @@ ST_FUNC void arm_init(struct TCCState *s)
                                    (1 << ARM_R5) | (1 << ARM_R6) | (1 << ARM_R8) | (1 << ARM_R10) | (1 << ARM_R11) |
                                    (1 << ARM_R12);
 
-  s->registers_for_allocator = 11;
-  caller_saved_registers = (1 << ARM_R0) | (1 << ARM_R1) | (1 << ARM_R2) | (1 << ARM_R3);
+  s->registers_for_allocator = 13; /* r0-r12: ip is caller-saved, available for allocation */
+  caller_saved_registers = (1 << ARM_R0) | (1 << ARM_R1) | (1 << ARM_R2) | (1 << ARM_R3) | (1 << ARM_R12);
 
   /* On yasos with no-pic-data-is-text-relative, R9 holds the GOT base and is
    * caller-saved: callees (compiled by other toolchains) may clobber it, so
@@ -1772,7 +2277,6 @@ ST_FUNC void arm_init(struct TCCState *s)
   if (!s->pic && !s->text_and_data_separation)
   {
     s->registers_map_for_allocator |= (1 << ARM_R9);
-    s->registers_for_allocator += 1;
   }
 
   /* Always reserve R7 (FP) and never allocate it as a general register.
@@ -1788,9 +2292,14 @@ ST_FUNC void arm_deinit(struct TCCState *s)
 {
   (void)s;
   tcc_free(thumb_gen_state.literal_pool);
+  tcc_free(dry_run_literal_pool);
+  tcc_chained_hash_destroy(&literal_pool_hash);
   thumb_gen_state.literal_pool = NULL;
+  dry_run_literal_pool = NULL;
   thumb_gen_state.literal_pool_size = 0;
   thumb_gen_state.literal_pool_count = 0;
+  dry_run_literal_pool_size = 0;
+  dry_run_literal_pool_count = 0;
   thumb_gen_state.generating_function = 0;
   thumb_gen_state.code_size = 0;
   thumb_gen_state.cached_global_sym = NULL;
@@ -1884,13 +2393,11 @@ static void th_literal_pool_generate(void)
   if (need_align)
   {
     /* align to 4 bytes after branch */
-    thumb_opcode nop =
-        th_mov_reg(R0, R0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
-    o(nop.opcode & 0xffff);
+    ot_check(th_nop(ENFORCE_ENCODING_16BIT));
   }
 
   /* Array to store the output position of each unique literal */
-  int *literal_positions = tcc_malloc(pool_count * sizeof(int));
+  int *literal_positions = tcc_mallocz(pool_count * sizeof(int));
 
   th_sym_d();
 
@@ -2042,7 +2549,8 @@ static void th_literal_pool_generate(void)
   thumb_gen_state.code_size = 0;
   generating_pool = 0;
   /* Clear the hash table after flushing pool */
-  literal_pool_hash_clear(literal_pool_hash);
+  literal_pool_hash_clear(&literal_pool_hash);
+  literal_pool_lookup_cache_clear(&literal_pool_last_lookup);
 }
 
 static void th_literal_pool_reserve_upcoming_bytes(int upcoming_bytes)
@@ -2126,7 +2634,7 @@ int ot(thumb_opcode op)
 
   /* Detect instructions that write to R9 when it's reserved for GOT pointer.
    * Exclude push/pop/stmdb/ldmia which legitimately save/restore R9. */
-  if (text_and_data_separation)
+  if (text_and_data_separation && !allow_r9_write)
   {
     int dest = thumb_decode_dest_reg(op);
     if (dest == R9)
@@ -2134,6 +2642,104 @@ int ot(thumb_opcode op)
       tcc_error("instruction 0x%0*x (size=%d) writes to R9 (GOT pointer) at ind=0x%x ir_op=%d", op.size == 4 ? 8 : 4,
                 op.opcode, op.size, (unsigned)ind, g_debug_current_op);
     }
+  }
+
+  /* Update the MOV-coalescing register-equivalence cache and the STR->LDR
+   * redundant-reload cache based on what is about to be emitted.  This only
+   * tracks state — no elision happens here; elision is performed at the
+   * call sites via ot_check_mov_reg / ot_check_ldr_imm so that ot()'s
+   * return value remains the real emitted size and downstream jump/offset
+   * accounting never sees a phantom emission.
+   *
+   * IT blocks: instructions inside an IT/ITx/ITxy/ITxyz are conditionally
+   * executed.  Their writes are therefore not guaranteed, so destination
+   * registers must be invalidated rather than recorded as equivalences. */
+  if (thumb_gen_state.generating_function)
+  {
+    if (mov_equiv_it_pending > 0)
+    {
+      /* Conditional instruction: pessimistically drop anything this op
+       * might write, and never record new equivalences.  Treat STR/LDR
+       * the same way — their effect is gated on the IT condition. */
+      int mv_rd = -1, mv_rm = -1;
+      if (decode_mov_reg_plain(op, &mv_rd, &mv_rm))
+      {
+        mov_equiv_invalidate_reg(mv_rd);
+        strldr_cache_invalidate_reg(mv_rd);
+      }
+      else
+      {
+        int dest = thumb_decode_dest_reg(op);
+        if (dest >= 0)
+        {
+          mov_equiv_invalidate_reg(dest);
+          strldr_cache_invalidate_reg(dest);
+        }
+        else
+        {
+          mov_equiv_reset_all();
+          strldr_cache_reset();
+        }
+      }
+      mov_equiv_it_pending--;
+    }
+    else
+    {
+      int it_len = mov_equiv_it_block_length(op);
+      if (it_len > 0)
+      {
+        /* IT itself writes no GPR; start the conditional window. */
+        mov_equiv_it_pending = it_len;
+      }
+      else
+      {
+        int mv_rd = -1, mv_rm = -1;
+        int sl_is_str = 0, sl_rt = 0, sl_rn = 0, sl_imm = 0;
+        uint32_t sl_puw = 0;
+        if (decode_str_ldr_imm(op, &sl_is_str, &sl_rt, &sl_rn, &sl_imm, &sl_puw))
+        {
+          if (sl_is_str)
+          {
+            /* STR does not write a register; record the store for
+             * redundant-reload matching.  MOV-equiv is unaffected. */
+            strldr_cache_record_str(sl_rt, sl_rn, sl_imm, sl_puw, op.size);
+          }
+          else
+          {
+            /* LDR writes Rt: invalidate both caches for that register.
+             * If the call-site helper ran the match it would have
+             * elided without reaching ot(); so if we get here, this LDR
+             * is actually emitting and genuinely clobbers Rt. */
+            mov_equiv_invalidate_reg(sl_rt);
+            strldr_cache_invalidate_reg(sl_rt);
+          }
+        }
+        else if (decode_mov_reg_plain(op, &mv_rd, &mv_rm))
+        {
+          mov_equiv_record_mov(mv_rd, mv_rm);
+          strldr_cache_invalidate_reg(mv_rd);
+        }
+        else
+        {
+          int dest = thumb_decode_dest_reg(op);
+          if (dest >= 0)
+          {
+            mov_equiv_invalidate_reg(dest);
+            strldr_cache_invalidate_reg(dest);
+          }
+          else
+          {
+            mov_equiv_reset_all();
+            strldr_cache_reset();
+          }
+        }
+      }
+    }
+  }
+  else
+  {
+    mov_equiv_reset_all();
+    strldr_cache_reset();
   }
 
   /* Dry run: don't emit actual opcodes, but still track code size and
@@ -2239,6 +2845,14 @@ int decbranch(int pos)
 
     xa = ret + pos + 4;
   }
+  else if ((xa & 0xf500) == 0xb100)
+  {
+    /* CBZ/CBNZ encoding: offset = (i:imm5) * 2, forward only */
+    uint32_t i_bit = (xa >> 9) & 1;
+    uint32_t imm5 = (xa >> 3) & 0x1f;
+    uint32_t imm6 = (i_bit << 5) | imm5;
+    xa = (int)(imm6 * 2) + pos + 4;
+  }
   else
   {
     tcc_error("internal error: decbranch unknown encoding pos 0x%x, inst: 0x%x\n", pos, xa);
@@ -2252,9 +2866,9 @@ static thumb_opcode th_generic_mov_imm(uint32_t r, int imm)
 {
   if (imm < 0)
   {
-    return th_mvn_imm(r, 0, -imm - 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE);
+    return th_mvn_imm(r, 0, -imm - 1, flags_safe(), ENFORCE_ENCODING_NONE);
   }
-  return th_mov_imm(r, imm, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE);
+  return th_mov_imm(r, imm, flags_safe(), ENFORCE_ENCODING_NONE);
 }
 static ScratchRegAlloc th_offset_to_reg_ex(int off, int sign, uint32_t exclude_regs)
 {
@@ -2272,7 +2886,7 @@ static ScratchRegAlloc th_offset_to_reg_ex(int off, int sign, uint32_t exclude_r
   }
 
   if (sign)
-    ot_check(th_rsb_imm(rr, rr, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    ot_check(th_rsb_imm(rr, rr, 0, flags_safe(), ENFORCE_ENCODING_NONE));
   return alloc;
 }
 
@@ -2320,6 +2934,22 @@ int th_patch_call(int t, int a)
     x[0] |= enc >> 16;
     x[1] |= enc;
   }
+  else if ((*x & 0xf500) == 0xb100)
+  {
+    /* CBZ/CBNZ: 16-bit, forward-only, range 0-126 bytes.
+     * CBZ base = 0xb100, CBNZ base = 0xb900; both match (x & 0xf500) == 0xb100
+     * since bit 11 (0x0800) is not in the mask.
+     * Encoding: op | (i << 9) | (imm5 << 3) | Rn
+     * where offset = (i:imm5) * 2 */
+    int offset = a - (lt + 4); /* PC-relative, Thumb PC = insn + 4 */
+    if (offset < 0 || offset > 126 || (offset & 1))
+      tcc_error("compiler_error: CBZ/CBNZ target out of range: offset=%d", offset);
+    uint32_t imm6 = (uint32_t)offset >> 1;
+    uint32_t i_bit = (imm6 >> 5) & 1;
+    uint32_t imm5 = imm6 & 0x1f;
+    *x &= 0xfd07; /* Keep base opcode, NZ bit, and Rn */
+    *x |= (uint16_t)((i_bit << 9) | (imm5 << 3));
+  }
   else
     tcc_error("compiler_error: unhandled branch type in th_patch_call for: t: "
               "0x%x, a: 0x%x, x: 0x%x 0x%x\n",
@@ -2328,37 +2958,50 @@ int th_patch_call(int t, int a)
   return t;
 }
 
-static void gadd_sp(int val)
+/* Add a value to SP.  When the immediate doesn't fit the ADD/SUB SP encoding,
+ * a scratch register is needed.  scratch_reg selects which one:
+ *   >= 0  : use that specific physical register (caller guarantees it's free)
+ *   < 0   : default to R_IP (safe in prologue/epilogue where R0-R3 hold args)
+ */
+static void gadd_sp_ex(int val, int scratch_reg)
 {
   if (val == 0)
     return;
 
+  if (scratch_reg < 0)
+    scratch_reg = R_IP;
+
   if (val > 0)
   {
-    thumb_opcode add_imm = th_add_sp_imm(R_SP, (uint32_t)val, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE);
+    thumb_opcode add_imm = th_add_imm(R_SP, R_SP, (uint32_t)val, flags_safe(), ENFORCE_ENCODING_NONE);
     if (is_valid_opcode(add_imm))
     {
       ot(add_imm);
       return;
     }
 
-    /* Large adjustment: materialize value into IP and add via register form. */
-    load_full_const(R_IP, PREG_NONE, (uint32_t)val, 0);
-    ot_check(th_add_sp_reg(R_SP, R_IP, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE, THUMB_SHIFT_DEFAULT));
+    load_full_const(scratch_reg, PREG_NONE, (uint32_t)val, 0);
+    ot_check(
+        th_add_reg(R_SP, R_SP, scratch_reg, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     return;
   }
 
   /* val < 0 */
   const uint32_t sub = (uint32_t)(-val);
-  thumb_opcode sub_imm = th_sub_sp_imm(R_SP, sub, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE);
+  thumb_opcode sub_imm = th_sub_imm(R_SP, R_SP, sub, flags_safe(), ENFORCE_ENCODING_NONE);
   if (is_valid_opcode(sub_imm))
   {
     ot(sub_imm);
     return;
   }
 
-  load_full_const(R_IP, PREG_NONE, (uint32_t)sub, 0);
-  ot_check(th_sub_sp_reg(R_SP, R_IP, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+  load_full_const(scratch_reg, PREG_NONE, (uint32_t)sub, 0);
+  ot_check(th_sub_reg(R_SP, R_SP, scratch_reg, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+}
+
+static void gadd_sp(int val)
+{
+  gadd_sp_ex(val, -1);
 }
 
 void ggoto(void)
@@ -2381,6 +3024,17 @@ ST_FUNC void tcc_gen_machine_indirect_jump_mop(MachineOperand src, TccIrOp op)
   mach_release_all(&ctx);
 }
 
+/* Returns the number of bytes emitted by tcc_gen_machine_switch_table_mop for
+ * a table with the given number of entries.  Used by the dry-run pass in
+ * codegen.c so that branch-offset analysis is accurate without the backend
+ * having to emit any real instructions. */
+ST_FUNC int tcc_gen_machine_switch_table_dry_run_size(int num_entries)
+{
+  /* Layout: LSL.W(4) + ADD(2) + LDR.W(4) + ADD(2) + BX(2) = 14 bytes preamble
+   * + 4 bytes per table entry (32-bit signed PC-relative offsets). */
+  return 14 + num_entries * 4;
+}
+
 /* MOP variant: accepts a MachineOperand for the index register. */
 ST_FUNC void tcc_gen_machine_switch_table_mop(MachineOperand src, TCCIRSwitchTable *table, TCCIRState *ir, int ir_idx)
 {
@@ -2397,10 +3051,10 @@ ST_FUNC void tcc_gen_machine_switch_table_mop(MachineOperand src, TCCIRSwitchTab
   /* Reuse index_reg as scratch - it's dead after SWITCH_TABLE (terminator). */
   int rt = index_reg;
 
-  ot_check(th_lsl_imm(rt, index_reg, 2, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_32BIT));
-  ot_check(th_add_reg(rt, rt, R_PC, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-  ot_check(th_ldr_imm(rt, rt, 6, 6, ENFORCE_ENCODING_32BIT));
-  ot_check(th_add_reg(rt, rt, R_PC, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+  ot_check(th_lsl_imm(rt, index_reg, 2, flags_safe(), ENFORCE_ENCODING_32BIT));
+  ot_check(th_add_reg(rt, rt, R_PC, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+  ot_check_ldr_imm(rt, rt, 6, 6, ENFORCE_ENCODING_32BIT);
+  ot_check(th_add_reg(rt, rt, R_PC, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
   ot_check(th_bx_reg(rt));
 
   int table_start = ind;
@@ -2440,7 +3094,7 @@ ST_FUNC void gen_vla_alloc(CType *type, int align)
   int r = gv(RC_INT);
 
   /* r = SP - r */
-  ot_check(th_sub_reg(r, R_SP, r, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+  ot_check(th_sub_reg(r, R_SP, r, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
 
   if (align < 8)
     align = 8;
@@ -2450,7 +3104,7 @@ ST_FUNC void gen_vla_alloc(CType *type, int align)
   if (align > 1)
   {
     /* Try immediate BIC first; if it doesn't encode, fall back to register mask. */
-    if (!ot(th_bic_imm(r, r, (uint32_t)(align - 1), FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE)))
+    if (!ot(th_bic_imm(r, r, (uint32_t)(align - 1), flags_safe(), ENFORCE_ENCODING_NONE)))
     {
       ScratchRegAlloc mask_alloc = get_scratch_reg_with_save(1u << r);
       int mask_reg = mask_alloc.reg;
@@ -2458,7 +3112,7 @@ ST_FUNC void gen_vla_alloc(CType *type, int align)
       {
         load_full_const(mask_reg, PREG_NONE, LFC_SPLIT(align - 1));
       }
-      ot_check(th_bic_reg(r, r, mask_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+      ot_check(th_bic_reg(r, r, mask_reg, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
       if (mask_alloc.saved)
       {
         ot_check(th_pop(1u << mask_reg));
@@ -2467,7 +3121,7 @@ ST_FUNC void gen_vla_alloc(CType *type, int align)
   }
 
   /* SP = r */
-  ot_check(th_mov_reg(R_SP, r, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
+  ot_check_mov_reg(R_SP, r, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
 
   vpop();
 }
@@ -2481,9 +3135,12 @@ ST_FUNC void gen_vla_sp_save(int addr)
   int off = fp_adjust_local_offset(addr, 0 /* not param */);
   int sign = (off < 0) ? 1 : 0;
   int abs_off = sign ? -off : off;
+  const int base_reg = tcc_state->need_frame_pointer ? R_FP : R_SP;
 
-  ot_check(th_mov_reg(R_IP, R_SP, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
-  th_store32_imm_or_reg_ex(R_IP, R_FP, abs_off, sign, 0);
+  ScratchRegAlloc vla_sc = get_scratch_reg_with_save(0);
+  ot_check_mov_reg(vla_sc.reg, R_SP, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
+  th_store32_imm_or_reg_ex(vla_sc.reg, base_reg, abs_off, sign, 0);
+  restore_scratch_reg(&vla_sc);
 }
 
 ST_FUNC void gen_vla_sp_restore(int addr)
@@ -2495,9 +3152,12 @@ ST_FUNC void gen_vla_sp_restore(int addr)
   int off = fp_adjust_local_offset(addr, 0 /* not param */);
   int sign = (off < 0) ? 1 : 0;
   int abs_off = sign ? -off : off;
+  const int base_reg = tcc_state->need_frame_pointer ? R_FP : R_SP;
 
-  load_from_base(R_IP, PREG_REG_NONE, IROP_BTYPE_INT32, 0, abs_off, sign, R_FP);
-  ot_check(th_mov_reg(R_SP, R_IP, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
+  ScratchRegAlloc vla_sc = get_scratch_reg_with_save(0);
+  load_from_base(vla_sc.reg, PREG_REG_NONE, IROP_BTYPE_INT32, 0, abs_off, sign, base_reg);
+  ot_check_mov_reg(R_SP, vla_sc.reg, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
+  restore_scratch_reg(&vla_sc);
 }
 
 int load_ushort_from_base(int ir, int base, int fc, int sign)
@@ -2533,6 +3193,95 @@ int store_word_to_base(int ir, int base, int fc, int sign)
   const thumb_opcode ins = th_str_imm(ir, base, fc, sign ? 4 : 6, ENFORCE_ENCODING_NONE);
   TRACE("Store word sign: %d, r %d, base: %d, fc: %d\n", sign, ir, base, fc, sign);
   return ot(ins);
+}
+
+/* Returns 1 if a 64-bit access at (sym + addend) is guaranteed 4-byte aligned
+ * (so LDRD/STRD is safe).  Conservative: only allows natural alignment for
+ * non-struct, non-packed symbols, plus any explicit alignment >= 4. */
+static int sym_is_4_byte_aligned_for_64bit(Sym *sym, int32_t addend)
+{
+  if (!sym)
+    return 0;
+  if ((addend & 3) != 0)
+    return 0;
+  if (sym->a.packed)
+    return 0;
+  if (sym->a.aligned >= 3) /* explicit alignment 2^(n-1) >= 4 */
+    return 1;
+  if (sym->a.aligned > 0) /* explicit 1 or 2 byte alignment — not safe */
+    return 0;
+  /* sym->a.aligned == 0: rely on the declared type's natural alignment.
+   * Structs/unions may be packed-wrapped; reject conservatively.  Native
+   * scalars (long long, double, pointer) have natural alignment >= 4. */
+  int btype = sym->type.t & VT_BTYPE;
+  if (btype == VT_STRUCT)
+    return 0;
+  return 1;
+}
+
+/* Try to emit STRD Rt, Rt2, [base, #±abs_off] for a 64-bit paired store.
+ * Constraints (Thumb-2 STRD imm T1):
+ *   - Rt != Rt2
+ *   - Rt, Rt2 in r0..r12 or r14 (not SP, not PC)
+ *   - abs_off 4-byte aligned and <= 1020
+ * Returns 1 on success, 0 if the caller must fall back to two 32-bit stores. */
+static int try_strd_pair(int lo_reg, int hi_reg, int base, int abs_off, int sign)
+{
+  if ((abs_off & 3) != 0 || abs_off > 1020)
+    return 0;
+  if (lo_reg < 0 || lo_reg > R_LR || lo_reg == R_SP)
+    return 0;
+  if (hi_reg < 0 || hi_reg > R_LR || hi_reg == R_SP)
+    return 0;
+  if (lo_reg == hi_reg)
+    return 0;
+  const uint32_t puw = sign ? 4u : 6u;
+  ot_check(th_strd_imm((uint32_t)lo_reg, (uint32_t)hi_reg, (uint32_t)base, abs_off, puw));
+  return 1;
+}
+
+/* Mirror of try_strd_pair for LDRD.  Same register and offset constraints;
+ * the caller is responsible for guaranteeing 4-byte alignment of the target
+ * address (stack, or a symbol that passes sym_is_4_byte_aligned_for_64bit). */
+static int try_ldrd_pair(int lo_reg, int hi_reg, int base, int abs_off, int sign)
+{
+  if ((abs_off & 3) != 0 || abs_off > 1020)
+    return 0;
+  if (lo_reg < 0 || lo_reg > R_LR || lo_reg == R_SP)
+    return 0;
+  if (hi_reg < 0 || hi_reg > R_LR || hi_reg == R_SP)
+    return 0;
+  if (lo_reg == hi_reg)
+    return 0;
+  const uint32_t puw = sign ? 4u : 6u;
+  ot_check(th_ldrd_imm((uint32_t)lo_reg, (uint32_t)hi_reg, (uint32_t)base, abs_off, puw));
+  return 1;
+}
+
+/* Emit a single STR to a spill slot. Used by the codegen STRD pairing logic
+ * to flush a pending store when pairing wasn't possible. */
+ST_FUNC void tcc_gen_machine_store_spill(int src_reg, int32_t spill_offset)
+{
+  const int base_reg = tcc_state->need_frame_pointer ? R_FP : R_SP;
+  int adj = fp_adjust_local_offset(spill_offset, 0);
+  int sign = (adj < 0);
+  int abs_off = sign ? -adj : adj;
+  ot_check_str_imm((uint32_t)src_reg, (uint32_t)base_reg,
+                   abs_off, sign ? 4u : 6u, ENFORCE_ENCODING_NONE);
+}
+
+/* Try to emit STRD for two 32-bit values to adjacent spill slots.
+ * off1 must be the lower offset (off1 + 4 == off2).
+ * Returns 1 on success, 0 if STRD constraints not met. */
+ST_FUNC int tcc_gen_machine_try_strd_spill(int reg1, int32_t off1, int reg2, int32_t off2)
+{
+  if (off1 + 4 != off2)
+    return 0;
+  const int base_reg = tcc_state->need_frame_pointer ? R_FP : R_SP;
+  int adj = fp_adjust_local_offset(off1, 0);
+  int sign = (adj < 0);
+  int abs_off = sign ? -adj : adj;
+  return try_strd_pair(reg1, reg2, base_reg, abs_off, sign);
 }
 
 ST_FUNC int tcc_machine_can_encode_stack_offset_for_reg(int frame_offset, int dest_reg)
@@ -2737,9 +3486,10 @@ static ThumbLiteralPoolEntry *th_literal_pool_allocate()
       dry_run_literal_pool_size <<= 1;
       dry_run_literal_pool =
           tcc_realloc(dry_run_literal_pool, dry_run_literal_pool_size * sizeof(ThumbLiteralPoolEntry));
+      tcc_chained_hash_reserve(&literal_pool_hash, dry_run_literal_pool_size);
     }
     entry = &dry_run_literal_pool[dry_run_literal_pool_count++];
-    memset(entry, 0, sizeof(ThumbLiteralPoolEntry));
+    entry->sym = NULL;
     entry->relocation = -1;
     entry->shared_index = -1;
     /* Track the count in the main state for code size calculations */
@@ -2752,9 +3502,10 @@ static ThumbLiteralPoolEntry *th_literal_pool_allocate()
     const int new_size = thumb_gen_state.literal_pool_size << 1;
     thumb_gen_state.literal_pool = tcc_realloc(thumb_gen_state.literal_pool, new_size * sizeof(ThumbLiteralPoolEntry));
     thumb_gen_state.literal_pool_size = new_size;
+    tcc_chained_hash_reserve(&literal_pool_hash, new_size);
   }
   entry = &thumb_gen_state.literal_pool[thumb_gen_state.literal_pool_count++];
-  memset(entry, 0, sizeof(ThumbLiteralPoolEntry));
+  entry->sym = NULL;
   entry->relocation = -1;
   entry->shared_index = -1;
   return entry;
@@ -2766,22 +3517,33 @@ static ThumbLiteralPoolEntry *th_literal_pool_allocate()
 static ThumbLiteralPoolEntry *th_literal_pool_find_or_allocate(Sym *sym, int64_t imm)
 {
   int found_index;
-  LiteralPoolHashEntry *hash;
+  uint32_t full_hash;
+  TCCChainedHash *hash;
+  LiteralPoolLookupCache *cache;
+  ThumbLiteralPoolEntry *pool;
   int new_index;
 
   if (dry_run_state.active)
   {
-    hash = dry_run_literal_pool_hash;
+    hash = &literal_pool_hash;
+    cache = &literal_pool_last_lookup;
+    pool = dry_run_literal_pool;
     new_index = dry_run_literal_pool_count;
   }
   else
   {
-    hash = literal_pool_hash;
+    hash = &literal_pool_hash;
+    cache = &literal_pool_last_lookup;
+    pool = thumb_gen_state.literal_pool;
     new_index = thumb_gen_state.literal_pool_count;
   }
 
-  /* O(1) hash lookup instead of O(n) linear search */
-  found_index = literal_pool_hash_find(hash, sym, imm);
+  full_hash = literal_pool_hash_func(sym, imm);
+  found_index = literal_pool_lookup_cache_find(cache, full_hash, sym, imm);
+  if (found_index < 0)
+  {
+    found_index = literal_pool_hash_find(hash, pool, full_hash, sym, imm);
+  }
 
   /* Allocate new entry */
   ThumbLiteralPoolEntry *entry = th_literal_pool_allocate();
@@ -2792,9 +3554,10 @@ static ThumbLiteralPoolEntry *th_literal_pool_find_or_allocate(Sym *sym, int64_t
   }
   else
   {
-    /* This is a new primary entry - add to hash table */
-    literal_pool_hash_insert(hash, sym, imm, new_index);
+    literal_pool_hash_insert(hash, full_hash, new_index);
+    found_index = new_index;
   }
+  literal_pool_lookup_cache_insert(cache, full_hash, sym, imm, found_index);
   return entry;
 }
 
@@ -2803,9 +3566,7 @@ static void load_full_const(int r, int r1, uint32_t imm_lo, uint32_t imm_hi)
   struct Sym *sym = _lfc_sym;
   _lfc_sym = NULL;
   int64_t imm = (int64_t)((uint64_t)imm_hi << 32 | (uint64_t)imm_lo);
-  ElfSym *esym = NULL;
   ThumbLiteralPoolEntry *entry;
-  int sym_off = 0;
   thumb_opcode load_ins;
   int patch_pos;
 
@@ -2827,11 +3588,6 @@ static void load_full_const(int r, int r1, uint32_t imm_lo, uint32_t imm_hi)
         sym = NULL;
       }
     }
-
-    if (sym)
-    {
-      esym = elfsym(sym);
-    }
   }
 
   TRACE("'load_full_const' to register: %d, with imm: %d\n", r, imm);
@@ -2847,7 +3603,7 @@ static void load_full_const(int r, int r1, uint32_t imm_lo, uint32_t imm_hi)
   }
   else
   {
-    load_ins = th_ldrd_imm(r, r1, R_PC, 0, 4, ENFORCE_ENCODING_NONE);
+    load_ins = th_ldrd_imm(r, r1, R_PC, 0, 4);
   }
   ot_check(load_ins);
   patch_pos = ind - load_ins.size;
@@ -2863,30 +3619,29 @@ static void load_full_const(int r, int r1, uint32_t imm_lo, uint32_t imm_hi)
   entry->data_size = (r1 == PREG_NONE) ? 4 : 8;
   entry->short_instruction = (r1 == PREG_NONE && load_ins.size == 2);
 
+  if (!sym)
+  {
+    entry->imm = imm;
+    return;
+  }
+
   /* Re-derive esym after ot_check(): literal pool generation during ot_check
    * can call put_elf_sym → section_ptr_add → section_realloc, which may
    * free and reallocate the symtab section buffer, invalidating any
    * earlier ElfSym pointer. */
-  if (sym)
-    esym = elfsym(sym);
+  ElfSym *esym = elfsym(sym);
+  int sym_off = 0;
   if (esym)
   {
     sym_off = esym->st_shndx;
   }
   if (!pic)
   {
-    if (sym)
-    {
-      entry->relocation = R_ARM_ABS32;
-      /* The imm value is the addend (offset from symbol base).
-         For arr[i], imm = i * sizeof(element).
-         The linker will add the symbol's address to this addend. */
-      entry->imm = imm;
-    }
-    else
-    {
-      entry->imm = imm;
-    }
+    entry->relocation = R_ARM_ABS32;
+    /* The imm value is the addend (offset from symbol base).
+       For arr[i], imm = i * sizeof(element).
+       The linker will add the symbol's address to this addend. */
+    entry->imm = imm;
   }
   else
   {
@@ -2971,15 +3726,15 @@ static void load_full_const(int r, int r1, uint32_t imm_lo, uint32_t imm_hi)
             !sym_in_code_section_cg)
         {
           /* Static data symbol — GOTOFF (add R9) */
-          ot_check(th_add_reg(r, r, R9, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+          ot_check(th_add_reg(r, r, R9, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
         }
         else
         {
           thumb_opcode ot;
-          ot_check(th_add_reg(r, r, R9, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+          ot_check(th_add_reg(r, r, R9, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
 
-          ot_check(th_ldr_imm(r, r, 0, 6, ENFORCE_ENCODING_NONE));
-          ot = th_add_imm(r, r, imm, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE);
+          ot_check_ldr_imm(r, r, 0, 6, ENFORCE_ENCODING_NONE);
+          ot = th_add_imm(r, r, imm, flags_safe(), ENFORCE_ENCODING_NONE);
           if (ot.size != 0)
           {
             ot_check(ot);
@@ -3010,7 +3765,7 @@ static void load_full_const(int r, int r1, uint32_t imm_lo, uint32_t imm_hi)
             entry2->data_size = 4;
             entry2->short_instruction = (ldr.size == 2);
             ot_check(
-                th_add_reg(r, r, scratch, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+                th_add_reg(r, r, scratch, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
             restore_scratch_reg(&scratch_alloc);
           }
         }
@@ -3019,15 +3774,15 @@ static void load_full_const(int r, int r1, uint32_t imm_lo, uint32_t imm_hi)
       {
         if (sym->type.t & VT_STATIC)
         {
-          ot_check(th_add_reg(r, r, R_PC, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-          ot_check(th_sub_imm(r, r, 8, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+          ot_check(th_add_reg(r, r, R_PC, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+          ot_check(th_sub_imm(r, r, 8, flags_safe(), ENFORCE_ENCODING_NONE));
         }
         else
         {
           thumb_opcode ot;
-          ot_check(th_add_reg(r, r, R_PC, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-          ot_check(th_ldr_imm(r, r, 4, 6, ENFORCE_ENCODING_NONE));
-          ot = th_add_imm(r, r, imm, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE);
+          ot_check(th_add_reg(r, r, R_PC, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+          ot_check_ldr_imm(r, r, 4, 6, ENFORCE_ENCODING_NONE);
+          ot = th_add_imm(r, r, imm, flags_safe(), ENFORCE_ENCODING_NONE);
           if (ot.size != 0)
           {
             ot_check(ot);
@@ -3050,7 +3805,7 @@ static void load_full_const(int r, int r1, uint32_t imm_lo, uint32_t imm_hi)
             entry2->data_size = 4;
             entry2->short_instruction = (ldr.size == 2);
             ot_check(
-                th_add_reg(r, r, scratch, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+                th_add_reg(r, r, scratch, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
             restore_scratch_reg(&scratch_alloc);
           }
         }
@@ -3085,8 +3840,8 @@ ST_FUNC void tcc_machine_addr_of_stack_slot(int dest_reg, int frame_offset, int 
   {
     if (dest_reg != base_reg)
     {
-      ot_check(th_mov_reg(dest_reg, base_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE,
-                          false));
+      ot_check_mov_reg(dest_reg, base_reg, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE,
+                       false);
     }
     return;
   }
@@ -3105,8 +3860,8 @@ ST_FUNC void tcc_machine_addr_of_stack_slot(int dest_reg, int frame_offset, int 
     {
       if (cached_reg != dest_reg)
       {
-        ot_check(th_mov_reg(dest_reg, cached_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                            ENFORCE_ENCODING_NONE, false));
+        ot_check_mov_reg(dest_reg, cached_reg, flags_safe(), THUMB_SHIFT_DEFAULT,
+                         ENFORCE_ENCODING_NONE, false);
       }
       return;
     }
@@ -3115,8 +3870,8 @@ ST_FUNC void tcc_machine_addr_of_stack_slot(int dest_reg, int frame_offset, int 
 
   const int neg = (frame_offset < 0);
   int abs_off = neg ? -frame_offset : frame_offset;
-  thumb_opcode op = neg ? th_sub_imm(dest_reg, base_reg, abs_off, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE)
-                        : th_add_imm(dest_reg, base_reg, abs_off, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE);
+  thumb_opcode op = neg ? th_sub_imm(dest_reg, base_reg, abs_off, flags_safe(), ENFORCE_ENCODING_NONE)
+                        : th_add_imm(dest_reg, base_reg, abs_off, flags_safe(), ENFORCE_ENCODING_NONE);
 
   if (op.size != 0)
   {
@@ -3140,7 +3895,7 @@ ST_FUNC void tcc_machine_addr_of_stack_slot(int dest_reg, int frame_offset, int 
   }
 
   load_full_const(offset_reg, PREG_NONE, LFC_SPLIT(frame_offset));
-  ot_check(th_add_reg(dest_reg, base_reg, offset_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+  ot_check(th_add_reg(dest_reg, base_reg, offset_reg, flags_safe(), THUMB_SHIFT_DEFAULT,
                       ENFORCE_ENCODING_NONE));
 
   if (dest_reg == base_reg)
@@ -3273,8 +4028,28 @@ static void load_from_base(int r, int r1, int irop_btype, int is_unsigned, int f
       uint32_t exclude = (1u << r) | (1u << ir_high);
       base_alloc = get_scratch_reg_with_save(exclude);
       base_reg = (uint32_t)base_alloc.reg;
-      ot_check(th_mov_reg((int)base_reg, (int)base, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                          ENFORCE_ENCODING_NONE, false));
+      ot_check_mov_reg((int)base_reg, (int)base, flags_safe(), THUMB_SHIFT_DEFAULT,
+                       ENFORCE_ENCODING_NONE, false);
+    }
+
+    /* Try LDRD Rt, Rt2, [Rn, #±imm] when both halves share one base.
+     * T1 encoding requires: Rt != Rt2, Rt/Rt2 not SP/PC, offset 4-byte
+     * aligned and |offset| <= 1020.  LDRD also requires the target address
+     * to be 4-byte aligned on ARMv7-M/v8-M (faults otherwise, regardless of
+     * UNALIGN_TRP).  Restrict to SP/FP-relative bases where TCC's stack
+     * allocator guarantees 4-byte alignment of 64-bit slots; arbitrary
+     * pointers (e.g. into a packed struct) may be unaligned. */
+    const int base_is_stack = (base_reg == (uint32_t)R_SP || base_reg == (uint32_t)R_FP);
+    if (base_is_stack && (fc & 3) == 0 && fc <= 1020 && r >= 0 && r <= R_LR && r != R_SP && ir_high >= 0 &&
+        ir_high <= R_LR && ir_high != R_SP && r != ir_high)
+    {
+      uint32_t puw = sign ? 4 : 6;
+      ot_check(th_ldrd_imm((uint32_t)r, (uint32_t)ir_high, base_reg, fc, puw));
+      if (base_alloc.saved)
+        restore_scratch_reg(&base_alloc);
+      if (ir_high_alloc.saved)
+        restore_scratch_reg(&ir_high_alloc);
+      return;
     }
 
     /* Load low word */
@@ -3459,7 +4234,7 @@ typedef thumb_opcode (*thumb_regonly3_handler_t)(uint32_t rd, uint32_t rn, uint3
 
 static thumb_opcode thumb_mul_regonly(uint32_t rd, uint32_t rn, uint32_t rm)
 {
-  return th_mul(rd, rn, rm, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE);
+  return th_mul(rd, rn, rm, flags_safe(), ENFORCE_ENCODING_NONE);
 }
 
 static thumb_opcode thumb_sdiv_regonly(uint32_t rd, uint32_t rn, uint32_t rm)
@@ -3681,19 +4456,21 @@ static void thumb_emit_data_processing_mop64(const MachineOperand *src1, const M
   else
   {
     rn_hi = mach_alloc_scratch(&mctx, excl);
-    ot_check(th_mov_imm((uint32_t)rn_hi, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    ot_check(th_mov_imm((uint32_t)rn_hi, 0, flags_safe(), ENFORCE_ENCODING_NONE));
   }
   if (thumb_is_hw_reg(rn_hi))
     excl |= (1u << (uint32_t)rn_hi);
 
   /* 3. Load src2 and emit the 64-bit operation. */
-  const thumb_flags_behaviour lo_flags = uses_carry ? FLAGS_BEHAVIOUR_SET : FLAGS_BEHAVIOUR_NOT_IMPORTANT;
+  const thumb_flags_behaviour lo_flags = uses_carry ? FLAGS_BEHAVIOUR_SET : flags_safe();
+  /* For CMP, the high-word SBCS must set flags (the following SETIF reads them). */
+  const thumb_flags_behaviour hi_flags = (op == TCCIR_OP_CMP) ? FLAGS_BEHAVIOUR_SET : flags_safe();
   if (src2->kind == MACH_OP_IMM)
   {
     const uint32_t imm_lo = (uint32_t)((uint64_t)src2->u.imm.val & 0xffffffffu);
     const uint32_t imm_hi = (uint32_t)((uint64_t)src2->u.imm.val >> 32);
     thumb_emit_op_imm_fallback(rd_lo, rn_lo, imm_lo, lo_flags, regular);
-    thumb_emit_op_imm_fallback(rd_hi, rn_hi, imm_hi, FLAGS_BEHAVIOUR_NOT_IMPORTANT, carry_h);
+    thumb_emit_op_imm_fallback(rd_hi, rn_hi, imm_hi, hi_flags, carry_h);
   }
   else
   {
@@ -3710,13 +4487,13 @@ static void thumb_emit_data_processing_mop64(const MachineOperand *src1, const M
     else
     {
       rm_hi = mach_alloc_scratch(&mctx, excl);
-      ot_check(th_mov_imm((uint32_t)rm_hi, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+      ot_check(th_mov_imm((uint32_t)rm_hi, 0, flags_safe(), ENFORCE_ENCODING_NONE));
     }
     {
       ot_check(thumb_call_reg_handler(regular.reg_handler, (uint32_t)rd_lo, (uint32_t)rn_lo, (uint32_t)rm_lo, lo_flags,
                                       THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
       ot_check(thumb_call_reg_handler(carry_h.reg_handler, (uint32_t)rd_hi, (uint32_t)rn_hi, (uint32_t)rm_hi,
-                                      FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+                                      hi_flags, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     }
   }
 
@@ -3835,18 +4612,18 @@ static void thumb_emit_shift64_mop(const MachineOperand *src1, const MachineOper
     excl |= (1u << (uint32_t)src_hi);
     if (arith_right)
       ot_check(
-          th_asr_imm((uint32_t)src_hi, (uint32_t)src_lo, 31, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+          th_asr_imm((uint32_t)src_hi, (uint32_t)src_lo, 31, flags_safe(), ENFORCE_ENCODING_NONE));
     else
-      ot_check(th_mov_imm((uint32_t)src_hi, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+      ot_check(th_mov_imm((uint32_t)src_hi, 0, flags_safe(), ENFORCE_ENCODING_NONE));
   }
 
   /* Emit the shift — logic identical to thumb_emit_shift64_imm core. */
   if (sh == 0)
   {
-    ot_check(th_mov_reg((uint32_t)dst_lo, (uint32_t)src_lo, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                        ENFORCE_ENCODING_NONE, false));
-    ot_check(th_mov_reg((uint32_t)dst_hi, (uint32_t)src_hi, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                        ENFORCE_ENCODING_NONE, false));
+    ot_check_mov_reg((uint32_t)dst_lo, (uint32_t)src_lo, flags_safe(), THUMB_SHIFT_DEFAULT,
+                     ENFORCE_ENCODING_NONE, false);
+    ot_check_mov_reg((uint32_t)dst_hi, (uint32_t)src_hi, flags_safe(), THUMB_SHIFT_DEFAULT,
+                     ENFORCE_ENCODING_NONE, false);
   }
   else if (sh < 32)
   {
@@ -3856,50 +4633,50 @@ static void thumb_emit_shift64_mop(const MachineOperand *src1, const MachineOper
     {
       /* Compute the cross-shift into tmp BEFORE any destination is written,
        * because dst_lo/dst_hi may alias src_lo/src_hi. */
-      ot_check(cross_shift((uint32_t)tmp.reg, (uint32_t)src_lo, 32 - sh, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+      ot_check(cross_shift((uint32_t)tmp.reg, (uint32_t)src_lo, 32 - sh, flags_safe(),
                            ENFORCE_ENCODING_NONE));
       if (dst_hi == src_lo)
       {
         /* dst_hi aliases src_lo — compute dst_lo first (needs src_lo). */
         ot_check(
-            dst_lo_shift((uint32_t)dst_lo, (uint32_t)src_lo, sh, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+            dst_lo_shift((uint32_t)dst_lo, (uint32_t)src_lo, sh, flags_safe(), ENFORCE_ENCODING_NONE));
         ot_check(
-            dst_hi_shift((uint32_t)dst_hi, (uint32_t)src_hi, sh, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+            dst_hi_shift((uint32_t)dst_hi, (uint32_t)src_hi, sh, flags_safe(), ENFORCE_ENCODING_NONE));
       }
       else
       {
         /* Default order: dst_hi first to avoid clobbering src_hi via dst_lo. */
         ot_check(
-            dst_hi_shift((uint32_t)dst_hi, (uint32_t)src_hi, sh, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+            dst_hi_shift((uint32_t)dst_hi, (uint32_t)src_hi, sh, flags_safe(), ENFORCE_ENCODING_NONE));
         ot_check(
-            dst_lo_shift((uint32_t)dst_lo, (uint32_t)src_lo, sh, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+            dst_lo_shift((uint32_t)dst_lo, (uint32_t)src_lo, sh, flags_safe(), ENFORCE_ENCODING_NONE));
       }
-      ot_check(th_orr_reg((uint32_t)dst_hi, (uint32_t)dst_hi, (uint32_t)tmp.reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+      ot_check(th_orr_reg((uint32_t)dst_hi, (uint32_t)dst_hi, (uint32_t)tmp.reg, flags_safe(),
                           THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     }
     else
     {
       /* Compute the cross-shift into tmp BEFORE any destination is written,
        * because dst_lo/dst_hi may alias src_lo/src_hi. */
-      ot_check(cross_shift((uint32_t)tmp.reg, (uint32_t)src_hi, 32 - sh, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+      ot_check(cross_shift((uint32_t)tmp.reg, (uint32_t)src_hi, 32 - sh, flags_safe(),
                            ENFORCE_ENCODING_NONE));
       if (dst_lo == src_hi)
       {
         /* dst_lo aliases src_hi — compute dst_hi first (needs src_hi). */
         ot_check(
-            dst_hi_shift((uint32_t)dst_hi, (uint32_t)src_hi, sh, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+            dst_hi_shift((uint32_t)dst_hi, (uint32_t)src_hi, sh, flags_safe(), ENFORCE_ENCODING_NONE));
         ot_check(
-            th_lsr_imm((uint32_t)dst_lo, (uint32_t)src_lo, sh, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+            th_lsr_imm((uint32_t)dst_lo, (uint32_t)src_lo, sh, flags_safe(), ENFORCE_ENCODING_NONE));
       }
       else
       {
         /* Default order: dst_lo first to avoid clobbering src_lo via dst_hi. */
         ot_check(
-            th_lsr_imm((uint32_t)dst_lo, (uint32_t)src_lo, sh, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+            th_lsr_imm((uint32_t)dst_lo, (uint32_t)src_lo, sh, flags_safe(), ENFORCE_ENCODING_NONE));
         ot_check(
-            dst_hi_shift((uint32_t)dst_hi, (uint32_t)src_hi, sh, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+            dst_hi_shift((uint32_t)dst_hi, (uint32_t)src_hi, sh, flags_safe(), ENFORCE_ENCODING_NONE));
       }
-      ot_check(th_orr_reg((uint32_t)dst_lo, (uint32_t)dst_lo, (uint32_t)tmp.reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+      ot_check(th_orr_reg((uint32_t)dst_lo, (uint32_t)dst_lo, (uint32_t)tmp.reg, flags_safe(),
                           THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     }
     restore_scratch_reg(&tmp);
@@ -3909,20 +4686,20 @@ static void thumb_emit_shift64_mop(const MachineOperand *src1, const MachineOper
     if (is_left)
     {
       /* Emit MOV dst_hi first: dst_lo may alias src_lo. */
-      ot_check(th_mov_reg((uint32_t)dst_hi, (uint32_t)src_lo, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                          ENFORCE_ENCODING_NONE, false));
-      ot_check(th_mov_imm((uint32_t)dst_lo, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+      ot_check_mov_reg((uint32_t)dst_hi, (uint32_t)src_lo, flags_safe(), THUMB_SHIFT_DEFAULT,
+                       ENFORCE_ENCODING_NONE, false);
+      ot_check(th_mov_imm((uint32_t)dst_lo, 0, flags_safe(), ENFORCE_ENCODING_NONE));
     }
     else
     {
       /* Emit MOV dst_lo first: dst_hi may alias src_hi. */
-      ot_check(th_mov_reg((uint32_t)dst_lo, (uint32_t)src_hi, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                          ENFORCE_ENCODING_NONE, false));
+      ot_check_mov_reg((uint32_t)dst_lo, (uint32_t)src_hi, flags_safe(), THUMB_SHIFT_DEFAULT,
+                       ENFORCE_ENCODING_NONE, false);
       if (arith_right)
         ot_check(
-            th_asr_imm((uint32_t)dst_hi, (uint32_t)src_hi, 31, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+            th_asr_imm((uint32_t)dst_hi, (uint32_t)src_hi, 31, flags_safe(), ENFORCE_ENCODING_NONE));
       else
-        ot_check(th_mov_imm((uint32_t)dst_hi, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+        ot_check(th_mov_imm((uint32_t)dst_hi, 0, flags_safe(), ENFORCE_ENCODING_NONE));
     }
   }
   else if (sh < 64)
@@ -3930,9 +4707,9 @@ static void thumb_emit_shift64_mop(const MachineOperand *src1, const MachineOper
     if (is_left)
     {
       /* Emit shift into dst_hi first: dst_lo may alias src_lo. */
-      ot_check(dst_hi_shift((uint32_t)dst_hi, (uint32_t)src_lo, sh - 32, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+      ot_check(dst_hi_shift((uint32_t)dst_hi, (uint32_t)src_lo, sh - 32, flags_safe(),
                             ENFORCE_ENCODING_NONE));
-      ot_check(th_mov_imm((uint32_t)dst_lo, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+      ot_check(th_mov_imm((uint32_t)dst_lo, 0, flags_safe(), ENFORCE_ENCODING_NONE));
     }
     else
     {
@@ -3941,19 +4718,19 @@ static void thumb_emit_shift64_mop(const MachineOperand *src1, const MachineOper
         /* dst_lo aliases src_hi — compute dst_hi (sign extension) first
          * while src_hi is still intact, then shift into dst_lo. */
         ot_check(
-            th_asr_imm((uint32_t)dst_hi, (uint32_t)src_hi, 31, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
-        ot_check(dst_hi_shift((uint32_t)dst_lo, (uint32_t)src_hi, sh - 32, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+            th_asr_imm((uint32_t)dst_hi, (uint32_t)src_hi, 31, flags_safe(), ENFORCE_ENCODING_NONE));
+        ot_check(dst_hi_shift((uint32_t)dst_lo, (uint32_t)src_hi, sh - 32, flags_safe(),
                               ENFORCE_ENCODING_NONE));
       }
       else
       {
-        ot_check(dst_hi_shift((uint32_t)dst_lo, (uint32_t)src_hi, sh - 32, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+        ot_check(dst_hi_shift((uint32_t)dst_lo, (uint32_t)src_hi, sh - 32, flags_safe(),
                               ENFORCE_ENCODING_NONE));
         if (arith_right)
           ot_check(
-              th_asr_imm((uint32_t)dst_hi, (uint32_t)src_hi, 31, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+              th_asr_imm((uint32_t)dst_hi, (uint32_t)src_hi, 31, flags_safe(), ENFORCE_ENCODING_NONE));
         else
-          ot_check(th_mov_imm((uint32_t)dst_hi, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+          ot_check(th_mov_imm((uint32_t)dst_hi, 0, flags_safe(), ENFORCE_ENCODING_NONE));
       }
     }
   }
@@ -3961,20 +4738,20 @@ static void thumb_emit_shift64_mop(const MachineOperand *src1, const MachineOper
   {
     if (is_left)
     {
-      ot_check(th_mov_imm((uint32_t)dst_lo, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
-      ot_check(th_mov_imm((uint32_t)dst_hi, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+      ot_check(th_mov_imm((uint32_t)dst_lo, 0, flags_safe(), ENFORCE_ENCODING_NONE));
+      ot_check(th_mov_imm((uint32_t)dst_hi, 0, flags_safe(), ENFORCE_ENCODING_NONE));
     }
     else if (arith_right)
     {
       ot_check(
-          th_asr_imm((uint32_t)dst_hi, (uint32_t)src_hi, 31, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
-      ot_check(th_mov_reg((uint32_t)dst_lo, (uint32_t)dst_hi, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                          ENFORCE_ENCODING_NONE, false));
+          th_asr_imm((uint32_t)dst_hi, (uint32_t)src_hi, 31, flags_safe(), ENFORCE_ENCODING_NONE));
+      ot_check_mov_reg((uint32_t)dst_lo, (uint32_t)dst_hi, flags_safe(), THUMB_SHIFT_DEFAULT,
+                       ENFORCE_ENCODING_NONE, false);
     }
     else
     {
-      ot_check(th_mov_imm((uint32_t)dst_lo, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
-      ot_check(th_mov_imm((uint32_t)dst_hi, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+      ot_check(th_mov_imm((uint32_t)dst_lo, 0, flags_safe(), ENFORCE_ENCODING_NONE));
+      ot_check(th_mov_imm((uint32_t)dst_hi, 0, flags_safe(), ENFORCE_ENCODING_NONE));
     }
   }
 
@@ -4020,6 +4797,14 @@ static void thumb_emit_data_processing_mop32(const MachineOperand *src1, const M
 
   uint32_t excl = thumb_is_hw_reg(dest_reg) ? (1u << (uint32_t)dest_reg) : 0;
 
+  /* Exclude src2's register from scratch allocation for src1.
+   * Without this, materializing an immediate for src1 could pick src2's
+   * register, clobbering it before src2 is read.  This applies whether
+   * src2 is a plain register or a dereferenced one (the address register
+   * must survive until the load). */
+  if (src2->kind == MACH_OP_REG && thumb_is_hw_reg(src2->u.reg.r0))
+    excl |= (1u << (uint32_t)src2->u.reg.r0);
+
   /* 2. Ensure src1 is in a register; add it to the exclusion mask. */
   int src1_reg = mach_ensure_in_reg(&mctx, src1, excl);
   if (thumb_is_hw_reg(src1_reg))
@@ -4055,12 +4840,26 @@ static void thumb_emit_data_processing_mop32(const MachineOperand *src1, const M
  * Dispatches to thumb_emit_data_processing_mop64 / thumb_emit_shift64_mop for
  * 64-bit pair destinations, or thumb_emit_data_processing_mop32 for 32-bit.
  */
+static void data_processing_mop_impl(MachineOperand src1, MachineOperand src2, MachineOperand dest, TccIrOp op,
+                                     thumb_flags_behaviour flags_override);
+
 void tcc_gen_machine_data_processing_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest, TccIrOp op)
+{
+  data_processing_mop_impl(src1, src2, dest, op, flags_safe());
+}
+
+void tcc_gen_machine_data_processing_mop_flags(MachineOperand src1, MachineOperand src2, MachineOperand dest, TccIrOp op)
+{
+  data_processing_mop_impl(src1, src2, dest, op, FLAGS_BEHAVIOUR_SET);
+}
+
+static void data_processing_mop_impl(MachineOperand src1, MachineOperand src2, MachineOperand dest, TccIrOp op,
+                                     thumb_flags_behaviour flags_override)
 {
   ThumbDataProcessingHandler handler;
   ThumbDataProcessingHandler carry_handler; /* used for hi word of 64-bit ops */
   bool uses_carry = false;
-  thumb_flags_behaviour flags = FLAGS_BEHAVIOUR_NOT_IMPORTANT;
+  thumb_flags_behaviour flags = flags_override;
 
   switch (op)
   {
@@ -4079,9 +4878,11 @@ void tcc_gen_machine_data_processing_mop(MachineOperand src1, MachineOperand src
     uses_carry = true;
     break;
   case TCCIR_OP_CMP:
-    handler.imm_handler = th_cmp_imm;
+    handler.imm_handler = th_cmp_imm_handler;
     handler.reg_handler = th_cmp_reg;
-    carry_handler = handler;
+    carry_handler.imm_handler = th_sbc_imm;
+    carry_handler.reg_handler = th_sbc_reg;
+    uses_carry = true;
     break;
   case TCCIR_OP_SHL:
     handler.imm_handler = th_lsl_imm;
@@ -4126,8 +4927,9 @@ void tcc_gen_machine_data_processing_mop(MachineOperand src1, MachineOperand src
     return;
   }
 
-  /* Dispatch 64-bit pair destinations to the mop64 path. */
-  if (dest.is_64bit)
+  /* Dispatch 64-bit pair destinations to the mop64 path.
+   * CMP has no dest (MACH_OP_NONE), so also check src1 for 64-bit. */
+  if (dest.is_64bit || (op == TCCIR_OP_CMP && src1.is_64bit))
   {
     if (op == TCCIR_OP_SHL || op == TCCIR_OP_SHR || op == TCCIR_OP_SAR)
       thumb_emit_shift64_mop(&src1, &src2, &dest, op);
@@ -4137,6 +4939,31 @@ void tcc_gen_machine_data_processing_mop(MachineOperand src1, MachineOperand src
   }
 
   thumb_emit_data_processing_mop32(&src1, &src2, &dest, op, handler, flags);
+}
+
+/* tcc_gen_machine_ubfx_mop: emit UBFX Rd, Rn, #lsb, #width.
+ * src2 encodes lsb (bits 0-4) and width (bits 5-9). */
+void tcc_gen_machine_ubfx_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest)
+{
+  MachineCodegenContext ctx = {0};
+  int rd = mach_get_dest_reg(&ctx, &dest, 0);
+  uint32_t excl = (1u << (uint32_t)rd);
+  int rn = mach_ensure_in_reg(&ctx, &src1, excl);
+  int param = (src2.kind == MACH_OP_IMM) ? (int)src2.u.imm.val : 0;
+  int lsb = param & 0x1F;
+  int width = (param >> 5) & 0x1F;
+  if (width == 0)
+    width = 8;
+  int widthm1 = width - 1;
+  int imm3 = (lsb >> 2) & 0x7;
+  int imm2 = lsb & 0x3;
+  /* Thumb-2 UBFX encoding: 11110 0 11 1100 Rn | 0 imm3 Rd imm2 0 widthm1 */
+  thumb_opcode op;
+  op.size = 4;
+  op.opcode = 0xF3C00000 | ((uint32_t)rn << 16) | ((uint32_t)imm3 << 12) | ((uint32_t)rd << 8) | ((uint32_t)imm2 << 6) | (uint32_t)widthm1;
+  ot(op);
+  mach_writeback_dest(&dest, rd);
+  mach_release_all(&ctx);
 }
 
 /* ============================================================
@@ -4200,7 +5027,7 @@ static void mach_mod_mop(MachineCodegenContext *ctx, const MachineOperand *src1,
   ot_check(thumb_mul_regonly((uint32_t)quotient_reg, (uint32_t)quotient_reg, (uint32_t)src2_reg));
 
   /* 7. dest = src1 - quotient */
-  ot_check(th_sub_reg(dest_reg, src1_reg, quotient_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+  ot_check(th_sub_reg(dest_reg, src1_reg, quotient_reg, flags_safe(), THUMB_SHIFT_DEFAULT,
                       ENFORCE_ENCODING_NONE));
 
   /* 8. Write result back. */
@@ -4311,6 +5138,375 @@ static void thumb_emit_mul64_mop(MachineCodegenContext *ctx, const MachineOperan
  * MLA (accumulator; 4-operand) uses tcc_gen_machine_mla_mop.
  * UMULL (64-bit output from 32-bit inputs) uses tcc_gen_machine_umull_mop.
  */
+/* Decompose multiply-by-constant into shift+add sequences.
+ * Returns 1 if handled, 0 to fall back to hardware MUL. */
+static int thumb_try_mul_by_const_mop(MachineCodegenContext *ctx, MachineOperand *src1, MachineOperand *src2,
+                                      MachineOperand *dest)
+{
+  /* Identify which operand is the immediate and which is the variable. */
+  const MachineOperand *imm_op, *var_op;
+  if (src2->kind == MACH_OP_IMM)
+  {
+    imm_op = src2;
+    var_op = src1;
+  }
+  else if (src1->kind == MACH_OP_IMM)
+  {
+    imm_op = src1;
+    var_op = src2;
+  }
+  else
+    return 0;
+
+  int64_t c = imm_op->u.imm.val;
+  if (c <= 0)
+    return 0;
+
+  /* Determine the decomposition pattern.
+   * We handle: powers of 2, (2^n ± 1), and products thereof.
+   *
+   * Pattern             Insns  Example
+   * ─────────────────── ───── ───────
+   * 2^n                 1     LSL Rd, Rn, #n
+   * 2^n + 1             1     ADD Rd, Rn, Rn LSL #n
+   * 2^n - 1             1     SUB Rd, Rn LSL #n, Rn  (RSB-like via SUB)
+   * (2^a + 1) * 2^b     2     ADD Rd, Rn, Rn LSL #a; LSL Rd, Rd, #b
+   * (2^a - 1) * 2^b     2     SUB Rd, Rn LSL #a, Rn; LSL Rd, Rd, #b
+   * (2^a + 1)(2^b + 1)  2     ADD Rd, Rn, Rn LSL #a; ADD Rd, Rd, Rn LSL #(a+b)
+   *                            — only some cases, handled via table
+   */
+
+  int shift1 = 0, shift2 = 0;
+  enum
+  {
+    MUL_NONE,
+    MUL_POWER_OF_2,          /* c = 2^n : LSL #n */
+    MUL_TWO_N_PLUS_1,        /* c = 2^n+1 : ADD Rd, Rn, Rn LSL #n */
+    MUL_TWO_N_MINUS_1,       /* c = 2^n-1 : SUB Rd, Rn LSL #n, Rn */
+    MUL_TWO_N_PLUS_1_SHIFT,  /* c = (2^a+1)*2^b : ADD; LSL */
+    MUL_TWO_N_MINUS_1_SHIFT, /* c = (2^a-1)*2^b : SUB; LSL */
+  } pattern = MUL_NONE;
+
+  /* Check for power of 2 */
+  if (c > 0 && (c & (c - 1)) == 0)
+  {
+    int n = 0;
+    int64_t v = c;
+    while (v > 1)
+    {
+      n++;
+      v >>= 1;
+    }
+    if (n >= 1 && n <= 31)
+    {
+      shift1 = n;
+      pattern = MUL_POWER_OF_2;
+    }
+  }
+
+  /* Check for 2^n + 1 (3, 5, 9, 17, ...) */
+  if (pattern == MUL_NONE && c >= 3)
+  {
+    int64_t v = c - 1;
+    if (v > 0 && (v & (v - 1)) == 0)
+    {
+      int n = 0;
+      while (v > 1)
+      {
+        n++;
+        v >>= 1;
+      }
+      if (n >= 1 && n <= 31)
+      {
+        shift1 = n;
+        pattern = MUL_TWO_N_PLUS_1;
+      }
+    }
+  }
+
+  /* Check for 2^n - 1 (7, 15, 31, ...) */
+  if (pattern == MUL_NONE && c >= 7)
+  {
+    int64_t v = c + 1;
+    if (v > 0 && (v & (v - 1)) == 0)
+    {
+      int n = 0;
+      while (v > 1)
+      {
+        n++;
+        v >>= 1;
+      }
+      if (n >= 2 && n <= 31)
+      {
+        shift1 = n;
+        pattern = MUL_TWO_N_MINUS_1;
+      }
+    }
+  }
+
+  /* Check for (2^a + 1) * 2^b (6, 10, 12, 20, 24, 40, 48, ...) */
+  if (pattern == MUL_NONE && c >= 6)
+  {
+    int64_t v = c;
+    int b = 0;
+    while ((v & 1) == 0)
+    {
+      b++;
+      v >>= 1;
+    }
+    if (b >= 1 && b <= 31)
+    {
+      int64_t inner = v - 1;
+      if (inner > 0 && (inner & (inner - 1)) == 0)
+      {
+        int a = 0;
+        while (inner > 1)
+        {
+          a++;
+          inner >>= 1;
+        }
+        if (a >= 1 && a <= 31)
+        {
+          shift1 = a;
+          shift2 = b;
+          pattern = MUL_TWO_N_PLUS_1_SHIFT;
+        }
+      }
+    }
+  }
+
+  /* Check for (2^a - 1) * 2^b (14, 28, 30, 56, 60, 62, ...) */
+  if (pattern == MUL_NONE && c >= 14)
+  {
+    int64_t v = c;
+    int b = 0;
+    while ((v & 1) == 0)
+    {
+      b++;
+      v >>= 1;
+    }
+    if (b >= 1 && b <= 31)
+    {
+      int64_t inner = v + 1;
+      if (inner > 0 && (inner & (inner - 1)) == 0)
+      {
+        int a = 0;
+        while (inner > 1)
+        {
+          a++;
+          inner >>= 1;
+        }
+        if (a >= 2 && a <= 31)
+        {
+          shift1 = a;
+          shift2 = b;
+          pattern = MUL_TWO_N_MINUS_1_SHIFT;
+        }
+      }
+    }
+  }
+
+  if (pattern == MUL_NONE)
+    return 0;
+
+  /* Emit the decomposed sequence. */
+  int dest_reg = mach_get_dest_reg(ctx, dest, 0);
+  uint32_t excl = thumb_is_hw_reg(dest_reg) ? (1u << (uint32_t)dest_reg) : 0;
+  int var_reg = mach_ensure_in_reg(ctx, var_op, excl);
+  thumb_flags_behaviour fl = flags_safe();
+  thumb_shift sh;
+
+  switch (pattern)
+  {
+  case MUL_POWER_OF_2:
+    ot_check(th_lsl_imm((uint32_t)dest_reg, (uint32_t)var_reg, (uint32_t)shift1, fl, ENFORCE_ENCODING_NONE));
+    break;
+
+  case MUL_TWO_N_PLUS_1:
+    sh = (thumb_shift){THUMB_SHIFT_LSL, (uint16_t)shift1, THUMB_SHIFT_IMMEDIATE};
+    ot_check(th_add_reg((uint32_t)dest_reg, (uint32_t)var_reg, (uint32_t)var_reg, fl, sh, ENFORCE_ENCODING_NONE));
+    break;
+
+  case MUL_TWO_N_MINUS_1:
+    /* Thumb-2 SUB Rd, Rn, Rm LSL #n = Rn - (Rm << n).
+     * We need (var << n) - var, which is the reverse. No RSB with shift
+     * exists in Thumb-2, so we do: LSL Rd, var, #n; SUB Rd, Rd, var. */
+    ot_check(th_lsl_imm((uint32_t)dest_reg, (uint32_t)var_reg, (uint32_t)shift1, fl, ENFORCE_ENCODING_NONE));
+    sh = (thumb_shift){THUMB_SHIFT_NONE, 0, THUMB_SHIFT_IMMEDIATE};
+    ot_check(th_sub_reg((uint32_t)dest_reg, (uint32_t)dest_reg, (uint32_t)var_reg, fl, sh, ENFORCE_ENCODING_NONE));
+    break;
+
+  case MUL_TWO_N_PLUS_1_SHIFT:
+    sh = (thumb_shift){THUMB_SHIFT_LSL, (uint16_t)shift1, THUMB_SHIFT_IMMEDIATE};
+    ot_check(th_add_reg((uint32_t)dest_reg, (uint32_t)var_reg, (uint32_t)var_reg, fl, sh, ENFORCE_ENCODING_NONE));
+    ot_check(th_lsl_imm((uint32_t)dest_reg, (uint32_t)dest_reg, (uint32_t)shift2, fl, ENFORCE_ENCODING_NONE));
+    break;
+
+  case MUL_TWO_N_MINUS_1_SHIFT:
+    /* (2^a - 1) * 2^b: LSL Rd, var, #a; SUB Rd, Rd, var; LSL Rd, Rd, #b */
+    ot_check(th_lsl_imm((uint32_t)dest_reg, (uint32_t)var_reg, (uint32_t)shift1, fl, ENFORCE_ENCODING_NONE));
+    sh = (thumb_shift){THUMB_SHIFT_NONE, 0, THUMB_SHIFT_IMMEDIATE};
+    ot_check(th_sub_reg((uint32_t)dest_reg, (uint32_t)dest_reg, (uint32_t)var_reg, fl, sh, ENFORCE_ENCODING_NONE));
+    ot_check(th_lsl_imm((uint32_t)dest_reg, (uint32_t)dest_reg, (uint32_t)shift2, fl, ENFORCE_ENCODING_NONE));
+    break;
+
+  default:
+    return 0;
+  }
+
+  mach_writeback_dest(dest, dest_reg);
+  mach_release_all(ctx);
+  return 1;
+}
+
+/* Fused MUL-by-const + ADD peephole.
+ * Transforms:  tmp = var * C;  dest = base + tmp
+ * Into a shorter sequence using ARM shifted-add (ADD Rd, Rn, Rm LSL #imm):
+ *   C = 2^n:              ADD dest, base, var LSL #n           (1 insn vs 2)
+ *   C = (2^a+1)*2^b:      ADD t, var, var LSL #a;
+ *                          ADD dest, base, t LSL #b             (2 insn vs 3)
+ *   C = (2^a-1)*2^b:      LSL t, var, #a; SUB t, t, var;
+ *                          ADD dest, base, t LSL #b             (3 insn vs 4)
+ * Returns 1 if fused, 0 to fall back to separate MUL + ADD. */
+ST_FUNC int tcc_gen_machine_mul_const_add_fused_mop(MachineOperand mul_var, int64_t mul_const,
+                                                    MachineOperand mul_dest, MachineOperand add_base,
+                                                    MachineOperand add_dest)
+{
+  if (mul_const <= 0)
+    return 0;
+
+  int shift1 = 0, shift2 = 0;
+  enum
+  {
+    FUSE_NONE,
+    FUSE_POW2,
+    FUSE_TWO_N_PLUS_1_SHIFT,
+    FUSE_TWO_N_MINUS_1_SHIFT,
+  } pattern = FUSE_NONE;
+
+  /* Power of 2: C = 2^n */
+  if (mul_const > 1 && (mul_const & (mul_const - 1)) == 0)
+  {
+    int n = 0;
+    int64_t v = mul_const;
+    while (v > 1) { n++; v >>= 1; }
+    if (n >= 1 && n <= 31)
+    {
+      shift1 = n;
+      pattern = FUSE_POW2;
+    }
+  }
+
+  /* (2^a + 1) * 2^b: e.g. 12 = 3*4 = (2^1+1)*2^2 */
+  if (pattern == FUSE_NONE && mul_const >= 6)
+  {
+    int64_t v = mul_const;
+    int b = 0;
+    while ((v & 1) == 0) { b++; v >>= 1; }
+    if (b >= 1 && b <= 31)
+    {
+      int64_t inner = v - 1;
+      if (inner > 0 && (inner & (inner - 1)) == 0)
+      {
+        int a = 0;
+        while (inner > 1) { a++; inner >>= 1; }
+        if (a >= 1 && a <= 31)
+        {
+          shift1 = a;
+          shift2 = b;
+          pattern = FUSE_TWO_N_PLUS_1_SHIFT;
+        }
+      }
+    }
+  }
+
+  /* (2^a - 1) * 2^b: e.g. 28 = 7*4 = (2^3-1)*2^2 */
+  if (pattern == FUSE_NONE && mul_const >= 14)
+  {
+    int64_t v = mul_const;
+    int b = 0;
+    while ((v & 1) == 0) { b++; v >>= 1; }
+    if (b >= 1 && b <= 31)
+    {
+      int64_t inner = v + 1;
+      if (inner > 0 && (inner & (inner - 1)) == 0)
+      {
+        int a = 0;
+        while (inner > 1) { a++; inner >>= 1; }
+        if (a >= 2 && a <= 31)
+        {
+          shift1 = a;
+          shift2 = b;
+          pattern = FUSE_TWO_N_MINUS_1_SHIFT;
+        }
+      }
+    }
+  }
+
+  if (pattern == FUSE_NONE)
+    return 0;
+
+  MachineCodegenContext ctx = {0};
+  thumb_flags_behaviour fl = flags_safe();
+  thumb_shift sh;
+
+  /* Allocate registers: dest first (may hint to the ADD dest's phys reg),
+   * then base and var, using exclusion masks to prevent conflicts. */
+  int dest_reg = mach_get_dest_reg(&ctx, &add_dest, 0);
+  uint32_t excl = thumb_is_hw_reg(dest_reg) ? (1u << (uint32_t)dest_reg) : 0;
+  int base_reg = mach_ensure_in_reg(&ctx, &add_base, excl);
+  if (thumb_is_hw_reg(base_reg))
+    excl |= (1u << (uint32_t)base_reg);
+  int var_reg = mach_ensure_in_reg(&ctx, &mul_var, excl);
+
+  switch (pattern)
+  {
+  case FUSE_POW2:
+    /* ADD dest, base, var LSL #n */
+    sh = (thumb_shift){THUMB_SHIFT_LSL, (uint16_t)shift1, THUMB_SHIFT_IMMEDIATE};
+    ot_check(th_add_reg((uint32_t)dest_reg, (uint32_t)base_reg, (uint32_t)var_reg, fl, sh, ENFORCE_ENCODING_NONE));
+    break;
+
+  case FUSE_TWO_N_PLUS_1_SHIFT:
+  {
+    /* Step 1: ADD tmp, var, var LSL #a */
+    if (thumb_is_hw_reg(var_reg))
+      excl |= (1u << (uint32_t)var_reg);
+    int tmp_reg = mach_get_dest_reg(&ctx, &mul_dest, excl);
+    sh = (thumb_shift){THUMB_SHIFT_LSL, (uint16_t)shift1, THUMB_SHIFT_IMMEDIATE};
+    ot_check(th_add_reg((uint32_t)tmp_reg, (uint32_t)var_reg, (uint32_t)var_reg, fl, sh, ENFORCE_ENCODING_NONE));
+    /* Step 2: ADD dest, base, tmp LSL #b */
+    sh = (thumb_shift){THUMB_SHIFT_LSL, (uint16_t)shift2, THUMB_SHIFT_IMMEDIATE};
+    ot_check(th_add_reg((uint32_t)dest_reg, (uint32_t)base_reg, (uint32_t)tmp_reg, fl, sh, ENFORCE_ENCODING_NONE));
+    break;
+  }
+
+  case FUSE_TWO_N_MINUS_1_SHIFT:
+  {
+    /* Step 1: LSL tmp, var, #a */
+    if (thumb_is_hw_reg(var_reg))
+      excl |= (1u << (uint32_t)var_reg);
+    int tmp_reg = mach_get_dest_reg(&ctx, &mul_dest, excl);
+    ot_check(th_lsl_imm((uint32_t)tmp_reg, (uint32_t)var_reg, (uint32_t)shift1, fl, ENFORCE_ENCODING_NONE));
+    /* Step 2: SUB tmp, tmp, var */
+    sh = (thumb_shift){THUMB_SHIFT_NONE, 0, THUMB_SHIFT_IMMEDIATE};
+    ot_check(th_sub_reg((uint32_t)tmp_reg, (uint32_t)tmp_reg, (uint32_t)var_reg, fl, sh, ENFORCE_ENCODING_NONE));
+    /* Step 3: ADD dest, base, tmp LSL #b */
+    sh = (thumb_shift){THUMB_SHIFT_LSL, (uint16_t)shift2, THUMB_SHIFT_IMMEDIATE};
+    ot_check(th_add_reg((uint32_t)dest_reg, (uint32_t)base_reg, (uint32_t)tmp_reg, fl, sh, ENFORCE_ENCODING_NONE));
+    break;
+  }
+
+  default:
+    mach_release_all(&ctx);
+    return 0;
+  }
+
+  mach_writeback_dest(&add_dest, dest_reg);
+  mach_release_all(&ctx);
+  return 1;
+}
+
 ST_FUNC void tcc_gen_machine_muldiv_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest, TccIrOp op)
 {
   MachineCodegenContext ctx = {0};
@@ -4319,7 +5515,7 @@ ST_FUNC void tcc_gen_machine_muldiv_mop(MachineOperand src1, MachineOperand src2
   case TCCIR_OP_MUL:
     if (src1.is_64bit || src2.is_64bit || dest.is_64bit)
       thumb_emit_mul64_mop(&ctx, &src1, &src2, &dest);
-    else
+    else if (!thumb_try_mul_by_const_mop(&ctx, &src1, &src2, &dest))
       mach_regonly_binop_mop(&ctx, &src1, &src2, &dest, thumb_mul_regonly);
     break;
   case TCCIR_OP_DIV:
@@ -4350,16 +5546,16 @@ ST_FUNC void tcc_gen_machine_muldiv_mop(MachineOperand src1, MachineOperand src2
       if (thumb_is_hw_reg(r_lo))
         excl |= (1u << (uint32_t)r_lo);
       int r_hi = mach_ensure_in_reg(&ctx, &hi, excl);
-      ot_check(th_cmp_imm(0, r_lo, 0, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE));
+      ot_check(th_cmp_imm(r_lo, 0, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE));
       th_literal_pool_reserve_upcoming_bytes(6);
       ot_check(th_it(mapcc(TOK_EQ), 0x8)); /* IT EQ (single instruction) */
-      ot_check(th_cmp_imm(0, r_hi, 0, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE));
+      ot_check(th_cmp_imm(r_hi, 0, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE));
     }
     else
     {
       /* 32-bit: CMP src, #0 — no destination, only flags. */
       int src_reg = mach_ensure_in_reg(&ctx, &src1, 0);
-      ot_check(th_cmp_imm(0, src_reg, 0, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE));
+      ot_check(th_cmp_imm(src_reg, 0, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE));
     }
     break;
   }
@@ -4367,6 +5563,64 @@ ST_FUNC void tcc_gen_machine_muldiv_mop(MachineOperand src1, MachineOperand src2
     tcc_error("compiler_error: tcc_gen_machine_muldiv_mop: unhandled op %d", (int)op);
     break;
   }
+  mach_release_all(&ctx);
+}
+
+/* tcc_gen_machine_cmp_eq64_mop: 64-bit equality comparison.
+ * Emits CMP hi1,hi2; IT EQ; CMPEQ lo1,lo2 which correctly sets
+ * the Z flag for full 64-bit equality (used by SETIF/JUMPIF EQ/NE). */
+ST_FUNC void tcc_gen_machine_cmp_eq64_mop(MachineOperand src1, MachineOperand src2)
+{
+  MachineCodegenContext ctx = {0};
+  uint32_t excl = 0;
+
+  if (src1.kind == MACH_OP_REG)
+  {
+    if (src1.u.reg.r0 != (int)PREG_REG_NONE)
+      excl |= (1u << (uint32_t)src1.u.reg.r0);
+    if (!src1.needs_deref && src1.is_64bit && src1.u.reg.r1 >= 0)
+      excl |= (1u << (uint32_t)src1.u.reg.r1);
+  }
+  if (src2.kind == MACH_OP_REG)
+  {
+    if (src2.u.reg.r0 != (int)PREG_REG_NONE)
+      excl |= (1u << (uint32_t)src2.u.reg.r0);
+    if (!src2.needs_deref && src2.is_64bit && src2.u.reg.r1 >= 0)
+      excl |= (1u << (uint32_t)src2.u.reg.r1);
+  }
+
+  MachineOperand r_src1 = mach_resolve_deref_64(&ctx, &src1, &excl);
+  MachineOperand r_src2 = mach_resolve_deref_64(&ctx, &src2, &excl);
+
+  MachineOperand s1_lo = mach_make_lo_half(&r_src1);
+  s1_lo.btype = IROP_BTYPE_INT32;
+  int rn_lo = mach_ensure_in_reg(&ctx, &s1_lo, excl);
+  if (thumb_is_hw_reg(rn_lo))
+    excl |= (1u << (uint32_t)rn_lo);
+
+  MachineOperand s1_hi = mach_make_hi_half(&r_src1);
+  s1_hi.btype = IROP_BTYPE_INT32;
+  int rn_hi = mach_ensure_in_reg(&ctx, &s1_hi, excl);
+  if (thumb_is_hw_reg(rn_hi))
+    excl |= (1u << (uint32_t)rn_hi);
+
+  MachineOperand s2_lo = mach_make_lo_half(&r_src2);
+  s2_lo.btype = IROP_BTYPE_INT32;
+  int rm_lo = mach_ensure_in_reg(&ctx, &s2_lo, excl);
+  if (thumb_is_hw_reg(rm_lo))
+    excl |= (1u << (uint32_t)rm_lo);
+
+  MachineOperand s2_hi = mach_make_hi_half(&r_src2);
+  s2_hi.btype = IROP_BTYPE_INT32;
+  int rm_hi = mach_ensure_in_reg(&ctx, &s2_hi, excl);
+
+  ot_check(th_cmp_reg(0, (uint32_t)rn_hi, (uint32_t)rm_hi, FLAGS_BEHAVIOUR_SET, THUMB_SHIFT_DEFAULT,
+                       ENFORCE_ENCODING_NONE));
+  th_literal_pool_reserve_upcoming_bytes(6);
+  ot_check(th_it(mapcc(TOK_EQ), 0x8));
+  ot_check(th_cmp_reg(0, (uint32_t)rn_lo, (uint32_t)rm_lo, FLAGS_BEHAVIOUR_SET, THUMB_SHIFT_DEFAULT,
+                       ENFORCE_ENCODING_NONE));
+
   mach_release_all(&ctx);
 }
 
@@ -4640,8 +5894,8 @@ ST_FUNC void tcc_gen_machine_assign_mop(MachineOperand src, MachineOperand dest,
     uint32_t excl = thumb_is_hw_reg(dest_reg) ? (1u << (uint32_t)dest_reg) : 0;
     int src_reg = mach_ensure_in_reg(&mctx, &src, excl);
     if (src_reg != dest_reg)
-      ot_check(th_mov_reg((uint32_t)dest_reg, (uint32_t)src_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                          ENFORCE_ENCODING_NONE, false));
+      ot_check_mov_reg((uint32_t)dest_reg, (uint32_t)src_reg, flags_safe(), THUMB_SHIFT_DEFAULT,
+                       ENFORCE_ENCODING_NONE, false);
     break;
   }
   }
@@ -4690,7 +5944,7 @@ ST_FUNC void tcc_gen_machine_setif_mop(MachineOperand src, MachineOperand dest, 
     ot_check(th_mov_imm(lo_reg, 0, FLAGS_BEHAVIOUR_BLOCK, ENFORCE_ENCODING_NONE));
     th_literal_pool_reserve_upcoming_bytes(6);
     ot_check(th_it(cond, 0x8)); /* IT <cond> — single conditioned instruction */
-    ot_check(th_mov_imm(lo_reg, 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    ot_check(th_mov_imm(lo_reg, 1, flags_safe(), ENFORCE_ENCODING_NONE));
     /* Hi word is always 0 — boolean result never exceeds 1 (i.e. fits in 32-bit lo). */
     ot_check(th_mov_imm(hi_reg, 0, FLAGS_BEHAVIOUR_BLOCK, ENFORCE_ENCODING_NONE));
 
@@ -4704,7 +5958,7 @@ ST_FUNC void tcc_gen_machine_setif_mop(MachineOperand src, MachineOperand dest, 
     ot_check(th_mov_imm(dest_reg, 0, FLAGS_BEHAVIOUR_BLOCK, ENFORCE_ENCODING_NONE));
     th_literal_pool_reserve_upcoming_bytes(6);
     ot_check(th_it(cond, 0x8)); /* IT <cond> — single conditioned instruction */
-    ot_check(th_mov_imm(dest_reg, 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    ot_check(th_mov_imm(dest_reg, 1, flags_safe(), ENFORCE_ENCODING_NONE));
 
     mach_writeback_dest(&dest, dest_reg);
   }
@@ -4750,7 +6004,7 @@ ST_FUNC void tcc_gen_machine_bool_mop(MachineOperand src1, MachineOperand src2, 
       int hi1_reg = mach_ensure_in_reg(&mctx, &hi1, excl);
       excl |= thumb_is_hw_reg(hi1_reg) ? (1u << (uint32_t)hi1_reg) : 0;
       /* r1 = lo1 | hi1 — is src1 non-zero? */
-      ot_check(th_orr_reg(r1, r1, hi1_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+      ot_check(th_orr_reg(r1, r1, hi1_reg, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     }
     else
     {
@@ -4769,7 +6023,7 @@ ST_FUNC void tcc_gen_machine_bool_mop(MachineOperand src1, MachineOperand src2, 
       int hi2_reg = mach_ensure_in_reg(&mctx, &hi2, excl);
       excl |= thumb_is_hw_reg(hi2_reg) ? (1u << (uint32_t)hi2_reg) : 0;
       /* r2 = lo2 | hi2 — is src2 non-zero? */
-      ot_check(th_orr_reg(r2, r2, hi2_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+      ot_check(th_orr_reg(r2, r2, hi2_reg, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     }
     else
     {
@@ -4785,18 +6039,18 @@ ST_FUNC void tcc_gen_machine_bool_mop(MachineOperand src1, MachineOperand src2, 
       ot_check(th_mov_imm(dest_reg, 0, FLAGS_BEHAVIOUR_BLOCK, ENFORCE_ENCODING_NONE));
       th_literal_pool_reserve_upcoming_bytes(6);
       ot_check(th_it(0x1, 0x8)); /* IT NE */
-      ot_check(th_mov_imm(dest_reg, 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+      ot_check(th_mov_imm(dest_reg, 1, flags_safe(), ENFORCE_ENCODING_NONE));
     }
     else /* TCCIR_OP_BOOL_AND */
     {
-      ot_check(th_cmp_imm(0, r1, 0, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE));
+      ot_check(th_cmp_imm(r1, 0, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE));
       th_literal_pool_reserve_upcoming_bytes(6);
       ot_check(th_it(0x1, 0x8));                                                  /* IT NE */
-      ot_check(th_cmp_imm(0, r2, 0, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE)); /* CMPne r2, #0 */
+      ot_check(th_cmp_imm(r2, 0, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE)); /* CMPne r2, #0 */
       ot_check(th_mov_imm(dest_reg, 0, FLAGS_BEHAVIOUR_BLOCK, ENFORCE_ENCODING_NONE));
       th_literal_pool_reserve_upcoming_bytes(6);
       ot_check(th_it(0x1, 0x8)); /* IT NE */
-      ot_check(th_mov_imm(dest_reg, 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+      ot_check(th_mov_imm(dest_reg, 1, flags_safe(), ENFORCE_ENCODING_NONE));
     }
 
     mach_writeback_dest(&dest, dest_reg);
@@ -4819,18 +6073,18 @@ ST_FUNC void tcc_gen_machine_bool_mop(MachineOperand src1, MachineOperand src2, 
     ot_check(th_mov_imm(dest_reg, 0, FLAGS_BEHAVIOUR_BLOCK, ENFORCE_ENCODING_NONE));
     th_literal_pool_reserve_upcoming_bytes(6);
     ot_check(th_it(0x1, 0x8)); /* IT NE */
-    ot_check(th_mov_imm(dest_reg, 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    ot_check(th_mov_imm(dest_reg, 1, flags_safe(), ENFORCE_ENCODING_NONE));
   }
   else /* TCCIR_OP_BOOL_AND */
   {
-    ot_check(th_cmp_imm(0, src1_reg, 0, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE));
+    ot_check(th_cmp_imm(src1_reg, 0, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE));
     th_literal_pool_reserve_upcoming_bytes(6);
     ot_check(th_it(0x1, 0x8));                                                        /* IT NE */
-    ot_check(th_cmp_imm(0, src2_reg, 0, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE)); /* CMPne src2, #0 */
+    ot_check(th_cmp_imm(src2_reg, 0, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE)); /* CMPne src2, #0 */
     ot_check(th_mov_imm(dest_reg, 0, FLAGS_BEHAVIOUR_BLOCK, ENFORCE_ENCODING_NONE));
     th_literal_pool_reserve_upcoming_bytes(6);
     ot_check(th_it(0x1, 0x8)); /* IT NE */
-    ot_check(th_mov_imm(dest_reg, 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    ot_check(th_mov_imm(dest_reg, 1, flags_safe(), ENFORCE_ENCODING_NONE));
   }
 
   mach_writeback_dest(&dest, dest_reg);
@@ -4894,8 +6148,8 @@ ST_FUNC void tcc_gen_machine_load_mop(MachineOperand src, MachineOperand dest, T
     {
       /* Direct register-to-register (treat as MOV — should be ASSIGN, not LOAD) */
       if (dest_reg != src.u.reg.r0)
-        ot_check(th_mov_reg((uint32_t)dest_reg, (uint32_t)src.u.reg.r0, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                            THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
+        ot_check_mov_reg((uint32_t)dest_reg, (uint32_t)src.u.reg.r0, flags_safe(), THUMB_SHIFT_DEFAULT,
+                         ENFORCE_ENCODING_NONE, false);
       /* Narrow sub-word parameter values: when a parameter is declared as
        * char/short but arrives in a full 32-bit register (AAPCS default
        * argument promotion), the upper bits may contain garbage.  Emit
@@ -4916,8 +6170,8 @@ ST_FUNC void tcc_gen_machine_load_mop(MachineOperand src, MachineOperand dest, T
       }
       /* 64-bit pair: also copy the hi-half register */
       if (dest_r1 != PREG_REG_NONE && src.u.reg.r1 >= 0 && dest_r1 != src.u.reg.r1)
-        ot_check(th_mov_reg((uint32_t)dest_r1, (uint32_t)src.u.reg.r1, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                            THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
+        ot_check_mov_reg((uint32_t)dest_r1, (uint32_t)src.u.reg.r1, flags_safe(), THUMB_SHIFT_DEFAULT,
+                         ENFORCE_ENCODING_NONE, false);
     }
     break;
 
@@ -4969,8 +6223,16 @@ ST_FUNC void tcc_gen_machine_load_mop(MachineOperand src, MachineOperand dest, T
     /* needs_deref: load symbol address into scratch, then dereference. */
     int addr_r = mach_alloc_scratch(&ctx, (uint32_t)1u << (uint32_t)dest_reg);
     tcc_machine_load_constant(addr_r, PREG_REG_NONE, 0, 0, sym);
-    load_from_base(dest_reg, dest_r1, btype, is_unsigned, addend < 0 ? (int)(-addend) : (int)addend, addend < 0 ? 1 : 0,
-                   (uint32_t)addr_r);
+    /* For a 64-bit deref, try LDRD when we can prove the symbol's address
+     * at `addend` is 4-byte aligned.  Otherwise fall back to the pair of
+     * 32-bit loads via load_from_base. */
+    const int sym_sign = (addend < 0), sym_abs = sym_sign ? (int)(-addend) : (int)addend;
+    if (dest.is_64bit && dest_r1 != PREG_REG_NONE && sym_is_4_byte_aligned_for_64bit(sym, addend) &&
+        try_ldrd_pair(dest_reg, dest_r1, addr_r, sym_abs, sym_sign))
+    {
+      break;
+    }
+    load_from_base(dest_reg, dest_r1, btype, is_unsigned, sym_abs, sym_sign, (uint32_t)addr_r);
     break;
   }
 
@@ -5132,7 +6394,11 @@ ST_FUNC void tcc_gen_machine_store_mop(MachineOperand dest, MachineOperand src, 
     case MACH_OP_REG:
       if (dest.needs_deref)
       {
-        /* 64-bit pointer-store: STR lo, [base]; STR hi, [base, #4] */
+        /* 64-bit pointer-store through a register-held address.  Do NOT use
+         * STRD here: ARMv7-M/v8-M requires 4-byte alignment for STRD and
+         * faults otherwise, but the pointer may target packed-struct memory
+         * that is only 1- or 2-byte aligned.  Plain STR tolerates unaligned
+         * (UNALIGN_TRP=0 default) so two 32-bit stores stay safe. */
         const uint32_t base = (uint32_t)dest.u.reg.r0;
         th_store32_imm_or_reg_ex(lo_reg, base, 0, 0, excl | (1u << base));
         th_store32_imm_or_reg_ex(hi_reg, base, 4, 0, excl | (1u << base));
@@ -5145,20 +6411,20 @@ ST_FUNC void tcc_gen_machine_store_mop(MachineOperand dest, MachineOperand src, 
         if (lo_reg == dreg_hi)
         {
           if (dreg_lo != lo_reg && dreg_lo != (int)PREG_REG_NONE)
-            ot_check(th_mov_reg((uint32_t)dreg_lo, (uint32_t)lo_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                                ENFORCE_ENCODING_NONE, false));
+            ot_check_mov_reg((uint32_t)dreg_lo, (uint32_t)lo_reg, flags_safe(), THUMB_SHIFT_DEFAULT,
+                             ENFORCE_ENCODING_NONE, false);
           if (dreg_hi != hi_reg && dreg_hi != (int)PREG_REG_NONE)
-            ot_check(th_mov_reg((uint32_t)dreg_hi, (uint32_t)hi_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                                ENFORCE_ENCODING_NONE, false));
+            ot_check_mov_reg((uint32_t)dreg_hi, (uint32_t)hi_reg, flags_safe(), THUMB_SHIFT_DEFAULT,
+                             ENFORCE_ENCODING_NONE, false);
         }
         else
         {
           if (dreg_hi != hi_reg && dreg_hi != (int)PREG_REG_NONE)
-            ot_check(th_mov_reg((uint32_t)dreg_hi, (uint32_t)hi_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                                ENFORCE_ENCODING_NONE, false));
+            ot_check_mov_reg((uint32_t)dreg_hi, (uint32_t)hi_reg, flags_safe(), THUMB_SHIFT_DEFAULT,
+                             ENFORCE_ENCODING_NONE, false);
           if (dreg_lo != lo_reg && dreg_lo != (int)PREG_REG_NONE)
-            ot_check(th_mov_reg((uint32_t)dreg_lo, (uint32_t)lo_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                                ENFORCE_ENCODING_NONE, false));
+            ot_check_mov_reg((uint32_t)dreg_lo, (uint32_t)lo_reg, flags_safe(), THUMB_SHIFT_DEFAULT,
+                             ENFORCE_ENCODING_NONE, false);
         }
       }
       break;
@@ -5178,14 +6444,22 @@ ST_FUNC void tcc_gen_machine_store_mop(MachineOperand dest, MachineOperand src, 
           ot_check(th_ldr_reg((uint32_t)ptr_r, base, (uint32_t)rr.reg, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
           restore_scratch_reg(&rr);
         }
+        /* Pointer-through store from an LLOCAL spill slot: the target
+         * address is arbitrary (may be unaligned packed-struct memory), so
+         * skip STRD. */
         th_store32_imm_or_reg_ex(lo_reg, (uint32_t)ptr_r, 0, 0, excl | (1u << (uint32_t)ptr_r));
         th_store32_imm_or_reg_ex(hi_reg, (uint32_t)ptr_r, 4, 0, excl | (1u << (uint32_t)ptr_r));
       }
       else
       {
         const int adj_hi = adj + 4;
-        th_store32_imm_or_reg_ex(lo_reg, base, adj < 0 ? -adj : adj, adj < 0 ? 1 : 0, excl | (1u << base));
-        th_store32_imm_or_reg_ex(hi_reg, base, adj_hi < 0 ? -adj_hi : adj_hi, adj_hi < 0 ? 1 : 0, excl | (1u << base));
+        const int sign = (adj < 0), abs_off = sign ? -adj : adj;
+        if (!try_strd_pair(lo_reg, hi_reg, (int)base, abs_off, sign))
+        {
+          th_store32_imm_or_reg_ex(lo_reg, base, abs_off, sign, excl | (1u << base));
+          th_store32_imm_or_reg_ex(hi_reg, base, adj_hi < 0 ? -adj_hi : adj_hi, adj_hi < 0 ? 1 : 0,
+                                   excl | (1u << base));
+        }
       }
       break;
     }
@@ -5195,20 +6469,32 @@ ST_FUNC void tcc_gen_machine_store_mop(MachineOperand dest, MachineOperand src, 
       const int adj = dest.u.param.offset + offset_to_args;
       const int adj_hi = adj + 4;
       const uint32_t base = (uint32_t)(tcc_state->need_frame_pointer ? R_FP : R_SP);
-      th_store32_imm_or_reg_ex(lo_reg, base, adj < 0 ? -adj : adj, adj < 0 ? 1 : 0, excl | (1u << base));
-      th_store32_imm_or_reg_ex(hi_reg, base, adj_hi < 0 ? -adj_hi : adj_hi, adj_hi < 0 ? 1 : 0, excl | (1u << base));
+      const int sign = (adj < 0), abs_off = sign ? -adj : adj;
+      if (!try_strd_pair(lo_reg, hi_reg, (int)base, abs_off, sign))
+      {
+        th_store32_imm_or_reg_ex(lo_reg, base, abs_off, sign, excl | (1u << base));
+        th_store32_imm_or_reg_ex(hi_reg, base, adj_hi < 0 ? -adj_hi : adj_hi, adj_hi < 0 ? 1 : 0, excl | (1u << base));
+      }
       break;
     }
 
     case MACH_OP_SYMBOL:
     {
+      /* Global symbol store.  STRD needs 4-byte alignment; allow it only when
+       * the symbol's declared type guarantees natural alignment >= 4 (regular
+       * scalar globals) or the symbol was explicitly aligned.  Packed structs
+       * and struct-typed globals stay on the STR-pair path. */
       Sym *sym = dest.u.sym.sym ? validate_sym_for_reloc(dest.u.sym.sym) : NULL;
       int addr_r = mach_alloc_scratch(&ctx, excl);
       tcc_machine_load_constant(addr_r, PREG_REG_NONE, 0, 0, sym);
       const int32_t addend = dest.u.sym.addend;
       const int32_t addend_hi = addend + 4;
-      th_store32_imm_or_reg_ex(lo_reg, (uint32_t)addr_r, addend < 0 ? (int)(-addend) : (int)addend, addend < 0 ? 1 : 0,
-                               excl | (1u << addr_r));
+      const int sign = (addend < 0), abs_off = sign ? (int)(-addend) : (int)addend;
+      if (sym_is_4_byte_aligned_for_64bit(sym, addend) && try_strd_pair(lo_reg, hi_reg, addr_r, abs_off, sign))
+      {
+        break;
+      }
+      th_store32_imm_or_reg_ex(lo_reg, (uint32_t)addr_r, abs_off, sign, excl | (1u << addr_r));
       th_store32_imm_or_reg_ex(hi_reg, (uint32_t)addr_r, addend_hi < 0 ? (int)(-addend_hi) : (int)addend_hi,
                                addend_hi < 0 ? 1 : 0, excl | (1u << addr_r));
       break;
@@ -5216,6 +6502,7 @@ ST_FUNC void tcc_gen_machine_store_mop(MachineOperand dest, MachineOperand src, 
 
     case MACH_OP_IMM:
     {
+      /* Store to a constant address — alignment unknown, skip STRD. */
       int addr_r = mach_alloc_scratch(&ctx, excl);
       tcc_machine_load_constant(addr_r, PREG_REG_NONE, dest.u.imm.val, 0, NULL);
       th_store32_imm_or_reg_ex(lo_reg, (uint32_t)addr_r, 0, 0, excl | (1u << addr_r));
@@ -5227,8 +6514,11 @@ ST_FUNC void tcc_gen_machine_store_mop(MachineOperand dest, MachineOperand src, 
     {
       int addr_r = mach_alloc_scratch(&ctx, excl);
       tcc_machine_addr_of_stack_slot(addr_r, dest.u.frame.offset, 0 /* not param */);
-      th_store32_imm_or_reg_ex(lo_reg, (uint32_t)addr_r, 0, 0, excl | (1u << addr_r));
-      th_store32_imm_or_reg_ex(hi_reg, (uint32_t)addr_r, 4, 0, excl | (1u << addr_r));
+      if (!try_strd_pair(lo_reg, hi_reg, addr_r, 0, 0))
+      {
+        th_store32_imm_or_reg_ex(lo_reg, (uint32_t)addr_r, 0, 0, excl | (1u << addr_r));
+        th_store32_imm_or_reg_ex(hi_reg, (uint32_t)addr_r, 4, 0, excl | (1u << addr_r));
+      }
       break;
     }
 
@@ -5242,8 +6532,11 @@ ST_FUNC void tcc_gen_machine_store_mop(MachineOperand dest, MachineOperand src, 
       int sign = (off < 0), abs_off = sign ? (int)(-off) : (int)off;
       int32_t off_hi = off + 4;
       int sign_hi = (off_hi < 0), abs_off_hi = sign_hi ? (int)(-off_hi) : (int)off_hi;
-      th_store32_imm_or_reg_ex(lo_reg, (uint32_t)base, abs_off, sign, excl | (1u << (uint32_t)base));
-      th_store32_imm_or_reg_ex(hi_reg, (uint32_t)base, abs_off_hi, sign_hi, excl | (1u << (uint32_t)base));
+      if (!try_strd_pair(lo_reg, hi_reg, base, abs_off, sign))
+      {
+        th_store32_imm_or_reg_ex(lo_reg, (uint32_t)base, abs_off, sign, excl | (1u << (uint32_t)base));
+        th_store32_imm_or_reg_ex(hi_reg, (uint32_t)base, abs_off_hi, sign_hi, excl | (1u << (uint32_t)base));
+      }
       if (chain_used)
         restore_scratch_reg(&chain_scratch);
       break;
@@ -5257,6 +6550,15 @@ ST_FUNC void tcc_gen_machine_store_mop(MachineOperand dest, MachineOperand src, 
   }
 
   const int btype = dest.btype; /* Store width from destination type */
+
+  /* Fast path: immediate → register — load constant directly into dest,
+   * avoiding a scratch register + MOV. */
+  if (src.kind == MACH_OP_IMM && dest.kind == MACH_OP_REG && !dest.needs_deref && dest.u.reg.r0 != (int)PREG_REG_NONE)
+  {
+    tcc_machine_load_constant(dest.u.reg.r0, PREG_REG_NONE, src.u.imm.val, 0, NULL);
+    mach_release_all(&ctx);
+    return;
+  }
 
   /* Get source value register — may allocate a scratch if spilled/const */
   const int src_reg = mach_ensure_in_reg(&ctx, &src, 0);
@@ -5280,8 +6582,8 @@ ST_FUNC void tcc_gen_machine_store_mop(MachineOperand dest, MachineOperand src, 
       /* Register-to-register store (MOV) */
       const int dreg = dest.u.reg.r0;
       if (dreg != src_reg && dreg != (int)PREG_REG_NONE)
-        ot_check(th_mov_reg((uint32_t)dreg, (uint32_t)src_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                            ENFORCE_ENCODING_NONE, false));
+        ot_check_mov_reg((uint32_t)dreg, (uint32_t)src_reg, flags_safe(), THUMB_SHIFT_DEFAULT,
+                         ENFORCE_ENCODING_NONE, false);
     }
     break;
 
@@ -5420,31 +6722,125 @@ ST_FUNC void tcc_gen_machine_load_indexed_mop(MachineOperand dest, MachineOperan
   int shift_amount = (scale.kind == MACH_OP_IMM) ? (int)scale.u.imm.val : 2;
   if (shift_amount < 0 || shift_amount > 31)
     shift_amount = 2;
+
+  /* Fast path: constant-displacement load (scale == 0 and index is an immediate).
+   * Generated by the displacement-fusion pass when folding `ADD base,#imm; LOAD *`
+   * into a single `LDR dest,[base,#imm]`, matching GCC's addressing-mode output. */
+  if (!dest.is_64bit && shift_amount == 0 && index.kind == MACH_OP_IMM)
+  {
+    int imm = (int)index.u.imm.val;
+    int sign = (imm < 0);
+    int abs_off = sign ? -imm : imm;
+    if (abs_off <= 4095)
+    {
+      const int dest_reg = mach_get_dest_reg(&ctx, &dest, 0);
+      uint32_t excl = (1u << (uint32_t)dest_reg);
+      int base_reg = mach_ensure_in_reg(&ctx, &base, excl);
+      load_from_base(dest_reg, PREG_REG_NONE, dest.btype, (int)dest.is_unsigned, abs_off, sign, (uint32_t)base_reg);
+      mach_writeback_dest(&dest, dest_reg);
+      mach_release_all(&ctx);
+      return;
+    }
+  }
+
   thumb_shift shift = {.type = THUMB_SHIFT_LSL, .value = (uint32_t)shift_amount, .mode = THUMB_SHIFT_IMMEDIATE};
+
+  /* Fast path: 64-bit constant-displacement load using LDRD [base, #imm].
+   * LDRD supports word-aligned offsets in range [-1020, 1020]. */
+  if (dest.is_64bit && shift_amount == 0 && index.kind == MACH_OP_IMM)
+  {
+    int imm = (int)index.u.imm.val;
+    int sign = (imm < 0);
+    int abs_off = sign ? -imm : imm;
+    if (abs_off <= 1020 && (abs_off & 3) == 0)
+    {
+      const bool dest_is_reg = (dest.kind == MACH_OP_REG && !dest.needs_deref);
+      int dest_lo, dest_hi;
+      MachineOperand dest_hi_mop = {0};
+      uint32_t excl = 0;
+
+      if (dest_is_reg)
+      {
+        dest_lo = dest.u.reg.r0;
+        if (!thumb_is_hw_reg(dest.u.reg.r1))
+          tcc_error("load_indexed_mop: 64-bit dest has invalid r1=%d (r0=%d) — "
+                    "register allocator must produce a valid pair",
+                    dest.u.reg.r1, dest.u.reg.r0);
+        dest_hi = dest.u.reg.r1;
+        excl = (1u << (uint32_t)dest_lo) | (1u << (uint32_t)dest_hi);
+      }
+      else
+      {
+        dest_lo = mach_get_dest_reg(&ctx, &dest, 0);
+        excl = (1u << (uint32_t)dest_lo);
+        dest_hi_mop = mach_make_hi_half(&dest);
+        dest_hi = mach_get_dest_reg(&ctx, &dest_hi_mop, excl);
+        excl |= (1u << (uint32_t)dest_hi);
+      }
+
+      int base_reg = mach_ensure_in_reg(&ctx, &base, excl);
+      uint32_t puw = sign ? 4u : 6u;
+      ot_check(th_ldrd_imm((uint32_t)dest_lo, (uint32_t)dest_hi, (uint32_t)base_reg, abs_off, puw));
+      if (!dest_is_reg)
+      {
+        MachineOperand dest_lo_mop = mach_make_lo_half(&dest);
+        mach_writeback_dest(&dest_lo_mop, dest_lo);
+        mach_writeback_dest(&dest_hi_mop, dest_hi);
+      }
+      mach_release_all(&ctx);
+      return;
+    }
+  }
 
   /* 64-bit indexed load: compute EA = base + index<<shift into scratch, then LDRD. */
   if (dest.is_64bit)
   {
-    const int dest_lo = dest.u.reg.r0;
-    if (!thumb_is_hw_reg(dest.u.reg.r1))
-      tcc_error("load_indexed_mop: 64-bit dest has invalid r1=%d (r0=%d) — "
-                "register allocator must produce a valid pair",
-                dest.u.reg.r1, dest.u.reg.r0);
-    const int dest_hi = dest.u.reg.r1;
-    uint32_t excl = (1u << (uint32_t)dest_lo) | (1u << (uint32_t)dest_hi);
+    const bool dest_is_reg = (dest.kind == MACH_OP_REG && !dest.needs_deref);
+    int dest_lo, dest_hi;
+    MachineOperand dest_hi_mop = {0};
+    uint32_t excl = 0;
+
+    if (dest_is_reg)
+    {
+      dest_lo = dest.u.reg.r0;
+      if (!thumb_is_hw_reg(dest.u.reg.r1))
+        tcc_error("load_indexed_mop: 64-bit dest has invalid r1=%d (r0=%d) — "
+                  "register allocator must produce a valid pair",
+                  dest.u.reg.r1, dest.u.reg.r0);
+      dest_hi = dest.u.reg.r1;
+      excl = (1u << (uint32_t)dest_lo) | (1u << (uint32_t)dest_hi);
+    }
+    else
+    {
+      dest_lo = mach_get_dest_reg(&ctx, &dest, 0);
+      excl = (1u << (uint32_t)dest_lo);
+      dest_hi_mop = mach_make_hi_half(&dest);
+      dest_hi = mach_get_dest_reg(&ctx, &dest_hi_mop, excl);
+      excl |= (1u << (uint32_t)dest_hi);
+    }
+
     int base_reg = mach_ensure_in_reg(&ctx, &base, excl);
     excl |= (1u << (uint32_t)base_reg);
     int index_reg = mach_ensure_in_reg(&ctx, &index, excl);
     excl |= (1u << (uint32_t)index_reg);
     int ea_r = mach_alloc_scratch(&ctx, excl);
-    ot_check(th_add_reg((uint32_t)ea_r, (uint32_t)base_reg, (uint32_t)index_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, shift,
+    ot_check(th_add_reg((uint32_t)ea_r, (uint32_t)base_reg, (uint32_t)index_reg, flags_safe(), shift,
                         ENFORCE_ENCODING_NONE));
-    ot_check(th_ldrd_imm((uint32_t)dest_lo, (uint32_t)dest_hi, (uint32_t)ea_r, 0, 5, ENFORCE_ENCODING_NONE));
+    ot_check(th_ldrd_imm((uint32_t)dest_lo, (uint32_t)dest_hi, (uint32_t)ea_r, 0, 5));
+    if (!dest_is_reg)
+    {
+      MachineOperand dest_lo_mop = mach_make_lo_half(&dest);
+      mach_writeback_dest(&dest_lo_mop, dest_lo);
+      mach_writeback_dest(&dest_hi_mop, dest_hi);
+    }
     mach_release_all(&ctx);
     return;
   }
 
-  const int dest_reg = dest.u.reg.r0;
+  /* Use mach_get_dest_reg so MACH_OP_SPILL / MACH_OP_PARAM_STACK dests get a
+   * scratch + writeback (previously `dest.u.reg.r0` was read unconditionally,
+   * aliasing with spill.offset and emitting an invalid encoding). */
+  const int dest_reg = mach_get_dest_reg(&ctx, &dest, 0);
   const int btype = dest.btype;
   const int is_unsigned = (int)dest.is_unsigned;
 
@@ -5471,6 +6867,7 @@ ST_FUNC void tcc_gen_machine_load_indexed_mop(MachineOperand dest, MachineOperan
   {
     ot_check(th_ldr_reg(dest_reg, base_reg, index_reg, shift, ENFORCE_ENCODING_NONE));
   }
+  mach_writeback_dest(&dest, dest_reg);
   mach_release_all(&ctx);
 }
 
@@ -5486,7 +6883,57 @@ ST_FUNC void tcc_gen_machine_store_indexed_mop(MachineOperand base, MachineOpera
   int shift_amount = (scale.kind == MACH_OP_IMM) ? (int)scale.u.imm.val : 2;
   if (shift_amount < 0 || shift_amount > 31)
     shift_amount = 2;
+
+  /* Fast path: constant-displacement store (scale == 0 and index is an immediate).
+   * Mirrors the load_indexed fast path; emits `STR value,[base,#imm]`. */
+  if (!value.is_64bit && shift_amount == 0 && index.kind == MACH_OP_IMM)
+  {
+    int imm = (int)index.u.imm.val;
+    int sign = (imm < 0);
+    int abs_off = sign ? -imm : imm;
+    if (abs_off <= 4095)
+    {
+      const int btype = value.btype;
+      int value_reg = mach_ensure_in_reg(&ctx, &value, 0);
+      uint32_t excl = (1u << (uint32_t)value_reg);
+      int base_reg = mach_ensure_in_reg(&ctx, &base, excl);
+      if (btype == IROP_BTYPE_INT8)
+        th_store8_imm_or_reg(value_reg, (uint32_t)base_reg, abs_off, sign);
+      else if (btype == IROP_BTYPE_INT16)
+        th_store16_imm_or_reg(value_reg, (uint32_t)base_reg, abs_off, sign);
+      else
+        th_store32_imm_or_reg_ex(value_reg, (uint32_t)base_reg, abs_off, sign,
+                                 (1u << (uint32_t)value_reg) | (1u << (uint32_t)base_reg));
+      mach_release_all(&ctx);
+      return;
+    }
+  }
+
   thumb_shift shift = {.type = THUMB_SHIFT_LSL, .value = (uint32_t)shift_amount, .mode = THUMB_SHIFT_IMMEDIATE};
+
+  /* Fast path: 64-bit constant-displacement store using STRD [base, #imm]. */
+  if (value.is_64bit && shift_amount == 0 && index.kind == MACH_OP_IMM)
+  {
+    int imm = (int)index.u.imm.val;
+    int sign = (imm < 0);
+    int abs_off = sign ? -imm : imm;
+    if (abs_off <= 1020 && (abs_off & 3) == 0)
+    {
+      MachineOperand val_lo = mach_make_lo_half(&value);
+      val_lo.btype = IROP_BTYPE_INT32;
+      MachineOperand val_hi = mach_make_hi_half(&value);
+      val_hi.btype = IROP_BTYPE_INT32;
+      const int lo_reg = mach_ensure_in_reg(&ctx, &val_lo, 0);
+      uint32_t excl = (1u << (uint32_t)lo_reg);
+      const int hi_reg = mach_ensure_in_reg(&ctx, &val_hi, excl);
+      excl |= (1u << (uint32_t)hi_reg);
+      int base_reg = mach_ensure_in_reg(&ctx, &base, excl);
+      uint32_t puw = sign ? 4u : 6u;
+      ot_check(th_strd_imm((uint32_t)lo_reg, (uint32_t)hi_reg, (uint32_t)base_reg, abs_off, puw));
+      mach_release_all(&ctx);
+      return;
+    }
+  }
 
   /* 64-bit indexed store: compute EA = base + index<<shift into scratch, then STRD. */
   if (value.is_64bit)
@@ -5504,9 +6951,9 @@ ST_FUNC void tcc_gen_machine_store_indexed_mop(MachineOperand base, MachineOpera
     int index_reg = mach_ensure_in_reg(&ctx, &index, excl);
     excl |= (1u << (uint32_t)index_reg);
     int ea_r = mach_alloc_scratch(&ctx, excl);
-    ot_check(th_add_reg((uint32_t)ea_r, (uint32_t)base_reg, (uint32_t)index_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, shift,
+    ot_check(th_add_reg((uint32_t)ea_r, (uint32_t)base_reg, (uint32_t)index_reg, flags_safe(), shift,
                         ENFORCE_ENCODING_NONE));
-    ot_check(th_strd_imm((uint32_t)lo_reg, (uint32_t)hi_reg, (uint32_t)ea_r, 0, 5, ENFORCE_ENCODING_NONE));
+    ot_check(th_strd_imm((uint32_t)lo_reg, (uint32_t)hi_reg, (uint32_t)ea_r, 0, 6));
     mach_release_all(&ctx);
     return;
   }
@@ -5550,21 +6997,20 @@ ST_FUNC void tcc_gen_machine_load_postinc_mop(MachineOperand dest, MachineOperan
   /* 64-bit post-increment load: LDRD dest_lo, dest_hi, [ptr], #offset */
   if (dest.is_64bit)
   {
-    const int dest_lo = dest.u.reg.r0;
-    if (!thumb_is_hw_reg(dest.u.reg.r1))
-      tcc_error("load_postinc_mop: 64-bit dest has invalid r1=%d (r0=%d) — "
-                "register allocator must produce a valid pair",
-                dest.u.reg.r1, dest.u.reg.r0);
-    const int dest_hi = dest.u.reg.r1;
+    const int dest_lo = mach_get_dest_reg(&ctx, &dest, 0);
+    MachineOperand dest_hi_mop = mach_make_hi_half(&dest);
+    const int dest_hi = mach_get_dest_reg(&ctx, &dest_hi_mop, (1u << (uint32_t)dest_lo));
     uint32_t excl = (1u << (uint32_t)dest_lo) | (1u << (uint32_t)dest_hi);
     int ptr_reg = mach_ensure_in_reg(&ctx, &ptr, excl);
     ot_check(
-        th_ldrd_imm((uint32_t)dest_lo, (uint32_t)dest_hi, (uint32_t)ptr_reg, offset_imm, puw, ENFORCE_ENCODING_NONE));
+        th_ldrd_imm((uint32_t)dest_lo, (uint32_t)dest_hi, (uint32_t)ptr_reg, offset_imm, puw));
+    mach_writeback_dest(&dest_hi_mop, dest_hi);
+    mach_writeback_dest(&dest, dest_lo);
     mach_release_all(&ctx);
     return;
   }
 
-  const int dest_reg = dest.u.reg.r0;
+  const int dest_reg = mach_get_dest_reg(&ctx, &dest, 0);
   const int btype = dest.btype;
   const int is_unsigned = (int)dest.is_unsigned;
 
@@ -5587,8 +7033,9 @@ ST_FUNC void tcc_gen_machine_load_postinc_mop(MachineOperand dest, MachineOperan
   }
   else
   {
-    ot_check(th_ldr_imm(dest_reg, ptr_reg, offset_imm, puw, ENFORCE_ENCODING_NONE));
+    ot_check_ldr_imm(dest_reg, ptr_reg, offset_imm, puw, ENFORCE_ENCODING_NONE);
   }
+  mach_writeback_dest(&dest, dest_reg);
   mach_release_all(&ctx);
 }
 
@@ -5623,7 +7070,7 @@ ST_FUNC void tcc_gen_machine_store_postinc_mop(MachineOperand ptr, MachineOperan
     excl |= (1u << (uint32_t)hi_reg);
     int ptr_reg = mach_ensure_in_reg(&ctx, &ptr, excl);
     ot_check(
-        th_strd_imm((uint32_t)lo_reg, (uint32_t)hi_reg, (uint32_t)ptr_reg, offset_imm, puw, ENFORCE_ENCODING_NONE));
+        th_strd_imm((uint32_t)lo_reg, (uint32_t)hi_reg, (uint32_t)ptr_reg, offset_imm, puw));
     mach_release_all(&ctx);
     return;
   }
@@ -5639,7 +7086,7 @@ ST_FUNC void tcc_gen_machine_store_postinc_mop(MachineOperand ptr, MachineOperan
   else if (btype == IROP_BTYPE_INT16)
     ot_check(th_strh_imm(value_reg, ptr_reg, offset_imm, puw, ENFORCE_ENCODING_NONE));
   else
-    ot_check(th_str_imm(value_reg, ptr_reg, offset_imm, puw, ENFORCE_ENCODING_NONE));
+    ot_check_str_imm(value_reg, ptr_reg, offset_imm, puw, ENFORCE_ENCODING_NONE);
 
   mach_release_all(&ctx);
 }
@@ -5693,8 +7140,8 @@ static void fp_mop_load_arg(int target_reg, const MachineOperand *op)
     if (!op->needs_deref)
     {
       if (op->u.reg.r0 != target_reg)
-        ot_check(th_mov_reg((uint32_t)target_reg, (uint32_t)op->u.reg.r0, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
-                            THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
+        ot_check_mov_reg((uint32_t)target_reg, (uint32_t)op->u.reg.r0, flags_safe(),
+                         THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
     }
     else
     {
@@ -5905,15 +7352,15 @@ static MachineOperand mach_make_complex_imag(const MachineOperand *op)
 /* Helper: save a double from R0:R1 to SP-relative stack offset. */
 static void fp_mop_save_double_to_sp(int off)
 {
-  ot_check(th_str_imm(R0, R_SP, off, 6, ENFORCE_ENCODING_NONE));
-  ot_check(th_str_imm(R1, R_SP, off + 4, 6, ENFORCE_ENCODING_NONE));
+  ot_check_str_imm(R0, R_SP, off, 6, ENFORCE_ENCODING_NONE);
+  ot_check_str_imm(R1, R_SP, off + 4, 6, ENFORCE_ENCODING_NONE);
 }
 
 /* Helper: load a double from SP-relative stack offset into (lo_reg, hi_reg). */
 static void fp_mop_load_double_from_sp(int lo_reg, int hi_reg, int off)
 {
-  ot_check(th_ldr_imm(lo_reg, R_SP, off, 6, ENFORCE_ENCODING_NONE));
-  ot_check(th_ldr_imm(hi_reg, R_SP, off + 4, 6, ENFORCE_ENCODING_NONE));
+  ot_check_ldr_imm(lo_reg, R_SP, off, 6, ENFORCE_ENCODING_NONE);
+  ot_check_ldr_imm(hi_reg, R_SP, off + 4, 6, ENFORCE_ENCODING_NONE);
 }
 
 /* Process complex double multiplication via MachineOperands.
@@ -5940,7 +7387,7 @@ static void thumb_process_complex_mul_double_mop(MachineOperand src1, MachineOpe
     MachineOperand s2_imag = mach_make_complex_imag(&src2);
 
     /* Allocate 8 bytes to save the scalar 'a'. */
-    ot_check(th_sub_sp_imm(R_SP, 8, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    ot_check(th_sub_imm(R_SP, R_SP, 8, flags_safe(), ENFORCE_ENCODING_NONE));
 
     /* Load scalar 'a' into R0:R1 and save to stack. */
     fp_mop_load_double_arg(R0, R1, &src1);
@@ -5959,7 +7406,7 @@ static void thumb_process_complex_mul_double_mop(MachineOperand src1, MachineOpe
     /* R0:R1 = a*d → write to dest imag. */
     fp_mop_writeback_result(&d_imag, 1);
 
-    ot_check(th_add_sp_imm(R_SP, 8, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    ot_check(th_add_imm(R_SP, R_SP, 8, flags_safe(), ENFORCE_ENCODING_NONE));
   }
   else if (s1_complex && !s2_complex)
   {
@@ -5968,7 +7415,7 @@ static void thumb_process_complex_mul_double_mop(MachineOperand src1, MachineOpe
     MachineOperand s1_imag = mach_make_complex_imag(&src1);
 
     /* Allocate 8 bytes to save the scalar 'c'. */
-    ot_check(th_sub_sp_imm(R_SP, 8, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    ot_check(th_sub_imm(R_SP, R_SP, 8, flags_safe(), ENFORCE_ENCODING_NONE));
 
     /* Load scalar 'c' into R0:R1 and save to stack. */
     fp_mop_load_double_arg(R0, R1, &src2);
@@ -5986,7 +7433,7 @@ static void thumb_process_complex_mul_double_mop(MachineOperand src1, MachineOpe
     fp_mop_do_bl("__aeabi_dmul");
     fp_mop_writeback_result(&d_imag, 1);
 
-    ot_check(th_add_sp_imm(R_SP, 8, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    ot_check(th_add_imm(R_SP, R_SP, 8, flags_safe(), ENFORCE_ENCODING_NONE));
   }
   else
   {
@@ -6008,7 +7455,7 @@ static void thumb_process_complex_mul_double_mop(MachineOperand src1, MachineOpe
     const int off_scratch0 = 0, off_scratch1 = 8;
     const int off_a = 16, off_b = 24, off_c = 32, off_d = 40;
 
-    ot_check(th_sub_sp_imm(R_SP, 48, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    ot_check(th_sub_imm(R_SP, R_SP, 48, flags_safe(), ENFORCE_ENCODING_NONE));
 
     /* Save all 4 components to stack. */
     fp_mop_load_double_arg(R0, R1, &s1_real);
@@ -6062,7 +7509,7 @@ static void thumb_process_complex_mul_double_mop(MachineOperand src1, MachineOpe
     fp_mop_load_double_from_sp(R0, R1, off_scratch1);
     fp_mop_writeback_result(&d_imag, 1);
 
-    ot_check(th_add_sp_imm(R_SP, 48, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    ot_check(th_add_imm(R_SP, R_SP, 48, flags_safe(), ENFORCE_ENCODING_NONE));
   }
 }
 
@@ -6079,8 +7526,8 @@ static void complex_pair_writeback(MachineOperand *d_lo, int lo_reg, MachineOper
   {
     /* Total swap: save hi to temp, then write both */
     int tmp = (lo_reg != R2 && hi_reg != R2) ? R2 : R3;
-    ot_check(th_mov_reg((uint32_t)tmp, (uint32_t)hi_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                        ENFORCE_ENCODING_NONE, false));
+    ot_check_mov_reg((uint32_t)tmp, (uint32_t)hi_reg, flags_safe(), THUMB_SHIFT_DEFAULT,
+                     ENFORCE_ENCODING_NONE, false);
     mach_writeback_dest(d_lo, lo_reg);
     mach_writeback_dest(d_hi, tmp);
   }
@@ -6088,8 +7535,8 @@ static void complex_pair_writeback(MachineOperand *d_lo, int lo_reg, MachineOper
   {
     /* Lo writeback would clobber hi value; save hi first */
     int tmp = (lo_reg != R2 && hi_reg != R2) ? R2 : R3;
-    ot_check(th_mov_reg((uint32_t)tmp, (uint32_t)hi_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                        ENFORCE_ENCODING_NONE, false));
+    ot_check_mov_reg((uint32_t)tmp, (uint32_t)hi_reg, flags_safe(), THUMB_SHIFT_DEFAULT,
+                     ENFORCE_ENCODING_NONE, false);
     mach_writeback_dest(d_lo, lo_reg);
     mach_writeback_dest(d_hi, tmp);
   }
@@ -6131,7 +7578,7 @@ static void thumb_process_complex_op_double_mop(MachineOperand src1, MachineOper
    *   [sp+8]  = s1_imag (8 bytes)
    *   [sp+0]  = s1_real (8 bytes)
    */
-  ot_check(th_sub_sp_imm(R_SP, 32, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+  ot_check(th_sub_imm(R_SP, R_SP, 32, flags_safe(), ENFORCE_ENCODING_NONE));
 
   /* Save all 4 components to stack. */
   fp_mop_load_double_arg(R0, R1, &s1_real);
@@ -6163,7 +7610,7 @@ static void thumb_process_complex_op_double_mop(MachineOperand src1, MachineOper
   fp_mop_load_double_from_sp(R0, R1, 8);
   fp_mop_writeback_result(&d_imag, 1);
 
-  ot_check(th_add_sp_imm(R_SP, 32, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+  ot_check(th_add_imm(R_SP, R_SP, 32, flags_safe(), ENFORCE_ENCODING_NONE));
 }
 
 /* Process complex addition/subtraction via MachineOperands.
@@ -6190,28 +7637,28 @@ static void thumb_process_complex_op_mop(MachineOperand src1, MachineOperand src
    *   [sp+4]  = s1_imag
    *   [sp+0]  = s1_real
    */
-  ot_check(th_sub_sp_imm(R_SP, 16, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+  ot_check(th_sub_imm(R_SP, R_SP, 16, flags_safe(), ENFORCE_ENCODING_NONE));
 
   /* Load and save each component to stack. */
   fp_mop_load_arg(R0, &s1_real);
-  ot_check(th_str_imm(R0, R_SP, 0, 6, ENFORCE_ENCODING_NONE));
+  ot_check_str_imm(R0, R_SP, 0, 6, ENFORCE_ENCODING_NONE);
   fp_mop_load_arg(R0, &s1_imag);
-  ot_check(th_str_imm(R0, R_SP, 4, 6, ENFORCE_ENCODING_NONE));
+  ot_check_str_imm(R0, R_SP, 4, 6, ENFORCE_ENCODING_NONE);
   fp_mop_load_arg(R0, &s2_real);
-  ot_check(th_str_imm(R0, R_SP, 8, 6, ENFORCE_ENCODING_NONE));
+  ot_check_str_imm(R0, R_SP, 8, 6, ENFORCE_ENCODING_NONE);
   fp_mop_load_arg(R0, &s2_imag);
-  ot_check(th_str_imm(R0, R_SP, 12, 6, ENFORCE_ENCODING_NONE));
+  ot_check_str_imm(R0, R_SP, 12, 6, ENFORCE_ENCODING_NONE);
 
   /* Compute real part: func(a.real, b.real) */
-  ot_check(th_ldr_imm(R0, R_SP, 0, 6, ENFORCE_ENCODING_NONE));
-  ot_check(th_ldr_imm(R1, R_SP, 8, 6, ENFORCE_ENCODING_NONE));
+  ot_check_ldr_imm(R0, R_SP, 0, 6, ENFORCE_ENCODING_NONE);
+  ot_check_ldr_imm(R1, R_SP, 8, 6, ENFORCE_ENCODING_NONE);
   fp_mop_do_bl(func_name);
   /* Save real result to stack slot 0 */
-  ot_check(th_str_imm(R0, R_SP, 0, 6, ENFORCE_ENCODING_NONE));
+  ot_check_str_imm(R0, R_SP, 0, 6, ENFORCE_ENCODING_NONE);
 
   /* Compute imag part: func(a.imag, b.imag) */
-  ot_check(th_ldr_imm(R0, R_SP, 4, 6, ENFORCE_ENCODING_NONE));
-  ot_check(th_ldr_imm(R1, R_SP, 12, 6, ENFORCE_ENCODING_NONE));
+  ot_check_ldr_imm(R0, R_SP, 4, 6, ENFORCE_ENCODING_NONE);
+  ot_check_ldr_imm(R1, R_SP, 12, 6, ENFORCE_ENCODING_NONE);
   fp_mop_do_bl(func_name);
   /* R0 = imag result */
 
@@ -6220,8 +7667,8 @@ static void thumb_process_complex_op_mop(MachineOperand src1, MachineOperand src
   MachineOperand d_imag = mach_make_hi_half(&dest);
 
   /* R0 = imag result.  Load real result from stack into R1. */
-  ot_check(th_ldr_imm(R1, R_SP, 0, 6, ENFORCE_ENCODING_NONE));
-  ot_check(th_add_sp_imm(R_SP, 16, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+  ot_check_ldr_imm(R1, R_SP, 0, 6, ENFORCE_ENCODING_NONE);
+  ot_check(th_add_imm(R_SP, R_SP, 16, flags_safe(), ENFORCE_ENCODING_NONE));
 
   /* Write back: R1 = real part, R0 = imag part.
    * Use safe writeback to avoid clobbering when dest overlaps R0/R1. */
@@ -6247,17 +7694,17 @@ static void thumb_process_complex_mul_mop(MachineOperand src1, MachineOperand sr
   MachineOperand s2_imag = mach_make_hi_half(&src2);
 
   /* Allocate 24 bytes on stack */
-  ot_check(th_sub_sp_imm(R_SP, 24, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+  ot_check(th_sub_imm(R_SP, R_SP, 24, flags_safe(), ENFORCE_ENCODING_NONE));
 
   /* Save inputs to stack */
   fp_mop_load_arg(R0, &s1_real);
-  ot_check(th_str_imm(R0, R_SP, 8, 6, ENFORCE_ENCODING_NONE)); /* a */
+  ot_check_str_imm(R0, R_SP, 8, 6, ENFORCE_ENCODING_NONE); /* a */
   fp_mop_load_arg(R0, &s1_imag);
-  ot_check(th_str_imm(R0, R_SP, 12, 6, ENFORCE_ENCODING_NONE)); /* b */
+  ot_check_str_imm(R0, R_SP, 12, 6, ENFORCE_ENCODING_NONE); /* b */
   fp_mop_load_arg(R0, &s2_real);
-  ot_check(th_str_imm(R0, R_SP, 16, 6, ENFORCE_ENCODING_NONE)); /* c */
+  ot_check_str_imm(R0, R_SP, 16, 6, ENFORCE_ENCODING_NONE); /* c */
   fp_mop_load_arg(R0, &s2_imag);
-  ot_check(th_str_imm(R0, R_SP, 20, 6, ENFORCE_ENCODING_NONE)); /* d */
+  ot_check_str_imm(R0, R_SP, 20, 6, ENFORCE_ENCODING_NONE); /* d */
 
   const int off_scratch0 = 0;
   const int off_scratch1 = 4;
@@ -6267,47 +7714,47 @@ static void thumb_process_complex_mul_mop(MachineOperand src1, MachineOperand sr
   const int off_d = 20;
 
   /* Step 1: ac = a * c → scratch0 */
-  ot_check(th_ldr_imm(R0, R_SP, off_a, 6, ENFORCE_ENCODING_NONE));
-  ot_check(th_ldr_imm(R1, R_SP, off_c, 6, ENFORCE_ENCODING_NONE));
+  ot_check_ldr_imm(R0, R_SP, off_a, 6, ENFORCE_ENCODING_NONE);
+  ot_check_ldr_imm(R1, R_SP, off_c, 6, ENFORCE_ENCODING_NONE);
   fp_mop_do_bl("__aeabi_fmul");
-  ot_check(th_str_imm(R0, R_SP, off_scratch0, 6, ENFORCE_ENCODING_NONE));
+  ot_check_str_imm(R0, R_SP, off_scratch0, 6, ENFORCE_ENCODING_NONE);
 
   /* Step 2: bd = b * d → scratch1 */
-  ot_check(th_ldr_imm(R0, R_SP, off_b, 6, ENFORCE_ENCODING_NONE));
-  ot_check(th_ldr_imm(R1, R_SP, off_d, 6, ENFORCE_ENCODING_NONE));
+  ot_check_ldr_imm(R0, R_SP, off_b, 6, ENFORCE_ENCODING_NONE);
+  ot_check_ldr_imm(R1, R_SP, off_d, 6, ENFORCE_ENCODING_NONE);
   fp_mop_do_bl("__aeabi_fmul");
-  ot_check(th_str_imm(R0, R_SP, off_scratch1, 6, ENFORCE_ENCODING_NONE));
+  ot_check_str_imm(R0, R_SP, off_scratch1, 6, ENFORCE_ENCODING_NONE);
 
   /* Step 3: real = ac - bd → scratch0 */
-  ot_check(th_ldr_imm(R0, R_SP, off_scratch0, 6, ENFORCE_ENCODING_NONE));
-  ot_check(th_ldr_imm(R1, R_SP, off_scratch1, 6, ENFORCE_ENCODING_NONE));
+  ot_check_ldr_imm(R0, R_SP, off_scratch0, 6, ENFORCE_ENCODING_NONE);
+  ot_check_ldr_imm(R1, R_SP, off_scratch1, 6, ENFORCE_ENCODING_NONE);
   fp_mop_do_bl("__aeabi_fsub");
-  ot_check(th_str_imm(R0, R_SP, off_scratch0, 6, ENFORCE_ENCODING_NONE));
+  ot_check_str_imm(R0, R_SP, off_scratch0, 6, ENFORCE_ENCODING_NONE);
 
   /* Step 4: ad = a * d → scratch1 */
-  ot_check(th_ldr_imm(R0, R_SP, off_a, 6, ENFORCE_ENCODING_NONE));
-  ot_check(th_ldr_imm(R1, R_SP, off_d, 6, ENFORCE_ENCODING_NONE));
+  ot_check_ldr_imm(R0, R_SP, off_a, 6, ENFORCE_ENCODING_NONE);
+  ot_check_ldr_imm(R1, R_SP, off_d, 6, ENFORCE_ENCODING_NONE);
   fp_mop_do_bl("__aeabi_fmul");
-  ot_check(th_str_imm(R0, R_SP, off_scratch1, 6, ENFORCE_ENCODING_NONE));
+  ot_check_str_imm(R0, R_SP, off_scratch1, 6, ENFORCE_ENCODING_NONE);
 
   /* Step 5: bc = b * c → off_a (no longer needed) */
-  ot_check(th_ldr_imm(R0, R_SP, off_b, 6, ENFORCE_ENCODING_NONE));
-  ot_check(th_ldr_imm(R1, R_SP, off_c, 6, ENFORCE_ENCODING_NONE));
+  ot_check_ldr_imm(R0, R_SP, off_b, 6, ENFORCE_ENCODING_NONE);
+  ot_check_ldr_imm(R1, R_SP, off_c, 6, ENFORCE_ENCODING_NONE);
   fp_mop_do_bl("__aeabi_fmul");
-  ot_check(th_str_imm(R0, R_SP, off_a, 6, ENFORCE_ENCODING_NONE));
+  ot_check_str_imm(R0, R_SP, off_a, 6, ENFORCE_ENCODING_NONE);
 
   /* Step 6: imag = ad + bc → scratch1 */
-  ot_check(th_ldr_imm(R0, R_SP, off_scratch1, 6, ENFORCE_ENCODING_NONE));
-  ot_check(th_ldr_imm(R1, R_SP, off_a, 6, ENFORCE_ENCODING_NONE));
+  ot_check_ldr_imm(R0, R_SP, off_scratch1, 6, ENFORCE_ENCODING_NONE);
+  ot_check_ldr_imm(R1, R_SP, off_a, 6, ENFORCE_ENCODING_NONE);
   fp_mop_do_bl("__aeabi_fadd");
-  ot_check(th_str_imm(R0, R_SP, off_scratch1, 6, ENFORCE_ENCODING_NONE));
+  ot_check_str_imm(R0, R_SP, off_scratch1, 6, ENFORCE_ENCODING_NONE);
 
   /* Load results and write back */
   MachineOperand d_real = mach_make_lo_half(&dest);
   MachineOperand d_imag = mach_make_hi_half(&dest);
-  ot_check(th_ldr_imm(R0, R_SP, off_scratch0, 6, ENFORCE_ENCODING_NONE)); /* real */
-  ot_check(th_ldr_imm(R1, R_SP, off_scratch1, 6, ENFORCE_ENCODING_NONE)); /* imag */
-  ot_check(th_add_sp_imm(R_SP, 24, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+  ot_check_ldr_imm(R0, R_SP, off_scratch0, 6, ENFORCE_ENCODING_NONE); /* real */
+  ot_check_ldr_imm(R1, R_SP, off_scratch1, 6, ENFORCE_ENCODING_NONE); /* imag */
+  ot_check(th_add_imm(R_SP, R_SP, 24, flags_safe(), ENFORCE_ENCODING_NONE));
 
   complex_pair_writeback(&d_real, R0, &d_imag, R1);
 }
@@ -6317,19 +7764,17 @@ static void thumb_process_complex_mul_mop(MachineOperand src1, MachineOperand sr
  *
  * __divsc3 calling convention (soft-float AAPCS, hidden return pointer):
  *   R0       = hidden return pointer (8-byte buffer for result)
- *   R1       = a_re (float)
- *   R2       = a_im (float)
- *   R3       = b_re (float)
- *   [sp+0]   = b_im (float, on stack)
+ *   R1       = a_real (first float arg)
+ *   R2       = a_imag (second float arg)
+ *   R3       = b_real (third float arg)
+ *   [sp+0]   = b_imag (fourth float arg, on stack)
  *   Result written to [R0+0..3] = real, [R0+4..7] = imag
  *
- * Stack layout (24 bytes, 8-byte aligned):
- *   [sp+0]   = b_im for __divsc3 stack arg  (4 bytes)
- *   [sp+4]   = a_re staging                 (4 bytes)
- *   [sp+8]   = a_im staging                 (4 bytes)
- *   [sp+12]  = b_re staging                 (4 bytes)
- *   [sp+16]  = result buffer: real part      (4 bytes)
- *   [sp+20]  = result buffer: imag part      (4 bytes)
+ * Stack layout (16 bytes):
+ *   [sp+0]   = b_imag for __divsc3 stack arg  (4 bytes)
+ *   [sp+4]   = padding                        (4 bytes)
+ *   [sp+8]   = result buffer: real part        (4 bytes)
+ *   [sp+12]  = result buffer: imag part        (4 bytes)
  */
 static void thumb_process_complex_div_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest)
 {
@@ -6338,37 +7783,58 @@ static void thumb_process_complex_div_mop(MachineOperand src1, MachineOperand sr
   MachineOperand s2_real = mach_make_lo_half(&src2);
   MachineOperand s2_imag = mach_make_hi_half(&src2);
 
-  /* Allocate 24 bytes (8-byte aligned). */
-  ot_check(th_sub_sp_imm(R_SP, 24, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+  /* In PIC mode, save {r9, r12} BEFORE allocating the call frame so that
+   * SP-relative offsets within the 16-byte area remain correct when
+   * __divsc3 reads its stack arg at [sp+0]. */
+  if (text_and_data_separation)
+    ot_check(th_push((uint16_t)((1 << R9) | (1 << R12))));
 
-  /* Stage all four operands to stack via R0 to avoid clobbering. */
-  fp_mop_load_arg(R0, &s2_imag);
-  ot_check(th_str_imm(R0, R_SP, 0, 6, ENFORCE_ENCODING_NONE)); /* b_im → [sp+0] (stack arg) */
+  /* Allocate 16 bytes on stack. */
+  ot_check(th_sub_imm(R_SP, R_SP, 16, flags_safe(), ENFORCE_ENCODING_NONE));
+
+  /* Save all inputs to stack first to avoid register clobbering. */
   fp_mop_load_arg(R0, &s1_real);
-  ot_check(th_str_imm(R0, R_SP, 4, 6, ENFORCE_ENCODING_NONE)); /* a_re → [sp+4] */
+  ot_check_str_imm(R0, R_SP, 0, 6, ENFORCE_ENCODING_NONE); /* a_real */
   fp_mop_load_arg(R0, &s1_imag);
-  ot_check(th_str_imm(R0, R_SP, 8, 6, ENFORCE_ENCODING_NONE)); /* a_im → [sp+8] */
+  ot_check_str_imm(R0, R_SP, 4, 6, ENFORCE_ENCODING_NONE); /* a_imag */
   fp_mop_load_arg(R0, &s2_real);
-  ot_check(th_str_imm(R0, R_SP, 12, 6, ENFORCE_ENCODING_NONE)); /* b_re → [sp+12] */
+  ot_check_str_imm(R0, R_SP, 8, 6, ENFORCE_ENCODING_NONE); /* b_real */
+  fp_mop_load_arg(R0, &s2_imag);
+  ot_check_str_imm(R0, R_SP, 12, 6, ENFORCE_ENCODING_NONE); /* b_imag */
 
-  /* Load register args from staging area. */
-  ot_check(th_ldr_imm(R1, R_SP, 4, 6, ENFORCE_ENCODING_NONE));  /* R1 = a_re */
-  ot_check(th_ldr_imm(R2, R_SP, 8, 6, ENFORCE_ENCODING_NONE));  /* R2 = a_im */
-  ot_check(th_ldr_imm(R3, R_SP, 12, 6, ENFORCE_ENCODING_NONE)); /* R3 = b_re */
+  /* Rearrange stack for __divsc3 call:
+   * Need [sp+0] = b_imag, [sp+8..15] = result buffer.
+   * Currently [sp+0]=a_real, [sp+4]=a_imag, [sp+8]=b_real, [sp+12]=b_imag.
+   * Load R1-R3 from stack, then rearrange. */
+  ot_check_ldr_imm(R1, R_SP, 0, 6, ENFORCE_ENCODING_NONE);  /* R1 = a_real */
+  ot_check_ldr_imm(R2, R_SP, 4, 6, ENFORCE_ENCODING_NONE);  /* R2 = a_imag */
+  ot_check_ldr_imm(R3, R_SP, 8, 6, ENFORCE_ENCODING_NONE);  /* R3 = b_real */
+  ot_check_ldr_imm(R0, R_SP, 12, 6, ENFORCE_ENCODING_NONE); /* R0 = b_imag */
+  ot_check_str_imm(R0, R_SP, 0, 6, ENFORCE_ENCODING_NONE);  /* [sp+0] = b_imag (stack arg) */
 
-  /* R0 = pointer to result buffer at [sp+16]. */
-  ot_check(th_add_sp_imm(R0, 16, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+  /* R0 = pointer to result buffer at [sp+8]. */
+  ot_check(th_add_imm(R0, R_SP, 8, flags_safe(), ENFORCE_ENCODING_NONE));
 
-  /* Call __divsc3. */
-  fp_mop_do_bl("__divsc3");
+  /* Call __divsc3 (directly, not via fp_mop_do_bl which would add another
+   * push/pop of {r9, r12} and corrupt the stack arg layout). */
+  {
+    Sym *sym = external_global_sym(tok_alloc_const("__divsc3"), &func_old_type);
+    MachineOperand func_mop = {0};
+    func_mop.kind = MACH_OP_SYMBOL;
+    func_mop.u.sym.sym = sym;
+    func_mop.u.sym.addend = 0;
+    gcall_or_jump_mop(0, func_mop);
+  }
 
   /* Read result from buffer and write back to dest. */
   MachineOperand d_real = mach_make_lo_half(&dest);
   MachineOperand d_imag = mach_make_hi_half(&dest);
-  ot_check(th_ldr_imm(R0, R_SP, 16, 6, ENFORCE_ENCODING_NONE)); /* real */
-  ot_check(th_ldr_imm(R1, R_SP, 20, 6, ENFORCE_ENCODING_NONE)); /* imag */
+  ot_check_ldr_imm(R0, R_SP, 8, 6, ENFORCE_ENCODING_NONE);  /* real */
+  ot_check_ldr_imm(R1, R_SP, 12, 6, ENFORCE_ENCODING_NONE); /* imag */
+  ot_check(th_add_imm(R_SP, R_SP, 16, flags_safe(), ENFORCE_ENCODING_NONE));
 
-  ot_check(th_add_sp_imm(R_SP, 24, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+  if (text_and_data_separation)
+    ot_check(th_pop((uint16_t)((1 << R9) | (1 << R12))));
 
   complex_pair_writeback(&d_real, R0, &d_imag, R1);
 }
@@ -6400,8 +7866,14 @@ static void thumb_process_complex_div_double_mop(MachineOperand src1, MachineOpe
   MachineOperand d_real = mach_make_complex_real(&dest);
   MachineOperand d_imag = mach_make_complex_imag(&dest);
 
+  /* In PIC mode, save {r9, r12} BEFORE allocating the call frame so that
+   * SP-relative offsets within the 40-byte area remain correct when
+   * __divdc3 reads its stack args at [sp+0..23]. */
+  if (text_and_data_separation)
+    ot_check(th_push((uint16_t)((1 << R9) | (1 << R12))));
+
   /* Allocate 40 bytes (8-byte aligned). */
-  ot_check(th_sub_sp_imm(R_SP, 40, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+  ot_check(th_sub_imm(R_SP, R_SP, 40, flags_safe(), ENFORCE_ENCODING_NONE));
 
   /* Set up __divdc3 stack args (must be at lowest sp offsets). */
   /* [sp+16] = b_im (src2 imag). */
@@ -6418,10 +7890,18 @@ static void thumb_process_complex_div_double_mop(MachineOperand src1, MachineOpe
   fp_mop_load_double_arg(R2, R3, &s1_real);
 
   /* R0 = pointer to result buffer at [sp+24]. */
-  ot_check(th_add_sp_imm(R0, 24, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+  ot_check(th_add_imm(R0, R_SP, 24, flags_safe(), ENFORCE_ENCODING_NONE));
 
-  /* Call __divdc3. */
-  fp_mop_do_bl("__divdc3");
+  /* Call __divdc3 (directly, not via fp_mop_do_bl which would add another
+   * push/pop of {r9, r12} and corrupt the stack arg layout). */
+  {
+    Sym *sym = external_global_sym(tok_alloc_const("__divdc3"), &func_old_type);
+    MachineOperand func_mop = {0};
+    func_mop.kind = MACH_OP_SYMBOL;
+    func_mop.u.sym.sym = sym;
+    func_mop.u.sym.addend = 0;
+    gcall_or_jump_mop(0, func_mop);
+  }
 
   /* Read result from buffer and write back to dest. */
   fp_mop_load_double_from_sp(R0, R1, 24);
@@ -6429,7 +7909,10 @@ static void thumb_process_complex_div_double_mop(MachineOperand src1, MachineOpe
   fp_mop_load_double_from_sp(R0, R1, 32);
   fp_mop_writeback_result(&d_imag, 1);
 
-  ot_check(th_add_sp_imm(R_SP, 40, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+  ot_check(th_add_imm(R_SP, R_SP, 40, flags_safe(), ENFORCE_ENCODING_NONE));
+
+  if (text_and_data_separation)
+    ot_check(th_pop((uint16_t)((1 << R9) | (1 << R12))));
 }
 
 /* tcc_gen_machine_fp_mop: MachineOperand-based entry point for floating-point
@@ -6491,7 +7974,7 @@ ST_FUNC void tcc_gen_machine_fp_mop(MachineOperand src1, MachineOperand src2, Ma
       fp_mop_load_double_arg(R0, R1, &src1);
       scr = get_scratch_reg_with_save((1u << R0) | (1u << R1));
       load_full_const(scr.reg, PREG_NONE, 0x80000000, 0);
-      ot_check(th_eor_reg(R1, R1, scr.reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+      ot_check(th_eor_reg(R1, R1, scr.reg, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
       restore_scratch_reg(&scr);
       fp_mop_writeback_result(&dest, 1);
     }
@@ -6501,7 +7984,7 @@ ST_FUNC void tcc_gen_machine_fp_mop(MachineOperand src1, MachineOperand src2, Ma
       fp_mop_load_arg(R0, &src1);
       scr = get_scratch_reg_with_save(1u << R0);
       load_full_const(scr.reg, PREG_NONE, 0x80000000, 0);
-      ot_check(th_eor_reg(R0, R0, scr.reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+      ot_check(th_eor_reg(R0, R0, scr.reg, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
       restore_scratch_reg(&scr);
       mach_writeback_dest(&dest, R0);
     }
@@ -6676,7 +8159,7 @@ ST_FUNC void tcc_gen_machine_return_value_mop(MachineOperand src, TccIrOp op)
   MachineCodegenContext ctx = {0};
   int src_reg = mach_ensure_in_reg(&ctx, &src, 0);
   if (src_reg != R0)
-    ot_check(th_mov_reg(R0, src_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
+    ot_check_mov_reg(R0, src_reg, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
   mach_release_all(&ctx);
 }
 
@@ -6692,6 +8175,9 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
   /* Clear global symbol cache at function start */
   thumb_gen_state.cached_global_sym = NULL;
   thumb_gen_state.cached_global_reg = PREG_NONE;
+  /* MOV-coalescing cache is per-function: register live ranges don't
+   * cross function boundaries. */
+  mov_equiv_reset_all();
   TCCIRState *ir = tcc_state->ir;
 
   /* Determine if LR needs saving */
@@ -6707,7 +8193,7 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
   if (tcc_state->force_lr_save)
     tcc_state->need_frame_pointer = 1;
 
-  const int need_fp = (tcc_state->force_frame_pointer || tcc_state->need_frame_pointer || (stack_size > 0));
+  const int need_fp = (tcc_state->force_frame_pointer || tcc_state->need_frame_pointer);
   tcc_state->need_frame_pointer = need_fp;
 
   /* Use two-phase push (standard frame record) when __builtin_return_address
@@ -6740,6 +8226,8 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
     }
   }
 
+  int push_align_pad = 0; /* 4 if push count is odd, absorbed into SUB SP */
+
   if (standard_frame_record)
   {
     /* ── Two-phase push: frame record {r7, lr} then callee-saved ──
@@ -6752,12 +8240,14 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
       frame_count++;
     }
 
-    /* Pad total to even count for 8-byte alignment (AAPCS). */
+    /* Pad total to even count for 8-byte alignment (AAPCS).
+     * Standard frame record uses FP-relative negative offsets (e.g. static
+     * chain at [FP-4]), so the alignment gap must stay as SUB SP space
+     * below FP — cannot use a dummy push register here. */
     int total = frame_count + callee_count;
     if (total % 2 != 0)
     {
-      callee_regs_local |= (1 << R12);
-      callee_count++;
+      push_align_pad = 4;
     }
 
     th_sym_t();
@@ -6774,7 +8264,7 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
     ot_check(th_push(frame_regs));
 
     /* MOV r7, sp — FP points at the frame record */
-    if (!ot(th_add_imm(R_FP, R_SP, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE)))
+    if (!ot(th_add_imm(R_FP, R_SP, 0, flags_safe(), ENFORCE_ENCODING_NONE)))
     {
       fprintf(stderr, "compiler_error: prolog frame pointer setup failed\n");
       exit(1);
@@ -6806,11 +8296,24 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
       registers_count++;
     }
 
-    /* Keep the total push size 8-byte aligned (AAPCS). */
+    /* Keep the total push size 8-byte aligned (AAPCS).
+     * When no locals/FP (stack_size == 0, no frame pointer), pad by pushing
+     * a dummy low register (R3) — avoids SUB SP + ADD SP, saving 2 insns.
+     * When FP is used, alignment pad must stay as SUB SP space because
+     * FP-relative negative offsets may address that area.
+     * When locals exist, absorb the gap into SUB SP instead, keeping
+     * PUSH in 16-bit encoding (no high regs like R12). */
     if (registers_count % 2 != 0)
     {
-      registers_to_push |= (1 << R12);
-      registers_count++;
+      if (stack_size == 0 && !need_fp)
+      {
+        registers_to_push |= (1 << R3);
+        registers_count++;
+      }
+      else
+      {
+        push_align_pad = 4;
+      }
     }
 
     th_sym_t();
@@ -6841,10 +8344,20 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
    */
   if (stack_size & 7)
     stack_size = (stack_size + 7) & ~7;
+
+  /* allocated_stack_size is the portion of the stack used for locals/spills.
+   * It must NOT include the alignment pad — local offsets are computed
+   * relative to this value, and the pad sits below all addressable locals. */
   allocated_stack_size = stack_size;
+
+  /* total_stack_dealloc is the full amount to restore in the epilogue,
+   * including the alignment pad that sits below addressable locals. */
+  int total_stack_dealloc = stack_size + push_align_pad;
+  epilogue_stack_dealloc = total_stack_dealloc;
+  stack_size = total_stack_dealloc;
   if (tcc_state->need_frame_pointer && !standard_frame_record)
   {
-    if (!ot(th_add_imm(R_FP, R_SP, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE)))
+    if (!ot(th_add_imm(R_FP, R_SP, 0, flags_safe(), ENFORCE_ENCODING_NONE)))
     {
       // todo mov fp, sp
       // load r12 immediate
@@ -6857,6 +8370,17 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
   {
     gadd_sp(-stack_size);
   }
+
+  /* When FP is omitted, SP is lower by the full SUB SP amount (locals +
+   * alignment pad).  Adjust offset_to_args so incoming stack parameters
+   * are found at the correct SP-relative position. */
+  if (!need_fp)
+    offset_to_args += epilogue_stack_dealloc;
+
+  /* However, local addressing uses allocated_stack_size (without pad).
+   * The pad sits at the top of the SUB SP region, right below pushed regs,
+   * so locals occupy SP+0 .. SP+allocated_stack_size-1, matching the same
+   * addresses as the old push-IP-for-alignment approach. */
 
   /* Save incoming static chain (R10) at fixed chain slot.
    * With two-phase push, callee-saved regs are below FP, so the chain
@@ -6891,7 +8415,10 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
 
     /* __gr_top = FP + offset_to_args (end of pushed r0-r3, start of stack args).
      * This is the top of the contiguous register save + stack arg area. */
-    ot_check(th_add_imm(R12, R_FP, offset_to_args, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    {
+      const int fp_or_sp = tcc_state->need_frame_pointer ? R_FP : R_SP;
+      ot_check(th_add_imm(R12, fp_or_sp, offset_to_args, flags_safe(), ENFORCE_ENCODING_NONE));
+    }
     tcc_gen_machine_store_to_stack(R12, -(callee_push_size + 20));
 
     /* store the number of named-arg bytes consumed in r0-r3 */
@@ -6917,7 +8444,10 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
       adj -= callee_push_size;
 
     /* Store stack args pointer (FP + offset_to_args = start of stack args area) */
-    ot_check(th_add_imm(R_IP, R_FP, offset_to_args, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    {
+      const int fp_or_sp = tcc_state->need_frame_pointer ? R_FP : R_SP;
+      ot_check(th_add_imm(R_IP, fp_or_sp, offset_to_args, flags_safe(), ENFORCE_ENCODING_NONE));
+    }
     tcc_gen_machine_store_to_stack_ex(R_IP, adj, (1u << R0) | (1u << R1) | (1u << R2) | (1u << R3));
 
     /* Store r0-r3 at offsets +4, +8, +12, +16 from the block start */
@@ -7097,8 +8627,7 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
         if (dst >= 0 && dst < 32 && (src_mask & (1u << dst)))
           continue; /* dst's current value is still needed as a source somewhere */
 
-        ot_check(
-            th_mov_reg(dst, src, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
+        ot_check_mov_reg(dst, src, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
         moves[i] = moves[--move_count];
         --i;
         progressed = 1;
@@ -7128,8 +8657,7 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
        * then walk dst<-src edges until we return to the start.
        */
       const int start = moves[0].dst;
-      ot_check(
-          th_mov_reg(temp, start, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
+      ot_check_mov_reg(temp, start, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
 
       int cur = start;
       for (;;)
@@ -7153,13 +8681,11 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
 
         if (src == start)
         {
-          ot_check(
-              th_mov_reg(cur, temp, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
+          ot_check_mov_reg(cur, temp, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
           break;
         }
 
-        ot_check(
-            th_mov_reg(cur, src, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
+        ot_check_mov_reg(cur, src, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
         cur = src;
       }
     }
@@ -7178,16 +8704,17 @@ ST_FUNC void tcc_gen_machine_epilog(int leaffunc)
   {
     /* ── Two-phase pop (mirrors two-phase push) ── */
     /* Restore SP from FP (works even with alloca/VLA since FP is stable) */
-    ot_check(th_mov_reg(R_SP, R_FP, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
-    /* SP = FP; callee-saved regs are below FP. Adjust SP down. */
-    gadd_sp(-callee_push_size);
+    ot_check_mov_reg(R_SP, R_FP, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
+    /* SP = FP; callee-saved regs are below FP. Adjust SP down.
+     * R3 is free in the epilogue (not used for return values). */
+    gadd_sp_ex(-callee_push_size, R3);
     ot_check(th_pop(callee_saved_regs));
     /* SP is now at FP (pointing at frame record {r7, [lr]}) */
     if (vararg_push_size > 0 && lr_saved)
     {
       /* Variadic: pop FP+LR, then skip over the pushed r0-r3 area */
       ot_check(th_pop((1 << R_FP) | (1 << R_LR)));
-      gadd_sp(vararg_push_size);
+      gadd_sp_ex(vararg_push_size, R3);
       ot_check(th_bx_reg(R_LR));
     }
     else if (lr_saved)
@@ -7198,19 +8725,19 @@ ST_FUNC void tcc_gen_machine_epilog(int leaffunc)
     {
       ot_check(th_pop(1 << R_FP));
       if (vararg_push_size > 0)
-        gadd_sp(vararg_push_size);
+        gadd_sp_ex(vararg_push_size, R3);
       ot_check(th_bx_reg(R_LR));
     }
   }
   else if (tcc_state->need_frame_pointer)
   {
     /* ── Original single-push with FP: restore SP from FP, then pop all ── */
-    ot_check(th_mov_reg(R_SP, R_FP, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
+    ot_check_mov_reg(R_SP, R_FP, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
     if (vararg_push_size > 0 && lr_saved)
     {
       /* Variadic: pop all regs with LR (not PC), then skip pushed r0-r3 */
       ot_check(th_pop(pushed_registers));
-      gadd_sp(vararg_push_size);
+      gadd_sp_ex(vararg_push_size, R3);
       ot_check(th_bx_reg(R_LR));
     }
     else if (lr_saved)
@@ -7224,15 +8751,15 @@ ST_FUNC void tcc_gen_machine_epilog(int leaffunc)
       if (pushed_registers > 0)
         ot_check(th_pop(pushed_registers));
       if (vararg_push_size > 0)
-        gadd_sp(vararg_push_size);
+        gadd_sp_ex(vararg_push_size, R3);
       ot_check(th_bx_reg(R_LR));
     }
   }
   else
   {
     /* ── No frame pointer ── */
-    if (allocated_stack_size > 0)
-      gadd_sp(allocated_stack_size);
+    if (epilogue_stack_dealloc > 0)
+      gadd_sp_ex(epilogue_stack_dealloc, R3);
     if (lr_saved)
     {
       pushed_registers |= 1 << R_PC;
@@ -7298,13 +8825,13 @@ ST_FUNC void tcc_gen_machine_lea_mop(MachineOperand dest, MachineOperand src)
     if (abs_off == 0)
     {
       if (r != base)
-        ot_check(th_mov_reg((uint32_t)r, (uint32_t)base, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                            ENFORCE_ENCODING_NONE, false));
+        ot_check_mov_reg((uint32_t)r, (uint32_t)base, flags_safe(), THUMB_SHIFT_DEFAULT,
+                         ENFORCE_ENCODING_NONE, false);
     }
     else
     {
-      thumb_opcode ins = sign ? th_sub_imm(r, base, abs_off, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE)
-                              : th_add_imm(r, base, abs_off, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE);
+      thumb_opcode ins = sign ? th_sub_imm(r, base, abs_off, flags_safe(), ENFORCE_ENCODING_NONE)
+                              : th_add_imm(r, base, abs_off, flags_safe(), ENFORCE_ENCODING_NONE);
       if (ins.size != 0)
       {
         ot_check(ins);
@@ -7314,9 +8841,9 @@ ST_FUNC void tcc_gen_machine_lea_mop(MachineOperand dest, MachineOperand src)
         /* Large offset: load into a scratch and use register ADD/SUB */
         ScratchRegAlloc off_sc = get_scratch_reg_with_save(excl | (1u << (uint32_t)r) | (1u << (uint32_t)base));
         load_full_const(off_sc.reg, PREG_NONE, LFC_SPLIT(abs_off));
-        ot_check(sign ? th_sub_reg(r, base, off_sc.reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+        ot_check(sign ? th_sub_reg(r, base, off_sc.reg, flags_safe(), THUMB_SHIFT_DEFAULT,
                                    ENFORCE_ENCODING_NONE)
-                      : th_add_reg(r, base, off_sc.reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                      : th_add_reg(r, base, off_sc.reg, flags_safe(), THUMB_SHIFT_DEFAULT,
                                    ENFORCE_ENCODING_NONE));
         restore_scratch_reg(&off_sc);
       }
@@ -7367,18 +8894,19 @@ ST_FUNC void tcc_gen_machine_store_to_stack(int reg, int offset)
  */
 ST_FUNC void tcc_gen_machine_store_to_stack_ex(int reg, int offset, uint32_t extra_exclude)
 {
+  const int base_reg = tcc_state->need_frame_pointer ? R_FP : R_SP;
   int sign = (offset < 0);
   int abs_offset = sign ? -offset : offset;
 
   /* Try direct STR with immediate offset */
-  if (!store_word_to_base(reg, R_FP, abs_offset, sign))
+  if (!store_word_to_base(reg, base_reg, abs_offset, sign))
   {
     /* Offset too large, use scratch register */
     /* Don't reuse the source register as offset scratch, otherwise we'd
      * clobber the value before the STR (e.g. store -offset instead of value). */
-    ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(abs_offset, sign, (1u << reg) | (1u << R_FP) | extra_exclude);
+    ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(abs_offset, sign, (1u << reg) | (1u << base_reg) | extra_exclude);
     int rr = rr_alloc.reg;
-    ot_check(th_str_reg(reg, R_FP, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+    ot_check(th_str_reg(reg, base_reg, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     restore_scratch_reg(&rr_alloc);
   }
 }
@@ -7478,12 +9006,7 @@ static void gcall_or_jump_mop(int is_jmp, MachineOperand target)
   if (is_jmp)
   {
     int r = mach_ensure_in_reg(&mctx, &adjusted, arg_regs);
-    if (r != R_IP)
-    {
-      thumb_shift no_shift = {THUMB_SHIFT_NONE, 0, THUMB_SHIFT_IMMEDIATE};
-      ot_check(th_mov_reg(R_IP, r, FLAGS_BEHAVIOUR_NOT_IMPORTANT, no_shift, ENFORCE_ENCODING_NONE, false));
-    }
-    ot_check(th_bx_reg(R_IP));
+    ot_check(th_bx_reg(r));
   }
   else
   {
@@ -7559,6 +9082,9 @@ typedef struct CallGenContext
   MachineOperand *mops;
   int argc;
   int stack_size;
+  uint32_t arg_move_dst_mask; /* Registers that will be explicitly written by register arg moves.
+                               * These are safe to clobber as scratch during stack arg placement
+                               * because the subsequent register moves will overwrite them. */
 } CallGenContext;
 
 static void thumb_emit_arg_move(const ThumbArgMove *m)
@@ -7567,8 +9093,8 @@ static void thumb_emit_arg_move(const ThumbArgMove *m)
   {
     if (m->src_reg == m->dst_reg)
       return;
-    ot_check(th_mov_reg(m->dst_reg, m->src_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                        ENFORCE_ENCODING_NONE, false));
+    ot_check_mov_reg(m->dst_reg, m->src_reg, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE,
+                     false);
     return;
   }
 
@@ -7587,7 +9113,8 @@ static void thumb_emit_arg_move(const ThumbArgMove *m)
     int base_dst = m->dst_reg;
 
     /* Get the struct base address into a scratch register */
-    int base_addr_reg = get_struct_base_addr_mop(&m->mop, ARM_R12);
+    ScratchRegAlloc struct_scratch = get_scratch_reg_with_save(0);
+    int base_addr_reg = get_struct_base_addr_mop(&m->mop, struct_scratch.reg);
 
     /* Load each word from the struct into consecutive target registers */
     for (int w = 0; w < word_count; ++w)
@@ -7596,20 +9123,14 @@ static void thumb_emit_arg_move(const ThumbArgMove *m)
       int offset = w * 4;
       if (!load_word_from_base(dst, base_addr_reg, offset, 0))
       {
-        /* Large offset - use R12 as scratch if it's not our base */
-        if (base_addr_reg != ARM_R12)
-        {
-          load_immediate(ARM_R12, offset, NULL, false);
-          ot_check(th_ldr_reg(dst, base_addr_reg, ARM_R12, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-        }
-        else
-        {
-          /* base_addr_reg is R12, need another approach */
-          load_immediate(ARM_LR, offset, NULL, false);
-          ot_check(th_ldr_reg(dst, base_addr_reg, ARM_LR, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-        }
+        /* Large offset - need a second scratch for the offset */
+        ScratchRegAlloc off_scratch = get_scratch_reg_with_save((1u << base_addr_reg) | (1u << dst));
+        load_immediate(off_scratch.reg, offset, NULL, false);
+        ot_check(th_ldr_reg(dst, base_addr_reg, off_scratch.reg, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+        restore_scratch_reg(&off_scratch);
       }
     }
+    restore_scratch_reg(&struct_scratch);
     return;
   }
 
@@ -7650,19 +9171,56 @@ static void thumb_emit_arg_move(const ThumbArgMove *m)
       }
       else
       {
-        /* 64-bit: load lo and hi halves separately. */
-        MachineOperand lo = mach_make_lo_half(&m->mop);
-        MachineOperand hi = mach_make_hi_half(&m->mop);
-        uint32_t excl = (1u << m->dst_reg) | (1u << m->dst_reg_hi);
-        int r_lo = mach_ensure_in_reg(&mctx, &lo, excl);
-        int r_hi = mach_ensure_in_reg(&mctx, &hi, excl | (1u << (uint32_t)r_lo));
-        if (r_lo != m->dst_reg)
-          ot_check(th_mov_reg(m->dst_reg, r_lo, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                              ENFORCE_ENCODING_NONE, false));
-        if (r_hi != m->dst_reg_hi)
-          ot_check(th_mov_reg(m->dst_reg_hi, r_hi, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                              ENFORCE_ENCODING_NONE, false));
+        /* Fast path: when the source is a stack-backed 64-bit value (spill
+         * slot or caller's param stack area) and the destination is a valid
+         * AAPCS register pair, emit a single LDRD straight into dst_reg /
+         * dst_reg_hi, skipping the scratch + MOV sequence that the generic
+         * lo/hi lowering below would produce.
+         *
+         * Stack spill slots and the caller-argument frame are guaranteed
+         * 8-byte aligned (AAPCS stack_align = 8, spill slots obey type
+         * alignment), so LDRD's 4-byte alignment requirement is satisfied. */
+        int ldrd_base = -1;
+        int ldrd_abs_off = 0;
+        int ldrd_sign = 0;
+        int ldrd_ok = 0;
+        if (!m->mop.needs_deref && (m->mop.kind == MACH_OP_SPILL || m->mop.kind == MACH_OP_PARAM_STACK))
+        {
+          int raw_off = (m->mop.kind == MACH_OP_SPILL) ? m->mop.u.spill.offset : m->mop.u.param.offset + offset_to_args;
+          int adjusted = (m->mop.kind == MACH_OP_SPILL) ? fp_adjust_local_offset(raw_off, 0) : raw_off;
+          ldrd_base = tcc_state->need_frame_pointer ? R_FP : R_SP;
+          ldrd_sign = (adjusted < 0);
+          ldrd_abs_off = ldrd_sign ? -adjusted : adjusted;
+          ldrd_ok = 1;
+        }
+        if (ldrd_ok && try_ldrd_pair(m->dst_reg, m->dst_reg_hi, ldrd_base, ldrd_abs_off, ldrd_sign))
+        {
+          /* LDRD emitted. */
+        }
+        else
+        {
+          /* 64-bit: load lo and hi halves separately. */
+          MachineOperand lo = mach_make_lo_half(&m->mop);
+          MachineOperand hi = mach_make_hi_half(&m->mop);
+          uint32_t excl = (1u << m->dst_reg) | (1u << m->dst_reg_hi);
+          int r_lo = mach_ensure_in_reg(&mctx, &lo, excl);
+          int r_hi = mach_ensure_in_reg(&mctx, &hi, excl | (1u << (uint32_t)r_lo));
+          if (r_lo != m->dst_reg)
+            ot_check_mov_reg(m->dst_reg, r_lo, flags_safe(), THUMB_SHIFT_DEFAULT,
+                             ENFORCE_ENCODING_NONE, false);
+          if (r_hi != m->dst_reg_hi)
+            ot_check_mov_reg(m->dst_reg_hi, r_hi, flags_safe(), THUMB_SHIFT_DEFAULT,
+                             ENFORCE_ENCODING_NONE, false);
+        }
       }
+    }
+    else if (m->mop.kind == MACH_OP_REG && m->mop.needs_deref && !m->mop.is_64bit &&
+             m->mop.u.reg.r0 != m->dst_reg)
+    {
+      /* Register-indirect 32-bit: load *base directly into dst_reg,
+       * bypassing scratch + MOV.  Safe because base != dst_reg. */
+      load_from_base(m->dst_reg, PREG_REG_NONE, m->mop.btype, (int)m->mop.is_unsigned, 0, 0,
+                     (uint32_t)m->mop.u.reg.r0);
     }
     else
     {
@@ -7670,8 +9228,8 @@ static void thumb_emit_arg_move(const ThumbArgMove *m)
       uint32_t excl = (1u << m->dst_reg);
       int r = mach_ensure_in_reg(&mctx, &m->mop, excl);
       if (r != m->dst_reg)
-        ot_check(th_mov_reg(m->dst_reg, r, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE,
-                            false));
+        ot_check_mov_reg(m->dst_reg, r, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE,
+                         false);
     }
     mach_release_all(&mctx);
     return;
@@ -7794,8 +9352,8 @@ static void thumb_emit_parallel_arg_moves(ThumbArgMove *moves, int move_count)
       }
 
       thumb_require_materialized_reg("thumb_emit_parallel_arg_moves", "tmp", tmp_alloc.reg);
-      ot_check(th_mov_reg(tmp_alloc.reg, moves[cyc].src_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                          ENFORCE_ENCODING_NONE, false));
+      ot_check_mov_reg(tmp_alloc.reg, moves[cyc].src_reg, flags_safe(), THUMB_SHIFT_DEFAULT,
+                       ENFORCE_ENCODING_NONE, false);
       moves[cyc].src_reg = tmp_alloc.reg;
       continue;
     }
@@ -7818,10 +9376,10 @@ static void store_word_to_stack(int src_reg, int stack_offset)
 {
   if (!store_word_to_base(src_reg, ARM_SP, stack_offset, 0))
   {
-    /* Offset too large - use alternate scratch register */
-    int scratch = (src_reg != ARM_R12) ? ARM_R12 : ARM_LR;
-    load_immediate(scratch, stack_offset, NULL, false);
-    ot_check(th_str_reg(src_reg, ARM_SP, scratch, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+    ScratchRegAlloc sc = get_scratch_reg_with_save((1u << src_reg));
+    load_immediate(sc.reg, stack_offset, NULL, false);
+    ot_check(th_str_reg(src_reg, ARM_SP, sc.reg, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+    restore_scratch_reg(&sc);
   }
 }
 
@@ -7830,19 +9388,10 @@ static void store_word_to_stack_safe(int src_reg, int stack_offset, int base_add
 {
   if (!store_word_to_base(src_reg, ARM_SP, stack_offset, 0))
   {
-    int scratch = (base_addr_reg != ARM_R12) ? ARM_R12 : ARM_R0;
-    if (scratch == ARM_R0)
-    {
-      ot_check(th_push(1 << ARM_R0));
-      load_immediate(ARM_R0, stack_offset, NULL, false);
-      ot_check(th_str_reg(src_reg, ARM_SP, ARM_R0, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-      ot_check(th_pop(1 << ARM_R0));
-    }
-    else
-    {
-      load_immediate(scratch, stack_offset, NULL, false);
-      ot_check(th_str_reg(src_reg, ARM_SP, scratch, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-    }
+    ScratchRegAlloc sc = get_scratch_reg_with_save((1u << src_reg) | (1u << base_addr_reg));
+    load_immediate(sc.reg, stack_offset, NULL, false);
+    ot_check(th_str_reg(src_reg, ARM_SP, sc.reg, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+    restore_scratch_reg(&sc);
   }
 }
 
@@ -8016,7 +9565,8 @@ static void place_stack_arg_struct(const MachineOperand *mop, const TCCAbiArgLoc
   int struct_size = (loc->kind == TCC_ABI_LOC_REG_STACK) ? loc->stack_size : loc->size;
   int words = (struct_size + 3) / 4;
 
-  int base_addr_reg = get_struct_base_addr_mop(mop, ARM_R12);
+  ScratchRegAlloc struct_sc = get_scratch_reg_with_save(0);
+  int base_addr_reg = get_struct_base_addr_mop(mop, struct_sc.reg);
 
   for (int w = 0; w < words; ++w)
   {
@@ -8032,10 +9582,68 @@ static void place_stack_arg_struct(const MachineOperand *mop, const TCCAbiArgLoc
 
     store_word_to_stack_safe(ARM_LR, dst_off, base_addr_reg);
   }
+  restore_scratch_reg(&struct_sc);
+}
+
+/* Find a free scratch register via liveness (no push/pop).
+ * Returns the register number, or R_IP as last resort.
+ * Must not push/pop since SP-relative offsets for stack args would shift.
+ *
+ * Unlike tcc_ls_find_free_scratch_reg (which refuses callee-saved regs),
+ * this also considers callee-saved registers already pushed in the prologue.
+ * Those are safe to clobber because the epilogue will restore them.
+ *
+ * arg_move_dst_mask: registers that will be explicitly written by register
+ * arg moves AFTER stack arg placement.  These are safe to clobber even if
+ * currently live, because the subsequent moves will overwrite them.
+ * Pass 0 when not in a pre-move stack arg placement context. */
+static int find_call_scratch(uint32_t extra_exclude, uint32_t arg_move_dst_mask)
+{
+  TCCIRState *ir = tcc_state->ir;
+  uint32_t exclude = scratch_global_exclude | extra_exclude;
+  if (ir)
+  {
+    /* Standard path: try caller-saved regs via liveness */
+    int reg = tcc_ls_find_free_scratch_reg(&ir->ls, ir->codegen_instruction_idx, exclude, ir->leaffunc);
+    if (reg != PREG_NONE && reg >= 0 && reg < 16 && reg != R_SP && reg != R_PC)
+      return reg;
+
+    /* Extended path: try callee-saved regs that are already pushed in prologue
+     * AND not live at this instruction (so we won't clobber active values). */
+    if (ir->ls.live_regs_by_instruction && ir->codegen_instruction_idx >= 0 &&
+        ir->codegen_instruction_idx < ir->ls.live_regs_by_instruction_size)
+    {
+      uint32_t live = ir->ls.live_regs_by_instruction[ir->codegen_instruction_idx];
+      uint32_t callee_pushed = pushed_registers & 0x0FF0u; /* R4-R11 that were pushed */
+      uint32_t candidates = callee_pushed & ~live & ~exclude;
+      if (candidates)
+      {
+        /* Prefer low registers (R4-R7) for 16-bit encoding */
+        int r = (int)__builtin_ctz(candidates);
+        return r;
+      }
+    }
+
+    /* Pre-move path: registers that are destinations of explicit (non-identity)
+     * register arg moves can be used as scratch — the moves will overwrite them.
+     * Prefer low registers for 16-bit encoding. */
+    if (arg_move_dst_mask)
+    {
+      uint32_t candidates = arg_move_dst_mask & ~exclude;
+      if (candidates)
+      {
+        int r = (int)__builtin_ctz(candidates);
+        if (r >= 0 && r < 16 && r != R_SP && r != R_PC)
+          return r;
+      }
+    }
+  }
+  return R_IP;
 }
 
 /* Place a 64-bit argument on stack (MOP path) */
-static void place_stack_arg_64bit(const MachineOperand *mop, int stack_offset, TCCIRState *ir)
+static void place_stack_arg_64bit(const MachineOperand *mop, int stack_offset, TCCIRState *ir,
+                                  uint32_t arg_move_dst_mask)
 {
   int lo_offset = stack_offset;
   int hi_offset = stack_offset + 4;
@@ -8052,10 +9660,11 @@ static void place_stack_arg_64bit(const MachineOperand *mop, int stack_offset, T
   else if (mop->kind == MACH_OP_IMM)
   {
     uint64_t imm64 = (uint64_t)mop->u.imm.val;
-    load_immediate(ARM_R12, (uint32_t)imm64, NULL, false);
-    store_word_to_stack(ARM_R12, lo_offset);
-    load_immediate(ARM_R12, (uint32_t)(imm64 >> 32), NULL, false);
-    store_word_to_stack(ARM_R12, hi_offset);
+    int scr = find_call_scratch(0, arg_move_dst_mask);
+    load_immediate(scr, (uint32_t)imm64, NULL, false);
+    store_word_to_stack(scr, lo_offset);
+    load_immediate(scr, (uint32_t)(imm64 >> 32), NULL, false);
+    store_word_to_stack(scr, hi_offset);
   }
   else if (mop->needs_deref && mop->kind != MACH_OP_PARAM_STACK)
   {
@@ -8069,13 +9678,14 @@ static void place_stack_arg_64bit(const MachineOperand *mop, int stack_offset, T
      * loads directly from the caller's argument area (ignores needs_deref),
      * so the else path with mach_make_lo/hi_half handles it correctly.
      *
-     * The base register must NOT be ARM_R12 because both halves are loaded
-     * into ARM_R12 (the scratch destination).  If base == ARM_R12 the first
-     * load would clobber the pointer before the second load can use it. */
+     * The base register must NOT be the scratch because both halves are
+     * loaded into the scratch.  If base == scratch the first load would
+     * clobber the pointer before the second load can use it. */
+    int scr = find_call_scratch(0, arg_move_dst_mask);
     int base;
     MachineCodegenContext mctx = {0};
     bool need_release = false;
-    if (mop->kind == MACH_OP_REG && mop->u.reg.r0 != ARM_R12)
+    if (mop->kind == MACH_OP_REG && mop->u.reg.r0 != scr)
     {
       base = mop->u.reg.r0;
     }
@@ -8085,13 +9695,13 @@ static void place_stack_arg_64bit(const MachineOperand *mop, int stack_offset, T
       addr.needs_deref = false;
       addr.is_64bit = false;
       addr.btype = IROP_BTYPE_INT32;
-      base = mach_ensure_in_reg(&mctx, &addr, (1u << ARM_R12));
+      base = mach_ensure_in_reg(&mctx, &addr, (1u << scr));
       need_release = true;
     }
-    load_from_base(ARM_R12, PREG_REG_NONE, IROP_BTYPE_INT32, 0, 0, 0, (uint32_t)base);
-    store_word_to_stack(ARM_R12, lo_offset);
-    load_from_base(ARM_R12, PREG_REG_NONE, IROP_BTYPE_INT32, 0, 4, 0, (uint32_t)base);
-    store_word_to_stack(ARM_R12, hi_offset);
+    load_from_base(scr, PREG_REG_NONE, IROP_BTYPE_INT32, 0, 0, 0, (uint32_t)base);
+    store_word_to_stack(scr, lo_offset);
+    load_from_base(scr, PREG_REG_NONE, IROP_BTYPE_INT32, 0, 4, 0, (uint32_t)base);
+    store_word_to_stack(scr, hi_offset);
     if (need_release)
       mach_release_all(&mctx);
   }
@@ -8131,34 +9741,41 @@ static void place_stack_arg_32bit(const MachineOperand *mop, int stack_offset, C
     }
     else
     {
-      /* Register-indirect: load through the register, then store to stack. */
-      ot_check(th_ldr_imm(ARM_R12, mop->u.reg.r0, 0, 6, ENFORCE_ENCODING_NONE));
-      store_word_to_stack(ARM_R12, stack_offset);
+      /* Register-indirect: load through the register, then store to stack.
+       * Must use btype-aware load so that byte/short values are properly
+       * zero/sign-extended (LDRB/LDRH) instead of always doing a word LDR. */
+      int scr = find_call_scratch(1u << mop->u.reg.r0, ctx->arg_move_dst_mask);
+      load_from_base(scr, PREG_REG_NONE, mop->btype, mop->is_unsigned, 0, 0, mop->u.reg.r0);
+      store_word_to_stack(scr, stack_offset);
     }
     break;
 
   case MACH_OP_IMM:
-    load_immediate(ARM_R12, (uint32_t)mop->u.imm.val, NULL, false);
-    store_word_to_stack(ARM_R12, stack_offset);
+  {
+    int scr = find_call_scratch(0, ctx->arg_move_dst_mask);
+    load_immediate(scr, (uint32_t)mop->u.imm.val, NULL, false);
+    store_word_to_stack(scr, stack_offset);
     break;
+  }
 
   case MACH_OP_SYMBOL:
   {
+    int scr = find_call_scratch(0, ctx->arg_move_dst_mask);
     Sym *sym = mop->u.sym.sym ? validate_sym_for_reloc(mop->u.sym.sym) : NULL;
     if (mop->needs_deref)
     {
       /* Load value from global symbol address. */
-      load_immediate(ARM_R12, 0, sym, false);
+      load_immediate(scr, 0, sym, false);
       int32_t addend = mop->u.sym.addend;
       int sign = (addend < 0);
       int abs_off = sign ? -addend : addend;
-      load_from_base(ARM_R12, PREG_REG_NONE, mop->btype, mop->is_unsigned, abs_off, sign, ARM_R12);
+      load_from_base(scr, PREG_REG_NONE, mop->btype, mop->is_unsigned, abs_off, sign, scr);
     }
     else
     {
-      load_immediate(ARM_R12, (uint32_t)mop->u.sym.addend, sym, false);
+      load_immediate(scr, (uint32_t)mop->u.sym.addend, sym, false);
     }
-    store_word_to_stack(ARM_R12, stack_offset);
+    store_word_to_stack(scr, stack_offset);
     break;
   }
 
@@ -8324,12 +9941,13 @@ static void place_stack_arguments(CallGenContext *ctx)
         int words_in_regs = (loc->kind == TCC_ABI_LOC_REG_STACK) ? loc->reg_count : 0;
         int stack_bytes = (loc->kind == TCC_ABI_LOC_REG_STACK) ? loc->stack_size : loc->size;
         int stack_words = (stack_bytes + 3) / 4;
+        int scr = find_call_scratch(0, ctx->arg_move_dst_mask);
         for (int w = 0; w < stack_words; w++)
         {
           int word_idx = words_in_regs + w;
           uint32_t word_val = (uint32_t)(imm64 >> (word_idx * 32));
-          load_immediate(ARM_R12, word_val, NULL, false);
-          store_word_to_stack(ARM_R12, stack_offset + w * 4);
+          load_immediate(scr, word_val, NULL, false);
+          store_word_to_stack(scr, stack_offset + w * 4);
         }
       }
       else
@@ -8338,7 +9956,7 @@ static void place_stack_arguments(CallGenContext *ctx)
       }
     }
     else if (mop->is_64bit)
-      place_stack_arg_64bit(mop, stack_offset, tcc_state->ir);
+      place_stack_arg_64bit(mop, stack_offset, tcc_state->ir, ctx->arg_move_dst_mask);
     else
       place_stack_arg_32bit(mop, stack_offset, ctx);
   }
@@ -8417,46 +10035,40 @@ ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand ca
       .stack_size = stack_size,
   };
 
-  /* === Preserve nested call registers (R0-R3) === */
+  /* === Preserve nested call registers (R0-R3, R9) via STR to frame ===
+   * Instead of PUSH/POP (which moves SP), store to the pre-reserved
+   * nested-call save area in the frame.  SP stays fixed. */
   int arg_regs_in_use = call_site->registers_map & 0x0F;
-  int arg_regs_push_mask = arg_regs_in_use;
-  int arg_regs_push_count = __builtin_popcount((unsigned)arg_regs_push_mask);
+  int arg_regs_save_mask = arg_regs_in_use;
 
   /* On yasos with no-pic-data-is-text-relative, R9 holds the GOT base and is
    * caller-saved.  Save it alongside the nested-call argument registers so it
-   * is restored after the callee returns.  It must be pushed *before* the
-   * stack-argument area is reserved so the callee sees the correct SP layout.
-   */
+   * is restored after the callee returns. */
   if (text_and_data_separation)
+    arg_regs_save_mask |= (1 << ARM_R9);
+
+  /* Save nested-call registers to pre-reserved frame area via STR.
+   * The nested save area is at [SP + ir->call_outgoing_size]. */
+  int nested_save_sp_offset = ir ? ir->call_outgoing_size : 0;
+  int nested_save_count = 0;
+  if (arg_regs_save_mask)
   {
-    arg_regs_push_mask |= (1 << ARM_R9);
-    arg_regs_push_count++;
+    for (int r = 0; r < 16; r++)
+    {
+      if (arg_regs_save_mask & (1 << r))
+      {
+        store_word_to_stack(r, nested_save_sp_offset + nested_save_count * 4);
+        nested_save_count++;
+      }
+    }
   }
 
-  /* AAPCS requires 8-byte SP alignment - pad with R12 if needed */
-  if (arg_regs_push_count & 1)
-  {
-    arg_regs_push_mask |= (1 << ARM_R12);
-    arg_regs_push_count++;
-  }
-
-  if (arg_regs_push_mask)
-  {
-    ot_check(th_push((uint16_t)arg_regs_push_mask));
-    call_site->used_stack_size += arg_regs_push_count * 4;
-  }
-
-  /* === Reserve stack space === */
+  /* Stack args are already placed in the pre-reserved outgoing area at [SP+0].
+   * No need to adjust SP — the area was allocated in the prologue. */
   stack_size = (stack_size + 7) & ~7; /* 8-byte align */
-  if (stack_size > 0)
-  {
-    gadd_sp(-stack_size);
-    call_site->used_stack_size += stack_size;
-  }
 
-  /* === Block R0-R3 from scratch allocation during argument setup === */
+  /* === Save scratch exclusion state === */
   uint32_t saved_scratch_exclude = scratch_global_exclude;
-  scratch_global_exclude |= 0x0F; /* R0-R3 */
 
   /* === Pre-save indirect call target if it resides in an argument register ===
    *
@@ -8472,7 +10084,7 @@ ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand ca
         func_mop.u.reg.r0 <= 3)
     {
       /* Find a free register outside R0-R3, R12 (stack-arg scratch), SP, PC. */
-      uint32_t exclude = scratch_global_exclude | (1u << R_IP) | (1u << R_SP) | (1u << R_PC);
+      uint32_t exclude = scratch_global_exclude | 0x0Fu | (1u << R_IP) | (1u << R_SP) | (1u << R_PC);
       int safe_reg = PREG_NONE;
       if (ir)
         safe_reg = tcc_ls_find_free_scratch_reg(&ir->ls, ir->codegen_instruction_idx, exclude, ir->leaffunc);
@@ -8484,8 +10096,8 @@ ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand ca
 
       /* Move function pointer from arg reg to safe reg. */
       thumb_shift no_shift = {THUMB_SHIFT_NONE, 0, THUMB_SHIFT_IMMEDIATE};
-      ot_check(th_mov_reg(safe_reg, func_mop.u.reg.r0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, no_shift, ENFORCE_ENCODING_NONE,
-                          false));
+      ot_check_mov_reg(safe_reg, func_mop.u.reg.r0, flags_safe(), no_shift, ENFORCE_ENCODING_NONE,
+                       false);
 
       /* Rewrite func_mop to point to the safe register. */
       func_mop.kind = MACH_OP_REG;
@@ -8498,37 +10110,92 @@ ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand ca
     }
   }
 
-  /* === Build and execute register argument moves === */
+  /* === Build register argument moves === */
   ThumbArgMove reg_moves[8];
   int reg_move_count = build_register_arg_moves(&ctx, reg_moves);
+
+  /* === Compute arg_move_dst_mask and identity-move protection ===
+   *
+   * Stack arguments are placed BEFORE register argument moves so that
+   * R0-R3 (non-identity move destinations) can serve as scratch registers
+   * for stack arg stores, saving 2 bytes per store (16-bit vs 32-bit encoding).
+   *
+   * arg_move_dst_mask: registers written by explicit (non-identity) reg moves.
+   *   These will be overwritten by the moves, so they're safe as scratch.
+   * identity_mask: registers where the reg allocator already placed the correct
+   *   value (no move entry created).  These MUST be protected from clobbering. */
+  {
+    uint32_t arg_move_dst_mask = 0;
+    for (int i = 0; i < reg_move_count; i++)
+      arg_move_dst_mask |= arg_move_write_set(&reg_moves[i]);
+
+    /* Compute all register-arg destination registers from the ABI layout. */
+    uint32_t all_reg_arg_dst = 0;
+    for (int i = 0; i < ctx.argc; i++)
+    {
+      const TCCAbiArgLoc *loc = &ctx.layout->locs[i];
+      if (loc->kind == TCC_ABI_LOC_REG || loc->kind == TCC_ABI_LOC_REG_STACK)
+      {
+        int base = ARM_R0 + loc->reg_base;
+        for (int w = 0; w < loc->reg_count; w++)
+          all_reg_arg_dst |= (1u << (base + w));
+      }
+    }
+
+    /* Protect identity-move registers (value already in place, no move entry). */
+    uint32_t identity_mask = all_reg_arg_dst & ~arg_move_dst_mask;
+    scratch_global_exclude |= identity_mask;
+
+    ctx.arg_move_dst_mask = arg_move_dst_mask;
+  }
 
   /* Pre-save stack args sourcing from R0-R3 before register shuffle */
   presave_stack_args_from_arg_regs(&ctx);
 
-  thumb_emit_parallel_arg_moves(reg_moves, reg_move_count);
-
-  /* === Place stack arguments === */
+  /* === Place stack arguments FIRST ===
+   * R0-R3 that are non-identity move destinations can be used as scratch
+   * via arg_move_dst_mask in find_call_scratch, yielding 16-bit STR
+   * encodings instead of 32-bit STR.W with R12. */
   place_stack_arguments(&ctx);
+
+  /* === Now block all R0-R3 and emit register argument moves === */
+  scratch_global_exclude |= 0x0F;
+  thumb_emit_parallel_arg_moves(reg_moves, reg_move_count);
 
   /* === Emit call === */
   gcall_or_jump_mop(0, func_mop);
   /* Restore scratch register exclusion */
   scratch_global_exclude = saved_scratch_exclude;
 
-  /* === Cleanup === */
-  if (stack_size > 0)
-  {
-    gadd_sp(stack_size);
-    call_site->used_stack_size -= stack_size;
-  }
-
-  if (arg_regs_push_mask)
-  {
-    ot_check(th_pop((uint16_t)arg_regs_push_mask));
-    call_site->used_stack_size -= arg_regs_push_count * 4;
-  }
-
   handle_return_value_mop(&dest_mop, drop_value);
+
+  /* === Cleanup: restore nested-call saved registers via LDR === */
+  if (arg_regs_save_mask)
+  {
+    int restore_idx = 0;
+    for (int r = 0; r < 16; r++)
+    {
+      if (arg_regs_save_mask & (1 << r))
+      {
+        int off = nested_save_sp_offset + restore_idx * 4;
+        /* R9 restore in text_and_data_separation mode needs the write guard
+         * temporarily lifted — the safety check blocks all R9 writes, but
+         * we are legitimately restoring it after a call. */
+        if (r == ARM_R9 && text_and_data_separation)
+          allow_r9_write = 1;
+        if (!load_word_from_base(r, ARM_SP, off, 0))
+        {
+          ScratchRegAlloc osc = get_scratch_reg_with_save((1u << r));
+          load_immediate(osc.reg, off, NULL, false);
+          ot_check(th_ldr_reg(r, ARM_SP, osc.reg, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+          restore_scratch_reg(&osc);
+        }
+        if (r == ARM_R9 && text_and_data_separation)
+          allow_r9_write = 0;
+        restore_idx++;
+      }
+    }
+  }
 
   call_site->registers_map &= ~0x0F; /* Clear R0-R3 */
 
@@ -8540,53 +10207,98 @@ ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand ca
     tcc_free(layout.locs);
 }
 
-ST_FUNC void tcc_gen_machine_jump_mop(TccIrOp op, int32_t target_ir, int ir_idx)
+/* Check if a backward branch to target_ir can use a narrow encoding.
+ * For backward branches, the target code address is already known in
+ * ir_to_code_mapping (it was emitted earlier in this pass).
+ * current_ir_idx is the IR index of the branch instruction itself.
+ * Returns 1 if narrow encoding fits, 0 otherwise. */
+static int can_narrow_backward_branch(int32_t target_ir, int is_conditional, int current_ir_idx)
+{
+  TCCIRState *ir = tcc_state->ir;
+  if (!ir || !ir->ir_to_code_mapping)
+    return 0;
+  if (target_ir < 0 || target_ir >= ir->ir_to_code_mapping_size)
+    return 0;
+
+  /* Forward branches have uninitialized ir_to_code_mapping[target_ir] (still 0).
+   * Only narrow genuinely backward branches where target was already emitted. */
+  if (target_ir >= current_ir_idx)
+    return 0;
+
+  int target_addr = (int)ir->ir_to_code_mapping[target_ir];
+  /* ind is the current code address where the branch will be emitted.
+   * offset = target - (source + 4) for Thumb pipeline. */
+  int offset = target_addr - ind - 4;
+
+  /* Only backward branches (negative offset) are safe to narrow here */
+  if (offset >= 0)
+    return 0;
+
+  return is_conditional ? branch_fits_t1(offset) : branch_fits_t2(offset);
+}
+
+ST_FUNC int tcc_gen_machine_jump_mop(TccIrOp op, int32_t target_ir, int ir_idx)
 {
 
   if (dry_run_state.active)
   {
-    /* Record branch for later optimization analysis */
-    branch_opt_record(ir_idx, ind, target_ir, 0); /* 0 = unconditional */
     /* Emit 32-bit placeholder for code size tracking */
     ot_check(th_b_t4(0));
-    return;
+    return 4;
   }
 
-  /* Real pass: check if we determined this can be 16-bit */
-  BranchEncoding enc = branch_opt_get_encoding(ir_idx);
-  if (enc == BRANCH_ENC_16BIT)
+  /* Real pass: try narrow encoding for backward branches */
+  if (can_narrow_backward_branch(target_ir, 0, ir_idx))
   {
-    ot_check(th_b_t2(0)); /* 16-bit placeholder */
+    ot_check(th_b_t2(0)); /* 16-bit unconditional */
+    return 2;
   }
   else
   {
-    ot_check(th_b_t4(0)); /* 32-bit placeholder */
+    ot_check(th_b_t4(0)); /* 32-bit unconditional */
+    return 4;
   }
 }
 
-ST_FUNC void tcc_gen_machine_conditional_jump_mop(int32_t condition, TccIrOp op, int32_t target_ir, int ir_idx)
+ST_FUNC int tcc_gen_machine_conditional_jump_mop(int32_t condition, TccIrOp op, int32_t target_ir, int ir_idx)
 {
   int cond = mapcc(condition);
 
   if (dry_run_state.active)
   {
-    /* Record branch for later optimization analysis */
-    branch_opt_record(ir_idx, ind, target_ir, 1); /* 1 = conditional */
     /* Emit 32-bit placeholder for code size tracking */
     ot_check(th_b_t3(cond, 0));
-    return;
+    return 4;
   }
 
-  /* Real pass: check if we determined this can be 16-bit */
-  BranchEncoding enc = branch_opt_get_encoding(ir_idx);
-  if (enc == BRANCH_ENC_16BIT)
+  /* Real pass: try narrow encoding for backward branches */
+  if (can_narrow_backward_branch(target_ir, 1, ir_idx))
   {
     ot_check(th_b_t1(cond, 0)); /* 16-bit conditional */
+    return 2;
   }
   else
   {
     ot_check(th_b_t3(cond, 0)); /* 32-bit conditional */
+    return 4;
   }
+}
+
+/* Return the maximum bytes a pending literal pool dump could insert.
+ * Used for CBZ/CBNZ distance safety checks. */
+ST_FUNC int tcc_gen_machine_pending_pool_size(void)
+{
+  int count = dry_run_state.active ? dry_run_literal_pool_count : thumb_gen_state.literal_pool_count;
+  return count * 4 + (count > 0 ? 2 : 0); /* entries + possible alignment padding */
+}
+
+/* Emit CBZ/CBNZ: combined compare-zero + branch in a single 16-bit instruction.
+ * rn must be r0-r7, target must be forward within 126 bytes.
+ * Returns the instruction size (always 2). */
+ST_FUNC int tcc_gen_machine_cbz_jump_mop(int rn, int nonzero, int32_t target_ir, int ir_idx)
+{
+  ot_check(th_cbz((uint16_t)rn, 0, (uint32_t)nonzero));
+  return 2;
 }
 
 /* Set static chain register: MOV R10, R7 (FP) */
@@ -8595,7 +10307,7 @@ ST_FUNC void tcc_gen_machine_set_chain(void)
   int chain_reg = architecture_config.static_chain_reg;
   thumb_shift no_shift = {THUMB_SHIFT_NONE, 0, THUMB_SHIFT_IMMEDIATE};
   /* MOV chain_reg, R_FP (R7 on ARM Thumb) */
-  ot_check(th_mov_reg(chain_reg, R_FP, FLAGS_BEHAVIOUR_NOT_IMPORTANT, no_shift, ENFORCE_ENCODING_NONE, false));
+  ot_check_mov_reg(chain_reg, R_FP, flags_safe(), no_shift, ENFORCE_ENCODING_NONE, false);
 }
 
 /* Reload static chain register from the chain save slot at [FP - 4].
@@ -8632,7 +10344,7 @@ ST_FUNC void tcc_gen_machine_init_chain_slot(IROperand src1)
   load_full_const(scratch.reg, PREG_NONE, 0, 0);
 
   /* STR R7, [scratch, #0] — store frame pointer into chain slot */
-  ot_check(th_str_imm(R_FP, scratch.reg, 0, 6, ENFORCE_ENCODING_NONE));
+  ot_check_str_imm(R_FP, scratch.reg, 0, 6, ENFORCE_ENCODING_NONE);
 
   /* Restore scratch register */
   restore_scratch_reg(&scratch);
@@ -8674,41 +10386,302 @@ ST_FUNC void tcc_gen_machine_vla_mop(MachineOperand dest, MachineOperand src1, M
       tcc_error("compiler_error: VLA alloc picked SP as temp");
 
     /* r = SP - r  (subtract size from stack pointer) */
-    ot_check(th_sub_sp_reg(r, r, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+    ot_check(th_sub_reg(r, R_SP, r, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
 
     if (align > 1)
     {
       /* Align down: r &= ~(align-1).  Try immediate BIC first. */
-      if (!ot(th_bic_imm(r, r, (uint32_t)(align - 1), FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE)))
+      if (!ot(th_bic_imm(r, r, (uint32_t)(align - 1), flags_safe(), ENFORCE_ENCODING_NONE)))
       {
         /* Fallback: materialize mask in a scratch register. */
         int mask_reg = mach_alloc_scratch(&ctx, 1u << (uint32_t)r);
         if (!ot(th_generic_mov_imm(mask_reg, align - 1)))
           load_full_const(mask_reg, PREG_NONE, LFC_SPLIT(align - 1));
-        ot_check(th_bic_reg(r, r, mask_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+        ot_check(th_bic_reg(r, r, mask_reg, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
       }
     }
 
-    ot_check(th_mov_reg(R_SP, r, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
+    ot_check_mov_reg(R_SP, r, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
     break;
   }
   case TCCIR_OP_VLA_SP_SAVE:
-    /* Save current SP to the destination save slot via IP as intermediary. */
-    ot_check(th_mov_reg(R_IP, R_SP, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
-    mach_writeback_dest(&dest, R_IP);
+  {
+    /* Save current SP to the destination save slot via a scratch register. */
+    ScratchRegAlloc sp_scratch = get_scratch_reg_with_save(0);
+    ot_check_mov_reg(sp_scratch.reg, R_SP, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE,
+                     false);
+    mach_writeback_dest(&dest, sp_scratch.reg);
+    restore_scratch_reg(&sp_scratch);
     break;
+  }
   case TCCIR_OP_VLA_SP_RESTORE:
   {
     /* Load the saved SP from src1 into a register, then restore SP. */
     int saved_sp = mach_ensure_in_reg(&ctx, &src1, 0);
-    ot_check(
-        th_mov_reg(R_SP, saved_sp, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
+    ot_check_mov_reg(R_SP, saved_sp, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
     break;
   }
   default:
     tcc_error("compiler_error: tcc_gen_machine_vla_mop unsupported op %d", op);
   }
   mach_release_all(&ctx);
+}
+
+/* Block copy from const data section to stack using LDM/STM.
+ * dest = STACKOFF (destination stack offset, is_local=1)
+ * src  = SYMREF (anonymous symbol in rodata)
+ * size = number of bytes to copy (must be multiple of 4)
+ *
+ * Generated code for 20 bytes (5 words):
+ *   LDR   r_src, [PC, #lit_pool]    ; load rodata address
+ *   ADD   r_dst, FP/SP, #stack_off  ; compute stack dest
+ *   LDMIA r_src!, {r0, r1, r2, r3}  ; load 4 words from rodata
+ *   STMIA r_dst!, {r0, r1, r2, r3}  ; store 4 words to stack
+ *   LDR   r0, [r_src]               ; load remaining word
+ *   STR   r0, [r_dst]               ; store remaining word
+ */
+/* tcc_gen_machine_select_mop: Conditional select using ITE block.
+ * Emits: ITE <cond>; MOV dest, then_val; MOV dest, else_val
+ *
+ * For simple register/immediate operands, this is 3 instructions (ITE + 2 MOVs)
+ * instead of 5+ (B.cond + MOV + B + MOV + ...) with branching.
+ */
+/* Check if a MachineOperand can be materialized in exactly one instruction.
+ * Returns 1 for: IMM (any value), REG (no deref), SYMBOL (no deref), SPILL (no deref).
+ * Returns 0 for: multi-instruction sequences (deref, chain_rel, etc). */
+static int select_can_inline(const MachineOperand *op)
+{
+  switch (op->kind)
+  {
+  case MACH_OP_IMM:
+    return 1; /* MOV/MOVW/MVN or literal pool LDR — always 1 instruction */
+  case MACH_OP_REG:
+    return !op->needs_deref; /* MOV reg is 1 instr; deref needs LDR too */
+  case MACH_OP_SYMBOL:
+    return !op->needs_deref; /* LDR from literal pool is 1 instr; deref needs 2 */
+  case MACH_OP_SPILL:
+    return !op->needs_deref; /* LDR from stack is 1 instr; deref (VT_LLOCAL) needs 2 */
+  case MACH_OP_FRAME_ADDR:
+    return 1; /* ADD reg, FP, #off is 1 instr */
+  default:
+    return 0;
+  }
+}
+
+/* Emit a single-instruction materialization of 'op' into 'reg'.
+ * Caller must ensure select_can_inline(op) returned 1. */
+static void select_emit_inline(MachineCodegenContext *ctx, const MachineOperand *op, int reg)
+{
+  switch (op->kind)
+  {
+  case MACH_OP_IMM:
+  {
+    thumb_opcode imm_op = th_generic_mov_imm((uint32_t)reg, (int)op->u.imm.val);
+    if (imm_op.size != 0)
+      ot(imm_op);
+    else
+      load_full_const(reg, PREG_NONE, LFC_SPLIT(op->u.imm.val));
+    break;
+  }
+  case MACH_OP_REG:
+    ot_check_mov_reg(reg, op->u.reg.r0, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE,
+                     true);
+    break;
+  case MACH_OP_SYMBOL:
+  {
+    Sym *raw_sym = op->u.sym.sym;
+    Sym *sym = raw_sym ? validate_sym_for_reloc(raw_sym) : NULL;
+    tcc_machine_load_constant(reg, PREG_REG_NONE, op->u.sym.addend, 0, sym);
+    break;
+  }
+  case MACH_OP_SPILL:
+    tcc_machine_load_spill_slot(reg, op->u.spill.offset);
+    break;
+  case MACH_OP_FRAME_ADDR:
+    tcc_machine_addr_of_stack_slot(reg, op->u.frame.offset, 0);
+    break;
+  default:
+    tcc_error("compiler_error: select_emit_inline: unhandled kind %d", (int)op->kind);
+    break;
+  }
+}
+
+ST_FUNC void tcc_gen_machine_select_mop(MachineOperand then_val, MachineOperand else_val, MachineOperand dest,
+                                        int cond_code)
+{
+  MachineCodegenContext mctx = {0};
+
+  int cond = mapcc(cond_code);
+
+  /* Get destination register */
+  int dest_reg = mach_get_dest_reg(&mctx, &dest, 0);
+  uint32_t excl = (1u << (uint32_t)dest_reg);
+
+  /* Determine if each operand can be materialized in exactly one instruction.
+   * If so, we can emit it directly inside the ITE block into dest_reg,
+   * saving scratch registers and pre-materialization instructions.
+   *
+   * Emitting inside the IT block is preferred because:
+   * - It avoids flag clobber (MOVS before ITE would destroy CMP flags)
+   * - It saves scratch registers (no pre-materialization needed)
+   * - It produces smaller code */
+  int then_inline = select_can_inline(&then_val);
+  int else_inline = select_can_inline(&else_val);
+
+  int then_reg = -1, else_reg = -1;
+
+  /* Pre-materialize operands that need multi-instruction sequences.
+   * These are loaded into scratch registers BEFORE the ITE block. */
+  if (!then_inline)
+  {
+    then_reg = mach_ensure_in_reg(&mctx, &then_val, excl);
+    excl |= (1u << (uint32_t)then_reg);
+  }
+  if (!else_inline)
+  {
+    else_reg = mach_ensure_in_reg(&mctx, &else_val, excl);
+    excl |= (1u << (uint32_t)else_reg);
+  }
+
+  /* ITE mask: the second instruction uses the opposite condition.
+   * mask encoding: bit3 = E_flag for 2nd instr, bit2 = end marker.
+   * E_flag = opposite of cond[0], so: mask = ((cond[0]^1) << 3) | (1 << 2) */
+  uint32_t ite_mask = (uint32_t)(((cond & 1) ^ 1) << 3) | 0x4u;
+
+  /* Reserve literal pool space to prevent pool dumps inside the IT block */
+  th_literal_pool_reserve_upcoming_bytes(10); /* ITE(2) + instr(2-4) + instr(2-4) */
+
+  ot_check(th_it((uint16_t)cond, (uint16_t)ite_mask));
+
+  /* Emit the Then instruction inside IT block */
+  if (then_inline)
+    select_emit_inline(&mctx, &then_val, dest_reg);
+  else
+    ot_check_mov_reg(dest_reg, then_reg, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE,
+                     true);
+
+  /* Emit the Else instruction inside IT block */
+  if (else_inline)
+    select_emit_inline(&mctx, &else_val, dest_reg);
+  else
+    ot_check_mov_reg(dest_reg, else_reg, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE,
+                     true);
+
+  mach_writeback_dest(&dest, dest_reg);
+  mach_release_all(&mctx);
+}
+
+ST_FUNC void tcc_gen_machine_block_copy_mop(TCCIRState *ir, IROperand dest, IROperand src, int size)
+{
+  if (size <= 0 || (size & 3))
+    tcc_error("compiler_error: block_copy size must be positive multiple of 4, got %d", size);
+
+  /* Get the source symbol from the SYMREF operand */
+  IRPoolSymref *symref = irop_get_symref_ex(ir, src);
+  if (!symref || !symref->sym)
+    tcc_error("compiler_error: block_copy source is not a valid symbol reference");
+  Sym *sym = validate_sym_for_reloc(symref->sym);
+
+  /* Get the destination stack offset */
+  int frame_offset = (int)irop_get_imm64_ex(ir, dest);
+
+  /* For large copies, call memcpy instead of inline LDM/STM.
+   * Compute dest address into r0 BEFORE pushing lr, since the address is
+   * sp-relative and pushing changes sp.  The BL to memcpy clobbers lr,
+   * so we must save/restore it for leaf functions whose prologue didn't. */
+  if (size >= 64)
+  {
+    tcc_machine_addr_of_stack_slot(R0, frame_offset, 0 /* not param */);
+    tcc_machine_load_constant(R1, PREG_REG_NONE, symref->addend, 0, sym);
+    tcc_machine_load_constant(R2, PREG_REG_NONE, size, 0, NULL);
+    int need_lr_save = ir->leaffunc;
+    if (need_lr_save)
+      ot_check(th_push(1u << ARM_LR));
+    Sym *memcpy_sym = external_global_sym(tok_alloc_const("memcpy"), &func_old_type);
+    MachineOperand func_mop = {0};
+    func_mop.kind = MACH_OP_SYMBOL;
+    func_mop.u.sym.sym = memcpy_sym;
+    func_mop.u.sym.addend = 0;
+    if (text_and_data_separation)
+      ot_check(th_push((uint16_t)((1 << R9) | (1 << R12))));
+    gcall_or_jump_mop(0, func_mop);
+    if (text_and_data_separation)
+      ot_check(th_pop((uint16_t)((1 << R9) | (1 << R12))));
+    if (need_lr_save)
+      ot_check(th_pop(1u << ARM_LR));
+    return;
+  }
+
+  int nwords = size / 4;
+
+  /* Allocate pointer registers first and compute addresses BEFORE allocating
+   * data registers.  Data register saves may use PUSH which modifies SP,
+   * so all SP-relative address computation must happen before that. */
+  ScratchRegAlloc src_scratch = get_scratch_reg_with_save(0);
+  int r_src = src_scratch.reg;
+  ScratchRegAlloc dst_scratch = get_scratch_reg_with_save(1u << (uint32_t)r_src);
+  int r_dst = dst_scratch.reg;
+
+  /* Load source address (rodata symbol) into r_src */
+  tcc_machine_load_constant(r_src, PREG_REG_NONE, symref->addend, 0, sym);
+
+  /* Compute destination stack address into r_dst BEFORE any data reg saves
+   * that might change SP via PUSH */
+  tcc_machine_addr_of_stack_slot(r_dst, frame_offset, 0 /* not param */);
+
+  /* Now allocate data registers for LDM/STM.  Even if these saves use PUSH
+   * and modify SP, we've already captured the destination address in r_dst. */
+  int max_data = nwords < 4 ? nwords : 4;
+  if (max_data < 1)
+    max_data = 1;
+
+  ScratchRegAlloc data_scratches[4];
+  int data_regs[4];
+  int ndata = 0;
+  uint32_t exclude = (1u << (uint32_t)r_src) | (1u << (uint32_t)r_dst);
+  for (int k = 0; k < max_data; k++)
+  {
+    data_scratches[k] = get_scratch_reg_with_save(exclude);
+    data_regs[k] = data_scratches[k].reg;
+    exclude |= (1u << (uint32_t)data_regs[k]);
+    ndata++;
+  }
+
+  int remaining_words = nwords;
+
+  /* Process in chunks of ndata words using LDM/STM with writeback */
+  while (remaining_words >= ndata && ndata >= 2)
+  {
+    uint32_t regset = 0;
+    for (int j = 0; j < ndata; j++)
+      regset |= (1u << (uint32_t)data_regs[j]);
+
+    ot_check(th_ldm(r_src, regset, 1 /* writeback */, ENFORCE_ENCODING_NONE));
+    ot_check(th_stm(r_dst, regset, 1 /* writeback */, ENFORCE_ENCODING_NONE));
+    remaining_words -= ndata;
+  }
+
+  /* Handle remaining words individually */
+  int dr = data_regs[0]; /* first data register */
+  while (remaining_words > 0)
+  {
+    ot_check_ldr_imm(dr, r_src, 0, 6, ENFORCE_ENCODING_NONE);
+    ot_check_str_imm(dr, r_dst, 0, 6, ENFORCE_ENCODING_NONE);
+    if (remaining_words > 1)
+    {
+      if (!ot(th_add_imm(r_src, r_src, 4, flags_safe(), ENFORCE_ENCODING_NONE)))
+        tcc_error("compiler_error: block_copy cannot advance source pointer");
+      if (!ot(th_add_imm(r_dst, r_dst, 4, flags_safe(), ENFORCE_ENCODING_NONE)))
+        tcc_error("compiler_error: block_copy cannot advance dest pointer");
+    }
+    remaining_words--;
+  }
+
+  /* Restore all scratch registers in reverse order: data regs first, then ptrs */
+  for (int k = ndata - 1; k >= 0; k--)
+    restore_scratch_reg(&data_scratches[k]);
+  restore_scratch_reg(&dst_scratch);
+  restore_scratch_reg(&src_scratch);
 }
 
 ST_FUNC void tcc_gen_machine_trap_mop(void)
@@ -8744,14 +10717,15 @@ ST_FUNC void tcc_gen_machine_prefetch_mop(MachineOperand addr, int rw)
   case MACH_OP_SPILL:
   {
     /* Spill slot: compute address (FP + offset) then PLD */
-    /* Load offset into IP (R12), add FP, then PLD [R12] */
     int32_t offset = addr.u.spill.offset;
     if (offset != 0)
     {
-      load_full_const(ARM_R12, PREG_NONE, LFC_SPLIT(offset));
-      ot_check(th_add_reg(ARM_R12, R_FP, ARM_R12, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+      ScratchRegAlloc scr = get_scratch_reg_with_save(0);
+      load_full_const(scr.reg, PREG_NONE, LFC_SPLIT(offset));
+      ot_check(th_add_reg(scr.reg, R_FP, scr.reg, flags_safe(), THUMB_SHIFT_DEFAULT,
                           ENFORCE_ENCODING_NONE));
-      ot_check(th_pld_imm(ARM_R12, 0, 0));
+      ot_check(th_pld_imm(scr.reg, 0, 0));
+      restore_scratch_reg(&scr);
     }
     else
     {
@@ -8762,17 +10736,20 @@ ST_FUNC void tcc_gen_machine_prefetch_mop(MachineOperand addr, int rw)
   case MACH_OP_IMM:
   {
     /* For immediate addresses, load into a register first */
-    /* Use R12 (IP) as scratch since it's caller-saved */
-    load_full_const(ARM_R12, PREG_NONE, LFC_SPLIT(addr.u.imm.val));
-    ot_check(th_pld_imm(ARM_R12, 0, 0));
+    ScratchRegAlloc scr = get_scratch_reg_with_save(0);
+    load_full_const(scr.reg, PREG_NONE, LFC_SPLIT(addr.u.imm.val));
+    ot_check(th_pld_imm(scr.reg, 0, 0));
+    restore_scratch_reg(&scr);
     break;
   }
   case MACH_OP_SYMBOL:
   {
     /* For symbol addresses, load into a register first */
+    ScratchRegAlloc scr = get_scratch_reg_with_save(0);
     _lfc_sym = addr.u.sym.sym;
-    load_full_const(ARM_R12, PREG_NONE, LFC_SPLIT(addr.u.sym.addend));
-    ot_check(th_pld_imm(ARM_R12, 0, 0));
+    load_full_const(scr.reg, PREG_NONE, LFC_SPLIT(addr.u.sym.addend));
+    ot_check(th_pld_imm(scr.reg, 0, 0));
+    restore_scratch_reg(&scr);
     break;
   }
   case MACH_OP_FRAME_ADDR:
@@ -8781,10 +10758,12 @@ ST_FUNC void tcc_gen_machine_prefetch_mop(MachineOperand addr, int rw)
     int32_t offset = addr.u.frame.offset;
     if (offset != 0)
     {
-      load_full_const(ARM_R12, PREG_NONE, LFC_SPLIT(offset));
-      ot_check(th_add_reg(ARM_R12, R_FP, ARM_R12, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+      ScratchRegAlloc scr = get_scratch_reg_with_save(0);
+      load_full_const(scr.reg, PREG_NONE, LFC_SPLIT(offset));
+      ot_check(th_add_reg(scr.reg, R_FP, scr.reg, flags_safe(), THUMB_SHIFT_DEFAULT,
                           ENFORCE_ENCODING_NONE));
-      ot_check(th_pld_imm(ARM_R12, 0, 0));
+      ot_check(th_pld_imm(scr.reg, 0, 0));
+      restore_scratch_reg(&scr);
     }
     else
     {
@@ -8814,7 +10793,7 @@ ST_FUNC void tcc_gen_machine_setjmp_mop(MachineOperand buf, MachineOperand dest)
   if (buf.kind == MACH_OP_NONE)
   {
     buf_reg = mach_alloc_scratch(&ctx, 0);
-    ot_check(th_mov_imm(buf_reg, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    ot_check(th_mov_imm(buf_reg, 0, flags_safe(), ENFORCE_ENCODING_NONE));
   }
   else
   {
@@ -8822,11 +10801,11 @@ ST_FUNC void tcc_gen_machine_setjmp_mop(MachineOperand buf, MachineOperand dest)
   }
 
   /* ---- save frame pointer ---- */
-  ot_check(th_str_imm(R_FP, buf_reg, 0, 6, ENFORCE_ENCODING_NONE)); /* r7  -> buf[0]  */
+  ot_check_str_imm(R_FP, buf_reg, 0, 6, ENFORCE_ENCODING_NONE); /* r7  -> buf[0]  */
 
   /* ---- save SP ---- */
-  ot_check(th_mov_reg(R_IP, R_SP, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
-  ot_check(th_str_imm(R_IP, buf_reg, 8, 6, ENFORCE_ENCODING_NONE)); /* SP -> buf[2] */
+  ot_check_mov_reg(R_IP, R_SP, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
+  ot_check_str_imm(R_IP, buf_reg, 8, 6, ENFORCE_ENCODING_NONE); /* SP -> buf[2] */
 
   /* ---- save resume address (ADR IP, resume_label) ---- */
   int adr_addr = ind;
@@ -8836,16 +10815,16 @@ ST_FUNC void tcc_gen_machine_setjmp_mop(MachineOperand buf, MachineOperand dest)
   int adr_imm = resume_label_addr - adr_base;
   ot_check(th_adr_imm(R_IP, adr_imm, ENFORCE_ENCODING_32BIT));
 
-  ot_check(th_orr_imm(R_IP, R_IP, 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE)); /* Thumb bit */
-  ot_check(th_str_imm(R_IP, buf_reg, 4, 6, ENFORCE_ENCODING_NONE));                          /* -> buf[1] */
+  ot_check(th_orr_imm(R_IP, R_IP, 1, flags_safe(), ENFORCE_ENCODING_NONE)); /* Thumb bit */
+  ot_check_str_imm(R_IP, buf_reg, 4, 6, ENFORCE_ENCODING_NONE);                              /* -> buf[1] */
 
   /* ---- normal path: return 0 ---- */
   int dest_reg = mach_get_dest_reg(&ctx, &dest, 0);
-  ot_check(th_mov_imm(dest_reg, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_32BIT)); /* dest = 0 */
+  ot_check(th_mov_imm(dest_reg, 0, flags_safe(), ENFORCE_ENCODING_32BIT)); /* dest = 0 */
   ot_check(th_b_t4(4));                                                                     /* B.W +4 (skip resume) */
 
   /* ---- resume_label: longjmp lands here ---- */
-  ot_check(th_mov_imm(dest_reg, 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_32BIT)); /* dest = 1 */
+  ot_check(th_mov_imm(dest_reg, 1, flags_safe(), ENFORCE_ENCODING_32BIT)); /* dest = 1 */
   /* ---- end_label ---- */
 
   mach_writeback_dest(&dest, dest_reg);
@@ -8869,7 +10848,7 @@ ST_FUNC void tcc_gen_machine_nl_setjmp_mop(MachineOperand buf, MachineOperand de
   if (buf.kind == MACH_OP_NONE)
   {
     buf_reg = mach_alloc_scratch(&ctx, 0);
-    ot_check(th_mov_imm(buf_reg, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    ot_check(th_mov_imm(buf_reg, 0, flags_safe(), ENFORCE_ENCODING_NONE));
   }
   else
   {
@@ -8877,18 +10856,18 @@ ST_FUNC void tcc_gen_machine_nl_setjmp_mop(MachineOperand buf, MachineOperand de
   }
 
   /* ---- save callee-saved registers r4-r11 ---- */
-  ot_check(th_str_imm(4, buf_reg, 0, 6, ENFORCE_ENCODING_NONE));     /* r4  -> buf[0]  */
-  ot_check(th_str_imm(5, buf_reg, 4, 6, ENFORCE_ENCODING_NONE));     /* r5  -> buf[1]  */
-  ot_check(th_str_imm(6, buf_reg, 8, 6, ENFORCE_ENCODING_NONE));     /* r6  -> buf[2]  */
-  ot_check(th_str_imm(R_FP, buf_reg, 12, 6, ENFORCE_ENCODING_NONE)); /* r7  -> buf[3]  */
-  ot_check(th_str_imm(8, buf_reg, 16, 6, ENFORCE_ENCODING_NONE));    /* r8  -> buf[4]  */
-  ot_check(th_str_imm(9, buf_reg, 20, 6, ENFORCE_ENCODING_NONE));    /* r9  -> buf[5]  */
-  ot_check(th_str_imm(10, buf_reg, 24, 6, ENFORCE_ENCODING_NONE));   /* r10 -> buf[6]  */
-  ot_check(th_str_imm(11, buf_reg, 28, 6, ENFORCE_ENCODING_NONE));   /* r11 -> buf[7]  */
+  ot_check_str_imm(4, buf_reg, 0, 6, ENFORCE_ENCODING_NONE);     /* r4  -> buf[0]  */
+  ot_check_str_imm(5, buf_reg, 4, 6, ENFORCE_ENCODING_NONE);     /* r5  -> buf[1]  */
+  ot_check_str_imm(6, buf_reg, 8, 6, ENFORCE_ENCODING_NONE);     /* r6  -> buf[2]  */
+  ot_check_str_imm(R_FP, buf_reg, 12, 6, ENFORCE_ENCODING_NONE); /* r7  -> buf[3]  */
+  ot_check_str_imm(8, buf_reg, 16, 6, ENFORCE_ENCODING_NONE);    /* r8  -> buf[4]  */
+  ot_check_str_imm(9, buf_reg, 20, 6, ENFORCE_ENCODING_NONE);    /* r9  -> buf[5]  */
+  ot_check_str_imm(10, buf_reg, 24, 6, ENFORCE_ENCODING_NONE);   /* r10 -> buf[6]  */
+  ot_check_str_imm(11, buf_reg, 28, 6, ENFORCE_ENCODING_NONE);   /* r11 -> buf[7]  */
 
   /* ---- save SP ---- */
-  ot_check(th_mov_reg(R_IP, R_SP, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
-  ot_check(th_str_imm(R_IP, buf_reg, 32, 6, ENFORCE_ENCODING_NONE)); /* SP -> buf[8] */
+  ot_check_mov_reg(R_IP, R_SP, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
+  ot_check_str_imm(R_IP, buf_reg, 32, 6, ENFORCE_ENCODING_NONE); /* SP -> buf[8] */
 
   /* ---- save resume address (ADR IP, resume_label) ---- */
   int adr_addr = ind;
@@ -8898,16 +10877,16 @@ ST_FUNC void tcc_gen_machine_nl_setjmp_mop(MachineOperand buf, MachineOperand de
   int adr_imm = resume_label_addr - adr_base;
   ot_check(th_adr_imm(R_IP, adr_imm, ENFORCE_ENCODING_32BIT));
 
-  ot_check(th_orr_imm(R_IP, R_IP, 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE)); /* Thumb bit */
-  ot_check(th_str_imm(R_IP, buf_reg, 36, 6, ENFORCE_ENCODING_NONE));                         /* -> buf[9] */
+  ot_check(th_orr_imm(R_IP, R_IP, 1, flags_safe(), ENFORCE_ENCODING_NONE)); /* Thumb bit */
+  ot_check_str_imm(R_IP, buf_reg, 36, 6, ENFORCE_ENCODING_NONE);                             /* -> buf[9] */
 
   /* ---- normal path: return 0 ---- */
   int dest_reg = mach_get_dest_reg(&ctx, &dest, 0);
-  ot_check(th_mov_imm(dest_reg, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_32BIT)); /* dest = 0 */
+  ot_check(th_mov_imm(dest_reg, 0, flags_safe(), ENFORCE_ENCODING_32BIT)); /* dest = 0 */
   ot_check(th_b_t4(4));                                                                     /* B.W +4 (skip resume) */
 
   /* ---- resume_label: longjmp lands here ---- */
-  ot_check(th_mov_imm(dest_reg, 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_32BIT)); /* dest = 1 */
+  ot_check(th_mov_imm(dest_reg, 1, flags_safe(), ENFORCE_ENCODING_32BIT)); /* dest = 1 */
   /* ---- end_label ---- */
 
   mach_writeback_dest(&dest, dest_reg);
@@ -8936,17 +10915,17 @@ ST_FUNC void tcc_gen_machine_longjmp_mop(MachineOperand buf)
   buf_reg = mach_ensure_in_reg(&ctx, &buf, 0);
 
   /* Copy buf pointer to IP so it survives FP restore */
-  ot_check(th_mov_reg(R_IP, buf_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
+  ot_check_mov_reg(R_IP, buf_reg, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
 
   /* Read resume address and saved SP into caller-saved regs first */
-  ot_check(th_ldr_imm(0, R_IP, 4, 6, ENFORCE_ENCODING_NONE)); /* r0 = resume addr */
-  ot_check(th_ldr_imm(1, R_IP, 8, 6, ENFORCE_ENCODING_NONE)); /* r1 = saved SP    */
+  ot_check_ldr_imm(0, R_IP, 4, 6, ENFORCE_ENCODING_NONE); /* r0 = resume addr */
+  ot_check_ldr_imm(1, R_IP, 8, 6, ENFORCE_ENCODING_NONE); /* r1 = saved SP    */
 
   /* Restore frame pointer */
-  ot_check(th_ldr_imm(R_FP, R_IP, 0, 6, ENFORCE_ENCODING_NONE)); /* r7 = FP */
+  ot_check_ldr_imm(R_FP, R_IP, 0, 6, ENFORCE_ENCODING_NONE); /* r7 = FP */
 
   /* Restore SP */
-  ot_check(th_mov_reg(R_SP, 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
+  ot_check_mov_reg(R_SP, 1, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
 
   /* Jump to resume address (Thumb bit already set by setjmp code) */
   ot_check(th_bx_reg(0));
@@ -8987,14 +10966,14 @@ ST_FUNC void tcc_gen_machine_nl_longjmp_mop(MachineOperand buf)
     if (abs_off == 0)
     {
       if (buf_reg != base)
-        ot_check(th_mov_reg((uint32_t)buf_reg, (uint32_t)base, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
-                            ENFORCE_ENCODING_NONE, false));
+        ot_check_mov_reg((uint32_t)buf_reg, (uint32_t)base, flags_safe(), THUMB_SHIFT_DEFAULT,
+                         ENFORCE_ENCODING_NONE, false);
     }
     else
     {
       thumb_opcode ins = sign
-                             ? th_sub_imm(buf_reg, base, abs_off, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE)
-                             : th_add_imm(buf_reg, base, abs_off, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE);
+                             ? th_sub_imm(buf_reg, base, abs_off, flags_safe(), ENFORCE_ENCODING_NONE)
+                             : th_add_imm(buf_reg, base, abs_off, flags_safe(), ENFORCE_ENCODING_NONE);
       if (ins.size != 0)
       {
         ot_check(ins);
@@ -9003,9 +10982,9 @@ ST_FUNC void tcc_gen_machine_nl_longjmp_mop(MachineOperand buf)
       {
         ScratchRegAlloc off_sc = get_scratch_reg_with_save(excl | (1u << (uint32_t)buf_reg) | (1u << (uint32_t)base));
         load_full_const(off_sc.reg, PREG_NONE, LFC_SPLIT(abs_off));
-        ot_check(sign ? th_sub_reg(buf_reg, base, off_sc.reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+        ot_check(sign ? th_sub_reg(buf_reg, base, off_sc.reg, flags_safe(), THUMB_SHIFT_DEFAULT,
                                    ENFORCE_ENCODING_NONE)
-                      : th_add_reg(buf_reg, base, off_sc.reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                      : th_add_reg(buf_reg, base, off_sc.reg, flags_safe(), THUMB_SHIFT_DEFAULT,
                                    ENFORCE_ENCODING_NONE));
         restore_scratch_reg(&off_sc);
       }
@@ -9019,25 +10998,27 @@ ST_FUNC void tcc_gen_machine_nl_longjmp_mop(MachineOperand buf)
   }
 
   /* Copy buf pointer to IP so it survives register restores */
-  ot_check(th_mov_reg(R_IP, buf_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
+  ot_check_mov_reg(R_IP, buf_reg, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
 
   /* Load resume address and saved SP into caller-saved regs first
    * (before we clobber r4+ with the restore) */
-  ot_check(th_ldr_imm(0, R_IP, 36, 6, ENFORCE_ENCODING_NONE)); /* r0 = resume addr */
-  ot_check(th_ldr_imm(1, R_IP, 32, 6, ENFORCE_ENCODING_NONE)); /* r1 = saved SP    */
+  ot_check_ldr_imm(0, R_IP, 36, 6, ENFORCE_ENCODING_NONE); /* r0 = resume addr */
+  ot_check_ldr_imm(1, R_IP, 32, 6, ENFORCE_ENCODING_NONE); /* r1 = saved SP    */
 
   /* Restore callee-saved registers r4-r11 */
-  ot_check(th_ldr_imm(4, R_IP, 0, 6, ENFORCE_ENCODING_NONE));     /* r4  = buf[0] */
-  ot_check(th_ldr_imm(5, R_IP, 4, 6, ENFORCE_ENCODING_NONE));     /* r5  = buf[1] */
-  ot_check(th_ldr_imm(6, R_IP, 8, 6, ENFORCE_ENCODING_NONE));     /* r6  = buf[2] */
-  ot_check(th_ldr_imm(R_FP, R_IP, 12, 6, ENFORCE_ENCODING_NONE)); /* r7  = buf[3] (FP) */
-  ot_check(th_ldr_imm(8, R_IP, 16, 6, ENFORCE_ENCODING_NONE));    /* r8  = buf[4] */
-  ot_check(th_ldr_imm(9, R_IP, 20, 6, ENFORCE_ENCODING_NONE));    /* r9  = buf[5] */
-  ot_check(th_ldr_imm(10, R_IP, 24, 6, ENFORCE_ENCODING_NONE));   /* r10 = buf[6] */
-  ot_check(th_ldr_imm(11, R_IP, 28, 6, ENFORCE_ENCODING_NONE));   /* r11 = buf[7] */
+  ot_check_ldr_imm(4, R_IP, 0, 6, ENFORCE_ENCODING_NONE);     /* r4  = buf[0] */
+  ot_check_ldr_imm(5, R_IP, 4, 6, ENFORCE_ENCODING_NONE);     /* r5  = buf[1] */
+  ot_check_ldr_imm(6, R_IP, 8, 6, ENFORCE_ENCODING_NONE);     /* r6  = buf[2] */
+  ot_check_ldr_imm(R_FP, R_IP, 12, 6, ENFORCE_ENCODING_NONE); /* r7  = buf[3] (FP) */
+  ot_check_ldr_imm(8, R_IP, 16, 6, ENFORCE_ENCODING_NONE);    /* r8  = buf[4] */
+  allow_r9_write = 1;
+  ot_check_ldr_imm(9, R_IP, 20, 6, ENFORCE_ENCODING_NONE); /* r9  = buf[5] */
+  allow_r9_write = 0;
+  ot_check_ldr_imm(10, R_IP, 24, 6, ENFORCE_ENCODING_NONE); /* r10 = buf[6] */
+  ot_check_ldr_imm(11, R_IP, 28, 6, ENFORCE_ENCODING_NONE); /* r11 = buf[7] */
 
   /* Restore SP */
-  ot_check(th_mov_reg(R_SP, 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
+  ot_check_mov_reg(R_SP, 1, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
 
   /* Jump to resume address (Thumb bit already set by setjmp code) */
   ot_check(th_bx_reg(0));
@@ -9090,16 +11071,15 @@ ST_FUNC void tcc_gen_machine_builtin_apply_mop(MachineOperand fn, MachineOperand
   int fn_reg = mach_ensure_in_reg(&ctx, &fn, (1u << args_reg));
   if (fn_reg != R_IP)
   {
-    ot_check(
-        th_mov_reg(R_IP, fn_reg, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
+    ot_check_mov_reg(R_IP, fn_reg, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
   }
 
   /* Step 3: Restore r0-r3 from the args block.
    * Layout: [+0]=stack_args_ptr, [+4]=r0, [+8]=r1, [+12]=r2, [+16]=r3. */
-  ot_check(th_ldr_imm(R0, args_reg, 4, 6, ENFORCE_ENCODING_NONE));
-  ot_check(th_ldr_imm(R1, args_reg, 8, 6, ENFORCE_ENCODING_NONE));
-  ot_check(th_ldr_imm(R2, args_reg, 12, 6, ENFORCE_ENCODING_NONE));
-  ot_check(th_ldr_imm(R3, args_reg, 16, 6, ENFORCE_ENCODING_NONE));
+  ot_check_ldr_imm(R0, args_reg, 4, 6, ENFORCE_ENCODING_NONE);
+  ot_check_ldr_imm(R1, args_reg, 8, 6, ENFORCE_ENCODING_NONE);
+  ot_check_ldr_imm(R2, args_reg, 12, 6, ENFORCE_ENCODING_NONE);
+  ot_check_ldr_imm(R3, args_reg, 16, 6, ENFORCE_ENCODING_NONE);
 
   /* Step 4: Call the function via BLX R12.
    * This clobbers LR and r0-r3 (caller-saved). */
@@ -9109,8 +11089,7 @@ ST_FUNC void tcc_gen_machine_builtin_apply_mop(MachineOperand fn, MachineOperand
   int dest_reg = mach_get_dest_reg(&ctx, &dest, 0);
   if (dest_reg != R0)
   {
-    ot_check(
-        th_mov_reg(dest_reg, R0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false));
+    ot_check_mov_reg(dest_reg, R0, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
   }
 
   mach_writeback_dest(&dest, dest_reg);
@@ -9333,4 +11312,142 @@ ST_FUNC void tcc_gen_machine_func_parameter_mop(MachineOperand src1, MachineOper
 
   /* Store parameter information - for now just mark as present */
   call_site->function_argument_list[param_index] = 1; /* Mark parameter as present */
+}
+/* Emit a nested-function trampoline into the current text section.
+ * chain_slot_sym: TCC symbol for the chain slot in .data
+ * func_sym:       TCC symbol for the nested function in .text
+ *
+ * The trampoline loads the parent frame pointer from the chain slot
+ * into R10 (the static-chain register) and tail-calls the nested function.
+ *
+ * Two variants:
+ *  - GOT-indirect (text_and_data_separation): uses R9-relative GOT loads,
+ *    relocations are R_ARM_GOT32 (linker-resolved, no absolute addresses
+ *    in the code section).
+ *  - Direct: inline literal pool with R_ARM_ABS32 relocations.
+ */
+ST_FUNC addr_t gen_nested_func_trampoline(Sym *chain_slot_sym, Sym *func_sym)
+{
+  Section *text_sec = cur_text_section;
+  int use_got = tcc_state->text_and_data_separation;
+
+  section_prealloc(text_sec, use_got ? 36 : 24);
+
+  /* Align ind to 4-byte boundary */
+  while (ind & 3)
+    text_sec->data[ind++] = 0x00;
+
+  addr_t tramp_start = ind;
+
+  if (use_got)
+  {
+    /* GOT-indirect trampoline (32 bytes):
+     *   +0:  LDR  r12, [pc, #20]  ; GOT offset of chain_slot (from +24)
+     *   +4:  LDR  r10, [r9, r12]  ; chain_slot address via GOT
+     *   +8:  LDR  r10, [r10, #0]  ; *chain_slot = parent FP
+     *   +12: LDR  r12, [pc, #12]  ; GOT offset of function (from +28)
+     *   +16: LDR  r12, [r9, r12]  ; function address via GOT
+     *   +20: BX   r12             ; tail-call
+     *   +22: NOP
+     *   +24: .word 0              ; R_ARM_GOT32 chain_slot
+     *   +28: .word 0              ; R_ARM_GOT32 function
+     */
+
+    /* +0: LDR R12, [PC, #20] - F8DF C014 */
+    text_sec->data[ind++] = 0xDF;
+    text_sec->data[ind++] = 0xF8;
+    text_sec->data[ind++] = 0x14;
+    text_sec->data[ind++] = 0xC0;
+
+    /* +4: LDR R10, [R9, R12] - F859 A00C */
+    text_sec->data[ind++] = 0x59;
+    text_sec->data[ind++] = 0xF8;
+    text_sec->data[ind++] = 0x0C;
+    text_sec->data[ind++] = 0xA0;
+
+    /* +8: LDR R10, [R10, #0] - F8DA A000 */
+    text_sec->data[ind++] = 0xDA;
+    text_sec->data[ind++] = 0xF8;
+    text_sec->data[ind++] = 0x00;
+    text_sec->data[ind++] = 0xA0;
+
+    /* +12: LDR R12, [PC, #12] - F8DF C00C */
+    text_sec->data[ind++] = 0xDF;
+    text_sec->data[ind++] = 0xF8;
+    text_sec->data[ind++] = 0x0C;
+    text_sec->data[ind++] = 0xC0;
+
+    /* +16: LDR R12, [R9, R12] - F859 C00C */
+    text_sec->data[ind++] = 0x59;
+    text_sec->data[ind++] = 0xF8;
+    text_sec->data[ind++] = 0x0C;
+    text_sec->data[ind++] = 0xC0;
+
+    /* +20: BX R12 - 4760 */
+    text_sec->data[ind++] = 0x60;
+    text_sec->data[ind++] = 0x47;
+
+    /* +22: NOP - BF00 */
+    text_sec->data[ind++] = 0x00;
+    text_sec->data[ind++] = 0xBF;
+
+    /* +24: chain slot GOT offset */
+    greloc(text_sec, chain_slot_sym, ind, R_ARM_GOT32);
+    text_sec->data[ind++] = 0x00;
+    text_sec->data[ind++] = 0x00;
+    text_sec->data[ind++] = 0x00;
+    text_sec->data[ind++] = 0x00;
+
+    /* +28: function GOT offset */
+    greloc(text_sec, func_sym, ind, R_ARM_GOT32);
+    text_sec->data[ind++] = 0x00;
+    text_sec->data[ind++] = 0x00;
+    text_sec->data[ind++] = 0x00;
+    text_sec->data[ind++] = 0x00;
+  }
+  else
+  {
+    /* Direct trampoline (20 bytes):
+     *   +0:  LDR  r10, [pc, #8]   ; chain_slot address (from +12)
+     *   +4:  LDR  r10, [r10, #0]  ; *chain_slot = parent FP
+     *   +8:  LDR  pc, [pc, #4]    ; function address (from +16), tail call
+     *   +12: .word chain_slot     ; R_ARM_ABS32
+     *   +16: .word function        ; R_ARM_ABS32
+     */
+
+    /* LDR R10, [PC, #8] - F8DF A008 */
+    text_sec->data[ind++] = 0xDF;
+    text_sec->data[ind++] = 0xF8;
+    text_sec->data[ind++] = 0x08;
+    text_sec->data[ind++] = 0xA0;
+
+    /* LDR R10, [R10, #0] - F8DA A000 */
+    text_sec->data[ind++] = 0xDA;
+    text_sec->data[ind++] = 0xF8;
+    text_sec->data[ind++] = 0x00;
+    text_sec->data[ind++] = 0xA0;
+
+    /* LDR PC, [PC, #4] - F8DF F004 */
+    text_sec->data[ind++] = 0xDF;
+    text_sec->data[ind++] = 0xF8;
+    text_sec->data[ind++] = 0x04;
+    text_sec->data[ind++] = 0xF0;
+
+    /* chain slot address */
+    greloc(text_sec, chain_slot_sym, ind, R_ARM_ABS32);
+    text_sec->data[ind++] = 0x00;
+    text_sec->data[ind++] = 0x00;
+    text_sec->data[ind++] = 0x00;
+    text_sec->data[ind++] = 0x00;
+
+    /* function address */
+    greloc(text_sec, func_sym, ind, R_ARM_ABS32);
+    text_sec->data[ind++] = 0x00;
+    text_sec->data[ind++] = 0x00;
+    text_sec->data[ind++] = 0x00;
+    text_sec->data[ind++] = 0x00;
+  }
+
+  text_sec->data_offset = ind;
+  return tramp_start + 1; /* +1 for Thumb interworking bit */
 }

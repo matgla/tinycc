@@ -93,15 +93,15 @@
 #define __WINT_TYPE__ int
 #endif
 
-#if __STDC_VERSION__ >= 201112L
-#define __STDC_NO_ATOMICS__ 1
-#define __STDC_NO_COMPLEX__ 1
-#define __STDC_NO_THREADS__ 1
+    #if __STDC_VERSION__ >= 201112L
+    #define __STDC_NO_ATOMICS__ 1
+    #define __STDC_NO_COMPLEX__ 1
+    #define __STDC_NO_THREADS__ 1
 #if !defined _WIN32
-#define __STDC_UTF_16__ 1
-#define __STDC_UTF_32__ 1
+    #define __STDC_UTF_16__ 1
+    #define __STDC_UTF_32__ 1
 #endif
-#endif
+    #endif
 
 #if defined _WIN32
 #define __declspec(x) __attribute__((x))
@@ -201,30 +201,30 @@
    These are indented with 4 spaces so that c2str stringifies the guards
    instead of emitting them as real host-preprocessor directives (which
    would cause the host GCC to strip the blocks). */
-#ifndef __INT8_MAX__
-#define __INT8_MAX__ 0x7f
-#endif
-#ifndef __INT16_MAX__
-#define __INT16_MAX__ 0x7fff
-#endif
-#ifndef __INT32_MAX__
-#define __INT32_MAX__ 0x7fffffff
-#endif
-#ifndef __INT64_MAX__
-#define __INT64_MAX__ 0x7fffffffffffffffLL
-#endif
-#ifndef __UINT8_MAX__
-#define __UINT8_MAX__ 0xff
-#endif
-#ifndef __UINT16_MAX__
-#define __UINT16_MAX__ 0xffff
-#endif
-#ifndef __UINT32_MAX__
-#define __UINT32_MAX__ 0xffffffffU
-#endif
-#ifndef __UINT64_MAX__
-#define __UINT64_MAX__ 0xffffffffffffffffULL
-#endif
+    #ifndef __INT8_MAX__
+    #define __INT8_MAX__ 0x7f
+    #endif
+    #ifndef __INT16_MAX__
+    #define __INT16_MAX__ 0x7fff
+    #endif
+    #ifndef __INT32_MAX__
+    #define __INT32_MAX__ 0x7fffffff
+    #endif
+    #ifndef __INT64_MAX__
+    #define __INT64_MAX__ 0x7fffffffffffffffLL
+    #endif
+    #ifndef __UINT8_MAX__
+    #define __UINT8_MAX__ 0xff
+    #endif
+    #ifndef __UINT16_MAX__
+    #define __UINT16_MAX__ 0xffff
+    #endif
+    #ifndef __UINT32_MAX__
+    #define __UINT32_MAX__ 0xffffffffU
+    #endif
+    #ifndef __UINT64_MAX__
+    #define __UINT64_MAX__ 0xffffffffffffffffULL
+    #endif
 
 /* Floating point limits (IEEE 754). These match include/float.h values. */
 #define __FLT_MAX__ 3.40282347e+38F
@@ -249,18 +249,11 @@
 #define __LDBL_MAX_EXP__ 1024
 #define __LDBL_MIN_EXP__ (-1021)
 
-#ifdef __leading_underscore
-#define __USER_LABEL_PREFIX__ _
-#else
-#define __USER_LABEL_PREFIX__
-#endif
-#if !defined _WIN32
-/* glibc defines */
-#define __REDIRECT(name, proto, alias) name proto __asm__(#alias)
-#define __REDIRECT_NTH(name, proto, alias) name proto __asm__(#alias) __THROW
-#define __REDIRECT_NTHNL(name, proto, alias) name proto __asm__(#alias) __THROWNL
-#endif
-
+    #ifdef __leading_underscore
+    #define __USER_LABEL_PREFIX__ _
+    #else
+    #define __USER_LABEL_PREFIX__
+    #endif
 /* not implemented */
 #define __PRETTY_FUNCTION__ __FUNCTION__
 #define __has_builtin(x) 0

@@ -336,6 +336,11 @@ DEF_ASM_BASE(umlal)
 DEF_ASM_BASE(umull)
 DEF_ASM_BASE(usat)
 
+/* DSP byte-parallel instructions (ARMv7E-M / ARMv8-M Mainline) */
+DEF_ASM_BASE(uadd8)
+DEF_ASM_BASE(usub8)
+DEF_ASM_BASE(sel)
+
 /* floating point */
 DEF_ASM_BASE(vpush)
 DEF_ASM_BASE(vpop)

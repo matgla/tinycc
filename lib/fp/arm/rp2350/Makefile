@@ -11,7 +11,7 @@ SRCS = dcp_init.c dcp_ops.c dcp_cmp.c dcp_conv.c
 BUILD_DIR ?= build
 OBJS = $(addprefix $(BUILD_DIR)/,$(SRCS:.c=.o))
 
-FP_CFLAGS += -O2 -Wall -Wextra -march=armv7e-m -DRP2350_DCP_ENABLED -I../../.. -I../../../../include
+override FP_CFLAGS += -O2 -Wall -Wextra -march=armv7e-m -DRP2350_DCP_ENABLED -I../../.. -I../../../../include
 
 all: $(BUILD_DIR) $(OBJS)
 

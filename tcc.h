@@ -77,6 +77,21 @@ extern long double strtold(const char *__nptr, char **__endptr);
 #define O_BINARY 0
 #endif
 
+#ifdef _WIN32
+static inline unsigned tcc_getclock_ms(void)
+{
+  return GetTickCount();
+}
+#else
+static inline unsigned tcc_getclock_ms(void)
+{
+  struct timeval tv;
+  if (0 == gettimeofday(&tv, NULL))
+    return tv.tv_sec * 1000 + (tv.tv_usec + 500) / 1000;
+  return (unsigned)time(NULL) * 1000;
+}
+#endif
+
 #ifndef offsetof
 #define offsetof(type, field) ((size_t)&((type *)0)->field)
 #endif
@@ -89,10 +104,12 @@ extern long double strtold(const char *__nptr, char **__endptr);
 #define NORETURN __declspec(noreturn)
 #define ALIGNED(x) __declspec(align(x))
 #define PRINTF_LIKE(x, y)
+#define HOT
 #else
 #define NORETURN __attribute__((noreturn))
 #define ALIGNED(x) __attribute__((aligned(x)))
 #define PRINTF_LIKE(x, y) __attribute__((format(printf, (x), (y))))
+#define HOT __attribute__((hot))
 #endif
 
 #ifdef _WIN32
@@ -119,32 +136,11 @@ extern long double strtold(const char *__nptr, char **__endptr);
 
 /* -------------------------------------------- */
 
-/* parser debug */
-/* #define PARSE_DEBUG */
-/* preprocessor debug */
-/* #define PP_DEBUG */
-/* include file debug */
-/* #define INC_DEBUG */
-/* memory leak debug (only for single threaded usage) */
-/* #define MEM_DEBUG 1,2,3 */
-/* assembler debug */
-/* #define ASM_DEBUG */
-/* machine-level debug (store/assign operations) */
-/* #define TCC_MACHINE_DEBUG */
+/* Unified logging — see log.h for all scope switches */
+#include "log.h"
 
-/* Machine-level debug output macro */
-#ifndef TCC_MACHINE_DEBUG
-#define TCC_MACHINE_DEBUG 0
-#endif
-
-#if TCC_MACHINE_DEBUG
-#define TCC_MACH_DBG(...) fprintf(stderr, __VA_ARGS__)
-#else
-#define TCC_MACH_DBG(...)                                                                                              \
-  do                                                                                                                   \
-  {                                                                                                                    \
-  } while (0)
-#endif
+/* Legacy aliases — will be removed once all callers migrate */
+#define TCC_MACH_DBG(...) LOG_MACH(__VA_ARGS__)
 
 /* target selection */
 /* #define TCC_TARGET_I386   */    /* i386 code generator */
@@ -465,7 +461,12 @@ struct SymAttr
       packed : 1, weak : 1, visibility : 2, dllexport : 1, nodecorate : 1, dllimport : 1, addrtaken : 1, nodebug : 1,
       naked : 1, nested_func : 1, /* nested function flag */
       sso_be : 1,                 /* scalar_storage_order("big-endian") */
-      transparent_union : 1;      /* __attribute__((transparent_union)) */
+      transparent_union : 1,      /* __attribute__((transparent_union)) */
+      possibly_written : 1;       /* global may have been written after its
+                                     initializer (a store was emitted, or its
+                                     address escaped to a non-const pointer).
+                                     Used by inline-eval to decide whether
+                                     `*&g` can fold to the initializer. */
 };
 
 /* function attributes or temporary attributes for parsing */
@@ -478,13 +479,16 @@ struct FuncAttr
       func_dtor : 1,                    /* attribute((destructor)) */
       func_args : 8,                    /* PE __stdcall args */
       func_alwinl : 1,                  /* always_inline */
+      func_noinline : 1,                /* noinline — suppress auto-inline */
       func_pure : 1,                    /* attribute((pure)) - no side effects, reads memory */
       func_const : 1,                   /* attribute((const)) - no side effects, no memory reads */
       func_no_instrument : 1,           /* attribute((no_instrument_function)) */
       func_va_arg_pack : 1,             /* uses __builtin_va_arg_pack() */
       func_rewritten_extern_inline : 1, /* extern inline rewritten to non-extern inline-only def */
       func_outofline_needed : 1,        /* always_inline call could not stay call-site-only */
-      xxxx : 9;
+      func_auto_inline : 1,             /* compiler-selected auto-inline candidate (small func) */
+      func_eval_only_inline : 1,        /* body saved for const-fold only, not regular inlining */
+      xxxx : 6;
 };
 
 /* symbol management */
@@ -595,7 +599,10 @@ typedef struct Section
   uint32_t *str_hash; /* Hash table: hash -> offset in data */
   int str_hash_size;  /* Size of hash table */
   int str_hash_count; /* Number of entries in hash */
-  char name[1];       /* section name */
+  /* Hash value cache for fast find_elf_sym - avoids strcmp on mismatches */
+  unsigned int *hash_val_cache; /* full hash values indexed by sym_index */
+  int hash_val_alloc;           /* allocated size of cache */
+  char name[1];                 /* section name */
 } Section;
 
 /* -------------------------------------------------- */
@@ -705,10 +712,11 @@ typedef struct BufferedFile
 #define CH_EOF (-1) /* end of file */
 
 /* used to record tokens */
-/* Small Buffer Optimization: inline 4 ints (16 bytes) for small token strings.
+/* Small Buffer Optimization: keep a modest inline token buffer so common macro
+   expansions avoid heap traffic entirely.
    allocated_len == 0 means using inline buffer (small_buf).
    allocated_len > 0 means using heap buffer (str pointer). */
-#define TOKSTR_SMALL_BUFSIZE 8 /* number of ints in inline buffer */
+#define TOKSTR_SMALL_BUFSIZE 16 /* number of ints in inline buffer */
 
 typedef struct TokenString
 {
@@ -806,6 +814,168 @@ typedef struct CachedInclude
 
 #define CACHED_INCLUDES_HASH_SIZE 32
 
+#define TCC_PCH_MAGIC 0x48504354u
+#define TCC_PCH_VERSION 1u
+
+enum
+{
+  TCC_PCH_SEC_STRINGS = 1,
+  TCC_PCH_SEC_IDENTS,
+  TCC_PCH_SEC_TOKEN_BLOBS,
+  TCC_PCH_SEC_MACROS,
+  TCC_PCH_SEC_MACRO_ARGS,
+  TCC_PCH_SEC_REPLAY_RECORDS,
+  TCC_PCH_SEC_CACHED_INCLUDES,
+  TCC_PCH_SEC_DEPENDENCIES,
+  TCC_PCH_SEC_PRAGMA_LIBS,
+  TCC_PCH_SEC_MANIFEST,
+};
+
+enum
+{
+  TCC_PCH_REPLAY_TOKENS = 1,
+  TCC_PCH_REPLAY_PACK_SET,
+  TCC_PCH_REPLAY_PACK_PUSH,
+  TCC_PCH_REPLAY_PACK_POP,
+};
+
+typedef struct TCCPCHFileHeader
+{
+  uint32_t magic;
+  uint32_t version;
+  uint32_t header_size;
+  uint32_t section_count;
+  uint32_t endianness;
+  uint32_t sizeof_int;
+  uint32_t long_size;
+  uint32_t ldouble_size;
+  uint32_t ptr_size;
+  uint32_t tok_ident_value;
+  uint32_t builtin_ident_count;
+  uint64_t keywords_hash;
+  uint32_t filetype;
+  uint32_t float_abi;
+  uint32_t fpu_type;
+  uint64_t predefines_hash;
+  uint64_t include_path_hash;
+  uint64_t dependency_hash;
+  uint32_t ident_count;
+  uint32_t macro_count;
+  uint32_t macro_arg_count;
+  uint32_t replay_count;
+  uint32_t include_count;
+  uint32_t pragma_lib_count;
+  uint32_t dependency_count;
+  uint32_t counter_delta;
+} TCCPCHFileHeader;
+
+typedef struct TCCPCHSectionHeader
+{
+  uint32_t kind;
+  uint32_t offset;
+  uint32_t size;
+} TCCPCHSectionHeader;
+
+typedef struct TCCPCHIdentRecord
+{
+  uint32_t token;
+  uint32_t string_off;
+  uint32_t len;
+} TCCPCHIdentRecord;
+
+typedef struct TCCPCHMacroRecord
+{
+  uint32_t name_token;
+  uint32_t macro_type;
+  uint32_t arg_start;
+  uint32_t arg_count;
+  uint32_t tok_blob_off_words;
+  uint32_t tok_blob_len_words;
+} TCCPCHMacroRecord;
+
+typedef struct TCCPCHMacroArgRecord
+{
+  uint32_t token;
+  uint32_t is_vaargs;
+} TCCPCHMacroArgRecord;
+
+typedef struct TCCPCHReplayRecord
+{
+  uint32_t kind;
+  uint32_t arg0;
+  uint32_t arg1;
+} TCCPCHReplayRecord;
+
+typedef struct TCCPCHCachedIncludeRecord
+{
+  uint32_t filename_off;
+  uint32_t ifndef_macro;
+  uint32_t once;
+} TCCPCHCachedIncludeRecord;
+
+typedef struct TCCPCHDependencyRecord
+{
+  uint32_t filename_off;
+  uint32_t reserved;
+  uint64_t size;
+  uint64_t mtime_sec;
+  uint64_t mtime_nsec;
+} TCCPCHDependencyRecord;
+
+typedef struct TCCPCHPragmaLibRecord
+{
+  uint32_t string_off;
+} TCCPCHPragmaLibRecord;
+
+typedef struct TCCPCHManifestRecord
+{
+  uint32_t root_filename_off;
+  uint32_t generator_version_off;
+} TCCPCHManifestRecord;
+
+typedef struct TCCPCHState
+{
+  char *filename;
+  char *root_filename;
+  char *generator_version;
+  unsigned char *raw; /* raw file buffer; section pointers alias into this */
+  char *strings;
+  int strings_size;
+  int *token_blob;
+  int token_blob_words;
+  TCCPCHIdentRecord *idents;
+  TCCPCHMacroRecord *macros;
+  TCCPCHMacroArgRecord *macro_args;
+  TCCPCHReplayRecord *replay_records;
+  TCCPCHCachedIncludeRecord *cached_includes;
+  TCCPCHDependencyRecord *dependencies;
+  TCCPCHPragmaLibRecord *pragma_libs;
+  int nb_idents;
+  int nb_macros;
+  int nb_macro_args;
+  int nb_replay_records;
+  int nb_cached_includes;
+  int nb_dependencies;
+  int nb_pragma_libs;
+  uint32_t counter_delta;
+  uint32_t filetype;
+  int builtin_token_delta;
+  int applied;
+  int consumed;
+  int replay_active;
+  int replay_index;
+  struct BufferedFile *replay_file;
+  const int *replay_ptr;
+  const int *replay_end;
+} TCCPCHState;
+
+typedef struct TCCAutoPCHEntry
+{
+  char *header_path;
+  char *pch_name;
+  int disabled;
+} TCCAutoPCHEntry;
+
 #ifdef CONFIG_TCC_ASM
 
 /* Target-specific register count for inline asm constraints.
@@ -850,6 +1020,25 @@ struct sym_attr
   unsigned char plt_thumb_stub : 1;
 #endif
 };
+
+/* Cached archive symbol index for reuse across --start-group rescans.
+   Avoids re-reading archive data, re-computing hashes, and rebuilding
+   the chained hash table on every pass through the same archive. */
+typedef struct ArchiveSymbolCache
+{
+  char *filename;                     /* cache key: archive file path */
+  uint8_t *data;                      /* raw archive index data (owns memory) */
+  int nsyms;                          /* number of symbols in index */
+  int entrysize;                      /* 4 or 8 (32/64-bit offsets) */
+  const char **sym_names;             /* pointers into data */
+  unsigned int *name_hashes;          /* pre-computed elf_hash per symbol */
+  unsigned long long *member_offsets; /* file offsets per symbol */
+  int *ar_ht_buckets;                 /* chained hash table buckets */
+  int *ar_ht_next;                    /* chained hash table chain links */
+  int ar_ht_mask;                     /* hash table mask (size - 1) */
+  unsigned long long *loaded_members; /* dedup set for loaded members */
+  unsigned int loaded_member_mask;    /* dedup set mask */
+} ArchiveSymbolCache;
 
 struct TCCState
 {
@@ -935,16 +1124,24 @@ struct TCCState
   unsigned char opt_dead_store;       /* -fdead-store-elim: dead store elimination */
   unsigned char opt_fp_offset_cache;  /* -ffp-offset-cache: frame pointer offset caching */
   unsigned char opt_indexed_memory;   /* -findexed-memory: indexed load/store fusion */
+  unsigned char opt_disp_fusion;      /* -fdisp-fusion: ADD+LOAD/STORE -> displacement-addressed mem op */
+  unsigned char opt_lea_fold;         /* -flea-fold: LEA Addr[StackLoc]+deref -> direct stack slot access */
   unsigned char opt_postinc_fusion;   /* -fpostinc-fusion: post-increment load/store fusion */
   unsigned char opt_mla_fusion;       /* -fmla-fusion: multiply-accumulate fusion */
   unsigned char opt_stack_addr_cse;   /* -fstack-addr-cse: stack address CSE */
   unsigned char opt_licm;             /* -flicm: loop-invariant code motion */
   unsigned char opt_strength_red;     /* -fstrength-reduce: strength reduction for multiply */
   unsigned char opt_iv_strength_red;  /* -fiv-strength-red: IV strength reduction for array access */
+  unsigned char opt_loop_unroll;      /* -floop-unroll: full unroll small constant-trip-count loops */
+  unsigned char opt_loop_rotation;    /* -floop-rotation: rotate top-tested loops to bottom-tested */
   unsigned char opt_nonneg_fold;      /* -fnonneg-fold: non-negative value branch folding */
   unsigned char opt_vrp;              /* -fvrp: value range propagation branch folding */
   unsigned char opt_float_narrow;     /* -ffloat-narrow: narrow double math to float when safe */
   unsigned char opt_jump_threading;   /* -fjump-threading: jump threading optimization */
+  unsigned char opt_inline_functions; /* -finline-functions: auto-inline small functions at -O2 */
+  unsigned char opt_inline_small;     /* -finline-small-functions: auto-inline tiny functions at -O1 */
+  unsigned char opt_ipc;              /* interprocedural constant propagation */
+  int opt_inline_limit;               /* -finline-limit=N: token-stream word threshold (default 0=use level default) */
   unsigned char instrument_functions; /* -finstrument-functions */
 
   /* Function purity cache for LICM optimization */
@@ -956,6 +1153,18 @@ struct TCCState
     int purity; /* TCC_FUNC_PURITY_* value */
   } func_purity_cache[FUNC_PURITY_CACHE_SIZE];
   int func_purity_cache_count;
+
+  /* Constant function result cache for interprocedural constant propagation.
+   * After optimization, functions that reduce to "return #const" are cached
+   * so callers can replace FUNCCALLVAL with ASSIGN #const. */
+#define FUNC_CONST_RESULT_CACHE_SIZE 256
+  struct
+  {
+    int token;      /* Function name token (v field of Sym) */
+    int64_t value;  /* Constant return value */
+    int btype;      /* IROP_BTYPE_* of return value */
+  } func_const_result_cache[FUNC_CONST_RESULT_CACHE_SIZE];
+  int func_const_result_cache_count;
 
 #ifdef CONFIG_TCC_DEBUG
   /* Debug-only runtime features */
@@ -978,6 +1187,7 @@ struct TCCState
 #if defined(TCC_TARGET_ARM) || defined(TCC_TARGET_ARM_THUMB)
   unsigned char float_abi; /* float ABI of the generated code*/
   unsigned char fpu_type;  /* FPU type for ARM hardfp */
+  const char *march_str;   /* -march= value, NULL means default */
 #endif
   unsigned char text_and_data_separation; /* support for GCC
                                              -mno-pic-data-is-text-relative */
@@ -1060,10 +1270,40 @@ struct TCCState
   char **pragma_libs;
   int nb_pragma_libs;
 
+  int pch_ident_start;
+  int pch_replay_token_start;
+  int pch_macro_depth;
+  int pch_filetype;
+  int pch_auto_enabled;
+  int pch_verbose;
+  int pch_is_auto;
+  uint64_t pch_predefines_hash_cached;
+  int pch_predefines_hash_valid;
+  uint64_t pch_include_path_hash_cached;
+  int pch_include_path_hash_valid;
+  int pch_auto_index_loaded;
+  int nb_pch_replay_records;
+  int alloc_pch_replay_records;
+  TCCPCHReplayRecord *pch_replay_records;
+  TokenString pch_token_blob;
+  char *pch_infile;
+  TCCPCHState *pch;
+  TCCAutoPCHEntry *auto_pch_entries;
+  int nb_auto_pch_entries;
+
   /* inline functions are stored as token lists and compiled last
      only if referenced */
   struct InlineFunc **inline_fns;
   int nb_inline_fns;
+
+  /* Inline-eval parameter overlay: during try_inline_const_eval, identifier
+   * resolution substitutes these SValues when a token matches a param token.
+   * This preserves the caller's full SValue (sym + offset + type) for VT_SYM
+   * pointer arguments so that `*p` in the callee body can see the underlying
+   * global and potentially fold to its initializer. */
+  int inline_eval_overlay_n; /* number of active overlay entries (0 when inactive) */
+  int inline_eval_overlay_tok[8];
+  SValue inline_eval_overlay_sv[8];
 
   /* __builtin_va_arg_pack() context: when expanding a clone of an
      always_inline variadic function, this points to the token stream
@@ -1074,6 +1314,17 @@ struct TCCState
   /* sections */
   Section **sections;
   int nb_sections; /* number of sections, including first dummy section */
+
+  /* Hash table for fast section name lookup (avoids linear scan) */
+  Section **section_ht;         /* open-addressing hash table: name → Section* */
+  unsigned int section_ht_mask; /* table size - 1 (power of 2) */
+  int section_ht_count;         /* number of entries */
+
+  /* Tracking list of UNDEF symbol indices in symtab for fast alacarte
+     resolution.  Append-only; entries may become defined later. */
+  int *undef_sym_list;
+  int nb_undef_syms;
+  int undef_sym_alloc;
 
   Section **priv_sections;
   int nb_priv_sections; /* number of private sections */
@@ -1123,6 +1374,8 @@ struct TCCState
 
   /* Is there a new undefined sym since last new_undef_sym() */
   int new_undef_sym;
+  /* Number of archive members loaded in current group rescan pass */
+  int group_rescan_loaded;
   /* extra attributes (eg. GOT/PLT value) for symtab symbols */
   struct sym_attr *sym_attrs;
   int nb_sym_attrs;
@@ -1145,6 +1398,37 @@ struct TCCState
   int total_lines;
   unsigned int total_bytes;
   unsigned int total_output[4];
+  unsigned int bench_file_open_time;
+  unsigned int bench_file_open_count;
+  unsigned int bench_library_resolve_time;
+  unsigned int bench_library_resolve_count;
+  unsigned int bench_compile_setup_time;
+  unsigned int bench_compile_setup_count;
+  unsigned int bench_compile_exec_time;
+  unsigned int bench_compile_exec_count;
+  unsigned int bench_compile_finalize_time;
+  unsigned int bench_compile_finalize_count;
+  unsigned int bench_function_body_time;
+  unsigned int bench_function_body_count;
+  unsigned int bench_function_opt_time;
+  unsigned int bench_function_opt_count;
+  unsigned int bench_function_alloc_time;
+  unsigned int bench_function_alloc_count;
+  unsigned int bench_function_codegen_time;
+  unsigned int bench_function_codegen_count;
+  unsigned int bench_compile_time;
+  unsigned int bench_compile_count;
+  unsigned int bench_object_load_time;
+  unsigned int bench_object_load_count;
+  unsigned int bench_archive_load_time;
+  unsigned int bench_archive_load_count;
+  unsigned int bench_archive_member_count;
+  unsigned int bench_dll_load_time;
+  unsigned int bench_dll_load_count;
+  unsigned int bench_ldscript_load_time;
+  unsigned int bench_ldscript_load_count;
+  unsigned int bench_output_time;
+  unsigned int bench_output_count;
 
   /* option -dnum (for general development purposes) */
   int g_debug;
@@ -1158,6 +1442,9 @@ struct TCCState
   unsigned long current_archive_offset;
   /* Archive file path for lazy loading (NULL if not in archive) */
   const char *current_archive_path;
+  /* Cached archive symbol tables for --start-group rescan avoidance */
+  ArchiveSymbolCache *archive_sym_caches;
+  int nb_archive_sym_caches;
 
   /* Phase 2: Garbage Collection During Loading */
   LazyObjectFile **lazy_objfiles; /* Array of lazy-loaded object files */
@@ -1179,6 +1466,7 @@ struct TCCState
   NestedFunc *nested_funcs;
   int nb_nested_funcs;
   int nested_funcs_capacity;
+  int had_nested_funcs;
   NestedFunc *current_nested_func; /* nested func currently being compiled */
   int rt_num_callers;
   int parameters_registers;
@@ -1225,6 +1513,35 @@ struct TCCState
      These are recorded during parsing and resolved after codegen
      when label ELF symbol values are known. */
   struct LabelDiffFixup *label_diff_fixups;
+};
+
+/* String/memory builtin IDs for table-driven dispatch.
+ * Used by tccgen.c and ir/opt.c to avoid repeated strcmp. */
+enum StrBuiltinId
+{
+  STRBI_UNKNOWN = 0,
+  STRBI_STRLEN,
+  STRBI_STRNLEN,
+  STRBI_STRCMP,
+  STRBI_STRNCMP,
+  STRBI_STRCPY,
+  STRBI_STRNCPY,
+  STRBI_STPCPY,
+  STRBI_STPNCPY,
+  STRBI_STRCAT,
+  STRBI_STRNCAT,
+  STRBI_STRCHR,
+  STRBI_STRRCHR,
+  STRBI_STRSTR,
+  STRBI_STRPBRK,
+  STRBI_STRCSPN,
+  STRBI_MEMCMP,
+  STRBI_MEMCHR,
+  STRBI_MEMMOVE,
+  STRBI_BCOPY,
+  STRBI_MEMPCPY,
+  STRBI_INDEX,
+  STRBI_RINDEX,
 };
 
 /* A deferred fixup for a label-difference expression (&&sym1 - &&sym2)
@@ -1452,6 +1769,124 @@ enum tcc_token
 /* keywords: tok >= TOK_IDENT && tok < TOK_UIDENT */
 #define TOK_UIDENT TOK_DEFINE
 
+static inline int resolve_str_builtin_by_tok(int tok)
+{
+  switch (tok)
+  {
+  case TOK_builtin_strlen:
+    return STRBI_STRLEN;
+  case TOK_builtin_strnlen:
+    return STRBI_STRNLEN;
+  case TOK_builtin_strcmp:
+    return STRBI_STRCMP;
+  case TOK_builtin_strncmp:
+    return STRBI_STRNCMP;
+  case TOK_builtin_strcpy:
+    return STRBI_STRCPY;
+  case TOK_builtin_strncpy:
+    return STRBI_STRNCPY;
+  case TOK_builtin_stpcpy:
+    return STRBI_STPCPY;
+  case TOK_builtin_stpncpy:
+    return STRBI_STPNCPY;
+  case TOK_builtin_strcat:
+    return STRBI_STRCAT;
+  case TOK_builtin_strncat:
+    return STRBI_STRNCAT;
+  case TOK_builtin_strchr:
+    return STRBI_STRCHR;
+  case TOK_builtin_strrchr:
+    return STRBI_STRRCHR;
+  case TOK_builtin_strstr:
+    return STRBI_STRSTR;
+  case TOK_builtin_strpbrk:
+    return STRBI_STRPBRK;
+  case TOK_builtin_strcspn:
+    return STRBI_STRCSPN;
+  case TOK_builtin_memcmp:
+    return STRBI_MEMCMP;
+  case TOK_builtin_memchr:
+    return STRBI_MEMCHR;
+  case TOK_builtin_memmove:
+    return STRBI_MEMMOVE;
+  case TOK_builtin_mempcpy:
+    return STRBI_MEMPCPY;
+  default:
+    return STRBI_UNKNOWN;
+  }
+}
+
+static inline int resolve_str_builtin_id(int tok, const char *name)
+{
+  static const struct
+  {
+    const char *name;
+    int id;
+  } map[] = {{"strlen", STRBI_STRLEN},           {"__tcc_strlen", STRBI_STRLEN},
+             {"strnlen", STRBI_STRNLEN},         {"strcmp", STRBI_STRCMP},
+             {"__tcc_strcmp", STRBI_STRCMP},     {"strncmp", STRBI_STRNCMP},
+             {"__tcc_strncmp", STRBI_STRNCMP},   {"strcpy", STRBI_STRCPY},
+             {"__tcc_strcpy", STRBI_STRCPY},     {"strncpy", STRBI_STRNCPY},
+             {"__tcc_strncpy", STRBI_STRNCPY},   {"stpcpy", STRBI_STPCPY},
+             {"__tcc_stpcpy", STRBI_STPCPY},     {"stpncpy", STRBI_STPNCPY},
+             {"__tcc_stpncpy", STRBI_STPNCPY},   {"strcat", STRBI_STRCAT},
+             {"__tcc_strcat", STRBI_STRCAT},     {"strncat", STRBI_STRNCAT},
+             {"__tcc_strncat", STRBI_STRNCAT},   {"strchr", STRBI_STRCHR},
+             {"__tcc_strchr", STRBI_STRCHR},     {"strrchr", STRBI_STRRCHR},
+             {"__tcc_strrchr", STRBI_STRRCHR},   {"strstr", STRBI_STRSTR},
+             {"__tcc_strstr", STRBI_STRSTR},     {"strpbrk", STRBI_STRPBRK},
+             {"__tcc_strpbrk", STRBI_STRPBRK},   {"strcspn", STRBI_STRCSPN},
+             {"__tcc_strcspn", STRBI_STRCSPN},   {"memcmp", STRBI_MEMCMP},
+             {"memchr", STRBI_MEMCHR},           {"memmove", STRBI_MEMMOVE},
+             {"__tcc_memmove", STRBI_MEMMOVE},   {"bcopy", STRBI_BCOPY},
+             {"__tcc_bcopy", STRBI_BCOPY},       {"mempcpy", STRBI_MEMPCPY},
+             {"__tcc_mempcpy", STRBI_MEMPCPY},   {"index", STRBI_INDEX},
+             {"rindex", STRBI_RINDEX},           {"__builtin_index", STRBI_INDEX},
+             {"__builtin_rindex", STRBI_RINDEX}, {NULL, STRBI_UNKNOWN}};
+  int id = resolve_str_builtin_by_tok(tok);
+  if (id != STRBI_UNKNOWN)
+    return id;
+  if (!name)
+    return STRBI_UNKNOWN;
+  for (int i = 0; map[i].name; i++)
+  {
+    if (strcmp(name, map[i].name) == 0)
+      return map[i].id;
+  }
+  return STRBI_UNKNOWN;
+}
+
+/* Returns 1 if this STRBI id is a "simple redirect" target that the IR
+   optimizer will replace with a __tcc_* helper call.  Inlining these
+   functions defeats the redirect and can preserve unwanted side-effects
+   (e.g. test-harness abort checks) that the helper avoids. */
+static inline int strbi_is_redirect_target(int id)
+{
+  switch (id)
+  {
+  case STRBI_MEMMOVE:
+  case STRBI_BCOPY:
+  case STRBI_MEMPCPY:
+  case STRBI_STRCAT:
+  case STRBI_STRCHR:
+  case STRBI_INDEX:
+  case STRBI_STRCPY:
+  case STRBI_STPCPY:
+  case STRBI_STPNCPY:
+  case STRBI_STRNLEN:
+  case STRBI_STRPBRK:
+  case STRBI_STRRCHR:
+  case STRBI_RINDEX:
+  case STRBI_STRSTR:
+  case STRBI_STRCSPN:
+  case STRBI_STRNCPY:
+  case STRBI_STRNCAT:
+    return 1;
+  default:
+    return 0;
+  }
+}
+
 /* ------------ libtcc.c ------------ */
 
 ST_DATA struct TCCState *tcc_state;
@@ -1557,6 +1992,7 @@ ST_FUNC void tcc_add_btstub(TCCState *s1);
 #endif
 ST_FUNC void tcc_add_pragma_libs(TCCState *s1);
 PUB_FUNC int tcc_add_library_err(TCCState *s, const char *f);
+PUB_FUNC void tcc_bench_log(TCCState *s1, const char *operation, const char *name, unsigned elapsed_ms);
 PUB_FUNC void tcc_print_stats(TCCState *s, unsigned total_time);
 PUB_FUNC int tcc_parse_args(TCCState *s, int *argc, char ***argv, int optind);
 #ifdef _WIN32
@@ -1627,6 +2063,7 @@ ST_FUNC int tok_alloc_const(const char *str);
 ST_FUNC const char *get_tok_str(int v, CValue *cv);
 ST_FUNC void begin_macro(TokenString *str, int alloc);
 ST_FUNC void end_macro(void);
+ST_FUNC void end_macro_to(TokenString *target);
 ST_FUNC int set_idnum(int c, int val);
 ST_INLN void tok_str_new(TokenString *s);
 ST_FUNC TokenString *tok_str_alloc(void);
@@ -1652,6 +2089,10 @@ ST_FUNC void tccpp_new(TCCState *s);
 ST_FUNC void tccpp_delete(TCCState *s);
 ST_FUNC void tccpp_putfile(const char *filename);
 ST_FUNC int tcc_preprocess(TCCState *s1);
+ST_FUNC int tcc_pch_generate(TCCState *s1, const char *filename, int filetype);
+ST_FUNC int tcc_pch_try_load(TCCState *s1, int filetype);
+ST_FUNC void tcc_pch_free(TCCState *s1);
+ST_FUNC void tcc_pch_auto_reset(TCCState *s1);
 ST_FUNC void skip(int c);
 ST_FUNC NORETURN void expect(const char *msg);
 ST_FUNC void pp_error(CString *cs);
@@ -1699,6 +2140,7 @@ ST_DATA CType func_vt;     /* current function return type (used by return instr
 ST_DATA int func_var;      /* true if current function is variadic */
 ST_DATA int func_vc;
 ST_DATA int func_ind;
+ST_DATA int func_has_label_addr; /* true if current function uses &&label (computed goto) */
 ST_DATA const char *funcname;
 
 ST_FUNC void tccgen_init(TCCState *s1);
@@ -1826,6 +2268,8 @@ ST_FUNC void tcc_gc_mark_phase(TCCState *s1);
 ST_FUNC void tcc_load_referenced_sections(TCCState *s1);
 ST_FUNC void tcc_free_lazy_objfiles(TCCState *s1);
 ST_FUNC int tcc_load_archive(TCCState *s1, int fd, int alacarte);
+ST_FUNC void tcc_archive_cache_free(TCCState *s1);
+ST_FUNC int tcc_group_has_satisfiable_undefs(TCCState *s1);
 ST_FUNC void add_array(TCCState *s1, const char *sec, int c);
 
 ST_FUNC struct sym_attr *get_sym_attr(TCCState *s1, int index, int alloc);
@@ -1909,38 +2353,15 @@ ST_FUNC void o(unsigned int c);
 ST_FUNC void gen_vla_sp_save(int addr);
 ST_FUNC void gen_vla_sp_restore(int addr);
 ST_FUNC void gen_vla_alloc(CType *type, int align);
+ST_FUNC addr_t gen_nested_func_trampoline(Sym *chain_slot_sym, Sym *func_sym);
 
-static inline uint16_t read16le(unsigned char *p)
-{
-  return p[0] | (uint16_t)p[1] << 8;
-}
-static inline void write16le(unsigned char *p, uint16_t x)
-{
-  p[0] = x & 255;
-  p[1] = x >> 8 & 255;
-}
-static inline uint32_t read32le(unsigned char *p)
-{
-  return read16le(p) | (uint32_t)read16le(p + 2) << 16;
-}
-static inline void write32le(unsigned char *p, uint32_t x)
-{
-  write16le(p, x);
-  write16le(p + 2, x >> 16);
-}
-static inline void add32le(unsigned char *p, int32_t x)
-{
-  write32le(p, read32le(p) + x);
-}
-static inline uint64_t read64le(unsigned char *p)
-{
-  return read32le(p) | (uint64_t)read32le(p + 4) << 32;
-}
-static inline void write64le(unsigned char *p, uint64_t x)
-{
-  write32le(p, x);
-  write32le(p + 4, x >> 32);
-}
+ST_FUNC uint16_t read16le(unsigned char *p);
+ST_FUNC void write16le(unsigned char *p, uint16_t x);
+ST_FUNC uint32_t read32le(unsigned char *p);
+ST_FUNC void write32le(unsigned char *p, uint32_t x);
+ST_FUNC void add32le(unsigned char *p, int32_t x);
+ST_FUNC uint64_t read64le(unsigned char *p);
+ST_FUNC void write64le(unsigned char *p, uint64_t x);
 static inline void add64le(unsigned char *p, int64_t x)
 {
   write64le(p, read64le(p) + x);
@@ -2013,48 +2434,7 @@ ST_FUNC void gen_cvt_sxtw(void);
 ST_FUNC void gen_cvt_csti(int t);
 #endif
 
-typedef struct FloatingPointConfig
-{
-  int8_t reg_size;
-  int8_t reg_count;
-  int8_t stack_align;
-  int32_t has_fadd : 1;
-  int32_t has_fsub : 1;
-  int32_t has_fmul : 1;
-  int32_t has_fdiv : 1;
-  int32_t has_fcmp : 1;
-  int32_t has_ftof : 1;
-  int32_t has_itof : 1;
-  int32_t has_ftod : 1;
-  int32_t has_ftoi : 1;
-  int32_t has_dadd : 1;
-  int32_t has_dsub : 1;
-  int32_t has_dmul : 1;
-  int32_t has_ddiv : 1;
-  int32_t has_dcmp : 1;
-  int32_t has_dtof : 1;
-  int32_t has_itod : 1;
-  int32_t has_dtoi : 1;
-  int32_t has_ltod : 1;
-  int32_t has_ltof : 1;
-  int32_t has_dtol : 1;
-  int32_t has_ftol : 1;
-  int32_t has_fneg : 1;
-  int32_t has_dneg : 1;
-} FloatingPointConfig;
-
-typedef struct ArchitectureConfig
-{
-  int8_t pointer_size;
-  int8_t stack_align;
-  int8_t reg_size;
-  int8_t parameter_registers;
-  int8_t has_fpu : 1;
-  int8_t static_chain_reg; /* register used for static chain (e.g., R10 for ARM) */
-  const FloatingPointConfig *fpu;
-} ArchitectureConfig;
-
-extern ArchitectureConfig architecture_config;
+#include "tcc_target.h"
 
 /* ------------ arm-gen.c ------------ */
 #if defined(TCC_TARGET_ARM) || defined(TCC_TARGET_ARM_THUMB)
@@ -2217,11 +2597,17 @@ ST_FUNC void tcc_machine_load_jmp_result(int dest_reg, int jmp_addr, int invert)
 
 ST_FUNC void tcc_gen_machine_data_processing_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest,
                                                  TccIrOp op);
+ST_FUNC void tcc_gen_machine_data_processing_mop_flags(MachineOperand src1, MachineOperand src2, MachineOperand dest,
+                                                       TccIrOp op);
+ST_FUNC void tcc_gen_machine_cmp_eq64_mop(MachineOperand src1, MachineOperand src2);
+ST_FUNC void tcc_gen_machine_ubfx_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest);
 ST_FUNC void tcc_gen_machine_assign_mop(MachineOperand src, MachineOperand dest, TccIrOp op);
 ST_FUNC void tcc_gen_machine_setif_mop(MachineOperand src, MachineOperand dest, TccIrOp op);
 ST_FUNC void tcc_gen_machine_bool_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest, TccIrOp op);
 ST_FUNC void tcc_gen_machine_load_mop(MachineOperand src, MachineOperand dest, TccIrOp op);
 ST_FUNC void tcc_gen_machine_store_mop(MachineOperand dest, MachineOperand src, TccIrOp op);
+ST_FUNC void tcc_gen_machine_store_spill(int src_reg, int32_t spill_offset);
+ST_FUNC int tcc_gen_machine_try_strd_spill(int reg1, int32_t off1, int reg2, int32_t off2);
 ST_FUNC void tcc_gen_machine_load_indexed_mop(MachineOperand dest, MachineOperand base, MachineOperand index,
                                               MachineOperand scale, TccIrOp op);
 ST_FUNC void tcc_gen_machine_store_indexed_mop(MachineOperand base, MachineOperand index, MachineOperand scale,
@@ -2240,6 +2626,9 @@ ST_FUNC void tcc_gen_machine_lea_mop(MachineOperand dest, MachineOperand src);
 ST_FUNC int tcc_gen_machine_number_of_registers(void);
 ST_FUNC void tcc_gen_machine_return_value_mop(MachineOperand src, TccIrOp op);
 ST_FUNC void tcc_gen_machine_muldiv_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest, TccIrOp op);
+ST_FUNC int tcc_gen_machine_mul_const_add_fused_mop(MachineOperand mul_var, int64_t mul_const,
+                                                    MachineOperand mul_dest, MachineOperand add_base,
+                                                    MachineOperand add_dest);
 ST_FUNC void tcc_gen_machine_mla_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest,
                                      MachineOperand accum);
 ST_FUNC void tcc_gen_machine_umull_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest);
@@ -2254,8 +2643,11 @@ ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand ca
 ST_FUNC int tcc_gen_machine_abi_assign_call_args(const TCCAbiArgDesc *args, int argc, TCCAbiCallLayout *out_layout);
 ST_FUNC void tcc_gen_machine_save_call_context(void);
 ST_FUNC void tcc_gen_machine_restore_call_context(void);
-ST_FUNC void tcc_gen_machine_jump_mop(TccIrOp op, int32_t target_ir, int ir_idx);
-ST_FUNC void tcc_gen_machine_conditional_jump_mop(int32_t condition, TccIrOp op, int32_t target_ir, int ir_idx);
+ST_FUNC int tcc_gen_machine_jump_mop(TccIrOp op, int32_t target_ir, int ir_idx);
+ST_FUNC int tcc_gen_machine_conditional_jump_mop(int32_t condition, TccIrOp op, int32_t target_ir, int ir_idx);
+ST_FUNC int tcc_gen_machine_pending_pool_size(void);
+ST_FUNC int tcc_gen_machine_cbz_jump_mop(int rn, int nonzero, int32_t target_ir, int ir_idx);
+ST_FUNC int tcc_gen_machine_switch_table_dry_run_size(int num_entries);
 ST_FUNC void tcc_gen_machine_switch_table_mop(MachineOperand src, struct TCCIRSwitchTable *table, struct TCCIRState *ir,
                                               int ir_idx);
 ST_FUNC void tcc_gen_machine_set_chain(void);
@@ -2272,6 +2664,7 @@ ST_FUNC int tcc_gen_machine_dry_run_get_lr_push_count(void);
 ST_FUNC uint32_t tcc_gen_machine_dry_run_get_scratch_regs_pushed(void);
 ST_FUNC void tcc_gen_machine_reset_scratch_state(void);
 ST_FUNC int tcc_gen_machine_dry_run_is_active(void);
+ST_FUNC int tcc_gen_machine_real_run_had_scratch_push(void);
 /* Phase-3 per-instruction scratch constraint recording.
  * Call reset before each mop-dispatched instruction (in both dry-run and
  * real-emit passes); call count after to read how many scratch registers the
@@ -2284,6 +2677,11 @@ ST_FUNC uint16_t tcc_gen_machine_insn_scratch_saves_mask(void);
 ST_FUNC void tcc_gen_machine_branch_opt_init(void);
 ST_FUNC void tcc_gen_machine_branch_opt_analyze(uint32_t *ir_to_code_mapping, int mapping_size);
 ST_FUNC int tcc_gen_machine_branch_opt_get_encoding(int ir_index); /* Returns 16 or 32 */
+
+/* Reset the MOV-coalescing register-equivalence cache at IR instruction
+ * boundaries (any IR op may be a branch target, so cross-IR equivalences
+ * cannot be trusted). */
+ST_FUNC void tcc_gen_machine_mov_coalesce_reset(void);
 
 /* Trap instruction generation */
 ST_FUNC void tcc_gen_machine_trap_mop(void);
@@ -2300,6 +2698,13 @@ ST_FUNC void tcc_gen_machine_nl_longjmp_mop(MachineOperand buf);
 /* __builtin_apply_args / __builtin_apply instruction generation */
 ST_FUNC void tcc_gen_machine_builtin_apply_args_mop(MachineOperand dest);
 ST_FUNC void tcc_gen_machine_builtin_apply_mop(MachineOperand fn, MachineOperand args, MachineOperand dest);
+
+/* Block copy from const data to stack (LDM/STM on ARM) */
+ST_FUNC void tcc_gen_machine_block_copy_mop(TCCIRState *ir, IROperand dest, IROperand src, int size);
+
+/* Conditional select: dest = (cond) ? then_val : else_val (ITE on ARM) */
+ST_FUNC void tcc_gen_machine_select_mop(MachineOperand then_val, MachineOperand else_val, MachineOperand dest,
+                                        int cond_code);
 
 /* MachineOperand load/store into specific physical registers (for inline asm) */
 void tcc_gen_mach_load_to_reg(int dest_reg, const MachineOperand *op);

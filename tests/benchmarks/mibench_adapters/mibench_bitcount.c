@@ -4,7 +4,7 @@
  * Tests various bit counting algorithms.
  */
 
-#include "benchmarks.h"
+#include "../benchmarks.h"
 
 /* Bit counting functions from MiBench */
 

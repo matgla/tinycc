@@ -21,8 +21,14 @@
 #include "tcc.h"
 #include "tcctools.c"
 
+#if defined(TCC_IS_NATIVE) && defined(TARGETOS_YasOS)
+#include <sys/perf.h>
+#endif
+
 static const char help[] = "Tiny C Compiler " TCC_VERSION " - Copyright (C) 2001-2006 Fabrice Bellard\n"
                            "Usage: tcc [options...] [-o outfile] [-c] infile(s)...\n"
+                           "       tcc [options...] -generate-pch header [-o outfile]\n"
+                           "       tcc [options...] -use-pch file infile(s)...\n"
                            "       tcc [options...] -run infile (or --) [arguments...]\n"
                            "General options:\n"
                            "  -c           compile only - generate an object file\n"
@@ -42,6 +48,8 @@ static const char help[] = "Tiny C Compiler " TCC_VERSION " - Copyright (C) 2001
                            "  -Dsym[=val]  define 'sym' with value 'val'\n"
                            "  -Usym        undefine 'sym'\n"
                            "  -E           preprocess only\n"
+                           "  -generate-pch file  generate a preprocessor-only PCH from 'file'\n"
+                           "  -use-pch file       load a preprocessor-only PCH snapshot\n"
                            "Linker options:\n"
                            "  -Ldir        add library path 'dir'\n"
                            "  -llib        link with dynamic or static library 'lib'\n"
@@ -272,22 +280,13 @@ static char *default_outputfile(TCCState *s, const char *first_file)
     strcpy(ext, ".exe");
   else
 #endif
-      if ((s->just_deps || s->output_type == TCC_OUTPUT_OBJ) && !s->option_r && *ext)
+  if (s->output_type == TCC_OUTPUT_PCH && *ext)
+    strcpy(ext, ".pch");
+  else if ((s->just_deps || s->output_type == TCC_OUTPUT_OBJ) && !s->option_r && *ext)
     strcpy(ext, ".o");
   else
     strcpy(buf, "a.out");
   return tcc_strdup(buf);
-}
-
-static unsigned getclock_ms(void)
-{
-#ifdef _WIN32
-  return GetTickCount();
-#else
-  struct timeval tv;
-  gettimeofday(&tv, NULL);
-  return tv.tv_sec * 1000 + (tv.tv_usec + 500) / 1000;
-#endif
 }
 
 int main(int argc0, char **argv0)
@@ -382,6 +381,19 @@ redo:
           tcc_error_noabort("could not write '%s'", s->outfile);
       }
     }
+    else if (s->output_type == TCC_OUTPUT_PCH)
+    {
+      if (s->nb_libraries)
+        tcc_error_noabort("cannot specify libraries with -generate-pch");
+      else if (s->pch_infile)
+        tcc_error_noabort("cannot combine -generate-pch with -use-pch");
+      else if (s->nb_files != 1)
+        tcc_error_noabort("-generate-pch requires exactly one header input");
+      else if (s->option_r)
+        tcc_error_noabort("cannot combine -generate-pch with -r");
+      else if (!s->outfile)
+        s->outfile = default_outputfile(s, s->files[0]->name);
+    }
     else if (s->output_type == TCC_OUTPUT_OBJ && !s->option_r)
     {
       if (s->nb_libraries)
@@ -395,7 +407,7 @@ redo:
       goto cleanup_early;
     }
     if (s->do_bench)
-      start_time = getclock_ms();
+      start_time = tcc_getclock_ms();
   }
 
   set_environment(s);
@@ -461,9 +473,20 @@ redo:
         }
       }
 
+      /* The new_undef_sym flag fires whenever a new SHN_UNDEF symbol is
+         added, even if a later archive in the same pass resolved it or
+         the remaining undefs can only be satisfied by earlier archives
+         in the group.  Only skip the rescan when no currently unresolved
+         symbol is satisfiable by any cached archive. */
+      if (ret == 0 && s->new_undef_sym) {
+        if (!tcc_group_has_satisfiable_undefs(s))
+          s->new_undef_sym = 0;
+      }
+
       while (ret == 0 && s->new_undef_sym)
       {
         s->new_undef_sym = 0;
+        s->group_rescan_loaded = 0;
         for (int i = group_start; i < group_end && ret == 0; ++i)
         {
           struct filespec *g = s->files[i];
@@ -479,6 +502,11 @@ redo:
               ret = tcc_add_file(s, g->name);
           }
         }
+        /* If no archive members were loaded in this rescan pass,
+           further rescans are futile — remaining undefs are linker-
+           script symbols or simply unresolvable by these archives. */
+        if (s->group_rescan_loaded == 0)
+          break;
       }
 
       n = group_end + 1;
@@ -506,13 +534,13 @@ redo:
   } while (++n < s->nb_files && 0 == ret && (s->output_type != TCC_OUTPUT_OBJ || s->option_r));
 
   if (s->do_bench)
-    end_time = getclock_ms();
+    end_time = tcc_getclock_ms();
 
   if (s->run_test)
   {
     t = 0;
   }
-  else if (s->output_type == TCC_OUTPUT_PREPROCESS)
+  else if (s->output_type == TCC_OUTPUT_PREPROCESS || s->output_type == TCC_OUTPUT_PCH)
   {
     ;
   }
@@ -526,7 +554,9 @@ redo:
       if (!s->outfile)
         s->outfile = default_outputfile(s, first_file);
       if (!s->just_deps)
+      {
         ret = tcc_output_file(s, s->outfile);
+      }
       if (!ret && s->gen_deps)
         gen_makedeps(s, s->outfile, s->deps_outfile);
     }
@@ -545,6 +575,11 @@ redo:
     done = 0; /* compile more files with -c */
   else if (s->do_bench)
     tcc_print_stats(s, end_time - start_time);
+
+#if defined(TCC_IS_NATIVE) && defined(TARGETOS_YasOS)
+  if (s->do_bench)
+    perf_dump_print(1);
+#endif
 
   tcc_delete(s);
 

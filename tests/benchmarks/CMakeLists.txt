@@ -40,6 +40,10 @@ if(ENABLE_MIBENCH)
         ${CMAKE_CURRENT_SOURCE_DIR}/mibench_adapters/mibench_sha.c
         ${CMAKE_CURRENT_SOURCE_DIR}/mibench_adapters/mibench_bitcount.c
         ${CMAKE_CURRENT_SOURCE_DIR}/mibench_adapters/mibench_crc32.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/mibench_adapters/mibench_dijkstra.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/mibench_adapters/mibench_qsort.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/mibench_adapters/mibench_rijndael.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/mibench_adapters/mibench_stringsearch.c
         ${CMAKE_CURRENT_SOURCE_DIR}/mibench_adapters/mibench_init.c
     )
     add_definitions(-DENABLE_MIBENCH=1)
@@ -102,6 +106,7 @@ if(BENCHMARK_COMPILER STREQUAL "TCC")
         add_custom_command(
             OUTPUT ${obj}
             COMMAND ${TCC_EXE} -c ${BENCH_ARCH_FLAGS} -O${BENCHMARK_OPT_LEVEL} -g
+                -DBENCHMARK_OPT_LEVEL=${BENCHMARK_OPT_LEVEL}
                 -I${CMAKE_CURRENT_SOURCE_DIR}
                 -I${CMAKE_CURRENT_SOURCE_DIR}/../../include
                 ${src} -o ${obj}
@@ -138,6 +143,7 @@ elseif(BENCHMARK_COMPILER STREQUAL "GCC")
         -fdata-sections
         -g
     )
+    target_compile_definitions(benchmark_lib_gcc PRIVATE BENCHMARK_OPT_LEVEL=${BENCHMARK_OPT_LEVEL})
 
     target_include_directories(benchmark_lib_gcc PRIVATE ${BENCH_INCLUDE_DIRS})
 
@@ -159,6 +165,7 @@ add_executable(minimal_uart_picosdk${BENCHMARK_EXECUTABLE_SUFFIX}
     minimal_uart_picosdk.c
     benchmark_main.c
     cycle_counter.c
+    hardfault_handler.c
 )
 
 # Link to Pico SDK libraries
@@ -167,6 +174,7 @@ target_link_libraries(minimal_uart_picosdk${BENCHMARK_EXECUTABLE_SUFFIX}
     pico_stdlib
     hardware_uart
     hardware_gpio
+    hardware_timer
     ${BENCHMARK_LIB}
 )
 

@@ -67,41 +67,13 @@ extern "C" {
  * when they are fully supported.
  */
 
-/* For now, these are inline implementations that access the components */
-static inline double creal(double _Complex z)
-{
-    return (double)z;  /* Casting complex to real extracts real part */
-}
+extern double creal(double _Complex z);
+extern float crealf(float _Complex z);
+extern long double creall(long double _Complex z);
 
-static inline float crealf(float _Complex z)
-{
-    return (float)z;
-}
-
-static inline long double creall(long double _Complex z)
-{
-    return (long double)z;
-}
-
-/*
- * Imaginary part access - these will be fully implemented
- * when __imag__ operator support is complete.
- */
-static inline double cimag(double _Complex z)
-{
-    /* Placeholder - full implementation needs __imag__ support */
-    return 0.0;
-}
-
-static inline float cimagf(float _Complex z)
-{
-    return 0.0f;
-}
-
-static inline long double cimagl(long double _Complex z)
-{
-    return 0.0L;
-}
+extern double cimag(double _Complex z);
+extern float cimagf(float _Complex z);
+extern long double cimagl(long double _Complex z);
 
 /*
  * Conjugate functions - return the complex conjugate.

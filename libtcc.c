@@ -668,12 +668,21 @@ ST_FUNC int tcc_open(TCCState *s1, const char *filename)
 /* compile the file opened in 'file'. Return non zero if errors. */
 static int tcc_compile(TCCState *s1, int filetype, const char *str, int fd)
 {
+  unsigned compile_start = 0;
+  unsigned phase_start = 0;
+
   /* Here we enter the code section where we use the global variables for
      parsing and code generation (tccpp.c, tccgen.c, <target>-gen.c).
      Other threads need to wait until we're done.
 
      Alternatively we could use thread local storage for those global
      variables, which may or may not have advantages */
+
+  if (s1->do_bench)
+  {
+    compile_start = tcc_getclock_ms();
+    phase_start = compile_start;
+  }
 
   tcc_enter_state(s1);
   s1->error_set_jmp_enabled = 1;
@@ -697,13 +706,28 @@ static int tcc_compile(TCCState *s1, int filetype, const char *str, int fd)
     preprocess_start(s1, filetype);
     tccgen_init(s1);
 
+    if (s1->output_type != TCC_OUTPUT_PREPROCESS && s1->output_type != TCC_OUTPUT_PCH)
+      tccelf_begin_file(s1);
+
+    if (s1->do_bench)
+    {
+      unsigned elapsed = tcc_getclock_ms() - phase_start;
+      s1->bench_compile_setup_time += elapsed;
+      s1->bench_compile_setup_count++;
+      tcc_bench_log(s1, "compile-setup", str, elapsed);
+      phase_start = tcc_getclock_ms();
+    }
+
     if (s1->output_type == TCC_OUTPUT_PREPROCESS)
     {
       tcc_preprocess(s1);
     }
+    else if (s1->output_type == TCC_OUTPUT_PCH)
+    {
+      tcc_pch_generate(s1, str, filetype);
+    }
     else
     {
-      tccelf_begin_file(s1);
       if (filetype & (AFF_TYPE_ASM | AFF_TYPE_ASMPP))
       {
         tcc_assemble(s1, !!(filetype & AFF_TYPE_ASMPP));
@@ -712,13 +736,36 @@ static int tcc_compile(TCCState *s1, int filetype, const char *str, int fd)
       {
         tccgen_compile(s1);
       }
-      tccelf_end_file(s1);
     }
+
+    if (s1->do_bench)
+    {
+      unsigned elapsed = tcc_getclock_ms() - phase_start;
+      s1->bench_compile_exec_time += elapsed;
+      s1->bench_compile_exec_count++;
+      tcc_bench_log(s1, "compile-exec", str, elapsed);
+      phase_start = tcc_getclock_ms();
+    }
+
+    if (s1->output_type != TCC_OUTPUT_PREPROCESS && s1->output_type != TCC_OUTPUT_PCH)
+      tccelf_end_file(s1);
   }
   tccgen_finish(s1);
   preprocess_end(s1);
   s1->error_set_jmp_enabled = 0;
   tcc_exit_state(s1);
+  if (s1->do_bench)
+  {
+    unsigned now = tcc_getclock_ms();
+    unsigned finalize_elapsed = now - phase_start;
+    unsigned elapsed = now - compile_start;
+    s1->bench_compile_finalize_time += finalize_elapsed;
+    s1->bench_compile_finalize_count++;
+    tcc_bench_log(s1, "compile-finalize", str, finalize_elapsed);
+    s1->bench_compile_time += elapsed;
+    s1->bench_compile_count++;
+    tcc_bench_log(s1, filetype & (AFF_TYPE_ASM | AFF_TYPE_ASMPP) ? "assemble" : "compile", str, elapsed);
+  }
   return s1->nb_errors != 0 ? -1 : 0;
 }
 
@@ -758,7 +805,7 @@ LIBTCCAPI TCCState *tcc_new(void)
   s->tcc_ext = 1;
   s->nocommon = 1;
   s->dollars_in_identifiers = 1; /*on by default like in gcc/clang*/
-  s->cversion = 199901;          /* default unless -std=c11 is supplied */
+  s->cversion = 201112;          /* default to C11 */
   s->warn_implicit_function_declaration = 1;
   s->warn_discarded_qualifiers = 1;
   s->ms_extensions = 1;
@@ -788,6 +835,7 @@ LIBTCCAPI TCCState *tcc_new(void)
   s->ppfp = stdout;
   /* might be used in error() before preprocess_start() */
   s->include_stack_ptr = s->include_stack;
+  s->pch_auto_enabled = 1;
 
   tcc_set_lib_path(s, CONFIG_TCCDIR);
   return s;
@@ -803,6 +851,9 @@ LIBTCCAPI void tcc_delete(TCCState *s1)
   /* free lazy object files (Phase 2 GC) */
   tcc_free_lazy_objfiles(s1);
 
+  /* free cached archive symbol tables */
+  tcc_archive_cache_free(s1);
+
   /* free sections */
   tccelf_delete(s1);
 
@@ -813,6 +864,7 @@ LIBTCCAPI void tcc_delete(TCCState *s1)
   /* free include paths */
   dynarray_reset(&s1->include_paths, &s1->nb_include_paths);
   dynarray_reset(&s1->sysinclude_paths, &s1->nb_sysinclude_paths);
+  tcc_pch_auto_reset(s1);
 
   tcc_free(s1->tcc_lib_path);
   tcc_free(s1->soname);
@@ -823,7 +875,9 @@ LIBTCCAPI void tcc_delete(TCCState *s1)
   tcc_free(s1->mapfile);
   tcc_free(s1->outfile);
   tcc_free(s1->deps_outfile);
+  tcc_free(s1->pch_infile);
   tcc_free(s1->linker_script);
+  tcc_pch_free(s1);
   if (s1->ld_script)
   {
     ld_script_cleanup(s1->ld_script);
@@ -878,7 +932,7 @@ LIBTCCAPI int tcc_set_output_type(TCCState *s, int output_type)
     tcc_add_sysinclude_path(s, CONFIG_TCC_SYSINCLUDEPATHS);
   }
 
-  if (output_type == TCC_OUTPUT_PREPROCESS)
+  if (output_type == TCC_OUTPUT_PREPROCESS || output_type == TCC_OUTPUT_PCH)
   {
     s->do_debug = 0;
     return 0;
@@ -948,6 +1002,8 @@ static int guess_filetype(const char *filename);
 ST_FUNC int tcc_add_file_internal(TCCState *s1, const char *filename, int flags)
 {
   int fd, ret = -1;
+  unsigned open_start = 0;
+  unsigned elapsed = 0;
 
   if (0 == (flags & AFF_TYPE_MASK))
     flags |= guess_filetype(filename);
@@ -957,7 +1013,16 @@ ST_FUNC int tcc_add_file_internal(TCCState *s1, const char *filename, int flags)
     return 0;
 
   /* open the file */
+  if (s1->do_bench)
+    open_start = tcc_getclock_ms();
   fd = _tcc_open(s1, filename);
+  if (s1->do_bench)
+  {
+    elapsed = tcc_getclock_ms() - open_start;
+    s1->bench_file_open_time += elapsed;
+    s1->bench_file_open_count++;
+    tcc_bench_log(s1, "open", filename, elapsed);
+  }
   if (fd < 0)
   {
     if (flags & AFF_PRINT_ERROR)
@@ -994,7 +1059,9 @@ ST_FUNC int tcc_add_file_internal(TCCState *s1, const char *filename, int flags)
       {
       }
       else
+      {
         ret = tcc_load_dll(s1, fd, filename, (flags & AFF_REFERENCED_DLL) != 0);
+      }
       break;
 
     default:
@@ -1012,7 +1079,8 @@ ST_FUNC int tcc_add_file_internal(TCCState *s1, const char *filename, int flags)
   else
   {
     /* update target deps */
-    dynarray_add(&s1->target_deps, &s1->nb_target_deps, tcc_strdup(filename));
+    if (s1->output_type != TCC_OUTPUT_PCH)
+      dynarray_add(&s1->target_deps, &s1->nb_target_deps, tcc_strdup(filename));
     ret = tcc_compile(s1, flags, filename, fd);
   }
   s1->current_filename = NULL;
@@ -1062,13 +1130,33 @@ static int tcc_add_library_internal(TCCState *s1, const char *fmt, const char *f
 {
   char buf[1024];
   int i, ret;
+  unsigned resolve_start = 0;
+
+  if (s1->do_bench)
+    resolve_start = tcc_getclock_ms();
 
   for (i = 0; i < nb_paths; i++)
   {
     snprintf(buf, sizeof(buf), fmt, paths[i], filename);
     ret = tcc_add_file_internal(s1, buf, flags & ~AFF_PRINT_ERROR);
     if (ret != FILE_NOT_FOUND)
+    {
+      if (s1->do_bench)
+      {
+        unsigned elapsed = tcc_getclock_ms() - resolve_start;
+        s1->bench_library_resolve_time += elapsed;
+        s1->bench_library_resolve_count++;
+        tcc_bench_log(s1, "resolve-lib", buf, elapsed);
+      }
       return ret;
+    }
+  }
+  if (s1->do_bench)
+  {
+    unsigned elapsed = tcc_getclock_ms() - resolve_start;
+    s1->bench_library_resolve_time += elapsed;
+    s1->bench_library_resolve_count++;
+    tcc_bench_log(s1, "resolve-lib", filename, elapsed);
   }
   if (flags & AFF_PRINT_ERROR)
     tcc_error_noabort("library '%s' not found", filename);
@@ -1136,6 +1224,7 @@ LIBTCCAPI int tcc_add_symbol(TCCState *s1, const char *name, const void *val)
 
 LIBTCCAPI void tcc_set_lib_path(TCCState *s, const char *path)
 {
+  tcc_pch_auto_reset(s);
   tcc_free(s->tcc_lib_path);
   s->tcc_lib_path = tcc_strdup(path);
 }
@@ -1453,6 +1542,7 @@ enum
   TCC_OPTION_O,
   TCC_OPTION_mfloat_abi,
   TCC_OPTION_mfpu,
+  TCC_OPTION_march,
   TCC_OPTION_m,
   TCC_OPTION_f,
   TCC_OPTION_isystem,
@@ -1467,6 +1557,10 @@ enum
   TCC_OPTION_run,
   TCC_OPTION_w,
   TCC_OPTION_E,
+  TCC_OPTION_generate_pch,
+  TCC_OPTION_use_pch,
+  TCC_OPTION_verbose_pch,
+  TCC_OPTION_fno_auto_pch,
   TCC_OPTION_M,
   TCC_OPTION_MD,
   TCC_OPTION_MF,
@@ -1501,6 +1595,9 @@ static const TCCOption tcc_options[] = {
     {"-help", TCC_OPTION_HELP, 0},
     {"?", TCC_OPTION_HELP, 0},
     {"hh", TCC_OPTION_HELP2, 0},
+    /* Must appear before the short "-v" option, otherwise "-verbose-pch" is parsed as "-v erbose-pch". */
+    {"verbose-pch", TCC_OPTION_verbose_pch, 0},
+    {"fno-auto-pch", TCC_OPTION_fno_auto_pch, 0},
     {"v", TCC_OPTION_v, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP},
     {"-version", TCC_OPTION_v, 0}, /* handle as verbose, also prints version*/
     {"I", TCC_OPTION_I, TCC_OPTION_HAS_ARG},
@@ -1511,6 +1608,8 @@ static const TCCOption tcc_options[] = {
     {"B", TCC_OPTION_B, TCC_OPTION_HAS_ARG},
     {"l", TCC_OPTION_l, TCC_OPTION_HAS_ARG},
     {"bench", TCC_OPTION_bench, 0},
+    {"generate-pch", TCC_OPTION_generate_pch, TCC_OPTION_HAS_ARG},
+    {"use-pch", TCC_OPTION_use_pch, TCC_OPTION_HAS_ARG},
     {"g", TCC_OPTION_g, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP},
     {"c", TCC_OPTION_c, 0},
     {"dumpmachine", TCC_OPTION_dumpmachine, 0},
@@ -1541,6 +1640,8 @@ static const TCCOption tcc_options[] = {
     {"mfloat-abi", TCC_OPTION_mfloat_abi, TCC_OPTION_HAS_ARG},
     {"mfpu=", TCC_OPTION_mfpu, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP},
     {"mfpu", TCC_OPTION_mfpu, TCC_OPTION_HAS_ARG},
+    {"march=", TCC_OPTION_march, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP},
+    {"march", TCC_OPTION_march, TCC_OPTION_HAS_ARG},
     {"mpic-data-is-text-relative", TCC_OPTION_mpic_data_is_text_relative, 0},
 #endif
     {"m", TCC_OPTION_m, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP},
@@ -1618,13 +1719,22 @@ static const FlagDef options_f[] = {{offsetof(TCCState, char_is_unsigned), 0, "u
                                     {offsetof(TCCState, opt_dead_store), 0, "dead-store-elim"},
                                     {offsetof(TCCState, opt_fp_offset_cache), 0, "fp-offset-cache"},
                                     {offsetof(TCCState, opt_indexed_memory), 0, "indexed-memory"},
+                                    {offsetof(TCCState, opt_disp_fusion), 0, "disp-fusion"},
+                                    {offsetof(TCCState, opt_lea_fold), 0, "lea-fold"},
                                     {offsetof(TCCState, opt_postinc_fusion), 0, "postinc-fusion"},
                                     {offsetof(TCCState, opt_mla_fusion), 0, "mla-fusion"},
                                     {offsetof(TCCState, opt_stack_addr_cse), 0, "stack-addr-cse"},
                                     {offsetof(TCCState, opt_licm), 0, "licm"},
                                     {offsetof(TCCState, opt_strength_red), 0, "strength-red"},
                                     {offsetof(TCCState, opt_iv_strength_red), 0, "iv-strength-red"},
+                                    {offsetof(TCCState, opt_loop_unroll), 0, "loop-unroll"},
+                                    {offsetof(TCCState, opt_loop_rotation), 0, "loop-rotation"},
                                     {offsetof(TCCState, opt_jump_threading), 0, "jump-threading"},
+                                    {offsetof(TCCState, opt_nonneg_fold), 0, "nonneg-fold"},
+                                    {offsetof(TCCState, opt_vrp), 0, "vrp"},
+                                    {offsetof(TCCState, opt_float_narrow), 0, "float-narrow"},
+                                    {offsetof(TCCState, opt_inline_functions), 0, "inline-functions"},
+                                    {offsetof(TCCState, opt_inline_small), 0, "inline-small-functions"},
                                     {offsetof(TCCState, instrument_functions), 0, "instrument-functions"},
                                     {0, 0, NULL}};
 
@@ -1872,6 +1982,12 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
         tcc_warning("-%s: overriding compiler action already specified", popt->name);
       s->output_type = x;
       break;
+    set_output_type_add_file:
+      if (s->output_type)
+        tcc_warning("-%s: overriding compiler action already specified", popt->name);
+      s->output_type = x;
+      args_parser_add_file(s, optarg, AFF_TYPE_C | (s->filetype & ~AFF_TYPE_MASK));
+      break;
     case TCC_OPTION_d:
       if (*optarg == 'D')
         s->dflag = 3;
@@ -1938,6 +2054,14 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
       ++noaction;
       break;
     case TCC_OPTION_f:
+      /* Handle -finline-limit=N */
+      if (!strncmp(optarg, "inline-limit=", 13))
+      {
+        int n = atoi(optarg + 13);
+        if (n > 0)
+          s->opt_inline_limit = n;
+        break;
+      }
       /* Handle -fno-builtin-<name> flags */
       if (!strncmp(optarg, "no-builtin-", 11))
       {
@@ -2034,6 +2158,9 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
         return tcc_error_noabort("unsupported FPU type '%s'", optarg);
       }
       break;
+    case TCC_OPTION_march:
+      s->march_str = optarg;
+      break;
     case TCC_OPTION_mpic_data_is_text_relative:
       printf("Setting text and data separation to: 1\n");
       s->text_and_data_separation = 1;
@@ -2076,6 +2203,19 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
     case TCC_OPTION_E:
       x = TCC_OUTPUT_PREPROCESS;
       goto set_output_type;
+    case TCC_OPTION_generate_pch:
+      x = TCC_OUTPUT_PCH;
+      goto set_output_type_add_file;
+    case TCC_OPTION_use_pch:
+      tcc_free(s->pch_infile);
+      s->pch_infile = tcc_strdup(optarg);
+      break;
+    case TCC_OPTION_verbose_pch:
+      s->pch_verbose = 1;
+      break;
+    case TCC_OPTION_fno_auto_pch:
+      s->pch_auto_enabled = 0;
+      break;
     case TCC_OPTION_P:
       s->Pflag = atoi(optarg) + 1;
       break;
@@ -2128,8 +2268,7 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
         s->opt_dce = 1;
         s->opt_const_prop = 1;
         s->opt_copy_prop = 1;
-        /* cse disabled: miscompiles SHA-1 when combined with copy-prop.
-           Can still be enabled manually with -fcse for debugging. */
+        s->opt_cse = 1;
         s->opt_bool_cse = 1;
         s->opt_bool_idempotent = 1;
         s->opt_bool_simplify = 1;
@@ -2138,6 +2277,8 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
         s->opt_redundant_store = 1;
         s->opt_dead_store = 1;
         s->opt_indexed_memory = 1; /* Fuse SHL+ADD+LOAD/STORE into indexed ops */
+        s->opt_disp_fusion = 1;    /* Fuse ADD+imm+LOAD/STORE into displacement-addressed ops */
+        s->opt_lea_fold = 1;       /* Fold LEA Addr[StackLoc]+deref into direct stack slot access */
         s->opt_postinc_fusion = 1; /* Fuse LOAD/STORE + ADD into post-increment ops */
         s->opt_mla_fusion = 1;     /* Fuse MUL+ADD into MLA */
         /* fp-offset-cache disabled: miscompiles loops when combined with
@@ -2145,12 +2286,24 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
            enabled manually with -ffp-offset-cache for debugging. */
         s->opt_stack_addr_cse = 1;  /* Hoist repeated stack address computations */
         s->opt_licm = 1;            /* Loop-invariant code motion */
+        s->opt_ipc = 1;             /* Interprocedural constant propagation */
         s->opt_strength_red = 1;    /* Strength reduction for multiply */
         s->opt_iv_strength_red = 1; /* IV strength reduction for array loops */
+        s->opt_loop_unroll = 1;    /* Full-unroll small constant-trip-count loops */
+        s->opt_loop_rotation = 1;  /* Rotate top-tested loops to bottom-tested */
         s->opt_nonneg_fold = 1;     /* Non-negative value branch folding */
         s->opt_vrp = 1;             /* Value range propagation branch folding */
         s->opt_float_narrow = 1;    /* Narrow double math to float when safe */
         s->opt_jump_threading = 1;  /* Jump threading optimization */
+        s->opt_inline_small = 1;    /* Inline tiny static/inline functions (≤30 words) */
+        if (!s->opt_inline_limit)
+          s->opt_inline_limit = 30;
+      }
+      if (s->optimize >= 2)
+      {
+        s->opt_inline_functions = 1; /* Inline small static/inline functions (≤60 words) */
+        if (s->opt_inline_limit < 60)
+          s->opt_inline_limit = 60;
       }
       break;
     case TCC_OPTION_T:
@@ -2214,6 +2367,23 @@ LIBTCCAPI int tcc_set_options(TCCState *s, const char *r)
   return ret < 0 ? ret : 0;
 }
 
+PUB_FUNC void tcc_bench_log(TCCState *s1, const char *operation, const char *name, unsigned elapsed_ms)
+{
+  if (!s1 || !s1->do_bench)
+    return;
+  if (!name || !name[0])
+    name = "<unknown>";
+  fprintf(stderr, "# bench %-14s %6u ms  %s\n", operation, elapsed_ms, name);
+}
+
+static void tcc_print_bench_breakdown(const char *label, unsigned total_time, unsigned count)
+{
+  if (!count)
+    return;
+  fprintf(stderr, "# bench total %-16s %6u ms  %4u calls  %7.2f ms avg\n", label, total_time, count,
+         (double)total_time / count);
+}
+
 PUB_FUNC void tcc_print_stats(TCCState *s1, unsigned total_time)
 {
   if (!total_time)
@@ -2225,6 +2395,23 @@ PUB_FUNC void tcc_print_stats(TCCState *s1, unsigned total_time)
           (double)total_bytes / 1000 / total_time);
   fprintf(stderr, "# text %u, data.rw %u, data.ro %u, bss %u bytes\n", s1->total_output[0], s1->total_output[1],
           s1->total_output[2], s1->total_output[3]);
+  tcc_print_bench_breakdown("open", s1->bench_file_open_time, s1->bench_file_open_count);
+  tcc_print_bench_breakdown("resolve", s1->bench_library_resolve_time, s1->bench_library_resolve_count);
+    tcc_print_bench_breakdown("compile-setup", s1->bench_compile_setup_time, s1->bench_compile_setup_count);
+    tcc_print_bench_breakdown("compile-exec", s1->bench_compile_exec_time, s1->bench_compile_exec_count);
+    tcc_print_bench_breakdown("compile-finalize", s1->bench_compile_finalize_time, s1->bench_compile_finalize_count);
+  tcc_print_bench_breakdown("func-body", s1->bench_function_body_time, s1->bench_function_body_count);
+  tcc_print_bench_breakdown("func-opt", s1->bench_function_opt_time, s1->bench_function_opt_count);
+  tcc_print_bench_breakdown("func-alloc", s1->bench_function_alloc_time, s1->bench_function_alloc_count);
+  tcc_print_bench_breakdown("func-codegen", s1->bench_function_codegen_time, s1->bench_function_codegen_count);
+  tcc_print_bench_breakdown("compile", s1->bench_compile_time, s1->bench_compile_count);
+  tcc_print_bench_breakdown("obj", s1->bench_object_load_time, s1->bench_object_load_count);
+  tcc_print_bench_breakdown("archive", s1->bench_archive_load_time, s1->bench_archive_load_count);
+  if (s1->bench_archive_member_count)
+    fprintf(stderr, "# bench total archive-members %u\n", s1->bench_archive_member_count);
+  tcc_print_bench_breakdown("dll", s1->bench_dll_load_time, s1->bench_dll_load_count);
+  tcc_print_bench_breakdown("ldscript", s1->bench_ldscript_load_time, s1->bench_ldscript_load_count);
+  tcc_print_bench_breakdown("output", s1->bench_output_time, s1->bench_output_count);
 #ifdef MEM_DEBUG
   fprintf(stderr, "# memory usage");
 #ifdef TCC_IS_NATIVE

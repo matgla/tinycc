@@ -41,7 +41,7 @@ int main(void)
     _Complex float result;
     float real, imag;
     int pass = 1;
-    
+
     /* Test addition: (1+0i) + (3+0i) = (4+0i) */
     result = test_add(a, b);
     real = __real__ result;
@@ -51,7 +51,7 @@ int main(void)
         printf("FAIL: add expected 4.0 + 0.0i\n");
         pass = 0;
     }
-    
+
     /* Test subtraction: (1+0i) - (3+0i) = (-2+0i) */
     result = test_sub(a, b);
     real = __real__ result;
@@ -61,7 +61,7 @@ int main(void)
         printf("FAIL: sub expected -2.0 + 0.0i\n");
         pass = 0;
     }
-    
+
     /* Test multiplication: (1+0i) * (3+0i) = (3+0i) */
     result = test_mul(a, b);
     real = __real__ result;
@@ -71,7 +71,7 @@ int main(void)
         printf("FAIL: mul expected 3.0 + 0.0i\n");
         pass = 0;
     }
-    
+
     /* Test division: (3+0i) / (1+0i) = (3+0i) */
     result = test_div(b, a);
     real = __real__ result;
@@ -81,7 +81,7 @@ int main(void)
         printf("FAIL: div expected 3.0 + 0.0i\n");
         pass = 0;
     }
-    
+
     if (pass) {
         printf("OK: All basic complex arithmetic tests passed!\n");
         return 0;

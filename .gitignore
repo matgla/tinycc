@@ -86,3 +86,15 @@ tmp/
 
 .venv
 bin/
+.yasos-build
+tests/ir_tests/pch_header_check
+tests/ir_tests/pch_usage_check
+pch/
+config.h.cross
+.opencode
+test.txt
+tests/ir_tests/dump_ir.txt
+tests/ir_tests/dump.txt
+tests/ir_tests/dump_fine.txt
+tests/ir_tests/dump_ir_fine.txt
+.aider*

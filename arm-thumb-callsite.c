@@ -11,13 +11,6 @@
 #include "tcctype.h"
 #include <limits.h>
 
-/* Debug output for callsite processing - disabled by default
- * Enable with: -DCALLSITE_DEBUG_ENABLED or #define CALLSITE_DEBUG_ENABLED */
-#ifdef CALLSITE_DEBUG_ENABLED
-#define CALLSITE_DEBUG(...) fprintf(stderr, __VA_ARGS__)
-#else
-#define CALLSITE_DEBUG(...) ((void)0)
-#endif
 
 void thumb_free_call_sites(void)
 {
@@ -96,7 +89,7 @@ ThumbGenCallSite *thumb_get_call_site_for_id(int call_id)
 int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, int argc_hint, TCCAbiCallLayout *layout,
                                     IROperand **out_args, MachineOperand **out_mops)
 {
-  CALLSITE_DEBUG("[CALLSITE] thumb_build_call_layout_from_ir: call_idx=%d call_id=%d argc_hint=%d total_insns=%d\n",
+  LOG_CALLSITE("thumb_build_call_layout_from_ir: call_idx=%d call_id=%d argc_hint=%d total_insns=%d",
                  call_idx, call_id, argc_hint, ir ? ir->next_instruction_index : -1);
   if (!ir || !layout || call_idx < 0)
     return -1;
@@ -129,7 +122,7 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, i
       {
         const IROperand src2 = tcc_ir_get_src2(ir, j);
         int param_call_id = irop_is_none(src2) ? -1 : TCCIR_DECODE_CALL_ID((uint32_t)src2.u.imm32);
-        CALLSITE_DEBUG("[CALLSITE]   legacy scan j=%d: FUNCPARAMVAL param_call_id=%d (want %d) param_idx=%d\n", j,
+        LOG_CALLSITE("legacy scan j=%d: FUNCPARAMVAL param_call_id=%d (want %d) param_idx=%d", j,
                        param_call_id, call_id,
                        irop_is_none(src2) ? -1 : (int)TCCIR_DECODE_PARAM_IDX((uint32_t)src2.u.imm32));
         if (param_call_id == call_id)
@@ -141,7 +134,7 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, i
       }
     }
     argc = max_arg_index + 1;
-    CALLSITE_DEBUG("[CALLSITE]   legacy scan result: max_arg_index=%d argc=%d\n", max_arg_index, argc);
+    LOG_CALLSITE("legacy scan result: max_arg_index=%d argc=%d", max_arg_index, argc);
   }
 
   if (argc <= 0)
@@ -183,7 +176,7 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, i
     mops = (MachineOperand *)tcc_mallocz(sizeof(MachineOperand) * argc);
   }
 
-  CALLSITE_DEBUG("[CALLSITE] scanning backwards from call_idx=%d for call_id=%d argc=%d\n", call_idx, call_id, argc);
+  LOG_CALLSITE("scanning backwards from call_idx=%d for call_id=%d argc=%d", call_idx, call_id, argc);
   int found_count = 0;
   for (int j = call_idx - 1; j >= 0 && found_count < argc; --j)
   {
@@ -194,7 +187,7 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, i
       int param_call_id = !irop_is_none(src2) ? TCCIR_DECODE_CALL_ID((uint32_t)src2.u.imm32) : -1;
       int param_idx_raw = !irop_is_none(src2) ? (int)TCCIR_DECODE_PARAM_IDX((uint32_t)src2.u.imm32) : -1;
       (void)param_idx_raw; /* only used by CALLSITE_DEBUG */
-      CALLSITE_DEBUG("[CALLSITE]   j=%d FUNCPARAMVAL param_call_id=%d param_idx=%d (want call_id=%d)\n", j,
+      LOG_CALLSITE("j=%d FUNCPARAMVAL param_call_id=%d param_idx=%d (want call_id=%d)", j,
                      param_call_id, param_idx_raw, call_id);
       if (param_call_id == call_id)
       {
@@ -202,7 +195,7 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, i
         int param_idx = TCCIR_DECODE_PARAM_IDX((uint32_t)src2.u.imm32);
         if (param_idx >= 0 && param_idx < argc && !found[param_idx])
         {
-          CALLSITE_DEBUG("[CALLSITE]     recording arg[%d] btype=%d is_64bit=%d\n", param_idx, src1_irop.btype,
+          LOG_CALLSITE("recording arg[%d] btype=%d is_64bit=%d", param_idx, src1_irop.btype,
                          irop_is_64bit(src1_irop));
           /* Collect IROperand if requested */
           if (args)
@@ -268,11 +261,11 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, i
     }
   }
 
-  CALLSITE_DEBUG("[CALLSITE] scan complete: found_count=%d argc=%d\n", found_count, argc);
+  LOG_CALLSITE("scan complete: found_count=%d argc=%d", found_count, argc);
   /* Verify all parameters were found */
   for (int i = 0; i < argc; ++i)
   {
-    CALLSITE_DEBUG("[CALLSITE]   arg[%d]: found=%d\n", i, found[i]);
+    LOG_CALLSITE("arg[%d]: found=%d", i, found[i]);
     if (!found[i])
     {
       tcc_error("compiler_error: missing FUNCPARAMVAL for call_id=%d arg=%d", call_id, i);

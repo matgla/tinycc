@@ -1,0 +1,4 @@
+1 2 3 sum=6
+1 2 3 sum=6
+1 2 3 sum=6
+Using CFLAGS: -O2 -g

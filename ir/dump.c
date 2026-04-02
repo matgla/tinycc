@@ -96,6 +96,8 @@ const char *tcc_ir_get_op_name(TccIrOp op)
     return "LEA";
   case TCCIR_OP_TEST_ZERO:
     return "TEST_ZERO";
+  case TCCIR_OP_UBFX:
+    return "UBFX";
   case TCCIR_OP_FADD:
     return "FADD";
   case TCCIR_OP_FSUB:
@@ -166,6 +168,10 @@ const char *tcc_ir_get_op_name(TccIrOp op)
     return "NL_SETJMP";
   case TCCIR_OP_NL_LONGJMP:
     return "NL_LONGJMP";
+  case TCCIR_OP_BLOCK_COPY:
+    return "BLOCK_COPY";
+  case TCCIR_OP_SELECT:
+    return "SELECT";
   default:
     return "UNKNOWN_OP";
   }
@@ -449,7 +455,11 @@ void tcc_dump_quadruple_to(FILE *out, const TACQuadruple *q, int pc)
     }
   }
 
-  if (op == TCCIR_OP_STORE)
+  if (op == TCCIR_OP_BLOCK_COPY)
+    fprintf(out, " [BLOCK_COPY]");
+  else if (op == TCCIR_OP_SELECT)
+    fprintf(out, " [SELECT]");
+  else if (op == TCCIR_OP_STORE)
     fprintf(out, " [STORE]");
   else if (op == TCCIR_OP_LOAD)
     fprintf(out, " [LOAD]");
@@ -978,7 +988,11 @@ void tcc_print_quadruple_irop(TCCIRState *ir, IRQuadCompact *q, int pc)
     }
   }
 
-  if (op == TCCIR_OP_STORE)
+  if (op == TCCIR_OP_BLOCK_COPY)
+    printf(" [BLOCK_COPY]");
+  else if (op == TCCIR_OP_SELECT)
+    printf(" [SELECT]");
+  else if (op == TCCIR_OP_STORE)
     printf(" [STORE]");
   else if (op == TCCIR_OP_LOAD)
     printf(" [LOAD]");

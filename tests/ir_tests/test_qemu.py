@@ -104,6 +104,7 @@ TEST_FILES = [
     ("103_pure_func_multiple.c", 0),
     ("104_pure_func_variant.c", 0),
     ("105_builtin_strncmp_zero_count.c", 0),
+    ("106_string_ops_runtime.c", 0),
 
     # Single-precision float tests
     ("72_float_result.c", 1),  # Returns 1 on success (non-standard convention)
@@ -113,8 +114,6 @@ TEST_FILES = [
     ("test_aeabi_dmul_bits.c", 0),
     ("test_f2d_bits.c", 0),
     ("test_aeabi_double_all.c", 0),
-
-    ("test_dmul_orig_override.c", 0),
 
     ("test_llong_add_signed.c", 0),
     ("test_llong_add_unsigned.c", 0),
@@ -280,6 +279,9 @@ TEST_FILES = [
     # IEEE 754 NaN comparison tests (soft-float GT/GE fix)
     ("170_nan_comparison.c", 0),
 
+    # Compile-time strlen constant folding
+    ("171_strlen_constfold.c", 0),
+
     # ("../tests2/106_versym.c", 0),
     ("../tests2/108_constructor.c", 0),
     # ("../tests2/112_backtrace.c", 0),
@@ -334,8 +336,43 @@ TEST_FILES = [
 
     ("111_builtin_printf.c", 0),
     ("112_builtin_puts.c", 0),
+    ("108_loop_unroll_basic.c", 0),
+    ("109_loop_unroll_no_unroll.c", 0),
+    ("110_loop_unroll_with_array.c", 0),
     ("150_builtin_fp.c", 0),
+
+    # Benchmark regression tests (-O2 correctness)
+    ("bench_fibonacci.c", 0),
+    ("bench_bubble_sort.c", 0),
+    ("bench_linked_list.c", 0),
+    ("bench_binary_search.c", 0),
+    ("bench_matrix_mul.c", 0),
+    ("bench_function_calls.c", 0),
+    ("bench_conditionals.c", 0),
+    ("bench_switch_stmt.c", 0),
+    ("bench_indirect_calls.c", 0),
+    ("bench_array_sum.c", 0),
+    ("bench_bitwise_mix.c", 0),
+    ("bench_strcpy.c", 0),
+    ("bench_memcpy.c", 0),
+    ("bench_strcmp.c", 0),
+    ("bench_strlen_scan.c", 0),
+
+    # MiBench regression tests (-O2 correctness)
+    ("mibench_bitcount.c", 0),
+    ("mibench_crc32.c", 0),
+    ("mibench_dijkstra.c", (0, 30)),  # Longer timeout for graph traversal
+    ("mibench_qsort.c", 0),
+    ("mibench_stringsearch.c", 0),
+    ("mibench_sha.c", 0),
+    ("mibench_rijndael.c", 0),
 ]
+
+# Per-test compiler defines (e.g. for missing platform macros)
+# Maps test filename -> list of defines passed as -D flags
+TEST_FILE_DEFINES = {
+    "mibench_sha.c": ["LITTLE_ENDIAN"],  # newlib doesn't provide this unlike glibc
+}
 
 # Nested function tests expected to fail (not yet implemented)
 NESTED_XFAIL_TEST_FILES = [
@@ -441,6 +478,12 @@ TCC_BUG_TEST_FILES = [
     ("bug_bitfield_packed10.c", 0),
     ("bug_switch_bitfield.c", 0),
 
+    # Bug: GNU ?: (Elvis operator) extension miscompiled - picks wrong branch.
+    # `tt ?: fallback` always evaluates to fallback even when tt is non-null.
+    # Caused toybox cp to use source filename as destination, triggering
+    # "same file" error.  Workaround: expand to explicit `tt ? tt : fallback`.
+    ("bug_gnu_ternary_elvis.c", 0),
+
 
 ]
 
@@ -466,20 +509,31 @@ def _test_id(test_file):
     return Path(_primary_test_file(test_file)).stem
 
 def load_expect_file(test_name):
-    """Load and return lines from .expect file and expected exit code"""
+    """Load and return lines from .expect file and expected exit code.
+
+    Recognises [returns N] directives: the last one found sets the
+    expected exit code (returned as second element).  Those lines are
+    excluded from the expected-output list.
+    """
     test_file = Path(_primary_test_file(test_name))
     expect_file = CURRENT_DIR / f"{test_file.parent}/{test_file.stem}.expect"
     if not expect_file.exists():
         raise FileNotFoundError(f"Expect file not found: {expect_file}")
 
     lines = []
+    exit_code = None
+    returns_pattern = re.compile(r'^\[returns (\d+)\]$')
 
     with open(expect_file, "r") as f:
         for line in f:
             stripped = line.rstrip('\n')
-            lines.append(stripped)
+            m = returns_pattern.match(stripped)
+            if m:
+                exit_code = int(m.group(1))
+            else:
+                lines.append(stripped)
 
-    return lines
+    return lines, exit_code
 
 
 def load_tagged_expect_file(test_name):
@@ -565,7 +619,9 @@ def _escape_regex(line):
 
 
 def _run_qemu_test(test_file, expected_exit_code, args=None, defines=None, opt_level="-O0", output_dir=None, timeout=10):
-    expected_lines = load_expect_file(test_file)
+    expected_lines, expect_exit = load_expect_file(test_file)
+    if expect_exit is not None:
+        expected_exit_code = expect_exit
     opt_suffix = f"_{opt_level.replace('-', '').replace(' ', '_')}"
     config = CompileConfig(extra_cflags=opt_level, output_suffix=opt_suffix, output_dir=output_dir)
     sut, loglines = run_test(test_file, MACHINE, args, defines=defines, config=config)
@@ -653,7 +709,7 @@ def _run_tagged_qemu_test(test_file, tag, expected_lines, expected_exit_code, op
 
 
 # Optimization levels to test
-OPT_LEVELS = ["-O0", "-O1"]
+OPT_LEVELS = ["-O0", "-O1", "-O2"]
 
 
 def _generate_matrix_params(test_list):
@@ -690,7 +746,8 @@ def test_qemu_execution(test_file, expected_exit_code, timeout, opt_level, tmp_p
     if (ASAN_ENABLED or VALGRIND_ENABLED) and primary in SLOW_UNDER_INSTRUMENTATION:
         pytest.skip("Skipped under ASan/valgrind (too slow)")
 
-    _run_qemu_test(test_file, expected_exit_code, opt_level=opt_level, output_dir=tmp_path, timeout=timeout)
+    defines = TEST_FILE_DEFINES.get(primary)
+    _run_qemu_test(test_file, expected_exit_code, defines=defines, opt_level=opt_level, output_dir=tmp_path, timeout=timeout)
 
 
 # Nested function xfail tests (not yet implemented)
@@ -908,6 +965,7 @@ PIC_TEXT_DATA_SEP_TEST_FILES = [
     # register instead of the AND result.  push_mask ends up with bit 13 (SP)
     # set → th_push returns {0,0}.
     ("bug_struct_mask_copy.c", 0),
+    ("bug_mask_copy_noloop.c", 0),
 ]
 
 

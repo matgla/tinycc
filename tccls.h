@@ -57,6 +57,13 @@ typedef struct LSLiveInterval
   uint8_t addrtaken;       // 1 if variable's address is taken (must be on stack)
   uint8_t reg_type;        // LS_REG_TYPE_INT, LS_REG_TYPE_FLOAT, or LS_REG_TYPE_DOUBLE
   uint8_t lvalue;          // 1 if interval represents an lvalue
+  /* Precomputed sort key for active-set ordering (computed once at add time).
+   * Placed last so all preceding fields stay at their original offsets.
+   *   bit 33    = !is_param  → PARAM intervals sort first (key == 0)
+   *   bits 32:1 = end        → lower end-point sorts first
+   *   bit  0    = !lvalue    → lvalue=1 sorts before lvalue=0
+   */
+  uint64_t sort_key;
 } LSLiveInterval;
 
 typedef struct LSLiveIntervalState
@@ -89,6 +96,7 @@ void tcc_ls_clear_live_intervals(LSLiveIntervalState *ls);
 
 void tcc_ls_add_live_interval(LSLiveIntervalState *ls, int vreg, int start, int end, int crosses_call, int addrtaken,
                               int reg_type, int lvalue, int precolored_reg);
+void tcc_ls_set_use_counts(uint16_t *counts, int count);
 void tcc_ls_allocate_registers(LSLiveIntervalState *ls, int used_parameters_registers,
                                int used_float_parameters_registers, int spill_base);
 
@@ -110,3 +118,8 @@ void tcc_ls_reset_scratch_cache(LSLiveIntervalState *ls);
  *   is_leaf - 1 if this is a leaf function (LR holds return address)
  */
 int tcc_ls_find_free_scratch_reg(LSLiveIntervalState *ls, int instruction_idx, uint32_t exclude_regs, int is_leaf);
+
+/* Recompute dirty_registers from live_regs_by_instruction.
+ * Removes callee-saved registers that were allocated but never actually
+ * appear in any instruction's live set (ghost registers). */
+void tcc_ls_recompute_dirty_registers(LSLiveIntervalState *ls);

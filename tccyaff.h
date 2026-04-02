@@ -27,7 +27,7 @@ typedef struct __attribute__((packed)) YaffHeader {
   uint16_t symbol_table_relocations_amount;
   uint16_t local_relocations_amount;
   uint16_t data_relocations_amount;
-  uint16_t _reserved2;
+  uint16_t copy_relocations_amount;
   uint16_t exported_symbols_amount;
   uint16_t imported_symbols_amount;
   uint32_t got_length;
@@ -57,7 +57,8 @@ typedef struct __attribute__((packed)) YaffSymbolTableRelocationEntry {
   uint32_t is_exported_symbol : 1;
   uint32_t index : 31;
   uint32_t function_pointer : 1;
-  uint32_t symbol_index : 31;
+  uint32_t plt_call : 1;
+  uint32_t symbol_index : 30;
 } YaffSymbolTableRelocationEntry;
 
 typedef struct __attribute__((packed)) YaffDataRelocationEntry {
@@ -71,6 +72,12 @@ typedef struct __attribute__((packed)) YaffLocalRelocationEntry {
   uint32_t index : 30;
   uint32_t target_offset;
 } YaffLocalRelocationEntry;
+
+typedef struct __attribute__((packed)) YaffCopyRelocationEntry {
+  uint32_t bss_offset;
+  uint32_t symbol_index;
+  uint32_t size;
+} YaffCopyRelocationEntry;
 
 typedef struct __attribute__((packed)) YaffLookupEntry {
   uint16_t symbol_offset;

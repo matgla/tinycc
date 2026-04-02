@@ -2488,7 +2488,7 @@ static int tcc_get_dwarf_info(TCCState *s1, Sym *s)
   }
   else if ((type & VT_BTYPE) != VT_FUNC)
   {
-    type &= ~VT_STRUCT_MASK;
+    type &= ~(VT_STRUCT_MASK | VT_COMPLEX);
     for (i = 1; i <= N_DEFAULT_DEBUG; i++)
       if (default_debug[i - 1].type == type)
         break;
