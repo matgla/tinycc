@@ -58,6 +58,9 @@ void tcc_ir_opt_fp_cache_invalidate_reg(TCCIRState *ir, int phys_reg)
 extern int tcc_ir_find_defining_instruction(TCCIRState *ir, int32_t vreg, int before_idx);
 extern int tcc_ir_vreg_has_single_use(TCCIRState *ir, int32_t vreg, int exclude_idx);
 
+/* Forward declaration */
+static int tcc_ir_vreg_has_single_def(TCCIRState *ir, int32_t vreg);
+
 #ifndef TCCIR_VREG_TYPE_NONE
 #define TCCIR_VREG_TYPE_NONE 0
 #endif
@@ -2316,6 +2319,15 @@ static int ir_opt_pure_expr_equal(TCCIRState *ir, IROperand a, int a_use_idx, IR
 
   if (a_def_idx == b_def_idx)
     return 1;
+
+  /* When comparing different vregs, each must have a single definition.
+   * tcc_ir_find_defining_instruction does a linear backward scan and may
+   * find only one of multiple reaching definitions at merge points.
+   * Without this check, two vregs with different semantics can appear
+   * equal if they share the same constant on one branch (e.g. is_float
+   * and is_max both have a path that assigns #1). */
+  if (!tcc_ir_vreg_has_single_def(ir, a_vr) || !tcc_ir_vreg_has_single_def(ir, b_vr))
+    return 0;
 
   return ir_opt_pure_def_equal(ir, a_def_idx, b_def_idx, depth + 1);
 }
@@ -6639,6 +6651,33 @@ int tcc_ir_find_defining_instruction(TCCIRState *ir, int32_t vreg, int before_id
       return i;
   }
   return -1;
+}
+
+/* Check whether a vreg has exactly one definition in the function.
+ * Returns 1 if there is a single definition, 0 otherwise.
+ * This is needed by ir_opt_pure_expr_equal to guard against comparing
+ * vregs that have multiple reaching definitions from different branches. */
+static int tcc_ir_vreg_has_single_def(TCCIRState *ir, int32_t vreg)
+{
+  int def_count = 0;
+  int n = ir->next_instruction_index;
+
+  for (int i = 0; i < n; ++i)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    if (!irop_config[q->op].has_dest)
+      continue;
+    IROperand dest = tcc_ir_op_get_dest(ir, q);
+    if (irop_get_vreg(dest) == vreg)
+    {
+      def_count++;
+      if (def_count > 1)
+        return 0;
+    }
+  }
+  return def_count == 1;
 }
 
 int tcc_ir_vreg_has_single_use(TCCIRState *ir, int32_t vreg, int exclude_idx)

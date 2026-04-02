@@ -891,6 +891,16 @@ ST_FUNC int tccgen_compile(TCCState *s1)
   return 0;
 }
 
+static void tcc_bench_log_phase(TCCState *s1, const char *operation, const char *name, unsigned *total_time,
+                                unsigned *count, unsigned elapsed)
+{
+  if (!s1 || !s1->do_bench)
+    return;
+  *total_time += elapsed;
+  (*count)++;
+  tcc_bench_log(s1, operation, name, elapsed);
+}
+
 ST_FUNC void tccgen_finish(TCCState *s1)
 {
   tcc_debug_end(s1); /* just in case of errors: free memory */
@@ -3677,7 +3687,7 @@ static void gen_opl(int op)
         dest.r = 0;
         if ((dest_type & VT_BTYPE) == VT_LLONG)
           tcc_ir_set_llong_type(tcc_state->ir, dest.vr);
-        TccIrOp ir_op;
+        TccIrOp ir_op = TCCIR_OP_NOP;
         switch (op)
         {
         case '^':
@@ -7241,7 +7251,6 @@ static void gen_cast(CType *type)
   int sbt, dbt, sf, df, c;
   int dbt_bt, sbt_bt, ds, ss, bits, trunc;
 
-
   if (is_transparent_union_type(type))
   {
     CType *member_type = find_assignable_transparent_union_member(type);
@@ -7258,8 +7267,7 @@ static void gen_cast(CType *type)
      (char/short stored in int registers), never to VT_CONST values.
      Skip when the value is a constant to avoid misinterpreting VT_NONCONST
      as part of the VT_MUSTCAST field. */
-  if ((vtop->r & (VT_MUSTCAST | (VT_MUSTCAST << 1))) &&
-      (vtop->r & VT_VALMASK) != VT_CONST)
+  if ((vtop->r & (VT_MUSTCAST | (VT_MUSTCAST << 1))) && (vtop->r & VT_VALMASK) != VT_CONST)
     force_charshort_cast();
 
   /* bitfields first get cast to ints */
@@ -9173,9 +9181,15 @@ ST_FUNC void inc(int post, int c)
      *
      * Fix: emit an explicit LOAD of the stored value into a fresh temp vreg.
      * This materializes the value so that subsequent indir() correctly treats
-     * it as a pointer value to dereference, not a stack-slot reference. */
+     * it as a pointer value to dereference, not a stack-slot reference.
+     *
+     * Only do this for VAR vregs (local variables with stack slots).
+     * TEMP vregs already hold the computed value in a register and don't
+     * need reloading — emitting a LOAD for them would incorrectly treat
+     * the integer value as a memory address (crashes on global pre-dec). */
     SValue *sv = vtop;
-    if (sv->vr >= 0 && (sv->r & VT_VALMASK) == 0)
+    if (sv->vr >= 0 && (sv->r & VT_VALMASK) == 0
+        && TCCIR_DECODE_VREG_TYPE(sv->vr) == TCCIR_VREG_TYPE_VAR)
     {
       SValue src;
       memset(&src, 0, sizeof(src));
@@ -14276,16 +14290,26 @@ static void __attribute__((noinline)) unary_builtin_fp(void)
       vstore();
       vtop--; /* pop the store result */
 
-      /* Load the word containing the sign bit as an unsigned integer */
+      /* Load the word containing the sign bit as an unsigned integer. */
       CType uint_type;
       uint_type.t = VT_INT | VT_UNSIGNED;
       uint_type.ref = NULL;
       vset(&uint_type, VT_LOCAL | VT_LVAL, tmp_loc + high_word_offset);
       vtop->vr = vr_tmp;
 
-      /* Unsigned right shift by 31 to isolate the sign bit (0 or 1) */
-      vpushi(31);
-      gen_op(TOK_SHR);
+      if (fp_size == 4)
+      {
+        /* Match GCC __builtin_signbitf runtime behavior: return the raw
+         * sign mask (0x80000000) for negative float values. */
+        vpushi(0x80000000u);
+        gen_op('&');
+      }
+      else
+      {
+        /* Runtime double stays normalized to 0/1. */
+        vpushi(31);
+        gen_op(TOK_SHR);
+      }
     }
     break;
   }
@@ -15069,10 +15093,11 @@ static void __attribute__((noinline)) unary_builtin_fp2(void)
     /* Check if both arguments are constants */
     int bt_x = vtop[-1].type.t & VT_BTYPE;
     int bt_y = vtop[0].type.t & VT_BTYPE;
-    if ((vtop[-1].r & (VT_VALMASK | VT_LVAL)) == VT_CONST && !(vtop[-1].r & VT_SYM) &&
-        (vtop[0].r & (VT_VALMASK | VT_LVAL)) == VT_CONST && !(vtop[0].r & VT_SYM) &&
-        (bt_x == VT_FLOAT || bt_x == VT_DOUBLE || bt_x == VT_LDOUBLE) &&
-        (bt_y == VT_FLOAT || bt_y == VT_DOUBLE || bt_y == VT_LDOUBLE))
+    int x_is_const = (vtop[-1].r & (VT_VALMASK | VT_LVAL)) == VT_CONST && !(vtop[-1].r & VT_SYM);
+    int y_is_const = (vtop[0].r & (VT_VALMASK | VT_LVAL)) == VT_CONST && !(vtop[0].r & VT_SYM);
+    int x_is_fp = (bt_x == VT_FLOAT || bt_x == VT_DOUBLE || bt_x == VT_LDOUBLE);
+    int y_is_fp = (bt_y == VT_FLOAT || bt_y == VT_DOUBLE || bt_y == VT_LDOUBLE);
+    if (x_is_const && y_is_const && x_is_fp && y_is_fp)
     {
       double x = (bt_x == VT_FLOAT) ? (double)vtop[-1].c.f : vtop[-1].c.d;
       double y = (bt_y == VT_FLOAT) ? (double)vtop[0].c.f : vtop[0].c.d;
@@ -22923,9 +22948,9 @@ static void setup_nested_func_trampoline(Sym *s)
     char tramp_name[256];
     snprintf(tramp_name, sizeof(tramp_name), "__tramp_%s", func_name);
 
-    /* Placeholder: offset will be updated when trampoline code is emitted */
+    /* Placeholder: offset and size will be updated when trampoline code is emitted */
     int elf_idx =
-        put_elf_sym(symtab_section, 0, 24, ELFW(ST_INFO)(STB_LOCAL, STT_FUNC), 0, text_sec->sh_num, tramp_name);
+        put_elf_sym(symtab_section, 0, 0, ELFW(ST_INFO)(STB_LOCAL, STT_FUNC), 0, text_sec->sh_num, tramp_name);
 
     Sym *tr_sym = sym_malloc();
     memset(tr_sym, 0, sizeof(*tr_sym));
@@ -22962,79 +22987,19 @@ static void setup_nested_func_trampoline(Sym *s)
 /* Emit trampoline code for a nested function that needs it */
 static void emit_trampoline_for_nested_func(NestedFunc *nf)
 {
-  Section *text_sec = cur_text_section;
-
-  /* Trampoline is 20 bytes: 14 bytes code + 2 bytes NOP + 4+4 literal pool.
-   * Plus up to 3 bytes for alignment padding.
-   * We must ensure the section buffer can hold these bytes. The codegen
-   * sets data_offset = ind at the end, but we're before that point.
-   * Use section_prealloc to extend the buffer without moving data_offset. */
-  section_prealloc(text_sec, 24);
-
-  /* Align ind to 4-byte boundary for the trampoline */
-  while (ind & 3)
-  {
-    text_sec->data[ind++] = 0x00;
-  }
-
-  addr_t tramp_start = ind;
-
-  /* Trampoline layout (20 bytes total, no padding needed):
-   *   +0:  LDR  r10, [pc, #8]   ; r10 = chain_slot address (from +12)
-   *   +4:  LDR  r10, [r10, #0]  ; r10 = *chain_slot = parent FP value
-   *   +8:  LDR  pc, [pc, #4]    ; pc = function address (from +16), tail call
-   *   +12: .word chain_slot_addr ; address of chain slot in .data
-   *   +16: .word function_addr   ; address of nested function in .text
-   *
-   * PC-relative offset calculation (Thumb: PC reads as current + 4):
-   *   LDR at +0: PC=+4, offset=8  → loads from +12 (chain_slot)
-   *   LDR at +8: PC=+12, offset=4 → loads from +16 (function)
-   */
-
-  /* LDR R10, [PC, #8] - Thumb-2 encoding: F8DF A008 */
-  text_sec->data[ind++] = 0xDF;
-  text_sec->data[ind++] = 0xF8;
-  text_sec->data[ind++] = 0x08;
-  text_sec->data[ind++] = 0xA0;
-
-  /* LDR R10, [R10, #0] - Thumb-2 encoding: F8DA A000 */
-  text_sec->data[ind++] = 0xDA;
-  text_sec->data[ind++] = 0xF8;
-  text_sec->data[ind++] = 0x00;
-  text_sec->data[ind++] = 0xA0;
-
-  /* LDR PC, [PC, #4] - Thumb-2 encoding: F8DF F004 */
-  text_sec->data[ind++] = 0xDF;
-  text_sec->data[ind++] = 0xF8;
-  text_sec->data[ind++] = 0x04;
-  text_sec->data[ind++] = 0xF0;
-
-  /* Literal pool entry 1: chain slot address (+12) */
-  greloc(text_sec, nf->chain_slot_tcc_sym, ind, R_ARM_ABS32);
-  text_sec->data[ind++] = 0x00;
-  text_sec->data[ind++] = 0x00;
-  text_sec->data[ind++] = 0x00;
-  text_sec->data[ind++] = 0x00;
-
-  /* Literal pool entry 2: nested function address (+16) */
-  greloc(text_sec, nf->sym, ind, R_ARM_ABS32);
-  text_sec->data[ind++] = 0x00;
-  text_sec->data[ind++] = 0x00;
-  text_sec->data[ind++] = 0x00;
-  text_sec->data[ind++] = 0x00;
+  /* Arch-specific: emit trampoline machine code + relocations.
+   * Returns the entry address (may include arch-specific bits, e.g. Thumb). */
+  addr_t entry_addr = gen_nested_func_trampoline(nf->chain_slot_tcc_sym, nf->sym);
 
   /* Update the ELF symbol for the trampoline to point to actual code location */
   {
     ElfSym *esym = elfsym(nf->trampoline_tcc_sym);
     if (esym)
     {
-      esym->st_value = tramp_start + 1; /* +1 for Thumb bit */
-      esym->st_size = ind - tramp_start;
+      esym->st_value = entry_addr;
+      esym->st_size = ind - (entry_addr & ~1u);
     }
   }
-
-  /* Sync data_offset so the section knows about the trampoline bytes */
-  text_sec->data_offset = ind;
 }
 
 /* Emit all trampolines needed for nested functions in this parent */
@@ -23746,6 +23711,7 @@ static void gen_function(Sym *sym)
   struct scope f = {0};
   TCCIRState *ir;
   Sym *global_label_stack_start; /* save global label stack at function start */
+  unsigned phase_start = 0;
   cur_scope = root_scope = &f;
   nocode_wanted = 0;
 
@@ -23848,6 +23814,8 @@ static void gen_function(Sym *sym)
   }
 
   func_vla_arg(sym);
+  if (tcc_state->do_bench)
+    phase_start = tcc_getclock_ms();
   block(0);
   /* Backpatch all return jumps to point to the epilogue (past the end of IR) */
   tcc_ir_backpatch_to_here(ir, rsym);
@@ -23856,6 +23824,14 @@ static void gen_function(Sym *sym)
   if (tcc_state->instrument_functions && !sym->type.ref->f.func_no_instrument)
   {
     gen_instrument_call(sym, "__cyg_profile_func_exit");
+  }
+
+  if (tcc_state->do_bench)
+  {
+    unsigned now = tcc_getclock_ms();
+    tcc_bench_log_phase(tcc_state, "func-body", funcname, &tcc_state->bench_function_body_time,
+                        &tcc_state->bench_function_body_count, now - phase_start);
+    phase_start = now;
   }
 
 #ifdef CONFIG_TCC_DEBUG
@@ -24146,6 +24122,14 @@ static void gen_function(Sym *sym)
     }
   }
 
+  if (tcc_state->do_bench)
+  {
+    unsigned now = tcc_getclock_ms();
+    tcc_bench_log_phase(tcc_state, "func-opt", funcname, &tcc_state->bench_function_opt_time,
+                        &tcc_state->bench_function_opt_count, now - phase_start);
+    phase_start = now;
+  }
+
   nocode_wanted = 0;
 
   /* reset local stack */
@@ -24227,6 +24211,14 @@ static void gen_function(Sym *sym)
     put_extern_sym(sym, cur_text_section, ind + 1, 0);
   }
 
+  if (tcc_state->do_bench)
+  {
+    unsigned now = tcc_getclock_ms();
+    tcc_bench_log_phase(tcc_state, "func-alloc", funcname, &tcc_state->bench_function_alloc_time,
+                        &tcc_state->bench_function_alloc_count, now - phase_start);
+    phase_start = now;
+  }
+
   /* Before codegen, create placeholder ELF symbols for addr-taken labels
    * (&&label) that are still on global_label_stack with c == -3.
    * During codegen, the backend will emit relocations referencing these
@@ -24249,6 +24241,13 @@ static void gen_function(Sym *sym)
   {
     tcc_debug_prolog_epilog(tcc_state, 1);
     // gfunc_epilog();
+  }
+
+  if (tcc_state->do_bench)
+  {
+    unsigned now = tcc_getclock_ms();
+    tcc_bench_log_phase(tcc_state, "func-codegen", funcname, &tcc_state->bench_function_codegen_time,
+                        &tcc_state->bench_function_codegen_count, now - phase_start);
   }
 
 #ifdef CONFIG_TCC_DEBUG

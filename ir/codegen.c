@@ -1648,6 +1648,33 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
         MachineOperand func_mop = machine_op_from_ir(ir, &src1_ir);
         MachineOperand mop_dest = machine_op_from_ir(ir, &dest_ir);
         tcc_gen_machine_func_call_mop(func_mop, src2_ir, mop_dest, drop_return_value, ir, i);
+        /* Debug: check if the dest vreg's allocation changes at the next instruction */
+        if (!is_dry_run && mop_dest.is_64bit && !drop_return_value && i + 1 < ir->next_instruction_index)
+        {
+          IROperand next_dest_check = dest_ir; /* same vreg */
+          /* Save and restore codegen_instruction_idx to peek at next instruction's allocation */
+          int saved_idx = ir->codegen_instruction_idx;
+          ir->codegen_instruction_idx = i + 1;
+          MachineOperand next_mop = machine_op_from_ir(ir, &next_dest_check);
+          ir->codegen_instruction_idx = saved_idx;
+          if (next_mop.kind != mop_dest.kind ||
+              (next_mop.kind == MACH_OP_REG &&
+               (next_mop.u.reg.r0 != mop_dest.u.reg.r0 || next_mop.u.reg.r1 != mop_dest.u.reg.r1)) ||
+              (next_mop.kind == MACH_OP_SPILL && next_mop.u.spill.offset != mop_dest.u.spill.offset))
+          {
+            fprintf(stderr, "[SPLIT] vreg=%d call_idx=%d: call_dest=kind%d", mop_dest.vreg, i, mop_dest.kind);
+            if (mop_dest.kind == MACH_OP_REG)
+              fprintf(stderr, "(r%d:r%d)", mop_dest.u.reg.r0, mop_dest.u.reg.r1);
+            else if (mop_dest.kind == MACH_OP_SPILL)
+              fprintf(stderr, "(spill%d)", mop_dest.u.spill.offset);
+            fprintf(stderr, " next=kind%d", next_mop.kind);
+            if (next_mop.kind == MACH_OP_REG)
+              fprintf(stderr, "(r%d:r%d)", next_mop.u.reg.r0, next_mop.u.reg.r1);
+            else if (next_mop.kind == MACH_OP_SPILL)
+              fprintf(stderr, "(spill%d)", next_mop.u.spill.offset);
+            fprintf(stderr, "\n");
+          }
+        }
         tcc_ir_spill_cache_clear(&ir->spill_cache);
         if (ir->has_static_chain)
           tcc_gen_machine_restore_chain();

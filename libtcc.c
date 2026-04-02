@@ -668,12 +668,21 @@ ST_FUNC int tcc_open(TCCState *s1, const char *filename)
 /* compile the file opened in 'file'. Return non zero if errors. */
 static int tcc_compile(TCCState *s1, int filetype, const char *str, int fd)
 {
+  unsigned compile_start = 0;
+  unsigned phase_start = 0;
+
   /* Here we enter the code section where we use the global variables for
      parsing and code generation (tccpp.c, tccgen.c, <target>-gen.c).
      Other threads need to wait until we're done.
 
      Alternatively we could use thread local storage for those global
      variables, which may or may not have advantages */
+
+  if (s1->do_bench)
+  {
+    compile_start = tcc_getclock_ms();
+    phase_start = compile_start;
+  }
 
   tcc_enter_state(s1);
   s1->error_set_jmp_enabled = 1;
@@ -697,13 +706,24 @@ static int tcc_compile(TCCState *s1, int filetype, const char *str, int fd)
     preprocess_start(s1, filetype);
     tccgen_init(s1);
 
+    if (s1->output_type != TCC_OUTPUT_PREPROCESS)
+      tccelf_begin_file(s1);
+
+    if (s1->do_bench)
+    {
+      unsigned elapsed = tcc_getclock_ms() - phase_start;
+      s1->bench_compile_setup_time += elapsed;
+      s1->bench_compile_setup_count++;
+      tcc_bench_log(s1, "compile-setup", str, elapsed);
+      phase_start = tcc_getclock_ms();
+    }
+
     if (s1->output_type == TCC_OUTPUT_PREPROCESS)
     {
       tcc_preprocess(s1);
     }
     else
     {
-      tccelf_begin_file(s1);
       if (filetype & (AFF_TYPE_ASM | AFF_TYPE_ASMPP))
       {
         tcc_assemble(s1, !!(filetype & AFF_TYPE_ASMPP));
@@ -712,13 +732,36 @@ static int tcc_compile(TCCState *s1, int filetype, const char *str, int fd)
       {
         tccgen_compile(s1);
       }
-      tccelf_end_file(s1);
     }
+
+    if (s1->do_bench)
+    {
+      unsigned elapsed = tcc_getclock_ms() - phase_start;
+      s1->bench_compile_exec_time += elapsed;
+      s1->bench_compile_exec_count++;
+      tcc_bench_log(s1, "compile-exec", str, elapsed);
+      phase_start = tcc_getclock_ms();
+    }
+
+    if (s1->output_type != TCC_OUTPUT_PREPROCESS)
+      tccelf_end_file(s1);
   }
   tccgen_finish(s1);
   preprocess_end(s1);
   s1->error_set_jmp_enabled = 0;
   tcc_exit_state(s1);
+  if (s1->do_bench)
+  {
+    unsigned now = tcc_getclock_ms();
+    unsigned finalize_elapsed = now - phase_start;
+    unsigned elapsed = now - compile_start;
+    s1->bench_compile_finalize_time += finalize_elapsed;
+    s1->bench_compile_finalize_count++;
+    tcc_bench_log(s1, "compile-finalize", str, finalize_elapsed);
+    s1->bench_compile_time += elapsed;
+    s1->bench_compile_count++;
+    tcc_bench_log(s1, filetype & (AFF_TYPE_ASM | AFF_TYPE_ASMPP) ? "assemble" : "compile", str, elapsed);
+  }
   return s1->nb_errors != 0 ? -1 : 0;
 }
 
@@ -948,6 +991,8 @@ static int guess_filetype(const char *filename);
 ST_FUNC int tcc_add_file_internal(TCCState *s1, const char *filename, int flags)
 {
   int fd, ret = -1;
+  unsigned open_start = 0;
+  unsigned elapsed = 0;
 
   if (0 == (flags & AFF_TYPE_MASK))
     flags |= guess_filetype(filename);
@@ -957,7 +1002,16 @@ ST_FUNC int tcc_add_file_internal(TCCState *s1, const char *filename, int flags)
     return 0;
 
   /* open the file */
+  if (s1->do_bench)
+    open_start = tcc_getclock_ms();
   fd = _tcc_open(s1, filename);
+  if (s1->do_bench)
+  {
+    elapsed = tcc_getclock_ms() - open_start;
+    s1->bench_file_open_time += elapsed;
+    s1->bench_file_open_count++;
+    tcc_bench_log(s1, "open", filename, elapsed);
+  }
   if (fd < 0)
   {
     if (flags & AFF_PRINT_ERROR)
@@ -994,7 +1048,9 @@ ST_FUNC int tcc_add_file_internal(TCCState *s1, const char *filename, int flags)
       {
       }
       else
+      {
         ret = tcc_load_dll(s1, fd, filename, (flags & AFF_REFERENCED_DLL) != 0);
+      }
       break;
 
     default:
@@ -1062,13 +1118,33 @@ static int tcc_add_library_internal(TCCState *s1, const char *fmt, const char *f
 {
   char buf[1024];
   int i, ret;
+  unsigned resolve_start = 0;
+
+  if (s1->do_bench)
+    resolve_start = tcc_getclock_ms();
 
   for (i = 0; i < nb_paths; i++)
   {
     snprintf(buf, sizeof(buf), fmt, paths[i], filename);
     ret = tcc_add_file_internal(s1, buf, flags & ~AFF_PRINT_ERROR);
     if (ret != FILE_NOT_FOUND)
+    {
+      if (s1->do_bench)
+      {
+        unsigned elapsed = tcc_getclock_ms() - resolve_start;
+        s1->bench_library_resolve_time += elapsed;
+        s1->bench_library_resolve_count++;
+        tcc_bench_log(s1, "resolve-lib", buf, elapsed);
+      }
       return ret;
+    }
+  }
+  if (s1->do_bench)
+  {
+    unsigned elapsed = tcc_getclock_ms() - resolve_start;
+    s1->bench_library_resolve_time += elapsed;
+    s1->bench_library_resolve_count++;
+    tcc_bench_log(s1, "resolve-lib", filename, elapsed);
   }
   if (flags & AFF_PRINT_ERROR)
     tcc_error_noabort("library '%s' not found", filename);
@@ -1625,6 +1701,9 @@ static const FlagDef options_f[] = {{offsetof(TCCState, char_is_unsigned), 0, "u
                                     {offsetof(TCCState, opt_strength_red), 0, "strength-red"},
                                     {offsetof(TCCState, opt_iv_strength_red), 0, "iv-strength-red"},
                                     {offsetof(TCCState, opt_jump_threading), 0, "jump-threading"},
+                                    {offsetof(TCCState, opt_nonneg_fold), 0, "nonneg-fold"},
+                                    {offsetof(TCCState, opt_vrp), 0, "vrp"},
+                                    {offsetof(TCCState, opt_float_narrow), 0, "float-narrow"},
                                     {offsetof(TCCState, instrument_functions), 0, "instrument-functions"},
                                     {0, 0, NULL}};
 
@@ -2214,6 +2293,23 @@ LIBTCCAPI int tcc_set_options(TCCState *s, const char *r)
   return ret < 0 ? ret : 0;
 }
 
+PUB_FUNC void tcc_bench_log(TCCState *s1, const char *operation, const char *name, unsigned elapsed_ms)
+{
+  if (!s1 || !s1->do_bench)
+    return;
+  if (!name || !name[0])
+    name = "<unknown>";
+  fprintf(stderr, "# bench %-14s %6u ms  %s\n", operation, elapsed_ms, name);
+}
+
+static void tcc_print_bench_breakdown(const char *label, unsigned total_time, unsigned count)
+{
+  if (!count)
+    return;
+  fprintf(stderr, "# bench total %-16s %6u ms  %4u calls  %7.2f ms avg\n", label, total_time, count,
+         (double)total_time / count);
+}
+
 PUB_FUNC void tcc_print_stats(TCCState *s1, unsigned total_time)
 {
   if (!total_time)
@@ -2225,6 +2321,23 @@ PUB_FUNC void tcc_print_stats(TCCState *s1, unsigned total_time)
           (double)total_bytes / 1000 / total_time);
   fprintf(stderr, "# text %u, data.rw %u, data.ro %u, bss %u bytes\n", s1->total_output[0], s1->total_output[1],
           s1->total_output[2], s1->total_output[3]);
+  tcc_print_bench_breakdown("open", s1->bench_file_open_time, s1->bench_file_open_count);
+  tcc_print_bench_breakdown("resolve", s1->bench_library_resolve_time, s1->bench_library_resolve_count);
+    tcc_print_bench_breakdown("compile-setup", s1->bench_compile_setup_time, s1->bench_compile_setup_count);
+    tcc_print_bench_breakdown("compile-exec", s1->bench_compile_exec_time, s1->bench_compile_exec_count);
+    tcc_print_bench_breakdown("compile-finalize", s1->bench_compile_finalize_time, s1->bench_compile_finalize_count);
+  tcc_print_bench_breakdown("func-body", s1->bench_function_body_time, s1->bench_function_body_count);
+  tcc_print_bench_breakdown("func-opt", s1->bench_function_opt_time, s1->bench_function_opt_count);
+  tcc_print_bench_breakdown("func-alloc", s1->bench_function_alloc_time, s1->bench_function_alloc_count);
+  tcc_print_bench_breakdown("func-codegen", s1->bench_function_codegen_time, s1->bench_function_codegen_count);
+  tcc_print_bench_breakdown("compile", s1->bench_compile_time, s1->bench_compile_count);
+  tcc_print_bench_breakdown("obj", s1->bench_object_load_time, s1->bench_object_load_count);
+  tcc_print_bench_breakdown("archive", s1->bench_archive_load_time, s1->bench_archive_load_count);
+  if (s1->bench_archive_member_count)
+    fprintf(stderr, "# bench total archive-members %u\n", s1->bench_archive_member_count);
+  tcc_print_bench_breakdown("dll", s1->bench_dll_load_time, s1->bench_dll_load_count);
+  tcc_print_bench_breakdown("ldscript", s1->bench_ldscript_load_time, s1->bench_ldscript_load_count);
+  tcc_print_bench_breakdown("output", s1->bench_output_time, s1->bench_output_count);
 #ifdef MEM_DEBUG
   fprintf(stderr, "# memory usage");
 #ifdef TCC_IS_NATIVE

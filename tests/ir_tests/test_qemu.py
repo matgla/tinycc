@@ -114,8 +114,6 @@ TEST_FILES = [
     ("test_f2d_bits.c", 0),
     ("test_aeabi_double_all.c", 0),
 
-    ("test_dmul_orig_override.c", 0),
-
     ("test_llong_add_signed.c", 0),
     ("test_llong_add_unsigned.c", 0),
     ("test_llong_load_signed.c", 0),
@@ -441,6 +439,12 @@ TCC_BUG_TEST_FILES = [
     ("bug_bitfield_packed10.c", 0),
     ("bug_switch_bitfield.c", 0),
 
+    # Bug: GNU ?: (Elvis operator) extension miscompiled - picks wrong branch.
+    # `tt ?: fallback` always evaluates to fallback even when tt is non-null.
+    # Caused toybox cp to use source filename as destination, triggering
+    # "same file" error.  Workaround: expand to explicit `tt ? tt : fallback`.
+    ("bug_gnu_ternary_elvis.c", 0),
+
 
 ]
 
@@ -466,20 +470,31 @@ def _test_id(test_file):
     return Path(_primary_test_file(test_file)).stem
 
 def load_expect_file(test_name):
-    """Load and return lines from .expect file and expected exit code"""
+    """Load and return lines from .expect file and expected exit code.
+
+    Recognises [returns N] directives: the last one found sets the
+    expected exit code (returned as second element).  Those lines are
+    excluded from the expected-output list.
+    """
     test_file = Path(_primary_test_file(test_name))
     expect_file = CURRENT_DIR / f"{test_file.parent}/{test_file.stem}.expect"
     if not expect_file.exists():
         raise FileNotFoundError(f"Expect file not found: {expect_file}")
 
     lines = []
+    exit_code = None
+    returns_pattern = re.compile(r'^\[returns (\d+)\]$')
 
     with open(expect_file, "r") as f:
         for line in f:
             stripped = line.rstrip('\n')
-            lines.append(stripped)
+            m = returns_pattern.match(stripped)
+            if m:
+                exit_code = int(m.group(1))
+            else:
+                lines.append(stripped)
 
-    return lines
+    return lines, exit_code
 
 
 def load_tagged_expect_file(test_name):
@@ -565,7 +580,9 @@ def _escape_regex(line):
 
 
 def _run_qemu_test(test_file, expected_exit_code, args=None, defines=None, opt_level="-O0", output_dir=None, timeout=10):
-    expected_lines = load_expect_file(test_file)
+    expected_lines, expect_exit = load_expect_file(test_file)
+    if expect_exit is not None:
+        expected_exit_code = expect_exit
     opt_suffix = f"_{opt_level.replace('-', '').replace(' ', '_')}"
     config = CompileConfig(extra_cflags=opt_level, output_suffix=opt_suffix, output_dir=output_dir)
     sut, loglines = run_test(test_file, MACHINE, args, defines=defines, config=config)

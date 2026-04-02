@@ -4827,17 +4827,34 @@ static int elf_output_obj(TCCState *s1, const char *filename)
 
 LIBTCCAPI int tcc_output_file(TCCState *s, const char *filename)
 {
+  unsigned output_start = 0;
+  int ret;
+
+  if (s->do_bench)
+    output_start = tcc_getclock_ms();
+
   if (s->test_coverage)
     tcc_tcov_add_file(s, filename);
   if (s->output_type == TCC_OUTPUT_OBJ)
-    return elf_output_obj(s, filename);
+    ret = elf_output_obj(s, filename);
 #ifdef TCC_TARGET_PE
-  return pe_output_file(s, filename);
+  else
+    ret = pe_output_file(s, filename);
 #elif defined TCC_TARGET_MACHO
-  return macho_output_file(s, filename);
+  else
+    ret = macho_output_file(s, filename);
 #else
-  return elf_output_file(s, filename);
+  else
+    ret = elf_output_file(s, filename);
 #endif
+  if (s->do_bench)
+  {
+    unsigned elapsed = tcc_getclock_ms() - output_start;
+    s->bench_output_time += elapsed;
+    s->bench_output_count++;
+    tcc_bench_log(s, "output", filename, elapsed);
+  }
+  return ret;
 }
 
 ST_FUNC ssize_t full_read(int fd, void *buf, size_t count)
@@ -4949,6 +4966,10 @@ ST_FUNC int tcc_load_object_file(TCCState *s1, int fd, unsigned long file_offset
   ElfW(Sym) * sym, *symtab;
   ElfW_Rel *rel;
   Section *s;
+  unsigned object_start = 0;
+
+  if (s1->do_bench)
+    object_start = tcc_getclock_ms();
 
   /* Use lazy loading for aggressive GC mode */
   if (s1->gc_sections_aggressive)
@@ -5254,6 +5275,16 @@ ST_FUNC int tcc_load_object_file(TCCState *s1, int fd, unsigned long file_offset
 
   ret = 0;
 the_end:
+  if (s1->do_bench)
+  {
+    unsigned elapsed = tcc_getclock_ms() - object_start;
+    s1->bench_object_load_time += elapsed;
+    s1->bench_object_load_count++;
+    if (s1->current_archive_offset)
+      s1->bench_archive_member_count++;
+    else
+      tcc_bench_log(s1, "load-obj", s1->current_filename, elapsed);
+  }
   tcc_free(symtab);
   tcc_free(strtab);
   tcc_free(old_to_new_syms);
@@ -5373,6 +5404,15 @@ ST_FUNC int tcc_load_archive(TCCState *s1, int fd, int alacarte)
   ElfW(Ehdr) ehdr;
   unsigned long saved_archive_offset;
   const char *saved_archive_path;
+  unsigned archive_start = 0;
+  unsigned members_before = 0;
+  char archive_desc[1088];
+
+  if (s1->do_bench)
+  {
+    archive_start = tcc_getclock_ms();
+    members_before = s1->bench_archive_member_count;
+  }
 
   /* skip magic which was already checked */
   /* full_read(fd, magic, sizeof(magic)); */
@@ -5388,6 +5428,16 @@ ST_FUNC int tcc_load_archive(TCCState *s1, int fd, int alacarte)
     len = read_ar_header(fd, file_offset, &hdr);
     if (len == 0)
     {
+      if (s1->do_bench)
+      {
+        unsigned elapsed = tcc_getclock_ms() - archive_start;
+        unsigned members_loaded = s1->bench_archive_member_count - members_before;
+        s1->bench_archive_load_time += elapsed;
+        s1->bench_archive_load_count++;
+        snprintf(archive_desc, sizeof(archive_desc), "%s (%u members)",
+                 s1->current_filename ? s1->current_filename : "<archive>", members_loaded);
+        tcc_bench_log(s1, "load-archive", archive_desc, elapsed);
+      }
       s1->current_archive_offset = saved_archive_offset;
       s1->current_archive_path = saved_archive_path;
       return 0;
@@ -5406,6 +5456,16 @@ ST_FUNC int tcc_load_archive(TCCState *s1, int fd, int alacarte)
       if (!strcmp(hdr.ar_name, "/"))
       {
         int ret = tcc_load_alacarte(s1, fd, size, 4);
+        if (s1->do_bench)
+        {
+          unsigned elapsed = tcc_getclock_ms() - archive_start;
+          unsigned members_loaded = s1->bench_archive_member_count - members_before;
+          s1->bench_archive_load_time += elapsed;
+          s1->bench_archive_load_count++;
+          snprintf(archive_desc, sizeof(archive_desc), "%s (%u members)",
+                   s1->current_filename ? s1->current_filename : "<archive>", members_loaded);
+          tcc_bench_log(s1, "load-archive", archive_desc, elapsed);
+        }
         s1->current_archive_offset = saved_archive_offset;
         s1->current_archive_path = saved_archive_path;
         return ret;
@@ -5413,6 +5473,16 @@ ST_FUNC int tcc_load_archive(TCCState *s1, int fd, int alacarte)
       if (!strcmp(hdr.ar_name, "/SYM64/"))
       {
         int ret = tcc_load_alacarte(s1, fd, size, 8);
+        if (s1->do_bench)
+        {
+          unsigned elapsed = tcc_getclock_ms() - archive_start;
+          unsigned members_loaded = s1->bench_archive_member_count - members_before;
+          s1->bench_archive_load_time += elapsed;
+          s1->bench_archive_load_count++;
+          snprintf(archive_desc, sizeof(archive_desc), "%s (%u members)",
+                   s1->current_filename ? s1->current_filename : "<archive>", members_loaded);
+          tcc_bench_log(s1, "load-archive", archive_desc, elapsed);
+        }
         s1->current_archive_offset = saved_archive_offset;
         s1->current_archive_path = saved_archive_path;
         return ret;
@@ -5589,6 +5659,10 @@ ST_FUNC int tcc_load_dll(TCCState *s1, int fd, const char *filename, int level)
   int sym_index;
   const char *name, *soname;
   struct versym_info v;
+  unsigned dll_start = 0;
+
+  if (s1->do_bench)
+    dll_start = tcc_getclock_ms();
 
   full_read(fd, &ehdr, sizeof(ehdr));
 
@@ -5703,6 +5777,13 @@ ST_FUNC int tcc_load_dll(TCCState *s1, int fd, const char *filename, int level)
 ret_success:
   ret = 0;
 the_end:
+  if (s1->do_bench)
+  {
+    unsigned elapsed = tcc_getclock_ms() - dll_start;
+    s1->bench_dll_load_time += elapsed;
+    s1->bench_dll_load_count++;
+    tcc_bench_log(s1, "load-dll", filename, elapsed);
+  }
   tcc_free(dynstr);
   tcc_free(dynsym);
   tcc_free(dynamic);
@@ -5967,6 +6048,10 @@ ST_FUNC int tcc_load_ldscript(TCCState *s1, int fd)
   char cmd[64];
   char filename[1024];
   int t, ret;
+  unsigned ldscript_start = 0;
+
+  if (s1->do_bench)
+    ldscript_start = tcc_getclock_ms();
 
   s1->fd = fd;
   s1->cc = -1;
@@ -5974,7 +6059,16 @@ ST_FUNC int tcc_load_ldscript(TCCState *s1, int fd)
   {
     t = ld_next(s1, cmd, sizeof(cmd));
     if (t == LD_TOK_EOF)
+    {
+      if (s1->do_bench)
+      {
+        unsigned elapsed = tcc_getclock_ms() - ldscript_start;
+        s1->bench_ldscript_load_time += elapsed;
+        s1->bench_ldscript_load_count++;
+        tcc_bench_log(s1, "ldscript", s1->current_filename, elapsed);
+      }
       return 0;
+    }
     else if (t != LD_TOK_NAME)
       return -1;
     if (!strcmp(cmd, "INPUT") || !strcmp(cmd, "GROUP"))

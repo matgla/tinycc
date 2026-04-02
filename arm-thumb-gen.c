@@ -6313,23 +6313,18 @@ static void thumb_process_complex_mul_mop(MachineOperand src1, MachineOperand sr
 }
 
 /* Process complex float division via MachineOperands.
- * Calls __divsc3 from libgcc for numerically robust division.
+ * (a+bi) / (c+di) = ((ac+bd) + (bc-ad)i) / (c²+d²)
  *
- * __divsc3 calling convention (soft-float AAPCS, hidden return pointer):
- *   R0       = hidden return pointer (8-byte buffer for result)
- *   R1       = a_re (float)
- *   R2       = a_im (float)
- *   R3       = b_re (float)
- *   [sp+0]   = b_im (float, on stack)
- *   Result written to [R0+0..3] = real, [R0+4..7] = imag
+ * Uses __aeabi_fmul, __aeabi_fadd, __aeabi_fsub, __aeabi_fdiv.
+ * Single-precision AEABI calling convention: R0 = arg1, R1 = arg2, result in R0.
  *
- * Stack layout (24 bytes, 8-byte aligned):
- *   [sp+0]   = b_im for __divsc3 stack arg  (4 bytes)
- *   [sp+4]   = a_re staging                 (4 bytes)
- *   [sp+8]   = a_im staging                 (4 bytes)
- *   [sp+12]  = b_re staging                 (4 bytes)
- *   [sp+16]  = result buffer: real part      (4 bytes)
- *   [sp+20]  = result buffer: imag part      (4 bytes)
+ * Stack layout (24 bytes):
+ *   [sp+20] = d  (imag of src2)
+ *   [sp+16] = c  (real of src2)
+ *   [sp+12] = b  (imag of src1)
+ *   [sp+8]  = a  (real of src1)
+ *   [sp+4]  = scratch1
+ *   [sp+0]  = scratch0
  */
 static void thumb_process_complex_div_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest)
 {
@@ -6338,36 +6333,97 @@ static void thumb_process_complex_div_mop(MachineOperand src1, MachineOperand sr
   MachineOperand s2_real = mach_make_lo_half(&src2);
   MachineOperand s2_imag = mach_make_hi_half(&src2);
 
-  /* Allocate 24 bytes (8-byte aligned). */
+  /* Allocate 24 bytes on stack */
   ot_check(th_sub_sp_imm(R_SP, 24, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
 
-  /* Stage all four operands to stack via R0 to avoid clobbering. */
-  fp_mop_load_arg(R0, &s2_imag);
-  ot_check(th_str_imm(R0, R_SP, 0, 6, ENFORCE_ENCODING_NONE)); /* b_im → [sp+0] (stack arg) */
+  /* Save inputs to stack */
   fp_mop_load_arg(R0, &s1_real);
-  ot_check(th_str_imm(R0, R_SP, 4, 6, ENFORCE_ENCODING_NONE)); /* a_re → [sp+4] */
+  ot_check(th_str_imm(R0, R_SP, 8, 6, ENFORCE_ENCODING_NONE)); /* a */
   fp_mop_load_arg(R0, &s1_imag);
-  ot_check(th_str_imm(R0, R_SP, 8, 6, ENFORCE_ENCODING_NONE)); /* a_im → [sp+8] */
+  ot_check(th_str_imm(R0, R_SP, 12, 6, ENFORCE_ENCODING_NONE)); /* b */
   fp_mop_load_arg(R0, &s2_real);
-  ot_check(th_str_imm(R0, R_SP, 12, 6, ENFORCE_ENCODING_NONE)); /* b_re → [sp+12] */
+  ot_check(th_str_imm(R0, R_SP, 16, 6, ENFORCE_ENCODING_NONE)); /* c */
+  fp_mop_load_arg(R0, &s2_imag);
+  ot_check(th_str_imm(R0, R_SP, 20, 6, ENFORCE_ENCODING_NONE)); /* d */
 
-  /* Load register args from staging area. */
-  ot_check(th_ldr_imm(R1, R_SP, 4, 6, ENFORCE_ENCODING_NONE));  /* R1 = a_re */
-  ot_check(th_ldr_imm(R2, R_SP, 8, 6, ENFORCE_ENCODING_NONE));  /* R2 = a_im */
-  ot_check(th_ldr_imm(R3, R_SP, 12, 6, ENFORCE_ENCODING_NONE)); /* R3 = b_re */
+  const int off_scratch0 = 0;
+  const int off_scratch1 = 4;
+  const int off_a = 8;
+  const int off_b = 12;
+  const int off_c = 16;
+  const int off_d = 20;
 
-  /* R0 = pointer to result buffer at [sp+16]. */
-  ot_check(th_add_sp_imm(R0, 16, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+  /* Step 1: ac = a * c → scratch0 */
+  ot_check(th_ldr_imm(R0, R_SP, off_a, 6, ENFORCE_ENCODING_NONE));
+  ot_check(th_ldr_imm(R1, R_SP, off_c, 6, ENFORCE_ENCODING_NONE));
+  fp_mop_do_bl("__aeabi_fmul");
+  ot_check(th_str_imm(R0, R_SP, off_scratch0, 6, ENFORCE_ENCODING_NONE));
 
-  /* Call __divsc3. */
-  fp_mop_do_bl("__divsc3");
+  /* Step 2: bd = b * d → scratch1 */
+  ot_check(th_ldr_imm(R0, R_SP, off_b, 6, ENFORCE_ENCODING_NONE));
+  ot_check(th_ldr_imm(R1, R_SP, off_d, 6, ENFORCE_ENCODING_NONE));
+  fp_mop_do_bl("__aeabi_fmul");
+  ot_check(th_str_imm(R0, R_SP, off_scratch1, 6, ENFORCE_ENCODING_NONE));
 
-  /* Read result from buffer and write back to dest. */
+  /* Step 3: real_num = ac + bd → scratch0 */
+  ot_check(th_ldr_imm(R0, R_SP, off_scratch0, 6, ENFORCE_ENCODING_NONE));
+  ot_check(th_ldr_imm(R1, R_SP, off_scratch1, 6, ENFORCE_ENCODING_NONE));
+  fp_mop_do_bl("__aeabi_fadd");
+  ot_check(th_str_imm(R0, R_SP, off_scratch0, 6, ENFORCE_ENCODING_NONE));
+
+  /* Step 4: ad = a * d → scratch1 */
+  ot_check(th_ldr_imm(R0, R_SP, off_a, 6, ENFORCE_ENCODING_NONE));
+  ot_check(th_ldr_imm(R1, R_SP, off_d, 6, ENFORCE_ENCODING_NONE));
+  fp_mop_do_bl("__aeabi_fmul");
+  ot_check(th_str_imm(R0, R_SP, off_scratch1, 6, ENFORCE_ENCODING_NONE));
+
+  /* Step 5: bc = b * c → off_a (no longer needed) */
+  ot_check(th_ldr_imm(R0, R_SP, off_b, 6, ENFORCE_ENCODING_NONE));
+  ot_check(th_ldr_imm(R1, R_SP, off_c, 6, ENFORCE_ENCODING_NONE));
+  fp_mop_do_bl("__aeabi_fmul");
+  ot_check(th_str_imm(R0, R_SP, off_a, 6, ENFORCE_ENCODING_NONE));
+
+  /* Step 6: imag_num = bc - ad → scratch1 */
+  ot_check(th_ldr_imm(R0, R_SP, off_a, 6, ENFORCE_ENCODING_NONE));
+  ot_check(th_ldr_imm(R1, R_SP, off_scratch1, 6, ENFORCE_ENCODING_NONE));
+  fp_mop_do_bl("__aeabi_fsub");
+  ot_check(th_str_imm(R0, R_SP, off_scratch1, 6, ENFORCE_ENCODING_NONE));
+
+  /* Step 7: cc = c * c → off_a */
+  ot_check(th_ldr_imm(R0, R_SP, off_c, 6, ENFORCE_ENCODING_NONE));
+  ot_check(th_ldr_imm(R1, R_SP, off_c, 6, ENFORCE_ENCODING_NONE));
+  fp_mop_do_bl("__aeabi_fmul");
+  ot_check(th_str_imm(R0, R_SP, off_a, 6, ENFORCE_ENCODING_NONE));
+
+  /* Step 8: dd = d * d → off_b (no longer needed) */
+  ot_check(th_ldr_imm(R0, R_SP, off_d, 6, ENFORCE_ENCODING_NONE));
+  ot_check(th_ldr_imm(R1, R_SP, off_d, 6, ENFORCE_ENCODING_NONE));
+  fp_mop_do_bl("__aeabi_fmul");
+  ot_check(th_str_imm(R0, R_SP, off_b, 6, ENFORCE_ENCODING_NONE));
+
+  /* Step 9: denom = cc + dd → off_a */
+  ot_check(th_ldr_imm(R0, R_SP, off_a, 6, ENFORCE_ENCODING_NONE));
+  ot_check(th_ldr_imm(R1, R_SP, off_b, 6, ENFORCE_ENCODING_NONE));
+  fp_mop_do_bl("__aeabi_fadd");
+  ot_check(th_str_imm(R0, R_SP, off_a, 6, ENFORCE_ENCODING_NONE));
+
+  /* Step 10: real = real_num / denom → scratch0 */
+  ot_check(th_ldr_imm(R0, R_SP, off_scratch0, 6, ENFORCE_ENCODING_NONE));
+  ot_check(th_ldr_imm(R1, R_SP, off_a, 6, ENFORCE_ENCODING_NONE));
+  fp_mop_do_bl("__aeabi_fdiv");
+  ot_check(th_str_imm(R0, R_SP, off_scratch0, 6, ENFORCE_ENCODING_NONE));
+
+  /* Step 11: imag = imag_num / denom → scratch1 */
+  ot_check(th_ldr_imm(R0, R_SP, off_scratch1, 6, ENFORCE_ENCODING_NONE));
+  ot_check(th_ldr_imm(R1, R_SP, off_a, 6, ENFORCE_ENCODING_NONE));
+  fp_mop_do_bl("__aeabi_fdiv");
+  ot_check(th_str_imm(R0, R_SP, off_scratch1, 6, ENFORCE_ENCODING_NONE));
+
+  /* Load results and write back */
   MachineOperand d_real = mach_make_lo_half(&dest);
   MachineOperand d_imag = mach_make_hi_half(&dest);
-  ot_check(th_ldr_imm(R0, R_SP, 16, 6, ENFORCE_ENCODING_NONE)); /* real */
-  ot_check(th_ldr_imm(R1, R_SP, 20, 6, ENFORCE_ENCODING_NONE)); /* imag */
-
+  ot_check(th_ldr_imm(R0, R_SP, off_scratch0, 6, ENFORCE_ENCODING_NONE)); /* real */
+  ot_check(th_ldr_imm(R1, R_SP, off_scratch1, 6, ENFORCE_ENCODING_NONE)); /* imag */
   ot_check(th_add_sp_imm(R_SP, 24, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
 
   complex_pair_writeback(&d_real, R0, &d_imag, R1);
@@ -6625,6 +6681,21 @@ ST_FUNC void tcc_gen_machine_fp_mop(MachineOperand src1, MachineOperand src2, Ma
 ST_FUNC void tcc_gen_machine_return_value_mop(MachineOperand src, TccIrOp op)
 {
   (void)op;
+
+  /* DEBUG: trace return value codegen for fmax/fmin/my_fmax/pick_gt */
+  if (funcname &&
+      (strcmp(funcname, "fmax") == 0 || strcmp(funcname, "fmin") == 0 || strcmp(funcname, "my_fmax") == 0 ||
+       strcmp(funcname, "my_fmin") == 0 || strcmp(funcname, "pick_gt") == 0 || strcmp(funcname, "pick_lt") == 0 ||
+       strcmp(funcname, "just_return_y") == 0 || strcmp(funcname, "just_return_x") == 0))
+  {
+    fprintf(stderr, "[RETVAL] func=%s kind=%d is_64bit=%d btype=%d vreg=%d", funcname, src.kind, src.is_64bit,
+            src.btype, src.vreg);
+    if (src.kind == MACH_OP_REG)
+      fprintf(stderr, " r0=%d r1=%d", src.u.reg.r0, src.u.reg.r1);
+    else if (src.kind == MACH_OP_SPILL)
+      fprintf(stderr, " spill_off=%d", src.u.spill.offset);
+    fprintf(stderr, "\n");
+  }
 
   /* 64-bit return: lo word → R0 (REG_IRET), hi word → R1 (REG_IRE2).
    * AAPCS guarantees that for a 64-bit pair src.u.reg.r1 = src.u.reg.r0 + 1 ≥ R1,
@@ -8131,8 +8202,10 @@ static void place_stack_arg_32bit(const MachineOperand *mop, int stack_offset, C
     }
     else
     {
-      /* Register-indirect: load through the register, then store to stack. */
-      ot_check(th_ldr_imm(ARM_R12, mop->u.reg.r0, 0, 6, ENFORCE_ENCODING_NONE));
+      /* Register-indirect: load through the register, then store to stack.
+       * Must use btype-aware load so that byte/short values are properly
+       * zero/sign-extended (LDRB/LDRH) instead of always doing a word LDR. */
+      load_from_base(ARM_R12, PREG_REG_NONE, mop->btype, mop->is_unsigned, 0, 0, mop->u.reg.r0);
       store_word_to_stack(ARM_R12, stack_offset);
     }
     break;
@@ -8515,6 +8588,8 @@ ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand ca
   /* Restore scratch register exclusion */
   scratch_global_exclude = saved_scratch_exclude;
 
+  handle_return_value_mop(&dest_mop, drop_value);
+
   /* === Cleanup === */
   if (stack_size > 0)
   {
@@ -8527,8 +8602,6 @@ ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand ca
     ot_check(th_pop((uint16_t)arg_regs_push_mask));
     call_site->used_stack_size -= arg_regs_push_count * 4;
   }
-
-  handle_return_value_mop(&dest_mop, drop_value);
 
   call_site->registers_map &= ~0x0F; /* Clear R0-R3 */
 
@@ -9333,4 +9406,142 @@ ST_FUNC void tcc_gen_machine_func_parameter_mop(MachineOperand src1, MachineOper
 
   /* Store parameter information - for now just mark as present */
   call_site->function_argument_list[param_index] = 1; /* Mark parameter as present */
+}
+/* Emit a nested-function trampoline into the current text section.
+ * chain_slot_sym: TCC symbol for the chain slot in .data
+ * func_sym:       TCC symbol for the nested function in .text
+ *
+ * The trampoline loads the parent frame pointer from the chain slot
+ * into R10 (the static-chain register) and tail-calls the nested function.
+ *
+ * Two variants:
+ *  - GOT-indirect (text_and_data_separation): uses R9-relative GOT loads,
+ *    relocations are R_ARM_GOT32 (linker-resolved, no absolute addresses
+ *    in the code section).
+ *  - Direct: inline literal pool with R_ARM_ABS32 relocations.
+ */
+ST_FUNC addr_t gen_nested_func_trampoline(Sym *chain_slot_sym, Sym *func_sym)
+{
+  Section *text_sec = cur_text_section;
+  int use_got = tcc_state->text_and_data_separation;
+
+  section_prealloc(text_sec, use_got ? 36 : 24);
+
+  /* Align ind to 4-byte boundary */
+  while (ind & 3)
+    text_sec->data[ind++] = 0x00;
+
+  addr_t tramp_start = ind;
+
+  if (use_got)
+  {
+    /* GOT-indirect trampoline (32 bytes):
+     *   +0:  LDR  r12, [pc, #20]  ; GOT offset of chain_slot (from +24)
+     *   +4:  LDR  r10, [r9, r12]  ; chain_slot address via GOT
+     *   +8:  LDR  r10, [r10, #0]  ; *chain_slot = parent FP
+     *   +12: LDR  r12, [pc, #12]  ; GOT offset of function (from +28)
+     *   +16: LDR  r12, [r9, r12]  ; function address via GOT
+     *   +20: BX   r12             ; tail-call
+     *   +22: NOP
+     *   +24: .word 0              ; R_ARM_GOT32 chain_slot
+     *   +28: .word 0              ; R_ARM_GOT32 function
+     */
+
+    /* +0: LDR R12, [PC, #20] - F8DF C014 */
+    text_sec->data[ind++] = 0xDF;
+    text_sec->data[ind++] = 0xF8;
+    text_sec->data[ind++] = 0x14;
+    text_sec->data[ind++] = 0xC0;
+
+    /* +4: LDR R10, [R9, R12] - F859 A00C */
+    text_sec->data[ind++] = 0x59;
+    text_sec->data[ind++] = 0xF8;
+    text_sec->data[ind++] = 0x0C;
+    text_sec->data[ind++] = 0xA0;
+
+    /* +8: LDR R10, [R10, #0] - F8DA A000 */
+    text_sec->data[ind++] = 0xDA;
+    text_sec->data[ind++] = 0xF8;
+    text_sec->data[ind++] = 0x00;
+    text_sec->data[ind++] = 0xA0;
+
+    /* +12: LDR R12, [PC, #12] - F8DF C00C */
+    text_sec->data[ind++] = 0xDF;
+    text_sec->data[ind++] = 0xF8;
+    text_sec->data[ind++] = 0x0C;
+    text_sec->data[ind++] = 0xC0;
+
+    /* +16: LDR R12, [R9, R12] - F859 C00C */
+    text_sec->data[ind++] = 0x59;
+    text_sec->data[ind++] = 0xF8;
+    text_sec->data[ind++] = 0x0C;
+    text_sec->data[ind++] = 0xC0;
+
+    /* +20: BX R12 - 4760 */
+    text_sec->data[ind++] = 0x60;
+    text_sec->data[ind++] = 0x47;
+
+    /* +22: NOP - BF00 */
+    text_sec->data[ind++] = 0x00;
+    text_sec->data[ind++] = 0xBF;
+
+    /* +24: chain slot GOT offset */
+    greloc(text_sec, chain_slot_sym, ind, R_ARM_GOT32);
+    text_sec->data[ind++] = 0x00;
+    text_sec->data[ind++] = 0x00;
+    text_sec->data[ind++] = 0x00;
+    text_sec->data[ind++] = 0x00;
+
+    /* +28: function GOT offset */
+    greloc(text_sec, func_sym, ind, R_ARM_GOT32);
+    text_sec->data[ind++] = 0x00;
+    text_sec->data[ind++] = 0x00;
+    text_sec->data[ind++] = 0x00;
+    text_sec->data[ind++] = 0x00;
+  }
+  else
+  {
+    /* Direct trampoline (20 bytes):
+     *   +0:  LDR  r10, [pc, #8]   ; chain_slot address (from +12)
+     *   +4:  LDR  r10, [r10, #0]  ; *chain_slot = parent FP
+     *   +8:  LDR  pc, [pc, #4]    ; function address (from +16), tail call
+     *   +12: .word chain_slot     ; R_ARM_ABS32
+     *   +16: .word function        ; R_ARM_ABS32
+     */
+
+    /* LDR R10, [PC, #8] - F8DF A008 */
+    text_sec->data[ind++] = 0xDF;
+    text_sec->data[ind++] = 0xF8;
+    text_sec->data[ind++] = 0x08;
+    text_sec->data[ind++] = 0xA0;
+
+    /* LDR R10, [R10, #0] - F8DA A000 */
+    text_sec->data[ind++] = 0xDA;
+    text_sec->data[ind++] = 0xF8;
+    text_sec->data[ind++] = 0x00;
+    text_sec->data[ind++] = 0xA0;
+
+    /* LDR PC, [PC, #4] - F8DF F004 */
+    text_sec->data[ind++] = 0xDF;
+    text_sec->data[ind++] = 0xF8;
+    text_sec->data[ind++] = 0x04;
+    text_sec->data[ind++] = 0xF0;
+
+    /* chain slot address */
+    greloc(text_sec, chain_slot_sym, ind, R_ARM_ABS32);
+    text_sec->data[ind++] = 0x00;
+    text_sec->data[ind++] = 0x00;
+    text_sec->data[ind++] = 0x00;
+    text_sec->data[ind++] = 0x00;
+
+    /* function address */
+    greloc(text_sec, func_sym, ind, R_ARM_ABS32);
+    text_sec->data[ind++] = 0x00;
+    text_sec->data[ind++] = 0x00;
+    text_sec->data[ind++] = 0x00;
+    text_sec->data[ind++] = 0x00;
+  }
+
+  text_sec->data_offset = ind;
+  return tramp_start + 1; /* +1 for Thumb interworking bit */
 }

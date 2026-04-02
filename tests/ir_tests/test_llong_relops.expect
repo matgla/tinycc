@@ -1,2 +1,12 @@
 Testing long long relational operators
+Case 0: a=0 b=0
+Case 1: a=1 b=0
+Case 2: a=0 b=1
+Case 3: a=-1 b=0
+Case 4: a=0 b=-1
+Case 5: a=-1 b=-1
+Case 6: a=-9223372036854775808 b=0
+Case 7: a=9223372036854775807 b=-9223372036854775808
+Case 8: a=4294967296 b=4294967297
+Case 9: a=-8589934592 b=-17179869184
 PASS

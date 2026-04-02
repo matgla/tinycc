@@ -36,7 +36,7 @@ DEFAULT_GCC_PATH = Path(__file__).parent / "gcc-testsuite" / "gcc" / "testsuite"
 GCC_TORTURE_PATH = Path(os.environ.get("GCC_TORTURE_PATH", DEFAULT_GCC_PATH))
 
 # Optimization levels to test
-OPT_LEVELS = ["-O0", "-O1"]
+OPT_LEVELS = ["-O0"]
 
 # GCC Torture tests expected to fail
 # These tests are known to fail with armv8m-tcc

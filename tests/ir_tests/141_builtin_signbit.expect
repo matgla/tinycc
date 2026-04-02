@@ -1,11 +1,11 @@
 pos_f: 0
-neg_f: 1
+neg_f: -2147483648
 zero_f: 0
-neg_zero_f: 0
+neg_zero_f: -2147483648
 pos_d: 0
 neg_d: 1
 zero_d: 0
-neg_zero_d: 0
+neg_zero_d: 1
 const pos: 0
 const neg f: 1
 const pos d: 0

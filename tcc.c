@@ -21,6 +21,10 @@
 #include "tcc.h"
 #include "tcctools.c"
 
+#if defined(TCC_IS_NATIVE) && defined(TARGETOS_YasOS)
+#include <sys/perf.h>
+#endif
+
 static const char help[] = "Tiny C Compiler " TCC_VERSION " - Copyright (C) 2001-2006 Fabrice Bellard\n"
                            "Usage: tcc [options...] [-o outfile] [-c] infile(s)...\n"
                            "       tcc [options...] -run infile (or --) [arguments...]\n"
@@ -279,17 +283,6 @@ static char *default_outputfile(TCCState *s, const char *first_file)
   return tcc_strdup(buf);
 }
 
-static unsigned getclock_ms(void)
-{
-#ifdef _WIN32
-  return GetTickCount();
-#else
-  struct timeval tv;
-  gettimeofday(&tv, NULL);
-  return tv.tv_sec * 1000 + (tv.tv_usec + 500) / 1000;
-#endif
-}
-
 int main(int argc0, char **argv0)
 {
   TCCState *s, *s1;
@@ -395,7 +388,7 @@ redo:
       goto cleanup_early;
     }
     if (s->do_bench)
-      start_time = getclock_ms();
+      start_time = tcc_getclock_ms();
   }
 
   set_environment(s);
@@ -506,7 +499,7 @@ redo:
   } while (++n < s->nb_files && 0 == ret && (s->output_type != TCC_OUTPUT_OBJ || s->option_r));
 
   if (s->do_bench)
-    end_time = getclock_ms();
+    end_time = tcc_getclock_ms();
 
   if (s->run_test)
   {
@@ -545,6 +538,11 @@ redo:
     done = 0; /* compile more files with -c */
   else if (s->do_bench)
     tcc_print_stats(s, end_time - start_time);
+
+#if defined(TCC_IS_NATIVE) && defined(TARGETOS_YasOS)
+  if (s->do_bench)
+    perf_dump_print(1);
+#endif
 
   tcc_delete(s);
 

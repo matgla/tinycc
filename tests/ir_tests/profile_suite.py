@@ -5,10 +5,11 @@ Profile TinyCC compiler memory usage and performance across the test suite.
 Uses the unified qemu_run.py infrastructure with profiling support.
 
 Usage:
-    python profile_suite.py [--output-dir DIR] [--limit N] [--profiler heaptrack|time|perf] [--cflags "..."]
+    python profile_suite.py [--output-dir DIR] [--limit N] [--profiler heaptrack|callgrind|time|perf] [--cflags "..."]
 
 Output:
     - profile_results/heaptrack_*.zst - heaptrack data files (use heaptrack_gui to view)
+    - profile_results/callgrind_*.out - callgrind data files (use kcachegrind/qcachegrind/callgrind_annotate)
     - profile_results/time_*.txt      - GNU time output files
     - profile_results/perf_*.data     - perf data files (use perf report to view)
     - profile_results/perf_*.svg      - CPU flamegraph SVG files (open in browser)
@@ -104,6 +105,9 @@ def print_result(result: CompileResult, test_name: str, idx: int, total: int):
         # Show memory alongside perf samples if available
         if result.max_rss_kb > 0 and result.heap_peak_kb == 0:
             extra += f" rss={result.max_rss_kb}KB"
+    elif result.callgrind_summary > 0:
+        event_name = result.callgrind_event or "events"
+        extra = f" {event_name}={result.callgrind_summary:,}"
     if result.flamegraph_file:
         extra += " [flamegraph]"
 
@@ -124,6 +128,8 @@ def result_to_dict(result: CompileResult, test_name: str) -> dict:
         "heap_peak_kb": result.heap_peak_kb,
         "heap_allocations": result.heap_allocations,
         "heap_temporary_allocs": result.heap_temporary_allocs,
+        "callgrind_event": result.callgrind_event,
+        "callgrind_summary": result.callgrind_summary,
         "perf_samples": result.perf_samples,
         "flamegraph_file": result.flamegraph_file,
         "profile_file": result.profile_file,
@@ -173,12 +179,15 @@ def write_summary(results, output_dir):
         print(f"Total binary size: {total_bin_size} bytes ({total_bin_size/1024:.2f} KB)")
         # Count flamegraphs generated
         flamegraph_count = sum(1 for r in successful if r.get("flamegraph_file"))
+        callgrind_count = sum(1 for r in successful if r.get("callgrind_summary", 0) > 0)
 
         print(f"\nResults saved to: {output_dir}")
         print(f"  - {csv_file.name}")
         print(f"  - {json_file.name}")
         if max_heap > 0:
             print(f"  - heaptrack_*.zst files (open with heaptrack_gui for memory flamegraphs)")
+        if callgrind_count > 0:
+            print(f"  - {callgrind_count} callgrind_*.out file(s) (open with kcachegrind/qcachegrind or callgrind_annotate)")
         if flamegraph_count > 0:
             print(f"  - {flamegraph_count} perf_*.svg flamegraph(s) (open in browser for CPU profiling)")
 
@@ -190,7 +199,7 @@ def main():
     parser.add_argument("--limit", "-n", type=int, default=0,
                         help="Limit number of tests to run (0 = all)")
     default_profiler = "time" if sys.platform == "darwin" else "heaptrack"
-    profiler_choices = ["heaptrack", "time", "perf"]
+    profiler_choices = ["heaptrack", "callgrind", "time", "perf"]
     if sys.platform == "darwin":
         profiler_choices.append("xctrace")
     parser.add_argument("--profiler", "-p", choices=profiler_choices, default=default_profiler,

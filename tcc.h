@@ -77,6 +77,21 @@ extern long double strtold(const char *__nptr, char **__endptr);
 #define O_BINARY 0
 #endif
 
+#ifdef _WIN32
+static inline unsigned tcc_getclock_ms(void)
+{
+  return GetTickCount();
+}
+#else
+static inline unsigned tcc_getclock_ms(void)
+{
+  struct timeval tv;
+  if (0 == gettimeofday(&tv, NULL))
+    return tv.tv_sec * 1000 + (tv.tv_usec + 500) / 1000;
+  return (unsigned)time(NULL) * 1000;
+}
+#endif
+
 #ifndef offsetof
 #define offsetof(type, field) ((size_t)&((type *)0)->field)
 #endif
@@ -1145,6 +1160,37 @@ struct TCCState
   int total_lines;
   unsigned int total_bytes;
   unsigned int total_output[4];
+  unsigned int bench_file_open_time;
+  unsigned int bench_file_open_count;
+  unsigned int bench_library_resolve_time;
+  unsigned int bench_library_resolve_count;
+  unsigned int bench_compile_setup_time;
+  unsigned int bench_compile_setup_count;
+  unsigned int bench_compile_exec_time;
+  unsigned int bench_compile_exec_count;
+  unsigned int bench_compile_finalize_time;
+  unsigned int bench_compile_finalize_count;
+  unsigned int bench_function_body_time;
+  unsigned int bench_function_body_count;
+  unsigned int bench_function_opt_time;
+  unsigned int bench_function_opt_count;
+  unsigned int bench_function_alloc_time;
+  unsigned int bench_function_alloc_count;
+  unsigned int bench_function_codegen_time;
+  unsigned int bench_function_codegen_count;
+  unsigned int bench_compile_time;
+  unsigned int bench_compile_count;
+  unsigned int bench_object_load_time;
+  unsigned int bench_object_load_count;
+  unsigned int bench_archive_load_time;
+  unsigned int bench_archive_load_count;
+  unsigned int bench_archive_member_count;
+  unsigned int bench_dll_load_time;
+  unsigned int bench_dll_load_count;
+  unsigned int bench_ldscript_load_time;
+  unsigned int bench_ldscript_load_count;
+  unsigned int bench_output_time;
+  unsigned int bench_output_count;
 
   /* option -dnum (for general development purposes) */
   int g_debug;
@@ -1557,6 +1603,7 @@ ST_FUNC void tcc_add_btstub(TCCState *s1);
 #endif
 ST_FUNC void tcc_add_pragma_libs(TCCState *s1);
 PUB_FUNC int tcc_add_library_err(TCCState *s, const char *f);
+PUB_FUNC void tcc_bench_log(TCCState *s1, const char *operation, const char *name, unsigned elapsed_ms);
 PUB_FUNC void tcc_print_stats(TCCState *s, unsigned total_time);
 PUB_FUNC int tcc_parse_args(TCCState *s, int *argc, char ***argv, int optind);
 #ifdef _WIN32
@@ -1909,6 +1956,7 @@ ST_FUNC void o(unsigned int c);
 ST_FUNC void gen_vla_sp_save(int addr);
 ST_FUNC void gen_vla_sp_restore(int addr);
 ST_FUNC void gen_vla_alloc(CType *type, int align);
+ST_FUNC addr_t gen_nested_func_trampoline(Sym *chain_slot_sym, Sym *func_sym);
 
 static inline uint16_t read16le(unsigned char *p)
 {
