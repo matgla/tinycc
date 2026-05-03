@@ -159,20 +159,38 @@ IR > threshold: don't inline` / `try_unroll_loop()` / `try_rotate_loop()`
 
 ## Proposed Architecture: Optimization Engine with Libraries
 
-The goal is to move from a monolithic file to a layered architecture:
+There are now two optimization layers: **SSA-form passes** (run on SSA-renamed IR before destruction) and **pre-SSA passes** (run on flat IR after SSA destruction). Both share the IR core but have distinct infrastructure.
 
 ```
-┌─────────────────────────────────────────┐
-│   Optimization Driver (tccgen.c)        │  <-- pipeline orchestration (existing)
-├─────────────────────────────────────────┤
-│      Individual Passes (opt_*.c)        │  <-- ~10 files, 250-4500 lines each
-├─────────────────────────────────────────┤
-│  Shared Libraries (opt_utils, opt_du,   │  <-- shared infrastructure
-│    opt_alias, opt_loop_utils)           │
-├─────────────────────────────────────────┤
-│         IR Core (core.c, ir.h)          │  <-- existing foundation
-└─────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│          Optimization Driver (tccgen.c)                  │
+├────────────────────────┬─────────────────────────────────┤
+│  SSA Optimization      │  Pre-SSA Optimization           │
+│  Engine (ir/opt/)      │  Passes (ir/opt.c → opt_*.c)    │
+│  ✓ Implemented         │  Existing monolith              │
+│                        │                                 │
+│  cprop, dce            │  ~60 passes: const_prop, cse,   │
+│  + target generators   │  fusion, loop opts, DSE, VRP... │
+├────────────────────────┤                                 │
+│  Target Generators     │                                 │
+│  (arch/arm/)           │                                 │
+│  ✓ Implemented         │                                 │
+├────────────────────────┴─────────────────────────────────┤
+│  Shared Libraries (opt_utils, opt_du, opt_alias,         │
+│    opt_loop_utils) — to be extracted from opt.c          │
+├──────────────────────────────────────────────────────────┤
+│         IR Core (core.c, ir.h, cfg.c, ssa.c)             │
+└──────────────────────────────────────────────────────────┘
 ```
+
+**SSA engine** (`ir/opt/`) — already implemented:
+- Generator-based dispatch: each rewrite rule is an explicit named function (like `thop_*`)
+- Use-def chains built from SSA form (each TEMP vreg has exactly one def)
+- Target-specific generators registered by backend via `tcc_ir_ssa_opt_register_target()`
+- Generic code has no knowledge of the target architecture
+
+**Pre-SSA passes** (`ir/opt.c`) — the monolith below targets splitting into thematic files.
+As SSA passes mature (SCCP, GVN, etc.), more pre-SSA passes become redundant and can be removed rather than split.
 
 ### Library Layer (extract first)
 
@@ -396,7 +414,13 @@ Each step is mechanical: move code, update `#include`s, change `static` to `exte
 
 ---
 
-## Phase 4: Optimization Engine — Building Passes from Blocks
+## Phase 4: Pre-SSA Optimization Engine — Building Passes from Blocks
+
+### Relationship to SSA Optimization Engine
+
+The SSA optimization engine (`ir/opt/`) is already implemented and runs on SSA-renamed IR *before* SSA destruction. It uses a generator-based dispatch pattern inspired by `thop_*` instruction builders, with target-specific generators registered from `arch/arm/`.
+
+This Phase 4 covers the **pre-SSA** optimization engine for the ~60 passes in `ir/opt.c` that run *after* SSA destruction on flat IR. As SSA passes mature (SCCP replaces const_prop, GVN replaces cse_arith, SSA-DCE replaces dce, SSA-fusion replaces mla_fusion/indexed_fusion), pre-SSA passes become redundant and are removed rather than converted. The pre-SSA engine is therefore a **migration bridge** — it makes the remaining pre-SSA passes easier to maintain while SSA equivalents are developed.
 
 ### Motivation
 
@@ -421,26 +445,36 @@ The peephole pattern (~25 passes) has the most uniform structure and benefits mo
 ### Architecture
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│                   Pipeline Driver (tccgen.c)              │
-│  Calls engine runs and hand-written passes in sequence    │
-├──────────────────────────────────────────────────────────┤
-│         Peephole Rule Engine (opt_engine.c)               │
-│  Forward-scan loop, trigger_op dispatch, rule matching    │
-├──────────────────┬───────────────────────────────────────┤
-│  Peephole Rules  │  Hand-written passes (CSE, const      │
-│  (opt_rules_*.c) │  prop, DSE, SL-fwd, VRP, loop opts,  │
-│  ~25 passes      │  DCE, etc.) — ~35 passes              │
-├──────────────────┴───────────────────────────────────────┤
-│              Analysis Cache (opt_analysis.c)              │
-│  def-use (IROptDU), BB boundaries, pred_count             │
-├──────────────────────────────────────────────────────────┤
-│         Shared Infra (opt_utils, opt_hash, opt_du)        │
-│  transform primitives, generic hash table, NOP helpers    │
-├──────────────────────────────────────────────────────────┤
-│                    IR Core (ir.h)                         │
-└──────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────────────┐
+│                        Pipeline Driver (tccgen.c)                        │
+├──────────────────────────────┬────────────────────────────────────────────┤
+│  SSA Opt Engine (ir/opt/)    │  Pre-SSA Opt Engine (ir/opt_engine.c)     │
+│  ✓ Implemented               │  Planned (this phase)                     │
+│                              │                                           │
+│  Generators + use-def chains │  Peephole rules + analysis cache          │
+│  Target gens in arch/arm/    │  Forward-scan loop, trigger_op dispatch   │
+│  Runs on SSA form            │  Runs on flat IR after SSA destruction    │
+├──────────────────────────────┼────────────────┬──────────────────────────┤
+│                              │  Peephole Rules │  Hand-written passes    │
+│                              │  (opt_rules_*) │  (CSE, const prop, DSE, │
+│                              │  ~25 passes    │  VRP, loop opts) ~35    │
+├──────────────────────────────┴────────────────┴──────────────────────────┤
+│                     Analysis Cache (opt_analysis.c)                      │
+│  def-use (IROptDU), BB boundaries, pred_count                            │
+├─────────────────────────────────────────────────────────────────────────-─┤
+│             Shared Infra (opt_utils, opt_hash, opt_du)                   │
+│  transform primitives, generic hash table, NOP helpers                   │
+├──────────────────────────────────────────────────────────────────────────┤
+│                          IR Core (ir.h)                                  │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
+
+**Migration strategy:** As SSA optimization passes mature, pre-SSA equivalents are removed:
+- SSA `ssa_opt_dce` → replaces pre-SSA `tcc_ir_opt_dce`
+- SSA `ssa_opt_cprop` → replaces pre-SSA `tcc_ir_opt_copy_prop`
+- SSA `ssa_gen_arm_fuse_mul_add_to_mla` → replaces pre-SSA `tcc_ir_opt_mla_fusion`
+- Future SSA SCCP → replaces pre-SSA `tcc_ir_opt_const_prop` + `const_prop_tmp` + `value_tracking`
+- Future SSA GVN → replaces pre-SSA `tcc_ir_opt_cse_arith` + `cse_global_load`
 
 ### Block 1: Analysis Cache
 
@@ -974,6 +1008,8 @@ int ir_opt_run_peephole(TCCIRState *ir, IROptAnalysis *a,
 ---
 
 #### Phase 4.4: Fusion Rules (`ir/opt_rules_fusion.c`)
+
+**Note:** SSA equivalents for MLA fusion, indexed memory fusion, and MUL→SHL strength reduction already exist as generators in `arch/arm/ssa_opt_arm.c`. Once the SSA optimization engine fully replaces pre-SSA passes, these pre-SSA fusion rules become unnecessary. This phase is only needed if the pre-SSA engine outlives the SSA migration.
 
 **Goal:** Convert the 7 fusion passes into peephole rules that run in a single engine pass.
 

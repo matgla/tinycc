@@ -1076,6 +1076,10 @@ static int try_reassign_scratch_conflict(TCCIRState *ir, int r, int insn_i)
    * cause the codegen to look in the wrong register after a call/entry. */
   if (ir_iv->incoming_reg0 >= 0)
     return -1;
+  /* Skip phi-pinned intervals: their register is relied upon by identity phi
+   * resolution (no copy was emitted because src and dest share the same reg). */
+  if (ir_iv->phi_pinned)
+    return -1;
 
   /* Compute the union of live register masks across [ls_iv->start .. ls_iv->end].
    * Any register set in this union is occupied by some other live vreg and
@@ -1892,6 +1896,10 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
         save_regs++; /* R9 */
       ir->call_nested_save_size = save_regs * 4;
     }
+    else if (call_count >= 1 && tcc_state->text_and_data_separation)
+    {
+      ir->call_nested_save_size = 4; /* R9 only */
+    }
     else
     {
       ir->call_nested_save_size = 0;
@@ -2099,10 +2107,10 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
 
       ir_to_code_mapping[i] = ind;
 
-      /* Each IR op can be a branch target from elsewhere; clear the
-       * backend's MOV-coalescing cache so cross-IR equivalences inferred
-       * from the emission-order stream cannot be used to elide MOVs on
-       * an entry path that bypasses the earlier MOVs. */
+      /* Reset both MOV-equivalence and STR→LDR caches at every IR
+       * instruction boundary.  Physical registers may be reassigned to
+       * different virtual registers between IR instructions, so cached
+       * equivalences from one instruction are not valid in the next. */
       tcc_gen_machine_mov_coalesce_reset();
 
       /* Real-run only: record original-index mapping and emit debug line info */
@@ -2257,6 +2265,17 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
       case TCCIR_OP_MLA:
       {
         MopArgs a = DECODE(.dest = 1, .src1 = 1, .src2 = 1, .accum = 1);
+        if (TCC_LOG_LS) {
+          IROperand accum_ir_dbg = ir->iroperand_pool[cq->operand_base + 3];
+          int vr_dbg = irop_get_vreg(accum_ir_dbg);
+          IRLiveInterval *li_dbg = (vr_dbg > 0 && tcc_ir_vreg_is_valid(ir, vr_dbg)) ? tcc_ir_vreg_live_interval(ir, vr_dbg) : (IRLiveInterval*)0;
+          LOG_LS("MLA accum: vreg=0x%x type=%d pos=%d tag=%d alloc.r0=%d alloc.off=%d mop.kind=%d mop.off=%d",
+                 vr_dbg, TCCIR_DECODE_VREG_TYPE(vr_dbg), TCCIR_DECODE_VREG_POSITION(vr_dbg),
+                 irop_get_tag(accum_ir_dbg),
+                 li_dbg ? li_dbg->allocation.r0 : -99,
+                 li_dbg ? li_dbg->allocation.offset : -99,
+                 a.accum.kind, a.accum.kind == MACH_OP_SPILL ? a.accum.u.spill.offset : -99);
+        }
         SCRATCH_WRAP(tcc_gen_machine_mla_mop(a.src1, a.src2, a.dest, a.accum));
         break;
       }
@@ -2311,7 +2330,10 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
             }
           }
         }
-        SCRATCH_WRAP(tcc_gen_machine_data_processing_mop(a.src1, a.src2, a.dest, cq->op));
+        {
+          uint32_t bs = ir->barrel_shifts ? ir->barrel_shifts[cq->orig_index] : 0;
+          SCRATCH_WRAP(tcc_gen_machine_data_processing_mop(a.src1, a.src2, a.dest, cq->op, bs));
+        }
         break;
       }
       case TCCIR_OP_CMP:
@@ -2395,6 +2417,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
       case TCCIR_OP_SHL:
       case TCCIR_OP_SHR:
       case TCCIR_OP_SAR:
+      case TCCIR_OP_ROR:
       case TCCIR_OP_OR:
       case TCCIR_OP_AND:
       case TCCIR_OP_XOR:
@@ -2402,7 +2425,10 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
       case TCCIR_OP_ADC_USE:
       {
         MopArgs a = DECODE(.dest = 1, .src1 = 1, .src2 = 1);
-        SCRATCH_WRAP(tcc_gen_machine_data_processing_mop(a.src1, a.src2, a.dest, cq->op));
+        {
+          uint32_t bs = ir->barrel_shifts ? ir->barrel_shifts[cq->orig_index] : 0;
+          SCRATCH_WRAP(tcc_gen_machine_data_processing_mop(a.src1, a.src2, a.dest, cq->op, bs));
+        }
         break;
       }
       case TCCIR_OP_UBFX:
@@ -2562,6 +2588,121 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
       case TCCIR_OP_ASSIGN:
       {
         MopArgs a = DECODE(.dest = 2, .src1 = 1);
+
+        /* LDRD peephole: two adjacent 32-bit assigns loading from adjacent
+         * spill slots into registers → single LDRD instruction. */
+        if (a.src1.kind == MACH_OP_SPILL && !a.src1.needs_deref &&
+            a.dest.kind == MACH_OP_REG && !a.dest.is_64bit &&
+            (a.src1.btype == IROP_BTYPE_INT32 || a.src1.btype == IROP_BTYPE_FLOAT32) &&
+            (a.src1.u.spill.offset & 3) == 0)
+        {
+          int next_i = -1;
+          for (int j = i + 1; j < ir->next_instruction_index; j++)
+          {
+            if (ir->compact_instructions[j].op != TCCIR_OP_NOP)
+            {
+              next_i = j;
+              break;
+            }
+          }
+          if (next_i >= 0 && ir->compact_instructions[next_i].op == TCCIR_OP_ASSIGN &&
+              !ir->compact_instructions[next_i].is_jump_target)
+          {
+            IRQuadCompact *nq = &ir->compact_instructions[next_i];
+            IROperand n_src1_ir = tcc_ir_op_get_src1(ir, nq);
+            IROperand n_src2_ir = tcc_ir_op_get_src2(ir, nq);
+            IROperand n_dest_ir = tcc_ir_op_get_dest(ir, nq);
+            MopArgs b = ir_decode_cached(is_dry_run, 0, NULL, next_i, ir, nq,
+                                         &n_src1_ir, &n_src2_ir, &n_dest_ir,
+                                         (MopSpec){.dest = 2, .src1 = 1});
+
+            if (b.src1.kind == MACH_OP_SPILL && !b.src1.needs_deref &&
+                b.dest.kind == MACH_OP_REG && !b.dest.is_64bit &&
+                (b.src1.btype == IROP_BTYPE_INT32 || b.src1.btype == IROP_BTYPE_FLOAT32) &&
+                (b.src1.u.spill.offset & 3) == 0)
+            {
+              int32_t off1 = a.src1.u.spill.offset;
+              int32_t off2 = b.src1.u.spill.offset;
+              int reg1 = a.dest.u.reg.r0;
+              int reg2 = b.dest.u.reg.r0;
+
+              if (reg1 != reg2 && off1 + 4 == off2)
+              {
+                if (tcc_gen_machine_try_ldrd_spill(reg1, off1, reg2, off2))
+                {
+                  i = next_i;
+                  break;
+                }
+              }
+              else if (reg1 != reg2 && off2 + 4 == off1)
+              {
+                if (tcc_gen_machine_try_ldrd_spill(reg2, off2, reg1, off1))
+                {
+                  i = next_i;
+                  break;
+                }
+              }
+            }
+          }
+        }
+
+        /* STRD peephole: two adjacent 32-bit assigns storing registers to
+         * adjacent spill slots → single STRD instruction. */
+        if (a.dest.kind == MACH_OP_SPILL && !a.dest.needs_deref &&
+            a.src1.kind == MACH_OP_REG && !a.src1.is_64bit &&
+            (a.dest.btype == IROP_BTYPE_INT32 || a.dest.btype == IROP_BTYPE_FLOAT32) &&
+            (a.dest.u.spill.offset & 3) == 0)
+        {
+          int next_i = -1;
+          for (int j = i + 1; j < ir->next_instruction_index; j++)
+          {
+            if (ir->compact_instructions[j].op != TCCIR_OP_NOP)
+            {
+              next_i = j;
+              break;
+            }
+          }
+          if (next_i >= 0 && ir->compact_instructions[next_i].op == TCCIR_OP_ASSIGN &&
+              !ir->compact_instructions[next_i].is_jump_target)
+          {
+            IRQuadCompact *nq = &ir->compact_instructions[next_i];
+            IROperand n_src1_ir = tcc_ir_op_get_src1(ir, nq);
+            IROperand n_src2_ir = tcc_ir_op_get_src2(ir, nq);
+            IROperand n_dest_ir = tcc_ir_op_get_dest(ir, nq);
+            MopArgs b = ir_decode_cached(is_dry_run, 0, NULL, next_i, ir, nq,
+                                         &n_src1_ir, &n_src2_ir, &n_dest_ir,
+                                         (MopSpec){.dest = 2, .src1 = 1});
+
+            if (b.dest.kind == MACH_OP_SPILL && !b.dest.needs_deref &&
+                b.src1.kind == MACH_OP_REG && !b.src1.is_64bit &&
+                (b.dest.btype == IROP_BTYPE_INT32 || b.dest.btype == IROP_BTYPE_FLOAT32) &&
+                (b.dest.u.spill.offset & 3) == 0)
+            {
+              int32_t off1 = a.dest.u.spill.offset;
+              int32_t off2 = b.dest.u.spill.offset;
+              int reg1 = a.src1.u.reg.r0;
+              int reg2 = b.src1.u.reg.r0;
+
+              if (reg1 != reg2 && off1 + 4 == off2)
+              {
+                if (tcc_gen_machine_try_strd_spill(reg1, off1, reg2, off2))
+                {
+                  i = next_i;
+                  break;
+                }
+              }
+              else if (reg1 != reg2 && off2 + 4 == off1)
+              {
+                if (tcc_gen_machine_try_strd_spill(reg2, off2, reg1, off1))
+                {
+                  i = next_i;
+                  break;
+                }
+              }
+            }
+          }
+        }
+
         SCRATCH_WRAP(tcc_gen_machine_assign_mop(a.src1, a.dest, cq->op));
         break;
       }
@@ -2614,13 +2755,13 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
       {
         int table_id = (int)irop_get_imm64_ex(ir, src2_ir);
         TCCIRSwitchTable *table = &ir->switch_tables[table_id];
+        MopArgs a = DECODE(.src1 = 1);
         if (is_dry_run)
         {
           ind += tcc_gen_machine_switch_table_dry_run_size(table->num_entries);
         }
         else
         {
-          MopArgs a = DECODE(.src1 = 1);
           tcc_gen_machine_insn_scratch_reset();
           tcc_gen_machine_switch_table_mop(a.src1, table, ir, i);
         }

@@ -69,8 +69,7 @@ static thumb_opcode thop_mvn_reg(uint32_t rd, uint32_t rn, uint32_t rm, thumb_fl
 thumb_opcode th_mvn_reg(uint32_t rd, uint32_t rn, uint32_t rm, thumb_flags_behaviour flags, thumb_shift shift,
                         thumb_enforce_encoding encoding)
 {
-  (void)rn;
-  return thop_mvn_reg(rd, rd, rm, flags, shift, encoding);
+  return thop_mvn_reg(rd, rn, rm, flags, shift, encoding);
 }
 
 /* ───── MVN immediate ───── */
@@ -98,7 +97,6 @@ thumb_opcode th_mvn_imm(uint32_t rd, uint32_t rm, uint32_t imm, thumb_flags_beha
                         thumb_enforce_encoding encoding)
 {
   (void)rm;
-  (void)encoding;
   return thop_emit(TH_MVN_IMM.name, TH_MVN_IMM.variants, TH_MVN_IMM.variant_count,
-                   (thop_args){.rd = rd, .imm = imm, .flags = flags});
+                   (thop_args){.rd = rd, .imm = imm, .flags = flags, .enc = encoding});
 }

@@ -184,6 +184,22 @@ static void ir_vreg_intervals_init(IRLiveInterval *intervals, int count)
   }
 }
 
+/* Ensure temporary live interval array can hold at least `count` entries */
+void tcc_ir_vreg_ensure_temp_capacity(TCCIRState *ir, int count)
+{
+  while (count > ir->temporary_variables_live_intervals_size) {
+    int used = ir->temporary_variables_live_intervals_size;
+    ir->temporary_variables_live_intervals_size <<= 1;
+    ir->temporary_variables_live_intervals = (IRLiveInterval *)tcc_realloc(
+        ir->temporary_variables_live_intervals,
+        sizeof(IRLiveInterval) * ir->temporary_variables_live_intervals_size);
+    memset(&ir->temporary_variables_live_intervals[used], 0,
+           sizeof(IRLiveInterval) * (ir->temporary_variables_live_intervals_size - used));
+    ir_vreg_intervals_init(&ir->temporary_variables_live_intervals[used],
+                           ir->temporary_variables_live_intervals_size - used);
+  }
+}
+
 /* ============================================================================
  * Live Interval Access
  * ============================================================================ */

@@ -36,6 +36,10 @@ UT_DECLARE_SUITE(thop_mem_reg);
 UT_DECLARE_SUITE(thop_mem_unpriv);
 UT_DECLARE_SUITE(thop_mov);
 UT_DECLARE_SUITE(thop_ldr_literal);
+UT_DECLARE_SUITE(thop_mul);
+UT_DECLARE_SUITE(thop_mvn);
+UT_DECLARE_SUITE(thop_pld);
+UT_DECLARE_SUITE(thop_rev);
 
 int main(void)
 {
@@ -66,5 +70,9 @@ int main(void)
   UT_RUN_SUITE(thop_mem_unpriv);
   UT_RUN_SUITE(thop_mov);
   UT_RUN_SUITE(thop_ldr_literal);
+  UT_RUN_SUITE(thop_mul);
+  UT_RUN_SUITE(thop_mvn);
+  UT_RUN_SUITE(thop_pld);
+  UT_RUN_SUITE(thop_rev);
   UT_REPORT_AND_EXIT();
 }

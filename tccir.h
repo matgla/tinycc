@@ -193,6 +193,7 @@ typedef enum TccIrOp
    * Backend emits ITE cond; MOV/LDR dest, src1; MOV/LDR dest, src2.
    */
   TCCIR_OP_SELECT,
+  TCCIR_OP_ROR,
 } TccIrOp;
 
 /* FUNCPARAMVAL encoding helpers:
@@ -271,6 +272,7 @@ typedef struct IRLiveInterval
   uint8_t use_vfp : 1;         // whether to use VFP registers (hard float)
   uint8_t is_lvalue : 1;
   uint8_t crosses_call : 1; // whether interval spans a function call
+  uint8_t phi_pinned : 1;   // register relied upon by identity phi — do not reassign
   uint32_t start;           // start instruction index
   uint32_t end;             // end instruction index
   IRVregReplacement allocation;
@@ -529,6 +531,11 @@ typedef struct TCCIRState
   TCCIRSwitchTable *switch_tables;
   int num_switch_tables;
   int switch_tables_capacity;
+
+  /* Barrel shift annotations: populated just before codegen, freed after.
+   * barrel_shifts[i] encodes an optional barrel shift on src2 of instruction i:
+   * 0 = none, else (type<<5)|amount. type: 1=SHL, 2=SHR, 3=SAR, 4=ROR. */
+  uint8_t *barrel_shifts;
 } TCCIRState;
 
 TCCIRState *tcc_ir_allocate_block();
@@ -555,7 +562,6 @@ void tcc_ir_set_llong_type(TCCIRState *ir, int vreg);
 void tcc_ir_set_original_offset(TCCIRState *ir, int vreg, int offset);
 int tcc_ir_get_reg_type(TCCIRState *ir, int vreg);
 
-void tcc_ir_liveness_analysis(TCCIRState *ir);
 void tcc_ir_register_allocation_params(TCCIRState *ir);
 /* For parameters that arrive on the caller stack (beyond r0-r3 per AAPCS),
  * do not allocate separate local spill slots. They already have a stable
@@ -571,7 +577,6 @@ void tcc_ir_show(TCCIRState *ir);
 void tcc_ir_dump_set_show_physical_regs(int show);
 void tcc_ir_set_addrtaken(TCCIRState *ir, int vreg);
 
-void tcc_ir_patch_live_intervals_registers(TCCIRState *ir);
 IRLiveInterval *tcc_ir_get_live_interval(TCCIRState *ir, int vreg);
 void tcc_ir_backpatch(TCCIRState *ir, int t, int target_address);
 void tcc_ir_backpatch_to_here(TCCIRState *ir, int t);
@@ -697,6 +702,13 @@ static inline IROperand tcc_ir_op_get_accum(const TCCIRState *ir, const IRQuadCo
   if (accum_idx >= 0 && accum_idx < ir->iroperand_pool_count)
     return ir->iroperand_pool[accum_idx];
   return IROP_NONE;
+}
+
+static inline void tcc_ir_op_set_accum(TCCIRState *ir, IRQuadCompact *q, IROperand op)
+{
+  int accum_idx = q->operand_base + 3;
+  if (accum_idx >= 0 && accum_idx < ir->iroperand_pool_count)
+    ir->iroperand_pool[accum_idx] = op;
 }
 
 /* Get the 4th operand (condition code) for SELECT operations.

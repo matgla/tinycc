@@ -410,18 +410,25 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
         dest->type = src1->type;
       }
 
-      if (tcc_ir_type_is_float(dest->type.t))
-      {
-        tcc_ir_vreg_type_set_fp(ir, dest->vr, 1, tcc_ir_type_is_double(dest->type.t));
-      }
-      else if ((dest->type.t & VT_BTYPE) == VT_LLONG)
-      {
-        tcc_ir_vreg_type_set_64bit(ir, dest->vr);
-      }
-      /* Phase 3: Set complex flag for complex types */
-      if (dest->type.t & VT_COMPLEX)
-      {
-        tcc_ir_vreg_type_set_complex(ir, dest->vr);
+      /* For STORE ops the dest vreg holds a 32-bit address; dest->type
+       * describes the stored value, not the pointer.  Don't promote the
+       * address vreg to float/64-bit/complex. */
+      int dest_is_store = (op == TCCIR_OP_STORE || op == TCCIR_OP_STORE_INDEXED ||
+                           op == TCCIR_OP_STORE_POSTINC);
+      if (!dest_is_store) {
+        if (tcc_ir_type_is_float(dest->type.t))
+        {
+          tcc_ir_vreg_type_set_fp(ir, dest->vr, 1, tcc_ir_type_is_double(dest->type.t));
+        }
+        else if ((dest->type.t & VT_BTYPE) == VT_LLONG)
+        {
+          tcc_ir_vreg_type_set_64bit(ir, dest->vr);
+        }
+        /* Phase 3: Set complex flag for complex types */
+        if (dest->type.t & VT_COMPLEX)
+        {
+          tcc_ir_vreg_type_set_complex(ir, dest->vr);
+        }
       }
       dest_interval = tcc_ir_vreg_live_interval(ir, dest->vr);
       int new_is_lvalue;
@@ -2049,6 +2056,7 @@ const IRRegistersConfig irop_config[] = {
     [TCCIR_OP_BLOCK_COPY] = {1, 1, 1},
     /* SELECT: dest=result, src1=then_val, src2=else_val, pool[+3]=condition */
     [TCCIR_OP_SELECT] = {1, 1, 1},
+    [TCCIR_OP_ROR] = {1, 1, 1},
 }
 ;
 // clang-format on

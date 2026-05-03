@@ -16,14 +16,23 @@ static void cfg_add_edge(IRCFG *cfg, int from, int to)
 {
   IRBasicBlock *fb = &cfg->blocks[from];
   IRBasicBlock *tb = &cfg->blocks[to];
-  if (fb->num_succs < 2)
-    fb->succs[fb->num_succs++] = to;
+  /* Avoid duplicate successor edges */
+  for (int i = 0; i < fb->num_succs; i++)
+    if (fb->succs[i] == to)
+      goto add_pred;
+  if (fb->num_succs >= fb->succs_cap) {
+    int nc = fb->succs_cap ? fb->succs_cap * 2 : 4;
+    fb->succs = tcc_realloc(fb->succs, nc * sizeof(int));
+    fb->succs_cap = nc;
+  }
+  fb->succs[fb->num_succs++] = to;
+add_pred:
   if (tb->num_preds >= tb->preds_cap) {
     int nc = tb->preds_cap ? tb->preds_cap * 2 : 4;
     tb->preds = tcc_realloc(tb->preds, nc * sizeof(int));
     tb->preds_cap = nc;
   }
-  tb->preds[tb->num_preds++] = to == from ? from : from;
+  tb->preds[tb->num_preds++] = from;
 }
 
 IRCFG *tcc_ir_cfg_build(TCCIRState *ir)
@@ -75,8 +84,6 @@ IRCFG *tcc_ir_cfg_build(TCCIRState *ir)
         cfg->blocks[bi].end_idx = i;
       bi++;
       cfg->blocks[bi].start_idx = i;
-      cfg->blocks[bi].succs[0] = -1;
-      cfg->blocks[bi].succs[1] = -1;
       cfg->blocks[bi].idom = -1;
       cfg->blocks[bi].rpo_number = -1;
     }
@@ -109,6 +116,18 @@ IRCFG *tcc_ir_cfg_build(TCCIRState *ir)
       if (b + 1 < cfg->num_blocks)
         cfg_add_edge(cfg, b, b + 1);
     }
+    else if (q->op == TCCIR_OP_SWITCH_TABLE) {
+      IROperand src2 = tcc_ir_op_get_src2(ir, q);
+      int table_id = (int)irop_get_imm64_ex(ir, src2);
+      if (table_id >= 0 && table_id < ir->num_switch_tables) {
+        TCCIRSwitchTable *table = &ir->switch_tables[table_id];
+        for (int ti = 0; ti < table->num_entries; ti++) {
+          int target = table->targets[ti];
+          if (target >= 0 && target < n)
+            cfg_add_edge(cfg, b, cfg->instr_to_block[target]);
+        }
+      }
+    }
     else if (q->op == TCCIR_OP_RETURNVALUE || q->op == TCCIR_OP_RETURNVOID ||
              q->op == TCCIR_OP_IJUMP) {
       /* no successors (IJUMP: conservative — skip loops containing it) */
@@ -126,8 +145,12 @@ void tcc_ir_cfg_free(IRCFG *cfg)
 {
   if (!cfg)
     return;
-  for (int i = 0; i < cfg->num_blocks; i++)
+  for (int i = 0; i < cfg->num_blocks; i++) {
+    tcc_free(cfg->blocks[i].succs);
     tcc_free(cfg->blocks[i].preds);
+    tcc_free(cfg->blocks[i].dom_frontier);
+    tcc_free(cfg->blocks[i].dom_children);
+  }
   tcc_free(cfg->blocks);
   tcc_free(cfg->rpo_order);
   tcc_free(cfg->instr_to_block);
@@ -244,4 +267,68 @@ int tcc_ir_cfg_dominates(IRCFG *cfg, int a, int b)
     b = cfg->blocks[b].idom;
   }
   return 0;
+}
+
+static void cfg_add_df(IRBasicBlock *bb, int df_block, uint8_t *df_seen)
+{
+  if (df_seen[df_block / 8] & (1 << (df_block % 8)))
+    return;
+  df_seen[df_block / 8] |= (1 << (df_block % 8));
+  if (bb->num_df >= bb->df_cap) {
+    int nc = bb->df_cap ? bb->df_cap * 2 : 4;
+    bb->dom_frontier = tcc_realloc(bb->dom_frontier, nc * sizeof(int));
+    bb->df_cap = nc;
+  }
+  bb->dom_frontier[bb->num_df++] = df_block;
+}
+
+static void cfg_add_dom_child(IRBasicBlock *bb, int child)
+{
+  if (bb->num_dom_children >= bb->dom_children_cap) {
+    int nc = bb->dom_children_cap ? bb->dom_children_cap * 2 : 4;
+    bb->dom_children = tcc_realloc(bb->dom_children, nc * sizeof(int));
+    bb->dom_children_cap = nc;
+  }
+  bb->dom_children[bb->num_dom_children++] = child;
+}
+
+void tcc_ir_cfg_compute_dom_frontiers(IRCFG *cfg)
+{
+  if (!cfg || cfg->num_blocks == 0)
+    return;
+
+  /* Build dominator tree children lists */
+  for (int b = 1; b < cfg->num_blocks; b++) {
+    int idom = cfg->blocks[b].idom;
+    if (idom >= 0 && idom != b)
+      cfg_add_dom_child(&cfg->blocks[idom], b);
+  }
+
+  /* Compute dominance frontier using the standard algorithm.
+   * Per-block bitset avoids O(n^2) duplicate checks in cfg_add_df. */
+  int nb = cfg->num_blocks;
+  int df_seen_bytes = (nb + 7) / 8;
+  uint8_t *df_seen = tcc_mallocz(nb * df_seen_bytes);
+
+  for (int b = 0; b < nb; b++) {
+    IRBasicBlock *bb = &cfg->blocks[b];
+    if (bb->num_preds < 2)
+      continue;
+    if (bb->idom < 0)
+      continue;
+    for (int pi = 0; pi < bb->num_preds; pi++) {
+      int runner = bb->preds[pi];
+      if (runner < 0 || cfg->blocks[runner].idom < 0)
+        continue;
+      int steps = 0;
+      while (runner != bb->idom && steps < nb) {
+        cfg_add_df(&cfg->blocks[runner], b, &df_seen[runner * df_seen_bytes]);
+        if (runner == cfg->blocks[runner].idom)
+          break;
+        runner = cfg->blocks[runner].idom;
+        steps++;
+      }
+    }
+  }
+  tcc_free(df_seen);
 }

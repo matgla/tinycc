@@ -634,6 +634,7 @@ def _run_qemu_test(test_file, expected_exit_code, args=None, defines=None, opt_l
     except Exception as e:
         raise AssertionError(f"Test failed for {test_file} with {opt_level}: {e}") from e
     finally:
+        sut.close()
         sut.logfile.close()
 
 
@@ -705,6 +706,7 @@ def _run_tagged_qemu_test(test_file, tag, expected_lines, expected_exit_code, op
     except Exception as e:
         raise AssertionError(f"Test failed for {test_file} [{tag}] with {opt_level}: {e}") from e
     finally:
+        sut.close()
         sut.logfile.close()
 
 

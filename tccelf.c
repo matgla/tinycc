@@ -22,7 +22,6 @@
 #include "tccld.h"
 #include "tccyaff.h"
 
-
 /********************************************************/
 /* global variables */
 
@@ -908,9 +907,9 @@ ST_FUNC void free_section(Section *s)
 {
   if (!s)
     return;
-  free_deferred_chunks(s); /* Clean up lazy loading metadata */
-  free_reloc_patches(s);   /* Clean up relocation patches */
-  tcc_free(s->str_hash);   /* Clean up string hash table */
+  free_deferred_chunks(s);     /* Clean up lazy loading metadata */
+  free_reloc_patches(s);       /* Clean up relocation patches */
+  tcc_free(s->str_hash);       /* Clean up string hash table */
   tcc_free(s->hash_val_cache); /* Clean up hash value cache */
   tcc_free(s->data);
   s->data = NULL;
@@ -1044,11 +1043,14 @@ static void section_ht_grow(TCCState *s1)
   unsigned int new_size = s1->section_ht_mask ? (s1->section_ht_mask + 1) * 2 : 64;
   Section **new_ht = tcc_mallocz(new_size * sizeof(Section *));
   unsigned int new_mask = new_size - 1;
-  if (s1->section_ht) {
+  if (s1->section_ht)
+  {
     unsigned int i;
-    for (i = 0; i <= s1->section_ht_mask; i++) {
+    for (i = 0; i <= s1->section_ht_mask; i++)
+    {
       Section *s = s1->section_ht[i];
-      if (s) {
+      if (s)
+      {
         unsigned int idx = section_name_hash(s->name) & new_mask;
         while (new_ht[idx])
           idx = (idx + 1) & new_mask;
@@ -1080,7 +1082,8 @@ static Section *section_ht_find(TCCState *s1, const char *name)
   if (!s1->section_ht)
     return NULL;
   idx = section_name_hash(name) & s1->section_ht_mask;
-  while ((s = s1->section_ht[idx]) != NULL) {
+  while ((s = s1->section_ht[idx]) != NULL)
+  {
     if (!strcmp(s->name, name))
       return s;
     idx = (idx + 1) & s1->section_ht_mask;
@@ -1258,41 +1261,6 @@ ST_FUNC Section *find_section(TCCState *s1, const char *name)
   return new_section(s1, name, SHT_PROGBITS, SHF_ALLOC);
 }
 
-/* ------------------------------------------------------------------------- */
-
-/* String table deduplication hash table functions - DISABLED due to issues */
-#if 0
-/* Initialize hash table for string deduplication in a section */
-static void strtab_init_hash(Section *s)
-{
-    if (s->str_hash)
-        return;
-    s->str_hash_size = 256;
-    s->str_hash = tcc_mallocz(s->str_hash_size * sizeof(uint32_t));
-    s->str_hash_count = 0;
-}
-
-static uint32_t str_hash_func(const char *str)
-{
-    uint32_t h = 5381;
-    int c;
-    while ((c = *str++))
-        h = ((h << 5) + h) + c;
-    return h;
-}
-
-static int strtab_find(Section *s, const char *str, uint32_t hash)
-{
-    /* ... */
-    return -1;
-}
-
-static void strtab_insert(Section *s, const char *str, uint32_t offset, uint32_t hash)
-{
-    /* ... */
-}
-#endif
-
 ST_FUNC int put_elf_str(Section *s, const char *sym)
 {
   int offset, len;
@@ -1349,8 +1317,7 @@ static void rebuild_hash(Section *s, unsigned int nb_buckets)
   ptr += nb_buckets + 1;
 
   /* Rebuild hash value cache */
-  s->hash->hash_val_cache = tcc_realloc(s->hash->hash_val_cache,
-                                         nb_syms * sizeof(unsigned int));
+  s->hash->hash_val_cache = tcc_realloc(s->hash->hash_val_cache, nb_syms * sizeof(unsigned int));
   s->hash->hash_val_alloc = nb_syms;
   hcache = s->hash->hash_val_cache;
   hcache[0] = 0;
@@ -1435,12 +1402,11 @@ ST_FUNC int put_elf_sym(Section *s, addr_t value, unsigned long size, int info, 
       else
       {
         /* Store cached hash value (rebuild_hash handles this when triggered) */
-        if (sym_index >= hs->hash_val_alloc) {
+        if (sym_index >= hs->hash_val_alloc)
+        {
           int new_alloc = (sym_index + 16) & ~15;
-          hs->hash_val_cache = tcc_realloc(hs->hash_val_cache,
-                                            new_alloc * sizeof(unsigned int));
-          memset(hs->hash_val_cache + hs->hash_val_alloc, 0,
-                 (new_alloc - hs->hash_val_alloc) * sizeof(unsigned int));
+          hs->hash_val_cache = tcc_realloc(hs->hash_val_cache, new_alloc * sizeof(unsigned int));
+          memset(hs->hash_val_cache + hs->hash_val_alloc, 0, (new_alloc - hs->hash_val_alloc) * sizeof(unsigned int));
           hs->hash_val_alloc = new_alloc;
         }
         hs->hash_val_cache[sym_index] = full_hash;
@@ -1454,13 +1420,15 @@ ST_FUNC int put_elf_sym(Section *s, addr_t value, unsigned long size, int info, 
   }
 
   /* Track non-local UNDEF symbols in symtab for fast alacarte lookup */
-  if (shndx == SHN_UNDEF && ELFW(ST_BIND)(info) != STB_LOCAL) {
+  if (shndx == SHN_UNDEF && ELFW(ST_BIND)(info) != STB_LOCAL)
+  {
     TCCState *ts = s->s1;
-    if (s == ts->symtab) {
-      if (ts->nb_undef_syms >= ts->undef_sym_alloc) {
+    if (s == ts->symtab)
+    {
+      if (ts->nb_undef_syms >= ts->undef_sym_alloc)
+      {
         ts->undef_sym_alloc = ts->undef_sym_alloc ? ts->undef_sym_alloc * 2 : 64;
-        ts->undef_sym_list = tcc_realloc(ts->undef_sym_list,
-                                          ts->undef_sym_alloc * sizeof(int));
+        ts->undef_sym_list = tcc_realloc(ts->undef_sym_list, ts->undef_sym_alloc * sizeof(int));
       }
       ts->undef_sym_list[ts->nb_undef_syms++] = sym_index;
     }
@@ -5013,7 +4981,8 @@ static const char *get_merged_section_name(const char *name)
 {
   if (name[0] != '.')
     return name;
-  switch (name[1]) {
+  switch (name[1])
+  {
   case 't':
     if (!strncmp(name, ".text.", 6))
       return ".text";
@@ -5167,8 +5136,8 @@ ST_FUNC int tcc_load_object_file(TCCState *s1, int fd, unsigned long file_offset
       sh = &shdr[sh->sh_info];
     /* ignore sections types we do not handle (plus relocs to those) */
     sh_name = strsec + sh->sh_name;
-    if (sh_name[0] == '.' && (sh_name[1] == 'd' || sh_name[1] == 's')
-        && (0 == strncmp(sh_name, ".debug_", 7) || 0 == strncmp(sh_name, ".stab", 5)))
+    if (sh_name[0] == '.' && (sh_name[1] == 'd' || sh_name[1] == 's') &&
+        (0 == strncmp(sh_name, ".debug_", 7) || 0 == strncmp(sh_name, ".stab", 5)))
     {
       if (!s1->do_debug || seencompressed)
         continue;
@@ -5513,19 +5482,20 @@ ST_FUNC int tcc_group_has_satisfiable_undefs(TCCState *s1)
   int ci, ui, si;
   if (s1->nb_archive_sym_caches == 0)
     return 0;
-  for (ui = 0; ui < s1->nb_undef_syms; ui++) {
+  for (ui = 0; ui < s1->nb_undef_syms; ui++)
+  {
     unsigned int h;
     int aidx;
     si = s1->undef_sym_list[ui];
     if (syms[si].st_shndx != SHN_UNDEF)
       continue;
     const char *name = (char *)s->link->data + syms[si].st_name;
-    h = (sym_hcache && si < hs->hash_val_alloc)
-          ? sym_hcache[si]
-          : elf_hash((const unsigned char *)name);
-    for (ci = 0; ci < s1->nb_archive_sym_caches; ci++) {
+    h = (sym_hcache && si < hs->hash_val_alloc) ? sym_hcache[si] : elf_hash((const unsigned char *)name);
+    for (ci = 0; ci < s1->nb_archive_sym_caches; ci++)
+    {
       ArchiveSymbolCache *cache = &s1->archive_sym_caches[ci];
-      for (aidx = cache->ar_ht_buckets[h & cache->ar_ht_mask]; aidx >= 0; aidx = cache->ar_ht_next[aidx]) {
+      for (aidx = cache->ar_ht_buckets[h & cache->ar_ht_mask]; aidx >= 0; aidx = cache->ar_ht_next[aidx])
+      {
         if (cache->name_hashes[aidx] == h && !strcmp(cache->sym_names[aidx], name))
           return 1;
       }
@@ -5538,7 +5508,8 @@ ST_FUNC int tcc_group_has_satisfiable_undefs(TCCState *s1)
 static ArchiveSymbolCache *find_archive_sym_cache(TCCState *s1, const char *filename)
 {
   int i;
-  for (i = 0; i < s1->nb_archive_sym_caches; i++) {
+  for (i = 0; i < s1->nb_archive_sym_caches; i++)
+  {
     if (!strcmp(s1->archive_sym_caches[i].filename, filename))
       return &s1->archive_sym_caches[i];
   }
@@ -5546,8 +5517,7 @@ static ArchiveSymbolCache *find_archive_sym_cache(TCCState *s1, const char *file
 }
 
 /* Create and populate a new archive symbol cache entry */
-static ArchiveSymbolCache *create_archive_sym_cache(TCCState *s1, const char *filename,
-                                                     int fd, int size, int entrysize)
+static ArchiveSymbolCache *create_archive_sym_cache(TCCState *s1, const char *filename, int fd, int size, int entrysize)
 {
   int i, nsyms, ar_ht_size;
   unsigned int loaded_member_size;
@@ -5557,7 +5527,8 @@ static ArchiveSymbolCache *create_archive_sym_cache(TCCState *s1, const char *fi
   ArchiveSymbolCache *cache;
 
   data = tcc_malloc(size);
-  if (full_read(fd, data, size) != size) {
+  if (full_read(fd, data, size) != size)
+  {
     tcc_free(data);
     return NULL;
   }
@@ -5566,8 +5537,8 @@ static ArchiveSymbolCache *create_archive_sym_cache(TCCState *s1, const char *fi
   ar_names = (char *)ar_index + nsyms * entrysize;
 
   /* Grow cache array */
-  s1->archive_sym_caches = tcc_realloc(s1->archive_sym_caches,
-    (s1->nb_archive_sym_caches + 1) * sizeof(ArchiveSymbolCache));
+  s1->archive_sym_caches =
+      tcc_realloc(s1->archive_sym_caches, (s1->nb_archive_sym_caches + 1) * sizeof(ArchiveSymbolCache));
   cache = &s1->archive_sym_caches[s1->nb_archive_sym_caches++];
   memset(cache, 0, sizeof(*cache));
 
@@ -5609,7 +5580,8 @@ static ArchiveSymbolCache *create_archive_sym_cache(TCCState *s1, const char *fi
   cache->loaded_members = tcc_mallocz(loaded_member_size * sizeof(unsigned long long));
 
   /* Populate symbol arrays and hash table */
-  for (p = ar_names, i = 0; i < nsyms; i++, p += strlen(p) + 1) {
+  for (p = ar_names, i = 0; i < nsyms; i++, p += strlen(p) + 1)
+  {
     unsigned int h;
     int bucket;
     cache->sym_names[i] = p;
@@ -5627,7 +5599,8 @@ static ArchiveSymbolCache *create_archive_sym_cache(TCCState *s1, const char *fi
 ST_FUNC void tcc_archive_cache_free(TCCState *s1)
 {
   int i;
-  for (i = 0; i < s1->nb_archive_sym_caches; i++) {
+  for (i = 0; i < s1->nb_archive_sym_caches; i++)
+  {
     ArchiveSymbolCache *c = &s1->archive_sym_caches[i];
     tcc_free(c->filename);
     tcc_free(c->loaded_members);
@@ -5660,9 +5633,11 @@ static int tcc_load_alacarte(TCCState *s1, int fd, int size, int entrysize)
      rescans this avoids re-reading the index, re-computing elf_hash
      for all symbols, and re-allocating hash tables. */
   cache = find_archive_sym_cache(s1, s1->current_filename);
-  if (!cache) {
+  if (!cache)
+  {
     cache = create_archive_sym_cache(s1, s1->current_filename, fd, size, entrysize);
-    if (!cache) {
+    if (!cache)
+    {
       tcc_error_noabort("invalid archive");
       s1->current_archive_offset = saved_archive_offset;
       s1->current_archive_path = saved_archive_path;
@@ -5693,7 +5668,9 @@ static int tcc_load_alacarte(TCCState *s1, int fd, int size, int entrysize)
 
       /* Use cached hash from symtab hash table when available,
          avoiding elf_hash recomputation across archive calls. */
-      h = (sym_hcache && si < hs->hash_val_alloc) ? sym_hcache[si] : elf_hash((const unsigned char *)((char *)s->link->data + sym->st_name));
+      h = (sym_hcache && si < hs->hash_val_alloc)
+              ? sym_hcache[si]
+              : elf_hash((const unsigned char *)((char *)s->link->data + sym->st_name));
 
       for (aidx = cache->ar_ht_buckets[h & cache->ar_ht_mask]; aidx >= 0; aidx = cache->ar_ht_next[aidx])
       {
@@ -5737,7 +5714,8 @@ static int tcc_load_alacarte(TCCState *s1, int fd, int size, int entrysize)
   {
     ElfW(Sym) *syms = (ElfW(Sym) *)symtab_section->data;
     int ri, wi = 0;
-    for (ri = 0; ri < s1->nb_undef_syms; ri++) {
+    for (ri = 0; ri < s1->nb_undef_syms; ri++)
+    {
       int idx = s1->undef_sym_list[ri];
       if (syms[idx].st_shndx == SHN_UNDEF)
         s1->undef_sym_list[wi++] = idx;
@@ -6388,7 +6366,8 @@ static int ld_add_file_list(TCCState *s1, const char *cmd, int as_needed)
     /* Same fast check as the CLI --start-group loop: only continue
        rescanning while some current undef is satisfiable by these
        cached archives. */
-    if (s1->new_undef_sym) {
+    if (s1->new_undef_sym)
+    {
       s1->new_undef_sym = tcc_group_has_satisfiable_undefs(s1);
     }
     while (s1->new_undef_sym)

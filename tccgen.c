@@ -21,11 +21,15 @@
 #define USING_GLOBALS
 #include "tcc.h"
 
+#include "ir/cfg.h"
 #include "ir/codegen.h"
 #include "ir/core.h"
 #include "ir/licm.h"
 #include "ir/opt.h"
+#include "ir/regalloc.h"
+#include "ir/ssa.h"
 #include "tccir.h"
+#include "arch/arm/arm_regalloc.h"
 
 #include <math.h>
 
@@ -25270,6 +25274,7 @@ static void gen_function(Sym *sym)
   }
 #endif
 
+
   /* Block copy init: replace memset(0) + consecutive stores with BLOCK_COPY
    * from a pre-built rodata block.  Run once before the iterative loop. */
   tcc_ir_opt_block_copy_init(ir);
@@ -25298,27 +25303,31 @@ static void gen_function(Sym *sym)
     if (tcc_state->opt_dce)
       changes += tcc_ir_opt_dce(ir);
 
-    /* Phase 1: Constant Propagation with Algebraic Simplification */
+    /* Constant propagation — feeds branch_folding and other pre-SSA passes.
+     * Full dataflow constant propagation (SCCP) runs later in the SSA phase;
+     * this pre-SSA pass handles the simpler cases needed here. */
     if (tcc_state->opt_const_prop)
       changes += tcc_ir_opt_const_prop(ir);
 
-
-    /* Phase 1a: Fold LOAD of a static global whose initializer is known and
-     * has not been clobbered into ASSIGN #imm.  Feeds subsequent const_prop
-     * + branch_folding; error arms guarded by `g != initial` collapse. */
+    /* Fold LOAD of a static global whose initializer is known and
+     * has not been clobbered into ASSIGN #imm. */
     if (tcc_state->opt_const_prop)
       changes += tcc_ir_opt_global_init_prop(ir);
 
-    /* Phase 1b: TMP Constant Propagation - propagate constants from folded expressions */
+    /* TMP constant propagation — propagate constants from folded expressions. */
     if (tcc_state->opt_const_prop)
       changes += tcc_ir_opt_const_prop_tmp(ir);
 
-
-    /* Phase 1b1: fold constant string builtin calls after argument/address
-     * propagation exposes literal-backed pointers in the IR.
-     */
+    /* Fold constant string builtin calls after argument/address
+     * propagation exposes literal-backed pointers in the IR. */
     if (tcc_state->opt_const_prop)
       changes += tcc_ir_opt_const_string_calls(ir);
+
+    /* Phase 1b2: Flow-sensitive value tracking — propagates constants through
+     * multi-definition VARs and store-through-pointer patterns (LEA+STORE).
+     * Must run after const_prop so single-def constants are already folded. */
+    if (tcc_state->opt_const_prop)
+      changes += tcc_ir_opt_value_tracking(ir);
 
     /* Phase 1c: Constant Branch Folding - fold branches with constant conditions
      * This is critical for optimizing conditionals where values are constants.
@@ -25357,14 +25366,7 @@ static void gen_function(Sym *sym)
     if (tcc_state->opt_copy_prop)
       changes += tcc_ir_opt_var_to_tmp(ir);
 
-    /* Phase 1d: Value Tracking through Arithmetic - track constants through ADD/SUB
-     * This enables folding comparisons like "CMP V0, #1000000" when V0 has a
-     * known constant value from previous arithmetic (e.g., V0 = 1234 - 42 = 1192).
-     */
-    if (tcc_state->opt_const_prop)
-      changes += tcc_ir_opt_value_tracking(ir);
-
-    /* Phase 1e: Non-negative value branch folding - fold soft-float comparisons
+    /* Non-negative value branch folding - fold soft-float comparisons
      * of known non-negative values (e.g. fabs(x)) against zero.
      */
     if (tcc_state->opt_nonneg_fold)
@@ -25390,20 +25392,7 @@ static void gen_function(Sym *sym)
     if (tcc_state->opt_float_narrow)
       changes += tcc_ir_opt_float_narrowing(ir);
 
-    /* Phase 2: Copy Propagation */
-    if (tcc_state->opt_copy_prop)
-      changes += tcc_ir_opt_copy_prop(ir);
-
-    /* Phase 3: Arithmetic Common Subexpression Elimination */
-    if (tcc_state->opt_cse)
-      changes += tcc_ir_opt_cse_arith(ir);
-
-    /* Phase 3a: Global LOAD value CSE — deduplicate loads from the same global
-     * within a basic block.  Enables same-vreg comparison folds after inlining. */
-    if (tcc_state->opt_const_prop)
-      changes += tcc_ir_opt_cse_global_load(ir);
-
-    /* Phase 3b: Deref forwarding — reuse a just-loaded deref value in an
+    /* Deref forwarding — reuse a just-loaded deref value in an
      * adjacent CMP instead of re-reading from memory.  Fires after inlining
      * of check functions that save a value for an error path then compare. */
     if (tcc_state->opt_const_prop)
@@ -25426,15 +25415,12 @@ static void gen_function(Sym *sym)
       tcc_ir_opt_dce(ir);
   }
 
-  /* Narrow CSE: deduplicate PARAM/VAR + #constant expressions.
-   * Safe and independent — not gated by opt_cse. */
+  /* Narrow CSE: deduplicate PARAM/VAR + #constant expressions. */
   if (tcc_state->optimize >= 1)
     tcc_ir_opt_cse_param_add(ir);
 
   /* GlobalSym CSE: hoist repeated global symbol addresses to TEMPs.
-   * Must run before compact_nops since it reuses NOP slots.
-   * Not gated by opt_cse (which is disabled due to cse_arith SHA-1 bug)
-   * because this pass is independent and safe. */
+   * Must run before compact_nops since it reuses NOP slots. */
   if (tcc_state->optimize >= 1)
     tcc_ir_opt_globalsym_cse(ir);
 
@@ -25442,40 +25428,7 @@ static void gen_function(Sym *sym)
    * All subsequent passes benefit from a smaller instruction array. */
   tcc_ir_opt_compact_nops(ir);
 
-  /* Phase 3b: Global CSE - eliminate redundant computations across basic blocks
-   * This catches cases like address calculations in if/else branches where
-   * the same computation happens in both branches.
-   * NOTE: Currently disabled due to issues with complex control flow (gotos/labels)
-   */
-  (void)tcc_ir_opt_cse_global;
-#if 0
-  if (tcc_state->opt_cse)
-  {
-    int gcse_changes = tcc_ir_opt_cse_global(ir);
-    if (gcse_changes > 0)
-    {
-      if (tcc_state->opt_dce)
-        tcc_ir_opt_dce(ir); /* Clean up any newly dead code */
-
-      /* GCSE creates TMP<-TMP ASSIGN (copy) instructions. Run copy propagation
-       * to propagate these copies, enabling further CSE matches.
-       * Example: GCSE replaces T12<-V1 SHL #2 with T12<-T7. Then P0 ADD T12
-       * doesn't match P0 ADD T7 until copy prop replaces T12 with T7. */
-      for (int gcse_round = 0; gcse_round < 3; gcse_round++)
-      {
-        int cp = tcc_state->opt_copy_prop ? tcc_ir_opt_copy_prop(ir) : 0;
-        if (cp <= 0)
-          break;
-        int cse2 = tcc_ir_opt_cse_arith(ir);
-        cse2 += tcc_ir_opt_cse_global(ir);
-        if (tcc_state->opt_dce)
-          tcc_ir_opt_dce(ir);
-        if (cse2 <= 0)
-          break;
-      }
-    }
-  }
-#endif
+  /* Global CSE is handled by SSA GVN pass in regalloc. */
 
   LOG_IR_GEN("OPTIMIZE: Ran %d optimization iterations", iteration);
 
@@ -25504,6 +25457,15 @@ static void gen_function(Sym *sym)
    * Ordering constraints:
    *   mla_fusion      should run before indexed/postinc (cleaner patterns)
    */
+  /* Rotation fusion: SHL(x,n) + SHR(x,32-n) + OR → ROR(x,32-n).
+   * Runs before other fusions to simplify the IR early. */
+  if (tcc_state->optimize > 0)
+    tcc_ir_opt_rotate_fusion(ir);
+
+  /* Barrel shift fusion: fold single-use SHL/SHR/SAR/ROR into consuming ALU op.
+   * Runs before regalloc so liveness is updated. Results stored in ir->barrel_shifts[]
+   * side-table keyed by orig_index (stable across regalloc instruction renumbering). */
+
   /* Combined fusion pass: MLA + indexed memory in one loop with shared def/use table. */
   if (tcc_state->opt_mla_fusion || tcc_state->opt_indexed_memory)
     tcc_ir_opt_fusion_pass(ir, tcc_state->opt_mla_fusion, tcc_state->opt_indexed_memory);
@@ -25572,7 +25534,6 @@ static void gen_function(Sym *sym)
       tcc_ir_opt_dce(ir);
       tcc_ir_opt_compact_nops(ir);
       tcc_ir_opt_sl_forward(ir);
-      tcc_ir_opt_copy_prop(ir);
       tcc_ir_opt_stack_addr_nonnull_fold(ir);
       tcc_ir_opt_branch_folding(ir);
       tcc_ir_opt_dce(ir);
@@ -25598,19 +25559,8 @@ static void gen_function(Sym *sym)
   {
     if (!(tcc_state->opt_store_load_fwd && !ir->has_static_chain && tcc_ir_opt_sl_forward(ir)))
       break;
-    /* Global LOAD CSE after SL_FWD: forwarding may expose redundant global
-     * loads (e.g. arr[0]=g1; *p→g1 forwarded, then check_u64 reloads g1). */
-    tcc_ir_opt_cse_global_load(ir);
-    /* Copy propagation EARLY: collapse TEMP→TEMP ASSIGN chains created by
-     * SL_FWD (e.g. T5←T4←T0) and global LOAD CSE (T6←T0) so that
-     * const_prop's same-vreg comparison fold can see matching vregs. */
-    if (tcc_state->opt_copy_prop)
-      tcc_ir_opt_copy_prop(ir);
     if (tcc_state->opt_const_prop)
     {
-      /* Iteratively propagate and fold constants: each round may turn a
-       * two-const ALU op into a single constant, which feeds the next round.
-       * A 4-operand chain (a+b+c+d) needs 3 rounds to fully collapse. */
       for (int cp_iter = 0; cp_iter < 4; cp_iter++)
       {
         int cp_ch = 0;
@@ -25620,7 +25570,6 @@ static void gen_function(Sym *sym)
         if (!cp_ch)
           break;
       }
-      tcc_ir_opt_value_tracking(ir);
       tcc_ir_opt_const_prop_tmp(ir);
       tcc_ir_opt_branch_folding(ir);
       tcc_ir_opt_branch_folding(ir);
@@ -25659,10 +25608,6 @@ static void gen_function(Sym *sym)
   if (tcc_state->opt_const_prop)
   {
     tcc_ir_opt_const_prop(ir);
-    tcc_ir_opt_const_prop_tmp(ir);
-    /* Value tracking with lcmp same-vreg fold: runs after SL_FWD has
-     * converted LOADs to ASSIGNs so the chain resolution can match. */
-    tcc_ir_opt_value_tracking(ir);
     tcc_ir_opt_const_prop_tmp(ir);
     tcc_ir_opt_branch_folding(ir);
     tcc_ir_opt_stack_addr_nonnull_fold(ir);
@@ -25709,6 +25654,14 @@ static void gen_function(Sym *sym)
    * and before IV strength reduction which benefits from rotated layout. */
   if (tcc_state->opt_loop_rotation)
     tcc_ir_opt_loop_rotation(ir);
+
+#ifdef CONFIG_TCC_DEBUG
+  if (tcc_state->dump_ir) {
+    printf("=== IR AFTER LOOP ROTATION ===\n");
+    tcc_ir_show(ir);
+    printf("=== END IR AFTER LOOP ROTATION ===\n");
+  }
+#endif
 
   /* Phase 5a: Loop Unrolling - fully unroll small constant-trip-count loops.
    * After unrolling, re-run iterative constant propagation + DCE to collapse
@@ -25962,8 +25915,6 @@ static void gen_function(Sym *sym)
   /* Nested calls are now handled at code generation time via backward scan.
    * No IR reordering needed - saves O(n) memory allocations. */
 
-  tcc_ir_liveness_analysis(ir);
-
   /* Mark return value vregs with incoming_reg0=0 BEFORE allocation
    * so the allocator knows they arrive in r0 and can optimize accordingly */
   tcc_ir_mark_return_value_incoming_regs(ir);
@@ -25999,6 +25950,11 @@ static void gen_function(Sym *sym)
     {
       loc = min_stack_ref;
     }
+    /* Variadic functions reserve 28 bytes at [FP-4..FP-28] for the va_area
+     * (register copies + metadata), set up in the machine prologue — not
+     * visible as STACKOFF in the IR.  Don't compact past that reservation. */
+    if (func_var && loc > -28)
+      loc = -28;
   }
 
   /* Disable R12 allocation for functions with computed gotos (IJMP).
@@ -26024,8 +25980,57 @@ static void gen_function(Sym *sym)
   if (tcc_state->optimize < 1 && tcc_state->registers_for_allocator > 12)
     tcc_state->registers_for_allocator = 12;
 
-  /* TODO: track float_parameters_count separately for hard float ABI */
-  tcc_ls_allocate_registers(&ir->ls, ir->parameters_count, 0, loc);
+  /* Barrel shift fusion: fold single-use SHL/SHR/SAR/ROR into consuming ALU op.
+   * Runs just before regalloc so the register allocator sees updated live ranges.
+   * Results stored in ir->barrel_shifts[] keyed by orig_index. */
+  if (tcc_state->optimize > 0)
+    tcc_ir_barrel_shift_fusion(ir);
+
+  /* Register allocation (SSA-based linear scan) */
+  {
+    const RegAllocTarget *ra_target = arm_get_regalloc_target();
+    tcc_ir_ssa_regalloc(ir, ra_target, loc);
+  }
+
+  /* SSA optimization may NOP instructions, creating stale JMP targets
+   * and fall-through JMPs.  Thread targets through NOPs first, then
+   * eliminate any resulting fall-throughs. */
+  if (tcc_state->opt_jump_threading) {
+    int jt_changes;
+    do {
+      jt_changes = tcc_ir_opt_jump_threading(ir);
+      jt_changes += tcc_ir_opt_eliminate_fallthrough(ir);
+    } while (jt_changes > 0);
+  }
+
+  /* Re-compact local stack after SSA optimization.
+   * SSA DCE may have eliminated StackLoc stores/loads that the pre-SSA
+   * compaction (above) could not see.  Re-scan for the most-negative
+   * STACKOFF still referenced and shrink loc accordingly. */
+  {
+    int min_stack_ref = 0;
+    for (int i = 0; i < ir->next_instruction_index; i++) {
+      const IRQuadCompact *q = &ir->compact_instructions[i];
+      if (q->op == TCCIR_OP_NOP)
+        continue;
+      IROperand ops[3];
+      ops[0] = tcc_ir_op_get_dest(ir, q);
+      ops[1] = tcc_ir_get_src1(ir, i);
+      ops[2] = tcc_ir_get_src2(ir, i);
+      for (int j = 0; j < 3; j++) {
+        if (ops[j].tag == IROP_TAG_STACKOFF) {
+          int off = irop_get_stack_offset(ops[j]);
+          if (off < min_stack_ref)
+            min_stack_ref = off;
+        }
+      }
+    }
+    if (min_stack_ref > loc) {
+      loc = min_stack_ref;
+    }
+    if (func_var && loc > -28)
+      loc = -28;
+  }
 
   tcc_state->registers_for_allocator = saved_regs_for_alloc;
 
@@ -26150,7 +26155,7 @@ static void gen_function(Sym *sym)
    * frame offsets and shrink loc to only cover the slots still in use. */
   {
     int min_local_offset = 0;
-    int stackoff_count = 0;
+    (void)0; /* stackoff_count removed — was diagnostic only */
     for (int i = 0; i < ir->next_instruction_index; i++)
     {
       const IRQuadCompact *q = &ir->compact_instructions[i];
@@ -26167,7 +26172,6 @@ static void gen_function(Sym *sym)
         if (irop_get_tag(ops[j]) == IROP_TAG_STACKOFF)
         {
           int32_t off = irop_get_stack_offset(ops[j]);
-          stackoff_count++;
           if (off < min_local_offset)
             min_local_offset = off;
         }
@@ -26177,6 +26181,8 @@ static void gen_function(Sym *sym)
     {
       loc = min_local_offset;
     }
+    if (func_var && loc > -28)
+      loc = -28;
   }
 
   /* We may have removed a lot of spill slots (stack-passed params). Repack the
@@ -26188,13 +26194,65 @@ static void gen_function(Sym *sym)
    * extend `loc` to the most-negative one so spills don't overlap locals.
    */
   {
+    int has_nested_chain = ir->has_static_chain;
+    if (!has_nested_chain) {
+      for (int j = 0; j < ir->next_instruction_index; j++) {
+        int op = ir->compact_instructions[j].op;
+        if (op == TCCIR_OP_SET_CHAIN || op == TCCIR_OP_INIT_CHAIN_SLOT) {
+          has_nested_chain = 1;
+          break;
+        }
+      }
+    }
+    /* Build bitmap of vregs referenced by live (non-NOP) instructions. */
+    int max_vreg_pos = 0;
+    for (int i = 0; i < ir->ls.next_interval_index; ++i) {
+      int p = TCCIR_DECODE_VREG_POSITION(ir->ls.intervals[i].vreg);
+      if (p > max_vreg_pos) max_vreg_pos = p;
+    }
+    uint8_t *live_vregs = tcc_mallocz((max_vreg_pos + 8) / 8);
+    for (int j = 0; j < ir->next_instruction_index; j++) {
+      const IRQuadCompact *q = &ir->compact_instructions[j];
+      if (q->op == TCCIR_OP_NOP)
+        continue;
+      int32_t vrs[3] = { -1, -1, -1 };
+      if (irop_config[q->op].has_dest)
+        vrs[0] = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
+      if (irop_config[q->op].has_src1)
+        vrs[1] = irop_get_vreg(tcc_ir_op_get_src1(ir, q));
+      if (irop_config[q->op].has_src2)
+        vrs[2] = irop_get_vreg(tcc_ir_op_get_src2(ir, q));
+      for (int k = 0; k < 3; k++) {
+        if (vrs[k] >= 0) {
+          int p = TCCIR_DECODE_VREG_POSITION(vrs[k]);
+          if (p <= max_vreg_pos)
+            live_vregs[p / 8] |= (1 << (p % 8));
+        }
+      }
+    }
+
     int min_stack_loc = 0;
     for (int i = 0; i < ir->ls.next_interval_index; ++i)
     {
       int sl = ir->ls.intervals[i].stack_location;
-      if (sl < min_stack_loc)
-        min_stack_loc = sl;
+      if (sl >= min_stack_loc)
+        continue;
+      /* Skip spill slots for vregs with no register and no live IR
+       * references — SSA DCE may have eliminated all uses after the
+       * register allocator assigned the spill.
+       * Bail out for functions with static chain or SET_CHAIN — nested
+       * functions access parent VARs through the frame pointer without
+       * explicit IR references in the parent. */
+      if (ir->ls.intervals[i].r0 < 0 && !has_nested_chain) {
+        if (!(live_vregs[TCCIR_DECODE_VREG_POSITION(ir->ls.intervals[i].vreg) / 8] &
+              (1 << (TCCIR_DECODE_VREG_POSITION(ir->ls.intervals[i].vreg) % 8)))) {
+          ir->ls.intervals[i].stack_location = 0;
+          continue;
+        }
+      }
+      min_stack_loc = sl;
     }
+    tcc_free(live_vregs);
     if (min_stack_loc < loc)
     {
       loc = min_stack_loc;
@@ -26203,7 +26261,17 @@ static void gen_function(Sym *sym)
 
   tcc_ir_move_coalescing(ir);
 
-  tcc_ir_patch_live_intervals_registers(ir);
+  /* Sync LSLiveInterval → IRLiveInterval after post-allocation modifications
+   * (register swap, move coalescing, stack-passed param rewrite, compaction). */
+  for (int i = 0; i < ir->ls.next_interval_index; ++i)
+  {
+    LSLiveInterval *lsi = &ir->ls.intervals[i];
+    tcc_ir_stack_reg_assign(ir, lsi->vreg, lsi->stack_location, lsi->r0, lsi->r1);
+    IRLiveInterval *li = tcc_ir_vreg_live_interval(ir, lsi->vreg);
+    if (li)
+      li->crosses_call = lsi->crosses_call;
+  }
+
   tcc_ir_register_allocation_params(ir);
   tcc_ir_build_stack_layout(ir);
 
@@ -26289,6 +26357,12 @@ static void gen_function(Sym *sym)
   }
 
   tcc_ir_codegen_generate(ir);
+
+  if (ir->barrel_shifts) {
+    tcc_free(ir->barrel_shifts);
+    ir->barrel_shifts = NULL;
+  }
+
   if (!sym->a.naked)
   {
     tcc_debug_prolog_epilog(tcc_state, 1);

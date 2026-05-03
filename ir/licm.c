@@ -311,7 +311,6 @@ IRLoops *tcc_ir_detect_loops(TCCIRState *ir)
     loops->num_loops = dst;
   }
 
-#ifdef DEBUG_IR_GEN
   if (loops->num_loops > 0)
   {
     LOG_LICM("Detected %d loop(s) (after filtering)", loops->num_loops);
@@ -322,7 +321,6 @@ IRLoops *tcc_ir_detect_loops(TCCIRState *ir)
              loops->loops[i].preheader_idx, loops->loops[i].num_body_instrs);
     }
   }
-#endif
 
   return loops;
 }
@@ -600,9 +598,7 @@ static int hoist_from_loop(TCCIRState *ir, IRLoop *loop)
    * TODO: re-enable with proper dominance-based safety checks. */
   return const_hoisted;
 
-#ifdef DEBUG_IR_GEN
   LOG_LICM("hoist_from_loop: const_hoisted=%d, header=%d", const_hoisted, loop->header_idx);
-#endif
 
   /* Collect unique stack address offsets used in the loop */
   HoistedStackAddr hoisted_addrs[MAX_HOISTED_OFFSETS];
@@ -660,9 +656,7 @@ static int hoist_from_loop(TCCIRState *ir, IRLoop *loop)
   if (num_hoisted_addrs == 0)
     return const_hoisted;
 
-#ifdef DEBUG_IR_GEN
   LOG_LICM("Found %d unique stack address(es) to hoist", num_hoisted_addrs);
-#endif
 
   /* Allocate vregs for all hoisted values */
   for (int i = 0; i < num_hoisted_addrs; i++)
@@ -700,10 +694,8 @@ static int hoist_from_loop(TCCIRState *ir, IRLoop *loop)
     hoisted_addrs[i].hoisted = 1;
     total_inserted++;
 
-#ifdef DEBUG_IR_GEN
     LOG_LICM("Inserted hoist for offset %d at position %d (vreg %d)", hoisted_addrs[i].offset, inserted_idx,
            TCCIR_DECODE_VREG_POSITION(hoisted_addrs[i].hoisted_vreg));
-#endif
   }
 
   /* Update loop body indices to account for inserted instructions */
@@ -763,11 +755,9 @@ static int hoist_from_loop(TCCIRState *ir, IRLoop *loop)
     }
   }
 
-#ifdef DEBUG_IR_GEN
   LOG_LICM("Replaced stack address operand(s) in loop body");
   LOG_LICM("hoist_from_loop returning: total_inserted=%d, const_hoisted=%d, sum=%d", total_inserted,
          const_hoisted, total_inserted + const_hoisted);
-#endif
 
   return total_inserted + const_hoisted;
 }
@@ -880,6 +870,7 @@ static int hoist_const_exprs_from_loop(TCCIRState *ir, IRLoop *loop)
     case TCCIR_OP_SHL:
     case TCCIR_OP_SHR:
     case TCCIR_OP_SAR:
+    case TCCIR_OP_ROR:
       break;
     default:
       continue; /* Skip non-arithmetic operations */
@@ -933,9 +924,7 @@ static int hoist_const_exprs_from_loop(TCCIRState *ir, IRLoop *loop)
   if (num_hoisted == 0)
     return 0;
 
-#ifdef DEBUG_IR_GEN
   LOG_LICM("Found %d constant expression(s) to hoist", num_hoisted);
-#endif
 
   /* For each candidate, check if the same expression already exists before the loop
    * (e.g., hoisted by an outer loop). If so, reuse that vreg instead of hoisting again. */
@@ -972,10 +961,8 @@ static int hoist_const_exprs_from_loop(TCCIRState *ir, IRLoop *loop)
   int insert_pos = loop->preheader_idx + 1;
   int total_inserted = 0;
 
-#ifdef DEBUG_IR_GEN
   LOG_LICM("hoist_const_exprs: loop preheader=%d, insert_pos=%d, header=%d, start=%d, end=%d",
          loop->preheader_idx, insert_pos, loop->header_idx, loop->start_idx, loop->end_idx);
-#endif
 
   for (int i = num_hoisted - 1; i >= 0; i--)
   {
@@ -1015,10 +1002,8 @@ static int hoist_const_exprs_from_loop(TCCIRState *ir, IRLoop *loop)
     hoisted_exprs[i].is_hoisted = 1;
     total_inserted++;
 
-#ifdef DEBUG_IR_GEN
     LOG_LICM("Hoisted instruction %d to position %d (vreg %d)", orig_idx, inserted_idx,
            TCCIR_DECODE_VREG_POSITION(hoisted_exprs[i].hoisted_vreg));
-#endif
   }
 
   /* Update loop indices */
@@ -1054,9 +1039,7 @@ static int hoist_const_exprs_from_loop(TCCIRState *ir, IRLoop *loop)
     tcc_ir_op_set_dest(ir, orig_q, orig_dest);
   }
 
-#ifdef DEBUG_IR_GEN
   LOG_LICM("Replaced original instruction(s) with ASSIGN");
-#endif
 
   return total_inserted;
 }
@@ -1084,10 +1067,8 @@ int tcc_ir_hoist_loop_invariants(TCCIRState *ir, IRLoops *loops)
     /* If we hoisted any instructions, update indices for all subsequent loops */
     if (hoisted > 0)
     {
-#ifdef DEBUG_IR_GEN
       LOG_LICM("Loop %d hoisted %d instrs, loop[%d].preheader=%d, updating later loops", i, hoisted, i,
              loop->preheader_idx);
-#endif
       /* Indices of subsequent loops need to be shifted by number of inserted instructions */
       for (int j = i + 1; j < loops->num_loops; j++)
       {
@@ -1229,12 +1210,10 @@ void tcc_ir_cache_func_purity(TCCState *s, int func_token, TCCFuncPurity purity)
   s->func_purity_cache[s->func_purity_cache_count].purity = purity;
   s->func_purity_cache_count++;
 
-#ifdef DEBUG_IR_GEN
   LOG_LICM("PURITY: Cached '%s' as %s", get_tok_str(func_token, NULL),
          purity == TCC_FUNC_PURITY_CONST  ? "CONST"
          : purity == TCC_FUNC_PURITY_PURE ? "PURE"
                                           : "IMPURE");
-#endif
 }
 
 /* Lookup function purity from cache */
@@ -1286,10 +1265,7 @@ TCCFuncPurity tcc_ir_infer_func_purity(TCCIRState *ir, Sym *func_sym)
   if (!ir || !func_sym)
     return TCC_FUNC_PURITY_IMPURE;
 
-#ifdef DEBUG_IR_GEN
-  /* Get function name for debugging */
   const char *func_name = get_tok_str(func_sym->v, NULL);
-#endif
 
   int is_const = 1; /* Assume const until proven otherwise */
 
@@ -1306,9 +1282,7 @@ TCCFuncPurity tcc_ir_infer_func_purity(TCCIRState *ir, Sym *func_sym)
         IROperand dest = tcc_ir_op_get_dest(ir, q);
         if (!is_stack_or_param_addr(ir, dest))
         {
-#ifdef DEBUG_IR_GEN
-          LOG_LICM("PURITY: Function '%s' is IMPURE: stores to non-stack memory", func_name);
-#endif
+          LOG_LICM("PURITY: Function '%s' is IMPURE: stores to non-stack memory", funcname);
           return TCC_FUNC_PURITY_IMPURE;
         }
       }
@@ -1367,9 +1341,7 @@ TCCFuncPurity tcc_ir_infer_func_purity(TCCIRState *ir, Sym *func_sym)
 
           if (callee_purity == TCC_FUNC_PURITY_IMPURE || callee_purity == TCC_FUNC_PURITY_UNKNOWN)
           {
-#ifdef DEBUG_IR_GEN
             LOG_LICM("PURITY: Function '%s' is IMPURE: calls impure function '%s'", func_name, callee_name);
-#endif
             return TCC_FUNC_PURITY_IMPURE;
           }
           if (callee_purity == TCC_FUNC_PURITY_PURE)
@@ -1378,9 +1350,7 @@ TCCFuncPurity tcc_ir_infer_func_purity(TCCIRState *ir, Sym *func_sym)
         else
         {
           /* Indirect call - can't determine purity, conservative: IMPURE */
-#ifdef DEBUG_IR_GEN
           LOG_LICM("PURITY: Function '%s' is IMPURE: indirect call", func_name);
-#endif
           return TCC_FUNC_PURITY_IMPURE;
         }
       }
@@ -1388,9 +1358,7 @@ TCCFuncPurity tcc_ir_infer_func_purity(TCCIRState *ir, Sym *func_sym)
 
     case TCCIR_OP_VLA_ALLOC:
       /* VLA allocation modifies stack in non-trivial way */
-#ifdef DEBUG_IR_GEN
       LOG_LICM("PURITY: Function '%s' is IMPURE: VLA allocation", func_name);
-#endif
       return TCC_FUNC_PURITY_IMPURE;
 
     default:
@@ -1399,9 +1367,7 @@ TCCFuncPurity tcc_ir_infer_func_purity(TCCIRState *ir, Sym *func_sym)
   }
 
   TCCFuncPurity result = is_const ? TCC_FUNC_PURITY_CONST : TCC_FUNC_PURITY_PURE;
-#ifdef DEBUG_IR_GEN
   LOG_LICM("PURITY: Function '%s' inferred as %s", func_name, result == TCC_FUNC_PURITY_CONST ? "CONST" : "PURE");
-#endif
   return result;
 }
 
@@ -1438,18 +1404,14 @@ int tcc_ir_get_func_purity(TCCIRState *ir, Sym *sym)
     func_noreturn |= sym->type.ref->f.func_noreturn;
   }
 
-#ifdef DEBUG_IR_GEN
   LOG_LICM("Checking purity for function '%s': func_pure=%d, func_const=%d", func_name, func_pure, func_const);
-#endif
 
   /* Check well-known pure functions */
   for (size_t i = 0; i < NUM_PURE_FUNCS; i++)
   {
     if (strcmp(func_name, pure_func_table[i].name) == 0)
     {
-#ifdef DEBUG_IR_GEN
       LOG_LICM("Found '%s' in pure function table with purity=%d", func_name, pure_func_table[i].purity);
-#endif
       return pure_func_table[i].purity;
     }
   }
@@ -1464,18 +1426,14 @@ int tcc_ir_get_func_purity(TCCIRState *ir, Sym *sym)
   /* Check for explicit __attribute__((const)) - highest purity level */
   if (func_const)
   {
-#ifdef DEBUG_IR_GEN
     LOG_LICM("Function '%s' has func_const attribute", func_name);
-#endif
     return TCC_FUNC_PURITY_CONST;
   }
 
   /* Check for explicit __attribute__((pure)) */
   if (func_pure)
   {
-#ifdef DEBUG_IR_GEN
     LOG_LICM("Function '%s' has func_pure attribute", func_name);
-#endif
     return TCC_FUNC_PURITY_PURE;
   }
 
@@ -1487,17 +1445,13 @@ int tcc_ir_get_func_purity(TCCIRState *ir, Sym *sym)
     int cached = tcc_ir_lookup_func_purity(tcc_state, sym->v);
     if (cached >= 0)
     {
-#ifdef DEBUG_IR_GEN
       LOG_LICM("Found cached purity for '%s': %d", func_name, cached);
-#endif
       return cached;
     }
   }
 
   /* Conservative default: unknown = IMPURE (can't hoist) */
-#ifdef DEBUG_IR_GEN
   LOG_LICM("Function '%s' is unknown, marking as IMPURE", func_name);
-#endif
   return TCC_FUNC_PURITY_IMPURE;
 }
 
@@ -1622,9 +1576,7 @@ static int tcc_ir_is_hoistable_call_ex(TCCIRState *ir, int instr_idx, IRLoop *lo
     IROperand dest = tcc_ir_op_get_dest(ir, q);
     if (irop_get_tag(dest) != IROP_TAG_VREG)
     {
-#ifdef DEBUG_IR_GEN
       LOG_LICM("Call at %d: destination is not a vreg, can't hoist", instr_idx);
-#endif
       return 0;
     }
   }
@@ -1636,9 +1588,7 @@ static int tcc_ir_is_hoistable_call_ex(TCCIRState *ir, int instr_idx, IRLoop *lo
   if (!func_sym)
   {
     /* Indirect call - can't determine purity */
-#ifdef DEBUG_IR_GEN
     LOG_LICM("Call at %d: indirect call, can't hoist", instr_idx);
-#endif
     return 0;
   }
 
@@ -1650,9 +1600,7 @@ static int tcc_ir_is_hoistable_call_ex(TCCIRState *ir, int instr_idx, IRLoop *lo
     return 0;
   }
 
-#ifdef DEBUG_IR_GEN
   LOG_LICM("Call at %d: function is pure (purity=%d), checking args...", instr_idx, purity);
-#endif
 
   /* Find all FUNCPARAMVAL instructions for this call */
   IROperand call_src2 = tcc_ir_op_get_src2(ir, q);
@@ -1785,9 +1733,7 @@ int tcc_ir_hoist_pure_calls(TCCIRState *ir, IRLoops *loops)
      */
     if (loop_contains_vla(ir, loop))
     {
-#ifdef DEBUG_IR_GEN
       LOG_LICM("Skipping loop %d with VLA allocations", loop_idx);
-#endif
       continue;
     }
 
@@ -1804,9 +1750,7 @@ int tcc_ir_hoist_pure_calls(TCCIRState *ir, IRLoops *loops)
     int all_call_indices[MAX_HOISTABLE_CALLS];
     int num_all_calls = 0;
 
-#ifdef DEBUG_IR_GEN
     LOG_LICM("Scanning loop %d with %d body instructions for pure calls", loop_idx, loop->num_body_instrs);
-#endif
 
     for (int i = 0; i < loop->num_body_instrs && num_all_calls < MAX_HOISTABLE_CALLS; i++)
     {
@@ -1831,9 +1775,7 @@ int tcc_ir_hoist_pure_calls(TCCIRState *ir, IRLoops *loops)
 
     if (num_all_calls == 0)
     {
-#ifdef DEBUG_IR_GEN
       LOG_LICM("No pure calls found in loop %d", loop_idx);
-#endif
       continue;
     }
 
@@ -1851,9 +1793,7 @@ int tcc_ir_hoist_pure_calls(TCCIRState *ir, IRLoops *loops)
     {
       hoisted_this_iteration = 0;
 
-#ifdef DEBUG_IR_GEN
       LOG_LICM("Iteration: checking %d pure calls", num_all_calls);
-#endif
 
       /* Find hoistable function calls in this loop */
       HoistableCallInfo hoistable[MAX_HOISTABLE_CALLS];
@@ -1871,9 +1811,7 @@ int tcc_ir_hoist_pure_calls(TCCIRState *ir, IRLoops *loops)
         if (q->op == TCCIR_OP_NOP || q->op == TCCIR_OP_ASSIGN)
           continue;
 
-#ifdef DEBUG_IR_GEN
         LOG_LICM("Found call at instruction %d, checking hoistability...", instr_idx);
-#endif
         if (tcc_ir_is_hoistable_call_ex(ir, instr_idx, loop, hoisted_vregs, num_hoisted_vregs))
         {
           hoistable[num_hoistable].instr_idx = instr_idx;
@@ -1886,15 +1824,11 @@ int tcc_ir_hoist_pure_calls(TCCIRState *ir, IRLoops *loops)
 
       if (num_hoistable == 0)
       {
-#ifdef DEBUG_IR_GEN
         LOG_LICM("No more hoistable pure calls found in loop %d", loop_idx);
-#endif
         break;
       }
 
-#ifdef DEBUG_IR_GEN
       LOG_LICM("Found %d hoistable pure call(s) in loop %d", num_hoistable, loop_idx);
-#endif
 
       /* For each hoistable call, we need to:
        * 1. Allocate a NEW call_id for the hoisted call (critical!)
@@ -2053,9 +1987,7 @@ int tcc_ir_hoist_pure_calls(TCCIRState *ir, IRLoops *loops)
 
         hoistable[i].is_hoisted = 1;
 
-#ifdef DEBUG_IR_GEN
         LOG_LICM("Hoisted pure call at instruction %d (new call_id=%d)", call_idx, new_call_id);
-#endif
 
         /* Update all_call_indices for remaining calls - they shifted by insertions_this_call */
         for (int j = 0; j < num_all_calls; j++)
@@ -2118,17 +2050,13 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
   if (!ir)
     return NULL;
 
-#ifdef DEBUG_IR_GEN
   LOG_LICM("Starting loop-invariant code motion");
-#endif
 
   /* Step 1: Detect loops */
   IRLoops *loops = tcc_ir_detect_loops(ir);
   if (!loops || loops->num_loops == 0)
   {
-#ifdef DEBUG_IR_GEN
     LOG_LICM("No loops found");
-#endif
     tcc_ir_free_loops(loops);
     return NULL;
   }
@@ -2264,7 +2192,7 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
           }
 
           /* Fixed-point invariant detection */
-          int total_loop_instrs = 0;
+          int total_loop_instrs = 0; (void)total_loop_instrs;
           for (int bi = 0; bi < cfg->num_blocks; bi++)
             if (in_loop[bi])
               total_loop_instrs += cfg->blocks[bi].end_idx - cfg->blocks[bi].start_idx;
@@ -2286,7 +2214,7 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
                 switch (q->op) {
                 case TCCIR_OP_ADD: case TCCIR_OP_SUB: case TCCIR_OP_MUL:
                 case TCCIR_OP_AND: case TCCIR_OP_OR: case TCCIR_OP_XOR:
-                case TCCIR_OP_SHL: case TCCIR_OP_SHR: case TCCIR_OP_SAR:
+                case TCCIR_OP_SHL: case TCCIR_OP_SHR: case TCCIR_OP_SAR: case TCCIR_OP_ROR:
                 case TCCIR_OP_ASSIGN: case TCCIR_OP_LEA:
                   break;
                 default:
@@ -2385,6 +2313,7 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
                 if (all_inv) {
                   is_invariant[ii] = 1;
                   inv_changed = 1;
+                  LOG_LICM("  dom-LICM: marked invariant insn %d op=%d", ii, q->op);
                 }
               }
             }
@@ -2404,6 +2333,8 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
               }
             }
           }
+
+          LOG_LICM("dom-LICM: natural loop header=blk%d latch=blk%d preheader=blk%d", h, b, preheader);
 
           /* Hoist invariant instructions to preheader */
           int insert_pos = cfg->blocks[preheader].end_idx;
@@ -2436,8 +2367,10 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
               if (total_hoisted_here >= max_hoist)
                 break;
 
-              /* Safety: instruction's block must dominate all exit blocks */
-              int instr_block = cfg->instr_to_block[ii]; /* use original block */
+              /* Safety: instruction's block must dominate all exit blocks.
+               * Use bi directly — we're iterating block bi's range, and
+               * instr_to_block may be stale after cross-loop insertions. */
+              int instr_block = bi;
               int safe = 1;
               for (int ei = 0; ei < cfg->num_blocks && safe; ei++) {
                 if (!is_exit[ei])
@@ -2465,6 +2398,21 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
               /* NOP out the original (shifted by total_hoisted_here) */
               ir->compact_instructions[adj_ii + 1].op = TCCIR_OP_NOP;
               hoisted++;
+              LOG_LICM("dom-LICM: hoisted insn %d (adj %d) op=%d to preheader pos %d, NOP'd %d",
+                       ii, adj_ii, hoist_q.op, adj_insert, adj_ii + 1);
+            }
+          }
+
+          /* Update CFG block indices to account for inserted instructions.
+           * Each insert_instruction_before shifts all instructions >= insert_pos.
+           * After total_hoisted_here insertions at insert_pos, all blocks
+           * with indices >= insert_pos are shifted forward. */
+          if (total_hoisted_here > 0) {
+            for (int ui = 0; ui < cfg->num_blocks; ui++) {
+              if (cfg->blocks[ui].start_idx >= insert_pos)
+                cfg->blocks[ui].start_idx += total_hoisted_here;
+              if (cfg->blocks[ui].end_idx >= insert_pos)
+                cfg->blocks[ui].end_idx += total_hoisted_here;
             }
           }
 

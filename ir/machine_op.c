@@ -232,8 +232,6 @@ MachineOperand machine_op_from_ir(TCCIRState *ir, const IROperand *op)
     return m;
   }
 
-  int is_register_param = (vreg_type == TCCIR_VREG_TYPE_PARAM && interval->incoming_reg0 >= 0);
-
   /* Compute the final stack offset, applying the delta for locals that
    * had a sub-component offset in the original operand.
    * Only apply the delta when the variable actually needs stack access
@@ -338,9 +336,31 @@ MachineOperand machine_op_from_ir(TCCIRState *ir, const IROperand *op)
     m.u.reg.r0 = (int)(interval->allocation.r0 & PREG_REG_NONE);
     m.u.reg.r1 = m.is_64bit ? (int)(interval->allocation.r1 & PREG_REG_NONE) : -1;
 
+    /* VAR vregs can be recycled across scopes for variables of different
+     * types.  If the operand needs a register pair (is_64bit) but the
+     * interval was allocated as a single register, the allocation belongs
+     * to an earlier, narrower use.  Fall back to the STACKOFF path so the
+     * codegen loads from the stack instead of using a stale single-reg. */
+    if (m.is_64bit && m.u.reg.r1 == PREG_REG_NONE && tag == IROP_TAG_STACKOFF)
+    {
+      int32_t stack_off = irop_get_stack_offset(*op);
+      if (!op->is_lval)
+      {
+        m.kind = MACH_OP_FRAME_ADDR;
+        m.u.frame.offset = stack_off;
+      }
+      else
+      {
+        m.kind = MACH_OP_SPILL;
+        m.u.spill.offset = stack_off;
+        m.needs_deref = (bool)op->is_llocal;
+      }
+      return m;
+    }
+
     /* Preserve is_lval only for pointer derefs, not for locals promoted to reg. */
     int preserve_lval = 0;
-    if (op->is_lval && !op->is_const && !op->is_local && !op->is_llocal && !is_register_param)
+    if (op->is_lval && !op->is_const && !op->is_local && !op->is_llocal)
     {
       preserve_lval = 1;
     }

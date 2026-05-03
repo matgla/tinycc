@@ -90,18 +90,6 @@ int tcc_ir_opt_cse_param_add(struct TCCIRState *ir);
 /* Deref forwarding - reuse loaded deref value in adjacent CMP */
 int tcc_ir_opt_deref_fwd(struct TCCIRState *ir);
 
-/* Arithmetic CSE - eliminate redundant arithmetic */
-int tcc_ir_opt_cse_arith(struct TCCIRState *ir);
-
-/* Boolean CSE - eliminate redundant boolean operations */
-int tcc_ir_opt_cse_bool(struct TCCIRState *ir);
-
-/* Global CSE - eliminate redundant computations across basic blocks
- * Phase 2 of BUBBLE_SORT_COMPARISON_PLAN
- * Uses dominator-based analysis to find redundant computations
- * in different basic blocks and replace them with ASSIGN */
-int tcc_ir_opt_cse_global(struct TCCIRState *ir);
-
 /* Boolean Idempotent Simplification */
 int tcc_ir_opt_bool_idempotent(struct TCCIRState *ir);
 
@@ -125,12 +113,6 @@ int tcc_ir_opt_global_init_prop(struct TCCIRState *ir);
 /* Redundant Store Elimination */
 int tcc_ir_opt_store_redundant(struct TCCIRState *ir);
 
-/* MLA (Multiply-Accumulate) Fusion - fuse MUL + ADD into MLA */
-int tcc_ir_opt_mla_fusion(struct TCCIRState *ir);
-
-/* Indexed Load/Store Fusion - fuse SHL + ADD + LOAD/STORE into indexed memory op */
-int tcc_ir_opt_indexed_memory_fusion(struct TCCIRState *ir);
-
 /* Displacement Load/Store Fusion - fuse ADD(base, #imm) + LOAD/STORE/ASSIGN-lval
  * into indexed memory op with constant index and scale=0. */
 int tcc_ir_opt_disp_fusion(struct TCCIRState *ir);
@@ -142,6 +124,14 @@ int tcc_ir_opt_add_deref_fold(struct TCCIRState *ir);
 
 /* Combined fusion pass: mla_fusion + indexed_memory_fusion in one loop (shared IROptDU) */
 int tcc_ir_opt_fusion_pass(struct TCCIRState *ir, int do_mla, int do_indexed);
+
+/* Rotation fusion: SHL(x,n) + SHR(x,32-n) + OR → ROR(x,32-n) */
+int tcc_ir_opt_rotate_fusion(struct TCCIRState *ir);
+
+/* Late barrel shift fusion: populates ir->barrel_shifts[] side-table.
+ * Must run immediately before codegen — no passes may run between. */
+void tcc_ir_barrel_shift_fusion(struct TCCIRState *ir);
+
 
 /* Deref-in-ALU indexed fusion: extract deref operands into LOAD_INDEXED when
  * the address is computed by SHL+ADD (array table lookup pattern). */

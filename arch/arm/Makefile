@@ -14,7 +14,7 @@ AR        ?= ar
 CFLAGS    ?=
 DEFINES   ?=
 
-SRCS = arm.c arm_aapcs.c
+SRCS = arm.c arm_aapcs.c arm_regalloc.c ssa_opt_arm.c
 OBJS = $(addprefix $(BUILD_DIR)/, $(SRCS:.c=.o))
 
 ISA_DIRS = thumb
@@ -39,7 +39,7 @@ $(BUILD_DIR)/lib%.a: FORCE
 
 $(BUILD_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)
-	$(CC) -o $@ -c $< $(CFLAGS) $(DEFINES) -I$(TOP) -I$(TOP)/ir
+	$(CC) -o $@ -c $< $(CFLAGS) $(DEFINES) -I$(TOP) -I$(TOP)/ir -I$(TOP)/ir/opt
 
 clean:
 	rm -f $(OBJS) $(LIB) $(ISA_LIBS)

@@ -256,15 +256,8 @@ int tcc_opt_constant_folding(TCCIRState *ir)
 
 int tcc_opt_cse(TCCIRState *ir)
 {
-  if (!ir)
-    return 0;
-
-  int eliminated = 0;
-
-  /* TODO: Implement CSE using value numbering or hashing */
-
-  opt_stats.cse_eliminated += eliminated;
-  return eliminated;
+  (void)ir;
+  return 0;
 }
 
 /* ============================================================================

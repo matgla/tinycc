@@ -2596,7 +2596,7 @@ ST_FUNC void tcc_machine_load_cmp_result(int dest_reg, int condition_code);
 ST_FUNC void tcc_machine_load_jmp_result(int dest_reg, int jmp_addr, int invert);
 
 ST_FUNC void tcc_gen_machine_data_processing_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest,
-                                                 TccIrOp op);
+                                                 TccIrOp op, uint32_t barrel_shift);
 ST_FUNC void tcc_gen_machine_data_processing_mop_flags(MachineOperand src1, MachineOperand src2, MachineOperand dest,
                                                        TccIrOp op);
 ST_FUNC void tcc_gen_machine_cmp_eq64_mop(MachineOperand src1, MachineOperand src2);
@@ -2608,6 +2608,7 @@ ST_FUNC void tcc_gen_machine_load_mop(MachineOperand src, MachineOperand dest, T
 ST_FUNC void tcc_gen_machine_store_mop(MachineOperand dest, MachineOperand src, TccIrOp op);
 ST_FUNC void tcc_gen_machine_store_spill(int src_reg, int32_t spill_offset);
 ST_FUNC int tcc_gen_machine_try_strd_spill(int reg1, int32_t off1, int reg2, int32_t off2);
+ST_FUNC int tcc_gen_machine_try_ldrd_spill(int reg1, int32_t off1, int reg2, int32_t off2);
 ST_FUNC void tcc_gen_machine_load_indexed_mop(MachineOperand dest, MachineOperand base, MachineOperand index,
                                               MachineOperand scale, TccIrOp op);
 ST_FUNC void tcc_gen_machine_store_indexed_mop(MachineOperand base, MachineOperand index, MachineOperand scale,
@@ -2682,6 +2683,7 @@ ST_FUNC int tcc_gen_machine_branch_opt_get_encoding(int ir_index); /* Returns 16
  * boundaries (any IR op may be a branch target, so cross-IR equivalences
  * cannot be trusted). */
 ST_FUNC void tcc_gen_machine_mov_coalesce_reset(void);
+ST_FUNC void tcc_gen_machine_strldr_cache_reset(void);
 
 /* Trap instruction generation */
 ST_FUNC void tcc_gen_machine_trap_mop(void);

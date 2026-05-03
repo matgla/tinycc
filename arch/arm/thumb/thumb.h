@@ -647,6 +647,11 @@ static inline __attribute__((always_inline)) thumb_opcode thop_emit(const char *
       THOP_TRACE("%s: variant %zu skipped (flags SET but no s-bit)\n", name ? name : "?unknown?", i);
       continue;
     }
+    if (a.flags == FLAGS_BEHAVIOUR_BLOCK && s->implicit_s)
+    {
+      THOP_TRACE("%s: variant %zu skipped (implicit S-bit conflicts with BLOCK)\n", name ? name : "?unknown?", i);
+      continue;
+    }
     if (s->forbid_s_in_it && a.in_it_block && a.flags == FLAGS_BEHAVIOUR_SET)
     {
       THOP_TRACE("%s: variant %zu skipped (S-bit forbidden in IT block)\n", name ? name : "?unknown?", i);

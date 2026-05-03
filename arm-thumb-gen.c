@@ -42,6 +42,7 @@
 #endif
 
 #include "arch/arm/arm.h"
+#include "arch/arm/ssa_opt_arm.h"
 #include "arm-thumb-defs.h"
 #include "ir/opt.h"
 #include "tcc-chained-hash.h"
@@ -276,7 +277,7 @@ static int ot_check_mov_reg(uint32_t rd, uint32_t rm, thumb_flags_behaviour flag
 static int ot_check_ldr_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw, thumb_enforce_encoding enc);
 static int ot_check_str_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw, thumb_enforce_encoding enc);
 static void mov_equiv_reset_all(void);
-static void strldr_cache_reset(void);
+ST_FUNC void tcc_gen_machine_strldr_cache_reset(void);
 static void thumb_require_materialized_reg(const char *ctx, const char *operand, int reg);
 static bool thumb_is_hw_reg(int reg);
 static int get_struct_base_addr_mop(const MachineOperand *mop, int default_reg);
@@ -1212,7 +1213,7 @@ ST_FUNC void tcc_gen_machine_branch_opt_init(void)
 ST_FUNC void tcc_gen_machine_mov_coalesce_reset(void)
 {
   mov_equiv_reset_all();
-  strldr_cache_reset();
+  tcc_gen_machine_strldr_cache_reset();
 }
 
 /* Public interface for dry-run code generation */
@@ -1939,7 +1940,7 @@ typedef struct StrLdrCacheEntry
 static StrLdrCacheEntry strldr_cache[STRLDR_CACHE_CAPACITY];
 static int strldr_cache_count;
 
-static void strldr_cache_reset(void)
+ST_FUNC void tcc_gen_machine_strldr_cache_reset(void)
 {
   strldr_cache_count = 0;
 }
@@ -1961,7 +1962,7 @@ static void strldr_cache_record_str(int rt, int rn, int imm, uint32_t puw, int s
 {
   if (puw != 6)
   {
-    strldr_cache_reset();
+    tcc_gen_machine_strldr_cache_reset();
     return;
   }
   /* Overwriting the same slot invalidates any prior cache entry for it. */
@@ -1973,7 +1974,7 @@ static void strldr_cache_record_str(int rt, int rn, int imm, uint32_t puw, int s
   }
   if (strldr_cache_count >= STRLDR_CACHE_CAPACITY)
   {
-    strldr_cache_reset();
+    tcc_gen_machine_strldr_cache_reset();
   }
   StrLdrCacheEntry *e = &strldr_cache[strldr_cache_count++];
   e->valid = 1;
@@ -2233,6 +2234,7 @@ const FloatingPointConfig *arm_determine_fpu_config(struct TCCState *s)
 
 ST_FUNC void arm_init(struct TCCState *s)
 {
+  tcc_ir_ssa_opt_arm_register();
   arm_target_init(s->march_str, arm_fpu_type_to_mfpu_str(s->fpu_type), NULL, 0);
 
   float_type.t = VT_FLOAT;
@@ -2678,7 +2680,7 @@ int ot(thumb_opcode op)
         else
         {
           mov_equiv_reset_all();
-          strldr_cache_reset();
+          tcc_gen_machine_strldr_cache_reset();
         }
       }
       mov_equiv_it_pending--;
@@ -2730,7 +2732,7 @@ int ot(thumb_opcode op)
           else
           {
             mov_equiv_reset_all();
-            strldr_cache_reset();
+            tcc_gen_machine_strldr_cache_reset();
           }
         }
       }
@@ -2739,7 +2741,7 @@ int ot(thumb_opcode op)
   else
   {
     mov_equiv_reset_all();
-    strldr_cache_reset();
+    tcc_gen_machine_strldr_cache_reset();
   }
 
   /* Dry run: don't emit actual opcodes, but still track code size and
@@ -3048,8 +3050,9 @@ ST_FUNC void tcc_gen_machine_switch_table_mop(MachineOperand src, TCCIRSwitchTab
   if (!thumb_is_hw_reg(index_reg))
     tcc_error("internal error: SWITCH_TABLE index not in a hardware register (mop)");
 
-  /* Reuse index_reg as scratch - it's dead after SWITCH_TABLE (terminator). */
-  int rt = index_reg;
+  /* Use R_IP as scratch to avoid clobbering index_reg, which may still be
+     live at the switch targets (SSA can place the loop counter directly here). */
+  int rt = R_IP;
 
   ot_check(th_lsl_imm(rt, index_reg, 2, flags_safe(), ENFORCE_ENCODING_32BIT));
   ot_check(th_add_reg(rt, rt, R_PC, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
@@ -3282,6 +3285,20 @@ ST_FUNC int tcc_gen_machine_try_strd_spill(int reg1, int32_t off1, int reg2, int
   int sign = (adj < 0);
   int abs_off = sign ? -adj : adj;
   return try_strd_pair(reg1, reg2, base_reg, abs_off, sign);
+}
+
+/* Try to emit LDRD for two 32-bit values from adjacent spill slots.
+ * off1 must be the lower offset (off1 + 4 == off2).
+ * Returns 1 on success, 0 if LDRD constraints not met. */
+ST_FUNC int tcc_gen_machine_try_ldrd_spill(int reg1, int32_t off1, int reg2, int32_t off2)
+{
+  if (off1 + 4 != off2)
+    return 0;
+  const int base_reg = tcc_state->need_frame_pointer ? R_FP : R_SP;
+  int adj = fp_adjust_local_offset(off1, 0);
+  int sign = (adj < 0);
+  int abs_off = sign ? -adj : adj;
+  return try_ldrd_pair(reg1, reg2, base_reg, abs_off, sign);
 }
 
 ST_FUNC int tcc_machine_can_encode_stack_offset_for_reg(int frame_offset, int dest_reg)
@@ -4781,10 +4798,64 @@ static void thumb_emit_shift64_mop(const MachineOperand *src1, const MachineOper
  */
 static void thumb_emit_data_processing_mop32(const MachineOperand *src1, const MachineOperand *src2,
                                              const MachineOperand *dest, TccIrOp op, ThumbDataProcessingHandler handler,
-                                             thumb_flags_behaviour flags)
+                                             thumb_flags_behaviour flags, uint32_t barrel_shift)
 {
   const bool dest_sets_flags = (op == TCCIR_OP_CMP);
   MachineCodegenContext mctx = {0};
+
+  /* RSB fast path: SUB with immediate src1 → RSB Rd, src2, #imm.
+   * Avoids materializing the immediate into a register.
+   * Only attempt when the immediate is encodable as a Thumb-2 modified
+   * constant (th_pack_const returns non-zero, or imm==0). */
+  if (op == TCCIR_OP_SUB && !dest_sets_flags && barrel_shift == 0 &&
+      src1->kind == MACH_OP_IMM && !src1->needs_deref && !src1->is_64bit)
+  {
+    uint32_t imm = (uint32_t)src1->u.imm.val;
+    if (imm == 0 || th_pack_const(imm) != 0)
+    {
+      int dest_reg = mach_get_dest_reg(&mctx, dest, 0);
+      uint32_t excl = thumb_is_hw_reg(dest_reg) ? (1u << (uint32_t)dest_reg) : 0;
+      int src2_reg = mach_ensure_in_reg(&mctx, src2, excl);
+      ot_check(th_rsb_imm((uint32_t)dest_reg, (uint32_t)src2_reg, imm, flags, ENFORCE_ENCODING_NONE));
+      if (dest->kind != MACH_OP_NONE)
+      {
+        const bool needs_wb = dest->kind == MACH_OP_SPILL || dest->kind == MACH_OP_PARAM_STACK ||
+                              (dest->kind == MACH_OP_REG && (dest->needs_deref || dest->u.reg.r0 == (int)PREG_REG_NONE));
+        if (needs_wb)
+          mach_writeback_dest(dest, dest_reg);
+      }
+      mach_release_all(&mctx);
+      return;
+    }
+  }
+
+  /* UXTB/UXTH fast path: AND with #0xFF or #0xFFFF → UXTB/UXTH.
+   * 16-bit encoding (2 bytes) vs 32-bit AND immediate (4 bytes). */
+  if (op == TCCIR_OP_AND && !dest_sets_flags && barrel_shift == 0 &&
+      src2->kind == MACH_OP_IMM && !src2->needs_deref && !src2->is_64bit &&
+      flags != FLAGS_BEHAVIOUR_SET)
+  {
+    uint32_t mask = (uint32_t)src2->u.imm.val;
+    if (mask == 0xFF || mask == 0xFFFF)
+    {
+      int dest_reg = mach_get_dest_reg(&mctx, dest, 0);
+      uint32_t excl = thumb_is_hw_reg(dest_reg) ? (1u << (uint32_t)dest_reg) : 0;
+      int src1_reg = mach_ensure_in_reg(&mctx, src1, excl);
+      if (mask == 0xFF)
+        ot_check(th_uxtb((uint32_t)dest_reg, (uint32_t)src1_reg, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+      else
+        ot_check(th_uxth((uint32_t)dest_reg, (uint32_t)src1_reg, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+      if (dest->kind != MACH_OP_NONE)
+      {
+        const bool needs_wb = dest->kind == MACH_OP_SPILL || dest->kind == MACH_OP_PARAM_STACK ||
+                              (dest->kind == MACH_OP_REG && (dest->needs_deref || dest->u.reg.r0 == (int)PREG_REG_NONE));
+        if (needs_wb)
+          mach_writeback_dest(dest, dest_reg);
+      }
+      mach_release_all(&mctx);
+      return;
+    }
+  }
 
   /* 1. Determine dest register (allocate scratch for spills/param/no-reg).
    * CMP and other flag-setting ops don't write a result register, so we
@@ -4816,9 +4887,23 @@ static void thumb_emit_data_processing_mop32(const MachineOperand *src1, const M
       mach_ensure_imm_or_reg(&mctx, src2, excl, handler.imm_handler, dest_reg, src1_reg, flags, &imm_emitted);
   if (!imm_emitted)
   {
-    /* Immediate form didn't fit (or src2 isn't an immediate): emit reg form. */
+    /* Decode barrel shift annotation (0=none, else type<<5|amount). */
+    thumb_shift sh = THUMB_SHIFT_DEFAULT;
+    if (barrel_shift != 0)
+    {
+      static const thumb_shift_type bs_map[] = {
+        [1] = THUMB_SHIFT_LSL, [2] = THUMB_SHIFT_LSR,
+        [3] = THUMB_SHIFT_ASR, [4] = THUMB_SHIFT_ROR,
+      };
+      uint32_t stype = (barrel_shift >> 5) & 7;
+      uint32_t samt = barrel_shift & 31;
+      sh.type = bs_map[stype];
+      sh.value = samt;
+      sh.mode = THUMB_SHIFT_IMMEDIATE;
+    }
+    thumb_enforce_encoding enc = (barrel_shift != 0) ? ENFORCE_ENCODING_32BIT : ENFORCE_ENCODING_NONE;
     ot_check(thumb_call_reg_handler(handler.reg_handler, (uint32_t)dest_reg, (uint32_t)src1_reg, (uint32_t)src2_reg,
-                                    flags, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+                                    flags, sh, enc));
   }
 
   /* 4. Write result back to spill slot / stack param / pointer-dest. */
@@ -4841,25 +4926,28 @@ static void thumb_emit_data_processing_mop32(const MachineOperand *src1, const M
  * 64-bit pair destinations, or thumb_emit_data_processing_mop32 for 32-bit.
  */
 static void data_processing_mop_impl(MachineOperand src1, MachineOperand src2, MachineOperand dest, TccIrOp op,
-                                     thumb_flags_behaviour flags_override);
+                                     thumb_flags_behaviour flags_override, uint32_t barrel_shift);
 
-void tcc_gen_machine_data_processing_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest, TccIrOp op)
+void tcc_gen_machine_data_processing_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest, TccIrOp op,
+                                         uint32_t barrel_shift)
 {
-  data_processing_mop_impl(src1, src2, dest, op, flags_safe());
+  data_processing_mop_impl(src1, src2, dest, op, flags_safe(), barrel_shift);
 }
 
 void tcc_gen_machine_data_processing_mop_flags(MachineOperand src1, MachineOperand src2, MachineOperand dest, TccIrOp op)
 {
-  data_processing_mop_impl(src1, src2, dest, op, FLAGS_BEHAVIOUR_SET);
+  data_processing_mop_impl(src1, src2, dest, op, FLAGS_BEHAVIOUR_SET, 0);
 }
 
 static void data_processing_mop_impl(MachineOperand src1, MachineOperand src2, MachineOperand dest, TccIrOp op,
-                                     thumb_flags_behaviour flags_override)
+                                     thumb_flags_behaviour flags_override, uint32_t barrel_shift)
 {
   ThumbDataProcessingHandler handler;
   ThumbDataProcessingHandler carry_handler; /* used for hi word of 64-bit ops */
   bool uses_carry = false;
-  thumb_flags_behaviour flags = flags_override;
+  /* CMP always sets flags — it has no non-flag-setting variant.
+   * Ignore FLAGS_BEHAVIOUR_BLOCK for CMP; it must always use SET. */
+  thumb_flags_behaviour flags = (op == TCCIR_OP_CMP) ? FLAGS_BEHAVIOUR_SET : flags_override;
 
   switch (op)
   {
@@ -4897,6 +4985,11 @@ static void data_processing_mop_impl(MachineOperand src1, MachineOperand src2, M
   case TCCIR_OP_SAR:
     handler.imm_handler = th_asr_imm;
     handler.reg_handler = th_asr_reg;
+    carry_handler = handler;
+    break;
+  case TCCIR_OP_ROR:
+    handler.imm_handler = th_ror_imm;
+    handler.reg_handler = th_ror_reg;
     carry_handler = handler;
     break;
   case TCCIR_OP_OR:
@@ -4938,7 +5031,7 @@ static void data_processing_mop_impl(MachineOperand src1, MachineOperand src2, M
     return;
   }
 
-  thumb_emit_data_processing_mop32(&src1, &src2, &dest, op, handler, flags);
+  thumb_emit_data_processing_mop32(&src1, &src2, &dest, op, handler, flags, barrel_shift);
 }
 
 /* tcc_gen_machine_ubfx_mop: emit UBFX Rd, Rn, #lsb, #width.
@@ -4983,6 +5076,11 @@ static void mach_regonly_binop_mop(MachineCodegenContext *ctx, const MachineOper
   /* 1. Get dest register (scratch if spill/param). */
   int dest_reg = mach_get_dest_reg(ctx, dest, 0);
   uint32_t excl = thumb_is_hw_reg(dest_reg) ? (1u << (uint32_t)dest_reg) : 0;
+
+  /* Pre-exclude src2's physical register so that loading src1 (which may
+   * need a scratch for deref) does not clobber src2's value. */
+  if (src2->kind == MACH_OP_REG && !src2->needs_deref && thumb_is_hw_reg(src2->u.reg.r0))
+    excl |= (1u << (uint32_t)src2->u.reg.r0);
 
   /* 2. Ensure src1 in a register; extend exclusion mask. */
   int src1_reg = mach_ensure_in_reg(ctx, src1, excl);
@@ -5638,8 +5736,20 @@ ST_FUNC void tcc_gen_machine_mla_mop(MachineOperand src1, MachineOperand src2, M
 {
   MachineCodegenContext ctx = {0};
 
-  int src1_reg = mach_ensure_in_reg(&ctx, &src1, 0);
-  uint32_t excl = thumb_is_hw_reg(src1_reg) ? (1u << (uint32_t)src1_reg) : 0u;
+  /* Pre-exclude registers directly referenced by REG operands so that scratch
+   * allocations for other operands (e.g. immediates) cannot clobber them. */
+  uint32_t live_regs = 0;
+  if (src1.kind == MACH_OP_REG && !src1.needs_deref)
+    live_regs |= (1u << (uint32_t)src1.u.reg.r0);
+  if (src2.kind == MACH_OP_REG && !src2.needs_deref)
+    live_regs |= (1u << (uint32_t)src2.u.reg.r0);
+  if (accum.kind == MACH_OP_REG && !accum.needs_deref)
+    live_regs |= (1u << (uint32_t)accum.u.reg.r0);
+
+  int src1_reg = mach_ensure_in_reg(&ctx, &src1, live_regs);
+  uint32_t excl = live_regs;
+  if (thumb_is_hw_reg(src1_reg))
+    excl |= (1u << (uint32_t)src1_reg);
 
   int src2_reg = mach_ensure_in_reg(&ctx, &src2, excl);
   if (thumb_is_hw_reg(src2_reg))
@@ -6384,8 +6494,13 @@ ST_FUNC void tcc_gen_machine_store_mop(MachineOperand dest, MachineOperand src, 
     MachineOperand src_hi = mach_make_hi_half(&src);
     src_hi.btype = IROP_BTYPE_INT32;
 
-    const int lo_reg = mach_ensure_in_reg(&ctx, &src_lo, 0);
-    uint32_t excl = thumb_is_hw_reg(lo_reg) ? (1u << (uint32_t)lo_reg) : 0u;
+    uint32_t dest_excl = 0;
+    if (dest.kind == MACH_OP_REG && dest.needs_deref &&
+        dest.u.reg.r0 >= 0 && dest.u.reg.r0 < 16)
+      dest_excl = (1u << (uint32_t)dest.u.reg.r0);
+
+    const int lo_reg = mach_ensure_in_reg(&ctx, &src_lo, dest_excl);
+    uint32_t excl = dest_excl | (thumb_is_hw_reg(lo_reg) ? (1u << (uint32_t)lo_reg) : 0u);
     const int hi_reg = mach_ensure_in_reg(&ctx, &src_hi, excl);
     excl |= thumb_is_hw_reg(hi_reg) ? (1u << (uint32_t)hi_reg) : 0u;
 
@@ -6560,8 +6675,14 @@ ST_FUNC void tcc_gen_machine_store_mop(MachineOperand dest, MachineOperand src, 
     return;
   }
 
-  /* Get source value register — may allocate a scratch if spilled/const */
-  const int src_reg = mach_ensure_in_reg(&ctx, &src, 0);
+  /* Get source value register — may allocate a scratch if spilled/const.
+   * When storing through a register-held pointer, protect the base register
+   * before materializing immediates or spilled values. */
+  uint32_t src_excl = 0;
+  if (dest.kind == MACH_OP_REG && dest.needs_deref &&
+      dest.u.reg.r0 >= 0 && dest.u.reg.r0 < 16)
+    src_excl |= (1u << (uint32_t)dest.u.reg.r0);
+  const int src_reg = mach_ensure_in_reg(&ctx, &src, src_excl);
 
   switch (dest.kind)
   {
@@ -6819,6 +6940,8 @@ ST_FUNC void tcc_gen_machine_load_indexed_mop(MachineOperand dest, MachineOperan
       excl |= (1u << (uint32_t)dest_hi);
     }
 
+    if (index.kind == MACH_OP_REG && !index.needs_deref)
+      excl |= (1u << (uint32_t)index.u.reg.r0);
     int base_reg = mach_ensure_in_reg(&ctx, &base, excl);
     excl |= (1u << (uint32_t)base_reg);
     int index_reg = mach_ensure_in_reg(&ctx, &index, excl);
@@ -6845,6 +6968,8 @@ ST_FUNC void tcc_gen_machine_load_indexed_mop(MachineOperand dest, MachineOperan
   const int is_unsigned = (int)dest.is_unsigned;
 
   uint32_t excl = (1u << (uint32_t)dest_reg);
+  if (index.kind == MACH_OP_REG && !index.needs_deref)
+    excl |= (1u << (uint32_t)index.u.reg.r0);
   int base_reg = mach_ensure_in_reg(&ctx, &base, excl);
   excl |= (1u << (uint32_t)base_reg);
   int index_reg = mach_ensure_in_reg(&ctx, &index, excl);
@@ -6942,8 +7067,13 @@ ST_FUNC void tcc_gen_machine_store_indexed_mop(MachineOperand base, MachineOpera
     val_lo.btype = IROP_BTYPE_INT32;
     MachineOperand val_hi = mach_make_hi_half(&value);
     val_hi.btype = IROP_BTYPE_INT32;
-    const int lo_reg = mach_ensure_in_reg(&ctx, &val_lo, 0);
-    uint32_t excl = (1u << (uint32_t)lo_reg);
+    uint32_t excl = 0;
+    if (base.kind == MACH_OP_REG && !base.needs_deref)
+      excl |= (1u << (uint32_t)base.u.reg.r0);
+    if (index.kind == MACH_OP_REG && !index.needs_deref)
+      excl |= (1u << (uint32_t)index.u.reg.r0);
+    const int lo_reg = mach_ensure_in_reg(&ctx, &val_lo, excl);
+    excl |= (1u << (uint32_t)lo_reg);
     const int hi_reg = mach_ensure_in_reg(&ctx, &val_hi, excl);
     excl |= (1u << (uint32_t)hi_reg);
     int base_reg = mach_ensure_in_reg(&ctx, &base, excl);
@@ -6960,8 +7090,13 @@ ST_FUNC void tcc_gen_machine_store_indexed_mop(MachineOperand base, MachineOpera
 
   const int btype = value.btype;
 
-  int value_reg = mach_ensure_in_reg(&ctx, &value, 0);
-  uint32_t excl = (1u << (uint32_t)value_reg);
+  uint32_t excl = 0;
+  if (base.kind == MACH_OP_REG && !base.needs_deref)
+    excl |= (1u << (uint32_t)base.u.reg.r0);
+  if (index.kind == MACH_OP_REG && !index.needs_deref)
+    excl |= (1u << (uint32_t)index.u.reg.r0);
+  int value_reg = mach_ensure_in_reg(&ctx, &value, excl);
+  excl |= (1u << (uint32_t)value_reg);
   int base_reg = mach_ensure_in_reg(&ctx, &base, excl);
   excl |= (1u << (uint32_t)base_reg);
   int index_reg = mach_ensure_in_reg(&ctx, &index, excl);
