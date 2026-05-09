@@ -3301,6 +3301,24 @@ ST_FUNC int tcc_gen_machine_try_ldrd_spill(int reg1, int32_t off1, int reg2, int
   return try_ldrd_pair(reg1, reg2, base_reg, abs_off, sign);
 }
 
+/* Try to emit LDRD/STRD for two 32-bit values from adjacent offsets off a
+ * generic base register (not FP/SP).  Used by the LOAD_INDEXED/STORE_INDEXED
+ * pairing peephole.  `off` is the lower offset (caller has verified
+ * off + 4 fits within the same access range).  Returns 1 on success. */
+ST_FUNC int tcc_gen_machine_try_ldrd_base(int reg1, int reg2, int base_reg, int32_t off)
+{
+  int sign = (off < 0);
+  int abs_off = sign ? -off : off;
+  return try_ldrd_pair(reg1, reg2, base_reg, abs_off, sign);
+}
+
+ST_FUNC int tcc_gen_machine_try_strd_base(int reg1, int reg2, int base_reg, int32_t off)
+{
+  int sign = (off < 0);
+  int abs_off = sign ? -off : off;
+  return try_strd_pair(reg1, reg2, base_reg, abs_off, sign);
+}
+
 ST_FUNC int tcc_machine_can_encode_stack_offset_for_reg(int frame_offset, int dest_reg)
 {
   /* Check if frame_offset can be directly encoded in ldr/str instructions

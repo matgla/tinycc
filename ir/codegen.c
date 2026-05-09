@@ -2534,12 +2534,145 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
       case TCCIR_OP_LOAD_INDEXED:
       {
         MopArgs a = DECODE(.dest = 2, .src1 = 1, .src2 = 1, .scale = 1);
+
+        /* LDRD pairing: two adjacent 32-bit LOAD_INDEXED ops with the same
+         * base register, scale=0, and constant offsets differing by 4 can
+         * fold to a single LDRD.  Mirrors the SPILL-slot LDRD peephole
+         * above; the offset is a generic [base, #imm] so we use the
+         * non-spill `try_ldrd_base` wrapper. */
+        if (!a.dest.is_64bit && a.dest.kind == MACH_OP_REG &&
+            a.scale.kind == MACH_OP_IMM && a.scale.u.imm.val == 0 &&
+            a.src2.kind == MACH_OP_IMM &&
+            a.src1.kind == MACH_OP_REG && !a.src1.needs_deref &&
+            (a.dest.btype == IROP_BTYPE_INT32 || a.dest.btype == IROP_BTYPE_FLOAT32))
+        {
+          int next_i = -1;
+          for (int j = i + 1; j < ir->next_instruction_index; j++)
+          {
+            if (ir->compact_instructions[j].op != TCCIR_OP_NOP)
+            {
+              next_i = j;
+              break;
+            }
+          }
+          if (next_i >= 0 && ir->compact_instructions[next_i].op == TCCIR_OP_LOAD_INDEXED &&
+              !ir->compact_instructions[next_i].is_jump_target)
+          {
+            IRQuadCompact *nq = &ir->compact_instructions[next_i];
+            IROperand n_src1_ir = tcc_ir_op_get_src1(ir, nq);
+            IROperand n_src2_ir = tcc_ir_op_get_src2(ir, nq);
+            IROperand n_dest_ir = tcc_ir_op_get_dest(ir, nq);
+            MopArgs b = ir_decode_cached(is_dry_run, 0, NULL, next_i, ir, nq, &n_src1_ir, &n_src2_ir, &n_dest_ir,
+                                         (MopSpec){.dest = 2, .src1 = 1, .src2 = 1, .scale = 1});
+
+            if (!b.dest.is_64bit && b.dest.kind == MACH_OP_REG &&
+                b.scale.kind == MACH_OP_IMM && b.scale.u.imm.val == 0 &&
+                b.src2.kind == MACH_OP_IMM &&
+                b.src1.kind == MACH_OP_REG && !b.src1.needs_deref &&
+                (b.dest.btype == IROP_BTYPE_INT32 || b.dest.btype == IROP_BTYPE_FLOAT32) &&
+                a.src1.u.reg.r0 == b.src1.u.reg.r0)
+            {
+              int32_t off1 = (int32_t)a.src2.u.imm.val;
+              int32_t off2 = (int32_t)b.src2.u.imm.val;
+              int reg1 = a.dest.u.reg.r0;
+              int reg2 = b.dest.u.reg.r0;
+              int base_reg = a.src1.u.reg.r0;
+
+              /* LDRD writes Rt before Rt2; if Rt overlaps the base reg the
+               * second load reads from a clobbered base.  Punt those cases. */
+              if (reg1 != reg2 && reg1 != base_reg && reg2 != base_reg)
+              {
+                if ((off1 & 3) == 0 && off1 + 4 == off2)
+                {
+                  if (tcc_gen_machine_try_ldrd_base(reg1, reg2, base_reg, off1))
+                  {
+                    i = next_i;
+                    break;
+                  }
+                }
+                else if ((off2 & 3) == 0 && off2 + 4 == off1)
+                {
+                  if (tcc_gen_machine_try_ldrd_base(reg2, reg1, base_reg, off2))
+                  {
+                    i = next_i;
+                    break;
+                  }
+                }
+              }
+            }
+          }
+        }
+
         SCRATCH_WRAP(tcc_gen_machine_load_indexed_mop(a.dest, a.src1, a.src2, a.scale, cq->op));
         break;
       }
       case TCCIR_OP_STORE_INDEXED:
       {
         MopArgs a = DECODE(.dest = 1, .src1 = 1, .src2 = 1, .scale = 1);
+
+        /* STRD pairing peephole: two adjacent 32-bit STORE_INDEXED ops with
+         * same base, scale=0, offsets differing by 4 → single STRD. */
+        if (!a.src1.is_64bit && a.src1.kind == MACH_OP_REG &&
+            a.scale.kind == MACH_OP_IMM && a.scale.u.imm.val == 0 &&
+            a.src2.kind == MACH_OP_IMM &&
+            a.dest.kind == MACH_OP_REG && !a.dest.needs_deref &&
+            (a.src1.btype == IROP_BTYPE_INT32 || a.src1.btype == IROP_BTYPE_FLOAT32))
+        {
+          int next_i = -1;
+          for (int j = i + 1; j < ir->next_instruction_index; j++)
+          {
+            if (ir->compact_instructions[j].op != TCCIR_OP_NOP)
+            {
+              next_i = j;
+              break;
+            }
+          }
+          if (next_i >= 0 && ir->compact_instructions[next_i].op == TCCIR_OP_STORE_INDEXED &&
+              !ir->compact_instructions[next_i].is_jump_target)
+          {
+            IRQuadCompact *nq = &ir->compact_instructions[next_i];
+            IROperand n_src1_ir = tcc_ir_op_get_src1(ir, nq);
+            IROperand n_src2_ir = tcc_ir_op_get_src2(ir, nq);
+            IROperand n_dest_ir = tcc_ir_op_get_dest(ir, nq);
+            MopArgs b = ir_decode_cached(is_dry_run, 0, NULL, next_i, ir, nq, &n_src1_ir, &n_src2_ir, &n_dest_ir,
+                                         (MopSpec){.dest = 1, .src1 = 1, .src2 = 1, .scale = 1});
+
+            if (!b.src1.is_64bit && b.src1.kind == MACH_OP_REG &&
+                b.scale.kind == MACH_OP_IMM && b.scale.u.imm.val == 0 &&
+                b.src2.kind == MACH_OP_IMM &&
+                b.dest.kind == MACH_OP_REG && !b.dest.needs_deref &&
+                (b.src1.btype == IROP_BTYPE_INT32 || b.src1.btype == IROP_BTYPE_FLOAT32) &&
+                a.dest.u.reg.r0 == b.dest.u.reg.r0)
+            {
+              int32_t off1 = (int32_t)a.src2.u.imm.val;
+              int32_t off2 = (int32_t)b.src2.u.imm.val;
+              int reg1 = a.src1.u.reg.r0;
+              int reg2 = b.src1.u.reg.r0;
+              int base_reg = a.dest.u.reg.r0;
+
+              if (reg1 != reg2)
+              {
+                if ((off1 & 3) == 0 && off1 + 4 == off2)
+                {
+                  if (tcc_gen_machine_try_strd_base(reg1, reg2, base_reg, off1))
+                  {
+                    i = next_i;
+                    break;
+                  }
+                }
+                else if ((off2 & 3) == 0 && off2 + 4 == off1)
+                {
+                  if (tcc_gen_machine_try_strd_base(reg2, reg1, base_reg, off2))
+                  {
+                    i = next_i;
+                    break;
+                  }
+                }
+              }
+            }
+          }
+        }
+
         SCRATCH_WRAP(tcc_gen_machine_store_indexed_mop(a.dest, a.src2, a.scale, a.src1, cq->op));
         break;
       }

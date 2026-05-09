@@ -25502,6 +25502,20 @@ static void gen_function(Sym *sym)
       tcc_ir_opt_dce(ir);
   }
 
+  /* Indexed-chain fold: collapse `T = base ADD #imm1; T _INDEXED #imm2`
+   * into a single _INDEXED op with combined offset.  Catches sha_final-style
+   * struct-field-of-array-base writes that disp_fusion can't see in one
+   * pass (its consumer-side dispatch only matches plain LOAD/STORE). */
+  if (tcc_state->opt_disp_fusion)
+    tcc_ir_opt_indexed_chain(ir);
+
+  /* Indexed-pair reorder: sink FUNCPARAMVAL past the next LOAD/STORE_INDEXED
+   * so adjacent _INDEXED ops with same base + adjacent offsets become
+   * physically adjacent in the IR, exposing them to the codegen LDRD/STRD
+   * pairing peephole.  Helps printf-of-many-fields patterns like sha_print. */
+  if (tcc_state->opt_disp_fusion)
+    tcc_ir_opt_indexed_pair_reorder(ir);
+
   /* LEA+deref fold - collapse `LEA Addr[StackLoc[-N]] + [ADD #K] + deref-use`
    * into a direct StackLoc access.  Runs after disp-fusion so any surviving
    * LEA+ADD pairs still have a chance to be folded here. */

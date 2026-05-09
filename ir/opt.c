@@ -8084,6 +8084,7 @@ int tcc_ir_opt_copy_prop(TCCIRState *ir)
   int max_tmp_pos = 0;
   int max_var_pos = 0;
   int max_param_pos = 0;
+  int any_tmp = 0;
   int current_gen = 1;   /* Generation counter, starts at 1 (0 means invalid) */
   int active_copies = 0; /* Number of active TMP copies in current_gen */
   int i;
@@ -8112,8 +8113,11 @@ int tcc_ir_opt_copy_prop(TCCIRState *ir)
       int32_t dest_vr = irop_get_vreg(dest);
       const int vr_type = TCCIR_DECODE_VREG_TYPE(dest_vr);
       const int pos = TCCIR_DECODE_VREG_POSITION(dest_vr);
-      if (vr_type == TCCIR_VREG_TYPE_TEMP && pos > max_tmp_pos)
-        max_tmp_pos = pos;
+      if (vr_type == TCCIR_VREG_TYPE_TEMP) {
+        any_tmp = 1;
+        if (pos > max_tmp_pos)
+          max_tmp_pos = pos;
+      }
       else if (vr_type == TCCIR_VREG_TYPE_VAR && pos > max_var_pos)
         max_var_pos = pos;
       else if (vr_type == TCCIR_VREG_TYPE_PARAM && pos > max_param_pos)
@@ -8125,6 +8129,8 @@ int tcc_ir_opt_copy_prop(TCCIRState *ir)
       int32_t src1_vr = irop_get_vreg(src1);
       const int vr_type = TCCIR_DECODE_VREG_TYPE(src1_vr);
       const int pos = TCCIR_DECODE_VREG_POSITION(src1_vr);
+      if (vr_type == TCCIR_VREG_TYPE_TEMP)
+        any_tmp = 1;
       if (vr_type == TCCIR_VREG_TYPE_VAR && pos > max_var_pos)
         max_var_pos = pos;
       else if (vr_type == TCCIR_VREG_TYPE_PARAM && pos > max_param_pos)
@@ -8136,6 +8142,8 @@ int tcc_ir_opt_copy_prop(TCCIRState *ir)
       int32_t src2_vr = irop_get_vreg(src2);
       const int vr_type = TCCIR_DECODE_VREG_TYPE(src2_vr);
       const int pos = TCCIR_DECODE_VREG_POSITION(src2_vr);
+      if (vr_type == TCCIR_VREG_TYPE_TEMP)
+        any_tmp = 1;
       if (vr_type == TCCIR_VREG_TYPE_VAR && pos > max_var_pos)
         max_var_pos = pos;
       else if (vr_type == TCCIR_VREG_TYPE_PARAM && pos > max_param_pos)
@@ -8143,7 +8151,7 @@ int tcc_ir_opt_copy_prop(TCCIRState *ir)
     }
   }
 
-  if (max_tmp_pos == 0)
+  if (!any_tmp)
     return 0;
 
   /* Use stack buffers if possible, otherwise single heap allocation */
@@ -8273,8 +8281,15 @@ int tcc_ir_opt_copy_prop(TCCIRState *ir)
 
     /* Propagate copies into STORE destinations.
      * For STORE: dest is TMP***DEREF*** (address to write to), src1 is the value.
-     * If TMP was copied from another TMP, replace TMP***DEREF*** with source***DEREF***.
-     * Only allow TMP←TMP copies here (same restriction as src1/src2 lval propagation). */
+     * If TMP was copied from another vreg, replace TMP***DEREF*** with src***DEREF***.
+     *
+     * Source kinds we accept:
+     *   - TMP: standard TMP-to-TMP propagation.
+     *   - PARAM/VAR: only if the source isn't is_local/is_llocal (i.e. the
+     *     source holds a register-resident pointer, not a stack-relative
+     *     address that would need an LEA at the use site).  copy_info
+     *     already invalidates entries at FUNCCALL and BB boundaries, so
+     *     the source value is guaranteed live with the same content here. */
     if (active_copies > 0 && q->op == TCCIR_OP_STORE && irop_config[q->op].has_dest)
     {
       IROperand store_dest = tcc_ir_op_get_dest(ir, q);
@@ -8285,9 +8300,14 @@ int tcc_ir_opt_copy_prop(TCCIRState *ir)
         if (pos <= max_tmp_pos && copy_info[pos].gen == current_gen)
         {
           int src_type = TCCIR_DECODE_VREG_TYPE(copy_info[pos].source_vr);
-          if (src_type == TCCIR_VREG_TYPE_TEMP)
+          IROperand src_op = copy_info[pos].source;
+          int ok = (src_type == TCCIR_VREG_TYPE_TEMP);
+          if (!ok && (src_type == TCCIR_VREG_TYPE_PARAM || src_type == TCCIR_VREG_TYPE_VAR) &&
+              !src_op.is_local && !src_op.is_llocal)
+            ok = 1;
+          if (ok)
           {
-            IROperand replacement = copy_info[pos].source;
+            IROperand replacement = src_op;
             replacement.is_lval = 1;                          /* Preserve DEREF semantics */
             replacement.btype = store_dest.btype;             /* Preserve store width */
             replacement.is_unsigned = store_dest.is_unsigned; /* Preserve signedness */
@@ -15250,6 +15270,341 @@ int tcc_ir_opt_disp_fusion(TCCIRState *ir)
   LOG_IR_GEN("=== DISP FUSION END: %d fusions ===", changes);
 
   tcc_free(du.def);
+  return changes;
+}
+
+/* ============================================================================
+ * Indexed-chain fold
+ * ============================================================================
+ *
+ * Fold a constant-immediate ADD that feeds an existing _INDEXED memory op
+ * into the indexed op's offset:
+ *
+ *   ADD T = base, #imm1                    →  (NOP)
+ *   ... base=T STORE_INDEXED #imm2, #0     →  base=base STORE_INDEXED #(imm1+imm2), #0
+ *   ... base=T LOAD_INDEXED  #imm2, #0     →  base=base LOAD_INDEXED  #(imm1+imm2), #0
+ *
+ * Picks up sha_final-style chains:
+ *
+ *   T = &info->data[0]  (= P0+28)
+ *   *(T + 56) = info->count_hi          ; STORE_INDEXED with offset 56
+ *
+ * which folds to a single `strb r1, [P0, #84]`.  Runs after disp_fusion so
+ * any STORE_INDEXED produced there can also be chained into.  Only handles
+ * scale=0 entries (constant offset, no shift).
+ */
+int tcc_ir_opt_indexed_chain(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  int changes = 0;
+  if (n == 0)
+    return 0;
+
+  IROptDU du;
+  ir_opt_du_build(ir, &du);
+
+  LOG_IR_GEN("=== INDEXED CHAIN START (n=%d) ===", n);
+
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    int is_store = (q->op == TCCIR_OP_STORE_INDEXED);
+    int is_load = (q->op == TCCIR_OP_LOAD_INDEXED);
+    if (!is_store && !is_load)
+      continue;
+
+    /* Layout: pool[base+0]=dest(load) or base(store)
+     *         pool[base+1]=base(load) or value(store)
+     *         pool[base+2]=index, pool[base+3]=scale */
+    int base_slot = is_store ? 0 : 1;
+    IROperand base_op = ir->iroperand_pool[q->operand_base + base_slot];
+    IROperand index_op = ir->iroperand_pool[q->operand_base + 2];
+    IROperand scale_op = ir->iroperand_pool[q->operand_base + 3];
+
+    /* Only chain scale=0 ops with a constant existing offset. */
+    if (irop_get_tag(scale_op) != IROP_TAG_IMM32 || scale_op.u.imm32 != 0)
+      continue;
+    if (irop_get_tag(index_op) != IROP_TAG_IMM32)
+      continue;
+    int imm2 = (int)index_op.u.imm32;
+
+    int32_t base_vr = irop_get_vreg(base_op);
+    if (base_vr < 0)
+      continue;
+    if (base_op.is_local || base_op.is_llocal)
+      continue;
+    if (base_op.is_lval)
+      continue; /* base is a pointer-from-memory; backend would need to load it */
+
+    /* Find the unique def of base.  Must be ADD with a constant immediate. */
+    int add_idx = ir_opt_du_def(&du, base_vr, i);
+    if (add_idx < 0)
+      continue;
+    if (ir_opt_du_uses(&du, base_vr) != 1)
+      continue;
+
+    IRQuadCompact *add_q = &ir->compact_instructions[add_idx];
+    if (add_q->op != TCCIR_OP_ADD)
+      continue;
+
+    IROperand add_src1 = tcc_ir_op_get_src1(ir, add_q);
+    IROperand add_src2 = tcc_ir_op_get_src2(ir, add_q);
+
+    IROperand new_base;
+    int imm1;
+    if (irop_get_tag(add_src2) == IROP_TAG_IMM32 && irop_get_tag(add_src1) == IROP_TAG_VREG &&
+        irop_has_vreg(add_src1))
+    {
+      new_base = add_src1;
+      imm1 = (int)add_src2.u.imm32;
+    }
+    else if (irop_get_tag(add_src1) == IROP_TAG_IMM32 && irop_get_tag(add_src2) == IROP_TAG_VREG &&
+             irop_has_vreg(add_src2))
+    {
+      new_base = add_src2;
+      imm1 = (int)add_src1.u.imm32;
+    }
+    else
+    {
+      continue;
+    }
+
+    if (new_base.is_local || new_base.is_llocal)
+      continue;
+
+    /* Combined offset must fit Thumb-2 immediate range and (for the LDRD/STRD
+     * paths the backend chooses for 64-bit ops) preserve alignment.  We
+     * already gate scale=0; for the value btype carried by STORE_INDEXED's
+     * value slot or LOAD_INDEXED's dest slot, the existing STORE_INDEXED was
+     * produced by disp_fusion which enforced non-64-bit, so we just need to
+     * keep the same width and check the imm range. */
+    long long imm_total = (long long)imm1 + imm2;
+    if (imm_total > 4095 || imm_total < -255)
+      continue;
+
+    /* Same-block (ADD and the indexed op): disp_fusion already enforces this
+     * for fold-produced entries, but be defensive for SHL+ADD-produced ones. */
+    int same_block = 1;
+    for (int j = add_idx + 1; j < i; j++)
+    {
+      TccIrOp bop = ir->compact_instructions[j].op;
+      if (bop == TCCIR_OP_JUMP || bop == TCCIR_OP_JUMPIF)
+      {
+        same_block = 0;
+        break;
+      }
+    }
+    if (!same_block)
+      continue;
+
+    /* Update operands in place and NOP the ADD. */
+    new_base.is_lval = 0;
+    new_base.btype = base_op.btype;
+    ir->iroperand_pool[q->operand_base + base_slot] = new_base;
+    IROperand new_index = irop_make_imm32(0, (int32_t)imm_total, IROP_BTYPE_INT32);
+    ir->iroperand_pool[q->operand_base + 2] = new_index;
+
+    add_q->op = TCCIR_OP_NOP;
+    changes++;
+
+    LOG_IR_GEN("INDEXED_CHAIN: ADD@%d (#%d) + %s_INDEXED@%d (#%d) -> #%lld", add_idx, imm1,
+               is_store ? "STORE" : "LOAD", i, imm2, imm_total);
+  }
+
+  LOG_IR_GEN("=== INDEXED CHAIN END: %d folds ===", changes);
+  tcc_free(du.def);
+  return changes;
+}
+
+/* ============================================================================
+ * Indexed-pair reorder
+ * ============================================================================
+ *
+ * Sink intervening FUNCPARAMVAL ops past an upcoming LOAD/STORE_INDEXED so
+ * that LDRD/STRD-pairable ops become adjacent.  Pattern:
+ *
+ *   LOAD_INDEXED  T_a = base + offset_a   (scale=0, constant offset)
+ *   FUNCPARAMVAL  ... T_a                  (consumes T_a; doesn't write base)
+ *   LOAD_INDEXED  T_b = base + offset_b
+ *
+ * becomes
+ *
+ *   LOAD_INDEXED  T_a = base + offset_a
+ *   LOAD_INDEXED  T_b = base + offset_b   (hoisted)
+ *   FUNCPARAMVAL  ... T_a                  (sunk)
+ *
+ * Same for adjacent STORE_INDEXED chains.  Only swap when the FUNCPARAMVAL
+ * does not name T_b (the hoisted op's dest) and the two indexed ops both
+ * have scale=0 with the same base register vreg.  Letting codegen decide
+ * pair-validity (offsets, alignment, regalloc) keeps this pass simple — we
+ * only do swaps that *might* help and never block.
+ */
+int tcc_ir_opt_indexed_pair_reorder(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  int changes = 0;
+  if (n < 3)
+    return 0;
+
+  LOG_IR_GEN("=== INDEXED PAIR REORDER START (n=%d) ===", n);
+
+  for (int i = 0; i + 2 < n; i++)
+  {
+    IRQuadCompact *q1 = &ir->compact_instructions[i];
+    if (q1->op != TCCIR_OP_LOAD_INDEXED && q1->op != TCCIR_OP_STORE_INDEXED)
+      continue;
+    int q1_is_load = (q1->op == TCCIR_OP_LOAD_INDEXED);
+
+    /* q1 must have scale=0 and constant offset. */
+    IROperand q1_scale = ir->iroperand_pool[q1->operand_base + 3];
+    IROperand q1_index = ir->iroperand_pool[q1->operand_base + 2];
+    if (irop_get_tag(q1_scale) != IROP_TAG_IMM32 || q1_scale.u.imm32 != 0)
+      continue;
+    if (irop_get_tag(q1_index) != IROP_TAG_IMM32)
+      continue;
+
+    int q1_base_slot = q1_is_load ? 1 : 0;
+    IROperand q1_base = ir->iroperand_pool[q1->operand_base + q1_base_slot];
+    int32_t q1_base_vr = irop_get_vreg(q1_base);
+    if (q1_base_vr < 0)
+      continue;
+
+    /* Look ahead within a small window for a pair-able same-op _INDEXED.
+     * Intervening ops may be NOP, FUNCPARAMVAL, or simple non-lval ASSIGN
+     * — those are guaranteed not to write memory, define the base vreg,
+     * or jump.  Anything else (STORE, CALL, JUMP, ALU writing base, ...)
+     * blocks the search. */
+    const int window = 12;
+    int q3_idx = -1;
+    int blocked = 0;
+    for (int k = i + 1; k < n && (k - i) <= window; k++)
+    {
+      IRQuadCompact *cq = &ir->compact_instructions[k];
+      if (cq->op == TCCIR_OP_NOP)
+        continue;
+      if (cq->is_jump_target)
+      {
+        blocked = 1;
+        break;
+      }
+
+      if (cq->op == q1->op)
+      {
+        q3_idx = k;
+        break;
+      }
+
+      /* Is this op safe to leave between q1 and the future q3? */
+      int safe = 0;
+      if (cq->op == TCCIR_OP_FUNCPARAMVAL)
+      {
+        safe = 1; /* register/stack param setup; we accept the small risk
+                   * that param-reg writes interfere with regalloc choices */
+      }
+      else if (cq->op == TCCIR_OP_ASSIGN)
+      {
+        IROperand a_dest = tcc_ir_op_get_dest(ir, cq);
+        IROperand a_src1 = tcc_ir_op_get_src1(ir, cq);
+        /* Plain non-deref copy.  Bail if the ASSIGN writes our base (the
+         * to-be-hoisted load would observe the wrong base). */
+        if (!a_dest.is_lval && !a_src1.is_lval && irop_get_vreg(a_dest) != q1_base_vr)
+          safe = 1;
+      }
+      if (!safe)
+      {
+        blocked = 1;
+        break;
+      }
+    }
+    if (q3_idx < 0 || blocked)
+      continue;
+
+    IRQuadCompact *q3 = &ir->compact_instructions[q3_idx];
+    /* q3 same op-kind as q1 (LOAD/STORE_INDEXED) — already verified. */
+
+    IROperand q3_scale = ir->iroperand_pool[q3->operand_base + 3];
+    IROperand q3_index = ir->iroperand_pool[q3->operand_base + 2];
+    if (irop_get_tag(q3_scale) != IROP_TAG_IMM32 || q3_scale.u.imm32 != 0)
+      continue;
+    if (irop_get_tag(q3_index) != IROP_TAG_IMM32)
+      continue;
+
+    int q3_base_slot = q1_is_load ? 1 : 0;
+    IROperand q3_base = ir->iroperand_pool[q3->operand_base + q3_base_slot];
+    if (irop_get_vreg(q3_base) != q1_base_vr)
+      continue;
+
+    int32_t imm1 = q1_index.u.imm32;
+    int32_t imm2 = q3_index.u.imm32;
+    if (imm1 + 4 != imm2 && imm2 + 4 != imm1)
+      continue;
+
+    /* Offsets must be 4-byte aligned (LDRD/STRD requirement). */
+    if ((imm1 & 3) != 0 || (imm2 & 3) != 0)
+      continue;
+
+    /* Bubble q3 up to position i+1 by swapping with each predecessor op.
+     * Each swap must respect: no intervening op uses q3's dest/value or
+     * defines q3's base.  Since the safety scan above already verified
+     * each intervening op is FUNCPARAMVAL or non-lval ASSIGN that doesn't
+     * touch the base, we just have to check vreg dependencies on q3's
+     * dest/value at each step. */
+    IROperand q3_dv = q1_is_load ? ir->iroperand_pool[q3->operand_base + 0]
+                                 : ir->iroperand_pool[q3->operand_base + 1];
+    int32_t q3_dv_vr = irop_get_vreg(q3_dv);
+
+    int swap_pos = q3_idx;
+    int target_pos = i + 1;
+    while (swap_pos > target_pos)
+    {
+      int prev = swap_pos - 1;
+      while (prev > i && ir->compact_instructions[prev].op == TCCIR_OP_NOP)
+        prev--;
+      if (prev <= i)
+        break;
+
+      IRQuadCompact *pq = &ir->compact_instructions[prev];
+
+      /* For LOAD: prev must not USE q3's dest (it would see undefined
+       * value if hoisted ahead).  For STORE: prev must not READ q3's
+       * value (same reason). */
+      int conflict = 0;
+      if (q3_dv_vr >= 0)
+      {
+        if (irop_config[pq->op].has_src1)
+        {
+          IROperand s = tcc_ir_op_get_src1(ir, pq);
+          if (irop_get_vreg(s) == q3_dv_vr)
+            conflict = 1;
+        }
+        if (!conflict && irop_config[pq->op].has_src2)
+        {
+          IROperand s = tcc_ir_op_get_src2(ir, pq);
+          if (irop_get_vreg(s) == q3_dv_vr)
+            conflict = 1;
+        }
+      }
+      if (conflict)
+        break;
+
+      /* Swap pq with q3 by exchanging IRQuadCompact contents (operand_base
+       * stays put — operand pool entries don't move). */
+      IRQuadCompact tmp = *pq;
+      *pq = ir->compact_instructions[swap_pos];
+      ir->compact_instructions[swap_pos] = tmp;
+
+      swap_pos = prev;
+    }
+
+    if (swap_pos < q3_idx)
+    {
+      changes++;
+      LOG_IR_GEN("INDEXED PAIR REORDER: bubbled %s_INDEXED from i=%d to i=%d (next to i=%d, offsets %d,%d)",
+                 q1_is_load ? "LOAD" : "STORE", q3_idx, swap_pos, i, imm1, imm2);
+    }
+  }
+
+  LOG_IR_GEN("=== INDEXED PAIR REORDER END: %d swaps ===", changes);
   return changes;
 }
 

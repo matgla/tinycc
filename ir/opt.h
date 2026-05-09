@@ -117,6 +117,14 @@ int tcc_ir_opt_store_redundant(struct TCCIRState *ir);
  * into indexed memory op with constant index and scale=0. */
 int tcc_ir_opt_disp_fusion(struct TCCIRState *ir);
 
+/* Indexed-chain fold - fuse a constant-immediate ADD that feeds an existing
+ * scale=0 _INDEXED memory op into the indexed op's offset. */
+int tcc_ir_opt_indexed_chain(struct TCCIRState *ir);
+
+/* Indexed-pair reorder - sink FUNCPARAMVAL past the next LOAD/STORE_INDEXED
+ * so LDRD/STRD-pairable ops become adjacent for the codegen peephole. */
+int tcc_ir_opt_indexed_pair_reorder(struct TCCIRState *ir);
+
 /* LEA + deref fold - collapse `LEA Addr[StackLoc[-N]] + [ADD #K] + deref-use`
  * into a direct StackLoc access, eliminating the address-materialization op. */
 int tcc_ir_opt_lea_fold(struct TCCIRState *ir);
