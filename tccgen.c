@@ -25490,6 +25490,18 @@ static void gen_function(Sym *sym)
   if (tcc_state->opt_disp_fusion)
     tcc_ir_opt_add_deref_fold(ir);
 
+  /* Re-run copy_prop + DCE after disp/add_deref fusion: those passes leave
+   * behind `T = P0 [ASSIGN]` copies whose only consumer is the new
+   * STORE_INDEXED/LOAD_INDEXED base operand.  Propagating P0 directly into
+   * the indexed op eliminates the copy and lets the regalloc avoid an
+   * extra MOV per folded access. */
+  if (tcc_state->opt_disp_fusion && tcc_state->opt_copy_prop)
+  {
+    tcc_ir_opt_copy_prop(ir);
+    if (tcc_state->opt_dce)
+      tcc_ir_opt_dce(ir);
+  }
+
   /* LEA+deref fold - collapse `LEA Addr[StackLoc[-N]] + [ADD #K] + deref-use`
    * into a direct StackLoc access.  Runs after disp-fusion so any surviving
    * LEA+ADD pairs still have a chance to be folded here. */

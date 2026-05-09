@@ -584,6 +584,57 @@ static void ra_build_phi_hints(SSAInterval *intervals, int count,
   #undef PHI_VREG_IDX
 }
 
+/* Build coalescing hints from explicit ASSIGN copies in the instruction
+ * stream. After pre-RA phi resolution, block_phis is empty but the IR
+ * carries `dest = src` copies at each former phi edge. Each such copy
+ * is a place where we'd like dest and src to share a register so the
+ * post-RA move-coalescing pass can erase the mov rX, rX. */
+static void ra_build_assign_hints(SSAInterval *intervals, int count,
+                                  TCCIRState *ir, int max_vreg_pos)
+{
+  if (max_vreg_pos <= 0) return;
+
+  int table_size = 4 * max_vreg_pos;
+  int *vreg_to_iv = tcc_malloc(sizeof(int) * table_size);
+  for (int i = 0; i < table_size; i++)
+    vreg_to_iv[i] = -1;
+
+  #define ASSIGN_VREG_IDX(vr) \
+    ((TCCIR_DECODE_VREG_TYPE(vr) * max_vreg_pos) + TCCIR_DECODE_VREG_POSITION(vr))
+
+  for (int i = 0; i < count; i++) {
+    int idx = ASSIGN_VREG_IDX(intervals[i].vreg);
+    if (idx >= 0 && idx < table_size)
+      vreg_to_iv[idx] = i;
+  }
+
+  int n = ir->next_instruction_index;
+  for (int i = 0; i < n; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_ASSIGN) continue;
+    IROperand d = tcc_ir_op_get_dest(ir, q);
+    IROperand s = tcc_ir_op_get_src1(ir, q);
+    int32_t dest_vr = irop_get_vreg(d);
+    int32_t src_vr = irop_get_vreg(s);
+    if (dest_vr < 0 || src_vr < 0) continue;
+    int dest_tbl = ASSIGN_VREG_IDX(dest_vr);
+    int src_tbl = ASSIGN_VREG_IDX(src_vr);
+    if (dest_tbl < 0 || dest_tbl >= table_size) continue;
+    if (src_tbl < 0 || src_tbl >= table_size) continue;
+    int dest_iv = vreg_to_iv[dest_tbl];
+    int src_iv = vreg_to_iv[src_tbl];
+    if (dest_iv < 0 || src_iv < 0) continue;
+    if (intervals[dest_iv].reg_type != intervals[src_iv].reg_type) continue;
+    if (intervals[dest_iv].hint_vreg < 0)
+      intervals[dest_iv].hint_vreg = src_vr;
+    if (intervals[src_iv].hint_vreg < 0)
+      intervals[src_iv].hint_vreg = dest_vr;
+  }
+
+  tcc_free(vreg_to_iv);
+  #undef ASSIGN_VREG_IDX
+}
+
 /* ============================================================================
  * Linear Scan Allocation
  * ============================================================================ */
@@ -640,8 +691,6 @@ static void ra_linear_scan(SSAInterval *intervals, int count,
   uint64_t fp_free = fp_allowed;
   uint64_t dirty_int = 0;
   uint64_t dirty_fp = 0;
-
-  (void)vreg_to_iv; /* phi hint lookup - reserved for future use */
 
   /* Active set sorted by end point */
   SSAInterval **active = tcc_malloc(sizeof(SSAInterval *) * count);
@@ -788,7 +837,36 @@ static void ra_linear_scan(SSAInterval *intervals, int count,
     RA_DBG("  alloc T%d [%u,%u] xcall=%d int_free=0x%llx active=%d",
            TCCIR_DECODE_VREG_POSITION(cur->vreg), cur->start, cur->end,
            cur->crosses_call, (unsigned long long)int_free, active_count);
-    if (cur->crosses_call) {
+
+    /* Phi-coalescing: try the hinted partner's register first.
+     * ra_build_phi_hints set hint_vreg to a vreg this interval used to
+     * share a phi edge with (now resolved into an explicit ASSIGN copy).
+     * If the partner has expired and freed its register, taking that
+     * same register here turns the explicit copy into mov rX, rX which
+     * the post-RA move-coalescing pass erases. */
+    if (cur->hint_vreg >= 0 && max_vreg_pos > 0) {
+      int hint_idx = HINT_IDX(cur->hint_vreg);
+      if (hint_idx >= 0 && hint_idx < hint_tbl_size) {
+        SSAInterval *partner = vreg_to_iv[hint_idx];
+        if (partner && partner->r0 >= 0 && partner->r1 < 0 &&
+            partner->stack_location == 0) {
+          int hr = partner->r0;
+          if ((int_free & (1ull << hr)) &&
+              hr < tcc_state->registers_for_allocator) {
+            int ok = 1;
+            if (cur->crosses_call) {
+              ok = 0;
+              for (int ci = 0; ci < target->int_class.num_callee_saved; ci++) {
+                if (target->int_class.callee_saved[ci] == hr) { ok = 1; break; }
+              }
+            }
+            if (ok) reg = hr;
+          }
+        }
+      }
+    }
+
+    if (reg < 0 && cur->crosses_call) {
       /* Prefer callee-saved */
       for (int ci = 0; ci < target->int_class.num_callee_saved; ci++) {
         int r = target->int_class.callee_saved[ci];
@@ -953,9 +1031,20 @@ static int ra_interval_locations_overlap(IRLiveInterval *a, IRLiveInterval *b)
   return ra_interval_regs_overlap(a, b);
 }
 
+/* Set to 1 while running ra_resolve_phis BEFORE register allocation, where
+ * no allocation info exists. In that mode, copy-elision (identity check)
+ * and physical-register clobber detection must fall back to vreg-level
+ * reasoning. */
+static int ra_phi_resolve_pre_ra_mode = 0;
+
 static int ra_phi_copy_is_identity(IRLiveInterval *dest_li, IRLiveInterval *src_li)
 {
   if (!dest_li || !src_li)
+    return 0;
+  /* Pre-RA: never collapse; allocation may still place them in the same
+   * register, in which case the post-RA move-coalescing pass will erase
+   * the redundant copy. */
+  if (ra_phi_resolve_pre_ra_mode)
     return 0;
   if (dest_li->allocation.offset != 0 || src_li->allocation.offset != 0)
     return dest_li->allocation.offset == src_li->allocation.offset;
@@ -966,6 +1055,20 @@ static int ra_phi_copy_is_identity(IRLiveInterval *dest_li, IRLiveInterval *src_
 static int ra_phi_copy_dest_clobbers_pending_source(TCCIRState *ir, RAPhiCopy *copies,
                                                     int copy_count, int copy_idx)
 {
+  /* Pre-RA: clobber means "copy_idx writes a vreg that another pending
+   * copy still needs to read". Compare by vreg, not by physical
+   * register (which doesn't exist yet). */
+  if (ra_phi_resolve_pre_ra_mode) {
+    int32_t dest_vr = copies[copy_idx].dest_vreg;
+    for (int i = 0; i < copy_count; i++) {
+      if (i == copy_idx || copies[i].emitted)
+        continue;
+      if (copies[i].src_vreg == dest_vr)
+        return 1;
+    }
+    return 0;
+  }
+
   IRLiveInterval *dest_li = tcc_ir_vreg_live_interval(ir, copies[copy_idx].dest_vreg);
   if (!dest_li)
     return 0;
@@ -1004,6 +1107,13 @@ static int ra_phi_copy_needed(TCCIRState *ir, IRPhiNode *phi, int operand_idx)
   IRLiveInterval *dest_li = tcc_ir_vreg_live_interval(ir, phi->dest_vreg);
   if (!dest_li)
     return 0;
+  /* Pre-RA: emit a copy for every operand. Post-RA coalescing will drop
+   * any that turn out to land in the same physical register. */
+  if (ra_phi_resolve_pre_ra_mode) {
+    if (!tcc_ir_vreg_is_valid(ir, phi->operands[operand_idx].vreg))
+      return 0;
+    return 1;
+  }
   if (dest_li->allocation.r0 == PREG_NONE && dest_li->allocation.offset == 0)
     return 0;
   IRLiveInterval *src_li = NULL;
@@ -1235,29 +1345,61 @@ static void ra_resolve_phis(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa)
   int nb = cfg->num_blocks;
   int old_n = ir->next_instruction_index;
 
-  /* Count copies needed per predecessor block */
+  /* Count copies needed per predecessor block.
+   *
+   * Single-pass aggregation: walk every phi node once (O(total phi
+   * operands)) and bucket each operand into its predecessor block's
+   * counter. The previous version called ra_count_phi_copies_for_pred
+   * per predecessor, which itself looped over every block, producing
+   * O(blocks^2) work even when no phis existed — pathological for huge
+   * branch-heavy functions (compile/20001226-1 has 16K blocks). */
   int *copies_per_block = tcc_mallocz(nb * sizeof(int));
   int total_copies = 0;
-
+  /* For modified-JUMPIF detection we need the per-(pred,succ) count too,
+   * but only for blocks that ended in a JUMPIF AND have any copies on the
+   * target edge. Build a bitmap of (pred -> succ-block) edges that carry
+   * at least one phi copy. We use a simple flat array indexed by pred. */
+  int *copies_to_jumpif_succ = tcc_mallocz(nb * sizeof(int));
+  for (int b = 0; b < nb; b++) copies_to_jumpif_succ[b] = -1;
+  /* First, identify the JUMPIF-target succ_block per pred (if any). */
+  for (int b = 0; b < nb; b++) {
+    IRBasicBlock *bb = &cfg->blocks[b];
+    int last_instr = bb->end_idx - 1;
+    if (last_instr < bb->start_idx) continue;
+    if (ir->compact_instructions[last_instr].op != TCCIR_OP_JUMPIF) continue;
+    IROperand dest = tcc_ir_op_get_dest(ir, &ir->compact_instructions[last_instr]);
+    int old_target = (int)irop_get_imm64_ex(ir, dest);
+    int target_block = (old_target >= 0 && old_target < old_n) ? cfg->instr_to_block[old_target] : -1;
+    copies_to_jumpif_succ[b] = target_block; /* may be -1 */
+  }
+  /* Now walk phis once. Per operand: increment copies_per_block[pred],
+   * and if pred's JUMPIF target == this phi's succ block, also note that
+   * the JUMPIF edge carries a copy. */
   int extra_jumps = 0;
   int modified_jumpifs = 0;
-  for (int b = 0; b < nb; b++) {
-    copies_per_block[b] = ra_count_phi_copies_for_pred(ir, cfg, ssa, b, -1);
-    total_copies += copies_per_block[b];
-    if (copies_per_block[b] > 0) {
-      IRBasicBlock *bb = &cfg->blocks[b];
-      int last_instr = bb->end_idx - 1;
-      if (last_instr >= bb->start_idx && ir->compact_instructions[last_instr].op == TCCIR_OP_JUMPIF) {
-        IROperand dest = tcc_ir_op_get_dest(ir, &ir->compact_instructions[last_instr]);
-        int old_target = (int)irop_get_imm64_ex(ir, dest);
-        int target_block = (old_target >= 0 && old_target < old_n) ? cfg->instr_to_block[old_target] : -1;
-        if (target_block >= 0 && ra_count_phi_copies_for_pred(ir, cfg, ssa, b, target_block) > 0) {
-          extra_jumps++;
-          modified_jumpifs++;
-        }
+  uint8_t *jumpif_edge_has_copy = tcc_mallocz(nb);
+  for (int sb = 0; sb < nb; sb++) {
+    for (IRPhiNode *phi = ssa->block_phis[sb]; phi; phi = phi->next) {
+      for (int pi = 0; pi < phi->num_operands; pi++) {
+        int pred = phi->operands[pi].pred_block;
+        if (pred < 0 || pred >= nb) continue;
+        if (phi->operands[pi].vreg < 0) continue;
+        if (!ra_phi_copy_needed(ir, phi, pi)) continue;
+        copies_per_block[pred]++;
+        total_copies++;
+        if (copies_to_jumpif_succ[pred] == sb)
+          jumpif_edge_has_copy[pred] = 1;
       }
     }
   }
+  for (int b = 0; b < nb; b++) {
+    if (jumpif_edge_has_copy[b]) {
+      extra_jumps++;
+      modified_jumpifs++;
+    }
+  }
+  tcc_free(copies_to_jumpif_succ);
+  tcc_free(jumpif_edge_has_copy);
 
   RA_DBG("SSA phi resolver: total_copies=%d extra_jumps=%d", total_copies, extra_jumps);
   for (int b = 0; b < nb; b++) {
@@ -1475,6 +1617,25 @@ static void ra_resolve_phis(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa)
       int tgt = table->targets[ti];
       if (tgt >= 0 && tgt < wp) new_instrs[tgt].is_jump_target = 1;
     }
+  }
+
+  /* The remaining steps (live-interval remap/extend, live_regs bitmap)
+   * only apply when phi resolution runs after register allocation.
+   * Pre-RA, no LS intervals or bitmap exist yet — skip. ra_build_intervals
+   * will scan the freshly emitted ASSIGN copies and produce correct
+   * intervals from scratch.
+   *
+   * Clear ssa->block_phis: the explicit copies we just inserted are now
+   * the source of truth. Leaving phi nodes active confuses the interval
+   * builder (it tries to extend phi-dest intervals as if the phi were
+   * still semantically active, on top of the now-explicit defs). */
+  if (ra_phi_resolve_pre_ra_mode) {
+    for (int b = 0; b < nb; b++)
+      ssa->block_phis[b] = NULL;
+    tcc_free(old_to_new);
+    tcc_free(copies_per_block);
+    tcc_free(copy_records);
+    return;
   }
 
   /* Remap live interval start/end */
@@ -1743,6 +1904,18 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
     }
   }
 
+  /* Resolve phis BEFORE register allocation: insert ASSIGN copies at
+   * predecessor block ends so phi-DSTs and phi-SRCs become regular SSA
+   * temps with non-overlapping intervals. Without this, the linear scan
+   * sees phi-DST intervals that span the whole loop body alongside their
+   * phi-SRC operands' intervals (also spanning the body), creating
+   * artificial register pressure across loops. After this pass the IR
+   * is no longer in SSA form; ra_build_intervals scans the explicit
+   * copies and produces concrete intervals. */
+  ra_phi_resolve_pre_ra_mode = 1;
+  ra_resolve_phis(ir, cfg, ssa);
+  ra_phi_resolve_pre_ra_mode = 0;
+
   /* Build call prefix for call-crossing detection */
   int *call_prefix = ra_build_call_prefix(ir);
 
@@ -1752,8 +1925,11 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
   int max_vreg_pos = 0;
   ra_build_intervals(ir, cfg, ssa, &intervals, &interval_count, call_prefix, &max_vreg_pos);
 
-  /* Build phi register hints */
+  /* Build phi register hints. block_phis is empty after pre-RA resolution,
+   * so the phi-based pass is a no-op; the assign-based pass picks up
+   * the explicit copies emitted at predecessor block ends. */
   ra_build_phi_hints(intervals, interval_count, ssa, cfg, max_vreg_pos);
+  ra_build_assign_hints(intervals, interval_count, ir, max_vreg_pos);
 
   /* Run linear scan */
   uint64_t dirty_int = 0, dirty_fp = 0;
@@ -1764,11 +1940,10 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
   ir->ls.dirty_registers = dirty_int;
   ir->ls.dirty_float_registers = dirty_fp;
 
-  /* Resolve phis: insert ASSIGN copies and rebuild instruction array.
-   * When there are phi copies, ra_resolve_phis also builds the
-   * live_regs_by_instruction bitmap.  When there are none it returns early,
-   * so we must build the bitmap unconditionally afterwards. */
-  ra_resolve_phis(ir, cfg, ssa);
+  /* Phi resolution already happened before ra_build_intervals (above).
+   * The instruction stream now has explicit ASSIGN copies; ssa->block_phis
+   * is cleared. We just need to build the live_regs bitmap from the
+   * intervals the linear scan produced. */
   ra_build_live_regs_bitmap(ir);
 
   /* Cleanup */

@@ -38,9 +38,19 @@ def get_tcc_path():
     return Path(os.environ.get("TCC_OVERRIDE", DEFAULT_TCC))
 
 
+_IRTESTS_DIR = TCC_DIR / "tests" / "ir_tests"
+_TCC_INCLUDE_FLAGS = [
+    "-nostdinc",
+    "-I", str(_IRTESTS_DIR / "libc_includes"),
+    "-I", str(_IRTESTS_DIR / "libc_imports"),
+    "-I", str(_IRTESTS_DIR / "libc_includes" / "newlib"),
+    "-I", str(TCC_DIR / "include"),
+]
+
+
 def compile_tcc(src, output, tcc=None, opt="-O2"):
     tcc = tcc or get_tcc_path()
-    return run([str(tcc), opt, "-c", str(src), "-o", str(output)])
+    return run([str(tcc), opt, *_TCC_INCLUDE_FLAGS, "-c", str(src), "-o", str(output)])
 
 
 def compile_gcc(src, output, opt="-O2", extra_flags=None):

@@ -2272,9 +2272,68 @@ int tcc_ir_opt_add_deref_fold(TCCIRState *ir)
     /* Only fold PARAM bases: the explicit LOAD_INDEXED can expose stack
      * loads to constant propagation which may incorrectly fold across
      * calls that modify memory through aliased pointers.  PARAM vregs
-     * point to caller-owned memory, safe from this issue. */
+     * point to caller-owned memory, safe from this issue.
+     *
+     * Peep-through: if the base is a TEMP whose only def is a plain
+     * ASSIGN copy from a PARAM, treat that PARAM as the effective base.
+     * The TEMP is just a shadow of the parameter — copy_prop typically
+     * eliminates it but doesn't always run before this pass. */
     if (TCCIR_DECODE_VREG_TYPE(base_vr) != TCCIR_VREG_TYPE_PARAM)
-      continue;
+    {
+      if (TCCIR_DECODE_VREG_TYPE(base_vr) != TCCIR_VREG_TYPE_TEMP)
+        continue;
+      /* Peep-through: short bounded backward scan looking for an `ASSIGN
+       * T <- PARAM` immediately preceding the ADD.  The frontend emits
+       * the copy right before the ADD, so a window of ~16 instructions
+       * is enough; falling back to a full-function scan would make this
+       * O(n^2) on stress tests like 20001226-1 (16k compares).
+       *
+       * Bail on any branch/store/call before the def to keep the
+       * semantics local — same constraints as the later same-block
+       * and side-effect checks. */
+      int copy_idx = -1;
+      int max_back = 16;
+      for (int j = i - 1; j >= 0 && (i - j) <= max_back; j--)
+      {
+        IRQuadCompact *cq = &ir->compact_instructions[j];
+        if (cq->op == TCCIR_OP_NOP)
+          continue;
+        if (cq->op == TCCIR_OP_JUMP || cq->op == TCCIR_OP_JUMPIF ||
+            cq->op == TCCIR_OP_STORE || cq->op == TCCIR_OP_STORE_INDEXED ||
+            cq->op == TCCIR_OP_STORE_POSTINC || cq->op == TCCIR_OP_FUNCCALLVAL ||
+            cq->op == TCCIR_OP_FUNCCALLVOID)
+          break;
+        if (irop_config[cq->op].has_dest)
+        {
+          IROperand cd = tcc_ir_op_get_dest(ir, cq);
+          if (irop_get_vreg(cd) == base_vr && !cd.is_lval)
+          {
+            copy_idx = j;
+            break;
+          }
+        }
+      }
+      if (copy_idx < 0)
+        continue;
+      IRQuadCompact *cq = &ir->compact_instructions[copy_idx];
+      if (cq->op != TCCIR_OP_ASSIGN)
+        continue;
+      IROperand cs1 = tcc_ir_op_get_src1(ir, cq);
+      IROperand cd = tcc_ir_op_get_dest(ir, cq);
+      if (cs1.is_lval || cd.is_lval)
+        continue;
+      int32_t cs1_vr = irop_get_vreg(cs1);
+      if (cs1_vr < 0 || TCCIR_DECODE_VREG_TYPE(cs1_vr) != TCCIR_VREG_TYPE_PARAM)
+        continue;
+      /* Use the PARAM source as the new base.  Don't NOP the copy — later
+       * DCE will remove it if the TEMP becomes dead.  We don't verify "T is
+       * used only here" because the existing use_count == 1 check on the
+       * ADD's dest below covers what we actually need: the LOAD_INDEXED
+       * still computes the same value regardless of how many extra readers
+       * the TEMP base has, since the copy stays put. */
+      src1 = cs1;
+      base_vr = cs1_vr;
+    }
 
     /* Check T has exactly one use, and that use is a DEREF */
     int use_count = 0;
@@ -11414,6 +11473,25 @@ int tcc_ir_opt_sl_forward(TCCIRState *ir)
         }
       }
     }
+    /* STORE_INDEXED / STORE_POSTINC are pointer-based stores that this pass
+     * does not analyze in detail.  Conservatively invalidate all tracked
+     * stack slots — the pointer might alias any of them.  Without this,
+     * disp_fusion's STORE -> STORE_INDEXED rewrites could leave the
+     * forwarding table thinking a slot still holds its initializer value
+     * after a real write through that slot's address. */
+    if (q->op == TCCIR_OP_STORE_INDEXED || q->op == TCCIR_OP_STORE_POSTINC)
+    {
+      int j;
+      for (j = 0; j < entry_count; j++)
+      {
+        if (entries[j].valid)
+        {
+          LOG_IR_GEN("STORE-LOAD: Invalidate local at i=%d due to indexed/postinc store at i=%d",
+                     entries[j].instruction_idx, i);
+          entries[j].valid = 0;
+        }
+      }
+    }
     /* Process STORE instructions: track them for later forwarding */
     if (q->op == TCCIR_OP_STORE)
     {
@@ -13403,11 +13481,28 @@ static void ir_opt_du_build(TCCIRState *ir, IROptDU *du)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP)
       continue;
+    /* STORE-family ops carry the address pointer in their `dest` slot —
+     * that is a USE of the pointer vreg, not a definition.  Counting it as
+     * a def would shadow the real def from the upstream address-compute
+     * (e.g. ADD base, #imm) and prevent disp/indexed fusion from finding
+     * it via ir_opt_du_def. */
+    int dest_is_addr_use = (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
+                            q->op == TCCIR_OP_STORE_POSTINC);
     if (irop_config[q->op].has_dest)
     {
       int idx = ir_opt_du_idx(du, irop_get_vreg(tcc_ir_op_get_dest(ir, q)));
       if (idx >= 0)
-        du->def[idx] = i;
+      {
+        if (dest_is_addr_use)
+        {
+          if (du->use[idx] < 2)
+            du->use[idx]++;
+        }
+        else
+        {
+          du->def[idx] = i;
+        }
+      }
     }
     if (irop_config[q->op].has_src1)
     {
@@ -14971,6 +15066,17 @@ int tcc_ir_opt_disp_fusion(TCCIRState *ir)
     if (is_load && TCCIR_DECODE_VREG_TYPE(addr_vr) == TCCIR_VREG_TYPE_VAR)
       continue;
 
+    /* Skip 64-bit, FP64 and struct accesses: LOAD_INDEXED/STORE_INDEXED
+     * lower to LDRD/STRD which require 4-byte alignment.  Packed structs
+     * can place 64-bit fields at unaligned offsets (e.g. packed Count at
+     * offset 6 in pr20051113-1), which would HardFault at runtime. */
+    {
+      int access_btype = addr_op.btype;
+      if (access_btype == IROP_BTYPE_INT64 || access_btype == IROP_BTYPE_FLOAT64 ||
+          access_btype == IROP_BTYPE_STRUCT)
+        continue;
+    }
+
     /* The backend's `tcc_gen_machine_load_indexed_mop` 32-bit path reads
      * `dest.u.reg.r0` unconditionally, which is valid only for MACH_OP_REG
      * dests.  VAR vregs routinely get MACH_OP_SPILL, in which case the
@@ -15052,7 +15158,41 @@ int tcc_ir_opt_disp_fusion(TCCIRState *ir)
     IROperand orig_dest = tcc_ir_op_get_dest(ir, q);
     IROperand orig_src1 = tcc_ir_op_get_src1(ir, q);
 
-    /* Allocate 4 fresh pool slots — LOAD/STORE/ASSIGN used 2, indexed ops need 4. */
+    /* Single-use copy peep-through: when the ADD's base is a TEMP whose only
+     * def is `T <- X [ASSIGN]` (a plain non-deref copy from a PARAM, VAR, or
+     * other TEMP) and that TEMP has no other uses, fold X directly into the
+     * STORE_INDEXED/LOAD_INDEXED base so regalloc doesn't have to coalesce
+     * the copy.  Matches the sha_init pattern where each field write copies
+     * P0 into a fresh TEMP just to feed the ADD. */
+    {
+      int32_t base_vr = irop_get_vreg(base_op);
+      if (base_vr >= 0 && TCCIR_DECODE_VREG_TYPE(base_vr) == TCCIR_VREG_TYPE_TEMP &&
+          ir_opt_du_uses(&du, base_vr) == 1)
+      {
+        int copy_idx = ir_opt_du_def(&du, base_vr, add_idx);
+        if (copy_idx >= 0)
+        {
+          IRQuadCompact *copy_q = &ir->compact_instructions[copy_idx];
+          if (copy_q->op == TCCIR_OP_ASSIGN)
+          {
+            IROperand copy_dest = tcc_ir_op_get_dest(ir, copy_q);
+            IROperand copy_src = tcc_ir_op_get_src1(ir, copy_q);
+            /* Plain copy (no deref on either side), with the destination just
+             * a fresh TEMP — semantically equivalent to using copy_src
+             * directly. */
+            if (!copy_dest.is_lval && !copy_src.is_lval && irop_has_vreg(copy_src))
+            {
+              base_op = copy_src;
+              copy_q->op = TCCIR_OP_NOP;
+            }
+          }
+        }
+      }
+    }
+
+    /* Allocate 4 fresh pool slots — LOAD/STORE/ASSIGN used 2, indexed ops need 4.
+     * Grow the pool first so we don't bail when capacity is tight. */
+    tcc_ir_pool_ensure(ir, 4);
     int new_base_idx = ir->iroperand_pool_count;
     if (new_base_idx + 4 > ir->iroperand_pool_capacity)
       continue;
@@ -20727,23 +20867,25 @@ static int ir_negate_condition(int cond)
   return cond ^ 1;
 }
 
-/* Check if any instruction other than 'exclude_idx' jumps to 'target' */
-static int ir_has_other_jump_to(TCCIRState *ir, int target, int exclude_idx)
+/* O(1) variant for use with a precomputed jump-target count array.
+ * `jt_cnt[t]` = number of JUMP/JUMPIFs targeting t. The exclude is honored
+ * by checking whether the instruction at exclude_idx is itself a jump to
+ * `target` and subtracting its contribution. */
+static int ir_has_other_jump_to_fast(TCCIRState *ir, const int *jt_cnt,
+                                     int target, int exclude_idx)
 {
   int n = ir->next_instruction_index;
-  for (int j = 0; j < n; j++)
-  {
-    if (j == exclude_idx)
-      continue;
-    IRQuadCompact *q = &ir->compact_instructions[j];
-    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
-    {
+  if (target < 0 || target >= n) return 0;
+  int total = jt_cnt[target];
+  if (total == 0) return 0;
+  if (exclude_idx >= 0 && exclude_idx < n) {
+    IRQuadCompact *q = &ir->compact_instructions[exclude_idx];
+    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF) {
       IROperand d = tcc_ir_op_get_dest(ir, q);
-      if ((int)irop_get_imm64_ex(ir, d) == target)
-        return 1;
+      if ((int)irop_get_imm64_ex(ir, d) == target) total--;
     }
   }
-  return 0;
+  return total > 0;
 }
 
 /* ============================================================================
@@ -21228,6 +21370,34 @@ int tcc_ir_opt_select(TCCIRState *ir)
   if (n < 5)
     return 0;
 
+  /* Precompute jump target counts: jt_cnt[target] = number of JUMP/JUMPIFs
+   * targeting `target`. Lets ir_has_other_jump_to_fast (below) answer in O(1)
+   * what would otherwise be an O(n) scan per query — opt_select calls the
+   * predicate four times per JUMPIF, which on a function with thousands of
+   * branches drives the pass into O(n^2). Decrement the count whenever we
+   * NOP a JUMP/JUMPIF below to keep it consistent. */
+  int *jt_cnt = tcc_mallocz(sizeof(int) * n);
+  for (int j = 0; j < n; j++) {
+    IRQuadCompact *q = &ir->compact_instructions[j];
+    if (q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF)
+      continue;
+    IROperand d = tcc_ir_op_get_dest(ir, q);
+    int t = (int)irop_get_imm64_ex(ir, d);
+    if (t >= 0 && t < n)
+      jt_cnt[t]++;
+  }
+  #define JT_HAS_OTHER(target, exclude_idx) \
+    ir_has_other_jump_to_fast(ir, jt_cnt, (target), (exclude_idx))
+  #define JT_NOP_JUMP(idx) do { \
+    IRQuadCompact *_jq = &ir->compact_instructions[idx]; \
+    if (_jq->op == TCCIR_OP_JUMP || _jq->op == TCCIR_OP_JUMPIF) { \
+      IROperand _jd = tcc_ir_op_get_dest(ir, _jq); \
+      int _jt = (int)irop_get_imm64_ex(ir, _jd); \
+      if (_jt >= 0 && _jt < n && jt_cnt[_jt] > 0) jt_cnt[_jt]--; \
+    } \
+    _jq->op = TCCIR_OP_NOP; \
+  } while (0)
+
   for (int i = 0; i < n - 4; i++)
   {
     IRQuadCompact *jumpif_q = &ir->compact_instructions[i];
@@ -21252,9 +21422,9 @@ int tcc_ir_opt_select(TCCIRState *ir)
     /* Safety: the then-block (fall-through) must not be a jump target from
      * elsewhere, and the else-block must only be targeted by this JUMPIF.
      * Otherwise NOP'ing the blocks would break other control flow. */
-    if (ir_has_other_jump_to(ir, then_start, i))
+    if (JT_HAS_OTHER(then_start, i))
       continue;
-    if (ir_has_other_jump_to(ir, else_target, i))
+    if (JT_HAS_OTHER(else_target, i))
       continue;
 
     /* ----------------------------------------------------------------
@@ -21366,7 +21536,9 @@ int tcc_ir_opt_select(TCCIRState *ir)
       tcc_ir_iroperand_pool_add(ir, else_val);
       tcc_ir_iroperand_pool_add(ir, sel_cond);
 
-      /* Rewrite the JUMPIF as SELECT */
+      /* Rewrite the JUMPIF as SELECT (drops one jump to else_target) */
+      if (else_target >= 0 && else_target < n && jt_cnt[else_target] > 0)
+        jt_cnt[else_target]--;
       jumpif_q->op = TCCIR_OP_SELECT;
       jumpif_q->operand_base = pool_base;
 
@@ -21382,13 +21554,13 @@ int tcc_ir_opt_select(TCCIRState *ir)
       /* NOP the then-block: then_param, then_call, unconditional jump */
       ir->compact_instructions[then_start].op = TCCIR_OP_NOP;
       ir->compact_instructions[then_call_idx].op = TCCIR_OP_NOP;
-      ir->compact_instructions[jump_idx].op = TCCIR_OP_NOP;
+      JT_NOP_JUMP(jump_idx);
 
       /* Clear stale is_jump_target on positions no longer targeted
        * (the NOPed JUMP no longer jumps, so re-check with no exclusion) */
-      if (!ir_has_other_jump_to(ir, else_target, -1))
+      if (!JT_HAS_OTHER(else_target, -1))
         ir->compact_instructions[else_target].is_jump_target = 0;
-      if (merge_target >= 0 && merge_target < n && !ir_has_other_jump_to(ir, merge_target, -1))
+      if (merge_target >= 0 && merge_target < n && !JT_HAS_OTHER(merge_target, -1))
         ir->compact_instructions[merge_target].is_jump_target = 0;
 
       changes++;
@@ -21447,20 +21619,22 @@ int tcc_ir_opt_select(TCCIRState *ir)
       tcc_ir_iroperand_pool_add(ir, else_val);
       tcc_ir_iroperand_pool_add(ir, sel_cond);
 
-      /* Rewrite JUMPIF as SELECT */
+      /* Rewrite JUMPIF as SELECT (drops one jump to else_target) */
+      if (else_target >= 0 && else_target < n && jt_cnt[else_target] > 0)
+        jt_cnt[else_target]--;
       jumpif_q->op = TCCIR_OP_SELECT;
       jumpif_q->operand_base = pool_base;
 
       /* NOP the then-assign, jump, and else-assign */
       ir->compact_instructions[then_start].op = TCCIR_OP_NOP;
-      ir->compact_instructions[jump_idx].op = TCCIR_OP_NOP;
+      JT_NOP_JUMP(jump_idx);
       ir->compact_instructions[else_start].op = TCCIR_OP_NOP;
 
       /* Clear stale is_jump_target on positions no longer targeted
        * (the NOPed JUMP no longer jumps, so re-check with no exclusion) */
-      if (!ir_has_other_jump_to(ir, else_target, -1))
+      if (!JT_HAS_OTHER(else_target, -1))
         ir->compact_instructions[else_target].is_jump_target = 0;
-      if (merge_target >= 0 && merge_target < n && !ir_has_other_jump_to(ir, merge_target, -1))
+      if (merge_target >= 0 && merge_target < n && !JT_HAS_OTHER(merge_target, -1))
         ir->compact_instructions[merge_target].is_jump_target = 0;
 
       changes++;
@@ -21468,6 +21642,9 @@ int tcc_ir_opt_select(TCCIRState *ir)
     }
   }
 
+  tcc_free(jt_cnt);
+  #undef JT_HAS_OTHER
+  #undef JT_NOP_JUMP
   return changes;
 }
 

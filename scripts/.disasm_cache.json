@@ -1481,18 +1481,18 @@
   },
   "mibench_sha::sha_final": {
     "gcc": 31,
-    "tcc": 57,
-    "updated": "2026-05-08T17:52:59.440501+00:00"
+    "tcc": 49,
+    "updated": "2026-05-09T15:48:04.353353+00:00"
   },
   "mibench_sha::sha_init": {
     "gcc": 13,
-    "tcc": 22,
-    "updated": "2026-05-07T19:50:40.479131+00:00"
+    "tcc": 16,
+    "updated": "2026-05-09T15:48:04.353423+00:00"
   },
   "mibench_sha::sha_print": {
     "gcc": 11,
-    "tcc": 18,
-    "updated": "2026-05-07T19:50:40.479133+00:00"
+    "tcc": 16,
+    "updated": "2026-05-09T15:48:04.353428+00:00"
   },
   "mibench_sha::sha_stream": {
     "gcc": 31,
@@ -1501,13 +1501,13 @@
   },
   "mibench_sha::sha_transform": {
     "gcc": 150,
-    "tcc": 309,
-    "updated": "2026-05-08T20:21:53.875901+00:00"
+    "tcc": 287,
+    "updated": "2026-05-09T15:48:04.353431+00:00"
   },
   "mibench_sha::sha_update": {
     "gcc": 47,
-    "tcc": 49,
-    "updated": "2026-05-08T16:05:19.557769+00:00"
+    "tcc": 43,
+    "updated": "2026-05-09T15:48:04.353433+00:00"
   },
   "nested_multi_level::main": {
     "gcc": 9,
