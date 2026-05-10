@@ -18888,8 +18888,9 @@ typedef struct DerivedIV
   int base_vreg;     /* Base address vreg (-1 if stack offset or immediate) */
   IROperand base_op; /* Original base operand */
   int stride;        /* Stride = iv.step * shift_amount (in bytes) */
-  int use_idx;       /* ADD instruction index where DIV is computed */
-  int shl_idx;       /* SHL instruction index (for NOP-ing) */
+  int use_idx;       /* ADD/MLA instruction index where DIV is computed */
+  int shl_idx;       /* SHL/MUL instruction index (for NOP-ing); -1 if fused into MLA */
+  int share_with;    /* If >=0, share strength-reduced ptr from divs[share_with]; -1 = primary */
 } DerivedIV;
 
 /* Find basic induction variables in a loop.
@@ -19001,18 +19002,63 @@ static int find_induction_vars_ex(TCCIRState *ir, IRLoop *loop, InductionVar *iv
 
 /* Find derived induction variables in a loop.
  * A DIV is: base + (IV << shift) - used for array indexing.
- * We look for ADD instructions that use a SHL result where SHL uses an IV.
+ * We look for ADD instructions that use a SHL result where SHL uses an IV,
+ * and (separately) MLA instructions where MUL+ADD have already been fused.
+ *
+ * The licm.c body detector caps body extension at +50 instructions, which
+ * misses rotated loops with the body proper placed AFTER the back-edge
+ * (latch) in instruction order — common when tcc's loop rotation moves the
+ * latch above the body.  We compute our own extended scan range here so
+ * IV/SR works regardless of body layout.  Any j > end_idx whose JMP/JUMPIF
+ * targets back into the current body must itself be part of the loop —
+ * extend the body upward to include it, iterating until convergence.
  */
 static int find_derived_ivs(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int num_ivs, DerivedIV *divs, int max_divs)
 {
   int num_divs = 0;
+
+  /* Compute an MLA-only extended scan range.  licm.c's body detector caps
+   * extension at +50 instructions, missing rotated loops with the body proper
+   * placed AFTER the back-edge in instruction order.  Iteratively extend the
+   * end of the loop range to include any j > end_idx whose JMP/JUMPIF targets
+   * back into the body — those instructions must execute as part of the loop.
+   *
+   * We use this extended range ONLY for MLA-fused DIV detection (a new pattern
+   * that the existing pass never handled).  The existing ADD-based detection
+   * keeps using loop->body_instrs to preserve baseline behavior — extending
+   * its scan can trigger downstream passes (local_alu_cse → copy_prop → DCE)
+   * to wrongly drop SHR/AND chains in bodies that weren't previously visible
+   * to IV/SR.  Restricting body extension to the new MLA pattern avoids that
+   * regression while still catching the test_ge_operator case. */
+  int mla_scan_start = loop->start_idx;
+  int mla_scan_end = loop->end_idx;
+  {
+    int extended;
+    do
+    {
+      extended = 0;
+      for (int j = mla_scan_end + 1; j < ir->next_instruction_index; j++)
+      {
+        IRQuadCompact *jq = &ir->compact_instructions[j];
+        if (jq->op != TCCIR_OP_JUMP && jq->op != TCCIR_OP_JUMPIF)
+          continue;
+        IROperand jdest = tcc_ir_op_get_dest(ir, jq);
+        int jtarget = (int)irop_get_imm64_ex(ir, jdest);
+        if (jtarget >= mla_scan_start && jtarget <= mla_scan_end)
+        {
+          mla_scan_end = j;
+          extended = 1;
+        }
+      }
+    } while (extended);
+  }
 
   if (TCC_LOG_IV_SR)
   {
     fprintf(stderr, "[IV_SR] Loop body_instrs:");
     for (int bi = 0; bi < loop->num_body_instrs; bi++)
       fprintf(stderr, " %d", loop->body_instrs[bi]);
-    fprintf(stderr, "\n");
+    fprintf(stderr, " (MLA scan range: [%d..%d])\n", mla_scan_start, mla_scan_end);
   }
 
   /* Scan the extended body for ADD instructions (DIV computation) */
@@ -19229,10 +19275,150 @@ static int find_derived_ivs(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int
     divs[num_divs].stride = stride;
     divs[num_divs].use_idx = i;
     divs[num_divs].shl_idx = shl_idx;
+    divs[num_divs].share_with = -1;
     num_divs++;
 
     LOG_IV_SR("IV_SR: Found DIV base+%d*VAR%d at ADD idx=%d (SHL idx=%d)", stride, TCCIR_DECODE_VREG_POSITION(iv_vr), i,
               shl_idx);
+  }
+
+  /* Second pass: detect MLA-fused derived IVs.
+   * Pattern: dest = src1 * src2 + accum  where
+   *   src1 = IV (or copy-through to one)
+   *   src2 = stride immediate
+   *   accum = loop-invariant base
+   * MLA is produced by Phase 3b–4b's MUL→MLA fusion BEFORE IV/SR runs, so
+   * the original `MUL+ADD` shape this pass was written for is gone.  We treat
+   * the MLA itself as the use site and set shl_idx = -1 (no separate SHL/MUL
+   * to NOP — the multiply is fused into the MLA we replace).  Uses the
+   * extended MLA scan range so rotated loops with body-after-back-edge are
+   * also covered. */
+  if (getenv("TCC_DBG_MLAIV")) {
+    fprintf(stderr, "[MLAIV] scan loop [%d..%d]\n", mla_scan_start, mla_scan_end);
+    for (int dbg = mla_scan_start; dbg <= mla_scan_end; dbg++)
+      fprintf(stderr, "[MLAIV]   idx %d op=%d\n", dbg, ir->compact_instructions[dbg].op);
+  }
+  for (int i = mla_scan_start; i <= mla_scan_end && num_divs < max_divs; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+
+    if (q->op != TCCIR_OP_MLA)
+      continue;
+    if (getenv("TCC_DBG_MLAIV"))
+      fprintf(stderr, "[MLAIV] candidate MLA at idx %d\n", i);
+
+    IROperand dest = tcc_ir_op_get_dest(ir, q);
+    IROperand src1 = tcc_ir_op_get_src1(ir, q);
+    IROperand src2 = tcc_ir_op_get_src2(ir, q);
+    IROperand accum = tcc_ir_op_get_accum(ir, q);
+
+    /* src2 must be the stride immediate */
+    if (!irop_is_immediate(src2))
+      continue;
+
+    /* src1 must be an IV (with one level of copy-through) */
+    int iv_vr = irop_get_vreg(src1);
+    if (iv_vr < 0)
+      continue;
+
+    int iv_idx = -1;
+    for (int k = 0; k < num_ivs; k++)
+    {
+      if (ivs[k].vreg == iv_vr)
+      {
+        iv_idx = k;
+        break;
+      }
+    }
+    if (iv_idx < 0)
+    {
+      /* Chase one level of copy: T <-- VAR ASSIGN */
+      int def = tcc_ir_find_defining_instruction(ir, iv_vr, i);
+      if (def >= 0)
+      {
+        IRQuadCompact *dq = &ir->compact_instructions[def];
+        if (dq->op == TCCIR_OP_ASSIGN || dq->op == TCCIR_OP_STORE)
+        {
+          int copy_src = irop_get_vreg(tcc_ir_op_get_src1(ir, dq));
+          for (int k = 0; k < num_ivs; k++)
+          {
+            if (ivs[k].vreg == copy_src)
+            {
+              iv_idx = k;
+              break;
+            }
+          }
+        }
+      }
+    }
+    if (iv_idx < 0)
+      continue;
+
+    /* accum (the base) must be loop-invariant: not redefined inside the loop.
+     * Use the extended MLA scan range so rotated loops with the body proper
+     * outside [start_idx..end_idx] are still checked correctly. */
+    int base_vr = irop_get_vreg(accum);
+    if (base_vr >= 0)
+    {
+      int redefined = 0;
+      for (int j = mla_scan_start; j <= mla_scan_end; j++)
+      {
+        IRQuadCompact *lq = &ir->compact_instructions[j];
+        if (lq->op == TCCIR_OP_NOP || j == i)
+          continue;
+        if (irop_config[lq->op].has_dest)
+        {
+          IROperand ld = tcc_ir_op_get_dest(ir, lq);
+          if (irop_get_vreg(ld) == base_vr)
+          {
+            redefined = 1;
+            break;
+          }
+        }
+      }
+      if (redefined)
+        continue;
+    }
+
+    int mul_const = (int)irop_get_imm64_ex(ir, src2);
+    int stride = ivs[iv_idx].step * mul_const;
+
+    /* Dead-code check: must have at least one use of this MLA's dest. */
+    int dest_vr = irop_get_vreg(dest);
+    int use_count = 0;
+    for (int j = 0; j < ir->next_instruction_index; j++)
+    {
+      if (j == i)
+        continue;
+      IRQuadCompact *uq = &ir->compact_instructions[j];
+      IROperand u1 = tcc_ir_op_get_src1(ir, uq);
+      IROperand u2 = tcc_ir_op_get_src2(ir, uq);
+      if (irop_get_vreg(u1) == dest_vr)
+        use_count++;
+      if (irop_get_vreg(u2) == dest_vr)
+        use_count++;
+      if (uq->op == TCCIR_OP_STORE || uq->op == TCCIR_OP_STORE_INDEXED || uq->op == TCCIR_OP_STORE_POSTINC)
+      {
+        IROperand ud = tcc_ir_op_get_dest(ir, uq);
+        if (irop_get_vreg(ud) == dest_vr)
+          use_count++;
+      }
+    }
+    if (use_count < 1)
+      continue;
+
+    divs[num_divs].iv_idx = iv_idx;
+    divs[num_divs].base_vreg = base_vr;
+    divs[num_divs].base_op = accum;
+    divs[num_divs].stride = stride;
+    divs[num_divs].use_idx = i;
+    divs[num_divs].shl_idx = -1; /* fused into MLA — nothing to NOP */
+    divs[num_divs].share_with = -1;
+    num_divs++;
+
+    if (getenv("TCC_DBG_MLAIV"))
+      fprintf(stderr, "[MLAIV] FOUND MLA-DIV at idx %d, stride=%d, iv_vr=%d, base_vr=%d\n", i, stride, iv_vr, base_vr);
+    LOG_IV_SR("IV_SR: Found MLA-DIV base+%d*VAR%d at MLA idx=%d (fused)", stride, TCCIR_DECODE_VREG_POSITION(iv_vr), i);
   }
 
   return num_divs;
@@ -19308,15 +19494,52 @@ static int insert_instr_at(TCCIRState *ir, int pos, TccIrOp op, IROperand dest, 
  * 1. Insert ptr = base + (iv_init * stride) in preheader (BEFORE the header)
  * 2. Replace the ADD (DIV) with just using ptr
  * 3. Insert ptr += stride after the IV increment
- * 4. NOP out the SHL instruction
+ * 4. NOP out the SHL instruction (skipped when div->shl_idx < 0, MLA case)
+ *
+ * If shared_ptr_vreg >= 0 the DIV reuses an already-strength-reduced pointer
+ * (group of identical recurrences), so this skips the init/bump steps and
+ * only rewrites use_idx in place to ASSIGN dest, shared_ptr.
  */
 static int transform_derived_iv(TCCIRState *ir, IRLoop *loop, InductionVar *iv, DerivedIV *div, int *out_ptr_vreg,
-                                int *out_idx_shift)
+                                int *out_idx_shift, int shared_ptr_vreg)
 {
   if (out_ptr_vreg)
     *out_ptr_vreg = -1;
   if (out_idx_shift)
     *out_idx_shift = 0;
+
+  /* Shared-pointer fast path: rewrite the use site to ASSIGN of the existing
+   * primary's strength-reduced pointer.  No insertions — just rewrites.
+   * Returns 1 to signal success without triggering the caller's index-shift
+   * bookkeeping (no instructions inserted). */
+  if (shared_ptr_vreg >= 0)
+  {
+    if (div->use_idx < 0 || div->use_idx >= ir->next_instruction_index)
+      return 0;
+    IRQuadCompact *use_q = &ir->compact_instructions[div->use_idx];
+    IROperand ptr_op = irop_make_vreg(shared_ptr_vreg, IROP_BTYPE_INT32);
+    IROperand null_op = {0};
+    use_q->op = TCCIR_OP_ASSIGN;
+    tcc_ir_op_set_src1(ir, use_q, ptr_op);
+    tcc_ir_op_set_src2(ir, use_q, null_op);
+    /* If this DIV had a separate SHL/MUL feeding into it (shl_idx >= 0),
+     * NOP it — its result is now dead because the consuming ADD just became
+     * an ASSIGN.  Leaving a dead SHL/MUL in place would let later passes
+     * (e.g. local_alu_cse) treat its output as a live equivalent expression
+     * and CSE other matching ADDs into stale values, miscompiling the loop.
+     * For MLA-fused DIVs (shl_idx == -1) there is no separate instruction. */
+    if (div->shl_idx >= 0 && div->shl_idx < ir->next_instruction_index)
+    {
+      IRQuadCompact *shl_q = &ir->compact_instructions[div->shl_idx];
+      shl_q->op = TCCIR_OP_NOP;
+    }
+    /* Note: MLA's accum operand at +3 is now orphaned in the pool, harmless. */
+    if (out_ptr_vreg)
+      *out_ptr_vreg = shared_ptr_vreg;
+    LOG_IV_SR("IV_SR: shared-DIV at idx=%d rewritten to ASSIGN <- TMP%d (NOPed shl_idx=%d)", div->use_idx,
+              TCCIR_DECODE_VREG_POSITION(shared_ptr_vreg), div->shl_idx);
+    return 1;
+  }
 
   /* Allocate a new temp vreg for the pointer */
   int ptr_vreg = tcc_ir_vreg_alloc_temp(ir);
@@ -19453,21 +19676,26 @@ static int transform_derived_iv(TCCIRState *ir, IRLoop *loop, InductionVar *iv, 
 
   /* Update our tracked indices */
   int new_use_idx = div->use_idx + idx_shift;
-  int new_shl_idx = div->shl_idx + idx_shift;
+  int new_shl_idx = (div->shl_idx >= 0) ? div->shl_idx + idx_shift : -1;
   int new_iv_def_idx = iv->def_idx;
   if (iv->def_idx >= insert_pos)
     new_iv_def_idx += idx_shift;
 
-  /* Step 2: Replace the ADD instruction with ASSIGN (ptr -> dest) */
+  /* Step 2: Replace the ADD/MLA instruction with ASSIGN (ptr -> dest) */
   IRQuadCompact *add_q = &ir->compact_instructions[new_use_idx];
   add_q->op = TCCIR_OP_ASSIGN;
   tcc_ir_op_set_src1(ir, add_q, ptr_op);
   tcc_ir_op_set_src2(ir, add_q, null_op);
-  /* dest stays the same - it's the address temp that was being used */
+  /* dest stays the same - it's the address temp that was being used.
+   * For an MLA being rewritten, the accum operand at +3 is now orphaned. */
 
-  /* Step 3: NOP out the SHL instruction (no longer needed) */
-  IRQuadCompact *shl_q = &ir->compact_instructions[new_shl_idx];
-  shl_q->op = TCCIR_OP_NOP;
+  /* Step 3: NOP out the SHL/MUL instruction (skipped for fused MLA where
+   * the multiply has no separate IR instruction). */
+  if (new_shl_idx >= 0)
+  {
+    IRQuadCompact *shl_q = &ir->compact_instructions[new_shl_idx];
+    shl_q->op = TCCIR_OP_NOP;
+  }
 
   /* Step 4: Insert ptr += stride AFTER the IV increment.
    * In most loops the IV increment is at the latch (unconditional),
@@ -20039,6 +20267,48 @@ static int iv_strength_reduction_core(TCCIRState *ir, IRLoops *loops)
 
     LOG_IV_SR("IV_SR: Found %d DIV(s) in loop %d", num_divs, li);
 
+    /* Deduplicate DIVs that compute identical (iv, stride, base) recurrences.
+     * Without this, N identical MLAs (e.g. arr[i].a, arr[i].b, arr[i].c each
+     * computing the same &arr[i]) would each get its own strength-reduced
+     * pointer, requiring N pointer bumps in the latch — strictly worse than
+     * the original.  Mark each duplicate's share_with field with the index of
+     * the earliest equivalent DIV, so the transform can rewrite them to
+     * ASSIGN dest, primary_ptr instead of allocating fresh pointers. */
+    for (int dj = 1; dj < num_divs; dj++)
+    {
+      for (int dk = 0; dk < dj; dk++)
+      {
+        if (divs[dk].share_with >= 0)
+          continue; /* only chain to primaries */
+        if (divs[dj].iv_idx != divs[dk].iv_idx || divs[dj].stride != divs[dk].stride)
+          continue;
+        /* Compare base operands: same vreg, or same immediate value, or same stack offset. */
+        IROperand a = divs[dj].base_op;
+        IROperand b = divs[dk].base_op;
+        int tag_a = irop_get_tag(a);
+        int tag_b = irop_get_tag(b);
+        if (tag_a != tag_b)
+          continue;
+        int eq = 0;
+        if (tag_a == IROP_TAG_IMM32 || tag_a == IROP_TAG_STACKOFF)
+          eq = (a.u.imm32 == b.u.imm32 && a.is_lval == b.is_lval);
+        else if (tag_a == IROP_TAG_VREG)
+        {
+          int32_t va = irop_get_vreg(a);
+          int32_t vb = irop_get_vreg(b);
+          if (va >= 0 && va == vb && a.is_lval == b.is_lval)
+            eq = 1;
+        }
+        if (eq)
+        {
+          divs[dj].share_with = dk;
+          LOG_IV_SR("IV_SR: DIV %d shares pointer with DIV %d (iv_idx=%d stride=%d)", dj, dk, divs[dj].iv_idx,
+                    divs[dj].stride);
+          break;
+        }
+      }
+    }
+
     /* Transform each derived IV, deferring IV elimination to pick the
      * cheapest end-pointer across all transformed DIVs. */
     int div_ptr_vregs[MAX_DIV];
@@ -20052,7 +20322,20 @@ static int iv_strength_reduction_core(TCCIRState *ir, IRLoops *loops)
     for (int di = 0; di < num_divs; di++)
     {
       int sr_ptr_vreg = -1, sr_idx_shift = 0;
-      int changes = transform_derived_iv(ir, loop, &ivs[divs[di].iv_idx], &divs[di], &sr_ptr_vreg, &sr_idx_shift);
+      int shared = -1;
+      if (divs[di].share_with >= 0)
+      {
+        /* Use primary's already-allocated ptr (must have been processed first
+         * given the dedup invariant share_with < di and we iterate in order). */
+        shared = div_ptr_vregs[divs[di].share_with];
+        if (shared < 0)
+        {
+          LOG_IV_SR("IV_SR: skipping shared DIV %d — primary %d not transformed", di, divs[di].share_with);
+          continue;
+        }
+      }
+      int changes =
+          transform_derived_iv(ir, loop, &ivs[divs[di].iv_idx], &divs[di], &sr_ptr_vreg, &sr_idx_shift, shared);
       total_changes += changes;
       div_ptr_vregs[di] = sr_ptr_vreg;
       div_changes[di] = changes;

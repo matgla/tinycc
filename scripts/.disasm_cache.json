@@ -1,4 +1,34 @@
 {
+  "110_iv_strength_reduction::array_copy": {
+    "gcc": 10,
+    "tcc": 16,
+    "updated": "2026-05-10T19:00:40.893154+00:00"
+  },
+  "110_iv_strength_reduction::array_diff_sum": {
+    "gcc": 17,
+    "tcc": 28,
+    "updated": "2026-05-10T19:00:40.893167+00:00"
+  },
+  "110_iv_strength_reduction::array_sum": {
+    "gcc": 12,
+    "tcc": 23,
+    "updated": "2026-05-10T19:00:40.893170+00:00"
+  },
+  "110_iv_strength_reduction::array_sum_reverse": {
+    "gcc": 11,
+    "tcc": 23,
+    "updated": "2026-05-10T19:00:40.893172+00:00"
+  },
+  "110_iv_strength_reduction::main": {
+    "gcc": 72,
+    "tcc": 140,
+    "updated": "2026-05-10T19:00:40.893174+00:00"
+  },
+  "110_iv_strength_reduction::short_array_sum": {
+    "gcc": 12,
+    "tcc": 19,
+    "updated": "2026-05-10T19:00:40.893176+00:00"
+  },
   "165_builtin_add_overflow::main": {
     "gcc": 5,
     "tcc": 5,
@@ -576,8 +606,8 @@
   },
   "ir/bench_bubble_sort::bench_bubble_sort": {
     "gcc": 31,
-    "tcc": 75,
-    "updated": "2026-05-10T09:18:30.111609+00:00"
+    "tcc": 74,
+    "updated": "2026-05-10T19:00:15.151811+00:00"
   },
   "ir/bench_bubble_sort::main": {
     "gcc": 7,
@@ -661,8 +691,8 @@
   },
   "ir/bench_linked_list::bench_linked_list": {
     "gcc": 22,
-    "tcc": 38,
-    "updated": "2026-05-02T08:48:22.345164+00:00"
+    "tcc": 37,
+    "updated": "2026-05-10T19:00:15.151817+00:00"
   },
   "ir/bench_linked_list::main": {
     "gcc": 7,
@@ -1241,8 +1271,8 @@
   },
   "ir/test_fp_offset_cache::test_loop_access": {
     "gcc": 27,
-    "tcc": 59,
-    "updated": "2026-05-10T09:18:30.111480+00:00"
+    "tcc": 55,
+    "updated": "2026-05-10T19:00:15.151583+00:00"
   },
   "ir/test_fp_offset_cache::test_mixed_access": {
     "gcc": 4,
@@ -1256,8 +1286,8 @@
   },
   "ir/test_fp_offset_cache::test_swap_pattern": {
     "gcc": 26,
-    "tcc": 47,
-    "updated": "2026-05-10T09:18:30.111483+00:00"
+    "tcc": 46,
+    "updated": "2026-05-10T19:00:15.151604+00:00"
   },
   "ir/test_ge_operator::main": {
     "gcc": 72,
