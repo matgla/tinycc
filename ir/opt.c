@@ -15047,7 +15047,11 @@ int tcc_ir_opt_deref_indexed_fusion(TCCIRState *ir)
         continue;
 
       IROperand index_op = tcc_ir_op_get_src1(ir, shl_q);
-      if (index_op.is_local || index_op.is_llocal)
+      /* is_llocal means double-indirection (LLOCAL) which the codegen needs to
+       * resolve via an extra load.  Skip for now — too involved.
+       * is_local on the index is fine: it's a plain stack value, and
+       * mach_ensure_in_reg materializes it before use as an LDR/STR index. */
+      if (index_op.is_llocal)
         continue;
       /* Allow is_local base (stack address): the codegen materializes it
        * via mach_ensure_in_reg.  Same as the LOAD/STORE fusion above. */

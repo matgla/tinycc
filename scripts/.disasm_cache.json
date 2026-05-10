@@ -206,8 +206,8 @@
   },
   "ir/110_iv_strength_reduction::array_diff_sum": {
     "gcc": 17,
-    "tcc": 23,
-    "updated": "2026-05-02T08:48:22.345027+00:00"
+    "tcc": 21,
+    "updated": "2026-05-10T20:55:30.635631+00:00"
   },
   "ir/110_iv_strength_reduction::array_sum": {
     "gcc": 12,
@@ -381,8 +381,8 @@
   },
   "ir/90_global_array_assignment::main": {
     "gcc": 15,
-    "tcc": 21,
-    "updated": "2026-05-02T08:48:22.344763+00:00"
+    "tcc": 20,
+    "updated": "2026-05-10T20:55:30.635446+00:00"
   },
   "ir/91_const_propagation::main": {
     "gcc": 15,
@@ -411,8 +411,8 @@
   },
   "ir/92_loop_invariant::main": {
     "gcc": 20,
-    "tcc": 28,
-    "updated": "2026-05-02T08:48:22.344866+00:00"
+    "tcc": 26,
+    "updated": "2026-05-10T20:55:30.635485+00:00"
   },
   "ir/92_loop_invariant::test_loop": {
     "gcc": 10,
@@ -1076,8 +1076,8 @@
   },
   "ir/mibench_sha::sha_transform": {
     "gcc": 147,
-    "tcc": 183,
-    "updated": "2026-05-10T09:18:30.111661+00:00"
+    "tcc": 176,
+    "updated": "2026-05-10T20:55:30.635743+00:00"
   },
   "ir/mibench_sha::sha_update": {
     "gcc": 38,
@@ -1391,8 +1391,8 @@
   },
   "ir/test_mibench_sha::main": {
     "gcc": 55,
-    "tcc": 64,
-    "updated": "2026-05-10T09:18:30.111565+00:00"
+    "tcc": 62,
+    "updated": "2026-05-10T20:55:30.635621+00:00"
   },
   "ir/test_mibench_sha::sha_final": {
     "gcc": 55,
@@ -1406,8 +1406,8 @@
   },
   "ir/test_mibench_sha::sha_transform": {
     "gcc": 147,
-    "tcc": 183,
-    "updated": "2026-05-10T09:18:30.111568+00:00"
+    "tcc": 176,
+    "updated": "2026-05-10T20:55:30.635625+00:00"
   },
   "ir/test_mibench_sha::sha_update": {
     "gcc": 56,
