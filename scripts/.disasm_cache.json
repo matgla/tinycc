@@ -41,8 +41,8 @@
   },
   "98_value_tracking::test_conditionals_pattern": {
     "gcc": 5,
-    "tcc": 11,
-    "updated": "2026-05-10T11:15:28.659291+00:00"
+    "tcc": 6,
+    "updated": "2026-05-10T12:29:57.895696+00:00"
   },
   "98_value_tracking::test_value_track_add": {
     "gcc": 2,
@@ -496,8 +496,8 @@
   },
   "ir/97_loop_const_expr::test_conditionals_pattern": {
     "gcc": 5,
-    "tcc": 11,
-    "updated": "2026-05-10T10:04:42.718468+00:00"
+    "tcc": 6,
+    "updated": "2026-05-10T12:31:36.796972+00:00"
   },
   "ir/97_loop_const_expr::test_const_hoist": {
     "gcc": 6,
@@ -526,8 +526,8 @@
   },
   "ir/98_value_tracking::test_conditionals_pattern": {
     "gcc": 5,
-    "tcc": 11,
-    "updated": "2026-05-10T10:04:42.718493+00:00"
+    "tcc": 6,
+    "updated": "2026-05-10T12:31:36.796993+00:00"
   },
   "ir/98_value_tracking::test_value_track_add": {
     "gcc": 2,
@@ -586,13 +586,13 @@
   },
   "ir/bench_conditionals::bench_conditionals": {
     "gcc": 2,
-    "tcc": 10,
-    "updated": "2026-05-10T11:37:20.667955+00:00"
+    "tcc": 2,
+    "updated": "2026-05-10T12:31:36.797104+00:00"
   },
   "ir/bench_conditionals::main": {
     "gcc": 6,
-    "tcc": 7,
-    "updated": "2026-05-02T08:48:22.345184+00:00"
+    "tcc": 6,
+    "updated": "2026-05-10T12:31:36.797107+00:00"
   },
   "ir/bench_fibonacci::bench_fibonacci": {
     "gcc": 11,

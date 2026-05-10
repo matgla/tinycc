@@ -27,6 +27,12 @@
  * post-loop reads of T_o_phi can be replaced by T_v.  Subsequent passes
  * (cprop_imm, branch fold, dce) then collapse the post-loop comparison
  * branches and finally the loop body itself.
+ *
+ * Guarded variant: when trip count is not provably >=1 (e.g. the bound is
+ * a runtime parameter), the post-loop value of T_o_phi is c0 if the loop
+ * was skipped and c1 if it ran.  We materialize this as a SELECT consuming
+ * the entry condition's flags, then kill the body the same way.  The
+ * resulting code matches GCC's `cmp; ite; mov...; mov...; bx lr` shape.
  */
 
 #define USING_GLOBALS
@@ -96,52 +102,93 @@ static int loop_body_has_side_effects(IRSSAOptCtx *ctx, IRLoop *loop)
   return 0;
 }
 
-/* Find the CMP+JUMPIF at the loop header and check that the loop is a counted
- * loop with provable trip count ≥ 1.  Pattern:
- *   CMP iv, #BOUND
- *   JUMPIF cond → exit
- * where iv has constant init #INIT in the preheader and cond exits when
- * iv ≥/> BOUND, with INIT < BOUND (or ≤ for >).
- */
-static int loop_runs_at_least_once(IRSSAOptCtx *ctx, IRLoop *loop)
+/* Inverse of a JUMPIF cond token, i.e. the token that's true exactly when the
+ * original is false.  Mirrors invert_cond_token in opt.c (kept local to
+ * avoid pulling in that header). */
+static int dl_invert_cond_token(int tok)
+{
+  switch (tok) {
+  case 0x94: return 0x95;
+  case 0x95: return 0x94;
+  case 0x9c: return 0x9d;
+  case 0x9d: return 0x9c;
+  case 0x9e: return 0x9f;
+  case 0x9f: return 0x9e;
+  case 0x92: return 0x93;
+  case 0x93: return 0x92;
+  case 0x96: return 0x97;
+  case 0x97: return 0x96;
+  default:   return tok ^ 1;
+  }
+}
+
+/* Components extracted from the header CMP+JUMPIF for the dead-loop transform.
+ * Populated by analyze_loop_entry; consumed by the constant-rewrite path
+ * (when proven_runs is set) and the guarded SELECT path (when not). */
+typedef struct LoopEntryInfo {
+  int cmp_idx;
+  int jpf_idx;
+  int header_block;
+  int latch_block;
+  int going_up;        /* iv steps up toward bound */
+  int going_down;      /* iv steps down toward bound */
+  int exit_tok;        /* JUMPIF cond: true when loop NOT entered */
+  int entry_tok;       /* inverse: cond true when loop ENTERED — for SELECT */
+  int init_is_const;
+  int64_t init_val;
+  int bound_is_const;
+  int64_t bound_val;
+  IROperand bound_op;
+  int32_t iv_vr;
+  IRPhiNode *iv_phi;
+  int proven_runs;     /* 1 iff trip count is provably >= 1 with constant bound */
+} LoopEntryInfo;
+
+/* Generalized form of loop_runs_at_least_once: extracts the entry-condition
+ * components without requiring the bound to be a compile-time constant.
+ * Returns 1 if the pattern matched and `out` is filled, 0 if we should bail. */
+static int analyze_loop_entry(IRSSAOptCtx *ctx, IRLoop *loop, LoopEntryInfo *out)
 {
   TCCIRState *ir = ctx->ir;
   int hi = loop_max_idx(loop);
+  memset(out, 0, sizeof(*out));
 
   /* Walk the header forward to find the controlling CMP. */
-  int cmp_idx = -1;
+  out->cmp_idx = -1;
   for (int j = loop->header_idx; j <= hi; j++) {
     int op = ir->compact_instructions[j].op;
     if (op == TCCIR_OP_NOP)
       continue;
     if (op == TCCIR_OP_CMP) {
-      cmp_idx = j;
+      out->cmp_idx = j;
       break;
     }
-    /* Anything else before the CMP (e.g. body) means this isn't a top-tested
-     * counted loop in the form we recognize. */
     return 0;
   }
-  if (cmp_idx < 0)
+  if (out->cmp_idx < 0)
     return 0;
 
-  IRQuadCompact *cmp = &ir->compact_instructions[cmp_idx];
+  IRQuadCompact *cmp = &ir->compact_instructions[out->cmp_idx];
   IROperand src1 = tcc_ir_op_get_src1(ir, cmp);
   IROperand src2 = tcc_ir_op_get_src2(ir, cmp);
 
-  /* Need: CMP iv, #imm */
-  int64_t bound;
-  if (irop_is_immediate(src2))
-    bound = irop_get_imm64_ex(ir, src2);
-  else
+  /* CMP iv, <bound> — bound may be immediate or a vreg (loop-invariant). */
+  out->bound_op = src2;
+  if (irop_is_immediate(src2)) {
+    out->bound_is_const = 1;
+    out->bound_val = irop_get_imm64_ex(ir, src2);
+  } else if (src2.tag == IROP_TAG_VREG && !src2.is_lval) {
+    out->bound_is_const = 0;
+  } else {
+    return 0;
+  }
+
+  out->iv_vr = irop_get_vreg(src1);
+  if (out->iv_vr < 0 || TCCIR_DECODE_VREG_TYPE(out->iv_vr) != TCCIR_VREG_TYPE_TEMP)
     return 0;
 
-  int32_t iv_vr = irop_get_vreg(src1);
-  if (iv_vr < 0 || TCCIR_DECODE_VREG_TYPE(iv_vr) != TCCIR_VREG_TYPE_TEMP)
-    return 0;
-
-  /* The next non-NOP must be JUMPIF that exits the loop. */
-  int j = cmp_idx + 1;
+  /* Locate the JUMPIF immediately after (skipping NOPs). */
+  int j = out->cmp_idx + 1;
   while (j < ir->next_instruction_index && ir->compact_instructions[j].op == TCCIR_OP_NOP)
     j++;
   if (j >= ir->next_instruction_index)
@@ -149,56 +196,50 @@ static int loop_runs_at_least_once(IRSSAOptCtx *ctx, IRLoop *loop)
   IRQuadCompact *jpf = &ir->compact_instructions[j];
   if (jpf->op != TCCIR_OP_JUMPIF)
     return 0;
+  out->jpf_idx = j;
+  out->exit_tok = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src1(ir, jpf));
+  out->entry_tok = dl_invert_cond_token(out->exit_tok);
 
-  IROperand cond = tcc_ir_op_get_src1(ir, jpf);
-  int tok = (int)irop_get_imm64_ex(ir, cond);
-
-  /* The IV at the header is the phi's destination.  Look up its phi at the
-   * header block and resolve the preheader operand to a constant. */
-  int header_block = ctx->cfg ? ctx->cfg->instr_to_block[loop->header_idx] : -1;
-  if (header_block < 0)
+  out->header_block = ctx->cfg ? ctx->cfg->instr_to_block[loop->header_idx] : -1;
+  if (out->header_block < 0)
     return 0;
+  out->latch_block = ctx->cfg->instr_to_block[loop->end_idx];
 
-  int latch_block = ctx->cfg->instr_to_block[loop->end_idx];
-
+  /* IV phi — needs preheader operand resolvable to a constant for either
+   * path (constant rewrite uses init_val for bounds check; SELECT path uses
+   * it as the "loop skipped" value). */
   IRPhiNode *iv_phi = NULL;
-  for (IRPhiNode *p = ctx->ssa->block_phis[header_block]; p; p = p->next) {
-    if (p->dest_vreg == iv_vr) {
+  for (IRPhiNode *p = ctx->ssa->block_phis[out->header_block]; p; p = p->next) {
+    if (p->dest_vreg == out->iv_vr) {
       iv_phi = p;
       break;
     }
   }
   if (!iv_phi || iv_phi->num_operands != 2)
     return 0;
+  out->iv_phi = iv_phi;
 
-  int64_t init_val = 0;
-  int got_init = 0;
   for (int oi = 0; oi < iv_phi->num_operands; oi++) {
-    if (iv_phi->operands[oi].pred_block == latch_block)
-      continue; /* latch operand */
-    /* preheader operand */
+    if (iv_phi->operands[oi].pred_block == out->latch_block)
+      continue;
     int64_t v;
     if (resolve_const_through_copies(ctx, iv_phi->operands[oi].vreg, &v)) {
-      init_val = v;
-      got_init = 1;
+      out->init_val = v;
+      out->init_is_const = 1;
     }
     break;
   }
-  if (!got_init)
+  if (!out->init_is_const)
     return 0;
 
-  /* Conservatively check that the latch operand is iv_phi advancing toward
-   * bound: latch_op = ADD(iv_phi, +k) with k>0 (going up to bound), or
-   * SUB(iv_phi, +k) with k>0 (going down to bound).  Then trip count > 0
-   * iff init_val is on the "loop-runs" side of bound for the exit token. */
-  int going_up = 0, going_down = 0;
+  /* Latch operand must be ADD/SUB of the iv with a positive step (going_up
+   * or going_down toward bound).  Same logic as loop_runs_at_least_once. */
   for (int oi = 0; oi < iv_phi->num_operands; oi++) {
-    if (iv_phi->operands[oi].pred_block != latch_block)
+    if (iv_phi->operands[oi].pred_block != out->latch_block)
       continue;
     int32_t lvr = iv_phi->operands[oi].vreg;
     if (lvr < 0)
       return 0;
-    /* Walk through copies to find the actual computation. */
     for (int hop = 0; hop < 8 && lvr >= 0; hop++) {
       IRSSAVregInfo *lvi = ssa_opt_vinfo(ctx, lvr);
       if (!lvi || lvi->def_instr < 0 || lvi->def_count > 1)
@@ -211,47 +252,43 @@ static int loop_runs_at_least_once(IRSSAOptCtx *ctx, IRLoop *loop)
         lvr = irop_get_vreg(s);
         continue;
       }
-      if ((dq->op == TCCIR_OP_ADD || dq->op == TCCIR_OP_SUB)) {
+      if (dq->op == TCCIR_OP_ADD || dq->op == TCCIR_OP_SUB) {
         IROperand a = tcc_ir_op_get_src1(ir, dq);
         IROperand b = tcc_ir_op_get_src2(ir, dq);
-        if (irop_get_vreg(a) != iv_vr || !irop_is_immediate(b))
+        if (irop_get_vreg(a) != out->iv_vr || !irop_is_immediate(b))
           return 0;
         int64_t step = irop_get_imm64_ex(ir, b);
         if (step <= 0)
           return 0;
         if (dq->op == TCCIR_OP_ADD)
-          going_up = 1;
+          out->going_up = 1;
         else
-          going_down = 1;
+          out->going_down = 1;
         break;
       }
       return 0;
     }
     break;
   }
-  if (!going_up && !going_down)
+  if (!out->going_up && !out->going_down)
     return 0;
 
-  /* Check the exit condition.  Tokens (from ssa_opt_branch.c):
-   *   0x9c = <S, 0x9d = >=S, 0x9e = <=S, 0x9f = >S
-   *   0x92 = <U, 0x93 = >=U, 0x96 = <=U, 0x97 = >U
-   *   0x94 = ==,  0x95 = !=
-   * The JUMPIF jumps to "exit" when cond is true. */
-  if (going_up) {
-    /* Going up to bound; loop exits when iv reaches bound.
-     * Common: cond = ">=" → exits when iv ≥ bound.  Trip count > 0 iff init < bound. */
-    if (tok == 0x9d || tok == 0x93)
-      return init_val < bound;
-    if (tok == 0x9f || tok == 0x97)
-      return init_val <= bound;
+  /* Decide if trip count is provably >= 1 — only possible when bound is also
+   * a compile-time constant.  Same arithmetic as the original predicate. */
+  if (out->bound_is_const) {
+    int tok = out->exit_tok;
+    int64_t init_val = out->init_val, bound = out->bound_val;
+    if (out->going_up) {
+      if (tok == 0x9d || tok == 0x93) out->proven_runs = (init_val < bound);
+      else if (tok == 0x9f || tok == 0x97) out->proven_runs = (init_val <= bound);
+    }
+    if (out->going_down) {
+      if (tok == 0x9c || tok == 0x92) out->proven_runs = (init_val > bound);
+      else if (tok == 0x9e || tok == 0x96) out->proven_runs = (init_val >= bound);
+    }
   }
-  if (going_down) {
-    if (tok == 0x9c || tok == 0x92)
-      return init_val > bound;
-    if (tok == 0x9e || tok == 0x96)
-      return init_val >= bound;
-  }
-  return 0;
+
+  return 1;
 }
 
 /* For each header phi whose latch operand resolves to a constant AND whose
@@ -500,6 +537,254 @@ static int try_kill_loop_body(IRSSAOptCtx *ctx, IRLoop *loop)
   return 1;
 }
 
+/* Guarded variant: when trip count isn't provably >=1, materialize each
+ * qualifying header phi as a SELECT consuming the header CMP's flags.
+ *
+ * The transform overwrites the header JUMPIF (and `num_cands - 1` body slots
+ * just after it) with SELECTs, then writes a JUMP-to-exit in the next slot,
+ * and finally NOPs the rest of the body — yielding `cmp; select...; b exit`
+ * which the backend lowers to `cmp; ite ...; movXX; movYY; b ...`.
+ *
+ * Returns 1 if the loop was successfully rewritten, 0 otherwise. */
+static int rewrite_loop_exit_phis_guarded(IRSSAOptCtx *ctx, IRLoop *loop, LoopEntryInfo *info)
+{
+  TCCIRState *ir = ctx->ir;
+  IRSSAState *ssa = ctx->ssa;
+  IRCFG *cfg = ctx->cfg;
+  if (!ssa || !ssa->block_phis || !cfg)
+    return 0;
+
+  int hi = loop_max_idx(loop);
+
+  /* Collect qualifying value phis. */
+  enum { MAX_CANDS = 4 };
+  struct {
+    IRPhiNode *phi;
+    int64_t c_pre;
+    int64_t c_latch;
+    int btype;
+    int32_t new_vr;
+  } cands[MAX_CANDS];
+  int num_cands = 0;
+
+  for (IRPhiNode *phi = ssa->block_phis[info->header_block]; phi; phi = phi->next) {
+    if (phi == info->iv_phi) continue;       /* IV phi handled by edge-drop */
+    if (phi->num_operands != 2) continue;
+    /* irop_make_imm32 only stores 32-bit immediates; skip wider phis. */
+    if (phi->btype == IROP_BTYPE_INT64) continue;
+
+    int pre_slot = -1, latch_slot = -1;
+    for (int oi = 0; oi < phi->num_operands; oi++) {
+      if (phi->operands[oi].pred_block == info->latch_block) latch_slot = oi;
+      else                                                    pre_slot   = oi;
+    }
+    if (pre_slot < 0 || latch_slot < 0) continue;
+
+    int64_t c_pre, c_latch;
+    if (!resolve_const_through_copies(ctx, phi->operands[pre_slot].vreg, &c_pre))
+      continue;
+    if (!resolve_const_through_copies(ctx, phi->operands[latch_slot].vreg, &c_latch))
+      continue;
+
+    /* Phi must have no in-loop INSTR uses and no phi-use outside the header
+     * (matches the constraints try_kill_loop_body checks before NOPing). */
+    IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, phi->dest_vreg);
+    if (!vi) continue;
+    int reject = 0;
+    for (int u = 0; u < vi->use_count; u++) {
+      IRSSAUse *use = &vi->uses[u];
+      if (use->kind == SSA_USE_INSTR) {
+        if (use->idx >= loop->start_idx && use->idx <= hi) { reject = 1; break; }
+      } else { /* SSA_USE_PHI */
+        if (use->idx != info->header_block) { reject = 1; break; }
+      }
+    }
+    if (reject) continue;
+
+    if (num_cands >= MAX_CANDS) return 0; /* bail; too many phis to fit */
+    cands[num_cands].phi      = phi;
+    cands[num_cands].c_pre    = c_pre;
+    cands[num_cands].c_latch  = c_latch;
+    cands[num_cands].btype    = phi->btype;
+    cands[num_cands].new_vr   = -1;
+    num_cands++;
+  }
+  if (num_cands == 0)
+    return 0;
+
+  /* Need num_cands SELECT slots plus one JUMP slot, all within the loop body
+   * range starting at jpf_idx (the JUMPIF and subsequent body instructions
+   * we'll overwrite). */
+  int needed = num_cands + 1;
+  if (info->jpf_idx + needed - 1 > hi) {
+    fprintf(stderr, "[DLOOPG] not enough slots: jpf=%d needed=%d hi=%d\n",
+            info->jpf_idx, needed, hi);
+    return 0;
+  }
+
+  /* Also bail if any in-body TEMP defined past the slots we're about to
+   * overwrite has uses outside the loop range — try_kill_loop_body's
+   * analogous check, but generalized to allow phi-uses at any in-loop
+   * block (since we'll NOP the whole body, those phis become dead too). */
+  for (int idx = info->jpf_idx + needed; idx <= hi; idx++) {
+    IRQuadCompact *q = &ir->compact_instructions[idx];
+    if (q->op == TCCIR_OP_NOP || q->op == TCCIR_OP_JUMP) continue;
+    if (!irop_config[q->op].has_dest) continue;
+    if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
+        q->op == TCCIR_OP_STORE_POSTINC)
+      return 0;
+    IROperand d = tcc_ir_op_get_dest(ir, q);
+    int32_t vr = irop_get_vreg(d);
+    if (vr < 0) continue;
+    if (TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
+      return 0;
+    IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, vr);
+    if (!vi) continue;
+    for (int u = 0; u < vi->use_count; u++) {
+      IRSSAUse *use = &vi->uses[u];
+      if (use->kind == SSA_USE_INSTR) {
+        if (use->idx < loop->start_idx || use->idx > hi)
+          return 0;
+      } else { /* SSA_USE_PHI: allow any block whose instructions live
+                  inside the loop range — those phis die with the body. */
+        int b = use->idx;
+        if (b < 0 || b >= cfg->num_blocks)
+          return 0;
+        int bs = cfg->blocks[b].start_idx;
+        int be = cfg->blocks[b].end_idx;
+        if (bs < loop->start_idx || be > hi) {
+          /* Phi-use outside the loop — that's a real escape, bail. */
+          if (b != info->header_block)
+            return 0;
+        }
+      }
+    }
+  }
+
+  /* All checks passed — commit. Allocate fresh TEMPs. */
+  for (int i = 0; i < num_cands; i++) {
+    cands[i].new_vr = tcc_ir_vreg_alloc_temp(ir);
+    if (cands[i].new_vr < 0)
+      return 0;
+  }
+
+  /* Grow vinfo if needed for the new TEMPs. */
+  int max_pos = 0;
+  for (int i = 0; i < num_cands; i++) {
+    int p = TCCIR_DECODE_VREG_POSITION(cands[i].new_vr);
+    if (p > max_pos) max_pos = p;
+  }
+  if (max_pos >= ctx->vinfo_cap) {
+    int new_cap = max_pos + 16;
+    ctx->vinfo = tcc_realloc(ctx->vinfo, new_cap * sizeof(IRSSAVregInfo));
+    memset(&ctx->vinfo[ctx->vinfo_cap], 0,
+           (new_cap - ctx->vinfo_cap) * sizeof(IRSSAVregInfo));
+    ctx->vinfo_cap = new_cap;
+  }
+
+  /* Capture exit target before clobbering the JUMPIF. */
+  IRQuadCompact *jpf_q = &ir->compact_instructions[info->jpf_idx];
+  IROperand exit_dest = tcc_ir_op_get_dest(ir, jpf_q);
+  int exit_target = (int)irop_get_imm64_ex(ir, exit_dest);
+
+  /* Drop phi operands flowing on dead edges before NOPing/overwriting body
+   * instructions — same precaution as try_kill_loop_body. */
+  int body_first_block = -1;
+  if (info->jpf_idx + 1 < ir->next_instruction_index)
+    body_first_block = cfg->instr_to_block[info->jpf_idx + 1];
+  if (body_first_block >= 0 && body_first_block != info->header_block &&
+      body_first_block != exit_target)
+    ssa_drop_phi_edge(ctx, info->header_block, body_first_block);
+  if (info->latch_block >= 0)
+    ssa_drop_phi_edge(ctx, info->latch_block, info->header_block);
+
+  /* Write SELECTs over JUMPIF and subsequent slots.  Slot 0 is the JUMPIF
+   * (already not registered as a vreg def, so no use-list cleanup needed);
+   * later slots may overlap real body instructions, so clear their uses
+   * via ssa_opt_nop_instr first. */
+  for (int i = 0; i < num_cands; i++) {
+    int slot = info->jpf_idx + i;
+    if (i > 0)
+      ssa_opt_nop_instr(ctx, slot);
+
+    IRQuadCompact *q = &ir->compact_instructions[slot];
+    IROperand sel_dest = irop_make_vreg(cands[i].new_vr, cands[i].btype);
+    IROperand sel_then = irop_make_imm32(-1, (int32_t)cands[i].c_latch, cands[i].btype);
+    IROperand sel_else = irop_make_imm32(-1, (int32_t)cands[i].c_pre,   cands[i].btype);
+    IROperand sel_cond = irop_make_imm32(-1, info->entry_tok, VT_INT);
+
+    int pool_base = tcc_ir_iroperand_pool_add(ir, sel_dest);
+    tcc_ir_iroperand_pool_add(ir, sel_then);
+    tcc_ir_iroperand_pool_add(ir, sel_else);
+    tcc_ir_iroperand_pool_add(ir, sel_cond);
+    q->op = TCCIR_OP_SELECT;
+    q->operand_base = pool_base;
+
+    IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, cands[i].new_vr);
+    if (vi) {
+      vi->def_instr     = slot;
+      vi->def_phi_block = -1;
+      vi->def_count     = 1;
+    }
+  }
+
+  /* Place JUMP exit in the slot after the last SELECT. */
+  {
+    int slot = info->jpf_idx + num_cands;
+    ssa_opt_nop_instr(ctx, slot);
+    IRQuadCompact *q = &ir->compact_instructions[slot];
+    IROperand jdest = irop_make_imm32(-1, exit_target, IROP_BTYPE_INT32);
+    int pool_base = tcc_ir_iroperand_pool_add(ir, jdest);
+    q->op = TCCIR_OP_JUMP;
+    q->operand_base = pool_base;
+  }
+
+  /* NOP every body instruction past the JUMP. */
+  for (int idx = info->jpf_idx + num_cands + 1; idx <= hi; idx++) {
+    if (ir->compact_instructions[idx].op != TCCIR_OP_NOP)
+      ssa_opt_nop_instr(ctx, idx);
+  }
+
+  /* Rewrite all post-loop INSTR uses of phi.dest_vreg → cand.new_vr. */
+  for (int i = 0; i < num_cands; i++) {
+    IRSSAVregInfo *old_vi = ssa_opt_vinfo(ctx, cands[i].phi->dest_vreg);
+    IRSSAVregInfo *new_vi = ssa_opt_vinfo(ctx, cands[i].new_vr);
+    if (!old_vi) continue;
+    IROperand new_op = irop_make_vreg(cands[i].new_vr, cands[i].btype);
+
+    int u = 0;
+    while (u < old_vi->use_count) {
+      IRSSAUse use = old_vi->uses[u];
+      if (use.kind != SSA_USE_INSTR) { u++; continue; }
+      IRQuadCompact *uq = &ir->compact_instructions[use.idx];
+      int rewrote = 0;
+      if (irop_config[uq->op].has_src1) {
+        IROperand s = tcc_ir_op_get_src1(ir, uq);
+        if (irop_get_vreg(s) == cands[i].phi->dest_vreg && !s.is_lval) {
+          tcc_ir_op_set_src1(ir, uq, new_op);
+          rewrote = 1;
+        }
+      }
+      if (irop_config[uq->op].has_src2) {
+        IROperand s = tcc_ir_op_get_src2(ir, uq);
+        if (irop_get_vreg(s) == cands[i].phi->dest_vreg && !s.is_lval) {
+          tcc_ir_op_set_src2(ir, uq, new_op);
+          rewrote = 1;
+        }
+      }
+      if (rewrote) {
+        old_vi->uses[u] = old_vi->uses[--old_vi->use_count];
+        if (new_vi)
+          ssa_opt_add_use_instr(new_vi, use.idx);
+      } else {
+        u++;
+      }
+    }
+  }
+
+  return num_cands;
+}
+
 int ssa_opt_dead_loop(IRSSAOptCtx *ctx)
 {
   TCCIRState *ir = ctx->ir;
@@ -521,12 +806,20 @@ int ssa_opt_dead_loop(IRSSAOptCtx *ctx)
       continue;
     if (loop_body_has_side_effects(ctx, loop))
       continue;
-    if (!loop_runs_at_least_once(ctx, loop))
+
+    LoopEntryInfo info;
+    if (!analyze_loop_entry(ctx, loop, &info))
       continue;
 
-    total += rewrite_loop_exit_phis(ctx, loop);
-    /* After rewriting, the body may have no live-out values. Try to delete it. */
-    total += try_kill_loop_body(ctx, loop);
+    if (info.proven_runs) {
+      total += rewrite_loop_exit_phis(ctx, loop);
+      total += try_kill_loop_body(ctx, loop);
+    } else {
+      /* Trip count not provable: emit a SELECT-based guard instead.  This
+       * variant rewrites and kills the body in one step (the SELECT replaces
+       * the phi value materialization, the JUMP replaces the back-edge). */
+      total += rewrite_loop_exit_phis_guarded(ctx, loop, &info);
+    }
   }
 
   tcc_ir_free_loops(loops);
