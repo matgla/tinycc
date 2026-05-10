@@ -125,6 +125,16 @@ int tcc_ir_opt_indexed_chain(struct TCCIRState *ir);
  * so LDRD/STRD-pairable ops become adjacent for the codegen peephole. */
 int tcc_ir_opt_indexed_pair_reorder(struct TCCIRState *ir);
 
+/* Call-chain result rename - rename `CALL → V; PARAMVAL[0] V` pairs to a
+ * fresh TEMP per pair so the regalloc can keep the value in r0 across
+ * the chain instead of moving it through a callee-saved reg each call. */
+int tcc_ir_opt_call_chain_rename(struct TCCIRState *ir);
+
+/* Stack-address ADD-operand CSE - hoist literal Addr[StackLoc[X]] operands
+ * appearing in ADDs with a vreg other operand into a single TEMP per
+ * unique offset, exposing SHL+ADD indexed-memory fusion. */
+int tcc_ir_opt_stackoff_addr_cse(struct TCCIRState *ir);
+
 /* LEA + deref fold - collapse `LEA Addr[StackLoc[-N]] + [ADD #K] + deref-use`
  * into a direct StackLoc access, eliminating the address-materialization op. */
 int tcc_ir_opt_lea_fold(struct TCCIRState *ir);

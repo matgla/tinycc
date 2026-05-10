@@ -111,6 +111,315 @@ static const char *ra_vreg_type_char(int type)
 }
 
 /* ============================================================================
+ * Post-Phi-Resolution Constant-Branch Folding
+ *
+ * Loop-rotation produces an entry guard like `i = 0; cmp i, N; jump if >=`.
+ * Pre-SSA the comparison is foldable (i is a constant), but SSA construction
+ * turns i into a phi destination which masks the constant. Phi resolution
+ * then materializes the entry-path constant assignment right before the cmp,
+ * so within that single basic block the cmp is foldable again — but no pass
+ * runs after phi resolution.
+ *
+ * When the guard is dead, the fall-through block contains only the phi-
+ * resolution copies for the carrier vregs (post-loopN values that flow
+ * into round N+1). Removing it shrinks every carrier's live range to a
+ * single short window between loop exit and the next round's entry,
+ * lifting register pressure dramatically in code like SHA's chained loops.
+ * ============================================================================ */
+
+static int ra_eval_cmp_cond(int64_t v1, int64_t v2, int tok)
+{
+  switch (tok) {
+  case 0x94: return v1 == v2;
+  case 0x95: return v1 != v2;
+  case 0x9c: return v1 < v2;
+  case 0x9d: return v1 >= v2;
+  case 0x9e: return v1 <= v2;
+  case 0x9f: return v1 > v2;
+  case 0x92: return (uint64_t)v1 < (uint64_t)v2;
+  case 0x93: return (uint64_t)v1 >= (uint64_t)v2;
+  case 0x96: return (uint64_t)v1 <= (uint64_t)v2;
+  case 0x97: return (uint64_t)v1 > (uint64_t)v2;
+  default: return -1;
+  }
+}
+
+/* Resolve `op` to a constant by walking back from `cmp_idx` within the same
+ * basic block. Returns 1 on success. The walk fails if any instruction in
+ * (def, cmp_idx] is a jump target (multiple predecessors mean the def doesn't
+ * dominate cmp_idx), if it crosses a control-flow op, hits a non-ASSIGN def,
+ * or reaches an ASSIGN whose source isn't an immediate. */
+static int ra_try_resolve_const_local(TCCIRState *ir, const uint8_t *is_target,
+                                      IROperand op, int cmp_idx, int64_t *out)
+{
+  if (irop_is_immediate(op)) {
+    *out = irop_get_imm64_ex(ir, op);
+    return 1;
+  }
+  if (op.tag != IROP_TAG_VREG || op.is_lval) return 0;
+  int32_t vr = irop_get_vreg(op);
+  if (vr < 0) return 0;
+
+  /* If cmp_idx itself is a join point, other paths can deliver a different
+   * value bypassing any local def. */
+  if (is_target && is_target[cmp_idx]) return 0;
+
+  for (int k = cmp_idx - 1; k >= 0; k--) {
+    IRQuadCompact *q = &ir->compact_instructions[k];
+    TccIrOp opc = q->op;
+    if (opc == TCCIR_OP_NOP) {
+      /* A NOP at a jump-target position would still mark a join; bail. */
+      if (is_target && is_target[k]) return 0;
+      continue;
+    }
+
+    /* Stop at any control-flow op: those end the basic block above. */
+    if (opc == TCCIR_OP_JUMP || opc == TCCIR_OP_JUMPIF ||
+        opc == TCCIR_OP_IJUMP || opc == TCCIR_OP_SWITCH_TABLE ||
+        opc == TCCIR_OP_RETURNVALUE || opc == TCCIR_OP_RETURNVOID)
+      return 0;
+
+    /* Skip stores: they don't define vregs, only memory. */
+    if (opc == TCCIR_OP_STORE || opc == TCCIR_OP_STORE_INDEXED ||
+        opc == TCCIR_OP_STORE_POSTINC) {
+      if (is_target && is_target[k]) return 0;
+      continue;
+    }
+
+    if (!irop_config[opc].has_dest) {
+      if (is_target && is_target[k]) return 0;
+      continue;
+    }
+    IROperand d = tcc_ir_op_get_dest(ir, q);
+    if (d.is_lval) {
+      if (is_target && is_target[k]) return 0;
+      continue;
+    }
+    int32_t dv = irop_get_vreg(d);
+    if (dv != vr) {
+      if (is_target && is_target[k]) return 0;
+      continue;
+    }
+
+    /* Found the def at line k. The def dominates cmp_idx only if no jump
+     * target exists in (k, cmp_idx] — but we already checked cmp_idx and
+     * every line in between via the bails above. */
+    if (opc != TCCIR_OP_ASSIGN) return 0;
+    IROperand s = tcc_ir_op_get_src1(ir, q);
+    if (!irop_is_immediate(s) || s.is_lval) return 0;
+    *out = irop_get_imm64_ex(ir, s);
+    return 1;
+  }
+  return 0;
+}
+
+/* NOP every instruction starting at `start_idx` until reaching one that is
+ * the target of any jump/branch elsewhere. Used to remove a now-unreachable
+ * fall-through block after folding a JUMPIF into an unconditional JUMP. */
+static int ra_nop_dead_block(TCCIRState *ir, const uint8_t *is_target, int start_idx)
+{
+  int n = ir->next_instruction_index;
+  int nopped = 0;
+  for (int i = start_idx; i < n; i++) {
+    if (is_target[i]) break;
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP) continue;
+    q->op = TCCIR_OP_NOP;
+    nopped++;
+  }
+  return nopped;
+}
+
+/* Build a bitmap of instructions that are the target of any jump. */
+static uint8_t *ra_build_jump_target_map(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  if (n <= 0) return NULL;
+  uint8_t *map = tcc_mallocz((size_t)n);
+  for (int i = 0; i < n; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF) {
+      int t = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+      if (t >= 0 && t < n) map[t] = 1;
+    } else if (q->op == TCCIR_OP_SWITCH_TABLE) {
+      IROperand s2 = tcc_ir_op_get_src2(ir, q);
+      int table_id = (int)irop_get_imm64_ex(ir, s2);
+      if (table_id >= 0 && table_id < ir->num_switch_tables) {
+        TCCIRSwitchTable *table = &ir->switch_tables[table_id];
+        for (int j = 0; j < table->num_entries; j++) {
+          int t = table->targets[j];
+          if (t >= 0 && t < n) map[t] = 1;
+        }
+        int dt = table->default_target;
+        if (dt >= 0 && dt < n) map[dt] = 1;
+      }
+    }
+  }
+  return map;
+}
+
+/* Try to fold CMP + JUMPIF where both CMP operands resolve to constants
+ * within the same basic block. Returns the number of branches folded. */
+static int ra_fold_const_branches(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  if (n <= 0) return 0;
+
+  uint8_t *is_target = ra_build_jump_target_map(ir);
+  if (!is_target) return 0;
+
+  int folds = 0;
+  for (int i = 0; i < n; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_JUMPIF) continue;
+
+    /* Find the most recent CMP that sets the flags JUMPIF reads. Walk back
+     * through ops that don't write flags; stop at any other flag-setter or
+     * at a basic block boundary. Phi resolution often inserts unrelated
+     * ASSIGN copies between the CMP and JUMPIF that we must skip past. */
+    int cmp_idx = -1;
+    for (int j = i - 1; j >= 0; j--) {
+      IRQuadCompact *pq = &ir->compact_instructions[j];
+      TccIrOp pop = pq->op;
+      if (pop == TCCIR_OP_NOP) continue;
+      if (pop == TCCIR_OP_CMP) { cmp_idx = j; break; }
+      /* Other flag-setting ops invalidate the CMP we'd want to read. */
+      if (pop == TCCIR_OP_TEST_ZERO || pop == TCCIR_OP_FCMP) break;
+      /* BB boundary. */
+      if (pop == TCCIR_OP_JUMP || pop == TCCIR_OP_JUMPIF ||
+          pop == TCCIR_OP_IJUMP || pop == TCCIR_OP_SWITCH_TABLE ||
+          pop == TCCIR_OP_RETURNVALUE || pop == TCCIR_OP_RETURNVOID)
+        break;
+      /* Other ops (ASSIGN, ADD, LOAD, STORE, ...) don't write flags. */
+    }
+    if (cmp_idx < 0) continue;
+
+    IRQuadCompact *cmp_q = &ir->compact_instructions[cmp_idx];
+    IROperand src1 = tcc_ir_op_get_src1(ir, cmp_q);
+    IROperand src2 = tcc_ir_op_get_src2(ir, cmp_q);
+
+    int64_t v1, v2;
+    if (!ra_try_resolve_const_local(ir, is_target, src1, cmp_idx, &v1)) continue;
+    if (!ra_try_resolve_const_local(ir, is_target, src2, cmp_idx, &v2)) continue;
+
+    /* Truncate to operand width to match comparison semantics. */
+    int cmp_btype = irop_get_btype(src1);
+    if (cmp_btype != IROP_BTYPE_INT64) {
+      v1 = (int64_t)(int32_t)(uint32_t)v1;
+      v2 = (int64_t)(int32_t)(uint32_t)v2;
+    }
+
+    IROperand cond = tcc_ir_op_get_src1(ir, q);
+    int tok = (int)irop_get_imm64_ex(ir, cond);
+    int result = ra_eval_cmp_cond(v1, v2, tok);
+    if (result < 0) continue;
+
+    if (result) {
+      /* Always taken: convert JUMPIF into unconditional JUMP. */
+      IROperand target = tcc_ir_op_get_dest(ir, q);
+      cmp_q->op = TCCIR_OP_NOP;
+      q->op = TCCIR_OP_JUMP;
+      tcc_ir_set_dest(ir, i, target);
+      tcc_ir_set_src1(ir, i, IROP_NONE);
+      /* Fall-through is now unreachable up to the next jump target. */
+      ra_nop_dead_block(ir, is_target, i + 1);
+    } else {
+      /* Never taken: drop both CMP and JUMPIF. */
+      cmp_q->op = TCCIR_OP_NOP;
+      q->op = TCCIR_OP_NOP;
+    }
+    folds++;
+  }
+
+  tcc_free(is_target);
+  return folds;
+}
+
+/* DISABLED — too aggressive for current heuristic.
+ *
+ * Eliminate ASSIGN copies whose destination is overwritten before any read.
+ * Phi resolution emits a copy per CFG edge for every phi; when an earlier
+ * pass folded an edge away, its copies survive as dead stores. Naive linear
+ * walk of "no use before redef" is unsound: a jump TO line i (post-i target)
+ * can land between i and the redef without going through i's def, so on that
+ * path the redef supplies V's value but i was bypassed entirely. Need a
+ * proper post-dominance check before re-enabling.
+ *
+ * Kept here so the diagnosis isn't lost. */
+__attribute__((unused))
+static int ra_dead_assign_elim(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  if (n <= 1) return 0;
+
+  int killed = 0;
+  for (int i = 0; i < n - 1; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_ASSIGN) continue;
+
+    IROperand d = tcc_ir_op_get_dest(ir, q);
+    if (d.is_lval) continue;
+    int32_t dv = irop_get_vreg(d);
+    if (dv < 0) continue;
+
+    int redef_idx = -1;
+    int max_fwd_target = i;
+    int aborted = 0;
+
+    for (int k = i + 1; k < n; k++) {
+      IRQuadCompact *qk = &ir->compact_instructions[k];
+      TccIrOp opk = qk->op;
+      if (opk == TCCIR_OP_NOP) continue;
+
+      if (opk == TCCIR_OP_IJUMP || opk == TCCIR_OP_SWITCH_TABLE ||
+          opk == TCCIR_OP_RETURNVALUE || opk == TCCIR_OP_RETURNVOID) {
+        aborted = 1;
+        break;
+      }
+
+      if (irop_config[opk].has_src1) {
+        IROperand s = tcc_ir_op_get_src1(ir, qk);
+        if (!s.is_lval && irop_get_vreg(s) == dv) { aborted = 1; break; }
+      }
+      if (irop_config[opk].has_src2) {
+        IROperand s = tcc_ir_op_get_src2(ir, qk);
+        if (!s.is_lval && irop_get_vreg(s) == dv) { aborted = 1; break; }
+      }
+      if (opk == TCCIR_OP_MLA) {
+        IROperand s = tcc_ir_op_get_accum(ir, qk);
+        if (!s.is_lval && irop_get_vreg(s) == dv) { aborted = 1; break; }
+      }
+      if (irop_config[opk].has_dest) {
+        IROperand dk = tcc_ir_op_get_dest(ir, qk);
+        if (dk.is_lval) {
+          if (irop_get_vreg(dk) == dv) { aborted = 1; break; }
+        } else if (irop_get_vreg(dk) == dv) {
+          if (opk == TCCIR_OP_ASSIGN) {
+            redef_idx = k;
+            break;
+          }
+          aborted = 1;
+          break;
+        }
+      }
+
+      if (opk == TCCIR_OP_JUMP || opk == TCCIR_OP_JUMPIF) {
+        int target = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, qk));
+        if (target > max_fwd_target) max_fwd_target = target;
+      }
+    }
+
+    if (aborted || redef_idx < 0) continue;
+    /* A forward jump targeting beyond the redef would skip it on some path. */
+    if (max_fwd_target > redef_idx) continue;
+
+    q->op = TCCIR_OP_NOP;
+    killed++;
+  }
+  return killed;
+}
+
+/* ============================================================================
  * SSA Live Interval Building
  * ============================================================================ */
 
@@ -843,7 +1152,17 @@ static void ra_linear_scan(SSAInterval *intervals, int count,
      * share a phi edge with (now resolved into an explicit ASSIGN copy).
      * If the partner has expired and freed its register, taking that
      * same register here turns the explicit copy into mov rX, rX which
-     * the post-RA move-coalescing pass erases. */
+     * the post-RA move-coalescing pass erases.
+     *
+     * Boundary case: when partner->end == cur->start, the standard `<`
+     * expiration kept partner active, so its register looks busy here.
+     * But within a single ARM 3-operand instruction (or ASSIGN/`mov`),
+     * sources are read before the dest is written — so the same register
+     * can serve both. Allow the hint to take that register and force
+     * partner out of the active set so subsequent allocations see it as
+     * free. Restricted to single-register INT to avoid corrupting register
+     * pairs (umull, ll-shift, etc.) where the architecture forbids dest/
+     * source overlap. */
     if (cur->hint_vreg >= 0 && max_vreg_pos > 0) {
       int hint_idx = HINT_IDX(cur->hint_vreg);
       if (hint_idx >= 0 && hint_idx < hint_tbl_size) {
@@ -851,7 +1170,11 @@ static void ra_linear_scan(SSAInterval *intervals, int count,
         if (partner && partner->r0 >= 0 && partner->r1 < 0 &&
             partner->stack_location == 0) {
           int hr = partner->r0;
-          if ((int_free & (1ull << hr)) &&
+          int hr_free = (int_free & (1ull << hr)) != 0;
+          int boundary = !hr_free && partner->end == cur->start &&
+                         cur->reg_type == LS_REG_TYPE_INT &&
+                         partner->reg_type == LS_REG_TYPE_INT;
+          if ((hr_free || boundary) &&
               hr < tcc_state->registers_for_allocator) {
             int ok = 1;
             if (cur->crosses_call) {
@@ -860,7 +1183,20 @@ static void ra_linear_scan(SSAInterval *intervals, int count,
                 if (target->int_class.callee_saved[ci] == hr) { ok = 1; break; }
               }
             }
-            if (ok) reg = hr;
+            if (ok) {
+              reg = hr;
+              if (boundary) {
+                /* Force partner out of active so its register doesn't
+                 * appear taken to subsequent intervals. */
+                for (int k = 0; k < active_count; k++) {
+                  if (active[k] == partner) {
+                    int_free |= (1ull << hr);
+                    active[k] = active[--active_count];
+                    break;
+                  }
+                }
+              }
+            }
           }
         }
       }
@@ -1915,6 +2251,13 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
   ra_phi_resolve_pre_ra_mode = 1;
   ra_resolve_phis(ir, cfg, ssa);
   ra_phi_resolve_pre_ra_mode = 0;
+
+  /* Fold CMP + JUMPIF where both operands resolve to constants within the
+   * same basic block. Phi resolution often materializes the entry-path
+   * constant of a loop counter right before its bound check; folding the
+   * dead skip-loop block removes the carrier-vreg copies it contains and
+   * cuts the carriers' live ranges, easing register pressure. */
+  ra_fold_const_branches(ir);
 
   /* Build call prefix for call-crossing detection */
   int *call_prefix = ra_build_call_prefix(ir);

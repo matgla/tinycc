@@ -41,6 +41,74 @@ static int eval_cond(int64_t v1, int64_t v2, int tok)
   }
 }
 
+/* Drop phi operands that flow from `dead_pred_block` to phis at
+ * `target_block_idx`. Used after folding a JUMPIF: the dead edge no longer
+ * exists, so phi resolution should not emit copies for it. */
+static void ssa_drop_phi_edge(IRSSAOptCtx *ctx, int dead_pred_block,
+                              int target_block_idx)
+{
+  if (!ctx->ssa || !ctx->ssa->block_phis || !ctx->cfg) return;
+  if (target_block_idx < 0 || target_block_idx >= ctx->cfg->num_blocks) return;
+
+  for (IRPhiNode *phi = ctx->ssa->block_phis[target_block_idx]; phi; phi = phi->next) {
+    /* Find every operand from dead_pred_block. Each removal shifts
+     * remaining operands down, which means the vinfo `slot` field for those
+     * operands must also be decremented to match. Process from low index
+     * upward and recompute the loop bound after each removal. */
+    int r = 0;
+    while (r < phi->num_operands) {
+      if (phi->operands[r].pred_block != dead_pred_block) {
+        r++;
+        continue;
+      }
+
+      /* Remove this operand's SSA_USE_PHI entry from its vreg's vinfo. */
+      int32_t dropped_vr = phi->operands[r].vreg;
+      if (dropped_vr >= 0) {
+        IRSSAVregInfo *dvi = ssa_opt_vinfo(ctx, dropped_vr);
+        if (dvi) {
+          for (int u = 0; u < dvi->use_count; u++) {
+            if (dvi->uses[u].kind == SSA_USE_PHI &&
+                dvi->uses[u].idx == target_block_idx &&
+                dvi->uses[u].slot == r) {
+              dvi->uses[u] = dvi->uses[--dvi->use_count];
+              break;
+            }
+          }
+        }
+      }
+
+      /* Shift remaining operands down by one and decrement their vinfo
+       * slots so SSA_USE_PHI entries keep pointing to the right operand. */
+      for (int s = r + 1; s < phi->num_operands; s++) {
+        phi->operands[s - 1] = phi->operands[s];
+        int32_t v = phi->operands[s - 1].vreg;
+        if (v < 0) continue;
+        IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, v);
+        if (!vi) continue;
+        for (int u = 0; u < vi->use_count; u++) {
+          if (vi->uses[u].kind == SSA_USE_PHI &&
+              vi->uses[u].idx == target_block_idx &&
+              vi->uses[u].slot == s) {
+            vi->uses[u].slot = s - 1;
+            break;
+          }
+        }
+      }
+      phi->num_operands--;
+      /* Don't advance r: the operand we just removed has been replaced by
+       * what was at r+1, which we still need to inspect. */
+    }
+  }
+}
+
+static int ssa_block_for_instr(IRCFG *cfg, int instr_idx)
+{
+  if (!cfg || !cfg->instr_to_block) return -1;
+  if (instr_idx < 0) return -1;
+  return cfg->instr_to_block[instr_idx];
+}
+
 static int ssa_fold_cmp_jumpif(IRSSAOptCtx *ctx, int cmp_idx)
 {
   TCCIRState *ir = ctx->ir;
@@ -160,14 +228,28 @@ static int ssa_fold_cmp_jumpif(IRSSAOptCtx *ctx, int cmp_idx)
     vi = ssa_opt_vinfo(ctx, irop_get_vreg(src2));
     if (vi) ssa_opt_remove_use_instr(vi, cmp_idx);
 
+    /* Identify the dead edge so we can prune corresponding phi operands.
+     * Without this, phi resolution still emits copies for that edge, which
+     * surface as dead writes to spilled carrier vregs. */
+    int jumpif_block = ssa_block_for_instr(ctx->cfg, j);
+    int target_idx = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, next_q));
+    int target_block = ssa_block_for_instr(ctx->cfg, target_idx);
+    int fallthru_block = ssa_block_for_instr(ctx->cfg, j + 1);
+
     if (result) {
       IROperand dest = tcc_ir_op_get_dest(ir, next_q);
       cmp_q->op = TCCIR_OP_NOP;
       next_q->op = TCCIR_OP_JUMP;
       tcc_ir_set_dest(ir, j, dest);
+      /* Fall-through edge dies. */
+      if (jumpif_block >= 0 && fallthru_block >= 0 && fallthru_block != target_block)
+        ssa_drop_phi_edge(ctx, jumpif_block, fallthru_block);
     } else {
       cmp_q->op = TCCIR_OP_NOP;
       next_q->op = TCCIR_OP_NOP;
+      /* Target edge dies; fall-through is the surviving path. */
+      if (jumpif_block >= 0 && target_block >= 0 && target_block != fallthru_block)
+        ssa_drop_phi_edge(ctx, jumpif_block, target_block);
     }
     return 1;
   }

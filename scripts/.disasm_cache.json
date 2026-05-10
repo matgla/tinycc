@@ -4,10 +4,40 @@
     "tcc": 5,
     "updated": "2026-05-02T15:28:07.765499+00:00"
   },
+  "50_simple_struct::main": {
+    "gcc": 9,
+    "tcc": 9,
+    "updated": "2026-05-10T09:41:17.940821+00:00"
+  },
+  "98_value_tracking::main": {
+    "gcc": 13,
+    "tcc": 49,
+    "updated": "2026-05-10T09:41:43.283815+00:00"
+  },
+  "98_value_tracking::test_chained_arithmetic": {
+    "gcc": 2,
+    "tcc": 2,
+    "updated": "2026-05-10T09:41:43.283826+00:00"
+  },
+  "98_value_tracking::test_conditionals_pattern": {
+    "gcc": 5,
+    "tcc": 24,
+    "updated": "2026-05-10T09:41:43.283829+00:00"
+  },
+  "98_value_tracking::test_value_track_add": {
+    "gcc": 2,
+    "tcc": 2,
+    "updated": "2026-05-10T09:41:43.283831+00:00"
+  },
+  "98_value_tracking::test_value_track_sub": {
+    "gcc": 2,
+    "tcc": 2,
+    "updated": "2026-05-10T09:41:43.283833+00:00"
+  },
   "bench_function_calls::bench_function_calls": {
     "gcc": 8,
-    "tcc": 25,
-    "updated": "2026-05-09T17:29:01.039424+00:00"
+    "tcc": 21,
+    "updated": "2026-05-09T17:52:13.033232+00:00"
   },
   "bench_function_calls::func_a": {
     "gcc": 3,
@@ -191,8 +221,8 @@
   },
   "ir/170_nan_comparison::main": {
     "gcc": 294,
-    "tcc": 258,
-    "updated": "2026-05-04T20:33:30.939926+00:00"
+    "tcc": 283,
+    "updated": "2026-05-10T09:18:30.111580+00:00"
   },
   "ir/171_strlen_constfold::main": {
     "gcc": 51,
@@ -366,8 +396,8 @@
   },
   "ir/94_copy_propagation::Move": {
     "gcc": 20,
-    "tcc": 17,
-    "updated": "2026-05-09T17:35:48.125861+00:00"
+    "tcc": 16,
+    "updated": "2026-05-10T09:18:30.111455+00:00"
   },
   "ir/94_copy_propagation::main": {
     "gcc": 28,
@@ -526,8 +556,8 @@
   },
   "ir/bench_bubble_sort::bench_bubble_sort": {
     "gcc": 31,
-    "tcc": 82,
-    "updated": "2026-05-02T08:48:22.345167+00:00"
+    "tcc": 75,
+    "updated": "2026-05-10T09:18:30.111609+00:00"
   },
   "ir/bench_bubble_sort::main": {
     "gcc": 7,
@@ -786,8 +816,8 @@
   },
   "ir/bug_ll_shift_ptr_clobber::main": {
     "gcc": 235,
-    "tcc": 336,
-    "updated": "2026-05-09T17:35:48.126008+00:00"
+    "tcc": 335,
+    "updated": "2026-05-10T09:18:30.111574+00:00"
   },
   "ir/bug_llong_const::main": {
     "gcc": 11,
@@ -816,8 +846,8 @@
   },
   "ir/bug_partition::partition": {
     "gcc": 21,
-    "tcc": 52,
-    "updated": "2026-05-09T17:35:48.125781+00:00"
+    "tcc": 50,
+    "updated": "2026-05-10T09:18:30.111420+00:00"
   },
   "ir/bug_partition::swap": {
     "gcc": 6,
@@ -846,8 +876,8 @@
   },
   "ir/bug_struct_field_postinc::main": {
     "gcc": 33,
-    "tcc": 65,
-    "updated": "2026-05-02T08:48:22.345010+00:00"
+    "tcc": 63,
+    "updated": "2026-05-10T09:41:26.060511+00:00"
   },
   "ir/bug_struct_member_cmp_fold::main": {
     "gcc": 107,
@@ -896,8 +926,8 @@
   },
   "ir/mibench_bitcount::bench_mibench_bitcount": {
     "gcc": 54,
-    "tcc": 35,
-    "updated": "2026-05-09T17:35:48.126066+00:00"
+    "tcc": 33,
+    "updated": "2026-05-10T09:18:30.111633+00:00"
   },
   "ir/mibench_bitcount::main": {
     "gcc": 7,
@@ -906,8 +936,8 @@
   },
   "ir/mibench_crc32::bench_mibench_crc32": {
     "gcc": 49,
-    "tcc": 54,
-    "updated": "2026-05-02T08:48:22.345255+00:00"
+    "tcc": 52,
+    "updated": "2026-05-10T09:18:30.111637+00:00"
   },
   "ir/mibench_crc32::main": {
     "gcc": 7,
@@ -916,8 +946,8 @@
   },
   "ir/mibench_dijkstra::bench_mibench_dijkstra": {
     "gcc": 163,
-    "tcc": 31,
-    "updated": "2026-05-06T21:00:51.161468+00:00"
+    "tcc": 28,
+    "updated": "2026-05-10T09:18:30.111644+00:00"
   },
   "ir/mibench_dijkstra::main": {
     "gcc": 7,
@@ -946,13 +976,13 @@
   },
   "ir/mibench_rijndael::decrypt": {
     "gcc": 981,
-    "tcc": 1275,
-    "updated": "2026-05-09T17:35:48.126111+00:00"
+    "tcc": 1274,
+    "updated": "2026-05-10T09:18:30.111672+00:00"
   },
   "ir/mibench_rijndael::encrypt": {
     "gcc": 987,
-    "tcc": 1271,
-    "updated": "2026-05-09T17:35:48.126113+00:00"
+    "tcc": 1270,
+    "updated": "2026-05-10T09:18:30.111674+00:00"
   },
   "ir/mibench_rijndael::main": {
     "gcc": 7,
@@ -961,8 +991,8 @@
   },
   "ir/mibench_rijndael::set_key": {
     "gcc": 281,
-    "tcc": 537,
-    "updated": "2026-05-09T17:35:48.126116+00:00"
+    "tcc": 536,
+    "updated": "2026-05-10T09:18:30.111677+00:00"
   },
   "ir/mibench_sha::bench_mibench_sha": {
     "gcc": 69,
@@ -996,8 +1026,8 @@
   },
   "ir/mibench_sha::sha_transform": {
     "gcc": 147,
-    "tcc": 234,
-    "updated": "2026-05-02T08:48:22.345309+00:00"
+    "tcc": 183,
+    "updated": "2026-05-10T09:18:30.111661+00:00"
   },
   "ir/mibench_sha::sha_update": {
     "gcc": 38,
@@ -1006,8 +1036,8 @@
   },
   "ir/mibench_stringsearch::bench_mibench_stringsearch": {
     "gcc": 98,
-    "tcc": 68,
-    "updated": "2026-05-09T17:35:48.126071+00:00"
+    "tcc": 65,
+    "updated": "2026-05-10T09:18:30.111640+00:00"
   },
   "ir/mibench_stringsearch::main": {
     "gcc": 7,
@@ -1191,8 +1221,8 @@
   },
   "ir/test_fp_offset_cache::test_loop_access": {
     "gcc": 27,
-    "tcc": 61,
-    "updated": "2026-05-02T08:48:22.344902+00:00"
+    "tcc": 59,
+    "updated": "2026-05-10T09:18:30.111480+00:00"
   },
   "ir/test_fp_offset_cache::test_mixed_access": {
     "gcc": 4,
@@ -1206,8 +1236,8 @@
   },
   "ir/test_fp_offset_cache::test_swap_pattern": {
     "gcc": 26,
-    "tcc": 51,
-    "updated": "2026-05-02T08:48:22.344907+00:00"
+    "tcc": 47,
+    "updated": "2026-05-10T09:18:30.111483+00:00"
   },
   "ir/test_ge_operator::main": {
     "gcc": 72,
@@ -1311,8 +1341,8 @@
   },
   "ir/test_mibench_sha::main": {
     "gcc": 55,
-    "tcc": 65,
-    "updated": "2026-05-02T08:48:22.345075+00:00"
+    "tcc": 64,
+    "updated": "2026-05-10T09:18:30.111565+00:00"
   },
   "ir/test_mibench_sha::sha_final": {
     "gcc": 55,
@@ -1326,8 +1356,8 @@
   },
   "ir/test_mibench_sha::sha_transform": {
     "gcc": 147,
-    "tcc": 234,
-    "updated": "2026-05-02T08:48:22.345081+00:00"
+    "tcc": 183,
+    "updated": "2026-05-10T09:18:30.111568+00:00"
   },
   "ir/test_mibench_sha::sha_update": {
     "gcc": 56,
@@ -1336,8 +1366,8 @@
   },
   "ir/test_mla_fusion::main": {
     "gcc": 21,
-    "tcc": 47,
-    "updated": "2026-05-02T08:48:22.344885+00:00"
+    "tcc": 44,
+    "updated": "2026-05-10T09:18:30.111492+00:00"
   },
   "ir/test_mla_fusion::mla_complex": {
     "gcc": 4,
@@ -1376,8 +1406,8 @@
   },
   "ir/test_mul32wide_outparams::mul32wide_u32": {
     "gcc": 20,
-    "tcc": 23,
-    "updated": "2026-05-09T17:35:48.125951+00:00"
+    "tcc": 22,
+    "updated": "2026-05-10T09:18:30.111526+00:00"
   },
   "ir/test_mul64wide_compare::check_one": {
     "gcc": 47,
@@ -1391,8 +1421,8 @@
   },
   "ir/test_mul64wide_compare::mul32wide_u32": {
     "gcc": 20,
-    "tcc": 23,
-    "updated": "2026-05-09T17:35:48.125946+00:00"
+    "tcc": 22,
+    "updated": "2026-05-10T09:18:30.111530+00:00"
   },
   "ir/test_mul64wide_compare::mul64wide_orig": {
     "gcc": 62,
@@ -1416,8 +1446,8 @@
   },
   "ir/test_offset_addressing::main": {
     "gcc": 27,
-    "tcc": 51,
-    "updated": "2026-05-02T14:52:06.756746+00:00"
+    "tcc": 50,
+    "updated": "2026-05-10T09:18:30.111499+00:00"
   },
   "ir/test_offset_addressing::store_array_element": {
     "gcc": 3,
@@ -1436,8 +1466,8 @@
   },
   "ir/test_sha_transform::main": {
     "gcc": 152,
-    "tcc": 57,
-    "updated": "2026-05-09T17:35:48.125978+00:00"
+    "tcc": 45,
+    "updated": "2026-05-10T09:41:26.060579+00:00"
   },
   "ir/test_struct_pass_by_value::main": {
     "gcc": 7,
@@ -1501,8 +1531,8 @@
   },
   "mibench_sha::bench_mibench_sha": {
     "gcc": 70,
-    "tcc": 71,
-    "updated": "2026-05-08T17:56:07.174691+00:00"
+    "tcc": 59,
+    "updated": "2026-05-09T21:39:34.782319+00:00"
   },
   "mibench_sha::main": {
     "gcc": 7,
@@ -1511,18 +1541,18 @@
   },
   "mibench_sha::sha_final": {
     "gcc": 31,
-    "tcc": 49,
-    "updated": "2026-05-09T15:48:04.353353+00:00"
+    "tcc": 47,
+    "updated": "2026-05-09T17:52:05.419953+00:00"
   },
   "mibench_sha::sha_init": {
     "gcc": 13,
-    "tcc": 16,
-    "updated": "2026-05-09T15:48:04.353423+00:00"
+    "tcc": 15,
+    "updated": "2026-05-09T17:52:05.419999+00:00"
   },
   "mibench_sha::sha_print": {
     "gcc": 11,
-    "tcc": 16,
-    "updated": "2026-05-09T15:48:04.353428+00:00"
+    "tcc": 14,
+    "updated": "2026-05-09T17:52:05.420004+00:00"
   },
   "mibench_sha::sha_stream": {
     "gcc": 31,
@@ -1531,8 +1561,8 @@
   },
   "mibench_sha::sha_transform": {
     "gcc": 150,
-    "tcc": 287,
-    "updated": "2026-05-09T15:48:04.353431+00:00"
+    "tcc": 178,
+    "updated": "2026-05-09T21:39:34.782351+00:00"
   },
   "mibench_sha::sha_update": {
     "gcc": 47,
@@ -1576,8 +1606,8 @@
   },
   "pic-tds/bug_mask_copy_noloop::main": {
     "gcc": 47,
-    "tcc": 47,
-    "updated": "2026-05-09T17:35:48.126107+00:00"
+    "tcc": 45,
+    "updated": "2026-05-10T09:18:30.111654+00:00"
   },
   "pic-tds/bug_struct_mask_copy::adjust_sp": {
     "gcc": 1,
@@ -1611,8 +1641,8 @@
   },
   "pic-tds/bug_struct_mask_copy::gen_call_op": {
     "gcc": 93,
-    "tcc": 197,
-    "updated": "2026-05-02T08:48:22.345324+00:00"
+    "tcc": 190,
+    "updated": "2026-05-10T09:41:26.060682+00:00"
   },
   "pic-tds/bug_struct_mask_copy::get_site": {
     "gcc": 7,

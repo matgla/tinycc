@@ -8945,6 +8945,23 @@ static int gsym_cse_insert_before(TCCIRState *ir, int before_idx, IRQuadCompact 
         tcc_ir_op_set_dest(ir, q, irop_make_imm32(-1, target + 1, IROP_BTYPE_INT32));
     }
   }
+  /* Patch switch-table targets too — SWITCH_TABLE op stores its case targets
+   * in a separate side table that is independent of the IR array, so a plain
+   * shift+jump-patch pass would silently desynchronize them. */
+  for (int t = 0; t < ir->num_switch_tables; t++)
+  {
+    TCCIRSwitchTable *table = &ir->switch_tables[t];
+    if (table->default_target >= before_idx)
+      table->default_target += 1;
+    if (table->targets)
+    {
+      for (int j = 0; j < table->num_entries; j++)
+      {
+        if (table->targets[j] >= before_idx)
+          table->targets[j] += 1;
+      }
+    }
+  }
   return before_idx;
 }
 
@@ -14505,7 +14522,12 @@ int tcc_ir_opt_fusion_pass(TCCIRState *ir, int do_mla, int do_indexed)
     IROperand index_op = tcc_ir_op_get_src1(ir, shl_q);
     if (index_op.is_local || index_op.is_llocal)
       continue;
-    if (base_op.is_local || base_op.is_llocal || base_op.is_lval)
+    /* base.is_lval = pointer loaded from memory; base.is_llocal = "long
+     * local" (struct address that needs an LEA chain).  Both bypass the
+     * straightforward base-reg interpretation.  But base.is_local (a plain
+     * stack address) is fine — the codegen's mach_ensure_in_reg will
+     * materialize it into a scratch reg before using as the LDR/STR base. */
+    if (base_op.is_llocal || base_op.is_lval)
       continue;
 
     /* Same-block check */
@@ -14715,90 +14737,104 @@ void tcc_ir_barrel_shift_fusion(TCCIRState *ir)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
 
+    int commutative = 0;
     switch (q->op)
     {
-    case TCCIR_OP_ADD: case TCCIR_OP_SUB:
-    case TCCIR_OP_AND: case TCCIR_OP_OR: case TCCIR_OP_XOR:
-    case TCCIR_OP_CMP:
+    case TCCIR_OP_ADD: case TCCIR_OP_AND: case TCCIR_OP_OR: case TCCIR_OP_XOR:
+      commutative = 1;
+      break;
+    case TCCIR_OP_SUB: case TCCIR_OP_CMP:
       break;
     default:
       continue;
     }
 
-    IROperand src2 = tcc_ir_op_get_src2(ir, q);
-    if (!irop_has_vreg(src2))
-      continue;
-
-    int32_t vr2 = irop_get_vreg(src2);
-    int shift_idx = ir_opt_du_def(&du, vr2, i);
-    if (shift_idx < 0)
-      continue;
-
-    IRQuadCompact *sq = &ir->compact_instructions[shift_idx];
-    int stype;
-    switch (sq->op) {
-    case TCCIR_OP_SHL:
-      if (q->op == TCCIR_OP_ADD) continue;
-      stype = 1; break;
-    case TCCIR_OP_SHR: stype = 2; break;
-    case TCCIR_OP_SAR: stype = 3; break;
-    case TCCIR_OP_ROR: stype = 4; break;
-    default: continue;
-    }
-
-    if (ir_opt_du_uses(&du, vr2) != 1)
-      continue;
-
-    IROperand shift_dest = tcc_ir_op_get_dest(ir, sq);
-    if (shift_dest.btype == IROP_BTYPE_INT64)
-      continue;
-
-    IROperand consumer_dest = tcc_ir_op_get_dest(ir, q);
-    if (consumer_dest.btype == IROP_BTYPE_INT64)
-      continue;
-    if (src2.btype == IROP_BTYPE_INT64)
-      continue;
-
-    IROperand shift_src2 = tcc_ir_op_get_src2(ir, sq);
-    if (!irop_is_immediate(shift_src2))
-      continue;
-
-    int64_t amount = irop_get_imm64_ex(ir, shift_src2);
-    if (amount < 0 || amount > 31)
-      continue;
-
-    IROperand shift_src1 = tcc_ir_op_get_src1(ir, sq);
-    if (!irop_has_vreg(shift_src1))
-      continue;
-
-    int32_t shift_src_vr = irop_get_vreg(shift_src1);
-
-    IROperand alu_src1 = tcc_ir_op_get_src1(ir, q);
-    if (irop_has_vreg(alu_src1) && irop_get_vreg(alu_src1) == shift_src_vr)
-      continue;
-
-    int safe = 1;
-    for (int j = shift_idx + 1; j < i && safe; j++)
-    {
-      IRQuadCompact *jq = &ir->compact_instructions[j];
-      TccIrOp bop = jq->op;
-      if (bop == TCCIR_OP_JUMP || bop == TCCIR_OP_JUMPIF)
-        safe = 0;
-      if (bop == TCCIR_OP_NOP)
+    /* Try fusing on src2 first; for commutative ops, also try src1 (swapping
+     * operands so the shift lands on src2 where the backend expects it). */
+    for (int attempt = 0; attempt < (commutative ? 2 : 1); attempt++) {
+      IROperand src2 = (attempt == 0) ? tcc_ir_op_get_src2(ir, q)
+                                      : tcc_ir_op_get_src1(ir, q);
+      if (!irop_has_vreg(src2))
         continue;
-      if (irop_config[bop].has_dest)
-      {
-        IROperand jdest = tcc_ir_op_get_dest(ir, jq);
-        if (irop_has_vreg(jdest) && irop_get_vreg(jdest) == shift_src_vr)
-          safe = 0;
-      }
-    }
-    if (!safe)
-      continue;
 
-    tcc_ir_set_src2(ir, i, shift_src1);
-    ir->barrel_shifts[q->orig_index] = (uint8_t)((stype << 5) | (int)amount);
-    sq->op = TCCIR_OP_NOP;
+      int32_t vr2 = irop_get_vreg(src2);
+      int shift_idx = ir_opt_du_def(&du, vr2, i);
+      if (shift_idx < 0)
+        continue;
+
+      IRQuadCompact *sq = &ir->compact_instructions[shift_idx];
+      int stype;
+      switch (sq->op) {
+      case TCCIR_OP_SHL:
+        if (q->op == TCCIR_OP_ADD) continue;
+        stype = 1; break;
+      case TCCIR_OP_SHR: stype = 2; break;
+      case TCCIR_OP_SAR: stype = 3; break;
+      case TCCIR_OP_ROR: stype = 4; break;
+      default: continue;
+      }
+
+      if (ir_opt_du_uses(&du, vr2) != 1)
+        continue;
+
+      IROperand shift_dest = tcc_ir_op_get_dest(ir, sq);
+      if (shift_dest.btype == IROP_BTYPE_INT64)
+        continue;
+
+      IROperand consumer_dest = tcc_ir_op_get_dest(ir, q);
+      if (consumer_dest.btype == IROP_BTYPE_INT64)
+        continue;
+      if (src2.btype == IROP_BTYPE_INT64)
+        continue;
+
+      IROperand shift_src2 = tcc_ir_op_get_src2(ir, sq);
+      if (!irop_is_immediate(shift_src2))
+        continue;
+
+      int64_t amount = irop_get_imm64_ex(ir, shift_src2);
+      if (amount < 0 || amount > 31)
+        continue;
+
+      IROperand shift_src1 = tcc_ir_op_get_src1(ir, sq);
+      if (!irop_has_vreg(shift_src1))
+        continue;
+
+      int32_t shift_src_vr = irop_get_vreg(shift_src1);
+
+      IROperand other = (attempt == 0) ? tcc_ir_op_get_src1(ir, q)
+                                        : tcc_ir_op_get_src2(ir, q);
+      if (irop_has_vreg(other) && irop_get_vreg(other) == shift_src_vr)
+        continue;
+
+      int safe = 1;
+      for (int j = shift_idx + 1; j < i && safe; j++)
+      {
+        IRQuadCompact *jq = &ir->compact_instructions[j];
+        TccIrOp bop = jq->op;
+        if (bop == TCCIR_OP_JUMP || bop == TCCIR_OP_JUMPIF)
+          safe = 0;
+        if (bop == TCCIR_OP_NOP)
+          continue;
+        if (irop_config[bop].has_dest)
+        {
+          IROperand jdest = tcc_ir_op_get_dest(ir, jq);
+          if (irop_has_vreg(jdest) && irop_get_vreg(jdest) == shift_src_vr)
+            safe = 0;
+        }
+      }
+      if (!safe)
+        continue;
+
+      /* For the swap path: rewrite src1 to the non-shift operand so the
+       * backend sees `op dest, other, shifted`. The shift's source vreg
+       * goes into src2 in both paths. */
+      if (attempt == 1)
+        tcc_ir_set_src1(ir, i, other);
+      tcc_ir_set_src2(ir, i, shift_src1);
+      ir->barrel_shifts[q->orig_index] = (uint8_t)((stype << 5) | (int)amount);
+      sq->op = TCCIR_OP_NOP;
+      break;
+    }
   }
 
   tcc_free(du.def);
@@ -14940,7 +14976,9 @@ int tcc_ir_opt_deref_indexed_fusion(TCCIRState *ir)
       IROperand index_op = tcc_ir_op_get_src1(ir, shl_q);
       if (index_op.is_local || index_op.is_llocal)
         continue;
-      if (base_op.is_local || base_op.is_llocal || base_op.is_lval)
+      /* Allow is_local base (stack address): the codegen materializes it
+       * via mach_ensure_in_reg.  Same as the LOAD/STORE fusion above. */
+      if (base_op.is_llocal || base_op.is_lval)
         continue;
 
       /* Same-block check: SHL through ALU instruction */
@@ -15609,6 +15647,315 @@ int tcc_ir_opt_indexed_pair_reorder(TCCIRState *ir)
 }
 
 /* ============================================================================
+ * Call-chain result rename
+ * ============================================================================
+ *
+ * Pattern:
+ *   CALL_i  --> V              (V is a VAR/TEMP receiving the call result)
+ *   FUNCPARAMVAL[0] V           (V immediately consumed as next call's arg 0)
+ *   CALL_(i+1) --> V            (overwrites V)
+ *
+ * The regalloc currently keeps V in a callee-saved register because V's
+ * lifetime spans multiple CALL instructions, even though each segment of
+ * V's value is short-lived (def at one CALL, single use at the next call's
+ * PARAMVAL[0], then redefined).  The result is a `mov V_reg, r0` after
+ * each call and `mov r0, V_reg` before each PARAMVAL — both wasted, since
+ * the call's return is already in r0 and PARAMVAL[0] expects r0.
+ *
+ * Fix: for each (CALL → V; PARAMVAL[0] V; ... ; redef-of-V) segment where
+ * V is overwritten by the next CALL with no intervening read, rename V at
+ * just that one (CALL.dest, PARAMVAL.src1) pair to a fresh TEMP.  The
+ * fresh TEMP has a tiny live range that doesn't cross any CALL, so the
+ * regalloc can put it in r0 (the AAPCS return / arg0 reg), and the post-
+ * allocation move-coalescer eats both `mov`s.
+ *
+ * V's other defs/uses (in particular the LAST call in a chain whose
+ * result flows out via an external read like `return y`) are left alone,
+ * so V keeps the right value at the function's external-visible points.
+ */
+int tcc_ir_opt_call_chain_rename(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  int changes = 0;
+  if (n < 3)
+    return 0;
+
+  LOG_IR_GEN("=== CALL CHAIN RENAME START (n=%d) ===", n);
+
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_FUNCCALLVAL)
+      continue;
+
+    IROperand dest = tcc_ir_op_get_dest(ir, q);
+    int32_t v_vr = irop_get_vreg(dest);
+    if (v_vr < 0 || dest.is_lval)
+      continue;
+    int v_type = TCCIR_DECODE_VREG_TYPE(v_vr);
+    if (v_type != TCCIR_VREG_TYPE_VAR && v_type != TCCIR_VREG_TYPE_TEMP)
+      continue;
+
+    /* Next non-NOP must be FUNCPARAMVAL with src = V, param index 0. */
+    int j = i + 1;
+    while (j < n && ir->compact_instructions[j].op == TCCIR_OP_NOP)
+      j++;
+    if (j >= n)
+      continue;
+    IRQuadCompact *next_q = &ir->compact_instructions[j];
+    if (next_q->op != TCCIR_OP_FUNCPARAMVAL || next_q->is_jump_target)
+      continue;
+
+    IROperand pv_src = tcc_ir_op_get_src1(ir, next_q);
+    if (irop_get_vreg(pv_src) != v_vr)
+      continue;
+    /* PARAMVAL src may be is_lval=1 for VAR sources (semantically: load
+     * V's storage into the param reg).  After our rename, the value is
+     * already in T_anon as a register, so we'll emit the new src with
+     * is_lval=0.  V's btype/is_unsigned are preserved. */
+    IROperand pv_src2 = tcc_ir_op_get_src2(ir, next_q);
+    int param_idx = TCCIR_DECODE_PARAM_IDX(irop_get_imm64_ex(ir, pv_src2));
+    if (param_idx != 0)
+      continue;
+
+    /* Walk forward to verify V is overwritten before any subsequent read.
+     * Stop at JUMP/JUMPIF/RETURN — beyond a control-flow boundary the
+     * rename is unsafe (other paths might read V).  Also bail if any op
+     * reads V before the redef. */
+    int safe = 0;
+    int redef_idx = -1;
+    for (int k = j + 1; k < n; k++)
+    {
+      IRQuadCompact *kq = &ir->compact_instructions[k];
+      if (kq->op == TCCIR_OP_NOP)
+        continue;
+      if (kq->op == TCCIR_OP_JUMP || kq->op == TCCIR_OP_JUMPIF || kq->op == TCCIR_OP_IJUMP ||
+          kq->op == TCCIR_OP_RETURNVOID || kq->op == TCCIR_OP_RETURNVALUE || kq->op == TCCIR_OP_SWITCH_TABLE ||
+          kq->is_jump_target)
+        break;
+
+      /* Check if op reads V. */
+      int reads_v = 0;
+      if (irop_config[kq->op].has_src1)
+      {
+        IROperand s = tcc_ir_op_get_src1(ir, kq);
+        if (irop_get_vreg(s) == v_vr)
+          reads_v = 1;
+      }
+      if (!reads_v && irop_config[kq->op].has_src2)
+      {
+        IROperand s = tcc_ir_op_get_src2(ir, kq);
+        if (irop_get_vreg(s) == v_vr)
+          reads_v = 1;
+      }
+      /* STORE.dest is also a read of the address vreg, not a redef. */
+      if (!reads_v && (kq->op == TCCIR_OP_STORE || kq->op == TCCIR_OP_STORE_INDEXED ||
+                       kq->op == TCCIR_OP_STORE_POSTINC))
+      {
+        IROperand d = tcc_ir_op_get_dest(ir, kq);
+        if (irop_get_vreg(d) == v_vr)
+          reads_v = 1;
+      }
+      if (reads_v)
+        break; /* V is read between PARAMVAL and redef → can't rename */
+
+      /* Check if op writes V. */
+      if (irop_config[kq->op].has_dest)
+      {
+        IROperand d = tcc_ir_op_get_dest(ir, kq);
+        if (irop_get_vreg(d) == v_vr && !d.is_lval)
+        {
+          /* Honest redefinition: V will be overwritten before any later read. */
+          if (kq->op == TCCIR_OP_FUNCCALLVAL || kq->op == TCCIR_OP_ASSIGN || kq->op == TCCIR_OP_LOAD)
+          {
+            redef_idx = k;
+            safe = 1;
+          }
+          break;
+        }
+      }
+    }
+    if (!safe)
+      continue;
+    (void)redef_idx;
+
+    /* Allocate a fresh TEMP and rename V at this CALL.dest and
+     * PARAMVAL.src1 only.  V's other defs/uses stay intact. */
+    int32_t t_anon = tcc_ir_vreg_alloc_temp(ir);
+    if (t_anon < 0)
+      continue;
+
+    IROperand new_dest = irop_make_vreg(t_anon, dest.btype);
+    new_dest.is_unsigned = dest.is_unsigned;
+    tcc_ir_set_dest(ir, i, new_dest);
+
+    IROperand new_pv_src = irop_make_vreg(t_anon, pv_src.btype);
+    new_pv_src.is_unsigned = pv_src.is_unsigned;
+    tcc_ir_set_src1(ir, j, new_pv_src);
+
+    changes++;
+    LOG_IR_GEN("CALL CHAIN RENAME: V%d at CALL@%d/PARAMVAL@%d -> T%d", v_vr, i, j, t_anon);
+  }
+
+  LOG_IR_GEN("=== CALL CHAIN RENAME END: %d renames ===", changes);
+  return changes;
+}
+
+/* ============================================================================
+ * Stack-address ADD-operand CSE
+ * ============================================================================
+ *
+ * Pattern (sha_transform expansion loop W[i-N] computation):
+ *   T_a = Addr[StackLoc[X]] ADD R_idx_a
+ *   T_b = Addr[StackLoc[X]] ADD R_idx_b
+ *   T_c = Addr[StackLoc[X]] ADD R_idx_c
+ *   ...
+ *
+ * Each `Addr[StackLoc[X]]` operand is an inline literal that the codegen
+ * materializes as `add rX, sp, #off` per occurrence — N redundant
+ * recomputes of the same address.  The downstream SHL+ADD fusion also
+ * bails on `is_local` base, so the SHL/ADD chain can't fold to
+ * LOAD_INDEXED with a shift-base.
+ *
+ * Fix: for each unique StackLoc offset that appears as a literal source
+ * in two or more ADDs, hoist a single ASSIGN of that StackLoc to a fresh
+ * TEMP at the function entry, and replace each literal use with the TEMP.
+ * After this, the ADDs have a register base (not is_local), so the
+ * subsequent SHL+ADD indexed-memory fusion can fire.
+ *
+ * Safety: the hoisted ASSIGN happens at function entry (before any code
+ * that could modify the frame pointer), so the address is constant for
+ * the whole function lifetime.  The TEMP's value is just an FP-relative
+ * pointer — same semantics as the literal.
+ */
+int tcc_ir_opt_stackoff_addr_cse(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  if (n < 2)
+    return 0;
+
+  /* Pass 1: count uses per unique StackLoc imm32 offset that appears as
+   * a non-lval source operand of an ADD with a vreg other operand. */
+#define SAC_MAX_OFFSETS 32
+  struct {
+    int32_t offset;
+    int count;
+    int32_t hoisted_vreg;
+    IROperand sample; /* operand we cloned (for btype) */
+  } slots[SAC_MAX_OFFSETS];
+  int nslots = 0;
+
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_ADD)
+      continue;
+    IROperand src1 = tcc_ir_op_get_src1(ir, q);
+    IROperand src2 = tcc_ir_op_get_src2(ir, q);
+    for (int sl = 0; sl < 2; sl++)
+    {
+      IROperand op = (sl == 0) ? src1 : src2;
+      IROperand other = (sl == 0) ? src2 : src1;
+      if (irop_get_tag(op) != IROP_TAG_STACKOFF)
+        continue;
+      if (op.is_lval)
+        continue;
+      /* Only consider patterns where the OTHER operand is a vreg (a
+       * register-shifted index) — that's the SHL+ADD pattern that the
+       * fusion wants to fold.  Constants on the other side are handled
+       * by stack_addr_cse already. */
+      if (!irop_has_vreg(other))
+        continue;
+      int32_t off = op.u.imm32;
+      int slot = -1;
+      for (int s = 0; s < nslots; s++)
+        if (slots[s].offset == off) { slot = s; break; }
+      if (slot < 0)
+      {
+        if (nslots >= SAC_MAX_OFFSETS)
+          continue;
+        slot = nslots++;
+        slots[slot].offset = off;
+        slots[slot].count = 0;
+        slots[slot].hoisted_vreg = -1;
+        slots[slot].sample = op;
+      }
+      slots[slot].count++;
+    }
+  }
+
+  /* Pass 2: for each offset with >= 2 uses, hoist an ASSIGN at function
+   * entry and rewrite all matching uses.  We insert at index 0 by shifting
+   * the IR — for K hoists, that's K shifts; tolerable since K <= 32. */
+  int changes = 0;
+  for (int s = 0; s < nslots; s++)
+  {
+    if (slots[s].count < 2)
+      continue;
+
+    int32_t t_anon = tcc_ir_vreg_alloc_temp(ir);
+    if (t_anon < 0)
+      continue;
+
+    /* Build ASSIGN T_anon <- Addr[StackLoc[off]] and insert at index 0.
+     * Mirror the sample operand's btype/sign to keep the IR consistent. */
+    IROperand new_dest = irop_make_vreg(t_anon, slots[s].sample.btype);
+    new_dest.is_unsigned = slots[s].sample.is_unsigned;
+    IROperand new_src = slots[s].sample;
+    IRQuadCompact assign_q = {0};
+    assign_q.op = TCCIR_OP_ASSIGN;
+    assign_q.operand_base = tcc_ir_pool_add(ir, new_dest);
+    tcc_ir_pool_add(ir, new_src);
+
+    if (gsym_cse_insert_before(ir, 0, &assign_q) < 0)
+      continue;
+    n++; /* IR grew by 1 */
+    slots[s].hoisted_vreg = t_anon;
+  }
+
+  if (changes >= 0)
+  {
+    /* Pass 3: rewrite uses (the indexes have shifted by the number of
+     * hoists already inserted; each insert shifted EVERYTHING from idx 0
+     * onward, so iterate fresh). */
+    for (int i = 0; i < n; i++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      if (q->op != TCCIR_OP_ADD)
+        continue;
+      IROperand src1 = tcc_ir_op_get_src1(ir, q);
+      IROperand src2 = tcc_ir_op_get_src2(ir, q);
+      for (int sl = 0; sl < 2; sl++)
+      {
+        IROperand op = (sl == 0) ? src1 : src2;
+        IROperand other = (sl == 0) ? src2 : src1;
+        if (irop_get_tag(op) != IROP_TAG_STACKOFF || op.is_lval)
+          continue;
+        if (!irop_has_vreg(other))
+          continue;
+        int32_t off = op.u.imm32;
+        int slot = -1;
+        for (int s = 0; s < nslots; s++)
+          if (slots[s].offset == off) { slot = s; break; }
+        if (slot < 0 || slots[slot].hoisted_vreg < 0)
+          continue;
+        IROperand replacement = irop_make_vreg(slots[slot].hoisted_vreg, op.btype);
+        replacement.is_unsigned = op.is_unsigned;
+        if (sl == 0)
+          tcc_ir_set_src1(ir, i, replacement);
+        else
+          tcc_ir_set_src2(ir, i, replacement);
+        changes++;
+      }
+    }
+  }
+
+  LOG_IR_GEN("=== STACKOFF ADDR CSE: %d uses rewritten ===", changes);
+  return changes;
+#undef SAC_MAX_OFFSETS
+}
+
+/* ============================================================================
  * LEA + deref fold
  * ============================================================================
  *
@@ -15754,10 +16101,17 @@ int tcc_ir_opt_lea_fold(TCCIRState *ir)
           IROperand d = tcc_ir_op_get_dest(ir, uq);
           /* A dest with is_lval=1 is a *use* of the vreg (we deref through
            * it), not a redefinition. A dest without is_lval would redefine
-           * lea_vr and end its live range — treat as a hard stop. */
+           * lea_vr and end its live range — treat as a hard stop.
+           *
+           * Exception: STORE/STORE_INDEXED/STORE_POSTINC place the *base
+           * pointer* in the dest slot, which is a USE.  disp_fusion clears
+           * is_lval on STORE_INDEXED's base, so the is_lval test alone
+           * would mis-classify it as a redef. */
           if (irop_has_vreg(d) && irop_get_vreg(d) == lea_vr)
           {
-            if (d.is_lval)
+            int is_ptr_store = (uq->op == TCCIR_OP_STORE || uq->op == TCCIR_OP_STORE_INDEXED ||
+                                uq->op == TCCIR_OP_STORE_POSTINC);
+            if (d.is_lval || is_ptr_store)
               total_uses++;
             else
               break; /* lea_vr redefined; stop scanning */
@@ -15935,6 +16289,71 @@ int tcc_ir_opt_lea_fold(TCCIRState *ir)
      * op actually dereferences through the address. */
     int32_t deref_vr =
         (add_idx >= 0) ? irop_get_vreg(tcc_ir_op_get_dest(ir, &ir->compact_instructions[add_idx])) : lea_vr;
+
+    /* STORE_INDEXED / LOAD_INDEXED special case: their base pointer lives in
+     * dest (STORE_INDEXED) or src1 (LOAD_INDEXED), the constant offset in
+     * src2, and the shift amount in slot 3 (scale).  When base is the LEA's
+     * vreg, scale==0, and src2 is IMM32, fold to a direct StackLoc STORE/LOAD
+     * at offset (base + add_offset + index_imm).  This unlocks subsequent
+     * stack-store-load forwarding and DSE on aggregate field writes. */
+    {
+      IRQuadCompact *cq = &ir->compact_instructions[cur_idx];
+      int is_store_idx = (cq->op == TCCIR_OP_STORE_INDEXED);
+      int is_load_idx = (cq->op == TCCIR_OP_LOAD_INDEXED);
+      if (is_store_idx || is_load_idx)
+      {
+        IROperand base = is_store_idx ? tcc_ir_op_get_dest(ir, cq) : tcc_ir_op_get_src1(ir, cq);
+        if (irop_has_vreg(base) && irop_get_vreg(base) == deref_vr)
+        {
+          IROperand idx = tcc_ir_op_get_src2(ir, cq);
+          IROperand scale = tcc_ir_op_get_scale(ir, cq);
+          if (irop_get_tag(idx) == IROP_TAG_IMM32 && irop_get_tag(scale) == IROP_TAG_IMM32 &&
+              scale.u.imm32 == 0)
+          {
+            int folded_off = base_offset + add_offset + (int32_t)idx.u.imm32;
+            IROperand width_op = is_store_idx ? tcc_ir_op_get_src1(ir, cq)
+                                              : tcc_ir_op_get_dest(ir, cq);
+            if (width_op.btype != IROP_BTYPE_STRUCT)
+            {
+              IROperand stack_op = irop_make_stackoff(-1, folded_off, /*is_lval*/ 1, /*is_llocal*/ 0,
+                                                     /*is_param_flag*/ (int)lea_src.is_param,
+                                                     width_op.btype);
+              stack_op.is_unsigned = width_op.is_unsigned;
+              stack_op.is_static = lea_src.is_static;
+
+              if (is_store_idx)
+              {
+                IROperand val = tcc_ir_op_get_src1(ir, cq);
+                cq->op = TCCIR_OP_STORE;
+                tcc_ir_set_dest(ir, cur_idx, stack_op);
+                tcc_ir_set_src1(ir, cur_idx, val);
+                tcc_ir_set_src2(ir, cur_idx, IROP_NONE);
+              }
+              else
+              {
+                IROperand orig_dest = tcc_ir_op_get_dest(ir, cq);
+                cq->op = TCCIR_OP_LOAD;
+                tcc_ir_set_dest(ir, cur_idx, orig_dest);
+                tcc_ir_set_src1(ir, cur_idx, stack_op);
+                tcc_ir_set_src2(ir, cur_idx, IROP_NONE);
+              }
+
+              lea_q->op = TCCIR_OP_NOP;
+              if (add_idx >= 0)
+                ir->compact_instructions[add_idx].op = TCCIR_OP_NOP;
+
+              changes++;
+              LOG_IR_GEN("LEA FOLD INDEXED: LEA@%d%s -> %s_INDEXED@%d -> %s  (offset=%d+%d+%d=%d)",
+                         i, (add_idx >= 0 ? " + ADD" : ""), is_store_idx ? "STORE" : "LOAD", cur_idx,
+                         is_store_idx ? "STORE" : "LOAD", base_offset, add_offset,
+                         (int32_t)idx.u.imm32, folded_off);
+              continue;
+            }
+          }
+        }
+      }
+    }
+
     int which = 0;
     if (!find_deref_use_operand(ir, cur_idx, deref_vr, &which))
       continue;

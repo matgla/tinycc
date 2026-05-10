@@ -25516,6 +25516,21 @@ static void gen_function(Sym *sym)
   if (tcc_state->opt_disp_fusion)
     tcc_ir_opt_indexed_pair_reorder(ir);
 
+  /* Call-chain result rename: rename `CALL → V; PARAMVAL[0] V; redef V`
+   * triples to fresh per-pair TEMPs so the regalloc keeps the value in r0
+   * across `f(g(h(x)))`-style call chains instead of moving it through a
+   * callee-saved reg.  Helps every benchmark with a function-call chain
+   * (bench_function_calls and many others). */
+  if (tcc_state->optimize >= 1)
+    tcc_ir_opt_call_chain_rename(ir);
+
+  /* Hoist literal Addr[StackLoc[X]] operands out of ADDs by CSE'ing them
+   * into a single TEMP per offset at function entry.  Helps `pool[i].field`
+   * patterns where a single base address is reused across many loop
+   * iterations with different runtime indices. */
+  if (tcc_state->optimize >= 1)
+    tcc_ir_opt_stackoff_addr_cse(ir);
+
   /* LEA+deref fold - collapse `LEA Addr[StackLoc[-N]] + [ADD #K] + deref-use`
    * into a direct StackLoc access.  Runs after disp-fusion so any surviving
    * LEA+ADD pairs still have a chance to be folded here. */
