@@ -324,6 +324,155 @@ static int ssa_fold_test_zero(IRSSAOptCtx *ctx, int tz_idx)
   return 1;
 }
 
+/* Compute block reachability based on the IR's current terminators (not the
+ * statically-built CFG succs/preds, which aren't updated when JUMPIFs are
+ * folded to JUMPs).  Returns a malloc'd uint8_t array of size cfg->num_blocks
+ * with 1 = reachable from entry, 0 = unreachable.  Caller frees. */
+static uint8_t *ssa_compute_reachable_blocks(IRSSAOptCtx *ctx)
+{
+  IRCFG *cfg = ctx->cfg;
+  TCCIRState *ir = ctx->ir;
+  if (!cfg || cfg->num_blocks <= 0) return NULL;
+
+  int nb = cfg->num_blocks;
+  int n_instrs = ir->next_instruction_index;
+  uint8_t *reachable = tcc_mallocz(nb);
+  int *worklist = tcc_malloc(nb * sizeof(int));
+  int wl_head = 0, wl_tail = 0;
+
+  /* Entry = block containing instruction 0.  Conservative fallback: if the
+   * function is empty or the mapping is bad, assume all blocks reachable. */
+  int entry = (cfg->num_instrs > 0) ? cfg->instr_to_block[0] : -1;
+  if (entry < 0 || entry >= nb) {
+    for (int i = 0; i < nb; i++) reachable[i] = 1;
+    tcc_free(worklist);
+    return reachable;
+  }
+
+  reachable[entry] = 1;
+  worklist[wl_tail++] = entry;
+
+#define MARK(blk_)                                                            \
+  do {                                                                        \
+    int _b = (blk_);                                                          \
+    if (_b >= 0 && _b < nb && !reachable[_b]) {                               \
+      reachable[_b] = 1;                                                      \
+      worklist[wl_tail++] = _b;                                               \
+    }                                                                         \
+  } while (0)
+
+  while (wl_head < wl_tail) {
+    int b = worklist[wl_head++];
+    IRBasicBlock *bb = &cfg->blocks[b];
+
+    /* Find terminator: last non-NOP instruction in the block. */
+    int term = -1;
+    for (int i = bb->end_idx - 1; i >= bb->start_idx; i--) {
+      if (ir->compact_instructions[i].op != TCCIR_OP_NOP) {
+        term = i;
+        break;
+      }
+    }
+
+    /* Helper: fall through to the block containing bb->end_idx. */
+    int fall_block = -1;
+    if (bb->end_idx < n_instrs)
+      fall_block = cfg->instr_to_block[bb->end_idx];
+
+    if (term < 0) {
+      /* All NOPs: fall through. */
+      MARK(fall_block);
+      continue;
+    }
+
+    IRQuadCompact *q = &ir->compact_instructions[term];
+    if (q->op == TCCIR_OP_JUMP) {
+      int target = (int)tcc_ir_op_get_dest(ir, q).u.imm32;
+      int tb = (target >= 0 && target < cfg->num_instrs) ?
+               cfg->instr_to_block[target] : -1;
+      MARK(tb);
+    } else if (q->op == TCCIR_OP_JUMPIF) {
+      int target = (int)tcc_ir_op_get_dest(ir, q).u.imm32;
+      int tb = (target >= 0 && target < cfg->num_instrs) ?
+               cfg->instr_to_block[target] : -1;
+      MARK(tb);
+      MARK(fall_block);
+    } else if (q->op == TCCIR_OP_RETURNVALUE || q->op == TCCIR_OP_RETURNVOID ||
+               q->op == TCCIR_OP_TRAP) {
+      /* No successors. */
+    } else if (q->op == TCCIR_OP_IJUMP || q->op == TCCIR_OP_SWITCH_TABLE) {
+      /* Conservative: keep all CFG successors reachable. */
+      for (int si = 0; si < bb->num_succs; si++)
+        MARK(bb->succs[si]);
+    } else {
+      MARK(fall_block);
+    }
+  }
+
+#undef MARK
+
+  tcc_free(worklist);
+  return reachable;
+}
+
+/* After branch folding, blocks may be transitively unreachable.  Walk every
+ * phi in the function and drop operands whose pred_block is no longer
+ * reachable.  This is what unblocks SCCP/cprop on values like
+ *   merge_phi(rA from live_block, rB from now-dead_block)
+ * which previously kept def_count > 1 and prevented constant folding. */
+static int ssa_branch_prune_unreachable_phis(IRSSAOptCtx *ctx)
+{
+  if (!ctx->ssa || !ctx->ssa->block_phis || !ctx->cfg) return 0;
+
+  uint8_t *reachable = ssa_compute_reachable_blocks(ctx);
+  if (!reachable) return 0;
+
+  int nb = ctx->cfg->num_blocks;
+  int changes = 0;
+
+  /* For each block whose phis we want to clean, gather the unique set of
+   * unreachable predecessors and drop each in turn.  ssa_drop_phi_edge
+   * walks every phi at the target and removes all matching operands, so
+   * one call per (dead_pred, target_block) pair handles all phis there. */
+  uint8_t *seen_pred = tcc_malloc(nb);
+  for (int b = 0; b < nb; b++) {
+    if (!reachable[b]) continue;
+    if (!ctx->ssa->block_phis[b]) continue;
+
+    memset(seen_pred, 0, nb);
+    int has_dead = 0;
+    for (IRPhiNode *phi = ctx->ssa->block_phis[b]; phi; phi = phi->next) {
+      for (int i = 0; i < phi->num_operands; i++) {
+        int pred = phi->operands[i].pred_block;
+        if (pred >= 0 && pred < nb && !reachable[pred] && !seen_pred[pred]) {
+          seen_pred[pred] = 1;
+          has_dead = 1;
+        }
+      }
+    }
+    if (!has_dead) continue;
+
+    /* Count operands before drop for change accounting. */
+    int before = 0;
+    for (IRPhiNode *phi = ctx->ssa->block_phis[b]; phi; phi = phi->next)
+      before += phi->num_operands;
+
+    for (int p = 0; p < nb; p++) {
+      if (seen_pred[p])
+        ssa_drop_phi_edge(ctx, p, b);
+    }
+
+    int after = 0;
+    for (IRPhiNode *phi = ctx->ssa->block_phis[b]; phi; phi = phi->next)
+      after += phi->num_operands;
+    changes += before - after;
+  }
+  tcc_free(seen_pred);
+
+  tcc_free(reachable);
+  return changes;
+}
+
 static const IRSSAOptGen branch_gens[] = {
   { TCCIR_OP_CMP,       ssa_fold_cmp_jumpif, "branch_cmp" },
   { TCCIR_OP_TEST_ZERO, ssa_fold_test_zero,  "branch_tz" },
@@ -331,6 +480,11 @@ static const IRSSAOptGen branch_gens[] = {
 
 int ssa_opt_branch(IRSSAOptCtx *ctx)
 {
-  return ssa_opt_run_gens(ctx, branch_gens,
-                          sizeof(branch_gens) / sizeof(branch_gens[0]));
+  int changes = ssa_opt_run_gens(ctx, branch_gens,
+                                 sizeof(branch_gens) / sizeof(branch_gens[0]));
+  /* Folding may have created transitively-unreachable blocks whose phi
+   * operands still pollute multi-def merges.  Prune them so SCCP/cprop on
+   * the next iteration sees clean single-def values. */
+  changes += ssa_branch_prune_unreachable_phis(ctx);
+  return changes;
 }

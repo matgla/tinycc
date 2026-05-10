@@ -9,6 +9,26 @@
     "tcc": 9,
     "updated": "2026-05-10T09:41:17.940821+00:00"
   },
+  "95_const_branch_fold::main": {
+    "gcc": 11,
+    "tcc": 32,
+    "updated": "2026-05-10T10:05:01.888759+00:00"
+  },
+  "95_const_branch_fold::test_fold_branch": {
+    "gcc": 2,
+    "tcc": 3,
+    "updated": "2026-05-10T10:05:01.888770+00:00"
+  },
+  "95_const_branch_fold::test_fold_modulo": {
+    "gcc": 2,
+    "tcc": 2,
+    "updated": "2026-05-10T10:05:01.888774+00:00"
+  },
+  "95_const_branch_fold::test_nested_fold": {
+    "gcc": 2,
+    "tcc": 2,
+    "updated": "2026-05-10T10:05:01.888777+00:00"
+  },
   "98_value_tracking::main": {
     "gcc": 13,
     "tcc": 49,
@@ -476,8 +496,8 @@
   },
   "ir/97_loop_const_expr::test_conditionals_pattern": {
     "gcc": 5,
-    "tcc": 14,
-    "updated": "2026-05-02T08:48:22.344862+00:00"
+    "tcc": 11,
+    "updated": "2026-05-10T10:04:42.718468+00:00"
   },
   "ir/97_loop_const_expr::test_const_hoist": {
     "gcc": 6,
@@ -506,8 +526,8 @@
   },
   "ir/98_value_tracking::test_conditionals_pattern": {
     "gcc": 5,
-    "tcc": 14,
-    "updated": "2026-05-02T08:48:22.344874+00:00"
+    "tcc": 11,
+    "updated": "2026-05-10T10:04:42.718493+00:00"
   },
   "ir/98_value_tracking::test_value_track_add": {
     "gcc": 2,
@@ -566,8 +586,8 @@
   },
   "ir/bench_conditionals::bench_conditionals": {
     "gcc": 2,
-    "tcc": 15,
-    "updated": "2026-05-02T08:48:22.345182+00:00"
+    "tcc": 13,
+    "updated": "2026-05-10T10:04:42.718708+00:00"
   },
   "ir/bench_conditionals::main": {
     "gcc": 6,
