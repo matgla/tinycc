@@ -120,6 +120,11 @@ int ssa_opt_var_forward(IRSSAOptCtx *ctx);
 int ssa_opt_var_const_fold(IRSSAOptCtx *ctx);
 int ssa_opt_dead_loop(IRSSAOptCtx *ctx);
 
+/* Drop phi operands flowing from dead_pred_block into phis at target_block_idx.
+ * Used after folding/eliminating an edge so that phi resolution does not emit
+ * copies for the dead path. */
+void ssa_drop_phi_edge(IRSSAOptCtx *ctx, int dead_pred_block, int target_block_idx);
+
 /* ============================================================================
  * Target-Specific Generator Registration
  *

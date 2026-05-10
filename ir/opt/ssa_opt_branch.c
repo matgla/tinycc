@@ -44,8 +44,8 @@ static int eval_cond(int64_t v1, int64_t v2, int tok)
 /* Drop phi operands that flow from `dead_pred_block` to phis at
  * `target_block_idx`. Used after folding a JUMPIF: the dead edge no longer
  * exists, so phi resolution should not emit copies for it. */
-static void ssa_drop_phi_edge(IRSSAOptCtx *ctx, int dead_pred_block,
-                              int target_block_idx)
+void ssa_drop_phi_edge(IRSSAOptCtx *ctx, int dead_pred_block,
+                       int target_block_idx)
 {
   if (!ctx->ssa || !ctx->ssa->block_phis || !ctx->cfg) return;
   if (target_block_idx < 0 || target_block_idx >= ctx->cfg->num_blocks) return;
