@@ -6038,16 +6038,22 @@ ST_FUNC void tcc_gen_machine_assign_mop(MachineOperand src, MachineOperand dest,
  * src must be MACH_OP_IMM carrying the raw condition code in u.imm.val.
  *
  * 32-bit dest:
- *   MOV dest, #0
- *   IT  <cond>
- *   MOV dest, #1
+ *   ITE <cond>
+ *   MOV dest, #1   (T: cond met)
+ *   MOV dest, #0   (E: cond not met)
  *
  * 64-bit dest pair (e.g. long long result = (x > y)):
  *   The boolean result 0 or 1 fits in 32 bits, so hi word is always 0.
- *   MOV dest_lo, #0
- *   IT  <cond>
+ *   ITE <cond>
  *   MOV dest_lo, #1
+ *   MOV dest_lo, #0
  *   MOV dest_hi, #0   (unconditional, outside IT block — hi is always 0)
+ *
+ * Inner MOVs use NOT_IMPORTANT for flags: SETIF is the consumer of the CMP
+ * flags; once the ITE captures the condition, no subsequent code in this
+ * lowering depends on CMP's flag state, so the 16-bit T1 encoding (which
+ * implicitly sets flags) is safe.  This shrinks each conditional MOV from
+ * 4 bytes (mov.w) to 2 bytes (movs).
  */
 ST_FUNC void tcc_gen_machine_setif_mop(MachineOperand src, MachineOperand dest, TccIrOp op)
 {
@@ -6055,6 +6061,10 @@ ST_FUNC void tcc_gen_machine_setif_mop(MachineOperand src, MachineOperand dest, 
   MachineCodegenContext mctx = {0};
 
   const int cond = mapcc((int)src.u.imm.val);
+  /* ITE mask: 2nd instruction has opposite condition.
+   * mask[3] = 1 if it should be the 'else' bit (opposite of cond[0]).
+   * For the T-then-E pattern, mask = ((!cond[0]) << 3) | 0x4. */
+  const uint16_t ite_mask = (uint16_t)(((cond ^ 1) & 1) << 3) | 0x4u;
 
   if (dest.is_64bit)
   {
@@ -6068,13 +6078,13 @@ ST_FUNC void tcc_gen_machine_setif_mop(MachineOperand src, MachineOperand dest, 
     uint32_t excl = thumb_is_hw_reg(lo_reg) ? (1u << (uint32_t)lo_reg) : 0u;
     int hi_reg = mach_get_dest_reg(&mctx, &dst_hi, excl);
 
-    /* Emit SETIF sequence for lo word. */
-    ot_check(th_mov_imm(lo_reg, 0, FLAGS_BEHAVIOUR_BLOCK, ENFORCE_ENCODING_NONE));
+    /* Emit ITE sequence for lo word. */
     th_literal_pool_reserve_upcoming_bytes(6);
-    ot_check(th_it(cond, 0x8)); /* IT <cond> — single conditioned instruction */
-    ot_check(th_mov_imm(lo_reg, 1, flags_safe(), ENFORCE_ENCODING_NONE));
+    ot_check(th_it(cond, ite_mask)); /* ITE <cond> — two conditioned instructions */
+    ot_check(th_mov_imm(lo_reg, 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    ot_check(th_mov_imm(lo_reg, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
     /* Hi word is always 0 — boolean result never exceeds 1 (i.e. fits in 32-bit lo). */
-    ot_check(th_mov_imm(hi_reg, 0, FLAGS_BEHAVIOUR_BLOCK, ENFORCE_ENCODING_NONE));
+    ot_check(th_mov_imm(hi_reg, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
 
     mach_writeback_dest(&dst_lo, lo_reg);
     mach_writeback_dest(&dst_hi, hi_reg);
@@ -6083,10 +6093,10 @@ ST_FUNC void tcc_gen_machine_setif_mop(MachineOperand src, MachineOperand dest, 
   {
     int dest_reg = mach_get_dest_reg(&mctx, &dest, 0);
 
-    ot_check(th_mov_imm(dest_reg, 0, FLAGS_BEHAVIOUR_BLOCK, ENFORCE_ENCODING_NONE));
     th_literal_pool_reserve_upcoming_bytes(6);
-    ot_check(th_it(cond, 0x8)); /* IT <cond> — single conditioned instruction */
-    ot_check(th_mov_imm(dest_reg, 1, flags_safe(), ENFORCE_ENCODING_NONE));
+    ot_check(th_it(cond, ite_mask)); /* ITE <cond> — two conditioned instructions */
+    ot_check(th_mov_imm(dest_reg, 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
+    ot_check(th_mov_imm(dest_reg, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
 
     mach_writeback_dest(&dest, dest_reg);
   }

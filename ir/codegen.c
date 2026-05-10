@@ -2388,7 +2388,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
             }
           }
         }
-        /* 64-bit EQ/NE peephole: CMP pair followed by SETIF/JUMPIF EQ/NE.
+        /* 64-bit EQ/NE peephole: CMP pair followed by SETIF/JUMPIF/SELECT EQ/NE.
          * Use CMP+IT+CMPEQ instead of CMP+SBCS for correct Z flag. */
         {
           MopArgs eq_a = DECODE(.dest = 1, .src1 = 1, .src2 = 1);
@@ -2400,9 +2400,20 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
             if (next_j < ir->next_instruction_index)
             {
               TccIrOp next_op = ir->compact_instructions[next_j].op;
+              IROperand nc;
+              int has_cond = 0;
               if (next_op == TCCIR_OP_SETIF || next_op == TCCIR_OP_JUMPIF)
               {
-                IROperand nc = tcc_ir_op_get_src1(ir, &ir->compact_instructions[next_j]);
+                nc = tcc_ir_op_get_src1(ir, &ir->compact_instructions[next_j]);
+                has_cond = 1;
+              }
+              else if (next_op == TCCIR_OP_SELECT)
+              {
+                nc = tcc_ir_op_get_cond(ir, &ir->compact_instructions[next_j]);
+                has_cond = 1;
+              }
+              if (has_cond)
+              {
                 int next_cond = (int)irop_get_imm64_ex(ir, nc);
                 if (next_cond == TOK_EQ || next_cond == TOK_NE)
                 {

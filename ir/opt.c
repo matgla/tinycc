@@ -1941,8 +1941,11 @@ int tcc_ir_opt_dse(TCCIRState *ir)
             }
           }
 
-          /* For STORE: check if dest is a dead TMP/VAR used as pointer base */
-          if (!has_dead_src && q->op == TCCIR_OP_STORE)
+          /* For STORE / STORE_INDEXED: check if dest is a dead TMP/VAR
+           * used as pointer base.  STORE_INDEXED has the same dest-as-base
+           * semantics as STORE — the dest carries the address, src1 the
+           * value — so the same dead-base check kills the store. */
+          if (!has_dead_src && (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED))
           {
             IROperand d = tcc_ir_op_get_dest(ir, q);
             int32_t vr = irop_get_vreg(d);
@@ -11510,22 +11513,92 @@ int tcc_ir_opt_sl_forward(TCCIRState *ir)
         }
       }
     }
-    /* STORE_INDEXED / STORE_POSTINC are pointer-based stores that this pass
-     * does not analyze in detail.  Conservatively invalidate all tracked
-     * stack slots — the pointer might alias any of them.  Without this,
-     * disp_fusion's STORE -> STORE_INDEXED rewrites could leave the
-     * forwarding table thinking a slot still holds its initializer value
-     * after a real write through that slot's address. */
+    /* STORE_INDEXED / STORE_POSTINC are pointer-based stores.
+     *
+     * For STORE_INDEXED with scale=0, an immediate index, and a base TEMP
+     * resolved by the LEA map, we know the exact stack location being
+     * written: StackLoc[lea_map[base].offset + index].  Track such stores
+     * the same way as a plain STORE so that subsequent loads/CMPs at that
+     * (or aliasing) offset can be forwarded.  This lets inlined struct
+     * field writes (the fill_big pattern: *p=v0; *(p+4)=v1; *(p+8)=v2; ...)
+     * forward through to direct StackLoc reads in the caller.
+     *
+     * Otherwise — STORE_POSTINC, scale!=0, non-immediate index, or base
+     * not in the LEA map — fall back to conservative blanket invalidation:
+     * the pointer might alias any tracked slot.  Without this, disp_fusion's
+     * STORE -> STORE_INDEXED rewrites would leave the forwarding table
+     * thinking a slot still holds its initializer value after a real write
+     * through that slot's address. */
     if (q->op == TCCIR_OP_STORE_INDEXED || q->op == TCCIR_OP_STORE_POSTINC)
     {
-      int j;
-      for (j = 0; j < entry_count; j++)
+      int resolved_si = 0;
+      if (q->op == TCCIR_OP_STORE_INDEXED)
       {
-        if (entries[j].valid)
+        IROperand si_dest = tcc_ir_op_get_dest(ir, q);
+        IROperand si_src1 = tcc_ir_op_get_src1(ir, q);
+        IROperand si_src2 = tcc_ir_op_get_src2(ir, q);
+        IROperand si_scale = tcc_ir_op_get_scale(ir, q);
+        int32_t base_vr = irop_get_vreg(si_dest);
+        if (base_vr >= 0 && TCCIR_DECODE_VREG_TYPE(base_vr) == TCCIR_VREG_TYPE_TEMP &&
+            irop_is_immediate(si_src2) && !si_src2.is_sym &&
+            irop_get_tag(si_scale) == IROP_TAG_IMM32 && si_scale.u.imm32 == 0)
         {
-          LOG_IR_GEN("STORE-LOAD: Invalidate local at i=%d due to indexed/postinc store at i=%d",
-                     entries[j].instruction_idx, i);
-          entries[j].valid = 0;
+          int bp = TCCIR_DECODE_VREG_POSITION(base_vr);
+          if (bp <= max_tmp && lea_map[bp].valid)
+          {
+            const Sym *si_sym = lea_map[bp].sym;
+            int64_t si_off = lea_map[bp].offset + irop_get_imm64_ex(ir, si_src2);
+
+            /* Invalidate any existing entry at this exact offset (overwrite). */
+            uint32_t sih = ((uintptr_t)si_sym * 31 + (uint32_t)si_off * 17) % 128;
+            for (StoreEntry *sie = hash_table[sih]; sie != NULL; sie = sie->next)
+            {
+              if (sie->valid && sie->local_sym == si_sym && sie->local_offset == si_off)
+                sie->valid = 0;
+            }
+
+            /* Access width comes from the value being stored (src1),
+             * since STORE_INDEXED's dest is a register-typed base, not
+             * the access slot.  Default to INT32 if the value's btype is
+             * unknown (matches the most common 32-bit case). */
+            int store_btype = si_src1.btype;
+            if (store_btype != IROP_BTYPE_INT8 && store_btype != IROP_BTYPE_INT16 &&
+                store_btype != IROP_BTYPE_INT32 && store_btype != IROP_BTYPE_INT64 &&
+                store_btype != IROP_BTYPE_FLOAT32 && store_btype != IROP_BTYPE_FLOAT64)
+              store_btype = IROP_BTYPE_INT32;
+
+            /* Record the store. */
+            StoreEntry *sne = &entries[entry_count++];
+            sne->valid = 1;
+            sne->addr_addrtaken = 0;
+            sne->addr_via_pointer = 1; /* via pointer — call invalidates it */
+            sne->local_offset = si_off;
+            sne->local_sym = si_sym;
+            sne->stored_value = si_src1;
+            sne->instruction_idx = i;
+            sne->store_dest_vr = -1;
+            sne->store_btype = store_btype;
+            sne->next = hash_table[sih];
+            hash_table[sih] = sne;
+
+            LOG_SL_FWD("STORE_INDEXED@i=%d TRACK via LEA: sym=%p off=%lld btype=%d",
+                       i, (const void *)si_sym, (long long)si_off, store_btype);
+            resolved_si = 1;
+          }
+        }
+      }
+
+      if (!resolved_si)
+      {
+        int j;
+        for (j = 0; j < entry_count; j++)
+        {
+          if (entries[j].valid)
+          {
+            LOG_IR_GEN("STORE-LOAD: Invalidate local at i=%d due to indexed/postinc store at i=%d",
+                       entries[j].instruction_idx, i);
+            entries[j].valid = 0;
+          }
         }
       }
     }
@@ -18037,6 +18110,254 @@ int tcc_ir_opt_local_load_cse(TCCIRState *ir)
 }
 
 /* ============================================================================
+ * Local ALU CSE  (tcc_ir_opt_local_alu_cse)
+ * ============================================================================
+ *
+ * Within a basic block, when the same arithmetic op produces equal values
+ * (same opcode + same operands, including the optional MLA accumulator),
+ * the second occurrence is replaced with an ASSIGN copy of the first.
+ *
+ * This complements ssa_opt_gvn for two cases that GVN cannot handle:
+ *   1. VAR-typed sources (multiple defs across the function) that happen
+ *      to be unchanged within a single BB — e.g. the loop induction
+ *      variable V used as `&arr[V]` (== V * stride + base) at every
+ *      array access in the loop body.
+ *   2. MLA: GVN runs before MLA fusion, so MLAs created later are never
+ *      seen by GVN.
+ *
+ * Cache is reset on:
+ *   - basic-block boundary (jump target)
+ *   - any control-flow / call instruction
+ *   - definition of any vreg currently used as a key in the cache
+ * ============================================================================ */
+int tcc_ir_opt_local_alu_cse(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  int changes = 0;
+  if (n < 2)
+    return 0;
+  int dbg_alu = (getenv("TCC_DBG_CSE") != NULL);
+  if (dbg_alu)
+    fprintf(stderr, "[local_alu_cse] entering, n=%d\n", n);
+
+#define LACSE_MAX 32
+  struct LACSEEntry
+  {
+    int op;
+    uint8_t s1_tag, s2_tag, s3_tag;
+    uint8_t s1_lval, s2_lval, s3_lval; /* lval-flag for each src — used for STORE invalidation */
+    int32_t s1_vr, s2_vr, s3_vr;
+    int32_t s1_imm, s2_imm, s3_imm;
+    int32_t dest_vr;
+  };
+  struct LACSEEntry cache[LACSE_MAX];
+  int cache_count = 0;
+
+  /* Operand key extractor: returns (tag, vreg, imm) so two operands compare
+   * equal iff they refer to the same value. */
+  #define EXTRACT_KEY(op_, tag_, vr_, imm_)                                                                            \
+    do                                                                                                                 \
+    {                                                                                                                  \
+      (tag_) = (op_).tag;                                                                                              \
+      (vr_) = irop_get_vreg(op_);                                                                                      \
+      if ((op_).tag == IROP_TAG_IMM32 || (op_).tag == IROP_TAG_F32 || (op_).tag == IROP_TAG_STACKOFF)                  \
+        (imm_) = (op_).u.imm32;                                                                                        \
+      else if ((op_).tag == IROP_TAG_SYMREF || (op_).tag == IROP_TAG_I64 || (op_).tag == IROP_TAG_F64)                 \
+        (imm_) = (int32_t)(op_).u.pool_idx;                                                                            \
+      else                                                                                                             \
+        (imm_) = 0;                                                                                                    \
+    } while (0)
+
+  /* Returns 1 if the op is a pure arithmetic op safe to CSE.
+   * Excludes ops with side effects (CMP sets flags, STORE writes memory) and
+   * ops whose result depends on more than just the operand values. */
+  #define IS_CSE_PURE(op)                                                                                              \
+    ((op) == TCCIR_OP_ADD || (op) == TCCIR_OP_SUB || (op) == TCCIR_OP_MUL || (op) == TCCIR_OP_MLA ||                   \
+     (op) == TCCIR_OP_AND || (op) == TCCIR_OP_OR || (op) == TCCIR_OP_XOR || (op) == TCCIR_OP_SHL ||                    \
+     (op) == TCCIR_OP_SHR || (op) == TCCIR_OP_SAR || (op) == TCCIR_OP_ROR)
+
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+
+    /* Reset at basic-block boundaries. */
+    if (q->is_jump_target)
+      cache_count = 0;
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    /* Control flow / calls flush the cache: callees can mutate any
+     * addrtaken VAR, so cached entries depending on VARs become stale. */
+    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF || q->op == TCCIR_OP_IJUMP ||
+        q->op == TCCIR_OP_SWITCH_TABLE || q->op == TCCIR_OP_RETURNVALUE || q->op == TCCIR_OP_RETURNVOID ||
+        q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID)
+    {
+      cache_count = 0;
+      continue;
+    }
+
+    /* Invalidate cache entries based on this instruction's effects. Two cases:
+     *   1. STORE / STORE_INDEXED / STORE_POSTINC: writes memory — kill any
+     *      entry whose src is an lval (memory read). Conservative on aliasing.
+     *      Also: STORE with is_lval=0 dest is a direct write to the dest vreg
+     *      (e.g. `P0 = T4` updates P0), so we must also kill entries reading
+     *      that vreg directly.
+     *   2. Any op with has_dest writing to a vreg V: kill entries whose src
+     *      uses V (V's value just changed). Particularly important for VAR
+     *      redefinition like the loop induction variable increment. */
+    int is_store_like = (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
+                         q->op == TCCIR_OP_STORE_POSTINC);
+    int32_t dest_vr_kill = -1;
+    if (irop_config[q->op].has_dest)
+    {
+      IROperand dest_op = tcc_ir_op_get_dest(ir, q);
+      dest_vr_kill = irop_get_vreg(dest_op);
+    }
+    if (is_store_like || dest_vr_kill >= 0)
+    {
+      int w = 0;
+      for (int c = 0; c < cache_count; c++)
+      {
+        int kills = 0;
+        if (is_store_like && (cache[c].s1_lval || cache[c].s2_lval || cache[c].s3_lval))
+          kills = 1;
+        if (dest_vr_kill >= 0)
+        {
+          if (cache[c].s1_tag == IROP_TAG_VREG && cache[c].s1_vr == dest_vr_kill)
+            kills = 1;
+          else if (cache[c].s2_tag == IROP_TAG_VREG && cache[c].s2_vr == dest_vr_kill)
+            kills = 1;
+          else if (cache[c].s3_tag == IROP_TAG_VREG && cache[c].s3_vr == dest_vr_kill)
+            kills = 1;
+          else if (cache[c].dest_vr == dest_vr_kill)
+            kills = 1; /* this op redefines a previously-cached dest — drop entry */
+        }
+        if (!kills)
+          cache[w++] = cache[c];
+      }
+      cache_count = w;
+    }
+    if (is_store_like)
+      continue; /* STORE itself isn't an ALU op — don't try to cache it */
+
+    if (!IS_CSE_PURE(q->op))
+      continue;
+
+    IROperand src1 = tcc_ir_op_get_src1(ir, q);
+    IROperand src2 = tcc_ir_op_get_src2(ir, q);
+    IROperand dest = tcc_ir_op_get_dest(ir, q);
+
+    /* Skip llocal (indirect-via-pointer) — too aliasing-sensitive. */
+    if (src1.is_llocal || src2.is_llocal)
+      continue;
+
+    int32_t dest_vr = irop_get_vreg(dest);
+    if (dest_vr < 0)
+      continue;
+
+    /* Don't cache when dest itself is an lval (means STORE, not arithmetic). */
+    if (dest.is_lval)
+      continue;
+    /* Don't replace VAR/PARAM defs — only TEMP defs.  Replacing a VAR def
+     * with ASSIGN is unsafe because:
+     *   - VAR has multiple defs across the function (it's a stack slot)
+     *   - The cached_dest may be a VAR/TEMP whose value differs at the next
+     *     def site if there's any path where its value isn't computed.
+     *   - cprop on the resulting `VAR <-- TEMP [ASSIGN]` may not propagate
+     *     the way we expect, leaving stale uses. */
+    if (TCCIR_DECODE_VREG_TYPE(dest_vr) != TCCIR_VREG_TYPE_TEMP)
+      continue;
+
+    int is_mla = (q->op == TCCIR_OP_MLA);
+    IROperand accum = IROP_NONE;
+    if (is_mla)
+    {
+      accum = tcc_ir_op_get_accum(ir, q);
+      if (accum.is_llocal)
+        continue;
+    }
+
+    uint8_t s1_tag, s2_tag, s3_tag = 0;
+    int32_t s1_vr, s2_vr, s3_vr = 0;
+    int32_t s1_imm, s2_imm, s3_imm = 0;
+    EXTRACT_KEY(src1, s1_tag, s1_vr, s1_imm);
+    EXTRACT_KEY(src2, s2_tag, s2_vr, s2_imm);
+    if (is_mla)
+      EXTRACT_KEY(accum, s3_tag, s3_vr, s3_imm);
+
+    uint8_t s1_lval_q = src1.is_lval;
+    uint8_t s2_lval_q = src2.is_lval;
+    uint8_t s3_lval_q = is_mla ? accum.is_lval : 0;
+
+    /* Look up in cache. */
+    int found = -1;
+    for (int c = 0; c < cache_count; c++)
+    {
+      if (cache[c].op != q->op)
+        continue;
+      if (cache[c].s1_tag == s1_tag && cache[c].s1_lval == s1_lval_q && cache[c].s1_vr == s1_vr &&
+          cache[c].s1_imm == s1_imm && cache[c].s2_tag == s2_tag && cache[c].s2_lval == s2_lval_q &&
+          cache[c].s2_vr == s2_vr && cache[c].s2_imm == s2_imm && cache[c].s3_tag == s3_tag &&
+          cache[c].s3_lval == s3_lval_q && cache[c].s3_vr == s3_vr && cache[c].s3_imm == s3_imm)
+      {
+        found = c;
+        break;
+      }
+      /* Commutative: ADD/MUL/AND/OR/XOR/MLA's mul pair commute on src1<->src2. */
+      if (q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_MUL || q->op == TCCIR_OP_AND || q->op == TCCIR_OP_OR ||
+          q->op == TCCIR_OP_XOR || q->op == TCCIR_OP_MLA)
+      {
+        if (cache[c].s1_tag == s2_tag && cache[c].s1_lval == s2_lval_q && cache[c].s1_vr == s2_vr &&
+            cache[c].s1_imm == s2_imm && cache[c].s2_tag == s1_tag && cache[c].s2_lval == s1_lval_q &&
+            cache[c].s2_vr == s1_vr && cache[c].s2_imm == s1_imm && cache[c].s3_tag == s3_tag &&
+            cache[c].s3_lval == s3_lval_q && cache[c].s3_vr == s3_vr && cache[c].s3_imm == s3_imm)
+        {
+          found = c;
+          break;
+        }
+      }
+    }
+
+    if (found >= 0)
+    {
+      /* Replace with ASSIGN dest = cached_dest. */
+      IROperand new_src = irop_make_vreg(cache[found].dest_vr, dest.btype);
+      q->op = TCCIR_OP_ASSIGN;
+      tcc_ir_op_set_src1(ir, q, new_src);
+      tcc_ir_op_set_src2(ir, q, IROP_NONE);
+      if (is_mla)
+        tcc_ir_op_set_accum(ir, q, IROP_NONE);
+      changes++;
+      continue;
+    }
+
+    /* Cache this op's result. */
+    if (cache_count < LACSE_MAX)
+    {
+      struct LACSEEntry *e = &cache[cache_count++];
+      e->op = q->op;
+      e->s1_tag = s1_tag;
+      e->s1_lval = (uint8_t)src1.is_lval;
+      e->s1_vr = s1_vr;
+      e->s1_imm = s1_imm;
+      e->s2_tag = s2_tag;
+      e->s2_lval = (uint8_t)src2.is_lval;
+      e->s2_vr = s2_vr;
+      e->s2_imm = s2_imm;
+      e->s3_tag = s3_tag;
+      e->s3_lval = is_mla ? (uint8_t)accum.is_lval : 0;
+      e->s3_vr = s3_vr;
+      e->s3_imm = s3_imm;
+      e->dest_vr = dest_vr;
+    }
+  }
+
+#undef LACSE_MAX
+#undef EXTRACT_KEY
+#undef IS_CSE_PURE
+  return changes;
+}
+
+/* ============================================================================
  * Single-BB VAR → TMP Promotion  (tcc_ir_opt_var_to_tmp)
  * ============================================================================
  *
@@ -22141,7 +22462,10 @@ int tcc_ir_opt_select(TCCIRState *ir)
   int n = ir->next_instruction_index;
   int changes = 0;
 
-  if (n < 5)
+  /* Smallest pattern is the RETURN diamond: JUMPIF + RETURN + RETURN = 3 instr.
+   * Other patterns (ASSIGN/CALL diamond) need more, but their inner checks
+   * already bail out when the remaining suffix is too short. */
+  if (n < 3)
     return 0;
 
   /* Precompute jump target counts: jt_cnt[target] = number of JUMP/JUMPIFs
@@ -22172,7 +22496,7 @@ int tcc_ir_opt_select(TCCIRState *ir)
     _jq->op = TCCIR_OP_NOP; \
   } while (0)
 
-  for (int i = 0; i < n - 4; i++)
+  for (int i = 0; i < n - 2; i++)
   {
     IRQuadCompact *jumpif_q = &ir->compact_instructions[i];
     if (jumpif_q->op != TCCIR_OP_JUMPIF)
@@ -22410,6 +22734,75 @@ int tcc_ir_opt_select(TCCIRState *ir)
         ir->compact_instructions[else_target].is_jump_target = 0;
       if (merge_target >= 0 && merge_target < n && !JT_HAS_OTHER(merge_target, -1))
         ir->compact_instructions[merge_target].is_jump_target = 0;
+
+      changes++;
+      continue;
+    }
+
+    /* ----------------------------------------------------------------
+     * Pattern: Return diamond
+     * ----------------------------------------------------------------
+     * then: RETURNVALUE val_then [const]
+     * else_target: RETURNVALUE val_else [const]
+     *
+     * Both branches are terminal (no merge), so no JUMP between them.
+     * The else_target falls immediately after the then RETURNVALUE.
+     * ---------------------------------------------------------------- */
+    if (then_q1->op == TCCIR_OP_RETURNVALUE)
+    {
+      IROperand then_val = tcc_ir_op_get_src1(ir, then_q1);
+
+      /* Then-value must be a compile-time constant — vreg uses would
+       * be disrupted by removing the branches. */
+      int then_tag = irop_get_tag(then_val);
+      if (then_tag != IROP_TAG_IMM32 && then_tag != IROP_TAG_SYMREF)
+        continue;
+
+      /* Find else block (skip NOPs starting at else_target) */
+      int else_start = ir_skip_nops_forward(ir, else_target, n);
+      if (else_start >= n)
+        continue;
+      IRQuadCompact *else_q = &ir->compact_instructions[else_start];
+      if (else_q->op != TCCIR_OP_RETURNVALUE)
+        continue;
+
+      IROperand else_val = tcc_ir_op_get_src1(ir, else_q);
+      int else_tag = irop_get_tag(else_val);
+      if (else_tag != IROP_TAG_IMM32 && else_tag != IROP_TAG_SYMREF)
+        continue;
+
+      /* Else block must immediately follow the then RETURNVALUE
+       * (otherwise NOP'ing the else RETURNVALUE could break adjacent code). */
+      int after_then = ir_skip_nops_forward(ir, then_start + 1, n);
+      if (after_then != else_start)
+        continue;
+
+      /* Allocate 4 pool entries for SELECT */
+      int32_t select_vreg = tcc_ir_get_vreg_temp(ir);
+      IROperand sel_dest = irop_make_vreg(select_vreg, IROP_BTYPE_INT32);
+      IROperand sel_cond = irop_make_imm32(-1, then_cond, VT_INT);
+
+      int pool_base = tcc_ir_iroperand_pool_add(ir, sel_dest);
+      tcc_ir_iroperand_pool_add(ir, then_val);
+      tcc_ir_iroperand_pool_add(ir, else_val);
+      tcc_ir_iroperand_pool_add(ir, sel_cond);
+
+      /* Rewrite JUMPIF as SELECT (drops one jump to else_target) */
+      if (else_target >= 0 && else_target < n && jt_cnt[else_target] > 0)
+        jt_cnt[else_target]--;
+      jumpif_q->op = TCCIR_OP_SELECT;
+      jumpif_q->operand_base = pool_base;
+
+      /* Rewrite the then RETURNVALUE to consume the SELECT result */
+      IROperand new_ret_val = irop_make_vreg(select_vreg, IROP_BTYPE_INT32);
+      tcc_ir_op_set_src1(ir, then_q1, new_ret_val);
+
+      /* NOP the else RETURNVALUE (else_start) — unreachable now */
+      ir->compact_instructions[else_start].op = TCCIR_OP_NOP;
+
+      /* Clear stale is_jump_target on else_target if no longer targeted */
+      if (!JT_HAS_OTHER(else_target, -1))
+        ir->compact_instructions[else_target].is_jump_target = 0;
 
       changes++;
       continue;

@@ -15,6 +15,8 @@
 #include "ssa.h"
 
 struct TCCIRState;
+struct IRQuadCompact;
+typedef struct IRQuadCompact IRQuadCompact;
 
 /* ============================================================================
  * SSA Use-Def Chains

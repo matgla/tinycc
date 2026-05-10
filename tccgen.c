@@ -25765,6 +25765,33 @@ static void gen_function(Sym *sym)
   }
   tcc_ir_free_loops(licm_loops);
 
+  /* Local ALU CSE: dedupe pure arithmetic ops within a basic block.
+   * Catches `arr[i].x` + `arr[i].y` patterns where the same `i*stride+base`
+   * computation is repeated for each field access — GVN can't see these
+   * because the loop induction var has multiple defs across the function.
+   * MUST run AFTER IV strength reduction: IV-SR creates separate stride
+   * pointers per use site (T17, T16, T18 each starting at base, each
+   * incremented by stride), and dedup'ing the underlying SHL+ADD chains
+   * before IV-SR collapses one of those distinct stride pointers into
+   * a stale base, breaking the loop. After IV-SR has wired up the stride
+   * pointers, any remaining redundant arithmetic is safe to dedupe. */
+  if (tcc_state->optimize > 0 && !getenv("TCC_DISABLE_LOCAL_ALU_CSE"))
+  {
+    int loops = 0;
+    int total_changes = 0;
+    int ch;
+    while (loops++ < 4 && (ch = tcc_ir_opt_local_alu_cse(ir)) > 0)
+    {
+      total_changes += ch;
+      if (tcc_state->opt_copy_prop)
+        tcc_ir_opt_copy_prop(ir);
+      if (tcc_state->opt_dce)
+        tcc_ir_opt_dce(ir);
+    }
+    if (getenv("TCC_DBG_CSE"))
+      fprintf(stderr, "[local_alu_cse] %d changes in %d iterations\n", total_changes, loops);
+  }
+
   /* Phase 7: Strength Reduction - transform MUL by constant to shift/add */
   if (tcc_state->opt_strength_red)
     tcc_ir_opt_strength_reduction(ir);

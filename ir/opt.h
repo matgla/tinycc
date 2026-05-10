@@ -66,6 +66,13 @@ int tcc_ir_opt_var_tmp_fwd(struct TCCIRState *ir);
  * different TEMPs, the second load is replaced with a copy of the first TEMP. */
 int tcc_ir_opt_local_load_cse(struct TCCIRState *ir);
 
+/* Local ALU CSE. Within a basic block, dedupe pure arithmetic ops (ADD, SUB,
+ * MUL, MLA, AND, OR, XOR, SHL, SHR, SAR, ROR) with identical operands. Catches
+ * cases the SSA GVN cannot: VARs that happen to be unchanged within the BB
+ * (e.g. loop induction vars used in repeated `arr[i]` indexing), and MLAs
+ * created by post-SSA fusion. */
+int tcc_ir_opt_local_alu_cse(struct TCCIRState *ir);
+
 /* Single-BB VAR → TMP promotion. For a non-address-taken VAR with exactly one
  * def and in-BB lval-ASSIGN reads only, redirect the def's dest to a fresh
  * TEMP and rewrite each read into a pure register copy. Copy prop + DCE then

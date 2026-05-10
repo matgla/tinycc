@@ -30,10 +30,13 @@ typedef struct GVNEntry {
   int op;
   int32_t src1;
   int32_t src2;
+  int32_t src3;  /* 3rd operand (MLA accumulator); 0 for non-MLA */
   int32_t imm1;
   int32_t imm2;
+  int32_t imm3;
   uint8_t s1_tag;
   uint8_t s2_tag;
+  uint8_t s3_tag;
   int32_t result_vr;
   struct GVNEntry *next;
 } GVNEntry;
@@ -44,6 +47,7 @@ static int gvn_is_pure_alu(int op)
   case TCCIR_OP_ADD:
   case TCCIR_OP_SUB:
   case TCCIR_OP_MUL:
+  case TCCIR_OP_MLA: /* dest = src1 * src2 + accum (also pure, has 3rd operand) */
   case TCCIR_OP_AND:
   case TCCIR_OP_OR:
   case TCCIR_OP_XOR:
@@ -76,13 +80,16 @@ static int gvn_is_commutative(int op)
 }
 
 static uint32_t gvn_hash(int op, uint8_t s1_tag, int32_t s1, int32_t imm1,
-                          uint8_t s2_tag, int32_t s2, int32_t imm2)
+                          uint8_t s2_tag, int32_t s2, int32_t imm2,
+                          uint8_t s3_tag, int32_t s3, int32_t imm3)
 {
   uint32_t h = (uint32_t)op * 2654435761u;
   h ^= ((uint32_t)s1_tag << 28) ^ (uint32_t)s1 * 2246822519u;
   h ^= (uint32_t)imm1 * 3266489917u;
   h ^= ((uint32_t)s2_tag << 28) ^ (uint32_t)s2 * 374761393u;
   h ^= (uint32_t)imm2 * 668265263u;
+  h ^= ((uint32_t)s3_tag << 28) ^ (uint32_t)s3 * 1597334677u;
+  h ^= (uint32_t)imm3 * 1442695041u;
   return h & (GVN_HASH_SIZE - 1);
 }
 
@@ -101,12 +108,14 @@ static void gvn_operand_key(IROperand op, uint8_t *tag, int32_t *vr, int32_t *im
 }
 
 static GVNEntry *gvn_find(GVNEntry **table, int op, uint8_t s1_tag, int32_t s1,
-                           int32_t imm1, uint8_t s2_tag, int32_t s2, int32_t imm2)
+                           int32_t imm1, uint8_t s2_tag, int32_t s2, int32_t imm2,
+                           uint8_t s3_tag, int32_t s3, int32_t imm3)
 {
-  uint32_t h = gvn_hash(op, s1_tag, s1, imm1, s2_tag, s2, imm2);
+  uint32_t h = gvn_hash(op, s1_tag, s1, imm1, s2_tag, s2, imm2, s3_tag, s3, imm3);
   for (GVNEntry *e = table[h]; e; e = e->next) {
     if (e->op == op && e->s1_tag == s1_tag && e->src1 == s1 && e->imm1 == imm1 &&
-        e->s2_tag == s2_tag && e->src2 == s2 && e->imm2 == imm2)
+        e->s2_tag == s2_tag && e->src2 == s2 && e->imm2 == imm2 &&
+        e->s3_tag == s3_tag && e->src3 == s3 && e->imm3 == imm3)
       return e;
   }
   return NULL;
@@ -122,7 +131,8 @@ static int undo_cap;
 static void gvn_scope_push(GVNEntry **table, GVNEntry *entry)
 {
   uint32_t h = gvn_hash(entry->op, entry->s1_tag, entry->src1, entry->imm1,
-                         entry->s2_tag, entry->src2, entry->imm2);
+                         entry->s2_tag, entry->src2, entry->imm2,
+                         entry->s3_tag, entry->src3, entry->imm3);
   if (undo_count >= undo_cap) {
     int nc = undo_cap ? undo_cap * 2 : 64;
     undo_stack = tcc_realloc(undo_stack, nc * sizeof(GVNScopeUndo));
@@ -208,16 +218,43 @@ static int gvn_process_block(IRSSAOptCtx *ctx, IRCFG *cfg, GVNEntry **table, int
         continue;
     }
 
-    uint8_t s1_tag, s2_tag;
+    /* MLA has a 3rd operand (accumulator) at pool[operand_base+3]. */
+    IROperand accum = IROP_NONE;
+    int32_t s3v = -1;
+    int is_mla = (q->op == TCCIR_OP_MLA);
+    if (is_mla) {
+      accum = tcc_ir_op_get_accum(ir, q);
+      if (accum.is_lval || accum.is_local || accum.is_llocal)
+        continue;
+      s3v = irop_get_vreg(accum);
+      if (s3v >= 0) {
+        if (TCCIR_DECODE_VREG_TYPE(s3v) != TCCIR_VREG_TYPE_TEMP)
+          continue;
+        IRSSAVregInfo *s3vi = ssa_opt_vinfo(ctx, s3v);
+        if (!s3vi || s3vi->def_count > 1)
+          continue;
+        if (s3vi->def_phi_block >= 0)
+          continue;
+      }
+    }
+
+    uint8_t s1_tag, s2_tag, s3_tag = 0;
     int32_t s1_vr, s2_vr, s1_imm, s2_imm;
+    int32_t s3_vr = 0, s3_imm = 0;
     gvn_operand_key(src1, &s1_tag, &s1_vr, &s1_imm);
     gvn_operand_key(src2, &s2_tag, &s2_vr, &s2_imm);
+    if (is_mla)
+      gvn_operand_key(accum, &s3_tag, &s3_vr, &s3_imm);
 
     GVNEntry *existing = gvn_find(table, q->op, s1_tag, s1_vr, s1_imm,
-                                   s2_tag, s2_vr, s2_imm);
+                                   s2_tag, s2_vr, s2_imm, s3_tag, s3_vr, s3_imm);
     if (!existing && gvn_is_commutative(q->op))
       existing = gvn_find(table, q->op, s2_tag, s2_vr, s2_imm,
-                           s1_tag, s1_vr, s1_imm);
+                           s1_tag, s1_vr, s1_imm, s3_tag, s3_vr, s3_imm);
+    /* MLA: src1 * src2 is commutative — also try swapped src1<->src2. */
+    if (!existing && is_mla)
+      existing = gvn_find(table, q->op, s2_tag, s2_vr, s2_imm,
+                           s1_tag, s1_vr, s1_imm, s3_tag, s3_vr, s3_imm);
 
     if (existing) {
       /* Convert to ASSIGN copy instead of replace_all_uses.
@@ -236,6 +273,10 @@ static int gvn_process_block(IRSSAOptCtx *ctx, IRCFG *cfg, GVNEntry **table, int
       if (s1vi) ssa_opt_remove_use_instr(s1vi, i);
       IRSSAVregInfo *s2vi = ssa_opt_vinfo(ctx, s2v);
       if (s2vi) ssa_opt_remove_use_instr(s2vi, i);
+      if (is_mla && s3v >= 0) {
+        IRSSAVregInfo *s3vi = ssa_opt_vinfo(ctx, s3v);
+        if (s3vi) ssa_opt_remove_use_instr(s3vi, i);
+      }
 
       /* Add use of the result vreg */
       IRSSAVregInfo *rvi = ssa_opt_vinfo(ctx, existing->result_vr);
@@ -257,6 +298,9 @@ static int gvn_process_block(IRSSAOptCtx *ctx, IRCFG *cfg, GVNEntry **table, int
     e->s2_tag = s2_tag;
     e->src2 = s2_vr;
     e->imm2 = s2_imm;
+    e->s3_tag = s3_tag;
+    e->src3 = s3_vr;
+    e->imm3 = s3_imm;
     e->result_vr = dest_vr;
     gvn_scope_push(table, e);
   }

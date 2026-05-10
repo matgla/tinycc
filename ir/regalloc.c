@@ -47,6 +47,7 @@ typedef struct SSAInterval {
   uint8_t reg_type;
   uint16_t use_count;
   int8_t precolored;
+  int8_t pref_reg; /* soft hint: prefer this physical reg if available (e.g. r0 for RETURNVALUE feeders) */
   int32_t hint_vreg;
 } SSAInterval;
 
@@ -774,6 +775,7 @@ static void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
       iv->stack_location = 0;
       iv->use_count = uses[idx];
       iv->precolored = -1;
+      iv->pref_reg = -1;
       iv->hint_vreg = -1;
       iv->is_param = (type == TCCIR_VREG_TYPE_PARAM);
 
@@ -804,6 +806,12 @@ static void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
         if (iv->end == 0) iv->end = 1;
         if (pos < 4 && !iv->crosses_call && li->incoming_reg0 >= 0)
           iv->precolored = li->incoming_reg0;
+      } else if (li->incoming_reg0 >= 0 && iv->reg_type == LS_REG_TYPE_INT) {
+        /* Non-PARAM with incoming_reg0 hint (set by setup_returnvalue_hint
+         * in codegen): use as a soft preference. The linear scan will try
+         * this register first and handle the boundary case where a PARAM
+         * is just expiring at this start point. */
+        iv->pref_reg = (int8_t)li->incoming_reg0;
       }
 
       wi++;
@@ -1195,6 +1203,41 @@ static void ra_linear_scan(SSAInterval *intervals, int count,
                     break;
                   }
                 }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    /* Soft preference: try iv->pref_reg first (e.g., r0 for vregs that
+     * feed RETURNVALUE).  If free, take it.  If a still-active interval
+     * ends exactly at cur->start and holds that register, evict it and
+     * take it (boundary case — same logic as the phi-coalescing hint). */
+    if (reg < 0 && cur->pref_reg >= 0 && cur->reg_type == LS_REG_TYPE_INT) {
+      int hr = (int)cur->pref_reg;
+      if (hr < tcc_state->registers_for_allocator) {
+        int hr_free = (int_free & (1ull << hr)) != 0;
+        int ok = 1;
+        if (cur->crosses_call) {
+          ok = 0;
+          for (int ci = 0; ci < target->int_class.num_callee_saved; ci++) {
+            if (target->int_class.callee_saved[ci] == hr) { ok = 1; break; }
+          }
+        }
+        if (ok) {
+          if (hr_free) {
+            reg = hr;
+          } else {
+            /* Boundary: an active INT interval ending at cur->start in hr. */
+            for (int k = 0; k < active_count; k++) {
+              SSAInterval *a = active[k];
+              if (a->r0 == hr && a->r1 < 0 && a->end == cur->start &&
+                  a->stack_location == 0 && a->reg_type == LS_REG_TYPE_INT) {
+                int_free |= (1ull << hr);
+                active[k] = active[--active_count];
+                reg = hr;
+                break;
               }
             }
           }
