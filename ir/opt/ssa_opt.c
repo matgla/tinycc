@@ -426,6 +426,7 @@ int tcc_ir_ssa_opt_run(IRSSAOptCtx *ctx)
     changes += ssa_opt_narrow(ctx);
     changes += ssa_opt_gvn(ctx);
     changes += ssa_opt_phi_simplify(ctx);
+    changes += ssa_opt_dead_loop(ctx);
     changes += ssa_opt_dce(ctx);
 
     /* target-specific generators (registered by backend) */

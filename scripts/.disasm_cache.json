@@ -31,8 +31,8 @@
   },
   "98_value_tracking::main": {
     "gcc": 13,
-    "tcc": 40,
-    "updated": "2026-05-10T11:15:28.659242+00:00"
+    "tcc": 19,
+    "updated": "2026-05-10T11:37:25.824518+00:00"
   },
   "98_value_tracking::test_chained_arithmetic": {
     "gcc": 2,
@@ -586,8 +586,8 @@
   },
   "ir/bench_conditionals::bench_conditionals": {
     "gcc": 2,
-    "tcc": 13,
-    "updated": "2026-05-10T10:04:42.718708+00:00"
+    "tcc": 10,
+    "updated": "2026-05-10T11:37:20.667955+00:00"
   },
   "ir/bench_conditionals::main": {
     "gcc": 6,
