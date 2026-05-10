@@ -311,14 +311,33 @@ IRLoops *tcc_ir_detect_loops(TCCIRState *ir)
     loops->num_loops = dst;
   }
 
+  /* Compute nesting depth: count how many other loops properly contain each loop */
+  for (int i = 0; i < loops->num_loops; i++)
+  {
+    int depth = 1;
+    for (int j = 0; j < loops->num_loops; j++)
+    {
+      if (i == j)
+        continue;
+      if (loops->loops[j].start_idx <= loops->loops[i].start_idx &&
+          loops->loops[j].end_idx >= loops->loops[i].end_idx &&
+          (loops->loops[j].start_idx < loops->loops[i].start_idx ||
+           loops->loops[j].end_idx > loops->loops[i].end_idx))
+      {
+        depth++;
+      }
+    }
+    loops->loops[i].depth = depth;
+  }
+
   if (loops->num_loops > 0)
   {
     LOG_LICM("Detected %d loop(s) (after filtering)", loops->num_loops);
     for (int i = 0; i < loops->num_loops; i++)
     {
-      LOG_LICM("Loop %d: header=%d, start=%d, end=%d, preheader=%d, body_instrs=%d", i,
+      LOG_LICM("Loop %d: header=%d, start=%d, end=%d, preheader=%d, body_instrs=%d, depth=%d", i,
              loops->loops[i].header_idx, loops->loops[i].start_idx, loops->loops[i].end_idx,
-             loops->loops[i].preheader_idx, loops->loops[i].num_body_instrs);
+             loops->loops[i].preheader_idx, loops->loops[i].num_body_instrs, loops->loops[i].depth);
     }
   }
 

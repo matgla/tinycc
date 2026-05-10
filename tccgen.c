@@ -80,7 +80,7 @@ ST_DATA int nocode_wanted;                /* no code generation wanted */
 #define NODATA_WANTED (nocode_wanted > 0) /* no static data output wanted either */
 #define DATA_ONLY_WANTED 0x80000000       /* ON outside of functions and for static initializers */
 
-/* no code output after unconditional jumps such as with if (0) ... */
+/* no code output after unconditional jumps such as with if (tcc_state->optimize > 0) ... */
 #define CODE_OFF_BIT 0x20000000
 #define CODE_OFF()                                                                                                     \
   do                                                                                                                   \
@@ -18745,7 +18745,7 @@ tok_next:
       /* If a const global was folded to an immediate (r=VT_CONST, no VT_LVAL),
        * but the symbol is still available, restore the original lvalue form so
        * that '&var' correctly takes the address of the global. This handles
-       * cases like 'if (0) return &const_global;' where the read is folded
+       * cases like 'if (tcc_state->optimize > 0) return &const_global;' where the read is folded
        * but the address-of must still be valid. (Only VT_SYM is not in r
        * because we preserved sym without setting the VT_SYM flag in r.) */
       if (!(vtop->r & VT_LVAL) && (vtop->r & VT_VALMASK) == VT_CONST && vtop->sym != NULL)
@@ -26059,6 +26059,11 @@ static void gen_function(Sym *sym)
     const RegAllocTarget *ra_target = arm_get_regalloc_target();
     tcc_ir_ssa_regalloc(ir, ra_target, loc);
   }
+
+  /* Back-edge phi hoisting: convert JUMPIF exit + ASSIGN copies + JUMP body
+   * into ASSIGN copies + inverted JUMPIF body, eliminating one branch per loop */
+  if (tcc_state->optimize > 0)
+    tcc_ir_opt_backedge_phi_hoist(ir);
 
   /* SSA optimization may NOP instructions, creating stale JMP targets
    * and fall-through JMPs.  Thread targets through NOPs first, then

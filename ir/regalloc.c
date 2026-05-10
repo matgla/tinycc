@@ -27,6 +27,7 @@
 #include "cfg.h"
 #include "ssa.h"
 #include "opt/ssa_opt.h"
+#include "licm.h"
 
 #define RA_DBG(fmt, ...) LOG_LS(fmt, ##__VA_ARGS__)
 
@@ -451,10 +452,35 @@ static void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
 
   #define VREG_IDX(vr) ((TCCIR_DECODE_VREG_TYPE(vr) * max_vreg_pos) + TCCIR_DECODE_VREG_POSITION(vr))
 
+  /* Build per-instruction loop depth map for spill-cost weighting.
+   * Uses at deeper loop nesting get exponentially higher weight so the
+   * allocator prefers spilling values that live in shallow code. */
+  uint8_t *instr_depth = tcc_mallocz(n);
+  if (tcc_state->optimize > 0) {
+    IRLoops *loops = tcc_ir_detect_loops(ir);
+    if (loops) {
+      for (int li = 0; li < loops->num_loops; li++) {
+        IRLoop *lp = &loops->loops[li];
+        for (int bi = 0; bi < lp->num_body_instrs; bi++) {
+          int idx = lp->body_instrs[bi];
+          if (idx >= 0 && idx < n && lp->depth > instr_depth[idx])
+            instr_depth[idx] = (uint8_t)lp->depth;
+        }
+      }
+      tcc_ir_free_loops(loops);
+    }
+  }
+
   /* Scan instructions for def/use */
   for (int i = 0; i < n; i++) {
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP) continue;
+
+    /* Weight = 4^depth: depth 0 → 1, depth 1 → 4, depth 2 → 16, depth 3 → 64 */
+    uint16_t w = 1;
+    if (instr_depth[i] > 0) {
+      w = 1 << (2 * (instr_depth[i] < 7 ? instr_depth[i] : 7));
+    }
 
     /* Uses: src1, src2 */
     if (irop_config[q->op].has_src1) {
@@ -465,7 +491,7 @@ static void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
         if (idx < table_size) {
           if (starts[idx] == INTERVAL_NOT_STARTED) starts[idx] = 0;
           if (ends[idx] < (uint32_t)i) ends[idx] = i;
-          if (uses[idx] < 65535) uses[idx]++;
+          if (uses[idx] <= 65535 - w) uses[idx] += w; else uses[idx] = 65535;
         }
       }
     }
@@ -477,7 +503,7 @@ static void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
         if (idx < table_size) {
           if (starts[idx] == INTERVAL_NOT_STARTED) starts[idx] = 0;
           if (ends[idx] < (uint32_t)i) ends[idx] = i;
-          if (uses[idx] < 65535) uses[idx]++;
+          if (uses[idx] <= 65535 - w) uses[idx] += w; else uses[idx] = 65535;
         }
       }
     }
@@ -490,7 +516,7 @@ static void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
         if (idx < table_size) {
           if (starts[idx] == INTERVAL_NOT_STARTED) starts[idx] = 0;
           if (ends[idx] < (uint32_t)i) ends[idx] = i;
-          if (uses[idx] < 65535) uses[idx]++;
+          if (uses[idx] <= 65535 - w) uses[idx] += w; else uses[idx] = 65535;
         }
       }
     }
@@ -821,6 +847,7 @@ static void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
   tcc_free(starts);
   tcc_free(ends);
   tcc_free(uses);
+  tcc_free(instr_depth);
 
   if (TCC_LOG_LS) {
     RA_DBG("SSA ra_build_intervals: %d final intervals", wi);
@@ -1268,21 +1295,26 @@ static void ra_linear_scan(SSAInterval *intervals, int count,
       cur->r0 = reg;
       active[active_count++] = cur;
     } else {
-      /* Spill: evict the interval with longest remaining range */
+      /* Spill: among intervals that extend past cur, evict the one
+       * with the lowest spill cost (fewest loop-weighted uses).
+       * use_count is already weighted by loop depth (4^depth per use),
+       * so this prefers evicting intervals with few loop-hot uses. */
       SSAInterval *victim = NULL;
       int victim_idx = -1;
-      uint32_t worst_end = 0;
+      uint16_t victim_uses = UINT16_MAX;
       for (int j = 0; j < active_count; j++) {
         SSAInterval *a = active[j];
         if (a->precolored >= 0) continue;
         if (a->reg_type != LS_REG_TYPE_INT) continue;
-        if (a->end > worst_end || (a->end == worst_end && victim && a->use_count < victim->use_count)) {
-          worst_end = a->end;
+        if (a->end <= cur->end) continue;
+        if (a->use_count < victim_uses ||
+            (a->use_count == victim_uses && victim && a->end > victim->end)) {
+          victim_uses = a->use_count;
           victim = a;
           victim_idx = j;
         }
       }
-      if (victim && victim->end > cur->end) {
+      if (victim) {
         /* Evict victim, give its register to cur */
         reg = victim->r0;
         victim->r0 = -1;
@@ -2342,6 +2374,14 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
 
 /* ============================================================================
  * Post-Allocation Move Coalescing
+ *
+ * Eliminates register-to-register copies (ASSIGN dest = src) by making both
+ * sides share the same physical register.  The source must die at the ASSIGN
+ * instruction, the new register must be free for the destination's entire
+ * live range, and call-crossing safety must be preserved.
+ *
+ * The code generator already elides identity moves (mov rX, rX), so a
+ * successful coalescing eliminates the copy without modifying the IR.
  * ============================================================================ */
 
 int tcc_ir_move_coalescing(TCCIRState *ir)
@@ -2354,6 +2394,11 @@ int tcc_ir_move_coalescing(TCCIRState *ir)
   const int n = ir->next_instruction_index;
   const int tbl_size = ls->live_regs_by_instruction_size;
 
+  /* Track vregs already reverse-coalesced to prevent chains where a src
+   * gets moved to register A, then a later ASSIGN moves it back to B. */
+  uint32_t *rev_done = NULL;
+  int rev_done_size = 0;
+
   for (int i = 0; i < n; ++i)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
@@ -2362,16 +2407,18 @@ int tcc_ir_move_coalescing(TCCIRState *ir)
 
     const IROperand src1 = tcc_ir_op_get_src1(ir, q);
     const IROperand dest = tcc_ir_op_get_dest(ir, q);
-    if (!irop_config[q->op].has_src1 || !tcc_ir_vreg_is_valid(ir, src1.vr))
+    if (src1.is_lval || dest.is_lval) continue;
+    int32_t sv = irop_get_vreg(src1);
+    if (sv < 0 || !tcc_ir_vreg_is_valid(ir, sv))
       continue;
     int32_t dv = irop_get_vreg(dest);
-    if (!irop_config[q->op].has_dest || !tcc_ir_vreg_is_valid(ir, dv))
+    if (dv < 0 || !tcc_ir_vreg_is_valid(ir, dv))
       continue;
 
     LSLiveInterval *src_iv = NULL, *dst_iv = NULL;
     for (int j = 0; j < ls->next_interval_index; ++j)
     {
-      if (ls->intervals[j].vreg == (uint32_t)src1.vr) src_iv = &ls->intervals[j];
+      if (ls->intervals[j].vreg == (uint32_t)sv) src_iv = &ls->intervals[j];
       if (ls->intervals[j].vreg == (uint32_t)dv) dst_iv = &ls->intervals[j];
       if (src_iv && dst_iv) break;
     }
@@ -2379,30 +2426,141 @@ int tcc_ir_move_coalescing(TCCIRState *ir)
     if (src_iv->r0 < 0 || dst_iv->r0 < 0) continue;
     if (src_iv->stack_location != 0 || dst_iv->stack_location != 0) continue;
     if (src_iv->r0 == dst_iv->r0) continue;
-    if (src_iv->end != (uint32_t)i) continue;
 
-    int src_reg = src_iv->r0;
-    int conflict = 0;
-    for (int k = i + 1; k <= (int)dst_iv->end && k < tbl_size; ++k)
-    {
-      if (ls->live_regs_by_instruction[k] & (1u << src_reg))
+    /* Forward direction: reassign dest to use src's register.
+     * Requires src to die at this ASSIGN. */
+    if (src_iv->end == (uint32_t)i) {
+      int src_reg = src_iv->r0;
+      if (dst_iv->crosses_call && !(src_reg >= 4 && src_reg <= 11))
+        goto try_reverse;
+
+      int conflict = 0;
+      for (int k = i + 1; k <= (int)dst_iv->end && k < tbl_size; ++k)
       {
-        conflict = 1;
-        break;
+        if (ls->live_regs_by_instruction[k] & (1u << src_reg))
+        { conflict = 1; break; }
+      }
+      if (!conflict) {
+        for (int k = (int)dst_iv->start; k < i && k < tbl_size; ++k)
+        {
+          if (ls->live_regs_by_instruction[k] & (1u << src_reg))
+          { conflict = 1; break; }
+        }
+      }
+      if (!conflict) {
+        int old_reg = dst_iv->r0;
+        dst_iv->r0 = src_reg;
+        for (int k = (int)dst_iv->start; k <= (int)dst_iv->end && k < tbl_size; ++k)
+        {
+          ls->live_regs_by_instruction[k] &= ~(1u << old_reg);
+          ls->live_regs_by_instruction[k] |= (1u << src_reg);
+        }
+        coalesced++;
+        continue;
+      }
+    }
+
+    /* Reverse direction: reassign src to use dest's register.
+     * Works for loop-carried phi copies where src = f(dest, ...) and
+     * dest's register is only occupied by dest during src's range.
+     * Safety: src must not be redefined between the ASSIGN and dest's
+     * last use, otherwise the shared register would get clobbered. */
+try_reverse:;
+    /* Skip if this src vreg was already reverse-coalesced */
+    {
+      int already = 0;
+      for (int ri = 0; ri < rev_done_size; ri++) {
+        if (rev_done[ri] == (uint32_t)sv) { already = 1; break; }
+      }
+      if (already) continue;
+    }
+    int dest_reg = dst_iv->r0;
+    if (src_iv->crosses_call && !(dest_reg >= 4 && dest_reg <= 11))
+      continue;
+
+    int conflict = 0;
+
+    /* Conservative: src must be defined directly FROM dest (reads dest
+     * as src1), like `src = dest + 1` or `src = dest * x + acc`.
+     * This guarantees ARM's read-before-write makes the in-place
+     * operation correct. */
+    {
+      int def_idx = (int)src_iv->start;
+      if (def_idx < 0 || def_idx >= n) { conflict = 1; goto rev_check_done; }
+      IRQuadCompact *qdef = &ir->compact_instructions[def_idx];
+      if (!irop_config[qdef->op].has_src1) { conflict = 1; goto rev_check_done; }
+      IROperand s1 = tcc_ir_op_get_src1(ir, qdef);
+      if (irop_get_vreg(s1) != dv) { conflict = 1; goto rev_check_done; }
+    }
+
+    /* Check src is not redefined while dest is still live */
+    for (int k = i + 1; k <= (int)dst_iv->end && k < n; ++k)
+    {
+      IRQuadCompact *qk = &ir->compact_instructions[k];
+      if (qk->op == TCCIR_OP_NOP) continue;
+      if (irop_config[qk->op].has_dest) {
+        IROperand dk = tcc_ir_op_get_dest(ir, qk);
+        int is_mem_store = (qk->op == TCCIR_OP_STORE || qk->op == TCCIR_OP_STORE_INDEXED ||
+                            qk->op == TCCIR_OP_STORE_POSTINC) && dk.is_lval;
+        if (!is_mem_store) {
+          int32_t dkvr = irop_get_vreg(dk);
+          if (dkvr == sv) { conflict = 1; break; }
+        }
+      }
+    }
+    if (conflict) goto rev_check_done;
+
+    /* Check dest not used between src's def and the ASSIGN.
+     * src's def overwrites dest_reg; any intervening use of dest
+     * would read the wrong value. */
+    for (int k = (int)src_iv->start + 1; k < i && k < n; ++k)
+    {
+      IRQuadCompact *qk = &ir->compact_instructions[k];
+      if (qk->op == TCCIR_OP_NOP) continue;
+      if (irop_config[qk->op].has_src1) {
+        if (irop_get_vreg(tcc_ir_op_get_src1(ir, qk)) == dv) { conflict = 1; break; }
+      }
+      if (!conflict && irop_config[qk->op].has_src2) {
+        if (irop_get_vreg(tcc_ir_op_get_src2(ir, qk)) == dv) { conflict = 1; break; }
+      }
+      if (!conflict && irop_config[qk->op].has_dest) {
+        IROperand dk = tcc_ir_op_get_dest(ir, qk);
+        if (dk.is_lval && irop_get_vreg(dk) == dv) { conflict = 1; break; }
+      }
+      if (!conflict && qk->op == TCCIR_OP_MLA) {
+        if (irop_get_vreg(tcc_ir_op_get_accum(ir, qk)) == dv) { conflict = 1; break; }
+      }
+    }
+rev_check_done:
+    if (conflict) continue;
+
+    /* Check dest_reg not occupied by other intervals during src's range */
+    for (int k = (int)src_iv->start; k <= (int)src_iv->end && k < tbl_size; ++k)
+    {
+      if (ls->live_regs_by_instruction[k] & (1u << dest_reg))
+      {
+        /* dest_reg is live here — only OK if it's from dest_iv itself */
+        if (k < (int)dst_iv->start || k > (int)dst_iv->end)
+        { conflict = 1; break; }
       }
     }
     if (conflict) continue;
 
-    int old_reg = dst_iv->r0;
-    dst_iv->r0 = src_reg;
-
-    for (int k = (int)dst_iv->start; k <= (int)dst_iv->end && k < tbl_size; ++k)
+    int old_reg = src_iv->r0;
+    src_iv->r0 = dest_reg;
+    for (int k = (int)src_iv->start; k <= (int)src_iv->end && k < tbl_size; ++k)
     {
       ls->live_regs_by_instruction[k] &= ~(1u << old_reg);
-      ls->live_regs_by_instruction[k] |= (1u << src_reg);
+      ls->live_regs_by_instruction[k] |= (1u << dest_reg);
     }
+    /* Record this src vreg as reverse-coalesced */
+    rev_done = tcc_realloc(rev_done, sizeof(uint32_t) * (rev_done_size + 1));
+    rev_done[rev_done_size++] = (uint32_t)sv;
     coalesced++;
   }
+
+  if (rev_done)
+    tcc_free(rev_done);
 
   if (coalesced > 0)
     tcc_ls_recompute_dirty_registers(ls);

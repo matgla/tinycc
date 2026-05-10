@@ -218,6 +218,10 @@ int tcc_ir_opt_decrement_to_zero(struct TCCIRState *ir);
 /* Redundant Init Elimination - remove function-entry VAR inits killed before use */
 int tcc_ir_opt_redundant_init_elim(struct TCCIRState *ir);
 
+/* Back-Edge Phi Hoisting - transform JUMPIF exit + ASSIGNs + JUMP body into
+ * ASSIGNs + inverted JUMPIF body, eliminating one branch per loop */
+int tcc_ir_opt_backedge_phi_hoist(struct TCCIRState *ir);
+
 /* ============================================================================
  * Optimization Driver
  * ============================================================================ */
