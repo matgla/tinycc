@@ -117,6 +117,7 @@ int ssa_opt_branch(IRSSAOptCtx *ctx);
 int ssa_opt_sccp(IRSSAOptCtx *ctx);
 int ssa_opt_load_cse(IRSSAOptCtx *ctx);
 int ssa_opt_var_forward(IRSSAOptCtx *ctx);
+int ssa_opt_var_const_fold(IRSSAOptCtx *ctx);
 
 /* ============================================================================
  * Target-Specific Generator Registration

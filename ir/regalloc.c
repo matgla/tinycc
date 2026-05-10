@@ -2142,6 +2142,7 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
         tcc_ir_ssa_opt_run(&ssa_opt_ctx);
       } else {
         ssa_opt_ctx.no_stack_fwd = 0;
+        ssa_opt_var_const_fold(&ssa_opt_ctx);
         ssa_opt_var_forward(&ssa_opt_ctx);
         ssa_opt_sccp(&ssa_opt_ctx);
         ssa_opt_load_cse(&ssa_opt_ctx);

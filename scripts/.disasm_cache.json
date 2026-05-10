@@ -11,13 +11,13 @@
   },
   "95_const_branch_fold::main": {
     "gcc": 11,
-    "tcc": 32,
-    "updated": "2026-05-10T10:05:01.888759+00:00"
+    "tcc": 11,
+    "updated": "2026-05-10T10:25:52.863612+00:00"
   },
   "95_const_branch_fold::test_fold_branch": {
     "gcc": 2,
-    "tcc": 3,
-    "updated": "2026-05-10T10:05:01.888770+00:00"
+    "tcc": 2,
+    "updated": "2026-05-10T10:25:52.863626+00:00"
   },
   "95_const_branch_fold::test_fold_modulo": {
     "gcc": 2,
@@ -31,8 +31,8 @@
   },
   "98_value_tracking::main": {
     "gcc": 13,
-    "tcc": 49,
-    "updated": "2026-05-10T09:41:43.283815+00:00"
+    "tcc": 40,
+    "updated": "2026-05-10T11:15:28.659242+00:00"
   },
   "98_value_tracking::test_chained_arithmetic": {
     "gcc": 2,
@@ -41,8 +41,8 @@
   },
   "98_value_tracking::test_conditionals_pattern": {
     "gcc": 5,
-    "tcc": 24,
-    "updated": "2026-05-10T09:41:43.283829+00:00"
+    "tcc": 11,
+    "updated": "2026-05-10T11:15:28.659291+00:00"
   },
   "98_value_tracking::test_value_track_add": {
     "gcc": 2,

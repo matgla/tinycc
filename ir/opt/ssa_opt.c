@@ -415,6 +415,7 @@ int tcc_ir_ssa_opt_run(IRSSAOptCtx *ctx)
     iteration++;
 
     /* target-independent passes */
+    changes += ssa_opt_var_const_fold(ctx);
     changes += ssa_opt_sccp(ctx);
     changes += ssa_opt_cprop(ctx);
     changes += ssa_opt_fold(ctx);

@@ -301,3 +301,165 @@ int ssa_opt_var_forward(IRSSAOptCtx *ctx)
   tcc_free(var_addrtaken);
   return changes;
 }
+
+/* ============================================================================
+ * VAR Self-Update Constant Fold: collapse `Vx = Vx OP #imm` against a
+ * dominating prior `Vx = #const` in the same block.
+ *
+ * The standard fold pass requires both operands to be immediate-tagged, which
+ * misses VARs whose value was just stored as a constant (no SSA promotion for
+ * single-block multi-def vars). This peephole walks back within the block,
+ * bailing on anything that could alias or rewrite Vx, and folds the read-side
+ * using the prior store.  The prior store is NOPed (now dead).
+ * ============================================================================ */
+
+static int ssa_var_const_fold_one(IRSSAOptCtx *ctx, int idx)
+{
+  TCCIRState *ir = ctx->ir;
+  IRCFG *cfg = ctx->cfg;
+  if (!cfg)
+    return 0;
+
+  IRQuadCompact *q = &ir->compact_instructions[idx];
+  int op = q->op;
+
+  switch (op) {
+  case TCCIR_OP_ADD: case TCCIR_OP_SUB: case TCCIR_OP_MUL:
+  case TCCIR_OP_AND: case TCCIR_OP_OR:  case TCCIR_OP_XOR:
+  case TCCIR_OP_SHL: case TCCIR_OP_SHR: case TCCIR_OP_SAR:
+    break;
+  default:
+    return 0;
+  }
+
+  IROperand src1 = tcc_ir_op_get_src1(ir, q);
+  IROperand src2 = tcc_ir_op_get_src2(ir, q);
+  IROperand dest = tcc_ir_op_get_dest(ir, q);
+
+  int32_t dest_vr = irop_get_vreg(dest);
+  int32_t src1_vr = irop_get_vreg(src1);
+  if (dest_vr < 0 || src1_vr != dest_vr)
+    return 0;
+  if (TCCIR_DECODE_VREG_TYPE(dest_vr) != TCCIR_VREG_TYPE_VAR)
+    return 0;
+  if (src2.tag != IROP_TAG_IMM32 || src2.is_lval)
+    return 0;
+  /* src1 must be a read of the same VAR. Accept either bare VREG or lval
+   * STACKOFF encoding — the frontend uses the latter when the VAR's value is
+   * read into an arithmetic op. */
+  if (!(src1.tag == IROP_TAG_VREG && !src1.is_lval) &&
+      !(src1.tag == IROP_TAG_STACKOFF && src1.is_lval))
+    return 0;
+
+  int blk = cfg->instr_to_block[idx];
+  if (blk < 0 || blk >= cfg->num_blocks)
+    return 0;
+  IRBasicBlock *bb = &cfg->blocks[blk];
+
+  int prior_idx = -1;
+  int32_t prior_val = 0;
+  for (int k = idx - 1; k >= bb->start_idx; k--) {
+    IRQuadCompact *pq = &ir->compact_instructions[k];
+    if (pq->op == TCCIR_OP_NOP)
+      continue;
+
+    /* Anything that could alias Vx through memory or call kills our fold. */
+    switch (pq->op) {
+    case TCCIR_OP_FUNCCALLVAL:
+    case TCCIR_OP_FUNCCALLVOID:
+    case TCCIR_OP_STORE:
+    case TCCIR_OP_STORE_INDEXED:
+    case TCCIR_OP_STORE_POSTINC:
+    case TCCIR_OP_BLOCK_COPY:
+    case TCCIR_OP_INLINE_ASM:
+    case TCCIR_OP_VLA_ALLOC:
+    case TCCIR_OP_SETJMP:
+    case TCCIR_OP_LONGJMP:
+    case TCCIR_OP_NL_SETJMP:
+    case TCCIR_OP_NL_LONGJMP:
+      return 0;
+    default:
+      break;
+    }
+
+    if (irop_config[pq->op].has_dest &&
+        pq->op != TCCIR_OP_FUNCPARAMVAL && pq->op != TCCIR_OP_FUNCPARAMVOID) {
+      IROperand pd = tcc_ir_op_get_dest(ir, pq);
+      /* var_forward treats any instruction with a VAR-encoded dest as a def
+       * (regardless of is_lval), since writes to a VAR may be expressed via
+       * either bare-vreg or lval-stackoff encoding.  Match that here. */
+      if (irop_get_vreg(pd) == dest_vr) {
+        if (pq->op == TCCIR_OP_ASSIGN) {
+          IROperand ps = tcc_ir_op_get_src1(ir, pq);
+          if (ps.tag == IROP_TAG_IMM32 && !ps.is_lval) {
+            prior_idx = k;
+            prior_val = ps.u.imm32;
+          }
+        }
+        /* Found a write to Vx — either captured constant or unknown. Stop. */
+        break;
+      }
+    }
+  }
+
+  if (prior_idx < 0)
+    return 0;
+
+  int32_t v1 = prior_val;
+  int32_t v2 = src2.u.imm32;
+  int64_t result;
+  switch (op) {
+  case TCCIR_OP_ADD: result = (int64_t)((uint64_t)(uint32_t)v1 + (uint64_t)(uint32_t)v2); break;
+  case TCCIR_OP_SUB: result = (int64_t)((uint64_t)(uint32_t)v1 - (uint64_t)(uint32_t)v2); break;
+  case TCCIR_OP_MUL: result = (int64_t)((uint64_t)(uint32_t)v1 * (uint64_t)(uint32_t)v2); break;
+  case TCCIR_OP_AND: result = v1 & v2; break;
+  case TCCIR_OP_OR:  result = v1 | v2; break;
+  case TCCIR_OP_XOR: result = v1 ^ v2; break;
+  case TCCIR_OP_SHL:
+    if ((uint32_t)v2 >= 32) result = 0;
+    else result = (int64_t)((uint32_t)v1 << (uint32_t)v2);
+    break;
+  case TCCIR_OP_SHR:
+    if ((uint32_t)v2 >= 32) result = 0;
+    else result = (uint32_t)v1 >> (uint32_t)v2;
+    break;
+  case TCCIR_OP_SAR:
+    if ((uint32_t)v2 >= 32) result = v1 >> 31;
+    else result = v1 >> v2;
+    break;
+  default:
+    return 0;
+  }
+
+  IROperand imm = irop_make_imm32(0, (int32_t)result, dest.btype);
+  q->op = TCCIR_OP_ASSIGN;
+  tcc_ir_op_set_src1(ir, q, imm);
+  tcc_ir_op_set_src2(ir, q, IROP_NONE);
+
+  ir->compact_instructions[prior_idx].op = TCCIR_OP_NOP;
+  return 1;
+}
+
+int ssa_opt_var_const_fold(IRSSAOptCtx *ctx)
+{
+  TCCIRState *ir = ctx->ir;
+
+  /* Bail on functions with computed goto or switch-table jumps: the CFG
+   * does not enumerate every IJMP target, so the basic block containing a
+   * self-update may actually be re-entered mid-block via a label-as-value.
+   * Walking back to a "prior store" then folds against the function-entry
+   * value rather than the per-iteration value (regression in 920501-3). */
+  for (int i = 0; i < ir->next_instruction_index; i++) {
+    int op = ir->compact_instructions[i].op;
+    if (op == TCCIR_OP_IJUMP || op == TCCIR_OP_SWITCH_TABLE)
+      return 0;
+  }
+
+  int changes = 0;
+  for (int i = 0; i < ir->next_instruction_index; i++) {
+    if (ir->compact_instructions[i].op == TCCIR_OP_NOP)
+      continue;
+    changes += ssa_var_const_fold_one(ctx, i);
+  }
+  return changes;
+}
