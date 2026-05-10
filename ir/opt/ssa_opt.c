@@ -11,6 +11,7 @@
 #define USING_GLOBALS
 #include "ir.h"
 #include "ssa_opt.h"
+#include <limits.h>
 
 /* ============================================================================
  * Target-Specific Generator Registration
@@ -373,6 +374,102 @@ int ssa_opt_replace_all_uses(IRSSAOptCtx *ctx, int32_t old_vr, int32_t new_vr)
   }
 
   return count;
+}
+
+/* ============================================================================
+ * LEA Resolution Helpers (shared by load_cse + sccp)
+ * ============================================================================ */
+
+int ssa_opt_resolve_lea_stackloc(IRSSAOptCtx *ctx, int32_t vr)
+{
+  if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
+    return INT_MIN;
+  IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, vr);
+  if (!vi || vi->def_instr < 0 || vi->def_count > 1)
+    return INT_MIN;
+  TCCIRState *ir = ctx->ir;
+  IRQuadCompact *dq = &ir->compact_instructions[vi->def_instr];
+  if (dq->op == TCCIR_OP_LEA) {
+    IROperand src = tcc_ir_op_get_src1(ir, dq);
+    if (src.tag == IROP_TAG_STACKOFF || src.is_local)
+      return irop_get_stack_offset(src);
+  }
+  if (dq->op == TCCIR_OP_ASSIGN) {
+    IROperand src = tcc_ir_op_get_src1(ir, dq);
+    if (src.tag == IROP_TAG_STACKOFF && !src.is_lval)
+      return irop_get_stack_offset(src);
+    int32_t sv = irop_get_vreg(src);
+    if (sv >= 0 && !src.is_lval)
+      return ssa_opt_resolve_lea_stackloc(ctx, sv);
+  }
+  /* T = base + imm where base resolves to LEA(StackLoc[N]).  Common pattern
+   * for struct field address: T46 = T45 + 4 with T45 = &StackLoc[-196]. */
+  if (dq->op == TCCIR_OP_ADD || dq->op == TCCIR_OP_SUB) {
+    IROperand src1 = tcc_ir_op_get_src1(ir, dq);
+    IROperand src2 = tcc_ir_op_get_src2(ir, dq);
+    if (!src1.is_lval && irop_is_immediate(src2)) {
+      int32_t s1vr = irop_get_vreg(src1);
+      if (s1vr >= 0) {
+        int base_off = ssa_opt_resolve_lea_stackloc(ctx, s1vr);
+        if (base_off != INT_MIN) {
+          int delta = irop_get_imm32(src2);
+          return dq->op == TCCIR_OP_ADD ? base_off + delta : base_off - delta;
+        }
+      }
+    }
+  }
+  return INT_MIN;
+}
+
+int ssa_opt_indirect_stack_offset(IRSSAOptCtx *ctx, const IRQuadCompact *q, int side)
+{
+  TCCIRState *ir = ctx->ir;
+  IROperand base;
+  int has_index = 0;
+  int require_lval = 0;
+  IROperand idx = IROP_NONE, scale = IROP_NONE;
+
+  if (side == SSA_OPT_INDIRECT_DEST) {
+    base = tcc_ir_op_get_dest(ir, q);
+    if (q->op == TCCIR_OP_STORE_INDEXED) {
+      has_index = 1;
+      idx = tcc_ir_op_get_src2(ir, q);
+      scale = tcc_ir_op_get_scale(ir, q);
+    } else if (q->op == TCCIR_OP_STORE) {
+      require_lval = 1; /* plain *T = val: T must be deref'd */
+    } else {
+      return INT_MIN;
+    }
+  } else {
+    base = tcc_ir_op_get_src1(ir, q);
+    if (q->op == TCCIR_OP_LOAD_INDEXED) {
+      has_index = 1;
+      idx = tcc_ir_op_get_src2(ir, q);
+      scale = tcc_ir_op_get_scale(ir, q);
+    } else if (q->op == TCCIR_OP_LOAD) {
+      require_lval = 1;
+    } else {
+      return INT_MIN;
+    }
+  }
+
+  if (base.tag != IROP_TAG_VREG || base.is_local)
+    return INT_MIN;
+  if (require_lval && !base.is_lval)
+    return INT_MIN;
+  int32_t bvr = irop_get_vreg(base);
+  if (bvr < 0 || TCCIR_DECODE_VREG_TYPE(bvr) != TCCIR_VREG_TYPE_TEMP)
+    return INT_MIN;
+  int base_off = ssa_opt_resolve_lea_stackloc(ctx, bvr);
+  if (base_off == INT_MIN)
+    return INT_MIN;
+  if (!has_index)
+    return base_off;
+  if (!irop_is_immediate(idx) || !irop_is_immediate(scale))
+    return INT_MIN;
+  if (irop_get_imm32(scale) != 0)
+    return INT_MIN;
+  return base_off + irop_get_imm32(idx);
 }
 
 /* ============================================================================

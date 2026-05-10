@@ -98,18 +98,35 @@ static void sstore_remove_offset(GLoadState *st, int offset)
     st->sstores[k] = st->sstores[--st->scount];
 }
 
+static int slot_btype_bytes(int btype)
+{
+  switch (btype) {
+  case IROP_BTYPE_INT8: return 1;
+  case IROP_BTYPE_INT16: return 2;
+  case IROP_BTYPE_INT32:
+  case IROP_BTYPE_FLOAT32:
+  case IROP_BTYPE_FUNC: return 4;
+  case IROP_BTYPE_INT64:
+  case IROP_BTYPE_FLOAT64: return 8;
+  default: return 8;
+  }
+}
+
 static void sstore_invalidate_overlap(GLoadState *st, int offset, int btype)
 {
-  int size = (btype == IROP_BTYPE_INT64 || btype == IROP_BTYPE_FLOAT64) ? 8 : 4;
-  if (size > 4) {
-    for (int w = 4; w < size; w += 4)
-      sstore_remove_offset(st, offset + w);
-  }
+  int size = slot_btype_bytes(btype);
+  int lo = offset;
+  int hi = offset + size;
   for (int k = 0; k < st->scount; k++) {
     SStoreEntry *e = &st->sstores[k];
-    int esize = (e->btype == IROP_BTYPE_INT64 || e->btype == IROP_BTYPE_FLOAT64) ? 8 : 4;
-    if (esize > 4 && e->stack_offset != offset &&
-        e->stack_offset < offset + size && e->stack_offset + esize > offset) {
+    int esize = slot_btype_bytes(e->btype);
+    int elo = e->stack_offset;
+    int ehi = elo + esize;
+    /* Drop entries whose byte range overlaps the new store and is not
+     * an exact size+offset match (which sstore_track_* will overwrite). */
+    if (e->stack_offset == offset && esize == size)
+      continue;
+    if (elo < hi && ehi > lo) {
       st->sstores[k] = st->sstores[--st->scount];
       k--;
     }
@@ -162,33 +179,8 @@ static void sstore_remove_vr(GLoadState *st, int32_t vr)
   }
 }
 
-/* Resolve a TEMP vreg backward to find if it's Addr[StackLoc[N]].
- * Returns the stack offset, or INT_MIN if not resolvable. */
-static int resolve_lea_stackloc(IRSSAOptCtx *ctx, int32_t vr)
-{
-  if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
-    return INT_MIN;
-  IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, vr);
-  if (!vi || vi->def_instr < 0 || vi->def_count > 1)
-    return INT_MIN;
-  TCCIRState *ir = ctx->ir;
-  IRQuadCompact *dq = &ir->compact_instructions[vi->def_instr];
-  if (dq->op == TCCIR_OP_LEA) {
-    IROperand src = tcc_ir_op_get_src1(ir, dq);
-    if (src.tag == IROP_TAG_STACKOFF || src.is_local)
-      return irop_get_stack_offset(src);
-  }
-  if (dq->op == TCCIR_OP_ASSIGN) {
-    IROperand src = tcc_ir_op_get_src1(ir, dq);
-    if (src.tag == IROP_TAG_STACKOFF && !src.is_lval)
-      return irop_get_stack_offset(src);
-    /* Chase through TEMP copies */
-    int32_t sv = irop_get_vreg(src);
-    if (sv >= 0 && !src.is_lval)
-      return resolve_lea_stackloc(ctx, sv);
-  }
-  return INT_MIN;
-}
+/* resolve_lea_stackloc moved to ssa_opt.c as ssa_opt_resolve_lea_stackloc. */
+#define resolve_lea_stackloc ssa_opt_resolve_lea_stackloc
 
 static int gload_process_block(IRSSAOptCtx *ctx, GLoadState state, int b)
 {
@@ -221,6 +213,38 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState state, int b)
     if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED) {
       IROperand dest = tcc_ir_op_get_dest(ir, q);
 
+      /* Source-side load forwarding: if the source is a stack-loadable
+       * lvalue (direct StackLoc or *TEMP-resolving-to-LEA) and we have a
+       * tracked constant or vreg there, rewrite the source.  Apply before
+       * tracking, since tracking might invalidate the src offset. */
+      if (q->op == TCCIR_OP_STORE && !ctx->no_stack_fwd) {
+        IROperand src = tcc_ir_op_get_src1(ir, q);
+        if (src.is_lval && !src.is_sym && !irop_is_immediate(src)) {
+          int load_off = INT_MIN;
+          int load_btype = irop_get_btype(src);
+          if (src.tag == IROP_TAG_STACKOFF) {
+            int32_t svr = irop_get_vreg(src);
+            if (svr < 0 || TCCIR_DECODE_VREG_TYPE(svr) != TCCIR_VREG_TYPE_VAR)
+              load_off = irop_get_stack_offset(src);
+          } else if (src.tag == IROP_TAG_VREG && !src.is_local) {
+            int32_t pvr = irop_get_vreg(src);
+            load_off = resolve_lea_stackloc(ctx, pvr);
+          }
+          if (load_off != INT_MIN) {
+            int sk = sstore_find(&state, load_off);
+            if (sk >= 0 && state.sstores[sk].btype == load_btype) {
+              SStoreEntry *se = &state.sstores[sk];
+              if (se->stored_vr < 0) {
+                tcc_ir_set_src1(ir, i, se->stored_imm);
+                changes++;
+                /* Refresh dest after rewrite (no-op for STORE; just use
+                 * existing local to keep flow consistent). */
+              }
+            }
+          }
+        }
+      }
+
       /* Track StackLoc stores for stack forwarding.  Record the stored
        * slot width so narrower subfield loads do not reuse wider values. */
       if (dest.tag == IROP_TAG_STACKOFF) {
@@ -242,6 +266,36 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState state, int b)
             state.sstores[k] = state.sstores[--state.scount];
         }
         continue;
+      }
+
+      /* TEMP-DEREF stack stores: *T = val (STORE) or *(T + idx) = val
+       * (STORE_INDEXED with scale=0), where T resolves to LEA(StackLoc[N]).
+       * Treat as a direct stack store at the resolved offset.  STORE_INDEXED
+       * carries its base in dest as a non-lvalue pointer; STORE wraps the
+       * dest pointer in is_lval to express the deref. */
+      int store_dest_is_temp_indir =
+          (dest.tag == IROP_TAG_VREG && !dest.is_local &&
+           ((q->op == TCCIR_OP_STORE && dest.is_lval) ||
+            q->op == TCCIR_OP_STORE_INDEXED));
+      if (store_dest_is_temp_indir) {
+        int eff_off = ssa_opt_indirect_stack_offset(ctx, q, SSA_OPT_INDIRECT_DEST);
+        if (eff_off != INT_MIN) {
+          if (!ctx->no_stack_fwd) {
+            IROperand src = tcc_ir_op_get_src1(ir, q);
+            int store_btype = irop_get_btype(dest);
+            int32_t svr = irop_get_vreg(src);
+            if (svr >= 0 && TCCIR_DECODE_VREG_TYPE(svr) == TCCIR_VREG_TYPE_TEMP)
+              sstore_track_vr(&state, eff_off, store_btype, svr);
+            else if (irop_is_immediate(src))
+              sstore_track_imm(&state, eff_off, store_btype, src);
+            else
+              sstore_remove_offset(&state, eff_off);
+          }
+          continue;
+        }
+        /* Indirect TEMP-DEREF store with unresolved address.  We can't
+         * prove which slot it touches, so the global-load aliasing logic
+         * below applies (kill state).  Fall through. */
       }
 
       if (dest.is_local) {

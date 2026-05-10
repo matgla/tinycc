@@ -896,8 +896,8 @@
   },
   "ir/bug_struct_field_postinc::main": {
     "gcc": 33,
-    "tcc": 63,
-    "updated": "2026-05-10T09:41:26.060511+00:00"
+    "tcc": 60,
+    "updated": "2026-05-10T13:40:38.149460+00:00"
   },
   "ir/bug_struct_member_cmp_fold::main": {
     "gcc": 107,
@@ -1076,8 +1076,8 @@
   },
   "ir/nested_capture_array::main": {
     "gcc": 14,
-    "tcc": 41,
-    "updated": "2026-05-02T08:48:22.345113+00:00"
+    "tcc": 40,
+    "updated": "2026-05-10T13:40:38.149596+00:00"
   },
   "ir/nested_capture_multiple::main": {
     "gcc": 24,
@@ -1713,5 +1713,10 @@
     "gcc": 91,
     "tcc": 196,
     "updated": "2026-05-02T09:36:13.429614+00:00"
+  },
+  "test_struct_return::main": {
+    "gcc": 7,
+    "tcc": 51,
+    "updated": "2026-05-10T13:14:00.679211+00:00"
   }
 }

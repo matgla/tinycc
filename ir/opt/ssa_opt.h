@@ -125,6 +125,21 @@ int ssa_opt_dead_loop(IRSSAOptCtx *ctx);
  * copies for the dead path. */
 void ssa_drop_phi_edge(IRSSAOptCtx *ctx, int dead_pred_block, int target_block_idx);
 
+/* Resolve a TEMP vreg backward to find if it's Addr[StackLoc[N]].  Chases
+ * single-def LEA → ASSIGN copy chains.  Returns the stack offset, or INT_MIN
+ * if the chain doesn't resolve to a stack address.  Multi-def TEMPs bail. */
+int ssa_opt_resolve_lea_stackloc(IRSSAOptCtx *ctx, int32_t vr);
+
+/* Resolve the effective stack offset that a STORE / STORE_INDEXED / LOAD /
+ * LOAD_INDEXED targets, when its base address is a TEMP that resolves to
+ * Addr[StackLoc[N]].  For STORE_INDEXED and LOAD_INDEXED, the immediate index
+ * (with scale=0) is added to the resolved base.  Returns INT_MIN when the
+ * dest is not TEMP-DEREF or the LEA chain does not resolve, or the index
+ * is not a constant with scale 0. */
+int ssa_opt_indirect_stack_offset(IRSSAOptCtx *ctx, const IRQuadCompact *q, int side);
+#define SSA_OPT_INDIRECT_DEST 0  /* STORE / STORE_INDEXED dest base */
+#define SSA_OPT_INDIRECT_SRC1 1  /* LOAD / LOAD_INDEXED source base */
+
 /* ============================================================================
  * Target-Specific Generator Registration
  *

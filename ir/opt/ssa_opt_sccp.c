@@ -11,6 +11,7 @@
 #define USING_GLOBALS
 #include "ir.h"
 #include "ssa_opt.h"
+#include <limits.h>
 
 /* ============================================================================
  * SCCP: Sparse Conditional Constant Propagation
@@ -157,6 +158,10 @@ static int sccp_get_operand_value(SCCPState *s, IROperand op, int64_t *out)
   return c->state;
 }
 
+/* Forward decl: defined below. */
+static int sccp_resolve_stack_load(SCCPState *s, int soff, int load_btype,
+                                   int instr_idx, int64_t *out, int *dep_pos);
+
 static int sccp_get_store_src_value(SCCPState *s, IROperand src, int64_t *out,
                                     int *src_pos_out)
 {
@@ -175,6 +180,192 @@ static int sccp_get_store_src_value(SCCPState *s, IROperand src, int64_t *out,
     *out = src_cell->value;
     if (src_pos_out) *src_pos_out = TCCIR_DECODE_VREG_POSITION(src_vr);
     return SCCP_CONST;
+  }
+  return SCCP_BOTTOM;
+}
+
+/* Variant that also resolves a STACKOFF-lvalue source via stack-store
+ * scanning.  Needs the instruction index for backward dominator-tree walk. */
+static int sccp_get_store_src_value_ex(SCCPState *s, IROperand src,
+                                       int instr_idx, int64_t *out,
+                                       int *src_pos_out)
+{
+  int st = sccp_get_store_src_value(s, src, out, src_pos_out);
+  if (st != SCCP_BOTTOM)
+    return st;
+
+  int load_off = INT_MIN;
+  /* Direct StackLoc lvalue: V <-- StackLoc[N] [STORE]. */
+  if (src.tag == IROP_TAG_STACKOFF && src.is_lval && src.is_local && !src.is_llocal) {
+    int32_t svr = irop_get_vreg(src);
+    if (svr < 0 || TCCIR_DECODE_VREG_TYPE(svr) != TCCIR_VREG_TYPE_VAR)
+      load_off = irop_get_stack_offset(src);
+  }
+  /* TEMP-DEREF lvalue: V <-- *T [STORE] where T resolves to &StackLoc[N]. */
+  if (load_off == INT_MIN && src.tag == IROP_TAG_VREG && src.is_lval &&
+      !src.is_local) {
+    int32_t svr = irop_get_vreg(src);
+    if (svr >= 0 && TCCIR_DECODE_VREG_TYPE(svr) == TCCIR_VREG_TYPE_TEMP)
+      load_off = ssa_opt_resolve_lea_stackloc(s->ctx, svr);
+  }
+
+  if (load_off != INT_MIN) {
+    int dep_pos = -1;
+    int st2 = sccp_resolve_stack_load(s, load_off, irop_get_btype(src),
+                                       instr_idx, out, &dep_pos);
+    if (st2 == SCCP_CONST) {
+      if (src_pos_out && dep_pos >= 0)
+        *src_pos_out = dep_pos;
+      return SCCP_CONST;
+    }
+  }
+  return SCCP_BOTTOM;
+}
+
+/* Conservative byte size for an IROP_BTYPE.  Treats unknown/struct as 8
+ * so unrelated stores can't be proven not to alias them. */
+static int sccp_btype_bytes(int btype)
+{
+  switch (btype) {
+  case IROP_BTYPE_INT8: return 1;
+  case IROP_BTYPE_INT16: return 2;
+  case IROP_BTYPE_INT32:
+  case IROP_BTYPE_FLOAT32:
+  case IROP_BTYPE_FUNC: return 4;
+  case IROP_BTYPE_INT64:
+  case IROP_BTYPE_FLOAT64: return 8;
+  default: return 8;
+  }
+}
+
+/* Try to identify the stack offset that a STORE-class instruction targets,
+ * accounting for both direct StackLoc dests and TEMP-DEREF dests that
+ * resolve back to LEA(StackLoc[N]).  Returns INT_MIN when the dest is
+ * something else (global, escaping pointer, unresolved LEA, etc.). */
+static int sccp_store_target_off(IRSSAOptCtx *ctx, IRQuadCompact *sq,
+                                 int *out_btype)
+{
+  TCCIRState *ir = ctx->ir;
+  IROperand sd = tcc_ir_op_get_dest(ir, sq);
+  if (sq->op == TCCIR_OP_STORE) {
+    if (sd.tag == IROP_TAG_STACKOFF && sd.is_lval && sd.is_local) {
+      if (out_btype) *out_btype = irop_get_btype(sd);
+      return irop_get_stack_offset(sd);
+    }
+    int off = ssa_opt_indirect_stack_offset(ctx, sq, SSA_OPT_INDIRECT_DEST);
+    if (off != INT_MIN && out_btype)
+      *out_btype = irop_get_btype(sd);
+    return off;
+  }
+  if (sq->op == TCCIR_OP_STORE_INDEXED) {
+    int off = ssa_opt_indirect_stack_offset(ctx, sq, SSA_OPT_INDIRECT_DEST);
+    if (off != INT_MIN && out_btype)
+      *out_btype = irop_get_btype(sd);
+    return off;
+  }
+  return INT_MIN;
+}
+
+/* Could store sq potentially alias the global / unknown-pointer load
+ * we're trying to resolve?  Returns 1 when we can't prove non-aliasing. */
+static int sccp_store_may_escape(IRSSAOptCtx *ctx, IRQuadCompact *sq)
+{
+  TCCIRState *ir = ctx->ir;
+  IROperand sd = tcc_ir_op_get_dest(ir, sq);
+  /* Direct stack stores never alias unrelated stack slots; checked by
+   * caller against soff. */
+  if (sd.tag == IROP_TAG_STACKOFF && sd.is_lval && sd.is_local)
+    return 0;
+  /* TEMP-DEREF stores that resolve to a known stack slot likewise can
+   * be reasoned about by offset.  Caller compares offsets. */
+  if (sd.tag == IROP_TAG_VREG && sd.is_lval && !sd.is_local) {
+    int off = ssa_opt_indirect_stack_offset(ctx, sq, SSA_OPT_INDIRECT_DEST);
+    if (off != INT_MIN)
+      return 0;
+  }
+  /* VAR stores: writing into a named local slot — separate from the stack
+   * load we're tracking unless its address escaped (we conservatively bail
+   * in those cases below). */
+  if (sd.is_local && !sd.is_lval)
+    return 0;
+  return 1;
+}
+
+/* Scan one block backward looking for a stack store at offset `soff` that
+ * matches load_btype.  Returns SCCP_CONST with *out set, SCCP_BOTTOM if a
+ * potentially-aliasing store was hit before finding a match, or SCCP_TOP
+ * if the block was scanned to its start with no aliasing/matching store. */
+static int sccp_scan_block_for_stack_store(SCCPState *s, IRBasicBlock *bb,
+                                           int start_idx, int soff,
+                                           int load_btype, int64_t *out,
+                                           int *dep_pos)
+{
+  TCCIRState *ir = s->ctx->ir;
+  int load_size = sccp_btype_bytes(load_btype);
+  int load_lo = soff;
+  int load_hi = soff + load_size;
+  for (int si = start_idx; si >= bb->start_idx; si--) {
+    IRQuadCompact *sq = &ir->compact_instructions[si];
+    if (sq->op == TCCIR_OP_NOP)
+      continue;
+    if (sq->op == TCCIR_OP_FUNCCALLVOID || sq->op == TCCIR_OP_FUNCCALLVAL)
+      return SCCP_BOTTOM;
+    if (sq->op == TCCIR_OP_STORE_POSTINC)
+      return SCCP_BOTTOM;  /* writes to memory + updates pointer */
+    if (sq->op == TCCIR_OP_STORE_INDEXED || sq->op == TCCIR_OP_STORE) {
+      int store_btype = 0;
+      int target = sccp_store_target_off(s->ctx, sq, &store_btype);
+      if (target == INT_MIN) {
+        if (sq->op == TCCIR_OP_STORE_INDEXED)
+          return SCCP_BOTTOM;
+        if (sccp_store_may_escape(s->ctx, sq))
+          return SCCP_BOTTOM;
+        continue;
+      }
+      /* Exact match: forward the stored value. */
+      if (target == soff && store_btype == load_btype) {
+        int st2 = sccp_get_store_src_value(s, tcc_ir_op_get_src1(ir, sq),
+                                            out, dep_pos);
+        if (st2 == SCCP_CONST)
+          return SCCP_CONST;
+        return SCCP_BOTTOM;
+      }
+      /* Aliasing check: bail if byte ranges overlap. */
+      int store_size = sccp_btype_bytes(store_btype);
+      int store_lo = target;
+      int store_hi = target + store_size;
+      if (store_hi > load_lo && load_hi > store_lo)
+        return SCCP_BOTTOM;
+      /* Disjoint stack ranges; keep scanning. */
+      continue;
+    }
+  }
+  return SCCP_TOP;
+}
+
+static int sccp_resolve_stack_load(SCCPState *s, int soff, int load_btype,
+                                   int instr_idx, int64_t *out, int *dep_pos)
+{
+  IRCFG *cfg = s->ctx->cfg;
+  int block = cfg->instr_to_block[instr_idx];
+  IRBasicBlock *bb = &cfg->blocks[block];
+
+  int st = sccp_scan_block_for_stack_store(s, bb, instr_idx - 1, soff,
+                                            load_btype, out, dep_pos);
+  if (st != SCCP_TOP)
+    return st;
+
+  /* Walk up dominator tree if not found in current block. */
+  int dom = bb->idom;
+  while (dom >= 0 && dom != block) {
+    IRBasicBlock *db = &cfg->blocks[dom];
+    int dst = sccp_scan_block_for_stack_store(s, db, db->end_idx - 1, soff,
+                                               load_btype, out, dep_pos);
+    if (dst != SCCP_TOP)
+      return dst;
+    if (dom == db->idom)
+      break;
+    dom = db->idom;
   }
   return SCCP_BOTTOM;
 }
@@ -230,8 +421,8 @@ static int sccp_resolve_var(SCCPState *s, int32_t var_vreg, int instr_idx,
       if (dv >= 0 &&
           TCCIR_DECODE_VREG_TYPE(dv) == TCCIR_VREG_TYPE_VAR &&
           TCCIR_DECODE_VREG_POSITION(dv) == var_pos) {
-        return sccp_get_store_src_value(s, tcc_ir_op_get_src1(ir, q), out,
-                                        dep_src_pos);
+        return sccp_get_store_src_value_ex(s, tcc_ir_op_get_src1(ir, q), i,
+                                           out, dep_src_pos);
       }
     }
 
@@ -317,6 +508,38 @@ static int sccp_get_operand_value_ex(SCCPState *s, IROperand op,
     *out = irop_get_imm64_ex(s->ctx->ir, op);
     return SCCP_CONST;
   }
+
+  /* TEMP-DEREF operand: *T where T resolves to &StackLoc[N].  Forward to
+   * stack-store scan at the resolved offset. */
+  if (op.tag == IROP_TAG_VREG && op.is_lval && !op.is_local) {
+    int32_t tvr = irop_get_vreg(op);
+    if (tvr >= 0 && TCCIR_DECODE_VREG_TYPE(tvr) == TCCIR_VREG_TYPE_TEMP) {
+      int load_off = ssa_opt_resolve_lea_stackloc(s->ctx, tvr);
+      if (load_off != INT_MIN) {
+        int dep_pos = -1;
+        int st = sccp_resolve_stack_load(s, load_off, irop_get_btype(op),
+                                          instr_idx, out, &dep_pos);
+        if (st == SCCP_CONST)
+          return SCCP_CONST;
+      }
+      return SCCP_BOTTOM;
+    }
+  }
+
+  /* Direct StackLoc-lval operand: load from stack slot. */
+  if (op.tag == IROP_TAG_STACKOFF && op.is_lval && op.is_local && !op.is_llocal) {
+    int32_t svr = irop_get_vreg(op);
+    if (svr < 0 || TCCIR_DECODE_VREG_TYPE(svr) != TCCIR_VREG_TYPE_VAR) {
+      int dep_pos = -1;
+      int st = sccp_resolve_stack_load(s, irop_get_stack_offset(op),
+                                        irop_get_btype(op), instr_idx, out,
+                                        &dep_pos);
+      if (st == SCCP_CONST)
+        return SCCP_CONST;
+      return SCCP_BOTTOM;
+    }
+  }
+
   int32_t vr = irop_get_vreg(op);
   if (vr < 0)
     return SCCP_BOTTOM;
@@ -568,89 +791,42 @@ static void sccp_visit_instr(SCCPState *s, int idx)
       }
 
       /* LOAD from StackLoc: scan backward for a constant store to the
-       * same offset within this block. */
+       * same offset within this block (and dominators). */
       if (src.tag == IROP_TAG_STACKOFF && src.is_lval && src.is_local &&
           !src.is_llocal && (svr < 0 || TCCIR_DECODE_VREG_TYPE(svr) != TCCIR_VREG_TYPE_VAR)) {
-        int soff = irop_get_stack_offset(src);
-        int load_btype = irop_get_btype(src);
-        int resolved = 0;
         int64_t sval = 0;
         int dep_pos = -1;
-        IRBasicBlock *bb = &cfg->blocks[block];
-        for (int si = idx - 1; si >= bb->start_idx; si--) {
-          IRQuadCompact *sq = &ir->compact_instructions[si];
-          if (sq->op == TCCIR_OP_NOP)
-            continue;
-          if (sq->op == TCCIR_OP_FUNCCALLVOID || sq->op == TCCIR_OP_FUNCCALLVAL)
-            break;
-          if (sq->op == TCCIR_OP_STORE_INDEXED || sq->op == TCCIR_OP_STORE_POSTINC)
-            break;
-          if (sq->op == TCCIR_OP_STORE) {
-            IROperand sd = tcc_ir_op_get_dest(ir, sq);
-            if (sd.tag == IROP_TAG_STACKOFF && sd.is_lval && sd.is_local &&
-                irop_get_stack_offset(sd) == soff && irop_get_btype(sd) == load_btype) {
-              int st2 = sccp_get_store_src_value(s, tcc_ir_op_get_src1(ir, sq),
-                                                  &sval, &dep_pos);
-              if (st2 == SCCP_CONST)
-                resolved = 1;
-              break;
-            }
-            if (sd.is_lval && sd.tag != IROP_TAG_STACKOFF)
-              break;
-          }
-        }
-        /* Walk up dominator tree if not found in current block */
-        if (!resolved) {
-          int dom = bb->idom;
-          while (dom >= 0 && dom != block) {
-            IRBasicBlock *db = &cfg->blocks[dom];
-            int stop = 0;
-            for (int si = db->end_idx - 1; si >= db->start_idx; si--) {
-              IRQuadCompact *sq = &ir->compact_instructions[si];
-              if (sq->op == TCCIR_OP_NOP)
-                continue;
-              if (sq->op == TCCIR_OP_FUNCCALLVOID ||
-                  sq->op == TCCIR_OP_FUNCCALLVAL) {
-                stop = 1;
-                break;
-              }
-              if (sq->op == TCCIR_OP_STORE_INDEXED ||
-                  sq->op == TCCIR_OP_STORE_POSTINC) {
-                stop = 1;
-                break;
-              }
-              if (sq->op == TCCIR_OP_STORE) {
-                IROperand sd = tcc_ir_op_get_dest(ir, sq);
-                if (sd.tag == IROP_TAG_STACKOFF && sd.is_lval && sd.is_local &&
-                    irop_get_stack_offset(sd) == soff &&
-                    irop_get_btype(sd) == load_btype) {
-                  int st2 = sccp_get_store_src_value(
-                      s, tcc_ir_op_get_src1(ir, sq), &sval, &dep_pos);
-                  if (st2 == SCCP_CONST)
-                    resolved = 1;
-                  stop = 1;
-                  break;
-                }
-                if (sd.is_lval && sd.tag != IROP_TAG_STACKOFF) {
-                  stop = 1;
-                  break;
-                }
-              }
-            }
-            if (stop || resolved)
-              break;
-            if (dom == db->idom)
-              break;
-            dom = db->idom;
-          }
-        }
-        if (resolved) {
+        int rst = sccp_resolve_stack_load(s, irop_get_stack_offset(src),
+                                           irop_get_btype(src), idx, &sval,
+                                           &dep_pos);
+        if (rst == SCCP_CONST) {
           int changed = sccp_meet(dest_cell, sval);
           if (dep_pos >= 0)
             sccp_add_mem_dep(s, dep_pos, idx);
           if (changed)
             sccp_add_ssa(s, TCCIR_DECODE_VREG_POSITION(dest_vr));
           goto handle_control_flow;
+        }
+      }
+
+      /* LOAD via TEMP-LEA-DEREF: T <-- *Tp [LOAD] where Tp resolves to
+       * &StackLoc[N].  Reuse the same backward scan after resolving the
+       * effective offset. */
+      if (src.tag == IROP_TAG_VREG && src.is_lval && !src.is_local) {
+        int eff_off = ssa_opt_indirect_stack_offset(s->ctx, q, SSA_OPT_INDIRECT_SRC1);
+        if (eff_off != INT_MIN) {
+          int64_t sval = 0;
+          int dep_pos = -1;
+          int rst = sccp_resolve_stack_load(s, eff_off, irop_get_btype(src),
+                                             idx, &sval, &dep_pos);
+          if (rst == SCCP_CONST) {
+            int changed = sccp_meet(dest_cell, sval);
+            if (dep_pos >= 0)
+              sccp_add_mem_dep(s, dep_pos, idx);
+            if (changed)
+              sccp_add_ssa(s, TCCIR_DECODE_VREG_POSITION(dest_vr));
+            goto handle_control_flow;
+          }
         }
       }
     }
@@ -853,6 +1029,114 @@ static int sccp_apply(SCCPState *s)
     tcc_ir_set_src1(ir, vi->def_instr, imm);
     tcc_ir_set_src2(ir, vi->def_instr, IROP_NONE);
     changes++;
+  }
+
+  /* Phase 1.5: Rewrite CMP/TEST_ZERO operands that resolve to constants
+   * via stack-load forwarding or VAR scanning.  Uses sccp_phase15_resolve
+   * (stricter than the general resolve_var) to avoid being misled by
+   * `vi->original_offset` heuristics for non-param VARs. */
+  IRCFG *cfg = s->ctx->cfg;
+  for (int i = 0; i < ir->next_instruction_index; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_CMP && q->op != TCCIR_OP_TEST_ZERO)
+      continue;
+    int n_srcs = (q->op == TCCIR_OP_CMP) ? 2 : 1;
+    int block = cfg->instr_to_block[i];
+    IRBasicBlock *bb = &cfg->blocks[block];
+    for (int oi = 0; oi < n_srcs; oi++) {
+      IROperand src = oi == 0 ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_src2(ir, q);
+      if (irop_is_immediate(src))
+        continue;
+
+      int64_t val = 0;
+      int got = 0;
+
+      /* Case A: TEMP-DEREF *T where T resolves to &StackLoc[N]. */
+      if (src.tag == IROP_TAG_VREG && src.is_lval && !src.is_local) {
+        int32_t tvr = irop_get_vreg(src);
+        if (tvr >= 0 && TCCIR_DECODE_VREG_TYPE(tvr) == TCCIR_VREG_TYPE_TEMP) {
+          int load_off = ssa_opt_resolve_lea_stackloc(s->ctx, tvr);
+          if (load_off != INT_MIN) {
+            int dep_pos = -1;
+            int st = sccp_resolve_stack_load(s, load_off, irop_get_btype(src),
+                                              i, &val, &dep_pos);
+            if (st == SCCP_CONST)
+              got = 1;
+          }
+        }
+      }
+
+      /* Case B: direct StackLoc-lvalue (not a VAR). */
+      if (!got && src.tag == IROP_TAG_STACKOFF && src.is_lval &&
+          src.is_local && !src.is_llocal) {
+        int32_t svr = irop_get_vreg(src);
+        if (svr < 0 || TCCIR_DECODE_VREG_TYPE(svr) != TCCIR_VREG_TYPE_VAR) {
+          int dep_pos = -1;
+          int st = sccp_resolve_stack_load(s, irop_get_stack_offset(src),
+                                            irop_get_btype(src), i, &val,
+                                            &dep_pos);
+          if (st == SCCP_CONST)
+            got = 1;
+        } else if (svr >= 0 && TCCIR_DECODE_VREG_TYPE(svr) == TCCIR_VREG_TYPE_VAR) {
+          /* Case C: VAR operand.  Walk back in the same block looking
+           * for the most recent def of this VAR, requiring it to be a
+           * direct ASSIGN or STORE-to-VAR with an immediate src.  Bail
+           * on any potentially-aliasing intervening write. */
+          int var_pos = TCCIR_DECODE_VREG_POSITION(svr);
+          for (int k = i - 1; k >= bb->start_idx; k--) {
+            IRQuadCompact *kq = &ir->compact_instructions[k];
+            if (kq->op == TCCIR_OP_NOP) continue;
+            if (kq->op == TCCIR_OP_FUNCCALLVOID || kq->op == TCCIR_OP_FUNCCALLVAL)
+              break;
+            if (kq->op == TCCIR_OP_STORE_INDEXED || kq->op == TCCIR_OP_STORE_POSTINC)
+              break;
+            if (irop_config[kq->op].has_dest) {
+              IROperand kd = tcc_ir_op_get_dest(ir, kq);
+              int32_t kdv = irop_get_vreg(kd);
+              if (kdv >= 0 &&
+                  TCCIR_DECODE_VREG_TYPE(kdv) == TCCIR_VREG_TYPE_VAR &&
+                  TCCIR_DECODE_VREG_POSITION(kdv) == var_pos) {
+                if (kq->op == TCCIR_OP_ASSIGN || kq->op == TCCIR_OP_STORE) {
+                  IROperand ks = tcc_ir_op_get_src1(ir, kq);
+                  if (irop_is_immediate(ks) && !ks.is_lval) {
+                    val = irop_get_imm64_ex(ir, ks);
+                    got = 1;
+                  }
+                }
+                break;
+              }
+            }
+            if (kq->op == TCCIR_OP_STORE) {
+              IROperand kd = tcc_ir_op_get_dest(ir, kq);
+              if (kd.tag == IROP_TAG_STACKOFF && kd.is_local && kd.is_lval)
+                continue;
+              break;
+            }
+          }
+        }
+      }
+
+      if (!got)
+        continue;
+      IROperand imm;
+      if (val == (int64_t)(int32_t)val)
+        imm = irop_make_imm32(0, (int32_t)val, irop_get_btype(src));
+      else
+        imm = irop_make_i64(0, tcc_ir_pool_add_i64(ir, val), irop_get_btype(src));
+      /* Drop the old operand's use entry so cascading DCE can fire when
+       * its remaining uses go to zero. */
+      int32_t old_vr = irop_get_vreg(src);
+      if (old_vr >= 0) {
+        IRSSAVregInfo *ovi = ssa_opt_vinfo(s->ctx, old_vr);
+        if (ovi)
+          ssa_opt_remove_use_instr(ovi, i);
+      }
+      if (oi == 0)
+        tcc_ir_set_src1(ir, i, imm);
+      else
+        tcc_ir_set_src2(ir, i, imm);
+      changes++;
+    }
   }
 
   /* Branch folding is left to the ssa_opt_branch pass which runs after

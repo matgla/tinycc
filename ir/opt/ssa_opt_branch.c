@@ -126,6 +126,8 @@ static int ssa_fold_cmp_jumpif(IRSSAOptCtx *ctx, int cmp_idx)
     IROperand ops[2] = { src1, src2 };
     int64_t vals[2];
     int got[2] = { 0, 0 };
+    int cmp_block = ssa_block_for_instr(ctx->cfg, cmp_idx);
+    IRBasicBlock *cmp_bb = (cmp_block >= 0) ? &ctx->cfg->blocks[cmp_block] : NULL;
     for (int oi = 0; oi < 2; oi++) {
       if (irop_is_immediate(ops[oi])) {
         vals[oi] = irop_get_imm64_ex(ir, ops[oi]);
@@ -143,6 +145,54 @@ static int ssa_fold_cmp_jumpif(IRSSAOptCtx *ctx, int cmp_idx)
                 vals[oi] = irop_get_imm64_ex(ir, ds);
                 got[oi] = 1;
               }
+            }
+          }
+        }
+        /* VAR operand: scan same block backward for the most recent def
+         * of this VAR.  Bail on any potentially-aliasing intervening write
+         * (call, indirect store, store through escaped pointer) or any
+         * non-immediate definition. */
+        if (!got[oi] && cmp_bb && vr >= 0 &&
+            TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR) {
+          int var_pos = TCCIR_DECODE_VREG_POSITION(vr);
+          for (int k = cmp_idx - 1; k >= cmp_bb->start_idx; k--) {
+            IRQuadCompact *kq = &ir->compact_instructions[k];
+            if (kq->op == TCCIR_OP_NOP)
+              continue;
+            if (kq->op == TCCIR_OP_FUNCCALLVOID || kq->op == TCCIR_OP_FUNCCALLVAL)
+              break;
+            if (kq->op == TCCIR_OP_STORE_INDEXED || kq->op == TCCIR_OP_STORE_POSTINC)
+              break;  /* may alias VAR through pointer arithmetic */
+            /* Any op that defines this VAR.  STORE/STORE_INDEXED dests
+             * always have is_lval=1 — non-lval VAR dest signals direct
+             * write to the var slot; lval dest is a write through *V. */
+            if (irop_config[kq->op].has_dest) {
+              IROperand kd = tcc_ir_op_get_dest(ir, kq);
+              int32_t kdv = irop_get_vreg(kd);
+              if (kdv >= 0 &&
+                  TCCIR_DECODE_VREG_TYPE(kdv) == TCCIR_VREG_TYPE_VAR &&
+                  TCCIR_DECODE_VREG_POSITION(kdv) == var_pos) {
+                /* Found the most recent def of this VAR.  Try to extract
+                 * an immediate value. */
+                if (kq->op == TCCIR_OP_ASSIGN || kq->op == TCCIR_OP_STORE) {
+                  IROperand ks = tcc_ir_op_get_src1(ir, kq);
+                  if (irop_is_immediate(ks) && !ks.is_lval) {
+                    vals[oi] = irop_get_imm64_ex(ir, ks);
+                    got[oi] = 1;
+                  }
+                }
+                break;
+              }
+            }
+            if (kq->op == TCCIR_OP_STORE) {
+              IROperand kd = tcc_ir_op_get_dest(ir, kq);
+              /* STORE to a different VAR slot or to a known stack slot
+               * cannot alias this VAR. */
+              if (kd.tag == IROP_TAG_STACKOFF && kd.is_local && kd.is_lval)
+                continue;
+              /* TEMP-DEREF or global STORE: could alias through escaped
+               * pointers.  Bail. */
+              break;
             }
           }
         }
