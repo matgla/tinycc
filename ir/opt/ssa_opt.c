@@ -96,7 +96,15 @@ static void ssa_opt_scan_instr_uses(IRSSAOptCtx *ctx, int i, IRQuadCompact *q)
   if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
       q->op == TCCIR_OP_STORE_POSTINC) {
     IROperand d = tcc_ir_op_get_dest(ir, q);
-    ssa_opt_record_use(ctx, irop_get_vreg(d), i);
+    /* Memory-write STOREs: dest is an address being read.  STORE with a
+     * non-lval VREG dest is the IR's value-def encoding (`T = expr`,
+     * commonly address materialisation like `T = Addr[StackLoc[N]]`),
+     * not a use — skip recording it. */
+    int dest_is_use = 1;
+    if (q->op == TCCIR_OP_STORE && !d.is_lval)
+      dest_is_use = 0;
+    if (dest_is_use)
+      ssa_opt_record_use(ctx, irop_get_vreg(d), i);
   }
 }
 
@@ -104,10 +112,26 @@ static int ssa_opt_is_def_op(int op)
 {
   if (!irop_config[op].has_dest)
     return 0;
-  if (op == TCCIR_OP_STORE || op == TCCIR_OP_STORE_INDEXED ||
-      op == TCCIR_OP_STORE_POSTINC || op == TCCIR_OP_FUNCPARAMVAL ||
-      op == TCCIR_OP_FUNCPARAMVOID)
+  if (op == TCCIR_OP_STORE_INDEXED || op == TCCIR_OP_STORE_POSTINC ||
+      op == TCCIR_OP_FUNCPARAMVAL || op == TCCIR_OP_FUNCPARAMVOID)
     return 0;
+  /* TCCIR_OP_STORE with non-lval dest is a value def (see
+   * ssa_opt_scan_instr_uses); lval-dest STORE is a memory write and is
+   * NOT a vreg def.  Caller must additionally check dest.is_lval==0 for
+   * STORE — this returns 1 here so the caller's decode path runs. */
+  return 1;
+}
+
+/* Returns nonzero if `q` definitively defines a vreg via its dest operand. */
+static int ssa_opt_quad_defines_value(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  if (!ssa_opt_is_def_op(q->op))
+    return 0;
+  if (q->op == TCCIR_OP_STORE) {
+    IROperand d = tcc_ir_op_get_dest((TCCIRState *)ir, (IRQuadCompact *)q);
+    if (d.is_lval)
+      return 0;
+  }
   return 1;
 }
 
@@ -143,7 +167,7 @@ static void ssa_opt_build_chains(IRSSAOptCtx *ctx)
     if (q->op == TCCIR_OP_NOP)
       continue;
 
-    if (ssa_opt_is_def_op(q->op)) {
+    if (ssa_opt_quad_defines_value(ir, q)) {
       IROperand d = tcc_ir_op_get_dest(ir, q);
       IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, irop_get_vreg(d));
       if (vi) {
@@ -402,6 +426,20 @@ int ssa_opt_resolve_lea_stackloc(IRSSAOptCtx *ctx, int32_t vr)
     if (sv >= 0 && !src.is_lval)
       return ssa_opt_resolve_lea_stackloc(ctx, sv);
   }
+  /* `T <-- Addr[StackLoc[N]] [STORE]` is the frontend's encoding for
+   * address materialisation into a TEMP (vstore through a non-lval dest).
+   * Semantically identical to LEA / ASSIGN(stack-addr). */
+  if (dq->op == TCCIR_OP_STORE) {
+    IROperand dest = tcc_ir_op_get_dest(ir, dq);
+    if (!dest.is_lval) {
+      IROperand src = tcc_ir_op_get_src1(ir, dq);
+      if (src.tag == IROP_TAG_STACKOFF && !src.is_lval)
+        return irop_get_stack_offset(src);
+      int32_t sv = irop_get_vreg(src);
+      if (sv >= 0 && !src.is_lval)
+        return ssa_opt_resolve_lea_stackloc(ctx, sv);
+    }
+  }
   /* T = base + imm where base resolves to LEA(StackLoc[N]).  Common pattern
    * for struct field address: T46 = T45 + 4 with T45 = &StackLoc[-196]. */
   if (dq->op == TCCIR_OP_ADD || dq->op == TCCIR_OP_SUB) {
@@ -419,6 +457,93 @@ int ssa_opt_resolve_lea_stackloc(IRSSAOptCtx *ctx, int32_t vr)
     }
   }
   return INT_MIN;
+}
+
+/* Resolve `vr` backward to a canonical (base_vr, offset) form.  See
+ * ssa_opt.h for the contract.
+ *
+ * Walks ASSIGN/ADD chains within the function, with a hop limit to prevent
+ * pathological pointer-cycles from being expensive.  Stops as soon as the
+ * current vreg's defining op is something we can't fold into an offset
+ * (anything other than ASSIGN of another vreg or ADD with an immediate).
+ *
+ * VAR/PARAM vregs are terminals — they represent the "root" address whose
+ * value is the canonical base.  Multi-def TEMPs and definitions outside
+ * the function bail to prevent unsound forwarding.
+ *
+ * Accepts both VAR-read encodings on source operands: VREG-tagged (V's
+ * register form, is_lval=0) and STACKOFF-tagged (V's slot form,
+ * is_lval=1 + is_local=1).  Both produce the same address value. */
+int ssa_opt_resolve_temp_to_base_off(IRSSAOptCtx *ctx, int32_t vr,
+                                      int32_t *out_base, int32_t *out_off)
+{
+  *out_off = 0;
+  for (int hop = 0; hop < 8; hop++) {
+    if (vr < 0)
+      return 0;
+    int type = TCCIR_DECODE_VREG_TYPE(vr);
+    if (type == TCCIR_VREG_TYPE_VAR || type == TCCIR_VREG_TYPE_PARAM) {
+      *out_base = vr;
+      return 1;
+    }
+    if (type != TCCIR_VREG_TYPE_TEMP)
+      return 0;
+
+    IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, vr);
+    if (!vi || vi->def_count > 1 || vi->def_instr < 0)
+      return 0;
+    IRQuadCompact *dq = &ctx->ir->compact_instructions[vi->def_instr];
+
+    if (dq->op == TCCIR_OP_ASSIGN) {
+      IROperand src = tcc_ir_op_get_src1(ctx->ir, dq);
+      int32_t sv = irop_get_vreg(src);
+      if (sv < 0)
+        return 0;
+      int svt = TCCIR_DECODE_VREG_TYPE(sv);
+      /* TEMP-to-TEMP plain copy: keep chasing. */
+      if (svt == TCCIR_VREG_TYPE_TEMP && !src.is_lval && !src.is_local &&
+          !src.is_llocal && src.tag == IROP_TAG_VREG) {
+        vr = sv;
+        continue;
+      }
+      /* VAR/PARAM read, both encodings: register form (VREG/!lval) or
+       * slot form (STACKOFF/lval+local).  Either way the value loaded
+       * is V's current address-bearing content. */
+      if (svt == TCCIR_VREG_TYPE_VAR || svt == TCCIR_VREG_TYPE_PARAM) {
+        int reg_form = (src.tag == IROP_TAG_VREG && !src.is_lval &&
+                        !src.is_local && !src.is_llocal);
+        int slot_form = (src.tag == IROP_TAG_STACKOFF && src.is_lval &&
+                          src.is_local && !src.is_llocal);
+        if (reg_form || slot_form) {
+          *out_base = sv;
+          return 1;
+        }
+      }
+      return 0;
+    }
+
+    if (dq->op == TCCIR_OP_ADD) {
+      IROperand src1 = tcc_ir_op_get_src1(ctx->ir, dq);
+      IROperand src2 = tcc_ir_op_get_src2(ctx->ir, dq);
+      if (!irop_is_immediate(src2) || src2.is_lval)
+        return 0;
+      if (src1.is_lval)
+        return 0;
+      int32_t s1vr = irop_get_vreg(src1);
+      if (s1vr < 0)
+        return 0;
+      *out_off += irop_get_imm32(src2);
+      vr = s1vr;
+      continue;
+    }
+
+    /* Other defining op (LOAD, MLA, CALL, ...): treat this TEMP as the
+     * canonical root itself.  Two reads through it would still share if
+     * the TEMP is the same vreg (existing TVStore path). */
+    *out_base = vr;
+    return 1;
+  }
+  return 0;
 }
 
 int ssa_opt_indirect_stack_offset(IRSSAOptCtx *ctx, const IRQuadCompact *q, int side)
@@ -515,6 +640,11 @@ int tcc_ir_ssa_opt_run(IRSSAOptCtx *ctx)
     changes += ssa_opt_var_const_fold(ctx);
     changes += ssa_opt_sccp(ctx);
     changes += ssa_opt_cprop(ctx);
+    /* Collapse `V <- val [STORE]; ... PARAM V` into `... PARAM val` when V
+     * has a single def and that lone PARAM as its only use.  Catches the
+     * inlined-check1 pattern that spills printf args into VARs ahead of
+     * the conditional branch even when only the FAIL path reads them. */
+    changes += ssa_opt_var_to_param_forward(ctx);
     changes += ssa_opt_fold(ctx);
     changes += ssa_opt_load_cse(ctx);
     changes += ssa_opt_branch(ctx);
@@ -533,5 +663,22 @@ int tcc_ir_ssa_opt_run(IRSSAOptCtx *ctx)
     total += changes;
   } while (changes > 0 && iteration < max_iterations);
 
+  return total;
+}
+
+int tcc_ir_ssa_opt_run_target(IRSSAOptCtx *ctx)
+{
+  if (!target_gens || target_gen_count <= 0)
+    return 0;
+  int total = 0;
+  for (int iter = 0; iter < 3; iter++) {
+    int changes = ssa_opt_run_gens(ctx, target_gens, target_gen_count);
+    if (changes == 0)
+      break;
+    total += changes;
+    /* DCE removes instructions we NOP'd; rerun cprop to clean up new copies. */
+    ssa_opt_cprop(ctx);
+    ssa_opt_dce(ctx);
+  }
   return total;
 }

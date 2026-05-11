@@ -1,1767 +1,2597 @@
 {
-  "110_iv_strength_reduction::array_copy": {
-    "gcc": 10,
-    "tcc": 16,
-    "updated": "2026-05-10T19:00:40.893154+00:00"
-  },
-  "110_iv_strength_reduction::array_diff_sum": {
-    "gcc": 17,
-    "tcc": 28,
-    "updated": "2026-05-10T19:00:40.893167+00:00"
-  },
-  "110_iv_strength_reduction::array_sum": {
+  "95_cse::main": {
     "gcc": 12,
-    "tcc": 23,
-    "updated": "2026-05-10T19:00:40.893170+00:00"
+    "tcc": 12,
+    "updated": "2026-05-14T21:03:34.055399+00:00"
   },
-  "110_iv_strength_reduction::array_sum_reverse": {
-    "gcc": 11,
-    "tcc": 23,
-    "updated": "2026-05-10T19:00:40.893172+00:00"
+  "95_cse::test_arithmetic_cse": {
+    "gcc": 3,
+    "tcc": 3,
+    "updated": "2026-05-14T21:03:34.055409+00:00"
   },
-  "110_iv_strength_reduction::main": {
-    "gcc": 72,
-    "tcc": 140,
-    "updated": "2026-05-10T19:00:40.893174+00:00"
-  },
-  "110_iv_strength_reduction::short_array_sum": {
-    "gcc": 12,
-    "tcc": 19,
-    "updated": "2026-05-10T19:00:40.893176+00:00"
-  },
-  "165_builtin_add_overflow::main": {
+  "95_cse::test_complex_cse": {
     "gcc": 5,
     "tcc": 5,
-    "updated": "2026-05-02T15:28:07.765499+00:00"
+    "updated": "2026-05-14T21:03:34.055412+00:00"
   },
-  "50_simple_struct::main": {
-    "gcc": 9,
-    "tcc": 9,
-    "updated": "2026-05-10T09:41:17.940821+00:00"
-  },
-  "95_const_branch_fold::main": {
-    "gcc": 11,
-    "tcc": 11,
-    "updated": "2026-05-10T10:25:52.863612+00:00"
-  },
-  "95_const_branch_fold::test_fold_branch": {
-    "gcc": 2,
-    "tcc": 2,
-    "updated": "2026-05-10T10:25:52.863626+00:00"
-  },
-  "95_const_branch_fold::test_fold_modulo": {
-    "gcc": 2,
-    "tcc": 2,
-    "updated": "2026-05-10T10:05:01.888774+00:00"
-  },
-  "95_const_branch_fold::test_nested_fold": {
-    "gcc": 2,
-    "tcc": 2,
-    "updated": "2026-05-10T10:05:01.888777+00:00"
-  },
-  "98_value_tracking::main": {
-    "gcc": 13,
-    "tcc": 13,
-    "updated": "2026-05-10T11:52:27.575785+00:00"
-  },
-  "98_value_tracking::test_chained_arithmetic": {
-    "gcc": 2,
-    "tcc": 2,
-    "updated": "2026-05-10T09:41:43.283826+00:00"
-  },
-  "98_value_tracking::test_conditionals_pattern": {
-    "gcc": 5,
+  "95_cse::test_mul_cse": {
+    "gcc": 3,
     "tcc": 6,
-    "updated": "2026-05-10T12:29:57.895696+00:00"
-  },
-  "98_value_tracking::test_value_track_add": {
-    "gcc": 2,
-    "tcc": 2,
-    "updated": "2026-05-10T09:41:43.283831+00:00"
-  },
-  "98_value_tracking::test_value_track_sub": {
-    "gcc": 2,
-    "tcc": 2,
-    "updated": "2026-05-10T09:41:43.283833+00:00"
-  },
-  "bench_function_calls::bench_function_calls": {
-    "gcc": 8,
-    "tcc": 21,
-    "updated": "2026-05-09T17:52:13.033232+00:00"
-  },
-  "bench_function_calls::func_a": {
-    "gcc": 3,
-    "tcc": 4,
-    "updated": "2026-05-09T17:29:01.039439+00:00"
-  },
-  "bench_function_calls::func_b": {
-    "gcc": 3,
-    "tcc": 4,
-    "updated": "2026-05-09T17:29:01.039443+00:00"
-  },
-  "bench_function_calls::func_c": {
-    "gcc": 3,
-    "tcc": 4,
-    "updated": "2026-05-09T17:29:01.039445+00:00"
-  },
-  "bench_matrix_mul::bench_matrix_mul": {
-    "gcc": 52,
-    "tcc": 76,
-    "updated": "2026-05-11T12:56:21.224012+00:00"
-  },
-  "bench_matrix_mul::main": {
-    "gcc": 7,
-    "tcc": 7,
-    "updated": "2026-05-08T19:02:55.911729+00:00"
-  },
-  "bug_struct_array_index_mul_clobber::get_item": {
-    "gcc": 10,
-    "tcc": 11,
-    "updated": "2026-05-09T17:30:48.362335+00:00"
-  },
-  "bug_struct_array_index_mul_clobber::main": {
-    "gcc": 27,
-    "tcc": 200,
-    "updated": "2026-05-09T17:30:48.362348+00:00"
+    "updated": "2026-05-14T21:03:34.055414+00:00"
   },
   "func-sections/bug_static_func_reloc::main": {
     "gcc": 47,
-    "tcc": 67,
-    "updated": "2026-05-07T16:31:18.163806+00:00"
+    "tcc": 60,
+    "updated": "2026-05-14T21:11:44.701418+00:00"
   },
   "gnu89-inline/bug_gnu89_inline_asm::add1_inline": {
     "gcc": 2,
     "tcc": 2,
-    "updated": "2026-05-02T08:48:22.345267+00:00"
+    "updated": "2026-05-14T21:11:44.701408+00:00"
   },
   "gnu89-inline/bug_gnu89_inline_asm::main": {
     "gcc": 6,
     "tcc": 8,
-    "updated": "2026-05-02T08:48:22.345269+00:00"
+    "updated": "2026-05-14T21:11:44.701410+00:00"
   },
   "ir/01_hello_world::main": {
     "gcc": 14,
     "tcc": 14,
-    "updated": "2026-05-02T08:48:22.344759+00:00"
+    "updated": "2026-05-14T21:11:44.700880+00:00"
   },
   "ir/01_hello_world::sum": {
     "gcc": 2,
-    "tcc": 3,
-    "updated": "2026-05-02T08:48:22.344761+00:00"
+    "tcc": 2,
+    "updated": "2026-05-14T21:11:44.700884+00:00"
   },
   "ir/100_pure_func_strlen::main": {
     "gcc": 21,
     "tcc": 11,
-    "updated": "2026-05-02T08:48:22.344937+00:00"
+    "updated": "2026-05-14T21:11:44.701075+00:00"
   },
   "ir/101_pure_func_abs::main": {
     "gcc": 21,
     "tcc": 11,
-    "updated": "2026-05-02T08:48:22.344938+00:00"
+    "updated": "2026-05-14T21:11:44.701095+00:00"
   },
   "ir/102_pure_func_strcmp::main": {
     "gcc": 24,
     "tcc": 11,
-    "updated": "2026-05-02T08:48:22.344949+00:00"
+    "updated": "2026-05-14T21:11:44.701096+00:00"
   },
   "ir/103_pure_func_multiple::main": {
     "gcc": 25,
     "tcc": 11,
-    "updated": "2026-05-02T08:48:22.344947+00:00"
+    "updated": "2026-05-14T21:11:44.701089+00:00"
   },
   "ir/104_pure_func_variant::main": {
     "gcc": 30,
-    "tcc": 35,
-    "updated": "2026-05-02T08:48:22.344946+00:00"
+    "tcc": 36,
+    "updated": "2026-05-14T21:11:44.701104+00:00"
   },
   "ir/105_builtin_strncmp_zero_count::main": {
     "gcc": 9,
     "tcc": 16,
-    "updated": "2026-05-10T16:08:56.100411+00:00"
+    "updated": "2026-05-14T21:11:44.701090+00:00"
   },
   "ir/105_builtin_strncmp_zero_count::strncmp": {
     "gcc": 15,
-    "tcc": 38,
-    "updated": "2026-05-02T08:48:22.344953+00:00"
+    "tcc": 39,
+    "updated": "2026-05-14T21:11:44.701092+00:00"
   },
   "ir/106_string_ops_runtime::main": {
     "gcc": 39,
-    "tcc": 38,
-    "updated": "2026-05-02T08:48:22.344956+00:00"
+    "tcc": 41,
+    "updated": "2026-05-14T21:11:44.701098+00:00"
   },
   "ir/108_loop_unroll_basic::main": {
     "gcc": 11,
     "tcc": 11,
-    "updated": "2026-05-02T08:48:22.345162+00:00"
+    "updated": "2026-05-14T21:11:44.701313+00:00"
   },
   "ir/109_loop_unroll_no_unroll::main": {
     "gcc": 21,
-    "tcc": 34,
-    "updated": "2026-05-02T08:48:22.345160+00:00"
+    "tcc": 40,
+    "updated": "2026-05-14T21:11:44.701317+00:00"
   },
   "ir/110_iv_strength_reduction::array_copy": {
     "gcc": 10,
-    "tcc": 15,
-    "updated": "2026-05-02T08:48:22.345025+00:00"
+    "tcc": 14,
+    "updated": "2026-05-14T21:11:44.701157+00:00"
   },
   "ir/110_iv_strength_reduction::array_diff_sum": {
     "gcc": 17,
-    "tcc": 20,
-    "updated": "2026-05-11T09:55:12.627254+00:00"
+    "tcc": 18,
+    "updated": "2026-05-14T21:11:44.701159+00:00"
   },
   "ir/110_iv_strength_reduction::array_sum": {
     "gcc": 12,
-    "tcc": 17,
-    "updated": "2026-05-02T08:48:22.345029+00:00"
+    "tcc": 16,
+    "updated": "2026-05-14T21:11:44.701161+00:00"
   },
   "ir/110_iv_strength_reduction::array_sum_reverse": {
     "gcc": 11,
-    "tcc": 15,
-    "updated": "2026-05-02T08:48:22.345031+00:00"
+    "tcc": 14,
+    "updated": "2026-05-14T21:11:44.701162+00:00"
   },
   "ir/110_iv_strength_reduction::main": {
     "gcc": 78,
-    "tcc": 136,
-    "updated": "2026-05-11T09:55:12.627257+00:00"
+    "tcc": 113,
+    "updated": "2026-05-14T21:11:44.701165+00:00"
   },
   "ir/110_iv_strength_reduction::short_array_sum": {
     "gcc": 12,
-    "tcc": 15,
-    "updated": "2026-05-02T08:48:22.345034+00:00"
+    "tcc": 16,
+    "updated": "2026-05-14T21:11:44.701166+00:00"
   },
   "ir/110_loop_unroll_with_array::main": {
     "gcc": 50,
-    "tcc": 64,
-    "updated": "2026-05-02T08:48:22.345171+00:00"
+    "tcc": 65,
+    "updated": "2026-05-14T21:11:44.701315+00:00"
   },
   "ir/111_builtin_printf::main": {
     "gcc": 16,
     "tcc": 18,
-    "updated": "2026-05-02T08:48:22.345155+00:00"
+    "updated": "2026-05-14T21:11:44.701308+00:00"
   },
   "ir/112_builtin_puts::main": {
     "gcc": 14,
     "tcc": 16,
-    "updated": "2026-05-02T08:48:22.345153+00:00"
+    "updated": "2026-05-14T21:11:44.701297+00:00"
   },
   "ir/140_builtin_classify_type::main": {
     "gcc": 30,
-    "tcc": 32,
-    "updated": "2026-05-07T16:31:18.163725+00:00"
+    "tcc": 30,
+    "updated": "2026-05-14T21:11:44.701230+00:00"
   },
   "ir/145_builtin_bswap::main": {
     "gcc": 5,
     "tcc": 5,
-    "updated": "2026-05-02T08:48:22.345090+00:00"
+    "updated": "2026-05-14T21:11:44.701241+00:00"
   },
   "ir/150_builtin_fp::main": {
     "gcc": 308,
-    "tcc": 394,
-    "updated": "2026-05-02T08:48:22.345189+00:00"
+    "tcc": 373,
+    "updated": "2026-05-14T21:11:44.701319+00:00"
   },
   "ir/165_builtin_add_overflow::main": {
     "gcc": 5,
     "tcc": 5,
-    "updated": "2026-05-02T15:28:14.763106+00:00"
+    "updated": "2026-05-14T21:11:44.701248+00:00"
   },
   "ir/166_builtin_mul_overflow_p::main": {
     "gcc": 37,
     "tcc": 37,
-    "updated": "2026-05-02T08:48:22.345086+00:00"
+    "updated": "2026-05-14T21:11:44.701237+00:00"
   },
   "ir/170_nan_comparison::main": {
     "gcc": 294,
-    "tcc": 283,
-    "updated": "2026-05-10T09:18:30.111580+00:00"
+    "tcc": 279,
+    "updated": "2026-05-14T21:11:44.701250+00:00"
   },
   "ir/171_strlen_constfold::main": {
     "gcc": 51,
     "tcc": 37,
-    "updated": "2026-05-07T16:31:18.163740+00:00"
+    "updated": "2026-05-14T21:11:44.701242+00:00"
   },
   "ir/20_op_add::main": {
     "gcc": 42,
-    "tcc": 54,
-    "updated": "2026-05-04T20:33:30.939652+00:00"
+    "tcc": 44,
+    "updated": "2026-05-14T21:11:44.700912+00:00"
   },
   "ir/20_op_add::simple0": {
     "gcc": 2,
     "tcc": 2,
-    "updated": "2026-05-02T08:48:22.344781+00:00"
+    "updated": "2026-05-14T21:11:44.700914+00:00"
   },
   "ir/20_op_add::simple01": {
     "gcc": 2,
     "tcc": 2,
-    "updated": "2026-05-02T08:48:22.344783+00:00"
+    "updated": "2026-05-14T21:11:44.700916+00:00"
   },
   "ir/20_op_add::simple02": {
     "gcc": 4,
-    "tcc": 4,
-    "updated": "2026-05-02T08:48:22.344785+00:00"
+    "tcc": 3,
+    "updated": "2026-05-14T21:11:44.700918+00:00"
   },
   "ir/20_op_add::simple022": {
     "gcc": 4,
-    "tcc": 4,
-    "updated": "2026-05-02T08:48:22.344787+00:00"
+    "tcc": 3,
+    "updated": "2026-05-14T21:11:44.700920+00:00"
   },
   "ir/20_op_add::simple1": {
     "gcc": 3,
-    "tcc": 4,
-    "updated": "2026-05-02T08:48:22.344789+00:00"
+    "tcc": 3,
+    "updated": "2026-05-14T21:11:44.700922+00:00"
   },
   "ir/20_op_add::simple2": {
     "gcc": 2,
-    "tcc": 3,
-    "updated": "2026-05-02T08:48:22.344791+00:00"
+    "tcc": 2,
+    "updated": "2026-05-14T21:11:44.700924+00:00"
   },
   "ir/20_op_add::simple3": {
     "gcc": 2,
-    "tcc": 3,
-    "updated": "2026-05-02T08:48:22.344793+00:00"
+    "tcc": 2,
+    "updated": "2026-05-14T21:11:44.700926+00:00"
   },
   "ir/20_op_add::simple4": {
     "gcc": 4,
-    "tcc": 6,
-    "updated": "2026-05-02T08:48:22.344795+00:00"
+    "tcc": 4,
+    "updated": "2026-05-14T21:11:44.700928+00:00"
   },
   "ir/20_op_add::simple5": {
     "gcc": 7,
     "tcc": 11,
-    "updated": "2026-05-10T16:08:56.100275+00:00"
+    "updated": "2026-05-14T21:11:44.700930+00:00"
   },
   "ir/20_op_add::simple_stack": {
     "gcc": 2,
     "tcc": 3,
-    "updated": "2026-05-02T08:48:22.344799+00:00"
+    "updated": "2026-05-14T21:11:44.700932+00:00"
   },
   "ir/30_function_call::main": {
     "gcc": 2,
     "tcc": 2,
-    "updated": "2026-05-02T08:48:22.344731+00:00"
+    "updated": "2026-05-14T21:11:44.700902+00:00"
   },
   "ir/30_function_call::sum": {
     "gcc": 2,
-    "tcc": 3,
-    "updated": "2026-05-02T08:48:22.344743+00:00"
+    "tcc": 2,
+    "updated": "2026-05-14T21:11:44.700904+00:00"
   },
   "ir/40_if::main": {
     "gcc": 9,
     "tcc": 9,
-    "updated": "2026-05-04T20:33:30.939602+00:00"
+    "updated": "2026-05-14T21:11:44.700894+00:00"
   },
   "ir/50_simple_struct::main": {
     "gcc": 9,
     "tcc": 9,
-    "updated": "2026-05-07T16:31:18.163573+00:00"
+    "updated": "2026-05-14T21:11:44.700868+00:00"
   },
   "ir/60_landor::main": {
     "gcc": 36,
     "tcc": 36,
-    "updated": "2026-05-02T08:48:22.344747+00:00"
+    "updated": "2026-05-14T21:11:44.700887+00:00"
   },
   "ir/60_landor::nested_operation": {
     "gcc": 5,
     "tcc": 12,
-    "updated": "2026-05-02T08:48:22.344750+00:00"
+    "updated": "2026-05-14T21:11:44.700889+00:00"
   },
   "ir/61_simple_or::main": {
     "gcc": 8,
     "tcc": 8,
-    "updated": "2026-05-02T08:48:22.344752+00:00"
+    "updated": "2026-05-14T21:11:44.700900+00:00"
   },
   "ir/72_float_result::main": {
     "gcc": 2,
     "tcc": 2,
-    "updated": "2026-05-02T08:48:22.344955+00:00"
+    "updated": "2026-05-14T21:11:44.701087+00:00"
   },
   "ir/73_float_ops::main": {
     "gcc": 2,
     "tcc": 2,
-    "updated": "2026-05-02T08:48:22.344958+00:00"
+    "updated": "2026-05-14T21:11:44.701106+00:00"
   },
   "ir/90_global_array_assignment::main": {
     "gcc": 15,
-    "tcc": 19,
-    "updated": "2026-05-11T09:55:12.627129+00:00"
+    "tcc": 18,
+    "updated": "2026-05-14T21:11:44.700892+00:00"
   },
   "ir/91_const_propagation::main": {
     "gcc": 15,
     "tcc": 15,
-    "updated": "2026-05-02T08:48:22.344825+00:00"
+    "updated": "2026-05-14T21:11:44.700976+00:00"
   },
   "ir/91_const_propagation::test_const": {
     "gcc": 2,
     "tcc": 2,
-    "updated": "2026-05-02T08:48:22.344827+00:00"
+    "updated": "2026-05-14T21:11:44.700977+00:00"
   },
   "ir/91_const_propagation::test_mul_identity": {
     "gcc": 2,
     "tcc": 2,
-    "updated": "2026-05-02T08:48:22.344829+00:00"
+    "updated": "2026-05-14T21:11:44.700979+00:00"
   },
   "ir/91_const_propagation::test_mul_zero": {
     "gcc": 2,
     "tcc": 2,
-    "updated": "2026-05-02T08:48:22.344831+00:00"
+    "updated": "2026-05-14T21:11:44.700981+00:00"
   },
   "ir/91_const_propagation::test_zero_identity": {
     "gcc": 2,
     "tcc": 2,
-    "updated": "2026-05-02T08:48:22.344833+00:00"
+    "updated": "2026-05-14T21:11:44.700983+00:00"
   },
   "ir/92_loop_invariant::main": {
     "gcc": 20,
-    "tcc": 24,
-    "updated": "2026-05-11T09:55:12.627176+00:00"
+    "tcc": 21,
+    "updated": "2026-05-14T21:11:44.700985+00:00"
   },
   "ir/92_loop_invariant::test_loop": {
     "gcc": 10,
-    "tcc": 13,
-    "updated": "2026-05-02T08:48:22.344868+00:00"
+    "tcc": 9,
+    "updated": "2026-05-14T21:11:44.700987+00:00"
   },
   "ir/93_chained_arithmetic::main": {
     "gcc": 21,
     "tcc": 21,
-    "updated": "2026-05-02T08:48:22.344836+00:00"
+    "updated": "2026-05-14T21:11:44.700966+00:00"
   },
   "ir/93_chained_arithmetic::test_and_or_identity": {
     "gcc": 1,
-    "tcc": 4,
-    "updated": "2026-05-02T08:48:22.344838+00:00"
+    "tcc": 1,
+    "updated": "2026-05-14T21:11:44.700968+00:00"
   },
   "ir/93_chained_arithmetic::test_chain": {
     "gcc": 1,
     "tcc": 1,
-    "updated": "2026-05-02T08:48:22.344840+00:00"
+    "updated": "2026-05-14T21:11:44.700970+00:00"
   },
   "ir/93_chained_arithmetic::test_shift_zero": {
     "gcc": 1,
     "tcc": 1,
-    "updated": "2026-05-02T08:48:22.344842+00:00"
+    "updated": "2026-05-14T21:11:44.700972+00:00"
   },
   "ir/93_chained_arithmetic::test_sub_zero": {
     "gcc": 1,
     "tcc": 1,
-    "updated": "2026-05-02T08:48:22.344844+00:00"
+    "updated": "2026-05-14T21:11:44.700974+00:00"
   },
   "ir/94_copy_propagation::Move": {
     "gcc": 20,
-    "tcc": 16,
-    "updated": "2026-05-10T09:18:30.111455+00:00"
+    "tcc": 15,
+    "updated": "2026-05-14T21:11:44.700936+00:00"
   },
   "ir/94_copy_propagation::main": {
     "gcc": 28,
-    "tcc": 35,
-    "updated": "2026-05-02T08:48:22.344855+00:00"
+    "tcc": 49,
+    "updated": "2026-05-14T21:11:44.700938+00:00"
   },
   "ir/94_copy_propagation::test_copy_chain": {
     "gcc": 2,
     "tcc": 2,
-    "updated": "2026-05-02T08:48:22.344857+00:00"
+    "updated": "2026-05-14T21:11:44.700940+00:00"
   },
   "ir/95_const_branch_fold::main": {
     "gcc": 11,
     "tcc": 11,
-    "updated": "2026-05-02T08:48:22.344817+00:00"
+    "updated": "2026-05-14T21:11:44.700998+00:00"
   },
   "ir/95_const_branch_fold::test_fold_branch": {
     "gcc": 2,
     "tcc": 2,
-    "updated": "2026-05-02T08:48:22.344819+00:00"
+    "updated": "2026-05-14T21:11:44.701000+00:00"
   },
   "ir/95_const_branch_fold::test_fold_modulo": {
     "gcc": 2,
     "tcc": 2,
-    "updated": "2026-05-02T08:48:22.344821+00:00"
+    "updated": "2026-05-14T21:11:44.701002+00:00"
   },
   "ir/95_const_branch_fold::test_nested_fold": {
     "gcc": 2,
     "tcc": 2,
-    "updated": "2026-05-02T08:48:22.344823+00:00"
+    "updated": "2026-05-14T21:11:44.701003+00:00"
   },
   "ir/95_cse::main": {
     "gcc": 12,
-    "tcc": 37,
-    "updated": "2026-05-02T08:48:22.344845+00:00"
+    "tcc": 12,
+    "updated": "2026-05-14T21:11:44.700989+00:00"
   },
   "ir/95_cse::test_arithmetic_cse": {
     "gcc": 3,
-    "tcc": 4,
-    "updated": "2026-05-02T08:48:22.344848+00:00"
+    "tcc": 3,
+    "updated": "2026-05-14T21:11:44.700990+00:00"
   },
   "ir/95_cse::test_complex_cse": {
     "gcc": 5,
     "tcc": 5,
-    "updated": "2026-05-02T08:48:22.344849+00:00"
+    "updated": "2026-05-14T21:11:44.700992+00:00"
   },
   "ir/95_cse::test_mul_cse": {
     "gcc": 3,
-    "tcc": 9,
-    "updated": "2026-05-10T16:08:56.100357+00:00"
+    "tcc": 6,
+    "updated": "2026-05-14T21:11:44.700994+00:00"
   },
   "ir/96_const_cmp_fold_vreg::main": {
     "gcc": 9,
     "tcc": 9,
-    "updated": "2026-05-02T08:48:22.344808+00:00"
+    "updated": "2026-05-14T21:11:44.700954+00:00"
   },
   "ir/96_const_cmp_fold_vreg::test_const_tracking": {
     "gcc": 2,
     "tcc": 2,
-    "updated": "2026-05-02T08:48:22.344810+00:00"
+    "updated": "2026-05-14T21:11:44.700956+00:00"
   },
   "ir/96_const_cmp_fold_vreg::test_nested_const": {
     "gcc": 2,
     "tcc": 2,
-    "updated": "2026-05-02T08:48:22.344812+00:00"
+    "updated": "2026-05-14T21:11:44.700958+00:00"
   },
   "ir/97_loop_const_expr::main": {
     "gcc": 11,
     "tcc": 11,
-    "updated": "2026-05-02T08:48:22.344859+00:00"
+    "updated": "2026-05-14T21:11:44.701048+00:00"
   },
   "ir/97_loop_const_expr::test_chained_hoist": {
     "gcc": 6,
-    "tcc": 10,
-    "updated": "2026-05-02T08:48:22.344861+00:00"
+    "tcc": 7,
+    "updated": "2026-05-14T21:11:44.701050+00:00"
   },
   "ir/97_loop_const_expr::test_conditionals_pattern": {
     "gcc": 5,
     "tcc": 6,
-    "updated": "2026-05-10T12:31:36.796972+00:00"
+    "updated": "2026-05-14T21:11:44.701052+00:00"
   },
   "ir/97_loop_const_expr::test_const_hoist": {
     "gcc": 6,
-    "tcc": 10,
-    "updated": "2026-05-02T08:48:22.344864+00:00"
+    "tcc": 7,
+    "updated": "2026-05-14T21:11:44.701054+00:00"
   },
   "ir/97_void_call_noargs::main": {
     "gcc": 6,
     "tcc": 6,
-    "updated": "2026-05-02T08:48:22.344921+00:00"
+    "updated": "2026-05-14T21:11:44.701062+00:00"
   },
   "ir/98_call_over32_args::main": {
     "gcc": 6,
     "tcc": 6,
-    "updated": "2026-05-02T08:48:22.344927+00:00"
+    "updated": "2026-05-14T21:11:44.701064+00:00"
   },
   "ir/98_value_tracking::main": {
     "gcc": 13,
     "tcc": 13,
-    "updated": "2026-05-02T08:48:22.344870+00:00"
+    "updated": "2026-05-14T21:11:44.701026+00:00"
   },
   "ir/98_value_tracking::test_chained_arithmetic": {
     "gcc": 2,
     "tcc": 2,
-    "updated": "2026-05-02T08:48:22.344872+00:00"
+    "updated": "2026-05-14T21:11:44.701028+00:00"
   },
   "ir/98_value_tracking::test_conditionals_pattern": {
     "gcc": 5,
     "tcc": 6,
-    "updated": "2026-05-10T12:31:36.796993+00:00"
+    "updated": "2026-05-14T21:11:44.701030+00:00"
   },
   "ir/98_value_tracking::test_value_track_add": {
     "gcc": 2,
     "tcc": 2,
-    "updated": "2026-05-02T08:48:22.344875+00:00"
+    "updated": "2026-05-14T21:11:44.701032+00:00"
   },
   "ir/98_value_tracking::test_value_track_sub": {
     "gcc": 2,
     "tcc": 2,
-    "updated": "2026-05-02T08:48:22.344877+00:00"
+    "updated": "2026-05-14T21:11:44.701034+00:00"
   },
   "ir/99_struct_init_from_struct::main": {
     "gcc": 27,
     "tcc": 27,
-    "updated": "2026-05-02T08:48:22.344929+00:00"
+    "updated": "2026-05-14T21:11:44.701071+00:00"
   },
   "ir/bench_array_sum::bench_array_sum": {
     "gcc": 19,
-    "tcc": 19,
-    "updated": "2026-05-02T08:48:22.345230+00:00"
+    "tcc": 25,
+    "updated": "2026-05-14T21:11:44.701354+00:00"
   },
   "ir/bench_array_sum::main": {
     "gcc": 7,
     "tcc": 7,
-    "updated": "2026-05-02T08:48:22.345232+00:00"
+    "updated": "2026-05-14T21:11:44.701356+00:00"
   },
   "ir/bench_binary_search::bench_binary_search": {
     "gcc": 38,
-    "tcc": 62,
-    "updated": "2026-05-11T09:55:12.627321+00:00"
+    "tcc": 54,
+    "updated": "2026-05-14T21:11:44.701321+00:00"
   },
   "ir/bench_binary_search::main": {
     "gcc": 7,
     "tcc": 7,
-    "updated": "2026-05-02T08:48:22.345193+00:00"
+    "updated": "2026-05-14T21:11:44.701323+00:00"
   },
   "ir/bench_bitwise_mix::bench_bitwise_mix": {
     "gcc": 11,
-    "tcc": 17,
-    "updated": "2026-05-02T08:48:22.345224+00:00"
+    "tcc": 18,
+    "updated": "2026-05-14T21:11:44.701388+00:00"
   },
   "ir/bench_bitwise_mix::main": {
     "gcc": 7,
     "tcc": 7,
-    "updated": "2026-05-02T08:48:22.345228+00:00"
+    "updated": "2026-05-14T21:11:44.701390+00:00"
   },
   "ir/bench_bubble_sort::bench_bubble_sort": {
     "gcc": 31,
-    "tcc": 72,
-    "updated": "2026-05-11T09:55:12.627319+00:00"
+    "tcc": 55,
+    "updated": "2026-05-14T21:11:44.701347+00:00"
   },
   "ir/bench_bubble_sort::main": {
     "gcc": 7,
     "tcc": 7,
-    "updated": "2026-05-02T08:48:22.345169+00:00"
+    "updated": "2026-05-14T21:11:44.701349+00:00"
   },
   "ir/bench_conditionals::bench_conditionals": {
     "gcc": 2,
     "tcc": 2,
-    "updated": "2026-05-10T12:31:36.797104+00:00"
+    "updated": "2026-05-14T21:11:44.701325+00:00"
   },
   "ir/bench_conditionals::main": {
     "gcc": 6,
     "tcc": 6,
-    "updated": "2026-05-10T12:31:36.797107+00:00"
+    "updated": "2026-05-14T21:11:44.701327+00:00"
   },
   "ir/bench_fibonacci::bench_fibonacci": {
     "gcc": 11,
     "tcc": 8,
-    "updated": "2026-05-10T16:08:56.100503+00:00"
+    "updated": "2026-05-14T21:11:44.701342+00:00"
   },
   "ir/bench_fibonacci::fib": {
     "gcc": 260,
-    "tcc": 42,
-    "updated": "2026-05-07T07:27:58.984398+00:00"
+    "tcc": 38,
+    "updated": "2026-05-14T21:11:44.701344+00:00"
   },
   "ir/bench_fibonacci::main": {
     "gcc": 8,
     "tcc": 8,
-    "updated": "2026-05-02T08:48:22.345242+00:00"
+    "updated": "2026-05-14T21:11:44.701345+00:00"
   },
   "ir/bench_function_calls::bench_function_calls": {
     "gcc": 8,
-    "tcc": 21,
-    "updated": "2026-05-02T08:48:22.345173+00:00"
+    "tcc": 14,
+    "updated": "2026-05-14T21:11:44.701332+00:00"
   },
   "ir/bench_function_calls::func_a": {
     "gcc": 3,
-    "tcc": 3,
-    "updated": "2026-05-10T16:08:56.100509+00:00"
+    "tcc": 4,
+    "updated": "2026-05-14T21:11:44.701334+00:00"
   },
   "ir/bench_function_calls::func_b": {
     "gcc": 3,
     "tcc": 3,
-    "updated": "2026-05-10T16:08:56.100512+00:00"
+    "updated": "2026-05-14T21:11:44.701336+00:00"
   },
   "ir/bench_function_calls::func_c": {
     "gcc": 3,
     "tcc": 3,
-    "updated": "2026-05-10T16:08:56.100514+00:00"
+    "updated": "2026-05-14T21:11:44.701338+00:00"
   },
   "ir/bench_function_calls::main": {
     "gcc": 7,
-    "tcc": 7,
-    "updated": "2026-05-02T08:48:22.345180+00:00"
+    "tcc": 18,
+    "updated": "2026-05-14T21:11:44.701340+00:00"
   },
   "ir/bench_indirect_calls::bench_indirect_calls": {
     "gcc": 20,
-    "tcc": 28,
-    "updated": "2026-05-11T09:55:12.627333+00:00"
+    "tcc": 26,
+    "updated": "2026-05-14T21:11:44.701362+00:00"
   },
   "ir/bench_indirect_calls::func_ptr_add": {
     "gcc": 2,
-    "tcc": 3,
-    "updated": "2026-05-02T08:48:22.345211+00:00"
+    "tcc": 2,
+    "updated": "2026-05-14T21:11:44.701363+00:00"
   },
   "ir/bench_indirect_calls::func_ptr_mul": {
     "gcc": 2,
-    "tcc": 3,
-    "updated": "2026-05-02T08:48:22.345214+00:00"
+    "tcc": 2,
+    "updated": "2026-05-14T21:11:44.701365+00:00"
   },
   "ir/bench_indirect_calls::func_ptr_xor": {
     "gcc": 3,
-    "tcc": 4,
-    "updated": "2026-05-02T08:48:22.345218+00:00"
+    "tcc": 3,
+    "updated": "2026-05-14T21:11:44.701367+00:00"
   },
   "ir/bench_indirect_calls::main": {
     "gcc": 7,
-    "tcc": 7,
-    "updated": "2026-05-02T08:48:22.345221+00:00"
+    "tcc": 30,
+    "updated": "2026-05-14T21:11:44.701369+00:00"
   },
   "ir/bench_linked_list::bench_linked_list": {
     "gcc": 22,
-    "tcc": 37,
-    "updated": "2026-05-10T19:00:15.151817+00:00"
+    "tcc": 33,
+    "updated": "2026-05-14T21:11:44.701351+00:00"
   },
   "ir/bench_linked_list::main": {
     "gcc": 7,
     "tcc": 7,
-    "updated": "2026-05-02T08:48:22.345165+00:00"
+    "updated": "2026-05-14T21:11:44.701352+00:00"
   },
   "ir/bench_matrix_mul::bench_matrix_mul": {
     "gcc": 52,
-    "tcc": 76,
-    "updated": "2026-05-02T08:48:22.345200+00:00"
+    "tcc": 71,
+    "updated": "2026-05-14T21:11:44.701329+00:00"
   },
   "ir/bench_matrix_mul::main": {
     "gcc": 7,
     "tcc": 7,
-    "updated": "2026-05-02T08:48:22.345204+00:00"
+    "updated": "2026-05-14T21:11:44.701331+00:00"
   },
   "ir/bench_memcpy::bench_memcpy": {
     "gcc": 30,
-    "tcc": 39,
-    "updated": "2026-05-02T08:48:22.345247+00:00"
+    "tcc": 35,
+    "updated": "2026-05-14T21:11:44.701380+00:00"
   },
   "ir/bench_memcpy::main": {
     "gcc": 7,
     "tcc": 7,
-    "updated": "2026-05-02T08:48:22.345249+00:00"
+    "updated": "2026-05-14T21:11:44.701384+00:00"
   },
   "ir/bench_strcmp::bench_strcmp": {
     "gcc": 9,
     "tcc": 2,
-    "updated": "2026-05-02T08:48:22.345244+00:00"
+    "updated": "2026-05-14T21:11:44.701374+00:00"
   },
   "ir/bench_strcmp::main": {
     "gcc": 7,
     "tcc": 6,
-    "updated": "2026-05-02T08:48:22.345245+00:00"
+    "updated": "2026-05-14T21:11:44.701376+00:00"
   },
   "ir/bench_strcpy::bench_strcpy": {
     "gcc": 20,
-    "tcc": 23,
-    "updated": "2026-05-02T08:48:22.345234+00:00"
+    "tcc": 21,
+    "updated": "2026-05-14T21:11:44.701370+00:00"
   },
   "ir/bench_strcpy::main": {
     "gcc": 7,
     "tcc": 7,
-    "updated": "2026-05-02T08:48:22.345236+00:00"
+    "updated": "2026-05-14T21:11:44.701372+00:00"
   },
   "ir/bench_strlen_scan::bench_strlen_scan": {
     "gcc": 15,
     "tcc": 19,
-    "updated": "2026-05-02T08:48:22.345251+00:00"
+    "updated": "2026-05-14T21:11:44.701392+00:00"
   },
   "ir/bench_strlen_scan::main": {
     "gcc": 7,
     "tcc": 7,
-    "updated": "2026-05-02T08:48:22.345253+00:00"
+    "updated": "2026-05-14T21:11:44.701394+00:00"
   },
   "ir/bench_switch_stmt::bench_switch": {
     "gcc": 2,
     "tcc": 2,
-    "updated": "2026-05-02T08:48:22.345185+00:00"
+    "updated": "2026-05-14T21:11:44.701358+00:00"
   },
   "ir/bench_switch_stmt::main": {
     "gcc": 6,
     "tcc": 6,
-    "updated": "2026-05-02T08:48:22.345187+00:00"
+    "updated": "2026-05-14T21:11:44.701360+00:00"
   },
   "ir/bug_addrof_param_modify::main": {
     "gcc": 15,
-    "tcc": 44,
-    "updated": "2026-05-02T08:48:22.345012+00:00"
+    "tcc": 15,
+    "updated": "2026-05-14T21:11:44.701174+00:00"
   },
   "ir/bug_addrof_param_modify::modify_int": {
     "gcc": 3,
     "tcc": 3,
-    "updated": "2026-05-09T17:35:48.125960+00:00"
+    "updated": "2026-05-14T21:11:44.701176+00:00"
   },
   "ir/bug_addrof_param_modify::modify_str": {
     "gcc": 2,
-    "tcc": 3,
-    "updated": "2026-05-09T17:35:48.125962+00:00"
+    "tcc": 2,
+    "updated": "2026-05-14T21:11:44.701178+00:00"
   },
   "ir/bug_addrof_param_modify::test_addrof_int": {
     "gcc": 2,
-    "tcc": 9,
-    "updated": "2026-05-07T16:31:18.163692+00:00"
+    "tcc": 2,
+    "updated": "2026-05-14T21:11:44.701179+00:00"
   },
   "ir/bug_addrof_param_modify::test_addrof_second_param": {
     "gcc": 2,
-    "tcc": 10,
-    "updated": "2026-05-10T16:08:56.100444+00:00"
+    "tcc": 2,
+    "updated": "2026-05-14T21:11:44.701182+00:00"
   },
   "ir/bug_addrof_param_modify::test_addrof_str": {
     "gcc": 2,
-    "tcc": 9,
-    "updated": "2026-05-07T16:31:18.163699+00:00"
+    "tcc": 2,
+    "updated": "2026-05-14T21:11:44.701183+00:00"
   },
   "ir/bug_addrof_reg_param::check_prefix": {
     "gcc": 18,
-    "tcc": 21,
-    "updated": "2026-05-04T20:33:30.939851+00:00"
+    "tcc": 38,
+    "updated": "2026-05-14T21:11:44.701168+00:00"
   },
   "ir/bug_addrof_reg_param::main": {
     "gcc": 12,
-    "tcc": 12,
-    "updated": "2026-05-02T08:48:22.345038+00:00"
+    "tcc": 41,
+    "updated": "2026-05-14T21:11:44.701170+00:00"
   },
   "ir/bug_addrof_reg_param::strstart": {
     "gcc": 16,
-    "tcc": 20,
-    "updated": "2026-05-09T17:35:48.125974+00:00"
+    "tcc": 17,
+    "updated": "2026-05-14T21:11:44.701172+00:00"
   },
   "ir/bug_alias_attribute::alias1": {
     "gcc": 2,
     "tcc": 2,
-    "updated": "2026-05-02T08:48:22.345047+00:00"
+    "updated": "2026-05-14T21:11:44.701187+00:00"
   },
   "ir/bug_alias_attribute::alias2": {
     "gcc": 2,
     "tcc": 2,
-    "updated": "2026-05-02T08:48:22.345049+00:00"
+    "updated": "2026-05-14T21:11:44.701189+00:00"
   },
   "ir/bug_alias_attribute::alias3": {
     "gcc": 2,
     "tcc": 2,
-    "updated": "2026-05-02T08:48:22.345051+00:00"
+    "updated": "2026-05-14T21:11:44.701190+00:00"
   },
   "ir/bug_alias_attribute::asm_base2": {
     "gcc": 0,
     "tcc": 0,
-    "updated": "2026-05-02T08:48:22.345053+00:00"
+    "updated": "2026-05-14T21:11:44.701192+00:00"
   },
   "ir/bug_alias_attribute::base1": {
     "gcc": 0,
     "tcc": 0,
-    "updated": "2026-05-02T08:48:22.345054+00:00"
+    "updated": "2026-05-14T21:11:44.701194+00:00"
   },
   "ir/bug_alias_attribute::base3": {
     "gcc": 0,
     "tcc": 0,
-    "updated": "2026-05-02T08:48:22.345056+00:00"
+    "updated": "2026-05-14T21:11:44.701196+00:00"
   },
   "ir/bug_alias_attribute::main": {
     "gcc": 16,
     "tcc": 27,
-    "updated": "2026-05-02T08:48:22.345058+00:00"
+    "updated": "2026-05-14T21:11:44.701197+00:00"
   },
   "ir/bug_decl_attr_after_comma::main": {
     "gcc": 2,
     "tcc": 2,
-    "updated": "2026-05-02T08:48:22.345042+00:00"
+    "updated": "2026-05-14T21:11:44.701201+00:00"
   },
   "ir/bug_for_ternary_chain::main": {
     "gcc": 65,
-    "tcc": 68,
-    "updated": "2026-05-11T09:55:12.627276+00:00"
+    "tcc": 56,
+    "updated": "2026-05-14T21:11:44.701213+00:00"
   },
   "ir/bug_for_ternary_chain::set_idnum": {
     "gcc": 5,
-    "tcc": 7,
-    "updated": "2026-05-02T14:52:06.756815+00:00"
+    "tcc": 9,
+    "updated": "2026-05-14T21:11:44.701215+00:00"
   },
   "ir/bug_inline_asm_reserved_regs::main": {
     "gcc": 4,
-    "tcc": 4,
-    "updated": "2026-05-02T08:48:22.345044+00:00"
+    "tcc": 5,
+    "updated": "2026-05-14T21:11:44.701155+00:00"
   },
   "ir/bug_ll_mul10_switch_min::main": {
     "gcc": 107,
-    "tcc": 83,
-    "updated": "2026-05-11T09:55:12.627158+00:00"
+    "tcc": 176,
+    "updated": "2026-05-14T21:11:44.700996+00:00"
   },
   "ir/bug_ll_shift_ptr_clobber::main": {
     "gcc": 235,
-    "tcc": 334,
-    "updated": "2026-05-11T09:55:12.627281+00:00"
+    "tcc": 329,
+    "updated": "2026-05-14T21:11:44.701211+00:00"
   },
   "ir/bug_llong_const::main": {
     "gcc": 11,
     "tcc": 11,
-    "updated": "2026-05-02T08:48:22.344767+00:00"
+    "updated": "2026-05-14T21:11:44.700908+00:00"
   },
   "ir/bug_mul_by_const::main": {
     "gcc": 15,
     "tcc": 15,
-    "updated": "2026-05-02T08:48:22.344765+00:00"
+    "updated": "2026-05-14T21:11:44.700934+00:00"
   },
   "ir/bug_mul_compound::main": {
     "gcc": 140,
-    "tcc": 234,
-    "updated": "2026-05-06T21:00:51.161271+00:00"
+    "tcc": 232,
+    "updated": "2026-05-14T21:11:44.700948+00:00"
   },
   "ir/bug_parse_number_64bit::main": {
     "gcc": 27,
     "tcc": 27,
-    "updated": "2026-05-02T08:48:22.344835+00:00"
+    "updated": "2026-05-14T21:11:44.700910+00:00"
   },
   "ir/bug_partition::main": {
     "gcc": 24,
-    "tcc": 40,
-    "updated": "2026-05-02T08:48:22.344773+00:00"
+    "tcc": 57,
+    "updated": "2026-05-14T21:11:44.700960+00:00"
   },
   "ir/bug_partition::partition": {
     "gcc": 21,
-    "tcc": 49,
-    "updated": "2026-05-11T09:55:12.627140+00:00"
+    "tcc": 39,
+    "updated": "2026-05-14T21:11:44.700963+00:00"
   },
   "ir/bug_partition::swap": {
     "gcc": 6,
-    "tcc": 9,
-    "updated": "2026-05-09T17:35:48.125828+00:00"
+    "tcc": 6,
+    "updated": "2026-05-14T21:11:44.700965+00:00"
   },
   "ir/bug_sizeof_comma_func_decay::main": {
     "gcc": 2,
     "tcc": 2,
-    "updated": "2026-05-02T08:48:22.345045+00:00"
+    "updated": "2026-05-14T21:11:44.701210+00:00"
   },
   "ir/bug_sret_param_layout::main": {
     "gcc": 5,
     "tcc": 5,
-    "updated": "2026-05-02T08:48:22.345102+00:00"
+    "updated": "2026-05-14T21:11:44.701262+00:00"
   },
   "ir/bug_struct_array_index_mul_clobber::get_item": {
     "gcc": 10,
     "tcc": 10,
-    "updated": "2026-05-10T16:08:56.100454+00:00"
+    "updated": "2026-05-14T21:11:44.701206+00:00"
   },
   "ir/bug_struct_array_index_mul_clobber::main": {
     "gcc": 27,
-    "tcc": 30,
-    "updated": "2026-05-02T08:48:22.345064+00:00"
+    "tcc": 31,
+    "updated": "2026-05-14T21:11:44.701208+00:00"
   },
   "ir/bug_struct_field_postinc::main": {
     "gcc": 33,
-    "tcc": 60,
-    "updated": "2026-05-10T13:40:38.149460+00:00"
+    "tcc": 56,
+    "updated": "2026-05-14T21:11:44.701204+00:00"
   },
   "ir/bug_struct_member_cmp_fold::main": {
     "gcc": 107,
-    "tcc": 191,
-    "updated": "2026-05-02T08:48:22.345068+00:00"
+    "tcc": 194,
+    "updated": "2026-05-14T21:11:44.701217+00:00"
   },
   "ir/bug_struct_member_cmp_fold::pool_allocate": {
     "gcc": 12,
     "tcc": 22,
-    "updated": "2026-05-02T08:48:22.345070+00:00"
+    "updated": "2026-05-14T21:11:44.701219+00:00"
   },
   "ir/bug_swap::main": {
     "gcc": 29,
-    "tcc": 73,
-    "updated": "2026-05-09T17:35:48.125850+00:00"
+    "tcc": 56,
+    "updated": "2026-05-14T21:11:44.700896+00:00"
   },
   "ir/bug_swap::swap": {
     "gcc": 6,
-    "tcc": 9,
-    "updated": "2026-05-09T17:35:48.125854+00:00"
+    "tcc": 6,
+    "updated": "2026-05-14T21:11:44.700898+00:00"
   },
   "ir/bug_ull_mul10_loop::main": {
     "gcc": 21,
-    "tcc": 39,
-    "updated": "2026-05-11T09:55:12.627147+00:00"
+    "tcc": 36,
+    "updated": "2026-05-14T21:11:44.700946+00:00"
   },
   "ir/bug_ull_mul10_once::main": {
     "gcc": 7,
     "tcc": 7,
-    "updated": "2026-05-02T08:48:22.344771+00:00"
+    "updated": "2026-05-14T21:11:44.700906+00:00"
   },
   "ir/bug_ull_mul_int_accum::get_digits": {
     "gcc": 1,
     "tcc": 1,
-    "updated": "2026-05-02T08:48:22.344896+00:00"
+    "updated": "2026-05-14T21:11:44.700950+00:00"
   },
   "ir/bug_ull_mul_int_accum::main": {
     "gcc": 54,
-    "tcc": 68,
-    "updated": "2026-05-05T12:26:27.982843+00:00"
+    "tcc": 66,
+    "updated": "2026-05-14T21:11:44.700952+00:00"
   },
   "ir/bug_union_self_cast_typedef::main": {
     "gcc": 20,
-    "tcc": 45,
-    "updated": "2026-05-02T08:48:22.345060+00:00"
+    "tcc": 41,
+    "updated": "2026-05-14T21:11:44.701199+00:00"
   },
   "ir/mibench_bitcount::bench_mibench_bitcount": {
     "gcc": 54,
-    "tcc": 32,
-    "updated": "2026-05-11T09:55:12.627344+00:00"
+    "tcc": 40,
+    "updated": "2026-05-14T21:11:44.701396+00:00"
   },
   "ir/mibench_bitcount::main": {
     "gcc": 7,
-    "tcc": 7,
-    "updated": "2026-05-02T08:48:22.345261+00:00"
+    "tcc": 26,
+    "updated": "2026-05-14T21:11:44.701398+00:00"
   },
   "ir/mibench_crc32::bench_mibench_crc32": {
     "gcc": 49,
-    "tcc": 49,
-    "updated": "2026-05-11T09:55:12.627341+00:00"
+    "tcc": 43,
+    "updated": "2026-05-14T21:11:44.701400+00:00"
   },
   "ir/mibench_crc32::main": {
     "gcc": 7,
     "tcc": 7,
-    "updated": "2026-05-02T08:48:22.345257+00:00"
+    "updated": "2026-05-14T21:11:44.701402+00:00"
   },
   "ir/mibench_dijkstra::bench_mibench_dijkstra": {
     "gcc": 163,
-    "tcc": 27,
-    "updated": "2026-05-11T09:55:12.627352+00:00"
+    "tcc": 22,
+    "updated": "2026-05-14T21:11:44.701403+00:00"
   },
   "ir/mibench_dijkstra::main": {
     "gcc": 7,
-    "tcc": 7,
-    "updated": "2026-05-02T08:48:22.345282+00:00"
+    "tcc": 28,
+    "updated": "2026-05-14T21:11:44.701405+00:00"
   },
   "ir/mibench_qsort::bench_mibench_qsort": {
     "gcc": 44,
-    "tcc": 54,
-    "updated": "2026-05-02T08:48:22.345271+00:00"
+    "tcc": 49,
+    "updated": "2026-05-14T21:11:44.701412+00:00"
   },
   "ir/mibench_qsort::compare_strings": {
     "gcc": 11,
-    "tcc": 17,
-    "updated": "2026-05-10T16:08:56.100539+00:00"
+    "tcc": 11,
+    "updated": "2026-05-14T21:11:44.701414+00:00"
   },
   "ir/mibench_qsort::main": {
     "gcc": 7,
     "tcc": 7,
-    "updated": "2026-05-02T08:48:22.345275+00:00"
+    "updated": "2026-05-14T21:11:44.701416+00:00"
   },
   "ir/mibench_rijndael::bench_mibench_rijndael": {
     "gcc": 63,
-    "tcc": 67,
-    "updated": "2026-05-11T09:55:12.627378+00:00"
+    "tcc": 58,
+    "updated": "2026-05-14T21:11:44.701472+00:00"
   },
   "ir/mibench_rijndael::decrypt": {
     "gcc": 981,
-    "tcc": 1274,
-    "updated": "2026-05-10T09:18:30.111672+00:00"
+    "tcc": 1226,
+    "updated": "2026-05-14T21:11:44.701474+00:00"
   },
   "ir/mibench_rijndael::encrypt": {
     "gcc": 987,
-    "tcc": 1270,
-    "updated": "2026-05-10T09:18:30.111674+00:00"
+    "tcc": 1226,
+    "updated": "2026-05-14T21:11:44.701476+00:00"
   },
   "ir/mibench_rijndael::main": {
     "gcc": 7,
     "tcc": 7,
-    "updated": "2026-05-02T08:48:22.345338+00:00"
+    "updated": "2026-05-14T21:11:44.701478+00:00"
   },
   "ir/mibench_rijndael::set_key": {
     "gcc": 281,
-    "tcc": 525,
-    "updated": "2026-05-11T10:12:13.667715+00:00"
+    "tcc": 464,
+    "updated": "2026-05-14T21:11:44.701480+00:00"
   },
   "ir/mibench_sha::bench_mibench_sha": {
     "gcc": 69,
-    "tcc": 56,
-    "updated": "2026-05-11T09:55:12.627362+00:00"
+    "tcc": 60,
+    "updated": "2026-05-14T21:11:44.701424+00:00"
   },
   "ir/mibench_sha::main": {
     "gcc": 7,
     "tcc": 7,
-    "updated": "2026-05-02T08:48:22.345299+00:00"
+    "updated": "2026-05-14T21:11:44.701426+00:00"
   },
   "ir/mibench_sha::sha_final": {
     "gcc": 31,
-    "tcc": 47,
-    "updated": "2026-05-09T17:35:48.126081+00:00"
+    "tcc": 39,
+    "updated": "2026-05-14T21:11:44.701428+00:00"
   },
   "ir/mibench_sha::sha_init": {
     "gcc": 13,
     "tcc": 15,
-    "updated": "2026-05-09T17:35:48.126083+00:00"
+    "updated": "2026-05-14T21:11:44.701430+00:00"
   },
   "ir/mibench_sha::sha_print": {
     "gcc": 11,
-    "tcc": 14,
-    "updated": "2026-05-09T17:35:48.126085+00:00"
+    "tcc": 12,
+    "updated": "2026-05-14T21:11:44.701432+00:00"
   },
   "ir/mibench_sha::sha_stream": {
     "gcc": 31,
-    "tcc": 25,
-    "updated": "2026-05-02T08:48:22.345307+00:00"
+    "tcc": 44,
+    "updated": "2026-05-14T21:11:44.701434+00:00"
   },
   "ir/mibench_sha::sha_transform": {
     "gcc": 147,
-    "tcc": 174,
-    "updated": "2026-05-11T09:55:12.627368+00:00"
+    "tcc": 150,
+    "updated": "2026-05-14T21:11:44.701435+00:00"
   },
   "ir/mibench_sha::sha_update": {
     "gcc": 38,
     "tcc": 43,
-    "updated": "2026-05-09T17:35:48.126089+00:00"
+    "updated": "2026-05-14T21:11:44.701437+00:00"
   },
   "ir/mibench_stringsearch::bench_mibench_stringsearch": {
     "gcc": 98,
-    "tcc": 58,
-    "updated": "2026-05-11T09:55:12.627354+00:00"
+    "tcc": 47,
+    "updated": "2026-05-14T21:11:44.701420+00:00"
   },
   "ir/mibench_stringsearch::main": {
     "gcc": 7,
     "tcc": 7,
-    "updated": "2026-05-02T08:48:22.345279+00:00"
+    "updated": "2026-05-14T21:11:44.701422+00:00"
   },
   "ir/nested_basic::main": {
     "gcc": 12,
     "tcc": 12,
-    "updated": "2026-05-02T08:48:22.345100+00:00"
+    "updated": "2026-05-14T21:11:44.701259+00:00"
   },
   "ir/nested_basic_args::main": {
     "gcc": 12,
     "tcc": 12,
-    "updated": "2026-05-02T08:48:22.345109+00:00"
+    "updated": "2026-05-14T21:11:44.701270+00:00"
   },
   "ir/nested_capture_array::main": {
     "gcc": 14,
-    "tcc": 40,
-    "updated": "2026-05-10T13:40:38.149596+00:00"
+    "tcc": 14,
+    "updated": "2026-05-14T21:11:44.701268+00:00"
   },
   "ir/nested_capture_multiple::main": {
     "gcc": 24,
-    "tcc": 58,
-    "updated": "2026-05-02T08:48:22.345111+00:00"
+    "tcc": 49,
+    "updated": "2026-05-14T21:11:44.701272+00:00"
   },
   "ir/nested_capture_read::main": {
     "gcc": 9,
     "tcc": 9,
-    "updated": "2026-05-02T08:48:22.345117+00:00"
+    "updated": "2026-05-14T21:11:44.701266+00:00"
   },
   "ir/nested_capture_write::main": {
     "gcc": 12,
-    "tcc": 26,
-    "updated": "2026-05-02T08:48:22.345136+00:00"
+    "tcc": 23,
+    "updated": "2026-05-14T21:11:44.701274+00:00"
   },
   "ir/nested_direct_call_args::main": {
     "gcc": 12,
     "tcc": 12,
-    "updated": "2026-05-02T08:48:22.345129+00:00"
+    "updated": "2026-05-14T21:11:44.701264+00:00"
   },
   "ir/nested_funcptr::main": {
     "gcc": 29,
-    "tcc": 25,
-    "updated": "2026-05-02T08:48:22.345126+00:00"
+    "tcc": 23,
+    "updated": "2026-05-14T21:11:44.701278+00:00"
   },
   "ir/nested_funcptr::multiply.0": {
     "gcc": 3,
-    "tcc": 10,
-    "updated": "2026-05-02T08:48:22.345128+00:00"
+    "tcc": 32,
+    "updated": "2026-05-14T21:11:44.701280+00:00"
   },
   "ir/nested_funcptr_call_twice::bump.0": {
     "gcc": 3,
-    "tcc": 10,
-    "updated": "2026-05-02T08:48:22.345138+00:00"
+    "tcc": 37,
+    "updated": "2026-05-14T21:11:44.701287+00:00"
   },
   "ir/nested_funcptr_call_twice::main": {
     "gcc": 31,
-    "tcc": 38,
-    "updated": "2026-05-02T08:48:22.345140+00:00"
+    "tcc": 28,
+    "updated": "2026-05-14T21:11:44.701289+00:00"
   },
   "ir/nested_funcptr_indirect::add_it.0": {
     "gcc": 3,
-    "tcc": 10,
-    "updated": "2026-05-02T08:48:22.345120+00:00"
+    "tcc": 35,
+    "updated": "2026-05-14T21:11:44.701281+00:00"
   },
   "ir/nested_funcptr_indirect::main": {
     "gcc": 29,
-    "tcc": 30,
-    "updated": "2026-05-02T08:48:22.345122+00:00"
+    "tcc": 26,
+    "updated": "2026-05-14T21:11:44.701283+00:00"
   },
   "ir/nested_multi_level::main": {
     "gcc": 9,
     "tcc": 9,
-    "updated": "2026-05-02T18:29:26.060205+00:00"
+    "updated": "2026-05-14T21:11:44.701296+00:00"
   },
   "ir/nested_multiple::main": {
     "gcc": 15,
     "tcc": 15,
-    "updated": "2026-05-02T18:29:26.060180+00:00"
+    "updated": "2026-05-14T21:11:44.701261+00:00"
   },
   "ir/nested_recursive_parent::factorial_with_nested": {
     "gcc": 23,
-    "tcc": 27,
-    "updated": "2026-05-02T08:48:22.345146+00:00"
+    "tcc": 25,
+    "updated": "2026-05-14T21:11:44.701290+00:00"
   },
   "ir/nested_recursive_parent::main": {
     "gcc": 12,
     "tcc": 13,
-    "updated": "2026-05-02T08:48:22.345147+00:00"
+    "updated": "2026-05-14T21:11:44.701292+00:00"
   },
   "ir/nested_shadowing::main": {
     "gcc": 15,
     "tcc": 15,
-    "updated": "2026-05-02T08:48:22.345118+00:00"
+    "updated": "2026-05-14T21:11:44.701276+00:00"
   },
   "ir/nested_struct_return::main": {
     "gcc": 11,
     "tcc": 11,
-    "updated": "2026-05-02T08:48:22.345124+00:00"
+    "updated": "2026-05-14T21:11:44.701285+00:00"
   },
   "ir/test_aeabi_dmul_bits::main": {
     "gcc": 27,
-    "tcc": 29,
-    "updated": "2026-05-02T08:48:22.344965+00:00"
+    "tcc": 41,
+    "updated": "2026-05-14T21:11:44.701100+00:00"
   },
   "ir/test_cleanup_double::cleanup_double": {
     "gcc": 4,
     "tcc": 8,
-    "updated": "2026-05-02T08:48:22.344814+00:00"
+    "updated": "2026-05-14T21:11:44.700942+00:00"
   },
   "ir/test_cleanup_double::main": {
     "gcc": 9,
-    "tcc": 15,
-    "updated": "2026-05-02T08:48:22.344816+00:00"
+    "tcc": 13,
+    "updated": "2026-05-14T21:11:44.700944+00:00"
   },
   "ir/test_complex_fold::main": {
     "gcc": 2,
     "tcc": 2,
-    "updated": "2026-05-02T08:48:22.345131+00:00"
+    "updated": "2026-05-14T21:11:44.701299+00:00"
   },
   "ir/test_complex_fold::test1": {
     "gcc": 29,
     "tcc": 4,
-    "updated": "2026-05-02T08:48:22.345133+00:00"
+    "updated": "2026-05-14T21:11:44.701301+00:00"
   },
   "ir/test_complex_fold::test2": {
     "gcc": 1,
     "tcc": 2,
-    "updated": "2026-05-02T08:48:22.345135+00:00"
+    "updated": "2026-05-14T21:11:44.701303+00:00"
   },
   "ir/test_complex_init::main": {
     "gcc": 12,
-    "tcc": 33,
-    "updated": "2026-05-02T08:48:22.345144+00:00"
+    "tcc": 19,
+    "updated": "2026-05-14T21:11:44.701294+00:00"
   },
   "ir/test_complex_mul::main": {
     "gcc": 14,
-    "tcc": 87,
-    "updated": "2026-05-02T08:48:22.345156+00:00"
+    "tcc": 50,
+    "updated": "2026-05-14T21:11:44.701310+00:00"
   },
   "ir/test_complex_mul::test_mul": {
     "gcc": 51,
-    "tcc": 55,
-    "updated": "2026-05-02T08:48:22.345158+00:00"
+    "tcc": 53,
+    "updated": "2026-05-14T21:11:44.701312+00:00"
   },
   "ir/test_complex_simple::main": {
     "gcc": 2,
-    "tcc": 49,
-    "updated": "2026-05-02T08:48:22.345149+00:00"
+    "tcc": 2,
+    "updated": "2026-05-14T21:11:44.701304+00:00"
   },
   "ir/test_complex_simple::test_add": {
     "gcc": 20,
-    "tcc": 30,
-    "updated": "2026-05-02T08:48:22.345151+00:00"
+    "tcc": 20,
+    "updated": "2026-05-14T21:11:44.701306+00:00"
   },
   "ir/test_double_printf_literals::main": {
     "gcc": 17,
     "tcc": 17,
-    "updated": "2026-05-02T08:48:22.344931+00:00"
+    "updated": "2026-05-14T21:11:44.701077+00:00"
   },
   "ir/test_double_printf_mixed::main": {
     "gcc": 15,
     "tcc": 32,
-    "updated": "2026-05-02T08:48:22.344934+00:00"
+    "updated": "2026-05-14T21:11:44.701067+00:00"
   },
   "ir/test_double_printf_ops::main": {
     "gcc": 21,
-    "tcc": 49,
-    "updated": "2026-05-02T08:48:22.344932+00:00"
+    "tcc": 21,
+    "updated": "2026-05-14T21:11:44.701073+00:00"
   },
   "ir/test_f2d_bits::main": {
     "gcc": 30,
-    "tcc": 48,
-    "updated": "2026-05-02T08:48:22.344960+00:00"
+    "tcc": 42,
+    "updated": "2026-05-14T21:11:44.701085+00:00"
   },
   "ir/test_fp_offset_cache::main": {
     "gcc": 14,
     "tcc": 11,
-    "updated": "2026-05-02T08:48:22.344900+00:00"
+    "updated": "2026-05-14T21:11:44.701006+00:00"
   },
   "ir/test_fp_offset_cache::test_loop_access": {
     "gcc": 27,
-    "tcc": 53,
-    "updated": "2026-05-11T09:55:12.627193+00:00"
+    "tcc": 45,
+    "updated": "2026-05-14T21:11:44.701008+00:00"
   },
   "ir/test_fp_offset_cache::test_mixed_access": {
     "gcc": 4,
     "tcc": 6,
-    "updated": "2026-05-02T08:48:22.344904+00:00"
+    "updated": "2026-05-14T21:11:44.701010+00:00"
   },
   "ir/test_fp_offset_cache::test_multiple_access": {
     "gcc": 7,
     "tcc": 5,
-    "updated": "2026-05-02T08:48:22.344906+00:00"
+    "updated": "2026-05-14T21:11:44.701012+00:00"
   },
   "ir/test_fp_offset_cache::test_swap_pattern": {
     "gcc": 26,
-    "tcc": 45,
-    "updated": "2026-05-11T09:55:12.627196+00:00"
+    "tcc": 41,
+    "updated": "2026-05-14T21:11:44.701013+00:00"
   },
   "ir/test_ge_operator::main": {
     "gcc": 72,
-    "tcc": 140,
-    "updated": "2026-05-02T14:52:06.756737+00:00"
+    "tcc": 133,
+    "updated": "2026-05-14T21:11:44.701056+00:00"
   },
   "ir/test_ge_operator::test_ge_direct": {
     "gcc": 5,
     "tcc": 5,
-    "updated": "2026-05-10T16:08:56.100395+00:00"
+    "updated": "2026-05-14T21:11:44.701058+00:00"
   },
   "ir/test_ge_operator::test_ge_workaround": {
     "gcc": 5,
     "tcc": 5,
-    "updated": "2026-05-10T16:08:56.100397+00:00"
+    "updated": "2026-05-14T21:11:44.701059+00:00"
   },
   "ir/test_llong_add_signed::main": {
     "gcc": 7,
     "tcc": 7,
-    "updated": "2026-05-02T08:48:22.344963+00:00"
+    "updated": "2026-05-14T21:11:44.701102+00:00"
   },
   "ir/test_llong_add_unsigned::main": {
     "gcc": 7,
     "tcc": 7,
-    "updated": "2026-05-02T08:48:22.344962+00:00"
+    "updated": "2026-05-14T21:11:44.701108+00:00"
   },
   "ir/test_llong_bitwise::main": {
     "gcc": 7,
     "tcc": 7,
-    "updated": "2026-05-02T08:48:22.345009+00:00"
+    "updated": "2026-05-14T21:11:44.701149+00:00"
   },
   "ir/test_llong_div_signed::main": {
     "gcc": 7,
     "tcc": 7,
-    "updated": "2026-05-02T08:48:22.344991+00:00"
+    "updated": "2026-05-14T21:11:44.701146+00:00"
   },
   "ir/test_llong_div_unsigned::main": {
     "gcc": 7,
     "tcc": 7,
-    "updated": "2026-05-02T08:48:22.344992+00:00"
+    "updated": "2026-05-14T21:11:44.701151+00:00"
   },
   "ir/test_llong_load_signed::main": {
     "gcc": 7,
     "tcc": 7,
-    "updated": "2026-05-02T14:52:06.756768+00:00"
+    "updated": "2026-05-14T21:11:44.701119+00:00"
   },
   "ir/test_llong_load_unsigned::main": {
     "gcc": 7,
     "tcc": 7,
-    "updated": "2026-05-02T14:52:06.756774+00:00"
+    "updated": "2026-05-14T21:11:44.701127+00:00"
   },
   "ir/test_llong_mod_signed::main": {
     "gcc": 7,
     "tcc": 7,
-    "updated": "2026-05-02T08:48:22.345005+00:00"
+    "updated": "2026-05-14T21:11:44.701144+00:00"
   },
   "ir/test_llong_mod_unsigned::main": {
     "gcc": 7,
     "tcc": 7,
-    "updated": "2026-05-02T08:48:22.345007+00:00"
+    "updated": "2026-05-14T21:11:44.701153+00:00"
   },
   "ir/test_llong_mul_64bit::main": {
     "gcc": 9,
     "tcc": 9,
-    "updated": "2026-05-02T08:48:22.344974+00:00"
+    "updated": "2026-05-14T21:11:44.701110+00:00"
   },
   "ir/test_llong_mul_parts::main": {
     "gcc": 9,
     "tcc": 9,
-    "updated": "2026-05-02T08:48:22.344978+00:00"
+    "updated": "2026-05-14T21:11:44.701115+00:00"
   },
   "ir/test_llong_mul_reg::main": {
     "gcc": 9,
     "tcc": 9,
-    "updated": "2026-05-02T08:48:22.344976+00:00"
+    "updated": "2026-05-14T21:11:44.701117+00:00"
   },
   "ir/test_llong_mul_signed::main": {
     "gcc": 7,
     "tcc": 7,
-    "updated": "2026-05-02T08:48:22.344971+00:00"
+    "updated": "2026-05-14T21:11:44.701111+00:00"
   },
   "ir/test_llong_mul_unsigned::main": {
     "gcc": 7,
     "tcc": 7,
-    "updated": "2026-05-02T08:48:22.344972+00:00"
+    "updated": "2026-05-14T21:11:44.701113+00:00"
   },
   "ir/test_llong_relops::main": {
     "gcc": 15,
-    "tcc": 15,
-    "updated": "2026-05-02T08:48:22.344940+00:00"
+    "tcc": 14,
+    "updated": "2026-05-14T21:11:44.701079+00:00"
   },
   "ir/test_llong_relops::run_signed": {
     "gcc": 100,
-    "tcc": 211,
-    "updated": "2026-05-02T14:52:06.756762+00:00"
+    "tcc": 108,
+    "updated": "2026-05-14T21:11:44.701081+00:00"
   },
   "ir/test_llong_relops::run_unsigned": {
     "gcc": 91,
-    "tcc": 196,
-    "updated": "2026-05-02T14:52:06.756764+00:00"
+    "tcc": 98,
+    "updated": "2026-05-14T21:11:44.701083+00:00"
   },
   "ir/test_mibench_sha::main": {
     "gcc": 55,
-    "tcc": 60,
-    "updated": "2026-05-11T09:55:12.627268+00:00"
+    "tcc": 63,
+    "updated": "2026-05-14T21:11:44.701221+00:00"
   },
   "ir/test_mibench_sha::sha_final": {
     "gcc": 55,
-    "tcc": 55,
-    "updated": "2026-05-09T17:35:48.125991+00:00"
+    "tcc": 45,
+    "updated": "2026-05-14T21:11:44.701223+00:00"
   },
   "ir/test_mibench_sha::sha_init": {
     "gcc": 13,
     "tcc": 15,
-    "updated": "2026-05-09T17:35:48.125993+00:00"
+    "updated": "2026-05-14T21:11:44.701224+00:00"
   },
   "ir/test_mibench_sha::sha_transform": {
     "gcc": 147,
-    "tcc": 174,
-    "updated": "2026-05-11T09:55:12.627272+00:00"
+    "tcc": 150,
+    "updated": "2026-05-14T21:11:44.701226+00:00"
   },
   "ir/test_mibench_sha::sha_update": {
     "gcc": 56,
-    "tcc": 47,
-    "updated": "2026-05-09T17:35:48.125996+00:00"
+    "tcc": 45,
+    "updated": "2026-05-14T21:11:44.701228+00:00"
   },
   "ir/test_mla_fusion::main": {
     "gcc": 21,
-    "tcc": 43,
-    "updated": "2026-05-11T09:55:12.627201+00:00"
+    "tcc": 23,
+    "updated": "2026-05-14T21:11:44.701015+00:00"
   },
   "ir/test_mla_fusion::mla_complex": {
     "gcc": 4,
-    "tcc": 6,
-    "updated": "2026-05-10T16:08:56.100374+00:00"
+    "tcc": 4,
+    "updated": "2026-05-14T21:11:44.701017+00:00"
   },
   "ir/test_mla_fusion::mla_loop": {
     "gcc": 13,
-    "tcc": 10,
-    "updated": "2026-05-02T08:48:22.344889+00:00"
+    "tcc": 13,
+    "updated": "2026-05-14T21:11:44.701019+00:00"
   },
   "ir/test_mla_fusion::mla_multiple": {
     "gcc": 4,
-    "tcc": 6,
-    "updated": "2026-05-10T16:08:56.100378+00:00"
+    "tcc": 4,
+    "updated": "2026-05-14T21:11:44.701021+00:00"
   },
   "ir/test_mla_fusion::mla_simple": {
     "gcc": 2,
-    "tcc": 3,
-    "updated": "2026-05-02T08:48:22.344892+00:00"
+    "tcc": 2,
+    "updated": "2026-05-14T21:11:44.701023+00:00"
   },
   "ir/test_mla_fusion::mla_swapped": {
     "gcc": 2,
-    "tcc": 3,
-    "updated": "2026-05-02T08:48:22.344894+00:00"
+    "tcc": 2,
+    "updated": "2026-05-14T21:11:44.701024+00:00"
   },
   "ir/test_mul32wide_outparams::check_pair": {
     "gcc": 32,
-    "tcc": 72,
-    "updated": "2026-05-06T21:00:51.161350+00:00"
+    "tcc": 82,
+    "updated": "2026-05-14T21:11:44.701121+00:00"
   },
   "ir/test_mul32wide_outparams::main": {
     "gcc": 36,
     "tcc": 39,
-    "updated": "2026-05-02T08:48:22.344983+00:00"
+    "updated": "2026-05-14T21:11:44.701123+00:00"
   },
   "ir/test_mul32wide_outparams::mul32wide_u32": {
     "gcc": 20,
     "tcc": 22,
-    "updated": "2026-05-10T09:18:30.111526+00:00"
+    "updated": "2026-05-14T21:11:44.701125+00:00"
   },
   "ir/test_mul64wide_compare::check_one": {
     "gcc": 47,
-    "tcc": 48,
-    "updated": "2026-05-02T08:48:22.344994+00:00"
+    "tcc": 67,
+    "updated": "2026-05-14T21:11:44.701129+00:00"
   },
   "ir/test_mul64wide_compare::main": {
     "gcc": 42,
-    "tcc": 41,
-    "updated": "2026-05-02T08:48:22.344996+00:00"
+    "tcc": 191,
+    "updated": "2026-05-14T21:11:44.701130+00:00"
   },
   "ir/test_mul64wide_compare::mul32wide_u32": {
     "gcc": 20,
     "tcc": 22,
-    "updated": "2026-05-10T09:18:30.111530+00:00"
+    "updated": "2026-05-14T21:11:44.701133+00:00"
   },
   "ir/test_mul64wide_compare::mul64wide_orig": {
     "gcc": 62,
-    "tcc": 152,
-    "updated": "2026-05-04T20:33:30.939834+00:00"
+    "tcc": 104,
+    "updated": "2026-05-14T21:11:44.701135+00:00"
   },
   "ir/test_mul64wide_compare::mul64wide_ref": {
     "gcc": 62,
-    "tcc": 115,
-    "updated": "2026-05-04T20:33:30.939838+00:00"
+    "tcc": 74,
+    "updated": "2026-05-14T21:11:44.701136+00:00"
   },
   "ir/test_offset_addressing::compute_with_array": {
     "gcc": 9,
-    "tcc": 10,
-    "updated": "2026-05-10T16:08:56.100385+00:00"
+    "tcc": 9,
+    "updated": "2026-05-14T21:11:44.701036+00:00"
   },
   "ir/test_offset_addressing::load_array_element": {
     "gcc": 3,
     "tcc": 3,
-    "updated": "2026-05-02T08:48:22.344912+00:00"
+    "updated": "2026-05-14T21:11:44.701038+00:00"
   },
   "ir/test_offset_addressing::main": {
     "gcc": 27,
-    "tcc": 49,
-    "updated": "2026-05-11T09:55:12.627209+00:00"
+    "tcc": 30,
+    "updated": "2026-05-14T21:11:44.701039+00:00"
   },
   "ir/test_offset_addressing::store_array_element": {
     "gcc": 3,
-    "tcc": 4,
-    "updated": "2026-05-09T17:35:48.125906+00:00"
+    "tcc": 3,
+    "updated": "2026-05-14T21:11:44.701042+00:00"
   },
   "ir/test_offset_addressing::sum_array": {
     "gcc": 8,
-    "tcc": 9,
-    "updated": "2026-05-02T08:48:22.344917+00:00"
+    "tcc": 8,
+    "updated": "2026-05-14T21:11:44.701044+00:00"
   },
   "ir/test_offset_addressing::swap_adjacent": {
     "gcc": 8,
-    "tcc": 11,
-    "updated": "2026-05-09T17:35:48.125910+00:00"
+    "tcc": 8,
+    "updated": "2026-05-14T21:11:44.701046+00:00"
   },
   "ir/test_sha_transform::main": {
     "gcc": 152,
-    "tcc": 44,
-    "updated": "2026-05-11T09:55:12.627250+00:00"
+    "tcc": 106,
+    "updated": "2026-05-14T21:11:44.701185+00:00"
+  },
+  "ir/test_sl_fwd_alias_call::main": {
+    "gcc": 5,
+    "tcc": 5,
+    "updated": "2026-05-14T21:11:44.701233+00:00"
+  },
+  "ir/test_sl_fwd_alias_call::may_write": {
+    "gcc": 3,
+    "tcc": 3,
+    "updated": "2026-05-14T21:11:44.701235+00:00"
+  },
+  "ir/test_sl_fwd_alias_offsets::main": {
+    "gcc": 5,
+    "tcc": 5,
+    "updated": "2026-05-14T21:11:44.701239+00:00"
+  },
+  "ir/test_sl_fwd_alias_uncond::main": {
+    "gcc": 5,
+    "tcc": 5,
+    "updated": "2026-05-14T21:11:44.701232+00:00"
   },
   "ir/test_struct_pass_by_value::main": {
     "gcc": 7,
     "tcc": 7,
-    "updated": "2026-05-02T08:48:22.344923+00:00"
+    "updated": "2026-05-14T21:11:44.701065+00:00"
   },
   "ir/test_struct_return::main": {
     "gcc": 7,
     "tcc": 7,
-    "updated": "2026-05-02T08:48:22.344925+00:00"
+    "updated": "2026-05-14T21:11:44.701069+00:00"
   },
   "ir/test_switch::bench_switch": {
     "gcc": 5,
     "tcc": 5,
-    "updated": "2026-05-02T08:48:22.345091+00:00"
+    "updated": "2026-05-14T21:11:44.701244+00:00"
   },
   "ir/test_switch::main": {
     "gcc": 6,
     "tcc": 6,
-    "updated": "2026-05-02T08:48:22.345093+00:00"
+    "updated": "2026-05-14T21:11:44.701246+00:00"
   },
   "ir/test_switch_return::main": {
     "gcc": 26,
-    "tcc": 14,
-    "updated": "2026-05-11T09:55:12.627287+00:00"
+    "tcc": 13,
+    "updated": "2026-05-14T21:11:44.701255+00:00"
   },
   "ir/test_switch_return::switch_return": {
     "gcc": 7,
     "tcc": 33,
-    "updated": "2026-05-02T08:48:22.345106+00:00"
+    "updated": "2026-05-14T21:11:44.701257+00:00"
   },
   "ir/test_switch_simple::main": {
     "gcc": 6,
     "tcc": 6,
-    "updated": "2026-05-02T08:48:22.345088+00:00"
+    "updated": "2026-05-14T21:11:44.701252+00:00"
   },
   "ir/test_switch_small::main": {
     "gcc": 6,
-    "tcc": 9,
-    "updated": "2026-05-07T19:49:29.856037+00:00"
+    "tcc": 8,
+    "updated": "2026-05-14T21:11:44.701253+00:00"
   },
   "ir/test_u64_mask_bit41::main": {
     "gcc": 83,
     "tcc": 5,
-    "updated": "2026-05-02T08:48:22.344980+00:00"
+    "updated": "2026-05-14T21:11:44.701142+00:00"
   },
   "ir/test_u64_param_split::main": {
     "gcc": 42,
-    "tcc": 111,
-    "updated": "2026-05-02T08:48:22.344987+00:00"
+    "tcc": 47,
+    "updated": "2026-05-14T21:11:44.701138+00:00"
   },
   "ir/test_u64_shift32::main": {
     "gcc": 87,
-    "tcc": 126,
-    "updated": "2026-05-04T20:33:30.939825+00:00"
+    "tcc": 182,
+    "updated": "2026-05-14T21:11:44.701140+00:00"
   },
   "ir/test_u64_shift_add::main": {
     "gcc": 26,
-    "tcc": 67,
-    "updated": "2026-05-06T21:00:51.161361+00:00"
-  },
-  "mibench_sha::bench_mibench_sha": {
-    "gcc": 70,
-    "tcc": 59,
-    "updated": "2026-05-09T21:39:34.782319+00:00"
-  },
-  "mibench_sha::main": {
-    "gcc": 7,
-    "tcc": 7,
-    "updated": "2026-05-07T19:50:40.479126+00:00"
-  },
-  "mibench_sha::sha_final": {
-    "gcc": 31,
-    "tcc": 47,
-    "updated": "2026-05-09T17:52:05.419953+00:00"
-  },
-  "mibench_sha::sha_init": {
-    "gcc": 13,
-    "tcc": 15,
-    "updated": "2026-05-09T17:52:05.419999+00:00"
-  },
-  "mibench_sha::sha_print": {
-    "gcc": 11,
-    "tcc": 14,
-    "updated": "2026-05-09T17:52:05.420004+00:00"
-  },
-  "mibench_sha::sha_stream": {
-    "gcc": 31,
-    "tcc": 25,
-    "updated": "2026-05-08T19:02:09.132776+00:00"
-  },
-  "mibench_sha::sha_transform": {
-    "gcc": 150,
-    "tcc": 178,
-    "updated": "2026-05-09T21:39:34.782351+00:00"
-  },
-  "mibench_sha::sha_update": {
-    "gcc": 47,
-    "tcc": 43,
-    "updated": "2026-05-09T15:48:04.353433+00:00"
-  },
-  "nested_multi_level::main": {
-    "gcc": 9,
-    "tcc": 9,
-    "updated": "2026-05-02T18:29:06.672356+00:00"
+    "tcc": 44,
+    "updated": "2026-05-14T21:11:44.701147+00:00"
   },
   "pic-tds/bug_mask_copy_noloop::adjust_sp": {
     "gcc": 1,
     "tcc": 1,
-    "updated": "2026-05-02T08:48:22.345284+00:00"
+    "updated": "2026-05-14T21:11:44.701439+00:00"
   },
   "pic-tds/bug_mask_copy_noloop::do_call": {
     "gcc": 1,
     "tcc": 1,
-    "updated": "2026-05-02T08:48:22.345286+00:00"
+    "updated": "2026-05-14T21:11:44.701441+00:00"
   },
   "pic-tds/bug_mask_copy_noloop::emit_check_mask": {
     "gcc": 9,
     "tcc": 12,
-    "updated": "2026-05-02T08:48:22.345288+00:00"
+    "updated": "2026-05-14T21:11:44.701443+00:00"
   },
   "pic-tds/bug_mask_copy_noloop::gen_call_op": {
     "gcc": 72,
-    "tcc": 121,
-    "updated": "2026-05-02T08:48:22.345290+00:00"
+    "tcc": 124,
+    "updated": "2026-05-14T21:11:44.701445+00:00"
   },
   "pic-tds/bug_mask_copy_noloop::get_site": {
     "gcc": 6,
     "tcc": 10,
-    "updated": "2026-05-02T08:48:22.345292+00:00"
+    "updated": "2026-05-14T21:11:44.701447+00:00"
   },
   "pic-tds/bug_mask_copy_noloop::handle_return": {
     "gcc": 1,
     "tcc": 1,
-    "updated": "2026-05-02T08:48:22.345294+00:00"
+    "updated": "2026-05-14T21:11:44.701449+00:00"
   },
   "pic-tds/bug_mask_copy_noloop::main": {
     "gcc": 47,
     "tcc": 45,
-    "updated": "2026-05-10T09:18:30.111654+00:00"
+    "updated": "2026-05-14T21:11:44.701450+00:00"
   },
   "pic-tds/bug_struct_mask_copy::adjust_sp": {
     "gcc": 1,
     "tcc": 1,
-    "updated": "2026-05-02T08:48:22.345313+00:00"
+    "updated": "2026-05-14T21:11:44.701452+00:00"
   },
   "pic-tds/bug_struct_mask_copy::build_layout": {
     "gcc": 13,
-    "tcc": 19,
-    "updated": "2026-05-09T17:35:48.126093+00:00"
+    "tcc": 17,
+    "updated": "2026-05-14T21:11:44.701454+00:00"
   },
   "pic-tds/bug_struct_mask_copy::do_call": {
     "gcc": 1,
     "tcc": 1,
-    "updated": "2026-05-02T08:48:22.345316+00:00"
+    "updated": "2026-05-14T21:11:44.701456+00:00"
   },
   "pic-tds/bug_struct_mask_copy::emit_check": {
     "gcc": 13,
     "tcc": 12,
-    "updated": "2026-05-02T08:48:22.345318+00:00"
+    "updated": "2026-05-14T21:11:44.701457+00:00"
   },
   "pic-tds/bug_struct_mask_copy::emit_reg_args": {
     "gcc": 5,
-    "tcc": 8,
-    "updated": "2026-05-10T16:08:56.100557+00:00"
+    "tcc": 7,
+    "updated": "2026-05-14T21:11:44.701459+00:00"
   },
   "pic-tds/bug_struct_mask_copy::emit_stack_args": {
     "gcc": 1,
     "tcc": 1,
-    "updated": "2026-05-02T08:48:22.345322+00:00"
+    "updated": "2026-05-14T21:11:44.701461+00:00"
   },
   "pic-tds/bug_struct_mask_copy::gen_call_op": {
     "gcc": 93,
-    "tcc": 190,
-    "updated": "2026-05-10T09:41:26.060682+00:00"
+    "tcc": 166,
+    "updated": "2026-05-14T21:11:44.701463+00:00"
   },
   "pic-tds/bug_struct_mask_copy::get_site": {
     "gcc": 7,
     "tcc": 10,
-    "updated": "2026-05-02T08:48:22.345325+00:00"
+    "updated": "2026-05-14T21:11:44.701465+00:00"
   },
   "pic-tds/bug_struct_mask_copy::handle_return": {
     "gcc": 1,
     "tcc": 1,
-    "updated": "2026-05-02T08:48:22.345327+00:00"
+    "updated": "2026-05-14T21:11:44.701466+00:00"
   },
   "pic-tds/bug_struct_mask_copy::main": {
     "gcc": 90,
-    "tcc": 107,
-    "updated": "2026-05-02T08:48:22.345329+00:00"
+    "tcc": 111,
+    "updated": "2026-05-14T21:11:44.701468+00:00"
   },
   "pic-tds/bug_struct_mask_copy::make_push": {
     "gcc": 23,
-    "tcc": 68,
-    "updated": "2026-05-02T08:48:22.345331+00:00"
+    "tcc": 59,
+    "updated": "2026-05-14T21:11:44.701470+00:00"
   },
-  "test_complex_simple::main": {
+  "tests2/00_assignment::main": {
+    "gcc": 13,
+    "tcc": 13,
+    "updated": "2026-05-14T21:15:32.782006+00:00"
+  },
+  "tests2/01_comment::main": {
+    "gcc": 13,
+    "tcc": 13,
+    "updated": "2026-05-14T21:15:32.782012+00:00"
+  },
+  "tests2/02_printf::main": {
+    "gcc": 22,
+    "tcc": 22,
+    "updated": "2026-05-14T21:15:32.782000+00:00"
+  },
+  "tests2/03_struct::fred$": {
     "gcc": 2,
-    "tcc": 49,
-    "updated": "2026-05-03T08:35:17.411813+00:00"
+    "tcc": 4,
+    "updated": "2026-05-14T21:15:32.781983+00:00"
   },
-  "test_complex_simple::test_add": {
-    "gcc": 20,
+  "tests2/03_struct::main": {
+    "gcc": 23,
+    "tcc": 29,
+    "updated": "2026-05-14T21:15:32.781996+00:00"
+  },
+  "tests2/04_for::main": {
+    "gcc": 10,
+    "tcc": 10,
+    "updated": "2026-05-14T21:15:32.782030+00:00"
+  },
+  "tests2/05_array::main": {
+    "gcc": 28,
+    "tcc": 22,
+    "updated": "2026-05-14T21:15:32.782010+00:00"
+  },
+  "tests2/06_case::main": {
+    "gcc": 29,
     "tcc": 30,
-    "updated": "2026-05-03T08:35:17.411825+00:00"
+    "updated": "2026-05-14T21:15:32.782014+00:00"
   },
-  "test_ge_operator::main": {
-    "gcc": 72,
-    "tcc": 141,
-    "updated": "2026-05-10T16:57:21.014285+00:00"
+  "tests2/07_function::main": {
+    "gcc": 14,
+    "tcc": 14,
+    "updated": "2026-05-14T21:15:32.782018+00:00"
   },
-  "test_ge_operator::test_ge_direct": {
+  "tests2/07_function::myfunc": {
+    "gcc": 2,
+    "tcc": 2,
+    "updated": "2026-05-14T21:15:32.782020+00:00"
+  },
+  "tests2/07_function::qfunc": {
+    "gcc": 2,
+    "tcc": 4,
+    "updated": "2026-05-14T21:15:32.782022+00:00"
+  },
+  "tests2/07_function::vfunc": {
+    "gcc": 3,
+    "tcc": 5,
+    "updated": "2026-05-14T21:15:32.782024+00:00"
+  },
+  "tests2/07_function::zfunc": {
+    "gcc": 2,
+    "tcc": 3,
+    "updated": "2026-05-14T21:15:32.782026+00:00"
+  },
+  "tests2/08_while::main": {
+    "gcc": 14,
+    "tcc": 15,
+    "updated": "2026-05-14T21:15:32.782008+00:00"
+  },
+  "tests2/09_do_while::main": {
+    "gcc": 14,
+    "tcc": 14,
+    "updated": "2026-05-14T21:15:32.782003+00:00"
+  },
+  "tests2/100_c99array-decls::fooc": {
+    "gcc": 7,
+    "tcc": 3,
+    "updated": "2026-05-14T21:15:32.782231+00:00"
+  },
+  "tests2/100_c99array-decls::main": {
+    "gcc": 2,
+    "tcc": 2,
+    "updated": "2026-05-14T21:15:32.782233+00:00"
+  },
+  "tests2/101_cleanup::check": {
+    "gcc": 29,
+    "tcc": 53,
+    "updated": "2026-05-14T21:15:32.782354+00:00"
+  },
+  "tests2/101_cleanup::check2": {
+    "gcc": 4,
+    "tcc": 6,
+    "updated": "2026-05-14T21:15:32.782356+00:00"
+  },
+  "tests2/101_cleanup::check_oh_i": {
+    "gcc": 4,
+    "tcc": 6,
+    "updated": "2026-05-14T21:15:32.782357+00:00"
+  },
+  "tests2/101_cleanup::cl": {
+    "gcc": 4,
+    "tcc": 6,
+    "updated": "2026-05-14T21:15:32.782359+00:00"
+  },
+  "tests2/101_cleanup::goto_hell": {
+    "gcc": 4,
+    "tcc": 8,
+    "updated": "2026-05-14T21:15:32.782361+00:00"
+  },
+  "tests2/101_cleanup::incr_glob_i": {
+    "gcc": 6,
+    "tcc": 7,
+    "updated": "2026-05-14T21:15:32.782363+00:00"
+  },
+  "tests2/101_cleanup::loop_cleanups": {
+    "gcc": 48,
+    "tcc": 78,
+    "updated": "2026-05-14T21:15:32.782365+00:00"
+  },
+  "tests2/101_cleanup::main": {
+    "gcc": 38,
+    "tcc": 392023,
+    "updated": "2026-05-14T21:15:32.782367+00:00"
+  },
+  "tests2/101_cleanup::test": {
+    "gcc": 6,
+    "tcc": 9,
+    "updated": "2026-05-14T21:15:32.782368+00:00"
+  },
+  "tests2/101_cleanup::test2": {
+    "gcc": 3,
+    "tcc": 12,
+    "updated": "2026-05-14T21:15:32.782370+00:00"
+  },
+  "tests2/101_cleanup::test3": {
+    "gcc": 15,
+    "tcc": 30,
+    "updated": "2026-05-14T21:15:32.782372+00:00"
+  },
+  "tests2/101_cleanup::test_ret": {
+    "gcc": 7,
+    "tcc": 12,
+    "updated": "2026-05-14T21:15:32.782374+00:00"
+  },
+  "tests2/101_cleanup::test_ret2": {
+    "gcc": 11,
+    "tcc": 17,
+    "updated": "2026-05-14T21:15:32.782376+00:00"
+  },
+  "tests2/101_cleanup::test_ret_subcall": {
+    "gcc": 2,
+    "tcc": 4,
+    "updated": "2026-05-14T21:15:32.782378+00:00"
+  },
+  "tests2/103_implicit_memmove::foo": {
     "gcc": 5,
     "tcc": 5,
-    "updated": "2026-05-10T15:26:55.658246+00:00"
+    "updated": "2026-05-14T21:15:32.782236+00:00"
   },
-  "test_ge_operator::test_ge_workaround": {
-    "gcc": 5,
-    "tcc": 5,
-    "updated": "2026-05-10T15:30:04.703747+00:00"
+  "tests2/103_implicit_memmove::foo2": {
+    "gcc": 2,
+    "tcc": 4,
+    "updated": "2026-05-14T21:15:32.782238+00:00"
   },
-  "test_llong_load_signed::main": {
+  "tests2/103_implicit_memmove::main": {
+    "gcc": 2,
+    "tcc": 2,
+    "updated": "2026-05-14T21:15:32.782240+00:00"
+  },
+  "tests2/104_inline::extern_extern_postdeclared": {
+    "gcc": 1,
+    "tcc": 1,
+    "updated": "2026-05-14T21:15:32.782255+00:00"
+  },
+  "tests2/104_inline::extern_extern_postdeclared2": {
+    "gcc": 1,
+    "tcc": 1,
+    "updated": "2026-05-14T21:15:32.782257+00:00"
+  },
+  "tests2/104_inline::extern_extern_predeclared": {
+    "gcc": 1,
+    "tcc": 1,
+    "updated": "2026-05-14T21:15:32.782259+00:00"
+  },
+  "tests2/104_inline::extern_extern_predeclared2": {
+    "gcc": 1,
+    "tcc": 1,
+    "updated": "2026-05-14T21:15:32.782261+00:00"
+  },
+  "tests2/104_inline::extern_extern_prepostdeclared": {
+    "gcc": 1,
+    "tcc": 1,
+    "updated": "2026-05-14T21:15:32.782263+00:00"
+  },
+  "tests2/104_inline::extern_extern_prepostdeclared2": {
+    "gcc": 1,
+    "tcc": 1,
+    "updated": "2026-05-14T21:15:32.782264+00:00"
+  },
+  "tests2/104_inline::extern_extern_undeclared": {
+    "gcc": 1,
+    "tcc": 1,
+    "updated": "2026-05-14T21:15:32.782266+00:00"
+  },
+  "tests2/104_inline::extern_extern_undeclared2": {
+    "gcc": 1,
+    "tcc": 1,
+    "updated": "2026-05-14T21:15:32.782268+00:00"
+  },
+  "tests2/104_inline::extern_postdeclared": {
+    "gcc": 1,
+    "tcc": 1,
+    "updated": "2026-05-14T21:15:32.782270+00:00"
+  },
+  "tests2/104_inline::extern_postdeclared2": {
+    "gcc": 1,
+    "tcc": 1,
+    "updated": "2026-05-14T21:15:32.782271+00:00"
+  },
+  "tests2/104_inline::extern_predeclared": {
+    "gcc": 1,
+    "tcc": 1,
+    "updated": "2026-05-14T21:15:32.782273+00:00"
+  },
+  "tests2/104_inline::extern_predeclared2": {
+    "gcc": 1,
+    "tcc": 1,
+    "updated": "2026-05-14T21:15:32.782275+00:00"
+  },
+  "tests2/104_inline::extern_prepostdeclared": {
+    "gcc": 1,
+    "tcc": 1,
+    "updated": "2026-05-14T21:15:32.782277+00:00"
+  },
+  "tests2/104_inline::extern_undeclared": {
+    "gcc": 1,
+    "tcc": 1,
+    "updated": "2026-05-14T21:15:32.782278+00:00"
+  },
+  "tests2/104_inline::extern_undeclared2": {
+    "gcc": 1,
+    "tcc": 1,
+    "updated": "2026-05-14T21:15:32.782280+00:00"
+  },
+  "tests2/104_inline::inst2_extern_inline_postdeclared": {
+    "gcc": 1,
+    "tcc": 1,
+    "updated": "2026-05-14T21:15:32.782282+00:00"
+  },
+  "tests2/104_inline::inst2_extern_inline_predeclared": {
+    "gcc": 1,
+    "tcc": 1,
+    "updated": "2026-05-14T21:15:32.782284+00:00"
+  },
+  "tests2/104_inline::inst3_extern_inline_predeclared": {
+    "gcc": 1,
+    "tcc": 1,
+    "updated": "2026-05-14T21:15:32.782286+00:00"
+  },
+  "tests2/104_inline::inst_extern_inline_postdeclared": {
+    "gcc": 1,
+    "tcc": 1,
+    "updated": "2026-05-14T21:15:32.782288+00:00"
+  },
+  "tests2/104_inline::inst_extern_inline_predeclared": {
+    "gcc": 1,
+    "tcc": 1,
+    "updated": "2026-05-14T21:15:32.782290+00:00"
+  },
+  "tests2/104_inline::main": {
+    "gcc": 4,
+    "tcc": 14,
+    "updated": "2026-05-14T21:15:32.782292+00:00"
+  },
+  "tests2/104_inline::noinst_extern_inline_func": {
+    "gcc": 1,
+    "tcc": 1,
+    "updated": "2026-05-14T21:15:32.782294+00:00"
+  },
+  "tests2/104_inline::noinst_extern_inline_postdeclared": {
+    "gcc": 1,
+    "tcc": 1,
+    "updated": "2026-05-14T21:15:32.782295+00:00"
+  },
+  "tests2/104_inline::noinst_extern_inline_postdeclared2": {
+    "gcc": 1,
+    "tcc": 1,
+    "updated": "2026-05-14T21:15:32.782297+00:00"
+  },
+  "tests2/104_inline::noinst_extern_inline_undeclared": {
+    "gcc": 1,
+    "tcc": 1,
+    "updated": "2026-05-14T21:15:32.782299+00:00"
+  },
+  "tests2/105_local_extern::bar": {
+    "gcc": 2,
+    "tcc": 3,
+    "updated": "2026-05-14T21:15:32.782248+00:00"
+  },
+  "tests2/105_local_extern::f": {
+    "gcc": 2,
+    "tcc": 4,
+    "updated": "2026-05-14T21:15:32.782250+00:00"
+  },
+  "tests2/105_local_extern::foo": {
+    "gcc": 2,
+    "tcc": 3,
+    "updated": "2026-05-14T21:15:32.782252+00:00"
+  },
+  "tests2/105_local_extern::main": {
     "gcc": 7,
     "tcc": 7,
-    "updated": "2026-05-07T19:47:55.204820+00:00"
+    "updated": "2026-05-14T21:15:32.782254+00:00"
   },
-  "test_llong_relops::main": {
+  "tests2/108_constructor::main": {
+    "gcc": 7,
+    "tcc": 7,
+    "updated": "2026-05-14T21:15:32.782242+00:00"
+  },
+  "tests2/108_constructor::testc": {
+    "gcc": 4,
+    "tcc": 6,
+    "updated": "2026-05-14T21:15:32.782244+00:00"
+  },
+  "tests2/108_constructor::testd": {
+    "gcc": 4,
+    "tcc": 6,
+    "updated": "2026-05-14T21:15:32.782246+00:00"
+  },
+  "tests2/10_pointer::main": {
+    "gcc": 33,
+    "tcc": 48,
+    "updated": "2026-05-14T21:15:32.782046+00:00"
+  },
+  "tests2/118_switch::ibdg": {
+    "gcc": 129,
+    "tcc": 445,
+    "updated": "2026-05-14T21:15:32.782337+00:00"
+  },
+  "tests2/118_switch::main": {
+    "gcc": 46,
+    "tcc": 73,
+    "updated": "2026-05-14T21:15:32.782339+00:00"
+  },
+  "tests2/118_switch::ubdg": {
+    "gcc": 129,
+    "tcc": 451,
+    "updated": "2026-05-14T21:15:32.782341+00:00"
+  },
+  "tests2/11_precedence::main": {
+    "gcc": 50,
+    "tcc": 50,
+    "updated": "2026-05-14T21:15:32.782034+00:00"
+  },
+  "tests2/122_vla_reuse::main": {
+    "gcc": 54,
+    "tcc": 113,
+    "updated": "2026-05-14T21:15:32.782335+00:00"
+  },
+  "tests2/123_vla_bug::main": {
+    "gcc": 22,
+    "tcc": 52,
+    "updated": "2026-05-14T21:15:32.782332+00:00"
+  },
+  "tests2/129_scopes::main": {
+    "gcc": 2,
+    "tcc": 2,
+    "updated": "2026-05-14T21:15:32.782330+00:00"
+  },
+  "tests2/12_hashdefine::main": {
+    "gcc": 11,
+    "tcc": 11,
+    "updated": "2026-05-14T21:15:32.782042+00:00"
+  },
+  "tests2/130_large_argument::main": {
+    "gcc": 38,
+    "tcc": 44,
+    "updated": "2026-05-14T21:15:32.782347+00:00"
+  },
+  "tests2/130_large_argument::pass_large_struct1": {
+    "gcc": 7,
+    "tcc": 13,
+    "updated": "2026-05-14T21:15:32.782348+00:00"
+  },
+  "tests2/130_large_argument::pass_large_struct2": {
+    "gcc": 9,
+    "tcc": 17,
+    "updated": "2026-05-14T21:15:32.782350+00:00"
+  },
+  "tests2/130_large_argument::pass_many_args": {
+    "gcc": 32,
+    "tcc": 29,
+    "updated": "2026-05-14T21:15:32.782352+00:00"
+  },
+  "tests2/133_string_concat::main": {
+    "gcc": 6,
+    "tcc": 5,
+    "updated": "2026-05-14T21:15:32.782333+00:00"
+  },
+  "tests2/135_func_arg_struct_compare::dummy": {
+    "gcc": 5,
+    "tcc": 1,
+    "updated": "2026-05-14T21:15:32.782343+00:00"
+  },
+  "tests2/135_func_arg_struct_compare::main": {
+    "gcc": 5,
+    "tcc": 16,
+    "updated": "2026-05-14T21:15:32.782345+00:00"
+  },
+  "tests2/13_integer_literals::main": {
+    "gcc": 18,
+    "tcc": 18,
+    "updated": "2026-05-14T21:15:32.782028+00:00"
+  },
+  "tests2/14_if::main": {
+    "gcc": 7,
+    "tcc": 7,
+    "updated": "2026-05-14T21:15:32.782016+00:00"
+  },
+  "tests2/15_recursion::factorial": {
+    "gcc": 13,
+    "tcc": 21,
+    "updated": "2026-05-14T21:15:32.782054+00:00"
+  },
+  "tests2/15_recursion::main": {
+    "gcc": 19,
+    "tcc": 25,
+    "updated": "2026-05-14T21:15:32.782056+00:00"
+  },
+  "tests2/16_nesting::main": {
+    "gcc": 29,
+    "tcc": 22,
+    "updated": "2026-05-14T21:15:32.782036+00:00"
+  },
+  "tests2/18_include::main": {
+    "gcc": 20,
+    "tcc": 20,
+    "updated": "2026-05-14T21:15:32.782038+00:00"
+  },
+  "tests2/19_pointer_arithmetic::main": {
+    "gcc": 10,
+    "tcc": 18,
+    "updated": "2026-05-14T21:15:32.782052+00:00"
+  },
+  "tests2/20_pointer_comparison::main": {
+    "gcc": 21,
+    "tcc": 35,
+    "updated": "2026-05-14T21:15:32.782032+00:00"
+  },
+  "tests2/21_char_array::main": {
+    "gcc": 27,
+    "tcc": 35,
+    "updated": "2026-05-14T21:15:32.782044+00:00"
+  },
+  "tests2/25_quicksort::main": {
+    "gcc": 51,
+    "tcc": 83,
+    "updated": "2026-05-14T21:15:32.782063+00:00"
+  },
+  "tests2/25_quicksort::partition": {
+    "gcc": 27,
+    "tcc": 43,
+    "updated": "2026-05-14T21:15:32.782065+00:00"
+  },
+  "tests2/25_quicksort::quicksort": {
+    "gcc": 139,
+    "tcc": 44,
+    "updated": "2026-05-14T21:15:32.782067+00:00"
+  },
+  "tests2/25_quicksort::swap": {
+    "gcc": 6,
+    "tcc": 6,
+    "updated": "2026-05-14T21:15:32.782068+00:00"
+  },
+  "tests2/26_character_constants::main": {
+    "gcc": 26,
+    "tcc": 26,
+    "updated": "2026-05-14T21:15:32.782057+00:00"
+  },
+  "tests2/27_sizeof::main": {
     "gcc": 15,
     "tcc": 15,
-    "updated": "2026-05-02T08:51:41.369441+00:00"
+    "updated": "2026-05-14T21:15:32.782050+00:00"
   },
-  "test_llong_relops::run_signed": {
-    "gcc": 100,
-    "tcc": 211,
-    "updated": "2026-05-02T09:36:13.429602+00:00"
+  "tests2/28_strings::main": {
+    "gcc": 148,
+    "tcc": 152,
+    "updated": "2026-05-14T21:15:32.782061+00:00"
   },
-  "test_llong_relops::run_unsigned": {
-    "gcc": 91,
-    "tcc": 196,
-    "updated": "2026-05-02T09:36:13.429614+00:00"
+  "tests2/29_array_address::main": {
+    "gcc": 11,
+    "tcc": 10,
+    "updated": "2026-05-14T21:15:32.782040+00:00"
   },
-  "test_struct_return::main": {
-    "gcc": 7,
+  "tests2/30_hanoi::Hanoi": {
+    "gcc": 350,
+    "tcc": 65,
+    "updated": "2026-05-14T21:15:32.782070+00:00"
+  },
+  "tests2/30_hanoi::Move": {
+    "gcc": 32,
+    "tcc": 43,
+    "updated": "2026-05-14T21:15:32.782072+00:00"
+  },
+  "tests2/30_hanoi::PrintAll": {
+    "gcc": 37,
+    "tcc": 43,
+    "updated": "2026-05-14T21:15:32.782074+00:00"
+  },
+  "tests2/30_hanoi::main": {
+    "gcc": 32,
+    "tcc": 45,
+    "updated": "2026-05-14T21:15:32.782076+00:00"
+  },
+  "tests2/35_sizeof::main": {
+    "gcc": 11,
+    "tcc": 11,
+    "updated": "2026-05-14T21:15:32.782078+00:00"
+  },
+  "tests2/36_array_initialisers::main": {
+    "gcc": 48,
+    "tcc": 56,
+    "updated": "2026-05-14T21:15:32.782059+00:00"
+  },
+  "tests2/37_sprintf::main": {
+    "gcc": 16,
+    "tcc": 16,
+    "updated": "2026-05-14T21:15:32.782080+00:00"
+  },
+  "tests2/38_multiple_array_index::main": {
+    "gcc": 46,
+    "tcc": 41,
+    "updated": "2026-05-14T21:15:32.782081+00:00"
+  },
+  "tests2/39_typedef::func": {
+    "gcc": 2,
+    "tcc": 2,
+    "updated": "2026-05-14T21:15:32.782083+00:00"
+  },
+  "tests2/39_typedef::main": {
+    "gcc": 14,
+    "tcc": 22,
+    "updated": "2026-05-14T21:15:32.782085+00:00"
+  },
+  "tests2/39_typedef::set_anon_super": {
+    "gcc": 2,
+    "tcc": 2,
+    "updated": "2026-05-14T21:15:32.782087+00:00"
+  },
+  "tests2/41_hashif::main": {
+    "gcc": 15,
+    "tcc": 15,
+    "updated": "2026-05-14T21:15:32.782090+00:00"
+  },
+  "tests2/42_function_pointer::fred": {
+    "gcc": 6,
+    "tcc": 6,
+    "updated": "2026-05-14T21:15:32.782101+00:00"
+  },
+  "tests2/42_function_pointer::main": {
+    "gcc": 14,
+    "tcc": 16,
+    "updated": "2026-05-14T21:15:32.782103+00:00"
+  },
+  "tests2/43_void_param::fred": {
+    "gcc": 2,
+    "tcc": 4,
+    "updated": "2026-05-14T21:15:32.782092+00:00"
+  },
+  "tests2/43_void_param::main": {
+    "gcc": 5,
+    "tcc": 5,
+    "updated": "2026-05-14T21:15:32.782094+00:00"
+  },
+  "tests2/44_scoped_declarations::main": {
+    "gcc": 5,
+    "tcc": 5,
+    "updated": "2026-05-14T21:15:32.782097+00:00"
+  },
+  "tests2/45_empty_for::main": {
+    "gcc": 10,
+    "tcc": 10,
+    "updated": "2026-05-14T21:15:32.782089+00:00"
+  },
+  "tests2/47_switch_return::fred": {
+    "gcc": 18,
+    "tcc": 22,
+    "updated": "2026-05-14T21:15:32.782105+00:00"
+  },
+  "tests2/47_switch_return::main": {
+    "gcc": 9,
+    "tcc": 17,
+    "updated": "2026-05-14T21:15:32.782107+00:00"
+  },
+  "tests2/48_nested_break::main": {
+    "gcc": 8,
+    "tcc": 8,
+    "updated": "2026-05-14T21:15:32.782117+00:00"
+  },
+  "tests2/50_logical_second_arg::fred": {
+    "gcc": 5,
+    "tcc": 5,
+    "updated": "2026-05-14T21:15:32.782126+00:00"
+  },
+  "tests2/50_logical_second_arg::joe": {
+    "gcc": 5,
+    "tcc": 5,
+    "updated": "2026-05-14T21:15:32.782128+00:00"
+  },
+  "tests2/50_logical_second_arg::main": {
+    "gcc": 51,
+    "tcc": 51,
+    "updated": "2026-05-14T21:15:32.782130+00:00"
+  },
+  "tests2/51_static::henry": {
+    "gcc": 9,
+    "tcc": 11,
+    "updated": "2026-05-14T21:15:32.782132+00:00"
+  },
+  "tests2/51_static::main": {
+    "gcc": 24,
+    "tcc": 29,
+    "updated": "2026-05-14T21:15:32.782134+00:00"
+  },
+  "tests2/52_unnamed_enum::main": {
+    "gcc": 30,
+    "tcc": 30,
+    "updated": "2026-05-14T21:15:32.782096+00:00"
+  },
+  "tests2/54_goto::fred": {
+    "gcc": 6,
+    "tcc": 6,
+    "updated": "2026-05-14T21:15:32.782109+00:00"
+  },
+  "tests2/54_goto::henry": {
+    "gcc": 9,
+    "tcc": 9,
+    "updated": "2026-05-14T21:15:32.782111+00:00"
+  },
+  "tests2/54_goto::joe": {
+    "gcc": 9,
+    "tcc": 9,
+    "updated": "2026-05-14T21:15:32.782113+00:00"
+  },
+  "tests2/54_goto::main": {
+    "gcc": 6,
+    "tcc": 21,
+    "updated": "2026-05-14T21:15:32.782115+00:00"
+  },
+  "tests2/55_lshift_type::check": {
+    "gcc": 19,
+    "tcc": 21,
+    "updated": "2026-05-14T21:15:32.782136+00:00"
+  },
+  "tests2/55_lshift_type::main": {
+    "gcc": 529,
+    "tcc": 1688,
+    "updated": "2026-05-14T21:15:32.782138+00:00"
+  },
+  "tests2/61_integers::main": {
+    "gcc": 171,
+    "tcc": 171,
+    "updated": "2026-05-14T21:15:32.782124+00:00"
+  },
+  "tests2/64_macro_nesting::main": {
+    "gcc": 6,
+    "tcc": 6,
+    "updated": "2026-05-14T21:15:32.782099+00:00"
+  },
+  "tests2/67_macro_concat::main": {
+    "gcc": 10,
+    "tcc": 12,
+    "updated": "2026-05-14T21:15:32.782122+00:00"
+  },
+  "tests2/71_macro_empty_arg::main": {
+    "gcc": 6,
+    "tcc": 6,
+    "updated": "2026-05-14T21:15:32.782118+00:00"
+  },
+  "tests2/72_long_long_constant::main": {
+    "gcc": 5,
+    "tcc": 5,
+    "updated": "2026-05-14T21:15:32.782120+00:00"
+  },
+  "tests2/75_array_in_struct_init::main": {
+    "gcc": 33,
+    "tcc": 38,
+    "updated": "2026-05-14T21:15:32.782140+00:00"
+  },
+  "tests2/76_dollars_in_identifiers::main": {
+    "gcc": 45,
+    "tcc": 46,
+    "updated": "2026-05-14T21:15:32.782142+00:00"
+  },
+  "tests2/77_push_pop_macro::main": {
+    "gcc": 18,
+    "tcc": 18,
+    "updated": "2026-05-14T21:15:32.782144+00:00"
+  },
+  "tests2/78_vla_label::f1": {
+    "gcc": 9,
+    "tcc": 30,
+    "updated": "2026-05-14T21:15:32.782155+00:00"
+  },
+  "tests2/78_vla_label::f2": {
+    "gcc": 1,
+    "tcc": 1,
+    "updated": "2026-05-14T21:15:32.782157+00:00"
+  },
+  "tests2/78_vla_label::f3": {
+    "gcc": 14,
+    "tcc": 14,
+    "updated": "2026-05-14T21:15:32.782159+00:00"
+  },
+  "tests2/78_vla_label::main": {
+    "gcc": 8,
+    "tcc": 43,
+    "updated": "2026-05-14T21:15:32.782161+00:00"
+  },
+  "tests2/79_vla_continue::f": {
+    "gcc": 2,
+    "tcc": 2,
+    "updated": "2026-05-14T21:15:32.782194+00:00"
+  },
+  "tests2/79_vla_continue::main": {
+    "gcc": 8,
+    "tcc": 8,
+    "updated": "2026-05-14T21:15:32.782196+00:00"
+  },
+  "tests2/79_vla_continue::test1": {
+    "gcc": 17,
+    "tcc": 21,
+    "updated": "2026-05-14T21:15:32.782198+00:00"
+  },
+  "tests2/79_vla_continue::test2": {
+    "gcc": 17,
+    "tcc": 37,
+    "updated": "2026-05-14T21:15:32.782199+00:00"
+  },
+  "tests2/79_vla_continue::test3": {
+    "gcc": 17,
+    "tcc": 40,
+    "updated": "2026-05-14T21:15:32.782201+00:00"
+  },
+  "tests2/79_vla_continue::test4": {
+    "gcc": 17,
+    "tcc": 36,
+    "updated": "2026-05-14T21:15:32.782203+00:00"
+  },
+  "tests2/79_vla_continue::test5": {
+    "gcc": 2,
+    "tcc": 24,
+    "updated": "2026-05-14T21:15:32.782205+00:00"
+  },
+  "tests2/80_flexarray::f1char": {
+    "gcc": 2,
+    "tcc": 2,
+    "updated": "2026-05-14T21:15:32.782165+00:00"
+  },
+  "tests2/80_flexarray::f1int": {
+    "gcc": 2,
+    "tcc": 2,
+    "updated": "2026-05-14T21:15:32.782167+00:00"
+  },
+  "tests2/80_flexarray::main": {
+    "gcc": 2,
+    "tcc": 2,
+    "updated": "2026-05-14T21:15:32.782168+00:00"
+  },
+  "tests2/81_types::f1": {
+    "gcc": 3,
+    "tcc": 5,
+    "updated": "2026-05-14T21:15:32.782180+00:00"
+  },
+  "tests2/81_types::f2": {
+    "gcc": 3,
+    "tcc": 5,
+    "updated": "2026-05-14T21:15:32.782181+00:00"
+  },
+  "tests2/81_types::f3": {
+    "gcc": 3,
+    "tcc": 5,
+    "updated": "2026-05-14T21:15:32.782183+00:00"
+  },
+  "tests2/81_types::f4": {
+    "gcc": 4,
     "tcc": 7,
-    "updated": "2026-05-10T15:02:52.321447+00:00"
+    "updated": "2026-05-14T21:15:32.782185+00:00"
+  },
+  "tests2/81_types::f5": {
+    "gcc": 3,
+    "tcc": 5,
+    "updated": "2026-05-14T21:15:32.782187+00:00"
+  },
+  "tests2/81_types::f8": {
+    "gcc": 2,
+    "tcc": 2,
+    "updated": "2026-05-14T21:15:32.782189+00:00"
+  },
+  "tests2/81_types::f9": {
+    "gcc": 3,
+    "tcc": 5,
+    "updated": "2026-05-14T21:15:32.782190+00:00"
+  },
+  "tests2/81_types::main": {
+    "gcc": 2,
+    "tcc": 2,
+    "updated": "2026-05-14T21:15:32.782192+00:00"
+  },
+  "tests2/82_attribs_position::actual_function": {
+    "gcc": 2,
+    "tcc": 2,
+    "updated": "2026-05-14T21:15:32.782146+00:00"
+  },
+  "tests2/82_attribs_position::foo": {
+    "gcc": 1,
+    "tcc": 1,
+    "updated": "2026-05-14T21:15:32.782148+00:00"
+  },
+  "tests2/82_attribs_position::label_attribute": {
+    "gcc": 2,
+    "tcc": 2,
+    "updated": "2026-05-14T21:15:32.782150+00:00"
+  },
+  "tests2/82_attribs_position::main": {
+    "gcc": 9,
+    "tcc": 34,
+    "updated": "2026-05-14T21:15:32.782152+00:00"
+  },
+  "tests2/82_attribs_position::some_stdcall_func": {
+    "gcc": 2,
+    "tcc": 2,
+    "updated": "2026-05-14T21:15:32.782153+00:00"
+  },
+  "tests2/86_memory-model::main": {
+    "gcc": 5,
+    "tcc": 5,
+    "updated": "2026-05-14T21:15:32.782207+00:00"
+  },
+  "tests2/87_dead_code::main": {
+    "gcc": 56,
+    "tcc": 105,
+    "updated": "2026-05-14T21:15:32.782163+00:00"
+  },
+  "tests2/88_codeopt::bla": {
+    "gcc": 2,
+    "tcc": 4,
+    "updated": "2026-05-14T21:15:32.782170+00:00"
+  },
+  "tests2/88_codeopt::broken_jumpopt": {
+    "gcc": 6,
+    "tcc": 10,
+    "updated": "2026-05-14T21:15:32.782172+00:00"
+  },
+  "tests2/88_codeopt::chk": {
+    "gcc": 2,
+    "tcc": 2,
+    "updated": "2026-05-14T21:15:32.782174+00:00"
+  },
+  "tests2/88_codeopt::extend_brk": {
+    "gcc": 20,
+    "tcc": 24,
+    "updated": "2026-05-14T21:15:32.782176+00:00"
+  },
+  "tests2/88_codeopt::main": {
+    "gcc": 22,
+    "tcc": 27,
+    "updated": "2026-05-14T21:15:32.782178+00:00"
+  },
+  "tests2/89_nocode_wanted::kb_wait_1": {
+    "gcc": 8,
+    "tcc": 9,
+    "updated": "2026-05-14T21:15:32.782209+00:00"
+  },
+  "tests2/89_nocode_wanted::kb_wait_2": {
+    "gcc": 0,
+    "tcc": 9,
+    "updated": "2026-05-14T21:15:32.782210+00:00"
+  },
+  "tests2/89_nocode_wanted::kb_wait_2_1": {
+    "gcc": 0,
+    "tcc": 9,
+    "updated": "2026-05-14T21:15:32.782212+00:00"
+  },
+  "tests2/89_nocode_wanted::kb_wait_2_2": {
+    "gcc": 8,
+    "tcc": 9,
+    "updated": "2026-05-14T21:15:32.782214+00:00"
+  },
+  "tests2/89_nocode_wanted::kb_wait_3": {
+    "gcc": 0,
+    "tcc": 9,
+    "updated": "2026-05-14T21:15:32.782215+00:00"
+  },
+  "tests2/89_nocode_wanted::kb_wait_4": {
+    "gcc": 0,
+    "tcc": 9,
+    "updated": "2026-05-14T21:15:32.782217+00:00"
+  },
+  "tests2/89_nocode_wanted::main": {
+    "gcc": 13,
+    "tcc": 43,
+    "updated": "2026-05-14T21:15:32.782219+00:00"
+  },
+  "tests2/90_struct-init::foo": {
+    "gcc": 408,
+    "tcc": 763,
+    "updated": "2026-05-14T21:15:32.782301+00:00"
+  },
+  "tests2/90_struct-init::inc_global": {
+    "gcc": 5,
+    "tcc": 6,
+    "updated": "2026-05-14T21:15:32.782303+00:00"
+  },
+  "tests2/90_struct-init::main": {
+    "gcc": 105,
+    "tcc": 495,
+    "updated": "2026-05-14T21:15:32.782304+00:00"
+  },
+  "tests2/90_struct-init::print_": {
+    "gcc": 18,
+    "tcc": 20,
+    "updated": "2026-05-14T21:15:32.782306+00:00"
+  },
+  "tests2/90_struct-init::sys_four": {
+    "gcc": 2,
+    "tcc": 4,
+    "updated": "2026-05-14T21:15:32.782308+00:00"
+  },
+  "tests2/90_struct-init::sys_ni": {
+    "gcc": 2,
+    "tcc": 4,
+    "updated": "2026-05-14T21:15:32.782310+00:00"
+  },
+  "tests2/90_struct-init::sys_one": {
+    "gcc": 2,
+    "tcc": 4,
+    "updated": "2026-05-14T21:15:32.782312+00:00"
+  },
+  "tests2/90_struct-init::sys_three": {
+    "gcc": 2,
+    "tcc": 4,
+    "updated": "2026-05-14T21:15:32.782314+00:00"
+  },
+  "tests2/90_struct-init::sys_two": {
+    "gcc": 2,
+    "tcc": 4,
+    "updated": "2026-05-14T21:15:32.782316+00:00"
+  },
+  "tests2/90_struct-init::test_compound_with_relocs": {
+    "gcc": 11,
+    "tcc": 12,
+    "updated": "2026-05-14T21:15:32.782318+00:00"
+  },
+  "tests2/90_struct-init::test_init_bf": {
+    "gcc": 12,
+    "tcc": 14,
+    "updated": "2026-05-14T21:15:32.782320+00:00"
+  },
+  "tests2/90_struct-init::test_init_ranges": {
+    "gcc": 20,
+    "tcc": 11,
+    "updated": "2026-05-14T21:15:32.782322+00:00"
+  },
+  "tests2/90_struct-init::test_init_struct_from_struct": {
+    "gcc": 19,
+    "tcc": 29,
+    "updated": "2026-05-14T21:15:32.782323+00:00"
+  },
+  "tests2/90_struct-init::test_multi_relocs": {
+    "gcc": 97,
+    "tcc": 154,
+    "updated": "2026-05-14T21:15:32.782326+00:00"
+  },
+  "tests2/90_struct-init::test_zero_init": {
+    "gcc": 20,
+    "tcc": 37,
+    "updated": "2026-05-14T21:15:32.782328+00:00"
+  },
+  "tests2/91_ptr_longlong_arith32::main": {
+    "gcc": 9,
+    "tcc": 25,
+    "updated": "2026-05-14T21:15:32.782221+00:00"
+  },
+  "tests2/92_enum_bitfield::blah": {
+    "gcc": 2,
+    "tcc": 2,
+    "updated": "2026-05-14T21:15:32.782222+00:00"
+  },
+  "tests2/92_enum_bitfield::convert_like_real": {
+    "gcc": 8,
+    "tcc": 12,
+    "updated": "2026-05-14T21:15:32.782224+00:00"
+  },
+  "tests2/92_enum_bitfield::main": {
+    "gcc": 2,
+    "tcc": 19,
+    "updated": "2026-05-14T21:15:32.782227+00:00"
+  },
+  "tests2/93_integer_promotion::main": {
+    "gcc": 173,
+    "tcc": 590,
+    "updated": "2026-05-14T21:15:32.782229+00:00"
+  },
+  "tests2/97_utf8_string_literal::main": {
+    "gcc": 33,
+    "tcc": 73,
+    "updated": "2026-05-14T21:15:32.782235+00:00"
   }
 }

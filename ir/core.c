@@ -643,7 +643,6 @@ static void tcc_ir_params_add_hidden_sret(TCCIRState *ir, CType *func_type)
 
     loc = (loc - PTR_SIZE) & -PTR_SIZE;
     func_vc = loc;
-    tcc_state->need_frame_pointer = 1;
 
     /* Consume a PARAM vreg for the hidden sret pointer */
     int sret_param_vr = tcc_ir_get_vreg_param(ir);

@@ -149,12 +149,21 @@ static void ssa_var_info_free(SSAVarInfo *info)
   tcc_free(info->var_btype);
 }
 
-static uint8_t *ssa_build_promotable(const SSAVarInfo *info, int *out_count)
+static uint8_t *ssa_build_promotable(const SSAVarInfo *info, int nb, int *out_count)
 {
   int num_vars = info->num_vars;
+  /* Single-block CFG: no back-edges, so any non-addrtaken VAR is safely
+   * promotable to a TEMP via straight-line renaming — no phi placement
+   * needed.  Enabling this lets GVN / cprop / DCE see local-variable defs
+   * in leaf functions.  Multi-block CFGs must keep the multi_block_def
+   * criterion: a VAR defined in only one block but used across a back-edge
+   * still needs a phi at the loop header. */
+  int single_block = (nb <= 1);
   int count = 0;
   for (int v = 0; v < num_vars; v++) {
-    if (bitset_test(info->multi_block_def, v) && !bitset_test(info->addrtaken, v))
+    if (bitset_test(info->addrtaken, v))
+      continue;
+    if (single_block || bitset_test(info->multi_block_def, v))
       count++;
   }
   *out_count = count;
@@ -163,7 +172,9 @@ static uint8_t *ssa_build_promotable(const SSAVarInfo *info, int *out_count)
 
   uint8_t *is_promotable = tcc_mallocz((num_vars + 7) / 8);
   for (int v = 0; v < num_vars; v++) {
-    if (bitset_test(info->multi_block_def, v) && !bitset_test(info->addrtaken, v))
+    if (bitset_test(info->addrtaken, v))
+      continue;
+    if (single_block || bitset_test(info->multi_block_def, v))
       bitset_set(is_promotable, v);
   }
   return is_promotable;
@@ -226,7 +237,7 @@ IRSSAState *tcc_ir_ssa_construct(TCCIRState *ir, IRCFG *cfg)
   int nb = cfg->num_blocks;
   int num_vars = ir->next_local_variable;
 
-  if (num_vars == 0 || nb <= 1)
+  if (num_vars == 0 || nb == 0)
     return NULL;
 
   if (ssa_has_unsupported_ops(ir))
@@ -244,7 +255,7 @@ IRSSAState *tcc_ir_ssa_construct(TCCIRState *ir, IRCFG *cfg)
   ssa_scan_var_defs(ir, cfg, &info);
 
   int promotable_count;
-  uint8_t *is_promotable = ssa_build_promotable(&info, &promotable_count);
+  uint8_t *is_promotable = ssa_build_promotable(&info, nb, &promotable_count);
   if (!is_promotable) {
     ssa_var_info_free(&info);
     return NULL;

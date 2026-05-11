@@ -1834,31 +1834,38 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
         else
         {
           int first_param = i; /* fallback to call instruction */
+          /* Scan backward for the earliest FUNCPARAM of this call.
+           * Param-value computation may sit between FUNCPARAMs (e.g. PARAM0,
+           * then some ASSIGNs setting up R1, then PARAM1), so do NOT stop at
+           * non-PARAM instructions — only stop at the previous CALL or at
+           * function entry. */
           for (int k = i - 1; k >= 0; k--)
           {
             const IRQuadCompact *pk = &ir->compact_instructions[k];
             if (pk->op == TCCIR_OP_NOP)
               continue;
+            if (pk->op == TCCIR_OP_FUNCCALLVAL || pk->op == TCCIR_OP_FUNCCALLVOID)
+              break; /* hit the previous call — done */
             if (pk->op == TCCIR_OP_FUNCPARAMVAL)
             {
-              /* Verify this FUNCPARAM belongs to the same call. */
               const IROperand param_src2 = tcc_ir_get_src2(ir, k);
               if (!irop_is_none(param_src2))
               {
                 int param_call_id = TCCIR_DECODE_CALL_ID((uint32_t)param_src2.u.imm32);
                 if (param_call_id == call_id)
-                {
                   first_param = k;
-                  continue; /* keep scanning for earlier params */
-                }
               }
             }
-            break; /* hit a non-FUNCPARAM, non-NOP instruction */
+            /* Non-PARAM, non-CALL: keep scanning past arg-value computation. */
           }
-          /* Check liveness just BEFORE the first FUNCPARAM (first_param - 1).
-           * Liveness AT first_param includes the call's own args being defined,
-           * which would falsely indicate R0-R3 need saving.
-           * If first_param == 0, nothing preceded arg setup → no saves needed. */
+          /* A register needs saving across this call iff some interval holds
+           * a value in it BEFORE the call setup begins AND that value is still
+           * needed AFTER the call returns.  Checking live_before alone falsely
+           * counts arg-passing intervals of the *previous* call (their ranges
+           * end exactly at that CALL, which is often first_param - 1).
+           * Intersecting with live_after_call removes them: their intervals
+           * do not extend past the previous call.  Cross-call live values, by
+           * definition, are live at both points. */
           if (first_param == 0)
           {
             need_save = 0;
@@ -1866,12 +1873,13 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
           else if (first_param - 1 < ir->ls.live_regs_by_instruction_size)
           {
             uint32_t live_before = ir->ls.live_regs_by_instruction[first_param - 1];
-            need_save &= live_before;
+            uint32_t live_after_call = (i + 1 < ir->ls.live_regs_by_instruction_size)
+                                           ? ir->ls.live_regs_by_instruction[i + 1]
+                                           : 0;
+            need_save &= live_before & live_after_call;
           }
           else
           {
-            /* first_param is beyond the liveness table — no intervals extend
-             * this far, so no registers can be live.  Clear need_save. */
             need_save = 0;
           }
         }
@@ -2014,12 +2022,85 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
     }
     if (!tcc_state->need_frame_pointer && !tcc_state->force_frame_pointer && (stack_size > 0 || has_stack_params))
     {
-    {
-      ir->scratch_save_size = 16; /* 4 slots — 64-bit ops on 32-bit ARM can need 3+ simultaneous scratch saves */
-      loc -= ir->scratch_save_size;
-      ir->scratch_save_base = loc;
-      stack_size = (-loc + 7) & ~7;
-    }
+      /* Scratch save area is a safety net for get_scratch_reg_with_save()
+       * paths that PUSH/STR into the area when no free register is found.
+       * The skip-dry-run path doesn't know max_scratch_depth, so it reserves
+       * conservatively.  But a pre-scan over the IR can rule out the
+       * scratch-requiring ops entirely for simple functions (e.g. integer
+       * code with no FP / 64-bit / div / inline-asm), avoiding the dead
+       * reservation. */
+      int might_need_scratch = 0;
+      for (int i = 0; i < ir->next_instruction_index; i++)
+      {
+        int op = ir->compact_instructions[i].op;
+        if (op == TCCIR_OP_NOP)
+          continue;
+        /* FP/double ops invoke soft-float helpers (or VFP) with multi-reg
+         * scratch needs; 64-bit ints are emulated as pairs and may need
+         * scratch for the high half; div/mod call helpers; block-copy and
+         * VLA touch SP/memcpy; inline asm and indexed memory ops are
+         * unconstrained.  Any of these forces the safety net. */
+        if (op >= TCCIR_OP_FADD && op <= TCCIR_OP_CVT_FTOI) { might_need_scratch = 1; break; }
+        switch (op)
+        {
+        case TCCIR_OP_DIV:
+        case TCCIR_OP_UDIV:
+        case TCCIR_OP_PDIV:
+        case TCCIR_OP_UMOD:
+        case TCCIR_OP_IMOD:
+        case TCCIR_OP_UMULL:
+        case TCCIR_OP_BLOCK_COPY:
+        case TCCIR_OP_VLA_ALLOC:
+        case TCCIR_OP_VLA_SP_SAVE:
+        case TCCIR_OP_VLA_SP_RESTORE:
+        case TCCIR_OP_INLINE_ASM:
+        case TCCIR_OP_ASM_INPUT:
+        case TCCIR_OP_ASM_OUTPUT:
+        case TCCIR_OP_SET_CHAIN:
+        case TCCIR_OP_LOAD_INDEXED:
+        case TCCIR_OP_STORE_INDEXED:
+        case TCCIR_OP_IJUMP:
+        case TCCIR_OP_SWITCH_TABLE:
+          might_need_scratch = 1;
+          break;
+        default:
+          break;
+        }
+        if (might_need_scratch)
+          break;
+        /* 64-bit operand on any op: emulated as a pair, may need scratch. */
+        IROperand d = tcc_ir_op_get_dest(ir, &ir->compact_instructions[i]);
+        IROperand s1 = tcc_ir_op_get_src1(ir, &ir->compact_instructions[i]);
+        IROperand s2 = tcc_ir_op_get_src2(ir, &ir->compact_instructions[i]);
+        if (irop_is_64bit(d) || irop_is_64bit(s1) || irop_is_64bit(s2))
+        {
+          might_need_scratch = 1;
+          break;
+        }
+      }
+      /* Calls with stack-passed args: the call-site setup may need scratch
+       * to materialise the argument values into SP-relative slots. */
+      if (!might_need_scratch && ir->call_outgoing_size > 0)
+        might_need_scratch = 1;
+      /* Incoming stack params: reads from [sp + offset_to_args] may collide
+       * with live argument registers, forcing get_scratch_reg_with_save to
+       * STR the register into the reserved area before the load. */
+      if (!might_need_scratch && has_stack_params)
+        might_need_scratch = 1;
+      /* Large frames need scratch to materialise SP-relative offsets that
+       * exceed the immediate-encoding range of Thumb-2 LDR/STR.  A simple
+       * 124-byte threshold matches the LDR rt,[sp,#imm5*4] limit; above
+       * that, individual access sites may need an extra register. */
+      if (!might_need_scratch && stack_size > 124)
+        might_need_scratch = 1;
+
+      if (might_need_scratch)
+      {
+        ir->scratch_save_size = 16; /* 4 slots — 64-bit ops on 32-bit ARM can need 3+ simultaneous scratch saves */
+        loc -= ir->scratch_save_size;
+        ir->scratch_save_base = loc;
+        stack_size = (-loc + 7) & ~7;
+      }
     }
 
     /* Mirror the dry-run finalisation: init branch opt (sets 32-bit fallback),
@@ -2064,6 +2145,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
   {
     const int is_dry_run = (pass == 0);
     int codegen_skip_cmp = -1;
+    int codegen_skip_select = -1; /* SUBS+IT peephole: skip this SELECT (CMP already emitted SUBS+IT+MOVNE in its slot). */
     int codegen_cbz_reg = -1;    /* pending CBZ: physical register for compare */
     int codegen_cbz_nonzero = 0; /* pending CBZ: 0=CBZ (EQ), 1=CBNZ (NE) */
     /* CBZ/CBNZ: in real pass with dry-run mapping, or with conservative
@@ -2095,9 +2177,14 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
       /* Default: no extra scratch constraints for this instruction. */
       ir->codegen_materialize_scratch_flags = 0;
 
-      /* At jump targets, flags from a prior CMP are not guaranteed live. */
+      /* At jump targets, flags from a prior CMP are not guaranteed live.
+       * The STR→LDR peephole tracker is also invalidated, since a branch can
+       * reach this IR op from a path where the prior STR did not execute. */
       if (cq->is_jump_target)
+      {
         ir->codegen_flags_live = 0;
+        ir->spill_cache.last_emit_kind = 0;
+      }
 
       /* Track current instruction for scratch register allocation */
       ir->codegen_instruction_idx = i;
@@ -2424,6 +2511,44 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
             }
           }
         }
+        /* SUBS+IT peephole: CMP x, #K immediately followed by
+         * `T <-- #1 SELECT #0` (cond=NE) or `T <-- #0 SELECT #1` (cond=EQ)
+         * collapses cmp+ite+movne+moveq (4 instr) into subs+it+movne (3 instr).
+         * The SUBS sets flags AND result in one shot: on EQ the result is 0
+         * (matches the "else" arm), on NE the IT-MOVNE overwrites with 1. */
+        {
+          MopArgs subs_a = DECODE(.dest = 1, .src1 = 1, .src2 = 1);
+          if (!subs_a.src1.is_64bit && subs_a.src2.kind == MACH_OP_IMM &&
+              subs_a.src1.kind == MACH_OP_REG && !subs_a.src1.needs_deref) {
+            int next_j = i + 1;
+            while (next_j < ir->next_instruction_index &&
+                   ir->compact_instructions[next_j].op == TCCIR_OP_NOP)
+              next_j++;
+            if (next_j < ir->next_instruction_index &&
+                ir->compact_instructions[next_j].op == TCCIR_OP_SELECT) {
+              IRQuadCompact *sq = &ir->compact_instructions[next_j];
+              IROperand sel_s1 = tcc_ir_op_get_src1(ir, sq);
+              IROperand sel_s2 = tcc_ir_op_get_src2(ir, sq);
+              IROperand sel_cond = tcc_ir_op_get_cond(ir, sq);
+              int sel_cc = (int)irop_get_imm64_ex(ir, sel_cond);
+              int v1 = irop_is_immediate(sel_s1) ? (int)irop_get_imm64_ex(ir, sel_s1) : -1;
+              int v2 = irop_is_immediate(sel_s2) ? (int)irop_get_imm64_ex(ir, sel_s2) : -1;
+              int matches = (v1 == 1 && v2 == 0 && sel_cc == TOK_NE) ||
+                            (v1 == 0 && v2 == 1 && sel_cc == TOK_EQ);
+              if (matches) {
+                IROperand sel_dest = tcc_ir_op_get_dest(ir, sq);
+                MachineOperand sd = machine_op_from_ir(ir, &sel_dest);
+                if (sd.kind == MACH_OP_REG && !sd.needs_deref && sd.u.reg.r0 >= 0) {
+                  if (tcc_gen_machine_subs_eq_select_01(subs_a.src1, subs_a.src2, sd)) {
+                    ir->codegen_flags_live = 0;
+                    codegen_skip_select = next_j;
+                    break; /* skip normal CMP emission */
+                  }
+                }
+              }
+            }
+          }
+        }
         /* fall through */
       case TCCIR_OP_SHL:
       case TCCIR_OP_SHR:
@@ -2632,11 +2757,34 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
           int next_i = -1;
           for (int j = i + 1; j < ir->next_instruction_index; j++)
           {
-            if (ir->compact_instructions[j].op != TCCIR_OP_NOP)
-            {
-              next_i = j;
-              break;
+            int jop = ir->compact_instructions[j].op;
+            if (jop == TCCIR_OP_NOP)
+              continue;
+            /* An ASSIGN or pure-vreg LOAD whose src and dst materialise to
+             * the same physical register emits no code (mov elision in
+             * load/assign codegen).  Skip these so adjacent STORE_INDEXEDs
+             * can still pair as STRD even with a no-op copy between them
+             * (move-coalesced inlined swap_adjacent / similar patterns). */
+            if (jop == TCCIR_OP_ASSIGN || jop == TCCIR_OP_LOAD) {
+              IRQuadCompact *jq = &ir->compact_instructions[j];
+              IROperand jds = tcc_ir_op_get_src1(ir, jq);
+              IROperand jdd = tcc_ir_op_get_dest(ir, jq);
+              /* Identity check: src is a vreg / stack-local-as-mov, dst is
+               * a vreg, both end up in the same hw register. */
+              if (jdd.tag == IROP_TAG_VREG && !jdd.is_lval &&
+                  (jds.tag == IROP_TAG_VREG ||
+                   (jds.tag == IROP_TAG_STACKOFF && jds.is_local)) &&
+                  !jds.is_llocal && !jds.is_sym) {
+                MachineOperand sm = machine_op_from_ir(ir, &jds);
+                MachineOperand dm = machine_op_from_ir(ir, &jdd);
+                if (sm.kind == MACH_OP_REG && dm.kind == MACH_OP_REG &&
+                    !sm.needs_deref && !dm.needs_deref &&
+                    sm.u.reg.r0 == dm.u.reg.r0 && sm.u.reg.r0 >= 0)
+                  continue; /* identity move — skip */
+              }
             }
+            next_i = j;
+            break;
           }
           if (next_i >= 0 && ir->compact_instructions[next_i].op == TCCIR_OP_STORE_INDEXED &&
               !ir->compact_instructions[next_i].is_jump_target)
@@ -3030,6 +3178,12 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
       }
       case TCCIR_OP_SELECT:
       {
+        /* Skip if the preceding CMP's SUBS+IT peephole already emitted the
+         * full sequence (subs + it ne + movne #1) in this slot. */
+        if (i == codegen_skip_select) {
+          codegen_skip_select = -1;
+          break;
+        }
         /* Conditional select: dest = (cond) ? src1 : src2
          * Condition code stored in 4th pool entry as IMM32. */
         MopArgs a = DECODE(.dest = 2, .src1 = 1, .src2 = 1);

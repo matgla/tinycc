@@ -610,6 +610,9 @@ static void vpush64(int ty, unsigned long long v);
 static void vpush(CType *type);
 static void gen_inline_functions(TCCState *s);
 static void free_inline_functions(TCCState *s);
+static int ir_inline_stash_eligible(Sym *sym, TCCIRState *ir);
+static void ir_inline_stash_add(TCCState *s1, Sym *sym, TCCIRState *ir);
+static void ir_inline_stash_flush(TCCState *s1);
 static void skip_or_save_block(TokenString **str);
 static void gv_dup(void);
 static int get_temp_local_var(int size, int align, int *vr_out);
@@ -891,6 +894,10 @@ ST_FUNC void tccgen_finish(TCCState *s1)
 {
   tcc_debug_end(s1); /* just in case of errors: free memory */
 
+  /* Release per-TU function write summaries (Sym* keys are about to become
+   * invalid as global_stack is popped). */
+  tcc_ir_func_write_summary_clear_all();
+
   tcc_free(pending_aliases);
   pending_aliases = NULL;
   nb_pending_aliases = 0;
@@ -905,6 +912,8 @@ ST_FUNC void tccgen_finish(TCCState *s1)
   }
 
   free_inline_functions(s1);
+  /* Flush stashed static-function IR before sym_pop drops the Sym* keys. */
+  ir_inline_stash_flush(s1);
   sym_pop(&global_stack, NULL, 0);
   sym_pop(&local_stack, NULL, 0);
   /* free nested functions array */
@@ -7381,6 +7390,45 @@ static int nested_callee_has_genuine_capture(TCCState *s, Sym *call_func_sym)
   return 0;
 }
 
+/* Returns 1 when inlining `call_func_sym` (a nested function) into the
+ * currently-compiling function is safe with respect to capture scope:
+ * the callee's lexical parent is either (a) the current function itself
+ * (callee is our direct child) or (b) an ancestor of the current function
+ * (callee is an enclosing function we still see through our own static
+ * chain).  In both cases any reference to a captured variable inside the
+ * inlined body still resolves to a slot reachable from the current frame
+ * pointer or from R10's existing chain target.
+ *
+ * Returns 0 for siblings or otherwise-unreachable callees — those would
+ * need a chain pointer that the current function does not hold.
+ *
+ * When `current_nf` is NULL (top-level caller, not inside a nested func),
+ * any nested callee's parent is reachable (the inline replay happens in
+ * the outer scope, which is the callee's lexical parent or an ancestor). */
+static int nested_callee_captures_reachable(TCCState *s, Sym *call_func_sym, NestedFunc *current_nf)
+{
+  NestedFunc *callee_nf = NULL;
+  for (int ni = 0; ni < s->nb_nested_funcs; ni++) {
+    if (s->nested_funcs[ni].sym == call_func_sym) {
+      callee_nf = &s->nested_funcs[ni];
+      break;
+    }
+  }
+  if (!callee_nf)
+    return 0;
+  if (!current_nf)
+    return 1;
+  /* Walk up from current_nf checking if callee's parent appears on the way.
+   * If callee->parent_nf == current_nf  -> direct child (safe).
+   * If callee->parent_nf is one of current_nf's ancestors -> safe.
+   * Otherwise (sibling, cousin, unrelated) -> not safe. */
+  for (NestedFunc *p = current_nf; p; p = p->parent_nf) {
+    if (callee_nf->parent_nf == p)
+      return 1;
+  }
+  return 0;
+}
+
 /* Check if a nested function with genuine captures only reads them (never
  * writes or takes their address).  When true, token-replay inlining is safe:
  * the inlined body will reference the parent's locals directly, and since it
@@ -9514,7 +9562,11 @@ ST_FUNC void vstore(void)
 
     /* Constant complex float/double: materialize to a temp local first,
      * then let the memcpy path below copy it to the destination.
-     * We can't gaddrof() a VT_CONST complex directly. */
+     * We can't gaddrof() a VT_CONST complex directly.
+     *
+     * Fast path: when the destination is a stack local AND base types
+     * match, materialize the constant directly into the destination
+     * slots — skips the temp + copy entirely. */
     if (src_is_const && is_float(src_bt))
     {
       double src_real = 0.0, src_imag = 0.0;
@@ -9538,6 +9590,57 @@ ST_FUNC void vstore(void)
       {
         memcpy(&src_real, &vtop->c, 8);
         memcpy(&src_imag, (char *)&vtop->c + 8, 8);
+      }
+
+      if (src_bt == dst_bt && tcc_state->ir && !NOEVAL_WANTED &&
+          (vtop[-1].r & (VT_VALMASK | VT_LVAL)) == (VT_LOCAL | VT_LVAL))
+      {
+        /* Direct materialization into dst — emit two scalar stores and skip
+         * the convert/memcpy path entirely. */
+        SValue dst_save = vtop[-1];
+        vpop();        /* pop constant */
+        vtop--;        /* drop dst from the stack (we own it via dst_save) */
+
+        CType elem_type;
+        elem_type.t = src_bt;
+        elem_type.ref = NULL;
+
+        /* Store real part to dst */
+        {
+          SValue elem_dst = dst_save;
+          elem_dst.type = elem_type;
+          vpushv(&elem_dst);
+          CValue cv;
+          memset(&cv, 0, sizeof(cv));
+          if (src_bt == VT_FLOAT)
+            cv.f = (float)src_real;
+          else
+            cv.d = src_real;
+          vsetc(&elem_type, VT_CONST, &cv);
+          vstore();
+          vpop();
+        }
+
+        /* Store imag part to dst + elem_size */
+        {
+          SValue elem_dst = dst_save;
+          elem_dst.type = elem_type;
+          elem_dst.c.i = dst_save.c.i + src_elem_size;
+          vpushv(&elem_dst);
+          CValue cv;
+          memset(&cv, 0, sizeof(cv));
+          if (src_bt == VT_FLOAT)
+            cv.f = (float)src_imag;
+          else
+            cv.d = src_imag;
+          vsetc(&elem_type, VT_CONST, &cv);
+          vstore();
+          vpop();
+        }
+
+        /* Push dst back as the assignment expression result */
+        vpushv(&dst_save);
+        return;
       }
 
       /* Allocate a temp local to hold the complex constant */
@@ -9787,6 +9890,65 @@ ST_FUNC void vstore(void)
       int complex_size, complex_align;
       complex_size = type_size(&vtop->type, &complex_align);
 
+      /* For small, word-aligned complex copies between stack locals,
+       * expand to individual word LOAD/STORE pairs in the IR — mirrors
+       * the small-struct optimization in the VT_STRUCT branch.  Skipping
+       * the memmove call exposes the stores to store-load forwarding and
+       * DCE, which is critical for eliminating dead complex assignments
+       * (e.g. `_Complex float z = test_add(x,y);` when z is unused). */
+      if (tcc_state->ir && complex_size <= 32 && !(complex_size & 3) &&
+          !(complex_align & 3) &&
+          (vtop[0].r & (VT_VALMASK | VT_LVAL)) == (VT_LOCAL | VT_LVAL) &&
+          (vtop[-1].r & (VT_VALMASK | VT_LVAL)) == (VT_LOCAL | VT_LVAL) &&
+          !NOEVAL_WANTED)
+      {
+        CType saved_complex_type = vtop->type;
+        SValue src = vtop[0];
+        SValue dst = vtop[-1];
+        vtop--; /* pop src; vtop = dst (kept as result lvalue) */
+
+        /* NRVO same-slot fast-path: when the source and destination refer
+         * to the same stack slot (e.g. NRVO redirected a call's sret
+         * buffer into the destination), the copy is a no-op.  Skip it. */
+        if (src.c.i == dst.c.i)
+        {
+          vtop->type = saved_complex_type;
+          return;
+        }
+
+        CType word_type;
+        word_type.t = VT_INT;
+        word_type.ref = NULL;
+
+        for (int off = 0; off < complex_size; off += 4)
+        {
+          SValue s, d, tmp;
+          svalue_init(&s);
+          s.type = word_type;
+          s.r = VT_LOCAL | VT_LVAL;
+          s.vr = src.vr;
+          s.c.i = src.c.i + off;
+
+          svalue_init(&tmp);
+          tmp.type = word_type;
+          tmp.r = 0;
+          tmp.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+
+          tcc_ir_put(tcc_state->ir, TCCIR_OP_LOAD, &s, NULL, &tmp);
+
+          svalue_init(&d);
+          d.type = word_type;
+          d.r = VT_LOCAL | VT_LVAL;
+          d.vr = dst.vr;
+          d.c.i = dst.c.i + off;
+
+          tcc_ir_put(tcc_state->ir, TCCIR_OP_STORE, &tmp, NULL, &d);
+        }
+
+        vtop->type = saved_complex_type;
+        return;
+      }
+
       /* destination */
       vpushv(vtop - 1);
       vtop->type.t = VT_PTR;
@@ -9846,6 +10008,14 @@ ST_FUNC void vstore(void)
       SValue src = vtop[0];
       SValue dst = vtop[-1];
       vtop--; /* pop src; vtop = dst (kept as result lvalue) */
+
+      /* NRVO same-slot fast-path: src and dst at the same offset means
+       * the call already wrote the result into the destination. */
+      if (src.c.i == dst.c.i)
+      {
+        vtop->type = saved_struct_type;
+        goto vstore_done;
+      }
 
       CType word_type;
       word_type.t = VT_INT;
@@ -13340,6 +13510,11 @@ static void unary_funcall(void)
    * without fragile nested-depth scanning.
    */
   int call_id = 0;
+  /* If we claim an NRVO target as the sret buffer, remember its vreg so
+   * the post-call result push can use the same vreg as the destination —
+   * lets the IR see the call's effect and the later use as a single
+   * variable (otherwise DCE may misanalyse the dependency). */
+  int nrvo_call_vreg = -1;
   if (!NOEVAL_WANTED && tcc_state->ir)
     call_id = tcc_state->ir->next_call_id++;
 
@@ -13364,14 +13539,58 @@ static void unary_funcall(void)
         while (size & (size - 1))
           size = (size | (size - 1)) + 1;
 #endif
-      loc = (loc - size) & -align;
+      /* NRVO: if the caller has hinted a destination slot for this
+       * call's return, use it as the sret buffer.  Saves the temp +
+       * the temp→dst copy in the caller.  Conditions: size and
+       * alignment must match exactly so we don't write past the dst.
+       *
+       * Important: do NOT mutate `loc` here.  The destination slot was
+       * already allocated by the surrounding declaration, and `loc`
+       * already points past it.  Overwriting `loc` would let later
+       * allocations in this function overlap the destination.
+       *
+       * Skip NRVO for nested-function callees: the callee accesses outer
+       * locals via static link, and an existing IR-fold can collapse a
+       * `LEA(local_a) + 4` into a `StackLoc[N]` reference whose pool
+       * entry was originally tagged as a static-link access — emitting
+       * the wrong base register at codegen.  Triggers when the callee's
+       * local struct field offset coincides with the caller's other
+       * locals (much more likely once NRVO eliminates the temp). */
+      int nrvo_claimed = 0;
+      int nrvo_vreg = -1;
+      int sret_loc;
+      int callee_is_nested = (call_func_sym && call_func_sym->a.nested_func);
+      if (ret_nregs == 0 && tcc_state->nrvo_target_active &&
+          tcc_state->nrvo_target_size == size &&
+          tcc_state->nrvo_target_align == align &&
+          !callee_is_nested)
+      {
+        sret_loc = tcc_state->nrvo_target_loc;
+        nrvo_vreg = tcc_state->nrvo_target_vreg;
+        nrvo_claimed = 1;
+        /* Consume the hint: nested calls inside this expression must not
+         * try to claim the same slot. */
+        tcc_state->nrvo_target_active = 0;
+      }
+      else
+      {
+        loc = (loc - size) & -align;
+        sret_loc = loc;
+      }
       ret.type = s->type;
       ret.r = VT_LOCAL | VT_LVAL;
       /* pass it as 'int' to avoid structure arg passing
          problems */
-      vseti(VT_LOCAL, loc);
+      vseti(VT_LOCAL, sret_loc);
+      if (nrvo_claimed)
+      {
+        vtop->vr = nrvo_vreg;
+        nrvo_call_vreg = nrvo_vreg;
+      }
 #ifdef CONFIG_TCC_BCHECK
-      if (tcc_state->do_bounds_check)
+      /* Skip bcheck padding when NRVO reused a caller-owned slot — that
+       * slot already has whatever bcheck guards the caller installed. */
+      if (tcc_state->do_bounds_check && !nrvo_claimed)
         --loc;
 #endif
       ret.c = vtop->c;
@@ -14541,7 +14760,17 @@ va_arg_pack_done:
     /* Already handled above */
   }
   else if (can_inline_eval && !NOEVAL_WANTED && call_func_sym && saved_arg_count == nb_real_args && tcc_state->ir &&
-           !tcc_state->in_inline_expansion)
+           /* Allow one level of nested inlining (a call to a small function
+            * from inside an already-inlined body) only when the called
+            * function returns void.
+            * - Void return avoids the store-then-load-through-return-slot
+            *   phi pattern that some optimizer passes mis-fold (930725-1).
+            * - Depth cap prevents mutual-recursion expansion (pr22379). */
+           (!tcc_state->in_inline_expansion ||
+            call_func_sym->a.nested_func ||
+            (tcc_state->inline_expansion_depth < 2 &&
+             call_func_sym->type.ref &&
+             (call_func_sym->type.ref->type.t & VT_BTYPE) == VT_VOID)))
   {
     /* ---- Token-level inline expansion ----
      * Expand inline functions at the call site in these cases:
@@ -14645,10 +14874,16 @@ va_arg_pack_done:
         (call_func_sym->type.ref->f.func_auto_inline || eval_only_all_const) &&
         !call_func_sym->type.ref->f.func_noinline && (tcc_state->opt_inline_functions || tcc_state->opt_inline_small) &&
         !strbi_is_redirect_target(resolve_str_builtin_id(0, func_name)) &&
-        /* Don't inline a nested function with parent-scope captures into a
-         * sibling nested function — the captured variables won't be in scope. */
-        !(call_func_sym->a.nested_func && tcc_state->current_nested_func &&
-          nested_callee_has_genuine_capture(tcc_state, call_func_sym)) &&
+        /* Don't inline a nested function with parent-scope captures unless
+         * those captures are reachable from the current scope.  Reachable
+         * means the callee's lexical parent is either the current function
+         * or one of its ancestors; in both cases the inlined body's chain-
+         * or local-reads land on slots the current frame can still address.
+         * Sibling/cousin calls would need a different chain pointer. */
+        !(call_func_sym->a.nested_func &&
+          nested_callee_has_genuine_capture(tcc_state, call_func_sym) &&
+          !nested_callee_captures_reachable(tcc_state, call_func_sym,
+                                            tcc_state->current_nested_func)) &&
         /* Only inline functions whose signature is safe: scalar/pointer params
          * that fit in 32-bit registers, and scalar or struct return types.
          * 64-bit types and struct *parameters* are not handled. */
@@ -14831,6 +15066,14 @@ va_arg_pack_done:
       int saved_rsym = rsym;
       const char *saved_funcname = funcname;
       struct scope *saved_root_scope = root_scope;
+      /* Save inline-expansion state so nested inline expansions (e.g. a
+       * nested function inlined inside the body of another inlined function)
+       * can restore the outer expansion's state.  Without this, the inner
+       * expansion's exit clears in_inline_expansion to 0, and the outer
+       * body's `return` then emits a real RETURNVALUE instead of the
+       * store-to-inline_return_loc + jump-to-rsym pattern. */
+      uint8_t saved_in_inline_expansion = tcc_state->in_inline_expansion;
+      int saved_inline_return_loc = tcc_state->inline_return_loc;
 
       /* Set up inline function context */
       func_vt = s->type; /* return type */
@@ -14870,6 +15113,7 @@ va_arg_pack_done:
        * expansion and NOT for nested '{...}' blocks inside the inline body. */
       tcc_state->in_inline_expansion = local_scope;
       tcc_state->inline_return_loc = inline_ret_loc;
+      tcc_state->inline_expansion_depth++;
       root_scope = cur_scope;
 
       /* --- 4. Replay inline function body --- */
@@ -14900,7 +15144,9 @@ va_arg_pack_done:
       /* Read back inline_return_loc: the struct return handler may have
        * redirected it to point at the source local (skipping a memmove). */
       inline_ret_loc = tcc_state->inline_return_loc;
-      tcc_state->in_inline_expansion = 0;
+      tcc_state->in_inline_expansion = saved_in_inline_expansion;
+      tcc_state->inline_return_loc = saved_inline_return_loc;
+      tcc_state->inline_expansion_depth--;
       func_vt = saved_func_vt;
       func_var = saved_func_var;
       func_has_label_addr = saved_func_has_label_addr;
@@ -15035,7 +15281,12 @@ va_arg_pack_done:
       /* Struct returned via sret pointer: the callee already wrote to the
        * sret buffer. Just push the buffer location as an lvalue. */
       vsetc(&ret.type, ret.r, &ret.c);
-      /* Do NOT set vtop->vr = return_vreg - there's no return register for sret */
+      /* Do NOT set vtop->vr = return_vreg - there's no return register for sret.
+       * If NRVO redirected the sret buffer to a named local, tag the result
+       * with that local's vreg so IR analyses see writes (via the call) and
+       * later reads as belonging to the same variable. */
+      if (nrvo_call_vreg != -1)
+        vtop->vr = nrvo_call_vreg;
     }
     else
     {
@@ -21091,37 +21342,42 @@ static void gfunc_return(CType *func_type)
       if (func_type->t & VT_COMPLEX)
       {
         /* Complex sret return: copy the complex value to the caller's
-         * return buffer via memmove(sret_ptr, src_addr, complex_size).
+         * return buffer.
          *
          * If vtop is an lval (already in memory — e.g. a local variable),
-         * we can take its address directly.  This is critical for complex
+         * we use its address directly.  This is critical for complex
          * types larger than 8 bytes (e.g. _Complex long long, _Complex
          * double) because TCCIR_OP_STORE only handles up to 64-bit values
          * and would silently truncate 16-byte complex types.
          *
          * If vtop is an rvalue in a register pair (e.g. result of complex
          * float arithmetic), we spill to a temp local first.
-         */
+         *
+         * Small word-aligned copies are inlined as word LOAD/STORE pairs
+         * through sret_ptr; larger or unaligned sizes fall back to
+         * memmove. */
         int complex_size, complex_align;
         complex_size = type_size(func_type, &complex_align);
 
-        SValue src_addr;
-        memset(&src_addr, 0, sizeof(src_addr));
-        src_addr.type.t = VT_PTR;
-        src_addr.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-        src_addr.r = 0;
+        /* src_mem describes WHERE the source bytes live, as an lvalue
+         * (VT_LVAL set).  Either points at vtop directly (in-memory
+         * source) or at a fresh spill slot (rvalue source).
+         *
+         * src_is_opaque_rvalue tracks whether the spill came from an
+         * rvalue produced by an opaque complex operation (e.g. complex
+         * FMUL/FDIV, lowered to per-component math inside the backend
+         * but represented as a single IR FMUL/FDIV op).  In that case,
+         * the IR does NOT show explicit reads from the imaginary-half
+         * parameter slots, so DCE may eliminate them — relying on the
+         * memmove call to act as a memory-barrier.  We therefore keep
+         * the memmove for the rvalue-spill path. */
+        SValue src_mem;
+        memset(&src_mem, 0, sizeof(src_mem));
+        int src_is_opaque_rvalue = 0;
 
         if (vtop->r & VT_LVAL)
         {
-          /* Source is already in memory — compute its address directly */
-          SValue src_mem;
-          memset(&src_mem, 0, sizeof(src_mem));
-          src_mem.type.t = VT_PTR;
-          src_mem.r = vtop->r & ~VT_LVAL; /* keep VT_LOCAL etc, clear VT_LVAL */
-          src_mem.vr = vtop->vr;
-          src_mem.c.i = vtop->c.i;
-          src_mem.sym = vtop->sym; /* preserve symbol for global variables */
-          tcc_ir_put(tcc_state->ir, TCCIR_OP_LEA, &src_mem, NULL, &src_addr);
+          src_mem = *vtop;
         }
         else
         {
@@ -21139,13 +21395,11 @@ static void gfunc_return(CType *func_type)
           tmp_dst.c.i = tmp_loc;
           tcc_ir_put(tcc_state->ir, TCCIR_OP_STORE, vtop, NULL, &tmp_dst);
 
-          SValue tmp_addr_src;
-          memset(&tmp_addr_src, 0, sizeof(tmp_addr_src));
-          tmp_addr_src.type.t = VT_PTR;
-          tmp_addr_src.r = VT_LOCAL;
-          tmp_addr_src.vr = -1;
-          tmp_addr_src.c.i = tmp_loc;
-          tcc_ir_put(tcc_state->ir, TCCIR_OP_LEA, &tmp_addr_src, NULL, &src_addr);
+          src_mem.type = vtop->type;
+          src_mem.r = VT_LOCAL | VT_LVAL;
+          src_mem.vr = -1;
+          src_mem.c.i = tmp_loc;
+          src_is_opaque_rvalue = 1;
         }
 
         /* Load the sret pointer from func_vc.
@@ -21165,38 +21419,114 @@ static void gfunc_return(CType *func_type)
 
         tcc_ir_put(tcc_state->ir, TCCIR_OP_ASSIGN, &sret_slot, NULL, &sret_ptr);
 
-        /* Generate memmove(sret_ptr, src_addr, complex_size) */
-        SValue size_sv;
-        memset(&size_sv, 0, sizeof(size_sv));
-        size_sv.type.t = VT_INT;
-        size_sv.r = VT_CONST;
-        size_sv.vr = -1;
-        size_sv.c.i = complex_size;
+        /* Inline word-by-word copy for small, word-aligned complex
+         * returns — skips the memmove call, exposes stores to DCE/CSE,
+         * and matches the small-struct optimization in vstore().
+         *
+         * Skip when the source is an opaque rvalue spill: removing the
+         * memmove there can confuse DCE (see comment on
+         * src_is_opaque_rvalue above). */
+        if (!src_is_opaque_rvalue && complex_size <= 16 &&
+            !(complex_size & 3) && !(complex_align & 3))
+        {
+          CType word_type;
+          word_type.t = VT_INT;
+          word_type.ref = NULL;
 
-        vpush_helper_func(
+          for (int off = 0; off < complex_size; off += 4)
+          {
+            /* Load word from src_mem + off */
+            SValue src_word = src_mem;
+            src_word.type = word_type;
+            src_word.c.i += off;
+
+            SValue tmp_word;
+            svalue_init(&tmp_word);
+            tmp_word.type = word_type;
+            tmp_word.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+            tmp_word.r = 0;
+
+            tcc_ir_put(tcc_state->ir, TCCIR_OP_LOAD, &src_word, NULL, &tmp_word);
+
+            /* Resolve store target = sret_ptr + off (vreg holding addr) */
+            SValue dst_ptr;
+            if (off == 0)
+            {
+              dst_ptr = sret_ptr;
+            }
+            else
+            {
+              SValue off_imm;
+              svalue_init(&off_imm);
+              off_imm.type.t = VT_INT;
+              off_imm.r = VT_CONST;
+              off_imm.vr = -1;
+              off_imm.c.i = off;
+
+              svalue_init(&dst_ptr);
+              dst_ptr.type.t = VT_PTR;
+              dst_ptr.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+              dst_ptr.r = 0;
+
+              tcc_ir_put(tcc_state->ir, TCCIR_OP_ADD, &sret_ptr, &off_imm, &dst_ptr);
+            }
+
+            /* Store tmp_word through dst_ptr (vreg with VT_LVAL = deref) */
+            SValue store_dst;
+            svalue_init(&store_dst);
+            store_dst.type = word_type;
+            store_dst.r = VT_LVAL;
+            store_dst.vr = dst_ptr.vr;
+
+            tcc_ir_put(tcc_state->ir, TCCIR_OP_STORE, &tmp_word, NULL, &store_dst);
+          }
+        }
+        else
+        {
+          /* Fallback: memmove(sret_ptr, &src_mem, complex_size) */
+          SValue src_addr;
+          memset(&src_addr, 0, sizeof(src_addr));
+          src_addr.type.t = VT_PTR;
+          src_addr.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+          src_addr.r = 0;
+
+          SValue src_for_lea = src_mem;
+          src_for_lea.type.t = VT_PTR;
+          src_for_lea.r &= ~VT_LVAL; /* take address */
+          tcc_ir_put(tcc_state->ir, TCCIR_OP_LEA, &src_for_lea, NULL, &src_addr);
+
+          SValue size_sv;
+          memset(&size_sv, 0, sizeof(size_sv));
+          size_sv.type.t = VT_INT;
+          size_sv.r = VT_CONST;
+          size_sv.vr = -1;
+          size_sv.c.i = complex_size;
+
+          vpush_helper_func(
 #ifdef TCC_ARM_EABI
-            (!(complex_align & 3)) ? TOK_memmove4 : TOK_memmove
+              (!(complex_align & 3)) ? TOK_memmove4 : TOK_memmove
 #else
-            TOK_memmove
+              TOK_memmove
 #endif
-        );
+          );
 
-        SValue param_num;
-        const int call_id = tcc_state->ir->next_call_id++;
-        svalue_init(&param_num);
-        param_num.vr = -1;
-        param_num.r = VT_CONST;
+          SValue param_num;
+          const int call_id = tcc_state->ir->next_call_id++;
+          svalue_init(&param_num);
+          param_num.vr = -1;
+          param_num.r = VT_CONST;
 
-        param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
-        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &sret_ptr, &param_num, NULL);
-        param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 1);
-        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &src_addr, &param_num, NULL);
-        param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 2);
-        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &size_sv, &param_num, NULL);
+          param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
+          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &sret_ptr, &param_num, NULL);
+          param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 1);
+          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &src_addr, &param_num, NULL);
+          param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 2);
+          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &size_sv, &param_num, NULL);
 
-        SValue call_id_sv = tcc_ir_svalue_call_id_argc(call_id, 3);
-        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[0], &call_id_sv, NULL);
-        vpop(); /* pop helper func */
+          SValue call_id_sv = tcc_ir_svalue_call_id_argc(call_id, 3);
+          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[0], &call_id_sv, NULL);
+          vpop(); /* pop helper func */
+        }
       }
       else
       {
@@ -24059,7 +24389,40 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has
   else if (has_init)
   {
     p.sec = sec;
+
+    /* NRVO: for a local _Complex initializer, hint that the first
+     * sret-returning call inside the initializer expression may write
+     * directly to this variable's slot instead of a fresh temp.
+     *
+     * Limited to VT_COMPLEX for now: VT_STRUCT locals are sometimes
+     * placed at offsets that don't match the addr computed here (they
+     * may be spilled later by the register allocator), so the NRVO
+     * pointer would point at the wrong slot. */
+    int saved_nrvo_active = tcc_state->nrvo_target_active;
+    int saved_nrvo_loc = tcc_state->nrvo_target_loc;
+    int saved_nrvo_vreg = tcc_state->nrvo_target_vreg;
+    int saved_nrvo_size = tcc_state->nrvo_target_size;
+    int saved_nrvo_align = tcc_state->nrvo_target_align;
+    if (!sec && tcc_state->ir &&
+        ((type->t & VT_BTYPE) == VT_STRUCT || (type->t & VT_COMPLEX)))
+    {
+      int nrvo_size, nrvo_align;
+      nrvo_size = type_size(type, &nrvo_align);
+      tcc_state->nrvo_target_active = 1;
+      tcc_state->nrvo_target_loc = addr;
+      tcc_state->nrvo_target_vreg = vreg;
+      tcc_state->nrvo_target_size = nrvo_size;
+      tcc_state->nrvo_target_align = nrvo_align;
+    }
+
     decl_initializer(&p, type, addr, DIF_FIRST, vreg);
+
+    tcc_state->nrvo_target_active = saved_nrvo_active;
+    tcc_state->nrvo_target_loc = saved_nrvo_loc;
+    tcc_state->nrvo_target_vreg = saved_nrvo_vreg;
+    tcc_state->nrvo_target_size = saved_nrvo_size;
+    tcc_state->nrvo_target_align = saved_nrvo_align;
+
     /* patch flexible array member size back to -1, */
     /* for possible subsequent similar declarations */
     if (flexible_array)
@@ -25048,6 +25411,56 @@ static void gen_instrument_call(Sym *cur_func_sym, const char *hook_name)
   vtop -= 3; /* pop 2 args + func */
 }
 
+#ifdef CONFIG_TCC_DEBUG
+/* Returns 1 if `pass_name` matches the comma-separated list in
+ * s->dump_ir_passes (or the list contains the special token "all").
+ * Used by DUMP_AFTER_PASS to gate per-pass IR dumps. */
+static int dump_ir_passes_match(TCCState *s, const char *pass_name)
+{
+  if (!s->dump_ir_passes || !pass_name)
+    return 0;
+  const char *p = s->dump_ir_passes;
+  size_t name_len = strlen(pass_name);
+  while (*p)
+  {
+    const char *comma = strchr(p, ',');
+    size_t tok_len = comma ? (size_t)(comma - p) : strlen(p);
+    if (tok_len == 3 && !memcmp(p, "all", 3))
+      return 1;
+    if (tok_len == name_len && !memcmp(p, pass_name, name_len))
+      return 1;
+    if (!comma)
+      break;
+    p = comma + 1;
+  }
+  return 0;
+}
+
+/* If pass_name matches -dump-ir-passes selection, dump the IR labeled with
+ * the pass name.  Intended to be called immediately after a
+ * tcc_ir_opt_<name>() call to bisect which pass corrupts the IR. */
+static void dump_ir_after_pass(TCCState *s, TCCIRState *ir, const char *pass_name)
+{
+  if (!dump_ir_passes_match(s, pass_name))
+    return;
+  tcc_ir_dump_set_show_physical_regs(0);
+  printf("=== AFTER %s ===\n", pass_name);
+  tcc_ir_show(ir);
+  printf("=== END AFTER %s ===\n", pass_name);
+}
+
+/* Run a pass call and dump if selected.  `expr` is the call, `name` is a
+ * string literal naming the pass. */
+#define RUN_PASS(name, expr)                                                                                           \
+  do                                                                                                                   \
+  {                                                                                                                    \
+    (void)(expr);                                                                                                      \
+    dump_ir_after_pass(tcc_state, ir, name);                                                                           \
+  } while (0)
+#else
+#define RUN_PASS(name, expr) ((void)(expr))
+#endif
+
 /* parse a function defined by symbol 'sym' and generate its code in
    'cur_text_section' */
 static void gen_function(Sym *sym)
@@ -25167,6 +25580,39 @@ static void gen_function(Sym *sym)
    * whose standalone copy has no callers (no sibling references, no trampoline).
    * Must run after block(0) so all nested functions are registered. */
   if (ir && tcc_state->nb_nested_funcs > 0) {
+    /* Fast path: if this function's IR ended up with zero chain-setup ops
+     * (every nested-function call was inlined) and no nested function is
+     * trampoline-required (no & taken), then nothing at runtime can read
+     * this function's locals through the static chain.  Clear addrtaken
+     * on every captured VAR — the per-VAR bit is what cprop/DCE consult
+     * later, and leaving it set blocks constant folding for what are now
+     * plain locals. */
+    int func_has_chain_op = 0;
+    int any_trampoline_needed = 0;
+    for (int i = 0; i < ir->next_instruction_index && !func_has_chain_op; i++) {
+      int op = ir->compact_instructions[i].op;
+      if (op == TCCIR_OP_SET_CHAIN || op == TCCIR_OP_INIT_CHAIN_SLOT)
+        func_has_chain_op = 1;
+    }
+    for (int ni = 0; ni < tcc_state->nb_nested_funcs && !any_trampoline_needed; ni++) {
+      if (tcc_state->nested_funcs[ni].trampoline_needed)
+        any_trampoline_needed = 1;
+    }
+    if (!func_has_chain_op && !any_trampoline_needed) {
+      for (int ni = 0; ni < tcc_state->nb_nested_funcs; ni++) {
+        NestedFunc *nf = &tcc_state->nested_funcs[ni];
+        for (int ci = 0; ci < nf->nb_captured; ci++) {
+          int vreg = nf->captured_vregs[ci];
+          if (vreg >= 0) {
+            IRLiveInterval *interval = tcc_ir_get_live_interval(ir, vreg);
+            if (interval)
+              interval->addrtaken = 0;
+          }
+        }
+      }
+    }
+  }
+  if (ir && tcc_state->nb_nested_funcs > 0) {
     for (int ni = 0; ni < tcc_state->nb_nested_funcs; ni++) {
       NestedFunc *nf = &tcc_state->nested_funcs[ni];
       if (!nf->sym || !nf->sym->type.ref || !nf->sym->type.ref->f.func_auto_inline)
@@ -25278,12 +25724,20 @@ static void gen_function(Sym *sym)
   /* Block copy init: replace memset(0) + consecutive stores with BLOCK_COPY
    * from a pre-built rodata block.  Run once before the iterative loop. */
   tcc_ir_opt_block_copy_init(ir);
+#ifdef CONFIG_TCC_DEBUG
+  dump_ir_after_pass(tcc_state, ir, "block_copy_init");
+#endif
 
   /* Interprocedural constant propagation: replace calls to functions known
    * to return a constant with ASSIGN #const.  Runs before the iterative
    * loop so existing passes cascade the constant through the caller. */
   if (tcc_state->opt_ipc)
+  {
     tcc_ir_opt_const_call_replace(ir);
+#ifdef CONFIG_TCC_DEBUG
+    dump_ir_after_pass(tcc_state, ir, "const_call_replace");
+#endif
+  }
 
   /* Iterative optimization loop
    * Runs optimization passes until no more changes are made,
@@ -25427,6 +25881,9 @@ static void gen_function(Sym *sym)
   /* Compact NOPs accumulated during the iterative loop.
    * All subsequent passes benefit from a smaller instruction array. */
   tcc_ir_opt_compact_nops(ir);
+#ifdef CONFIG_TCC_DEBUG
+  dump_ir_after_pass(tcc_state, ir, "compact_nops_pre_jthread");
+#endif
 
   /* Global CSE is handled by SSA GVN pass in regalloc. */
 
@@ -25438,14 +25895,25 @@ static void gen_function(Sym *sym)
   if (tcc_state->opt_jump_threading)
   {
     int jump_changes = tcc_ir_opt_jump_threading(ir);
+#ifdef CONFIG_TCC_DEBUG
+    dump_ir_after_pass(tcc_state, ir, "jump_threading");
+#endif
     /* Always run fall-through elimination when jump threading is enabled.
      * Fall-through jumps can appear even without threading changes, e.g.
      * when DCE turns dead code into NOPs making a JMP target the next
      * real instruction.  This is essential for dead-code suppression in
      * tests like 96_nodata_wanted. */
     jump_changes += tcc_ir_opt_eliminate_fallthrough(ir);
+#ifdef CONFIG_TCC_DEBUG
+    dump_ir_after_pass(tcc_state, ir, "eliminate_fallthrough");
+#endif
     if (jump_changes && tcc_state->opt_dce)
+    {
       tcc_ir_opt_dce(ir); /* Clean up any newly unreachable code */
+#ifdef CONFIG_TCC_DEBUG
+      dump_ir_after_pass(tcc_state, ir, "dce_post_jthread");
+#endif
+    }
   }
 
   /* Phases 3b–4b: Fusion and boolean passes.
@@ -25554,6 +26022,9 @@ static void gen_function(Sym *sym)
 
   /* Compact NOPs before the store-load forwarding loop (up to 12 iterations). */
   tcc_ir_opt_compact_nops(ir);
+#ifdef CONFIG_TCC_DEBUG
+  dump_ir_after_pass(tcc_state, ir, "compact_nops_pre_slfwd");
+#endif
 
   /* Entry-block store propagation: forward struct field constants initialized
    * before loops into deref operands inside loops.  Runs before SL-FWD because
@@ -25564,6 +26035,9 @@ static void gen_function(Sym *sym)
     for (int esp_iter = 0; esp_iter < 3; esp_iter++)
     {
       int esp_ch = tcc_ir_opt_entry_store_prop(ir);
+#ifdef CONFIG_TCC_DEBUG
+      dump_ir_after_pass(tcc_state, ir, "entry_store_prop");
+#endif
       if (esp_ch <= 0)
         break;
       tcc_ir_opt_const_prop(ir);
@@ -25575,10 +26049,16 @@ static void gen_function(Sym *sym)
       tcc_ir_opt_dce(ir);
       tcc_ir_opt_compact_nops(ir);
       tcc_ir_opt_sl_forward(ir);
+#ifdef CONFIG_TCC_DEBUG
+      dump_ir_after_pass(tcc_state, ir, "esp_sl_forward");
+#endif
       tcc_ir_opt_stack_addr_nonnull_fold(ir);
       tcc_ir_opt_branch_folding(ir);
       tcc_ir_opt_dce(ir);
       tcc_ir_opt_dead_var_store_elim(ir);
+#ifdef CONFIG_TCC_DEBUG
+      dump_ir_after_pass(tcc_state, ir, "esp_dead_var_store_elim");
+#endif
       tcc_ir_opt_const_var_prop(ir);
       tcc_ir_opt_branch_folding(ir);
       tcc_ir_opt_dce(ir);
@@ -25600,6 +26080,9 @@ static void gen_function(Sym *sym)
   {
     if (!(tcc_state->opt_store_load_fwd && !ir->has_static_chain && tcc_ir_opt_sl_forward(ir)))
       break;
+#ifdef CONFIG_TCC_DEBUG
+    dump_ir_after_pass(tcc_state, ir, "sl_forward");
+#endif
     if (tcc_state->opt_const_prop)
     {
       for (int cp_iter = 0; cp_iter < 4; cp_iter++)
@@ -25614,6 +26097,9 @@ static void gen_function(Sym *sym)
       tcc_ir_opt_const_prop_tmp(ir);
       tcc_ir_opt_branch_folding(ir);
       tcc_ir_opt_branch_folding(ir);
+#ifdef CONFIG_TCC_DEBUG
+      dump_ir_after_pass(tcc_state, ir, "slloop_branch_folding");
+#endif
       tcc_ir_opt_stack_addr_nonnull_fold(ir);
       tcc_ir_opt_setif_branch_fuse(ir);
       tcc_ir_opt_stack_bool_diamond(ir);
@@ -25622,7 +26108,12 @@ static void gen_function(Sym *sym)
        * paths) must be NOP'd before fallthrough elimination can see that
        * a JMP to its nearby target is a simple fallthrough over NOPs. */
       if (tcc_state->opt_dce)
+      {
         tcc_ir_opt_dce(ir);
+#ifdef CONFIG_TCC_DEBUG
+        dump_ir_after_pass(tcc_state, ir, "slloop_dce");
+#endif
+      }
       /* Remove unconditional jumps that became fallthrough after branch folding
        * + DCE.  This eliminates BB boundaries so the next store-load round can
        * see stores across previously separated blocks (e.g. struct field
@@ -25631,6 +26122,9 @@ static void gen_function(Sym *sym)
       {
         tcc_ir_opt_jump_threading(ir);
         tcc_ir_opt_eliminate_fallthrough(ir);
+#ifdef CONFIG_TCC_DEBUG
+        dump_ir_after_pass(tcc_state, ir, "slloop_jthread_ftelim");
+#endif
       }
       /* Compact NOPs so the next SL-FWD iteration sees clean BB boundaries.
        * Dead code from DCE + eliminated fallthroughs create NOP chains that
@@ -25638,6 +26132,9 @@ static void gen_function(Sym *sym)
        * causing the SL-FWD to unnecessarily reset its hash table at merge
        * points.  Compacting removes these phantom predecessors. */
       tcc_ir_opt_compact_nops(ir);
+#ifdef CONFIG_TCC_DEBUG
+      dump_ir_after_pass(tcc_state, ir, "slloop_compact_nops");
+#endif
     }
   }
 
@@ -25656,14 +26153,82 @@ static void gen_function(Sym *sym)
       tcc_ir_opt_dce(ir);
   }
 
+  /* Param-addrof const-store fold: collapse `LEA &P; *T = #C; ... use(P) ...`
+   * into a direct constant.  Must run after SL-FWD has inlined helpers and
+   * exposed the bare LEA+STORE+RETURNVALUE shape.  The local-addrof variant
+   * handles the analogous pattern over a local VAR (callers that inline a
+   * `helper(&local)` body). */
+  if (tcc_state->opt_store_load_fwd && !ir->has_static_chain)
+  {
+    int padrof_changed = tcc_ir_opt_param_addrof_const_fold(ir) > 0;
+    int ladrof_changed = tcc_ir_opt_local_addrof_const_fold(ir) > 0;
+    if (padrof_changed || ladrof_changed)
+    {
+      if (tcc_state->opt_const_prop)
+      {
+        tcc_ir_opt_const_prop(ir);
+        tcc_ir_opt_const_prop_tmp(ir);
+      }
+      if (tcc_state->opt_dce)
+        tcc_ir_opt_dce(ir);
+      tcc_ir_opt_compact_nops(ir);
+    }
+  }
+
+  /* Complex constant param folding: pack a _Complex float local that is
+   * initialized to constants and only used as a single FUNCPARAMVAL into a
+   * packed 64-bit immediate, eliminating the stack round-trip at the call. */
+  if (tcc_state->opt_const_prop)
+  {
+    if (tcc_ir_opt_complex_const_param_fold(ir))
+    {
+      if (tcc_state->opt_dce)
+        tcc_ir_opt_dce(ir);
+    }
+  }
+
+  /* Dead call result elimination: convert FUNCCALLVAL→FUNCCALLVOID when
+   * the call's return TEMP has no uses, so the codegen skips the
+   * post-call register-copy moves. */
+  if (tcc_state->opt_dead_store)
+    tcc_ir_opt_dead_call_result_elim(ir);
+
+  /* Dead sret-call elimination: drop calls to func_pure_via_sret callees
+   * whose sret target is a dead local.  Must run after dead_call_result_elim
+   * so FUNCCALLVAL→FUNCCALLVOID conversion exposes void-return shape. */
+  if (tcc_state->opt_dead_store)
+    tcc_ir_opt_dead_sret_call_elim(ir);
+
+  /* Dead-init-via-call: kill stack-slot stores whose bytes are fully
+   * overwritten by a subsequent CALL, using the callee's write summary. */
+  if (tcc_state->opt_dead_store)
+    tcc_ir_opt_dead_init_via_call(ir);
+
+  /* Fold CALL → TEMP_LOCAL + LOAD + STORE patterns into a direct CALL → *V.
+   * Eliminates the spill+reload round-trip when a call's return value is
+   * immediately written through a pointer (e.g. complex sret returns where
+   * each component is computed then stored to *sret). */
+  if (tcc_state->opt_dead_store)
+    tcc_ir_opt_fold_call_result_store(ir);
+
   /* Phase 4: Redundant Store Elimination - remove stores overwritten before read
    * CONSERVATIVE: Only handles stack locals whose address is not taken */
   if (tcc_state->opt_redundant_store)
+  {
     tcc_ir_opt_store_redundant(ir);
+#ifdef CONFIG_TCC_DEBUG
+    dump_ir_after_pass(tcc_state, ir, "store_redundant");
+#endif
+  }
 
   /* Dead store elimination - remove unused ASSIGN instructions */
   if (tcc_state->opt_dead_store)
+  {
     tcc_ir_opt_dse(ir);
+#ifdef CONFIG_TCC_DEBUG
+    dump_ir_after_pass(tcc_state, ir, "dse");
+#endif
+  }
 
   /* Dead VAR store elimination (post-SL_FWD): after DSE kills dead TMPs,
    * VARs that were only read by those TMPs become dead.  Typical pattern:
@@ -25674,6 +26239,9 @@ static void gen_function(Sym *sym)
   if (tcc_state->opt_dead_store)
   {
     tcc_ir_opt_dead_var_store_elim(ir);
+#ifdef CONFIG_TCC_DEBUG
+    dump_ir_after_pass(tcc_state, ir, "dead_var_store_elim");
+#endif
   }
 
   /* Dead address-taken VAR elimination - remove writes to VARs with no live reads.
@@ -25682,12 +26250,20 @@ static void gen_function(Sym *sym)
   {
     if (tcc_ir_opt_dead_addrvar_elim(ir))
       tcc_ir_opt_dse(ir);
+#ifdef CONFIG_TCC_DEBUG
+    dump_ir_after_pass(tcc_state, ir, "dead_addrvar_elim");
+#endif
   }
 
   /* Redundant VAR ASSIGN elimination - kill assigns overwritten before next read.
    * Must run after dead_addrvar_elim to catch newly-exposed redundant assigns. */
   if (tcc_state->opt_dead_store)
+  {
     tcc_ir_opt_redundant_var_assign(ir);
+#ifdef CONFIG_TCC_DEBUG
+    dump_ir_after_pass(tcc_state, ir, "redundant_var_assign");
+#endif
+  }
 
   /* Phase 4c: Loop Rotation - convert top-tested (while) loops to
    * bottom-tested (do-while) to eliminate 2 branches per iteration.
@@ -26296,11 +26872,19 @@ static void gen_function(Sym *sym)
       if (irop_config[q->op].has_src2)
         vrs[2] = irop_get_vreg(tcc_ir_op_get_src2(ir, q));
       for (int k = 0; k < 3; k++) {
-        if (vrs[k] >= 0) {
-          int p = TCCIR_DECODE_VREG_POSITION(vrs[k]);
-          if (p <= max_vreg_pos)
-            live_vregs[p / 8] |= (1 << (p % 8));
-        }
+        if (vrs[k] < 0)
+          continue;
+        /* irop_get_vreg returns 0 (vreg_type=0, position=0) for non-vreg
+         * operands whose default-zero bit pattern doesn't encode a real
+         * vreg (e.g. GlobalSym in CALL src1, plain immediates). A
+         * position-only bitmap would then falsely mark vreg position 0
+         * (V0/T0/P0) as referenced and pin a dead stack slot. Valid vreg
+         * types start at 1 (VAR/TEMP/PARAM); filter type-0 entries out. */
+        if (TCCIR_DECODE_VREG_TYPE(vrs[k]) == 0)
+          continue;
+        int p = TCCIR_DECODE_VREG_POSITION(vrs[k]);
+        if (p <= max_vreg_pos)
+          live_vregs[p / 8] |= (1 << (p % 8));
       }
     }
 
@@ -26326,13 +26910,128 @@ static void gen_function(Sym *sym)
       min_stack_loc = sl;
     }
     tcc_free(live_vregs);
-    if (min_stack_loc < loc)
-    {
-      loc = min_stack_loc;
+
+    /* Also scan IR operands directly for explicit stack-offset references
+     * (frontend-allocated temp locals like StackLoc[-N], used by call-result
+     * spilling and similar). The frontend pre-allocates these via `loc -= N`
+     * before optimization, so dead temps inflate the frame.
+     *
+     * Skip operands whose vreg ended up fully in a register: the is_local
+     * flag is a vestigial marker from the C declaration, but the regalloc
+     * may have kept the value in a register only, leaving the stack slot
+     * unused.  Counting it here would pin the frame to a dead slot. */
+    int min_op_offset = 0;
+    if (!has_nested_chain) {
+      for (int j = 0; j < ir->next_instruction_index; j++) {
+        const IRQuadCompact *q = &ir->compact_instructions[j];
+        if (q->op == TCCIR_OP_NOP)
+          continue;
+        IROperand ops[3];
+        int nops = 0;
+        if (irop_config[q->op].has_dest)
+          ops[nops++] = tcc_ir_op_get_dest(ir, q);
+        if (irop_config[q->op].has_src1)
+          ops[nops++] = tcc_ir_op_get_src1(ir, q);
+        if (irop_config[q->op].has_src2)
+          ops[nops++] = tcc_ir_op_get_src2(ir, q);
+        for (int k = 0; k < nops; k++) {
+          IROperand *o = &ops[k];
+          int has_stackoff = (o->tag == IROP_TAG_STACKOFF) ||
+                             (o->is_local || o->is_llocal);
+          if (!has_stackoff)
+            continue;
+          int vr = irop_get_vreg(*o);
+          if (vr >= 0) {
+            IRLiveInterval *li = tcc_ir_get_live_interval(ir, vr);
+            if (li && li->allocation.r0 != PREG_NONE &&
+                !(li->allocation.r0 & PREG_SPILLED) &&
+                li->allocation.offset == 0)
+              continue; /* vreg is register-only; stack slot unused */
+          }
+          int off = (int)irop_get_stack_offset(*o);
+          if (off < min_op_offset)
+            min_op_offset = off;
+        }
+      }
+    } else {
+      /* When nested-frame access is possible we can't trust the scan to
+       * cover all frame uses, so keep the original frontend-assigned loc. */
+      min_op_offset = loc;
     }
+
+    /* Combine spill-driven and operand-driven minima. Both are <= 0; the
+     * actual frame needs to extend to whichever is more negative. */
+    if (min_op_offset < min_stack_loc)
+      min_stack_loc = min_op_offset;
+
+    /* Grow loc if spills need more space; shrink if the IR uses less than
+     * the frontend pre-allocated (dead temp locals after optimization). */
+    if (min_stack_loc < loc)
+      loc = min_stack_loc;
+    else if (!has_nested_chain && min_stack_loc > loc)
+      loc = min_stack_loc;
   }
 
   tcc_ir_move_coalescing(ir);
+
+  /* Frame-shrink pass — re-scan the post-coalesce IR for stack-resident
+   * operand references. Move coalescing rewrites operands and may eliminate
+   * frontend-allocated temp-local refs. If no operand still names a slot
+   * below the frontend's `loc`, the unused slots can be reclaimed. */
+  {
+    int post_min_op_offset = 0;
+    int post_has_nested_chain = ir->has_static_chain;
+    if (!post_has_nested_chain) {
+      for (int j = 0; j < ir->next_instruction_index; j++) {
+        int op = ir->compact_instructions[j].op;
+        if (op == TCCIR_OP_SET_CHAIN || op == TCCIR_OP_INIT_CHAIN_SLOT) {
+          post_has_nested_chain = 1;
+          break;
+        }
+      }
+    }
+    if (!post_has_nested_chain) {
+      for (int j = 0; j < ir->next_instruction_index; j++) {
+        const IRQuadCompact *q = &ir->compact_instructions[j];
+        if (q->op == TCCIR_OP_NOP)
+          continue;
+        IROperand ops[3];
+        int nops = 0;
+        if (irop_config[q->op].has_dest)
+          ops[nops++] = tcc_ir_op_get_dest(ir, q);
+        if (irop_config[q->op].has_src1)
+          ops[nops++] = tcc_ir_op_get_src1(ir, q);
+        if (irop_config[q->op].has_src2)
+          ops[nops++] = tcc_ir_op_get_src2(ir, q);
+        for (int k = 0; k < nops; k++) {
+          IROperand *o = &ops[k];
+          int has_stackoff = (o->tag == IROP_TAG_STACKOFF) ||
+                             (o->is_local || o->is_llocal);
+          if (!has_stackoff)
+            continue;
+          int vr = irop_get_vreg(*o);
+          if (vr >= 0) {
+            IRLiveInterval *li = tcc_ir_get_live_interval(ir, vr);
+            if (li && li->allocation.r0 != PREG_NONE &&
+                !(li->allocation.r0 & PREG_SPILLED) &&
+                li->allocation.offset == 0)
+              continue; /* register-only vreg; stack slot unused */
+          }
+          int off = (int)irop_get_stack_offset(*o);
+          if (off < post_min_op_offset)
+            post_min_op_offset = off;
+        }
+      }
+      /* Also keep any still-live regalloc spill slots in mind. */
+      for (int i = 0; i < ir->ls.next_interval_index; ++i) {
+        int sl = ir->ls.intervals[i].stack_location;
+        if (sl < post_min_op_offset)
+          post_min_op_offset = sl;
+      }
+      if (post_min_op_offset > loc)
+        loc = post_min_op_offset;
+    }
+  }
 
   /* Sync LSLiveInterval → IRLiveInterval after post-allocation modifications
    * (register swap, move coalescing, stack-passed param rewrite, compaction). */
@@ -26380,17 +27079,18 @@ static void gen_function(Sym *sym)
      * - nb_captured > 0 and NOT eligible for inlining: compiled separately,
      *   accesses parent vars via FP-relative chain offsets */
     /* Determine if any nested function needs the parent's FP at runtime.
-     * Safe to clear FP only when there's a single inlineable nested function
-     * with no trampoline — multi-level nesting or non-inlineable functions
-     * need the parent's FP for static chain access. */
-    int can_omit_fp = 0;
-    if (tcc_state->nb_nested_funcs == 1)
-    {
-      NestedFunc *nf = &tcc_state->nested_funcs[0];
-      if (!nf->trampoline_needed &&
-          nf->sym && nf->sym->type.ref &&
-          nf->sym->type.ref->f.func_auto_inline)
-        can_omit_fp = 1;
+     * Safe to clear FP when every nested function is auto-inlineable and
+     * has no trampoline — every standalone copy of those nested functions
+     * is dead code (no caller can reach it), so the parent never needs to
+     * supply its FP via the static chain.  Multi-level nesting is fine as
+     * long as every level satisfies this condition. */
+    int can_omit_fp = (tcc_state->nb_nested_funcs > 0);
+    for (int i = 0; i < tcc_state->nb_nested_funcs && can_omit_fp; i++) {
+      NestedFunc *nf = &tcc_state->nested_funcs[i];
+      if (nf->trampoline_needed ||
+          !nf->sym || !nf->sym->type.ref ||
+          !nf->sym->type.ref->f.func_auto_inline)
+        can_omit_fp = 0;
     }
     int needs_fp_for_nested = !can_omit_fp;
     compile_nested_functions(sym);
@@ -26412,6 +27112,19 @@ static void gen_function(Sym *sym)
     phase_start = now;
   }
 
+  /* Per-function pure-via-sret analysis: classify this function's body so
+   * that callers can apply dead-sret-call elimination at their call sites.
+   * Must run after all body opts (final IR), before codegen, and before
+   * func_vc is overwritten by the next function's compilation. */
+  if (tcc_state->opt_dead_store)
+    tcc_ir_analyze_pure_via_sret(ir, sym);
+
+  /* Per-function write summary: record must-write byte ranges via each
+   * pointer parameter, so callers' DSE can elide stack-slot inits the
+   * callee fully overwrites.  Same timing constraint as pure_via_sret. */
+  if (tcc_state->opt_dead_store)
+    tcc_ir_compute_func_write_summary(ir, sym);
+
   /* Before codegen, create placeholder ELF symbols for addr-taken labels
    * (&&label) that are still on global_label_stack with c == -3.
    * During codegen, the backend will emit relocations referencing these
@@ -26428,6 +27141,11 @@ static void gen_function(Sym *sym)
       }
     }
   }
+
+  /* Late pass: merge duplicate RETURNVALUE #imm into JUMP-to-first.
+   * Runs immediately before codegen so no other pass relies on the IR
+   * having multiple distinct return sites. */
+  tcc_ir_opt_returnvalue_merge(ir);
 
   tcc_ir_codegen_generate(ir);
 
@@ -26542,8 +27260,74 @@ static void gen_function(Sym *sym)
 
   /* do this after funcend debug info */
   next();
-  tcc_ir_free(ir);
+  if (ir_inline_stash_eligible(sym, ir))
+  {
+    ir_inline_stash_add(tcc_state, sym, ir);
+  }
+  else
+  {
+    tcc_ir_free(ir);
+  }
   tcc_state->ir = NULL;
+}
+
+/* Phase 0 inliner stash: keep optimized IR of eligible `static` functions
+ * alive past gen_function() so a future inliner pass can splice it into
+ * callers. Today there are no consumers — this exists to validate the
+ * lifecycle change (no leaks, no regressions) before the splice logic lands. */
+#ifndef IR_INLINE_STASH_SIZE_BUDGET
+#define IR_INLINE_STASH_SIZE_BUDGET 200
+#endif
+
+static int ir_inline_stash_eligible(Sym *sym, TCCIRState *ir)
+{
+  if (!sym || !ir)
+    return 0;
+  if (!(sym->type.t & VT_STATIC))
+    return 0;
+  if (sym->a.addrtaken)
+    return 0;
+  if (!sym->type.ref || sym->type.ref->f.func_type == FUNC_ELLIPSIS)
+    return 0;
+  if (ir->has_static_chain)
+    return 0;
+  if (ir->nb_nested_funcs > 0)
+    return 0;
+  if (ir->naked)
+    return 0;
+#ifdef CONFIG_TCC_ASM
+  if (ir->inline_asm_count > 0)
+    return 0;
+#endif
+  if (ir->next_instruction_index > IR_INLINE_STASH_SIZE_BUDGET)
+    return 0;
+  return 1;
+}
+
+static void ir_inline_stash_add(TCCState *s1, Sym *sym, TCCIRState *ir)
+{
+  if (s1->nb_stashed_func_irs >= s1->stashed_func_irs_capacity)
+  {
+    s1->stashed_func_irs_capacity = s1->stashed_func_irs_capacity ? s1->stashed_func_irs_capacity * 2 : 4;
+    s1->stashed_func_irs =
+        tcc_realloc(s1->stashed_func_irs, s1->stashed_func_irs_capacity * sizeof(StashedFuncIR));
+  }
+  s1->stashed_func_irs[s1->nb_stashed_func_irs].sym = sym;
+  s1->stashed_func_irs[s1->nb_stashed_func_irs].ir = ir;
+  s1->nb_stashed_func_irs++;
+}
+
+static void ir_inline_stash_flush(TCCState *s1)
+{
+  for (int i = 0; i < s1->nb_stashed_func_irs; i++)
+  {
+    if (s1->stashed_func_irs[i].ir)
+      tcc_ir_free(s1->stashed_func_irs[i].ir);
+  }
+  tcc_free(s1->stashed_func_irs);
+  s1->stashed_func_irs = NULL;
+  s1->nb_stashed_func_irs = 0;
+  s1->stashed_func_irs_capacity = 0;
 }
 
 static void gen_inline_functions(TCCState *s)

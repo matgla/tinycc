@@ -23,6 +23,43 @@
  *   x - x, x ^ x → 0
  * ============================================================================ */
 
+/* Resolve a vreg operand back to its constant defining ASSIGN, if any.
+ * In SSA a TEMP is single-def, so following its def to an ASSIGN #imm gives
+ * the value the operand will carry at runtime.  Returns 1 and sets *out_val
+ * when the vreg's single def is an `ASSIGN #imm32` with non-lval src.
+ *
+ * Restricted to defs in the SAME basic block as the use: a cross-block
+ * forward through a join point can lose information when multiple paths
+ * each define the value differently (the bug_switch_goto_or pattern —
+ * see comment on cprop_imm in ssa_opt_cprop.c).  Same-block defs have
+ * exactly one path from def to use, so the resolution is unambiguous. */
+static int try_resolve_const_vreg(IRSSAOptCtx *ctx, IROperand op, int use_idx, int32_t *out_val)
+{
+  if (op.is_lval || op.is_local || op.is_llocal || op.is_sym)
+    return 0;
+  if (op.tag != IROP_TAG_VREG)
+    return 0;
+  int32_t vr = irop_get_vreg(op);
+  if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
+    return 0;
+  IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, vr);
+  if (!vi || vi->def_count != 1 || vi->def_instr < 0)
+    return 0;
+  IRCFG *cfg = ctx->cfg;
+  if (!cfg)
+    return 0;
+  if (cfg->instr_to_block[vi->def_instr] != cfg->instr_to_block[use_idx])
+    return 0;
+  IRQuadCompact *dq = &ctx->ir->compact_instructions[vi->def_instr];
+  if (dq->op != TCCIR_OP_ASSIGN)
+    return 0;
+  IROperand dsrc = tcc_ir_op_get_src1(ctx->ir, dq);
+  if (dsrc.tag != IROP_TAG_IMM32 || dsrc.is_lval)
+    return 0;
+  *out_val = dsrc.u.imm32;
+  return 1;
+}
+
 static int fold_binary(IRSSAOptCtx *ctx, int idx)
 {
   TCCIRState *ir = ctx->ir;
@@ -40,6 +77,36 @@ static int fold_binary(IRSSAOptCtx *ctx, int idx)
   int src2_is_imm = (src2.tag == IROP_TAG_IMM32 && !src2.is_lval);
   int32_t val1 = src1.u.imm32;
   int32_t val2 = src2.u.imm32;
+
+  /* Resolve vreg operands whose single ASSIGN def carries a constant —
+   * fold_binary can then catch identities like `0 + x` even when the 0
+   * arrives via an intermediate vreg.  Materialise the resolved value as
+   * a real immediate operand and drop the vreg use; DCE then cleans up
+   * the dead constant ASSIGN if it has no other users.  The fold logic
+   * below then proceeds unchanged on the immediate. */
+  int32_t resolved_v1 = 0, resolved_v2 = 0;
+  if (!src1_is_imm && try_resolve_const_vreg(ctx, src1, idx, &resolved_v1)) {
+    int32_t old_vr = irop_get_vreg(src1);
+    IROperand imm1 = irop_make_imm32(0, resolved_v1, irop_get_btype(src1));
+    tcc_ir_op_set_src1(ir, q, imm1);
+    IRSSAVregInfo *uvi = ssa_opt_vinfo(ctx, old_vr);
+    if (uvi)
+      ssa_opt_remove_use_instr(uvi, idx);
+    src1 = imm1;
+    src1_is_imm = 1;
+    val1 = resolved_v1;
+  }
+  if (!src2_is_imm && try_resolve_const_vreg(ctx, src2, idx, &resolved_v2)) {
+    int32_t old_vr = irop_get_vreg(src2);
+    IROperand imm2 = irop_make_imm32(0, resolved_v2, irop_get_btype(src2));
+    tcc_ir_op_set_src2(ir, q, imm2);
+    IRSSAVregInfo *uvi = ssa_opt_vinfo(ctx, old_vr);
+    if (uvi)
+      ssa_opt_remove_use_instr(uvi, idx);
+    src2 = imm2;
+    src2_is_imm = 1;
+    val2 = resolved_v2;
+  }
 
   /* Both operands immediate: full constant fold */
   if (src1_is_imm && src2_is_imm) {

@@ -877,6 +877,9 @@ LIBTCCAPI void tcc_delete(TCCState *s1)
   tcc_free(s1->deps_outfile);
   tcc_free(s1->pch_infile);
   tcc_free(s1->linker_script);
+#ifdef CONFIG_TCC_DEBUG
+  tcc_free(s1->dump_ir_passes);
+#endif
   tcc_pch_free(s1);
   if (s1->ld_script)
   {
@@ -1584,6 +1587,7 @@ enum
   TCC_OPTION_T,
 #ifdef CONFIG_TCC_DEBUG
   TCC_OPTION_dump_ir,
+  TCC_OPTION_dump_ir_passes,
 #endif
 };
 
@@ -1617,6 +1621,7 @@ static const TCCOption tcc_options[] = {
 #ifdef CONFIG_TCC_DEBUG
     /* Must appear before the short "-d" option, otherwise "-dump-ir" is parsed as "-d ump-ir". */
     {"dump-ir", TCC_OPTION_dump_ir, 0},
+    {"dump-ir-passes=", TCC_OPTION_dump_ir_passes, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP},
 #endif
     {"d", TCC_OPTION_d, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP},
     {"static", TCC_OPTION_static, 0},
@@ -2301,9 +2306,9 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
       }
       if (s->optimize >= 2)
       {
-        s->opt_inline_functions = 1; /* Inline small static/inline functions (≤60 words) */
-        if (s->opt_inline_limit < 60)
-          s->opt_inline_limit = 60;
+        s->opt_inline_functions = 1; /* Inline small static/inline functions (≤100 words) */
+        if (s->opt_inline_limit < 100)
+          s->opt_inline_limit = 100;
       }
       break;
     case TCC_OPTION_T:
@@ -2317,6 +2322,10 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
 #ifdef CONFIG_TCC_DEBUG
     case TCC_OPTION_dump_ir:
       s->dump_ir = 1;
+      break;
+    case TCC_OPTION_dump_ir_passes:
+      tcc_free(s->dump_ir_passes);
+      s->dump_ir_passes = tcc_strdup(optarg);
       break;
 #endif
     case TCC_OPTION_print_search_dirs:

@@ -471,6 +471,30 @@ static void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
     }
   }
 
+  /* Pre-pass: identify vregs that appear as a source operand in any non-NOP
+   * instruction.  Used below to decide whether a STORE-class op's dest is
+   * really a register def (promoted scalar with at least one read elsewhere)
+   * or just an address being written through (no other reads — the vreg
+   * represents an implicit stack address that the codegen materializes via
+   * its origin, not via an IR-level def). */
+  uint8_t *vreg_read_as_src = tcc_mallocz((table_size + 7) / 8);
+  for (int i = 0; i < n; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP) continue;
+    IROperand srcs[3];
+    int nsrcs = 0;
+    if (irop_config[q->op].has_src1) srcs[nsrcs++] = tcc_ir_op_get_src1(ir, q);
+    if (irop_config[q->op].has_src2) srcs[nsrcs++] = tcc_ir_op_get_src2(ir, q);
+    if (q->op == TCCIR_OP_MLA)       srcs[nsrcs++] = tcc_ir_op_get_accum(ir, q);
+    for (int k = 0; k < nsrcs; k++) {
+      int32_t svr = irop_get_vreg(srcs[k]);
+      if (svr < 0 || !tcc_ir_vreg_is_valid(ir, svr)) continue;
+      int sidx = VREG_IDX(svr);
+      if (sidx < table_size)
+        vreg_read_as_src[sidx >> 3] |= (uint8_t)(1u << (sidx & 7));
+    }
+  }
+
   /* Scan instructions for def/use */
   for (int i = 0; i < n; i++) {
     IRQuadCompact *q = &ir->compact_instructions[i];
@@ -523,10 +547,37 @@ static void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
 
     /* Def: dest (non-STORE) */
     if (irop_config[q->op].has_dest) {
-      int dest_is_use = (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
-                         q->op == TCCIR_OP_STORE_POSTINC);
       IROperand d = tcc_ir_op_get_dest(ir, q);
+      int is_store_op = (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
+                         q->op == TCCIR_OP_STORE_POSTINC);
       int32_t vr = irop_get_vreg(d);
+      /* STORE-class ops nominally treat dest as an address being written
+       * through, so the dest vreg must be live before this instruction
+       * (start=0).  But when the optimizer register-promotes a scalar local,
+       * the STORE becomes a register def and dest's lifetime starts here.
+       * Promote STORE→DEF only when ALL of:
+       *   (a) dest is a VAR (TEMPs frequently hold computed pointer values
+       *       — a TEMP-dest STORE is a genuine memory write through the
+       *       TEMP's address even when the TEMP itself isn't address-taken),
+       *   (b) the vreg is not address-taken (no aliasing through &v),
+       *   (c) the vreg is not lvalue-typed (not an address-of value like &a),
+       *   (d) the vreg is read as a source somewhere — an unread STORE-only
+       *       VAR may be an implicit stack address whose defining ASSIGN
+       *       was optimized away, where the "live from entry" property is
+       *       load-bearing for the codegen to materialize the address.
+       * Together these identify register-promoted scalars whose STOREs are
+       * really ASSIGNs.  Without this, every such vreg is marked live from
+       * entry and forced into callee-saved registers by crosses_call. */
+      int dest_is_use = is_store_op;
+      if (is_store_op && vr >= 0 && tcc_ir_vreg_is_valid(ir, vr) &&
+          TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR) {
+        IRLiveInterval *li = tcc_ir_vreg_live_interval(ir, vr);
+        int didx = VREG_IDX(vr);
+        int read_as_src = didx < table_size &&
+                          ((vreg_read_as_src[didx >> 3] >> (didx & 7)) & 1);
+        if (li && !li->addrtaken && !li->is_lvalue && read_as_src)
+          dest_is_use = 0;
+      }
       if (vr >= 0 && tcc_ir_vreg_is_valid(ir, vr)) {
         int idx = VREG_IDX(vr);
         if (idx < table_size) {
@@ -651,6 +702,14 @@ static void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
     }
   }
 
+  /* Track vregs whose end was pushed to a CALL because they feed a
+   * FUNCPARAMVAL of that call.  These are "consumed at the call" — they
+   * don't need a callee-saved register.  Used below in the crosses_call
+   * computation to avoid spuriously forcing R4-R11 for arg sources. */
+  uint8_t *param_extended = NULL;
+  if (table_size > 0)
+    param_extended = tcc_mallocz((table_size + 7) / 8);
+
   /* Extend FUNCPARAMVAL intervals to their FUNCCALL */
   {
     int max_call_id = ir->next_call_id;
@@ -679,6 +738,27 @@ static void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
           if (idx < table_size) {
             if (ends[idx] < (uint32_t)cidx) ends[idx] = cidx;
             if (starts[idx] == INTERVAL_NOT_STARTED) starts[idx] = 0;
+            /* Only mark as param-extended for plain 32-bit non-deref sources.
+             * 64-bit sources and dereferenced sources go through more complex
+             * codegen paths that haven't been validated for caller-saved arg
+             * registers; keep them in callee-saved (crosses_call=1). */
+            /* The PARAM source is consumed by the call as a register argument.
+             * is_lval=1 nominally means the source is dereferenced (load from
+             * its stack slot), but if the underlying vreg is a register-
+             * promotable VAR (addrtaken=0, not lvalue-typed), the "deref" is a
+             * plain register read and the value still doesn't outlive the
+             * call — let it land in a caller-saved arg register. */
+            int eligible = !s1.is_lval;
+            if (!eligible && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR) {
+              IRLiveInterval *li = tcc_ir_vreg_live_interval(ir, vr);
+              if (li && !li->addrtaken && !li->is_lvalue)
+                eligible = 1;
+            }
+            if (param_extended && (int)ends[idx] == cidx && eligible) {
+              int sbtype = irop_get_btype(s1);
+              if (sbtype != IROP_BTYPE_INT64 && sbtype != IROP_BTYPE_FLOAT64)
+                param_extended[idx >> 3] |= (uint8_t)(1u << (idx & 7));
+            }
           }
         }
       }
@@ -699,6 +779,47 @@ static void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
    * are the exception: a single linear interval cannot represent a wrapped
    * live range, so we conservatively move those starts to the loop target. */
 
+  /* Bitset of vregs (by table_size index) that have a phi-resolution copy
+   * — i.e., an ASSIGN dest — somewhere in the IR.  Computed once and reused
+   * by every back-edge below.  An interval is "loop-carried" at a back-edge
+   * (target, i) iff its vreg is ASSIGNed somewhere in [target, i): that's
+   * the latch copy that materializes the next iteration's value.  This
+   * catches the real loop-carried temps even though ssa->block_phis has
+   * been cleared by pre-RA phi resolution. */
+  uint8_t *vreg_has_assign = NULL;
+  {
+    int bitset_bytes = (table_size + 7) / 8;
+    if (bitset_bytes > 0) {
+      vreg_has_assign = tcc_mallocz(bitset_bytes);
+      for (int i = 0; i < n; i++) {
+        IRQuadCompact *q = &ir->compact_instructions[i];
+        if (q->op != TCCIR_OP_ASSIGN) continue;
+        int32_t dv = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
+        if (dv < 0 || !tcc_ir_vreg_is_valid(ir, dv)) continue;
+        int didx = VREG_IDX(dv);
+        if (didx >= 0 && didx < table_size)
+          vreg_has_assign[didx >> 3] |= (uint8_t)(1u << (didx & 7));
+      }
+    }
+  }
+
+  #define RA_VREG_HAS_ASSIGN_IN_RANGE(vidx, lo, hi)                             \
+    ({                                                                          \
+      int found_ = 0;                                                          \
+      if (vreg_has_assign && ((vreg_has_assign[(vidx) >> 3] >> ((vidx) & 7)) & 1)) { \
+        int type__ = (vidx) / max_vreg_pos;                                    \
+        int pos__ = (vidx) % max_vreg_pos;                                     \
+        int32_t needle_ = TCCIR_ENCODE_VREG(type__, pos__);                    \
+        for (int s_ = (lo); s_ < (hi); s_++) {                                 \
+          IRQuadCompact *qa_ = &ir->compact_instructions[s_];                  \
+          if (qa_->op != TCCIR_OP_ASSIGN) continue;                            \
+          int32_t adv_ = irop_get_vreg(tcc_ir_op_get_dest(ir, qa_));           \
+          if (adv_ == needle_) { found_ = 1; break; }                          \
+        }                                                                       \
+      }                                                                         \
+      found_;                                                                  \
+    })
+
   #define RA_EXTEND_BACKEDGE(i, target, broad)                                  \
     do {                                                                        \
       RA_DBG("  back-edge i=%d -> target=%d%s", (i), (target),                 \
@@ -717,11 +838,22 @@ static void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
                            (int)ends[idx_] >= (target));                         \
         if (!live_at_target_ && (live_at_backedge_ || overlaps_loop_) &&        \
             (int)starts[idx_] > (target)) {                                     \
-          uint32_t old_s_ = starts[idx_];                                       \
-          starts[idx_] = (target);                                              \
-          RA_DBG("    %s%d [%u,%u] -> [%u,%u] (loop-carried)",                 \
-                 ra_vreg_type_char(type_), idx_ % max_vreg_pos, old_s_,         \
-                 ends[idx_], starts[idx_], ends[idx_]);                          \
+          /* Only extend when actually loop-carried.  An interval that's       \
+           * "live at the back-edge JMP" without a phi-resolution ASSIGN in   \
+           * [target, i) is just a within-iteration temp whose lifetime      \
+           * happens to extend past the JMP via a fall-through use (failure  \
+           * path); extending it would balloon a short range into a full-    \
+           * loop span and cause spurious spills.  For broad (IJMP), keep   \
+           * prior conservative behavior since the real target is unknown. */ \
+          int is_loop_carried_ = (broad) ? 1 :                                  \
+              RA_VREG_HAS_ASSIGN_IN_RANGE(idx_, (target), (i));                 \
+          if (is_loop_carried_) {                                                \
+            uint32_t old_s_ = starts[idx_];                                     \
+            starts[idx_] = (target);                                            \
+            RA_DBG("    %s%d [%u,%u] -> [%u,%u] (loop-carried)",               \
+                   ra_vreg_type_char(type_), idx_ % max_vreg_pos, old_s_,       \
+                   ends[idx_], starts[idx_], ends[idx_]);                        \
+          }                                                                    \
         }                                                                       \
         if ((live_at_target_ || live_at_backedge_ || overlaps_loop_) &&         \
             (int)ends[idx_] < (i)) {                                            \
@@ -761,6 +893,8 @@ static void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
   }
 
   #undef RA_EXTEND_BACKEDGE
+  #undef RA_VREG_HAS_ASSIGN_IN_RANGE
+  tcc_free(vreg_has_assign);
 
   if (TCC_LOG_LS) {
     RA_DBG("SSA ra_build_intervals: after backward jump extension");
@@ -816,20 +950,35 @@ static void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
         iv->precolored = 10;
       }
 
-      /* Call crossing */
+      /* Call crossing: a call STRICTLY between def and last use.
+       * If iv->end is at a call AND this vreg was extended to that call
+       * by the FUNCPARAMVAL extension above, the value is being consumed
+       * as a call argument — it does not outlive the call, so crosses_call
+       * stays 0 (lets the allocator place it in a caller-saved arg reg).
+       * For other vregs whose end lands at a call (e.g., the function
+       * pointer of an indirect call), keep the conservative crosses_call=1. */
       if (!iv->crosses_call) {
         iv->crosses_call = ra_has_call_in_range(call_prefix, iv->start, iv->end, n);
         if (!iv->crosses_call && iv->end < (uint32_t)n) {
           TccIrOp eop = ir->compact_instructions[iv->end].op;
-          if (eop == TCCIR_OP_FUNCCALLVAL || eop == TCCIR_OP_FUNCCALLVOID)
-            iv->crosses_call = 1;
+          if (eop == TCCIR_OP_FUNCCALLVAL || eop == TCCIR_OP_FUNCCALLVOID) {
+            int idx = VREG_IDX(vreg);
+            int is_param_use = (param_extended &&
+                                ((param_extended[idx >> 3] >> (idx & 7)) & 1));
+            if (!is_param_use)
+              iv->crosses_call = 1;
+          }
         }
       }
 
-      /* Params: start at 0, precolor if in register */
+      /* Params: start at 0, precolor if in register.
+       * Do NOT bump end past its last actual use — the pref_reg boundary
+       * eviction (a->end == cur->start) relies on the param expiring at
+       * the instruction that consumes it.  Phantom-extending end to 1
+       * would force a return-value temporary defined at instruction 0
+       * onto a different register and emit a redundant mov to r0. */
       if (type == TCCIR_VREG_TYPE_PARAM) {
         iv->start = 0;
-        if (iv->end == 0) iv->end = 1;
         if (pos < 4 && !iv->crosses_call && li->incoming_reg0 >= 0)
           iv->precolored = li->incoming_reg0;
       } else if (li->incoming_reg0 >= 0 && iv->reg_type == LS_REG_TYPE_INT) {
@@ -848,6 +997,8 @@ static void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
   tcc_free(ends);
   tcc_free(uses);
   tcc_free(instr_depth);
+  tcc_free(param_extended);
+  tcc_free(vreg_read_as_src);
 
   if (TCC_LOG_LS) {
     RA_DBG("SSA ra_build_intervals: %d final intervals", wi);
@@ -980,6 +1131,91 @@ static void ra_build_assign_hints(SSAInterval *intervals, int count,
 }
 
 /* ============================================================================
+ * Outgoing-PARAM Register Affinity
+ *
+ * When a TEMP feeds FUNCPARAMVAL(idx, src) with idx < 4, prefer the
+ * matching AAPCS arg register (r0..r3) for that TEMP.  Without the hint
+ * the regalloc picks any free int register and codegen emits a
+ * `mov rN, rM` to shuffle the value into the arg slot at the CALL.
+ * With the hint, the value lands in the right register up front.
+ *
+ * Pairs with the crosses_call relaxation above: TEMPs consumed at a
+ * FUNCCALL no longer get crosses_call=1, so the soft-pref-reg path in
+ * ra_linear_scan can pick caller-saved r0..r3 without bailing.
+ *
+ * Skips deref sources (PARAM *T uses T as an address pointer; the
+ * loaded value goes into the arg at codegen time, not T itself) and
+ * 64-bit args (need a register pair which single-reg affinity can't
+ * express). */
+static void ra_build_outgoing_param_hints(SSAInterval *intervals, int count,
+                                           TCCIRState *ir, int max_vreg_pos)
+{
+  if (max_vreg_pos <= 0) return;
+
+  int table_size = 4 * max_vreg_pos;
+  int *vreg_to_iv = tcc_malloc(sizeof(int) * table_size);
+  for (int i = 0; i < table_size; i++)
+    vreg_to_iv[i] = -1;
+
+  #define OPH_VREG_IDX(vr) \
+    ((TCCIR_DECODE_VREG_TYPE(vr) * max_vreg_pos) + TCCIR_DECODE_VREG_POSITION(vr))
+
+  for (int i = 0; i < count; i++) {
+    int idx = OPH_VREG_IDX(intervals[i].vreg);
+    if (idx >= 0 && idx < table_size)
+      vreg_to_iv[idx] = i;
+  }
+
+  int n = ir->next_instruction_index;
+  for (int i = 0; i < n; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_FUNCPARAMVAL) continue;
+
+    IROperand src = tcc_ir_op_get_src1(ir, q);
+
+    int sbtype = irop_get_btype(src);
+    if (sbtype == IROP_BTYPE_INT64 || sbtype == IROP_BTYPE_FLOAT64) continue;
+
+    int32_t src_vr = irop_get_vreg(src);
+    if (src_vr < 0) continue;
+    int src_type = TCCIR_DECODE_VREG_TYPE(src_vr);
+    if (src_type != TCCIR_VREG_TYPE_TEMP && src_type != TCCIR_VREG_TYPE_VAR)
+      continue;
+
+    /* For TEMPs we require non-lval source.  For VARs we additionally accept
+     * lval sources when the VAR is register-promotable (addrtaken=0 and
+     * not lvalue-typed); after promotion the "deref" becomes a register
+     * read, so we can place the value directly in the arg register and
+     * avoid a mov from a callee-saved register. */
+    if (src.is_lval) {
+      if (src_type != TCCIR_VREG_TYPE_VAR) continue;
+      IRLiveInterval *li = tcc_ir_vreg_live_interval(ir, src_vr);
+      if (!li || li->addrtaken || li->is_lvalue) continue;
+    }
+
+    IROperand param_info = tcc_ir_op_get_src2(ir, q);
+    int param_idx = TCCIR_DECODE_PARAM_IDX((int)param_info.u.imm32);
+    if (param_idx < 0 || param_idx >= 4) continue;
+
+    int tbl_idx = OPH_VREG_IDX(src_vr);
+    if (tbl_idx < 0 || tbl_idx >= table_size) continue;
+    int iv_idx = vreg_to_iv[tbl_idx];
+    if (iv_idx < 0) continue;
+
+    SSAInterval *iv = &intervals[iv_idx];
+    if (iv->reg_type != LS_REG_TYPE_INT) continue;
+    if (iv->precolored >= 0) continue;
+    if (iv->crosses_call) continue;
+    if (iv->pref_reg >= 0) continue;
+
+    iv->pref_reg = (int8_t)param_idx;
+  }
+
+  tcc_free(vreg_to_iv);
+  #undef OPH_VREG_IDX
+}
+
+/* ============================================================================
  * Linear Scan Allocation
  * ============================================================================ */
 
@@ -994,7 +1230,125 @@ static int sort_by_start(const void *a, const void *b)
   return 0;
 }
 
-static void ra_linear_scan(SSAInterval *intervals, int count,
+/* Safety check for loop-carried phi coalescing.
+ *
+ * Returns 1 if cur can take partner's physical register even though their
+ * live intervals overlap.  The case: cur is defined inside the partner's
+ * live range by an instruction that reads partner as a source, and
+ * partner's only remaining use past that def is a single ASSIGN with
+ * dest = partner, src1 = cur (i.e. the explicit back-edge phi copy left
+ * over after SSA destruction).  Under that pattern partner's value is
+ * "killed" at cur's def: after the defining instruction R holds cur's
+ * value, the back-edge ASSIGN becomes mov R, R (elided), and R remains
+ * the carrier for the same logical loop variable across iterations.
+ *
+ * Note: cur->start may have been pulled back to the loop entry by the
+ * back-edge extension (so cur's "official" start is before its actual
+ * def).  We locate the def position by scanning for the first instruction
+ * in [cur->start, partner->end] whose dest is cur.
+ *
+ * Reads of partner *before* the def are fine: at those positions the
+ * register holds partner's value (which equals what cur will be assigned
+ * from in the previous iteration via the back-edge ASSIGN).  Reads
+ * *after* the def — except for the back-edge ASSIGN itself — are not
+ * fine: they would see cur's value, not partner's. */
+static int ra_safe_loop_phi_coalesce(TCCIRState *ir, SSAInterval *cur, SSAInterval *partner)
+{
+  int n = ir->next_instruction_index;
+  int cur_start = (int)cur->start;
+  int partner_end = (int)partner->end;
+  int32_t cur_vreg = cur->vreg;
+  int32_t partner_vreg = partner->vreg;
+
+  if (cur_start < 0 || cur_start >= n || partner_end < cur_start || partner_end >= n)
+    return 0;
+
+  /* Locate cur's def: first instruction in [cur_start, partner_end] whose
+   * non-STORE dest is cur AND which reads partner as a source. */
+  int def_pos = -1;
+  for (int j = cur_start; j <= partner_end; j++) {
+    IRQuadCompact *q = &ir->compact_instructions[j];
+    if (q->op == TCCIR_OP_NOP) continue;
+    if (!irop_config[q->op].has_dest) continue;
+    if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
+        q->op == TCCIR_OP_STORE_POSTINC) continue;
+    IROperand d = tcc_ir_op_get_dest(ir, q);
+    if (!irop_has_vreg(d) || irop_get_vreg(d) != cur_vreg) continue;
+
+    int reads_partner = 0;
+    if (irop_config[q->op].has_src1) {
+      IROperand s = tcc_ir_op_get_src1(ir, q);
+      if (irop_has_vreg(s) && irop_get_vreg(s) == partner_vreg) reads_partner = 1;
+    }
+    if (!reads_partner && irop_config[q->op].has_src2) {
+      IROperand s = tcc_ir_op_get_src2(ir, q);
+      if (irop_has_vreg(s) && irop_get_vreg(s) == partner_vreg) reads_partner = 1;
+    }
+    if (!reads_partner && q->op == TCCIR_OP_MLA) {
+      IROperand s = tcc_ir_op_get_accum(ir, q);
+      if (irop_has_vreg(s) && irop_get_vreg(s) == partner_vreg) reads_partner = 1;
+    }
+    if (!reads_partner) return 0;
+    def_pos = j;
+    break;
+  }
+  if (def_pos < 0) return 0;
+
+  int found_back_copy = 0;
+  for (int j = def_pos + 1; j <= partner_end; j++) {
+    IRQuadCompact *q = &ir->compact_instructions[j];
+    if (q->op == TCCIR_OP_NOP) continue;
+
+    int uses_partner_as_src = 0;
+    if (irop_config[q->op].has_src1) {
+      IROperand s = tcc_ir_op_get_src1(ir, q);
+      if (irop_has_vreg(s) && irop_get_vreg(s) == partner_vreg)
+        uses_partner_as_src = 1;
+    }
+    if (!uses_partner_as_src && irop_config[q->op].has_src2) {
+      IROperand s = tcc_ir_op_get_src2(ir, q);
+      if (irop_has_vreg(s) && irop_get_vreg(s) == partner_vreg)
+        uses_partner_as_src = 1;
+    }
+    if (!uses_partner_as_src && q->op == TCCIR_OP_MLA) {
+      IROperand s = tcc_ir_op_get_accum(ir, q);
+      if (irop_has_vreg(s) && irop_get_vreg(s) == partner_vreg)
+        uses_partner_as_src = 1;
+    }
+    if (uses_partner_as_src) {
+      if (q->op != TCCIR_OP_ASSIGN) return 0;
+      IROperand d = tcc_ir_op_get_dest(ir, q);
+      if (!irop_has_vreg(d) || irop_get_vreg(d) != partner_vreg) return 0;
+      IROperand s = tcc_ir_op_get_src1(ir, q);
+      if (!irop_has_vreg(s) || irop_get_vreg(s) != cur_vreg) return 0;
+      if (found_back_copy) return 0;
+      found_back_copy = 1;
+      continue;
+    }
+
+    if (irop_config[q->op].has_dest) {
+      int dest_is_use = (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
+                         q->op == TCCIR_OP_STORE_POSTINC);
+      if (dest_is_use) {
+        IROperand d = tcc_ir_op_get_dest(ir, q);
+        if (irop_has_vreg(d) && irop_get_vreg(d) == partner_vreg)
+          return 0;
+      } else {
+        IROperand d = tcc_ir_op_get_dest(ir, q);
+        if (irop_has_vreg(d) && irop_get_vreg(d) == partner_vreg) {
+          if (q->op != TCCIR_OP_ASSIGN) return 0;
+          IROperand s = tcc_ir_op_get_src1(ir, q);
+          if (!irop_has_vreg(s) || irop_get_vreg(s) != cur_vreg) return 0;
+          if (found_back_copy) return 0;
+          found_back_copy = 1;
+        }
+      }
+    }
+  }
+  return found_back_copy;
+}
+
+static void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
                            const RegAllocTarget *target, int spill_base,
                            uint64_t *out_dirty_int, uint64_t *out_dirty_fp,
                            int max_vreg_pos)
@@ -1156,6 +1510,68 @@ static void ra_linear_scan(SSAInterval *intervals, int count,
           }
         }
       }
+      if (r0 < 0 && cur->crosses_call && cur->reg_type == LS_REG_TYPE_LLONG) {
+        /* Fallback: any two callee-saved registers (need not be an aligned
+         * pair).  Thumb-2 LDRD/STRD accept any two distinct r0..r12/r14
+         * (try_ldrd_pair / try_strd_pair in arm-thumb-gen.c only enforce
+         * lo != hi and Rn != SP/PC).  Other 64-bit ops (cmp+sbcs, adds+adcs,
+         * load/store as two 32-bit halves) likewise have no pair-alignment
+         * requirement.  Without this fallback, a call-crossing 64-bit value
+         * spills whenever the small set of aligned callee-saved pairs is
+         * busy — e.g. when R7 is excluded as Thumb FP, R4:R5/R6:R7/R8:R9/
+         * R10:R11 quickly collide with the loop IV, array base, and another
+         * live 64-bit value.
+         *
+         * If two free callee-saved are not immediately available, evict up to
+         * two single-INT victims (lowest-use, end > cur->end, currently in a
+         * callee-saved reg) to free the pair.  Mirrors the eviction policy
+         * used for single-INT spill below, just iterated to fill both slots.
+         * Bail out if a candidate victim has use_count >= cur->use_count to
+         * avoid spilling a hotter interval.
+         *
+         * Restricted to LS_REG_TYPE_LLONG to avoid evicting INT base pointers
+         * for soft-double / complex-float pairs, where the cost/benefit shifts
+         * (softfloat helpers reload args anyway, and complex temporaries are
+         * often short-lived).  Enabling it for those types regressed
+         * gcc-execute/20021120-1::foo by 200+ insns in benchmarks. */
+        for (int round = 0; r0 < 0 && round < 3; round++) {
+          int first = -1;
+          for (int ci = 0; ci < target->int_class.num_callee_saved; ci++) {
+            int r = target->int_class.callee_saved[ci];
+            if (int_free & (1ull << r)) {
+              if (first < 0) first = r;
+              else { r0 = first; r1 = r; break; }
+            }
+          }
+          if (r0 >= 0) break;
+          SSAInterval *victim = NULL;
+          int victim_idx = -1;
+          uint16_t victim_uses = UINT16_MAX;
+          for (int j = 0; j < active_count; j++) {
+            SSAInterval *a = active[j];
+            if (a->precolored >= 0) continue;
+            if (a->reg_type != LS_REG_TYPE_INT) continue;
+            if (a->end <= cur->end) continue;
+            if (a->r0 < 0 || a->stack_location != 0) continue;
+            int is_callee = 0;
+            for (int ci = 0; ci < target->int_class.num_callee_saved; ci++) {
+              if (target->int_class.callee_saved[ci] == a->r0) { is_callee = 1; break; }
+            }
+            if (!is_callee) continue;
+            if (a->use_count < victim_uses) {
+              victim_uses = a->use_count;
+              victim = a;
+              victim_idx = j;
+            }
+          }
+          if (!victim || victim_uses >= cur->use_count) break;
+          int_free |= (1ull << victim->r0);
+          spill_loc -= 4;
+          victim->stack_location = spill_loc;
+          victim->r0 = -1;
+          active[victim_idx] = active[--active_count];
+        }
+      }
       if (r0 >= 0) {
         int_free &= ~((1ull << r0) | (1ull << r1));
         dirty_int |= ((1ull << r0) | (1ull << r1));
@@ -1237,6 +1653,62 @@ static void ra_linear_scan(SSAInterval *intervals, int count,
       }
     }
 
+    /* Loop-carried phi coalescing.
+     *
+     * The standard boundary case above fires when partner expires exactly
+     * at cur->start.  A loop-carried phi (sum_array's `sum + arr[i]`,
+     * for example) extends the partner's live interval to the back-edge
+     * JMP — past cur's def — so partner's register looks taken at the
+     * point we want to coalesce.  If cur's defining instruction reads
+     * partner and the only remaining use of partner before partner->end
+     * is an ASSIGN `partner <-- cur` (the back-edge copy), the two share
+     * a value from cur->start onward and can share the register.
+     *
+     * Transfer ownership of R from partner to cur in the active set:
+     * extend cur->end to cover partner->end, remove partner from active,
+     * and let cur represent R there.  Both vregs keep r0 = R so codegen
+     * resolves either name to the same register, and the back-edge
+     * ASSIGN becomes mov R, R which post-RA cleanup elides.  Without
+     * this transfer R would be double-counted and the expire phase would
+     * free it as soon as partner's original end lapses while cur is still
+     * alive in R. */
+    int coalesced_loop_phi = 0;
+    if (reg < 0 && cur->hint_vreg >= 0 && max_vreg_pos > 0 &&
+        cur->reg_type == LS_REG_TYPE_INT && tcc_state->optimize >= 1) {
+      int hint_idx = HINT_IDX(cur->hint_vreg);
+      if (hint_idx >= 0 && hint_idx < hint_tbl_size) {
+        SSAInterval *partner = vreg_to_iv[hint_idx];
+        if (partner && partner->r0 >= 0 && partner->r1 < 0 &&
+            partner->stack_location == 0 &&
+            partner->reg_type == LS_REG_TYPE_INT &&
+            (int)partner->end > (int)cur->start) {
+          int hr = partner->r0;
+          int partner_active_idx = -1;
+          for (int k = 0; k < active_count; k++) {
+            if (active[k] == partner) { partner_active_idx = k; break; }
+          }
+          if (partner_active_idx >= 0 && !(int_free & (1ull << hr)) &&
+              hr < tcc_state->registers_for_allocator) {
+            int ok = 1;
+            if (cur->crosses_call) {
+              ok = 0;
+              for (int ci = 0; ci < target->int_class.num_callee_saved; ci++) {
+                if (target->int_class.callee_saved[ci] == hr) { ok = 1; break; }
+              }
+            }
+            if (ok && ra_safe_loop_phi_coalesce(ir, cur, partner)) {
+              reg = hr;
+              coalesced_loop_phi = 1;
+              if (partner->end > cur->end)
+                cur->end = partner->end;
+              cur->r0 = reg;
+              active[partner_active_idx] = active[--active_count];
+            }
+          }
+        }
+      }
+    }
+
     /* Soft preference: try iv->pref_reg first (e.g., r0 for vregs that
      * feed RETURNVALUE).  If free, take it.  If a still-active interval
      * ends exactly at cur->start and holds that register, evict it and
@@ -1289,7 +1761,13 @@ static void ra_linear_scan(SSAInterval *intervals, int count,
       }
     }
 
-    if (reg >= 0) {
+    if (coalesced_loop_phi) {
+      /* Partner was removed from active above; transfer R's ownership
+       * to cur. int_free stays unchanged (R was taken via partner,
+       * now taken via cur). */
+      dirty_int |= (1ull << reg);
+      active[active_count++] = cur;
+    } else if (reg >= 0) {
       int_free &= ~(1ull << reg);
       dirty_int |= (1ull << reg);
       cur->r0 = reg;
@@ -2230,6 +2708,10 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
         ssa_opt_gvn(&ssa_opt_ctx);
         ssa_opt_phi_simplify(&ssa_opt_ctx);
         ssa_opt_dce(&ssa_opt_ctx);
+        /* Target-specific fusions (MLA, LOAD/STORE_INDEXED on ARM). These
+         * don't need promotable vars or phi nodes — they pattern-match on
+         * existing TEMP vregs. */
+        tcc_ir_ssa_opt_run_target(&ssa_opt_ctx);
       }
     } else {
       ssa_opt_cprop(&ssa_opt_ctx);
@@ -2349,10 +2831,11 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
    * the explicit copies emitted at predecessor block ends. */
   ra_build_phi_hints(intervals, interval_count, ssa, cfg, max_vreg_pos);
   ra_build_assign_hints(intervals, interval_count, ir, max_vreg_pos);
+  ra_build_outgoing_param_hints(intervals, interval_count, ir, max_vreg_pos);
 
   /* Run linear scan */
   uint64_t dirty_int = 0, dirty_fp = 0;
-  ra_linear_scan(intervals, interval_count, target, spill_base, &dirty_int, &dirty_fp, max_vreg_pos);
+  ra_linear_scan(ir, intervals, interval_count, target, spill_base, &dirty_int, &dirty_fp, max_vreg_pos);
 
   /* Write results to IR + LS state */
   ra_write_results(ir, intervals, interval_count);
@@ -2402,12 +2885,52 @@ int tcc_ir_move_coalescing(TCCIRState *ir)
   for (int i = 0; i < n; ++i)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op != TCCIR_OP_ASSIGN)
+    /* LOAD with a VREG source where the underlying interval ended up in a
+     * register (no spill) is a register copy at codegen — treat like ASSIGN
+     * for coalescing.  Catches inlined "temp = var" patterns the IR
+     * generator emits as LOAD even when no memory access is involved.
+     * Accept is_lval=1 for local VAR reads as long as the VAR is reg-only;
+     * skip is_llocal (true memory load via pointer) and is_sym (global). */
+    /* LOAD from a vreg whose interval ended up in a register (no spill)
+     * is a register copy at codegen — treat like ASSIGN for coalescing.
+     * Catches inlined "temp = var" patterns where the IR generator emits
+     * LOAD with VREG/STACKOFF source even though no memory access happens.
+     * Skip is_llocal (double-indirection via pointer) and is_sym (global).
+     * Skip sub-word btypes: those LOADs emit UXTB/SXTB/UXTH/SXTH alongside
+     * the mov to truncate; coalescing them away would skip the narrowing
+     * and yield wrong values (see pr69447, fp-cmp-8 sub-word args). */
+    int is_copy_load = 0;
+    if (q->op == TCCIR_OP_LOAD) {
+      IROperand ts = tcc_ir_op_get_src1(ir, q);
+      int valid_tag = (ts.tag == IROP_TAG_VREG ||
+                       (ts.tag == IROP_TAG_STACKOFF && ts.is_local));
+      int dest_bt = irop_get_btype(tcc_ir_op_get_dest(ir, q));
+      int src_bt = irop_get_btype(ts);
+      int width_safe = (dest_bt == src_bt) &&
+                       (dest_bt == IROP_BTYPE_INT32 ||
+                        dest_bt == IROP_BTYPE_INT64 ||
+                        dest_bt == IROP_BTYPE_FUNC);
+      if (width_safe && valid_tag && !ts.is_llocal && !ts.is_sym) {
+        int32_t tsv = irop_get_vreg(ts);
+        if (tsv >= 0 && tcc_ir_vreg_is_valid(ir, tsv)) {
+          for (int j = 0; j < ls->next_interval_index; ++j) {
+            if (ls->intervals[j].vreg == (uint32_t)tsv) {
+              if (ls->intervals[j].r0 >= 0 && ls->intervals[j].stack_location == 0)
+                is_copy_load = 1;
+              break;
+            }
+          }
+        }
+      }
+    }
+    if (q->op != TCCIR_OP_ASSIGN && !is_copy_load)
       continue;
 
     const IROperand src1 = tcc_ir_op_get_src1(ir, q);
     const IROperand dest = tcc_ir_op_get_dest(ir, q);
-    if (src1.is_lval || dest.is_lval) continue;
+    /* For is_copy_load (LOAD from in-register VAR) the src has is_lval=1
+     * but it behaves as a register copy — don't skip it on that basis. */
+    if ((src1.is_lval && !is_copy_load) || dest.is_lval) continue;
     int32_t sv = irop_get_vreg(src1);
     if (sv < 0 || !tcc_ir_vreg_is_valid(ir, sv))
       continue;
@@ -2437,8 +2960,36 @@ int tcc_ir_move_coalescing(TCCIRState *ir)
       int conflict = 0;
       for (int k = i + 1; k <= (int)dst_iv->end && k < tbl_size; ++k)
       {
-        if (ls->live_regs_by_instruction[k] & (1u << src_reg))
-        { conflict = 1; break; }
+        if (ls->live_regs_by_instruction[k] & (1u << src_reg)) {
+          /* Two-address relaxation: at k == dst.end the dst's last use is
+           * an instruction that consumes dst and writes a fresh result.
+           * If that result lands in src_reg (some interval starts at k in
+           * src_reg) AND the same instruction reads dst, sharing src_reg
+           * is safe — ARM ops read all sources before writing dest, so
+           * `OP src_reg, ..., src_reg` is a valid two-operand form. */
+          int safe = 0;
+          if (k == (int)dst_iv->end) {
+            IRQuadCompact *kq = &ir->compact_instructions[k];
+            int reads_dst = 0;
+            if (irop_config[kq->op].has_src1 &&
+                irop_get_vreg(tcc_ir_op_get_src1(ir, kq)) == dv)
+              reads_dst = 1;
+            if (!reads_dst && irop_config[kq->op].has_src2 &&
+                irop_get_vreg(tcc_ir_op_get_src2(ir, kq)) == dv)
+              reads_dst = 1;
+            if (reads_dst) {
+              for (int j2 = 0; j2 < ls->next_interval_index; j2++) {
+                LSLiveInterval *xi = &ls->intervals[j2];
+                if (xi->r0 == src_reg && xi->stack_location == 0 &&
+                    xi->start == (uint32_t)k) {
+                  safe = 1;
+                  break;
+                }
+              }
+            }
+          }
+          if (!safe) { conflict = 1; break; }
+        }
       }
       if (!conflict) {
         for (int k = (int)dst_iv->start; k < i && k < tbl_size; ++k)

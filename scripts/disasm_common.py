@@ -271,7 +271,7 @@ class DisasmCache:
                     suite_stats[suite]["overwritten"] += 1
             elif status == "improved":
                 delta = (old_tcc - tcc_count) if old_tcc is not None else 0
-                improvements.append((key, tcc_count))
+                improvements.append((key, old_tcc, tcc_count))
                 if suite:
                     suite_stats[suite]["improved"] += 1
                     suite_stats[suite]["improved_delta"] += delta
@@ -308,8 +308,9 @@ class DisasmCache:
 
         if report["improvements"]:
             eprint(f"\n  IMPROVEMENTS ({len(report['improvements'])} functions):")
-            for key, tcc_count in report["improvements"]:
-                eprint(f"    [+] {key}: -> {tcc_count}")
+            for key, old_tcc, tcc_count in report["improvements"]:
+                delta = (old_tcc - tcc_count) if old_tcc is not None else 0
+                eprint(f"    [+] {key}: {old_tcc} -> {tcc_count} (-{delta})")
 
         total_changes = (len(report["regressions"]) + len(report["improvements"])
                          + len(report.get("overwritten", [])))

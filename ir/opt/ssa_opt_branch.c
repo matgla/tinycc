@@ -163,17 +163,32 @@ static int ssa_fold_cmp_jumpif(IRSSAOptCtx *ctx, int cmp_idx)
               break;
             if (kq->op == TCCIR_OP_STORE_INDEXED || kq->op == TCCIR_OP_STORE_POSTINC)
               break;  /* may alias VAR through pointer arithmetic */
-            /* Any op that defines this VAR.  STORE/STORE_INDEXED dests
-             * always have is_lval=1 — non-lval VAR dest signals direct
-             * write to the var slot; lval dest is a write through *V. */
+            /* Any op that defines this VAR.  Distinguish *direct slot
+             * writes* (which we can mine for an immediate value) from
+             * *pointer-deref through V* (`STORE V_DEREF <-- val`) — the
+             * latter writes to V's pointee, not V's slot, and must not
+             * be treated as a def of V's value.
+             *
+             * Discriminator: a slot write has kd.is_local=1 (the dest
+             * carries the VT_LOCAL svalue encoding); a pointer-deref
+             * inherited its flags from a TEMP that had is_local=0, so
+             * kd.is_local=0 for the deref case (introduced by
+             * cprop_copy_var_stackoff). */
             if (irop_config[kq->op].has_dest) {
               IROperand kd = tcc_ir_op_get_dest(ir, kq);
               int32_t kdv = irop_get_vreg(kd);
               if (kdv >= 0 &&
                   TCCIR_DECODE_VREG_TYPE(kdv) == TCCIR_VREG_TYPE_VAR &&
                   TCCIR_DECODE_VREG_POSITION(kdv) == var_pos) {
-                /* Found the most recent def of this VAR.  Try to extract
-                 * an immediate value. */
+                /* For STORE with a pointer-deref dest (is_local=0,
+                 * is_lval=1), do not stop — this writes through V's
+                 * value, not V's slot, so V's content is unchanged.
+                 * The scan must continue past it to find an actual slot
+                 * def (or hit a barrier). */
+                if (kq->op == TCCIR_OP_STORE && kd.is_lval && !kd.is_local)
+                  continue;
+                /* Found the most recent slot def of this VAR.  Try to
+                 * extract an immediate value. */
                 if (kq->op == TCCIR_OP_ASSIGN || kq->op == TCCIR_OP_STORE) {
                   IROperand ks = tcc_ir_op_get_src1(ir, kq);
                   if (irop_is_immediate(ks) && !ks.is_lval) {

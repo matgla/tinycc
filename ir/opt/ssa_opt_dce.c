@@ -36,8 +36,20 @@ static int dce_temp_worklist(IRSSAOptCtx *ctx)
     IRQuadCompact *q = &ctx->ir->compact_instructions[def];
     if (q->op == TCCIR_OP_NOP)
       continue;
-    if (ssa_opt_has_side_effects(q->op))
-      continue;
+    if (ssa_opt_has_side_effects(q->op)) {
+      /* STORE with non-lval VREG dest is the IR's value-def encoding
+       * (`T = expr`, e.g. address materialisation `T = Addr[StackLoc[N]]`).
+       * It writes only to the dest vreg, no memory or other side effect,
+       * so a dead TEMP defined this way is safe to NOP. */
+      int killable = 0;
+      if (q->op == TCCIR_OP_STORE) {
+        IROperand d = tcc_ir_op_get_dest(ctx->ir, q);
+        if (!d.is_lval)
+          killable = 1;
+      }
+      if (!killable)
+        continue;
+    }
 
     int32_t op_vregs[4] = { -1, -1, -1, -1 };
     int nops = 0;
@@ -215,13 +227,25 @@ static int dce_dead_var_stores(IRSSAOptCtx *ctx)
       }
     }
 
-    /* STORE dest: for ptr stores, the dest TEMP is a use (address) */
+    /* STORE dest: for ptr stores, the dest TEMP is a use (address).
+     * When the dest is a VAR vreg with is_lval=1 AND is_local=0, V's *value*
+     * (a pointer) is read as the destination address — that's a value use of
+     * V, not a write to V's slot.  Without marking V as used, pass 2 below
+     * would NOP this STORE, dropping the write to the pointee memory.
+     *
+     * The is_local=0 check excludes plain VAR-slot stores `V <-- val [STORE]`
+     * where the operand encodes V's stack slot (is_local=1, is_lval=1).  In
+     * that pattern V is the storage, not a pointer, so the STORE writes
+     * directly to V's slot — V is *not* used as a value here, and a dead V
+     * is safe to eliminate. */
     if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED) {
       IROperand d = tcc_ir_op_get_dest(ir, q);
       int32_t dvr = irop_get_vreg(d);
       if (dvr >= 0 && TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_VAR &&
-          d.is_lval) {
-        /* Pointer store through a VAR (rare, but possible) */
+          d.is_lval && !d.is_local) {
+        int pos = TCCIR_DECODE_VREG_POSITION(dvr);
+        if (pos < num_vars)
+          var_used[pos / 8] |= (1 << (pos % 8));
       }
     }
 
@@ -757,9 +781,13 @@ int ssa_opt_dce(IRSSAOptCtx *ctx)
         }
         if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
             q->op == TCCIR_OP_STORE_POSTINC) {
-          IRSSAVregInfo *vi = ssa_opt_vinfo(ctx,
-              irop_get_vreg(tcc_ir_op_get_dest(ctx->ir, q)));
-          if (vi) vi->use_count++;
+          IROperand d = tcc_ir_op_get_dest(ctx->ir, q);
+          /* STORE with non-lval VREG dest is a value def, not a memory
+           * write — dest is not a use.  See ssa_opt_scan_instr_uses. */
+          if (q->op != TCCIR_OP_STORE || d.is_lval) {
+            IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, irop_get_vreg(d));
+            if (vi) vi->use_count++;
+          }
         }
         if (q->op == TCCIR_OP_MLA) {
           IRSSAVregInfo *vi = ssa_opt_vinfo(ctx,

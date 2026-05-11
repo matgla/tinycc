@@ -109,6 +109,17 @@ int tcc_ir_opt_return(struct TCCIRState *ir);
 /* Store-Load Forwarding */
 int tcc_ir_opt_sl_forward(struct TCCIRState *ir);
 
+/* Param-Addrof Constant-Store Fold - collapse the spill/addr/store/reload
+ * sequence produced by `f(int v){ helper(&v); return v; }` after helper
+ * inlining writes a known constant through &v. */
+int tcc_ir_opt_param_addrof_const_fold(struct TCCIRState *ir);
+
+/* Local-Addrof Constant-Store Fold - analogue of the param version but for
+ * local variables: collapses `V = c0; helper(&V); use(V)` where helper
+ * inlines into a constant STORE through &V, replacing reads of V with the
+ * stored constant. */
+int tcc_ir_opt_local_addrof_const_fold(struct TCCIRState *ir);
+
 /* Constant VAR Propagation - propagate constant VARs exposed by store-load forwarding */
 int tcc_ir_opt_const_var_prop(struct TCCIRState *ir);
 
@@ -116,6 +127,44 @@ int tcc_ir_opt_const_var_prop(struct TCCIRState *ir);
  * whose initializer is known and has not been written with ASSIGN of the
  * constant value. */
 int tcc_ir_opt_global_init_prop(struct TCCIRState *ir);
+
+/* Complex Constant Param Folding - pack a _Complex float local that is
+ * initialized to constants and only used as one FUNCPARAMVAL into a packed
+ * 64-bit complex immediate, eliminating the stack round-trip at the call. */
+int tcc_ir_opt_complex_const_param_fold(struct TCCIRState *ir);
+
+/* Dead Call Result Elimination - convert FUNCCALLVAL → FUNCCALLVOID when
+ * the call's destination TEMP has no remaining reads.  Skips the
+ * post-call moves the codegen would otherwise emit. */
+int tcc_ir_opt_dead_call_result_elim(struct TCCIRState *ir);
+
+/* Pure-via-sret analysis - infer whether the current function's only
+ * observable side effect is writes through its sret-pointer parameter.
+ * Sets sym->f.func_pure_via_sret on success so subsequent callers can
+ * apply dead-sret-call elimination at their call sites. */
+void tcc_ir_analyze_pure_via_sret(struct TCCIRState *ir, struct Sym *func_sym);
+
+/* Function write summary - per-pointer-parameter must-write byte map.
+ * Computed at end-of-IR-opts (before codegen), stored in a TU-scoped
+ * side table keyed by Sym*.  Consulted by tcc_ir_opt_dead_init_via_call. */
+void tcc_ir_compute_func_write_summary(struct TCCIRState *ir, struct Sym *func_sym);
+void tcc_ir_func_write_summary_clear_all(void);
+
+/* Dead Init Via Call - kill stack-slot stores whose bytes are fully
+ * overwritten by a subsequent CALL whose callee summary covers them. */
+int tcc_ir_opt_dead_init_via_call(struct TCCIRState *ir);
+
+/* Dead Sret Call Elimination - remove FUNCCALLVOID (or FUNCCALLVAL with
+ * unused result) when the callee is func_pure_via_sret and its sret
+ * target (PARAM0 = Addr[StackLoc[X]]) is a local that is never read
+ * after the call.  Also nops the call's preceding FUNCPARAM ops. */
+int tcc_ir_opt_dead_sret_call_elim(struct TCCIRState *ir);
+
+/* Fold CALL → TEMP_LOCAL + LOAD T = TEMP_LOCAL + STORE *V = T into
+ * CALL → *V directly.  Eliminates the spill-reload round-trip when a
+ * call's return value is immediately stored through a pointer
+ * (typical pattern for complex/struct sret returns). */
+int tcc_ir_opt_fold_call_result_store(struct TCCIRState *ir);
 
 /* Redundant Store Elimination */
 int tcc_ir_opt_store_redundant(struct TCCIRState *ir);
@@ -205,6 +254,11 @@ int tcc_ir_opt_block_copy_init(struct TCCIRState *ir);
 
 /* Post-Increment Assign Folding - fold T=V[lval]; V=T OP x into V=V OP x */
 int tcc_ir_opt_postinc_assign_fold(struct TCCIRState *ir);
+
+/* RETURNVALUE merge - convert duplicate RETURNVALUE #imm into JUMP-to-first
+ * so the codegen emits one `mov r0, imm; b epilogue` and N-1 single branches
+ * instead of N copies of the 2-instruction sequence. */
+int tcc_ir_opt_returnvalue_merge(struct TCCIRState *ir);
 
 /* Conditional Select - replace if/else diamond with SELECT (ITE on ARM) */
 int tcc_ir_opt_select(struct TCCIRState *ir);

@@ -149,11 +149,120 @@ static int reassoc_binary(IRSSAOptCtx *ctx, int idx)
 }
 
 /* ============================================================================
+ * reassoc_add_cancel_const: (x + c) + (x - c) → x + x
+ *
+ * Pattern: outer ADD whose two operands are single-use TEMPs defined by
+ * ADD(a, c) and SUB(a, c) respectively, where a is the same vreg and c
+ * is the same immediate.  Rewrite as `a + a` (the backend can emit a
+ * single ADD or LSL #1 depending on register/encoding).
+ *
+ * Also handles the symmetric (a + c) + (a + (-c)) and SUB/ADD orderings.
+ *
+ * Constraints: inner defs are single-use (only this outer ADD reads them),
+ * so we can let DCE clean them up afterwards.
+ * ============================================================================ */
+static int reassoc_add_cancel_const(IRSSAOptCtx *ctx, int idx)
+{
+  TCCIRState *ir = ctx->ir;
+  IRQuadCompact *q = &ir->compact_instructions[idx];
+  if (q->op != TCCIR_OP_ADD)
+    return 0;
+
+  IROperand os1 = tcc_ir_op_get_src1(ir, q);
+  IROperand os2 = tcc_ir_op_get_src2(ir, q);
+  if (os1.tag != IROP_TAG_VREG || os2.tag != IROP_TAG_VREG)
+    return 0;
+  if (os1.is_lval || os2.is_lval)
+    return 0;
+
+  int32_t v1 = irop_get_vreg(os1);
+  int32_t v2 = irop_get_vreg(os2);
+  if (v1 < 0 || v2 < 0)
+    return 0;
+  if (TCCIR_DECODE_VREG_TYPE(v1) != TCCIR_VREG_TYPE_TEMP ||
+      TCCIR_DECODE_VREG_TYPE(v2) != TCCIR_VREG_TYPE_TEMP)
+    return 0;
+
+  IRSSAVregInfo *vi1 = ssa_opt_vinfo(ctx, v1);
+  IRSSAVregInfo *vi2 = ssa_opt_vinfo(ctx, v2);
+  if (!vi1 || !vi2 || vi1->def_count != 1 || vi2->def_count != 1)
+    return 0;
+  if (vi1->use_count != 1 || vi2->use_count != 1)
+    return 0;
+
+  IRQuadCompact *d1 = &ir->compact_instructions[vi1->def_instr];
+  IRQuadCompact *d2 = &ir->compact_instructions[vi2->def_instr];
+
+  /* Match (a OP1 c) and (a OP2 c) where OP1/OP2 are {ADD, SUB} and the
+   * constants cancel (same value with opposite signs in the combined sum). */
+  if ((d1->op != TCCIR_OP_ADD && d1->op != TCCIR_OP_SUB) ||
+      (d2->op != TCCIR_OP_ADD && d2->op != TCCIR_OP_SUB))
+    return 0;
+
+  IROperand d1s1 = tcc_ir_op_get_src1(ir, d1);
+  IROperand d1s2 = tcc_ir_op_get_src2(ir, d1);
+  IROperand d2s1 = tcc_ir_op_get_src1(ir, d2);
+  IROperand d2s2 = tcc_ir_op_get_src2(ir, d2);
+
+  if (d1s1.tag != IROP_TAG_VREG || d2s1.tag != IROP_TAG_VREG)
+    return 0;
+  if (d1s1.is_lval || d2s1.is_lval)
+    return 0;
+  if (!irop_is_immediate(d1s2) || !irop_is_immediate(d2s2))
+    return 0;
+
+  int32_t a1 = irop_get_vreg(d1s1);
+  int32_t a2 = irop_get_vreg(d2s1);
+  if (a1 != a2)
+    return 0;
+
+  int32_t c1 = irop_get_imm32(d1s2);
+  int32_t c2 = irop_get_imm32(d2s2);
+  int sign1 = (d1->op == TCCIR_OP_ADD) ? 1 : -1;
+  int sign2 = (d2->op == TCCIR_OP_ADD) ? 1 : -1;
+  /* The constants cancel when c1*sign1 + c2*sign2 == 0. */
+  if ((int64_t)c1 * sign1 + (int64_t)c2 * sign2 != 0)
+    return 0;
+
+  /* Type of the outer dest must match the inner sources so we don't
+   * accidentally change semantics through implicit narrowing. */
+  int outer_btype = irop_get_btype(tcc_ir_op_get_dest(ir, q));
+  if (irop_get_btype(d1s1) != outer_btype)
+    return 0;
+
+  /* Rewrite outer as a + a. */
+  IROperand a_op = irop_make_vreg(a1, outer_btype);
+  tcc_ir_op_set_src1(ir, q, a_op);
+  tcc_ir_op_set_src2(ir, q, a_op);
+
+  /* Remove the old uses of v1, v2 from the outer ADD. */
+  ssa_opt_remove_use_instr(vi1, idx);
+  ssa_opt_remove_use_instr(vi2, idx);
+
+  /* Add two uses of `a` at the outer ADD. */
+  IRSSAVregInfo *avi = ssa_opt_vinfo(ctx, a1);
+  if (avi) {
+    ssa_opt_add_use_instr(avi, idx);
+    ssa_opt_add_use_instr(avi, idx);
+  }
+
+  return 1;
+}
+
+/* ============================================================================
  * Generator Table
  * ============================================================================ */
 
+static int reassoc_add_dispatch(IRSSAOptCtx *ctx, int idx)
+{
+  int r = reassoc_add_cancel_const(ctx, idx);
+  if (r)
+    return r;
+  return reassoc_binary(ctx, idx);
+}
+
 static const IRSSAOptGen reassoc_gens[] = {
-  { TCCIR_OP_ADD, reassoc_binary, "reassoc_add" },
+  { TCCIR_OP_ADD, reassoc_add_dispatch, "reassoc_add" },
   { TCCIR_OP_SUB, reassoc_binary, "reassoc_sub" },
   { TCCIR_OP_MUL, reassoc_binary, "reassoc_mul" },
   { TCCIR_OP_AND, reassoc_binary, "reassoc_and" },

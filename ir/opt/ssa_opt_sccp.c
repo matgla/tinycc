@@ -413,14 +413,21 @@ static int sccp_resolve_var(SCCPState *s, int32_t var_vreg, int instr_idx,
     }
 
     /* Direct STORE to VAR: Vn <-- Tx [STORE] where dest is a VAR vreg.
-     * STORE dests always have is_lval=1; distinguish from pointer-deref
-     * stores by checking the vreg type (VAR vs TEMP). */
+     * STORE dests always have is_lval=1.  The VAR-vreg-type check alone
+     * isn't enough to identify a slot write: cprop may rewrite a STORE
+     * `T_DEREF <-- val` into `V_DEREF <-- val` when T was a copy of V
+     * (cprop_copy_var_stackoff), which is a *pointer-deref through V's
+     * value*, not a write to V's slot.  Require `dest.is_local=1` to
+     * gate this branch — direct VAR-slot writes carry the is_local flag
+     * inherited from the VT_LOCAL svalue, while pointer-deref dests
+     * carry is_local=0 (they originated from a TEMP). */
     if (q->op == TCCIR_OP_STORE) {
       IROperand dest = tcc_ir_op_get_dest(ir, q);
       int32_t dv = irop_get_vreg(dest);
       if (dv >= 0 &&
           TCCIR_DECODE_VREG_TYPE(dv) == TCCIR_VREG_TYPE_VAR &&
-          TCCIR_DECODE_VREG_POSITION(dv) == var_pos) {
+          TCCIR_DECODE_VREG_POSITION(dv) == var_pos &&
+          dest.is_local) {
         return sccp_get_store_src_value_ex(s, tcc_ir_op_get_src1(ir, q), i,
                                            out, dep_src_pos);
       }
@@ -510,7 +517,14 @@ static int sccp_get_operand_value_ex(SCCPState *s, IROperand op,
   }
 
   /* TEMP-DEREF operand: *T where T resolves to &StackLoc[N].  Forward to
-   * stack-store scan at the resolved offset. */
+   * stack-store scan at the resolved offset.
+   *
+   * VAR-DEREF (*V) is NOT a slot read of V — it dereferences V's value
+   * (a pointer) and reads pointed-to memory.  Without alias info we
+   * can't resolve it, so return BOTTOM rather than falling through to
+   * sccp_resolve_var below (which would wrongly return V's slot value
+   * as if it were *V).  Pattern appears after cprop_copy_var_stackoff
+   * forwards a VAR into a deref-operand use site. */
   if (op.tag == IROP_TAG_VREG && op.is_lval && !op.is_local) {
     int32_t tvr = irop_get_vreg(op);
     if (tvr >= 0 && TCCIR_DECODE_VREG_TYPE(tvr) == TCCIR_VREG_TYPE_TEMP) {
@@ -524,6 +538,8 @@ static int sccp_get_operand_value_ex(SCCPState *s, IROperand op,
       }
       return SCCP_BOTTOM;
     }
+    if (tvr >= 0 && TCCIR_DECODE_VREG_TYPE(tvr) == TCCIR_VREG_TYPE_VAR)
+      return SCCP_BOTTOM;
   }
 
   /* Direct StackLoc-lval operand: load from stack slot. */
@@ -1111,6 +1127,38 @@ static int sccp_apply(SCCPState *s)
               if (kd.tag == IROP_TAG_STACKOFF && kd.is_local && kd.is_lval)
                 continue;
               break;
+            }
+          }
+          /* If the VAR is still read elsewhere AND the constant requires
+           * a pool load, don't substitute — keep the VAR alive so a single
+           * load satisfies both this CMP and the other use(s).  Mirrors
+           * the guard in tcc_ir_opt_const_prop (pre-SSA).  SSA info isn't
+           * reliable for pre-SSA-tracked VARs at this point, so count uses
+           * via a direct IR scan. */
+          if (got) {
+            uint32_t uv = (uint32_t)val;
+            int needs_pool = (uv > 0xFFFFu && uv < 0xFFFF0001u);
+            if (needs_pool) {
+              int other_uses = 0;
+              int n2 = ir->next_instruction_index;
+              for (int u = 0; u < n2 && other_uses < 2; u++) {
+                if (u == i) continue;
+                IRQuadCompact *uq = &ir->compact_instructions[u];
+                if (uq->op == TCCIR_OP_NOP) continue;
+                for (int oi = 0; oi < 2; oi++) {
+                  if (oi == 0 && !irop_config[uq->op].has_src1) continue;
+                  if (oi == 1 && !irop_config[uq->op].has_src2) continue;
+                  IROperand op = oi == 0 ? tcc_ir_op_get_src1(ir, uq)
+                                         : tcc_ir_op_get_src2(ir, uq);
+                  if (irop_get_vreg(op) == svr &&
+                      !(op.is_local && !op.is_lval)) {
+                    other_uses++;
+                    break;
+                  }
+                }
+              }
+              if (other_uses > 0)
+                got = 0;
             }
           }
         }

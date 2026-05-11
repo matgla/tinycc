@@ -303,6 +303,13 @@ typedef struct SpillCacheEntry
 typedef struct SpillCache
 {
   SpillCacheEntry entries[SPILL_CACHE_SIZE];
+  /* Tracks the most recently emitted spill helper to elide a redundant
+   * LDR that immediately follows a STR (or LDR) to/from the same slot.
+   * Only valid when ind == last_emit_ind (no intervening emission). */
+  int last_emit_ind;
+  int8_t last_emit_kind; /* 0=none, 1=STR, 2=LDR */
+  int8_t last_emit_reg;
+  int32_t last_emit_offset;
 } SpillCache;
 
 typedef enum TCCStackSlotKind

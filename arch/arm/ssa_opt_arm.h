@@ -32,6 +32,13 @@ int ssa_gen_arm_fuse_shl_add_to_store_indexed(IRSSAOptCtx *ctx, int instr_idx);
 /* MUL → SHL: strength-reduce power-of-2 multiply to shift */
 int ssa_gen_arm_reduce_mul_to_shift(IRSSAOptCtx *ctx, int instr_idx);
 
+/* ADD(base, #imm) + LOAD → LOAD_INDEXED(base, #imm, scale=0):
+ * fuse base + small constant offset addressing into a single load. */
+int ssa_gen_arm_fuse_load_through_add_imm(IRSSAOptCtx *ctx, int instr_idx);
+
+/* ADD(base, #imm) + STORE → STORE_INDEXED(base, val, #imm, scale=0). */
+int ssa_gen_arm_fuse_store_through_add_imm(IRSSAOptCtx *ctx, int instr_idx);
+
 /* Register ARM generators with the SSA optimization engine */
 void tcc_ir_ssa_opt_arm_register(void);
 

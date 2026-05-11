@@ -87,6 +87,9 @@ void tcc_ir_ssa_opt_init(IRSSAOptCtx *ctx, struct TCCIRState *ir,
 void tcc_ir_ssa_opt_rebuild(IRSSAOptCtx *ctx);
 void tcc_ir_ssa_opt_free(IRSSAOptCtx *ctx);
 int tcc_ir_ssa_opt_run(IRSSAOptCtx *ctx);
+/* Run only the target-specific generators registered via
+ * tcc_ir_ssa_opt_register_target. Iterates a few times for convergence. */
+int tcc_ir_ssa_opt_run_target(IRSSAOptCtx *ctx);
 
 /* Run a generator table over all instructions */
 int ssa_opt_run_gens(IRSSAOptCtx *ctx, const IRSSAOptGen *gens, int count);
@@ -119,6 +122,13 @@ int ssa_opt_branch(IRSSAOptCtx *ctx);
 int ssa_opt_sccp(IRSSAOptCtx *ctx);
 int ssa_opt_load_cse(IRSSAOptCtx *ctx);
 int ssa_opt_var_forward(IRSSAOptCtx *ctx);
+
+/* Forward single-def, single-use, non-address-taken VARs into their lone
+ * FUNCPARAMVAL use site, NOPing the original STORE.  Narrow companion to
+ * ssa_opt_var_forward: only the PARAM-use case (collapses inlined-helper
+ * printf-arg materialisation) and skips deref sources so as not to expose
+ * SCCP stack-load alias issues. */
+int ssa_opt_var_to_param_forward(IRSSAOptCtx *ctx);
 int ssa_opt_var_const_fold(IRSSAOptCtx *ctx);
 int ssa_opt_dead_loop(IRSSAOptCtx *ctx);
 
@@ -131,6 +141,16 @@ void ssa_drop_phi_edge(IRSSAOptCtx *ctx, int dead_pred_block, int target_block_i
  * single-def LEA → ASSIGN copy chains.  Returns the stack offset, or INT_MIN
  * if the chain doesn't resolve to a stack address.  Multi-def TEMPs bail. */
 int ssa_opt_resolve_lea_stackloc(IRSSAOptCtx *ctx, int32_t vr);
+
+/* Resolve a vreg backward to its canonical (base_vr, offset) form.  Chases
+ * single-def ASSIGN copies and `T = base ADD #imm` chains until it lands
+ * on a VAR/PARAM root (or a TEMP whose definition isn't a recognized copy
+ * pattern).  Returns 1 with *out_base / *out_off populated on success; 0
+ * otherwise.  Used by load-CSE to recognize that two TEMP pointers
+ * (T9 = V1, T19 = V1) name the same memory, so reads through them can
+ * share a result. */
+int ssa_opt_resolve_temp_to_base_off(IRSSAOptCtx *ctx, int32_t vr,
+                                      int32_t *out_base, int32_t *out_off);
 
 /* Resolve the effective stack offset that a STORE / STORE_INDEXED / LOAD /
  * LOAD_INDEXED targets, when its base address is a TEMP that resolves to

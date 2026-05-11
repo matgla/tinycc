@@ -164,6 +164,24 @@ static GVNEntry *gvn_alloc_entry(void)
   return e;
 }
 
+/* PARAM mutation bitmap.  A PARAM that is the dest of any STORE/ASSIGN-write
+ * is not safe to use as a GVN hash key — its value changes mid-function.
+ * Built once per function in ssa_opt_gvn().  Indexed by PARAM position. */
+static uint8_t *param_mutated;
+static int param_mutated_cap;
+
+static int gvn_param_is_stable(int32_t vreg)
+{
+  if (vreg < 0)
+    return 0;
+  if (TCCIR_DECODE_VREG_TYPE(vreg) != TCCIR_VREG_TYPE_PARAM)
+    return 0;
+  int pos = TCCIR_DECODE_VREG_POSITION(vreg);
+  if (pos >= param_mutated_cap)
+    return 0;
+  return !(param_mutated[pos / 8] & (1u << (pos % 8)));
+}
+
 static int gvn_process_block(IRSSAOptCtx *ctx, IRCFG *cfg, GVNEntry **table, int b)
 {
   TCCIRState *ir = ctx->ir;
@@ -200,22 +218,34 @@ static int gvn_process_block(IRSSAOptCtx *ctx, IRCFG *cfg, GVNEntry **table, int
     int32_t s1v = irop_get_vreg(src1);
     int32_t s2v = irop_get_vreg(src2);
     if (s1v >= 0) {
-      if (TCCIR_DECODE_VREG_TYPE(s1v) != TCCIR_VREG_TYPE_TEMP)
+      int t = TCCIR_DECODE_VREG_TYPE(s1v);
+      if (t == TCCIR_VREG_TYPE_TEMP) {
+        IRSSAVregInfo *s1vi = ssa_opt_vinfo(ctx, s1v);
+        if (!s1vi || s1vi->def_count > 1)
+          continue;
+        if (s1vi->def_phi_block >= 0)
+          continue;
+      } else if (t == TCCIR_VREG_TYPE_PARAM) {
+        if (!gvn_param_is_stable(s1v))
+          continue;
+      } else {
         continue;
-      IRSSAVregInfo *s1vi = ssa_opt_vinfo(ctx, s1v);
-      if (!s1vi || s1vi->def_count > 1)
-        continue;
-      if (s1vi->def_phi_block >= 0)
-        continue;
+      }
     }
     if (s2v >= 0) {
-      if (TCCIR_DECODE_VREG_TYPE(s2v) != TCCIR_VREG_TYPE_TEMP)
+      int t = TCCIR_DECODE_VREG_TYPE(s2v);
+      if (t == TCCIR_VREG_TYPE_TEMP) {
+        IRSSAVregInfo *s2vi = ssa_opt_vinfo(ctx, s2v);
+        if (!s2vi || s2vi->def_count > 1)
+          continue;
+        if (s2vi->def_phi_block >= 0)
+          continue;
+      } else if (t == TCCIR_VREG_TYPE_PARAM) {
+        if (!gvn_param_is_stable(s2v))
+          continue;
+      } else {
         continue;
-      IRSSAVregInfo *s2vi = ssa_opt_vinfo(ctx, s2v);
-      if (!s2vi || s2vi->def_count > 1)
-        continue;
-      if (s2vi->def_phi_block >= 0)
-        continue;
+      }
     }
 
     /* MLA has a 3rd operand (accumulator) at pool[operand_base+3]. */
@@ -228,13 +258,19 @@ static int gvn_process_block(IRSSAOptCtx *ctx, IRCFG *cfg, GVNEntry **table, int
         continue;
       s3v = irop_get_vreg(accum);
       if (s3v >= 0) {
-        if (TCCIR_DECODE_VREG_TYPE(s3v) != TCCIR_VREG_TYPE_TEMP)
+        int t = TCCIR_DECODE_VREG_TYPE(s3v);
+        if (t == TCCIR_VREG_TYPE_TEMP) {
+          IRSSAVregInfo *s3vi = ssa_opt_vinfo(ctx, s3v);
+          if (!s3vi || s3vi->def_count > 1)
+            continue;
+          if (s3vi->def_phi_block >= 0)
+            continue;
+        } else if (t == TCCIR_VREG_TYPE_PARAM) {
+          if (!gvn_param_is_stable(s3v))
+            continue;
+        } else {
           continue;
-        IRSSAVregInfo *s3vi = ssa_opt_vinfo(ctx, s3v);
-        if (!s3vi || s3vi->def_count > 1)
-          continue;
-        if (s3vi->def_phi_block >= 0)
-          continue;
+        }
       }
     }
 
@@ -316,6 +352,56 @@ static int gvn_process_block(IRSSAOptCtx *ctx, IRCFG *cfg, GVNEntry **table, int
   return changes;
 }
 
+/* Mark a PARAM as mutated.  A PARAM is mutated if any instruction other than
+ * its single function-entry definition writes to it.  Conservatively any
+ * STORE/ASSIGN with a PARAM-typed dest counts.
+ *
+ * Nested functions can mutate the enclosing function's PARAMs through the
+ * static chain — those writes never appear in this function's IR.  When
+ * SET_CHAIN / INIT_CHAIN_SLOT is present, treat all PARAMs as mutated. */
+static void gvn_param_scan(TCCIRState *ir)
+{
+  int np = ir->next_parameter;
+  if (np <= 0) {
+    param_mutated_cap = 0;
+    return;
+  }
+  param_mutated_cap = np;
+  int bytes = (np + 7) / 8;
+  param_mutated = tcc_mallocz(bytes);
+
+  int has_chain = 0;
+  for (int i = 0; i < ir->next_instruction_index; i++) {
+    int op = ir->compact_instructions[i].op;
+    if (op == TCCIR_OP_SET_CHAIN || op == TCCIR_OP_INIT_CHAIN_SLOT) {
+      has_chain = 1;
+      break;
+    }
+  }
+  if (has_chain) {
+    for (int i = 0; i < bytes; i++)
+      param_mutated[i] = 0xFF;
+    return;
+  }
+
+  for (int i = 0; i < ir->next_instruction_index; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    if (!irop_config[q->op].has_dest)
+      continue;
+    IROperand d = tcc_ir_op_get_dest(ir, q);
+    int32_t vr = irop_get_vreg(d);
+    if (vr < 0)
+      continue;
+    if (TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_PARAM)
+      continue;
+    int pos = TCCIR_DECODE_VREG_POSITION(vr);
+    if (pos < np)
+      param_mutated[pos / 8] |= (uint8_t)(1u << (pos % 8));
+  }
+}
+
 int ssa_opt_gvn(IRSSAOptCtx *ctx)
 {
   IRCFG *cfg = ctx->cfg;
@@ -334,12 +420,19 @@ int ssa_opt_gvn(IRSSAOptCtx *ctx)
   pool_cap = n;
   entry_pool = tcc_mallocz(n * sizeof(GVNEntry));
 
+  param_mutated = NULL;
+  param_mutated_cap = 0;
+  gvn_param_scan(ctx->ir);
+
   int changes = gvn_process_block(ctx, cfg, table, 0);
 
   tcc_free(undo_stack);
   undo_stack = NULL;
   tcc_free(entry_pool);
   entry_pool = NULL;
+  tcc_free(param_mutated);
+  param_mutated = NULL;
+  param_mutated_cap = 0;
 
   return changes;
 }

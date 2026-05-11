@@ -1352,6 +1352,34 @@ static ScratchRegAlloc get_scratch_reg_with_save(uint32_t exclude_regs)
       scratch_global_exclude |= (1u << reg);
       return result;
     }
+
+    /* Fallback path: a callee-saved register R4-R11 already pushed by the
+     * prolog AND not live at this instruction can be used as scratch for
+     * free.  The prolog/epilog save/restore makes the clobber invisible to
+     * the caller.  Gated by !dry_run_active so dry-run never sees a value
+     * different from real-run: pushed_registers is only valid after the
+     * prolog has actually run, which is real-run.  R7 (FP) is reserved.
+     * R9 is reserved as GOT base when text_and_data_separation is on. */
+    if (!dry_run_state.active && pushed_registers && reg == PREG_NONE)
+    {
+      uint32_t reserved = (1u << R_FP);
+      if (tcc_state->text_and_data_separation)
+        reserved |= (1u << 9);
+      uint32_t live = 0;
+      if (ir->ls.live_regs_by_instruction && ir->codegen_instruction_idx >= 0 &&
+          ir->codegen_instruction_idx < ir->ls.live_regs_by_instruction_size)
+        live = ir->ls.live_regs_by_instruction[ir->codegen_instruction_idx];
+      uint32_t candidate = pushed_registers & 0x0FF0u & ~exclude_regs & ~live & ~reserved;
+      if (candidate)
+      {
+        int sreg = (int)__builtin_ctz(candidate);
+        LOG_SCRATCH("-> returning reg=%d (pre-pushed callee-saved, dead here) exclude=0x%x", sreg, exclude_regs);
+        result.reg = sreg;
+        result.saved = 0;
+        scratch_global_exclude |= (1u << sreg);
+        return result;
+      }
+    }
   }
 
   int reg_to_save = -1;
@@ -1688,6 +1716,10 @@ void tcc_ir_spill_cache_clear(SpillCache *cache)
   {
     cache->entries[i].valid = 0;
   }
+  cache->last_emit_kind = 0;
+  cache->last_emit_ind = 0;
+  cache->last_emit_reg = 0;
+  cache->last_emit_offset = 0;
 }
 
 void tcc_ir_spill_cache_record(SpillCache *cache, int reg, int offset)
@@ -3354,6 +3386,19 @@ ST_FUNC void tcc_machine_load_spill_slot(int dest_reg, int frame_offset)
 
   /* Adjust for callee-saved gap below FP (spill slots are always locals) */
   frame_offset = fp_adjust_local_offset(frame_offset, 0);
+
+  /* Peephole: if the previous emit was a STR or LDR of the same register to/from
+   * the same slot AND no other instruction has been emitted since, the value is
+   * already in dest_reg — skip the redundant load. */
+  TCCIRState *ir = tcc_state ? tcc_state->ir : NULL;
+  if (ir && ir->spill_cache.last_emit_kind != 0 &&
+      ir->spill_cache.last_emit_ind == ind &&
+      ir->spill_cache.last_emit_reg == dest_reg &&
+      ir->spill_cache.last_emit_offset == frame_offset)
+  {
+    return;
+  }
+
   const int base_reg = tcc_state->need_frame_pointer ? R_FP : R_SP;
   const int sign = (frame_offset < 0);
   const int abs_offset = sign ? -frame_offset : frame_offset;
@@ -3364,6 +3409,14 @@ ST_FUNC void tcc_machine_load_spill_slot(int dest_reg, int frame_offset)
     int rr = rr_alloc.reg;
     ot_check(th_ldr_reg(dest_reg, base_reg, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     restore_scratch_reg(&rr_alloc);
+  }
+
+  if (ir)
+  {
+    ir->spill_cache.last_emit_kind = 2; /* LDR */
+    ir->spill_cache.last_emit_ind = ind;
+    ir->spill_cache.last_emit_reg = (int8_t)dest_reg;
+    ir->spill_cache.last_emit_offset = frame_offset;
   }
 }
 
@@ -3398,6 +3451,15 @@ ST_FUNC void tcc_machine_store_spill_slot(int src_reg, int frame_offset)
     int rr = rr_alloc.reg;
     ot_check(th_str_reg(src_reg, base_reg, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     restore_scratch_reg(&rr_alloc);
+  }
+
+  TCCIRState *ir = tcc_state ? tcc_state->ir : NULL;
+  if (ir)
+  {
+    ir->spill_cache.last_emit_kind = 1; /* STR */
+    ir->spill_cache.last_emit_ind = ind;
+    ir->spill_cache.last_emit_reg = (int8_t)src_reg;
+    ir->spill_cache.last_emit_offset = frame_offset;
   }
 }
 
@@ -5740,6 +5802,43 @@ ST_FUNC void tcc_gen_machine_cmp_eq64_mop(MachineOperand src1, MachineOperand sr
   mach_release_all(&ctx);
 }
 
+/* tcc_gen_machine_subs_eq_select_01: emit
+ *   SUBS dest, src1, #K
+ *   IT NE
+ *   MOVNE dest, #1
+ * for the CMP src1,#K + SELECT(#1,#0,NE) / SELECT(#0,#1,EQ) peephole.
+ * Returns 1 if emitted, 0 if the SUBS immediate didn't encode (caller falls back). */
+ST_FUNC int tcc_gen_machine_subs_eq_select_01(MachineOperand src1, MachineOperand src2, MachineOperand dest)
+{
+  if (src2.kind != MACH_OP_IMM)
+    return 0;
+  if (src1.kind != MACH_OP_REG || src1.needs_deref || src1.u.reg.r0 < 0)
+    return 0;
+  if (dest.kind != MACH_OP_REG || dest.needs_deref || dest.u.reg.r0 < 0)
+    return 0;
+
+  uint32_t src_reg = (uint32_t)src1.u.reg.r0;
+  uint32_t dst_reg = (uint32_t)dest.u.reg.r0;
+  uint32_t Ku = (uint32_t)src2.u.imm.val;
+
+  thumb_opcode subs = th_sub_imm(dst_reg, src_reg, Ku, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE);
+  if (subs.size == 0)
+    return 0;
+
+  /* Reserve so a literal-pool flush can't split the IT/MOV pair. */
+  th_literal_pool_reserve_upcoming_bytes(10);
+  ot_check(subs);
+  ot_check(th_it(mapcc(TOK_NE), 0x8u));
+  thumb_opcode movne = th_generic_mov_imm(dst_reg, 1);
+  if (movne.size != 0) {
+    ot_check(movne);
+  } else {
+    /* mov #1 always encodes on ARM Thumb-2, but be safe. */
+    load_full_const((int)dst_reg, PREG_NONE, 1u, 0u);
+  }
+  return 1;
+}
+
 /* tcc_gen_machine_mla_mop: MachineOperand-based entry point for MLA.
  * dest = src1 * src2 + accum  (all operands are 32-bit)
  *
@@ -6694,11 +6793,13 @@ ST_FUNC void tcc_gen_machine_store_mop(MachineOperand dest, MachineOperand src, 
 
   const int btype = dest.btype; /* Store width from destination type */
 
-  /* Fast path: immediate → register — load constant directly into dest,
-   * avoiding a scratch register + MOV. */
-  if (src.kind == MACH_OP_IMM && dest.kind == MACH_OP_REG && !dest.needs_deref && dest.u.reg.r0 != (int)PREG_REG_NONE)
+  /* Fast path: plain-register dest (no deref) — load src directly into dest,
+   * skipping the intermediate scratch + MOV that the generic path emits.
+   * Covers IMM, SYMBOL, SPILL, FRAME_ADDR, PARAM_STACK, CHAIN_REL, and
+   * REG-with-or-without-deref src kinds. */
+  if (dest.kind == MACH_OP_REG && !dest.needs_deref && dest.u.reg.r0 != (int)PREG_REG_NONE)
   {
-    tcc_machine_load_constant(dest.u.reg.r0, PREG_REG_NONE, src.u.imm.val, 0, NULL);
+    tcc_gen_mach_load_to_reg(dest.u.reg.r0, &src);
     mach_release_all(&ctx);
     return;
   }
@@ -8965,12 +9066,22 @@ ST_FUNC void tcc_gen_machine_lea_mop(MachineOperand dest, MachineOperand src)
   MachineCodegenContext ctx = {0};
   int r;
 
+  /* When dest is a writable register, compute the address directly into it
+   * to avoid a scratch + redundant mov. mach_alloc_scratch is driven by the
+   * per-instruction live_regs bitmap which already marks the dest reg "live"
+   * (it's the def target), so it would otherwise pick a different reg and
+   * writeback would emit `mov dest_reg, scratch`. */
+  int dest_reg = -1;
+  if (dest.kind == MACH_OP_REG && !dest.needs_deref &&
+      dest.u.reg.r0 != (int)PREG_REG_NONE)
+    dest_reg = dest.u.reg.r0;
+
   switch (src.kind)
   {
   case MACH_OP_PARAM_STACK:
   {
     /* Compute address of caller's argument slot. */
-    r = mach_alloc_scratch(&ctx, 0);
+    r = (dest_reg >= 0) ? dest_reg : mach_alloc_scratch(&ctx, 0);
     tcc_machine_addr_of_stack_slot(r, src.u.param.offset, 1 /* is_param */);
     break;
   }
@@ -8981,7 +9092,11 @@ ST_FUNC void tcc_gen_machine_lea_mop(MachineOperand dest, MachineOperand src)
     int chain_used = 0;
     uint32_t excl = 0;
     int base = resolve_chain_base(tcc_state->ir, src.u.chain.chain_index, excl, &chain_scratch, &chain_used);
-    r = mach_alloc_scratch(&ctx, excl | (1u << (uint32_t)base));
+    /* dest_reg only usable if it doesn't collide with the chain base */
+    if (dest_reg >= 0 && dest_reg != base && !(excl & (1u << (uint32_t)dest_reg)))
+      r = dest_reg;
+    else
+      r = mach_alloc_scratch(&ctx, excl | (1u << (uint32_t)base));
     int32_t off = src.u.chain.offset;
     int sign = (off < 0);
     int abs_off = sign ? (int)(-off) : (int)off;
@@ -9015,8 +9130,23 @@ ST_FUNC void tcc_gen_machine_lea_mop(MachineOperand dest, MachineOperand src)
       restore_scratch_reg(&chain_scratch);
     break;
   }
+  case MACH_OP_FRAME_ADDR:
+    /* Address of a local stack slot: ADD dest, sp, #offset. */
+    r = (dest_reg >= 0) ? dest_reg : mach_alloc_scratch(&ctx, 0);
+    tcc_machine_addr_of_stack_slot(r, src.u.frame.offset, 0);
+    break;
+  case MACH_OP_SYMBOL:
+    if (!src.needs_deref)
+    {
+      Sym *raw_sym = src.u.sym.sym;
+      Sym *sym = raw_sym ? validate_sym_for_reloc(raw_sym) : NULL;
+      r = (dest_reg >= 0) ? dest_reg : mach_alloc_scratch(&ctx, 0);
+      tcc_machine_load_constant(r, PREG_REG_NONE, src.u.sym.addend, 0, sym);
+      break;
+    }
+    /* fallthrough for needs_deref */
   default:
-    /* FRAME_ADDR, SYMBOL, REG: mach_ensure_in_reg already computes the address. */
+    /* REG and other lvalue-y forms: mach_ensure_in_reg already computes the address. */
     r = mach_ensure_in_reg(&ctx, &src, 0);
     break;
   }
@@ -9329,8 +9459,10 @@ static void thumb_emit_arg_move(const ThumbArgMove *m)
           uint32_t excl = (1u << m->dst_reg) | (1u << m->dst_reg_hi);
           base = mach_ensure_in_reg(&mctx, &addr, excl);
         }
-        load_from_base(m->dst_reg, PREG_REG_NONE, IROP_BTYPE_INT32, 0, 0, 0, (uint32_t)base);
-        load_from_base(m->dst_reg_hi, PREG_REG_NONE, IROP_BTYPE_INT32, 0, 4, 0, (uint32_t)base);
+        /* Use the 64-bit load_from_base path so it preserves the base when
+         * base == dst_reg (otherwise the lo-load would clobber it before
+         * the hi-load can use it). */
+        load_from_base(m->dst_reg, m->dst_reg_hi, IROP_BTYPE_INT64, 0, 0, 0, (uint32_t)base);
       }
       else
       {
@@ -9377,22 +9509,120 @@ static void thumb_emit_arg_move(const ThumbArgMove *m)
         }
       }
     }
-    else if (m->mop.kind == MACH_OP_REG && m->mop.needs_deref && !m->mop.is_64bit &&
-             m->mop.u.reg.r0 != m->dst_reg)
-    {
-      /* Register-indirect 32-bit: load *base directly into dst_reg,
-       * bypassing scratch + MOV.  Safe because base != dst_reg. */
-      load_from_base(m->dst_reg, PREG_REG_NONE, m->mop.btype, (int)m->mop.is_unsigned, 0, 0,
-                     (uint32_t)m->mop.u.reg.r0);
-    }
     else
     {
-      /* 32-bit: single-register load. */
-      uint32_t excl = (1u << m->dst_reg);
-      int r = mach_ensure_in_reg(&mctx, &m->mop, excl);
-      if (r != m->dst_reg)
-        ot_check_mov_reg(m->dst_reg, r, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE,
-                         false);
+      /* 32-bit: prefer loading directly into dst_reg when the operand kind
+       * permits it, bypassing the scratch + MOV sequence that
+       * mach_ensure_in_reg would emit.  Kinds that need an extra
+       * pointer-chain scratch beyond dst_reg (CHAIN_REL) fall through to
+       * the generic path. */
+      const MachineOperand *mop = &m->mop;
+      const int dst = m->dst_reg;
+      int handled = 0;
+
+      switch (mop->kind)
+      {
+      case MACH_OP_NONE:
+        tcc_machine_load_constant(dst, PREG_REG_NONE, 0, 0, NULL);
+        handled = 1;
+        break;
+
+      case MACH_OP_REG:
+        if (mop->needs_deref)
+        {
+          /* LDR dst, [r0]; legal even when r0 == dst (loaded value
+           * just replaces the base). */
+          load_from_base(dst, PREG_REG_NONE, mop->btype, (int)mop->is_unsigned, 0, 0,
+                         (uint32_t)mop->u.reg.r0);
+        }
+        else if (mop->u.reg.r0 != dst)
+        {
+          ot_check_mov_reg(dst, mop->u.reg.r0, flags_safe(), THUMB_SHIFT_DEFAULT,
+                           ENFORCE_ENCODING_NONE, false);
+        }
+        handled = 1;
+        break;
+
+      case MACH_OP_SPILL:
+        if (!mop->needs_deref)
+        {
+          tcc_machine_load_spill_slot(dst, mop->u.spill.offset);
+        }
+        else
+        {
+          /* LLOCAL: load pointer into dst, then dereference into dst. */
+          tcc_machine_load_spill_slot(dst, mop->u.spill.offset);
+          load_from_base(dst, PREG_REG_NONE, mop->btype, (int)mop->is_unsigned, 0, 0,
+                         (uint32_t)dst);
+        }
+        handled = 1;
+        break;
+
+      case MACH_OP_PARAM_STACK:
+      {
+        const int adjusted = mop->u.param.offset + offset_to_args;
+        const int base_reg = tcc_state->need_frame_pointer ? R_FP : R_SP;
+        const int sign = (adjusted < 0);
+        const int abs_off = sign ? -adjusted : adjusted;
+        load_from_base(dst, PREG_REG_NONE, mop->btype, (int)mop->is_unsigned, abs_off, sign,
+                       (uint32_t)base_reg);
+        handled = 1;
+        break;
+      }
+
+      case MACH_OP_IMM:
+        tcc_machine_load_constant(dst, PREG_REG_NONE, mop->u.imm.val, 0, NULL);
+        handled = 1;
+        break;
+
+      case MACH_OP_FRAME_ADDR:
+        if (!mop->needs_deref)
+        {
+          tcc_machine_addr_of_stack_slot(dst, mop->u.frame.offset, 0);
+        }
+        else
+        {
+          tcc_machine_addr_of_stack_slot(dst, mop->u.frame.offset, 0);
+          load_from_base(dst, PREG_REG_NONE, mop->btype, (int)mop->is_unsigned, 0, 0,
+                         (uint32_t)dst);
+        }
+        handled = 1;
+        break;
+
+      case MACH_OP_SYMBOL:
+      {
+        Sym *raw_sym = mop->u.sym.sym;
+        Sym *sym = raw_sym ? validate_sym_for_reloc(raw_sym) : NULL;
+        if (!mop->needs_deref)
+        {
+          tcc_machine_load_constant(dst, PREG_REG_NONE, mop->u.sym.addend, 0, sym);
+        }
+        else
+        {
+          tcc_machine_load_constant(dst, PREG_REG_NONE, 0, 0, sym);
+          const int32_t addend = mop->u.sym.addend;
+          const int sign = (addend < 0);
+          const int abs_off = sign ? (int)(-addend) : (int)addend;
+          load_from_base(dst, PREG_REG_NONE, mop->btype, (int)mop->is_unsigned, abs_off, sign,
+                         (uint32_t)dst);
+        }
+        handled = 1;
+        break;
+      }
+
+      default:
+        /* CHAIN_REL etc.: fall through to generic scratch + MOV. */
+        break;
+      }
+
+      if (!handled)
+      {
+        uint32_t excl = (1u << dst);
+        int r = mach_ensure_in_reg(&mctx, mop, excl);
+        if (r != dst)
+          ot_check_mov_reg(dst, r, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE,
+                           false);
+      }
     }
     mach_release_all(&mctx);
     return;
@@ -10704,6 +10934,31 @@ ST_FUNC void tcc_gen_machine_select_mop(MachineOperand then_val, MachineOperand 
   {
     else_reg = mach_ensure_in_reg(&mctx, &else_val, excl);
     excl |= (1u << (uint32_t)else_reg);
+  }
+
+  /* Identity-then shortcut: if the then-value is already in dest_reg, the
+   * predicated mov would be `movXX dest, dest` — a real instruction inside an
+   * IT block (the usual elision in ot_check_mov_reg is suppressed by in_it).
+   * Emit `IT <inv_cond>` + the else mov instead.  Saves one instruction. */
+  int then_is_identity = 0;
+  if (then_inline && then_val.kind == MACH_OP_REG && !then_val.needs_deref &&
+      (int)then_val.u.reg.r0 == dest_reg)
+    then_is_identity = 1;
+  else if (!then_inline && then_reg == dest_reg)
+    then_is_identity = 1;
+
+  if (then_is_identity)
+  {
+    int inv_cond = cond ^ 1;
+    th_literal_pool_reserve_upcoming_bytes(8); /* IT(2) + instr(2-4) */
+    ot_check(th_it((uint16_t)inv_cond, 0x8u)); /* IT <inv_cond>, single insn */
+    if (else_inline)
+      select_emit_inline(&mctx, &else_val, dest_reg);
+    else
+      ot_check_mov_reg(dest_reg, else_reg, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, true);
+    mach_writeback_dest(&dest, dest_reg);
+    mach_release_all(&mctx);
+    return;
   }
 
   /* ITE mask: the second instruction uses the opposite condition.

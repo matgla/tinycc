@@ -181,6 +181,16 @@ TEST_FILES = [
     # identity comparison fold eliminates struct member comparisons with different addends
     ("bug_struct_member_cmp_fold.c", 0),
 
+    # SL-FWD multi-pred merge alias bug: inlined callee conditionally writes
+    # through caller's stack ptr; caller post-call read must NOT forward the
+    # pre-call value past the conditional store.  See SL_FWD_FIX_PLAN.md.
+    ("test_sl_fwd_alias.c", 0),
+    # Hand-crafted alias variants of the SL-FWD fix: must remain correct
+    # without regressing forwarding for benign patterns.
+    ("test_sl_fwd_alias_uncond.c", 0),
+    ("test_sl_fwd_alias_call.c", 0),
+    ("test_sl_fwd_alias_offsets.c", 0),
+
     ("../tests2/00_assignment.c", 0),
     ("../tests2/01_comment.c", 0),
     ("../tests2/02_printf.c", 0),

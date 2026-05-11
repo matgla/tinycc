@@ -488,7 +488,8 @@ struct FuncAttr
       func_outofline_needed : 1,        /* always_inline call could not stay call-site-only */
       func_auto_inline : 1,             /* compiler-selected auto-inline candidate (small func) */
       func_eval_only_inline : 1,        /* body saved for const-fold only, not regular inlining */
-      xxxx : 6;
+      func_pure_via_sret : 1,           /* inferred: only observable side effect is *sret_arg writes */
+      xxxx : 5;
 };
 
 /* symbol management */
@@ -1040,6 +1041,16 @@ typedef struct ArchiveSymbolCache
   unsigned int loaded_member_mask;    /* dedup set mask */
 } ArchiveSymbolCache;
 
+/* Per-TU stash of optimized IR for `static` functions that look eligible
+ * for later inlining. Populated at the end of gen_function(); flushed at
+ * tccgen_finish(). Phase 0: stash only, no consumers — exists to validate
+ * the lifecycle change before the inliner pass lands. */
+typedef struct StashedFuncIR
+{
+  Sym *sym;
+  TCCIRState *ir;
+} StashedFuncIR;
+
 struct TCCState
 {
   unsigned char verbose;           /* if true, display some information during compilation */
@@ -1169,6 +1180,10 @@ struct TCCState
 #ifdef CONFIG_TCC_DEBUG
   /* Debug-only runtime features */
   unsigned char dump_ir; /* -dump-ir: print IR (pre/post opts) to stdout */
+  /* -dump-ir-passes=name[,name...] (or "all"): after each named optimization
+   * pass in the optimize loop, print "=== AFTER <name> ===" + IR.  Used to
+   * bisect which pass corrupts the IR.  NULL = disabled. */
+  char *dump_ir_passes;
 #endif
 
   /* use GNU C extensions */
@@ -1462,6 +1477,12 @@ struct TCCState
   CString linker_arg; /* collect -Wl options */
   int thumb_func;
   TCCIRState *ir;
+  /* Inliner stash: optimized IR for eligible `static` functions, kept alive
+   * past the per-function gen_function() free so a future inliner pass can
+   * splice it into callers. Phase 0: no consumers yet. */
+  StashedFuncIR *stashed_func_irs;
+  int nb_stashed_func_irs;
+  int stashed_func_irs_capacity;
   /* Nested functions - saved token streams for functions defined inside other functions */
   NestedFunc *nested_funcs;
   int nb_nested_funcs;
@@ -1485,8 +1506,20 @@ struct TCCState
   /* Inline expansion state: when replaying an inline function's token
      stream at a call site, these track the return value destination. */
   uint8_t in_inline_expansion; /* nonzero while expanding inline body */
+  uint8_t inline_expansion_depth; /* nested expansion depth, capped to bound work */
   int inline_return_loc;       /* stack offset for storing return value */
   int inline_const_arg_count;  /* constant-like current inline params */
+
+  /* Named Return Value Optimization (NRVO) target.
+     When set, an upcoming function call returning a struct/complex via
+     hidden sret pointer should use this stack slot as its return buffer
+     instead of allocating a fresh temp.  Saves the temp + the temp→dst
+     copy.  Active during evaluation of a single initializer expression. */
+  uint8_t nrvo_target_active;
+  int nrvo_target_loc;   /* stack offset of destination */
+  int nrvo_target_vreg;  /* vreg of destination variable */
+  int nrvo_target_size;  /* size in bytes — must match function return size */
+  int nrvo_target_align; /* alignment — must match */
   struct
   {
     int vreg;
@@ -2600,6 +2633,11 @@ ST_FUNC void tcc_gen_machine_data_processing_mop(MachineOperand src1, MachineOpe
 ST_FUNC void tcc_gen_machine_data_processing_mop_flags(MachineOperand src1, MachineOperand src2, MachineOperand dest,
                                                        TccIrOp op);
 ST_FUNC void tcc_gen_machine_cmp_eq64_mop(MachineOperand src1, MachineOperand src2);
+/* SUBS+IT peephole helper: emits `SUBS dest, src1, src2; IT NE; MOVNE dest, #1`
+ * collapsing a CMP+SELECT(1,0,NE) / SELECT(0,1,EQ) pair into 3 instructions.
+ * src2 must be MACH_OP_IMM. Returns 1 on emit, 0 if the SUBS immediate can't
+ * be encoded and the caller should fall back to the regular CMP+SELECT. */
+ST_FUNC int tcc_gen_machine_subs_eq_select_01(MachineOperand src1, MachineOperand src2, MachineOperand dest);
 ST_FUNC void tcc_gen_machine_ubfx_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest);
 ST_FUNC void tcc_gen_machine_assign_mop(MachineOperand src, MachineOperand dest, TccIrOp op);
 ST_FUNC void tcc_gen_machine_setif_mop(MachineOperand src, MachineOperand dest, TccIrOp op);
