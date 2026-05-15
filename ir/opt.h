@@ -79,6 +79,12 @@ int tcc_ir_opt_local_alu_cse(struct TCCIRState *ir);
  * collapse the remaining chain. */
 int tcc_ir_opt_var_to_tmp(struct TCCIRState *ir);
 
+/* ADD/SUB Constant Reassociation - normalize ADD chains */
+int tcc_ir_opt_add_reassoc(struct TCCIRState *ir);
+
+/* CMP Expression-Equality Fold - fold CMP when both operands are provably equal */
+int tcc_ir_opt_cmp_expr_fold(struct TCCIRState *ir);
+
 /* Copy Propagation - replace copies with originals */
 int tcc_ir_opt_copy_prop(struct TCCIRState *ir);
 

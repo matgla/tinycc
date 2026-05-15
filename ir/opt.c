@@ -76,6 +76,14 @@ static int tcc_ir_vreg_has_single_def(TCCIRState *ir, int32_t vreg);
 static int evaluate_compare_condition(int64_t val1, int64_t val2, int cond_token);
 static int change_callee_sym(TCCIRState *ir, int instr_idx, const char *new_name, int ret_btype);
 static int change_callee_sym_keep_type(TCCIRState *ir, int instr_idx, const char *new_name);
+/* Forward declaration (defined in expression equality section below) */
+static int ir_opt_pure_expr_equal(TCCIRState *ir, IROperand a, int a_use_idx, IROperand b, int b_use_idx, int depth);
+static int ir_opt_pure_def_equal(TCCIRState *ir, int a_def_idx, int b_def_idx, int depth);
+static int ir_opt_nonvreg_expr_equal(TCCIRState *ir, IROperand a, IROperand b);
+/* Forward declaration (defined in add_reassoc section) */
+static uint8_t *ir_opt_build_def_count(TCCIRState *ir, int n, int *out_stride);
+#define DC_IS_SINGLE_DEF(dc, stride, vr)                                                                               \
+  ((vr) >= 0 && (dc)[TCCIR_DECODE_VREG_TYPE(vr) * (stride) + TCCIR_DECODE_VREG_POSITION(vr)] == 1)
 /* Forward declaration (defined in IV strength reduction section) */
 static int insert_instr_at(TCCIRState *ir, int pos, TccIrOp op, IROperand dest, IROperand src1, IROperand src2);
 
@@ -4330,6 +4338,9 @@ int tcc_ir_opt_const_prop(TCCIRState *ir)
   if (n == 0)
     return 0;
 
+  int dc_stride = 0;
+  uint8_t *dc = (n <= 4000) ? ir_opt_build_def_count(ir, n, &dc_stride) : NULL;
+
   /* Combined pass: find max_var_pos AND fold identity comparisons in a single
    * scan.  The two concerns are orthogonal — one looks at VAR dests, the other
    * looks at CMP instructions followed by JUMPIF/SETIF.
@@ -4415,25 +4426,46 @@ int tcc_ir_opt_const_prop(TCCIRState *ir)
       }
     }
 
-    /* Check if both operands refer to the same vreg (identity comparison).
-     * Both must also have the same is_lval — CMP *V, V is NOT identity. */
-    int32_t vr1 = irop_get_vreg(cmp_src1);
-    int32_t vr2 = irop_get_vreg(cmp_src2);
-    if (vr1 < 0 || vr2 < 0 || vr1 != vr2 || cmp_src1.is_lval != cmp_src2.is_lval)
-      continue;
-
-    /* Symbol reference operands with the same vreg may still refer to different
-     * memory locations when their addends differ (e.g. different fields of the
-     * same struct).  Only fold when both operands are truly identical. */
-    if (cmp_src1.is_sym || cmp_src2.is_sym)
+    /* Check if both operands are provably identical (identity comparison).
+     * First check: same vreg with same is_lval flag.
+     * Second check: different vregs but structurally equal expressions
+     * (e.g. both compute "base + 5" via independent ADD instructions). */
     {
-      if (cmp_src1.is_sym != cmp_src2.is_sym)
-        continue; /* one is sym, other is not — can't be identical */
-      IRPoolSymref *ref1 = irop_get_symref_ex(ir, cmp_src1);
-      IRPoolSymref *ref2 = irop_get_symref_ex(ir, cmp_src2);
-      if (!ref1 || !ref2)
-        continue;
-      if (ref1->sym != ref2->sym || ref1->addend != ref2->addend)
+      int is_identity = 0;
+      int32_t vr1 = irop_get_vreg(cmp_src1);
+      int32_t vr2 = irop_get_vreg(cmp_src2);
+
+      if (vr1 >= 0 && vr2 >= 0 && vr1 == vr2 && cmp_src1.is_lval == cmp_src2.is_lval)
+      {
+        /* Same vreg — check symbol refs for struct field disambiguation */
+        if (cmp_src1.is_sym || cmp_src2.is_sym)
+        {
+          if (cmp_src1.is_sym == cmp_src2.is_sym)
+          {
+            IRPoolSymref *ref1 = irop_get_symref_ex(ir, cmp_src1);
+            IRPoolSymref *ref2 = irop_get_symref_ex(ir, cmp_src2);
+            if (ref1 && ref2 && ref1->sym == ref2->sym && ref1->addend == ref2->addend)
+              is_identity = 1;
+          }
+        }
+        else
+          is_identity = 1;
+      }
+
+      /* Try definition-level equality for different vregs.
+       * Compares the defining instructions directly (same op, same
+       * operands), including cross-tag comparisons (VAR vs TEMP).
+       * Guarded: find_defining_instruction is O(n) per CMP. */
+      if (!is_identity && n <= 4000 && vr1 >= 0 && vr2 >= 0 && vr1 != vr2 &&
+          DC_IS_SINGLE_DEF(dc, dc_stride, vr1) && DC_IS_SINGLE_DEF(dc, dc_stride, vr2))
+      {
+        int def1 = tcc_ir_find_defining_instruction(ir, vr1, i);
+        int def2 = tcc_ir_find_defining_instruction(ir, vr2, i);
+        if (def1 >= 0 && def2 >= 0 && ir_opt_pure_def_equal(ir, def1, def2, 0))
+          is_identity = 1;
+      }
+
+      if (!is_identity)
         continue;
     }
 
@@ -5432,6 +5464,7 @@ int tcc_ir_opt_const_prop(TCCIRState *ir)
       }
     }
 
+  tcc_free(dc);
   tcc_free(var_info);
 
   return changes;
@@ -6659,7 +6692,7 @@ int tcc_ir_opt_value_tracking(TCCIRState *ir)
           /* Classify: nargs=1 or 2, float or double */
           int sf_nargs = 0, sf_kind = 0;
           /* kinds: 1=add 2=sub 3=mul 4=div 5=f2iz 6=f2uiz 7=i2f 8=ui2f
-           *        9=f2d 10=d2f 11=d2iz 12=d2uiz */
+           *        9=f2d 10=d2f 11=d2iz 12=d2uiz 13=i2d 14=ui2d */
           if (strcmp(sf, "__aeabi_fadd") == 0)
           {
             sf_nargs = 2;
@@ -6735,6 +6768,16 @@ int tcc_ir_opt_value_tracking(TCCIRState *ir)
           {
             sf_nargs = 1;
             sf_kind = 10;
+          }
+          else if (strcmp(sf, "__aeabi_i2d") == 0)
+          {
+            sf_nargs = 1;
+            sf_kind = 13;
+          }
+          else if (strcmp(sf, "__aeabi_ui2d") == 0)
+          {
+            sf_nargs = 1;
+            sf_kind = 14;
           }
           else if (strcmp(sf, "__aeabi_d2iz") == 0)
           {
@@ -6987,6 +7030,30 @@ int tcc_ir_opt_value_tracking(TCCIRState *ir)
                   } da;
                   da.u = (uint64_t)a0;
                   result = (int64_t)(uint32_t)da.d;
+                  folded = 1;
+                }
+                break;
+                case 13:
+                { /* i2d */
+                  union
+                  {
+                    double d;
+                    uint64_t u;
+                  } dr;
+                  dr.d = (double)(int32_t)a0;
+                  result = (int64_t)dr.u;
+                  folded = 1;
+                }
+                break;
+                case 14:
+                { /* ui2d */
+                  union
+                  {
+                    double d;
+                    uint64_t u;
+                  } dr;
+                  dr.d = (double)(uint32_t)a0;
+                  result = (int64_t)dr.u;
                   folded = 1;
                 }
                 break;
@@ -8203,6 +8270,7 @@ static int ir_opt_pure_def_equal(TCCIRState *ir, int a_def_idx, int b_def_idx, i
   case TCCIR_OP_ASSIGN:
     return ir_opt_pure_expr_equal(ir, tcc_ir_op_get_src1(ir, qa), a_def_idx, tcc_ir_op_get_src1(ir, qb), b_def_idx,
                                   depth + 1);
+  case TCCIR_OP_ADD:
   case TCCIR_OP_OR:
   case TCCIR_OP_AND:
   case TCCIR_OP_XOR:
@@ -8217,6 +8285,15 @@ static int ir_opt_pure_def_equal(TCCIRState *ir, int a_def_idx, int b_def_idx, i
              ir_opt_pure_expr_equal(ir, a2, a_def_idx, b2, b_def_idx, depth + 1)) ||
             (ir_opt_pure_expr_equal(ir, a1, a_def_idx, b2, b_def_idx, depth + 1) &&
              ir_opt_pure_expr_equal(ir, a2, a_def_idx, b1, b_def_idx, depth + 1)));
+  }
+  case TCCIR_OP_SUB:
+  {
+    IROperand a1 = tcc_ir_op_get_src1(ir, qa);
+    IROperand a2 = tcc_ir_op_get_src2(ir, qa);
+    IROperand b1 = tcc_ir_op_get_src1(ir, qb);
+    IROperand b2 = tcc_ir_op_get_src2(ir, qb);
+    return (ir_opt_pure_expr_equal(ir, a1, a_def_idx, b1, b_def_idx, depth + 1) &&
+            ir_opt_pure_expr_equal(ir, a2, a_def_idx, b2, b_def_idx, depth + 1));
   }
   case TCCIR_OP_FUNCCALLVAL:
   {
@@ -9487,6 +9564,340 @@ int tcc_ir_opt_const_prop_tmp(TCCIRState *ir)
   return changes;
 #undef TMP_CONST_STACK_SIZE
 #undef TMP_CONST_STACK_N
+}
+
+/* ADD/SUB Constant Reassociation
+ *
+ * Normalizes ADD/SUB chains with constant operands so that cascaded
+ * pointer arithmetic collapses into a single ADD from the original base:
+ *
+ *   ADD(ADD(base, c1), c2)  →  ADD(base, c1+c2)
+ *
+ * This enables downstream CMP identity folding to recognize that two
+ * independently computed "base + N" values are identical.
+ */
+
+/* Build a flat def-count table: O(n) build, O(1) lookup.
+ * Returns allocated array indexed by [vreg_type * stride + vreg_position].
+ * stride = max_vreg_position + 1.  Caller must tcc_free() the result. */
+static uint8_t *ir_opt_build_def_count(TCCIRState *ir, int n, int *out_stride)
+{
+  int max_pos = 0;
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
+      continue;
+    int32_t vr = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
+    if (vr < 0)
+      continue;
+    int pos = TCCIR_DECODE_VREG_POSITION(vr);
+    if (pos > max_pos)
+      max_pos = pos;
+  }
+  int stride = max_pos + 1;
+  uint8_t *dc = tcc_mallocz(16 * stride);
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
+      continue;
+    int32_t vr = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
+    if (vr < 0)
+      continue;
+    int typ = TCCIR_DECODE_VREG_TYPE(vr);
+    int pos = TCCIR_DECODE_VREG_POSITION(vr);
+    if (dc[typ * stride + pos] < 2)
+      dc[typ * stride + pos]++;
+  }
+  *out_stride = stride;
+  return dc;
+}
+
+int tcc_ir_opt_add_reassoc(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  int changes = 0;
+
+  if (n < 2 || n > 4000)
+    return 0;
+
+  uint8_t *is_merge = ir_opt_build_merge_bitmap(ir, n);
+  int dc_stride = 0;
+  uint8_t *dc = ir_opt_build_def_count(ir, n, &dc_stride);
+
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_ADD && q->op != TCCIR_OP_SUB)
+      continue;
+
+    IROperand src1 = tcc_ir_op_get_src1(ir, q);
+    IROperand src2 = tcc_ir_op_get_src2(ir, q);
+    if (!irop_is_immediate(src2))
+      continue;
+
+    if (src1.is_lval)
+      continue;
+
+    int32_t src1_vr = irop_get_vreg(src1);
+    if (src1_vr < 0)
+      continue;
+
+    if (!DC_IS_SINGLE_DEF(dc, dc_stride, src1_vr))
+      continue;
+
+    int def_idx = tcc_ir_find_defining_instruction(ir, src1_vr, i);
+    if (def_idx < 0)
+      continue;
+
+    /* Verify no merge points between def and use */
+    {
+      int safe = 1;
+      for (int j = def_idx + 1; j <= i; j++)
+      {
+        if (is_merge[j / 8] & (1 << (j % 8)))
+        {
+          safe = 0;
+          break;
+        }
+      }
+      if (!safe)
+        continue;
+    }
+
+    IRQuadCompact *def_q = &ir->compact_instructions[def_idx];
+    if (def_q->op != TCCIR_OP_ADD && def_q->op != TCCIR_OP_SUB)
+      continue;
+
+    IROperand def_src2 = tcc_ir_op_get_src2(ir, def_q);
+    if (!irop_is_immediate(def_src2))
+      continue;
+    IROperand def_src1 = tcc_ir_op_get_src1(ir, def_q);
+
+    /* The reassociation replaces src1_vr with def_src1 at the use point.
+     * If def_src1 is a vreg, it must not be redefined between def_idx and i,
+     * otherwise the substituted value would read a stale/wrong version. */
+    int32_t inner_vr = irop_get_vreg(def_src1);
+    if (inner_vr >= 0 && !DC_IS_SINGLE_DEF(dc, dc_stride, inner_vr))
+    {
+      int redefined = 0;
+      for (int j = def_idx + 1; j < i; j++)
+      {
+        IRQuadCompact *jq = &ir->compact_instructions[j];
+        if (jq->op == TCCIR_OP_NOP)
+          continue;
+        IROperand jdst = tcc_ir_op_get_dest(ir, jq);
+        if (irop_get_vreg(jdst) == inner_vr)
+        {
+          redefined = 1;
+          break;
+        }
+      }
+      if (redefined)
+        continue;
+    }
+
+    int64_t c1 = irop_get_imm64_ex(ir, def_src2);
+    int64_t c2 = irop_get_imm64_ex(ir, src2);
+    int64_t eff_c1 = (def_q->op == TCCIR_OP_SUB) ? -c1 : c1;
+    int64_t eff_c2 = (q->op == TCCIR_OP_SUB) ? -c2 : c2;
+    int64_t combined = eff_c1 + eff_c2;
+
+    if (combined != (int32_t)combined)
+      continue;
+
+    int btype = irop_get_btype(src2);
+    LOG_IR_GEN("OPTIMIZE: ADD reassoc at i=%d: (%lld) + (%lld) = %lld",
+               i, (long long)eff_c1, (long long)eff_c2, (long long)combined);
+
+    if (combined == 0)
+    {
+      q->op = TCCIR_OP_ASSIGN;
+      tcc_ir_set_src1(ir, i, def_src1);
+      tcc_ir_set_src2(ir, i, IROP_NONE);
+    }
+    else
+    {
+      q->op = TCCIR_OP_ADD;
+      tcc_ir_set_src1(ir, i, def_src1);
+      tcc_ir_set_src2(ir, i, irop_make_imm32(-1, (int32_t)combined, btype));
+    }
+    changes++;
+  }
+
+  tcc_free(dc);
+  tcc_free(is_merge);
+  return changes;
+}
+
+/* CMP Expression-Equality Fold
+ *
+ * Fold CMP+JUMPIF/SELECT when both CMP operands compute the same
+ * expression (e.g. both are ADD(GlobalSym, 5) via different vregs).
+ * Handles cross-type comparisons (VAR vs TEMP) by comparing at the
+ * definition level, bypassing the STACKOFF/VREG tag mismatch that
+ * ir_opt_pure_expr_equal cannot handle.
+ */
+int tcc_ir_opt_cmp_expr_fold(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  int changes = 0;
+
+  if (n < 2 || n > 4000)
+    return 0;
+
+  int dc_stride = 0;
+  uint8_t *dc = ir_opt_build_def_count(ir, n, &dc_stride);
+
+  for (int i = 0; i < n - 1; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_CMP)
+      continue;
+
+    IROperand src1 = tcc_ir_op_get_src1(ir, q);
+    IROperand src2 = tcc_ir_op_get_src2(ir, q);
+    int32_t vr1 = irop_get_vreg(src1);
+    int32_t vr2 = irop_get_vreg(src2);
+    if (vr1 < 0 || vr2 < 0 || vr1 == vr2)
+      continue;
+
+    /* Both operands must have a single reaching definition */
+    int def1 = tcc_ir_find_defining_instruction(ir, vr1, i);
+    int def2 = tcc_ir_find_defining_instruction(ir, vr2, i);
+    if (def1 < 0 || def2 < 0 || def1 == def2)
+      continue;
+
+    /* Try standard def equality (works for single-def vregs) */
+    int is_equal = 0;
+    if (DC_IS_SINGLE_DEF(dc, dc_stride, vr1) && DC_IS_SINGLE_DEF(dc, dc_stride, vr2))
+      is_equal = ir_opt_pure_def_equal(ir, def1, def2, 0);
+
+    /* Pattern match: both defs are ADD/SUB with the same immediate, and
+     * their base operands resolve to the same value (e.g. both are
+     * ASSIGN(GlobalSym) or LOAD of the same source). */
+    if (!is_equal)
+    {
+      IRQuadCompact *dq1 = &ir->compact_instructions[def1];
+      IRQuadCompact *dq2 = &ir->compact_instructions[def2];
+      if (dq1->op == dq2->op && (dq1->op == TCCIR_OP_ADD || dq1->op == TCCIR_OP_SUB))
+      {
+        IROperand ds2_1 = tcc_ir_op_get_src2(ir, dq1);
+        IROperand ds2_2 = tcc_ir_op_get_src2(ir, dq2);
+        if (irop_is_immediate(ds2_1) && irop_is_immediate(ds2_2) &&
+            irop_get_imm64_ex(ir, ds2_1) == irop_get_imm64_ex(ir, ds2_2))
+        {
+          IROperand base1 = tcc_ir_op_get_src1(ir, dq1);
+          IROperand base2 = tcc_ir_op_get_src1(ir, dq2);
+          int32_t bvr1 = irop_get_vreg(base1);
+          int32_t bvr2 = irop_get_vreg(base2);
+
+          if (bvr1 >= 0 && bvr2 >= 0)
+          {
+            /* Same base vreg → equal */
+            if (bvr1 == bvr2)
+              is_equal = 1;
+            /* Different base vregs: check if they resolve to the same value */
+            if (!is_equal)
+            {
+              int bd1 = tcc_ir_find_defining_instruction(ir, bvr1, def1);
+              int bd2 = tcc_ir_find_defining_instruction(ir, bvr2, def2);
+              if (bd1 >= 0 && bd2 >= 0)
+              {
+                IRQuadCompact *bdq1 = &ir->compact_instructions[bd1];
+                IRQuadCompact *bdq2 = &ir->compact_instructions[bd2];
+                /* Both ASSIGN/LOAD of the same source operand */
+                if ((bdq1->op == TCCIR_OP_ASSIGN || bdq1->op == TCCIR_OP_LOAD) &&
+                    (bdq2->op == TCCIR_OP_ASSIGN || bdq2->op == TCCIR_OP_LOAD))
+                {
+                  IROperand bs1 = tcc_ir_op_get_src1(ir, bdq1);
+                  IROperand bs2 = tcc_ir_op_get_src1(ir, bdq2);
+                  int32_t bsvr1 = irop_get_vreg(bs1);
+                  int32_t bsvr2 = irop_get_vreg(bs2);
+                  /* Same vreg source (e.g. both LOAD from V0) */
+                  if (bsvr1 >= 0 && bsvr1 == bsvr2)
+                    is_equal = 1;
+                  /* Both non-vreg: compare structurally (e.g. same GlobalSym) */
+                  if (!is_equal && bsvr1 < 0 && bsvr2 < 0)
+                    is_equal = ir_opt_nonvreg_expr_equal(ir, bs1, bs2);
+                  /* One is vreg (LOAD(V0)), other is constant (ASSIGN(GlobalSym)):
+                   * resolve the vreg's value and compare with the constant. */
+                  if (!is_equal && ((bsvr1 >= 0) != (bsvr2 >= 0)))
+                  {
+                    int vreg_side = (bsvr1 >= 0) ? bsvr1 : bsvr2;
+                    IROperand const_side = (bsvr1 >= 0) ? bs2 : bs1;
+                    int vreg_def_at = (bsvr1 >= 0) ? bd1 : bd2;
+                    int vdef = tcc_ir_find_defining_instruction(ir, vreg_side, vreg_def_at);
+                    if (vdef >= 0)
+                    {
+                      IRQuadCompact *vdq = &ir->compact_instructions[vdef];
+                      if (vdq->op == TCCIR_OP_ASSIGN)
+                      {
+                        IROperand vs = tcc_ir_op_get_src1(ir, vdq);
+                        if (irop_get_vreg(vs) < 0)
+                          is_equal = ir_opt_nonvreg_expr_equal(ir, vs, const_side);
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    if (!is_equal)
+      continue;
+
+    /* Both operands compute the same expression — fold the CMP */
+    IRQuadCompact *next = &ir->compact_instructions[i + 1];
+    if (next->op == TCCIR_OP_JUMPIF)
+    {
+      IROperand cond = tcc_ir_op_get_src1(ir, next);
+      int tok = (int)irop_get_imm64_ex(ir, cond);
+      int result = evaluate_compare_condition(0, 0, tok);
+      if (result < 0)
+        continue;
+      IROperand jmp_dest = tcc_ir_op_get_dest(ir, next);
+      if (result)
+      {
+        q->op = TCCIR_OP_NOP;
+        next->op = TCCIR_OP_JUMP;
+        tcc_ir_set_dest(ir, i + 1, jmp_dest);
+      }
+      else
+      {
+        q->op = TCCIR_OP_NOP;
+        next->op = TCCIR_OP_NOP;
+      }
+      changes++;
+    }
+    else if (next->op == TCCIR_OP_SELECT)
+    {
+      IROperand select_cond = ir->iroperand_pool[next->operand_base + 3];
+      int tok = (int)irop_get_imm64_ex(ir, select_cond);
+      int result = evaluate_compare_condition(0, 0, tok);
+      if (result < 0)
+        continue;
+      IROperand then_val = tcc_ir_op_get_src1(ir, next);
+      IROperand else_val = tcc_ir_op_get_src2(ir, next);
+      IROperand chosen = result ? then_val : else_val;
+      q->op = TCCIR_OP_NOP;
+      next->op = TCCIR_OP_ASSIGN;
+      tcc_ir_set_src1(ir, i + 1, chosen);
+      tcc_ir_set_src2(ir, i + 1, IROP_NONE);
+      changes++;
+    }
+  }
+
+  tcc_free(dc);
+
+  if (changes)
+    changes += tcc_ir_opt_dce(ir);
+
+  return changes;
 }
 
 /* Copy Propagation

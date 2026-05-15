@@ -25772,6 +25772,21 @@ static void gen_function(Sym *sym)
     if (tcc_state->opt_const_prop)
       changes += tcc_ir_opt_const_prop_tmp(ir);
 
+    /* ADD/SUB constant reassociation — normalize ADD(ADD(base, c1), c2) into
+     * ADD(base, c1+c2).  Enables CMP identity folding to detect that two
+     * independently computed "base + N" values are identical.
+     * Follow with redundant_var_assign to remove old defs made dead by
+     * the reassociation, so single_def checks pass in subsequent CMP fold. */
+    if (tcc_state->opt_const_prop)
+    {
+      int reassoc_ch = tcc_ir_opt_add_reassoc(ir);
+      if (reassoc_ch)
+      {
+        tcc_ir_opt_redundant_var_assign(ir);
+        changes += reassoc_ch;
+      }
+    }
+
     /* Fold constant string builtin calls after argument/address
      * propagation exposes literal-backed pointers in the IR. */
     if (tcc_state->opt_const_prop)
@@ -25782,6 +25797,13 @@ static void gen_function(Sym *sym)
      * Must run after const_prop so single-def constants are already folded. */
     if (tcc_state->opt_const_prop)
       changes += tcc_ir_opt_value_tracking(ir);
+
+    /* CMP expression-equality fold — detect CMP(a, b) where a and b are
+     * defined by identical expressions (e.g. both ADD(GlobalSym, 5)).
+     * Runs after value_tracking which simplifies LOAD→ASSIGN, exposing
+     * single-def vregs with matching definitions. */
+    if (tcc_state->opt_const_prop)
+      changes += tcc_ir_opt_cmp_expr_fold(ir);
 
     /* Phase 1c: Constant Branch Folding - fold branches with constant conditions
      * This is critical for optimizing conditionals where values are constants.

@@ -1,4 +1,14 @@
 {
+  "105_builtin_strncmp_zero_count::main": {
+    "gcc": 2,
+    "tcc": 16,
+    "updated": "2026-05-15T07:15:32.221377+00:00"
+  },
+  "105_builtin_strncmp_zero_count::strncmp": {
+    "gcc": 15,
+    "tcc": 39,
+    "updated": "2026-05-15T07:15:32.221390+00:00"
+  },
   "95_cse::main": {
     "gcc": 12,
     "tcc": 12,
@@ -71,8 +81,8 @@
   },
   "ir/105_builtin_strncmp_zero_count::main": {
     "gcc": 9,
-    "tcc": 16,
-    "updated": "2026-05-14T21:11:44.701090+00:00"
+    "tcc": 11,
+    "updated": "2026-05-15T15:19:14.946926+00:00"
   },
   "ir/105_builtin_strncmp_zero_count::strncmp": {
     "gcc": 15,
@@ -921,13 +931,13 @@
   },
   "ir/mibench_rijndael::decrypt": {
     "gcc": 981,
-    "tcc": 1226,
-    "updated": "2026-05-14T21:11:44.701474+00:00"
+    "tcc": 1183,
+    "updated": "2026-05-15T15:19:14.947074+00:00"
   },
   "ir/mibench_rijndael::encrypt": {
     "gcc": 987,
-    "tcc": 1226,
-    "updated": "2026-05-14T21:11:44.701476+00:00"
+    "tcc": 1183,
+    "updated": "2026-05-15T15:19:14.947078+00:00"
   },
   "ir/mibench_rijndael::main": {
     "gcc": 7,
@@ -1291,8 +1301,8 @@
   },
   "ir/test_mibench_sha::sha_final": {
     "gcc": 55,
-    "tcc": 45,
-    "updated": "2026-05-14T21:11:44.701223+00:00"
+    "tcc": 48,
+    "updated": "2026-05-15T15:19:14.946980+00:00"
   },
   "ir/test_mibench_sha::sha_init": {
     "gcc": 13,
@@ -1583,6 +1593,11 @@
     "gcc": 23,
     "tcc": 59,
     "updated": "2026-05-14T21:11:44.701470+00:00"
+  },
+  "test_double_printf_mixed::main": {
+    "gcc": 15,
+    "tcc": 16,
+    "updated": "2026-05-15T15:26:49.301585+00:00"
   },
   "tests2/00_assignment::main": {
     "gcc": 13,
