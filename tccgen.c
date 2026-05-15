@@ -12379,12 +12379,16 @@ ST_FUNC void indir(void)
   {
     SValue dest;
     svalue_init(&dest);
-    dest.type = *pointed_type(&vtop->type);
+    /* The temp holds the pointer value (u32), not the dereferenced value.
+     * Use vtop's pointer type so the ASSIGN's dest btype matches what the
+     * register actually contains.  Earlier code used *pointed_type(), which
+     * mis-typed pointer temps as their pointed-to type and forced the
+     * codegen to emit a spurious u32→u64 zero-extension. */
+    dest.type = vtop->type;
     dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
     tcc_ir_put(tcc_state->ir, TCCIR_OP_ASSIGN, vtop, NULL, &dest);
     vtop->vr = dest.vr;
     vtop->r = 0;
-    // gv(RC_INT);
   }
   vtop->type = *pointed_type(&vtop->type);
   /* After pointer dereference, the result represents the pointed-to object,
@@ -25824,6 +25828,11 @@ static void gen_function(Sym *sym)
     if (tcc_state->opt_const_prop)
       changes += tcc_ir_opt_stack_bool_diamond(ir);
 
+    /* Phase 1c3b: OR-Boolean-Diamond. Same shape as 1c3 but with the
+     * stack-slot consumer being `acc |= slot` rather than TEST_ZERO+JUMPIF. */
+    if (tcc_state->opt_const_prop)
+      changes += tcc_ir_opt_or_bool_diamond(ir);
+
     /* Phase 1c4: VAR → TMP local forwarding. Reroute in-BB uses of a VAR
      * just written from a TEMP to use the TEMP directly (no reload). */
     if (tcc_state->opt_const_prop)
@@ -26124,6 +26133,7 @@ static void gen_function(Sym *sym)
       tcc_ir_opt_stack_addr_nonnull_fold(ir);
       tcc_ir_opt_setif_branch_fuse(ir);
       tcc_ir_opt_stack_bool_diamond(ir);
+      tcc_ir_opt_or_bool_diamond(ir);
       tcc_ir_opt_var_tmp_fwd(ir);
       /* DCE first: unreachable code after branch folding (e.g. dead error
        * paths) must be NOP'd before fallthrough elimination can see that
@@ -26332,6 +26342,8 @@ static void gen_function(Sym *sym)
         if (tcc_state->opt_const_prop)
           ch2 += tcc_ir_opt_stack_bool_diamond(ir);
         if (tcc_state->opt_const_prop)
+          ch2 += tcc_ir_opt_or_bool_diamond(ir);
+        if (tcc_state->opt_const_prop)
           ch2 += tcc_ir_opt_var_tmp_fwd(ir);
         if (tcc_state->opt_const_prop)
           ch2 += tcc_ir_opt_value_tracking(ir);
@@ -26406,6 +26418,10 @@ static void gen_function(Sym *sym)
 
   /* PACK64 peephole — collapse `((u64)hi << 32) | (u64)lo` chains. */
   tcc_ir_opt_pack64(ir);
+
+  /* OR-bool-diamond — fold `acc |= (cond ? 1 : 0)` materialization. */
+  if (tcc_state->opt_const_prop)
+    tcc_ir_opt_or_bool_diamond(ir);
 
   /* Late deref forwarding — var_tmp_fwd may have expanded VARs back to
    * their defining deref expressions, creating STORE+CMP deref pairs. */
@@ -26501,6 +26517,25 @@ static void gen_function(Sym *sym)
     }
   }
 
+  /* PACK64 tautology — collapse PACK64(low(X), X>>32) into ASSIGN X.
+   * Must run AFTER late var_tmp_fwd + copy_prop: those passes resolve the
+   * intermediate TMP chains so PACK64's operands directly reference the
+   * defining ASSIGN/LOAD/SHR ops on a common X.  When the fold fires, the
+   * resulting `CMP X, X` is caught by identity-comparison folding in a
+   * second const_prop pass. */
+  if (tcc_ir_opt_pack64_tautology(ir) > 0)
+  {
+    if (tcc_state->opt_copy_prop)
+    {
+      tcc_ir_opt_var_tmp_fwd(ir);
+      tcc_ir_opt_copy_prop(ir);
+    }
+    if (tcc_state->opt_const_prop)
+      tcc_ir_opt_const_prop(ir);
+    if (tcc_state->opt_dce)
+      tcc_ir_opt_dce(ir);
+  }
+
   /* ADD-immediate + DEREF fold into LOAD_INDEXED — DISABLED.
    * The fold moves the memory load from the DEREF use site to the ADD
    * site, which can violate memory ordering even with FUNCPARAMVAL-only
@@ -26531,6 +26566,17 @@ static void gen_function(Sym *sym)
         tcc_ir_opt_eliminate_fallthrough(ir);
     }
   }
+
+  /* CMP narrowing — `CMP T_u64, u64_const_with_hi_0` → 32-bit CMP when
+   * T's hi is provably zero (from SHR≥32 or ZEXT).  Eliminates the hi
+   * half setup and compare. */
+  tcc_ir_opt_cmp_narrow_64(ir);
+
+  /* ASSIGN fusion — fold `T_new = X OP Y; T_final = T_new ASSIGN` into a
+   * single op writing directly to T_final.  Runs very late so it sees the
+   * stable IR after var_to_tmp / copy_prop / dce, which is when the chain
+   * pattern is most prevalent (e.g. or_bool_diamond's true arm). */
+  tcc_ir_opt_assign_fuse(ir);
 
   /* Phase 8: Conditional Select - replace if/else diamonds with SELECT.
    * Must run late, after all other optimizations have simplified the IR,

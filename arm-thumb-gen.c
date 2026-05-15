@@ -5782,22 +5782,56 @@ ST_FUNC void tcc_gen_machine_cmp_eq64_mop(MachineOperand src1, MachineOperand sr
   if (thumb_is_hw_reg(rn_hi))
     excl |= (1u << (uint32_t)rn_hi);
 
-  MachineOperand s2_lo = mach_make_lo_half(&r_src2);
-  s2_lo.btype = IROP_BTYPE_INT32;
-  int rm_lo = mach_ensure_in_reg(&ctx, &s2_lo, excl);
-  if (thumb_is_hw_reg(rm_lo))
-    excl |= (1u << (uint32_t)rm_lo);
+  /* Immediate-CMP fast path: if src2 is a u64 immediate, try the cmp-imm
+   * form (`cmp.w Rn, #imm`) for each half — avoids loading the constant
+   * into a scratch reg.  Probe encodability before allocating scratches:
+   * `mach_ensure_in_reg` on a MACH_OP_IMM would unconditionally emit a
+   * `movs Rscratch, #imm`, which is exactly the instruction we're trying
+   * to avoid here. */
+  thumb_opcode hi_imm_op = {0};
+  thumb_opcode lo_imm_op = {0};
+  if (r_src2.kind == MACH_OP_IMM)
+  {
+    const uint64_t imm = (uint64_t)r_src2.u.imm.val;
+    const uint32_t imm_lo = (uint32_t)(imm & 0xffffffffu);
+    const uint32_t imm_hi = (uint32_t)(imm >> 32);
+    hi_imm_op = th_cmp_imm((uint32_t)rn_hi, imm_hi, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE);
+    lo_imm_op = th_cmp_imm((uint32_t)rn_lo, imm_lo, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE);
+  }
 
-  MachineOperand s2_hi = mach_make_hi_half(&r_src2);
-  s2_hi.btype = IROP_BTYPE_INT32;
-  int rm_hi = mach_ensure_in_reg(&ctx, &s2_hi, excl);
+  /* Use cmp-imm for whichever halves fit; only allocate scratch
+   * registers for halves that need them. */
+  int hi_uses_imm = (r_src2.kind == MACH_OP_IMM && hi_imm_op.size);
+  int lo_uses_imm = (r_src2.kind == MACH_OP_IMM && lo_imm_op.size);
 
-  ot_check(th_cmp_reg(0, (uint32_t)rn_hi, (uint32_t)rm_hi, FLAGS_BEHAVIOUR_SET, THUMB_SHIFT_DEFAULT,
-                       ENFORCE_ENCODING_NONE));
+  int rm_lo = 0, rm_hi = 0;
+  if (!lo_uses_imm)
+  {
+    MachineOperand s2_lo = mach_make_lo_half(&r_src2);
+    s2_lo.btype = IROP_BTYPE_INT32;
+    rm_lo = mach_ensure_in_reg(&ctx, &s2_lo, excl);
+    if (thumb_is_hw_reg(rm_lo))
+      excl |= (1u << (uint32_t)rm_lo);
+  }
+  if (!hi_uses_imm)
+  {
+    MachineOperand s2_hi = mach_make_hi_half(&r_src2);
+    s2_hi.btype = IROP_BTYPE_INT32;
+    rm_hi = mach_ensure_in_reg(&ctx, &s2_hi, excl);
+  }
+
+  if (hi_uses_imm)
+    ot_check(hi_imm_op);
+  else
+    ot_check(th_cmp_reg(0, (uint32_t)rn_hi, (uint32_t)rm_hi, FLAGS_BEHAVIOUR_SET, THUMB_SHIFT_DEFAULT,
+                         ENFORCE_ENCODING_NONE));
   th_literal_pool_reserve_upcoming_bytes(6);
   ot_check(th_it(mapcc(TOK_EQ), 0x8));
-  ot_check(th_cmp_reg(0, (uint32_t)rn_lo, (uint32_t)rm_lo, FLAGS_BEHAVIOUR_SET, THUMB_SHIFT_DEFAULT,
-                       ENFORCE_ENCODING_NONE));
+  if (lo_uses_imm)
+    ot_check(lo_imm_op);
+  else
+    ot_check(th_cmp_reg(0, (uint32_t)rn_lo, (uint32_t)rm_lo, FLAGS_BEHAVIOUR_SET, THUMB_SHIFT_DEFAULT,
+                         ENFORCE_ENCODING_NONE));
 
   mach_release_all(&ctx);
 }

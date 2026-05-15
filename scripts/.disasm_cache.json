@@ -786,8 +786,8 @@
   },
   "ir/bug_mul_compound::main": {
     "gcc": 140,
-    "tcc": 232,
-    "updated": "2026-05-14T21:11:44.700948+00:00"
+    "tcc": 231,
+    "updated": "2026-05-15T21:22:17.964181+00:00"
   },
   "ir/bug_parse_number_64bit::main": {
     "gcc": 27,
@@ -931,13 +931,13 @@
   },
   "ir/mibench_rijndael::decrypt": {
     "gcc": 981,
-    "tcc": 1183,
-    "updated": "2026-05-15T15:19:14.947074+00:00"
+    "tcc": 1182,
+    "updated": "2026-05-15T21:22:17.964816+00:00"
   },
   "ir/mibench_rijndael::encrypt": {
     "gcc": 987,
-    "tcc": 1183,
-    "updated": "2026-05-15T15:19:14.947078+00:00"
+    "tcc": 1182,
+    "updated": "2026-05-15T21:22:17.964822+00:00"
   },
   "ir/mibench_rijndael::main": {
     "gcc": 7,
@@ -946,8 +946,8 @@
   },
   "ir/mibench_rijndael::set_key": {
     "gcc": 281,
-    "tcc": 464,
-    "updated": "2026-05-14T21:11:44.701480+00:00"
+    "tcc": 462,
+    "updated": "2026-05-15T21:22:17.964830+00:00"
   },
   "ir/mibench_sha::bench_mibench_sha": {
     "gcc": 69,
@@ -976,13 +976,13 @@
   },
   "ir/mibench_sha::sha_stream": {
     "gcc": 31,
-    "tcc": 44,
-    "updated": "2026-05-14T21:11:44.701434+00:00"
+    "tcc": 37,
+    "updated": "2026-05-15T21:22:17.964771+00:00"
   },
   "ir/mibench_sha::sha_transform": {
     "gcc": 147,
-    "tcc": 150,
-    "updated": "2026-05-14T21:11:44.701435+00:00"
+    "tcc": 148,
+    "updated": "2026-05-15T21:22:17.964777+00:00"
   },
   "ir/mibench_sha::sha_update": {
     "gcc": 38,
@@ -1101,8 +1101,8 @@
   },
   "ir/test_cleanup_double::cleanup_double": {
     "gcc": 4,
-    "tcc": 8,
-    "updated": "2026-05-14T21:11:44.700942+00:00"
+    "tcc": 7,
+    "updated": "2026-05-15T21:22:17.964094+00:00"
   },
   "ir/test_cleanup_double::main": {
     "gcc": 9,
@@ -1196,8 +1196,8 @@
   },
   "ir/test_ge_operator::main": {
     "gcc": 72,
-    "tcc": 133,
-    "updated": "2026-05-14T21:11:44.701056+00:00"
+    "tcc": 132,
+    "updated": "2026-05-15T21:56:35.060410+00:00"
   },
   "ir/test_ge_operator::test_ge_direct": {
     "gcc": 5,
@@ -1301,8 +1301,8 @@
   },
   "ir/test_mibench_sha::sha_final": {
     "gcc": 55,
-    "tcc": 48,
-    "updated": "2026-05-15T15:19:14.946980+00:00"
+    "tcc": 45,
+    "updated": "2026-05-15T21:22:17.964575+00:00"
   },
   "ir/test_mibench_sha::sha_init": {
     "gcc": 13,
@@ -1311,8 +1311,8 @@
   },
   "ir/test_mibench_sha::sha_transform": {
     "gcc": 147,
-    "tcc": 150,
-    "updated": "2026-05-14T21:11:44.701226+00:00"
+    "tcc": 148,
+    "updated": "2026-05-15T21:22:17.964586+00:00"
   },
   "ir/test_mibench_sha::sha_update": {
     "gcc": 56,
@@ -1351,8 +1351,8 @@
   },
   "ir/test_mul32wide_outparams::check_pair": {
     "gcc": 32,
-    "tcc": 82,
-    "updated": "2026-05-14T21:11:44.701121+00:00"
+    "tcc": 63,
+    "updated": "2026-05-15T21:22:17.964346+00:00"
   },
   "ir/test_mul32wide_outparams::main": {
     "gcc": 36,
@@ -1366,8 +1366,8 @@
   },
   "ir/test_mul64wide_compare::check_one": {
     "gcc": 47,
-    "tcc": 67,
-    "updated": "2026-05-14T21:11:44.701129+00:00"
+    "tcc": 58,
+    "updated": "2026-05-15T21:22:17.964327+00:00"
   },
   "ir/test_mul64wide_compare::main": {
     "gcc": 42,
@@ -1381,13 +1381,13 @@
   },
   "ir/test_mul64wide_compare::mul64wide_orig": {
     "gcc": 62,
-    "tcc": 104,
-    "updated": "2026-05-14T21:11:44.701135+00:00"
+    "tcc": 70,
+    "updated": "2026-05-15T21:22:17.964337+00:00"
   },
   "ir/test_mul64wide_compare::mul64wide_ref": {
     "gcc": 62,
-    "tcc": 74,
-    "updated": "2026-05-14T21:11:44.701136+00:00"
+    "tcc": 72,
+    "updated": "2026-05-15T21:22:17.964342+00:00"
   },
   "ir/test_offset_addressing::compute_with_array": {
     "gcc": 9,
@@ -1496,8 +1496,8 @@
   },
   "ir/test_u64_shift32::main": {
     "gcc": 87,
-    "tcc": 182,
-    "updated": "2026-05-14T21:11:44.701140+00:00"
+    "tcc": 112,
+    "updated": "2026-05-15T22:45:46.339705+00:00"
   },
   "ir/test_u64_shift_add::main": {
     "gcc": 26,
@@ -1601,8 +1601,8 @@
   },
   "test_u64_shift32::main": {
     "gcc": 87,
-    "tcc": 150,
-    "updated": "2026-05-15T20:12:56.877752+00:00"
+    "tcc": 112,
+    "updated": "2026-05-15T22:41:45.313487+00:00"
   },
   "test_u64_shift::main": {
     "gcc": 13,

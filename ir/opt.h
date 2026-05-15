@@ -58,6 +58,9 @@ int tcc_ir_opt_setif_branch_fuse(struct TCCIRState *ir);
  * written to a single-use stack slot into two direct branches. */
 int tcc_ir_opt_stack_bool_diamond(struct TCCIRState *ir);
 
+/* OR-bool-diamond — fold `acc |= (cond ? 1 : 0)` into a conditional OR. */
+int tcc_ir_opt_or_bool_diamond(struct TCCIRState *ir);
+
 /* VAR → TMP local forwarding. After STORE V ← T, rewrite subsequent reads of
  * V within the same BB to use T directly, avoiding the spill/reload round-trip. */
 int tcc_ir_opt_var_tmp_fwd(struct TCCIRState *ir);
@@ -93,6 +96,16 @@ int tcc_ir_copy_propagation(struct TCCIRState *ir);
 
 /* PACK64 peephole - collapse ZEXT + SHL #32 + ZEXT + OR -> PACK64 */
 int tcc_ir_opt_pack64(struct TCCIRState *ir);
+
+/* PACK64 tautology fold - collapse PACK64(low(X), X>>32) -> ASSIGN X */
+int tcc_ir_opt_pack64_tautology(struct TCCIRState *ir);
+
+/* ASSIGN fusion - fold `T_new = X OP Y; T_final = T_new` into one op */
+int tcc_ir_opt_assign_fuse(struct TCCIRState *ir);
+
+/* CMP narrowing - rewrite `CMP T_u64, u64_imm_with_hi_0` to 32-bit
+ * when T's hi half is provably zero (SHR>=32 or ZEXT). */
+int tcc_ir_opt_cmp_narrow_64(struct TCCIRState *ir);
 
 /* Global LOAD value CSE - deduplicate loads from the same global within a BB */
 int tcc_ir_opt_cse_global_load(struct TCCIRState *ir);
