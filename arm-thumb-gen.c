@@ -5931,6 +5931,46 @@ ST_FUNC void tcc_gen_machine_umull_mop(MachineOperand src1, MachineOperand src2,
   mach_release_all(&ctx);
 }
 
+/* tcc_gen_machine_pack64_mop: lower TCCIR_OP_PACK64 by emitting two
+ * 32-bit assigns into the dest's halves.  src_lo and src_hi are u32
+ * operands; dest is a u64 register pair / spill / param slot.
+ *
+ * The two sub-assigns delegate to tcc_gen_machine_assign_mop, so they
+ * benefit from its existing handling of every dest kind (REG/SPILL/...).
+ * Often regalloc has already aligned the registers (e.g. dest.r0 = src_lo
+ * register), in which case the sub-assigns degrade to a no-op MOV that
+ * the encoder can skip. */
+ST_FUNC void tcc_gen_machine_pack64_mop(MachineOperand src_lo, MachineOperand src_hi, MachineOperand dest)
+{
+  if (!dest.is_64bit)
+  {
+    tcc_error("compiler_error: tcc_gen_machine_pack64_mop: dest not 64-bit");
+    return;
+  }
+  MachineOperand dst_lo = mach_make_lo_half(&dest);
+  MachineOperand dst_hi = mach_make_hi_half(&dest);
+  dst_lo.btype = IROP_BTYPE_INT32;
+  dst_hi.btype = IROP_BTYPE_INT32;
+  /* Order matters when dst_lo aliases src_hi (e.g. regalloc placed dest.r0
+   * on the same register as src_hi): write the half that doesn't alias
+   * src_hi first.  In practice src_lo→dst_lo is safe when dst_lo != src_hi's
+   * register; otherwise stage through a scratch via assign_mop's normal
+   * register-conflict handling. */
+  if (src_hi.kind == MACH_OP_REG && !src_hi.needs_deref &&
+      dst_lo.kind == MACH_OP_REG && !dst_lo.needs_deref &&
+      src_hi.u.reg.r0 == dst_lo.u.reg.r0)
+  {
+    /* dst_lo == src_hi register: write hi first to free src_hi's slot. */
+    tcc_gen_machine_assign_mop(src_hi, dst_hi, TCCIR_OP_ASSIGN);
+    tcc_gen_machine_assign_mop(src_lo, dst_lo, TCCIR_OP_ASSIGN);
+  }
+  else
+  {
+    tcc_gen_machine_assign_mop(src_lo, dst_lo, TCCIR_OP_ASSIGN);
+    tcc_gen_machine_assign_mop(src_hi, dst_hi, TCCIR_OP_ASSIGN);
+  }
+}
+
 /* tcc_gen_machine_assign_mop: MachineOperand-based entry point for simple
  * 32-bit value assignment.  Called from ir/codegen.c instead of
  * tcc_gen_machine_assign_op when:

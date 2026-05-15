@@ -118,6 +118,10 @@ const char *tcc_ir_get_op_name(TccIrOp op)
     return "CVT_ITOF";
   case TCCIR_OP_CVT_FTOI:
     return "CVT_FTOI";
+  case TCCIR_OP_ZEXT:
+    return "ZEXT";
+  case TCCIR_OP_PACK64:
+    return "PACK64";
   case TCCIR_OP_BOOL_OR:
     return "BOOL_OR";
   case TCCIR_OP_BOOL_AND:

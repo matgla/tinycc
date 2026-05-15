@@ -27893,3 +27893,171 @@ int tcc_ir_opt_local_addrof_const_fold(TCCIRState *ir)
   return changes;
 }
 
+/* tcc_ir_opt_pack64: peephole that detects the C-level
+ *   `((uint64_t)hi << 32) | (uint64_t)lo`
+ * pattern in the IR and collapses it to a single PACK64 op.
+ *
+ * IR shape before:
+ *   i_zh: T_zh   = ZEXT src_hi             (u32 -> u64)
+ *   i_sh: T_sh   = T_zh SHL #32            (u64)
+ *   i_zl: T_zl   = ZEXT src_lo             (u32 -> u64)
+ *   i_or: dest   = T_sh OR T_zl            (u64; operand order may be swapped)
+ *
+ * IR shape after:
+ *   i_zh, i_sh, i_zl: NOP
+ *   i_or: dest = PACK64(src_lo, src_hi)
+ *
+ * Requires each intermediate (T_zh, T_sh, T_zl) to be a TEMP with exactly
+ * one use — otherwise NOP'ing the producer would lose data. */
+int tcc_ir_opt_pack64(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  int changes = 0;
+  if (n < 4)
+    return 0;
+
+  /* Find max TEMP position and build def_idx + use_count for TEMPs. */
+  int max_tmp_pos = 0;
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
+      continue;
+    int32_t vr = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
+    if (TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
+      continue;
+    int pos = TCCIR_DECODE_VREG_POSITION(vr);
+    if (pos > max_tmp_pos)
+      max_tmp_pos = pos;
+  }
+  if (max_tmp_pos == 0)
+    return 0;
+
+  int stride = max_tmp_pos + 1;
+  int *def_idx = tcc_malloc(stride * sizeof(int));
+  uint16_t *use_count = tcc_mallocz(stride * sizeof(uint16_t));
+  for (int i = 0; i < stride; i++)
+    def_idx[i] = -1;
+
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    if (irop_config[q->op].has_src1)
+    {
+      int32_t vr = irop_get_vreg(tcc_ir_op_get_src1(ir, q));
+      if (TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP)
+      {
+        int pos = TCCIR_DECODE_VREG_POSITION(vr);
+        if (pos <= max_tmp_pos && use_count[pos] < 0xFFFF)
+          use_count[pos]++;
+      }
+    }
+    if (irop_config[q->op].has_src2)
+    {
+      int32_t vr = irop_get_vreg(tcc_ir_op_get_src2(ir, q));
+      if (TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP)
+      {
+        int pos = TCCIR_DECODE_VREG_POSITION(vr);
+        if (pos <= max_tmp_pos && use_count[pos] < 0xFFFF)
+          use_count[pos]++;
+      }
+    }
+    if (irop_config[q->op].has_dest)
+    {
+      int32_t vr = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
+      if (TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP &&
+          q->op != TCCIR_OP_STORE && q->op != TCCIR_OP_STORE_INDEXED &&
+          q->op != TCCIR_OP_FUNCPARAMVAL)
+      {
+        int pos = TCCIR_DECODE_VREG_POSITION(vr);
+        if (pos <= max_tmp_pos)
+        {
+          if (def_idx[pos] >= 0)
+            def_idx[pos] = -2; /* multiple defs — disqualify */
+          else
+            def_idx[pos] = i;
+        }
+      }
+    }
+  }
+
+  /* Scan for the pack pattern at each OR. */
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_OR)
+      continue;
+    IROperand or_dest = tcc_ir_op_get_dest(ir, q);
+    if (irop_get_btype(or_dest) != IROP_BTYPE_INT64)
+      continue;
+    if (or_dest.is_lval)
+      continue;
+
+    IROperand or_src1 = tcc_ir_op_get_src1(ir, q);
+    IROperand or_src2 = tcc_ir_op_get_src2(ir, q);
+
+    /* Both orderings: src1 = SHL, src2 = ZEXT  OR  src1 = ZEXT, src2 = SHL. */
+    for (int swap = 0; swap < 2; swap++)
+    {
+      IROperand shl_op = swap ? or_src2 : or_src1;
+      IROperand zl_op = swap ? or_src1 : or_src2;
+
+      int32_t shl_vr = irop_get_vreg(shl_op);
+      int32_t zl_vr = irop_get_vreg(zl_op);
+      if (TCCIR_DECODE_VREG_TYPE(shl_vr) != TCCIR_VREG_TYPE_TEMP)
+        continue;
+      if (TCCIR_DECODE_VREG_TYPE(zl_vr) != TCCIR_VREG_TYPE_TEMP)
+        continue;
+      int shl_pos = TCCIR_DECODE_VREG_POSITION(shl_vr);
+      int zl_pos = TCCIR_DECODE_VREG_POSITION(zl_vr);
+      if (shl_pos > max_tmp_pos || zl_pos > max_tmp_pos)
+        continue;
+      if (use_count[shl_pos] != 1 || use_count[zl_pos] != 1)
+        continue;
+      if (def_idx[shl_pos] < 0 || def_idx[zl_pos] < 0)
+        continue;
+
+      IRQuadCompact *shl_q = &ir->compact_instructions[def_idx[shl_pos]];
+      if (shl_q->op != TCCIR_OP_SHL)
+        continue;
+      IROperand shl_amt = tcc_ir_op_get_src2(ir, shl_q);
+      if (!irop_is_immediate(shl_amt) || irop_get_imm64_ex(ir, shl_amt) != 32)
+        continue;
+      IROperand shl_input = tcc_ir_op_get_src1(ir, shl_q);
+      int32_t shl_input_vr = irop_get_vreg(shl_input);
+      if (TCCIR_DECODE_VREG_TYPE(shl_input_vr) != TCCIR_VREG_TYPE_TEMP)
+        continue;
+      int zh_pos = TCCIR_DECODE_VREG_POSITION(shl_input_vr);
+      if (zh_pos > max_tmp_pos || use_count[zh_pos] != 1 || def_idx[zh_pos] < 0)
+        continue;
+
+      IRQuadCompact *zh_q = &ir->compact_instructions[def_idx[zh_pos]];
+      IRQuadCompact *zl_q = &ir->compact_instructions[def_idx[zl_pos]];
+      if (zh_q->op != TCCIR_OP_ZEXT || zl_q->op != TCCIR_OP_ZEXT)
+        continue;
+
+      IROperand src_hi = tcc_ir_op_get_src1(ir, zh_q);
+      IROperand src_lo = tcc_ir_op_get_src1(ir, zl_q);
+
+      LOG_IR_GEN("OPTIMIZE: PACK64 fold at i=%d (zh=%d, sh=%d, zl=%d)", i,
+                 def_idx[zh_pos], def_idx[shl_pos], def_idx[zl_pos]);
+
+      q->op = TCCIR_OP_PACK64;
+      tcc_ir_set_src1(ir, i, src_lo);
+      tcc_ir_set_src2(ir, i, src_hi);
+
+      ir->compact_instructions[def_idx[zh_pos]].op = TCCIR_OP_NOP;
+      ir->compact_instructions[def_idx[shl_pos]].op = TCCIR_OP_NOP;
+      ir->compact_instructions[def_idx[zl_pos]].op = TCCIR_OP_NOP;
+      changes++;
+      break;
+    }
+  }
+
+  tcc_free(def_idx);
+  tcc_free(use_count);
+  return changes;
+}
+

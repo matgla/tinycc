@@ -95,6 +95,15 @@ typedef enum TccIrOp
   TCCIR_OP_CVT_FTOF, /* float to double or double to float */
   TCCIR_OP_CVT_ITOF, /* int to float/double */
   TCCIR_OP_CVT_FTOI, /* float/double to int */
+  /* Integer zero-extension: dest = (u_dest_width) src. Always zero-extends
+   * regardless of source signedness — distinguished from ASSIGN/OR so the
+   * optimizer never sign-extends the source value when folding. */
+  TCCIR_OP_ZEXT,
+  /* Pack two u32 values into a u64: dest_lo = src1, dest_hi = src2.
+   * Emitted by a peephole that detects `((u64)hi << 32) | (u64)lo` chains
+   * (ZEXT + SHL #32 + ZEXT + OR) and collapses them.  Backend lowers to
+   * two 32-bit register moves; regalloc can often eliminate them. */
+  TCCIR_OP_PACK64,
   /* Logical boolean operations - produce 0/1 result */
   TCCIR_OP_BOOL_OR,  /* (src1 != 0) || (src2 != 0) -> 0/1 */
   TCCIR_OP_BOOL_AND, /* (src1 != 0) && (src2 != 0) -> 0/1 */

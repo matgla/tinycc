@@ -2007,6 +2007,8 @@ const IRRegistersConfig irop_config[] = {
     [TCCIR_OP_CVT_FTOF] = {1, 1, 0}, /* dest=result, src1=input */
     [TCCIR_OP_CVT_ITOF] = {1, 1, 0}, /* dest=result, src1=input */
     [TCCIR_OP_CVT_FTOI] = {1, 1, 0}, /* dest=result, src1=input */
+    [TCCIR_OP_ZEXT] = {1, 1, 0},     /* dest = (u_dest_width) src1 */
+    [TCCIR_OP_PACK64] = {1, 1, 1},   /* dest_lo = src1, dest_hi = src2 */
     /* Logical boolean operations */
     [TCCIR_OP_BOOL_OR] = {1, 1, 1},  /* dest = (src1 || src2) */
     [TCCIR_OP_BOOL_AND] = {1, 1, 1}, /* dest = (src1 && src2) */

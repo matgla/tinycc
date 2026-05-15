@@ -91,6 +91,9 @@ int tcc_ir_opt_copy_prop(struct TCCIRState *ir);
 /* Legacy copy propagation function - wrapper for tcc_ir_opt_copy_prop */
 int tcc_ir_copy_propagation(struct TCCIRState *ir);
 
+/* PACK64 peephole - collapse ZEXT + SHL #32 + ZEXT + OR -> PACK64 */
+int tcc_ir_opt_pack64(struct TCCIRState *ir);
+
 /* Global LOAD value CSE - deduplicate loads from the same global within a BB */
 int tcc_ir_opt_cse_global_load(struct TCCIRState *ir);
 

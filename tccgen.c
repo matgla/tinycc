@@ -3410,11 +3410,14 @@ static void lbuild(int t)
       int result_vr = tcc_ir_get_vreg_temp(tcc_state->ir);
       if ((t & VT_BTYPE) == VT_LLONG)
         tcc_ir_set_llong_type(tcc_state->ir, result_vr);
-      /* Special case: high word is constant 0 - just assign/extend low to 64-bit */
+      /* Special case: high word is constant 0 — emit a dedicated zero-extend
+       * op.  This is opaque to the IR optimizer's value tracker, which would
+       * sign-extend the low half if we used `low OR 0_u64`.  The codegen
+       * lowers ZEXT to "low half = low, high half = 0" (same as ASSIGN of a
+       * 32-bit src into a 64-bit dest), but the dedicated opcode survives
+       * copy-propagation so the widening always reaches the backend. */
       if (high_is_const && high.c.i == 0)
       {
-        /* Result is just the low word zero-extended to 64-bit.
-         * Generate: result = low | 0 (or just assign if low is already correct) */
         SValue result;
         memset(&result, 0, sizeof(result));
         result.type.t = t;
@@ -3423,15 +3426,7 @@ static void lbuild(int t)
         if ((result.type.t & VT_BTYPE) == VT_LLONG)
           tcc_ir_set_llong_type(tcc_state->ir, result.vr);
 
-        /* For zero-extension, we can use ASSIGN with proper type or OR with 0 */
-        SValue zero;
-        memset(&zero, 0, sizeof(zero));
-        zero.type.t = VT_LLONG;
-        zero.r = VT_CONST;
-        zero.c.i = 0;
-        zero.vr = -1;
-
-        tcc_ir_put(tcc_state->ir, TCCIR_OP_OR, &low, &zero, &result);
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_ZEXT, &low, NULL, &result);
 
         vtop[-1].vr = result_vr;
         vtop[-1].type.t = t;
@@ -8851,8 +8846,12 @@ again:
       /* generate high word */
       if (sbt & VT_UNSIGNED)
       {
+        /* IR mode: leave the high word as a constant 0 so lbuild's
+         * high_is_const fast path fires (emits a single ZEXT op).
+         * Non-IR mode still needs the value materialized in a register. */
         vpushi(0);
-        gv(RC_INT);
+        if (!tcc_state->ir)
+          gv(RC_INT);
       }
       else
       {
@@ -26404,6 +26403,9 @@ static void gen_function(Sym *sym)
     if (late_cp > 0 && tcc_state->opt_dead_store)
       tcc_ir_opt_dse(ir);
   }
+
+  /* PACK64 peephole — collapse `((u64)hi << 32) | (u64)lo` chains. */
+  tcc_ir_opt_pack64(ir);
 
   /* Late deref forwarding — var_tmp_fwd may have expanded VARs back to
    * their defining deref expressions, creating STORE+CMP deref pairs. */

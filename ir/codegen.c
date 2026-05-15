@@ -2998,6 +2998,24 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
         SCRATCH_WRAP(tcc_gen_machine_assign_mop(a.src1, a.dest, cq->op));
         break;
       }
+      case TCCIR_OP_ZEXT:
+      {
+        /* Zero-extension: lower like ASSIGN — assign_mop already emits the
+         * u32-src→u64-dest widening (low = src, high = 0).  The point of
+         * ZEXT as a distinct opcode is to be opaque to the IR optimizer's
+         * value-tracking, which would otherwise sign-extend the source. */
+        MopArgs a = DECODE(.dest = 2, .src1 = 1);
+        SCRATCH_WRAP(tcc_gen_machine_assign_mop(a.src1, a.dest, TCCIR_OP_ASSIGN));
+        break;
+      }
+      case TCCIR_OP_PACK64:
+      {
+        /* Pack two u32s into a u64: dest_lo = src1, dest_hi = src2.  Lower
+         * to two 32-bit assigns to the dest's halves. */
+        MopArgs a = DECODE(.dest = 2, .src1 = 1, .src2 = 1);
+        SCRATCH_WRAP(tcc_gen_machine_pack64_mop(a.src1, a.src2, a.dest));
+        break;
+      }
       case TCCIR_OP_LEA:
       {
         MopArgs a = DECODE(.dest = 1, .src1 = 1);

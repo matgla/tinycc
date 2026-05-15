@@ -1156,8 +1156,8 @@
   },
   "ir/test_double_printf_mixed::main": {
     "gcc": 15,
-    "tcc": 32,
-    "updated": "2026-05-14T21:11:44.701067+00:00"
+    "tcc": 16,
+    "updated": "2026-05-15T18:32:59.057765+00:00"
   },
   "ir/test_double_printf_ops::main": {
     "gcc": 21,
@@ -1598,6 +1598,16 @@
     "gcc": 15,
     "tcc": 16,
     "updated": "2026-05-15T15:26:49.301585+00:00"
+  },
+  "test_u64_shift32::main": {
+    "gcc": 87,
+    "tcc": 150,
+    "updated": "2026-05-15T20:12:56.877752+00:00"
+  },
+  "test_u64_shift::main": {
+    "gcc": 13,
+    "tcc": 17,
+    "updated": "2026-05-15T18:33:29.505575+00:00"
   },
   "tests2/00_assignment::main": {
     "gcc": 13,
