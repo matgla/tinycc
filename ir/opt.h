@@ -14,20 +14,27 @@
 struct TCCIRState;
 struct TCCState;
 struct IRLoops;
+struct IROptCtx;
 
 /* ============================================================================
  * Optimization Pass Functions
- * ============================================================================ */
+ * ============================================================================
+ * Each pass has a legacy signature (TCCIRState *ir) and a pipeline-ready
+ * _ex variant (IROptCtx *ctx).  The legacy version wraps the _ex version
+ * with a temporary context. */
 
 /* Dead Code Elimination - remove unreachable instructions */
 int tcc_ir_opt_dce(struct TCCIRState *ir);
+int tcc_ir_opt_dce_ex(struct IROptCtx *ctx);
 
 /* NOP Compaction - remove NOP instructions, shrink array, fix jump targets.
  * Returns number of NOPs removed. */
 int tcc_ir_opt_compact_nops(struct TCCIRState *ir);
+int tcc_ir_opt_compact_nops_ex(struct IROptCtx *ctx);
 
 /* Dead Store Elimination - remove stores to dead variables */
 int tcc_ir_opt_dse(struct TCCIRState *ir);
+int tcc_ir_opt_dse_ex(struct IROptCtx *ctx);
 
 /* Dead address-taken VAR elimination - remove writes to VARs with no live reads */
 int tcc_ir_opt_dead_addrvar_elim(struct TCCIRState *ir);
@@ -285,6 +292,43 @@ int tcc_ir_opt_redundant_init_elim(struct TCCIRState *ir);
 /* Back-Edge Phi Hoisting - transform JUMPIF exit + ASSIGNs + JUMP body into
  * ASSIGNs + inverted JUMPIF body, eliminating one branch per loop */
 int tcc_ir_opt_backedge_phi_hoist(struct TCCIRState *ir);
+
+/* ============================================================================
+ * Pipeline-ready _ex variants (accept IROptCtx* for pass manager integration)
+ * ============================================================================ */
+int tcc_ir_opt_const_prop_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_const_prop_tmp_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_const_var_prop_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_global_init_prop_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_value_tracking_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_add_reassoc_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_cmp_expr_fold_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_const_string_calls_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_copy_prop_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_branch_folding_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_stack_addr_nonnull_fold_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_setif_branch_fuse_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_stack_bool_diamond_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_or_bool_diamond_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_float_narrowing_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_pack64_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_pack64_tautology_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_cmp_narrow_64_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_sl_forward_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_deref_fwd_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_entry_store_prop_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_postinc_fusion_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_assign_fuse_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_var_to_tmp_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_var_tmp_fwd_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_vrp_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_nonneg_branch_fold_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_float_branch_fold_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_jump_threading_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_dead_loop_elim_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_redundant_var_assign_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_dead_var_store_elim_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_store_redundant_ex(struct IROptCtx *ctx);
 
 /* ============================================================================
  * Optimization Statistics

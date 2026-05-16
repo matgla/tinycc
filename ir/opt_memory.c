@@ -15,6 +15,7 @@
 
 #include "ir.h"
 #include "opt.h"
+#include "opt_engine.h"
 #include "opt_du.h"
 #include "opt_xform.h"
 #include "opt_utils.h"
@@ -3257,3 +3258,8 @@ int tcc_ir_opt_store_redundant(TCCIRState *ir)
   return changes;
 #undef RSE_MAX_ACTIVE
 }
+
+int tcc_ir_opt_sl_forward_ex(IROptCtx *ctx) { return tcc_ir_opt_sl_forward(ctx->ir); }
+int tcc_ir_opt_deref_fwd_ex(IROptCtx *ctx) { return tcc_ir_opt_deref_fwd(ctx->ir); }
+int tcc_ir_opt_entry_store_prop_ex(IROptCtx *ctx) { return tcc_ir_opt_entry_store_prop(ctx->ir); }
+int tcc_ir_opt_store_redundant_ex(IROptCtx *ctx) { return tcc_ir_opt_store_redundant(ctx->ir); }

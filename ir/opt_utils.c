@@ -445,6 +445,26 @@ void ir_opt_mark_block_starts(TCCIRState *ir, int *block_start_seen, int gen, in
   }
 }
 
+uint8_t *ir_opt_build_block_starts_bitmap(TCCIRState *ir, int n)
+{
+  uint8_t *bs = tcc_mallocz((n + 7) / 8);
+  bs[0] |= 1;
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
+    {
+      IROperand dest = tcc_ir_op_get_dest(ir, q);
+      const int tgt = (int)irop_get_imm64_ex(ir, dest);
+      if (tgt >= 0 && tgt < n)
+        bs[tgt / 8] |= (1 << (tgt % 8));
+      if (i + 1 < n)
+        bs[(i + 1) / 8] |= (1 << ((i + 1) % 8));
+    }
+  }
+  return bs;
+}
+
 int ir_opt_next_non_nop(TCCIRState *ir, int start)
 {
   int n = ir->next_instruction_index;
@@ -952,6 +972,49 @@ const char *ir_opt_get_constant_string_from_symref(TCCIRState *ir, IROperand op)
     return NULL;
 
   return str;
+}
+
+/* ============================================================================
+ * Callee symbol replacement helpers
+ * ============================================================================ */
+
+int change_callee_sym(TCCIRState *ir, int instr_idx, const char *new_name, int ret_btype)
+{
+  IRQuadCompact *q = &ir->compact_instructions[instr_idx];
+  IROperand src1 = tcc_ir_op_get_src1(ir, q);
+  IRPoolSymref *entry = irop_get_symref_ex(ir, src1);
+  if (!entry)
+    return 0;
+
+  CType ftype;
+  ftype.t = VT_FUNC;
+  ftype.ref = sym_push2(&global_stack, SYM_FIELD, ret_btype, 0);
+  ftype.ref->f.func_call = FUNC_CDECL;
+  ftype.ref->f.func_type = FUNC_OLD;
+
+  Sym *new_sym = external_global_sym(tok_alloc_const(new_name), &ftype);
+  if (!new_sym)
+    return 0;
+  entry->sym = new_sym;
+  return 1;
+}
+
+int change_callee_sym_keep_type(TCCIRState *ir, int instr_idx, const char *new_name)
+{
+  IRQuadCompact *q = &ir->compact_instructions[instr_idx];
+  IROperand src1 = tcc_ir_op_get_src1(ir, q);
+  IRPoolSymref *entry = irop_get_symref_ex(ir, src1);
+  Sym *new_sym;
+
+  if (!entry || !entry->sym)
+    return 0;
+
+  new_sym = external_global_sym(tok_alloc_const(new_name), &entry->sym->type);
+  if (!new_sym)
+    return 0;
+
+  entry->sym = new_sym;
+  return 1;
 }
 
 int tcc_ir_vreg_has_single_def(TCCIRState *ir, int32_t vreg)

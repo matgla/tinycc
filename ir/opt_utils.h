@@ -51,6 +51,8 @@ uint8_t *ir_opt_build_merge_bitmap(struct TCCIRState *ir, int n);
 void ir_opt_mark_block_starts(struct TCCIRState *ir, int *block_start_seen,
                               int gen, int n);
 
+uint8_t *ir_opt_build_block_starts_bitmap(struct TCCIRState *ir, int n);
+
 int ir_opt_next_non_nop(struct TCCIRState *ir, int start);
 
 int ir_skip_nops_forward(struct TCCIRState *ir, int start, int n);
@@ -98,5 +100,12 @@ const char *ir_opt_get_constant_string_from_symref(struct TCCIRState *ir,
                                                    IROperand op);
 
 int tcc_ir_vreg_has_single_def(struct TCCIRState *ir, int32_t vreg);
+
+/* ============================================================================
+ * Callee symbol replacement helpers
+ * ============================================================================ */
+
+int change_callee_sym(struct TCCIRState *ir, int instr_idx, const char *new_name, int ret_btype);
+int change_callee_sym_keep_type(struct TCCIRState *ir, int instr_idx, const char *new_name);
 
 #endif /* TCC_IR_OPT_UTILS_H */

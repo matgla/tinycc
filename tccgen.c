@@ -27,6 +27,7 @@
 #include "ir/licm.h"
 #include "ir/opt.h"
 #include "ir/opt_engine.h"
+#include "ir/opt_pipeline.h"
 #include "ir/opt_gens_fusion.h"
 #include "ir/opt_gens_bool.h"
 #include "ir/opt_gens_call_result.h"
@@ -25958,41 +25959,21 @@ static void gen_function(Sym *sym)
    *
    * Ordering constraints:
    *   mla_fusion      should run before indexed/postinc (cleaner patterns)
+   *
+   * Uses a shared IROptCtx for all fusion/gen passes in this section,
+   * avoiding repeated alloc/free and enabling cross-pass DU cache reuse.
    */
-  if (tcc_state->optimize > 0) {
-    IROptCtx fusion_ctx;
-    tcc_ir_opt_ctx_init(&fusion_ctx, ir);
-    tcc_ir_opt_run_gens(&fusion_ctx, fusion_gens, fusion_gens_count);
-    tcc_ir_opt_ctx_free(&fusion_ctx);
-  }
+  IROptCtx pipeline_ctx;
+  tcc_ir_opt_ctx_init(&pipeline_ctx, ir);
 
-  /* Barrel shift fusion: fold single-use SHL/SHR/SAR/ROR into consuming ALU op.
-   * Runs before regalloc so liveness is updated. Results stored in ir->barrel_shifts[]
-   * side-table keyed by orig_index (stable across regalloc instruction renumbering). */
+  if (tcc_state->optimize > 0)
+    tcc_ir_opt_gens_fusion_ex(&pipeline_ctx);
 
-  /* MLA + indexed memory fusion now handled by fusion_gens engine above */
+  if (tcc_state->opt_indexed_memory)
+    tcc_ir_opt_gens_deref_indexed_ex(&pipeline_ctx);
 
-  /* Deref-in-ALU indexed fusion: extract deref operands in ALU instructions
-   * (e.g. XOR with table lookup) into LOAD_INDEXED when the address is
-   * computed by SHL+ADD.  Runs after regular indexed fusion to catch the
-   * remaining patterns where the load is embedded in an ALU operand. */
-  if (tcc_state->opt_indexed_memory) {
-    IROptCtx deref_ctx;
-    tcc_ir_opt_ctx_init(&deref_ctx, ir);
-    tcc_ir_opt_run_gens(&deref_ctx, fusion_deref_indexed_gens, fusion_deref_indexed_gens_count);
-    tcc_ir_opt_ctx_free(&deref_ctx);
-  }
-
-  /* Displacement load/store fusion - fuse ADD(base, #imm) + LOAD/STORE/ASSIGN-lval
-   * into a single LOAD_INDEXED/STORE_INDEXED with scale=0 and immediate index.
-   * Must follow the SHL+ADD fusion above (disjoint patterns, but ordering keeps
-   * the def/use table interpretation clean after NOPs are inserted). */
-  if (tcc_state->opt_disp_fusion) {
-    IROptCtx disp_ctx;
-    tcc_ir_opt_ctx_init(&disp_ctx, ir);
-    tcc_ir_opt_run_gens(&disp_ctx, fusion_disp_gens, fusion_disp_gens_count);
-    tcc_ir_opt_ctx_free(&disp_ctx);
-  }
+  if (tcc_state->opt_disp_fusion)
+    tcc_ir_opt_gens_disp_ex(&pipeline_ctx);
 
   /* ADD+deref fold - fuse ADD(base, #imm) where the result is used as an
    * lval (implicit deref) in CMP/ADD/etc into LOAD_INDEXED + plain use.
@@ -26012,26 +25993,11 @@ static void gen_function(Sym *sym)
       tcc_ir_opt_dce(ir);
   }
 
-  /* Indexed-chain fold: collapse `T = base ADD #imm1; T _INDEXED #imm2`
-   * into a single _INDEXED op with combined offset.  Catches sha_final-style
-   * struct-field-of-array-base writes that disp_fusion can't see in one
-   * pass (its consumer-side dispatch only matches plain LOAD/STORE). */
+  /* Indexed-chain fold + pair reorder (invalidate ctx after intermediate passes) */
   if (tcc_state->opt_disp_fusion) {
-    IROptCtx chain_ctx;
-    tcc_ir_opt_ctx_init(&chain_ctx, ir);
-    tcc_ir_opt_run_gens(&chain_ctx, fusion_chain_gens, fusion_chain_gens_count);
-    tcc_ir_opt_ctx_free(&chain_ctx);
-  }
-
-  /* Indexed-pair reorder: sink FUNCPARAMVAL past the next LOAD/STORE_INDEXED
-   * so adjacent _INDEXED ops with same base + adjacent offsets become
-   * physically adjacent in the IR, exposing them to the codegen LDRD/STRD
-   * pairing peephole.  Helps printf-of-many-fields patterns like sha_print. */
-  if (tcc_state->opt_disp_fusion) {
-    IROptCtx pair_ctx;
-    tcc_ir_opt_ctx_init(&pair_ctx, ir);
-    tcc_ir_opt_run_gens(&pair_ctx, fusion_pair_reorder_gens, fusion_pair_reorder_gens_count);
-    tcc_ir_opt_ctx_free(&pair_ctx);
+    tcc_ir_opt_ctx_invalidate(&pipeline_ctx);
+    tcc_ir_opt_gens_chain_ex(&pipeline_ctx);
+    tcc_ir_opt_gens_pair_reorder_ex(&pipeline_ctx);
   }
 
   /* Call-chain result rename: rename `CALL → V; PARAMVAL[0] V; redef V`
@@ -26060,12 +26026,10 @@ static void gen_function(Sym *sym)
   if (tcc_state->opt_postinc_fusion)
     tcc_ir_opt_postinc_fusion(ir);
 
-  /* Boolean idempotent simplification via engine generators. */
+  /* Boolean idempotent simplification via shared pipeline context. */
   if (tcc_state->opt_bool_idempotent) {
-    IROptCtx bool_ctx;
-    tcc_ir_opt_ctx_init(&bool_ctx, ir);
-    tcc_ir_opt_run_gens(&bool_ctx, bool_gens, bool_gens_count);
-    tcc_ir_opt_ctx_free(&bool_ctx);
+    tcc_ir_opt_ctx_invalidate(&pipeline_ctx);
+    tcc_ir_opt_gens_bool_ex(&pipeline_ctx);
   }
   /* Boolean CSE (hash-table based, BB-scoped). */
   if (tcc_state->opt_bool_cse)
@@ -26239,14 +26203,13 @@ static void gen_function(Sym *sym)
     }
   }
 
-  /* Call-result dead elimination via engine: dead_sret_call, dead_call_result,
-   * fold_call_result_store in one forward scan with shared DU table. */
+  /* Call-result dead elimination via shared pipeline context. */
   if (tcc_state->opt_dead_store) {
-    IROptCtx call_ctx;
-    tcc_ir_opt_ctx_init(&call_ctx, ir);
-    tcc_ir_opt_run_gens(&call_ctx, call_result_gens, call_result_gens_count);
-    tcc_ir_opt_ctx_free(&call_ctx);
+    tcc_ir_opt_ctx_invalidate(&pipeline_ctx);
+    tcc_ir_opt_gens_call_result_ex(&pipeline_ctx);
   }
+
+  tcc_ir_opt_ctx_free(&pipeline_ctx);
 
   /* Dead-init-via-call: kill stack-slot stores whose bytes are fully
    * overwritten by a subsequent CALL, using the callee's write summary. */

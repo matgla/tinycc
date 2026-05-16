@@ -10,6 +10,7 @@
 
 #define USING_GLOBALS
 #include "ir.h"
+#include "opt_engine.h"
 
 /* ============================================================================
  * Jump Threading Optimization (Phase 2c)
@@ -201,3 +202,5 @@ int tcc_ir_opt_eliminate_fallthrough(TCCIRState *ir)
 
   return changes;
 }
+
+int tcc_ir_opt_jump_threading_ex(IROptCtx *ctx) { return tcc_ir_opt_jump_threading(ctx->ir); }
