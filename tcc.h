@@ -1144,6 +1144,7 @@ struct TCCState
   unsigned char opt_iv_strength_red;  /* -fiv-strength-red: IV strength reduction for array access */
   unsigned char opt_loop_unroll;      /* -floop-unroll: full unroll small constant-trip-count loops */
   unsigned char opt_loop_rotation;    /* -floop-rotation: rotate top-tested loops to bottom-tested */
+  unsigned char opt_reroll;           /* -freroll-blocks: re-roll N identical consecutive blocks into a loop */
   unsigned char opt_nonneg_fold;      /* -fnonneg-fold: non-negative value branch folding */
   unsigned char opt_vrp;              /* -fvrp: value range propagation branch folding */
   unsigned char opt_float_narrow;     /* -ffloat-narrow: narrow double math to float when safe */

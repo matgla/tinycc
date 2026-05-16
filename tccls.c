@@ -135,21 +135,89 @@ void tcc_ls_compact_stack_locations(LSLiveIntervalState *ls, int spill_base)
   if (spill_base > 0)
     spill_base = 0;
 
-  int loc = spill_base;
+  const int n = ls->next_interval_index;
+  if (n == 0)
+    return;
 
-  for (int i = 0; i < ls->next_interval_index; ++i)
+  /* Build a mapping from old stack_location -> new stack_location so that
+   * multiple intervals sharing a slot (from regalloc slot reuse) continue
+   * to share after compaction.  Without this mapping, each interval would
+   * be assigned a fresh slot here, undoing addrtaken slot coalescing. */
+  typedef struct
+  {
+    int old_offset;
+    int size;
+    int new_offset;
+  } SlotMapEntry;
+
+  SlotMapEntry *map = tcc_malloc(sizeof(SlotMapEntry) * n);
+  int map_count = 0;
+
+  /* Pass 1: collect distinct old offsets and track the max size required
+   * at each (so a slot shared by a 4-byte and an 8-byte interval gets an
+   * 8-byte allocation). */
+  for (int i = 0; i < n; ++i)
   {
     LSLiveInterval *it = &ls->intervals[i];
     if (it->stack_location == 0)
       continue;
 
     const int size = tcc_ls_reg_type_stack_size(it->reg_type);
+    int found = -1;
+    for (int j = 0; j < map_count; ++j)
+    {
+      if (map[j].old_offset == it->stack_location)
+      {
+        found = j;
+        break;
+      }
+    }
+    if (found >= 0)
+    {
+      if (size > map[found].size)
+        map[found].size = size;
+    }
+    else
+    {
+      map[map_count].old_offset = it->stack_location;
+      map[map_count].size = size;
+      map[map_count].new_offset = 0;
+      map_count++;
+    }
+  }
+
+  /* Pass 2: assign new offsets in the same order as old offsets were
+   * encountered.  This preserves any relative ordering the codegen
+   * relied on (e.g. adjacent spill slots for LDRD pairs). */
+  int loc = spill_base;
+  for (int j = 0; j < map_count; ++j)
+  {
+    const int size = map[j].size;
     loc = (loc - size) & -size;
     if (loc == 0)
       loc = -size;
-    it->stack_location = loc;
-    STACK_ALLOC_LOG("compact", it->vreg, loc, size);
+    map[j].new_offset = loc;
   }
+
+  /* Pass 3: rewrite each interval's stack_location through the map. */
+  for (int i = 0; i < n; ++i)
+  {
+    LSLiveInterval *it = &ls->intervals[i];
+    if (it->stack_location == 0)
+      continue;
+
+    for (int j = 0; j < map_count; ++j)
+    {
+      if (map[j].old_offset == it->stack_location)
+      {
+        it->stack_location = map[j].new_offset;
+        STACK_ALLOC_LOG("compact", it->vreg, map[j].new_offset, map[j].size);
+        break;
+      }
+    }
+  }
+
+  tcc_free(map);
 }
 
 void tcc_ls_recompute_dirty_registers(LSLiveIntervalState *ls)

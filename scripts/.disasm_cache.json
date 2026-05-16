@@ -36,8 +36,8 @@
   },
   "101_cleanup::main": {
     "gcc": 38,
-    "tcc": 392023,
-    "updated": "2026-05-16T17:55:06.149032+00:00"
+    "tcc": 106,
+    "updated": "2026-05-16T22:35:29.758973+00:00"
   },
   "101_cleanup::test": {
     "gcc": 6,
@@ -78,6 +78,11 @@
     "gcc": 15,
     "tcc": 39,
     "updated": "2026-05-15T07:15:32.221390+00:00"
+  },
+  "93_integer_promotion::main": {
+    "gcc": 173,
+    "tcc": 586,
+    "updated": "2026-05-16T22:37:38.609948+00:00"
   },
   "95_cse::main": {
     "gcc": 12,
@@ -218,6 +223,26 @@
     "gcc": 14,
     "tcc": 16,
     "updated": "2026-05-14T21:11:44.701297+00:00"
+  },
+  "ir/113_reroll_basic::incr_glob_i": {
+    "gcc": 8,
+    "tcc": 12,
+    "updated": "2026-05-16T22:36:40.549974+00:00"
+  },
+  "ir/113_reroll_basic::main": {
+    "gcc": 22,
+    "tcc": 177,
+    "updated": "2026-05-16T22:36:40.549982+00:00"
+  },
+  "ir/114_reroll_negative::add_to_sum": {
+    "gcc": 6,
+    "tcc": 7,
+    "updated": "2026-05-16T22:36:40.549985+00:00"
+  },
+  "ir/114_reroll_negative::main": {
+    "gcc": 18,
+    "tcc": 91,
+    "updated": "2026-05-16T22:36:40.549988+00:00"
   },
   "ir/140_builtin_classify_type::main": {
     "gcc": 30,
@@ -856,8 +881,8 @@
   },
   "ir/bug_mul_compound::main": {
     "gcc": 140,
-    "tcc": 231,
-    "updated": "2026-05-15T21:22:17.964181+00:00"
+    "tcc": 64,
+    "updated": "2026-05-16T22:36:40.549755+00:00"
   },
   "ir/bug_parse_number_64bit::main": {
     "gcc": 27,
@@ -1701,8 +1726,8 @@
   },
   "tests2/03_struct::main": {
     "gcc": 23,
-    "tcc": 29,
-    "updated": "2026-05-14T21:15:32.781996+00:00"
+    "tcc": 23,
+    "updated": "2026-05-16T22:37:05.508242+00:00"
   },
   "tests2/04_for::main": {
     "gcc": 10,
@@ -1801,8 +1826,8 @@
   },
   "tests2/101_cleanup::main": {
     "gcc": 38,
-    "tcc": 392023,
-    "updated": "2026-05-14T21:15:32.782367+00:00"
+    "tcc": 106,
+    "updated": "2026-05-16T22:37:05.508408+00:00"
   },
   "tests2/101_cleanup::test": {
     "gcc": 6,

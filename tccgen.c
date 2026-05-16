@@ -21911,6 +21911,195 @@ static void end_switch(void)
 /* ------------------------------------------------------------------------- */
 /* __attribute__((cleanup(fn))) */
 
+/* Inline-expand a cleanup call if `fs` is an auto-inline candidate.
+ *
+ * Cleanup calls are emitted at scope-exit by try_call_scope_cleanup, which
+ * bypasses unary_funcall's normal call-site path — and with it, the auto-
+ * inline machinery.  For a function like 101_cleanup's INCR_GI macro
+ * (`int i __attribute__((cleanup(incr_glob_i))) = 1;`) repeated 65k+ times,
+ * that means each cleanup emits a BL to incr_glob_i instead of inlining
+ * `glob_i += *i`, leaving tens of thousands of redundant call sequences in
+ * the output.
+ *
+ * This helper mirrors the inline-expansion block in unary_funcall (around
+ * the `(has_addr_of_label || force_always_inline)` branch), but trimmed for
+ * the cleanup-call shape: one pointer argument, void return, no labels in
+ * the body, no struct-return setup.  Returns 1 if the cleanup was inlined
+ * (caller skips the PARAM/CALL emission), 0 otherwise. */
+static int try_inline_cleanup_call(Sym *fs, Sym *vs)
+{
+  const char *fn_name = fs ? get_tok_str(fs->v & ~SYM_FIELD, NULL) : "?";
+  if (!tcc_state->ir) {
+    if (getenv("DBG_CLINL")) fprintf(stderr, "[CLINL] %s: no ir\n", fn_name);
+    return 0;
+  }
+  if (!fs || !vs || !fs->type.ref) {
+    if (getenv("DBG_CLINL")) fprintf(stderr, "[CLINL] %s: missing type.ref\n", fn_name);
+    return 0;
+  }
+  if (!fs->type.ref->f.func_auto_inline || fs->type.ref->f.func_noinline) {
+    if (getenv("DBG_CLINL")) fprintf(stderr, "[CLINL] %s: auto_inline=%d noinline=%d\n",
+                                     fn_name, fs->type.ref->f.func_auto_inline, fs->type.ref->f.func_noinline);
+    return 0;
+  }
+  if (!tcc_state->opt_inline_functions && !tcc_state->opt_inline_small) {
+    if (getenv("DBG_CLINL")) fprintf(stderr, "[CLINL] %s: inline opts off\n", fn_name);
+    return 0;
+  }
+  /* Cleanup functions return void. */
+  if ((fs->type.ref->type.t & VT_BTYPE) != VT_VOID) {
+    if (getenv("DBG_CLINL")) fprintf(stderr, "[CLINL] %s: not void\n", fn_name);
+    return 0;
+  }
+  if (fs->a.nested_func) {
+    if (getenv("DBG_CLINL")) fprintf(stderr, "[CLINL] %s: nested\n", fn_name);
+    return 0;
+  }
+
+  Sym *s = fs->type.ref;
+  Sym *param_sym = s->next;
+  if (!param_sym || param_sym->next != NULL) {
+    if (getenv("DBG_CLINL")) fprintf(stderr, "[CLINL] %s: bad params\n", fn_name);
+    return 0;
+  }
+  if (!auto_inline_sig_ok(fs)) {
+    if (getenv("DBG_CLINL")) fprintf(stderr, "[CLINL] %s: bad sig\n", fn_name);
+    return 0;
+  }
+
+  struct InlineFunc *inline_fn = NULL;
+  for (int i = 0; i < tcc_state->nb_inline_fns; i++)
+  {
+    if (tcc_state->inline_fns[i] && tcc_state->inline_fns[i]->sym == fs)
+    {
+      inline_fn = tcc_state->inline_fns[i];
+      break;
+    }
+  }
+  if (!inline_fn || !inline_fn->func_str) {
+    if (getenv("DBG_CLINL")) fprintf(stderr, "[CLINL] %s: no inline_fn (nb_fns=%d)\n",
+                                     fn_name, tcc_state->nb_inline_fns);
+    return 0;
+  }
+
+  if (inline_body_has_apply_args(inline_fn->func_str)) {
+    if (getenv("DBG_CLINL")) fprintf(stderr, "[CLINL] %s: apply_args\n", fn_name);
+    return 0;
+  }
+  if (inline_body_has_shadowed_ident(inline_fn->func_str)) {
+    if (getenv("DBG_CLINL")) fprintf(stderr, "[CLINL] %s: shadowed_ident\n", fn_name);
+    return 0;
+  }
+  if (inline_body_has_static_local(inline_fn->func_str)) {
+    if (getenv("DBG_CLINL")) fprintf(stderr, "[CLINL] %s: static_local\n", fn_name);
+    return 0;
+  }
+
+  int *fsb = tok_str_buf(inline_fn->func_str);
+  int fsl = inline_fn->func_str->len;
+  if (macro_ptr && macro_ptr >= fsb && macro_ptr < fsb + fsl) {
+    if (getenv("DBG_CLINL")) fprintf(stderr, "[CLINL] %s: own_macro\n", fn_name);
+    return 0;
+  }
+  if (getenv("DBG_CLINL")) fprintf(stderr, "[CLINL] %s: INLINING\n", fn_name);
+
+  /* Build the argument SValue: &vs (address of the cleanup variable). */
+  vset(&vs->type, vs->r, vs->c);
+  vtop->sym = vs;
+  vtop->vr = vs->vreg;
+  mk_pointer(&vtop->type);
+  gaddrof();
+  SValue arg_val = *vtop;
+  --vtop;
+
+  /* --- Create parameter local and store the argument --- */
+  Sym *saved_local = local_stack;
+  int saved_local_scope = local_scope;
+  int saved_inline_const_arg_count = tcc_state->inline_const_arg_count;
+  tcc_state->inline_const_arg_count = 0;
+  ++local_scope; /* shadow caller's same-named variables */
+
+  int psize, palign;
+  psize = type_size(&param_sym->type, &palign);
+  if (psize < 4)
+    psize = 4;
+  if (palign < 4)
+    palign = 4;
+  loc = (loc - psize) & -palign;
+
+  int pv = param_sym->v & ~SYM_FIELD;
+  if (pv == 0)
+    pv = anon_sym++;
+  Sym *psym = sym_push(pv, &param_sym->type, VT_LOCAL | VT_LVAL, loc);
+
+  SValue store_dst;
+  svalue_init(&store_dst);
+  store_dst.type = param_sym->type;
+  store_dst.r = VT_LOCAL | VT_LVAL;
+  store_dst.vr = psym->vreg;
+  store_dst.c.i = loc;
+  tcc_ir_put(tcc_state->ir, TCCIR_OP_STORE, &arg_val, NULL, &store_dst);
+
+  /* --- Save parser/codegen state --- */
+  CType saved_func_vt = func_vt;
+  int saved_func_var = func_var;
+  int saved_func_has_label_addr = func_has_label_addr;
+  int saved_rsym = rsym;
+  const char *saved_funcname = funcname;
+  struct scope *saved_root_scope = root_scope;
+  uint8_t saved_in_inline_expansion = tcc_state->in_inline_expansion;
+  int saved_inline_return_loc = tcc_state->inline_return_loc;
+
+  func_vt = s->type; /* void */
+  func_var = 0;
+  rsym = -1;
+  tcc_state->in_inline_expansion = local_scope;
+  tcc_state->inline_return_loc = 0;
+  tcc_state->inline_expansion_depth++;
+  root_scope = cur_scope;
+
+  /* --- Replay the function body --- */
+  int saved_tok = tok;
+  CValue saved_tokc = tokc;
+  int *inline_label_tokens = NULL;
+  int nb_inline_label_tokens = 0;
+  Sym **saved_inline_labels =
+      inline_hide_label_bindings(inline_fn->func_str, &inline_label_tokens, &nb_inline_label_tokens);
+
+  TokenString *inline_ts = tok_str_alloc();
+  inline_ts->data.str = tok_str_buf(inline_fn->func_str);
+  inline_ts->allocated_len = 1;
+  inline_ts->len = inline_fn->func_str->len;
+  begin_macro(inline_ts, 2);
+  next();
+  block(0);
+  end_macro();
+  inline_restore_label_bindings(inline_label_tokens, saved_inline_labels, nb_inline_label_tokens);
+
+  tok = saved_tok;
+  tokc = saved_tokc;
+
+  /* --- Backpatch return jumps --- */
+  tcc_ir_backpatch_to_here(tcc_state->ir, rsym);
+
+  /* --- Restore state --- */
+  tcc_state->in_inline_expansion = saved_in_inline_expansion;
+  tcc_state->inline_return_loc = saved_inline_return_loc;
+  tcc_state->inline_expansion_depth--;
+  func_vt = saved_func_vt;
+  func_var = saved_func_var;
+  func_has_label_addr = saved_func_has_label_addr;
+  rsym = saved_rsym;
+  funcname = saved_funcname;
+  root_scope = saved_root_scope;
+  tcc_state->inline_const_arg_count = saved_inline_const_arg_count;
+  sym_pop(&local_stack, saved_local, 0);
+  local_scope = saved_local_scope;
+
+  (void)psym;
+  return 1;
+}
+
 static void try_call_scope_cleanup(Sym *stop)
 {
   Sym *cls = cur_scope->cl.s;
@@ -21926,6 +22115,14 @@ static void try_call_scope_cleanup(Sym *stop)
   {
     Sym *fs = cls->cleanup_func;
     Sym *vs = cls->prev_tok;
+
+    /* Try to inline-expand the cleanup body in place; falls back to a normal
+     * PARAM/CALL when the cleanup function is too large or otherwise unsafe
+     * to inline.  Inlining is critical for tests like 101_cleanup where the
+     * cleanup function is small (`glob_i += *i`) but called tens of
+     * thousands of times. */
+    if (try_inline_cleanup_call(fs, vs))
+      continue;
 
     vpushsym(&fs->type, fs);
     vset(&vs->type, vs->r, vs->c);
@@ -25736,6 +25933,18 @@ static void gen_function(Sym *sym)
   dump_ir_after_pass(tcc_state, ir, "block_copy_init");
 #endif
 
+  /* Identical-block loop re-rolling.  Runs BEFORE propagation so the
+   * per-iteration IR is in its raw, structurally-consistent form (the
+   * propagation passes can rewrite operand encodings in ways that vary
+   * across iterations and would defeat structural matching). */
+  if (tcc_state->opt_reroll) {
+    tcc_ir_opt_reroll(ir);
+    tcc_ir_opt_compact_nops(ir);
+#ifdef CONFIG_TCC_DEBUG
+    dump_ir_after_pass(tcc_state, ir, "reroll");
+#endif
+  }
+
   /* Interprocedural constant propagation: replace calls to functions known
    * to return a constant with ASSIGN #const.  Runs before the iterative
    * loop so existing passes cascade the constant through the caller. */
@@ -26788,10 +26997,22 @@ static void gen_function(Sym *sym)
           int vr = irop_get_vreg(*o);
           if (vr >= 0) {
             IRLiveInterval *li = tcc_ir_get_live_interval(ir, vr);
-            if (li && li->allocation.r0 != PREG_NONE &&
-                !(li->allocation.r0 & PREG_SPILLED) &&
-                li->allocation.offset == 0)
-              continue; /* vreg is register-only; stack slot unused */
+            if (li) {
+              if (li->allocation.r0 != PREG_NONE &&
+                  !(li->allocation.r0 & PREG_SPILLED) &&
+                  li->allocation.offset == 0)
+                continue; /* vreg is register-only; stack slot unused */
+              /* Spilled vreg: the operand's u.imm32 carries the frontend's
+               * original offset, but addrtaken slot coalescing may have
+               * remapped this vreg to share a slot with another.  Use the
+               * post-regalloc allocation offset, matching machine_op.c. */
+              if (li->allocation.offset != 0) {
+                int off = li->allocation.offset + ((int)o->u.imm32 - li->original_offset);
+                if (off < min_op_offset)
+                  min_op_offset = off;
+                continue;
+              }
+            }
           }
           int off = (int)irop_get_stack_offset(*o);
           if (off < min_op_offset)
@@ -26857,10 +27078,23 @@ static void gen_function(Sym *sym)
           int vr = irop_get_vreg(*o);
           if (vr >= 0) {
             IRLiveInterval *li = tcc_ir_get_live_interval(ir, vr);
-            if (li && li->allocation.r0 != PREG_NONE &&
-                !(li->allocation.r0 & PREG_SPILLED) &&
-                li->allocation.offset == 0)
-              continue; /* register-only vreg; stack slot unused */
+            if (li) {
+              if (li->allocation.r0 != PREG_NONE &&
+                  !(li->allocation.r0 & PREG_SPILLED) &&
+                  li->allocation.offset == 0)
+                continue; /* register-only vreg; stack slot unused */
+              /* Spilled vreg: use the post-regalloc allocation offset.
+               * The operand's u.imm32 still carries the frontend-assigned
+               * offset, which is obsolete after addrtaken slot coalescing
+               * (multiple vregs sharing a single slot).  Compute the actual
+               * codegen offset the same way machine_op.c does. */
+              if (li->allocation.offset != 0) {
+                int off = li->allocation.offset + ((int)o->u.imm32 - li->original_offset);
+                if (off < post_min_op_offset)
+                  post_min_op_offset = off;
+                continue;
+              }
+            }
           }
           int off = (int)irop_get_stack_offset(*o);
           if (off < post_min_op_offset)

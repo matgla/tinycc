@@ -349,6 +349,8 @@ TEST_FILES = [
     ("108_loop_unroll_basic.c", 0),
     ("109_loop_unroll_no_unroll.c", 0),
     ("110_loop_unroll_with_array.c", 0),
+    ("113_reroll_basic.c", 0),
+    ("114_reroll_negative.c", 0),
     ("150_builtin_fp.c", 0),
 
     # Benchmark regression tests (-O2 correctness)

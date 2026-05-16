@@ -710,59 +710,174 @@ static void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
   if (table_size > 0)
     param_extended = tcc_mallocz((table_size + 7) / 8);
 
-  /* Extend FUNCPARAMVAL intervals to their FUNCCALL */
-  {
-    int max_call_id = ir->next_call_id;
-    int *call_idx_by_id = NULL;
-    if (max_call_id > 0) {
-      call_idx_by_id = tcc_malloc(sizeof(int) * max_call_id);
-      for (int i = 0; i < max_call_id; i++) call_idx_by_id[i] = -1;
-      for (int i = 0; i < n; i++) {
-        IRQuadCompact *q = &ir->compact_instructions[i];
-        if (q->op == TCCIR_OP_FUNCCALLVOID || q->op == TCCIR_OP_FUNCCALLVAL) {
-          int cid = TCCIR_DECODE_CALL_ID(irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q)));
-          if (cid >= 0 && cid < max_call_id) call_idx_by_id[cid] = i;
+  /* Extend FUNCPARAMVAL intervals to their FUNCCALL.
+   *
+   * Find each PARAM's matching CALL by forward-scanning for the next CALL
+   * whose call_id matches.  This handles two cases the original "build a
+   * cid -> call_idx map" approach got wrong when functions had many calls:
+   *
+   *   1. Nested calls — PARAMs for an outer call can be emitted before
+   *      inner calls complete.  Matching by cid (not just "next CALL")
+   *      correctly skips over inner CALLs.
+   *
+   *   2. call_id wrap-around — the IR encodes call_id in 16 bits, so a
+   *      function with >65536 calls reuses ids.  The original map kept
+   *      only the LAST CALL per cid, so early PARAMs (cid=0 from the
+   *      first call) wrongly pointed at the late-in-function CALL that
+   *      had reused cid=0, ballooning the PARAM source's lifetime to
+   *      function end.  Forward-scan stops at the first matching cid
+   *      *after* the PARAM, picking the genuinely paired CALL. */
+  for (int i = 0; i < n; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_FUNCPARAMVAL) continue;
+    int cid = TCCIR_DECODE_CALL_ID(irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q)));
+    if (cid < 0) continue;
+    /* Find the next CALL after this PARAM with matching cid. */
+    int cidx = -1;
+    for (int j = i + 1; j < n; j++) {
+      IRQuadCompact *qq = &ir->compact_instructions[j];
+      if (qq->op != TCCIR_OP_FUNCCALLVOID && qq->op != TCCIR_OP_FUNCCALLVAL) continue;
+      int ccid = TCCIR_DECODE_CALL_ID(irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, qq)));
+      if (ccid == cid) {
+        cidx = j;
+        break;
+      }
+    }
+    if (cidx < 0) continue;
+    IROperand s1 = tcc_ir_op_get_src1(ir, q);
+    int32_t vr = irop_get_vreg(s1);
+    if (vr >= 0 && tcc_ir_vreg_is_valid(ir, vr)) {
+      int idx = VREG_IDX(vr);
+      if (idx < table_size) {
+        if (ends[idx] < (uint32_t)cidx) ends[idx] = cidx;
+        if (starts[idx] == INTERVAL_NOT_STARTED) starts[idx] = 0;
+        /* Only mark as param-extended for plain 32-bit non-deref sources.
+         * 64-bit sources and dereferenced sources go through more complex
+         * codegen paths that haven't been validated for caller-saved arg
+         * registers; keep them in callee-saved (crosses_call=1). */
+        /* The PARAM source is consumed by the call as a register argument.
+         * is_lval=1 nominally means the source is dereferenced (load from
+         * its stack slot), but if the underlying vreg is a register-
+         * promotable VAR (addrtaken=0, not lvalue-typed), the "deref" is a
+         * plain register read and the value still doesn't outlive the
+         * call — let it land in a caller-saved arg register. */
+        int eligible = !s1.is_lval;
+        if (!eligible && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR) {
+          IRLiveInterval *li = tcc_ir_vreg_live_interval(ir, vr);
+          if (li && !li->addrtaken && !li->is_lvalue)
+            eligible = 1;
+        }
+        if (param_extended && (int)ends[idx] == cidx && eligible) {
+          int sbtype = irop_get_btype(s1);
+          if (sbtype != IROP_BTYPE_INT64 && sbtype != IROP_BTYPE_FLOAT64)
+            param_extended[idx >> 3] |= (uint8_t)(1u << (idx & 7));
         }
       }
+    }
+  }
+
+  /* Extend lifetimes of addrtaken VAR vregs to cover pointer-derived uses.
+   *
+   * When `T = &V` materializes V's address into a temp T, V's stack slot is
+   * effectively in use until T (or any pointer transitively derived from T)
+   * dies.  Without this extension, V's vreg lifetime ends at the AddrOf
+   * instruction even though the slot is still read via T at later
+   * instructions (e.g. through a cleanup-attribute call).
+   *
+   * This extension makes V's lifetime cover its slot's true memory liveness,
+   * allowing stack-slot reuse for non-overlapping addrtaken VARs in
+   * ra_linear_scan below.
+   *
+   * Limitations: only simple flows are tracked (ASSIGN, LEA, ADD/SUB pointer
+   * arithmetic).  Pointer escape via STORE to memory or PHI is conservatively
+   * handled by extending the root V to function end.  C semantics make
+   * post-scope access via stored pointers UB; we don't try to optimize that. */
+  {
+    int *taint_root = tcc_malloc(sizeof(int) * table_size);
+    for (int i = 0; i < table_size; i++) taint_root[i] = -1;
+
+    /* Pass 1: seed taint from direct address-of patterns.
+     * Iterate to a fixed point to propagate through chained ASSIGNs. */
+    int changed;
+    do {
+      changed = 0;
       for (int i = 0; i < n; i++) {
         IRQuadCompact *q = &ir->compact_instructions[i];
-        if (q->op != TCCIR_OP_FUNCPARAMVAL) continue;
-        int cid = TCCIR_DECODE_CALL_ID(irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q)));
-        if (cid < 0 || cid >= max_call_id) continue;
-        int cidx = call_idx_by_id[cid];
-        if (cidx < 0) continue;
-        IROperand s1 = tcc_ir_op_get_src1(ir, q);
-        int32_t vr = irop_get_vreg(s1);
-        if (vr >= 0 && tcc_ir_vreg_is_valid(ir, vr)) {
-          int idx = VREG_IDX(vr);
-          if (idx < table_size) {
-            if (ends[idx] < (uint32_t)cidx) ends[idx] = cidx;
-            if (starts[idx] == INTERVAL_NOT_STARTED) starts[idx] = 0;
-            /* Only mark as param-extended for plain 32-bit non-deref sources.
-             * 64-bit sources and dereferenced sources go through more complex
-             * codegen paths that haven't been validated for caller-saved arg
-             * registers; keep them in callee-saved (crosses_call=1). */
-            /* The PARAM source is consumed by the call as a register argument.
-             * is_lval=1 nominally means the source is dereferenced (load from
-             * its stack slot), but if the underlying vreg is a register-
-             * promotable VAR (addrtaken=0, not lvalue-typed), the "deref" is a
-             * plain register read and the value still doesn't outlive the
-             * call — let it land in a caller-saved arg register. */
-            int eligible = !s1.is_lval;
-            if (!eligible && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR) {
-              IRLiveInterval *li = tcc_ir_vreg_live_interval(ir, vr);
-              if (li && !li->addrtaken && !li->is_lvalue)
-                eligible = 1;
+        if (q->op == TCCIR_OP_NOP) continue;
+        /* STORE-class ops don't produce a value-holding dest. */
+        if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
+            q->op == TCCIR_OP_STORE_POSTINC) continue;
+        if (!irop_config[q->op].has_dest) continue;
+
+        IROperand dest = tcc_ir_op_get_dest(ir, q);
+        int32_t dvr = irop_get_vreg(dest);
+        if (dvr < 0 || !tcc_ir_vreg_is_valid(ir, dvr)) continue;
+        int didx = VREG_IDX(dvr);
+        if (didx >= table_size) continue;
+        if (taint_root[didx] >= 0) continue; /* already tainted */
+
+        int new_root = -1;
+        IROperand srcs[2];
+        int nsrcs = 0;
+        if (irop_config[q->op].has_src1) srcs[nsrcs++] = tcc_ir_op_get_src1(ir, q);
+        if (irop_config[q->op].has_src2) srcs[nsrcs++] = tcc_ir_op_get_src2(ir, q);
+
+        /* Only propagate through pointer-producing ops: ASSIGN, LEA, and
+         * pointer arithmetic (ADD, SUB).  Other ops (LOAD, MUL, etc.) read
+         * the pointer's value but don't produce a new pointer to the same
+         * region. */
+        int propagate = (q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_LEA ||
+                         q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_SUB);
+        if (!propagate) continue;
+
+        for (int k = 0; k < nsrcs && new_root < 0; k++) {
+          IROperand s = srcs[k];
+          /* Direct: src is &V where V is addrtaken VAR.
+           * The is_local flag plus !is_lval distinguishes address-of from
+           * load-from-stack-slot. */
+          if (irop_get_tag(s) == IROP_TAG_STACKOFF && !s.is_lval && s.is_local) {
+            int32_t v_vr = irop_get_vreg(s);
+            if (v_vr >= 0 && tcc_ir_vreg_is_valid(ir, v_vr)) {
+              IRLiveInterval *li = tcc_ir_vreg_live_interval(ir, v_vr);
+              if (li && li->addrtaken) {
+                int vidx = VREG_IDX(v_vr);
+                if (vidx < table_size) new_root = vidx;
+              }
             }
-            if (param_extended && (int)ends[idx] == cidx && eligible) {
-              int sbtype = irop_get_btype(s1);
-              if (sbtype != IROP_BTYPE_INT64 && sbtype != IROP_BTYPE_FLOAT64)
-                param_extended[idx >> 3] |= (uint8_t)(1u << (idx & 7));
+          }
+          /* Transitive: src is a tainted vreg. */
+          if (new_root < 0) {
+            int32_t s_vr = irop_get_vreg(s);
+            if (s_vr >= 0 && tcc_ir_vreg_is_valid(ir, s_vr)) {
+              int sidx = VREG_IDX(s_vr);
+              if (sidx < table_size && taint_root[sidx] >= 0)
+                new_root = taint_root[sidx];
             }
           }
         }
+
+        if (new_root >= 0) {
+          taint_root[didx] = new_root;
+          /* Extend root V's end to dest's end. */
+          if (ends[didx] > ends[new_root]) {
+            ends[new_root] = ends[didx];
+            changed = 1;
+          }
+        }
       }
-      tcc_free(call_idx_by_id);
+    } while (changed);
+
+    tcc_free(taint_root);
+  }
+
+  if (TCC_LOG_LS) {
+    RA_DBG("SSA ra_build_intervals: after addrtaken pointer-flow extension");
+    for (int idx = 0; idx < table_size; idx++) {
+      if (starts[idx] == INTERVAL_NOT_STARTED) continue;
+      int type = idx / max_vreg_pos;
+      int pos = idx % max_vreg_pos;
+      RA_DBG("  %s%d range=[%u,%u]", ra_vreg_type_char(type), pos,
+             starts[idx], ends[idx]);
     }
   }
 
@@ -1394,6 +1509,20 @@ static void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
   SSAInterval **active = tcc_malloc(sizeof(SSAInterval *) * count);
   int active_count = 0;
 
+  /* Active addrtaken intervals — tracked separately because the main `active`
+   * set is for register-resident intervals; addrtaken intervals always spill
+   * and were previously dropped on the floor.  We track them so their stack
+   * slots can be returned to a free list once the interval ends. */
+  SSAInterval **active_addrtaken = tcc_malloc(sizeof(SSAInterval *) * count);
+  int active_addrtaken_count = 0;
+
+  /* Free list of expired 4-byte addrtaken stack slots, available for reuse
+   * by later addrtaken intervals.  Only 4-byte slots are tracked here; other
+   * sizes fall through to fresh allocation, matching the legacy behavior of
+   * always assigning `spill_loc -= 4` regardless of value width. */
+  int *free_slots_4 = tcc_malloc(sizeof(int) * count);
+  int free_slots_4_count = 0;
+
   int spill_loc = spill_base;
 
   for (int i = 0; i < count; i++) {
@@ -1420,10 +1549,35 @@ static void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
     }
     active_count = w;
 
-    /* Address-taken: force spill */
+    /* Expire old addrtaken intervals — return their 4-byte slots to the
+     * free list so later non-overlapping addrtaken intervals can reuse them. */
+    int wa = 0;
+    for (int j = 0; j < active_addrtaken_count; j++) {
+      SSAInterval *a = active_addrtaken[j];
+      if (a->end < cur->start) {
+        free_slots_4[free_slots_4_count++] = a->stack_location;
+      } else {
+        active_addrtaken[wa++] = a;
+      }
+    }
+    active_addrtaken_count = wa;
+
+    /* Address-taken: force spill.
+     * Reuse an expired addrtaken slot when one is available; otherwise grow
+     * the spill area.  Slot reuse is correct here because the addrtaken
+     * extension pass in ra_build_intervals has already pushed V's end past
+     * the death of any pointer derived from V — so two intervals with
+     * non-overlapping (extended) lifetimes truly access disjoint memory
+     * windows.  Track in active_addrtaken so the slot returns to the free
+     * list when cur expires. */
     if (cur->addrtaken) {
-      spill_loc -= 4;
-      cur->stack_location = spill_loc;
+      if (free_slots_4_count > 0) {
+        cur->stack_location = free_slots_4[--free_slots_4_count];
+      } else {
+        spill_loc -= 4;
+        cur->stack_location = spill_loc;
+      }
+      active_addrtaken[active_addrtaken_count++] = cur;
       continue;
     }
 
@@ -1810,6 +1964,8 @@ static void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
   }
 
   tcc_free(active);
+  tcc_free(active_addrtaken);
+  tcc_free(free_slots_4);
   tcc_free(vreg_to_iv);
   #undef HINT_IDX
 

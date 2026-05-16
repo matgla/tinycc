@@ -120,6 +120,9 @@ int tcc_ir_opt_cse_global_load(struct TCCIRState *ir);
 /* GlobalSym CSE - hoist repeated global symbol addresses to a single TEMP */
 int tcc_ir_opt_globalsym_cse(struct TCCIRState *ir);
 
+/* Identical-block loop re-rolling - collapse macro-unrolled runs into a loop */
+int tcc_ir_opt_reroll(struct TCCIRState *ir);
+
 /* Narrow CSE: deduplicate PARAM/VAR + #constant expressions */
 int tcc_ir_opt_cse_param_add(struct TCCIRState *ir);
 
