@@ -20,11 +20,11 @@
 - [x] **2.2** Build-only verify (no rules wired yet)
 
 ### Phase 3 — Convert pass groups to generator tables
-- [ ] **3.1** Fusion group → `ir/opt_gens_fusion.c` (rotate done; remaining: mla, indexed_mem, deref_indexed, disp, postinc, lea_fold, indexed_chain, indexed_pair_reorder, assign_fuse)
-- [ ] **3.2** Branch-folding group → `ir/opt_gens_branch.c` (branch_folding, setif_branch_fuse, or_bool_diamond, parts of stack_addr_nonnull_fold)
-- [ ] **3.3** Boolean simplification → `ir/opt_gens_bool.c` (bool_idempotent + bool_simplify + idempotent half of bool_pass)
+- [x] **3.1** Fusion group → `ir/opt_gens_fusion.c` (7 converted: rotate, mla, indexed_mem, deref_indexed, disp, indexed_chain, indexed_pair_reorder; hand-written: postinc, lea_fold, assign_fuse)
+- [ ] **3.2** Branch-folding group → `ir/opt_gens_branch.c` (branch_folding, setif_branch_fuse, or_bool_diamond, parts of stack_addr_nonnull_fold) — deferred: called from 10+ pipeline locations, complex wiring
+- [x] **3.3** Boolean simplification → `ir/opt_gens_bool.c` (bool_idempotent + bool_simplify + idempotent half of bool_pass)
 - [ ] **3.4** BB-scoped hash CSE rewrites to use `IROptHashTable` (cse_global_load, globalsym_cse, cse_param_add, local_load_cse, local_alu_cse, stackoff_addr_cse, cse_bool)
-- [ ] **3.5** Call-result dead group → `ir/opt_gens_call_result.c` (dead_call_result_elim, dead_init_via_call, dead_sret_call_elim, fold_call_result_store)
+- [x] **3.5** Call-result dead group → `ir/opt_gens_call_result.c` (dead_call_result_elim, dead_sret_call_elim, fold_call_result_store converted; dead_init_via_call stays in opt.c — FWS dependency)
 
 ### Phase 4 — Generic hash table
 - [ ] **4.1** `ir/opt_hash.{h,c}` — `IROptHashTable`, bump-allocated entry pool, drop-in replacement for 3 of 4 hand-rolled CSE tables (skip `sl_forward`'s alias-aware table)

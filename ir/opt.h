@@ -119,11 +119,8 @@ int tcc_ir_opt_cse_param_add(struct TCCIRState *ir);
 /* Deref forwarding - reuse loaded deref value in adjacent CMP */
 int tcc_ir_opt_deref_fwd(struct TCCIRState *ir);
 
-/* Boolean Idempotent Simplification */
-int tcc_ir_opt_bool_idempotent(struct TCCIRState *ir);
-
-/* Boolean Expression Simplification */
-int tcc_ir_opt_bool_simplify(struct TCCIRState *ir);
+/* Boolean CSE (hash-table based, BB-scoped) */
+int tcc_ir_opt_bool_cse(struct TCCIRState *ir);
 
 /* Store-Load Forwarding */
 int tcc_ir_opt_sl_forward(struct TCCIRState *ir);
@@ -154,8 +151,8 @@ int tcc_ir_opt_complex_const_param_fold(struct TCCIRState *ir);
 
 /* Dead Call Result Elimination - convert FUNCCALLVAL → FUNCCALLVOID when
  * the call's destination TEMP has no remaining reads.  Skips the
- * post-call moves the codegen would otherwise emit. */
-int tcc_ir_opt_dead_call_result_elim(struct TCCIRState *ir);
+ * post-call moves the codegen would otherwise emit.
+ * (moved to ir/opt_gens_call_result.c — engine generator) */
 
 /* Pure-via-sret analysis - infer whether the current function's only
  * observable side effect is writes through its sret-pointer parameter.
@@ -176,14 +173,10 @@ int tcc_ir_opt_dead_init_via_call(struct TCCIRState *ir);
 /* Dead Sret Call Elimination - remove FUNCCALLVOID (or FUNCCALLVAL with
  * unused result) when the callee is func_pure_via_sret and its sret
  * target (PARAM0 = Addr[StackLoc[X]]) is a local that is never read
- * after the call.  Also nops the call's preceding FUNCPARAM ops. */
-int tcc_ir_opt_dead_sret_call_elim(struct TCCIRState *ir);
+ * after the call.  Also nops the call's preceding FUNCPARAM ops.
+ * (moved to ir/opt_gens_call_result.c — engine generator) */
 
-/* Fold CALL → TEMP_LOCAL + LOAD T = TEMP_LOCAL + STORE *V = T into
- * CALL → *V directly.  Eliminates the spill-reload round-trip when a
- * call's return value is immediately stored through a pointer
- * (typical pattern for complex/struct sret returns). */
-int tcc_ir_opt_fold_call_result_store(struct TCCIRState *ir);
+/* fold_call_result_store: moved to ir/opt_gens_call_result.c — engine generator */
 
 /* Redundant Store Elimination */
 int tcc_ir_opt_store_redundant(struct TCCIRState *ir);
@@ -230,8 +223,6 @@ void tcc_ir_barrel_shift_fusion(struct TCCIRState *ir);
  * the address is computed by SHL+ADD (array table lookup pattern). */
 /* tcc_ir_opt_deref_indexed_fusion -> ir_gen_deref_indexed_fusion in opt_gens_fusion.c */
 
-/* Combined boolean pass: cse_bool + bool_idempotent in one loop */
-int tcc_ir_opt_bool_pass(struct TCCIRState *ir, int do_idempotent, int do_cse);
 
 /* Post-Increment Load/Store Fusion - fuse LOAD/STORE + ADD into post-increment op */
 int tcc_ir_opt_postinc_fusion(struct TCCIRState *ir);

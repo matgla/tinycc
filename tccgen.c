@@ -28,6 +28,8 @@
 #include "ir/opt.h"
 #include "ir/opt_engine.h"
 #include "ir/opt_gens_fusion.h"
+#include "ir/opt_gens_bool.h"
+#include "ir/opt_gens_call_result.h"
 #include "ir/regalloc.h"
 #include "ir/ssa.h"
 #include "tccir.h"
@@ -26058,11 +26060,16 @@ static void gen_function(Sym *sym)
   if (tcc_state->opt_postinc_fusion)
     tcc_ir_opt_postinc_fusion(ir);
 
-  /* Combined boolean pass: CSE + idempotent in one loop. */
-  if (tcc_state->opt_bool_cse || tcc_state->opt_bool_idempotent)
-    tcc_ir_opt_bool_pass(ir, tcc_state->opt_bool_idempotent, tcc_state->opt_bool_cse);
-  if (tcc_state->opt_bool_simplify)
-    tcc_ir_opt_bool_simplify(ir);
+  /* Boolean idempotent simplification via engine generators. */
+  if (tcc_state->opt_bool_idempotent) {
+    IROptCtx bool_ctx;
+    tcc_ir_opt_ctx_init(&bool_ctx, ir);
+    tcc_ir_opt_run_gens(&bool_ctx, bool_gens, bool_gens_count);
+    tcc_ir_opt_ctx_free(&bool_ctx);
+  }
+  /* Boolean CSE (hash-table based, BB-scoped). */
+  if (tcc_state->opt_bool_cse)
+    tcc_ir_opt_bool_cse(ir);
 
   /* Compact NOPs before the store-load forwarding loop (up to 12 iterations). */
   tcc_ir_opt_compact_nops(ir);
@@ -26232,29 +26239,19 @@ static void gen_function(Sym *sym)
     }
   }
 
-  /* Dead call result elimination: convert FUNCCALLVAL→FUNCCALLVOID when
-   * the call's return TEMP has no uses, so the codegen skips the
-   * post-call register-copy moves. */
-  if (tcc_state->opt_dead_store)
-    tcc_ir_opt_dead_call_result_elim(ir);
-
-  /* Dead sret-call elimination: drop calls to func_pure_via_sret callees
-   * whose sret target is a dead local.  Must run after dead_call_result_elim
-   * so FUNCCALLVAL→FUNCCALLVOID conversion exposes void-return shape. */
-  if (tcc_state->opt_dead_store)
-    tcc_ir_opt_dead_sret_call_elim(ir);
+  /* Call-result dead elimination via engine: dead_sret_call, dead_call_result,
+   * fold_call_result_store in one forward scan with shared DU table. */
+  if (tcc_state->opt_dead_store) {
+    IROptCtx call_ctx;
+    tcc_ir_opt_ctx_init(&call_ctx, ir);
+    tcc_ir_opt_run_gens(&call_ctx, call_result_gens, call_result_gens_count);
+    tcc_ir_opt_ctx_free(&call_ctx);
+  }
 
   /* Dead-init-via-call: kill stack-slot stores whose bytes are fully
    * overwritten by a subsequent CALL, using the callee's write summary. */
   if (tcc_state->opt_dead_store)
     tcc_ir_opt_dead_init_via_call(ir);
-
-  /* Fold CALL → TEMP_LOCAL + LOAD + STORE patterns into a direct CALL → *V.
-   * Eliminates the spill+reload round-trip when a call's return value is
-   * immediately written through a pointer (e.g. complex sret returns where
-   * each component is computed then stored to *sret). */
-  if (tcc_state->opt_dead_store)
-    tcc_ir_opt_fold_call_result_store(ir);
 
   /* Phase 4: Redundant Store Elimination - remove stores overwritten before read
    * CONSERVATIVE: Only handles stack locals whose address is not taken */

@@ -973,78 +973,7 @@ int tcc_ir_opt_complex_const_param_fold(TCCIRState *ir)
  * "temp local" (negative vreg sentinel) rather than a regular TEMP, so we
  * compare full vreg values rather than restricting to the TEMP type.
  */
-int tcc_ir_opt_dead_call_result_elim(TCCIRState *ir)
-{
-  if (!ir || ir->next_instruction_index == 0)
-    return 0;
-
-  const int n = ir->next_instruction_index;
-  int changes = 0;
-
-  for (int i = 0; i < n; i++)
-  {
-    IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op != TCCIR_OP_FUNCCALLVAL)
-      continue;
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
-    int32_t dest_vr = irop_get_vreg(dest);
-    if (dest_vr == -1)
-      continue;
-    /* Skip PARAM vregs — they map to incoming function args, never CALL dests
-     * in well-formed IR, but be defensive. */
-    if (dest_vr >= 0 && TCCIR_DECODE_VREG_TYPE(dest_vr) == TCCIR_VREG_TYPE_PARAM)
-      continue;
-
-    /* Scan the whole function for any read of dest_vr.  A read is any src1
-     * or src2 (across all ops), plus the dest of STORE/STORE_INDEXED/
-     * STORE_POSTINC where dest acts as a pointer base (a use). */
-    int has_use = 0;
-    for (int j = 0; j < n && !has_use; j++)
-    {
-      if (j == i)
-        continue;
-      IRQuadCompact *p = &ir->compact_instructions[j];
-      if (p->op == TCCIR_OP_NOP)
-        continue;
-      for (int s = 0; s < 2; s++)
-      {
-        if (s == 0 && !irop_config[p->op].has_src1)
-          continue;
-        if (s == 1 && !irop_config[p->op].has_src2)
-          continue;
-        IROperand op = s ? tcc_ir_op_get_src2(ir, p) : tcc_ir_op_get_src1(ir, p);
-        if (irop_get_vreg(op) == dest_vr)
-        {
-          has_use = 1;
-          break;
-        }
-      }
-      if (has_use)
-        break;
-      if (p->op == TCCIR_OP_STORE || p->op == TCCIR_OP_STORE_INDEXED || p->op == TCCIR_OP_STORE_POSTINC)
-      {
-        IROperand op = tcc_ir_op_get_dest(ir, p);
-        if (irop_get_vreg(op) == dest_vr)
-          has_use = 1;
-      }
-    }
-    if (has_use)
-      continue;
-
-    /* Convert FUNCCALLVAL (dest, src1, src2) → FUNCCALLVOID (src1, src2):
-     * shift src1, src2 down one slot in the operand pool so the layout
-     * matches FUNCCALLVOID's offsets (irop_config controls offset math). */
-    IROperand src1 = ir->iroperand_pool[q->operand_base + 1];
-    IROperand src2 = ir->iroperand_pool[q->operand_base + 2];
-    q->op = TCCIR_OP_FUNCCALLVOID;
-    ir->iroperand_pool[q->operand_base + 0] = src1;
-    ir->iroperand_pool[q->operand_base + 1] = src2;
-    changes++;
-    LOG_IR_GEN("=== DEAD CALL RESULT: i=%d FUNCCALLVAL→FUNCCALLVOID (dest vr=%d) ===", i, dest_vr);
-  }
-
-  return changes;
-}
+/* dead_call_result_elim moved to ir/opt_gens_call_result.c (engine generator) */
 
 /* Locate the sret-pointer parameter spill at the prolog: the first non-NOP
  * instruction should be `STORE LocalSlot[X] <-- P0`.  Returns 1 and fills
@@ -1787,354 +1716,9 @@ int tcc_ir_opt_dead_init_via_call(TCCIRState *ir)
   return changes;
 }
 
-/* Dead Sret Call Elimination — at each call site to a func_pure_via_sret
- * callee, if the sret target is a local stack slot that is never read
- * (directly or by escaping address) after the call, eliminate the call
- * and its preceding FUNCPARAMs. */
-int tcc_ir_opt_dead_sret_call_elim(TCCIRState *ir)
-{
-  if (!ir || ir->next_instruction_index == 0)
-    return 0;
-  const int n = ir->next_instruction_index;
-  int changes = 0;
+/* dead_sret_call_elim moved to ir/opt_gens_call_result.c (engine generator) */
 
-  for (int i = 0; i < n; i++)
-  {
-    IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op != TCCIR_OP_FUNCCALLVAL && q->op != TCCIR_OP_FUNCCALLVOID)
-      continue;
-
-    /* If FUNCCALLVAL, the return value must be unused. */
-    if (q->op == TCCIR_OP_FUNCCALLVAL)
-    {
-      IROperand dest = tcc_ir_op_get_dest(ir, q);
-      int32_t dest_vr = irop_get_vreg(dest);
-      if (dest_vr < 0)
-        continue;
-      int has_use = 0;
-      for (int j = 0; j < n && !has_use; j++)
-      {
-        if (j == i)
-          continue;
-        IRQuadCompact *p = &ir->compact_instructions[j];
-        if (p->op == TCCIR_OP_NOP)
-          continue;
-        if (irop_config[p->op].has_src1 && irop_get_vreg(tcc_ir_op_get_src1(ir, p)) == dest_vr)
-          has_use = 1;
-        if (!has_use && irop_config[p->op].has_src2 && irop_get_vreg(tcc_ir_op_get_src2(ir, p)) == dest_vr)
-          has_use = 1;
-        if (!has_use &&
-            (p->op == TCCIR_OP_STORE || p->op == TCCIR_OP_STORE_INDEXED || p->op == TCCIR_OP_STORE_POSTINC) &&
-            irop_get_vreg(tcc_ir_op_get_dest(ir, p)) == dest_vr)
-          has_use = 1;
-      }
-      if (has_use)
-        continue;
-    }
-
-    /* Callee must be marked func_pure_via_sret. */
-    Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
-    if (!callee)
-      continue;
-    int callee_pure = callee->f.func_pure_via_sret;
-    if (callee->type.ref)
-      callee_pure |= callee->type.ref->f.func_pure_via_sret;
-    if (!callee_pure)
-      continue;
-
-    /* Get PARAM0 (the sret target) and its call_id. */
-    IROperand call_src2 = tcc_ir_op_get_src2(ir, q);
-    int call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, call_src2));
-    IROperand param0;
-    if (!ir_opt_get_call_param_operand(ir, i, 0, &param0))
-      continue;
-    /* PARAM0 must be the address of a local stack slot: Addr[StackLoc[X]]. */
-    if (!param0.is_local || param0.is_lval)
-      continue;
-    if (irop_get_tag(param0) != IROP_TAG_STACKOFF)
-      continue;
-    int32_t sret_off = (int32_t)irop_get_stack_offset(param0);
-
-    /* Determine sret region size from callee's return type. */
-    int sret_size = 0;
-    {
-      CType *ret_type = callee->type.ref ? &callee->type.ref->type : &callee->type;
-      int align = 0;
-      sret_size = type_size(ret_type, &align);
-      if (sret_size <= 0)
-        continue;
-      /* Round up to slot alignment (4 bytes minimum). */
-      sret_size = (sret_size + 3) & ~3;
-    }
-
-    /* Verify: no operand in any subsequent instruction touches the slot
-     * range [sret_off, sret_off + sret_size).  This conservatively treats
-     * any STACKOFF reference in the range as a live use, including LEAs
-     * that could let the address escape. */
-    int range_used_later = 0;
-    for (int j = i + 1; j < n && !range_used_later; j++)
-    {
-      IRQuadCompact *p = &ir->compact_instructions[j];
-      if (p->op == TCCIR_OP_NOP)
-        continue;
-      IROperand ops[3];
-      ops[0] = irop_config[p->op].has_dest ? tcc_ir_op_get_dest(ir, p) : (IROperand){0};
-      ops[1] = irop_config[p->op].has_src1 ? tcc_ir_op_get_src1(ir, p) : (IROperand){0};
-      ops[2] = irop_config[p->op].has_src2 ? tcc_ir_op_get_src2(ir, p) : (IROperand){0};
-      for (int k = 0; k < 3 && !range_used_later; k++)
-      {
-        if (irop_is_none(ops[k]))
-          continue;
-        if (irop_get_tag(ops[k]) != IROP_TAG_STACKOFF)
-          continue;
-        int32_t off = (int32_t)irop_get_stack_offset(ops[k]);
-        if (off >= sret_off && off < sret_off + sret_size)
-          range_used_later = 1;
-      }
-    }
-    if (range_used_later)
-      continue;
-
-    /* Also verify: no vreg defined before i (that holds an Addr[] in the
-     * dead range) is used after i.  Walk pre-call ops and collect such
-     * vregs; bail if any have post-call uses. */
-    int address_escaped = 0;
-    for (int j = 0; j < i && !address_escaped; j++)
-    {
-      IRQuadCompact *p = &ir->compact_instructions[j];
-      if (p->op == TCCIR_OP_NOP)
-        continue;
-      if (!irop_config[p->op].has_dest)
-        continue;
-      IROperand src1 = irop_config[p->op].has_src1 ? tcc_ir_op_get_src1(ir, p) : (IROperand){0};
-      /* Look for LEA-style: dest <-- Addr[StackLoc[X]] with X in dead range. */
-      int is_addr_of_range = 0;
-      if (src1.is_local && !src1.is_lval && irop_get_tag(src1) == IROP_TAG_STACKOFF)
-      {
-        int32_t off = (int32_t)irop_get_stack_offset(src1);
-        if (off >= sret_off && off < sret_off + sret_size)
-          is_addr_of_range = 1;
-      }
-      if (!is_addr_of_range)
-        continue;
-      IROperand dest = tcc_ir_op_get_dest(ir, p);
-      int32_t dest_vr = irop_get_vreg(dest);
-      if (dest_vr < 0)
-        continue;
-      /* Search post-call uses of this vreg (skip the call's own PARAMs). */
-      for (int k = i + 1; k < n && !address_escaped; k++)
-      {
-        IRQuadCompact *pk = &ir->compact_instructions[k];
-        if (pk->op == TCCIR_OP_NOP)
-          continue;
-        if ((pk->op == TCCIR_OP_FUNCPARAMVAL || pk->op == TCCIR_OP_FUNCPARAMVOID))
-        {
-          uint32_t enc = (uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, pk));
-          if (TCCIR_DECODE_CALL_ID(enc) == call_id)
-            continue;
-        }
-        if (irop_config[pk->op].has_src1 && irop_get_vreg(tcc_ir_op_get_src1(ir, pk)) == dest_vr)
-          address_escaped = 1;
-        if (!address_escaped && irop_config[pk->op].has_src2 &&
-            irop_get_vreg(tcc_ir_op_get_src2(ir, pk)) == dest_vr)
-          address_escaped = 1;
-      }
-    }
-    if (address_escaped)
-      continue;
-
-    /* All checks passed: eliminate the call and its PARAMs. */
-    ir_opt_nop_call_params(ir, i);
-    q->op = TCCIR_OP_NOP;
-    changes++;
-    LOG_IR_GEN("=== DEAD SRET CALL: i=%d (sret_off=%d size=%d) ===", i, (int)sret_off, sret_size);
-  }
-
-  return changes;
-}
-
-/* Fold CALL → TEMP_LOCAL + LOAD T = TEMP_LOCAL + STORE *V = T into
- * CALL → *V directly.  Eliminates the spill-reload round-trip when a
- * call's return value is immediately stored through a pointer
- * (typical pattern for complex/struct sret returns).
- *
- * Pattern matched:
- *   FUNCCALLVAL → STACKOFF[off]  (TEMP_LOCAL pseudo, vreg in [-9..-2])
- *   ... (no other reads/writes of STACKOFF[off]) ...
- *   LOAD T = STACKOFF[off]       (unique reader)
- *   STORE *V = T                  (T has exactly one use, this STORE)
- *
- * Transform:
- *   FUNCCALLVAL → *V              (CALL's dest becomes the store target)
- *   (LOAD and STORE are NOPped)
- *
- * Constraints: V's vreg must be a function PARAM or defined before the
- * CALL.  Only handles plain STORE (not STORE_INDEXED with offset).
- */
-int tcc_ir_opt_fold_call_result_store(TCCIRState *ir)
-{
-  if (!ir || ir->next_instruction_index == 0)
-    return 0;
-  const int n = ir->next_instruction_index;
-  int changes = 0;
-
-  for (int i = 0; i < n; i++)
-  {
-    IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op != TCCIR_OP_FUNCCALLVAL)
-      continue;
-
-    /* CALL's dest must be a TEMP_LOCAL stack slot (vreg in [-9..-2],
-     * is_lval, is_local, STACKOFF). */
-    IROperand call_dest = tcc_ir_op_get_dest(ir, q);
-    int32_t call_dest_vr = irop_get_vreg(call_dest);
-    if (call_dest_vr >= 0 || call_dest_vr < -9)
-      continue;
-    if (!call_dest.is_lval || !call_dest.is_local ||
-        irop_get_tag(call_dest) != IROP_TAG_STACKOFF)
-      continue;
-    int64_t call_dest_off = irop_get_imm64_ex(ir, call_dest);
-
-    /* Find the unique LOAD reading STACKOFF[call_dest_off] with the same
-     * TEMP_LOCAL pseudo.  Bail if multiple LOADs or any other op
-     * references the slot. */
-    int load_idx = -1;
-    int32_t load_dest_vr = -1;
-    int multi_use = 0;
-    for (int j = i + 1; j < n && !multi_use; j++)
-    {
-      IRQuadCompact *p = &ir->compact_instructions[j];
-      if (p->op == TCCIR_OP_NOP)
-        continue;
-      IROperand ops[3];
-      ops[0] = irop_config[p->op].has_dest ? tcc_ir_op_get_dest(ir, p) : (IROperand){0};
-      ops[1] = irop_config[p->op].has_src1 ? tcc_ir_op_get_src1(ir, p) : (IROperand){0};
-      ops[2] = irop_config[p->op].has_src2 ? tcc_ir_op_get_src2(ir, p) : (IROperand){0};
-      for (int k = 0; k < 3 && !multi_use; k++)
-      {
-        if (irop_is_none(ops[k]))
-          continue;
-        if (irop_get_vreg(ops[k]) != call_dest_vr)
-          continue;
-        if (irop_get_tag(ops[k]) != IROP_TAG_STACKOFF)
-          continue;
-        if (irop_get_imm64_ex(ir, ops[k]) != call_dest_off)
-          continue;
-        /* Op touches our slot. */
-        if (p->op == TCCIR_OP_LOAD && k == 1 && load_idx < 0)
-        {
-          load_idx = j;
-          load_dest_vr = irop_get_vreg(tcc_ir_op_get_dest(ir, p));
-        }
-        else
-        {
-          /* Multiple readers or unexpected op. */
-          multi_use = 1;
-        }
-      }
-    }
-    if (multi_use || load_idx < 0 || load_dest_vr < 0)
-      continue;
-
-    /* The LOAD's dest vreg must have exactly one use, as the src1 of a
-     * STORE.  Plain STORE only (no STORE_INDEXED/POSTINC for now). */
-    int store_idx = -1;
-    int load_dst_misuse = 0;
-    for (int k = 0; k < n && !load_dst_misuse; k++)
-    {
-      if (k == load_idx)
-        continue;
-      IRQuadCompact *p = &ir->compact_instructions[k];
-      if (p->op == TCCIR_OP_NOP)
-        continue;
-      int uses = 0;
-      if (irop_config[p->op].has_src1 && irop_get_vreg(tcc_ir_op_get_src1(ir, p)) == load_dest_vr)
-        uses = 1;
-      if (irop_config[p->op].has_src2 && irop_get_vreg(tcc_ir_op_get_src2(ir, p)) == load_dest_vr)
-        uses = 2;
-      if ((p->op == TCCIR_OP_STORE || p->op == TCCIR_OP_STORE_INDEXED || p->op == TCCIR_OP_STORE_POSTINC) &&
-          irop_get_vreg(tcc_ir_op_get_dest(ir, p)) == load_dest_vr)
-        uses = 3; /* used as store-dest pointer — not a value use we can fold */
-      if (!uses)
-        continue;
-      if (p->op != TCCIR_OP_STORE || uses != 1 || store_idx >= 0)
-      {
-        load_dst_misuse = 1;
-        break;
-      }
-      store_idx = k;
-    }
-    if (load_dst_misuse || store_idx < 0)
-      continue;
-
-    /* The STORE's dest becomes the new CALL dest.  Verify the dest's vreg
-     * is available at position i (PARAM, or defined before i).  If the
-     * dest vreg is defined by an ASSIGN from a PARAM after i, substitute
-     * the PARAM directly (still available at i). */
-    IRQuadCompact *store_q = &ir->compact_instructions[store_idx];
-    IROperand store_dst = tcc_ir_op_get_dest(ir, store_q);
-    int32_t store_dst_vr = irop_get_vreg(store_dst);
-    if (store_dst_vr < 0)
-      continue;
-    if (!store_dst.is_lval)
-      continue;
-
-    int avail_at_call = 0;
-    if (TCCIR_DECODE_VREG_TYPE(store_dst_vr) == TCCIR_VREG_TYPE_PARAM)
-    {
-      avail_at_call = 1;
-    }
-    else
-    {
-      /* Find the vreg's definition.  If it's an ASSIGN with a PARAM source,
-       * rewrite store_dst to point at the PARAM directly. */
-      for (int k = 0; k < n; k++)
-      {
-        IRQuadCompact *p = &ir->compact_instructions[k];
-        if (p->op == TCCIR_OP_NOP)
-          continue;
-        if (!irop_config[p->op].has_dest)
-          continue;
-        if (irop_get_vreg(tcc_ir_op_get_dest(ir, p)) != store_dst_vr)
-          continue;
-        /* Found the definition. */
-        if (k < i)
-        {
-          avail_at_call = 1;
-          break;
-        }
-        /* Defined after i.  Check if it's a simple ASSIGN from a PARAM. */
-        if (p->op == TCCIR_OP_ASSIGN)
-        {
-          IROperand src = tcc_ir_op_get_src1(ir, p);
-          int32_t src_vr = irop_get_vreg(src);
-          if (src_vr >= 0 && TCCIR_DECODE_VREG_TYPE(src_vr) == TCCIR_VREG_TYPE_PARAM &&
-              !src.is_lval && irop_get_tag(src) == IROP_TAG_VREG)
-          {
-            /* Rewrite store_dst's vreg to the PARAM. */
-            store_dst = src;
-            store_dst.is_lval = 1; /* the original store_dst was *vreg */
-            store_dst_vr = src_vr;
-            avail_at_call = 1;
-          }
-        }
-        break;
-      }
-    }
-    if (!avail_at_call)
-      continue;
-
-    /* All checks passed: rewrite CALL's dest to STORE's dest. */
-    ir->iroperand_pool[q->operand_base + 0] = store_dst;
-    ir->compact_instructions[load_idx].op = TCCIR_OP_NOP;
-    ir->compact_instructions[store_idx].op = TCCIR_OP_NOP;
-    changes++;
-    LOG_IR_GEN("=== FOLD_CALL_RESULT_STORE: CALL@%d → *vreg%d (was TEMP_LOCAL+%ld) ===",
-               i, (int)store_dst_vr, (long)call_dest_off);
-  }
-
-  return changes;
-}
+/* fold_call_result_store moved to ir/opt_gens_call_result.c (engine generator) */
 
 /* Dead Store Elimination - remove ASSIGN instructions where the destination
  * vreg is never used. This eliminates redundant copies after CSE/idempotent
@@ -9607,143 +9191,9 @@ static void bool_cse_clear_all(BoolCSEEntry **hash_table)
   }
 }
 
-/* Boolean idempotent optimization pass
- * Handles: a && a -> a, a || a -> a, a && 1 -> a, a || 0 -> a
- * Returns: number of optimizations applied.
- */
-int tcc_ir_opt_bool_idempotent(TCCIRState *ir)
-{
-  int n = ir->next_instruction_index;
-  int changes = 0;
-  int i;
+/* bool_idempotent moved to ir/opt_gens_bool.c (engine generator) */
 
-  if (n == 0)
-    return 0;
-
-  for (i = 0; i < n; i++)
-  {
-    IRQuadCompact *q = &ir->compact_instructions[i];
-
-    if (q->op != TCCIR_OP_BOOL_AND && q->op != TCCIR_OP_BOOL_OR)
-      continue;
-
-    IROperand src1 = tcc_ir_op_get_src1(ir, q);
-    IROperand src2 = tcc_ir_op_get_src2(ir, q);
-    int is_and = (q->op == TCCIR_OP_BOOL_AND);
-
-    /* Check for a && a or a || a */
-    if (src1.vr >= 0 && src1.vr == src2.vr)
-    {
-      LOG_IR_GEN("BOOL IDEMPOTENT: %s vr%d with itself at i=%d -> ASSIGN", is_and ? "&&" : "||", src1.vr, i);
-      q->op = TCCIR_OP_ASSIGN;
-      tcc_ir_set_src2(ir, i, IROP_NONE);
-      changes++;
-      continue;
-    }
-
-    /* Check for a && 1 or a || 0 */
-    /* Note: These require the constant to be in src2 for our analysis */
-    if (src2.vr < 0 && irop_is_immediate(src2))
-    {
-      int64_t val = irop_get_imm64_ex(ir, src2);
-      int should_optimize = 0;
-
-      if (is_and && val == 1)
-      {
-        /* a && 1 -> a */
-        should_optimize = 1;
-      }
-      else if (!is_and && val == 0)
-      {
-        /* a || 0 -> a */
-        should_optimize = 1;
-      }
-
-      if (should_optimize)
-      {
-        LOG_IR_GEN("BOOL IDEMPOTENT: %s with neutral element at i=%d -> ASSIGN", is_and ? "&&" : "||", i);
-        q->op = TCCIR_OP_ASSIGN;
-        /* src1 is already the value we want */
-        tcc_ir_set_src2(ir, i, IROP_NONE);
-        changes++;
-      }
-    }
-  }
-
-  return changes;
-}
-
-/* Boolean simplification pass
- * Handles: (x && y) && z -> inner = x && y; result = inner && z
- *          (x || y) || z -> inner = x || y; result = inner || z
- * This breaks down nested boolean ops to enable more CSE opportunities.
- * Returns: number of optimizations applied.
- */
-int tcc_ir_opt_bool_simplify(TCCIRState *ir)
-{
-  int n = ir->next_instruction_index;
-  int changes = 0;
-  int i;
-
-  if (n == 0)
-    return 0;
-
-  /* Single pass: look for nested boolean ops of the same type */
-  for (i = 0; i < n; i++)
-  {
-    IRQuadCompact *q = &ir->compact_instructions[i];
-
-    if (q->op != TCCIR_OP_BOOL_AND && q->op != TCCIR_OP_BOOL_OR)
-      continue;
-
-    IROperand src1 = tcc_ir_op_get_src1(ir, q);
-    /* Skip if src1 is not a vreg (can't be result of another op) */
-    if (src1.vr < 0)
-      continue;
-
-    /* Find the defining instruction for src1 */
-    int def_idx = tcc_ir_find_defining_instruction(ir, src1.vr, i);
-    if (def_idx < 0)
-      continue;
-
-    /* Check if the defining instruction is a boolean op of the same type */
-    IRQuadCompact *def_q = &ir->compact_instructions[def_idx];
-    if (def_q->op != q->op)
-      continue;
-
-    /* Check that the inner op is only used here (single use) */
-    if (!tcc_ir_vreg_has_single_use(ir, src1.vr, i))
-      continue;
-
-    /* Found: inner op of same type with single use.
-     * We can flatten: (a OP b) OP c becomes just the outer OP using inner's operands.
-     * Actually, that's not quite right - we want to KEEP the inner op and just
-     * have the outer refer to its result. But that's already the case!
-     * So what this optimization does is recognize that we've already done CSE
-     * on the inner, and we can just use that result.
-     *
-     * Actually, the real purpose is to PREVENT the inner from being CSE'd
-     * with something else if it's only used here. But that's not what we want.
-     *
-     * Let me reconsider: The goal is to simplify boolean expressions.
-     * If we have: r1 = a && b; r2 = r1 && c
-     * This can be kept as is - the code generator handles this fine.
-     * But for CSE purposes, we might want to mark r1 as "don't CSE replace"
-     * if it would prevent other optimizations.
-     *
-     * For now, let's just mark this as an optimization opportunity and
-     * track it. The real benefit might be in register allocation.
-     */
-
-    LOG_IR_GEN("BOOL SIMPLIFY: Nested %s at i=%d (inner at i=%d)", q->op == TCCIR_OP_BOOL_AND ? "&&" : "||", i,
-               def_idx);
-
-    /* The second inner op will be eliminated by DCE if unused */
-    changes++;
-  }
-
-  return changes;
-}
+/* bool_simplify removed — did not perform any IR transformation */
 
 /* Arithmetic Common Subexpression Elimination
  * Phase 3: Eliminate redundant arithmetic computations within basic blocks
@@ -16167,12 +15617,12 @@ int tcc_ir_opt_lea_fold(TCCIRState *ir)
  *
  * Returns total number of changes.
  */
-int tcc_ir_opt_bool_pass(TCCIRState *ir, int do_idempotent, int do_cse)
+int tcc_ir_opt_bool_cse(TCCIRState *ir)
 {
   int n = ir->next_instruction_index;
   int changes = 0;
 
-  if (n == 0 || (!do_idempotent && !do_cse))
+  if (n == 0)
     return 0;
 
   BoolCSEEntry *hash_table[BOOL_CSE_HASH_SIZE];
@@ -16185,12 +15635,10 @@ int tcc_ir_opt_bool_pass(TCCIRState *ir, int do_idempotent, int do_cse)
     if (q->op == TCCIR_OP_NOP)
       continue;
 
-    /* Block boundary: flush CSE table so stale entries don't cross blocks. */
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF || q->op == TCCIR_OP_FUNCCALLVOID ||
         q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_RETURNVALUE || q->op == TCCIR_OP_RETURNVOID)
     {
-      if (do_cse)
-        bool_cse_clear_all(hash_table);
+      bool_cse_clear_all(hash_table);
       continue;
     }
 
@@ -16200,65 +15648,33 @@ int tcc_ir_opt_bool_pass(TCCIRState *ir, int do_idempotent, int do_cse)
     IROperand src1 = tcc_ir_op_get_src1(ir, q);
     IROperand src2 = tcc_ir_op_get_src2(ir, q);
 
-    /* --- Idempotent simplification --- */
-    if (do_idempotent)
+    int left_vr = src1.vr, right_vr = src2.vr;
+    if (left_vr > right_vr)
     {
-      int simplified = 0;
-      if (src1.vr >= 0 && src1.vr == src2.vr)
-      {
-        q->op = TCCIR_OP_ASSIGN;
-        tcc_ir_set_src2(ir, i, IROP_NONE);
-        changes++;
-        simplified = 1;
-      }
-      else if (src2.vr < 0 && irop_is_immediate(src2))
-      {
-        int64_t val = irop_get_imm64_ex(ir, src2);
-        int is_and = (q->op == TCCIR_OP_BOOL_AND);
-        if ((is_and && val == 1) || (!is_and && val == 0))
-        {
-          q->op = TCCIR_OP_ASSIGN;
-          tcc_ir_set_src2(ir, i, IROP_NONE);
-          changes++;
-          simplified = 1;
-        }
-      }
-      if (simplified)
-        continue; /* Already handled; skip CSE for this slot. */
+      int tmp = left_vr;
+      left_vr = right_vr;
+      right_vr = tmp;
     }
 
-    /* --- Common subexpression elimination --- */
-    if (do_cse)
+    BoolCSEEntry *existing = bool_cse_find(hash_table, q->op, left_vr, right_vr);
+    IROperand dest = tcc_ir_op_get_dest(ir, q);
+    int32_t dest_vr = irop_get_vreg(dest);
+    if (existing)
     {
-      int left_vr = src1.vr, right_vr = src2.vr;
-      if (left_vr > right_vr)
-      {
-        int tmp = left_vr;
-        left_vr = right_vr;
-        right_vr = tmp;
-      }
-
-      BoolCSEEntry *existing = bool_cse_find(hash_table, q->op, left_vr, right_vr);
-      IROperand dest = tcc_ir_op_get_dest(ir, q);
-      int32_t dest_vr = irop_get_vreg(dest);
-      if (existing)
-      {
-        IROperand new_src = dest;
-        new_src.vr = existing->result_vr;
-        q->op = TCCIR_OP_ASSIGN;
-        tcc_ir_set_src1(ir, i, new_src);
-        tcc_ir_set_src2(ir, i, IROP_NONE);
-        changes++;
-      }
-      else
-      {
-        bool_cse_add(hash_table, q->op, left_vr, right_vr, dest_vr);
-      }
+      IROperand new_src = dest;
+      new_src.vr = existing->result_vr;
+      q->op = TCCIR_OP_ASSIGN;
+      tcc_ir_set_src1(ir, i, new_src);
+      tcc_ir_set_src2(ir, i, IROP_NONE);
+      changes++;
+    }
+    else
+    {
+      bool_cse_add(hash_table, q->op, left_vr, right_vr, dest_vr);
     }
   }
 
-  if (do_cse)
-    bool_cse_clear_all(hash_table);
+  bool_cse_clear_all(hash_table);
   return changes;
 }
 
