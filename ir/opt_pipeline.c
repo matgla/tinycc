@@ -141,6 +141,34 @@ int tcc_ir_opt_gen_pass_adapter(IROptCtx *ctx, const IROptGenPassData *data)
 }
 
 /* ============================================================================
+ * Compound passes (replicate original nested sub-loops)
+ * ============================================================================ */
+
+static int tcc_ir_opt_const_prop_cascade_ex(IROptCtx *ctx)
+{
+  TCCIRState *ir = ctx->ir;
+  int total = 0;
+  for (int i = 0; i < 4; i++) {
+    int ch = 0;
+    ch += tcc_ir_opt_const_prop(ir);
+    ch += tcc_ir_opt_const_prop_tmp(ir);
+    ch += tcc_ir_opt_const_var_prop(ir);
+    if (!ch)
+      break;
+    total += ch;
+  }
+  total += tcc_ir_opt_const_prop_tmp(ir);
+  return total;
+}
+
+static int tcc_ir_opt_branch_folding_2x_ex(IROptCtx *ctx)
+{
+  int ch = tcc_ir_opt_branch_folding(ctx->ir);
+  ch += tcc_ir_opt_branch_folding(ctx->ir);
+  return ch;
+}
+
+/* ============================================================================
  * Optimization Level Presets
  * ============================================================================ */
 
@@ -184,19 +212,17 @@ static const IROptPass fusion_passes[] = {
 };
 
 static const IROptPass memory_passes[] = {
-  PASS_GATED("sl_forward",    tcc_ir_opt_sl_forward_ex,      0, IR_PASS_INVALIDATES_ALL, FLAG(opt_store_load_fwd)),
-  PASS_GATED("const_prop",    tcc_ir_opt_const_prop_ex,      0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
-  PASS_GATED("const_tmp",     tcc_ir_opt_const_prop_tmp_ex,  0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
-  PASS_GATED("const_var",     tcc_ir_opt_const_var_prop_ex,  0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
-  PASS_GATED("branch_fold",   tcc_ir_opt_branch_folding_ex,  0, IR_PASS_INVALIDATES_ALL, FLAG(opt_const_prop)),
-  PASS_GATED("stack_nonnull", tcc_ir_opt_stack_addr_nonnull_fold_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
-  PASS_GATED("setif_fuse",    tcc_ir_opt_setif_branch_fuse_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
-  PASS_GATED("stack_bool",    tcc_ir_opt_stack_bool_diamond_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
-  PASS_GATED("or_bool",       tcc_ir_opt_or_bool_diamond_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
-  PASS_GATED("var_tmp_fwd",   tcc_ir_opt_var_tmp_fwd_ex,    0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
-  PASS_GATED("dce",           tcc_ir_opt_dce_ex,             0, IR_PASS_INVALIDATES_DU, FLAG(opt_dce)),
-  PASS_GATED("jump_thread",   tcc_ir_opt_jump_threading_ex,  0, IR_PASS_INVALIDATES_ALL, FLAG(opt_jump_threading)),
-  PASS_GATED("elim_fallthru", tcc_ir_opt_eliminate_fallthrough_ex, 0, IR_PASS_INVALIDATES_ALL, FLAG(opt_jump_threading)),
+  PASS_GATED("sl_forward",      tcc_ir_opt_sl_forward_ex,        0, IR_PASS_INVALIDATES_ALL, FLAG(opt_store_load_fwd)),
+  PASS_GATED("const_cascade",   tcc_ir_opt_const_prop_cascade_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
+  PASS_GATED("branch_fold_2x",  tcc_ir_opt_branch_folding_2x_ex, 0, IR_PASS_INVALIDATES_ALL, FLAG(opt_const_prop)),
+  PASS_GATED("stack_nonnull",   tcc_ir_opt_stack_addr_nonnull_fold_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
+  PASS_GATED("setif_fuse",      tcc_ir_opt_setif_branch_fuse_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
+  PASS_GATED("stack_bool",      tcc_ir_opt_stack_bool_diamond_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
+  PASS_GATED("or_bool",         tcc_ir_opt_or_bool_diamond_ex,   0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
+  PASS_GATED("var_tmp_fwd",     tcc_ir_opt_var_tmp_fwd_ex,       0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
+  PASS_GATED("dce",             tcc_ir_opt_dce_ex,               0, IR_PASS_INVALIDATES_DU, FLAG(opt_dce)),
+  PASS_GATED("jump_thread",     tcc_ir_opt_jump_threading_ex,    0, IR_PASS_INVALIDATES_ALL, FLAG(opt_jump_threading)),
+  PASS_GATED("elim_fallthru",   tcc_ir_opt_eliminate_fallthrough_ex, 0, IR_PASS_INVALIDATES_ALL, FLAG(opt_jump_threading)),
 };
 
 static const IROptPass late_cleanup_passes[] = {
@@ -207,17 +233,35 @@ static const IROptPass late_cleanup_passes[] = {
   PASS_GATED("redundant_assign", tcc_ir_opt_redundant_var_assign_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_dead_store)),
 };
 
+/* Compound pass: entry-store-prop cleanup phase (replicates original two-phase
+ * cleanup with sl_forward + repeated branch_folding/dce). */
+static int tcc_ir_opt_entry_store_cleanup_ex(IROptCtx *ctx)
+{
+  TCCIRState *ir = ctx->ir;
+  int ch = 0;
+  ch += tcc_ir_opt_const_prop(ir);
+  ch += tcc_ir_opt_const_prop_tmp(ir);
+  ch += tcc_ir_opt_const_var_prop(ir);
+  ch += tcc_ir_opt_branch_folding(ir);
+  ch += tcc_ir_opt_stack_addr_nonnull_fold(ir);
+  ch += tcc_ir_opt_redundant_loop_check(ir);
+  tcc_ir_opt_dce(ir);
+  tcc_ir_opt_compact_nops(ir);
+  ch += tcc_ir_opt_sl_forward(ir);
+  ch += tcc_ir_opt_stack_addr_nonnull_fold(ir);
+  ch += tcc_ir_opt_branch_folding(ir);
+  tcc_ir_opt_dce(ir);
+  ch += tcc_ir_opt_dead_var_store_elim(ir);
+  ch += tcc_ir_opt_const_var_prop(ir);
+  ch += tcc_ir_opt_branch_folding(ir);
+  tcc_ir_opt_dce(ir);
+  tcc_ir_opt_compact_nops(ir);
+  return ch;
+}
+
 static const IROptPass entry_store_passes[] = {
-  PASS_GATED("entry_store",    tcc_ir_opt_entry_store_prop_ex,  0, IR_PASS_INVALIDATES_ALL, FLAG(opt_store_load_fwd)),
-  PASS_GATED("const_prop",    tcc_ir_opt_const_prop_ex,        0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
-  PASS_GATED("const_tmp",     tcc_ir_opt_const_prop_tmp_ex,    0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
-  PASS_GATED("const_var",     tcc_ir_opt_const_var_prop_ex,    0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
-  PASS_GATED("branch_fold",   tcc_ir_opt_branch_folding_ex,    0, IR_PASS_INVALIDATES_ALL, FLAG(opt_const_prop)),
-  PASS_GATED("stack_nonnull", tcc_ir_opt_stack_addr_nonnull_fold_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
-  PASS_GATED("loop_check",    tcc_ir_opt_redundant_loop_check_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
-  PASS_GATED("dce",           tcc_ir_opt_dce_ex,               0, IR_PASS_INVALIDATES_DU, FLAG(opt_dce)),
-  PASS_GATED("sl_forward",    tcc_ir_opt_sl_forward_ex,        0, IR_PASS_INVALIDATES_ALL, FLAG(opt_store_load_fwd)),
-  PASS_GATED("dead_var_store", tcc_ir_opt_dead_var_store_elim_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_dead_store)),
+  PASS_GATED("entry_store",  tcc_ir_opt_entry_store_prop_ex,    0, IR_PASS_INVALIDATES_ALL, FLAG(opt_store_load_fwd)),
+  PASS_GATED("esp_cleanup",  tcc_ir_opt_entry_store_cleanup_ex, 0, IR_PASS_INVALIDATES_ALL, FLAG(opt_const_prop)),
 };
 
 #undef PASS

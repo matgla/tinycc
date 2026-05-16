@@ -25897,98 +25897,30 @@ static void gen_function(Sym *sym)
   dump_ir_after_pass(tcc_state, ir, "compact_nops_pre_slfwd");
 #endif
 
-  /* Entry-block store propagation: forward struct field constants initialized
-   * before loops into deref operands inside loops.  Runs before SL-FWD because
-   * it ignores BB boundaries (entry-BB stores dominate all code), enabling
-   * forwarding that SL-FWD's multi-pred reset would block. */
+  /* Entry-block store propagation — trigger-based group (3 iterations).
+   * entry_store_prop is the trigger: if it returns 0, the group exits.
+   * Cleanup uses compound pass replicating original two-phase sequence. */
   if (tcc_state->opt_store_load_fwd && !ir->has_static_chain)
   {
-    for (int esp_iter = 0; esp_iter < 3; esp_iter++)
-    {
-      int esp_ch = tcc_ir_opt_entry_store_prop(ir);
-#ifdef CONFIG_TCC_DEBUG
-      dump_ir_after_pass(tcc_state, ir, "entry_store_prop");
-#endif
-      if (esp_ch <= 0)
-        break;
-      tcc_ir_opt_const_prop(ir);
-      tcc_ir_opt_const_prop_tmp(ir);
-      tcc_ir_opt_const_var_prop(ir);
-      tcc_ir_opt_branch_folding(ir);
-      tcc_ir_opt_stack_addr_nonnull_fold(ir);
-      tcc_ir_opt_redundant_loop_check(ir);
-      tcc_ir_opt_dce(ir);
-      tcc_ir_opt_compact_nops(ir);
-      tcc_ir_opt_sl_forward(ir);
-#ifdef CONFIG_TCC_DEBUG
-      dump_ir_after_pass(tcc_state, ir, "esp_sl_forward");
-#endif
-      tcc_ir_opt_stack_addr_nonnull_fold(ir);
-      tcc_ir_opt_branch_folding(ir);
-      tcc_ir_opt_dce(ir);
-      tcc_ir_opt_dead_var_store_elim(ir);
-#ifdef CONFIG_TCC_DEBUG
-      dump_ir_after_pass(tcc_state, ir, "esp_dead_var_store_elim");
-#endif
-      tcc_ir_opt_const_var_prop(ir);
-      tcc_ir_opt_branch_folding(ir);
-      tcc_ir_opt_dce(ir);
-      tcc_ir_opt_compact_nops(ir);
-    }
+    IROptCtx esp_ctx;
+    tcc_ir_opt_ctx_init(&esp_ctx, ir);
+    tcc_ir_opt_run_group(&esp_ctx, &entry_store_group);
+    tcc_ir_opt_ctx_free(&esp_ctx);
   }
 
-  /* Phase 4: Store-Load Forwarding - replace loads from recently stored addresses
-   * CONSERVATIVE: Only handles stack locals whose address is not taken.
-   * DISABLED for nested functions with static chain. */
-  for (int sl_iter = 0; sl_iter < 12; sl_iter++)
+  /* Phase 4: Store-Load Forwarding — trigger-based iterative group.
+   * sl_forward is the trigger (idx 0): if it returns 0, the group exits.
+   * Uses compound passes (const_prop_cascade, branch_folding_2x) to match
+   * the original nested sub-loop and double-call behavior. */
+  if (tcc_state->opt_store_load_fwd && !ir->has_static_chain)
   {
-    if (!(tcc_state->opt_store_load_fwd && !ir->has_static_chain && tcc_ir_opt_sl_forward(ir)))
-      break;
-#ifdef CONFIG_TCC_DEBUG
-    dump_ir_after_pass(tcc_state, ir, "sl_forward");
-#endif
-    if (tcc_state->opt_const_prop)
-    {
-      for (int cp_iter = 0; cp_iter < 4; cp_iter++)
-      {
-        int cp_ch = 0;
-        cp_ch += tcc_ir_opt_const_prop(ir);
-        cp_ch += tcc_ir_opt_const_prop_tmp(ir);
-        cp_ch += tcc_ir_opt_const_var_prop(ir);
-        if (!cp_ch)
-          break;
-      }
-      tcc_ir_opt_const_prop_tmp(ir);
-      tcc_ir_opt_branch_folding(ir);
-      tcc_ir_opt_branch_folding(ir);
-#ifdef CONFIG_TCC_DEBUG
-      dump_ir_after_pass(tcc_state, ir, "slloop_branch_folding");
-#endif
-      tcc_ir_opt_stack_addr_nonnull_fold(ir);
-      tcc_ir_opt_setif_branch_fuse(ir);
-      tcc_ir_opt_stack_bool_diamond(ir);
-      tcc_ir_opt_or_bool_diamond(ir);
-      tcc_ir_opt_var_tmp_fwd(ir);
-      if (tcc_state->opt_dce)
-      {
-        tcc_ir_opt_dce(ir);
-#ifdef CONFIG_TCC_DEBUG
-        dump_ir_after_pass(tcc_state, ir, "slloop_dce");
-#endif
-      }
-      if (tcc_state->opt_jump_threading)
-      {
-        tcc_ir_opt_jump_threading(ir);
-        tcc_ir_opt_eliminate_fallthrough(ir);
-#ifdef CONFIG_TCC_DEBUG
-        dump_ir_after_pass(tcc_state, ir, "slloop_jthread_ftelim");
-#endif
-      }
-      tcc_ir_opt_compact_nops(ir);
-#ifdef CONFIG_TCC_DEBUG
-      dump_ir_after_pass(tcc_state, ir, "slloop_compact_nops");
-#endif
-    }
+    const IRPassGroup *groups;
+    int group_count;
+    tcc_ir_opt_get_pipeline(IR_OPT_LEVEL_2, &groups, &group_count);
+    IROptCtx sl_ctx;
+    tcc_ir_opt_ctx_init(&sl_ctx, ir);
+    tcc_ir_opt_run_group(&sl_ctx, &groups[1]);
+    tcc_ir_opt_ctx_free(&sl_ctx);
   }
 
   /* Post-SL_FWD cleanup: the SL_FWD loop's DCE may have killed dead branches

@@ -24,6 +24,9 @@ int tcc_ir_opt_add_deref_fold(TCCIRState *ir)
   int n = ir->next_instruction_index;
   int changes = 0;
 
+  IROptDU du;
+  ir_opt_du_build_mode(ir, &du, IR_DU_MODE_TMP_ONLY);
+
   for (int i = 0; i < n; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
@@ -113,52 +116,37 @@ int tcc_ir_opt_add_deref_fold(TCCIRState *ir)
       base_vr = cs1_vr;
     }
 
-    /* Check T has exactly one use, and that use is a DEREF */
-    int use_count = 0;
+    /* Fast pre-filter: skip if T has != 1 use (O(1) via shared DU). */
+    if (ir_opt_du_uses(&du, dest_vr) != 1)
+      continue;
+
+    /* Find the single use and verify it's a DEREF. */
     int use_idx = -1;
     int use_is_deref = 0;
-    int use_in_src2 = 0; /* track which slot has the deref */
-    for (int j = 0; j < n; j++)
+    int use_in_src2 = 0;
+    for (int j = i + 1; j < n; j++)
     {
-      if (j == i)
-        continue;
       IRQuadCompact *uq = &ir->compact_instructions[j];
       if (uq->op == TCCIR_OP_NOP)
         continue;
-      /* Check src1 */
       if (irop_config[uq->op].has_src1)
       {
         IROperand s = tcc_ir_op_get_src1(ir, uq);
         if (irop_get_vreg(s) == dest_vr)
-        {
-          use_count++;
-          use_idx = j;
-          use_is_deref = s.is_lval;
-          use_in_src2 = 0;
-        }
+        { use_idx = j; use_is_deref = s.is_lval; use_in_src2 = 0; break; }
       }
-      /* Check src2 */
       if (irop_config[uq->op].has_src2)
       {
         IROperand s = tcc_ir_op_get_src2(ir, uq);
         if (irop_get_vreg(s) == dest_vr)
-        {
-          use_count++;
-          use_idx = j;
-          use_is_deref = s.is_lval;
-          use_in_src2 = 1;
-        }
+        { use_idx = j; use_is_deref = s.is_lval; use_in_src2 = 1; break; }
       }
-      /* Check dest (STORE dest is a pointer use) */
-      if (uq->op == TCCIR_OP_STORE || uq->op == TCCIR_OP_STORE_INDEXED)
-      {
-        IROperand d = tcc_ir_op_get_dest(ir, uq);
-        if (irop_get_vreg(d) == dest_vr)
-          use_count++;
-      }
+      if ((uq->op == TCCIR_OP_STORE || uq->op == TCCIR_OP_STORE_INDEXED) &&
+          irop_get_vreg(tcc_ir_op_get_dest(ir, uq)) == dest_vr)
+      { use_idx = j; break; }
     }
 
-    if (use_count != 1 || !use_is_deref || use_idx < 0)
+    if (!use_is_deref || use_idx < 0)
       continue;
 
     /* Same-block: no branch between ADD and its deref use.  Branches could
@@ -248,6 +236,7 @@ int tcc_ir_opt_add_deref_fold(TCCIRState *ir)
     changes++;
   }
 
+  tcc_free(du.def);
   return changes;
 }
 
@@ -1911,84 +1900,8 @@ int tcc_ir_opt_assign_fuse(TCCIRState *ir)
   if (n < 2)
     return 0;
 
-  /* Build use and def counts for TEMPs. */
-  int max_tmp_pos = 0;
-  for (int i = 0; i < n; i++)
-  {
-    IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
-      continue;
-    int32_t vr = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
-    if (TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
-      continue;
-    int pos = TCCIR_DECODE_VREG_POSITION(vr);
-    if (pos > max_tmp_pos)
-      max_tmp_pos = pos;
-  }
-  if (max_tmp_pos == 0)
-    return 0;
-
-  int stride = max_tmp_pos + 1;
-  uint16_t *use_count = tcc_mallocz(stride * sizeof(uint16_t));
-  uint16_t *def_count = tcc_mallocz(stride * sizeof(uint16_t));
-  int *def_idx = tcc_malloc(stride * sizeof(int));
-  for (int i = 0; i < stride; i++)
-    def_idx[i] = -1;
-
-  for (int i = 0; i < n; i++)
-  {
-    IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op == TCCIR_OP_NOP)
-      continue;
-    if (irop_config[q->op].has_src1)
-    {
-      int32_t vr = irop_get_vreg(tcc_ir_op_get_src1(ir, q));
-      if (TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP)
-      {
-        int pos = TCCIR_DECODE_VREG_POSITION(vr);
-        if (pos <= max_tmp_pos && use_count[pos] < 0xFFFF)
-          use_count[pos]++;
-      }
-    }
-    if (irop_config[q->op].has_src2)
-    {
-      int32_t vr = irop_get_vreg(tcc_ir_op_get_src2(ir, q));
-      if (TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP)
-      {
-        int pos = TCCIR_DECODE_VREG_POSITION(vr);
-        if (pos <= max_tmp_pos && use_count[pos] < 0xFFFF)
-          use_count[pos]++;
-      }
-    }
-    /* STORE's "dest" operand is actually a pointer USE, not a def. */
-    if (irop_config[q->op].has_dest && q->op != TCCIR_OP_STORE && q->op != TCCIR_OP_STORE_INDEXED &&
-        q->op != TCCIR_OP_STORE_POSTINC)
-    {
-      int32_t vr = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
-      if (TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP)
-      {
-        int pos = TCCIR_DECODE_VREG_POSITION(vr);
-        if (pos <= max_tmp_pos)
-        {
-          def_idx[pos] = i;
-          if (def_count[pos] < 0xFFFF)
-            def_count[pos]++;
-        }
-      }
-    }
-    /* STORE's dest acts as a pointer use too — count it as a use. */
-    if ((q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED) &&
-        irop_config[q->op].has_dest)
-    {
-      int32_t vr = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
-      if (TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP)
-      {
-        int pos = TCCIR_DECODE_VREG_POSITION(vr);
-        if (pos <= max_tmp_pos && use_count[pos] < 0xFFFF)
-          use_count[pos]++;
-      }
-    }
-  }
+  IROptDU du;
+  ir_opt_du_build_mode(ir, &du, IR_DU_MODE_TMP_ONLY);
 
   for (int i = 1; i < n; i++)
   {
@@ -2002,15 +1915,12 @@ int tcc_ir_opt_assign_fuse(TCCIRState *ir)
     int32_t src_vr = irop_get_vreg(asn_src);
     if (TCCIR_DECODE_VREG_TYPE(src_vr) != TCCIR_VREG_TYPE_TEMP)
       continue;
-    int src_pos = TCCIR_DECODE_VREG_POSITION(src_vr);
-    if (src_pos > max_tmp_pos)
-      continue;
-    if (use_count[src_pos] != 1 || def_count[src_pos] != 1)
+    if (ir_opt_du_uses(&du, src_vr) != 1 || !ir_opt_du_is_single_def(&du, src_vr))
       continue;
     if (asn_src.is_lval)
       continue;
 
-    int def_i = def_idx[src_pos];
+    int def_i = ir_opt_du_def(&du, src_vr, n);
     if (def_i < 0 || def_i >= i)
       continue;
 
@@ -2062,16 +1972,14 @@ int tcc_ir_opt_assign_fuse(TCCIRState *ir)
       continue;
 
     /* Rewrite: producer's dest = ASSIGN's dest; NOP the ASSIGN. */
-    LOG_IR_GEN("OPTIMIZE: assign_fuse def_i=%d asn_i=%d (T%d → T%d)", def_i, i, src_pos,
-               TCCIR_DECODE_VREG_POSITION(irop_get_vreg(asn_dest)));
+    LOG_IR_GEN("OPTIMIZE: assign_fuse def_i=%d asn_i=%d (T%d → T%d)", def_i, i,
+               TCCIR_DECODE_VREG_POSITION(src_vr), TCCIR_DECODE_VREG_POSITION(irop_get_vreg(asn_dest)));
     tcc_ir_set_dest(ir, def_i, asn_dest);
     q_asn->op = TCCIR_OP_NOP;
     changes++;
   }
 
-  tcc_free(use_count);
-  tcc_free(def_count);
-  tcc_free(def_idx);
+  tcc_free(du.def);
   return changes;
 }
 
