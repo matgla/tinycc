@@ -14,6 +14,8 @@
 #include "licm.h"
 #include "pool.h"
 #include "vreg.h"
+#include "opt_du.h"
+#include "opt_xform.h"
 
 /* ============================================================================
  * FP Offset Cache Optimization - delegated to tccopt.c
@@ -11198,14 +11200,6 @@ int tcc_ir_opt_deref_fwd(TCCIRState *ir)
 }
 
 
-/* Return value optimization - fold LOAD -> RETURNVALUE patterns */
-int tcc_ir_opt_return(TCCIRState *ir)
-{
-  /* TODO: Move implementation from tccir.c */
-  (void)ir;
-  return 0;
-}
-
 /* ============================================================================
  * Entry-Block Store Propagation
  * ============================================================================
@@ -15121,21 +15115,6 @@ int tcc_ir_opt_float_narrowing(TCCIRState *ir)
   return changes;
 }
 
-void tcc_ir_opt_run_all(TCCIRState *ir, int level)
-{
-  /* TODO: Move implementation from tccir.c */
-  (void)ir;
-  (void)level;
-}
-
-int tcc_ir_opt_run_by_name(TCCIRState *ir, const char *name)
-{
-  /* TODO: Move implementation from tccir.c */
-  (void)ir;
-  (void)name;
-  return 0;
-}
-
 /* ============================================================================
  * Stack Address CSE (Common Subexpression Elimination) Optimization
  * ============================================================================
@@ -15372,139 +15351,6 @@ int tcc_ir_opt_stack_addr_cse(TCCIRState *ir)
   LOG_IR_GEN("=== STACK ADDRESS CSE END: %d replacements ===", changes);
 
   return changes;
-}
-
-/* ============================================================================
- * Def-Use Table: O(n) pre-computation enabling O(1) def/use queries
- * ============================================================================
- * Replaces tcc_ir_find_defining_instruction() (O(n) backward scan) and
- * inline O(n) use-count loops used in the fusion passes.
- *
- * Memory: (4+1) bytes × total_vregs.  For a typical embedded function with
- * ~90 total vregs that is ~450 bytes — much less than existing pass allocs
- * such as sl_forward (32×n bytes).
- *
- * Layout in one allocation:
- *   int def[max_var + max_tmp + max_param]   (4 B each, -1 = no def)
- *   uint8_t use[max_var + max_tmp + max_param] (1 B each, saturates at 2)
- *
- * Vreg flat index:
- *   VAR   pos  →  pos
- *   TMP   pos  →  max_var + pos
- *   PARAM pos  →  max_var + max_tmp + pos
- */
-typedef struct
-{
-  int *def;
-  uint8_t *use;
-  int max_var;
-  int max_tmp;
-  int total;
-} IROptDU;
-
-static int ir_opt_du_idx(const IROptDU *du, int32_t vreg)
-{
-  if (vreg < 0)
-    return -1;
-  int type = TCCIR_DECODE_VREG_TYPE(vreg);
-  int pos = TCCIR_DECODE_VREG_POSITION(vreg);
-  int idx;
-  switch (type)
-  {
-  case TCCIR_VREG_TYPE_VAR:
-    idx = pos;
-    break;
-  case TCCIR_VREG_TYPE_TEMP:
-    idx = du->max_var + pos;
-    break;
-  case TCCIR_VREG_TYPE_PARAM:
-    idx = du->max_var + du->max_tmp + pos;
-    break;
-  default:
-    return -1;
-  }
-  return (idx < du->total) ? idx : -1;
-}
-
-/* Build def and use tables in a single O(n) forward pass.
- * Call tcc_free(du.def) when done — single allocation covers both arrays. */
-static void ir_opt_du_build(TCCIRState *ir, IROptDU *du)
-{
-  du->max_var = ir->next_local_variable + 1;
-  du->max_tmp = ir->next_temporary_variable + 1;
-  int max_par = ir->next_parameter + 1;
-  du->total = du->max_var + du->max_tmp + max_par;
-
-  /* Single allocation: int def[] immediately followed by uint8_t use[]. */
-  int def_bytes = du->total * (int)sizeof(int);
-  int use_bytes = du->total * (int)sizeof(uint8_t);
-  du->def = tcc_malloc(def_bytes + use_bytes);
-  du->use = (uint8_t *)((char *)du->def + def_bytes);
-
-  for (int k = 0; k < du->total; k++)
-    du->def[k] = -1;
-  memset(du->use, 0, use_bytes);
-
-  int n = ir->next_instruction_index;
-  for (int i = 0; i < n; i++)
-  {
-    IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op == TCCIR_OP_NOP)
-      continue;
-    /* STORE-family ops carry the address pointer in their `dest` slot —
-     * that is a USE of the pointer vreg, not a definition.  Counting it as
-     * a def would shadow the real def from the upstream address-compute
-     * (e.g. ADD base, #imm) and prevent disp/indexed fusion from finding
-     * it via ir_opt_du_def. */
-    int dest_is_addr_use = (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
-                            q->op == TCCIR_OP_STORE_POSTINC);
-    if (irop_config[q->op].has_dest)
-    {
-      int idx = ir_opt_du_idx(du, irop_get_vreg(tcc_ir_op_get_dest(ir, q)));
-      if (idx >= 0)
-      {
-        if (dest_is_addr_use)
-        {
-          if (du->use[idx] < 2)
-            du->use[idx]++;
-        }
-        else
-        {
-          du->def[idx] = i;
-        }
-      }
-    }
-    if (irop_config[q->op].has_src1)
-    {
-      int idx = ir_opt_du_idx(du, irop_get_vreg(tcc_ir_op_get_src1(ir, q)));
-      if (idx >= 0 && du->use[idx] < 2)
-        du->use[idx]++;
-    }
-    if (irop_config[q->op].has_src2)
-    {
-      int idx = ir_opt_du_idx(du, irop_get_vreg(tcc_ir_op_get_src2(ir, q)));
-      if (idx >= 0 && du->use[idx] < 2)
-        du->use[idx]++;
-    }
-  }
-}
-
-/* Defining instruction index for vreg that is strictly before before_idx.
- * Returns -1 when the vreg has no definition or its def is not before before_idx. */
-static inline int ir_opt_du_def(const IROptDU *du, int32_t vreg, int before_idx)
-{
-  int idx = ir_opt_du_idx(du, vreg);
-  if (idx < 0)
-    return -1;
-  int d = du->def[idx];
-  return (d >= 0 && d < before_idx) ? d : -1;
-}
-
-/* Use count for vreg (0, 1, or 2 meaning "2 or more"). */
-static inline int ir_opt_du_uses(const IROptDU *du, int32_t vreg)
-{
-  int idx = ir_opt_du_idx(du, vreg);
-  return (idx >= 0) ? (int)du->use[idx] : 0;
 }
 
 /* ============================================================================
@@ -16360,13 +16206,7 @@ int tcc_ir_opt_fusion_pass(TCCIRState *ir, int do_mla, int do_indexed)
             ir_opt_du_uses(&du, mul_result_vr) == 1)
         {
           /* Same-block check */
-          int same_block = 1;
-          for (int j = mul_idx + 1; j < i && same_block; j++)
-          {
-            TccIrOp bop = ir->compact_instructions[j].op;
-            if (bop == TCCIR_OP_JUMP || bop == TCCIR_OP_JUMPIF)
-              same_block = 0;
-          }
+          int same_block = ir_xform_same_block(ir, mul_idx, i);
           /* Accumulator defined-before-MUL check */
           if (same_block)
           {
@@ -16636,14 +16476,8 @@ int tcc_ir_opt_rotate_fusion(TCCIRState *ir)
     if (irop_get_vreg(shl_src1) != irop_get_vreg(shr_src1))
       continue;
 
-    int same_block = 1;
     int min_idx = shl_idx < shr_idx ? shl_idx : shr_idx;
-    for (int j = min_idx + 1; j < i && same_block; j++)
-    {
-      TccIrOp bop = ir->compact_instructions[j].op;
-      if (bop == TCCIR_OP_JUMP || bop == TCCIR_OP_JUMPIF)
-        same_block = 0;
-    }
+    int same_block = ir_xform_same_block(ir, min_idx, i);
     if (!same_block)
       continue;
 
@@ -16946,14 +16780,7 @@ int tcc_ir_opt_deref_indexed_fusion(TCCIRState *ir)
         continue;
 
       /* Same-block check: SHL through ALU instruction */
-      int same_block = 1;
-      for (int j = shl_idx + 1; j < i && same_block; j++)
-      {
-        TccIrOp bop = ir->compact_instructions[j].op;
-        if (bop == TCCIR_OP_JUMP || bop == TCCIR_OP_JUMPIF)
-          same_block = 0;
-      }
-      if (!same_block)
+      if (!ir_xform_same_block(ir, shl_idx, i))
         continue;
 
       /* All checks passed — transform */
@@ -17163,17 +16990,7 @@ int tcc_ir_opt_disp_fusion(TCCIRState *ir)
      * mach_ensure_in_reg will handle the load.  Allowed. */
 
     /* Same-block requirement between ADD and its consumer. */
-    int same_block = 1;
-    for (int j = add_idx + 1; j < i; j++)
-    {
-      TccIrOp bop = ir->compact_instructions[j].op;
-      if (bop == TCCIR_OP_JUMP || bop == TCCIR_OP_JUMPIF)
-      {
-        same_block = 0;
-        break;
-      }
-    }
-    if (!same_block)
+    if (!ir_xform_same_block(ir, add_idx, i))
       continue;
 
     /* Capture original LOAD/STORE/ASSIGN operands before we repoint them. */
@@ -17386,17 +17203,7 @@ int tcc_ir_opt_indexed_chain(TCCIRState *ir)
 
     /* Same-block (ADD and the indexed op): disp_fusion already enforces this
      * for fold-produced entries, but be defensive for SHL+ADD-produced ones. */
-    int same_block = 1;
-    for (int j = add_idx + 1; j < i; j++)
-    {
-      TccIrOp bop = ir->compact_instructions[j].op;
-      if (bop == TCCIR_OP_JUMP || bop == TCCIR_OP_JUMPIF)
-      {
-        same_block = 0;
-        break;
-      }
-    }
-    if (!same_block)
+    if (!ir_xform_same_block(ir, add_idx, i))
       continue;
 
     /* Update operands in place and NOP the ADD. */

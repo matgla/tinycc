@@ -291,7 +291,7 @@ LIB-$(TR) ?= {B}:/usr/$(TRIPLET-$T)/lib:/usr/lib/$(MARCH-$T)
 INC-$(TR) ?= {B}/include:/usr/$(TRIPLET-$T)/include:/usr/include
 endif
 
-IR_FILES = ir/type.c ir/pool.c ir/vreg.c ir/stack.c ir/dump.c ir/codegen.c ir/opt.c ir/opt_jump_thread.c ir/licm.c ir/cfg.c ir/ssa.c ir/opt/ssa_opt.c ir/opt/ssa_opt_dce.c ir/opt/ssa_opt_cprop.c ir/opt/ssa_opt_fold.c ir/opt/ssa_opt_phi.c ir/opt/ssa_opt_strength.c ir/opt/ssa_opt_gvn.c ir/opt/ssa_opt_reassoc.c ir/opt/ssa_opt_narrow.c ir/opt/ssa_opt_branch.c ir/opt/ssa_opt_sccp.c ir/opt/ssa_opt_load_cse.c ir/opt/ssa_opt_dead_loop.c ir/regalloc.c ir/core.c ir/machine_op.c
+IR_FILES = ir/type.c ir/pool.c ir/vreg.c ir/stack.c ir/dump.c ir/codegen.c ir/opt.c ir/opt_du.c ir/opt_xform.c ir/opt_jump_thread.c ir/licm.c ir/cfg.c ir/ssa.c ir/opt/ssa_opt.c ir/opt/ssa_opt_dce.c ir/opt/ssa_opt_cprop.c ir/opt/ssa_opt_fold.c ir/opt/ssa_opt_phi.c ir/opt/ssa_opt_strength.c ir/opt/ssa_opt_gvn.c ir/opt/ssa_opt_reassoc.c ir/opt/ssa_opt_narrow.c ir/opt/ssa_opt_branch.c ir/opt/ssa_opt_sccp.c ir/opt/ssa_opt_load_cse.c ir/opt/ssa_opt_dead_loop.c ir/regalloc.c ir/core.c ir/machine_op.c
 CORE_FILES = tccir_operand.c tccls.c tcc.c tcctools.c libtcc.c tccpp.c tccgen.c tccdbg.c tccelf.c tccasm.c tccyaff.c tccld.c tccdebug.c svalue.c tccmachine.c tccopt.c $(IR_FILES)
 CORE_FILES += tcc.h config.h libtcc.h tcctok.h tccir.h tccir_operand.h tccld.h tccmachine.h tccopt.h log.h
 CORE_FILES += $(wildcard ir/*.h)

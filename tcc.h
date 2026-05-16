@@ -1129,7 +1129,6 @@ struct TCCState
   unsigned char opt_bool_cse;         /* -fbool-cse: boolean CSE */
   unsigned char opt_bool_idempotent;  /* -fbool-idempotent: boolean idempotent simplification */
   unsigned char opt_bool_simplify;    /* -fbool-simplify: boolean expression simplification */
-  unsigned char opt_return_value;     /* -freturn-value-opt: return value optimization */
   unsigned char opt_store_load_fwd;   /* -fstore-load-fwd: store-load forwarding */
   unsigned char opt_redundant_store;  /* -fredundant-store-elim: redundant store elimination */
   unsigned char opt_dead_store;       /* -fdead-store-elim: dead store elimination */

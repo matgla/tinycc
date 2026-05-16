@@ -26046,10 +26046,6 @@ static void gen_function(Sym *sym)
   if (tcc_state->opt_bool_simplify)
     tcc_ir_opt_bool_simplify(ir);
 
-  /* Return value optimization - fold LOAD -> RETURNVALUE */
-  if (tcc_state->opt_return_value)
-    tcc_ir_opt_return(ir);
-
   /* Compact NOPs before the store-load forwarding loop (up to 12 iterations). */
   tcc_ir_opt_compact_nops(ir);
 #ifdef CONFIG_TCC_DEBUG

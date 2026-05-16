@@ -125,9 +125,6 @@ int tcc_ir_opt_bool_idempotent(struct TCCIRState *ir);
 /* Boolean Expression Simplification */
 int tcc_ir_opt_bool_simplify(struct TCCIRState *ir);
 
-/* Return Value Optimization */
-int tcc_ir_opt_return(struct TCCIRState *ir);
-
 /* Store-Load Forwarding */
 int tcc_ir_opt_sl_forward(struct TCCIRState *ir);
 
@@ -297,16 +294,6 @@ int tcc_ir_opt_redundant_init_elim(struct TCCIRState *ir);
 /* Back-Edge Phi Hoisting - transform JUMPIF exit + ASSIGNs + JUMP body into
  * ASSIGNs + inverted JUMPIF body, eliminating one branch per loop */
 int tcc_ir_opt_backedge_phi_hoist(struct TCCIRState *ir);
-
-/* ============================================================================
- * Optimization Driver
- * ============================================================================ */
-
-/* Run all enabled optimizations */
-void tcc_ir_opt_run_all(struct TCCIRState *ir, int level);
-
-/* Run specific optimization by name */
-int tcc_ir_opt_run_by_name(struct TCCIRState *ir, const char *name);
 
 /* ============================================================================
  * Optimization Statistics
