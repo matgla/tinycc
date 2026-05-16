@@ -262,6 +262,10 @@ static int scratch_push_count = 0;
  * and trigger recompilation with FP enabled. */
 static int real_run_scratch_push_detected = 0;
 
+/* Tail-call flag: when set, the next gcall_or_jump_mop emits B (branch)
+ * instead of BL (branch-with-link), and post-call cleanup is skipped. */
+static int tail_call_pending = 0;
+
 /* Current slot index within the scratch save area (0-based).
  * Incremented on save, decremented on restore. */
 static int scratch_save_slot = 0;
@@ -9309,9 +9313,13 @@ ST_FUNC void tcc_gen_machine_store_to_sp(int reg, int offset)
  */
 static void gcall_or_jump_mop(int is_jmp, MachineOperand target)
 {
+  /* Tail-call: promote is_jmp so we emit B/BX instead of BL/BLX. */
+  if (tail_call_pending)
+    is_jmp = 1;
+
   if (target.kind == MACH_OP_SYMBOL)
   {
-    /* Direct call via BL with relocation. */
+    /* Direct call via BL (or B.W for tail call) with relocation. */
     Sym *sym = target.u.sym.sym;
     int32_t addend = target.u.sym.addend;
     Sym *validated_sym = sym ? validate_sym_for_reloc(sym) : NULL;
@@ -9337,7 +9345,10 @@ static void gcall_or_jump_mop(int is_jmp, MachineOperand target)
     TRACE("gcall_or_jmp_mop: %d, ind: 0x%x, 0x%x", is_jmp, ind, imm);
     if (imm)
     {
-      ot_check(th_bl_t1(imm));
+      if (is_jmp)
+        ot_check(th_b_t4((int32_t)imm));
+      else
+        ot_check(th_bl_t1(imm));
       if (!dry_run_state.active && reloc_sym)
       {
         int call_pos = ind - 4;
@@ -9353,7 +9364,12 @@ static void gcall_or_jump_mop(int is_jmp, MachineOperand target)
     uint32_t imm = th_encbranch(ind, ind + (int32_t)target.u.imm.val);
     TRACE("gcall_or_jmp_mop(imm): %d, ind: 0x%x, 0x%x", is_jmp, ind, imm);
     if (imm)
-      ot_check(th_bl_t1(imm));
+    {
+      if (is_jmp)
+        ot_check(th_b_t4((int32_t)imm));
+      else
+        ot_check(th_bl_t1(imm));
+    }
     return;
   }
 
@@ -10502,16 +10518,20 @@ ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand ca
       .stack_size = stack_size,
   };
 
+  /* Set tail_call_pending if this is a tail-call-only function. */
+  if (ir->tail_call_only)
+    tail_call_pending = 1;
+
   /* === Preserve nested call registers (R0-R3, R9) via STR to frame ===
    * Instead of PUSH/POP (which moves SP), store to the pre-reserved
    * nested-call save area in the frame.  SP stays fixed. */
   int arg_regs_in_use = call_site->registers_map & 0x0F;
-  int arg_regs_save_mask = arg_regs_in_use;
+  int arg_regs_save_mask = tail_call_pending ? 0 : (arg_regs_in_use);
 
   /* On yasos with no-pic-data-is-text-relative, R9 holds the GOT base and is
    * caller-saved.  Save it alongside the nested-call argument registers so it
    * is restored after the callee returns. */
-  if (text_and_data_separation)
+  if (!tail_call_pending && text_and_data_separation)
     arg_regs_save_mask |= (1 << ARM_R9);
 
   /* Save nested-call registers to pre-reserved frame area via STR.
@@ -10629,10 +10649,43 @@ ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand ca
   scratch_global_exclude |= 0x0F;
   thumb_emit_parallel_arg_moves(reg_moves, reg_move_count);
 
+  /* === Tail call: tear down frame before branching === */
+  if (tail_call_pending)
+  {
+    /* For indirect calls, the target may be in a callee-saved register that
+     * will be popped.  Move it to R_IP (R12) before frame teardown. */
+    if (func_mop.kind == MACH_OP_REG && !func_mop.needs_deref &&
+        func_mop.u.reg.r0 >= R4 && func_mop.u.reg.r0 <= R11)
+    {
+      ot_check_mov_reg(R_IP, func_mop.u.reg.r0, flags_safe(),
+                       THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
+      func_mop.u.reg.r0 = R_IP;
+    }
+    if (epilogue_stack_dealloc > 0)
+      gadd_sp_ex(epilogue_stack_dealloc, R_IP);
+    /* Only pop true callee-saved registers (R4-R11).  R0-R3 may be pushed
+     * for alignment but now hold call arguments — popping them would clobber
+     * the prepared args.  Skip non-callee slots FIRST (they sit at lower
+     * addresses after push), then pop callee-saved from correct position. */
+    uint32_t callee_pop = pushed_registers & 0x0FF0u; /* R4-R11 only */
+    uint32_t non_callee = pushed_registers & ~callee_pop & ~(1u << R_LR) & ~(1u << R_PC);
+    int non_callee_bytes = __builtin_popcount(non_callee) * 4;
+    if (non_callee_bytes > 0)
+      gadd_sp_ex(non_callee_bytes, R_IP);
+    if (callee_pop)
+      ot_check(th_pop(callee_pop));
+  }
+
   /* === Emit call === */
   gcall_or_jump_mop(0, func_mop);
   /* Restore scratch register exclusion */
   scratch_global_exclude = saved_scratch_exclude;
+
+  if (tail_call_pending)
+  {
+    tail_call_pending = 0;
+    goto call_cleanup;
+  }
 
   handle_return_value_mop(&dest_mop, drop_value);
 
@@ -10666,6 +10719,7 @@ ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand ca
 
   call_site->registers_map &= ~0x0F; /* Clear R0-R3 */
 
+call_cleanup:
   if (args)
     tcc_free(args);
   if (mops)

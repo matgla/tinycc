@@ -1,4 +1,74 @@
 {
+  "101_cleanup::check": {
+    "gcc": 29,
+    "tcc": 53,
+    "updated": "2026-05-16T17:55:06.149003+00:00"
+  },
+  "101_cleanup::check2": {
+    "gcc": 4,
+    "tcc": 6,
+    "updated": "2026-05-16T17:55:06.149015+00:00"
+  },
+  "101_cleanup::check_oh_i": {
+    "gcc": 4,
+    "tcc": 6,
+    "updated": "2026-05-16T17:55:06.149018+00:00"
+  },
+  "101_cleanup::cl": {
+    "gcc": 4,
+    "tcc": 6,
+    "updated": "2026-05-16T17:55:06.149022+00:00"
+  },
+  "101_cleanup::goto_hell": {
+    "gcc": 4,
+    "tcc": 7,
+    "updated": "2026-05-16T17:55:06.149025+00:00"
+  },
+  "101_cleanup::incr_glob_i": {
+    "gcc": 6,
+    "tcc": 7,
+    "updated": "2026-05-16T17:55:06.149027+00:00"
+  },
+  "101_cleanup::loop_cleanups": {
+    "gcc": 48,
+    "tcc": 78,
+    "updated": "2026-05-16T17:55:06.149029+00:00"
+  },
+  "101_cleanup::main": {
+    "gcc": 38,
+    "tcc": 392023,
+    "updated": "2026-05-16T17:55:06.149032+00:00"
+  },
+  "101_cleanup::test": {
+    "gcc": 6,
+    "tcc": 9,
+    "updated": "2026-05-16T17:55:06.149034+00:00"
+  },
+  "101_cleanup::test2": {
+    "gcc": 3,
+    "tcc": 12,
+    "updated": "2026-05-16T17:55:06.149037+00:00"
+  },
+  "101_cleanup::test3": {
+    "gcc": 15,
+    "tcc": 30,
+    "updated": "2026-05-16T17:55:06.149039+00:00"
+  },
+  "101_cleanup::test_ret": {
+    "gcc": 7,
+    "tcc": 12,
+    "updated": "2026-05-16T17:55:06.149042+00:00"
+  },
+  "101_cleanup::test_ret2": {
+    "gcc": 11,
+    "tcc": 17,
+    "updated": "2026-05-16T17:55:06.149044+00:00"
+  },
+  "101_cleanup::test_ret_subcall": {
+    "gcc": 2,
+    "tcc": 4,
+    "updated": "2026-05-16T17:55:06.149046+00:00"
+  },
   "105_builtin_strncmp_zero_count::main": {
     "gcc": 2,
     "tcc": 16,
@@ -1716,8 +1786,8 @@
   },
   "tests2/101_cleanup::goto_hell": {
     "gcc": 4,
-    "tcc": 8,
-    "updated": "2026-05-14T21:15:32.782361+00:00"
+    "tcc": 7,
+    "updated": "2026-05-16T17:54:26.820129+00:00"
   },
   "tests2/101_cleanup::incr_glob_i": {
     "gcc": 6,
@@ -2591,8 +2661,8 @@
   },
   "tests2/91_ptr_longlong_arith32::main": {
     "gcc": 9,
-    "tcc": 25,
-    "updated": "2026-05-14T21:15:32.782221+00:00"
+    "tcc": 16,
+    "updated": "2026-05-16T17:54:26.820067+00:00"
   },
   "tests2/92_enum_bitfield::blah": {
     "gcc": 2,
@@ -2611,8 +2681,8 @@
   },
   "tests2/93_integer_promotion::main": {
     "gcc": 173,
-    "tcc": 590,
-    "updated": "2026-05-14T21:15:32.782229+00:00"
+    "tcc": 586,
+    "updated": "2026-05-16T17:54:26.820079+00:00"
   },
   "tests2/97_utf8_string_literal::main": {
     "gcc": 33,

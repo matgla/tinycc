@@ -26293,13 +26293,23 @@ static void gen_function(Sym *sym)
    */
   {
     ir->leaffunc = 1;
+    ir->tail_call_only = 0;
+    int call_count = 0;
+    int call_idx = -1;
+    int has_complex_fp = 0;
     for (int i = 0; i < ir->next_instruction_index; ++i)
     {
       const IRQuadCompact *q = &ir->compact_instructions[i];
-      if (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID || q->op == TCCIR_OP_BUILTIN_APPLY)
+      if (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID)
       {
         ir->leaffunc = 0;
-        break;
+        call_count++;
+        call_idx = i;
+      }
+      else if (q->op == TCCIR_OP_BUILTIN_APPLY)
+      {
+        ir->leaffunc = 0;
+        call_count = 99;
       }
       /* Complex FP ops expand to soft-float BL calls during codegen */
       if (q->op == TCCIR_OP_FADD || q->op == TCCIR_OP_FSUB || q->op == TCCIR_OP_FMUL || q->op == TCCIR_OP_FDIV)
@@ -26308,8 +26318,72 @@ static void gen_function(Sym *sym)
         if (dest.is_complex)
         {
           ir->leaffunc = 0;
-          break;
+          has_complex_fp = 1;
         }
+      }
+    }
+
+    /* Tail-call detection: if there is exactly one call and it is at the tail
+     * position (immediately followed by RETURNVALUE/RETURNVOID with only NOPs
+     * between), the function can use a branch instead of bl, preserving LR. */
+    if (call_count == 1 && !has_complex_fp && !func_var && !ir->has_static_chain && call_idx >= 0)
+    {
+      const IRQuadCompact *cq = &ir->compact_instructions[call_idx];
+      int is_tail = 0;
+
+      /* Find the next non-NOP instruction after the call */
+      int j = call_idx + 1;
+      while (j < ir->next_instruction_index && ir->compact_instructions[j].op == TCCIR_OP_NOP)
+        j++;
+
+      if (j < ir->next_instruction_index)
+      {
+        const IRQuadCompact *nq = &ir->compact_instructions[j];
+        if (!nq->is_jump_target)
+        {
+          if (cq->op == TCCIR_OP_FUNCCALLVOID && nq->op == TCCIR_OP_RETURNVOID)
+          {
+            is_tail = 1;
+          }
+          else if (cq->op == TCCIR_OP_FUNCCALLVAL && nq->op == TCCIR_OP_RETURNVALUE)
+          {
+            IROperand call_dest = tcc_ir_op_get_dest(ir, cq);
+            IROperand ret_src = tcc_ir_op_get_src1(ir, nq);
+            int call_vr = irop_get_vreg(call_dest);
+            int ret_vr = irop_get_vreg(ret_src);
+            if (call_vr >= 0 && call_vr == ret_vr)
+              is_tail = 1;
+          }
+          else if (cq->op == TCCIR_OP_FUNCCALLVOID && nq->op == TCCIR_OP_RETURNVALUE)
+          {
+            /* void call followed by return of a different value — not a tail call */
+          }
+          else if (cq->op == TCCIR_OP_FUNCCALLVAL && nq->op == TCCIR_OP_RETURNVOID)
+          {
+            /* Call with unused return value followed by void return — tail call */
+            is_tail = 1;
+          }
+        }
+      }
+
+      /* Verify no remaining code after the return (other paths to different returns
+       * would mean LR could be needed). Check that everything after j is NOP. */
+      if (is_tail)
+      {
+        for (int k = j + 1; k < ir->next_instruction_index; k++)
+        {
+          if (ir->compact_instructions[k].op != TCCIR_OP_NOP)
+          {
+            is_tail = 0;
+            break;
+          }
+        }
+      }
+
+      if (is_tail)
+      {
+        ir->tail_call_only = 1;
+        ir->leaffunc = 1;
       }
     }
   }

@@ -1895,6 +1895,16 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
     }
     ir->call_outgoing_size = max_outgoing;
 
+    /* Disable tail-call optimization if the call needs stack arguments or if
+     * text_and_data_separation requires R9 save/restore around the call.
+     * With stack args, the pre-reserved outgoing area would need to be set up
+     * before the branch, complicating frame teardown. */
+    if (ir->tail_call_only && (max_outgoing > 0 || tcc_state->text_and_data_separation))
+    {
+      ir->tail_call_only = 0;
+      ir->leaffunc = 0;
+    }
+
     /* Reserve nested-call register save area for functions with multiple calls.
      * Size based on actual max R0-R3 usage across calls (+ R9 if needed). */
     if (call_count > 1 && max_nested_save_regs > 0)
@@ -1955,6 +1965,17 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
   ir->scratch_save_base = 0;
 
   int stack_size = (-loc + 7) & ~7; // align to 8 bytes
+
+  /* Disable tail-call if the function needs any stack frame or frame pointer.
+   * Tail-call tears down the frame before branching, but arguments to the tail
+   * call may reference stack-relative addresses (struct copies, spilled values)
+   * that would become invalid after the teardown. */
+  if (ir->tail_call_only &&
+      (stack_size > 0 || tcc_state->need_frame_pointer || tcc_state->force_frame_pointer))
+  {
+    ir->tail_call_only = 0;
+    ir->leaffunc = 0;
+  }
 
   /* ============================================================================
    * DRY RUN PASS: Analyze scratch register needs before emitting prologue

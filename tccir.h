@@ -411,6 +411,7 @@ typedef struct TCCIRState
   int named_arg_stack_bytes;
 
   uint8_t leaffunc : 1;
+  uint8_t tail_call_only : 1;
   uint8_t naked : 1;
   uint8_t processing_if : 1;
   uint8_t check_for_backwards_jumps : 1;
