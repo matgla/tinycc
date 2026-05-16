@@ -26,6 +26,8 @@
 #include "ir/core.h"
 #include "ir/licm.h"
 #include "ir/opt.h"
+#include "ir/opt_engine.h"
+#include "ir/opt_gens_fusion.h"
 #include "ir/regalloc.h"
 #include "ir/ssa.h"
 #include "tccir.h"
@@ -25955,18 +25957,18 @@ static void gen_function(Sym *sym)
    * Ordering constraints:
    *   mla_fusion      should run before indexed/postinc (cleaner patterns)
    */
-  /* Rotation fusion: SHL(x,n) + SHR(x,32-n) + OR → ROR(x,32-n).
-   * Runs before other fusions to simplify the IR early. */
-  if (tcc_state->optimize > 0)
-    tcc_ir_opt_rotate_fusion(ir);
+  if (tcc_state->optimize > 0) {
+    IROptCtx fusion_ctx;
+    tcc_ir_opt_ctx_init(&fusion_ctx, ir);
+    tcc_ir_opt_run_gens(&fusion_ctx, fusion_gens, fusion_gens_count);
+    tcc_ir_opt_ctx_free(&fusion_ctx);
+  }
 
   /* Barrel shift fusion: fold single-use SHL/SHR/SAR/ROR into consuming ALU op.
    * Runs before regalloc so liveness is updated. Results stored in ir->barrel_shifts[]
    * side-table keyed by orig_index (stable across regalloc instruction renumbering). */
 
-  /* Combined fusion pass: MLA + indexed memory in one loop with shared def/use table. */
-  if (tcc_state->opt_mla_fusion || tcc_state->opt_indexed_memory)
-    tcc_ir_opt_fusion_pass(ir, tcc_state->opt_mla_fusion, tcc_state->opt_indexed_memory);
+  /* MLA + indexed memory fusion now handled by fusion_gens engine above */
 
   /* Deref-in-ALU indexed fusion: extract deref operands in ALU instructions
    * (e.g. XOR with table lookup) into LOAD_INDEXED when the address is

@@ -11,16 +11,16 @@
 ### Phase 1 — Extract shared analysis & primitives
 - [x] **1.1** `ir/opt_du.{h,c}` — `IROptDU` + `ir_opt_du_build/idx/def/uses`
 - [x] **1.2** `ir/opt_xform.{h,c}` — `ir_xform_nop` (inline), `ir_xform_same_block` (5/6 call sites migrated; 1 site keeps non-canonical NOP-boundary semantics)
-- [ ] **1.3** `ir/opt_utils.{h,c}` — constant evaluators, BB/CFG helpers, purity tables, expression equality, call-param helpers
-- [ ] **1.4** `ir/opt_alias.{h,c}` — stack-slot aliasing helpers
-- [ ] **1.5** `ir/opt_loop_utils.{h,c}` — IV analysis, loop bounds, loop transforms
+- [x] **1.3** `ir/opt_utils.{h,c}` — constant evaluators, BB/CFG helpers, purity tables, expression equality, call-param helpers
+- [x] **1.4** `ir/opt_alias.{h,c}` — stack-slot aliasing helpers
+- [x] **1.5** `ir/opt_loop_utils.{h,c}` — IV analysis, loop bounds, loop transforms
 
 ### Phase 2 — Build the pre-SSA engine
-- [ ] **2.1** `ir/opt_engine.{h,c}` — `IROptCtx`, `IROptGen`, `tcc_ir_opt_run_gens`, lazy analysis cache
-- [ ] **2.2** Build-only verify (no rules wired yet)
+- [x] **2.1** `ir/opt_engine.{h,c}` — `IROptCtx`, `IROptGen`, `tcc_ir_opt_run_gens`, lazy analysis cache
+- [x] **2.2** Build-only verify (no rules wired yet)
 
 ### Phase 3 — Convert pass groups to generator tables
-- [ ] **3.1** Fusion group → `ir/opt_gens_fusion.c` (mla, indexed_mem, rotate, deref_indexed, disp, postinc, lea_fold, indexed_chain, indexed_pair_reorder, assign_fuse)
+- [ ] **3.1** Fusion group → `ir/opt_gens_fusion.c` (rotate done; remaining: mla, indexed_mem, deref_indexed, disp, postinc, lea_fold, indexed_chain, indexed_pair_reorder, assign_fuse)
 - [ ] **3.2** Branch-folding group → `ir/opt_gens_branch.c` (branch_folding, setif_branch_fuse, or_bool_diamond, parts of stack_addr_nonnull_fold)
 - [ ] **3.3** Boolean simplification → `ir/opt_gens_bool.c` (bool_idempotent + bool_simplify + idempotent half of bool_pass)
 - [ ] **3.4** BB-scoped hash CSE rewrites to use `IROptHashTable` (cse_global_load, globalsym_cse, cse_param_add, local_load_cse, local_alu_cse, stackoff_addr_cse, cse_bool)

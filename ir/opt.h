@@ -216,10 +216,10 @@ int tcc_ir_opt_lea_fold(struct TCCIRState *ir);
 int tcc_ir_opt_add_deref_fold(struct TCCIRState *ir);
 
 /* Combined fusion pass: mla_fusion + indexed_memory_fusion in one loop (shared IROptDU) */
-int tcc_ir_opt_fusion_pass(struct TCCIRState *ir, int do_mla, int do_indexed);
+/* tcc_ir_opt_fusion_pass replaced by generators in opt_gens_fusion.c */
 
 /* Rotation fusion: SHL(x,n) + SHR(x,32-n) + OR → ROR(x,32-n) */
-int tcc_ir_opt_rotate_fusion(struct TCCIRState *ir);
+/* tcc_ir_opt_rotate_fusion replaced by ir_gen_rotate_fusion in opt_gens_fusion.c */
 
 /* Late barrel shift fusion: populates ir->barrel_shifts[] side-table.
  * Must run immediately before codegen — no passes may run between. */
