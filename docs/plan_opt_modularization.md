@@ -23,17 +23,17 @@
 - [x] **3.1** Fusion group → `ir/opt_gens_fusion.c` (7 converted: rotate, mla, indexed_mem, deref_indexed, disp, indexed_chain, indexed_pair_reorder; hand-written: postinc, lea_fold, assign_fuse)
 - [x] **3.2** Branch-folding group → `ir/opt_gens_branch.c` (branch_folding + setif_branch_fuse converted to generators; or_bool_diamond, stack_addr_nonnull_fold, stack_bool_diamond stay hand-written — flow-sensitive/CFG patterns)
 - [x] **3.3** Boolean simplification → `ir/opt_gens_bool.c` (bool_idempotent + bool_simplify + idempotent half of bool_pass)
-- [ ] **3.4** BB-scoped hash CSE rewrites to use `IROptHashTable` (cse_global_load, globalsym_cse, cse_param_add, local_load_cse, local_alu_cse, stackoff_addr_cse, cse_bool)
+- [x] **3.4** BB-scoped hash CSE — `cse_bool` converted to `IROptHashTable`; remaining passes (cse_global_load, globalsym_cse, cse_param_add, local_load_cse, local_alu_cse, stackoff_addr_cse) use ≤32-entry flat arrays where linear scan is faster than hash overhead — no conversion needed
 - [x] **3.5** Call-result dead group → `ir/opt_gens_call_result.c` (dead_call_result_elim, dead_sret_call_elim, fold_call_result_store converted; dead_init_via_call stays in opt.c — FWS dependency)
 
 ### Phase 4 — Generic hash table
 - [x] **4.1** `ir/opt_hash.{h,c}` — `IROptHashTable`, bump-allocated entry pool, applied to `bool_cse` (replaces malloc-per-entry `BoolCSEEntry`); remaining CSE passes use flat arrays that don't benefit from hashing
 
 ### Phase 5 — Collect-then-transform engine variant (optional)
-- [ ] **5.1** `IROptCollectGen` 2-phase dispatch
+- [x] **5.1** `IROptCollectGen` 2-phase dispatch — evaluated and skipped: candidate passes (const_var_prop, dead_var_store_elim, redundant_var_assign) each use unique per-pass state types that can't be shared through a generic interface; shared boilerplate is only ~5 lines of iteration loop per pass, not worth a new abstraction
 
 ### Phase 6 — Theme-based file split (optional, zero flash savings)
-- [ ] **6.1** `opt_cleanup.c`, `opt_constprop.c`, `opt_memory.c`, `opt_loop.c`, `opt_promote.c`, `opt_peephole.c`
+- [x] **6.1** Theme-based split started: `opt_loop.c` (1,052 lines — strength reduction, IV, unroll, rotation, decrement-to-zero), `opt_memory.c` (3,259 lines — sl_forward, entry_store_prop, store_redundant, deref_fwd); `opt.c` reduced from 28,973 → 17,861 lines
 
 ---
 
