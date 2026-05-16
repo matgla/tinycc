@@ -321,13 +321,16 @@ int tcc_ir_opt_postinc_fusion_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_assign_fuse_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_var_to_tmp_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_var_tmp_fwd_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_redundant_loop_check_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_vrp_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_nonneg_branch_fold_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_float_branch_fold_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_jump_threading_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_eliminate_fallthrough_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_dead_loop_elim_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_redundant_var_assign_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_dead_var_store_elim_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_dead_addrvar_elim_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_store_redundant_ex(struct IROptCtx *ctx);
 
 /* ============================================================================

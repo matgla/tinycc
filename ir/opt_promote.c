@@ -1634,3 +1634,4 @@ int tcc_ir_opt_backedge_phi_hoist(TCCIRState *ir)
 
 int tcc_ir_opt_var_to_tmp_ex(IROptCtx *ctx) { return tcc_ir_opt_var_to_tmp(ctx->ir); }
 int tcc_ir_opt_var_tmp_fwd_ex(IROptCtx *ctx) { return tcc_ir_opt_var_tmp_fwd(ctx->ir); }
+int tcc_ir_opt_redundant_loop_check_ex(IROptCtx *ctx) { return tcc_ir_opt_redundant_loop_check(ctx->ir); }

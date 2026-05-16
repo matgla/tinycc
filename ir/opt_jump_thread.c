@@ -204,3 +204,4 @@ int tcc_ir_opt_eliminate_fallthrough(TCCIRState *ir)
 }
 
 int tcc_ir_opt_jump_threading_ex(IROptCtx *ctx) { return tcc_ir_opt_jump_threading(ctx->ir); }
+int tcc_ir_opt_eliminate_fallthrough_ex(IROptCtx *ctx) { return tcc_ir_opt_eliminate_fallthrough(ctx->ir); }

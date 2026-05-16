@@ -25747,161 +25747,17 @@ static void gen_function(Sym *sym)
 #endif
   }
 
-  /* Iterative optimization loop
-   * Runs optimization passes until no more changes are made,
-   * or until max iterations reached. This allows constant propagation
-   * to feed into branch folding, which then enables more DCE, etc.
-   */
-  int iteration = 0;
-  const int max_iterations = 10;
-  int changes = 0;
-
-  do
+  /* Iterative optimization loop — propagation + simplification passes run
+   * until fixed-point (no changes) or max 10 iterations.  Managed by the
+   * pipeline runner with per-pass feature-flag gating. */
   {
-    changes = 0;
-    iteration++;
-
-    /* Dead code elimination - remove unreachable instructions */
-    if (tcc_state->opt_dce)
-      changes += tcc_ir_opt_dce(ir);
-
-    /* Constant propagation — feeds branch_folding and other pre-SSA passes.
-     * Full dataflow constant propagation (SCCP) runs later in the SSA phase;
-     * this pre-SSA pass handles the simpler cases needed here. */
-    if (tcc_state->opt_const_prop)
-      changes += tcc_ir_opt_const_prop(ir);
-
-    /* Fold LOAD of a static global whose initializer is known and
-     * has not been clobbered into ASSIGN #imm. */
-    if (tcc_state->opt_const_prop)
-      changes += tcc_ir_opt_global_init_prop(ir);
-
-    /* TMP constant propagation — propagate constants from folded expressions. */
-    if (tcc_state->opt_const_prop)
-      changes += tcc_ir_opt_const_prop_tmp(ir);
-
-    /* ADD/SUB constant reassociation — normalize ADD(ADD(base, c1), c2) into
-     * ADD(base, c1+c2).  Enables CMP identity folding to detect that two
-     * independently computed "base + N" values are identical.
-     * Follow with redundant_var_assign to remove old defs made dead by
-     * the reassociation, so single_def checks pass in subsequent CMP fold. */
-    if (tcc_state->opt_const_prop)
-    {
-      int reassoc_ch = tcc_ir_opt_add_reassoc(ir);
-      if (reassoc_ch)
-      {
-        tcc_ir_opt_redundant_var_assign(ir);
-        changes += reassoc_ch;
-      }
-    }
-
-    /* Fold constant string builtin calls after argument/address
-     * propagation exposes literal-backed pointers in the IR. */
-    if (tcc_state->opt_const_prop)
-      changes += tcc_ir_opt_const_string_calls(ir);
-
-    /* Phase 1b2: Flow-sensitive value tracking — propagates constants through
-     * multi-definition VARs and store-through-pointer patterns (LEA+STORE).
-     * Must run after const_prop so single-def constants are already folded. */
-    if (tcc_state->opt_const_prop)
-      changes += tcc_ir_opt_value_tracking(ir);
-
-    /* CMP expression-equality fold — detect CMP(a, b) where a and b are
-     * defined by identical expressions (e.g. both ADD(GlobalSym, 5)).
-     * Runs after value_tracking which simplifies LOAD→ASSIGN, exposing
-     * single-def vregs with matching definitions. */
-    if (tcc_state->opt_const_prop)
-      changes += tcc_ir_opt_cmp_expr_fold(ir);
-
-    /* Phase 1c: Constant Branch Folding - fold branches with constant conditions
-     * This is critical for optimizing conditionals where values are constants.
-     * Must run after constant propagation to maximize folding opportunities.
-     */
-    if (tcc_state->opt_const_prop)
-      changes += tcc_ir_opt_branch_folding(ir);
-    if (tcc_state->opt_const_prop)
-      changes += tcc_ir_opt_stack_addr_nonnull_fold(ir);
-
-    /* Phase 1c2: Boolean materialization peephole. Fuse
-     * CMP+SETIF+TEST_ZERO+JUMPIF into CMP+JUMPIF when the materialized
-     * boolean is single-use. */
-    if (tcc_state->opt_const_prop)
-      changes += tcc_ir_opt_setif_branch_fuse(ir);
-
-    /* Phase 1c3: Stack-Boolean-Diamond. Collapse STORE/JUMP/STORE/TEST_ZERO/
-     * JUMPIF written to a single-use stack slot into two direct branches. */
-    if (tcc_state->opt_const_prop)
-      changes += tcc_ir_opt_stack_bool_diamond(ir);
-
-    /* Phase 1c3b: OR-Boolean-Diamond. Same shape as 1c3 but with the
-     * stack-slot consumer being `acc |= slot` rather than TEST_ZERO+JUMPIF. */
-    if (tcc_state->opt_const_prop)
-      changes += tcc_ir_opt_or_bool_diamond(ir);
-
-    /* Phase 1c4: VAR → TMP local forwarding. Reroute in-BB uses of a VAR
-     * just written from a TEMP to use the TEMP directly (no reload). */
-    if (tcc_state->opt_const_prop)
-      changes += tcc_ir_opt_var_tmp_fwd(ir);
-
-    /* Phase 1c4b: Local load CSE — currently disabled.
-     * While the direct use-substitution approach correctly preserves DEREF
-     * flags, merging VAR loads extends TEMP live ranges, increasing register
-     * pressure on ARM's limited register file and causing net regressions
-     * from additional spills. Needs register-pressure-aware heuristics. */
-
-    /* Phase 1c5: Single-BB VAR→TMP promotion. Converts a non-addressed VAR
-     * with a single def and only lval-ASSIGN reads into a fresh TEMP,
-     * feeding copy_prop so the reload round-trip disappears. */
-    if (tcc_state->opt_copy_prop)
-      changes += tcc_ir_opt_var_to_tmp(ir);
-
-    /* Non-negative value branch folding - fold soft-float comparisons
-     * of known non-negative values (e.g. fabs(x)) against zero.
-     */
-    if (tcc_state->opt_nonneg_fold)
-      changes += tcc_ir_opt_nonneg_branch_fold(ir);
-
-    /* Phase 1e1: Float comparison branch folding - fold repeated FCMP and
-     * duplicated pure boolean tests on the fall-through path.
-     */
-    if (tcc_state->opt_vrp)
-      changes += tcc_ir_opt_float_branch_fold(ir);
-
-    /* Phase 1e2: Value Range Propagation - fold branches whose outcome is
-     * fully determined by value ranges derived from earlier branches.
-     * Example: after "var > 0" branch, var-1 is non-negative, so
-     * (var-1) <U UINT_MAX is always true.
-     */
-    if (tcc_state->opt_vrp)
-      changes += tcc_ir_opt_vrp(ir);
-
-    /* Phase 1f: Float narrowing - replace floor((double)float_val) with
-     * floorf(float_val) for integer-valued math functions.
-     */
-    if (tcc_state->opt_float_narrow)
-      changes += tcc_ir_opt_float_narrowing(ir);
-
-    /* Deref forwarding — reuse a just-loaded deref value in an
-     * adjacent CMP instead of re-reading from memory.  Fires after inlining
-     * of check functions that save a value for an error path then compare. */
-    if (tcc_state->opt_const_prop)
-      changes += tcc_ir_opt_deref_fwd(ir);
-
-  } while (changes > 0 && iteration < max_iterations);
-
-  /* Post-loop cleanup: when the iterative loop exhausted max_iterations,
-   * cascading folds (e.g. bswap→SHR→AND→CMP) may have made more VARs
-   * single-def constants.  One final DCE+const_prop+branch_folding round
-   * catches the remaining opportunities without raising max_iterations. */
-  if (iteration >= max_iterations && tcc_state->opt_const_prop)
-  {
-    if (tcc_state->opt_dce)
-      tcc_ir_opt_dce(ir);
-    tcc_ir_opt_const_prop(ir);
-    tcc_ir_opt_const_prop_tmp(ir);
-    tcc_ir_opt_branch_folding(ir);
-    if (tcc_state->opt_dce)
-      tcc_ir_opt_dce(ir);
+    const IRPassGroup *groups;
+    int group_count;
+    tcc_ir_opt_get_pipeline(IR_OPT_LEVEL_2, &groups, &group_count);
+    IROptCtx prop_ctx;
+    tcc_ir_opt_ctx_init(&prop_ctx, ir);
+    tcc_ir_opt_run_group(&prop_ctx, &groups[0]);
+    tcc_ir_opt_ctx_free(&prop_ctx);
   }
 
   /* Narrow CSE: deduplicate PARAM/VAR + #constant expressions. */
@@ -25922,7 +25778,7 @@ static void gen_function(Sym *sym)
 
   /* Global CSE is handled by SSA GVN pass in regalloc. */
 
-  LOG_IR_GEN("OPTIMIZE: Ran %d optimization iterations", iteration);
+  LOG_IR_GEN("OPTIMIZE: propagation group complete");
 
   /* Phase 2c: Jump Threading - forward jump targets through NOPs and chains
    * This eliminates unnecessary jumps and simplifies control flow.
@@ -26083,14 +25939,7 @@ static void gen_function(Sym *sym)
 
   /* Phase 4: Store-Load Forwarding - replace loads from recently stored addresses
    * CONSERVATIVE: Only handles stack locals whose address is not taken.
-   * DISABLED for nested functions with static chain: chain-relative captured
-   * variable offsets can numerically match FP-relative local variable offsets,
-   * causing the forwarding to confuse aliased values. */
-  /* Iterate store-load forwarding + const prop + branch folding + DCE.
-   * Each round may fold branches (e.g. CMP #7,#7 → always true), removing
-   * basic-block boundaries and exposing more store-load forwarding opportunities
-   * for the next round.  This is critical for struct field accesses where each
-   * check1() call creates a branch between consecutive field reads. */
+   * DISABLED for nested functions with static chain. */
   for (int sl_iter = 0; sl_iter < 12; sl_iter++)
   {
     if (!(tcc_state->opt_store_load_fwd && !ir->has_static_chain && tcc_ir_opt_sl_forward(ir)))
@@ -26120,9 +25969,6 @@ static void gen_function(Sym *sym)
       tcc_ir_opt_stack_bool_diamond(ir);
       tcc_ir_opt_or_bool_diamond(ir);
       tcc_ir_opt_var_tmp_fwd(ir);
-      /* DCE first: unreachable code after branch folding (e.g. dead error
-       * paths) must be NOP'd before fallthrough elimination can see that
-       * a JMP to its nearby target is a simple fallthrough over NOPs. */
       if (tcc_state->opt_dce)
       {
         tcc_ir_opt_dce(ir);
@@ -26130,10 +25976,6 @@ static void gen_function(Sym *sym)
         dump_ir_after_pass(tcc_state, ir, "slloop_dce");
 #endif
       }
-      /* Remove unconditional jumps that became fallthrough after branch folding
-       * + DCE.  This eliminates BB boundaries so the next store-load round can
-       * see stores across previously separated blocks (e.g. struct field
-       * accesses separated by check1() calls). */
       if (tcc_state->opt_jump_threading)
       {
         tcc_ir_opt_jump_threading(ir);
@@ -26142,11 +25984,6 @@ static void gen_function(Sym *sym)
         dump_ir_after_pass(tcc_state, ir, "slloop_jthread_ftelim");
 #endif
       }
-      /* Compact NOPs so the next SL-FWD iteration sees clean BB boundaries.
-       * Dead code from DCE + eliminated fallthroughs create NOP chains that
-       * inflate pred_count (NOP is not a terminator → implicit fallthrough),
-       * causing the SL-FWD to unnecessarily reset its hash table at merge
-       * points.  Compacting removes these phantom predecessors. */
       tcc_ir_opt_compact_nops(ir);
 #ifdef CONFIG_TCC_DEBUG
       dump_ir_after_pass(tcc_state, ir, "slloop_compact_nops");
@@ -26216,58 +26053,16 @@ static void gen_function(Sym *sym)
   if (tcc_state->opt_dead_store)
     tcc_ir_opt_dead_init_via_call(ir);
 
-  /* Phase 4: Redundant Store Elimination - remove stores overwritten before read
-   * CONSERVATIVE: Only handles stack locals whose address is not taken */
-  if (tcc_state->opt_redundant_store)
+  /* Late cleanup: store elimination, dead var/addrvar elimination, redundant assign.
+   * Run with max_iterations=2 so dead_addrvar_elim → DSE cascade works. */
   {
-    tcc_ir_opt_store_redundant(ir);
-#ifdef CONFIG_TCC_DEBUG
-    dump_ir_after_pass(tcc_state, ir, "store_redundant");
-#endif
-  }
-
-  /* Dead store elimination - remove unused ASSIGN instructions */
-  if (tcc_state->opt_dead_store)
-  {
-    tcc_ir_opt_dse(ir);
-#ifdef CONFIG_TCC_DEBUG
-    dump_ir_after_pass(tcc_state, ir, "dse");
-#endif
-  }
-
-  /* Dead VAR store elimination (post-SL_FWD): after DSE kills dead TMPs,
-   * VARs that were only read by those TMPs become dead.  Typical pattern:
-   * SL_FWD forwards struct field loads, making the address computation
-   * dead (e.g. T15 = V3; T16 = T15+16 → both dead after forwarding).
-   * DSE kills T15/T16, then dead_var_store_elim kills V3's store.
-   * Cascade with DSE to kill the now-dead source TMPs of eliminated VAR stores. */
-  if (tcc_state->opt_dead_store)
-  {
-    tcc_ir_opt_dead_var_store_elim(ir);
-#ifdef CONFIG_TCC_DEBUG
-    dump_ir_after_pass(tcc_state, ir, "dead_var_store_elim");
-#endif
-  }
-
-  /* Dead address-taken VAR elimination - remove writes to VARs with no live reads.
-   * Must run after value tracking + DCE have eliminated all uses of overflow results. */
-  if (tcc_state->opt_dead_store)
-  {
-    if (tcc_ir_opt_dead_addrvar_elim(ir))
-      tcc_ir_opt_dse(ir);
-#ifdef CONFIG_TCC_DEBUG
-    dump_ir_after_pass(tcc_state, ir, "dead_addrvar_elim");
-#endif
-  }
-
-  /* Redundant VAR ASSIGN elimination - kill assigns overwritten before next read.
-   * Must run after dead_addrvar_elim to catch newly-exposed redundant assigns. */
-  if (tcc_state->opt_dead_store)
-  {
-    tcc_ir_opt_redundant_var_assign(ir);
-#ifdef CONFIG_TCC_DEBUG
-    dump_ir_after_pass(tcc_state, ir, "redundant_var_assign");
-#endif
+    const IRPassGroup *groups;
+    int group_count;
+    tcc_ir_opt_get_pipeline(IR_OPT_LEVEL_2, &groups, &group_count);
+    IROptCtx cleanup_ctx;
+    tcc_ir_opt_ctx_init(&cleanup_ctx, ir);
+    tcc_ir_opt_run_group(&cleanup_ctx, &groups[group_count - 1]);
+    tcc_ir_opt_ctx_free(&cleanup_ctx);
   }
 
   /* Phase 4c: Loop Rotation - convert top-tested (while) loops to

@@ -57,6 +57,7 @@ typedef struct IRPassGroup
   int count;
   int max_iterations;
   uint8_t compact_after;
+  int8_t trigger_idx;
 } IRPassGroup;
 
 /* ============================================================================
@@ -103,6 +104,9 @@ void tcc_ir_opt_get_pipeline(IROptLevel level, const IRPassGroup **out_groups,
 /* Convenience: run the full pipeline for a given optimization level.
  * Equivalent to get_pipeline + run_pipeline. Returns total changes. */
 int tcc_ir_opt_run_default(struct TCCIRState *ir, IROptLevel level);
+
+/* Entry-store-prop group (trigger-based, 3 iterations, compact_after) */
+extern const IRPassGroup entry_store_group;
 
 /* Concrete gen-pass adapters (pipeline-callable) */
 int tcc_ir_opt_gens_fusion_ex(IROptCtx *ctx);

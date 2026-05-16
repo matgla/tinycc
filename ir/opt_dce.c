@@ -2639,4 +2639,5 @@ int tcc_ir_opt_dead_loop_elim(TCCIRState *ir)
 int tcc_ir_opt_dead_loop_elim_ex(IROptCtx *ctx) { return tcc_ir_opt_dead_loop_elim(ctx->ir); }
 int tcc_ir_opt_redundant_var_assign_ex(IROptCtx *ctx) { return tcc_ir_opt_redundant_var_assign(ctx->ir); }
 int tcc_ir_opt_dead_var_store_elim_ex(IROptCtx *ctx) { return tcc_ir_opt_dead_var_store_elim(ctx->ir); }
+int tcc_ir_opt_dead_addrvar_elim_ex(IROptCtx *ctx) { return tcc_ir_opt_dead_addrvar_elim(ctx->ir); }
 

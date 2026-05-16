@@ -21,6 +21,24 @@
 
 #define FLAG(f) (uint16_t)offsetof(TCCState, f)
 
+static void pipeline_trace_pass(const IRPassGroup *group, const IROptPass *pass,
+                                int iter, int changes)
+{
+  if (tcc_state->verbose >= 2 && changes > 0)
+    fprintf(stderr, "[OPT %s/%s iter=%d] %d changes\n",
+            group->name, pass->name, iter + 1, changes);
+}
+
+static void pipeline_trace_group(const IRPassGroup *group, int iterations,
+                                 int total_changes)
+{
+  if (tcc_state->verbose >= 2)
+    fprintf(stderr, "[OPT %s] %s after %d iteration%s (%d total changes)\n",
+            group->name,
+            total_changes ? "stopped" : "converged",
+            iterations, iterations == 1 ? "" : "s", total_changes);
+}
+
 static void pipeline_ensure_requirements(IROptCtx *ctx, uint32_t requires)
 {
   if (requires & IR_PASS_REQUIRES_DU)
@@ -45,11 +63,28 @@ int tcc_ir_opt_run_group(IROptCtx *ctx, const IRPassGroup *group)
 {
   int total_changes = 0;
   int iterations = group->max_iterations > 0 ? group->max_iterations : 1;
+  int iter;
 
-  for (int iter = 0; iter < iterations; iter++) {
+  for (iter = 0; iter < iterations; iter++) {
     int round_changes = 0;
 
+    /* Trigger pass: if set, run it first — exit group if it returns 0. */
+    if (group->trigger_idx >= 0) {
+      const IROptPass *trigger = &group->passes[group->trigger_idx];
+      if (trigger->flag_offset && !*((unsigned char *)tcc_state + trigger->flag_offset))
+        break;
+      pipeline_ensure_requirements(ctx, trigger->requires);
+      int tch = trigger->run(ctx);
+      pipeline_trace_pass(group, trigger, iter, tch);
+      if (tch <= 0)
+        break;
+      round_changes += tch;
+      pipeline_apply_invalidations(ctx, trigger->invalidates);
+    }
+
     for (int p = 0; p < group->count; p++) {
+      if (p == group->trigger_idx)
+        continue;
       const IROptPass *pass = &group->passes[p];
       if (!pass->run)
         continue;
@@ -63,13 +98,21 @@ int tcc_ir_opt_run_group(IROptCtx *ctx, const IRPassGroup *group)
         round_changes += changes;
         pipeline_apply_invalidations(ctx, pass->invalidates);
       }
+      pipeline_trace_pass(group, pass, iter, changes);
     }
 
     total_changes += round_changes;
-    if (round_changes == 0)
+
+    if (group->compact_after && round_changes > 0) {
+      tcc_ir_opt_compact_nops(ctx->ir);
+      tcc_ir_opt_ctx_invalidate(ctx);
+    }
+
+    if (round_changes == 0 && group->trigger_idx < 0)
       break;
   }
 
+  pipeline_trace_group(group, iter, total_changes);
   return total_changes;
 }
 
@@ -110,6 +153,7 @@ static const IROptPass propagation_passes[] = {
   PASS_GATED("global_init",     tcc_ir_opt_global_init_prop_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("const_prop_tmp",  tcc_ir_opt_const_prop_tmp_ex,   0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("add_reassoc",     tcc_ir_opt_add_reassoc_ex,      0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
+  PASS_GATED("redundant_assign", tcc_ir_opt_redundant_var_assign_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("string_calls",    tcc_ir_opt_const_string_calls_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("value_tracking",  tcc_ir_opt_value_tracking_ex,   0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("cmp_expr_fold",   tcc_ir_opt_cmp_expr_fold_ex,    0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
@@ -140,27 +184,50 @@ static const IROptPass fusion_passes[] = {
 };
 
 static const IROptPass memory_passes[] = {
-  PASS_GATED("sl_forward",  tcc_ir_opt_sl_forward_ex,      0, IR_PASS_INVALIDATES_ALL, FLAG(opt_store_load_fwd)),
-  PASS_GATED("const_prop",  tcc_ir_opt_const_prop_ex,      0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
-  PASS_GATED("const_tmp",   tcc_ir_opt_const_prop_tmp_ex,  0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
-  PASS_GATED("const_var",   tcc_ir_opt_const_var_prop_ex,  0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
-  PASS_GATED("branch_fold", tcc_ir_opt_branch_folding_ex,  0, IR_PASS_INVALIDATES_ALL, FLAG(opt_const_prop)),
-  PASS_GATED("dce",         tcc_ir_opt_dce_ex,             0, IR_PASS_INVALIDATES_DU, FLAG(opt_dce)),
-  PASS_GATED("jump_thread", tcc_ir_opt_jump_threading_ex,  0, IR_PASS_INVALIDATES_ALL, FLAG(opt_jump_threading)),
+  PASS_GATED("sl_forward",    tcc_ir_opt_sl_forward_ex,      0, IR_PASS_INVALIDATES_ALL, FLAG(opt_store_load_fwd)),
+  PASS_GATED("const_prop",    tcc_ir_opt_const_prop_ex,      0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
+  PASS_GATED("const_tmp",     tcc_ir_opt_const_prop_tmp_ex,  0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
+  PASS_GATED("const_var",     tcc_ir_opt_const_var_prop_ex,  0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
+  PASS_GATED("branch_fold",   tcc_ir_opt_branch_folding_ex,  0, IR_PASS_INVALIDATES_ALL, FLAG(opt_const_prop)),
+  PASS_GATED("stack_nonnull", tcc_ir_opt_stack_addr_nonnull_fold_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
+  PASS_GATED("setif_fuse",    tcc_ir_opt_setif_branch_fuse_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
+  PASS_GATED("stack_bool",    tcc_ir_opt_stack_bool_diamond_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
+  PASS_GATED("or_bool",       tcc_ir_opt_or_bool_diamond_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
+  PASS_GATED("var_tmp_fwd",   tcc_ir_opt_var_tmp_fwd_ex,    0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
+  PASS_GATED("dce",           tcc_ir_opt_dce_ex,             0, IR_PASS_INVALIDATES_DU, FLAG(opt_dce)),
+  PASS_GATED("jump_thread",   tcc_ir_opt_jump_threading_ex,  0, IR_PASS_INVALIDATES_ALL, FLAG(opt_jump_threading)),
+  PASS_GATED("elim_fallthru", tcc_ir_opt_eliminate_fallthrough_ex, 0, IR_PASS_INVALIDATES_ALL, FLAG(opt_jump_threading)),
 };
 
 static const IROptPass late_cleanup_passes[] = {
-  PASS_GATED("dce",              tcc_ir_opt_dce_ex,              0, IR_PASS_INVALIDATES_DU, FLAG(opt_dce)),
   PASS_GATED("store_redundant",  tcc_ir_opt_store_redundant_ex,  0, IR_PASS_INVALIDATES_DU, FLAG(opt_redundant_store)),
   PASS_GATED("dse",              tcc_ir_opt_dse_ex,              0, IR_PASS_INVALIDATES_DU, FLAG(opt_dead_store)),
   PASS_GATED("dead_var_store",   tcc_ir_opt_dead_var_store_elim_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_dead_store)),
+  PASS_GATED("dead_addrvar",     tcc_ir_opt_dead_addrvar_elim_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_dead_store)),
   PASS_GATED("redundant_assign", tcc_ir_opt_redundant_var_assign_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_dead_store)),
-  PASS_GATED("call_result",      tcc_ir_opt_gens_call_result_ex, IR_PASS_REQUIRES_DU, IR_PASS_INVALIDATES_DU, FLAG(opt_dead_store)),
+};
+
+static const IROptPass entry_store_passes[] = {
+  PASS_GATED("entry_store",    tcc_ir_opt_entry_store_prop_ex,  0, IR_PASS_INVALIDATES_ALL, FLAG(opt_store_load_fwd)),
+  PASS_GATED("const_prop",    tcc_ir_opt_const_prop_ex,        0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
+  PASS_GATED("const_tmp",     tcc_ir_opt_const_prop_tmp_ex,    0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
+  PASS_GATED("const_var",     tcc_ir_opt_const_var_prop_ex,    0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
+  PASS_GATED("branch_fold",   tcc_ir_opt_branch_folding_ex,    0, IR_PASS_INVALIDATES_ALL, FLAG(opt_const_prop)),
+  PASS_GATED("stack_nonnull", tcc_ir_opt_stack_addr_nonnull_fold_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
+  PASS_GATED("loop_check",    tcc_ir_opt_redundant_loop_check_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
+  PASS_GATED("dce",           tcc_ir_opt_dce_ex,               0, IR_PASS_INVALIDATES_DU, FLAG(opt_dce)),
+  PASS_GATED("sl_forward",    tcc_ir_opt_sl_forward_ex,        0, IR_PASS_INVALIDATES_ALL, FLAG(opt_store_load_fwd)),
+  PASS_GATED("dead_var_store", tcc_ir_opt_dead_var_store_elim_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_dead_store)),
 };
 
 #undef PASS
 #undef PASS_GATED
 #undef FLAG
+
+const IRPassGroup entry_store_group = {
+  "entry_store_prop", entry_store_passes,
+  (int)(sizeof(entry_store_passes) / sizeof(entry_store_passes[0])), 3, 1, 0
+};
 
 #define COUNTOF(arr) (int)(sizeof(arr) / sizeof((arr)[0]))
 
@@ -169,28 +236,28 @@ static const IROptPass o0_passes[] = {
   { "dce", tcc_ir_opt_dce_ex, 0, IR_PASS_INVALIDATES_DU, 0 },
 };
 static const IRPassGroup pipeline_o0[] = {
-  { "cleanup", o0_passes, COUNTOF(o0_passes), 1, 0 },
+  { "cleanup", o0_passes, COUNTOF(o0_passes), 1, 0, -1 },
 };
 
 /* O1: propagation + simplification + late cleanup */
 static const IRPassGroup pipeline_o1[] = {
-  { "propagation",  propagation_passes,  COUNTOF(propagation_passes),  10, 0 },
-  { "late_cleanup", late_cleanup_passes, COUNTOF(late_cleanup_passes), 1, 1 },
+  { "propagation",  propagation_passes,  COUNTOF(propagation_passes),  10, 0, -1 },
+  { "late_cleanup", late_cleanup_passes, COUNTOF(late_cleanup_passes), 2, 1, -1 },
 };
 
 /* O2: full pipeline including memory + fusion */
 static const IRPassGroup pipeline_o2[] = {
-  { "propagation",  propagation_passes,  COUNTOF(propagation_passes),  10, 0 },
-  { "memory",       memory_passes,       COUNTOF(memory_passes),       12, 1 },
-  { "fusion",       fusion_passes,       COUNTOF(fusion_passes),       1, 0 },
-  { "late_cleanup", late_cleanup_passes, COUNTOF(late_cleanup_passes), 1, 1 },
+  { "propagation",  propagation_passes,  COUNTOF(propagation_passes),  10, 0, -1 },
+  { "memory",       memory_passes,       COUNTOF(memory_passes),       12, 1, 0 },
+  { "fusion",       fusion_passes,       COUNTOF(fusion_passes),       1, 0, -1 },
+  { "late_cleanup", late_cleanup_passes, COUNTOF(late_cleanup_passes), 2, 1, -1 },
 };
 
 /* Os: like O2 but skip fusion (keeps code size smaller) */
 static const IRPassGroup pipeline_os[] = {
-  { "propagation",  propagation_passes,  COUNTOF(propagation_passes),  10, 0 },
-  { "memory",       memory_passes,       COUNTOF(memory_passes),       12, 1 },
-  { "late_cleanup", late_cleanup_passes, COUNTOF(late_cleanup_passes), 1, 1 },
+  { "propagation",  propagation_passes,  COUNTOF(propagation_passes),  10, 0, -1 },
+  { "memory",       memory_passes,       COUNTOF(memory_passes),       12, 1, 0 },
+  { "late_cleanup", late_cleanup_passes, COUNTOF(late_cleanup_passes), 2, 1, -1 },
 };
 
 void tcc_ir_opt_get_pipeline(IROptLevel level, const IRPassGroup **out_groups,
