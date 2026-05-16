@@ -18,7 +18,9 @@
 #include "opt_xform.h"
 #include "opt_utils.h"
 #include "opt_alias.h"
+#include "opt_hash.h"
 #include "opt_loop_utils.h"
+#include "opt_gens_branch.h"
 
 /* ============================================================================
  * FP Offset Cache Optimization - delegated to tccopt.c
@@ -85,16 +87,6 @@ static uint8_t *ir_opt_build_def_count(TCCIRState *ir, int n, int *out_stride);
 /* ============================================================================
  * Boolean Optimization Helpers
  * ============================================================================ */
-
-/* Hash table entry for CSE */
-typedef struct CSEHashEntry
-{
-  uint32_t key;        /* hash of (op, min(vr1,vr2), max(vr1,vr2)) */
-  int instruction_idx; /* index of instruction that computes this */
-  struct CSEHashEntry *next;
-} CSEHashEntry;
-
-#define CSE_HASH_SIZE 256
 
 /* Stub implementation - functions to be moved from tccir.c */
 
@@ -973,7 +965,6 @@ int tcc_ir_opt_complex_const_param_fold(TCCIRState *ir)
  * "temp local" (negative vreg sentinel) rather than a regular TEMP, so we
  * compare full vreg values rather than restricting to the TEMP type.
  */
-/* dead_call_result_elim moved to ir/opt_gens_call_result.c (engine generator) */
 
 /* Locate the sret-pointer parameter spill at the prolog: the first non-NOP
  * instruction should be `STORE LocalSlot[X] <-- P0`.  Returns 1 and fills
@@ -1716,9 +1707,7 @@ int tcc_ir_opt_dead_init_via_call(TCCIRState *ir)
   return changes;
 }
 
-/* dead_sret_call_elim moved to ir/opt_gens_call_result.c (engine generator) */
 
-/* fold_call_result_store moved to ir/opt_gens_call_result.c (engine generator) */
 
 /* Dead Store Elimination - remove ASSIGN instructions where the destination
  * vreg is never used. This eliminates redundant copies after CSE/idempotent
@@ -6803,9 +6792,7 @@ static const uint8_t *ir_opt_get_rodata_bytes(TCCIRState *ir, IROperand op, size
   return sec->data + offset;
 }
 
-/* ir_opt_eval_const_u64 moved to opt_utils.c */
 
-/* ir_opt_eval_const_string moved to opt_utils.c */
 
 static int ir_opt_eval_const_string_operand(TCCIRState *ir, IROperand op, int use_idx, IROperand *out, int depth)
 {
@@ -7200,7 +7187,6 @@ int tcc_ir_opt_const_string_calls(TCCIRState *ir)
   return changes;
 }
 
-/* ir_opt_nonvreg_expr_equal moved to opt_utils.c */
 
 /* ir_opt_pure_def_equal, ir_opt_pure_expr_equal, ir_opt_is_pure_fallthrough_instruction
  * moved to opt_utils.c */
@@ -9123,77 +9109,33 @@ int tcc_ir_opt_copy_prop(TCCIRState *ir)
  */
 
 /* Hash table for tracking boolean ops for CSE */
-typedef struct BoolCSEEntry
+/* BoolCSE helpers using generic IROptHashTable.
+ * extra[0] = op (BOOL_AND/BOOL_OR), extra[1] = left_vr, extra[2] = right_vr */
+typedef struct
 {
-  int op;        /* TCCIR_OP_BOOL_AND or TCCIR_OP_BOOL_OR */
-  int left_vr;   /* Left operand vreg (normalized: smaller first) */
-  int right_vr;  /* Right operand vreg */
-  int result_vr; /* The vreg that holds the result */
-  struct BoolCSEEntry *next;
-} BoolCSEEntry;
+  int op;
+  int left_vr;
+  int right_vr;
+} BoolCSEKey;
 
-#define BOOL_CSE_HASH_SIZE 64
-
-/* Compute hash for boolean op (normalized operand order) */
 static uint32_t bool_cse_hash(int op, int left_vr, int right_vr)
 {
-  /* Normalize order for commutative ops */
   if (left_vr > right_vr)
   {
     int tmp = left_vr;
     left_vr = right_vr;
     right_vr = tmp;
   }
-  return ((uint32_t)op * 31 + (uint32_t)left_vr * 17 + (uint32_t)right_vr) % BOOL_CSE_HASH_SIZE;
+  return (uint32_t)op * 31 + (uint32_t)left_vr * 17 + (uint32_t)right_vr;
 }
 
-/* Find existing boolean CSE entry */
-static BoolCSEEntry *bool_cse_find(BoolCSEEntry **hash_table, int op, int left_vr, int right_vr)
+static int bool_cse_eq(const IROptHashEntry *e, const void *key)
 {
-  uint32_t h = bool_cse_hash(op, left_vr, right_vr);
-  BoolCSEEntry *e;
-
-  for (e = hash_table[h]; e != NULL; e = e->next)
-  {
-    if (e->op == op && e->left_vr == left_vr && e->right_vr == right_vr)
-      return e;
-  }
-  return NULL;
+  const BoolCSEKey *k = (const BoolCSEKey *)key;
+  return e->extra[0] == k->op && e->extra[1] == k->left_vr && e->extra[2] == k->right_vr;
 }
 
-/* Add boolean CSE entry */
-static void bool_cse_add(BoolCSEEntry **hash_table, int op, int left_vr, int right_vr, int result_vr)
-{
-  uint32_t h = bool_cse_hash(op, left_vr, right_vr);
-  BoolCSEEntry *e = tcc_malloc(sizeof(BoolCSEEntry));
-  e->op = op;
-  e->left_vr = left_vr;
-  e->right_vr = right_vr;
-  e->result_vr = result_vr;
-  e->next = hash_table[h];
-  hash_table[h] = e;
-}
 
-/* Clear all CSE entries */
-static void bool_cse_clear_all(BoolCSEEntry **hash_table)
-{
-  int i;
-  for (i = 0; i < BOOL_CSE_HASH_SIZE; i++)
-  {
-    BoolCSEEntry *e = hash_table[i];
-    while (e)
-    {
-      BoolCSEEntry *next = e->next;
-      tcc_free(e);
-      e = next;
-    }
-    hash_table[i] = NULL;
-  }
-}
-
-/* bool_idempotent moved to ir/opt_gens_bool.c (engine generator) */
-
-/* bool_simplify removed — did not perform any IR transformation */
 
 /* Arithmetic Common Subexpression Elimination
  * Phase 3: Eliminate redundant arithmetic computations within basic blocks
@@ -10557,7 +10499,6 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
   return changes;
 }
 
-/* ir_opt_store_btype_size_bytes, ir_opt_stack_slot_range_for_offset moved to opt_alias.c */
 
 /* Store-Load Forwarding
  * Phase 4: Replace loads from addresses that were just stored to with the stored value
@@ -15195,7 +15136,6 @@ int tcc_ir_opt_stackoff_addr_cse(TCCIRState *ir)
  *     through a LEA'd pointer; that's indistinguishable from a direct
  *     stack-slot store and is handled separately).
  */
-/* find_deref_use_operand moved to opt_alias.c */
 
 int tcc_ir_opt_lea_fold(TCCIRState *ir)
 {
@@ -15625,8 +15565,8 @@ int tcc_ir_opt_bool_cse(TCCIRState *ir)
   if (n == 0)
     return 0;
 
-  BoolCSEEntry *hash_table[BOOL_CSE_HASH_SIZE];
-  memset(hash_table, 0, sizeof(hash_table));
+  IROptHashTable ht;
+  ir_opt_hash_init(&ht, 64, n);
 
   for (int i = 0; i < n; i++)
   {
@@ -15638,7 +15578,7 @@ int tcc_ir_opt_bool_cse(TCCIRState *ir)
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF || q->op == TCCIR_OP_FUNCCALLVOID ||
         q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_RETURNVALUE || q->op == TCCIR_OP_RETURNVOID)
     {
-      bool_cse_clear_all(hash_table);
+      ir_opt_hash_clear(&ht);
       continue;
     }
 
@@ -15656,7 +15596,9 @@ int tcc_ir_opt_bool_cse(TCCIRState *ir)
       right_vr = tmp;
     }
 
-    BoolCSEEntry *existing = bool_cse_find(hash_table, q->op, left_vr, right_vr);
+    uint32_t h = bool_cse_hash(q->op, left_vr, right_vr);
+    BoolCSEKey key = {q->op, left_vr, right_vr};
+    IROptHashEntry *existing = ir_opt_hash_lookup(&ht, h, bool_cse_eq, &key);
     IROperand dest = tcc_ir_op_get_dest(ir, q);
     int32_t dest_vr = irop_get_vreg(dest);
     if (existing)
@@ -15670,11 +15612,19 @@ int tcc_ir_opt_bool_cse(TCCIRState *ir)
     }
     else
     {
-      bool_cse_add(hash_table, q->op, left_vr, right_vr, dest_vr);
+      IROptHashEntry *e = ir_opt_hash_insert(&ht, h);
+      if (e)
+      {
+        e->instruction_idx = i;
+        e->result_vr = dest_vr;
+        e->extra[0] = q->op;
+        e->extra[1] = left_vr;
+        e->extra[2] = right_vr;
+      }
     }
   }
 
-  bool_cse_clear_all(hash_table);
+  ir_opt_hash_free(&ht);
   return changes;
 }
 
@@ -15699,7 +15649,6 @@ int tcc_ir_find_defining_instruction(TCCIRState *ir, int32_t vreg, int before_id
   return -1;
 }
 
-/* tcc_ir_vreg_has_single_def moved to opt_utils.c */
 
 int tcc_ir_vreg_has_single_use(TCCIRState *ir, int32_t vreg, int exclude_idx)
 {
@@ -15730,187 +15679,15 @@ int tcc_ir_vreg_has_single_use(TCCIRState *ir, int32_t vreg, int exclude_idx)
   return use_count == 1;
 }
 
-/* ============================================================================
- * Constant Branch Folding Optimization
- * ============================================================================
- *
- * Folds branches with constant conditions to unconditional jumps or eliminates them.
- * This is critical for optimizing conditionals where values are compile-time constants.
- *
- * Pattern 1: TEST_ZERO #const followed by JUMPIF
- *   TEST_ZERO #0          ->  NOP
- *   JUMPIF "==", target   ->  JUMP target  (always taken since 0 == 0)
- *   ...dead code...       ->  NOP (removed by subsequent DCE)
- *
- * Pattern 2: CMP #const1, #const2 followed by JUMPIF
- *   CMP #5, #3            ->  NOP
- *   JUMPIF ">", target    ->  JUMP target  (always taken since 5 > 3)
- *   ...dead code...       ->  NOP (removed by subsequent DCE)
- *
- * The optimization also handles the case where the branch is never taken:
- *   TEST_ZERO #1          ->  NOP
- *   JUMPIF "==", target   ->  NOP  (never taken since 1 != 0)
- *
- * This pass should be run after constant propagation to maximize folding opportunities.
- */
-
-/* evaluate_compare_condition moved to opt_utils.c */
-
-/* ============================================================================
- * Phase 2: Constant Comparison Folding through VReg Tracking
- * ============================================================================
- *
- * Tracks constant values through virtual registers to enable branch folding
- * even when the CMP instruction uses a vreg (not immediate).
- *
- * Example:
- *   V0 <- #1234              ; V0 = 1234 (tracked constant)
- *   V0 <- V0 SUB #42         ; V0 = 1192 (computed constant)
- *   CMP V0, #1000000         ; Compare 1192 vs 1000000
- *   JUMPIF "<=", target      ; ALWAYS TRUE - fold to unconditional JUMP
- *
- * This optimization runs within branch folding to maximize opportunities.
- */
-
-/* Structure to track constant values for VAR vregs */
-typedef struct
-{
-  int is_constant;
-  int64_t value;
-} VRegConstValue;
-
+/* branch_folding: see ir/opt_gens_branch.c for generator implementation */
 int tcc_ir_opt_branch_folding(TCCIRState *ir)
 {
-  int n = ir->next_instruction_index;
-  int changes = 0;
-
-  if (n < 2)
+  if (ir->next_instruction_index < 2)
     return 0;
-
-  LOG_IR_GEN("=== BRANCH FOLDING START ===");
-
-  for (int i = 0; i < n - 1; i++)
-  {
-    IRQuadCompact *test_q = &ir->compact_instructions[i];
-
-    if (test_q->op == TCCIR_OP_NOP)
-      continue;
-
-    /* Find the next non-NOP instruction (SETIF fusion can leave NOPs between CMP and JUMPIF) */
-    int j = i + 1;
-    while (j < n && ir->compact_instructions[j].op == TCCIR_OP_NOP)
-      j++;
-    if (j >= n)
-      continue;
-    IRQuadCompact *jump_q = &ir->compact_instructions[j];
-
-    /* Pattern 1: TEST_ZERO #const followed by JUMPIF */
-    if (test_q->op == TCCIR_OP_TEST_ZERO && jump_q->op == TCCIR_OP_JUMPIF)
-    {
-      IROperand src1 = tcc_ir_op_get_src1(ir, test_q);
-
-      if (!irop_is_immediate(src1))
-        continue;
-
-      int64_t val = irop_get_imm64_ex(ir, src1);
-      IROperand cond = tcc_ir_op_get_src1(ir, jump_q);
-      int tok = (int)irop_get_imm64_ex(ir, cond);
-
-      /* Evaluate the condition: JUMPIF tests if the condition is true */
-      int branch_taken = 0;
-      int is_known_condition = 1;
-
-      switch (tok)
-      {
-      case 0x94: /* TOK_EQ */
-        branch_taken = (val == 0);
-        break;
-      case 0x95: /* TOK_NE */
-        branch_taken = (val != 0);
-        break;
-      default:
-        /* For TEST_ZERO, we only expect EQ and NE conditions */
-        is_known_condition = 0;
-        break;
-      }
-
-      if (!is_known_condition)
-        continue;
-
-      if (branch_taken)
-      {
-        /* Branch always taken - convert JUMPIF to unconditional JUMP */
-        /* The jump target is stored in the dest operand */
-        IROperand dest = tcc_ir_op_get_dest(ir, jump_q);
-
-        test_q->op = TCCIR_OP_NOP;
-        jump_q->op = TCCIR_OP_JUMP;
-
-        /* For JUMP, dest contains the target. Keep the same dest operand */
-        tcc_ir_set_dest(ir, j, dest);
-
-        LOG_IR_GEN("BRANCH FOLD: TEST_ZERO #0 -> unconditional JUMP to %d", (int)dest.u.imm32);
-        changes++;
-      }
-      else
-      {
-        /* Branch never taken - remove both instructions */
-        test_q->op = TCCIR_OP_NOP;
-        jump_q->op = TCCIR_OP_NOP;
-
-        LOG_IR_GEN("BRANCH FOLD: TEST_ZERO #%lld with cond 0x%x never taken -> both NOP", (long long)val, tok);
-        changes++;
-      }
-    }
-    /* Pattern 2: CMP #const, #const followed by JUMPIF */
-    else if (test_q->op == TCCIR_OP_CMP && jump_q->op == TCCIR_OP_JUMPIF)
-    {
-      IROperand src1 = tcc_ir_op_get_src1(ir, test_q);
-      IROperand src2 = tcc_ir_op_get_src2(ir, test_q);
-
-      if (!irop_is_immediate(src1) || !irop_is_immediate(src2))
-        continue;
-
-      int64_t val1 = irop_get_imm64_ex(ir, src1);
-      int64_t val2 = irop_get_imm64_ex(ir, src2);
-
-      IROperand cond = tcc_ir_op_get_src1(ir, jump_q);
-      int tok = (int)irop_get_imm64_ex(ir, cond);
-
-      int result = evaluate_compare_condition(val1, val2, tok);
-
-      if (result < 0)
-        continue; /* Unknown condition */
-
-      if (result)
-      {
-        /* Branch always taken - convert to unconditional JUMP */
-        IROperand dest = tcc_ir_op_get_dest(ir, jump_q);
-
-        test_q->op = TCCIR_OP_NOP;
-        jump_q->op = TCCIR_OP_JUMP;
-
-        tcc_ir_set_dest(ir, j, dest);
-
-        LOG_IR_GEN("BRANCH FOLD: CMP %lld,%lld with cond 0x%x -> unconditional JUMP to %d", (long long)val1,
-                   (long long)val2, tok, (int)dest.u.imm32);
-        changes++;
-      }
-      else
-      {
-        /* Branch never taken - remove both instructions */
-        test_q->op = TCCIR_OP_NOP;
-        jump_q->op = TCCIR_OP_NOP;
-
-        LOG_IR_GEN("BRANCH FOLD: CMP %lld,%lld with cond 0x%x never taken -> both NOP", (long long)val1,
-                   (long long)val2, tok);
-        changes++;
-      }
-    }
-  }
-
-  LOG_IR_GEN("=== BRANCH FOLDING END: %d branches folded ===", changes);
-
+  IROptCtx ctx;
+  tcc_ir_opt_ctx_init(&ctx, ir);
+  int changes = tcc_ir_opt_run_gens(&ctx, branch_gens, branch_gens_count);
+  tcc_ir_opt_ctx_free(&ctx);
   return changes;
 }
 
@@ -15932,7 +15709,6 @@ int tcc_ir_opt_branch_folding(TCCIRState *ir)
  */
 #define MAX_STACKADDR_VREGS 64
 
-/* is_stack_address_operand moved to opt_alias.c */
 
 int tcc_ir_opt_stack_addr_nonnull_fold(TCCIRState *ir)
 {
@@ -16356,108 +16132,15 @@ int tcc_ir_opt_stack_addr_nonnull_fold(TCCIRState *ir)
   return changes;
 }
 
-/* ============================================================================
- * Boolean Materialization Peephole: CMP + SETIF + TEST_ZERO + JUMPIF → CMP + JUMPIF
- * ============================================================================
- *
- * C code like `if (cond) { ... }` often lowers to:
- *   CMP a, b
- *   R <-- (cond=C)          ; SETIF: materialize 0/1 into R
- *   TEST_ZERO R             ; reload flags from R
- *   JUMPIF target if EQ/NE  ; branch on R
- *
- * When R has no other use, this collapses to the flags already set by CMP:
- *   CMP a, b
- *   JUMPIF target if (EQ ? invert(C) : C)
- *
- * Inverse condition table (TCC tokens):
- *   EQ<->NE, LT<->GE, LE<->GT, ULT<->UGE, ULE<->UGT.
- */
-/* invert_cond_token moved to opt_utils.c */
-
+/* setif_branch_fuse: see ir/opt_gens_branch.c for generator implementation */
 int tcc_ir_opt_setif_branch_fuse(TCCIRState *ir)
 {
-  int n = ir->next_instruction_index;
-  int changes = 0;
-
-  if (n < 4)
+  if (ir->next_instruction_index < 4)
     return 0;
-
-  LOG_IR_GEN("=== SETIF BRANCH FUSE START ===");
-
-  for (int i = 0; i + 3 < n; i++)
-  {
-    IRQuadCompact *cmp_q = &ir->compact_instructions[i];
-    IRQuadCompact *setif_q = &ir->compact_instructions[i + 1];
-    IRQuadCompact *test_q = &ir->compact_instructions[i + 2];
-    IRQuadCompact *jump_q = &ir->compact_instructions[i + 3];
-
-    if (cmp_q->op != TCCIR_OP_CMP)
-      continue;
-    if (setif_q->op != TCCIR_OP_SETIF)
-      continue;
-    if (test_q->op != TCCIR_OP_TEST_ZERO)
-      continue;
-    if (jump_q->op != TCCIR_OP_JUMPIF)
-      continue;
-
-    /* None of the three later instructions may start a new basic block —
-     * otherwise a branch could land inside our sequence after we fuse it. */
-    if (setif_q->is_jump_target || test_q->is_jump_target || jump_q->is_jump_target)
-      continue;
-
-    /* SETIF's dest must be the exact vreg TEST_ZERO reads, and have no
-     * other uses in the function (TEST_ZERO is the sole consumer). */
-    IROperand setif_dest = tcc_ir_op_get_dest(ir, setif_q);
-    IROperand test_src1 = tcc_ir_op_get_src1(ir, test_q);
-    int32_t setif_vr = irop_get_vreg(setif_dest);
-    int32_t test_vr = irop_get_vreg(test_src1);
-
-    if (setif_vr < 0 || setif_vr != test_vr)
-      continue;
-
-    /* Only fuse when the materialized bool has a single use (the TEST_ZERO).
-     * tcc_ir_vreg_has_single_use(vr, exclude_idx) counts uses *other than*
-     * exclude_idx — pass -1 so we count all uses, and require exactly one. */
-    if (!tcc_ir_vreg_has_single_use(ir, setif_vr, -1))
-      continue;
-
-    /* Read the condition tokens for SETIF and JUMPIF. */
-    IROperand setif_src1 = tcc_ir_op_get_src1(ir, setif_q);
-    IROperand jump_src1 = tcc_ir_op_get_src1(ir, jump_q);
-    int setif_tok = (int)irop_get_imm64_ex(ir, setif_src1);
-    int jump_tok = (int)irop_get_imm64_ex(ir, jump_src1);
-
-    /* JUMPIF after TEST_ZERO only makes sense with EQ (jump when R==0) or
-     * NE (jump when R!=0). */
-    int new_tok;
-    if (jump_tok == 0x94) /* EQ: jump when SETIF produced 0 -> inverse */
-      new_tok = invert_cond_token(setif_tok);
-    else if (jump_tok == 0x95) /* NE: jump when SETIF produced 1 -> same */
-      new_tok = setif_tok;
-    else
-      continue;
-
-    if (new_tok < 0)
-      continue;
-
-    /* Rewrite the JUMPIF condition, then NOP the SETIF + TEST_ZERO. */
-    int btype = irop_get_btype(jump_src1);
-    IROperand new_cond = irop_make_imm32(-1, new_tok, btype);
-    tcc_ir_set_src1(ir, i + 3, new_cond);
-
-    setif_q->op = TCCIR_OP_NOP;
-    test_q->op = TCCIR_OP_NOP;
-
-    LOG_IR_GEN("SETIF FUSE: CMP+SETIF(0x%x)+TEST_ZERO+JUMPIF(0x%x) -> CMP+JUMPIF(0x%x) at i=%d", setif_tok, jump_tok,
-               new_tok, i);
-    changes++;
-    /* Skip over the fused region. */
-    i += 3;
-  }
-
-  LOG_IR_GEN("=== SETIF BRANCH FUSE END: %d fused ===", changes);
-
+  IROptCtx ctx;
+  tcc_ir_opt_ctx_init(&ctx, ir);
+  int changes = tcc_ir_opt_run_gens(&ctx, branch_gens, branch_gens_count);
+  tcc_ir_opt_ctx_free(&ctx);
   return changes;
 }
 
@@ -16488,7 +16171,6 @@ int tcc_ir_opt_setif_branch_fuse(TCCIRState *ir)
  * depends on it; any other predecessor reaching i+3 without writing the slot
  * is already undefined behavior.
  */
-/* stackoff_same_slot, operand_references_slot moved to opt_alias.c */
 
 int tcc_ir_opt_stack_bool_diamond(TCCIRState *ir)
 {
@@ -18072,7 +17754,6 @@ int tcc_ir_opt_var_to_tmp(TCCIRState *ir)
  * Returns: 1 if transformation applied, 0 otherwise
  */
 
-/* is_power_of_2 moved to opt_utils.c */
 
 /* Transform a single MUL instruction
  * Returns 1 if transformed, 0 otherwise
@@ -18721,7 +18402,6 @@ int tcc_ir_opt_loop_unroll(TCCIRState *ir)
  *   EXIT:    ...
  */
 
-/* invert_condition moved to opt_utils.c */
 
 /* Try to rotate a single loop.  Returns 1 if rotated, 0 otherwise.
  *
