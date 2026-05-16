@@ -2753,30 +2753,30 @@ int try_unroll_loop_ex(TCCIRState *ir, IRLoop *loop, IRLoops *loops, int loop_id
     return 0;
   }
 
-  int body_indices[UNROLL_MAX_BODY_INSNS];
+  int ret = 0;
+  size_t _usz = UNROLL_MAX_BODY_INSNS * (2 * sizeof(int) + 3 * sizeof(IROperand));
+  char *_ubuf = (char *)tcc_mallocz(_usz);
+  char *_up = _ubuf;
+  int *body_indices = (int *)_up; _up += UNROLL_MAX_BODY_INSNS * sizeof(int);
+  int *body_ops = (int *)_up; _up += UNROLL_MAX_BODY_INSNS * sizeof(int);
+  IROperand *body_dests = (IROperand *)_up; _up += UNROLL_MAX_BODY_INSNS * sizeof(IROperand);
+  IROperand *body_src1s = (IROperand *)_up; _up += UNROLL_MAX_BODY_INSNS * sizeof(IROperand);
+  IROperand *body_src2s = (IROperand *)_up;
+
   int body_count = collect_body_instructions(ir, loop, iv->vreg, cmp_idx, jmpif_idx, iv->def_idx, body_indices,
                                              UNROLL_MAX_BODY_INSNS);
   if (body_count <= 0 || body_count > UNROLL_MAX_BODY_INSNS)
   {
     LOG_LOOP_OPT("try_unroll_loop: body_count=%d (invalid or > %d), giving up", body_count, UNROLL_MAX_BODY_INSNS);
-    return 0;
+    goto unroll_cleanup;
   }
 
   int total_insns = trip_count * body_count;
   if (total_insns > UNROLL_MAX_TOTAL_INSNS)
   {
     LOG_LOOP_OPT("try_unroll_loop: total_insns=%d > %d, giving up", total_insns, UNROLL_MAX_TOTAL_INSNS);
-    return 0;
+    goto unroll_cleanup;
   }
-
-  /* Save original opcodes and operands for body instructions before NOP'ing.
-   * The write loop needs original data, but NOP slots may be overwritten by
-   * earlier iterations (a body instruction's slot can be reused for unrolled
-   * output, destroying the operand_base). */
-  int body_ops[UNROLL_MAX_BODY_INSNS];
-  IROperand body_dests[UNROLL_MAX_BODY_INSNS];
-  IROperand body_src1s[UNROLL_MAX_BODY_INSNS];
-  IROperand body_src2s[UNROLL_MAX_BODY_INSNS];
   for (int b = 0; b < body_count; b++)
   {
     IRQuadCompact *bq = &ir->compact_instructions[body_indices[b]];
@@ -2816,7 +2816,7 @@ int try_unroll_loop_ex(TCCIRState *ir, IRLoop *loop, IRLoops *loops, int loop_id
    * single-loop win from test_mla_fusion / inline test cases without
    * breaking multi-loop ones like 110_iv_strength_reduction. */
   if (needed_slots > avail_slots && (!loops || loops->num_loops != 1))
-    return 0;
+    goto unroll_cleanup;
   if (needed_slots > avail_slots)
   {
     int extra = needed_slots - avail_slots;
@@ -2826,7 +2826,7 @@ int try_unroll_loop_ex(TCCIRState *ir, IRLoop *loop, IRLoops *loops, int loop_id
     for (int k = 0; k < extra; k++)
     {
       if (insert_instr_at(ir, insert_pos, TCCIR_OP_NOP, none_op, none_op, none_op) < 0)
-        return 0;
+        goto unroll_cleanup;
     }
     loop_end += extra;
     if (exit_target > orig_end)
@@ -2871,7 +2871,7 @@ int try_unroll_loop_ex(TCCIRState *ir, IRLoop *loop, IRLoops *loops, int loop_id
       IROperand jd = tcc_ir_op_get_dest(ir, q);
       int target = (int)irop_get_imm64_ex(ir, jd);
       if (target < i && target < loop->start_idx)
-        return 0; /* Backward jump escaping the loop — nested or malformed */
+        goto unroll_cleanup; /* Backward jump escaping the loop — nested or malformed */
     }
   }
 
@@ -2941,7 +2941,7 @@ int try_unroll_loop_ex(TCCIRState *ir, IRLoop *loop, IRLoops *loops, int loop_id
         write_pos++;
 
       if (write_pos > loop_end)
-        return 0; /* Should not happen — avail_slots check above prevents this */
+        goto unroll_cleanup; /* Should not happen — avail_slots check above prevents this */
 
       write_instr_at_nop(ir, write_pos, saved_op, dest, src1, src2);
       write_pos++;
@@ -2996,7 +2996,11 @@ int try_unroll_loop_ex(TCCIRState *ir, IRLoop *loop, IRLoops *loops, int loop_id
     }
   }
 
-  return 1;
+  ret = 1;
+
+unroll_cleanup:
+  tcc_free(_ubuf);
+  return ret;
 }
 
 
@@ -3342,13 +3346,24 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
   IROperand cmp_src1 = tcc_ir_op_get_src1(ir, cmp_q);
   IROperand cmp_src2 = tcc_ir_op_get_src2(ir, cmp_q);
 
-  /* Save body instructions */
-  int body_ops[128], latch_ops[8];
-  IROperand body_dests[128], body_src1s[128], body_src2s[128];
-  IROperand body_extras[128]; /* MLA accumulator (operand_base+3) */
-  int body_has_extra[128];
-  IROperand latch_dests[8], latch_src1s[8], latch_src2s[8];
-  uint32_t body_lines[128], latch_lines[8];
+  /* Save body instructions — heap-allocated to avoid large stack frames */
+  int bc = body_count, lc = eff_latch_count;
+  size_t _rsz = bc * (2 * sizeof(int) + 4 * sizeof(IROperand) + sizeof(uint32_t))
+              + lc * (sizeof(int) + 3 * sizeof(IROperand) + sizeof(uint32_t));
+  char *_rbuf = (char *)tcc_mallocz(_rsz);
+  char *_rp = _rbuf;
+  int *body_ops = (int *)_rp; _rp += bc * sizeof(int);
+  int *body_has_extra = (int *)_rp; _rp += bc * sizeof(int);
+  IROperand *body_dests = (IROperand *)_rp; _rp += bc * sizeof(IROperand);
+  IROperand *body_src1s = (IROperand *)_rp; _rp += bc * sizeof(IROperand);
+  IROperand *body_src2s = (IROperand *)_rp; _rp += bc * sizeof(IROperand);
+  IROperand *body_extras = (IROperand *)_rp; _rp += bc * sizeof(IROperand);
+  uint32_t *body_lines = (uint32_t *)_rp; _rp += bc * sizeof(uint32_t);
+  int *latch_ops = (int *)_rp; _rp += lc * sizeof(int);
+  IROperand *latch_dests = (IROperand *)_rp; _rp += lc * sizeof(IROperand);
+  IROperand *latch_src1s = (IROperand *)_rp; _rp += lc * sizeof(IROperand);
+  IROperand *latch_src2s = (IROperand *)_rp; _rp += lc * sizeof(IROperand);
+  uint32_t *latch_lines = (uint32_t *)_rp;
 
   for (int b = 0; b < body_count; b++)
   {
@@ -3484,6 +3499,7 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
   LOG_IR_GEN("[LOOP-ROTATE] Rotated loop header=%d body=[%d..%d] latch=[%d..%d] → bottom-tested at %d", hi, body_start,
              body_end, latch_start, latch_end, body_target);
 
+  tcc_free(_rbuf);
   return 1;
 }
 
