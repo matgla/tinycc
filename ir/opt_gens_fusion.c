@@ -339,3 +339,480 @@ const IROptGen fusion_gens[] = {
 };
 
 const int fusion_gens_count = sizeof(fusion_gens) / sizeof(fusion_gens[0]);
+
+static int ir_gen_deref_indexed_fusion(IROptCtx *ctx, int i)
+{
+  TCCIRState *ir = ctx->ir;
+  const IROptDU *du = &ctx->du;
+
+  if (!tcc_state->opt_indexed_memory)
+    return 0;
+
+  IRQuadCompact *q = &ir->compact_instructions[i];
+
+  if (q->op == TCCIR_OP_LOAD || q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_LOAD_INDEXED ||
+      q->op == TCCIR_OP_STORE_INDEXED || q->op == TCCIR_OP_LOAD_POSTINC || q->op == TCCIR_OP_STORE_POSTINC ||
+      q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_CMP || q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF ||
+      q->op == TCCIR_OP_FUNCCALLVOID || q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_RETURNVALUE ||
+      q->op == TCCIR_OP_RETURNVOID)
+    return 0;
+
+  int operand_positions[2] = {0, 0};
+  int num_deref = 0;
+
+  if (irop_config[q->op].has_src1) {
+    IROperand s1 = tcc_ir_op_get_src1(ir, q);
+    if (s1.is_lval && irop_has_vreg(s1))
+      operand_positions[num_deref++] = 1;
+  }
+  if (irop_config[q->op].has_src2) {
+    IROperand s2 = tcc_ir_op_get_src2(ir, q);
+    if (s2.is_lval && irop_has_vreg(s2))
+      operand_positions[num_deref++] = 2;
+  }
+
+  if (num_deref == 0)
+    return 0;
+
+  int total_changes = 0;
+  for (int d = 0; d < num_deref; d++) {
+    int src_pos = operand_positions[d];
+    IROperand deref_op = (src_pos == 1) ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_src2(ir, q);
+
+    int32_t addr_vr = irop_get_vreg(deref_op);
+    if (addr_vr < 0)
+      continue;
+    if (ir_opt_du_uses(du, addr_vr) != 1)
+      continue;
+
+    int add_idx = ir_opt_du_def(du, addr_vr, i);
+    if (add_idx < 0)
+      continue;
+
+    IRQuadCompact *add_q = &ir->compact_instructions[add_idx];
+    if (add_q->op != TCCIR_OP_ADD)
+      continue;
+
+    IROperand add_src1 = tcc_ir_op_get_src1(ir, add_q);
+    IROperand add_src2 = tcc_ir_op_get_src2(ir, add_q);
+    int32_t offset_vr = -1;
+    IROperand base_op = IROP_NONE;
+    int shl_idx = -1;
+    IRQuadCompact *shl_q = NULL;
+
+    if (irop_has_vreg(add_src1)) {
+      int32_t vr1 = irop_get_vreg(add_src1);
+      int idx1 = ir_opt_du_def(du, vr1, add_idx);
+      if (idx1 >= 0 && ir->compact_instructions[idx1].op == TCCIR_OP_SHL) {
+        offset_vr = vr1; base_op = add_src2; shl_idx = idx1;
+        shl_q = &ir->compact_instructions[shl_idx];
+      }
+    }
+    if (shl_idx < 0 && irop_has_vreg(add_src2)) {
+      int32_t vr2 = irop_get_vreg(add_src2);
+      int idx2 = ir_opt_du_def(du, vr2, add_idx);
+      if (idx2 >= 0 && ir->compact_instructions[idx2].op == TCCIR_OP_SHL) {
+        offset_vr = vr2; base_op = add_src1; shl_idx = idx2;
+        shl_q = &ir->compact_instructions[shl_idx];
+      }
+    }
+    if (shl_idx < 0)
+      continue;
+
+    if (ir_opt_du_uses(du, offset_vr) != 1)
+      continue;
+
+    IROperand shl_src2 = tcc_ir_op_get_src2(ir, shl_q);
+    if (!shl_src2.is_const)
+      continue;
+    int shift_amount = shl_src2.u.imm32;
+    if (shift_amount < 1 || shift_amount > 3)
+      continue;
+
+    IROperand index_op = tcc_ir_op_get_src1(ir, shl_q);
+    if (index_op.is_llocal)
+      continue;
+    if (base_op.is_llocal || base_op.is_lval)
+      continue;
+
+    if (!ir_xform_same_block(ir, shl_idx, i))
+      continue;
+
+    int32_t loaded_vr = tcc_ir_vreg_alloc_temp(ir);
+    if (loaded_vr < 0)
+      continue;
+    if (ir->iroperand_pool_count + 4 > ir->iroperand_pool_capacity)
+      continue;
+
+    int new_base_idx = ir->iroperand_pool_count;
+    tcc_ir_pool_add(ir, IROP_NONE);
+    tcc_ir_pool_add(ir, IROP_NONE);
+    tcc_ir_pool_add(ir, IROP_NONE);
+    tcc_ir_pool_add(ir, IROP_NONE);
+
+    IROperand loaded_op = irop_make_vreg(loaded_vr, deref_op.btype ? deref_op.btype : IROP_BTYPE_INT32);
+    IROperand base_clean = base_op;
+    base_clean.is_lval = 0;
+    IROperand scale_imm = irop_make_imm32(0, shift_amount, IROP_BTYPE_INT32);
+
+    ir->iroperand_pool[new_base_idx + 0] = loaded_op;
+    ir->iroperand_pool[new_base_idx + 1] = base_clean;
+    ir->iroperand_pool[new_base_idx + 2] = index_op;
+    ir->iroperand_pool[new_base_idx + 3] = scale_imm;
+
+    add_q->op = TCCIR_OP_LOAD_INDEXED;
+    add_q->operand_base = new_base_idx;
+    shl_q->op = TCCIR_OP_NOP;
+
+    IROperand clean_op = loaded_op;
+    q = &ir->compact_instructions[i];
+    if (src_pos == 1)
+      tcc_ir_op_set_src1(ir, q, clean_op);
+    else
+      tcc_ir_op_set_src2(ir, q, clean_op);
+
+    total_changes++;
+  }
+  return total_changes;
+}
+
+const IROptGen fusion_deref_indexed_gens[] = {
+    {-1, ir_gen_deref_indexed_fusion, "deref_indexed_fusion", 1},
+};
+
+const int fusion_deref_indexed_gens_count = 1;
+
+static int ir_gen_disp_fusion(IROptCtx *ctx, int i)
+{
+  TCCIRState *ir = ctx->ir;
+  const IROptDU *du = &ctx->du;
+
+  if (!tcc_state->opt_disp_fusion)
+    return 0;
+
+  IRQuadCompact *q = &ir->compact_instructions[i];
+
+  int is_store = 0;
+  int is_load = 0;
+  IROperand addr_op = IROP_NONE;
+
+  if (q->op == TCCIR_OP_LOAD) {
+    is_load = 1;
+    addr_op = tcc_ir_op_get_src1(ir, q);
+  } else if (q->op == TCCIR_OP_STORE) {
+    is_store = 1;
+    addr_op = tcc_ir_op_get_dest(ir, q);
+  } else if (q->op == TCCIR_OP_ASSIGN) {
+    IROperand src1 = tcc_ir_op_get_src1(ir, q);
+    if (!src1.is_lval)
+      return 0;
+    is_load = 1;
+    addr_op = src1;
+  } else {
+    return 0;
+  }
+
+  if (!irop_has_vreg(addr_op))
+    return 0;
+
+  int32_t addr_vr = irop_get_vreg(addr_op);
+
+  if (is_load && TCCIR_DECODE_VREG_TYPE(addr_vr) == TCCIR_VREG_TYPE_VAR)
+    return 0;
+
+  {
+    int access_btype = addr_op.btype;
+    if (access_btype == IROP_BTYPE_INT64 || access_btype == IROP_BTYPE_FLOAT64 ||
+        access_btype == IROP_BTYPE_STRUCT)
+      return 0;
+  }
+
+  if (is_load) {
+    IROperand dest_op = tcc_ir_op_get_dest(ir, q);
+    int32_t dest_vr = irop_get_vreg(dest_op);
+    if (dest_vr < 0 || TCCIR_DECODE_VREG_TYPE(dest_vr) != TCCIR_VREG_TYPE_TEMP)
+      return 0;
+  }
+
+  int add_idx = ir_opt_du_def(du, addr_vr, i);
+  if (add_idx < 0)
+    return 0;
+
+  IRQuadCompact *add_q = &ir->compact_instructions[add_idx];
+  if (add_q->op != TCCIR_OP_ADD)
+    return 0;
+
+  if (ir_opt_du_uses(du, addr_vr) != 1)
+    return 0;
+
+  IROperand add_src1 = tcc_ir_op_get_src1(ir, add_q);
+  IROperand add_src2 = tcc_ir_op_get_src2(ir, add_q);
+
+  IROperand base_op;
+  int imm;
+  if (irop_get_tag(add_src2) == IROP_TAG_IMM32 && irop_get_tag(add_src1) == IROP_TAG_VREG && irop_has_vreg(add_src1)) {
+    base_op = add_src1;
+    imm = (int)add_src2.u.imm32;
+  } else if (irop_get_tag(add_src1) == IROP_TAG_IMM32 && irop_get_tag(add_src2) == IROP_TAG_VREG &&
+             irop_has_vreg(add_src2)) {
+    base_op = add_src2;
+    imm = (int)add_src1.u.imm32;
+  } else {
+    return 0;
+  }
+
+  if (imm > 4095 || imm < -255)
+    return 0;
+  if (base_op.is_local || base_op.is_llocal)
+    return 0;
+  if (!ir_xform_same_block(ir, add_idx, i))
+    return 0;
+
+  IROperand orig_dest = tcc_ir_op_get_dest(ir, q);
+  IROperand orig_src1 = tcc_ir_op_get_src1(ir, q);
+
+  {
+    int32_t base_vr = irop_get_vreg(base_op);
+    if (base_vr >= 0 && TCCIR_DECODE_VREG_TYPE(base_vr) == TCCIR_VREG_TYPE_TEMP &&
+        ir_opt_du_uses(du, base_vr) == 1) {
+      int copy_idx = ir_opt_du_def(du, base_vr, add_idx);
+      if (copy_idx >= 0) {
+        IRQuadCompact *copy_q = &ir->compact_instructions[copy_idx];
+        if (copy_q->op == TCCIR_OP_ASSIGN) {
+          IROperand copy_dest = tcc_ir_op_get_dest(ir, copy_q);
+          IROperand copy_src = tcc_ir_op_get_src1(ir, copy_q);
+          if (!copy_dest.is_lval && !copy_src.is_lval && irop_has_vreg(copy_src)) {
+            base_op = copy_src;
+            copy_q->op = TCCIR_OP_NOP;
+          }
+        }
+      }
+    }
+  }
+
+  tcc_ir_pool_ensure(ir, 4);
+  int new_base_idx = ir->iroperand_pool_count;
+  if (new_base_idx + 4 > ir->iroperand_pool_capacity)
+    return 0;
+  tcc_ir_pool_add(ir, IROP_NONE);
+  tcc_ir_pool_add(ir, IROP_NONE);
+  tcc_ir_pool_add(ir, IROP_NONE);
+  tcc_ir_pool_add(ir, IROP_NONE);
+
+  IROperand index_imm = irop_make_imm32(0, imm, IROP_BTYPE_INT32);
+  IROperand scale_imm = irop_make_imm32(0, 0, IROP_BTYPE_INT32);
+
+  if (is_store) {
+    IROperand base_for_store = base_op;
+    base_for_store.is_lval = 0;
+    ir->iroperand_pool[new_base_idx + 0] = base_for_store;
+    ir->iroperand_pool[new_base_idx + 1] = orig_src1;
+    ir->iroperand_pool[new_base_idx + 2] = index_imm;
+    ir->iroperand_pool[new_base_idx + 3] = scale_imm;
+    q->op = TCCIR_OP_STORE_INDEXED;
+  } else {
+    IROperand base_for_load = base_op;
+    base_for_load.is_lval = 0;
+    IROperand new_dest = orig_dest;
+    if (q->op == TCCIR_OP_ASSIGN) {
+      new_dest.btype = addr_op.btype;
+      new_dest.is_unsigned = addr_op.is_unsigned;
+    }
+    ir->iroperand_pool[new_base_idx + 0] = new_dest;
+    ir->iroperand_pool[new_base_idx + 1] = base_for_load;
+    ir->iroperand_pool[new_base_idx + 2] = index_imm;
+    ir->iroperand_pool[new_base_idx + 3] = scale_imm;
+    q->op = TCCIR_OP_LOAD_INDEXED;
+  }
+  q->operand_base = new_base_idx;
+
+  add_q->op = TCCIR_OP_NOP;
+  return 1;
+}
+
+const IROptGen fusion_disp_gens[] = {
+    {TCCIR_OP_LOAD, ir_gen_disp_fusion, "disp_load_fusion", 1},
+    {TCCIR_OP_STORE, ir_gen_disp_fusion, "disp_store_fusion", 1},
+    {TCCIR_OP_ASSIGN, ir_gen_disp_fusion, "disp_assign_fusion", 1},
+};
+
+const int fusion_disp_gens_count = sizeof(fusion_disp_gens) / sizeof(fusion_disp_gens[0]);
+
+static int ir_gen_indexed_chain(IROptCtx *ctx, int i)
+{
+  TCCIRState *ir = ctx->ir;
+  const IROptDU *du = &ctx->du;
+  IRQuadCompact *q = &ir->compact_instructions[i];
+
+  int is_store = (q->op == TCCIR_OP_STORE_INDEXED);
+  int base_slot = is_store ? 0 : 1;
+  IROperand base_op = ir->iroperand_pool[q->operand_base + base_slot];
+  IROperand index_op = ir->iroperand_pool[q->operand_base + 2];
+  IROperand scale_op = ir->iroperand_pool[q->operand_base + 3];
+
+  if (irop_get_tag(scale_op) != IROP_TAG_IMM32 || scale_op.u.imm32 != 0)
+    return 0;
+  if (irop_get_tag(index_op) != IROP_TAG_IMM32)
+    return 0;
+  int imm2 = (int)index_op.u.imm32;
+
+  int32_t base_vr = irop_get_vreg(base_op);
+  if (base_vr < 0)
+    return 0;
+  if (base_op.is_local || base_op.is_llocal || base_op.is_lval)
+    return 0;
+
+  int add_idx = ir_opt_du_def(du, base_vr, i);
+  if (add_idx < 0)
+    return 0;
+  if (ir_opt_du_uses(du, base_vr) != 1)
+    return 0;
+
+  IRQuadCompact *add_q = &ir->compact_instructions[add_idx];
+  if (add_q->op != TCCIR_OP_ADD)
+    return 0;
+
+  IROperand add_src1 = tcc_ir_op_get_src1(ir, add_q);
+  IROperand add_src2 = tcc_ir_op_get_src2(ir, add_q);
+
+  IROperand new_base;
+  int imm1;
+  if (irop_get_tag(add_src2) == IROP_TAG_IMM32 && irop_get_tag(add_src1) == IROP_TAG_VREG && irop_has_vreg(add_src1)) {
+    new_base = add_src1; imm1 = (int)add_src2.u.imm32;
+  } else if (irop_get_tag(add_src1) == IROP_TAG_IMM32 && irop_get_tag(add_src2) == IROP_TAG_VREG && irop_has_vreg(add_src2)) {
+    new_base = add_src2; imm1 = (int)add_src1.u.imm32;
+  } else {
+    return 0;
+  }
+
+  if (new_base.is_local || new_base.is_llocal)
+    return 0;
+
+  long long imm_total = (long long)imm1 + imm2;
+  if (imm_total > 4095 || imm_total < -255)
+    return 0;
+
+  if (!ir_xform_same_block(ir, add_idx, i))
+    return 0;
+
+  new_base.is_lval = 0;
+  new_base.btype = base_op.btype;
+  ir->iroperand_pool[q->operand_base + base_slot] = new_base;
+  ir->iroperand_pool[q->operand_base + 2] = irop_make_imm32(0, (int32_t)imm_total, IROP_BTYPE_INT32);
+
+  add_q->op = TCCIR_OP_NOP;
+  return 1;
+}
+
+const IROptGen fusion_chain_gens[] = {
+    {TCCIR_OP_LOAD_INDEXED, ir_gen_indexed_chain, "indexed_chain_load", 1},
+    {TCCIR_OP_STORE_INDEXED, ir_gen_indexed_chain, "indexed_chain_store", 1},
+};
+
+const int fusion_chain_gens_count = sizeof(fusion_chain_gens) / sizeof(fusion_chain_gens[0]);
+
+static int ir_gen_indexed_pair_reorder(IROptCtx *ctx, int i)
+{
+  TCCIRState *ir = ctx->ir;
+  int n = ir->next_instruction_index;
+  IRQuadCompact *q1 = &ir->compact_instructions[i];
+
+  if (i + 2 >= n)
+    return 0;
+
+  int q1_is_load = (q1->op == TCCIR_OP_LOAD_INDEXED);
+
+  IROperand q1_scale = ir->iroperand_pool[q1->operand_base + 3];
+  IROperand q1_index = ir->iroperand_pool[q1->operand_base + 2];
+  if (irop_get_tag(q1_scale) != IROP_TAG_IMM32 || q1_scale.u.imm32 != 0)
+    return 0;
+  if (irop_get_tag(q1_index) != IROP_TAG_IMM32)
+    return 0;
+
+  int q1_base_slot = q1_is_load ? 1 : 0;
+  IROperand q1_base = ir->iroperand_pool[q1->operand_base + q1_base_slot];
+  int32_t q1_base_vr = irop_get_vreg(q1_base);
+  if (q1_base_vr < 0)
+    return 0;
+
+  const int window = 12;
+  int q3_idx = -1;
+  int blocked = 0;
+  for (int k = i + 1; k < n && (k - i) <= window; k++) {
+    IRQuadCompact *cq = &ir->compact_instructions[k];
+    if (cq->op == TCCIR_OP_NOP)
+      continue;
+    if (cq->is_jump_target) { blocked = 1; break; }
+    if (cq->op == q1->op) { q3_idx = k; break; }
+    int safe = 0;
+    if (cq->op == TCCIR_OP_FUNCPARAMVAL) {
+      safe = 1;
+    } else if (cq->op == TCCIR_OP_ASSIGN) {
+      IROperand a_dest = tcc_ir_op_get_dest(ir, cq);
+      IROperand a_src1 = tcc_ir_op_get_src1(ir, cq);
+      if (!a_dest.is_lval && !a_src1.is_lval && irop_get_vreg(a_dest) != q1_base_vr)
+        safe = 1;
+    }
+    if (!safe) { blocked = 1; break; }
+  }
+  if (q3_idx < 0 || blocked)
+    return 0;
+
+  IRQuadCompact *q3 = &ir->compact_instructions[q3_idx];
+
+  IROperand q3_scale = ir->iroperand_pool[q3->operand_base + 3];
+  IROperand q3_index = ir->iroperand_pool[q3->operand_base + 2];
+  if (irop_get_tag(q3_scale) != IROP_TAG_IMM32 || q3_scale.u.imm32 != 0)
+    return 0;
+  if (irop_get_tag(q3_index) != IROP_TAG_IMM32)
+    return 0;
+
+  int q3_base_slot = q1_is_load ? 1 : 0;
+  IROperand q3_base = ir->iroperand_pool[q3->operand_base + q3_base_slot];
+  if (irop_get_vreg(q3_base) != q1_base_vr)
+    return 0;
+
+  int32_t imm1 = q1_index.u.imm32;
+  int32_t imm2 = q3_index.u.imm32;
+  if (imm1 + 4 != imm2 && imm2 + 4 != imm1)
+    return 0;
+  if ((imm1 & 3) != 0 || (imm2 & 3) != 0)
+    return 0;
+
+  IROperand q3_dv = q1_is_load ? ir->iroperand_pool[q3->operand_base + 0]
+                               : ir->iroperand_pool[q3->operand_base + 1];
+  int32_t q3_dv_vr = irop_get_vreg(q3_dv);
+
+  int swap_pos = q3_idx;
+  int target_pos = i + 1;
+  while (swap_pos > target_pos) {
+    int prev = swap_pos - 1;
+    while (prev > i && ir->compact_instructions[prev].op == TCCIR_OP_NOP)
+      prev--;
+    if (prev <= i)
+      break;
+    IRQuadCompact *pq = &ir->compact_instructions[prev];
+    int conflict = 0;
+    if (q3_dv_vr >= 0) {
+      if (irop_config[pq->op].has_src1 && irop_get_vreg(tcc_ir_op_get_src1(ir, pq)) == q3_dv_vr)
+        conflict = 1;
+      if (!conflict && irop_config[pq->op].has_src2 && irop_get_vreg(tcc_ir_op_get_src2(ir, pq)) == q3_dv_vr)
+        conflict = 1;
+    }
+    if (conflict)
+      break;
+    IRQuadCompact tmp = *pq;
+    *pq = ir->compact_instructions[swap_pos];
+    ir->compact_instructions[swap_pos] = tmp;
+    swap_pos = prev;
+  }
+
+  return (swap_pos < q3_idx) ? 1 : 0;
+}
+
+const IROptGen fusion_pair_reorder_gens[] = {
+    {TCCIR_OP_LOAD_INDEXED, ir_gen_indexed_pair_reorder, "pair_reorder_load", 0},
+    {TCCIR_OP_STORE_INDEXED, ir_gen_indexed_pair_reorder, "pair_reorder_store", 0},
+};
+
+const int fusion_pair_reorder_gens_count = sizeof(fusion_pair_reorder_gens) / sizeof(fusion_pair_reorder_gens[0]);

@@ -25974,15 +25974,23 @@ static void gen_function(Sym *sym)
    * (e.g. XOR with table lookup) into LOAD_INDEXED when the address is
    * computed by SHL+ADD.  Runs after regular indexed fusion to catch the
    * remaining patterns where the load is embedded in an ALU operand. */
-  if (tcc_state->opt_indexed_memory)
-    tcc_ir_opt_deref_indexed_fusion(ir);
+  if (tcc_state->opt_indexed_memory) {
+    IROptCtx deref_ctx;
+    tcc_ir_opt_ctx_init(&deref_ctx, ir);
+    tcc_ir_opt_run_gens(&deref_ctx, fusion_deref_indexed_gens, fusion_deref_indexed_gens_count);
+    tcc_ir_opt_ctx_free(&deref_ctx);
+  }
 
   /* Displacement load/store fusion - fuse ADD(base, #imm) + LOAD/STORE/ASSIGN-lval
    * into a single LOAD_INDEXED/STORE_INDEXED with scale=0 and immediate index.
    * Must follow the SHL+ADD fusion above (disjoint patterns, but ordering keeps
    * the def/use table interpretation clean after NOPs are inserted). */
-  if (tcc_state->opt_disp_fusion)
-    tcc_ir_opt_disp_fusion(ir);
+  if (tcc_state->opt_disp_fusion) {
+    IROptCtx disp_ctx;
+    tcc_ir_opt_ctx_init(&disp_ctx, ir);
+    tcc_ir_opt_run_gens(&disp_ctx, fusion_disp_gens, fusion_disp_gens_count);
+    tcc_ir_opt_ctx_free(&disp_ctx);
+  }
 
   /* ADD+deref fold - fuse ADD(base, #imm) where the result is used as an
    * lval (implicit deref) in CMP/ADD/etc into LOAD_INDEXED + plain use.
@@ -26006,15 +26014,23 @@ static void gen_function(Sym *sym)
    * into a single _INDEXED op with combined offset.  Catches sha_final-style
    * struct-field-of-array-base writes that disp_fusion can't see in one
    * pass (its consumer-side dispatch only matches plain LOAD/STORE). */
-  if (tcc_state->opt_disp_fusion)
-    tcc_ir_opt_indexed_chain(ir);
+  if (tcc_state->opt_disp_fusion) {
+    IROptCtx chain_ctx;
+    tcc_ir_opt_ctx_init(&chain_ctx, ir);
+    tcc_ir_opt_run_gens(&chain_ctx, fusion_chain_gens, fusion_chain_gens_count);
+    tcc_ir_opt_ctx_free(&chain_ctx);
+  }
 
   /* Indexed-pair reorder: sink FUNCPARAMVAL past the next LOAD/STORE_INDEXED
    * so adjacent _INDEXED ops with same base + adjacent offsets become
    * physically adjacent in the IR, exposing them to the codegen LDRD/STRD
    * pairing peephole.  Helps printf-of-many-fields patterns like sha_print. */
-  if (tcc_state->opt_disp_fusion)
-    tcc_ir_opt_indexed_pair_reorder(ir);
+  if (tcc_state->opt_disp_fusion) {
+    IROptCtx pair_ctx;
+    tcc_ir_opt_ctx_init(&pair_ctx, ir);
+    tcc_ir_opt_run_gens(&pair_ctx, fusion_pair_reorder_gens, fusion_pair_reorder_gens_count);
+    tcc_ir_opt_ctx_free(&pair_ctx);
+  }
 
   /* Call-chain result rename: rename `CALL → V; PARAMVAL[0] V; redef V`
    * triples to fresh per-pair TEMPs so the regalloc keeps the value in r0

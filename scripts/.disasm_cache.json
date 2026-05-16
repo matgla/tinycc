@@ -831,8 +831,8 @@
   },
   "ir/bug_struct_field_postinc::main": {
     "gcc": 33,
-    "tcc": 56,
-    "updated": "2026-05-14T21:11:44.701204+00:00"
+    "tcc": 55,
+    "updated": "2026-05-16T10:15:26.333965+00:00"
   },
   "ir/bug_struct_member_cmp_fold::main": {
     "gcc": 107,

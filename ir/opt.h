@@ -190,15 +190,15 @@ int tcc_ir_opt_store_redundant(struct TCCIRState *ir);
 
 /* Displacement Load/Store Fusion - fuse ADD(base, #imm) + LOAD/STORE/ASSIGN-lval
  * into indexed memory op with constant index and scale=0. */
-int tcc_ir_opt_disp_fusion(struct TCCIRState *ir);
+/* tcc_ir_opt_disp_fusion -> ir_gen_disp_fusion in opt_gens_fusion.c */
 
 /* Indexed-chain fold - fuse a constant-immediate ADD that feeds an existing
  * scale=0 _INDEXED memory op into the indexed op's offset. */
-int tcc_ir_opt_indexed_chain(struct TCCIRState *ir);
+/* tcc_ir_opt_indexed_chain -> ir_gen_indexed_chain in opt_gens_fusion.c */
 
 /* Indexed-pair reorder - sink FUNCPARAMVAL past the next LOAD/STORE_INDEXED
  * so LDRD/STRD-pairable ops become adjacent for the codegen peephole. */
-int tcc_ir_opt_indexed_pair_reorder(struct TCCIRState *ir);
+/* tcc_ir_opt_indexed_pair_reorder -> ir_gen_indexed_pair_reorder in opt_gens_fusion.c */
 
 /* Call-chain result rename - rename `CALL → V; PARAMVAL[0] V` pairs to a
  * fresh TEMP per pair so the regalloc can keep the value in r0 across
@@ -228,7 +228,7 @@ void tcc_ir_barrel_shift_fusion(struct TCCIRState *ir);
 
 /* Deref-in-ALU indexed fusion: extract deref operands into LOAD_INDEXED when
  * the address is computed by SHL+ADD (array table lookup pattern). */
-int tcc_ir_opt_deref_indexed_fusion(struct TCCIRState *ir);
+/* tcc_ir_opt_deref_indexed_fusion -> ir_gen_deref_indexed_fusion in opt_gens_fusion.c */
 
 /* Combined boolean pass: cse_bool + bool_idempotent in one loop */
 int tcc_ir_opt_bool_pass(struct TCCIRState *ir, int do_idempotent, int do_cse);

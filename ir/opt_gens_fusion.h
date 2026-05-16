@@ -16,4 +16,16 @@
 extern const IROptGen fusion_gens[];
 extern const int fusion_gens_count;
 
+extern const IROptGen fusion_deref_indexed_gens[];
+extern const int fusion_deref_indexed_gens_count;
+
+extern const IROptGen fusion_disp_gens[];
+extern const int fusion_disp_gens_count;
+
+extern const IROptGen fusion_chain_gens[];
+extern const int fusion_chain_gens_count;
+
+extern const IROptGen fusion_pair_reorder_gens[];
+extern const int fusion_pair_reorder_gens_count;
+
 #endif /* TCC_IR_OPT_GENS_FUSION_H */
