@@ -385,8 +385,9 @@ typedef struct IRQuadCompact
   int orig_index;               /* Original IR index (stable across DCE) */
   TccIrOp op;                   /* Operation code */
   uint32_t operand_base;        /* Index into svalue_pool */
-  uint32_t line_num : 31;       /* Source line for debug info (non-negative, 31 bits = up to 2B lines) */
+  uint32_t line_num : 30;       /* Source line for debug info (non-negative, 30 bits = up to 1B lines) */
   uint32_t is_jump_target : 1;  /* Set when at least one JUMP/JUMPIF targets this instruction */
+  uint32_t no_unroll : 1;       /* Set on rerolled back-edges to prevent re-unrolling */
 } IRQuadCompact;
 
 /* Per-operation operand configuration (defined in tccir.c) */

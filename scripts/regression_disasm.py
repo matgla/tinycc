@@ -31,7 +31,7 @@ import sys
 import tempfile
 import threading
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from pathlib import Path
 
 from disasm_common import (
@@ -133,28 +133,62 @@ def collect_tests(suite_filter: str):
     return tests
 
 
+TRACE_TESTS = {"memcpy-a1", "memcpy-a2", "memcpy-a4", "memcpy-a8", "memclr"}
+
+
 def process_one(idx: int, total: int, suite: str, src: str, tmpdir: Path, dump_dir: str, gcc_opt: str):
     src_path = Path(src)
     basename = src_path.stem
     key = f"{suite}/{basename}"
+    trace = basename in TRACE_TESTS
     tcc_obj = tmpdir / f"{suite}_{basename}_tcc.o"
     gcc_obj = tmpdir / f"{suite}_{basename}_gcc.o"
     tcc_dump_path = tmpdir / f"{suite}_{basename}_tcc.dump"
     gcc_dump_path = tmpdir / f"{suite}_{basename}_gcc.dump"
     status = "OK"
 
-    if compile_tcc(src, tcc_obj).returncode != 0:
+    if trace:
+        eprint(f"  TRACE {key}: starting tcc compile")
+    try:
+        tcc_result = compile_tcc(src, tcc_obj)
+    except subprocess.TimeoutExpired:
+        with PRINT_LOCK:
+            eprint(f"[{idx}/{total}] {key} ... SKIP (tcc compile timed out)")
+        return {"type": "skip", "key": key, "reason": "tcc compile timed out"}
+    if trace:
+        eprint(f"  TRACE {key}: tcc done (rc={tcc_result.returncode})")
+    if tcc_result.returncode != 0:
         with PRINT_LOCK:
             eprint(f"[{idx}/{total}] {key} ... SKIP (tcc compile failed)")
+            if tcc_result.stderr:
+                for line in tcc_result.stderr.strip().splitlines():
+                    eprint(f"    {line}")
         return {"type": "skip", "key": key, "reason": "tcc compile failed"}
 
-    if compile_gcc(src, gcc_obj, opt=gcc_opt, extra_flags=["-ffreestanding"]).returncode != 0:
+    if trace:
+        eprint(f"  TRACE {key}: starting gcc compile")
+    try:
+        gcc_result = compile_gcc(src, gcc_obj, opt=gcc_opt, extra_flags=["-ffreestanding"])
+    except subprocess.TimeoutExpired:
+        with PRINT_LOCK:
+            eprint(f"[{idx}/{total}] {key} ... SKIP (gcc compile timed out)")
+        return {"type": "skip", "key": key, "reason": "gcc compile timed out"}
+    if trace:
+        eprint(f"  TRACE {key}: gcc done (rc={gcc_result.returncode})")
+    if gcc_result.returncode != 0:
         with PRINT_LOCK:
             eprint(f"[{idx}/{total}] {key} ... SKIP (gcc compile failed)")
+            if gcc_result.stderr:
+                for line in gcc_result.stderr.strip().splitlines():
+                    eprint(f"    {line}")
         return {"type": "skip", "key": key, "reason": "gcc compile failed"}
 
+    if trace:
+        eprint(f"  TRACE {key}: disassembling")
     tcc_text = disassemble(tcc_obj)
     gcc_text = disassemble(gcc_obj)
+    if trace:
+        eprint(f"  TRACE {key}: disasm done (tcc={len(tcc_text)} gcc={len(gcc_text)} chars)")
     tcc_dump_path.write_text(tcc_text)
     gcc_dump_path.write_text(gcc_text)
 
@@ -162,15 +196,21 @@ def process_one(idx: int, total: int, suite: str, src: str, tmpdir: Path, dump_d
         shutil.copy(tcc_dump_path, Path(dump_dir) / f"{suite}_{basename}_tcc.dump")
         shutil.copy(gcc_dump_path, Path(dump_dir) / f"{suite}_{basename}_gcc.dump")
 
+    if trace:
+        eprint(f"  TRACE {key}: getting functions")
     tcc_funcs = get_functions(tcc_obj, include_local=True)
     gcc_funcs = get_functions(gcc_obj, include_local=True)
     common = sorted(tcc_funcs & gcc_funcs)
+    if trace:
+        eprint(f"  TRACE {key}: {len(common)} common functions")
 
     if not common:
         with PRINT_LOCK:
             eprint(f"[{idx}/{total}] {key} ... SKIP (no common functions)")
         return {"type": "skip", "key": key, "reason": "no common functions"}
 
+    if trace:
+        eprint(f"  TRACE {key}: counting instructions")
     funcs = []
     for func in common:
         tcc_count = count_instructions(tcc_text, func)
@@ -182,6 +222,8 @@ def process_one(idx: int, total: int, suite: str, src: str, tmpdir: Path, dump_d
 
     with PRINT_LOCK:
         eprint(f"[{idx}/{total}] {key} ... {status}")
+    if trace:
+        eprint(f"  TRACE {key}: DONE")
     return {"type": "ok", "key": key, "funcs": funcs}
 
 
@@ -189,22 +231,39 @@ def run_all(tests, jobs, gcc_opt, dump_dir, suite="all"):
     total = len(tests)
     eprint(f"Compiling {total} tests (TCC -O2 vs GCC {gcc_opt}), jobs={jobs} ...")
     eprint(f"Suites: {suite}")
+    sys.stderr.flush()
+    errors = []
     with tempfile.TemporaryDirectory(prefix="regression_disasm.") as tmpdir:
         tmpdir = Path(tmpdir)
         results = []
         with ThreadPoolExecutor(max_workers=jobs) as ex:
-            futures = {
-                ex.submit(process_one, i + 1, total, suite, src, tmpdir, dump_dir, gcc_opt): (suite, src)
-                for i, (suite, src) in enumerate(tests)
-            }
-            for future in as_completed(futures):
-                try:
-                    results.append(future.result())
-                except Exception as exc:
-                    suite, src = futures[future]
-                    eprint(f"ERROR processing {suite}/{Path(src).name}: {exc}")
-        eprint("")
-        return results
+            future_to_test = {}
+            for i, (suite, src) in enumerate(tests):
+                f = ex.submit(process_one, i + 1, total, suite, src, tmpdir, dump_dir, gcc_opt)
+                future_to_test[f] = (suite, src)
+            eprint(f"Submitted {len(future_to_test)} futures, waiting ...")
+            sys.stderr.flush()
+
+            pending = set(future_to_test.keys())
+            while pending:
+                done, pending = wait(pending, timeout=20, return_when=FIRST_COMPLETED)
+                if not done:
+                    eprint(f"STUCK: {len(pending)} test(s) still running after 20s:")
+                    for f in list(pending)[:20]:
+                        s, src = future_to_test[f]
+                        eprint(f"  {s}/{Path(src).stem}")
+                    sys.stderr.flush()
+                for future in done:
+                    try:
+                        results.append(future.result())
+                    except Exception as exc:
+                        s, src = future_to_test[future]
+                        key = f"{s}/{Path(src).stem}"
+                        eprint(f"ERROR processing {key}: {exc}")
+                        errors.append(key)
+        eprint(f"All {total} tests done ({len(errors)} errors).")
+        sys.stderr.flush()
+        return results, errors
 
 
 def collect_data(results):
@@ -635,7 +694,8 @@ if __name__ == "__main__":
         eprint("ERROR: No tests discovered. Check Python imports.")
         sys.exit(1)
 
-    results = run_all(tests, args.j, args.gcc_opt, args.dump_dir or "", args.suite)
+    results, errors = run_all(tests, args.j, args.gcc_opt, args.dump_dir or "", args.suite)
+    eprint("Collecting data ...")
     data = collect_data(results)
 
     if args.csv:
@@ -647,4 +707,12 @@ if __name__ == "__main__":
     else:
         print_summary(data, args.gcc_opt)
 
+    eprint("Updating cache ...")
     run_cache_check(data, args.no_cache, args.overwrite_cache)
+
+    failed = errors + data["skipped"]
+    if failed:
+        eprint(f"\nFAILED: {len(failed)} test(s):")
+        for f in failed:
+            eprint(f"  {f}")
+        sys.exit(1)

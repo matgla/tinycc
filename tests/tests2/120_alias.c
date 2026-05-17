@@ -20,7 +20,11 @@ void alias_for_target(void) __attribute__((alias("target")));
 #endif
 
 int g_int = 34;
+#ifdef __TINYC__
 int alias_int __attribute__((alias("g_int")));
+#else
+extern int alias_int __asm__("g_int");
+#endif
 
 #ifdef __leading_underscore
 #define _ "_"
@@ -29,7 +33,11 @@ int alias_int __attribute__((alias("g_int")));
 #endif
 
 void asm_for_target(void) __asm__(_ "target");
+#ifdef __TINYC__
 int asm_int __asm__(_ "g_int");
+#else
+extern int asm_int __asm__(_ "g_int");
+#endif
 
 /* This is not supposed to compile, alias targets must be defined in the
    same unit.  In TCC they even must be defined before the reference

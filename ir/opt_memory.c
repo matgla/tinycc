@@ -991,6 +991,7 @@ int tcc_ir_opt_sl_forward(TCCIRState *ir)
     int64_t offset; /* resolved stack offset */
     const Sym *sym; /* local symbol (NULL for anonymous) */
     int valid;      /* 1 if entry is valid */
+    int lea_idx;    /* instruction index of the LEA that created this entry */
   } LeaMapEntry;
 
   LeaMapEntry *lea_map = tcc_mallocz(sizeof(LeaMapEntry) * (max_tmp + 1));
@@ -1114,6 +1115,7 @@ int tcc_ir_opt_sl_forward(TCCIRState *ir)
             lea_map[tmp_pos].offset = loff;
             lea_map[tmp_pos].sym = lsym;
             lea_map[tmp_pos].valid = 1;
+            lea_map[tmp_pos].lea_idx = i;
             /* Mark this slot as addrtaken: a LEA exposed its address, so any
              * function call after a STORE here could mutate it via the
              * escaping pointer.  Record the earliest LEA instruction index
@@ -1171,6 +1173,7 @@ int tcc_ir_opt_sl_forward(TCCIRState *ir)
               lea_map[dest_pos].offset = lea_map[s1_pos].offset + irop_get_imm64_ex(ir, lsrc2);
               lea_map[dest_pos].sym = lea_map[s1_pos].sym;
               lea_map[dest_pos].valid = 1;
+              lea_map[dest_pos].lea_idx = lea_map[s1_pos].lea_idx;
             }
           }
           /* Check: constant + LEA_temp (ADD is commutative) */
@@ -1183,6 +1186,7 @@ int tcc_ir_opt_sl_forward(TCCIRState *ir)
               lea_map[dest_pos].offset = lea_map[s2_pos].offset + irop_get_imm64_ex(ir, lsrc1);
               lea_map[dest_pos].sym = lea_map[s2_pos].sym;
               lea_map[dest_pos].valid = 1;
+              lea_map[dest_pos].lea_idx = lea_map[s2_pos].lea_idx;
             }
           }
         }
@@ -1207,6 +1211,7 @@ int tcc_ir_opt_sl_forward(TCCIRState *ir)
           var_lea_map[vp].offset = lea_map[sp].offset;
           var_lea_map[vp].sym = lea_map[sp].sym;
           var_lea_map[vp].valid = 1;
+          var_lea_map[vp].lea_idx = lea_map[sp].lea_idx;
         }
       }
       /* TEMP <-- VAR_in_var_lea_map [ASSIGN]: propagate VAR's LEA to TEMP. */
@@ -1221,6 +1226,7 @@ int tcc_ir_opt_sl_forward(TCCIRState *ir)
           lea_map[dp].offset = var_lea_map[vp].offset;
           lea_map[dp].sym = var_lea_map[vp].sym;
           lea_map[dp].valid = 1;
+          lea_map[dp].lea_idx = var_lea_map[vp].lea_idx;
         }
       }
     }
@@ -1395,9 +1401,9 @@ int tcc_ir_opt_sl_forward(TCCIRState *ir)
     {
       IROperand jdest = tcc_ir_op_get_dest(ir, q);
       int jtarget = (int)jdest.u.imm32;
-      if (jtarget >= 0 && jtarget < n && pred_count[jtarget] == 1 && entry_count > 0)
+      if (jtarget >= 0 && jtarget < n && entry_count > 0)
       {
-        /* Snapshot entries[] for the target to restore on entry */
+        /* Snapshot entries[] for the target to restore/join on entry */
         if (!saved_entries[jtarget])
           saved_entries[jtarget] = tcc_malloc(sizeof(StoreEntry) * n);
         memcpy(saved_entries[jtarget], entries, sizeof(StoreEntry) * entry_count);
@@ -1428,11 +1434,82 @@ int tcc_ir_opt_sl_forward(TCCIRState *ir)
        * the predecessor is the fall-through — keep current state intact. */
       if (pred_count[i] > 1)
       {
-        LOG_SL_FWD("BB@i=%d RESET: multi-pred target (preds=%d) — dropping %d tracked stores", i, pred_count[i],
-                   entry_count);
-        memset(hash_table, 0, sizeof(hash_table));
-        entry_count = 0;
-        write_tracker_gen++;
+        /* Multi-pred join: if we have a saved snapshot from a JUMP predecessor,
+         * intersect it with the current (fall-through) state.  Keep only stores
+         * present in both with the same (sym, offset).  This preserves forwarding
+         * across diamond patterns (if/else) where neither branch modifies the
+         * tracked stack slots. */
+        if (pred_count[i] == 2 && saved_entries[i] && entry_count > 0)
+        {
+          int sc = saved_entry_count[i];
+          int new_count = 0;
+          for (int j = 0; j < entry_count; j++)
+          {
+            if (!entries[j].valid)
+              continue;
+            int found = 0;
+            for (int k = 0; k < sc; k++)
+            {
+              if (!saved_entries[i][k].valid)
+                continue;
+              if (saved_entries[i][k].instruction_idx == entries[j].instruction_idx &&
+                  saved_entries[i][k].local_sym == entries[j].local_sym &&
+                  saved_entries[i][k].local_offset == entries[j].local_offset)
+              {
+                found = 1;
+                break;
+              }
+            }
+            if (found)
+            {
+              /* Safety: drop stores that could be aliased through an addrtaken
+               * pointer (e.g. struct fields whose base address escapes).  After
+               * LEA resolution, per-field addrtaken entries may be lost, so a
+               * function call on any path could have modified this store
+               * through the escaped pointer. */
+              if (entries[j].addr_addrtaken || entries[j].addr_via_pointer)
+                found = 0;
+              if (found)
+              {
+                for (int ak = 0; ak < addrtaken_count; ak++)
+                {
+                  if (addrtaken_slots[ak].sym != entries[j].local_sym)
+                    continue;
+                  if (addrtaken_slots[ak].earliest_lea_idx > i)
+                    continue;
+                  /* Any addrtaken slot with same sym: conservatively assume
+                   * the escaped pointer could reach this store's offset. */
+                  found = 0;
+                  break;
+                }
+              }
+            }
+            if (found)
+            {
+              if (new_count != j)
+                entries[new_count] = entries[j];
+              new_count++;
+            }
+          }
+          LOG_SL_FWD("BB@i=%d JOIN: multi-pred (preds=2), kept %d of %d entries (snapshot had %d)", i, new_count,
+                     entry_count, sc);
+          entry_count = new_count;
+          memset(hash_table, 0, sizeof(hash_table));
+          for (int j = 0; j < entry_count; j++)
+          {
+            uint32_t h = ((uintptr_t)entries[j].local_sym * 31 + (uint32_t)entries[j].local_offset * 17) % 128;
+            entries[j].next = hash_table[h];
+            hash_table[h] = &entries[j];
+          }
+        }
+        else
+        {
+          LOG_SL_FWD("BB@i=%d RESET: multi-pred target (preds=%d) — dropping %d tracked stores", i, pred_count[i],
+                     entry_count);
+          memset(hash_table, 0, sizeof(hash_table));
+          entry_count = 0;
+          write_tracker_gen++;
+        }
       }
       else if (pred_count[i] == 1)
       {

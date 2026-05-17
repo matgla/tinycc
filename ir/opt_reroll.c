@@ -446,6 +446,8 @@ static void reroll_rewrite(TCCIRState *ir, int base, int P, int N)
   rc = insert_instr_at(ir, after_run + 2, TCCIR_OP_JUMPIF, jmp_target, cond_imm, irop_make_none());
   if (rc < 0) return;
 
+  ir->compact_instructions[after_run + 2].no_unroll = 1;
+
   /* Mark the body start as a branch target so downstream passes (compact,
    * jump-threading, SSA construction) preserve it. */
   ir->compact_instructions[body_start].is_jump_target = 1;

@@ -8,6 +8,7 @@ and a best-known-result cache for TCC vs GCC code size tracking.
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -30,8 +31,22 @@ def eprint(*args, **kwargs):
     print(*args, file=sys.stderr, **kwargs)
 
 
+SUBPROCESS_TIMEOUT = 30
+
+
 def run(cmd, **kwargs):
-    return subprocess.run(cmd, capture_output=True, text=True, **kwargs)
+    timeout = kwargs.pop("timeout", SUBPROCESS_TIMEOUT)
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, start_new_session=True, **kwargs,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
+        raise
+    return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
 
 
 def get_tcc_path():
@@ -56,6 +71,8 @@ def compile_tcc(src, output, tcc=None, opt="-O2"):
 def compile_gcc(src, output, opt="-O2", extra_flags=None):
     cmd = [
         "arm-none-eabi-gcc", "-mcpu=cortex-m33", "-mthumb", opt,
+        "-std=gnu11", "-Wno-implicit-int", "-Wno-incompatible-pointer-types",
+        "-Wno-int-conversion", "-Wno-implicit-function-declaration",
         "-c", str(src), "-o", str(output),
     ]
     if extra_flags:
@@ -122,6 +139,36 @@ def count_instructions_with_clones(dump_text, func_name):
         elif in_func and _INST_RE.match(line) and not _is_non_instruction(line):
             count += 1
     return count
+
+
+def _strip_clone_suffix(name):
+    for s in _GCC_CLONE_SUFFIXES:
+        idx = name.find(s)
+        if idx >= 0:
+            return name[:idx]
+    return name
+
+
+def count_all_functions(dump_text, func_names, with_clones=False):
+    """Count instructions for all functions in a single pass over the dump text."""
+    wanted = set(func_names)
+    counts = {f: 0 for f in wanted}
+    current_func = None
+    for line in dump_text.splitlines():
+        if _HEADER_RE.match(line):
+            current_func = None
+            m = _HEADER_NAME_RE.search(line)
+            if m:
+                name = m.group(1)
+                if name in wanted:
+                    current_func = name
+                elif with_clones:
+                    base = _strip_clone_suffix(name)
+                    if base != name and base in wanted:
+                        current_func = base
+        elif current_func and _INST_RE.match(line) and not _is_non_instruction(line):
+            counts[current_func] += 1
+    return counts
 
 
 def extract_function_disasm(dump_text, func_name):

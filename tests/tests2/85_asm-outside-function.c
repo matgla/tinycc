@@ -11,7 +11,8 @@ extern void vide(void);
 #if defined(__thumb__)
 __asm__(".thumb\n"
         ".globl " _ "vide\n"
-        ".thumb_func " _ "vide\n" _ "vide:\n"
+        ".type " _ "vide, %function\n"
+        ".thumb_func\n" _ "vide:\n"
         "bx lr\n");
 #else
 __asm__(".globl " _ "vide\n" _ "vide:\n"

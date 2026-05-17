@@ -809,6 +809,7 @@ int insert_instr_at(TCCIRState *ir, int pos, TccIrOp op, IROperand dest, IROpera
   new_q->op = op;
   new_q->orig_index = pos;
   new_q->is_jump_target = 0; /* shifted instructions carry their flag; new slot has none */
+  new_q->no_unroll = 0;
   new_q->line_num = 0;
   new_q->operand_base = tcc_ir_pool_add(ir, dest); /* dest at base + 0 */
   tcc_ir_pool_add(ir, src1);                       /* src1 at base + 1 */
@@ -2719,6 +2720,14 @@ int try_unroll_loop_ex(TCCIRState *ir, IRLoop *loop, IRLoops *loops, int loop_id
 {
   LOG_LOOP_OPT("try_unroll_loop: header=%d start=%d end=%d preheader=%d", loop->header_idx, loop->start_idx,
                loop->end_idx, loop->preheader_idx);
+
+  if (loop->end_idx >= 0 && loop->end_idx < ir->next_instruction_index &&
+      ir->compact_instructions[loop->end_idx].no_unroll)
+  {
+    LOG_LOOP_OPT("try_unroll_loop: back-edge marked no_unroll (rerolled), skipping");
+    return 0;
+  }
+
   InductionVar ivs[MAX_IV];
   int num_ivs = find_induction_vars_ex(ir, loop, ivs, MAX_IV, 1 /* allow copy-through */);
   if (num_ivs < 1)
