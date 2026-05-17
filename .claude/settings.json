@@ -144,7 +144,13 @@
       "Bash(awk '/IR AFTER OPTIMIZATIONS/{found=1} found{print; if\\(/END IR AFTER/\\){found=0}}')",
       "Bash(./armv8m-tcc -dump-ir -O1 -c tests/ir_tests/../gcctestsuite/gcc-testsuite/gcc.c-torture/execute/20080424-1.c)",
       "Bash(awk '/IR AFTER LOOP ROTATION/{n++} n==1{print}')",
-      "Bash(./armv8m-tcc -dump-ir -O2 -c /tmp/min7.c)"
+      "Bash(./armv8m-tcc -dump-ir -O2 -c /tmp/min7.c)",
+      "Bash(python run.py -c 114_reroll_negative.c --cflags=\"-O2\" --dump-ir)",
+      "Bash(python run.py -c 105_builtin_strncmp_zero_count.c --dump-ir --cflags=\"-O2\")",
+      "Bash(./armv8m-tcc -O2 -dump-ir -c tests/ir_tests/105_builtin_strncmp_zero_count.c)",
+      "Bash(./armv8m-tcc --version)",
+      "Bash(python run.py -c 105_builtin_strncmp_zero_count.c --cflags=\"-O2\" --dump-ir)",
+      "Bash(./armv8m-tcc -dump-ir -O2 -c /tmp/strncmp_test.c -o /tmp/strncmp.o)"
     ]
   }
 }

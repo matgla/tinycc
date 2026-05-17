@@ -1602,6 +1602,256 @@ int tcc_ir_opt_const_prop(TCCIRState *ir)
     changes++;
   }
 
+  /* Redundant AND elimination after LOAD u8/u16 unsigned:
+   * LDRB/LDRH zero-extend on ARM, so the LOAD's result is already in
+   * range and a following AND with a superset mask is dead.  The
+   * backend selects LDRB/LDRH based on src.btype (which carries the
+   * "load size" semantics for pointer-deref LOADs), so we must gate
+   * on src.btype, not dest.btype — `T4 <- P1+T3` propagates pointer
+   * width (INT32) into T4 even when P1 points to u16 data.
+   *
+   * Skip NOPs between LOAD and AND — earlier passes may leave compacted
+   * gaps that hide otherwise-adjacent pairs from the fold. */
+  for (i = 0; i < n - 1; i++)
+  {
+    IRQuadCompact *load_q = &ir->compact_instructions[i];
+    if (load_q->op != TCCIR_OP_LOAD)
+      continue;
+    int j = i + 1;
+    while (j < n && ir->compact_instructions[j].op == TCCIR_OP_NOP)
+      j++;
+    if (j >= n)
+      continue;
+    IRQuadCompact *and_q = &ir->compact_instructions[j];
+    if (and_q->op != TCCIR_OP_AND)
+      continue;
+    IROperand load_src = tcc_ir_op_get_src1(ir, load_q);
+    IROperand load_dest = tcc_ir_op_get_dest(ir, load_q);
+    if (!load_src.is_unsigned)
+      continue;
+    int load_btype = irop_get_btype(load_src);
+    uint32_t load_range;
+    if (load_btype == IROP_BTYPE_INT8)
+      load_range = 0xFFu;
+    else if (load_btype == IROP_BTYPE_INT16)
+      load_range = 0xFFFFu;
+    else
+      continue;
+    IROperand and_src2 = tcc_ir_op_get_src2(ir, and_q);
+    if (!irop_is_immediate(and_src2))
+      continue;
+    int64_t and_mask = irop_get_imm64_ex(ir, and_src2);
+    if (((uint64_t)load_range & (uint64_t)and_mask) != (uint64_t)load_range)
+      continue;
+    IROperand and_src1 = tcc_ir_op_get_src1(ir, and_q);
+    if (irop_get_vreg(load_dest) != irop_get_vreg(and_src1))
+      continue;
+    if (!tcc_ir_vreg_has_single_use(ir, irop_get_vreg(load_dest), i))
+      continue;
+    /* Redirect the LOAD to write the AND's dest vreg, but preserve the
+     * LOAD's dest btype so downstream passes (LOAD_INDEXED fusion) keep
+     * the correct load width.  Copying the AND's operand verbatim would
+     * widen the dest btype to INT32, causing fusion to emit LDR instead
+     * of LDRB/LDRH. */
+    IROperand and_dest = tcc_ir_op_get_dest(ir, and_q);
+    IROperand new_dest = load_dest;
+    irop_set_vreg(&new_dest, irop_get_vreg(and_dest));
+    tcc_ir_set_dest(ir, i, new_dest);
+    and_q->op = TCCIR_OP_NOP;
+    changes++;
+  }
+
+  /* Convert LOAD-no-deref to ASSIGN when the source vreg is already
+   * provably in the destination type's range. The LOAD opcode forces
+   * a UXTB/UXTH narrowing on REG sources to handle AAPCS-promoted
+   * parameters; that narrowing is dead if the source value is already
+   * narrow.  ASSIGN does not narrow, so coalescing/peepholing can
+   * eliminate the move entirely. */
+  {
+    /* Find the maximum vreg position per type so we can size arrays. */
+    int max_pos_var = 0, max_pos_tmp = 0;
+    for (i = 0; i < n; i++)
+    {
+      IRQuadCompact *q2 = &ir->compact_instructions[i];
+      if (q2->op == TCCIR_OP_NOP)
+        continue;
+      IROperand ops[3] = {tcc_ir_op_get_dest(ir, q2), tcc_ir_op_get_src1(ir, q2), tcc_ir_op_get_src2(ir, q2)};
+      for (int k = 0; k < 3; k++)
+      {
+        int32_t vr = irop_get_vreg(ops[k]);
+        if (vr < 0)
+          continue;
+        int type = TCCIR_DECODE_VREG_TYPE(vr);
+        int pos = TCCIR_DECODE_VREG_POSITION(vr);
+        if (type == TCCIR_VREG_TYPE_VAR && pos > max_pos_var)
+          max_pos_var = pos;
+        else if (type == TCCIR_VREG_TYPE_TEMP && pos > max_pos_tmp)
+          max_pos_tmp = pos;
+      }
+    }
+
+    /* narrow[type * stride + pos]:
+     *   0 = uninitialised (no def seen yet)
+     *   1 = always narrow_u8 so far
+     *   2 = always narrow_u16 so far
+     *   3 = mixed / not narrow (sticky)  */
+    int stride = (max_pos_var > max_pos_tmp ? max_pos_var : max_pos_tmp) + 1;
+    if (stride > 0)
+    {
+      uint8_t *narrow = tcc_mallocz((size_t)stride * 4); /* 4 type slots */
+
+      /* Pass A: classify every vreg by all its definitions. */
+      for (i = 0; i < n; i++)
+      {
+        IRQuadCompact *q2 = &ir->compact_instructions[i];
+        if (q2->op == TCCIR_OP_NOP || !irop_config[q2->op].has_dest)
+          continue;
+        IROperand dest = tcc_ir_op_get_dest(ir, q2);
+        int32_t dvr = irop_get_vreg(dest);
+        if (dvr < 0)
+          continue;
+        int type = TCCIR_DECODE_VREG_TYPE(dvr);
+        int pos = TCCIR_DECODE_VREG_POSITION(dvr);
+        if (type != TCCIR_VREG_TYPE_VAR && type != TCCIR_VREG_TYPE_TEMP)
+          continue;
+        uint8_t *slot = &narrow[type * stride + pos];
+        if (*slot == 3)
+          continue; /* already mixed */
+
+        /* What does this definition produce? */
+        uint8_t produced = 3; /* default: unknown / not narrow */
+        if (q2->op == TCCIR_OP_LOAD)
+        {
+          /* The backend gates LDRB/LDRH on src.btype (see load_from_base
+           * call in arm-thumb-gen.c).  Only narrow if src actually carries
+           * sub-word type info — pointer LOADs propagate INT32 from the
+           * ADD that built the address. */
+          IROperand sq = tcc_ir_op_get_src1(ir, q2);
+          if (sq.is_unsigned)
+          {
+            int b = irop_get_btype(sq);
+            if (b == IROP_BTYPE_INT8)
+              produced = 1;
+            else if (b == IROP_BTYPE_INT16)
+              produced = 2;
+          }
+        }
+        else if (q2->op == TCCIR_OP_AND)
+        {
+          IROperand s2 = tcc_ir_op_get_src2(ir, q2);
+          if (irop_is_immediate(s2))
+          {
+            uint64_t m = (uint64_t)irop_get_imm64_ex(ir, s2);
+            if ((m & ~(uint64_t)0xFFu) == 0)
+              produced = 1;
+            else if ((m & ~(uint64_t)0xFFFFu) == 0)
+              produced = 2;
+          }
+        }
+        else if (q2->op == TCCIR_OP_UBFX)
+        {
+          IROperand s2 = tcc_ir_op_get_src2(ir, q2);
+          if (irop_is_immediate(s2))
+          {
+            int64_t param = irop_get_imm64_ex(ir, s2);
+            int width = (int)((param >> 5) & 0x1F);
+            if (width > 0 && width <= 8)
+              produced = 1;
+            else if (width > 0 && width <= 16)
+              produced = 2;
+          }
+        }
+        else if (q2->op == TCCIR_OP_SHR)
+        {
+          /* Logical shift right by N on a 32-bit value leaves 32-N bits.
+           * SHR #24 → result fits in 8 bits, SHR #16 → 16 bits.  Result
+           * range is independent of source signedness (SHR zero-fills).
+           * Guard against 64-bit src where the shift may not narrow. */
+          IROperand sq = tcc_ir_op_get_src1(ir, q2);
+          IROperand s2 = tcc_ir_op_get_src2(ir, q2);
+          if (irop_is_immediate(s2) &&
+              irop_get_btype(sq) != IROP_BTYPE_INT64)
+          {
+            int64_t shift = irop_get_imm64_ex(ir, s2);
+            if (shift >= 24 && shift < 32)
+              produced = 1;
+            else if (shift >= 16 && shift < 32)
+              produced = 2;
+          }
+        }
+        else if (q2->op == TCCIR_OP_ASSIGN)
+        {
+          /* ASSIGN copies the source value unchanged — narrowness
+           * propagates through.  In-order walk means earlier defs may
+           * not be classified yet, so this only catches forward chains
+           * (def of source appears textually before its use).  That's
+           * sufficient for typical *p++ patterns where the LOAD's
+           * narrow result feeds later byte-typed copies. */
+          IROperand sq = tcc_ir_op_get_src1(ir, q2);
+          int32_t svr = irop_get_vreg(sq);
+          if (svr >= 0 && !sq.is_lval && !sq.is_local && !sq.is_llocal)
+          {
+            int stype = TCCIR_DECODE_VREG_TYPE(svr);
+            int spos = TCCIR_DECODE_VREG_POSITION(svr);
+            if ((stype == TCCIR_VREG_TYPE_VAR || stype == TCCIR_VREG_TYPE_TEMP) && spos < stride)
+            {
+              uint8_t src_cls = narrow[stype * stride + spos];
+              if (src_cls == 1 || src_cls == 2)
+                produced = src_cls;
+            }
+          }
+        }
+
+        if (*slot == 0)
+          *slot = produced;
+        else if (*slot != produced)
+          *slot = 3;
+      }
+
+      /* Pass B: convert eligible LOAD to ASSIGN. */
+      for (i = 0; i < n; i++)
+      {
+        IRQuadCompact *q2 = &ir->compact_instructions[i];
+        if (q2->op != TCCIR_OP_LOAD)
+          continue;
+        IROperand dest = tcc_ir_op_get_dest(ir, q2);
+        IROperand src1 = tcc_ir_op_get_src1(ir, q2);
+        if (!dest.is_unsigned)
+          continue;
+        /* Memory deref iff src1.is_lval && not a register-promoted local/const.
+         * Mirrors the backend's preserve_lval logic in machine_op.c. */
+        int does_memory_deref = src1.is_lval && !src1.is_const && !src1.is_local && !src1.is_llocal;
+        if (does_memory_deref)
+          continue;
+        int32_t svr = irop_get_vreg(src1);
+        if (svr < 0)
+          continue;
+        int stype = TCCIR_DECODE_VREG_TYPE(svr);
+        int spos = TCCIR_DECODE_VREG_POSITION(svr);
+        if (stype != TCCIR_VREG_TYPE_VAR && stype != TCCIR_VREG_TYPE_TEMP)
+          continue;
+        uint8_t src_class = narrow[stype * stride + spos];
+        int dbtype = irop_get_btype(dest);
+        int need_class;
+        if (dbtype == IROP_BTYPE_INT8)
+          need_class = 1;
+        else if (dbtype == IROP_BTYPE_INT16)
+          need_class = 2;
+        else
+          continue;
+        /* src_class==1 (u8) satisfies u16 dest too. */
+        if (src_class == 0 || src_class == 3)
+          continue;
+        if (src_class > need_class)
+          continue;
+        q2->op = TCCIR_OP_ASSIGN;
+        changes++;
+      }
+
+      tcc_free(narrow);
+    }
+  }
+
   /* Third pass: Fold CMP+SETIF patterns when CMP has constant operands */
   for (i = 0; i < n - 1; i++)
   {
@@ -3842,21 +4092,27 @@ int tcc_ir_opt_add_reassoc(TCCIRState *ir)
     if (!irop_is_immediate(src2))
       continue;
 
-    if (src1.is_lval)
+    /* Bail on real memory dereferences only. Register-promoted locals
+     * (is_lval && is_local) and llocals carry is_lval as a tag but
+     * read from a register, so substituting their def-value is sound.
+     * Matches the does_memory_deref predicate elsewhere in this file. */
+    if (src1.is_lval && !src1.is_const && !src1.is_local && !src1.is_llocal)
       continue;
 
     int32_t src1_vr = irop_get_vreg(src1);
     if (src1_vr < 0)
       continue;
 
-    if (!DC_IS_SINGLE_DEF(dc, dc_stride, src1_vr))
-      continue;
-
     int def_idx = tcc_ir_find_defining_instruction(ir, src1_vr, i);
     if (def_idx < 0)
       continue;
 
-    /* Verify no merge points between def and use */
+    /* Verify def_idx and i are in the same straight-line basic block.
+     * The merge bitmap only flags multi-predecessor instructions; a
+     * forward-jump target with a single (non-fall-through) predecessor
+     * is NOT a merge but IS a block boundary, and the linear-scan def
+     * lookup will incorrectly find a def that doesn't actually reach i.
+     * Bail on any merge OR any prior JUMP/RETURN that breaks linearity. */
     {
       int safe = 1;
       for (int j = def_idx + 1; j <= i; j++)
@@ -3865,6 +4121,16 @@ int tcc_ir_opt_add_reassoc(TCCIRState *ir)
         {
           safe = 0;
           break;
+        }
+        if (j > 0)
+        {
+          int prev_op = ir->compact_instructions[j - 1].op;
+          if (prev_op == TCCIR_OP_JUMP || prev_op == TCCIR_OP_RETURNVALUE ||
+              prev_op == TCCIR_OP_RETURNVOID)
+          {
+            safe = 0;
+            break;
+          }
         }
       }
       if (!safe)
@@ -3881,13 +4147,15 @@ int tcc_ir_opt_add_reassoc(TCCIRState *ir)
     IROperand def_src1 = tcc_ir_op_get_src1(ir, def_q);
 
     /* The reassociation replaces src1_vr with def_src1 at the use point.
-     * If def_src1 is a vreg, it must not be redefined between def_idx and i,
-     * otherwise the substituted value would read a stale/wrong version. */
+     * If def_src1 is a vreg, it must not be redefined between def_idx and i
+     * (inclusive of def_idx, since def_q itself may write inner_vr, e.g.
+     * self-update chains like V0 = V0 + 200 where def_src1 and def_dst are
+     * both V0 — substituting reads V0 at the wrong point). */
     int32_t inner_vr = irop_get_vreg(def_src1);
     if (inner_vr >= 0 && !DC_IS_SINGLE_DEF(dc, dc_stride, inner_vr))
     {
       int redefined = 0;
-      for (int j = def_idx + 1; j < i; j++)
+      for (int j = def_idx; j < i; j++)
       {
         IRQuadCompact *jq = &ir->compact_instructions[j];
         if (jq->op == TCCIR_OP_NOP)

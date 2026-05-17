@@ -45,6 +45,7 @@ typedef struct SSAInterval {
   uint8_t crosses_call : 1;
   uint8_t addrtaken : 1;
   uint8_t is_param : 1;
+  uint8_t reg_shared : 1; /* cur shares hr with another active interval (return-block tail); skip expire-free and active push */
   uint8_t reg_type;
   uint16_t use_count;
   int8_t precolored;
@@ -1053,6 +1054,7 @@ static void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
       iv->pref_reg = -1;
       iv->hint_vreg = -1;
       iv->is_param = (type == TCCIR_VREG_TYPE_PARAM);
+      iv->reg_shared = 0;
 
       IRLiveInterval *li = tcc_ir_vreg_live_interval(ir, vreg);
       iv->addrtaken = li->addrtaken;
@@ -1243,6 +1245,75 @@ static void ra_build_assign_hints(SSAInterval *intervals, int count,
 
   tcc_free(vreg_to_iv);
   #undef ASSIGN_VREG_IDX
+}
+
+/* Build coalescing hints from LOAD-of-PARAM copies.  TCC frontends emit
+ * `Tn <-- Pk [LOAD]` at function entry to move each register-passed PARAM
+ * into the local-variable temp that the function body actually reads.
+ * For full-word (INT32) sources the LOAD is a pure copy, so we can hint
+ * the temp toward the PARAM's register — the boundary case in the linear
+ * scan (partner->end == cur->start) then lets cur take that register at
+ * its def instruction, eliminating the copy.
+ *
+ * GATING (per feedback_load_narrowing memory): LOAD on a sub-word PARAM
+ * (INT8/INT16) carries implicit AAPCS narrowing, so it is NOT a pure copy
+ * and must be skipped.  INT64 needs a register pair and isn't expressible
+ * as a single-reg hint.  is_lval sources are real memory dereferences,
+ * not pass-through copies. */
+static void ra_build_load_param_hints(SSAInterval *intervals, int count,
+                                      TCCIRState *ir, int max_vreg_pos)
+{
+  if (max_vreg_pos <= 0) return;
+
+  int table_size = 4 * max_vreg_pos;
+  int *vreg_to_iv = tcc_malloc(sizeof(int) * table_size);
+  for (int i = 0; i < table_size; i++)
+    vreg_to_iv[i] = -1;
+
+  #define LOAD_VREG_IDX(vr) \
+    ((TCCIR_DECODE_VREG_TYPE(vr) * max_vreg_pos) + TCCIR_DECODE_VREG_POSITION(vr))
+
+  for (int i = 0; i < count; i++) {
+    int idx = LOAD_VREG_IDX(intervals[i].vreg);
+    if (idx >= 0 && idx < table_size)
+      vreg_to_iv[idx] = i;
+  }
+
+  int n = ir->next_instruction_index;
+  for (int i = 0; i < n; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_LOAD) continue;
+    IROperand d = tcc_ir_op_get_dest(ir, q);
+    IROperand s = tcc_ir_op_get_src1(ir, q);
+    if (s.is_lval) continue;                /* real memory load, not a copy */
+    int32_t dest_vr = irop_get_vreg(d);
+    int32_t src_vr = irop_get_vreg(s);
+    if (dest_vr < 0 || src_vr < 0) continue;
+    /* Source must be a PARAM (the only LOAD-as-copy pattern we trust). */
+    if (TCCIR_DECODE_VREG_TYPE(src_vr) != TCCIR_VREG_TYPE_PARAM) continue;
+    if (TCCIR_DECODE_VREG_TYPE(dest_vr) == TCCIR_VREG_TYPE_PARAM) continue;
+    /* Width gate: only full-word INT32.  Sub-word carries AAPCS narrowing,
+     * INT64 needs a pair, FP types use a different reg class. */
+    int sbtype = irop_get_btype(s);
+    if (sbtype != IROP_BTYPE_INT32) continue;
+    int dbtype = irop_get_btype(d);
+    if (dbtype != IROP_BTYPE_INT32) continue;
+    int dest_tbl = LOAD_VREG_IDX(dest_vr);
+    int src_tbl = LOAD_VREG_IDX(src_vr);
+    if (dest_tbl < 0 || dest_tbl >= table_size) continue;
+    if (src_tbl < 0 || src_tbl >= table_size) continue;
+    int dest_iv = vreg_to_iv[dest_tbl];
+    int src_iv = vreg_to_iv[src_tbl];
+    if (dest_iv < 0 || src_iv < 0) continue;
+    if (intervals[dest_iv].reg_type != intervals[src_iv].reg_type) continue;
+    if (intervals[dest_iv].hint_vreg < 0)
+      intervals[dest_iv].hint_vreg = src_vr;
+    if (intervals[src_iv].hint_vreg < 0)
+      intervals[src_iv].hint_vreg = dest_vr;
+  }
+
+  tcc_free(vreg_to_iv);
+  #undef LOAD_VREG_IDX
 }
 
 /* ============================================================================
@@ -1533,8 +1604,11 @@ static void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
     for (int j = 0; j < active_count; j++) {
       SSAInterval *a = active[j];
       if (a->end < cur->start) {
-        /* Free register */
-        if (a->r0 >= 0 && a->stack_location == 0) {
+        /* Free register — but not if cur shared hr with another active
+         * interval (reg_shared): the partner still logically owns hr,
+         * so freeing it here would let a later allocation clobber the
+         * loop body's view of partner. */
+        if (a->r0 >= 0 && a->stack_location == 0 && !a->reg_shared) {
           if (a->reg_type == LS_REG_TYPE_FLOAT || a->reg_type == LS_REG_TYPE_DOUBLE) {
             fp_free |= (1ull << a->r0);
             if (a->r1 >= 0) fp_free |= (1ull << a->r1);
@@ -1894,6 +1968,54 @@ static void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
               }
             }
           }
+          /* Return-block register sharing: cur is a single-use RETURNVALUE
+           * feeder whose def at cur->start and consumer at cur->end form
+           * a return tail.  Control returns to the caller at cur->end, so
+           * we can SHARE hr with whatever interval `partner` is holding
+           * it — cur's def overwrites hr, but we never re-execute past
+           * the return on this control-flow path.
+           *
+           * Safety conditions:
+           *   1. cur->end is RETURNVALUE/RETURNVOID.
+           *   2. partner's vreg is not READ at any instruction in
+           *      [cur->start, cur->end] — cur's def would clobber it.
+           *
+           * Sharing model: cur->r0 = hr, but we do NOT remove partner
+           * from active, do NOT mark hr free in int_free, and set
+           * cur->reg_shared so cur's expire phase does not free hr
+           * (partner still logically owns it).  Other CFG paths through
+           * partner's live range emit their own reads of hr unaffected —
+           * those paths never execute cur's def, so partner's value
+           * remains intact in hr along them. */
+          if (reg < 0 && cur->end > cur->start &&
+              (int)cur->end < ir->next_instruction_index) {
+            IRQuadCompact *eq = &ir->compact_instructions[cur->end];
+            if (eq->op == TCCIR_OP_RETURNVALUE || eq->op == TCCIR_OP_RETURNVOID) {
+              for (int k = 0; k < active_count; k++) {
+                SSAInterval *a = active[k];
+                if (a->r0 != hr || a->r1 >= 0 || a->stack_location != 0 ||
+                    a->reg_type != LS_REG_TYPE_INT)
+                  continue;
+                int conflict = 0;
+                for (int p = (int)cur->start; p <= (int)cur->end && !conflict; p++) {
+                  IRQuadCompact *pq = &ir->compact_instructions[p];
+                  IROperand s1 = tcc_ir_op_get_src1(ir, pq);
+                  IROperand s2 = tcc_ir_op_get_src2(ir, pq);
+                  if (irop_has_vreg(s1) && !irop_is_immediate(s1) &&
+                      irop_get_vreg(s1) == a->vreg) { conflict = 1; break; }
+                  if (irop_has_vreg(s2) && !irop_is_immediate(s2) &&
+                      irop_get_vreg(s2) == a->vreg) { conflict = 1; break; }
+                }
+                if (!conflict) {
+                  cur->r0 = hr;
+                  cur->reg_shared = 1;
+                  dirty_int |= (1ull << hr);
+                  reg = hr;
+                  break;
+                }
+              }
+            }
+          }
         }
       }
     }
@@ -1915,7 +2037,13 @@ static void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
       }
     }
 
-    if (coalesced_loop_phi) {
+    if (cur->reg_shared) {
+      /* Return-block share: cur->r0 was set in the pref_reg path.
+       * Don't touch int_free (partner still owns hr) and don't add cur
+       * to active (cur's expire would otherwise hit the !reg_shared
+       * guard but adding it is just bookkeeping; the simpler invariant
+       * is "shared cur never enters active"). */
+    } else if (coalesced_loop_phi) {
       /* Partner was removed from active above; transfer R's ownership
        * to cur. int_free stays unchanged (R was taken via partner,
        * now taken via cur). */
@@ -2987,6 +3115,7 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
    * the explicit copies emitted at predecessor block ends. */
   ra_build_phi_hints(intervals, interval_count, ssa, cfg, max_vreg_pos);
   ra_build_assign_hints(intervals, interval_count, ir, max_vreg_pos);
+  ra_build_load_param_hints(intervals, interval_count, ir, max_vreg_pos);
   ra_build_outgoing_param_hints(intervals, interval_count, ir, max_vreg_pos);
 
   /* Run linear scan */

@@ -135,6 +135,15 @@ int tcc_ir_opt_bool_cse(struct TCCIRState *ir);
 /* Store-Load Forwarding */
 int tcc_ir_opt_sl_forward(struct TCCIRState *ir);
 
+/* Forward const ASSIGN to a VAR through &V LEA into deref uses.  Handles the
+ * addr-taken local pattern (e.g. __attribute__((cleanup))) that var_to_tmp
+ * intentionally skips. */
+int tcc_ir_opt_addrof_var_fwd(struct TCCIRState *ir);
+
+/* Forward STORE GlobalSym(X) <- T_val into subsequent in-BB deref reads of X.
+ * Cross-block invalidation via calls / aliasing stores / BB boundaries. */
+int tcc_ir_opt_global_sl_fwd(struct TCCIRState *ir);
+
 /* Param-Addrof Constant-Store Fold - collapse the spill/addr/store/reload
  * sequence produced by `f(int v){ helper(&v); return v; }` after helper
  * inlining writes a known constant through &v. */
@@ -335,6 +344,8 @@ int tcc_ir_opt_redundant_var_assign_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_dead_var_store_elim_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_dead_addrvar_elim_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_store_redundant_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_addrof_var_fwd_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_global_sl_fwd_ex(struct IROptCtx *ctx);
 
 /* ============================================================================
  * Optimization Statistics

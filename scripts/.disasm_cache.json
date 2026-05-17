@@ -71,13 +71,13 @@
   },
   "105_builtin_strncmp_zero_count::main": {
     "gcc": 2,
-    "tcc": 16,
-    "updated": "2026-05-15T07:15:32.221377+00:00"
+    "tcc": 2,
+    "updated": "2026-05-18T09:49:33.809071+00:00"
   },
   "105_builtin_strncmp_zero_count::strncmp": {
     "gcc": 15,
-    "tcc": 39,
-    "updated": "2026-05-15T07:15:32.221390+00:00"
+    "tcc": 16,
+    "updated": "2026-05-18T15:32:24.555921+00:00"
   },
   "113_reroll_basic::incr_glob_i": {
     "gcc": 8,
@@ -88,6 +88,16 @@
     "gcc": 22,
     "tcc": 44,
     "updated": "2026-05-17T19:51:47.408463+00:00"
+  },
+  "114_reroll_negative::add_to_sum": {
+    "gcc": 6,
+    "tcc": 7,
+    "updated": "2026-05-17T20:59:33.464180+00:00"
+  },
+  "114_reroll_negative::main": {
+    "gcc": 18,
+    "tcc": 23,
+    "updated": "2026-05-17T21:46:53.651908+00:00"
   },
   "93_integer_promotion::main": {
     "gcc": 173,
@@ -113,6 +123,11 @@
     "gcc": 3,
     "tcc": 6,
     "updated": "2026-05-14T21:03:34.055414+00:00"
+  },
+  "98_call_over32_args::main": {
+    "gcc": 6,
+    "tcc": 6,
+    "updated": "2026-05-17T22:29:21.990546+00:00"
   },
   "bug/bug_bitfield_packed10::main": {
     "gcc": 105,
@@ -358,6 +373,46 @@
     "gcc": 3,
     "tcc": 3,
     "updated": "2026-05-17T10:41:49.243082+00:00"
+  },
+  "bug_alias_attribute::alias1": {
+    "gcc": 2,
+    "tcc": 2,
+    "updated": "2026-05-17T21:50:06.175168+00:00"
+  },
+  "bug_alias_attribute::alias2": {
+    "gcc": 2,
+    "tcc": 2,
+    "updated": "2026-05-17T21:50:06.175185+00:00"
+  },
+  "bug_alias_attribute::alias3": {
+    "gcc": 2,
+    "tcc": 2,
+    "updated": "2026-05-17T22:03:00.235107+00:00"
+  },
+  "bug_alias_attribute::asm_base2": {
+    "gcc": 0,
+    "tcc": 0,
+    "updated": "2026-05-17T21:50:06.175192+00:00"
+  },
+  "bug_alias_attribute::base1": {
+    "gcc": 0,
+    "tcc": 0,
+    "updated": "2026-05-17T21:50:06.175194+00:00"
+  },
+  "bug_alias_attribute::base3": {
+    "gcc": 0,
+    "tcc": 0,
+    "updated": "2026-05-17T21:50:06.175196+00:00"
+  },
+  "bug_alias_attribute::main": {
+    "gcc": 16,
+    "tcc": 27,
+    "updated": "2026-05-17T21:50:06.175197+00:00"
+  },
+  "bug_union_self_cast_typedef::main": {
+    "gcc": 20,
+    "tcc": 41,
+    "updated": "2026-05-18T15:32:54.090540+00:00"
   },
   "float/107_stack_safe::main": {
     "gcc": 12,
@@ -936,8 +991,8 @@
   },
   "func-sections/bug_static_func_reloc::main": {
     "gcc": 47,
-    "tcc": 60,
-    "updated": "2026-05-14T21:11:44.701418+00:00"
+    "tcc": 45,
+    "updated": "2026-05-17T20:58:20.994047+00:00"
   },
   "gcc-compile/103818::foo": {
     "gcc": 37,
@@ -97886,13 +97941,13 @@
   },
   "ir/105_builtin_strncmp_zero_count::main": {
     "gcc": 9,
-    "tcc": 11,
-    "updated": "2026-05-15T15:19:14.946926+00:00"
+    "tcc": 2,
+    "updated": "2026-05-18T09:52:09.510869+00:00"
   },
   "ir/105_builtin_strncmp_zero_count::strncmp": {
     "gcc": 15,
-    "tcc": 39,
-    "updated": "2026-05-14T21:11:44.701092+00:00"
+    "tcc": 16,
+    "updated": "2026-05-18T15:32:15.723968+00:00"
   },
   "ir/106_string_ops_runtime::main": {
     "gcc": 39,
@@ -97931,8 +97986,8 @@
   },
   "ir/110_iv_strength_reduction::main": {
     "gcc": 78,
-    "tcc": 113,
-    "updated": "2026-05-14T21:11:44.701165+00:00"
+    "tcc": 89,
+    "updated": "2026-05-17T20:58:20.993888+00:00"
   },
   "ir/110_iv_strength_reduction::short_array_sum": {
     "gcc": 12,
@@ -97961,8 +98016,8 @@
   },
   "ir/113_reroll_basic::main": {
     "gcc": 22,
-    "tcc": 44,
-    "updated": "2026-05-17T19:51:52.903283+00:00"
+    "tcc": 39,
+    "updated": "2026-05-17T21:35:38.326331+00:00"
   },
   "ir/114_reroll_negative::add_to_sum": {
     "gcc": 6,
@@ -97971,8 +98026,8 @@
   },
   "ir/114_reroll_negative::main": {
     "gcc": 18,
-    "tcc": 91,
-    "updated": "2026-05-16T22:36:40.549988+00:00"
+    "tcc": 23,
+    "updated": "2026-05-17T21:49:37.721814+00:00"
   },
   "ir/140_builtin_classify_type::main": {
     "gcc": 30,
@@ -98141,8 +98196,8 @@
   },
   "ir/92_loop_invariant::main": {
     "gcc": 20,
-    "tcc": 21,
-    "updated": "2026-05-14T21:11:44.700985+00:00"
+    "tcc": 17,
+    "updated": "2026-05-17T20:58:20.993750+00:00"
   },
   "ir/92_loop_invariant::test_loop": {
     "gcc": 10,
@@ -98181,8 +98236,8 @@
   },
   "ir/94_copy_propagation::main": {
     "gcc": 28,
-    "tcc": 49,
-    "updated": "2026-05-14T21:11:44.700938+00:00"
+    "tcc": 33,
+    "updated": "2026-05-17T20:58:20.993737+00:00"
   },
   "ir/94_copy_propagation::test_copy_chain": {
     "gcc": 2,
@@ -98356,13 +98411,13 @@
   },
   "ir/bench_fibonacci::bench_fibonacci": {
     "gcc": 11,
-    "tcc": 8,
-    "updated": "2026-05-14T21:11:44.701342+00:00"
+    "tcc": 3,
+    "updated": "2026-05-17T22:04:00.477141+00:00"
   },
   "ir/bench_fibonacci::fib": {
     "gcc": 260,
     "tcc": 38,
-    "updated": "2026-05-14T21:11:44.701344+00:00"
+    "updated": "2026-05-17T22:04:00.477149+00:00"
   },
   "ir/bench_fibonacci::main": {
     "gcc": 8,
@@ -98391,8 +98446,8 @@
   },
   "ir/bench_function_calls::main": {
     "gcc": 7,
-    "tcc": 18,
-    "updated": "2026-05-14T21:11:44.701340+00:00"
+    "tcc": 7,
+    "updated": "2026-05-17T20:58:20.993996+00:00"
   },
   "ir/bench_indirect_calls::bench_indirect_calls": {
     "gcc": 20,
@@ -98416,8 +98471,8 @@
   },
   "ir/bench_indirect_calls::main": {
     "gcc": 7,
-    "tcc": 30,
-    "updated": "2026-05-14T21:11:44.701369+00:00"
+    "tcc": 7,
+    "updated": "2026-05-17T20:58:20.994010+00:00"
   },
   "ir/bench_linked_list::bench_linked_list": {
     "gcc": 22,
@@ -98521,13 +98576,13 @@
   },
   "ir/bug_addrof_reg_param::check_prefix": {
     "gcc": 18,
-    "tcc": 38,
-    "updated": "2026-05-14T21:11:44.701168+00:00"
+    "tcc": 20,
+    "updated": "2026-05-17T20:58:20.993869+00:00"
   },
   "ir/bug_addrof_reg_param::main": {
     "gcc": 12,
-    "tcc": 41,
-    "updated": "2026-05-14T21:11:44.701170+00:00"
+    "tcc": 12,
+    "updated": "2026-05-17T20:58:20.993872+00:00"
   },
   "ir/bug_addrof_reg_param::strstart": {
     "gcc": 16,
@@ -98571,8 +98626,8 @@
   },
   "ir/bug_const_ptr_got_deref::main": {
     "gcc": 16,
-    "tcc": 18,
-    "updated": "2026-05-17T10:07:20.185374+00:00"
+    "tcc": 8,
+    "updated": "2026-05-17T20:58:20.993879+00:00"
   },
   "ir/bug_decl_attr_after_comma::main": {
     "gcc": 2,
@@ -98596,13 +98651,13 @@
   },
   "ir/bug_ll_mul10_switch_min::main": {
     "gcc": 107,
-    "tcc": 176,
-    "updated": "2026-05-14T21:11:44.700996+00:00"
+    "tcc": 75,
+    "updated": "2026-05-17T20:58:20.993746+00:00"
   },
   "ir/bug_ll_shift_ptr_clobber::main": {
     "gcc": 235,
-    "tcc": 329,
-    "updated": "2026-05-14T21:11:44.701211+00:00"
+    "tcc": 312,
+    "updated": "2026-05-17T20:58:20.993926+00:00"
   },
   "ir/bug_llong_const::main": {
     "gcc": 11,
@@ -98626,8 +98681,8 @@
   },
   "ir/bug_partition::main": {
     "gcc": 24,
-    "tcc": 57,
-    "updated": "2026-05-14T21:11:44.700960+00:00"
+    "tcc": 33,
+    "updated": "2026-05-17T20:58:20.993691+00:00"
   },
   "ir/bug_partition::partition": {
     "gcc": 21,
@@ -98711,13 +98766,13 @@
   },
   "ir/mibench_bitcount::bench_mibench_bitcount": {
     "gcc": 54,
-    "tcc": 40,
-    "updated": "2026-05-14T21:11:44.701396+00:00"
+    "tcc": 24,
+    "updated": "2026-05-17T20:58:20.994034+00:00"
   },
   "ir/mibench_bitcount::main": {
     "gcc": 7,
-    "tcc": 26,
-    "updated": "2026-05-14T21:11:44.701398+00:00"
+    "tcc": 7,
+    "updated": "2026-05-17T20:58:20.994036+00:00"
   },
   "ir/mibench_crc32::bench_mibench_crc32": {
     "gcc": 49,
@@ -98736,8 +98791,8 @@
   },
   "ir/mibench_dijkstra::main": {
     "gcc": 7,
-    "tcc": 28,
-    "updated": "2026-05-14T21:11:44.701405+00:00"
+    "tcc": 7,
+    "updated": "2026-05-17T20:58:20.994043+00:00"
   },
   "ir/mibench_qsort::bench_mibench_qsort": {
     "gcc": 44,
@@ -98816,8 +98871,8 @@
   },
   "ir/mibench_sha::sha_update": {
     "gcc": 38,
-    "tcc": 43,
-    "updated": "2026-05-14T21:11:44.701437+00:00"
+    "tcc": 39,
+    "updated": "2026-05-18T15:32:15.724100+00:00"
   },
   "ir/mibench_stringsearch::bench_mibench_stringsearch": {
     "gcc": 98,
@@ -98871,13 +98926,13 @@
   },
   "ir/nested_funcptr::multiply.0": {
     "gcc": 3,
-    "tcc": 32,
-    "updated": "2026-05-14T21:11:44.701280+00:00"
+    "tcc": 9,
+    "updated": "2026-05-17T22:04:00.477012+00:00"
   },
   "ir/nested_funcptr_call_twice::bump.0": {
     "gcc": 3,
-    "tcc": 37,
-    "updated": "2026-05-14T21:11:44.701287+00:00"
+    "tcc": 9,
+    "updated": "2026-05-17T22:04:00.477032+00:00"
   },
   "ir/nested_funcptr_call_twice::main": {
     "gcc": 31,
@@ -98886,8 +98941,8 @@
   },
   "ir/nested_funcptr_indirect::add_it.0": {
     "gcc": 3,
-    "tcc": 35,
-    "updated": "2026-05-14T21:11:44.701281+00:00"
+    "tcc": 9,
+    "updated": "2026-05-17T22:04:00.477058+00:00"
   },
   "ir/nested_funcptr_indirect::main": {
     "gcc": 29,
@@ -98926,13 +98981,13 @@
   },
   "ir/test_aeabi_dmul_bits::main": {
     "gcc": 27,
-    "tcc": 41,
-    "updated": "2026-05-14T21:11:44.701100+00:00"
+    "tcc": 37,
+    "updated": "2026-05-17T20:58:20.993827+00:00"
   },
   "ir/test_aeabi_double_all::main": {
     "gcc": 687,
-    "tcc": 3148,
-    "updated": "2026-05-17T10:07:20.185338+00:00"
+    "tcc": 757,
+    "updated": "2026-05-18T10:34:48.559196+00:00"
   },
   "ir/test_aeabi_double_all::write_hex32": {
     "gcc": 12,
@@ -98941,8 +98996,8 @@
   },
   "ir/test_aeabi_double_all::write_str": {
     "gcc": 9,
-    "tcc": 12,
-    "updated": "2026-05-17T10:07:20.185351+00:00"
+    "tcc": 11,
+    "updated": "2026-05-18T15:32:15.723990+00:00"
   },
   "ir/test_cleanup_double::cleanup_double": {
     "gcc": 4,
@@ -99161,8 +99216,8 @@
   },
   "ir/test_mibench_sha::sha_update": {
     "gcc": 56,
-    "tcc": 45,
-    "updated": "2026-05-14T21:11:44.701228+00:00"
+    "tcc": 43,
+    "updated": "2026-05-18T15:32:15.724022+00:00"
   },
   "ir/test_mla_fusion::main": {
     "gcc": 21,
@@ -99216,8 +99271,8 @@
   },
   "ir/test_mul64wide_compare::main": {
     "gcc": 42,
-    "tcc": 191,
-    "updated": "2026-05-14T21:11:44.701130+00:00"
+    "tcc": 41,
+    "updated": "2026-05-17T22:04:00.476508+00:00"
   },
   "ir/test_mul64wide_compare::mul32wide_u32": {
     "gcc": 20,
@@ -99246,8 +99301,8 @@
   },
   "ir/test_offset_addressing::main": {
     "gcc": 27,
-    "tcc": 30,
-    "updated": "2026-05-14T21:11:44.701039+00:00"
+    "tcc": 22,
+    "updated": "2026-05-17T20:58:20.993788+00:00"
   },
   "ir/test_offset_addressing::store_array_element": {
     "gcc": 3,
@@ -99356,8 +99411,8 @@
   },
   "pic-tds/bug_const_ptr_got_deref::main": {
     "gcc": 16,
-    "tcc": 18,
-    "updated": "2026-05-17T10:07:20.185492+00:00"
+    "tcc": 8,
+    "updated": "2026-05-17T20:58:20.994053+00:00"
   },
   "pic-tds/bug_mask_copy_noloop::adjust_sp": {
     "gcc": 1,
@@ -99426,8 +99481,8 @@
   },
   "pic-tds/bug_struct_mask_copy::gen_call_op": {
     "gcc": 93,
-    "tcc": 166,
-    "updated": "2026-05-14T21:11:44.701463+00:00"
+    "tcc": 159,
+    "updated": "2026-05-17T20:58:20.994084+00:00"
   },
   "pic-tds/bug_struct_mask_copy::get_site": {
     "gcc": 7,
@@ -99446,13 +99501,13 @@
   },
   "pic-tds/bug_struct_mask_copy::make_push": {
     "gcc": 23,
-    "tcc": 59,
-    "updated": "2026-05-14T21:11:44.701470+00:00"
+    "tcc": 57,
+    "updated": "2026-05-18T08:03:11.530561+00:00"
   },
   "test_aeabi_double_all::main": {
     "gcc": 646,
-    "tcc": 3148,
-    "updated": "2026-05-17T19:52:10.391319+00:00"
+    "tcc": 759,
+    "updated": "2026-05-17T20:56:17.913131+00:00"
   },
   "test_aeabi_double_all::write_hex32": {
     "gcc": 12,
@@ -99601,8 +99656,8 @@
   },
   "tests2/101_cleanup::main": {
     "gcc": 38,
-    "tcc": 106,
-    "updated": "2026-05-16T22:37:05.508408+00:00"
+    "tcc": 95,
+    "updated": "2026-05-17T22:03:32.989491+00:00"
   },
   "tests2/101_cleanup::test": {
     "gcc": 6,
@@ -99971,8 +100026,8 @@
   },
   "tests2/25_quicksort::main": {
     "gcc": 51,
-    "tcc": 83,
-    "updated": "2026-05-14T21:15:32.782063+00:00"
+    "tcc": 74,
+    "updated": "2026-05-17T22:03:32.989319+00:00"
   },
   "tests2/25_quicksort::partition": {
     "gcc": 27,
@@ -100026,8 +100081,8 @@
   },
   "tests2/30_hanoi::main": {
     "gcc": 32,
-    "tcc": 45,
-    "updated": "2026-05-14T21:15:32.782076+00:00"
+    "tcc": 37,
+    "updated": "2026-05-17T22:03:32.989302+00:00"
   },
   "tests2/33_ternary_op::call_fp": {
     "gcc": 16,
@@ -100131,8 +100186,8 @@
   },
   "tests2/47_switch_return::main": {
     "gcc": 9,
-    "tcc": 17,
-    "updated": "2026-05-14T21:15:32.782107+00:00"
+    "tcc": 9,
+    "updated": "2026-05-17T22:03:32.989332+00:00"
   },
   "tests2/48_nested_break::main": {
     "gcc": 8,
@@ -100196,8 +100251,8 @@
   },
   "tests2/55_lshift_type::main": {
     "gcc": 529,
-    "tcc": 1688,
-    "updated": "2026-05-14T21:15:32.782138+00:00"
+    "tcc": 1685,
+    "updated": "2026-05-17T22:03:32.989380+00:00"
   },
   "tests2/61_integers::main": {
     "gcc": 171,
@@ -100366,8 +100421,8 @@
   },
   "tests2/82_attribs_position::main": {
     "gcc": 9,
-    "tcc": 34,
-    "updated": "2026-05-14T21:15:32.782152+00:00"
+    "tcc": 24,
+    "updated": "2026-05-17T22:03:32.989374+00:00"
   },
   "tests2/82_attribs_position::some_stdcall_func": {
     "gcc": 2,
@@ -100391,8 +100446,8 @@
   },
   "tests2/87_dead_code::main": {
     "gcc": 56,
-    "tcc": 105,
-    "updated": "2026-05-14T21:15:32.782163+00:00"
+    "tcc": 86,
+    "updated": "2026-05-17T22:03:32.989394+00:00"
   },
   "tests2/88_codeopt::bla": {
     "gcc": 2,
@@ -100411,8 +100466,8 @@
   },
   "tests2/88_codeopt::extend_brk": {
     "gcc": 20,
-    "tcc": 24,
-    "updated": "2026-05-14T21:15:32.782176+00:00"
+    "tcc": 21,
+    "updated": "2026-05-17T22:03:32.989409+00:00"
   },
   "tests2/88_codeopt::main": {
     "gcc": 22,
@@ -100451,13 +100506,13 @@
   },
   "tests2/89_nocode_wanted::main": {
     "gcc": 13,
-    "tcc": 43,
-    "updated": "2026-05-14T21:15:32.782219+00:00"
+    "tcc": 13,
+    "updated": "2026-05-17T22:03:32.989402+00:00"
   },
   "tests2/90_struct-init::foo": {
     "gcc": 408,
-    "tcc": 763,
-    "updated": "2026-05-14T21:15:32.782301+00:00"
+    "tcc": 436,
+    "updated": "2026-05-17T22:03:32.989461+00:00"
   },
   "tests2/90_struct-init::inc_global": {
     "gcc": 5,
@@ -100466,8 +100521,8 @@
   },
   "tests2/90_struct-init::main": {
     "gcc": 105,
-    "tcc": 495,
-    "updated": "2026-05-14T21:15:32.782304+00:00"
+    "tcc": 100,
+    "updated": "2026-05-17T22:03:32.989469+00:00"
   },
   "tests2/90_struct-init::print_": {
     "gcc": 18,

@@ -18,6 +18,7 @@
 #include "opt_gens_call_result.h"
 #include "opt_gens_branch.h"
 #include "opt_utils.h"
+#include "opt_xform.h"
 
 #define FLAG(f) (uint16_t)offsetof(TCCState, f)
 
@@ -231,6 +232,7 @@ static const IROptPass late_cleanup_passes[] = {
   PASS_GATED("dead_var_store",   tcc_ir_opt_dead_var_store_elim_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_dead_store)),
   PASS_GATED("dead_addrvar",     tcc_ir_opt_dead_addrvar_elim_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_dead_store)),
   PASS_GATED("redundant_assign", tcc_ir_opt_redundant_var_assign_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_dead_store)),
+  PASS_GATED("inplace_arith",    tcc_ir_opt_store_inplace_arith_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_redundant_store)),
 };
 
 /* Compound pass: entry-store-prop cleanup phase (replicates original two-phase

@@ -26,4 +26,10 @@ static inline void ir_xform_nop(TCCIRState *ir, int idx)
  * keep their own loop. */
 int ir_xform_same_block(TCCIRState *ir, int from_idx, int to_idx);
 
+/* In-place arithmetic peephole: fold `T = V OP src; V = T [STORE]` into
+ * `V = V OP src; NOP`, saving one mov at codegen.  Returns number of folds. */
+int tcc_ir_opt_store_inplace_arith(TCCIRState *ir);
+struct IROptCtx;
+int tcc_ir_opt_store_inplace_arith_ex(struct IROptCtx *ctx);
+
 #endif /* TCC_IR_OPT_XFORM_H */

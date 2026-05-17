@@ -907,7 +907,7 @@ int tcc_ir_opt_sl_forward(TCCIRState *ir)
   int entry_count;
 
   /* Track stores whose loads were forwarded — candidates for dead-store elim. */
-#define SL_FWD_MAX_DEAD_STORES 16
+#define SL_FWD_MAX_DEAD_STORES 256
   struct
   {
     int store_idx;
@@ -1689,13 +1689,16 @@ int tcc_ir_opt_sl_forward(TCCIRState *ir)
      * LOAD, but only when it passes a single scalar:
      *  - complex types copy multiple words from the stack reference, so a
      *    single store can't cover the entire value;
-     *  - VAR vregs use abstract positions, not real stack offsets. */
+     *  - VAR vregs use abstract positions, not real stack offsets.
+     * 64-bit scalars (double, long long) are allowed: the matching store
+     * is a single 64-bit store and the width check in the entry-scan loop
+     * keeps the forwarding well-defined. */
     if (q->op == TCCIR_OP_LOAD ||
         (q->op == TCCIR_OP_ASSIGN && tcc_ir_op_get_src1(ir, q).is_lval &&
          !(irop_get_vreg(tcc_ir_op_get_src1(ir, q)) >= 0 &&
            TCCIR_DECODE_VREG_TYPE(irop_get_vreg(tcc_ir_op_get_src1(ir, q))) == TCCIR_VREG_TYPE_VAR)) ||
         (q->op == TCCIR_OP_FUNCPARAMVAL && tcc_ir_op_get_src1(ir, q).is_local && tcc_ir_op_get_src1(ir, q).is_lval &&
-         !tcc_ir_op_get_src1(ir, q).is_complex && !irop_is_64bit(tcc_ir_op_get_src1(ir, q)) &&
+         !tcc_ir_op_get_src1(ir, q).is_complex &&
          !(irop_get_vreg(tcc_ir_op_get_src1(ir, q)) >= 0 &&
            TCCIR_DECODE_VREG_TYPE(irop_get_vreg(tcc_ir_op_get_src1(ir, q))) == TCCIR_VREG_TYPE_VAR)))
     {
@@ -1823,9 +1826,11 @@ int tcc_ir_opt_sl_forward(TCCIRState *ir)
               store_bits = 16;
               break;
             case IROP_BTYPE_INT32:
+            case IROP_BTYPE_FLOAT32:
               store_bits = 32;
               break;
             case IROP_BTYPE_INT64:
+            case IROP_BTYPE_FLOAT64:
               store_bits = 64;
               break;
             default:
@@ -1841,11 +1846,96 @@ int tcc_ir_opt_sl_forward(TCCIRState *ir)
               load_bits = 16;
               break;
             case IROP_BTYPE_INT32:
+            case IROP_BTYPE_FLOAT32:
               load_bits = 32;
+              break;
+            case IROP_BTYPE_INT64:
+            case IROP_BTYPE_FLOAT64:
+              load_bits = 64;
               break;
             default:
               load_bits = 0;
               break;
+            }
+            /* Same-size cross-type (union punning): INT64↔FLOAT64, INT32↔FLOAT32.
+             * Only forward immediate values — non-immediate (vreg) forwarding
+             * across btype boundaries can interact badly with downstream passes
+             * that key off operand btype (e.g. inlined-callee parameter slots).
+             *
+             * Skip when the load operand has a VAR base: a VAR vreg can be
+             * allocated to a stack offset that overlaps an earlier tracked store
+             * after stack reuse (e.g. call result stored into a slot that was
+             * previously holding an argument).  The forwarding tracker doesn't
+             * see the reuse, so cross-type forward could pick up a stale value.
+             * Direct stack-offset loads (addr_vr < 0) are safe.
+             *
+             * For 64-bit pool-backed immediates the bits live in different pools
+             * (i64 vs f64), so re-pool when crossing INT64↔FLOAT64.  For 32-bit
+             * immediates the storage is shared via the union (u.imm32 /
+             * u.f32_bits), so a btype/tag swap suffices. */
+            if (store_bits > 0 && store_bits == load_bits && irop_is_immediate(e->stored_value) && addr_vr < 0)
+            {
+              IROperand fwd = e->stored_value;
+              int sv_tag = irop_get_tag(e->stored_value);
+              int translated = 1;
+              if (sv_tag == IROP_TAG_I64 && src1.btype == IROP_BTYPE_FLOAT64)
+              {
+                uint64_t bits = (uint64_t)irop_get_imm64_ex(ir, e->stored_value);
+                uint32_t new_idx = tcc_ir_pool_add_f64(ir, bits);
+                fwd = irop_make_f64(-1, new_idx);
+              }
+              else if (sv_tag == IROP_TAG_F64 && src1.btype == IROP_BTYPE_INT64)
+              {
+                int64_t val = irop_get_imm64_ex(ir, e->stored_value);
+                uint32_t new_idx = tcc_ir_pool_add_i64(ir, val);
+                fwd = irop_make_i64(-1, new_idx, IROP_BTYPE_INT64);
+              }
+              else if (sv_tag == IROP_TAG_IMM32 && src1.btype == IROP_BTYPE_FLOAT32)
+              {
+                fwd.tag = IROP_TAG_F32;
+                fwd.btype = IROP_BTYPE_FLOAT32;
+              }
+              else if (sv_tag == IROP_TAG_F32 && src1.btype == IROP_BTYPE_INT32)
+              {
+                fwd.tag = IROP_TAG_IMM32;
+                fwd.btype = IROP_BTYPE_INT32;
+              }
+              else
+              {
+                translated = 0;
+              }
+              if (translated)
+              {
+                LOG_SL_FWD("LOAD@i=%d FORWARD-PUN: store@i=%d store_btype=%d load_btype=%d bits=%d", i,
+                           e->instruction_idx, (int)e->store_btype, (int)src1.btype, store_bits);
+                if (q->op != TCCIR_OP_FUNCPARAMVAL)
+                  q->op = TCCIR_OP_ASSIGN;
+                int pool_off = q->operand_base + irop_config[q->op].has_dest;
+                ir->iroperand_pool[pool_off] = fwd;
+                {
+                  IROperand fwd_dest = tcc_ir_op_get_dest(ir, q);
+                  int32_t fwd_dest_vr = irop_get_vreg(fwd_dest);
+                  if (fwd_dest_vr >= 0 && TCCIR_DECODE_VREG_TYPE(fwd_dest_vr) == TCCIR_VREG_TYPE_TEMP)
+                  {
+                    int fwd_pos = TCCIR_DECODE_VREG_POSITION(fwd_dest_vr);
+                    if (fwd_pos <= max_tmp)
+                    {
+                      fwd_tmp_val[fwd_pos] = fwd;
+                      fwd_tmp_valid[fwd_pos] = 1;
+                    }
+                  }
+                }
+                if (fwd_store_count < SL_FWD_MAX_DEAD_STORES && !e->addr_addrtaken &&
+                    irop_get_vreg(tcc_ir_op_get_dest(ir, &ir->compact_instructions[e->instruction_idx])) < 0)
+                {
+                  fwd_stores[fwd_store_count].store_idx = e->instruction_idx;
+                  fwd_stores[fwd_store_count].offset = e->local_offset;
+                  fwd_stores[fwd_store_count].sym = e->local_sym;
+                  fwd_store_count++;
+                }
+                changes++;
+                break;
+              }
             }
             if (store_bits > 0 && load_bits > 0 && store_bits > load_bits && irop_is_immediate(e->stored_value))
             {
@@ -3332,7 +3422,8 @@ int tcc_ir_opt_store_redundant(TCCIRState *ir)
     int64_t offset;
     const Sym *sym;
     int store_idx;
-    int btype; /* VT_BYTE / VT_INT / etc. — width of the store */
+    int btype;     /* VT_BYTE / VT_INT / etc. — width of the store */
+    int is_global; /* 1 = global symref entry, 0 = local stack slot */
   } RseSlot;
 
   int n = ir->next_instruction_index;
@@ -3361,15 +3452,26 @@ int tcc_ir_opt_store_redundant(TCCIRState *ir)
       continue;
     }
 
-    /* READ check: any instruction that uses a local address as src1 or src2
-     * keeps the corresponding pending store alive. */
+    /* READ check: any instruction that uses a local OR global address as
+     * src1 or src2 keeps the corresponding pending store alive. */
     if (irop_config[q->op].has_src1)
     {
       IROperand src1 = tcc_ir_op_get_src1(ir, q);
-      if (src1.is_local)
+      if (src1.is_local || (src1.is_sym && src1.is_lval))
       {
-        int64_t off = irop_get_imm64_ex(ir, src1);
-        const Sym *sym = irop_get_sym_ex(ir, src1);
+        int64_t off;
+        const Sym *sym;
+        if (src1.is_sym)
+        {
+          IRPoolSymref *sr = irop_get_symref_ex(ir, src1);
+          sym = sr ? sr->sym : NULL;
+          off = sr ? sr->addend : 0;
+        }
+        else
+        {
+          off = irop_get_imm64_ex(ir, src1);
+          sym = irop_get_sym_ex(ir, src1);
+        }
         for (int k = 0; k < active_count; k++)
         {
           if (active[k].sym == sym && active[k].offset == off)
@@ -3383,10 +3485,21 @@ int tcc_ir_opt_store_redundant(TCCIRState *ir)
     if (irop_config[q->op].has_src2)
     {
       IROperand src2 = tcc_ir_op_get_src2(ir, q);
-      if (src2.is_local)
+      if (src2.is_local || (src2.is_sym && src2.is_lval))
       {
-        int64_t off = irop_get_imm64_ex(ir, src2);
-        const Sym *sym = irop_get_sym_ex(ir, src2);
+        int64_t off;
+        const Sym *sym;
+        if (src2.is_sym)
+        {
+          IRPoolSymref *sr = irop_get_symref_ex(ir, src2);
+          sym = sr ? sr->sym : NULL;
+          off = sr ? sr->addend : 0;
+        }
+        else
+        {
+          off = irop_get_imm64_ex(ir, src2);
+          sym = irop_get_sym_ex(ir, src2);
+        }
         for (int k = 0; k < active_count; k++)
         {
           if (active[k].sym == sym && active[k].offset == off)
@@ -3398,24 +3511,53 @@ int tcc_ir_opt_store_redundant(TCCIRState *ir)
       }
     }
 
-    /* STORE to a local non-addr-taken address. */
+    /* STORE to a local non-addr-taken address, or to a global symref. */
     if (q->op == TCCIR_OP_STORE)
     {
       IROperand dest = tcc_ir_op_get_dest(ir, q);
-      if (!dest.is_local)
-        continue;
-
-      /* Skip addr-taken locals: they may be read through a pointer. */
-      int32_t addr_vr = irop_get_vreg(dest);
-      if (addr_vr >= 0)
+      int dest_is_global = (dest.is_sym && dest.is_lval);
+      if (!dest.is_local && !dest_is_global)
       {
-        IRLiveInterval *interval = tcc_ir_get_live_interval(ir, addr_vr);
-        if (interval && interval->addrtaken)
-          continue;
+        /* STORE through unknown pointer — could alias any tracked global.
+         * Local entries are safe (non-addrtaken locals can't be aliased). */
+        for (int k = 0; k < active_count;)
+        {
+          if (active[k].is_global)
+            active[k] = active[--active_count];
+          else
+            k++;
+        }
+        continue;
       }
 
-      int64_t off = irop_get_imm64_ex(ir, dest);
-      const Sym *sym = irop_get_sym_ex(ir, dest);
+      /* Skip addr-taken locals: they may be read through a pointer.
+       * (Globals don't need this check — their address is always known but
+       * any aliased access via a TEMP pointer is handled by the flush
+       * above on STORE through unknown pointer.) */
+      if (!dest_is_global)
+      {
+        int32_t addr_vr = irop_get_vreg(dest);
+        if (addr_vr >= 0)
+        {
+          IRLiveInterval *interval = tcc_ir_get_live_interval(ir, addr_vr);
+          if (interval && interval->addrtaken)
+            continue;
+        }
+      }
+
+      int64_t off;
+      const Sym *sym;
+      if (dest_is_global)
+      {
+        IRPoolSymref *dr = irop_get_symref_ex(ir, dest);
+        sym = dr ? dr->sym : NULL;
+        off = dr ? dr->addend : 0;
+      }
+      else
+      {
+        off = irop_get_imm64_ex(ir, dest);
+        sym = irop_get_sym_ex(ir, dest);
+      }
 
       int store_btype = dest.btype;
 
@@ -3454,6 +3596,7 @@ int tcc_ir_opt_store_redundant(TCCIRState *ir)
         active[active_count].offset = off;
         active[active_count].store_idx = i;
         active[active_count].btype = store_btype;
+        active[active_count].is_global = dest_is_global;
         active_count++;
       }
       /* else: table full — skip this store conservatively */
@@ -3466,7 +3609,477 @@ int tcc_ir_opt_store_redundant(TCCIRState *ir)
 #undef RSE_MAX_ACTIVE
 }
 
+/* ============================================================================
+ * Address-of-VAR Forwarding (tcc_ir_opt_addrof_var_fwd)
+ * ============================================================================
+ *
+ * Within a basic block, forward a constant ASSIGN to a VAR through a LEA to
+ * the deref of the LEA's result:
+ *
+ *   V0 <-- #N [ASSIGN]
+ *   T0 <-- &V0           [LEA]
+ *   ...T0***DEREF***...  →  ...#N...
+ *
+ * Companion to var_to_tmp (opt_promote.c), which handles VARs whose address
+ * is NOT taken.  Here we handle the case where &V is taken but the address
+ * only flows to local derefs (no escape via call, no store-through, no
+ * second use of the LEA result as a value).
+ *
+ * This pattern is produced by __attribute__((cleanup)) — the inlined cleanup
+ * call materializes &local just to re-dereference it in the inlined body.
+ */
+int tcc_ir_opt_addrof_var_fwd(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  int changes = 0;
+
+  if (n < 3)
+    return 0;
+
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    /* A constant write to a local VAR can appear as either ASSIGN or STORE
+     * depending on the frontend path that produced it. Both are equivalent
+     * here: dest is the VAR's memory slot, src1 is the constant. */
+    if (q->op != TCCIR_OP_ASSIGN && q->op != TCCIR_OP_STORE)
+      continue;
+
+    IROperand dest = tcc_ir_op_get_dest(ir, q);
+    int32_t v_dest_vr = irop_get_vreg(dest);
+    if (v_dest_vr < 0 || TCCIR_DECODE_VREG_TYPE(v_dest_vr) != TCCIR_VREG_TYPE_VAR)
+      continue;
+
+    IROperand src = tcc_ir_op_get_src1(ir, q);
+    if (irop_get_tag(src) != IROP_TAG_IMM32)
+      continue;
+
+    int v_btype = irop_get_btype(dest);
+    if (v_btype != IROP_BTYPE_INT32)
+      continue;
+
+    int32_t imm_val = src.u.imm32;
+
+    /* Track aliases of &V_p propagated through `V_a = T_alias [STORE]` and
+     * `T_b = V_alias [ASSIGN]` copy chains.  Each tracked vreg holds the
+     * value of &V_p; any *T deref through it yields V_p's value (= imm_val). */
+#define ADDROF_VAR_MAX_REWRITES 32
+#define ADDROF_VAR_MAX_ALIASES 16
+    int rewrites_idx[ADDROF_VAR_MAX_REWRITES];
+    int rewrites_slot[ADDROF_VAR_MAX_REWRITES]; /* 0 = src1, 1 = src2 */
+    int rewrite_count = 0;
+    /* alias[]: vregs that currently hold &V_p (TEMP or VAR). */
+    int32_t alias[ADDROF_VAR_MAX_ALIASES];
+    int alias_count = 0;
+    int aborted = 0;
+
+    for (int j = i + 1; j < n && !aborted; j++)
+    {
+      IRQuadCompact *jq = &ir->compact_instructions[j];
+      if (jq->op == TCCIR_OP_NOP)
+        continue;
+
+      if (jq->is_jump_target)
+        break;
+      if (jq->op == TCCIR_OP_JUMP || jq->op == TCCIR_OP_JUMPIF || jq->op == TCCIR_OP_IJUMP ||
+          jq->op == TCCIR_OP_RETURNVALUE || jq->op == TCCIR_OP_RETURNVOID ||
+          jq->op == TCCIR_OP_SWITCH_TABLE)
+        break;
+      if (jq->op == TCCIR_OP_FUNCCALLVAL || jq->op == TCCIR_OP_FUNCCALLVOID)
+        break;
+
+      int handled = 0;
+
+      /* LEA T = &V_p creates the first alias. */
+      if (jq->op == TCCIR_OP_LEA)
+      {
+        IROperand ldest = tcc_ir_op_get_dest(ir, jq);
+        IROperand lsrc = tcc_ir_op_get_src1(ir, jq);
+        int32_t lsrc_vr = irop_get_vreg(lsrc);
+        int32_t ldest_vr = irop_get_vreg(ldest);
+        if (lsrc_vr == v_dest_vr && !lsrc.is_lval &&
+            TCCIR_DECODE_VREG_TYPE(ldest_vr) == TCCIR_VREG_TYPE_TEMP)
+        {
+          if (alias_count >= ADDROF_VAR_MAX_ALIASES)
+          {
+            aborted = 1;
+            break;
+          }
+          alias[alias_count++] = ldest_vr;
+          handled = 1;
+        }
+      }
+
+      /* STORE V_a <-- T_alias  (V_a becomes an alias holding &V_p).  The src
+       * carries is_lval=0 because we're storing a TEMP's pointer value. */
+      if (!handled && jq->op == TCCIR_OP_STORE)
+      {
+        IROperand sdest = tcc_ir_op_get_dest(ir, jq);
+        IROperand ssrc = tcc_ir_op_get_src1(ir, jq);
+        int32_t sdest_vr = irop_get_vreg(sdest);
+        int32_t ssrc_vr = irop_get_vreg(ssrc);
+        if (!ssrc.is_lval && sdest_vr >= 0 && ssrc_vr >= 0 &&
+            TCCIR_DECODE_VREG_TYPE(sdest_vr) == TCCIR_VREG_TYPE_VAR &&
+            TCCIR_DECODE_VREG_TYPE(ssrc_vr) == TCCIR_VREG_TYPE_TEMP)
+        {
+          for (int k = 0; k < alias_count; k++)
+          {
+            if (alias[k] == ssrc_vr)
+            {
+              if (alias_count >= ADDROF_VAR_MAX_ALIASES)
+              {
+                aborted = 1;
+              }
+              else
+              {
+                alias[alias_count++] = sdest_vr;
+                handled = 1;
+              }
+              break;
+            }
+          }
+        }
+      }
+
+      /* ASSIGN T_b <-- V_alias  (T_b becomes an alias holding &V_p).  The src
+       * carries is_lval=1 — this is "load the VAR's slot value", which holds
+       * the pointer.  Note: this is NOT a deref of the pointer, it's a load
+       * of the slot's contents — so we propagate the alias rather than the
+       * underlying constant. */
+      if (!handled && jq->op == TCCIR_OP_ASSIGN)
+      {
+        IROperand adest = tcc_ir_op_get_dest(ir, jq);
+        IROperand asrc = tcc_ir_op_get_src1(ir, jq);
+        int32_t adest_vr = irop_get_vreg(adest);
+        int32_t asrc_vr = irop_get_vreg(asrc);
+        if (adest_vr >= 0 && asrc_vr >= 0 &&
+            TCCIR_DECODE_VREG_TYPE(adest_vr) == TCCIR_VREG_TYPE_TEMP &&
+            TCCIR_DECODE_VREG_TYPE(asrc_vr) == TCCIR_VREG_TYPE_VAR &&
+            asrc.is_lval)
+        {
+          for (int k = 0; k < alias_count; k++)
+          {
+            if (alias[k] == asrc_vr)
+            {
+              if (alias_count >= ADDROF_VAR_MAX_ALIASES)
+              {
+                aborted = 1;
+              }
+              else
+              {
+                alias[alias_count++] = adest_vr;
+                handled = 1;
+              }
+              break;
+            }
+          }
+        }
+      }
+
+      if (handled)
+        continue;
+      if (aborted)
+        break;
+
+      /* Any redefinition of V_p or any tracked alias invalidates. VAR dest
+       * always has is_lval=1, so vreg comparison alone is the right check. */
+      if (irop_config[jq->op].has_dest)
+      {
+        IROperand d = tcc_ir_op_get_dest(ir, jq);
+        int32_t d_vr = irop_get_vreg(d);
+        if (d_vr == v_dest_vr)
+        {
+          aborted = 1;
+          break;
+        }
+        for (int k = 0; k < alias_count; k++)
+        {
+          if (d_vr == alias[k])
+          {
+            aborted = 1;
+            break;
+          }
+        }
+        if (aborted)
+          break;
+      }
+
+      /* Scan src1/src2 for uses of any tracked alias. */
+      for (int s = 0; s < 2 && !aborted; s++)
+      {
+        if (s == 0 && !irop_config[jq->op].has_src1)
+          continue;
+        if (s == 1 && !irop_config[jq->op].has_src2)
+          continue;
+        IROperand u = (s == 0) ? tcc_ir_op_get_src1(ir, jq) : tcc_ir_op_get_src2(ir, jq);
+        int32_t u_vr = irop_get_vreg(u);
+        if (u_vr < 0)
+          continue;
+
+        for (int k = 0; k < alias_count; k++)
+        {
+          if (u_vr != alias[k])
+            continue;
+          /* Rewrites are only safe when the alias is a TEMP and the read
+           * is a deref of the pointer it holds (T***DEREF*** == *(&V) == V).
+           * For VAR aliases, a read with is_lval=1 is a slot-load that
+           * returns the stored pointer value, NOT a deref — chain-extension
+           * (handled above) propagates the alias; if we reach here with a
+           * VAR alias the use isn't a recognized chain shape, so bail. */
+          if (TCCIR_DECODE_VREG_TYPE(u_vr) != TCCIR_VREG_TYPE_TEMP)
+          {
+            aborted = 1;
+            break;
+          }
+          if (!u.is_lval)
+          {
+            /* TEMP alias read as a value but the consuming op isn't one of
+             * our chain-extending shapes (already handled above). The
+             * address escapes — bail. */
+            aborted = 1;
+            break;
+          }
+          if (irop_get_btype(u) != v_btype)
+          {
+            aborted = 1;
+            break;
+          }
+          if (rewrite_count >= ADDROF_VAR_MAX_REWRITES)
+          {
+            aborted = 1;
+            break;
+          }
+          rewrites_idx[rewrite_count] = j;
+          rewrites_slot[rewrite_count] = s;
+          rewrite_count++;
+        }
+      }
+    }
+
+    if (aborted || rewrite_count == 0)
+      continue;
+
+    for (int r = 0; r < rewrite_count; r++)
+    {
+      int idx = rewrites_idx[r];
+      IROperand orig = (rewrites_slot[r] == 1) ? tcc_ir_get_src2(ir, idx) : tcc_ir_get_src1(ir, idx);
+      IROperand newop = irop_make_imm32(-1, imm_val, irop_get_btype(orig));
+      newop.is_unsigned = orig.is_unsigned;
+      if (rewrites_slot[r] == 1)
+        tcc_ir_set_src2(ir, idx, newop);
+      else
+        tcc_ir_set_src1(ir, idx, newop);
+      changes++;
+    }
+#undef ADDROF_VAR_MAX_REWRITES
+#undef ADDROF_VAR_MAX_ALIASES
+  }
+
+  return changes;
+}
+
+/* ============================================================================
+ * Global Store-Load Forwarding (tcc_ir_opt_global_sl_fwd)
+ * ============================================================================
+ *
+ * Within a single basic block, forward the value of a STORE to a GlobalSym
+ * into subsequent uses of the same global as an lval (deref) source operand:
+ *
+ *   STORE GlobalSym(X)***DEREF*** <-- T_val
+ *   ... (no call, no aliasing store) ...
+ *   T_new <-- GlobalSym(X)***DEREF*** ADD #C
+ *
+ *     becomes
+ *
+ *   STORE GlobalSym(X)***DEREF*** <-- T_val
+ *   ...
+ *   T_new <-- T_val ADD #C
+ *
+ * Distinct from cse_global_load (which only deduplicates LOAD ops between
+ * themselves and skips globals that are written) and from sl_forward (which
+ * tracks stack locals only).  Targets the read-modify-write chain pattern
+ * left after addrof_var_fwd collapses helper-inlined accumulator updates.
+ *
+ * Invalidation rules:
+ *   - any CALL clears all tracked entries (callee may write any global)
+ *   - a STORE through an unknown pointer clears all entries (alias unknown)
+ *   - a STORE to a different GlobalSym keeps entries (globals don't alias)
+ *   - a redefinition of the tracked T_val invalidates that entry
+ *   - any BB boundary clears all entries
+ */
+int tcc_ir_opt_global_sl_fwd(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  int changes = 0;
+
+  if (n < 2)
+    return 0;
+
+  /* Computed goto (IJUMP) can transfer control to any addr-taken label,
+   * but TCC doesn't mark those labels with is_jump_target.  Without that
+   * info, in-BB forwarding through fall-through into a label that's also
+   * an IJUMP target is unsafe.  Skip the whole function in that case. */
+  for (int i = 0; i < n; i++)
+    if (ir->compact_instructions[i].op == TCCIR_OP_IJUMP)
+      return 0;
+
+#define GSLFWD_MAX_ENTRIES 16
+  struct
+  {
+    Sym *sym;
+    int64_t addend;
+    int btype;
+    int32_t value_vr; /* vreg holding the stored value */
+  } entries[GSLFWD_MAX_ENTRIES];
+  int entry_count = 0;
+
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+
+    /* BB boundaries clear everything. */
+    if (q->is_jump_target || q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF || q->op == TCCIR_OP_IJUMP ||
+        q->op == TCCIR_OP_RETURNVALUE || q->op == TCCIR_OP_RETURNVOID || q->op == TCCIR_OP_SWITCH_TABLE)
+    {
+      entry_count = 0;
+      continue;
+    }
+    /* Calls may write any global. */
+    if (q->op == TCCIR_OP_FUNCCALLVOID || q->op == TCCIR_OP_FUNCCALLVAL)
+    {
+      entry_count = 0;
+      continue;
+    }
+
+    /* Rewrite eligible deref uses of any tracked global before processing
+     * this instruction's effect on the table.  Skip the dest slot — that
+     * one is the store destination, not a value read. */
+    if (q->op != TCCIR_OP_STORE && q->op != TCCIR_OP_STORE_INDEXED && q->op != TCCIR_OP_STORE_POSTINC)
+    {
+      for (int s = 0; s < 2; s++)
+      {
+        int has = (s == 0) ? irop_config[q->op].has_src1 : irop_config[q->op].has_src2;
+        if (!has)
+          continue;
+        IROperand u = (s == 0) ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_src2(ir, q);
+        if (!u.is_sym || !u.is_lval)
+          continue;
+        IRPoolSymref *uref = irop_get_symref_ex(ir, u);
+        if (!uref || !uref->sym)
+          continue;
+        int btype = irop_get_btype(u);
+        for (int k = 0; k < entry_count; k++)
+        {
+          if (entries[k].sym != uref->sym || entries[k].addend != uref->addend ||
+              entries[k].btype != btype)
+            continue;
+          IROperand newop = irop_make_vreg(entries[k].value_vr, btype);
+          newop.is_unsigned = u.is_unsigned;
+          if (s == 0)
+            tcc_ir_set_src1(ir, i, newop);
+          else
+            tcc_ir_set_src2(ir, i, newop);
+          changes++;
+          break;
+        }
+      }
+    }
+
+    /* Now handle this instruction's effect on the tracking table. */
+    if (q->op == TCCIR_OP_STORE)
+    {
+      IROperand dest = tcc_ir_op_get_dest(ir, q);
+      IROperand src1 = tcc_ir_op_get_src1(ir, q);
+
+      /* STORE to a GlobalSym: refresh that entry. */
+      if (dest.is_sym && dest.is_lval)
+      {
+        IRPoolSymref *dref = irop_get_symref_ex(ir, dest);
+        if (!dref || !dref->sym)
+          continue;
+        int dbtype = irop_get_btype(dest);
+        int32_t val_vr = irop_get_vreg(src1);
+        /* Only track when the source is a plain value vreg with no lval/sym
+         * flag (so the value is directly usable as a substitution).  And
+         * skip non-INT32 to match the conservative scope of the addrof_var
+         * pass — wider/FP types need more careful interval reasoning. */
+        if (val_vr < 0 || src1.is_lval || src1.is_sym || dbtype != IROP_BTYPE_INT32)
+        {
+          /* still invalidate any existing entry for this sym/addend */
+          for (int k = 0; k < entry_count;)
+          {
+            if (entries[k].sym == dref->sym && entries[k].addend == dref->addend)
+              entries[k] = entries[--entry_count];
+            else
+              k++;
+          }
+          continue;
+        }
+        /* Find existing entry to refresh, else append. */
+        int found = 0;
+        for (int k = 0; k < entry_count; k++)
+        {
+          if (entries[k].sym == dref->sym && entries[k].addend == dref->addend)
+          {
+            entries[k].btype = dbtype;
+            entries[k].value_vr = val_vr;
+            found = 1;
+            break;
+          }
+        }
+        if (!found && entry_count < GSLFWD_MAX_ENTRIES)
+        {
+          entries[entry_count].sym = dref->sym;
+          entries[entry_count].addend = dref->addend;
+          entries[entry_count].btype = dbtype;
+          entries[entry_count].value_vr = val_vr;
+          entry_count++;
+        }
+        continue;
+      }
+
+      /* STORE to a local stack slot is safe (can't alias globals).  Anything
+       * else (unknown pointer write) invalidates everything. */
+      if (!dest.is_local)
+      {
+        entry_count = 0;
+      }
+      continue;
+    }
+    if (q->op == TCCIR_OP_STORE_INDEXED || q->op == TCCIR_OP_STORE_POSTINC)
+    {
+      /* These could hit any address — invalidate. */
+      entry_count = 0;
+      continue;
+    }
+
+    /* If this op redefines a tracked value vreg, drop the entry. */
+    if (irop_config[q->op].has_dest)
+    {
+      IROperand d = tcc_ir_op_get_dest(ir, q);
+      int32_t d_vr = irop_get_vreg(d);
+      if (d_vr >= 0 && !d.is_lval)
+      {
+        for (int k = 0; k < entry_count;)
+        {
+          if (entries[k].value_vr == d_vr)
+            entries[k] = entries[--entry_count];
+          else
+            k++;
+        }
+      }
+    }
+  }
+
+  return changes;
+#undef GSLFWD_MAX_ENTRIES
+}
+
 int tcc_ir_opt_sl_forward_ex(IROptCtx *ctx) { return tcc_ir_opt_sl_forward(ctx->ir); }
 int tcc_ir_opt_deref_fwd_ex(IROptCtx *ctx) { return tcc_ir_opt_deref_fwd(ctx->ir); }
 int tcc_ir_opt_entry_store_prop_ex(IROptCtx *ctx) { return tcc_ir_opt_entry_store_prop(ctx->ir); }
 int tcc_ir_opt_store_redundant_ex(IROptCtx *ctx) { return tcc_ir_opt_store_redundant(ctx->ir); }
+int tcc_ir_opt_addrof_var_fwd_ex(IROptCtx *ctx) { return tcc_ir_opt_addrof_var_fwd(ctx->ir); }
+int tcc_ir_opt_global_sl_fwd_ex(IROptCtx *ctx) { return tcc_ir_opt_global_sl_fwd(ctx->ir); }

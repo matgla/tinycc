@@ -26151,12 +26151,20 @@ static void gen_function(Sym *sym)
    * into a direct constant.  Must run after SL-FWD has inlined helpers and
    * exposed the bare LEA+STORE+RETURNVALUE shape.  The local-addrof variant
    * handles the analogous pattern over a local VAR (callers that inline a
-   * `helper(&local)` body). */
+   * `helper(&local)` body).  addrof_var_fwd handles the read-through
+   * analogue: `ASSIGN V=#C; LEA T=&V; ... *T ...` → ... #C ... (the
+   * __attribute__((cleanup)) pattern). */
   if (tcc_state->opt_store_load_fwd && !ir->has_static_chain)
   {
     int padrof_changed = tcc_ir_opt_param_addrof_const_fold(ir) > 0;
     int ladrof_changed = tcc_ir_opt_local_addrof_const_fold(ir) > 0;
-    if (padrof_changed || ladrof_changed)
+    int aofvar_changed = 0;
+    int gslfwd_changed = 0;
+    if (tcc_state->opt_const_prop)
+      aofvar_changed = tcc_ir_opt_addrof_var_fwd(ir) > 0;
+    if (tcc_state->opt_store_load_fwd)
+      gslfwd_changed = tcc_ir_opt_global_sl_fwd(ir) > 0;
+    if (padrof_changed || ladrof_changed || aofvar_changed || gslfwd_changed)
     {
       if (tcc_state->opt_const_prop)
       {
@@ -27288,6 +27296,33 @@ static void gen_function(Sym *sym)
     sym->type.ref->f.func_auto_inline = 1;
   }
 
+  /* Post-optimization revoke: a function tagged auto_inline at registration
+   * (based on token-stream length) may still produce a large IR if its body
+   * is mostly calls to other helpers (cf. fail_u64 below: ~50 tokens but
+   * ~20 IR ops dominated by FUNCCALL pairs).  Inlining such a function at N
+   * call sites multiplies the call-heavy body by N for no real savings —
+   * GCC keeps these helpers out-of-line.  We count "expensive" IR ops
+   * (calls + control flow), and if the body looks call-heavy, demote it. */
+  if (ir && sym && sym->type.ref->f.func_auto_inline &&
+      !sym->a.nested_func &&
+      !sym->type.ref->f.func_alwinl &&
+      ir->next_instruction_index > 12)
+  {
+    int call_ops = 0;
+    for (int ii = 0; ii < ir->next_instruction_index; ii++)
+    {
+      int op = ir->compact_instructions[ii].op;
+      if (op == TCCIR_OP_FUNCCALLVAL || op == TCCIR_OP_FUNCCALLVOID)
+        call_ops++;
+    }
+    /* Threshold: >=3 calls or IR larger than ~24 ops marks the body as
+     * "too expensive to inline".  These functions remain regular calls. */
+    if (call_ops >= 3 || ir->next_instruction_index > 24)
+    {
+      sym->type.ref->f.func_auto_inline = 0;
+    }
+  }
+
   /* end of function */
   tcc_debug_funcend(tcc_state, ind - func_ind);
 
@@ -28095,7 +28130,8 @@ static int decl(int l)
            * short bodies (≤ 15 tokens) — longer bodies may trigger an IR
            * coalescing bug with narrowed locals. */
           int void_llong_limit = (auto_inline_sig_ok(sym) == 2) ? 15 : threshold;
-          if (fn->func_str && body_len <= void_llong_limit && !inline_body_has_apply_args(fn->func_str))
+          if (fn->func_str && body_len <= void_llong_limit && !inline_body_has_apply_args(fn->func_str) &&
+              !inline_body_has_loops(fn->func_str))
           {
             if (TCC_LOG_INLINE_STRUCT)
               fprintf(stderr, "[auto-inline] SMALL: registering %s as inline candidate\n",
@@ -28158,6 +28194,39 @@ static int decl(int l)
             }
             /* gen_function's post-opt check will revoke auto_inline
              * if the compiled IR exceeds 8 instructions. */
+            /* If auto_inline was revoked (either by had_nested_funcs above or
+             * by gen_function's post-opt size/call-count check), the function
+             * is already compiled standalone and won't be inlined at any
+             * callsite.  If the body is pure and within the eval-only cap,
+             * promote to func_eval_only_inline so try_inline_const_eval can
+             * still fold all-constant calls (mirrors the TOO-LARGE branch's
+             * retroactive promotion below).  Otherwise free the token stream
+             * so gen_inline_functions doesn't re-emit a duplicate body.
+             * Skip the promotion path when nested funcs revoked: token-replay
+             * cannot reproduce closure/trampoline semantics. */
+            if (!sym->type.ref->f.func_auto_inline)
+            {
+              int promote_eval_only = !tcc_state->had_nested_funcs && fn->func_str && body_len <= 160 &&
+                                      !inline_body_has_apply_args(fn->func_str) &&
+                                      !inline_body_has_side_effects(fn->func_str);
+              if (promote_eval_only)
+              {
+                sym->type.ref->f.func_eval_only_inline = 1;
+                /* VT_INLINE already set above for static; keep it set so
+                 * gen_inline_functions' eval-only skip branch catches us. */
+              }
+              else
+              {
+                if (is_static)
+                  sym->type.t &= ~VT_INLINE;
+                if (fn->func_str)
+                {
+                  tok_str_free(fn->func_str);
+                  fn->func_str = NULL;
+                }
+                fn->sym = NULL;
+              }
+            }
             if (TCC_LOG_INLINE_STRUCT)
               fprintf(stderr, "[auto-inline] SMALL: done compiling %s sym->c=%d\n",
                       get_tok_str(sym->v & ~SYM_FIELD, NULL), sym->c);

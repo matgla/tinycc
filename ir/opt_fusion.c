@@ -491,6 +491,356 @@ int tcc_ir_opt_postinc_fusion(TCCIRState *ir)
                is_load ? "LOAD" : "STORE", i, add_idx, is_load ? "LOAD" : "STORE", ptr_vr, offset);
   }
 
+  /* ---------------------------------------------------------------------------
+   * Reverse-order pattern: ADD new_ptr, ptr, #imm   ;   LOAD val, ptr
+   *
+   * The C idiom `c = *p++` is sometimes lowered as
+   *     new_ptr = ptr + 1
+   *     val     = *ptr            (uses pre-increment value)
+   * — i.e. the increment is emitted *before* the load even though the load
+   * uses the unincremented pointer.  The forward pass above only matches
+   * LOAD-then-ADD, so this form was missed entirely (see strncmp-style loops).
+   *
+   * We accept the reverse order under stricter constraints:
+   *   (1) `ptr` is a TEMP vreg, `new_ptr` is a different vreg.
+   *   (2) The LOAD is the next non-NOP instruction; no jump-target / control
+   *       flow / writes to ptr or new_ptr in between.
+   *   (3) `ptr` is dead after the LOAD (no later reads anywhere — a re-def
+   *       counts as killing the live range and is fine).
+   *   (4) The instruction slot immediately after the LOAD is a NOP we can
+   *       repurpose for the ASSIGN, which must be sequenced *after* the
+   *       LOAD_POSTINC (so it observes the hardware writeback).
+   *
+   * Transform:
+   *   ADD new_ptr, ptr, #imm   ->   NOP
+   *   LOAD val, ptr            ->   LOAD_POSTINC val, ptr, #imm
+   *   <NOP slot at load+1>     ->   ASSIGN new_ptr, ptr
+   * ------------------------------------------------------------------------ */
+  for (int i = 0; i < n - 1; i++)
+  {
+    IRQuadCompact *add_q = &ir->compact_instructions[i];
+    if (add_q->op != TCCIR_OP_ADD)
+      continue;
+
+    IROperand add_dest = tcc_ir_op_get_dest(ir, add_q);
+    IROperand add_s1 = tcc_ir_op_get_src1(ir, add_q);
+    IROperand add_s2 = tcc_ir_op_get_src2(ir, add_q);
+
+    LOG_IR_GEN("POSTINC FUSION (rev) try @%d: ADD dest_vr=%d local=%d is_temp=%d s1{vr=%d const=%d local=%d} s2{vr=%d const=%d local=%d}",
+               i, irop_get_vreg(add_dest), add_dest.is_local,
+               (irop_has_vreg(add_dest) && TCCIR_DECODE_VREG_TYPE(irop_get_vreg(add_dest)) == TCCIR_VREG_TYPE_TEMP),
+               irop_get_vreg(add_s1), add_s1.is_const, add_s1.is_local,
+               irop_get_vreg(add_s2), add_s2.is_const, add_s2.is_local);
+
+    /* (1) Identify ptr (vreg) + offset (immediate). */
+    IROperand ptr_op_local;
+    int32_t ptr_vr = -1;
+    int offset = 0;
+    if (irop_has_vreg(add_s1) && add_s2.is_const && !add_s2.is_sym)
+    {
+      ptr_op_local = add_s1;
+      ptr_vr = irop_get_vreg(add_s1);
+      offset = add_s2.u.imm32;
+    }
+    else if (irop_has_vreg(add_s2) && add_s1.is_const && !add_s1.is_sym)
+    {
+      ptr_op_local = add_s2;
+      ptr_vr = irop_get_vreg(add_s2);
+      offset = add_s1.u.imm32;
+    }
+    else
+    {
+      LOG_IR_GEN("POSTINC FUSION (rev) @%d: skip - no ptr+imm pattern", i);
+      continue;
+    }
+
+    if (ptr_vr < 0)
+      continue;
+    if (ptr_op_local.is_local)
+    {
+      LOG_IR_GEN("POSTINC FUSION (rev) @%d: skip - ptr is local vr=%d", i, ptr_vr);
+      continue;
+    }
+    if (TCCIR_DECODE_VREG_TYPE(ptr_vr) != TCCIR_VREG_TYPE_TEMP)
+    {
+      LOG_IR_GEN("POSTINC FUSION (rev) @%d: skip - ptr not TEMP vr=%d type=%d", i, ptr_vr, TCCIR_DECODE_VREG_TYPE(ptr_vr));
+      continue;
+    }
+    if (offset < 1 || offset > 255)
+    {
+      LOG_IR_GEN("POSTINC FUSION (rev) @%d: skip - bad offset %d", i, offset);
+      continue;
+    }
+
+    if (!irop_has_vreg(add_dest))
+      continue;
+    int32_t new_vr = irop_get_vreg(add_dest);
+    if (new_vr < 0 || new_vr == ptr_vr)
+    {
+      LOG_IR_GEN("POSTINC FUSION (rev) @%d: skip - bad new_vr=%d", i, new_vr);
+      continue;
+    }
+    LOG_IR_GEN("POSTINC FUSION (rev) @%d: candidate ptr_vr=%d new_vr=%d offset=%d", i, ptr_vr, new_vr, offset);
+
+    /* (2) Locate immediately-following LOAD on ptr_vr; bail on any
+     *     intervening touch of ptr_vr or new_vr or control flow. */
+    int load_idx = -1;
+    int unsafe = 0;
+    for (int j = i + 1; j < n && j < i + 10; j++)
+    {
+      IRQuadCompact *uq = &ir->compact_instructions[j];
+      if (uq->op == TCCIR_OP_NOP)
+        continue;
+
+      if (uq->is_jump_target || uq->op == TCCIR_OP_JUMP || uq->op == TCCIR_OP_JUMPIF || uq->op == TCCIR_OP_IJUMP)
+      {
+        LOG_IR_GEN("POSTINC FUSION (rev) @%d: unsafe at j=%d op=%d (jump/jt)", i, j, uq->op);
+        unsafe = 1;
+        break;
+      }
+
+      if (uq->op == TCCIR_OP_LOAD)
+      {
+        IROperand l_s1 = tcc_ir_op_get_src1(ir, uq);
+        IROperand l_d = tcc_ir_op_get_dest(ir, uq);
+        LOG_IR_GEN("POSTINC FUSION (rev) @%d: LOAD@%d s1_vr=%d d_vr=%d (need ptr_vr=%d)", i, j,
+                   irop_get_vreg(l_s1), irop_get_vreg(l_d), ptr_vr);
+        if (irop_has_vreg(l_s1) && irop_get_vreg(l_s1) == ptr_vr)
+        {
+          /* Loaded value must not alias ptr_vr or new_vr. */
+          if (irop_has_vreg(l_d))
+          {
+            int32_t l_d_vr = irop_get_vreg(l_d);
+            if (l_d_vr == ptr_vr || l_d_vr == new_vr)
+            {
+              LOG_IR_GEN("POSTINC FUSION (rev) @%d: skip - dest aliases ptr/new", i);
+              break;
+            }
+          }
+          load_idx = j;
+          break;
+        }
+      }
+
+      /* Any other touch of ptr_vr / new_vr in the gap is unsafe. */
+      if (irop_config[uq->op].has_src1)
+      {
+        IROperand s1 = tcc_ir_op_get_src1(ir, uq);
+        if (irop_has_vreg(s1))
+        {
+          int32_t v = irop_get_vreg(s1);
+          if (v == ptr_vr || v == new_vr)
+          {
+            unsafe = 1;
+            break;
+          }
+        }
+      }
+      if (irop_config[uq->op].has_src2)
+      {
+        IROperand s2 = tcc_ir_op_get_src2(ir, uq);
+        if (irop_has_vreg(s2))
+        {
+          int32_t v = irop_get_vreg(s2);
+          if (v == ptr_vr || v == new_vr)
+          {
+            unsafe = 1;
+            break;
+          }
+        }
+      }
+      if (irop_config[uq->op].has_dest)
+      {
+        IROperand d = tcc_ir_op_get_dest(ir, uq);
+        if (irop_has_vreg(d))
+        {
+          int32_t v = irop_get_vreg(d);
+          if (v == ptr_vr || v == new_vr)
+          {
+            unsafe = 1;
+            break;
+          }
+        }
+      }
+    }
+    if (load_idx < 0 || unsafe)
+    {
+      LOG_IR_GEN("POSTINC FUSION (rev) @%d: skip - load_idx=%d unsafe=%d", i, load_idx, unsafe);
+      continue;
+    }
+
+    /* (3) ptr_vr must be dead after the LOAD (no later reads).  A re-def
+     *     kills the live range — stop scanning at that point. */
+    int has_later_use = 0;
+    for (int k = load_idx + 1; k < n; k++)
+    {
+      IRQuadCompact *kq = &ir->compact_instructions[k];
+      if (kq->op == TCCIR_OP_NOP)
+        continue;
+
+      int killed = 0;
+      if (irop_config[kq->op].has_src1)
+      {
+        IROperand s1 = tcc_ir_op_get_src1(ir, kq);
+        if (irop_has_vreg(s1) && irop_get_vreg(s1) == ptr_vr)
+        {
+          has_later_use = 1;
+          break;
+        }
+      }
+      if (irop_config[kq->op].has_src2)
+      {
+        IROperand s2 = tcc_ir_op_get_src2(ir, kq);
+        if (irop_has_vreg(s2) && irop_get_vreg(s2) == ptr_vr)
+        {
+          has_later_use = 1;
+          break;
+        }
+      }
+      if (irop_config[kq->op].has_dest)
+      {
+        IROperand d = tcc_ir_op_get_dest(ir, kq);
+        if (irop_has_vreg(d) && irop_get_vreg(d) == ptr_vr)
+        {
+          killed = 1;
+        }
+      }
+      if (killed)
+        break;
+    }
+    if (has_later_use)
+    {
+      LOG_IR_GEN("POSTINC FUSION (rev) @%d: skip - ptr_vr=%d has later use", i, ptr_vr);
+      continue;
+    }
+
+    /* (3b) Walk ptr_vr's defining chain through ASSIGN/LOAD copies.  If the
+     *      root of the chain is a PARAM or other longer-lived vreg that is
+     *      still read after load_idx, refuse to fuse: copy-prop / regalloc
+     *      coalescing will share the register, and the HW writeback would
+     *      clobber that vreg's stored value.  This is the strncmp-vs-parse_int
+     *      distinction — strncmp's P0 is dead after V0=P0, parse_int's is not. */
+    {
+      int chain_vr = ptr_vr;
+      int chain_unsafe = 0;
+      for (int d = 0; d < 4; d++)
+      {
+        int def_idx = tcc_ir_find_defining_instruction(ir, chain_vr, i);
+        if (def_idx < 0)
+          break;
+        IRQuadCompact *def_q = &ir->compact_instructions[def_idx];
+        if (def_q->op != TCCIR_OP_ASSIGN && def_q->op != TCCIR_OP_LOAD)
+          break;
+        IROperand def_s1 = tcc_ir_op_get_src1(ir, def_q);
+        if (!irop_has_vreg(def_s1))
+          break;
+        int src_vr = irop_get_vreg(def_s1);
+        if (src_vr < 0 || src_vr == chain_vr)
+          break;
+        /* Does src_vr have a read after load_idx?  A re-def kills it. */
+        for (int k = load_idx + 1; k < n; k++)
+        {
+          IRQuadCompact *kq = &ir->compact_instructions[k];
+          if (kq->op == TCCIR_OP_NOP)
+            continue;
+          int seen_use = 0, seen_def = 0;
+          if (irop_config[kq->op].has_src1)
+          {
+            IROperand s1 = tcc_ir_op_get_src1(ir, kq);
+            if (irop_has_vreg(s1) && irop_get_vreg(s1) == src_vr)
+              seen_use = 1;
+          }
+          if (irop_config[kq->op].has_src2)
+          {
+            IROperand s2 = tcc_ir_op_get_src2(ir, kq);
+            if (irop_has_vreg(s2) && irop_get_vreg(s2) == src_vr)
+              seen_use = 1;
+          }
+          if (irop_config[kq->op].has_dest)
+          {
+            IROperand d = tcc_ir_op_get_dest(ir, kq);
+            if (irop_has_vreg(d) && irop_get_vreg(d) == src_vr)
+              seen_def = 1;
+          }
+          if (seen_use)
+          {
+            chain_unsafe = 1;
+            break;
+          }
+          if (seen_def)
+            break;
+        }
+        if (chain_unsafe)
+          break;
+        chain_vr = src_vr;
+      }
+      if (chain_unsafe)
+      {
+        LOG_IR_GEN("POSTINC FUSION (rev) @%d: skip - ptr_vr=%d derives from a vreg still live after LOAD@%d (regalloc may coalesce)",
+                   i, ptr_vr, load_idx);
+        continue;
+      }
+    }
+
+    /* (4) The LOAD must not itself be a branch target — we move it earlier. */
+    if (ir->compact_instructions[load_idx].is_jump_target)
+    {
+      LOG_IR_GEN("POSTINC FUSION (rev) @%d: skip - LOAD@%d is jump target", i, load_idx);
+      continue;
+    }
+
+    /* ---- Apply transformation ----
+     *
+     * Put LOAD_POSTINC at the ADD's slot (earlier) and ASSIGN at the LOAD's
+     * slot (later) so the ASSIGN is sequenced after the hardware writeback.
+     * Any NOPs between are untouched. is_jump_target of the ADD slot is
+     * preserved on what's now LOAD_POSTINC — safe because LOAD_POSTINC is
+     * the first instruction of the fused sequence.
+     */
+    IRQuadCompact *load_q_orig = &ir->compact_instructions[load_idx];
+    IROperand val_op = tcc_ir_op_get_dest(ir, load_q_orig);
+    IROperand ptr_op = tcc_ir_op_get_src1(ir, load_q_orig);
+
+    /* LOAD_POSTINC always dereferences implicitly; the src1 operand is the
+     * raw pointer register, not an lvalue.  If we left is_lval=1 (as it is
+     * on the LOAD's src1, signalling "deref this pointer"), the backend
+     * would emit an extra `ldr ip, [ptr]` to follow the lvalue chain,
+     * producing a wrong double-load.  Clear it here. */
+    IROperand ptr_base = ptr_op;
+    ptr_base.is_lval = 0;
+
+    int new_load_base = ir->iroperand_pool_count;
+    tcc_ir_pool_add(ir, IROP_NONE);
+    tcc_ir_pool_add(ir, IROP_NONE);
+    tcc_ir_pool_add(ir, IROP_NONE);
+    tcc_ir_pool_add(ir, IROP_NONE);
+
+    /* ADD slot becomes LOAD_POSTINC. */
+    add_q->op = TCCIR_OP_LOAD_POSTINC;
+    add_q->operand_base = new_load_base;
+    ir->iroperand_pool[new_load_base + 0] = val_op;
+    ir->iroperand_pool[new_load_base + 1] = ptr_base;
+    ir->iroperand_pool[new_load_base + 2] = IROP_NONE;
+    ir->iroperand_pool[new_load_base + 3] = irop_make_imm32(-1, offset, IROP_BTYPE_INT32);
+
+    /* LOAD slot becomes ASSIGN new_ptr, ptr (post-writeback). */
+    int new_assign_base = ir->iroperand_pool_count;
+    tcc_ir_pool_add(ir, IROP_NONE);
+    tcc_ir_pool_add(ir, IROP_NONE);
+    tcc_ir_pool_add(ir, IROP_NONE);
+
+    load_q_orig->op = TCCIR_OP_ASSIGN;
+    load_q_orig->operand_base = new_assign_base;
+    ir->iroperand_pool[new_assign_base + 0] = add_dest;
+    ir->iroperand_pool[new_assign_base + 1] = ptr_base;
+    ir->iroperand_pool[new_assign_base + 2] = IROP_NONE;
+
+    changes++;
+
+    LOG_IR_GEN("POSTINC FUSION (rev): ADD@%d + LOAD@%d -> LOAD_POSTINC@%d + ASSIGN@%d (ptr_vr=%d new_vr=%d offset=%d)",
+               i, load_idx, i, load_idx, ptr_vr, new_vr, offset);
+  }
+
   LOG_IR_GEN("=== POSTINC FUSION END: %d fusions ===", changes);
 
   return changes;
