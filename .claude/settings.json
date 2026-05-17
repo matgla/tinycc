@@ -143,7 +143,8 @@
       "Bash(./armv8m-tcc -dump-ir -O1 -c tests/ir_tests/../gcctestsuite/gcc-testsuite/gcc/testsuite/gcc.c-torture/execute/20080424-1.c)",
       "Bash(awk '/IR AFTER OPTIMIZATIONS/{found=1} found{print; if\\(/END IR AFTER/\\){found=0}}')",
       "Bash(./armv8m-tcc -dump-ir -O1 -c tests/ir_tests/../gcctestsuite/gcc-testsuite/gcc.c-torture/execute/20080424-1.c)",
-      "Bash(awk '/IR AFTER LOOP ROTATION/{n++} n==1{print}')"
+      "Bash(awk '/IR AFTER LOOP ROTATION/{n++} n==1{print}')",
+      "Bash(./armv8m-tcc -dump-ir -O2 -c /tmp/min7.c)"
     ]
   }
 }
