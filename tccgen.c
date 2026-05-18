@@ -433,6 +433,7 @@ static const FoldableMathFunc foldable_math_funcs[] = {
     {"fabs", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = fabs}},
     {"fmod", 2, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f2_d = fmod}},
     {"remainder", 2, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f2_d = remainder}},
+    {"copysign", 2, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f2_d = copysign}},
 
     /* Single-precision functions */
     {"sinf", 1, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f1_f = sinf}},
@@ -458,6 +459,7 @@ static const FoldableMathFunc foldable_math_funcs[] = {
     {"fabsf", 1, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f1_f = fabsf}},
     {"fmodf", 2, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f2_f = fmodf}},
     {"remainderf", 2, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f2_f = remainderf}},
+    {"copysignf", 2, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f2_f = copysignf}},
 };
 
 #define NUM_FOLDABLE_MATH_FUNCS (sizeof(foldable_math_funcs) / sizeof(foldable_math_funcs[0]))
@@ -15779,13 +15781,33 @@ static void __attribute__((noinline)) unary_builtin_fp(void)
     int tok1 = tok;
     parse_builtin_params(0, "ee");
 
-    /* For __builtin_copysign(x, y), we need to call copysign(x, y)
-     * which returns a value with the magnitude of x and the sign of y.
-     * We generate a call to the standard library function. */
-
-    /* Get the type of the first argument to determine which variant to use */
     int arg_bt = vtop[-1].type.t & VT_BTYPE;
     int is_float = (arg_bt == VT_FLOAT) || (tok1 == TOK_builtin_copysignf);
+
+    if (is_const_for_folding(&vtop[-1]) && is_const_for_folding(&vtop[0]))
+    {
+      if (is_float)
+      {
+        float mag = get_const_float(&vtop[-1]);
+        float sgn = get_const_float(&vtop[0]);
+        float res = copysignf(mag, sgn);
+        vtop--;
+        vtop->c.f = res;
+        vtop->type.t = VT_FLOAT;
+        vtop->r = VT_CONST;
+      }
+      else
+      {
+        double mag = get_const_double(&vtop[-1]);
+        double sgn = get_const_double(&vtop[0]);
+        double res = copysign(mag, sgn);
+        vtop--;
+        vtop->c.d = res;
+        vtop->type.t = VT_DOUBLE;
+        vtop->r = VT_CONST;
+      }
+      break;
+    }
 
     /* Ensure both arguments match the target precision.  For
      * __builtin_copysignf the standard says the result is float, so both
@@ -16285,6 +16307,18 @@ static void __attribute__((noinline)) unary_builtin_fp2(void)
   case TOK_builtin_copysignl:
   {
     parse_builtin_params(0, "ee");
+
+    if (is_const_for_folding(&vtop[-1]) && is_const_for_folding(&vtop[0]))
+    {
+      double mag = get_const_double(&vtop[-1]);
+      double sgn = get_const_double(&vtop[0]);
+      double res = copysign(mag, sgn);
+      vtop--;
+      vtop->c.ld = res;
+      vtop->type.t = VT_LDOUBLE;
+      vtop->r = VT_CONST;
+      break;
+    }
 
     /* On ARM, long double == double, so just call copysign */
 
@@ -16870,6 +16904,106 @@ static void __attribute__((noinline)) unary_builtin_fp2(void)
     }
     break;
   }
+  }
+}
+
+/* __builtin_modff / __builtin_modf / __builtin_modfl
+ * Signature: float modff(float x, float *iptr)
+ *            double modf(double x, double *iptr)
+ * Returns the fractional part; stores the integer part through *iptr. */
+static void __attribute__((noinline)) unary_builtin_modf(void)
+{
+  int tok1 = tok;
+  next();
+  skip('(');
+  expr_eq();
+  convert_parameter_type(&vtop->type);
+  skip(',');
+  expr_eq();
+  convert_parameter_type(&vtop->type);
+  skip(')');
+
+  /* vstack: [..., value, pointer] */
+
+  int is_float = (tok1 == TOK_builtin_modff);
+
+  /* Try constant folding when the value argument is a compile-time constant */
+  if (is_const_for_folding(&vtop[-1]))
+  {
+    CValue ipart_cv, frac_cv;
+    memset(&ipart_cv, 0, sizeof(ipart_cv));
+    memset(&frac_cv, 0, sizeof(frac_cv));
+    int ret_bt;
+
+    if (is_float)
+    {
+      float val = get_const_float(&vtop[-1]);
+      float ipart;
+      float frac = modff(val, &ipart);
+      ipart_cv.f = ipart;
+      frac_cv.f = frac;
+      ret_bt = VT_FLOAT;
+    }
+    else
+    {
+      double val = get_const_double(&vtop[-1]);
+      double ipart;
+      double frac = modf(val, &ipart);
+      if (tok1 == TOK_builtin_modfl)
+      {
+        ipart_cv.ld = ipart;
+        frac_cv.ld = frac;
+        ret_bt = VT_LDOUBLE;
+      }
+      else
+      {
+        ipart_cv.d = ipart;
+        frac_cv.d = frac;
+        ret_bt = VT_DOUBLE;
+      }
+    }
+
+    /* Store the integer part through the pointer:
+     * vtop[0] = pointer, dereference it and store the constant */
+    SValue ptr_sv = vtop[0];
+    vtop--;            /* pop pointer, value is now on top */
+    vtop[0] = ptr_sv;  /* replace value with pointer */
+    indir();           /* dereference: pointer → lvalue */
+
+    CType ct;
+    ct.t = ret_bt;
+    ct.ref = NULL;
+    vsetc(&ct, VT_CONST, &ipart_cv); /* push the integer part constant */
+    vstore();          /* store integer part to *iptr */
+    vpop();            /* pop stored value left by vstore */
+
+    /* Push the fractional part as the result */
+    CType rt;
+    rt.t = ret_bt;
+    rt.ref = NULL;
+    vsetc(&rt, VT_CONST, &frac_cv);
+  }
+  else
+  {
+    /* Runtime: emit a call to modff/modf/modfl */
+    const char *func_name;
+    int ret_type;
+    if (tok1 == TOK_builtin_modff)
+    {
+      func_name = "modff";
+      ret_type = VT_FLOAT;
+    }
+    else if (tok1 == TOK_builtin_modf)
+    {
+      func_name = "modf";
+      ret_type = VT_DOUBLE;
+    }
+    else
+    {
+      func_name = "modfl";
+      ret_type = VT_LDOUBLE;
+    }
+    gen_builtin_libcall(tok_alloc_const(func_name), 2, ret_type);
   }
 }
 
@@ -19487,6 +19621,11 @@ tok_next:
   case TOK_builtin_bswap32:
   case TOK_builtin_bswap64:
     unary_builtin_fp2();
+    break;
+  case TOK_builtin_modff:
+  case TOK_builtin_modf:
+  case TOK_builtin_modfl:
+    unary_builtin_modf();
     break;
   case TOK_builtin_add_overflow:
   case TOK_builtin_sub_overflow:

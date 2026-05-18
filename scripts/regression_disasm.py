@@ -158,6 +158,10 @@ DISASM_SKIP_TESTS = {
     # execute tests requiring -std=gnu89
     "gcc-execute/920415-1",
     "gcc-execute/920728-1",
+    # execute tests requiring -std=c2y (not supported by all arm-none-eabi-gcc versions)
+    "gcc-execute/uabs-1",
+    "gcc-execute/uabs-2",
+    "gcc-execute/uabs-3",
 }
 
 TRACE_TESTS = {"memcpy-a1", "memcpy-a2", "memcpy-a4", "memcpy-a8", "memclr"}

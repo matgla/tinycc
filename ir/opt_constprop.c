@@ -2267,7 +2267,7 @@ int tcc_ir_opt_value_tracking(TCCIRState *ir)
                        ? TCCIR_DECODE_VREG_POSITION(dest_vr)
                        : -1;
 
-    /* LEA tracking: T = &V — record that TMP T points to VAR V */
+    /* LEA tracking: T = &V+offset — record that TMP T points to VAR V at given offset */
     if (q->op == TCCIR_OP_LEA)
     {
       int32_t src1_vr = irop_get_vreg(src1);
@@ -2713,6 +2713,33 @@ int tcc_ir_opt_value_tracking(TCCIRState *ir)
       }
     }
 
+    /* Pattern 2c: FUNCPARAMVAL with known-constant VAR src → replace with immediate.
+     * When modf/copysign folding stores a compile-time constant to a local
+     * via LEA+STORE, the subsequent FUNCPARAMVAL that passes that local by
+     * value can substitute the tracked constant directly. */
+    if (q->op == TCCIR_OP_FUNCPARAMVAL)
+    {
+      int32_t src1_vr = irop_get_vreg(src1);
+      if (src1_vr >= 0 && TCCIR_DECODE_VREG_TYPE(src1_vr) == TCCIR_VREG_TYPE_VAR)
+      {
+        int src1_pos = TCCIR_DECODE_VREG_POSITION(src1_vr);
+        if (src1_pos >= 0 && src1_pos <= max_vreg && VT_IS_CONST(state, src1_pos))
+        {
+          int64_t val = state[src1_pos].value;
+          int btype = irop_get_btype(src1);
+          if (val == (int32_t)val)
+            tcc_ir_set_src1(ir, i, irop_make_imm32(-1, (int32_t)val, btype));
+          else
+          {
+            uint32_t pool_idx = tcc_ir_pool_add_i64(ir, val);
+            tcc_ir_set_src1(ir, i, irop_make_i64(-1, pool_idx, btype));
+          }
+          LOG_IR_GEN("VALUE_TRACK PARAM-FOLD: i=%d V%d -> #%lld", i, src1_pos, (long long)val);
+          changes++;
+        }
+      }
+    }
+
     /* Pattern 3: CMP with constant vreg - FOLD IT */
     if (q->op == TCCIR_OP_CMP && i + 1 < n)
     {
@@ -3010,6 +3037,69 @@ int tcc_ir_opt_value_tracking(TCCIRState *ir)
                 tcc_ir_set_src2(ir, i, IROP_NONE);
                 LOG_IR_GEN("VALUE_TRACK: %s(%lld, %lld) = %lld at i=%d -> folded", fname, (long long)val0,
                            (long long)val1, (long long)result, i);
+                changes++;
+                continue;
+              }
+            }
+          }
+        }
+        /* Constant-fold __aeabi_cfcmple/cdcmple with known constant args (FUNCCALLVAL variant). */
+        {
+          int is_fcmp = (fname && (strcmp(fname, "__aeabi_cfcmple") == 0 || strcmp(fname, "__aeabi_cfcmpeq") == 0));
+          int is_dcmp = (fname && (strcmp(fname, "__aeabi_cdcmple") == 0 || strcmp(fname, "__aeabi_cdcmpeq") == 0));
+          if (is_fcmp || is_dcmp)
+          {
+            IROperand arg0, arg1;
+            if (ir_opt_get_call_param_operand(ir, i, 0, &arg0) && ir_opt_get_call_param_operand(ir, i, 1, &arg1))
+            {
+              int64_t a0 = 0, a1 = 0;
+              int a0_ok = irop_is_immediate(arg0), a1_ok = irop_is_immediate(arg1);
+              if (a0_ok) a0 = irop_get_imm64_ex(ir, arg0);
+              if (a1_ok) a1 = irop_get_imm64_ex(ir, arg1);
+              if (!a0_ok)
+              {
+                int32_t vr = irop_get_vreg(arg0);
+                if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR)
+                {
+                  int p = TCCIR_DECODE_VREG_POSITION(vr);
+                  if (p >= 0 && p <= max_vreg && VT_IS_CONST(state, p))
+                  { a0 = state[p].value; a0_ok = 1; }
+                }
+              }
+              if (!a1_ok)
+              {
+                int32_t vr = irop_get_vreg(arg1);
+                if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR)
+                {
+                  int p = TCCIR_DECODE_VREG_POSITION(vr);
+                  if (p >= 0 && p <= max_vreg && VT_IS_CONST(state, p))
+                  { a1 = state[p].value; a1_ok = 1; }
+                }
+              }
+              if (a0_ok && a1_ok)
+              {
+                int result;
+                if (is_fcmp)
+                {
+                  union { float f; uint32_t u; } fa, fb;
+                  fa.u = (uint32_t)a0;
+                  fb.u = (uint32_t)a1;
+                  result = (fa.f > fb.f) - (fa.f < fb.f);
+                }
+                else
+                {
+                  union { double d; uint64_t u; } da, db;
+                  da.u = (uint64_t)a0;
+                  db.u = (uint64_t)a1;
+                  result = (da.d > db.d) - (da.d < db.d);
+                }
+                IROperand call_dest = tcc_ir_op_get_dest(ir, q);
+                ir_opt_nop_call_params(ir, i);
+                q->op = TCCIR_OP_ASSIGN;
+                tcc_ir_set_dest(ir, i, call_dest);
+                tcc_ir_set_src1(ir, i, irop_make_imm32(-1, result, IROP_BTYPE_INT32));
+                tcc_ir_set_src2(ir, i, IROP_NONE);
+                LOG_IR_GEN("VALUE_TRACK: %s -> %d at i=%d (float cmp fold)", fname, result, i);
                 changes++;
                 continue;
               }
@@ -3316,6 +3406,16 @@ int tcc_ir_opt_value_tracking(TCCIRState *ir)
             sf_nargs = 1;
             sf_kind = 12;
           }
+          else if (strcmp(sf, "copysignf") == 0 || strcmp(sf, "__copysignf") == 0)
+          {
+            sf_nargs = 2;
+            sf_kind = 15;
+          }
+          else if (strcmp(sf, "copysign") == 0 || strcmp(sf, "__copysign") == 0)
+          {
+            sf_nargs = 2;
+            sf_kind = 16;
+          }
 
           if (sf_kind)
           {
@@ -3584,6 +3684,26 @@ int tcc_ir_opt_value_tracking(TCCIRState *ir)
                   folded = 1;
                 }
                 break;
+                case 15:
+                { /* copysignf */
+                  union { float f; uint32_t u; } fa, fb, fr;
+                  fa.u = (uint32_t)a0;
+                  fb.u = (uint32_t)a1;
+                  fr.f = copysignf(fa.f, fb.f);
+                  result = (int64_t)(int32_t)fr.u;
+                  folded = 1;
+                }
+                break;
+                case 16:
+                { /* copysign (double) */
+                  union { double d; uint64_t u; } da, db, dr;
+                  da.u = (uint64_t)a0;
+                  db.u = (uint64_t)a1;
+                  dr.d = copysign(da.d, db.d);
+                  result = (int64_t)dr.u;
+                  folded = 1;
+                }
+                break;
                 }
 
               if (folded)
@@ -3621,6 +3741,91 @@ int tcc_ir_opt_value_tracking(TCCIRState *ir)
                   }
                 }
                 LOG_IR_GEN("VALUE_TRACK: %s -> %lld at i=%d (soft-float fold)", sf, (long long)result, i);
+                changes++;
+                continue;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    /* Constant-fold __aeabi_cfcmple/cdcmple VOID calls + subsequent JUMPIF.
+     * These set CPU flags; when both args are known constants, replace the
+     * call+jumpif pair with an unconditional jump or nop. */
+    if (q->op == TCCIR_OP_FUNCCALLVOID && i + 1 < n)
+    {
+      IRQuadCompact *next_q = &ir->compact_instructions[i + 1];
+      if (next_q->op == TCCIR_OP_JUMPIF)
+      {
+        Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+        if (callee)
+        {
+          const char *fname = get_tok_str(callee->v, NULL);
+          int is_fcmp = (fname && (strcmp(fname, "__aeabi_cfcmple") == 0 || strcmp(fname, "__aeabi_cfcmpeq") == 0));
+          int is_dcmp = (fname && (strcmp(fname, "__aeabi_cdcmple") == 0 || strcmp(fname, "__aeabi_cdcmpeq") == 0));
+          if (is_fcmp || is_dcmp)
+          {
+            IROperand arg0, arg1;
+            if (ir_opt_get_call_param_operand(ir, i, 0, &arg0) && ir_opt_get_call_param_operand(ir, i, 1, &arg1))
+            {
+              int64_t a0 = 0, a1 = 0;
+              int a0_ok = irop_is_immediate(arg0), a1_ok = irop_is_immediate(arg1);
+              if (a0_ok) a0 = irop_get_imm64_ex(ir, arg0);
+              if (a1_ok) a1 = irop_get_imm64_ex(ir, arg1);
+              if (!a0_ok)
+              {
+                int32_t vr = irop_get_vreg(arg0);
+                if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR)
+                {
+                  int p = TCCIR_DECODE_VREG_POSITION(vr);
+                  if (p >= 0 && p <= max_vreg && VT_IS_CONST(state, p))
+                  { a0 = state[p].value; a0_ok = 1; }
+                }
+              }
+              if (!a1_ok)
+              {
+                int32_t vr = irop_get_vreg(arg1);
+                if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR)
+                {
+                  int p = TCCIR_DECODE_VREG_POSITION(vr);
+                  if (p >= 0 && p <= max_vreg && VT_IS_CONST(state, p))
+                  { a1 = state[p].value; a1_ok = 1; }
+                }
+              }
+              if (a0_ok && a1_ok)
+              {
+                int cmp_result;
+                if (is_fcmp)
+                {
+                  union { float f; uint32_t u; } fa, fb;
+                  fa.u = (uint32_t)a0;
+                  fb.u = (uint32_t)a1;
+                  cmp_result = (fa.f > fb.f) - (fa.f < fb.f);
+                }
+                else
+                {
+                  union { double d; uint64_t u; } da, db;
+                  da.u = (uint64_t)a0;
+                  db.u = (uint64_t)a1;
+                  cmp_result = (da.d > db.d) - (da.d < db.d);
+                }
+
+                IROperand cond = tcc_ir_op_get_src1(ir, next_q);
+                int tok = (int)irop_get_imm64_ex(ir, cond);
+                int branch_taken = evaluate_compare_condition(cmp_result, 0, tok);
+
+                ir_opt_nop_call_params(ir, i);
+                q->op = TCCIR_OP_NOP;
+                if (branch_taken)
+                {
+                  IROperand jmp_dest = tcc_ir_op_get_dest(ir, next_q);
+                  next_q->op = TCCIR_OP_JUMP;
+                  tcc_ir_set_dest(ir, i + 1, jmp_dest);
+                }
+                else
+                  next_q->op = TCCIR_OP_NOP;
+                LOG_IR_GEN("VALUE_TRACK: %s fold -> cmp=%d branch=%d at i=%d", fname, cmp_result, branch_taken, i);
                 changes++;
                 continue;
               }
@@ -4026,6 +4231,66 @@ int tcc_ir_opt_const_prop_tmp(TCCIRState *ir)
       }
     }
 
+    /* Fold __aeabi_cfcmple/cdcmple VOID calls + JUMPIF when TMP propagation
+     * has made both PARAM args immediate. */
+    if (q->op == TCCIR_OP_FUNCCALLVOID && i + 1 < n)
+    {
+      IRQuadCompact *next_q = &ir->compact_instructions[i + 1];
+      if (next_q->op == TCCIR_OP_JUMPIF)
+      {
+        Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+        if (callee)
+        {
+          const char *fn = get_tok_str(callee->v, NULL);
+          int is_fcmp = (fn && (strcmp(fn, "__aeabi_cfcmple") == 0 || strcmp(fn, "__aeabi_cfcmpeq") == 0));
+          int is_dcmp = (fn && (strcmp(fn, "__aeabi_cdcmple") == 0 || strcmp(fn, "__aeabi_cdcmpeq") == 0));
+          if (is_fcmp || is_dcmp)
+          {
+            IROperand arg0, arg1;
+            if (ir_opt_get_call_param_operand(ir, i, 0, &arg0) && ir_opt_get_call_param_operand(ir, i, 1, &arg1))
+            {
+              if (irop_is_immediate(arg0) && irop_is_immediate(arg1))
+              {
+                int64_t a0 = irop_get_imm64_ex(ir, arg0);
+                int64_t a1 = irop_get_imm64_ex(ir, arg1);
+                int cmp_result;
+                if (is_fcmp)
+                {
+                  union { float f; uint32_t u; } fa, fb;
+                  fa.u = (uint32_t)a0;
+                  fb.u = (uint32_t)a1;
+                  cmp_result = (fa.f > fb.f) - (fa.f < fb.f);
+                }
+                else
+                {
+                  union { double d; uint64_t u; } da, db;
+                  da.u = (uint64_t)a0;
+                  db.u = (uint64_t)a1;
+                  cmp_result = (da.d > db.d) - (da.d < db.d);
+                }
+                IROperand cond = tcc_ir_op_get_src1(ir, next_q);
+                int tok = (int)irop_get_imm64_ex(ir, cond);
+                int branch_taken = evaluate_compare_condition(cmp_result, 0, tok);
+                ir_opt_nop_call_params(ir, i);
+                q->op = TCCIR_OP_NOP;
+                if (branch_taken)
+                {
+                  IROperand jmp_dest = tcc_ir_op_get_dest(ir, next_q);
+                  next_q->op = TCCIR_OP_JUMP;
+                  tcc_ir_set_dest(ir, i + 1, jmp_dest);
+                }
+                else
+                  next_q->op = TCCIR_OP_NOP;
+                changes++;
+                current_gen++;
+                continue;
+              }
+            }
+          }
+        }
+      }
+    }
+
     /* Clear all at basic block boundaries - O(1) via generation bump */
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF || q->op == TCCIR_OP_FUNCCALLVOID ||
         q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_RETURNVALUE || q->op == TCCIR_OP_RETURNVOID)
@@ -4038,7 +4303,7 @@ int tcc_ir_opt_const_prop_tmp(TCCIRState *ir)
     IROperand dest = tcc_ir_op_get_dest(ir, q);
     int32_t dest_vr = irop_get_vreg(dest);
     if (irop_config[q->op].has_dest && TCCIR_DECODE_VREG_TYPE(dest_vr) == TCCIR_VREG_TYPE_TEMP &&
-        q->op == TCCIR_OP_ASSIGN)
+        (q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_CVT_FTOF))
     {
       const int pos = TCCIR_DECODE_VREG_POSITION(dest_vr);
       IROperand cur_src1 = tcc_ir_op_get_src1(ir, q);
