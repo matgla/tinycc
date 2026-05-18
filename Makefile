@@ -618,9 +618,9 @@ warn-check: armv8m-tcc$(EXESUF)
 test: cross test-aeabi-host test-asm warn-check test-venv test-prepare download-gcc-tests ut
 	@echo "------------ ir_tests (pytest) ------------"
 	@if [ "$(USE_VENV)" = "1" ]; then \
-		cd $(IRTESTS_DIR) && "$(VENV_PY)" -m pytest -s -n $(J); \
+		cd $(IRTESTS_DIR) && "$(VENV_PY)" -m pytest -s -n $(J) --durations=10; \
 	else \
-		cd $(IRTESTS_DIR) && $(PYTEST) -s -n $(J); \
+		cd $(IRTESTS_DIR) && $(PYTEST) -s -n $(J) --durations=10; \
 	fi
 
 # legacy tests (kept for reference)

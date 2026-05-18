@@ -63,9 +63,10 @@ _TCC_INCLUDE_FLAGS = [
 ]
 
 
-def compile_tcc(src, output, tcc=None, opt="-O2"):
+def compile_tcc(src, output, tcc=None, opt="-O2", extra_flags=None):
     tcc = tcc or get_tcc_path()
-    return run([str(tcc), opt, *_TCC_INCLUDE_FLAGS, "-c", str(src), "-o", str(output)])
+    ef = extra_flags.split() if extra_flags else []
+    return run([str(tcc), opt, *ef, *_TCC_INCLUDE_FLAGS, "-c", str(src), "-o", str(output)])
 
 
 def compile_gcc(src, output, opt="-O2", extra_flags=None):

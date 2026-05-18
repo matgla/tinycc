@@ -10005,17 +10005,22 @@ ST_FUNC void vstore(void)
      * propagation, DCE) instead of hiding them behind an opaque memmove
      * call.  Fall through to the memmove path for large, misaligned,
      * VLA, or non-local structs. */
+#define IS_GLOBAL_LVAL(r) \
+  (((r) & (VT_VALMASK | VT_LVAL | VT_SYM)) == (VT_CONST | VT_LVAL | VT_SYM))
     if (tcc_state->ir && !has_vla && size <= 32 && !(size & 3) && !(align & 3) &&
-        (vtop[0].r & (VT_VALMASK | VT_LVAL)) == (VT_LOCAL | VT_LVAL) &&
-        (vtop[-1].r & (VT_VALMASK | VT_LVAL)) == (VT_LOCAL | VT_LVAL) && !NOEVAL_WANTED)
+        (((vtop[0].r & (VT_VALMASK | VT_LVAL)) == (VT_LOCAL | VT_LVAL) &&
+          (vtop[-1].r & (VT_VALMASK | VT_LVAL)) == (VT_LOCAL | VT_LVAL)) ||
+         (IS_GLOBAL_LVAL(vtop[0].r) && IS_GLOBAL_LVAL(vtop[-1].r))) &&
+        !NOEVAL_WANTED)
     {
       SValue src = vtop[0];
       SValue dst = vtop[-1];
       vtop--; /* pop src; vtop = dst (kept as result lvalue) */
 
-      /* NRVO same-slot fast-path: src and dst at the same offset means
-       * the call already wrote the result into the destination. */
-      if (src.c.i == dst.c.i)
+      /* NRVO same-slot fast-path (locals only): src and dst at the
+       * same stack offset means the call already wrote into dst. */
+      if ((src.r & VT_VALMASK) == VT_LOCAL &&
+          (dst.r & VT_VALMASK) == VT_LOCAL && src.c.i == dst.c.i)
       {
         vtop->type = saved_struct_type;
         goto vstore_done;
@@ -10030,8 +10035,9 @@ ST_FUNC void vstore(void)
         SValue s, d, tmp;
         svalue_init(&s);
         s.type = word_type;
-        s.r = VT_LOCAL | VT_LVAL;
+        s.r = src.r;
         s.vr = src.vr;
+        s.sym = src.sym;
         s.c.i = src.c.i + off;
 
         svalue_init(&tmp);
@@ -10043,8 +10049,9 @@ ST_FUNC void vstore(void)
 
         svalue_init(&d);
         d.type = word_type;
-        d.r = VT_LOCAL | VT_LVAL;
+        d.r = dst.r;
         d.vr = dst.vr;
+        d.sym = dst.sym;
         d.c.i = dst.c.i + off;
 
         tcc_ir_put(tcc_state->ir, TCCIR_OP_STORE, &tmp, NULL, &d);
@@ -10053,6 +10060,7 @@ ST_FUNC void vstore(void)
       vtop->type = saved_struct_type;
       goto vstore_done;
     }
+#undef IS_GLOBAL_LVAL
 
     /* destination, keep on stack() as result */
     vpushv(vtop - 1);

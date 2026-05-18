@@ -712,6 +712,14 @@ int tcc_ir_opt_cse_global_load(TCCIRState *ir)
  */
 #define GSYM_CSE_MAX 16
 
+typedef struct
+{
+  Sym *sym;
+  int64_t addend;
+  int count;
+  int has_lval;
+} GSymEntry;
+
 /* Helper: insert instruction before `before_idx`, shift array, patch jumps.
  * Returns the index where the instruction was inserted (-1 on failure). */
 int gsym_cse_insert_before(TCCIRState *ir, int before_idx, IRQuadCompact *new_q)
@@ -758,6 +766,34 @@ int gsym_cse_insert_before(TCCIRState *ir, int before_idx, IRQuadCompact *new_q)
   return before_idx;
 }
 
+static void gsym_cse_count(TCCIRState *ir, IROperand op, GSymEntry *entries, int *num_entries)
+{
+  if (irop_get_tag(op) != IROP_TAG_SYMREF)
+    return;
+  IRPoolSymref *sr = irop_get_symref_ex(ir, op);
+  if (!sr || !sr->sym)
+    return;
+  for (int e = 0; e < *num_entries; e++)
+  {
+    if (entries[e].sym == sr->sym && entries[e].addend == sr->addend)
+    {
+      if (op.is_lval)
+        entries[e].has_lval = 1;
+      else
+        entries[e].count++;
+      return;
+    }
+  }
+  if (*num_entries < GSYM_CSE_MAX)
+  {
+    entries[*num_entries].sym = sr->sym;
+    entries[*num_entries].addend = sr->addend;
+    entries[*num_entries].has_lval = op.is_lval;
+    entries[*num_entries].count = op.is_lval ? 0 : 1;
+    (*num_entries)++;
+  }
+}
+
 int tcc_ir_opt_globalsym_cse(TCCIRState *ir)
 {
   int n = ir->next_instruction_index;
@@ -765,47 +801,50 @@ int tcc_ir_opt_globalsym_cse(TCCIRState *ir)
   if (n == 0)
     return 0;
 
-  typedef struct
-  {
-    Sym *sym;
-    int64_t addend;
-    int count;
-  } GSymEntry;
-
-  /* Scan entire function for repeated GlobalSym operands in ADD instructions */
   GSymEntry entries[GSYM_CSE_MAX];
   int num_entries = 0;
 
+  /* Scan instructions that commonly carry GlobalSym operands.
+   * Only ADD src1 carries non-lval SYMREFs (address + offset).
+   * LOAD/STORE/FUNCPARAMVAL/ASSIGN carry lval SYMREFs — we track
+   * those to avoid hoisting symbols that later passes might mishandle. */
   for (int i = 0; i < n; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op != TCCIR_OP_ADD)
-      continue;
-    IROperand src1 = tcc_ir_op_get_src1(ir, q);
-    if (irop_get_tag(src1) != IROP_TAG_SYMREF || src1.is_lval)
-      continue;
-    IRPoolSymref *sr = irop_get_symref_ex(ir, src1);
-    if (!sr || !sr->sym)
-      continue;
-    int found = -1;
-    for (int e = 0; e < num_entries; e++)
+    switch (q->op)
     {
-      if (entries[e].sym == sr->sym && entries[e].addend == sr->addend)
-      {
-        found = e;
-        break;
-      }
+    case TCCIR_OP_ADD:
+    {
+      int off = irop_config[TCCIR_OP_ADD].has_dest;
+      if (q->operand_base + off < (uint32_t)ir->iroperand_pool_count)
+        gsym_cse_count(ir, ir->iroperand_pool[q->operand_base + off],
+                       entries, &num_entries);
+      break;
     }
-    if (found >= 0)
-      entries[found].count++;
-    else if (num_entries < GSYM_CSE_MAX)
+    case TCCIR_OP_LOAD:
+    case TCCIR_OP_STORE:
+    case TCCIR_OP_ASSIGN:
+    case TCCIR_OP_FUNCPARAMVAL:
     {
-      entries[num_entries].sym = sr->sym;
-      entries[num_entries].addend = sr->addend;
-      entries[num_entries].count = 1;
-      num_entries++;
+      int nops = irop_config[q->op].has_dest + irop_config[q->op].has_src1;
+      for (int k = 0; k < nops; k++)
+        if (q->operand_base + k < (uint32_t)ir->iroperand_pool_count)
+        {
+          IROperand op = ir->iroperand_pool[q->operand_base + k];
+          if (op.tag == IROP_TAG_SYMREF)
+            gsym_cse_count(ir, op, entries, &num_entries);
+        }
+      break;
+    }
+    default:
+      break;
     }
   }
+
+  /* Determine how many entries qualify for hoisting (count >= 3). */
+  int max_gsym_hoist = tcc_ir_estimate_hoist_budget(ir, 0, n - 1, ir->parameters_count);
+  if (max_gsym_hoist < 2)
+    max_gsym_hoist = 2;
 
   /* Sort entries by use count descending so the most-used bases get priority */
   for (int i = 0; i < num_entries - 1; i++)
@@ -817,71 +856,108 @@ int tcc_ir_opt_globalsym_cse(TCCIRState *ir)
         entries[j] = tmp;
       }
 
-  /* For entries with 3+ uses, insert ASSIGN at function entry and replace all uses.
-   * Limit based on estimated register pressure in the function body. */
-  int max_gsym_hoist = tcc_ir_estimate_hoist_budget(ir, 0, n - 1, ir->parameters_count);
-  if (max_gsym_hoist < 2)
-    max_gsym_hoist = 2;
-  int total_inserted = 0;
-  for (int e = 0; e < num_entries; e++)
+  /* Count how many will actually be hoisted and allocate their vregs. */
+  int32_t hoist_vregs[GSYM_CSE_MAX];
+  int num_hoist = 0;
+  for (int e = 0; e < num_entries && num_hoist < max_gsym_hoist; e++)
   {
-    if (entries[e].count < 3)
+    if (entries[e].count < 3 || entries[e].has_lval)
       continue;
-    if (total_inserted >= max_gsym_hoist)
-      break;
+    hoist_vregs[num_hoist] = tcc_ir_vreg_alloc_temp(ir);
+    entries[e].count = -(num_hoist + 1); /* tag: negative = hoist slot index */
+    num_hoist++;
+  }
+  if (num_hoist == 0)
+    return 0;
 
-    int32_t base_vr = tcc_ir_vreg_alloc_temp(ir);
-
-    /* Find the first ADD with this GlobalSym to copy the operand */
-    IROperand sym_op = IROP_NONE;
+  /* Build all ASSIGN instructions and batch-insert at position 0.
+   * Single array shift + single jump/switch-table patch pass. */
+  {
+    int new_n = n + num_hoist;
+    while (new_n >= ir->compact_instructions_size)
     {
-      int nn = ir->next_instruction_index;
-      for (int j = total_inserted; j < nn; j++)
+      int new_size = ir->compact_instructions_size << 1;
+      ir->compact_instructions = tcc_realloc(ir->compact_instructions,
+                                             sizeof(IRQuadCompact) * new_size);
+      ir->compact_instructions_size = new_size;
+    }
+    /* Shift existing instructions right by num_hoist */
+    for (int i = n - 1; i >= 0; i--)
+      ir->compact_instructions[i + num_hoist] = ir->compact_instructions[i];
+    ir->next_instruction_index = new_n;
+
+    /* Fill the first num_hoist slots with ASSIGN instructions */
+    for (int h = 0; h < num_hoist; h++)
+    {
+      /* Find the entry that maps to hoist slot h */
+      GSymEntry *ge = NULL;
+      for (int e = 0; e < num_entries; e++)
+        if (entries[e].count == -(h + 1)) { ge = &entries[e]; break; }
+
+      uint32_t pool_idx = tcc_ir_pool_add_symref(ir, ge->sym,
+                                                  (int32_t)ge->addend, 0);
+      IROperand sym_op = irop_make_symref(-1, pool_idx, 0, 0, 0, IROP_BTYPE_INT32);
+      IROperand dest_op = irop_make_vreg(hoist_vregs[h], IROP_BTYPE_INT32);
+      IRQuadCompact aq = {0};
+      aq.op = TCCIR_OP_ASSIGN;
+      aq.operand_base = tcc_ir_pool_add(ir, dest_op);
+      tcc_ir_pool_add(ir, sym_op);
+      ir->compact_instructions[h] = aq;
+    }
+
+    /* Patch jump targets: add num_hoist to all targets >= 0 */
+    for (int i = 0; i < new_n; i++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
       {
-        IRQuadCompact *sq = &ir->compact_instructions[j];
-        if (sq->op != TCCIR_OP_ADD)
-          continue;
-        IROperand s1 = tcc_ir_op_get_src1(ir, sq);
-        if (irop_get_tag(s1) != IROP_TAG_SYMREF || s1.is_lval)
-          continue;
-        IRPoolSymref *ssr = irop_get_symref_ex(ir, s1);
-        if (ssr && ssr->sym == entries[e].sym && ssr->addend == entries[e].addend)
-        {
-          sym_op = s1;
-          break;
-        }
+        IROperand dest = tcc_ir_op_get_dest(ir, q);
+        int target = (int)irop_get_imm64_ex(ir, dest);
+        if (target >= 0)
+          tcc_ir_op_set_dest(ir, q,
+                             irop_make_imm32(-1, target + num_hoist, IROP_BTYPE_INT32));
       }
     }
-    if (irop_get_tag(sym_op) != IROP_TAG_SYMREF)
-      continue;
-
-    /* Build the ASSIGN instruction: T_base = GlobalSym+offset */
-    IROperand dest_op = irop_make_vreg(base_vr, IROP_BTYPE_INT32);
-    IRQuadCompact assign_q = {0};
-    assign_q.op = TCCIR_OP_ASSIGN;
-    assign_q.operand_base = tcc_ir_pool_add(ir, dest_op);
-    tcc_ir_pool_add(ir, sym_op);
-
-    /* Insert at position 0 (function entry) */
-    gsym_cse_insert_before(ir, total_inserted, &assign_q);
-    total_inserted++;
-
-    /* Replace all matching GlobalSym src1 operands with the TEMP */
-    IROperand base_ref = irop_make_vreg(base_vr, IROP_BTYPE_INT32);
-    int nn = ir->next_instruction_index;
-    for (int j = total_inserted; j < nn; j++)
+    for (int t = 0; t < ir->num_switch_tables; t++)
     {
-      IRQuadCompact *rq = &ir->compact_instructions[j];
-      if (rq->op != TCCIR_OP_ADD)
-        continue;
-      IROperand rs1 = tcc_ir_op_get_src1(ir, rq);
-      if (irop_get_tag(rs1) != IROP_TAG_SYMREF || rs1.is_lval)
-        continue;
-      IRPoolSymref *rsr = irop_get_symref_ex(ir, rs1);
-      if (!rsr || rsr->sym != entries[e].sym || rsr->addend != entries[e].addend)
-        continue;
-      tcc_ir_op_set_src1(ir, rq, base_ref);
-      changes++;
+      TCCIRSwitchTable *table = &ir->switch_tables[t];
+      if (table->default_target >= 0)
+        table->default_target += num_hoist;
+      if (table->targets)
+        for (int j = 0; j < table->num_entries; j++)
+          if (table->targets[j] >= 0)
+            table->targets[j] += num_hoist;
+    }
+  }
+
+  /* Replace matching non-lval GlobalSym ADD src1 operands with their TEMPs.
+   * Only ADD instructions carry non-lval SYMREFs as src1 (address + offset). */
+  int nn = ir->next_instruction_index;
+  for (int j = num_hoist; j < nn; j++)
+  {
+    IRQuadCompact *rq = &ir->compact_instructions[j];
+    if (rq->op != TCCIR_OP_ADD)
+      continue;
+    int off = irop_config[TCCIR_OP_ADD].has_dest;
+    if (rq->operand_base + off >= (uint32_t)ir->iroperand_pool_count)
+      continue;
+    IROperand s1 = ir->iroperand_pool[rq->operand_base + off];
+    if (s1.tag != IROP_TAG_SYMREF || s1.is_lval)
+      continue;
+    IRPoolSymref *sr = irop_get_symref_ex(ir, s1);
+    if (!sr || !sr->sym)
+      continue;
+    for (int h = 0; h < num_entries; h++)
+    {
+      if (entries[h].count < 0 && entries[h].sym == sr->sym &&
+          entries[h].addend == sr->addend)
+      {
+        int slot = -(entries[h].count + 1);
+        tcc_ir_op_set_src1(ir, rq,
+                           irop_make_vreg(hoist_vregs[slot], IROP_BTYPE_INT32));
+        changes++;
+        break;
+      }
     }
   }
 

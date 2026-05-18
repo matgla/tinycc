@@ -131,7 +131,18 @@ GCC_SKIP_TESTS = {
     "compile/bitfield-endian-2", # __uint128_t bitfield + scalar_storage_order
     "compile/pr70355", # __int128 vector type
     "compile/pr99822", # __int128 type
-
+    # C23 enum with underlying type (not supported by TCC)
+    "compile/pr111059-7",
+    "compile/pr111059-8",
+    "compile/pr111059-9",
+    "compile/pr111059-10",
+    "compile/pr111059-11",
+    "compile/pr111059-12",
+    "compile/pr111911-2",
+    # _Decimal64 (not available on ARM bare-metal)
+    "pr80692",
+    # C23 variadic without named parameter
+    "pr117432",
 }
 
 
@@ -355,6 +366,9 @@ def should_skip_gcc_test(test_path: Path) -> Optional[str]:
         # skipped rather than treated as compiler failures.
         if "dg-require-dll" in content:
             return "Requires DLL target support (not available on ARM ELF)"
+
+        if "dg-require-effective-target dfp" in content:
+            return "Requires decimal floating point (not available on ARM bare-metal)"
 
         # Tests requiring trampolines (nested functions) are now supported
         # if "dg-require-effective-target trampolines" in content:

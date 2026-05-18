@@ -40,8 +40,7 @@ from disasm_common import (
     DisasmCache,
     compile_gcc,
     compile_tcc,
-    count_instructions,
-    count_instructions_with_clones,
+    count_all_functions,
     disassemble,
     eprint,
     get_functions,
@@ -88,55 +87,83 @@ def collect_tests(suite_filter: str):
                 continue
             if suite_filter == "ir" and is_tests2:
                 continue
-            tests.append(("ir" if not is_tests2 else "tests2", path))
+            tests.append(("ir" if not is_tests2 else "tests2", path, ""))
 
     if suite_filter in ("all", "float"):
         for entry in test_qemu.FLOAT_TEST_FILES:
             tf = entry[0] if isinstance(entry, tuple) else entry
-            tests.append(("float", resolve(primary(tf), IR_TESTS_DIR)))
+            tests.append(("float", resolve(primary(tf), IR_TESTS_DIR), ""))
 
     if suite_filter in ("all", "bug"):
         for entry in test_qemu.TCC_BUG_TEST_FILES:
             tf = entry[0] if isinstance(entry, tuple) else entry
-            tests.append(("bug", resolve(primary(tf), IR_TESTS_DIR)))
+            tests.append(("bug", resolve(primary(tf), IR_TESTS_DIR), ""))
 
     if suite_filter in ("all", "ir"):
         for entry in test_qemu.FUNCTION_SECTIONS_TEST_FILES:
             tf = entry[0] if isinstance(entry, tuple) else entry
-            tests.append(("func-sections", resolve(primary(tf), IR_TESTS_DIR)))
+            tests.append(("func-sections", resolve(primary(tf), IR_TESTS_DIR), ""))
         for entry in test_qemu.GNU89_INLINE_TEST_FILES:
             tf = entry[0] if isinstance(entry, tuple) else entry
-            tests.append(("gnu89-inline", resolve(primary(tf), IR_TESTS_DIR)))
+            tests.append(("gnu89-inline", resolve(primary(tf), IR_TESTS_DIR), ""))
         for entry in test_qemu.PIC_TEXT_DATA_SEP_TEST_FILES:
             tf = entry[0] if isinstance(entry, tuple) else entry
-            tests.append(("pic-tds", resolve(primary(tf), IR_TESTS_DIR)))
+            tests.append(("pic-tds", resolve(primary(tf), IR_TESTS_DIR), ""))
 
     if suite_filter in ("all", "gcc-compile", "gcc-execute"):
-        gcc_conftest_dir = TCC_DIR / "tests" / "gcctestsuite"
-        sys.path.insert(0, str(gcc_conftest_dir))
+        sys.path.insert(0, str(TCC_DIR / "tests" / "gcctestsuite"))
         try:
             from conftest import discover_gcc_compile_tests, discover_gcc_execute_tests, should_skip_gcc_test
 
             if suite_filter in ("all", "gcc-compile"):
                 for tc in discover_gcc_compile_tests():
-                    if should_skip_gcc_test(Path("compile") / tc.source.name):
+                    if should_skip_gcc_test(tc.source):
                         continue
-                    tests.append(("gcc-compile", str(tc.source)))
+                    tests.append(("gcc-compile", str(tc.source), tc.dg_options))
             if suite_filter in ("all", "gcc-execute"):
                 for tc in discover_gcc_execute_tests():
                     if should_skip_gcc_test(tc.source):
                         continue
-                    tests.append(("gcc-execute", str(tc.source)))
+                    tests.append(("gcc-execute", str(tc.source), tc.dg_options))
         except Exception as exc:
             eprint(f"# WARNING: GCC torture discovery failed: {exc}")
 
+    tests = [(s, src, flags) for s, src, flags in tests
+             if f"{s}/{Path(src).stem}" not in DISASM_SKIP_TESTS]
     return tests
 
+
+DISASM_SKIP_TESTS = {
+    # float test requiring sys/mman.h (not available on bare-metal)
+    "float/119_random_stuff",
+    # compile tests requiring -std=gnu89 or -fpermissive (invalid in -std=gnu11)
+    "gcc-compile/20020418-1",
+    "gcc-compile/20020927-1",
+    "gcc-compile/920415-1",
+    "gcc-compile/920817-1",
+    "gcc-compile/20180605-1",
+    "gcc-compile/pr72802",
+    # compile tests requiring GCC-specific builtins
+    "gcc-compile/pr37669",
+    # compile tests requiring specific flags incompatible with ARM defaults
+    "gcc-compile/pr39845",
+    "gcc-compile/pr123365",
+    # compile tests expecting compilation errors (dg-error)
+    "gcc-compile/20030305-1",
+    "gcc-compile/pr28865",
+    "gcc-compile/pr48767",
+    "gcc-compile/pr83547",
+    # stress test exceeding TCC internal limits
+    "gcc-compile/20001226-1",
+    # execute tests requiring -std=gnu89
+    "gcc-execute/920415-1",
+    "gcc-execute/920728-1",
+}
 
 TRACE_TESTS = {"memcpy-a1", "memcpy-a2", "memcpy-a4", "memcpy-a8", "memclr"}
 
 
-def process_one(idx: int, total: int, suite: str, src: str, tmpdir: Path, dump_dir: str, gcc_opt: str):
+def process_one(idx: int, total: int, suite: str, src: str, tmpdir: Path, dump_dir: str, gcc_opt: str, extra_flags: str = ""):
     src_path = Path(src)
     basename = src_path.stem
     key = f"{suite}/{basename}"
@@ -150,7 +177,7 @@ def process_one(idx: int, total: int, suite: str, src: str, tmpdir: Path, dump_d
     if trace:
         eprint(f"  TRACE {key}: starting tcc compile")
     try:
-        tcc_result = compile_tcc(src, tcc_obj)
+        tcc_result = compile_tcc(src, tcc_obj, extra_flags=extra_flags or None)
     except subprocess.TimeoutExpired:
         with PRINT_LOCK:
             eprint(f"[{idx}/{total}] {key} ... SKIP (tcc compile timed out)")
@@ -168,7 +195,8 @@ def process_one(idx: int, total: int, suite: str, src: str, tmpdir: Path, dump_d
     if trace:
         eprint(f"  TRACE {key}: starting gcc compile")
     try:
-        gcc_result = compile_gcc(src, gcc_obj, opt=gcc_opt, extra_flags=["-ffreestanding"])
+        gcc_ef = ["-ffreestanding"] + (extra_flags.split() if extra_flags else [])
+        gcc_result = compile_gcc(src, gcc_obj, opt=gcc_opt, extra_flags=gcc_ef)
     except subprocess.TimeoutExpired:
         with PRINT_LOCK:
             eprint(f"[{idx}/{total}] {key} ... SKIP (gcc compile timed out)")
@@ -205,17 +233,26 @@ def process_one(idx: int, total: int, suite: str, src: str, tmpdir: Path, dump_d
         eprint(f"  TRACE {key}: {len(common)} common functions")
 
     if not common:
-        with PRINT_LOCK:
-            eprint(f"[{idx}/{total}] {key} ... SKIP (no common functions)")
-        return {"type": "skip", "key": key, "reason": "no common functions"}
-
-    if trace:
-        eprint(f"  TRACE {key}: counting instructions")
-    funcs = []
-    for func in common:
-        tcc_count = count_instructions(tcc_text, func)
-        gcc_count = count_instructions_with_clones(gcc_text, func)
-        funcs.append((func, tcc_count, gcc_count))
+        if not tcc_funcs or not gcc_funcs:
+            with PRINT_LOCK:
+                eprint(f"[{idx}/{total}] {key} ... SKIP (no functions)")
+            return {"type": "skip", "key": key, "reason": "no functions"}
+        tcc_counts = count_all_functions(tcc_text, sorted(tcc_funcs), with_clones=False)
+        gcc_counts = count_all_functions(gcc_text, sorted(gcc_funcs), with_clones=True)
+        tcc_total = sum(tcc_counts.values())
+        gcc_total = sum(gcc_counts.values())
+        if tcc_total == 0 and gcc_total == 0:
+            with PRINT_LOCK:
+                eprint(f"[{idx}/{total}] {key} ... SKIP (no instructions)")
+            return {"type": "skip", "key": key, "reason": "no instructions"}
+        funcs = [("*", tcc_total, gcc_total)]
+        status = "OK (whole-file)"
+    else:
+        if trace:
+            eprint(f"  TRACE {key}: counting instructions")
+        tcc_counts = count_all_functions(tcc_text, common, with_clones=False)
+        gcc_counts = count_all_functions(gcc_text, common, with_clones=True)
+        funcs = [(func, tcc_counts[func], gcc_counts[func]) for func in common]
 
     tcc_obj.unlink(missing_ok=True)
     gcc_obj.unlink(missing_ok=True)
@@ -238,8 +275,8 @@ def run_all(tests, jobs, gcc_opt, dump_dir, suite="all"):
         results = []
         with ThreadPoolExecutor(max_workers=jobs) as ex:
             future_to_test = {}
-            for i, (suite, src) in enumerate(tests):
-                f = ex.submit(process_one, i + 1, total, suite, src, tmpdir, dump_dir, gcc_opt)
+            for i, (suite, src, flags) in enumerate(tests):
+                f = ex.submit(process_one, i + 1, total, suite, src, tmpdir, dump_dir, gcc_opt, flags)
                 future_to_test[f] = (suite, src)
             eprint(f"Submitted {len(future_to_test)} futures, waiting ...")
             sys.stderr.flush()
@@ -710,7 +747,19 @@ if __name__ == "__main__":
     eprint("Updating cache ...")
     run_cache_check(data, args.no_cache, args.overwrite_cache)
 
-    failed = errors + data["skipped"]
+    compile_failures = [s for s in data["skipped"] if "compile failed" in s]
+    no_common = [s for s in data["skipped"] if "no common functions" in s]
+    no_funcs = [s for s in data["skipped"] if "no functions" in s and "no common" not in s]
+    other_skips = [s for s in data["skipped"]
+                   if "compile failed" not in s and "no common functions" not in s
+                   and "no functions" not in s]
+
+    if no_common:
+        eprint(f"\nInfo: {len(no_common)} test(s) skipped (no common functions)")
+    if no_funcs:
+        eprint(f"\nInfo: {len(no_funcs)} test(s) skipped (no functions in object)")
+
+    failed = errors + compile_failures + other_skips
     if failed:
         eprint(f"\nFAILED: {len(failed)} test(s):")
         for f in failed:
