@@ -26521,6 +26521,15 @@ static void gen_function(Sym *sym)
   dump_ir_after_pass(tcc_state, ir, "block_copy_init");
 #endif
 
+  /* Fold memmove(dst_ptr, &local_tmp, N) into direct STORE_INDEXED ops on
+   * dst_ptr when the temp is only used to feed this single memmove.  Cuts
+   * a function call (and its temp materialization) out of complex/struct
+   * assignments through a pointer destination. */
+  tcc_ir_opt_memmove_to_indexed_stores(ir);
+#ifdef CONFIG_TCC_DEBUG
+  dump_ir_after_pass(tcc_state, ir, "memmove_to_indexed_stores");
+#endif
+
   /* Identical-block loop re-rolling.  Runs BEFORE propagation so the
    * per-iteration IR is in its raw, structurally-consistent form (the
    * propagation passes can rewrite operand encodings in ways that vary

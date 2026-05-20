@@ -1251,3 +1251,399 @@ int tcc_ir_opt_block_copy_init(TCCIRState *ir)
 
   return changes;
 }
+
+/* Eliminate `memmove/memcpy(dst_ptr, &stack_tmp, N)` when the only writes to
+ * stack_tmp[0..N) are local STOREs that precede the call in the same basic
+ * block.  Each contributing STORE is rewritten to a STORE_INDEXED targeting
+ * the destination pointer at its original offset, and the call + params + the
+ * `LEA &stack_tmp` are NOPed.  Skipping the memmove call removes a function
+ * call from each hot iteration of a `*c = *d * s`-style complex-assignment
+ * loop and frees the stack temp for DCE. */
+int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  int changes = 0;
+
+  if (n == 0)
+    return 0;
+
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_FUNCCALLVOID)
+      continue;
+
+    /* Callee must be memmove/memcpy family (returns first arg). */
+    Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+    if (!callee)
+      continue;
+    const char *name = get_tok_str(callee->v, NULL);
+    if (!name)
+      continue;
+    int is_memmove_like = strcmp(name, "__aeabi_memmove") == 0 ||
+                          strcmp(name, "__aeabi_memmove4") == 0 ||
+                          strcmp(name, "__aeabi_memmove8") == 0 ||
+                          strcmp(name, "__aeabi_memcpy") == 0 ||
+                          strcmp(name, "__aeabi_memcpy4") == 0 ||
+                          strcmp(name, "__aeabi_memcpy8") == 0 ||
+                          strcmp(name, "memmove") == 0 ||
+                          strcmp(name, "memcpy") == 0;
+    if (!is_memmove_like)
+      continue;
+
+    IROperand p_dst, p_src, p_size;
+    if (!ir_opt_get_call_param_operand(ir, i, 0, &p_dst))
+      continue;
+    if (!ir_opt_get_call_param_operand(ir, i, 1, &p_src))
+      continue;
+    if (!ir_opt_get_call_param_operand(ir, i, 2, &p_size))
+      continue;
+
+    /* Size must be a small positive constant divisible by 4. */
+    if (irop_get_tag(p_size) != IROP_TAG_IMM32)
+      continue;
+    int total_size = (int)irop_get_imm64_ex(ir, p_size);
+    if (total_size <= 0 || (total_size & 3) || total_size > 64)
+      continue;
+
+    /* Source must be an address of a local stack offset.  May arrive in one
+     * of two forms:
+     *   (a) Direct LEA-form operand: STACKOFF with is_local=1, is_lval=0.
+     *   (b) A vreg that was set by `LEA/ASSIGN vr <- Addr[StackLoc[X]]`
+     *       earlier in the same basic block. */
+    int tmp_base;
+    int lea_idx = -1; /* instruction index of the LEA that produced p_src, if any */
+    if (irop_get_tag(p_src) == IROP_TAG_STACKOFF && p_src.is_local && !p_src.is_lval)
+    {
+      tmp_base = (int)irop_get_imm64_ex(ir, p_src);
+    }
+    else if (irop_get_tag(p_src) == IROP_TAG_VREG && irop_has_vreg(p_src) && !p_src.is_lval)
+    {
+      int32_t src_vr = irop_get_vreg(p_src);
+      if (src_vr < 0)
+        continue;
+      /* Scan backwards for the most recent `<vr> <- Addr[StackLoc[X]]`. */
+      int found_lea = 0;
+      tmp_base = 0;
+      for (int j = i - 1; j >= 0; j--)
+      {
+        IRQuadCompact *lq = &ir->compact_instructions[j];
+        if (lq->op == TCCIR_OP_NOP)
+          continue;
+        if (lq->is_jump_target)
+          break;
+        if (lq->op == TCCIR_OP_JUMP || lq->op == TCCIR_OP_JUMPIF || lq->op == TCCIR_OP_IJUMP)
+          break;
+        if (!irop_config[lq->op].has_dest)
+          continue;
+        IROperand ld = tcc_ir_op_get_dest(ir, lq);
+        if (!irop_has_vreg(ld) || irop_get_vreg(ld) != src_vr || ld.is_lval)
+          continue;
+        /* This op writes our vreg.  Must be a LEA/ASSIGN whose src1 is an
+         * Addr[StackLoc[X]] (is_local=1, is_lval=0). */
+        if (lq->op != TCCIR_OP_LEA && lq->op != TCCIR_OP_ASSIGN)
+          break;
+        IROperand ls = tcc_ir_op_get_src1(ir, lq);
+        if (irop_get_tag(ls) != IROP_TAG_STACKOFF || !ls.is_local || ls.is_lval)
+          break;
+        tmp_base = (int)irop_get_imm64_ex(ir, ls);
+        lea_idx = j;
+        found_lea = 1;
+        break;
+      }
+      if (!found_lea)
+        continue;
+    }
+    else
+    {
+      continue;
+    }
+
+    /* Destination must be a vreg pointer (value, not lvalue, not stack-local). */
+    if (irop_get_tag(p_dst) != IROP_TAG_VREG || p_dst.is_lval || p_dst.is_local || p_dst.is_const)
+      continue;
+    if (!irop_has_vreg(p_dst))
+      continue;
+    int32_t dst_vr = irop_get_vreg(p_dst);
+    if (dst_vr < 0)
+      continue;
+    (void)dst_vr;
+
+    /* Walk backwards through the same basic block looking for STOREs that
+     * fully cover the temp range.  Stop on any other op (other call, jump,
+     * non-STORE write) or a previously NOPed slot. */
+    int store_indices[16];
+    int store_offsets[16];
+    int nstores = 0;
+    int total_covered = 0;
+    int aborted = 0;
+
+    for (int j = i - 1; j >= 0 && nstores < 16; j--)
+    {
+      IRQuadCompact *sq = &ir->compact_instructions[j];
+      if (sq->op == TCCIR_OP_NOP)
+        continue;
+      if (sq->op == TCCIR_OP_FUNCPARAMVAL || sq->op == TCCIR_OP_FUNCPARAMVOID)
+        continue; /* memmove's own params */
+      if (sq->is_jump_target)
+        break;
+      if (sq->op == TCCIR_OP_JUMP || sq->op == TCCIR_OP_JUMPIF || sq->op == TCCIR_OP_IJUMP)
+        break;
+
+      if (sq->op != TCCIR_OP_STORE)
+      {
+        /* Allow benign in-between ops (LOAD, ASSIGN, ADD, arithmetic into
+         * vregs, FUNCCALLs).  Aliasing safety is enforced by the global
+         * scan below — which verifies no operand anywhere references the
+         * temp range.  Here we only bail if this very op writes into the
+         * temp range, which the global scan would also catch but is cheap
+         * to detect now. */
+        if (irop_config[sq->op].has_dest)
+        {
+          IROperand d = tcc_ir_op_get_dest(ir, sq);
+          if (irop_get_tag(d) == IROP_TAG_STACKOFF && d.is_local && d.is_lval)
+          {
+            int doff = (int)irop_get_imm64_ex(ir, d);
+            if (doff >= tmp_base && doff < tmp_base + total_size)
+            {
+              aborted = 1;
+              break;
+            }
+          }
+        }
+        continue;
+      }
+
+      /* This is a STORE.  Check if it targets our temp range. */
+      IROperand st_dest = tcc_ir_op_get_dest(ir, sq);
+      if (irop_get_tag(st_dest) != IROP_TAG_STACKOFF || !st_dest.is_local || !st_dest.is_lval)
+        continue;
+      int st_off = (int)irop_get_imm64_ex(ir, st_dest);
+      if (st_off < tmp_base || st_off >= tmp_base + total_size)
+        continue;
+
+      int is_wide = irop_is_64bit(st_dest);
+      int st_size = is_wide ? 8 : 4;
+      if (st_off + st_size > tmp_base + total_size)
+      {
+        aborted = 1;
+        break;
+      }
+
+      /* Source value must be a vreg or immediate (rewriting requires the
+       * value to be straightforwardly usable in a STORE_INDEXED). */
+      IROperand st_src = tcc_ir_op_get_src1(ir, sq);
+      int src_tag = irop_get_tag(st_src);
+      if (src_tag != IROP_TAG_VREG && src_tag != IROP_TAG_IMM32 &&
+          src_tag != IROP_TAG_I64 && src_tag != IROP_TAG_F32 && src_tag != IROP_TAG_F64)
+      {
+        aborted = 1;
+        break;
+      }
+
+      store_indices[nstores] = j;
+      store_offsets[nstores] = st_off - tmp_base;
+      nstores++;
+      total_covered += st_size;
+
+      if (total_covered >= total_size)
+        break;
+    }
+
+    if (aborted || nstores == 0 || total_covered != total_size)
+      continue;
+
+    /* Verify the stack temp is not used anywhere else as a load source or
+     * have its address taken elsewhere.  Conservative: scan all instructions
+     * (except the memmove call's own params + the contributing stores). */
+    int safe = 1;
+    for (int j = 0; j < n; j++)
+    {
+      if (j == i)
+        continue;
+      IRQuadCompact *sq = &ir->compact_instructions[j];
+      if (sq->op == TCCIR_OP_NOP)
+        continue;
+      /* Skip the contributing stores. */
+      int is_store_of_ours = 0;
+      for (int s = 0; s < nstores; s++)
+      {
+        if (store_indices[s] == j)
+        {
+          is_store_of_ours = 1;
+          break;
+        }
+      }
+      if (is_store_of_ours)
+        continue;
+      /* Skip the LEA that produced p_src (the temp's address) — it's about
+       * to be NOPed alongside the memmove call. */
+      if (j == lea_idx)
+        continue;
+      /* Skip params of the memmove call. */
+      if (sq->op == TCCIR_OP_FUNCPARAMVAL || sq->op == TCCIR_OP_FUNCPARAMVOID)
+      {
+        IROperand pop_enc = tcc_ir_op_get_src2(ir, sq);
+        IROperand call_src2 = tcc_ir_op_get_src2(ir, q);
+        if (TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, pop_enc)) ==
+            TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, call_src2)))
+          continue;
+      }
+
+      /* Check operands for tmp_base address use or stack offset use. */
+      for (int si = 0; si < 3; si++)
+      {
+        IROperand op;
+        if (si == 0 && irop_config[sq->op].has_dest)
+          op = tcc_ir_op_get_dest(ir, sq);
+        else if (si == 1 && irop_config[sq->op].has_src1)
+          op = tcc_ir_op_get_src1(ir, sq);
+        else if (si == 2 && irop_config[sq->op].has_src2)
+          op = tcc_ir_op_get_src2(ir, sq);
+        else
+          continue;
+        if (irop_get_tag(op) != IROP_TAG_STACKOFF)
+          continue;
+        if (!op.is_local)
+          continue;
+        int off = (int)irop_get_imm64_ex(ir, op);
+        if (off < tmp_base || off >= tmp_base + total_size)
+          continue;
+        /* The stack temp is referenced elsewhere — bail. */
+        safe = 0;
+        break;
+      }
+      if (!safe)
+        break;
+    }
+    if (!safe)
+      continue;
+
+    /* The destination vreg must be defined before the earliest store we
+     * plan to rewrite — otherwise the rewritten STORE_INDEXEDs would
+     * reference an uninitialized vreg.  Scan backwards from the memmove
+     * for the most recent definition of dst_vr; require it to be at an
+     * index strictly less than every store_indices[] entry. */
+    {
+      int earliest_store_idx = i;
+      for (int s = 0; s < nstores; s++)
+      {
+        if (store_indices[s] < earliest_store_idx)
+          earliest_store_idx = store_indices[s];
+      }
+      int dst_def_idx = -1;
+      for (int j = i - 1; j >= 0; j--)
+      {
+        IRQuadCompact *sq = &ir->compact_instructions[j];
+        if (sq->op == TCCIR_OP_NOP)
+          continue;
+        if (!irop_config[sq->op].has_dest)
+          continue;
+        IROperand d = tcc_ir_op_get_dest(ir, sq);
+        if (irop_has_vreg(d) && irop_get_vreg(d) == dst_vr && !d.is_lval)
+        {
+          dst_def_idx = j;
+          break;
+        }
+      }
+      if (dst_def_idx < 0 || dst_def_idx >= earliest_store_idx)
+        continue;
+    }
+
+    /* If we tracked an LEA that produced p_src, verify its result vreg is
+     * referenced exactly once outside the LEA itself: by the memmove's
+     * PARAM1.  Otherwise some other instruction reads the temp's address
+     * (and may, through that pointer, observe writes we're about to
+     * relocate). */
+    if (lea_idx >= 0)
+    {
+      int32_t lea_vr = irop_get_vreg(tcc_ir_op_get_dest(ir, &ir->compact_instructions[lea_idx]));
+      int lea_other_uses = 0;
+      for (int j = 0; j < n && !lea_other_uses; j++)
+      {
+        if (j == lea_idx)
+          continue;
+        IRQuadCompact *sq = &ir->compact_instructions[j];
+        if (sq->op == TCCIR_OP_NOP)
+          continue;
+        /* The memmove PARAM1 is an expected use — skip. */
+        if (sq->op == TCCIR_OP_FUNCPARAMVAL || sq->op == TCCIR_OP_FUNCPARAMVOID)
+        {
+          IROperand pop_enc = tcc_ir_op_get_src2(ir, sq);
+          IROperand call_src2 = tcc_ir_op_get_src2(ir, q);
+          if (TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, pop_enc)) ==
+                  TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, call_src2)) &&
+              TCCIR_DECODE_PARAM_IDX((uint32_t)irop_get_imm64_ex(ir, pop_enc)) == 1)
+            continue;
+        }
+        for (int si = 0; si < 3; si++)
+        {
+          IROperand op2;
+          if (si == 0 && irop_config[sq->op].has_dest)
+            op2 = tcc_ir_op_get_dest(ir, sq);
+          else if (si == 1 && irop_config[sq->op].has_src1)
+            op2 = tcc_ir_op_get_src1(ir, sq);
+          else if (si == 2 && irop_config[sq->op].has_src2)
+            op2 = tcc_ir_op_get_src2(ir, sq);
+          else
+            continue;
+          if (irop_has_vreg(op2) && irop_get_vreg(op2) == lea_vr)
+          {
+            lea_other_uses = 1;
+            break;
+          }
+        }
+      }
+      if (lea_other_uses)
+        continue;
+    }
+
+    /* Rewrite each contributing STORE to STORE_INDEXED targeting the
+     * destination pointer with the appropriate immediate offset. */
+    for (int s = 0; s < nstores; s++)
+    {
+      int sidx = store_indices[s];
+      IRQuadCompact *sq = &ir->compact_instructions[sidx];
+      IROperand st_src = tcc_ir_op_get_src1(ir, sq);
+      IROperand st_dest_old = tcc_ir_op_get_dest(ir, sq);
+      int offset = store_offsets[s];
+
+      /* Build the STORE_INDEXED operand block:
+       *   slot 0: dest = dst_vr (pointer, no lval)
+       *   slot 1: src1 = stored value
+       *   slot 2: src2 = immediate index (byte offset)
+       *   slot 3: scale = 0 (byte-offset mode)
+       */
+      tcc_ir_pool_ensure(ir, 4);
+      int new_base = ir->iroperand_pool_count;
+
+      IROperand base = p_dst;
+      base.is_lval = 0;
+      /* Preserve the destination's natural width as the base; the index field
+       * carries the byte offset.  The store width comes from src1's btype. */
+      tcc_ir_pool_add(ir, base);
+      tcc_ir_pool_add(ir, st_src);
+      IROperand index_op = irop_make_imm32(-1, offset, IROP_BTYPE_INT32);
+      tcc_ir_pool_add(ir, index_op);
+      IROperand scale_op = irop_make_imm32(-1, 0, IROP_BTYPE_INT32);
+      tcc_ir_pool_add(ir, scale_op);
+
+      sq->op = TCCIR_OP_STORE_INDEXED;
+      sq->operand_base = new_base;
+      (void)st_dest_old;
+    }
+
+    /* NOP the memmove call and all its FUNCPARAMVAL/FUNCPARAMVOID params. */
+    ir_opt_nop_call_params(ir, i);
+    q->op = TCCIR_OP_NOP;
+
+    /* NOP the LEA that took the address of the temp — its only user (the
+     * memmove's PARAM1) is gone, and the stack temp is now dead. */
+    if (lea_idx >= 0)
+      ir->compact_instructions[lea_idx].op = TCCIR_OP_NOP;
+
+    changes++;
+  }
+
+  return changes;
+}

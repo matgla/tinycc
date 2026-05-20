@@ -69,6 +69,14 @@ int tcc_ir_opt_const_string_calls(struct TCCIRState *ir);
  * aggregate self-assignments. */
 int tcc_ir_opt_self_copy_elim(struct TCCIRState *ir);
 
+/* Eliminate memmove/memcpy(dst_ptr, &stack_tmp, N) calls when the only writes
+ * to stack_tmp[0..N) are local STOREs preceding the call.  Each contributing
+ * STORE is rewritten to a STORE_INDEXED targeting the destination pointer at
+ * the original offset; the memmove call and its params + the LEA &stack_tmp
+ * are NOPed.  Eliminates a memmove call from hot loops doing complex/struct
+ * assignments through a pointer destination. */
+int tcc_ir_opt_memmove_to_indexed_stores(struct TCCIRState *ir);
+
 /* Value Tracking through Arithmetic - track constants through ADD/SUB */
 int tcc_ir_opt_value_tracking(struct TCCIRState *ir);
 
