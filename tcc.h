@@ -489,7 +489,8 @@ struct FuncAttr
       func_auto_inline : 1,             /* compiler-selected auto-inline candidate (small func) */
       func_eval_only_inline : 1,        /* body saved for const-fold only, not regular inlining */
       func_pure_via_sret : 1,           /* inferred: only observable side effect is *sret_arg writes */
-      xxxx : 5;
+      func_late_reopt : 1,              /* body kept for end-of-TU re-optimization (non-const static global fold) */
+      xxxx : 4;
 };
 
 /* symbol management */
@@ -535,6 +536,15 @@ struct Sym
   unsigned long long objsize_strlen_value; /* conservative max NUL-terminated string bytes */
   unsigned char objsize_max_valid;
   unsigned char objsize_strlen_valid;
+  /* Captured constant initializer bytes for small local arrays/vectors.
+   * Set by decl_initializer_alloc when all init values are compile-time
+   * constants; invalidated by vstore when the variable is later written.
+   * Used by __builtin_shuffle and similar intrinsics to fold runtime
+   * mask loads into constant indices. */
+  unsigned char *const_init_data;
+  int const_init_size;
+  unsigned char const_init_valid;
+  unsigned char const_init_in_progress;
 };
 
 #include "ir/machine_op.h"
@@ -1310,6 +1320,14 @@ struct TCCState
      only if referenced */
   struct InlineFunc **inline_fns;
   int nb_inline_fns;
+
+  /* Current function symbol being compiled.  Set by gen_function so IR opt
+   * passes can mark the function for end-of-TU re-optimization. */
+  Sym *cur_func_sym;
+  /* When set, tcc_ir_opt_global_init_prop bypasses the VT_CONSTANT gate.
+   * Set only during the end-of-TU late_reopt pass, when possibly_written
+   * reflects the entire TU. */
+  int ir_late_reopt_phase;
 
   /* Inline-eval parameter overlay: during try_inline_const_eval, identifier
    * resolution substitutes these SValues when a token matches a param token.
@@ -2692,6 +2710,9 @@ ST_FUNC int tcc_gen_machine_cbz_jump_mop(int rn, int nonzero, int32_t target_ir,
 ST_FUNC int tcc_gen_machine_switch_table_dry_run_size(int num_entries);
 ST_FUNC void tcc_gen_machine_switch_table_mop(MachineOperand src, struct TCCIRSwitchTable *table, struct TCCIRState *ir,
                                               int ir_idx);
+ST_FUNC int tcc_gen_machine_switch_load_dry_run_size(int num_entries);
+ST_FUNC void tcc_gen_machine_switch_load_mop(MachineOperand src, MachineOperand dest,
+                                             struct TCCIRSwitchValueTable *vtab, struct TCCIRState *ir, int ir_idx);
 ST_FUNC void tcc_gen_machine_set_chain(void);
 ST_FUNC void tcc_gen_machine_restore_chain(void);
 ST_FUNC void tcc_gen_machine_init_chain_slot(IROperand src1);

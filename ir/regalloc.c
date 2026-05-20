@@ -423,6 +423,203 @@ static int ra_dead_assign_elim(TCCIRState *ir)
 }
 
 /* ============================================================================
+ * Phi-copy / constant-staging chain fold
+ *
+ * After ra_resolve_phis, switch-case bodies of the form
+ *   case N: V0 = const_N; break;
+ * arrive at register allocation as a two-instruction chain:
+ *   T_case  <- const_N    (ASSIGN, the SSA-renamed original def)
+ *   T_phi   <- T_case     (ASSIGN, the phi copy inserted before the JMP)
+ *
+ * When T_case has exactly one use (the phi copy) and the original ASSIGN's
+ * source is a "freely duplicable" constant (IMM/SYMREF/STACKOFF/F32 with
+ * inline payload, or another non-lval VREG), we fold the chain into a single
+ * ASSIGN: T_phi <- const_N. This halves the per-case instruction count on
+ * dense switches (gcc-torture/compile/pr34093.c).
+ *
+ * Implementation: rewrite the original def's dest from T_case to T_phi and
+ * NOP the phi copy. This preserves the def's slot — which carries the
+ * basic-block label (is_jump_target) for the case body — and keeps the
+ * source operand exactly as it was, so its in-pool payload (symref idx,
+ * stack offset, etc.) doesn't need to be rebuilt.
+ * ============================================================================ */
+static int ra_fold_phi_const_chain(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  if (n < 2)
+    return 0;
+
+  int max_tmp = -1;
+  for (int i = 0; i < n; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP) continue;
+    if (!irop_config[q->op].has_dest) continue;
+    IROperand d = tcc_ir_op_get_dest(ir, q);
+    if (d.is_lval) continue;
+    int32_t v = irop_get_vreg(d);
+    if (v < 0 || TCCIR_DECODE_VREG_TYPE(v) != TCCIR_VREG_TYPE_TEMP) continue;
+    int pos = TCCIR_DECODE_VREG_POSITION(v);
+    if (pos > max_tmp) max_tmp = pos;
+  }
+  if (max_tmp < 0)
+    return 0;
+
+  /* def_idx[t]: -1 = no def, -2 = multi-def, else index of single def
+   * def_count[t]: number of times t is written (caps at 2). */
+  int *def_idx = tcc_malloc(sizeof(int) * (max_tmp + 1));
+  int *use_count = tcc_mallocz(sizeof(int) * (max_tmp + 1));
+  int *def_count = tcc_mallocz(sizeof(int) * (max_tmp + 1));
+  for (int p = 0; p <= max_tmp; p++) def_idx[p] = -1;
+
+  for (int i = 0; i < n; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP) continue;
+    int op = q->op;
+
+    if (irop_config[op].has_dest) {
+      IROperand d = tcc_ir_op_get_dest(ir, q);
+      if (!d.is_lval) {
+        int32_t v = irop_get_vreg(d);
+        if (v >= 0 && TCCIR_DECODE_VREG_TYPE(v) == TCCIR_VREG_TYPE_TEMP) {
+          int pos = TCCIR_DECODE_VREG_POSITION(v);
+          if (pos <= max_tmp) {
+            if (def_idx[pos] == -1) def_idx[pos] = i;
+            else def_idx[pos] = -2;
+            if (def_count[pos] < 3) def_count[pos]++;
+          }
+        }
+      }
+    }
+    if (irop_config[op].has_src1) {
+      IROperand s = tcc_ir_op_get_src1(ir, q);
+      int32_t v = irop_get_vreg(s);
+      if (v >= 0 && TCCIR_DECODE_VREG_TYPE(v) == TCCIR_VREG_TYPE_TEMP) {
+        int pos = TCCIR_DECODE_VREG_POSITION(v);
+        if (pos <= max_tmp) use_count[pos]++;
+      }
+    }
+    if (irop_config[op].has_src2) {
+      IROperand s = tcc_ir_op_get_src2(ir, q);
+      int32_t v = irop_get_vreg(s);
+      if (v >= 0 && TCCIR_DECODE_VREG_TYPE(v) == TCCIR_VREG_TYPE_TEMP) {
+        int pos = TCCIR_DECODE_VREG_POSITION(v);
+        if (pos <= max_tmp) use_count[pos]++;
+      }
+    }
+    if (op == TCCIR_OP_MLA) {
+      IROperand s = tcc_ir_op_get_accum(ir, q);
+      int32_t v = irop_get_vreg(s);
+      if (v >= 0 && TCCIR_DECODE_VREG_TYPE(v) == TCCIR_VREG_TYPE_TEMP) {
+        int pos = TCCIR_DECODE_VREG_POSITION(v);
+        if (pos <= max_tmp) use_count[pos]++;
+      }
+    }
+  }
+
+  int folded = 0;
+  for (int i = 1; i < n; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_ASSIGN) continue;
+
+    IROperand u_dest = tcc_ir_op_get_dest(ir, q);
+    if (u_dest.is_lval) continue;
+    int32_t u_dest_vr = irop_get_vreg(u_dest);
+    /* Allow any non-lval dest: the def will inherit it. */
+    if (u_dest_vr < 0) continue;
+
+    IROperand u_src = tcc_ir_op_get_src1(ir, q);
+    if (u_src.is_lval || u_src.is_llocal) continue;
+    int32_t src_vr = irop_get_vreg(u_src);
+    if (src_vr < 0 || TCCIR_DECODE_VREG_TYPE(src_vr) != TCCIR_VREG_TYPE_TEMP) continue;
+    int src_pos = TCCIR_DECODE_VREG_POSITION(src_vr);
+    if (src_pos > max_tmp) continue;
+
+    if (use_count[src_pos] != 1) continue;
+    int j = def_idx[src_pos];
+    if (j < 0 || j >= i) continue;
+
+    /* Only fold when u_dest is a phi-style target with multiple defs.
+     * For straight-line single-def TMPs the chain has no payoff and the
+     * fold is more aggressive than the IR optimiser intended (regression
+     * source for non-switch tests like test_mul32wide_outparams). */
+    int u_dest_type = TCCIR_DECODE_VREG_TYPE(u_dest_vr);
+    if (u_dest_type != TCCIR_VREG_TYPE_TEMP) continue;
+    int u_dest_pos = TCCIR_DECODE_VREG_POSITION(u_dest_vr);
+    if (u_dest_pos > max_tmp) continue;
+    if (def_count[u_dest_pos] < 2) continue;
+
+    IRQuadCompact *def_q = &ir->compact_instructions[j];
+    if (def_q->op != TCCIR_OP_ASSIGN) continue;
+
+    IROperand def_src = tcc_ir_op_get_src1(ir, def_q);
+    /* Only fold safe-to-duplicate constant-like sources. We rule out memory
+     * reads (is_lval) because the use's dest may differ in btype and we'd
+     * need to preserve the load width. Pure IMM/SYMREF/STACKOFF/F32 carry
+     * their payload inline; F64/I64/SYMREF via pool_idx survive a copy. */
+    if (def_src.is_lval || def_src.is_llocal) continue;
+    int dtag = def_src.tag;
+    int safe_const = (dtag == IROP_TAG_IMM32 || dtag == IROP_TAG_F32 ||
+                      dtag == IROP_TAG_I64 || dtag == IROP_TAG_F64 ||
+                      dtag == IROP_TAG_SYMREF || dtag == IROP_TAG_STACKOFF);
+    if (!safe_const) continue;
+
+    /* btype must match across the entire chain: u_dest_bt = def_dest_bt =
+     * def_src_bt. Any width difference would change the semantics of the
+     * implicit widen/narrow ASSIGN performs (e.g. ZEXT of a 32-bit constant
+     * into a 64-bit T_src that the use then reads as a register pair). */
+    int u_dest_bt = irop_get_btype(u_dest);
+    int def_dest_bt = irop_get_btype(tcc_ir_op_get_dest(ir, def_q));
+    int def_src_bt = irop_get_btype(def_src);
+    if (u_dest_bt != def_dest_bt || u_dest_bt != def_src_bt)
+      continue;
+    /* And the source vreg's btype recorded on the use must match too, so we
+     * never collapse a narrowing read of a wider T_src. */
+    if (irop_get_btype(u_src) != u_dest_bt)
+      continue;
+
+    /* Same basic block: no jump-target landing zones between def and use.
+     * The def itself can be a jump target (start of the case body); only
+     * intervening landing zones break the chain. */
+    int same_bb = 1;
+    for (int k = j + 1; k <= i; k++) {
+      if (ir->compact_instructions[k].is_jump_target) { same_bb = 0; break; }
+    }
+    if (!same_bb) continue;
+
+    /* Make sure u_dest isn't redefined or read between j+1 and i-1 — if it
+     * were, rewriting j's dest to u_dest would change semantics. */
+    int conflict = 0;
+    for (int k = j + 1; k < i && !conflict; k++) {
+      IRQuadCompact *kq = &ir->compact_instructions[k];
+      if (kq->op == TCCIR_OP_NOP) continue;
+      if (irop_config[kq->op].has_dest) {
+        IROperand kd = tcc_ir_op_get_dest(ir, kq);
+        if (!kd.is_lval && irop_get_vreg(kd) == u_dest_vr) { conflict = 1; break; }
+      }
+      if (irop_config[kq->op].has_src1) {
+        IROperand ks = tcc_ir_op_get_src1(ir, kq);
+        if (irop_get_vreg(ks) == u_dest_vr) { conflict = 1; break; }
+      }
+      if (irop_config[kq->op].has_src2) {
+        IROperand ks = tcc_ir_op_get_src2(ir, kq);
+        if (irop_get_vreg(ks) == u_dest_vr) { conflict = 1; break; }
+      }
+    }
+    if (conflict) continue;
+
+    /* Apply fold: rewrite def's dest to u_dest, NOP the use. */
+    tcc_ir_set_dest(ir, j, u_dest);
+    q->op = TCCIR_OP_NOP;
+    folded++;
+  }
+
+  tcc_free(def_idx);
+  tcc_free(use_count);
+  tcc_free(def_count);
+  return folded;
+}
+
+/* ============================================================================
  * SSA Live Interval Building
  * ============================================================================ */
 
@@ -3093,6 +3290,19 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
   ra_phi_resolve_pre_ra_mode = 1;
   ra_resolve_phis(ir, cfg, ssa);
   ra_phi_resolve_pre_ra_mode = 0;
+
+  /* Collapse "TMP <- const; T_phi <- TMP" chains the phi resolver leaves
+   * behind in dense switch case bodies. Each fold drops one ASSIGN and one
+   * SSA temp from the case body, cutting both the per-case instruction count
+   * and the phi-temp live ranges that drive the linear scan into spills. */
+  ra_fold_phi_const_chain(ir);
+
+  /* Once the per-case bodies are canonicalised to "T_phi <- const; JMP merge",
+   * try to rewrite the entire SWITCH_TABLE dispatch into a single SWITCH_LOAD
+   * against an inline value table.  Must run after the phi-const fold above
+   * (which produces the canonical body shape) and before live-interval
+   * construction (which would otherwise see the now-dead case bodies). */
+  tcc_ir_opt_switch_to_data(ir);
 
   /* Fold CMP + JUMPIF where both operands resolve to constants within the
    * same basic block. Phi resolution often materializes the entry-path

@@ -11,6 +11,7 @@
 #define USING_GLOBALS
 #include "ir.h"
 #include "ssa_opt.h"
+#include <limits.h>
 
 static int dce_temp_worklist(IRSSAOptCtx *ctx)
 {
@@ -743,6 +744,311 @@ static int dce_dead_phi_cycles(IRSSAOptCtx *ctx)
   return changes;
 }
 
+/* Dead-overwrite store elimination for stack memory.
+ *
+ * Walks each basic block forward, tracking pending STORE/STORE_INDEXED
+ * to canonical (sym, stack-offset) pairs.  When a later STORE to the same
+ * offset with the same access width is seen with no intervening read of
+ * that location and no call, the earlier STORE is dead.
+ *
+ * The conventional pre-SSA store_redundant pass only handles plain STORE
+ * with direct StackLoc/SymRef dests.  This sub-pass extends to
+ * STORE_INDEXED with a LEA-resolved TEMP base — common after SSA load CSE
+ * + algebraic folds collapse the read between two writes (pr60502.c). */
+static int sl_store_byte_width(int btype)
+{
+  switch (btype) {
+  case IROP_BTYPE_INT8:   return 1;
+  case IROP_BTYPE_INT16:  return 2;
+  case IROP_BTYPE_INT32:
+  case IROP_BTYPE_FLOAT32: return 4;
+  case IROP_BTYPE_INT64:
+  case IROP_BTYPE_FLOAT64: return 8;
+  default: return 0;
+  }
+}
+
+/* Resolve a STORE/STORE_INDEXED instruction's destination to a stack-offset
+ * range [off, off+width).  Returns 1 if successfully resolved, else 0.  Also
+ * returns 0 if the store can alias unknown memory (unresolved pointer base).
+ *
+ * For STORE: dest is `T_lval_DEREF` where T resolves to LEA-StackLoc; or
+ * direct STACKOFF with is_lval=1+is_local=1.
+ * For STORE_INDEXED: dest is `T_base` (non-lval pointer), with constant
+ * index + scale=0; combined via ssa_opt_indirect_stack_offset. */
+static int sl_resolve_store_offset(IRSSAOptCtx *ctx, int instr_idx,
+                                   int *out_off, int *out_width, int *out_unknown)
+{
+  TCCIRState *ir = ctx->ir;
+  IRQuadCompact *q = &ir->compact_instructions[instr_idx];
+  IROperand dest = tcc_ir_op_get_dest(ir, q);
+  *out_unknown = 0;
+
+  if (q->op == TCCIR_OP_STORE_INDEXED) {
+    int eff = ssa_opt_indirect_stack_offset(ctx, q, SSA_OPT_INDIRECT_DEST);
+    if (eff == INT_MIN) {
+      *out_unknown = 1;
+      return 0;
+    }
+    /* Access width comes from the stored VALUE (src1), not the base pointer
+     * dest — the dest's btype is the pointer's btype (typically 0/NONE), not
+     * the access width. */
+    IROperand src1 = tcc_ir_op_get_src1(ir, q);
+    int w = sl_store_byte_width(irop_get_btype(src1));
+    if (w == 0) {
+      *out_unknown = 1;
+      return 0;
+    }
+    *out_off = eff;
+    *out_width = w;
+    return 1;
+  }
+
+  if (q->op != TCCIR_OP_STORE)
+    return 0;
+
+  /* Direct STACKOFF dest with is_lval=1+is_local=1 → known stack store. */
+  if (dest.tag == IROP_TAG_STACKOFF && dest.is_lval && dest.is_local && !dest.is_llocal) {
+    int32_t dv = irop_get_vreg(dest);
+    if (dv < 0 || TCCIR_DECODE_VREG_TYPE(dv) != TCCIR_VREG_TYPE_VAR) {
+      int w = sl_store_byte_width(irop_get_btype(dest));
+      if (w == 0) {
+        *out_unknown = 1;
+        return 0;
+      }
+      *out_off = irop_get_stack_offset(dest);
+      *out_width = w;
+      return 1;
+    }
+  }
+
+  /* `T_DEREF = src` where T resolves to LEA(StackLoc). */
+  if (dest.tag == IROP_TAG_VREG && dest.is_lval) {
+    int32_t dv = irop_get_vreg(dest);
+    if (dv >= 0 && TCCIR_DECODE_VREG_TYPE(dv) == TCCIR_VREG_TYPE_TEMP) {
+      int eff = ssa_opt_resolve_lea_stackloc(ctx, dv);
+      if (eff != INT_MIN) {
+        int w = sl_store_byte_width(irop_get_btype(dest));
+        if (w == 0) {
+          *out_unknown = 1;
+          return 0;
+        }
+        *out_off = eff;
+        *out_width = w;
+        return 1;
+      }
+    }
+    /* TEMP-DEREF store through an unresolvable pointer — may alias. */
+    *out_unknown = 1;
+    return 0;
+  }
+
+  /* Other patterns (e.g. global symref): treat as may-alias. */
+  *out_unknown = 1;
+  return 0;
+}
+
+/* Resolve a LOAD/LOAD_INDEXED instruction's source to a stack-offset range.
+ * Same return semantics as sl_resolve_store_offset. */
+static int sl_resolve_load_offset(IRSSAOptCtx *ctx, int instr_idx,
+                                  int *out_off, int *out_width, int *out_unknown)
+{
+  TCCIRState *ir = ctx->ir;
+  IRQuadCompact *q = &ir->compact_instructions[instr_idx];
+  IROperand src1 = tcc_ir_op_get_src1(ir, q);
+  *out_unknown = 0;
+
+  if (q->op == TCCIR_OP_LOAD_INDEXED) {
+    int eff = ssa_opt_indirect_stack_offset(ctx, q, SSA_OPT_INDIRECT_SRC1);
+    if (eff == INT_MIN) {
+      *out_unknown = 1;
+      return 0;
+    }
+    int w = sl_store_byte_width(irop_get_btype(tcc_ir_op_get_dest(ir, q)));
+    if (w == 0) {
+      *out_unknown = 1;
+      return 0;
+    }
+    *out_off = eff;
+    *out_width = w;
+    return 1;
+  }
+
+  if (q->op != TCCIR_OP_LOAD)
+    return 0;
+
+  if (src1.tag == IROP_TAG_STACKOFF && src1.is_lval && src1.is_local && !src1.is_llocal) {
+    int32_t sv = irop_get_vreg(src1);
+    if (sv < 0 || TCCIR_DECODE_VREG_TYPE(sv) != TCCIR_VREG_TYPE_VAR) {
+      int w = sl_store_byte_width(irop_get_btype(src1));
+      if (w == 0) {
+        *out_unknown = 1;
+        return 0;
+      }
+      *out_off = irop_get_stack_offset(src1);
+      *out_width = w;
+      return 1;
+    }
+  }
+
+  if (src1.tag == IROP_TAG_VREG && src1.is_lval) {
+    int32_t sv = irop_get_vreg(src1);
+    if (sv >= 0 && TCCIR_DECODE_VREG_TYPE(sv) == TCCIR_VREG_TYPE_TEMP) {
+      int eff = ssa_opt_resolve_lea_stackloc(ctx, sv);
+      if (eff != INT_MIN) {
+        int w = sl_store_byte_width(irop_get_btype(tcc_ir_op_get_dest(ir, q)));
+        if (w == 0) {
+          *out_unknown = 1;
+          return 0;
+        }
+        *out_off = eff;
+        *out_width = w;
+        return 1;
+      }
+    }
+    *out_unknown = 1;
+    return 0;
+  }
+
+  *out_unknown = 1;
+  return 0;
+}
+
+static int dce_dead_overwrite_stores(IRSSAOptCtx *ctx)
+{
+  TCCIRState *ir = ctx->ir;
+  IRCFG *cfg = ctx->cfg;
+  int n = ir->next_instruction_index;
+  int changes = 0;
+
+  if (!cfg || cfg->num_blocks == 0 || n == 0)
+    return 0;
+
+#define DOS_PEND_MAX 32
+  typedef struct { int idx; int off; int width; } DosPending;
+
+  for (int b = 0; b < cfg->num_blocks; b++) {
+    IRBasicBlock *bb = &cfg->blocks[b];
+    DosPending pending[DOS_PEND_MAX];
+    int npending = 0;
+
+    for (int i = bb->start_idx; i < bb->end_idx; i++) {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      if (q->op == TCCIR_OP_NOP)
+        continue;
+
+      /* Calls or block terminators: clear pending state (may read/write
+       * arbitrary memory through escaped pointers). */
+      if (q->op == TCCIR_OP_FUNCCALLVOID || q->op == TCCIR_OP_FUNCCALLVAL ||
+          q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF ||
+          q->op == TCCIR_OP_IJUMP || q->op == TCCIR_OP_SWITCH_TABLE ||
+          q->op == TCCIR_OP_RETURNVALUE || q->op == TCCIR_OP_RETURNVOID) {
+        npending = 0;
+        continue;
+      }
+
+      /* LOAD / LOAD_INDEXED of a known stack offset evicts overlapping
+       * pending stores (the value is observed, so the prior store must
+       * remain).  LOADs through external pointers (PARAM/unresolved
+       * TEMPs) cannot reach our tracked local-stack offsets, so do NOT
+       * clear pending in that case — local stack memory is unreachable
+       * from caller-supplied pointers. */
+      if (q->op == TCCIR_OP_LOAD || q->op == TCCIR_OP_LOAD_INDEXED ||
+          q->op == TCCIR_OP_LOAD_POSTINC) {
+        int lo = 0, lw = 0, lu = 0;
+        if (sl_resolve_load_offset(ctx, i, &lo, &lw, &lu)) {
+          for (int k = 0; k < npending;) {
+            int po = pending[k].off, pw = pending[k].width;
+            if (lo < po + pw && lo + lw > po)
+              pending[k] = pending[--npending];
+            else
+              k++;
+          }
+        }
+        continue;
+      }
+
+      /* STORE / STORE_INDEXED handling */
+      if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED) {
+        int so = 0, sw = 0, su = 0;
+        (void)su;
+        int resolved = sl_resolve_store_offset(ctx, i, &so, &sw, &su);
+        if (!resolved) {
+          /* Unresolved STORE through an external/global pointer: cannot
+           * reach our local-stack pending entries (only the caller's stack
+           * or globals).  Leave pending alone — mirrors the conventional
+           * store_redundant pass's handling. */
+          continue;
+        }
+
+        /* Look for an exact same-offset same-width pending store: that one
+         * is dead (overwritten without intervening read).  Also evict any
+         * pending stores that overlap with the new write's range, since
+         * their tracked value is now partially clobbered. */
+        for (int k = 0; k < npending;) {
+          int po = pending[k].off, pw = pending[k].width;
+          if (po == so && pw == sw) {
+            /* Exact overwrite — older store is dead. */
+            ssa_opt_nop_instr(ctx, pending[k].idx);
+            changes++;
+            pending[k] = pending[--npending];
+          } else if (so < po + pw && so + sw > po) {
+            /* Partial overlap — drop tracking (can't prove older is dead). */
+            pending[k] = pending[--npending];
+          } else {
+            k++;
+          }
+        }
+
+        /* Track this store. */
+        if (npending < DOS_PEND_MAX) {
+          pending[npending].idx = i;
+          pending[npending].off = so;
+          pending[npending].width = sw;
+          npending++;
+        }
+        continue;
+      }
+
+      /* STORE_POSTINC: clear pending — base updates make offset tracking
+       * unreliable. */
+      if (q->op == TCCIR_OP_STORE_POSTINC) {
+        npending = 0;
+        continue;
+      }
+
+      /* Other ops: may consume a LEA-typed TEMP as src1/src2.  If the src
+       * is a STACKOFF/VREG that resolves to a tracked offset, treat as a
+       * read (evict).  Common: BLOCK_COPY/memmove receives a stack address
+       * to read from. */
+      for (int side = 0; side < 2; side++) {
+        IROperand s = side ? tcc_ir_op_get_src2(ir, q) : tcc_ir_op_get_src1(ir, q);
+        if (s.is_lval || s.tag != IROP_TAG_VREG)
+          continue;
+        int32_t sv = irop_get_vreg(s);
+        if (sv < 0 || TCCIR_DECODE_VREG_TYPE(sv) != TCCIR_VREG_TYPE_TEMP)
+          continue;
+        int eff = ssa_opt_resolve_lea_stackloc(ctx, sv);
+        if (eff == INT_MIN)
+          continue;
+        /* This op holds an address into the stack — may read from there.
+         * Without size info, conservatively evict any entries that could
+         * overlap a 16-byte access window starting at eff. */
+        for (int k = 0; k < npending;) {
+          int po = pending[k].off, pw = pending[k].width;
+          if (po + pw > eff && po < eff + 256)
+            pending[k] = pending[--npending];
+          else
+            k++;
+        }
+      }
+    }
+  }
+
+#undef DOS_PEND_MAX
+  return changes;
+}
+
 int ssa_opt_dce(IRSSAOptCtx *ctx)
 {
   int changes = 0;
@@ -758,6 +1064,7 @@ int ssa_opt_dce(IRSSAOptCtx *ctx)
         inner += dce_temp_worklist(ctx);
       changes += inner;
     } while (inner > 0);
+    changes += dce_dead_overwrite_stores(ctx);
     changes += dce_dead_stackloc_stores(ctx);
     if (changes) {
       /* Repair stale TEMP use counts: some passes NOP instructions

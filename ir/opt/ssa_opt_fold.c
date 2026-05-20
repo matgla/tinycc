@@ -208,6 +208,64 @@ static int fold_binary(IRSSAOptCtx *ctx, int idx)
     }
   }
 
+  /* Bit-complement identity:
+   *   a | (a ^ -1) = -1
+   *   a & (a ^ -1) = 0
+   *
+   * Recognises the pattern where one operand is a single-def TEMP whose
+   * defining op is `XOR a #-1`, and the other operand is `a` itself.
+   * Common after LOAD-CSE folds duplicate reads of the same address —
+   * see pr60502.c where `*x ^ m1 | *x` with m1 = all-FF collapses to -1
+   * per byte.  Restricts to same-block defs to keep the fold safe under
+   * control-flow joins (mirrors try_resolve_const_vreg). */
+  if ((q->op == TCCIR_OP_OR || q->op == TCCIR_OP_AND) &&
+      !src1_is_imm && !src2_is_imm &&
+      src1.tag == IROP_TAG_VREG && src2.tag == IROP_TAG_VREG &&
+      !src1.is_lval && !src2.is_lval &&
+      src1_vr >= 0 && src2_vr >= 0) {
+    IRCFG *cfg = ctx->cfg;
+    for (int trial = 0; trial < 2 && cfg; trial++) {
+      int32_t a_vr = trial ? src2_vr : src1_vr;
+      int32_t x_vr = trial ? src1_vr : src2_vr;
+      if (TCCIR_DECODE_VREG_TYPE(x_vr) != TCCIR_VREG_TYPE_TEMP)
+        continue;
+      IRSSAVregInfo *xvi = ssa_opt_vinfo(ctx, x_vr);
+      if (!xvi || xvi->def_count != 1 || xvi->def_instr < 0)
+        continue;
+      if (cfg->instr_to_block[xvi->def_instr] != cfg->instr_to_block[idx])
+        continue;
+      IRQuadCompact *xdef = &ctx->ir->compact_instructions[xvi->def_instr];
+      if (xdef->op != TCCIR_OP_XOR)
+        continue;
+      IROperand xs1 = tcc_ir_op_get_src1(ir, xdef);
+      IROperand xs2 = tcc_ir_op_get_src2(ir, xdef);
+      /* Identify which XOR operand carries the -1 constant.  The other
+       * operand is the value being complemented; it must match the OR/AND's
+       * "a" operand (same vreg, non-lval). */
+      int s1_neg1 = (xs1.tag == IROP_TAG_IMM32 && !xs1.is_lval && xs1.u.imm32 == -1);
+      int s2_neg1 = (xs2.tag == IROP_TAG_IMM32 && !xs2.is_lval && xs2.u.imm32 == -1);
+      if (!s1_neg1 && !s2_neg1)
+        continue;
+      IROperand x_inner = s1_neg1 ? xs2 : xs1;
+      if (x_inner.is_lval || x_inner.tag != IROP_TAG_VREG)
+        continue;
+      if (irop_get_vreg(x_inner) != a_vr)
+        continue;
+      /* Match.  OR -> -1, AND -> 0. */
+      int32_t fold_val = (q->op == TCCIR_OP_OR) ? -1 : 0;
+      IROperand imm = irop_make_imm32(0, fold_val, dest.btype);
+      q->op = TCCIR_OP_ASSIGN;
+      tcc_ir_op_set_src1(ir, q, imm);
+      tcc_ir_op_set_src2(ir, q, IROP_NONE);
+      IRSSAVregInfo *vi;
+      vi = ssa_opt_vinfo(ctx, a_vr);
+      if (vi) ssa_opt_remove_use_instr(vi, idx);
+      vi = ssa_opt_vinfo(ctx, x_vr);
+      if (vi) ssa_opt_remove_use_instr(vi, idx);
+      return 1;
+    }
+  }
+
   /* Identity: x + 0, x - 0, x | 0, x ^ 0, x << 0, x >> 0, x * 1 → x */
   if (src2_is_imm && !src1.is_lval) {
     int is_identity = 0;

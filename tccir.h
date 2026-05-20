@@ -203,6 +203,19 @@ typedef enum TccIrOp
    */
   TCCIR_OP_SELECT,
   TCCIR_OP_ROR,
+
+  /* Data-table switch dispatch:
+   * dest = vreg receiving the loaded value
+   * src1 = index vreg (already adjusted: value - min_case, range-checked)
+   * src2.c.i = switch_value_table_id
+   * Loads values[src1] from the inline data table at codegen. Falls through
+   * to the next instruction (typically a JMP to the merge block). The caller
+   * is responsible for emitting a preceding range check that branches to a
+   * separate block when the index is out of range; that block must load the
+   * default_val from the value table (we keep range-check + default outside
+   * SWITCH_LOAD itself to leverage existing CMP/JUMPIF/ASSIGN lowering).
+   */
+  TCCIR_OP_SWITCH_LOAD,
 } TccIrOp;
 
 /* FUNCPARAMVAL encoding helpers:
@@ -364,6 +377,23 @@ typedef struct TCCIRSwitchTable
   int table_code_addr; /* Code address of start of table data (set during codegen) */
 } TCCIRSwitchTable;
 
+/* Switch value table: emitted when SWITCH_TABLE is rewritten to a data-table
+ * load (TCCIR_OP_SWITCH_LOAD). Each case slot holds a value (IMM32 or SYMREF
+ * address) that gets loaded into the destination vreg instead of dispatching
+ * to a case body. SYMREF entries emit R_ARM_ABS32 relocations at the table's
+ * rodata offset so the linker fills in the symbol's runtime address.
+ *
+ * The table itself lives in .rodata; rodata_sym is an anonymous symbol
+ * pointing to the table's base.  The dispatch code loads rodata_sym into a
+ * scratch register and uses an indexed shifted LDR to read values[index]. */
+typedef struct TCCIRSwitchValueTable
+{
+  int num_entries;       /* Size of values[] (= num cases) */
+  IROperand *values;     /* Per-case values (IMM32, SYMREF, etc.) */
+  IROperand default_val; /* Out-of-range fallback value */
+  Sym *rodata_sym;       /* Symbol pointing to table base in .rodata */
+} TCCIRSwitchValueTable;
+
 typedef struct TCCMachineScratchRegs
 {
   unsigned char reg_count;
@@ -414,6 +444,12 @@ typedef struct TCCIRState
   uint8_t leaffunc : 1;
   uint8_t tail_call_only : 1;
   uint8_t naked : 1;
+  /* Set by noreturn_collapse when the body has been replaced with `b .`:
+   * control never reaches the epilogue, so suppress emitting it (saves the
+   * unreachable `bx lr` after the self-jump). Unlike `naked`, this does
+   * NOT suppress the prologue or debug info — the collapsed function is
+   * still a normal callee from the linker's perspective. */
+  uint8_t noreturn : 1;
   uint8_t processing_if : 1;
   uint8_t check_for_backwards_jumps : 1;
   uint8_t basic_block_start : 1;
@@ -549,6 +585,11 @@ typedef struct TCCIRState
   TCCIRSwitchTable *switch_tables;
   int num_switch_tables;
   int switch_tables_capacity;
+
+  /* Switch value tables for SWITCH_LOAD (constant-table dispatch). */
+  TCCIRSwitchValueTable *switch_value_tables;
+  int num_switch_value_tables;
+  int switch_value_tables_capacity;
 
   /* Barrel shift annotations: populated just before codegen, freed after.
    * barrel_shifts[i] encodes an optional barrel shift on src2 of instruction i:

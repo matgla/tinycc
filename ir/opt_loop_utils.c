@@ -2924,11 +2924,88 @@ int try_unroll_loop_ex(TCCIRState *ir, IRLoop *loop, IRLoops *loops, int loop_id
   /* Also NOP the "JMP to body" that may precede the loop header
    * (instruction at start_idx - 1 if it's a jump into the loop body) */
 
+  /* Collect body-local TEMPs that can be renamed per iteration.  Without
+   * renaming, every iteration writes the same TEMP position (e.g.
+   * `T3 <- V0; V0 <- T3 + 16` repeated 6×), which makes downstream passes
+   * with global use-count checks (postinc_assign_fold, add_reassoc) bail
+   * because T3 has many defs/uses across the function.  Renaming each
+   * iteration's body-local TEMPs to fresh positions restores the
+   * single-def-single-use shape those passes expect. */
+#define UNROLL_MAX_RENAME 16
+  int rename_old_pos[UNROLL_MAX_RENAME];
+  int rename_count = 0;
+  for (int b = 0; b < body_count && rename_count < UNROLL_MAX_RENAME; b++)
+  {
+    int op = body_ops[b];
+    if (!irop_config[op].has_dest)
+      continue;
+    /* STORE/STORE_INDEXED/STORE_POSTINC dests are addresses (uses), not defs.
+     * FUNCPARAMVAL/FUNCPARAMVOID dests carry the param value (a use).
+     * Skip these so we don't treat their TEMP operands as body-defined. */
+    if (op == TCCIR_OP_STORE || op == TCCIR_OP_STORE_INDEXED || op == TCCIR_OP_STORE_POSTINC ||
+        op == TCCIR_OP_FUNCPARAMVAL || op == TCCIR_OP_FUNCPARAMVOID)
+      continue;
+    int32_t vr = irop_get_vreg(body_dests[b]);
+    if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
+      continue;
+    int pos = TCCIR_DECODE_VREG_POSITION(vr);
+    int seen = 0;
+    for (int r = 0; r < rename_count; r++)
+      if (rename_old_pos[r] == pos) { seen = 1; break; }
+    if (seen)
+      continue;
+    rename_old_pos[rename_count++] = pos;
+  }
+  /* Reject any TEMP that is referenced outside the loop body region — its
+   * value escapes and must not be renamed.  Mark with -1. */
+  if (rename_count > 0)
+  {
+    int n_all = ir->next_instruction_index;
+    for (int i = 0; i < n_all; i++)
+    {
+      if (i >= loop->start_idx && i <= loop_end)
+        continue;
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      if (q->op == TCCIR_OP_NOP)
+        continue;
+      for (int slot = 0; slot < 3; slot++)
+      {
+        IROperand op;
+        if (slot == 0)
+        {
+          if (!irop_config[q->op].has_dest) continue;
+          op = tcc_ir_op_get_dest(ir, q);
+        }
+        else if (slot == 1)
+        {
+          if (!irop_config[q->op].has_src1) continue;
+          op = tcc_ir_op_get_src1(ir, q);
+        }
+        else
+        {
+          if (!irop_config[q->op].has_src2) continue;
+          op = tcc_ir_op_get_src2(ir, q);
+        }
+        int32_t vr = irop_get_vreg(op);
+        if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
+          continue;
+        int pos = TCCIR_DECODE_VREG_POSITION(vr);
+        for (int r = 0; r < rename_count; r++)
+          if (rename_old_pos[r] == pos) rename_old_pos[r] = -1;
+      }
+    }
+  }
+
   /* Write unrolled copies into the NOP'd slots */
   int write_pos = loop->start_idx;
 
   for (int k = 0; k < trip_count; k++)
   {
+    /* Allocate fresh TEMPs for this iteration's renameable body-local TEMPs. */
+    int rename_new_vreg[UNROLL_MAX_RENAME];
+    for (int r = 0; r < rename_count; r++)
+      rename_new_vreg[r] = (rename_old_pos[r] < 0) ? -1 : tcc_ir_vreg_alloc_temp(ir);
+
     for (int b = 0; b < body_count; b++)
     {
       int saved_op = body_ops[b];
@@ -2945,6 +3022,34 @@ int try_unroll_loop_ex(TCCIRState *ir, IRLoop *loop, IRLoops *loops, int loop_id
       if (irop_get_vreg(src2) == iv->vreg)
         src2 = iv_const;
 
+      /* Per-iteration TEMP renaming */
+      for (int r = 0; r < rename_count; r++)
+      {
+        if (rename_old_pos[r] < 0)
+          continue;
+        int32_t old_pos = rename_old_pos[r];
+        int32_t new_vr = rename_new_vreg[r];
+        if (irop_config[saved_op].has_dest)
+        {
+          int32_t vr = irop_get_vreg(dest);
+          if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP &&
+              TCCIR_DECODE_VREG_POSITION(vr) == old_pos)
+            irop_set_vreg(&dest, new_vr);
+        }
+        {
+          int32_t vr = irop_get_vreg(src1);
+          if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP &&
+              TCCIR_DECODE_VREG_POSITION(vr) == old_pos)
+            irop_set_vreg(&src1, new_vr);
+        }
+        {
+          int32_t vr = irop_get_vreg(src2);
+          if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP &&
+              TCCIR_DECODE_VREG_POSITION(vr) == old_pos)
+            irop_set_vreg(&src2, new_vr);
+        }
+      }
+
       /* Find next NOP slot to write into */
       while (write_pos <= loop_end && ir->compact_instructions[write_pos].op != TCCIR_OP_NOP)
         write_pos++;
@@ -2956,6 +3061,7 @@ int try_unroll_loop_ex(TCCIRState *ir, IRLoop *loop, IRLoops *loops, int loop_id
       write_pos++;
     }
   }
+#undef UNROLL_MAX_RENAME
 
   /* If the IV is used after the loop, set its final value.
    * Check if iv vreg is referenced anywhere after the loop. */

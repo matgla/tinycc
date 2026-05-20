@@ -243,6 +243,17 @@ void tcc_ir_free(TCCIRState *ir)
     ir->switch_tables_capacity = 0;
   }
 
+  /* Free switch value tables (SWITCH_LOAD lookup data) */
+  if (ir->switch_value_tables)
+  {
+    for (int i = 0; i < ir->num_switch_value_tables; i++)
+      tcc_free(ir->switch_value_tables[i].values);
+    tcc_free(ir->switch_value_tables);
+    ir->switch_value_tables = NULL;
+    ir->num_switch_value_tables = 0;
+    ir->switch_value_tables_capacity = 0;
+  }
+
   /* Free nested_funcs array (note: NestedFunc structs themselves are owned by TCCState) */
   if (ir->nested_funcs)
   {
@@ -2047,6 +2058,8 @@ const IRRegistersConfig irop_config[] = {
     [TCCIR_OP_NL_LONGJMP] = {0, 1, 0},
     /* Jump table switch: src1=index vreg, src2=table_id, no dest */
     [TCCIR_OP_SWITCH_TABLE] = {0, 1, 1},
+    /* Data-table switch load: dest=loaded value, src1=index, src2=value_table_id */
+    [TCCIR_OP_SWITCH_LOAD] = {1, 1, 1},
     /* __builtin_apply_args: dest=pointer to saved arg block, no sources */
     [TCCIR_OP_BUILTIN_APPLY_ARGS] = {1, 0, 0},
     /* __builtin_apply: dest=return value, src1=fn_ptr, src2=args_block_ptr */

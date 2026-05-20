@@ -32,6 +32,18 @@ int tcc_ir_opt_dce_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_compact_nops(struct TCCIRState *ir);
 int tcc_ir_opt_compact_nops_ex(struct IROptCtx *ctx);
 
+/* Useless Function Body - NOP the entire body when no instruction has an
+ * observable side effect (no STORE, no CALL, no RETURNVALUE, no volatile
+ * sym read, etc.). */
+int tcc_ir_opt_useless_function_body(struct TCCIRState *ir);
+int tcc_ir_opt_useless_function_body_ex(struct IROptCtx *ctx);
+
+/* No-Return Function Collapse - if the function never returns (no RETURN op
+ * anywhere) and has no calls/asm/volatile/setjmp/trap, then nothing outside
+ * the function can observe its writes; collapse the body to `b .`. */
+int tcc_ir_opt_noreturn_collapse(struct TCCIRState *ir);
+int tcc_ir_opt_noreturn_collapse_ex(struct IROptCtx *ctx);
+
 /* Dead Store Elimination - remove stores to dead variables */
 int tcc_ir_opt_dse(struct TCCIRState *ir);
 int tcc_ir_opt_dse_ex(struct IROptCtx *ctx);
@@ -51,6 +63,11 @@ int tcc_ir_opt_const_prop_tmp(struct TCCIRState *ir);
 
 /* Constant fold string builtin calls such as `strcmp` and `strncmp` */
 int tcc_ir_opt_const_string_calls(struct TCCIRState *ir);
+
+/* Eliminate memcpy/memmove(dst, src, n) calls where dst and src compute the
+ * same value — the copy is a provable no-op.  Triggered by `*p = *p`-style
+ * aggregate self-assignments. */
+int tcc_ir_opt_self_copy_elim(struct TCCIRState *ir);
 
 /* Value Tracking through Arithmetic - track constants through ADD/SUB */
 int tcc_ir_opt_value_tracking(struct TCCIRState *ir);
@@ -91,6 +108,16 @@ int tcc_ir_opt_var_to_tmp(struct TCCIRState *ir);
 
 /* ADD/SUB Constant Reassociation - normalize ADD chains */
 int tcc_ir_opt_add_reassoc(struct TCCIRState *ir);
+
+/* VAR self-update chain fold: combine `V = V ± C1; V = V ± C2; ...` into
+ * a single `V = V ± sum`.  Catches unrolled pointer-increment loops where
+ * each iteration becomes a self-update ADD and add_reassoc can't combine. */
+int tcc_ir_opt_var_self_add_chain_fold(struct TCCIRState *ir);
+
+/* CMP stack-address fold: fold `CMP V, Addr[StackLoc[Y]]` (and the
+ * following JUMPIF/SELECT) when V provably equals Addr[StackLoc[X]] + N
+ * with X+N == Y. */
+int tcc_ir_opt_cmp_stack_addr_fold(struct TCCIRState *ir);
 
 /* CMP Expression-Equality Fold - fold CMP when both operands are provably equal */
 int tcc_ir_opt_cmp_expr_fold(struct TCCIRState *ir);
@@ -200,6 +227,18 @@ int tcc_ir_opt_dead_init_via_call(struct TCCIRState *ir);
 /* Redundant Store Elimination */
 int tcc_ir_opt_store_redundant(struct TCCIRState *ir);
 
+/* Dead Local Slot Elimination - remove writes to stack-locals that are never
+ * read and whose address never escapes (except as memset PARAM0).  Also
+ * removes the memset call when its target is entirely dead. */
+int tcc_ir_opt_dead_local_slot_elim(struct TCCIRState *ir);
+int tcc_ir_opt_dead_local_slot_elim_ex(struct IROptCtx *ctx);
+
+/* Dead TEMP_LOCAL Elimination - remove non-call writes to anonymous
+ * temp_local slots (vreg in [-9,-2]) when no later op references the slot.
+ * Companion to dead_call_result's TEMP_LOCAL branch for non-CALL shapes. */
+int tcc_ir_opt_dead_temp_local_elim(struct TCCIRState *ir);
+int tcc_ir_opt_dead_temp_local_elim_ex(struct IROptCtx *ctx);
+
 /* Displacement Load/Store Fusion - fuse ADD(base, #imm) + LOAD/STORE/ASSIGN-lval
  * into indexed memory op with constant index and scale=0. */
 /* tcc_ir_opt_disp_fusion -> ir_gen_disp_fusion in opt_gens_fusion.c */
@@ -305,6 +344,11 @@ int tcc_ir_opt_redundant_init_elim(struct TCCIRState *ir);
  * ASSIGNs + inverted JUMPIF body, eliminating one branch per loop */
 int tcc_ir_opt_backedge_phi_hoist(struct TCCIRState *ir);
 
+/* Forward-Diamond JUMPIF inversion (post-regalloc): when phi copies on the
+ * fall-through path coalesce into no-ops, invert the JUMPIF and skip the
+ * redundant bridging unconditional JUMP. */
+int tcc_ir_opt_post_ra_forward_diamond(struct TCCIRState *ir);
+
 /* ============================================================================
  * Pipeline-ready _ex variants (accept IROptCtx* for pass manager integration)
  * ============================================================================ */
@@ -314,8 +358,11 @@ int tcc_ir_opt_const_var_prop_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_global_init_prop_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_value_tracking_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_add_reassoc_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_var_self_add_chain_fold_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_cmp_stack_addr_fold_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_cmp_expr_fold_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_const_string_calls_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_self_copy_elim_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_copy_prop_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_branch_folding_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_stack_addr_nonnull_fold_ex(struct IROptCtx *ctx);
@@ -333,6 +380,8 @@ int tcc_ir_opt_postinc_fusion_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_assign_fuse_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_var_to_tmp_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_var_tmp_fwd_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_switch_to_data_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_switch_to_data(struct TCCIRState *ir);
 int tcc_ir_opt_redundant_loop_check_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_vrp_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_nonneg_branch_fold_ex(struct IROptCtx *ctx);
@@ -340,6 +389,14 @@ int tcc_ir_opt_float_branch_fold_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_jump_threading_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_eliminate_fallthrough_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_dead_loop_elim_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_uninit_local_ub(struct TCCIRState *ir);
+int tcc_ir_opt_uninit_local_ub_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_ub_only_body_elide(struct TCCIRState *ir);
+int tcc_ir_opt_ub_only_body_elide_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_local_only_body_elide(struct TCCIRState *ir);
+int tcc_ir_opt_local_only_body_elide_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_const_return_uninit_elide(struct TCCIRState *ir);
+int tcc_ir_opt_const_return_uninit_elide_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_redundant_var_assign_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_dead_var_store_elim_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_dead_addrvar_elim_ex(struct IROptCtx *ctx);

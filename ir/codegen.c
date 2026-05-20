@@ -2051,11 +2051,13 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
        * code with no FP / 64-bit / div / inline-asm), avoiding the dead
        * reservation. */
       int might_need_scratch = 0;
+      int has_any_op = 0;
       for (int i = 0; i < ir->next_instruction_index; i++)
       {
         int op = ir->compact_instructions[i].op;
         if (op == TCCIR_OP_NOP)
           continue;
+        has_any_op = 1;
         /* FP/double ops invoke soft-float helpers (or VFP) with multi-reg
          * scratch needs; 64-bit ints are emulated as pairs and may need
          * scratch for the high half; div/mod call helpers; block-copy and
@@ -2082,6 +2084,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
         case TCCIR_OP_STORE_INDEXED:
         case TCCIR_OP_IJUMP:
         case TCCIR_OP_SWITCH_TABLE:
+        case TCCIR_OP_SWITCH_LOAD:
           might_need_scratch = 1;
           break;
         default:
@@ -2105,8 +2108,10 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
         might_need_scratch = 1;
       /* Incoming stack params: reads from [sp + offset_to_args] may collide
        * with live argument registers, forcing get_scratch_reg_with_save to
-       * STR the register into the reserved area before the load. */
-      if (!might_need_scratch && has_stack_params)
+       * STR the register into the reserved area before the load.
+       * Only relevant if some non-NOP op actually runs — a fully-NOP'd body
+       * (useless_function_body) never loads those params. */
+      if (!might_need_scratch && has_stack_params && has_any_op)
         might_need_scratch = 1;
       /* Large frames need scratch to materialise SP-relative offsets that
        * exceed the immediate-encoding range of Thumb-2 LDR/STR.  A simple
@@ -3099,6 +3104,23 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
         tcc_ir_spill_cache_clear(&ir->spill_cache);
         break;
       }
+      case TCCIR_OP_SWITCH_LOAD:
+      {
+        int vt_id = (int)irop_get_imm64_ex(ir, src2_ir);
+        TCCIRSwitchValueTable *vtab = &ir->switch_value_tables[vt_id];
+        MopArgs a = DECODE(.dest = 1, .src1 = 1);
+        if (is_dry_run)
+        {
+          ind += tcc_gen_machine_switch_load_dry_run_size(vtab->num_entries);
+        }
+        else
+        {
+          tcc_gen_machine_insn_scratch_reset();
+          tcc_gen_machine_switch_load_mop(a.src1, a.dest, vtab, ir, i);
+        }
+        tcc_ir_spill_cache_clear(&ir->spill_cache);
+        break;
+      }
       case TCCIR_OP_SETIF:
       {
         MopArgs a = DECODE(.dest = 1, .src1 = 1);
@@ -3447,7 +3469,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
     }
   }
 
-  if (!ir->naked)
+  if (!ir->naked && !ir->noreturn)
     tcc_gen_machine_epilog(ir->leaffunc);
   tcc_ir_codegen_backpatch_jumps(ir, ir_to_code_mapping);
 

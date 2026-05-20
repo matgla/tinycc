@@ -1632,6 +1632,141 @@ int tcc_ir_opt_backedge_phi_hoist(TCCIRState *ir)
   return changes;
 }
 
+/* Forward-diamond JUMPIF inversion (post-regalloc).
+ *
+ * Pattern:
+ *   i:           JUMPIF cond -> T              ; T = jump_idx + 1
+ *   i+1..jump_idx-1: ASSIGN copies, all coalesced no-ops (dest reg == src reg)
+ *   jump_idx:    JUMP M                        ; M > T (forward merge)
+ *   T:           <then-target>                 ; falls through to merge
+ *
+ * When register allocation coalesces the phi copies into no-ops, the entire
+ * fall-through path between the JUMPIF and JUMP becomes empty.  Invert the
+ * JUMPIF and retarget it to M; NOP the ASSIGNs and the JUMP.  Saves one
+ * unconditional b.w per occurrence.
+ *
+ * Common after SWITCH_LOAD lowering where the out-of-range path carries the
+ * pre-initialized default value via a phi copy that coalesces away. */
+int tcc_ir_opt_post_ra_forward_diamond(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  if (n < 3) return 0;
+
+  int changes = 0;
+
+  for (int i = 0; i + 2 < n; i++) {
+    IRQuadCompact *jif = &ir->compact_instructions[i];
+    if (jif->op != TCCIR_OP_JUMPIF)
+      continue;
+
+    int exit_target = (int)irop_get_imm32(tcc_ir_op_get_dest(ir, jif));
+    int cond = (int)tcc_ir_op_get_src1(ir, jif).u.imm32;
+
+    if (exit_target <= i || exit_target >= n)
+      continue;
+
+    /* Count consecutive ASSIGNs after JUMPIF (allow 0 — degenerate case) */
+    int num_assigns = 0;
+    for (int j = i + 1; j < n; j++) {
+      IRQuadCompact *q = &ir->compact_instructions[j];
+      if (q->op == TCCIR_OP_ASSIGN)
+        num_assigns++;
+      else
+        break;
+    }
+    if (num_assigns > 8)
+      continue;
+
+    int jump_idx = i + 1 + num_assigns;
+    if (jump_idx >= n)
+      continue;
+    IRQuadCompact *jmp = &ir->compact_instructions[jump_idx];
+    if (jmp->op != TCCIR_OP_JUMP)
+      continue;
+
+    int merge_target = (int)irop_get_imm32(tcc_ir_op_get_dest(ir, jmp));
+    if (merge_target <= jump_idx || merge_target >= n)
+      continue;
+
+    /* Strict diamond: JUMPIF target must be the instruction right after JUMP */
+    if (exit_target != jump_idx + 1)
+      continue;
+
+    /* No-op if both legs go to same place */
+    if (merge_target == exit_target)
+      continue;
+
+    /* Any ASSIGN that survives between JUMPIF and JUMP must be a coalesced
+     * no-op (dest and src in the same physical register, neither spilled). */
+    int safe = 1;
+    for (int j = 0; j < num_assigns && safe; j++) {
+      IRQuadCompact *aq = &ir->compact_instructions[i + 1 + j];
+      IROperand adst = tcc_ir_op_get_dest(ir, aq);
+      IROperand asrc = tcc_ir_op_get_src1(ir, aq);
+      int32_t adst_vr = irop_get_vreg(adst);
+      int32_t asrc_vr = irop_get_vreg(asrc);
+      if (adst_vr < 0 || asrc_vr < 0) { safe = 0; break; }
+
+      int dst_reg = -2, dst_reg1 = -2, src_reg = -2, src_reg1 = -2;
+      int dst_spilled = 0, src_spilled = 0;
+      for (int k = 0; k < ir->ls.next_interval_index; k++) {
+        LSLiveInterval *li = &ir->ls.intervals[k];
+        if (li->vreg == (uint32_t)adst_vr) {
+          if (li->stack_location != 0 || li->r0 < 0)
+            dst_spilled = 1;
+          else {
+            dst_reg = li->r0;
+            dst_reg1 = li->r1;
+          }
+        }
+        if (li->vreg == (uint32_t)asrc_vr) {
+          if (li->stack_location != 0 || li->r0 < 0)
+            src_spilled = 1;
+          else {
+            src_reg = li->r0;
+            src_reg1 = li->r1;
+          }
+        }
+      }
+      if (dst_spilled || src_spilled) { safe = 0; break; }
+      if (dst_reg < 0 || src_reg < 0) { safe = 0; break; }
+      /* Require identical reg pair (handles both 32-bit and 64-bit) */
+      if (dst_reg != src_reg || dst_reg1 != src_reg1) { safe = 0; break; }
+    }
+    if (!safe)
+      continue;
+
+    int inv_cond = invert_condition(cond);
+    if (inv_cond < 0)
+      continue;
+
+    /* Retarget JUMPIF to merge and invert its condition */
+    {
+      IROperand new_dest = {0};
+      new_dest.tag = IROP_TAG_IMM32;
+      new_dest.u.imm32 = merge_target;
+      tcc_ir_op_set_dest(ir, jif, new_dest);
+
+      IROperand new_cond = {0};
+      new_cond.tag = IROP_TAG_IMM32;
+      new_cond.u.imm32 = inv_cond;
+      tcc_ir_op_set_src1(ir, jif, new_cond);
+    }
+
+    /* NOP the no-op ASSIGNs and the bridging JUMP */
+    for (int j = 0; j < num_assigns; j++)
+      ir->compact_instructions[i + 1 + j].op = TCCIR_OP_NOP;
+    ir->compact_instructions[jump_idx].op = TCCIR_OP_NOP;
+
+    /* merge_target was already a JUMP target; is_jump_target stays set.
+     * exit_target loses one predecessor but is conservatively left flagged. */
+
+    changes++;
+  }
+
+  return changes;
+}
+
 int tcc_ir_opt_var_to_tmp_ex(IROptCtx *ctx) { return tcc_ir_opt_var_to_tmp(ctx->ir); }
 int tcc_ir_opt_var_tmp_fwd_ex(IROptCtx *ctx) { return tcc_ir_opt_var_tmp_fwd(ctx->ir); }
 int tcc_ir_opt_redundant_loop_check_ex(IROptCtx *ctx) { return tcc_ir_opt_redundant_loop_check(ctx->ir); }

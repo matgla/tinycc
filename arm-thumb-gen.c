@@ -3108,6 +3108,70 @@ ST_FUNC void tcc_gen_machine_switch_table_mop(MachineOperand src, TCCIRSwitchTab
   mach_release_all(&ctx);
 }
 
+/* SWITCH_LOAD: data-table dispatch that loads values[index] into dest.
+ *
+ * Layout (uniform 14-byte preamble):
+ *
+ *   LSL.W rt, index, #2          (4 bytes)
+ *   ADD   rt, rt, pc             (2 bytes)         ; PC=preamble_start+8
+ *   LDR.W ip,  [rt, #6]          (4 bytes)         ; load table[index] -> ip
+ *   B.W   skip                   (4 bytes)         ; jump past the table
+ *   <table data>                 (4*N bytes)
+ *   skip:
+ *   [optional STR/MOV ip -> dest]                  ; only if dest is spilled,
+ *                                                  ;   emitted by the IR-level
+ *                                                  ;   ASSIGN that follows.
+ *
+ * The fixed loaded register is R_IP (same as SWITCH_TABLE's scratch); the
+ * IR-level optimization wraps SWITCH_LOAD with an ASSIGN that places IP into
+ * the real dest, so we don't need a separate spill path here.
+ *
+ * SYMREF entries emit R_ARM_ABS32 relocations at their table slots; the
+ * linker fills in the absolute symbol address.
+ */
+/* SWITCH_LOAD dispatch size: literal-pool LDR (4 bytes, T2 encoding for
+ * R_IP) + indexed shifted LDR.W (4 bytes).  The table itself lives in
+ * .rodata and contributes no .text bytes. */
+ST_FUNC int tcc_gen_machine_switch_load_dry_run_size(int num_entries)
+{
+  (void)num_entries;
+  return 8;
+}
+
+ST_FUNC void tcc_gen_machine_switch_load_mop(MachineOperand src, MachineOperand dest, TCCIRSwitchValueTable *vtab,
+                                             TCCIRState *ir, int ir_idx)
+{
+  (void)ir_idx;
+  (void)ir;
+
+  TRACE("'tcc_gen_machine_switch_load_mop' vt_id=%d entries=%d\n", (int)(vtab - ir->switch_value_tables),
+        vtab->num_entries);
+
+  if (!vtab->rodata_sym)
+    tcc_error("internal error: SWITCH_LOAD table has no rodata symbol (switch_to_data should have allocated it)");
+
+  MachineCodegenContext ctx = {0};
+  int index_reg = mach_ensure_in_reg(&ctx, &src, 0);
+  if (!thumb_is_hw_reg(index_reg))
+    tcc_error("internal error: SWITCH_LOAD index not in a hardware register");
+
+  int dest_is_spilled = (dest.kind != MACH_OP_REG);
+  if (dest_is_spilled)
+    tcc_error("internal error: SWITCH_LOAD dest must be in a hardware register");
+
+  int dest_reg = dest.u.reg.r0;
+
+  /* Load the table's base address from the literal pool into IP. */
+  _lfc_sym = vtab->rodata_sym;
+  load_full_const(R_IP, PREG_NONE, 0, 0);
+
+  /* dest = table[index] via LDR.W dest, [ip, index, LSL #2]. */
+  thumb_shift shift = {THUMB_SHIFT_LSL, 2, THUMB_SHIFT_IMMEDIATE};
+  ot_check(th_ldr_reg((uint32_t)dest_reg, (uint32_t)R_IP, (uint32_t)index_reg, shift, ENFORCE_ENCODING_32BIT));
+
+  mach_release_all(&ctx);
+}
+
 void gsym_addr(int t, int a)
 {
   TRACE("'gsym_addr' %.8x branch target: %.8x\n", t, a);

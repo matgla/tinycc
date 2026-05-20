@@ -452,6 +452,33 @@ int tcc_ir_opt_vrp(TCCIRState *ir)
           int tok = (int)irop_get_imm64_ex(ir, cond_op);
           IROperand jmp_dest = tcc_ir_op_get_dest(ir, jump_q);
 
+          /* Tautology fold: unsigned compare against zero is always-true
+           * (>=U 0) or always-false (<U 0) regardless of the operand's value.
+           * No range info required. */
+          if (cmp_val == 0)
+          {
+            int fold_taut = -1;
+            if (tok == 0x93) /* TOK_UGE */
+              fold_taut = 1;
+            else if (tok == 0x92) /* TOK_ULT */
+              fold_taut = 0;
+            if (fold_taut == 1)
+            {
+              q->op = TCCIR_OP_NOP;
+              jump_q->op = TCCIR_OP_JUMP;
+              tcc_ir_set_dest(ir, i + 1, jmp_dest);
+              changes++;
+              continue;
+            }
+            else if (fold_taut == 0)
+            {
+              q->op = TCCIR_OP_NOP;
+              jump_q->op = TCCIR_OP_NOP;
+              changes++;
+              continue;
+            }
+          }
+
           /* Try to fold using known range */
           if (src_slot >= 0 && ranges[src_slot].valid)
           {

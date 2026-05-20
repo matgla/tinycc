@@ -160,6 +160,8 @@ const char *tcc_ir_get_op_name(TccIrOp op)
     return "MLA";
   case TCCIR_OP_SWITCH_TABLE:
     return "SWITCH_TABLE";
+  case TCCIR_OP_SWITCH_LOAD:
+    return "SWITCH_LOAD";
   case TCCIR_OP_BUILTIN_APPLY_ARGS:
     return "BUILTIN_APPLY_ARGS";
   case TCCIR_OP_BUILTIN_APPLY:

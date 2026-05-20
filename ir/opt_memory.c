@@ -13,6 +13,8 @@
 
 #define USING_GLOBALS
 
+#include <limits.h>
+
 #include "ir.h"
 #include "opt.h"
 #include "opt_engine.h"
@@ -2238,17 +2240,48 @@ int tcc_ir_opt_sl_forward(TCCIRState *ir)
           const Sym *eff_sym = lea_map[bp].sym;
           uint32_t lih = ((uintptr_t)eff_sym * 31 + (uint32_t)eff_off * 17) % 128;
           StoreEntry *lie;
+          /* Access width: for LOAD_INDEXED, src1 is the base pointer whose
+           * btype is the pointer type (often 0/NONE) — not the access width.
+           * The dest's btype encodes the loaded value's width, which is what
+           * we must match against the store_btype recorded when the value
+           * was stored. */
+          int li_access_btype = (int)tcc_ir_op_get_dest(ir, q).btype;
           for (lie = hash_table[lih]; lie != NULL; lie = lie->next)
           {
             if (!lie->valid)
               continue;
             if (lie->local_sym != eff_sym || lie->local_offset != eff_off)
               continue;
-            if (lie->store_btype != li_src1.btype)
+            if (lie->store_btype != li_access_btype)
               continue;
             int li_tag = irop_get_tag(lie->stored_value);
-            if (li_tag != IROP_TAG_IMM32 && li_tag != IROP_TAG_I64 && li_tag != IROP_TAG_STACKOFF)
-              continue;
+            int li_is_const = (li_tag == IROP_TAG_IMM32 || li_tag == IROP_TAG_I64 || li_tag == IROP_TAG_STACKOFF);
+            if (!li_is_const)
+            {
+              /* TEMP/VAR/PARAM forwarding: stored_value is a register-holding
+               * vreg.  Safe to forward only when (a) the value is a true vreg
+               * (not an lvalue/deref), and (b) that vreg has not been written
+               * to between the originating STORE and this LOAD_INDEXED.
+               * TEMPs in TCC IR are mostly SSA-like, but a conservative check
+               * via the write tracker mirrors what the plain-LOAD path does. */
+              if (lie->stored_value.is_lval)
+                continue;
+              int32_t sv_vr = irop_get_vreg(lie->stored_value);
+              if (sv_vr < 0)
+                continue;
+              int sv_type = TCCIR_DECODE_VREG_TYPE(sv_vr);
+              int sv_pos = TCCIR_DECODE_VREG_POSITION(sv_vr);
+              VregWriteTracker *sv_tracker = NULL;
+              if (sv_type == TCCIR_VREG_TYPE_VAR && sv_pos <= max_var)
+                sv_tracker = &var_writes[sv_pos];
+              else if (sv_type == TCCIR_VREG_TYPE_TEMP && sv_pos <= max_tmp)
+                sv_tracker = &tmp_writes[sv_pos];
+              else if (sv_type == TCCIR_VREG_TYPE_PARAM && sv_pos <= max_par)
+                sv_tracker = &par_writes[sv_pos];
+              if (sv_tracker && sv_tracker->gen == write_tracker_gen &&
+                  sv_tracker->last_write_idx > lie->instruction_idx)
+                continue;
+            }
             if (li_tag == IROP_TAG_STACKOFF && lie->stored_value.is_lval)
               continue;
             q->op = TCCIR_OP_ASSIGN;
@@ -2893,16 +2926,23 @@ int tcc_ir_opt_sl_forward(TCCIRState *ir)
         /* Not a mergeable overwrite — invalidate as before */
         new_entry->valid = 0;
       }
-      /* Invalidate wider entries at lower offsets that partially overlap.
-       * A store of N bytes at offset X overwrites part of any wider entry
-       * at offset Y < X where Y + entry_bytes > X.  Example:
-       *   int-store  #0 at -48   (creates 32-bit entry)
-       *   short-store #73 at -48 (merges low bits into 32-bit entry)
-       *   short-store #65531 at -46 (must invalidate 32-bit entry at -48) */
+      /* Wider-entry overlap with narrower store.  A store of N bytes at
+       * offset X overlaps any wider entry at offset Y < X where
+       * Y + entry_bytes > X.  When both values are constant immediates and
+       * the wider entry is <=32 bits, merge the new bytes into the wider
+       * entry instead of invalidating.  This preserves cross-width forwarding
+       * for patterns like
+       *   STORE32 -16=#0; STORE8 -16=#-1; STORE8 -15=#-1; ... LDRSB -16
+       * where bytes 1..3 of the 32-bit entry get refreshed as each narrow
+       * store lands.  Only fall back to invalidate when the merge isn't
+       * representable (non-immediates, INT64 entries, etc.). */
       {
         int max_delta = (new_bits_local > 0) ? (4 - new_bits_local / 8) : 0;
         if (max_delta < 0)
           max_delta = 0;
+        IROperand new_src1 = tcc_ir_op_get_src1(ir, q);
+        int new_src_is_imm = irop_is_immediate(new_src1);
+        int new_bytes = (new_bits_local > 0) ? (new_bits_local / 8) : 0;
         for (int delta = 1; delta <= max_delta; delta++)
         {
           int64_t check_off = addr_offset - delta;
@@ -2927,8 +2967,27 @@ int tcc_ir_opt_sl_forward(TCCIRState *ir)
             default:
               break;
             }
-            if (entry_bytes > delta)
-              ce->valid = 0;
+            if (entry_bytes <= delta)
+              continue;
+            /* Try to merge the narrow store's bytes into the wider entry. */
+            int ce_is_imm = irop_is_immediate(ce->stored_value);
+            if (new_src_is_imm && ce_is_imm && new_bytes > 0 && entry_bytes <= 4 &&
+                delta + new_bytes <= entry_bytes)
+            {
+              int32_t old_v = ce->stored_value.u.imm32;
+              int32_t new_v = new_src1.u.imm32;
+              uint32_t byte_mask = (new_bytes == 4) ? 0xFFFFFFFFu : ((1u << (new_bytes * 8)) - 1);
+              uint32_t pos_mask = byte_mask << (delta * 8);
+              uint32_t value_in_pos = ((uint32_t)new_v & byte_mask) << (delta * 8);
+              int32_t merged = (int32_t)(((uint32_t)old_v & ~pos_mask) | value_in_pos);
+              ce->stored_value.u.imm32 = merged;
+              ce->instruction_idx = i;
+              LOG_SL_FWD("STORE@i=%d CROSS-MERGE into store@i=? at off=%lld delta=%d: "
+                         "new_bytes=%d entry_bytes=%d old_v=%d new_v=%d merged=%d",
+                         i, (long long)check_off, delta, new_bytes, entry_bytes, old_v, new_v, merged);
+              continue;
+            }
+            ce->valid = 0;
           }
         }
       }
@@ -3290,6 +3349,9 @@ int tcc_ir_opt_sl_forward(TCCIRState *ir)
           _w = 8;                                                                                                      \
         else if ((op).btype == IROP_BTYPE_STRUCT)                                                                      \
           _w = 1024;                                                                                                   \
+        /* Complex types implicitly read both real and imag halves. */                                                 \
+        if ((op).is_complex)                                                                                           \
+          _w *= 2;                                                                                                     \
         if (off < _roff + _w)                                                                                          \
           still_read = 1;                                                                                              \
       }                                                                                                                \
@@ -3607,6 +3669,1117 @@ int tcc_ir_opt_store_redundant(TCCIRState *ir)
 
   return changes;
 #undef RSE_MAX_ACTIVE
+}
+
+/* Dead Local Slot Elimination
+ *
+ * Kill stores to stack-local offsets that are never read and whose address
+ * never escapes — except as PARAM0 of a recognized write-only intrinsic
+ * (memset / __aeabi_memset).  Also kill the memset call itself when its
+ * target range is entirely dead.
+ *
+ * Catches the gcc.c-torture compile/931004-1.c pattern: a large local array
+ * initialized to constants that nothing reads or escapes.  GCC reduces such
+ * a function to a bare `return 0`; this pass closes most of that gap.
+ *
+ * CONSERVATIVE: bails on functions with IJUMP, or on any Addr[StackLoc[X]]
+ * use outside memset PARAM0.  In those cases offset-level liveness is unsafe
+ * without knowing object boundaries (the stack layout is not yet populated
+ * during the IR optimization pipeline).
+ */
+int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  if (n == 0)
+    return 0;
+
+  /* Nested function: `StackLoc[X]` here is the parent's frame, accessed via
+   * the static chain register.  We have no way to see the parent's reads, so
+   * any store could be live there. */
+  if (ir->captured_count > 0 || ir->has_static_chain)
+    return 0;
+
+  for (int i = 0; i < n; i++)
+  {
+    int op = ir->compact_instructions[i].op;
+    if (op == TCCIR_OP_IJUMP || op == TCCIR_OP_SET_CHAIN || op == TCCIR_OP_INIT_CHAIN_SLOT)
+      return 0;
+  }
+
+  int max_call_id = ir->next_call_id;
+  /* Per-call bitmaps: write-through-PARAM0 helpers (memset/memcpy/memmove).
+   * For memset and memmove4/8 the size param index is 1; for the standard
+   * memcpy/memmove ABI the size param index is 2.  We track both so the
+   * elimination phase below knows where to find the size. */
+  uint8_t *is_writecall = NULL;       /* any of: memset/memcpy/memmove family */
+  uint8_t *writecall_size_at_2 = NULL; /* 1 = size is param 2; 0 = size is param 1 */
+  /* memcpy/memmove also READ through PARAM1: track them so the per-store
+   * elimination below can convert that read into a bounded live[] range
+   * instead of an unbounded non-tame escape that would gate every other
+   * dead store. */
+  uint8_t *is_memcpy_like = NULL;
+  int writecall_count = 0;
+  if (max_call_id > 0)
+  {
+    is_writecall = tcc_mallocz((max_call_id + 7) / 8);
+    writecall_size_at_2 = tcc_mallocz((max_call_id + 7) / 8);
+    is_memcpy_like = tcc_mallocz((max_call_id + 7) / 8);
+  }
+
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_FUNCCALLVOID && q->op != TCCIR_OP_FUNCCALLVAL)
+      continue;
+    Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+    if (!callee)
+      continue;
+    const char *name = get_tok_str(callee->v, NULL);
+    if (!name)
+      continue;
+    int sz_at_2 = -1;
+    int memcpy_like = 0;
+    if (strcmp(name, "__aeabi_memset") == 0 || strcmp(name, "memset") == 0)
+      sz_at_2 = 0;
+    else if (strcmp(name, "__aeabi_memmove4") == 0 || strcmp(name, "__aeabi_memmove8") == 0 ||
+             strcmp(name, "__aeabi_memmove") == 0 || strcmp(name, "__aeabi_memcpy4") == 0 ||
+             strcmp(name, "__aeabi_memcpy8") == 0 || strcmp(name, "__aeabi_memcpy") == 0 ||
+             strcmp(name, "memmove") == 0 || strcmp(name, "memcpy") == 0)
+    {
+      sz_at_2 = 1;
+      memcpy_like = 1;
+    }
+    if (sz_at_2 < 0)
+      continue;
+    int cid = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q)));
+    if (cid < 0 || cid >= max_call_id || !is_writecall)
+      continue;
+    is_writecall[cid / 8] |= (1 << (cid % 8));
+    if (sz_at_2)
+      writecall_size_at_2[cid / 8] |= (1 << (cid % 8));
+    if (memcpy_like)
+      is_memcpy_like[cid / 8] |= (1 << (cid % 8));
+    writecall_count++;
+  }
+
+  /* ==========================================================================
+   * Tameness analysis for address-of-local escapes.
+   *
+   * Goal: prove that some local slots' addresses, although taken, never reach
+   * a context that reads the slot.  Such "tame" slots remain safely
+   * eliminable.  Without this, the bail at the address-of escape below would
+   * give up on the whole function.
+   *
+   * vreg_slot[V] tracks which slot V points to:
+   *   -1 = unknown / no slot
+   *   -2 = AMBIGUOUS (multiple slots)
+   *   >=0 encoded as (offset - INT_MIN) so we can store negative offsets.
+   *
+   * Tame use of a derived-address vreg V (V → slot S, !ambiguous):
+   *   - ADD/SUB with constant: derived; propagate
+   *   - ASSIGN: derived; propagate
+   *   - CMP src: harmless
+   *   - STORE dest (write through V): harmless
+   *   - PARAM0 of memset/memcpy/memmove: harmless
+   * Anything else → non-tame for slot S (and ambiguity poisons every slot).
+   * ========================================================================== */
+  int max_vreg = ir->next_temporary_variable + ir->next_local_variable + ir->next_parameter + 16;
+  int *vreg_slot = tcc_malloc((size_t)max_vreg * sizeof(int));
+  for (int v = 0; v < max_vreg; v++)
+    vreg_slot[v] = -1;
+  /* vreg_external[V]=1 means V provably came from external memory (a PARAM
+   * directly or pointer arithmetic on one) and therefore can't point into
+   * this function's local frame. Used to relax the has_unknown_deref bail
+   * for TEMP lval-loads whose base is a param-derived pointer. */
+  unsigned char *vreg_external = tcc_mallocz((size_t)max_vreg);
+#define VR_SLOT_AMBIG INT_MIN
+#define VR_FLAT(_vr)                                                                                                   \
+  ({                                                                                                                   \
+    int _t = TCCIR_DECODE_VREG_TYPE(_vr);                                                                              \
+    int _p = TCCIR_DECODE_VREG_POSITION(_vr);                                                                          \
+    int _b = -1;                                                                                                       \
+    if (_t == TCCIR_VREG_TYPE_TEMP)                                                                                    \
+      _b = _p;                                                                                                         \
+    else if (_t == TCCIR_VREG_TYPE_VAR)                                                                                \
+      _b = ir->next_temporary_variable + _p;                                                                           \
+    else if (_t == TCCIR_VREG_TYPE_PARAM)                                                                              \
+      _b = ir->next_temporary_variable + ir->next_local_variable + _p;                                                 \
+    (_b >= 0 && _b < max_vreg) ? _b : -1;                                                                              \
+  })
+
+  /* Per-slot tame state, stored as a parallel pair of arrays.  Slots are
+   * added on first observation (first addr-of-local escape). */
+  int slot_cap = 32;
+  int *tame_slot_off = tcc_malloc((size_t)slot_cap * sizeof(int));
+  uint8_t *tame_slot_ok = tcc_malloc((size_t)slot_cap * sizeof(uint8_t));
+  int tame_slot_n = 0;
+  /* Set when an unknown-slot TMP is dereferenced: such a deref could touch
+   * any byte of the frame, even offsets whose address was never taken
+   * explicitly.  Disables the "off not in tame_slot → eligible" shortcut. */
+  int has_unknown_deref = 0;
+
+#define TAME_FIND_OR_ADD(_off)                                                                                         \
+  ({                                                                                                                   \
+    int _x = -1;                                                                                                       \
+    for (int _i = 0; _i < tame_slot_n; _i++)                                                                           \
+      if (tame_slot_off[_i] == (_off))                                                                                 \
+      {                                                                                                                \
+        _x = _i;                                                                                                       \
+        break;                                                                                                         \
+      }                                                                                                                \
+    if (_x < 0)                                                                                                        \
+    {                                                                                                                  \
+      if (tame_slot_n >= slot_cap)                                                                                     \
+      {                                                                                                                \
+        slot_cap *= 2;                                                                                                 \
+        tame_slot_off = tcc_realloc(tame_slot_off, (size_t)slot_cap * sizeof(int));                                    \
+        tame_slot_ok = tcc_realloc(tame_slot_ok, (size_t)slot_cap * sizeof(uint8_t));                                  \
+      }                                                                                                                \
+      _x = tame_slot_n++;                                                                                              \
+      tame_slot_off[_x] = (_off);                                                                                      \
+      tame_slot_ok[_x] = 1;                                                                                            \
+    }                                                                                                                  \
+    _x;                                                                                                                \
+  })
+#define TAME_FIND(_off)                                                                                                \
+  ({                                                                                                                   \
+    int _x = -1;                                                                                                       \
+    for (int _i = 0; _i < tame_slot_n; _i++)                                                                           \
+      if (tame_slot_off[_i] == (_off))                                                                                 \
+      {                                                                                                                \
+        _x = _i;                                                                                                       \
+        break;                                                                                                         \
+      }                                                                                                                \
+    _x;                                                                                                                \
+  })
+
+  /* Step 1: seed vreg_slot[] from direct addr-of-local sources.
+   * Patterns:
+   *   V <-- Addr[StackLoc[X]]                       (ASSIGN or LEA)
+   *   V <-- Addr[StackLoc[X]] ADD/SUB <anything>    (offset may be variable)
+   */
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_ASSIGN && q->op != TCCIR_OP_LEA &&
+        q->op != TCCIR_OP_ADD && q->op != TCCIR_OP_SUB)
+      continue;
+    if (!irop_config[q->op].has_dest)
+      continue;
+    IROperand dest = tcc_ir_op_get_dest(ir, q);
+    int dv = VR_FLAT(irop_get_vreg(dest));
+    if (dv < 0)
+      continue;
+    IROperand s1 = tcc_ir_op_get_src1(ir, q);
+    if (irop_get_tag(s1) != IROP_TAG_STACKOFF || !s1.is_local || s1.is_lval || irop_get_vreg(s1) != -1)
+      continue;
+    int slot = irop_get_stack_offset(s1);
+    TAME_FIND_OR_ADD(slot); /* register slot — default tame=1 */
+    if (vreg_slot[dv] == -1)
+      vreg_slot[dv] = slot;
+    else if (vreg_slot[dv] != slot)
+      vreg_slot[dv] = VR_SLOT_AMBIG;
+  }
+
+  /* Step 2: propagate slot membership through ASSIGN and ADD/SUB regardless
+   * of whether the offset operand is a constant.  The result vreg still
+   * points into the same slot — we just don't know the exact offset, which
+   * is fine for tameness (we never use the offset value). */
+  int changed = 1;
+  while (changed)
+  {
+    changed = 0;
+    for (int i = 0; i < n; i++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      if (q->op != TCCIR_OP_ASSIGN && q->op != TCCIR_OP_LEA &&
+          q->op != TCCIR_OP_ADD && q->op != TCCIR_OP_SUB)
+        continue;
+      if (!irop_config[q->op].has_dest)
+        continue;
+      IROperand dest = tcc_ir_op_get_dest(ir, q);
+      int dv = VR_FLAT(irop_get_vreg(dest));
+      if (dv < 0)
+        continue;
+      IROperand s1 = tcc_ir_op_get_src1(ir, q);
+      int sv1 = VR_FLAT(irop_get_vreg(s1));
+      int s1_slot = (sv1 >= 0) ? vreg_slot[sv1] : -1;
+      int next = s1_slot;
+      if (q->op != TCCIR_OP_ASSIGN && q->op != TCCIR_OP_LEA)
+      {
+        IROperand s2 = tcc_ir_op_get_src2(ir, q);
+        int sv2 = VR_FLAT(irop_get_vreg(s2));
+        int s2_slot = (sv2 >= 0) ? vreg_slot[sv2] : -1;
+        /* &slot + ptr-to-slot' is ambiguous (which slot does the result
+         * point into?). */
+        if (s2_slot != -1)
+        {
+          if (s1_slot == -1)
+            next = s2_slot;
+          else if (s1_slot != s2_slot)
+            next = VR_SLOT_AMBIG;
+        }
+      }
+      if (next == -1)
+        continue;
+      int prev = vreg_slot[dv];
+      if (prev == -1)
+      {
+        vreg_slot[dv] = next;
+        changed = 1;
+      }
+      else if (prev == VR_SLOT_AMBIG)
+      {
+        /* already poisoned */
+      }
+      else if (prev != next)
+      {
+        vreg_slot[dv] = VR_SLOT_AMBIG;
+        changed = 1;
+      }
+    }
+  }
+
+  /* Step 2b: seed and propagate vreg_external.
+   *   - Seed: dest <-- PARAM (ASSIGN), dest <-- imm (ADD/SUB const, etc.).
+   *   - Propagate: dest <-- ext-src1 [ASSIGN/LEA], dest <-- ext OP {imm|ext}.
+   * A vreg that has both a stack-slot and external provenance gets cleared
+   * (ambiguous); we keep only the conservative case. */
+  {
+    int changed_ext = 1;
+    while (changed_ext)
+    {
+      changed_ext = 0;
+      for (int i = 0; i < n; i++)
+      {
+        IRQuadCompact *q = &ir->compact_instructions[i];
+        if (q->op != TCCIR_OP_ASSIGN && q->op != TCCIR_OP_LEA && q->op != TCCIR_OP_ADD && q->op != TCCIR_OP_SUB)
+          continue;
+        if (!irop_config[q->op].has_dest)
+          continue;
+        IROperand dest = tcc_ir_op_get_dest(ir, q);
+        int dv = VR_FLAT(irop_get_vreg(dest));
+        if (dv < 0 || vreg_external[dv])
+          continue;
+        if (vreg_slot[dv] != -1)
+          continue; /* known to carry a stack slot — not "external" */
+        IROperand s1 = tcc_ir_op_get_src1(ir, q);
+        IROperand s2 = irop_config[q->op].has_src2 ? tcc_ir_op_get_src2(ir, q) : s1;
+        int sv1 = VR_FLAT(irop_get_vreg(s1));
+        int sv2 = irop_config[q->op].has_src2 ? VR_FLAT(irop_get_vreg(s2)) : -1;
+        int s1_param = (irop_get_vreg(s1) != -1 && TCCIR_DECODE_VREG_TYPE(irop_get_vreg(s1)) == TCCIR_VREG_TYPE_PARAM &&
+                        !s1.is_lval);
+        int s1_ext = s1_param || (sv1 >= 0 && vreg_external[sv1]);
+        int s1_const = (irop_get_tag(s1) == IROP_TAG_IMM32 || irop_get_tag(s1) == IROP_TAG_I64);
+        int s2_param = (irop_config[q->op].has_src2 && irop_get_vreg(s2) != -1 &&
+                        TCCIR_DECODE_VREG_TYPE(irop_get_vreg(s2)) == TCCIR_VREG_TYPE_PARAM && !s2.is_lval);
+        int s2_ext = s2_param || (sv2 >= 0 && vreg_external[sv2]);
+        int s2_const = irop_config[q->op].has_src2 &&
+                       (irop_get_tag(s2) == IROP_TAG_IMM32 || irop_get_tag(s2) == IROP_TAG_I64);
+        int ok;
+        if (q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_LEA)
+          ok = (s1_ext || s1_const);
+        else /* ADD/SUB: both must be ext/const (and at least one non-const) */
+          ok = (s1_ext && (s2_ext || s2_const)) || (s2_ext && (s1_ext || s1_const));
+        if (ok && !vreg_external[dv])
+        {
+          vreg_external[dv] = 1;
+          changed_ext = 1;
+        }
+      }
+    }
+  }
+
+  /* Step 3: classify every use of a derived-address vreg.  Anything that
+   * isn't a recognized tame pattern marks its slot non-tame. */
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+
+    /* Check if this is a write-call PARAM0 (which is harmless). */
+    int is_write_p0 = 0;
+    /* PARAM1 of memcpy/memmove is a bounded READ. With a constant size we
+     * can model it as a live[] read range later instead of an unbounded
+     * escape — see the bounded_read live[] pass below.  Tag this PARAM
+     * as tame for the slot classification step so it doesn't poison the
+     * function-wide any_nontame gate. */
+    int is_memcpy_src_bounded = 0;
+    if ((q->op == TCCIR_OP_FUNCPARAMVAL || q->op == TCCIR_OP_FUNCPARAMVOID) && is_writecall)
+    {
+      uint32_t enc = (uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q));
+      int cid = TCCIR_DECODE_CALL_ID(enc);
+      int pidx = TCCIR_DECODE_PARAM_IDX(enc);
+      if (cid >= 0 && cid < max_call_id && (is_writecall[cid / 8] & (1 << (cid % 8))) && pidx == 0)
+        is_write_p0 = 1;
+      else if (cid >= 0 && cid < max_call_id && (is_memcpy_like[cid / 8] & (1 << (cid % 8))) && pidx == 1)
+      {
+        /* memcpy/memmove source pointer.  Need a constant size param to be
+         * able to bound the read precisely; otherwise leave non-tame. */
+        IROperand sz_op;
+        for (int j = i + 1; j < n; j++)
+        {
+          IRQuadCompact *qj = &ir->compact_instructions[j];
+          if (qj->op == TCCIR_OP_NOP)
+            continue;
+          if (qj->op != TCCIR_OP_FUNCPARAMVAL && qj->op != TCCIR_OP_FUNCPARAMVOID &&
+              qj->op != TCCIR_OP_FUNCCALLVOID && qj->op != TCCIR_OP_FUNCCALLVAL)
+            continue;
+          if (qj->op == TCCIR_OP_FUNCPARAMVAL || qj->op == TCCIR_OP_FUNCPARAMVOID)
+          {
+            uint32_t encj = (uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, qj));
+            if (TCCIR_DECODE_CALL_ID(encj) == cid && TCCIR_DECODE_PARAM_IDX(encj) == 2)
+            {
+              sz_op = tcc_ir_op_get_src1(ir, qj);
+              if (irop_get_tag(sz_op) == IROP_TAG_IMM32)
+                is_memcpy_src_bounded = 1;
+              break;
+            }
+          }
+          else if (TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, qj))) == cid)
+            break;
+        }
+      }
+    }
+
+    /* Look at each operand role.  We're interested in:
+     *   (a) an operand carrying Addr[StackLoc[X]] (direct addr-of), OR
+     *   (b) an operand carrying a vreg whose vreg_slot[] is set.
+     *
+     * For each such address-of-local use, classify the containing op.
+     * Mark the relevant slot(s) non-tame if the use isn't recognized. */
+    for (int k = 0; k < 3; k++)
+    {
+      IROperand op;
+      int has;
+      if (k == 0)
+      {
+        has = irop_config[q->op].has_dest;
+        if (has)
+          op = tcc_ir_op_get_dest(ir, q);
+      }
+      else if (k == 1)
+      {
+        has = irop_config[q->op].has_src1;
+        if (has)
+          op = tcc_ir_op_get_src1(ir, q);
+      }
+      else
+      {
+        has = irop_config[q->op].has_src2;
+        if (has)
+          op = tcc_ir_op_get_src2(ir, q);
+      }
+      if (!has)
+        continue;
+
+      /* Direct addr-of-local (Addr[StackLoc[X]], !is_lval). */
+      int slot = INT_MIN; /* sentinel for "no slot involved" */
+      if (irop_get_tag(op) == IROP_TAG_STACKOFF && op.is_local && !op.is_lval && irop_get_vreg(op) == -1)
+        slot = irop_get_stack_offset(op);
+
+      /* Vreg use that's a derived address. */
+      int vr = irop_get_vreg(op);
+      int v_slot = VR_SLOT_AMBIG + 1; /* "unknown" sentinel < AMBIG */
+      if (vr != -1)
+      {
+        int vf = VR_FLAT(vr);
+        if (vf >= 0)
+          v_slot = vreg_slot[vf];
+      }
+
+      /* Vreg with is_lval=true (as a src) is a memory dereference.
+       *   - VAR/PARAM: just loads the variable's value, *not* a read
+       *     through that value — harmless.
+       *   - TMP with known slot S: deref reads slot S → S non-tame.
+       *   - TMP with unknown slot: we can't bound where the read lands.
+       *     Poison all tame_slot entries AND set has_unknown_deref to
+       *     also protect offsets that never had their address taken. */
+      int vr_type = (vr != -1) ? TCCIR_DECODE_VREG_TYPE(vr) : 0;
+      if (op.is_lval && vr != -1 && k != 0 && vr_type == TCCIR_VREG_TYPE_TEMP)
+      {
+        int vf2 = VR_FLAT(vr);
+        int is_external = (vf2 >= 0 && vreg_external && vreg_external[vf2]);
+        if ((v_slot == -1 || v_slot == VR_SLOT_AMBIG) && !is_external)
+        {
+          has_unknown_deref = 1;
+          for (int t = 0; t < tame_slot_n; t++)
+            tame_slot_ok[t] = 0;
+        }
+        else if (v_slot != -1 && v_slot != VR_SLOT_AMBIG && v_slot != VR_SLOT_AMBIG + 1)
+        {
+          int idx = TAME_FIND_OR_ADD(v_slot);
+          if (idx >= 0)
+            tame_slot_ok[idx] = 0;
+        }
+      }
+
+      /* Direct addr-of-local: classify in-place. */
+      if (slot != INT_MIN)
+      {
+        int idx = TAME_FIND_OR_ADD(slot);
+        int tame_here = 0;
+        switch (q->op)
+        {
+        case TCCIR_OP_ASSIGN:
+        case TCCIR_OP_LEA:
+          /* dest <-- &slot is the seed itself; harmless. */
+          tame_here = (k == 1);
+          break;
+        case TCCIR_OP_ADD:
+        case TCCIR_OP_SUB:
+        {
+          /* &slot + const: harmless if src2 is immediate. */
+          IROperand s2 = tcc_ir_op_get_src2(ir, q);
+          if (k == 1 && (irop_get_tag(s2) == IROP_TAG_IMM32 || irop_get_tag(s2) == IROP_TAG_I64))
+            tame_here = 1;
+          break;
+        }
+        case TCCIR_OP_CMP:
+          tame_here = (k == 1 || k == 2);
+          break;
+        case TCCIR_OP_FUNCPARAMVAL:
+        case TCCIR_OP_FUNCPARAMVOID:
+          if ((is_write_p0 || is_memcpy_src_bounded) && k == 1)
+            tame_here = 1;
+          break;
+        default:
+          break;
+        }
+        if (!tame_here)
+          tame_slot_ok[idx] = 0;
+      }
+
+      /* Vreg use of a derived-address vreg.
+       *
+       * Two flavors of "use" carry the slot address out of the IR opcode:
+       *
+       *   (a) Plain vreg-as-value (is_lval=0): the operand IS the address.
+       *       Any non-tame use of the address makes the slot non-tame.
+       *
+       *   (b) VAR/PARAM lval load (is_lval=1, vr=VAR/PARAM): the IR loads
+       *       the variable's value.  For our purposes "the value" IS the
+       *       slot address (we got here only because vreg_slot[V] mapped V
+       *       to a slot from Step 1/2 — that mapping reflects what the var
+       *       holds).  So a PARAM use of the loaded address must also be
+       *       classified, otherwise calls like `strlen(s)` where `s` is a
+       *       local pointer variable would let us silently treat the
+       *       pointed-to slot as write-only.
+       *
+       *   TMP lval (is_lval=1, vr=TMP) is handled separately below as a
+       *   deref of the address — different shape, different handling.
+       *
+       * Skip the dest role (k=0) for ADD/SUB/ASSIGN: dest there is the
+       * propagation target, already handled in step 2 — it isn't a "use"
+       * of an existing addr-vreg, so it shouldn't influence tameness. */
+      int classify_use = (vr != -1 && v_slot != -1 && v_slot != VR_SLOT_AMBIG + 1);
+      if (classify_use && op.is_lval) {
+        int vt = TCCIR_DECODE_VREG_TYPE(vr);
+        if (vt != TCCIR_VREG_TYPE_VAR && vt != TCCIR_VREG_TYPE_PARAM)
+          classify_use = 0;
+      }
+      if (classify_use)
+      {
+        int idx = (v_slot == VR_SLOT_AMBIG) ? -1 : TAME_FIND_OR_ADD(v_slot);
+        int tame_here = 0;
+        switch (q->op)
+        {
+        case TCCIR_OP_ASSIGN:
+        case TCCIR_OP_LEA:
+          /* V_new <-- V_old or V_new <-- &slot: propagation step.
+           * dest (k=0) is the result; src1 (k=1) is the actual use,
+           * already known harmless. */
+          tame_here = 1;
+          break;
+        case TCCIR_OP_ADD:
+        case TCCIR_OP_SUB:
+        {
+          IROperand s2 = tcc_ir_op_get_src2(ir, q);
+          if (k == 0)
+            tame_here = 1; /* dest: propagation target, not a use */
+          else if (k == 1 && (irop_get_tag(s2) == IROP_TAG_IMM32 || irop_get_tag(s2) == IROP_TAG_I64))
+            tame_here = 1;
+          /* k == 2 (V on the RHS as src2): only OK in narrow cases — bail. */
+          break;
+        }
+        case TCCIR_OP_CMP:
+          tame_here = 1;
+          break;
+        case TCCIR_OP_STORE:
+        case TCCIR_OP_STORE_INDEXED:
+        case TCCIR_OP_STORE_POSTINC:
+          /* Vreg-as-dest is the address (write through V). */
+          if (k == 0)
+            tame_here = 1;
+          /* Vreg-as-src1 is the value being stored: the address is
+           * escaping into memory — non-tame. */
+          break;
+        case TCCIR_OP_FUNCPARAMVAL:
+        case TCCIR_OP_FUNCPARAMVOID:
+          if ((is_write_p0 || is_memcpy_src_bounded) && k == 1)
+            tame_here = 1;
+          /* Any other PARAM — callee may dereference, non-tame. */
+          break;
+        default:
+          break;
+        }
+        if (!tame_here)
+        {
+          if (v_slot == VR_SLOT_AMBIG)
+          {
+            for (int t = 0; t < tame_slot_n; t++)
+              tame_slot_ok[t] = 0;
+          }
+          else if (idx >= 0)
+            tame_slot_ok[idx] = 0;
+        }
+      }
+    }
+  }
+
+  /* Collect read/escape ranges as (offset, width, position).  Linear
+   * array — typical functions have at most a few hundred distinct ranges,
+   * so the O(n*r) intersection checks in the kill loop are fine.  Tracking
+   * position lets the elimination loops do position-aware liveness: a
+   * STORE at i is dead if no read AFTER i touches the same bytes. */
+  typedef struct
+  {
+    int off;
+    int width;
+    int pos;
+  } LiveRange;
+  int cap = 64;
+  LiveRange *live = tcc_malloc(sizeof(LiveRange) * cap);
+  int live_count = 0;
+
+#define DLS_LIVE_ADD(off_, width_, pos_)                                                                               \
+  do                                                                                                                   \
+  {                                                                                                                    \
+    int _o = (off_);                                                                                                   \
+    int _w = (width_);                                                                                                 \
+    int _p = (pos_);                                                                                                   \
+    if (live_count >= cap)                                                                                             \
+    {                                                                                                                  \
+      cap *= 2;                                                                                                        \
+      live = tcc_realloc(live, sizeof(LiveRange) * cap);                                                               \
+    }                                                                                                                  \
+    live[live_count].off = _o;                                                                                         \
+    live[live_count].width = _w;                                                                                       \
+    live[live_count].pos = _p;                                                                                         \
+    live_count++;                                                                                                      \
+  } while (0)
+
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    int is_store = (q->op == TCCIR_OP_STORE);
+
+    for (int k = 0; k < 3; k++)
+    {
+      if (k == 0 && is_store)
+        continue;
+      IROperand op;
+      if (k == 0)
+      {
+        if (!irop_config[q->op].has_dest)
+          continue;
+        op = tcc_ir_op_get_dest(ir, q);
+      }
+      else if (k == 1)
+      {
+        if (!irop_config[q->op].has_src1)
+          continue;
+        op = tcc_ir_op_get_src1(ir, q);
+      }
+      else
+      {
+        if (!irop_config[q->op].has_src2)
+          continue;
+        op = tcc_ir_op_get_src2(ir, q);
+      }
+
+      if (irop_get_tag(op) != IROP_TAG_STACKOFF)
+        continue;
+      if (!op.is_local)
+        continue;
+      if (irop_get_vreg(op) != -1)
+        continue;
+      /* STRUCT byte widths aren't recoverable from the operand alone (they
+       * live in the ctype pool).  Disqualify only for LVAL STRUCT accesses
+       * (they'd add an undersized live[] entry and mask a real read).  For
+       * pure addr-of (!is_lval) operands the tameness analysis above already
+       * classified the escape; if the address only flows to write-call
+       * PARAM0 (or other tame uses), there is no untracked read to worry
+       * about.  COMPLEX width IS recoverable: it's 2 * scalar size. */
+      if (op.is_lval && irop_get_btype(op) == IROP_BTYPE_STRUCT)
+      {
+        int off = irop_get_stack_offset(op);
+        int tidx = TAME_FIND_OR_ADD(off);
+        tame_slot_ok[tidx] = 0;
+        continue;
+      }
+      int off = irop_get_stack_offset(op);
+
+      if (op.is_lval)
+      {
+        int w = ir_opt_store_btype_size_bytes(irop_get_btype(op));
+        if (w <= 0)
+          w = irop_is_64bit(op) ? 8 : 4;
+        /* _Complex T occupies 2 * sizeof(T) consecutive bytes — both
+         * components share the same slot, and a complex-typed access
+         * touches both halves. */
+        if (op.is_complex)
+          w *= 2;
+        DLS_LIVE_ADD(off, w, i);
+      }
+      /* For !is_lval (address-of) the tameness analysis above already
+       * decided whether the escape is benign; nothing to do in the live[]
+       * pass here. */
+    }
+  }
+
+  /* Bounded-read live[] for memcpy/memmove sources.  Their PARAM1 was tagged
+   * tame for slot classification only when a constant size was found; emit
+   * the corresponding read range here so dead-store elimination still
+   * respects bytes the callee will actually read. */
+  if (is_memcpy_like)
+  {
+    for (int i = 0; i < n; i++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      if (q->op != TCCIR_OP_FUNCCALLVAL && q->op != TCCIR_OP_FUNCCALLVOID)
+        continue;
+      int cid = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q)));
+      if (cid < 0 || cid >= max_call_id)
+        continue;
+      if (!(is_memcpy_like[cid / 8] & (1 << (cid % 8))))
+        continue;
+      IROperand src_p, sz_p;
+      if (!ir_opt_get_call_param_operand(ir, i, 1, &src_p))
+        continue;
+      if (!ir_opt_get_call_param_operand(ir, i, 2, &sz_p))
+        continue;
+      if (irop_get_tag(sz_p) != IROP_TAG_IMM32)
+        continue;
+      int sz = (int)irop_get_imm64_ex(ir, sz_p);
+      if (sz <= 0)
+        continue;
+      /* Direct addr-of-local source */
+      if (irop_get_tag(src_p) == IROP_TAG_STACKOFF && src_p.is_local && !src_p.is_lval &&
+          irop_get_vreg(src_p) == -1)
+      {
+        int off = irop_get_stack_offset(src_p);
+        DLS_LIVE_ADD(off, sz, i);
+      }
+      else
+      {
+        int vr = irop_get_vreg(src_p);
+        if (vr == -1)
+          continue;
+        int vf = VR_FLAT(vr);
+        if (vf < 0)
+          continue;
+        int slot = vreg_slot[vf];
+        if (slot == -1 || slot == VR_SLOT_AMBIG)
+          continue;
+        DLS_LIVE_ADD(slot, sz, i);
+      }
+    }
+  }
+
+  int changes = 0;
+
+  /* STORE and direct-PARAM0 elimination must be conservative: a non-tame
+   * escape's deref can read anywhere in the relevant slot, but we don't
+   * know the slot's bounds.  So if any slot escaped non-tamely, skip these
+   * offset-level eliminations entirely.  The vreg-PARAM0 path below is
+   * still per-slot — it knows exactly which slot its target points into. */
+  int any_nontame = has_unknown_deref;
+  for (int t = 0; !any_nontame && t < tame_slot_n; t++)
+    if (!tame_slot_ok[t])
+      any_nontame = 1;
+
+  if (!any_nontame)
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_STORE)
+      continue;
+    IROperand dest = tcc_ir_op_get_dest(ir, q);
+    if (irop_get_tag(dest) != IROP_TAG_STACKOFF)
+      continue;
+    if (!dest.is_local || irop_get_vreg(dest) != -1)
+      continue;
+    /* STRUCT width isn't recoverable from the operand — leave such stores
+     * alone (live[] entries for STRUCT reads were also gated out above). */
+    if (irop_get_btype(dest) == IROP_BTYPE_STRUCT)
+      continue;
+    int off = irop_get_stack_offset(dest);
+    int width = ir_opt_store_btype_size_bytes(irop_get_btype(dest));
+    if (width <= 0)
+      continue; /* unknown width — don't risk killing a wider store */
+    if (dest.is_complex)
+      width *= 2;
+    /* Position-aware liveness: only reads at positions AFTER this STORE
+     * make it live.  Earlier reads were satisfied by an earlier definition. */
+    int alive = 0;
+    for (int k = 0; k < live_count; k++)
+      if (live[k].pos > i &&
+          off < live[k].off + live[k].width && off + width > live[k].off)
+      {
+        alive = 1;
+        break;
+      }
+    if (alive)
+      continue;
+    LOG_IR_GEN("DEAD LOCAL SLOT: nop STORE to StackLoc[%d] at i=%d w=%d", off, i, width);
+    q->op = TCCIR_OP_NOP;
+    changes++;
+  }
+
+  if (!any_nontame && writecall_count > 0)
+  {
+    for (int i = 0; i < n; i++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      if (q->op != TCCIR_OP_FUNCCALLVOID && q->op != TCCIR_OP_FUNCCALLVAL)
+        continue;
+      int cid = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q)));
+      if (cid < 0 || cid >= max_call_id)
+        continue;
+      if (!(is_writecall[cid / 8] & (1 << (cid % 8))))
+        continue;
+      int sz_pidx = (writecall_size_at_2[cid / 8] & (1 << (cid % 8))) ? 2 : 1;
+      IROperand p0, p_sz;
+      if (!ir_opt_get_call_param_operand(ir, i, 0, &p0))
+        continue;
+      if (!ir_opt_get_call_param_operand(ir, i, sz_pidx, &p_sz))
+        continue;
+      if (irop_get_tag(p0) != IROP_TAG_STACKOFF || !p0.is_local || p0.is_lval)
+        continue;
+      if (irop_get_vreg(p0) != -1)
+        continue;
+      if (irop_get_tag(p_sz) != IROP_TAG_IMM32)
+        continue;
+      int base = irop_get_stack_offset(p0);
+      int sz = (int)irop_get_imm64_ex(ir, p_sz);
+      if (sz <= 0)
+        continue;
+      /* Position-aware: a read AT or BEFORE this call was satisfied by an
+       * earlier write; only later reads keep the call alive. */
+      int alive = 0;
+      for (int k = 0; k < live_count; k++)
+        if (live[k].pos > i &&
+            base < live[k].off + live[k].width && base + sz > live[k].off)
+        {
+          alive = 1;
+          break;
+        }
+      if (alive)
+        continue;
+      LOG_IR_GEN("DEAD LOCAL SLOT: nop write-call at i=%d (base=%d size=%d)", i, base, sz);
+      ir_opt_nop_call_params(ir, i);
+      q->op = TCCIR_OP_NOP;
+      changes++;
+    }
+  }
+
+  /* NEW: vreg-PARAM0 write-call elimination.
+   * Handles the case where a memset/memcpy/memmove writes through a vreg
+   * pointer derived from a tame local slot.  The runtime offset within the
+   * slot is unknown (often a loop-induction-variable offset), so we use a
+   * conservative whole-slot check: a write through V → slot S is dead iff
+   *   - S is a tame slot (no untracked escape, no derived-vreg read), AND
+   *   - no live[] entry has offset >= S (i.e., no direct lvalue read or
+   *     store within the slot's range).
+   *
+   * Gated on any_nontame=0 because StackLoc offsets are not allocation
+   * boundaries: `&a` and `&a[1]` of the same `char a[10]` show up as two
+   * separate "slots" -10 and -9.  If the bigger one (slot -10) escaped
+   * non-tamely (e.g. passed to puts), eliminating a memset that targets
+   * the inner offset -9 silently loses the writes that the live read of
+   * slot -10 would have observed.
+   */
+  if (!any_nontame && writecall_count > 0)
+  {
+    for (int i = 0; i < n; i++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      if (q->op != TCCIR_OP_FUNCCALLVOID && q->op != TCCIR_OP_FUNCCALLVAL)
+        continue;
+      int cid = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q)));
+      if (cid < 0 || cid >= max_call_id)
+        continue;
+      if (!(is_writecall[cid / 8] & (1 << (cid % 8))))
+        continue;
+      IROperand p0;
+      if (!ir_opt_get_call_param_operand(ir, i, 0, &p0))
+        continue;
+      /* Skip the direct Addr[StackLoc[X]] case — handled above. */
+      if (irop_get_tag(p0) == IROP_TAG_STACKOFF && !p0.is_lval && irop_get_vreg(p0) == -1)
+        continue;
+      /* Need a vreg PARAM0 with a known-single tame slot. */
+      int vr = irop_get_vreg(p0);
+      if (vr == -1)
+        continue;
+      int vf = VR_FLAT(vr);
+      if (vf < 0)
+        continue;
+      int slot = vreg_slot[vf];
+      if (slot == -1 || slot == VR_SLOT_AMBIG)
+        continue;
+      int tidx = TAME_FIND(slot);
+      if (tidx < 0 || !tame_slot_ok[tidx])
+        continue;
+      /* Conservative whole-slot check: any live byte at offset >= slot
+       * read AFTER this call?  (Earlier reads were satisfied upstream.)
+       * Wide live[] entries (e.g. memcpy-source bounded reads of N bytes)
+       * may start below `slot` and extend across it — check that the
+       * range's end exceeds `slot`, not just its base. */
+      int alive = 0;
+      for (int k = 0; k < live_count; k++)
+        if (live[k].pos > i && live[k].off + live[k].width > slot)
+        {
+          alive = 1;
+          break;
+        }
+      if (alive)
+        continue;
+      LOG_IR_GEN("DEAD LOCAL SLOT: nop write-call (vreg PARAM0) at i=%d (slot=%d)", i, slot);
+      ir_opt_nop_call_params(ir, i);
+      q->op = TCCIR_OP_NOP;
+      changes++;
+    }
+  }
+
+  tcc_free(live);
+  tcc_free(is_writecall);
+  tcc_free(writecall_size_at_2);
+  tcc_free(is_memcpy_like);
+  tcc_free(vreg_slot);
+  tcc_free(vreg_external);
+  tcc_free(tame_slot_off);
+  tcc_free(tame_slot_ok);
+  return changes;
+#undef DLS_LIVE_ADD
+#undef VR_SLOT_AMBIG
+#undef VR_FLAT
+#undef TAME_FIND_OR_ADD
+#undef TAME_FIND
+}
+
+/* ============================================================================
+ * Dead TEMP_LOCAL write elimination (tcc_ir_opt_dead_temp_local_elim)
+ * ============================================================================
+ *
+ * Eliminates non-call writes to anonymous TEMP_LOCAL slots (vreg in
+ * [-9, -2], allocated via get_temp_local_var()) when no subsequent
+ * instruction references the same slot.
+ *
+ * Companion to ir_gen_dead_call_result's TEMP_LOCAL branch: dead_call
+ * handles CALL-into-TEMP_LOCAL, this handles every other op shape that
+ * can target a TEMP_LOCAL (ASSIGN, plain arithmetic with sub-word
+ * narrowing like AND/SHL/SAR, LOAD copied into TEMP_LOCAL via dest).
+ *
+ * Why this is needed: after dead_local_slot_elim NOPs the StackLoc
+ * writeback for a temp_local-mediated chain, the writes _into_ the
+ * temp_local become dead but no other pass picks them up — DCE only
+ * tracks positive-typed vregs (VAR/TEMP/PARAM) and the temp_local
+ * encoding falls outside that range.
+ *
+ * Safety: the forward-only scan refuses to eliminate when ANY later
+ * reference exists to the same TEMP_LOCAL.  For complex types a single
+ * slot may be written in halves across multiple instructions, so the
+ * truly-last write becomes eligible first; the iterated pipeline picks
+ * up the predecessors on later passes after DCE drains the dangling
+ * temp-register chains.
+ */
+int tcc_ir_opt_dead_temp_local_elim(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  if (n == 0)
+    return 0;
+  int changes = 0;
+  /* Reverse order so a single pass chains through back-to-back writes to
+   * the same temp_local: the truly-last becomes eligible first, then once
+   * NOP'd the previous write sees a clear forward window, and so on. */
+  for (int i = n - 1; i >= 0; i--) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    /* Calls have their own elimination in opt_gens_call_result.c — that
+     * path also nops the matching PARAM operands; skip them here. */
+    if (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID)
+      continue;
+    /* Need a dest that's a TEMP_LOCAL stack slot. */
+    if (!irop_config[q->op].has_dest)
+      continue;
+    IROperand dest = tcc_ir_op_get_dest(ir, q);
+    if (irop_get_tag(dest) != IROP_TAG_STACKOFF || !dest.is_local)
+      continue;
+    int32_t dest_vr = irop_get_vreg(dest);
+    if (dest_vr > -2 || dest_vr < -9)
+      continue;
+    int my_off = irop_get_stack_offset(dest);
+    int my_w = ir_opt_store_btype_size_bytes(irop_get_btype(dest));
+    if (my_w <= 0) my_w = irop_is_64bit(dest) ? 8 : 4;
+    if (dest.is_complex) my_w *= 2;
+    if (my_w <= 0 || my_w > 64) continue;
+    /* Byte-precise forward scan: live_mask bit b is set iff our byte
+     * (my_off + b) still holds the value we just wrote.  A later WRITE
+     * to overlapping bytes clobbers them.  A LVAL READ overlapping a
+     * still-live byte keeps us alive.  Non-LVAL addr-of usually bails,
+     * but a few common shapes (PARAM-src1 of memmove/memcpy/memset with
+     * constant size, possibly through a one-use LEA/ASSIGN copy) carry
+     * a known [offset, offset+size) range we can check precisely. */
+    uint64_t live_mask = (my_w >= 64) ? ~(uint64_t)0 : ((uint64_t)1 << my_w) - 1;
+    int alive = 0;
+    int dead = 0;
+    for (int j = i + 1; j < n && !alive && !dead; j++) {
+      IRQuadCompact *p = &ir->compact_instructions[j];
+      if (p->op == TCCIR_OP_NOP)
+        continue;
+      for (int k = 0; k < 3 && !alive && !dead; k++) {
+        IROperand po;
+        int has;
+        if (k == 0) { has = irop_config[p->op].has_dest;
+                      if (has) po = tcc_ir_op_get_dest(ir, p); }
+        else if (k == 1) { has = irop_config[p->op].has_src1;
+                           if (has) po = tcc_ir_op_get_src1(ir, p); }
+        else { has = irop_config[p->op].has_src2;
+               if (has) po = tcc_ir_op_get_src2(ir, p); }
+        if (!has) continue;
+        if (irop_get_vreg(po) != dest_vr) continue;
+        int po_off = irop_get_stack_offset(po);
+        int po_w = ir_opt_store_btype_size_bytes(irop_get_btype(po));
+        if (po_w <= 0) po_w = irop_is_64bit(po) ? 8 : 4;
+        if (po.is_complex) po_w *= 2;
+        /* Helper: clamp [po_off, po_off+po_w) into our [my_off, my_off+my_w)
+         * to byte-offsets [lo, hi) into live_mask. */
+        int lo = po_off - my_off;
+        int hi = lo + po_w;
+        if (lo < 0) lo = 0;
+        if (hi > my_w) hi = my_w;
+
+        if (k == 0 && irop_config[p->op].has_dest) {
+          /* Subsequent write to our vreg — clobber overlapping bytes. */
+          if (lo < hi) {
+            uint64_t mask = (hi - lo >= 64) ? ~(uint64_t)0 : ((uint64_t)1 << (hi - lo)) - 1;
+            live_mask &= ~(mask << lo);
+            if (live_mask == 0) dead = 1;
+          }
+          continue;
+        }
+        if (po.is_lval) {
+          /* LVAL source — direct memory read of our slot. */
+          if (lo < hi) {
+            uint64_t mask = (hi - lo >= 64) ? ~(uint64_t)0 : ((uint64_t)1 << (hi - lo)) - 1;
+            if (live_mask & (mask << lo)) alive = 1;
+          }
+          continue;
+        }
+        /* Non-LVAL addr-of of our slot.  Resolve through one optional
+         * LEA/ASSIGN copy hop, then look for a PARAM-src1 use whose call
+         * has a constant size operand. */
+        int param_idx = -1;
+        int pidx = -1;
+        int sz = -1;
+        if ((p->op == TCCIR_OP_FUNCPARAMVAL || p->op == TCCIR_OP_FUNCPARAMVOID) && k == 1) {
+          param_idx = j;
+        } else if ((p->op == TCCIR_OP_ASSIGN || p->op == TCCIR_OP_LEA) && k == 1) {
+          IROperand pd = tcc_ir_op_get_dest(ir, p);
+          int32_t pd_vr = irop_get_vreg(pd);
+          if (pd_vr >= 0 && TCCIR_DECODE_VREG_TYPE(pd_vr) == TCCIR_VREG_TYPE_TEMP) {
+            int hit = -1;
+            int multi = 0;
+            for (int m = j + 1; m < n && !multi; m++) {
+              IRQuadCompact *mq = &ir->compact_instructions[m];
+              if (mq->op == TCCIR_OP_NOP) continue;
+              for (int mk = 0; mk < 3 && !multi; mk++) {
+                int mhas;
+                IROperand mo;
+                if (mk == 0) { mhas = irop_config[mq->op].has_dest;
+                               if (mhas) mo = tcc_ir_op_get_dest(ir, mq); }
+                else if (mk == 1) { mhas = irop_config[mq->op].has_src1;
+                                    if (mhas) mo = tcc_ir_op_get_src1(ir, mq); }
+                else { mhas = irop_config[mq->op].has_src2;
+                       if (mhas) mo = tcc_ir_op_get_src2(ir, mq); }
+                if (!mhas) continue;
+                if (irop_get_vreg(mo) != pd_vr) continue;
+                if ((mq->op == TCCIR_OP_FUNCPARAMVAL || mq->op == TCCIR_OP_FUNCPARAMVOID) &&
+                    mk == 1 && hit < 0) {
+                  hit = m;
+                } else {
+                  multi = 1;
+                }
+              }
+            }
+            if (!multi && hit >= 0) param_idx = hit;
+          }
+        }
+        if (param_idx >= 0) {
+          IRQuadCompact *pp = &ir->compact_instructions[param_idx];
+          uint32_t enc = (uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, pp));
+          int cid = TCCIR_DECODE_CALL_ID(enc);
+          pidx = TCCIR_DECODE_PARAM_IDX(enc);
+          for (int m = param_idx + 1; m < n; m++) {
+            IRQuadCompact *cq = &ir->compact_instructions[m];
+            if (cq->op != TCCIR_OP_FUNCCALLVOID && cq->op != TCCIR_OP_FUNCCALLVAL) continue;
+            if (TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, cq))) != cid)
+              continue;
+            Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, cq));
+            if (!callee) break;
+            const char *nm = get_tok_str(callee->v, NULL);
+            if (!nm) break;
+            int sz_pidx = -1;
+            if (!strcmp(nm, "__aeabi_memset") || !strcmp(nm, "memset"))
+              sz_pidx = 2;
+            else if (!strcmp(nm, "__aeabi_memmove") || !strcmp(nm, "__aeabi_memcpy") ||
+                     !strcmp(nm, "memmove") || !strcmp(nm, "memcpy"))
+              sz_pidx = 2;
+            else if (!strcmp(nm, "__aeabi_memmove4") || !strcmp(nm, "__aeabi_memmove8") ||
+                     !strcmp(nm, "__aeabi_memcpy4") || !strcmp(nm, "__aeabi_memcpy8"))
+              sz_pidx = 1;
+            if (sz_pidx < 0 || (pidx != 0 && pidx != 1)) break;
+            IROperand sz_op;
+            if (!ir_opt_get_call_param_operand(ir, m, sz_pidx, &sz_op)) break;
+            if (irop_get_tag(sz_op) != IROP_TAG_IMM32) break;
+            sz = (int)irop_get_imm64_ex(ir, sz_op);
+            break;
+          }
+        }
+        if (sz <= 0) {
+          /* Couldn't bound the access — pessimistically alive. */
+          alive = 1;
+          continue;
+        }
+        int rlo = po_off - my_off;
+        int rhi = rlo + sz;
+        if (rlo < 0) rlo = 0;
+        if (rhi > my_w) rhi = my_w;
+        if (rlo >= rhi) continue; /* range disjoint from our live bytes */
+        uint64_t mask = (rhi - rlo >= 64) ? ~(uint64_t)0 : ((uint64_t)1 << (rhi - rlo)) - 1;
+        mask <<= rlo;
+        if (pidx == 0) {
+          /* Write through addr-of-our-slot. */
+          live_mask &= ~mask;
+          if (live_mask == 0) dead = 1;
+        } else if (live_mask & mask) {
+          alive = 1;
+        }
+      }
+    }
+    if (alive)
+      continue;
+    LOG_IR_GEN("DEAD TEMP_LOCAL: nop op=%d at i=%d (vr=%d off=%d w=%d %s)",
+               q->op, i, dest_vr, my_off, my_w, dead ? "overwritten" : "no-reader");
+    q->op = TCCIR_OP_NOP;
+    changes++;
+  }
+  return changes;
 }
 
 /* ============================================================================
@@ -4081,5 +5254,7 @@ int tcc_ir_opt_sl_forward_ex(IROptCtx *ctx) { return tcc_ir_opt_sl_forward(ctx->
 int tcc_ir_opt_deref_fwd_ex(IROptCtx *ctx) { return tcc_ir_opt_deref_fwd(ctx->ir); }
 int tcc_ir_opt_entry_store_prop_ex(IROptCtx *ctx) { return tcc_ir_opt_entry_store_prop(ctx->ir); }
 int tcc_ir_opt_store_redundant_ex(IROptCtx *ctx) { return tcc_ir_opt_store_redundant(ctx->ir); }
+int tcc_ir_opt_dead_local_slot_elim_ex(IROptCtx *ctx) { return tcc_ir_opt_dead_local_slot_elim(ctx->ir); }
+int tcc_ir_opt_dead_temp_local_elim_ex(IROptCtx *ctx) { return tcc_ir_opt_dead_temp_local_elim(ctx->ir); }
 int tcc_ir_opt_addrof_var_fwd_ex(IROptCtx *ctx) { return tcc_ir_opt_addrof_var_fwd(ctx->ir); }
 int tcc_ir_opt_global_sl_fwd_ex(IROptCtx *ctx) { return tcc_ir_opt_global_sl_fwd(ctx->ir); }

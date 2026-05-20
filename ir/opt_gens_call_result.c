@@ -29,13 +29,40 @@ static int ir_gen_dead_call_result(IROptCtx *ctx, int i)
 
   IROperand dest = tcc_ir_op_get_dest(ir, q);
   int32_t dest_vr = irop_get_vreg(dest);
-  if (dest_vr < 0)
-    return 0;
   if (TCCIR_DECODE_VREG_TYPE(dest_vr) == TCCIR_VREG_TYPE_PARAM)
     return 0;
 
-  if (ir_opt_du_uses(du, dest_vr) != 0)
-    return 0;
+  if (dest_vr >= 0) {
+    if (ir_opt_du_uses(du, dest_vr) != 0)
+      return 0;
+  } else {
+    /* TEMP_LOCAL dest (vr in [-9, -2]): DU table doesn't cover these, so
+     * do a manual forward scan.  Bail on any subsequent reference (read
+     * OR write) to this TEMP_LOCAL — for complex types one CALL may write
+     * only a half, so a later "write" can't be treated as a clobber that
+     * makes our value dead.  Iterated pipeline catches back-to-back cases:
+     * the truly-last write becomes eligible first, and after it's dropped
+     * the next-to-last gets a clean forward window. */
+    if (dest_vr > -2 || dest_vr < -9) return 0;
+    int n = ir->next_instruction_index;
+    for (int j = i + 1; j < n; j++) {
+      IRQuadCompact *p = &ir->compact_instructions[j];
+      if (p->op == TCCIR_OP_NOP) continue;
+      for (int k = 0; k < 3; k++) {
+        IROperand po;
+        int has;
+        if (k == 0) { has = irop_config[p->op].has_dest;
+                      if (has) po = tcc_ir_op_get_dest(ir, p); }
+        else if (k == 1) { has = irop_config[p->op].has_src1;
+                           if (has) po = tcc_ir_op_get_src1(ir, p); }
+        else { has = irop_config[p->op].has_src2;
+               if (has) po = tcc_ir_op_get_src2(ir, p); }
+        if (!has) continue;
+        if (irop_get_vreg(po) == dest_vr)
+          return 0;
+      }
+    }
+  }
 
   IROperand src1 = ir->iroperand_pool[q->operand_base + 1];
   IROperand src2 = ir->iroperand_pool[q->operand_base + 2];

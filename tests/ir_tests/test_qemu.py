@@ -342,6 +342,7 @@ TEST_FILES = [
     ("test_complex_fold.c", 0),
     ("test_complex_init.c", 0),
     ("test_complex_mul.c", 0),
+    ("test_complex_real_mul.c", 0),
     ("test_complex_simple.c", 0),
 
     ("111_builtin_printf.c", 0),

@@ -421,6 +421,45 @@ static void iload_kill_for_store(GLoadState *st, int32_t store_base_vr, int stor
   }
 }
 
+/* Like iload_kill_for_store but knows that the store goes to the local
+ * stack frame (caller resolved store base to a LEA-StackLoc).  Such a
+ * store cannot alias an iload whose base is a PARAM/VAR (caller-supplied
+ * pointer) or a TEMP that does NOT resolve to a stack location.
+ *
+ * Same-base entries still need precise byte-range overlap analysis. */
+static void iload_kill_for_stack_store(IRSSAOptCtx *ctx, GLoadState *st, int32_t store_base_vr,
+                                       int store_lo, int store_hi)
+{
+  for (int k = 0; k < st->ilcount; k++) {
+    const ILoadEntry *e = &st->iloads[k];
+    int kill = 0;
+    if (e->base_vr == store_base_vr) {
+      int eo = (int)e->idx_imm * (1 << e->scale);
+      int eh = eo + slot_btype_bytes(e->btype);
+      if (eo < store_hi && eh > store_lo)
+        kill = 1;
+    } else {
+      int e_type = TCCIR_DECODE_VREG_TYPE(e->base_vr);
+      if (e_type == TCCIR_VREG_TYPE_TEMP) {
+        /* TEMP base: may or may not be a stack pointer.  If it does NOT
+         * resolve to a stack location, the store can't reach it (different
+         * memory region).  If it does resolve, treat as aliasing (different
+         * stack slots can alias in unusual cases like union punning). */
+        if (ssa_opt_resolve_lea_stackloc(ctx, e->base_vr) != INT_MIN)
+          kill = 1;
+      }
+      /* PARAM/VAR base: caller-supplied or named-local register holding a
+       * pointer.  Won't alias a fresh local-stack store unless the address
+       * escaped, but the SSA load-CSE only tracks LOADs of such bases when
+       * they look pointer-like.  Skip kill. */
+    }
+    if (kill) {
+      st->iloads[k] = st->iloads[--st->ilcount];
+      k--;
+    }
+  }
+}
+
 /* resolve_lea_stackloc moved to ssa_opt.c as ssa_opt_resolve_lea_stackloc. */
 #define resolve_lea_stackloc ssa_opt_resolve_lea_stackloc
 
@@ -533,6 +572,7 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState state, int b)
           int size = slot_btype_bytes(store_btype);
           int store_lo = 0, store_hi = size;
           int can_check = 0;
+          int store_to_stack = 0; /* base resolves to LEA-StackLoc */
 
           if (dest.tag == IROP_TAG_VREG && store_base_vr >= 0 &&
               TCCIR_DECODE_VREG_TYPE(store_base_vr) == TCCIR_VREG_TYPE_TEMP) {
@@ -548,9 +588,16 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState state, int b)
                 can_check = 1;
               }
             }
+            /* If this store's base TEMP resolves to a local stack address,
+             * the store cannot alias loads through PARAM/VAR pointers or
+             * through TEMPs that don't themselves resolve to stack. */
+            if (can_check && ssa_opt_resolve_lea_stackloc(ctx, store_base_vr) != INT_MIN)
+              store_to_stack = 1;
           }
 
-          if (can_check)
+          if (store_to_stack)
+            iload_kill_for_stack_store(ctx, &state, store_base_vr, store_lo, store_hi);
+          else if (can_check)
             iload_kill_for_store(&state, store_base_vr, store_lo, store_hi);
           else
             state.ilcount = 0;
@@ -816,8 +863,34 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState state, int b)
       int32_t il_base_vr = irop_get_vreg(idx_base);
       if (il_dest_vr < 0 || TCCIR_DECODE_VREG_TYPE(il_dest_vr) != TCCIR_VREG_TYPE_TEMP)
         continue;
-      if (il_base_vr < 0 || TCCIR_DECODE_VREG_TYPE(il_base_vr) != TCCIR_VREG_TYPE_TEMP)
+      if (il_base_vr < 0)
         continue;
+      {
+        int il_base_type = TCCIR_DECODE_VREG_TYPE(il_base_vr);
+        /* Allow PARAM bases when the PARAM has exactly one definition (the
+         * implicit entry-block ABI assignment).  A reassigned PARAM (e.g.
+         * `c = &local;` after using `c` as a caller-supplied pointer) would
+         * make a later CSE unsound — loads through the original PARAM value
+         * don't correspond to loads through the reassigned pointer.  VAR
+         * bases are similarly tracked as multi-def in the non-promoted case,
+         * so skip them entirely. */
+        if (il_base_type == TCCIR_VREG_TYPE_PARAM) {
+          int writes = 0;
+          for (int wi = 0; wi < ctx->ir->next_instruction_index; wi++) {
+            IRQuadCompact *wq = &ctx->ir->compact_instructions[wi];
+            if (!irop_config[wq->op].has_dest)
+              continue;
+            IROperand wd = tcc_ir_op_get_dest(ctx->ir, wq);
+            if (irop_get_vreg(wd) == il_base_vr) {
+              writes++;
+              if (writes > 0) break;
+            }
+          }
+          if (writes > 0)
+            continue;
+        } else if (il_base_type != TCCIR_VREG_TYPE_TEMP)
+          continue;
+      }
       if (idx_base.is_lval)
         continue;
       if (!irop_is_immediate(idx_idx) || !irop_is_immediate(idx_sc))
@@ -943,7 +1016,25 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState state, int b)
     if (src1.is_lval && !src1.is_sym && !src1.is_local && !src1.is_llocal &&
         src1.tag == IROP_TAG_VREG) {
       int32_t ptr_vr = irop_get_vreg(src1);
-      if (ptr_vr >= 0 && TCCIR_DECODE_VREG_TYPE(ptr_vr) == TCCIR_VREG_TYPE_TEMP) {
+      int ptr_type = ptr_vr >= 0 ? TCCIR_DECODE_VREG_TYPE(ptr_vr) : -1;
+      int ptr_ok = (ptr_type == TCCIR_VREG_TYPE_TEMP);
+      /* PARAM bases are also safe if the PARAM is never reassigned within
+       * the function — the value is the caller-supplied pointer for all
+       * uses.  A reassigned PARAM (e.g. `if (c==0) c=&local;`) is unsafe to
+       * CSE through since later loads carry a different value. */
+      if (ptr_vr >= 0 && ptr_type == TCCIR_VREG_TYPE_PARAM) {
+        int writes = 0;
+        for (int wi = 0; wi < ctx->ir->next_instruction_index && writes == 0; wi++) {
+          IRQuadCompact *wq = &ctx->ir->compact_instructions[wi];
+          if (!irop_config[wq->op].has_dest)
+            continue;
+          if (irop_get_vreg(tcc_ir_op_get_dest(ctx->ir, wq)) == ptr_vr)
+            writes = 1;
+        }
+        if (writes == 0)
+          ptr_ok = 1;
+      }
+      if (ptr_vr >= 0 && ptr_ok) {
         int32_t canon_base = -1, canon_off = 0;
         if (ssa_opt_resolve_temp_to_base_off(ctx, ptr_vr, &canon_base, &canon_off) &&
             canon_base >= 0) {
