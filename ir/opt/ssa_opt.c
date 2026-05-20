@@ -406,55 +406,74 @@ int ssa_opt_replace_all_uses(IRSSAOptCtx *ctx, int32_t old_vr, int32_t new_vr)
 
 int ssa_opt_resolve_lea_stackloc(IRSSAOptCtx *ctx, int32_t vr)
 {
-  if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
-    return INT_MIN;
-  IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, vr);
-  if (!vi || vi->def_instr < 0 || vi->def_count > 1)
-    return INT_MIN;
   TCCIRState *ir = ctx->ir;
-  IRQuadCompact *dq = &ir->compact_instructions[vi->def_instr];
-  if (dq->op == TCCIR_OP_LEA) {
-    IROperand src = tcc_ir_op_get_src1(ir, dq);
-    if (src.tag == IROP_TAG_STACKOFF || src.is_local)
-      return irop_get_stack_offset(src);
-  }
-  if (dq->op == TCCIR_OP_ASSIGN) {
-    IROperand src = tcc_ir_op_get_src1(ir, dq);
-    if (src.tag == IROP_TAG_STACKOFF && !src.is_lval)
-      return irop_get_stack_offset(src);
-    int32_t sv = irop_get_vreg(src);
-    if (sv >= 0 && !src.is_lval)
-      return ssa_opt_resolve_lea_stackloc(ctx, sv);
-  }
-  /* `T <-- Addr[StackLoc[N]] [STORE]` is the frontend's encoding for
-   * address materialisation into a TEMP (vstore through a non-lval dest).
-   * Semantically identical to LEA / ASSIGN(stack-addr). */
-  if (dq->op == TCCIR_OP_STORE) {
-    IROperand dest = tcc_ir_op_get_dest(ir, dq);
-    if (!dest.is_lval) {
+  int acc = 0;
+  /* Bound on chain length; chains longer than this (e.g. degenerate va_arg
+   * pointer arithmetic) bail to INT_MIN.  Without a cap the recursive form
+   * blew the host stack on pathological inputs. */
+  for (int hop = 0; hop < 64; hop++) {
+    if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
+      return INT_MIN;
+    IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, vr);
+    if (!vi || vi->def_instr < 0 || vi->def_count > 1)
+      return INT_MIN;
+    IRQuadCompact *dq = &ir->compact_instructions[vi->def_instr];
+
+    if (dq->op == TCCIR_OP_LEA) {
+      IROperand src = tcc_ir_op_get_src1(ir, dq);
+      if (src.tag == IROP_TAG_STACKOFF || src.is_local)
+        return irop_get_stack_offset(src) + acc;
+      return INT_MIN;
+    }
+
+    if (dq->op == TCCIR_OP_ASSIGN) {
       IROperand src = tcc_ir_op_get_src1(ir, dq);
       if (src.tag == IROP_TAG_STACKOFF && !src.is_lval)
-        return irop_get_stack_offset(src);
+        return irop_get_stack_offset(src) + acc;
       int32_t sv = irop_get_vreg(src);
-      if (sv >= 0 && !src.is_lval)
-        return ssa_opt_resolve_lea_stackloc(ctx, sv);
+      if (sv >= 0 && !src.is_lval) {
+        vr = sv;
+        continue;
+      }
+      return INT_MIN;
     }
-  }
-  /* T = base + imm where base resolves to LEA(StackLoc[N]).  Common pattern
-   * for struct field address: T46 = T45 + 4 with T45 = &StackLoc[-196]. */
-  if (dq->op == TCCIR_OP_ADD || dq->op == TCCIR_OP_SUB) {
-    IROperand src1 = tcc_ir_op_get_src1(ir, dq);
-    IROperand src2 = tcc_ir_op_get_src2(ir, dq);
-    if (!src1.is_lval && irop_is_immediate(src2)) {
-      int32_t s1vr = irop_get_vreg(src1);
-      if (s1vr >= 0) {
-        int base_off = ssa_opt_resolve_lea_stackloc(ctx, s1vr);
-        if (base_off != INT_MIN) {
-          int delta = irop_get_imm32(src2);
-          return dq->op == TCCIR_OP_ADD ? base_off + delta : base_off - delta;
+
+    /* `T <-- Addr[StackLoc[N]] [STORE]` is the frontend's encoding for
+     * address materialisation into a TEMP (vstore through a non-lval dest).
+     * Semantically identical to LEA / ASSIGN(stack-addr). */
+    if (dq->op == TCCIR_OP_STORE) {
+      IROperand dest = tcc_ir_op_get_dest(ir, dq);
+      if (!dest.is_lval) {
+        IROperand src = tcc_ir_op_get_src1(ir, dq);
+        if (src.tag == IROP_TAG_STACKOFF && !src.is_lval)
+          return irop_get_stack_offset(src) + acc;
+        int32_t sv = irop_get_vreg(src);
+        if (sv >= 0 && !src.is_lval) {
+          vr = sv;
+          continue;
         }
       }
+      return INT_MIN;
     }
+
+    /* T = base + imm where base resolves to LEA(StackLoc[N]).  Common pattern
+     * for struct field address: T46 = T45 + 4 with T45 = &StackLoc[-196]. */
+    if (dq->op == TCCIR_OP_ADD || dq->op == TCCIR_OP_SUB) {
+      IROperand src1 = tcc_ir_op_get_src1(ir, dq);
+      IROperand src2 = tcc_ir_op_get_src2(ir, dq);
+      if (!src1.is_lval && irop_is_immediate(src2)) {
+        int32_t s1vr = irop_get_vreg(src1);
+        if (s1vr >= 0) {
+          int delta = irop_get_imm32(src2);
+          acc += (dq->op == TCCIR_OP_ADD) ? delta : -delta;
+          vr = s1vr;
+          continue;
+        }
+      }
+      return INT_MIN;
+    }
+
+    return INT_MIN;
   }
   return INT_MIN;
 }

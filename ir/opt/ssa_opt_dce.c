@@ -874,7 +874,9 @@ static int sl_resolve_load_offset(IRSSAOptCtx *ctx, int instr_idx,
     return 1;
   }
 
-  if (q->op != TCCIR_OP_LOAD)
+  /* ASSIGN with deref source is a load — `T3 <-- T2***DEREF*** [ASSIGN]`. */
+  if (q->op != TCCIR_OP_LOAD &&
+      !(q->op == TCCIR_OP_ASSIGN && src1.is_lval))
     return 0;
 
   if (src1.tag == IROP_TAG_STACKOFF && src1.is_lval && src1.is_local && !src1.is_llocal) {
@@ -947,14 +949,48 @@ static int dce_dead_overwrite_stores(IRSSAOptCtx *ctx)
         continue;
       }
 
-      /* LOAD / LOAD_INDEXED of a known stack offset evicts overlapping
-       * pending stores (the value is observed, so the prior store must
-       * remain).  LOADs through external pointers (PARAM/unresolved
-       * TEMPs) cannot reach our tracked local-stack offsets, so do NOT
-       * clear pending in that case — local stack memory is unreachable
-       * from caller-supplied pointers. */
-      if (q->op == TCCIR_OP_LOAD || q->op == TCCIR_OP_LOAD_INDEXED ||
-          q->op == TCCIR_OP_LOAD_POSTINC) {
+      /* Source-side memory reads: any op with an is_lval source operand is a
+       * memory load through that operand (LOAD/ASSIGN/LOAD-fused arithmetic
+       * like `T <-- *P ADD #1`).  Each such read evicts overlapping pending
+       * stores so the prior store stays live.  An unresolvable deref could
+       * alias any tracked store — clear pending entirely. */
+      int saw_unresolved_deref = 0;
+      for (int side = 0; side < 2; side++) {
+        IROperand s = side ? tcc_ir_op_get_src2(ir, q) : tcc_ir_op_get_src1(ir, q);
+        if (!s.is_lval)
+          continue;
+        int eff = INT_MIN;
+        int width = sl_store_byte_width(irop_get_btype(s));
+        if (s.tag == IROP_TAG_STACKOFF && s.is_local && !s.is_llocal) {
+          int32_t sv = irop_get_vreg(s);
+          if (sv < 0 || TCCIR_DECODE_VREG_TYPE(sv) != TCCIR_VREG_TYPE_VAR)
+            eff = irop_get_stack_offset(s);
+        } else if (s.tag == IROP_TAG_VREG) {
+          int32_t sv = irop_get_vreg(s);
+          if (sv >= 0 && TCCIR_DECODE_VREG_TYPE(sv) == TCCIR_VREG_TYPE_TEMP)
+            eff = ssa_opt_resolve_lea_stackloc(ctx, sv);
+        }
+        if (eff == INT_MIN || width == 0) {
+          saw_unresolved_deref = 1;
+          break;
+        }
+        for (int k = 0; k < npending;) {
+          int po = pending[k].off, pw = pending[k].width;
+          if (eff < po + pw && eff + width > po)
+            pending[k] = pending[--npending];
+          else
+            k++;
+        }
+      }
+      if (saw_unresolved_deref) {
+        npending = 0;
+        continue;
+      }
+
+      /* LOAD_INDEXED / LOAD_POSTINC: pointer + index form (src1 is non-lval
+       * base).  The generic sweep above won't catch these; use the dedicated
+       * resolver. */
+      if (q->op == TCCIR_OP_LOAD_INDEXED || q->op == TCCIR_OP_LOAD_POSTINC) {
         int lo = 0, lw = 0, lu = 0;
         if (sl_resolve_load_offset(ctx, i, &lo, &lw, &lu)) {
           for (int k = 0; k < npending;) {
@@ -964,9 +1000,17 @@ static int dce_dead_overwrite_stores(IRSSAOptCtx *ctx)
             else
               k++;
           }
+        } else if (lu) {
+          npending = 0;
         }
         continue;
       }
+
+      /* Plain LOAD with a resolvable address — already evicted via the
+       * source-side sweep above when src1.is_lval.  If the LOAD's src1 isn't
+       * is_lval (degenerate IR), bail conservatively. */
+      if (q->op == TCCIR_OP_LOAD)
+        continue;
 
       /* STORE / STORE_INDEXED handling */
       if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED) {

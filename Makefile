@@ -545,6 +545,12 @@ test-prepare:
 	echo "------------ ir_tests: building newlib (first run) ------------"; \
 	cd $(IRTESTS_DIR)/qemu/mps2-an505 && sh ./build_newlib.sh
 
+.PHONY: rebuild-newlib
+rebuild-newlib:
+	@echo "------------ ir_tests: rebuilding newlib ------------"
+	@rm -rf $(IRTESTS_DIR)/qemu/mps2-an505/newlib_build
+	@cd $(IRTESTS_DIR)/qemu/mps2-an505 && sh ./build_newlib.sh
+
 .PHONY: prepare-pch benchmark-pch benchmark-pch-libc benchmark-pch-libtcc
 prepare-pch: cross
 	@$(PYTHON) "$(PCH_PREPARE_SCRIPT)" $(PCH_PREPARE_ARGS)
@@ -730,7 +736,7 @@ ut:
 ut-clean:
 	$(MAKE) -C tests/unit clean
 
-.PHONY: all cross fp-libs clean test test-valgrind test-aeabi-host test-legacy test-tests2 test-gcc-torture test-gcc-torture-compile test-gcc-torture-execute test-full test-all download-gcc-tests tar tags ETAGS doc distclean install uninstall ut ut-clean FORCE
+.PHONY: all cross fp-libs clean test test-valgrind test-aeabi-host test-legacy test-tests2 test-gcc-torture test-gcc-torture-compile test-gcc-torture-execute test-full test-all rebuild-newlib download-gcc-tests tar tags ETAGS doc distclean install uninstall ut ut-clean FORCE
 
 # Container image settings (auto-detect docker or podman)
 DOCKER_REGISTRY ?= ghcr.io
@@ -792,6 +798,8 @@ help:
 	@echo "   $(wordlist 9,99,$(TCC_X))"
 	@echo "make test"
 	@echo "   rebuild + initialize GCC testsuite + run pytest in tests/ir_tests"
+	@echo "make rebuild-newlib"
+	@echo "   wipe and rebuild newlib used by ir_tests/qemu (mps2-an505)"
 	@echo "make test-legacy"
 	@echo "   run legacy make-based tests (tests/Makefile)"
 	@echo "make tests2.all / make tests2.37 / make tests2.37+"
