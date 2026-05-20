@@ -1161,7 +1161,8 @@ int tcc_ir_opt_block_copy_init(TCCIRState *ir)
 
       /* Source must be a compile-time constant */
       int src_tag = irop_get_tag(st_src);
-      if (src_tag != IROP_TAG_SYMREF && src_tag != IROP_TAG_IMM32 && src_tag != IROP_TAG_I64)
+      if (src_tag != IROP_TAG_SYMREF && src_tag != IROP_TAG_IMM32 && src_tag != IROP_TAG_I64 &&
+          src_tag != IROP_TAG_F32 && src_tag != IROP_TAG_F64)
         break;
 
       store_indices[nstores] = j;
