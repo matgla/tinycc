@@ -119,6 +119,10 @@ int ssa_opt_gvn(IRSSAOptCtx *ctx);
 int ssa_opt_reassoc(IRSSAOptCtx *ctx);
 int ssa_opt_narrow(IRSSAOptCtx *ctx);
 int ssa_opt_branch(IRSSAOptCtx *ctx);
+/* CMP equality-fact propagation: walks the dom tree pushing equality
+ * facts from CMP+JEQ/JNE and folds redundant compares whose result is
+ * already known on the current dominated path. */
+int ssa_opt_cmp_eq_prop(IRSSAOptCtx *ctx);
 int ssa_opt_sccp(IRSSAOptCtx *ctx);
 int ssa_opt_load_cse(IRSSAOptCtx *ctx);
 int ssa_opt_var_forward(IRSSAOptCtx *ctx);

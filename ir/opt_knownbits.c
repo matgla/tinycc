@@ -253,6 +253,45 @@ static int kb_compute(TccIrOp op, uint32_t a_kz, uint32_t a_ko,
     *out_kz = a_kz;
     *out_ko = a_ko;
     break;
+  case TCCIR_OP_ADD:
+  case TCCIR_OP_SUB:
+  {
+    /* Bit-by-bit half-add with carry propagation.  For SUB we add ~b + 1
+     * (two's-complement negation): re-bias the b knownbits as ~b
+     * (swap kz<->ko) and inject an initial carry of 1.  At each bit we
+     * stop the moment any input bit or the incoming carry becomes
+     * unknown — beyond that, both the bit and the outgoing carry are
+     * unknown, so we can't tighten anything higher up. */
+    uint32_t kz = 0, ko = 0;
+    uint32_t carry_known = 1, carry_val = 0;
+    if (op == TCCIR_OP_SUB)
+    {
+      uint32_t tmp = b_kz;
+      b_kz = b_ko;
+      b_ko = tmp;
+      carry_val = 1; /* +1 for two's complement */
+    }
+    for (int i = 0; i < 32; i++)
+    {
+      uint32_t mask = 1u << i;
+      int a_known = ((a_kz | a_ko) & mask) != 0;
+      int b_known = ((b_kz | b_ko) & mask) != 0;
+      if (!a_known || !b_known || !carry_known)
+        break;
+      uint32_t a_bit = (a_ko >> i) & 1u;
+      uint32_t b_bit = (b_ko >> i) & 1u;
+      uint32_t sum_bit = a_bit ^ b_bit ^ carry_val;
+      uint32_t new_carry = (a_bit & b_bit) | ((a_bit ^ b_bit) & carry_val);
+      if (sum_bit)
+        ko |= mask;
+      else
+        kz |= mask;
+      carry_val = new_carry;
+    }
+    *out_kz = kz;
+    *out_ko = ko;
+    break;
+  }
   default:
     return 0;
   }
@@ -389,6 +428,57 @@ int tcc_ir_opt_known_bits(TCCIRState *ir)
        * dest handler. */
     }
 
+    /* TEST_ZERO + JUMPIF EQ/NE folding using known-bits.  When kb proves
+     * src1 has any known-one bit (ko != 0), the value is provably non-zero
+     * and the EQ branch is dead / NE branch unconditional.  branch_folding
+     * can't see this — it requires src1 to already be an immediate.  Catches
+     * the `~(p_10 | 1) + 1 != 0` shape (pr43255) where the low bit is set
+     * by OR #1, propagated through XOR/ADD via the bit-by-bit kb_compute. */
+    if (op == TCCIR_OP_TEST_ZERO)
+    {
+      IROperand src1 = tcc_ir_op_get_src1(ir, q);
+      uint32_t kz, ko;
+      if (kb_operand(ir, src1, tmp_kb, max_tmp_pos, current_gen,
+                     stack_slots, n_stack_slots, &kz, &ko) &&
+          ko != 0)
+      {
+        int j = i + 1;
+        while (j < n && ir->compact_instructions[j].op == TCCIR_OP_NOP)
+          j++;
+        if (j < n && ir->compact_instructions[j].op == TCCIR_OP_JUMPIF &&
+            !ir->compact_instructions[j].is_jump_target)
+        {
+          IRQuadCompact *jq = &ir->compact_instructions[j];
+          IROperand cond = tcc_ir_op_get_src1(ir, jq);
+          int tok = (int)irop_get_imm64_ex(ir, cond);
+          int branch_taken;
+          if (tok == 0x94)        /* EQ: would-jump iff value == 0 */
+            branch_taken = 0;
+          else if (tok == 0x95)   /* NE: would-jump iff value != 0 */
+            branch_taken = 1;
+          else
+            goto post_op;
+          if (branch_taken)
+          {
+            IROperand dest = tcc_ir_op_get_dest(ir, jq);
+            q->op = TCCIR_OP_NOP;
+            jq->op = TCCIR_OP_JUMP;
+            tcc_ir_set_dest(ir, j, dest);
+          }
+          else
+          {
+            q->op = TCCIR_OP_NOP;
+            jq->op = TCCIR_OP_NOP;
+          }
+          LOG_IR_GEN("OPTIMIZE: knownbits TEST_ZERO fold at i=%d "
+                     "(ko=%08x, tok=0x%x -> %s)",
+                     i, ko, tok, branch_taken ? "JUMP" : "NOP");
+          changes++;
+          goto post_op;
+        }
+      }
+    }
+
     int has_dest = irop_config[op].has_dest;
     if (!has_dest)
       continue;
@@ -459,6 +549,21 @@ int tcc_ir_opt_known_bits(TCCIRState *ir)
       int h2 = kb_operand(ir, s2, tmp_kb, max_tmp_pos, current_gen,
                           stack_slots, n_stack_slots, &b_kz, &b_ko);
       have_kb = h1 || h2;
+      if (!h1) { a_kz = 0; a_ko = 0; }
+      if (!h2) { b_kz = 0; b_ko = 0; }
+    }
+    else if (op == TCCIR_OP_ADD || op == TCCIR_OP_SUB)
+    {
+      /* Need BOTH operands fully tracked through their low bits — partial
+       * knowledge of only one side gives no information about the sum.
+       * kb_compute (above) walks LSB→MSB and stops at the first unknown
+       * bit, so a missing operand maps to "everything unknown" and the
+       * result has nothing to fold. */
+      int h1 = kb_operand(ir, s1, tmp_kb, max_tmp_pos, current_gen,
+                          stack_slots, n_stack_slots, &a_kz, &a_ko);
+      int h2 = kb_operand(ir, s2, tmp_kb, max_tmp_pos, current_gen,
+                          stack_slots, n_stack_slots, &b_kz, &b_ko);
+      have_kb = h1 && h2;
       if (!h1) { a_kz = 0; a_ko = 0; }
       if (!h2) { b_kz = 0; b_ko = 0; }
     }

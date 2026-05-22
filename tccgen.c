@@ -3634,6 +3634,163 @@ static void gv_dup(void)
 }
 
 #if PTR_SIZE == 4
+/* Inspect the direct IR producer of a 64-bit vreg to see if it is a 32->64
+ * extension emitted by gen_cast.  Returns:
+ *   1 for zero-extension via TCCIR_OP_ZEXT (out *out_low_vr is the 32-bit src)
+ *   2 for sign-extension via the canonical SHL #32 + OR low pattern
+ *   0 otherwise.
+ *
+ * Intentionally strict: only looks at the direct producer of `vr`, no
+ * ASSIGN-chain walking.  gen_cast for 32->64 unsigned emits ZEXT directly into
+ * the destination vreg, and the signed path emits OR(SHL(SAR(low,31),32),low)
+ * directly.  Anything in between (extra ASSIGNs from gv_dup, etc.) is opaque
+ * and we conservatively bail. */
+static int detect_ll_ext_provenance(int vr, int *out_low_vr)
+{
+  TCCIRState *ir = tcc_state->ir;
+  if (!ir || vr < 0)
+    return 0;
+  int n = ir->next_instruction_index;
+  if (n <= 0)
+    return 0;
+
+  int def = tcc_ir_find_defining_instruction(ir, vr, n);
+  if (def < 0)
+    return 0;
+  IRQuadCompact *q = &ir->compact_instructions[def];
+
+  if (q->op == TCCIR_OP_ZEXT)
+  {
+    /* Verify the ZEXT's source vreg is 32-bit (not a wider value being
+     * truncated-and-zero-extended in one step).  A genuine 32->64 ZEXT
+     * means the source operand width is 32 bits. */
+    IROperand s1 = tcc_ir_op_get_src1(ir, q);
+    if (irop_is_64bit(s1))
+      return 0;
+    int s_vr = irop_get_vreg(s1);
+    if (s_vr < 0)
+      return 0;
+    *out_low_vr = s_vr;
+    return 1;
+  }
+
+  if (q->op == TCCIR_OP_OR)
+  {
+    IROperand or_s1 = tcc_ir_op_get_src1(ir, q);
+    IROperand or_s2 = tcc_ir_op_get_src2(ir, q);
+    int or_s1_vr = irop_get_vreg(or_s1);
+    int or_s2_vr = irop_get_vreg(or_s2);
+    if (or_s1_vr < 0 || or_s2_vr < 0)
+      return 0;
+    /* Try each operand as the "shifted high" side; the other is the low. */
+    for (int swap = 0; swap < 2; ++swap)
+    {
+      int shifted_vr = swap ? or_s2_vr : or_s1_vr;
+      int low_vr = swap ? or_s1_vr : or_s2_vr;
+      int shl_def = tcc_ir_find_defining_instruction(ir, shifted_vr, def);
+      if (shl_def < 0)
+        continue;
+      IRQuadCompact *shl_q = &ir->compact_instructions[shl_def];
+      if (shl_q->op != TCCIR_OP_SHL)
+        continue;
+      IROperand shl_s2 = tcc_ir_op_get_src2(ir, shl_q);
+      if (!irop_is_immediate(shl_s2))
+        continue;
+      if ((int64_t)irop_get_imm64_ex(ir, shl_s2) != 32)
+        continue;
+      IROperand shl_s1 = tcc_ir_op_get_src1(ir, shl_q);
+      int high_vr = irop_get_vreg(shl_s1);
+      if (high_vr < 0)
+        continue;
+      int sar_def = tcc_ir_find_defining_instruction(ir, high_vr, shl_def);
+      if (sar_def < 0)
+        continue;
+      IRQuadCompact *sar_q = &ir->compact_instructions[sar_def];
+      if (sar_q->op != TCCIR_OP_SAR)
+        continue;
+      IROperand sar_s2 = tcc_ir_op_get_src2(ir, sar_q);
+      if (!irop_is_immediate(sar_s2))
+        continue;
+      if ((int64_t)irop_get_imm64_ex(ir, sar_s2) != 31)
+        continue;
+      IROperand sar_s1 = tcc_ir_op_get_src1(ir, sar_q);
+      int sar_src_vr = irop_get_vreg(sar_s1);
+      if (sar_src_vr < 0)
+        continue;
+      /* The SAR's source must be exactly the OR's low operand. */
+      if (sar_src_vr != low_vr)
+        continue;
+      /* Both must be 32-bit. */
+      if (irop_is_64bit(sar_s1) || irop_is_64bit(swap ? or_s1 : or_s2))
+        continue;
+      *out_low_vr = low_vr;
+      return 2;
+    }
+  }
+
+  return 0;
+}
+
+/* If both 64-bit operands on the vstack are 32->64 extensions, emit a single
+ * SMULL/UMULL (32x32->64) and replace the two operands with the 64-bit result.
+ * Returns 1 if it handled the multiply, 0 to fall back to the generic 64x64
+ * expansion in gen_opl '*'. */
+static int try_emit_widening_mul64(int t)
+{
+  TCCIRState *ir = tcc_state->ir;
+  if (!ir)
+    return 0;
+  /* Need IR-tracked vregs for both operands. */
+  if (vtop->vr < 0 || vtop[-1].vr < 0)
+    return 0;
+  /* Constants don't have a defining IR op; skip them. */
+  if ((vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST)
+    return 0;
+  if ((vtop[-1].r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST)
+    return 0;
+  /* Both operands must be 64-bit. */
+  if ((vtop->type.t & VT_BTYPE) != VT_LLONG)
+    return 0;
+  if ((vtop[-1].type.t & VT_BTYPE) != VT_LLONG)
+    return 0;
+
+  int low1 = -1, low2 = -1;
+  int p1 = detect_ll_ext_provenance(vtop[-1].vr, &low1);
+  int p2 = detect_ll_ext_provenance(vtop->vr, &low2);
+  if (p1 == 0 || p2 == 0)
+    return 0;
+  if (low1 < 0 || low2 < 0)
+    return 0;
+  /* Mixing signedness is unsafe — only handle pure unsigned×unsigned or
+   * pure signed×signed.  (If the source operands' actual signedness differs
+   * from how they were extended, the multiply still matches the bit pattern
+   * required by the C standard for two same-class operands.) */
+  if (p1 != p2)
+    return 0;
+
+  int tok = (p1 == 1) ? TOK_UMULL : TOK_SMULL;
+  int dest_t = VT_LLONG | ((p1 == 1) ? VT_UNSIGNED : 0);
+
+  /* Replace each operand on the stack with a 32-bit SValue pointing at the
+   * extension source vreg.  Then emit a single 32x32->64 multiply. */
+  int u_lo = (p1 == 1) ? VT_UNSIGNED : 0;
+  vtop[-1].vr = low1;
+  vtop[-1].type.t = VT_INT | u_lo;
+  vtop[-1].r = 0;
+  vtop[-1].c.i = 0;
+
+  vtop[0].vr = low2;
+  vtop[0].type.t = VT_INT | u_lo;
+  vtop[0].r = 0;
+  vtop[0].c.i = 0;
+
+  gen_op(tok);
+  /* gen_op leaves the 64-bit product on the stack; ensure type reflects that. */
+  vtop->type.t = dest_t;
+  (void)t;
+  return 1;
+}
+
 /* generate CPU independent (unsigned) long long operations */
 static void gen_opl(int op)
 {
@@ -3759,6 +3916,11 @@ static void gen_opl(int op)
     /* FALLTHROUGH */
   case '*':
     t = vtop->type.t; /* Save type for lbuild at end */
+    /* Widening-multiply peephole: when both 64-bit operands are 32->64
+     * extensions (zero or sign), emit a single 32x32->64 UMULL/SMULL
+     * instead of the generic 64x64 expansion. */
+    if (op == '*' && tcc_state->ir && try_emit_widening_mul64(t))
+      break;
     vswap();
     lexpand();
     vrotb(3);
@@ -6734,9 +6896,9 @@ redo:
       /* relational op: the result is an int */
       vtop->type.t = VT_INT;
     }
-    else if (op == TOK_UMULL)
+    else if (op == TOK_UMULL || op == TOK_SMULL)
     {
-      /* UMULL produces 64-bit result from 32-bit inputs - preserve the type set by tcc_ir_gen_opi */
+      /* UMULL/SMULL produce 64-bit result from 32-bit inputs - preserve the type set by tcc_ir_gen_opi */
     }
     else
     {
@@ -18740,6 +18902,98 @@ static void __attribute__((noinline)) unary_builtin_shuffle(void)
   }
 }
 
+/* __builtin_convertvector(vec, type) — element-wise type conversion.
+ * The source and target vectors must have the same element count.  Each
+ * destination element is the C cast of the matching source element. */
+static void __attribute__((noinline)) unary_builtin_convertvector(void)
+{
+  CType dst_vec_type, dst_elem_type, src_vec_type, src_elem_type;
+  SValue src_sv;
+  int src_elem_count, dst_elem_count;
+  int dst_vec_size, dst_elem_size, dst_elem_align;
+  int src_elem_size, src_elem_align;
+  int res_vr, res_loc;
+  int i;
+
+  next();
+  skip('(');
+  expr_eq();
+  skip(',');
+  parse_type(&dst_vec_type);
+  skip(')');
+
+  src_sv = *vtop;
+  vtop--;
+
+  if (!is_vector_type(&src_sv.type))
+    tcc_error("__builtin_convertvector first argument must be a vector");
+  if (!is_vector_type(&dst_vec_type))
+    tcc_error("__builtin_convertvector second argument must be a vector type");
+
+  src_vec_type = src_sv.type;
+  src_elem_type = src_vec_type.ref->type;
+  dst_elem_type = dst_vec_type.ref->type;
+  src_elem_count = vector_elem_count(&src_vec_type);
+  dst_elem_count = vector_elem_count(&dst_vec_type);
+
+  if (src_elem_count != dst_elem_count)
+    tcc_error("__builtin_convertvector source and target must have same element count");
+
+  src_elem_size = type_size(&src_elem_type, &src_elem_align);
+  dst_elem_size = type_size(&dst_elem_type, &dst_elem_align);
+  dst_vec_size = dst_vec_type.ref->c;
+
+  res_loc = get_temp_local_var(dst_vec_size, dst_vec_size > 8 ? 8 : dst_vec_size, &res_vr);
+
+  for (i = 0; i < dst_elem_count; i++)
+  {
+    int src_offset = i * src_elem_size;
+    int dst_offset = i * dst_elem_size;
+    SValue res_base;
+
+    /* Load src element [i] */
+    vpushv(&src_sv);
+    gaddrof();
+    vtop->type = char_pointer_type;
+    vpushi(src_offset);
+    gen_op('+');
+    vtop->type = src_elem_type;
+    vtop->r |= VT_LVAL;
+
+    /* Cast to dst element type */
+    gen_cast(&dst_elem_type);
+
+    /* Store to dst[i] */
+    memset(&res_base, 0, sizeof(res_base));
+    res_base.type = dst_vec_type;
+    res_base.r = VT_LOCAL | VT_LVAL;
+    res_base.vr = res_vr;
+    res_base.c.i = res_loc;
+
+    vpushv(&res_base);
+    gaddrof();
+    vtop->type = char_pointer_type;
+    vpushi(dst_offset);
+    gen_op('+');
+    vtop->type = dst_elem_type;
+    vtop->r |= VT_LVAL;
+
+    vswap();
+    vstore();
+    vpop();
+  }
+
+  {
+    SValue result;
+    memset(&result, 0, sizeof(result));
+    result.type = dst_vec_type;
+    result.r = VT_LOCAL | VT_LVAL;
+    result.vr = res_vr;
+    result.c.i = res_loc;
+    vpushv(&result);
+  }
+}
+
 /* Extracted from unary() to reduce stack frame size. */
 static void __attribute__((noinline)) unary_builtin_chk(void)
 {
@@ -20392,6 +20646,9 @@ tok_next:
   case TOK_builtin_shuffle:
   case TOK_builtin_shufflevector:
     unary_builtin_shuffle();
+    break;
+  case TOK_builtin_convertvector:
+    unary_builtin_convertvector();
     break;
   case TOK_builtin_conjf:
   case TOK_builtin_conj:
@@ -24061,6 +24318,39 @@ static void init_putz(init_params *p, unsigned long c, int size)
       tcc_ir_put(tcc_state->ir, TCCIR_OP_STORE, &zero, NULL, &d);
     }
   }
+  else if (tcc_state->ir && size > 0 && size <= 16)
+  {
+    /* Small non-word-aligned zero-init: expand to individual byte stores
+     * of #0.  Byte-granular stores let downstream byte loads match
+     * exactly (no partial-overlap forwarding required), which is the
+     * shape produced by partially-initialized char arrays / packed
+     * structs (e.g. `const char X[10] = { 'A', 'B', 'C', 'D', 'E' };`).
+     * Size capped at 16 to stay within the contributing-store limit of
+     * tcc_ir_opt_memmove_to_indexed_stores; larger sizes fall through
+     * to the memset call below so the optimizer can still recognize the
+     * memset-shift pattern. */
+    CType byte_type;
+    byte_type.t = VT_BYTE | VT_UNSIGNED;
+    byte_type.ref = NULL;
+
+    SValue zero;
+    svalue_init(&zero);
+    zero.type = byte_type;
+    zero.r = VT_CONST;
+    zero.vr = -1;
+    zero.c.i = 0;
+
+    for (int off = 0; off < size; off++)
+    {
+      SValue d;
+      svalue_init(&d);
+      d.type = byte_type;
+      d.r = VT_LOCAL | VT_LVAL;
+      d.vr = -1;
+      d.c.i = c + off;
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_STORE, &zero, NULL, &d);
+    }
+  }
   else
   {
     SValue src1;
@@ -27144,11 +27434,14 @@ static void gen_function(Sym *sym)
     int ladrof_changed = tcc_ir_opt_local_addrof_const_fold(ir) > 0;
     int aofvar_changed = 0;
     int gslfwd_changed = 0;
+    int iglh_changed = 0;
     if (tcc_state->opt_const_prop)
       aofvar_changed = tcc_ir_opt_addrof_var_fwd(ir) > 0;
     if (tcc_state->opt_store_load_fwd)
       gslfwd_changed = tcc_ir_opt_global_sl_fwd(ir) > 0;
-    if (padrof_changed || ladrof_changed || aofvar_changed || gslfwd_changed)
+    if (tcc_state->opt_store_load_fwd)
+      iglh_changed = tcc_ir_opt_invariant_global_load_hoist(ir) > 0;
+    if (padrof_changed || ladrof_changed || aofvar_changed || gslfwd_changed || iglh_changed)
     {
       if (tcc_state->opt_const_prop)
       {
@@ -27181,6 +27474,21 @@ static void gen_function(Sym *sym)
        * later passes) see a clean straight-line BB across what used to be a
        * jump-target boundary. */
       tcc_ir_opt_eliminate_fallthrough(ir);
+      /* Once the cleanup cascade above has run, copy propagation has folded
+       * the `T_new = ASSIGN T_anchor` chains left by the global-load hoist
+       * into direct uses of T_anchor.  Now invariant_temp_deref_hoist can
+       * collapse the resulting repeated `CMP T_anchor***DEREF***, X` pattern
+       * into one explicit deref load + N register-only compares. */
+      if (tcc_state->opt_copy_prop)
+        tcc_ir_opt_copy_prop(ir);
+      if (tcc_state->opt_store_load_fwd && tcc_ir_opt_invariant_temp_deref_hoist(ir) > 0)
+      {
+        if (tcc_state->opt_copy_prop)
+          tcc_ir_opt_copy_prop(ir);
+        if (tcc_state->opt_dce)
+          tcc_ir_opt_dce(ir);
+        tcc_ir_opt_compact_nops(ir);
+      }
       /* Redundant-store elimination: kill back-to-back stores to the same
        * address with no intervening read (e.g. three resets of a global
        * counter exposed by the prior switch-IPCP fold). */
@@ -27420,6 +27728,18 @@ static void gen_function(Sym *sym)
 
   /* PACK64 peephole — collapse `((u64)hi << 32) | (u64)lo` chains. */
   tcc_ir_opt_pack64(ir);
+
+  /* SHL32-OR chain peephole — collapse the (signed-widen + shift/mask)
+   * idiom where the high half is dead.  Re-run const_prop after so the
+   * exposed `X AND 0xFFFFFFFF` (now src1 is the original i32 value) folds
+   * into an ASSIGN. */
+  if (tcc_ir_opt_shl32_or_chain(ir) > 0)
+  {
+    if (tcc_state->opt_const_prop)
+      tcc_ir_opt_const_prop(ir);
+    if (tcc_state->opt_dce)
+      tcc_ir_opt_dce(ir);
+  }
 
   /* OR-bool-diamond — fold `acc |= (cond ? 1 : 0)` materialization. */
   if (tcc_state->opt_const_prop)
@@ -28393,16 +28713,11 @@ static void gen_function(Sym *sym)
      * already eliminated post-call code (DCE treats FUNCCALL-to-noreturn
      * as a terminator).  We can't collapse the whole body — the call
      * itself may have observable side effects in the callee — but we can
-     * suppress the unreachable epilogue.
-     *
-     * DISABLED for now: setting ir->noreturn on a regular function (one
-     * that still has a literal pool) interacts badly with the literal-pool
-     * emit path — the pool gets misplaced and LDR offsets wind up pointing
-     * into code as data.  The win here (2 bytes of dropped `bx lr`) isn't
-     * worth the risk; once the literal-pool interaction is fixed we can
-     * re-enable. */
-    /* else
-      tcc_ir_opt_noreturn_call_epilogue_suppress(ir); */
+     * suppress the unreachable epilogue.  The backend still flushes pending
+     * literal pools when it sees ir->noreturn, so LDR-literal users remain
+     * patched even though no return sequence is emitted. */
+    else
+      tcc_ir_opt_noreturn_call_epilogue_suppress(ir);
   }
 
   /* UB-only body elide: every STORE in the function goes through an address
@@ -28412,6 +28727,27 @@ static void gen_function(Sym *sym)
   if (tcc_state->opt_dce)
   {
     if (tcc_ir_opt_ub_only_body_elide(ir))
+      loc = 0;
+  }
+
+  /* Null-store dom-return: a STORE through a compile-time-NULL pointer that
+   * dominates every RETURNVOID is unconditional UB; collapse to bx lr.
+   * Catches gcc.c-torture/compile/pr36817 (`unsigned *p=0; *p++=0;` 18→1)
+   * which slips past ub_only_body_elide because the pointer is *explicitly*
+   * initialised to 0, not uninit. */
+  if (tcc_state->opt_dce)
+  {
+    if (tcc_ir_opt_null_store_dom_return(ir))
+      loc = 0;
+  }
+
+  /* Trap-only body suppress: constprop turned a constant `x / 0` (or `% 0`)
+   * into TCCIR_OP_TRAP, DCE NOPed the rest.  The remaining single-TRAP body
+   * never returns, so the prologue/epilogue are dead.  Reset `loc` so the
+   * frame allocated by tccgen for now-dead locals doesn't show up as SUB SP. */
+  if (tcc_state->opt_dce)
+  {
+    if (tcc_ir_opt_trap_only_body_suppress(ir))
       loc = 0;
   }
 

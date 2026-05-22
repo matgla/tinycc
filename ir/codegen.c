@@ -1591,6 +1591,29 @@ static inline void ir_codegen_track_scratch(int is_dry_run, int i, TccIrOp op, i
     ir_codegen_check_scratch(i, op, dry_insn_scratch, dry_insn_saves);
 }
 
+static int ir_codegen_count_vreg_uses(TCCIRState *ir, int32_t vreg)
+{
+  if (vreg < 0)
+    return 0;
+
+  int uses = 0;
+  for (int i = 0; i < ir->next_instruction_index; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+
+    if (irop_config[q->op].has_src1 && irop_get_vreg(tcc_ir_op_get_src1(ir, q)) == vreg)
+      uses++;
+    if (irop_config[q->op].has_src2 && irop_get_vreg(tcc_ir_op_get_src2(ir, q)) == vreg)
+      uses++;
+    if (q->op == TCCIR_OP_MLA && q->operand_base + 3 < ir->iroperand_pool_count &&
+        irop_get_vreg(ir->iroperand_pool[q->operand_base + 3]) == vreg)
+      uses++;
+  }
+  return uses;
+}
+
 #ifdef TCC_REGALLOC_DEBUG
 static void tcc_ir_debug_codegen_generate_entry(TCCIRState *ir)
 {
@@ -2072,6 +2095,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
         case TCCIR_OP_UMOD:
         case TCCIR_OP_IMOD:
         case TCCIR_OP_UMULL:
+        case TCCIR_OP_SMULL:
         case TCCIR_OP_BLOCK_COPY:
         case TCCIR_OP_VLA_ALLOC:
         case TCCIR_OP_VLA_SP_SAVE:
@@ -2389,13 +2413,94 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
                  li_dbg ? li_dbg->allocation.offset : -99,
                  a.accum.kind, a.accum.kind == MACH_OP_SPILL ? a.accum.u.spill.offset : -99);
         }
-        SCRATCH_WRAP(tcc_gen_machine_mla_mop(a.src1, a.src2, a.dest, a.accum));
+        if (a.dest.is_64bit)
+        {
+          SCRATCH_WRAP({
+            int fused = tcc_gen_machine_mlal_accum_mop(a.src1, a.src2, a.accum, a.dest, !a.dest.is_unsigned);
+            if (!fused)
+              tcc_error("compiler_error: unable to lower 64-bit MLA");
+          });
+        }
+        else
+        {
+          SCRATCH_WRAP(tcc_gen_machine_mla_mop(a.src1, a.src2, a.dest, a.accum));
+        }
         break;
       }
       case TCCIR_OP_UMULL:
+      case TCCIR_OP_SMULL:
       {
         MopArgs a = DECODE(.dest = 1, .src1 = 1, .src2 = 1);
-        SCRATCH_WRAP(tcc_gen_machine_umull_mop(a.src1, a.src2, a.dest));
+
+        /* Peephole: (S/U)MULL feeding a single 64-bit ADD into the same
+         * accumulator pair maps directly to (S/U)MLAL. */
+        if (a.dest.vreg >= 0 && ir_codegen_count_vreg_uses(ir, a.dest.vreg) == 1)
+        {
+          int next_j = i + 1;
+          while (next_j < ir->next_instruction_index && ir->compact_instructions[next_j].op == TCCIR_OP_NOP)
+            next_j++;
+          if (next_j < ir->next_instruction_index && ir->compact_instructions[next_j].op == TCCIR_OP_ADD &&
+              !ir->compact_instructions[next_j].is_jump_target)
+          {
+            IRQuadCompact *nq = &ir->compact_instructions[next_j];
+            IROperand n_src1_ir = tcc_ir_op_get_src1(ir, nq);
+            IROperand n_src2_ir = tcc_ir_op_get_src2(ir, nq);
+            IROperand n_dest_ir = tcc_ir_op_get_dest(ir, nq);
+            MopArgs b = ir_decode_cached(is_dry_run, 0, NULL, next_j, ir, nq, &n_src1_ir, &n_src2_ir, &n_dest_ir,
+                                         (MopSpec){.dest = 1, .src1 = 1, .src2 = 1});
+
+            MachineOperand *accum = NULL;
+            if (b.src1.vreg == a.dest.vreg)
+              accum = &b.src2;
+            else if (b.src2.vreg == a.dest.vreg)
+              accum = &b.src1;
+
+            if (accum && b.dest.is_64bit && accum->is_64bit)
+            {
+              tcc_gen_machine_insn_scratch_reset();
+              int fused = tcc_gen_machine_mlal_accum_mop(a.src1, a.src2, *accum, b.dest, cq->op == TCCIR_OP_SMULL);
+              if (fused)
+              {
+                ir_codegen_track_scratch(is_dry_run, i, cq->op, dry_insn_scratch, dry_insn_saves);
+                i = next_j;
+                break;
+              }
+            }
+
+            if (accum && accum->is_64bit && irop_get_vreg(n_dest_ir) >= 0)
+            {
+              int store_j = next_j + 1;
+              while (store_j < ir->next_instruction_index && ir->compact_instructions[store_j].op == TCCIR_OP_NOP)
+                store_j++;
+              if (store_j < ir->next_instruction_index && ir->compact_instructions[store_j].op == TCCIR_OP_STORE &&
+                  !ir->compact_instructions[store_j].is_jump_target)
+              {
+                IRQuadCompact *sq = &ir->compact_instructions[store_j];
+                IROperand st_src_ir = tcc_ir_op_get_src1(ir, sq);
+                IROperand st_dest_ir = tcc_ir_op_get_dest(ir, sq);
+                if (irop_get_vreg(st_src_ir) == irop_get_vreg(n_dest_ir) &&
+                    irop_get_vreg(st_dest_ir) == accum->vreg &&
+                    ir_codegen_count_vreg_uses(ir, irop_get_vreg(n_dest_ir)) == 1)
+                {
+                  tcc_gen_machine_insn_scratch_reset();
+                  int fused =
+                      tcc_gen_machine_mlal_accum_mop(a.src1, a.src2, *accum, *accum, cq->op == TCCIR_OP_SMULL);
+                  if (fused)
+                  {
+                    ir_codegen_track_scratch(is_dry_run, i, cq->op, dry_insn_scratch, dry_insn_saves);
+                    i = store_j;
+                    break;
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        if (cq->op == TCCIR_OP_UMULL)
+          SCRATCH_WRAP(tcc_gen_machine_umull_mop(a.src1, a.src2, a.dest));
+        else
+          SCRATCH_WRAP(tcc_gen_machine_smull_mop(a.src1, a.src2, a.dest));
         break;
       }
       case TCCIR_OP_ADD:
@@ -3469,8 +3574,13 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
     }
   }
 
-  if (!ir->naked && !ir->noreturn)
-    tcc_gen_machine_epilog(ir->leaffunc);
+  if (!ir->naked)
+  {
+    if (!ir->noreturn)
+      tcc_gen_machine_epilog(ir->leaffunc);
+    else
+      tcc_gen_machine_finish_noreturn();
+  }
   tcc_ir_codegen_backpatch_jumps(ir, ir_to_code_mapping);
 
   /* Backpatch return jumps to point to epilogue */

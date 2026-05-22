@@ -1965,7 +1965,11 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
   for (int i = 0; i < n; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op != TCCIR_OP_FUNCCALLVOID)
+    /* memcpy returns its dst argument; in IR it can appear as FUNCCALLVOID
+     * (return value discarded) or FUNCCALLVAL (return value used). The
+     * FUNCCALLVAL form is only foldable when its result vreg has no readers
+     * — verified later once we know the call is memcpy-like. */
+    if (q->op != TCCIR_OP_FUNCCALLVOID && q->op != TCCIR_OP_FUNCCALLVAL)
       continue;
 
     /* Callee must be memmove/memcpy family (returns first arg). */
@@ -1986,6 +1990,48 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
     if (!is_memmove_like)
       continue;
 
+    /* FUNCCALLVAL: the return value is the dst pointer. Only foldable if no
+     * later instruction reads the result vreg — once the call is NOPed the
+     * vreg has no producer. A dest with no allocated vreg (-1) is already
+     * known to have no readers and is always safe. */
+    if (q->op == TCCIR_OP_FUNCCALLVAL)
+    {
+      IROperand call_dest = tcc_ir_op_get_dest(ir, q);
+      int32_t ret_vr = irop_get_vreg(call_dest);
+      int has_reader = 0;
+      if (ret_vr >= 0)
+      {
+        for (int j = 0; j < n && !has_reader; j++)
+        {
+          if (j == i)
+            continue;
+          IRQuadCompact *sq = &ir->compact_instructions[j];
+          if (sq->op == TCCIR_OP_NOP)
+            continue;
+          if (irop_config[sq->op].has_src1)
+          {
+            IROperand s = tcc_ir_op_get_src1(ir, sq);
+            if (irop_has_vreg(s) && irop_get_vreg(s) == ret_vr)
+            {
+              has_reader = 1;
+              break;
+            }
+          }
+          if (irop_config[sq->op].has_src2)
+          {
+            IROperand s = tcc_ir_op_get_src2(ir, sq);
+            if (irop_has_vreg(s) && irop_get_vreg(s) == ret_vr)
+            {
+              has_reader = 1;
+              break;
+            }
+          }
+        }
+      }
+      if (has_reader)
+        continue;
+    }
+
     IROperand p_dst, p_src, p_size;
     if (!ir_opt_get_call_param_operand(ir, i, 0, &p_dst))
       continue;
@@ -1994,11 +2040,14 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
     if (!ir_opt_get_call_param_operand(ir, i, 2, &p_size))
       continue;
 
-    /* Size must be a small positive constant divisible by 4. */
+    /* Size must be a small positive constant.
+     * Note: previously required divisibility by 4 (STORE_INDEXED on a vreg
+     * pointer worked best with word stores), but byte-granular stores work
+     * fine for both the STORE_INDEXED and direct-StackLoc rewrite paths. */
     if (irop_get_tag(p_size) != IROP_TAG_IMM32)
       continue;
     int total_size = (int)irop_get_imm64_ex(ir, p_size);
-    if (total_size <= 0 || (total_size & 3) || total_size > 64)
+    if (total_size <= 0 || total_size > 64)
       continue;
 
     /* Source must be an address of a local stack offset.  May arrive in one
@@ -2054,24 +2103,57 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
       continue;
     }
 
-    /* Destination must be a vreg pointer (value, not lvalue, not stack-local). */
-    if (irop_get_tag(p_dst) != IROP_TAG_VREG || p_dst.is_lval || p_dst.is_local || p_dst.is_const)
+    /* Destination accepted in two forms:
+     *   (a) vreg pointer: rewrite stores to STORE_INDEXED on the pointer.
+     *   (b) direct stack offset: rewrite each store's destination offset to
+     *       the corresponding slot of the dst local (keeps STORE op).
+     * Form (b) catches `memcpy(local_buffer, &local_const_src, N)` whose
+     * source's bytes are explicit STOREs in IR — the const local can be
+     * dropped entirely. */
+    int dst_is_stackoff = 0;
+    int dst_base = 0;
+    int32_t dst_vr = -1;
+    if (irop_get_tag(p_dst) == IROP_TAG_STACKOFF && p_dst.is_local && !p_dst.is_lval)
+    {
+      dst_is_stackoff = 1;
+      dst_base = (int)irop_get_imm64_ex(ir, p_dst);
+      /* Forbid overlap with src range; the rewrite assumes non-overlap. */
+      if (dst_base + total_size > tmp_base && dst_base < tmp_base + total_size)
+        continue;
+    }
+    else if (irop_get_tag(p_dst) == IROP_TAG_VREG && !p_dst.is_lval && !p_dst.is_local && !p_dst.is_const)
+    {
+      if (!irop_has_vreg(p_dst))
+        continue;
+      dst_vr = irop_get_vreg(p_dst);
+      if (dst_vr < 0)
+        continue;
+    }
+    else
+    {
       continue;
-    if (!irop_has_vreg(p_dst))
-      continue;
-    int32_t dst_vr = irop_get_vreg(p_dst);
-    if (dst_vr < 0)
-      continue;
-    (void)dst_vr;
+    }
 
     /* Walk backwards through the same basic block looking for STOREs that
      * fully cover the temp range.  Stop on any other op (other call, jump,
-     * non-STORE write) or a previously NOPed slot. */
+     * non-STORE write) or a previously NOPed slot.
+     *
+     * A preceding `memset(src_range, 0, N)` (or __aeabi_memset) is also
+     * accepted as filling the bytes it covers with zeros — in the rewrite
+     * its destination PARAM is shifted from src to dst, and explicit byte
+     * stores supply the non-zero bytes.
+     *
+     * Coverage tracked at byte granularity via a 64-bit bitmap (total_size
+     * is bounded above by 64). */
     int store_indices[16];
     int store_offsets[16];
     int nstores = 0;
-    int total_covered = 0;
     int aborted = 0;
+    uint64_t covered_mask = 0;
+    int memset_idx = -1;
+    int memset_off = 0;
+    int memset_len = 0;
+    int memset_dst_param_idx = -1; /* IR index of the memset's PARAM0 */
 
     for (int j = i - 1; j >= 0 && nstores < 16; j--)
     {
@@ -2087,6 +2169,76 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
 
       if (sq->op != TCCIR_OP_STORE)
       {
+        /* Recognize a `memset(src_range, 0, N)` (or __aeabi_memset variant)
+         * preceding the contributing byte stores. Only one memset is tracked;
+         * subsequent ones bail. */
+        if (memset_idx < 0 &&
+            (sq->op == TCCIR_OP_FUNCCALLVOID || sq->op == TCCIR_OP_FUNCCALLVAL))
+        {
+          Sym *ms_callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, sq));
+          const char *ms_name = ms_callee ? get_tok_str(ms_callee->v, NULL) : NULL;
+          int is_memset_like = ms_name &&
+                               (strcmp(ms_name, "memset") == 0 ||
+                                strcmp(ms_name, "__aeabi_memset") == 0);
+          if (is_memset_like)
+          {
+            IROperand ms_p0, ms_p1, ms_p2;
+            int ok = ir_opt_get_call_param_operand(ir, j, 0, &ms_p0) &&
+                     ir_opt_get_call_param_operand(ir, j, 1, &ms_p1) &&
+                     ir_opt_get_call_param_operand(ir, j, 2, &ms_p2);
+            /* __aeabi_memset(dst, len, val); memset(dst, val, len). */
+            int is_aeabi = (strcmp(ms_name, "__aeabi_memset") == 0);
+            IROperand ms_val = is_aeabi ? ms_p2 : ms_p1;
+            IROperand ms_len = is_aeabi ? ms_p1 : ms_p2;
+            if (ok &&
+                irop_get_tag(ms_p0) == IROP_TAG_STACKOFF && ms_p0.is_local && !ms_p0.is_lval &&
+                irop_get_tag(ms_val) == IROP_TAG_IMM32 && irop_get_imm64_ex(ir, ms_val) == 0 &&
+                irop_get_tag(ms_len) == IROP_TAG_IMM32)
+            {
+              int ms_off = (int)irop_get_imm64_ex(ir, ms_p0);
+              int ms_n = (int)irop_get_imm64_ex(ir, ms_len);
+              if (ms_n > 0 &&
+                  ms_off >= tmp_base &&
+                  ms_off + ms_n <= tmp_base + total_size)
+              {
+                /* Find the PARAM0 instruction index for later rewrite. */
+                int ms_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(
+                    ir, tcc_ir_op_get_src2(ir, sq)));
+                int p0_idx = -1;
+                for (int k = j - 1; k >= 0; --k)
+                {
+                  IRQuadCompact *pq = &ir->compact_instructions[k];
+                  if (pq->op == TCCIR_OP_NOP)
+                    continue;
+                  if (pq->op != TCCIR_OP_FUNCPARAMVAL && pq->op != TCCIR_OP_FUNCPARAMVOID)
+                    continue;
+                  IROperand penc = tcc_ir_op_get_src2(ir, pq);
+                  uint32_t enc = (uint32_t)irop_get_imm64_ex(ir, penc);
+                  if (TCCIR_DECODE_CALL_ID(enc) != ms_call_id)
+                    continue;
+                  if (TCCIR_DECODE_PARAM_IDX(enc) == 0)
+                  {
+                    p0_idx = k;
+                    break;
+                  }
+                }
+                if (p0_idx >= 0)
+                {
+                  memset_idx = j;
+                  memset_off = ms_off;
+                  memset_len = ms_n;
+                  memset_dst_param_idx = p0_idx;
+                  /* Mark bytes as covered by the memset. */
+                  int bit0 = ms_off - tmp_base;
+                  for (int b = 0; b < ms_n; b++)
+                    covered_mask |= ((uint64_t)1) << (bit0 + b);
+                  continue;
+                }
+              }
+            }
+          }
+        }
+
         /* Allow benign in-between ops (LOAD, ASSIGN, ADD, arithmetic into
          * vregs, FUNCCALLs).  Aliasing safety is enforced by the global
          * scan below — which verifies no operand anywhere references the
@@ -2117,8 +2269,12 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
       if (st_off < tmp_base || st_off >= tmp_base + total_size)
         continue;
 
-      int is_wide = irop_is_64bit(st_dest);
-      int st_size = is_wide ? 8 : 4;
+      int st_size = ir_opt_store_btype_size_bytes(irop_get_btype(st_dest));
+      if (st_size <= 0)
+      {
+        aborted = 1;
+        break;
+      }
       if (st_off + st_size > tmp_base + total_size)
       {
         aborted = 1;
@@ -2139,19 +2295,42 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
       store_indices[nstores] = j;
       store_offsets[nstores] = st_off - tmp_base;
       nstores++;
-      total_covered += st_size;
+      /* Mark the bytes covered by this store in the bitmap. */
+      int bit0 = st_off - tmp_base;
+      for (int b = 0; b < st_size; b++)
+        covered_mask |= ((uint64_t)1) << (bit0 + b);
 
-      if (total_covered >= total_size)
+      /* Stop when full coverage is reached (explicit stores + any memset). */
+      uint64_t want_mask = (total_size >= 64) ? ~(uint64_t)0
+                                              : (((uint64_t)1 << total_size) - 1);
+      if (covered_mask == want_mask)
         break;
     }
 
-    if (aborted || nstores == 0 || total_covered != total_size)
-      continue;
+    {
+      uint64_t want_mask = (total_size >= 64) ? ~(uint64_t)0
+                                              : (((uint64_t)1 << total_size) - 1);
+      if (aborted || nstores == 0 || covered_mask != want_mask)
+        continue;
+    }
+
+    /* Compute index of the earliest contributing store. STOREs into the
+     * src range at indices strictly less than this are guaranteed dead in
+     * the original IR (overwritten by the contributing stores, which fully
+     * cover the src range) and are safe to treat as no-ops in our scan. */
+    int earliest_contrib_idx = i;
+    for (int s = 0; s < nstores; s++)
+    {
+      if (store_indices[s] < earliest_contrib_idx)
+        earliest_contrib_idx = store_indices[s];
+    }
 
     /* Verify the stack temp is not used anywhere else as a load source or
      * have its address taken elsewhere.  Conservative: scan all instructions
      * (except the memmove call's own params + the contributing stores). */
     int safe = 1;
+    int dead_pre_stores[16];
+    int n_dead_pre_stores = 0;
     for (int j = 0; j < n; j++)
     {
       if (j == i)
@@ -2183,6 +2362,42 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
         if (TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, pop_enc)) ==
             TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, call_src2)))
           continue;
+      }
+
+      /* Skip the recognized memset call and its PARAMs — its PARAM0 will be
+       * shifted to dst during the rewrite, replacing the src reference. */
+      if (memset_idx >= 0)
+      {
+        if (j == memset_idx)
+          continue;
+        if (sq->op == TCCIR_OP_FUNCPARAMVAL || sq->op == TCCIR_OP_FUNCPARAMVOID)
+        {
+          IROperand pop_enc = tcc_ir_op_get_src2(ir, sq);
+          IROperand ms_src2 = tcc_ir_op_get_src2(ir, &ir->compact_instructions[memset_idx]);
+          if (TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, pop_enc)) ==
+              TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, ms_src2)))
+            continue;
+        }
+      }
+
+      /* A pre-contributing STORE entirely into the src range with an
+       * immediate or vreg source is dead (subsequent contributing stores
+       * cover its byte range). Record it so we can NOP it during rewrite,
+       * and skip the bail. */
+      if (sq->op == TCCIR_OP_STORE && j < earliest_contrib_idx)
+      {
+        IROperand sd = tcc_ir_op_get_dest(ir, sq);
+        if (irop_get_tag(sd) == IROP_TAG_STACKOFF && sd.is_local && sd.is_lval)
+        {
+          int sd_off = (int)irop_get_imm64_ex(ir, sd);
+          int sd_size = ir_opt_store_btype_size_bytes(irop_get_btype(sd));
+          if (sd_size > 0 && sd_off >= tmp_base && sd_off + sd_size <= tmp_base + total_size)
+          {
+            if (n_dead_pre_stores < (int)(sizeof(dead_pre_stores) / sizeof(dead_pre_stores[0])))
+              dead_pre_stores[n_dead_pre_stores++] = j;
+            continue;
+          }
+        }
       }
 
       /* Check operands for tmp_base address use or stack offset use. */
@@ -2218,7 +2433,9 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
      * plan to rewrite — otherwise the rewritten STORE_INDEXEDs would
      * reference an uninitialized vreg.  Scan backwards from the memmove
      * for the most recent definition of dst_vr; require it to be at an
-     * index strictly less than every store_indices[] entry. */
+     * index strictly less than every store_indices[] entry.
+     * Skipped when dst is a direct stack offset — no vreg dependency. */
+    if (!dst_is_stackoff)
     {
       int earliest_store_idx = i;
       for (int s = 0; s < nstores; s++)
@@ -2242,6 +2459,72 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
         }
       }
       if (dst_def_idx < 0 || dst_def_idx >= earliest_store_idx)
+        continue;
+    }
+
+    /* When dst is a direct stack offset, the relocated stores land in the
+     * dst range earlier than the original memcpy would have written it.
+     * Ensure nothing reads or writes dst's range between the earliest
+     * relocated store and the memcpy itself — otherwise that intervening
+     * access would observe state different from the original program.
+     * Accesses to dst AFTER the memcpy are unchanged by the rewrite (the
+     * relocated stores still happen, just earlier). */
+    if (dst_is_stackoff)
+    {
+      int dst_safe = 1;
+      for (int j = 0; j < i && dst_safe; j++)
+      {
+        if (j == i)
+          continue;
+        IRQuadCompact *sq = &ir->compact_instructions[j];
+        if (sq->op == TCCIR_OP_NOP)
+          continue;
+        /* Contributing stores are about to be relocated to dst — skip them.
+         * They are the only writes to dst we permit before the memcpy. */
+        int is_store_of_ours = 0;
+        for (int s = 0; s < nstores; s++)
+        {
+          if (store_indices[s] == j)
+          {
+            is_store_of_ours = 1;
+            break;
+          }
+        }
+        if (is_store_of_ours)
+          continue;
+        /* Skip params of the memcpy call. */
+        if (sq->op == TCCIR_OP_FUNCPARAMVAL || sq->op == TCCIR_OP_FUNCPARAMVOID)
+        {
+          IROperand pop_enc = tcc_ir_op_get_src2(ir, sq);
+          IROperand call_src2 = tcc_ir_op_get_src2(ir, q);
+          if (TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, pop_enc)) ==
+              TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, call_src2)))
+            continue;
+        }
+        for (int si = 0; si < 3; si++)
+        {
+          IROperand op;
+          if (si == 0 && irop_config[sq->op].has_dest)
+            op = tcc_ir_op_get_dest(ir, sq);
+          else if (si == 1 && irop_config[sq->op].has_src1)
+            op = tcc_ir_op_get_src1(ir, sq);
+          else if (si == 2 && irop_config[sq->op].has_src2)
+            op = tcc_ir_op_get_src2(ir, sq);
+          else
+            continue;
+          if (irop_get_tag(op) != IROP_TAG_STACKOFF)
+            continue;
+          if (!op.is_local)
+            continue;
+          int off = (int)irop_get_imm64_ex(ir, op);
+          if (off < dst_base || off >= dst_base + total_size)
+            continue;
+          /* dst range referenced elsewhere — bail. */
+          dst_safe = 0;
+          break;
+        }
+      }
+      if (!dst_safe)
         continue;
     }
 
@@ -2293,8 +2576,10 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
         continue;
     }
 
-    /* Rewrite each contributing STORE to STORE_INDEXED targeting the
-     * destination pointer with the appropriate immediate offset. */
+    /* Rewrite each contributing STORE.
+     *   - dst is vreg pointer: convert to STORE_INDEXED with byte-offset index.
+     *   - dst is direct stack offset: shift the STORE's destination offset
+     *     from `tmp_base + off` to `dst_base + off`. */
     for (int s = 0; s < nstores; s++)
     {
       int sidx = store_indices[s];
@@ -2302,6 +2587,14 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
       IROperand st_src = tcc_ir_op_get_src1(ir, sq);
       IROperand st_dest_old = tcc_ir_op_get_dest(ir, sq);
       int offset = store_offsets[s];
+
+      if (dst_is_stackoff)
+      {
+        IROperand new_dest = st_dest_old;
+        new_dest.u.imm32 = dst_base + offset;
+        tcc_ir_set_dest(ir, sidx, new_dest);
+        continue;
+      }
 
       /* Build the STORE_INDEXED operand block:
        *   slot 0: dest = dst_vr (pointer, no lval)
@@ -2336,6 +2629,24 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
      * memmove's PARAM1) is gone, and the stack temp is now dead. */
     if (lea_idx >= 0)
       ir->compact_instructions[lea_idx].op = TCCIR_OP_NOP;
+
+    /* NOP dead pre-contributing stores into the src range; they were
+     * already dead in the original IR and have no purpose after we
+     * relocate the contributing stores. */
+    for (int s = 0; s < n_dead_pre_stores; s++)
+      ir->compact_instructions[dead_pre_stores[s]].op = TCCIR_OP_NOP;
+
+    /* If a preceding memset was recognized as filling the zero bytes,
+     * shift its PARAM0 (dst) from src to the matching offset in dst. */
+    if (dst_is_stackoff && memset_idx >= 0 && memset_dst_param_idx >= 0)
+    {
+      IRQuadCompact *pq = &ir->compact_instructions[memset_dst_param_idx];
+      IROperand p0_val = tcc_ir_op_get_src1(ir, pq);
+      p0_val.u.imm32 = dst_base + (memset_off - tmp_base);
+      tcc_ir_set_src1(ir, memset_dst_param_idx, p0_val);
+      /* memset_len bytes still get written; it's just to a different slot. */
+      (void)memset_len;
+    }
 
     changes++;
   }

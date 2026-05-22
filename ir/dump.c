@@ -35,6 +35,8 @@ const char *tcc_ir_get_op_name(TccIrOp op)
     return "MUL";
   case TCCIR_OP_UMULL:
     return "UMULL";
+  case TCCIR_OP_SMULL:
+    return "SMULL";
   case TCCIR_OP_DIV:
     return "DIV";
   case TCCIR_OP_UMOD:

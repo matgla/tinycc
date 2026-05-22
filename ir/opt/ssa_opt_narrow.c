@@ -63,9 +63,19 @@ static int gen_shr_fold(IRSSAOptCtx *ctx, int idx)
   if (shift_up != shift_down)
     return 0;
 
+  /* Skip 64-bit operations: the (1 << (32-n))-1 mask assumes 32-bit width.
+   * For INT64, (x << 24) >> 24 should mask 40 bits, not 8. */
+  IROperand inner_src1 = tcc_ir_op_get_src1(ir, inner);
+  IROperand inner_dest = tcc_ir_op_get_dest(ir, inner);
+  IROperand q_dest = tcc_ir_op_get_dest(ir, q);
+  if (inner_src1.btype == IROP_BTYPE_INT64 || inner_src1.btype == IROP_BTYPE_FLOAT64 ||
+      inner_dest.btype == IROP_BTYPE_INT64 || inner_dest.btype == IROP_BTYPE_FLOAT64 ||
+      q_dest.btype == IROP_BTYPE_INT64 || q_dest.btype == IROP_BTYPE_FLOAT64 ||
+      src1.btype == IROP_BTYPE_INT64 || src1.btype == IROP_BTYPE_FLOAT64)
+    return 0;
+
   /* (x SHL #n) SHR #n → x AND #mask */
   uint32_t mask = (1u << (32 - shift_up)) - 1;
-  IROperand inner_src1 = tcc_ir_op_get_src1(ir, inner);
 
   if (inner_src1.is_lval || inner_src1.is_local || inner_src1.is_llocal)
     return 0;

@@ -178,6 +178,7 @@ static int tcc_ir_opt_const_prop_cascade_ex(IROptCtx *ctx)
     ch += tcc_ir_opt_const_prop(ir);
     ch += tcc_ir_opt_const_prop_tmp(ir);
     ch += tcc_ir_opt_const_var_prop(ir);
+    ch += tcc_ir_opt_value_tracking(ir);
     if (!ch)
       break;
     total += ch;
@@ -211,6 +212,7 @@ static const IROptPass propagation_passes[] = {
   PASS_GATED("symref_prop",     tcc_ir_opt_symref_const_prop_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("const_prop_tmp",  tcc_ir_opt_const_prop_tmp_ex,   0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("known_bits",      tcc_ir_opt_known_bits_ex,        0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
+  PASS_GATED("neg_chain_cse",   tcc_ir_opt_neg_chain_cse_ex,    0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("add_reassoc",     tcc_ir_opt_add_reassoc_ex,      0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("redundant_assign", tcc_ir_opt_redundant_var_assign_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("string_calls",    tcc_ir_opt_const_string_calls_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
@@ -265,6 +267,10 @@ static const IROptPass memory_passes[] = {
 };
 
 static const IROptPass late_cleanup_passes[] = {
+  /* dead_vla_struct: NOP a VLA_ALLOC whose captured base-pointer slot only
+   * feeds STORE destinations (no LOAD, no escape). Must precede zero_vla so
+   * the orphaned outer SP_SAVE/RESTORE pair gets collapsed in the same round. */
+  PASS_GATED("dead_vla_struct",  tcc_ir_opt_dead_vla_struct_elim_ex, 0, IR_PASS_INVALIDATES_ALL, FLAG(opt_dead_store)),
   /* zero_vla: turn VLA_ALLOC(size=0) into NOPs so dead_lea_store (which bails
    * on any VLA_ALLOC) can clean up the surrounding stack scaffolding. */
   PASS_GATED("zero_vla",         tcc_ir_opt_zero_vla_elim_ex,    0, IR_PASS_INVALIDATES_ALL, FLAG(opt_dead_store)),
@@ -282,6 +288,7 @@ static const IROptPass late_cleanup_passes[] = {
   PASS_GATED("dead_temp_local",  tcc_ir_opt_dead_temp_local_elim_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_dead_store)),
   PASS_GATED("redundant_assign", tcc_ir_opt_redundant_var_assign_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_dead_store)),
   PASS_GATED("inplace_arith",    tcc_ir_opt_store_inplace_arith_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_redundant_store)),
+  PASS_GATED("global_base_share",tcc_ir_opt_global_base_share_ex,    0, IR_PASS_INVALIDATES_ALL, FLAG(opt_indexed_memory)),
 };
 
 /* Compound pass: entry-store-prop cleanup phase (replicates original two-phase

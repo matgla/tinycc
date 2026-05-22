@@ -693,6 +693,40 @@ static int ir_opt_setif_cmp_operand_equal(TCCIRState *ir, IROperand a, IROperand
   return 0;
 }
 
+/* When a def reads memory (`Sym***DEREF***` or `T_vreg***DEREF***` source), the
+ * value at that address must be the same at both `a_def_idx` and `b_def_idx`
+ * for the defs to be value-equivalent.  Conservatively require no aliasing
+ * store, call, inline-asm, or branch target between the two defs.  Pure ALU
+ * ops (and loads — they only read) are safe to skip. */
+static int ir_opt_pure_def_memory_stable(TCCIRState *ir, int a_def_idx, int b_def_idx)
+{
+  int lo = a_def_idx < b_def_idx ? a_def_idx : b_def_idx;
+  int hi = a_def_idx < b_def_idx ? b_def_idx : a_def_idx;
+  for (int k = lo + 1; k < hi; k++)
+  {
+    int kop = ir->compact_instructions[k].op;
+    if (kop == TCCIR_OP_STORE || kop == TCCIR_OP_STORE_INDEXED ||
+        kop == TCCIR_OP_STORE_POSTINC || kop == TCCIR_OP_BLOCK_COPY ||
+        kop == TCCIR_OP_FUNCCALLVOID || kop == TCCIR_OP_FUNCCALLVAL ||
+        kop == TCCIR_OP_INLINE_ASM || kop == TCCIR_OP_VLA_ALLOC)
+      return 0;
+    if (ir->compact_instructions[k].is_jump_target)
+      return 0;
+  }
+  return 1;
+}
+
+/* True if `q` has any source operand that reads memory (lval-flagged operand
+ * — `Sym***DEREF***`, `StackLoc***DEREF***`, or `T_vreg***DEREF***`). */
+static int ir_opt_pure_def_has_memory_read(TCCIRState *ir, IRQuadCompact *q)
+{
+  if (irop_config[q->op].has_src1 && tcc_ir_op_get_src1(ir, q).is_lval)
+    return 1;
+  if (irop_config[q->op].has_src2 && tcc_ir_op_get_src2(ir, q).is_lval)
+    return 1;
+  return 0;
+}
+
 int ir_opt_pure_def_equal(TCCIRState *ir, int a_def_idx, int b_def_idx, int depth)
 {
   IRQuadCompact *qa;
@@ -709,6 +743,18 @@ int ir_opt_pure_def_equal(TCCIRState *ir, int a_def_idx, int b_def_idx, int dept
   if (qa->op != qb->op)
     return 0;
 
+  /* Memory-stability gate: if either def reads memory through a lval source,
+   * we can only call the two defs value-equivalent when the underlying
+   * memory hasn't been mutated between them.  Without this check a STORE
+   * (or call) between two structurally-identical `*p` loads would silently
+   * fold a stale read.  Cheap to check (single forward scan) and a no-op for
+   * the existing ALU-only cases that never had lval sources. */
+  if (a_def_idx != b_def_idx &&
+      (ir_opt_pure_def_has_memory_read(ir, qa) ||
+       ir_opt_pure_def_has_memory_read(ir, qb)) &&
+      !ir_opt_pure_def_memory_stable(ir, a_def_idx, b_def_idx))
+    return 0;
+
   switch (qa->op)
   {
   case TCCIR_OP_ASSIGN:
@@ -718,6 +764,7 @@ int ir_opt_pure_def_equal(TCCIRState *ir, int a_def_idx, int b_def_idx, int dept
   case TCCIR_OP_OR:
   case TCCIR_OP_AND:
   case TCCIR_OP_XOR:
+  case TCCIR_OP_MUL:
   case TCCIR_OP_BOOL_OR:
   case TCCIR_OP_BOOL_AND:
   {
@@ -731,6 +778,15 @@ int ir_opt_pure_def_equal(TCCIRState *ir, int a_def_idx, int b_def_idx, int dept
              ir_opt_pure_expr_equal_impl(ir, a2, a_def_idx, b1, b_def_idx, depth + 1)));
   }
   case TCCIR_OP_SUB:
+  case TCCIR_OP_SHL:
+  case TCCIR_OP_SHR:
+  case TCCIR_OP_SAR:
+  case TCCIR_OP_ROR:
+  case TCCIR_OP_UMOD:
+  case TCCIR_OP_IMOD:
+  case TCCIR_OP_UDIV:
+  case TCCIR_OP_DIV:
+  case TCCIR_OP_PDIV:
   {
     IROperand a1 = tcc_ir_op_get_src1(ir, qa);
     IROperand a2 = tcc_ir_op_get_src2(ir, qa);
@@ -738,6 +794,22 @@ int ir_opt_pure_def_equal(TCCIRState *ir, int a_def_idx, int b_def_idx, int dept
     IROperand b2 = tcc_ir_op_get_src2(ir, qb);
     return (ir_opt_pure_expr_equal_impl(ir, a1, a_def_idx, b1, b_def_idx, depth + 1) &&
             ir_opt_pure_expr_equal_impl(ir, a2, a_def_idx, b2, b_def_idx, depth + 1));
+  }
+  case TCCIR_OP_MLA:
+  {
+    IROperand a1 = tcc_ir_op_get_src1(ir, qa);
+    IROperand a2 = tcc_ir_op_get_src2(ir, qa);
+    IROperand b1 = tcc_ir_op_get_src1(ir, qb);
+    IROperand b2 = tcc_ir_op_get_src2(ir, qb);
+    IROperand a3 = tcc_ir_op_get_accum(ir, qa);
+    IROperand b3 = tcc_ir_op_get_accum(ir, qb);
+    /* MLA = src1 * src2 + accum.  src1*src2 is commutative; accum is fixed. */
+    if (!ir_opt_pure_expr_equal_impl(ir, a3, a_def_idx, b3, b_def_idx, depth + 1))
+      return 0;
+    return ((ir_opt_pure_expr_equal_impl(ir, a1, a_def_idx, b1, b_def_idx, depth + 1) &&
+             ir_opt_pure_expr_equal_impl(ir, a2, a_def_idx, b2, b_def_idx, depth + 1)) ||
+            (ir_opt_pure_expr_equal_impl(ir, a1, a_def_idx, b2, b_def_idx, depth + 1) &&
+             ir_opt_pure_expr_equal_impl(ir, a2, a_def_idx, b1, b_def_idx, depth + 1)));
   }
   case TCCIR_OP_FUNCCALLVAL:
   {

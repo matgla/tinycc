@@ -1135,6 +1135,8 @@ TccIrOp tcc_irop_from_token(int token)
     return TCCIR_OP_MUL;
   case TOK_UMULL:
     return TCCIR_OP_UMULL;
+  case TOK_SMULL:
+    return TCCIR_OP_SMULL;
   case TOK_SHL:
     return TCCIR_OP_SHL;
   case TOK_SAR:
@@ -1192,10 +1194,15 @@ void tcc_ir_gen_i(TCCIRState *ir, int op)
   svalue_init(&dest);
   dest.vr = tcc_ir_get_vreg_temp(ir);
   dest.r = 0;
-  /* Most integer ops preserve the operand type, but UMULL produces a 64-bit result. */
+  /* Most integer ops preserve the operand type, but UMULL/SMULL produce a 64-bit result. */
   if (ir_op == TCCIR_OP_UMULL)
   {
     dest.type.t = VT_LLONG | VT_UNSIGNED;
+    tcc_ir_set_llong_type(ir, dest.vr);
+  }
+  else if (ir_op == TCCIR_OP_SMULL)
+  {
+    dest.type.t = VT_LLONG;
     tcc_ir_set_llong_type(ir, dest.vr);
   }
   else
@@ -1205,7 +1212,7 @@ void tcc_ir_gen_i(TCCIRState *ir, int op)
   tcc_ir_put(ir, ir_op, &vtop[-1], &vtop[0], &dest);
   vtop[-1].vr = dest.vr;
   vtop[-1].r = 0;
-  vtop[-1].type = dest.type; /* Update type - critical for UMULL which produces 64-bit from 32-bit inputs */
+  vtop[-1].type = dest.type; /* Update type - critical for UMULL/SMULL which produce 64-bit from 32-bit inputs */
   --vtop;
 }
 
@@ -1976,6 +1983,7 @@ const IRRegistersConfig irop_config[] = {
     [TCCIR_OP_MUL] = {1, 1, 1},
     [TCCIR_OP_MLA] = {1, 1, 1},  /* MLA has accumulator as extra operand at pool[operand_base+3] */
     [TCCIR_OP_UMULL] = {1, 1, 1},
+    [TCCIR_OP_SMULL] = {1, 1, 1},
     [TCCIR_OP_DIV] = {1, 1, 1},
     [TCCIR_OP_UMOD] = {1, 1, 1},
     [TCCIR_OP_IMOD] = {1, 1, 1},

@@ -19,6 +19,22 @@
 #include "opt_loop_utils.h"
 #include "cfg.h"
 
+static int tcc_ir_callee_is_noreturn(Sym *callee)
+{
+  if (!callee)
+    return 0;
+  if (callee->type.ref && callee->type.ref->f.func_noreturn)
+    return 1;
+
+  ElfSym *esym = elfsym(callee);
+  if (esym && esym->st_shndx != SHN_UNDEF)
+    return 0;
+
+  const char *name = get_tok_str(callee->asm_label ? callee->asm_label : callee->v, NULL);
+  return name && (!strcmp(name, "abort") || !strcmp(name, "exit") || !strcmp(name, "_Exit") ||
+                  !strcmp(name, "quick_exit"));
+}
+
 /* Dead Code Elimination pass
  * Removes unreachable instructions by following control flow from entry.
  * Returns 1 if any instructions were eliminated, 0 otherwise.
@@ -113,7 +129,7 @@ int tcc_ir_opt_dce(TCCIRState *ir)
        * uninit_dom_return passes — they set sym->f.func_noreturn at end of
        * gen_function), the call never returns and code after it is dead. */
       Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
-      if (callee && callee->type.ref && callee->type.ref->f.func_noreturn)
+      if (tcc_ir_callee_is_noreturn(callee))
         break; /* terminator: no fall-through */
       MARK_REACHABLE(i + 1);
       break;
@@ -304,9 +320,19 @@ int tcc_ir_opt_useless_function_body(TCCIRState *ir)
     memset(ir->ls.live_regs_by_instruction, 0,
            ir->ls.live_regs_by_instruction_size * sizeof(ir->ls.live_regs_by_instruction[0]));
   ir->leaffunc = 1;
+  /* The body had every essential-op already NOPed away (e.g. dead_vla_struct
+   * removed the VLA dance for a never-read local).  Drop the frame-pointer
+   * forcing so the prologue collapses to a single `bx lr` rather than the
+   * VLA-era push/setup/sub/teardown. */
+  tcc_state->need_frame_pointer = 0;
+  tcc_state->force_frame_pointer = 0;
 
   LOG_IR_GEN("USELESS-BODY: NOPed %d instructions (no observable side effects)", changes);
-  return changes;
+  /* Always return 1 once we've proved the body is observationally empty —
+   * even when an earlier pass already NOPed everything (changes == 0), the
+   * caller still needs to reset `loc` so the prologue doesn't allocate
+   * frame space for now-dead locals. */
+  return changes > 0 ? changes : 1;
 }
 
 int tcc_ir_opt_useless_function_body_ex(IROptCtx *ctx)
@@ -517,6 +543,61 @@ int tcc_ir_opt_noreturn_collapse(TCCIRState *ir)
 int tcc_ir_opt_noreturn_collapse_ex(IROptCtx *ctx)
 {
   return tcc_ir_opt_noreturn_collapse(ctx->ir);
+}
+
+/* Trap-Only Body Suppression
+ *
+ * After constprop converts a constant `x / 0` or `x % 0` into TCCIR_OP_TRAP,
+ * DCE NOPs out every following op.  The resulting IR has a single TRAP at
+ * the top and nothing else.  Without this pass codegen still emits a full
+ * prologue (push, frame setup, SUB SP) for the unreachable post-trap world,
+ * even though the TRAP never returns.  Suppress the prologue/epilogue by
+ * resetting the relevant frame state — caller resets `loc` to drop the
+ * stack-size contribution from now-dead locals. */
+int tcc_ir_opt_trap_only_body_suppress(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  if (n == 0)
+    return 0;
+  if (!tcc_state || tcc_state->optimize < 2)
+    return 0;
+  if (ir->naked)
+    return 0;
+
+  int trap_idx = -1;
+  for (int i = 0; i < n; i++)
+  {
+    int op = ir->compact_instructions[i].op;
+    if (op == TCCIR_OP_NOP)
+      continue;
+    if (op == TCCIR_OP_TRAP && trap_idx < 0)
+    {
+      trap_idx = i;
+      continue;
+    }
+    /* Any other live op (or a second TRAP) — not a pure trap-only body. */
+    return 0;
+  }
+  if (trap_idx < 0)
+    return 0;
+
+  LOG_IR_GEN("TRAP-ONLY-BODY: body collapsed to a single TRAP at i=%d — "
+             "suppressing prologue/epilogue", trap_idx);
+  ir->ls.dirty_registers = 0;
+  ir->ls.dirty_float_registers = 0;
+  if (ir->ls.live_regs_by_instruction && ir->ls.live_regs_by_instruction_size > 0)
+    memset(ir->ls.live_regs_by_instruction, 0,
+           ir->ls.live_regs_by_instruction_size * sizeof(ir->ls.live_regs_by_instruction[0]));
+  ir->leaffunc = 1;
+  ir->noreturn = 1;
+  tcc_state->need_frame_pointer = 0;
+  tcc_state->force_frame_pointer = 0;
+  return 1;
+}
+
+int tcc_ir_opt_trap_only_body_suppress_ex(IROptCtx *ctx)
+{
+  return tcc_ir_opt_trap_only_body_suppress(ctx->ir);
 }
 
 /* Zero-Size VLA Elimination
@@ -932,7 +1013,7 @@ int tcc_ir_opt_noreturn_call_epilogue_suppress(TCCIRState *ir)
     if (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID)
     {
       Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
-      if (callee && callee->type.ref && callee->type.ref->f.func_noreturn)
+      if (tcc_ir_callee_is_noreturn(callee))
         has_noreturn_call = 1;
     }
   }
@@ -960,8 +1041,32 @@ int tcc_ir_opt_noreturn_call_epilogue_suppress(TCCIRState *ir)
   if (last_op != TCCIR_OP_FUNCCALLVAL && last_op != TCCIR_OP_FUNCCALLVOID)
     return 0;
 
+  /* An implicit-return function can have its final live op be a noreturn call
+   * on only one branch, e.g. `if (bad) abort();` with the non-abort path
+   * jumping to the function end.  In that shape there is no explicit
+   * RETURNVOID/RETURNVALUE in the IR, but the backend epilogue is still the
+   * target for the other path.  Do not suppress the epilogue if any live jump
+   * can land after the final noreturn call (possibly through trailing NOPs). */
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    int target = -1;
+    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
+    {
+      IROperand dest = tcc_ir_op_get_dest(ir, q);
+      target = (int)irop_get_imm64_ex(ir, dest);
+    }
+    else
+      continue;
+
+    while (target >= 0 && target < n && ir->compact_instructions[target].op == TCCIR_OP_NOP)
+      target++;
+    if (target < 0 || target >= n || target > last_idx)
+      return 0;
+  }
+
   Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, &ir->compact_instructions[last_idx]));
-  if (!callee || !callee->type.ref || !callee->type.ref->f.func_noreturn)
+  if (!tcc_ir_callee_is_noreturn(callee))
     return 0;
 
   LOG_IR_GEN("NORETURN-CALL-EPILOGUE-SUPPRESS: function ends at noreturn call "
@@ -5179,3 +5284,356 @@ int tcc_ir_opt_const_return_uninit_elide(TCCIRState *ir)
 
 int tcc_ir_opt_const_return_uninit_elide_ex(IROptCtx *ctx) { return tcc_ir_opt_const_return_uninit_elide(ctx->ir); }
 
+/* Null-Store Dominates Return — UB exploit for STORE through compile-time NULL.
+ *
+ * Detects functions where some STORE has its address operand provably equal to
+ * a compile-time constant 0 (NULL pointer dereference) on at least one
+ * execution path, and that STORE dominates every RETURNVOID.  Per C11 those
+ * executions are UB and we may legally choose any behaviour; we pick
+ * "collapse to bx lr", matching GCC -O2 on gcc.c-torture/compile/pr36817.c
+ * where `unsigned *p=0; *p++=0;` reduces the entire body to a single return.
+ *
+ * Approach: linear forward scan from entry tracking which TEMPs / VARs hold
+ * a compile-time-known zero (propagated through ASSIGN of #0 and ASSIGN of a
+ * known-zero source).  Stop at any operation that breaks linear flow
+ * (unconditional JUMP, RETURN, CALL, IJUMP, SWITCH_TABLE, asm).  When the
+ * scan finds a STORE through a known-zero address, verify its block
+ * dominates every RETURNVOID before collapsing.
+ *
+ * The linear-scan + dominator check is sound:
+ *   - Stopping at unconditional JUMP ensures we never claim UB based on a
+ *     hypothetical state at code skipped by the jump.
+ *   - Killing known-zero on any non-zero write means the recorded "known
+ *     zero" is the value seen on the LINEAR fall-through path from entry.
+ *   - The dominator check ensures every actual execution reaches the STORE,
+ *     so UB on the linear path implies UB on every execution.
+ */
+int tcc_ir_opt_null_store_dom_return(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  if (n == 0)
+    return 0;
+  /* O2-only: same gating philosophy as the other UB-exploit passes. */
+  if (!tcc_state || tcc_state->optimize < 2)
+    return 0;
+
+  /* Bail on unanalyzable ops + non-void returns.  Inline asm / IJUMP can hide
+   * writes through pointers we can't see; non-void returns would need a
+   * synthesized return value we don't have.  An explicit RETURNVOID is not
+   * required — TCC's IR often elides it and relies on the codegen epilogue. */
+  for (int i = 0; i < n; i++)
+  {
+    TccIrOp op = ir->compact_instructions[i].op;
+    switch (op)
+    {
+    case TCCIR_OP_ASM_INPUT:
+    case TCCIR_OP_ASM_OUTPUT:
+    case TCCIR_OP_INLINE_ASM:
+    case TCCIR_OP_IJUMP:
+    case TCCIR_OP_TRAP:
+    case TCCIR_OP_SETJMP:
+    case TCCIR_OP_LONGJMP:
+    case TCCIR_OP_NL_SETJMP:
+    case TCCIR_OP_NL_LONGJMP:
+    case TCCIR_OP_BUILTIN_APPLY_ARGS:
+    case TCCIR_OP_BUILTIN_APPLY:
+    case TCCIR_OP_BUILTIN_RETURN:
+    case TCCIR_OP_RETURNVALUE:
+      return 0;
+    default:
+      break;
+    }
+    /* Volatile sym access on any operand is observable; can't elide. */
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    for (int k = 0; k <= 2; k++)
+    {
+      IROperand op2;
+      if (k == 0)
+      {
+        if (!irop_config[q->op].has_dest)
+          continue;
+        op2 = tcc_ir_op_get_dest(ir, q);
+      }
+      else if (k == 1)
+      {
+        if (!irop_config[q->op].has_src1)
+          continue;
+        op2 = tcc_ir_op_get_src1(ir, q);
+      }
+      else
+      {
+        if (!irop_config[q->op].has_src2)
+          continue;
+        op2 = tcc_ir_op_get_src2(ir, q);
+      }
+      if (op2.is_sym)
+      {
+        Sym *sym = irop_get_sym_ex(ir, op2);
+        if (sym && (sym->type.t & VT_VOLATILE))
+          return 0;
+      }
+    }
+  }
+#define NSDR_MAX_TEMP 8192
+#define NSDR_MAX_VAR 1024
+  uint8_t temp_zero[(NSDR_MAX_TEMP + 7) / 8] = {0};
+  uint8_t var_zero[(NSDR_MAX_VAR + 7) / 8] = {0};
+  uint8_t var_addr_taken[(NSDR_MAX_VAR + 7) / 8] = {0};
+
+  /* Pre-scan: identify address-taken VARs (skip them — pointer writes could
+   * have initialized them invisibly). */
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    for (int k = 0; k <= 2; k++)
+    {
+      IROperand op;
+      if (k == 0)
+      {
+        if (!irop_config[q->op].has_dest)
+          continue;
+        op = tcc_ir_op_get_dest(ir, q);
+      }
+      else if (k == 1)
+      {
+        if (!irop_config[q->op].has_src1)
+          continue;
+        op = tcc_ir_op_get_src1(ir, q);
+      }
+      else
+      {
+        if (!irop_config[q->op].has_src2)
+          continue;
+        op = tcc_ir_op_get_src2(ir, q);
+      }
+      int32_t vr = irop_get_vreg(op);
+      if (vr < 0)
+        continue;
+      if (TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_VAR)
+        continue;
+      if (op.is_local && !op.is_lval)
+      {
+        int p = TCCIR_DECODE_VREG_POSITION(vr);
+        if (p >= 0 && p < NSDR_MAX_VAR)
+          var_addr_taken[p >> 3] |= (uint8_t)(1u << (p & 7));
+      }
+    }
+    if (q->op == TCCIR_OP_LEA && irop_config[q->op].has_src1)
+    {
+      IROperand op = tcc_ir_op_get_src1(ir, q);
+      int32_t vr = irop_get_vreg(op);
+      if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR)
+      {
+        int p = TCCIR_DECODE_VREG_POSITION(vr);
+        if (p >= 0 && p < NSDR_MAX_VAR)
+          var_addr_taken[p >> 3] |= (uint8_t)(1u << (p & 7));
+      }
+    }
+  }
+
+#define VREG_IS_KNOWN_ZERO(_op)                                                                                            \
+  ({                                                                                                                       \
+    int _r = 0;                                                                                                            \
+    int32_t _vr = irop_get_vreg(_op);                                                                                      \
+    if (_vr >= 0 && !(_op).is_lval)                                                                                        \
+    {                                                                                                                      \
+      int _t = TCCIR_DECODE_VREG_TYPE(_vr);                                                                                \
+      int _p = TCCIR_DECODE_VREG_POSITION(_vr);                                                                            \
+      if (_t == TCCIR_VREG_TYPE_TEMP && _p >= 0 && _p < NSDR_MAX_TEMP)                                                     \
+      {                                                                                                                    \
+        if (temp_zero[_p >> 3] & (uint8_t)(1u << (_p & 7)))                                                                \
+          _r = 1;                                                                                                          \
+      }                                                                                                                    \
+      else if (_t == TCCIR_VREG_TYPE_VAR && _p >= 0 && _p < NSDR_MAX_VAR &&                                                \
+               !(var_addr_taken[_p >> 3] & (uint8_t)(1u << (_p & 7))))                                                     \
+      {                                                                                                                    \
+        if (var_zero[_p >> 3] & (uint8_t)(1u << (_p & 7)))                                                                 \
+          _r = 1;                                                                                                          \
+      }                                                                                                                    \
+    }                                                                                                                      \
+    _r;                                                                                                                    \
+  })
+
+  int ub_store_idx = -1;
+
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+
+    /* Check STORE through known-NULL pointer (before applying any writes
+     * from this instruction — STORE's "dest" is the address it reads). */
+    if (q->op == TCCIR_OP_STORE)
+    {
+      IROperand dest = tcc_ir_op_get_dest(ir, q);
+      if (dest.is_lval && !dest.is_local)
+      {
+        /* Direct immediate NULL address operand. */
+        if (irop_is_immediate(dest) && irop_get_imm64_ex(ir, dest) == 0)
+        {
+          ub_store_idx = i;
+          break;
+        }
+        /* Vreg currently known to be zero. */
+        int32_t vr = irop_get_vreg(dest);
+        if (vr >= 0)
+        {
+          int t = TCCIR_DECODE_VREG_TYPE(vr);
+          int p = TCCIR_DECODE_VREG_POSITION(vr);
+          if (t == TCCIR_VREG_TYPE_TEMP && p >= 0 && p < NSDR_MAX_TEMP)
+          {
+            if (temp_zero[p >> 3] & (uint8_t)(1u << (p & 7)))
+            {
+              ub_store_idx = i;
+              break;
+            }
+          }
+          else if (t == TCCIR_VREG_TYPE_VAR && p >= 0 && p < NSDR_MAX_VAR &&
+                   !(var_addr_taken[p >> 3] & (uint8_t)(1u << (p & 7))))
+          {
+            if (var_zero[p >> 3] & (uint8_t)(1u << (p & 7)))
+            {
+              ub_store_idx = i;
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    /* Apply the write effect of this instruction to known-zero tracking. */
+    if (irop_config[q->op].has_dest)
+    {
+      IROperand dst = tcc_ir_op_get_dest(ir, q);
+      /* is_lval (deref) or is_local (stack address) destinations don't
+       * define a vreg in the value sense. */
+      if (!dst.is_lval && !dst.is_local)
+      {
+        int32_t dvr = irop_get_vreg(dst);
+        if (dvr >= 0)
+        {
+          int dtype = TCCIR_DECODE_VREG_TYPE(dvr);
+          int dpos = TCCIR_DECODE_VREG_POSITION(dvr);
+
+          int makes_zero = 0;
+          if (q->op == TCCIR_OP_ASSIGN && irop_config[q->op].has_src1)
+          {
+            IROperand src1 = tcc_ir_op_get_src1(ir, q);
+            if (irop_is_immediate(src1) && irop_get_imm64_ex(ir, src1) == 0)
+              makes_zero = 1;
+            else if (VREG_IS_KNOWN_ZERO(src1))
+              makes_zero = 1;
+          }
+
+          if (dtype == TCCIR_VREG_TYPE_TEMP && dpos >= 0 && dpos < NSDR_MAX_TEMP)
+          {
+            if (makes_zero)
+              temp_zero[dpos >> 3] |= (uint8_t)(1u << (dpos & 7));
+            else
+              temp_zero[dpos >> 3] &= (uint8_t)~(1u << (dpos & 7));
+          }
+          else if (dtype == TCCIR_VREG_TYPE_VAR && dpos >= 0 && dpos < NSDR_MAX_VAR)
+          {
+            if (makes_zero)
+              var_zero[dpos >> 3] |= (uint8_t)(1u << (dpos & 7));
+            else
+              var_zero[dpos >> 3] &= (uint8_t)~(1u << (dpos & 7));
+          }
+        }
+      }
+    }
+
+    /* Stop conditions: any op that ends linear forward flow.  An unconditional
+     * JUMP makes subsequent linear-order instructions unreachable from this
+     * point (they'd need to be entered via a jump target with possibly
+     * different state, which we can't track here).  Other terminators have
+     * similar semantics. */
+    if (q->op == TCCIR_OP_JUMP)
+      break;
+    if (q->op == TCCIR_OP_RETURNVOID || q->op == TCCIR_OP_RETURNVALUE)
+      break;
+    if (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID)
+      break;
+    if (q->op == TCCIR_OP_SWITCH_TABLE)
+      break;
+  }
+
+#undef VREG_IS_KNOWN_ZERO
+#undef NSDR_MAX_TEMP
+#undef NSDR_MAX_VAR
+
+  if (ub_store_idx < 0)
+    return 0;
+
+  /* Verify the UB STORE's block dominates every function exit.  An "exit" is
+   * either an explicit RETURNVOID or a CFG-leaf block (no successors — fall
+   * off the end of the function, which TCC's codegen handles by appending a
+   * bx lr). */
+  IRCFG *cfg = tcc_ir_cfg_build(ir);
+  if (!cfg || cfg->num_blocks == 0)
+  {
+    if (cfg)
+      tcc_ir_cfg_free(cfg);
+    return 0;
+  }
+  tcc_ir_cfg_compute_dominators(cfg);
+
+  int store_block = cfg->instr_to_block[ub_store_idx];
+  int ok = 1;
+  /* Check explicit RETURNVOIDs. */
+  for (int i = 0; i < n && ok; i++)
+  {
+    TccIrOp op = ir->compact_instructions[i].op;
+    if (op != TCCIR_OP_RETURNVOID)
+      continue;
+    int ret_block = cfg->instr_to_block[i];
+    if (store_block == ret_block)
+    {
+      if (ub_store_idx >= i)
+        ok = 0;
+    }
+    else if (!tcc_ir_cfg_dominates(cfg, store_block, ret_block))
+    {
+      ok = 0;
+    }
+  }
+  /* Check CFG-leaf blocks (implicit fall-off exits). */
+  for (int b = 0; b < cfg->num_blocks && ok; b++)
+  {
+    if (cfg->blocks[b].num_succs != 0)
+      continue;
+    if (b == store_block)
+      continue; /* same block: STORE comes before the implicit exit by construction */
+    if (!tcc_ir_cfg_dominates(cfg, store_block, b))
+      ok = 0;
+  }
+  tcc_ir_cfg_free(cfg);
+
+  if (!ok)
+    return 0;
+
+  LOG_IR_GEN("NULL-STORE-DOM-RETURN: collapsing function body to bx lr "
+             "(STORE at i=%d through compile-time NULL dominates all RETURNVOIDs)", ub_store_idx);
+
+  /* NOP everything — codegen will emit bare prologue + bx lr.  Mirrors
+   * ub_only_body_elide's bookkeeping. */
+  for (int i = 0; i < n; i++)
+  {
+    ir->compact_instructions[i].op = TCCIR_OP_NOP;
+    ir->compact_instructions[i].is_jump_target = 0;
+  }
+
+  ir->ls.dirty_registers = 0;
+  ir->ls.dirty_float_registers = 0;
+  if (ir->ls.live_regs_by_instruction && ir->ls.live_regs_by_instruction_size > 0)
+    memset(ir->ls.live_regs_by_instruction, 0,
+           ir->ls.live_regs_by_instruction_size * sizeof(ir->ls.live_regs_by_instruction[0]));
+  ir->leaffunc = 1;
+
+  return 1;
+}
+
+int tcc_ir_opt_null_store_dom_return_ex(IROptCtx *ctx) { return tcc_ir_opt_null_store_dom_return(ctx->ir); }

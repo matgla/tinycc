@@ -667,6 +667,7 @@ int tcc_ir_ssa_opt_run(IRSSAOptCtx *ctx)
     changes += ssa_opt_fold(ctx);
     changes += ssa_opt_load_cse(ctx);
     changes += ssa_opt_branch(ctx);
+    changes += ssa_opt_cmp_eq_prop(ctx);
     changes += ssa_opt_reassoc(ctx);
     changes += ssa_opt_strength(ctx);
     changes += ssa_opt_narrow(ctx);

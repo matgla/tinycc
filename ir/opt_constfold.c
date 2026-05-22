@@ -929,19 +929,31 @@ int tcc_ir_opt_const_call_replace(TCCIRState *ir)
     IROperand dest = tcc_ir_op_get_dest(ir, q);
     IROperand call_info = tcc_ir_op_get_src2(ir, q);
     int call_id = TCCIR_DECODE_CALL_ID((int)irop_get_imm64_ex(ir, call_info));
+    int32_t dest_vr = irop_get_vreg(dest);
 
     LOG_IR_GEN("OPTIMIZE: IPC replace call to %s with #%lld at i=%d", get_tok_str(callee->v, NULL), (long long)val, i);
 
-    q->op = TCCIR_OP_ASSIGN;
-    if (val == (int32_t)val)
-      tcc_ir_set_src1(ir, i, irop_make_imm32(-1, (int32_t)val, btype));
+    /* If the return value has no allocated vreg, the result is discarded.
+     * Functions in the const-result cache are pure (ASSIGN+RETURNVALUE only),
+     * so the call has no side effects — NOP it instead of leaving a dead
+     * ASSIGN-to-nowhere that DCE can't always remove. */
+    if (dest_vr < 0)
+    {
+      q->op = TCCIR_OP_NOP;
+    }
     else
     {
-      uint32_t pool_idx = tcc_ir_pool_add_i64(ir, val);
-      tcc_ir_set_src1(ir, i, irop_make_i64(-1, pool_idx, btype));
+      q->op = TCCIR_OP_ASSIGN;
+      if (val == (int32_t)val)
+        tcc_ir_set_src1(ir, i, irop_make_imm32(-1, (int32_t)val, btype));
+      else
+      {
+        uint32_t pool_idx = tcc_ir_pool_add_i64(ir, val);
+        tcc_ir_set_src1(ir, i, irop_make_i64(-1, pool_idx, btype));
+      }
+      tcc_ir_set_src2(ir, i, IROP_NONE);
+      tcc_ir_set_dest(ir, i, dest);
     }
-    tcc_ir_set_src2(ir, i, IROP_NONE);
-    tcc_ir_set_dest(ir, i, dest);
 
     for (int j = i - 1; j >= 0; j--)
     {

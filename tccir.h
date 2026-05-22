@@ -216,6 +216,10 @@ typedef enum TccIrOp
    * SWITCH_LOAD itself to leverage existing CMP/JUMPIF/ASSIGN lowering).
    */
   TCCIR_OP_SWITCH_LOAD,
+  /* Signed 32x32 -> 64 multiply: {dest_hi:dest_lo} = (int32)src1 * (int32)src2.
+   * Placed at the end of the enum to avoid shifting other op values, which
+   * could break ranges or generated tables that depend on absolute positions. */
+  TCCIR_OP_SMULL,
 } TccIrOp;
 
 /* FUNCPARAMVAL encoding helpers:

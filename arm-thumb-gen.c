@@ -2757,6 +2757,32 @@ int ot(thumb_opcode op)
           mov_equiv_record_mov(mv_rd, mv_rm);
           strldr_cache_invalidate_reg(mv_rd);
         }
+        else if (op.size == 4 &&
+                 (((op.opcode >> 16) & 0xFE40) == 0xE840))
+        {
+          /* LDRD/STRD (Thumb-2): encoded as 1110 100P U1W0 nnnn (STRD) or
+           * 1110 100P U1W1 nnnn (LDRD).  Bit 20 (high-halfword bit 4)
+           * distinguishes load (1) vs store (0).
+           *
+           * STRD writes no GPR — only memory.  LDRD writes both Rt and Rt2
+           * (low-halfword bits [15:12] and [11:8] respectively).  Either way
+           * the rest of the GPR-equivalence cache is unaffected, so don't
+           * fall through to the "unknown opcode → reset everything" path
+           * which destroys upstream coalescing wins. */
+          if ((op.opcode >> 20) & 1)
+          {
+            /* LDRD: invalidate Rt and Rt2 (writeback to Rn is rare here and
+             * already covered by the writeback handling — for the typical
+             * STRD imm with W=0 used by the codegen we don't touch Rn). */
+            int rt = (int)((op.opcode >> 12) & 0xF);
+            int rt2 = (int)((op.opcode >> 8) & 0xF);
+            mov_equiv_invalidate_reg(rt);
+            mov_equiv_invalidate_reg(rt2);
+            strldr_cache_invalidate_reg(rt);
+            strldr_cache_invalidate_reg(rt2);
+          }
+          /* STRD: no GPR write, leave the mov_equiv cache alone. */
+        }
         else
         {
           int dest = thumb_decode_dest_reg(op);
@@ -4762,8 +4788,18 @@ static void thumb_emit_shift64_mop(const MachineOperand *src1, const MachineOper
   if (thumb_is_hw_reg(src_lo))
     excl |= (1u << (uint32_t)src_lo);
 
+  /* Skip src1 high-half materialization when the shift will not read it.
+   * SHL with sh >= 32 only uses src_lo (everything shifts up out of view).
+   * SHR/SAR with sh >= 64 produces a 0/sign-fill that the emit tail
+   * generates directly without referencing src_hi. */
+  int hi_needed = 1;
+  if (is_left && sh >= 32)
+    hi_needed = 0;
+  else if (!is_left && sh >= 64)
+    hi_needed = 0;
+
   /* Load src1 high half or compute by extension. */
-  int src_hi;
+  int src_hi = (int)PREG_REG_NONE;
   if (src1->is_64bit)
   {
     MachineOperand s1_hi = mach_make_hi_half(src1);
@@ -4771,7 +4807,7 @@ static void thumb_emit_shift64_mop(const MachineOperand *src1, const MachineOper
     if (thumb_is_hw_reg(src_hi))
       excl |= (1u << (uint32_t)src_hi);
   }
-  else
+  else if (hi_needed)
   {
     src_hi = mach_alloc_scratch(&mctx, excl);
     excl |= (1u << (uint32_t)src_hi);
@@ -6033,6 +6069,97 @@ ST_FUNC void tcc_gen_machine_umull_mop(MachineOperand src1, MachineOperand src2,
   mach_release_all(&ctx);
 }
 
+/* tcc_gen_machine_smull_mop: MachineOperand-based entry point for SMULL.
+ * {dest_hi:dest_lo} = (int32_t)src1 * (int32_t)src2  (64-bit signed result).
+ * Mirrors umull_mop but emits th_smull. */
+ST_FUNC void tcc_gen_machine_smull_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest)
+{
+  MachineCodegenContext ctx = {0};
+
+  MachineOperand s1 = src1;
+  s1.is_64bit = false;
+  MachineOperand s2 = src2;
+  s2.is_64bit = false;
+
+  int rn = mach_ensure_in_reg(&ctx, &s1, 0);
+  uint32_t excl = thumb_is_hw_reg(rn) ? (1u << (uint32_t)rn) : 0u;
+
+  int rm = mach_ensure_in_reg(&ctx, &s2, excl);
+  if (thumb_is_hw_reg(rm))
+    excl |= (1u << (uint32_t)rm);
+
+  MachineOperand dst_lo = mach_make_lo_half(&dest);
+  MachineOperand dst_hi = mach_make_hi_half(&dest);
+  dst_lo.btype = IROP_BTYPE_INT32;
+  dst_hi.btype = IROP_BTYPE_INT32;
+
+  int rd_lo = mach_get_dest_reg(&ctx, &dst_lo, excl);
+  if (thumb_is_hw_reg(rd_lo))
+    excl |= (1u << (uint32_t)rd_lo);
+  int rd_hi = mach_get_dest_reg(&ctx, &dst_hi, excl);
+
+  /* th_smull(rdlo, rdhi, rn, rm): {rdhi:rdlo} = (signed)rn * (signed)rm */
+  ot_check(th_smull((uint32_t)rd_lo, (uint32_t)rd_hi, (uint32_t)rn, (uint32_t)rm));
+
+  mach_writeback_dest(&dst_lo, rd_lo);
+  mach_writeback_dest(&dst_hi, rd_hi);
+  mach_release_all(&ctx);
+}
+
+/* tcc_gen_machine_mlal_accum_mop: emit SMLAL/UMLAL for
+ *   dest = accum + (int32/uint32)src1 * (int32/uint32)src2
+ *
+ * This narrow helper is used by codegen peepholes after register allocation.
+ * It only handles the cheap in-place accumulate form, where the ADD destination
+ * already holds the accumulator pair.  Other forms fall back to SMULL/UMULL
+ * plus the normal 64-bit ADD so we do not risk clobbering multiply sources. */
+ST_FUNC int tcc_gen_machine_mlal_accum_mop(MachineOperand src1, MachineOperand src2, MachineOperand accum,
+                                           MachineOperand dest, int is_signed)
+{
+  if (!dest.is_64bit || !accum.is_64bit)
+    return 0;
+  if (dest.kind != MACH_OP_REG || accum.kind != MACH_OP_REG)
+    return 0;
+  if (dest.needs_deref || accum.needs_deref)
+    return 0;
+  if (dest.u.reg.r0 != accum.u.reg.r0 || dest.u.reg.r1 != accum.u.reg.r1)
+    return 0;
+
+  int rd_lo = dest.u.reg.r0;
+  int rd_hi = dest.u.reg.r1;
+  if (!thumb_is_hw_reg(rd_lo) || !thumb_is_hw_reg(rd_hi) || rd_lo == rd_hi)
+    return 0;
+
+  MachineCodegenContext ctx = {0};
+  MachineOperand s1 = src1;
+  s1.is_64bit = false;
+  MachineOperand s2 = src2;
+  s2.is_64bit = false;
+
+  uint32_t excl = (1u << (uint32_t)rd_lo) | (1u << (uint32_t)rd_hi);
+  int rn = mach_ensure_in_reg(&ctx, &s1, excl);
+  if (thumb_is_hw_reg(rn))
+    excl |= (1u << (uint32_t)rn);
+
+  int rm = mach_ensure_in_reg(&ctx, &s2, excl);
+  if (thumb_is_hw_reg(rm))
+    excl |= (1u << (uint32_t)rm);
+
+  if (is_signed)
+    ot_check(th_smlal((uint32_t)rd_lo, (uint32_t)rd_hi, (uint32_t)rn, (uint32_t)rm));
+  else
+    ot_check(th_umlal((uint32_t)rd_lo, (uint32_t)rd_hi, (uint32_t)rn, (uint32_t)rm));
+
+  MachineOperand dst_lo = mach_make_lo_half(&dest);
+  MachineOperand dst_hi = mach_make_hi_half(&dest);
+  dst_lo.btype = IROP_BTYPE_INT32;
+  dst_hi.btype = IROP_BTYPE_INT32;
+  mach_writeback_dest(&dst_lo, rd_lo);
+  mach_writeback_dest(&dst_hi, rd_hi);
+  mach_release_all(&ctx);
+  return 1;
+}
+
 /* tcc_gen_machine_pack64_mop: lower TCCIR_OP_PACK64 by emitting two
  * 32-bit assigns into the dest's halves.  src_lo and src_hi are u32
  * operands; dest is a u64 register pair / spill / param slot.
@@ -6053,14 +6180,36 @@ ST_FUNC void tcc_gen_machine_pack64_mop(MachineOperand src_lo, MachineOperand sr
   MachineOperand dst_hi = mach_make_hi_half(&dest);
   dst_lo.btype = IROP_BTYPE_INT32;
   dst_hi.btype = IROP_BTYPE_INT32;
-  /* Order matters when dst_lo aliases src_hi (e.g. regalloc placed dest.r0
-   * on the same register as src_hi): write the half that doesn't alias
-   * src_hi first.  In practice src_lo→dst_lo is safe when dst_lo != src_hi's
-   * register; otherwise stage through a scratch via assign_mop's normal
-   * register-conflict handling. */
-  if (src_hi.kind == MACH_OP_REG && !src_hi.needs_deref &&
+
+  /* Detect register-swap aliasing: dst_lo == src_hi AND dst_hi == src_lo.
+   * Neither write order can preserve both source values; we must stage one
+   * side through a scratch register. */
+  int swap_alias = 0;
+  if (src_lo.kind == MACH_OP_REG && !src_lo.needs_deref &&
+      src_hi.kind == MACH_OP_REG && !src_hi.needs_deref &&
       dst_lo.kind == MACH_OP_REG && !dst_lo.needs_deref &&
-      src_hi.u.reg.r0 == dst_lo.u.reg.r0)
+      dst_hi.kind == MACH_OP_REG && !dst_hi.needs_deref &&
+      src_hi.u.reg.r0 == dst_lo.u.reg.r0 && src_lo.u.reg.r0 == dst_hi.u.reg.r0 &&
+      src_lo.u.reg.r0 != src_hi.u.reg.r0)
+    swap_alias = 1;
+
+  if (swap_alias)
+  {
+    /* Save src_lo to a scratch before overwriting it via dst_hi. */
+    uint32_t excl = (1u << (uint32_t)dst_lo.u.reg.r0) | (1u << (uint32_t)dst_hi.u.reg.r0);
+    ScratchRegAlloc scratch = get_scratch_reg_with_save(excl);
+    ot_check_mov_reg((uint32_t)scratch.reg, (uint32_t)src_lo.u.reg.r0, flags_safe(),
+                     THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
+    /* Now dst_hi = src_hi (still live), then dst_lo = scratch (=old src_lo). */
+    tcc_gen_machine_assign_mop(src_hi, dst_hi, TCCIR_OP_ASSIGN);
+    MachineOperand scratch_op = src_lo;
+    scratch_op.u.reg.r0 = scratch.reg;
+    tcc_gen_machine_assign_mop(scratch_op, dst_lo, TCCIR_OP_ASSIGN);
+    restore_scratch_reg(&scratch);
+  }
+  else if (src_hi.kind == MACH_OP_REG && !src_hi.needs_deref &&
+           dst_lo.kind == MACH_OP_REG && !dst_lo.needs_deref &&
+           src_hi.u.reg.r0 == dst_lo.u.reg.r0)
   {
     /* dst_lo == src_hi register: write hi first to free src_hi's slot. */
     tcc_gen_machine_assign_mop(src_hi, dst_hi, TCCIR_OP_ASSIGN);
@@ -9180,6 +9329,13 @@ ST_FUNC void tcc_gen_machine_epilog(int leaffunc)
     }
   }
 
+  thumb_gen_state.generating_function = 0;
+  th_literal_pool_generate();
+  thumb_free_call_sites();
+}
+
+ST_FUNC void tcc_gen_machine_finish_noreturn(void)
+{
   thumb_gen_state.generating_function = 0;
   th_literal_pool_generate();
   thumb_free_call_sites();

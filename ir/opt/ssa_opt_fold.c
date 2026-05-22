@@ -299,6 +299,43 @@ static int fold_binary(IRSSAOptCtx *ctx, int idx)
     }
   }
 
+  /* Double-negation collapse: `T_b = #0 SUB T_a` where T_a's single def is
+   * `T_a = #0 SUB T_z` → fold to `T_b = ASSIGN T_z`.  Iteratively with cprop
+   * + GVN this collapses goto-chain idioms like gcc.c-torture/compile/961126-1.c
+   * where `i = -i; if (*p != i) goto quit;` is repeated 32 times — each
+   * alternate iteration's SUB folds away. */
+  if (q->op == TCCIR_OP_SUB && src1_is_imm && val1 == 0 && !src2_is_imm &&
+      src2.tag == IROP_TAG_VREG && !src2.is_lval &&
+      src2_vr >= 0 && TCCIR_DECODE_VREG_TYPE(src2_vr) == TCCIR_VREG_TYPE_TEMP) {
+    IRSSAVregInfo *avi = ssa_opt_vinfo(ctx, src2_vr);
+    if (avi && avi->def_count == 1 && avi->def_instr >= 0) {
+      IRQuadCompact *dq = &ctx->ir->compact_instructions[avi->def_instr];
+      if (dq->op == TCCIR_OP_SUB) {
+        IROperand ds1 = tcc_ir_op_get_src1(ir, dq);
+        IROperand ds2 = tcc_ir_op_get_src2(ir, dq);
+        if (ds1.tag == IROP_TAG_IMM32 && !ds1.is_lval && ds1.u.imm32 == 0 &&
+            ds2.tag == IROP_TAG_VREG && !ds2.is_lval) {
+          /* Width must match — the inner SUB writes T_a with the dest btype;
+           * if the outer SUB has a different width, the fold would skip an
+           * implicit narrowing/widening that the second negation enforces. */
+          if (irop_get_btype(dest) == irop_get_btype(ds2)) {
+            IROperand new_src = ds2;
+            new_src.is_lval = 0;
+            q->op = TCCIR_OP_ASSIGN;
+            tcc_ir_op_set_src1(ir, q, new_src);
+            tcc_ir_op_set_src2(ir, q, IROP_NONE);
+            ssa_opt_remove_use_instr(avi, idx);
+            int32_t tz_vr = irop_get_vreg(ds2);
+            IRSSAVregInfo *zvi = ssa_opt_vinfo(ctx, tz_vr);
+            if (zvi)
+              ssa_opt_add_use_instr(zvi, idx);
+            return 1;
+          }
+        }
+      }
+    }
+  }
+
   /* Commutative identity: 0 + x, 0 | x, 0 ^ x, 1 * x → x */
   if (src1_is_imm && !src2.is_lval && src2.tag == IROP_TAG_VREG) {
     int is_identity = 0;

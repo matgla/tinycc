@@ -1767,6 +1767,7 @@ static inline SValue tcc_ir_svalue_call_id_argc(int call_id, int argc)
 #define TOK_UMOD 0x84   /* unsigned modulo */
 #define TOK_PDIV 0x85   /* fast division with undefined rounding for pointers */
 #define TOK_UMULL 0x86  /* unsigned 32x32 -> 64 mul */
+#define TOK_SMULL 0x9a  /* signed 32x32 -> 64 mul */
 #define TOK_ADDC1 0x87  /* add with carry generation */
 #define TOK_ADDC2 0x88  /* add with carry use */
 #define TOK_SUBC1 0x89  /* add with carry generation */
@@ -2712,10 +2713,14 @@ ST_FUNC int tcc_gen_machine_mul_const_add_fused_mop(MachineOperand mul_var, int6
 ST_FUNC void tcc_gen_machine_mla_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest,
                                      MachineOperand accum);
 ST_FUNC void tcc_gen_machine_umull_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest);
+ST_FUNC void tcc_gen_machine_smull_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest);
+ST_FUNC int tcc_gen_machine_mlal_accum_mop(MachineOperand src1, MachineOperand src2, MachineOperand accum,
+                                           MachineOperand dest, int is_signed);
 ST_FUNC void tcc_gen_machine_fp_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest, TccIrOp op,
                                     int is_complex);
 ST_FUNC void tcc_gen_machine_vla_mop(MachineOperand dest, MachineOperand src1, MachineOperand src2, TccIrOp op);
 ST_FUNC void tcc_gen_machine_epilog(int leaffunc);
+ST_FUNC void tcc_gen_machine_finish_noreturn(void);
 ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int stack_size,
                                     uint32_t extra_prologue_regs);
 ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand call_id, MachineOperand dest,

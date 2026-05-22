@@ -1649,6 +1649,13 @@ int tcc_ir_opt_const_prop(TCCIRState *ir)
         btype = IROP_BTYPE_INT64;
         break;
       }
+      case TCCIR_OP_SMULL:
+      {
+        int64_t sresult = (int64_t)(int32_t)val1 * (int64_t)(int32_t)val2;
+        result = sresult;
+        btype = IROP_BTYPE_INT64;
+        break;
+      }
       case TCCIR_OP_UBFX:
       {
         int lsb = (int)val2 & 0x1F;
@@ -1713,12 +1720,14 @@ int tcc_ir_opt_const_prop(TCCIRState *ir)
       int simplify;
       int replace_with_zero;
       int replace_with_const;
+      int trap_on_div_zero;
       int64_t const_value;
       int btype = irop_get_btype(src1);
 
       simplify = 0;
       replace_with_zero = 0;
       replace_with_const = 0;
+      trap_on_div_zero = 0;
       const_value = 0;
 
       switch (q->op)
@@ -1754,6 +1763,13 @@ int tcc_ir_opt_const_prop(TCCIRState *ir)
       case TCCIR_OP_UDIV:
         if (c == 1)
           simplify = 1; /* X / 1 = X */
+        else if (c == 0)
+          trap_on_div_zero = 1; /* X / 0 is UB — emit trap */
+        break;
+      case TCCIR_OP_IMOD:
+      case TCCIR_OP_UMOD:
+        if (c == 0)
+          trap_on_div_zero = 1; /* X % 0 is UB — emit trap */
         break;
       case TCCIR_OP_AND:
         if (c == 0)
@@ -1804,6 +1820,15 @@ int tcc_ir_opt_const_prop(TCCIRState *ir)
         }
         tcc_ir_set_src1(ir, i, new_src1);
         tcc_ir_set_src2(ir, i, IROP_NONE);
+        changes++;
+      }
+      else if (trap_on_div_zero)
+      {
+        /* Integer division/modulo by constant 0 is UB.  Replace with TRAP
+         * so DCE can drop all subsequent code in the block (mirrors GCC -O2,
+         * which emits a single UDF for `int b[1/0]` and similar). */
+        LOG_IR_GEN("OPTIMIZE: %s by constant 0 -> trap at i=%d", tcc_ir_get_op_name(q->op), i);
+        q->op = TCCIR_OP_TRAP;
         changes++;
       }
     }
@@ -1885,9 +1910,13 @@ int tcc_ir_opt_const_prop(TCCIRState *ir)
     if (irop_get_vreg(shl_dest) != irop_get_vreg(shr_src1))
       continue;
     /* Skip 64-bit types: the mask computation assumes 32-bit width.
-     * For INT64, SHL #16 → SHR #16 masks 48 bits, not 16. */
+     * For INT64, SHL #16 → SHR #16 masks 48 bits, not 16.  Also check dest
+     * btypes since src1 btype may have been weakened during forwarding. */
     IROperand shl_orig_src1_chk = tcc_ir_op_get_src1(ir, shl_q);
-    if (shl_orig_src1_chk.btype == IROP_BTYPE_INT64 || shl_orig_src1_chk.btype == IROP_BTYPE_FLOAT64)
+    IROperand shr_dest_chk = tcc_ir_op_get_dest(ir, shr_q);
+    if (shl_orig_src1_chk.btype == IROP_BTYPE_INT64 || shl_orig_src1_chk.btype == IROP_BTYPE_FLOAT64 ||
+        shl_dest.btype == IROP_BTYPE_INT64 || shl_dest.btype == IROP_BTYPE_FLOAT64 ||
+        shr_dest_chk.btype == IROP_BTYPE_INT64 || shr_dest_chk.btype == IROP_BTYPE_FLOAT64)
       continue;
     /* SHL #N then SHR #N = AND with mask of (32-N) low bits */
     uint32_t mask = (shl_amt == 32) ? 0 : ((1u << (32 - shl_amt)) - 1);
@@ -2646,6 +2675,13 @@ int tcc_ir_opt_value_tracking(TCCIRState *ir)
       has_vla = 1;
   }
 
+  int has_prefetch = 0;
+  for (int vi = 0; vi < n && !has_prefetch; vi++)
+  {
+    if (ir->compact_instructions[vi].op == TCCIR_OP_PREFETCH)
+      has_prefetch = 1;
+  }
+
   /* Detect IJUMP — `&&label` targets aren't marked as merge points
    * (the predecessor scan only records JUMP/JUMPIF/SWITCH_TABLE edges),
    * so VAR const-tracking can carry a stale value through what is
@@ -2869,6 +2905,35 @@ int tcc_ir_opt_value_tracking(TCCIRState *ir)
                        src_tmp);
           }
         }
+        if (!lea_propagated && dest_pos <= max_vreg)
+        {
+          lea_var_map[dest_pos].gen = 0;
+          if (has_prefetch)
+          {
+            VT_INVALIDATE(state, dest_pos);
+          }
+          else if (irop_is_immediate(src1))
+          {
+            if (is_addrtaken[dest_pos / 8] & (1 << (dest_pos % 8)))
+            {
+              VT_INVALIDATE(state, dest_pos);
+            }
+            else
+            {
+              if (VT_IS_CONST(state, dest_pos) && VT_HAS_DEF(state, dest_pos))
+              {
+                ir->compact_instructions[state[dest_pos].def_idx].op = TCCIR_OP_NOP;
+                changes++;
+              }
+              VT_SET_CONST_DEF(state, dest_pos, irop_get_imm64_ex(ir, src1), i);
+              LOG_IR_GEN("VALUE_TRACK DIRECT STORE: i=%d V%d = %lld", i, dest_pos, (long long)state[dest_pos].value);
+            }
+          }
+          else
+          {
+            VT_INVALIDATE(state, dest_pos);
+          }
+        }
         /* src1 VAR is read here — mark its def as consumed so the
          * dead-def elimination won't kill the defining instruction. */
         if (src_vr >= 0 && TCCIR_DECODE_VREG_TYPE(src_vr) == TCCIR_VREG_TYPE_VAR)
@@ -2877,8 +2942,6 @@ int tcc_ir_opt_value_tracking(TCCIRState *ir)
           if (src_pos >= 0 && src_pos <= max_vreg)
             VT_CLEAR_DEF(state, src_pos);
         }
-        if (!lea_propagated && dest_pos <= max_vreg)
-          lea_var_map[dest_pos].gen = 0;
       }
       /* Any STORE through an unknown pointer could alias any address-taken var.
        * Iterate only the tracked addrtaken list — O(k) instead of O(max_vreg). */
@@ -2958,22 +3021,24 @@ int tcc_ir_opt_value_tracking(TCCIRState *ir)
      * folds are safe. */
     if ((q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_SUB || q->op == TCCIR_OP_XOR || q->op == TCCIR_OP_AND ||
          q->op == TCCIR_OP_OR || (!has_vla && q->op == TCCIR_OP_SHL) || q->op == TCCIR_OP_SHR ||
-         q->op == TCCIR_OP_SAR || q->op == TCCIR_OP_MUL) &&
+         q->op == TCCIR_OP_SAR || q->op == TCCIR_OP_MUL || q->op == TCCIR_OP_MLA) &&
         irop_is_immediate(src2))
     {
       int32_t src1_vr = irop_get_vreg(src1);
       int src1_pos = (src1_vr >= 0 && TCCIR_DECODE_VREG_TYPE(src1_vr) == TCCIR_VREG_TYPE_VAR)
                          ? TCCIR_DECODE_VREG_POSITION(src1_vr)
                          : -1;
+      IROperand accum = (q->op == TCCIR_OP_MLA) ? tcc_ir_op_get_accum(ir, q) : IROP_NONE;
 
       /* Check if src1 is a known constant AND src2 is immediate */
       if (src1_pos >= 0 && src1_pos <= max_vreg && VT_IS_CONST(state, src1_pos))
       {
         int64_t val1 = state[src1_pos].value;
         int64_t val2 = irop_get_imm64_ex(ir, src2);
-        int btype = irop_get_btype(src1);
+        int btype = (q->op == TCCIR_OP_MLA) ? irop_get_btype(dest) : irop_get_btype(src1);
         int is_64 = (btype == IROP_BTYPE_INT64 || btype == IROP_BTYPE_FLOAT64);
         int64_t result;
+        int fold_ok = 1;
         int shift_mask = is_64 ? 63 : 31;
         switch (q->op)
         {
@@ -2995,6 +3060,37 @@ int tcc_ir_opt_value_tracking(TCCIRState *ir)
         case TCCIR_OP_MUL:
           result = val1 * val2;
           break;
+        case TCCIR_OP_MLA:
+        {
+          int64_t acc_val = 0;
+          int acc_ok = 0;
+          int32_t acc_vr = irop_get_vreg(accum);
+          int acc_pos = (acc_vr >= 0 && TCCIR_DECODE_VREG_TYPE(acc_vr) == TCCIR_VREG_TYPE_VAR)
+                            ? TCCIR_DECODE_VREG_POSITION(acc_vr)
+                            : -1;
+          if (irop_is_immediate(accum))
+          {
+            acc_val = irop_get_imm64_ex(ir, accum);
+            acc_ok = 1;
+          }
+          else if (acc_pos >= 0 && acc_pos <= max_vreg && VT_IS_CONST(state, acc_pos))
+          {
+            acc_val = state[acc_pos].value;
+            acc_ok = 1;
+          }
+          if (!acc_ok)
+          {
+            fold_ok = 0;
+            break;
+          }
+          if (dest.is_unsigned)
+            result = (int64_t)((uint64_t)(uint32_t)val1 * (uint64_t)(uint32_t)val2 + (uint64_t)acc_val);
+          else
+            result = (int64_t)((int64_t)(int32_t)val1 * (int64_t)(int32_t)val2 + acc_val);
+          is_64 = 1;
+          btype = IROP_BTYPE_INT64;
+          break;
+        }
         case TCCIR_OP_SHL:
           result = (int64_t)((uint64_t)val1 << (val2 & shift_mask));
           break;
@@ -3020,6 +3116,14 @@ int tcc_ir_opt_value_tracking(TCCIRState *ir)
         default:
           result = 0;
           break;
+        }
+        if (!fold_ok)
+        {
+          if (src1_pos >= 0 && src1_pos <= max_vreg)
+            VT_CLEAR_DEF(state, src1_pos);
+          if (dest_pos >= 0 && dest_pos <= max_vreg)
+            VT_INVALIDATE(state, dest_pos);
+          continue;
         }
         if (!is_64 && q->op != TCCIR_OP_SHR && q->op != TCCIR_OP_SAR)
           result = (int64_t)(int32_t)(uint32_t)result;
@@ -4764,6 +4868,13 @@ int tcc_ir_opt_const_prop_tmp(TCCIRState *ir)
         {
           uint64_t uresult = (uint64_t)(uint32_t)v1 * (uint64_t)(uint32_t)v2;
           res = (int64_t)uresult;
+          btype = IROP_BTYPE_INT64;
+          break;
+        }
+        case TCCIR_OP_SMULL:
+        {
+          int64_t sresult = (int64_t)(int32_t)v1 * (int64_t)(int32_t)v2;
+          res = sresult;
           btype = IROP_BTYPE_INT64;
           break;
         }

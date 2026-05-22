@@ -99,6 +99,39 @@ static int ir_gen_rotate_fusion(IROptCtx *ctx, int i)
   return 1;
 }
 
+static int ir_gen_is_mla_mul_op(TccIrOp op)
+{
+  return op == TCCIR_OP_MUL || op == TCCIR_OP_UMULL || op == TCCIR_OP_SMULL;
+}
+
+static int ir_gen_is_long_mla_mul_op(TccIrOp op)
+{
+  return op == TCCIR_OP_UMULL || op == TCCIR_OP_SMULL;
+}
+
+static int ir_gen_operand_aliases_accum_low(IROptCtx *ctx, IROperand op, IROperand accum_op, int use_idx, int depth)
+{
+  TCCIRState *ir = ctx->ir;
+  const IROptDU *du = &ctx->du;
+
+  if (depth > 6)
+    return 0;
+  if (irop_get_vreg(op) == irop_get_vreg(accum_op))
+    return 1;
+  if (!irop_has_vreg(op))
+    return 0;
+
+  int def_idx = ir_opt_du_def(du, irop_get_vreg(op), use_idx);
+  if (def_idx < 0)
+    return 0;
+
+  IRQuadCompact *dq = &ir->compact_instructions[def_idx];
+  if (dq->op != TCCIR_OP_ASSIGN && dq->op != TCCIR_OP_LOAD)
+    return 0;
+
+  return ir_gen_operand_aliases_accum_low(ctx, tcc_ir_op_get_src1(ir, dq), accum_op, def_idx, depth + 1);
+}
+
 static int ir_gen_mla_fusion(IROptCtx *ctx, int i)
 {
   TCCIRState *ir = ctx->ir;
@@ -121,7 +154,7 @@ static int ir_gen_mla_fusion(IROptCtx *ctx, int i)
   if (irop_has_vreg(add_src2)) {
     int32_t vr = irop_get_vreg(add_src2);
     int idx = ir_opt_du_def(du, vr, i);
-    if (idx >= 0 && ir->compact_instructions[idx].op == TCCIR_OP_MUL) {
+    if (idx >= 0 && ir_gen_is_mla_mul_op(ir->compact_instructions[idx].op)) {
       mul_result_vr = vr;
       accum_op = add_src1;
       mul_idx = idx;
@@ -131,7 +164,7 @@ static int ir_gen_mla_fusion(IROptCtx *ctx, int i)
   if (!mul_q && irop_has_vreg(add_src1)) {
     int32_t vr = irop_get_vreg(add_src1);
     int idx = ir_opt_du_def(du, vr, i);
-    if (idx >= 0 && ir->compact_instructions[idx].op == TCCIR_OP_MUL) {
+    if (idx >= 0 && ir_gen_is_mla_mul_op(ir->compact_instructions[idx].op)) {
       mul_result_vr = vr;
       accum_op = add_src2;
       mul_idx = idx;
@@ -148,11 +181,13 @@ static int ir_gen_mla_fusion(IROptCtx *ctx, int i)
   if (irop_get_tag(accum_op) == IROP_TAG_STACKOFF && !accum_op.is_lval)
     return 0;
 
+  TccIrOp old_mul_op = mul_q->op;
   IROperand ms1 = tcc_ir_op_get_src1(ir, mul_q);
   IROperand ms2 = tcc_ir_op_get_src2(ir, mul_q);
+  const int long_mla = ir_gen_is_long_mla_mul_op(old_mul_op);
 
   int dup_mul = 0;
-  if (!ms1.is_lval && !ms2.is_lval && !irop_is_immediate(ms1) && !irop_is_immediate(ms2)) {
+  if (!long_mla && !ms1.is_lval && !ms2.is_lval && !irop_is_immediate(ms1) && !irop_is_immediate(ms2)) {
     int32_t ms1_vr = irop_get_vreg(ms1);
     int32_t ms2_vr = irop_get_vreg(ms2);
     if (ms1_vr >= 0 && ms2_vr >= 0) {
@@ -174,7 +209,7 @@ static int ir_gen_mla_fusion(IROptCtx *ctx, int i)
   }
 
   if ((ms1.is_lval && !ms1.is_local && !ms1.is_llocal) || (ms2.is_lval && !ms2.is_local && !ms2.is_llocal) ||
-      irop_is_immediate(ms1) || irop_is_immediate(ms2) || dup_mul ||
+      (!long_mla && (irop_is_immediate(ms1) || irop_is_immediate(ms2))) || dup_mul ||
       ir_opt_du_uses(du, mul_result_vr) != 1)
     return 0;
 
@@ -188,12 +223,37 @@ static int ir_gen_mla_fusion(IROptCtx *ctx, int i)
       return 0;
   }
 
+  IROperand final_dest = add_dest;
+  int store_idx = -1;
+  if (long_mla && irop_has_vreg(add_dest) && ir_opt_du_uses(du, irop_get_vreg(add_dest)) == 1) {
+    int next = i + 1;
+    while (next < ir->next_instruction_index && ir->compact_instructions[next].op == TCCIR_OP_NOP)
+      next++;
+    if (next < ir->next_instruction_index && ir->compact_instructions[next].op == TCCIR_OP_STORE &&
+        !ir->compact_instructions[next].is_jump_target && ir_xform_same_block(ir, i, next)) {
+      IRQuadCompact *sq = &ir->compact_instructions[next];
+      IROperand st_src = tcc_ir_op_get_src1(ir, sq);
+      IROperand st_dest = tcc_ir_op_get_dest(ir, sq);
+      if (irop_get_vreg(st_src) == irop_get_vreg(add_dest) && irop_get_vreg(st_dest) == accum_vr) {
+        final_dest = st_dest;
+        store_idx = next;
+      }
+    }
+  }
+  if (long_mla)
+    final_dest.is_unsigned = (old_mul_op == TCCIR_OP_UMULL);
+
+  if (long_mla) {
+    if (ir_gen_operand_aliases_accum_low(ctx, ms1, accum_op, mul_idx, 0))
+      tcc_ir_set_src1(ir, mul_idx, accum_op);
+    if (ir_gen_operand_aliases_accum_low(ctx, ms2, accum_op, mul_idx, 0))
+      tcc_ir_set_src2(ir, mul_idx, accum_op);
+  }
+
   mul_q->op = TCCIR_OP_MLA;
   int mul_dest_idx = mul_q->operand_base;
-  int add_dest_idx = q->operand_base;
-  if (mul_dest_idx >= 0 && mul_dest_idx < ir->iroperand_pool_count && add_dest_idx >= 0 &&
-      add_dest_idx < ir->iroperand_pool_count)
-    ir->iroperand_pool[mul_dest_idx] = ir->iroperand_pool[add_dest_idx];
+  if (mul_dest_idx >= 0 && mul_dest_idx < ir->iroperand_pool_count)
+    ir->iroperand_pool[mul_dest_idx] = final_dest;
 
   int accum_idx = mul_q->operand_base + 3;
   while (ir->iroperand_pool_count <= accum_idx)
@@ -201,10 +261,12 @@ static int ir_gen_mla_fusion(IROptCtx *ctx, int i)
   if (accum_idx < ir->iroperand_pool_capacity) {
     ir->iroperand_pool[accum_idx] = accum_op;
     q->op = TCCIR_OP_NOP;
+    if (store_idx >= 0)
+      ir->compact_instructions[store_idx].op = TCCIR_OP_NOP;
     return 1;
   }
 
-  mul_q->op = TCCIR_OP_MUL;
+  mul_q->op = old_mul_op;
   return 0;
 }
 

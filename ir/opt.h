@@ -45,11 +45,27 @@ int tcc_ir_opt_useless_function_body_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_noreturn_collapse(struct TCCIRState *ir);
 int tcc_ir_opt_noreturn_collapse_ex(struct IROptCtx *ctx);
 
+/* Trap-Only Body Suppression - after constprop folds a constant `x / 0` into
+ * TCCIR_OP_TRAP and DCE NOPs the rest, the surviving body is a lone TRAP.
+ * Reset dirty_registers/leaffunc/noreturn/need_frame_pointer (and let caller
+ * reset `loc`) so the prologue/epilogue collapse to nothing. */
+int tcc_ir_opt_trap_only_body_suppress(struct TCCIRState *ir);
+int tcc_ir_opt_trap_only_body_suppress_ex(struct IROptCtx *ctx);
+
 /* Zero-Size VLA Elimination - convert VLA_ALLOC ops whose size operand is
  * compile-time 0 (e.g. `T a[n][0]`) into NOPs and remove the matching
  * VLA_SP_SAVE/VLA_SP_RESTORE pair when nothing else changes SP between them. */
 int tcc_ir_opt_zero_vla_elim(struct TCCIRState *ir);
 int tcc_ir_opt_zero_vla_elim_ex(struct IROptCtx *ctx);
+
+/* Dead-VLA-Struct Elimination - when a VLA_ALLOC's base pointer is captured
+ * into a stack slot whose only readers are address-arithmetic ops that end in
+ * STORE destinations (never a LOAD via the derived address, never an escape
+ * via CALL / RETURN / STORE-as-value), NOP the VLA_ALLOC, the inner
+ * VLA_SP_SAVE, the address-derivation chain, and the dead STOREs.  Matches
+ * GCC -O2 on gcc.c-torture/execute/20040308-1.c. */
+int tcc_ir_opt_dead_vla_struct_elim(struct TCCIRState *ir);
+int tcc_ir_opt_dead_vla_struct_elim_ex(struct IROptCtx *ctx);
 
 /* Infinite Self-Recursion Collapse - if the function unconditionally calls
  * itself before any return path, by induction it never returns.  Collapse
@@ -174,6 +190,12 @@ int tcc_ir_opt_pack64(struct TCCIRState *ir);
 /* PACK64 tautology fold - collapse PACK64(low(X), X>>32) -> ASSIGN X */
 int tcc_ir_opt_pack64_tautology(struct TCCIRState *ir);
 
+/* SHL32-OR chain fold - collapse `((X SHL 32) OR Y) SHL 32` -> `Y SHL 32`
+ * and `((X SHL 32) OR Y) AND #0xFFFFFFFF` -> `Y AND #0xFFFFFFFF`.  Cuts
+ * out the dead sign-extension high half from the i32→i64 widen idiom when
+ * the consumer shifts/masks it out anyway. */
+int tcc_ir_opt_shl32_or_chain(struct TCCIRState *ir);
+
 /* ASSIGN fusion - fold `T_new = X OP Y; T_final = T_new` into one op */
 int tcc_ir_opt_assign_fuse(struct TCCIRState *ir);
 
@@ -189,6 +211,14 @@ int tcc_ir_opt_globalsym_cse(struct TCCIRState *ir);
 
 /* Identical-block loop re-rolling - collapse macro-unrolled runs into a loop */
 int tcc_ir_opt_reroll(struct TCCIRState *ir);
+
+/* Negation-chain CSE - collapse repeated `T = -T` chains by tracking each
+ * TEMP's canonical (base, sign) pair.  After the first two unique negation
+ * states are seen, subsequent SUBs in the chain are rewritten as ASSIGN to
+ * the earliest TEMP with that form so copy-prop + DCE can collapse them.
+ * Targets goto-chain idioms like gcc.c-torture/compile/961126-1.c. */
+int tcc_ir_opt_neg_chain_cse(struct TCCIRState *ir);
+int tcc_ir_opt_neg_chain_cse_ex(struct IROptCtx *ctx);
 
 /* Narrow CSE: deduplicate PARAM/VAR + #constant expressions */
 int tcc_ir_opt_cse_param_add(struct TCCIRState *ir);
@@ -210,6 +240,20 @@ int tcc_ir_opt_addrof_var_fwd(struct TCCIRState *ir);
 /* Forward STORE GlobalSym(X) <- T_val into subsequent in-BB deref reads of X.
  * Cross-block invalidation via calls / aliasing stores / BB boundaries. */
 int tcc_ir_opt_global_sl_fwd(struct TCCIRState *ir);
+
+/* Invariant Global LOAD Hoist - cross-BB CSE for ASSIGN/LOAD of globals when
+ * the function has only forward control flow and no aliasing stores.  Catches
+ * unrolled goto-chain patterns (gcc.c-torture/compile/961126-1.c) where the
+ * same `*p` is reloaded at every conditional check. */
+int tcc_ir_opt_invariant_global_load_hoist(struct TCCIRState *ir);
+int tcc_ir_opt_invariant_global_load_hoist_ex(struct IROptCtx *ctx);
+
+/* Invariant TEMP-deref Hoist - companion to the global load hoist.  Inserts
+ * one explicit `T_v = T***DEREF***` after a singly-defined pointer TEMP and
+ * rewrites later `T***DEREF***` uses to T_v non-lval, so the repeated
+ * deref-in-CMP pattern compiles to one LDR + many CMP. */
+int tcc_ir_opt_invariant_temp_deref_hoist(struct TCCIRState *ir);
+int tcc_ir_opt_invariant_temp_deref_hoist_ex(struct IROptCtx *ctx);
 
 /* Param-Addrof Constant-Store Fold - collapse the spill/addr/store/reload
  * sequence produced by `f(int v){ helper(&v); return v; }` after helper
@@ -282,6 +326,12 @@ void tcc_ir_tu_propagate_noreturn_to_callers(void);
  * end-of-TU analysis confirmed have no reachable readers. */
 int tcc_ir_opt_dead_static_store_elim(struct TCCIRState *ir);
 int tcc_ir_opt_dead_static_store_elim_ex(struct IROptCtx *ctx);
+
+/* Global Base Sharing - merge clusters of STOREs to same-section globals into
+ * a single LEA + STORE_INDEXED sequence, eliminating per-store PC-relative
+ * literal-pool loads of symbol addresses. */
+int tcc_ir_opt_global_base_share(struct TCCIRState *ir);
+int tcc_ir_opt_global_base_share_ex(struct IROptCtx *ctx);
 
 /* Dead Init Via Call - kill stack-slot stores whose bytes are fully
  * overwritten by a subsequent CALL whose callee summary covers them. */
@@ -485,6 +535,8 @@ int tcc_ir_opt_local_only_body_elide(struct TCCIRState *ir);
 int tcc_ir_opt_local_only_body_elide_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_const_return_uninit_elide(struct TCCIRState *ir);
 int tcc_ir_opt_const_return_uninit_elide_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_null_store_dom_return(struct TCCIRState *ir);
+int tcc_ir_opt_null_store_dom_return_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_redundant_var_assign_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_dead_var_store_elim_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_dead_addrvar_elim_ex(struct IROptCtx *ctx);

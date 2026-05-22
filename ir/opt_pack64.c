@@ -569,7 +569,150 @@ int tcc_ir_opt_cmp_narrow_64(TCCIRState *ir)
   return changes;
 }
 
+/* tcc_ir_opt_shl32_or_chain: collapse `((X SHL 32) OR Y) SHL 32` and
+ * `((X SHL 32) OR Y) AND 0xFFFFFFFF` chains.
+ *
+ * Both forms appear in the 32-bit-to-64-bit widening idiom used by TCC when
+ * the C code does `((long long)val << 32)` or `((long long)val & 0xFFFFFFFFLL)`
+ * via the manual sign-extension sequence:
+ *
+ *   T_sar  = X SAR #31              ; i32 sign-extension
+ *   T_shl1 = T_sar SHL #32          ; place sign-ext into high half (i64)
+ *   T_or   = T_shl1 OR X            ; (long long)X (sign-extended)
+ *   T_use  = T_or SHL #32           ; → final = (long long)X << 32
+ *      -- or --
+ *   T_use  = T_or AND #0xFFFFFFFF   ; → final = (uint32_t)X zero-extended
+ *
+ * Because the high half of `T_shl1 OR X` is shifted out by the final SHL 32
+ * (or masked out by AND 0xFFFFFFFF), `T_shl1` (and hence the SAR feeding it)
+ * is dead.  Rewrite the final SHL/AND to read X directly so the SAR/SHL1/OR
+ * chain becomes dead and gets DCE'd.
+ *
+ * IR shape before (pattern A — SHL 32 consumer):
+ *   i_shl1:  T_shl1 = anything SHL #32      ; i64
+ *   i_or:    T_or   = T_shl1 OR Y           ; i64, single-use
+ *   i_use:   T_use  = T_or SHL #32          ; i64
+ *
+ * IR shape after:
+ *   i_shl1:  NOP                            ; (was T_shl1's def, now dead)
+ *   i_or:    NOP                            ; (was T_or's def, now dead)
+ *   i_use:   T_use  = Y SHL #32             ; reads Y directly
+ *
+ * Pattern B (AND consumer) is the same but with `AND #0xFFFFFFFF` in place
+ * of `SHL #32`.  Both T_shl1 and T_or must be single-use TEMPs so we can
+ * safely NOP them. */
+int tcc_ir_opt_shl32_or_chain(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  int changes = 0;
+  if (n < 3)
+    return 0;
+
+  IROptDU du;
+  ir_opt_du_build_mode(ir, &du, IR_DU_MODE_TMP_ONLY);
+
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    /* Looking for the consumer: SHL #32 or AND #0xFFFFFFFF on a TEMP src1. */
+    int is_shl32 = 0, is_and_low = 0;
+    if (q->op == TCCIR_OP_SHL || q->op == TCCIR_OP_AND)
+    {
+      IROperand q_src2 = tcc_ir_op_get_src2(ir, q);
+      if (!irop_is_immediate(q_src2))
+        continue;
+      int64_t imm = irop_get_imm64_ex(ir, q_src2);
+      if (q->op == TCCIR_OP_SHL && imm == 32)
+        is_shl32 = 1;
+      else if (q->op == TCCIR_OP_AND && (uint64_t)imm == 0xFFFFFFFFULL)
+        is_and_low = 1;
+      else
+        continue;
+    }
+    else
+    {
+      continue;
+    }
+    IROperand q_dest = tcc_ir_op_get_dest(ir, q);
+    if (irop_get_btype(q_dest) != IROP_BTYPE_INT64)
+      continue;
+
+    IROperand q_src1 = tcc_ir_op_get_src1(ir, q);
+    int32_t or_vr = irop_get_vreg(q_src1);
+    if (TCCIR_DECODE_VREG_TYPE(or_vr) != TCCIR_VREG_TYPE_TEMP)
+      continue;
+    if (q_src1.is_lval || q_src1.is_sym)
+      continue;
+    if (ir_opt_du_uses(&du, or_vr) != 1 || !ir_opt_du_is_single_def(&du, or_vr))
+      continue;
+    int or_def = ir_opt_du_def(&du, or_vr, n);
+    if (or_def < 0)
+      continue;
+
+    IRQuadCompact *or_q = &ir->compact_instructions[or_def];
+    if (or_q->op != TCCIR_OP_OR)
+      continue;
+    IROperand or_dest = tcc_ir_op_get_dest(ir, or_q);
+    if (irop_get_btype(or_dest) != IROP_BTYPE_INT64)
+      continue;
+
+    /* One of OR's operands must be `something SHL #32` (the dead-bits half). */
+    IROperand or_a = tcc_ir_op_get_src1(ir, or_q);
+    IROperand or_b = tcc_ir_op_get_src2(ir, or_q);
+
+    int chosen = -1; /* 0 → a is shl, b is keep; 1 → b is shl, a is keep */
+    int shl1_def = -1;
+    IROperand keep_op = IROP_NONE;
+
+    for (int s = 0; s < 2; s++)
+    {
+      IROperand shl_cand = (s == 0) ? or_a : or_b;
+      IROperand keep_cand = (s == 0) ? or_b : or_a;
+      int32_t shl_vr = irop_get_vreg(shl_cand);
+      if (TCCIR_DECODE_VREG_TYPE(shl_vr) != TCCIR_VREG_TYPE_TEMP)
+        continue;
+      if (shl_cand.is_lval || shl_cand.is_sym)
+        continue;
+      if (ir_opt_du_uses(&du, shl_vr) != 1 || !ir_opt_du_is_single_def(&du, shl_vr))
+        continue;
+      int def = ir_opt_du_def(&du, shl_vr, n);
+      if (def < 0)
+        continue;
+      IRQuadCompact *shl_q = &ir->compact_instructions[def];
+      if (shl_q->op != TCCIR_OP_SHL)
+        continue;
+      IROperand shl_amt = tcc_ir_op_get_src2(ir, shl_q);
+      if (!irop_is_immediate(shl_amt) || irop_get_imm64_ex(ir, shl_amt) != 32)
+        continue;
+      IROperand shl_dest_chk = tcc_ir_op_get_dest(ir, shl_q);
+      if (irop_get_btype(shl_dest_chk) != IROP_BTYPE_INT64)
+        continue;
+      chosen = s;
+      shl1_def = def;
+      keep_op = keep_cand;
+      break;
+    }
+    if (chosen < 0)
+      continue;
+
+    LOG_IR_GEN("OPTIMIZE: SHL32_OR_CHAIN %s at i=%d (or_def=%d, shl1_def=%d)",
+               is_shl32 ? "SHL32" : "AND_low", i, or_def, shl1_def);
+    (void)is_and_low;
+
+    /* Rewrite consumer's src1 from T_or to the kept OR operand. */
+    tcc_ir_set_src1(ir, i, keep_op);
+    /* The OR is now dead; the SHL feeding it is dead (single-use both). */
+    ir->compact_instructions[or_def].op = TCCIR_OP_NOP;
+    ir->compact_instructions[shl1_def].op = TCCIR_OP_NOP;
+    changes++;
+  }
+
+  tcc_free(du.def);
+  return changes;
+}
+
 int tcc_ir_opt_pack64_ex(IROptCtx *ctx) { return tcc_ir_opt_pack64(ctx->ir); }
 int tcc_ir_opt_pack64_tautology_ex(IROptCtx *ctx) { return tcc_ir_opt_pack64_tautology(ctx->ir); }
 int tcc_ir_opt_cmp_narrow_64_ex(IROptCtx *ctx) { return tcc_ir_opt_cmp_narrow_64(ctx->ir); }
+int tcc_ir_opt_shl32_or_chain_ex(IROptCtx *ctx) { return tcc_ir_opt_shl32_or_chain(ctx->ir); }
 

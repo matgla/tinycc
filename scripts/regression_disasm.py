@@ -18,8 +18,7 @@ Options:
   --suite ir|tests2|float|gcc-compile|gcc-execute|bug|all
                            which test suites to include (default: all)
   --no-cache               disable cache tracking (skip comparison)
-  --update                 update cache entries (default: read-only compare)
-  --overwrite-cache        force overwrite all cache entries (implies --update)
+  --overwrite-cache        force overwrite all cache entries (always staged to pending)
 """
 
 import argparse
@@ -637,13 +636,12 @@ def run_csv_mode(gcc_opt, dump_dir, suite, jobs, tcc_override=None):
     return "\n".join(lines)
 
 
-def run_cache_check(data, no_cache, update=False, overwrite_cache=False):
+def run_cache_check(data, no_cache, overwrite_cache=False):
     if no_cache:
         return
     cache = DisasmCache()
     if overwrite_cache:
         cache.data = {}
-        update = True
     func_results = []
     for key in data["all_entries"]:
         test_key, func_name = key.split("::", 1)
@@ -651,12 +649,11 @@ def run_cache_check(data, no_cache, update=False, overwrite_cache=False):
         gcc_n = data["func_gcc"][key]
         func_results.append((key, tcc_n, gcc_n))
 
-    report = cache.check_regressions([(k, t, g) for k, t, g in func_results], mutate=update)
-    if update:
-        # Stage to the pending file; the main cache is only replaced when the
-        # user later runs --update-cache (which skips re-measurement).
-        cache.save_pending()
-        eprint(f"  Staged cache to {cache.pending_path.name} — promote with --update-cache")
+    report = cache.check_regressions([(k, t, g) for k, t, g in func_results], mutate=True)
+    # Stage to the pending file; the main cache is only replaced when the
+    # user later runs --update-cache (which skips re-measurement).
+    cache.save_pending()
+    eprint(f"  Staged cache to {cache.pending_path.name} — promote with --update-cache")
     cache.print_report(report)
     return report
 
@@ -672,8 +669,7 @@ def parse_args():
     parser.add_argument("--dump-dir", help="save dumps")
     parser.add_argument("--graph", nargs="+", help="graph mode: --graph REV [REV2]")
     parser.add_argument("--no-cache", action="store_true", help="disable cache tracking")
-    parser.add_argument("--update", action="store_true", help="stage cache entries to the pending file (default: read-only compare)")
-    parser.add_argument("--overwrite-cache", action="store_true", help="force overwrite all cache entries (implies --update)")
+    parser.add_argument("--overwrite-cache", action="store_true", help="force overwrite all cache entries (always staged to pending)")
     parser.add_argument("--update-cache", action="store_true",
                         help="promote the pending cache file to the main cache and exit without re-running")
     parser.add_argument("--discard-pending", action="store_true",
@@ -774,11 +770,8 @@ if __name__ == "__main__":
     else:
         print_summary(data, args.gcc_opt)
 
-    if args.update or args.overwrite_cache:
-        eprint("Updating cache ...")
-    else:
-        eprint("Comparing against cache (read-only; use --update to write) ...")
-    run_cache_check(data, args.no_cache, args.update, args.overwrite_cache)
+    eprint("Updating cache ...")
+    run_cache_check(data, args.no_cache, args.overwrite_cache)
 
     compile_failures = [s for s in data["skipped"] if "compile failed" in s]
     no_common = [s for s in data["skipped"] if "no common functions" in s]
