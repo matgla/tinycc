@@ -283,6 +283,136 @@ static int ir_opt_op_is_essential(TCCIRState *ir, IRQuadCompact *q, int idx)
   return 0;
 }
 
+static int ir_opt_vreg_has_def_in_range(TCCIRState *ir, int32_t vreg, int start, int end)
+{
+  if (vreg < 0)
+    return 0;
+  for (int i = start; i <= end; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
+      continue;
+    IROperand dest = tcc_ir_op_get_dest(ir, q);
+    if (!dest.is_lval && irop_get_vreg(dest) == vreg)
+      return 1;
+  }
+  return 0;
+}
+
+static int ir_opt_vreg_has_iv_update_in_range(TCCIRState *ir, int32_t vreg, int start, int end, int depth)
+{
+  if (vreg < 0 || depth > 2)
+    return 0;
+
+  for (int i = start; i <= end; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
+      continue;
+
+    IROperand dest = tcc_ir_op_get_dest(ir, q);
+    if (dest.is_lval || irop_get_vreg(dest) != vreg)
+      continue;
+
+    if ((q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_SUB) &&
+        irop_config[q->op].has_src1 && irop_config[q->op].has_src2 &&
+        irop_is_immediate(tcc_ir_op_get_src2(ir, q)))
+    {
+      int32_t s1 = irop_get_vreg(tcc_ir_op_get_src1(ir, q));
+      if (ir_opt_vreg_has_def_in_range(ir, s1, start, end))
+        return 1;
+    }
+
+    if (q->op == TCCIR_OP_ASSIGN && irop_config[q->op].has_src1)
+    {
+      int32_t src = irop_get_vreg(tcc_ir_op_get_src1(ir, q));
+      if (ir_opt_vreg_has_iv_update_in_range(ir, src, start, end, depth + 1))
+        return 1;
+    }
+  }
+
+  return 0;
+}
+
+static int ir_opt_jumpif_uses_iv_update(TCCIRState *ir, int jif_idx, int start, int end)
+{
+  for (int i = jif_idx - 1; i >= start; i--)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
+      break;
+    if (q->op != TCCIR_OP_CMP && q->op != TCCIR_OP_TEST_ZERO)
+      continue;
+
+    if (irop_config[q->op].has_src1)
+    {
+      int32_t s1 = irop_get_vreg(tcc_ir_op_get_src1(ir, q));
+      if (ir_opt_vreg_has_iv_update_in_range(ir, s1, start, end, 0))
+        return 1;
+    }
+    if (irop_config[q->op].has_src2)
+    {
+      int32_t s2 = irop_get_vreg(tcc_ir_op_get_src2(ir, q));
+      if (ir_opt_vreg_has_iv_update_in_range(ir, s2, start, end, 0))
+        return 1;
+    }
+    return 0;
+  }
+
+  return 0;
+}
+
+static int ir_opt_backward_jump_has_cond_exit(TCCIRState *ir, int idx)
+{
+  IRQuadCompact *q = &ir->compact_instructions[idx];
+  IROperand dest = tcc_ir_op_get_dest(ir, q);
+  int target = (int)irop_get_imm64_ex(ir, dest);
+  int n = ir->next_instruction_index;
+
+  if (target < 0 || target > idx)
+    return 0;
+
+  /* A conditional back-edge driven by an in-loop IV update is a finite
+   * side-effect-free loop for our late whole-body elision purposes.
+   * Unconditional infinite loops (`for (;;)` lowered to a bare self/back
+   * jump), and loops whose only exit depends on an unchanged parameter/load,
+   * remain essential. */
+  if (q->op == TCCIR_OP_JUMPIF)
+    return ir_opt_jumpif_uses_iv_update(ir, idx, target, idx);
+
+  if (q->op != TCCIR_OP_JUMP)
+    return 0;
+
+  for (int i = target; i <= idx; i++)
+  {
+    IRQuadCompact *iq = &ir->compact_instructions[i];
+    if (iq->op != TCCIR_OP_JUMPIF)
+      continue;
+
+    IROperand idest = tcc_ir_op_get_dest(ir, iq);
+    int itarget = (int)irop_get_imm64_ex(ir, idest);
+    if ((itarget < target || itarget > idx) &&
+        ir_opt_jumpif_uses_iv_update(ir, i, target, idx))
+      return 1;
+    if ((i + 1 < target || i + 1 > idx) &&
+        ir_opt_jumpif_uses_iv_update(ir, i, target, idx))
+      return 1;
+    if (itarget >= 0 && itarget < n && ir->compact_instructions[itarget].op == TCCIR_OP_NOP)
+    {
+      int t = itarget;
+      while (t < n && ir->compact_instructions[t].op == TCCIR_OP_NOP)
+        t++;
+      if ((t < target || t > idx) &&
+          ir_opt_jumpif_uses_iv_update(ir, i, target, idx))
+        return 1;
+    }
+  }
+
+  return 0;
+}
+
 int tcc_ir_opt_useless_function_body(TCCIRState *ir)
 {
   int n = ir->next_instruction_index;
@@ -295,7 +425,12 @@ int tcc_ir_opt_useless_function_body(TCCIRState *ir)
     if (q->op == TCCIR_OP_NOP)
       continue;
     if (ir_opt_op_is_essential(ir, q, i))
+    {
+      if ((q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF) &&
+          ir_opt_backward_jump_has_cond_exit(ir, i))
+        continue;
       return 0;
+    }
   }
 
   int changes = 0;
