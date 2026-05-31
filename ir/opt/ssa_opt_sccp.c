@@ -11,6 +11,7 @@
 #define USING_GLOBALS
 #include "ir.h"
 #include "ssa_opt.h"
+#include "licm.h"
 #include <limits.h>
 
 /* ============================================================================
@@ -70,6 +71,9 @@ typedef struct {
   SCCPMemDep *mem_deps;
   int mem_dep_count;
   int mem_dep_cap;
+  /* Loop info (lazily computed) for back-edge-aware stack-load resolution. */
+  IRLoops *loops;
+  int loops_done;
 } SCCPState;
 
 static SCCPCell *sccp_cell(SCCPState *s, int32_t vreg)
@@ -425,12 +429,70 @@ static int sccp_no_aliasing_between(SCCPState *s, int store_idx, int load_idx,
   return 1;
 }
 
+/* Back-edge-aware clobber check.  sccp_no_aliasing_between only scans the
+ * linear IR range between a dominating store and the load, on the assumption
+ * that every path from store to load lies within that range.  That assumption
+ * breaks for a load inside a loop: the loop body (which sits AFTER the load in
+ * IR order) reaches the load again via the back-edge, so a store there
+ * clobbers the value on the second and later iterations.  Returns 1 if the
+ * load at `load_idx` is inside a loop whose body writes the slot — meaning the
+ * loaded value is loop-carried and must not be treated as a constant.
+ *
+ * Fixes 931102-1/-2: `while ((reg.b.l & 1) == 0) reg.b.l >>= 1;` — SCCP
+ * resolved the header load of reg.b.l to the preheader's `= 2` store, folded
+ * the exit test to "always false", and the loop spun forever. */
+static int sccp_loop_clobbers_slot(SCCPState *s, int load_idx, int soff, int load_btype)
+{
+  if (!s->loops_done) {
+    s->loops = tcc_ir_detect_loops(s->ctx->ir);
+    s->loops_done = 1;
+  }
+  if (!s->loops || s->loops->num_loops == 0)
+    return 0;
+  int load_size = sccp_btype_bytes(load_btype);
+  int load_lo = soff, load_hi = soff + load_size;
+  TCCIRState *ir = s->ctx->ir;
+  for (int li = 0; li < s->loops->num_loops; li++) {
+    IRLoop *loop = &s->loops->loops[li];
+    if (load_idx < loop->start_idx || load_idx > loop->end_idx)
+      continue;
+    /* Load is in this loop — scan its body range for any write to the slot. */
+    for (int i = loop->start_idx; i <= loop->end_idx; i++) {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      TccIrOp op = q->op;
+      if (op == TCCIR_OP_NOP)
+        continue;
+      if (op == TCCIR_OP_FUNCCALLVOID || op == TCCIR_OP_FUNCCALLVAL || op == TCCIR_OP_BLOCK_COPY)
+        return 1; /* may write anything */
+      if (op != TCCIR_OP_STORE && op != TCCIR_OP_STORE_INDEXED && op != TCCIR_OP_STORE_POSTINC)
+        continue;
+      int store_btype = 0;
+      int target = sccp_store_target_off(s->ctx, q, &store_btype);
+      if (target != INT_MIN) {
+        int store_lo = target, store_hi = target + sccp_btype_bytes(store_btype);
+        if (store_hi > load_lo && load_hi > store_lo)
+          return 1; /* byte ranges overlap */
+        continue;
+      }
+      /* Unresolved store offset in the loop — conservatively assume it may
+       * touch the slot. */
+      return 1;
+    }
+  }
+  return 0;
+}
+
 static int sccp_resolve_stack_load(SCCPState *s, int soff, int load_btype,
                                    int instr_idx, int64_t *out, int *dep_pos)
 {
   IRCFG *cfg = s->ctx->cfg;
   int block = cfg->instr_to_block[instr_idx];
   IRBasicBlock *bb = &cfg->blocks[block];
+
+  /* A load inside a loop whose body stores the slot is loop-carried — the
+   * preheader store does not solely reach it on later iterations. */
+  if (sccp_loop_clobbers_slot(s, instr_idx, soff, load_btype))
+    return SCCP_BOTTOM;
 
   int st = sccp_scan_block_for_stack_store(s, bb, instr_idx - 1, soff,
                                             load_btype, out, dep_pos);
@@ -1481,6 +1543,8 @@ int ssa_opt_sccp(IRSSAOptCtx *ctx)
   tcc_free(s.cfg_wl);
   tcc_free(s.ssa_wl);
   tcc_free(s.mem_deps);
+  if (s.loops)
+    tcc_ir_free_loops(s.loops);
 
   return changes;
 }

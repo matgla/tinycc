@@ -44,6 +44,7 @@ typedef struct
   int has_stack_off;
   uint64_t const_val;
   int has_const;
+  uint8_t is_low32; /* kz/ko track only the low 32 bits of a 64-bit value */
 } TmpKB;
 
 typedef struct
@@ -1215,6 +1216,99 @@ int tcc_ir_opt_known_bits(TCCIRState *ir)
         dest_btype == IROP_BTYPE_FLOAT64 ||
         dest_btype == IROP_BTYPE_STRUCT)
     {
+      /* Track low 32 bits of 64-bit integer values through SHL/SUB/ASSIGN
+       * chains so that 32-bit consumers (shift amounts, truncations) can
+       * constant-fold.  Example: bswap64(zext32(x)) = bswap32(x)<<32,
+       * then y = (uint32_t)(32 - result) = 32 always. */
+      if (dest_btype == IROP_BTYPE_INT64)
+      {
+        /* SHL by constant >= 32: low 32 bits are all zero */
+        if (op == TCCIR_OP_SHL && irop_is_immediate(s2) && !s2.is_sym && !s2.is_lval)
+        {
+          int64_t amt = irop_get_imm64_ex(ir, s2);
+          if (amt >= 32)
+          {
+            tmp_kb[dpos].gen = current_gen;
+            tmp_kb[dpos].kz = 0xFFFFFFFFu;
+            tmp_kb[dpos].ko = 0;
+            tmp_kb[dpos].has_const = 0;
+            tmp_kb[dpos].is_low32 = 1;
+            continue;
+          }
+        }
+        /* SUB/ADD with 64-bit operands: propagate low 32 bits */
+        if (op == TCCIR_OP_SUB || op == TCCIR_OP_ADD)
+        {
+          uint32_t a_kz64 = 0, a_ko64 = 0, b_kz64 = 0, b_ko64 = 0;
+          int h1 = 0, h2 = 0;
+          if (irop_is_immediate(s1) && !s1.is_sym && !s1.is_lval)
+          {
+            uint32_t v = (uint32_t)irop_get_imm64_ex(ir, s1);
+            a_kz64 = ~v; a_ko64 = v; h1 = 1;
+          }
+          else if (irop_has_vreg(s1))
+          {
+            int32_t vr = irop_get_vreg(s1);
+            if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP)
+            {
+              int sp = TCCIR_DECODE_VREG_POSITION(vr);
+              if (sp >= 0 && sp <= max_tmp_pos && tmp_kb[sp].gen == current_gen && tmp_kb[sp].is_low32)
+              { a_kz64 = tmp_kb[sp].kz; a_ko64 = tmp_kb[sp].ko; h1 = 1; }
+            }
+          }
+          if (irop_is_immediate(s2) && !s2.is_sym && !s2.is_lval)
+          {
+            uint32_t v = (uint32_t)irop_get_imm64_ex(ir, s2);
+            b_kz64 = ~v; b_ko64 = v; h2 = 1;
+          }
+          else if (irop_has_vreg(s2))
+          {
+            int32_t vr = irop_get_vreg(s2);
+            if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP)
+            {
+              int sp = TCCIR_DECODE_VREG_POSITION(vr);
+              if (sp >= 0 && sp <= max_tmp_pos && tmp_kb[sp].gen == current_gen && tmp_kb[sp].is_low32)
+              { b_kz64 = tmp_kb[sp].kz; b_ko64 = tmp_kb[sp].ko; h2 = 1; }
+            }
+          }
+          if ((h1 || h2) && (h1 || (a_kz64 == 0 && a_ko64 == 0)) &&
+              (h2 || (b_kz64 == 0 && b_ko64 == 0)))
+          {
+            uint32_t dkz64, dko64;
+            if (kb_compute(op, a_kz64, a_ko64, b_kz64, b_ko64, &dkz64, &dko64))
+            {
+              tmp_kb[dpos].gen = current_gen;
+              tmp_kb[dpos].kz = dkz64;
+              tmp_kb[dpos].ko = dko64;
+              tmp_kb[dpos].has_const = 0;
+              tmp_kb[dpos].is_low32 = 1;
+              continue;
+            }
+          }
+        }
+        /* ASSIGN/ZEXT of 64-bit to 64-bit: propagate low32 kb */
+        if (op == TCCIR_OP_ASSIGN || op == TCCIR_OP_ZEXT)
+        {
+          if (irop_has_vreg(s1))
+          {
+            int32_t vr = irop_get_vreg(s1);
+            int vtype = TCCIR_DECODE_VREG_TYPE(vr);
+            int sp = TCCIR_DECODE_VREG_POSITION(vr);
+            if (vr >= 0 && vtype == TCCIR_VREG_TYPE_TEMP)
+            {
+              if (sp >= 0 && sp <= max_tmp_pos && tmp_kb[sp].gen == current_gen && tmp_kb[sp].is_low32)
+              {
+                tmp_kb[dpos].gen = current_gen;
+                tmp_kb[dpos].kz = tmp_kb[sp].kz;
+                tmp_kb[dpos].ko = tmp_kb[sp].ko;
+                tmp_kb[dpos].has_const = 0;
+                tmp_kb[dpos].is_low32 = 1;
+                continue;
+              }
+            }
+          }
+        }
+      }
       tmp_kb[dpos].gen = 0;
       continue;
     }
@@ -1225,8 +1319,61 @@ int tcc_ir_opt_known_bits(TCCIRState *ir)
         (s1_btype == IROP_BTYPE_FLOAT64) || (s2_btype == IROP_BTYPE_FLOAT64);
     if (wide_src)
     {
+      /* 32-bit shift/and with 64-bit shift amount: if the amount's low 32
+       * bits are fully known, rewrite src2 to an immediate constant. */
+      if ((op == TCCIR_OP_SHL || op == TCCIR_OP_SHR || op == TCCIR_OP_SAR ||
+           op == TCCIR_OP_AND || op == TCCIR_OP_SUB || op == TCCIR_OP_ADD ||
+           op == TCCIR_OP_ASSIGN || op == TCCIR_OP_ZEXT) &&
+          dest_btype != IROP_BTYPE_INT64)
+      {
+        int which = 0; /* 1 = s1 is 64-bit with known low32, 2 = s2 */
+        int32_t low32_val = 0;
+        for (int side = 1; side <= 2; side++)
+        {
+          IROperand sN = (side == 1) ? s1 : s2;
+          int sN_btype = (side == 1) ? s1_btype : s2_btype;
+          if (sN_btype != IROP_BTYPE_INT64) continue;
+          if (!irop_has_vreg(sN)) continue;
+          int32_t vr = irop_get_vreg(sN);
+          if (vr < 0) continue;
+          if (TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP) continue;
+          int sp = TCCIR_DECODE_VREG_POSITION(vr);
+          if (sp < 0 || sp > max_tmp_pos) continue;
+          if (tmp_kb[sp].gen != current_gen || !tmp_kb[sp].is_low32) continue;
+          if ((tmp_kb[sp].kz | tmp_kb[sp].ko) != 0xFFFFFFFFu) continue;
+          which = side;
+          low32_val = (int32_t)tmp_kb[sp].ko;
+          break;
+        }
+        if (which)
+        {
+          IROperand imm = irop_make_imm32(-1, low32_val, IROP_BTYPE_INT32);
+          if (which == 1)
+            tcc_ir_set_src1(ir, i, imm);
+          else
+            tcc_ir_set_src2(ir, i, imm);
+          LOG_IR_GEN("OPTIMIZE: low32 narrow 64-bit operand to #%d at i=%d", low32_val, i);
+          changes++;
+          /* Re-fetch operands and fall through to normal 32-bit kb tracking */
+          s1 = tcc_ir_op_get_src1(ir, q);
+          s2 = tcc_ir_op_get_src2(ir, q);
+          s1_btype = irop_get_btype(s1);
+          s2_btype = irop_get_btype(s2);
+          goto recheck_wide;
+        }
+      }
       tmp_kb[dpos].gen = 0;
       continue;
+recheck_wide:;
+      int wide_src2 =
+          (s1_btype == IROP_BTYPE_INT64) || (s2_btype == IROP_BTYPE_INT64) ||
+          (s1_btype == IROP_BTYPE_FLOAT32) || (s2_btype == IROP_BTYPE_FLOAT32) ||
+          (s1_btype == IROP_BTYPE_FLOAT64) || (s2_btype == IROP_BTYPE_FLOAT64);
+      if (wide_src2)
+      {
+        tmp_kb[dpos].gen = 0;
+        continue;
+      }
     }
 
     uint32_t a_kz = 0, a_ko = 0, b_kz = 0, b_ko = 0;
@@ -1295,7 +1442,25 @@ int tcc_ir_opt_known_bits(TCCIRState *ir)
       if (irop_is_immediate(s2) && !s2.is_sym && !s2.is_lval)
       {
         int64_t amt = irop_get_imm64_ex(ir, s2);
-        if (amt >= 0 && amt < 32)
+        if (amt >= 32 && dest_btype != IROP_BTYPE_INT64 &&
+            (op == TCCIR_OP_SHL || op == TCCIR_OP_SHR))
+        {
+          /* 32-bit SHL/SHR by >= 32: result is always 0.
+           * Replace with ASSIGN #0 directly. */
+          IROperand imm = irop_make_imm32(-1, 0, dest_btype);
+          imm.is_unsigned = dest.is_unsigned;
+          q->op = TCCIR_OP_ASSIGN;
+          tcc_ir_set_src1(ir, i, imm);
+          tcc_ir_set_src2(ir, i, IROP_NONE);
+          tmp_kb[dpos].gen = current_gen;
+          tmp_kb[dpos].kz = 0xFFFFFFFFu;
+          tmp_kb[dpos].ko = 0;
+          tmp_kb[dpos].has_const = 0;
+          tmp_kb[dpos].is_low32 = 0;
+          changes++;
+          continue;
+        }
+        else if (amt >= 0 && amt < 32)
         {
           int h1 = kb_operand(ir, s1, tmp_kb, max_tmp_pos, current_gen,
                               var_addr, max_var_pos,

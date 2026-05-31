@@ -238,12 +238,16 @@ static int dce_dead_var_stores(IRSSAOptCtx *ctx)
      * where the operand encodes V's stack slot (is_local=1, is_lval=1).  In
      * that pattern V is the storage, not a pointer, so the STORE writes
      * directly to V's slot — V is *not* used as a value here, and a dead V
-     * is safe to eliminate. */
+     * is safe to eliminate.
+     *
+     * STORE_INDEXED/STORE_POSTINC dest is always a pointer use (base address
+     * of the indexed access), even when the variable is local — the indexed
+     * store reads the base address, it doesn't define it. */
     if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED) {
       IROperand d = tcc_ir_op_get_dest(ir, q);
       int32_t dvr = irop_get_vreg(d);
       if (dvr >= 0 && TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_VAR &&
-          d.is_lval && !d.is_local) {
+          (q->op == TCCIR_OP_STORE_INDEXED || (d.is_lval && !d.is_local))) {
         int pos = TCCIR_DECODE_VREG_POSITION(dvr);
         if (pos < num_vars)
           var_used[pos / 8] |= (1 << (pos % 8));

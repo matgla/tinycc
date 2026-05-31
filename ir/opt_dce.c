@@ -973,6 +973,31 @@ int tcc_ir_opt_noreturn_collapse(TCCIRState *ir)
       return 0;
   }
 
+  /* The last op looping back is not enough: an *earlier* conditional branch
+   * can still exit the loop to the epilogue.  Scan every JUMP/JUMPIF — if any
+   * targets past the last live instruction (i.e. the implicit `bx lr`
+   * epilogue), the function has a reachable return path and must not be
+   * collapsed.  Without this, a bottom-tested loop like
+   *   for (...; --i < ~0u; ) ...   // exit branch jumps to past-end
+   * whose body ends in an unconditional back-edge JUMP was wrongly treated as
+   * noreturn and replaced with `b .` (miscompile: loop-2d/pr27073 spun
+   * forever).  Branches that stay within the body (target <= last_idx) are
+   * internal control flow and don't count as exits. */
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF)
+      continue;
+    int jt = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+    if (jt < 0)
+      continue;
+    int t = jt;
+    while (t < n && ir->compact_instructions[t].op == TCCIR_OP_NOP)
+      t++;
+    if (t >= n || t > last_idx)
+      return 0;
+  }
+
   LOG_IR_GEN("NORETURN-COLLAPSE: collapsing function body to infinite loop "
              "(no RETURN, no calls/asm/volatile — side effects unobservable)");
 
@@ -1016,6 +1041,933 @@ int tcc_ir_opt_noreturn_collapse(TCCIRState *ir)
 int tcc_ir_opt_noreturn_collapse_ex(IROptCtx *ctx)
 {
   return tcc_ir_opt_noreturn_collapse(ctx->ir);
+}
+
+/* ============================================================================
+ * Infinite Loop Body Simplification
+ * ============================================================================
+ *
+ * Detect infinite loops (no exit) whose body has no externally-observable side
+ * effects, and collapse them to a tight self-jump.
+ *
+ * A store is considered dead within an infinite loop when:
+ *   - It writes to a local/parameter whose address is not taken, OR
+ *   - It writes a loop-invariant constant to a non-volatile global (hoisted)
+ *
+ * The pass also hoists constant global stores to a preheader position so
+ * the store executes once rather than being eliminated entirely.
+ */
+int tcc_ir_opt_infinite_loop_simplify(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  if (n < 3)
+    return 0;
+  if (!tcc_state || tcc_state->optimize < 2)
+    return 0;
+
+  IRLoops *loops = tcc_ir_detect_loops(ir);
+  if (!loops || loops->num_loops == 0)
+  {
+    tcc_ir_free_loops(loops);
+    return 0;
+  }
+
+  int changes = 0;
+
+  for (int li = 0; li < loops->num_loops; li++)
+  {
+    IRLoop *loop = &loops->loops[li];
+
+    int back_edge_idx = -1;
+    int is_infinite = 1;
+    int has_call = 0;
+    int has_volatile = 0;
+
+    for (int bi = 0; bi < loop->num_body_instrs; bi++)
+    {
+      int idx = loop->body_instrs[bi];
+      IRQuadCompact *q = &ir->compact_instructions[idx];
+      if (q->op == TCCIR_OP_NOP)
+        continue;
+
+      if (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID ||
+          q->op == TCCIR_OP_CALLSEQ_BEGIN || q->op == TCCIR_OP_INLINE_ASM)
+      {
+        has_call = 1;
+        break;
+      }
+      if (q->op == TCCIR_OP_RETURNVALUE || q->op == TCCIR_OP_RETURNVOID)
+      {
+        is_infinite = 0;
+        break;
+      }
+      if (q->op == TCCIR_OP_IJUMP || q->op == TCCIR_OP_SWITCH_TABLE)
+      {
+        is_infinite = 0;
+        break;
+      }
+
+      /* Check for volatile operands */
+      for (int k = 0; k <= 2; k++)
+      {
+        IROperand op;
+        if (k == 0 && irop_config[q->op].has_dest)
+          op = tcc_ir_op_get_dest(ir, q);
+        else if (k == 1 && irop_config[q->op].has_src1)
+          op = tcc_ir_op_get_src1(ir, q);
+        else if (k == 2 && irop_config[q->op].has_src2)
+          op = tcc_ir_op_get_src2(ir, q);
+        else
+          continue;
+        if (op.is_sym)
+        {
+          Sym *sym = irop_get_sym_ex(ir, op);
+          if (sym && (sym->type.t & VT_VOLATILE))
+            has_volatile = 1;
+        }
+      }
+
+      if (q->op == TCCIR_OP_JUMPIF)
+      {
+        IROperand dest = tcc_ir_op_get_dest(ir, q);
+        int target = (int)dest.u.imm32;
+        if (target < loop->start_idx || target > loop->end_idx)
+        {
+          is_infinite = 0;
+          break;
+        }
+      }
+      if (q->op == TCCIR_OP_JUMP)
+      {
+        IROperand dest = tcc_ir_op_get_dest(ir, q);
+        int target = (int)dest.u.imm32;
+        if (target == loop->header_idx)
+          back_edge_idx = idx;
+        else if (target < loop->start_idx || target > loop->end_idx)
+        {
+          is_infinite = 0;
+          break;
+        }
+      }
+    }
+
+    if (!is_infinite || has_call || has_volatile || back_edge_idx < 0)
+      continue;
+
+    /* Analyze stores in the loop body. Check if all are dead or hoistable. */
+    int all_stores_dead = 1;
+
+    /* Track which globals get constant stores (for hoisting) */
+#define MAX_HOIST 8
+    struct { Sym *sym; int64_t addend; IROperand value; int store_idx; } hoist[MAX_HOIST];
+    int nhoist = 0;
+
+    for (int bi = 0; bi < loop->num_body_instrs; bi++)
+    {
+      int idx = loop->body_instrs[bi];
+      IRQuadCompact *q = &ir->compact_instructions[idx];
+
+      if (q->op != TCCIR_OP_STORE && q->op != TCCIR_OP_STORE_INDEXED &&
+          q->op != TCCIR_OP_STORE_POSTINC)
+        continue;
+
+      IROperand dest = tcc_ir_op_get_dest(ir, q);
+      int32_t dest_vr = irop_get_vreg(dest);
+
+      /* Store to a local or parameter (direct vreg store, not pointer deref) */
+      if (q->op == TCCIR_OP_STORE && dest_vr >= 0 && !dest.is_lval && !dest.is_sym)
+      {
+        IRLiveInterval *interval = tcc_ir_get_live_interval(ir, dest_vr);
+        if (interval && interval->addrtaken)
+          {
+            /* Address taken — check if the LEA is within the loop
+             * (reachable) or outside (unreachable from infinite loop). */
+            int lea_in_loop = 0;
+            for (int j = 0; j < n; j++)
+            {
+              IRQuadCompact *lq = &ir->compact_instructions[j];
+              if (lq->op == TCCIR_OP_LEA || lq->op == TCCIR_OP_ASSIGN)
+              {
+                if (irop_config[lq->op].has_src1)
+                {
+                  IROperand s1 = tcc_ir_op_get_src1(ir, lq);
+                  if (!s1.is_lval && irop_get_vreg(s1) == dest_vr)
+                  {
+                    /* Check if this LEA is in the loop body */
+                    for (int bk = 0; bk < loop->num_body_instrs; bk++)
+                    {
+                      if (loop->body_instrs[bk] == j)
+                      {
+                        lea_in_loop = 1;
+                        break;
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            if (lea_in_loop)
+            {
+              all_stores_dead = 0;
+              break;
+            }
+          }
+        continue;
+      }
+
+      if (q->op == TCCIR_OP_STORE && dest.is_sym && dest.is_lval)
+      {
+        /* Store to global. Check if value is loop-invariant (constant). */
+        IROperand src1 = tcc_ir_op_get_src1(ir, q);
+        IRPoolSymref *sr = irop_get_symref_ex(ir, dest);
+        if (!sr || !sr->sym)
+        {
+          all_stores_dead = 0;
+          break;
+        }
+        if (sr->sym->type.t & VT_VOLATILE)
+        {
+          all_stores_dead = 0;
+          break;
+        }
+        if (irop_is_immediate(src1) && !src1.is_sym)
+        {
+          /* Constant store to non-volatile global → hoistable */
+          if (nhoist < MAX_HOIST)
+          {
+            hoist[nhoist].sym = sr->sym;
+            hoist[nhoist].addend = sr->addend;
+            hoist[nhoist].value = src1;
+            hoist[nhoist].store_idx = idx;
+            nhoist++;
+          }
+          continue;
+        }
+        /* Non-constant store: check if it's a signed int read-modify-write
+         * (++m pattern) where eventual overflow is UB → body can be removed. */
+        int32_t val_vr = irop_get_vreg(src1);
+        int is_signed_rmw = 0;
+        int dbtype = irop_get_btype(dest);
+        if (val_vr >= 0 && !src1.is_lval && !src1.is_sym &&
+            (dbtype == IROP_BTYPE_INT32 || dbtype == IROP_BTYPE_INT16 ||
+             dbtype == IROP_BTYPE_INT8) &&
+            !dest.is_unsigned)
+        {
+          for (int bj = 0; bj < loop->num_body_instrs; bj++)
+          {
+            int didx = loop->body_instrs[bj];
+            IRQuadCompact *dq = &ir->compact_instructions[didx];
+            if (dq->op != TCCIR_OP_ADD && dq->op != TCCIR_OP_SUB)
+              continue;
+            if (!irop_config[dq->op].has_dest)
+              continue;
+            IROperand dd = tcc_ir_op_get_dest(ir, dq);
+            if (irop_get_vreg(dd) != val_vr)
+              continue;
+            IROperand ds1 = tcc_ir_op_get_src1(ir, dq);
+            IROperand ds2 = tcc_ir_op_get_src2(ir, dq);
+            if (ds1.is_sym && ds1.is_lval && irop_is_immediate(ds2) && !ds2.is_sym)
+            {
+              IRPoolSymref *dsr = irop_get_symref_ex(ir, ds1);
+              if (dsr && dsr->sym == sr->sym && dsr->addend == sr->addend)
+                is_signed_rmw = 1;
+            }
+            break;
+          }
+        }
+        if (!is_signed_rmw)
+        {
+          all_stores_dead = 0;
+          break;
+        }
+        continue;
+      }
+
+      /* STORE_INDEXED, STORE_POSTINC, or unknown STORE pattern */
+      all_stores_dead = 0;
+      break;
+    }
+
+    if (!all_stores_dead)
+      continue;
+
+    /* All stores are dead or hoistable. Simplify the loop. */
+
+    /* Step 1: Convert hoisted constant stores to execute before the loop.
+     * We rewrite the store instructions in-place: move them to just before
+     * the loop header, and NOP the originals. */
+    for (int h = 0; h < nhoist; h++)
+    {
+      /* Find the preheader position: the instruction just before the loop
+       * header.  If the loop has a preheader_idx, use it. Otherwise,
+       * we can't safely hoist (would need to insert instructions). */
+      int preheader = loop->preheader_idx;
+      if (preheader < 0)
+      {
+        /* Try to find a NOP slot before the header */
+        for (int j = loop->header_idx - 1; j >= 0; j--)
+        {
+          if (ir->compact_instructions[j].op == TCCIR_OP_NOP)
+          {
+            preheader = j;
+            break;
+          }
+          break;
+        }
+      }
+      if (preheader >= 0 && ir->compact_instructions[preheader].op == TCCIR_OP_NOP)
+      {
+        /* Copy the store to the preheader slot */
+        ir->compact_instructions[preheader] = ir->compact_instructions[hoist[h].store_idx];
+        ir->compact_instructions[preheader].is_jump_target =
+          ir->compact_instructions[hoist[h].store_idx].is_jump_target ? 1 : 0;
+        /* Copy operands */
+        int src_base = ir->compact_instructions[hoist[h].store_idx].operand_base;
+        int dst_base = ir->compact_instructions[preheader].operand_base;
+        int nops_count = (irop_config[TCCIR_OP_STORE].has_dest ? 1 : 0) +
+                         (irop_config[TCCIR_OP_STORE].has_src1 ? 1 : 0) +
+                         (irop_config[TCCIR_OP_STORE].has_src2 ? 1 : 0);
+        for (int k = 0; k < nops_count; k++)
+          ir->iroperand_pool[dst_base + k] = ir->iroperand_pool[src_base + k];
+      }
+      /* NOP the original store */
+      ir->compact_instructions[hoist[h].store_idx].op = TCCIR_OP_NOP;
+    }
+
+    /* Step 2: NOP all remaining non-NOP instructions in the loop body
+     * except the back-edge jump. Then convert the back-edge to a
+     * self-jump at the header. */
+    for (int bi = 0; bi < loop->num_body_instrs; bi++)
+    {
+      int idx = loop->body_instrs[bi];
+      IRQuadCompact *q = &ir->compact_instructions[idx];
+      if (q->op == TCCIR_OP_NOP)
+        continue;
+      if (idx == back_edge_idx)
+        continue;
+      q->op = TCCIR_OP_NOP;
+    }
+
+    /* Convert the back-edge to a self-jump at the loop header */
+    ir->compact_instructions[loop->header_idx].op = TCCIR_OP_JUMP;
+    ir->compact_instructions[loop->header_idx].is_jump_target = 1;
+    IROperand self = irop_make_imm32(-1, loop->header_idx, IROP_BTYPE_INT32);
+    tcc_ir_set_dest(ir, loop->header_idx, self);
+    tcc_ir_set_src1(ir, loop->header_idx, IROP_NONE);
+    tcc_ir_set_src2(ir, loop->header_idx, IROP_NONE);
+
+    /* NOP the old back-edge if it's not the header */
+    if (back_edge_idx != loop->header_idx)
+      ir->compact_instructions[back_edge_idx].op = TCCIR_OP_NOP;
+
+    changes++;
+#undef MAX_HOIST
+  }
+
+  tcc_ir_free_loops(loops);
+  return changes;
+}
+
+int tcc_ir_opt_infinite_loop_simplify_ex(IROptCtx *ctx)
+{
+  return tcc_ir_opt_infinite_loop_simplify(ctx->ir);
+}
+
+/* ============================================================================
+ * Dead-Code-Before-Infinite-Loop Elimination
+ * ============================================================================
+ *
+ * After infinite_loop_simplify collapses a side-effect-free infinite loop to a
+ * tight self-jump (`JMP to self`), the code that *precedes* the loop on the
+ * never-returning path is still emitted: stores to globals, the address-take
+ * that feeds them, the dominating `if` tests, etc.  GCC removes all of it.
+ *
+ * pr106433.c::bar is the motivating case:
+ *
+ *     if (x) {
+ *       if (m < 1) for (m = 0; m < 1; ++m) ++x;
+ *       p = &x;
+ *       for (;;) ++m;          // never returns
+ *     }
+ *     return 0;
+ *
+ * Once control enters the non-terminating, side-effect-free `for(;;)`, the
+ * function never resumes its caller, so the writes to m and p (and the
+ * address-take of x that forces a stack spill) can never be observed.
+ *
+ * An instruction is dead under this rule when, following the CFG, it cannot
+ * reach any observable program effect — a RETURN, a (non-pure) call, a
+ * volatile access, inline asm, a trap, a longjmp, etc.  Its only destiny is to
+ * spin forever in an empty loop.  A plain store to non-volatile memory is NOT
+ * such an effect: it is observable only if the function eventually returns so
+ * the value can be read, which on these paths never happens.
+ *
+ * We keep the self-jump sink itself (the program must still hang) and redirect
+ * every edge entering the dead region straight to the loop, NOPing the rest.
+ * DCE / jump-threading downstream cleans up the redirected hops.  Removing the
+ * address-take of a parameter/local also lets us clear its now-stale
+ * `addrtaken` flag, dropping the spill it would otherwise force. */
+
+/* An op is an "anchor": observable even if the function never returns.
+ * Differs from ir_opt_op_is_essential only in that a store to non-volatile
+ * memory is NOT an anchor (it needs a return to be observed) and plain
+ * control flow (JUMP/JUMPIF) is not an anchor. */
+static int ir_opt_op_is_inf_dead_anchor(TCCIRState *ir, IRQuadCompact *q, int idx)
+{
+  switch (q->op)
+  {
+  case TCCIR_OP_JUMP:
+  case TCCIR_OP_JUMPIF:
+    return 0; /* pure control flow */
+  case TCCIR_OP_STORE:
+  {
+    IROperand dest = tcc_ir_op_get_dest(ir, q);
+    /* Store to a global (sym lval): observable-without-return only if volatile. */
+    if (dest.is_sym && dest.is_lval)
+    {
+      Sym *s = irop_get_sym_ex(ir, dest);
+      return (s && (s->type.t & VT_VOLATILE)) ? 1 : 0;
+    }
+    /* Direct store to a local/param vreg: dead unless volatile. */
+    if (!dest.is_lval && !dest.is_sym && !dest.is_llocal)
+    {
+      int32_t dvr = irop_get_vreg(dest);
+      int dvt = TCCIR_DECODE_VREG_TYPE(dvr);
+      if (dvt == TCCIR_VREG_TYPE_VAR)
+        return ir_opt_vreg_sym_is_volatile(dvr);
+      if (dvt == TCCIR_VREG_TYPE_PARAM)
+        return ir_opt_param_vreg_is_volatile(TCCIR_DECODE_VREG_POSITION(dvr));
+    }
+    /* Pointer / unknown store target: keep conservatively. */
+    return 1;
+  }
+  default:
+    break;
+  }
+  /* Everything else (calls, asm, traps, returns, volatile reads, VLA, …) keeps
+   * its ir_opt_op_is_essential classification. */
+  return ir_opt_op_is_essential(ir, q, idx, NULL, 0);
+}
+
+/* Forward-walk from `start` over CFG successors, staying within the dead/sink
+ * set, until an empty-infinite-loop sink is reached.  Returns its index, or -1
+ * if no sink is reachable (the caller then leaves the region untouched). */
+static int ir_inf_dead_find_sink(TCCIRState *ir, int start, const uint8_t *dead,
+                                 const uint8_t *is_sink, int n)
+{
+  uint8_t *vis = tcc_mallocz((n + 7) / 8);
+  int *stk = tcc_malloc(n * sizeof(int));
+  int sp = 0, found = -1;
+  stk[sp++] = start;
+  vis[start / 8] |= (1 << (start % 8));
+  while (sp > 0)
+  {
+    int i = stk[--sp];
+    if (is_sink[i / 8] & (1 << (i % 8)))
+    {
+      found = i;
+      break;
+    }
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    int succ[2], ns = 0;
+    switch (q->op)
+    {
+    case TCCIR_OP_RETURNVALUE:
+    case TCCIR_OP_RETURNVOID:
+    case TCCIR_OP_TRAP:
+      break;
+    case TCCIR_OP_JUMP:
+      succ[ns++] = (int)tcc_ir_op_get_dest(ir, q).u.imm32;
+      break;
+    case TCCIR_OP_JUMPIF:
+      succ[ns++] = (int)tcc_ir_op_get_dest(ir, q).u.imm32;
+      succ[ns++] = i + 1;
+      break;
+    default:
+      succ[ns++] = i + 1;
+      break;
+    }
+    for (int k = 0; k < ns; k++)
+    {
+      int s = succ[k];
+      if (s < 0 || s >= n)
+        continue;
+      int sdead = dead[s / 8] & (1 << (s % 8));
+      int ssink = is_sink[s / 8] & (1 << (s % 8));
+      if (!sdead && !ssink)
+        continue; /* escapes the dead region — cannot happen for a dead node */
+      if (!(vis[s / 8] & (1 << (s % 8))))
+      {
+        vis[s / 8] |= (1 << (s % 8));
+        stk[sp++] = s;
+      }
+    }
+  }
+  tcc_free(vis);
+  tcc_free(stk);
+  return found;
+}
+
+int tcc_ir_opt_dead_before_infinite_loop(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  if (n < 2)
+    return 0;
+  if (!tcc_state || tcc_state->optimize < 2)
+    return 0;
+
+  /* Indirect jumps have statically-unknown successors — bail. */
+  for (int i = 0; i < n; i++)
+    if (ir->compact_instructions[i].op == TCCIR_OP_IJUMP)
+      return 0;
+
+#define GETBIT(arr, k) ((arr)[(k) / 8] & (1 << ((k) % 8)))
+#define SETBIT(arr, k) ((arr)[(k) / 8] |= (1 << ((k) % 8)))
+
+  /* Empty infinite-loop sinks: a JUMP whose target is itself. */
+  uint8_t *is_sink = tcc_mallocz((n + 7) / 8);
+  int have_sink = 0;
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_JUMP)
+      continue;
+    if ((int)tcc_ir_op_get_dest(ir, q).u.imm32 == i)
+    {
+      SETBIT(is_sink, i);
+      have_sink = 1;
+    }
+  }
+  if (!have_sink)
+  {
+    tcc_free(is_sink);
+    return 0;
+  }
+
+  /* anchor[i]: instruction has an effect observable without returning. */
+  uint8_t *anchor = tcc_mallocz((n + 7) / 8);
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    if (ir_opt_op_is_inf_dead_anchor(ir, q, i))
+      SETBIT(anchor, i);
+  }
+
+  /* can_reach[i]: from i, control can reach an anchor (backward fixpoint). */
+  uint8_t *can_reach = tcc_mallocz((n + 7) / 8);
+  int changed = 1;
+  while (changed)
+  {
+    changed = 0;
+    for (int i = n - 1; i >= 0; i--)
+    {
+      if (GETBIT(can_reach, i))
+        continue;
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      int reach = GETBIT(anchor, i) ? 1 : 0;
+      if (!reach)
+      {
+        switch (q->op)
+        {
+        case TCCIR_OP_RETURNVALUE:
+        case TCCIR_OP_RETURNVOID:
+        case TCCIR_OP_TRAP:
+        case TCCIR_OP_SWITCH_TABLE:
+          break; /* anchors / no fall-through */
+        case TCCIR_OP_JUMP:
+        {
+          int t = (int)tcc_ir_op_get_dest(ir, q).u.imm32;
+          if (t >= 0 && t < n && GETBIT(can_reach, t))
+            reach = 1;
+          break;
+        }
+        case TCCIR_OP_JUMPIF:
+        {
+          int t = (int)tcc_ir_op_get_dest(ir, q).u.imm32;
+          if (t >= 0 && t < n && GETBIT(can_reach, t))
+            reach = 1;
+          if (i + 1 < n && GETBIT(can_reach, i + 1))
+            reach = 1;
+          break;
+        }
+        default:
+          if (i + 1 < n && GETBIT(can_reach, i + 1))
+            reach = 1;
+          break;
+        }
+      }
+      if (reach)
+      {
+        SETBIT(can_reach, i);
+        changed = 1;
+      }
+    }
+  }
+
+  /* reach[i]: executed on some path from entry (forward BFS). */
+  uint8_t *reach = tcc_mallocz((n + 7) / 8);
+  int *wl = tcc_malloc(n * sizeof(int));
+  int wh = 0, wt = 0;
+  SETBIT(reach, 0);
+  wl[wt++] = 0;
+  while (wh < wt)
+  {
+    int i = wl[wh++];
+    IRQuadCompact *q = &ir->compact_instructions[i];
+#define PUSH(k)                                                                                                        \
+  do                                                                                                                   \
+  {                                                                                                                    \
+    int _k = (k);                                                                                                      \
+    if (_k >= 0 && _k < n && !GETBIT(reach, _k))                                                                       \
+    {                                                                                                                  \
+      SETBIT(reach, _k);                                                                                               \
+      wl[wt++] = _k;                                                                                                   \
+    }                                                                                                                  \
+  } while (0)
+    switch (q->op)
+    {
+    case TCCIR_OP_RETURNVALUE:
+    case TCCIR_OP_RETURNVOID:
+    case TCCIR_OP_TRAP:
+      break;
+    case TCCIR_OP_JUMP:
+      PUSH((int)tcc_ir_op_get_dest(ir, q).u.imm32);
+      break;
+    case TCCIR_OP_JUMPIF:
+      PUSH((int)tcc_ir_op_get_dest(ir, q).u.imm32);
+      PUSH(i + 1);
+      break;
+    case TCCIR_OP_SWITCH_TABLE:
+    {
+      IROperand src2 = tcc_ir_op_get_src2(ir, q);
+      int table_id = (int)irop_get_imm64_ex(ir, src2);
+      if (table_id >= 0 && table_id < ir->num_switch_tables)
+      {
+        TCCIRSwitchTable *table = &ir->switch_tables[table_id];
+        for (int j = 0; j < table->num_entries; j++)
+          PUSH(table->targets[j]);
+        PUSH(table->default_target);
+      }
+      break;
+    }
+    default:
+      PUSH(i + 1);
+      break;
+    }
+#undef PUSH
+  }
+
+  /* dead[i]: reachable, cannot reach an anchor, and not itself a sink. */
+  uint8_t *dead = tcc_mallocz((n + 7) / 8);
+  int any_dead = 0;
+  for (int i = 0; i < n; i++)
+  {
+    if (ir->compact_instructions[i].op == TCCIR_OP_NOP)
+      continue;
+    if (GETBIT(is_sink, i))
+      continue;
+    if (GETBIT(reach, i) && !GETBIT(can_reach, i))
+    {
+      SETBIT(dead, i);
+      any_dead = 1;
+    }
+  }
+
+  int changes = 0;
+  if (!any_dead)
+    goto done;
+
+  /* entry[d]: a dead instr reached by an edge from a kept (non-dead, non-NOP)
+   * instruction.  Such edges must be rerouted to the loop sink. */
+  uint8_t *entry = tcc_mallocz((n + 7) / 8);
+  for (int p = 0; p < n; p++)
+  {
+    if (!GETBIT(reach, p) || GETBIT(dead, p))
+      continue;
+    IRQuadCompact *q = &ir->compact_instructions[p];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+#define MARKENTRY(s)                                                                                                   \
+  do                                                                                                                   \
+  {                                                                                                                    \
+    int _s = (s);                                                                                                      \
+    if (_s >= 0 && _s < n && GETBIT(dead, _s))                                                                         \
+      SETBIT(entry, _s);                                                                                               \
+  } while (0)
+    switch (q->op)
+    {
+    case TCCIR_OP_RETURNVALUE:
+    case TCCIR_OP_RETURNVOID:
+    case TCCIR_OP_TRAP:
+      break;
+    case TCCIR_OP_JUMP:
+      MARKENTRY((int)tcc_ir_op_get_dest(ir, q).u.imm32);
+      break;
+    case TCCIR_OP_JUMPIF:
+      MARKENTRY((int)tcc_ir_op_get_dest(ir, q).u.imm32);
+      MARKENTRY(p + 1);
+      break;
+    case TCCIR_OP_SWITCH_TABLE:
+    {
+      IROperand src2 = tcc_ir_op_get_src2(ir, q);
+      int table_id = (int)irop_get_imm64_ex(ir, src2);
+      if (table_id >= 0 && table_id < ir->num_switch_tables)
+      {
+        TCCIRSwitchTable *table = &ir->switch_tables[table_id];
+        for (int j = 0; j < table->num_entries; j++)
+          MARKENTRY(table->targets[j]);
+        MARKENTRY(table->default_target);
+      }
+      break;
+    }
+    default:
+      MARKENTRY(p + 1);
+      break;
+    }
+#undef MARKENTRY
+  }
+
+  /* Resolve a loop sink for every entry up front; if any entry cannot reach a
+   * sink (a non-self-jump cycle), abort without touching the IR. */
+  int *entry_sink = tcc_malloc(n * sizeof(int));
+  int abort_pass = 0;
+  for (int d = 0; d < n; d++)
+  {
+    entry_sink[d] = -1;
+    if (!GETBIT(entry, d))
+      continue;
+    int sink = ir_inf_dead_find_sink(ir, d, dead, is_sink, n);
+    if (sink < 0)
+    {
+      abort_pass = 1;
+      break;
+    }
+    entry_sink[d] = sink;
+  }
+  if (abort_pass)
+  {
+    tcc_free(entry);
+    tcc_free(entry_sink);
+    goto done;
+  }
+
+  /* Apply: reroute entries to their sink, NOP the rest of the dead region.
+   * Track address-takes we remove so their spill-forcing flag can be cleared. */
+  int32_t *cleared_vr = tcc_malloc(n * sizeof(int32_t));
+  int ncleared = 0;
+  for (int d = 0; d < n; d++)
+  {
+    if (!GETBIT(dead, d))
+      continue;
+    IRQuadCompact *q = &ir->compact_instructions[d];
+    if (q->op == TCCIR_OP_LEA)
+    {
+      int32_t lea_src = irop_get_vreg(tcc_ir_op_get_src1(ir, q));
+      if (lea_src >= 0)
+        cleared_vr[ncleared++] = lea_src;
+    }
+    if (GETBIT(entry, d))
+    {
+      q->op = TCCIR_OP_JUMP;
+      tcc_ir_set_dest(ir, d, irop_make_imm32(-1, entry_sink[d], IROP_BTYPE_INT32));
+      tcc_ir_set_src1(ir, d, IROP_NONE);
+      tcc_ir_set_src2(ir, d, IROP_NONE);
+    }
+    else
+    {
+      q->op = TCCIR_OP_NOP;
+    }
+    changes++;
+  }
+
+  /* Clear `addrtaken` on any param/local/temp whose last surviving LEA we just
+   * removed — drops the now-unnecessary stack spill. */
+  for (int c = 0; c < ncleared; c++)
+  {
+    int32_t vr = cleared_vr[c];
+    int still = 0;
+    for (int i = 0; i < n; i++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      if (q->op != TCCIR_OP_LEA)
+        continue;
+      if (irop_get_vreg(tcc_ir_op_get_src1(ir, q)) == vr)
+      {
+        still = 1;
+        break;
+      }
+    }
+    if (!still && tcc_ir_vreg_is_valid(ir, vr))
+    {
+      IRLiveInterval *iv = tcc_ir_get_live_interval(ir, vr);
+      if (iv)
+        iv->addrtaken = 0;
+    }
+  }
+
+  LOG_IR_GEN("DEAD-BEFORE-INF-LOOP: rerouted/NOPed %d instructions", changes);
+
+  tcc_free(cleared_vr);
+  tcc_free(entry);
+  tcc_free(entry_sink);
+
+done:
+  tcc_free(is_sink);
+  tcc_free(anchor);
+  tcc_free(can_reach);
+  tcc_free(reach);
+  tcc_free(wl);
+  tcc_free(dead);
+#undef GETBIT
+#undef SETBIT
+  return changes;
+}
+
+int tcc_ir_opt_dead_before_infinite_loop_ex(IROptCtx *ctx)
+{
+  return tcc_ir_opt_dead_before_infinite_loop(ctx->ir);
+}
+
+/* ============================================================================
+ * Return-Constant Register Reuse
+ * ============================================================================
+ *
+ * A `RETURNVALUE C` (C an integer immediate) whose block is entered *only*
+ * through the equality edge of a `TEST_ZERO V` (C == 0) or `CMP V, #C` returns
+ * the very constant the comparison already proved V holds on that edge.
+ * Returning V instead of C lets the backend reuse the register V already lives
+ * in — typically r0 for a leading parameter or a prior result — and drop the
+ * constant materialization entirely.
+ *
+ * This never increases instruction count: in the worst case (V in some other
+ * register or spilled) the reused value costs the same single mov/ldr the
+ * constant would have cost; when V is already in the return register it costs
+ * nothing.  Matches GCC -O2 on pr106433.c::bar, eliminating the `movs r0, #0`
+ * that left us one instruction above GCC (cbnz/bx/b). */
+int tcc_ir_opt_return_const_reuse(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  if (n < 2)
+    return 0;
+  if (!tcc_state || tcc_state->optimize < 2)
+    return 0;
+
+  int changes = 0;
+  for (int r = 0; r < n; r++)
+  {
+    IRQuadCompact *R = &ir->compact_instructions[r];
+    if (R->op != TCCIR_OP_RETURNVALUE)
+      continue;
+    IROperand rv = tcc_ir_op_get_src1(ir, R);
+    if (rv.is_sym || rv.is_lval || !irop_is_immediate(rv))
+      continue;
+    int64_t cval = irop_get_imm64_ex(ir, rv);
+
+    /* (1) No fall-through into r: the instruction just before r must be an
+     * unconditional diversion, otherwise r has a second (non-equality)
+     * predecessor on which V may not equal C. */
+    int p = r - 1;
+    while (p >= 0 && ir->compact_instructions[p].op == TCCIR_OP_NOP)
+      p--;
+    if (p >= 0)
+    {
+      TccIrOp pop = ir->compact_instructions[p].op;
+      if (pop != TCCIR_OP_JUMP && pop != TCCIR_OP_RETURNVALUE && pop != TCCIR_OP_RETURNVOID &&
+          pop != TCCIR_OP_TRAP && pop != TCCIR_OP_IJUMP && pop != TCCIR_OP_SWITCH_TABLE)
+        continue;
+    }
+
+    /* (2) Exactly one branch predecessor, an equality JUMPIF targeting r. */
+    int jif = -1, npred = 0, bad = 0;
+    for (int j = 0; j < n && !bad; j++)
+    {
+      if (j == r)
+        continue;
+      IRQuadCompact *q = &ir->compact_instructions[j];
+      int targets_r = 0;
+      if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
+      {
+        if ((int)tcc_ir_op_get_dest(ir, q).u.imm32 == r)
+          targets_r = 1;
+      }
+      else if (q->op == TCCIR_OP_SWITCH_TABLE)
+      {
+        IROperand s2 = tcc_ir_op_get_src2(ir, q);
+        int tid = (int)irop_get_imm64_ex(ir, s2);
+        if (tid >= 0 && tid < ir->num_switch_tables)
+        {
+          TCCIRSwitchTable *t = &ir->switch_tables[tid];
+          for (int e = 0; e < t->num_entries; e++)
+            if (t->targets[e] == r)
+              targets_r = 1;
+          if (t->default_target == r)
+            targets_r = 1;
+        }
+      }
+      if (!targets_r)
+        continue;
+      npred++;
+      if (q->op == TCCIR_OP_JUMPIF && (int)tcc_ir_op_get_src1(ir, q).u.imm32 == TOK_EQ)
+        jif = j;
+      else
+        bad = 1;
+    }
+    if (bad || npred != 1 || jif < 0)
+      continue;
+
+    /* (3) The flag-setter just before the JUMPIF proves V == C, with V a plain
+     * register value (no memory / sym deref) of the same width as the return. */
+    int t = jif - 1;
+    while (t >= 0 && ir->compact_instructions[t].op == TCCIR_OP_NOP)
+      t--;
+    if (t < 0)
+      continue;
+    IRQuadCompact *T = &ir->compact_instructions[t];
+    IROperand vop = IROP_NONE;
+    int matched = 0;
+    if (T->op == TCCIR_OP_TEST_ZERO && cval == 0)
+    {
+      vop = tcc_ir_op_get_src1(ir, T);
+      matched = 1;
+    }
+    else if (T->op == TCCIR_OP_CMP)
+    {
+      IROperand a = tcc_ir_op_get_src1(ir, T);
+      IROperand b = tcc_ir_op_get_src2(ir, T);
+      if (!a.is_sym && !a.is_lval && irop_get_vreg(a) >= 0 && irop_is_immediate(b) && !b.is_sym &&
+          irop_get_imm64_ex(ir, b) == cval)
+      {
+        vop = a;
+        matched = 1;
+      }
+      else if (!b.is_sym && !b.is_lval && irop_get_vreg(b) >= 0 && irop_is_immediate(a) && !a.is_sym &&
+               irop_get_imm64_ex(ir, a) == cval)
+      {
+        vop = b;
+        matched = 1;
+      }
+    }
+    if (!matched || vop.is_sym || vop.is_lval || irop_get_vreg(vop) < 0)
+      continue;
+    int vt = TCCIR_DECODE_VREG_TYPE(irop_get_vreg(vop));
+    if (vt != TCCIR_VREG_TYPE_PARAM && vt != TCCIR_VREG_TYPE_VAR && vt != TCCIR_VREG_TYPE_TEMP)
+      continue;
+    if (irop_get_btype(vop) != irop_get_btype(rv))
+      continue;
+
+    /* Return the register the comparison proved equals C. */
+    tcc_ir_set_src1(ir, r, vop);
+    changes++;
+    LOG_IR_GEN("RETURN-CONST-REUSE: return #%lld -> reg at instr %d", (long long)cval, r);
+  }
+  return changes;
+}
+
+int tcc_ir_opt_return_const_reuse_ex(IROptCtx *ctx)
+{
+  return tcc_ir_opt_return_const_reuse(ctx->ir);
 }
 
 /* Trap-Only Body Suppression
@@ -2286,12 +3238,15 @@ int tcc_ir_opt_dse(TCCIRState *ir)
           }
         }
 
-        /* STORE/STORE_INDEXED dest: only a use when it's a pointer dereference
-         * (non-local), not when it's a direct local store (which is a define). */
+        /* STORE dest: only a use when it's a pointer dereference (non-local),
+         * not when it's a direct local store (which is a define).
+         * STORE_INDEXED dest is always a pointer use (base of indexed access),
+         * even when the variable is local — the indexed store reads the base
+         * address, it doesn't define it. */
         if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED)
         {
           const IROperand d = tcc_ir_op_get_dest(ir, q);
-          if (!d.is_local)
+          if (!d.is_local || q->op == TCCIR_OP_STORE_INDEXED)
           {
             int32_t vr = irop_get_vreg(d);
             if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR)
@@ -3328,6 +4283,20 @@ int tcc_ir_opt_dead_var_store_elim(TCCIRState *ir)
     {
       IROperand src2 = tcc_ir_op_get_src2(ir, q);
       int32_t vr = irop_get_vreg(src2);
+      if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR)
+      {
+        int pos = TCCIR_DECODE_VREG_POSITION(vr);
+        if (pos <= max_var)
+          var_read[pos / 8] |= (1 << (pos % 8));
+      }
+    }
+    /* STORE_INDEXED/STORE_POSTINC dest is a pointer read (base address),
+     * not a definition.  Count it as a VAR read so the VAR's definition
+     * isn't incorrectly eliminated. */
+    if (q->op == TCCIR_OP_STORE_INDEXED || q->op == TCCIR_OP_STORE_POSTINC)
+    {
+      IROperand d = tcc_ir_op_get_dest(ir, q);
+      int32_t vr = irop_get_vreg(d);
       if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR)
       {
         int pos = TCCIR_DECODE_VREG_POSITION(vr);
@@ -4660,6 +5629,92 @@ int tcc_ir_opt_redundant_var_assign_ex(IROptCtx *ctx) { return tcc_ir_opt_redund
 int tcc_ir_opt_dead_var_store_elim_ex(IROptCtx *ctx) { return tcc_ir_opt_dead_var_store_elim(ctx->ir); }
 int tcc_ir_opt_dead_addrvar_elim_ex(IROptCtx *ctx) { return tcc_ir_opt_dead_addrvar_elim(ctx->ir); }
 
+/* Observable side-effect guard shared by the uninit-UB collapse passes.
+ *
+ * Those passes exploit a dominating uninit read to declare the whole function
+ * UB and collapse it to `b .`.  That is only sound when the function does no
+ * observable work BEFORE returning — otherwise the side effects sequenced
+ * before the UB read (which GCC keeps) would be wrongly discarded, breaking
+ * code that relies on them (e.g. a result written through a pointer parameter,
+ * or a call whose effects the caller depends on).  Returns 1 if the function
+ * has any such observable effect: a call, inline asm, non-local control flow,
+ * a trap, a VLA op, a volatile access, or a STORE that escapes the frame
+ * (through a pointer or to a global).  Stores to the function's own locals are
+ * unobservable once it returns, so they don't count. */
+static int udr_has_observable_side_effects(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    switch (q->op)
+    {
+    case TCCIR_OP_FUNCCALLVAL:
+    case TCCIR_OP_FUNCCALLVOID:
+    case TCCIR_OP_CALLSEQ_BEGIN:
+    case TCCIR_OP_CALLARG_REG:
+    case TCCIR_OP_CALLARG_STACK:
+    case TCCIR_OP_CALLSEQ_END:
+    case TCCIR_OP_INLINE_ASM:
+    case TCCIR_OP_ASM_INPUT:
+    case TCCIR_OP_ASM_OUTPUT:
+    case TCCIR_OP_SETJMP:
+    case TCCIR_OP_LONGJMP:
+    case TCCIR_OP_NL_SETJMP:
+    case TCCIR_OP_NL_LONGJMP:
+    case TCCIR_OP_BUILTIN_APPLY_ARGS:
+    case TCCIR_OP_BUILTIN_APPLY:
+    case TCCIR_OP_BUILTIN_RETURN:
+    case TCCIR_OP_TRAP:
+    case TCCIR_OP_VLA_ALLOC:
+    case TCCIR_OP_VLA_SP_SAVE:
+    case TCCIR_OP_VLA_SP_RESTORE:
+      return 1;
+    case TCCIR_OP_STORE:
+    case TCCIR_OP_STORE_INDEXED:
+    case TCCIR_OP_STORE_POSTINC:
+    case TCCIR_OP_BLOCK_COPY:
+    {
+      IROperand d = tcc_ir_op_get_dest(ir, q);
+      if (!d.is_local)
+        return 1;
+      break;
+    }
+    default:
+      break;
+    }
+    for (int k = 0; k <= 2; k++)
+    {
+      IROperand op;
+      if (k == 0)
+      {
+        if (!irop_config[q->op].has_dest)
+          continue;
+        op = tcc_ir_op_get_dest(ir, q);
+      }
+      else if (k == 1)
+      {
+        if (!irop_config[q->op].has_src1)
+          continue;
+        op = tcc_ir_op_get_src1(ir, q);
+      }
+      else
+      {
+        if (!irop_config[q->op].has_src2)
+          continue;
+        op = tcc_ir_op_get_src2(ir, q);
+      }
+      if (op.is_sym)
+      {
+        Sym *vs = irop_get_sym_ex(ir, op);
+        if (vs && (vs->type.t & VT_VOLATILE))
+          return 1;
+      }
+    }
+  }
+  return 0;
+}
+
 /* Unconditional Uninitialized Local UB Exploit
  *
  * If the entry basic block unconditionally reads a TCCIR_VREG_TYPE_VAR (local C
@@ -4824,6 +5879,12 @@ int tcc_ir_opt_uninit_local_ub(TCCIRState *ir)
   if (!found_uninit)
     return 0;
 
+  /* See udr_has_observable_side_effects: only collapse a side-effect-free
+   * body.  va-arg-14's main reads an uninitialised `va_list t` but then calls
+   * vat(t,1) and exit(0) — observable work that must not be discarded. */
+  if (udr_has_observable_side_effects(ir))
+    return 0;
+
   LOG_IR_GEN("UNINIT-UB: collapsing function body to infinite loop (read of uninit local in entry block)");
 
   /* Replace the whole IR with a single self-jump.  Other passes (compact_nops,
@@ -4882,8 +5943,12 @@ int tcc_ir_opt_uninit_dominates_return(TCCIRState *ir)
       return 0;
   }
 
-  /* Must have at least one RETURN — otherwise noreturn_collapse handles it. */
+  /* Check for explicit or implicit returns.  An implicit return is a
+   * JUMP/JUMPIF whose target is past-end (>= n) — the backend emits
+   * `bx lr` at the epilogue for these.  When neither exists,
+   * noreturn_collapse handles the function. */
   int has_return = 0;
+  int has_implicit_return = 0;
   for (int i = 0; i < n; i++)
   {
     TccIrOp op = ir->compact_instructions[i].op;
@@ -4892,8 +5957,22 @@ int tcc_ir_opt_uninit_dominates_return(TCCIRState *ir)
       has_return = 1;
       break;
     }
+    if (op == TCCIR_OP_JUMP || op == TCCIR_OP_JUMPIF)
+    {
+      IROperand d = tcc_ir_op_get_dest(ir, &ir->compact_instructions[i]);
+      int t = (int)irop_get_imm64_ex(ir, d);
+      if (t >= n)
+        has_implicit_return = 1;
+    }
   }
-  if (!has_return)
+  if (!has_return && !has_implicit_return)
+    return 0;
+
+  /* Don't exploit the UB when the function does observable work before
+   * returning — collapsing to `b .` would discard side effects GCC keeps
+   * (e.g. 920726-1's `first()` writes its result through a `char *buf`
+   * parameter before `return dummy;`). */
+  if (udr_has_observable_side_effects(ir))
     return 0;
 
 #define UDR_MAX_VAR_POS 1024
@@ -5021,8 +6100,18 @@ int tcc_ir_opt_uninit_dominates_return(TCCIRState *ir)
   int ok = 1;
   for (int i = 0; i < n && ok; i++)
   {
-    TccIrOp op = ir->compact_instructions[i].op;
-    if (op != TCCIR_OP_RETURNVALUE && op != TCCIR_OP_RETURNVOID)
+    IRQuadCompact *rq = &ir->compact_instructions[i];
+    TccIrOp op = rq->op;
+    int is_ret = (op == TCCIR_OP_RETURNVALUE || op == TCCIR_OP_RETURNVOID);
+    int is_implicit_ret = 0;
+    if (op == TCCIR_OP_JUMP || op == TCCIR_OP_JUMPIF)
+    {
+      IROperand d = tcc_ir_op_get_dest(ir, rq);
+      int t = (int)irop_get_imm64_ex(ir, d);
+      if (t >= n)
+        is_implicit_ret = 1;
+    }
+    if (!is_ret && !is_implicit_ret)
       continue;
     int ret_block = cfg->instr_to_block[i];
     if (read_block == ret_block)

@@ -1351,6 +1351,7 @@ struct TCCState
    * Set only during the end-of-TU late_reopt pass, when possibly_written
    * reflects the entire TU. */
   int ir_late_reopt_phase;
+  int ir_post_float_narrow;
 
   /* Inline-eval parameter overlay: during try_inline_const_eval, identifier
    * resolution substitutes these SValues when a token matches a param token.
@@ -2696,6 +2697,8 @@ ST_FUNC int tcc_gen_machine_try_strd_spill(int reg1, int32_t off1, int reg2, int
 ST_FUNC int tcc_gen_machine_try_ldrd_spill(int reg1, int32_t off1, int reg2, int32_t off2);
 ST_FUNC int tcc_gen_machine_try_ldrd_base(int reg1, int reg2, int base_reg, int32_t off);
 ST_FUNC int tcc_gen_machine_try_strd_base(int reg1, int reg2, int base_reg, int32_t off);
+ST_FUNC int tcc_gen_machine_try_strd_imm_spill(int64_t val1, int64_t val2, int32_t off1, int32_t off2);
+ST_FUNC int tcc_gen_machine_try_strd_imm_base(int64_t val1, int64_t val2, int base_reg, int32_t off);
 ST_FUNC void tcc_gen_machine_load_indexed_mop(MachineOperand dest, MachineOperand base, MachineOperand index,
                                               MachineOperand scale, TccIrOp op);
 ST_FUNC void tcc_gen_machine_store_indexed_mop(MachineOperand base, MachineOperand index, MachineOperand scale,
@@ -2778,6 +2781,8 @@ ST_FUNC int tcc_gen_machine_branch_opt_get_encoding(int ir_index); /* Returns 16
  * cannot be trusted). */
 ST_FUNC void tcc_gen_machine_mov_coalesce_reset(void);
 ST_FUNC void tcc_gen_machine_strldr_cache_reset(void);
+ST_FUNC void tcc_gen_machine_imm_cache_reset(void);
+ST_FUNC void tcc_gen_machine_imm_cache_invalidate_live(uint32_t live_mask);
 
 /* Trap instruction generation */
 ST_FUNC void tcc_gen_machine_trap_mop(void);
@@ -2797,6 +2802,9 @@ ST_FUNC void tcc_gen_machine_builtin_apply_mop(MachineOperand fn, MachineOperand
 
 /* Block copy from const data to stack (LDM/STM on ARM) */
 ST_FUNC void tcc_gen_machine_block_copy_mop(TCCIRState *ir, IROperand dest, IROperand src, int size);
+
+/* Block copy between spill slots using LDM/STM (peephole for consecutive LOAD+STORE pairs) */
+ST_FUNC void tcc_gen_machine_spill_block_copy(int32_t src_spill_off, int32_t dst_spill_off, int nwords);
 
 /* Conditional select: dest = (cond) ? then_val : else_val (ITE on ARM) */
 ST_FUNC void tcc_gen_machine_select_mop(MachineOperand then_val, MachineOperand else_val, MachineOperand dest,

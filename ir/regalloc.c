@@ -488,6 +488,13 @@ static int ra_fold_phi_const_chain(TCCIRState *ir)
             if (def_count[pos] < 3) def_count[pos]++;
           }
         }
+      } else if (op == TCCIR_OP_STORE || op == TCCIR_OP_STORE_INDEXED ||
+                 op == TCCIR_OP_STORE_POSTINC) {
+        int32_t v = irop_get_vreg(d);
+        if (v >= 0 && TCCIR_DECODE_VREG_TYPE(v) == TCCIR_VREG_TYPE_TEMP) {
+          int pos = TCCIR_DECODE_VREG_POSITION(v);
+          if (pos <= max_tmp) use_count[pos]++;
+        }
       }
     }
     if (irop_config[op].has_src1) {
@@ -782,6 +789,9 @@ static void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
           if (starts[idx] == INTERVAL_NOT_STARTED)
             starts[idx] = dest_is_use ? 0 : i;
           if (ends[idx] < (uint32_t)i) ends[idx] = i;
+          if (dest_is_use) {
+            if (uses[idx] <= 65535 - w) uses[idx] += w; else uses[idx] = 65535;
+          }
         }
       }
     }

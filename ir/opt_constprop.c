@@ -331,7 +331,7 @@ int tcc_ir_opt_const_var_prop(TCCIRState *ir)
   {
     if (var_info)
       tcc_free(var_info);
-    return 0;
+    goto neg_vreg_phase;
   }
 
   /* Count uses per VAR (any src1/src2 reference) so we can throttle
@@ -526,6 +526,130 @@ int tcc_ir_opt_const_var_prop(TCCIRState *ir)
   }
 
   tcc_free(var_info);
+
+neg_vreg_phase:
+  /* Phase 4: Propagate constants through negative-vreg temp locals.
+   * These are temporary stack slots (vregs -2..-16) used by the frontend for
+   * intermediate values in cast chains (e.g. int → long long).  They behave
+   * like single-def VARs but use a different encoding. */
+  {
+#define NEG_VREG_MAX 16
+    typedef struct
+    {
+      uint8_t is_constant;
+      uint8_t def_count;
+      int64_t value;
+      int btype;
+      int is_unsigned;
+    } NegVregInfo;
+    NegVregInfo nvi[NEG_VREG_MAX];
+    memset(nvi, 0, sizeof(nvi));
+    int has_neg = 0;
+
+    for (i = 0; i < n; i++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
+        continue;
+      IROperand dest = tcc_ir_op_get_dest(ir, q);
+      int32_t dest_vr = irop_get_vreg(dest);
+      if (dest_vr >= -1 || dest_vr < -(int)NEG_VREG_MAX)
+        continue;
+      int idx = (int)(-dest_vr - 1);
+      has_neg = 1;
+      nvi[idx].def_count++;
+      if (q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_STORE)
+      {
+        IROperand src1 = tcc_ir_op_get_src1(ir, q);
+        /* For 64-bit negative vregs, subsequent LOADs may read individual
+         * 32-bit halves (lo/hi) and we cannot tell which half a given LOAD
+         * extracts.  Only propagate when the value is zero (both halves are
+         * 0) or the type is 32-bit. */
+        if (irop_is_immediate(src1) && !src1.is_sym && nvi[idx].def_count == 1 &&
+            (irop_get_btype(src1) != IROP_BTYPE_INT64 || irop_get_imm64_ex(ir, src1) == 0))
+        {
+          nvi[idx].is_constant = 1;
+          nvi[idx].value = irop_get_imm64_ex(ir, src1);
+          nvi[idx].btype = irop_get_btype(src1);
+          nvi[idx].is_unsigned = src1.is_unsigned;
+        }
+      }
+      else
+      {
+        nvi[idx].is_constant = 0;
+      }
+    }
+
+    for (i = 0; i < NEG_VREG_MAX; i++)
+    {
+      if (nvi[i].def_count > 1)
+        nvi[i].is_constant = 0;
+    }
+
+    if (has_neg)
+    {
+      for (i = 0; i < n; i++)
+      {
+        IRQuadCompact *q = &ir->compact_instructions[i];
+        if (q->op == TCCIR_OP_NOP)
+          continue;
+        if (irop_config[q->op].has_src1)
+        {
+          IROperand src1 = tcc_ir_op_get_src1(ir, q);
+          int32_t vr = irop_get_vreg(src1);
+          if (vr < -1 && vr >= -(int)NEG_VREG_MAX)
+          {
+            int idx = (int)(-vr - 1);
+            if (nvi[idx].is_constant)
+            {
+              int64_t val = nvi[idx].value;
+              int btype = nvi[idx].btype;
+              IROperand new_src1;
+              if (val == (int32_t)val)
+                new_src1 = irop_make_imm32(-1, (int32_t)val, btype);
+              else
+              {
+                uint32_t pool_idx = tcc_ir_pool_add_i64(ir, val);
+                new_src1 = irop_make_i64(-1, pool_idx, btype);
+              }
+              new_src1.is_unsigned = nvi[idx].is_unsigned;
+              tcc_ir_set_src1(ir, i, new_src1);
+              if (q->op == TCCIR_OP_LOAD)
+                q->op = TCCIR_OP_ASSIGN;
+              changes++;
+            }
+          }
+        }
+        if (irop_config[q->op].has_src2)
+        {
+          IROperand src2 = tcc_ir_op_get_src2(ir, q);
+          int32_t vr = irop_get_vreg(src2);
+          if (vr < -1 && vr >= -(int)NEG_VREG_MAX)
+          {
+            int idx = (int)(-vr - 1);
+            if (nvi[idx].is_constant)
+            {
+              int64_t val = nvi[idx].value;
+              int btype = nvi[idx].btype;
+              IROperand new_src2;
+              if (val == (int32_t)val)
+                new_src2 = irop_make_imm32(-1, (int32_t)val, btype);
+              else
+              {
+                uint32_t pool_idx = tcc_ir_pool_add_i64(ir, val);
+                new_src2 = irop_make_i64(-1, pool_idx, btype);
+              }
+              new_src2.is_unsigned = nvi[idx].is_unsigned;
+              tcc_ir_set_src2(ir, i, new_src2);
+              changes++;
+            }
+          }
+        }
+      }
+    }
+#undef NEG_VREG_MAX
+  }
+
   return changes;
 }
 
@@ -593,8 +717,6 @@ int tcc_ir_opt_global_init_prop(TCCIRState *ir)
       /* Linkage / attribute gates. */
       if (sym->a.weak || sym->a.dllimport)
         continue;
-      if (sym->a.possibly_written)
-        continue;
 
       const int ttype = sym->type.t;
       if (ttype & VT_VLA)
@@ -602,10 +724,18 @@ int tcc_ir_opt_global_init_prop(TCCIRState *ir)
       if (ttype & VT_VOLATILE)
         continue;
 
-      /* Linkage gate: a non-static, non-const global may be written from
-       * another TU.  Const globals (any linkage) are safe — C forbids
-       * modifying a const object. */
-      const int is_const_q = (ttype & VT_CONSTANT) != 0;
+      int is_const_q = (ttype & VT_CONSTANT) != 0;
+      /* For array types, const qualifies the element type, not the
+       * array itself.  Check the pointed-to type for VT_CONSTANT. */
+      if (!is_const_q && (ttype & VT_ARRAY) && sym->type.ref)
+        is_const_q = (sym->type.ref->type.t & VT_CONSTANT) != 0;
+
+      /* For non-const globals, possibly_written means another function
+       * may have stored to this symbol.  For const-qualified globals the
+       * C standard forbids modification, so ignore the flag. */
+      if (!is_const_q && sym->a.possibly_written)
+        continue;
+
       if (!(ttype & VT_STATIC) && !is_const_q)
         continue;
 
@@ -2388,33 +2518,42 @@ int tcc_ir_opt_const_prop(TCCIRState *ir)
     changes++;
   }
 
-  /* Redundant AND elimination: AND #M + AND #M → single AND #M.
-   * Also: AND #M1 + AND #M2 where M2 is a superset of M1 → AND #M1.
-   * Common pattern from C casts: (uint8_t)x generates AND #255 twice. */
-  for (i = 0; i < n - 1; i++)
+  /* AND chain fold: AND #M1 + AND #M2 → AND #(M1 & M2) when first AND
+   * result is single-use.  Handles bitfield chains where multiple AND
+   * operations clear different bits of the same word.
+   * Looks up the def chain: for each AND, if its src1 was defined by
+   * another AND with an immediate mask, fold the masks together. */
+  for (i = 0; i < n; i++)
   {
-    IRQuadCompact *and1_q = &ir->compact_instructions[i];
-    IRQuadCompact *and2_q = &ir->compact_instructions[i + 1];
-    if (and1_q->op != TCCIR_OP_AND || and2_q->op != TCCIR_OP_AND)
+    IRQuadCompact *and2_q = &ir->compact_instructions[i];
+    if (and2_q->op != TCCIR_OP_AND)
+      continue;
+    IROperand and2_src1 = tcc_ir_op_get_src1(ir, and2_q);
+    IROperand and2_src2 = tcc_ir_op_get_src2(ir, and2_q);
+    if (and2_src1.is_lval || !irop_is_immediate(and2_src2))
+      continue;
+    int32_t src1_vr = irop_get_vreg(and2_src1);
+    if (src1_vr < 0)
+      continue;
+    int def_idx = tcc_ir_find_defining_instruction(ir, src1_vr, i);
+    if (def_idx < 0 || def_idx >= i)
+      continue;
+    IRQuadCompact *and1_q = &ir->compact_instructions[def_idx];
+    if (and1_q->op != TCCIR_OP_AND)
       continue;
     IROperand and1_src2 = tcc_ir_op_get_src2(ir, and1_q);
-    IROperand and2_src2 = tcc_ir_op_get_src2(ir, and2_q);
-    if (!irop_is_immediate(and1_src2) || !irop_is_immediate(and2_src2))
+    if (!irop_is_immediate(and1_src2))
+      continue;
+    if (!tcc_ir_vreg_has_single_use(ir, src1_vr, def_idx))
       continue;
     int64_t mask1 = irop_get_imm64_ex(ir, and1_src2);
     int64_t mask2 = irop_get_imm64_ex(ir, and2_src2);
-    /* Second AND is redundant if mask1 is a subset of mask2 (mask1 & mask2 == mask1) */
-    if ((mask1 & mask2) != mask1)
-      continue;
-    IROperand and1_dest = tcc_ir_op_get_dest(ir, and1_q);
-    IROperand and2_src1 = tcc_ir_op_get_src1(ir, and2_q);
-    if (irop_get_vreg(and1_dest) != irop_get_vreg(and2_src1))
-      continue;
-    if (!tcc_ir_vreg_has_single_use(ir, irop_get_vreg(and1_dest), i))
-      continue;
-    IROperand and2_dest = tcc_ir_op_get_dest(ir, and2_q);
-    tcc_ir_set_dest(ir, i, and2_dest);
-    and2_q->op = TCCIR_OP_NOP;
+    int64_t combined = mask1 & mask2;
+    IROperand and1_src1 = tcc_ir_op_get_src1(ir, and1_q);
+    tcc_ir_set_src1(ir, i, and1_src1);
+    IROperand new_mask = irop_make_imm32(-1, (int32_t)combined, irop_get_btype(and2_src2));
+    tcc_ir_op_set_src2(ir, and2_q, new_mask);
+    and1_q->op = TCCIR_OP_NOP;
     changes++;
   }
 
@@ -2845,6 +2984,7 @@ int tcc_ir_opt_const_prop(TCCIRState *ir)
   tcc_free(dc);
   tcc_free(var_info);
 
+  if (getenv("DUMP_CP_OUT")) { fprintf(stderr, "=== CONST_PROP OUT (changes=%d) ===\n", changes); tcc_ir_show(ir); }
   return changes;
 }
 
@@ -4489,16 +4629,19 @@ int tcc_ir_opt_value_tracking(TCCIRState *ir)
             sf_nargs = 1;
             sf_kind = 8;
           }
-          /* __aeabi_f2d and __aeabi_d2f are NOT folded here: the float_narrowing
-           * pass pattern-matches f2d → double-math → d2f and rewrites it to a
-           * single float-precision math call (e.g. floor → floorf).  Folding
-           * f2d/d2f to constants prevents narrowing from firing. */
-          else if (0 && strcmp(sf, "__aeabi_f2d") == 0)
+          /* __aeabi_f2d and __aeabi_d2f are normally NOT folded: the
+           * float_narrowing pass pattern-matches f2d → double-math → d2f
+           * and rewrites it to a single float-precision call.  Folding
+           * f2d/d2f to constants prevents narrowing from firing.
+           * After float_narrowing has run (ir_post_float_narrow), it's
+           * safe to fold — DSF can create new constant f2d arguments
+           * that need folding to enable downstream comparison folding. */
+          else if (tcc_state->ir_post_float_narrow && strcmp(sf, "__aeabi_f2d") == 0)
           {
             sf_nargs = 1;
             sf_kind = 9;
           }
-          else if (0 && strcmp(sf, "__aeabi_d2f") == 0)
+          else if (tcc_state->ir_post_float_narrow && strcmp(sf, "__aeabi_d2f") == 0)
           {
             sf_nargs = 1;
             sf_kind = 10;
@@ -5089,10 +5232,13 @@ int tcc_ir_opt_const_prop_tmp(TCCIRState *ir)
   int n = ir->next_instruction_index;
   int changes = 0;
   int max_tmp_pos = 0;
+  int max_var_pos = -1;
   int current_gen = 1; /* Generation counter, 0 means invalid */
   int i;
   IRQuadCompact *q;
   TmpConstInfo *tmp_info;
+  TmpConstInfo *var_info = NULL;
+  uint8_t *var_addrtaken = NULL;
   int *block_start_seen;
   int block_start_gen = 1;
   void *heap_alloc = NULL;
@@ -5100,21 +5246,29 @@ int tcc_ir_opt_const_prop_tmp(TCCIRState *ir)
   if (n == 0)
     return 0;
 
-  /* Find max TMP position */
+  /* Find max TMP and VAR positions */
   for (i = 0; i < n; i++)
   {
     q = &ir->compact_instructions[i];
     IROperand dest = tcc_ir_op_get_dest(ir, q);
     int32_t dest_vr = irop_get_vreg(dest);
-    if (irop_config[q->op].has_dest && TCCIR_DECODE_VREG_TYPE(dest_vr) == TCCIR_VREG_TYPE_TEMP)
+    if (!irop_config[q->op].has_dest)
+      continue;
+    if (TCCIR_DECODE_VREG_TYPE(dest_vr) == TCCIR_VREG_TYPE_TEMP)
     {
       const int pos = TCCIR_DECODE_VREG_POSITION(dest_vr);
       if (pos > max_tmp_pos)
         max_tmp_pos = pos;
     }
+    else if (TCCIR_DECODE_VREG_TYPE(dest_vr) == TCCIR_VREG_TYPE_VAR)
+    {
+      const int pos = TCCIR_DECODE_VREG_POSITION(dest_vr);
+      if (pos > max_var_pos)
+        max_var_pos = pos;
+    }
   }
 
-  if (max_tmp_pos == 0)
+  if (max_tmp_pos == 0 && max_var_pos < 0)
     return 0;
 
   /* Use stack buffers if possible */
@@ -5134,10 +5288,32 @@ int tcc_ir_opt_const_prop_tmp(TCCIRState *ir)
     block_start_seen = (int *)((char *)heap_alloc + tmp_size);
   }
 
+  /* Allocate VAR tracking arrays */
+  if (max_var_pos >= 0)
+  {
+    var_info = tcc_mallocz(sizeof(TmpConstInfo) * (max_var_pos + 1));
+    var_addrtaken = tcc_mallocz((max_var_pos + 8) / 8);
+    for (i = 0; i < n; i++)
+    {
+      q = &ir->compact_instructions[i];
+      if (q->op == TCCIR_OP_LEA)
+      {
+        IROperand lsrc = tcc_ir_op_get_src1(ir, q);
+        int32_t sv = irop_get_vreg(lsrc);
+        if (sv >= 0 && TCCIR_DECODE_VREG_TYPE(sv) == TCCIR_VREG_TYPE_VAR)
+        {
+          int vp = TCCIR_DECODE_VREG_POSITION(sv);
+          if (vp <= max_var_pos)
+            var_addrtaken[vp / 8] |= (1 << (vp % 8));
+        }
+      }
+    }
+  }
+
   /* Mark block starts (shared helper) */
   ir_opt_mark_block_starts(ir, block_start_seen, block_start_gen, n);
 
-  /* Single pass: track TMP constants and propagate */
+  /* Single pass: track TMP/VAR constants and propagate */
   for (i = 0; i < n; i++)
   {
     q = &ir->compact_instructions[i];
@@ -5184,26 +5360,44 @@ int tcc_ir_opt_const_prop_tmp(TCCIRState *ir)
       }
     }
 
-    /* Propagate TMP constants to src1.
+    /* Propagate TMP/VAR constants to src1.
      * Skip SWITCH_TABLE and IJUMP: their src1 (the index / target address)
      * must remain in a register — the ARM code generator cannot handle an
      * immediate operand there. */
-    if (irop_config[q->op].has_src1 && TCCIR_DECODE_VREG_TYPE(src1_vr) == TCCIR_VREG_TYPE_TEMP &&
-        q->op != TCCIR_OP_SWITCH_TABLE && q->op != TCCIR_OP_IJUMP)
+    if (irop_config[q->op].has_src1 && q->op != TCCIR_OP_SWITCH_TABLE && q->op != TCCIR_OP_IJUMP)
     {
-      const int pos = TCCIR_DECODE_VREG_POSITION(src1_vr);
-      if (pos <= max_tmp_pos && tmp_info[pos].gen == current_gen)
+      int do_prop = 0;
+      int64_t prop_val = 0;
+      if (TCCIR_DECODE_VREG_TYPE(src1_vr) == TCCIR_VREG_TYPE_TEMP)
+      {
+        const int pos = TCCIR_DECODE_VREG_POSITION(src1_vr);
+        if (pos <= max_tmp_pos && tmp_info[pos].gen == current_gen)
+        {
+          do_prop = 1;
+          prop_val = tmp_info[pos].value;
+        }
+      }
+      else if (max_var_pos >= 0 && TCCIR_DECODE_VREG_TYPE(src1_vr) == TCCIR_VREG_TYPE_VAR &&
+               !(src1.is_local && !src1.is_lval))
+      {
+        const int pos = TCCIR_DECODE_VREG_POSITION(src1_vr);
+        if (pos <= max_var_pos && var_info[pos].gen == current_gen)
+        {
+          do_prop = 1;
+          prop_val = var_info[pos].value;
+        }
+      }
+      if (do_prop)
       {
         int btype = irop_get_btype(src1);
         IROperand new_src1;
-        int64_t val = tmp_info[pos].value;
-        if (val == (int32_t)val)
+        if (prop_val == (int32_t)prop_val)
         {
-          new_src1 = irop_make_imm32(-1, (int32_t)val, btype);
+          new_src1 = irop_make_imm32(-1, (int32_t)prop_val, btype);
         }
         else
         {
-          uint32_t pool_idx = tcc_ir_pool_add_i64(ir, val);
+          uint32_t pool_idx = tcc_ir_pool_add_i64(ir, prop_val);
           new_src1 = irop_make_i64(-1, pool_idx, btype);
         }
         /* Preserve type flags but NOT memory-access flags.
@@ -5218,16 +5412,34 @@ int tcc_ir_opt_const_prop_tmp(TCCIRState *ir)
 
     IROperand src2 = tcc_ir_op_get_src2(ir, q);
     int32_t src2_vr = irop_get_vreg(src2);
-    /* Propagate TMP constants to src2 */
-    if (irop_config[q->op].has_src2 && TCCIR_DECODE_VREG_TYPE(src2_vr) == TCCIR_VREG_TYPE_TEMP)
+    /* Propagate TMP/VAR constants to src2 */
+    if (irop_config[q->op].has_src2)
     {
-      const int pos = TCCIR_DECODE_VREG_POSITION(src2_vr);
-      if (pos <= max_tmp_pos && tmp_info[pos].gen == current_gen)
+      int do_prop = 0;
+      int64_t prop_val = 0;
+      if (TCCIR_DECODE_VREG_TYPE(src2_vr) == TCCIR_VREG_TYPE_TEMP)
       {
-        LOG_IR_GEN("OPTIMIZE: TMP const propagate TMP:%d = %lld to src2 at i=%d", pos, (long long)tmp_info[pos].value,
-                   i);
+        const int pos = TCCIR_DECODE_VREG_POSITION(src2_vr);
+        if (pos <= max_tmp_pos && tmp_info[pos].gen == current_gen)
+        {
+          do_prop = 1;
+          prop_val = tmp_info[pos].value;
+        }
+      }
+      else if (max_var_pos >= 0 && TCCIR_DECODE_VREG_TYPE(src2_vr) == TCCIR_VREG_TYPE_VAR)
+      {
+        const int pos = TCCIR_DECODE_VREG_POSITION(src2_vr);
+        if (pos <= max_var_pos && var_info[pos].gen == current_gen)
+        {
+          do_prop = 1;
+          prop_val = var_info[pos].value;
+        }
+      }
+      if (do_prop)
+      {
+        LOG_IR_GEN("OPTIMIZE: const propagate vreg %d = %lld to src2 at i=%d", src2_vr, (long long)prop_val, i);
         int btype = irop_get_btype(src2);
-        int64_t val = tmp_info[pos].value;
+        int64_t val = prop_val;
         /* When propagating a narrow constant into a wider bitwise op,
          * widen it to INT64 with zero-extension so the code generator
          * doesn't sign-extend the immediate into the upper register. */
@@ -5574,8 +5786,43 @@ int tcc_ir_opt_const_prop_tmp(TCCIRState *ir)
         tmp_info[pos].value = irop_get_imm64_ex(ir, cur_src1);
       }
     }
+
+    /* Track VAR <- constant assignments within basic blocks.
+     * Unlike single-def const_var_prop, this handles multi-def VARs by
+     * tracking the most recent constant value and invalidating on
+     * non-constant redefinitions. */
+    if (max_var_pos >= 0 && irop_config[q->op].has_dest &&
+        TCCIR_DECODE_VREG_TYPE(dest_vr) == TCCIR_VREG_TYPE_VAR)
+    {
+      const int pos = TCCIR_DECODE_VREG_POSITION(dest_vr);
+      if (pos <= max_var_pos && !(var_addrtaken[pos / 8] & (1 << (pos % 8))))
+      {
+        if ((q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_STORE) && !dest.is_lval)
+        {
+          IROperand cur_src1 = tcc_ir_op_get_src1(ir, q);
+          if (irop_is_immediate(cur_src1) && !cur_src1.is_sym)
+          {
+            var_info[pos].gen = current_gen;
+            var_info[pos].value = irop_get_imm64_ex(ir, cur_src1);
+          }
+          else
+          {
+            var_info[pos].gen = 0;
+          }
+        }
+        else
+        {
+          var_info[pos].gen = 0;
+        }
+      }
+    }
+
   }
 
+  if (var_info)
+    tcc_free(var_info);
+  if (var_addrtaken)
+    tcc_free(var_addrtaken);
   if (heap_alloc)
     tcc_free(heap_alloc);
 
@@ -5850,6 +6097,25 @@ int tcc_ir_opt_cmp_expr_fold(TCCIRState *ir)
         if (a_ref && b_ref && a_ref->sym == b_ref->sym && a_ref->addend == b_ref->addend)
           is_equal = 1;
       }
+      /* Same-symbol deref read: CMP *sym, *sym where both operands load
+       * from the same non-volatile global.  The reads see the same value,
+       * so the comparison result is known (x==x, x>=x, etc.).  Safe for
+       * integer types; skip floats (NaN != NaN). */
+      if (!is_equal && src1.is_sym && src2.is_sym && src1.is_lval && src2.is_lval)
+      {
+        IRPoolSymref *a_ref = irop_get_symref_ex(ir, src1);
+        IRPoolSymref *b_ref = irop_get_symref_ex(ir, src2);
+        if (a_ref && b_ref && a_ref->sym == b_ref->sym &&
+            a_ref->addend == b_ref->addend)
+        {
+          Sym *sym = a_ref->sym;
+          int ttype = sym->type.t;
+          int btype = ttype & VT_BTYPE;
+          if (!(ttype & VT_VOLATILE) &&
+              btype != VT_FLOAT && btype != VT_DOUBLE && btype != VT_LDOUBLE)
+            is_equal = 1;
+        }
+      }
       if (!is_equal)
         continue;
     }
@@ -6041,6 +6307,22 @@ int tcc_ir_opt_cmp_expr_fold(TCCIRState *ir)
       changes++;
       folded = 1;
     }
+    else if (next->op == TCCIR_OP_SETIF)
+    {
+      IROperand cond = tcc_ir_op_get_src1(ir, next);
+      int tok = (int)irop_get_imm64_ex(ir, cond);
+      int result = evaluate_compare_condition(0, 0, tok);
+      if (result < 0)
+        continue;
+      IROperand setif_dest = tcc_ir_op_get_dest(ir, next);
+      q->op = TCCIR_OP_NOP;
+      next->op = TCCIR_OP_ASSIGN;
+      tcc_ir_set_dest(ir, i + 1, setif_dest);
+      tcc_ir_set_src1(ir, i + 1, irop_make_imm32(-1, result, irop_get_btype(setif_dest)));
+      tcc_ir_set_src2(ir, i + 1, IROP_NONE);
+      changes++;
+      folded = 1;
+    }
 
     if (folded)
       ir_opt_setif_chain_cleanup(ir, def1, def2, vr1, vr2);
@@ -6050,6 +6332,54 @@ int tcc_ir_opt_cmp_expr_fold(TCCIRState *ir)
 
   if (changes)
     changes += tcc_ir_opt_dce(ir);
+
+  return changes;
+}
+
+/* Self-expression arithmetic identity fold: x/x→1, x%x→0 for integer
+ * expressions where both operands provably read the same non-volatile
+ * global value.  Safe because x/x is UB when x==0, so the compiler may
+ * assume x!=0. */
+int tcc_ir_opt_self_arith_fold(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  int changes = 0;
+
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_DIV && q->op != TCCIR_OP_UDIV &&
+        q->op != TCCIR_OP_IMOD && q->op != TCCIR_OP_UMOD)
+      continue;
+
+    IROperand src1 = tcc_ir_op_get_src1(ir, q);
+    IROperand src2 = tcc_ir_op_get_src2(ir, q);
+
+    if (!src1.is_sym || !src1.is_lval || !src2.is_sym || !src2.is_lval)
+      continue;
+
+    IRPoolSymref *a_ref = irop_get_symref_ex(ir, src1);
+    IRPoolSymref *b_ref = irop_get_symref_ex(ir, src2);
+    if (!a_ref || !b_ref || a_ref->sym != b_ref->sym ||
+        a_ref->addend != b_ref->addend)
+      continue;
+
+    Sym *sym = a_ref->sym;
+    int ttype = sym->type.t;
+    int btype = ttype & VT_BTYPE;
+    if ((ttype & VT_VOLATILE) ||
+        btype == VT_FLOAT || btype == VT_DOUBLE || btype == VT_LDOUBLE)
+      continue;
+
+    IROperand dest = tcc_ir_op_get_dest(ir, q);
+    int is_div = (q->op == TCCIR_OP_DIV || q->op == TCCIR_OP_UDIV);
+    int fold_val = is_div ? 1 : 0;
+    q->op = TCCIR_OP_ASSIGN;
+    tcc_ir_set_dest(ir, i, dest);
+    tcc_ir_set_src1(ir, i, irop_make_imm32(-1, fold_val, irop_get_btype(dest)));
+    tcc_ir_set_src2(ir, i, IROP_NONE);
+    changes++;
+  }
 
   return changes;
 }
@@ -6428,6 +6758,79 @@ static int ir_resolve_stack_addr_value(TCCIRState *ir, IROperand op, int at_idx,
   return 1;
 }
 
+/* Presence map of vregs that have at least one "def" as seen by the backward
+ * walk in ir_resolve_stack_addr_value_ex (any has_dest op other than
+ * STORE/STORE_INDEXED/STORE_POSTINC/FUNCPARAMVAL writing that vreg).  Built
+ * once per driving pass so the resolver can answer "this vreg has no def — the
+ * walk would scan to the start and return 0" in O(1).  Indexed by
+ * pos*3 + (type-1); a vreg outside the map's range is treated as absent.
+ * Returning early only for the no-def case keeps the walk's merge-crossing
+ * semantics intact (a no-def walk can only ever return 0). */
+static uint8_t *sav_def_present;
+static int sav_def_present_maxpos = -1;
+
+static int sav_is_def_op(int op)
+{
+  return op != TCCIR_OP_STORE && op != TCCIR_OP_STORE_INDEXED &&
+         op != TCCIR_OP_STORE_POSTINC && op != TCCIR_OP_FUNCPARAMVAL;
+}
+
+static void sav_build_def_map(TCCIRState *ir)
+{
+  int n = ir ? ir->next_instruction_index : 0;
+  sav_def_present = NULL;
+  sav_def_present_maxpos = -1;
+  int maxpos = -1;
+  for (int j = 0; j < n; j++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[j];
+    if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest || !sav_is_def_op(q->op))
+      continue;
+    int32_t dvr = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
+    if (dvr < 0)
+      continue;
+    int pos = TCCIR_DECODE_VREG_POSITION(dvr);
+    if (pos > maxpos)
+      maxpos = pos;
+  }
+  if (maxpos < 0)
+    return;
+  sav_def_present = (uint8_t *)tcc_mallocz((size_t)(maxpos + 1) * 3);
+  sav_def_present_maxpos = maxpos;
+  for (int j = 0; j < n; j++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[j];
+    if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest || !sav_is_def_op(q->op))
+      continue;
+    int32_t dvr = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
+    if (dvr < 0)
+      continue;
+    int type = TCCIR_DECODE_VREG_TYPE(dvr);
+    int pos = TCCIR_DECODE_VREG_POSITION(dvr);
+    if (type >= 1 && type <= 3)
+      sav_def_present[pos * 3 + (type - 1)] = 1;
+  }
+}
+
+static void sav_free_def_map(void)
+{
+  tcc_free(sav_def_present);
+  sav_def_present = NULL;
+  sav_def_present_maxpos = -1;
+}
+
+/* Returns 1 if vr definitely has no qualifying def (walk would return 0). */
+static int sav_vreg_has_no_def(int32_t vr)
+{
+  if (!sav_def_present)
+    return 0; /* map not built — be safe, let the walk run */
+  int type = TCCIR_DECODE_VREG_TYPE(vr);
+  int pos = TCCIR_DECODE_VREG_POSITION(vr);
+  if (type < 1 || type > 3 || pos > sav_def_present_maxpos)
+    return 1; /* outside any recorded def */
+  return sav_def_present[pos * 3 + (type - 1)] == 0;
+}
+
 static int ir_resolve_stack_addr_value_ex(TCCIRState *ir, IROperand op, int at_idx,
                                           StackAddrValue *out, int depth)
 {
@@ -6444,6 +6847,11 @@ static int ir_resolve_stack_addr_value_ex(TCCIRState *ir, IROperand op, int at_i
 
   int32_t vr = irop_get_vreg(op);
   if (vr < 0)
+    return 0;
+
+  /* Fast reject: a vreg with no def anywhere can only make the walk below
+   * scan to the start and return 0 — skip the scan. */
+  if (sav_vreg_has_no_def(vr))
     return 0;
 
   int saw_merge_at = at_idx;
@@ -6521,6 +6929,8 @@ int tcc_ir_opt_stack_addr_simplify(TCCIRState *ir)
   if (ir_has_backward_control_flow(ir))
     return 0;
 
+  sav_build_def_map(ir);
+
   for (int i = 0; i < n; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
@@ -6590,6 +7000,7 @@ int tcc_ir_opt_stack_addr_simplify(TCCIRState *ir)
     }
   }
 
+  sav_free_def_map();
   return changes;
 }
 
@@ -6613,6 +7024,8 @@ int tcc_ir_opt_cmp_stack_addr_fold(TCCIRState *ir)
     if (ir->compact_instructions[i].op == TCCIR_OP_IJUMP)
       return 0;
   }
+
+  sav_build_def_map(ir);
 
   for (int i = 0; i < n - 1; i++)
   {
@@ -6672,12 +7085,175 @@ int tcc_ir_opt_cmp_stack_addr_fold(TCCIRState *ir)
       changes++;
     }
   }
+  sav_free_def_map();
   return changes;
 }
 
 int tcc_ir_opt_cmp_stack_addr_fold_ex(IROptCtx *ctx) { return tcc_ir_opt_cmp_stack_addr_fold(ctx->ir); }
 
 int tcc_ir_opt_var_self_add_chain_fold_ex(IROptCtx *ctx) { return tcc_ir_opt_var_self_add_chain_fold(ctx->ir); }
+
+/* Single-Value Temp Propagation
+ *
+ * If ALL definitions of a TEMP are ASSIGN/LOAD of the same immediate
+ * constant, replace every use of that TEMP with the constant.  This
+ * handles phi-like merges where both arms assign the same value
+ * (e.g. after VRP folds a conditional set). */
+int tcc_ir_opt_single_value_tmp(TCCIRState *ir)
+{
+#define SVT_MAX_TEMPS 128
+  int n = ir->next_instruction_index;
+  if (n < 2)
+    return 0;
+
+  int max_tmp = -1;
+  for (int i = 0; i < n; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
+      continue;
+    IROperand d = tcc_ir_op_get_dest(ir, q);
+    int32_t dvr = irop_get_vreg(d);
+    if (dvr >= 0 && TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_TEMP) {
+      int pos = TCCIR_DECODE_VREG_POSITION(dvr);
+      if (pos > max_tmp)
+        max_tmp = pos;
+    }
+  }
+  if (max_tmp < 0 || max_tmp >= SVT_MAX_TEMPS)
+    return 0;
+
+  int count = max_tmp + 1;
+  uint8_t state[SVT_MAX_TEMPS];
+  int32_t vals[SVT_MAX_TEMPS];
+  memset(state, 0, count);
+
+  for (int i = 0; i < n; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
+      continue;
+    IROperand d = tcc_ir_op_get_dest(ir, q);
+    int32_t dvr = irop_get_vreg(d);
+    if (dvr < 0 || TCCIR_DECODE_VREG_TYPE(dvr) != TCCIR_VREG_TYPE_TEMP)
+      continue;
+    int pos = TCCIR_DECODE_VREG_POSITION(dvr);
+    if (pos >= count) continue;
+
+    if ((q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_LOAD) &&
+        state[pos] != 2) {
+      IROperand s = tcc_ir_op_get_src1(ir, q);
+      if (irop_is_immediate(s) && !s.is_lval &&
+          irop_get_btype(s) == IROP_BTYPE_INT32) {
+        int32_t v = (int32_t)irop_get_imm64_ex(ir, s);
+        if (state[pos] == 0) {
+          state[pos] = 1;
+          vals[pos] = v;
+        } else if (vals[pos] != v) {
+          state[pos] = 2;
+        }
+        continue;
+      }
+    }
+    state[pos] = 2;
+  }
+
+  int changes = 0;
+  for (int i = 0; i < n; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    if (q->op != TCCIR_OP_RETURNVALUE)
+      continue;
+    for (int k = 0; k < 2; k++) {
+      IROperand op = k == 0 ? tcc_ir_op_get_src1(ir, q)
+                            : tcc_ir_op_get_src2(ir, q);
+      int32_t vr = irop_get_vreg(op);
+      if (vr < 0 || op.is_lval)
+        continue;
+      if (TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
+        continue;
+      int pos = TCCIR_DECODE_VREG_POSITION(vr);
+      if (pos >= count || state[pos] != 1)
+        continue;
+      IROperand imm = irop_make_imm32(-1, vals[pos], IROP_BTYPE_INT32);
+      if (k == 0)
+        tcc_ir_set_src1(ir, i, imm);
+      else
+        tcc_ir_set_src2(ir, i, imm);
+      changes++;
+    }
+  }
+
+  if (changes) {
+    for (int i = 0; i < n; i++) {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
+        continue;
+      if (q->op != TCCIR_OP_ASSIGN && q->op != TCCIR_OP_LOAD)
+        continue;
+      IROperand d = tcc_ir_op_get_dest(ir, q);
+      int32_t dvr = irop_get_vreg(d);
+      if (dvr < 0 || TCCIR_DECODE_VREG_TYPE(dvr) != TCCIR_VREG_TYPE_TEMP)
+        continue;
+      int pos = TCCIR_DECODE_VREG_POSITION(dvr);
+      if (pos < count && state[pos] == 1) {
+        q->op = TCCIR_OP_NOP;
+        changes++;
+      }
+    }
+    changes += tcc_ir_opt_dce(ir);
+  }
+
+  if (changes) {
+    n = ir->next_instruction_index;
+    int64_t ret_val = 0;
+    int ret_btype = 0;
+    int ret_idx = -1;
+    int all_same_ret = 1;
+    int has_side_effect = 0;
+    for (int i = 0; i < n && all_same_ret && !has_side_effect; i++) {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      switch (q->op) {
+      case TCCIR_OP_RETURNVALUE: {
+        IROperand s = tcc_ir_op_get_src1(ir, q);
+        if (!irop_is_immediate(s)) { all_same_ret = 0; break; }
+        int64_t v = irop_get_imm64_ex(ir, s);
+        if (ret_idx < 0) {
+          ret_val = v; ret_btype = irop_get_btype(s); ret_idx = i;
+        } else if (v != ret_val) { all_same_ret = 0; }
+        break;
+      }
+      case TCCIR_OP_STORE: case TCCIR_OP_STORE_INDEXED:
+      case TCCIR_OP_FUNCCALLVAL: case TCCIR_OP_FUNCCALLVOID:
+      case TCCIR_OP_VLA_ALLOC: case TCCIR_OP_VLA_SP_SAVE:
+      case TCCIR_OP_VLA_SP_RESTORE: case TCCIR_OP_TRAP:
+      case TCCIR_OP_RETURNVOID:
+        has_side_effect = 1; break;
+      default: break;
+      }
+    }
+    if (all_same_ret && !has_side_effect && ret_idx >= 0) {
+      for (int i = 0; i < n; i++) {
+        IRQuadCompact *q = &ir->compact_instructions[i];
+        if (q->op == TCCIR_OP_NOP || q->op == TCCIR_OP_RETURNVALUE)
+          continue;
+        q->op = TCCIR_OP_NOP;
+        changes++;
+      }
+      if (ret_idx > 0) {
+        ir->compact_instructions[0].op = TCCIR_OP_RETURNVALUE;
+        IROperand rv = irop_make_imm32(-1, (int32_t)ret_val, ret_btype);
+        tcc_ir_set_src1(ir, 0, rv);
+        ir->compact_instructions[ret_idx].op = TCCIR_OP_NOP;
+        changes++;
+      }
+      changes += tcc_ir_opt_dce(ir);
+    }
+  }
+  return changes;
+#undef SVT_MAX_TEMPS
+}
+
+int tcc_ir_opt_single_value_tmp_ex(IROptCtx *ctx) { return tcc_ir_opt_single_value_tmp(ctx->ir); }
 
 int tcc_ir_opt_const_prop_ex(IROptCtx *ctx) { return tcc_ir_opt_const_prop(ctx->ir); }
 int tcc_ir_opt_const_prop_tmp_ex(IROptCtx *ctx) { return tcc_ir_opt_const_prop_tmp(ctx->ir); }
@@ -6687,6 +7263,7 @@ int tcc_ir_opt_symref_const_prop_ex(IROptCtx *ctx) { return tcc_ir_opt_symref_co
 int tcc_ir_opt_value_tracking_ex(IROptCtx *ctx) { return tcc_ir_opt_value_tracking(ctx->ir); }
 int tcc_ir_opt_add_reassoc_ex(IROptCtx *ctx) { return tcc_ir_opt_add_reassoc(ctx->ir); }
 int tcc_ir_opt_cmp_expr_fold_ex(IROptCtx *ctx) { return tcc_ir_opt_cmp_expr_fold(ctx->ir); }
+int tcc_ir_opt_self_arith_fold_ex(IROptCtx *ctx) { return tcc_ir_opt_self_arith_fold(ctx->ir); }
 int tcc_ir_opt_cmp_const_offset_fold_ex(IROptCtx *ctx) { return tcc_ir_opt_cmp_const_offset_fold(ctx->ir); }
 int tcc_ir_opt_const_string_calls_ex(IROptCtx *ctx) { return tcc_ir_opt_const_string_calls(ctx->ir); }
 int tcc_ir_opt_self_copy_elim_ex(IROptCtx *ctx) { return tcc_ir_opt_self_copy_elim(ctx->ir); }

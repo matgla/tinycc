@@ -563,6 +563,9 @@ int tcc_ir_is_pure_aeabi(const char *name)
       strcmp(name, "__aeabi_ul2d") == 0 || strcmp(name, "__aeabi_ul2f") == 0 || strcmp(name, "__aeabi_d2lz") == 0 ||
       strcmp(name, "__aeabi_d2ulz") == 0 || strcmp(name, "__aeabi_f2lz") == 0 || strcmp(name, "__aeabi_f2ulz") == 0)
     return 1;
+  /* Byte swap helpers */
+  if (strcmp(name, "__bswapsi2") == 0 || strcmp(name, "__bswapdi3") == 0)
+    return 1;
   return 0;
 }
 

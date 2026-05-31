@@ -281,7 +281,10 @@ static int ot_check_mov_reg(uint32_t rd, uint32_t rm, thumb_flags_behaviour flag
 static int ot_check_ldr_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw, thumb_enforce_encoding enc);
 static int ot_check_str_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw, thumb_enforce_encoding enc);
 static void mov_equiv_reset_all(void);
+static void imm_cache_reset_all(void);
+static void imm_cache_invalidate_reg(int reg);
 ST_FUNC void tcc_gen_machine_strldr_cache_reset(void);
+ST_FUNC void tcc_gen_machine_imm_cache_reset(void);
 static void thumb_require_materialized_reg(const char *ctx, const char *operand, int reg);
 static bool thumb_is_hw_reg(int reg);
 static int get_struct_base_addr_mop(const MachineOperand *mop, int default_reg);
@@ -1248,6 +1251,7 @@ ST_FUNC void tcc_gen_machine_dry_run_start(void)
   thumb_gen_state.cached_global_reg = PREG_NONE;
   thumb_gen_state.function_argument_count = 0;
   /* call_sites_by_id - don't modify, just track that we saved it */
+  imm_cache_reset_all();
 }
 
 ST_FUNC void tcc_gen_machine_dry_run_end(void)
@@ -1255,6 +1259,7 @@ ST_FUNC void tcc_gen_machine_dry_run_end(void)
   dry_run_state.active = 0;
   /* Restore thumb_gen_state after dry-run */
   thumb_gen_state_snapshot_restore(&dry_run_snapshot);
+  imm_cache_reset_all();
   /* Clear the literal pool hash table so that stale dry-run indices
    * don't cause real-pass entries to be misidentified as shared. */
   literal_pool_hash_clear(&literal_pool_hash);
@@ -1507,6 +1512,8 @@ no_free_reg:
 /* Restore a scratch register if it was saved */
 static void restore_scratch_reg(ScratchRegAlloc *alloc)
 {
+  if (alloc->saved)
+    imm_cache_invalidate_reg(alloc->reg);
   /* Dry run: don't emit pop, just update tracking */
   if (dry_run_state.active)
   {
@@ -1825,6 +1832,25 @@ static uint8_t mov_equiv[16];
  * may not be written", not as guaranteed assignments. */
 static int mov_equiv_it_pending;
 
+/* Immediate-value cache: tracks the last pure-integer constant loaded into
+ * each register by tcc_machine_load_constant (no symbol involved).  Persists
+ * across IR instruction boundaries so consecutive STORE instructions that
+ * materialise the same constant can skip the redundant MOV.  Reset at jump
+ * targets and function calls. */
+static struct { int64_t value; uint8_t valid; } imm_cache[16];
+
+static void imm_cache_reset_all(void)
+{
+  for (int i = 0; i < 16; i++)
+    imm_cache[i].valid = 0;
+}
+
+static void imm_cache_invalidate_reg(int reg)
+{
+  if (reg >= 0 && reg < 16)
+    imm_cache[reg].valid = 0;
+}
+
 static void mov_equiv_reset_all(void)
 {
   for (int i = 0; i < 16; i++)
@@ -1981,6 +2007,19 @@ ST_FUNC void tcc_gen_machine_strldr_cache_reset(void)
   strldr_cache_count = 0;
 }
 
+ST_FUNC void tcc_gen_machine_imm_cache_reset(void)
+{
+  imm_cache_reset_all();
+}
+
+ST_FUNC void tcc_gen_machine_imm_cache_invalidate_live(uint32_t live_mask)
+{
+  for (int i = 0; i < 16; i++) {
+    if (live_mask & (1u << i))
+      imm_cache[i].valid = 0;
+  }
+}
+
 /* Invalidate entries where the given register is either the stored value
  * (Rt) or the base register (Rn).  Called when a subsequent instruction
  * writes to that register. */
@@ -2071,16 +2110,38 @@ static int decode_str_ldr_imm(thumb_opcode op, int *is_str_out, int *rt_out, int
       *puw_out = 6;
       return 1;
     }
+    /* STRB/LDRB imm5: 0111 0xxx (STR) / 0111 1xxx (LDR). */
+    if ((hw & 0xF000) == 0x7000)
+    {
+      *is_str_out = !((hw >> 11) & 1);
+      *rt_out = hw & 0x7;
+      *rn_out = (hw >> 3) & 0x7;
+      *imm_out = (hw >> 6) & 0x1F;
+      *puw_out = 6;
+      return 1;
+    }
+    /* STRH/LDRH imm5: 1000 0xxx (STR) / 1000 1xxx (LDR). */
+    if ((hw & 0xF000) == 0x8000)
+    {
+      *is_str_out = !((hw >> 11) & 1);
+      *rt_out = hw & 0x7;
+      *rn_out = (hw >> 3) & 0x7;
+      *imm_out = ((hw >> 6) & 0x1F) << 1;
+      *puw_out = 6;
+      return 1;
+    }
     return 0;
   }
   if (op.size == 4)
   {
     uint16_t hi = (uint16_t)((op.opcode >> 16) & 0xFFFF);
     uint16_t lo = (uint16_t)(op.opcode & 0xFFFF);
-    /* T3: STR 0xF8Cx, LDR 0xF8Dx (imm12, puw=6).  Exclude PC-relative. */
-    if ((hi & 0xFFF0) == 0xF8C0 || (hi & 0xFFF0) == 0xF8D0)
+    /* T3: STR/LDR variants with imm12 (byte/half/word): hi[22:21]=size,
+     * hi[20]=L.  0xF88x=STRB.W, 0xF89x=LDRB.W, 0xF8Ax=STRH.W,
+     * 0xF8Bx=LDRH.W, 0xF8Cx=STR.W, 0xF8Dx=LDR.W. */
+    if ((hi & 0xFF80) == 0xF880)
     {
-      int is_ldr = ((hi & 0xFFF0) == 0xF8D0);
+      int is_ldr = (hi >> 4) & 1;
       int rn = hi & 0xF;
       if (rn == 0xF)
         return 0; /* PC-relative literal load; skip. */
@@ -2753,6 +2814,7 @@ int ot(thumb_opcode op)
       {
         mov_equiv_invalidate_reg(mv_rd);
         strldr_cache_invalidate_reg(mv_rd);
+        imm_cache_invalidate_reg(mv_rd);
       }
       else if (thumb_op_is_pure_flag_setter(op))
       {
@@ -2765,11 +2827,13 @@ int ot(thumb_opcode op)
         {
           mov_equiv_invalidate_reg(dest);
           strldr_cache_invalidate_reg(dest);
+          imm_cache_invalidate_reg(dest);
         }
         else
         {
           mov_equiv_reset_all();
           tcc_gen_machine_strldr_cache_reset();
+          imm_cache_reset_all();
         }
       }
       mov_equiv_it_pending--;
@@ -2803,12 +2867,14 @@ int ot(thumb_opcode op)
              * is actually emitting and genuinely clobbers Rt. */
             mov_equiv_invalidate_reg(sl_rt);
             strldr_cache_invalidate_reg(sl_rt);
+            imm_cache_invalidate_reg(sl_rt);
           }
         }
         else if (decode_mov_reg_plain(op, &mv_rd, &mv_rm))
         {
           mov_equiv_record_mov(mv_rd, mv_rm);
           strldr_cache_invalidate_reg(mv_rd);
+          imm_cache_invalidate_reg(mv_rd);
         }
         else if (op.size == 4 &&
                  (((op.opcode >> 16) & 0xFE40) == 0xE840))
@@ -2833,6 +2899,8 @@ int ot(thumb_opcode op)
             mov_equiv_invalidate_reg(rt2);
             strldr_cache_invalidate_reg(rt);
             strldr_cache_invalidate_reg(rt2);
+            imm_cache_invalidate_reg(rt);
+            imm_cache_invalidate_reg(rt2);
           }
           /* STRD: no GPR write, leave the mov_equiv cache alone. */
         }
@@ -2848,11 +2916,13 @@ int ot(thumb_opcode op)
           {
             mov_equiv_invalidate_reg(dest);
             strldr_cache_invalidate_reg(dest);
+            imm_cache_invalidate_reg(dest);
           }
           else
           {
             mov_equiv_reset_all();
             tcc_gen_machine_strldr_cache_reset();
+            imm_cache_reset_all();
           }
         }
       }
@@ -2862,6 +2932,7 @@ int ot(thumb_opcode op)
   {
     mov_equiv_reset_all();
     tcc_gen_machine_strldr_cache_reset();
+    imm_cache_reset_all();
   }
 
   /* Dry run: don't emit actual opcodes, but still track code size and
@@ -3420,8 +3491,6 @@ static int try_strd_pair(int lo_reg, int hi_reg, int base, int abs_off, int sign
     return 0;
   if (hi_reg < 0 || hi_reg > R_LR || hi_reg == R_SP)
     return 0;
-  if (lo_reg == hi_reg)
-    return 0;
   const uint32_t puw = sign ? 4u : 6u;
   ot_check(th_strd_imm((uint32_t)lo_reg, (uint32_t)hi_reg, (uint32_t)base, abs_off, puw));
   return 1;
@@ -3501,6 +3570,67 @@ ST_FUNC int tcc_gen_machine_try_strd_base(int reg1, int reg2, int base_reg, int3
   int sign = (off < 0);
   int abs_off = sign ? -off : off;
   return try_strd_pair(reg1, reg2, base_reg, abs_off, sign);
+}
+
+ST_FUNC int tcc_gen_machine_try_strd_imm_spill(int64_t val1, int64_t val2,
+                                               int32_t off1, int32_t off2)
+{
+  if (off1 + 4 != off2)
+    return 0;
+  const int base_reg = tcc_state->need_frame_pointer ? R_FP : R_SP;
+  int adj = fp_adjust_local_offset(off1, 0);
+  int sign = (adj < 0);
+  int abs_off = sign ? -adj : adj;
+  if ((abs_off & 3) != 0 || abs_off > 1020)
+    return 0;
+
+  MachineCodegenContext ctx = {0};
+  MachineOperand op1 = {.kind = MACH_OP_IMM, .u.imm.val = val1};
+  int r1 = mach_ensure_in_reg(&ctx, &op1, 0);
+  int r2;
+  if (val1 == val2) {
+    r2 = r1;
+  } else {
+    MachineOperand op2 = {.kind = MACH_OP_IMM, .u.imm.val = val2};
+    r2 = mach_ensure_in_reg(&ctx, &op2, (1u << (uint32_t)r1));
+  }
+  if (r1 == R_SP || r2 == R_SP) {
+    mach_release_all(&ctx);
+    return 0;
+  }
+  const uint32_t puw = sign ? 4u : 6u;
+  ot_check(th_strd_imm((uint32_t)r1, (uint32_t)r2, (uint32_t)base_reg, abs_off, puw));
+  mach_release_all(&ctx);
+  return 1;
+}
+
+ST_FUNC int tcc_gen_machine_try_strd_imm_base(int64_t val1, int64_t val2,
+                                              int base_reg, int32_t off)
+{
+  int sign = (off < 0);
+  int abs_off = sign ? -off : off;
+  if ((abs_off & 3) != 0 || abs_off > 1020)
+    return 0;
+
+  uint32_t excl = (1u << (uint32_t)base_reg);
+  MachineCodegenContext ctx = {0};
+  MachineOperand op1 = {.kind = MACH_OP_IMM, .u.imm.val = val1};
+  int r1 = mach_ensure_in_reg(&ctx, &op1, excl);
+  int r2;
+  if (val1 == val2) {
+    r2 = r1;
+  } else {
+    MachineOperand op2 = {.kind = MACH_OP_IMM, .u.imm.val = val2};
+    r2 = mach_ensure_in_reg(&ctx, &op2, excl | (1u << (uint32_t)r1));
+  }
+  if (r1 == R_SP || r2 == R_SP) {
+    mach_release_all(&ctx);
+    return 0;
+  }
+  const uint32_t puw = sign ? 4u : 6u;
+  ot_check(th_strd_imm((uint32_t)r1, (uint32_t)r2, (uint32_t)base_reg, abs_off, puw));
+  mach_release_all(&ctx);
+  return 1;
 }
 
 ST_FUNC int tcc_machine_can_encode_stack_offset_for_reg(int frame_offset, int dest_reg)
@@ -4179,6 +4309,10 @@ ST_FUNC void tcc_machine_load_constant(int dest_reg, int dest_reg_high, int64_t 
     /* Invalid or missing sym - fall through to treat as plain constant */
   }
 
+  if (!sym && !is_64bit && dest_reg >= 0 && dest_reg < 16 &&
+      imm_cache[dest_reg].valid && imm_cache[dest_reg].value == value)
+    return;
+
   if (is_64bit)
   {
     const uint32_t lo = (uint32_t)(value & 0xFFFFFFFF);
@@ -4204,6 +4338,12 @@ ST_FUNC void tcc_machine_load_constant(int dest_reg, int dest_reg_high, int64_t 
   /* 32-bit constant */
   if (!ot(th_generic_mov_imm(dest_reg, (uint32_t)value)))
     load_full_const(dest_reg, PREG_NONE, LFC_SPLIT(value));
+
+  if (!sym && !is_64bit && dest_reg >= 0 && dest_reg < 16)
+  {
+    imm_cache[dest_reg].value = value;
+    imm_cache[dest_reg].valid = 1;
+  }
 }
 
 /* Load comparison result (0 or 1) based on condition flags.
@@ -10778,6 +10918,9 @@ static void presave_stack_args_from_arg_regs(CallGenContext *ctx)
 /* Place all stack arguments */
 static void place_stack_arguments(CallGenContext *ctx)
 {
+  int cached_imm_reg = -1;
+  uint32_t cached_imm_val = 0;
+
   for (int i = 0; i < ctx->argc; ++i)
   {
     const TCCAbiArgLoc *loc = &ctx->layout->locs[i];
@@ -10787,6 +10930,22 @@ static void place_stack_arguments(CallGenContext *ctx)
       continue;
 
     int stack_offset = loc->stack_off;
+
+    if (mop->kind == MACH_OP_IMM && !mop->is_64bit && mop->btype != IROP_BTYPE_STRUCT && !mop->is_complex)
+    {
+      uint32_t val = (uint32_t)mop->u.imm.val;
+      int scr = find_call_scratch(0, ctx->arg_move_dst_mask);
+      if (cached_imm_reg != scr || cached_imm_val != val)
+      {
+        load_immediate(scr, val, NULL, false);
+        cached_imm_reg = scr;
+        cached_imm_val = val;
+      }
+      store_word_to_stack(scr, stack_offset);
+      continue;
+    }
+
+    cached_imm_reg = -1;
 
     if (mop->btype == IROP_BTYPE_STRUCT || mop->is_complex)
     {
@@ -11624,6 +11783,65 @@ ST_FUNC void tcc_gen_machine_block_copy_mop(TCCIRState *ir, IROperand dest, IROp
   }
 
   /* Restore all scratch registers in reverse order: data regs first, then ptrs */
+  for (int k = ndata - 1; k >= 0; k--)
+    restore_scratch_reg(&data_scratches[k]);
+  restore_scratch_reg(&dst_scratch);
+  restore_scratch_reg(&src_scratch);
+}
+
+ST_FUNC void tcc_gen_machine_spill_block_copy(int32_t src_spill_off, int32_t dst_spill_off, int nwords)
+{
+  ScratchRegAlloc src_scratch = get_scratch_reg_with_save(0);
+  int r_src = src_scratch.reg;
+  ScratchRegAlloc dst_scratch = get_scratch_reg_with_save(1u << (uint32_t)r_src);
+  int r_dst = dst_scratch.reg;
+
+  tcc_machine_addr_of_stack_slot(r_src, src_spill_off, 0);
+  tcc_machine_addr_of_stack_slot(r_dst, dst_spill_off, 0);
+
+  int max_data = nwords < 4 ? nwords : 4;
+  if (max_data < 1)
+    max_data = 1;
+
+  ScratchRegAlloc data_scratches[4];
+  int data_regs[4];
+  int ndata = 0;
+  uint32_t exclude = (1u << (uint32_t)r_src) | (1u << (uint32_t)r_dst);
+  for (int k = 0; k < max_data; k++)
+  {
+    data_scratches[k] = get_scratch_reg_with_save(exclude);
+    data_regs[k] = data_scratches[k].reg;
+    exclude |= (1u << (uint32_t)data_regs[k]);
+    ndata++;
+  }
+
+  int remaining = nwords;
+
+  while (remaining >= ndata && ndata >= 2)
+  {
+    uint32_t regset = 0;
+    for (int j = 0; j < ndata; j++)
+      regset |= (1u << (uint32_t)data_regs[j]);
+    ot_check(th_ldm(r_src, regset, 1 /* writeback */, ENFORCE_ENCODING_NONE));
+    ot_check(th_stm(r_dst, regset, 1 /* writeback */, ENFORCE_ENCODING_NONE));
+    remaining -= ndata;
+  }
+
+  int dr = data_regs[0];
+  while (remaining > 0)
+  {
+    ot_check_ldr_imm(dr, r_src, 0, 6, ENFORCE_ENCODING_NONE);
+    ot_check_str_imm(dr, r_dst, 0, 6, ENFORCE_ENCODING_NONE);
+    if (remaining > 1)
+    {
+      if (!ot(th_add_imm(r_src, r_src, 4, flags_safe(), ENFORCE_ENCODING_NONE)))
+        tcc_error("compiler_error: spill_block_copy cannot advance source pointer");
+      if (!ot(th_add_imm(r_dst, r_dst, 4, flags_safe(), ENFORCE_ENCODING_NONE)))
+        tcc_error("compiler_error: spill_block_copy cannot advance dest pointer");
+    }
+    remaining--;
+  }
+
   for (int k = ndata - 1; k >= 0; k--)
     restore_scratch_reg(&data_scratches[k]);
   restore_scratch_reg(&dst_scratch);

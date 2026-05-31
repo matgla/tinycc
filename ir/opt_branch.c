@@ -369,16 +369,41 @@ int tcc_ir_opt_vrp(TCCIRState *ir)
   int64_t pending_min = 0;
   int64_t pending_max = 0;
 
+  /* Scoped equality constraint: after CMP X, #A / JUMPIF != target,
+   * the constraint X==[A,A] holds until we reach target.  Unlike
+   * pending_*, this survives merge points within the fall-through.
+   * eq_scope_src_slot tracks the source PARAM/VAR if X was loaded
+   * from one, so loads from the same source inherit the range. */
+  int eq_scope_end = -1;
+  int eq_scope_slot = -1;
+  int eq_scope_src_slot = -1;
+  int64_t eq_scope_val = 0;
+
   for (int i = 0; i < n; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
 
-    /* At merge points: clear all ranges and discard pending constraint */
+    /* End the scoped equality constraint when we reach the JUMPIF target */
+    if (i == eq_scope_end) {
+      if (eq_scope_slot >= 0)
+        ranges[eq_scope_slot].valid = 0;
+      if (eq_scope_src_slot >= 0)
+        ranges[eq_scope_src_slot].valid = 0;
+      eq_scope_end = -1;
+      eq_scope_slot = -1;
+      eq_scope_src_slot = -1;
+    }
+
+    /* At merge points: clear all ranges and discard pending constraint,
+     * but re-apply the scoped equality constraint if still active. */
     if (is_merge[i / 8] & (1 << (i % 8)))
     {
       memset(ranges, 0, sizeof(ranges));
       pending_apply_at = -1;
       pending_slot = -1;
+      /* Scoped constraint re-apply disabled: not all merge points
+       * within [JUMPIF+2, target) are dominated by the fall-through.
+       * The CMP+SETIF backward scan handles the target case directly. */
     }
     else if (pending_apply_at == i && pending_slot >= 0)
     {
@@ -435,6 +460,23 @@ int tcc_ir_opt_vrp(TCCIRState *ir)
         }
       }
       continue;
+    }
+
+    /* Propagate ranges through non-lval ASSIGN: if the source vreg has a
+     * known range, copy it to dest. */
+    if (q->op == TCCIR_OP_ASSIGN && irop_config[q->op].has_dest)
+    {
+      int32_t s1_vr = irop_get_vreg(src1);
+      int32_t d_vr = irop_get_vreg(dest);
+      if (s1_vr >= 0 && d_vr >= 0 && !src1.is_lval) {
+        int s_slot = vrp_get_slot(TCCIR_DECODE_VREG_TYPE(s1_vr), TCCIR_DECODE_VREG_POSITION(s1_vr));
+        int d_slot = vrp_get_slot(TCCIR_DECODE_VREG_TYPE(d_vr), TCCIR_DECODE_VREG_POSITION(d_vr));
+        if (s_slot >= 0 && d_slot >= 0 && ranges[s_slot].valid) {
+          ranges[d_slot] = ranges[s_slot];
+        } else if (d_slot >= 0) {
+          ranges[d_slot].valid = 0;
+        }
+      }
     }
 
     /* CMP + JUMPIF: try to fold using range, or derive fall-through constraint */
@@ -594,6 +636,77 @@ int tcc_ir_opt_vrp(TCCIRState *ir)
               pending_slot = src_slot;
               pending_min = new_min;
               pending_max = new_max;
+
+              /* For equality constraints (fall-through of !=), set up
+               * a scoped constraint that survives merge points until
+               * the JUMPIF target.  All merge points within the
+               * fall-through region are internal branches that still
+               * satisfy the equality.
+               * Also back-propagate: if the CMP source was loaded from
+               * a PARAM, constrain the PARAM too so that subsequent
+               * loads from the same PARAM inherit the range. */
+              if (new_min == new_max) {
+                IROperand jdst = tcc_ir_op_get_dest(ir, jump_q);
+                int jtarget = (int)irop_get_imm64_ex(ir, jdst);
+                eq_scope_end = jtarget;
+                eq_scope_slot = src_slot;
+                eq_scope_src_slot = -1;
+                eq_scope_val = new_min;
+
+                /* Back-propagate equality to source PARAM.
+                 * Only valid when the CMP compares a vreg directly (not a
+                 * deref): CMP T,#K constrains T, but CMP T***DEREF***,#K
+                 * constrains *T, and propagating #K to T's source PARAM
+                 * would confuse a pointer address with a pointed-to value.
+                 * Scan ALL definitions of src1_vr before the CMP.
+                 * Safe when every def is either:
+                 *   (a) immediate constant != equality value (impossible path), or
+                 *   (b) non-lval PARAM load (same PARAM across all defs).
+                 * Case (a) paths are dead on the fall-through (constant != value
+                 * but we know vreg == value), so the value must come from (b). */
+                if (!src1.is_lval) {
+                  int32_t bp_param_vr = -1;
+                  int bp_param_slot = -1;
+                  int bp_safe = 1;
+                  for (int bi = 0; bi < i && bp_safe; bi++) {
+                    IRQuadCompact *bq = &ir->compact_instructions[bi];
+                    if (bq->op == TCCIR_OP_NOP || !irop_config[bq->op].has_dest)
+                      continue;
+                    IROperand bd = tcc_ir_op_get_dest(ir, bq);
+                    if (irop_get_vreg(bd) != src1_vr)
+                      continue;
+                    IROperand bs = tcc_ir_op_get_src1(ir, bq);
+                    if ((bq->op == TCCIR_OP_ASSIGN || bq->op == TCCIR_OP_LOAD) &&
+                        irop_is_immediate(bs)) {
+                      if (irop_get_imm64_ex(ir, bs) == new_min)
+                        bp_safe = 0;
+                      continue;
+                    }
+                    if (bq->op == TCCIR_OP_ASSIGN || bq->op == TCCIR_OP_LOAD) {
+                      int32_t bsv = irop_get_vreg(bs);
+                      if (bsv >= 0 && !bs.is_lval &&
+                          TCCIR_DECODE_VREG_TYPE(bsv) == TCCIR_VREG_TYPE_PARAM) {
+                        int bs_slot = vrp_get_slot(TCCIR_DECODE_VREG_TYPE(bsv),
+                                                   TCCIR_DECODE_VREG_POSITION(bsv));
+                        if (bp_param_vr >= 0 && bp_param_vr != bsv) {
+                          bp_safe = 0;
+                        } else {
+                          bp_param_vr = bsv;
+                          bp_param_slot = bs_slot;
+                        }
+                        continue;
+                      }
+                    }
+                    bp_safe = 0;
+                  }
+                  if (bp_safe && bp_param_vr >= 0 && bp_param_slot >= 0) {
+                    ranges[bp_param_slot].valid = 1;
+                    ranges[bp_param_slot].min_val = new_min;
+                    ranges[bp_param_slot].max_val = new_max;
+                    eq_scope_src_slot = bp_param_slot;
+                  }
+                }
+                }
             }
           }
         }
@@ -656,6 +769,94 @@ int tcc_ir_opt_vrp(TCCIRState *ir)
                   }
                 }
               }
+            }
+          }
+        }
+      }
+      /* CMP + SETIF: fold conditional set to constant when range proves result */
+      if (jump_q->op == TCCIR_OP_SETIF && irop_is_immediate(src2))
+      {
+        int32_t cmp_vr = irop_get_vreg(src1);
+        if (cmp_vr >= 0)
+        {
+          int cmp_slot = vrp_get_slot(TCCIR_DECODE_VREG_TYPE(cmp_vr), TCCIR_DECODE_VREG_POSITION(cmp_vr));
+          int have_range = (cmp_slot >= 0 && ranges[cmp_slot].valid);
+          /* Check if ALL reaching definitions of cmp_vr produce the
+           * same fold result for this comparison, given the scoped
+           * equality constraint on eq_scope_src_slot.  Each def must
+           * be either an immediate constant or a non-lval load from
+           * the constrained PARAM; any other def shape is unknown.
+           * Skip when the CMP dereferences its source (is_lval) — the
+           * constraint tracks the scalar value, not the pointed-to. */
+          if (!have_range && !src1.is_lval && eq_scope_src_slot >= 0 &&
+              i < eq_scope_end && cmp_slot >= 0) {
+            int64_t sf_cmp_val = irop_get_imm64_ex(ir, src2);
+            IROperand sf_cond_op = tcc_ir_op_get_src1(ir, jump_q);
+            int sf_tok = (int)irop_get_imm64_ex(ir, sf_cond_op);
+            int sf_unified = -2;
+            int sf_safe = 1;
+            for (int bi = 0; bi < i && sf_safe; bi++) {
+              IRQuadCompact *bq = &ir->compact_instructions[bi];
+              if (bq->op == TCCIR_OP_NOP || !irop_config[bq->op].has_dest)
+                continue;
+              IROperand bd = tcc_ir_op_get_dest(ir, bq);
+              if (irop_get_vreg(bd) != cmp_vr)
+                continue;
+              int64_t def_val;
+              IROperand bs = tcc_ir_op_get_src1(ir, bq);
+              if ((bq->op == TCCIR_OP_ASSIGN || bq->op == TCCIR_OP_LOAD) &&
+                  irop_is_immediate(bs)) {
+                def_val = irop_get_imm64_ex(ir, bs);
+              } else if (bq->op == TCCIR_OP_ASSIGN || bq->op == TCCIR_OP_LOAD) {
+                int32_t bsv = irop_get_vreg(bs);
+                if (bsv >= 0 && !bs.is_lval) {
+                  int bs_slot = vrp_get_slot(TCCIR_DECODE_VREG_TYPE(bsv),
+                                              TCCIR_DECODE_VREG_POSITION(bsv));
+                  if (bs_slot == eq_scope_src_slot)
+                    def_val = eq_scope_val;
+                  else { sf_safe = 0; continue; }
+                } else { sf_safe = 0; continue; }
+              } else { sf_safe = 0; continue; }
+              int sf_fold = evaluate_compare_condition(def_val, sf_cmp_val, sf_tok);
+              if (sf_fold < 0) { sf_safe = 0; continue; }
+              if (sf_unified == -2) sf_unified = sf_fold;
+              else if (sf_unified != sf_fold) sf_safe = 0;
+            }
+            if (sf_safe && sf_unified >= 0) {
+              ranges[cmp_slot].valid = 1;
+              ranges[cmp_slot].min_val = eq_scope_val;
+              ranges[cmp_slot].max_val = eq_scope_val;
+              have_range = 1;
+            }
+          }
+          if (have_range)
+          {
+            int64_t cmp_val = irop_get_imm64_ex(ir, src2);
+            int64_t rmin = ranges[cmp_slot].min_val;
+            int64_t rmax = ranges[cmp_slot].max_val;
+            IROperand set_src1_op = tcc_ir_op_get_src1(ir, jump_q);
+            int tok = (int)irop_get_imm64_ex(ir, set_src1_op);
+            int fold_result = -1;
+            int is_eq_ne = (tok == 0x94 || tok == 0x95);
+
+            if (is_eq_ne) {
+              if (cmp_val < rmin || cmp_val > rmax)
+                fold_result = (tok == 0x95) ? 1 : 0;
+              else if (rmin == rmax)
+                fold_result = (tok == 0x94) ? 1 : 0;
+            } else {
+              fold_result = vrp_fold_cmp(rmin, rmax, cmp_val, tok);
+            }
+
+            if (fold_result >= 0)
+            {
+              IROperand set_dest = tcc_ir_op_get_dest(ir, jump_q);
+              q->op = TCCIR_OP_NOP;
+              jump_q->op = TCCIR_OP_ASSIGN;
+              IROperand const_val = irop_make_imm32(-1, fold_result, IROP_BTYPE_INT32);
+              tcc_ir_set_src1(ir, i + 1, const_val);
+              tcc_ir_op_set_dest(ir, jump_q, set_dest);
+              changes++;
             }
           }
         }
@@ -749,20 +950,49 @@ int tcc_ir_opt_nonneg_branch_fold(TCCIRState *ir)
   int32_t nonneg_vregs[MAX_NONNEG_VREGS];
   int nonneg_count = 0;
 
+  int pending_p0_is_imm = 0;
+  int64_t pending_p0_imm = 0;
+  int pending_p0_call_id = -1;
+
   for (int i = 0; i < n; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op != TCCIR_OP_FUNCCALLVAL)
+
+    if (q->op == TCCIR_OP_FUNCPARAMVAL)
+    {
+      IROperand ps1 = tcc_ir_op_get_src1(ir, q);
+      IROperand ps2 = tcc_ir_op_get_src2(ir, q);
+      uint32_t encoded = (uint32_t)irop_get_imm64_ex(ir, ps2);
+      if (TCCIR_DECODE_PARAM_IDX(encoded) == 0)
+      {
+        pending_p0_is_imm = irop_is_immediate(ps1);
+        pending_p0_imm = pending_p0_is_imm ? irop_get_imm64_ex(ir, ps1) : 0;
+        pending_p0_call_id = TCCIR_DECODE_CALL_ID(encoded);
+      }
       continue;
+    }
+
+    if (q->op != TCCIR_OP_FUNCCALLVAL)
+    {
+      if (q->op != TCCIR_OP_NOP && q->op != TCCIR_OP_FUNCPARAMVOID)
+        pending_p0_call_id = -1;
+      continue;
+    }
 
     IROperand src1 = tcc_ir_op_get_src1(ir, q);
     Sym *callee = irop_get_sym_ex(ir, src1);
     if (!callee)
+    {
+      pending_p0_call_id = -1;
       continue;
+    }
 
     const char *name = get_tok_str(callee->v, NULL);
     if (!name)
+    {
+      pending_p0_call_id = -1;
       continue;
+    }
 
     int is_nonneg = 0;
     for (size_t j = 0; j < NUM_NONNEG_FUNCS; j++)
@@ -773,6 +1003,24 @@ int tcc_ir_opt_nonneg_branch_fold(TCCIRState *ir)
         break;
       }
     }
+
+    if (!is_nonneg && pending_p0_call_id >= 0 && pending_p0_is_imm)
+    {
+      IROperand src2 = tcc_ir_op_get_src2(ir, q);
+      uint32_t call_encoded = (uint32_t)irop_get_imm64_ex(ir, src2);
+      int this_call_id = TCCIR_DECODE_CALL_ID(call_encoded);
+      if (this_call_id == pending_p0_call_id && strcmp(name, "__aeabi_f2d") == 0)
+      {
+        uint32_t fbits = (uint32_t)pending_p0_imm;
+        uint32_t sign = (fbits >> 31) & 1;
+        uint32_t exp = (fbits >> 23) & 0xFF;
+        uint32_t mant = fbits & 0x7FFFFF;
+        if (!sign && !(exp == 0xFF && mant != 0))
+          is_nonneg = 1;
+      }
+    }
+
+    pending_p0_call_id = -1;
 
     if (is_nonneg)
     {

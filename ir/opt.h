@@ -45,6 +45,26 @@ int tcc_ir_opt_useless_function_body_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_noreturn_collapse(struct TCCIRState *ir);
 int tcc_ir_opt_noreturn_collapse_ex(struct IROptCtx *ctx);
 
+/* Infinite Loop Body Simplification - collapse infinite loops with no
+ * externally-observable side effects to tight self-jumps. */
+int tcc_ir_opt_infinite_loop_simplify(struct TCCIRState *ir);
+int tcc_ir_opt_infinite_loop_simplify_ex(struct IROptCtx *ctx);
+
+/* Dead-Code-Before-Infinite-Loop Elimination - once control enters a
+ * side-effect-free infinite loop the function never returns, so stores (and
+ * the address-takes / branches feeding them) that precede the loop on the
+ * never-returning path are unobservable; reroute their entry edges to the loop
+ * sink and NOP the rest. */
+int tcc_ir_opt_dead_before_infinite_loop(struct TCCIRState *ir);
+int tcc_ir_opt_dead_before_infinite_loop_ex(struct IROptCtx *ctx);
+
+/* Return-Constant Register Reuse - a `RETURNVALUE C` reached only via the
+ * equality edge of a `TEST_ZERO V` / `CMP V,#C` returns V (which provably
+ * equals C there) so the backend reuses V's register instead of
+ * rematerializing the constant. */
+int tcc_ir_opt_return_const_reuse(struct TCCIRState *ir);
+int tcc_ir_opt_return_const_reuse_ex(struct IROptCtx *ctx);
+
 /* Trap-Only Body Suppression - after constprop folds a constant `x / 0` into
  * TCCIR_OP_TRAP and DCE NOPs the rest, the surviving body is a lone TRAP.
  * Reset dirty_registers/leaffunc/noreturn/need_frame_pointer (and let caller
@@ -208,6 +228,10 @@ int tcc_ir_opt_stack_addr_simplify(struct TCCIRState *ir);
 /* CMP Expression-Equality Fold - fold CMP when both operands are provably equal */
 int tcc_ir_opt_cmp_expr_fold(struct TCCIRState *ir);
 
+/* Self-expression arithmetic identity fold: x/x→1, x%x→0 */
+int tcc_ir_opt_self_arith_fold(struct TCCIRState *ir);
+int tcc_ir_opt_self_arith_fold_ex(struct IROptCtx *ctx);
+
 /* CMP Constant-Offset Fold - fold CMP when one operand is the other plus a
  * known constant (e.g. `(x + 1) >= x` → always true under signed-overflow UB) */
 int tcc_ir_opt_cmp_const_offset_fold(struct TCCIRState *ir);
@@ -273,11 +297,23 @@ int tcc_ir_opt_cse_param_add(struct TCCIRState *ir);
 /* Deref forwarding - reuse loaded deref value in adjacent CMP */
 int tcc_ir_opt_deref_fwd(struct TCCIRState *ir);
 
+/* Pointer-deref load CSE - eliminate redundant loads through same pointer */
+int tcc_ir_opt_ptr_load_cse(struct TCCIRState *ir);
+
+/* Pointer store-to-load forwarding - forward stored values to subsequent
+ * loads from the same pointer dereference within a basic block */
+int tcc_ir_opt_ptr_store_load_fwd(struct TCCIRState *ir);
+
 /* Boolean CSE (hash-table based, BB-scoped) */
 int tcc_ir_opt_bool_cse(struct TCCIRState *ir);
 
 /* Store-Load Forwarding */
 int tcc_ir_opt_sl_forward(struct TCCIRState *ir);
+
+/* Diamond Store Forwarding - when both branches of an if/else diamond store
+ * the same constant through a computed address, forward the constant to the
+ * post-merge LOAD_INDEXED from the same address. */
+int tcc_ir_opt_diamond_store_fwd(struct TCCIRState *ir);
 
 /* Forward const ASSIGN to a VAR through &V LEA into deref uses.  Handles the
  * addr-taken local pattern (e.g. __attribute__((cleanup))) that var_to_tmp
@@ -537,6 +573,7 @@ int tcc_ir_opt_post_ra_forward_diamond(struct TCCIRState *ir);
  * ============================================================================ */
 int tcc_ir_opt_const_prop_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_const_prop_tmp_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_single_value_tmp_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_known_bits_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_dead_lea_store_elim_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_const_var_prop_ex(struct IROptCtx *ctx);
@@ -564,6 +601,8 @@ int tcc_ir_opt_pack64_from_stack_stores_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_cmp_narrow_64_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_sl_forward_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_deref_fwd_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_ptr_load_cse_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_ptr_store_load_fwd_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_entry_store_prop_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_postinc_fusion_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_assign_fuse_ex(struct IROptCtx *ctx);
@@ -597,6 +636,11 @@ int tcc_ir_opt_dead_var_store_elim_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_dead_addrvar_elim_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_dead_trailing_addrvar_store_elim_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_store_redundant_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_rmw_byte_clear(struct TCCIRState *ir);
+int tcc_ir_opt_byte_store_merge(struct TCCIRState *ir);
+int tcc_ir_opt_byte_store_merge_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_local_copy_prop(struct TCCIRState *ir);
+int tcc_ir_opt_local_copy_prop_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_addrof_var_fwd_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_global_sl_fwd_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_loop_const_sim(struct TCCIRState *ir);

@@ -423,8 +423,6 @@ int tcc_ir_opt_pack64_implicit(TCCIRState *ir)
     IROperand or_dest = tcc_ir_op_get_dest(ir, q);
     if (irop_get_btype(or_dest) != IROP_BTYPE_INT64)
       continue;
-    if (or_dest.is_lval)
-      continue;
 
     IROperand or_src1 = tcc_ir_op_get_src1(ir, q);
     IROperand or_src2 = tcc_ir_op_get_src2(ir, q);

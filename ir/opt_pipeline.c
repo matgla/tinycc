@@ -216,6 +216,7 @@ static int tcc_ir_opt_branch_cleanup_cascade_ex(IROptCtx *ctx)
     if (ch)
       tcc_ir_opt_compact_nops(ir);
     ch += tcc_ir_opt_orphan_cmp_elim(ir);
+    ch += tcc_ir_opt_dce(ir);
     if (!ch)
       break;
     total += ch;
@@ -247,6 +248,7 @@ static const IROptPass propagation_passes[] = {
   PASS_GATED("const_var_prop", tcc_ir_opt_const_var_prop_ex,    0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("global_init",     tcc_ir_opt_global_init_prop_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("symref_prop",     tcc_ir_opt_symref_const_prop_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
+  PASS_GATED("global_sl_fwd",  tcc_ir_opt_global_sl_fwd_ex,    0, IR_PASS_INVALIDATES_DU, FLAG(opt_store_load_fwd)),
   PASS_GATED("const_prop_tmp",  tcc_ir_opt_const_prop_tmp_ex,   0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("known_bits",      tcc_ir_opt_known_bits_ex,        0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("neg_chain_cse",   tcc_ir_opt_neg_chain_cse_ex,    0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
@@ -256,6 +258,7 @@ static const IROptPass propagation_passes[] = {
   PASS_GATED("self_copy_elim",  tcc_ir_opt_self_copy_elim_ex,    0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("value_tracking",  tcc_ir_opt_value_tracking_ex,   0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("cmp_expr_fold",   tcc_ir_opt_cmp_expr_fold_ex,    0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
+  PASS_GATED("self_arith",     tcc_ir_opt_self_arith_fold_ex,  0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("cmp_offset_fold", tcc_ir_opt_cmp_const_offset_fold_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("branch_fold",     tcc_ir_opt_branch_folding_ex,   0, IR_PASS_INVALIDATES_ALL, FLAG(opt_const_prop)),
   PASS_GATED("switch_collapse", tcc_ir_opt_switch_collapse_ex,  0, IR_PASS_INVALIDATES_ALL, FLAG(opt_const_prop)),
@@ -269,6 +272,7 @@ static const IROptPass propagation_passes[] = {
   PASS_GATED("nonneg_fold",     tcc_ir_opt_nonneg_branch_fold_ex, 0, IR_PASS_INVALIDATES_ALL, FLAG(opt_nonneg_fold)),
   PASS_GATED("float_branch",    tcc_ir_opt_float_branch_fold_ex, 0, IR_PASS_INVALIDATES_ALL, FLAG(opt_vrp)),
   PASS_GATED("vrp",             tcc_ir_opt_vrp_ex,              0, IR_PASS_INVALIDATES_ALL, FLAG(opt_vrp)),
+  PASS_GATED("single_val_tmp",  tcc_ir_opt_single_value_tmp_ex, 0, IR_PASS_INVALIDATES_ALL, FLAG(opt_const_prop)),
   PASS_GATED("float_narrow",    tcc_ir_opt_float_narrowing_ex,  0, IR_PASS_INVALIDATES_DU, FLAG(opt_float_narrow)),
   PASS_GATED("deref_fwd",       tcc_ir_opt_deref_fwd_ex,        0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
 };
@@ -311,6 +315,7 @@ static const IROptPass late_cleanup_passes[] = {
    * sl_forward trigger is idle.  Runs first so the dead-store passes below
    * see the simplified CFG. */
   PASS_GATED("branch_cleanup",   tcc_ir_opt_branch_cleanup_cascade_ex, 0, IR_PASS_INVALIDATES_ALL, FLAG(opt_jump_threading)),
+  PASS_GATED("nonneg_fold",     tcc_ir_opt_nonneg_branch_fold_ex, 0, IR_PASS_INVALIDATES_ALL, FLAG(opt_nonneg_fold)),
   /* dead_vla_struct: NOP a VLA_ALLOC whose captured base-pointer slot only
    * feeds STORE destinations (no LOAD, no escape). Must precede zero_vla so
    * the orphaned outer SP_SAVE/RESTORE pair gets collapsed in the same round. */
@@ -323,6 +328,8 @@ static const IROptPass late_cleanup_passes[] = {
   /* zero_vla: turn VLA_ALLOC(size=0) into NOPs so dead_lea_store (which bails
    * on any VLA_ALLOC) can clean up the surrounding stack scaffolding. */
   PASS_GATED("zero_vla",         tcc_ir_opt_zero_vla_elim_ex,    0, IR_PASS_INVALIDATES_ALL, FLAG(opt_dead_store)),
+  // PASS_GATED("local_copy_prop", tcc_ir_opt_local_copy_prop_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_redundant_store)),
+  PASS_GATED("byte_store_merge", tcc_ir_opt_byte_store_merge_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_redundant_store)),
   PASS_GATED("store_redundant",  tcc_ir_opt_store_redundant_ex,  0, IR_PASS_INVALIDATES_DU, FLAG(opt_redundant_store)),
   PASS_GATED("dse",              tcc_ir_opt_dse_ex,              0, IR_PASS_INVALIDATES_DU, FLAG(opt_dead_store)),
   /* dead_static_store: end-of-TU pass — only fires when ir_late_reopt_phase is
@@ -354,6 +361,15 @@ static const IROptPass late_cleanup_passes[] = {
    * loop so dse / redundant_assign can react to the newly-NOPed CMPs in the next
    * iteration. */
   PASS_GATED("orphan_cmp",       tcc_ir_opt_orphan_cmp_elim_ex,     0, IR_PASS_INVALIDATES_DU, FLAG(opt_dce)),
+  PASS_GATED("inf_loop_simpl",  tcc_ir_opt_infinite_loop_simplify_ex, 0, IR_PASS_INVALIDATES_ALL, FLAG(opt_dce)),
+  /* dead_before_inf_loop: after inf_loop_simpl has collapsed a side-effect-free
+   * infinite loop to a self-jump, NOP the now-unobservable stores / address-
+   * takes / branches that precede it on the never-returning path. */
+  PASS_GATED("dead_pre_inf",    tcc_ir_opt_dead_before_infinite_loop_ex, 0, IR_PASS_INVALIDATES_ALL, FLAG(opt_dce)),
+  /* return_reuse: return the register a dominating equality test proved equals
+   * the returned constant, so the backend reuses it (e.g. the already-zero r0
+   * on the x==0 path) instead of emitting a redundant constant materialization. */
+  PASS_GATED("return_reuse",    tcc_ir_opt_return_const_reuse_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
 };
 
 /* Compound pass: entry-store-prop cleanup phase (replicates original two-phase

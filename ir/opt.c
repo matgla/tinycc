@@ -791,6 +791,54 @@ static int tu_is_static_global_candidate(const Sym *sym)
   return 1;
 }
 
+/* Map from vreg → static Sym* for tracking which vregs hold addresses of
+ * static globals.  Used by tu_func_summary to trace STORE destinations
+ * through temps and to detect address escape paths. */
+#define TU_VREG_MAP_MAX 128
+typedef struct
+{
+  int32_t vreg;
+  Sym *sym;
+} TuVregSymEntry;
+
+static Sym *tu_vreg_map_lookup(const TuVregSymEntry *map, int count, int32_t vr)
+{
+  for (int i = 0; i < count; i++)
+    if (map[i].vreg == vr)
+      return map[i].sym;
+  return NULL;
+}
+
+static void tu_vreg_map_set(TuVregSymEntry *map, int *count, int32_t vr, Sym *sym)
+{
+  for (int i = 0; i < *count; i++)
+  {
+    if (map[i].vreg == vr)
+    {
+      map[i].sym = sym;
+      return;
+    }
+  }
+  if (*count < TU_VREG_MAP_MAX)
+  {
+    map[*count].vreg = vr;
+    map[*count].sym = sym;
+    (*count)++;
+  }
+}
+
+static void tu_vreg_map_clear(TuVregSymEntry *map, int *count, int32_t vr)
+{
+  for (int i = 0; i < *count; i++)
+  {
+    if (map[i].vreg == vr)
+    {
+      map[i].sym = NULL;
+      return;
+    }
+  }
+}
+
 void tcc_ir_collect_tu_func_summary(TCCIRState *ir, Sym *func_sym)
 {
   if (!ir || !func_sym)
@@ -804,6 +852,163 @@ void tcc_ir_collect_tu_func_summary(TCCIRState *ir, Sym *func_sym)
   const int n = ir->next_instruction_index;
   int writes_any_static = 0;
 
+  /* Phase 1: Forward scan to build vreg→static-sym map, detect escape paths.
+   *
+   * After optimizations (fusion, copy propagation), STORE destinations often
+   * use temp vregs rather than direct SYMREFs.  E.g.:
+   *   T8 = &static_arr [ASSIGN]     -- address materialization
+   *   STORE_INDEXED T8, #0, #4       -- write through temp
+   * The old code only detected writes when the STORE dest had a direct SYMREF,
+   * missing these temp-based patterns entirely.
+   *
+   * Similarly, the address materialization (ASSIGN from SYMREF) was counted
+   * as a "read" of the static.  It's actually just computing the address —
+   * it only counts as a read if the address escapes to a callee or is stored
+   * as a VALUE to another memory location. */
+  TuVregSymEntry vreg_map[TU_VREG_MAP_MAX];
+  int vreg_map_count = 0;
+  TuSymSet addr_only_syms = {0}; /* statics referenced only by address (non-lval) */
+  TuSymSet escaped_syms = {0};   /* address-of refs that escaped (call/store-as-value) */
+
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+
+    /* Track vreg definitions from static SYMREFs and propagate through
+     * copies and address arithmetic.  Skip STORE-like ops: their "dest"
+     * is an address operand (possibly post-incremented), not a regular
+     * value definition, so it should not disturb the vreg map. */
+    if (irop_config[q->op].has_dest &&
+        q->op != TCCIR_OP_STORE && q->op != TCCIR_OP_STORE_INDEXED &&
+        q->op != TCCIR_OP_STORE_POSTINC)
+    {
+      IROperand dest = tcc_ir_op_get_dest(ir, q);
+      int32_t dvr = irop_get_vreg(dest);
+      if (dvr >= 0 && !dest.is_lval)
+      {
+        Sym *derived_sym = NULL;
+
+        /* Direct SYMREF source: ASSIGN/ADD/LEA from a static global address.
+         * Also check MLA/MLS accumulator operand — after fusion, an ADD's
+         * SYMREF base can migrate there. */
+        if (irop_config[q->op].has_src1)
+        {
+          IROperand s1 = tcc_ir_op_get_src1(ir, q);
+          if (s1.is_sym && !s1.is_lval)
+          {
+            Sym *sym = tu_extract_sym(ir, s1);
+            if (sym && tu_is_static_global_candidate(sym))
+              derived_sym = sym;
+          }
+        }
+        if (!derived_sym && (q->op == TCCIR_OP_MLA))
+        {
+          IROperand acc = tcc_ir_op_get_accum(ir, q);
+          if (acc.is_sym && !acc.is_lval)
+          {
+            Sym *sym = tu_extract_sym(ir, acc);
+            if (sym && tu_is_static_global_candidate(sym))
+              derived_sym = sym;
+          }
+        }
+
+        /* Propagate through ASSIGN copies and address arithmetic (ADD/SUB
+         * with one operand in the map and the other an immediate or
+         * non-sym vreg).  Also propagate through MLA/MLS where the
+         * accumulator vreg carries the static address. */
+        if (!derived_sym &&
+            (q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_ADD ||
+             q->op == TCCIR_OP_SUB))
+        {
+          if (irop_config[q->op].has_src1)
+          {
+            IROperand s1 = tcc_ir_op_get_src1(ir, q);
+            int32_t svr = irop_get_vreg(s1);
+            if (svr >= 0 && !s1.is_sym)
+              derived_sym = tu_vreg_map_lookup(vreg_map, vreg_map_count, svr);
+          }
+        }
+        if (!derived_sym && (q->op == TCCIR_OP_MLA))
+        {
+          IROperand acc = tcc_ir_op_get_accum(ir, q);
+          int32_t avr = irop_get_vreg(acc);
+          if (avr >= 0 && !acc.is_sym)
+            derived_sym = tu_vreg_map_lookup(vreg_map, vreg_map_count, avr);
+        }
+
+        if (derived_sym)
+          tu_vreg_map_set(vreg_map, &vreg_map_count, dvr, derived_sym);
+        else
+          tu_vreg_map_clear(vreg_map, &vreg_map_count, dvr);
+      }
+    }
+
+    /* Detect address escape: static address stored as a VALUE to memory.
+     * For STORE ops, src1 is the value being stored. If that value is a
+     * vreg carrying a static's address, the address escapes. */
+    if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
+        q->op == TCCIR_OP_STORE_POSTINC)
+    {
+      if (irop_config[q->op].has_src1)
+      {
+        IROperand s1 = tcc_ir_op_get_src1(ir, q);
+        int32_t svr = irop_get_vreg(s1);
+        if (svr >= 0)
+        {
+          Sym *esc = tu_vreg_map_lookup(vreg_map, vreg_map_count, svr);
+          if (esc)
+            tu_symset_add(&escaped_syms, esc);
+        }
+      }
+    }
+
+    /* Detect address escape: static address used to read (LOAD through temp).
+     * For LOAD ops, src1 is the address being read from.  If that vreg was
+     * derived from a static SYMREF, the static's value is being read. */
+    if (q->op == TCCIR_OP_LOAD || q->op == TCCIR_OP_LOAD_INDEXED ||
+        q->op == TCCIR_OP_LOAD_POSTINC)
+    {
+      if (irop_config[q->op].has_src1)
+      {
+        IROperand s1 = tcc_ir_op_get_src1(ir, q);
+        int32_t svr = irop_get_vreg(s1);
+        if (svr >= 0)
+        {
+          Sym *esc = tu_vreg_map_lookup(vreg_map, vreg_map_count, svr);
+          if (esc)
+            tu_symset_add(&escaped_syms, esc);
+        }
+      }
+    }
+
+    /* Detect address escape: static address passed as function argument. */
+    if (q->op == TCCIR_OP_FUNCPARAMVAL)
+    {
+      if (irop_config[q->op].has_src1)
+      {
+        IROperand s1 = tcc_ir_op_get_src1(ir, q);
+        int32_t svr = irop_get_vreg(s1);
+        if (svr >= 0)
+        {
+          Sym *esc = tu_vreg_map_lookup(vreg_map, vreg_map_count, svr);
+          if (esc)
+            tu_symset_add(&escaped_syms, esc);
+        }
+        /* Direct SYMREF in FUNCPARAMVAL src1: address passed directly. */
+        if (s1.is_sym && !s1.is_lval)
+        {
+          Sym *sym = tu_extract_sym(ir, s1);
+          if (sym && tu_is_static_global_candidate(sym))
+            tu_symset_add(&escaped_syms, sym);
+        }
+      }
+    }
+  }
+
+  /* Phase 2: Main scan — classify reads and writes using the vreg map
+   * and escape information gathered in phase 1. */
   for (int i = 0; i < n; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
@@ -844,55 +1049,89 @@ void tcc_ir_collect_tu_func_summary(TCCIRState *ir, Sym *func_sym)
       Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
       if (callee)
         tu_symset_add(&s->calls, callee);
-      /* fall through so the call's operands are still examined for sym refs
-       * (e.g. struct arg passed by value) */
     }
 
-    /* STORE: dest may be a SYMREF address (static global write).
-     * For STORE_INDEXED / STORE_POSTINC, disp_fusion may clear is_lval on
-     * the base operand even though the op semantically writes through that
-     * base — treat the dest as a write for any SYMREF regardless of
-     * is_lval for these indexed/postinc forms. */
+    /* STORE write detection — enhanced with vreg tracing.
+     * First try the direct SYMREF in dest (original logic), then fall back
+     * to looking up the dest vreg in the vreg→static-sym map. */
     if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
         q->op == TCCIR_OP_STORE_POSTINC)
     {
       IROperand dest = tcc_ir_op_get_dest(ir, q);
-      int dest_is_write_target =
+      Sym *write_sym = NULL;
+
+      int dest_is_direct_sym =
           dest.is_sym &&
           (dest.is_lval || q->op == TCCIR_OP_STORE_INDEXED ||
            q->op == TCCIR_OP_STORE_POSTINC);
-      if (dest_is_write_target)
+      if (dest_is_direct_sym)
       {
-        Sym *sym = tu_extract_sym(ir, dest);
-        if (sym && tu_is_static_global_candidate(sym))
-        {
-          tu_symset_add(&s->static_writes, sym);
-          writes_any_static = 1;
-        }
+        write_sym = tu_extract_sym(ir, dest);
+      }
+      else
+      {
+        /* Indirect: dest vreg was loaded from a static SYMREF earlier. */
+        int32_t dvr = irop_get_vreg(dest);
+        if (dvr >= 0)
+          write_sym = tu_vreg_map_lookup(vreg_map, vreg_map_count, dvr);
+      }
+
+      if (write_sym && tu_is_static_global_candidate(write_sym))
+      {
+        tu_symset_add(&s->static_writes, write_sym);
+        writes_any_static = 1;
       }
     }
 
-    /* Read-side operand scan: any SYMREF appearing in src1/src2 counts as a
-     * read.  Both lval-derefs (LOAD-like) and bare-symref address-of forms
-     * are conservatively treated as reads — the address-of case may escape
-     * via a call/struct and let the symbol be read indirectly. */
+    /* Read-side operand scan — refined.
+     * Lval SYMREFs (dereferences) are always value reads.
+     * Non-lval SYMREFs (address-of) are only reads if the address escapes
+     * — otherwise they're just address materialization for stores. */
     if (irop_config[q->op].has_src1)
     {
       IROperand s1 = tcc_ir_op_get_src1(ir, q);
       Sym *sym = tu_extract_sym(ir, s1);
       if (sym && tu_is_static_global_candidate(sym))
-        tu_symset_add(&s->static_reads, sym);
+      {
+        if (s1.is_lval)
+        {
+          tu_symset_add(&s->static_reads, sym);
+        }
+        else
+        {
+          tu_symset_add(&addr_only_syms, sym);
+        }
+      }
     }
     if (irop_config[q->op].has_src2)
     {
       IROperand s2 = tcc_ir_op_get_src2(ir, q);
       Sym *sym = tu_extract_sym(ir, s2);
       if (sym && tu_is_static_global_candidate(sym))
-        tu_symset_add(&s->static_reads, sym);
+      {
+        if (s2.is_lval)
+        {
+          tu_symset_add(&s->static_reads, sym);
+        }
+        else
+        {
+          tu_symset_add(&addr_only_syms, sym);
+        }
+      }
     }
-    /* LEA: dest holds an address derived from src1.  If src1 was a SYMREF
-     * we've already counted it as a read above.  STOREs that put the
-     * SYMREF in src1 (the stored value) for "p = &g" are likewise covered. */
+    /* MLA/MLS accumulator operand can also carry a SYMREF. */
+    if (q->op == TCCIR_OP_MLA)
+    {
+      IROperand acc = tcc_ir_op_get_accum(ir, q);
+      Sym *sym = tu_extract_sym(ir, acc);
+      if (sym && tu_is_static_global_candidate(sym))
+      {
+        if (acc.is_lval)
+          tu_symset_add(&s->static_reads, sym);
+        else
+          tu_symset_add(&addr_only_syms, sym);
+      }
+    }
 
     /* Conservative escape: if any operand is an inline-asm or unknown op,
      * give up by marking every static this function touches as read so we
@@ -904,8 +1143,35 @@ void tcc_ir_collect_tu_func_summary(TCCIRState *ir, Sym *func_sym)
       /* Promote all writes to also-read so DSE never fires for this func. */
       for (int k = 0; k < s->static_writes.count; k++)
         tu_symset_add(&s->static_reads, s->static_writes.items[k]);
+      /* All addr-of refs escape too. */
+      for (int k = 0; k < addr_only_syms.count; k++)
+        tu_symset_add(&s->static_reads, addr_only_syms.items[k]);
     }
   }
+
+  /* Promote escaped address-of refs to reads: if the address of a static
+   * was passed to a function call or stored as a value to memory, a callee
+   * or later code may read through the pointer. */
+  for (int k = 0; k < addr_only_syms.count; k++)
+  {
+    Sym *sym = addr_only_syms.items[k];
+    if (!sym)
+      continue;
+    int is_escaped = 0;
+    for (int e = 0; e < escaped_syms.count; e++)
+    {
+      if (escaped_syms.items[e] == sym)
+      {
+        is_escaped = 1;
+        break;
+      }
+    }
+    if (is_escaped)
+      tu_symset_add(&s->static_reads, sym);
+  }
+
+  tu_symset_free(&addr_only_syms);
+  tu_symset_free(&escaped_syms);
 
   if (writes_any_static && func_sym->type.ref)
     func_sym->type.ref->f.tu_static_writer = 1;
@@ -2183,35 +2449,80 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
        * positions BEFORE the LEA (because the explicit stores can precede
        * the LEA in source order), which would reference an undefined vreg.
        * Switching to the direct-stackoff form sidesteps the dependency. */
-      for (int j = i - 1; j >= 0; j--)
       {
-        IRQuadCompact *lq = &ir->compact_instructions[j];
-        if (lq->op == TCCIR_OP_NOP)
-          continue;
-        if (lq->is_jump_target)
+        int32_t trace_vr = dst_vr;
+        int trace_add = 0;
+        int trace_depth = 0;
+        for (int j = i - 1; j >= 0 && trace_depth < 8; j--)
+        {
+          IRQuadCompact *lq = &ir->compact_instructions[j];
+          if (lq->op == TCCIR_OP_NOP)
+            continue;
+          if (lq->is_jump_target)
+            break;
+          if (lq->op == TCCIR_OP_JUMP || lq->op == TCCIR_OP_JUMPIF || lq->op == TCCIR_OP_IJUMP)
+            break;
+          if (!irop_config[lq->op].has_dest)
+            continue;
+          IROperand ld = tcc_ir_op_get_dest(ir, lq);
+          if (!irop_has_vreg(ld) || irop_get_vreg(ld) != trace_vr || ld.is_lval)
+            continue;
+          trace_depth++;
+          if (lq->op == TCCIR_OP_LEA || lq->op == TCCIR_OP_ASSIGN)
+          {
+            IROperand ls = tcc_ir_op_get_src1(ir, lq);
+            if (irop_get_tag(ls) == IROP_TAG_STACKOFF && ls.is_local && !ls.is_lval)
+            {
+              dst_is_stackoff = 1;
+              dst_base = (int)irop_get_imm64_ex(ir, ls) + trace_add;
+              dst_vr = -1;
+              if (dst_base + total_size > tmp_base && dst_base < tmp_base + total_size) {
+                dst_is_stackoff = 0;
+                dst_vr = irop_get_vreg(p_dst);
+              }
+              break;
+            }
+            if (irop_has_vreg(ls) && !ls.is_lval)
+            {
+              trace_vr = irop_get_vreg(ls);
+              continue;
+            }
+            break;
+          }
+          if (lq->op == TCCIR_OP_ADD)
+          {
+            IROperand as1 = tcc_ir_op_get_src1(ir, lq);
+            IROperand as2 = tcc_ir_op_get_src2(ir, lq);
+            if (irop_is_immediate(as2) && irop_has_vreg(as1) && !as1.is_lval)
+            {
+              trace_add += (int)irop_get_imm64_ex(ir, as2);
+              trace_vr = irop_get_vreg(as1);
+              continue;
+            }
+            break;
+          }
+          if (lq->op == TCCIR_OP_STORE && !ld.is_lval)
+          {
+            IROperand ls = tcc_ir_op_get_src1(ir, lq);
+            if (irop_has_vreg(ls) && !ls.is_lval)
+            {
+              trace_vr = irop_get_vreg(ls);
+              continue;
+            }
+            break;
+          }
+          if (lq->op == TCCIR_OP_LOAD)
+          {
+            IROperand ls = tcc_ir_op_get_src1(ir, lq);
+            if (irop_has_vreg(ls) && ls.is_lval)
+            {
+              trace_vr = irop_get_vreg(ls);
+              continue;
+            }
+            break;
+          }
           break;
-        if (lq->op == TCCIR_OP_JUMP || lq->op == TCCIR_OP_JUMPIF || lq->op == TCCIR_OP_IJUMP)
-          break;
-        if (!irop_config[lq->op].has_dest)
-          continue;
-        IROperand ld = tcc_ir_op_get_dest(ir, lq);
-        if (!irop_has_vreg(ld) || irop_get_vreg(ld) != dst_vr || ld.is_lval)
-          continue;
-        if (lq->op != TCCIR_OP_LEA && lq->op != TCCIR_OP_ASSIGN)
-          break;
-        IROperand ls = tcc_ir_op_get_src1(ir, lq);
-        if (irop_get_tag(ls) != IROP_TAG_STACKOFF || !ls.is_local || ls.is_lval)
-          break;
-        /* Found a LEA producing dst_vr as &StackLoc[X].  Switch to direct
-         * stackoff form. */
-        dst_is_stackoff = 1;
-        dst_base = (int)irop_get_imm64_ex(ir, ls);
-        dst_vr = -1;
-        if (dst_base + total_size > tmp_base && dst_base < tmp_base + total_size) {
-          dst_is_stackoff = 0;
-          dst_vr = irop_get_vreg(p_dst);
         }
-        break;
       }
     }
     else
@@ -2232,6 +2543,7 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
      * is bounded above by 64). */
     int store_indices[16];
     int store_offsets[16];
+    int store_lea_indices[16]; /* LEA that produced base vreg for indirect stores (-1 if direct) */
     int nstores = 0;
     int aborted = 0;
     uint64_t covered_mask = 0;
@@ -2252,7 +2564,7 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
       if (sq->op == TCCIR_OP_JUMP || sq->op == TCCIR_OP_JUMPIF || sq->op == TCCIR_OP_IJUMP)
         break;
 
-      if (sq->op != TCCIR_OP_STORE)
+      if (sq->op != TCCIR_OP_STORE && sq->op != TCCIR_OP_STORE_INDEXED)
       {
         /* Recognize a `memset(src_range, 0, N)` (or __aeabi_memset variant)
          * preceding the contributing byte stores. Only one memset is tracked;
@@ -2346,15 +2658,129 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
         continue;
       }
 
-      /* This is a STORE.  Check if it targets our temp range. */
+      /* This is a STORE or STORE_INDEXED.  Resolve the effective byte offset
+       * within the temp range.  Three patterns are accepted:
+       *   (a) STORE with direct STACKOFF dest (existing path)
+       *   (b) STORE through a vreg that traces back to Addr[StackLoc[X]]
+       *   (c) STORE_INDEXED with vreg base tracing to Addr[StackLoc[X]]
+       *       and an immediate byte offset (scale=0) */
+      int st_off = 0;
+      int st_off_found = 0;
+      int st_size = -1;
+      int st_store_lea = -1;
+      IROperand st_src;
       IROperand st_dest = tcc_ir_op_get_dest(ir, sq);
-      if (irop_get_tag(st_dest) != IROP_TAG_STACKOFF || !st_dest.is_local || !st_dest.is_lval)
+
+      if (sq->op == TCCIR_OP_STORE)
+      {
+        st_src = tcc_ir_op_get_src1(ir, sq);
+        if (irop_get_tag(st_dest) == IROP_TAG_STACKOFF && st_dest.is_local && st_dest.is_lval)
+        {
+          st_off = (int)irop_get_imm64_ex(ir, st_dest);
+          st_off_found = 1;
+          st_size = ir_opt_store_btype_size_bytes(irop_get_btype(st_dest));
+        }
+        else if (irop_get_tag(st_dest) == IROP_TAG_VREG && st_dest.is_lval)
+        {
+          int32_t trace_vr = irop_get_vreg(st_dest);
+          int trace_add = 0;
+          int trace_depth = 0;
+          if (trace_vr >= 0)
+          {
+            for (int k = j - 1; k >= 0 && trace_depth < 8; k--)
+            {
+              IRQuadCompact *kq = &ir->compact_instructions[k];
+              if (kq->op == TCCIR_OP_NOP) continue;
+              if (kq->is_jump_target) break;
+              if (kq->op == TCCIR_OP_JUMP || kq->op == TCCIR_OP_JUMPIF || kq->op == TCCIR_OP_IJUMP) break;
+              if (!irop_config[kq->op].has_dest) continue;
+              IROperand kd = tcc_ir_op_get_dest(ir, kq);
+              if (!irop_has_vreg(kd) || irop_get_vreg(kd) != trace_vr || kd.is_lval) continue;
+              trace_depth++;
+              if (kq->op == TCCIR_OP_ADD)
+              {
+                IROperand as1 = tcc_ir_op_get_src1(ir, kq);
+                IROperand as2 = tcc_ir_op_get_src2(ir, kq);
+                if (irop_is_immediate(as2) && irop_has_vreg(as1) && !as1.is_lval)
+                {
+                  trace_add += (int)irop_get_imm64_ex(ir, as2);
+                  trace_vr = irop_get_vreg(as1);
+                  continue;
+                }
+                break;
+              }
+              if (kq->op != TCCIR_OP_LEA && kq->op != TCCIR_OP_ASSIGN) break;
+              IROperand ks = tcc_ir_op_get_src1(ir, kq);
+              if (irop_get_tag(ks) != IROP_TAG_STACKOFF || !ks.is_local || ks.is_lval) break;
+              st_off = (int)irop_get_imm64_ex(ir, ks) + trace_add;
+              st_off_found = 1;
+              st_store_lea = k;
+              break;
+            }
+            if (st_off_found)
+              st_size = ir_opt_store_btype_size_bytes(irop_get_btype(st_dest));
+          }
+        }
+      }
+      else /* TCCIR_OP_STORE_INDEXED */
+      {
+        st_src = tcc_ir_op_get_src1(ir, sq);
+        IROperand st_idx = tcc_ir_op_get_src2(ir, sq);
+        if (irop_get_tag(st_dest) == IROP_TAG_VREG && irop_has_vreg(st_dest) &&
+            irop_get_tag(st_idx) == IROP_TAG_IMM32)
+        {
+          IROperand scale_op = ir->iroperand_pool[sq->operand_base + 3];
+          int scale_val = (int)irop_get_imm64_ex(ir, scale_op);
+          if (scale_val == 0)
+          {
+            int32_t trace_vr = irop_get_vreg(st_dest);
+            int idx_val = (int)irop_get_imm64_ex(ir, st_idx);
+            int trace_add = idx_val;
+            int trace_depth = 0;
+            if (trace_vr >= 0)
+            {
+              for (int k = j - 1; k >= 0 && trace_depth < 8; k--)
+              {
+                IRQuadCompact *kq = &ir->compact_instructions[k];
+                if (kq->op == TCCIR_OP_NOP) continue;
+                if (kq->is_jump_target) break;
+                if (kq->op == TCCIR_OP_JUMP || kq->op == TCCIR_OP_JUMPIF || kq->op == TCCIR_OP_IJUMP) break;
+                if (!irop_config[kq->op].has_dest) continue;
+                IROperand kd = tcc_ir_op_get_dest(ir, kq);
+                if (!irop_has_vreg(kd) || irop_get_vreg(kd) != trace_vr || kd.is_lval) continue;
+                trace_depth++;
+                if (kq->op == TCCIR_OP_ADD)
+                {
+                  IROperand as1 = tcc_ir_op_get_src1(ir, kq);
+                  IROperand as2 = tcc_ir_op_get_src2(ir, kq);
+                  if (irop_is_immediate(as2) && irop_has_vreg(as1) && !as1.is_lval)
+                  {
+                    trace_add += (int)irop_get_imm64_ex(ir, as2);
+                    trace_vr = irop_get_vreg(as1);
+                    continue;
+                  }
+                  break;
+                }
+                if (kq->op != TCCIR_OP_LEA && kq->op != TCCIR_OP_ASSIGN) break;
+                IROperand ks = tcc_ir_op_get_src1(ir, kq);
+                if (irop_get_tag(ks) != IROP_TAG_STACKOFF || !ks.is_local || ks.is_lval) break;
+                st_off = (int)irop_get_imm64_ex(ir, ks) + trace_add;
+                st_off_found = 1;
+                st_store_lea = k;
+                break;
+              }
+            }
+          }
+          if (st_off_found)
+            st_size = ir_opt_store_btype_size_bytes(irop_get_btype(st_src));
+        }
+      }
+
+      if (!st_off_found)
         continue;
-      int st_off = (int)irop_get_imm64_ex(ir, st_dest);
       if (st_off < tmp_base || st_off >= tmp_base + total_size)
         continue;
 
-      int st_size = ir_opt_store_btype_size_bytes(irop_get_btype(st_dest));
       if (st_size <= 0)
       {
         aborted = 1;
@@ -2368,7 +2794,6 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
 
       /* Source value must be a vreg or immediate (rewriting requires the
        * value to be straightforwardly usable in a STORE_INDEXED). */
-      IROperand st_src = tcc_ir_op_get_src1(ir, sq);
       int src_tag = irop_get_tag(st_src);
       if (src_tag != IROP_TAG_VREG && src_tag != IROP_TAG_IMM32 &&
           src_tag != IROP_TAG_I64 && src_tag != IROP_TAG_F32 && src_tag != IROP_TAG_F64)
@@ -2379,6 +2804,7 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
 
       store_indices[nstores] = j;
       store_offsets[nstores] = st_off - tmp_base;
+      store_lea_indices[nstores] = st_store_lea;
       nstores++;
       /* Mark the bytes covered by this store in the bitmap. */
       int bit0 = st_off - tmp_base;
@@ -2423,11 +2849,13 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
       IRQuadCompact *sq = &ir->compact_instructions[j];
       if (sq->op == TCCIR_OP_NOP)
         continue;
-      /* Skip the contributing stores. */
+      /* Skip the contributing stores and their LEAs (for indirect stores
+       * through vregs, the LEA that defined the base vreg references the
+       * temp range but will become dead after the rewrite). */
       int is_store_of_ours = 0;
       for (int s = 0; s < nstores; s++)
       {
-        if (store_indices[s] == j)
+        if (store_indices[s] == j || store_lea_indices[s] == j)
         {
           is_store_of_ours = 1;
           break;
@@ -2564,12 +2992,12 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
         IRQuadCompact *sq = &ir->compact_instructions[j];
         if (sq->op == TCCIR_OP_NOP)
           continue;
-        /* Contributing stores are about to be relocated to dst — skip them.
-         * They are the only writes to dst we permit before the memcpy. */
+        /* Contributing stores and their LEAs are about to be relocated to
+         * dst — skip them. */
         int is_store_of_ours = 0;
         for (int s = 0; s < nstores; s++)
         {
-          if (store_indices[s] == j)
+          if (store_indices[s] == j || store_lea_indices[s] == j)
           {
             is_store_of_ours = 1;
             break;
@@ -2671,10 +3099,11 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
         continue;
     }
 
-    /* Rewrite each contributing STORE.
+    /* Rewrite each contributing STORE/STORE_INDEXED.
      *   - dst is vreg pointer: convert to STORE_INDEXED with byte-offset index.
-     *   - dst is direct stack offset: shift the STORE's destination offset
-     *     from `tmp_base + off` to `dst_base + off`. */
+     *   - dst is direct stack offset: convert to plain STORE with shifted offset.
+     *     For indirect stores (vreg/STORE_INDEXED), rebuild as a plain STORE
+     *     with a fresh STACKOFF dest operand. */
     for (int s = 0; s < nstores; s++)
     {
       int sidx = store_indices[s];
@@ -2685,9 +3114,28 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
 
       if (dst_is_stackoff)
       {
-        IROperand new_dest = st_dest_old;
-        new_dest.u.imm32 = dst_base + offset;
-        tcc_ir_set_dest(ir, sidx, new_dest);
+        if (irop_get_tag(st_dest_old) == IROP_TAG_STACKOFF && st_dest_old.is_local &&
+            sq->op == TCCIR_OP_STORE)
+        {
+          IROperand new_dest = st_dest_old;
+          new_dest.u.imm32 = dst_base + offset;
+          tcc_ir_set_dest(ir, sidx, new_dest);
+        }
+        else
+        {
+          int store_btype = (sq->op == TCCIR_OP_STORE_INDEXED)
+                            ? irop_get_btype(st_src)
+                            : irop_get_btype(st_dest_old);
+          IROperand new_dest = irop_make_stackoff(-1, dst_base + offset,
+                                                  /*is_lval*/ 1, /*is_llocal*/ 0,
+                                                  /*is_param*/ 0, store_btype);
+          tcc_ir_pool_ensure(ir, 2);
+          int new_pool = ir->iroperand_pool_count;
+          tcc_ir_pool_add(ir, new_dest);
+          tcc_ir_pool_add(ir, st_src);
+          sq->op = TCCIR_OP_STORE;
+          sq->operand_base = new_pool;
+        }
         continue;
       }
 

@@ -51,6 +51,9 @@ ST_DATA int rsym, anon_sym, ind, loc;
 ST_DATA Sym *global_stack;
 ST_DATA Sym *local_stack;
 ST_DATA Sym *define_stack;
+
+static unsigned char *aapcs_last_const_init;
+static int aapcs_last_const_init_size;
 ST_DATA Sym *global_label_stack;
 ST_DATA Sym *local_label_stack;
 
@@ -7870,7 +7873,6 @@ static int inline_body_has_unsafe_loops(TokenString *func_str)
       if (sp > 0) sp--;
       break;
     case TOK_FOR:
-      return 1;
     case TOK_WHILE:
     case TOK_DO:
     {
@@ -9757,6 +9759,120 @@ static void make_vector_type(CType *out, const CType *elem_type, int vector_byte
   out->ref = s;
 }
 
+/* -------- vector constant folding helpers -------- */
+
+static unsigned char *find_sv_const_init(const SValue *sv, int min_size)
+{
+  if ((sv->r & (VT_VALMASK | VT_LVAL | VT_SYM)) != (VT_LOCAL | VT_LVAL))
+    return NULL;
+  int addr = (int)sv->c.i;
+  Sym *s;
+  for (s = local_stack; s; s = s->prev)
+  {
+    if (s->const_init_data && s->const_init_valid && (int)s->c == addr && s->const_init_size >= min_size)
+      return s->const_init_data;
+  }
+  return NULL;
+}
+
+static int64_t read_vec_const_elem(const unsigned char *data, int elem_size, int idx, int is_unsigned)
+{
+  unsigned char *p = (unsigned char *)data + idx * elem_size;
+  switch (elem_size)
+  {
+  case 1:
+    return is_unsigned ? (int64_t)(uint8_t)p[0] : (int64_t)(int8_t)p[0];
+  case 2:
+    return is_unsigned ? (int64_t)(uint16_t)read16le(p) : (int64_t)(int16_t)read16le(p);
+  case 4:
+    return is_unsigned ? (int64_t)(uint32_t)read32le(p) : (int64_t)(int32_t)read32le(p);
+  case 8:
+    return (int64_t)read64le(p);
+  }
+  return 0;
+}
+
+static void write_vec_const_elem(unsigned char *data, int elem_size, int idx, int64_t val)
+{
+  unsigned char *p = data + idx * elem_size;
+  switch (elem_size)
+  {
+  case 1:
+    p[0] = (unsigned char)(val & 0xFF);
+    break;
+  case 2:
+    write16le(p, (uint16_t)(val & 0xFFFF));
+    break;
+  case 4:
+    write32le(p, (uint32_t)(val & 0xFFFFFFFF));
+    break;
+  case 8:
+    write64le(p, (uint64_t)val);
+    break;
+  }
+}
+
+static int64_t eval_vec_const_op(int op, int64_t a, int64_t b, int is_unsigned)
+{
+  switch (op)
+  {
+  case '+':
+    return a + b;
+  case '-':
+    return a - b;
+  case '*':
+    return a * b;
+  case '/':
+    if (b == 0)
+      return 0;
+    return is_unsigned ? (int64_t)((uint64_t)a / (uint64_t)b) : a / b;
+  case '%':
+    if (b == 0)
+      return 0;
+    return is_unsigned ? (int64_t)((uint64_t)a % (uint64_t)b) : a % b;
+  case '^':
+    return a ^ b;
+  case '|':
+    return a | b;
+  case '&':
+    return a & b;
+  case TOK_SHL:
+    return a << (b & 63);
+  case TOK_SAR:
+    return is_unsigned ? (int64_t)((uint64_t)a >> (b & 63)) : a >> (b & 63);
+  case TOK_EQ:
+    return (a == b) ? (int64_t)-1 : 0;
+  case TOK_NE:
+    return (a != b) ? (int64_t)-1 : 0;
+  case TOK_LT:
+    return (a < b) ? (int64_t)-1 : 0;
+  case TOK_GT:
+    return (a > b) ? (int64_t)-1 : 0;
+  case TOK_LE:
+    return (a <= b) ? (int64_t)-1 : 0;
+  case TOK_GE:
+    return (a >= b) ? (int64_t)-1 : 0;
+  case TOK_ULT:
+    return ((uint64_t)a < (uint64_t)b) ? (int64_t)-1 : 0;
+  case TOK_UGT:
+    return ((uint64_t)a > (uint64_t)b) ? (int64_t)-1 : 0;
+  case TOK_ULE:
+    return ((uint64_t)a <= (uint64_t)b) ? (int64_t)-1 : 0;
+  case TOK_UGE:
+    return ((uint64_t)a >= (uint64_t)b) ? (int64_t)-1 : 0;
+  }
+  return 0;
+}
+
+static void attach_const_init_to_temp(int frame_offset, int size, const unsigned char *data)
+{
+  Sym *s = sym_push2(&local_stack, SYM_FIRST_ANOM, VT_INT, frame_offset);
+  s->const_init_data = tcc_malloc(size);
+  memcpy(s->const_init_data, data, size);
+  s->const_init_size = size;
+  s->const_init_valid = 1;
+}
+
 /* -------- end vector helpers -------- */
 
 /* Generate element-wise binary vector operation.
@@ -9840,6 +9956,107 @@ static void gen_op_vector(int op)
      * (possibly cmp-promoted) vector type so callers see a vector. */
     vtop->type = is_cmp ? cmp_vec_type : vec_type;
     return;
+  }
+
+  /* Compile-time constant fold: when both operands are fully known at compile
+   * time, compute the result in compiler memory and emit constant stores.
+   * This cascades: the result gets const_init_data so subsequent vector ops
+   * can also fold, collapsing entire chains of vector arithmetic. */
+  if (!is_float(elem_type.t) && !NOEVAL_WANTED && vec_size <= 64)
+  {
+    unsigned char *left_data = NULL, *right_data = NULL;
+    int64_t scalar_left_val = 0, scalar_right_val = 0;
+    int can_fold = 1;
+
+    if (scalar_left)
+    {
+      if ((left_sv.r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST)
+        scalar_left_val = left_sv.c.i;
+      else
+        can_fold = 0;
+    }
+    else
+    {
+      left_data = find_sv_const_init(&left_sv, vec_size);
+      if (!left_data)
+        can_fold = 0;
+    }
+
+    if (can_fold)
+    {
+      if (scalar_right)
+      {
+        if ((right_sv.r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST)
+          scalar_right_val = right_sv.c.i;
+        else
+          can_fold = 0;
+      }
+      else
+      {
+        right_data = find_sv_const_init(&right_sv, vec_size);
+        if (!right_data)
+          can_fold = 0;
+      }
+    }
+
+    if (can_fold)
+    {
+      int is_unsigned = (elem_type.t & VT_UNSIGNED) != 0;
+      int store_size = is_cmp ? type_size(&store_elem_type, &(int){0}) : elem_size;
+      CType *store_type = is_cmp ? &store_elem_type : &elem_type;
+      unsigned char result_buf[64];
+      memset(result_buf, 0, sizeof(result_buf));
+
+      for (i = 0; i < elem_count; i++)
+      {
+        int64_t lv = scalar_left ? scalar_left_val : read_vec_const_elem(left_data, elem_size, i, is_unsigned);
+        int64_t rv = scalar_right ? scalar_right_val : read_vec_const_elem(right_data, elem_size, i, is_unsigned);
+        int64_t res = eval_vec_const_op(op, lv, rv, is_unsigned);
+        write_vec_const_elem(result_buf, store_size, i, res);
+      }
+
+      res_loc = get_temp_local_var(vec_size, vec_size > 8 ? 8 : vec_size, &res_vr);
+
+      for (i = 0; i < elem_count; i++)
+      {
+        int offset = i * store_size;
+        int64_t val = read_vec_const_elem(result_buf, store_size, i, 0);
+        SValue res_base_sv;
+
+        vpush64(store_type->t & VT_BTYPE, (unsigned long long)val);
+
+        memset(&res_base_sv, 0, sizeof(res_base_sv));
+        res_base_sv.type = is_cmp ? cmp_vec_type : vec_type;
+        res_base_sv.r = VT_LOCAL | VT_LVAL;
+        res_base_sv.vr = res_vr;
+        res_base_sv.c.i = res_loc;
+
+        vpushv(&res_base_sv);
+        gaddrof();
+        vtop->type = char_pointer_type;
+        vpushi(offset);
+        gen_op('+');
+        vtop->type = *store_type;
+        vtop->r |= VT_LVAL;
+
+        vswap();
+        vstore();
+        vpop();
+      }
+
+      attach_const_init_to_temp(res_loc, vec_size, result_buf);
+
+      {
+        SValue result;
+        memset(&result, 0, sizeof(result));
+        result.type = is_cmp ? cmp_vec_type : vec_type;
+        result.r = VT_LOCAL | VT_LVAL;
+        result.vr = res_vr;
+        result.c.i = res_loc;
+        vpushv(&result);
+      }
+      return;
+    }
   }
 
   /* Allocate a temp stack slot for the result vector */
@@ -10272,6 +10489,24 @@ ST_FUNC void vstore(void)
   int sbt, dbt, ft, r, size, align, bit_size, bit_pos, delayed_cast;
   SValue orig_src = *vtop;
   SValue orig_dst = vtop[-1];
+
+  /* Eagerly snapshot source const_init_data before gaddrof in the memmove
+   * path invalidates it.  Used at vstore_done to propagate through struct
+   * copies. */
+  unsigned char *vstore_src_cid = NULL;
+  int vstore_src_cid_size = 0;
+  if ((orig_src.r & (VT_VALMASK | VT_LVAL | VT_SYM)) == (VT_LOCAL | VT_LVAL) &&
+      (orig_dst.r & (VT_VALMASK | VT_LVAL | VT_SYM)) == (VT_LOCAL | VT_LVAL))
+  {
+    int src_size = type_size(&vtop->type, &(int){0});
+    unsigned char *sd = find_sv_const_init(&orig_src, src_size);
+    if (sd && src_size > 0 && src_size <= 256)
+    {
+      vstore_src_cid = tcc_malloc(src_size);
+      memcpy(vstore_src_cid, sd, src_size);
+      vstore_src_cid_size = src_size;
+    }
+  }
 
   /* Invalidate captured const_init_data for any tracked local sym whose
    * frame range overlaps the destination of this store. Catches direct
@@ -10795,17 +11030,20 @@ ST_FUNC void vstore(void)
                             (vtop[0].r & VT_LVAL) == 0 &&
                             ((vtop[0].r & VT_VALMASK) < VT_CONST) &&
                             vtop[0].vr >= 0;
-    if (tcc_state->ir && !has_vla && size > 0 && size <= 32 &&
+    int is_local_copy = (IS_LOCAL_LVAL(vtop[0].r) || src_is_vec_rvalue) &&
+                         IS_LOCAL_LVAL(vtop[-1].r);
+    int is_global_copy = IS_GLOBAL_LVAL(vtop[0].r) && IS_GLOBAL_LVAL(vtop[-1].r);
+    int size_limit = is_local_copy ? 64 : 32;
+    if (tcc_state->ir && !has_vla && size > 0 && size <= size_limit &&
         ((!(size & 3) && !(align & 3)) ||
          (size == 2 && (align == 1 || is_vec_small) &&
           (struct_is_single_2byte_scalar_member(&vtop->type) || is_vec_small) &&
           !((vtop[0].c.i | vtop[-1].c.i) & 1) &&
-          (IS_LOCAL_LVAL(vtop[0].r) || src_is_vec_rvalue) && IS_LOCAL_LVAL(vtop[-1].r)) ||
+          is_local_copy) ||
          (size == 1 && align == 1 &&
           (struct_is_single_1byte_scalar_member(&vtop->type) || is_vec_small) &&
-          (IS_LOCAL_LVAL(vtop[0].r) || src_is_vec_rvalue) && IS_LOCAL_LVAL(vtop[-1].r))) &&
-        (((IS_LOCAL_LVAL(vtop[0].r) || src_is_vec_rvalue) && IS_LOCAL_LVAL(vtop[-1].r)) ||
-         (IS_GLOBAL_LVAL(vtop[0].r) && IS_GLOBAL_LVAL(vtop[-1].r))) &&
+          is_local_copy)) &&
+        (is_local_copy || is_global_copy) &&
         !NOEVAL_WANTED)
     {
       SValue src = vtop[0];
@@ -11177,7 +11415,34 @@ ST_FUNC void vstore(void)
         vtop -= 4;
       }
     }
-  vstore_done:;
+  vstore_done:
+    if (vstore_src_cid)
+    {
+      int dst_addr = (int)orig_dst.c.i;
+      Sym *dst_sym = NULL;
+      for (Sym *s = local_stack; s; s = s->prev)
+      {
+        if ((int)s->c == dst_addr && s->const_init_size >= size)
+        {
+          dst_sym = s;
+          break;
+        }
+      }
+      if (dst_sym)
+      {
+        if (!dst_sym->const_init_data)
+          dst_sym->const_init_data = tcc_malloc(vstore_src_cid_size);
+        memcpy(dst_sym->const_init_data, vstore_src_cid, vstore_src_cid_size);
+        dst_sym->const_init_size = vstore_src_cid_size;
+        dst_sym->const_init_valid = 1;
+      }
+      else
+      {
+        attach_const_init_to_temp(dst_addr, vstore_src_cid_size, vstore_src_cid);
+      }
+      tcc_free(vstore_src_cid);
+    }
+    ;
   }
   else if (ft & VT_BITFIELD)
   {
@@ -13666,6 +13931,11 @@ static void gfunc_param_typed(Sym *func, Sym *arg)
           vstore();
         }
 
+        /* Save const_init_data before gaddrof invalidates it — the
+         * inline expansion needs it for compile-time vector folding. */
+        aapcs_last_const_init = find_sv_const_init(vtop, size);
+        aapcs_last_const_init_size = aapcs_last_const_init ? size : 0;
+
         /* Convert the temp lvalue to a pointer argument. */
         mk_pointer(&vtop->type);
         gaddrof();
@@ -14713,6 +14983,8 @@ static void unary_funcall(void)
       saved_args_cap = pc;
   }
   SValue *saved_args = tcc_mallocz(saved_args_cap * sizeof(SValue));
+  unsigned char **saved_args_cid = tcc_mallocz(saved_args_cap * sizeof(unsigned char *));
+  int *saved_args_cid_size = tcc_mallocz(saved_args_cap * sizeof(int));
   int saved_arg_count = 0;
   int can_try_fold = 0;
   int can_inline_builtin = 0;
@@ -15173,7 +15445,19 @@ va_arg_pack_done:
              can_optimize_string_builtin) &&
             saved_arg_count < saved_args_cap && !NOEVAL_WANTED)
         {
-          saved_args[saved_arg_count++] = *vtop;
+          saved_args[saved_arg_count] = *vtop;
+          if (aapcs_last_const_init)
+          {
+            saved_args_cid[saved_arg_count] = tcc_malloc(aapcs_last_const_init_size);
+            memcpy(saved_args_cid[saved_arg_count], aapcs_last_const_init, aapcs_last_const_init_size);
+            saved_args_cid_size[saved_arg_count] = aapcs_last_const_init_size;
+            aapcs_last_const_init = NULL;
+          }
+          saved_arg_count++;
+        }
+        else
+        {
+          aapcs_last_const_init = NULL;
         }
 
         /* Materialize constant complex double/ldouble to a temp local.
@@ -15829,23 +16113,18 @@ va_arg_pack_done:
     /* Already handled above */
   }
   else if (can_inline_eval && !NOEVAL_WANTED && call_func_sym && saved_arg_count == nb_real_args && tcc_state->ir &&
-           /* Allow nested inlining (a call to a small function from inside
-            * an already-inlined body) under controlled conditions:
-            * - Void return: safe; no return-slot phi pattern.
-            * - Struct return: also safe because the return slot is a caller-
-            *   supplied address (sret) rather than a phi between constant/
-            *   non-constant branches — the mis-fold pattern from 930725-1
-            *   (pointer return) cannot arise.  Allow up to depth 3 so that
-            *   helper chains like c5p→CPOW→CCID collapse fully (20030613-1).
-            * - Pointer/scalar return: still gated to depth<1 to avoid the
-            *   store-then-load-through-return-slot phi pattern.
+           /* Allow nested inlining under controlled conditions:
+            * - Void/struct/integer return: safe at depth < 3.
+            * - Pointer return: still gated to depth<1 to avoid the
+            *   store-then-load-through-return-slot phi pattern (930725-1).
             * - Depth cap prevents mutual-recursion expansion (pr22379). */
            (!tcc_state->in_inline_expansion ||
             call_func_sym->a.nested_func ||
             (tcc_state->inline_expansion_depth < 3 &&
              call_func_sym->type.ref &&
              ((call_func_sym->type.ref->type.t & VT_BTYPE) == VT_VOID ||
-              (call_func_sym->type.ref->type.t & VT_BTYPE) == VT_STRUCT))))
+              (call_func_sym->type.ref->type.t & VT_BTYPE) == VT_STRUCT ||
+              ((call_func_sym->type.ref->type.t & VT_BTYPE) <= VT_LLONG)))))
   {
     /* ---- Token-level inline expansion ----
      * Expand inline functions at the call site in these cases:
@@ -16144,6 +16423,23 @@ va_arg_pack_done:
         else
         {
           tcc_ir_put(tcc_state->ir, TCCIR_OP_STORE, &arg_val, NULL, &store_dst);
+        }
+        /* Propagate const_init_data from the call-site argument to the
+         * inlined parameter's Sym so compile-time vector folding can
+         * cascade through the inlined body. */
+        if ((param_sym->type.t & VT_VECTOR) && psize <= 256)
+        {
+          unsigned char *arg_data = find_sv_const_init(&saved_args[pi], psize);
+          if (!arg_data && pi < saved_arg_count && saved_args_cid[pi] &&
+              saved_args_cid_size[pi] >= psize)
+            arg_data = saved_args_cid[pi];
+          if (arg_data)
+          {
+            psym->const_init_data = tcc_malloc(psize);
+            memcpy(psym->const_init_data, arg_data, psize);
+            psym->const_init_size = psize;
+            psym->const_init_valid = 1;
+          }
         }
       }
 
@@ -16453,6 +16749,10 @@ va_arg_pack_done:
     }
   } /* end of else block for non-folded function calls */
   tcc_free(saved_args);
+  for (int ci = 0; ci < saved_arg_count; ci++)
+    tcc_free(saved_args_cid[ci]);
+  tcc_free(saved_args_cid);
+  tcc_free(saved_args_cid_size);
   if (s->f.func_noreturn)
   {
     if (debug_modes)
@@ -17970,41 +18270,65 @@ static void __attribute__((noinline)) unary_builtin_fp2(void)
       }
       result_type.ref = NULL;
 
-      /* Cast to appropriate unsigned type */
-      gen_cast(&result_type);
+      /* For bswap64 on 32-bit target with unsigned ≤32-bit argument:
+       * bswap64(zext(x32)) = bswap32(x32) << 32.
+       * Decompose to avoid __bswapdi3 call and expose the zero low-word
+       * to the optimizer. */
+      int bswap64_from_small = 0;
+#if PTR_SIZE == 4
+      if (size == 8 && (vtop->type.t & VT_BTYPE) != VT_LLONG && (vtop->type.t & VT_UNSIGNED))
+        bswap64_from_small = 1;
+#endif
 
-      if (size == 2)
+      if (bswap64_from_small)
       {
-        /* bswap16: call __bswapsi2 and mask to 16 bits, or implement inline */
-        /* For now, use library call via __bswapsi2 (which handles 32-bit) and mask */
-        /* First extend to 32-bit, swap, then mask */
         CType uint32_type;
         uint32_type.t = VT_INT | VT_UNSIGNED;
         uint32_type.ref = NULL;
         gen_cast(&uint32_type);
-
-        /* Call __bswapsi2 library function using IR */
         gen_builtin_libcall(TOK___bswapsi2, 1, VT_INT | VT_UNSIGNED);
-
-        /* Shift right by 16 to get the swapped 16-bit value in the low bits */
-        /* Actually, for a 16-bit value 0xABCD, bswap32 gives 0xCDAB0000,
-           so we need to shift right by 16 to get 0x0000CDAB */
-        vpushi(16);
-        gen_op(TOK_SHR);
-
-        /* Cast back to uint16 */
-        gen_cast(&result_type);
-      }
-      else if (size == 4)
-      {
-        /* bswap32: call __bswapsi2 library function */
-        gen_builtin_libcall(TOK___bswapsi2, 1, VT_INT | VT_UNSIGNED);
+        vpushi(0);
+        vswap();
+        lbuild(VT_LLONG | VT_UNSIGNED);
       }
       else
       {
-        /* bswap64: emit as library call (complex on 32-bit ARM) */
-        /* Call __bswapdi3 library function using IR */
-        gen_builtin_libcall(TOK___bswapdi3, 1, VT_LLONG | VT_UNSIGNED);
+        /* Cast to appropriate unsigned type */
+        gen_cast(&result_type);
+
+        if (size == 2)
+        {
+          /* bswap16: call __bswapsi2 and mask to 16 bits, or implement inline */
+          /* For now, use library call via __bswapsi2 (which handles 32-bit) and mask */
+          /* First extend to 32-bit, swap, then mask */
+          CType uint32_type;
+          uint32_type.t = VT_INT | VT_UNSIGNED;
+          uint32_type.ref = NULL;
+          gen_cast(&uint32_type);
+
+          /* Call __bswapsi2 library function using IR */
+          gen_builtin_libcall(TOK___bswapsi2, 1, VT_INT | VT_UNSIGNED);
+
+          /* Shift right by 16 to get the swapped 16-bit value in the low bits */
+          /* Actually, for a 16-bit value 0xABCD, bswap32 gives 0xCDAB0000,
+             so we need to shift right by 16 to get 0x0000CDAB */
+          vpushi(16);
+          gen_op(TOK_SHR);
+
+          /* Cast back to uint16 */
+          gen_cast(&result_type);
+        }
+        else if (size == 4)
+        {
+          /* bswap32: call __bswapsi2 library function */
+          gen_builtin_libcall(TOK___bswapsi2, 1, VT_INT | VT_UNSIGNED);
+        }
+        else
+        {
+          /* bswap64: emit as library call (complex on 32-bit ARM) */
+          /* Call __bswapdi3 library function using IR */
+          gen_builtin_libcall(TOK___bswapdi3, 1, VT_LLONG | VT_UNSIGNED);
+        }
       }
     }
     break;
@@ -18948,6 +19272,85 @@ static void __attribute__((noinline)) unary_builtin_shuffle(void)
         tcc_error("__builtin_shufflevector result too large");
 
       make_vector_type(&result_vec_type, &src_elem_type, result_size);
+
+      /* Constant fold: when both source vectors have compile-time known data,
+       * compute the shuffle result entirely in compiler memory. */
+      if (!NOEVAL_WANTED)
+      {
+        int vec1_size = vec1_type.ref->c;
+        int vec2_size = vec2_type.ref->c;
+        unsigned char *vec1_data = find_sv_const_init(&vec1_sv, vec1_size);
+        unsigned char *vec2_data = find_sv_const_init(&vec2_sv, vec2_size);
+        if (vec1_data && vec2_data)
+        {
+          unsigned char result_buf[64];
+          memset(result_buf, 0, sizeof(result_buf));
+
+          for (i = 0; i < result_elem_count; i++)
+          {
+            int src_index = indices[i];
+            if (src_index == -1)
+              continue;
+            const unsigned char *src;
+            int elem_off;
+            if (src_index < vec1_elem_count)
+            {
+              src = vec1_data;
+              elem_off = src_index * src_elem_size;
+            }
+            else
+            {
+              src = vec2_data;
+              elem_off = (src_index - vec1_elem_count) * src_elem_size;
+            }
+            memcpy(result_buf + i * src_elem_size, src + elem_off, src_elem_size);
+          }
+
+          res_loc = get_temp_local_var(result_size, result_size > 8 ? 8 : result_size, &res_vr);
+          int is_unsigned = (src_elem_type.t & VT_UNSIGNED) != 0;
+
+          for (i = 0; i < result_elem_count; i++)
+          {
+            int64_t val = read_vec_const_elem(result_buf, src_elem_size, i, is_unsigned);
+            SValue res_base;
+
+            vpush64(src_elem_type.t & VT_BTYPE, (unsigned long long)val);
+
+            memset(&res_base, 0, sizeof(res_base));
+            res_base.type = result_vec_type;
+            res_base.r = VT_LOCAL | VT_LVAL;
+            res_base.vr = res_vr;
+            res_base.c.i = res_loc;
+
+            vpushv(&res_base);
+            gaddrof();
+            vtop->type = char_pointer_type;
+            vpushi(i * src_elem_size);
+            gen_op('+');
+            vtop->type = src_elem_type;
+            vtop->r |= VT_LVAL;
+
+            vswap();
+            vstore();
+            vpop();
+          }
+
+          attach_const_init_to_temp(res_loc, result_size, result_buf);
+
+          {
+            SValue result;
+            memset(&result, 0, sizeof(result));
+            result.type = result_vec_type;
+            result.r = VT_LOCAL | VT_LVAL;
+            result.vr = res_vr;
+            result.c.i = res_loc;
+            vpushv(&result);
+          }
+          tcc_free(indices);
+          break;
+        }
+      }
+
       res_loc = get_temp_local_var(result_size, result_size > 8 ? 8 : result_size, &res_vr);
 
       for (i = 0; i < result_elem_count; ++i)
@@ -22839,7 +23242,30 @@ static __attribute__((noinline)) void expr_cond_ternary(void)
   }
 
   if (islv)
+  {
     indir();
+    /* C11 6.5.15: ?: with struct operands yields an rvalue (temporary copy),
+       not an lvalue into the original.  Copy to a stack temporary so that
+       stores through the result don't modify the originals. */
+    int sz, al, tvr, tloc;
+    CType st = vtop->type;
+    sz = type_size(&st, &al);
+    if (sz > 0)
+    {
+      tloc = get_temp_local_var(sz, al > 8 ? 8 : al, &tvr);
+      SValue dst;
+      svalue_init(&dst);
+      dst.type = st;
+      dst.r = VT_LOCAL | VT_LVAL;
+      dst.vr = tvr;
+      dst.c.i = tloc;
+      vpushv(&dst);
+      vswap();
+      vstore();
+      vpop();
+      vpushv(&dst);
+    }
+  }
 }
 
 static void expr_cond(void)
@@ -26154,6 +26580,20 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has
     {
       /* push local reference */
       vset(type, r, addr);
+      /* Anonymous compound literals (v==0): set up const_init_data tracking
+       * via a dummy Sym so vector constant folding can read the data. */
+      if (has_init && size > 0 && size <= 256 && ((type->t & VT_ARRAY) || (type->t & VT_VECTOR)) &&
+          !(type->t & VT_VLA))
+      {
+        Sym *anon = sym_push2(&local_stack, SYM_FIRST_ANOM, type->t, addr);
+        anon->type.ref = type->ref;
+        anon->const_init_data = tcc_mallocz(size);
+        anon->const_init_size = size;
+        anon->const_init_valid = 1;
+        anon->const_init_in_progress = 1;
+        p.const_init_sym = anon;
+        p.const_init_base = addr;
+      }
     }
   }
   else
@@ -27509,6 +27949,7 @@ static void gen_function(Sym *sym)
   tcc_state->force_lr_save = 0;
   tcc_state->func_save_apply_args = 0;
   tcc_state->apply_args_offset = 0;
+  tcc_state->ir_post_float_narrow = 0;
 
   /* Save global label stack position so we only pop labels from this function */
   global_label_stack_start = global_label_stack;
@@ -27817,6 +28258,9 @@ static void gen_function(Sym *sym)
     tcc_ir_opt_run_group(&prop_ctx, &groups[0]);
     tcc_ir_opt_ctx_free(&prop_ctx);
   }
+
+  tcc_state->ir_post_float_narrow = 1;
+
 #ifdef CONFIG_TCC_DEBUG
   dump_ir_after_pass(tcc_state, ir, "propagation_group");
 #endif
@@ -28324,6 +28768,39 @@ static void gen_function(Sym *sym)
     }
   }
 
+  /* Phase 4d½: Diamond Store Forwarding — when both arms of an if/else
+   * diamond store the same constant to the same computed address, forward
+   * the constant to the post-merge LOAD_INDEXED.  This enables constprop
+   * to fold soft-float comparisons (e.g. 0.8 < 0.0 → false) and
+   * eliminate dead branches, which in turn allows LCS/DCE to remove
+   * entire loop nests. */
+  if (tcc_state->opt_store_load_fwd)
+  {
+    if (tcc_ir_opt_diamond_store_fwd(ir) > 0)
+    {
+      for (int dsf_iter = 0; dsf_iter < 6; dsf_iter++)
+      {
+        int dsf_ch = 0;
+        if (tcc_state->opt_const_prop)
+        {
+          dsf_ch += tcc_ir_opt_const_prop_tmp(ir);
+          dsf_ch += tcc_ir_opt_const_prop(ir);
+          dsf_ch += tcc_ir_opt_const_prop_tmp(ir);
+          dsf_ch += tcc_ir_opt_value_tracking(ir);
+          dsf_ch += tcc_ir_opt_branch_folding(ir);
+        }
+        if (tcc_state->opt_nonneg_fold)
+          dsf_ch += tcc_ir_opt_nonneg_branch_fold(ir);
+        dsf_ch += tcc_ir_opt_orphan_cmp_elim(ir);
+        if (tcc_state->opt_dce)
+          dsf_ch += tcc_ir_opt_dce(ir);
+        tcc_ir_opt_compact_nops(ir);
+        if (!dsf_ch)
+          break;
+      }
+    }
+  }
+
   /* Phase 4e: Loop Constant Simulation — collapse small constant-trip-count
    * loops whose body has no observable side effects (pure integer/FP math,
    * known soft-float helper calls, branches whose conditions are statically
@@ -28432,8 +28909,12 @@ static void gen_function(Sym *sym)
     int loops = 0;
     int total_changes = 0;
     int ch;
-    while (loops++ < 4 && (ch = tcc_ir_opt_local_alu_cse(ir)) > 0)
+    while (loops++ < 4)
     {
+      ch = tcc_ir_opt_ptr_load_cse(ir);
+      ch += tcc_ir_opt_local_alu_cse(ir);
+      if (ch <= 0)
+        break;
       total_changes += ch;
       if (tcc_state->opt_copy_prop)
         tcc_ir_opt_copy_prop(ir);
@@ -28442,6 +28923,97 @@ static void gen_function(Sym *sym)
     }
     if (getenv("TCC_DBG_CSE"))
       fprintf(stderr, "[local_alu_cse] %d changes in %d iterations\n", total_changes, loops);
+  }
+
+  /* Phase 6b: Pointer store-to-load forwarding — after local_alu_cse has
+   * CSE'd identical address computations (e.g. 5x `T = hstent + 12` collapsed
+   * to one), bitfield read-modify-write chains now use the same address vreg.
+   * Forward stored values to subsequent loads from the same pointer dereference,
+   * then cascade with known_bits + const_prop to simplify the chain. */
+  if (tcc_state->opt_const_prop)
+  {
+    for (int psl_round = 0; psl_round < 4; psl_round++)
+    {
+      int ch = tcc_ir_opt_ptr_store_load_fwd(ir);
+      if (ch <= 0 && psl_round > 0)
+        break;
+      if (ch > 0)
+      {
+        for (int kbi = 0; kbi < 8; kbi++)
+        {
+          int kch = 0;
+          kch += tcc_ir_opt_known_bits(ir);
+          kch += tcc_ir_opt_const_prop(ir);
+          kch += tcc_ir_opt_const_prop_tmp(ir);
+          if (tcc_state->opt_copy_prop)
+            kch += tcc_ir_opt_copy_prop(ir);
+          if (tcc_state->opt_dce)
+            tcc_ir_opt_dce(ir);
+          /* Dead-def elimination: NOP pure TEMP defs whose result is unused. */
+          {
+            int n = ir->next_instruction_index;
+            for (int di = 0; di < n; di++)
+            {
+              IRQuadCompact *dq = &ir->compact_instructions[di];
+              if (dq->op == TCCIR_OP_NOP || !irop_config[dq->op].has_dest)
+                continue;
+              if (dq->op == TCCIR_OP_STORE || dq->op == TCCIR_OP_STORE_INDEXED ||
+                  dq->op == TCCIR_OP_STORE_POSTINC || dq->op == TCCIR_OP_FUNCCALLVOID ||
+                  dq->op == TCCIR_OP_FUNCCALLVAL || dq->op == TCCIR_OP_BLOCK_COPY)
+                continue;
+              IROperand dd = tcc_ir_op_get_dest(ir, dq);
+              int32_t dv = irop_get_vreg(dd);
+              if (dv < 0 || dd.is_lval)
+                continue;
+              if (TCCIR_DECODE_VREG_TYPE(dv) != TCCIR_VREG_TYPE_TEMP)
+                continue;
+              int used = 0;
+              for (int dj = 0; dj < n && !used; dj++)
+              {
+                if (dj == di)
+                  continue;
+                IRQuadCompact *djq = &ir->compact_instructions[dj];
+                if (djq->op == TCCIR_OP_NOP)
+                  continue;
+                if (irop_config[djq->op].has_src1 && irop_get_vreg(tcc_ir_op_get_src1(ir, djq)) == dv)
+                  used = 1;
+                if (irop_config[djq->op].has_src2 && irop_get_vreg(tcc_ir_op_get_src2(ir, djq)) == dv)
+                  used = 1;
+                if (irop_config[djq->op].has_dest)
+                {
+                  IROperand djd = tcc_ir_op_get_dest(ir, djq);
+                  int dest_is_use = djd.is_lval ||
+                    djq->op == TCCIR_OP_STORE_INDEXED ||
+                    djq->op == TCCIR_OP_STORE_POSTINC;
+                  if (dest_is_use && irop_get_vreg(djd) == dv)
+                    used = 1;
+                }
+              }
+              if (!used)
+              {
+                dq->op = TCCIR_OP_NOP;
+                kch++;
+              }
+            }
+          }
+          tcc_ir_opt_compact_nops(ir);
+          kch += tcc_ir_opt_const_prop_tmp(ir);
+          if (kch <= 0)
+            break;
+          tcc_ir_opt_compact_nops(ir);
+        }
+      }
+    }
+  }
+
+  if (tcc_state->opt_redundant_store)
+  {
+    if (tcc_ir_opt_rmw_byte_clear(ir) > 0)
+    {
+      if (tcc_state->opt_dce)
+        tcc_ir_opt_dce(ir);
+      tcc_ir_opt_compact_nops(ir);
+    }
   }
 
   /* Phase 7: Strength Reduction - transform MUL by constant to shift/add */
@@ -28472,6 +29044,16 @@ static void gen_function(Sym *sym)
         tcc_ir_opt_dse(ir);
       tcc_ir_opt_compact_nops(ir);
     }
+  }
+
+  /* Late memmove→indexed-stores: earlier calls miss patterns where the
+   * destination address is computed through inline-parameter VAR chains
+   * (STORE→LOAD→ASSIGN→ADD) that are only fully formed after const prop. */
+  if (tcc_ir_opt_memmove_to_indexed_stores(ir) > 0)
+  {
+    tcc_ir_opt_compact_nops(ir);
+    if (tcc_state->opt_dead_store)
+      tcc_ir_opt_dse(ir);
   }
 
   /* PACK64 peephole — collapse `((u64)hi << 32) | (u64)lo` chains. */

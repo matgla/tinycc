@@ -165,6 +165,7 @@ static int lcs_op_supported(TccIrOp op)
   case TCCIR_OP_IMOD:
   case TCCIR_OP_UMOD:
   case TCCIR_OP_CMP:
+  case TCCIR_OP_TEST_ZERO:
   case TCCIR_OP_JUMP:
   case TCCIR_OP_JUMPIF:
   case TCCIR_OP_FUNCPARAMVAL:
@@ -529,6 +530,28 @@ static LcsStep lcs_exec(TCCIRState *ir, LcsState *st, IRQuadCompact *q, int pc,
 
   case TCCIR_OP_STORE:
   {
+    int64_t v;
+    if (!lcs_read_operand(ir, st, src1, &v)) { r.action = 0; return r; }
+    int sbt = irop_get_btype(src1);
+    int dbt = irop_get_btype(dest);
+    int is_fp = (sbt == IROP_BTYPE_FLOAT32 || sbt == IROP_BTYPE_FLOAT64 ||
+                 dbt == IROP_BTYPE_FLOAT32 || dbt == IROP_BTYPE_FLOAT64);
+    int64_t store_val = is_fp ? v : lcs_truncate(v, dbt);
+
+    /* For register-promotable VARs, update the VAR slot directly so that
+     * subsequent reads via the vreg see the stored value. */
+    int32_t dvr = irop_get_vreg(dest);
+    if (dvr >= 0 && dest.is_lval) {
+      int dtype = TCCIR_DECODE_VREG_TYPE(dvr);
+      int dpos  = TCCIR_DECODE_VREG_POSITION(dvr);
+      if (dtype == TCCIR_VREG_TYPE_VAR && dpos < st->n_vars) {
+        st->vars[dpos].known = 1;
+        st->vars[dpos].value = store_val;
+        st->vars[dpos].btype = dbt;
+        st->vars[dpos].is_addr = 0;
+      }
+    }
+
     /* Resolve destination address.  Accept either a direct StackLoc[X]
      * (is_local && is_lval) or a vreg whose simulator slot is_addr. */
     int32_t off;
@@ -545,22 +568,16 @@ static LcsStep lcs_exec(TCCIRState *ir, LcsState *st, IRQuadCompact *q, int pc,
       const LcsSlot *slot = NULL;
       if (type == TCCIR_VREG_TYPE_VAR && pos < st->n_vars) slot = &st->vars[pos];
       else if (type == TCCIR_VREG_TYPE_TEMP && pos < st->n_tmps) slot = &st->tmps[pos];
-      if (!slot || !slot->known || !slot->is_addr) { r.action = 0; return r; }
+      if (!slot || !slot->known || !slot->is_addr) return r;
       off = (int32_t)slot->value;
     }
     else
     {
       r.action = 0; return r;
     }
-    int64_t v;
-    if (!lcs_read_operand(ir, st, src1, &v)) { r.action = 0; return r; }
     LcsMemSlot *ms = lcs_mem_get(st, off);
     if (!ms) { r.action = 0; return r; }
-    int sbt = irop_get_btype(src1);
-    int dbt = irop_get_btype(dest);
-    int is_fp = (sbt == IROP_BTYPE_FLOAT32 || sbt == IROP_BTYPE_FLOAT64 ||
-                 dbt == IROP_BTYPE_FLOAT32 || dbt == IROP_BTYPE_FLOAT64);
-    ms->value = is_fp ? v : lcs_truncate(v, dbt);
+    ms->value = store_val;
     ms->btype = dbt;
     ms->known = 1;
     ms->written = 1;
@@ -678,6 +695,20 @@ static LcsStep lcs_exec(TCCIRState *ir, LcsState *st, IRQuadCompact *q, int pc,
     }
     st->cmp_v1 = v1;
     st->cmp_v2 = v2;
+    st->cmp_known = 1;
+    return r;
+  }
+
+  case TCCIR_OP_TEST_ZERO:
+  {
+    int64_t v1;
+    if (!lcs_read_operand(ir, st, src1, &v1))
+    {
+      r.action = 0;
+      return r;
+    }
+    st->cmp_v1 = v1;
+    st->cmp_v2 = 0;
     st->cmp_known = 1;
     return r;
   }
@@ -899,8 +930,9 @@ static int lcs_scan_body(TCCIRState *ir, int start_idx, int end_idx,
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP)
       continue;
-    if (!lcs_op_supported(q->op))
+    if (!lcs_op_supported(q->op)) {
       return 0;
+    }
     /* FUNCCALLVAL / FUNCCALLVOID src1 is a SYMREF (function symbol);
      * skip the source-scan for those.  FUNCPARAMVAL src2 is the
      * encoded (call_id, param_idx) immediate. */
@@ -1100,7 +1132,10 @@ static void lcs_init_var_state(TCCIRState *ir, int start_idx, LcsState *st)
     if (!irop_config[q->op].has_dest) continue;
     IROperand d = tcc_ir_op_get_dest(ir, q);
     if (d.is_llocal || d.is_sym) continue;
-    /* Direct stack-slot STORE of an immediate: seed the memory map. */
+    /* Direct stack-slot STORE of an immediate: seed the memory map.
+     * Also seed the VAR slot when the destination has an associated vreg
+     * and the source is a stack address — enables the simulator to track
+     * pointer-to-local patterns like `V0 = &array[0]`. */
     if (q->op == TCCIR_OP_STORE && d.is_local && d.is_lval &&
         irop_get_tag(d) == IROP_TAG_STACKOFF)
     {
@@ -1121,6 +1156,36 @@ static void lcs_init_var_state(TCCIRState *ir, int start_idx, LcsState *st)
         ms->initial_value = v;
         ms->initial_known = 1;
         mem_has_def[mem_idx] = 1;
+      }
+      else if (s1.is_local && !s1.is_lval &&
+               irop_get_tag(s1) == IROP_TAG_STACKOFF)
+      {
+        int32_t dvr = irop_get_vreg(d);
+        if (dvr >= 0) {
+          int dtype = TCCIR_DECODE_VREG_TYPE(dvr);
+          int dpos  = TCCIR_DECODE_VREG_POSITION(dvr);
+          LcsSlot *dslot = NULL;
+          uint8_t *dflow = NULL;
+          uint8_t *ddef = NULL;
+          if (dtype == TCCIR_VREG_TYPE_VAR && dpos < st->n_vars) {
+            dslot = &st->vars[dpos];
+            dflow = &var_flow_unsafe[dpos];
+            ddef = &var_has_def[dpos];
+          } else if (dtype == TCCIR_VREG_TYPE_TEMP && dpos < st->n_tmps) {
+            dslot = &st->tmps[dpos];
+            dflow = &tmp_flow_unsafe[dpos];
+            ddef = &tmp_has_def[dpos];
+          }
+          if (dslot && !*dflow) {
+            dslot->known = 1;
+            dslot->value = irop_get_stack_offset(s1);
+            dslot->btype = IROP_BTYPE_INT32;
+            dslot->is_addr = 1;
+            *ddef = 1;
+          }
+        }
+        ms->known = 0;
+        ms->initial_known = 0;
       }
       else
       {
@@ -1150,7 +1215,7 @@ static void lcs_init_var_state(TCCIRState *ir, int start_idx, LcsState *st)
     }
     if (*flow_unsafe) continue;
     if (q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_LOAD ||
-        q->op == TCCIR_OP_LEA)
+        q->op == TCCIR_OP_LEA || q->op == TCCIR_OP_STORE)
     {
       IROperand s1 = tcc_ir_op_get_src1(ir, q);
       if (irop_is_immediate(s1))
@@ -1201,6 +1266,58 @@ static void lcs_init_var_state(TCCIRState *ir, int start_idx, LcsState *st)
   tcc_free(mem_has_def);
   tcc_free(mem_flow_unsafe);
   tcc_free(real_pre_target);
+}
+
+/* Determine whether any stack memory modified by the loop is potentially
+ * accessed after `from_idx`.  Checks both direct StackLoc references and
+ * indirect/indexed accesses (LOAD_INDEXED, STORE_INDEXED, indirect LOAD/
+ * STORE through address-holding vregs).
+ *
+ * Returns 1 if any modified slot might be read after the loop, 0 if all
+ * modifications are loop-internal temporaries safe to discard. */
+static int lcs_any_mem_used_after(TCCIRState *ir, const LcsState *st,
+                                  int from_idx)
+{
+  int n = ir->next_instruction_index;
+  int has_modified_slot = 0;
+  for (int m = 0; m < st->n_mem; m++)
+  {
+    if (st->mem[m].written && st->mem[m].known &&
+        !(st->mem[m].initial_known &&
+          st->mem[m].value == st->mem[m].initial_value))
+    {
+      has_modified_slot = 1;
+      break;
+    }
+  }
+  if (!has_modified_slot)
+    return 0;
+
+  for (int i = from_idx; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP) continue;
+    if (q->op == TCCIR_OP_LOAD_INDEXED || q->op == TCCIR_OP_STORE_INDEXED ||
+        q->op == TCCIR_OP_LOAD_POSTINC || q->op == TCCIR_OP_STORE_POSTINC)
+      return 1;
+    IROperand ops[3];
+    int nops = 0;
+    if (irop_config[q->op].has_dest) ops[nops++] = tcc_ir_op_get_dest(ir, q);
+    if (irop_config[q->op].has_src1) ops[nops++] = tcc_ir_op_get_src1(ir, q);
+    if (irop_config[q->op].has_src2) ops[nops++] = tcc_ir_op_get_src2(ir, q);
+    for (int k = 0; k < nops; k++)
+    {
+      if (!ops[k].is_local || irop_get_tag(ops[k]) != IROP_TAG_STACKOFF)
+        continue;
+      int32_t off = irop_get_stack_offset(ops[k]);
+      for (int m = 0; m < st->n_mem; m++)
+      {
+        if (st->mem[m].written && st->mem[m].offset == off)
+          return 1;
+      }
+    }
+  }
+  return 0;
 }
 
 /* Determine whether a VAR vreg is read after `from_idx` (anywhere outside
@@ -1284,7 +1401,7 @@ static int lcs_generic_loop_is_stack_local(TCCIRState *ir, int start_idx,
 {
   uint8_t addr_var[LCS_MAX_TRACKED_VARS] = {0};
   uint8_t addr_tmp[LCS_MAX_TRACKED_TMPS] = {0};
-  int saw_stack_mem = 0;
+  int saw_stack_mem __attribute__((unused)) = 0;
 
   for (int i = start_idx; i <= end_idx; i++)
   {
@@ -1299,8 +1416,13 @@ static int lcs_generic_loop_is_stack_local(TCCIRState *ir, int start_idx,
         q->op == TCCIR_OP_LOAD_POSTINC || q->op == TCCIR_OP_STORE_POSTINC)
       return 0;
 
+    int is_call = (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID);
+
     for (int k = 0; k < 3; k++)
     {
+      if (is_call) continue;
+      if (q->op == TCCIR_OP_FUNCPARAMVOID) continue;
+      if (q->op == TCCIR_OP_FUNCPARAMVAL && k == 2) continue;
       IROperand op = ops[k];
       if (irop_is_none(op) || irop_is_immediate(op))
         continue;
@@ -1388,7 +1510,7 @@ static int lcs_generic_loop_is_stack_local(TCCIRState *ir, int start_idx,
       }
     }
   }
-  return saw_stack_mem;
+  return 1;
 }
 
 /* Try to fold a single loop.  Returns 1 if folded, 0 otherwise. */
@@ -1417,7 +1539,6 @@ static int lcs_try_fold(TCCIRState *ir, IRLoop *loop)
     if (trip_count > 0 && trip_count <= LCS_MAX_TRIP_COUNT)
       have_iv_trip = 1;
   }
-
   /* Compute effective loop range.  The loop detector may report a tight
    * range like [3..8] that omits the body when control flow is rotated
    * (header at 3 jumps to body at 9, body loops back to 6).  We take the
@@ -1537,10 +1658,7 @@ static int lcs_try_fold(TCCIRState *ir, IRLoop *loop)
     LcsStep step = lcs_exec(ir, &st, q, pc,
                             eff_start, eff_end,
                             cmp_idx, jmpif_idx, exit_target);
-    if (step.action == 0) {
-      sim_ok = 0;
-      break;
-    }
+    if (step.action == 0) { sim_ok = 0; break; }
     if (step.action == -1) break;  /* iteration finished, loop exited */
     if (step.action == 2) {
       if (!have_iv_trip && step.next_pc <= pc)
@@ -1563,6 +1681,22 @@ static int lcs_try_fold(TCCIRState *ir, IRLoop *loop)
   }
 
   if (!sim_ok || st.mem_overflow)
+  {
+    tcc_free(st.vars);
+    tcc_free(st.tmps);
+    tcc_free(st.calls);
+    tcc_free(st.mem);
+    return 0;
+  }
+
+  /* For generic bounded simulation (no IV trip count), bail when the loop
+   * modifies stack memory that is accessed after the loop — the simulator
+   * might be running a switch-dispatch pattern that the loop detector
+   * falsely identified as a loop.  IV-trip loops are safe: the trip count
+   * guarantees real iteration and the residual STOREs correctly capture
+   * the final state.  Loop-internal temporaries (stack slots only
+   * referenced within the loop body) are safe to ignore. */
+  if (!have_iv_trip && lcs_any_mem_used_after(ir, &st, exit_target))
   {
     tcc_free(st.vars);
     tcc_free(st.tmps);
@@ -1620,9 +1754,18 @@ static int lcs_try_fold(TCCIRState *ir, IRLoop *loop)
   int slot_pos = eff_start;
   int slot_end = eff_end;
 
-  /* Final IV value (if needed) */
+  /* Final IV value: use the simulation's actual final value (which accounts
+   * for early exits) rather than the IV-bound formula, since the loop may
+   * have exited before trip_count iterations via a data-dependent condition. */
   int iv_pos = have_iv_trip ? TCCIR_DECODE_VREG_POSITION(iv->vreg) : -1;
-  int iv_final_val = have_iv_trip ? iv->init_val + trip_count * iv->step : 0;
+  int iv_final_val = 0;
+  if (have_iv_trip) {
+    if (TCCIR_DECODE_VREG_TYPE(iv->vreg) == TCCIR_VREG_TYPE_VAR &&
+        iv_pos < st.n_vars && st.vars[iv_pos].known)
+      iv_final_val = (int)st.vars[iv_pos].value;
+    else
+      iv_final_val = iv->init_val + trip_count * iv->step;
+  }
 
   /* NOP the entire effective loop range first */
   for (int i = eff_start; i <= eff_end; i++)
@@ -1761,10 +1904,54 @@ int tcc_ir_opt_loop_const_sim(TCCIRState *ir)
   if (!loops)
     return 0;
 
+  /* Merge overlapping loops — same as the unroller does.  A C for-loop
+   * often produces two backward edges creating two detected loops that
+   * are really one.  Merge them so LCS sees the full loop body. */
+  for (int i = 0; i < loops->num_loops; i++)
+  {
+    if (loops->loops[i].start_idx < 0)
+      continue;
+    int merged;
+    do
+    {
+      merged = 0;
+      for (int j = 0; j < loops->num_loops; j++)
+      {
+        if (j == i || loops->loops[j].start_idx < 0)
+          continue;
+        IRLoop *a = &loops->loops[i];
+        IRLoop *b = &loops->loops[j];
+        if (a->start_idx <= b->end_idx && b->start_idx <= a->end_idx)
+        {
+          if (b->start_idx < a->start_idx)
+          {
+            a->header_idx = b->header_idx;
+            a->start_idx = b->start_idx;
+            a->preheader_idx = b->preheader_idx;
+          }
+          if (b->end_idx > a->end_idx)
+            a->end_idx = b->end_idx;
+          if (b->depth < a->depth)
+            a->depth = b->depth;
+          tcc_free(a->body_instrs);
+          int new_size = a->end_idx - a->start_idx + 1;
+          a->body_instrs = tcc_mallocz(sizeof(int) * new_size);
+          a->body_instrs_capacity = new_size;
+          a->num_body_instrs = 0;
+          for (int k = a->start_idx; k <= a->end_idx; k++)
+            a->body_instrs[a->num_body_instrs++] = k;
+          b->start_idx = -1;
+          merged = 1;
+        }
+      }
+    } while (merged);
+  }
+
   int changes = 0;
   for (int li = 0; li < loops->num_loops; li++)
   {
     IRLoop *loop = &loops->loops[li];
+    if (loop->start_idx < 0) continue;
     /* Skip nested loops (depth > 1 — outermost loops have depth=1) */
     if (loop->depth > 1) continue;
     /* Skip very large loop ranges to keep cost bounded */

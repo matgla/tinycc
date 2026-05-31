@@ -2250,6 +2250,16 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
        * equivalences from one instruction are not valid in the next. */
       tcc_gen_machine_mov_coalesce_reset();
 
+      /* Invalidate imm_cache for registers assigned to live vregs.
+       * Free (dead) registers retain cached constants across IR boundaries.
+       * Full reset at jump targets / calls where control flow is non-linear. */
+      if (cq->is_jump_target ||
+          cq->op == TCCIR_OP_FUNCCALLVAL || cq->op == TCCIR_OP_FUNCCALLVOID)
+        tcc_gen_machine_imm_cache_reset();
+      else if (ir->ls.live_regs_by_instruction &&
+               i < ir->ls.live_regs_by_instruction_size)
+        tcc_gen_machine_imm_cache_invalidate_live(ir->ls.live_regs_by_instruction[i]);
+
       /* Real-run only: record original-index mapping and emit debug line info */
       if (!is_dry_run)
       {
@@ -2724,6 +2734,120 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
         if (a.dest.kind == MACH_OP_NONE || a.src1.kind == MACH_OP_NONE)
           tcc_error("compiler_error: LOAD operand produced MACH_OP_NONE (i=%d dest_kind=%d src_kind=%d)", i,
                     a.dest.kind, a.src1.kind);
+
+        /* Block copy peephole: consecutive LOAD-from-spill + STORE-to-spill pairs
+         * with sequential offsets → single LDM/STM block copy.
+         * Safety: all loads must use the same destination register, proving each
+         * loaded value is dead after the store (just a temporary for the copy).
+         * If different registers are used, the values are live past the copy. */
+        if (a.dest.kind == MACH_OP_REG && !a.dest.needs_deref &&
+            a.src1.kind == MACH_OP_SPILL && !a.src1.needs_deref && !a.src1.is_64bit &&
+            (a.src1.btype == IROP_BTYPE_INT32 || a.src1.btype == IROP_BTYPE_FLOAT32) &&
+            (a.src1.u.spill.offset & 3) == 0)
+        {
+          int first_load_reg = a.dest.u.reg.r0;
+          int store_i = -1;
+          for (int j = i + 1; j < ir->next_instruction_index; j++)
+          {
+            if (ir->compact_instructions[j].op != TCCIR_OP_NOP)
+            {
+              store_i = j;
+              break;
+            }
+          }
+          if (store_i >= 0 && ir->compact_instructions[store_i].op == TCCIR_OP_STORE &&
+              !ir->compact_instructions[store_i].is_jump_target)
+          {
+            IRQuadCompact *sq = &ir->compact_instructions[store_i];
+            IROperand s_src1 = tcc_ir_op_get_src1(ir, sq);
+            IROperand s_src2 = tcc_ir_op_get_src2(ir, sq);
+            IROperand s_dest = tcc_ir_op_get_dest(ir, sq);
+            MopArgs sa = ir_decode_cached(is_dry_run, 0, NULL, store_i, ir, sq,
+                                          &s_src1, &s_src2, &s_dest,
+                                          (MopSpec){.dest = 1, .src1 = 2});
+
+            if (sa.dest.kind == MACH_OP_SPILL && !sa.dest.needs_deref && !sa.src1.is_64bit &&
+                sa.src1.kind == MACH_OP_REG && sa.src1.u.reg.r0 == first_load_reg &&
+                (sa.dest.btype == IROP_BTYPE_INT32 || sa.dest.btype == IROP_BTYPE_FLOAT32) &&
+                (sa.dest.u.spill.offset & 3) == 0)
+            {
+              int32_t src_base = a.src1.u.spill.offset;
+              int32_t dst_base = sa.dest.u.spill.offset;
+              int count = 1;
+              int last_i = store_i;
+
+              while (count < 32)
+              {
+                int next_load_i = -1;
+                for (int j = last_i + 1; j < ir->next_instruction_index; j++)
+                {
+                  if (ir->compact_instructions[j].op != TCCIR_OP_NOP)
+                  {
+                    next_load_i = j;
+                    break;
+                  }
+                }
+                if (next_load_i < 0 || ir->compact_instructions[next_load_i].op != TCCIR_OP_LOAD ||
+                    ir->compact_instructions[next_load_i].is_jump_target)
+                  break;
+
+                IRQuadCompact *lq = &ir->compact_instructions[next_load_i];
+                IROperand l_src1 = tcc_ir_op_get_src1(ir, lq);
+                IROperand l_src2 = tcc_ir_op_get_src2(ir, lq);
+                IROperand l_dest = tcc_ir_op_get_dest(ir, lq);
+                MopArgs la = ir_decode_cached(is_dry_run, 0, NULL, next_load_i, ir, lq,
+                                              &l_src1, &l_src2, &l_dest,
+                                              (MopSpec){.dest = 1, .src1 = 2});
+
+                if (la.src1.kind != MACH_OP_SPILL || la.src1.needs_deref || la.src1.is_64bit ||
+                    la.src1.u.spill.offset != src_base + count * 4 ||
+                    (la.src1.btype != IROP_BTYPE_INT32 && la.src1.btype != IROP_BTYPE_FLOAT32))
+                  break;
+
+                if (la.dest.kind != MACH_OP_REG || la.dest.u.reg.r0 != first_load_reg)
+                  break;
+
+                int next_store_i = -1;
+                for (int j = next_load_i + 1; j < ir->next_instruction_index; j++)
+                {
+                  if (ir->compact_instructions[j].op != TCCIR_OP_NOP)
+                  {
+                    next_store_i = j;
+                    break;
+                  }
+                }
+                if (next_store_i < 0 || ir->compact_instructions[next_store_i].op != TCCIR_OP_STORE ||
+                    ir->compact_instructions[next_store_i].is_jump_target)
+                  break;
+
+                IRQuadCompact *sq2 = &ir->compact_instructions[next_store_i];
+                IROperand s2_src1 = tcc_ir_op_get_src1(ir, sq2);
+                IROperand s2_src2 = tcc_ir_op_get_src2(ir, sq2);
+                IROperand s2_dest = tcc_ir_op_get_dest(ir, sq2);
+                MopArgs sa2 = ir_decode_cached(is_dry_run, 0, NULL, next_store_i, ir, sq2,
+                                               &s2_src1, &s2_src2, &s2_dest,
+                                               (MopSpec){.dest = 1, .src1 = 2});
+
+                if (sa2.dest.kind != MACH_OP_SPILL || sa2.dest.needs_deref || sa2.src1.is_64bit ||
+                    sa2.dest.u.spill.offset != dst_base + count * 4 ||
+                    sa2.src1.kind != MACH_OP_REG || sa2.src1.u.reg.r0 != first_load_reg ||
+                    (sa2.dest.btype != IROP_BTYPE_INT32 && sa2.dest.btype != IROP_BTYPE_FLOAT32))
+                  break;
+
+                count++;
+                last_i = next_store_i;
+              }
+
+              if (count >= 8)
+              {
+                SCRATCH_WRAP(tcc_gen_machine_spill_block_copy(src_base, dst_base, count));
+                i = last_i;
+                break;
+              }
+            }
+          }
+        }
+
         SCRATCH_WRAP(tcc_gen_machine_load_mop(a.src1, a.dest, cq->op));
         break;
       }
@@ -2774,7 +2898,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
               int reg1 = a.src1.u.reg.r0;
               int reg2 = b.src1.u.reg.r0;
 
-              if (reg1 != reg2 && off1 + 4 == off2)
+              if (off1 + 4 == off2)
               {
                 if (tcc_gen_machine_try_strd_spill(reg1, reg2, off1, off2))
                 {
@@ -2783,13 +2907,69 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
                   break;
                 }
               }
-              else if (reg1 != reg2 && off2 + 4 == off1)
+              else if (off2 + 4 == off1)
               {
                 if (tcc_gen_machine_try_strd_spill(reg2, reg1, off2, off1))
                 {
                   i = next_i;
                   break;
                 }
+              }
+            }
+          }
+        }
+
+        /* STRD peephole (immediate-to-spill form): two consecutive stores of
+         * immediate constants to adjacent spill slots → single STRD.
+         * The helper materializes the constants into scratch registers. */
+        if (a.dest.kind == MACH_OP_SPILL && !a.dest.needs_deref &&
+            a.src1.kind == MACH_OP_IMM && !a.src1.is_64bit &&
+            (a.dest.btype == IROP_BTYPE_INT32 || a.dest.btype == IROP_BTYPE_FLOAT32) &&
+            (a.dest.u.spill.offset & 3) == 0)
+        {
+          int next_i = -1;
+          for (int j = i + 1; j < ir->next_instruction_index; j++)
+          {
+            if (ir->compact_instructions[j].op != TCCIR_OP_NOP)
+            {
+              next_i = j;
+              break;
+            }
+          }
+          if (next_i >= 0 && ir->compact_instructions[next_i].op == TCCIR_OP_STORE &&
+              !ir->compact_instructions[next_i].is_jump_target)
+          {
+            IRQuadCompact *nq = &ir->compact_instructions[next_i];
+            IROperand n_src1_ir = tcc_ir_op_get_src1(ir, nq);
+            IROperand n_src2_ir = tcc_ir_op_get_src2(ir, nq);
+            IROperand n_dest_ir = tcc_ir_op_get_dest(ir, nq);
+            MopArgs b = ir_decode_cached(is_dry_run, 0, NULL, next_i, ir, nq,
+                                         &n_src1_ir, &n_src2_ir, &n_dest_ir,
+                                         (MopSpec){.dest = 1, .src1 = 2});
+
+            if (b.dest.kind == MACH_OP_SPILL && !b.dest.needs_deref &&
+                b.src1.kind == MACH_OP_IMM && !b.src1.is_64bit &&
+                (b.dest.btype == IROP_BTYPE_INT32 || b.dest.btype == IROP_BTYPE_FLOAT32) &&
+                (b.dest.u.spill.offset & 3) == 0)
+            {
+              int32_t off1 = a.dest.u.spill.offset;
+              int32_t off2 = b.dest.u.spill.offset;
+              int64_t val1 = a.src1.u.imm.val;
+              int64_t val2 = b.src1.u.imm.val;
+              int strd_ok = 0;
+
+              if (off1 + 4 == off2)
+              {
+                SCRATCH_WRAP(strd_ok = tcc_gen_machine_try_strd_imm_spill(val1, val2, off1, off2));
+              }
+              else if (off2 + 4 == off1)
+              {
+                SCRATCH_WRAP(strd_ok = tcc_gen_machine_try_strd_imm_spill(val2, val1, off2, off1));
+              }
+              if (strd_ok)
+              {
+                i = next_i;
+                break;
               }
             }
           }
@@ -2837,7 +3017,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
               int base_reg = a.dest.u.reg.r0;
               int32_t off2 = (int32_t)b.src2.u.imm.val;
 
-              if (reg1 != reg2 && off2 == 4)
+              if (off2 == 4)
               {
                 if (tcc_gen_machine_try_strd_base(reg1, reg2, base_reg, 0))
                 {
@@ -2845,6 +3025,96 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
                   break;
                 }
               }
+            }
+          }
+        }
+
+        /* STRD peephole (deref-through-vreg form, IMM sources): pair a plain
+         * STORE of an immediate through a register-deref destination (offset 0)
+         * with an immediately-following STORE_INDEXED of an immediate through
+         * the same base vreg at offset +4.  Mirrors the REG-source variant
+         * above; here both values are constants materialised into scratch regs
+         * before the paired store. */
+        if (a.dest.kind == MACH_OP_REG && a.dest.needs_deref &&
+            a.src1.kind == MACH_OP_IMM && !a.src1.is_64bit &&
+            (a.dest.btype == IROP_BTYPE_INT32 || a.dest.btype == IROP_BTYPE_FLOAT32))
+        {
+          int next_i = -1;
+          for (int j = i + 1; j < ir->next_instruction_index; j++)
+          {
+            if (ir->compact_instructions[j].op != TCCIR_OP_NOP)
+            {
+              next_i = j;
+              break;
+            }
+          }
+          if (next_i >= 0 && ir->compact_instructions[next_i].op == TCCIR_OP_STORE_INDEXED &&
+              !ir->compact_instructions[next_i].is_jump_target)
+          {
+            IRQuadCompact *nq = &ir->compact_instructions[next_i];
+            IROperand n_src1_ir = tcc_ir_op_get_src1(ir, nq);
+            IROperand n_src2_ir = tcc_ir_op_get_src2(ir, nq);
+            IROperand n_dest_ir = tcc_ir_op_get_dest(ir, nq);
+            MopArgs b = ir_decode_cached(is_dry_run, 0, NULL, next_i, ir, nq, &n_src1_ir, &n_src2_ir, &n_dest_ir,
+                                         (MopSpec){.dest = 1, .src1 = 1, .src2 = 1, .scale = 1});
+
+            if (b.src1.kind == MACH_OP_IMM && !b.src1.is_64bit &&
+                b.scale.kind == MACH_OP_IMM && b.scale.u.imm.val == 0 &&
+                b.src2.kind == MACH_OP_IMM &&
+                b.dest.kind == MACH_OP_REG && !b.dest.needs_deref &&
+                (b.src1.btype == IROP_BTYPE_INT32 || b.src1.btype == IROP_BTYPE_FLOAT32) &&
+                a.dest.u.reg.r0 == b.dest.u.reg.r0)
+            {
+              int32_t off2 = (int32_t)b.src2.u.imm.val;
+              if (off2 == 4)
+              {
+                if (tcc_gen_machine_try_strd_imm_base(a.src1.u.imm.val, b.src1.u.imm.val,
+                                                       a.dest.u.reg.r0, 0))
+                {
+                  i = next_i;
+                  break;
+                }
+              }
+            }
+          }
+        }
+
+        /* Store-load forwarding: STORE reg → spill followed immediately by
+         * LOAD from the same spill → same reg.  The value is still in the
+         * register, so emit the store but skip the redundant load. */
+        if (a.dest.kind == MACH_OP_SPILL && !a.dest.needs_deref &&
+            a.src1.kind == MACH_OP_REG && !a.src1.is_64bit &&
+            (a.dest.u.spill.offset & 3) == 0)
+        {
+          int next_i = -1;
+          for (int j = i + 1; j < ir->next_instruction_index; j++)
+          {
+            if (ir->compact_instructions[j].op != TCCIR_OP_NOP)
+            {
+              next_i = j;
+              break;
+            }
+          }
+          if (next_i >= 0 && ir->compact_instructions[next_i].op == TCCIR_OP_LOAD &&
+              !ir->compact_instructions[next_i].is_jump_target)
+          {
+            IRQuadCompact *lq = &ir->compact_instructions[next_i];
+            IROperand l_src1 = tcc_ir_op_get_src1(ir, lq);
+            IROperand l_src2 = tcc_ir_op_get_src2(ir, lq);
+            IROperand l_dest = tcc_ir_op_get_dest(ir, lq);
+            MopArgs la = ir_decode_cached(is_dry_run, 0, NULL, next_i, ir, lq,
+                                          &l_src1, &l_src2, &l_dest,
+                                          (MopSpec){.dest = 1, .src1 = 1});
+
+            if (la.src1.kind == MACH_OP_SPILL && !la.src1.needs_deref &&
+                la.src1.u.spill.offset == a.dest.u.spill.offset &&
+                la.dest.kind == MACH_OP_REG && !la.dest.is_64bit &&
+                la.dest.u.reg.r0 == a.src1.u.reg.r0 &&
+                la.src1.btype == a.dest.btype)
+            {
+              SCRATCH_WRAP(tcc_gen_machine_store_mop(a.dest, a.src1, cq->op));
+              i = next_i;
+              break;
             }
           }
         }
@@ -2932,7 +3202,10 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
         MopArgs a = DECODE(.dest = 1, .src1 = 1, .src2 = 1, .scale = 1);
 
         /* STRD pairing peephole: two adjacent 32-bit STORE_INDEXED ops with
-         * same base, scale=0, offsets differing by 4 → single STRD. */
+         * same base, scale=0, offsets differing by 4 → single STRD.
+         * Only for REG sources — IMM STRD through generic base registers is
+         * unsafe because STRD requires 4-byte aligned addresses while
+         * individual STR tolerates unaligned access on ARMv8-M. */
         if (!a.src1.is_64bit && a.src1.kind == MACH_OP_REG &&
             a.scale.kind == MACH_OP_IMM && a.scale.u.imm.val == 0 &&
             a.src2.kind == MACH_OP_IMM &&
@@ -2994,26 +3267,217 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
               int reg2 = b.src1.u.reg.r0;
               int base_reg = a.dest.u.reg.r0;
 
-              if (reg1 != reg2)
+              if ((off1 & 3) == 0 && off1 + 4 == off2)
               {
-                if ((off1 & 3) == 0 && off1 + 4 == off2)
+                if (tcc_gen_machine_try_strd_base(reg1, reg2, base_reg, off1))
                 {
-                  if (tcc_gen_machine_try_strd_base(reg1, reg2, base_reg, off1))
-                  {
-                    i = next_i;
-                    break;
-                  }
+                  i = next_i;
+                  break;
                 }
-                else if ((off2 & 3) == 0 && off2 + 4 == off1)
+              }
+              else if ((off2 & 3) == 0 && off2 + 4 == off1)
+              {
+                if (tcc_gen_machine_try_strd_base(reg2, reg1, base_reg, off2))
                 {
-                  if (tcc_gen_machine_try_strd_base(reg2, reg1, base_reg, off2))
-                  {
-                    i = next_i;
-                    break;
-                  }
+                  i = next_i;
+                  break;
                 }
               }
             }
+          }
+        }
+
+        /* STRD pairing peephole for IMM-source STORE_INDEXED ops: two adjacent
+         * stores of immediate values to consecutive word-aligned offsets from
+         * the same base register → materialise constants into scratch regs,
+         * emit a single STRD.  Mirrors the REG-source peephole above. */
+        if (a.src1.kind == MACH_OP_IMM && !a.src1.is_64bit &&
+            a.scale.kind == MACH_OP_IMM && a.scale.u.imm.val == 0 &&
+            a.src2.kind == MACH_OP_IMM &&
+            a.dest.kind == MACH_OP_REG && !a.dest.needs_deref &&
+            (a.src1.btype == IROP_BTYPE_INT32 || a.src1.btype == IROP_BTYPE_FLOAT32))
+        {
+          int next_i = -1;
+          for (int j = i + 1; j < ir->next_instruction_index; j++)
+          {
+            if (ir->compact_instructions[j].op != TCCIR_OP_NOP)
+            {
+              next_i = j;
+              break;
+            }
+          }
+          if (next_i >= 0 && ir->compact_instructions[next_i].op == TCCIR_OP_STORE_INDEXED &&
+              !ir->compact_instructions[next_i].is_jump_target)
+          {
+            IRQuadCompact *nq = &ir->compact_instructions[next_i];
+            IROperand n_src1_ir = tcc_ir_op_get_src1(ir, nq);
+            IROperand n_src2_ir = tcc_ir_op_get_src2(ir, nq);
+            IROperand n_dest_ir = tcc_ir_op_get_dest(ir, nq);
+            MopArgs b = ir_decode_cached(is_dry_run, 0, NULL, next_i, ir, nq, &n_src1_ir, &n_src2_ir, &n_dest_ir,
+                                         (MopSpec){.dest = 1, .src1 = 1, .src2 = 1, .scale = 1});
+
+            if (b.src1.kind == MACH_OP_IMM && !b.src1.is_64bit &&
+                b.scale.kind == MACH_OP_IMM && b.scale.u.imm.val == 0 &&
+                b.src2.kind == MACH_OP_IMM &&
+                b.dest.kind == MACH_OP_REG && !b.dest.needs_deref &&
+                (b.src1.btype == IROP_BTYPE_INT32 || b.src1.btype == IROP_BTYPE_FLOAT32) &&
+                a.dest.u.reg.r0 == b.dest.u.reg.r0)
+            {
+              int32_t off1 = (int32_t)a.src2.u.imm.val;
+              int32_t off2 = (int32_t)b.src2.u.imm.val;
+              int base_reg = a.dest.u.reg.r0;
+
+              if ((off1 & 3) == 0 && off1 + 4 == off2)
+              {
+                if (tcc_gen_machine_try_strd_imm_base(a.src1.u.imm.val, b.src1.u.imm.val,
+                                                       base_reg, off1))
+                {
+                  i = next_i;
+                  break;
+                }
+              }
+              else if ((off2 & 3) == 0 && off2 + 4 == off1)
+              {
+                if (tcc_gen_machine_try_strd_imm_base(b.src1.u.imm.val, a.src1.u.imm.val,
+                                                       base_reg, off2))
+                {
+                  i = next_i;
+                  break;
+                }
+              }
+            }
+          }
+        }
+
+        /* Byte-to-word coalescing peephole: four consecutive byte
+         * STORE_INDEXEDs with immediate sources to word-aligned consecutive
+         * offsets on the same base → single word store of the packed constant.
+         * Saves 3 constant loads + 3 strb → 1 movs + 1 str. */
+        if (a.src1.kind == MACH_OP_IMM && !a.src1.is_64bit &&
+            a.src1.btype == IROP_BTYPE_INT8 &&
+            a.scale.kind == MACH_OP_IMM && a.scale.u.imm.val == 0 &&
+            a.src2.kind == MACH_OP_IMM &&
+            ((int32_t)a.src2.u.imm.val & 3) == 0)
+        {
+          int32_t base_off = (int32_t)a.src2.u.imm.val;
+          uint32_t combined = (uint32_t)(a.src1.u.imm.val & 0xFF);
+          int last_i = i;
+          int found = 0;
+
+          for (int k = 1; k <= 3; k++)
+          {
+            int next_i = -1;
+            for (int j = last_i + 1; j < ir->next_instruction_index; j++)
+            {
+              if (ir->compact_instructions[j].op != TCCIR_OP_NOP)
+              {
+                next_i = j;
+                break;
+              }
+            }
+            if (next_i < 0 ||
+                ir->compact_instructions[next_i].op != TCCIR_OP_STORE_INDEXED ||
+                ir->compact_instructions[next_i].is_jump_target)
+              break;
+
+            IRQuadCompact *nq = &ir->compact_instructions[next_i];
+            IROperand n_src1_ir = tcc_ir_op_get_src1(ir, nq);
+            IROperand n_src2_ir = tcc_ir_op_get_src2(ir, nq);
+            IROperand n_dest_ir = tcc_ir_op_get_dest(ir, nq);
+            MopArgs b = ir_decode_cached(is_dry_run, 0, NULL, next_i, ir, nq,
+                                         &n_src1_ir, &n_src2_ir, &n_dest_ir,
+                                         (MopSpec){.dest = 1, .src1 = 1, .src2 = 1, .scale = 1});
+
+            if (b.src1.kind != MACH_OP_IMM || b.src1.is_64bit ||
+                b.src1.btype != IROP_BTYPE_INT8 ||
+                b.scale.kind != MACH_OP_IMM || b.scale.u.imm.val != 0 ||
+                b.src2.kind != MACH_OP_IMM ||
+                (int32_t)b.src2.u.imm.val != base_off + k)
+              break;
+
+            if (b.dest.kind != a.dest.kind)
+              break;
+            if (a.dest.kind == MACH_OP_REG &&
+                (b.dest.u.reg.r0 != a.dest.u.reg.r0 || b.dest.needs_deref != a.dest.needs_deref))
+              break;
+            if (a.dest.kind == MACH_OP_FRAME_ADDR &&
+                b.dest.u.frame.offset != a.dest.u.frame.offset)
+              break;
+
+            combined |= (uint32_t)(b.src1.u.imm.val & 0xFF) << (k * 8);
+            last_i = next_i;
+            found++;
+          }
+
+          if (found == 3)
+          {
+            uint32_t combined2 = 0;
+            int last_i2 = last_i;
+            int found2 = 0;
+            for (int k = 0; k <= 3; k++)
+            {
+              int next_i2 = -1;
+              for (int j = last_i2 + 1; j < ir->next_instruction_index; j++)
+              {
+                if (ir->compact_instructions[j].op != TCCIR_OP_NOP)
+                {
+                  next_i2 = j;
+                  break;
+                }
+              }
+              if (next_i2 < 0 ||
+                  ir->compact_instructions[next_i2].op != TCCIR_OP_STORE_INDEXED ||
+                  ir->compact_instructions[next_i2].is_jump_target)
+                break;
+
+              IRQuadCompact *nq2 = &ir->compact_instructions[next_i2];
+              IROperand ns1 = tcc_ir_op_get_src1(ir, nq2);
+              IROperand ns2 = tcc_ir_op_get_src2(ir, nq2);
+              IROperand nd = tcc_ir_op_get_dest(ir, nq2);
+              MopArgs c = ir_decode_cached(is_dry_run, 0, NULL, next_i2, ir, nq2,
+                                           &ns1, &ns2, &nd,
+                                           (MopSpec){.dest = 1, .src1 = 1, .src2 = 1, .scale = 1});
+
+              if (c.src1.kind != MACH_OP_IMM || c.src1.is_64bit ||
+                  c.src1.btype != IROP_BTYPE_INT8 ||
+                  c.scale.kind != MACH_OP_IMM || c.scale.u.imm.val != 0 ||
+                  c.src2.kind != MACH_OP_IMM ||
+                  (int32_t)c.src2.u.imm.val != base_off + 4 + k)
+                break;
+              if (c.dest.kind != a.dest.kind)
+                break;
+              if (a.dest.kind == MACH_OP_REG &&
+                  (c.dest.u.reg.r0 != a.dest.u.reg.r0 || c.dest.needs_deref != a.dest.needs_deref))
+                break;
+              if (a.dest.kind == MACH_OP_FRAME_ADDR &&
+                  c.dest.u.frame.offset != a.dest.u.frame.offset)
+                break;
+
+              combined2 |= (uint32_t)(c.src1.u.imm.val & 0xFF) << (k * 8);
+              last_i2 = next_i2;
+              found2++;
+            }
+
+            if (found2 == 4 && a.dest.kind == MACH_OP_REG && !a.dest.needs_deref)
+            {
+              int strd_ok = 0;
+              int base_reg = a.dest.u.reg.r0;
+              int32_t word_off = base_off;
+              SCRATCH_WRAP(strd_ok = tcc_gen_machine_try_strd_imm_base(
+                  (int64_t)(int32_t)combined, (int64_t)(int32_t)combined2, base_reg, word_off));
+              if (strd_ok)
+              {
+                i = last_i2;
+                break;
+              }
+            }
+
+            MachineOperand word_val = a.src1;
+            word_val.btype = IROP_BTYPE_INT32;
+            word_val.u.imm.val = (int64_t)(int32_t)combined;
+            SCRATCH_WRAP(tcc_gen_machine_store_indexed_mop(a.dest, a.src2, a.scale, word_val, cq->op));
+            i = last_i;
+            break;
           }
         }
 
@@ -3630,7 +4094,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
 
   if (!ir->naked)
   {
-    if (!ir->noreturn)
+    if (!ir->noreturn && !ir->tail_call_only)
       tcc_gen_machine_epilog(ir->leaffunc);
     else
       tcc_gen_machine_finish_noreturn();

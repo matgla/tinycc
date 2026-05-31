@@ -170,6 +170,13 @@ int tcc_ir_opt_setif_or_tautology(TCCIRState *ir)
   size_t tbl_bytes = sizeof(BoolInfo) * (size_t)(max_tmp + 1);
   BoolInfo *tbl = (BoolInfo *)tcc_mallocz(tbl_bytes);
   int *block_start_seen = (int *)tcc_mallocz(sizeof(int) * n);
+  /* Positions of tracker entries set in the current basic block. The
+   * invalidate path scans only these instead of all max_tmp+1 slots, so a
+   * function with no SETIF/OR chains (the common case) costs O(n) rather than
+   * O(n * max_tmp). Reset at every BB boundary; at most one push per
+   * instruction, so n slots always suffice. */
+  int *active_pos = (int *)tcc_malloc(sizeof(int) * n);
+  int active_n = 0;
   int block_gen = 1;
   uint32_t current_gen = 1;
   int changes = 0;
@@ -180,7 +187,10 @@ int tcc_ir_opt_setif_or_tautology(TCCIRState *ir)
   {
     /* BB boundary — invalidate all tracker entries. */
     if (i != 0 && block_start_seen[i] == block_gen)
+    {
       current_gen++;
+      active_n = 0;
+    }
 
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP)
@@ -243,6 +253,7 @@ int tcc_ir_opt_setif_or_tautology(TCCIRState *ir)
         continue;
       }
       tbl[dpos] = bi;
+      active_pos[active_n++] = dpos;
       continue;
     }
 
@@ -284,6 +295,7 @@ int tcc_ir_opt_setif_or_tautology(TCCIRState *ir)
       /* Always record the combined mask for downstream ORs in the chain. */
       tbl[dpos] = tbl[p1];
       tbl[dpos].mask = combined;
+      active_pos[active_n++] = dpos;
 
       if (combined == 0b111)
       {
@@ -316,8 +328,11 @@ int tcc_ir_opt_setif_or_tautology(TCCIRState *ir)
           if (dpos <= max_tmp)
             tbl[dpos].gen = 0;
         }
-        for (int j = 0; j <= max_tmp; j++)
+        /* Drop any active tracker entry that reads dvr as a CMP operand.
+         * Scans only the entries set in this BB, not the whole table. */
+        for (int k = 0; k < active_n; k++)
         {
+          int j = active_pos[k];
           if (tbl[j].gen != current_gen)
             continue;
           if (tbl[j].s1_vr == dvr || tbl[j].s2_vr == dvr)
@@ -327,14 +342,16 @@ int tcc_ir_opt_setif_or_tautology(TCCIRState *ir)
       /* lvalue stores can mutate aliased values; be conservative. */
       if (dest.is_lval)
       {
-        for (int j = 0; j <= max_tmp; j++)
-          tbl[j].gen = 0;
+        for (int k = 0; k < active_n; k++)
+          tbl[active_pos[k]].gen = 0;
+        active_n = 0;
       }
     }
   }
 
   tcc_free(tbl);
   tcc_free(block_start_seen);
+  tcc_free(active_pos);
 
   return changes;
 }

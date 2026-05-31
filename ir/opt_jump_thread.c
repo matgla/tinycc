@@ -200,9 +200,21 @@ int tcc_ir_opt_eliminate_fallthrough(TCCIRState *ir)
     /* Find the next non-NOP instruction after this one (n == epilogue) */
     int next_real = find_first_non_nop(ir, i + 1);
 
-    /* If jump target equals the next real instruction, eliminate it */
+    /* If jump target equals the next real instruction, eliminate it.
+     * Also eliminate a JUMPIF whose target matches the target of the
+     * immediately following unconditional JMP (both arms converge). */
     if (target != next_real)
-      continue;
+    {
+      if (q->op != TCCIR_OP_JUMPIF || next_real >= n)
+        continue;
+      IRQuadCompact *nq = &ir->compact_instructions[next_real];
+      if (nq->op != TCCIR_OP_JUMP)
+        continue;
+      IROperand nd = tcc_ir_op_get_dest(ir, nq);
+      int next_target = (int)irop_get_imm64_ex(ir, nd);
+      if (next_target != target)
+        continue;
+    }
 
     /* For JUMPIF (conditional), avoid the case that exposes TCC's
      * non-aliasing-aware constant prop: removing a JUMPIF whose flag-setter

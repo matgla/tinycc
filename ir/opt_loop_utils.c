@@ -2013,6 +2013,18 @@ int find_loop_exit_condition(TCCIRState *ir, IRLoop *loop, int iv_vreg, int *out
         case TOK_LE:
           inv_cond = TOK_GT;
           break;
+        case TOK_UGE:
+          inv_cond = TOK_ULT;
+          break;
+        case TOK_UGT:
+          inv_cond = TOK_ULE;
+          break;
+        case TOK_ULT:
+          inv_cond = TOK_UGE;
+          break;
+        case TOK_ULE:
+          inv_cond = TOK_UGT;
+          break;
         case TOK_EQ:
           inv_cond = TOK_NE;
           break;
@@ -2061,11 +2073,13 @@ int compute_trip_count(int init_val, int limit, int step, int cond_token)
 
   switch (cond_token)
   {
+  case TOK_UGE:
   case TOK_GE: /* exit if iv >= limit → loop while iv < limit */
     if (range <= 0)
       return 0;
     return (int)((range + step - 1) / step);
 
+  case TOK_UGT:
   case TOK_GT: /* exit if iv > limit → loop while iv <= limit */
     if (range < 0)
       return 0;

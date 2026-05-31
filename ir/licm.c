@@ -1143,6 +1143,15 @@ static struct
     {"strpbrk", 2},
     {"strcspn", 2},
     {"strspn", 2},
+    /* TCC-internal renamed variants (read-only string functions) */
+    {"__tcc_strlen", 2},
+    {"__tcc_strcmp", 2},
+    {"__tcc_strnlen", 2},
+    {"__tcc_strpbrk", 2},
+    {"__tcc_strrchr", 2},
+    {"__tcc_strstr", 2},
+    {"__tcc_strcspn", 2},
+    {"__tcc_memcmp1", 2},
 
     /* Memory functions - PURE */
     {"memcmp", 2},
@@ -2111,11 +2120,12 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
    * because VLAs have special stack semantics - the size computation must
    * happen at the VLA allocation point, not in the preheader.
    */
-  /* Old LICM passes disabled — replaced by dominance-based LICM below. */
+  /* Pure call hoisting disabled for now — the call_id renumbering
+   * corrupts argument linkage in chained-call patterns.
+   * TODO: fix tcc_ir_hoist_pure_calls index tracking and re-enable. */
   int hoisted_calls = 0;
   int hoisted = 0;
   (void)hoisted_calls;
-  (void)hoisted;
 
   /* ── Dominance-based LICM ──
    * Uses proper CFG + dominator tree to detect natural loops and
@@ -2178,26 +2188,9 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
             continue;
           }
 
-          /* Skip loops containing calls (conservative — call side effects) */
-          int has_call = 0;
-          for (int bi = 0; bi < cfg->num_blocks && !has_call; bi++) {
-            if (!in_loop[bi])
-              continue;
-            for (int ii = cfg->blocks[bi].start_idx; ii < cfg->blocks[bi].end_idx; ii++) {
-              int op = ir->compact_instructions[ii].op;
-              if (op == TCCIR_OP_FUNCCALLVAL || op == TCCIR_OP_FUNCCALLVOID) {
-                has_call = 1;
-                break;
-              }
-            }
-          }
-          if (has_call) {
-            tcc_free(in_loop);
-            tcc_free(worklist);
-            continue;
-          }
-
-          /* Collect loop defs: vreg → def count */
+          /* Collect loop defs: vreg → def count.
+           * Index by type*stride+position so that V2 (VAR,pos=2) and
+           * P2 (PARAM,pos=2) don't collide. */
           int max_vr = 0;
           for (int bi = 0; bi < cfg->num_blocks; bi++) {
             if (!in_loop[bi])
@@ -2214,7 +2207,8 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
               }
             }
           }
-          int *def_count = tcc_mallocz((max_vr + 1) * sizeof(int));
+          int dc_stride = max_vr + 1;
+          int *def_count = tcc_mallocz(4 * dc_stride * sizeof(int));
           for (int bi = 0; bi < cfg->num_blocks; bi++) {
             if (!in_loop[bi])
               continue;
@@ -2225,8 +2219,9 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
               int32_t vr = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
               if (vr >= 0) {
                 int pos = TCCIR_DECODE_VREG_POSITION(vr);
+                int typ = TCCIR_DECODE_VREG_TYPE(vr);
                 if (pos <= max_vr)
-                  def_count[pos]++;
+                  def_count[typ * dc_stride + pos]++;
               }
             }
           }
@@ -2267,7 +2262,8 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
                   int32_t dvr = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
                   if (dvr >= 0) {
                     int dp = TCCIR_DECODE_VREG_POSITION(dvr);
-                    if (dp <= max_vr && def_count[dp] > 1)
+                    int dt = TCCIR_DECODE_VREG_TYPE(dvr);
+                    if (dp <= max_vr && def_count[dt * dc_stride + dp] > 1)
                       continue;
                     /* Check if vreg is also defined outside the loop */
                     int outside_def = 0;
@@ -2323,9 +2319,10 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
                     continue;
                   }
                   int vp = TCCIR_DECODE_VREG_POSITION(vr);
-                  if (vp <= max_vr && def_count[vp] > 0) {
+                  int vt = TCCIR_DECODE_VREG_TYPE(vr);
+                  if (vp <= max_vr && def_count[vt * dc_stride + vp] > 0) {
                     /* Defined in loop — only invariant if single-def and that def is invariant */
-                    if (def_count[vp] == 1) {
+                    if (def_count[vt * dc_stride + vp] == 1) {
                       /* Find the def instruction */
                       int found_inv = 0;
                       for (int bi2 = 0; bi2 < cfg->num_blocks && !found_inv; bi2++) {
@@ -2385,17 +2382,40 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
               insert_pos--;
           }
 
+          /* Skip functions containing SWITCH_TABLE: insert_instruction_before
+           * doesn't update switch table target indices, so hoisting corrupts
+           * the dispatch. */
+          {
+            int has_switch = 0;
+            for (int si3 = 0; si3 < ir->next_instruction_index; si3++) {
+              if (ir->compact_instructions[si3].op == TCCIR_OP_SWITCH_TABLE) {
+                has_switch = 1;
+                break;
+              }
+            }
+            if (has_switch) {
+              LOG_LICM("dom-LICM: skipping — function has SWITCH_TABLE");
+              tcc_free(is_invariant);
+              tcc_free(is_exit);
+              tcc_free(def_count);
+              tcc_free(in_loop);
+              tcc_free(worklist);
+              continue;
+            }
+          }
+
           /* Estimate how many values we can hoist without starving the loop body */
           int loop_start_idx = cfg->blocks[h].start_idx;
           int loop_end_idx = cfg->blocks[b].end_idx;
           int max_hoist = tcc_ir_estimate_hoist_budget(ir, loop_start_idx, loop_end_idx, ir->parameters_count);
 
           int total_hoisted_here = 0;
+          int body_shift = 0;
           for (int bi = 0; bi < cfg->num_blocks && total_hoisted_here < max_hoist; bi++) {
             if (!in_loop[bi])
               continue;
             for (int ii = cfg->blocks[bi].start_idx; ii < cfg->blocks[bi].end_idx; ii++) {
-              int adj_ii = ii + total_hoisted_here;
+              int adj_ii = ii + body_shift;
               if (adj_ii >= ir->next_instruction_index)
                 break;
               if (!is_invariant[ii])
@@ -2435,11 +2455,21 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
               insert_instruction_before(ir, adj_insert, &hoist_q);
               total_hoisted_here++;
 
-              /* NOP out the original (shifted by total_hoisted_here) */
-              ir->compact_instructions[adj_ii + 1].op = TCCIR_OP_NOP;
+              /* NOP out the original.  insert_instruction_before shifts
+               * all instructions at indices >= adj_insert.  If adj_insert
+               * was before or at adj_ii, the original moved to adj_ii+1;
+               * otherwise it stayed at adj_ii. */
+              int nop_pos;
+              if (adj_insert <= adj_ii) {
+                nop_pos = adj_ii + 1;
+                body_shift++;
+              } else {
+                nop_pos = adj_ii;
+              }
+              ir->compact_instructions[nop_pos].op = TCCIR_OP_NOP;
               hoisted++;
               LOG_LICM("dom-LICM: hoisted insn %d (adj %d) op=%d to preheader pos %d, NOP'd %d",
-                       ii, adj_ii, hoist_q.op, adj_insert, adj_ii + 1);
+                       ii, adj_ii, hoist_q.op, adj_insert, nop_pos);
             }
           }
 
@@ -2465,6 +2495,13 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
       }
     }
     tcc_ir_cfg_free(cfg);
+  }
+
+  /* Dom-LICM may have inserted instructions — re-detect loops so the
+   * caller (IV strength reduction) gets valid indices. */
+  if (hoisted > 0) {
+    tcc_ir_free_loops(loops);
+    loops = tcc_ir_detect_loops(ir);
   }
 
   return loops;
