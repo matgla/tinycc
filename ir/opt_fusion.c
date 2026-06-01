@@ -909,8 +909,15 @@ int tcc_ir_opt_loop_postinc_fusion(TCCIRState *ir)
       int d_vr = irop_get_vreg(dest);
       int s1_vr = irop_get_vreg(src1);
 
-      /* Must be self-update: dest == src1, src2 is immediate */
-      if (d_vr >= 0 && d_vr == s1_vr && irop_is_immediate(src2))
+      /* Must be self-update: dest == src1, src2 is immediate.  ptr_vr must be
+       * a TEMP: post-increment addressing only applies to pointer temporaries
+       * (e.g. the running pointer created by IV strength reduction).  A VAR
+       * self-increment is a scalar loop counter (`for (j=…; j<n; j++)`), not a
+       * pointer; treating its lvalue uses (e.g. `CMP j, #10`) as memory derefs
+       * and fusing them would insert a spurious LOAD and corrupt the loop.
+       * The sibling fusion passes above apply the same TEMP restriction. */
+      if (d_vr >= 0 && d_vr == s1_vr && irop_is_immediate(src2) &&
+          TCCIR_DECODE_VREG_TYPE(d_vr) == TCCIR_VREG_TYPE_TEMP)
       {
         int imm = (int)irop_get_imm64_ex(ir, src2);
         if (imm >= 1 && imm <= 255)

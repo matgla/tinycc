@@ -1837,12 +1837,20 @@ static int mov_equiv_it_pending;
  * across IR instruction boundaries so consecutive STORE instructions that
  * materialise the same constant can skip the redundant MOV.  Reset at jump
  * targets and function calls. */
-static struct { int64_t value; uint8_t valid; } imm_cache[16];
+/* Per-register materialisation cache.  `sym == NULL` means the register holds
+ * the plain constant `value`; `sym != NULL` means it holds the address of that
+ * symbol plus addend `value` (so a later reference to the same global address
+ * can skip the redundant literal-pool load).  Invalidated per-register on every
+ * clobbering emit and at IR boundaries, just like the constant cache. */
+static struct { int64_t value; Sym *sym; uint8_t valid; } imm_cache[16];
 
 static void imm_cache_reset_all(void)
 {
   for (int i = 0; i < 16; i++)
+  {
     imm_cache[i].valid = 0;
+    imm_cache[i].sym = NULL;
+  }
 }
 
 static void imm_cache_invalidate_reg(int reg)
@@ -2730,6 +2738,33 @@ static int thumb_decode_dest_reg(thumb_opcode op)
   if (op.size == 2)
   {
     uint16_t hw = (uint16_t)(w & 0xFFFF);
+
+    /* 16-bit shift-immediate / add / subtract: 000xx ... Rd3.  Covers
+     * LSL/LSR/ASR(imm) and ADD/SUB(reg or imm3); every encoding writes the
+     * low-register Rd in bits [2:0]. */
+    if ((hw & 0xE000) == 0x0000)
+      return hw & 0x07;
+
+    /* 16-bit MOV/CMP/ADD/SUB (8-bit immediate): 001 op2 Rd3 imm8.
+     * op2==01 is CMP (writes no GPR — leave to the flag-setter path);
+     * MOV/ADD/SUB write Rd in bits [10:8]. */
+    if ((hw & 0xE000) == 0x2000)
+    {
+      if (((hw >> 11) & 0x03) == 0x01)
+        return -1;
+      return (hw >> 8) & 0x07;
+    }
+
+    /* 16-bit data-processing (register): 010000 op4 Rm3 Rd3, Rd in bits [2:0].
+     * TST(8), CMP(10), CMN(11) write no GPR. */
+    if ((hw & 0xFC00) == 0x4000)
+    {
+      int op4 = (hw >> 6) & 0x0F;
+      if (op4 == 0x8 || op4 == 0xA || op4 == 0xB)
+        return -1;
+      return hw & 0x07;
+    }
+
     /* 16-bit MOV (high registers): 0100 0110 D Rm4 Rd3
      * Bits [15:8]=0x46, D=bit7 of lower byte, Rd3=bits[2:0] */
     if ((hw >> 8) == 0x46)
@@ -2737,8 +2772,27 @@ static int thumb_decode_dest_reg(thumb_opcode op)
     /* 16-bit ADD (high registers): 0100 0100 D Rm4 Rd3 */
     if ((hw >> 8) == 0x44)
       return ((hw >> 4) & 0x08) | (hw & 0x07);
-    /* 16-bit CMP (high registers): 0100 0101 — no dest write, skip */
-    /* Low-register forms (R0-R7 only) can't reach R9 */
+    /* 16-bit CMP (high registers) 0x45 and BX/BLX 0x47: no single-GPR dest. */
+
+    /* 16-bit LDR (literal): 01001 Rt3 imm8, Rt in bits [10:8]. */
+    if ((hw & 0xF800) == 0x4800)
+      return (hw >> 8) & 0x07;
+
+    /* 16-bit LDR (SP-relative): 1001 1 Rt3 imm8, Rt in bits [10:8].
+     * (0x9000 is the STR form — no GPR dest.) */
+    if ((hw & 0xF800) == 0x9800)
+      return (hw >> 8) & 0x07;
+
+    /* 16-bit ADR / ADD (SP plus immediate): 1010 x Rd3 imm8, Rd in bits [10:8]. */
+    if ((hw & 0xF000) == 0xA000)
+      return (hw >> 8) & 0x07;
+
+    /* 16-bit sign/zero extend (SXTH/SXTB/UXTH/UXTB): 1011 0010 oo Rm3 Rd3. */
+    if ((hw & 0xFF00) == 0xB200)
+      return hw & 0x07;
+
+    /* Remaining low-register and memory forms either don't write a single GPR
+     * or are decoded by decode_str_ldr_imm before reaching here. */
     return -1;
   }
 
@@ -2770,6 +2824,16 @@ static int thumb_decode_dest_reg(thumb_opcode op)
       return (lo >> 8) & 0x0F;
     if ((hi & 0xFBF0) == 0xF2C0 && (lo & 0x8000) == 0) /* MOVT */
       return (lo >> 8) & 0x0F;
+    /* Thumb-2 data-processing (shifted register): 1110 101x xxxx nnnn |
+     * 0iii dddd iitt mmmm.  Rd = lo[11:8]; Rd==PC (0xF) marks the flag-setter
+     * variant (CMP.W/CMN.W/TST.W/TEQ.W — no GPR write). */
+    if ((hi & 0xFE00) == 0xEA00 && (lo & 0x8000) == 0)
+    {
+      int rd = (lo >> 8) & 0x0F;
+      if (rd != 0x0F)
+        return rd;
+      return -1;
+    }
   }
 
   return -1;
@@ -3952,6 +4016,37 @@ static void load_full_const(int r, int r1, uint32_t imm_lo, uint32_t imm_hi)
   /* Validate symbol - only use symbols that can be externalized */
   sym = validate_sym_for_reloc(sym);
 
+  /* Stable cache key: the validated symbol *before* the registration block
+   * below may NULL it.  Registration is skipped during dry-run, so using the
+   * post-registration `sym` would make the dry and real passes disagree on
+   * cache hits and desynchronise code size.  `reuse_sym` is identical in both
+   * passes (validate_sym_for_reloc does not depend on dry-run state). */
+  Sym *reuse_sym = sym;
+
+  /* Symbol-address reuse: when a register already holds &sym+imm, skip the
+   * redundant literal-pool load.  Uses the same per-register imm_cache that
+   * is invalidated on every clobbering emit and at IR boundaries, so the
+   * decision is deterministic across the dry-run and real passes.  Only the
+   * single-register (non-LDRD) form participates. */
+  if (reuse_sym && thumb_gen_state.generating_function && r1 == PREG_NONE && r >= 0 && r < 16)
+  {
+    if (imm_cache[r].valid && imm_cache[r].sym == reuse_sym && imm_cache[r].value == imm)
+      return; /* r already holds &sym+imm */
+    for (int rr = 0; rr < 16; rr++)
+    {
+      if (rr != r && imm_cache[rr].valid && imm_cache[rr].sym == reuse_sym && imm_cache[rr].value == imm)
+      {
+        /* Another register holds it: copy instead of reloading from the
+         * literal pool (saves a memory access and a pool word). */
+        ot_check_mov_reg((uint32_t)r, (uint32_t)rr, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
+        imm_cache[r].value = imm;
+        imm_cache[r].sym = reuse_sym;
+        imm_cache[r].valid = 1;
+        return;
+      }
+    }
+  }
+
   /* During dry-run, skip symbol registration and literal pool allocation.
    * We just emit the instruction (ot_check handles dry-run mode) to track
    * code size and scratch register usage, without creating side effects. */
@@ -3986,6 +4081,17 @@ static void load_full_const(int r, int r1, uint32_t imm_lo, uint32_t imm_hi)
   }
   ot_check(load_ins);
   patch_pos = ind - load_ins.size;
+
+  /* Record that r now holds &sym+imm so a later reference to the same global
+   * address can be elided.  Must run after ot_check(), whose emit-level
+   * invalidation cleared imm_cache[r] for the LDR we just produced.  Keyed on
+   * the pre-registration `reuse_sym` for dry/real-pass consistency. */
+  if (reuse_sym && thumb_gen_state.generating_function && r1 == PREG_NONE && r >= 0 && r < 16)
+  {
+    imm_cache[r].value = imm;
+    imm_cache[r].sym = reuse_sym;
+    imm_cache[r].valid = 1;
+  }
 
   /* During dry-run, we still need to create the literal pool entry to ensure
    * the literal pool behavior (threshold checks, sharing, etc.) matches the real pass.
@@ -4310,7 +4416,8 @@ ST_FUNC void tcc_machine_load_constant(int dest_reg, int dest_reg_high, int64_t 
   }
 
   if (!sym && !is_64bit && dest_reg >= 0 && dest_reg < 16 &&
-      imm_cache[dest_reg].valid && imm_cache[dest_reg].value == value)
+      imm_cache[dest_reg].valid && imm_cache[dest_reg].sym == NULL &&
+      imm_cache[dest_reg].value == value)
     return;
 
   if (is_64bit)
@@ -4342,6 +4449,7 @@ ST_FUNC void tcc_machine_load_constant(int dest_reg, int dest_reg_high, int64_t 
   if (!sym && !is_64bit && dest_reg >= 0 && dest_reg < 16)
   {
     imm_cache[dest_reg].value = value;
+    imm_cache[dest_reg].sym = NULL;
     imm_cache[dest_reg].valid = 1;
   }
 }

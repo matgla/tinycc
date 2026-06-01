@@ -188,6 +188,27 @@ def extract_function_disasm(dump_text, func_name):
     return lines
 
 
+def extract_all_function_disasm(dump_text, func_names):
+    """Extract the disasm line-block (header through trailing blank line) for
+    many functions in a single pass.  Returns {func_name: [lines]}.  Mirrors
+    extract_function_disasm but avoids one full scan per function."""
+    wanted = set(func_names)
+    result = {f: [] for f in wanted}
+    current = None
+    for line in dump_text.splitlines():
+        if _HEADER_RE.match(line):
+            m = _HEADER_NAME_RE.search(line)
+            name = m.group(1) if m else None
+            current = name if name in wanted else None
+            if current is not None:
+                result[current].append(line)
+        elif current is not None:
+            result[current].append(line)
+            if line.strip() == '':
+                current = None
+    return result
+
+
 def get_common_functions(tcc_obj, gcc_obj, include_local=False):
     tcc_funcs = get_functions(tcc_obj, include_local)
     gcc_funcs = get_functions(gcc_obj, include_local)
@@ -207,7 +228,28 @@ def get_callees_from_disasm(dump_text, func_name):
     return callees
 
 
+def build_callee_map(dump_text):
+    """Map every function name -> set of callee names, in a single pass.
+
+    Avoids re-scanning the whole dump once per function during the
+    transitive-callee BFS (the dumps can be 100k+ lines)."""
+    callee_map = {}
+    current = None
+    for line in dump_text.splitlines():
+        if _HEADER_RE.match(line):
+            m = _HEADER_NAME_RE.search(line)
+            current = m.group(1) if m else None
+            if current is not None and current not in callee_map:
+                callee_map[current] = set()
+        elif current is not None:
+            m = _BL_RE.search(line)
+            if m:
+                callee_map[current].add(m.group(1))
+    return callee_map
+
+
 def get_transitive_callees(dump_text, root_funcs, available_funcs):
+    callee_map = build_callee_map(dump_text)
     visited = set()
     queue = list(root_funcs)
     while queue:
@@ -217,19 +259,18 @@ def get_transitive_callees(dump_text, root_funcs, available_funcs):
         visited.add(func)
         if func not in available_funcs:
             continue
-        for callee in get_callees_from_disasm(dump_text, func):
+        for callee in callee_map.get(func, ()):
             if callee in available_funcs and callee not in visited:
                 queue.append(callee)
     return visited & available_funcs
 
 
 def compare_functions(tcc_dump, gcc_dump, common_funcs):
-    results = []
-    for func in common_funcs:
-        tcc_count = count_instructions(tcc_dump, func)
-        gcc_count = count_instructions_with_clones(gcc_dump, func)
-        results.append((func, tcc_count, gcc_count))
-    return results
+    # Single pass over each dump rather than one full scan per function
+    # (the dumps can be 100k+ lines for macro-heavy tests).
+    tcc_counts = count_all_functions(tcc_dump, common_funcs, with_clones=False)
+    gcc_counts = count_all_functions(gcc_dump, common_funcs, with_clones=True)
+    return [(func, tcc_counts[func], gcc_counts[func]) for func in common_funcs]
 
 
 # ── Cache ──

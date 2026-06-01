@@ -6280,8 +6280,16 @@ int tcc_ir_opt_global_sl_fwd(TCCIRState *ir)
           IROperand newop;
           if (entries[k].value_vr >= 0)
           {
-            /* Skip vreg forwardings for now — only forward immediates */
-            continue;
+            /* Forward a still-valid TEMP vreg holding the stored value.
+             * Restricting to TEMP keeps the forward sound: TEMPs are only ever
+             * written as non-lval dests, so the redefinition scan at the bottom
+             * of the loop reliably drops the entry the moment the value is
+             * overwritten before a use.  Replacing the global deref with a plain
+             * register read also removes a redundant memory load even when no
+             * constant folding follows (LOAD b == the value just stored). */
+            if (TCCIR_DECODE_VREG_TYPE(entries[k].value_vr) != TCCIR_VREG_TYPE_TEMP)
+              continue;
+            newop = irop_make_vreg(entries[k].value_vr, btype);
           }
           else if (entries[k].imm_is_i32)
           {

@@ -937,6 +937,35 @@ ST_FUNC int tccgen_compile(TCCState *s1)
   if (s1->opt_dce && s1->optimize >= 2)
     tcc_ir_tu_propagate_noreturn_to_callers();
   gen_late_reopt_functions(s1);
+  /* tu_static_writer functions were kept in inline_fns (gen_function's auto-
+   * inline path) so the end-of-TU dead-static analysis could re-compile them
+   * via late_reopt to drop dead static stores.  Those whose static turned out
+   * to be live were never flagged func_late_reopt, so they need no re-compile —
+   * but they were already emitted standalone at definition time.  Free their
+   * tokens and orphan the sym, otherwise gen_inline_functions re-emits the body
+   * a second time (the symbol just bumps forward, orphaning the first copy and
+   * doubling the function's .text footprint — e.g. a memset(static) inlined to a
+   * direct store would emit twice).  Skip functions still flagged for re-emit,
+   * kept for noreturn propagation (cleaned up below), or legitimately inlinable
+   * (gen_inline_functions already skips those, and their tokens are needed for
+   * call-site inlining). */
+  for (int fi = 0; fi < s1->nb_inline_fns; fi++)
+  {
+    struct InlineFunc *ifn = s1->inline_fns[fi];
+    if (!ifn || !ifn->sym || !ifn->sym->type.ref)
+      continue;
+    if (!ifn->sym->type.ref->f.tu_static_writer)
+      continue;
+    if (ifn->sym->type.ref->f.func_late_reopt || ifn->sym->type.ref->f.func_keep_tokens_for_noreturn ||
+        ifn->sym->type.ref->f.func_auto_inline || ifn->sym->type.ref->f.func_eval_only_inline)
+      continue;
+    if (ifn->func_str)
+    {
+      tok_str_free(ifn->func_str);
+      ifn->func_str = NULL;
+    }
+    ifn->sym = NULL;
+  }
   gen_inline_functions(s1);
   if (s1->opt_dce && s1->optimize >= 2)
   {
@@ -28210,6 +28239,14 @@ static void gen_function(Sym *sym)
   dump_ir_after_pass(tcc_state, ir, "small_memset_to_store");
 #endif
 
+  /* Same idea for a global (static) destination: inline a small constant-size
+   * memset of a static as a single naturally-aligned direct store, the way GCC
+   * does.  Unblocked by the tu_static_writer late-reopt double-emit fix. */
+  tcc_ir_opt_small_global_memset_to_store(ir);
+#ifdef CONFIG_TCC_DEBUG
+  dump_ir_after_pass(tcc_state, ir, "small_global_memset_to_store");
+#endif
+
   /* Fold memmove(dst_ptr, &local_tmp, N) into direct STORE_INDEXED ops on
    * dst_ptr when the temp is only used to feed this single memmove.  Cuts
    * a function call (and its temp materialization) out of complex/struct
@@ -29511,6 +29548,19 @@ static void gen_function(Sym *sym)
       jt_changes = tcc_ir_opt_jump_threading(ir);
       jt_changes += tcc_ir_opt_eliminate_fallthrough(ir);
     } while (jt_changes > 0);
+
+    /* Threading a loop guard that was inverted to branch directly to the body
+     * orphans the original `JMP body` trampoline: the conditional now targets
+     * the body and the preceding edge is an unconditional JUMP, so nothing
+     * reaches the old jump.  eliminate_fallthrough only drops JUMP-to-next,
+     * not unreachable instructions, so it survives to codegen as a dead b.w.
+     * Reachability DCE (purely control-flow based — safe post-regalloc) NOPs
+     * it; the backend skips NOPs.  We deliberately do NOT compact_nops here:
+     * renumbering perturbs the instruction indices that downstream post-RA
+     * peepholes (e.g. in-place increment coalescing) key off, which would
+     * trade the removed jump for a worse increment lowering. */
+    if (tcc_state->opt_dce)
+      tcc_ir_opt_dce(ir);
   }
 
   /* Re-compact local stack after SSA optimization.

@@ -534,6 +534,11 @@ int tcc_ir_opt_block_copy_init(struct TCCIRState *ir);
  * two direct STORE #0 instructions when block_copy_init didn't fire. */
 int tcc_ir_opt_small_memset_to_store(struct TCCIRState *ir);
 
+/* Small zero-memset to a GLOBAL (symref) destination - replace
+ * memset(&global[off], 0, N) with a single naturally-aligned direct STORE #0
+ * (strb/strh/str/strd) when N is exactly a single store's width. */
+int tcc_ir_opt_small_global_memset_to_store(struct TCCIRState *ir);
+
 /* CMP+SETIF CSE - within a basic block, replace a second CMP+SETIF whose
  * operands and cond match an earlier one with ASSIGN-from-prior-vreg.
  * Cuts a redundant compare-and-set when the same boolean is computed twice. */

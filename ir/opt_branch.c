@@ -379,6 +379,19 @@ int tcc_ir_opt_vrp(TCCIRState *ir)
   int eq_scope_src_slot = -1;
   int64_t eq_scope_val = 0;
 
+  /* Ranges deferred through a dominating unconditional jump.  When an
+   * unconditional JUMP targets a block T whose *only* predecessor is that
+   * jump (T is not a merge point, so pred_count[T]==1 and the jump itself is
+   * that predecessor), every fact valid at the jump is valid at entry to T.
+   * The linear scan otherwise drops these facts: the JUMP clears all ranges
+   * (its linear successor belongs to a different path) and T re-derives
+   * nothing.  We snapshot the ranges at the jump and reinstall them when the
+   * scan reaches T.  This carries a loop-guard's fall-through bound (e.g.
+   * `s<=1`) into a switch-dispatch block reached by the guard's taken edge —
+   * letting the dead `case`s on out-of-range values fold away. */
+  VRPRange deferred_ranges[VRP_MAX_POS * 3];
+  int deferred_target = -1;
+
   for (int i = 0; i < n; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
@@ -394,9 +407,18 @@ int tcc_ir_opt_vrp(TCCIRState *ir)
       eq_scope_src_slot = -1;
     }
 
+    /* Reinstall ranges carried through a dominating unconditional jump.
+     * deferred_target is only set for a non-merge (sole-predecessor) block,
+     * so this is the block's true entry state — it takes precedence over the
+     * merge/pending handling below (neither of which can apply to it). */
+    if (i == deferred_target)
+    {
+      memcpy(ranges, deferred_ranges, sizeof(ranges));
+      deferred_target = -1;
+    }
     /* At merge points: clear all ranges and discard pending constraint,
      * but re-apply the scoped equality constraint if still active. */
-    if (is_merge[i / 8] & (1 << (i % 8)))
+    else if (is_merge[i / 8] & (1 << (i % 8)))
     {
       memset(ranges, 0, sizeof(ranges));
       pending_apply_at = -1;
@@ -462,17 +484,34 @@ int tcc_ir_opt_vrp(TCCIRState *ir)
       continue;
     }
 
-    /* Propagate ranges through non-lval ASSIGN: if the source vreg has a
-     * known range, copy it to dest. */
+    /* Propagate ranges through an ASSIGN whose source forwards a value range.
+     * A non-lval source forwards its tracked range directly.  An lval source
+     * that simply names a local/parameter (VAR/PARAM vreg, not a pointer
+     * deref, double indirection, or symbol) also forwards a value range: the
+     * slot we track for a VAR/PARAM holds that variable's value, which is
+     * exactly what the lval load reads.  TEMP lvals are pointer dereferences
+     * whose pointer range is unrelated to the loaded value, so they are
+     * excluded. */
     if (q->op == TCCIR_OP_ASSIGN && irop_config[q->op].has_dest)
     {
       int32_t s1_vr = irop_get_vreg(src1);
       int32_t d_vr = irop_get_vreg(dest);
-      if (s1_vr >= 0 && d_vr >= 0 && !src1.is_lval) {
-        int s_slot = vrp_get_slot(TCCIR_DECODE_VREG_TYPE(s1_vr), TCCIR_DECODE_VREG_POSITION(s1_vr));
+      int src_type = (s1_vr >= 0) ? TCCIR_DECODE_VREG_TYPE(s1_vr) : -1;
+      int src_forwards_value =
+          s1_vr >= 0 &&
+          (!src1.is_lval ||
+           ((src_type == TCCIR_VREG_TYPE_VAR || src_type == TCCIR_VREG_TYPE_PARAM) &&
+            !src1.is_llocal && !src1.is_sym));
+      if (src_forwards_value && d_vr >= 0) {
+        int s_slot = vrp_get_slot(src_type, TCCIR_DECODE_VREG_POSITION(s1_vr));
         int d_slot = vrp_get_slot(TCCIR_DECODE_VREG_TYPE(d_vr), TCCIR_DECODE_VREG_POSITION(d_vr));
         if (s_slot >= 0 && d_slot >= 0 && ranges[s_slot].valid) {
           ranges[d_slot] = ranges[s_slot];
+          /* Preserve the copied range: the generic dest-invalidation at the
+           * bottom of the loop would otherwise immediately clear it (as it
+           * does for unhandled ops), defeating this propagation.  The ADD/SUB
+           * case above `continue`s for the same reason. */
+          continue;
         } else if (d_slot >= 0) {
           ranges[d_slot].valid = 0;
         }
@@ -880,6 +919,18 @@ int tcc_ir_opt_vrp(TCCIRState *ir)
      * from a different branch. */
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_RETURNVALUE || q->op == TCCIR_OP_RETURNVOID)
     {
+      /* Before discarding the ranges, hand them to a forward target block
+       * that this jump uniquely dominates (sole predecessor → not a merge
+       * point), so the scan can reuse them when it gets there. */
+      if (q->op == TCCIR_OP_JUMP)
+      {
+        int t = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+        if (t > i && t < n && !(is_merge[t / 8] & (1 << (t % 8))))
+        {
+          memcpy(deferred_ranges, ranges, sizeof(ranges));
+          deferred_target = t;
+        }
+      }
       memset(ranges, 0, sizeof(ranges));
       pending_apply_at = -1;
       pending_slot = -1;

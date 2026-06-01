@@ -162,6 +162,12 @@ static int tcc_ir_opt_known_bits_cascade_ex(IROptCtx *ctx)
     ch += tcc_ir_opt_eliminate_fallthrough(ir);
     tcc_ir_opt_compact_nops(ir);
     ch += tcc_ir_opt_sl_forward(ir);
+    /* Re-run global store-load forwarding inside the cascade: once branch_fold
+     * collapses a proven-false guard (e.g. an `if (...) abort();` check) and
+     * elim_fallthrough/compact merge the blocks, the straight-line region grows
+     * and the next round of global derefs becomes forwardable.  Without this,
+     * forwarding stalls at the first BB boundary. */
+    ch += tcc_ir_opt_global_sl_fwd(ir);
     if (!ch)
       break;
     total += ch;

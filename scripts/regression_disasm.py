@@ -504,6 +504,22 @@ def print_summary(data, gcc_opt):
             print(f"  {key:<50}  {tcc_n:>6}  {gcc_n:>6}  {ratio100/100:>5.2f}x")
         print()
 
+    abs_worst = []
+    for key in data["all_entries"]:
+        tcc_n = data["func_tcc"][key]
+        gcc_n = data["func_gcc"][key]
+        diff = tcc_n - gcc_n
+        if diff > 0:
+            abs_worst.append((diff, key, tcc_n, gcc_n))
+    if abs_worst:
+        print("--- Largest absolute diffs (TCC - GCC instr, top 30) ---")
+        print()
+        print(f"  {'test::function':<50}  {'TCC':>6}  {'GCC':>6}  {'diff':>6}")
+        print(f"  {'-'*50}  {'-'*6}  {'-'*6}  {'-'*6}")
+        for diff, key, tcc_n, gcc_n in sorted(abs_worst, key=lambda x: -x[0])[:30]:
+            print(f"  {key:<50}  {tcc_n:>6}  {gcc_n:>6}  {diff:>+6d}")
+        print()
+
     test_tcc = defaultdict(int)
     test_gcc = defaultdict(int)
     for key in data["all_entries"]:
@@ -524,6 +540,15 @@ def print_summary(data, gcc_opt):
     for r, tk, tv, gv in sorted(test_sorted, key=lambda x: -x[0])[:30]:
         ratio = f"{r/100:.2f}" if gv > 0 else "N/A"
         print(f"  {tk:<50}  {tv:>6}  {gv:>6}  {ratio:>5s}x")
+    print()
+
+    test_diff_sorted = [(tv - test_gcc[tk], tk, tv, test_gcc[tk]) for tk, tv in test_tcc.items()]
+    print("--- Per-test totals (top 30 largest absolute diffs) ---")
+    print()
+    print(f"  {'test':<50}  {'TCC':>6}  {'GCC':>6}  {'diff':>6}")
+    print(f"  {'-'*50}  {'-'*6}  {'-'*6}  {'-'*6}")
+    for d, tk, tv, gv in sorted(test_diff_sorted, key=lambda x: -x[0])[:30]:
+        print(f"  {tk:<50}  {tv:>6}  {gv:>6}  {d:>+6d}")
     print()
 
     if data["skipped"]:

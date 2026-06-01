@@ -2191,6 +2191,56 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
   const int pass_start = can_skip_dry_run ? 1 : 0;
   uint32_t *cbz_dry_mapping = NULL;
 
+  /* Branch-target reset map for the materialisation cache (imm_cache).
+   *
+   * imm_cache persists a register's cached constant / symbol address across
+   * straight-line IR boundaries (dead registers keep their value).  This is
+   * only sound when control reaches the instruction linearly: at a control-flow
+   * merge an alternate predecessor may have clobbered the register.  The shared
+   * `is_jump_target` flag covers most merges, but at -O0 backward (loop) branch
+   * targets are not always flagged, so cache a complete target set here and
+   * reset at those points too.  Kept local to codegen so the wider
+   * `is_jump_target` semantics (and the peephole fusions keyed on it) are
+   * untouched.  Mirrors the target enumeration in tcc_ir_codegen_backpatch_jumps. */
+  uint8_t *branch_target_reset = NULL;
+  if (ir->next_instruction_index > 0)
+  {
+    branch_target_reset = tcc_mallocz((size_t)ir->next_instruction_index);
+    int has_indirect_jump = 0;
+    for (int bi = 0; bi < ir->next_instruction_index; bi++)
+    {
+      IRQuadCompact *bq = &ir->compact_instructions[bi];
+      if (bq->op == TCCIR_OP_JUMP || bq->op == TCCIR_OP_JUMPIF)
+      {
+        IROperand bdest = tcc_ir_op_get_dest(ir, bq);
+        int btgt = irop_is_none(bdest) ? -1 : (int)bdest.u.imm32;
+        if (btgt >= 0 && btgt < ir->next_instruction_index)
+          branch_target_reset[btgt] = 1;
+      }
+      else if (bq->op == TCCIR_OP_IJUMP)
+      {
+        /* Computed goto: lands on an address-taken label that is not a static
+         * JUMP target and cannot be cheaply enumerated from the register-
+         * indirect jump.  Conservatively disable cross-boundary cache
+         * persistence for the whole function (computed goto is rare). */
+        has_indirect_jump = 1;
+      }
+    }
+    /* Switch-table targets (data-driven jumps). */
+    for (int st = 0; st < ir->num_switch_tables; st++)
+    {
+      TCCIRSwitchTable *tbl = &ir->switch_tables[st];
+      for (int je = 0; je < tbl->num_entries; je++)
+      {
+        int btgt = tbl->targets[je];
+        if (btgt >= 0 && btgt < ir->next_instruction_index)
+          branch_target_reset[btgt] = 1;
+      }
+    }
+    if (has_indirect_jump)
+      memset(branch_target_reset, 1, (size_t)ir->next_instruction_index);
+  }
+
   for (int pass = pass_start; pass < 2; pass++)
   {
     const int is_dry_run = (pass == 0);
@@ -2253,7 +2303,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
       /* Invalidate imm_cache for registers assigned to live vregs.
        * Free (dead) registers retain cached constants across IR boundaries.
        * Full reset at jump targets / calls where control flow is non-linear. */
-      if (cq->is_jump_target ||
+      if (cq->is_jump_target || (branch_target_reset && branch_target_reset[i]) ||
           cq->op == TCCIR_OP_FUNCCALLVAL || cq->op == TCCIR_OP_FUNCCALLVOID)
         tcc_gen_machine_imm_cache_reset();
       else if (ir->ls.live_regs_by_instruction &&
@@ -2546,7 +2596,15 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
              * Allow VAR operands with is_lval (load from stack = same value). */
             int cmp_is_ptr_deref = irop_op_is_lval(cmp_s1) &&
                                    TCCIR_DECODE_VREG_TYPE(irop_get_vreg(cmp_s1)) == TCCIR_VREG_TYPE_TEMP;
+            /* 64-bit only: a flag-setting 64-bit SUB/ADD lowers to
+             * `subs lo; sbc hi` (or adds/adc) where only the low-word op sets
+             * flags — `sbc`/`adc` do not.  So Z reflects only the low word and
+             * cannot replace a full-width `CMP Rd,#0` for an EQ/NE branch
+             * (miscompile: 920501-6's `for(b=0,s=t; b++,(s>>=1)!=0;)` exited
+             * after one iteration).  Keep the CMP, which the 64-bit EQ/NE
+             * peephole below lowers correctly via cmp_eq64. */
             if (cond_safe && !cmp_is_ptr_deref &&
+                !a.src1.is_64bit && !a.dest.is_64bit &&
                 irop_is_immediate(cmp_s2) && irop_get_imm64_ex(ir, cmp_s2) == 0 &&
                 irop_has_vreg(cmp_s1) &&
                 irop_get_vreg(cmp_s1) == irop_get_vreg(dest_ir))
@@ -2622,8 +2680,22 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
           MopArgs eq_a = DECODE(.dest = 1, .src1 = 1, .src2 = 1);
           if (eq_a.src1.is_64bit)
           {
+            /* Skip NOPs and flag-neutral register copies (ASSIGN lowers to
+             * `mov`, which preserves flags) when searching for the condition
+             * consumer.  After const-prop folds `CMP; SETIF; TEST_ZERO; JUMPIF`
+             * into `CMP; JUMPIF`, phi-resolution ASSIGNs for loop-carried
+             * variables get scheduled between the CMP and the JUMPIF; without
+             * skipping them this peephole would miss the EQ/NE consumer and
+             * fall back to the relational SBCS lowering, whose Z flag reflects
+             * only the high word — wrong for a 64-bit equality test
+             * (920501-6: `for(b=0,s=t; b++,(s>>=1)!=0;)` exited after one
+             * iteration).  The relational path already relies on these ASSIGNs
+             * preserving the CMP's flags up to the branch, so skipping them
+             * here is consistent. */
             int next_j = i + 1;
-            while (next_j < ir->next_instruction_index && ir->compact_instructions[next_j].op == TCCIR_OP_NOP)
+            while (next_j < ir->next_instruction_index &&
+                   (ir->compact_instructions[next_j].op == TCCIR_OP_NOP ||
+                    ir->compact_instructions[next_j].op == TCCIR_OP_ASSIGN))
               next_j++;
             if (next_j < ir->next_instruction_index)
             {
@@ -4074,6 +4146,8 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
   tcc_free(mop_cache);
   if (cbz_dry_mapping)
     tcc_free(cbz_dry_mapping);
+  if (branch_target_reset)
+    tcc_free(branch_target_reset);
 
   ir_to_code_mapping[ir->next_instruction_index] = ind;
   orig_ir_to_code_mapping[ir->orig_ir_to_code_mapping_size - 1] = ind;

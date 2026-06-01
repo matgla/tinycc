@@ -2984,7 +2984,6 @@ int tcc_ir_opt_const_prop(TCCIRState *ir)
   tcc_free(dc);
   tcc_free(var_info);
 
-  if (getenv("DUMP_CP_OUT")) { fprintf(stderr, "=== CONST_PROP OUT (changes=%d) ===\n", changes); tcc_ir_show(ir); }
   return changes;
 }
 
@@ -5969,6 +5968,24 @@ int tcc_ir_opt_add_reassoc(TCCIRState *ir)
     {
       continue;
     }
+
+    /* def_src1 becomes the new src1 at the *later* use point `i`.  If it is a
+     * real memory dereference (a global/pointer load — is_lval but not a
+     * register-promoted local or llocal), moving it forward is unsound: an
+     * intervening STORE/CALL between def_idx and i may have changed the
+     * memory.  e.g. `T0 = cnt*** + 2; cnt*** = T0; T7 = T0 + 1` must NOT
+     * become `T7 = cnt*** + 3` — the second load reads the post-store value.
+     *
+     * Unlike the use's src1 (handled above, which also bails at src1_vr<0 for
+     * a deref carrying no backing vreg), def_src1 here is reached via the inner
+     * ADD/SUB whose src1 IS a memory deref, so we must reject it explicitly.
+     * is_const is intentionally NOT part of the predicate: a global symref
+     * deref is flagged is_const (the *address* is constant) yet its *value*
+     * still changes across stores, so a const-permitting check would let the
+     * miscompile through.  Register-promoted locals/llocals (is_local/is_llocal)
+     * read from a register and stay safe via the inner_vr redefinition scan. */
+    if (def_src1.is_lval && !def_src1.is_local && !def_src1.is_llocal)
+      continue;
 
     /* The reassociation replaces src1_vr with def_src1 at the use point.
      * If def_src1 is a vreg, it must not be redefined between def_idx and i

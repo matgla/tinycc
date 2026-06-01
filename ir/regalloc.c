@@ -1778,6 +1778,19 @@ static void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
   uint64_t int_allowed = int_avail & tcc_state->registers_map_for_allocator;
   uint64_t fp_allowed = fp_avail & tcc_state->float_registers_map_for_allocator;
 
+  /* Nested-function trampolines load the static chain into the static-chain
+   * register (R10) and tail-jump to the nested function, clobbering R10
+   * without restoring it — even though R10 is AAPCS callee-saved.  A parent
+   * that defines nested functions calls them (directly, or via a function
+   * pointer through an ABI-compliant helper) and would see any value the
+   * allocator parked in R10 corrupted across that call (nestfunc-2: the
+   * i/j/k loop counters lived in R10 and the inner foo() call clobbered it →
+   * infinite loop).  Reserve R10 in such parents.  Nested functions
+   * themselves (has_static_chain) hold the live chain in R10 and are handled
+   * separately, so leave their allocation untouched. */
+  if (tcc_state->nb_nested_funcs > 0 && !ir->has_static_chain)
+    int_allowed &= ~(1ull << (uint64_t)architecture_config.static_chain_reg);
+
   uint64_t int_free = int_allowed;
   uint64_t fp_free = fp_allowed;
   uint64_t dirty_int = 0;

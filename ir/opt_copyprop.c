@@ -961,6 +961,95 @@ int tcc_ir_opt_globalsym_cse(TCCIRState *ir)
     }
   }
 
+  /* Reuse a hoisted base register for STOREs to the same global.
+   * A STORE whose lval-SYMREF address targets a symbol we just hoisted to a
+   * TEMP can reuse that TEMP as its base, turning  *(Sym+off) <- val  into
+   * STORE_INDEXED [T,#off].  The backend folds the displacement into the
+   * store immediate (strb/strh/str [base,#off]) reusing the already-loaded
+   * symbol address, eliminating a redundant ldr =Sym.  The hoisted TEMP is
+   * defined once at function entry, so it dominates every store — no
+   * same-block / liveness constraint is needed.  Mirrors disp_fusion's
+   * STORE_INDEXED operand layout: [base, value, index_imm, scale_imm].
+   *
+   * Restricted to the entry block: only there does the store sit right after
+   * the hoisted base ASSIGNs, so reusing the base extends its live range by
+   * ~nothing.  For a store deep in the function, forcing it onto the single
+   * hoisted base pins that register across the whole body — regalloc would
+   * otherwise rematerialize the address (cheap `ldr =Sym`) at each scattered
+   * use, and pinning it instead raises register pressure (extra callee-saved
+   * reg + lost fusions, e.g. 20040709-1::testM).  The win case (inlined
+   * memset to a global that the function's loops also walk, e.g. memclr) has
+   * its store in the entry block with the base already held for the loops. */
+  int entry_end = ir->next_instruction_index;
+  for (int k = num_hoist; k < ir->next_instruction_index; k++)
+  {
+    IRQuadCompact *kq = &ir->compact_instructions[k];
+    if (k > num_hoist && kq->is_jump_target)
+    {
+      entry_end = k;
+      break;
+    }
+    TccIrOp kop = kq->op;
+    if (kop == TCCIR_OP_JUMP || kop == TCCIR_OP_JUMPIF || kop == TCCIR_OP_IJUMP ||
+        kop == TCCIR_OP_SWITCH_TABLE || kop == TCCIR_OP_RETURNVALUE ||
+        kop == TCCIR_OP_RETURNVOID)
+    {
+      entry_end = k;
+      break;
+    }
+  }
+  for (int j = num_hoist; j < entry_end; j++)
+  {
+    IRQuadCompact *sq = &ir->compact_instructions[j];
+    if (sq->op != TCCIR_OP_STORE)
+      continue;
+    IROperand addr = tcc_ir_op_get_dest(ir, sq);
+    if (addr.tag != IROP_TAG_SYMREF || !addr.is_lval || addr.is_local)
+      continue;
+    /* Only fold byte/half/word/float32 stores: INT64/FLOAT64/STRUCT need a
+     * wider access the indexed form can't express in one op. */
+    if (addr.btype == IROP_BTYPE_INT64 || addr.btype == IROP_BTYPE_FLOAT64 ||
+        addr.btype == IROP_BTYPE_STRUCT)
+      continue;
+    IRPoolSymref *ssr = irop_get_symref_ex(ir, addr);
+    if (!ssr || !ssr->sym)
+      continue;
+    /* Find a hoisted base for this exact symbol whose displacement fits the
+     * indexed addressing range disp_fusion uses. */
+    int found_slot = -1;
+    int64_t delta = 0;
+    for (int h = 0; h < num_entries; h++)
+    {
+      if (entries[h].count >= 0 || entries[h].sym != ssr->sym)
+        continue;
+      int64_t d = (int64_t)ssr->addend - entries[h].addend;
+      if (d < -255 || d > 4095)
+        continue;
+      found_slot = -(entries[h].count + 1);
+      delta = d;
+      break;
+    }
+    if (found_slot < 0)
+      continue;
+
+    IROperand value = tcc_ir_op_get_src1(ir, sq);
+    IROperand base = irop_make_vreg(hoist_vregs[found_slot], IROP_BTYPE_INT32);
+    IROperand index_imm = irop_make_imm32(0, (int32_t)delta, IROP_BTYPE_INT32);
+    IROperand scale_imm = irop_make_imm32(0, 0, IROP_BTYPE_INT32);
+
+    tcc_ir_pool_ensure(ir, 4);
+    int nb = ir->iroperand_pool_count;
+    if (nb + 4 > ir->iroperand_pool_capacity)
+      continue;
+    tcc_ir_pool_add(ir, base);
+    tcc_ir_pool_add(ir, value);
+    tcc_ir_pool_add(ir, index_imm);
+    tcc_ir_pool_add(ir, scale_imm);
+    sq->op = TCCIR_OP_STORE_INDEXED;
+    sq->operand_base = nb;
+    changes++;
+  }
+
   return changes;
 }
 
@@ -1369,21 +1458,35 @@ int tcc_ir_opt_local_alu_cse(TCCIRState *ir)
     uint8_t s1_lval, s2_lval, s3_lval; /* lval-flag for each src — used for STORE invalidation */
     int32_t s1_vr, s2_vr, s3_vr;
     int32_t s1_imm, s2_imm, s3_imm;
+    Sym *s1_sym, *s2_sym, *s3_sym; /* resolved sym for SYMREF operands (NULL otherwise) */
     int32_t dest_vr;
   };
   struct LACSEEntry cache[LACSE_MAX];
   int cache_count = 0;
 
-  /* Operand key extractor: returns (tag, vreg, imm) so two operands compare
-   * equal iff they refer to the same value. */
-  #define EXTRACT_KEY(op_, tag_, vr_, imm_)                                                                            \
+  /* Operand key extractor: returns (tag, vreg, imm, sym) so two operands
+   * compare equal iff they refer to the same value.
+   *
+   * SYMREF operands carry a per-occurrence pool index (tcc_ir_pool_add_symref
+   * never deduplicates), so two references to the SAME global get different
+   * pool_idx values.  Key them by their resolved (sym, addend) instead, so
+   * e.g. `GlobalSym(g)***DEREF*** SHL #k` repeated for two reads of the same
+   * bitfield member is recognized as identical and CSE'd. */
+  #define EXTRACT_KEY(op_, tag_, vr_, imm_, sym_)                                                                      \
     do                                                                                                                 \
     {                                                                                                                  \
       (tag_) = (op_).tag;                                                                                              \
       (vr_) = irop_get_vreg(op_);                                                                                      \
+      (sym_) = NULL;                                                                                                   \
       if ((op_).tag == IROP_TAG_IMM32 || (op_).tag == IROP_TAG_F32 || (op_).tag == IROP_TAG_STACKOFF)                  \
         (imm_) = (op_).u.imm32;                                                                                        \
-      else if ((op_).tag == IROP_TAG_SYMREF || (op_).tag == IROP_TAG_I64 || (op_).tag == IROP_TAG_F64)                 \
+      else if ((op_).tag == IROP_TAG_SYMREF)                                                                           \
+      {                                                                                                                \
+        IRPoolSymref *sr_ = irop_get_symref_ex(ir, (op_));                                                             \
+        if (sr_) { (sym_) = sr_->sym; (imm_) = (int32_t)sr_->addend; }                                                 \
+        else (imm_) = (int32_t)(op_).u.pool_idx;                                                                       \
+      }                                                                                                                \
+      else if ((op_).tag == IROP_TAG_I64 || (op_).tag == IROP_TAG_F64)                                                 \
         (imm_) = (int32_t)(op_).u.pool_idx;                                                                            \
       else                                                                                                             \
         (imm_) = 0;                                                                                                    \
@@ -1407,10 +1510,14 @@ int tcc_ir_opt_local_alu_cse(TCCIRState *ir)
     if (q->op == TCCIR_OP_NOP)
       continue;
     /* Control flow / calls flush the cache: callees can mutate any
-     * addrtaken VAR, so cached entries depending on VARs become stale. */
+     * addrtaken VAR, so cached entries depending on VARs become stale.
+     * BLOCK_COPY (struct/memcpy) and INLINE_ASM can write arbitrary memory —
+     * they must invalidate cached memory-deref (lval-src) values too; flushing
+     * the whole cache is the simple conservative choice (both are rare). */
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF || q->op == TCCIR_OP_IJUMP ||
         q->op == TCCIR_OP_SWITCH_TABLE || q->op == TCCIR_OP_RETURNVALUE || q->op == TCCIR_OP_RETURNVOID ||
-        q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID)
+        q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID ||
+        q->op == TCCIR_OP_BLOCK_COPY || q->op == TCCIR_OP_INLINE_ASM)
     {
       cache_count = 0;
       continue;
@@ -1500,14 +1607,23 @@ int tcc_ir_opt_local_alu_cse(TCCIRState *ir)
     uint8_t s1_tag, s2_tag, s3_tag = 0;
     int32_t s1_vr, s2_vr, s3_vr = 0;
     int32_t s1_imm, s2_imm, s3_imm = 0;
-    EXTRACT_KEY(src1, s1_tag, s1_vr, s1_imm);
-    EXTRACT_KEY(src2, s2_tag, s2_vr, s2_imm);
+    Sym *s1_sym, *s2_sym, *s3_sym = NULL;
+    EXTRACT_KEY(src1, s1_tag, s1_vr, s1_imm, s1_sym);
+    EXTRACT_KEY(src2, s2_tag, s2_vr, s2_imm, s2_sym);
     if (is_mla)
-      EXTRACT_KEY(accum, s3_tag, s3_vr, s3_imm);
+      EXTRACT_KEY(accum, s3_tag, s3_vr, s3_imm, s3_sym);
 
     uint8_t s1_lval_q = src1.is_lval;
     uint8_t s2_lval_q = src2.is_lval;
     uint8_t s3_lval_q = is_mla ? accum.is_lval : 0;
+
+    /* Never CSE an op that reads a volatile global — each volatile access must
+     * be emitted (hardware registers etc.).  Only SYMREF operands carry a
+     * resolved sym here; volatile locals reach the backend through a separate
+     * non-fused load and are not matched by this pass. */
+    if ((s1_sym && (s1_sym->type.t & VT_VOLATILE)) || (s2_sym && (s2_sym->type.t & VT_VOLATILE)) ||
+        (s3_sym && (s3_sym->type.t & VT_VOLATILE)))
+      continue;
 
     /* Look up in cache. */
     int found = -1;
@@ -1516,9 +1632,10 @@ int tcc_ir_opt_local_alu_cse(TCCIRState *ir)
       if (cache[c].op != q->op)
         continue;
       if (cache[c].s1_tag == s1_tag && cache[c].s1_lval == s1_lval_q && cache[c].s1_vr == s1_vr &&
-          cache[c].s1_imm == s1_imm && cache[c].s2_tag == s2_tag && cache[c].s2_lval == s2_lval_q &&
-          cache[c].s2_vr == s2_vr && cache[c].s2_imm == s2_imm && cache[c].s3_tag == s3_tag &&
-          cache[c].s3_lval == s3_lval_q && cache[c].s3_vr == s3_vr && cache[c].s3_imm == s3_imm)
+          cache[c].s1_imm == s1_imm && cache[c].s1_sym == s1_sym && cache[c].s2_tag == s2_tag &&
+          cache[c].s2_lval == s2_lval_q && cache[c].s2_vr == s2_vr && cache[c].s2_imm == s2_imm &&
+          cache[c].s2_sym == s2_sym && cache[c].s3_tag == s3_tag && cache[c].s3_lval == s3_lval_q &&
+          cache[c].s3_vr == s3_vr && cache[c].s3_imm == s3_imm && cache[c].s3_sym == s3_sym)
       {
         found = c;
         break;
@@ -1528,9 +1645,10 @@ int tcc_ir_opt_local_alu_cse(TCCIRState *ir)
           q->op == TCCIR_OP_XOR || q->op == TCCIR_OP_MLA)
       {
         if (cache[c].s1_tag == s2_tag && cache[c].s1_lval == s2_lval_q && cache[c].s1_vr == s2_vr &&
-            cache[c].s1_imm == s2_imm && cache[c].s2_tag == s1_tag && cache[c].s2_lval == s1_lval_q &&
-            cache[c].s2_vr == s1_vr && cache[c].s2_imm == s1_imm && cache[c].s3_tag == s3_tag &&
-            cache[c].s3_lval == s3_lval_q && cache[c].s3_vr == s3_vr && cache[c].s3_imm == s3_imm)
+            cache[c].s1_imm == s2_imm && cache[c].s1_sym == s2_sym && cache[c].s2_tag == s1_tag &&
+            cache[c].s2_lval == s1_lval_q && cache[c].s2_vr == s1_vr && cache[c].s2_imm == s1_imm &&
+            cache[c].s2_sym == s1_sym && cache[c].s3_tag == s3_tag && cache[c].s3_lval == s3_lval_q &&
+            cache[c].s3_vr == s3_vr && cache[c].s3_imm == s3_imm && cache[c].s3_sym == s3_sym)
         {
           found = c;
           break;
@@ -1560,14 +1678,17 @@ int tcc_ir_opt_local_alu_cse(TCCIRState *ir)
       e->s1_lval = (uint8_t)src1.is_lval;
       e->s1_vr = s1_vr;
       e->s1_imm = s1_imm;
+      e->s1_sym = s1_sym;
       e->s2_tag = s2_tag;
       e->s2_lval = (uint8_t)src2.is_lval;
       e->s2_vr = s2_vr;
       e->s2_imm = s2_imm;
+      e->s2_sym = s2_sym;
       e->s3_tag = s3_tag;
       e->s3_lval = is_mla ? (uint8_t)accum.is_lval : 0;
       e->s3_vr = s3_vr;
       e->s3_imm = s3_imm;
+      e->s3_sym = s3_sym;
       e->dest_vr = dest_vr;
     }
   }

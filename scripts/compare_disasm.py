@@ -29,7 +29,7 @@ from disasm_common import (
     compare_functions,
     disassemble,
     eprint,
-    extract_function_disasm,
+    extract_all_function_disasm,
     get_common_functions,
     get_tcc_path,
     get_transitive_callees,
@@ -204,10 +204,7 @@ def print_summary_table(func_results, gcc_opt):
     print()
 
 
-def print_side_by_side(tcc_dump, gcc_dump, func_name, gcc_opt):
-    tcc_lines = extract_function_disasm(tcc_dump, func_name)
-    gcc_lines = extract_function_disasm(gcc_dump, func_name)
-
+def print_side_by_side(tcc_lines, gcc_lines, func_name, gcc_opt):
     if not tcc_lines and not gcc_lines:
         print("  (function not found in either output)")
         return
@@ -305,6 +302,11 @@ def main():
 
         print_summary_table(func_results, gcc_opt)
 
+        # Extract every function's disasm block once, not per-function in the loop.
+        result_funcs = [func for func, _, _ in func_results]
+        tcc_disasm = extract_all_function_disasm(tcc_dump, result_funcs)
+        gcc_disasm = extract_all_function_disasm(gcc_dump, result_funcs)
+
         if not no_cache:
             cache = DisasmCache()
             key_prefix = resolve_cache_key_prefix(cache, test_file.stem)
@@ -326,7 +328,7 @@ def main():
                 print(f"  Ratio:        {ratio:.2f} (TCC/GCC)")
             print()
 
-            print_side_by_side(tcc_dump, gcc_dump, func, gcc_opt)
+            print_side_by_side(tcc_disasm.get(func, []), gcc_disasm.get(func, []), func, gcc_opt)
 
     print()
     print("========================================")

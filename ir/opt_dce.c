@@ -655,6 +655,34 @@ static int ir_opt_range_has_iv_update(TCCIRState *ir, int start, int end)
   return 0;
 }
 
+/* True when the region [start,end] contains both a conditional branch and a
+ * control transfer that leaves the region.  That distinguishes a
+ * conditionally-terminating loop from an unconditional `for(;;)` whose only
+ * edge is the back-edge: the latter has no JUMPIF and no out-of-region edge,
+ * so it returns 0 and stays essential.  Combined with a monotonic IV in the
+ * region (ir_opt_range_has_iv_update), a true result identifies a loop that,
+ * per C11 6.8.5p6, may be assumed to terminate when the surrounding body is
+ * side-effect-free — and is therefore elidable by useless_function_body. */
+static int ir_opt_region_has_conditional_exit(TCCIRState *ir, int start, int end)
+{
+  int has_cond = 0;
+  int has_exit = 0;
+  for (int i = start; i <= end; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF)
+      continue;
+    int t = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+    if (q->op == TCCIR_OP_JUMPIF)
+      has_cond = 1;
+    if (t < start || t > end)
+      has_exit = 1; /* edge leaves the loop body */
+    if (has_cond && has_exit)
+      return 1;
+  }
+  return 0;
+}
+
 static int ir_opt_successor_enters_range(TCCIRState *ir, int succ, int start, int end)
 {
   int n = ir->next_instruction_index;
@@ -699,6 +727,19 @@ static int ir_opt_backward_jump_has_cond_exit(TCCIRState *ir, int idx)
 
   if (q->op != TCCIR_OP_JUMP)
     return 0;
+
+  /* Forward-progress (C11 6.8.5p6): in an otherwise side-effect-free body, a
+   * loop with a monotonic induction variable and a genuine conditional exit
+   * may be assumed to terminate.  The structured JUMPIF scan below only
+   * recognises loops whose IV exit test directly brackets the back-edge range;
+   * this catches loops whose exit branch is indirected through extra blocks —
+   * e.g. the inner `for(i=0; op && i<*num_operands && !mismatch; i++)` of
+   * gcc.c-torture compile/pr26833.c, whose `i<*num_operands` exit falls through
+   * to a separate JMP out of the body, so neither successor of the test leaves
+   * the [header,back-edge] range. */
+  if (ir_opt_range_has_iv_update(ir, target, idx) &&
+      ir_opt_region_has_conditional_exit(ir, target, idx))
+    return 1;
 
   for (int i = 0; i <= idx; i++)
   {
@@ -5629,6 +5670,39 @@ int tcc_ir_opt_redundant_var_assign_ex(IROptCtx *ctx) { return tcc_ir_opt_redund
 int tcc_ir_opt_dead_var_store_elim_ex(IROptCtx *ctx) { return tcc_ir_opt_dead_var_store_elim(ctx->ir); }
 int tcc_ir_opt_dead_addrvar_elim_ex(IROptCtx *ctx) { return tcc_ir_opt_dead_addrvar_elim(ctx->ir); }
 
+/* Is this STORE destination observable to the caller (escapes the frame)?
+ *
+ * A store escapes only when it writes through a pointer (is_lval) or to a
+ * global symbol (is_sym).  Three kinds of destination are frame-private and
+ * unobservable once the function returns:
+ *   - a frame-local stack slot (d.is_local),
+ *   - a direct (non-lval) write to a local variable's own value slot
+ *     (VAR vreg), or
+ *   - a direct write to a by-value parameter's own slot (PARAM vreg) — e.g.
+ *     `for (;;) p_25 += 1` on `unsigned p_25`, which lowers to a STORE whose
+ *     dest is the PARAM vreg with is_local==0.
+ * The last case is why a bare `!d.is_local` test is wrong: it wrongly treats
+ * a by-value parameter's private update as escaping, blocking the
+ * uninit-dominates-return collapse on gcc.c-torture compile/pc44485.c
+ * func_21.  Writing the parameter's own copy is never visible to the caller
+ * (arguments are passed by value), so it does not count as observable. */
+static int udr_store_is_observable(IROperand d)
+{
+  if (d.is_local)
+    return 0;
+  if (!d.is_lval && !d.is_sym)
+  {
+    int32_t dvr = irop_get_vreg(d);
+    if (dvr >= 0)
+    {
+      int vt = TCCIR_DECODE_VREG_TYPE(dvr);
+      if (vt == TCCIR_VREG_TYPE_VAR || vt == TCCIR_VREG_TYPE_PARAM)
+        return 0;
+    }
+  }
+  return 1;
+}
+
 /* Observable side-effect guard shared by the uninit-UB collapse passes.
  *
  * Those passes exploit a dominating uninit read to declare the whole function
@@ -5676,7 +5750,7 @@ static int udr_has_observable_side_effects(TCCIRState *ir)
     case TCCIR_OP_BLOCK_COPY:
     {
       IROperand d = tcc_ir_op_get_dest(ir, q);
-      if (!d.is_local)
+      if (udr_store_is_observable(d))
         return 1;
       break;
     }
@@ -5713,6 +5787,342 @@ static int udr_has_observable_side_effects(TCCIRState *ir)
     }
   }
   return 0;
+}
+
+/* Conservative test: does the function provably never return to its caller?
+ *
+ * Lets uninit_local_ub collapse a UB body even when it contains calls.  When a
+ * function can never return, replacing it with `b .` faithfully preserves its
+ * (non-)termination; the only behaviour dropped are the side-effecting calls,
+ * which are all dominated by the entry-block uninit read and so legally
+ * elidable (the program is undefined from that read onward).  When the function
+ * CAN return, collapsing would turn a terminating UB program (e.g. va-arg-14's
+ * main, which reads an uninit va_list then returns) into a hang — so we keep it.
+ *
+ * "Never returns" requires: no RETURNVALUE/RETURNVOID; the last live op is an
+ * unconditional JUMP looping back (control can't fall off the end into the
+ * implicit `bx lr` epilogue); and every control transfer (JUMP/JUMPIF plus
+ * every SWITCH_TABLE target and default) lands on a live instruction at or
+ * before that back-edge, never the past-end epilogue.  Mirrors the noreturn
+ * detection in tcc_ir_opt_noreturn_collapse, with switch-target coverage added.
+ * Returns 0 (may return) whenever anything is uncertain. */
+static int udr_function_provably_noreturn(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+
+  int last_idx = -1;
+  for (int i = n - 1; i >= 0; i--)
+  {
+    if (ir->compact_instructions[i].op != TCCIR_OP_NOP)
+    {
+      last_idx = i;
+      break;
+    }
+  }
+  if (last_idx < 0)
+    return 0;
+  /* Anything other than an unconditional JUMP as the final op can fall through
+   * to the epilogue (implicit return). */
+  if (ir->compact_instructions[last_idx].op != TCCIR_OP_JUMP)
+    return 0;
+
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    switch (q->op)
+    {
+    case TCCIR_OP_NOP:
+      continue;
+    case TCCIR_OP_RETURNVALUE:
+    case TCCIR_OP_RETURNVOID:
+      return 0;
+    /* Unknown / unmodelled control transfers: refuse to claim noreturn. */
+    case TCCIR_OP_IJUMP:
+    case TCCIR_OP_SWITCH_LOAD:
+      return 0;
+    /* A call to a noreturn callee (exit/abort/...) terminates the program at
+     * that point — the function's effect is NOT "spin forever", so `b .` would
+     * wrongly hang instead of exiting.  Refuse to collapse.  Ordinary returning
+     * calls (931102-1's e()) are fine: control comes back and stays trapped in
+     * the loop. */
+    case TCCIR_OP_FUNCCALLVAL:
+    case TCCIR_OP_FUNCCALLVOID:
+      if (tcc_ir_callee_is_noreturn(irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q))))
+        return 0;
+      break;
+    case TCCIR_OP_JUMP:
+    case TCCIR_OP_JUMPIF:
+    {
+      int jt = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+      if (jt < 0)
+        return 0;
+      while (jt < n && ir->compact_instructions[jt].op == TCCIR_OP_NOP)
+        jt++;
+      if (jt >= n || jt > last_idx)
+        return 0; /* exits to the epilogue == a reachable return */
+      break;
+    }
+    case TCCIR_OP_SWITCH_TABLE:
+    {
+      int table_id = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q));
+      if (table_id < 0 || table_id >= ir->num_switch_tables)
+        return 0;
+      TCCIRSwitchTable *t = &ir->switch_tables[table_id];
+      for (int e = 0; e <= t->num_entries; e++)
+      {
+        int tgt = (e == t->num_entries) ? t->default_target : t->targets[e];
+        if (tgt < 0)
+          return 0;
+        while (tgt < n && ir->compact_instructions[tgt].op == TCCIR_OP_NOP)
+          tgt++;
+        if (tgt >= n || tgt > last_idx)
+          return 0;
+      }
+      break;
+    }
+    default:
+      break;
+    }
+  }
+  return 1;
+}
+
+/* Can any observable side effect reach a function return?
+ *
+ * The uninit-UB collapse keeps observable work in functions that can *return*,
+ * because discarding a side effect sequenced before a clean return would turn a
+ * terminating-but-UB program into a hang (va-arg-14's main calls exit() then
+ * returns).  But that concern only applies to effects that actually precede a
+ * return: when every observable effect is "trapped" in a non-returning region
+ * (an infinite loop it can never escape), any execution that performs the effect
+ * was going to spin forever regardless, so collapsing the whole body to `b .`
+ * discards no terminating behavior.  That is exactly gcc.c-torture compile
+ * 20020605-1::f — its only side effect (a recursive call) sits in a dead
+ * infinite loop, and GCC -O2 collapses the body to `b .`.
+ *
+ * This computes reaches_ret[i] (backward fixpoint): control from instruction i
+ * can reach an explicit RETURNVALUE/RETURNVOID or the implicit epilogue (falling
+ * off the end, or a branch whose NOP-skipped target lands past the last live
+ * instruction).  Then it reports whether any observable side-effect instruction
+ * has reaches_ret set.  Target resolution mirrors udr_function_provably_noreturn.
+ *
+ * Conservative by construction: returns 1 (effect reaches a return -> keep the
+ * function) the moment it sees any control transfer it cannot bound (IJUMP /
+ * SWITCH_LOAD) or any exotic observable op whose termination behaviour it does
+ * not model (asm, setjmp/longjmp, trap, VLA, __builtin_apply).  Only ordinary
+ * calls, frame-escaping stores, and volatile accesses participate in the
+ * trapped-reachability analysis. */
+static int udr_observable_effect_reaches_return(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  if (n == 0)
+    return 0;
+
+  int last_idx = -1;
+  for (int i = n - 1; i >= 0; i--)
+    if (ir->compact_instructions[i].op != TCCIR_OP_NOP)
+    {
+      last_idx = i;
+      break;
+    }
+  if (last_idx < 0)
+    return 0;
+
+  /* Bail (conservatively "reaches return") on unmodelled control transfers and
+   * exotic observable ops — their presence alone forces us to keep the body. */
+  for (int i = 0; i < n; i++)
+  {
+    switch (ir->compact_instructions[i].op)
+    {
+    case TCCIR_OP_IJUMP:
+    case TCCIR_OP_SWITCH_LOAD:
+    case TCCIR_OP_INLINE_ASM:
+    case TCCIR_OP_ASM_INPUT:
+    case TCCIR_OP_ASM_OUTPUT:
+    case TCCIR_OP_SETJMP:
+    case TCCIR_OP_LONGJMP:
+    case TCCIR_OP_NL_SETJMP:
+    case TCCIR_OP_NL_LONGJMP:
+    case TCCIR_OP_BUILTIN_APPLY_ARGS:
+    case TCCIR_OP_BUILTIN_APPLY:
+    case TCCIR_OP_BUILTIN_RETURN:
+    case TCCIR_OP_TRAP:
+    case TCCIR_OP_VLA_ALLOC:
+    case TCCIR_OP_VLA_SP_SAVE:
+    case TCCIR_OP_VLA_SP_RESTORE:
+      return 1;
+    default:
+      break;
+    }
+  }
+
+#define UDR_NOPSKIP(t)                                                                                                  \
+  do                                                                                                                   \
+  {                                                                                                                    \
+    while ((t) < n && ir->compact_instructions[(t)].op == TCCIR_OP_NOP)                                                \
+      (t)++;                                                                                                           \
+  } while (0)
+#define UDR_RR_GET(k) (reaches_ret[(k) / 8] & (1 << ((k) % 8)))
+
+  uint8_t *reaches_ret = tcc_mallocz((n + 7) / 8);
+  int changed = 1;
+  while (changed)
+  {
+    changed = 0;
+    for (int i = n - 1; i >= 0; i--)
+    {
+      if (UDR_RR_GET(i))
+        continue;
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      int r = 0;
+      switch (q->op)
+      {
+      case TCCIR_OP_RETURNVALUE:
+      case TCCIR_OP_RETURNVOID:
+        r = 1;
+        break;
+      case TCCIR_OP_JUMP:
+      {
+        int t = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+        if (t < 0)
+        {
+          r = 1; /* malformed target -> conservative */
+          break;
+        }
+        UDR_NOPSKIP(t);
+        if (t > last_idx)
+          r = 1; /* epilogue == return */
+        else if (UDR_RR_GET(t))
+          r = 1;
+        break;
+      }
+      case TCCIR_OP_JUMPIF:
+      {
+        int t = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+        if (t < 0)
+        {
+          r = 1;
+          break;
+        }
+        UDR_NOPSKIP(t);
+        if (t > last_idx || UDR_RR_GET(t))
+          r = 1;
+        else
+        {
+          int f = i + 1;
+          UDR_NOPSKIP(f);
+          if (f > last_idx || UDR_RR_GET(f))
+            r = 1;
+        }
+        break;
+      }
+      case TCCIR_OP_SWITCH_TABLE:
+      {
+        int table_id = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q));
+        if (table_id < 0 || table_id >= ir->num_switch_tables)
+        {
+          r = 1;
+          break;
+        }
+        TCCIRSwitchTable *tb = &ir->switch_tables[table_id];
+        for (int e = 0; e <= tb->num_entries && !r; e++)
+        {
+          int tgt = (e == tb->num_entries) ? tb->default_target : tb->targets[e];
+          if (tgt < 0)
+          {
+            r = 1;
+            break;
+          }
+          UDR_NOPSKIP(tgt);
+          if (tgt > last_idx || UDR_RR_GET(tgt))
+            r = 1;
+        }
+        break;
+      }
+      default:
+      {
+        /* Fall-through op (NOP, arithmetic, load/store, call, ...). */
+        int t = i + 1;
+        UDR_NOPSKIP(t);
+        if (t > last_idx || UDR_RR_GET(t))
+          r = 1;
+        break;
+      }
+      }
+      if (r)
+      {
+        reaches_ret[i / 8] |= (uint8_t)(1 << (i % 8));
+        changed = 1;
+      }
+    }
+  }
+
+  int result = 0;
+  for (int i = 0; i < n && !result; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    int observable = 0;
+    switch (q->op)
+    {
+    case TCCIR_OP_FUNCCALLVAL:
+    case TCCIR_OP_FUNCCALLVOID:
+    case TCCIR_OP_CALLSEQ_BEGIN:
+    case TCCIR_OP_CALLARG_REG:
+    case TCCIR_OP_CALLARG_STACK:
+    case TCCIR_OP_CALLSEQ_END:
+      observable = 1;
+      break;
+    case TCCIR_OP_STORE:
+    case TCCIR_OP_STORE_INDEXED:
+    case TCCIR_OP_STORE_POSTINC:
+    case TCCIR_OP_BLOCK_COPY:
+      observable = udr_store_is_observable(tcc_ir_op_get_dest(ir, q));
+      break;
+    default:
+      break;
+    }
+    if (!observable)
+    {
+      for (int k = 0; k <= 2; k++)
+      {
+        IROperand op;
+        if (k == 0)
+        {
+          if (!irop_config[q->op].has_dest)
+            continue;
+          op = tcc_ir_op_get_dest(ir, q);
+        }
+        else if (k == 1)
+        {
+          if (!irop_config[q->op].has_src1)
+            continue;
+          op = tcc_ir_op_get_src1(ir, q);
+        }
+        else
+        {
+          if (!irop_config[q->op].has_src2)
+            continue;
+          op = tcc_ir_op_get_src2(ir, q);
+        }
+        if (op.is_sym)
+        {
+          Sym *vs = irop_get_sym_ex(ir, op);
+          if (vs && (vs->type.t & VT_VOLATILE))
+          {
+            observable = 1;
+            break;
+          }
+        }
+      }
+    }
+    if (observable && UDR_RR_GET(i))
+      result = 1;
+  }
+
+#undef UDR_NOPSKIP
+#undef UDR_RR_GET
+  tcc_free(reaches_ret);
+  return result;
 }
 
 /* Unconditional Uninitialized Local UB Exploit
@@ -5879,10 +6289,24 @@ int tcc_ir_opt_uninit_local_ub(TCCIRState *ir)
   if (!found_uninit)
     return 0;
 
-  /* See udr_has_observable_side_effects: only collapse a side-effect-free
-   * body.  va-arg-14's main reads an uninitialised `va_list t` but then calls
-   * vat(t,1) and exit(0) — observable work that must not be discarded. */
-  if (udr_has_observable_side_effects(ir))
+  /* The entry-block uninit read is UB that dominates the whole body, so the
+   * collapse is sound per C11 regardless of downstream side effects.  We still
+   * keep observable work in functions that can *return* — discarding it would
+   * turn a terminating-but-UB program into a hang (va-arg-14's main reads an
+   * uninit `va_list t`, calls vat(t,1)/exit(0), then returns).  But when the
+   * function provably never returns (every path bottoms out in an infinite
+   * loop, like gcc.c-torture/compile/931102-1.c::xxx), `b .` faithfully models
+   * its non-termination and the dominated-by-UB calls are legally elidable —
+   * matching GCC -O2, which collapses the same body to a 2-insn self-loop.
+   *
+   * The provably-noreturn test is whole-function; it misses bodies that have a
+   * clean (side-effect-free) return path but whose observable effects are all
+   * trapped in dead infinite loops (gcc.c-torture compile 20020605-1::f: the
+   * only call lives in an unreachable `while(1) f()`).  Those are equally safe
+   * to collapse — no terminating-with-output behavior is lost — so we also fold
+   * when no observable effect can actually reach a return. */
+  if (udr_has_observable_side_effects(ir) && !udr_function_provably_noreturn(ir) &&
+      udr_observable_effect_reaches_return(ir))
     return 0;
 
   LOG_IR_GEN("UNINIT-UB: collapsing function body to infinite loop (read of uninit local in entry block)");
@@ -7071,8 +7495,12 @@ int tcc_ir_opt_const_return_uninit_elide(TCCIRState *ir)
     return 0;
 
 #define CRUE_MAX_STORE_OFFSETS 512
+#define CRUE_MAX_VAR_POS 1024
   int store_offsets[CRUE_MAX_STORE_OFFSETS];
   int n_store_offsets = 0;
+  /* VARs whose address is taken anywhere: a pointer write may have
+   * initialised them, so a read of one is not provably uninit. */
+  uint8_t var_addr_taken[(CRUE_MAX_VAR_POS + 7) / 8] = {0};
 
   IROperand rv_src = IROP_NONE;
   int rv_count = 0;
@@ -7180,6 +7608,17 @@ int tcc_ir_opt_const_return_uninit_elide(TCCIRState *ir)
         if (sym && (sym->type.t & VT_VOLATILE))
           return 0;
       }
+      /* Address-of a VAR-vreg local (is_local, !is_lval): exclude it from the
+       * uninit-VAR check below — a pointer alias may write it. */
+      {
+        int32_t vr = irop_get_vreg(op);
+        if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR && op.is_local && !op.is_lval)
+        {
+          int pos = TCCIR_DECODE_VREG_POSITION(vr);
+          if (pos >= 0 && pos < CRUE_MAX_VAR_POS)
+            var_addr_taken[pos >> 3] |= (uint8_t)(1u << (pos & 7));
+        }
+      }
     }
 
     /* LEA with a STACKOFF source materialises a stack address — same risk
@@ -7189,6 +7628,13 @@ int tcc_ir_opt_const_return_uninit_elide(TCCIRState *ir)
       IROperand s = tcc_ir_op_get_src1(ir, q);
       if (irop_get_tag(s) == IROP_TAG_STACKOFF)
         return 0;
+      int32_t vr = irop_get_vreg(s);
+      if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR)
+      {
+        int pos = TCCIR_DECODE_VREG_POSITION(vr);
+        if (pos >= 0 && pos < CRUE_MAX_VAR_POS)
+          var_addr_taken[pos >> 3] |= (uint8_t)(1u << (pos & 7));
+      }
     }
   }
 
@@ -7202,6 +7648,10 @@ int tcc_ir_opt_const_return_uninit_elide(TCCIRState *ir)
    * fall-through from entry, and a UB read in the loop header IS executed
    * on entry. */
   int found_uninit = 0;
+  /* VARs written by an entry-block instruction preceding the current one.
+   * Tracked in program order so an init-then-read in the entry block is not
+   * mistaken for uninit (mirrors uninit_local_ub). */
+  uint8_t var_written[(CRUE_MAX_VAR_POS + 7) / 8] = {0};
   for (int i = 0; i < n; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
@@ -7249,6 +7699,42 @@ int tcc_ir_opt_const_return_uninit_elide(TCCIRState *ir)
       }
     }
 
+    /* Also recognise an uninit VAR-vreg read: a never-address-taken local
+     * kept in a virtual register (TCCIR_VREG_TYPE_VAR), read in the entry
+     * block before any write to it.  pr78574's `for (; j; j++)` reads uninit
+     * `j` — a VAR vreg that is never spilled to a STACKOFF — in the loop
+     * guard at entry, so the STACKOFF scan above never sees it.  This mirrors
+     * the detection in uninit_local_ub / uninit_dominates_return; what differs
+     * is the collapse target: those fold to `b .`, while here every
+     * RETURNVALUE returns the same constant, so we fold to that constant
+     * (matching GCC -O2's `return 0` on this body). */
+    for (int k = 1; k <= 2 && !found_uninit; k++)
+    {
+      if (k == 1 && !irop_config[q->op].has_src1)
+        continue;
+      if (k == 2 && !irop_config[q->op].has_src2)
+        continue;
+      IROperand sop = (k == 1) ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_src2(ir, q);
+      int32_t svr = irop_get_vreg(sop);
+      if (svr < 0)
+        continue;
+      if (TCCIR_DECODE_VREG_TYPE(svr) != TCCIR_VREG_TYPE_VAR)
+        continue;
+      /* Pure address-of (is_local && !is_lval) is not a value read. */
+      if (sop.is_local && !sop.is_lval)
+        continue;
+      int pos = TCCIR_DECODE_VREG_POSITION(svr);
+      if (pos < 0 || pos >= CRUE_MAX_VAR_POS)
+        continue;
+      if (var_addr_taken[pos >> 3] & (uint8_t)(1u << (pos & 7)))
+        continue;
+      if (!(var_written[pos >> 3] & (uint8_t)(1u << (pos & 7))))
+      {
+        found_uninit = 1;
+        break;
+      }
+    }
+
     /* If we hit an observable op before any uninit read, the observable
      * effect would be lost — bail. */
     if (!found_uninit)
@@ -7274,6 +7760,21 @@ int tcc_ir_opt_const_return_uninit_elide(TCCIRState *ir)
       }
     }
 
+    /* Record this instruction's VAR-vreg write (program order: applied after
+     * the read check so `int x = 0; if (x)` in the entry block doesn't flag
+     * x as uninit). */
+    if (!found_uninit && irop_config[q->op].has_dest)
+    {
+      IROperand dop = tcc_ir_op_get_dest(ir, q);
+      int32_t dvr = irop_get_vreg(dop);
+      if (dvr >= 0 && TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_VAR)
+      {
+        int pos = TCCIR_DECODE_VREG_POSITION(dvr);
+        if (pos >= 0 && pos < CRUE_MAX_VAR_POS)
+          var_written[pos >> 3] |= (uint8_t)(1u << (pos & 7));
+      }
+    }
+
     /* Entry-block terminators. */
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF || q->op == TCCIR_OP_RETURNVALUE ||
         q->op == TCCIR_OP_RETURNVOID)
@@ -7281,6 +7782,7 @@ int tcc_ir_opt_const_return_uninit_elide(TCCIRState *ir)
   }
 
 #undef CRUE_MAX_STORE_OFFSETS
+#undef CRUE_MAX_VAR_POS
 
   if (!found_uninit)
     return 0;

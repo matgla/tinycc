@@ -2182,6 +2182,17 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
               }
             }
           }
+          /* A valid preheader must DOMINATE the header: every path from
+           * function entry to the header must pass through it, so code
+           * hoisted there runs before each header execution.  A unique
+           * out-of-loop predecessor is not sufficient — when the header is
+           * itself the function entry block (or otherwise reachable from
+           * entry without passing the predecessor), that predecessor is a
+           * back-edge source of an enclosing loop, and hoisting an invariant
+           * into it skips it on the entry path (miscompile: the hoisted
+           * value is undefined on the first iteration). */
+          if (preheader >= 0 && !tcc_ir_cfg_dominates(cfg, preheader, h))
+            preheader = -1;
           if (preheader < 0) {
             tcc_free(in_loop);
             tcc_free(worklist);
