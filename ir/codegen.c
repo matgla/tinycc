@@ -1727,6 +1727,8 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
 
   tcc_ir_debug_codegen_generate_entry(ir);
 
+  if (getenv("DUMP_IR_CG")) { printf("==== POST-OPT IR AT CODEGEN ====\n"); tcc_ir_show(ir); fflush(stdout); }
+
   /* `&&label` stores label positions as IR indices BEFORE DCE/compaction.
    * max_orig_index and is_jump_target flags are maintained incrementally
    * during IR construction (tcc_ir_put / tcc_ir_backpatch), so no pre-pass

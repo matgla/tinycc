@@ -3900,9 +3900,12 @@ static void ra_coalesce_graph(TCCIRState *ir, SSAInterval *intervals, int count,
  * Entry Point
  * ============================================================================ */
 
+void dbg_scan_imm_dest(TCCIRState *ir, const char *pass);
+void dbg_scan_overlap(TCCIRState *ir, const char *pass);
 void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill_base)
 {
   if (!ir || !target) return;
+  dbg_scan_overlap(ir, "ssa_regalloc_entry");
 
   /* Build CFG + dominators */
   IRCFG *cfg = tcc_ir_cfg_build(ir);
@@ -3925,6 +3928,7 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
   } else {
     tcc_ir_ssa_rename(ir, ssa);
   }
+  dbg_scan_imm_dest(ir, "ssa_rename"); dbg_scan_overlap(ir, "ssa_rename");
 
   /* SSA optimization passes.
    * At -O0: only run DCE to remove dead phi definitions that could
@@ -3965,6 +3969,7 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
     }
     tcc_ir_ssa_opt_free(&ssa_opt_ctx);
   }
+  dbg_scan_imm_dest(ir, "ssa_opt_block"); dbg_scan_overlap(ir, "ssa_opt_block");
 
   /* Set types from operand btypes (same as tcc_ir_live_analysis).
    * Skip lvalue operands: when is_lval=1 the vreg holds a pointer (32-bit)
@@ -4055,12 +4060,14 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
   ra_phi_resolve_pre_ra_mode = 1;
   ra_resolve_phis(ir, cfg, ssa);
   ra_phi_resolve_pre_ra_mode = 0;
+  dbg_scan_imm_dest(ir,"ra_resolve_phis");
 
   /* Collapse "TMP <- const; T_phi <- TMP" chains the phi resolver leaves
    * behind in dense switch case bodies. Each fold drops one ASSIGN and one
    * SSA temp from the case body, cutting both the per-case instruction count
    * and the phi-temp live ranges that drive the linear scan into spills. */
   ra_fold_phi_const_chain(ir);
+  dbg_scan_imm_dest(ir,"ra_fold_phi_const_chain");
 
   /* Once the per-case bodies are canonicalised to "T_phi <- const; JMP merge",
    * try to rewrite the entire SWITCH_TABLE dispatch into a single SWITCH_LOAD
@@ -4068,6 +4075,7 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
    * (which produces the canonical body shape) and before live-interval
    * construction (which would otherwise see the now-dead case bodies). */
   tcc_ir_opt_switch_to_data(ir);
+  dbg_scan_imm_dest(ir,"switch_to_data");
 
   /* Fold CMP + JUMPIF where both operands resolve to constants within the
    * same basic block. Phi resolution often materializes the entry-path
@@ -4075,6 +4083,7 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
    * dead skip-loop block removes the carrier-vreg copies it contains and
    * cuts the carriers' live ranges, easing register pressure. */
   ra_fold_const_branches(ir);
+  dbg_scan_imm_dest(ir,"ra_fold_const_branches");
 
   /* const_memcpy_fwd: by this point the SSA opt fold (ssa_opt_fold's
    * bit-complement / SCCP / GVN) has materialised compile-time-constant

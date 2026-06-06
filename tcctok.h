@@ -627,6 +627,7 @@ DEF_ASMDIR(int)
 DEF_ASMDIR(symver)
 DEF_ASMDIR(syntax)
 DEF_ASMDIR(arch)
+DEF_ASMDIR(fpu)
 DEF_ASMDIR(thumb)
 DEF_ASMDIR(thumb_func)
 DEF_ASMDIR(section) /* must be last directive */

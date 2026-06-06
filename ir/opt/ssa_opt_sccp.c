@@ -1315,10 +1315,21 @@ static void sccp_process_cfg_edge(SCCPState *s, int pred, int succ)
  * Apply SCCP results: replace constants, fold branches, NOP dead code
  * ============================================================================ */
 
+void dbg_scan_imm_dest(TCCIRState *ir, const char *pass);
 static int sccp_apply(SCCPState *s)
 {
   TCCIRState *ir = s->ctx->ir;
   int changes = 0;
+
+  if (getenv("DUMP_OB")) {
+    fprintf(stderr, "=== operand layout at sccp_apply entry ===\n");
+    for (int i = 0; i < ir->next_instruction_index && i < 12; i++) {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      int nops = irop_config[q->op].has_dest + irop_config[q->op].has_src1 + irop_config[q->op].has_src2;
+      fprintf(stderr, "  insn %d: op=%d ob=%d nops=%d -> slots[%d..%d]\n",
+              i, (int)q->op, q->operand_base, nops, q->operand_base, q->operand_base + nops - 1);
+    }
+  }
 
   /* Phase 1: Replace constant-valued instructions with ASSIGN #const */
   for (int pos = 0; pos < s->cells_cap; pos++) {
@@ -1343,6 +1354,10 @@ static int sccp_apply(SCCPState *s)
     }
 
     IROperand dest = tcc_ir_op_get_dest(ir, q);
+    if (getenv("SCAN_IMM_DEST"))
+      fprintf(stderr, "SCCP rewrite def_instr=%d orig_op=%d has_dest=%d has_src1=%d has_src2=%d ob=%d\n",
+              vi->def_instr, (int)q->op, irop_config[q->op].has_dest, irop_config[q->op].has_src1,
+              irop_config[q->op].has_src2, q->operand_base);
     int64_t val = s->cells[pos].value;
     IROperand imm;
     if (val == (int64_t)(int32_t)val) {
@@ -1366,6 +1381,18 @@ static int sccp_apply(SCCPState *s)
     tcc_ir_set_src1(ir, vi->def_instr, imm);
     tcc_ir_set_src2(ir, vi->def_instr, IROP_NONE);
     changes++;
+    if (getenv("SCAN_IMM_DEST")) {
+      for (int j = 0; j < ir->next_instruction_index; j++) {
+        IRQuadCompact *jq = &ir->compact_instructions[j];
+        if (jq->op != TCCIR_OP_ASSIGN) continue;
+        if (irop_get_tag(tcc_ir_op_get_dest(ir, jq)) == IROP_TAG_IMM32) {
+          fprintf(stderr, "CORRUPT insn %d (ob=%d nops=%d) after rewriting def_instr=%d (op_now=%d ob=%d nops=%d)\n",
+                  j, jq->operand_base, (irop_config[jq->op].has_dest + irop_config[jq->op].has_src1 + irop_config[jq->op].has_src2),
+                  vi->def_instr, (int)q->op, q->operand_base, (irop_config[q->op].has_dest + irop_config[q->op].has_src1 + irop_config[q->op].has_src2));
+          break;
+        }
+      }
+    }
   }
 
   /* Phase 1.5: Rewrite CMP/TEST_ZERO operands that resolve to constants

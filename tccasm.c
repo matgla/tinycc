@@ -1224,6 +1224,27 @@ static void asm_parse_directive(TCCState *s1, int global)
   case TOK_ASMDIR_thumb:
     next();
     break;
+#ifdef TCC_TARGET_ARM
+  case TOK_ASMDIR_fpu:
+  {
+    /* `.fpu <name>` — enable the named FP unit's instruction encodings.
+       The name (e.g. fpv5-sp-d16) lexes as several tokens because of the
+       hyphens, so rebuild it the same way `.section` rebuilds its name. */
+    char fpu_name[64];
+    next();
+    fpu_name[0] = '\0';
+    while (tok != ';' && tok != TOK_LINEFEED && tok != CH_EOF)
+    {
+      if (tok == TOK_STR)
+        pstrcat(fpu_name, sizeof(fpu_name), tokc.str.data);
+      else
+        pstrcat(fpu_name, sizeof(fpu_name), get_tok_str(tok, NULL));
+      next();
+    }
+    tcc_asm_set_fpu(fpu_name);
+  }
+  break;
+#endif
   case TOK_ASMDIR_thumb_func:
     next();
     /* GAS accepts both `.thumb_func` (affects next label) and

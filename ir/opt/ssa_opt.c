@@ -644,6 +644,7 @@ int ssa_opt_run_gens(IRSSAOptCtx *ctx, const IRSSAOptGen *gens, int count)
  * Main Driver
  * ============================================================================ */
 
+void dbg_scan_imm_dest(TCCIRState *ir, const char *pass);
 int tcc_ir_ssa_opt_run(IRSSAOptCtx *ctx)
 {
   int total = 0;
@@ -657,24 +658,39 @@ int tcc_ir_ssa_opt_run(IRSSAOptCtx *ctx)
 
     /* target-independent passes */
     changes += ssa_opt_var_const_fold(ctx);
+    dbg_scan_imm_dest(ctx->ir, "ssa:var_const_fold");
     changes += ssa_opt_sccp(ctx);
+    dbg_scan_imm_dest(ctx->ir, "ssa:sccp");
     changes += ssa_opt_cprop(ctx);
+    dbg_scan_imm_dest(ctx->ir, "ssa:cprop");
     /* Collapse `V <- val [STORE]; ... PARAM V` into `... PARAM val` when V
      * has a single def and that lone PARAM as its only use.  Catches the
      * inlined-check1 pattern that spills printf args into VARs ahead of
      * the conditional branch even when only the FAIL path reads them. */
     changes += ssa_opt_var_to_param_forward(ctx);
+    dbg_scan_imm_dest(ctx->ir, "ssa:var_to_param_forward");
     changes += ssa_opt_fold(ctx);
+    dbg_scan_imm_dest(ctx->ir, "ssa:fold");
     changes += ssa_opt_load_cse(ctx);
+    dbg_scan_imm_dest(ctx->ir, "ssa:load_cse");
     changes += ssa_opt_branch(ctx);
+    dbg_scan_imm_dest(ctx->ir, "ssa:branch");
     changes += ssa_opt_cmp_eq_prop(ctx);
+    dbg_scan_imm_dest(ctx->ir, "ssa:cmp_eq_prop");
     changes += ssa_opt_reassoc(ctx);
+    dbg_scan_imm_dest(ctx->ir, "ssa:reassoc");
     changes += ssa_opt_strength(ctx);
+    dbg_scan_imm_dest(ctx->ir, "ssa:strength");
     changes += ssa_opt_narrow(ctx);
+    dbg_scan_imm_dest(ctx->ir, "ssa:narrow");
     changes += ssa_opt_gvn(ctx);
+    dbg_scan_imm_dest(ctx->ir, "ssa:gvn");
     changes += ssa_opt_phi_simplify(ctx);
+    dbg_scan_imm_dest(ctx->ir, "ssa:phi_simplify");
     changes += ssa_opt_dead_loop(ctx);
+    dbg_scan_imm_dest(ctx->ir, "ssa:dead_loop");
     changes += ssa_opt_dce(ctx);
+    dbg_scan_imm_dest(ctx->ir, "ssa:dce");
 
     /* target-specific generators (registered by backend) */
     if (target_gens && target_gen_count > 0)

@@ -60,11 +60,61 @@ static void pipeline_apply_invalidations(IROptCtx *ctx, uint32_t invalidates)
     tcc_ir_opt_ctx_invalidate(ctx);
 }
 
+void dbg_scan_overlap(TCCIRState *ir, const char *pass);
+void dbg_scan_overlap(TCCIRState *ir, const char *pass)
+{
+  if (!getenv("SCAN_OVERLAP"))
+    return;
+  int n = ir->next_instruction_index;
+  for (int a = 0; a < n; a++) {
+    IRQuadCompact *qa = &ir->compact_instructions[a];
+    if (qa->op == TCCIR_OP_NOP) continue;
+    int na = irop_config[qa->op].has_dest + irop_config[qa->op].has_src1 + irop_config[qa->op].has_src2;
+    if (na == 0) continue;
+    int a0 = qa->operand_base, a1 = qa->operand_base + na - 1;
+    for (int b = a + 1; b < n; b++) {
+      IRQuadCompact *qb = &ir->compact_instructions[b];
+      if (qb->op == TCCIR_OP_NOP) continue;
+      int nb = irop_config[qb->op].has_dest + irop_config[qb->op].has_src1 + irop_config[qb->op].has_src2;
+      if (nb == 0) continue;
+      int b0 = qb->operand_base, b1 = qb->operand_base + nb - 1;
+      if (a0 <= b1 && b0 <= a1) {
+        fprintf(stderr, "OVERLAP after '%s': insn %d slots[%d..%d] (op %d) <> insn %d slots[%d..%d] (op %d)\n",
+                pass ? pass : "?", a, a0, a1, (int)qa->op, b, b0, b1, (int)qb->op);
+        return;
+      }
+    }
+  }
+}
+
+void dbg_scan_imm_dest(TCCIRState *ir, const char *pass);
+void dbg_scan_imm_dest(TCCIRState *ir, const char *pass)
+{
+  if (!getenv("SCAN_IMM_DEST"))
+    return;
+  for (int i = 0; i < ir->next_instruction_index; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_ASSIGN)
+      continue;
+    IROperand d = tcc_ir_op_get_dest(ir, q);
+    if (irop_get_tag(d) == IROP_TAG_IMM32 || irop_get_tag(d) == IROP_TAG_I64 ||
+        irop_get_tag(d) == IROP_TAG_F32 || irop_get_tag(d) == IROP_TAG_F64) {
+      IROperand sc = tcc_ir_op_get_src1(ir, q);
+      fprintf(stderr, "ASSIGN-IMM-DEST after '%s' insn %d: dest{tag=%d vr=0x%x imm=%d} <- src{tag=%d vr=0x%x}\n",
+              pass ? pass : "?", i, irop_get_tag(d), (unsigned)d.vr, (int)d.u.imm32, irop_get_tag(sc), (unsigned)sc.vr);
+      return;
+    }
+  }
+}
+
 int tcc_ir_opt_run_group(IROptCtx *ctx, const IRPassGroup *group)
 {
   int total_changes = 0;
   int iterations = group->max_iterations > 0 ? group->max_iterations : 1;
   int iter;
+
+  dbg_scan_imm_dest(ctx->ir, "<before-group>");
+  dbg_scan_overlap(ctx->ir, "<before-group>");
 
   for (iter = 0; iter < iterations; iter++) {
     int round_changes = 0;
@@ -76,6 +126,8 @@ int tcc_ir_opt_run_group(IROptCtx *ctx, const IRPassGroup *group)
         break;
       pipeline_ensure_requirements(ctx, trigger->requires);
       int tch = trigger->run(ctx);
+      dbg_scan_imm_dest(ctx->ir, trigger->name);
+      dbg_scan_overlap(ctx->ir, trigger->name);
       pipeline_trace_pass(group, trigger, iter, tch);
       if (tch <= 0)
         break;
@@ -95,6 +147,8 @@ int tcc_ir_opt_run_group(IROptCtx *ctx, const IRPassGroup *group)
       pipeline_ensure_requirements(ctx, pass->requires);
 
       int changes = pass->run(ctx);
+      dbg_scan_imm_dest(ctx->ir, pass->name);
+      dbg_scan_overlap(ctx->ir, pass->name);
       if (changes > 0) {
         round_changes += changes;
         pipeline_apply_invalidations(ctx, pass->invalidates);

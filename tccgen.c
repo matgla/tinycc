@@ -28695,6 +28695,8 @@ static void dump_ir_after_pass(TCCState *s, TCCIRState *ir, const char *pass_nam
 
 /* parse a function defined by symbol 'sym' and generate its code in
    'cur_text_section' */
+void dbg_scan_imm_dest(TCCIRState *ir, const char *pass);
+void dbg_scan_overlap(TCCIRState *ir, const char *pass);
 static void gen_function(Sym *sym)
 {
   struct scope f = {0};
@@ -28959,6 +28961,7 @@ static void gen_function(Sym *sym)
 
   /* Block copy init: replace memset(0) + consecutive stores with BLOCK_COPY
    * from a pre-built rodata block.  Run once before the iterative loop. */
+  { void dbg_scan_overlap(TCCIRState*,const char*); dbg_scan_overlap(ir,"pre-block_copy_init"); }
   tcc_ir_opt_block_copy_init(ir);
 #ifdef CONFIG_TCC_DEBUG
   dump_ir_after_pass(tcc_state, ir, "block_copy_init");
@@ -29030,6 +29033,7 @@ static void gen_function(Sym *sym)
     tcc_ir_opt_run_group(&prop_ctx, &groups[0]);
     tcc_ir_opt_ctx_free(&prop_ctx);
   }
+  dbg_scan_overlap(ir,"P1-after-prop-group");
 
   tcc_state->ir_post_float_narrow = 1;
 
@@ -29387,6 +29391,7 @@ static void gen_function(Sym *sym)
   }
 
   tcc_ir_opt_ctx_free(&pipeline_ctx);
+  dbg_scan_overlap(ir,"P2-after-pipeline_ctx");
 
   /* Dead-init-via-call: kill stack-slot stores whose bytes are fully
    * overwritten by a subsequent CALL, using the callee's write summary. */
@@ -29635,6 +29640,7 @@ static void gen_function(Sym *sym)
    * the expanded constant arithmetic (e.g. 0+5+5+5+5+5 → 25). */
   if (tcc_state->opt_loop_unroll)
   {
+  dbg_scan_overlap(ir,"Q1-before-loop_unroll");
     int unrolled = tcc_ir_opt_loop_unroll(ir);
     if (unrolled > 0)
     {
@@ -29678,6 +29684,7 @@ static void gen_function(Sym *sym)
   /* Phase 5: Loop-Invariant Code Motion */
   IRLoops *licm_loops = NULL;
   if (tcc_state->opt_licm)
+  dbg_scan_overlap(ir,"Q2-before-licm");
     licm_loops = tcc_ir_opt_licm_ex(ir);
 
   /* Phase 6: Induction Variable Strength Reduction - transform array indexing
@@ -29817,6 +29824,7 @@ static void gen_function(Sym *sym)
 
   /* Phase 7: Strength Reduction - transform MUL by constant to shift/add */
   if (tcc_state->opt_strength_red)
+  dbg_scan_overlap(ir,"Q3-before-strength_reduction");
     tcc_ir_opt_strength_reduction(ir);
 
   /* Late copy propagation + dead store elimination.
@@ -29950,7 +29958,9 @@ static void gen_function(Sym *sym)
 
   /* Decrement-to-Zero - transform count-up loops to count-down-to-zero.
    * Must run late, after IV-SR has eliminated body uses of loop counters. */
+  dbg_scan_overlap(ir,"Q4-before-decrement_to_zero");
   tcc_ir_opt_decrement_to_zero(ir);
+  dbg_scan_overlap(ir,"Q4b-after-decrement_to_zero");
 
   /* Redundant Init Elimination - remove function-entry VAR inits that are
    * always killed before use. Must run after decrement-to-zero (which NOPs
@@ -30033,6 +30043,7 @@ static void gen_function(Sym *sym)
    * defining ASSIGN/LOAD/SHR ops on a common X.  When the fold fires, the
    * resulting `CMP X, X` is caught by identity-comparison folding in a
    * second const_prop pass. */
+  dbg_scan_overlap(ir,"R1-before-pack64_taut");
   if (tcc_ir_opt_pack64_tautology(ir) > 0)
   {
     if (tcc_state->opt_copy_prop)
@@ -30086,6 +30097,7 @@ static void gen_function(Sym *sym)
    * guard cannot perturb a downstream loop transform — only RA follows. */
   if (tcc_state->opt_const_prop && !getenv("TCC_NO_GUARD_ELIM"))
   {
+  dbg_scan_overlap(ir,"R3-before-loop_guard_elim");
     if (tcc_ir_opt_loop_guard_elim(ir) > 0)
     {
       if (tcc_state->opt_dce)
@@ -30099,18 +30111,23 @@ static void gen_function(Sym *sym)
   /* CMP narrowing — `CMP T_u64, u64_const_with_hi_0` → 32-bit CMP when
    * T's hi is provably zero (from SHR≥32 or ZEXT).  Eliminates the hi
    * half setup and compare. */
+  dbg_scan_overlap(ir,"P3-before-cmp_narrow_64");
+  dbg_scan_overlap(ir,"R4-just-before-cmp_narrow");
   tcc_ir_opt_cmp_narrow_64(ir);
 
   /* ASSIGN fusion — fold `T_new = X OP Y; T_final = T_new ASSIGN` into a
    * single op writing directly to T_final.  Runs very late so it sees the
    * stable IR after var_to_tmp / copy_prop / dce, which is when the chain
    * pattern is most prevalent (e.g. or_bool_diamond's true arm). */
+  dbg_scan_overlap(ir,"P4-before-assign_fuse");
   tcc_ir_opt_assign_fuse(ir);
+  dbg_scan_overlap(ir,"P4b-after-assign_fuse");
 
   /* Phase 8: Conditional Select - replace if/else diamonds with SELECT.
    * Must run late, after all other optimizations have simplified the IR,
    * so we see the cleanest diamond patterns. */
   tcc_ir_opt_select(ir);
+  dbg_scan_overlap(ir,"P5-after-select");
 
   /* Fold the `(a CMP b) ? -1 : 0` mask idiom (SETIF + #0 SUB) into a single
    * SELECT(#-1, #0, cond).  Shares opt_select's late placement so the new
@@ -30411,19 +30428,23 @@ static void gen_function(Sym *sym)
   /* Register allocation (SSA-based linear scan) */
   {
     const RegAllocTarget *ra_target = arm_get_regalloc_target();
+    dbg_scan_imm_dest(ir,"before-ssa-regalloc"); dbg_scan_overlap(ir,"before-ssa-regalloc");
     tcc_ir_ssa_regalloc(ir, ra_target, loc);
+    dbg_scan_imm_dest(ir,"after-ssa-regalloc");
   }
 
   /* Back-edge phi hoisting: convert JUMPIF exit + ASSIGN copies + JUMP body
    * into ASSIGN copies + inverted JUMPIF body, eliminating one branch per loop */
   if (tcc_state->optimize > 0)
     tcc_ir_opt_backedge_phi_hoist(ir);
+  dbg_scan_imm_dest(ir,"after-backedge-phi-hoist");
 
   /* Forward-diamond JUMPIF inversion: when phi copies on the else path
    * coalesce into no-ops after regalloc, invert the JUMPIF to target the
    * merge directly and drop the bridging unconditional JUMP. */
   if (tcc_state->optimize > 0)
     tcc_ir_opt_post_ra_forward_diamond(ir);
+  dbg_scan_imm_dest(ir,"after-post-ra-fwd-diamond");
 
   /* Abort tail-merge + body-invert: per distinct noreturn callee, keep the
    * first guarded call inline as a shared sink and invert+retarget every later
@@ -31080,7 +31101,9 @@ static void gen_function(Sym *sym)
   /* Late pass: merge duplicate RETURNVALUE #imm into JUMP-to-first.
    * Runs immediately before codegen so no other pass relies on the IR
    * having multiple distinct return sites. */
+  dbg_scan_imm_dest(ir,"before-returnvalue-merge");
   tcc_ir_opt_returnvalue_merge(ir);
+  dbg_scan_imm_dest(ir,"after-returnvalue-merge");
 
   /* Inter-procedural noreturn propagation: if the function makes a call to
    * another function whose body hasn't been compiled yet (forward decl

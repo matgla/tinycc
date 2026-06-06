@@ -757,6 +757,19 @@ ST_FUNC void asm_clobber(uint8_t *clobber_regs, const char *str)
   clobber_regs[reg] = 1;
 }
 
+/* Handle the `.fpu <name>` assembler directive.  Like GNU as, this enables
+   the FP-unit instruction encodings (vpush/vldr/…) for the remainder of the
+   translation unit, independent of the -mfpu used to build the object.  This
+   lets FPU-agnostic assembly (e.g. a context-switch routine that saves the FP
+   register file only when CONTROL.FPCA is set) still assemble the FP opcodes.
+   The features are OR'd into the live target set so the core profile from
+   -march/-mcpu is preserved.  Errors on an unknown FPU name. */
+ST_FUNC void tcc_asm_set_fpu(const char *name)
+{
+  thop_feat fpu = thumb_resolve_fpu(name);
+  arm_target_dependent.feat = thop_feat_or(arm_target_dependent.feat, fpu);
+}
+
 static int asm_parse_vfp_regvar(int t, int double_precision)
 {
   if (double_precision)

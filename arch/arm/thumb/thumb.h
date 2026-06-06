@@ -243,6 +243,10 @@ static inline uint32_t thop_feat32_bits(thop_feat32 f)
 
 thop_feat thumb_resolve_features(const char *march, const char *mfpu, uint64_t extra_feat_bits);
 
+/* Resolve only the FP-unit feature bits for a -mfpu / .fpu name (no core
+   features). Used by the `.fpu` assembler directive. */
+thop_feat thumb_resolve_fpu(const char *mfpu);
+
 /* ───── Backend-owned target-dependent config ─────
  *
  * Forward-declared as `struct target_dependent_config` in tcc.h; generic

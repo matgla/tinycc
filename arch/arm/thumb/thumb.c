@@ -208,6 +208,16 @@ thop_feat thumb_resolve_features(const char *march, const char *mfpu, uint64_t e
   return feat;
 }
 
+/* Resolve only the FP-unit feature bits for a given -mfpu / .fpu name.
+   Unlike thumb_resolve_features(), this does not fold in any core/profile
+   features, so callers can OR the result into an already-resolved target
+   feature set.  Used by the assembler's `.fpu` directive.  Errors on an
+   unknown name. */
+thop_feat thumb_resolve_fpu(const char *mfpu)
+{
+  return thop_feats_from_mfpu(mfpu);
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  *  thop_emit — generic Thumb instruction encoding engine
  *

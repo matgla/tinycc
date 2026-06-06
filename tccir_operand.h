@@ -328,8 +328,14 @@ static inline int32_t irop_get_vreg(const IROperand op)
     int neg_idx = op.position & 0xF;
     return -(neg_idx + 1);
   }
-  /* Position == max sentinel with vreg_type 0 means no vreg (-1) */
-  if (op.position == IROP_POSITION_NONE && op.vreg_type == 0)
+  /* A real positive vreg always carries a nonzero type (VAR/TEMP/PARAM = 1/2/3,
+   * encoded in bits 28-31); the smallest valid encoded vreg is 1<<28.  A
+   * vreg_type of 0 therefore means the operand has no associated vreg — its
+   * position bits hold unused/zero data.  This covers both the position==NONE
+   * sentinel and operands built with a 0 vreg (e.g. a symref whose SValue.vr
+   * was left 0 instead of -1), which would otherwise decode to a bogus
+   * "vreg 0" and crash later lookups. */
+  if (op.vreg_type == 0)
     return -1;
   /* Reconstruct vreg: type in bits 28-31, position in bits 0-16 */
   return (op.vreg_type << 28) | op.position;

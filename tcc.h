@@ -2290,9 +2290,10 @@ ST_FUNC void unary(void);
 ST_FUNC void gexpr(void);
 ST_FUNC int64_t expr_const64(void);
 ST_FUNC int expr_const(void);
-#if defined CONFIG_TCC_BCHECK || defined TCC_TARGET_C67
+/* get_sym_ref is used unconditionally by the IR optimization passes
+   (ir/opt.c, ir/opt_switch_data.c) and for string/rodata literals in
+   tccgen.c, so its prototype must always be visible. */
 ST_FUNC Sym *get_sym_ref(CType *type, Section *sec, unsigned long offset, unsigned long size);
-#endif
 #if defined TCC_TARGET_X86_64 && !defined TCC_TARGET_PE
 ST_FUNC int classify_x86_64_va_arg(CType *ty);
 #endif
@@ -2553,6 +2554,11 @@ ST_FUNC void subst_asm_operand(CString *add_str, SValue *sv, int modifier);
 ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands, int nb_outputs, int is_output, uint8_t *clobber_regs,
                           int out_reg);
 ST_FUNC void asm_clobber(uint8_t *clobber_regs, const char *str);
+#ifdef TCC_TARGET_ARM
+/* `.fpu <name>` directive: enable FP-unit instruction encodings for the rest
+   of the translation unit (GNU as compatible). Defined in arm-thumb-asm.c. */
+ST_FUNC void tcc_asm_set_fpu(const char *name);
+#endif
 
 /* Emit a fully prepared GCC-style inline asm block.
  * Used by IR codegen to lower TCCIR_OP_INLINE_ASM without relying on front-end load/store helpers. */
