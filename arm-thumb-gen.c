@@ -1434,10 +1434,10 @@ static ScratchRegAlloc get_scratch_reg_with_save(uint32_t exclude_regs)
       uint32_t reserved = (1u << R_FP);
       if (tcc_state->text_and_data_separation)
         reserved |= (1u << 9);
-      uint32_t live = 0;
+      uint32_t live = tcc_ls_compute_live_regs(&ir->ls, ir->codegen_instruction_idx);
       if (ir->ls.live_regs_by_instruction && ir->codegen_instruction_idx >= 0 &&
           ir->codegen_instruction_idx < ir->ls.live_regs_by_instruction_size)
-        live = ir->ls.live_regs_by_instruction[ir->codegen_instruction_idx];
+        live |= ir->ls.live_regs_by_instruction[ir->codegen_instruction_idx];
       uint32_t candidate = pushed_registers & 0x0FF0u & ~exclude_regs & ~live & ~reserved;
       if (candidate)
       {
@@ -2904,6 +2904,15 @@ int ot(thumb_opcode op)
   if (op.size == 0)
     return op.size;
 
+  /* DEBUG: emit-stream trace for the 90_struct miscompile. Same compiler +
+   * identical stable allocation ⇒ device and QEMU emit identical opcode streams
+   * up to the silicon-divergent branch; diffing this trace pinpoints the first
+   * differing emitted instruction (and its IR index). Real-run only. */
+  if (!dry_run_state.active && funcname &&
+      !strcmp((const char *)funcname, "test_init_struct_from_struct") && tcc_state && tcc_state->ir)
+    fprintf(stderr, "EMIT i=%d ind=0x%x op=0x%x sz=%d\n", tcc_state->ir->codegen_instruction_idx, (unsigned)ind,
+            (unsigned)op.opcode, op.size);
+
   /* Detect instructions that write to R9 when it's reserved for GOT pointer.
    * Exclude push/pop/stmdb/ldmia which legitimately save/restore R9. */
   if (text_and_data_separation && !allow_r9_write)
@@ -3633,6 +3642,8 @@ static int sym_is_4_byte_aligned_for_64bit(Sym *sym, int32_t addend)
  * Returns 1 on success, 0 if the caller must fall back to two 32-bit stores. */
 static int try_strd_pair(int lo_reg, int hi_reg, int base, int abs_off, int sign)
 {
+  if ((unsigned)base > 15)
+    return 0;
   if ((abs_off & 3) != 0 || abs_off > 1020)
     return 0;
   if (lo_reg < 0 || lo_reg > R_LR || lo_reg == R_SP)
@@ -3757,6 +3768,8 @@ ST_FUNC int tcc_gen_machine_try_strd_imm_base(int64_t val1, int64_t val2,
 {
   int sign = (off < 0);
   int abs_off = sign ? -off : off;
+  if ((unsigned)base_reg > 15)
+    return 0;
   if ((abs_off & 3) != 0 || abs_off > 1020)
     return 0;
 
@@ -6518,7 +6531,10 @@ ST_FUNC void tcc_gen_machine_mla_mop(MachineOperand src1, MachineOperand src2, M
   MachineCodegenContext ctx = {0};
 
   /* Pre-exclude registers directly referenced by REG operands so that scratch
-   * allocations for other operands (e.g. immediates) cannot clobber them. */
+   * allocations for other operands (e.g. immediates) cannot clobber them.
+   * The pre-allocated DEST register must be excluded too: if a source load
+   * grabs it as a saved scratch (push/pop), the restoring pop after the MLA
+   * overwrites the just-computed result. */
   uint32_t live_regs = 0;
   if (src1.kind == MACH_OP_REG && !src1.needs_deref)
     live_regs |= (1u << (uint32_t)src1.u.reg.r0);
@@ -6526,6 +6542,9 @@ ST_FUNC void tcc_gen_machine_mla_mop(MachineOperand src1, MachineOperand src2, M
     live_regs |= (1u << (uint32_t)src2.u.reg.r0);
   if (accum.kind == MACH_OP_REG && !accum.needs_deref)
     live_regs |= (1u << (uint32_t)accum.u.reg.r0);
+  if (dest.kind == MACH_OP_REG && !dest.needs_deref &&
+      dest.u.reg.r0 != (int)PREG_REG_NONE)
+    live_regs |= (1u << (uint32_t)dest.u.reg.r0);
 
   int src1_reg = mach_ensure_in_reg(&ctx, &src1, live_regs);
   uint32_t excl = live_regs;
@@ -6569,8 +6588,19 @@ ST_FUNC void tcc_gen_machine_umull_mop(MachineOperand src1, MachineOperand src2,
   MachineOperand s2 = src2;
   s2.is_64bit = false;
 
-  int rn = mach_ensure_in_reg(&ctx, &s1, 0);
-  uint32_t excl = thumb_is_hw_reg(rn) ? (1u << (uint32_t)rn) : 0u;
+  /* Pre-exclude the pre-allocated dest pair: a saved-scratch (push/pop) on a
+   * dest register would have its restoring pop clobber the result. */
+  uint32_t dest_excl = 0;
+  if (dest.kind == MACH_OP_REG && !dest.needs_deref)
+  {
+    if (dest.u.reg.r0 != (int)PREG_REG_NONE)
+      dest_excl |= (1u << (uint32_t)dest.u.reg.r0);
+    if (dest.is_64bit && dest.u.reg.r1 >= 0 && dest.u.reg.r1 != (int)PREG_REG_NONE)
+      dest_excl |= (1u << (uint32_t)dest.u.reg.r1);
+  }
+
+  int rn = mach_ensure_in_reg(&ctx, &s1, dest_excl);
+  uint32_t excl = dest_excl | (thumb_is_hw_reg(rn) ? (1u << (uint32_t)rn) : 0u);
 
   int rm = mach_ensure_in_reg(&ctx, &s2, excl);
   if (thumb_is_hw_reg(rm))
@@ -6607,8 +6637,18 @@ ST_FUNC void tcc_gen_machine_smull_mop(MachineOperand src1, MachineOperand src2,
   MachineOperand s2 = src2;
   s2.is_64bit = false;
 
-  int rn = mach_ensure_in_reg(&ctx, &s1, 0);
-  uint32_t excl = thumb_is_hw_reg(rn) ? (1u << (uint32_t)rn) : 0u;
+  /* Pre-exclude the pre-allocated dest pair (see umull_mop). */
+  uint32_t dest_excl = 0;
+  if (dest.kind == MACH_OP_REG && !dest.needs_deref)
+  {
+    if (dest.u.reg.r0 != (int)PREG_REG_NONE)
+      dest_excl |= (1u << (uint32_t)dest.u.reg.r0);
+    if (dest.is_64bit && dest.u.reg.r1 >= 0 && dest.u.reg.r1 != (int)PREG_REG_NONE)
+      dest_excl |= (1u << (uint32_t)dest.u.reg.r1);
+  }
+
+  int rn = mach_ensure_in_reg(&ctx, &s1, dest_excl);
+  uint32_t excl = dest_excl | (thumb_is_hw_reg(rn) ? (1u << (uint32_t)rn) : 0u);
 
   int rm = mach_ensure_in_reg(&ctx, &s2, excl);
   if (thumb_is_hw_reg(rm))
@@ -11667,8 +11707,17 @@ ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand ca
     arg_regs_save_mask |= (1 << ARM_R9);
 
   /* Save nested-call registers to pre-reserved frame area via STR.
-   * The nested save area is at [SP + ir->call_outgoing_size]. */
+   * The nested save area is at [SP + ir->call_outgoing_size].
+   *
+   * In functions with VLA/alloca the runtime SP has moved below the static
+   * frame, so [SP + off] would land inside the dynamically allocated memory
+   * (the callee then overwrites the saved R9/GOT base with user data).
+   * Address the slots FP-relative instead: the static SP equals
+   * FP - callee_push_size - epilogue_stack_dealloc. */
   int nested_save_sp_offset = ir ? ir->call_outgoing_size : 0;
+  int nested_save_fp_bias = tcc_state->func_dynamic_sp
+                                ? -(callee_push_size + epilogue_stack_dealloc)
+                                : 0;
   int nested_save_count = 0;
   if (arg_regs_save_mask)
   {
@@ -11676,7 +11725,12 @@ ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand ca
     {
       if (arg_regs_save_mask & (1 << r))
       {
-        store_word_to_stack(r, nested_save_sp_offset + nested_save_count * 4);
+        if (tcc_state->func_dynamic_sp)
+          tcc_gen_machine_store_to_stack_ex(
+              r, nested_save_sp_offset + nested_save_count * 4 + nested_save_fp_bias,
+              arg_regs_save_mask);
+        else
+          store_word_to_stack(r, nested_save_sp_offset + nested_save_count * 4);
         nested_save_count++;
       }
     }
@@ -11824,22 +11878,27 @@ ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand ca
   /* === Cleanup: restore nested-call saved registers via LDR === */
   if (arg_regs_save_mask)
   {
+    /* Match the FP-relative addressing used by the save side in functions
+     * with VLA/alloca (runtime SP has moved; see the save block above). */
+    const int restore_base = tcc_state->func_dynamic_sp ? R_FP : ARM_SP;
     int restore_idx = 0;
     for (int r = 0; r < 16; r++)
     {
       if (arg_regs_save_mask & (1 << r))
       {
-        int off = nested_save_sp_offset + restore_idx * 4;
+        int off = nested_save_sp_offset + restore_idx * 4 + nested_save_fp_bias;
+        int sign = (off < 0);
+        int abs_off = sign ? -off : off;
         /* R9 restore in text_and_data_separation mode needs the write guard
          * temporarily lifted — the safety check blocks all R9 writes, but
          * we are legitimately restoring it after a call. */
         if (r == ARM_R9 && text_and_data_separation)
           allow_r9_write = 1;
-        if (!load_word_from_base(r, ARM_SP, off, 0))
+        if (!load_word_from_base(r, restore_base, abs_off, sign))
         {
           ScratchRegAlloc osc = get_scratch_reg_with_save((1u << r));
           load_immediate(osc.reg, off, NULL, false);
-          ot_check(th_ldr_reg(r, ARM_SP, osc.reg, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+          ot_check(th_ldr_reg(r, restore_base, osc.reg, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
           restore_scratch_reg(&osc);
         }
         if (r == ARM_R9 && text_and_data_separation)
@@ -12534,14 +12593,24 @@ ST_FUNC void tcc_gen_machine_prefetch_mop(MachineOperand addr, int rw)
 
 /* __builtin_setjmp implementation for ARM Thumb-2.
  *
- * Jump buffer layout (3 words, fits in the standard 5-word buffer):
+ * GCC's documented ABI gives __builtin_setjmp a 5-word buffer; callers
+ * (e.g. gcc.c-torture pr84521) really do pass `void *buf[5]`, so nothing
+ * larger may be written through the buffer pointer.  The callee-saved
+ * register file (r4-r11) still must be restored on longjmp — the register
+ * allocator keeps VARs and the R9 GOT base in r4-r11 across the setjmp —
+ * so those 8 words live in a hidden, compiler-allocated save area in the
+ * setjmp-containing function's frame (src2/area), which stays valid for
+ * as long as a longjmp to this buffer is legal.
+ *
+ * Jump buffer layout (4 words used, fits the standard 5-word buffer):
  *   buf[0]  = frame pointer (R7/FP)
  *   buf[1]  = resume address (Thumb-bit set)
  *   buf[2]  = stack pointer (SP)
+ *   buf[3]  = address of the hidden r4-r11 save area (32 bytes)
  *
  * Returns 0 on initial call, 1 when returning via longjmp.
  */
-ST_FUNC void tcc_gen_machine_setjmp_mop(MachineOperand buf, MachineOperand dest)
+ST_FUNC void tcc_gen_machine_setjmp_mop(MachineOperand buf, MachineOperand area, MachineOperand dest)
 {
   MachineCodegenContext ctx = {0};
   int buf_reg;
@@ -12553,8 +12622,33 @@ ST_FUNC void tcc_gen_machine_setjmp_mop(MachineOperand buf, MachineOperand dest)
   }
   else
   {
-    buf_reg = mach_ensure_in_reg(&ctx, &buf, 0);
+    /* Exclude r4-r11 as scratch candidates: a saved-scratch there would
+     * hold the buffer pointer when the area stores below run, corrupting
+     * the saved register file (same class as the MLA scratch-pop bug). */
+    buf_reg = mach_ensure_in_reg(&ctx, &buf, 0x0FF0);
   }
+
+  /* ---- save callee-saved r4-r11 into the hidden frame area ----
+   * The area address is computed in IP (caller-saved) so the r4-r11
+   * values stored are the untouched setjmp-time ones; a scratch from
+   * mach_alloc_scratch could pick a callee-saved register. */
+  if (area.kind == MACH_OP_FRAME_ADDR)
+  {
+    tcc_machine_addr_of_stack_slot(R_IP, area.u.frame.offset, 0 /* not param */);
+  }
+  else
+  {
+    tcc_error("compiler_error: setjmp save area must be a frame slot (kind %d)", (int)area.kind);
+  }
+  ot_check_str_imm(4, R_IP, 0, 6, ENFORCE_ENCODING_NONE);     /* r4  -> area[0] */
+  ot_check_str_imm(5, R_IP, 4, 6, ENFORCE_ENCODING_NONE);     /* r5  -> area[1] */
+  ot_check_str_imm(6, R_IP, 8, 6, ENFORCE_ENCODING_NONE);     /* r6  -> area[2] */
+  ot_check_str_imm(R_FP, R_IP, 12, 6, ENFORCE_ENCODING_NONE); /* r7  -> area[3] */
+  ot_check_str_imm(8, R_IP, 16, 6, ENFORCE_ENCODING_NONE);    /* r8  -> area[4] */
+  ot_check_str_imm(9, R_IP, 20, 6, ENFORCE_ENCODING_NONE);    /* r9  -> area[5] */
+  ot_check_str_imm(10, R_IP, 24, 6, ENFORCE_ENCODING_NONE);   /* r10 -> area[6] */
+  ot_check_str_imm(11, R_IP, 28, 6, ENFORCE_ENCODING_NONE);   /* r11 -> area[7] */
+  ot_check_str_imm(R_IP, buf_reg, 12, 6, ENFORCE_ENCODING_NONE); /* &area -> buf[3] */
 
   /* ---- save frame pointer ---- */
   ot_check_str_imm(R_FP, buf_reg, 0, 6, ENFORCE_ENCODING_NONE); /* r7  -> buf[0]  */
@@ -12651,11 +12745,13 @@ ST_FUNC void tcc_gen_machine_nl_setjmp_mop(MachineOperand buf, MachineOperand de
 
 /* __builtin_longjmp implementation for ARM Thumb-2.
  *
- * Restores FP and SP saved by __builtin_setjmp, then jumps to the resume
- * address. Uses the minimal 3-word buffer layout.
+ * Restores the callee-saved register file (r4-r11, from the hidden save
+ * area whose address setjmp left in buf[3]) and SP, then jumps to the
+ * resume address.  This function does not return, so every caller-saved
+ * register is fair game as a temporary.
  *
- * Buffer layout (must match __builtin_setjmp):
- *   buf[0] = FP, buf[1] = resume_addr, buf[2] = SP
+ * Buffer layout (must match tcc_gen_machine_setjmp_mop):
+ *   buf[0] = FP, buf[1] = resume_addr, buf[2] = SP, buf[3] = &save_area
  */
 ST_FUNC void tcc_gen_machine_longjmp_mop(MachineOperand buf)
 {
@@ -12670,15 +12766,27 @@ ST_FUNC void tcc_gen_machine_longjmp_mop(MachineOperand buf)
 
   buf_reg = mach_ensure_in_reg(&ctx, &buf, 0);
 
-  /* Copy buf pointer to IP so it survives FP restore */
+  /* Copy buf pointer to IP so it survives the register restores */
   ot_check_mov_reg(R_IP, buf_reg, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
 
-  /* Read resume address and saved SP into caller-saved regs first */
-  ot_check_ldr_imm(0, R_IP, 4, 6, ENFORCE_ENCODING_NONE); /* r0 = resume addr */
-  ot_check_ldr_imm(1, R_IP, 8, 6, ENFORCE_ENCODING_NONE); /* r1 = saved SP    */
+  /* Read resume address, saved SP and save-area pointer into caller-saved
+   * regs before clobbering anything callee-saved. */
+  ot_check_ldr_imm(0, R_IP, 4, 6, ENFORCE_ENCODING_NONE);  /* r0 = resume addr */
+  ot_check_ldr_imm(1, R_IP, 8, 6, ENFORCE_ENCODING_NONE);  /* r1 = saved SP    */
+  ot_check_ldr_imm(2, R_IP, 12, 6, ENFORCE_ENCODING_NONE); /* r2 = &save_area  */
 
-  /* Restore frame pointer */
-  ot_check_ldr_imm(R_FP, R_IP, 0, 6, ENFORCE_ENCODING_NONE); /* r7 = FP */
+  /* Restore callee-saved r4-r11 (r7/FP comes from the area too; the copy
+   * in buf[0] is identical). */
+  ot_check_ldr_imm(4, 2, 0, 6, ENFORCE_ENCODING_NONE);     /* r4  */
+  ot_check_ldr_imm(5, 2, 4, 6, ENFORCE_ENCODING_NONE);     /* r5  */
+  ot_check_ldr_imm(6, 2, 8, 6, ENFORCE_ENCODING_NONE);     /* r6  */
+  ot_check_ldr_imm(R_FP, 2, 12, 6, ENFORCE_ENCODING_NONE); /* r7  */
+  ot_check_ldr_imm(8, 2, 16, 6, ENFORCE_ENCODING_NONE);    /* r8  */
+  allow_r9_write = 1; /* restoring the setjmp-time GOT base is the point */
+  ot_check_ldr_imm(9, 2, 20, 6, ENFORCE_ENCODING_NONE);    /* r9  */
+  allow_r9_write = 0;
+  ot_check_ldr_imm(10, 2, 24, 6, ENFORCE_ENCODING_NONE);   /* r10 */
+  ot_check_ldr_imm(11, 2, 28, 6, ENFORCE_ENCODING_NONE);   /* r11 */
 
   /* Restore SP */
   ot_check_mov_reg(R_SP, 1, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);

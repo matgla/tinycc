@@ -241,7 +241,7 @@ void tcc_ls_recompute_dirty_registers(LSLiveIntervalState *ls)
   ls->dirty_registers = non_callee | (callee_dirty & callee_used);
 }
 
-static uint32_t tcc_ls_compute_live_regs(LSLiveIntervalState *ls, int instruction_idx)
+uint32_t tcc_ls_compute_live_regs(LSLiveIntervalState *ls, int instruction_idx)
 {
   uint32_t live_regs = 0;
   for (int i = 0; i < ls->next_interval_index; ++i)
@@ -303,6 +303,18 @@ int tcc_ls_find_free_scratch_reg(LSLiveIntervalState *ls, int instruction_idx, u
       LS_DBG("    Computed live registers: 0x%x", live_regs);
     }
   }
+
+  /* DEBUG: 90_struct scratch-divergence. At idx 70/75/80 (printf-arg LEAs) the
+   * device returns PREG_NONE (R0-R3 all live) but QEMU returns R0 — diff the
+   * raw liveness to see if live_regs_by_instruction[idx] differs. */
+  if (funcname && !strcmp((const char *)funcname, "test_init_struct_from_struct") &&
+      (instruction_idx == 70 || instruction_idx == 72 || instruction_idx == 75 || instruction_idx == 80))
+    fprintf(stderr, "FSR idx=%d excl=0x%x live=0x%x arr=%p sz=%d raw[idx]=0x%x avail_low=0x%x\n", instruction_idx,
+            exclude_regs, live_regs, (void *)ls->live_regs_by_instruction, ls->live_regs_by_instruction_size,
+            (ls->live_regs_by_instruction && instruction_idx < ls->live_regs_by_instruction_size)
+                ? ls->live_regs_by_instruction[instruction_idx]
+                : 0xDEADu,
+            (~live_regs) & 0xFu);
 
   {
     const uint32_t avail_low = (~live_regs) & 0xFu;

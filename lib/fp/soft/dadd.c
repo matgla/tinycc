@@ -81,28 +81,41 @@ double __aeabi_dadd(double a, double b)
   if (b_exp != 0)
     b_mant |= DOUBLE_IMPLICIT_BIT;
 
-  /* Align exponents - shift smaller mantissa right */
+  /* Align exponents - shift smaller mantissa right.
+   * Work with 3 extra low bits (guard/round/sticky) so bits shifted out
+   * during alignment still participate in rounding.  Without them the
+   * small operand vanished entirely: 1 + -2^53 returned -2^53 instead of
+   * the exactly representable -(2^53-1) (gcc-torture ieee/pr28634). */
   int exp_diff = a_exp - b_exp;
   int result_exp;
   uint64_t result_mant;
   int result_sign;
 
+  a_mant <<= 3;
+  b_mant <<= 3;
+
   if (exp_diff > 0)
   {
     /* a has larger exponent */
     if (exp_diff < 64)
-      b_mant >>= exp_diff;
+    {
+      uint64_t lost = b_mant & ((1ULL << exp_diff) - 1);
+      b_mant = (b_mant >> exp_diff) | (lost != 0);
+    }
     else
-      b_mant = 0;
+      b_mant = (b_mant != 0);
     result_exp = a_exp;
   }
   else if (exp_diff < 0)
   {
     /* b has larger exponent */
     if (-exp_diff < 64)
-      a_mant >>= -exp_diff;
+    {
+      uint64_t lost = a_mant & ((1ULL << -exp_diff) - 1);
+      a_mant = (a_mant >> -exp_diff) | (lost != 0);
+    }
     else
-      a_mant = 0;
+      a_mant = (a_mant != 0);
     result_exp = b_exp;
   }
   else
@@ -117,10 +130,10 @@ double __aeabi_dadd(double a, double b)
     result_mant = a_mant + b_mant;
     result_sign = a_sign;
 
-    /* Check for overflow (carry) */
-    if (result_mant & (DOUBLE_IMPLICIT_BIT << 1))
+    /* Check for overflow (carry); keep the shifted-out bit as sticky */
+    if (result_mant & ((DOUBLE_IMPLICIT_BIT << 1) << 3))
     {
-      result_mant >>= 1;
+      result_mant = (result_mant >> 1) | (result_mant & 1);
       result_exp++;
     }
   }
@@ -144,10 +157,25 @@ double __aeabi_dadd(double a, double b)
       ur.u = 0;
       return ur.d;
     }
-    while (!(result_mant & DOUBLE_IMPLICIT_BIT) && result_exp > 0)
+    while (!(result_mant & (DOUBLE_IMPLICIT_BIT << 3)) && result_exp > 0)
     {
       result_mant <<= 1;
       result_exp--;
+    }
+  }
+
+  /* Round to nearest, ties to even, using the guard/round/sticky bits */
+  {
+    uint64_t grs = result_mant & 7;
+    result_mant >>= 3;
+    if (grs > 4 || (grs == 4 && (result_mant & 1)))
+    {
+      result_mant++;
+      if (result_mant & (DOUBLE_IMPLICIT_BIT << 1))
+      {
+        result_mant >>= 1;
+        result_exp++;
+      }
     }
   }
 

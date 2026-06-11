@@ -1551,6 +1551,9 @@ struct TCCState
   uint8_t omit_frame_pointer;
   uint8_t need_frame_pointer;
   uint8_t force_frame_pointer;  /* required for VLA/dynamic SP even if omit_frame_pointer */
+  uint8_t func_dynamic_sp;      /* function contains VLA_ALLOC: SP moves at runtime, so
+                                   SP-relative frame slots (nested-call save area) must be
+                                   addressed FP-relative instead */
   uint8_t force_lr_save;        /* __builtin_return_address needs LR saved even in leaf */
   uint8_t func_save_apply_args; /* __builtin_apply_args: save r0-r3 in prologue */
   int apply_args_offset;        /* stack offset of saved r0-r3 block for apply_args */
@@ -2816,7 +2819,7 @@ ST_FUNC void tcc_gen_machine_trap_mop(void);
 ST_FUNC void tcc_gen_machine_prefetch_mop(MachineOperand addr, int rw);
 
 /* Setjmp/longjmp instruction generation */
-ST_FUNC void tcc_gen_machine_setjmp_mop(MachineOperand buf, MachineOperand dest);
+ST_FUNC void tcc_gen_machine_setjmp_mop(MachineOperand buf, MachineOperand area, MachineOperand dest);
 ST_FUNC void tcc_gen_machine_longjmp_mop(MachineOperand buf);
 ST_FUNC void tcc_gen_machine_nl_setjmp_mop(MachineOperand buf, MachineOperand dest);
 ST_FUNC void tcc_gen_machine_nl_longjmp_mop(MachineOperand buf);

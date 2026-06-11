@@ -2062,8 +2062,9 @@ const IRRegistersConfig irop_config[] = {
     [TCCIR_OP_PREFETCH] = {0, 1, 1},
     /* Trap instruction: no operands, no dest */
     [TCCIR_OP_TRAP] = {0, 0, 0},
-    /* Setjmp: dest=return value (0 or 1), src1=buffer pointer vreg */
-    [TCCIR_OP_SETJMP] = {1, 1, 0},
+    /* Setjmp: dest=return value (0 or 1), src1=buffer pointer vreg,
+     * src2=address of the hidden r4-r11 save area (frame slot) */
+    [TCCIR_OP_SETJMP] = {1, 1, 1},
     /* Longjmp: src1=buffer pointer vreg, no dest (does not return) */
     [TCCIR_OP_LONGJMP] = {0, 1, 0},
     /* Non-local goto setjmp/longjmp: full callee-saved save/restore (40-byte buffer) */

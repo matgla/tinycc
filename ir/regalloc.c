@@ -1685,6 +1685,16 @@ static int sort_by_start(const void *a, const void *b)
   if (!ia->is_param && ib->is_param) return 1;
   if (ia->start < ib->start) return -1;
   if (ia->start > ib->start) return 1;
+  /* Equal starts: precolored intervals first, so their fixed registers are
+   * claimed before the scan hands the same register to a non-precolored
+   * interval (the precolored assignment does not check int_free).  Then by
+   * vreg — qsort is not stable, and leaving ties unspecified makes the
+   * allocation depend on the libc's qsort (host glibc and the device libc
+   * order equal elements differently). */
+  if (ia->precolored >= 0 && ib->precolored < 0) return -1;
+  if (ia->precolored < 0 && ib->precolored >= 0) return 1;
+  if (ia->vreg < ib->vreg) return -1;
+  if (ia->vreg > ib->vreg) return 1;
   return 0;
 }
 
@@ -2024,6 +2034,13 @@ static void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
   uint64_t dirty_int = 0;
   uint64_t dirty_fp = 0;
 
+  /* DEBUG: trace the linear-scan allocation decisions for the 90_struct
+   * miscompile (why R8 gets assigned to the printf-arg LEA temp on device but
+   * spilled on QEMU). RA90 lines: per-interval state + int_free + branch taken. */
+  int dbg90 = funcname && !strcmp((const char *)funcname, "test_init_struct_from_struct");
+  if (dbg90)
+    fprintf(stderr, "RA90 start count=%d int_allowed=0x%x\n", count, (unsigned)int_allowed);
+
   /* Active set sorted by end point */
   SSAInterval **active = tcc_malloc(sizeof(SSAInterval *) * count);
   int active_count = 0;
@@ -2047,6 +2064,11 @@ static void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
   for (int i = 0; i < count; i++) {
     SSAInterval *cur = &intervals[i];
 
+    if (dbg90)
+      fprintf(stderr, "RA90 i=%d vr=0x%x [%u,%u] xcall=%d prec=%d rt=%d addr=%d coal=%d r0in=%d int_free=0x%x\n", i,
+              (unsigned)cur->vreg, cur->start, cur->end, cur->crosses_call, cur->precolored, cur->reg_type,
+              cur->addrtaken, cur->coalesce_to, cur->r0, (unsigned)int_free);
+
     /* Graph coalescing: non-representative members are merged into their
      * representative's interval and inherit its register after the scan.  Skip
      * them so they neither consume a register nor enter the active set. */
@@ -2069,6 +2091,9 @@ static void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
           } else {
             int_free |= (1ull << a->r0);
             if (a->r1 >= 0) int_free |= (1ull << a->r1);
+            if (dbg90)
+              fprintf(stderr, "RA90  expire vr=0x%x end=%u < curstart=%u -> free R%d (int_free=0x%x)\n",
+                      (unsigned)a->vreg, a->end, cur->start, a->r0, (unsigned)int_free);
           }
         }
       } else {
@@ -2538,6 +2563,10 @@ static void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
         if (int_free & (1ull << r)) { reg = r; break; }
       }
     }
+
+    if (dbg90)
+      fprintf(stderr, "RA90  DECIDE vr=0x%x -> reg=%d (int_free=0x%x xcall=%d) %s\n", (unsigned)cur->vreg, reg,
+              (unsigned)int_free, cur->crosses_call, reg >= 0 ? "ASSIGN" : "SPILL");
 
     if (cur->reg_shared) {
       /* Return-block share: cur->r0 was set in the pref_reg path.

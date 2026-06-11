@@ -4271,11 +4271,13 @@ int tcc_ir_opt_dead_var_store_elim(TCCIRState *ir)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP)
       continue;
-    for (int k = 0; k < 3; k++)
+    int nops = (q->op == TCCIR_OP_MLA) ? 4 : 3;
+    for (int k = 0; k < nops; k++)
     {
       IROperand op = (k == 0)   ? tcc_ir_op_get_dest(ir, q)
                      : (k == 1) ? tcc_ir_op_get_src1(ir, q)
-                                : tcc_ir_op_get_src2(ir, q);
+                     : (k == 2) ? tcc_ir_op_get_src2(ir, q)
+                                : tcc_ir_op_get_accum(ir, q);
       int32_t vr = irop_get_vreg(op);
       if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR)
       {
@@ -4326,6 +4328,22 @@ int tcc_ir_opt_dead_var_store_elim(TCCIRState *ir)
     {
       IROperand src2 = tcc_ir_op_get_src2(ir, q);
       int32_t vr = irop_get_vreg(src2);
+      if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR)
+      {
+        int pos = TCCIR_DECODE_VREG_POSITION(vr);
+        if (pos <= max_var)
+          var_read[pos / 8] |= (1 << (pos % 8));
+      }
+    }
+    /* MLA's accumulator is a third source operand not covered by the
+     * src1/src2 checks above.  Missing it lets this pass NOP the def of a
+     * VAR that is still read as an MLA accum (e.g. `V2 = T MLA P + V1`
+     * created by mla-fusion from `V1 + T*P`) — the surviving MLA then
+     * reads an undefined frame slot. */
+    if (q->op == TCCIR_OP_MLA)
+    {
+      IROperand a = tcc_ir_op_get_accum(ir, q);
+      int32_t vr = irop_get_vreg(a);
       if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR)
       {
         int pos = TCCIR_DECODE_VREG_POSITION(vr);
@@ -5225,11 +5243,18 @@ int tcc_ir_opt_redundant_init_elim(TCCIRState *ir)
   if (n <= 1)
     return 0;
 
-  /* Bail if function has indirect jumps (setjmp/longjmp, computed goto).
-   * These create hidden control flow that our BFS doesn't follow. */
+  /* Bail if the function has indirect jumps (setjmp/longjmp, computed goto) or a
+   * switch table.  Both introduce control flow the forward BFS below does not
+   * follow: it walks fallthrough/branch successors but never SWITCH_TABLE case
+   * targets, so a use of V reachable only through a switch case is invisible to
+   * it.  Without this bail an entry init `V = imm` whose only use lives in a
+   * switch case (e.g. `int dest_reg = -1;` used inside the operand-kind switch
+   * of tcc_gen_machine_lea_mop) is wrongly eliminated, leaving V uninitialized
+   * on the case path. */
   for (int i = 0; i < n; i++)
   {
-    if (ir->compact_instructions[i].op == TCCIR_OP_IJUMP)
+    int op = ir->compact_instructions[i].op;
+    if (op == TCCIR_OP_IJUMP || op == TCCIR_OP_SWITCH_TABLE)
       return 0;
   }
 
@@ -5298,8 +5323,18 @@ int tcc_ir_opt_redundant_init_elim(TCCIRState *ir)
         found_use_before_kill = 1;
         break;
       }
-      /* STORE/FUNCPARAMVAL dest is a use */
-      if ((iq->op == TCCIR_OP_STORE || iq->op == TCCIR_OP_STORE_INDEXED || iq->op == TCCIR_OP_FUNCPARAMVAL) &&
+      /* MLA accumulator (3rd source operand) is a use — not covered by the
+       * src1/src2 checks above (mirrors the same gap fixed in
+       * tcc_ir_opt_dead_var_store_elim). */
+      if (iq->op == TCCIR_OP_MLA && irop_get_vreg(tcc_ir_op_get_accum(ir, iq)) == vr)
+      {
+        found_use_before_kill = 1;
+        break;
+      }
+      /* STORE/STORE_INDEXED/STORE_POSTINC/FUNCPARAMVAL dest is a use (the store
+       * address / passed value, not a definition of V). */
+      if ((iq->op == TCCIR_OP_STORE || iq->op == TCCIR_OP_STORE_INDEXED ||
+           iq->op == TCCIR_OP_STORE_POSTINC || iq->op == TCCIR_OP_FUNCPARAMVAL) &&
           irop_get_vreg(tcc_ir_op_get_dest(ir, iq)) == vr)
       {
         found_use_before_kill = 1;

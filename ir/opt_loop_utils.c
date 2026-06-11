@@ -3766,24 +3766,35 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
   IROperand cmp_src1 = tcc_ir_op_get_src1(ir, cmp_q);
   IROperand cmp_src2 = tcc_ir_op_get_src2(ir, cmp_q);
 
-  /* Save body instructions — heap-allocated to avoid large stack frames */
+  /* Save body instructions — heap-allocated to avoid large stack frames.
+   *
+   * IROperand is __attribute__((packed)) (9 bytes), so naive byte-bump carving
+   * of this scratch buffer leaves the int/uint32_t sub-arrays MISALIGNED after
+   * an odd-counted run of IROperand entries (e.g. latch_lines lands at a
+   * 2-mod-4 address when eff_latch_count is even). An unaligned uint32_t access
+   * is benign on x86, but on the RP2350 the compiler heap is PSRAM behind the
+   * XIP cache, where a word access that straddles a cache line corrupts data —
+   * a deterministic, hardware-only miscompile. Align every sub-array to 8. */
   int bc = body_count, lc = eff_latch_count;
   size_t _rsz = bc * (2 * sizeof(int) + 4 * sizeof(IROperand) + sizeof(uint32_t))
-              + lc * (sizeof(int) + 3 * sizeof(IROperand) + sizeof(uint32_t));
+              + lc * (sizeof(int) + 3 * sizeof(IROperand) + sizeof(uint32_t))
+              + 12 * 8; /* per-sub-array alignment padding (<=7 bytes each) */
   char *_rbuf = (char *)tcc_mallocz(_rsz);
   char *_rp = _rbuf;
-  int *body_ops = (int *)_rp; _rp += bc * sizeof(int);
-  int *body_has_extra = (int *)_rp; _rp += bc * sizeof(int);
-  IROperand *body_dests = (IROperand *)_rp; _rp += bc * sizeof(IROperand);
-  IROperand *body_src1s = (IROperand *)_rp; _rp += bc * sizeof(IROperand);
-  IROperand *body_src2s = (IROperand *)_rp; _rp += bc * sizeof(IROperand);
-  IROperand *body_extras = (IROperand *)_rp; _rp += bc * sizeof(IROperand);
-  uint32_t *body_lines = (uint32_t *)_rp; _rp += bc * sizeof(uint32_t);
-  int *latch_ops = (int *)_rp; _rp += lc * sizeof(int);
-  IROperand *latch_dests = (IROperand *)_rp; _rp += lc * sizeof(IROperand);
-  IROperand *latch_src1s = (IROperand *)_rp; _rp += lc * sizeof(IROperand);
-  IROperand *latch_src2s = (IROperand *)_rp; _rp += lc * sizeof(IROperand);
-  uint32_t *latch_lines = (uint32_t *)_rp;
+#define _RALIGN8() (_rp = (char *)(((uintptr_t)_rp + 7u) & ~(uintptr_t)7u))
+  _RALIGN8(); int *body_ops = (int *)_rp; _rp += bc * sizeof(int);
+  _RALIGN8(); int *body_has_extra = (int *)_rp; _rp += bc * sizeof(int);
+  _RALIGN8(); IROperand *body_dests = (IROperand *)_rp; _rp += bc * sizeof(IROperand);
+  _RALIGN8(); IROperand *body_src1s = (IROperand *)_rp; _rp += bc * sizeof(IROperand);
+  _RALIGN8(); IROperand *body_src2s = (IROperand *)_rp; _rp += bc * sizeof(IROperand);
+  _RALIGN8(); IROperand *body_extras = (IROperand *)_rp; _rp += bc * sizeof(IROperand);
+  _RALIGN8(); uint32_t *body_lines = (uint32_t *)_rp; _rp += bc * sizeof(uint32_t);
+  _RALIGN8(); int *latch_ops = (int *)_rp; _rp += lc * sizeof(int);
+  _RALIGN8(); IROperand *latch_dests = (IROperand *)_rp; _rp += lc * sizeof(IROperand);
+  _RALIGN8(); IROperand *latch_src1s = (IROperand *)_rp; _rp += lc * sizeof(IROperand);
+  _RALIGN8(); IROperand *latch_src2s = (IROperand *)_rp; _rp += lc * sizeof(IROperand);
+  _RALIGN8(); uint32_t *latch_lines = (uint32_t *)_rp;
+#undef _RALIGN8
 
   for (int b = 0; b < body_count; b++)
   {

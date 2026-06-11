@@ -1800,6 +1800,38 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
   int *return_jump_addrs = tcc_malloc(sizeof(int) * ir->next_instruction_index);
   int num_return_jumps = 0;
 
+  /* --- DEBUG: catch codegen-time corruption of a spilled temp's allocation.r0.
+   * The HW-only 90_struct c[1].y=5 bug: a temp that regalloc spilled
+   * (allocation.r0 == 0x3f) is overwritten to a register number during codegen,
+   * so machine_op_from_ir later reads it as "lives in R8". Snapshot now
+   * (post-regalloc) and report the first instruction at which any spilled temp
+   * flips to a register. --- */
+  static uint8_t *dbg_alloc_snap = NULL;
+  static int dbg_alloc_snap_n = 0;
+  static int dbg_alloc_active = 0;
+  static int dbg_alloc_reported = 0;
+  dbg_alloc_active = 0;
+  if (funcname && !strcmp((const char *)funcname, "test_init_struct_from_struct"))
+  {
+    dbg_alloc_snap_n = ir->temporary_variables_live_intervals_size;
+    dbg_alloc_snap = tcc_realloc(dbg_alloc_snap, (size_t)dbg_alloc_snap_n + 1);
+    for (int p = 0; p < dbg_alloc_snap_n; p++)
+      dbg_alloc_snap[p] = (uint8_t)ir->temporary_variables_live_intervals[p].allocation.r0;
+    dbg_alloc_active = 1;
+    dbg_alloc_reported = 0;
+    fprintf(stderr, "ALLOCSNAP n=%d\n", dbg_alloc_snap_n);
+    /* Snapshot the liveness bitmap at the printf-arg LEA indices at codegen
+     * START. Compare with the FSR trace (printed at the find_free call): if
+     * these are correct here but wrong at find_free, the bitmap is corrupted
+     * during codegen; if already wrong here, ra_build_live_regs_bitmap
+     * miscomputed it. */
+    uint32_t *lrb = ir->ls.live_regs_by_instruction;
+    int lrbn = ir->ls.live_regs_by_instruction_size;
+    fprintf(stderr, "LRBSNAP arr=%p sz=%d [70]=0x%x [72]=0x%x [75]=0x%x [80]=0x%x\n", (void *)lrb, lrbn,
+            (lrb && 70 < lrbn) ? lrb[70] : 0xDEADu, (lrb && 72 < lrbn) ? lrb[72] : 0xDEADu,
+            (lrb && 75 < lrbn) ? lrb[75] : 0xDEADu, (lrb && 80 < lrbn) ? lrb[80] : 0xDEADu);
+  }
+
   /* Clear spill cache at function start */
   tcc_ir_spill_cache_clear(&ir->spill_cache);
 
@@ -1827,7 +1859,10 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
       /* VLA functions dynamically move SP (sub sp, vla_size).  Without FP,
        * saved-SP references and local variable offsets break.  Force FP. */
       if (q->op == TCCIR_OP_VLA_ALLOC)
+      {
         tcc_state->need_frame_pointer = 1;
+        tcc_state->func_dynamic_sp = 1;
+      }
 
       if (q->op != TCCIR_OP_FUNCCALLVAL && q->op != TCCIR_OP_FUNCCALLVOID)
         continue;
@@ -2187,7 +2222,23 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
       {
         ir->scratch_save_size = 16; /* 4 slots — 64-bit ops on 32-bit ARM can need 3+ simultaneous scratch saves */
         loc -= ir->scratch_save_size;
-        ir->scratch_save_base = loc;
+        /* The outgoing call-arg area must stay at the very bottom of the
+         * frame (stack args are stored at literal [SP, #stack_off]), and the
+         * nested-call save area (R0-R3/R9 saves around calls) is addressed
+         * literally at [SP + call_outgoing_size + n*4] directly above it.
+         * The scratch area must therefore sit ABOVE BOTH: putting it lower
+         * maps scratch saves onto already-written argument slots or onto the
+         * saved R9/GOT base (restoring r9 = scratch garbage after the call). */
+        if (ir->call_outgoing_size > 0 || ir->call_nested_save_size > 0)
+        {
+          ir->call_outgoing_base = loc;
+          ir->call_nested_save_base = loc + ir->call_outgoing_size;
+          ir->scratch_save_base = loc + ir->call_outgoing_size + ir->call_nested_save_size;
+        }
+        else
+        {
+          ir->scratch_save_base = loc;
+        }
         stack_size = (-loc + 7) & ~7;
       }
     }
@@ -2346,6 +2397,27 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
       /* Track current instruction for scratch register allocation */
       ir->codegen_instruction_idx = i;
 
+      /* DEBUG: report the first spilled temp whose allocation.r0 was overwritten
+       * to a register since codegen start (corruption happened at instr <= i-1,
+       * or in the dry-run pass if i is 0). */
+      if (dbg_alloc_active && !dbg_alloc_reported)
+      {
+        int lim = ir->temporary_variables_live_intervals_size;
+        if (lim > dbg_alloc_snap_n)
+          lim = dbg_alloc_snap_n;
+        for (int p = 0; p < lim; p++)
+        {
+          uint8_t now = (uint8_t)ir->temporary_variables_live_intervals[p].allocation.r0;
+          if (dbg_alloc_snap[p] == 0x3f && now != 0x3f)
+          {
+            fprintf(stderr, "ALLOCCORRUPT T%d r0 0x3f->0x%x by codegen idx<=%d (this op=%d)\n",
+                    p, now, i, (int)cq->op);
+            dbg_alloc_reported = 1;
+            break;
+          }
+        }
+      }
+
       /* Debug tracking: update current op for ot_check failure reporting */
       g_debug_current_op = (int)cq->op;
 
@@ -2364,7 +2436,14 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
        * to its callee-saved home pair and then back to the next call's
        * argument pair — coalesce away. */
       tcc_gen_machine_strldr_cache_reset();
-      if (cq->is_jump_target)
+      /* Like imm_cache below, the GPR-equivalence cache must also drop at
+       * backward (loop) branch targets that is_jump_target misses at -O0:
+       * an equivalence recorded before the loop (e.g. the prologue's
+       * `mov r4, r0` param save) is not re-established on the back edge,
+       * and eliding a call-argument `mov r0, r4` on that basis passes
+       * garbage from the previous iteration (gcc_execute/990128-1 stored
+       * through such a garbage pointer into the kernel vector table). */
+      if (cq->is_jump_target || (branch_target_reset && branch_target_reset[i]))
         tcc_gen_machine_mov_equiv_reset();
 
       /* Invalidate imm_cache for registers assigned to live vregs.
@@ -3165,8 +3244,12 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
               break;
             }
           }
+          /* is_jump_target misses some branch targets (see branch_target_reset);
+           * consuming a branch-target store removes the label's only emission
+           * point, so branches to it backpatch against code address 0. */
           if (next_i >= 0 && ir->compact_instructions[next_i].op == TCCIR_OP_STORE_INDEXED &&
-              !ir->compact_instructions[next_i].is_jump_target)
+              !ir->compact_instructions[next_i].is_jump_target &&
+              !(branch_target_reset && branch_target_reset[next_i]))
           {
             IRQuadCompact *nq = &ir->compact_instructions[next_i];
             IROperand n_src1_ir = tcc_ir_op_get_src1(ir, nq);
@@ -3218,8 +3301,12 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
               break;
             }
           }
+          /* is_jump_target misses some branch targets (see branch_target_reset);
+           * consuming a branch-target store removes the label's only emission
+           * point, so branches to it backpatch against code address 0. */
           if (next_i >= 0 && ir->compact_instructions[next_i].op == TCCIR_OP_STORE_INDEXED &&
-              !ir->compact_instructions[next_i].is_jump_target)
+              !ir->compact_instructions[next_i].is_jump_target &&
+              !(branch_target_reset && branch_target_reset[next_i]))
           {
             IRQuadCompact *nq = &ir->compact_instructions[next_i];
             IROperand n_src1_ir = tcc_ir_op_get_src1(ir, nq);
@@ -3414,8 +3501,12 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
             next_i = j;
             break;
           }
+          /* is_jump_target misses some branch targets (see branch_target_reset);
+           * consuming a branch-target store removes the label's only emission
+           * point, so branches to it backpatch against code address 0. */
           if (next_i >= 0 && ir->compact_instructions[next_i].op == TCCIR_OP_STORE_INDEXED &&
-              !ir->compact_instructions[next_i].is_jump_target)
+              !ir->compact_instructions[next_i].is_jump_target &&
+              !(branch_target_reset && branch_target_reset[next_i]))
           {
             IRQuadCompact *nq = &ir->compact_instructions[next_i];
             IROperand n_src1_ir = tcc_ir_op_get_src1(ir, nq);
@@ -3476,8 +3567,12 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
               break;
             }
           }
+          /* is_jump_target misses some branch targets (see branch_target_reset);
+           * consuming a branch-target store removes the label's only emission
+           * point, so branches to it backpatch against code address 0. */
           if (next_i >= 0 && ir->compact_instructions[next_i].op == TCCIR_OP_STORE_INDEXED &&
-              !ir->compact_instructions[next_i].is_jump_target)
+              !ir->compact_instructions[next_i].is_jump_target &&
+              !(branch_target_reset && branch_target_reset[next_i]))
           {
             IRQuadCompact *nq = &ir->compact_instructions[next_i];
             IROperand n_src1_ir = tcc_ir_op_get_src1(ir, nq);
@@ -3968,8 +4063,8 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
         break;
       case TCCIR_OP_SETJMP:
       {
-        MopArgs a = DECODE(.dest = 1, .src1 = 1);
-        SCRATCH_WRAP(tcc_gen_machine_setjmp_mop(a.src1, a.dest));
+        MopArgs a = DECODE(.dest = 1, .src1 = 1, .src2 = 1);
+        SCRATCH_WRAP(tcc_gen_machine_setjmp_mop(a.src1, a.src2, a.dest));
         break;
       }
       case TCCIR_OP_LONGJMP:
@@ -4220,9 +4315,25 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
         }
         if (max_scratch_depth > 0)
         {
-          ir->scratch_save_size = max_scratch_depth * 4;
+          /* Round up to 8 so the frame's alignment padding (and with it the
+           * SP-literal addressing of the outgoing/nested areas) is unchanged
+           * relative to the no-scratch layout. */
+          ir->scratch_save_size = (max_scratch_depth * 4 + 7) & ~7;
           loc -= ir->scratch_save_size;
-          ir->scratch_save_base = loc;
+          /* Keep the outgoing call-arg area at the very bottom of the frame
+           * and the nested-call save area directly above it (both are
+           * addressed with literal SP offsets); see the matching re-slot in
+           * the might_need_scratch reservation above. */
+          if (ir->call_outgoing_size > 0 || ir->call_nested_save_size > 0)
+          {
+            ir->call_outgoing_base = loc;
+            ir->call_nested_save_base = loc + ir->call_outgoing_size;
+            ir->scratch_save_base = loc + ir->call_outgoing_size + ir->call_nested_save_size;
+          }
+          else
+          {
+            ir->scratch_save_base = loc;
+          }
           /* Recompute stack_size with scratch area included */
           stack_size = (-loc + 7) & ~7;
         }

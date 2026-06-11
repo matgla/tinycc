@@ -134,13 +134,16 @@ static int reassoc_binary(IRSSAOptCtx *ctx, int idx)
   IROperand new_imm = irop_make_imm32(0, combined, dest.btype);
   tcc_ir_op_set_src2(ir, q, new_imm);
 
-  /* Transfer inner's src1 use from inner to this instruction */
+  /* Record the new use of inner's src1 at this instruction.  The inner
+   * instruction still reads it too — its use record must stay until the
+   * inner is actually NOPed (ssa_opt_nop_instr removes it then).  Removing
+   * it here while the inner is live lets a later pass (e.g. GVN CSEing the
+   * outer back onto the still-live inner) drop the count to zero and DCE
+   * then kills the operand's def out from under the live inner. */
   int32_t inner_src1_vr = irop_get_vreg(inner_src1);
   IRSSAVregInfo *inner_vi = ssa_opt_vinfo(ctx, inner_src1_vr);
-  if (inner_vi) {
-    ssa_opt_remove_use_instr(inner_vi, vi->def_instr);
+  if (inner_vi)
     ssa_opt_add_use_instr(inner_vi, idx);
-  }
 
   /* Remove use of src1_vr (was the link between inner and outer) */
   ssa_opt_remove_use_instr(vi, idx);

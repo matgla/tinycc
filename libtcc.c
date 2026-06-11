@@ -177,7 +177,15 @@ PUB_FUNC void tcc_free(void *ptr)
 
 PUB_FUNC void *tcc_malloc(unsigned long size)
 {
-  return reallocator(0, size);
+  void *p = reallocator(0, size);
+  /* DEBUG: TCC_POISON fills raw (non-zeroed) allocations with garbage to mimic
+   * the device's PSRAM heap (vs QEMU/host SRAM which reads zero). If the host
+   * cross-tcc then reproduces the 90_struct R8 misallocation, an uninitialized
+   * tcc_malloc field in regalloc is the cause. tcc_mallocz zeroes after, so
+   * only non-zeroed allocations are poisoned. */
+  if (p && getenv("TCC_POISON"))
+    memset(p, 0xAA, size);
+  return p;
 }
 
 PUB_FUNC void *tcc_realloc(void *ptr, unsigned long size)

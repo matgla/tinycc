@@ -17484,7 +17484,13 @@ static void __attribute__((noinline)) unary_builtin_alloca(void)
   CType type;
   switch (tok)
   {
-#ifdef TOK_alloca
+/* TOK_alloca is an enum constant (tcctok.h), so it can't be tested with
+ * #ifdef — guard on the same target condition that defines it. Routing the
+ * plain `alloca` identifier here (instead of the lib/alloca.S call) is
+ * required for correctness: the library alloca moves SP behind the
+ * backend's back, so the SP-relative per-call R9/arg save area reads
+ * garbage afterwards (func_dynamic_sp is only set for VLA_ALLOC). */
+#if defined TCC_TARGET_I386 || defined TCC_TARGET_X86_64 || defined TCC_TARGET_ARM
   case TOK_alloca:
 #endif
   case TOK_builtin_alloca:
@@ -22082,20 +22088,32 @@ tok_next:
   }
   case TOK_builtin_setjmp:
   {
-    /* __builtin_setjmp(void **buf) - returns 0 on initial call, 1 on longjmp return */
+    /* __builtin_setjmp(void **buf) - returns 0 on initial call, 1 on longjmp return.
+     *
+     * GCC's ABI gives this builtin a 5-WORD buffer and callers really do
+     * pass `void *buf[5]` (gcc.c-torture pr84521), so the 40-byte
+     * NL_SETJMP layout previously used here overflowed the caller's
+     * buffer and smashed its stack.  The callee-saved register file
+     * (r4-r11) still must be restored on longjmp — the register
+     * allocator keeps VARs and the R9 GOT base in r4-r11 across the
+     * setjmp — so SETJMP saves those 8 words into a hidden 32-byte area
+     * in this function's frame (alive for as long as a longjmp to this
+     * buffer is legal) and records the area address in buf[3]. */
     parse_builtin_params(0, "e");
-    /* buf is now on vtop - emit SETJMP IR instruction.
-     * The backend saves callee-saved registers, SP, FP, and a resume address
-     * into the buffer.  On the normal path dest receives 0; when longjmp
-     * jumps to the resume address the backend writes 1 into dest.
-     */
+    loc = (loc - 32) & -8;
+    SValue area;
+    memset(&area, 0, sizeof(area));
+    area.type.t = VT_PTR;
+    area.r = VT_LOCAL; /* no VT_LVAL: address-of-local (frame-slot operand) */
+    area.c.i = loc;
+    area.vr = -1;
     SValue dest;
     dest.type.t = VT_INT;
     dest.type.ref = NULL;
     dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
     dest.r = 0;
     dest.c.i = 0;
-    tcc_ir_put(tcc_state->ir, TCCIR_OP_SETJMP, vtop, NULL, &dest);
+    tcc_ir_put(tcc_state->ir, TCCIR_OP_SETJMP, vtop, &area, &dest);
     vtop->vr = dest.vr;
     vtop->r = 0;
     vtop->type.t = VT_INT;
@@ -22110,7 +22128,7 @@ tok_next:
     /* Stack: buf, val (val is on top).  val is ignored (__builtin_longjmp
      * always forces the return value to 1). */
     vpop(); /* pop val */
-    /* vtop now has buf - emit LONGJMP IR instruction */
+    /* vtop now has buf - emit LONGJMP (see TOK_builtin_setjmp above) */
     tcc_ir_put(tcc_state->ir, TCCIR_OP_LONGJMP, vtop, NULL, NULL);
     vpop(); /* pop buf */
     /* longjmp does not return - mark as void and noreturn */
@@ -22119,7 +22137,8 @@ tok_next:
     CODE_OFF();
     break;
   }
-#ifdef TOK_alloca
+/* See unary_builtin_alloca: TOK_alloca is an enum, #ifdef never matched. */
+#if defined TCC_TARGET_I386 || defined TCC_TARGET_X86_64 || defined TCC_TARGET_ARM
   case TOK_alloca:
 #endif
   case TOK_builtin_alloca:
@@ -28943,6 +28962,7 @@ static void gen_function(Sym *sym)
   /* Reset per-function flags */
   tcc_state->force_frame_pointer = 0;
   tcc_state->need_frame_pointer = 0;
+  tcc_state->func_dynamic_sp = 0;
   tcc_state->force_lr_save = 0;
   tcc_state->func_save_apply_args = 0;
   tcc_state->apply_args_offset = 0;
@@ -31040,6 +31060,12 @@ static void gen_function(Sym *sym)
       loc = min_stack_loc;
     else if (!has_nested_chain && min_stack_loc > loc)
       loc = min_stack_loc;
+    /* The variadic va_area at [FP-4..FP-28] is written by the machine
+     * prologue and never appears as a STACKOFF in the IR, so the shrink
+     * scan above doesn't see it.  Shrinking past it leaves the va_area
+     * below SP where any callee push or exception frame clobbers it. */
+    if (func_var && loc > -28)
+      loc = -28;
   }
 
   tcc_ir_move_coalescing(ir);
@@ -31113,6 +31139,9 @@ static void gen_function(Sym *sym)
       }
       if (post_min_op_offset > loc)
         loc = post_min_op_offset;
+      /* Keep the prologue-managed variadic va_area reserved (see above). */
+      if (func_var && loc > -28)
+        loc = -28;
     }
   }
 

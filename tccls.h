@@ -85,6 +85,8 @@ void tcc_ls_compact_stack_locations(LSLiveIntervalState *ls, int spill_base);
 
 void tcc_ls_reset_scratch_cache(LSLiveIntervalState *ls);
 
+uint32_t tcc_ls_compute_live_regs(LSLiveIntervalState *ls, int instruction_idx);
+
 int tcc_ls_find_free_scratch_reg(LSLiveIntervalState *ls, int instruction_idx, uint32_t exclude_regs, int is_leaf);
 
 void tcc_ls_recompute_dirty_registers(LSLiveIntervalState *ls);
