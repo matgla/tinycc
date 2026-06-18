@@ -3802,10 +3802,12 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
     int op = bq->op;
     body_ops[b] = op;
     body_lines[b] = bq->line_num;
-    body_dests[b] = (IROperand){0};
-    body_src1s[b] = (IROperand){0};
-    body_src2s[b] = (IROperand){0};
-    body_extras[b] = (IROperand){0};
+    /* The _rbuf backing these arrays is tcc_mallocz'd (zero-filled), so the
+     * dest/src/extra slots already read as (IROperand){0}.  We must NOT write
+     * an explicit `= (IROperand){0}` here: IROperand is __packed__ (9 bytes), so
+     * &body_dests[b] is only byte-aligned for odd b, and the compiler lowers the
+     * compound-literal zero store to an 8-byte STRD which faults (UNALIGNED) on
+     * a non-4-aligned address.  Leave them at their pre-zeroed value. */
     body_has_extra[b] = (op == TCCIR_OP_MLA || op == TCCIR_OP_LOAD_INDEXED || op == TCCIR_OP_STORE_INDEXED);
     if (irop_config[op].has_dest)
       body_dests[b] = ir->iroperand_pool[bq->operand_base];
@@ -3824,9 +3826,8 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
     int op = lq->op;
     latch_ops[l] = op;
     latch_lines[l] = lq->line_num;
-    latch_dests[l] = (IROperand){0};
-    latch_src1s[l] = (IROperand){0};
-    latch_src2s[l] = (IROperand){0};
+    /* Pre-zeroed by tcc_mallocz; do not write (IROperand){0} — see the body
+     * loop above (packed IROperand → unaligned STRD fault). */
     if (irop_config[op].has_dest)
       latch_dests[l] = ir->iroperand_pool[lq->operand_base];
     if (irop_config[op].has_src1)

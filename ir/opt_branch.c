@@ -359,9 +359,12 @@ int tcc_ir_opt_vrp(TCCIRState *ir)
   uint8_t *is_merge = ir_opt_build_merge_bitmap(ir, n);
 
   /* Range table: PARAM in 0..VRP_MAX_POS-1, TEMP in VRP_MAX_POS..2*VRP_MAX_POS-1,
-   * VAR in 2*VRP_MAX_POS..3*VRP_MAX_POS-1 */
-  VRPRange ranges[VRP_MAX_POS * 3];
-  memset(ranges, 0, sizeof(ranges));
+   * VAR in 2*VRP_MAX_POS..3*VRP_MAX_POS-1.  Heap-allocated: VRP_MAX_POS*3
+   * VRPRange entries are ~18 KB each, far too large for the target's process
+   * stack (these two arrays alone would blow a 32 KB stack). */
+  const size_t vrp_ranges_bytes = sizeof(VRPRange) * (VRP_MAX_POS * 3);
+  VRPRange *ranges = tcc_mallocz(vrp_ranges_bytes);
+  VRPRange *deferred_ranges = tcc_mallocz(vrp_ranges_bytes);
 
   /* Pending fall-through constraint: applied at instruction pending_apply_at */
   int pending_apply_at = -1;
@@ -389,7 +392,6 @@ int tcc_ir_opt_vrp(TCCIRState *ir)
    * scan reaches T.  This carries a loop-guard's fall-through bound (e.g.
    * `s<=1`) into a switch-dispatch block reached by the guard's taken edge —
    * letting the dead `case`s on out-of-range values fold away. */
-  VRPRange deferred_ranges[VRP_MAX_POS * 3];
   int deferred_target = -1;
 
   for (int i = 0; i < n; i++)
@@ -413,14 +415,14 @@ int tcc_ir_opt_vrp(TCCIRState *ir)
      * merge/pending handling below (neither of which can apply to it). */
     if (i == deferred_target)
     {
-      memcpy(ranges, deferred_ranges, sizeof(ranges));
+      memcpy(ranges, deferred_ranges, vrp_ranges_bytes);
       deferred_target = -1;
     }
     /* At merge points: clear all ranges and discard pending constraint,
      * but re-apply the scoped equality constraint if still active. */
     else if (is_merge[i / 8] & (1 << (i % 8)))
     {
-      memset(ranges, 0, sizeof(ranges));
+      memset(ranges, 0, vrp_ranges_bytes);
       pending_apply_at = -1;
       pending_slot = -1;
       /* Scoped constraint re-apply disabled: not all merge points
@@ -927,17 +929,19 @@ int tcc_ir_opt_vrp(TCCIRState *ir)
         int t = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
         if (t > i && t < n && !(is_merge[t / 8] & (1 << (t % 8))))
         {
-          memcpy(deferred_ranges, ranges, sizeof(ranges));
+          memcpy(deferred_ranges, ranges, vrp_ranges_bytes);
           deferred_target = t;
         }
       }
-      memset(ranges, 0, sizeof(ranges));
+      memset(ranges, 0, vrp_ranges_bytes);
       pending_apply_at = -1;
       pending_slot = -1;
     }
   }
 
   tcc_free(is_merge);
+  tcc_free(ranges);
+  tcc_free(deferred_ranges);
 
   if (changes)
     changes += tcc_ir_opt_dce(ir);
