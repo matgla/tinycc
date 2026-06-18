@@ -463,12 +463,42 @@ static void iload_kill_for_stack_store(IRSSAOptCtx *ctx, GLoadState *st, int32_t
 /* resolve_lea_stackloc moved to ssa_opt.c as ssa_opt_resolve_lea_stackloc. */
 #define resolve_lea_stackloc ssa_opt_resolve_lea_stackloc
 
-static int gload_process_block(IRSSAOptCtx *ctx, GLoadState state, int b)
+typedef struct GLoadWork {
+  int block;
+  GLoadState *state;
+} GLoadWork;
+
+static int gload_process_block(IRSSAOptCtx *ctx, GLoadState *st_init, int b_init)
 {
   TCCIRState *ir = ctx->ir;
   IRCFG *cfg = ctx->cfg;
-  IRBasicBlock *bb = &cfg->blocks[b];
   int changes = 0;
+
+  /* Iterative DFS over the dominator tree with a heap worklist instead of
+   * native recursion.  Functions with deep branch nesting (one `if` per
+   * source statement, e.g. memcpy-bi's 80 inlined `check()` bound checks)
+   * recursed once per branch level and overflowed the 32 KB target process
+   * stack in this function's prologue.  Each pending work item OWNS a heap
+   * GLoadState snapshot — the same heap profile the recursive code already
+   * had (it malloc'd one snapshot per branch level), now with O(1) native
+   * call-stack depth. */
+  GLoadWork *work = tcc_malloc(sizeof *work * 8);
+  int sp = 0, cap = 8;
+  {
+    GLoadState *seed = tcc_malloc(sizeof *seed);
+    *seed = *st_init;
+    work[sp].block = b_init;
+    work[sp].state = seed;
+    sp++;
+  }
+
+  while (sp > 0) {
+    sp--;
+    int b = work[sp].block;
+    GLoadState *st = work[sp].state;
+
+  for (;;) {
+  IRBasicBlock *bb = &cfg->blocks[b];
 
   /* If this block has any predecessor that is NOT its immediate dominator,
    * a non-dominator path (loop back-edge or cross-edge) can modify tracked
@@ -483,11 +513,11 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState state, int b)
    * operator token and tcc rejected `#if A >= B` with "expression expected"). */
   for (int pi = 0; pi < bb->num_preds; pi++) {
     if (bb->preds[pi] != bb->idom) {
-      state.count = 0;
-      state.scount = 0;
-      state.gscount = 0;
-      state.tvcount = 0;
-      state.ilcount = 0;
+      st->count = 0;
+      st->scount = 0;
+      st->gscount = 0;
+      st->tvcount = 0;
+      st->ilcount = 0;
       break;
     }
   }
@@ -498,11 +528,11 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState state, int b)
       continue;
 
     if (q->op == TCCIR_OP_FUNCCALLVOID || q->op == TCCIR_OP_FUNCCALLVAL) {
-      state.count = 0;
-      state.scount = 0;
-      state.gscount = 0;
-      state.tvcount = 0;
-      state.ilcount = 0;
+      st->count = 0;
+      st->scount = 0;
+      st->gscount = 0;
+      st->tvcount = 0;
+      st->ilcount = 0;
       continue;
     }
 
@@ -526,10 +556,10 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState state, int b)
         if (pvr < 0 || TCCIR_DECODE_VREG_TYPE(pvr) != TCCIR_VREG_TYPE_TEMP)
           continue;
         int op_btype = irop_get_btype(op);
-        int tk = tvstore_find(&state, pvr, op_btype);
+        int tk = tvstore_find(st, pvr, op_btype);
         if (tk < 0)
           continue;
-        TVStoreEntry *te = &state.tvstores[tk];
+        TVStoreEntry *te = &st->tvstores[tk];
         IROperand new_op;
         if (te->stored_vr >= 0) {
           new_op = irop_make_vreg(te->stored_vr, op_btype);
@@ -564,7 +594,7 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState state, int b)
        * tracker can ignore them.  Everything else is treated as "may write
        * to anywhere through this base"; precise overlap analysis kicks in
        * when both base_vr and offsets are known. */
-      if (state.ilcount > 0) {
+      if (st->ilcount > 0) {
         int store_aliases_globals = 1;
         if (dest.tag == IROP_TAG_STACKOFF)
           store_aliases_globals = 0;
@@ -606,11 +636,11 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState state, int b)
           }
 
           if (store_to_stack)
-            iload_kill_for_stack_store(ctx, &state, store_base_vr, store_lo, store_hi);
+            iload_kill_for_stack_store(ctx, st, store_base_vr, store_lo, store_hi);
           else if (can_check)
-            iload_kill_for_store(&state, store_base_vr, store_lo, store_hi);
+            iload_kill_for_store(st, store_base_vr, store_lo, store_hi);
           else
-            state.ilcount = 0;
+            st->ilcount = 0;
         }
       }
 
@@ -632,9 +662,9 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState state, int b)
             load_off = resolve_lea_stackloc(ctx, pvr);
           }
           if (load_off != INT_MIN) {
-            int sk = sstore_find(&state, load_off);
-            if (sk >= 0 && state.sstores[sk].btype == load_btype) {
-              SStoreEntry *se = &state.sstores[sk];
+            int sk = sstore_find(st, load_off);
+            if (sk >= 0 && st->sstores[sk].btype == load_btype) {
+              SStoreEntry *se = &st->sstores[sk];
               if (se->stored_vr < 0) {
                 tcc_ir_set_src1(ir, i, se->stored_imm);
                 changes++;
@@ -656,15 +686,15 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState state, int b)
         if (!ctx->no_stack_fwd && dest.is_local && dest.is_lval && !dest.is_llocal) {
           int store_btype = irop_get_btype(dest);
           if (svr >= 0 && TCCIR_DECODE_VREG_TYPE(svr) == TCCIR_VREG_TYPE_TEMP)
-            sstore_track_vr(&state, irop_get_stack_offset(dest), store_btype, svr);
+            sstore_track_vr(st, irop_get_stack_offset(dest), store_btype, svr);
           else if (irop_is_immediate(src))
-            sstore_track_imm(&state, irop_get_stack_offset(dest), store_btype, src);
+            sstore_track_imm(st, irop_get_stack_offset(dest), store_btype, src);
         } else {
           /* A non-direct STACKOFF write may expose the address. */
           int off = irop_get_stack_offset(dest);
-          int k = sstore_find(&state, off);
+          int k = sstore_find(st, off);
           if (k >= 0)
-            state.sstores[k] = state.sstores[--state.scount];
+            st->sstores[k] = st->sstores[--st->scount];
         }
         continue;
       }
@@ -686,11 +716,11 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState state, int b)
             int store_btype = irop_get_btype(dest);
             int32_t svr = irop_get_vreg(src);
             if (svr >= 0 && TCCIR_DECODE_VREG_TYPE(svr) == TCCIR_VREG_TYPE_TEMP)
-              sstore_track_vr(&state, eff_off, store_btype, svr);
+              sstore_track_vr(st, eff_off, store_btype, svr);
             else if (irop_is_immediate(src))
-              sstore_track_imm(&state, eff_off, store_btype, src);
+              sstore_track_imm(st, eff_off, store_btype, src);
             else
-              sstore_remove_offset(&state, eff_off);
+              sstore_remove_offset(st, eff_off);
           }
           continue;
         }
@@ -722,12 +752,12 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState state, int b)
             int32_t svr = irop_get_vreg(src);
             int tracked = 0;
             if (irop_is_immediate(src)) {
-              tvstore_track_imm(&state, ptr_vr, store_btype, src);
+              tvstore_track_imm(st, ptr_vr, store_btype, src);
               tracked = 1;
             } else if (svr >= 0 &&
                        TCCIR_DECODE_VREG_TYPE(svr) == TCCIR_VREG_TYPE_TEMP &&
                        src.tag == IROP_TAG_VREG && !src.is_lval) {
-              tvstore_track_vr(&state, ptr_vr, store_btype, svr);
+              tvstore_track_vr(st, ptr_vr, store_btype, svr);
               tracked = 1;
             }
             if (tracked) {
@@ -735,16 +765,16 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState state, int b)
                * over any tracked address.  Drop all other tvstores (with
                * a different ptr_vr or btype), all global CSE entries, all
                * global stores, and all stack stores. */
-              for (int kk = 0; kk < state.tvcount; kk++) {
-                if (state.tvstores[kk].ptr_vr != ptr_vr ||
-                    state.tvstores[kk].btype != store_btype) {
-                  state.tvstores[kk] = state.tvstores[--state.tvcount];
+              for (int kk = 0; kk < st->tvcount; kk++) {
+                if (st->tvstores[kk].ptr_vr != ptr_vr ||
+                    st->tvstores[kk].btype != store_btype) {
+                  st->tvstores[kk] = st->tvstores[--st->tvcount];
                   kk--;
                 }
               }
-              state.count = 0;
-              state.scount = 0;
-              state.gscount = 0;
+              st->count = 0;
+              st->scount = 0;
+              st->gscount = 0;
               continue;
             }
           }
@@ -782,11 +812,11 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState state, int b)
         int dtype = (dvr >= 0) ? TCCIR_DECODE_VREG_TYPE(dvr) : -1;
         if (dtype == TCCIR_VREG_TYPE_VAR || dtype == TCCIR_VREG_TYPE_TEMP) {
           if (dvr >= 0) {
-            gload_remove_vr(&state, dvr);
-            sstore_remove_vr(&state, dvr);
-            gstore_remove_vr(&state, dvr);
-            tvstore_remove_vr(&state, dvr);
-            iload_remove_vr(&state, dvr);
+            gload_remove_vr(st, dvr);
+            sstore_remove_vr(st, dvr);
+            gstore_remove_vr(st, dvr);
+            tvstore_remove_vr(st, dvr);
+            iload_remove_vr(st, dvr);
           }
           continue;
         }
@@ -795,9 +825,9 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState state, int b)
       if (dest.is_sym && dest.is_lval) {
         IRPoolSymref *sref = irop_get_symref_ex(ir, dest);
         if (sref && sref->sym) {
-          for (int k = 0; k < state.count; k++) {
-            if (state.entries[k].sym == sref->sym) {
-              state.entries[k] = state.entries[--state.count];
+          for (int k = 0; k < st->count; k++) {
+            if (st->entries[k].sym == sref->sym) {
+              st->entries[k] = st->entries[--st->count];
               k--;
             }
           }
@@ -824,29 +854,29 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState state, int b)
             IROperand sval = tcc_ir_op_get_src1(ir, q);
             int32_t svr = irop_get_vreg(sval);
             if (irop_is_immediate(sval)) {
-              gstore_track_imm(&state, sref->sym, sref->addend, store_btype, sval);
+              gstore_track_imm(st, sref->sym, sref->addend, store_btype, sval);
             } else if (svr >= 0 && TCCIR_DECODE_VREG_TYPE(svr) == TCCIR_VREG_TYPE_TEMP &&
                        sval.tag == IROP_TAG_VREG && !sval.is_lval) {
-              gstore_track_vr(&state, sref->sym, sref->addend, store_btype, svr);
+              gstore_track_vr(st, sref->sym, sref->addend, store_btype, svr);
             } else {
               /* Value form we don't model — invalidate this slot. */
-              gstore_invalidate_overlap(&state, sref->sym, sref->addend, store_btype);
+              gstore_invalidate_overlap(st, sref->sym, sref->addend, store_btype);
             }
           } else if (q->op == TCCIR_OP_STORE && !width_safe) {
             /* Sub-word store: don't forward; also invalidate any stale entry
              * at this address so we don't propagate a wider stale value. */
-            gstore_invalidate_overlap(&state, sref->sym, sref->addend, store_btype_chk);
+            gstore_invalidate_overlap(st, sref->sym, sref->addend, store_btype_chk);
           } else if (q->op == TCCIR_OP_STORE_INDEXED) {
             /* Runtime index touches an unknown offset within sym. Drop all
              * entries for this sym. */
-            gstore_remove_sym(&state, sref->sym);
+            gstore_remove_sym(st, sref->sym);
           }
         }
       } else {
-        state.count = 0;
-        state.scount = 0;
-        state.gscount = 0;
-        state.tvcount = 0;
+        st->count = 0;
+        st->scount = 0;
+        st->gscount = 0;
+        st->tvcount = 0;
       }
       continue;
     }
@@ -855,17 +885,17 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState state, int b)
         q->op != TCCIR_OP_STORE_INDEXED && q->op != TCCIR_OP_STORE_POSTINC) {
       IROperand qdest = tcc_ir_op_get_dest(ir, q);
       if (qdest.tag == IROP_TAG_STACKOFF && qdest.is_local)
-        sstore_remove_offset(&state, irop_get_stack_offset(qdest));
+        sstore_remove_offset(st, irop_get_stack_offset(qdest));
       int32_t qdvr = irop_get_vreg(qdest);
       if (qdvr >= 0 && TCCIR_DECODE_VREG_TYPE(qdvr) == TCCIR_VREG_TYPE_VAR &&
           qdest.tag != IROP_TAG_STACKOFF)
-        state.scount = 0;
+        st->scount = 0;
       if (qdvr >= 0) {
-        gload_remove_vr(&state, qdvr);
-        sstore_remove_vr(&state, qdvr);
-        gstore_remove_vr(&state, qdvr);
-        tvstore_remove_vr(&state, qdvr);
-        iload_remove_vr(&state, qdvr);
+        gload_remove_vr(st, qdvr);
+        sstore_remove_vr(st, qdvr);
+        gstore_remove_vr(st, qdvr);
+        tvstore_remove_vr(st, qdvr);
+        iload_remove_vr(st, qdvr);
       }
     }
 
@@ -929,9 +959,9 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState state, int b)
       if (!ctx->no_stack_fwd) {
         int eff_off = ssa_opt_indirect_stack_offset(ctx, q, SSA_OPT_INDIRECT_SRC1);
         if (eff_off != INT_MIN) {
-          int sk = sstore_find(&state, eff_off);
-          if (sk >= 0 && state.sstores[sk].btype == il_btype) {
-            SStoreEntry *se = &state.sstores[sk];
+          int sk = sstore_find(st, eff_off);
+          if (sk >= 0 && st->sstores[sk].btype == il_btype) {
+            SStoreEntry *se = &st->sstores[sk];
             IROperand new_src;
             if (se->stored_vr >= 0) {
               new_src = irop_make_vreg(se->stored_vr, il_btype);
@@ -953,9 +983,9 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState state, int b)
         }
       }
 
-      int found = iload_find(&state, il_base_vr, il_idx, il_scale, il_btype);
+      int found = iload_find(st, il_base_vr, il_idx, il_scale, il_btype);
       if (found >= 0) {
-        int32_t earlier_vr = state.iloads[found].result_vr;
+        int32_t earlier_vr = st->iloads[found].result_vr;
         IROperand new_src = irop_make_vreg(earlier_vr, il_btype);
 
         IRSSAVregInfo *rvi = ssa_opt_vinfo(ctx, earlier_vr);
@@ -970,11 +1000,11 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState state, int b)
         tcc_ir_set_src1(ir, i, new_src);
         tcc_ir_set_src2(ir, i, IROP_NONE);
         /* Track this load's dest so subsequent matching loads keep CSE'ing. */
-        iload_track(&state, il_base_vr, il_idx, il_scale, il_btype, il_dest_vr);
+        iload_track(st, il_base_vr, il_idx, il_scale, il_btype, il_dest_vr);
         changes++;
         continue;
       }
-      iload_track(&state, il_base_vr, il_idx, il_scale, il_btype, il_dest_vr);
+      iload_track(st, il_base_vr, il_idx, il_scale, il_btype, il_dest_vr);
       continue;
     }
 
@@ -994,9 +1024,9 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState state, int b)
         src1.tag == IROP_TAG_VREG) {
       int32_t ptr_vr_l = irop_get_vreg(src1);
       if (ptr_vr_l >= 0 && TCCIR_DECODE_VREG_TYPE(ptr_vr_l) == TCCIR_VREG_TYPE_TEMP) {
-        int tk = tvstore_find(&state, ptr_vr_l, dest_btype);
+        int tk = tvstore_find(st, ptr_vr_l, dest_btype);
         if (tk >= 0) {
-          TVStoreEntry *te = &state.tvstores[tk];
+          TVStoreEntry *te = &st->tvstores[tk];
           IROperand new_src;
           if (te->stored_vr >= 0) {
             new_src = irop_make_vreg(te->stored_vr, dest_btype);
@@ -1058,9 +1088,9 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState state, int b)
         int32_t canon_base = -1, canon_off = 0;
         if (ssa_opt_resolve_temp_to_base_off(ctx, ptr_vr, &canon_base, &canon_off) &&
             canon_base >= 0) {
-          int found = iload_find(&state, canon_base, canon_off, 0, dest_btype);
+          int found = iload_find(st, canon_base, canon_off, 0, dest_btype);
           if (found >= 0) {
-            int32_t earlier_vr = state.iloads[found].result_vr;
+            int32_t earlier_vr = st->iloads[found].result_vr;
             IROperand new_src = irop_make_vreg(earlier_vr, dest_btype);
             IRSSAVregInfo *rvi = ssa_opt_vinfo(ctx, earlier_vr);
             if (rvi)
@@ -1071,11 +1101,11 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState state, int b)
             q->op = TCCIR_OP_ASSIGN;
             tcc_ir_set_src1(ir, i, new_src);
             tcc_ir_set_src2(ir, i, IROP_NONE);
-            iload_track(&state, canon_base, canon_off, 0, dest_btype, dest_vr);
+            iload_track(st, canon_base, canon_off, 0, dest_btype, dest_vr);
             changes++;
             continue;
           }
-          iload_track(&state, canon_base, canon_off, 0, dest_btype, dest_vr);
+          iload_track(st, canon_base, canon_off, 0, dest_btype, dest_vr);
         }
       }
     }
@@ -1101,9 +1131,9 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState state, int b)
       }
 
       if (stack_off != INT_MIN) {
-        int sk = sstore_find(&state, stack_off);
+        int sk = sstore_find(st, stack_off);
         if (sk >= 0) {
-          SStoreEntry *se = &state.sstores[sk];
+          SStoreEntry *se = &st->sstores[sk];
           if (se->btype != dest_btype)
             continue;
           IROperand new_src;
@@ -1115,6 +1145,18 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState state, int b)
           } else {
             new_src = se->stored_imm;
           }
+          /* Drop this LOAD's use of its old base pointer: the deref source is
+           * being replaced by the forwarded value, so the base vreg is no
+           * longer referenced here.  Omitting this (unlike every sibling
+           * forwarding path above) leaves a stale use entry that corrupts the
+           * base's use-list — a later swap-remove then drops the wrong entry
+           * (e.g. a still-live STORE-through-base address use), so a
+           * subsequent copy-prop fails to rewrite that store's address and it
+           * dereferences an undefined spill slot (95_bitfields TEST2 PACKED
+           * RMW store at -O1). */
+          IRSSAVregInfo *pvi = ssa_opt_vinfo(ctx, irop_get_vreg(src1));
+          if (pvi)
+            ssa_opt_remove_use_instr(pvi, i);
           q->op = TCCIR_OP_ASSIGN;
           tcc_ir_set_src1(ir, i, new_src);
           tcc_ir_set_src2(ir, i, IROP_NONE);
@@ -1137,9 +1179,9 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState state, int b)
     /* Store-to-load forwarding: prefer a tracked store value over an
      * earlier load, since forwarding eliminates the LOAD entirely and
      * the stored value (often an immediate) constant-folds further. */
-    int gstore_k = gstore_find(&state, ref->sym, ref->addend, dest_btype);
+    int gstore_k = gstore_find(st, ref->sym, ref->addend, dest_btype);
     if (gstore_k >= 0) {
-      GStoreEntry *ge = &state.gstores[gstore_k];
+      GStoreEntry *ge = &st->gstores[gstore_k];
       IROperand new_src;
       if (ge->stored_vr >= 0) {
         new_src = irop_make_vreg(ge->stored_vr, dest_btype);
@@ -1154,15 +1196,15 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState state, int b)
       tcc_ir_set_src2(ir, i, IROP_NONE);
       /* Track this load's dest as a fresh GLoad CSE entry so subsequent
        * non-aliased LOADs from the same address keep CSE'ing. */
-      gload_track(&state, ref->sym, ref->addend, dest_btype, dest_vr);
+      gload_track(st, ref->sym, ref->addend, dest_btype, dest_vr);
       changes++;
       continue;
     }
 
-    int found = gload_find(&state, ref->sym, ref->addend, dest_btype);
+    int found = gload_find(st, ref->sym, ref->addend, dest_btype);
 
     if (found >= 0) {
-      int32_t earlier_vr = state.entries[found].result_vr;
+      int32_t earlier_vr = st->entries[found].result_vr;
       IROperand new_src = irop_make_vreg(earlier_vr, dest_btype);
 
       IRSSAVregInfo *rvi = ssa_opt_vinfo(ctx, earlier_vr);
@@ -1174,13 +1216,55 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState state, int b)
       tcc_ir_set_src2(ir, i, IROP_NONE);
       changes++;
     } else {
-      gload_track(&state, ref->sym, ref->addend, dest_btype, dest_vr);
+      gload_track(st, ref->sym, ref->addend, dest_btype, dest_vr);
     }
   }
 
-  for (int ci = 0; ci < bb->num_dom_children; ci++)
-    changes += gload_process_block(ctx, state, bb->dom_children[ci]);
+  /* Walk the dominator children.  Each child must start from the forwarding
+   * state as it stands at the END of this block.
+   *
+   * Two stack-frugality measures keep this off the device's 32 KB process
+   * stack on deeply nested functions:
+   *   1. `st` is passed by POINTER, not by value — the GLoadState is ~2.6 KB,
+   *      and a by-value parameter multiplied by the dominator-tree depth blew
+   *      the stack (USAGE-STKOF in this function's prologue).
+   *   2. A single-child block is iterated, not recursed: the child inherits
+   *      this block's exact end state with no sibling to preserve, so we just
+   *      advance `b` and loop.  That collapses long straight-line dominator
+   *      chains (the common deep case) to O(1) stack; recursion depth is then
+   *      only the branch-nesting depth.
+   * For genuine multi-way branches, children mutate `*st` in place, so we
+   * snapshot/restore around every child except the last; the snapshot lives on
+   * the heap, not this recursion frame. */
+  if (bb->num_dom_children == 1) {
+    b = bb->dom_children[0];
+    continue;
+  }
+  if (bb->num_dom_children == 0)
+    break;
+  /* Multi-way: continue with child[0] on the live state, and push every
+   * other child with its own heap snapshot of this block's end state.
+   * Sibling subtrees are independent given the start state, so the DFS
+   * order among them does not matter. */
+  for (int ci = 1; ci < bb->num_dom_children; ci++) {
+    if (sp == cap) {
+      cap *= 2;
+      work = tcc_realloc(work, sizeof *work * cap);
+    }
+    GLoadState *snap = tcc_malloc(sizeof *snap);
+    *snap = *st;
+    work[sp].block = bb->dom_children[ci];
+    work[sp].state = snap;
+    sp++;
+  }
+  b = bb->dom_children[0];
+  continue;
+  } /* for (;;) */
 
+    tcc_free(st);
+  } /* while (sp > 0) */
+
+  tcc_free(work);
   return changes;
 }
 
@@ -1196,5 +1280,5 @@ int ssa_opt_load_cse(IRSSAOptCtx *ctx)
   initial.gscount = 0;
   initial.tvcount = 0;
   initial.ilcount = 0;
-  return gload_process_block(ctx, initial, 0);
+  return gload_process_block(ctx, &initial, 0);
 }

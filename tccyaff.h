@@ -44,6 +44,20 @@ typedef struct __attribute__((packed)) YaffHeader {
   uint16_t exported_symbols_lookup_offset;
   uint16_t imported_symbols_hash_table_offset;
   uint16_t exported_symbols_hash_table_offset;
+  /* Per-image stack/heap profile in bytes. 0xFFFFFFFF = use the OS default
+   * (kernel-driven stack size; heap free to grow in the shared paged pool).
+   * A concrete value lets a program declare its footprint (e.g. shell applets
+   * want far less stack than the 32 KiB default that tcc needs) so the kernel
+   * can bound the process to fixed limits — the basis for MPU-guarded,
+   * profile-limited processes. */
+  uint32_t stack_size;
+  uint32_t heap_size;
+  /* RELRO: size in bytes of the pure-const .rodata sub-region that lives in the
+   * SHARED/XIP image (after plt) instead of the per-process writable data
+   * segment. 0 = no shared rodata (all rodata stays per-process, legacy
+   * behaviour). When >0, the loader maps it once (XIP, ref-counted) and code
+   * reaches it via the rodata anchor GOT slot + R_ARM_RODATA_OFF offsets. */
+  uint32_t const_rodata_length;
 } YaffHeader;
 
 typedef enum YaffSectionCode {
@@ -51,6 +65,8 @@ typedef enum YaffSectionCode {
   YAFF_SECTION_DATA = 1,
   YAFF_SECTION_INIT = 2,
   YAFF_SECTION_UNKNOWN = 3,
+  YAFF_SECTION_BSS = 4,    /* matches loader Section.Bss (writer maps bss->data) */
+  YAFF_SECTION_RODATA = 5, /* RELRO: shared XIP .rodata. Needs the 3-bit field. */
 } YaffSectionCode;
 
 typedef struct __attribute__((packed)) YaffSymbolTableRelocationEntry {

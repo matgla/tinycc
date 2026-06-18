@@ -23,19 +23,12 @@ typedef union { long long __ll; long double __ld; } max_align_t;
 void *alloca(size_t size);
 #endif
 
-#endif
-
-/* Older glibc require a wint_t from <stddef.h> (when requested
-   by __need_wint_t, as otherwise stddef.h isn't allowed to
-   define this type).   Note that this must be outside the normal
-   _STDDEF_H guard, so that it works even when we've included the file
-   already (without requiring wint_t).  Some other libs define _WINT_T
-   if they've already provided that type, so we can use that as guard.
-   TCC defines __WINT_TYPE__ for us.  */
-#if defined (__need_wint_t)
-#ifndef _WINT_T
-#define _WINT_T
-typedef __WINT_TYPE__ wint_t;
-#endif
-#undef __need_wint_t
+/* NOTE: nothing must follow the guard's #endif below -- it has to be the last
+   token before EOF so tcc's multiple-include optimization records _STDDEF_H
+   and skips re-reading this header.  Upstream tcc kept a wint_t typedef
+   OUTSIDE the guard (gated behind __need_wint_t) for legacy glibc
+   partial-includes; that trailing content defeated the optimization and forced
+   a full re-read + re-tokenize on every #include (3x for one stdio.h compile).
+   YASOS never defines __need_wint_t, and wint_t is not a stddef.h type per C
+   anyway -- libc's <wchar.h> owns it -- so the block is dropped. */
 #endif

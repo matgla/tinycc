@@ -431,14 +431,21 @@ static int try_first_iter_exit(TCCIRState *ir, IRLoop *loop)
   LOG_LOOP_OPT("first_iter_exit: header=%d test@%d jumpif@%d exit=%d",
                loop->header_idx, test_idx, jumpif_idx, exit_target);
 
-  LdState st;
-  memset(&st, 0, sizeof(st));
-  if (!ld_walk_linear_to(ir, &st, jumpif_idx)) {
+  /* LdState is ~18 KB (var_state[256] + tmp_state[512], 24 B each).  A stack
+   * local here overflows the 32 KB target process stack when this loop pass is
+   * reached deep in the gen_function call chain (STKOF on -O1 compiles of
+   * functions containing loops).  Heap-allocate it; it is dead after the
+   * branch evaluation below, so free it before the rewrite work. */
+  LdState *st = tcc_malloc(sizeof(*st));
+  memset(st, 0, sizeof(*st));
+  int ok = ld_walk_linear_to(ir, st, jumpif_idx);
+  int taken = ok ? ld_eval_branch(ir, st, test_idx, jumpif_idx) : -1;
+  tcc_free(st);
+  if (!ok) {
     LOG_LOOP_OPT("first_iter_exit: bail (non-straight-line path before jumpif)");
     return 0;
   }
 
-  int taken = ld_eval_branch(ir, &st, test_idx, jumpif_idx);
   if (taken != 1) {
     LOG_LOOP_OPT("first_iter_exit: branch outcome=%d (need 1=taken)", taken);
     return 0;

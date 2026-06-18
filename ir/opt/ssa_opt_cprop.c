@@ -47,6 +47,15 @@ static int ssa_gen_cprop_assign(IRSSAOptCtx *ctx, int idx)
   if (TCCIR_DECODE_VREG_TYPE(src_vr) != TCCIR_VREG_TYPE_TEMP)
     return 0;
 
+  /* Width gate: an ASSIGN whose dest and src differ in btype is NOT a pure
+   * copy — it is a width conversion.  A 32-bit src into a 64-bit dest zero/
+   * sign-fills the high word; forwarding src into the dest's 64-bit uses drops
+   * that extension, so a later 64-bit consumer (e.g. an OR chain reconstructing
+   * a packed >32-bit bitfield from a folded SAR/SHL/OR sign-extend idiom) reads
+   * a garbage high half.  Same gate as ssa_gen_cprop_copy_param below. */
+  if (irop_get_btype(dest) != irop_get_btype(src))
+    return 0;
+
   IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, dest_vr);
   if (vi && vi->def_count > 1)
     return 0;

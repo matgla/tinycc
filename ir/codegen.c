@@ -927,6 +927,16 @@ static void tcc_ir_codegen_inline_asm_by_id(TCCIRState *ir, int id)
      * allocatable "r" registers in IR mode. */
     for (int i = 0; i < nb_operands; ++i)
     {
+      /* For an lvalue operand such as "+r"(*p), pr0_reg holds the ADDRESS of
+       * the value (the pointer), not the value itself.  That pointer is read
+       * both by the prolog load (ldr op->reg,[ptr]) and the epilog store
+       * (str op->reg,[ptr]), so it must survive across the asm body.  If we
+       * un-reserved it, the constraint solver could pick the same register
+       * for op->reg, and the prolog load would clobber the pointer before the
+       * store ran.  Keep lvalue-operand registers reserved so the value gets a
+       * distinct register. */
+      if (vals[i].r & VT_LVAL)
+        continue;
       if (!vals[i].pr0_spilled && vals[i].pr0_reg != PREG_REG_NONE && vals[i].pr0_reg < NB_ASM_REGS)
         reserved_regs[vals[i].pr0_reg] = 0;
       if (!vals[i].pr1_spilled && vals[i].pr1_reg != PREG_REG_NONE && vals[i].pr1_reg < NB_ASM_REGS)
@@ -3723,18 +3733,30 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
               found2++;
             }
 
-            if (found2 == 4 && a.dest.kind == MACH_OP_REG && !a.dest.needs_deref)
+            if (found2 == 4)
             {
-              int strd_ok = 0;
-              int base_reg = a.dest.u.reg.r0;
-              int32_t word_off = base_off;
-              SCRATCH_WRAP(strd_ok = tcc_gen_machine_try_strd_imm_base(
-                  (int64_t)(int32_t)combined, (int64_t)(int32_t)combined2, base_reg, word_off));
-              if (strd_ok)
-              {
-                i = last_i2;
-                break;
-              }
+              /* All 8 bytes coalesced.  Emit TWO 32-bit STRs, NOT an STRD:
+               * these stores originate from INT8 writes, so the destination
+               * has byte (1) alignment — e.g. zero-initialising an element of
+               * an array of 9-byte structs, where the base register holds
+               * `arr + i*9` and is unaligned for odd i.  On ARMv7-M/v8-M a
+               * single STR tolerates an unaligned address (CCR.UNALIGN_TRP=0
+               * by default) but STRD/LDRD ALWAYS fault when unaligned, so
+               * pairing into STRD off a register base (try_unroll_loop_ex's
+               * struct-array zero-init miscompiled this way) is unsafe. */
+              MachineOperand wv1 = a.src1;
+              wv1.btype = IROP_BTYPE_INT32;
+              wv1.u.imm.val = (int64_t)(int32_t)combined;
+              SCRATCH_WRAP(tcc_gen_machine_store_indexed_mop(a.dest, a.src2, a.scale, wv1, cq->op));
+
+              MachineOperand off2 = a.src2;
+              off2.u.imm.val = base_off + 4;
+              MachineOperand wv2 = a.src1;
+              wv2.btype = IROP_BTYPE_INT32;
+              wv2.u.imm.val = (int64_t)(int32_t)combined2;
+              SCRATCH_WRAP(tcc_gen_machine_store_indexed_mop(a.dest, off2, a.scale, wv2, cq->op));
+              i = last_i2;
+              break;
             }
 
             MachineOperand word_val = a.src1;

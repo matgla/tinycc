@@ -2250,6 +2250,16 @@ int tcc_ir_opt_zero_vla_elim(TCCIRState *ir)
             (irop_get_tag(s2) == IROP_TAG_STACKOFF &&
              irop_get_stack_offset(s2) == slot))
           other_reader = 1;
+        /* MLA's accumulator (4th operand) is a source not surfaced by the
+         * src1/src2 helpers — a VLA base read only as an MLA addend would
+         * otherwise look unused, so we'd wrongly NOP its capturing SP_SAVE. */
+        if (qj->op == TCCIR_OP_MLA)
+        {
+          IROperand acc = tcc_ir_op_get_accum(ir, qj);
+          if (irop_get_tag(acc) == IROP_TAG_STACKOFF &&
+              irop_get_stack_offset(acc) == slot)
+            other_reader = 1;
+        }
         if (irop_get_tag(d) == IROP_TAG_STACKOFF &&
             irop_get_stack_offset(d) == slot)
           other_writer = 1;
@@ -5729,6 +5739,36 @@ int tcc_ir_opt_dead_loop_elim(TCCIRState *ir)
     if (side_entry)
       continue;
 
+    /* Early-exit veto.  The body scan above ignores branches (JUMP/JUMPIF are
+     * skipped) and the elimination NOPs the ENTIRE body, so any data-dependent
+     * control flow beyond the loop's single trip-count test is silently
+     * dropped.  A decrement-and-branch helper inlined at a constant arg —
+     *   for (i=0;i<10;i++) if (--a==-1) return i;   (gcc.c-torture dbra-1)
+     * exits early carrying an iteration-dependent result (i); NOPing the body
+     * deletes that exit and the call wrongly folds to the fall-through value.
+     * A genuinely-dead loop has exactly one exit (its trip test = one JUMPIF
+     * targeting outside, or a bottom-test JUMPIF back to the header with a
+     * fall-through exit).  Bail when the body has a second conditional branch
+     * or an unconditional break/return out of the loop.  Keeping the loop is
+     * always sound; only an optimization is missed. */
+    {
+      int body_jumpif = 0, body_break = 0;
+      for (int idx = loop->start_idx; idx <= loop->end_idx && idx < n; idx++)
+      {
+        IRQuadCompact *q = &ir->compact_instructions[idx];
+        if (q->op == TCCIR_OP_JUMPIF)
+          body_jumpif++;
+        else if (q->op == TCCIR_OP_JUMP)
+        {
+          int t = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+          if ((t < loop->start_idx || t > loop->end_idx) && t != loop->header_idx)
+            body_break++;
+        }
+      }
+      if (body_jumpif > 1 || body_break > 0)
+        continue;
+    }
+
     /* The loop body only contains constant VAR assignments, counter updates,
      * and/or self-stores (`*p = *p`).  NOP all body instructions and place
      * any constant assignments in the preheader. */
@@ -7701,6 +7741,37 @@ int tcc_ir_opt_const_return_uninit_elide(TCCIRState *ir)
     }
     default:
       break;
+    }
+
+    /* A write to a local stack slot is not exclusive to STORE ops: any
+     * instruction whose destination operand is an lval local STACKOFF
+     * materialises a value into that slot (e.g. a LOAD that lowers a
+     * constant directly into the get_temp_local_var slot used by the
+     * __builtin_signbit lowering — `?tmp <-- #const [LOAD]`).  Such a write
+     * initialises the slot exactly as a STORE would, so a later lval read of
+     * the same offset is well-defined.  Record these offsets too, otherwise
+     * the read is misclassified as an uninitialised-local UB read and the
+     * whole function is wrongly collapsed to `return const`. */
+    if (irop_config[q->op].has_dest)
+    {
+      IROperand wdop = tcc_ir_op_get_dest(ir, q);
+      if (irop_get_tag(wdop) == IROP_TAG_STACKOFF && wdop.is_lval && wdop.is_local && !wdop.is_param)
+      {
+        int woff = (int)irop_get_stack_offset(wdop);
+        int already = 0;
+        for (int j = 0; j < n_store_offsets; j++)
+          if (store_offsets[j] == woff)
+          {
+            already = 1;
+            break;
+          }
+        if (!already)
+        {
+          if (n_store_offsets >= CRUE_MAX_STORE_OFFSETS)
+            return 0;
+          store_offsets[n_store_offsets++] = woff;
+        }
+      }
     }
 
     /* Scan all operands: bail on Addr[StackLoc] (stack address escapes —

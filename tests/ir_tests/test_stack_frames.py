@@ -35,10 +35,10 @@ FRAME_BUDGETS = {
     "unary_builtin_overflow":    950,  # extracted: add/sub/mul_overflow (increased: auto-inline inlines helpers)
     "decl":                     1400,  # was 1040, increased by auto-inline candidate tracking locals
     "block":                    1500,  # was 632  — recursive (nested blocks), increased by auto-inline
-    "decl_initializer_alloc":    550,
+    "decl_initializer_alloc":    780,  # was 550; +RELRO type_contains_pointer path + auto-inline (non-recursive, one-shot frame)
     "tcc_preprocess":            550,
     "expr_cond":                 450,  # recursive (ternary chains)
-    "decl_initializer":          450,
+    "decl_initializer":          510,  # was 450; self-host codegen drift (body unchanged), recursive — kept tight
     "next_nomacro":              350,  # called O(tokens); low frame matters
     "parse_btype":               350,
     "next":                      100,

@@ -182,12 +182,41 @@ static int gvn_param_is_stable(int32_t vreg)
   return !(param_mutated[pos / 8] & (1u << (pos % 8)));
 }
 
-static int gvn_process_block(IRSSAOptCtx *ctx, IRCFG *cfg, GVNEntry **table, int b)
+/* Worklist item for the iterative dominator-tree walk below.  kind==0 is a
+ * block to process; kind==1 is a deferred "restore the GVN scope to this undo
+ * watermark", scheduled to run after the block's whole subtree completes. */
+typedef struct GVNWork {
+  int kind;
+  int value;
+} GVNWork;
+
+static int gvn_process_block(IRSSAOptCtx *ctx, IRCFG *cfg, GVNEntry **table, int b_root)
 {
   TCCIRState *ir = ctx->ir;
-  IRBasicBlock *bb = &cfg->blocks[b];
   int changes = 0;
-  int saved_undo = undo_count;
+
+  /* Iterative DFS with a heap worklist instead of native recursion.  The
+   * recursion was once-per-dominator-child deep, so functions with deep
+   * branch nesting (one `if` per source statement) overflowed the 32 KB
+   * target process stack.  The scoped-availability semantics are preserved
+   * by pushing a POP marker (kind==1) before a block's children: it sits
+   * below them on the stack and so runs only after the entire subtree, just
+   * like the post-recursion gvn_scope_pop_to(saved_undo) it replaces. */
+  GVNWork *stack = tcc_malloc(sizeof *stack * 16);
+  int sp = 0, cap = 16;
+  stack[sp].kind = 0;
+  stack[sp].value = b_root;
+  sp++;
+
+  while (sp > 0) {
+    sp--;
+    if (stack[sp].kind == 1) {
+      gvn_scope_pop_to(stack[sp].value);
+      continue;
+    }
+    int b = stack[sp].value;
+    IRBasicBlock *bb = &cfg->blocks[b];
+    int saved_undo = undo_count;
 
   for (int i = bb->start_idx; i < bb->end_idx; i++) {
     IRQuadCompact *q = &ir->compact_instructions[i];
@@ -355,14 +384,26 @@ static int gvn_process_block(IRSSAOptCtx *ctx, IRCFG *cfg, GVNEntry **table, int
     gvn_scope_push(table, e);
   }
 
-  /* Recurse into dominator-tree children — entries from this block
-   * remain visible (the dominator guarantees availability). */
-  for (int ci = 0; ci < bb->num_dom_children; ci++)
-    changes += gvn_process_block(ctx, cfg, table, bb->dom_children[ci]);
+    /* Schedule the hash-table restore for after this block's subtree, then
+     * push the dominator-tree children above it.  Entries from this block
+     * remain visible to its children (the dominator guarantees availability);
+     * sibling subtrees are independent, so DFS order among them is irrelevant. */
+    if (sp + 1 + bb->num_dom_children > cap) {
+      while (sp + 1 + bb->num_dom_children > cap)
+        cap *= 2;
+      stack = tcc_realloc(stack, sizeof *stack * cap);
+    }
+    stack[sp].kind = 1;
+    stack[sp].value = saved_undo;
+    sp++;
+    for (int ci = 0; ci < bb->num_dom_children; ci++) {
+      stack[sp].kind = 0;
+      stack[sp].value = bb->dom_children[ci];
+      sp++;
+    }
+  } /* while (sp > 0) */
 
-  /* Restore hash table to state before this block */
-  gvn_scope_pop_to(saved_undo);
-
+  tcc_free(stack);
   return changes;
 }
 

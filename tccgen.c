@@ -1426,19 +1426,23 @@ ST_FUNC Sym *sym_find2(Sym *s, int v)
 /* structure lookup */
 ST_INLN Sym *struct_find(int v)
 {
+  TokenSym *ts;
   v -= TOK_IDENT;
   if ((unsigned)v >= (unsigned)(tok_ident - TOK_IDENT))
     return NULL;
-  return table_ident[v]->sym_struct;
+  ts = table_ident[v]; /* NULL = lazy builtin, never used as a struct tag */
+  return ts ? ts->sym_struct : NULL;
 }
 
 /* find an identifier */
 ST_INLN Sym *sym_find(int v)
 {
+  TokenSym *ts;
   v -= TOK_IDENT;
   if ((unsigned)v >= (unsigned)(tok_ident - TOK_IDENT))
     return NULL;
-  return table_ident[v]->sym_identifier;
+  ts = table_ident[v]; /* NULL = lazy builtin, never declared as an identifier */
+  return ts ? ts->sym_identifier : NULL;
 }
 
 static int sym_scope(Sym *s)
@@ -1567,8 +1571,9 @@ ST_FUNC Sym *sym_push(int v, CType *type, int r, int c)
   /* XXX: simplify */
   if (!(v & SYM_FIELD) && (v & ~SYM_STRUCT) < SYM_FIRST_ANOM)
   {
-    /* record symbol in token array */
-    ts = table_ident[(v & ~SYM_STRUCT) - TOK_IDENT];
+    /* record symbol in token array (materialize a lazy builtin slot if the
+       symbol's name is a builtin token referenced by fixed id) */
+    ts = tok_ensure(v & ~SYM_STRUCT);
     if (v & SYM_STRUCT)
       ps = &ts->sym_struct;
     else
@@ -1591,7 +1596,7 @@ ST_FUNC Sym *global_identifier_push(int v, int t, int c)
   /* don't record anonymous symbol */
   if (v < SYM_FIRST_ANOM)
   {
-    ps = &table_ident[v - TOK_IDENT]->sym_identifier;
+    ps = &tok_ensure(v)->sym_identifier;
     /* modify the top most local identifier, so that sym_identifier will
        point to 's' when popped; happens when called from inline asm */
     while (*ps != NULL && (*ps)->sym_scope)
@@ -1648,10 +1653,12 @@ ST_FUNC void sym_pop(Sym **ptop, Sym *b, int keep)
 /* label lookup */
 ST_FUNC Sym *label_find(int v)
 {
+  TokenSym *ts;
   v -= TOK_IDENT;
   if ((unsigned)v >= (unsigned)(tok_ident - TOK_IDENT))
     return NULL;
-  return table_ident[v]->sym_label;
+  ts = table_ident[v]; /* NULL = lazy builtin, never used as a label */
+  return ts ? ts->sym_label : NULL;
 }
 
 ST_FUNC Sym *label_push(Sym **ptop, int v, int flags)
@@ -16966,6 +16973,15 @@ va_arg_pack_done:
          * where bar takes void).  Use nb_real_args to exclude the implicit sret
          * pointer that struct-returning calls add to nb_args. */
         auto_inline_param_count(call_func_sym) == (nb_args - nb_implicit_args) &&
+        /* Budget: a "call-heavy" auto-inline body (one whose optimized IR
+         * still contains a non-foldable call, e.g. a printf wrapper) buys no
+         * savings when duplicated — it just multiplies the surviving call.
+         * Cap how many times such a callee is expanded; beyond the budget,
+         * fall back to a normal call.  Without this, a small helper invoked
+         * dozens of times by macro expansion (check() in 55_lshift_type at
+         * -O2) blows up compiler memory ("memory full"). */
+        !(call_func_sym->type.ref->f.func_inline_call_heavy &&
+          inline_fn->inline_count >= 8) &&
         ((call_func_sym->type.ref->type.t & VT_BTYPE) == VT_VOID || inline_body_has_return_stmt(inline_fn->func_str)))
     {
       /* Safety: if the current outer macro stream is already reading from this
@@ -16988,6 +17004,8 @@ va_arg_pack_done:
                           call_func_sym->type.ref ? (call_func_sym->type.ref->type.t & VT_BTYPE) : -1, nb_args,
                           nb_implicit_args);
         force_always_inline = 1;
+        if (call_func_sym->type.ref->f.func_inline_call_heavy)
+          inline_fn->inline_count++;
       }
       else if (TCC_LOG_INLINE_STRUCT)
       {
@@ -26092,8 +26110,14 @@ static void skip_or_save_block(TokenString **str)
 {
   int braces = tok == '{';
   int level = 0;
+  /* While recording (str != NULL), redirect #pragma pack directives consumed by
+     next() into the saved stream as deferred TOK_PACK_REPLAY actions rather than
+     letting them mutate pack_stack now — the body's structs are laid out later
+     during replay, so the pack state must travel with the tokens. */
+  TokenString *saved_capture = pp_pragma_capture;
   if (str)
     *str = tok_str_alloc();
+  pp_pragma_capture = str ? *str : saved_capture;
 
   while (1)
   {
@@ -26103,7 +26127,10 @@ static void skip_or_save_block(TokenString **str)
     if (t == TOK_EOF)
     {
       if (str || level > 0)
+      {
+        pp_pragma_capture = saved_capture;
         tcc_error("unexpected end of file");
+      }
       else
         break;
     }
@@ -26121,6 +26148,7 @@ static void skip_or_save_block(TokenString **str)
         break;
     }
   }
+  pp_pragma_capture = saved_capture;
   if (str)
     tok_str_add(*str, TOK_EOF);
 }
@@ -27274,6 +27302,46 @@ static void decl_initializer(init_params *p, CType *type, unsigned long c, int f
     }
 }
 
+/* RELRO support (-share-rodata): a const object can only acquire a relocation
+   (and therefore must stay in the per-process writable data segment rather than
+   the shared, read-only .rodata) if its initializer stores an address — which
+   requires a pointer somewhere in its type. Returns 1 if 'type' contains a
+   pointer, recursing through array element types and struct/union members.
+   Sound: every relocation into a const object originates from a pointer-typed
+   sub-object, so a type with no pointer can never be relocated.
+   Written with explicit branches (no folded ternaries) — this code runs under
+   the armv8m self-host, which has historically miscompiled compact forms. */
+static int type_contains_pointer(CType *type)
+{
+  CType *tp = type;
+  int bt;
+  /* Strip array dimensions: an array is VT_BTYPE==VT_PTR with VT_ARRAY set;
+     its element type is reached through ref->type. */
+  while ((tp->t & VT_ARRAY) && (tp->t & VT_BTYPE) == VT_PTR)
+  {
+    tp = &tp->ref->type;
+  }
+  bt = tp->t & VT_BTYPE;
+  if (bt == VT_PTR)
+  {
+    /* A real pointer (arrays were stripped above). */
+    return 1;
+  }
+  if (bt == VT_STRUCT)
+  {
+    Sym *f;
+    for (f = tp->ref->next; f; f = f->next)
+    {
+      if (type_contains_pointer(&f->type))
+      {
+        return 1;
+      }
+    }
+    return 0;
+  }
+  return 0;
+}
+
 /* parse an initializer for type 't' if 'has_init' is non zero, and
    allocate space in local or global data space ('r' is either
    VT_LOCAL or VT_CONST). If 'v' is non zero, then an associated
@@ -27547,7 +27615,18 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has
         tp = &tp->ref->type;
       if (tp->t & VT_CONSTANT)
       {
-        sec = rodata_section;
+        /* RELRO: with -share-rodata, a const object whose type contains a
+           pointer can hold a relocation, so it must live in the writable
+           per-process data segment (GOTOFF-addressed, like .data) — leaving
+           .rodata pure-const and shareable read-only across processes. */
+        if (tcc_state->share_rodata && type_contains_pointer(type))
+        {
+          sec = data_section;
+        }
+        else
+        {
+          sec = rodata_section;
+        }
       }
       else if (has_init)
       {
@@ -28462,6 +28541,7 @@ static void prescan_captured_vars(NestedFunc *nf, Sym *parent_local_stack, Neste
       switch (tv)
       {
       case TOK_CINT: case TOK_CCHAR: case TOK_LCHAR: case TOK_LINENUM:
+      case TOK_PACK_REPLAY:
       case TOK_CUINT: case TOK_CFLOAT: case TOK_CFLOAT_I: case TOK_CINT_I:
 #if LONG_SIZE == 4
       case TOK_CLONG: case TOK_CULONG:
@@ -28742,6 +28822,7 @@ static void prescan_token_buf_for_captures(NestedFunc *nf, const int *p, Sym *pa
     case TOK_CCHAR:
     case TOK_LCHAR:
     case TOK_LINENUM:
+    case TOK_PACK_REPLAY:
     case TOK_CUINT:
     case TOK_CFLOAT:
     case TOK_CFLOAT_I:
@@ -30646,6 +30727,51 @@ static void gen_function(Sym *sym)
   if (tcc_state->optimize < 1 && tcc_state->registers_for_allocator > 12)
     tcc_state->registers_for_allocator = 12;
 
+  /* setjmp clobber semantics: __builtin_setjmp / longjmp save and restore the
+   * callee-saved register file (r4-r11).  A longjmp therefore reverts any
+   * local variable kept in a callee-saved register to its value at the setjmp
+   * call — wrong for a variable MODIFIED between setjmp and longjmp and read
+   * after the longjmp-return (gcc.c-torture pr60003).  GCC keeps such locals in
+   * memory (which longjmp does not touch); the C standard likewise only
+   * guarantees the post-longjmp value of `volatile` automatic objects.
+   *
+   * Force every VAR vreg in a function that performs a setjmp to be
+   * memory-resident (addrtaken) so each write store-throughs and each read
+   * reloads.  Done here — after all optimization, just before regalloc — so
+   * the addrtaken-clearing opt passes (refresh_stale_var_addrtaken et al.) have
+   * already run and cannot strip the flag.  Conservative (all VARs, not just
+   * those live across the setjmp) but setjmp functions are rare. */
+  {
+    int has_setjmp = 0;
+    for (int i = 0; i < ir->next_instruction_index; i++)
+    {
+      int op = ir->compact_instructions[i].op;
+      if (op == TCCIR_OP_SETJMP || op == TCCIR_OP_NL_SETJMP)
+      {
+        has_setjmp = 1;
+        break;
+      }
+    }
+    if (has_setjmp)
+    {
+      for (int i = 0; i < ir->next_instruction_index; i++)
+      {
+        IRQuadCompact *q = &ir->compact_instructions[i];
+        if (q->op == TCCIR_OP_NOP)
+          continue;
+        for (int k = 0; k < 3; k++)
+        {
+          IROperand op = (k == 0)   ? tcc_ir_op_get_dest(ir, q)
+                         : (k == 1) ? tcc_ir_op_get_src1(ir, q)
+                                    : tcc_ir_op_get_src2(ir, q);
+          int32_t vr = irop_get_vreg(op);
+          if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR)
+            tcc_ir_set_addrtaken(ir, vr);
+        }
+      }
+    }
+  }
+
   /* Bitfield insert -> ARM BFI: lower the observed-insert idiom
    * `(W & ~field) | (V << lsb)` to a single BFI.  Must run BEFORE barrel-shift
    * fusion (which would otherwise fold the field-value SHL into the OR).
@@ -30963,6 +31089,21 @@ static void gen_function(Sym *sym)
         int p = TCCIR_DECODE_VREG_POSITION(vrs[k]);
         if (p <= max_vreg_pos)
           live_vregs[p / 8] |= (1 << (p % 8));
+      }
+      /* MLA / LOAD_INDEXED / STORE_INDEXED carry a 4th operand (the MLA
+       * accumulator / indexed base) that the dest/src1/src2 scan above does
+       * not see. A vreg referenced ONLY through that operand — e.g. `block` in
+       * `tab[pred*n + block]`, lowered to `MLA acc=block` — would otherwise be
+       * judged dead here and have its spill slot dropped, eliding its
+       * materialization store and leaving uses to read an uninitialized slot. */
+      if (q->op == TCCIR_OP_MLA || q->op == TCCIR_OP_LOAD_INDEXED ||
+          q->op == TCCIR_OP_STORE_INDEXED) {
+        int32_t av = irop_get_vreg(tcc_ir_op_get_accum(ir, q));
+        if (av >= 0 && TCCIR_DECODE_VREG_TYPE(av) != 0) {
+          int p = TCCIR_DECODE_VREG_POSITION(av);
+          if (p <= max_vreg_pos)
+            live_vregs[p / 8] |= (1 << (p % 8));
+        }
       }
     }
 
@@ -31594,6 +31735,27 @@ static void gen_function(Sym *sym)
         nonstatic_bloat)
     {
       sym->type.ref->f.func_auto_inline = 0;
+    }
+  }
+
+  /* Mark surviving auto-inline candidates whose body keeps a non-trivial,
+   * non-foldable call (e.g. a printf wrapper) as "call-heavy".  Inlining
+   * such a body at every call site duplicates the surviving call for no
+   * savings; when a function like this is called dozens of times (macro-
+   * generated check() in 55_lshift_type), unbounded expansion explodes the
+   * compiler's memory.  The call-site logic budget-limits how many times a
+   * call-heavy callee is expanded before falling back to a normal call. */
+  if (ir && sym && sym->type.ref->f.func_auto_inline &&
+      ir->next_instruction_index > 8)
+  {
+    for (int ii = 0; ii < ir->next_instruction_index; ii++)
+    {
+      int op = ir->compact_instructions[ii].op;
+      if (op == TCCIR_OP_FUNCCALLVAL || op == TCCIR_OP_FUNCCALLVOID)
+      {
+        sym->type.ref->f.func_inline_call_heavy = 1;
+        break;
+      }
     }
   }
 
@@ -32504,6 +32666,7 @@ static int decl(int l)
               case TOK_CFLOAT_I:
               case TOK_CINT_I:
               case TOK_LINENUM:
+              case TOK_PACK_REPLAY:
 #if LONG_SIZE == 4
               case TOK_CLONG:
               case TOK_CULONG:

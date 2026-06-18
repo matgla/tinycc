@@ -196,10 +196,17 @@ static int analyze_dead_vla(TCCIRState *ir, int vla_idx, int max_tmp,
     int has_d = irop_config[q->op].has_dest;
     int has_s1 = irop_config[q->op].has_src1;
     int has_s2 = irop_config[q->op].has_src2;
-    IROperand d = {0}, s1 = {0}, s2 = {0};
+    /* MLA carries a third source operand (the accumulator) at pool[base+3]
+     * which the src1/src2 helpers do not surface.  A VLA base consumed only
+     * as an MLA addend (`base + i*stride` address form) would otherwise look
+     * unused — treat it as a real source so the read is observed and the
+     * analysis bails (MLA is not an address propagator, see below). */
+    int has_accum = (q->op == TCCIR_OP_MLA);
+    IROperand d = {0}, s1 = {0}, s2 = {0}, accum = {0};
     if (has_d) d = tcc_ir_op_get_dest(ir, q);
     if (has_s1) s1 = tcc_ir_op_get_src1(ir, q);
     if (has_s2) s2 = tcc_ir_op_get_src2(ir, q);
+    if (has_accum) accum = tcc_ir_op_get_accum(ir, q);
 
     /* Does this op consume a tainted value (either by reading the slot
      * directly, or by reading a tainted TEMP)? */
@@ -218,6 +225,13 @@ static int analyze_dead_vla(TCCIRState *ir, int vla_idx, int max_tmp,
       if (operand_reads_slot(s2, slot))
         reads_slot = 1;
       else if (operand_is_temp(s2, &tpos) && tpos <= max_tmp && tainted[tpos])
+        reads_tainted = 1;
+    }
+    if (has_accum)
+    {
+      if (operand_reads_slot(accum, slot))
+        reads_slot = 1;
+      else if (operand_is_temp(accum, &tpos) && tpos <= max_tmp && tainted[tpos])
         reads_tainted = 1;
     }
 
@@ -344,6 +358,19 @@ static int sweep_orphan_tmp_defs(TCCIRState *ir, int max_tmp)
       {
         IROperand s = tcc_ir_op_get_src2(ir, q);
         int32_t vr = irop_get_vreg(s);
+        if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP)
+        {
+          int p = TCCIR_DECODE_VREG_POSITION(vr);
+          if (p <= max_tmp)
+            use_count[p]++;
+        }
+      }
+      /* MLA accumulator (4th operand) is a use of its TEMP not covered by the
+       * src1/src2 helpers above. */
+      if (q->op == TCCIR_OP_MLA)
+      {
+        IROperand a = tcc_ir_op_get_accum(ir, q);
+        int32_t vr = irop_get_vreg(a);
         if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP)
         {
           int p = TCCIR_DECODE_VREG_POSITION(vr);
@@ -779,10 +806,16 @@ int tcc_ir_opt_dead_alloca_vreg_elim(TCCIRState *ir)
       int has_d = irop_config[q->op].has_dest;
       int has_s1 = irop_config[q->op].has_src1;
       int has_s2 = irop_config[q->op].has_src2;
-      IROperand d = {0}, s1 = {0}, s2 = {0};
+      /* MLA's accumulator (4th operand) is a real source the src1/src2
+       * helpers miss — classify it too so a tainted VLA pointer used as an
+       * MLA addend is observed (MLA is not in the propagator set below, so a
+       * tainted accum forces the conservative bail). */
+      int has_accum = (q->op == TCCIR_OP_MLA);
+      IROperand d = {0}, s1 = {0}, s2 = {0}, accum = {0};
       if (has_d) d = tcc_ir_op_get_dest(ir, q);
       if (has_s1) s1 = tcc_ir_op_get_src1(ir, q);
       if (has_s2) s2 = tcc_ir_op_get_src2(ir, q);
+      if (has_accum) accum = tcc_ir_op_get_accum(ir, q);
 
       /* Classify each source operand wrt taint.
        *   tainted_val   = operand yields a tainted VALUE (the alloca pointer or
@@ -816,10 +849,12 @@ int tcc_ir_opt_dead_alloca_vreg_elim(TCCIRState *ir)
   } while (0)
 
       int s1_val = 0, s1_deref = 0, s2_val = 0, s2_deref = 0;
+      int acc_val = 0, acc_deref = 0;
       if (has_s1) CLASSIFY(s1, s1_val, s1_deref);
       if (has_s2) CLASSIFY(s2, s2_val, s2_deref);
+      if (has_accum) CLASSIFY(accum, acc_val, acc_deref);
 
-      if (s1_deref || s2_deref)
+      if (s1_deref || s2_deref || acc_deref)
       {
         bail = 1;
         break;
@@ -856,7 +891,7 @@ int tcc_ir_opt_dead_alloca_vreg_elim(TCCIRState *ir)
       /* No tainted input — instruction doesn't propagate or kill anything.
        * Special case: if dest is a tainted VAR being overwritten with a
        * non-tainted value, the VAR loses its taint. */
-      if (!s1_val && !s2_val)
+      if (!s1_val && !s2_val && !acc_val)
       {
         if (has_d)
         {

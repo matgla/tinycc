@@ -142,6 +142,27 @@ static int refresh_stale_var_addrtaken(TCCIRState *ir)
     }
   }
 
+  /* VARs whose own address is taken anywhere (they appear as a LEA src1).
+   * If a LEA `Vd <-- &Vs` writes into such a Vd, then the address &Vs is
+   * stored into a location (Vd) that itself escapes — so Vs stays reachable
+   * and must keep addrtaken even though Vd is never read *as a value*.  This
+   * is the `int *p = &a; foo(&p);` case: `p` is only ever address-taken, yet
+   * `&a` escapes through it. */
+  uint8_t *var_addr_taken = tcc_mallocz((max_var + 8) / 8);
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_LEA)
+      continue;
+    IROperand s = tcc_ir_op_get_src1(ir, q);
+    int32_t svr = irop_get_vreg(s);
+    if (svr < 0 || TCCIR_DECODE_VREG_TYPE(svr) != TCCIR_VREG_TYPE_VAR)
+      continue;
+    int sp = TCCIR_DECODE_VREG_POSITION(svr);
+    if (sp <= max_var)
+      var_addr_taken[sp / 8] |= (1 << (sp % 8));
+  }
+
   /* Mark a VAR as having a "live" LEA only if some LEA's destination is
    * actually read downstream — otherwise the LEA is effectively dead. */
   uint8_t *has_live_lea = tcc_mallocz((max_var + 8) / 8);
@@ -166,13 +187,17 @@ static int refresh_stale_var_addrtaken(TCCIRState *ir)
       int dt = TCCIR_DECODE_VREG_TYPE(dvr);
       int dp = TCCIR_DECODE_VREG_POSITION(dvr);
       if (dt == TCCIR_VREG_TYPE_VAR)
-        dest_read = (dp <= max_var) ? !!(var_read[dp / 8] & (1 << (dp % 8))) : 1;
+        dest_read = (dp <= max_var)
+                        ? (!!(var_read[dp / 8] & (1 << (dp % 8))) ||
+                           !!(var_addr_taken[dp / 8] & (1 << (dp % 8))))
+                        : 1;
       else if (dt == TCCIR_VREG_TYPE_TEMP)
         dest_read = (tmp_read && dp <= max_tmp) ? !!(tmp_read[dp / 8] & (1 << (dp % 8))) : 1;
     }
     if (dest_read)
       has_live_lea[sp / 8] |= (1 << (sp % 8));
   }
+  tcc_free(var_addr_taken);
 
   int cleared = 0;
   uint8_t *seen = tcc_mallocz((max_var + 8) / 8);
@@ -1423,6 +1448,18 @@ static int eval_cmp_operand_const(TCCIRState *ir, IROperand op, int use_idx, uin
    * STORE of an immediate to the matching slot. */
   if (irop_get_tag(op) == IROP_TAG_STACKOFF && op.is_lval && op.is_local && !op.is_llocal)
   {
+    /* If the use itself is a control-flow merge, an alternate predecessor
+     * may have stored a different value to the slot, while the linear
+     * backward scan below only sees the fall-through store.  Bail — this
+     * mirrors the inclusive `k <= use_idx` jump-target check in the
+     * same-BB ASSIGN case above.  (Without this, a diamond that writes
+     * #0/#1 to the slot on its two arms then `CMP slot,#0` at the merge
+     * gets the fall-through arm's store forwarded unconditionally, folding
+     * the compare to a constant on both paths.) */
+    if (use_idx >= 0 && use_idx < ir->next_instruction_index &&
+        ir->compact_instructions[use_idx].is_jump_target)
+      return 0;
+
     int64_t target_off = irop_get_stack_offset(op);
     int op_btype = irop_get_btype(op);
 

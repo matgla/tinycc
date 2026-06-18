@@ -376,7 +376,8 @@ typedef struct ThPackConstCacheEntry
   uint8_t valid;
 } ThPackConstCacheEntry;
 
-#define TH_PACK_CONST_CACHE_SIZE 256
+#define TH_PACK_CONST_CACHE_SIZE 64 /* YASOS: 256 -> 64 saves ~2.3 KiB .bss; pure
+                                       perf cache (miss => recompute const pack). */
 static ThPackConstCacheEntry th_pack_const_cache[TH_PACK_CONST_CACHE_SIZE];
 
 uint32_t th_pack_const(uint32_t imm)

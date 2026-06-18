@@ -1472,6 +1472,18 @@ ST_FUNC int find_elf_sym(Section *s, const char *name)
   return find_elf_sym_with_hash(s, name, elf_hash((unsigned char *)name));
 }
 
+/* Resolve `name` against loaded libraries: first the already-interned
+   dynsymtab_section, then (on miss) the loaded YAFF libraries' on-disk hash
+   tables (tcc_yaff_resolve), which interns a hit into dynsymtab_section.
+   Returns the dynsymtab index, or 0 if no loaded library provides it. */
+ST_FUNC int tcc_dynsym_find(TCCState *s1, const char *name)
+{
+  int idx = find_elf_sym(s1->dynsymtab_section, name);
+  if (idx)
+    return idx;
+  return tcc_yaff_resolve(s1, name);
+}
+
 /* return elf symbol value, signal error if 'err' is nonzero, decorate
    name if FORC */
 ST_FUNC addr_t get_sym_addr(TCCState *s1, const char *name, int err, int forc)
@@ -1566,7 +1578,7 @@ static void version_add(TCCState *s1)
     int dllindex, verndx;
     sym = &((ElfW(Sym) *)symtab->data)[sym_index];
     name = (char *)symtab->link->data + sym->st_name;
-    dllindex = find_elf_sym(s1->dynsymtab_section, name);
+    dllindex = tcc_dynsym_find(s1, name);
     verndx = (dllindex && dllindex < nb_sym_to_version) ? sym_to_version[dllindex] : -1;
     if (verndx >= 0
         /* XXX: on android, clang refuses to link with a libtcc.so made by tcc
@@ -2384,7 +2396,16 @@ int build_got(TCCState *s1)
   s1->got = new_section(s1, ".got", SHT_PROGBITS, SHF_ALLOC | SHF_WRITE);
   s1->got->sh_entsize = 8;
   /* keep space for _DYNAMIC pointer and two dummy got entries */
+#if defined(TCC_TARGET_YASOS)
+  /* + a reserved slot (index YAFF_RODATA_ANCHOR_GOT_INDEX = 3) holding the
+   * runtime base of the shared .rodata segment. Reserved up front so its GOT
+   * offset is a compile-time constant the codegen addresses as [R9,#24],
+   * independent of the final GOT layout; the loader fills it (the YAFF writer
+   * emits its relocation when -share-rodata is active). */
+  section_ptr_add(s1->got, 4 * PTR_SIZE * 2);
+#else
   section_ptr_add(s1->got, 3 * PTR_SIZE * 2);
+#endif
   return set_elf_sym(symtab_section, 0, 0, ELFW(ST_INFO)(STB_GLOBAL, STT_OBJECT), 0, s1->got->sh_num,
                      "_GLOBAL_OFFSET_TABLE_");
 }
@@ -3254,7 +3275,7 @@ static void bind_exe_dynsyms(TCCState *s1, int is_PIE)
         continue;
       }
       name = (char *)symtab_section->link->data + sym->st_name;
-      sym_index = find_elf_sym(s1->dynsymtab_section, name);
+      sym_index = tcc_dynsym_find(s1, name);
       if (sym_index)
       {
         if (is_PIE)
@@ -3333,7 +3354,7 @@ static void bind_libs_dynsyms(TCCState *s1)
   for_each_elem(symtab_section, 1, sym, ElfW(Sym))
   {
     name = (char *)symtab_section->link->data + sym->st_name;
-    dynsym_index = find_elf_sym(s1->dynsymtab_section, name);
+    dynsym_index = tcc_dynsym_find(s1, name);
     if (sym->st_shndx != SHN_UNDEF)
     {
       if (ELFW(ST_BIND)(sym->st_info) != STB_LOCAL && (dynsym_index || s1->rdynamic))

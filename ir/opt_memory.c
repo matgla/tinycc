@@ -1143,13 +1143,42 @@ int tcc_ir_opt_sl_forward(TCCIRState *ir)
           pred_count[target]++;
         }
       }
+      /* SWITCH_TABLE case/default targets are control-flow predecessors too;
+       * without counting them, a case target that is also fall-through-reached
+       * looks single-predecessor and the cross-BB store-forward below restores
+       * a snapshot that is invalid on the switch path (dropping a value that
+       * the switch arm overwrote).  Mirror the pred_count logic in const_prop. */
+      else if (jq->op == TCCIR_OP_SWITCH_TABLE)
+      {
+        IROperand src2 = tcc_ir_op_get_src2(ir, jq);
+        int table_id = (int)irop_get_imm64_ex(ir, src2);
+        if (table_id >= 0 && table_id < ir->num_switch_tables)
+        {
+          TCCIRSwitchTable *table = &ir->switch_tables[table_id];
+          for (int j = 0; j < table->num_entries; j++)
+          {
+            int t = table->targets[j];
+            if (t >= 0 && t < n)
+            {
+              actual_targets[t / 8] |= (1 << (t % 8));
+              pred_count[t]++;
+            }
+          }
+          if (table->default_target >= 0 && table->default_target < n)
+          {
+            actual_targets[table->default_target / 8] |= (1 << (table->default_target % 8));
+            pred_count[table->default_target]++;
+          }
+        }
+      }
     }
     /* Fall-through predecessors: instruction i+1 is reached from i unless i
      * is a terminator (JUMP, RETURNVALUE, RETURNVOID). */
     for (i = 0; i + 1 < n; i++)
     {
       IRQuadCompact *fq = &ir->compact_instructions[i];
-      if (fq->op != TCCIR_OP_JUMP && fq->op != TCCIR_OP_RETURNVALUE && fq->op != TCCIR_OP_RETURNVOID)
+      if (fq->op != TCCIR_OP_JUMP && fq->op != TCCIR_OP_RETURNVALUE && fq->op != TCCIR_OP_RETURNVOID &&
+          fq->op != TCCIR_OP_SWITCH_TABLE && fq->op != TCCIR_OP_IJUMP)
         pred_count[i + 1]++;
     }
     /* Instruction 0 is always a function entry — has an implicit predecessor. */
@@ -1706,6 +1735,13 @@ int tcc_ir_opt_sl_forward(TCCIRState *ir)
    * data-flow join analysis. */
   StoreEntry **saved_entries = tcc_mallocz(sizeof(StoreEntry *) * n);
   int *saved_entry_count = tcc_mallocz(sizeof(int) * n);
+  /* Allocated capacity (in StoreEntry units) of each saved_entries[t] slot.
+   * Snapshots only ever hold entry_count entries, which is normally far
+   * smaller than n; sizing every per-target snapshot to the full n made this
+   * pass O(num_targets * n) memory and blew the device heap (e.g. pr92904 at
+   * -O1/-O2 needed ~70 MB).  Grow each slot lazily to the count it actually
+   * needs instead. */
+  int *saved_entry_cap = tcc_mallocz(sizeof(int) * n);
 
   LOG_IR_GEN("=== STORE-LOAD FORWARDING START ===");
 
@@ -1723,9 +1759,14 @@ int tcc_ir_opt_sl_forward(TCCIRState *ir)
       int jtarget = (int)jdest.u.imm32;
       if (jtarget >= 0 && jtarget < n && entry_count > 0)
       {
-        /* Snapshot entries[] for the target to restore/join on entry */
-        if (!saved_entries[jtarget])
-          saved_entries[jtarget] = tcc_malloc(sizeof(StoreEntry) * n);
+        /* Snapshot entries[] for the target to restore/join on entry.  Size
+         * the slot to entry_count (growing if a later snapshot to the same
+         * target needs more) rather than the full n. */
+        if (saved_entry_cap[jtarget] < entry_count)
+        {
+          saved_entries[jtarget] = tcc_realloc(saved_entries[jtarget], sizeof(StoreEntry) * entry_count);
+          saved_entry_cap[jtarget] = entry_count;
+        }
         memcpy(saved_entries[jtarget], entries, sizeof(StoreEntry) * entry_count);
         saved_entry_count[jtarget] = entry_count;
       }
@@ -1739,8 +1780,13 @@ int tcc_ir_opt_sl_forward(TCCIRState *ir)
       /* JUMPIF: keep current state for the fall-through path */
       continue;
     }
-    if (q->op == TCCIR_OP_RETURNVALUE || q->op == TCCIR_OP_RETURNVOID)
+    if (q->op == TCCIR_OP_RETURNVALUE || q->op == TCCIR_OP_RETURNVOID ||
+        q->op == TCCIR_OP_SWITCH_TABLE || q->op == TCCIR_OP_IJUMP)
     {
+      /* Terminators with no fall-through path: drop tracked stores so the
+       * following instruction (a fresh BB) does not inherit a state that is
+       * only valid on the straight-line path.  SWITCH_TABLE/IJUMP case
+       * targets are marked multi-predecessor above and reset on entry. */
       memset(hash_table, 0, sizeof(hash_table));
       entry_count = 0;
       write_tracker_gen++;
@@ -1841,31 +1887,26 @@ int tcc_ir_opt_sl_forward(TCCIRState *ir)
         }
         if (prev_is_terminator)
         {
-          int had_entries = entry_count;
-          /* Restore from snapshot if available; otherwise reset */
+          /* Single-predecessor target reached only via a JUMP/terminator (no
+           * fall-through): reset the tracked store state.
+           *
+           * This used to RESTORE the snapshot saved at the predecessor JUMP to
+           * extend store-load forwarding across the BB boundary.  That heuristic
+           * was unsound: it relies on pred_count[i]==1 meaning the snapshotting
+           * JUMP is the *only* edge into i, but the snapshot is captured at the
+           * jump (the pre-branch state) and is not a real data-flow join.  With
+           * the extra control flow that aggressive inlining introduces (e.g.
+           * is_float()'s OR-chain inlined into gen_op in the self-hosted build),
+           * it resurrected a store-state that did not hold on the actual edge
+           * into this block and forwarded a stale value — corrupting, among
+           * other things, the soft-float helper-call arguments the rebuilt
+           * compiler emits.  Resetting is always sound; a correct cross-BB
+           * forward would need a real data-flow join.  The pred_count==2
+           * intersection above still handles the common diamond case. */
+          LOG_SL_FWD("BB@i=%d RESET: single-pred terminator target (dropped %d entries)", i, entry_count);
           memset(hash_table, 0, sizeof(hash_table));
           entry_count = 0;
           write_tracker_gen++;
-          if (saved_entries[i])
-          {
-            int sc = saved_entry_count[i];
-            LOG_SL_FWD("BB@i=%d RESTORE: single-pred target, restoring %d snapshot entries (was %d)", i, sc,
-                       had_entries);
-            memcpy(entries, saved_entries[i], sizeof(StoreEntry) * sc);
-            entry_count = sc;
-            /* Rebuild hash chains */
-            for (int k = 0; k < sc; k++)
-            {
-              uint32_t h = ((uintptr_t)entries[k].local_sym * 31 + (uint32_t)entries[k].local_offset * 17) % 128;
-              entries[k].next = hash_table[h];
-              hash_table[h] = &entries[k];
-            }
-          }
-          else if (had_entries > 0)
-          {
-            LOG_SL_FWD("BB@i=%d RESET: single-pred terminator target but no snapshot (dropped %d entries)", i,
-                       had_entries);
-          }
         }
         /* else: fall-through predecessor — keep current state intact */
       }
@@ -2097,9 +2138,17 @@ int tcc_ir_opt_sl_forward(TCCIRState *ir)
        * VAR slots with a sentinel sym (see resolved_local_store); mirror that
        * here for direct VAR loads so a VAR load never alias-matches an anonymous
        * StackLoc store at the same offset.  LEA-resolved loads keep their real
-       * sym (addr_vr is the TEMP holding the address, not a VAR). */
+       * sym (addr_vr is the TEMP holding the address, not a VAR).
+       *
+       * The sentinel encodes the VAR's vreg POSITION (not a flat constant):
+       * stack offsets are not yet assigned at this stage, so every VAR operand
+       * carries offset 0.  A flat sentinel would collapse all VARs into one
+       * (sym, offset) key, letting a store to one VAR forward into a load of a
+       * DIFFERENT VAR — e.g. an inlined `ptr` param's init forwarded into a
+       * load of an inlined local (gcc.c-torture pr17078-1: `*ptr = i` became
+       * `*ptr = ptr`).  Keying on the position keeps distinct VARs disjoint. */
       if (!load_via_lea && addr_vr >= 0 && TCCIR_DECODE_VREG_TYPE(addr_vr) == TCCIR_VREG_TYPE_VAR)
-        addr_sym = (const Sym *)(uintptr_t)1; /* sentinel: VAR namespace */
+        addr_sym = (const Sym *)(uintptr_t)(1 + (unsigned)TCCIR_DECODE_VREG_POSITION(addr_vr)); /* sentinel: VAR namespace, per-var */
 
       /* For VT_LOCAL, hash on symbol pointer and offset */
       h = ((uintptr_t)addr_sym * 31 + (uint32_t)addr_offset * 17) % 128;
@@ -2895,7 +2944,18 @@ int tcc_ir_opt_sl_forward(TCCIRState *ir)
     {
       for (int si = 0; si < 2; si++)
       {
-        IROperand src = (si == 0) ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_src2(ir, q);
+        /* NB: use an explicit if/else, not a ternary selecting between the two
+         * call results — the armv8m self-host cross miscompiles
+         * `(si==0) ? get_src1() : get_src2()`, evaluating get_src1() for si==1
+         * too.  That made sl_forward forward the src1 lval-deref's store into
+         * src2 as well (e.g. `T <- StackLoc[x] MUL P0` became `T <- L MUL L`),
+         * squaring an inlined call result instead of multiplying by the kept
+         * parameter (nested_recursive_parent at -O2). */
+        IROperand src;
+        if (si == 0)
+          src = tcc_ir_op_get_src1(ir, q);
+        else
+          src = tcc_ir_op_get_src2(ir, q);
         if (!src.is_lval)
           continue;
         /* Resolve the stack/symbol address — either directly for locals,
@@ -3347,9 +3407,12 @@ int tcc_ir_opt_sl_forward(TCCIRState *ir)
     resolved_local_store:
       /* VAR destinations use stack offsets that can coincidentally collide
        * with anonymous StackLoc offsets in the hash table.  Use a distinct
-       * sentinel sym pointer so VARs hash to different buckets than StackLocs. */
+       * sentinel sym pointer so VARs hash to different buckets than StackLocs.
+       * The sentinel encodes the VAR's vreg POSITION so distinct VARs stay in
+       * distinct buckets even before stack offsets are assigned (every VAR
+       * operand carries offset 0 at this stage) — must match the load side. */
       if (addr_vr >= 0 && TCCIR_DECODE_VREG_TYPE(addr_vr) == TCCIR_VREG_TYPE_VAR)
-        addr_sym = (const Sym *)(uintptr_t)1; /* sentinel: VAR namespace */
+        addr_sym = (const Sym *)(uintptr_t)(1 + (unsigned)TCCIR_DECODE_VREG_POSITION(addr_vr)); /* sentinel: VAR namespace, per-var */
 
       /* For VT_LOCAL, hash on symbol pointer and offset */
       h = ((uintptr_t)addr_sym * 31 + (uint32_t)addr_offset * 17) % 128;
@@ -3528,6 +3591,42 @@ int tcc_ir_opt_sl_forward(TCCIRState *ir)
       new_entry->instruction_idx = i;
       new_entry->store_dest_vr = addr_vr;
       new_entry->store_btype = dest.btype;
+      /* A 64-bit value can only be stored to a >=8-byte location (narrowing it
+       * to a smaller slot requires an explicit cast, which makes the stored
+       * value narrow first), so a STORE of a 64-bit value really writes 8 bytes.
+       * The armv8m self-host cross can stamp such a store's dest operand as
+       * INT32; that then matched a 32-bit field read and wrongly forwarded the
+       * whole 64-bit value into it (union `u.ull=v; ...u.s.lo`, bug_ull_mul10_loop).
+       * Detect 64-bit-ness from the value's vreg interval (is_llong/is_double) or
+       * a 64-bit immediate, not the operand btype — the same miscompile can stamp
+       * the value operand INT32 too.  Widen store_btype so the width check below
+       * rejects a 64-bit-store -> 32-bit-read forward.  Restricted to 64-bit so
+       * genuine narrowing byte/short stores are left untouched.  Mirrors the
+       * STORE_INDEXED paths, which derive the access width from src1. */
+      if (dest.btype != IROP_BTYPE_INT64 && dest.btype != IROP_BTYPE_FLOAT64)
+      {
+        int sv_is_64 = 0, sv_is_double = 0;
+        int sv_tag = irop_get_tag(new_entry->stored_value);
+        if (sv_tag == IROP_TAG_I64)
+          sv_is_64 = 1;
+        else if (sv_tag == IROP_TAG_F64)
+          sv_is_64 = sv_is_double = 1;
+        else
+        {
+          int32_t sv_vr = irop_get_vreg(new_entry->stored_value);
+          if (sv_vr >= 0)
+          {
+            IRLiveInterval *sv_li = tcc_ir_get_live_interval(ir, sv_vr);
+            if (sv_li && (sv_li->is_llong || sv_li->is_double))
+            {
+              sv_is_64 = 1;
+              sv_is_double = sv_li->is_double;
+            }
+          }
+        }
+        if (sv_is_64)
+          new_entry->store_btype = sv_is_double ? IROP_BTYPE_FLOAT64 : IROP_BTYPE_INT64;
+      }
       new_entry->next = hash_table[h];
       hash_table[h] = new_entry;
 
@@ -3929,6 +4028,7 @@ int tcc_ir_opt_sl_forward(TCCIRState *ir)
     tcc_free(saved_entries[i]);
   tcc_free(saved_entries);
   tcc_free(saved_entry_count);
+  tcc_free(saved_entry_cap);
   tcc_free(pred_count);
 
   LOG_IR_GEN("=== STORE-LOAD FORWARDING END: %d changes ===", changes);
@@ -5337,7 +5437,7 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
       continue;
     int is_store = (q->op == TCCIR_OP_STORE);
 
-    for (int k = 0; k < 3; k++)
+    for (int k = 0; k < 4; k++)
     {
       if (k == 0 && is_store)
         continue;
@@ -5354,11 +5454,21 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
           continue;
         op = tcc_ir_op_get_src1(ir, q);
       }
-      else
+      else if (k == 2)
       {
         if (!irop_config[q->op].has_src2)
           continue;
         op = tcc_ir_op_get_src2(ir, q);
+      }
+      else
+      {
+        /* MLA carries a fourth source operand (the accumulator) at
+         * pool[base+3].  When a VLA base pointer (or any local-slot value)
+         * is consumed only as an MLA addend, missing it here would leave the
+         * slot's defining store looking dead — record it like a normal src. */
+        if (q->op != TCCIR_OP_MLA)
+          continue;
+        op = tcc_ir_op_get_accum(ir, q);
       }
 
       /* Precise vreg-deref read: a TEMP lval src that resolves to an exact
@@ -9571,9 +9681,20 @@ int tcc_ir_opt_memmove_global_load_fwd(TCCIRState *ir)
         if (q->op == TCCIR_OP_NOP)
           continue;
         const IRRegistersConfig *cfg = &irop_config[q->op];
-        IROperand s1 = cfg->has_src1 ? tcc_ir_op_get_src1(ir, q) : IROP_NONE;
-        IROperand s2 = cfg->has_src2 ? tcc_ir_op_get_src2(ir, q) : IROP_NONE;
-        IROperand d = cfg->has_dest ? tcc_ir_op_get_dest(ir, q) : IROP_NONE;
+        /* NB: explicit if/else, not `cond ? get_srcN() : IROP_NONE`.  The
+         * armv8m self-host cross miscompiles a ternary whose arms are a
+         * struct-returning call and a struct constant (it materializes the
+         * call result and the constant in DIFFERENT sret buffers, then reads
+         * the merged value from the constant's buffer), so the call branch
+         * silently yields a stale operand.  Same class as the sl_forward
+         * ternary fixes (tinycc f0a85c86 / 21305c35). */
+        IROperand s1 = IROP_NONE, s2 = IROP_NONE, d = IROP_NONE;
+        if (cfg->has_src1)
+          s1 = tcc_ir_op_get_src1(ir, q);
+        if (cfg->has_src2)
+          s2 = tcc_ir_op_get_src2(ir, q);
+        if (cfg->has_dest)
+          d = tcc_ir_op_get_dest(ir, q);
 
         int in_s1 = cfg->has_src1 && irop_has_vreg(s1) && irop_get_vreg(s1) == av;
         int in_s2 = cfg->has_src2 && irop_has_vreg(s2) && irop_get_vreg(s2) == av;
@@ -9604,7 +9725,13 @@ int tcc_ir_opt_memmove_global_load_fwd(TCCIRState *ir)
 
         /* A single clean LOAD whose address operand is av (load reads D). */
         int which = in_s1 ? 1 : in_s2 ? 2 : 0;
-        IROperand dref = (which == 1) ? s1 : (which == 2) ? s2 : d;
+        IROperand dref;
+        if (which == 1)
+          dref = s1;
+        else if (which == 2)
+          dref = s2;
+        else
+          dref = d;
         if (q->op == TCCIR_OP_LOAD && which == 1 && s1.is_lval && !in_s2 && !in_d)
         {
           int wbytes = mglf_btype_width(irop_get_btype(dref));
@@ -9749,8 +9876,17 @@ int tcc_ir_opt_memmove_global_load_fwd(TCCIRState *ir)
     for (int r = 0; r < ld_n; r++)
     {
       IRQuadCompact *lq = &ir->compact_instructions[ld_idx[r]];
-      IROperand old = (ld_which[r] == 2) ? tcc_ir_op_get_src2(ir, lq)
-                                         : tcc_ir_op_get_src1(ir, lq);
+      /* Explicit if/else, not a ternary — see the s1/s2/d note above: the
+       * self-host cross miscompiles `cond ? get_src2() : get_src1()` (two
+       * struct-returning calls) by giving each arm its own sret buffer and
+       * reading the merge from the wrong one, so `old` would carry a stale
+       * btype/is_unsigned (here that mis-forwarded gB.k as a word read of
+       * gB.l — see tests/ir_tests/178_dead_store_sroa.c). */
+      IROperand old;
+      if (ld_which[r] == 2)
+        old = tcc_ir_op_get_src2(ir, lq);
+      else
+        old = tcc_ir_op_get_src1(ir, lq);
       uint32_t pool = tcc_ir_pool_add_symref(ir, gsym, gaddend + ld_delta[r], gflags);
       IROperand g = irop_make_symref(-1, pool, /*is_lval*/ 1, /*is_local*/ 0, /*is_const*/ 0,
                                      irop_get_btype(old));

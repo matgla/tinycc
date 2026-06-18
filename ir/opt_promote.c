@@ -1814,6 +1814,30 @@ int tcc_ir_opt_backedge_phi_hoist(TCCIRState *ir)
       tcc_ir_op_set_src1(ir, q, cond_op);
     }
 
+    /* Redirect any OTHER jump that targeted the original fall-through path
+     * [i+1 .. jump_idx] straight to body_target before we rewrite those slots.
+     * That whole region was "(coalesced no-op ASSIGNs); JUMP body_target", so
+     * entering it anywhere meant "go to body_target".  The rewrite repurposes
+     * those slots (ASSIGNs shifted up, inverted JUMPIF at jif_pos, JUMP→NOP),
+     * so a stale target pointing into the region would land on the inverted
+     * JUMPIF and re-use its comparison flags — the `if (A || B)` short-circuit
+     * bug where A's equality branch (which jumped to this continue/merge path)
+     * ends up on B's relational branch.  Skip the pattern's own slots. */
+    for (int k = 0; k < n; k++) {
+      if (k >= i && k <= jump_idx)
+        continue;
+      IRQuadCompact *kq = &ir->compact_instructions[k];
+      if (kq->op != TCCIR_OP_JUMP && kq->op != TCCIR_OP_JUMPIF)
+        continue;
+      int kt = (int)irop_get_imm32(tcc_ir_op_get_dest(ir, kq));
+      if (kt < i + 1 || kt > jump_idx)
+        continue;
+      IROperand kd = {0};
+      kd.tag = IROP_TAG_IMM32;
+      kd.u.imm32 = body_target;
+      tcc_ir_op_set_dest(ir, kq, kd);
+    }
+
     /* NOP the old unconditional JUMP */
     ir->compact_instructions[jump_idx].op = TCCIR_OP_NOP;
 
@@ -1948,6 +1972,30 @@ int tcc_ir_opt_post_ra_forward_diamond(TCCIRState *ir)
       tcc_ir_op_set_src1(ir, jif, new_cond);
     }
 
+    /* Redirect any OTHER jump that targeted the original fall-through path
+     * [i+1 .. jump_idx] straight to merge_target before we NOP those slots.
+     * That region was "(coalesced no-op ASSIGNs); JUMP merge_target", so
+     * entering it anywhere meant "go to merge_target"; once the JUMP is NOP'd a
+     * stale target pointing into it would fall onto the inverted JUMPIF (jif)
+     * and re-use jif's comparison flags — exactly the `if (A || B)`
+     * short-circuit bug where A's equality branch ends up on B's relational
+     * branch.  exit_target (= jump_idx+1) is outside the region, so jumps to
+     * the then-body are untouched. */
+    for (int k = 0; k < n; k++) {
+      if (k >= i && k <= jump_idx)
+        continue;
+      IRQuadCompact *kq = &ir->compact_instructions[k];
+      if (kq->op != TCCIR_OP_JUMP && kq->op != TCCIR_OP_JUMPIF)
+        continue;
+      int kt = (int)irop_get_imm32(tcc_ir_op_get_dest(ir, kq));
+      if (kt < i + 1 || kt > jump_idx)
+        continue;
+      IROperand kd = {0};
+      kd.tag = IROP_TAG_IMM32;
+      kd.u.imm32 = merge_target;
+      tcc_ir_op_set_dest(ir, kq, kd);
+    }
+
     /* NOP the no-op ASSIGNs and the bridging JUMP */
     for (int j = 0; j < num_assigns; j++)
       ir->compact_instructions[i + 1 + j].op = TCCIR_OP_NOP;
@@ -1955,6 +2003,8 @@ int tcc_ir_opt_post_ra_forward_diamond(TCCIRState *ir)
 
     /* merge_target was already a JUMP target; is_jump_target stays set.
      * exit_target loses one predecessor but is conservatively left flagged. */
+    if (merge_target >= 0 && merge_target < n)
+      ir->compact_instructions[merge_target].is_jump_target = 1;
 
     changes++;
   }

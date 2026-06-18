@@ -527,6 +527,21 @@ int tcc_ir_opt_reroll(TCCIRState *ir)
       /* Quick reject: body must be safe and have no internal jump targets. */
       if (!body_is_safe(ir, i, P)) continue;
 
+      /* Cheap opcode-only prematch.  A run of >=2 periods requires the opcode
+       * sequence of [i,i+P) to equal [i+P,i+2P) — block_matches checks this
+       * first, per instruction.  Scanning opcodes here (no operand decode, no
+       * defs set) lets us skip collect_body_defs + the full block_matches for
+       * the common no-match case without changing the result.  i+2P<=n holds
+       * because max_P is capped so i+REROLL_MIN_REPEATS*P<=n.  This cuts the
+       * per-position O(periods) work dramatically on large straight-line
+       * bodies (e.g. GCC-vector lowering) where no run actually re-rolls. */
+      {
+        int opmatch = 1;
+        for (int k = 0; k < P; k++)
+          if (ir->compact_instructions[i + k].op != ir->compact_instructions[i + P + k].op) { opmatch = 0; break; }
+        if (!opmatch) continue;
+      }
+
       collect_body_defs(ir, i, P, &defs);
       int reps = count_repeats(ir, i, P, &map, &defs);
       if (reps < REROLL_MIN_REPEATS) continue;

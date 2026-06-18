@@ -1447,6 +1447,14 @@ static void ra_build_assign_hints(SSAInterval *intervals, int count,
     int32_t dest_vr = irop_get_vreg(d);
     int32_t src_vr = irop_get_vreg(s);
     if (dest_vr < 0 || src_vr < 0) continue;
+    /* Width gate: a `dest = src` ASSIGN whose dest and src differ in width is
+     * NOT a pure register copy — it is an extension (i32->i64 zeroes/sign-fills
+     * the high word) or a truncation.  Coalescing the two vregs into one
+     * register makes the post-RA move-coalescing pass erase the `mov`, so the
+     * high-word materialization the ASSIGN lowering would emit is lost and any
+     * later 64-bit consumer reads a garbage high half (e.g. a packed >32-bit
+     * bitfield read collapsed from a SAR/SHL/OR sign-extend idiom). */
+    if (irop_is_64bit(d) != irop_is_64bit(s)) continue;
     int dest_tbl = ASSIGN_VREG_IDX(dest_vr);
     int src_tbl = ASSIGN_VREG_IDX(src_vr);
     if (dest_tbl < 0 || dest_tbl >= table_size) continue;
@@ -1729,6 +1737,18 @@ static int ra_safe_loop_phi_coalesce(TCCIRState *ir, SSAInterval *cur, SSAInterv
   int32_t partner_vreg = partner->vreg;
 
   if (cur_start < 0 || cur_start >= n || partner_end < cur_start || partner_end >= n)
+    return 0;
+
+  /* cur (the loop update) must be consumed by the back-edge copy partner<-cur
+   * at partner_end, so cur must NOT outlive partner.  If cur->end > partner_end
+   * then cur and partner are two DISTINCT values that both span the loop body
+   * (they interfere), and sharing one register conflates them.  This was a
+   * self-host miscompile: the cross coalesced a pointer-holding interval with
+   * an index-holding one in ra_coalesce_graph (cur.end > partner.end), yielding
+   * a register used as both index and pointer, which corrupted that pass's own
+   * coalescing decisions on later compiles.  Legitimate loop-IV updates have
+   * cur.end <= partner.end (the update is dead after the back-edge copy). */
+  if ((int)cur->end > partner_end)
     return 0;
 
   /* Locate cur's def: first instruction in [cur_start, partner_end] whose

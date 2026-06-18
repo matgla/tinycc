@@ -174,7 +174,10 @@ AUTO_PCH_STAMPS = $(foreach X,$(TCC_X),$(TOP)/pch/.$X-auto-pch.stamp)
 
 $(info $(LIBTCC1_CROSS))
 # build cross compilers & libs
-cross: $(LIBTCC1_CROSS) $(PROGS_CROSS) $(FP_LIBS_CROSS) $(AUTO_PCH_STAMPS)
+# PCH disabled on YasOS (unused; costs runtime heap + startup probe time) —
+# auto-PCH generation dropped here.  Re-add $(AUTO_PCH_STAMPS) (and re-enable
+# the loader in tccpp.c / pch_auto_enabled) to restore precompiled headers.
+cross: $(LIBTCC1_CROSS) $(PROGS_CROSS) $(FP_LIBS_CROSS)
 
 # build specific cross compiler & lib
 cross-%: %-tcc$(EXESUF) %-libtcc1.a ;
@@ -215,12 +218,12 @@ $(FP_LIBS_STAMP_DIR)/.%-fp-libs.stamp: $(FP_LIBS_STAMP_DIR)/.%-tcc.checksum $(FP
 	@cp $(abspath $(FP_LIBS_STAMP_DIR)/.$*-tcc.checksum) $(abspath $(FP_LIBS_STAMP_DIR)/.$*-fp-libs.checksum.saved)
 
 $(TOP)/pch/.%-auto-pch.stamp: %-tcc$(EXESUF)
-	@mkdir -p "$(TOP)/pch/$*-"
-	@dir="$(abspath $(TOP)/pch/$*-)"; \
+	@mkdir -p "$(TOP)/pch/$*"
+	@dir="$(abspath $(TOP)/pch/$*)"; \
 	index="$$dir/auto.index"; \
 	tool="./$*-tcc$(EXESUF) -B$(TOP)"; \
 	rm -f "$$index"; \
-	for hdr in $(AUTO_PCH_COMMON_HEADERS); do rm -f "$$dir/$$hdr.pch"; done; \
+	for hdr in $(AUTO_PCH_COMMON_HEADERS); do rm -f "$$dir/$$hdr.pch" "$$dir/$$hdr.opt.pch"; done; \
 	includes="$$($$tool -print-search-dirs 2>/dev/null | awk 'BEGIN { in_include = 0 } /^include:$$/ { in_include = 1; next } /^[^ ]/ { if (in_include) exit } in_include { sub(/^  /, ""); if ($$0 != "-") print }' || true)"; \
 	for hdr in $(AUTO_PCH_COMMON_HEADERS); do \
 		src=""; \
@@ -230,19 +233,23 @@ $(TOP)/pch/.%-auto-pch.stamp: %-tcc$(EXESUF)
 				break; \
 			fi; \
 		done; \
-		if [ -n "$$src" ] && $$tool -generate-pch "$$src" -o "$$dir/$$hdr.pch" >/dev/null 2>&1; then \
-			probe="$$dir/.$$hdr.probe.c"; \
-			printf '#include <%s>\nint main(void){return 0;}\n' "$$hdr" > "$$probe"; \
-			out="$$($$tool -use-pch "$$dir/$$hdr.pch" -E "$$probe" 2>&1 >/dev/null || true)"; \
-			rm -f "$$probe"; \
-			if ! printf '%s' "$$out" | grep -q 'ignoring PCH'; then \
-				printf '%s\t%s\n' "$$src" "$$hdr.pch" >> "$$index"; \
+		[ -n "$$src" ] || continue; \
+		for opt in 0 1; do \
+			if [ "$$opt" = 0 ]; then oflags=""; pch="$$hdr.pch"; else oflags="-O$$opt"; pch="$$hdr.opt.pch"; fi; \
+			if $$tool $$oflags -generate-pch "$$src" -o "$$dir/$$pch" >/dev/null 2>&1; then \
+				probe="$$dir/.$$hdr.probe.c"; \
+				printf '#include <%s>\nint main(void){return 0;}\n' "$$hdr" > "$$probe"; \
+				out="$$($$tool $$oflags -use-pch "$$dir/$$pch" -E "$$probe" 2>&1 >/dev/null || true)"; \
+				rm -f "$$probe"; \
+				if ! printf '%s' "$$out" | grep -q 'ignoring PCH'; then \
+					printf '%s\t%s\n' "$$src" "$$pch" >> "$$index"; \
+				else \
+					rm -f "$$dir/$$pch"; \
+				fi; \
 			else \
-				rm -f "$$dir/$$hdr.pch"; \
+				rm -f "$$dir/$$pch"; \
 			fi; \
-		else \
-			rm -f "$$dir/$$hdr.pch"; \
-		fi; \
+		done; \
 	done; \
 	touch "$@"
 
@@ -506,6 +513,27 @@ PCH_PREPARE_SCRIPT := $(IRTESTS_DIR)/prepare_pch.py
 NEWLIB_DIR := $(IRTESTS_DIR)/qemu/mps2-an505/newlib_build/arm-none-eabi/newlib
 NEWLIB_LIBC_A := $(NEWLIB_DIR)/libc.a
 
+# newlib is a vendored submodule (its include dir is symlinked into
+# libc_includes/newlib).  We must not commit edits into it; instead keep local
+# fixups as patches under tests/ir_tests/patches and apply them idempotently
+# before any target that consumes the headers (warn-check, test-prepare).
+NEWLIB_SRC := $(IRTESTS_DIR)/qemu/mps2-an505/libs/newlib
+NEWLIB_PATCH_DIR := $(IRTESTS_DIR)/patches
+
+.PHONY: patch-newlib
+patch-newlib:
+	@for p in $$(ls $(NEWLIB_PATCH_DIR)/*.patch 2>/dev/null | sort); do \
+		ap=$$(cd $$(dirname "$$p") && pwd)/$$(basename "$$p"); \
+		if git -C $(NEWLIB_SRC) apply --reverse --check "$$ap" >/dev/null 2>&1; then \
+			: ; \
+		elif git -C $(NEWLIB_SRC) apply --check "$$ap" >/dev/null 2>&1; then \
+			echo "------------ newlib: applying patch $$(basename $$p) ------------"; \
+			git -C $(NEWLIB_SRC) apply "$$ap"; \
+		else \
+			echo "WARNING: newlib patch $$(basename $$p) does not apply cleanly (skipping)"; \
+		fi; \
+	done
+
 # Host tests for soft-float aeabi functions
 AEABI_HOST_TESTS = test_aeabi_all test_host test_dmul_host
 AEABI_HOST_TEST_DIR = lib/fp/soft
@@ -539,7 +567,7 @@ $(IRTESTS_VENV_STAMP): $(IRTESTS_REQUIREMENTS)
 	touch "$@"
 
 .PHONY: test-prepare
-test-prepare:
+test-prepare: patch-newlib
 	@set -e; \
 	if [ -f "$(NEWLIB_LIBC_A)" ]; then exit 0; fi; \
 	echo "------------ ir_tests: building newlib (first run) ------------"; \
@@ -596,7 +624,7 @@ WARN_CHECK_SRCS = \
 	tests/tests2/07_function.c
 
 .PHONY: warn-check
-warn-check: armv8m-tcc$(EXESUF)
+warn-check: armv8m-tcc$(EXESUF) patch-newlib
 	@echo "------------ warn-check: libtcc1.a build ------------"
 	@rm -f armv8m-libtcc1.a
 	@log=$$($(MAKE) --no-print-directory armv8m-libtcc1.a 2>&1) ; \

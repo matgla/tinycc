@@ -228,13 +228,40 @@ static int try_fold_cmp(IRSSAOptCtx *ctx, int cmp_idx, int jmp_idx)
   return 1;
 }
 
-static int process_block(IRSSAOptCtx *ctx, int b)
+/* Worklist item for the iterative dominator-tree walk.  kind==0 is a block to
+ * process; kind==1 is a deferred "pop the fact stack to this watermark",
+ * scheduled to run after the block's whole subtree completes. */
+typedef struct CmpEqWork {
+  int kind;
+  int value;
+} CmpEqWork;
+
+static int process_block(IRSSAOptCtx *ctx, int b_root)
 {
   TCCIRState *ir = ctx->ir;
   IRCFG *cfg = ctx->cfg;
-  IRBasicBlock *bb = &cfg->blocks[b];
-  int saved_count = fact_count;
   int changes = 0;
+
+  /* Iterative DFS with a heap worklist instead of native recursion, which was
+   * once-per-dominator-child deep and overflowed the 32 KB target process
+   * stack on deeply branch-nested functions.  A POP marker (kind==1) pushed
+   * below a block's children runs only after the entire subtree, preserving
+   * the post-recursion fact_pop_to(saved_count) scoping it replaces. */
+  CmpEqWork *stack = tcc_malloc(sizeof *stack * 16);
+  int sp = 0, cap = 16;
+  stack[sp].kind = 0;
+  stack[sp].value = b_root;
+  sp++;
+
+  while (sp > 0) {
+    sp--;
+    if (stack[sp].kind == 1) {
+      fact_pop_to(stack[sp].value);
+      continue;
+    }
+    int b = stack[sp].value;
+    IRBasicBlock *bb = &cfg->blocks[b];
+    int saved_count = fact_count;
 
   /* Push edge fact only if this block has a unique predecessor that is also
    * its immediate dominator.  A single recorded predecessor is NOT sufficient:
@@ -266,11 +293,24 @@ static int process_block(IRSSAOptCtx *ctx, int b)
       changes++;
   }
 
-  /* Recurse into dom children. */
-  for (int ci = 0; ci < bb->num_dom_children; ci++)
-    changes += process_block(ctx, bb->dom_children[ci]);
+    /* Schedule the fact-stack restore for after this block's subtree, then
+     * push the dominator-tree children above it. */
+    if (sp + 1 + bb->num_dom_children > cap) {
+      while (sp + 1 + bb->num_dom_children > cap)
+        cap *= 2;
+      stack = tcc_realloc(stack, sizeof *stack * cap);
+    }
+    stack[sp].kind = 1;
+    stack[sp].value = saved_count;
+    sp++;
+    for (int ci = 0; ci < bb->num_dom_children; ci++) {
+      stack[sp].kind = 0;
+      stack[sp].value = bb->dom_children[ci];
+      sp++;
+    }
+  } /* while (sp > 0) */
 
-  fact_pop_to(saved_count);
+  tcc_free(stack);
   return changes;
 }
 

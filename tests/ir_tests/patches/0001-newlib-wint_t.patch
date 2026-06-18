@@ -1,0 +1,22 @@
+diff --git a/newlib/libc/include/machine/_default_types.h b/newlib/libc/include/machine/_default_types.h
+index 6137493be..8e1fd76ed 100644
+--- a/newlib/libc/include/machine/_default_types.h
++++ b/newlib/libc/include/machine/_default_types.h
+@@ -37,6 +37,17 @@
+ extern "C" {
+ #endif
+ 
++/* YASOS tcc's <stddef.h> intentionally does not honor __need_wint_t (it would
++   defeat the multiple-include optimization), but newlib's <sys/_types.h>,
++   <wchar.h> and <wctype.h> all expect stddef.h to supply wint_t under that
++   macro.  Define it here -- the lowest-level type header every wint_t consumer
++   includes -- so the partial-include contract is satisfied without touching
++   stddef.h. */
++#ifndef _WINT_T
++#define _WINT_T
++typedef __WINT_TYPE__ wint_t;
++#endif
++
+ #ifdef __INT8_TYPE__
+ typedef __INT8_TYPE__ __int8_t;
+ #ifdef __UINT8_TYPE__

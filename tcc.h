@@ -385,12 +385,16 @@ typedef struct Sym Sym;
 
 #define INCLUDE_STACK_SIZE 32
 #define IFDEF_STACK_SIZE 64
-#define VSTACK_SIZE 512
+#define VSTACK_SIZE 256 /* YASOS: 512 was an upstream bump for the yarpgen fuzzer's
+                           pathological expressions; 256 fits real code and saves
+                           ~10 KiB .bss (513->257 * 40 B SValue). Clean tcc_error on overflow. */
 #define STRING_MAX_SIZE 1024
 #define TOKSTR_MAX_SIZE 256
 #define PACK_STACK_SIZE 8
 
-#define TOK_HASH_SIZE 4096 /* must be a power of two */
+#define TOK_HASH_SIZE 2048 /* must be a power of two. YASOS: 4096 -> 2048 saves 8 KiB
+                              .bss; device compiles intern few-hundred symbols so the
+                              table stays sparse (lazy-lib interning keeps it sparser). */
 #define TOK_ALLOC_INCR 256 /* must be a power of two */
 #define TOK_MAX_SIZE 4     /* token max size in int unit when stored in string */
 
@@ -502,6 +506,7 @@ struct FuncAttr
       func_rewritten_extern_inline : 1, /* extern inline rewritten to non-extern inline-only def */
       func_outofline_needed : 1,        /* always_inline call could not stay call-site-only */
       func_auto_inline : 1,             /* compiler-selected auto-inline candidate (small func) */
+      func_inline_call_heavy : 1,       /* auto-inline body keeps a non-foldable call: budget-limit expansions */
       func_eval_only_inline : 1,        /* body saved for const-fold only, not regular inlining */
       func_pure_via_sret : 1,           /* inferred: only observable side effect is *sret_arg writes */
       func_late_reopt : 1,              /* body kept for end-of-TU re-optimization (non-const static global fold) */
@@ -681,6 +686,19 @@ typedef struct DLLReference
   char name[1];
 } DLLReference;
 
+/* A loaded YAFF library kept for on-demand symbol resolution.  Rather than
+   interning all of a library's exports, tcc reads its on-disk exported-symbol
+   tables (name/value region + index->offset lookup + name hash) and resolves a
+   referenced symbol by hashing its name into the on-disk hash (tcc_yaff_resolve)
+   — touching only the handful of symbols the link actually uses. */
+typedef struct YaffLib
+{
+  char *region;         /* exported-symbol entries (4B YaffSymbolEntry + name), owned */
+  unsigned short *lookup; /* symbol index -> byte offset into region, owned */
+  unsigned int *hash;   /* [nbucket, nchain, bucket[nbucket], chain[nchain]], owned */
+  unsigned int nsyms;   /* exported_symbols_amount (== lookup/chain length) */
+} YaffLib;
+
 /* -------------------------------------------------- */
 
 #define SYM_STRUCT 0x40000000     /* struct/union/enum symbol space */
@@ -790,6 +808,7 @@ typedef struct InlineFunc
 {
   TokenString *func_str;
   Sym *sym;
+  int inline_count; /* number of auto-inline expansions performed so far (call-heavy budget) */
   char filename[1];
 } InlineFunc;
 
@@ -847,23 +866,11 @@ typedef struct CachedInclude
 
 #define CACHED_INCLUDES_HASH_SIZE 32
 
-#define TCC_PCH_MAGIC 0x48504354u
-#define TCC_PCH_VERSION 1u
-
-enum
-{
-  TCC_PCH_SEC_STRINGS = 1,
-  TCC_PCH_SEC_IDENTS,
-  TCC_PCH_SEC_TOKEN_BLOBS,
-  TCC_PCH_SEC_MACROS,
-  TCC_PCH_SEC_MACRO_ARGS,
-  TCC_PCH_SEC_REPLAY_RECORDS,
-  TCC_PCH_SEC_CACHED_INCLUDES,
-  TCC_PCH_SEC_DEPENDENCIES,
-  TCC_PCH_SEC_PRAGMA_LIBS,
-  TCC_PCH_SEC_MANIFEST,
-};
-
+/* NOTE: precompiled-header (PCH) support was removed on YasOS (unused; it cost
+   runtime heap for the loaded ident/macro/token tables plus flash for the
+   serializer).  The enum below is retained because TCC_PCH_REPLAY_PACK_* is
+   reused by the general deferred-#pragma-pack replay mechanism (TOK_PACK_REPLAY
+   in saved token streams), which is NOT PCH-specific. */
 enum
 {
   TCC_PCH_REPLAY_TOKENS = 1,
@@ -871,143 +878,6 @@ enum
   TCC_PCH_REPLAY_PACK_PUSH,
   TCC_PCH_REPLAY_PACK_POP,
 };
-
-typedef struct TCCPCHFileHeader
-{
-  uint32_t magic;
-  uint32_t version;
-  uint32_t header_size;
-  uint32_t section_count;
-  uint32_t endianness;
-  uint32_t sizeof_int;
-  uint32_t long_size;
-  uint32_t ldouble_size;
-  uint32_t ptr_size;
-  uint32_t tok_ident_value;
-  uint32_t builtin_ident_count;
-  uint64_t keywords_hash;
-  uint32_t filetype;
-  uint32_t float_abi;
-  uint32_t fpu_type;
-  uint64_t predefines_hash;
-  uint64_t include_path_hash;
-  uint64_t dependency_hash;
-  uint32_t ident_count;
-  uint32_t macro_count;
-  uint32_t macro_arg_count;
-  uint32_t replay_count;
-  uint32_t include_count;
-  uint32_t pragma_lib_count;
-  uint32_t dependency_count;
-  uint32_t counter_delta;
-} TCCPCHFileHeader;
-
-typedef struct TCCPCHSectionHeader
-{
-  uint32_t kind;
-  uint32_t offset;
-  uint32_t size;
-} TCCPCHSectionHeader;
-
-typedef struct TCCPCHIdentRecord
-{
-  uint32_t token;
-  uint32_t string_off;
-  uint32_t len;
-} TCCPCHIdentRecord;
-
-typedef struct TCCPCHMacroRecord
-{
-  uint32_t name_token;
-  uint32_t macro_type;
-  uint32_t arg_start;
-  uint32_t arg_count;
-  uint32_t tok_blob_off_words;
-  uint32_t tok_blob_len_words;
-} TCCPCHMacroRecord;
-
-typedef struct TCCPCHMacroArgRecord
-{
-  uint32_t token;
-  uint32_t is_vaargs;
-} TCCPCHMacroArgRecord;
-
-typedef struct TCCPCHReplayRecord
-{
-  uint32_t kind;
-  uint32_t arg0;
-  uint32_t arg1;
-} TCCPCHReplayRecord;
-
-typedef struct TCCPCHCachedIncludeRecord
-{
-  uint32_t filename_off;
-  uint32_t ifndef_macro;
-  uint32_t once;
-} TCCPCHCachedIncludeRecord;
-
-typedef struct TCCPCHDependencyRecord
-{
-  uint32_t filename_off;
-  uint32_t reserved;
-  uint64_t size;
-  uint64_t mtime_sec;
-  uint64_t mtime_nsec;
-} TCCPCHDependencyRecord;
-
-typedef struct TCCPCHPragmaLibRecord
-{
-  uint32_t string_off;
-} TCCPCHPragmaLibRecord;
-
-typedef struct TCCPCHManifestRecord
-{
-  uint32_t root_filename_off;
-  uint32_t generator_version_off;
-} TCCPCHManifestRecord;
-
-typedef struct TCCPCHState
-{
-  char *filename;
-  char *root_filename;
-  char *generator_version;
-  unsigned char *raw; /* raw file buffer; section pointers alias into this */
-  char *strings;
-  int strings_size;
-  int *token_blob;
-  int token_blob_words;
-  TCCPCHIdentRecord *idents;
-  TCCPCHMacroRecord *macros;
-  TCCPCHMacroArgRecord *macro_args;
-  TCCPCHReplayRecord *replay_records;
-  TCCPCHCachedIncludeRecord *cached_includes;
-  TCCPCHDependencyRecord *dependencies;
-  TCCPCHPragmaLibRecord *pragma_libs;
-  int nb_idents;
-  int nb_macros;
-  int nb_macro_args;
-  int nb_replay_records;
-  int nb_cached_includes;
-  int nb_dependencies;
-  int nb_pragma_libs;
-  uint32_t counter_delta;
-  uint32_t filetype;
-  int builtin_token_delta;
-  int applied;
-  int consumed;
-  int replay_active;
-  int replay_index;
-  struct BufferedFile *replay_file;
-  const int *replay_ptr;
-  const int *replay_end;
-} TCCPCHState;
-
-typedef struct TCCAutoPCHEntry
-{
-  char *header_path;
-  char *pch_name;
-  int disabled;
-} TCCAutoPCHEntry;
 
 #ifdef CONFIG_TCC_ASM
 
@@ -1250,6 +1120,14 @@ struct TCCState
 #endif
   unsigned char text_and_data_separation; /* support for GCC
                                              -mno-pic-data-is-text-relative */
+  unsigned int yaff_stack_size; /* -stack-size=N: per-image stack hint (bytes)
+                                   written into the YAFF header; 0 = default */
+  unsigned int yaff_heap_size;  /* -heap-size=N: per-image heap cap (bytes)
+                                   written into the YAFF header; 0 = default */
+  unsigned char share_rodata;   /* -share-rodata: RELRO — route const objects
+                                   with pointer-bearing types to the writable
+                                   data segment so .rodata stays pure-const and
+                                   can be shared (XIP) across processes */
 
   unsigned char has_text_addr;
   addr_t text_addr;       /* address of text section */
@@ -1276,6 +1154,10 @@ struct TCCState
   /* array of all loaded dlls (including those referenced by loaded dlls) */
   DLLReference **loaded_dlls;
   int nb_loaded_dlls;
+
+  /* Loaded YAFF libraries, kept for on-demand symbol resolution (see YaffLib). */
+  YaffLib *yaff_libs;
+  int nb_yaff_libs;
 
   /* include paths */
   char **include_paths;
@@ -1328,27 +1210,6 @@ struct TCCState
   int *pack_stack_ptr;
   char **pragma_libs;
   int nb_pragma_libs;
-
-  int pch_ident_start;
-  int pch_replay_token_start;
-  int pch_macro_depth;
-  int pch_filetype;
-  int pch_auto_enabled;
-  int pch_verbose;
-  int pch_is_auto;
-  uint64_t pch_predefines_hash_cached;
-  int pch_predefines_hash_valid;
-  uint64_t pch_include_path_hash_cached;
-  int pch_include_path_hash_valid;
-  int pch_auto_index_loaded;
-  int nb_pch_replay_records;
-  int alloc_pch_replay_records;
-  TCCPCHReplayRecord *pch_replay_records;
-  TokenString pch_token_blob;
-  char *pch_infile;
-  TCCPCHState *pch;
-  TCCAutoPCHEntry *auto_pch_entries;
-  int nb_auto_pch_entries;
 
   /* inline functions are stored as token lists and compiled last
      only if referenced */
@@ -1845,8 +1706,11 @@ static inline SValue tcc_ir_svalue_call_id_argc(int call_id, int argc)
 #define TOK_PPNUM 0xd1      /* preprocessor number */
 #define TOK_PPSTR 0xd2      /* preprocessor string */
 #define TOK_LINENUM 0xd3    /* line number info */
+#define TOK_PACK_REPLAY 0xd4 /* deferred #pragma pack action embedded in a saved
+                                token stream; tokc.i encodes (kind<<16)|value.
+                                Applied (not emitted) when replayed via next(). */
 
-#define TOK_HAS_VALUE(t) (t >= TOK_CCHAR && t <= TOK_LINENUM)
+#define TOK_HAS_VALUE(t) (t >= TOK_CCHAR && t <= TOK_PACK_REPLAY)
 
 #define TOK_EOF (-1)    /* end of file */
 #define TOK_LINEFEED 10 /* line feed */
@@ -1860,7 +1724,15 @@ enum tcc_token
 #define DEF(id, str) , id
 #include "tcctok.h"
 #undef DEF
+  /* Sentinel: one past the last builtin token.  The tcc_keywords blob holds
+     every builtin token string in this same (enum) order, so the i-th blob
+     entry has token id TOK_IDENT + i, and NB_BUILTIN_TOKS is exactly the
+     number of builtin tokens.  Used by the lazy builtin-token interner. */
+  , TOK_BUILTIN_END
 };
+
+/* number of reserved builtin token ids in [TOK_IDENT, TOK_IDENT+NB_BUILTIN_TOKS) */
+#define NB_BUILTIN_TOKS (TOK_BUILTIN_END - TOK_IDENT)
 
 /* keywords: tok >= TOK_IDENT && tok < TOK_UIDENT */
 #define TOK_UIDENT TOK_DEFINE
@@ -2121,6 +1993,12 @@ ST_DATA const int *macro_ptr;
 ST_DATA int parse_flags;
 ST_DATA int tok_flags;
 ST_DATA CString tokcstr; /* current parsed string, if any */
+/* When non-NULL (set by skip_or_save_block while recording a function body for
+   later token-stream replay), #pragma pack directives are appended to this
+   stream as TOK_PACK_REPLAY actions instead of mutating pack_stack now, so the
+   pack state is applied at the struct's position during replay, not eagerly
+   during the recording scan. */
+ST_DATA TokenString *pp_pragma_capture;
 
 /* display benchmark infos */
 ST_DATA int tok_ident;
@@ -2158,6 +2036,7 @@ enum line_macro_output_format
 };
 
 ST_FUNC TokenSym *tok_alloc(const char *str, int len);
+ST_FUNC TokenSym *tok_ensure(int v); /* table_ident[v], materializing a lazy builtin slot */
 ST_FUNC int tok_alloc_const(const char *str);
 ST_FUNC const char *get_tok_str(int v, CValue *cv);
 ST_FUNC void begin_macro(TokenString *str, int alloc);
@@ -2173,6 +2052,7 @@ ST_FUNC void tok_str_add(TokenString *s, int t);
 ST_FUNC void tok_str_add2(TokenString *s, int t, CValue *cv);
 ST_FUNC void tok_str_add_tok(TokenString *s);
 ST_FUNC void tok_get(int *t, const int **pp, CValue *cv);
+ST_FUNC void pp_apply_pack_replay(TCCState *s1, int code);
 ST_INLN void define_push(int v, int macro_type, int *str, Sym *first_arg);
 ST_FUNC void define_undef(Sym *s);
 ST_INLN Sym *define_find(int v);
@@ -2188,10 +2068,6 @@ ST_FUNC void tccpp_new(TCCState *s);
 ST_FUNC void tccpp_delete(TCCState *s);
 ST_FUNC void tccpp_putfile(const char *filename);
 ST_FUNC int tcc_preprocess(TCCState *s1);
-ST_FUNC int tcc_pch_generate(TCCState *s1, const char *filename, int filetype);
-ST_FUNC int tcc_pch_try_load(TCCState *s1, int filetype);
-ST_FUNC void tcc_pch_free(TCCState *s1);
-ST_FUNC void tcc_pch_auto_reset(TCCState *s1);
 ST_FUNC void skip(int c);
 ST_FUNC NORETURN void expect(const char *msg);
 ST_FUNC void pp_error(CString *cs);
@@ -2352,6 +2228,9 @@ ST_FUNC int put_elf_str(Section *s, const char *sym);
 ST_FUNC int put_elf_sym(Section *s, addr_t value, unsigned long size, int info, int other, int shndx, const char *name);
 ST_FUNC int set_elf_sym(Section *s, addr_t value, unsigned long size, int info, int other, int shndx, const char *name);
 ST_FUNC int find_elf_sym(Section *s, const char *name);
+ST_FUNC int tcc_dynsym_find(TCCState *s1, const char *name); /* find_elf_sym(dynsymtab) + lazy YAFF resolve */
+ST_FUNC int tcc_yaff_resolve(TCCState *s1, const char *name); /* on-disk-hash lookup + intern; 0 if absent */
+ST_FUNC void tcc_yaff_libs_free(TCCState *s1);
 ST_FUNC void put_elf_reloc(Section *symtab, Section *s, unsigned long offset, int type, int symbol);
 ST_FUNC void put_elf_reloca(Section *symtab, Section *s, unsigned long offset, int type, int symbol, addr_t addend);
 

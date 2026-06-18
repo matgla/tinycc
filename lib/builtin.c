@@ -105,7 +105,11 @@ int BUILTIN(ctz)(unsigned int x)
   CTZI(x)
 }
 
-int __ctzsi2(unsigned int x)
+/* weak: libgcc-style runtime fallback.  libc (bitops.c) provides strong
+   definitions of the __*si2/__*di2 bit helpers; a strong def overrides this
+   weak one with no "defined twice" clash, yet programs that don't link this
+   libc (e.g. newlib-based test binaries) still resolve it from libtcc1. */
+__attribute__((weak)) int __ctzsi2(unsigned int x)
 {
   CTZI(x)
 }
@@ -149,7 +153,7 @@ int BUILTIN(popcount)(unsigned int x)
   POPCOUNTI(x, 0x3f)
 }
 
-int __popcountsi2(unsigned int x)
+__attribute__((weak)) int __popcountsi2(unsigned int x)
 {
   POPCOUNTI(x, 0x3f)
 }

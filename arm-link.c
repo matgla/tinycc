@@ -20,6 +20,7 @@ ST_FUNC int code_reloc(int reloc_type)
   case R_ARM_REL32:
   case R_ARM_GOTPC:
   case R_ARM_GOTOFF:
+  case R_ARM_RODATA_OFF:
   case R_ARM_GOT32:
   case R_ARM_GOT_PREL:
   case R_ARM_COPY:
@@ -88,6 +89,9 @@ ST_FUNC int gotplt_entry_type(int reloc_type)
 
   case R_ARM_GOTPC:
   case R_ARM_GOTOFF:
+  case R_ARM_RODATA_OFF:
+    /* RODATA_OFF needs the GOT to exist (for the reserved rodata anchor slot)
+     * but no per-symbol GOT entry — same as GOTOFF. */
     return BUILD_GOT_ONLY;
 
   case R_ARM_GOT32:
@@ -573,6 +577,11 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
     return;
   case R_ARM_GOTOFF:
     add32le(ptr, val - s1->got->sh_addr);
+    return;
+  case R_ARM_RODATA_OFF:
+    /* Offset of the symbol within .rodata: anchor (rodata runtime base, from
+     * the reserved GOT slot) + this value = the symbol's address. */
+    add32le(ptr, val - rodata_section->sh_addr);
     return;
   case R_ARM_GOT32:
     /* we load the got offset */

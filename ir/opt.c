@@ -1917,13 +1917,29 @@ int tcc_ir_opt_block_copy_init(TCCIRState *ir)
     if (nstores < 2)
       continue;
 
-    /* Create the rodata block:
-     * 1. Allocate space in rodata section
+    /* RELRO: a block holding any symbol reference acquires a relocation, so it
+     * cannot live in shared read-only .rodata (the loader can't patch XIP). Put
+     * such blocks in the writable data segment (per-process) so .rodata stays
+     * relocation-free and shareable. Pure-constant blocks stay in .rodata. */
+    int block_has_symref = 0;
+    for (int s = 0; s < nstores; s++)
+    {
+      if (irop_get_tag(store_values[s]) == IROP_TAG_SYMREF)
+      {
+        block_has_symref = 1;
+        break;
+      }
+    }
+    Section *block_sec =
+        (block_has_symref && tcc_state->share_rodata) ? data_section : rodata_section;
+
+    /* Create the constant block:
+     * 1. Allocate space in the chosen section
      * 2. Zero-fill (from the memset)
      * 3. Write constant values + relocations for symbol refs
      */
-    size_t rodata_offset = section_add(rodata_section, total_size, 4);
-    uint8_t *rodata_ptr = rodata_section->data + rodata_offset;
+    size_t rodata_offset = section_add(block_sec, total_size, 4);
+    uint8_t *rodata_ptr = block_sec->data + rodata_offset;
     memset(rodata_ptr, 0, total_size);
 
     for (int s = 0; s < nstores; s++)
@@ -1936,7 +1952,7 @@ int tcc_ir_opt_block_copy_init(TCCIRState *ir)
         if (symref && symref->sym)
         {
           write32le(rodata_ptr + store_offsets[s], symref->addend);
-          greloc(rodata_section, symref->sym, rodata_offset + store_offsets[s], R_DATA_PTR);
+          greloc(block_sec, symref->sym, rodata_offset + store_offsets[s], R_DATA_PTR);
         }
       }
       else if (store_sizes[s] == 8)
@@ -1953,11 +1969,11 @@ int tcc_ir_opt_block_copy_init(TCCIRState *ir)
       }
     }
 
-    /* Create anonymous symbol pointing to the rodata block */
+    /* Create anonymous symbol pointing to the constant block */
     CType ctype;
     ctype.t = VT_PTR | VT_CONST;
     ctype.ref = NULL;
-    Sym *rodata_sym = get_sym_ref(&ctype, rodata_section, rodata_offset, total_size);
+    Sym *rodata_sym = get_sym_ref(&ctype, block_sec, rodata_offset, total_size);
 
     /* Build BLOCK_COPY operands:
      * dest = STACKOFF(base_offset) with is_local=1

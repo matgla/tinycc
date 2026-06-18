@@ -4253,13 +4253,28 @@ static void load_full_const(int r, int r1, uint32_t imm_lo, uint32_t imm_hi)
          *   loader patches the slot to the runtime code address.
          */
         int sym_in_code_section = 0;
+        int sym_in_rodata = 0;
         if (sym_off > 0 && sym_off < tcc_state->nb_sections)
         {
           Section *sym_sec = tcc_state->sections[sym_off];
           if (sym_sec && (sym_sec->sh_flags & SHF_EXECINSTR))
             sym_in_code_section = 1;
+          /* Only the main .rodata section is anchor-addressed: R_ARM_RODATA_OFF
+           * resolves against rodata_section->sh_addr, so a symbol in any OTHER
+           * read-only section would be mis-addressed. Exact pointer match. */
+          if (sym_sec && sym_sec == rodata_section)
+            sym_in_rodata = 1;
         }
-        if (sym->type.t & VT_STATIC && sym_off != SHN_UNDEF && sym_off != cur_text_section->sh_num &&
+        if (tcc_state->share_rodata && (sym->type.t & VT_STATIC) && sym_off != SHN_UNDEF &&
+            sym_in_rodata)
+        {
+          /* Same-module pure-const .rodata symbol: address via the rodata
+           * anchor (shared base) + R_ARM_RODATA_OFF (offset within .rodata),
+           * not GOTOFF (which assumes rodata sits at a fixed distance from the
+           * per-process GOT — false once .rodata is shared XIP). */
+          entry->relocation = R_ARM_RODATA_OFF;
+        }
+        else if (sym->type.t & VT_STATIC && sym_off != SHN_UNDEF && sym_off != cur_text_section->sh_num &&
             !sym_in_code_section)
         {
           /* Static data symbol — GOTOFF (same segment as GOT).
@@ -4304,7 +4319,27 @@ static void load_full_const(int r, int r1, uint32_t imm_lo, uint32_t imm_hi)
           if (sym_sec && (sym_sec->sh_flags & SHF_EXECINSTR))
             sym_in_code_section_cg = 1;
         }
-        if (sym->type.t & VT_STATIC && sym_off != SHN_UNDEF && sym_off != cur_text_section->sh_num &&
+        if (entry->relocation == R_ARM_RODATA_OFF)
+        {
+          /* Shared .rodata anchor: r holds (sym - rodata_base) from the
+           * R_ARM_RODATA_OFF literal. Add the rodata runtime base from the
+           * reserved GOT anchor slot:
+           *   push {tmp}; ldr tmp, [R9, #24]; add r, r, tmp; pop {tmp}
+           * Use a DETERMINISTIC fixed scratch (a low register other than r,
+           * saved by push/pop), NOT get_scratch_reg_with_save: the latter's
+           * callee-saved fallback is gated on !dry_run_state.active, so under
+           * register pressure (e.g. ps's larger functions) it can pick a
+           * different register in the dry-run vs real pass, desync instruction
+           * sizes, and corrupt literal-pool offsets — yielding a near-NULL
+           * rodata address. A fixed push/pop emits identically in both passes. */
+          int anchor_tmp = (r == 0) ? 1 : 0;
+          ot_check(th_push((uint16_t)(1u << anchor_tmp)));
+          ot_check_ldr_imm(anchor_tmp, R9, YAFF_RODATA_ANCHOR_GOT_OFFSET, 6, ENFORCE_ENCODING_NONE);
+          ot_check(
+              th_add_reg(r, r, anchor_tmp, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+          ot_check(th_pop((uint16_t)(1u << anchor_tmp)));
+        }
+        else if (sym->type.t & VT_STATIC && sym_off != SHN_UNDEF && sym_off != cur_text_section->sh_num &&
             !sym_in_code_section_cg)
         {
           /* Static data symbol — GOTOFF (add R9) */
@@ -6149,13 +6184,21 @@ static int thumb_try_mul_by_const_mop(MachineCodegenContext *ctx, MachineOperand
     break;
 
   case MUL_TWO_N_MINUS_1:
+  {
     /* Thumb-2 SUB Rd, Rn, Rm LSL #n = Rn - (Rm << n).
      * We need (var << n) - var, which is the reverse. No RSB with shift
-     * exists in Thumb-2, so we do: LSL Rd, var, #n; SUB Rd, Rd, var. */
-    ot_check(th_lsl_imm((uint32_t)dest_reg, (uint32_t)var_reg, (uint32_t)shift1, fl, ENFORCE_ENCODING_NONE));
+     * exists in Thumb-2, so we do: LSL tmp, var, #n; SUB Rd, tmp, var.
+     * The LSL destination must differ from var_reg, otherwise it destroys
+     * var before the SUB reads it (mach_ensure_in_reg returns an already-
+     * resident var in dest_reg's register, ignoring the exclusion mask, so
+     * dest_reg == var_reg is reachable).  Shift straight into dest when they
+     * differ; otherwise borrow a scratch. */
+    int tmp = (dest_reg == var_reg) ? mach_alloc_scratch(ctx, (1u << (uint32_t)var_reg)) : dest_reg;
+    ot_check(th_lsl_imm((uint32_t)tmp, (uint32_t)var_reg, (uint32_t)shift1, fl, ENFORCE_ENCODING_NONE));
     sh = (thumb_shift){THUMB_SHIFT_NONE, 0, THUMB_SHIFT_IMMEDIATE};
-    ot_check(th_sub_reg((uint32_t)dest_reg, (uint32_t)dest_reg, (uint32_t)var_reg, fl, sh, ENFORCE_ENCODING_NONE));
+    ot_check(th_sub_reg((uint32_t)dest_reg, (uint32_t)tmp, (uint32_t)var_reg, fl, sh, ENFORCE_ENCODING_NONE));
     break;
+  }
 
   case MUL_TWO_N_PLUS_1_SHIFT:
     sh = (thumb_shift){THUMB_SHIFT_LSL, (uint16_t)shift1, THUMB_SHIFT_IMMEDIATE};
@@ -6164,12 +6207,17 @@ static int thumb_try_mul_by_const_mop(MachineCodegenContext *ctx, MachineOperand
     break;
 
   case MUL_TWO_N_MINUS_1_SHIFT:
-    /* (2^a - 1) * 2^b: LSL Rd, var, #a; SUB Rd, Rd, var; LSL Rd, Rd, #b */
-    ot_check(th_lsl_imm((uint32_t)dest_reg, (uint32_t)var_reg, (uint32_t)shift1, fl, ENFORCE_ENCODING_NONE));
+  {
+    /* (2^a - 1) * 2^b: LSL tmp, var, #a; SUB tmp, tmp, var; LSL Rd, tmp, #b.
+     * As in MUL_TWO_N_MINUS_1, the first LSL must not target var_reg, or it
+     * destroys var before the SUB reads it. */
+    int tmp = (dest_reg == var_reg) ? mach_alloc_scratch(ctx, (1u << (uint32_t)var_reg)) : dest_reg;
+    ot_check(th_lsl_imm((uint32_t)tmp, (uint32_t)var_reg, (uint32_t)shift1, fl, ENFORCE_ENCODING_NONE));
     sh = (thumb_shift){THUMB_SHIFT_NONE, 0, THUMB_SHIFT_IMMEDIATE};
-    ot_check(th_sub_reg((uint32_t)dest_reg, (uint32_t)dest_reg, (uint32_t)var_reg, fl, sh, ENFORCE_ENCODING_NONE));
-    ot_check(th_lsl_imm((uint32_t)dest_reg, (uint32_t)dest_reg, (uint32_t)shift2, fl, ENFORCE_ENCODING_NONE));
+    ot_check(th_sub_reg((uint32_t)tmp, (uint32_t)tmp, (uint32_t)var_reg, fl, sh, ENFORCE_ENCODING_NONE));
+    ot_check(th_lsl_imm((uint32_t)dest_reg, (uint32_t)tmp, (uint32_t)shift2, fl, ENFORCE_ENCODING_NONE));
     break;
+  }
 
   default:
     return 0;
@@ -6693,7 +6741,13 @@ ST_FUNC int tcc_gen_machine_mlal_accum_mop(MachineOperand src1, MachineOperand s
 
   int rd_lo = dest.u.reg.r0;
   int rd_hi = dest.u.reg.r1;
-  if (!thumb_is_hw_reg(rd_lo) || !thumb_is_hw_reg(rd_hi) || rd_lo == rd_hi)
+  /* Inline the hw-reg range checks rather than calling thumb_is_hw_reg(): the
+   * self-host cross drops the argument move into the inlined helper here and
+   * tests a stale register (the dest pointer) instead of rd_lo/rd_hi, so the
+   * native compiler wrongly bails out of every in-place 64-bit MLA with
+   * "unable to lower 64-bit MLA".  Direct comparisons on rd_lo/rd_hi (as the
+   * adjacent rd_lo == rd_hi check already does) compile correctly. */
+  if (rd_lo < 0 || rd_lo > 15 || rd_hi < 0 || rd_hi > 15 || rd_lo == rd_hi)
     return 0;
 
   MachineCodegenContext ctx = {0};

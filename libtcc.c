@@ -177,15 +177,7 @@ PUB_FUNC void tcc_free(void *ptr)
 
 PUB_FUNC void *tcc_malloc(unsigned long size)
 {
-  void *p = reallocator(0, size);
-  /* DEBUG: TCC_POISON fills raw (non-zeroed) allocations with garbage to mimic
-   * the device's PSRAM heap (vs QEMU/host SRAM which reads zero). If the host
-   * cross-tcc then reproduces the 90_struct R8 misallocation, an uninitialized
-   * tcc_malloc field in regalloc is the cause. tcc_mallocz zeroes after, so
-   * only non-zeroed allocations are poisoned. */
-  if (p && getenv("TCC_POISON"))
-    memset(p, 0xAA, size);
-  return p;
+  return reallocator(0, size);
 }
 
 PUB_FUNC void *tcc_realloc(void *ptr, unsigned long size)
@@ -715,7 +707,7 @@ static int tcc_compile(TCCState *s1, int filetype, const char *str, int fd)
     preprocess_start(s1, filetype);
     tccgen_init(s1);
 
-    if (s1->output_type != TCC_OUTPUT_PREPROCESS && s1->output_type != TCC_OUTPUT_PCH)
+    if (s1->output_type != TCC_OUTPUT_PREPROCESS)
       tccelf_begin_file(s1);
 
     if (s1->do_bench)
@@ -730,10 +722,6 @@ static int tcc_compile(TCCState *s1, int filetype, const char *str, int fd)
     if (s1->output_type == TCC_OUTPUT_PREPROCESS)
     {
       tcc_preprocess(s1);
-    }
-    else if (s1->output_type == TCC_OUTPUT_PCH)
-    {
-      tcc_pch_generate(s1, str, filetype);
     }
     else
     {
@@ -756,7 +744,7 @@ static int tcc_compile(TCCState *s1, int filetype, const char *str, int fd)
       phase_start = tcc_getclock_ms();
     }
 
-    if (s1->output_type != TCC_OUTPUT_PREPROCESS && s1->output_type != TCC_OUTPUT_PCH)
+    if (s1->output_type != TCC_OUTPUT_PREPROCESS)
       tccelf_end_file(s1);
   }
   tccgen_finish(s1);
@@ -834,6 +822,10 @@ LIBTCCAPI TCCState *tcc_new(void)
   s->section_align = 4;
   s->text_addr = 0;
   s->has_text_addr = 1;
+  /* RELRO rodata sharing is on by default for YASOS: .rodata is kept pure-const
+   * (pointer-bearing const objects go to the writable data segment) and shared
+   * XIP across processes. Disable with -no-share-rodata. */
+  s->share_rodata = 1;
 #else
   s->text_and_data_separation = 0;
 #endif
@@ -844,7 +836,6 @@ LIBTCCAPI TCCState *tcc_new(void)
   s->ppfp = stdout;
   /* might be used in error() before preprocess_start() */
   s->include_stack_ptr = s->include_stack;
-  s->pch_auto_enabled = 1;
 
   tcc_set_lib_path(s, CONFIG_TCCDIR);
   return s;
@@ -876,7 +867,6 @@ LIBTCCAPI void tcc_delete(TCCState *s1)
   /* free include paths */
   dynarray_reset(&s1->include_paths, &s1->nb_include_paths);
   dynarray_reset(&s1->sysinclude_paths, &s1->nb_sysinclude_paths);
-  tcc_pch_auto_reset(s1);
 
   tcc_free(s1->tcc_lib_path);
   tcc_free(s1->soname);
@@ -887,12 +877,10 @@ LIBTCCAPI void tcc_delete(TCCState *s1)
   tcc_free(s1->mapfile);
   tcc_free(s1->outfile);
   tcc_free(s1->deps_outfile);
-  tcc_free(s1->pch_infile);
   tcc_free(s1->linker_script);
 #ifdef CONFIG_TCC_DEBUG
   tcc_free(s1->dump_ir_passes);
 #endif
-  tcc_pch_free(s1);
   if (s1->ld_script)
   {
     ld_script_cleanup(s1->ld_script);
@@ -908,6 +896,7 @@ LIBTCCAPI void tcc_delete(TCCState *s1)
   tcc_free(s1->dState);
   /* free loaded dlls array */
   dynarray_reset(&s1->loaded_dlls, &s1->nb_loaded_dlls);
+  tcc_yaff_libs_free(s1);
   tcc_free(s1);
 #ifdef MEM_DEBUG
   tcc_memcheck(-1);
@@ -947,7 +936,7 @@ LIBTCCAPI int tcc_set_output_type(TCCState *s, int output_type)
     tcc_add_sysinclude_path(s, CONFIG_TCC_SYSINCLUDEPATHS);
   }
 
-  if (output_type == TCC_OUTPUT_PREPROCESS || output_type == TCC_OUTPUT_PCH)
+  if (output_type == TCC_OUTPUT_PREPROCESS)
   {
     s->do_debug = 0;
     return 0;
@@ -1094,8 +1083,7 @@ ST_FUNC int tcc_add_file_internal(TCCState *s1, const char *filename, int flags)
   else
   {
     /* update target deps */
-    if (s1->output_type != TCC_OUTPUT_PCH)
-      dynarray_add(&s1->target_deps, &s1->nb_target_deps, tcc_strdup(filename));
+    dynarray_add(&s1->target_deps, &s1->nb_target_deps, tcc_strdup(filename));
     ret = tcc_compile(s1, flags, filename, fd);
   }
   s1->current_filename = NULL;
@@ -1239,7 +1227,6 @@ LIBTCCAPI int tcc_add_symbol(TCCState *s1, const char *name, const void *val)
 
 LIBTCCAPI void tcc_set_lib_path(TCCState *s, const char *path)
 {
-  tcc_pch_auto_reset(s);
   tcc_free(s->tcc_lib_path);
   s->tcc_lib_path = tcc_strdup(path);
 }
@@ -1572,10 +1559,6 @@ enum
   TCC_OPTION_run,
   TCC_OPTION_w,
   TCC_OPTION_E,
-  TCC_OPTION_generate_pch,
-  TCC_OPTION_use_pch,
-  TCC_OPTION_verbose_pch,
-  TCC_OPTION_fno_auto_pch,
   TCC_OPTION_M,
   TCC_OPTION_MD,
   TCC_OPTION_MF,
@@ -1593,6 +1576,10 @@ enum
   TCC_OPTION_compatibility_version,
   TCC_OPTION_current_version,
   TCC_OPTION_mpic_data_is_text_relative,
+  TCC_OPTION_stack_size,
+  TCC_OPTION_heap_size,
+  TCC_OPTION_share_rodata,
+  TCC_OPTION_no_share_rodata,
   TCC_OPTION_fpic,
   TCC_OPTION_fpie,
   TCC_OPTION_no_pie,
@@ -1611,9 +1598,6 @@ static const TCCOption tcc_options[] = {
     {"-help", TCC_OPTION_HELP, 0},
     {"?", TCC_OPTION_HELP, 0},
     {"hh", TCC_OPTION_HELP2, 0},
-    /* Must appear before the short "-v" option, otherwise "-verbose-pch" is parsed as "-v erbose-pch". */
-    {"verbose-pch", TCC_OPTION_verbose_pch, 0},
-    {"fno-auto-pch", TCC_OPTION_fno_auto_pch, 0},
     {"v", TCC_OPTION_v, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP},
     {"-version", TCC_OPTION_v, 0}, /* handle as verbose, also prints version*/
     {"I", TCC_OPTION_I, TCC_OPTION_HAS_ARG},
@@ -1624,8 +1608,6 @@ static const TCCOption tcc_options[] = {
     {"B", TCC_OPTION_B, TCC_OPTION_HAS_ARG},
     {"l", TCC_OPTION_l, TCC_OPTION_HAS_ARG},
     {"bench", TCC_OPTION_bench, 0},
-    {"generate-pch", TCC_OPTION_generate_pch, TCC_OPTION_HAS_ARG},
-    {"use-pch", TCC_OPTION_use_pch, TCC_OPTION_HAS_ARG},
     {"g", TCC_OPTION_g, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP},
     {"c", TCC_OPTION_c, 0},
     {"dumpmachine", TCC_OPTION_dumpmachine, 0},
@@ -1660,6 +1642,12 @@ static const TCCOption tcc_options[] = {
     {"march=", TCC_OPTION_march, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP},
     {"march", TCC_OPTION_march, TCC_OPTION_HAS_ARG},
     {"mpic-data-is-text-relative", TCC_OPTION_mpic_data_is_text_relative, 0},
+    {"stack-size=", TCC_OPTION_stack_size, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP},
+    {"stack-size", TCC_OPTION_stack_size, TCC_OPTION_HAS_ARG},
+    {"heap-size=", TCC_OPTION_heap_size, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP},
+    {"heap-size", TCC_OPTION_heap_size, TCC_OPTION_HAS_ARG},
+    {"share-rodata", TCC_OPTION_share_rodata, 0},
+    {"no-share-rodata", TCC_OPTION_no_share_rodata, 0},
 #endif
     {"m", TCC_OPTION_m, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP},
     {"f", TCC_OPTION_f, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP},
@@ -1999,12 +1987,6 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
         tcc_warning("-%s: overriding compiler action already specified", popt->name);
       s->output_type = x;
       break;
-    set_output_type_add_file:
-      if (s->output_type)
-        tcc_warning("-%s: overriding compiler action already specified", popt->name);
-      s->output_type = x;
-      args_parser_add_file(s, optarg, AFF_TYPE_C | (s->filetype & ~AFF_TYPE_MASK));
-      break;
     case TCC_OPTION_d:
       if (*optarg == 'D')
         s->dflag = 3;
@@ -2182,6 +2164,18 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
       printf("Setting text and data separation to: 1\n");
       s->text_and_data_separation = 1;
       break;
+    case TCC_OPTION_stack_size:
+      s->yaff_stack_size = (unsigned int)strtoul(optarg, NULL, 0);
+      break;
+    case TCC_OPTION_heap_size:
+      s->yaff_heap_size = (unsigned int)strtoul(optarg, NULL, 0);
+      break;
+    case TCC_OPTION_share_rodata:
+      s->share_rodata = 1;
+      break;
+    case TCC_OPTION_no_share_rodata:
+      s->share_rodata = 0;
+      break;
 #endif
     case TCC_OPTION_m:
       if (set_flag(s, options_m, optarg) < 0)
@@ -2220,19 +2214,6 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
     case TCC_OPTION_E:
       x = TCC_OUTPUT_PREPROCESS;
       goto set_output_type;
-    case TCC_OPTION_generate_pch:
-      x = TCC_OUTPUT_PCH;
-      goto set_output_type_add_file;
-    case TCC_OPTION_use_pch:
-      tcc_free(s->pch_infile);
-      s->pch_infile = tcc_strdup(optarg);
-      break;
-    case TCC_OPTION_verbose_pch:
-      s->pch_verbose = 1;
-      break;
-    case TCC_OPTION_fno_auto_pch:
-      s->pch_auto_enabled = 0;
-      break;
     case TCC_OPTION_P:
       s->Pflag = atoi(optarg) + 1;
       break;

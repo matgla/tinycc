@@ -27,8 +27,6 @@
 
 static const char help[] = "Tiny C Compiler " TCC_VERSION " - Copyright (C) 2001-2006 Fabrice Bellard\n"
                            "Usage: tcc [options...] [-o outfile] [-c] infile(s)...\n"
-                           "       tcc [options...] -generate-pch header [-o outfile]\n"
-                           "       tcc [options...] -use-pch file infile(s)...\n"
                            "       tcc [options...] -run infile (or --) [arguments...]\n"
                            "General options:\n"
                            "  -c           compile only - generate an object file\n"
@@ -48,8 +46,6 @@ static const char help[] = "Tiny C Compiler " TCC_VERSION " - Copyright (C) 2001
                            "  -Dsym[=val]  define 'sym' with value 'val'\n"
                            "  -Usym        undefine 'sym'\n"
                            "  -E           preprocess only\n"
-                           "  -generate-pch file  generate a preprocessor-only PCH from 'file'\n"
-                           "  -use-pch file       load a preprocessor-only PCH snapshot\n"
                            "Linker options:\n"
                            "  -Ldir        add library path 'dir'\n"
                            "  -llib        link with dynamic or static library 'lib'\n"
@@ -280,9 +276,7 @@ static char *default_outputfile(TCCState *s, const char *first_file)
     strcpy(ext, ".exe");
   else
 #endif
-  if (s->output_type == TCC_OUTPUT_PCH && *ext)
-    strcpy(ext, ".pch");
-  else if ((s->just_deps || s->output_type == TCC_OUTPUT_OBJ) && !s->option_r && *ext)
+  if ((s->just_deps || s->output_type == TCC_OUTPUT_OBJ) && !s->option_r && *ext)
     strcpy(ext, ".o");
   else
     strcpy(buf, "a.out");
@@ -380,19 +374,6 @@ redo:
         if (!ppfp)
           tcc_error_noabort("could not write '%s'", s->outfile);
       }
-    }
-    else if (s->output_type == TCC_OUTPUT_PCH)
-    {
-      if (s->nb_libraries)
-        tcc_error_noabort("cannot specify libraries with -generate-pch");
-      else if (s->pch_infile)
-        tcc_error_noabort("cannot combine -generate-pch with -use-pch");
-      else if (s->nb_files != 1)
-        tcc_error_noabort("-generate-pch requires exactly one header input");
-      else if (s->option_r)
-        tcc_error_noabort("cannot combine -generate-pch with -r");
-      else if (!s->outfile)
-        s->outfile = default_outputfile(s, s->files[0]->name);
     }
     else if (s->output_type == TCC_OUTPUT_OBJ && !s->option_r)
     {
@@ -540,7 +521,7 @@ redo:
   {
     t = 0;
   }
-  else if (s->output_type == TCC_OUTPUT_PREPROCESS || s->output_type == TCC_OUTPUT_PCH)
+  else if (s->output_type == TCC_OUTPUT_PREPROCESS)
   {
     ;
   }

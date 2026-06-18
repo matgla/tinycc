@@ -152,6 +152,25 @@ int tcc_ir_opt_switch_to_data(TCCIRState *ir)
 
   int changes = 0;
 
+  /* Per-case probe scratch.  Sized to the largest table (capped at 1024;
+   * larger tables are skipped below) and heap-allocated rather than placed
+   * on the stack — fixed [1024] arrays here reserve ~24 KiB of frame at the
+   * prologue for EVERY function, overflowing the 32 KiB target process stack
+   * even when the function has no switch tables to rewrite. */
+  int max_entries = 0;
+  for (int t = 0; t < ir->num_switch_tables; t++) {
+    int ne = ir->switch_tables[t].num_entries;
+    if (ne > max_entries)
+      max_entries = ne;
+  }
+  if (max_entries > 1024)
+    max_entries = 1024;
+  if (max_entries <= 0)
+    return 0;
+  int *probe_assign = tcc_malloc(max_entries * sizeof(int));
+  int *probe_jump = tcc_malloc(max_entries * sizeof(int));
+  IROperand *probe_val = tcc_malloc(max_entries * sizeof(IROperand));
+
   for (int i = 0; i < n; i++) {
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op != TCCIR_OP_SWITCH_TABLE)
@@ -174,11 +193,8 @@ int tcc_ir_opt_switch_to_data(TCCIRState *ir)
     int common_merge = -1;
     int common_dest_unsigned = 0;
     /* Record exact (assign_idx, jump_idx) per case to NOP after probing.
-     * Capped at 1024 to keep stack usage bounded; bail out on huge tables. */
+     * Capped at 1024 (probe buffers sized to max_entries); skip huge tables. */
     if (table->num_entries > 1024) continue;
-    int probe_assign[1024];
-    int probe_jump[1024];
-    IROperand probe_val[1024];
     for (int k = 0; k < table->num_entries; k++) {
       IROperand d, v;
       int merge, aidx, jidx;
@@ -249,8 +265,20 @@ int tcc_ir_opt_switch_to_data(TCCIRState *ir)
      * codegen time. */
     {
       int tbl_bytes = vtab->num_entries * 4;
-      size_t tbl_off = section_add(rodata_section, tbl_bytes, 4);
-      unsigned char *tbl = (unsigned char *)(rodata_section->data + tbl_off);
+      /* RELRO: a table with any symbol entry acquires relocations and so cannot
+       * live in shared read-only .rodata; put it in the writable data segment
+       * (per-process). Pure-constant (IMM32-only) tables stay in .rodata. */
+      int tbl_has_symref = 0;
+      for (int k = 0; k < vtab->num_entries; k++) {
+        if (vtab->values[k].tag == IROP_TAG_SYMREF) {
+          tbl_has_symref = 1;
+          break;
+        }
+      }
+      Section *tbl_sec =
+          (tbl_has_symref && tcc_state->share_rodata) ? data_section : rodata_section;
+      size_t tbl_off = section_add(tbl_sec, tbl_bytes, 4);
+      unsigned char *tbl = (unsigned char *)(tbl_sec->data + tbl_off);
       for (int k = 0; k < vtab->num_entries; k++) {
         IROperand v = vtab->values[k];
         uint32_t val = 0;
@@ -258,7 +286,7 @@ int tcc_ir_opt_switch_to_data(TCCIRState *ir)
           val = (uint32_t)v.u.imm32;
         } else if (v.tag == IROP_TAG_SYMREF) {
           IRPoolSymref *sr = &ir->pool_symref[v.u.pool_idx];
-          greloc(rodata_section, sr->sym, (unsigned long)(tbl_off + k * 4), R_ARM_ABS32);
+          greloc(tbl_sec, sr->sym, (unsigned long)(tbl_off + k * 4), R_ARM_ABS32);
           val = (uint32_t)sr->addend;
         } else {
           tcc_error("internal error: SWITCH_LOAD table entry has unsupported tag %d", (int)v.tag);
@@ -268,7 +296,7 @@ int tcc_ir_opt_switch_to_data(TCCIRState *ir)
         tbl[k * 4 + 2] = (unsigned char)((val >> 16) & 0xff);
         tbl[k * 4 + 3] = (unsigned char)((val >> 24) & 0xff);
       }
-      vtab->rodata_sym = get_sym_ref(&int_type, rodata_section, tbl_off, tbl_bytes);
+      vtab->rodata_sym = get_sym_ref(&int_type, tbl_sec, tbl_off, tbl_bytes);
     }
 
     /* NOP each case body's ASSIGN + JMP using exact indices recorded
@@ -307,6 +335,9 @@ int tcc_ir_opt_switch_to_data(TCCIRState *ir)
   if (changes > 0)
     LOG_IR_GEN("switch_to_data: rewrote %d SWITCH_TABLE(s) into SWITCH_LOAD", changes);
 
+  tcc_free(probe_assign);
+  tcc_free(probe_jump);
+  tcc_free(probe_val);
   return changes;
 }
 

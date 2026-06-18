@@ -60,6 +60,7 @@ TEST_FILES = [
     ("50_simple_struct.c", 0),
     ("60_landor.c", 0),
     ("61_simple_or.c", 0),
+    ("62_or_continue_shortcircuit.c", 0),
     ("90_global_array_assignment.c", 0),
     ("bug_swap.c", 0),
     ("bug_partition.c", 0),
@@ -391,6 +392,8 @@ TEST_FILES = [
     ("180_loop_rotation_condbody.c", 0),
     ("181_loop_const_sim_extern_store.c", 0),
     ("182_init_copy_global_fwd_alu.c", 0),
+    ("183_selfhost_inline_accumulate.c", 0),
+    ("184_packed_bitfield_rmw_store.c", 0),
 ]
 
 # Per-test compiler defines (e.g. for missing platform macros)

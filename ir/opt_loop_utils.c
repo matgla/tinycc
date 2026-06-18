@@ -876,9 +876,11 @@ int transform_derived_iv(TCCIRState *ir, IRLoop *loop, InductionVar *iv, Derived
     *out_stride_pos = -1;
 
   /* DIAGNOSTIC: temporarily disable all derived-IV strength reduction to test
-   * whether it is the source of the linker heap corruption. REMOVE after test. */
-  if (out_ptr_vreg != (void *)1)
-    return 0;
+   * whether it is the source of the linker heap corruption. REMOVE after test.
+   * (Plain early return rather than a `(void*)1` sentinel: the sentinel made
+   * GCC's VRP assume out_ptr_vreg == (void*)1 past the check, so the later
+   * `*out_ptr_vreg = ...` writes tripped -Werror=array-bounds.) */
+  return 0;
 
   /* Shared-pointer fast path: rewrite the use site to ASSIGN of the existing
    * primary's strength-reduced pointer.  No insertions — just rewrites.
@@ -3679,6 +3681,20 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
          * validation performed above, which guards their fall-through-to-exit. */
         if (!has_inner_loop && !cond_body && !break_invert && body_end_is_implicit)
           return 0;
+        /* A forward branch escaping the relocated body region [.., body_end_jmp].
+         * Only a branch to (or past) the loop exit is safe — it stays put after
+         * relocation.  A target that lands in the GAP (body_end_jmp, exit_target)
+         * means the real body continues past body_end_jmp: a multi-arm / if-else-if
+         * diamond body whose *first* arm jumps to the latch mid-body.  We detected
+         * body_end at that first arm, so the later arms (and their own JUMP-to-latch
+         * edges) sit in the un-relocated gap; after the latch moves into the rotated
+         * region those edges point into the new loop top — a miscompile.  Reject. */
+        if (jt > body_end_jmp && jt < exit_target)
+        {
+          LOG_LOOP_OPT("Rotation: reject — body branch at %d escapes to gap %d in (%d,%d)", i, jt, body_end_jmp,
+                       exit_target);
+          return 0;
+        }
         /* Branch outside modified region - no remap needed */
         if (jt < region_start_5 || jt > body_end_jmp)
         {
@@ -3780,21 +3796,41 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
               + lc * (sizeof(int) + 3 * sizeof(IROperand) + sizeof(uint32_t))
               + 12 * 8; /* per-sub-array alignment padding (<=7 bytes each) */
   char *_rbuf = (char *)tcc_mallocz(_rsz);
-  char *_rp = _rbuf;
-#define _RALIGN8() (_rp = (char *)(((uintptr_t)_rp + 7u) & ~(uintptr_t)7u))
-  _RALIGN8(); int *body_ops = (int *)_rp; _rp += bc * sizeof(int);
-  _RALIGN8(); int *body_has_extra = (int *)_rp; _rp += bc * sizeof(int);
-  _RALIGN8(); IROperand *body_dests = (IROperand *)_rp; _rp += bc * sizeof(IROperand);
-  _RALIGN8(); IROperand *body_src1s = (IROperand *)_rp; _rp += bc * sizeof(IROperand);
-  _RALIGN8(); IROperand *body_src2s = (IROperand *)_rp; _rp += bc * sizeof(IROperand);
-  _RALIGN8(); IROperand *body_extras = (IROperand *)_rp; _rp += bc * sizeof(IROperand);
-  _RALIGN8(); uint32_t *body_lines = (uint32_t *)_rp; _rp += bc * sizeof(uint32_t);
-  _RALIGN8(); int *latch_ops = (int *)_rp; _rp += lc * sizeof(int);
-  _RALIGN8(); IROperand *latch_dests = (IROperand *)_rp; _rp += lc * sizeof(IROperand);
-  _RALIGN8(); IROperand *latch_src1s = (IROperand *)_rp; _rp += lc * sizeof(IROperand);
-  _RALIGN8(); IROperand *latch_src2s = (IROperand *)_rp; _rp += lc * sizeof(IROperand);
-  _RALIGN8(); uint32_t *latch_lines = (uint32_t *)_rp;
-#undef _RALIGN8
+  /* Carve the sub-arrays at explicit, 8-aligned byte offsets — each computed
+   * from the PREVIOUS distinct offset variable.  Do NOT use a running
+   * `_rp = (_rp+7)&~7; ptr = _rp; _rp += n;` pointer: the armv8m self-host
+   * cross wrongly GVN-CSEs the repeated `(_rp+7)&~7` align expression across the
+   * `_rp += n` advances (it treats _rp as invariant), so every advance is
+   * dead-code-eliminated and all sub-arrays collapse onto _rbuf.  They then
+   * alias, the IROperand stores clobber body_ops[], and the rotated body writes
+   * a garbage opcode -> HardFault in write_instr_at_nop's irop_config[op] lookup.
+   * Distinct offset operands (a different SSA value per align) defeat the bad CSE. */
+#define _ROFF(prev, cnt, esz) ((((prev) + (size_t)(cnt) * (esz)) + 7u) & ~(size_t)7u)
+  size_t _o_body_ops       = 0;
+  size_t _o_body_has_extra = _ROFF(_o_body_ops, bc, sizeof(int));
+  size_t _o_body_dests     = _ROFF(_o_body_has_extra, bc, sizeof(int));
+  size_t _o_body_src1s     = _ROFF(_o_body_dests, bc, sizeof(IROperand));
+  size_t _o_body_src2s     = _ROFF(_o_body_src1s, bc, sizeof(IROperand));
+  size_t _o_body_extras    = _ROFF(_o_body_src2s, bc, sizeof(IROperand));
+  size_t _o_body_lines     = _ROFF(_o_body_extras, bc, sizeof(IROperand));
+  size_t _o_latch_ops      = _ROFF(_o_body_lines, bc, sizeof(uint32_t));
+  size_t _o_latch_dests    = _ROFF(_o_latch_ops, lc, sizeof(int));
+  size_t _o_latch_src1s    = _ROFF(_o_latch_dests, lc, sizeof(IROperand));
+  size_t _o_latch_src2s    = _ROFF(_o_latch_src1s, lc, sizeof(IROperand));
+  size_t _o_latch_lines    = _ROFF(_o_latch_src2s, lc, sizeof(IROperand));
+#undef _ROFF
+  int *body_ops          = (int *)(_rbuf + _o_body_ops);
+  int *body_has_extra    = (int *)(_rbuf + _o_body_has_extra);
+  IROperand *body_dests  = (IROperand *)(_rbuf + _o_body_dests);
+  IROperand *body_src1s  = (IROperand *)(_rbuf + _o_body_src1s);
+  IROperand *body_src2s  = (IROperand *)(_rbuf + _o_body_src2s);
+  IROperand *body_extras = (IROperand *)(_rbuf + _o_body_extras);
+  uint32_t *body_lines   = (uint32_t *)(_rbuf + _o_body_lines);
+  int *latch_ops         = (int *)(_rbuf + _o_latch_ops);
+  IROperand *latch_dests = (IROperand *)(_rbuf + _o_latch_dests);
+  IROperand *latch_src1s = (IROperand *)(_rbuf + _o_latch_src1s);
+  IROperand *latch_src2s = (IROperand *)(_rbuf + _o_latch_src2s);
+  uint32_t *latch_lines  = (uint32_t *)(_rbuf + _o_latch_lines);
 
   for (int b = 0; b < body_count; b++)
   {

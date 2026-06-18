@@ -128,51 +128,108 @@ uint32_t tcc_get_offset_to_imported_libraries(YaffHeader *header)
   return sizeof(YaffHeader) + tcc_yaff_align(header, name_length);
 }
 
+/* Load a YAFF shared library WITHOUT interning any of its exported symbols.
+   Instead read the library's own on-disk exported-symbol tables — the name/
+   value region, the index->offset lookup table, and the name hash — and keep
+   them so tcc_yaff_resolve can look a symbol up by name on demand, interning
+   only the handful the link actually references.  All reads are bounded by
+   header offsets (no lseek(SEEK_END), which broke on-device). */
 ST_FUNC int tcc_load_yaff(TCCState *s1, int fd, const char *filename, int level)
 {
-  int ret = 0;
   const char *soname = tcc_basename(filename);
   YaffHeader header;
-  char buffer[TCC_YAFF_MAX_SYMBOL_ENTRY_SIZE];
-  uint32_t offset = 0;
   full_read(fd, &header, sizeof(YaffHeader));
   if (memcmp(header.magic, "YAFF", 4) != 0)
-  {
     return tcc_error_noabort("not a valid YAFF file");
-  }
 
-  offset = header.exported_symbols_offset;
-
-  for (int i = 0; i < header.exported_symbols_amount; ++i)
+  if (header.exported_symbols_amount > 0)
   {
-    YaffSymbolEntry *entry = (YaffSymbolEntry *)buffer;
-    size_t len = 0;
-    lseek(fd, offset, SEEK_SET);
-    full_read(fd, buffer, sizeof(buffer));
-    len = strnlen(entry->name, sizeof(buffer) - sizeof(YaffSymbolEntry));
-    if (len == sizeof(buffer))
-    {
-      return tcc_error_noabort("symbol entry too long");
-    }
-    {
-      /* Use STT_FUNC for code symbols so PLT entries are created correctly.
-         Keep STT_NOTYPE for data symbols to avoid triggering R_ARM_COPY in
-         bind_exe_dynsyms — YAFF resolves data imports via GOT at load time,
-         so BSS copies are unnecessary and would break import/export
-         classification in the YAFF writer. */
-      int sym_type = entry->section == YAFF_SECTION_CODE ? STT_FUNC : STT_NOTYPE;
-      set_elf_sym(s1->dynsymtab_section, entry->offset, 1,
-                  ELFW(ST_INFO)(entry->weak ? STB_WEAK : STB_GLOBAL, sym_type),
-                  STV_DEFAULT, 1, entry->name);
-    }
-    offset += sizeof(uint32_t) + len + 1;
-    offset = tcc_yaff_align(&header, offset);
+    YaffLib *lib;
+    unsigned int region_size, hdr2[2], nbucket, nchain, lookup_size, chain_bytes;
+
+    s1->yaff_libs = tcc_realloc(s1->yaff_libs, (s1->nb_yaff_libs + 1) * sizeof(YaffLib));
+    lib = &s1->yaff_libs[s1->nb_yaff_libs++];
+    memset(lib, 0, sizeof(*lib));
+    lib->nsyms = header.exported_symbols_amount;
+
+    /* name/value region: [exported_symbols_offset, imported_symbols_lookup_offset) */
+    region_size = header.imported_symbols_lookup_offset - header.exported_symbols_offset;
+    lib->region = tcc_malloc(region_size);
+    lseek(fd, header.exported_symbols_offset, SEEK_SET);
+    if ((unsigned)full_read(fd, lib->region, region_size) != region_size)
+      return tcc_error_noabort("short read of YAFF export region");
+
+    /* index -> region byte-offset lookup table (one u16 per exported symbol) */
+    lookup_size = lib->nsyms * sizeof(unsigned short);
+    lib->lookup = tcc_malloc(lookup_size);
+    lseek(fd, header.exported_symbols_lookup_offset, SEEK_SET);
+    if ((unsigned)full_read(fd, lib->lookup, lookup_size) != lookup_size)
+      return tcc_error_noabort("short read of YAFF export lookup");
+
+    /* name hash: [nbucket, nchain, bucket[nbucket], chain[nchain]] (self-sized) */
+    lseek(fd, header.exported_symbols_hash_table_offset, SEEK_SET);
+    if ((unsigned)full_read(fd, hdr2, sizeof(hdr2)) != sizeof(hdr2))
+      return tcc_error_noabort("short read of YAFF hash header");
+    nbucket = hdr2[0];
+    nchain = hdr2[1];
+    chain_bytes = (nbucket + nchain) * sizeof(unsigned int);
+    lib->hash = tcc_malloc((2 + nbucket + nchain) * sizeof(unsigned int));
+    lib->hash[0] = nbucket;
+    lib->hash[1] = nchain;
+    if ((unsigned)full_read(fd, lib->hash + 2, chain_bytes) != chain_bytes)
+      return tcc_error_noabort("short read of YAFF hash table");
   }
 
   /* if the dll is already loaded, do not load it */
   tcc_add_dllref(s1, soname, level);
 
-  return ret;
+  return 0;
+}
+
+/* Resolve `name` against the loaded YAFF libraries via their on-disk hash
+   tables, interning a hit into dynsymtab_section.  Returns the dynsymtab index
+   (>0) or 0 if no loaded library exports it. */
+ST_FUNC int tcc_yaff_resolve(TCCState *s1, const char *name)
+{
+  unsigned int h = tcc_yaff_hash(name);
+  int li;
+  for (li = 0; li < s1->nb_yaff_libs; li++)
+  {
+    YaffLib *lib = &s1->yaff_libs[li];
+    unsigned int nbucket = lib->hash[0];
+    unsigned int *bucket = lib->hash + 2;
+    unsigned int *chain = lib->hash + 2 + nbucket;
+    unsigned int i;
+    for (i = bucket[h % nbucket]; i != 0; i = chain[i])
+    {
+      YaffSymbolEntry *e;
+      const char *ename;
+      if (i >= lib->nsyms)
+        break; /* corrupt chain guard */
+      e = (YaffSymbolEntry *)(lib->region + lib->lookup[i]);
+      ename = (const char *)e + sizeof(YaffSymbolEntry);
+      if (strcmp(ename, name) == 0)
+        return set_elf_sym(s1->dynsymtab_section, e->offset, 1,
+                           ELFW(ST_INFO)(e->weak ? STB_WEAK : STB_GLOBAL,
+                                         e->section == YAFF_SECTION_CODE ? STT_FUNC : STT_NOTYPE),
+                           STV_DEFAULT, 1, ename);
+    }
+  }
+  return 0;
+}
+
+ST_FUNC void tcc_yaff_libs_free(TCCState *s1)
+{
+  int i;
+  for (i = 0; i < s1->nb_yaff_libs; i++)
+  {
+    tcc_free(s1->yaff_libs[i].region);
+    tcc_free(s1->yaff_libs[i].lookup);
+    tcc_free(s1->yaff_libs[i].hash);
+  }
+  tcc_free(s1->yaff_libs);
+  s1->yaff_libs = NULL;
+  s1->nb_yaff_libs = 0;
 }
 
 /* Write local relocations for GOT entries that reference local symbols.
@@ -284,6 +341,24 @@ static int tcc_yaff_write_local_relocations(TCCState *s1, FILE *f)
     reloc_words[1] = target_offset;
     fwrite(reloc_words, 1, sizeof(reloc_words), f);
     ++count;
+  }
+
+  /* RELRO: emit the reserved rodata anchor slot (GOT index 3) so the loader
+   * fills it with the runtime base of .rodata. Code addresses shared .rodata
+   * symbols as anchor + R_ARM_RODATA_OFF(sym). Phase 2a points the anchor at
+   * the per-process rodata (offset 0 of the data segment, where .rodata still
+   * lives) — behaviour-preserving while the new codegen path is validated;
+   * Phase 2b retargets it to YAFF_SECTION_RODATA (the shared XIP segment). */
+  if (s1->share_rodata && s1->got)
+  {
+    uint32_t anchor_words[2];
+    anchor_words[0] =
+        ((uint32_t)YAFF_SECTION_DATA & 0x3u) | ((uint32_t)YAFF_RODATA_ANCHOR_GOT_INDEX << 2);
+    anchor_words[1] = 0; /* .rodata is at offset 0 of the data segment */
+    fwrite(anchor_words, 1, sizeof(anchor_words), f);
+    ++count;
+    LOG_YAFF("emitted rodata anchor local reloc: got index %d -> DATA off 0",
+             YAFF_RODATA_ANCHOR_GOT_INDEX);
   }
 
   LOG_YAFF("total local relocations: %d", count);
@@ -465,6 +540,7 @@ static int tcc_yaff_write_data_relocations(TCCState *s1, FILE *f)
           case R_ARM_TARGET1:
           case R_ARM_NONE:
           case R_ARM_GOTOFF:
+          case R_ARM_RODATA_OFF:
           case R_ARM_GOTPC:
           case R_ARM_GOT_PREL:
           case R_ARM_PC24:
@@ -627,9 +703,11 @@ static int tcc_yaff_write_symbol_table_relocations(TCCState *s1, FILE *f)
           case R_ARM_PREL31:
           case R_ARM_TARGET1:
           case R_ARM_NONE:
+          case R_ARM_RODATA_OFF:
           {
             // relocations that are safe to ignore due to their PC relative
-            // nature
+            // nature (R_ARM_RODATA_OFF is resolved at link time into the .text
+            // literal, like R_ARM_GOTOFF — no runtime YAFF relocation needed)
             continue;
           }
           default:
@@ -1038,6 +1116,34 @@ ST_FUNC int tcc_output_yaff(TCCState *s1, FILE *f, const char *filename)
     addr_t data_start = data_section->sh_addr;
     addr_t rd_padding = (data_start > rodata_end) ? (data_start - rodata_end) : 0;
     header.data_length = rodata_section->sh_size + rd_padding + data_section->sh_size;
+    if (s1->share_rodata)
+    {
+      /* RELRO: the first rodata_size bytes of the data segment are pure-const
+       * .rodata, shared XIP. The loader maps them once (borrowed) and only
+       * allocates/copies the remaining data per process, resolving a DATA
+       * target with offset < const_rodata_length to the shared rodata.
+       *
+       * SOUNDNESS GATE: this is only valid if .rodata is genuinely relocation
+       * -free. The frontend split (-share-rodata) moves pointer-bearing const
+       * *objects* to the writable data segment, but COMPILER-GENERATED const
+       * with relocations (e.g. switch jump tables holding code addresses)
+       * bypasses that and stays in .rodata. A relocation patch site lands in
+       * the shared XIP rodata, which the loader cannot write -> fault. So only
+       * share when .rodata carries no relocations (and rd_padding == 0, since
+       * the data cascade assumes it). Modules that fail the gate keep rodata
+       * per-process (const_rodata_length stays 0 -> legacy behaviour). */
+      int rodata_has_relocs = (rodata_section->reloc != NULL && rodata_section->reloc->data_offset > 0);
+      if (rd_padding != 0 || rodata_has_relocs)
+      {
+        LOG_YAFF("share-rodata: NOT sharing (.rodata has %u reloc bytes, rd_padding=%u)",
+                 rodata_section->reloc ? (unsigned)rodata_section->reloc->data_offset : 0u,
+                 (unsigned)rd_padding);
+      }
+      else
+      {
+        header.const_rodata_length = (uint32_t)rodata_section->sh_size;
+      }
+    }
   }
   /* bss_length must include any alignment padding between data and bss,
    * AND between bss and GOT, so that the loader reproduces the exact
@@ -1066,6 +1172,18 @@ ST_FUNC int tcc_output_yaff(TCCState *s1, FILE *f, const char *filename)
   {
     header.text_and_data_separation = 0;
   }
+  /* Per-image stack/heap hints (bytes). 0xFFFFFFFF = "use the OS default"
+   * (kernel-driven stack size; heap free to grow in the shared paged pool).
+   * A concrete value lets the kernel bound the process to a fixed footprint
+   * (the basis for MPU-guarded, profile-limited processes). The internal
+   * TCCState fields default to 0 (option not given) which we map to the
+   * default sentinel here. */
+  header.stack_size = s1->yaff_stack_size ? s1->yaff_stack_size : 0xFFFFFFFFu;
+  header.heap_size = s1->yaff_heap_size ? s1->yaff_heap_size : 0xFFFFFFFFu;
+  /* header.const_rodata_length was set in the data_length block above
+   * (rodata_size when -share-rodata, else 0). */
+  if (!s1->share_rodata)
+    header.const_rodata_length = 0;
 
   fwrite(&header, 1, sizeof(YaffHeader), f);
   aligned_name_len = strlen(name) + 1;
