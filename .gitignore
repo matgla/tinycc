@@ -100,3 +100,5 @@ tests/ir_tests/dump_ir_fine.txt
 .aider*
 .claude
 .cache
+scripts/.disasm_cache.json
+scripts/.disasm_cache.pending.json
