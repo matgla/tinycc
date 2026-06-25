@@ -12,8 +12,7 @@ def prepare_expect(filepath):
         output_dir = (Path(filepath).parent / "expected").resolve()
         output_file = output_dir / (Path(filepath).stem)
         output_file_gcc = output_dir / (Path(filepath).stem + "_gcc")
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
+        os.makedirs(output_dir, exist_ok=True)
         assert compiler is not None, "TEST_COMPARE_CC environment variable must be set to the ARM compiler path."
         _ = subprocess.run(
             [compiler, filepath, "-march=armv8-m.main+dsp", "-mfpu=fpv5-d16", "-mfloat-abi=hard", "-nostdlib", "-Wl,-Ttext=0x0", "-o", output_file_gcc],
@@ -42,8 +41,7 @@ def compile_code(filepath):
         print(filepath)
         output_dir = (Path(filepath).parent / "build").resolve()
         output_file = output_dir / (Path(filepath).stem)
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
+        os.makedirs(output_dir, exist_ok=True)
         assert compiler is not None, "TEST_CC environment variable must be set to the ARM compiler path."
         cmd = [compiler, filepath, "-g", "-march=armv8-m.main+dsp", "-mfpu=fpv5-d16", "-nodefaultlibs", "-Wl,--oformat=elf32-littlearm", "-o", output_file]
         if "gcc" in os.path.basename(compiler) and "tcc" not in os.path.basename(compiler):
