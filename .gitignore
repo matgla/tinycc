@@ -98,3 +98,5 @@ tests/ir_tests/dump.txt
 tests/ir_tests/dump_fine.txt
 tests/ir_tests/dump_ir_fine.txt
 .aider*
+.claude
+.cache
