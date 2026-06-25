@@ -1,6 +1,6 @@
 /*
  * Compiler Identification
- * 
+ *
  * This file is compiled with the benchmark library (TCC or GCC)
  * to encode the compiler signature into the binary.
  */
@@ -14,3 +14,8 @@ const char *benchmark_compiler_name = "GCC";
 const int benchmark_compiler_sig = 0x474343;  /* "GCC" in hex */
 const char *benchmark_compiler_id = "GCC";
 #endif
+
+#ifndef BENCHMARK_OPT_LEVEL
+#define BENCHMARK_OPT_LEVEL -1
+#endif
+const int benchmark_opt_level = BENCHMARK_OPT_LEVEL;

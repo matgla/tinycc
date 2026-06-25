@@ -1,6 +1,6 @@
 Testing volatile register access
 cyccnt1: 0
-cyccnt2: 0
-delta: 0
-direct: 3758100484
+cyccnt2: 100
+delta: 100
+direct: 0
 Tests completed

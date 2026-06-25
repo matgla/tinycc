@@ -7,6 +7,11 @@
 #define BUILTINN(x) "__tcc_builtin_" #x
 #endif
 
+#if defined(__arm__)
+unsigned long __tcc_strlen(const char *s);
+char *__tcc_strcpy(char *d, const char *s);
+#endif
+
 /* ---------------------------------------------- */
 /* This file implements:
  * __builtin_ffs
@@ -100,7 +105,11 @@ int BUILTIN(ctz)(unsigned int x)
   CTZI(x)
 }
 
-int __ctzsi2(unsigned int x)
+/* weak: libgcc-style runtime fallback.  libc (bitops.c) provides strong
+   definitions of the __*si2/__*di2 bit helpers; a strong def overrides this
+   weak one with no "defined twice" clash, yet programs that don't link this
+   libc (e.g. newlib-based test binaries) still resolve it from libtcc1. */
+__attribute__((weak)) int __ctzsi2(unsigned int x)
 {
   CTZI(x)
 }
@@ -144,7 +153,7 @@ int BUILTIN(popcount)(unsigned int x)
   POPCOUNTI(x, 0x3f)
 }
 
-int __popcountsi2(unsigned int x)
+__attribute__((weak)) int __popcountsi2(unsigned int x)
 {
   POPCOUNTI(x, 0x3f)
 }
@@ -354,11 +363,17 @@ float fabsf(float x)
 double fmax(double x, double y)
 {
   if (isnan(x))
+  {
     return y;
+  }
   if (isnan(y))
+  {
     return x;
+  }
   if (x > y)
+  {
     return x;
+  }
   return y;
 }
 
@@ -577,25 +592,113 @@ char *__tcc_strchr(const char *s, int c)
   }
 }
 
+/* On ARM, this is provided by arm_string.S */
+#if !defined(__arm__)
+
 int __tcc_strcmp(const char *s1, const char *s2)
 {
-  while (*s1 != 0 && *s1 == *s2)
-    s1++, s2++;
+  const unsigned char *p1 = (const unsigned char *)s1;
+  const unsigned char *p2 = (const unsigned char *)s2;
 
-  if (*s1 == 0 || *s2 == 0)
-    return (unsigned char)*s1 - (unsigned char)*s2;
-  return *s1 - *s2;
+  /* Early out: first byte differs or is null (very common for short strings) */
+  if (*p1 != *p2 || *p1 == 0)
+    return (int)*p1 - (int)*p2;
+  p1++;
+  p2++;
+
+  /* Try word-at-a-time if both pointers share the same alignment */
+  if (((unsigned long)p1 & 3) == ((unsigned long)p2 & 3))
+  {
+    /* Byte-compare to reach word alignment */
+    while ((unsigned long)p1 & 3)
+    {
+      if (*p1 != *p2 || *p1 == 0)
+        return (int)*p1 - (int)*p2;
+      p1++;
+      p2++;
+    }
+
+    /* Word-at-a-time comparison (unrolled 2x) */
+    {
+      const unsigned long *w1 = (const unsigned long *)p1;
+      const unsigned long *w2 = (const unsigned long *)p2;
+      unsigned long a, b;
+
+      for (;;)
+      {
+        a = w1[0];
+        b = w2[0];
+        /* Single branch: words differ OR null byte present */
+        if (a != b || ((a - 0x01010101UL) & ~a & 0x80808080UL))
+          break;
+        a = w1[1];
+        b = w2[1];
+        if (a != b || ((a - 0x01010101UL) & ~a & 0x80808080UL))
+        {
+          w1++;
+          w2++;
+          break;
+        }
+        w1 += 2;
+        w2 += 2;
+      }
+
+      p1 = (const unsigned char *)w1;
+      p2 = (const unsigned char *)w2;
+    }
+  }
+
+  /* Byte-at-a-time for tail or fully-unaligned case */
+  while (*p1 != '\0' && *p1 == *p2)
+  {
+    p1++;
+    p2++;
+  }
+
+  return (int)*p1 - (int)*p2;
 }
+
+#endif /* !defined(__arm__) - strcmp */
+
+/* On ARM, this is provided by arm_string.S */
+#if !defined(__arm__)
 
 unsigned long __tcc_strlen(const char *s)
 {
   const char *p = s;
 
-  while (*p)
+  /* Align to word boundary */
+  while ((unsigned long)p & 3)
+  {
+    if (*p == '\0')
+      return (unsigned long)(p - s);
+    p++;
+  }
+
+  /* Word-at-a-time null scan */
+  {
+    const unsigned long *wp = (const unsigned long *)p;
+    unsigned long w;
+
+    for (;;)
+    {
+      w = *wp;
+      if ((w - 0x01010101UL) & ~w & 0x80808080UL)
+        break;
+      wp++;
+    }
+
+    p = (const char *)wp;
+  }
+
+  /* Find exact null position in the last word */
+  while (*p != '\0')
     p++;
 
   return (unsigned long)(p - s);
 }
+
+#endif /* !defined(__arm__) - strlen */
 
 extern volatile int chk_calls __attribute__((weak));
 extern void __chk_fail(void) __attribute__((weak));
@@ -730,15 +833,74 @@ char *__tcc_strncat(char *dst, const char *src, unsigned long n)
   return ret;
 }
 
+/* On ARM, these are provided by arm_string.S */
+#if !defined(__arm__)
+
 char *__tcc_strcpy(char *d, const char *s)
 {
   char *r = d;
 
-  while ((*d++ = *s++) != '\0')
-    ;
+  /* Align both pointers if they share the same alignment offset */
+  if (((unsigned long)d & 3) == ((unsigned long)s & 3))
+  {
+    /* Copy up to 3 bytes to reach word alignment */
+    while ((unsigned long)d & 3)
+    {
+      char c = *s;
+      *d = c;
+      if (c == '\0')
+        return r;
+      d++;
+      s++;
+    }
+
+    /* Word-at-a-time copy (unrolled 2x) */
+    {
+      unsigned long *wd = (unsigned long *)d;
+      const unsigned long *ws = (const unsigned long *)s;
+      unsigned long w0, w1;
+
+      for (;;)
+      {
+        w0 = ws[0];
+        if ((w0 - 0x01010101UL) & ~w0 & 0x80808080UL)
+          break;
+        w1 = ws[1];
+        wd[0] = w0;
+        if ((w1 - 0x01010101UL) & ~w1 & 0x80808080UL)
+        {
+          wd++;
+          ws++;
+          break;
+        }
+        wd[1] = w1;
+        wd += 2;
+        ws += 2;
+      }
+
+      d = (char *)wd;
+      s = (const char *)ws;
+    }
+  }
+
+  /* Byte-at-a-time for tail or fully-unaligned case */
+  {
+    char c;
+    do
+    {
+      c = *s;
+      *d = c;
+      s++;
+      d++;
+    } while (c != '\0');
+  }
 
   return r;
 }
+
+
+
+#endif /* !defined(__arm__) - strcpy */
 
 char *__tcc_stpcpy(char *dst, const char *src)
 {

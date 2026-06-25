@@ -1,0 +1,33 @@
+=== Long long diagnostic ===
+
+--- Test 1: Variable init ---
+a = 0x0000011f_71fb04cb (1234567890123)
+b = 0xffffffff_c521974f (-987654321)
+
+--- Test 2: Negation ---
+-b = 0x00000000_3ade68b1 (987654321)
+
+--- Test 3: Addition ---
+a + b = 0x0000011f_371c9c1a (1233580235802)
+
+--- Test 4: Subtraction ---
+a - b = 0x0000011f_acd96d7c (1235555544444)
+
+--- Test 5: Shift left ---
+u = 0x00000000_00000001 (1)
+u << 63 = 0x80000000_00000000 (9223372036854775808)
+
+--- Test 6: Small shifts ---
+u << 0 = 0x00000000_00000001 (1)
+u << 1 = 0x00000000_00000002 (2)
+u << 31 = 0x00000000_80000000 (2147483648)
+u << 32 = 0x00000001_00000000 (4294967296)
+
+--- Test 7: Constant folding ---
+
+--- Test 8: printf arg passing ---
+a via printf: 1234567890123
+b via printf: -987654321
+a+b via printf: 1233580235802
+
+=== Result: 0 failures ===

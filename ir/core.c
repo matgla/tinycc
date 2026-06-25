@@ -243,6 +243,17 @@ void tcc_ir_free(TCCIRState *ir)
     ir->switch_tables_capacity = 0;
   }
 
+  /* Free switch value tables (SWITCH_LOAD lookup data) */
+  if (ir->switch_value_tables)
+  {
+    for (int i = 0; i < ir->num_switch_value_tables; i++)
+      tcc_free(ir->switch_value_tables[i].values);
+    tcc_free(ir->switch_value_tables);
+    ir->switch_value_tables = NULL;
+    ir->num_switch_value_tables = 0;
+    ir->switch_value_tables_capacity = 0;
+  }
+
   /* Free nested_funcs array (note: NestedFunc structs themselves are owned by TCCState) */
   if (ir->nested_funcs)
   {
@@ -351,6 +362,13 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
   memset(cq, 0, sizeof(IRQuadCompact));
   cq->op = (uint8_t)op;
   cq->orig_index = pos;
+  if (pos > ir->max_orig_index)
+    ir->max_orig_index = pos;
+  if (ir->next_insn_is_jump_target)
+  {
+    cq->is_jump_target = 1;
+    ir->next_insn_is_jump_target = 0;
+  }
   cq->operand_base = ir->iroperand_pool_count;
 
   /* Handle destination operand */
@@ -403,18 +421,25 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
         dest->type = src1->type;
       }
 
-      if (tcc_ir_type_is_float(dest->type.t))
-      {
-        tcc_ir_vreg_type_set_fp(ir, dest->vr, 1, tcc_ir_type_is_double(dest->type.t));
-      }
-      else if ((dest->type.t & VT_BTYPE) == VT_LLONG)
-      {
-        tcc_ir_vreg_type_set_64bit(ir, dest->vr);
-      }
-      /* Phase 3: Set complex flag for complex types */
-      if (dest->type.t & VT_COMPLEX)
-      {
-        tcc_ir_vreg_type_set_complex(ir, dest->vr);
+      /* For STORE ops the dest vreg holds a 32-bit address; dest->type
+       * describes the stored value, not the pointer.  Don't promote the
+       * address vreg to float/64-bit/complex. */
+      int dest_is_store = (op == TCCIR_OP_STORE || op == TCCIR_OP_STORE_INDEXED ||
+                           op == TCCIR_OP_STORE_POSTINC);
+      if (!dest_is_store) {
+        if (tcc_ir_type_is_float(dest->type.t))
+        {
+          tcc_ir_vreg_type_set_fp(ir, dest->vr, 1, tcc_ir_type_is_double(dest->type.t));
+        }
+        else if ((dest->type.t & VT_BTYPE) == VT_LLONG)
+        {
+          tcc_ir_vreg_type_set_64bit(ir, dest->vr);
+        }
+        /* Phase 3: Set complex flag for complex types */
+        if (dest->type.t & VT_COMPLEX)
+        {
+          tcc_ir_vreg_type_set_complex(ir, dest->vr);
+        }
       }
       dest_interval = tcc_ir_vreg_live_interval(ir, dest->vr);
       int new_is_lvalue;
@@ -629,7 +654,6 @@ static void tcc_ir_params_add_hidden_sret(TCCIRState *ir, CType *func_type)
 
     loc = (loc - PTR_SIZE) & -PTR_SIZE;
     func_vc = loc;
-    tcc_state->need_frame_pointer = 1;
 
     /* Consume a PARAM vreg for the hidden sret pointer */
     int sret_param_vr = tcc_ir_get_vreg_param(ir);
@@ -720,8 +744,8 @@ void tcc_ir_params_process_single(TCCIRState *ir, Sym *sym, int arg_index, TCCAb
   TCCAbiArgLoc loc_info = tcc_abi_classify_argument(call_layout, arg_index, &desc);
   tcc_ir_params_update_tracking(ir, loc_info, call_layout);
 
-  if (loc_info.kind == TCC_ABI_LOC_STACK || loc_info.kind == TCC_ABI_LOC_REG_STACK)
-    tcc_state->need_frame_pointer = 1;
+  /* With the pre-reserved outgoing call area, stack args no longer require
+   * a frame pointer — SP stays fixed across calls. */
 
   if ((type->t & VT_BTYPE) == VT_STRUCT || (type->t & VT_COMPLEX))
   {
@@ -971,6 +995,10 @@ void tcc_ir_params_process_scalar(TCCIRState *ir, Sym *sym, CType *type, TCCAbiA
 {
   int flags = 0, addr = 0;
   int variadic = (sym->f.func_type == FUNC_ELLIPSIS);
+  CType pushed_type = *type;
+
+  if (sym->a.param_volatile)
+    pushed_type.t |= VT_VOLATILE;
 
   if (loc_info->kind == TCC_ABI_LOC_REG)
   {
@@ -996,7 +1024,7 @@ void tcc_ir_params_process_scalar(TCCIRState *ir, Sym *sym, CType *type, TCCAbiA
   int v = sym->v & ~SYM_FIELD;
   if (!v)
     v = anon_sym++;
-  sym_push(v, type, flags, addr);
+  sym_push(v, &pushed_type, flags, addr);
 }
 
 int tcc_ir_local_add(TCCIRState *ir, Sym *sym, int stack_offset)
@@ -1111,6 +1139,8 @@ TccIrOp tcc_irop_from_token(int token)
     return TCCIR_OP_MUL;
   case TOK_UMULL:
     return TCCIR_OP_UMULL;
+  case TOK_SMULL:
+    return TCCIR_OP_SMULL;
   case TOK_SHL:
     return TCCIR_OP_SHL;
   case TOK_SAR:
@@ -1168,10 +1198,15 @@ void tcc_ir_gen_i(TCCIRState *ir, int op)
   svalue_init(&dest);
   dest.vr = tcc_ir_get_vreg_temp(ir);
   dest.r = 0;
-  /* Most integer ops preserve the operand type, but UMULL produces a 64-bit result. */
+  /* Most integer ops preserve the operand type, but UMULL/SMULL produce a 64-bit result. */
   if (ir_op == TCCIR_OP_UMULL)
   {
     dest.type.t = VT_LLONG | VT_UNSIGNED;
+    tcc_ir_set_llong_type(ir, dest.vr);
+  }
+  else if (ir_op == TCCIR_OP_SMULL)
+  {
+    dest.type.t = VT_LLONG;
     tcc_ir_set_llong_type(ir, dest.vr);
   }
   else
@@ -1181,7 +1216,7 @@ void tcc_ir_gen_i(TCCIRState *ir, int op)
   tcc_ir_put(ir, ir_op, &vtop[-1], &vtop[0], &dest);
   vtop[-1].vr = dest.vr;
   vtop[-1].r = 0;
-  vtop[-1].type = dest.type; /* Update type - critical for UMULL which produces 64-bit from 32-bit inputs */
+  vtop[-1].type = dest.type; /* Update type - critical for UMULL/SMULL which produce 64-bit from 32-bit inputs */
   --vtop;
 }
 
@@ -1629,6 +1664,15 @@ void tcc_ir_backpatch(TCCIRState *ir, int t, int target_address)
     const int pool_off = ir->compact_instructions[t].operand_base;
     ir->iroperand_pool[pool_off] = cur;
 
+    /* Mark the target instruction as a jump target.
+     * If it already exists, set the flag directly.
+     * If it is the next-to-be-created slot (tcc_ir_backpatch_to_here pattern),
+     * set a pending flag that tcc_ir_put picks up on creation. */
+    if (target_address >= 0 && target_address < ir->next_instruction_index)
+      ir->compact_instructions[target_address].is_jump_target = 1;
+    else if (target_address == ir->next_instruction_index)
+      ir->next_insn_is_jump_target = 1;
+
     /* Chain ends when next is -1 (sentinel), out of range, or already patched */
     if (next < 0 || next >= ir->next_instruction_index || next == target_address)
       break;
@@ -1943,6 +1987,7 @@ const IRRegistersConfig irop_config[] = {
     [TCCIR_OP_MUL] = {1, 1, 1},
     [TCCIR_OP_MLA] = {1, 1, 1},  /* MLA has accumulator as extra operand at pool[operand_base+3] */
     [TCCIR_OP_UMULL] = {1, 1, 1},
+    [TCCIR_OP_SMULL] = {1, 1, 1},
     [TCCIR_OP_DIV] = {1, 1, 1},
     [TCCIR_OP_UMOD] = {1, 1, 1},
     [TCCIR_OP_IMOD] = {1, 1, 1},
@@ -1976,6 +2021,8 @@ const IRRegistersConfig irop_config[] = {
     [TCCIR_OP_LOAD_POSTINC] = {1, 1, 0},   /* dest = *ptr; ptr += offset */
     [TCCIR_OP_STORE_POSTINC] = {1, 1, 0},  /* *ptr = src; ptr += offset */
     [TCCIR_OP_TEST_ZERO] = {0, 1, 0},
+    [TCCIR_OP_UBFX] = {1, 1, 1},  /* dest = (src1 >> lsb) & ((1<<width)-1); src2 = lsb|(width<<5) */
+    [TCCIR_OP_BFI] = {1, 1, 1},   /* dest = src1 w/ field[lsb,width] := src2; lsb/width in bfi_params[] */
     /* Floating point operations */
     [TCCIR_OP_FADD] = {1, 1, 1}, [TCCIR_OP_FSUB] = {1, 1, 1}, [TCCIR_OP_FMUL] = {1, 1, 1}, [TCCIR_OP_FDIV] = {1, 1, 1},
     [TCCIR_OP_FNEG] = {1, 1, 0}, /* unary: src1=input, dest */
@@ -1984,6 +2031,8 @@ const IRRegistersConfig irop_config[] = {
     [TCCIR_OP_CVT_FTOF] = {1, 1, 0}, /* dest=result, src1=input */
     [TCCIR_OP_CVT_ITOF] = {1, 1, 0}, /* dest=result, src1=input */
     [TCCIR_OP_CVT_FTOI] = {1, 1, 0}, /* dest=result, src1=input */
+    [TCCIR_OP_ZEXT] = {1, 1, 0},     /* dest = (u_dest_width) src1 */
+    [TCCIR_OP_PACK64] = {1, 1, 1},   /* dest_lo = src1, dest_hi = src2 */
     /* Logical boolean operations */
     [TCCIR_OP_BOOL_OR] = {1, 1, 1},  /* dest = (src1 || src2) */
     [TCCIR_OP_BOOL_AND] = {1, 1, 1}, /* dest = (src1 && src2) */
@@ -2013,8 +2062,9 @@ const IRRegistersConfig irop_config[] = {
     [TCCIR_OP_PREFETCH] = {0, 1, 1},
     /* Trap instruction: no operands, no dest */
     [TCCIR_OP_TRAP] = {0, 0, 0},
-    /* Setjmp: dest=return value (0 or 1), src1=buffer pointer vreg */
-    [TCCIR_OP_SETJMP] = {1, 1, 0},
+    /* Setjmp: dest=return value (0 or 1), src1=buffer pointer vreg,
+     * src2=address of the hidden r4-r11 save area (frame slot) */
+    [TCCIR_OP_SETJMP] = {1, 1, 1},
     /* Longjmp: src1=buffer pointer vreg, no dest (does not return) */
     [TCCIR_OP_LONGJMP] = {0, 1, 0},
     /* Non-local goto setjmp/longjmp: full callee-saved save/restore (40-byte buffer) */
@@ -2022,12 +2072,19 @@ const IRRegistersConfig irop_config[] = {
     [TCCIR_OP_NL_LONGJMP] = {0, 1, 0},
     /* Jump table switch: src1=index vreg, src2=table_id, no dest */
     [TCCIR_OP_SWITCH_TABLE] = {0, 1, 1},
+    /* Data-table switch load: dest=loaded value, src1=index, src2=value_table_id */
+    [TCCIR_OP_SWITCH_LOAD] = {1, 1, 1},
     /* __builtin_apply_args: dest=pointer to saved arg block, no sources */
     [TCCIR_OP_BUILTIN_APPLY_ARGS] = {1, 0, 0},
     /* __builtin_apply: dest=return value, src1=fn_ptr, src2=args_block_ptr */
     [TCCIR_OP_BUILTIN_APPLY] = {1, 1, 1},
     /* __builtin_return: src1=result_ptr, no dest (does not return) */
     [TCCIR_OP_BUILTIN_RETURN] = {0, 1, 0},
+    /* Block copy: dest=stack dest, src1=symbol src, src2=size */
+    [TCCIR_OP_BLOCK_COPY] = {1, 1, 1},
+    /* SELECT: dest=result, src1=then_val, src2=else_val, pool[+3]=condition */
+    [TCCIR_OP_SELECT] = {1, 1, 1},
+    [TCCIR_OP_ROR] = {1, 1, 1},
 }
 ;
 // clang-format on

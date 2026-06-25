@@ -7,8 +7,9 @@
 #include "../fp_abi.h"
 #include "soft_common.h"
 
-/* Core comparison returning -1 (a<b), 0 (a==b), 1 (a>b), 2 (unordered/NaN) */
-static int dcmp_core(double a, double b)
+/* Core comparison returning -1 (a<b), 0 (a==b), 1 (a>b), 2 (unordered/NaN)
+ * Non-static so dcmp_asm.S can call it for flag-setting wrappers. */
+int dcmp_core(double a, double b)
 {
   union
   {
@@ -101,34 +102,7 @@ int __aeabi_dcmpun(double a, double b)
   return dcmp_core(a, b) == 2 ? 1 : 0;
 }
 
-/* Wrapper functions with 'c' prefix that set ARM CPSR flags */
-
-int __aeabi_cdcmple(double a, double b)
-{
-  return __aeabi_dcmple(a, b);
-}
-
-int __aeabi_cdrcmple(double a, double b)
-{
-  return __aeabi_dcmple(b, a);
-}
-
-int __aeabi_cdcmplt(double a, double b)
-{
-  return __aeabi_dcmplt(a, b);
-}
-
-int __aeabi_cdcmpeq(double a, double b)
-{
-  return __aeabi_dcmpeq(a, b);
-}
-
-int __aeabi_cdcmpgt(double a, double b)
-{
-  return __aeabi_dcmpgt(a, b);
-}
-
-int __aeabi_cdcmpge(double a, double b)
-{
-  return __aeabi_dcmpge(a, b);
-}
+/* The 'c' prefix functions (__aeabi_cdcmple, __aeabi_cdrcmple, etc.)
+ * that set ARM CPSR flags are implemented in assembly in dcmp_asm.S
+ * because C code cannot directly manipulate the ARM condition flags.
+ */

@@ -22,6 +22,9 @@ struct TCCIRState;
 /* Allocate a temporary virtual register */
 int tcc_ir_vreg_alloc_temp(struct TCCIRState *ir);
 
+/* Ensure temp live interval array can hold at least `count` entries */
+void tcc_ir_vreg_ensure_temp_capacity(struct TCCIRState *ir, int count);
+
 /* Allocate a variable virtual register */
 int tcc_ir_vreg_alloc_var(struct TCCIRState *ir);
 

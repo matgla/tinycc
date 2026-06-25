@@ -6,16 +6,16 @@ include ../../../config.mak
 FP_CC ?= $(CC)
 FP_CFLAGS ?= $(CFLAGS)
 
-SRCS = fadd.c fmul.c fdiv.c fcmp.c dadd.c dmul.c ddiv.c dconv.c dcmp.c conv.c f2d_stub.S fcmp_asm.S
+SRCS = fadd.c fmul.c fdiv.c fcmp.c dadd.c dmul.c ddiv.c dconv.c dcmp.c conv.c f2d_stub.S fcmp_asm.S dcmp_asm.S
 BUILD_DIR ?= build
 OBJS = $(addprefix $(BUILD_DIR)/,$(SRCS:.c=.o))
 OBJS := $(OBJS:.S=.o)
 
-FP_CFLAGS += -O2 -Wall -Wextra -I../.. -I../../../include
+override FP_CFLAGS += -O2 -Wall -Wextra -I../.. -I../../../include
 
 # Architecture flags for ARM cross-compilation
 ARCH_FLAGS = -mcpu=cortex-m33 -mthumb
-FP_CFLAGS += $(ARCH_FLAGS)
+override FP_CFLAGS += $(ARCH_FLAGS)
 
 all: $(BUILD_DIR) $(OBJS)
 

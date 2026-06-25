@@ -68,7 +68,7 @@ LIBC_INCLUDES = $(shell realpath $(MAKEFILE_DIR)../../libc_includes)
 LIBC_IMPORTS = $(shell realpath $(MAKEFILE_DIR)../../libc_imports)
 NEWLIB_INCLUDES = $(LIBC_INCLUDES)/newlib
 ifeq ($(USE_NEWLIB_BUILD),1)
-LIBGLOSS_PATH = $(shell realpath $(NEWLIB_BUILD_DIR)/arm-none-eabi/libgloss/arm)
+LIBGLOSS_PATH = $(abspath $(NEWLIB_BUILD_DIR)/arm-none-eabi/libgloss/arm)
 else
 LIBGLOSS_PATH = $(shell dirname $(RDIMON_CRT0_PATH))
 endif
@@ -77,6 +77,7 @@ CRT_LIBS =
 
 ifneq (,$(findstring armv8m-tcc,$(CC)))
 CFLAGS += -I$(LIBC_INCLUDES) -I$(LIBC_IMPORTS) -I$(NEWLIB_INCLUDES) -I$(ARM_SYSROOT)/include -I$(TCC_PATH)/include
+TCC_FLAGS += -B$(TCC_PATH)
 LDFLAGS += -B$(TCC_PATH)
 ifeq ($(USE_NEWLIB_BUILD),1)
 NEWLIB_LIBC_A := $(if $(and $(filter 1,$(DEBUG_LIBC)),$(wildcard $(NEWLIB_LIBC_G))),$(NEWLIB_LIBC_G),$(NEWLIB_DIR)/libc.a)
@@ -112,8 +113,13 @@ $(OUTPUT)/%.o: $(MAKEFILE_DIR)%.c | $(OUTPUT)
 $(OUTPUT)/%.o: $(MAKEFILE_DIR)%.S | $(OUTPUT)
 	$(CC_WRAPPER) $(CC) $(CFLAGS) -c $< -o $@
 
-$(TARGET): $(OBJS)
-	$(CC_WRAPPER) $(CC) $(CFLAGS) $^ $(CRT_LIBS) -o $@ $(LDFLAGS)
+$(TARGET): $(OBJS) $(if $(filter 1,$(USE_NEWLIB_BUILD)),$(NEWLIB_DIR)/libc.a)
+	$(CC_WRAPPER) $(CC) $(CFLAGS) $(OBJS) $(CRT_LIBS) -o $@ $(LDFLAGS)
+
+# Build newlib from source if not already built.
+$(NEWLIB_DIR)/libc.a:
+	@echo "newlib not found, building..."
+	cd $(MAKEFILE_DIR) && sh build_newlib.sh
 
 # Report binary size after build
 size: $(TARGET)

@@ -8,6 +8,7 @@ _start:
 .asciz "Helloasfh9ueawh9fhe9wahf79wah9efh9wahe97fh9w7ehf79haf"
 
 .global jump_target
+.thumb_func
 jump_target:
     movs r0, #0
     cmp r1, #1

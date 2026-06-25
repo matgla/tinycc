@@ -21,7 +21,7 @@ int main(void)
     printf("neg_f: %d\n", r);
     r = __builtin_signbitf(zero_f);
     printf("zero_f: %d\n", r);
-    /* Note: signbit(-0.0) should return 1, but our simple implementation returns 0 */
+    /* GCC returns the raw float sign mask for runtime __builtin_signbitf values. */
     r = __builtin_signbitf(neg_zero_f);
     printf("neg_zero_f: %d\n", r);
     

@@ -40,6 +40,7 @@ Options:
   --only {tcc,gcc}     Run only one compiler
   --skip-build         Skip build, use existing binaries
   -o OUTPUT            Save results to file
+  --serial-log FILE    Save full raw UART log to file
   -i IDENTITY          SSH identity file
   -p PORT              SSH port (default: 22)
 ```
@@ -52,6 +53,9 @@ python3 run_benchmark.py 192.168.0.113 --only tcc -O 0
 
 # Run both optimization levels and save results
 python3 run_benchmark.py 192.168.0.113 -O both -o results.txt
+
+# Also save the full raw serial/UART log
+python3 run_benchmark.py 192.168.0.113 -O both -o results.txt --serial-log serial.txt
 
 # Skip rebuild (use existing binaries)
 python3 run_benchmark.py 192.168.0.113 --skip-build
@@ -77,15 +81,20 @@ See [RP2350_README.md](RP2350_README.md) for detailed setup instructions.
 | integer_math | Integer arithmetic (mul, shift, xor) |
 | float_math | Floating point operations (soft-float) |
 | array_sum | Memory access patterns |
+| bitwise_mix | Bitwise mixing and rotates |
 | function_calls | Function call overhead |
 | conditionals | Branch prediction |
 | switch_stmt | Jump table performance |
+| indirect_calls | Function pointer dispatch |
 | strcpy | String copy |
 | memcpy | Memory copy |
 | strcmp | String comparison |
+| strlen_scan | Repeated string length scans |
 | fibonacci | Recursive function calls |
 | bubble_sort | Nested loops |
 | linked_list | Pointer chasing |
+| binary_search | Sorted-table lookup |
+| matrix_mul | Small matrix multiply |
 
 ### MiBench Suite (Real-world Benchmarks)
 
@@ -94,6 +103,10 @@ See [RP2350_README.md](RP2350_README.md) for detailed setup instructions.
 | mibench_sha | Security | SHA-1 cryptographic hash |
 | mibench_bitcount | Automotive | Bit counting algorithms |
 | mibench_crc32 | Telecomm | CRC32 checksum computation |
+| mibench_dijkstra | Network | Shortest path search |
+| mibench_qsort | Automotive | String sorting workload |
+| mibench_rijndael | Security | AES block cipher |
+| mibench_stringsearch | Office | Pratt-Boyer-Moore string search |
 
 See [MIBENCH_INTEGRATION.md](MIBENCH_INTEGRATION.md) for full MiBench integration plan.
 

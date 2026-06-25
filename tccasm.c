@@ -1224,6 +1224,27 @@ static void asm_parse_directive(TCCState *s1, int global)
   case TOK_ASMDIR_thumb:
     next();
     break;
+#ifdef TCC_TARGET_ARM
+  case TOK_ASMDIR_fpu:
+  {
+    /* `.fpu <name>` — enable the named FP unit's instruction encodings.
+       The name (e.g. fpv5-sp-d16) lexes as several tokens because of the
+       hyphens, so rebuild it the same way `.section` rebuilds its name. */
+    char fpu_name[64];
+    next();
+    fpu_name[0] = '\0';
+    while (tok != ';' && tok != TOK_LINEFEED && tok != CH_EOF)
+    {
+      if (tok == TOK_STR)
+        pstrcat(fpu_name, sizeof(fpu_name), tokc.str.data);
+      else
+        pstrcat(fpu_name, sizeof(fpu_name), get_tok_str(tok, NULL));
+      next();
+    }
+    tcc_asm_set_fpu(fpu_name);
+  }
+  break;
+#endif
   case TOK_ASMDIR_thumb_func:
     next();
     /* GAS accepts both `.thumb_func` (affects next label) and
@@ -1439,6 +1460,7 @@ static int tcc_assemble_internal(TCCState *s1, int do_preprocess, int global)
 ST_FUNC int tcc_assemble(TCCState *s1, int do_preprocess)
 {
   int ret;
+  arm_init(s1);
   tcc_debug_start(s1);
   /* default section is text */
   cur_text_section = text_section;
@@ -1830,6 +1852,24 @@ ST_FUNC void asm_instr(void)
      * Emit marker ops so liveness/regalloc see uses/defs across the barrier.
      */
     int asm_len = astr.size - 1;
+
+    /* asm_compute_constraints() — which derives op->is_rw from a '+' constraint
+     * modifier — only runs later at codegen time (tcc_asm_emit_inline).  The IR
+     * marker emission below tests operands[i].is_rw to decide whether a "+r"
+     * output also needs an ASM_INPUT (read) marker.  Without computing it here,
+     * is_rw is read from uninitialized operand stack memory, so the read marker
+     * for "+r" operands is dropped intermittently (it survives on the host but
+     * vanishes on the self-hosted -O1 build) — leaving the operand load missing
+     * and the post-asm store reading an uninitialized pointer slot. */
+    for (i = 0; i < nb_outputs; ++i)
+    {
+      const char *cstr = operands[i].constraint;
+      operands[i].is_rw = 0;
+      for (; *cstr == '=' || *cstr == '&' || *cstr == '+' || *cstr == '%'; ++cstr)
+        if (*cstr == '+')
+          operands[i].is_rw = 1;
+    }
+
     int inline_asm_id = tcc_ir_add_inline_asm(tcc_state->ir, astr.data, asm_len, must_subst, operands, nb_operands,
                                               nb_outputs, nb_labels, clobber_regs);
 

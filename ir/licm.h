@@ -99,4 +99,15 @@ int tcc_ir_is_in_loop(IRLoop *loop, int instr_idx);
  * Returns number of instructions hoisted */
 int tcc_ir_hoist_loop_invariants(TCCIRState *ir, IRLoops *loops);
 
+/* Estimate how many values can be safely hoisted out of a loop without
+ * starving the loop body of registers. Scans the loop body to estimate
+ * register pressure and returns the number of registers available for
+ * hoisted loop-invariant values.
+ *   ir          - IR state
+ *   loop_start  - first instruction index of the loop body
+ *   loop_end    - last instruction index of the loop body
+ *   num_params  - number of function parameters (consume registers)
+ * Returns: max number of values that can be hoisted (>= 1) */
+int tcc_ir_estimate_hoist_budget(TCCIRState *ir, int loop_start, int loop_end, int num_params);
+
 #endif /* TCC_IR_LICM_H */

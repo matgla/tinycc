@@ -4,7 +4,7 @@ QEMU test runner and compiler profiling utilities.
 This module provides:
 - Compilation of test cases using TinyCC or GCC
 - QEMU execution of compiled binaries
-- Profiling support (heaptrack, GNU time)
+- Profiling support (heaptrack, callgrind, GNU time, perf, xctrace)
 - Binary size reporting via arm-none-eabi-size
 
 Usage for testing:
@@ -30,6 +30,8 @@ from pathlib import Path
 from typing import Optional
 
 CURRENT_DIR = Path(__file__).parent
+DEBUGINFOD_URLS = "https://debuginfod.archlinux.org"
+DEFAULT_PERF_FREQUENCY = 999
 
 was_cleaned = False
 
@@ -179,11 +181,12 @@ class SubprocessSUT:
 @dataclass
 class ProfileConfig:
     """Configuration for compiler profiling."""
-    tool: str = "none"  # "none", "heaptrack", "time", "perf", "xctrace"
+    tool: str = "none"  # "none", "heaptrack", "callgrind", "time", "perf", "xctrace"
     output_dir: Optional[Path] = None
     output_prefix: str = ""  # prefix for output files (e.g., test name)
-    perf_frequency: int = 99  # sampling frequency for perf (Hz)
+    perf_frequency: int = DEFAULT_PERF_FREQUENCY  # sampling frequency for perf (Hz)
     measure_memory: bool = True  # For perf: also capture memory usage via /usr/bin/time
+    perf_postprocess: bool = True  # For perf: parse samples and generate flamegraph after recording
 
     def get_wrapper_cmd(self) -> str:
         """Get the CC_WRAPPER command for make."""
@@ -195,6 +198,16 @@ class ProfileConfig:
                 raise RuntimeError("heaptrack is not available on macOS; use --profiler time")
             out_file = self.output_dir / f"heaptrack_{self.output_prefix}"
             return f"heaptrack --record-only -o {out_file}"
+        elif self.tool == "callgrind":
+            if sys.platform == "darwin":
+                raise RuntimeError("callgrind profiling is not available on macOS; use --profiler xctrace or time")
+            out_file = self.output_dir / f"callgrind_{self.output_prefix}.out"
+            return (
+                "env "
+                'DEBUGINFOD_URLS="https://debuginfod.archlinux.org" '
+                "VALGRIND_DEBUGINFOD=1 "
+                f"valgrind --tool=callgrind --dump-instr=yes --callgrind-out-file={out_file}"
+            )
         elif self.tool == "time":
             out_file = self.output_dir / f"time_{self.output_prefix}.txt"
             if sys.platform == "darwin":
@@ -208,9 +221,17 @@ class ProfileConfig:
             if self.measure_memory:
                 # Wrap perf with time to get memory metrics too
                 time_file = self.output_dir / f"time_{self.output_prefix}.txt"
-                return f"/usr/bin/time -v -a -o {time_file} perf record -F {self.perf_frequency} -g --call-graph dwarf -o {perf_file}"
+                return (
+                    "env "
+                    f'DEBUGINFOD_URLS="{DEBUGINFOD_URLS}" '
+                    f"/usr/bin/time -v -a -o {time_file} perf record -F {self.perf_frequency} -g --call-graph dwarf -o {perf_file}"
+                )
             else:
-                return f"perf record -F {self.perf_frequency} -g --call-graph dwarf -o {perf_file}"
+                return (
+                    "env "
+                    f'DEBUGINFOD_URLS="{DEBUGINFOD_URLS}" '
+                    f"perf record -F {self.perf_frequency} -g --call-graph dwarf -o {perf_file}"
+                )
         elif self.tool == "xctrace":
             if sys.platform != "darwin":
                 raise RuntimeError("xctrace profiling is macOS-only")
@@ -268,6 +289,8 @@ class CompileResult:
     heap_peak_kb: int = 0
     heap_allocations: int = 0
     heap_temporary_allocs: int = 0
+    callgrind_event: str = ""
+    callgrind_summary: int = 0
     profile_file: str = ""
     flamegraph_file: str = ""  # SVG flamegraph (for perf profiling)
     perf_samples: int = 0  # Number of perf samples collected
@@ -278,6 +301,8 @@ class CompileResult:
     total_size: int = 0
     error: str = ""
     make_command: list = None  # The make command that was executed
+    pch_ignored: bool = False
+    pch_warning: str = ""
 
 
 def _as_file_list(test_file):
@@ -412,11 +437,15 @@ def parse_perf_output(perf_data_file, generate_flamegraph=True):
     if not perf_file.exists():
         return metrics
 
+    perf_env = os.environ.copy()
+    perf_env["DEBUGINFOD_URLS"] = DEBUGINFOD_URLS
+
     # Get sample count from perf report
     result = subprocess.run(
         ["perf", "report", "-i", str(perf_file), "--stdio", "--header"],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env=perf_env,
     )
 
     if result.returncode == 0:
@@ -458,6 +487,7 @@ def parse_perf_output(perf_data_file, generate_flamegraph=True):
         ["perf", "script", "-i", str(perf_file)],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env=perf_env,
     )
 
     if perf_script_result.returncode != 0:
@@ -565,6 +595,27 @@ def parse_heaptrack_output(heaptrack_prefix):
     return metrics, result_file
 
 
+def parse_callgrind_output(callgrind_file):
+    """Parse a callgrind output file for its primary event and summary count."""
+    metrics = {'event': '', 'summary': 0}
+
+    cg_file = Path(callgrind_file)
+    if not cg_file.exists():
+        return metrics, ""
+
+    with cg_file.open('r', encoding='utf-8', errors='replace') as f:
+        for line in f:
+            if line.startswith('events:'):
+                metrics['event'] = line.split(':', 1)[1].strip()
+            elif line.startswith('summary:'):
+                match = re.search(r'(\d+)', line)
+                if match:
+                    metrics['summary'] = int(match.group(1))
+                break
+
+    return metrics, str(cg_file)
+
+
 def compile_testcase(test_file, machine, compiler=None, cflags=None, config=None):
     """
     Compile a test case with optional profiling.
@@ -613,6 +664,7 @@ def compile_testcase(test_file, machine, compiler=None, cflags=None, config=None
         prefix = config.profiler.output_prefix
         for old_file in list(config.profiler.output_dir.glob(f"heaptrack_{prefix}*.zst")) + \
                         list(config.profiler.output_dir.glob(f"heaptrack_{prefix}*.gz")) + \
+                        list(config.profiler.output_dir.glob(f"callgrind_{prefix}.out")) + \
                         list(config.profiler.output_dir.glob(f"time_{prefix}.txt")) + \
                         list(config.profiler.output_dir.glob(f"perf_{prefix}.data")) + \
                         list(config.profiler.output_dir.glob(f"perf_{prefix}.svg")):
@@ -675,20 +727,16 @@ def compile_testcase(test_file, machine, compiler=None, cflags=None, config=None
         make_command=make_command,
     )
 
-    if result.returncode != 0:
-        compile_result.error = (result.stderr.decode('utf-8', errors='replace') if result.stderr else "") + \
-                               (result.stdout.decode('utf-8', errors='replace') if result.stdout else "")
-        return compile_result
+    for line in output_lines:
+        if "ignoring PCH" in line:
+            compile_result.pch_ignored = True
+            compile_result.pch_warning = line
+            break
 
-    # Get binary size
-    size_metrics = get_binary_size(elf_file)
-    compile_result.text_size = size_metrics['text']
-    compile_result.data_size = size_metrics['data']
-    compile_result.bss_size = size_metrics['bss']
-    compile_result.total_size = size_metrics['total']
+    def populate_profiler_outputs() -> None:
+        if not config.profiler or config.profiler.tool == "none":
+            return
 
-    # Parse profiler output
-    if config.profiler and config.profiler.tool != "none":
         prefix = config.profiler.output_prefix
         if config.profiler.tool == "heaptrack":
             ht_file = config.profiler.output_dir / f"heaptrack_{prefix}"
@@ -696,6 +744,12 @@ def compile_testcase(test_file, machine, compiler=None, cflags=None, config=None
             compile_result.heap_peak_kb = ht_metrics['heap_peak_kb']
             compile_result.heap_allocations = ht_metrics['allocations']
             compile_result.heap_temporary_allocs = ht_metrics['temporary_allocs']
+            compile_result.profile_file = profile_file
+        elif config.profiler.tool == "callgrind":
+            callgrind_file = config.profiler.output_dir / f"callgrind_{prefix}.out"
+            cg_metrics, profile_file = parse_callgrind_output(callgrind_file)
+            compile_result.callgrind_event = cg_metrics['event']
+            compile_result.callgrind_summary = cg_metrics['summary']
             compile_result.profile_file = profile_file
         elif config.profiler.tool == "time":
             time_file = config.profiler.output_dir / f"time_{prefix}.txt"
@@ -706,10 +760,11 @@ def compile_testcase(test_file, machine, compiler=None, cflags=None, config=None
             compile_result.profile_file = str(time_file)
         elif config.profiler.tool == "perf":
             perf_file = config.profiler.output_dir / f"perf_{prefix}.data"
-            perf_metrics = parse_perf_output(perf_file, generate_flamegraph=True)
-            compile_result.perf_samples = perf_metrics['samples']
             compile_result.profile_file = str(perf_file)
-            compile_result.flamegraph_file = perf_metrics['flamegraph_file']
+            if getattr(config.profiler, 'perf_postprocess', True):
+                perf_metrics = parse_perf_output(perf_file, generate_flamegraph=True)
+                compile_result.perf_samples = perf_metrics['samples']
+                compile_result.flamegraph_file = perf_metrics['flamegraph_file']
             # Also parse time output if measure_memory was enabled
             if getattr(config.profiler, 'measure_memory', True):
                 time_file = config.profiler.output_dir / f"time_{prefix}.txt"
@@ -722,6 +777,21 @@ def compile_testcase(test_file, machine, compiler=None, cflags=None, config=None
             trace_file = config.profiler.output_dir / f"xctrace_{prefix}.trace"
             if trace_file.exists():
                 compile_result.profile_file = str(trace_file)
+
+    if result.returncode != 0:
+        compile_result.error = (result.stderr.decode('utf-8', errors='replace') if result.stderr else "") + \
+                               (result.stdout.decode('utf-8', errors='replace') if result.stdout else "")
+        populate_profiler_outputs()
+        return compile_result
+
+    # Get binary size
+    size_metrics = get_binary_size(elf_file)
+    compile_result.text_size = size_metrics['text']
+    compile_result.data_size = size_metrics['data']
+    compile_result.bss_size = size_metrics['bss']
+    compile_result.total_size = size_metrics['total']
+
+    populate_profiler_outputs()
 
     return compile_result
 

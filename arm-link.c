@@ -1,4 +1,8 @@
-#include "arm-thumb-opcodes.h"
+#include "arch/arm/thumb/thumb.h"
+#include "arch/arm/thumb/thop_alu_reg.h"
+#include "arch/arm/thumb/thop_branch.h"
+#include "arch/arm/thumb/thop_cmp.h"
+#include "arch/arm/thumb/thop_mem_imm.h"
 #include "tcc.h"
 
 #ifdef NEED_RELOC_TYPE
@@ -16,6 +20,7 @@ ST_FUNC int code_reloc(int reloc_type)
   case R_ARM_REL32:
   case R_ARM_GOTPC:
   case R_ARM_GOTOFF:
+  case R_ARM_RODATA_OFF:
   case R_ARM_GOT32:
   case R_ARM_GOT_PREL:
   case R_ARM_COPY:
@@ -84,6 +89,9 @@ ST_FUNC int gotplt_entry_type(int reloc_type)
 
   case R_ARM_GOTPC:
   case R_ARM_GOTOFF:
+  case R_ARM_RODATA_OFF:
+    /* RODATA_OFF needs the GOT to exist (for the reserved rodata anchor slot)
+     * but no per-symbol GOT entry — same as GOTOFF. */
     return BUILD_GOT_ONLY;
 
   case R_ARM_GOT32:
@@ -140,6 +148,9 @@ ST_FUNC void relocate_plt(TCCState *s1)
   if (!s1->plt)
     return;
 
+  if (!thop_feat_bits(arm_target_dependent.feat))
+    arm_init(s1);
+
   p = s1->plt->data;
   p_end = p + s1->plt->data_offset;
   p += 32;
@@ -191,7 +202,7 @@ ST_FUNC void relocate_plt(TCCState *s1)
       // get address of the symbol
       // load the address of the symbol
       write_thumb_instruction(p + 10, th_ldr_imm(R_IP, R_IP, 0, 6, ENFORCE_ENCODING_NONE));
-      write_thumb_instruction(p + 14, th_cmp_imm(0, R_IP, 0, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_32BIT));
+      write_thumb_instruction(p + 14, th_cmp_imm(R_IP, 0, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_32BIT));
       // if 0 then call resolver, else move one instruction further
       write_thumb_instruction(p + 18, th_b_t1(1, 0));
       write_thumb_instruction(p + 22, th_bx_reg(R_IP));
@@ -229,9 +240,7 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
   {
     int x, is_thumb, is_call, h, blx_avail, is_bl, th_ko;
     x = read32le(ptr) & 0xffffff;
-#ifdef DEBUG_RELOC
-    printf("reloc %d: x=0x%x val=0x%x ", type, x, val);
-#endif
+    LOG_RELOC("reloc %d: x=0x%x val=0x%x ", type, x, val);
     write32le(ptr, read32le(ptr) & 0xff000000);
     if (x & 0x800000)
       x -= 0x1000000;
@@ -241,9 +250,7 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
     is_bl = read32le(ptr) >> 24 == 0xeb;
     is_call = (type == R_ARM_CALL || (type == R_ARM_PC24 && is_bl));
     x += val - addr;
-#ifdef DEBUG_RELOC
-    printf(" newx=0x%x name=%s\n", x, (char *)symtab_section->link->data + sym->st_name);
-#endif
+    LOG_RELOC(" newx=0x%x name=%s", x, (char *)symtab_section->link->data + sym->st_name);
     h = x & 2;
     th_ko = (x & 3) && (!blx_avail || !is_call);
     if (th_ko || x >= 0x2000000 || x < -0x2000000)
@@ -571,6 +578,11 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
   case R_ARM_GOTOFF:
     add32le(ptr, val - s1->got->sh_addr);
     return;
+  case R_ARM_RODATA_OFF:
+    /* Offset of the symbol within .rodata: anchor (rodata runtime base, from
+     * the reserved GOT slot) + this value = the symbol's address. */
+    add32le(ptr, val - rodata_section->sh_addr);
+    return;
   case R_ARM_GOT32:
     /* we load the got offset */
     write32le(ptr, get_sym_attr(s1, sym_index, 0)->got_offset);
@@ -601,7 +613,7 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
     /* do nothing */
     return;
   default:
-    fprintf(stderr, "FIXME: handle reloc type %d at %x [%p] to %x\n", type, (unsigned)addr, ptr, (unsigned)val);
+    LOG_RELOC("FIXME: handle reloc type %d at %x [%p] to %x", type, (unsigned)addr, ptr, (unsigned)val);
     return;
   }
 }

@@ -60,6 +60,7 @@ TEST_FILES = [
     ("50_simple_struct.c", 0),
     ("60_landor.c", 0),
     ("61_simple_or.c", 0),
+    ("62_or_continue_shortcircuit.c", 0),
     ("90_global_array_assignment.c", 0),
     ("bug_swap.c", 0),
     ("bug_partition.c", 0),
@@ -71,6 +72,7 @@ TEST_FILES = [
     ("bug_ll_mul10_switch_min.c", 0),
     ("bug_parse_number_64bit.c", 0),
     ("bug_ull_mul_int_accum.c", 0),
+    ("bug_struct_slot_reuse.c", 0),
     # ("bug_ternary_string.c", 0),  # Nested ternary with string literals
     # ("bug_return_else_string.c", 0),  # Return string from else block
     ("test_cleanup_double.c", 0),
@@ -104,6 +106,7 @@ TEST_FILES = [
     ("103_pure_func_multiple.c", 0),
     ("104_pure_func_variant.c", 0),
     ("105_builtin_strncmp_zero_count.c", 0),
+    ("106_string_ops_runtime.c", 0),
 
     # Single-precision float tests
     ("72_float_result.c", 1),  # Returns 1 on success (non-standard convention)
@@ -113,8 +116,6 @@ TEST_FILES = [
     ("test_aeabi_dmul_bits.c", 0),
     ("test_f2d_bits.c", 0),
     ("test_aeabi_double_all.c", 0),
-
-    ("test_dmul_orig_override.c", 0),
 
     ("test_llong_add_signed.c", 0),
     ("test_llong_add_unsigned.c", 0),
@@ -178,6 +179,19 @@ TEST_FILES = [
 
     # for-loop increment lost when body has nested ternary chain as function arg
     ("bug_for_ternary_chain.c", 0),
+
+    # identity comparison fold eliminates struct member comparisons with different addends
+    ("bug_struct_member_cmp_fold.c", 0),
+
+    # SL-FWD multi-pred merge alias bug: inlined callee conditionally writes
+    # through caller's stack ptr; caller post-call read must NOT forward the
+    # pre-call value past the conditional store.  See SL_FWD_FIX_PLAN.md.
+    ("test_sl_fwd_alias.c", 0),
+    # Hand-crafted alias variants of the SL-FWD fix: must remain correct
+    # without regressing forwarding for benign patterns.
+    ("test_sl_fwd_alias_uncond.c", 0),
+    ("test_sl_fwd_alias_call.c", 0),
+    ("test_sl_fwd_alias_offsets.c", 0),
 
     ("../tests2/00_assignment.c", 0),
     ("../tests2/01_comment.c", 0),
@@ -277,6 +291,9 @@ TEST_FILES = [
     # IEEE 754 NaN comparison tests (soft-float GT/GE fix)
     ("170_nan_comparison.c", 0),
 
+    # Compile-time strlen constant folding
+    ("171_strlen_constfold.c", 0),
+
     # ("../tests2/106_versym.c", 0),
     ("../tests2/108_constructor.c", 0),
     # ("../tests2/112_backtrace.c", 0),
@@ -327,12 +344,63 @@ TEST_FILES = [
     ("test_complex_fold.c", 0),
     ("test_complex_init.c", 0),
     ("test_complex_mul.c", 0),
+    ("test_complex_real_mul.c", 0),
     ("test_complex_simple.c", 0),
 
     ("111_builtin_printf.c", 0),
     ("112_builtin_puts.c", 0),
+    ("108_loop_unroll_basic.c", 0),
+    ("109_loop_unroll_no_unroll.c", 0),
+    ("110_loop_unroll_with_array.c", 0),
+    ("113_reroll_basic.c", 0),
+    ("114_reroll_negative.c", 0),
     ("150_builtin_fp.c", 0),
+
+    # Benchmark regression tests (-O2 correctness)
+    ("bench_fibonacci.c", 0),
+    ("bench_bubble_sort.c", 0),
+    ("bench_linked_list.c", 0),
+    ("bench_binary_search.c", 0),
+    ("bench_matrix_mul.c", 0),
+    ("bench_function_calls.c", 0),
+    ("bench_conditionals.c", 0),
+    ("bench_switch_stmt.c", 0),
+    ("bench_indirect_calls.c", 0),
+    ("bench_array_sum.c", 0),
+    ("bench_bitwise_mix.c", 0),
+    ("bench_strcpy.c", 0),
+    ("bench_memcpy.c", 0),
+    ("bench_strcmp.c", 0),
+    ("bench_strlen_scan.c", 0),
+
+    # MiBench regression tests (-O2 correctness)
+    ("mibench_bitcount.c", 0),
+    ("mibench_crc32.c", 0),
+    ("mibench_dijkstra.c", (0, 30)),  # Longer timeout for graph traversal
+    ("mibench_qsort.c", 0),
+    ("mibench_stringsearch.c", 0),
+    ("mibench_sha.c", 0),
+    ("mibench_rijndael.c", 0),
+    ("172_const_agg_fold.c", 245),
+    ("173_const_memcpy_fwd.c", 0),
+    ("174_bitfield_extract_fold.c", 0),
+    ("175_shift_pair_ubfx.c", 0),
+    ("176_init_copy_global_fwd.c", 0),
+    ("177_bfi_insert.c", 0),
+    ("178_dead_store_sroa.c", 0),
+    ("179_loop_carried_store.c", 0),
+    ("180_loop_rotation_condbody.c", 0),
+    ("181_loop_const_sim_extern_store.c", 0),
+    ("182_init_copy_global_fwd_alu.c", 0),
+    ("183_selfhost_inline_accumulate.c", 0),
+    ("184_packed_bitfield_rmw_store.c", 0),
 ]
+
+# Per-test compiler defines (e.g. for missing platform macros)
+# Maps test filename -> list of defines passed as -D flags
+TEST_FILE_DEFINES = {
+    "mibench_sha.c": ["LITTLE_ENDIAN"],  # newlib doesn't provide this unlike glibc
+}
 
 # Nested function tests expected to fail (not yet implemented)
 NESTED_XFAIL_TEST_FILES = [
@@ -436,6 +504,59 @@ TCC_BUG_TEST_FILES = [
     ("bug_packed_sizes.c", 0),
     ("bug_stride10.c", 0),
     ("bug_bitfield_packed10.c", 0),
+    ("bug_switch_bitfield.c", 0),
+
+    # Bug: GNU ?: (Elvis operator) extension miscompiled - picks wrong branch.
+    # `tt ?: fallback` always evaluates to fallback even when tt is non-null.
+    # Caused toybox cp to use source filename as destination, triggering
+    # "same file" error.  Workaround: expand to explicit `tt ? tt : fallback`.
+    ("bug_gnu_ternary_elvis.c", 0),
+
+    # Self-host codegen bugs found compiling tinycc for YasOS (build_rootfs.sh).
+    # Bug: dead-loop elimination reused a NOP slot's stale operand_base when
+    # widening it to ASSIGN, overflowing into the next instruction's dest and
+    # corrupting it into an immediate -> "mach_get_dest_reg: unexpected kind 3".
+    ("bug_dead_loop_assign_overlap.c", 0),
+    # Bug: ssa_opt_cmp_eq_prop pushed an equality fact from a loop back-edge into
+    # the loop header's dominator subtree when the header is also the function
+    # entry (its only CFG predecessor is the back-edge), folding the in-loop
+    # `if (c1 != c2) return ...;` to "always equal".  Broke strncasecmp at -O1,
+    # which made toybox `ps` print help instead of the process table.
+    ("bug_cmp_eq_loop_header_entry.c", 0),
+    # Bug: a switch-of-constants rewritten to SWITCH_LOAD spilled its dest under
+    # register pressure -> "SWITCH_LOAD dest must be in a hardware register".
+    ("bug_switch_load_spill.c", 0),
+    # Bug: mla-fusion formed a 64-bit MLA for a non-in-place accumulate (dest !=
+    # accumulator), which SMLAL/UMLAL cannot lower -> "unable to lower 64-bit MLA".
+    ("bug_mla64_non_inplace.c", 0),
+    # Bug: SSA rename cleared is_lval on a deref store/load through a promoted
+    # pointer var -> `(v=call())->m0=c` (member offset 0) lowered `*v=c` to `v=c`,
+    # dropping the store and clobbering the pointer (HardFault in toybox sh).
+    ("bug_chained_assign_store_off0.c", 0),
+    # Bug: loading a stack-passed parameter into an "unresolved" transient
+    # (PREG_NONE, frame offset 0) lowered an offset-0 spill as `str rX,[FP,#0]`,
+    # clobbering the saved frame record (r7) under the FP prologue -> caller's
+    # frame pointer corrupted on return (HardFault/STKOF in tinycc new_symtab).
+    ("bug_param_spill_fp_off0.c", 0),
+    # Bug: the CBZ/CBNZ peephole committed a 2-byte forward branch from a wrong
+    # distance estimate -> "CBZ/CBNZ target out of range" when the body > 126 bytes.
+    ("bug_cbz_far_zero_branch.c", 0),
+    # Bug: IV strength-reduction mis-shifted instructions for derived-IV address
+    # expressions feeding a struct-copy call, deleting a PARAM and crashing with
+    # "missing FUNCPARAMVAL for call_id=N" (in-place struct-array compaction).
+    ("bug_ivsr_struct_compact.c", 0),
+    # Bug: the post-increment lowering (LOAD_POSTINC/STORE_POSTINC) wrote back
+    # only the loaded/stored value, not the post-incremented pointer.  A SPILLED
+    # loop-carried pointer never advanced (the `ldrb [rN],#1` bumped only a
+    # scratch reg) -> `*q++` re-read the same byte forever.  tcc hung in
+    # parse_number() compiling ANY integer literal (self-hosted compiler froze).
+    ("bug_postinc_spilled_ptr.c", 0),
+    # Bug: CMP identity-folding ignored operand lval-ness, folding the
+    # `ptr >= array + N` bounds check (where the pointer field aliases
+    # &array[N]) to always-true and dropping the guard.  This is tcc's own
+    # ifdef_stack overflow check -> the first `#if` in the predefs reported
+    # "memory full (ifdef)" and the self-hosted compiler couldn't preprocess.
+    ("bug_cmp_ptr_array_alias.c", 0),
 
 
 ]
@@ -462,20 +583,31 @@ def _test_id(test_file):
     return Path(_primary_test_file(test_file)).stem
 
 def load_expect_file(test_name):
-    """Load and return lines from .expect file and expected exit code"""
+    """Load and return lines from .expect file and expected exit code.
+
+    Recognises [returns N] directives: the last one found sets the
+    expected exit code (returned as second element).  Those lines are
+    excluded from the expected-output list.
+    """
     test_file = Path(_primary_test_file(test_name))
     expect_file = CURRENT_DIR / f"{test_file.parent}/{test_file.stem}.expect"
     if not expect_file.exists():
         raise FileNotFoundError(f"Expect file not found: {expect_file}")
 
     lines = []
+    exit_code = None
+    returns_pattern = re.compile(r'^\[returns (\d+)\]$')
 
     with open(expect_file, "r") as f:
         for line in f:
             stripped = line.rstrip('\n')
-            lines.append(stripped)
+            m = returns_pattern.match(stripped)
+            if m:
+                exit_code = int(m.group(1))
+            else:
+                lines.append(stripped)
 
-    return lines
+    return lines, exit_code
 
 
 def load_tagged_expect_file(test_name):
@@ -561,7 +693,9 @@ def _escape_regex(line):
 
 
 def _run_qemu_test(test_file, expected_exit_code, args=None, defines=None, opt_level="-O0", output_dir=None, timeout=10):
-    expected_lines = load_expect_file(test_file)
+    expected_lines, expect_exit = load_expect_file(test_file)
+    if expect_exit is not None:
+        expected_exit_code = expect_exit
     opt_suffix = f"_{opt_level.replace('-', '').replace(' ', '_')}"
     config = CompileConfig(extra_cflags=opt_level, output_suffix=opt_suffix, output_dir=output_dir)
     sut, loglines = run_test(test_file, MACHINE, args, defines=defines, config=config)
@@ -574,6 +708,7 @@ def _run_qemu_test(test_file, expected_exit_code, args=None, defines=None, opt_l
     except Exception as e:
         raise AssertionError(f"Test failed for {test_file} with {opt_level}: {e}") from e
     finally:
+        sut.close()
         sut.logfile.close()
 
 
@@ -645,11 +780,15 @@ def _run_tagged_qemu_test(test_file, tag, expected_lines, expected_exit_code, op
     except Exception as e:
         raise AssertionError(f"Test failed for {test_file} [{tag}] with {opt_level}: {e}") from e
     finally:
+        sut.close()
         sut.logfile.close()
 
 
 # Optimization levels to test
-OPT_LEVELS = ["-O0", "-O1"]
+# -Os is the level toybox/yasos apps build at; several miscompiles (e.g. the
+# value-tracking store-through-pointer-var bug) only surface under -Os, so it
+# must be in the matrix even though -O0/-O1/-O2 pass.
+OPT_LEVELS = ["-O0", "-O1", "-O2", "-Os"]
 
 
 def _generate_matrix_params(test_list):
@@ -686,7 +825,8 @@ def test_qemu_execution(test_file, expected_exit_code, timeout, opt_level, tmp_p
     if (ASAN_ENABLED or VALGRIND_ENABLED) and primary in SLOW_UNDER_INSTRUMENTATION:
         pytest.skip("Skipped under ASan/valgrind (too slow)")
 
-    _run_qemu_test(test_file, expected_exit_code, opt_level=opt_level, output_dir=tmp_path, timeout=timeout)
+    defines = TEST_FILE_DEFINES.get(primary)
+    _run_qemu_test(test_file, expected_exit_code, defines=defines, opt_level=opt_level, output_dir=tmp_path, timeout=timeout)
 
 
 # Nested function xfail tests (not yet implemented)
@@ -904,6 +1044,7 @@ PIC_TEXT_DATA_SEP_TEST_FILES = [
     # register instead of the AND result.  push_mask ends up with bit 13 (SP)
     # set → th_push returns {0,0}.
     ("bug_struct_mask_copy.c", 0),
+    ("bug_mask_copy_noloop.c", 0),
 ]
 
 

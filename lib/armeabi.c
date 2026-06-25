@@ -517,7 +517,7 @@ long long __aeabi_lasr(long long a, int b)
   return u.ll;
 }
 
-float __aeabi_fneg(float a)
+__attribute__((weak)) float __aeabi_fneg(float a)
 {
   return aeabi_fneg_impl(a);
 }

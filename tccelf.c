@@ -22,9 +22,6 @@
 #include "tccld.h"
 #include "tccyaff.h"
 
-/* Define this to get some debug output during relocation processing.  */
-// #define DEBUG_RELOC
-
 /********************************************************/
 /* global variables */
 
@@ -50,6 +47,8 @@ struct sym_version
 #define SHF_PRIVATE 0x80000000
 /* section is dynsymtab_section */
 #define SHF_DYNSYM 0x40000000
+/* Larger initial ELF hash tables reduce rebuild churn without changing lookup semantics. */
+#define SYMTAB_INITIAL_HASH_BUCKETS 512
 
 #if defined(TCC_TARGET_PE)
 #define shf_RELRO SHF_ALLOC
@@ -121,27 +120,21 @@ ST_FUNC void tccelf_new(TCCState *s)
 /* -------------------------------------------------- */
 /* Lazy section loading support */
 
-/* Check if section should use lazy loading */
+/* Check if section should use lazy loading.
+   Only defer debug sections — deferring everything else adds
+   overhead (malloc + strdup + re-open) that exceeds the savings
+   when most sections will be needed for linking anyway. */
 static int should_defer_section(const char *name, int sh_type)
 {
-  /* Always defer DWARF debug sections (original behavior) */
-  if (strncmp(name, ".debug_", 7) == 0)
+  (void)sh_type;
+  /* Defer DWARF debug sections */
+  if (name[0] == '.' && name[1] == 'd' && strncmp(name, ".debug_", 7) == 0)
     return 1;
-
-  /* Never defer relocation sections - needed by GC */
-  if (sh_type == SHT_REL || sh_type == SHT_RELA)
-    return 0;
-
-  /* Never defer ARM exception handling sections - needed for runtime */
-  if (strncmp(name, ".ARM", 4) == 0)
-    return 0;
-
-  /* Never defer eh_frame - needed for stack unwinding */
-  if (strncmp(name, ".eh_frame", 9) == 0)
-    return 0;
-
-  /* Defer all other sections (full deferred loading) */
-  return 1;
+  /* Defer stab sections */
+  if (name[0] == '.' && name[1] == 's' && strncmp(name, ".stab", 5) == 0)
+    return 1;
+  /* Load everything else immediately */
+  return 0;
 }
 
 /* Forward declarations for lazy loading functions */
@@ -914,15 +907,18 @@ ST_FUNC void free_section(Section *s)
 {
   if (!s)
     return;
-  free_deferred_chunks(s); /* Clean up lazy loading metadata */
-  free_reloc_patches(s);   /* Clean up relocation patches */
-  tcc_free(s->str_hash);   /* Clean up string hash table */
+  free_deferred_chunks(s);     /* Clean up lazy loading metadata */
+  free_reloc_patches(s);       /* Clean up relocation patches */
+  tcc_free(s->str_hash);       /* Clean up string hash table */
+  tcc_free(s->hash_val_cache); /* Clean up hash value cache */
   tcc_free(s->data);
   s->data = NULL;
   s->data_allocated = s->data_offset = 0;
   s->str_hash = NULL;
   s->str_hash_size = 0;
   s->str_hash_count = 0;
+  s->hash_val_cache = NULL;
+  s->hash_val_alloc = 0;
   s->nb_reloc_patches = 0;
   s->alloc_reloc_patches = 0;
 }
@@ -946,6 +942,15 @@ ST_FUNC void tccelf_delete(TCCState *s1)
   for (i = 1; i < s1->nb_sections; i++)
     free_section(s1->sections[i]);
   dynarray_reset(&s1->sections, &s1->nb_sections);
+  tcc_free(s1->section_ht);
+  s1->section_ht = NULL;
+  s1->section_ht_mask = 0;
+  s1->section_ht_count = 0;
+
+  tcc_free(s1->undef_sym_list);
+  s1->undef_sym_list = NULL;
+  s1->nb_undef_syms = 0;
+  s1->undef_sym_alloc = 0;
 
   for (i = 0; i < s1->nb_priv_sections; i++)
     free_section(s1->priv_sections[i]);
@@ -1022,6 +1027,72 @@ ST_FUNC void tccelf_end_file(TCCState *s1)
   }
 }
 
+/* ---- Global section name hash table ---- */
+
+static unsigned int section_name_hash(const char *name)
+{
+  unsigned int h = 5381;
+  const unsigned char *p = (const unsigned char *)name;
+  while (*p)
+    h = ((h << 5) + h) ^ *p++;
+  return h;
+}
+
+static void section_ht_grow(TCCState *s1)
+{
+  unsigned int new_size = s1->section_ht_mask ? (s1->section_ht_mask + 1) * 2 : 64;
+  Section **new_ht = tcc_mallocz(new_size * sizeof(Section *));
+  unsigned int new_mask = new_size - 1;
+  if (s1->section_ht)
+  {
+    unsigned int i;
+    for (i = 0; i <= s1->section_ht_mask; i++)
+    {
+      Section *s = s1->section_ht[i];
+      if (s)
+      {
+        unsigned int idx = section_name_hash(s->name) & new_mask;
+        while (new_ht[idx])
+          idx = (idx + 1) & new_mask;
+        new_ht[idx] = s;
+      }
+    }
+    tcc_free(s1->section_ht);
+  }
+  s1->section_ht = new_ht;
+  s1->section_ht_mask = new_mask;
+}
+
+static void section_ht_insert(TCCState *s1, Section *sec)
+{
+  unsigned int idx;
+  if (s1->section_ht_count * 2 >= s1->section_ht_mask)
+    section_ht_grow(s1);
+  idx = section_name_hash(sec->name) & s1->section_ht_mask;
+  while (s1->section_ht[idx])
+    idx = (idx + 1) & s1->section_ht_mask;
+  s1->section_ht[idx] = sec;
+  s1->section_ht_count++;
+}
+
+static Section *section_ht_find(TCCState *s1, const char *name)
+{
+  unsigned int idx;
+  Section *s;
+  if (!s1->section_ht)
+    return NULL;
+  idx = section_name_hash(name) & s1->section_ht_mask;
+  while ((s = s1->section_ht[idx]) != NULL)
+  {
+    if (!strcmp(s->name, name))
+      return s;
+    idx = (idx + 1) & s1->section_ht_mask;
+  }
+  return NULL;
+}
+
+/* ---- End section name hash table ---- */
+
 ST_FUNC Section *new_section(TCCState *s1, const char *name, int sh_type, int sh_flags)
 {
   Section *sec;
@@ -1063,6 +1134,7 @@ ST_FUNC Section *new_section(TCCState *s1, const char *name, int sh_type, int sh
   {
     sec->sh_num = s1->nb_sections;
     dynarray_add(&s1->sections, &s1->nb_sections, sec);
+    section_ht_insert(s1, sec);
   }
 
   return sec;
@@ -1070,7 +1142,7 @@ ST_FUNC Section *new_section(TCCState *s1, const char *name, int sh_type, int sh
 
 ST_FUNC void init_symtab(Section *s)
 {
-  int *ptr, nb_buckets = 1;
+  int *ptr, nb_buckets = SYMTAB_INITIAL_HASH_BUCKETS;
   put_elf_str(s->link, "");
   section_ptr_add(s, sizeof(ElfW(Sym)));
   ptr = section_ptr_add(s->hash, (2 + nb_buckets + 1) * sizeof(int));
@@ -1189,41 +1261,6 @@ ST_FUNC Section *find_section(TCCState *s1, const char *name)
   return new_section(s1, name, SHT_PROGBITS, SHF_ALLOC);
 }
 
-/* ------------------------------------------------------------------------- */
-
-/* String table deduplication hash table functions - DISABLED due to issues */
-#if 0
-/* Initialize hash table for string deduplication in a section */
-static void strtab_init_hash(Section *s)
-{
-    if (s->str_hash)
-        return;
-    s->str_hash_size = 256;
-    s->str_hash = tcc_mallocz(s->str_hash_size * sizeof(uint32_t));
-    s->str_hash_count = 0;
-}
-
-static uint32_t str_hash_func(const char *str)
-{
-    uint32_t h = 5381;
-    int c;
-    while ((c = *str++))
-        h = ((h << 5) + h) + c;
-    return h;
-}
-
-static int strtab_find(Section *s, const char *str, uint32_t hash)
-{
-    /* ... */
-    return -1;
-}
-
-static void strtab_insert(Section *s, const char *str, uint32_t offset, uint32_t hash)
-{
-    /* ... */
-}
-#endif
-
 ST_FUNC int put_elf_str(Section *s, const char *sym)
 {
   int offset, len;
@@ -1261,6 +1298,8 @@ static void rebuild_hash(Section *s, unsigned int nb_buckets)
   ElfW(Sym) * sym;
   int *ptr, *hash, nb_syms, sym_index, h;
   unsigned char *strtab;
+  unsigned int full_hash;
+  unsigned int *hcache;
 
   strtab = s->link->data;
   nb_syms = s->data_offset / sizeof(ElfW(Sym));
@@ -1277,18 +1316,27 @@ static void rebuild_hash(Section *s, unsigned int nb_buckets)
   memset(hash, 0, (nb_buckets + 1) * sizeof(int));
   ptr += nb_buckets + 1;
 
+  /* Rebuild hash value cache */
+  s->hash->hash_val_cache = tcc_realloc(s->hash->hash_val_cache, nb_syms * sizeof(unsigned int));
+  s->hash->hash_val_alloc = nb_syms;
+  hcache = s->hash->hash_val_cache;
+  hcache[0] = 0;
+
   sym = (ElfW(Sym) *)s->data + 1;
   for (sym_index = 1; sym_index < nb_syms; sym_index++)
   {
     if (ELFW(ST_BIND)(sym->st_info) != STB_LOCAL)
     {
-      h = elf_hash(strtab + sym->st_name) % nb_buckets;
+      full_hash = elf_hash(strtab + sym->st_name);
+      h = full_hash % nb_buckets;
       *ptr = hash[h];
       hash[h] = sym_index;
+      hcache[sym_index] = full_hash;
     }
     else
     {
       *ptr = 0;
+      hcache[sym_index] = 0;
     }
     ptr++;
     sym++;
@@ -1303,13 +1351,14 @@ ST_FUNC int put_elf_sym(Section *s, addr_t value, unsigned long size, int info, 
   ElfW(Sym) * sym;
   Section *hs;
 
-  /* Validate name pointer - catch garbage early */
+  /* Validate name pointer - catch garbage early.
+     Accept printable ASCII and valid UTF-8 lead bytes (0xC2-0xF4).
+     Reject control characters and bare continuation bytes. */
   if (name && name[0])
   {
     unsigned char first = (unsigned char)name[0];
-    if (first < 0x20 || first > 0x7e)
+    if (first < 0x20 || (first > 0x7e && first < 0xc2) || first > 0xf4)
     {
-      /* name pointer contains garbage - treat as unnamed */
       name = NULL;
     }
   }
@@ -1337,8 +1386,10 @@ ST_FUNC int put_elf_sym(Section *s, addr_t value, unsigned long size, int info, 
     if (ELFW(ST_BIND)(info) != STB_LOCAL)
     {
       /* add another hashing entry */
+      unsigned int full_hash;
       nbuckets = base[0];
-      h = elf_hash((unsigned char *)s->link->data + name_offset) % nbuckets;
+      full_hash = elf_hash((unsigned char *)s->link->data + name_offset);
+      h = full_hash % nbuckets;
       *ptr = base[2 + h];
       base[2 + h] = sym_index;
       base[1]++;
@@ -1348,6 +1399,18 @@ ST_FUNC int put_elf_sym(Section *s, addr_t value, unsigned long size, int info, 
       {
         rebuild_hash(s, 2 * nbuckets);
       }
+      else
+      {
+        /* Store cached hash value (rebuild_hash handles this when triggered) */
+        if (sym_index >= hs->hash_val_alloc)
+        {
+          int new_alloc = (sym_index + 16) & ~15;
+          hs->hash_val_cache = tcc_realloc(hs->hash_val_cache, new_alloc * sizeof(unsigned int));
+          memset(hs->hash_val_cache + hs->hash_val_alloc, 0, (new_alloc - hs->hash_val_alloc) * sizeof(unsigned int));
+          hs->hash_val_alloc = new_alloc;
+        }
+        hs->hash_val_cache[sym_index] = full_hash;
+      }
     }
     else
     {
@@ -1355,32 +1418,70 @@ ST_FUNC int put_elf_sym(Section *s, addr_t value, unsigned long size, int info, 
       base[1]++;
     }
   }
+
+  /* Track non-local UNDEF symbols in symtab for fast alacarte lookup */
+  if (shndx == SHN_UNDEF && ELFW(ST_BIND)(info) != STB_LOCAL)
+  {
+    TCCState *ts = s->s1;
+    if (s == ts->symtab)
+    {
+      if (ts->nb_undef_syms >= ts->undef_sym_alloc)
+      {
+        ts->undef_sym_alloc = ts->undef_sym_alloc ? ts->undef_sym_alloc * 2 : 64;
+        ts->undef_sym_list = tcc_realloc(ts->undef_sym_list, ts->undef_sym_alloc * sizeof(int));
+      }
+      ts->undef_sym_list[ts->nb_undef_syms++] = sym_index;
+    }
+  }
+
   return sym_index;
 }
 
-ST_FUNC int find_elf_sym(Section *s, const char *name)
+static int find_elf_sym_with_hash(Section *s, const char *name, unsigned int full_hash)
 {
   ElfW(Sym) * sym;
   Section *hs;
-  int nbuckets, sym_index, h;
+  int nbuckets, sym_index;
   const char *name1;
+  unsigned int *hcache;
 
   hs = s->hash;
   if (!hs)
     return 0;
   nbuckets = ((int *)hs->data)[0];
-  h = elf_hash((unsigned char *)name) % nbuckets;
-  sym_index = ((int *)hs->data)[2 + h];
+  sym_index = ((int *)hs->data)[2 + full_hash % nbuckets];
+  hcache = hs->hash_val_cache;
 
   while (sym_index != 0)
   {
-    sym = &((ElfW(Sym) *)s->data)[sym_index];
-    name1 = (char *)s->link->data + sym->st_name;
-    if (!strcmp(name, name1))
-      return sym_index;
+    /* Compare cached hash value first to avoid expensive strcmp */
+    if (!hcache || hcache[sym_index] == full_hash)
+    {
+      sym = &((ElfW(Sym) *)s->data)[sym_index];
+      name1 = (char *)s->link->data + sym->st_name;
+      if (!strcmp(name, name1))
+        return sym_index;
+    }
     sym_index = ((int *)hs->data)[2 + nbuckets + sym_index];
   }
   return 0;
+}
+
+ST_FUNC int find_elf_sym(Section *s, const char *name)
+{
+  return find_elf_sym_with_hash(s, name, elf_hash((unsigned char *)name));
+}
+
+/* Resolve `name` against loaded libraries: first the already-interned
+   dynsymtab_section, then (on miss) the loaded YAFF libraries' on-disk hash
+   tables (tcc_yaff_resolve), which interns a hit into dynsymtab_section.
+   Returns the dynsymtab index, or 0 if no loaded library provides it. */
+ST_FUNC int tcc_dynsym_find(TCCState *s1, const char *name)
+{
+  int idx = find_elf_sym(s1->dynsymtab_section, name);
+  if (idx)
+    return idx;
+  return tcc_yaff_resolve(s1, name);
 }
 
 /* return elf symbol value, signal error if 'err' is nonzero, decorate
@@ -1477,7 +1578,7 @@ static void version_add(TCCState *s1)
     int dllindex, verndx;
     sym = &((ElfW(Sym) *)symtab->data)[sym_index];
     name = (char *)symtab->link->data + sym->st_name;
-    dllindex = find_elf_sym(s1->dynsymtab_section, name);
+    dllindex = tcc_dynsym_find(s1, name);
     verndx = (dllindex && dllindex < nb_sym_to_version) ? sym_to_version[dllindex] : -1;
     if (verndx >= 0
         /* XXX: on android, clang refuses to link with a libtcc.so made by tcc
@@ -1573,7 +1674,7 @@ ST_FUNC int set_elf_sym(Section *s, addr_t value, unsigned long size, int info, 
   if (sym_bind != STB_LOCAL)
   {
     /* we search global or weak symbols */
-    sym_index = find_elf_sym(s, name);
+    sym_index = find_elf_sym_with_hash(s, name, elf_hash((const unsigned char *)name));
     if (!sym_index)
       goto do_def;
     esym = &((ElfW(Sym) *)s->data)[sym_index];
@@ -1656,7 +1757,6 @@ ST_FUNC int set_elf_sym(Section *s, addr_t value, unsigned long size, int info, 
     do_patch:
       esym->st_info = ELFW(ST_INFO)(sym_bind, sym_type);
       esym->st_shndx = shndx;
-      s1->new_undef_sym = 1;
       esym->st_value = value;
       esym->st_size = size;
     }
@@ -1665,6 +1765,11 @@ ST_FUNC int set_elf_sym(Section *s, addr_t value, unsigned long size, int info, 
   {
   do_def:
     sym_index = put_elf_sym(s, value, size, ELFW(ST_INFO)(sym_bind, sym_type), other, shndx, name);
+    /* Signal the --start-group rescan loop only when a genuinely NEW
+       undefined symbol appears.  Resolving an existing undef (do_patch)
+       does not create new work for other archives. */
+    if (shndx == SHN_UNDEF)
+      s1->new_undef_sym = 1;
   }
   return sym_index;
 }
@@ -2032,9 +2137,7 @@ ST_FUNC void relocate_syms(TCCState *s1, Section *symtab, int do_resolve)
         if (addr)
         {
           sym->st_value = (addr_t)addr;
-#ifdef DEBUG_RELOC
-          printf("relocate_sym: %s -> 0x%lx\n", name, sym->st_value);
-#endif
+          LOG_RELOC("relocate_sym: %s -> 0x%lx", name, sym->st_value);
           goto found;
         }
 #endif
@@ -2293,7 +2396,16 @@ int build_got(TCCState *s1)
   s1->got = new_section(s1, ".got", SHT_PROGBITS, SHF_ALLOC | SHF_WRITE);
   s1->got->sh_entsize = 8;
   /* keep space for _DYNAMIC pointer and two dummy got entries */
+#if defined(TCC_TARGET_YASOS)
+  /* + a reserved slot (index YAFF_RODATA_ANCHOR_GOT_INDEX = 3) holding the
+   * runtime base of the shared .rodata segment. Reserved up front so its GOT
+   * offset is a compile-time constant the codegen addresses as [R9,#24],
+   * independent of the final GOT layout; the loader fills it (the YAFF writer
+   * emits its relocation when -share-rodata is active). */
+  section_ptr_add(s1->got, 4 * PTR_SIZE * 2);
+#else
   section_ptr_add(s1->got, 3 * PTR_SIZE * 2);
+#endif
   return set_elf_sym(symtab_section, 0, 0, ELFW(ST_INFO)(STB_GLOBAL, STT_OBJECT), 0, s1->got->sh_num,
                      "_GLOBAL_OFFSET_TABLE_");
 }
@@ -2950,6 +3062,7 @@ ST_FUNC void tcc_add_runtime(TCCState *s1)
     if (lpthread)
       tcc_add_library(s1, "pthread");
     tcc_add_library(s1, "c");
+    tcc_add_library(s1, "m");
 #ifdef TCC_LIBGCC
     if (!s1->static_link)
     {
@@ -3120,6 +3233,11 @@ static void fill_local_got_entries(TCCState *s1)
       unsigned offset = attr->got_offset;
       if (offset != rel->r_offset - s1->got->sh_addr)
         tcc_error_noabort("fill_local_got_entries: huh?");
+      /* Store the ELF symbol type (e.g. STT_FUNC vs STT_NOTYPE) in the
+         second word of the 8-byte GOT entry.  The YAFF writer reads this
+         to distinguish function pointers (which need thunks) from plain
+         code addresses such as labels used by goto *&&label.  */
+      write32le(s1->got->data + offset + PTR_SIZE, ELFW(ST_TYPE)(sym->st_info));
       rel->r_info = ELFW(R_INFO)(0, R_RELATIVE);
 #if SHT_RELX == SHT_RELA
       rel->r_addend = sym->st_value;
@@ -3157,7 +3275,7 @@ static void bind_exe_dynsyms(TCCState *s1, int is_PIE)
         continue;
       }
       name = (char *)symtab_section->link->data + sym->st_name;
-      sym_index = find_elf_sym(s1->dynsymtab_section, name);
+      sym_index = tcc_dynsym_find(s1, name);
       if (sym_index)
       {
         if (is_PIE)
@@ -3236,7 +3354,7 @@ static void bind_libs_dynsyms(TCCState *s1)
   for_each_elem(symtab_section, 1, sym, ElfW(Sym))
   {
     name = (char *)symtab_section->link->data + sym->st_name;
-    dynsym_index = find_elf_sym(s1->dynsymtab_section, name);
+    dynsym_index = tcc_dynsym_find(s1, name);
     if (sym->st_shndx != SHN_UNDEF)
     {
       if (ELFW(ST_BIND)(sym->st_info) != STB_LOCAL && (dynsym_index || s1->rdynamic))
@@ -3625,9 +3743,7 @@ static int sort_sections(TCCState *s1, int *sec_order, struct dyn_inf *d)
         f0 = f, ++n, f |= 1 << 8;
     }
     sec_cls[i] = f;
-#ifdef DEBUG_RELOC
-    printf("ph %d sec %02d : %3X %3X  %x  %04X  %s\n", (f > 0) * n, i, f, k, s->sh_type, (int)s->sh_size, s->name);
-#endif
+    LOG_RELOC("ph %d sec %02d : %3X %3X  %x  %04X  %s", (f > 0) * n, i, f, k, s->sh_type, (int)s->sh_size, s->name);
   }
   return n;
 }
@@ -4412,12 +4528,13 @@ static void gc_sections(TCCState *s1)
     name = (char *)symtab_section->link->data + sym->st_name;
 
     /* Mark entry point section */
-    if (s1->elf_entryname && !strcmp(name, s1->elf_entryname))
+    if (s1->elf_entryname && name[0] == s1->elf_entryname[0] && !strcmp(name, s1->elf_entryname))
     {
       sec_used[sym->st_shndx] = 1;
       continue;
     }
-    if (!strcmp(name, "_start") || !strcmp(name, "main") || !strcmp(name, "_main") || !strcmp(name, "__start"))
+    if ((name[0] == '_' || name[0] == 'm') &&
+        (!strcmp(name, "_start") || !strcmp(name, "main") || !strcmp(name, "_main") || !strcmp(name, "__start")))
     {
       sec_used[sym->st_shndx] = 1;
       continue;
@@ -4549,6 +4666,15 @@ static int elf_output_file(TCCState *s1, const char *filename)
   /* if linking, also link in runtime libraries (libc, libgcc, etc.) */
   tcc_add_runtime(s1);
   resolve_common_syms(s1);
+
+#ifdef TCC_TARGET_YAFF
+  /* Merge .init_array / .fini_array into .data early — before
+     build_got_entries() — so that the __yaff_initfini symbol uses the
+     R_RELATIVE (local) GOT path, and relocations pointing into the
+     merged data are resolved naturally by relocate_sections(). */
+  if (s1->output_format == TCC_OUTPUT_FORMAT_YAFF)
+    tcc_yaff_prepare_init_fini(s1);
+#endif
 
   /* Phase 2: Garbage Collection During Loading - mark and load referenced sections */
   if (s1->gc_sections_aggressive)
@@ -4811,17 +4937,34 @@ static int elf_output_obj(TCCState *s1, const char *filename)
 
 LIBTCCAPI int tcc_output_file(TCCState *s, const char *filename)
 {
+  unsigned output_start = 0;
+  int ret;
+
+  if (s->do_bench)
+    output_start = tcc_getclock_ms();
+
   if (s->test_coverage)
     tcc_tcov_add_file(s, filename);
   if (s->output_type == TCC_OUTPUT_OBJ)
-    return elf_output_obj(s, filename);
+    ret = elf_output_obj(s, filename);
 #ifdef TCC_TARGET_PE
-  return pe_output_file(s, filename);
+  else
+    ret = pe_output_file(s, filename);
 #elif defined TCC_TARGET_MACHO
-  return macho_output_file(s, filename);
+  else
+    ret = macho_output_file(s, filename);
 #else
-  return elf_output_file(s, filename);
+  else
+    ret = elf_output_file(s, filename);
 #endif
+  if (s->do_bench)
+  {
+    unsigned elapsed = tcc_getclock_ms() - output_start;
+    s->bench_output_time += elapsed;
+    s->bench_output_count++;
+    tcc_bench_log(s, "output", filename, elapsed);
+  }
+  return ret;
 }
 
 ST_FUNC ssize_t full_read(int fd, void *buf, size_t count)
@@ -4857,24 +5000,26 @@ ST_FUNC void *load_data(int fd, unsigned long file_offset, unsigned long size)
  */
 static const char *get_merged_section_name(const char *name)
 {
-  static const struct
+  if (name[0] != '.')
+    return name;
+  switch (name[1])
   {
-    const char *prefix;
-    const char *canonical;
-    int prefix_len;
-  } merge_map[] = {
-      {".text.", ".text", 6},
-      {".rodata.", ".rodata", 8},
-      {".data.", ".data", 6},
-      {".bss.", ".bss", 5},
-  };
-  size_t i;
-  for (i = 0; i < sizeof(merge_map) / sizeof(merge_map[0]); i++)
-  {
-    if (!strncmp(name, merge_map[i].prefix, merge_map[i].prefix_len))
-    {
-      return merge_map[i].canonical;
-    }
+  case 't':
+    if (!strncmp(name, ".text.", 6))
+      return ".text";
+    break;
+  case 'r':
+    if (!strncmp(name, ".rodata.", 8))
+      return ".rodata";
+    break;
+  case 'd':
+    if (!strncmp(name, ".data.", 6))
+      return ".data";
+    break;
+  case 'b':
+    if (!strncmp(name, ".bss.", 5))
+      return ".bss";
+    break;
   }
   return name;
 }
@@ -4917,12 +5062,14 @@ ST_FUNC int tcc_object_type(int fd, ElfW(Ehdr) * h)
 
 /* load an object file and merge it with current files */
 /* XXX: handle correctly stab (debug) info */
+static Section *find_existing_section(TCCState *s1, const char *name);
+
 ST_FUNC int tcc_load_object_file(TCCState *s1, int fd, unsigned long file_offset)
 {
   ElfW(Ehdr) ehdr;
   ElfW(Shdr) * shdr, *sh;
   unsigned long size, offset, offseti;
-  int i, j, nb_syms, sym_index, ret, seencompressed;
+  int i, nb_syms, sym_index, ret, seencompressed;
   char *strsec, *strtab;
   int stab_index = 0, stabstr_index = 0;
   (void)stab_index;
@@ -4933,6 +5080,12 @@ ST_FUNC int tcc_load_object_file(TCCState *s1, int fd, unsigned long file_offset
   ElfW(Sym) * sym, *symtab;
   ElfW_Rel *rel;
   Section *s;
+  const char *last_lookup_name = NULL;
+  Section *last_lookup_section = NULL;
+  unsigned object_start = 0;
+
+  if (s1->do_bench)
+    object_start = tcc_getclock_ms();
 
   /* Use lazy loading for aggressive GC mode */
   if (s1->gc_sections_aggressive)
@@ -5004,13 +5157,14 @@ ST_FUNC int tcc_load_object_file(TCCState *s1, int fd, unsigned long file_offset
       sh = &shdr[sh->sh_info];
     /* ignore sections types we do not handle (plus relocs to those) */
     sh_name = strsec + sh->sh_name;
-    if (0 == strncmp(sh_name, ".debug_", 7) || 0 == strncmp(sh_name, ".stab", 5))
+    if (sh_name[0] == '.' && (sh_name[1] == 'd' || sh_name[1] == 's') &&
+        (0 == strncmp(sh_name, ".debug_", 7) || 0 == strncmp(sh_name, ".stab", 5)))
     {
       if (!s1->do_debug || seencompressed)
         continue;
 #if !(TARGETOS_OpenBSD || TARGETOS_FreeBSD || TARGETOS_NetBSD)
     }
-    else if (0 == strncmp(sh_name, ".eh_frame", 9))
+    else if (sh_name[1] == 'e' && 0 == strncmp(sh_name, ".eh_frame", 9))
     {
       if (NULL == eh_frame_section)
         continue;
@@ -5035,17 +5189,25 @@ ST_FUNC int tcc_load_object_file(TCCState *s1, int fd, unsigned long file_offset
     /* Use merged name for .text.*, .rodata.*, .data.*, .bss.* sections */
     {
       const char *lookup_name = get_merged_section_name(sh_name);
-      for (j = 1; j < s1->nb_sections; j++)
+      s = NULL;
+      if (lookup_name == last_lookup_name)
       {
-        s = s1->sections[j];
-        if (strcmp(s->name, lookup_name))
-          continue;
+        s = last_lookup_section;
+      }
+      else
+      {
+        s = find_existing_section(s1, lookup_name);
+      }
+      last_lookup_name = lookup_name;
+      last_lookup_section = s;
+      if (s)
+      {
         if (sh->sh_type != s->sh_type && strcmp(s->name, ".eh_frame"))
         {
           tcc_error_noabort("section type conflict: %s %02x <> %02x", s->name, sh->sh_type, s->sh_type);
           goto the_end;
         }
-        if (!strncmp(sh_name, ".gnu.linkonce", 13))
+        if (sh_name[1] == 'g' && !strncmp(sh_name, ".gnu.linkonce", 13))
         {
           /* if a 'linkonce' section is already present, we
              do not add it again. It is a little tricky as
@@ -5056,7 +5218,7 @@ ST_FUNC int tcc_load_object_file(TCCState *s1, int fd, unsigned long file_offset
         }
         /* stab section tracking removed - DWARF only */
         /* Track if this section was merged (original name differs from lookup name) */
-        if (strcmp(sh_name, lookup_name))
+        if (sh_name != lookup_name)
           sm_table[i].merged_to = lookup_name;
         goto found;
       }
@@ -5067,8 +5229,10 @@ ST_FUNC int tcc_load_object_file(TCCState *s1, int fd, unsigned long file_offset
       s->sh_addralign = sh->sh_addralign;
       s->sh_entsize = sh->sh_entsize;
       sm_table[i].new_section = 1;
+      last_lookup_name = lookup_name;
+      last_lookup_section = s;
       /* Track if this section was merged */
-      if (strcmp(sh_name, lookup_name))
+      if (sh_name != lookup_name)
         sm_table[i].merged_to = lookup_name;
     }
   found:
@@ -5238,6 +5402,16 @@ ST_FUNC int tcc_load_object_file(TCCState *s1, int fd, unsigned long file_offset
 
   ret = 0;
 the_end:
+  if (s1->do_bench)
+  {
+    unsigned elapsed = tcc_getclock_ms() - object_start;
+    s1->bench_object_load_time += elapsed;
+    s1->bench_object_load_count++;
+    if (s1->current_archive_offset)
+      s1->bench_archive_member_count++;
+    else
+      tcc_bench_log(s1, "load-obj", s1->current_filename, elapsed);
+  }
   tcc_free(symtab);
   tcc_free(strtab);
   tcc_free(old_to_new_syms);
@@ -5286,64 +5460,293 @@ static int read_ar_header(int fd, int offset, ArchiveHeader *hdr)
   return len;
 }
 
+static int alacarte_member_seen(unsigned long long *loaded_members, unsigned int mask, unsigned long long offset)
+{
+  unsigned long long key = offset + 1;
+  unsigned int idx = ((unsigned int)offset ^ (unsigned int)(offset >> 32)) & mask;
+
+  while (loaded_members[idx])
+  {
+    if (loaded_members[idx] == key)
+      return 1;
+    idx = (idx + 1) & mask;
+  }
+  return 0;
+}
+
+static void alacarte_mark_member(unsigned long long *loaded_members, unsigned int mask, unsigned long long offset)
+{
+  unsigned long long key = offset + 1;
+  unsigned int idx = ((unsigned int)offset ^ (unsigned int)(offset >> 32)) & mask;
+
+  while (loaded_members[idx] && loaded_members[idx] != key)
+  {
+    idx = (idx + 1) & mask;
+  }
+  loaded_members[idx] = key;
+}
+
+static Section *find_existing_section(TCCState *s1, const char *name)
+{
+  return section_ht_find(s1, name);
+}
+
+/* Check whether any currently undefined symbol is satisfiable by cached
+   archive symbol tables.  Returns 1 if at least one such undef exists,
+   meaning a group rescan may still be productive. */
+ST_FUNC int tcc_group_has_satisfiable_undefs(TCCState *s1)
+{
+  Section *s = symtab_section;
+  ElfW(Sym) *syms = (ElfW(Sym) *)s->data;
+  Section *hs = s->hash;
+  unsigned int *sym_hcache = hs ? hs->hash_val_cache : NULL;
+  int ci, ui, si;
+  if (s1->nb_archive_sym_caches == 0)
+    return 0;
+  for (ui = 0; ui < s1->nb_undef_syms; ui++)
+  {
+    unsigned int h;
+    int aidx;
+    si = s1->undef_sym_list[ui];
+    if (syms[si].st_shndx != SHN_UNDEF)
+      continue;
+    const char *name = (char *)s->link->data + syms[si].st_name;
+    h = (sym_hcache && si < hs->hash_val_alloc) ? sym_hcache[si] : elf_hash((const unsigned char *)name);
+    for (ci = 0; ci < s1->nb_archive_sym_caches; ci++)
+    {
+      ArchiveSymbolCache *cache = &s1->archive_sym_caches[ci];
+      for (aidx = cache->ar_ht_buckets[h & cache->ar_ht_mask]; aidx >= 0; aidx = cache->ar_ht_next[aidx])
+      {
+        if (cache->name_hashes[aidx] == h && !strcmp(cache->sym_names[aidx], name))
+          return 1;
+      }
+    }
+  }
+  return 0;
+}
+
+/* Find an existing archive symbol cache entry by filename */
+static ArchiveSymbolCache *find_archive_sym_cache(TCCState *s1, const char *filename)
+{
+  int i;
+  for (i = 0; i < s1->nb_archive_sym_caches; i++)
+  {
+    if (!strcmp(s1->archive_sym_caches[i].filename, filename))
+      return &s1->archive_sym_caches[i];
+  }
+  return NULL;
+}
+
+/* Create and populate a new archive symbol cache entry */
+static ArchiveSymbolCache *create_archive_sym_cache(TCCState *s1, const char *filename, int fd, int size, int entrysize)
+{
+  int i, nsyms, ar_ht_size;
+  unsigned int loaded_member_size;
+  uint8_t *data;
+  const uint8_t *ar_index;
+  const char *ar_names, *p;
+  ArchiveSymbolCache *cache;
+
+  data = tcc_malloc(size);
+  if (full_read(fd, data, size) != size)
+  {
+    tcc_free(data);
+    return NULL;
+  }
+  nsyms = get_be(data, entrysize);
+  ar_index = data + entrysize;
+  ar_names = (char *)ar_index + nsyms * entrysize;
+
+  /* Grow cache array */
+  s1->archive_sym_caches =
+      tcc_realloc(s1->archive_sym_caches, (s1->nb_archive_sym_caches + 1) * sizeof(ArchiveSymbolCache));
+  cache = &s1->archive_sym_caches[s1->nb_archive_sym_caches++];
+  memset(cache, 0, sizeof(*cache));
+
+  cache->filename = tcc_strdup(filename);
+  cache->data = data;
+  cache->nsyms = nsyms;
+  cache->entrysize = entrysize;
+
+  /* Allocate symbol arrays */
+  cache->sym_names = tcc_malloc(nsyms * sizeof(const char *));
+  cache->name_hashes = tcc_malloc(nsyms * sizeof(unsigned int));
+  cache->member_offsets = tcc_malloc(nsyms * sizeof(unsigned long long));
+
+  /* Build chained hash table */
+  ar_ht_size = 1;
+  while (ar_ht_size < nsyms * 2)
+    ar_ht_size <<= 1;
+  cache->ar_ht_mask = ar_ht_size - 1;
+  cache->ar_ht_buckets = tcc_malloc(ar_ht_size * sizeof(int));
+  memset(cache->ar_ht_buckets, 0xff, ar_ht_size * sizeof(int));
+  cache->ar_ht_next = tcc_malloc(nsyms * sizeof(int));
+  memset(cache->ar_ht_next, 0xff, nsyms * sizeof(int));
+
+  /* Size loaded_members dedup set */
+  loaded_member_size = 256;
+  if ((unsigned int)nsyms / 8 > loaded_member_size)
+    loaded_member_size = (unsigned int)nsyms / 8;
+  {
+    unsigned int v = loaded_member_size;
+    v--;
+    v |= v >> 1;
+    v |= v >> 2;
+    v |= v >> 4;
+    v |= v >> 8;
+    v |= v >> 16;
+    loaded_member_size = v + 1;
+  }
+  cache->loaded_member_mask = loaded_member_size - 1;
+  cache->loaded_members = tcc_mallocz(loaded_member_size * sizeof(unsigned long long));
+
+  /* Populate symbol arrays and hash table */
+  for (p = ar_names, i = 0; i < nsyms; i++, p += strlen(p) + 1)
+  {
+    unsigned int h;
+    int bucket;
+    cache->sym_names[i] = p;
+    cache->name_hashes[i] = h = elf_hash((const unsigned char *)p);
+    cache->member_offsets[i] = get_be(ar_index + i * entrysize, entrysize);
+    bucket = h & cache->ar_ht_mask;
+    cache->ar_ht_next[i] = cache->ar_ht_buckets[bucket];
+    cache->ar_ht_buckets[bucket] = i;
+  }
+
+  return cache;
+}
+
+/* Free all cached archive symbol tables */
+ST_FUNC void tcc_archive_cache_free(TCCState *s1)
+{
+  int i;
+  for (i = 0; i < s1->nb_archive_sym_caches; i++)
+  {
+    ArchiveSymbolCache *c = &s1->archive_sym_caches[i];
+    tcc_free(c->filename);
+    tcc_free(c->loaded_members);
+    tcc_free(c->member_offsets);
+    tcc_free(c->name_hashes);
+    tcc_free(c->sym_names);
+    tcc_free(c->ar_ht_next);
+    tcc_free(c->ar_ht_buckets);
+    tcc_free(c->data);
+  }
+  tcc_free(s1->archive_sym_caches);
+  s1->archive_sym_caches = NULL;
+  s1->nb_archive_sym_caches = 0;
+}
+
 /* load only the objects which resolve undefined symbols */
 static int tcc_load_alacarte(TCCState *s1, int fd, int size, int entrysize)
 {
-  int i, bound, nsyms, sym_index, len, ret = -1;
+  int bound, len, ret = -1;
   unsigned long long off;
-  uint8_t *data;
-  const char *ar_names, *p;
-  const uint8_t *ar_index;
   ElfW(Sym) * sym;
   ArchiveHeader hdr;
+  ArchiveSymbolCache *cache;
   /* Save archive state for restoration */
   unsigned long saved_archive_offset = s1->current_archive_offset;
   const char *saved_archive_path = s1->current_archive_path;
   s1->current_archive_path = s1->current_filename;
 
-  data = tcc_malloc(size);
-  if (full_read(fd, data, size) != size)
-    goto invalid;
-  nsyms = get_be(data, entrysize);
-  ar_index = data + entrysize;
-  ar_names = (char *)ar_index + nsyms * entrysize;
+  /* Look up or create cached archive symbol table.  On --start-group
+     rescans this avoids re-reading the index, re-computing elf_hash
+     for all symbols, and re-allocating hash tables. */
+  cache = find_archive_sym_cache(s1, s1->current_filename);
+  if (!cache)
+  {
+    cache = create_archive_sym_cache(s1, s1->current_filename, fd, size, entrysize);
+    if (!cache)
+    {
+      tcc_error_noabort("invalid archive");
+      s1->current_archive_offset = saved_archive_offset;
+      s1->current_archive_path = saved_archive_path;
+      return -1;
+    }
+  }
 
+  /* Inverted resolution: iterate tracked undefined symbols,
+     look up each in archive hash table.  O(n_undef) per pass instead
+     of O(n_symtab) in the original forward scan. */
   do
   {
+    Section *s = symtab_section;
+    Section *hs = s->hash;
+    unsigned int *sym_hcache = hs ? hs->hash_val_cache : NULL;
+    int ui, si;
     bound = 0;
-    for (p = ar_names, i = 0; i < nsyms; i++, p += strlen(p) + 1)
+
+    for (ui = 0; ui < s1->nb_undef_syms; ui++)
     {
-      Section *s = symtab_section;
-      sym_index = find_elf_sym(s, p);
-      if (!sym_index)
-        continue;
-      sym = &((ElfW(Sym) *)s->data)[sym_index];
+      unsigned int h;
+      int aidx;
+
+      si = s1->undef_sym_list[ui];
+      sym = &((ElfW(Sym) *)s->data)[si];
       if (sym->st_shndx != SHN_UNDEF)
         continue;
-      off = get_be(ar_index + i * entrysize, entrysize);
-      len = read_ar_header(fd, off, &hdr);
-      if (len <= 0 || memcmp(hdr.ar_fmag, ARFMAG, 2))
+
+      /* Use cached hash from symtab hash table when available,
+         avoiding elf_hash recomputation across archive calls. */
+      h = (sym_hcache && si < hs->hash_val_alloc)
+              ? sym_hcache[si]
+              : elf_hash((const unsigned char *)((char *)s->link->data + sym->st_name));
+
+      for (aidx = cache->ar_ht_buckets[h & cache->ar_ht_mask]; aidx >= 0; aidx = cache->ar_ht_next[aidx])
       {
-      invalid:
-        tcc_error_noabort("invalid archive");
-        goto the_end;
+        if (cache->name_hashes[aidx] != h)
+          continue;
+        {
+          const char *sym_name = (char *)s->link->data + sym->st_name;
+          if (strcmp(cache->sym_names[aidx], sym_name))
+            continue;
+        }
+        off = cache->member_offsets[aidx];
+        if (alacarte_member_seen(cache->loaded_members, cache->loaded_member_mask, off))
+          break;
+
+        len = read_ar_header(fd, off, &hdr);
+        if (len <= 0 || memcmp(hdr.ar_fmag, ARFMAG, 2))
+        {
+          tcc_error_noabort("invalid archive");
+          goto the_end;
+        }
+        off += len;
+        if (s1->verbose == 2)
+          printf("   -> %s\n", hdr.ar_name);
+        /* Set archive offset for lazy loading */
+        s1->current_archive_offset = (unsigned long)off;
+        if (tcc_load_object_file(s1, fd, off) < 0)
+          goto the_end;
+        s1->current_archive_offset = saved_archive_offset;
+        alacarte_mark_member(cache->loaded_members, cache->loaded_member_mask, cache->member_offsets[aidx]);
+        ++bound;
+        ++s1->group_rescan_loaded;
+        /* symtab/hash may have been reallocated by tcc_load_object_file */
+        hs = s->hash;
+        sym_hcache = hs ? hs->hash_val_cache : NULL;
+        break;
       }
-      off += len;
-      if (s1->verbose == 2)
-        printf("   -> %s\n", hdr.ar_name);
-      /* Set archive offset for lazy loading */
-      s1->current_archive_offset = (unsigned long)off;
-      if (tcc_load_object_file(s1, fd, off) < 0)
-        goto the_end;
-      s1->current_archive_offset = saved_archive_offset;
-      ++bound;
     }
   } while (bound);
+  /* Compact the list, removing symbols now defined.  Shrinks iteration
+     cost for subsequent archive loads and group-rescan checks. */
+  {
+    ElfW(Sym) *syms = (ElfW(Sym) *)symtab_section->data;
+    int ri, wi = 0;
+    for (ri = 0; ri < s1->nb_undef_syms; ri++)
+    {
+      int idx = s1->undef_sym_list[ri];
+      if (syms[idx].st_shndx == SHN_UNDEF)
+        s1->undef_sym_list[wi++] = idx;
+    }
+    s1->nb_undef_syms = wi;
+  }
   ret = 0;
 the_end:
   s1->current_archive_offset = saved_archive_offset;
   s1->current_archive_path = saved_archive_path;
-  tcc_free(data);
   return ret;
 }
 
@@ -5357,6 +5760,15 @@ ST_FUNC int tcc_load_archive(TCCState *s1, int fd, int alacarte)
   ElfW(Ehdr) ehdr;
   unsigned long saved_archive_offset;
   const char *saved_archive_path;
+  unsigned archive_start = 0;
+  unsigned members_before = 0;
+  char archive_desc[1088];
+
+  if (s1->do_bench)
+  {
+    archive_start = tcc_getclock_ms();
+    members_before = s1->bench_archive_member_count;
+  }
 
   /* skip magic which was already checked */
   /* full_read(fd, magic, sizeof(magic)); */
@@ -5372,6 +5784,16 @@ ST_FUNC int tcc_load_archive(TCCState *s1, int fd, int alacarte)
     len = read_ar_header(fd, file_offset, &hdr);
     if (len == 0)
     {
+      if (s1->do_bench)
+      {
+        unsigned elapsed = tcc_getclock_ms() - archive_start;
+        unsigned members_loaded = s1->bench_archive_member_count - members_before;
+        s1->bench_archive_load_time += elapsed;
+        s1->bench_archive_load_count++;
+        snprintf(archive_desc, sizeof(archive_desc), "%s (%u members)",
+                 s1->current_filename ? s1->current_filename : "<archive>", members_loaded);
+        tcc_bench_log(s1, "load-archive", archive_desc, elapsed);
+      }
       s1->current_archive_offset = saved_archive_offset;
       s1->current_archive_path = saved_archive_path;
       return 0;
@@ -5390,6 +5812,16 @@ ST_FUNC int tcc_load_archive(TCCState *s1, int fd, int alacarte)
       if (!strcmp(hdr.ar_name, "/"))
       {
         int ret = tcc_load_alacarte(s1, fd, size, 4);
+        if (s1->do_bench)
+        {
+          unsigned elapsed = tcc_getclock_ms() - archive_start;
+          unsigned members_loaded = s1->bench_archive_member_count - members_before;
+          s1->bench_archive_load_time += elapsed;
+          s1->bench_archive_load_count++;
+          snprintf(archive_desc, sizeof(archive_desc), "%s (%u members)",
+                   s1->current_filename ? s1->current_filename : "<archive>", members_loaded);
+          tcc_bench_log(s1, "load-archive", archive_desc, elapsed);
+        }
         s1->current_archive_offset = saved_archive_offset;
         s1->current_archive_path = saved_archive_path;
         return ret;
@@ -5397,6 +5829,16 @@ ST_FUNC int tcc_load_archive(TCCState *s1, int fd, int alacarte)
       if (!strcmp(hdr.ar_name, "/SYM64/"))
       {
         int ret = tcc_load_alacarte(s1, fd, size, 8);
+        if (s1->do_bench)
+        {
+          unsigned elapsed = tcc_getclock_ms() - archive_start;
+          unsigned members_loaded = s1->bench_archive_member_count - members_before;
+          s1->bench_archive_load_time += elapsed;
+          s1->bench_archive_load_count++;
+          snprintf(archive_desc, sizeof(archive_desc), "%s (%u members)",
+                   s1->current_filename ? s1->current_filename : "<archive>", members_loaded);
+          tcc_bench_log(s1, "load-archive", archive_desc, elapsed);
+        }
         s1->current_archive_offset = saved_archive_offset;
         s1->current_archive_path = saved_archive_path;
         return ret;
@@ -5573,6 +6015,10 @@ ST_FUNC int tcc_load_dll(TCCState *s1, int fd, const char *filename, int level)
   int sym_index;
   const char *name, *soname;
   struct versym_info v;
+  unsigned dll_start = 0;
+
+  if (s1->do_bench)
+    dll_start = tcc_getclock_ms();
 
   full_read(fd, &ehdr, sizeof(ehdr));
 
@@ -5687,6 +6133,13 @@ ST_FUNC int tcc_load_dll(TCCState *s1, int fd, const char *filename, int level)
 ret_success:
   ret = 0;
 the_end:
+  if (s1->do_bench)
+  {
+    unsigned elapsed = tcc_getclock_ms() - dll_start;
+    s1->bench_dll_load_time += elapsed;
+    s1->bench_dll_load_count++;
+    tcc_bench_log(s1, "load-dll", filename, elapsed);
+  }
   tcc_free(dynstr);
   tcc_free(dynsym);
   tcc_free(dynamic);
@@ -5931,6 +6384,13 @@ static int ld_add_file_list(TCCState *s1, const char *cmd, int as_needed)
   }
   if (group && !as_needed)
   {
+    /* Same fast check as the CLI --start-group loop: only continue
+       rescanning while some current undef is satisfiable by these
+       cached archives. */
+    if (s1->new_undef_sym)
+    {
+      s1->new_undef_sym = tcc_group_has_satisfiable_undefs(s1);
+    }
     while (s1->new_undef_sym)
     {
       int i;
@@ -5951,6 +6411,10 @@ ST_FUNC int tcc_load_ldscript(TCCState *s1, int fd)
   char cmd[64];
   char filename[1024];
   int t, ret;
+  unsigned ldscript_start = 0;
+
+  if (s1->do_bench)
+    ldscript_start = tcc_getclock_ms();
 
   s1->fd = fd;
   s1->cc = -1;
@@ -5958,7 +6422,16 @@ ST_FUNC int tcc_load_ldscript(TCCState *s1, int fd)
   {
     t = ld_next(s1, cmd, sizeof(cmd));
     if (t == LD_TOK_EOF)
+    {
+      if (s1->do_bench)
+      {
+        unsigned elapsed = tcc_getclock_ms() - ldscript_start;
+        s1->bench_ldscript_load_time += elapsed;
+        s1->bench_ldscript_load_count++;
+        tcc_bench_log(s1, "ldscript", s1->current_filename, elapsed);
+      }
       return 0;
+    }
     else if (t != LD_TOK_NAME)
       return -1;
     if (!strcmp(cmd, "INPUT") || !strcmp(cmd, "GROUP"))
@@ -6046,10 +6519,12 @@ static void ld_apply_symbols(TCCState *s1, LDScript *ld)
       int vis =
           (sym->visibility == LD_SYM_HIDDEN || sym->visibility == LD_SYM_PROVIDE_HIDDEN) ? STV_HIDDEN : STV_DEFAULT;
 
+      /* Look up once, reuse for both PROVIDE check and update */
+      sym_idx = find_elf_sym(s1->symtab, sym->name);
+
       /* For PROVIDE symbols, only define if not already defined */
       if (sym->visibility == LD_SYM_PROVIDE || sym->visibility == LD_SYM_PROVIDE_HIDDEN)
       {
-        sym_idx = find_elf_sym(s1->symtab, sym->name);
         if (sym_idx)
         {
           ElfW(Sym) *esym = &((ElfW(Sym) *)s1->symtab->data)[sym_idx];
@@ -6058,8 +6533,7 @@ static void ld_apply_symbols(TCCState *s1, LDScript *ld)
         }
       }
 
-      /* Check if symbol already exists in symtab - if so, update it */
-      sym_idx = find_elf_sym(s1->symtab, sym->name);
+      /* Update existing symbol, or create new */
       if (sym_idx)
       {
         ElfW(Sym) *esym = &((ElfW(Sym) *)s1->symtab->data)[sym_idx];

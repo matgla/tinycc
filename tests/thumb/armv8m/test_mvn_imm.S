@@ -6,6 +6,7 @@ _start:
 
 .global test_mvn_imm
 test_mvn_imm:
+    mvn ip, #0
     mvn r2, #0xde
     mvns r4, #0xad
     mvns r10, #0xa

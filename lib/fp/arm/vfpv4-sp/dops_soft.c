@@ -18,6 +18,16 @@ extern unsigned int __aeabi_d2uiz(double a);
 extern double __aeabi_i2d(int a);
 extern double __aeabi_ui2d(unsigned int a);
 extern float __aeabi_d2f(double a);
+extern double __aeabi_f2d_bits(uint32_t bits);
+
+double __aeabi_f2d(float a)
+{
+  union {
+    float f;
+    uint32_t u;
+  } conv = {.f = a};
+  return __aeabi_f2d_bits(conv.u);
+}
 
 /* Double-precision addition - delegated to soft float */
 double __aeabi_dadd_wrapper(double a, double b)

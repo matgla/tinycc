@@ -70,6 +70,7 @@ LIBTCCAPI int tcc_set_output_type(TCCState *s, int output_type);
 #define TCC_OUTPUT_DLL      4 /* dynamic library */
 #define TCC_OUTPUT_OBJ      3 /* object file */
 #define TCC_OUTPUT_PREPROCESS 5 /* only preprocess */
+#define TCC_OUTPUT_PCH      6 /* generate a precompiled header */
 
 /* equivalent to -Lpath option */
 LIBTCCAPI int tcc_add_library_path(TCCState *s, const char *pathname);

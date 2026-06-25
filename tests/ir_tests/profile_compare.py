@@ -682,7 +682,7 @@ def remove_worktree(worktree_path: Path, repo_path: Path = REPO_ROOT) -> None:
             shutil.rmtree(worktree_path)
 
 
-def build_tinycc(source_path: Path, build_path: Path = None) -> Path:
+def build_tinycc(source_path: Path, build_path: Path = None, *, debug: bool = False) -> Path:
     """Build TinyCC from source (in-tree build), returns path to armv8m-tcc binary."""
     print(f"\nBuilding TinyCC from {source_path}")
 
@@ -695,7 +695,10 @@ def build_tinycc(source_path: Path, build_path: Path = None) -> Path:
         raise FileNotFoundError(f"configure script not found at {configure_script}")
 
     print("  Configuring...")
-    run_cmd(["./configure", "--enable-cross", "--enable-O2"], cwd=source_path)
+    configure_cmd = ["./configure", "--enable-cross", "--enable-O2"]
+    if debug:
+        configure_cmd.append("--debug")
+    run_cmd(configure_cmd, cwd=source_path)
 
     # Build
     print("  Building...")
@@ -794,7 +797,7 @@ def git_compare(baseline_ref: str, current_ref: str = "HEAD",
             create_workspace_snapshot(baseline_worktree, base_ref="HEAD")
         else:
             create_worktree(baseline_ref, baseline_worktree)
-        baseline_tcc = build_tinycc(baseline_worktree)
+        baseline_tcc = build_tinycc(baseline_worktree, debug=(profiler == "callgrind"))
         baseline_summary = run_profile_suite(
             baseline_tcc, baseline_profile_dir,
             profiler=profiler, limit=limit, cflags=cflags
@@ -820,7 +823,7 @@ def git_compare(baseline_ref: str, current_ref: str = "HEAD",
         current_dir_name = f"current_{current_info['short_hash']}" + ("_workspace" if is_workspace_ref(current_ref) else "")
         current_profile_dir = output_dir / current_dir_name
 
-        current_tcc = build_tinycc(current_worktree)
+        current_tcc = build_tinycc(current_worktree, debug=(profiler == "callgrind"))
         current_summary = run_profile_suite(
             current_tcc, current_profile_dir,
             profiler=profiler, limit=limit, cflags=cflags
@@ -947,7 +950,7 @@ Git comparison examples:
                         help="Git ref to use as 'current' (default: HEAD). "
                             "Special value: 'workspace' uses your current working tree (uncommitted changes) by snapshotting it into a temp build dir.")
     default_profiler = "time" if sys.platform == "darwin" else "heaptrack"
-    profiler_choices = ["heaptrack", "time", "perf"]
+    profiler_choices = ["heaptrack", "callgrind", "time", "perf"]
     if sys.platform == "darwin":
         profiler_choices.extend(["xctrace", "xcprofile"])  # alias for xctrace
     parser.add_argument("--profiler", "-p", choices=profiler_choices, default=default_profiler,

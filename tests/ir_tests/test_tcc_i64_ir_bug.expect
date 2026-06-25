@@ -1,6 +1,6 @@
 Testing I64/F64 IR bug reproductions
-i64_return: 0
+i64_return: 3735928559
 i64_cast: 0x12345678
-ul_constant: 0x0
+ul_constant: 0x1ff00ff
 i64_mul: 20000000000
 Tests completed

@@ -54,6 +54,7 @@ def _install_requirements_if_needed(venv_dir: Path, requirements_path: Path) -> 
     subprocess.check_call(
         [sys.executable, "-m", "pip", "install", "-r", str(requirements_path)]
     )
+    marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text(desired + "\n")
 
 

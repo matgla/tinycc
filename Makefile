@@ -16,6 +16,28 @@ ifeq (-$(GCC_MAJOR)-$(findstring $(GCC_MINOR),56789)-,-4--)
  CFLAGS += -D_FORTIFY_SOURCE=0
 endif
 
+ENABLE_GC_SECTIONS ?= no
+ENABLE_LTO ?= no
+RELEASE ?= no
+
+ifneq ($(filter 1 yes true,$(RELEASE)),)
+ ENABLE_GC_SECTIONS := yes
+ ENABLE_LTO := yes
+ override CFLAGS := $(filter-out -g,$(CFLAGS))
+ CFLAGS += -DNDEBUG
+ LDFLAGS += -s
+endif
+
+ifneq ($(filter 1 yes true,$(ENABLE_GC_SECTIONS)),)
+ CFLAGS += -ffunction-sections -fdata-sections
+ LDFLAGS += -Wl,--gc-sections
+endif
+
+ifneq ($(filter 1 yes true,$(ENABLE_LTO)),)
+ CFLAGS += -flto
+ LDFLAGS += -flto
+endif
+
 LIBTCC = libtcc.a
 LIBTCC1 = libtcc1.a
 LINK_LIBTCC =
@@ -147,9 +169,14 @@ endif
 
 PROGS_CROSS = $(foreach X,$(TCC_X),$X-tcc$(EXESUF))
 LIBTCC1_CROSS = $(foreach X,$(LIBTCC1_X),$X-libtcc1.a)
+AUTO_PCH_COMMON_HEADERS = stdio.h stdlib.h string.h
+AUTO_PCH_STAMPS = $(foreach X,$(TCC_X),$(TOP)/pch/.$X-auto-pch.stamp)
 
 $(info $(LIBTCC1_CROSS))
 # build cross compilers & libs
+# PCH disabled on YasOS (unused; costs runtime heap + startup probe time) —
+# auto-PCH generation dropped here.  Re-add $(AUTO_PCH_STAMPS) (and re-enable
+# the loader in tccpp.c / pch_auto_enabled) to restore precompiled headers.
 cross: $(LIBTCC1_CROSS) $(PROGS_CROSS) $(FP_LIBS_CROSS)
 
 # build specific cross compiler & lib
@@ -189,6 +216,42 @@ $(FP_LIBS_STAMP_DIR)/.%-fp-libs.stamp: $(FP_LIBS_STAMP_DIR)/.%-tcc.checksum $(FP
 	@$(SAN_ENV) $(MAKE) --no-print-directory -C lib CROSS_TARGET=$* fp-libs-shared || true
 	@# Save the checksum that was used for this build
 	@cp $(abspath $(FP_LIBS_STAMP_DIR)/.$*-tcc.checksum) $(abspath $(FP_LIBS_STAMP_DIR)/.$*-fp-libs.checksum.saved)
+
+$(TOP)/pch/.%-auto-pch.stamp: %-tcc$(EXESUF)
+	@mkdir -p "$(TOP)/pch/$*"
+	@dir="$(abspath $(TOP)/pch/$*)"; \
+	index="$$dir/auto.index"; \
+	tool="./$*-tcc$(EXESUF) -B$(TOP)"; \
+	rm -f "$$index"; \
+	for hdr in $(AUTO_PCH_COMMON_HEADERS); do rm -f "$$dir/$$hdr.pch" "$$dir/$$hdr.opt.pch"; done; \
+	includes="$$($$tool -print-search-dirs 2>/dev/null | awk 'BEGIN { in_include = 0 } /^include:$$/ { in_include = 1; next } /^[^ ]/ { if (in_include) exit } in_include { sub(/^  /, ""); if ($$0 != "-") print }' || true)"; \
+	for hdr in $(AUTO_PCH_COMMON_HEADERS); do \
+		src=""; \
+		for inc in $$includes; do \
+			if [ -f "$$inc/$$hdr" ]; then \
+				src="$$inc/$$hdr"; \
+				break; \
+			fi; \
+		done; \
+		[ -n "$$src" ] || continue; \
+		for opt in 0 1; do \
+			if [ "$$opt" = 0 ]; then oflags=""; pch="$$hdr.pch"; else oflags="-O$$opt"; pch="$$hdr.opt.pch"; fi; \
+			if $$tool $$oflags -generate-pch "$$src" -o "$$dir/$$pch" >/dev/null 2>&1; then \
+				probe="$$dir/.$$hdr.probe.c"; \
+				printf '#include <%s>\nint main(void){return 0;}\n' "$$hdr" > "$$probe"; \
+				out="$$($$tool $$oflags -use-pch "$$dir/$$pch" -E "$$probe" 2>&1 >/dev/null || true)"; \
+				rm -f "$$probe"; \
+				if ! printf '%s' "$$out" | grep -q 'ignoring PCH'; then \
+					printf '%s\t%s\n' "$$src" "$$pch" >> "$$index"; \
+				else \
+					rm -f "$$dir/$$pch"; \
+				fi; \
+			else \
+				rm -f "$$dir/$$pch"; \
+			fi; \
+		done; \
+	done; \
+	touch "$@"
 
 install: ; @$(MAKE) --no-print-directory  install$(CFG)
 install-strip: ; @$(MAKE) --no-print-directory  install$(CFG) CONFIG_strip=yes
@@ -235,11 +298,13 @@ LIB-$(TR) ?= {B}:/usr/$(TRIPLET-$T)/lib:/usr/lib/$(MARCH-$T)
 INC-$(TR) ?= {B}/include:/usr/$(TRIPLET-$T)/include:/usr/include
 endif
 
-IR_FILES = ir/type.c ir/pool.c ir/vreg.c ir/stack.c ir/live.c ir/dump.c ir/codegen.c ir/opt.c ir/opt_jump_thread.c ir/licm.c ir/core.c ir/machine_op.c
+IR_FILES = ir/type.c ir/pool.c ir/vreg.c ir/stack.c ir/dump.c ir/codegen.c ir/opt.c ir/opt_du.c ir/opt_xform.c ir/opt_utils.c ir/opt_alias.c ir/opt_loop_utils.c ir/opt_engine.c ir/opt_pipeline.c ir/opt_hash.c ir/opt_gens_fusion.c ir/opt_gens_bool.c ir/opt_gens_call_result.c ir/opt_gens_branch.c ir/opt_loop.c ir/opt_loop_dead.c ir/opt_memory.c ir/opt_jump_thread.c ir/opt_pack64.c ir/opt_dce.c ir/opt_constfold.c ir/opt_branch.c ir/opt_copyprop.c ir/opt_fusion.c ir/opt_promote.c ir/opt_constprop.c ir/opt_knownbits.c ir/opt_dead_lea_store.c ir/opt_const_aggregate.c ir/opt_dead_vla.c ir/opt_loop_const_sim.c ir/opt_switch_data.c ir/opt_reroll.c ir/opt_neg_chain.c ir/opt_bitfield.c ir/opt_cmp_fuse.c ir/opt_setif_or_taut.c ir/licm.c ir/cfg.c ir/ssa.c ir/opt/ssa_opt.c ir/opt/ssa_opt_dce.c ir/opt/ssa_opt_cprop.c ir/opt/ssa_opt_fold.c ir/opt/ssa_opt_phi.c ir/opt/ssa_opt_strength.c ir/opt/ssa_opt_gvn.c ir/opt/ssa_opt_reassoc.c ir/opt/ssa_opt_narrow.c ir/opt/ssa_opt_branch.c ir/opt/ssa_opt_sccp.c ir/opt/ssa_opt_load_cse.c ir/opt/ssa_opt_dead_loop.c ir/opt/ssa_opt_cmp_eq.c ir/regalloc.c ir/core.c ir/machine_op.c
 CORE_FILES = tccir_operand.c tccls.c tcc.c tcctools.c libtcc.c tccpp.c tccgen.c tccdbg.c tccelf.c tccasm.c tccyaff.c tccld.c tccdebug.c svalue.c tccmachine.c tccopt.c $(IR_FILES)
-CORE_FILES += tcc.h config.h libtcc.h tcctok.h tccir.h tccir_operand.h tccld.h tccmachine.h tccopt.h
+CORE_FILES += tcc.h config.h libtcc.h tcctok.h tccir.h tccir_operand.h tccld.h tccmachine.h tccopt.h log.h
 CORE_FILES += $(wildcard ir/*.h)
-armv8m_FILES = $(CORE_FILES) arch/arm_aapcs.c arch/armv8m.c arm-thumb-opcodes.c arm-thumb-gen.c arm-thumb-callsite.c arm-link.c arm-thumb-asm.c arm-thumb-defs.h thumb-tok.h
+armv8m_FILES = $(CORE_FILES) arm-thumb-gen.c arm-thumb-callsite.c arm-link.c arm-thumb-asm.c arm-thumb-defs.h thumb-tok.h arch/arm/thumb/thumb.h arch/arm/arm.h
+armv8m_ARCH = arm
+armv8m_ARCH_LIB = $(X)arch/arm/libarm.a
 
 TCCDEFS_H$(subst yes,,$(CONFIG_predefs)) = tccdefs_.h
 
@@ -249,10 +314,11 @@ LIBTCC_SRC = $(filter-out tcc.c tcctools.c,$(filter %.c,$($T_FILES)))
 # Compile from separate objects
 LIBTCC_OBJ = $(patsubst %.c,$(X)%.o,$(LIBTCC_SRC))
 LIBTCC_INC = $(filter %.h %-gen.c %-link.c,$($T_FILES))
-TCC_FILES = $(X)tcc.o $(LIBTCC_OBJ)
+ARCH_LIB = $($T_ARCH_LIB)
+TCC_FILES = $(X)tcc.o $(LIBTCC_OBJ) $(ARCH_LIB)
 $(X)tccpp.o : $(TCCDEFS_H)
 
-DEFINES += -I$(TOP) -I$(TOP)/ir
+DEFINES += -I$(TOP) -I$(TOP)/ir -I$(TOP)/ir/opt
 
 GITHASH:=$(shell git rev-parse --abbrev-ref HEAD 2>/dev/null || echo no)
 ifneq ($(GITHASH),no)
@@ -275,9 +341,13 @@ endif
 $(X)%.o : %.c $(LIBTCC_INC)
 	$S$(CC) -o $@ -c $< $(addsuffix ,$(DEFINES) $(CFLAGS))
 
-$(X)arch/%.o : arch/%.c $(LIBTCC_INC)
-	@mkdir -p $(dir $@)
-	$S$(CC) -o $@ -c $< $(addsuffix ,$(DEFINES) $(CFLAGS))
+# Architecture library — built by nested Makefile
+TARGET_ARCH_NAME = $($T_ARCH)
+$(ARCH_LIB): FORCE
+	@mkdir -p $(dir $(ARCH_LIB))
+	$S$(MAKE) --no-print-directory -C arch ARCH=$(TARGET_ARCH_NAME) \
+		TOP=$(CURDIR) BUILD_DIR=$(CURDIR)/$(dir $(ARCH_LIB)) \
+		CC="$(CC)" AR="$(AR)" CFLAGS="$(CFLAGS)" DEFINES="$(DEFINES)"
 
 $(X)ir/%.o : ir/%.c $(LIBTCC_INC)
 	@mkdir -p $(dir $@)
@@ -364,6 +434,7 @@ install-unx:
 	$(call IFw,$(TOPSRC)/lib/fp/libsoftfp.a $(TOPSRC)/lib/fp/libvfpv4sp.a $(TOPSRC)/lib/fp/libvfpv5dp.a $(TOPSRC)/lib/fp/librp2350fp.a,"$(libdir)")
 	$(call IFw,$(TOPSRC)/lib/fp/libsoftfp.so $(TOPSRC)/lib/fp/libvfpv4sp.so $(TOPSRC)/lib/fp/libvfpv5dp.so $(TOPSRC)/lib/fp/librp2350fp.so,"$(libdir)")
 	$(call IF,$(TOPSRC)/include/*.h $(TOPSRC)/tcclib.h,"$(tccdir)/include")
+	@if [ -d "$(TOPSRC)/pch" ]; then echo "-> $(tccdir)/pch : $(TOPSRC)/pch" ; mkdir -p "$(tccdir)/pch" && cp -r "$(TOPSRC)/pch"/. "$(tccdir)/pch" ; fi
 	$(call $(if $(findstring .so,$(LIBTCC)),IBw,IFw),$(LIBTCC),"$(libdir)")
 	$(call IF,$(TOPSRC)/libtcc.h,"$(includedir)")
 	$(call IFw,tcc.1,"$(mandir)/man1")
@@ -436,9 +507,32 @@ VENV_PIP := $(VENV_BINDIR)/pip
 IRTESTS_DIR := tests/ir_tests
 IRTESTS_REQUIREMENTS := $(IRTESTS_DIR)/requirements.txt
 IRTESTS_VENV_STAMP := $(VENV_DIR)/.irtests-requirements.stamp
+PCH_BENCHMARK_SCRIPT := $(IRTESTS_DIR)/benchmark_pch.py
+PCH_PREPARE_SCRIPT := $(IRTESTS_DIR)/prepare_pch.py
 
 NEWLIB_DIR := $(IRTESTS_DIR)/qemu/mps2-an505/newlib_build/arm-none-eabi/newlib
 NEWLIB_LIBC_A := $(NEWLIB_DIR)/libc.a
+
+# newlib is a vendored submodule (its include dir is symlinked into
+# libc_includes/newlib).  We must not commit edits into it; instead keep local
+# fixups as patches under tests/ir_tests/patches and apply them idempotently
+# before any target that consumes the headers (warn-check, test-prepare).
+NEWLIB_SRC := $(IRTESTS_DIR)/qemu/mps2-an505/libs/newlib
+NEWLIB_PATCH_DIR := $(IRTESTS_DIR)/patches
+
+.PHONY: patch-newlib
+patch-newlib:
+	@for p in $$(ls $(NEWLIB_PATCH_DIR)/*.patch 2>/dev/null | sort); do \
+		ap=$$(cd $$(dirname "$$p") && pwd)/$$(basename "$$p"); \
+		if git -C $(NEWLIB_SRC) apply --reverse --check "$$ap" >/dev/null 2>&1; then \
+			: ; \
+		elif git -C $(NEWLIB_SRC) apply --check "$$ap" >/dev/null 2>&1; then \
+			echo "------------ newlib: applying patch $$(basename $$p) ------------"; \
+			git -C $(NEWLIB_SRC) apply "$$ap"; \
+		else \
+			echo "WARNING: newlib patch $$(basename $$p) does not apply cleanly (skipping)"; \
+		fi; \
+	done
 
 # Host tests for soft-float aeabi functions
 AEABI_HOST_TESTS = test_aeabi_all test_host test_dmul_host
@@ -473,11 +567,30 @@ $(IRTESTS_VENV_STAMP): $(IRTESTS_REQUIREMENTS)
 	touch "$@"
 
 .PHONY: test-prepare
-test-prepare:
+test-prepare: patch-newlib
 	@set -e; \
 	if [ -f "$(NEWLIB_LIBC_A)" ]; then exit 0; fi; \
 	echo "------------ ir_tests: building newlib (first run) ------------"; \
 	cd $(IRTESTS_DIR)/qemu/mps2-an505 && sh ./build_newlib.sh
+
+.PHONY: rebuild-newlib
+rebuild-newlib:
+	@echo "------------ ir_tests: rebuilding newlib ------------"
+	@rm -rf $(IRTESTS_DIR)/qemu/mps2-an505/newlib_build
+	@cd $(IRTESTS_DIR)/qemu/mps2-an505 && sh ./build_newlib.sh
+
+.PHONY: prepare-pch benchmark-pch benchmark-pch-libc benchmark-pch-libtcc
+prepare-pch: cross
+	@$(PYTHON) "$(PCH_PREPARE_SCRIPT)" $(PCH_PREPARE_ARGS)
+
+benchmark-pch: cross
+	@$(PYTHON) "$(PCH_BENCHMARK_SCRIPT)" $(PCH_BENCHMARK_ARGS)
+
+benchmark-pch-libc: cross
+	@$(PYTHON) "$(PCH_BENCHMARK_SCRIPT)" --scenario libc-common $(PCH_BENCHMARK_ARGS)
+
+benchmark-pch-libtcc: cross
+	@$(PYTHON) "$(PCH_BENCHMARK_SCRIPT)" --scenario libtcc $(PCH_BENCHMARK_ARGS)
 
 
 ASMTESTS_DIR := tests/thumb/armv8m
@@ -498,13 +611,50 @@ test-asm: cross test-venv
 			$(PYTEST) --tb=short -q -n $(J) .; \
 		fi
 
+# Check that cross-compilation produces no unexpected warnings or errors.
+# Rebuilds libtcc1.a and compiles test files with -c, failing on any
+# "warning:" or "error:" in stderr.
+WARN_CHECK_SRCS = \
+	tests/tests2/15_recursion.c \
+	tests/tests2/14_if.c \
+	tests/tests2/04_for.c \
+	tests/tests2/08_while.c \
+	tests/tests2/09_do_while.c \
+	tests/tests2/06_case.c \
+	tests/tests2/07_function.c
+
+.PHONY: warn-check
+warn-check: armv8m-tcc$(EXESUF) patch-newlib
+	@echo "------------ warn-check: libtcc1.a build ------------"
+	@rm -f armv8m-libtcc1.a
+	@log=$$($(MAKE) --no-print-directory armv8m-libtcc1.a 2>&1) ; \
+	warns=$$(echo "$$log" | grep -c -E 'warning:|error:') ; \
+	if [ "$$warns" -ne 0 ]; then \
+		echo "FAIL: unexpected warnings/errors building libtcc1.a:" ; \
+		echo "$$log" | grep -E 'warning:|error:' ; \
+		exit 1 ; \
+	fi
+	@echo "------------ warn-check: test file compilation ------------"
+	@fail=0 ; \
+	wc_inc="-nostdinc -I$(IRTESTS_DIR)/libc_includes -I$(IRTESTS_DIR)/libc_imports -I$(IRTESTS_DIR)/libc_includes/newlib -Iinclude" ; \
+	for f in $(WARN_CHECK_SRCS); do \
+		out=$$(./armv8m-tcc$(EXESUF) $$wc_inc -c "$$f" -o /dev/null 2>&1) ; \
+		if echo "$$out" | grep -qE 'warning:|error:'; then \
+			echo "FAIL: $$f:" ; \
+			echo "$$out" | grep -E 'warning:|error:' ; \
+			fail=1 ; \
+		fi ; \
+	done ; \
+	if [ "$$fail" -ne 0 ]; then exit 1; fi
+	@echo "------------ warn-check: passed ------------"
+
 # run IR tests via pytest (preferred)
-test: cross test-aeabi-host test-asm test-venv test-prepare download-gcc-tests
+test: cross test-aeabi-host test-asm warn-check test-venv test-prepare download-gcc-tests ut
 	@echo "------------ ir_tests (pytest) ------------"
 	@if [ "$(USE_VENV)" = "1" ]; then \
-		cd $(IRTESTS_DIR) && "$(VENV_PY)" -m pytest -s -n $(J); \
+		cd $(IRTESTS_DIR) && "$(VENV_PY)" -m pytest -s -n $(J) --durations=10; \
 	else \
-		cd $(IRTESTS_DIR) && $(PYTEST) -s -n $(J); \
+		cd $(IRTESTS_DIR) && $(PYTEST) -s -n $(J) --durations=10; \
 	fi
 
 # legacy tests (kept for reference)
@@ -529,6 +679,7 @@ test-install: $(TCCDEFS_H)
 clean:
 	@rm -f tcc *-tcc tcc_p tcc_c
 	@rm -f tags ETAGS *.o *.a *.so* *.out *.log lib*.def *.exe *.dll
+	@rm -rf *-ir/ *-arch/
 	@rm -f a.out *.dylib *_.h *.pod *.tcov
 	@$(MAKE) -s -C lib $@
 	@$(MAKE) -s -C tests $@
@@ -606,7 +757,14 @@ test-all: cross test-aeabi-host test-asm test-venv test-prepare test-gcc-torture
 test-valgrind:
 	$(MAKE) test VALGRIND=1
 
-.PHONY: all cross fp-libs clean test test-valgrind test-aeabi-host test-legacy test-tests2 test-gcc-torture test-gcc-torture-compile test-gcc-torture-execute test-full test-all download-gcc-tests tar tags ETAGS doc distclean install uninstall FORCE
+# host-native internal unit tests (see tests/unit/README for the design)
+ut:
+	$(MAKE) -C tests/unit run
+
+ut-clean:
+	$(MAKE) -C tests/unit clean
+
+.PHONY: all cross fp-libs clean test test-valgrind test-aeabi-host test-legacy test-tests2 test-gcc-torture test-gcc-torture-compile test-gcc-torture-execute test-full test-all rebuild-newlib download-gcc-tests tar tags ETAGS doc distclean install uninstall ut ut-clean FORCE
 
 # Container image settings (auto-detect docker or podman)
 DOCKER_REGISTRY ?= ghcr.io
@@ -668,6 +826,8 @@ help:
 	@echo "   $(wordlist 9,99,$(TCC_X))"
 	@echo "make test"
 	@echo "   rebuild + initialize GCC testsuite + run pytest in tests/ir_tests"
+	@echo "make rebuild-newlib"
+	@echo "   wipe and rebuild newlib used by ir_tests/qemu (mps2-an505)"
 	@echo "make test-legacy"
 	@echo "   run legacy make-based tests (tests/Makefile)"
 	@echo "make tests2.all / make tests2.37 / make tests2.37+"

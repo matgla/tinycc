@@ -40,6 +40,11 @@ is_xfail_o1_test = _gcc_conftest.is_xfail_o1_test
 MACHINE = "mps2-an505"
 CURRENT_DIR = Path(__file__).parent
 
+# Max wall-clock seconds to wait for a compiled torture test to exit in QEMU.
+# A program that does not exit within this window is treated as a hang (fail),
+# not a pass.
+RUN_TIMEOUT = 5
+
 # Tests too slow under instrumentation (ASan / valgrind) — skip to avoid timeouts.
 # Includes tests that trigger valgrind "uninitialised value" errors (false positives
 # from GCC torture edge cases) and tests that time out under instrumentation.
@@ -167,12 +172,25 @@ def test_gcc_execute_ir(test_case, opt_level, tmp_path):
 
     # Wait for program to complete and check exit status
     # GCC torture tests should exit cleanly (exit code 0)
-    # Poll until process exits (max 5 seconds)
+    # Poll until process exits (max RUN_TIMEOUT seconds)
     start = time.monotonic()
-    while time.monotonic() - start < 5:
+    exited = False
+    while time.monotonic() - start < RUN_TIMEOUT:
         if _sut_has_exited(sut):
+            exited = True
             break
         time.sleep(0.01)
+
+    if not exited:
+        # Program never reached exit() — almost always an infinite loop in the
+        # generated code. close() would SIGTERM QEMU, which exits 0 and would
+        # mask the hang as a pass, so fail explicitly before closing.
+        sut.close()
+        pytest.fail(
+            f"Test did not exit within {RUN_TIMEOUT}s — likely an infinite loop "
+            f"in generated code (hang)"
+        )
+
     sut.close()
 
     # Exit code 0 means success

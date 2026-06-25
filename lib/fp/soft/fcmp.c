@@ -7,8 +7,9 @@
 #include "../fp_abi.h"
 #include "soft_common.h"
 
-/* Core comparison returning -1 (a<b), 0 (a==b), 1 (a>b), 2 (unordered/NaN) */
-static int fcmp_core(float a, float b)
+/* Core comparison returning -1 (a<b), 0 (a==b), 1 (a>b), 2 (unordered/NaN)
+ * Non-static so fcmp_asm.S can call it for flag-setting wrappers. */
+int fcmp_core(float a, float b)
 {
   union
   {

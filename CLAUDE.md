@@ -138,16 +138,36 @@ void function_name(int arg)
 
 Build uses `-std=c11 -Wunused-function -Werror`.
 
-## Debug Flags
+## Debug Logging
 
-Pass via `CFLAGS+=` to `make`:
+Unified logging system defined in `log.h`. Each scope is a compile-time switch:
 
 ```bash
-make CFLAGS+='-DPARSE_DEBUG'        # parser debug
-make CFLAGS+='-DPP_DEBUG'           # preprocessor debug
-make CFLAGS+='-DASM_DEBUG'          # assembler debug
+make CFLAGS+='-DTCC_LOG_ALL=1'          # enable ALL logging scopes
+make CFLAGS+='-DTCC_LOG_IR_GEN=1'       # IR generation & optimization passes
+make CFLAGS+='-DTCC_LOG_LOOP_OPT=1'     # loop optimization (induction vars)
+make CFLAGS+='-DTCC_LOG_IV_SR=1'        # induction variable / strength reduction
+make CFLAGS+='-DTCC_LOG_LICM=1'         # loop-invariant code motion
+make CFLAGS+='-DTCC_LOG_LS=1'           # linear scan register allocator
+make CFLAGS+='-DTCC_LOG_STACK_ALLOC=1'  # stack frame allocation
+make CFLAGS+='-DTCC_LOG_CODEGEN=1'      # frontend code generation (tccgen.c)
+make CFLAGS+='-DTCC_LOG_INLINE_STRUCT=1' # inline struct return expansion
+make CFLAGS+='-DTCC_LOG_CALLSITE=1'     # call site processing
+make CFLAGS+='-DTCC_LOG_YAFF=1'         # YAFF object format
+make CFLAGS+='-DTCC_LOG_THOP=1'         # thumb opcode encoding trace
+make CFLAGS+='-DTCC_LOG_THUMB=1'        # thumb code generation (general)
+make CFLAGS+='-DTCC_LOG_MACH=1'         # machine-level store/assign
+make CFLAGS+='-DTCC_LOG_BRANCH_OPT=1'   # branch size optimization
+make CFLAGS+='-DTCC_LOG_SCRATCH=1'      # scratch register management
+make CFLAGS+='-DTCC_LOG_RELOC=1'        # ELF relocation processing
+make CFLAGS+='-DTCC_LOG_POOL=1'         # IR memory pool
+```
+
+Use `LOG_<SCOPE>(fmt, ...)` macros in code. Output goes to stderr with `[SCOPE]` prefix.
+
+Other debug flags (not part of log.h):
+```bash
 make CFLAGS+='-DCONFIG_TCC_DEBUG'   # enables -dump-ir flag
-make CFLAGS+='-DTCC_LS_DEBUG'       # register allocator detail
 ```
 
 At runtime:

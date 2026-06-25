@@ -52,8 +52,11 @@ build/
 
 # Test outputs
 results.txt
+benchmark.txt
 *.log
 
 # Temporary files
 *.tmp
 /tmp/
+
+

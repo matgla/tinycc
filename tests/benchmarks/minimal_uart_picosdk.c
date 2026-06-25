@@ -58,7 +58,8 @@ int main(void)
   }
   else
   {
-    printf("\r\nBenchmark failed!\r\n");
+    printf("\r\nBenchmark failed! result=%d\r\n", result);
+    printf("benchmark stopped\r\n");
   }
 
   // Slow blink forever

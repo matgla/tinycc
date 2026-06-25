@@ -1,44 +1,44 @@
-[TEST=1]
+---- TEST 1 ----
 bits in use : 0000001FFFFFFFFF007F0FFF
 bits as set : 000000076055555500440333
 values      : 333 44 555555 06 07
 align/size  : 4 12
 
-[TEST=2]
+---- TEST 2 ----
 bits in use : 000000000000003F7FFFFFFFFFFFFFFF00000000003F0FFF
 bits as set : 0000000000000025123456789ABCDEF000000000001E0003
 values      : 03 1e 123456789abcdef0 05 fffffffe
 align/size  : 8 24
 
-[TEST=3]
+---- TEST 3 ----
 bits in use : 001F1F1F000003FF
 bits as set : 000E0619000002F5
 values      : 15 17 19 06 0e
 align/size  : 4 8
 
-[TEST=4]
+---- TEST 4 ----
 bits in use : 0007FFFF00000027
 bits as set : 00078F0F00000023
 values      : 03 ffffffff 0f fffffff8 78
 align/size  : 4 8
 
-[TEST=5]
+---- TEST 5 ----
 bits in use : FFFFFF3FFFFFFFFF000000003FFFFFFF00001FFFFFFFFFFF
 bits as set : 007744000000007800000000300000000000000123456789
 values      : 0000000123456789 f0000000 0000000000000078 44 77
 align/size  : 8 24
 
-[TEST=6]
+---- TEST 6 ----
 bits in use : 0000007000FFFFFFFFFFFFFF
 bits as set : 00000030002001FD00000004
 values      : 01 02 03 04 fffffffd
 align/size  : 4 12
 
-[TEST=7]
+---- TEST 7 ----
 bits in use : 3FFFFFFFFFFF0000
 bits as set : 0026000100050000
 values      : 01 00 ffffffff 04 05
-align/size  : 8 8
+align/size  : 4 8
 
 
 
@@ -126,7 +126,7 @@ align/size  : 4 12
 bits in use : 3FFFFFFFFFFF0000
 bits as set : 0026000100050000
 values      : 01 00 ffffffff 04 05
-align/size  : 8 8
+align/size  : 4 8
 
 
 

@@ -1,3 +1,5 @@
+#include <stdio.h>
+
 _Alignas(16) int i1;
 int _Alignas(16) i2;
 void _Alignas(16) *p2;
@@ -14,7 +16,6 @@ int16aligned_t i7;
    corresponding attribute _does_ apply to type-name, though not in
    some clang versions.  */
 int _Alignas(int __attribute__((aligned(16)))) i8;
-extern int printf(const char*, ...);
 #ifdef _MSC_VER
 #define alignof(x) (int)__alignof(x)
 #else

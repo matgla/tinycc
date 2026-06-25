@@ -2,7 +2,8 @@
 
 #include <string.h>
 
-#include "arm-thumb-opcodes.h"
+#include "arch/arm/thumb/thumb.h"
+#include "arch/arm/thumb/thop_block.h"
 #include "tccls.h"
 
 /* Provided by arm-thumb-gen.c */
@@ -59,24 +60,24 @@ ScratchRegAllocs get_scratch_regs_with_save(uint32_t exclude_regs, int count)
     else
     {
       int reg_to_save = -1;
-      if (!(exclude & (1u << R_IP)))
+      /* Prefer R0-R3: 16-bit PUSH/POP and 16-bit ALU encoding */
+      for (int r = 0; r <= 3; ++r)
       {
-        reg_to_save = R_IP;
+        if (!(exclude & (1u << r)))
+        {
+          reg_to_save = r;
+          break;
+        }
       }
-      else if (ir && ir->leaffunc && !(exclude & (1u << R_LR)))
+
+      if (reg_to_save < 0 && ir && ir->leaffunc && !(exclude & (1u << R_LR)))
       {
         reg_to_save = R_LR;
       }
-      else
+
+      if (reg_to_save < 0 && !(exclude & (1u << R_IP)))
       {
-        for (int r = 0; r <= 3; ++r)
-        {
-          if (!(exclude & (1u << r)))
-          {
-            reg_to_save = r;
-            break;
-          }
-        }
+        reg_to_save = R_IP;
       }
 
       if (reg_to_save < 0)
@@ -199,24 +200,24 @@ ScratchRegAlloc get_scratch_reg_with_save(uint32_t exclude_regs)
   }
 
   int reg_to_save = -1;
-  if (!(exclude_regs & (1u << R_IP)))
+  /* Prefer R0-R3: 16-bit PUSH/POP and 16-bit ALU encoding */
+  for (int r = 0; r <= 3; ++r)
   {
-    reg_to_save = R_IP;
+    if (!(exclude_regs & (1u << r)))
+    {
+      reg_to_save = r;
+      break;
+    }
   }
-  else if (ir && ir->leaffunc && !(exclude_regs & (1u << R_LR)))
+
+  if (reg_to_save < 0 && ir && ir->leaffunc && !(exclude_regs & (1u << R_LR)))
   {
     reg_to_save = R_LR;
   }
-  else
+
+  if (reg_to_save < 0 && !(exclude_regs & (1u << R_IP)))
   {
-    for (int r = 0; r <= 3; ++r)
-    {
-      if (!(exclude_regs & (1u << r)))
-      {
-        reg_to_save = r;
-        break;
-      }
-    }
+    reg_to_save = R_IP;
   }
 
   if (reg_to_save < 0)

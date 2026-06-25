@@ -2538,6 +2538,12 @@ typedef Elf32_Addr Elf32_Conflict;
   108 /* 32 bit offset relative to static                                      \
          TLS block */
 #define R_ARM_THM_TLS_DESCSEQ 129
+/* YASOS RELRO: 32-bit offset of a symbol within .rodata (S - rodata base).
+ * Emitted for references to shared (pure-const) .rodata symbols; the runtime
+ * address is anchor(rodata base from a fixed GOT slot) + this offset. Resolved
+ * at link time and baked into the .text literal, so it never reaches the YAFF
+ * writer (like R_ARM_GOTOFF). Uses a free value in the 130-159 ABI gap. */
+#define R_ARM_RODATA_OFF 137
 #define R_ARM_IRELATIVE 160
 #define R_ARM_RXPC25 249
 #define R_ARM_RSBREL32 250

@@ -35,8 +35,49 @@ ASAN_TIMEOUT_MULTIPLIER = 3 if ASAN_ENABLED else 1
 DEFAULT_GCC_PATH = Path(__file__).parent / "gcc-testsuite" / "gcc" / "testsuite" / "gcc.c-torture"
 GCC_TORTURE_PATH = Path(os.environ.get("GCC_TORTURE_PATH", DEFAULT_GCC_PATH))
 
+DEFAULT_OPT_LEVELS = ("-O0", "-O1", "-O2")
+SUPPORTED_OPT_LEVELS = frozenset(DEFAULT_OPT_LEVELS)
+
+
+def _normalize_opt_level(value: str) -> str:
+    normalized = value.strip()
+    if not normalized:
+        return ""
+    if normalized in {"0", "1", "2"}:
+        return f"-O{normalized}"
+    if normalized in {"O0", "O1", "O2"}:
+        return f"-{normalized}"
+    return normalized
+
+
+def parse_opt_levels(raw_value: Optional[str], *, default: tuple[str, ...] = DEFAULT_OPT_LEVELS) -> list[str]:
+    if raw_value is None or not raw_value.strip():
+        return list(default)
+
+    levels = []
+    for token in re.split(r"[\s,]+", raw_value.strip()):
+        normalized = _normalize_opt_level(token)
+        if not normalized:
+            continue
+        if normalized not in SUPPORTED_OPT_LEVELS:
+            raise ValueError(
+                f"unsupported optimization level '{token}'; expected one of {sorted(SUPPORTED_OPT_LEVELS)}"
+            )
+        if normalized not in levels:
+            levels.append(normalized)
+
+    return levels or list(default)
+
+
+def get_opt_levels(env_var: str = "YASOS_TCC_TEST_OPT_LEVELS", *, default: tuple[str, ...] = DEFAULT_OPT_LEVELS) -> list[str]:
+    try:
+        return parse_opt_levels(os.environ.get(env_var), default=default)
+    except ValueError as error:
+        raise RuntimeError(f"Invalid {env_var}: {error}") from error
+
+
 # Optimization levels to test
-OPT_LEVELS = ["-O0", "-O1"]
+OPT_LEVELS = get_opt_levels()
 
 # GCC Torture tests expected to fail
 # These tests are known to fail with armv8m-tcc
@@ -90,6 +131,18 @@ GCC_SKIP_TESTS = {
     "compile/bitfield-endian-2", # __uint128_t bitfield + scalar_storage_order
     "compile/pr70355", # __int128 vector type
     "compile/pr99822", # __int128 type
+    # C23 enum with underlying type (not supported by TCC)
+    "compile/pr111059-7",
+    "compile/pr111059-8",
+    "compile/pr111059-9",
+    "compile/pr111059-10",
+    "compile/pr111059-11",
+    "compile/pr111059-12",
+    "compile/pr111911-2",
+    # _Decimal64 (not available on ARM bare-metal)
+    "pr80692",
+    # C23 variadic without named parameter
+    "pr117432",
 }
 
 
@@ -313,6 +366,9 @@ def should_skip_gcc_test(test_path: Path) -> Optional[str]:
         # skipped rather than treated as compiler failures.
         if "dg-require-dll" in content:
             return "Requires DLL target support (not available on ARM ELF)"
+
+        if "dg-require-effective-target dfp" in content:
+            return "Requires decimal floating point (not available on ARM bare-metal)"
 
         # Tests requiring trampolines (nested functions) are now supported
         # if "dg-require-effective-target trampolines" in content:

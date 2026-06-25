@@ -4,7 +4,7 @@
  * Reduced stack usage to avoid TCC stack alignment issues.
  */
 
-#include "benchmarks.h"
+#include "../benchmarks.h"
 #include <string.h>
 
 /* Include SHA implementation */

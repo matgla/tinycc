@@ -5,7 +5,7 @@
  * Uses synthetic input data suitable for embedded targets.
  */
 
-#include "benchmarks.h"
+#include "../benchmarks.h"
 #include <string.h>
 
 /* Include SHA implementation directly - provides SHA_INFO and functions */

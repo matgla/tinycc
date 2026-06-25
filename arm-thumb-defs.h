@@ -116,6 +116,13 @@ enum
 /* Pointer size, in bytes */
 #define PTR_SIZE 4
 
+/* YASOS RELRO shared-.rodata anchor: a reserved GOT slot (index 3, just after
+ * the 3 dummy/_DYNAMIC slots) holding the runtime base of the shared .rodata
+ * segment. Each GOT entry is PTR_SIZE*2 bytes, so the anchor is at byte offset
+ * 24 from the GOT base (R9). Codegen loads it with ldr [R9, #24]. */
+#define YAFF_RODATA_ANCHOR_GOT_INDEX 3
+#define YAFF_RODATA_ANCHOR_GOT_OFFSET (YAFF_RODATA_ANCHOR_GOT_INDEX * PTR_SIZE * 2)
+
 /* Long double size and alignment, in bytes */
 #ifdef TCC_ARM_VFP
 #define LDOUBLE_SIZE 8

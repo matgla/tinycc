@@ -5,3 +5,6 @@ def test_vpop():
 
 def test_vpush():
     utils.perform_test_for_file("test_vpush.S")
+
+def test_vfp():
+    utils.perform_test_for_file("test_vfp.S")

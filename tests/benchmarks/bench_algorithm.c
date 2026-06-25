@@ -83,6 +83,84 @@ int bench_linked_list(int iterations)
   return sum;
 }
 
+/* Binary search benchmark - tests branch-heavy lookup in sorted data */
+int bench_binary_search(int iterations)
+{
+    int data[128];
+    int checksum = 0;
+
+    for (int i = 0; i < 128; i++)
+    {
+        data[i] = i * 5 + 11;
+    }
+
+    for (int n = 0; n < iterations; n++)
+    {
+        int target = data[(n * 17) & 127];
+        int left = 0;
+        int right = 127;
+
+        while (left <= right)
+        {
+            int mid = left + ((right - left) / 2);
+
+            if (data[mid] == target)
+            {
+                checksum = mid + target;
+                break;
+            }
+            if (data[mid] < target)
+            {
+                left = mid + 1;
+            }
+            else
+            {
+                right = mid - 1;
+            }
+        }
+    }
+
+    return checksum;
+}
+
+/* Small matrix multiply benchmark - deterministic integer arithmetic */
+int bench_matrix_mul(int iterations)
+{
+    int a[4][4];
+    int b[4][4];
+    int checksum = 0;
+
+    for (int row = 0; row < 4; row++)
+    {
+        for (int col = 0; col < 4; col++)
+        {
+            a[row][col] = row * 3 + col + 1;
+            b[row][col] = row + col * 2 + 5;
+        }
+    }
+
+    for (int n = 0; n < iterations; n++)
+    {
+        checksum = 0;
+        for (int row = 0; row < 4; row++)
+        {
+            for (int col = 0; col < 4; col++)
+            {
+                int value = 0;
+
+                for (int k = 0; k < 4; k++)
+                {
+                    value += a[row][k] * b[k][col];
+                }
+
+                checksum += value * (row + 1) * (col + 2);
+            }
+        }
+    }
+
+    return checksum;
+}
+
 /* Register benchmark with expected results */
 void init_algorithm_benchmarks(void)
 {
@@ -92,4 +170,6 @@ void init_algorithm_benchmarks(void)
   register_benchmark_ex("bubble_sort", bench_bubble_sort, 1000, "Bubble sort 64 elements", 799008);
   /* linked_list: sum of i*3+7 for i=0..99 = 15550 */
   register_benchmark_ex("linked_list", bench_linked_list, 5000, "Linked list traversal", 15550);
+    register_benchmark_ex("binary_search", bench_binary_search, 2000, "Binary search over sorted table", 389);
+    register_benchmark_ex("matrix_mul", bench_matrix_mul, 400, "4x4 integer matrix multiply", 49320);
 }

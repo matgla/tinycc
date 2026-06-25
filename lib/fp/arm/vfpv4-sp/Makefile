@@ -16,7 +16,7 @@ SRCS = $(SRCS_SP) $(SRCS_DP)
 BUILD_DIR ?= build
 OBJS = $(addprefix $(BUILD_DIR)/,$(SRCS:.c=.o))
 
-FP_CFLAGS += -O2 -Wall -Wextra -march=armv7e-m -mfpu=fpv4-sp-d16 -I../../.. -I../../../../include
+override FP_CFLAGS += -O2 -Wall -Wextra -march=armv7e-m -mfpu=fpv4-sp-d16 -I../../.. -I../../../../include
 
 all: $(BUILD_DIR) $(OBJS)
 

@@ -20,6 +20,7 @@
 
 #include "tcc.h"
 #include "tccld.h"
+#include "ir/opt.h"
 
 /********************************************************/
 /* global variables */
@@ -188,6 +189,13 @@ PUB_FUNC void *tcc_mallocz(unsigned long size)
 {
   void *ptr;
   ptr = tcc_malloc(size);
+  /* Always zero. A prior optimization skipped this memset on yasos-native,
+   * assuming malloc() always pre-zeroes — but that invariant is FALSE for bump
+   * allocations served from a RECYCLED pool: mk_pool() resets the pool's bump
+   * pointer (size = sizeof(*pool)) without re-zeroing the pool body, so those
+   * bytes still hold stale data. Skipping the memset therefore handed tcc
+   * non-zeroed memory and crashed self-host -O2 compiles (e.g. builtin-bitops-1:
+   * free() of a -1 sentinel read from a struct field that should have been 0). */
   if (size)
     memset(ptr, 0, size);
   return ptr;
@@ -668,12 +676,21 @@ ST_FUNC int tcc_open(TCCState *s1, const char *filename)
 /* compile the file opened in 'file'. Return non zero if errors. */
 static int tcc_compile(TCCState *s1, int filetype, const char *str, int fd)
 {
+  unsigned compile_start = 0;
+  unsigned phase_start = 0;
+
   /* Here we enter the code section where we use the global variables for
      parsing and code generation (tccpp.c, tccgen.c, <target>-gen.c).
      Other threads need to wait until we're done.
 
      Alternatively we could use thread local storage for those global
      variables, which may or may not have advantages */
+
+  if (s1->do_bench)
+  {
+    compile_start = tcc_getclock_ms();
+    phase_start = compile_start;
+  }
 
   tcc_enter_state(s1);
   s1->error_set_jmp_enabled = 1;
@@ -697,13 +714,24 @@ static int tcc_compile(TCCState *s1, int filetype, const char *str, int fd)
     preprocess_start(s1, filetype);
     tccgen_init(s1);
 
+    if (s1->output_type != TCC_OUTPUT_PREPROCESS)
+      tccelf_begin_file(s1);
+
+    if (s1->do_bench)
+    {
+      unsigned elapsed = tcc_getclock_ms() - phase_start;
+      s1->bench_compile_setup_time += elapsed;
+      s1->bench_compile_setup_count++;
+      tcc_bench_log(s1, "compile-setup", str, elapsed);
+      phase_start = tcc_getclock_ms();
+    }
+
     if (s1->output_type == TCC_OUTPUT_PREPROCESS)
     {
       tcc_preprocess(s1);
     }
     else
     {
-      tccelf_begin_file(s1);
       if (filetype & (AFF_TYPE_ASM | AFF_TYPE_ASMPP))
       {
         tcc_assemble(s1, !!(filetype & AFF_TYPE_ASMPP));
@@ -712,13 +740,36 @@ static int tcc_compile(TCCState *s1, int filetype, const char *str, int fd)
       {
         tccgen_compile(s1);
       }
-      tccelf_end_file(s1);
     }
+
+    if (s1->do_bench)
+    {
+      unsigned elapsed = tcc_getclock_ms() - phase_start;
+      s1->bench_compile_exec_time += elapsed;
+      s1->bench_compile_exec_count++;
+      tcc_bench_log(s1, "compile-exec", str, elapsed);
+      phase_start = tcc_getclock_ms();
+    }
+
+    if (s1->output_type != TCC_OUTPUT_PREPROCESS)
+      tccelf_end_file(s1);
   }
   tccgen_finish(s1);
   preprocess_end(s1);
   s1->error_set_jmp_enabled = 0;
   tcc_exit_state(s1);
+  if (s1->do_bench)
+  {
+    unsigned now = tcc_getclock_ms();
+    unsigned finalize_elapsed = now - phase_start;
+    unsigned elapsed = now - compile_start;
+    s1->bench_compile_finalize_time += finalize_elapsed;
+    s1->bench_compile_finalize_count++;
+    tcc_bench_log(s1, "compile-finalize", str, finalize_elapsed);
+    s1->bench_compile_time += elapsed;
+    s1->bench_compile_count++;
+    tcc_bench_log(s1, filetype & (AFF_TYPE_ASM | AFF_TYPE_ASMPP) ? "assemble" : "compile", str, elapsed);
+  }
   return s1->nb_errors != 0 ? -1 : 0;
 }
 
@@ -758,7 +809,7 @@ LIBTCCAPI TCCState *tcc_new(void)
   s->tcc_ext = 1;
   s->nocommon = 1;
   s->dollars_in_identifiers = 1; /*on by default like in gcc/clang*/
-  s->cversion = 199901;          /* default unless -std=c11 is supplied */
+  s->cversion = 201112;          /* default to C11 */
   s->warn_implicit_function_declaration = 1;
   s->warn_discarded_qualifiers = 1;
   s->ms_extensions = 1;
@@ -771,13 +822,17 @@ LIBTCCAPI TCCState *tcc_new(void)
   s->no_pie = 0;
 #if defined(TCC_TARGET_ARM) || defined(TCC_TARGET_ARM_THUMB)
   s->float_abi = ARM_SOFTFP_FLOAT;
-  s->fpu_type = ARM_FPU_AUTO;      /* default to auto-detect */
+  s->fpu_type = ARM_FPU_AUTO; /* default to auto-detect */
 #if defined(TCC_TARGET_YASOS)
   s->text_and_data_separation = 1;
   s->pic = 1;
   s->section_align = 4;
   s->text_addr = 0;
   s->has_text_addr = 1;
+  /* RELRO rodata sharing is on by default for YASOS: .rodata is kept pure-const
+   * (pointer-bearing const objects go to the writable data segment) and shared
+   * XIP across processes. Disable with -no-share-rodata. */
+  s->share_rodata = 1;
 #else
   s->text_and_data_separation = 0;
 #endif
@@ -800,8 +855,14 @@ LIBTCCAPI void tcc_delete(TCCState *s1)
   arm_deinit(s1);
 #endif
 
+  /* free IR-level interprocedural caches */
+  tcc_ir_free_switch_func_cache(s1);
+
   /* free lazy object files (Phase 2 GC) */
   tcc_free_lazy_objfiles(s1);
+
+  /* free cached archive symbol tables */
+  tcc_archive_cache_free(s1);
 
   /* free sections */
   tccelf_delete(s1);
@@ -824,6 +885,9 @@ LIBTCCAPI void tcc_delete(TCCState *s1)
   tcc_free(s1->outfile);
   tcc_free(s1->deps_outfile);
   tcc_free(s1->linker_script);
+#ifdef CONFIG_TCC_DEBUG
+  tcc_free(s1->dump_ir_passes);
+#endif
   if (s1->ld_script)
   {
     ld_script_cleanup(s1->ld_script);
@@ -839,6 +903,7 @@ LIBTCCAPI void tcc_delete(TCCState *s1)
   tcc_free(s1->dState);
   /* free loaded dlls array */
   dynarray_reset(&s1->loaded_dlls, &s1->nb_loaded_dlls);
+  tcc_yaff_libs_free(s1);
   tcc_free(s1);
 #ifdef MEM_DEBUG
   tcc_memcheck(-1);
@@ -948,6 +1013,8 @@ static int guess_filetype(const char *filename);
 ST_FUNC int tcc_add_file_internal(TCCState *s1, const char *filename, int flags)
 {
   int fd, ret = -1;
+  unsigned open_start = 0;
+  unsigned elapsed = 0;
 
   if (0 == (flags & AFF_TYPE_MASK))
     flags |= guess_filetype(filename);
@@ -957,7 +1024,16 @@ ST_FUNC int tcc_add_file_internal(TCCState *s1, const char *filename, int flags)
     return 0;
 
   /* open the file */
+  if (s1->do_bench)
+    open_start = tcc_getclock_ms();
   fd = _tcc_open(s1, filename);
+  if (s1->do_bench)
+  {
+    elapsed = tcc_getclock_ms() - open_start;
+    s1->bench_file_open_time += elapsed;
+    s1->bench_file_open_count++;
+    tcc_bench_log(s1, "open", filename, elapsed);
+  }
   if (fd < 0)
   {
     if (flags & AFF_PRINT_ERROR)
@@ -994,7 +1070,9 @@ ST_FUNC int tcc_add_file_internal(TCCState *s1, const char *filename, int flags)
       {
       }
       else
+      {
         ret = tcc_load_dll(s1, fd, filename, (flags & AFF_REFERENCED_DLL) != 0);
+      }
       break;
 
     default:
@@ -1062,13 +1140,33 @@ static int tcc_add_library_internal(TCCState *s1, const char *fmt, const char *f
 {
   char buf[1024];
   int i, ret;
+  unsigned resolve_start = 0;
+
+  if (s1->do_bench)
+    resolve_start = tcc_getclock_ms();
 
   for (i = 0; i < nb_paths; i++)
   {
     snprintf(buf, sizeof(buf), fmt, paths[i], filename);
     ret = tcc_add_file_internal(s1, buf, flags & ~AFF_PRINT_ERROR);
     if (ret != FILE_NOT_FOUND)
+    {
+      if (s1->do_bench)
+      {
+        unsigned elapsed = tcc_getclock_ms() - resolve_start;
+        s1->bench_library_resolve_time += elapsed;
+        s1->bench_library_resolve_count++;
+        tcc_bench_log(s1, "resolve-lib", buf, elapsed);
+      }
       return ret;
+    }
+  }
+  if (s1->do_bench)
+  {
+    unsigned elapsed = tcc_getclock_ms() - resolve_start;
+    s1->bench_library_resolve_time += elapsed;
+    s1->bench_library_resolve_count++;
+    tcc_bench_log(s1, "resolve-lib", filename, elapsed);
   }
   if (flags & AFF_PRINT_ERROR)
     tcc_error_noabort("library '%s' not found", filename);
@@ -1453,6 +1551,7 @@ enum
   TCC_OPTION_O,
   TCC_OPTION_mfloat_abi,
   TCC_OPTION_mfpu,
+  TCC_OPTION_march,
   TCC_OPTION_m,
   TCC_OPTION_f,
   TCC_OPTION_isystem,
@@ -1484,12 +1583,17 @@ enum
   TCC_OPTION_compatibility_version,
   TCC_OPTION_current_version,
   TCC_OPTION_mpic_data_is_text_relative,
+  TCC_OPTION_stack_size,
+  TCC_OPTION_heap_size,
+  TCC_OPTION_share_rodata,
+  TCC_OPTION_no_share_rodata,
   TCC_OPTION_fpic,
   TCC_OPTION_fpie,
   TCC_OPTION_no_pie,
   TCC_OPTION_T,
 #ifdef CONFIG_TCC_DEBUG
   TCC_OPTION_dump_ir,
+  TCC_OPTION_dump_ir_passes,
 #endif
 };
 
@@ -1518,6 +1622,7 @@ static const TCCOption tcc_options[] = {
 #ifdef CONFIG_TCC_DEBUG
     /* Must appear before the short "-d" option, otherwise "-dump-ir" is parsed as "-d ump-ir". */
     {"dump-ir", TCC_OPTION_dump_ir, 0},
+    {"dump-ir-passes=", TCC_OPTION_dump_ir_passes, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP},
 #endif
     {"d", TCC_OPTION_d, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP},
     {"static", TCC_OPTION_static, 0},
@@ -1541,7 +1646,15 @@ static const TCCOption tcc_options[] = {
     {"mfloat-abi", TCC_OPTION_mfloat_abi, TCC_OPTION_HAS_ARG},
     {"mfpu=", TCC_OPTION_mfpu, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP},
     {"mfpu", TCC_OPTION_mfpu, TCC_OPTION_HAS_ARG},
+    {"march=", TCC_OPTION_march, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP},
+    {"march", TCC_OPTION_march, TCC_OPTION_HAS_ARG},
     {"mpic-data-is-text-relative", TCC_OPTION_mpic_data_is_text_relative, 0},
+    {"stack-size=", TCC_OPTION_stack_size, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP},
+    {"stack-size", TCC_OPTION_stack_size, TCC_OPTION_HAS_ARG},
+    {"heap-size=", TCC_OPTION_heap_size, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP},
+    {"heap-size", TCC_OPTION_heap_size, TCC_OPTION_HAS_ARG},
+    {"share-rodata", TCC_OPTION_share_rodata, 0},
+    {"no-share-rodata", TCC_OPTION_no_share_rodata, 0},
 #endif
     {"m", TCC_OPTION_m, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP},
     {"f", TCC_OPTION_f, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP},
@@ -1612,19 +1725,28 @@ static const FlagDef options_f[] = {{offsetof(TCCState, char_is_unsigned), 0, "u
                                     {offsetof(TCCState, opt_bool_cse), 0, "bool-cse"},
                                     {offsetof(TCCState, opt_bool_idempotent), 0, "bool-idempotent"},
                                     {offsetof(TCCState, opt_bool_simplify), 0, "bool-simplify"},
-                                    {offsetof(TCCState, opt_return_value), 0, "return-value-opt"},
                                     {offsetof(TCCState, opt_store_load_fwd), 0, "store-load-fwd"},
                                     {offsetof(TCCState, opt_redundant_store), 0, "redundant-store-elim"},
                                     {offsetof(TCCState, opt_dead_store), 0, "dead-store-elim"},
                                     {offsetof(TCCState, opt_fp_offset_cache), 0, "fp-offset-cache"},
                                     {offsetof(TCCState, opt_indexed_memory), 0, "indexed-memory"},
+                                    {offsetof(TCCState, opt_disp_fusion), 0, "disp-fusion"},
+                                    {offsetof(TCCState, opt_lea_fold), 0, "lea-fold"},
                                     {offsetof(TCCState, opt_postinc_fusion), 0, "postinc-fusion"},
                                     {offsetof(TCCState, opt_mla_fusion), 0, "mla-fusion"},
                                     {offsetof(TCCState, opt_stack_addr_cse), 0, "stack-addr-cse"},
                                     {offsetof(TCCState, opt_licm), 0, "licm"},
                                     {offsetof(TCCState, opt_strength_red), 0, "strength-red"},
                                     {offsetof(TCCState, opt_iv_strength_red), 0, "iv-strength-red"},
+                                    {offsetof(TCCState, opt_loop_unroll), 0, "loop-unroll"},
+                                    {offsetof(TCCState, opt_loop_rotation), 0, "loop-rotation"},
+                                    {offsetof(TCCState, opt_reroll), 0, "reroll-blocks"},
                                     {offsetof(TCCState, opt_jump_threading), 0, "jump-threading"},
+                                    {offsetof(TCCState, opt_nonneg_fold), 0, "nonneg-fold"},
+                                    {offsetof(TCCState, opt_vrp), 0, "vrp"},
+                                    {offsetof(TCCState, opt_float_narrow), 0, "float-narrow"},
+                                    {offsetof(TCCState, opt_inline_functions), 0, "inline-functions"},
+                                    {offsetof(TCCState, opt_inline_small), 0, "inline-small-functions"},
                                     {offsetof(TCCState, instrument_functions), 0, "instrument-functions"},
                                     {0, 0, NULL}};
 
@@ -1938,6 +2060,14 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
       ++noaction;
       break;
     case TCC_OPTION_f:
+      /* Handle -finline-limit=N */
+      if (!strncmp(optarg, "inline-limit=", 13))
+      {
+        int n = atoi(optarg + 13);
+        if (n > 0)
+          s->opt_inline_limit = n;
+        break;
+      }
       /* Handle -fno-builtin-<name> flags */
       if (!strncmp(optarg, "no-builtin-", 11))
       {
@@ -2034,9 +2164,24 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
         return tcc_error_noabort("unsupported FPU type '%s'", optarg);
       }
       break;
+    case TCC_OPTION_march:
+      s->march_str = optarg;
+      break;
     case TCC_OPTION_mpic_data_is_text_relative:
       printf("Setting text and data separation to: 1\n");
       s->text_and_data_separation = 1;
+      break;
+    case TCC_OPTION_stack_size:
+      s->yaff_stack_size = (unsigned int)strtoul(optarg, NULL, 0);
+      break;
+    case TCC_OPTION_heap_size:
+      s->yaff_heap_size = (unsigned int)strtoul(optarg, NULL, 0);
+      break;
+    case TCC_OPTION_share_rodata:
+      s->share_rodata = 1;
+      break;
+    case TCC_OPTION_no_share_rodata:
+      s->share_rodata = 0;
       break;
 #endif
     case TCC_OPTION_m:
@@ -2128,29 +2273,49 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
         s->opt_dce = 1;
         s->opt_const_prop = 1;
         s->opt_copy_prop = 1;
-        /* cse disabled: miscompiles SHA-1 when combined with copy-prop.
-           Can still be enabled manually with -fcse for debugging. */
+        s->opt_cse = 1;
         s->opt_bool_cse = 1;
         s->opt_bool_idempotent = 1;
         s->opt_bool_simplify = 1;
-        s->opt_return_value = 1;
         s->opt_store_load_fwd = 1;
         s->opt_redundant_store = 1;
         s->opt_dead_store = 1;
         s->opt_indexed_memory = 1; /* Fuse SHL+ADD+LOAD/STORE into indexed ops */
-        s->opt_postinc_fusion = 1; /* Fuse LOAD/STORE + ADD into post-increment ops */
+        s->opt_disp_fusion = 1;    /* Fuse ADD+imm+LOAD/STORE into displacement-addressed ops */
+        s->opt_lea_fold = 1;       /* Fold LEA Addr[StackLoc]+deref into direct stack slot access */
+        s->opt_postinc_fusion = 0; /* DISABLED: fusing LOAD/STORE + ADD into a single
+                                    * LOAD_POSTINC/STORE_POSTINC is unsound when the
+                                    * pointer SPILLS — the ARM post-indexed writeback
+                                    * (ldr/str [rN],#imm) updates rN in place but the IR
+                                    * can't model it, so the spilled base never advances
+                                    * (tcc froze in parse_number on every integer literal).
+                                    * Without the fusion `*p++` lowers to an explicit
+                                    * LOAD + ADD whose result is written back correctly. */
         s->opt_mla_fusion = 1;     /* Fuse MUL+ADD into MLA */
         /* fp-offset-cache disabled: miscompiles loops when combined with
            iv-strength-red (e.g. SHA-1 sha_transform).  Can still be
            enabled manually with -ffp-offset-cache for debugging. */
         s->opt_stack_addr_cse = 1;  /* Hoist repeated stack address computations */
         s->opt_licm = 1;            /* Loop-invariant code motion */
+        s->opt_ipc = 1;             /* Interprocedural constant propagation */
         s->opt_strength_red = 1;    /* Strength reduction for multiply */
         s->opt_iv_strength_red = 1; /* IV strength reduction for array loops */
+        s->opt_loop_unroll = 1;    /* Full-unroll small constant-trip-count loops */
+        s->opt_loop_rotation = 1;  /* Rotate top-tested loops to bottom-tested */
+        s->opt_reroll = 1;          /* Re-roll runs of identical macro-unrolled blocks */
         s->opt_nonneg_fold = 1;     /* Non-negative value branch folding */
         s->opt_vrp = 1;             /* Value range propagation branch folding */
         s->opt_float_narrow = 1;    /* Narrow double math to float when safe */
         s->opt_jump_threading = 1;  /* Jump threading optimization */
+        s->opt_inline_small = 1;    /* Inline tiny static/inline functions (≤30 words) */
+        if (!s->opt_inline_limit)
+          s->opt_inline_limit = 30;
+      }
+      if (s->optimize >= 2)
+      {
+        s->opt_inline_functions = 1; /* Inline small static/inline functions (≤100 words) */
+        if (s->opt_inline_limit < 100)
+          s->opt_inline_limit = 100;
       }
       break;
     case TCC_OPTION_T:
@@ -2164,6 +2329,10 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
 #ifdef CONFIG_TCC_DEBUG
     case TCC_OPTION_dump_ir:
       s->dump_ir = 1;
+      break;
+    case TCC_OPTION_dump_ir_passes:
+      tcc_free(s->dump_ir_passes);
+      s->dump_ir_passes = tcc_strdup(optarg);
       break;
 #endif
     case TCC_OPTION_print_search_dirs:
@@ -2214,6 +2383,23 @@ LIBTCCAPI int tcc_set_options(TCCState *s, const char *r)
   return ret < 0 ? ret : 0;
 }
 
+PUB_FUNC void tcc_bench_log(TCCState *s1, const char *operation, const char *name, unsigned elapsed_ms)
+{
+  if (!s1 || !s1->do_bench)
+    return;
+  if (!name || !name[0])
+    name = "<unknown>";
+  fprintf(stderr, "# bench %-14s %6u ms  %s\n", operation, elapsed_ms, name);
+}
+
+static void tcc_print_bench_breakdown(const char *label, unsigned total_time, unsigned count)
+{
+  if (!count)
+    return;
+  fprintf(stderr, "# bench total %-16s %6u ms  %4u calls  %7.2f ms avg\n", label, total_time, count,
+         (double)total_time / count);
+}
+
 PUB_FUNC void tcc_print_stats(TCCState *s1, unsigned total_time)
 {
   if (!total_time)
@@ -2225,6 +2411,23 @@ PUB_FUNC void tcc_print_stats(TCCState *s1, unsigned total_time)
           (double)total_bytes / 1000 / total_time);
   fprintf(stderr, "# text %u, data.rw %u, data.ro %u, bss %u bytes\n", s1->total_output[0], s1->total_output[1],
           s1->total_output[2], s1->total_output[3]);
+  tcc_print_bench_breakdown("open", s1->bench_file_open_time, s1->bench_file_open_count);
+  tcc_print_bench_breakdown("resolve", s1->bench_library_resolve_time, s1->bench_library_resolve_count);
+    tcc_print_bench_breakdown("compile-setup", s1->bench_compile_setup_time, s1->bench_compile_setup_count);
+    tcc_print_bench_breakdown("compile-exec", s1->bench_compile_exec_time, s1->bench_compile_exec_count);
+    tcc_print_bench_breakdown("compile-finalize", s1->bench_compile_finalize_time, s1->bench_compile_finalize_count);
+  tcc_print_bench_breakdown("func-body", s1->bench_function_body_time, s1->bench_function_body_count);
+  tcc_print_bench_breakdown("func-opt", s1->bench_function_opt_time, s1->bench_function_opt_count);
+  tcc_print_bench_breakdown("func-alloc", s1->bench_function_alloc_time, s1->bench_function_alloc_count);
+  tcc_print_bench_breakdown("func-codegen", s1->bench_function_codegen_time, s1->bench_function_codegen_count);
+  tcc_print_bench_breakdown("compile", s1->bench_compile_time, s1->bench_compile_count);
+  tcc_print_bench_breakdown("obj", s1->bench_object_load_time, s1->bench_object_load_count);
+  tcc_print_bench_breakdown("archive", s1->bench_archive_load_time, s1->bench_archive_load_count);
+  if (s1->bench_archive_member_count)
+    fprintf(stderr, "# bench total archive-members %u\n", s1->bench_archive_member_count);
+  tcc_print_bench_breakdown("dll", s1->bench_dll_load_time, s1->bench_dll_load_count);
+  tcc_print_bench_breakdown("ldscript", s1->bench_ldscript_load_time, s1->bench_ldscript_load_count);
+  tcc_print_bench_breakdown("output", s1->bench_output_time, s1->bench_output_count);
 #ifdef MEM_DEBUG
   fprintf(stderr, "# memory usage");
 #ifdef TCC_IS_NATIVE

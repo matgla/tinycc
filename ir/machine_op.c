@@ -22,6 +22,31 @@
 #include "ir.h"
 #include <stdbool.h>
 
+static IRLiveInterval *machine_op_interval_for_vreg(TCCIRState *ir, int vreg)
+{
+  const int type = TCCIR_DECODE_VREG_TYPE(vreg);
+  const int position = TCCIR_DECODE_VREG_POSITION(vreg);
+
+  switch (type)
+  {
+  case TCCIR_VREG_TYPE_VAR:
+    if ((unsigned)position < (unsigned)ir->variables_live_intervals_size)
+      return &ir->variables_live_intervals[position];
+    break;
+  case TCCIR_VREG_TYPE_TEMP:
+    if ((unsigned)position < (unsigned)ir->temporary_variables_live_intervals_size)
+      return &ir->temporary_variables_live_intervals[position];
+    break;
+  case TCCIR_VREG_TYPE_PARAM:
+    if ((unsigned)position < (unsigned)ir->parameters_live_intervals_size)
+      return &ir->parameters_live_intervals[position];
+    break;
+  default:
+    break;
+  }
+  return NULL;
+}
+
 /* ============================================================================
  * machine_op_from_ir: Convert an IROperand to a MachineOperand
  * ============================================================================
@@ -63,37 +88,30 @@ MachineOperand machine_op_from_ir(TCCIRState *ir, const IROperand *op)
   m.is_unsigned = (bool)op->is_unsigned;
   m.is_64bit = (bool)irop_needs_pair(*op);
   m.is_complex = (bool)op->is_complex;
-  m.vreg = (int)irop_get_vreg(*op);
-
   const int tag = irop_get_tag(*op);
+  const int vreg = irop_get_vreg(*op);
+  m.vreg = vreg;
 
   /* ------------------------------------------------------------------ */
-  /* 1. Immediate constants                                               */
+  /* 1. Immediate constants & symbol references — jump table dispatch    */
   /* ------------------------------------------------------------------ */
-  if (tag == IROP_TAG_IMM32)
+  switch (tag)
   {
+  case IROP_TAG_IMM32:
     m.kind = MACH_OP_IMM;
     m.u.imm.val = (int64_t)irop_get_imm32(*op);
     return m;
-  }
-  if (tag == IROP_TAG_F32)
-  {
+  case IROP_TAG_F32:
     /* Store raw IEEE-754 bits; the backend decides how to encode them. */
     m.kind = MACH_OP_IMM;
     m.u.imm.val = (int64_t)(uint64_t)op->u.f32_bits;
     return m;
-  }
-  if (tag == IROP_TAG_I64 || tag == IROP_TAG_F64)
-  {
+  case IROP_TAG_I64:
+  case IROP_TAG_F64:
     m.kind = MACH_OP_IMM;
     m.u.imm.val = irop_get_imm64_ex(ir, *op);
     return m;
-  }
-
-  /* ------------------------------------------------------------------ */
-  /* 2. Symbol references                                                 */
-  /* ------------------------------------------------------------------ */
-  if (tag == IROP_TAG_SYMREF)
+  case IROP_TAG_SYMREF:
   {
     m.kind = MACH_OP_SYMBOL;
     IRPoolSymref *symref = irop_get_symref_ex(ir, *op);
@@ -105,13 +123,15 @@ MachineOperand machine_op_from_ir(TCCIRState *ir, const IROperand *op)
     m.needs_deref = (bool)op->is_lval;
     return m;
   }
+  default:
+    break;
+  }
 
   /* ------------------------------------------------------------------ */
   /* 3. Concrete stack slots (vreg < 0): locals, temp locals, and raw    */
   /*    stack-offset operands not assigned to a register.                */
   /*    fill_registers_ir returns early for these.                       */
   /* ------------------------------------------------------------------ */
-  const int vreg = irop_get_vreg(*op);
 
   if (vreg < 0 && (op->is_local || op->is_llocal || tag == IROP_TAG_STACKOFF))
   {
@@ -179,22 +199,19 @@ MachineOperand machine_op_from_ir(TCCIRState *ir, const IROperand *op)
     return m;
   }
 
-  if (!tcc_ir_vreg_is_valid(ir, vreg))
-  {
-    m.kind = MACH_OP_NONE;
-    return m;
-  }
-
-  IRLiveInterval *interval = tcc_ir_vreg_live_interval(ir, vreg);
+  IRLiveInterval *interval = machine_op_interval_for_vreg(ir, vreg);
   if (!interval)
   {
     m.kind = MACH_OP_NONE;
     return m;
   }
 
+  /* Cache vreg type — used twice below. */
+  const int vreg_type = TCCIR_DECODE_VREG_TYPE(vreg);
+
   /* Stack-passed parameters: if not allocated to a register, treat them as
    * residing in the incoming argument area. */
-  if (TCCIR_DECODE_VREG_TYPE(vreg) == TCCIR_VREG_TYPE_PARAM && interval->incoming_reg0 < 0 &&
+  if (vreg_type == TCCIR_VREG_TYPE_PARAM && interval->incoming_reg0 < 0 &&
       interval->allocation.r0 == PREG_NONE && interval->allocation.offset == 0)
   {
     m.kind = MACH_OP_PARAM_STACK;
@@ -215,24 +232,23 @@ MachineOperand machine_op_from_ir(TCCIRState *ir, const IROperand *op)
     return m;
   }
 
-  int is_register_param = (TCCIR_DECODE_VREG_TYPE(vreg) == TCCIR_VREG_TYPE_PARAM && interval->incoming_reg0 >= 0);
-
   /* Compute the final stack offset, applying the delta for locals that
-   * had a sub-component offset in the original operand. */
-  int32_t alloc_offset;
-  if (op->btype == IROP_BTYPE_STRUCT)
+   * had a sub-component offset in the original operand.
+   * Only apply the delta when the variable actually needs stack access
+   * (spilled or unallocated).  For register-allocated variables, the value
+   * lives in a register and the stack offset is irrelevant.  Applying the
+   * delta unconditionally can produce a spurious non-zero alloc_offset
+   * (e.g. when an inlined variable's IROperand carries a stale u.imm32)
+   * that makes a register-resident variable look spilled. */
+  int32_t alloc_offset = interval->allocation.offset;
+  bool needs_stack = (interval->allocation.r0 & PREG_SPILLED) ||
+                     interval->allocation.r0 == PREG_NONE ||
+                     alloc_offset != 0;
+  if (needs_stack && op->btype != IROP_BTYPE_STRUCT &&
+      (op->is_local || op->is_llocal) && !op->is_param && tag == IROP_TAG_STACKOFF)
   {
-    alloc_offset = interval->allocation.offset;
-  }
-  else if ((op->is_local || op->is_llocal) && !op->is_param && tag == IROP_TAG_STACKOFF)
-  {
-    int32_t old_stackoff = op->u.imm32;
-    int32_t delta = old_stackoff - interval->original_offset;
-    alloc_offset = interval->allocation.offset + delta;
-  }
-  else
-  {
-    alloc_offset = interval->allocation.offset;
+    int32_t delta = op->u.imm32 - interval->original_offset;
+    alloc_offset += delta;
   }
 
   bool is_spilled = (interval->allocation.r0 & PREG_SPILLED) || alloc_offset != 0;
@@ -320,9 +336,31 @@ MachineOperand machine_op_from_ir(TCCIRState *ir, const IROperand *op)
     m.u.reg.r0 = (int)(interval->allocation.r0 & PREG_REG_NONE);
     m.u.reg.r1 = m.is_64bit ? (int)(interval->allocation.r1 & PREG_REG_NONE) : -1;
 
+    /* VAR vregs can be recycled across scopes for variables of different
+     * types.  If the operand needs a register pair (is_64bit) but the
+     * interval was allocated as a single register, the allocation belongs
+     * to an earlier, narrower use.  Fall back to the STACKOFF path so the
+     * codegen loads from the stack instead of using a stale single-reg. */
+    if (m.is_64bit && m.u.reg.r1 == PREG_REG_NONE && tag == IROP_TAG_STACKOFF)
+    {
+      int32_t stack_off = irop_get_stack_offset(*op);
+      if (!op->is_lval)
+      {
+        m.kind = MACH_OP_FRAME_ADDR;
+        m.u.frame.offset = stack_off;
+      }
+      else
+      {
+        m.kind = MACH_OP_SPILL;
+        m.u.spill.offset = stack_off;
+        m.needs_deref = (bool)op->is_llocal;
+      }
+      return m;
+    }
+
     /* Preserve is_lval only for pointer derefs, not for locals promoted to reg. */
     int preserve_lval = 0;
-    if (op->is_lval && !op->is_const && !op->is_local && !op->is_llocal && !is_register_param)
+    if (op->is_lval && !op->is_const && !op->is_local && !op->is_llocal)
     {
       preserve_lval = 1;
     }
