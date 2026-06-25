@@ -559,7 +559,17 @@ int tcc_ir_opt_loop_bound_remat(TCCIRState *ir)
  * (typical signed-counted for/while loops).
  *
  * Returns 1 if transformed, 0 otherwise. */
+static int tcc_ir_opt_loop_unroll__timed(TCCIRState *ir);
 int tcc_ir_opt_loop_unroll(TCCIRState *ir)
+{
+  tcc_pass_timing_init();
+  if (!tcc_pass_timing_on) return tcc_ir_opt_loop_unroll__timed(ir);
+  unsigned long _t = tcc_pass_clk_us();
+  int _r = tcc_ir_opt_loop_unroll__timed(ir);
+  tcc_pass_timing_add("loop_unroll", tcc_pass_clk_us() - _t);
+  return _r;
+}
+static int tcc_ir_opt_loop_unroll__timed(TCCIRState *ir)
 {
   if (!ir || ir->next_instruction_index == 0)
     return 0;
@@ -721,7 +731,17 @@ int tcc_ir_opt_loop_unroll(TCCIRState *ir)
  *   [body_start .. body_end]: body instrs
  *   [body_end+1]:   JUMP latch_start           (body→latch) */
 
+static int tcc_ir_opt_loop_rotation__timed(TCCIRState *ir);
 int tcc_ir_opt_loop_rotation(TCCIRState *ir)
+{
+  tcc_pass_timing_init();
+  if (!tcc_pass_timing_on) return tcc_ir_opt_loop_rotation__timed(ir);
+  unsigned long _t = tcc_pass_clk_us();
+  int _r = tcc_ir_opt_loop_rotation__timed(ir);
+  tcc_pass_timing_add("loop_rotation", tcc_pass_clk_us() - _t);
+  return _r;
+}
+static int tcc_ir_opt_loop_rotation__timed(TCCIRState *ir)
 {
   if (!ir || ir->next_instruction_index == 0)
     return 0;

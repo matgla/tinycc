@@ -562,6 +562,11 @@ redo:
     perf_dump_print(1);
 #endif
 
+  {
+    extern void tcc_pass_timing_dump(void);
+    tcc_pass_timing_dump(); /* opt-in via TCC_PASS_TIMING env var; self-gates */
+  }
+
   tcc_delete(s);
 
   if (!done)

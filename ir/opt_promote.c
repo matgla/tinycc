@@ -1437,6 +1437,86 @@ int tcc_ir_opt_postinc_assign_fold(TCCIRState *ir)
   if (n < 2)
     return 0;
 
+  /* Pre-compute per-TEMP reference counts in O(n) so the single-use test
+   * below is O(1) instead of an O(n) rescan per candidate — that rescan made
+   * this pass O(n^2) and the single dominant compile-time cost on functions
+   * with many ASSIGN-of-VAR-to-TEMP loads (e.g. tight bit-counting loops).
+   * tmp_use[pos] counts every occurrence of a TEMP as src1, src2, or dest
+   * (dest is a USE for STORE-address / PARAM ops), mirroring the old scan.
+   * A foldable temp has exactly its single defining ASSIGN (one dest
+   * occurrence) plus its single real use, i.e. tmp_use[pos] == 2.  Folding
+   * only ever rewrites the candidate temp's own operand to a VAR, so it can
+   * only DEcrement that temp's count and never perturbs any other temp's
+   * count — the precomputed map stays valid across the mutations below. */
+  int max_tmp = 0;
+  for (int k = 0; k < n; k++)
+  {
+    IRQuadCompact *qk = &ir->compact_instructions[k];
+    if (qk->op == TCCIR_OP_NOP)
+      continue;
+    for (int slot = 0; slot < 3; slot++)
+    {
+      IROperand op;
+      if (slot == 0)
+      {
+        if (!irop_config[qk->op].has_src1)
+          continue;
+        op = tcc_ir_op_get_src1(ir, qk);
+      }
+      else if (slot == 1)
+      {
+        if (!irop_config[qk->op].has_src2)
+          continue;
+        op = tcc_ir_op_get_src2(ir, qk);
+      }
+      else
+      {
+        if (!irop_config[qk->op].has_dest)
+          continue;
+        op = tcc_ir_op_get_dest(ir, qk);
+      }
+      int32_t vr = irop_get_vreg(op);
+      if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP)
+      {
+        int p = TCCIR_DECODE_VREG_POSITION(vr);
+        if (p > max_tmp)
+          max_tmp = p;
+      }
+    }
+  }
+  int *tmp_use = tcc_mallocz(sizeof(int) * (size_t)(max_tmp + 1));
+  for (int k = 0; k < n; k++)
+  {
+    IRQuadCompact *qk = &ir->compact_instructions[k];
+    if (qk->op == TCCIR_OP_NOP)
+      continue;
+    for (int slot = 0; slot < 3; slot++)
+    {
+      IROperand op;
+      if (slot == 0)
+      {
+        if (!irop_config[qk->op].has_src1)
+          continue;
+        op = tcc_ir_op_get_src1(ir, qk);
+      }
+      else if (slot == 1)
+      {
+        if (!irop_config[qk->op].has_src2)
+          continue;
+        op = tcc_ir_op_get_src2(ir, qk);
+      }
+      else
+      {
+        if (!irop_config[qk->op].has_dest)
+          continue;
+        op = tcc_ir_op_get_dest(ir, qk);
+      }
+      int32_t vr = irop_get_vreg(op);
+      if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP)
+        tmp_use[TCCIR_DECODE_VREG_POSITION(vr)]++;
+    }
+  }
+
   for (int i = 0; i < n - 1; i++)
   {
     IRQuadCompact *q_assign = &ir->compact_instructions[i];
@@ -1507,41 +1587,14 @@ int tcc_ir_opt_postinc_assign_fold(TCCIRState *ir)
      * actually a USE (the memory address being written to), e.g.:
      *   T7***DEREF*** <-- T9 [STORE]   -- T7 provides the address
      * If T appears as a STORE dest, it has an additional use that would
-     * make our folding unsafe (the *q++ = t pattern). */
-    {
-      int use_count = 0;
-      int safe = 1;
-      for (int k = 0; k < n && safe; k++)
-      {
-        if (k == i) /* skip the ASSIGN we're considering */
-          continue;
-        IRQuadCompact *qk = &ir->compact_instructions[k];
-        if (qk->op == TCCIR_OP_NOP)
-          continue;
-
-        /* Check src1 and src2 */
-        if (irop_config[qk->op].has_src1 && irop_get_vreg(tcc_ir_op_get_src1(ir, qk)) == temp_vr)
-          use_count++;
-        if (irop_config[qk->op].has_src2 && irop_get_vreg(tcc_ir_op_get_src2(ir, qk)) == temp_vr)
-          use_count++;
-
-        /* Check dest operand — for STORE/STORE_INDEXED/STORE_POSTINC the
-         * dest provides the memory address (a USE, not a definition).
-         * For PARAM ops the dest provides the value being passed.
-         * Conservatively count any dest reference as a use. */
-        if (irop_config[qk->op].has_dest)
-        {
-          IROperand dest_op = tcc_ir_op_get_dest(ir, qk);
-          if (irop_get_vreg(dest_op) == temp_vr)
-            use_count++;
-        }
-
-        if (use_count > 1)
-          safe = 0;
-      }
-      if (!safe || use_count != 1)
-        continue;
-    }
+     * make our folding unsafe (the *q++ = t pattern).
+     *
+     * tmp_use[pos] (precomputed above) counts the defining ASSIGN's dest
+     * occurrence here plus every other reference of T; tmp_use == 2 means
+     * exactly one other reference, and we already confirmed above that it is
+     * B's src1.  Any STORE-address / extra use pushes the count past 2. */
+    if (tmp_use[TCCIR_DECODE_VREG_POSITION(temp_vr)] != 2)
+      continue;
 
     /* Safe to fold: replace T with V(is_lval) in B's src1, NOP A */
 
@@ -1555,6 +1608,7 @@ int tcc_ir_opt_postinc_assign_fold(TCCIRState *ir)
     changes++;
   }
 
+  tcc_free(tmp_use);
   return changes;
 }
 

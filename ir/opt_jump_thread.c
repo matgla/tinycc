@@ -10,6 +10,7 @@
 
 #define USING_GLOBALS
 #include "ir.h"
+#include "opt.h"
 #include "opt_engine.h"
 #include "opt_utils.h"
 
@@ -106,7 +107,17 @@ static int follow_jump_chain(TCCIRState *ir, int target_idx, uint8_t *visited)
 /* ============================================================================
  * Jump Threading - Forward jump targets through NOPs and jump chains
  * ============================================================================ */
+static int tcc_ir_opt_jump_threading__timed(TCCIRState *ir);
 int tcc_ir_opt_jump_threading(TCCIRState *ir)
+{
+  tcc_pass_timing_init();
+  if (!tcc_pass_timing_on) return tcc_ir_opt_jump_threading__timed(ir);
+  unsigned long _t = tcc_pass_clk_us();
+  int _r = tcc_ir_opt_jump_threading__timed(ir);
+  tcc_pass_timing_add("jump_threading", tcc_pass_clk_us() - _t);
+  return _r;
+}
+static int tcc_ir_opt_jump_threading__timed(TCCIRState *ir)
 {
   int n = ir->next_instruction_index;
   int changes = 0;

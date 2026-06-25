@@ -12980,13 +12980,30 @@ ST_FUNC void tcc_gen_machine_builtin_apply_mop(MachineOperand fn, MachineOperand
 {
   MachineCodegenContext ctx = {0};
 
-  /* Step 1: Load args block pointer into a callee-saved scratch register.
-   * We use the scratch allocator which will pick a suitable register. */
-  int args_reg = mach_ensure_in_reg(&ctx, &args, 0);
+  /* Registers destroyed by the restore-and-call sequence below: r0-r3 are
+   * reloaded with the saved argument values, and ip(r12)+lr are clobbered by
+   * the BLX.  The args-block base pointer (used by all four restore loads) and
+   * the callee address must therefore live OUTSIDE this set until used. */
+  const uint32_t clobbered =
+      (1u << R0) | (1u << R1) | (1u << R2) | (1u << R3) | (1u << (uint32_t)R_IP);
+
+  /* Step 1: Materialize the args block pointer, then guarantee it is in a
+   * register the restore loads won't overwrite.  mach_ensure_in_reg returns an
+   * already-allocated operand register verbatim (ignoring the exclusion mask),
+   * so when the value already lives in r0-r3 / ip we must relocate it to a
+   * safe scratch — otherwise the very first load (r0 <- [base+4]) destroys the
+   * base pointer and the remaining loads read from garbage addresses. */
+  int args_reg = mach_ensure_in_reg(&ctx, &args, clobbered);
+  if (clobbered & (1u << (uint32_t)args_reg))
+  {
+    int safe = mach_alloc_scratch(&ctx, clobbered);
+    ot_check_mov_reg(safe, args_reg, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
+    args_reg = safe;
+  }
 
   /* Step 2: Load the function pointer into R12 (IP), which survives the
    * register loads below because IP is not one of r0-r3. */
-  int fn_reg = mach_ensure_in_reg(&ctx, &fn, (1u << args_reg));
+  int fn_reg = mach_ensure_in_reg(&ctx, &fn, (1u << (uint32_t)args_reg));
   if (fn_reg != R_IP)
   {
     ot_check_mov_reg(R_IP, fn_reg, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);

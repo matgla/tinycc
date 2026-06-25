@@ -1229,6 +1229,8 @@ int change_callee_sym(TCCIRState *ir, int instr_idx, const char *new_name, int r
   Sym *new_sym = external_global_sym(tok_alloc_const(new_name), &ftype);
   if (!new_sym)
     return 0;
+  if (entry->sym == new_sym)
+    return 0; /* already this callee: report no change so the optimizer converges */
   entry->sym = new_sym;
   return 1;
 }
@@ -1246,6 +1248,8 @@ int change_callee_sym_keep_type(TCCIRState *ir, int instr_idx, const char *new_n
   new_sym = external_global_sym(tok_alloc_const(new_name), &entry->sym->type);
   if (!new_sym)
     return 0;
+  if (entry->sym == new_sym)
+    return 0; /* already this callee: report no change so the optimizer converges */
 
   entry->sym = new_sym;
   return 1;

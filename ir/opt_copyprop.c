@@ -11,13 +11,24 @@
 #define USING_GLOBALS
 
 #include "ir.h"
+#include "opt.h"
 #include "opt_engine.h"
 #include "opt_hash.h"
 #include "opt_du.h"
 #include "opt_utils.h"
 #include "licm.h"
 
+static int tcc_ir_opt_copy_prop__timed(TCCIRState *ir);
 int tcc_ir_opt_copy_prop(TCCIRState *ir)
+{
+  tcc_pass_timing_init();
+  if (!tcc_pass_timing_on) return tcc_ir_opt_copy_prop__timed(ir);
+  unsigned long _t = tcc_pass_clk_us();
+  int _r = tcc_ir_opt_copy_prop__timed(ir);
+  tcc_pass_timing_add("copy_prop", tcc_pass_clk_us() - _t);
+  return _r;
+}
+static int tcc_ir_opt_copy_prop__timed(TCCIRState *ir)
 {
   /* Track ASSIGN sources for TMP vregs.
    * A copy is: TMP:X <- VAR:Y or TMP:X <- PAR:Y (not TMP, not constant)

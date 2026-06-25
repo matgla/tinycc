@@ -887,4 +887,11 @@ void tcc_ir_free_switch_func_cache(struct TCCState *s);
  * tcc_ir_opt_const_call_replace; counts call sites it rewrote. */
 int tcc_ir_opt_switch_call_replace(struct TCCIRState *ir);
 
+/* Per-pass timing instrumentation (opt-in via TCC_PASS_TIMING env var). */
+extern signed char tcc_pass_timing_on;
+void tcc_pass_timing_init(void);
+unsigned long tcc_pass_clk_us(void);
+void tcc_pass_timing_add(const char *name, unsigned long us);
+void tcc_pass_timing_dump(void);
+
 #endif /* TCC_IR_OPT_H */

@@ -112,6 +112,7 @@ int tcc_ir_opt_run_group(IROptCtx *ctx, const IRPassGroup *group)
   int total_changes = 0;
   int iterations = group->max_iterations > 0 ? group->max_iterations : 1;
   int iter;
+  tcc_pass_timing_init();
 
   dbg_scan_imm_dest(ctx->ir, "<before-group>");
   dbg_scan_overlap(ctx->ir, "<before-group>");
@@ -124,8 +125,16 @@ int tcc_ir_opt_run_group(IROptCtx *ctx, const IRPassGroup *group)
       const IROptPass *trigger = &group->passes[group->trigger_idx];
       if (trigger->flag_offset && !*((unsigned char *)tcc_state + trigger->flag_offset))
         break;
-      pipeline_ensure_requirements(ctx, trigger->requires);
+      if (tcc_pass_timing_on > 0) {
+        unsigned long _rt = tcc_pass_clk_us();
+        pipeline_ensure_requirements(ctx, trigger->requires);
+        tcc_pass_timing_add("P:requirements", tcc_pass_clk_us() - _rt);
+      } else
+        pipeline_ensure_requirements(ctx, trigger->requires);
+      unsigned long _tt = tcc_pass_timing_on > 0 ? tcc_pass_clk_us() : 0;
       int tch = trigger->run(ctx);
+      if (tcc_pass_timing_on > 0)
+        tcc_pass_timing_add(trigger->name ? trigger->name : "P:trigger", tcc_pass_clk_us() - _tt);
       dbg_scan_imm_dest(ctx->ir, trigger->name);
       dbg_scan_overlap(ctx->ir, trigger->name);
       pipeline_trace_pass(group, trigger, iter, tch);
@@ -144,9 +153,17 @@ int tcc_ir_opt_run_group(IROptCtx *ctx, const IRPassGroup *group)
       if (pass->flag_offset && !*((unsigned char *)tcc_state + pass->flag_offset))
         continue;
 
-      pipeline_ensure_requirements(ctx, pass->requires);
+      if (tcc_pass_timing_on > 0) {
+        unsigned long _rt = tcc_pass_clk_us();
+        pipeline_ensure_requirements(ctx, pass->requires);
+        tcc_pass_timing_add("P:requirements", tcc_pass_clk_us() - _rt);
+      } else
+        pipeline_ensure_requirements(ctx, pass->requires);
 
+      unsigned long _pt = tcc_pass_timing_on > 0 ? tcc_pass_clk_us() : 0;
       int changes = pass->run(ctx);
+      if (tcc_pass_timing_on > 0)
+        tcc_pass_timing_add(pass->name ? pass->name : "P:pass", tcc_pass_clk_us() - _pt);
       dbg_scan_imm_dest(ctx->ir, pass->name);
       dbg_scan_overlap(ctx->ir, pass->name);
       if (changes > 0) {

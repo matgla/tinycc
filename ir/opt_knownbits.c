@@ -32,6 +32,7 @@
 #define USING_GLOBALS
 
 #include "ir.h"
+#include "opt.h"
 #include "opt_engine.h"
 #include "opt_utils.h"
 
@@ -82,9 +83,15 @@ static void kb_apply_store_width(int btype, uint32_t *kz, uint32_t *ko)
   *ko &= mask;
 }
 
-static void kb_apply_load_width(IROperand dest, uint32_t *kz, uint32_t *ko)
+/* btype/is_unsigned are passed as scalars (not the whole IROperand) on purpose:
+ * passing a 9-byte __attribute__((packed)) IROperand by value miscompiles on the
+ * self-hosted ARM cross — the 9th byte (the is_unsigned/flags byte) is dropped in
+ * the caller's argument marshalling, so an unsigned sub-word load would be read as
+ * signed and sign-extended (e.g. uint8_t 200 -> -56).  Reading the flags via a
+ * direct field access in the caller and passing the bit through a register-sized
+ * int sidesteps the bad struct-by-value path. */
+static void kb_apply_load_width(int btype, int is_unsigned, uint32_t *kz, uint32_t *ko)
 {
-  int btype = irop_get_btype(dest);
   uint32_t mask = kb_width_mask(btype);
 
   if (mask == 0xFFFFFFFFu)
@@ -94,7 +101,7 @@ static void kb_apply_load_width(IROperand dest, uint32_t *kz, uint32_t *ko)
   *ko &= mask;
 
   uint32_t high_mask = ~mask;
-  if (dest.is_unsigned)
+  if (is_unsigned)
   {
     *kz |= high_mask;
     return;
@@ -306,23 +313,29 @@ static int stack_kb_const32(const StackKB *slots, int n_slots, int current_gen,
   return 1;
 }
 
-static uint64_t kb_apply_const_width(uint64_t v, IROperand op)
+/* btype/is_unsigned are scalars, not a by-value IROperand: passing a 9-byte
+ * __attribute__((packed)) IROperand by value miscompiles on the self-hosted ARM
+ * cross (the 9th flags byte — is_unsigned/is_static/is_sym/is_param — is dropped
+ * in the caller's argument marshalling), so an unsigned sub-word value would be
+ * read as signed and sign-extended (uint8_t 200 -> -56).  Same hazard as
+ * kb_apply_load_width; callers read the flags by direct field access. */
+static uint64_t kb_apply_const_width(uint64_t v, int btype, int is_unsigned)
 {
-  switch (irop_get_btype(op))
+  switch (btype)
   {
   case IROP_BTYPE_INT8:
     v &= 0xFFu;
-    if (!op.is_unsigned && (v & 0x80u))
+    if (!is_unsigned && (v & 0x80u))
       v |= ~0xFFULL;
     return v;
   case IROP_BTYPE_INT16:
     v &= 0xFFFFu;
-    if (!op.is_unsigned && (v & 0x8000u))
+    if (!is_unsigned && (v & 0x8000u))
       v |= ~0xFFFFULL;
     return v;
   case IROP_BTYPE_INT32:
     v &= 0xFFFFFFFFu;
-    if (!op.is_unsigned && (v & 0x80000000u))
+    if (!is_unsigned && (v & 0x80000000u))
       v |= ~0xFFFFFFFFULL;
     return v;
   default:
@@ -330,35 +343,40 @@ static uint64_t kb_apply_const_width(uint64_t v, IROperand op)
   }
 }
 
-static int kb_operand_const_u64(const TCCIRState *ir, IROperand op,
+/* `op` is passed by pointer (not by value) so the byte-8 flags (is_unsigned via
+ * kb_apply_const_width) survive: a by-value 9-byte packed IROperand drops its 9th
+ * byte in the cross's caller-side arg marshalling.  irop_get_btype()/
+ * irop_is_immediate()/irop_get_imm64_ex() are called with *op (by value) but only
+ * read word-0/word-1 fields, which marshal correctly. */
+static int kb_operand_const_u64(const TCCIRState *ir, const IROperand *op,
                                 const TmpKB *tmp_kb, int max_tmp_pos,
                                 int current_gen,
                                 const VregAddrKB *var_addr, int max_var_pos,
                                 const StackKB *slots, int n_slots,
                                 uint64_t *out)
 {
-  if (irop_is_immediate(op) && !op.is_sym && !op.is_lval)
+  int btype = irop_get_btype(*op);
+  if (irop_is_immediate(*op) && !op->is_sym && !op->is_lval)
   {
     /* FLOAT immediates encode a pool index in u.imm32 rather than the bit
      * pattern of the value, so reading them as integers would yield the
      * index and silently corrupt later folds.  STRUCT immediates have no
      * scalar representation. */
-    int imm_btype = irop_get_btype(op);
-    if (imm_btype == IROP_BTYPE_FLOAT32 || imm_btype == IROP_BTYPE_FLOAT64 ||
-        imm_btype == IROP_BTYPE_STRUCT)
+    if (btype == IROP_BTYPE_FLOAT32 || btype == IROP_BTYPE_FLOAT64 ||
+        btype == IROP_BTYPE_STRUCT)
       return 0;
-    *out = kb_apply_const_width((uint64_t)irop_get_imm64_ex(ir, op), op);
+    *out = kb_apply_const_width((uint64_t)irop_get_imm64_ex(ir, *op), btype, op->is_unsigned);
     return 1;
   }
 
-  if (op.is_lval)
+  if (op->is_lval)
   {
     int32_t stack_off;
-    if (!kb_lval_stack_off(ir, op, tmp_kb, max_tmp_pos, var_addr, max_var_pos,
+    if (!kb_lval_stack_off(ir, *op, tmp_kb, max_tmp_pos, var_addr, max_var_pos,
                            current_gen, &stack_off))
       return 0;
 
-    if (irop_get_btype(op) == IROP_BTYPE_INT64)
+    if (btype == IROP_BTYPE_INT64)
     {
       uint32_t lo, hi;
       if (!stack_kb_const32(slots, n_slots, current_gen, stack_off, &lo) ||
@@ -368,20 +386,20 @@ static int kb_operand_const_u64(const TCCIRState *ir, IROperand op,
       return 1;
     }
 
-    if (irop_get_btype(op) != IROP_BTYPE_FLOAT32 &&
-        irop_get_btype(op) != IROP_BTYPE_FLOAT64 &&
-        irop_get_btype(op) != IROP_BTYPE_STRUCT)
+    if (btype != IROP_BTYPE_FLOAT32 &&
+        btype != IROP_BTYPE_FLOAT64 &&
+        btype != IROP_BTYPE_STRUCT)
     {
       uint32_t v;
       if (!stack_kb_const32(slots, n_slots, current_gen, stack_off, &v))
         return 0;
-      *out = kb_apply_const_width(v, op);
+      *out = kb_apply_const_width(v, btype, op->is_unsigned);
       return 1;
     }
     return 0;
   }
 
-  int32_t vr = irop_get_vreg(op);
+  int32_t vr = irop_get_vreg(*op);
   if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
     return 0;
 
@@ -390,7 +408,7 @@ static int kb_operand_const_u64(const TCCIRState *ir, IROperand op,
       !tmp_kb[pos].has_const)
     return 0;
 
-  *out = kb_apply_const_width(tmp_kb[pos].const_val, op);
+  *out = kb_apply_const_width(tmp_kb[pos].const_val, btype, op->is_unsigned);
   return 1;
 }
 
@@ -700,7 +718,17 @@ static int kb_compute(TccIrOp op, uint32_t a_kz, uint32_t a_ko,
 
 #define KB_MAX_STACK_SLOTS 32
 
+static int tcc_ir_opt_known_bits__timed(TCCIRState *ir);
 int tcc_ir_opt_known_bits(TCCIRState *ir)
+{
+  tcc_pass_timing_init();
+  if (!tcc_pass_timing_on) return tcc_ir_opt_known_bits__timed(ir);
+  unsigned long _t = tcc_pass_clk_us();
+  int _r = tcc_ir_opt_known_bits__timed(ir);
+  tcc_pass_timing_add("known_bits", tcc_pass_clk_us() - _t);
+  return _r;
+}
+static int tcc_ir_opt_known_bits__timed(TCCIRState *ir)
 {
   int n = ir->next_instruction_index;
 
@@ -989,7 +1017,7 @@ int tcc_ir_opt_known_bits(TCCIRState *ir)
             sop_btype == IROP_BTYPE_STRUCT)
           continue;
         uint64_t cv;
-        if (!kb_operand_const_u64(ir, sop, tmp_kb, max_tmp_pos, current_gen,
+        if (!kb_operand_const_u64(ir, &sop, tmp_kb, max_tmp_pos, current_gen,
                                   var_addr, max_var_pos,
                                   stack_slots, n_stack_slots, &cv))
           continue;
@@ -1188,11 +1216,11 @@ int tcc_ir_opt_known_bits(TCCIRState *ir)
       uint64_t cv1 = 0, cv2 = 0, cres = 0;
       int h1 = 0, h2 = 0;
       if (irop_config[op].has_src1)
-        h1 = kb_operand_const_u64(ir, s1, tmp_kb, max_tmp_pos, current_gen,
+        h1 = kb_operand_const_u64(ir, &s1, tmp_kb, max_tmp_pos, current_gen,
                                   var_addr, max_var_pos,
                                   stack_slots, n_stack_slots, &cv1);
       if (irop_config[op].has_src2)
-        h2 = kb_operand_const_u64(ir, s2, tmp_kb, max_tmp_pos, current_gen,
+        h2 = kb_operand_const_u64(ir, &s2, tmp_kb, max_tmp_pos, current_gen,
                                   var_addr, max_var_pos,
                                   stack_slots, n_stack_slots, &cv2);
       if (h1 && (!irop_config[op].has_src2 || h2) &&
@@ -1410,7 +1438,7 @@ recheck_wide:;
                        var_addr, max_var_pos,
                        stack_slots, n_stack_slots, &a_kz, &a_ko))
         {
-          kb_apply_load_width(dest, &a_kz, &a_ko);
+          kb_apply_load_width(irop_get_btype(dest), dest.is_unsigned, &a_kz, &a_ko);
           suppress_load_kb = ((a_kz | a_ko) != 0xFFFFFFFFu);
         }
         a_kz = 0;
@@ -1423,7 +1451,7 @@ recheck_wide:;
                              var_addr, max_var_pos,
                              stack_slots, n_stack_slots, &a_kz, &a_ko);
         if (have_kb && op == TCCIR_OP_LOAD)
-          kb_apply_load_width(dest, &a_kz, &a_ko);
+          kb_apply_load_width(irop_get_btype(dest), dest.is_unsigned, &a_kz, &a_ko);
       }
     }
     else if (op == TCCIR_OP_AND || op == TCCIR_OP_OR || op == TCCIR_OP_XOR)

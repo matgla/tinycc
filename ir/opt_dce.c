@@ -11,6 +11,7 @@
 #define USING_GLOBALS
 
 #include "ir.h"
+#include "opt.h"
 #include "opt_engine.h"
 #include "opt_xform.h"
 #include "opt_alias.h"
@@ -40,7 +41,17 @@ int tcc_ir_callee_is_noreturn(Sym *callee)
  * Removes unreachable instructions by following control flow from entry.
  * Returns 1 if any instructions were eliminated, 0 otherwise.
  */
+static int tcc_ir_opt_dce__timed(TCCIRState *ir);
 int tcc_ir_opt_dce(TCCIRState *ir)
+{
+  tcc_pass_timing_init();
+  if (!tcc_pass_timing_on) return tcc_ir_opt_dce__timed(ir);
+  unsigned long _t = tcc_pass_clk_us();
+  int _r = tcc_ir_opt_dce__timed(ir);
+  tcc_pass_timing_add("dce", tcc_pass_clk_us() - _t);
+  return _r;
+}
+static int tcc_ir_opt_dce__timed(TCCIRState *ir)
 {
   int n = ir->next_instruction_index;
   if (n == 0)
@@ -2779,7 +2790,17 @@ int tcc_ir_opt_compact_nops_ex(IROptCtx *ctx)
  * values that are cheap to rematerialize (small immediates).
  */
 
+static int tcc_ir_opt_dse__timed(TCCIRState *ir);
 int tcc_ir_opt_dse(TCCIRState *ir)
+{
+  tcc_pass_timing_init();
+  if (!tcc_pass_timing_on) return tcc_ir_opt_dse__timed(ir);
+  unsigned long _t = tcc_pass_clk_us();
+  int _r = tcc_ir_opt_dse__timed(ir);
+  tcc_pass_timing_add("dse", tcc_pass_clk_us() - _t);
+  return _r;
+}
+static int tcc_ir_opt_dse__timed(TCCIRState *ir)
 {
   int n = ir->next_instruction_index;
   if (n == 0)
@@ -5087,7 +5108,17 @@ int tcc_ir_opt_dead_trailing_addrvar_store_elim_ex(IROptCtx *ctx)
  * This catches patterns like repeated overflow flag stores where earlier
  * values are overwritten before use.
  */
+static int tcc_ir_opt_redundant_var_assign__timed(TCCIRState *ir);
 int tcc_ir_opt_redundant_var_assign(TCCIRState *ir)
+{
+  tcc_pass_timing_init();
+  if (!tcc_pass_timing_on) return tcc_ir_opt_redundant_var_assign__timed(ir);
+  unsigned long _t = tcc_pass_clk_us();
+  int _r = tcc_ir_opt_redundant_var_assign__timed(ir);
+  tcc_pass_timing_add("redundant_var_assign", tcc_pass_clk_us() - _t);
+  return _r;
+}
+static int tcc_ir_opt_redundant_var_assign__timed(TCCIRState *ir)
 {
   int n = ir->next_instruction_index;
   if (n == 0)
@@ -5419,7 +5450,17 @@ int tcc_ir_opt_redundant_init_elim(TCCIRState *ir)
 }
 
 
+static int tcc_ir_opt_dead_loop_elim__timed(TCCIRState *ir);
 int tcc_ir_opt_dead_loop_elim(TCCIRState *ir)
+{
+  tcc_pass_timing_init();
+  if (!tcc_pass_timing_on) return tcc_ir_opt_dead_loop_elim__timed(ir);
+  unsigned long _t = tcc_pass_clk_us();
+  int _r = tcc_ir_opt_dead_loop_elim__timed(ir);
+  tcc_pass_timing_add("dead_loop_elim", tcc_pass_clk_us() - _t);
+  return _r;
+}
+static int tcc_ir_opt_dead_loop_elim__timed(TCCIRState *ir)
 {
   int n = ir->next_instruction_index;
   int changes = 0;
@@ -5973,6 +6014,23 @@ static int udr_has_observable_side_effects(TCCIRState *ir)
  * before that back-edge, never the past-end epilogue.  Mirrors the noreturn
  * detection in tcc_ir_opt_noreturn_collapse, with switch-target coverage added.
  * Returns 0 (may return) whenever anything is uncertain. */
+
+/* Advance t past a run of NOP instructions (the IR's "deleted" placeholder),
+ * bounded by n.  Deliberately a separate, non-inlined function: when this skip
+ * loop was written inline and its counter came straight from a call return
+ * (irop_get_imm64_ex), the armv8m self-host cross dropped the loop-preheader
+ * copy of the call result (r0) into the loop-carried register, so the counter
+ * entered the loop as garbage and indexed compact_instructions[] wildly
+ * (gcc.c-torture execute/pr34099-2 -O2 HardFaulted in udr_observable_effect_
+ * reaches_return).  Passing the index as an ordinary parameter keeps the value
+ * off that miscompiled call-result→loop path. */
+static int udr_nopskip_target(const TCCIRState *ir, int t, int n)
+{
+  while (t < n && ir->compact_instructions[t].op == TCCIR_OP_NOP)
+    t++;
+  return t;
+}
+
 static int udr_function_provably_noreturn(TCCIRState *ir)
 {
   int n = ir->next_instruction_index;
@@ -6023,8 +6081,7 @@ static int udr_function_provably_noreturn(TCCIRState *ir)
       int jt = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
       if (jt < 0)
         return 0;
-      while (jt < n && ir->compact_instructions[jt].op == TCCIR_OP_NOP)
-        jt++;
+      jt = udr_nopskip_target(ir, jt, n);
       if (jt >= n || jt > last_idx)
         return 0; /* exits to the epilogue == a reachable return */
       break;
@@ -6040,8 +6097,7 @@ static int udr_function_provably_noreturn(TCCIRState *ir)
         int tgt = (e == t->num_entries) ? t->default_target : t->targets[e];
         if (tgt < 0)
           return 0;
-        while (tgt < n && ir->compact_instructions[tgt].op == TCCIR_OP_NOP)
-          tgt++;
+        tgt = udr_nopskip_target(ir, tgt, n);
         if (tgt >= n || tgt > last_idx)
           return 0;
       }
@@ -6123,12 +6179,7 @@ static int udr_observable_effect_reaches_return(TCCIRState *ir)
     }
   }
 
-#define UDR_NOPSKIP(t)                                                                                                  \
-  do                                                                                                                   \
-  {                                                                                                                    \
-    while ((t) < n && ir->compact_instructions[(t)].op == TCCIR_OP_NOP)                                                \
-      (t)++;                                                                                                           \
-  } while (0)
+#define UDR_NOPSKIP(t) ((t) = udr_nopskip_target(ir, (t), n))
 #define UDR_RR_GET(k) (reaches_ret[(k) / 8] & (1 << ((k) % 8)))
 
   uint8_t *reaches_ret = tcc_mallocz((n + 7) / 8);

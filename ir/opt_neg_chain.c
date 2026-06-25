@@ -95,6 +95,17 @@ int tcc_ir_opt_neg_chain_cse(TCCIRState *ir)
     first_neg[i] = -1;
   }
 
+  /* Merge points reset canon/first_pos/first_neg.  Clearing the whole tables
+   * (O(max_tmp)) at every branch join made this O(branches * temps) — quadratic
+   * on large straight-line functions (builtin-bitops' `main`) and a major
+   * on-target cost.  Instead record which entries were populated since the last
+   * reset and clear only those.  At most one canon and one first entry are
+   * recorded per instruction, so each list is bounded by n. */
+  int *touched_canon = (int *)tcc_malloc((size_t)n * sizeof(int));
+  int *touched_first = (int *)tcc_malloc((size_t)n * sizeof(int));
+  int n_touched_canon = 0;
+  int n_touched_first = 0;
+
   uint8_t *is_merge = ir_opt_build_merge_bitmap(ir, n);
 
   int changes = 0;
@@ -103,12 +114,16 @@ int tcc_ir_opt_neg_chain_cse(TCCIRState *ir)
   {
     if (is_merge[i / 8] & (1 << (i % 8)))
     {
-      memset(canon, 0, canon_size);
-      for (int j = 0; j <= max_tmp; j++)
+      for (int k = 0; k < n_touched_canon; k++)
+        canon[touched_canon[k]].valid = 0;
+      n_touched_canon = 0;
+      for (int k = 0; k < n_touched_first; k++)
       {
-        first_pos[j] = -1;
-        first_neg[j] = -1;
+        int bp = touched_first[k];
+        first_pos[bp] = -1;
+        first_neg[bp] = -1;
       }
+      n_touched_first = 0;
     }
 
     IRQuadCompact *q = &ir->compact_instructions[i];
@@ -206,6 +221,7 @@ int tcc_ir_opt_neg_chain_cse(TCCIRState *ir)
     canon[dest_pos].base_vr = base_vr;
     canon[dest_pos].sign = (uint8_t)sign;
     canon[dest_pos].valid = 1;
+    touched_canon[n_touched_canon++] = dest_pos;
 
     if (TCCIR_DECODE_VREG_TYPE(base_vr) == TCCIR_VREG_TYPE_TEMP)
     {
@@ -215,12 +231,18 @@ int tcc_ir_opt_neg_chain_cse(TCCIRState *ir)
         if (sign == 0)
         {
           if (first_pos[base_pos] < 0)
+          {
             first_pos[base_pos] = dest_vr;
+            touched_first[n_touched_first++] = base_pos;
+          }
         }
         else
         {
           if (first_neg[base_pos] < 0)
+          {
             first_neg[base_pos] = dest_vr;
+            touched_first[n_touched_first++] = base_pos;
+          }
         }
       }
     }
@@ -230,6 +252,8 @@ int tcc_ir_opt_neg_chain_cse(TCCIRState *ir)
   tcc_free(canon);
   tcc_free(first_pos);
   tcc_free(first_neg);
+  tcc_free(touched_canon);
+  tcc_free(touched_first);
   tcc_free(is_merge);
 
   return changes;

@@ -9,6 +9,7 @@
  */
 
 #include "licm.h"
+#include "opt.h"
 #include "cfg.h"
 #include "core.h"
 #include "pool.h"
@@ -2094,7 +2095,17 @@ int tcc_ir_opt_licm(TCCIRState *ir)
   return hoisted;
 }
 
-IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
+static IRLoops * tcc_ir_opt_licm_ex__timed(TCCIRState *ir);
+IRLoops * tcc_ir_opt_licm_ex(TCCIRState *ir)
+{
+  tcc_pass_timing_init();
+  if (!tcc_pass_timing_on) return tcc_ir_opt_licm_ex__timed(ir);
+  unsigned long _t = tcc_pass_clk_us();
+  IRLoops * _r = tcc_ir_opt_licm_ex__timed(ir);
+  tcc_pass_timing_add("licm_ex", tcc_pass_clk_us() - _t);
+  return _r;
+}
+static IRLoops *tcc_ir_opt_licm_ex__timed(TCCIRState *ir)
 {
   if (!ir)
     return NULL;

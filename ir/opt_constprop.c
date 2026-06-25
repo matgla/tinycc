@@ -11,6 +11,7 @@
 #define USING_GLOBALS
 
 #include "ir.h"
+#include "opt.h"
 #include "opt_engine.h"
 #include "opt_utils.h"
 #include "opt_du.h"
@@ -237,7 +238,17 @@ static int refresh_stale_var_addrtaken(TCCIRState *ir)
   return cleared;
 }
 
+static int tcc_ir_opt_const_var_prop__timed(TCCIRState *ir);
 int tcc_ir_opt_const_var_prop(TCCIRState *ir)
+{
+  tcc_pass_timing_init();
+  if (!tcc_pass_timing_on) return tcc_ir_opt_const_var_prop__timed(ir);
+  unsigned long _t = tcc_pass_clk_us();
+  int _r = tcc_ir_opt_const_var_prop__timed(ir);
+  tcc_pass_timing_add("const_var_prop", tcc_pass_clk_us() - _t);
+  return _r;
+}
+static int tcc_ir_opt_const_var_prop__timed(TCCIRState *ir)
 {
   int n = ir->next_instruction_index;
   int changes = 0;
@@ -1500,7 +1511,17 @@ static int eval_cmp_operand_const(TCCIRState *ir, IROperand op, int use_idx, uin
   return 0;
 }
 
+static int tcc_ir_opt_const_prop__timed(TCCIRState *ir);
 int tcc_ir_opt_const_prop(TCCIRState *ir)
+{
+  tcc_pass_timing_init();
+  if (!tcc_pass_timing_on) return tcc_ir_opt_const_prop__timed(ir);
+  unsigned long _t = tcc_pass_clk_us();
+  int _r = tcc_ir_opt_const_prop__timed(ir);
+  tcc_pass_timing_add("const_prop", tcc_pass_clk_us() - _t);
+  return _r;
+}
+static int tcc_ir_opt_const_prop__timed(TCCIRState *ir)
 {
   /* VarConstInfo: track constant variables */
   typedef struct
@@ -3103,7 +3124,17 @@ typedef struct
  * Beyond this limit, falls back to full scan. */
 #define VT_MAX_ADDRTAKEN 64
 
+static int tcc_ir_opt_value_tracking__timed(TCCIRState *ir);
 int tcc_ir_opt_value_tracking(TCCIRState *ir)
+{
+  tcc_pass_timing_init();
+  if (!tcc_pass_timing_on) return tcc_ir_opt_value_tracking__timed(ir);
+  unsigned long _t = tcc_pass_clk_us();
+  int _r = tcc_ir_opt_value_tracking__timed(ir);
+  tcc_pass_timing_add("value_tracking", tcc_pass_clk_us() - _t);
+  return _r;
+}
+static int tcc_ir_opt_value_tracking__timed(TCCIRState *ir)
 {
   int n = ir->next_instruction_index;
   int changes = 0;
@@ -5272,7 +5303,17 @@ int tcc_ir_opt_value_tracking(TCCIRState *ir)
 
 /* Range state for a single vreg slot */
 
+static int tcc_ir_opt_const_prop_tmp__timed(TCCIRState *ir);
 int tcc_ir_opt_const_prop_tmp(TCCIRState *ir)
+{
+  tcc_pass_timing_init();
+  if (!tcc_pass_timing_on) return tcc_ir_opt_const_prop_tmp__timed(ir);
+  unsigned long _t = tcc_pass_clk_us();
+  int _r = tcc_ir_opt_const_prop_tmp__timed(ir);
+  tcc_pass_timing_add("const_prop_tmp", tcc_pass_clk_us() - _t);
+  return _r;
+}
+static int tcc_ir_opt_const_prop_tmp__timed(TCCIRState *ir)
 {
   typedef struct
   {

@@ -366,6 +366,18 @@ int tcc_ir_opt_vrp(TCCIRState *ir)
   VRPRange *ranges = tcc_mallocz(vrp_ranges_bytes);
   VRPRange *deferred_ranges = tcc_mallocz(vrp_ranges_bytes);
 
+  /* `ranges`/`deferred_ranges` are 18 KB each and were unconditionally
+   * memset/memcpy'd at every branch, merge, and dominating jump — hundreds of
+   * times per function.  On the target's slow PSRAM heap that 18 KB-per-event
+   * clearing was the single largest compile cost (~44%) even though most
+   * functions never populate a single range (e.g. builtin-bitops' `main`, whose
+   * useful vrp work is reg-reg CMP folding that doesn't touch `ranges`).  Track
+   * whether each buffer currently holds any valid entry and skip the wipe/copy
+   * when it is already all-zero; fall back to the full operation when populated.
+   * ranges_dirty == 0 is the invariant "`ranges` is entirely .valid==0". */
+  int ranges_dirty = 0;
+  int deferred_dirty = 0;
+
   /* Pending fall-through constraint: applied at instruction pending_apply_at */
   int pending_apply_at = -1;
   int pending_slot = -1;
@@ -415,14 +427,27 @@ int tcc_ir_opt_vrp(TCCIRState *ir)
      * merge/pending handling below (neither of which can apply to it). */
     if (i == deferred_target)
     {
-      memcpy(ranges, deferred_ranges, vrp_ranges_bytes);
+      if (deferred_dirty)
+      {
+        memcpy(ranges, deferred_ranges, vrp_ranges_bytes);
+        ranges_dirty = 1;
+      }
+      else if (ranges_dirty)
+      {
+        memset(ranges, 0, vrp_ranges_bytes);
+        ranges_dirty = 0;
+      }
       deferred_target = -1;
     }
     /* At merge points: clear all ranges and discard pending constraint,
      * but re-apply the scoped equality constraint if still active. */
     else if (is_merge[i / 8] & (1 << (i % 8)))
     {
-      memset(ranges, 0, vrp_ranges_bytes);
+      if (ranges_dirty)
+      {
+        memset(ranges, 0, vrp_ranges_bytes);
+        ranges_dirty = 0;
+      }
       pending_apply_at = -1;
       pending_slot = -1;
       /* Scoped constraint re-apply disabled: not all merge points
@@ -443,6 +468,7 @@ int tcc_ir_opt_vrp(TCCIRState *ir)
         r->valid = 1;
         r->min_val = pending_min;
         r->max_val = pending_max;
+        ranges_dirty = 1;
       }
       pending_apply_at = -1;
       pending_slot = -1;
@@ -477,6 +503,7 @@ int tcc_ir_opt_vrp(TCCIRState *ir)
           ranges[dst_slot].valid = 1;
           ranges[dst_slot].min_val = new_min;
           ranges[dst_slot].max_val = new_max;
+          ranges_dirty = 1;
         }
         else if (dst_slot >= 0)
         {
@@ -744,6 +771,7 @@ int tcc_ir_opt_vrp(TCCIRState *ir)
                     ranges[bp_param_slot].valid = 1;
                     ranges[bp_param_slot].min_val = new_min;
                     ranges[bp_param_slot].max_val = new_max;
+                    ranges_dirty = 1;
                     eq_scope_src_slot = bp_param_slot;
                   }
                 }
@@ -867,6 +895,7 @@ int tcc_ir_opt_vrp(TCCIRState *ir)
               ranges[cmp_slot].valid = 1;
               ranges[cmp_slot].min_val = eq_scope_val;
               ranges[cmp_slot].max_val = eq_scope_val;
+              ranges_dirty = 1;
               have_range = 1;
             }
           }
@@ -929,11 +958,21 @@ int tcc_ir_opt_vrp(TCCIRState *ir)
         int t = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
         if (t > i && t < n && !(is_merge[t / 8] & (1 << (t % 8))))
         {
-          memcpy(deferred_ranges, ranges, vrp_ranges_bytes);
+          if (ranges_dirty)
+          {
+            memcpy(deferred_ranges, ranges, vrp_ranges_bytes);
+            deferred_dirty = 1;
+          }
+          else
+            deferred_dirty = 0;
           deferred_target = t;
         }
       }
-      memset(ranges, 0, vrp_ranges_bytes);
+      if (ranges_dirty)
+      {
+        memset(ranges, 0, vrp_ranges_bytes);
+        ranges_dirty = 0;
+      }
       pending_apply_at = -1;
       pending_slot = -1;
     }

@@ -360,61 +360,28 @@ int tcc_ir_opt_const_string_calls(TCCIRState *ir)
       continue;
     }
 
-    /* --- Simple redirects to __tcc_* helpers --- */
+    /* --- Simple redirects to __tcc_* helpers ---
+       A static id->name table instead of an inline switch: the switch made
+       this (large) function load ~14 distinct string-literal addresses via
+       pc-relative pooled loads plus a jump table, which tripped a literal-pool
+       placement miscompile in the self-hosted (cross-built) backend (a later
+       case's pool reference fell into code -> garbage helper pointer ->
+       strlen() crash). One array-base load + an indexed access sidesteps it. */
     {
+      static const char *const strbi_helper[] = {
+          [STRBI_MEMMOVE] = "__tcc_memmove", [STRBI_BCOPY] = "__tcc_bcopy",
+          [STRBI_MEMPCPY] = "__tcc_mempcpy", [STRBI_STRCAT] = "__tcc_strcat",
+          [STRBI_STRCHR] = "__tcc_strchr",   [STRBI_INDEX] = "__tcc_strchr",
+          [STRBI_STRCPY] = "__tcc_strcpy",   [STRBI_STPCPY] = "__tcc_stpcpy",
+          [STRBI_STPNCPY] = "__tcc_stpncpy", [STRBI_STRNLEN] = "__tcc_strnlen",
+          [STRBI_STRPBRK] = "__tcc_strpbrk", [STRBI_STRRCHR] = "__tcc_strrchr",
+          [STRBI_RINDEX] = "__tcc_strrchr",  [STRBI_STRSTR] = "__tcc_strstr",
+          [STRBI_STRCSPN] = "__tcc_strcspn", [STRBI_STRNCPY] = "__tcc_strncpy",
+          [STRBI_STRNCAT] = "__tcc_strncat",
+      };
       const char *helper = NULL;
-      switch (id)
-      {
-      case STRBI_MEMMOVE:
-        helper = "__tcc_memmove";
-        break;
-      case STRBI_BCOPY:
-        helper = "__tcc_bcopy";
-        break;
-      case STRBI_MEMPCPY:
-        helper = "__tcc_mempcpy";
-        break;
-      case STRBI_STRCAT:
-        helper = "__tcc_strcat";
-        break;
-      case STRBI_STRCHR:
-      case STRBI_INDEX:
-        helper = "__tcc_strchr";
-        break;
-      case STRBI_STRCPY:
-        helper = "__tcc_strcpy";
-        break;
-      case STRBI_STPCPY:
-        helper = "__tcc_stpcpy";
-        break;
-      case STRBI_STPNCPY:
-        helper = "__tcc_stpncpy";
-        break;
-      case STRBI_STRNLEN:
-        helper = "__tcc_strnlen";
-        break;
-      case STRBI_STRPBRK:
-        helper = "__tcc_strpbrk";
-        break;
-      case STRBI_STRRCHR:
-      case STRBI_RINDEX:
-        helper = "__tcc_strrchr";
-        break;
-      case STRBI_STRSTR:
-        helper = "__tcc_strstr";
-        break;
-      case STRBI_STRCSPN:
-        helper = "__tcc_strcspn";
-        break;
-      case STRBI_STRNCPY:
-        helper = "__tcc_strncpy";
-        break;
-      case STRBI_STRNCAT:
-        helper = "__tcc_strncat";
-        break;
-      default:
-        break;
-      }
+      if (id >= 0 && id < (int)(sizeof(strbi_helper) / sizeof(strbi_helper[0])))
+        helper = strbi_helper[id];
       if (helper)
       {
         if (change_callee_sym_keep_type(ir, i, helper))

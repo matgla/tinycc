@@ -1070,7 +1070,17 @@ static int sl_fwd_narrow_demand_only(TCCIRState *ir, int32_t target_vr, int star
  *   - Clear all pointer-based stores at unknown stores
  *   - Clear all stores at basic block boundaries and function calls
  */
+static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir);
 int tcc_ir_opt_sl_forward(TCCIRState *ir)
+{
+  tcc_pass_timing_init();
+  if (!tcc_pass_timing_on) return tcc_ir_opt_sl_forward__timed(ir);
+  unsigned long _t = tcc_pass_clk_us();
+  int _r = tcc_ir_opt_sl_forward__timed(ir);
+  tcc_pass_timing_add("sl_forward", tcc_pass_clk_us() - _t);
+  return _r;
+}
+static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
 {
   typedef struct StoreEntry
   {
@@ -6473,7 +6483,17 @@ int tcc_ir_opt_addrof_var_fwd(TCCIRState *ir)
  *   - a redefinition of the tracked T_val invalidates that entry
  *   - any BB boundary clears all entries
  */
+static int tcc_ir_opt_global_sl_fwd__timed(TCCIRState *ir);
 int tcc_ir_opt_global_sl_fwd(TCCIRState *ir)
+{
+  tcc_pass_timing_init();
+  if (!tcc_pass_timing_on) return tcc_ir_opt_global_sl_fwd__timed(ir);
+  unsigned long _t = tcc_pass_clk_us();
+  int _r = tcc_ir_opt_global_sl_fwd__timed(ir);
+  tcc_pass_timing_add("global_sl_fwd", tcc_pass_clk_us() - _t);
+  return _r;
+}
+static int tcc_ir_opt_global_sl_fwd__timed(TCCIRState *ir)
 {
   int n = ir->next_instruction_index;
   int changes = 0;

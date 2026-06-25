@@ -189,6 +189,13 @@ PUB_FUNC void *tcc_mallocz(unsigned long size)
 {
   void *ptr;
   ptr = tcc_malloc(size);
+  /* Always zero. A prior optimization skipped this memset on yasos-native,
+   * assuming malloc() always pre-zeroes — but that invariant is FALSE for bump
+   * allocations served from a RECYCLED pool: mk_pool() resets the pool's bump
+   * pointer (size = sizeof(*pool)) without re-zeroing the pool body, so those
+   * bytes still hold stale data. Skipping the memset therefore handed tcc
+   * non-zeroed memory and crashed self-host -O2 compiles (e.g. builtin-bitops-1:
+   * free() of a -1 sentinel read from a struct field that should have been 0). */
   if (size)
     memset(ptr, 0, size);
   return ptr;
