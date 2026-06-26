@@ -30,10 +30,68 @@ count_tests() {
     echo "  compile: $(ls "$TORTURE_DIR"/compile/*.c 2>/dev/null | wc -l)  execute: $(ls "$TORTURE_DIR"/execute/*.c 2>/dev/null | wc -l)"
 }
 
-# Already present (full or sparse checkout)? Nothing to do.
+# A handful of torture tests #include a file from a *sibling* testsuite
+# directory, e.g. execute/pr30314.c does
+#     #include "../../gcc.dg/tree-ssa/pr30314.c"
+# Those files live OUTSIDE the gcc.c-torture sparse path, so a sparse checkout
+# omits them and the compile fails with "include file '...' not found" (the test
+# harness uploads such includes to the device too, but only if they exist on
+# disk). Scan the checked-out tests for "../"-escaping quoted includes, resolve
+# each to a path inside this submodule, and sparse-add exactly those files. Loop
+# a few times so an included file that itself pulls in another out-of-tree file
+# is covered as well.
+#
+# No-op on a full checkout (every file is already present); guarded on the
+# sparse-checkout config so we never slow-scan a full gcc working tree.
+fetch_extra_includes() {
+    [ "$(git -C "$SUBMODULE_PATH" config --get core.sparseCheckout 2>/dev/null)" = "true" ] || return 0
+    local scan_dir="$SUBMODULE_PATH/gcc/testsuite"
+    [ -d "$scan_dir" ] || return 0
+
+    local pass
+    for pass in 1 2 3; do
+        local -a missing=()
+        local line file inc abs rel
+        # grep -H prints "FILE:#include "...""; split on the ":#" before the
+        # directive to recover the including file, then pull the quoted path.
+        while IFS= read -r line; do
+            file="${line%%:#*}"
+            inc="$(printf '%s\n' "$line" | sed -E 's/.*"([^"]+)".*/\1/')"
+            [ -n "$file" ] && [ -n "$inc" ] || continue
+            abs="$(realpath -m "$(dirname "$file")/$inc" 2>/dev/null)" || continue
+            case "$abs" in
+                "$SUBMODULE_PATH"/*) rel="${abs#"$SUBMODULE_PATH/"}" ;;
+                *) continue ;;  # include escapes the submodule entirely; skip
+            esac
+            [ -f "$SUBMODULE_PATH/$rel" ] || missing+=("$rel")
+        done < <(grep -rHoE --include='*.c' \
+                     '#[[:space:]]*include[[:space:]]*"\.\.[^"]*"' "$scan_dir" 2>/dev/null)
+
+        [ "${#missing[@]}" -eq 0 ] && return 0
+
+        local -a uniq=()
+        local m
+        while IFS= read -r m; do
+            [ -n "$m" ] && uniq+=("/$m")  # leading "/" anchors the no-cone pattern at repo root
+        done < <(printf '%s\n' "${missing[@]}" | sort -u)
+
+        echo "  fetching ${#uniq[@]} out-of-tree include file(s) referenced by torture tests"
+        # The repo is already in no-cone mode (set during sparse_fetch), so `add`
+        # inherits it; a partial clone lazily fetches the newly in-scope blobs.
+        git -C "$SUBMODULE_PATH" sparse-checkout add "${uniq[@]}" || {
+            echo "warning: could not sparse-add include files: ${uniq[*]}" >&2
+            return 0
+        }
+    done
+}
+
+# Already present (full or sparse checkout)? Nothing to fetch — but still make
+# sure the out-of-tree include files are there (a sparse checkout from before
+# this script learned to fetch them would be missing them).
 if [ -d "$TORTURE_DIR/compile" ] && [ -d "$TORTURE_DIR/execute" ]; then
     echo "GCC torture tests already available:"
     echo "  $TORTURE_DIR"
+    fetch_extra_includes
     count_tests
     exit 0
 fi
@@ -77,6 +135,10 @@ else
     rm -rf "${SUBMODULE_PATH:?}/.git"
     git -C "$SUPER_DIR" submodule update --init --depth 1 "$SUBMODULE_REL"
 fi
+
+# Fetch the few out-of-tree files torture tests #include (gcc.dg/, gcc.target/)
+# while the gitdir is still standalone and the just-fetched objects are local.
+fetch_extra_includes
 
 # Normalize the gitdir into the superproject's .git/modules layout so that
 # `git submodule status` and future submodule commands treat it like any other
