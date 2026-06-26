@@ -29,7 +29,32 @@ jobs:
 
       - name: Build and test
         shell: bash
+        env:
+          # Write a JUnit report from every pytest run (the final ir_tests run
+          # overwrites it last) so the failure collector knows which tests failed.
+          PYTEST_ADDOPTS: "--junitxml=/tmp/ci-junit.xml"
         run: |
           virtualenv .venv
           source .venv/bin/activate
-          make test -j$(nproc)
+          # `shell: bash` runs with -eo pipefail, so a failing make still fails
+          # the step even though its output is teed to a log we upload on failure.
+          make test -j$(nproc) 2>&1 | tee /tmp/make-test.log
+
+      - name: Collect failure artifacts
+        if: failure()
+        shell: bash
+        env:
+          MAKE_TEST_LOG: /tmp/make-test.log
+          PYTEST_JUNIT_XML: /tmp/ci-junit.xml
+        run: |
+          source .venv/bin/activate 2>/dev/null || true
+          bash scripts/collect_ci_failure_artifacts.sh "$PWD/ci-failure-artifacts"
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: make-test-failure-artifacts
+          path: ci-failure-artifacts.tar.gz
+          retention-days: 14
+          if-no-files-found: warn
