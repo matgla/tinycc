@@ -11,7 +11,7 @@ This is a specialized fork of **TinyCC (Tiny C Compiler)** targeting **ARMv8-M**
 ```bash
 # One-time setup
 ./configure
-git submodule update --init --depth 1 tests/gcctestsuite/gcc-testsuite  # optional GCC tests
+make download-gcc-tests  # optional: sparse-fetch GCC torture tests (~16 MB, not the full gcc repo)
 
 # Build ARMv8-M cross compiler
 make cross

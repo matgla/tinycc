@@ -165,8 +165,9 @@ Testing
 -------
 
 ```bash
-# Initialize GCC testsuite submodule (one-time)
-git submodule update --init --depth 1 tests/gcctestsuite/gcc-testsuite
+# Fetch the GCC torture tests (one-time). Only gcc.c-torture (~16 MB) is
+# pulled, sparsely, not the whole gcc repo (~1.3 GB):
+make download-gcc-tests        # or: bash tests/gcctestsuite/download_gcc_tests.sh
 
 # Run IR tests
 make test -j16
