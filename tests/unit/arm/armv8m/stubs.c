@@ -101,3 +101,52 @@ int set_elf_sym(struct Section *s, addr_t value, unsigned long size, int info, i
   (void)name;
   return 0;
 }
+
+/* get_tok_str is declared `const char *get_tok_str(int, CValue*)` in tcc.h and
+ * used by some opt passes only for diagnostic/symbol naming. Unit tests never
+ * inspect the result, so return a constant. CValue is opaque here (no tcc.h),
+ * hence the void* parameter — the linker resolves by name regardless. */
+const char *get_tok_str(int v, void *cv)
+{
+  (void)v;
+  (void)cv;
+  return "?";
+}
+
+/* ───── Frontend link stubs pulled in by optimizer passes ─────
+ *
+ * opt_constfold.c/opt_utils.c reference the symbol-table helpers below.
+ * They are unreachable at runtime for hand-built IR tests, but --gc-sections
+ * keeps them reachable from pass entry points, so the linker needs a
+ * definition.  Keep them opaque (no tcc.h) — pointer args/returns are enough.
+ */
+struct Sym;
+struct CType;
+
+struct Sym *global_stack = NULL;
+
+struct Sym *sym_push2(struct Sym **ps, int v, int t, int c)
+{
+  (void)ps; (void)v; (void)t; (void)c;
+  return NULL;
+}
+
+struct Sym *external_global_sym(int v, struct CType *type)
+{
+  (void)v; (void)type;
+  return NULL;
+}
+
+int tok_alloc_const(const char *str)
+{
+  (void)str;
+  return 0;
+}
+
+/* opt_dce.c (pulled in by the cmpfold suite) calls elfsym() on callee symbols.
+ * Hand-built IR has no real ELF symbols, so return NULL. */
+void *elfsym(void *s)
+{
+  (void)s;
+  return 0;
+}

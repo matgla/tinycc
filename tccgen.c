@@ -4065,6 +4065,29 @@ static void gen_opl(int op)
     /* FALLTHROUGH */
   case '*':
     t = vtop->type.t; /* Save type for lbuild at end */
+    /* Speculative / code-suppressed contexts (try_inline_const_eval, if(0)
+     * dead branches, constant-expression and data-only evaluation) run with
+     * nocode_wanted set, where tcc_ir_put is a no-op (see ir/core.c) and gv()
+     * is suppressed.  The generic 64x64 lexpand/lbuild expansion below assumes
+     * real register codegen and walks vtop off the vstack into the heap in
+     * that state.  No code is emitted here, so just collapse the two operands
+     * into a single 64-bit result, mirroring the +/-/&/|/^ IR paths above.
+     * (CODE_OFF_BIT-only dead code after return still needs real IR for
+     * backpatching, so exclude it — same predicate tcc_ir_put uses.) */
+    if (nocode_wanted & ~CODE_OFF_BIT)
+    {
+      vtop--;
+      vtop->type.t = VT_LLONG | (t & VT_UNSIGNED);
+      vtop->r = 0;
+      if (tcc_state->ir)
+      {
+        vtop->vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+        tcc_ir_set_llong_type(tcc_state->ir, vtop->vr);
+      }
+      else
+        vtop->vr = -1;
+      break;
+    }
     /* Widening-multiply peephole: when both 64-bit operands are 32->64
      * extensions (zero or sign), emit a single 32x32->64 UMULL/SMULL
      * instead of the generic 64x64 expansion. */

@@ -164,6 +164,13 @@ CHECKSUM_CMD = $(shell command -v sha256sum 2>/dev/null || command -v md5sum 2>/
 # proceed while still keeping ASan instrumentation.
 ifeq ($(CONFIG_asan),yes)
 SAN_ENV = LSAN_OPTIONS=detect_leaks=0 ASAN_OPTIONS=detect_leaks=0
+# TinyCC (like most compilers) intentionally does not free everything on exit,
+# so LSan's at-exit leak check would make every compiler invocation — including
+# each test compile under `make test` — exit non-zero.  Default leak detection
+# off (ASan still catches buffer overflows / use-after-free); override by
+# exporting your own [AL]SAN_OPTIONS.
+export LSAN_OPTIONS ?= detect_leaks=0
+export ASAN_OPTIONS ?= detect_leaks=0
 endif
 
 
@@ -338,18 +345,26 @@ endif
 	gcc -DC2STR $(filter %.c,$^) -o c2str.exe && ./c2str.exe $< $@
 
 # target specific object rules
-$(X)%.o : %.c $(LIBTCC_INC)
+# (depend on config.mak so toggling build flags — e.g. ASan via
+# ./configure [--disable-asan] — forces a recompile instead of silently
+# relinking stale, differently-instrumented objects)
+$(X)%.o : %.c $(LIBTCC_INC) config.mak
 	$S$(CC) -o $@ -c $< $(addsuffix ,$(DEFINES) $(CFLAGS))
 
 # Architecture library — built by nested Makefile
 TARGET_ARCH_NAME = $($T_ARCH)
 $(ARCH_LIB): FORCE
 	@mkdir -p $(dir $(ARCH_LIB))
+	@# Build flags changed (e.g. ASan toggled via configure)?  Drop stale objects
+	@# since the nested arch Makefile only tracks source timestamps, not flags.
+	@if [ -f "$(ARCH_LIB)" ] && [ config.mak -nt "$(ARCH_LIB)" ]; then \
+		rm -f $(dir $(ARCH_LIB))*.o "$(ARCH_LIB)"; \
+	fi
 	$S$(MAKE) --no-print-directory -C arch ARCH=$(TARGET_ARCH_NAME) \
 		TOP=$(CURDIR) BUILD_DIR=$(CURDIR)/$(dir $(ARCH_LIB)) \
 		CC="$(CC)" AR="$(AR)" CFLAGS="$(CFLAGS)" DEFINES="$(DEFINES)"
 
-$(X)ir/%.o : ir/%.c $(LIBTCC_INC)
+$(X)ir/%.o : ir/%.c $(LIBTCC_INC) config.mak
 	@mkdir -p $(dir $@)
 	$S$(CC) -o $@ -c $< $(addsuffix ,$(DEFINES) $(CFLAGS))
 

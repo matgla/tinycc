@@ -70,6 +70,12 @@ extern const char *ut_current_test;
     fprintf(stderr, "    %s %s\n", _ut_failed ? "FAIL" : "ok  ", #name);       \
   } while (0)
 
+/* Annotation: declares that the enclosing suite covers optimization pass
+ * <pass_name> (a string literal, e.g. UT_COVERS("neg_chain_cse")). Consumed by
+ * tests/unit/check_pass_coverage.py to build the pass-coverage ledger. Expands
+ * to a no-op statement so it can sit inside a UT_SUITE body. */
+#define UT_COVERS(pass_name) ((void)sizeof(pass_name))
+
 #define UT_SUITE(name) void ut_suite_##name(void)
 #define UT_DECLARE_SUITE(name) void ut_suite_##name(void)
 #define UT_RUN_SUITE(name)                                                     \

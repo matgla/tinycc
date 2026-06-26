@@ -28,8 +28,12 @@ UT_DEFINES := \
 	-DTCC_TARGET_ARM_THUMB \
 	-DTCC_TARGET_ARM_ARCHV8M
 
+# -ffunction-sections/-fdata-sections + -Wl,--gc-sections (link rule below) let
+# us pull the irop_config[] table out of the heavy ir/core.c without dragging in
+# its frontend functions (sym_push, vtop, ...) — unreferenced sections are GC'd.
 UT_CFLAGS := -std=c11 -g -O0 -Wall -Werror -Wno-unused-function \
 			 -Wno-declaration-after-statement \
+			 -ffunction-sections -fdata-sections \
 			 -I$(TOP) -I$(TOP)/ir -I$(UT_ROOT) $(UT_DEFINES)
 UT_DEPFLAGS := -MMD -MP
 
@@ -65,7 +69,25 @@ UT_MODULE_SRCS := \
 	$(TOP)/arch/arm/thumb/thop_mul.c \
 	$(TOP)/arch/arm/thumb/thop_mvn.c \
 	$(TOP)/arch/arm/thumb/thop_pld.c \
-	$(TOP)/arch/arm/thumb/thop_rev.c
+	$(TOP)/arch/arm/thumb/thop_rev.c \
+	$(TOP)/tccir_operand.c \
+	$(TOP)/ir/core.c \
+	$(TOP)/ir/opt_utils.c \
+	$(TOP)/ir/opt_neg_chain.c \
+	$(TOP)/ir/opt_knownbits.c \
+	$(TOP)/ir/opt_copyprop.c \
+	$(TOP)/ir/opt_cmp_fuse.c \
+	$(TOP)/ir/opt_constprop.c \
+	$(TOP)/ir/opt_du.c \
+	$(TOP)/ir/opt_constfold.c \
+	$(TOP)/ir/licm.c \
+	$(TOP)/ir/opt_jump_thread.c \
+	$(TOP)/ir/opt_setif_or_taut.c \
+	$(TOP)/ir/opt_dead_lea_store.c \
+	$(TOP)/ir/opt_dce.c \
+	$(TOP)/ir/opt.c \
+	$(TOP)/ir/opt_alias.c \
+	$(TOP)/ir/cfg.c
 
 UT_MODULE_OBJS := $(patsubst $(TOP)/%.c,$(BUILD_DIR)/%.o,$(UT_MODULE_SRCS))
 
@@ -83,6 +105,17 @@ UT_LOCAL_SRCS := \
 	test_ir_pool.c \
 	test_ir_type.c \
 	test_ir_vreg.c \
+	test_opt_neg_chain.c \
+	test_opt_knownbits.c \
+	test_opt_copyprop.c \
+	test_opt_cmp_fuse.c \
+	test_opt_cmpfold.c \
+	test_opt_constprop.c \
+	test_opt_constfold.c \
+	test_opt_licm.c \
+	test_opt_jump_thread.c \
+	test_opt_setif_or_taut.c \
+	test_opt_dead_lea_store.c \
 	test_thop_adr.c \
 	test_thop_alu_reg.c \
 	test_thop_block.c \
@@ -119,7 +152,7 @@ run: $(UT_BIN)
 
 $(UT_BIN): $(UT_OBJS)
 	@mkdir -p $(dir $@)
-	$(HOSTCC) -o $@ $^
+	$(HOSTCC) -Wl,--gc-sections -o $@ $^
 
 # Local source files → build/*.o
 $(BUILD_DIR)/%.o: %.c $(UT_ROOT)/ut.h Makefile
@@ -133,6 +166,11 @@ $(BUILD_DIR)/ir/%.o: $(TOP)/ir/%.c Makefile
 
 # libtcc.o — build from the tinycc source tree.
 $(BUILD_DIR)/libtcc.o: $(TOP)/libtcc.c Makefile
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(UT_CFLAGS) $(UT_DEPFLAGS) -c $< -o $@
+
+# tccir_operand.o — top-level source (pool getters for the opt-pass suites).
+$(BUILD_DIR)/tccir_operand.o: $(TOP)/tccir_operand.c Makefile
 	@mkdir -p $(dir $@)
 	$(HOSTCC) $(UT_CFLAGS) $(UT_DEPFLAGS) -c $< -o $@
 

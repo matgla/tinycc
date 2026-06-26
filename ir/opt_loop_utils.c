@@ -808,7 +808,14 @@ int insert_instr_at(TCCIRState *ir, int pos, TccIrOp op, IROperand dest, IROpera
   /* Create the new instruction using operand pool */
   IRQuadCompact *new_q = &ir->compact_instructions[pos];
   new_q->op = op;
-  new_q->orig_index = pos;
+  /* Assign a fresh unique orig_index — never re-use the compact position
+   * `pos`, which both collides with an existing instruction's key and is not
+   * reflected in ir->max_orig_index.  Side tables keyed by orig_index and
+   * sized max_orig_index+1 (ir->barrel_shifts[], shift64_dead_half[],
+   * bfi_params[], the codegen orig->code map) would otherwise be
+   * under-allocated and over-read in codegen.  Bumping max_orig_index keeps
+   * them sized to cover every live orig_index. */
+  new_q->orig_index = ++ir->max_orig_index;
   new_q->is_jump_target = 0; /* shifted instructions carry their flag; new slot has none */
   new_q->no_unroll = 0;
   new_q->line_num = 0;

@@ -149,21 +149,49 @@ static void ssa_var_info_free(SSAVarInfo *info)
   tcc_free(info->var_btype);
 }
 
-static uint8_t *ssa_build_promotable(const SSAVarInfo *info, int nb, int *out_count)
+/* Decide whether a local VAR should be promoted to SSA (and get phi nodes).
+ *
+ * Single-block CFG: no back-edges, so any non-addrtaken VAR is safely
+ * promotable to a TEMP via straight-line renaming — no phi placement needed.
+ * Enabling this lets GVN / cprop / DCE see local-variable defs in leaf
+ * functions.
+ *
+ * Multi-block CFG: a VAR defined in >=2 blocks (multi_block_def) needs phis and
+ * is promoted.  A VAR defined in only ONE block ALSO needs a phi when that def
+ * does not dominate all later uses — i.e. its def-block has a non-empty
+ * dominance frontier.  The classic case is a value defined only inside a loop
+ * and read again on the next iteration through the back-edge (the loop header
+ * is in the def-block's DF): without a phi it stays an unpromoted VAR with no
+ * loop-header definition, and the register allocator can hand it a register
+ * that is clobbered around the loop body (gcc-torture pr125291).  A value
+ * defined on one arm of a branch and read after the merge is the same shape.
+ * Promoting it is always safe: the phi resolver drops undef (vreg<0) operands,
+ * so a path that leaves the var genuinely uninitialized is unchanged. */
+static int ssa_var_promotable(const SSAVarInfo *info, IRCFG *cfg, int nb, int v,
+                              int single_block)
+{
+  if (bitset_test(info->addrtaken, v))
+    return 0;
+  if (single_block || bitset_test(info->multi_block_def, v))
+    return 1;
+  /* Single-block-def: promote iff a phi would actually be placed, i.e. some
+   * def-block has a non-empty dominance frontier. */
+  const uint8_t *def_bits = &info->def_blocks[v * info->block_bitset_bytes];
+  for (int b = 0; b < nb; b++) {
+    if (bitset_test(def_bits, b) && cfg->blocks[b].num_df > 0)
+      return 1;
+  }
+  return 0;
+}
+
+static uint8_t *ssa_build_promotable(const SSAVarInfo *info, IRCFG *cfg, int nb,
+                                     int *out_count)
 {
   int num_vars = info->num_vars;
-  /* Single-block CFG: no back-edges, so any non-addrtaken VAR is safely
-   * promotable to a TEMP via straight-line renaming — no phi placement
-   * needed.  Enabling this lets GVN / cprop / DCE see local-variable defs
-   * in leaf functions.  Multi-block CFGs must keep the multi_block_def
-   * criterion: a VAR defined in only one block but used across a back-edge
-   * still needs a phi at the loop header. */
   int single_block = (nb <= 1);
   int count = 0;
   for (int v = 0; v < num_vars; v++) {
-    if (bitset_test(info->addrtaken, v))
-      continue;
-    if (single_block || bitset_test(info->multi_block_def, v))
+    if (ssa_var_promotable(info, cfg, nb, v, single_block))
       count++;
   }
   *out_count = count;
@@ -172,9 +200,7 @@ static uint8_t *ssa_build_promotable(const SSAVarInfo *info, int nb, int *out_co
 
   uint8_t *is_promotable = tcc_mallocz((num_vars + 7) / 8);
   for (int v = 0; v < num_vars; v++) {
-    if (bitset_test(info->addrtaken, v))
-      continue;
-    if (single_block || bitset_test(info->multi_block_def, v))
+    if (ssa_var_promotable(info, cfg, nb, v, single_block))
       bitset_set(is_promotable, v);
   }
   return is_promotable;
@@ -255,7 +281,7 @@ IRSSAState *tcc_ir_ssa_construct(TCCIRState *ir, IRCFG *cfg)
   ssa_scan_var_defs(ir, cfg, &info);
 
   int promotable_count;
-  uint8_t *is_promotable = ssa_build_promotable(&info, nb, &promotable_count);
+  uint8_t *is_promotable = ssa_build_promotable(&info, cfg, nb, &promotable_count);
   if (!is_promotable) {
     ssa_var_info_free(&info);
     return NULL;
@@ -274,7 +300,11 @@ IRSSAState *tcc_ir_ssa_construct(TCCIRState *ir, IRCFG *cfg)
   int phi_counter = 0;
 
   for (int v = 0; v < num_vars; v++) {
-    if (!bitset_test(info.multi_block_def, v) || bitset_test(info.addrtaken, v))
+    /* Place phis for every promoted var (is_promotable already excludes
+     * addrtaken). For single-block-def vars this now also covers the ones kept
+     * as VARs before — loop-carried / branch-merge-live values that need a phi.
+     * In a single-block CFG the def-block has an empty DF, so this places none. */
+    if (!bitset_test(is_promotable, v))
       continue;
     uint8_t *def_bits = &info.def_blocks[v * bitset_bytes];
     phi_counter = ssa_place_phis_for_var(ssa, ir, cfg, v, info.var_btype[v], def_bits,
