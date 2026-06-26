@@ -620,6 +620,16 @@ typedef struct TCCIRState
    * Entry = lsb (bits 0-7) | (width << 8); width >= 1 so a real BFI entry is
    * never 0.  Consumed by tcc_gen_machine_bfi_mop. */
   uint16_t *bfi_params;
+
+  /* Codegen temporaries owned by tcc_ir_codegen_generate while it is running.
+   * They are normally freed before return; tcc_ir_free also releases them when
+   * a compile error longjmps out of codegen. */
+  int *codegen_return_jump_addrs;
+  int *codegen_dry_insn_scratch;
+  uint16_t *codegen_dry_insn_saves;
+  void *codegen_mop_cache;
+  uint32_t *codegen_cbz_dry_mapping;
+  uint8_t *codegen_branch_target_reset;
 } TCCIRState;
 
 TCCIRState *tcc_ir_allocate_block();
@@ -659,6 +669,10 @@ void tcc_ir_assign_physical_register(TCCIRState *ir, int vreg, int offset, int r
 const char *tcc_ir_get_op_name(TccIrOp op);
 void tcc_ir_show(TCCIRState *ir);
 void tcc_ir_dump_set_show_physical_regs(int show);
+/* -dump-ir-passes= helpers (shared by the legacy optimize loop in tccgen.c and
+ * the SSA optimizer driver in ir/opt/ssa_opt.c). */
+int tcc_ir_dump_passes_match(TCCState *s, const char *pass_name);
+void tcc_ir_dump_after_pass(TCCIRState *ir, const char *pass_name);
 void tcc_ir_set_addrtaken(TCCIRState *ir, int vreg);
 
 IRLiveInterval *tcc_ir_get_live_interval(TCCIRState *ir, int vreg);

@@ -3364,8 +3364,20 @@ static void ra_resolve_phis(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa)
    * builder (it tries to extend phi-dest intervals as if the phi were
    * still semantically active, on top of the now-explicit defs). */
   if (ra_phi_resolve_pre_ra_mode) {
-    for (int b = 0; b < nb; b++)
+    /* Free each block's phi list before detaching it — the explicit copies are
+     * now the source of truth, so these nodes are dead.  Merely NULLing the
+     * heads (as before) orphaned every phi node + operand array: tcc_ir_ssa_free
+     * later sees an empty block_phis and frees nothing, leaking on every compile. */
+    for (int b = 0; b < nb; b++) {
+      IRPhiNode *phi = ssa->block_phis[b];
+      while (phi) {
+        IRPhiNode *next = phi->next;
+        tcc_free(phi->operands);
+        tcc_free(phi);
+        phi = next;
+      }
       ssa->block_phis[b] = NULL;
+    }
     tcc_free(old_to_new);
     tcc_free(copies_per_block);
     tcc_free(copy_records);
@@ -4002,24 +4014,33 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
       if (had_promotable) {
         tcc_ir_ssa_opt_run(&ssa_opt_ctx);
       } else {
+        /* Run a pass, then make it observable to -dump-ir-passes=<name>
+         * golden snapshots (same names as the tcc_ir_ssa_opt_run driver). */
+#define RUN_SSA(name, call)                                                                                            \
+  do                                                                                                                   \
+  {                                                                                                                    \
+    (call);                                                                                                            \
+    tcc_ir_dump_after_pass(ir, name);                                                                                  \
+  } while (0)
         ssa_opt_ctx.no_stack_fwd = 0;
-        ssa_opt_var_const_fold(&ssa_opt_ctx);
-        ssa_opt_var_forward(&ssa_opt_ctx);
-        ssa_opt_sccp(&ssa_opt_ctx);
-        ssa_opt_load_cse(&ssa_opt_ctx);
-        ssa_opt_cprop(&ssa_opt_ctx);
-        ssa_opt_fold(&ssa_opt_ctx);
-        ssa_opt_branch(&ssa_opt_ctx);
-        ssa_opt_reassoc(&ssa_opt_ctx);
-        ssa_opt_strength(&ssa_opt_ctx);
-        ssa_opt_narrow(&ssa_opt_ctx);
-        ssa_opt_gvn(&ssa_opt_ctx);
-        ssa_opt_phi_simplify(&ssa_opt_ctx);
-        ssa_opt_dce(&ssa_opt_ctx);
+        RUN_SSA("ssa:var_const_fold", ssa_opt_var_const_fold(&ssa_opt_ctx));
+        RUN_SSA("ssa:var_forward", ssa_opt_var_forward(&ssa_opt_ctx));
+        RUN_SSA("ssa:sccp", ssa_opt_sccp(&ssa_opt_ctx));
+        RUN_SSA("ssa:load_cse", ssa_opt_load_cse(&ssa_opt_ctx));
+        RUN_SSA("ssa:cprop", ssa_opt_cprop(&ssa_opt_ctx));
+        RUN_SSA("ssa:fold", ssa_opt_fold(&ssa_opt_ctx));
+        RUN_SSA("ssa:branch", ssa_opt_branch(&ssa_opt_ctx));
+        RUN_SSA("ssa:reassoc", ssa_opt_reassoc(&ssa_opt_ctx));
+        RUN_SSA("ssa:strength", ssa_opt_strength(&ssa_opt_ctx));
+        RUN_SSA("ssa:narrow", ssa_opt_narrow(&ssa_opt_ctx));
+        RUN_SSA("ssa:gvn", ssa_opt_gvn(&ssa_opt_ctx));
+        RUN_SSA("ssa:phi_simplify", ssa_opt_phi_simplify(&ssa_opt_ctx));
+        RUN_SSA("ssa:dce", ssa_opt_dce(&ssa_opt_ctx));
         /* Target-specific fusions (MLA, LOAD/STORE_INDEXED on ARM). These
          * don't need promotable vars or phi nodes — they pattern-match on
          * existing TEMP vregs. */
         tcc_ir_ssa_opt_run_target(&ssa_opt_ctx);
+#undef RUN_SSA
       }
     } else {
       ssa_opt_cprop(&ssa_opt_ctx);

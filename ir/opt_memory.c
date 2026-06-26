@@ -4106,8 +4106,13 @@ static void rse_build_def_map(TCCIRState *ir)
         max_pos = p;
     }
   }
-  rse_def_map_size = max_pos + 1;
+  /* Release any map left over from an earlier build before overwriting the
+   * pointer.  tcc_ir_opt_const_memcpy_to_dest rebuilds the map after every
+   * successful rewrite, so without this the previous allocation would leak
+   * (tcc_free(NULL) is a no-op on the first/clean call). */
+  tcc_free(rse_def_map);
   rse_def_map = NULL;
+  rse_def_map_size = max_pos + 1;
   if (rse_def_map_size <= 0)
     return;
   rse_def_map = (int *)tcc_malloc(sizeof(int) * rse_def_map_size);

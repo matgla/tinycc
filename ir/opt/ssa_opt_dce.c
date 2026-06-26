@@ -729,6 +729,10 @@ static int dce_dead_phi_cycles(IRSSAOptCtx *ctx)
               vi->use_count--;
           }
           *pp = phi->next;
+          /* Free the unlinked node — it is no longer reachable from block_phis,
+           * so tcc_ir_ssa_free would otherwise never reclaim it. */
+          tcc_free(phi->operands);
+          tcc_free(phi);
           changes++;
           continue;
         }

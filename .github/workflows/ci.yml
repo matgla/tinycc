@@ -25,7 +25,10 @@ jobs:
           submodules: recursive
 
       - name: Configure
-        run: ./configure --enable-cross --enable-O2 
+        run: ./configure --enable-cross --enable-O2
+
+      - name: Source coverage ledger is complete
+        run: python3 tests/unit/gen_source_coverage.py --check
 
       - name: Build and test
         shell: bash

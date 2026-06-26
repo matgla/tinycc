@@ -6,6 +6,7 @@ This script runs test suites:
 - gcctestsuite/ - GCC torture tests (default)
 - ir_tests/ - IR-level tests (via --ir flag)
 - tests2/ - C compliance tests (via --tests2 flag, not all executable!)
+- frontend/ - Frontend tests (via --frontend flag)
 
 Note: tests2 tests are normally executed via ir_tests/test_qemu.py which runs
 a curated subset. Using --tests2 runs ALL tests2 tests, some may fail.
@@ -15,6 +16,7 @@ Usage:
     python run_tests.py --gcc                # Run only GCC torture tests
     python run_tests.py --ir                 # Run only IR tests
     python run_tests.py --tests2             # Run tests2 (not all executable!)
+    python run_tests.py --frontend           # Run frontend tests
     python run_tests.py --download-gcc       # Download GCC tests first
     python run_tests.py -v -x                # Verbose, stop on first failure
 
@@ -35,6 +37,7 @@ TESTS_DIR = Path(__file__).parent
 TESTS2_DIR = TESTS_DIR / "tests2"
 GCC_DIR = TESTS_DIR / "gcctestsuite"
 IR_DIR = TESTS_DIR / "ir_tests"
+FRONTEND_DIR = TESTS_DIR / "frontend"
 
 
 def run_pytest(test_dir: Path, markers: str = None, args: list = None, env: dict = None, verbose: bool = False) -> int:
@@ -82,6 +85,7 @@ Examples:
   python run_tests.py --gcc --compile-only # GCC compile tests only
   python run_tests.py --ir -n auto         # IR tests with parallel execution
   python run_tests.py --tests2             # Run tests2 (WARNING: not all executable!)
+  python run_tests.py --frontend           # Run frontend tests
         """
     )
 
@@ -92,6 +96,8 @@ Examples:
                         help="Run GCC torture tests")
     parser.add_argument("--ir", action="store_true",
                         help="Run IR tests")
+    parser.add_argument("--frontend", action="store_true",
+                        help="Run frontend tests")
     parser.add_argument("--download-gcc", action="store_true",
                         help="Download GCC torture tests first")
 
@@ -119,7 +125,7 @@ Examples:
 
     # If no specific test suite selected, run GCC torture tests only
     # Note: tests2 tests are executed via ir_tests, not directly
-    run_default = not (args.tests2 or args.gcc or args.ir)
+    run_default = not (args.tests2 or args.gcc or args.ir or args.frontend)
 
     # Download GCC tests if requested
     if args.download_gcc:
@@ -197,6 +203,13 @@ Examples:
         if args.numprocesses and "-n" not in ir_args:
             ir_args.extend(["-n", args.numprocesses])
         code = run_pytest(IR_DIR, marker_expr, ir_args, verbose=args.verbose)
+        exit_codes.append(code)
+
+    if args.frontend:
+        print("\n" + "="*60)
+        print("Running frontend tests")
+        print("="*60)
+        code = run_pytest(FRONTEND_DIR, marker_expr, pytest_args, verbose=args.verbose)
         exit_codes.append(code)
 
     # Summary

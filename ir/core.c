@@ -207,6 +207,35 @@ void tcc_ir_free(TCCIRState *ir)
     tcc_free(ir->parameters_live_intervals);
   }
 
+  if (ir->barrel_shifts)
+  {
+    tcc_free(ir->barrel_shifts);
+    ir->barrel_shifts = NULL;
+  }
+  if (ir->shift64_dead_half)
+  {
+    tcc_free(ir->shift64_dead_half);
+    ir->shift64_dead_half = NULL;
+  }
+  if (ir->bfi_params)
+  {
+    tcc_free(ir->bfi_params);
+    ir->bfi_params = NULL;
+  }
+
+  tcc_free(ir->codegen_return_jump_addrs);
+  ir->codegen_return_jump_addrs = NULL;
+  tcc_free(ir->codegen_dry_insn_scratch);
+  ir->codegen_dry_insn_scratch = NULL;
+  tcc_free(ir->codegen_dry_insn_saves);
+  ir->codegen_dry_insn_saves = NULL;
+  tcc_free(ir->codegen_mop_cache);
+  ir->codegen_mop_cache = NULL;
+  tcc_free(ir->codegen_cbz_dry_mapping);
+  ir->codegen_cbz_dry_mapping = NULL;
+  tcc_free(ir->codegen_branch_target_reset);
+  ir->codegen_branch_target_reset = NULL;
+
   if (ir->stack_layout.slots != NULL)
   {
     tcc_free(ir->stack_layout.slots);

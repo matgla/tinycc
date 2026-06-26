@@ -562,6 +562,12 @@ int tcc_ir_opt_loop_bound_remat(TCCIRState *ir)
 static int tcc_ir_opt_loop_unroll__timed(TCCIRState *ir);
 int tcc_ir_opt_loop_unroll(TCCIRState *ir)
 {
+  /* Finding #15: random-C differential seed 18 still exposes O2-only
+   * wrong-code through the loop unroller. Keep the pass disabled until the
+   * relocation/live-range handling is repaired; correctness beats the small
+   * code-size/speed win here. */
+  (void)ir;
+  return 0;
   tcc_pass_timing_init();
   if (!tcc_pass_timing_on) return tcc_ir_opt_loop_unroll__timed(ir);
   unsigned long _t = tcc_pass_clk_us();
@@ -734,6 +740,11 @@ static int tcc_ir_opt_loop_unroll__timed(TCCIRState *ir)
 static int tcc_ir_opt_loop_rotation__timed(TCCIRState *ir);
 int tcc_ir_opt_loop_rotation(TCCIRState *ir)
 {
+  /* Finding #15: loop rotation miscompiles O2 random-C checksum loops over
+   * local arrays (seeds 23 and 37). Disable the transform until its body
+   * relocation and downstream forwarding/coalescing invariants are fixed. */
+  (void)ir;
+  return 0;
   tcc_pass_timing_init();
   if (!tcc_pass_timing_on) return tcc_ir_opt_loop_rotation__timed(ir);
   unsigned long _t = tcc_pass_clk_us();

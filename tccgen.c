@@ -67,6 +67,56 @@ static int local_scope;
 static int func_param_decl_depth;
 ST_DATA char debug_modes;
 
+typedef struct FuncallScratch
+{
+  SValue *saved_args;
+  unsigned char **saved_args_cid;
+  int *saved_args_cid_size;
+  int saved_arg_count;
+  struct FuncallScratch *next;
+} FuncallScratch;
+
+static FuncallScratch *funcall_scratch_stack;
+
+static void funcall_scratch_free(FuncallScratch *fs)
+{
+  int i;
+
+  if (!fs)
+    return;
+  tcc_free(fs->saved_args);
+  for (i = 0; i < fs->saved_arg_count; i++)
+    tcc_free(fs->saved_args_cid[i]);
+  tcc_free(fs->saved_args_cid);
+  tcc_free(fs->saved_args_cid_size);
+  tcc_free(fs);
+}
+
+static void funcall_scratch_pop_free(FuncallScratch *fs)
+{
+  FuncallScratch **p;
+
+  for (p = &funcall_scratch_stack; *p; p = &(*p)->next)
+  {
+    if (*p == fs)
+    {
+      *p = fs->next;
+      break;
+    }
+  }
+  funcall_scratch_free(fs);
+}
+
+static void funcall_scratch_free_all(void)
+{
+  while (funcall_scratch_stack)
+  {
+    FuncallScratch *next = funcall_scratch_stack->next;
+    funcall_scratch_free(funcall_scratch_stack);
+    funcall_scratch_stack = next;
+  }
+}
+
 typedef struct PendingAliasDef
 {
   Sym *alias_sym;
@@ -1084,6 +1134,7 @@ ST_FUNC void tccgen_finish(TCCState *s1)
   tcc_ir_func_write_summary_clear_all();
   /* Same for the TU-wide read/call summary used by dead-static-store elim. */
   tcc_ir_tu_func_summary_clear_all();
+  funcall_scratch_free_all();
 
   tcc_free(pending_aliases);
   pending_aliases = NULL;
@@ -1630,6 +1681,11 @@ ST_FUNC void sym_pop(Sym **ptop, Sym *b, int keep)
       else
         ps = &ts->sym_identifier;
       *ps = s->prev_tok;
+    }
+    if (!keep && s->const_init_data)
+    {
+      tcc_free(s->const_init_data);
+      s->const_init_data = NULL;
     }
     /* Don't free symbols that have been exported to ELF (sym->c != 0)
        as they may still be referenced by IR instructions */
@@ -15722,9 +15778,15 @@ static void unary_funcall(void)
     if (pc > saved_args_cap)
       saved_args_cap = pc;
   }
-  SValue *saved_args = tcc_mallocz(saved_args_cap * sizeof(SValue));
-  unsigned char **saved_args_cid = tcc_mallocz(saved_args_cap * sizeof(unsigned char *));
-  int *saved_args_cid_size = tcc_mallocz(saved_args_cap * sizeof(int));
+  FuncallScratch *saved_scratch = tcc_mallocz(sizeof(*saved_scratch));
+  saved_scratch->saved_args = tcc_mallocz(saved_args_cap * sizeof(SValue));
+  saved_scratch->saved_args_cid = tcc_mallocz(saved_args_cap * sizeof(unsigned char *));
+  saved_scratch->saved_args_cid_size = tcc_mallocz(saved_args_cap * sizeof(int));
+  saved_scratch->next = funcall_scratch_stack;
+  funcall_scratch_stack = saved_scratch;
+  SValue *saved_args = saved_scratch->saved_args;
+  unsigned char **saved_args_cid = saved_scratch->saved_args_cid;
+  int *saved_args_cid_size = saved_scratch->saved_args_cid_size;
   int saved_arg_count = 0;
   int can_try_fold = 0;
   int can_inline_builtin = 0;
@@ -16194,6 +16256,7 @@ va_arg_pack_done:
             aapcs_last_const_init = NULL;
           }
           saved_arg_count++;
+          saved_scratch->saved_arg_count = saved_arg_count;
         }
         else
         {
@@ -16312,7 +16375,10 @@ va_arg_pack_done:
       {
         saved_args[nb_args - 1 - n] = *vtop;
         if (n == 0)
+        {
           saved_arg_count = nb_args;
+          saved_scratch->saved_arg_count = saved_arg_count;
+        }
       }
 
       /* We evaluate right-to-left; assign 0-based parameter indices
@@ -17506,11 +17572,8 @@ va_arg_pack_done:
       }
     }
   } /* end of else block for non-folded function calls */
-  tcc_free(saved_args);
-  for (int ci = 0; ci < saved_arg_count; ci++)
-    tcc_free(saved_args_cid[ci]);
-  tcc_free(saved_args_cid);
-  tcc_free(saved_args_cid_size);
+  saved_scratch->saved_arg_count = saved_arg_count;
+  funcall_scratch_pop_free(saved_scratch);
   if (s->f.func_noreturn)
   {
     if (debug_modes)
@@ -28038,7 +28101,7 @@ no_alloc:
   /* restore parse state if needed */
   if (init_str)
   {
-    end_macro();
+    end_macro_to(init_str);
     next();
   }
 
@@ -29019,41 +29082,14 @@ static void gen_instrument_call(Sym *cur_func_sym, const char *hook_name)
 }
 
 #ifdef CONFIG_TCC_DEBUG
-/* Returns 1 if `pass_name` matches the comma-separated list in
- * s->dump_ir_passes (or the list contains the special token "all").
- * Used by DUMP_AFTER_PASS to gate per-pass IR dumps. */
-static int dump_ir_passes_match(TCCState *s, const char *pass_name)
-{
-  if (!s->dump_ir_passes || !pass_name)
-    return 0;
-  const char *p = s->dump_ir_passes;
-  size_t name_len = strlen(pass_name);
-  while (*p)
-  {
-    const char *comma = strchr(p, ',');
-    size_t tok_len = comma ? (size_t)(comma - p) : strlen(p);
-    if (tok_len == 3 && !memcmp(p, "all", 3))
-      return 1;
-    if (tok_len == name_len && !memcmp(p, pass_name, name_len))
-      return 1;
-    if (!comma)
-      break;
-    p = comma + 1;
-  }
-  return 0;
-}
-
 /* If pass_name matches -dump-ir-passes selection, dump the IR labeled with
  * the pass name.  Intended to be called immediately after a
- * tcc_ir_opt_<name>() call to bisect which pass corrupts the IR. */
+ * tcc_ir_opt_<name>() call to bisect which pass corrupts the IR.  Thin wrapper
+ * over the shared implementation in ir/dump.c (also used by the SSA driver). */
 static void dump_ir_after_pass(TCCState *s, TCCIRState *ir, const char *pass_name)
 {
-  if (!dump_ir_passes_match(s, pass_name))
-    return;
-  tcc_ir_dump_set_show_physical_regs(0);
-  printf("=== AFTER %s ===\n", pass_name);
-  tcc_ir_show(ir);
-  printf("=== END AFTER %s ===\n", pass_name);
+  (void)s;
+  tcc_ir_dump_after_pass(ir, pass_name);
 }
 
 /* Run a pass call and dump if selected.  `expr` is the call, `name` is a

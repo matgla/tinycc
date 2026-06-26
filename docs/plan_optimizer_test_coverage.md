@@ -130,6 +130,22 @@ miscompile as a regression test, then broadening; register each in `test_main.c`
   is subsumed in SSA, diff old-path vs new-path `-dump-ir` for behavioral equivalence. Turns the
   risky merge into a green/red signal.
 
+### Phase G — Source-tree coverage ledger + generator
+Phases A–F focus on optimizer passes and codegen size levers, but most of the tinycc source tree
+(frontend, IR core, backend drivers, runtime libs) is only exercised indirectly by end-to-end
+QEMU/smoke tests. This phase adds a **file-level coverage ledger** so every TU knows which test
+layer covers it and which files have no dedicated coverage.
+- **`tests/unit/gen_source_coverage.py`** (new): scans tinycc source files, auto-maps unit suites to
+  their target TUs, reads `source_coverage_map.json`, and regenerates `SOURCE_COVERAGE.md`.
+- **`tests/unit/source_coverage_map.json`** (new): editable ledger mapping each source file to a
+  coverage kind (`unit`, `golden_ir`, `codegen_asm`, `ir_test`, `smoke`, `runtime_lib`, `tool`,
+  `partial`, `none`) and the covering test artifact(s).
+- **`tests/unit/SOURCE_COVERAGE.md`** (new/generated): human-readable report with summary stats and
+  per-layer tables.
+- **Goal:** every non-runtime source file is either covered by a unit/golden/asm test or explicitly
+  annotated as `ir_test`/`smoke`/`partial`/`none`; `gen_source_coverage.py --check` fails the CI job
+  when a new TU is missing from the map or when `SOURCE_COVERAGE.md` is stale.
+
 ## Risk-prioritized first batch
 Order = (historical-miscompile evidence) × (Phase-4 merge centrality) × (ease of isolated test):
 1. `opt_knownbits` 2. `opt_constfold` 3. `opt_constprop` 4. `opt_copyprop` 5. cmp-fold family
@@ -149,8 +165,10 @@ Order = (historical-miscompile evidence) × (Phase-4 merge centrality) × (ease 
 - `make ut` — all unit suites pass, `0 failed`; each Tier-1 suite **fails first** if its target
   fix is reverted (proves it bites).
 - `make test-opt` — golden-IR + codegen pytest modules pass; `--update` regenerates goldens.
-- `python tests/unit/check_pass_coverage.py` — prints the gap list; after Phase F exits non-zero
+- `python tests/unit/check_pass_coverage.py` — prints the pass gap list; after Phase F exits non-zero
   on any uncovered registered pass.
+- `python tests/unit/gen_source_coverage.py` — regenerates `SOURCE_COVERAGE.md`; after Phase G exits
+  non-zero on any tracked source file missing from `source_coverage_map.json`.
 - Determinism spot-check: run a golden case twice, confirm byte-identical `=== AFTER <pass> ===`.
 - No regression of the existing slow path: full `tests/smoke/tcc_suite_test.py` /
   `tests/ir_tests/test_qemu.py` still pass.
@@ -159,7 +177,9 @@ Order = (historical-miscompile evidence) × (Phase-4 merge centrality) × (ease 
 - **New:** `tests/unit/arm/armv8m/ir_build.{h,c}`,
   `tests/unit/arm/armv8m/test_opt_{knownbits,constfold,constprop,copyprop,cmpfold,licm}.c`;
   `tests/ir_tests/test_golden_ir.py`, `tests/ir_tests/golden/`; `tests/ir_tests/test_codegen_asm.py`;
-  `tests/unit/check_pass_coverage.py`, `tests/unit/PASS_COVERAGE.md`.
+  `tests/unit/check_pass_coverage.py`, `tests/unit/PASS_COVERAGE.md`;
+  `tests/unit/gen_source_coverage.py`, `tests/unit/source_coverage_map.json`,
+  `tests/unit/SOURCE_COVERAGE.md`.
 - **Modify:** `tests/unit/ut.h`, `tests/unit/arm/armv8m/Makefile`, `tests/unit/arm/armv8m/test_main.c`,
   `tests/unit/arm/armv8m/{stubs.c,tcc_state_stub.c}` (as link gaps surface), `Makefile`.
 - **Reuse (read, don't reinvent):** `tccir_operand.h` (`irop_make_*`), `tccir.h`

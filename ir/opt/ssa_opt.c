@@ -357,6 +357,24 @@ static void ssa_opt_rewrite_operand(IRSSAOptCtx *ctx, int instr_idx,
   }
 }
 
+static int ssa_opt_use_is_barrel_shift_src2(IRSSAOptCtx *ctx, IRSSAUse use,
+                                            int32_t old_vr)
+{
+  if (use.kind != SSA_USE_INSTR)
+    return 0;
+
+  TCCIRState *ir = ctx->ir;
+  IRQuadCompact *q = &ir->compact_instructions[use.idx];
+  if (!ir->barrel_shifts || q->orig_index < 0 ||
+      q->orig_index > ir->max_orig_index ||
+      ir->barrel_shifts[q->orig_index] == 0 ||
+      !irop_config[q->op].has_src2)
+    return 0;
+
+  IROperand src2 = tcc_ir_op_get_src2(ir, q);
+  return irop_get_vreg(src2) == old_vr;
+}
+
 static void ssa_opt_rewrite_phi_operand(IRSSAOptCtx *ctx, int block,
                                         int slot, int32_t old_vr,
                                         int32_t new_vr)
@@ -378,6 +396,16 @@ int ssa_opt_replace_all_uses(IRSSAOptCtx *ctx, int32_t old_vr, int32_t new_vr)
   IRSSAVregInfo *new_vi = ssa_opt_vinfo(ctx, new_vr);
   if (!old_vi)
     return 0;
+
+  /* ARM barrel-shift fusion encodes a hidden shift on an instruction's src2
+   * in ir->barrel_shifts[orig_index].  Replacing that src2 with another vreg
+   * or an immediate drops the implicit "this operand must be shifted" value
+   * identity from SSA's point of view.  Leave such defs in place so codegen
+   * still materializes the shift source exactly as fusion recorded it. */
+  for (int i = 0; i < old_vi->use_count; i++) {
+    if (ssa_opt_use_is_barrel_shift_src2(ctx, old_vi->uses[i], old_vr))
+      return 0;
+  }
 
   int count = 0;
   while (old_vi->use_count > 0) {
@@ -652,45 +680,42 @@ int tcc_ir_ssa_opt_run(IRSSAOptCtx *ctx)
   const int max_iterations = 5;
   int changes;
 
+  /* Run one SSA pass, accumulate its change count, then make it observable:
+   * dbg_scan_imm_dest() for the SCAN_IMM_DEST bug hunt and
+   * tcc_ir_dump_after_pass() for -dump-ir-passes=<name> golden snapshots
+   * (mirrors the legacy RUN_PASS macro in tccgen.c). */
+#define SSA_RUN(name, call)                                                                                            \
+  do                                                                                                                   \
+  {                                                                                                                    \
+    changes += (call);                                                                                                 \
+    dbg_scan_imm_dest(ctx->ir, name);                                                                                  \
+    tcc_ir_dump_after_pass(ctx->ir, name);                                                                             \
+  } while (0)
+
   do {
     changes = 0;
     iteration++;
 
     /* target-independent passes */
-    changes += ssa_opt_var_const_fold(ctx);
-    dbg_scan_imm_dest(ctx->ir, "ssa:var_const_fold");
-    changes += ssa_opt_sccp(ctx);
-    dbg_scan_imm_dest(ctx->ir, "ssa:sccp");
-    changes += ssa_opt_cprop(ctx);
-    dbg_scan_imm_dest(ctx->ir, "ssa:cprop");
+    SSA_RUN("ssa:var_const_fold", ssa_opt_var_const_fold(ctx));
+    SSA_RUN("ssa:sccp", ssa_opt_sccp(ctx));
+    SSA_RUN("ssa:cprop", ssa_opt_cprop(ctx));
     /* Collapse `V <- val [STORE]; ... PARAM V` into `... PARAM val` when V
      * has a single def and that lone PARAM as its only use.  Catches the
      * inlined-check1 pattern that spills printf args into VARs ahead of
      * the conditional branch even when only the FAIL path reads them. */
-    changes += ssa_opt_var_to_param_forward(ctx);
-    dbg_scan_imm_dest(ctx->ir, "ssa:var_to_param_forward");
-    changes += ssa_opt_fold(ctx);
-    dbg_scan_imm_dest(ctx->ir, "ssa:fold");
-    changes += ssa_opt_load_cse(ctx);
-    dbg_scan_imm_dest(ctx->ir, "ssa:load_cse");
-    changes += ssa_opt_branch(ctx);
-    dbg_scan_imm_dest(ctx->ir, "ssa:branch");
-    changes += ssa_opt_cmp_eq_prop(ctx);
-    dbg_scan_imm_dest(ctx->ir, "ssa:cmp_eq_prop");
-    changes += ssa_opt_reassoc(ctx);
-    dbg_scan_imm_dest(ctx->ir, "ssa:reassoc");
-    changes += ssa_opt_strength(ctx);
-    dbg_scan_imm_dest(ctx->ir, "ssa:strength");
-    changes += ssa_opt_narrow(ctx);
-    dbg_scan_imm_dest(ctx->ir, "ssa:narrow");
-    changes += ssa_opt_gvn(ctx);
-    dbg_scan_imm_dest(ctx->ir, "ssa:gvn");
-    changes += ssa_opt_phi_simplify(ctx);
-    dbg_scan_imm_dest(ctx->ir, "ssa:phi_simplify");
-    changes += ssa_opt_dead_loop(ctx);
-    dbg_scan_imm_dest(ctx->ir, "ssa:dead_loop");
-    changes += ssa_opt_dce(ctx);
-    dbg_scan_imm_dest(ctx->ir, "ssa:dce");
+    SSA_RUN("ssa:var_to_param_forward", ssa_opt_var_to_param_forward(ctx));
+    SSA_RUN("ssa:fold", ssa_opt_fold(ctx));
+    SSA_RUN("ssa:load_cse", ssa_opt_load_cse(ctx));
+    SSA_RUN("ssa:branch", ssa_opt_branch(ctx));
+    SSA_RUN("ssa:cmp_eq_prop", ssa_opt_cmp_eq_prop(ctx));
+    SSA_RUN("ssa:reassoc", ssa_opt_reassoc(ctx));
+    SSA_RUN("ssa:strength", ssa_opt_strength(ctx));
+    SSA_RUN("ssa:narrow", ssa_opt_narrow(ctx));
+    SSA_RUN("ssa:gvn", ssa_opt_gvn(ctx));
+    SSA_RUN("ssa:phi_simplify", ssa_opt_phi_simplify(ctx));
+    SSA_RUN("ssa:dead_loop", ssa_opt_dead_loop(ctx));
+    SSA_RUN("ssa:dce", ssa_opt_dce(ctx));
 
     /* target-specific generators (registered by backend) */
     if (target_gens && target_gen_count > 0)
@@ -698,6 +723,7 @@ int tcc_ir_ssa_opt_run(IRSSAOptCtx *ctx)
 
     total += changes;
   } while (changes > 0 && iteration < max_iterations);
+#undef SSA_RUN
 
   return total;
 }

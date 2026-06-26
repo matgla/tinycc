@@ -219,6 +219,13 @@ static int tcc_ir_opt_copy_prop__timed(TCCIRState *ir)
           LOG_COPY_PROP("Propagate src1 TMP:%d -> vreg:%d (lval=%d) at i=%d", pos,
                         TCCIR_DECODE_VREG_POSITION(copy_info[pos].source_vr), src1.is_lval, i);
           tcc_ir_set_src1(ir, i, replacement);
+          /* Keep the local in sync so the copy-recording step below sees the
+           * propagated source, not the stale original.  Otherwise an
+           * ASSIGN T2<-T1 rewritten to T2<-V0 is still recorded as T2<-V0's
+           * source = T1, leaving a T1 use that only collapses on a second pass
+           * (non-convergence). */
+          src1 = replacement;
+          src1_vr = irop_get_vreg(replacement);
           changes++;
         }
         else
@@ -256,6 +263,8 @@ static int tcc_ir_opt_copy_prop__timed(TCCIRState *ir)
           LOG_COPY_PROP("Propagate src2 TMP:%d -> vreg:%d (lval=%d) at i=%d", pos,
                         TCCIR_DECODE_VREG_POSITION(copy_info[pos].source_vr), src2.is_lval, i);
           tcc_ir_set_src2(ir, i, replacement);
+          src2 = replacement;
+          src2_vr = irop_get_vreg(replacement);
           changes++;
         }
       }
@@ -381,7 +390,7 @@ static int tcc_ir_opt_copy_prop__timed(TCCIRState *ir)
               (db != IROP_BTYPE_INT64 && db != IROP_BTYPE_FLOAT32 && db != IROP_BTYPE_FLOAT64 &&
                sb != IROP_BTYPE_INT64 && sb != IROP_BTYPE_FLOAT32 && sb != IROP_BTYPE_FLOAT64 &&
                db != IROP_BTYPE_INT8 && db != IROP_BTYPE_INT16 && sb != IROP_BTYPE_INT8 && sb != IROP_BTYPE_INT16);
-          if (!src_is_const && src1_vr >= 0 && !src1.is_lval && btype_compat &&
+          if (!src_is_const && src1_vr >= 0 && src1_vr != dest_vr && !src1.is_lval && btype_compat &&
               (src_vreg_type == TCCIR_VREG_TYPE_VAR || src_vreg_type == TCCIR_VREG_TYPE_PARAM ||
                src_vreg_type == TCCIR_VREG_TYPE_TEMP))
           {

@@ -580,7 +580,16 @@ int tcc_ir_opt_self_copy_elim(TCCIRState *ir)
         !ir_opt_get_call_param_operand(ir, i, 1, &p1))
       continue;
 
-    if (!ir_opt_pure_expr_equal(ir, p0, i, p1, i, 0))
+    /* Resolve each param's source at its own marshalling site, not at the call
+     * index.  If the source temp is redefined between param0 and param1, using
+     * the call index as the use-site for both collapses them to the same (last)
+     * reaching definition and the self-copy fold fires incorrectly. */
+    int p0_idx = ir_opt_get_call_param_index(ir, i, 0);
+    int p1_idx = ir_opt_get_call_param_index(ir, i, 1);
+    if (p0_idx < 0 || p1_idx < 0)
+      continue;
+
+    if (!ir_opt_pure_expr_equal(ir, p0, p0_idx, p1, p1_idx, 0))
       continue;
 
     /* Self-copy: NOP the param marshalling and the call itself.
@@ -1945,7 +1954,7 @@ static int rebuild_sim_env(const TCCFuncSwitchSnapshot *snap, int64_t arg_value,
     case TCCIR_OP_ADD:
     case TCCIR_OP_SUB:
     {
-      int64_t l, r1;
+      int64_t l = 0, r1 = 0;
       int rl = switch_sim_read_src(env, o, 1, &l);
       int rr = switch_sim_read_src(env, o, 2, &r1);
       if (rl == 0 || rr == 0) return 0;

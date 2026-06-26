@@ -23,6 +23,13 @@
  *   x - x, x ^ x → 0
  * ============================================================================ */
 
+static int has_barrel_shift_annotation(TCCIRState *ir, const IRQuadCompact *q)
+{
+  return ir->barrel_shifts && q->orig_index >= 0 &&
+         q->orig_index <= ir->max_orig_index &&
+         ir->barrel_shifts[q->orig_index] != 0;
+}
+
 /* Resolve a vreg operand back to its constant defining ASSIGN, if any.
  * In SSA a TEMP is single-def, so following its def to an ASSIGN #imm gives
  * the value the operand will carry at runtime.  Returns 1 and sets *out_val
@@ -68,6 +75,9 @@ static int fold_binary(IRSSAOptCtx *ctx, int idx)
   IROperand src1 = tcc_ir_op_get_src1(ir, q);
   IROperand src2 = tcc_ir_op_get_src2(ir, q);
   IROperand dest = tcc_ir_op_get_dest(ir, q);
+
+  if (has_barrel_shift_annotation(ir, q))
+    return 0;
 
   int32_t dest_vr = irop_get_vreg(dest);
   if (dest_vr < 0 || TCCIR_DECODE_VREG_TYPE(dest_vr) != TCCIR_VREG_TYPE_TEMP)

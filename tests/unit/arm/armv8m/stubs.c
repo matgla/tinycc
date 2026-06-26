@@ -103,13 +103,25 @@ int set_elf_sym(struct Section *s, addr_t value, unsigned long size, int info, i
 }
 
 /* get_tok_str is declared `const char *get_tok_str(int, CValue*)` in tcc.h and
- * used by some opt passes only for diagnostic/symbol naming. Unit tests never
- * inspect the result, so return a constant. CValue is opaque here (no tcc.h),
+ * used by name-gated optimizer passes (e.g. self_copy_elim, float_narrowing).
+ * The unit-test harness lets individual tests populate a token→name table so
+ * those passes can reach their positive folds.  CValue is opaque here (no tcc.h),
  * hence the void* parameter — the linker resolves by name regardless. */
+
+#define UTB_MAX_TOK 256
+static const char *utb_tok_names[UTB_MAX_TOK];
+
+void utb_set_tok_str(int tok, const char *name)
+{
+  if (tok >= 0 && tok < UTB_MAX_TOK)
+    utb_tok_names[tok] = name;
+}
+
 const char *get_tok_str(int v, void *cv)
 {
-  (void)v;
   (void)cv;
+  if (v >= 0 && v < UTB_MAX_TOK && utb_tok_names[v])
+    return utb_tok_names[v];
   return "?";
 }
 
@@ -134,6 +146,16 @@ struct Sym *sym_push2(struct Sym **ps, int v, int t, int c)
 struct Sym *external_global_sym(int v, struct CType *type)
 {
   (void)v; (void)type;
+  return NULL;
+}
+
+/* opt_constprop.c's global_init_prop pass calls sym_find(); it survives
+ * --gc-sections once the metamorphic suite references other opt_constprop
+ * passes, but it is never in the metamorphic pass list so it is not executed.
+ * Hand-built IR has no frontend symbol table, so report "not found". */
+struct Sym *sym_find(int v)
+{
+  (void)v;
   return NULL;
 }
 

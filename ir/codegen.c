@@ -1808,6 +1808,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
   memset(orig_ir_to_code_mapping, 0xFF, sizeof(uint32_t) * ir->orig_ir_to_code_mapping_size);
   /* Track addresses of return jumps for later backpatching to epilogue */
   int *return_jump_addrs = tcc_malloc(sizeof(int) * ir->next_instruction_index);
+  ir->codegen_return_jump_addrs = return_jump_addrs;
   int num_return_jumps = 0;
 
   /* --- DEBUG: catch codegen-time corruption of a spilled temp's allocation.r0.
@@ -2108,6 +2109,8 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
    * Both arrays are declared before #if so they are visible in both passes. */
   int *dry_insn_scratch = tcc_mallocz(ir->next_instruction_index * sizeof(int));
   uint16_t *dry_insn_saves = tcc_mallocz(ir->next_instruction_index * sizeof(uint16_t));
+  ir->codegen_dry_insn_scratch = dry_insn_scratch;
+  ir->codegen_dry_insn_saves = dry_insn_saves;
 
   /* ============================================================================
    * OPTION A: Skip dry-run for scratch-conflict-free functions
@@ -2286,6 +2289,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
   MopArgs *mop_cache = (!can_skip_dry_run && ir->next_instruction_index > 0)
                            ? tcc_malloc(ir->next_instruction_index * sizeof(MopArgs))
                            : NULL;
+  ir->codegen_mop_cache = mop_cache;
   int use_mop_cache = 0;
 
   const int pass_start = can_skip_dry_run ? 1 : 0;
@@ -2306,6 +2310,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
   if (ir->next_instruction_index > 0)
   {
     branch_target_reset = tcc_mallocz((size_t)ir->next_instruction_index);
+    ir->codegen_branch_target_reset = branch_target_reset;
     int has_indirect_jump = 0;
     for (int bi = 0; bi < ir->next_instruction_index; bi++)
     {
@@ -4218,6 +4223,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
       if (cbz_dry_mapping)
         tcc_free(cbz_dry_mapping);
       cbz_dry_mapping = tcc_malloc(ir->ir_to_code_mapping_size * sizeof(uint32_t));
+      ir->codegen_cbz_dry_mapping = cbz_dry_mapping;
       memcpy(cbz_dry_mapping, ir_to_code_mapping, ir->ir_to_code_mapping_size * sizeof(uint32_t));
 
       /* Check if LR was pushed during dry run in a leaf function */
@@ -4303,6 +4309,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
           /* Interval table was mutated: cached MopArgs are stale, discard. */
           tcc_free(mop_cache);
           mop_cache = NULL;
+          ir->codegen_mop_cache = NULL;
         }
         use_mop_cache = (mop_cache != NULL);
       }
@@ -4381,10 +4388,13 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
   }
 
   tcc_free(mop_cache);
+  ir->codegen_mop_cache = NULL;
   if (cbz_dry_mapping)
     tcc_free(cbz_dry_mapping);
+  ir->codegen_cbz_dry_mapping = NULL;
   if (branch_target_reset)
     tcc_free(branch_target_reset);
+  ir->codegen_branch_target_reset = NULL;
 
   ir_to_code_mapping[ir->next_instruction_index] = ind;
   orig_ir_to_code_mapping[ir->orig_ir_to_code_mapping_size - 1] = ind;
@@ -4420,8 +4430,11 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
   }
 
   tcc_free(return_jump_addrs);
+  ir->codegen_return_jump_addrs = NULL;
   tcc_free(dry_insn_saves);
+  ir->codegen_dry_insn_saves = NULL;
   tcc_free(dry_insn_scratch);
+  ir->codegen_dry_insn_scratch = NULL;
 }
 
 /* ============================================================================

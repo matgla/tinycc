@@ -2134,23 +2134,35 @@ static int tcc_ir_opt_const_prop__timed(TCCIRState *ir)
         result = (val1 != 0) || (val2 != 0) ? 1 : 0;
         break;
       case TCCIR_OP_IMOD:
-        if (val2 != 0)
+        if (val2 == 0)
+        {
+          can_fold = 0; /* Division by zero - don't fold */
+        }
+        else if (val2 == -1 &&
+                 ((btype == IROP_BTYPE_INT64 && val1 == INT64_MIN) ||
+                  (btype != IROP_BTYPE_INT64 && (int32_t)val1 == INT32_MIN)))
+        {
+          can_fold = 0; /* INT_MIN % -1 overflows in two's complement - bail */
+        }
+        else
         {
           result = val1 % val2;
         }
-        else
-        {
-          can_fold = 0; /* Division by zero - don't fold */
-        }
         break;
       case TCCIR_OP_DIV:
-        if (val2 != 0)
+        if (val2 == 0)
         {
-          result = val1 / val2;
+          can_fold = 0; /* Division by zero - don't fold */
+        }
+        else if (val2 == -1 &&
+                 ((btype == IROP_BTYPE_INT64 && val1 == INT64_MIN) ||
+                  (btype != IROP_BTYPE_INT64 && (int32_t)val1 == INT32_MIN)))
+        {
+          can_fold = 0; /* INT_MIN / -1 overflows in two's complement - bail */
         }
         else
         {
-          can_fold = 0; /* Division by zero - don't fold */
+          result = val1 / val2;
         }
         break;
       case TCCIR_OP_UDIV:
@@ -6200,6 +6212,16 @@ int tcc_ir_opt_cmp_expr_fold(TCCIRState *ir)
        * const-var-prop may leave behind `CMP symref(X), symref(X)` that the
        * vreg-based path below would skip because vr1 == vr2 == -1. */
       is_equal = ir_opt_nonvreg_expr_equal(ir, src1, src2);
+      /* Two integer immediates compare equal by value (e.g. `CMP #7, #7`).
+       * Scoped to the CMP-operand site (mirroring the asymmetric branch's
+       * manual check) rather than broadening the shared
+       * `ir_opt_nonvreg_expr_equal` helper, which would perturb its ADD/SUB
+       * base-equality callers.  Floats excluded (NaN != NaN). */
+      if (!is_equal && irop_is_immediate(src1) && irop_is_immediate(src2) &&
+          !src1.is_sym && !src2.is_sym &&
+          irop_get_btype(src1) != IROP_BTYPE_FLOAT32 && irop_get_btype(src1) != IROP_BTYPE_FLOAT64 &&
+          irop_get_btype(src2) != IROP_BTYPE_FLOAT32 && irop_get_btype(src2) != IROP_BTYPE_FLOAT64)
+        is_equal = irop_get_imm64_ex(ir, src1) == irop_get_imm64_ex(ir, src2);
       /* Fallback for symref-vs-symref: the strict check requires every flag
        * to match, but the two operands at a CMP can carry different
        * unsigned/is_lval encodings from how the frontend lowered each side
@@ -6290,7 +6312,7 @@ int tcc_ir_opt_cmp_expr_fold(TCCIRState *ir)
     }
     else
     {
-      if (vr1 < 0 || vr2 < 0 || vr1 == vr2)
+      if (vr1 < 0 || vr2 < 0)
         continue;
 
       /* Operand value-identity requires matching lval-ness: `*(p)` (a load
@@ -6300,15 +6322,33 @@ int tcc_ir_opt_cmp_expr_fold(TCCIRState *ir)
       if (src1.is_lval != src2.is_lval)
         continue;
 
-      /* Both operands must have a single reaching definition */
-      def1 = tcc_ir_find_defining_instruction(ir, vr1, i);
-      def2 = tcc_ir_find_defining_instruction(ir, vr2, i);
-      if (def1 < 0 || def2 < 0 || def1 == def2)
-        continue;
+      if (vr1 == vr2)
+      {
+        /* x OP x: a value compared against itself.  CMP is an integer compare
+         * (floats lower to FCMP), so a plain register value is always
+         * determinate — evaluate_compare_condition(0,0,tok) gives the result.
+         * Require matching width and signedness: `CMP x:I8, x:I32` compares a
+         * truncation against the full value and is NOT always equal.  A
+         * dereference *(V) OP *(V) could read a volatile location twice, so
+         * only fold the non-lval (register-value) form. */
+        if (src1.is_lval ||
+            irop_get_btype(src1) != irop_get_btype(src2) ||
+            src1.is_unsigned != src2.is_unsigned)
+          continue;
+        is_equal = 1;
+      }
+      else
+      {
+        /* Both operands must have a single reaching definition */
+        def1 = tcc_ir_find_defining_instruction(ir, vr1, i);
+        def2 = tcc_ir_find_defining_instruction(ir, vr2, i);
+        if (def1 < 0 || def2 < 0 || def1 == def2)
+          continue;
 
-      /* Try standard def equality (works for single-def vregs) */
-      if (DC_IS_SINGLE_DEF(dc, dc_stride, vr1) && DC_IS_SINGLE_DEF(dc, dc_stride, vr2))
-        is_equal = ir_opt_pure_def_equal(ir, def1, def2, 0);
+        /* Try standard def equality (works for single-def vregs) */
+        if (DC_IS_SINGLE_DEF(dc, dc_stride, vr1) && DC_IS_SINGLE_DEF(dc, dc_stride, vr2))
+          is_equal = ir_opt_pure_def_equal(ir, def1, def2, 0);
+      }
     }
 
     /* Pattern match: both defs are ADD/SUB with the same immediate, and
@@ -7319,22 +7359,13 @@ int tcc_ir_opt_single_value_tmp(TCCIRState *ir)
   }
 
   if (changes) {
-    for (int i = 0; i < n; i++) {
-      IRQuadCompact *q = &ir->compact_instructions[i];
-      if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
-        continue;
-      if (q->op != TCCIR_OP_ASSIGN && q->op != TCCIR_OP_LOAD)
-        continue;
-      IROperand d = tcc_ir_op_get_dest(ir, q);
-      int32_t dvr = irop_get_vreg(d);
-      if (dvr < 0 || TCCIR_DECODE_VREG_TYPE(dvr) != TCCIR_VREG_TYPE_TEMP)
-        continue;
-      int pos = TCCIR_DECODE_VREG_POSITION(dvr);
-      if (pos < count && state[pos] == 1) {
-        q->op = TCCIR_OP_NOP;
-        changes++;
-      }
-    }
+    /* Let DCE reclaim the now-dead constant defs.  Do NOT NOP them directly by
+     * state[pos] == 1: a single-value temp may still have uses OTHER than the
+     * RETURNVALUE we just folded (e.g. `OR T, #const` in a bitfield store),
+     * because Phase 2 only propagates into RETURNVALUE operands.  Blindly
+     * removing such a def leaves a dangling use → a use-before-def miscompile.
+     * DCE removes a def only when it has no remaining uses, which is exactly
+     * the condition we need. */
     changes += tcc_ir_opt_dce(ir);
   }
 

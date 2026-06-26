@@ -663,8 +663,18 @@ warn-check: armv8m-tcc$(EXESUF) patch-newlib
 	if [ "$$fail" -ne 0 ]; then exit 1; fi
 	@echo "------------ warn-check: passed ------------"
 
+# run frontend coverage tests
+# Fast, QEMU-free preprocessor / type-system / diagnostic golden tests.
+test-frontend: cross
+	@echo "------------ frontend tests ------------"
+	@if [ "$(USE_VENV)" = "1" ]; then \
+		cd $(TOP)/tests/frontend && "$(VENV_PY)" -m pytest -q; \
+	else \
+		cd $(TOP)/tests/frontend && $(PYTEST) -q; \
+	fi
+
 # run IR tests via pytest (preferred)
-test: cross test-aeabi-host test-asm warn-check test-venv test-prepare download-gcc-tests ut
+test: cross test-aeabi-host test-asm warn-check test-venv test-prepare download-gcc-tests ut test-frontend
 	@echo "------------ ir_tests (pytest) ------------"
 	@if [ "$(USE_VENV)" = "1" ]; then \
 		cd $(IRTESTS_DIR) && "$(VENV_PY)" -m pytest -s -n $(J) --durations=10; \
@@ -776,10 +786,15 @@ test-valgrind:
 ut:
 	$(MAKE) -C tests/unit run
 
+# gcov line/branch coverage report for the unit tests (requires gcovr).
+# Renders HTML + text under tests/unit/<target>/build/coverage/.
+ut-coverage:
+	$(MAKE) -C tests/unit coverage
+
 ut-clean:
 	$(MAKE) -C tests/unit clean
 
-.PHONY: all cross fp-libs clean test test-valgrind test-aeabi-host test-legacy test-tests2 test-gcc-torture test-gcc-torture-compile test-gcc-torture-execute test-full test-all rebuild-newlib download-gcc-tests tar tags ETAGS doc distclean install uninstall ut ut-clean FORCE
+.PHONY: all cross fp-libs clean test test-valgrind test-aeabi-host test-legacy test-tests2 test-gcc-torture test-gcc-torture-compile test-gcc-torture-execute test-full test-all rebuild-newlib download-gcc-tests tar tags ETAGS doc distclean install uninstall ut ut-coverage ut-clean FORCE
 
 # Container image settings (auto-detect docker or podman)
 DOCKER_REGISTRY ?= ghcr.io

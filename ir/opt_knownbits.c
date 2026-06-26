@@ -424,7 +424,7 @@ static IROperand kb_make_const_operand(TCCIRState *ir, uint64_t val, int btype)
   return irop_make_i64(-1, pool_idx, btype);
 }
 
-static int kb_const_compute(TccIrOp op, int dest_btype,
+static int kb_const_compute(TccIrOp op, int dest_btype, int src1_btype,
                             uint64_t a, uint64_t b, uint64_t *out)
 {
   int width = (dest_btype == IROP_BTYPE_INT64) ? 64 : 32;
@@ -434,9 +434,24 @@ static int kb_const_compute(TccIrOp op, int dest_btype,
   {
   case TCCIR_OP_ASSIGN:
   case TCCIR_OP_LOAD:
-  case TCCIR_OP_ZEXT:
     *out = a;
     break;
+  case TCCIR_OP_ZEXT:
+  {
+    /* Zero-extend from the SOURCE width. kb_operand_const_u64 sign-extends a
+     * signed source to 64 bits, so a verbatim copy would poison the high half
+     * (e.g. ZEXT(#-326:I32) must give 0x00000000FFFFFEBA, not ...FFFFFEBA). */
+    uint64_t src_mask;
+    switch (src1_btype)
+    {
+    case IROP_BTYPE_INT8:  src_mask = 0xFFULL;       break;
+    case IROP_BTYPE_INT16: src_mask = 0xFFFFULL;     break;
+    case IROP_BTYPE_INT32: src_mask = 0xFFFFFFFFULL; break;
+    default:               src_mask = ~0ULL;         break;
+    }
+    *out = a & src_mask;
+    break;
+  }
   case TCCIR_OP_ADD:
     *out = a + b;
     break;
@@ -460,7 +475,9 @@ static int kb_const_compute(TccIrOp op, int dest_btype,
   case TCCIR_OP_SHR:
     if (b >= (uint64_t)width)
       return 0;
-    *out = a >> b;
+    /* Logical shift: mask the source to the operation width first so the
+     * sign-extended high bits (for a 32-bit op) are not shifted in. */
+    *out = (a & mask) >> b;
     break;
   case TCCIR_OP_SAR:
     if (b >= (uint64_t)width)
@@ -1224,7 +1241,7 @@ static int tcc_ir_opt_known_bits__timed(TCCIRState *ir)
                                   var_addr, max_var_pos,
                                   stack_slots, n_stack_slots, &cv2);
       if (h1 && (!irop_config[op].has_src2 || h2) &&
-          kb_const_compute(op, dest_btype, cv1, cv2, &cres))
+          kb_const_compute(op, dest_btype, s1_btype, cv1, cv2, &cres))
       {
         IROperand imm = kb_make_const_operand(ir, cres, dest_btype);
         imm.is_unsigned = dest.is_unsigned;

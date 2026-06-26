@@ -3569,6 +3569,26 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
   if (body_count > 128)
     return 0;
 
+  /* Calls inside the rotated body make the carried live ranges cross a
+   * different control-flow shape after rotation.  Later forwarding/coalescing
+   * can then observe the preheader/body copies as interchangeable when the
+   * call-clobbered value is not.  Keep call-containing loops in their original
+   * top-tested form; simple call-free counted loops still rotate. */
+  for (int i = body_start; i <= body_end; i++)
+  {
+    int op = ir->compact_instructions[i].op;
+    if (op == TCCIR_OP_FUNCCALLVAL || op == TCCIR_OP_FUNCCALLVOID)
+    {
+      LOG_LOOP_OPT("Rotation: reject — body has call at %d", i);
+      return 0;
+    }
+    if (op == TCCIR_OP_LOAD_INDEXED || op == TCCIR_OP_STORE_INDEXED)
+    {
+      LOG_LOOP_OPT("Rotation: reject — body has indexed memory op at %d", i);
+      return 0;
+    }
+  }
+
   /* --- Step 4a2: Reject if body has a fall-through exit --- */
   /* When body_end_is_implicit, the body may end with trailing NOPs (from
    * eliminated fall-through jumps) after a JUMPIF.  In the original layout,
@@ -4008,4 +4028,3 @@ int loop_size_cmp(const void *a, const void *b)
   int sb = lb->end_idx - lb->start_idx;
   return sa - sb;
 }
-

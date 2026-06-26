@@ -1433,6 +1433,8 @@ void tcc_ir_barrel_shift_fusion(TCCIRState *ir)
 
       IROperand other = (attempt == 0) ? tcc_ir_op_get_src1(ir, q)
                                         : tcc_ir_op_get_src2(ir, q);
+      if (!irop_has_vreg(other))
+        continue;
       if (irop_has_vreg(other) && irop_get_vreg(other) == shift_src_vr)
         continue;
 
@@ -2992,4 +2994,3 @@ int tcc_ir_opt_assign_fuse(TCCIRState *ir)
 
 int tcc_ir_opt_postinc_fusion_ex(IROptCtx *ctx) { return tcc_ir_opt_postinc_fusion(ctx->ir); }
 int tcc_ir_opt_assign_fuse_ex(IROptCtx *ctx) { return tcc_ir_opt_assign_fuse(ctx->ir); }
-

@@ -99,7 +99,21 @@ fi
 # Resolve the submodule URL and the exact pinned commit from the superproject.
 URL="$(git -C "$SUPER_DIR" config -f .gitmodules "submodule.$SUBMODULE_REL.url" 2>/dev/null \
        || echo "https://github.com/gcc-mirror/gcc.git")"
-PIN="$(git -C "$SUPER_DIR" rev-parse "HEAD:$SUBMODULE_REL" 2>/dev/null || true)"
+
+# Read the pinned submodule commit from the superproject's HEAD tree. This is the
+# *only* fatal git operation against the superproject — if it yields nothing the
+# script refuses to run (see below) — so it must survive CI's most common gotcha:
+# the job container runs as root while the workspace was checked out by a
+# different uid, so git's "dubious ownership" guard makes every superproject git
+# command fail. That failure is otherwise swallowed by `2>/dev/null`, leaving PIN
+# empty and tripping the refuse-to-fetch guard. So on an empty result, register
+# the superproject as a safe directory and retry once before giving up.
+resolve_pin() { git -C "$SUPER_DIR" rev-parse "HEAD:$SUBMODULE_REL" 2>/dev/null; }
+PIN="$(resolve_pin || true)"
+if [ -z "$PIN" ]; then
+    git config --global --add safe.directory "$SUPER_DIR" 2>/dev/null || true
+    PIN="$(resolve_pin || true)"
+fi
 
 echo "URL:           $URL"
 echo "Pinned commit: ${PIN:-<unknown — will use default-branch tip>}"
