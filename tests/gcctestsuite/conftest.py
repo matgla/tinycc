@@ -88,6 +88,12 @@ GCC_XFAIL_TESTS = {
     # builtins/ tests — builtin override tests requiring lib/main.c framework
     # compile/ tests — compilation failures (parser, type system, unsupported features)
     # always_inline related failures (need proper fix for inline expansion)
+    # Confirmed real miscompile (not an unsupported feature): the function
+    # computes the wrong result at every -O level (xfail rather than skip so a
+    # future codegen fix shows up as an XPASS). Minimal repro: a while loop with
+    # `(short)` truncation, an unsigned-char shift count (`flagbyte >> flagbits`)
+    # and `& 3`; tcc returns 3 at -O0 and 2 at -O1/-O2 instead of 1.
+    "pr125291",
 }
 
 # GCC Torture tests expected to fail only at -O1
@@ -309,6 +315,12 @@ def should_skip_gcc_test(test_path: Path) -> Optional[str]:
     import re as _re
     skip_patterns = {
         "mipscop",
+        # __builtin_issignaling is not implemented by this tcc, so the gcc
+        # *-builtin-issignaling-1 torture family (plain plus the _Float16/
+        # _Float32/_Float64/_Float128/__bf16 variants, which also need those
+        # types) fails to compile with "implicit declaration". Skip on the
+        # feature token so future variants are covered automatically.
+        "__builtin_issignaling",
     }
     name = test_path.name.lower()
 
