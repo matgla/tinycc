@@ -985,6 +985,16 @@ static int ir_opt_pure_expr_equal_impl(TCCIRState *ir, IROperand a, int a_use_id
   if (a_tag != IROP_TAG_VREG || b_tag != IROP_TAG_VREG)
     return ir_opt_nonvreg_expr_equal(ir, a, b);
 
+  /* A dereferenced operand `*(V)` (is_lval) and a plain address operand `V`
+   * (not is_lval) are different values — one loads from memory, the other is
+   * the address itself — even when V resolves to the same definition.  Without
+   * this guard, `c->field0 + K` (value-of-load + K) is treated as equal to
+   * `&c->field0 + K` (== &c->fieldK, an address), which mis-folds comparisons
+   * like `(c->size + K) > c->size_allocated` to a constant when K is the
+   * byte offset between the two fields. */
+  if (a.is_lval != b.is_lval)
+    return 0;
+
   a_vr = irop_get_vreg(a);
   b_vr = irop_get_vreg(b);
   if (a_vr < 0 || b_vr < 0)

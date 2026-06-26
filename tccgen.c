@@ -27042,6 +27042,7 @@ static void decl_initializer(init_params *p, CType *type, unsigned long c, int f
         tcc_error("unhandled string literal merging");
       while (tok == TOK_STR || tok == TOK_LSTR)
       {
+        int tok_width = (tok == TOK_STR) ? 1 : (int)sizeof(nwchar_t);
         if (initstr.size)
           initstr.size -= size1;
         if (tok == TOK_STR)
@@ -27049,7 +27050,25 @@ static void decl_initializer(init_params *p, CType *type, unsigned long c, int f
         else
           len += tokc.str.size / sizeof(nwchar_t);
         len--;
-        cstr_cat(&initstr, tokc.str.data, tokc.str.size);
+        if (tok_width == size1)
+        {
+          cstr_cat(&initstr, tokc.str.data, tokc.str.size);
+        }
+        else if (size1 == (int)sizeof(nwchar_t) && tok == TOK_STR)
+        {
+          /* Mixing a narrow piece into a wide initializer (C permits e.g.
+           * `L"a" "b"`): widen each byte to an nwchar_t element instead of
+           * byte-copying it, which would otherwise be read back at the wider
+           * element stride below and over-read initstr. */
+          const unsigned char *np = (const unsigned char *)tokc.str.data;
+          for (int z = 0; z < tokc.str.size; z++)
+            cstr_wccat(&initstr, np[z]);
+        }
+        else
+        {
+          /* A wide piece in a narrow (char) array is not representable. */
+          tcc_error("unhandled string literal merging");
+        }
         next();
       }
       if (tok != ')' && tok != '}' && tok != ',' && tok != ';' && tok != TOK_EOF)

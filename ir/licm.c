@@ -177,8 +177,11 @@ IRLoops *tcc_ir_detect_loops(TCCIRState *ir)
       IROperand dest = tcc_ir_op_get_dest(ir, q);
       int target = (int)irop_get_imm64_ex(ir, dest);
 
-      /* Check if this is a backward jump (loop back edge) */
-      if (target < i)
+      /* Check if this is a backward jump (loop back edge).  The target must be
+       * a valid non-negative instruction index: an unresolved/sentinel dest can
+       * decode negative, which would make the loop body range [target, i] index
+       * before compact_instructions. */
+      if (target >= 0 && target < i)
       {
         /* Found a loop */
         if (loops->num_loops >= loops->capacity)

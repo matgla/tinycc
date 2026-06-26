@@ -6330,7 +6330,12 @@ int tcc_ir_opt_cmp_expr_fold(TCCIRState *ir)
           int32_t bvr1 = irop_get_vreg(base1);
           int32_t bvr2 = irop_get_vreg(base2);
 
-          if (bvr1 >= 0 && bvr2 >= 0)
+          /* A dereferenced base `*(V)` (is_lval) and a plain address base `V`
+           * are different values even when V resolves to the same definition.
+           * Without this, `*(p) + K` (loaded value + K) is equated with
+           * `p + K` (an address), mis-folding `(c->field0 + K) > c->fieldK`
+           * (K == field offset) to a constant. */
+          if (base1.is_lval == base2.is_lval && bvr1 >= 0 && bvr2 >= 0)
           {
             /* Same base vreg → equal */
             if (bvr1 == bvr2)
@@ -6577,11 +6582,18 @@ int tcc_ir_opt_cmp_const_offset_fold(TCCIRState *ir)
       IROperand ds1 = tcc_ir_op_get_src1(ir, dq);
       IROperand ds2 = tcc_ir_op_get_src2(ir, dq);
 
+      /* The CMP operand standing in for `b`.  The ADD base must match it in
+       * lval-ness too: `*(V)` (loaded value) and `V` (address) share a vreg
+       * but are different values, so `a = *(V) + K` does not make `a == V + K`
+       * provable from `b == V`. */
+      IROperand b_op = swap ? src1 : src2;
+
       /* Match `a = b + K` (or `a = K + b`, commutative ADD). */
       int64_t k = 0;
-      if (irop_get_vreg(ds1) == b && irop_is_immediate(ds2))
+      if (irop_get_vreg(ds1) == b && ds1.is_lval == b_op.is_lval && irop_is_immediate(ds2))
         k = irop_get_imm64_ex(ir, ds2);
-      else if (dq->op == TCCIR_OP_ADD && irop_get_vreg(ds2) == b && irop_is_immediate(ds1))
+      else if (dq->op == TCCIR_OP_ADD && irop_get_vreg(ds2) == b && ds2.is_lval == b_op.is_lval &&
+               irop_is_immediate(ds1))
         k = irop_get_imm64_ex(ir, ds1);
       else
         continue;
