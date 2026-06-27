@@ -270,6 +270,8 @@ int tcc_ls_find_free_scratch_reg(LSLiveIntervalState *ls, int instruction_idx, u
 {
   uint32_t live_regs = exclude_regs;
 
+  if (getenv("TCC_PARANOID_SCRATCH")) return PREG_NONE; /* TEMP: force push/pop for every scratch */
+
   LS_DBG("  Finding scratch register at instruction %d (is_leaf=%d)", instruction_idx, is_leaf);
   LS_DBG("    Exclude regs: 0x%x", exclude_regs);
 
@@ -282,27 +284,30 @@ int tcc_ls_find_free_scratch_reg(LSLiveIntervalState *ls, int instruction_idx, u
 
   live_regs |= (1 << 15);
 
+  /* Union the precomputed per-instruction bitmap with a fresh interval scan.
+   * ra_build_live_regs_bitmap deliberately OMITS any interval that carries a
+   * stack_location (it assumes a spilled value does not hold a register across
+   * its whole range).  That assumption is FALSE for a loop-carried value kept
+   * live in a register across the loop body while also owning a spill slot
+   * (r0 >= 0 AND stack_location != 0): the bitmap then under-reports that
+   * register as free, and the scratch picker can hand it out, clobbering the
+   * still-live value (random-C O2 wrong-code, Finding #15).  tcc_ls_compute_live_regs
+   * scans the intervals directly (ignoring stack_location) and DOES report it,
+   * so unioning the two is correct and strictly conservative: it can only mark
+   * MORE registers live, never fewer, so it can never introduce a new clobber. */
   if (ls->live_regs_by_instruction && instruction_idx >= 0 && instruction_idx < ls->live_regs_by_instruction_size)
-  {
     live_regs |= ls->live_regs_by_instruction[instruction_idx];
-    LS_DBG("    Using precomputed liveness: 0x%x", live_regs);
-  }
+
+  if (ls->cached_instruction_idx == instruction_idx)
+    live_regs |= ls->cached_live_regs;
   else
   {
-    if (ls->cached_instruction_idx == instruction_idx)
-    {
-      live_regs |= ls->cached_live_regs;
-      LS_DBG("    Using cached liveness: 0x%x", live_regs);
-    }
-    else
-    {
-      uint32_t computed = tcc_ls_compute_live_regs(ls, instruction_idx);
-      ls->cached_instruction_idx = instruction_idx;
-      ls->cached_live_regs = computed;
-      live_regs |= computed;
-      LS_DBG("    Computed live registers: 0x%x", live_regs);
-    }
+    uint32_t computed = tcc_ls_compute_live_regs(ls, instruction_idx);
+    ls->cached_instruction_idx = instruction_idx;
+    ls->cached_live_regs = computed;
+    live_regs |= computed;
   }
+  LS_DBG("    Liveness (bitmap ∪ interval-scan): 0x%x", live_regs);
 
   /* DEBUG: 90_struct scratch-divergence. At idx 70/75/80 (printf-arg LEAs) the
    * device returns PREG_NONE (R0-R3 all live) but QEMU returns R0 — diff the

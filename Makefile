@@ -675,8 +675,38 @@ test-frontend: cross
 		cd $(TOP)/tests/frontend && $(PYTEST) -q; \
 	fi
 
+# run linker/object coverage tests
+# Fast, QEMU-free readelf/objdump golden tests.
+test-linker: cross
+	@echo "------------ linker tests ------------"
+	@if [ "$(USE_VENV)" = "1" ]; then \
+		cd $(TOP)/tests/linker && "$(VENV_PY)" -m pytest -q; \
+	else \
+		cd $(TOP)/tests/linker && $(PYTEST) -q; \
+	fi
+
+# run debug-info coverage tests
+# Fast, QEMU-free DWARF/STAB readelf tests.
+test-debug: cross
+	@echo "------------ debug-info tests ------------"
+	@if [ "$(USE_VENV)" = "1" ]; then \
+		cd $(TOP)/tests/debug && "$(VENV_PY)" -m pytest -q; \
+	else \
+		cd $(TOP)/tests/debug && $(PYTEST) -q; \
+	fi
+
+# run runtime-library coverage tests
+# Host-native soft-FP tests plus cross-compiled runtime-helper reference tests.
+test-runtime: cross
+	@echo "------------ runtime-library tests ------------"
+	@if [ "$(USE_VENV)" = "1" ]; then \
+		cd $(TOP)/tests/runtime && "$(VENV_PY)" -m pytest -q; \
+	else \
+		cd $(TOP)/tests/runtime && $(PYTEST) -q; \
+	fi
+
 # run IR tests via pytest (preferred)
-test: cross test-aeabi-host test-asm warn-check test-venv test-prepare download-gcc-tests ut test-frontend
+test: cross test-aeabi-host test-asm warn-check test-venv test-prepare download-gcc-tests ut test-frontend test-linker test-debug test-runtime
 	@echo "------------ ir_tests (pytest) ------------"
 	@if [ "$(USE_VENV)" = "1" ]; then \
 		cd $(IRTESTS_DIR) && "$(VENV_PY)" -m pytest -s -n $(J) --durations=10; \
@@ -796,7 +826,7 @@ ut-coverage:
 ut-clean:
 	$(MAKE) -C tests/unit clean
 
-.PHONY: all cross fp-libs clean test test-valgrind test-aeabi-host test-legacy test-tests2 test-gcc-torture test-gcc-torture-compile test-gcc-torture-execute test-full test-all rebuild-newlib download-gcc-tests tar tags ETAGS doc distclean install uninstall ut ut-coverage ut-clean FORCE
+.PHONY: all cross fp-libs clean test test-valgrind test-aeabi-host test-legacy test-tests2 test-gcc-torture test-gcc-torture-compile test-gcc-torture-execute test-full test-all test-frontend test-linker test-debug test-runtime rebuild-newlib download-gcc-tests tar tags ETAGS doc distclean install uninstall ut ut-coverage ut-clean FORCE
 
 # Container image settings (auto-detect docker or podman)
 DOCKER_REGISTRY ?= ghcr.io

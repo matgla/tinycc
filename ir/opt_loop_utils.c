@@ -2246,8 +2246,17 @@ int collect_body_instructions(TCCIRState *ir, IRLoop *loop, int iv_vreg, int cmp
   /* Scan only [start_idx..end_idx].  The forward-jump extension in the loop
    * detector can pull in post-loop instructions (e.g. the exit target), which
    * must NOT be treated as body.  The merge pass already ensures end_idx
-   * covers all body instructions from overlapping loops. */
-  for (int i = loop->start_idx; i <= loop->end_idx && count < max_body; i++)
+   * covers all body instructions from overlapping loops.
+   *
+   * Scan the FULL range — do NOT stop at max_body.  Stopping early would
+   * silently TRUNCATE the body: try_unroll_loop_ex would then NOP the whole
+   * [start..end] region and re-emit only the collected prefix × trip_count,
+   * dropping every instruction past the cap (including an inner loop's control
+   * flow, which lives in the tail).  That miscompiles — random-C seed 18 has a
+   * 203-instruction body whose first 32 collectable insns are straight-line, so
+   * the truncated prefix passed the JUMPIF/call rejection below and unrolled an
+   * incomplete body.  An over-cap body is rejected outright (see below). */
+  for (int i = loop->start_idx; i <= loop->end_idx; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
 
@@ -2308,6 +2317,14 @@ int collect_body_instructions(TCCIRState *ir, IRLoop *loop, int iv_vreg, int cmp
         q->op == TCCIR_OP_MLA || q->op == TCCIR_OP_SELECT)
     {
       LOG_LOOP_OPT("collect_body: REJECTED at [%d] 4-operand op=%d", i, q->op);
+      return -1;
+    }
+
+    /* Body has more real instructions than we can buffer / safely unroll.
+     * Reject instead of truncating: a truncated body unrolls to wrong code. */
+    if (count >= max_body)
+    {
+      LOG_LOOP_OPT("collect_body: REJECTED body exceeds max_body=%d", max_body);
       return -1;
     }
 

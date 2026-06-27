@@ -6,10 +6,13 @@
 
 | Layer | Count | Fraction |
 |---|---|---|
-| Covered by unit suite | 56 | 47.5% |
-| Covered by QEMU ir_tests corpus | 46 | 39.0% |
-| Runtime library (exercised by compiled programs) | 16 | 13.6% |
-| **Total tracked files** | **118** | **100%** |
+| Covered by unit suite | 56 | 40.3% |
+| Covered by linker pytest harness | 3 | 2.2% |
+| Covered by debug-info pytest harness | 2 | 1.4% |
+| Covered by QEMU ir_tests corpus | 41 | 29.5% |
+| Runtime library (exercised by compiled programs) | 23 | 16.5% |
+| Covered by runtime-library unit suite | 14 | 10.1% |
+| **Total tracked files** | **139** | **100%** |
 
 ## Covered by unit suite
 
@@ -72,6 +75,21 @@
 | `tccir_operand.c` | tests/unit/arm/armv8m/test_ir_operand.c | — |
 | `tccls.c` | tests/unit/arm/armv8m/test_ra_linearscan.c | — |
 
+## Covered by linker pytest harness
+
+| Source file | Covered via | Note |
+|---|---|---|
+| `tccelf.c` | tests/linker/test_linker.py | — |
+| `tccld.c` | tests/linker/test_linker.py | — |
+| `tccyaff.c` | tests/linker/test_linker.py | YAFF output only enabled for TCC_TARGET_YASOS builds; host cross compiler skips YAFF case |
+
+## Covered by debug-info pytest harness
+
+| Source file | Covered via | Note |
+|---|---|---|
+| `tccdbg.c` | tests/debug/test_debug.py | — |
+| `tccdebug.c` | tests/debug/test_debug.py | — |
+
 ## Covered by QEMU ir_tests corpus
 
 | Source file | Covered via | Note |
@@ -112,34 +130,55 @@
 | `libtcc.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
 | `tcc.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
 | `tccasm.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `tccdbg.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `tccdebug.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `tccelf.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
 | `tccgen.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `tccld.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
 | `tccmachine.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
 | `tccopt.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
 | `tccpp.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
 | `tcctools.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `tccyaff.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
 
 ## Runtime library (exercised by compiled programs)
 
 | Source file | Covered via | Note |
 |---|---|---|
-| `lib/armeabi.c` | runtime tests (compiled programs) | — |
 | `lib/armflush.c` | runtime tests (compiled programs) | — |
-| `lib/armv8m_eabi.c` | runtime tests (compiled programs) | — |
 | `lib/bcheck.c` | runtime tests (compiled programs) | — |
 | `lib/bt-dll.c` | runtime tests (compiled programs) | — |
 | `lib/bt-exe.c` | runtime tests (compiled programs) | — |
 | `lib/bt-log.c` | runtime tests (compiled programs) | — |
-| `lib/builtin.c` | runtime tests (compiled programs) | — |
 | `lib/dsohandle.c` | runtime tests (compiled programs) | — |
+| `lib/fp/arm/rp2350/dcp_cmp.c` | runtime tests (compiled programs) | — |
+| `lib/fp/arm/rp2350/dcp_conv.c` | runtime tests (compiled programs) | — |
+| `lib/fp/arm/rp2350/dcp_init.c` | runtime tests (compiled programs) | — |
+| `lib/fp/arm/rp2350/dcp_ops.c` | runtime tests (compiled programs) | — |
+| `lib/fp/arm/vfpv4-sp/conv.c` | runtime tests (compiled programs) | — |
+| `lib/fp/arm/vfpv4-sp/dops_soft.c` | runtime tests (compiled programs) | — |
+| `lib/fp/arm/vfpv4-sp/fcmp.c` | runtime tests (compiled programs) | — |
+| `lib/fp/arm/vfpv4-sp/fops.c` | runtime tests (compiled programs) | — |
+| `lib/fp/arm/vfpv5-dp/cmp.c` | runtime tests (compiled programs) | — |
+| `lib/fp/arm/vfpv5-dp/conv.c` | runtime tests (compiled programs) | — |
+| `lib/fp/arm/vfpv5-dp/ops.c` | runtime tests (compiled programs) | — |
 | `lib/lib-arm64.c` | runtime tests (compiled programs) | — |
-| `lib/libtcc1.c` | runtime tests (compiled programs) | — |
 | `lib/runmain.c` | runtime tests (compiled programs) | — |
 | `lib/stdatomic.c` | runtime tests (compiled programs) | — |
 | `lib/tcov.c` | runtime tests (compiled programs) | — |
 | `lib/thumbflush.c` | runtime tests (compiled programs) | — |
 | `lib/va_list.c` | runtime tests (compiled programs) | — |
+
+## Covered by runtime-library unit suite
+
+| Source file | Covered via | Note |
+|---|---|---|
+| `lib/armeabi.c` | tests/runtime/test_runtime.py | — |
+| `lib/armv8m_eabi.c` | tests/runtime/test_runtime.py | empty include shim compiled as part of armeabi.o |
+| `lib/builtin.c` | tests/runtime/test_runtime.py | — |
+| `lib/fp/soft/conv.c` | tests/runtime/test_runtime.py | — |
+| `lib/fp/soft/dadd.c` | tests/runtime/test_runtime.py | — |
+| `lib/fp/soft/dcmp.c` | tests/runtime/test_runtime.py | — |
+| `lib/fp/soft/dconv.c` | tests/runtime/test_runtime.py | — |
+| `lib/fp/soft/ddiv.c` | tests/runtime/test_runtime.py | — |
+| `lib/fp/soft/dmul.c` | tests/runtime/test_runtime.py | — |
+| `lib/fp/soft/fadd.c` | tests/runtime/test_runtime.py | — |
+| `lib/fp/soft/fcmp.c` | tests/runtime/test_runtime.py | — |
+| `lib/fp/soft/fdiv.c` | tests/runtime/test_runtime.py | — |
+| `lib/fp/soft/fmul.c` | tests/runtime/test_runtime.py | — |
+| `lib/libtcc1.c` | tests/runtime/test_runtime.py | — |

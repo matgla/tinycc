@@ -12,12 +12,6 @@ def pytest_addoption(parser):
         default=False,
         help="Regenerate golden files from current compiler output",
     )
-    parser.addoption(
-        "--compiler",
-        action="store",
-        default=None,
-        help="Path to the armv8m-tcc cross compiler",
-    )
 
 
 def _find_compiler(compiler_override=None):

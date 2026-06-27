@@ -375,4 +375,5 @@ clean:
 	@$(MAKE) -C tests2 $@
 	@$(MAKE) -C pp $@
 	@$(MAKE) -C frontend $@
+	@rm -rf linker/build debug/build runtime/build
 

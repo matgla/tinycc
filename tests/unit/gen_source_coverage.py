@@ -15,6 +15,7 @@ Usage:
 
 import argparse
 import datetime
+import fnmatch
 import json
 import sys
 from pathlib import Path
@@ -28,9 +29,17 @@ KIND_ORDER = [
     "unit",
     "golden_ir",
     "codegen_asm",
+    "frontend",
+    "ra",
+    "backend_unit",
+    "linker",
+    "debug",
     "ir_test",
     "smoke",
     "runtime_lib",
+    "runtime_unit",
+    "libtcc_api",
+    "selfhost",
     "tool",
     "partial",
     "none",
@@ -40,9 +49,17 @@ KIND_LABEL = {
     "unit": "Covered by unit suite",
     "golden_ir": "Covered by golden-IR snapshot",
     "codegen_asm": "Covered by codegen disassembly test",
+    "frontend": "Covered by frontend pytest harness",
+    "ra": "Covered by register-allocation unit suite",
+    "backend_unit": "Covered by backend unit suite",
+    "linker": "Covered by linker pytest harness",
+    "debug": "Covered by debug-info pytest harness",
     "ir_test": "Covered by QEMU ir_tests corpus",
     "smoke": "Covered by smoke tests",
     "runtime_lib": "Runtime library (exercised by compiled programs)",
+    "runtime_unit": "Covered by runtime-library unit suite",
+    "libtcc_api": "Covered by libtcc API test",
+    "selfhost": "Covered by self-host bootstrap gate",
     "tool": "Build/test helper, not product code",
     "partial": "Partial coverage only",
     "none": "No known dedicated coverage",
@@ -54,6 +71,7 @@ SOURCE_GLOBS = [
     ("ir/*.c", False),
     ("arch/arm/**/*.c", True),
     ("lib/*.c", False),
+    ("lib/fp/**/*.c", True),
 ]
 
 # Files excluded from the inventory (test fixtures, examples, helpers).
@@ -64,6 +82,7 @@ EXCLUDE_PATTERNS = [
     ".cache/*",
     "tests/*",
     "build/*",
+    "lib/fp/soft/test_*.c",
 ]
 
 
@@ -76,6 +95,8 @@ def is_excluded(rel: str) -> bool:
         if pat.endswith("/*"):
             if rel.startswith(pat[:-1]):
                 return True
+        elif fnmatch.fnmatch(rel, pat) or fnmatch.fnmatch(name, pat):
+            return True
         elif rel == pat or rel.endswith("/" + pat):
             return True
     return False

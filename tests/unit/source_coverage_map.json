@@ -604,10 +604,10 @@
     ]
   },
   "lib/armeabi.c": {
-    "kind": "runtime_lib",
+    "kind": "runtime_unit",
     "note": "",
     "via": [
-      "runtime tests (compiled programs)"
+      "tests/runtime/test_runtime.py"
     ]
   },
   "lib/armflush.c": {
@@ -618,10 +618,10 @@
     ]
   },
   "lib/armv8m_eabi.c": {
-    "kind": "runtime_lib",
-    "note": "",
+    "kind": "runtime_unit",
+    "note": "empty include shim compiled as part of armeabi.o",
     "via": [
-      "runtime tests (compiled programs)"
+      "tests/runtime/test_runtime.py"
     ]
   },
   "lib/bcheck.c": {
@@ -653,10 +653,10 @@
     ]
   },
   "lib/builtin.c": {
-    "kind": "runtime_lib",
+    "kind": "runtime_unit",
     "note": "",
     "via": [
-      "runtime tests (compiled programs)"
+      "tests/runtime/test_runtime.py"
     ]
   },
   "lib/dsohandle.c": {
@@ -664,6 +664,153 @@
     "note": "",
     "via": [
       "runtime tests (compiled programs)"
+    ]
+  },
+  "lib/fp/arm/rp2350/dcp_cmp.c": {
+    "kind": "runtime_lib",
+    "note": "",
+    "via": [
+      "runtime tests (compiled programs)"
+    ]
+  },
+  "lib/fp/arm/rp2350/dcp_conv.c": {
+    "kind": "runtime_lib",
+    "note": "",
+    "via": [
+      "runtime tests (compiled programs)"
+    ]
+  },
+  "lib/fp/arm/rp2350/dcp_init.c": {
+    "kind": "runtime_lib",
+    "note": "",
+    "via": [
+      "runtime tests (compiled programs)"
+    ]
+  },
+  "lib/fp/arm/rp2350/dcp_ops.c": {
+    "kind": "runtime_lib",
+    "note": "",
+    "via": [
+      "runtime tests (compiled programs)"
+    ]
+  },
+  "lib/fp/arm/vfpv4-sp/conv.c": {
+    "kind": "runtime_lib",
+    "note": "",
+    "via": [
+      "runtime tests (compiled programs)"
+    ]
+  },
+  "lib/fp/arm/vfpv4-sp/dops_soft.c": {
+    "kind": "runtime_lib",
+    "note": "",
+    "via": [
+      "runtime tests (compiled programs)"
+    ]
+  },
+  "lib/fp/arm/vfpv4-sp/fcmp.c": {
+    "kind": "runtime_lib",
+    "note": "",
+    "via": [
+      "runtime tests (compiled programs)"
+    ]
+  },
+  "lib/fp/arm/vfpv4-sp/fops.c": {
+    "kind": "runtime_lib",
+    "note": "",
+    "via": [
+      "runtime tests (compiled programs)"
+    ]
+  },
+  "lib/fp/arm/vfpv5-dp/cmp.c": {
+    "kind": "runtime_lib",
+    "note": "",
+    "via": [
+      "runtime tests (compiled programs)"
+    ]
+  },
+  "lib/fp/arm/vfpv5-dp/conv.c": {
+    "kind": "runtime_lib",
+    "note": "",
+    "via": [
+      "runtime tests (compiled programs)"
+    ]
+  },
+  "lib/fp/arm/vfpv5-dp/ops.c": {
+    "kind": "runtime_lib",
+    "note": "",
+    "via": [
+      "runtime tests (compiled programs)"
+    ]
+  },
+  "lib/fp/soft/conv.c": {
+    "kind": "runtime_unit",
+    "note": "",
+    "via": [
+      "tests/runtime/test_runtime.py"
+    ]
+  },
+  "lib/fp/soft/dadd.c": {
+    "kind": "runtime_unit",
+    "note": "",
+    "via": [
+      "tests/runtime/test_runtime.py"
+    ]
+  },
+  "lib/fp/soft/dcmp.c": {
+    "kind": "runtime_unit",
+    "note": "",
+    "via": [
+      "tests/runtime/test_runtime.py"
+    ]
+  },
+  "lib/fp/soft/dconv.c": {
+    "kind": "runtime_unit",
+    "note": "",
+    "via": [
+      "tests/runtime/test_runtime.py"
+    ]
+  },
+  "lib/fp/soft/ddiv.c": {
+    "kind": "runtime_unit",
+    "note": "",
+    "via": [
+      "tests/runtime/test_runtime.py"
+    ]
+  },
+  "lib/fp/soft/dmul.c": {
+    "kind": "runtime_unit",
+    "note": "",
+    "via": [
+      "tests/runtime/test_runtime.py"
+    ]
+  },
+  "lib/fp/soft/fadd.c": {
+    "kind": "runtime_unit",
+    "note": "",
+    "via": [
+      "tests/runtime/test_runtime.py"
+    ]
+  },
+  "lib/fp/soft/fcmp.c": {
+    "kind": "runtime_unit",
+    "note": "",
+    "via": [
+      "tests/runtime/test_runtime.py"
+    ]
+  },
+  "lib/fp/soft/fdiv.c": {
+    "kind": "runtime_unit",
+    "note": "",
+    "via": [
+      "tests/runtime/test_runtime.py"
+    ]
+  },
+  "lib/fp/soft/fmul.c": {
+    "kind": "runtime_unit",
+    "note": "",
+    "via": [
+      "tests/runtime/test_runtime.py"
     ]
   },
   "lib/lib-arm64.c": {
@@ -674,10 +821,10 @@
     ]
   },
   "lib/libtcc1.c": {
-    "kind": "runtime_lib",
+    "kind": "runtime_unit",
     "note": "",
     "via": [
-      "runtime tests (compiled programs)"
+      "tests/runtime/test_runtime.py"
     ]
   },
   "lib/runmain.c": {
@@ -744,24 +891,24 @@
     ]
   },
   "tccdbg.c": {
-    "kind": "ir_test",
-    "note": "no dedicated unit/golden/asm test yet",
+    "kind": "debug",
+    "note": "",
     "via": [
-      "tests/ir_tests/*.expect QEMU corpus"
+      "tests/debug/test_debug.py"
     ]
   },
   "tccdebug.c": {
-    "kind": "ir_test",
-    "note": "no dedicated unit/golden/asm test yet",
+    "kind": "debug",
+    "note": "",
     "via": [
-      "tests/ir_tests/*.expect QEMU corpus"
+      "tests/debug/test_debug.py"
     ]
   },
   "tccelf.c": {
-    "kind": "ir_test",
-    "note": "no dedicated unit/golden/asm test yet",
+    "kind": "linker",
+    "note": "",
     "via": [
-      "tests/ir_tests/*.expect QEMU corpus"
+      "tests/linker/test_linker.py"
     ]
   },
   "tccgen.c": {
@@ -779,10 +926,10 @@
     ]
   },
   "tccld.c": {
-    "kind": "ir_test",
-    "note": "no dedicated unit/golden/asm test yet",
+    "kind": "linker",
+    "note": "",
     "via": [
-      "tests/ir_tests/*.expect QEMU corpus"
+      "tests/linker/test_linker.py"
     ]
   },
   "tccls.c": {
@@ -821,10 +968,10 @@
     ]
   },
   "tccyaff.c": {
-    "kind": "ir_test",
-    "note": "no dedicated unit/golden/asm test yet",
+    "kind": "linker",
+    "note": "YAFF output only enabled for TCC_TARGET_YASOS builds; host cross compiler skips YAFF case",
     "via": [
-      "tests/ir_tests/*.expect QEMU corpus"
+      "tests/linker/test_linker.py"
     ]
   }
 }

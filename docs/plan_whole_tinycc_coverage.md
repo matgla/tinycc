@@ -272,20 +272,41 @@ gaps were exposed and are recorded here (not fixed per instruction):
    atomic codegen-asm case is therefore deferred until either the builtins are
    wired or the harness is taught to use the QEMU newlib sysroot includes.
 
-### Phase 5 — Object, linker, and debug info coverage
+### Phase 5 — Object, linker, and debug info coverage ✅ Implemented
 
-These are currently the weakest areas. Add host-side golden tests:
+Status: **implemented**. Host-side pytest harnesses live in `tests/linker/` and
+`tests/debug/`, are wired into `run_tests.py` (`--linker`, `--debug`) and
+`make test-linker` / `make test-debug`, and update the source-coverage ledger.
 
-- `tests/linker/relocations/` — compile small C snippets to ELF, assert relocation
-  types/symbols via `arm-none-eabi-readelf -r`.
-- `tests/linker/sections/` — assert section order, alignment, and merging.
-- `tests/linker/yaff/` — if YAFF remains supported, assert YAFF output structure.
-- `tests/debug/dwarf/` — compile with `-g`, inspect `.debug_info` / `.debug_line`
-  for key DIEs and line-number programs.
-- `tests/debug/stab/` — same for STAB if still in use.
+Implemented cases:
+
+- `tests/linker/relocations/` — external globals produce `R_ARM_ABS32`, external
+  function calls produce `R_ARM_THM_JUMP24`, and static locals produce no
+  relocations.
+- `tests/linker/sections/` — standard section presence/order, custom sections,
+  alignment, and current `-ffunction-sections` behaviour (functions stay in a
+  single `.text` section rather than per-function subsections).
+- `tests/linker/yaff/` — YAFF header structure test.  The cross compiler in this
+  tree does not define `TCC_TARGET_YASOS`, so it produces ELF even for `.yaff`
+  output; the test skips with a documented note rather than failing.
+- `tests/debug/dwarf/` — compile-unit, function/parameter/variable DIEs, and
+  line-number program presence.
+- `tests/debug/stab/` — documents that STAB emission is disabled in this fork
+  (`put_stabs*` in `tccdbg.c` are no-ops); only DWARF sections are emitted.
 
 Target files:
 - `tccelf.c`, `tccld.c`, `tccyaff.c`, `tccdbg.c`, `tccdebug.c`.
+
+#### Findings during Phase 5
+
+- `-ffunction-sections` does **not** currently split functions into
+  `.text.<name>` subsections; the section test asserts the observed single-`.text`
+  layout so a future change will be visible as a failure to flip.
+- YAFF output is gated by `TCC_TARGET_YASOS` in `tcc.c`; the host cross compiler
+  falls back to ELF.  The YAFF case is therefore a structural check guarded by a
+  skip on this build, not a hard failure.
+- STAB output is intentionally disabled; the STAB case verifies that no `.stab`
+  sections are emitted and then skips.
 
 ### Phase 6 — Runtime library coverage
 
