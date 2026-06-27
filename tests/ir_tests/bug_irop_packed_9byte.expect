@@ -1,0 +1,33 @@
+sizeof(IROperand)=9
+
+--- Pool element addresses (9-byte stride) ---
+pool[0] addr offset: 0 (mod4=0)
+pool[1] addr offset: 9 (mod4=1)
+pool[2] addr offset: 18 (mod4=2)
+pool[3] addr offset: 27 (mod4=3)
+pool[4] addr offset: 36 (mod4=0)
+pool[5] addr offset: 45 (mod4=1)
+
+Test 1: pool[0] FUNCPARAMVAL (call_id=0, param=0)
+  vr=0xf109fff0 tag=2 is_none=0 imm=0 call_id=0 param=0
+  scanner_call_id=0 (expect 0)
+
+Test 2: pool[2] at offset 18 (call_id=1)
+  vr=0xf109fff0 tag=2 is_none=0 scanner_call_id=1 (expect 1)
+
+Test 3: pool[4] at offset 36 (call_id=2)
+  vr=0xf109fff0 tag=2 is_none=0 scanner_call_id=2 (expect 2)
+
+Test 4: pool[5] NONE
+  vr=0xffffffff tag=0 is_none=1 (expect tag=0, none=1)
+
+Test 5: NOP-out scan for call_id=0
+  pool[0]: irop_get_imm64_ex=0 encoded_call_id=0 -> MATCH (would NOP)
+  pool[1]: irop_get_imm64_ex=1 encoded_call_id=0 -> MATCH (would NOP)
+  pool[2]: irop_get_imm64_ex=65536 encoded_call_id=1
+  pool[3]: irop_get_imm64_ex=65537 encoded_call_id=1
+  pool[4]: irop_get_imm64_ex=131072 encoded_call_id=2
+  pool[5]: irop_get_imm64_ex=0 encoded_call_id=0
+  nop_count=2 (expect 2)
+
+ALL TESTS PASSED (0 errors)

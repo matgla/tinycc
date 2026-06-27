@@ -2617,6 +2617,21 @@ int try_eliminate_loop_symbolic(TCCIRState *ir, IRLoop *loop)
       (guard_cmp >= 0 && guard_jmpif >= 0 && num_acc_used == 1 && !counter_used_after &&
        ivs[single_acc_idx].init_val == 0);
 
+  /* The fallback closed form below writes UNCONDITIONAL final IV values
+   * (counter = limit; acc = limit*step).  Those are only correct when the loop
+   * provably executes at least once.  But the limit here is SYMBOLIC (constant
+   * limits go through try_eliminate_loop), so a top-tested `while`/`for` with
+   * limit <= init runs ZERO times and every IV must keep its init value — e.g.
+   * `i=0; while(i<n) i++; return i` is max(n,0), NOT n.  Only the SELECT path
+   * emits the zero-trip guard; the unconditional fallback cannot, so bail and
+   * leave the loop intact.  Bail BEFORE NOPing the body.  (codegen_asm count(),
+   * pre-existing wrong-code since loop-elim was enabled.) */
+  if (!use_select_path)
+  {
+    LOG_LOOP_OPT("try_eliminate_loop_symbolic: bail — fallback can't guard the zero-trip case for a symbolic limit");
+    return 0;
+  }
+
   /* NOP the loop body in both paths. */
   for (int i = loop->start_idx; i <= loop->end_idx; i++)
     ir->compact_instructions[i].op = TCCIR_OP_NOP;
@@ -3360,6 +3375,30 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
   {
     LOG_LOOP_OPT("Rotation: reject — body_start %d not after backedge %d (n=%d)", body_start, backedge_idx, n);
     return 0;
+  }
+
+  /* Reject rotating a loop that is nested inside an ALREADY-ROTATED loop.
+   * Rotating both an outer loop and an inner loop nested within it produces a
+   * doubly-rotated nested shape that a later pass miscompiles (random-C O2
+   * wrong-code, Finding #15 follow-up, seed 49: nested csmix accumulators).
+   * Rotating EITHER loop alone is correct, so decline the inner one once the
+   * enclosing loop has been rotated.  A rotated (bottom-tested) loop's back-edge
+   * is a conditional JUMPIF that branches backward to the loop body; an
+   * un-rotated (top-tested) loop's back-edge is an unconditional JUMP to the
+   * header.  So look for a backward-branching JUMPIF that strictly encloses
+   * [hi, backedge_idx] — that is an enclosing rotated loop. */
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_JUMPIF)
+      continue;
+    IROperand jd = tcc_ir_op_get_dest(ir, q);
+    int jt = (int)irop_get_imm64_ex(ir, jd);
+    if (jt >= 0 && jt < hi && i > backedge_idx)
+    {
+      LOG_LOOP_OPT("Rotation: reject — nested inside already-rotated loop [%d..%d]", jt, i);
+      return 0;
+    }
   }
 
   /* --- Step 3: Identify latch region [latch_start .. latch_end] --- */

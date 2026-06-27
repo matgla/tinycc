@@ -172,9 +172,3 @@ int tcc_ir_opt_switch_to_data(struct TCCIRState *ir)
   (void)ir;
   return 0;
 }
-
-int tcc_ir_opt_const_memcpy_to_dest(struct TCCIRState *ir)
-{
-  (void)ir;
-  return 0;
-}

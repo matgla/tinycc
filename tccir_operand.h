@@ -52,7 +52,18 @@ typedef enum TCCIR_VREG_TYPE
 #define IROP_TAG_NONE 0     /* sentinel for unused operand */
 #define IROP_TAG_VREG 1     /* pure vreg with no additional data */
 #define IROP_TAG_IMM32 2    /* payload.imm32: signed 32-bit immediate */
-#define IROP_TAG_STACKOFF 3 /* payload.imm32: signed 32-bit FP-relative offset */
+#define IROP_TAG_STACKOFF 3 /* payload.imm32: signed 32-bit FP-relative offset
+                               *
+                               * IMPORTANT: not every STACKOFF operand is a real
+                               * stack slot reference.  A *direct* stack location
+                               * has tag == STACKOFF, is_local == 1, is_lval == 1
+                               * AND vreg_type == 0.  When a VAR or PARAM is
+                               * referenced via its potential spill encoding,
+                               * vreg_type is non-zero and the offset field is
+                               * only metadata about where it *would* spill; the
+                               * program reads from the vreg, not from that slot.
+                               * New passes that inspect stack operands MUST
+                               * check vreg_type == 0 to avoid miscompiles. */
 #define IROP_TAG_F32 4      /* payload.f32_bits: 32-bit float bits (inline) */
 #define IROP_TAG_I64 5      /* payload.pool_idx: index into pool_i64[] */
 #define IROP_TAG_F64 6      /* payload.pool_idx: index into pool_f64[] */
@@ -97,7 +108,10 @@ typedef struct __attribute__((packed)) IROperand
       uint32_t is_local : 1;   /* VT_LOCAL: stack-relative (23) */
       uint32_t is_const : 1;   /* VT_CONST: constant value (24) */
       uint32_t btype : 3;      /* IROP_BTYPE_* (25-27) */
-      uint32_t vreg_type : 4;  /* TCCIR_VREG_TYPE_* (28-31) */
+      uint32_t vreg_type : 4;  /* TCCIR_VREG_TYPE_* (28-31).
+                                  For IROP_TAG_STACKOFF: zero means a real
+                                  direct StackLoc reference; non-zero means a
+                                  vreg-backed spill encoding (see above). */
     };
   };
   union

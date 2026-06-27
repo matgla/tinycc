@@ -352,6 +352,20 @@ int tcc_ir_opt_loop_bound_remat(TCCIRState *ir)
       if (irop_get_tag(src) != IROP_TAG_STACKOFF)
         continue;
 
+      /* Only rematerialize an address-of-stack computation (`Addr[StackLoc]`,
+       * is_lval=0) — the SP-relative *end pointer* this pass targets.  A
+       * value LOAD from a stack slot (is_lval=1) is NOT an end pointer: it
+       * reads memory whose content can differ from a fresh anonymous-slot
+       * load.  In particular a value-load of a named local VAR (is_local=1,
+       * carrying a live VAR vreg) is a register/SSA value with no guaranteed
+       * physical home at that offset; rematerializing it as a raw
+       * `StackLoc[off]` load (vreg=-1) reads uninitialized stack.  (fuzz
+       * seed 6214: pre-loop `u8 <= ~cs` test read `u8` from an unwritten
+       * StackLoc[0].)  Recomputing a stack ADDRESS, by contrast, is always
+       * sound, so keep those. */
+      if (src.is_lval)
+        continue;
+
       int32_t stack_off = (int32_t)irop_get_imm64_ex(ir, src);
       int is_param = src.is_param;
       int is_lval = src.is_lval;
@@ -562,7 +576,6 @@ int tcc_ir_opt_loop_bound_remat(TCCIRState *ir)
 static int tcc_ir_opt_loop_unroll__timed(TCCIRState *ir);
 int tcc_ir_opt_loop_unroll(TCCIRState *ir)
 {
-  if (getenv("TCC_NO_UNROLL")) return 0;
   tcc_pass_timing_init();
   if (!tcc_pass_timing_on) return tcc_ir_opt_loop_unroll__timed(ir);
   unsigned long _t = tcc_pass_clk_us();
@@ -679,11 +692,11 @@ static int tcc_ir_opt_loop_unroll__timed(TCCIRState *ir)
 
     /* Try elimination first (cheaper than unrolling), fall back to symbolic
      * closed-form (for vreg-limit accumulator loops), then unrolling. */
-    if (!getenv("TCC_NO_ELIM") && try_eliminate_loop(ir, loop))
+    if (try_eliminate_loop(ir, loop))
       unrolled++;
-    else if (!getenv("TCC_NO_SYM") && try_eliminate_loop_symbolic(ir, loop))
+    else if (try_eliminate_loop_symbolic(ir, loop))
       unrolled++;
-    else if (!getenv("TCC_NO_UEX"))
+    else
       unrolled += try_unroll_loop_ex(ir, loop, loops, i);
   }
 
@@ -735,7 +748,6 @@ static int tcc_ir_opt_loop_unroll__timed(TCCIRState *ir)
 static int tcc_ir_opt_loop_rotation__timed(TCCIRState *ir);
 int tcc_ir_opt_loop_rotation(TCCIRState *ir)
 {
-  if (getenv("TCC_NO_ROTATE")) return 0;
   tcc_pass_timing_init();
   if (!tcc_pass_timing_on) return tcc_ir_opt_loop_rotation__timed(ir);
   unsigned long _t = tcc_pass_clk_us();

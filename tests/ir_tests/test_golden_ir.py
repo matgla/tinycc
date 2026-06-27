@@ -31,8 +31,8 @@ TINYCC_DIR = CURRENT_DIR / "../.."
 # --debug.  The runner tolerates either.
 DEBUG_COMPILER_CANDIDATES = [
     TINYCC_DIR / "armv8m-tcc.debug",
-    TINYCC_DIR / "tcc",
     TINYCC_DIR / "armv8m-tcc",
+    TINYCC_DIR / "tcc",
 ]
 
 # SSA passes targeted by Phase C of plan_optimizer_test_coverage.md.
@@ -134,8 +134,21 @@ def _run_compiler(compiler, cflags, c_file, tmp_path):
 
 @pytest.fixture(scope="session")
 def debug_compiler(pytestconfig):
-    compiler = _find_debug_compiler(pytestconfig.getoption("compiler"))
+    require_dump_ir = pytestconfig.getoption("--require-dump-ir")
+    try:
+        compiler = _find_debug_compiler(pytestconfig.getoption("compiler"))
+    except FileNotFoundError as exc:
+        if require_dump_ir:
+            raise
+        pytest.skip(str(exc))
     if not _compiler_has_dump_ir_passes(compiler):
+        msg = (
+            f"{compiler} does not support -dump-ir-passes=all. "
+            "Build a CONFIG_TCC_DEBUG compiler or run `make test-golden-ir` "
+            "with GOLDEN_IR_COMPILER=/path/to/debug-tcc."
+        )
+        if not require_dump_ir:
+            pytest.skip(msg)
         raise RuntimeError(
             f"{compiler} does not support -dump-ir-passes=all. "
             "It must be built with CONFIG_TCC_DEBUG."

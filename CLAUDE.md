@@ -140,6 +140,13 @@ Build uses `-std=c11 -Wunused-function -Werror`.
 
 ## Debug Logging
 
+For debugging **optimizer miscompilations** found by the differential fuzzer
+(tcc -O0 correct, -O1/-O2 wrong), see
+[`docs/debugging_fuzz_divergences.md`](docs/debugging_fuzz_divergences.md) — the
+end-to-end workflow built around `scripts/bisect_opt.py` (QEMU-confirmed culprit
+knob + the exact IR line where a memory read is misfolded to a constant).
+`docs/fuzz_triage_guide.md` covers the sweep/triage infrastructure.
+
 Unified logging system defined in `log.h`. Each scope is a compile-time switch:
 
 ```bash

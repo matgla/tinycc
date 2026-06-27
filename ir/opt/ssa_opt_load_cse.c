@@ -689,6 +689,27 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState *st_init, int b_init
             sstore_track_vr(st, irop_get_stack_offset(dest), store_btype, svr);
           else if (irop_is_immediate(src))
             sstore_track_imm(st, irop_get_stack_offset(dest), store_btype, src);
+        } else if (q->op == TCCIR_OP_STORE_INDEXED) {
+          /* Indexed write through a stack base address (Addr[StackLoc[B]] +
+           * idx*scale).  The base-offset-only removal in the plain branch below
+           * dropped just the B slot, leaving the sibling slots forwardable even
+           * though a runtime index can land on any of them (fuzz seed 2657:
+           * `arr[i]=v` with runtime i, then a fully-unrolled `for k arr[k]` whose
+           * reads wrongly forwarded the initializer values for k != B).  With a
+           * constant index invalidate just the exact slot; with a runtime index
+           * conservatively drop all stack-store and indexed-load forwarding. */
+          IROperand idx = tcc_ir_op_get_src2(ir, q);
+          IROperand sc = tcc_ir_op_get_scale(ir, q);
+          if (irop_is_immediate(idx) && irop_is_immediate(sc)) {
+            int off = irop_get_stack_offset(dest) +
+                      (int)irop_get_imm32(idx) * (1 << irop_get_imm32(sc));
+            sstore_invalidate_overlap(st, off, irop_get_btype(dest));
+            sstore_remove_offset(st, off);
+            st->ilcount = 0;
+          } else {
+            st->scount = 0;
+            st->ilcount = 0;
+          }
         } else {
           /* A non-direct STACKOFF write may expose the address. */
           int off = irop_get_stack_offset(dest);

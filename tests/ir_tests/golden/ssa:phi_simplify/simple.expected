@@ -1,0 +1,7 @@
+0000: CMP P0,#0
+0001: JMP to 4  if "!="
+0002: T5 <-- P1 [LOAD]
+0003: JMP to 5
+0004: T6 <-- P1 [LOAD]
+0005: T2 <-- T3 [ASSIGN]
+0006: RETURNVALUE T3

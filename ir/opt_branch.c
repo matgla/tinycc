@@ -1441,6 +1441,7 @@ int tcc_ir_opt_nonneg_branch_fold(TCCIRState *ir)
 
 int tcc_ir_opt_branch_folding(TCCIRState *ir)
 {
+  if (tcc_ir_opt_pass_disabled("branch_fold")) return 0;
   if (ir->next_instruction_index < 2)
     return 0;
   IROptCtx ctx;

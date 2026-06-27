@@ -103,6 +103,7 @@ UT_MODULE_SRCS := \
 	$(TOP)/ir/opt_setif_or_taut.c \
 	$(TOP)/ir/opt_dead_lea_store.c \
 	$(TOP)/ir/opt_dce.c \
+	$(TOP)/ir/opt_branch.c \
 	$(TOP)/ir/opt_hash.c \
 	$(TOP)/ir/opt.c \
 	$(TOP)/ir/opt_alias.c \
@@ -112,10 +113,16 @@ UT_MODULE_SRCS := \
 	$(TOP)/ir/opt_reroll.c \
 	$(TOP)/ir/opt_bitfield.c \
 	$(TOP)/ir/opt_const_aggregate.c \
+	$(TOP)/ir/opt_memory.c \
 	$(TOP)/ir/opt_dead_vla.c \
 	$(TOP)/ir/opt_xform.c \
+	$(TOP)/ir/opt_engine.c \
+	$(TOP)/ir/opt_gens_branch.c \
 		$(TOP)/ir/regalloc.c \
+		$(TOP)/ir/codegen.c \
+		$(TOP)/ir/machine_op.c \
 		$(TOP)/tccls.c \
+		$(TOP)/tccmachine.c \
 		$(TOP)/arch/arm/arm_regalloc.c
 
 UT_MODULE_OBJS := $(patsubst $(TOP)/%.c,$(BUILD_DIR)/%.o,$(UT_MODULE_SRCS))
@@ -149,6 +156,17 @@ UT_LOCAL_SRCS := \
 	test_opt_knownbits.c \
 	test_opt_copyprop.c \
 	test_opt_cmp_fuse.c \
+	test_opt_helpers.c \
+	test_opt_stack_addr_cse.c \
+	test_opt_bool_norm.c \
+	test_opt_cmp_cse.c \
+	test_opt_memset_fold.c \
+	test_opt_dead_init_call.c \
+	test_opt_memmove.c \
+	test_opt_loop_utils.c \
+	test_opt_du.c \
+	test_opt_alias.c \
+	test_ir_stack_extra.c \
 	test_opt_cmpfold.c \
 	test_opt_constprop.c \
 	test_opt_constfold.c \
@@ -160,10 +178,24 @@ UT_LOCAL_SRCS := \
 	test_opt_reroll.c \
 	test_opt_bitfield.c \
 	test_opt_const_aggregate.c \
+	test_opt_memory.c \
+	test_opt_dce.c \
+	test_opt_branch_fold.c \
+	test_opt_orphan_cmp.c \
+	test_opt_float_branch.c \
+	test_opt_redundant_assign.c \
+	test_opt_nonneg_fold.c \
+	test_opt_return_reuse.c \
 	test_opt_dead_vla.c \
 	test_opt_xform.c \
 	test_metamorphic.c \
 	test_metamorphic_ssa.c \
+	test_codegen_arith.c \
+	test_codegen_mem.c \
+	test_codegen_control.c \
+	test_codegen_call.c \
+	test_codegen_fp.c \
+	test_codegen_atomic.c \
 	test_thop_adr.c \
 	test_thop_alu_reg.c \
 	test_thop_alu_imm.c \

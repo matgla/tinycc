@@ -188,6 +188,84 @@ UT_TEST(test_knownbits_narrow_signed_load_sign_extends)
   return 0;
 }
 
+/* GUARD: ASSIGN with an lvalue source is load-shaped even when the source
+ * operand is an immediate-like constant.  known-bits may record the value fact,
+ * but it must not replace the source with a plain non-lvalue immediate, which
+ * would drop the dereference semantics (seed3531). */
+UT_TEST(test_knownbits_assign_lval_immediate_keeps_load_shape)
+{
+  TCCIRState *ir = utb_new();
+
+  IROperand src = utb_imm(1234, I32);
+  src.is_lval = 1;
+  int i_as = utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(1, I32), src, UTB_NONE);
+
+  int changes = tcc_ir_opt_known_bits(ir);
+
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(utb_op(ir, i_as), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ((int)utb_src1(ir, i_as).is_lval, 1);
+  UT_ASSERT(irop_is_immediate(utb_src1(ir, i_as)));
+  UT_ASSERT_EQ(irop_get_imm64_ex(ir, utb_src1(ir, i_as)), 1234);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* GUARD: if a fully-known result is derived from an lvalue operand, keep the
+ * load-bearing instruction shape.  Seed3531 exposed a direct stack-slot SHR
+ * being rewritten to an immediate, dropping the read dependency. */
+UT_TEST(test_knownbits_lval_shift_keeps_load_shape)
+{
+  TCCIRState *ir = utb_new();
+
+  utb_emit(ir, TCCIR_OP_STORE, kb_stack_lval(-8, I32), utb_imm(2947349673u, I32),
+           UTB_NONE);
+  int i_shr = utb_emit(ir, TCCIR_OP_SHR, utb_temp(1, I32),
+                       kb_stack_lval(-8, I32), utb_imm(23, I32));
+
+  int changes = tcc_ir_opt_known_bits(ir);
+
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(utb_op(ir, i_shr), TCCIR_OP_SHR);
+  UT_ASSERT_EQ((int)utb_src1(ir, i_shr).is_lval, 1);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* GUARD: a stack store before a nested conditional must keep stack-slot facts
+ * dirty until the next block boundary.  The old pass cleared that dirty flag on
+ * every JUMPIF, so the merge block below inherited StackLoc[-8] = 222 and
+ * folded the LOAD even though the branch target can arrive from before that
+ * store. */
+UT_TEST(test_knownbits_jumpif_after_stack_store_invalidates_merge_slot)
+{
+  TCCIRState *ir = utb_new();
+
+  utb_emit(ir, TCCIR_OP_STORE, kb_stack_lval(-8, I32), utb_imm(111, I32),
+           UTB_NONE);
+  utb_emit(ir, TCCIR_OP_TEST_ZERO, UTB_NONE, utb_param(0, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(6, I32), utb_imm(0x94, I32),
+           UTB_NONE);
+  utb_emit(ir, TCCIR_OP_STORE, kb_stack_lval(-8, I32), utb_imm(222, I32),
+           UTB_NONE);
+  utb_emit(ir, TCCIR_OP_TEST_ZERO, UTB_NONE, utb_param(1, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(6, I32), utb_imm(0x94, I32),
+           UTB_NONE);
+  int i_ld = utb_emit(ir, TCCIR_OP_LOAD, utb_temp(1, I32),
+                      kb_stack_lval(-8, I32), UTB_NONE);
+
+  int changes = tcc_ir_opt_known_bits(ir);
+
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(utb_op(ir, i_ld), TCCIR_OP_LOAD);
+  UT_ASSERT_EQ((int)utb_src1(ir, i_ld).is_lval, 1);
+
+  utb_free(ir);
+  return 0;
+}
+
 /* NEGATIVE: both operands are unknown params, so no result bit is determined.
  * AND of two unknowns yields no known bits -> the pass must NOT fold and must
  * report zero changes, leaving the AND intact. */
@@ -673,6 +751,9 @@ UT_SUITE(opt_knownbits)
   UT_RUN(test_knownbits_or_then_shl_folds_word);
   UT_RUN(test_knownbits_narrow_unsigned_load_masks_width);
   UT_RUN(test_knownbits_narrow_signed_load_sign_extends);
+  UT_RUN(test_knownbits_assign_lval_immediate_keeps_load_shape);
+  UT_RUN(test_knownbits_lval_shift_keeps_load_shape);
+  UT_RUN(test_knownbits_jumpif_after_stack_store_invalidates_merge_slot);
   UT_RUN(test_knownbits_unknown_operands_no_fold);
   UT_RUN(test_knownbits_partial_known_no_fold);
   UT_RUN(test_knownbits_and_allones_identity);

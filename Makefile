@@ -503,8 +503,16 @@ config.mak:
 PYTHON ?= python3
 PYTEST ?= pytest
 
-# Pytest parallel workers: make test J=16 → pytest -n 16 (default: auto)
+# Pytest parallel workers: make test J=16 → pytest -n 16 (default: auto).
+# J=1 disables xdist entirely so logs are sequential.
 J ?= auto
+PYTEST_XDIST ?= -n $(J)
+ifeq ($(J),1)
+PYTEST_XDIST =
+endif
+
+# Cross compiler used by pytest test suites.
+CROSS_COMPILER = $(CURDIR)/armv8m-tcc
 
 # If set to 1, wrap compiler invocations with valgrind to detect memory errors.
 # Usage: make test VALGRIND=1
@@ -526,6 +534,7 @@ IRTESTS_REQUIREMENTS := $(IRTESTS_DIR)/requirements.txt
 IRTESTS_VENV_STAMP := $(VENV_DIR)/.irtests-requirements.stamp
 PCH_BENCHMARK_SCRIPT := $(IRTESTS_DIR)/benchmark_pch.py
 PCH_PREPARE_SCRIPT := $(IRTESTS_DIR)/prepare_pch.py
+GOLDEN_IR_COMPILER ?= $(TOP)/armv8m-tcc.debug
 
 NEWLIB_DIR := $(IRTESTS_DIR)/qemu/mps2-an505/newlib_build/arm-none-eabi/newlib
 NEWLIB_LIBC_A := $(NEWLIB_DIR)/libc.a
@@ -623,9 +632,9 @@ test-asm: cross test-venv
 		TEST_OBJCOPY="arm-none-eabi-objcopy"; \
 		export TEST_CC TEST_COMPARE_CC TEST_OBJDUMP TEST_OBJCOPY; \
 		if [ "$(USE_VENV)" = "1" ]; then \
-			"$(VENV_PY)" -m pytest --tb=short -q -n $(J) .; \
+			"$(VENV_PY)" -m pytest --tb=short -q $(PYTEST_XDIST) .; \
 		else \
-			$(PYTEST) --tb=short -q -n $(J) .; \
+			$(PYTEST) --tb=short -q $(PYTEST_XDIST) .; \
 		fi
 
 # Check that cross-compilation produces no unexpected warnings or errors.
@@ -670,9 +679,9 @@ warn-check: armv8m-tcc$(EXESUF) patch-newlib
 test-frontend: cross
 	@echo "------------ frontend tests ------------"
 	@if [ "$(USE_VENV)" = "1" ]; then \
-		cd $(TOP)/tests/frontend && "$(VENV_PY)" -m pytest -q; \
+		cd $(TOP)/tests/frontend && "$(VENV_PY)" -m pytest -q --compiler=$(CROSS_COMPILER); \
 	else \
-		cd $(TOP)/tests/frontend && $(PYTEST) -q; \
+		cd $(TOP)/tests/frontend && $(PYTEST) -q --compiler=$(CROSS_COMPILER); \
 	fi
 
 # run linker/object coverage tests
@@ -700,18 +709,50 @@ test-debug: cross
 test-runtime: cross
 	@echo "------------ runtime-library tests ------------"
 	@if [ "$(USE_VENV)" = "1" ]; then \
-		cd $(TOP)/tests/runtime && "$(VENV_PY)" -m pytest -q; \
+		cd $(TOP)/tests/runtime && "$(VENV_PY)" -m pytest -q --compiler=$(CROSS_COMPILER); \
 	else \
-		cd $(TOP)/tests/runtime && $(PYTEST) -q; \
+		cd $(TOP)/tests/runtime && $(PYTEST) -q --compiler=$(CROSS_COMPILER); \
+	fi
+
+# run self-host bootstrap gate
+# Compile-only smoke test always runs; FAT-drive round-trip skips if YasOS env is missing.
+test-selfhost: cross
+	@echo "------------ self-host bootstrap gate ------------"
+	@if [ "$(USE_VENV)" = "1" ]; then \
+		cd $(TOP)/tests/selfhost && "$(VENV_PY)" -m pytest -q --compiler=$(CROSS_COMPILER); \
+	else \
+		cd $(TOP)/tests/selfhost && $(PYTEST) -q --compiler=$(CROSS_COMPILER); \
 	fi
 
 # run IR tests via pytest (preferred)
-test: cross test-aeabi-host test-asm warn-check test-venv test-prepare download-gcc-tests ut test-frontend test-linker test-debug test-runtime
+.NOTPARALLEL: test test-full test-all
+test: cross test-aeabi-host test-asm warn-check test-venv test-prepare download-gcc-tests ut test-frontend test-linker test-debug test-runtime test-selfhost
 	@echo "------------ ir_tests (pytest) ------------"
 	@if [ "$(USE_VENV)" = "1" ]; then \
-		cd $(IRTESTS_DIR) && "$(VENV_PY)" -m pytest -s -n $(J) --durations=10; \
+		cd $(IRTESTS_DIR) && "$(VENV_PY)" -m pytest -s $(PYTEST_XDIST) -m "not golden_ir" --durations=10; \
 	else \
-		cd $(IRTESTS_DIR) && $(PYTEST) -s -n $(J) --durations=10; \
+		cd $(IRTESTS_DIR) && $(PYTEST) -s $(PYTEST_XDIST) -m "not golden_ir" --durations=10; \
+	fi
+
+# Fully sequential test run: disables pytest-xdist too, for the cleanest logs.
+.PHONY: test-sequential
+test-sequential:
+	@+$(MAKE) --no-print-directory test J=1
+
+# run golden IR snapshot tests explicitly.
+# These require a compiler built with CONFIG_TCC_DEBUG because -dump-ir-passes
+# is intentionally a debug/diagnostic interface.  Set GOLDEN_IR_COMPILER to a
+# specific debug binary, or leave it unset to use the runner's fallback search.
+test-golden-ir: test-venv
+	@echo "------------ golden IR snapshot tests ------------"
+	@compiler_arg=""; \
+	if [ -x "$(GOLDEN_IR_COMPILER)" ]; then \
+		compiler_arg="--compiler $(GOLDEN_IR_COMPILER)"; \
+	fi; \
+	if [ "$(USE_VENV)" = "1" ]; then \
+		cd $(IRTESTS_DIR) && "$(VENV_PY)" -m pytest -s $(PYTEST_XDIST) -m "golden_ir" --require-dump-ir $$compiler_arg test_golden_ir.py; \
+	else \
+		cd $(IRTESTS_DIR) && $(PYTEST) -s $(PYTEST_XDIST) -m "golden_ir" --require-dump-ir $$compiler_arg test_golden_ir.py; \
 	fi
 
 # legacy tests (kept for reference)
@@ -749,9 +790,9 @@ distclean: clean
 test-tests2: cross test-venv
 	@echo "------------ tests2 test suite ------------"
 	@if [ "$(USE_VENV)" = "1" ]; then \
-		cd $(TOP)/tests && "$(VENV_PY)" run_tests.py --tests2 -v -n $(J); \
+		cd $(TOP)/tests && "$(VENV_PY)" run_tests.py --tests2 -v $(PYTEST_XDIST); \
 	else \
-		cd $(TOP)/tests && $(PYTEST) -v -m tests2 --tb=short -n $(J) tests/tests2/; \
+		cd $(TOP)/tests && $(PYTEST) -v -m tests2 --tb=short $(PYTEST_XDIST) tests/tests2/; \
 	fi
 
 # download GCC torture tests
@@ -768,9 +809,9 @@ test-gcc-torture-compile: cross test-venv test-prepare download-gcc-tests
 		PYTEST_TIMEOUT=""; \
 	fi; \
 	if [ "$(USE_VENV)" = "1" ]; then \
-		cd $(IRTESTS_DIR) && "$(VENV_PY)" -m pytest -m "gcc_compile" --tb=short -n $(J) $$PYTEST_TIMEOUT test_gcc_torture_ir.py; \
+		cd $(IRTESTS_DIR) && "$(VENV_PY)" -m pytest -m "gcc_compile" --tb=short $(PYTEST_XDIST) $$PYTEST_TIMEOUT test_gcc_torture_ir.py; \
 	else \
-		cd $(IRTESTS_DIR) && $(PYTEST) -m "gcc_compile" --tb=short -n $(J) $$PYTEST_TIMEOUT test_gcc_torture_ir.py; \
+		cd $(IRTESTS_DIR) && $(PYTEST) -m "gcc_compile" --tb=short $(PYTEST_XDIST) $$PYTEST_TIMEOUT test_gcc_torture_ir.py; \
 	fi
 
 # run GCC torture execute tests only (via ir_tests framework)
@@ -782,9 +823,9 @@ test-gcc-torture-execute: cross test-venv test-prepare download-gcc-tests
 		PYTEST_TIMEOUT=""; \
 	fi; \
 	if [ "$(USE_VENV)" = "1" ]; then \
-		cd $(IRTESTS_DIR) && "$(VENV_PY)" -m pytest -m "gcc_execute" --tb=short -n $(J) $$PYTEST_TIMEOUT test_gcc_torture_ir.py; \
+		cd $(IRTESTS_DIR) && "$(VENV_PY)" -m pytest -m "gcc_execute" --tb=short $(PYTEST_XDIST) $$PYTEST_TIMEOUT test_gcc_torture_ir.py; \
 	else \
-		cd $(IRTESTS_DIR) && $(PYTEST) -m "gcc_execute" --tb=short -n $(J) $$PYTEST_TIMEOUT test_gcc_torture_ir.py; \
+		cd $(IRTESTS_DIR) && $(PYTEST) -m "gcc_execute" --tb=short $(PYTEST_XDIST) $$PYTEST_TIMEOUT test_gcc_torture_ir.py; \
 	fi
 
 # run full GCC torture tests (compile + execute via ir_tests framework)
@@ -796,9 +837,9 @@ test-gcc-torture: cross test-venv test-prepare download-gcc-tests
 		PYTEST_TIMEOUT=""; \
 	fi; \
 	if [ "$(USE_VENV)" = "1" ]; then \
-		cd $(IRTESTS_DIR) && "$(VENV_PY)" -m pytest -m "gcc_torture" --tb=short -n $(J) $$PYTEST_TIMEOUT test_gcc_torture_ir.py; \
+		cd $(IRTESTS_DIR) && "$(VENV_PY)" -m pytest -m "gcc_torture" --tb=short $(PYTEST_XDIST) $$PYTEST_TIMEOUT test_gcc_torture_ir.py; \
 	else \
-		cd $(IRTESTS_DIR) && $(PYTEST) -m "gcc_torture" --tb=short -n $(J) $$PYTEST_TIMEOUT test_gcc_torture_ir.py; \
+		cd $(IRTESTS_DIR) && $(PYTEST) -m "gcc_torture" --tb=short $(PYTEST_XDIST) $$PYTEST_TIMEOUT test_gcc_torture_ir.py; \
 	fi
 
 # run full test suite (IR + GCC torture compile-only)
@@ -818,6 +859,13 @@ test-valgrind:
 ut:
 	$(MAKE) -C tests/unit run
 
+# pipeline pass coverage ledger: compares PASS/PASS_GATED names in
+# ir/opt_pipeline.c + SSA_RUN names against UT_COVERS markers and golden-IR
+# directories.  Reports gaps but exits 0 so the CI gate stays soft while
+# coverage is still being fanned out.
+check-pass-coverage:
+	@python3 tests/unit/check_pass_coverage.py
+
 # gcov line/branch coverage report for the unit tests (requires gcovr).
 # Renders HTML + text under tests/unit/<target>/build/coverage/.
 ut-coverage:
@@ -826,7 +874,7 @@ ut-coverage:
 ut-clean:
 	$(MAKE) -C tests/unit clean
 
-.PHONY: all cross fp-libs clean test test-valgrind test-aeabi-host test-legacy test-tests2 test-gcc-torture test-gcc-torture-compile test-gcc-torture-execute test-full test-all test-frontend test-linker test-debug test-runtime rebuild-newlib download-gcc-tests tar tags ETAGS doc distclean install uninstall ut ut-coverage ut-clean FORCE
+.PHONY: all cross fp-libs clean test test-sequential test-valgrind test-aeabi-host test-legacy test-tests2 test-gcc-torture test-gcc-torture-compile test-gcc-torture-execute test-full test-all test-frontend test-linker test-debug test-runtime test-selfhost test-golden-ir rebuild-newlib download-gcc-tests tar tags ETAGS doc distclean install uninstall ut ut-coverage ut-clean check-pass-coverage FORCE
 
 # Container image settings (auto-detect docker or podman)
 DOCKER_REGISTRY ?= ghcr.io
@@ -888,6 +936,8 @@ help:
 	@echo "   $(wordlist 9,99,$(TCC_X))"
 	@echo "make test"
 	@echo "   rebuild + initialize GCC testsuite + run pytest in tests/ir_tests"
+	@echo "make test-sequential"
+	@echo "   same as make test, but runs pytest sequentially for clean logs"
 	@echo "make rebuild-newlib"
 	@echo "   wipe and rebuild newlib used by ir_tests/qemu (mps2-an505)"
 	@echo "make test-legacy"

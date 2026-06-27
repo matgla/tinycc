@@ -2168,14 +2168,7 @@ int tcc_ir_opt_lea_cse(TCCIRState *ir)
  *   i1: T2 = T1 ADD #K
  *   i2: <op> ... T2***DEREF*** ...
  *
- * Pattern C — ADD Addr[StackLoc] + #K + consumer-with-deref (combined-form
- * variant of B; the frontend emits this single ADD when materializing
- * &local[const_idx] without a separate LEA op, e.g. via nested-function
- * inlining):
- *   i0: T = ADD Addr[StackLoc[-N]], #K
- *   i1: <op> ... T***DEREF*** ...
- *
- * Pattern D — ASSIGN Addr[StackLoc] + consumer-with-deref (semantically
+ * Pattern C — ASSIGN Addr[StackLoc] + consumer-with-deref (semantically
  * identical to pattern A; the frontend emits ASSIGN instead of LEA when
  * the address materialization is part of a copy chain, again common in
  * nested-function inlining):
@@ -2214,24 +2207,21 @@ int tcc_ir_opt_lea_fold(TCCIRState *ir)
   {
     IRQuadCompact *lea_q = &ir->compact_instructions[i];
 
-    /* Three entry shapes are handled:
+    /* Two entry shapes are handled:
      *   - LEA Addr[StackLoc[X]] -> T            (classic LEA form)
      *   - ASSIGN Addr[StackLoc[X]] -> T         (semantically identical to LEA;
      *     emitted by the frontend when materializing &local for nested-function
      *     inlining or other capture-via-address patterns)
-     *   - ADD Addr[StackLoc[X]], #K -> T        (combined LEA+offset form)
-     * The ADD form already folds the constant offset, so the optional
-     * ADD-interposer search below is skipped. */
-    int is_add_form = 0;
-    int32_t add_form_imm = 0;
+     *
+     * The combined ADD Addr[StackLoc[X]], #K form is deliberately not an entry
+     * root here.  Folding it to a direct StackLoc access can remove the only
+     * address-valued operation tying a constant subslot access to the enclosing
+     * aggregate; later stack-slot passes then miss aliases through other
+     * Addr[StackLoc] indexed accesses.  Keep that form explicit unless it is an
+     * interposer after a real LEA/ASSIGN root, where the root still carries the
+     * address-taken information for the aggregate. */
     if (lea_q->op == TCCIR_OP_ADD)
-    {
-      IROperand s2 = tcc_ir_op_get_src2(ir, lea_q);
-      if (irop_get_tag(s2) != IROP_TAG_IMM32)
-        continue;
-      add_form_imm = (int32_t)s2.u.imm32;
-      is_add_form = 1;
-    }
+      continue;
     else if (lea_q->op == TCCIR_OP_ASSIGN)
     {
       /* ASSIGN must have no src2 (or NONE) to be a pure copy of src1. */
@@ -2362,12 +2352,11 @@ int tcc_ir_opt_lea_fold(TCCIRState *ir)
 
     /* Optional ADD #K interposer: a single intermediate ADD that consumes
      * the LEA result and adds a constant, whose own result has exactly one
-     * use (the eventual deref consumer).  Skipped for ADD-form starts —
-     * the constant offset is already in add_form_imm. */
+     * use (the eventual deref consumer). */
     int add_idx = -1;
-    int32_t add_offset = is_add_form ? add_form_imm : 0;
+    int32_t add_offset = 0;
     IRQuadCompact *add_q = &ir->compact_instructions[cur_idx];
-    if (!is_add_form && add_q->op == TCCIR_OP_ADD)
+    if (add_q->op == TCCIR_OP_ADD)
     {
       IROperand a1 = tcc_ir_op_get_src1(ir, add_q);
       IROperand a2 = tcc_ir_op_get_src2(ir, add_q);
@@ -2493,11 +2482,10 @@ int tcc_ir_opt_lea_fold(TCCIRState *ir)
      * stack-store-load forwarding and DSE on aggregate field writes. */
     {
       IRQuadCompact *cq = &ir->compact_instructions[cur_idx];
-      int is_store_idx = (cq->op == TCCIR_OP_STORE_INDEXED);
       int is_load_idx = (cq->op == TCCIR_OP_LOAD_INDEXED);
-      if (is_store_idx || is_load_idx)
+      if (is_load_idx)
       {
-        IROperand base = is_store_idx ? tcc_ir_op_get_dest(ir, cq) : tcc_ir_op_get_src1(ir, cq);
+        IROperand base = tcc_ir_op_get_src1(ir, cq);
         if (irop_has_vreg(base) && irop_get_vreg(base) == deref_vr)
         {
           IROperand idx = tcc_ir_op_get_src2(ir, cq);
@@ -2506,8 +2494,7 @@ int tcc_ir_opt_lea_fold(TCCIRState *ir)
               scale.u.imm32 == 0)
           {
             int folded_off = base_offset + add_offset + (int32_t)idx.u.imm32;
-            IROperand width_op = is_store_idx ? tcc_ir_op_get_src1(ir, cq)
-                                              : tcc_ir_op_get_dest(ir, cq);
+            IROperand width_op = tcc_ir_op_get_dest(ir, cq);
             if (width_op.btype != IROP_BTYPE_STRUCT)
             {
               IROperand stack_op = irop_make_stackoff(-1, folded_off, /*is_lval*/ 1, /*is_llocal*/ 0,
@@ -2516,31 +2503,19 @@ int tcc_ir_opt_lea_fold(TCCIRState *ir)
               stack_op.is_unsigned = width_op.is_unsigned;
               stack_op.is_static = lea_src.is_static;
 
-              if (is_store_idx)
-              {
-                IROperand val = tcc_ir_op_get_src1(ir, cq);
-                cq->op = TCCIR_OP_STORE;
-                tcc_ir_set_dest(ir, cur_idx, stack_op);
-                tcc_ir_set_src1(ir, cur_idx, val);
-                tcc_ir_set_src2(ir, cur_idx, IROP_NONE);
-              }
-              else
-              {
-                IROperand orig_dest = tcc_ir_op_get_dest(ir, cq);
-                cq->op = TCCIR_OP_LOAD;
-                tcc_ir_set_dest(ir, cur_idx, orig_dest);
-                tcc_ir_set_src1(ir, cur_idx, stack_op);
-                tcc_ir_set_src2(ir, cur_idx, IROP_NONE);
-              }
+              IROperand orig_dest = tcc_ir_op_get_dest(ir, cq);
+              cq->op = TCCIR_OP_LOAD;
+              tcc_ir_set_dest(ir, cur_idx, orig_dest);
+              tcc_ir_set_src1(ir, cur_idx, stack_op);
+              tcc_ir_set_src2(ir, cur_idx, IROP_NONE);
 
               lea_q->op = TCCIR_OP_NOP;
               if (add_idx >= 0)
                 ir->compact_instructions[add_idx].op = TCCIR_OP_NOP;
 
               changes++;
-              LOG_IR_GEN("LEA FOLD INDEXED: LEA@%d%s -> %s_INDEXED@%d -> %s  (offset=%d+%d+%d=%d)",
-                         i, (add_idx >= 0 ? " + ADD" : ""), is_store_idx ? "STORE" : "LOAD", cur_idx,
-                         is_store_idx ? "STORE" : "LOAD", base_offset, add_offset,
+              LOG_IR_GEN("LEA FOLD INDEXED: LEA@%d%s -> LOAD_INDEXED@%d -> LOAD  (offset=%d+%d+%d=%d)",
+                         i, (add_idx >= 0 ? " + ADD" : ""), cur_idx, base_offset, add_offset,
                          (int32_t)idx.u.imm32, folded_off);
               continue;
             }
@@ -2551,6 +2526,12 @@ int tcc_ir_opt_lea_fold(TCCIRState *ir)
 
     int which = 0;
     if (!find_deref_use_operand(ir, cur_idx, deref_vr, &which))
+      continue;
+    /* Keep stores through the address temp explicit.  A direct StackLoc store
+     * followed by direct StackLoc loads lets later scalar stack-slot passes
+     * reason about one field while missing other aliases through the aggregate
+     * address.  Read-side folds are still safe and keep the common load win. */
+    if (which == 3)
       continue;
 
     IRQuadCompact *cons_q = &ir->compact_instructions[cur_idx];

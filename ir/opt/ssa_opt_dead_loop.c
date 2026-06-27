@@ -125,9 +125,21 @@ static int dead_loop_body_hi(TCCIRState *ir, IRLoop *loop)
   IROperand exit_dest = tcc_ir_op_get_dest(ir, &ir->compact_instructions[jpf_idx]);
   int exit_target = (int)irop_get_imm64_ex(ir, exit_dest);
 
-  /* Only a forward exit (past the header) can have inflated the body bound. */
-  if (exit_target > loop->header_idx && exit_target - 1 < hi)
+  /* A natural loop never exits into the middle of its own body, so the body is
+   * exactly [header_idx, exit_target): exit_target-1 is the authoritative upper
+   * bound.  loop_max_idx() can OVER-count (a spuriously-included post-loop tail)
+   * OR UNDER-count: when the body sits past a split/rotated back-edge the loop
+   * detector's end_idx stops at the back-edge, leaving the real body (the
+   * straight-line region between the back-edge and the exit target) outside
+   * loop_max_idx.  Under-counting was a wrong-code bug: loop_body_has_side_effects
+   * and rewrite_loop_exit_phis' in-loop-use guard then missed the body's CALLs and
+   * in-loop phi uses, so a loop-carried header phi got folded to its latch constant
+   * and corrupted the first-iteration read (random-C O1/O2 wrong-code, seeds
+   * 51/52/132/281).  Take exit_target-1 as the bound in both directions. */
+  if (exit_target > loop->header_idx)
     hi = exit_target - 1;
+  if (hi >= ir->next_instruction_index)
+    hi = ir->next_instruction_index - 1;
   return hi;
 }
 

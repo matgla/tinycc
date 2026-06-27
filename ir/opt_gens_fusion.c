@@ -263,23 +263,26 @@ static int ir_gen_mla_fusion(IROptCtx *ctx, int i)
   }
 
   mul_q->op = TCCIR_OP_MLA;
-  int mul_dest_idx = mul_q->operand_base;
-  if (mul_dest_idx >= 0 && mul_dest_idx < ir->iroperand_pool_count)
-    ir->iroperand_pool[mul_dest_idx] = final_dest;
 
-  int accum_idx = mul_q->operand_base + 3;
-  while (ir->iroperand_pool_count <= accum_idx)
-    tcc_ir_pool_add(ir, IROP_NONE);
-  if (accum_idx < ir->iroperand_pool_capacity) {
-    ir->iroperand_pool[accum_idx] = accum_op;
-    q->op = TCCIR_OP_NOP;
-    if (store_idx >= 0)
-      ir->compact_instructions[store_idx].op = TCCIR_OP_NOP;
-    return 1;
+  /* The MLA has four operands (dest, src1, src2, accum) but the original MUL
+   * only allocated three slots.  Growing the block in-place at operand_base+3
+   * can overwrite operands of instructions whose operand blocks were allocated
+   * between the MUL and the ADD, so move the whole operand block to a fresh
+   * 4-slot region at the end of the pool. */
+  {
+    int new_base = ir->iroperand_pool_count;
+    tcc_ir_pool_ensure(ir, 4);
+    tcc_ir_pool_add(ir, final_dest);
+    tcc_ir_pool_add(ir, tcc_ir_op_get_src1(ir, mul_q));
+    tcc_ir_pool_add(ir, tcc_ir_op_get_src2(ir, mul_q));
+    tcc_ir_pool_add(ir, accum_op);
+    mul_q->operand_base = new_base;
   }
 
-  mul_q->op = old_mul_op;
-  return 0;
+  q->op = TCCIR_OP_NOP;
+  if (store_idx >= 0)
+    ir->compact_instructions[store_idx].op = TCCIR_OP_NOP;
+  return 1;
 }
 
 static int ir_gen_indexed_memory_fusion(IROptCtx *ctx, int i)

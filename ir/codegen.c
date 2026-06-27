@@ -3822,6 +3822,18 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
       {
         MopArgs a = DECODE(.dest = 2, .src1 = 1);
 
+        /* A bare immediate destination (no deref) is malformed IR: you cannot
+         * assign into a literal, so the instruction is a dead no-op.  It can
+         * survive when const-prop folds a value to a constant and a fusion then
+         * consumes the real consumer, leaving a stranded `#K <- #M` assign
+         * (seed 2966: the UDIV accumulator folds to 9 and is fused into the
+         * MLA, but the now-dead `#9 <- #-9733` def keeps an immediate dest).
+         * Drop it rather than aborting in mach_get_dest_reg ("unexpected kind
+         * 3"); the live value already resides in the fused op, so the computed
+         * result is unchanged. */
+        if (a.dest.kind == MACH_OP_IMM && !a.dest.needs_deref)
+          break;
+
         /* LDRD peephole: two adjacent 32-bit assigns loading from adjacent
          * spill slots into registers → single LDRD instruction. */
         if (a.src1.kind == MACH_OP_SPILL && !a.src1.needs_deref &&

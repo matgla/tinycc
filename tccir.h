@@ -585,6 +585,12 @@ typedef struct TCCIRState
   uint32_t *orig_ir_to_code_mapping;
   int orig_ir_to_code_mapping_size;
 
+  /* Mirror of tccgen's func_has_label_addr for the current function: set when the
+   * body takes a label address (GCC labels-as-values, `&&label`).  Kept on the IR
+   * state so the IR layer (regalloc) can consult it without referencing a tccgen
+   * global (which the standalone unit-test link does not provide). */
+  int func_has_label_addr;
+
   LSLiveIntervalState ls;
 
   /* Extra scratch allocation flags to apply during materialization for the current IR instruction. */

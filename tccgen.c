@@ -17904,19 +17904,12 @@ static void __attribute__((noinline)) unary_builtin_fp(void)
       vset(&uint_type, VT_LOCAL | VT_LVAL, tmp_loc + high_word_offset);
       vtop->vr = vr_tmp;
 
-      if (fp_size == 4)
-      {
-        /* Match GCC __builtin_signbitf runtime behavior: return the raw
-         * sign mask (0x80000000) for negative float values. */
-        vpushi(0x80000000u);
-        gen_op('&');
-      }
-      else
-      {
-        /* Runtime double stays normalized to 0/1. */
-        vpushi(31);
-        gen_op(TOK_SHR);
-      }
+      /* Match arm-none-eabi-gcc runtime behaviour: it emits
+       * `and r0, <high_word>, #0x80000000` for both signbitf and signbit,
+       * returning the raw sign mask (0x80000000 = -2147483648 as signed int)
+       * for negative values and 0 otherwise. */
+      vpushi(0x80000000u);
+      gen_op('&');
     }
     break;
   }
@@ -23096,6 +23089,8 @@ tok_next:
     if (s->c <= 0)
       s->c = -3; /* LABEL_ADDR_TAKEN marker */
     func_has_label_addr = 1;
+    if (tcc_state->ir)
+      tcc_state->ir->func_has_label_addr = 1; /* mirror for the IR layer (regalloc) */
     if ((s->type.t & VT_BTYPE) != VT_PTR)
     {
       s->type.t = VT_VOID;
@@ -29745,7 +29740,6 @@ static void gen_function(Sym *sym)
         break;
     }
   }
-
   /* Post-SL_FWD cleanup: the SL_FWD loop's DCE may have killed dead branches
    * that were the only remaining defs of a VAR (e.g. `fail = 1` in a dead
    * printf path).  Re-run const_prop + branch_folding + DCE so the now-
@@ -29771,16 +29765,31 @@ static void gen_function(Sym *sym)
   if (tcc_state->opt_store_load_fwd && !ir->has_static_chain)
   {
     int padrof_changed = tcc_ir_opt_param_addrof_const_fold(ir) > 0;
+#ifdef CONFIG_TCC_DEBUG
+    dump_ir_after_pass(tcc_state, ir, "ZZ_padrof");
+#endif
     int ladrof_changed = tcc_ir_opt_local_addrof_const_fold(ir) > 0;
+#ifdef CONFIG_TCC_DEBUG
+    dump_ir_after_pass(tcc_state, ir, "ZZ_ladrof");
+#endif
     int aofvar_changed = 0;
     int gslfwd_changed = 0;
     int iglh_changed = 0;
     if (tcc_state->opt_const_prop)
       aofvar_changed = tcc_ir_opt_addrof_var_fwd(ir) > 0;
+#ifdef CONFIG_TCC_DEBUG
+    dump_ir_after_pass(tcc_state, ir, "ZZ_aofvar");
+#endif
     if (tcc_state->opt_store_load_fwd)
       gslfwd_changed = tcc_ir_opt_global_sl_fwd(ir) > 0;
+#ifdef CONFIG_TCC_DEBUG
+    dump_ir_after_pass(tcc_state, ir, "ZZ_gslfwd");
+#endif
     if (tcc_state->opt_store_load_fwd)
       iglh_changed = tcc_ir_opt_invariant_global_load_hoist(ir) > 0;
+#ifdef CONFIG_TCC_DEBUG
+    dump_ir_after_pass(tcc_state, ir, "ZZ_iglh");
+#endif
     if (padrof_changed || ladrof_changed || aofvar_changed || gslfwd_changed || iglh_changed)
     {
       if (tcc_state->opt_const_prop)
@@ -29862,6 +29871,9 @@ static void gen_function(Sym *sym)
    * overwritten by a subsequent CALL, using the callee's write summary. */
   if (tcc_state->opt_dead_store)
     tcc_ir_opt_dead_init_via_call(ir);
+#ifdef CONFIG_TCC_DEBUG
+  dump_ir_after_pass(tcc_state, ir, "ZZ_dead_init_via_call");
+#endif
 
   /* Late cleanup: store elimination, dead var/addrvar elimination, redundant assign.
    * Run with max_iterations=2 so dead_addrvar_elim → DSE cascade works.
@@ -29884,6 +29896,9 @@ static void gen_function(Sym *sym)
     tcc_ir_opt_ctx_init(&cleanup_ctx, ir);
     tcc_ir_opt_run_group(&cleanup_ctx, cleanup_group);
     tcc_ir_opt_ctx_free(&cleanup_ctx);
+#ifdef CONFIG_TCC_DEBUG
+    dump_ir_after_pass(tcc_state, ir, "ZZ_late_cleanup_1");
+#endif
 
     if (tcc_state->opt_dead_store) {
       for (int iter = 0; iter < 4; iter++) {
@@ -29922,6 +29937,9 @@ static void gen_function(Sym *sym)
    * and before IV strength reduction which benefits from rotated layout. */
   if (tcc_state->opt_loop_rotation)
     tcc_ir_opt_loop_rotation(ir);
+#ifdef CONFIG_TCC_DEBUG
+  dump_ir_after_pass(tcc_state, ir, "ZZ_loop_rotation");
+#endif
 
   /* Phase 4c.5: First-iteration-exit peeling.  Rewrites a loop's exit
    * JUMPIF to unconditional JUMP when the header test is provably true
@@ -30047,6 +30065,9 @@ static void gen_function(Sym *sym)
   {
     if (tcc_ir_opt_diamond_store_fwd(ir) > 0)
     {
+#ifdef CONFIG_TCC_DEBUG
+      dump_ir_after_pass(tcc_state, ir, "ZZ_diamond_store_fwd");
+#endif
       for (int dsf_iter = 0; dsf_iter < 6; dsf_iter++)
       {
         int dsf_ch = 0;
@@ -30098,6 +30119,9 @@ static void gen_function(Sym *sym)
       tcc_ir_opt_compact_nops(ir);
     }
     (void)total_lcs_changes;
+#ifdef CONFIG_TCC_DEBUG
+    dump_ir_after_pass(tcc_state, ir, "ZZ_loop_const_sim");
+#endif
   }
 
   /* Phase 5a: Loop Unrolling - fully unroll small constant-trip-count loops.
@@ -30139,6 +30163,9 @@ static void gen_function(Sym *sym)
           ch2 += tcc_ir_opt_value_tracking(ir);
       } while (ch2 > 0 && ++iter2 < 10);
     }
+#ifdef CONFIG_TCC_DEBUG
+    dump_ir_after_pass(tcc_state, ir, "ZZ_loop_unroll");
+#endif
   }
   /* Phase 5: Loop-Invariant Code Motion - DISABLED
    * The LICM pass has a bug in hoist_const_exprs_from_loop(): instruction

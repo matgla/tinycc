@@ -7,11 +7,12 @@
 | Layer | Count | Fraction |
 |---|---|---|
 | Covered by unit suite | 56 | 40.3% |
+| Covered by backend unit suite | 3 | 2.2% |
 | Covered by linker pytest harness | 3 | 2.2% |
 | Covered by debug-info pytest harness | 2 | 1.4% |
-| Covered by QEMU ir_tests corpus | 41 | 29.5% |
 | Runtime library (exercised by compiled programs) | 23 | 16.5% |
 | Covered by runtime-library unit suite | 14 | 10.1% |
+| Covered by self-host bootstrap gate | 38 | 27.3% |
 | **Total tracked files** | **139** | **100%** |
 
 ## Covered by unit suite
@@ -75,6 +76,14 @@
 | `tccir_operand.c` | tests/unit/arm/armv8m/test_ir_operand.c | — |
 | `tccls.c` | tests/unit/arm/armv8m/test_ra_linearscan.c | — |
 
+## Covered by backend unit suite
+
+| Source file | Covered via | Note |
+|---|---|---|
+| `ir/codegen.c` | tests/unit/arm/armv8m/test_codegen_arith.c, tests/unit/arm/armv8m/test_codegen_mem.c, tests/unit/arm/armv8m/test_codegen_control.c, tests/unit/arm/armv8m/test_codegen_call.c, tests/unit/arm/armv8m/test_codegen_fp.c | — |
+| `ir/machine_op.c` | tests/unit/arm/armv8m/test_codegen_arith.c, tests/unit/arm/armv8m/test_codegen_mem.c, tests/unit/arm/armv8m/test_codegen_control.c, tests/unit/arm/armv8m/test_codegen_call.c, tests/unit/arm/armv8m/test_codegen_fp.c, tests/unit/arm/armv8m/test_codegen_atomic.c | — |
+| `tccmachine.c` | tests/unit/arm/armv8m/test_codegen_atomic.c | — |
+
 ## Covered by linker pytest harness
 
 | Source file | Covered via | Note |
@@ -89,52 +98,6 @@
 |---|---|---|
 | `tccdbg.c` | tests/debug/test_debug.py | — |
 | `tccdebug.c` | tests/debug/test_debug.py | — |
-
-## Covered by QEMU ir_tests corpus
-
-| Source file | Covered via | Note |
-|---|---|---|
-| `arch/arm/arm.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `arch/arm/arm_aapcs.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `arch/arm/ssa_opt_arm.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `arch/arm/thumb/thumb.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `arm-link.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `arm-thumb-asm.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `arm-thumb-callsite.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `arm-thumb-gen.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `arm-thumb-scratch.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `ir/cfg.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `ir/codegen.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `ir/machine_op.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `ir/opt.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `ir/opt_alias.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `ir/opt_branch.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `ir/opt_dce.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `ir/opt_du.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `ir/opt_engine.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `ir/opt_fusion.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `ir/opt_gens_bool.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `ir/opt_gens_branch.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `ir/opt_gens_call_result.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `ir/opt_gens_fusion.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `ir/opt_hash.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `ir/opt_loop.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `ir/opt_loop_const_sim.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `ir/opt_loop_utils.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `ir/opt_memory.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `ir/opt_pack64.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `ir/opt_pipeline.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `ir/opt_promote.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `ir/opt_switch_data.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `ir/opt_utils.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `libtcc.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `tcc.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `tccasm.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `tccgen.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `tccmachine.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `tccopt.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `tccpp.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `tcctools.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
 
 ## Runtime library (exercised by compiled programs)
 
@@ -182,3 +145,46 @@
 | `lib/fp/soft/fdiv.c` | tests/runtime/test_runtime.py | — |
 | `lib/fp/soft/fmul.c` | tests/runtime/test_runtime.py | — |
 | `lib/libtcc1.c` | tests/runtime/test_runtime.py | — |
+
+## Covered by self-host bootstrap gate
+
+| Source file | Covered via | Note |
+|---|---|---|
+| `arch/arm/arm.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
+| `arch/arm/arm_aapcs.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
+| `arch/arm/ssa_opt_arm.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
+| `arch/arm/thumb/thumb.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
+| `arm-link.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
+| `arm-thumb-asm.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
+| `arm-thumb-callsite.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
+| `arm-thumb-gen.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
+| `arm-thumb-scratch.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
+| `ir/cfg.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
+| `ir/opt.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
+| `ir/opt_alias.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
+| `ir/opt_branch.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
+| `ir/opt_dce.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
+| `ir/opt_du.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
+| `ir/opt_engine.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
+| `ir/opt_fusion.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
+| `ir/opt_gens_bool.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
+| `ir/opt_gens_branch.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
+| `ir/opt_gens_call_result.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
+| `ir/opt_gens_fusion.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
+| `ir/opt_hash.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
+| `ir/opt_loop.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
+| `ir/opt_loop_const_sim.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
+| `ir/opt_loop_utils.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
+| `ir/opt_memory.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
+| `ir/opt_pack64.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
+| `ir/opt_pipeline.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
+| `ir/opt_promote.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
+| `ir/opt_switch_data.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
+| `ir/opt_utils.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
+| `libtcc.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
+| `tcc.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
+| `tccasm.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
+| `tccgen.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
+| `tccopt.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
+| `tccpp.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
+| `tcctools.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |

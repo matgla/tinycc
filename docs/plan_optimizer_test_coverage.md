@@ -113,15 +113,18 @@ miscompile as a regression test, then broadening; register each in `test_main.c`
   stopping before QEMU. Counting beats full goldens (robust to scheduling churn); keep full-disasm
   goldens only for the trickiest sequences.
 
-### Phase E — Coverage ledger + CI gate
-- **`tests/unit/check_pass_coverage.py`** (new): enumerate registered passes from the
-  `PASS`/`PASS_GATED` string-literal names in `ir/opt_pipeline.c` + the SSA pass tables; collect
-  tested passes from `UT_COVERS(...)` markers + `tests/ir_tests/golden/<pass>/` dirs; diff and
-  report gaps. **`tests/unit/PASS_COVERAGE.md`** (new): checked-in ledger (pass → group →
-  test file(s) → kind → risk tier).
-- Wire into CI alongside `make ut` (already `0 failed`-gated) via `make test-opt`. Gate policy:
-  during fan-out the script reports gaps non-fatally; once Phase F reaches 100% of registered
-  passes it flips to **hard fail on any uncovered registered pass** (the agreed end state).
+### Phase E — Coverage ledger + CI gate — IMPLEMENTED (2026-06-28)
+- [x] `tests/unit/check_pass_coverage.py` implemented: enumerates registered passes from the
+  `PASS`/`PASS_GATED` string-literal names in `ir/opt_pipeline.c` plus `SSA_RUN("ssa:<pass>")` names
+  in `ir/opt/*.c`; collects tested passes from `UT_COVERS(...)` markers in
+  `tests/unit/arm/armv8m/*.c` and golden-IR directories under `tests/ir_tests/golden/<pass>/`;
+  diffs and reports gaps. An alias map handles the common case where a marker uses the pass-function
+  basename (e.g. `float_narrowing`) rather than the shorter registered name (`float_narrow`).
+- [x] `make check-pass-coverage` target added; CI step added in `.github/workflows/ci.yml` after the
+  source-coverage check. The gate is currently soft-fail (exit 0 while gaps remain); it flips to a
+  hard fail once Phase F reaches 100% of registered passes.
+- **Snapshot:** 35/89 registered passes covered (39.3% alias-resolved). The gap list is produced
+  automatically by the script and is the input to the next coverage push.
 
 ### Phase F — Fan out to all registered passes + merge-equivalence harness
 - One suite/golden per remaining registered pass until the ledger is 100% (then flip the gate).

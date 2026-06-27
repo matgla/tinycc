@@ -29,6 +29,8 @@
 #include "opt/ssa_opt.h"
 #include "licm.h"
 
+extern int tcc_ir_opt_pass_disabled(const char *name);
+
 #define RA_DBG(fmt, ...) LOG_LS(fmt, ##__VA_ARGS__)
 
 /* ============================================================================
@@ -3488,6 +3490,7 @@ static void ra_build_live_regs_bitmap(TCCIRState *ir)
     if (lsi->end > max_end) max_end = lsi->end;
   }
   int sz = (int)max_end + 1;
+  if (sz < ir->next_instruction_index) sz = ir->next_instruction_index;
   if (sz > 0) {
     if (ir->ls.live_regs_by_instruction)
       tcc_free(ir->ls.live_regs_by_instruction);
@@ -3512,6 +3515,7 @@ static void ra_build_live_regs_bitmap(TCCIRState *ir)
       for (int k = s; k <= e; k++)
         ir->ls.live_regs_by_instruction[k] |= mask;
     }
+
     if (TCC_LOG_LS) {
       for (int k = 0; k < sz; k++)
         RA_DBG("  instr[%d] live=0x%x", k, ir->ls.live_regs_by_instruction[k]);
@@ -3592,6 +3596,120 @@ static void ra_co_ops(TCCIRState *ir, IRQuadCompact *q,
 #define RA_BS_SET(bs, i)  ((bs)[(i) >> 6] |= (1ull << ((i) & 63)))
 #define RA_BS_CLR(bs, i)  ((bs)[(i) >> 6] &= ~(1ull << ((i) & 63)))
 #define RA_BS_TEST(bs, i) (((bs)[(i) >> 6] >> ((i) & 63)) & 1ull)
+
+/* Refine live_regs_by_instruction (the interval-derived approximation the
+ * scratch-register picker consults) with ACCURATE per-instruction liveness from
+ * a real CFG backward dataflow.
+ *
+ * The interval bitmap models each value as one contiguous [start,end] range.
+ * For a loop-carried value (defined inside a rotated loop body and live across
+ * the back-edge into the next iteration) that single range does NOT span the
+ * loop-header prefix where the value is still live, so the bitmap under-reports
+ * the value's register as free there.  The scratch picker then hands it out and
+ * clobbers the loop-carried value (random-C O2 wrong-code / HardFault once loop
+ * rotation is enabled — Finding #15 follow-up, seeds 244 et al).
+ *
+ * This dataflow (same ra_co_ops def/use model the graph-coalescer trusts) marks
+ * every register holding a genuinely-live, register-resident vreg.  It is
+ * strictly conservative for the picker: it can only ADD live bits, never remove
+ * them, so it can never introduce a new clobber — it only prevents real ones.
+ * Bails (leaving the interval bitmap as-is) on functions with un-enumerated
+ * edges (IJUMP / SWITCH_TABLE), matching the coalescer's own guard. */
+static void ra_refine_live_regs_accurate(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  if (n <= 0) return;
+  for (int i = 0; i < n; i++) {
+    int op = ir->compact_instructions[i].op;
+    if (op == TCCIR_OP_IJUMP || op == TCCIR_OP_SWITCH_TABLE || op == TCCIR_OP_SWITCH_LOAD)
+      return;
+  }
+  IRCFG *cfg = tcc_ir_cfg_build(ir);
+  if (!cfg) return;
+  tcc_ir_cfg_compute_dominators(cfg);
+  int nb = cfg->num_blocks;
+  if (nb <= 0) { tcc_ir_cfg_free(cfg); return; }
+  /* vreg index space */
+  int maxpos = 1;
+  for (int j = 0; j < ir->ls.next_interval_index; j++) {
+    int p = TCCIR_DECODE_VREG_POSITION(ir->ls.intervals[j].vreg);
+    if (p + 1 > maxpos) maxpos = p + 1;
+  }
+  int tbl = 4 * maxpos;
+  int nw = (tbl + 63) / 64;
+  #define DVIDX(vr) ((TCCIR_DECODE_VREG_TYPE(vr) * maxpos) + TCCIR_DECODE_VREG_POSITION(vr))
+  /* vreg -> physical regs */
+  int8_t *vr0 = tcc_malloc(tbl); int8_t *vr1 = tcc_malloc(tbl);
+  for (int i = 0; i < tbl; i++) { vr0[i] = -1; vr1[i] = -1; }
+  for (int j = 0; j < ir->ls.next_interval_index; j++) {
+    LSLiveInterval *iv = &ir->ls.intervals[j];
+    if (iv->stack_location != 0) continue;
+    int vi = DVIDX(iv->vreg);
+    if (vi < 0 || vi >= tbl) continue;
+    vr0[vi] = (int8_t)iv->r0; vr1[vi] = (int8_t)iv->r1;
+  }
+  uint64_t *useb = tcc_mallocz(sizeof(uint64_t)*(size_t)nb*nw);
+  uint64_t *defbk= tcc_mallocz(sizeof(uint64_t)*(size_t)nb*nw);
+  uint64_t *livein=tcc_mallocz(sizeof(uint64_t)*(size_t)nb*nw);
+  uint64_t *liveout=tcc_mallocz(sizeof(uint64_t)*(size_t)nb*nw);
+  for (int b = 0; b < nb; b++) {
+    uint64_t *ub = useb + (size_t)b*nw, *db = defbk + (size_t)b*nw;
+    int s = cfg->blocks[b].start_idx, e = cfg->blocks[b].end_idx;
+    for (int i = s; i < e && i < n; i++) {
+      int32_t def=-1, hd=0, uses[4], nu=0;
+      ra_co_ops(ir, &ir->compact_instructions[i], &def, &hd, uses, &nu);
+      for (int k=0;k<nu;k++){ if(!tcc_ir_vreg_is_valid(ir,uses[k]))continue; int u=DVIDX(uses[k]); if(u<0||u>=tbl)continue; if(!RA_BS_TEST(db,u)) RA_BS_SET(ub,u);}
+      if (hd && tcc_ir_vreg_is_valid(ir,def)){int d=DVIDX(def); if(d>=0&&d<tbl) RA_BS_SET(db,d);}
+    }
+  }
+  int changed=1, guard=0;
+  while (changed && guard++ < nb+4) {
+    changed=0;
+    for (int ri=cfg->rpo_count-1; ri>=0; ri--) {
+      int b = cfg->rpo_order ? cfg->rpo_order[ri] : ri;
+      if (b<0||b>=nb) continue;
+      uint64_t *lo=liveout+(size_t)b*nw,*li=livein+(size_t)b*nw,*ub=useb+(size_t)b*nw,*db=defbk+(size_t)b*nw;
+      for (int w=0;w<nw;w++) lo[w]=0;
+      for (int si=0;si<cfg->blocks[b].num_succs;si++){int sb=cfg->blocks[b].succs[si]; if(sb<0||sb>=nb)continue; uint64_t*sli=livein+(size_t)sb*nw; for(int w=0;w<nw;w++) lo[w]|=sli[w];}
+      for (int w=0;w<nw;w++){uint64_t nv=ub[w]|(lo[w]&~db[w]); if(nv!=li[w]){li[w]=nv;changed=1;}}
+    }
+  }
+  /* Loop-liveness completion.  A value live at a loop header is live throughout
+   * the ENTIRE loop body (it round-trips the back-edge), but the interval model
+   * gives it a single [def,last-use] range that leaves the loop-header prefix
+   * uncovered — the scratch picker then reuses its register inside the loop and
+   * clobbers the loop-carried value (seed 244).  For each back-edge, OR the
+   * registers live-IN at the loop header across the whole loop body [header,
+   * back-edge].  Scoped to loop bodies on purpose: a blanket per-instruction
+   * live-out refinement also marks straight-line liveness the interval model
+   * intentionally omits, which over-constrains the scratch picker and perturbs
+   * unrelated functions into latent-bug territory (seed 221). */
+  for (int bi = 0; bi < n; bi++) {
+    IRQuadCompact *q = &ir->compact_instructions[bi];
+    if (q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF) continue;
+    int t = (int)tcc_ir_op_get_dest(ir, q).u.imm32;
+    if (t < 0 || t >= bi) continue; /* not a back-edge */
+    /* live-in at the loop header t: find the block starting at t. */
+    int hb = -1;
+    for (int b = 0; b < nb; b++) if (cfg->blocks[b].start_idx == t) { hb = b; break; }
+    if (hb < 0) continue;
+    uint64_t *hli = livein + (size_t)hb*nw;
+    uint32_t mask = 0;
+    for (int vi=0; vi<tbl; vi++) {
+      if (!RA_BS_TEST(hli,vi)) continue;
+      if (vr0[vi]>=0 && vr0[vi]<16) mask |= (1u<<vr0[vi]);
+      if (vr1[vi]>=0 && vr1[vi]<16) mask |= (1u<<vr1[vi]);
+    }
+    mask &= 0x1FFFu; /* R0-R12 */
+    if (!mask || !ir->ls.live_regs_by_instruction) continue;
+    int e = bi; if (e >= ir->ls.live_regs_by_instruction_size) e = ir->ls.live_regs_by_instruction_size - 1;
+    for (int k = t; k <= e; k++)
+      ir->ls.live_regs_by_instruction[k] |= mask;
+  }
+  #undef DVIDX
+  tcc_free(vr0);tcc_free(vr1);tcc_free(useb);tcc_free(defbk);tcc_free(livein);tcc_free(liveout);
+  tcc_ir_cfg_free(cfg);
+}
 
 static void ra_coalesce_graph(TCCIRState *ir, SSAInterval *intervals, int count,
                               int max_vreg_pos)
@@ -3733,6 +3851,29 @@ static void ra_coalesce_graph(TCCIRState *ir, SSAInterval *intervals, int count,
     }
   }
 
+  /* ---- Build per-block def bitmap to detect phi-related copies. ----
+   * A copy dest that is defined in more than one block is a phi result
+   * (explicit copies inserted after SSA phi resolution).  Coalescing such
+   * a dest with its source can overwrite the source's value on a sibling
+   * phi arm when the source is still live across the merge (seed 860). */
+  uint64_t *def_blocks = tcc_mallocz(sizeof(uint64_t) * (size_t)nb * nw);
+  int *instr_block = tcc_malloc(sizeof(int) * n);
+  for (int i = 0; i < n; i++) instr_block[i] = -1;
+  for (int b = 0; b < nb; b++) {
+    int s = cfg->blocks[b].start_idx, e = cfg->blocks[b].end_idx;
+    for (int i = s; i < e && i < n; i++) {
+      instr_block[i] = b;
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      int32_t def = -1, hd = 0, uses[4], nu = 0;
+      ra_co_ops(ir, q, &def, &hd, uses, &nu);
+      if (hd && tcc_ir_vreg_is_valid(ir, def)) {
+        int d = VIDX(def);
+        if (d >= 0 && d < tbl)
+          RA_BS_SET(def_blocks + (size_t)b * nw, d);
+      }
+    }
+  }
+
   /* ---- Collect copy edges + candidate set (Stage 4 prep). ---- */
   /* Copy edge kinds: ASSIGN dst<-src; two-address dst<-src OP imm (ADD/SUB). */
   int *cand_id = tcc_malloc(sizeof(int) * tbl);
@@ -3766,15 +3907,55 @@ static void ra_coalesce_graph(TCCIRState *ir, SSAInterval *intervals, int count,
     int di = VIDX(dv), si = VIDX(sv);
     if (di < 0 || di >= tbl || si < 0 || si >= tbl) continue;
     if (iv_of[di] < 0 || iv_of[si] < 0) continue; /* both must have intervals */
+    /* Reject unsafe phi-result copies: the dest is defined on multiple
+     * incoming edges.  The dangerous case is when the source temp is itself
+     * a copy of a VAR that is live-out of the merge block; coalescing the
+     * phi result with that source (transitively with the VAR) lets a sibling
+     * phi arm overwrite the still-live VAR (seed 860).  Latch-style loop
+     * phis, where the source is computed in the latch, are unaffected. */
+    {
+      int def_bc = 0;
+      for (int b = 0; b < nb; b++) {
+        if (RA_BS_TEST(def_blocks + (size_t)b * nw, di)) {
+          def_bc++;
+          if (def_bc > 1) break;
+        }
+      }
+      if (def_bc > 1) {
+        /* Allow phi-copy coalescing only when the merge block is a loop header
+         * (one of its predecessors is a back edge, i.e. the merge block dominates
+         * that predecessor).  Loop phis coalesce safely because the latch source
+         * is not live-out of the header.  Conditional-merge phis can have a
+         * source equivalent to a variable live across the merge; coalescing them
+         * lets the sibling arm overwrite that variable (seed 860). */
+        int bi = instr_block[i];
+        int is_loop_header = 0;
+        if (bi >= 0 && bi < nb) {
+          for (int pi = 0; pi < cfg->blocks[bi].num_preds; pi++) {
+            int pb = cfg->blocks[bi].preds[pi];
+            if (pb >= 0 && pb < nb && tcc_ir_cfg_dominates(cfg, bi, pb)) {
+              is_loop_header = 1;
+              break;
+            }
+          }
+        }
+        if (!is_loop_header) {
+          continue;
+        }
+      }
+    }
     ADD_CAND(di); ADD_CAND(si);
     if (ne >= ecap) { ecap *= 2; edge_d = tcc_realloc(edge_d, sizeof(int32_t)*ecap);
                       edge_s = tcc_realloc(edge_s, sizeof(int32_t)*ecap); }
     edge_d[ne] = di; edge_s[ne] = si; ne++;
   }
 
+  tcc_free(def_blocks);
+
   if (ncand < 2 || ne == 0) {
     tcc_free(iv_of); tcc_free(useb); tcc_free(defbk); tcc_free(livein);
-    tcc_free(liveout); tcc_free(cand_id); tcc_free(edge_d); tcc_free(edge_s);
+    tcc_free(liveout); tcc_free(instr_block);
+    tcc_free(cand_id); tcc_free(edge_d); tcc_free(edge_s);
     tcc_ir_cfg_free(cfg);
     return;
   }
@@ -3974,6 +4155,7 @@ static void ra_coalesce_graph(TCCIRState *ir, SSAInterval *intervals, int count,
   #undef VIDX
   tcc_free(deg); tcc_free(live);
   tcc_free(iv_of); tcc_free(useb); tcc_free(defbk); tcc_free(livein); tcc_free(liveout);
+  tcc_free(instr_block);
   tcc_free(cand_id); tcc_free(cand_vidx); tcc_free(edge_d); tcc_free(edge_s);
   tcc_ir_cfg_free(cfg);
 }
@@ -3984,6 +4166,153 @@ static void ra_coalesce_graph(TCCIRState *ir, SSAInterval *intervals, int count,
 
 void dbg_scan_imm_dest(TCCIRState *ir, const char *pass);
 void dbg_scan_overlap(TCCIRState *ir, const char *pass);
+/* Promote multiply-block-defined TEMPs to fresh VARs so SSA construction places
+ * phis for them.  The frontend emits a single TEMP written on BOTH arms of a
+ * branch-lowered ternary (`cond ? a : b` where an arm has a side effect / call,
+ * so it cannot lower to SELECT) — e.g. `T323 <- a` in one block and `T323 <- b`
+ * in another, then a merge-block use.  That violates the SSA-by-construction
+ * assumption the renamer makes for TEMPs (it renames only VARs and leaves such a
+ * TEMP untouched), so the merge use resolves to ONE arm's definition
+ * unconditionally — random-C O1/O2 wrong-code, seeds 100/118 (the value reached a
+ * later inlined-csmix use as the else-arm value regardless of the condition).
+ * Converting the TEMP to a VAR routes it through the normal var→SSA promotion,
+ * which inserts the phi.  VAR and TEMP operands share the IROP_TAG_VREG encoding
+ * and differ only in the type bits, so irop_set_vreg suffices; tcc_ir_vreg_alloc_var
+ * grows the live-interval array.  Only fires for the rare multi-block-def TEMP. */
+static void ra_promote_multidef_temps_to_vars(TCCIRState *ir, IRCFG *cfg)
+{
+  int n = ir->next_instruction_index;
+  int ntmp = ir->next_temporary_variable;
+  if (n <= 0 || ntmp <= 0 || !cfg || cfg->num_blocks <= 1)
+    return;
+
+  /* Skip functions that take label addresses (GCC labels-as-values, `&&label`):
+   * their exact machine-code layout is observable at runtime via the label-offset
+   * map, so the phi-resolution copies this promotion introduces would shift those
+   * offsets (96_nodata_wanted measures code size with `&&label` arithmetic).
+   * Such functions also have inlining disabled (tccgen gates auto-inline on
+   * !func_has_label_addr), so they never hit the inlined-ternary miscompile this
+   * promotion fixes — skipping them is free of correctness cost. */
+  if (ir->func_has_label_addr)
+    return;
+
+  /* Only run when SSA construction will actually proceed and rename the new VARs
+   * back into SSA temps.  SSA construction BAILS on un-enumerable control flow
+   * (IJUMP / computed goto, SETJMP); if we promoted there, the converted VARs
+   * would be left as unpromoted stack slots and change codegen for the worse
+   * (96_nodata_wanted's `&&label` arithmetic).  Mirror ssa_has_unsupported_ops. */
+  for (int i = 0; i < n; i++) {
+    TccIrOp op = ir->compact_instructions[i].op;
+    if (op == TCCIR_OP_IJUMP || op == TCCIR_OP_SETJMP || op == TCCIR_OP_NL_SETJMP)
+      return;
+  }
+
+  /* def_block[t] = the block of t's first def, or -2 = multi-block, -1 = none. */
+  int *def_block = tcc_malloc(sizeof(int) * ntmp);
+  for (int t = 0; t < ntmp; t++) def_block[t] = -1;
+
+  for (int i = 0; i < n; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
+      continue;
+    if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
+        q->op == TCCIR_OP_STORE_POSTINC || q->op == TCCIR_OP_FUNCPARAMVAL ||
+        q->op == TCCIR_OP_FUNCPARAMVOID)
+      continue;
+    IROperand d = tcc_ir_op_get_dest(ir, q);
+    int32_t vr = irop_get_vreg(d);
+    if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP) continue;
+    if (d.is_lval) continue; /* a deref store target, not a plain TEMP def */
+    int t = TCCIR_DECODE_VREG_POSITION(vr);
+    if (t < 0 || t >= ntmp) continue;
+    int blk = cfg->instr_to_block[i];
+    if (def_block[t] == -1) def_block[t] = blk;
+    else if (def_block[t] != blk) def_block[t] = -2; /* multi-block */
+  }
+
+  /* A multi-block-defined TEMP only needs a phi (and only then is its renaming
+   * actually wrong) when it has a USE in a block that does not itself define it —
+   * a value flowing across a merge.  A TEMP whose uses are all in its own
+   * def-blocks reaches each use from the local def and is already correct;
+   * promoting it would insert needless phi-copies and grow code (96_nodata_wanted
+   * measures code size via `&&label` arithmetic and is sensitive to this).  For
+   * each multi-block TEMP, mark its def-blocks and require a use elsewhere. */
+  int32_t *temp_to_var = tcc_malloc(sizeof(int32_t) * ntmp);
+  for (int t = 0; t < ntmp; t++) temp_to_var[t] = -1;
+  uint8_t *needs_phi = tcc_mallocz(ntmp);
+  {
+    uint8_t *isdef = tcc_mallocz(cfg->num_blocks);
+    for (int t = 0; t < ntmp; t++) {
+      if (def_block[t] != -2) continue;
+      memset(isdef, 0, cfg->num_blocks);
+      /* collect def-blocks of t */
+      for (int i = 0; i < n; i++) {
+        IRQuadCompact *q = &ir->compact_instructions[i];
+        if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest) continue;
+        if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
+            q->op == TCCIR_OP_STORE_POSTINC || q->op == TCCIR_OP_FUNCPARAMVAL ||
+            q->op == TCCIR_OP_FUNCPARAMVOID) continue;
+        IROperand d = tcc_ir_op_get_dest(ir, q);
+        int32_t vr = irop_get_vreg(d);
+        if (vr >= 0 && !d.is_lval && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP &&
+            TCCIR_DECODE_VREG_POSITION(vr) == t)
+          isdef[cfg->instr_to_block[i]] = 1;
+      }
+      /* a use in a non-def block ⇒ needs a phi */
+      for (int i = 0; i < n && !needs_phi[t]; i++) {
+        IRQuadCompact *q = &ir->compact_instructions[i];
+        if (q->op == TCCIR_OP_NOP) continue;
+        int blk = cfg->instr_to_block[i];
+        if (isdef[blk]) continue;
+        int32_t uses[5]; int nu = 0;
+        if (irop_config[q->op].has_src1) uses[nu++] = irop_get_vreg(tcc_ir_op_get_src1(ir, q));
+        if (irop_config[q->op].has_src2) uses[nu++] = irop_get_vreg(tcc_ir_op_get_src2(ir, q));
+        if (q->op == TCCIR_OP_MLA) uses[nu++] = irop_get_vreg(tcc_ir_op_get_accum(ir, q));
+        if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED || q->op == TCCIR_OP_STORE_POSTINC)
+          uses[nu++] = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
+        for (int u = 0; u < nu; u++)
+          if (uses[u] >= 0 && TCCIR_DECODE_VREG_TYPE(uses[u]) == TCCIR_VREG_TYPE_TEMP &&
+              TCCIR_DECODE_VREG_POSITION(uses[u]) == t) { needs_phi[t] = 1; break; }
+      }
+    }
+    tcc_free(isdef);
+  }
+  int any = 0;
+  for (int t = 0; t < ntmp; t++) {
+    if (needs_phi[t]) { temp_to_var[t] = tcc_ir_vreg_alloc_var(ir); any = 1; }
+  }
+  tcc_free(needs_phi);
+  if (!any) { tcc_free(def_block); tcc_free(temp_to_var); return; }
+
+  /* Rewrite every operand referencing a promoted TEMP to its VAR (type bits only;
+   * is_local/is_lval/tag are preserved). */
+  #define REMAP(getter, setter)                                                                                         \
+    do {                                                                                                                \
+      IROperand o = getter(ir, q);                                                                                      \
+      int32_t ovr = irop_get_vreg(o);                                                                                   \
+      if (ovr >= 0 && TCCIR_DECODE_VREG_TYPE(ovr) == TCCIR_VREG_TYPE_TEMP) {                                            \
+        int op_t = TCCIR_DECODE_VREG_POSITION(ovr);                                                                     \
+        if (op_t >= 0 && op_t < ntmp && temp_to_var[op_t] >= 0) {                                                       \
+          irop_set_vreg(&o, temp_to_var[op_t]);                                                                         \
+          setter(ir, q, o);                                                                                             \
+        }                                                                                                               \
+      }                                                                                                                 \
+    } while (0)
+
+  for (int i = 0; i < n; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP) continue;
+    if (irop_config[q->op].has_dest) REMAP(tcc_ir_op_get_dest, tcc_ir_op_set_dest);
+    if (irop_config[q->op].has_src1) REMAP(tcc_ir_op_get_src1, tcc_ir_op_set_src1);
+    if (irop_config[q->op].has_src2) REMAP(tcc_ir_op_get_src2, tcc_ir_op_set_src2);
+    if (q->op == TCCIR_OP_MLA) REMAP(tcc_ir_op_get_accum, tcc_ir_op_set_accum);
+  }
+  #undef REMAP
+
+  tcc_free(def_block);
+  tcc_free(temp_to_var);
+}
+
 void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill_base)
 {
   if (!ir || !target) return;
@@ -3997,6 +4326,8 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
   }
   tcc_ir_cfg_compute_dominators(cfg);
   tcc_ir_cfg_compute_dom_frontiers(cfg);
+
+  ra_promote_multidef_temps_to_vars(ir, cfg);
 
   /* Construct SSA */
   IRSSAState *ssa = tcc_ir_ssa_construct(ir, cfg);
@@ -4031,7 +4362,8 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
 #define RUN_SSA(name, call)                                                                                            \
   do                                                                                                                   \
   {                                                                                                                    \
-    (call);                                                                                                            \
+    if (!tcc_ir_opt_pass_disabled(name))                                                                               \
+      (call);                                                                                                          \
     tcc_ir_dump_after_pass(ir, name);                                                                                  \
   } while (0)
         ssa_opt_ctx.no_stack_fwd = 0;
@@ -4247,6 +4579,7 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
    * is cleared. We just need to build the live_regs bitmap from the
    * intervals the linear scan produced. */
   ra_build_live_regs_bitmap(ir);
+  ra_refine_live_regs_accurate(ir);
 
   /* Cleanup */
   tcc_free(intervals);

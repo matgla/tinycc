@@ -157,17 +157,14 @@ def test_forward_branch_conditional_still_wide():
     funcs = _disassemble(obj)
     loop = funcs["loop"]
 
-    wide_fwd = _count_mnem(loop, "bge.w")
-    narrow_back = _count_mnem(loop, "b.n")
+    wide_fwd = sum(_count_mnem(loop, m) for m in ("bgt.w", "bge.w", "blt.w", "ble.w", "beq.w", "bne.w"))
+    narrow_back = _count_mnem(loop, "blt.n")
 
-    # Loop rotation is currently disabled (it had O2 wrong-code bugs — see the
-    # `return 0` guards in tcc_ir_opt_loop_rotation), so the loop keeps its
-    # top-tested form: the back-edge is an unconditional narrow `b.n` rather than
-    # the rotated tight `blt.n`.  When rotation is re-enabled this should become a
-    # backward conditional branch again.
-    assert narrow_back >= 1, f"expected narrow backward b.n, got {narrow_back}"
+    # Loop rotation is enabled, so the loop is bottom-tested: the back-edge is a
+    # tight conditional narrow `blt.n` rather than an unconditional `b.n`.
+    assert narrow_back >= 1, f"expected narrow backward blt.n, got {narrow_back}"
     # Forward conditional branches still stay wide (Phase 2a not landed).
-    assert wide_fwd >= 1, f"expected forward bge.w, got {wide_fwd}"
+    assert wide_fwd >= 1, f"expected forward wide conditional branch, got {wide_fwd}"
 
 
 # -----------------------------------------------------------------------------

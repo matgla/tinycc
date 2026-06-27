@@ -2733,6 +2733,16 @@ static void th_literal_pool_reserve_upcoming_bytes(int upcoming_bytes)
     th_literal_pool_generate();
 }
 
+static int th_literal_pool_would_flush_for(int upcoming_bytes)
+{
+  int pool_count = dry_run_state.active ? dry_run_literal_pool_count : thumb_gen_state.literal_pool_count;
+
+  if (!thumb_gen_state.generating_function || pool_count == 0)
+    return 0;
+
+  return thumb_gen_state.code_size + pool_count * 4 + upcoming_bytes >= 1020;
+}
+
 int is_valid_opcode(thumb_opcode op)
 {
   return (op.size == 2 || op.size == 4);
@@ -5505,6 +5515,31 @@ static void thumb_emit_data_processing_mop32(const MachineOperand *src1, const M
     }
   }
 
+  /* Shift-by-0 identity: on ARM, LSR/ASR with immediate field 0 means
+   * shift-by-32 (yielding 0 / sign-extend), NOT shift-by-0.  Fold x >> 0
+   * to a plain MOV Rd, Rm so the semantics are correct regardless of
+   * whether the optimizer managed to simplify the IR. */
+  if (!dest_sets_flags && barrel_shift == 0 &&
+      (op == TCCIR_OP_SHR || op == TCCIR_OP_SAR || op == TCCIR_OP_ROR) &&
+      src2->kind == MACH_OP_IMM && !src2->needs_deref && !src2->is_64bit &&
+      (uint32_t)src2->u.imm.val == 0)
+  {
+    int dest_reg = mach_get_dest_reg(&mctx, dest, 0);
+    uint32_t excl = thumb_is_hw_reg(dest_reg) ? (1u << (uint32_t)dest_reg) : 0;
+    int src1_reg = mach_ensure_in_reg(&mctx, src1, excl);
+    ot_check_mov_reg((uint32_t)dest_reg, (uint32_t)src1_reg, flags,
+                     THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
+    if (dest->kind != MACH_OP_NONE)
+    {
+      const bool needs_wb = dest->kind == MACH_OP_SPILL || dest->kind == MACH_OP_PARAM_STACK ||
+                            (dest->kind == MACH_OP_REG && (dest->needs_deref || dest->u.reg.r0 == (int)PREG_REG_NONE));
+      if (needs_wb)
+        mach_writeback_dest(dest, dest_reg);
+    }
+    mach_release_all(&mctx);
+    return;
+  }
+
   /* UXTB/UXTH fast path: AND with #0xFF or #0xFFFF → UXTB/UXTH.
    * 16-bit encoding (2 bytes) vs 32-bit AND immediate (4 bytes). */
   if (op == TCCIR_OP_AND && !dest_sets_flags && barrel_shift == 0 &&
@@ -5862,6 +5897,14 @@ static void mach_mod_mop(MachineCodegenContext *ctx, const MachineOperand *src1,
   /* 1. Get dest register. */
   int dest_reg = mach_get_dest_reg(ctx, dest, 0);
   uint32_t excl = thumb_is_hw_reg(dest_reg) ? (1u << (uint32_t)dest_reg) : 0;
+
+  /* Pre-exclude src2's physical register so that materializing src1 (which may
+   * need a scratch when it is an immediate or a deref) does not clobber src2's
+   * value before the divide reads it — same guard as mach_regonly_binop_mop.
+   * Without it an immediate dividend's scratch load could land on the divisor's
+   * register (random-C O1 wrong-code, seed 151: `K % (lr|1)` divisor clobbered). */
+  if (src2->kind == MACH_OP_REG && !src2->needs_deref && thumb_is_hw_reg(src2->u.reg.r0))
+    excl |= (1u << (uint32_t)src2->u.reg.r0);
 
   /* 2. Ensure src1 in a register. */
   int src1_reg = mach_ensure_in_reg(ctx, src1, excl);
@@ -7088,8 +7131,13 @@ ST_FUNC void tcc_gen_machine_setif_mop(MachineOperand src, MachineOperand dest, 
     uint32_t excl = thumb_is_hw_reg(lo_reg) ? (1u << (uint32_t)lo_reg) : 0u;
     int hi_reg = mach_get_dest_reg(&mctx, &dst_hi, excl);
 
-    /* Emit ITE sequence for lo word. */
-    th_literal_pool_reserve_upcoming_bytes(6);
+    /* Emit ITE sequence for lo word.  Reserve the WHOLE atomic ITE+movs block so
+     * a literal-pool flush never lands between the IT and its conditioned movs.
+     * A high register (R8-R12) dest forces the 4-byte mov.w (T2) encoding, so the
+     * worst case is ITE(2) + 3*mov.w(4) = 14 bytes — NOT 6 (which only covers the
+     * 2-byte movs of a low-reg dest).  Under-reserving split the ITE and ran the
+     * fall-through into the literal pool (seed 89 O1 HardFault). */
+    th_literal_pool_reserve_upcoming_bytes(14);
     ot_check(th_it(cond, ite_mask)); /* ITE <cond> — two conditioned instructions */
     ot_check(th_mov_imm(lo_reg, 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
     ot_check(th_mov_imm(lo_reg, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
@@ -7103,7 +7151,11 @@ ST_FUNC void tcc_gen_machine_setif_mop(MachineOperand src, MachineOperand dest, 
   {
     int dest_reg = mach_get_dest_reg(&mctx, &dest, 0);
 
-    th_literal_pool_reserve_upcoming_bytes(6);
+    /* Reserve the whole ITE+2-movs block: a high-register dest (R8-R12) uses the
+     * 4-byte mov.w (T2) encoding, so the worst case is ITE(2) + 2*mov.w(4) = 10
+     * bytes, not 6.  Under-reserving let a literal-pool flush split the ITE and
+     * run the fall-through into the pool (seed 89 O1 HardFault). */
+    th_literal_pool_reserve_upcoming_bytes(10);
     ot_check(th_it(cond, ite_mask)); /* ITE <cond> — two conditioned instructions */
     ot_check(th_mov_imm(dest_reg, 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
     ot_check(th_mov_imm(dest_reg, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
@@ -11998,6 +12050,13 @@ static int can_narrow_backward_branch(int32_t target_ir, int is_conditional, int
 
   /* Only backward branches (negative offset) are safe to narrow here */
   if (offset >= 0)
+    return 0;
+
+  /* If emitting the narrow branch would first flush a pending literal pool,
+   * the branch source moves forward after this range check.  A borderline
+   * T1/T2 branch can become out of range by the time backpatching runs, and
+   * th_patch_call() cannot widen an already-emitted 16-bit branch in place. */
+  if (th_literal_pool_would_flush_for(2))
     return 0;
 
   return is_conditional ? branch_fits_t1(offset) : branch_fits_t2(offset);

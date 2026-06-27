@@ -10,14 +10,16 @@
 
 #define USING_GLOBALS
 
+#include <ctype.h>
+
 #include "ir.h"
 #include "opt_pipeline.h"
 #include "opt.h"
+#include "opt_utils.h"
 #include "opt_gens_fusion.h"
 #include "opt_gens_bool.h"
 #include "opt_gens_call_result.h"
 #include "opt_gens_branch.h"
-#include "opt_utils.h"
 #include "opt_xform.h"
 
 #define FLAG(f) (uint16_t)offsetof(TCCState, f)
@@ -125,6 +127,8 @@ int tcc_ir_opt_run_group(IROptCtx *ctx, const IRPassGroup *group)
       const IROptPass *trigger = &group->passes[group->trigger_idx];
       if (trigger->flag_offset && !*((unsigned char *)tcc_state + trigger->flag_offset))
         break;
+      if (tcc_ir_opt_pass_disabled(trigger->name))
+        break;
       if (tcc_pass_timing_on > 0) {
         unsigned long _rt = tcc_pass_clk_us();
         pipeline_ensure_requirements(ctx, trigger->requires);
@@ -151,6 +155,8 @@ int tcc_ir_opt_run_group(IROptCtx *ctx, const IRPassGroup *group)
       if (!pass->run)
         continue;
       if (pass->flag_offset && !*((unsigned char *)tcc_state + pass->flag_offset))
+        continue;
+      if (tcc_ir_opt_pass_disabled(pass->name))
         continue;
 
       if (tcc_pass_timing_on > 0) {

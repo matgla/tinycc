@@ -116,6 +116,15 @@ void ir_opt_du_build_mode(TCCIRState *ir, IROptDU *du, uint8_t mode)
       if (idx >= 0 && du->use[idx] < 2)
         du->use[idx]++;
     }
+    /* MLA/MLS have a 4th accumulator operand that is a USE of its vreg.
+     * Missing it makes call-result elimination think the result is dead
+     * when it is only consumed as an MLA accumulator (seed 4274). */
+    if (q->op == TCCIR_OP_MLA)
+    {
+      int idx = ir_opt_du_idx(du, irop_get_vreg(tcc_ir_op_get_accum(ir, q)));
+      if (idx >= 0 && du->use[idx] < 2)
+        du->use[idx]++;
+    }
   }
 }
 

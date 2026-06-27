@@ -1570,14 +1570,25 @@ int tcc_ir_opt_local_alu_cse(TCCIRState *ir)
           kills = 1;
         if (dest_vr_kill >= 0)
         {
-          if (cache[c].s1_tag == IROP_TAG_VREG && cache[c].s1_vr == dest_vr_kill)
+          /* A cached source operand reads the just-redefined value if it carries
+           * dest_vr_kill's vreg — whether encoded as a plain VREG or as a
+           * STACKOFF-lval VAR read (a local variable read).  The original guard
+           * only matched IROP_TAG_VREG, so a re-assignment of a local VAR
+           * (`lr = ...`, dest encoded STACKOFF-lval, dest_vr_kill = the VAR vreg)
+           * failed to invalidate a cached `pb XOR lr` keyed on the old lr, and the
+           * stale value was commutatively re-CSE'd into a later `lr XOR pb`
+           * (random-C O1 wrong-code, seeds 202/251). */
+          #define ALU_CSE_KILLS_VR(tg, lv, vr) \
+            (((tg) == IROP_TAG_VREG || ((tg) == IROP_TAG_STACKOFF && (lv))) && (vr) == dest_vr_kill)
+          if (ALU_CSE_KILLS_VR(cache[c].s1_tag, cache[c].s1_lval, cache[c].s1_vr))
             kills = 1;
-          else if (cache[c].s2_tag == IROP_TAG_VREG && cache[c].s2_vr == dest_vr_kill)
+          else if (ALU_CSE_KILLS_VR(cache[c].s2_tag, cache[c].s2_lval, cache[c].s2_vr))
             kills = 1;
-          else if (cache[c].s3_tag == IROP_TAG_VREG && cache[c].s3_vr == dest_vr_kill)
+          else if (ALU_CSE_KILLS_VR(cache[c].s3_tag, cache[c].s3_lval, cache[c].s3_vr))
             kills = 1;
           else if (cache[c].dest_vr == dest_vr_kill)
             kills = 1; /* this op redefines a previously-cached dest — drop entry */
+          #undef ALU_CSE_KILLS_VR
         }
         if (!kills)
           cache[w++] = cache[c];

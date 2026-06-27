@@ -75,6 +75,34 @@ assert ARRAY_SIZE & (ARRAY_SIZE - 1) == 0, "ARRAY_SIZE must be a power of two"
 SIGNED_TYPES = ["int", "short", "char", "long"]
 UNSIGNED_TYPES = ["unsigned", "unsigned short", "unsigned char", "unsigned long"]
 
+# ---------------------------------------------------------------------------
+# Generator feature PROFILES  (Axis 2 of docs/plan_fuzz_reach_expansion.md)
+# ---------------------------------------------------------------------------
+# The fuzzer only ever finds bugs in the slice of C it emits.  A *profile* widens
+# that slice along one feature axis (floats, pointers, bitfields, ...).
+#
+# HARD INVARIANT — the default profile ("int") is BYTE-IDENTICAL to the historical
+# stream.  Every feature below is gated on a flag in ``Gen.features`` so that when
+# the flag is absent *no* rng value is drawn and *no* text is emitted.  That keeps
+# the seed->bug mapping recorded in the triage tables + fuzz memories valid.
+# Expand reach by adding a NEW profile; never edit the default stream.
+PROFILES = {
+    "int":   frozenset(),                 # default — DO NOT change its stream
+    "float": frozenset({"float"}),        # adds double/float arithmetic
+}
+DEFAULT_PROFILE = "int"
+
+# --- "float" profile tunables ---------------------------------------------
+# Literals are chosen so their value is EXACT in both float and double (mantissa
+# < 2**24) and finite/normal (no Inf, NaN or denormal), so every value's bit
+# pattern is identical under tcc soft-float and gcc soft-float -> any divergence
+# is a real codegen bug, never a legal FP disagreement.  Results are clamped to
+# |x| <= 2**40 each step so loop-carried FP can never grow to Inf.
+FP_TYPES = ["double", "float"]
+FP_MANT_BITS = 24                          # <= float's 24-bit significand
+FP_EXP_LO, FP_EXP_HI = -12, 20
+MAX_FP_VARS = 4                            # results clamped to |x| <= 2**40 (0x1p40)
+
 
 def _mask_for_type(ctype: str) -> str:
     """Bit mask that keeps an unsigned value in range for a storage type.
@@ -94,9 +122,10 @@ def _mask_for_type(ctype: str) -> str:
 class Gen:
     """Holds RNG + symbol tables while building one program."""
 
-    def __init__(self, seed: int):
+    def __init__(self, seed: int, features=frozenset()):
         self.rng = random.Random(seed)
         self.seed = seed
+        self.features = frozenset(features)   # active profile feature flags
         # Scalar unsigned variables currently in scope and known-initialised.
         # We only *read* from the signed-typed globals; all live compute vars are
         # unsigned so arithmetic never overflows a signed type.
@@ -104,6 +133,7 @@ class Gen:
         self.svars: list[tuple[str, str]] = []  # (name, ctype) signed globals (read only)
         self.arrays: list[str] = []      # unsigned array names (size ARRAY_SIZE)
         self.structs: list[str] = []     # struct instance names
+        self.fvars: list[tuple[str, str]] = []  # (name, ctype) FP locals ("float" profile)
         self.helpers: list[str] = []     # all helper function names (unsigned->unsigned)
         # Helpers that may be CALLED from the current context.  Restricted to
         # already-defined helpers while emitting a helper body so the call graph
@@ -251,6 +281,57 @@ class Gen:
             base = self.rconst()
         return f"((unsigned)({base}) & {ARRAY_SIZE - 1}u)"
 
+    def has(self, feature: str) -> bool:
+        return feature in self.features
+
+    # ----- floating-point generation ("float" profile only) -------------------
+
+    def _fconst(self, ctype: str) -> str:
+        """An EXACT, finite, normal FP literal of type ``ctype``.
+
+        Value = sign * m * 2**e with m < 2**24, so it is representable without
+        rounding in *both* float and double -> the literal parses to identical
+        bits on tcc and gcc (no parser-rounding false positives).  Emitted as a
+        C99 hex-float literal (Python ``float.hex()`` is exactly that syntax).
+        """
+        m = self.rng.randint(0, (1 << FP_MANT_BITS) - 1)
+        e = self.rng.randint(FP_EXP_LO, FP_EXP_HI)
+        sign = self.rng.choice((1.0, -1.0))
+        val = sign * m * (2.0 ** e)        # exact in IEEE double (and float)
+        lit = val.hex()                    # e.g. '-0x1.8000000000000p+3'
+        return f"{lit}f" if ctype == "float" else lit
+
+    def _fleaf(self, ctype: str) -> str:
+        """An FP operand of type ``ctype`` with no side effects.
+
+        One of: an exact constant, an existing FP var (float<->double casts are
+        defined), or an int->float cast of an unsigned value (always defined,
+        correctly rounded identically on both compilers).
+        """
+        choices = ["fconst", "fconst"]
+        if self.fvars:
+            choices += ["fvar", "fvar"]
+        if self.uvars:
+            choices.append("ucast")
+        kind = self.rng.choice(choices)
+        if kind == "fconst":
+            return self._fconst(ctype)
+        if kind == "fvar":
+            name, _ = self.rng.choice(self.fvars)
+            return f"({ctype})({name})"
+        return f"({ctype})((unsigned)({self.rng.choice(self.uvars)}))"
+
+    def _fclamp(self, pad: str, name: str, ctype: str) -> str:
+        """Bound |name| <= 2**40 so loop-carried FP can never reach Inf.
+
+        The bound is a power of two (exact); the compare/select also exercises FP
+        comparison + select codegen.  Result stays finite -> bits stay portable.
+        """
+        sfx = "f" if ctype == "float" else ""
+        big = f"0x1p40{sfx}"
+        return (f"{pad}{name} = ({name} < -{big} || {name} > {big}) "
+                f"? ({ctype})1 : {name};")
+
     # ----- statement generation ------------------------------------------------
 
     def block(self, depth: int, indent: int) -> list[str]:
@@ -269,6 +350,8 @@ class Gen:
             opts.append("arraystore")
         if self.structs:
             opts.append("structstore")
+        if self.has("float") and self.fvars:
+            opts += ["fassign", "fassign", "fcmp"]
         kind = self.rng.choice(opts)
 
         if kind == "assign":
@@ -289,6 +372,31 @@ class Gen:
             name = self.rng.choice(self.structs)
             f = self.rng.randint(0, STRUCT_FIELDS - 1)
             return [f"{pad}{name}.f{f} = (unsigned)({self.expr(MAX_EXPR_DEPTH)});"]
+
+        if kind == "fassign":
+            # Three-address single op (no a*b+c pattern to fuse) -> isolates each
+            # softfloat routine and keeps every intermediate rounded to nominal
+            # precision.  Result is clamped so it can never grow to Inf.
+            name, ctype = self.rng.choice(self.fvars)
+            op = self.rng.choice(["+", "-", "*", "/", "neg"])
+            if op == "neg":
+                rhs = f"-({self._fleaf(ctype)})"
+            elif op == "/":
+                a, b = self._fleaf(ctype), self._fleaf(ctype)
+                # Force a nonzero divisor: never 0.0/0.0 (NaN) or x/0.0 (Inf).
+                rhs = f"({a}) / ((({b}) == ({ctype})0) ? ({ctype})1 : ({b}))"
+            else:
+                a, b = self._fleaf(ctype), self._fleaf(ctype)
+                rhs = f"({a}) {op} ({b})"
+            return [f"{pad}{name} = {rhs};", self._fclamp(pad, name, ctype)]
+
+        if kind == "fcmp":
+            # Fold a finite, non-NaN FP comparison (portable 0/1) into the
+            # checksum -> exercises FP compare + the int<-bool path.
+            ctype = self.rng.choice(FP_TYPES)
+            cop = self.rng.choice(["<", ">", "<=", ">=", "==", "!="])
+            a, b = self._fleaf(ctype), self._fleaf(ctype)
+            return [f"{pad}cs = csmix(cs, (({a}) {cop} ({b})) ? 1u : 0u);"]
 
         if kind == "if":
             cond = self.expr(MAX_EXPR_DEPTH)
@@ -346,13 +454,17 @@ class Gen:
 # Top-level program assembly
 # ---------------------------------------------------------------------------
 
-def _prologue(seed: int) -> str:
-    return (
+def _prologue(seed: int, features=frozenset()) -> str:
+    # NB: when ``features`` is empty this is BYTE-IDENTICAL to the historical
+    # prologue (extra_inc == "" and no helpers appended).  Do not reorder.
+    extra_inc = "#include <string.h>\n" if "float" in features else ""
+    base = (
         f"/* AUTO-GENERATED by tests/fuzz/gen_c.py  seed={seed}\n"
         " * UB-free random C program for differential fuzzing (Tracks 2/3).\n"
         ' * Prints a single line: "checksum=<hex>".  Do not edit by hand.\n'
         " */\n"
         "#include <stdio.h>\n"
+        f"{extra_inc}"
         "\n"
         "/* Rolling checksum mix (all unsigned -> fully defined). */\n"
         "static unsigned csmix(unsigned h, unsigned v)\n"
@@ -362,6 +474,18 @@ def _prologue(seed: int) -> str:
         "  return h * 2654435761u;\n"
         "}\n"
     )
+    if "float" in features:
+        # Reinterpret FP bits -> unsigned via memcpy: no aliasing UB, and the
+        # store to a nominal-width object rounds away any excess precision, so
+        # the folded value is identical across compilers/optimisation levels.
+        base += (
+            "\n"
+            "static unsigned fbits_d(double d){ unsigned u[2]; "
+            "memcpy(u, &d, sizeof u); return csmix(u[0], u[1]); }\n"
+            "static unsigned fbits_f(float f){ unsigned u; "
+            "memcpy(&u, &f, sizeof u); return u; }\n"
+        )
+    return base
 
 
 def _emit_helper(g: Gen, name: str) -> str:
@@ -412,10 +536,15 @@ def _emit_helper(g: Gen, name: str) -> str:
     return "\n".join(lines)
 
 
-def generate_program(seed: int) -> str:
-    """Return the full C source for a UB-free random program for ``seed``."""
-    g = Gen(seed)
-    out: list[str] = [_prologue(seed)]
+def generate_program(seed: int, profile: str = DEFAULT_PROFILE) -> str:
+    """Return the full C source for a UB-free random program for ``seed``.
+
+    ``profile`` selects a feature set (see ``PROFILES``).  The default ``"int"``
+    profile is byte-identical to the historical generator.
+    """
+    features = PROFILES[profile] if isinstance(profile, str) else frozenset(profile)
+    g = Gen(seed, features)
+    out: list[str] = [_prologue(seed, features)]
 
     # --- helper functions (declared before main so calls are in scope) ---
     # Append each name to g.helpers only AFTER its body is emitted, so a helper
@@ -473,6 +602,16 @@ def generate_program(seed: int) -> str:
         main.append(f"  struct S {name} = {{ {inits} }};")
         g.structs.append(name)
 
+    # FP locals ("float" profile).  Force at least one of each width so both
+    # fbits_* reinterpret helpers are always referenced (-Wunused-function).
+    if g.has("float"):
+        n_fp = g.rng.randint(2, MAX_FP_VARS)
+        for i in range(n_fp):
+            ctype = ("double", "float")[i] if i < 2 else g.rng.choice(FP_TYPES)
+            name = g.fresh("f")
+            main.append(f"  {ctype} {name} = {g._fconst(ctype)};")
+            g.fvars.append((name, ctype))
+
     main.append("")
     # Body: a handful of statements / control flow.
     main += g.block(depth=2, indent=1)
@@ -494,6 +633,10 @@ def generate_program(seed: int) -> str:
     for name in g.structs:
         for i in range(STRUCT_FIELDS):
             main.append(f"  cs = csmix(cs, {name}.f{i});")
+    # Fold each FP var's exact bit pattern into the checksum.
+    for name, ctype in g.fvars:
+        helper = "fbits_f" if ctype == "float" else "fbits_d"
+        main.append(f"  cs = csmix(cs, {helper}({name}));")
 
     main.append('  printf("checksum=%08x\\n", cs);')
     main.append("  return 0;")
@@ -511,6 +654,8 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--seed", type=int, default=0, help="RNG seed (default 0)")
+    ap.add_argument("--profile", choices=sorted(PROFILES), default=DEFAULT_PROFILE,
+                    help="feature profile (default 'int' = byte-identical historical stream)")
     ap.add_argument("-o", "--output", type=str, default=None,
                     help="write the program to this file (default: stdout)")
     ap.add_argument("--count", type=int, default=0,
@@ -523,12 +668,12 @@ def main(argv=None) -> int:
         out_dir = Path(args.out_dir or ".")
         out_dir.mkdir(parents=True, exist_ok=True)
         for s in range(args.seed, args.seed + args.count):
-            src = generate_program(s)
+            src = generate_program(s, args.profile)
             (out_dir / f"fuzz_{s}.c").write_text(src)
         print(f"wrote {args.count} programs to {out_dir}", file=sys.stderr)
         return 0
 
-    src = generate_program(args.seed)
+    src = generate_program(args.seed, args.profile)
     if args.output:
         Path(args.output).write_text(src)
     else:

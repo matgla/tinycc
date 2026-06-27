@@ -64,6 +64,11 @@ def _default_seeds():
 
 SEEDS = _default_seeds()
 
+# Generator feature profile (Axis 2 of docs/plan_fuzz_reach_expansion.md).
+# FUZZ_PROFILE=float sweeps the FP profile.  This (ARM-gcc) oracle is the gold
+# standard for floats: soft-float -> IEEE correctly-rounded, no excess precision.
+PROFILE = os.environ.get("FUZZ_PROFILE", "int")
+
 
 def _gcc_ref_or_skip():
     usable, reason = H.gcc_reference_available()
@@ -93,7 +98,7 @@ def test_tcc_matches_gcc(seed, tmp_path):
         pytest.xfail(KNOWN_DIVERGENCES[seed])
 
     src = tmp_path / f"fuzz_{seed}.c"
-    src.write_text(generate_program(seed))
+    src.write_text(generate_program(seed, PROFILE))
 
     ref = H.run_with_gcc(src, GCC_OPT, tmp_path)
     if not ref.ok:

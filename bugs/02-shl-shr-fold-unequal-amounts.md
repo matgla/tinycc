@@ -1,6 +1,6 @@
 # 02 — `SHL N → SHR M` peephole only handles `N == M`
 
-**Status:** WORKED AROUND via [ir/opt_knownbits.c](../ir/opt_knownbits.c)
+**Status:** FIXED via generalized peephole in [ir/opt_constprop.c](../ir/opt_constprop.c)
 **Severity:** Medium — large class of missed folds on bitfield reads.
 
 ## Symptom
@@ -36,22 +36,21 @@ T15 = T14 SAR #25            ; expect: bits 0..6 sign-ext = -13
 
 `const_prop` can fold neither chain. The whole abort-test ladder stays alive.
 
-## Workaround
+## Fix
 
-Added [ir/opt_knownbits.c](../ir/opt_knownbits.c) — a known-bits lattice (per-temp
-and per-stack-slot `known_zero`/`known_one` masks). It propagates through
-`AND`/`OR`/`XOR`/`SHL`/`SHR`/`SAR` and rewrites the op to `ASSIGN imm`
-when all 32 bits become known. This covers the bitfield extract because
-the relevant bits of `T5` are forced known by the preceding inserts even
-though `T5`'s full value is not.
+Generalized the peephole in `ir/opt_constprop.c`.  For unsigned chains where
+`0 < N <= M < 32`, `SHL #N → SHR #M` is rewritten to
+`SHR #(M-N) → AND #((1 << (32-M)) - 1)`.  The resulting `SHR+AND` pair is then
+eligible for the existing `UBFX` fusion.  Equal shifts (`N == M`) keep the
+previous single-`AND` fold.
 
-## A simpler, narrower alternative
+Signed extracts (`SHL → SAR`) are still handled by `opt_knownbits.c`.
 
-For the unequal-shift peephole alone, generalize the existing fold:
-when `shl_amt <= shr_amt`, replace with `(x >> (M - N)) & ((1 << (32 - M)) - 1)`
-(`SHR` + `AND`). This won't help when the source value is partially known
-but not constant — the cascade still needs known-bits — so the workaround
-went the more general route.
+## Note
+
+`ir/opt_knownbits.c` remains in the pipeline; it covers cases where the source
+value is partially known but not constant and folds the whole chain to an
+immediate.
 
 ## Related
 

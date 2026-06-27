@@ -21,6 +21,51 @@
 #include "opt_utils.h"
 #include "opt_gens_branch.h"
 
+static int ir_branch_cmp_width(IROperand src1, IROperand src2)
+{
+  return (irop_get_btype(src1) == IROP_BTYPE_INT64 ||
+          irop_get_btype(src2) == IROP_BTYPE_INT64)
+             ? 64
+             : 32;
+}
+
+static int ir_branch_eval_const_cmp(int64_t val1, int64_t val2, int cond,
+                                    IROperand src1, IROperand src2)
+{
+  if (ir_branch_cmp_width(src1, src2) != 64)
+  {
+    uint32_t u1 = (uint32_t)val1;
+    uint32_t u2 = (uint32_t)val2;
+    int32_t s1 = (int32_t)u1;
+    int32_t s2 = (int32_t)u2;
+    switch (cond)
+    {
+    case TOK_EQ:
+      return u1 == u2;
+    case TOK_NE:
+      return u1 != u2;
+    case TOK_LT:
+      return s1 < s2;
+    case TOK_GE:
+      return s1 >= s2;
+    case TOK_LE:
+      return s1 <= s2;
+    case TOK_GT:
+      return s1 > s2;
+    case TOK_ULT:
+      return u1 < u2;
+    case TOK_UGE:
+      return u1 >= u2;
+    case TOK_ULE:
+      return u1 <= u2;
+    case TOK_UGT:
+      return u1 > u2;
+    default:
+      break;
+    }
+  }
+  return evaluate_compare_condition(val1, val2, cond);
+}
 
 static int ir_gen_branch_fold_test_zero(IROptCtx *ctx, int i)
 {
@@ -118,7 +163,7 @@ static int ir_gen_branch_fold_cmp(IROptCtx *ctx, int i)
   IROperand cond = tcc_ir_op_get_src1(ir, jump_q);
   int tok = (int)irop_get_imm64_ex(ir, cond);
 
-  int result = evaluate_compare_condition(val1, val2, tok);
+  int result = ir_branch_eval_const_cmp(val1, val2, tok, src1, src2);
   if (result < 0)
     return 0;
 

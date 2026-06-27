@@ -86,6 +86,7 @@ TCCIRState *tcc_ir_alloc(void)
   block->processing_if = 0;
   block->basic_block_start = 1;
   block->prevent_coalescing = 0;
+  block->func_has_label_addr = 0;
 
   /* Nested function / static chain fields */
   block->has_static_chain = 0;

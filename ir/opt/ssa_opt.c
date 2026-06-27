@@ -13,6 +13,8 @@
 #include "ssa_opt.h"
 #include <limits.h>
 
+extern int tcc_ir_opt_pass_disabled(const char *name);
+
 /* ============================================================================
  * Target-Specific Generator Registration
  * ============================================================================ */
@@ -687,7 +689,8 @@ int tcc_ir_ssa_opt_run(IRSSAOptCtx *ctx)
 #define SSA_RUN(name, call)                                                                                            \
   do                                                                                                                   \
   {                                                                                                                    \
-    changes += (call);                                                                                                 \
+    if (!tcc_ir_opt_pass_disabled(name))                                                                               \
+      changes += (call);                                                                                               \
     dbg_scan_imm_dest(ctx->ir, name);                                                                                  \
     tcc_ir_dump_after_pass(ctx->ir, name);                                                                             \
   } while (0)

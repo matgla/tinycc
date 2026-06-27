@@ -31,6 +31,12 @@ int evaluate_compare_condition(int64_t val1, int64_t val2, int cond_token);
 int is_power_of_2(int64_t n);
 
 /* ============================================================================
+ * Pass-disable helper (for debugging / bisection)
+ * ============================================================================ */
+
+int tcc_ir_opt_pass_disabled(const char *name);
+
+/* ============================================================================
  * Condition token helpers
  * ============================================================================ */
 

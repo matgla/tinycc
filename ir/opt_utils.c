@@ -10,12 +10,47 @@
 
 #define USING_GLOBALS
 
+#include <ctype.h>
+#include <stdlib.h>
+#include <string.h>
+
 #include "ir.h"
 #include "opt_utils.h"
 
 /* Forward declaration for mutual recursion */
 static int ir_opt_pure_expr_equal_impl(TCCIRState *ir, IROperand a, int a_use_idx,
                                        IROperand b, int b_use_idx, int depth);
+
+/* ============================================================================
+ * Pass-disable helper (for debugging / bisection)
+ * ============================================================================ */
+
+int tcc_ir_opt_pass_disabled(const char *name)
+{
+  static const char *disabled = NULL;
+  static int checked = 0;
+  if (!checked) {
+    checked = 1;
+    disabled = getenv("TCC_DISABLE_PASS");
+  }
+  if (!disabled || !name)
+    return 0;
+  const char *p = disabled;
+  size_t nlen = strlen(name);
+  while (*p) {
+    while (*p == ',' || isspace((unsigned char)*p))
+      p++;
+    if (!*p)
+      break;
+    const char *start = p;
+    while (*p && *p != ',' && !isspace((unsigned char)*p))
+      p++;
+    size_t len = p - start;
+    if (len == nlen && strncmp(start, name, len) == 0)
+      return 1;
+  }
+  return 0;
+}
 
 /* ============================================================================
  * Constant evaluators
@@ -124,6 +159,14 @@ int ir_opt_eval_const_u64(TCCIRState *ir, IROperand op, int use_idx, uint64_t *o
       return 0;
     if (!ir_opt_eval_const_u64(ir, tcc_ir_op_get_src2(ir, q), def_idx, &v2, depth + 1))
       return 0;
+    /* Determine the operand width so that shifts are evaluated at the
+     * correct precision.  Without this, a 32-bit SHR of a sign-extended
+     * negative constant (e.g. -u4 stored as 0xFFFFFFFFxxxxxxxx) would be
+     * computed as a 64-bit shift, yielding a completely different result
+     * than the runtime 32-bit operation. */
+    IROperand shift_src1 = tcc_ir_op_get_src1(ir, q);
+    int shift_btype = irop_get_btype(shift_src1);
+    int shift_is_64 = (shift_btype == IROP_BTYPE_INT64 || shift_btype == IROP_BTYPE_FLOAT64);
     switch (q->op)
     {
     case TCCIR_OP_ADD:
@@ -148,10 +191,16 @@ int ir_opt_eval_const_u64(TCCIRState *ir, IROperand op, int use_idx, uint64_t *o
       *out = v1 << v2;
       break;
     case TCCIR_OP_SHR:
-      *out = v1 >> v2;
+      if (shift_is_64)
+        *out = v1 >> v2;
+      else
+        *out = (uint64_t)((uint32_t)v1 >> (v2 & 31));
       break;
     case TCCIR_OP_SAR:
-      *out = (uint64_t)((int64_t)v1 >> v2);
+      if (shift_is_64)
+        *out = (uint64_t)((int64_t)v1 >> v2);
+      else
+        *out = (uint64_t)((int64_t)(int32_t)(uint32_t)v1 >> (v2 & 31));
       break;
     case TCCIR_OP_ROR:
     {

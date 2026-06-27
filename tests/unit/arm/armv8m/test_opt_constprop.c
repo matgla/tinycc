@@ -49,6 +49,7 @@
  * the optimizer engine headers). */
 int tcc_ir_opt_const_var_prop(TCCIRState *ir);
 int tcc_ir_opt_const_prop(TCCIRState *ir);
+int tcc_ir_opt_const_prop_tmp(TCCIRState *ir);
 int tcc_ir_opt_global_init_prop(TCCIRState *ir);
 int tcc_ir_opt_symref_const_prop(TCCIRState *ir);
 int tcc_ir_opt_complex_const_param_fold(TCCIRState *ir);
@@ -943,6 +944,32 @@ UT_TEST(test_constprop_cmp_setif_fold_gt)
   return 0;
 }
 
+/* GUARD: a 64-bit immediate assigned into a 32-bit temp must be tracked as the
+ * truncated 32-bit value.  This mirrors `(int)(long long)(V2SI){2,2}` after
+ * known_bits folds the 64-bit stack load to `0x0000000200000002`: the following
+ * int temp is `2`, so `temp != 2` is false. */
+UT_TEST(test_constproptmp_i64_to_i32_assign_truncates_fact)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+
+  int64_t packed = ((int64_t)2 << 32) | 2;
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I64), utb_imm64(ir, packed, I64), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(1, I32), utb_temp(0, I64), UTB_NONE);
+  int icmp = utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_temp(1, I32), utb_imm(2, I32));
+  int iset = utb_emit(ir, TCCIR_OP_SETIF, utb_temp(2, I32), utb_imm(TOK_NE, I32), UTB_NONE);
+
+  int changes = tcc_ir_opt_const_prop_tmp(ir);
+
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, icmp), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, iset), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, iset)), 0);
+  UT_ASSERT_EQ(utb_assert_wellformed(ir, 4), 0);
+  utb_free(ir);
+  return 0;
+}
+
 /* GUARD: BOOL_OR with only one constant operand is left untouched because the
  * backend cannot materialise mixed const/reg boolean ops. */
 UT_TEST(test_constprop_bool_or_one_const_no_fold)
@@ -1699,6 +1726,36 @@ UT_TEST(test_valuetracking_merge_point_clears)
   return 0;
 }
 
+/* GUARD (CFG + multi-def VAR is not tracked by direct const assignment):
+ * value_tracking is a forward scan, not a full CFG dataflow solver.  In a
+ * function with branches, a VAR with multiple definitions can have different
+ * values on different paths, so direct assignments to that VAR must not seed
+ * the constant tracker.
+ *   JUMPIF -> L
+ *   V0 <- #5
+ *   V1 = V0 + #1   -> stays ADD, not ASSIGN #6
+ *   JUMP -> exit
+ * L:
+ *   V0 <- #9 */
+UT_TEST(test_valuetracking_cfg_multidef_direct_assign_not_tracked)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  utb_alloc_var_intervals(ir, 4);
+
+  utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(4, I32), utb_imm(0x94 /*EQ*/, I32), UTB_NONE); /* 0 */
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(5, I32), UTB_NONE);            /* 1 */
+  int iadd = utb_emit(ir, TCCIR_OP_ADD, utb_var(1, I32), utb_var(0, I32), utb_imm(1, I32)); /* 2 */
+  utb_emit(ir, TCCIR_OP_JUMP, utb_imm(5, I32), UTB_NONE, UTB_NONE);                     /* 3 */
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(9, I32), UTB_NONE);            /* 4 */
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);                      /* 5 */
+
+  (void)tcc_ir_opt_value_tracking(ir);
+  UT_ASSERT_EQ(utb_op(ir, iadd), TCCIR_OP_ADD);
+  utb_free(ir);
+  return 0;
+}
+
 /* POSITIVE (call fold, __aeabi_lcmp): both 64-bit compare arguments are
  * immediates, so the call folds to the three-way result.  Oracle: lcmp(10,20) =
  * (10>20)-(10<20) = -1. */
@@ -1801,6 +1858,7 @@ UT_SUITE(opt_constprop)
 {
   UT_COVERS("const_var_prop");
   UT_COVERS("const_prop");
+  UT_COVERS("const_prop_tmp");
   UT_COVERS("global_init_prop");
   UT_COVERS("symref_const_prop");
   UT_COVERS("complex_const_param_fold");
@@ -1858,6 +1916,7 @@ UT_SUITE(opt_constprop)
   UT_RUN(test_constprop_shr_and_to_ubfx);
   UT_RUN(test_constprop_xor_cancellation);
   UT_RUN(test_constprop_cmp_setif_fold_gt);
+  UT_RUN(test_constproptmp_i64_to_i32_assign_truncates_fact);
   UT_RUN(test_constprop_bool_or_one_const_no_fold);
 
   /* global_init_prop */
@@ -1899,6 +1958,7 @@ UT_SUITE(opt_constprop)
   UT_RUN(test_valuetracking_cmp_setif_fold);
   UT_RUN(test_valuetracking_addrtaken_not_tracked);
   UT_RUN(test_valuetracking_merge_point_clears);
+  UT_RUN(test_valuetracking_cfg_multidef_direct_assign_not_tracked);
   UT_RUN(test_valuetracking_lcmp_const_fold);
   UT_RUN(test_valuetracking_ulcmp_const_fold);
   UT_RUN(test_valuetracking_unknown_call_no_fold);

@@ -1,16 +1,16 @@
 {
   "arch/arm/arm.c": {
-    "kind": "ir_test",
-    "note": "no dedicated unit/golden/asm test yet",
+    "kind": "selfhost",
+    "note": "compile-only self-host smoke gate",
     "via": [
-      "tests/ir_tests/*.expect QEMU corpus"
+      "tests/selfhost/test_selfhost_compile.py"
     ]
   },
   "arch/arm/arm_aapcs.c": {
-    "kind": "ir_test",
-    "note": "no dedicated unit/golden/asm test yet",
+    "kind": "selfhost",
+    "note": "compile-only self-host smoke gate",
     "via": [
-      "tests/ir_tests/*.expect QEMU corpus"
+      "tests/selfhost/test_selfhost_compile.py"
     ]
   },
   "arch/arm/arm_regalloc.c": {
@@ -21,10 +21,10 @@
     ]
   },
   "arch/arm/ssa_opt_arm.c": {
-    "kind": "ir_test",
-    "note": "no dedicated unit/golden/asm test yet",
+    "kind": "selfhost",
+    "note": "compile-only self-host smoke gate",
     "via": [
-      "tests/ir_tests/*.expect QEMU corpus"
+      "tests/selfhost/test_selfhost_compile.py"
     ]
   },
   "arch/arm/thumb/thop_adr.c": {
@@ -224,59 +224,63 @@
     ]
   },
   "arch/arm/thumb/thumb.c": {
-    "kind": "ir_test",
-    "note": "no dedicated unit/golden/asm test yet",
+    "kind": "selfhost",
+    "note": "compile-only self-host smoke gate",
     "via": [
-      "tests/ir_tests/*.expect QEMU corpus"
+      "tests/selfhost/test_selfhost_compile.py"
     ]
   },
   "arm-link.c": {
-    "kind": "ir_test",
-    "note": "no dedicated unit/golden/asm test yet",
+    "kind": "selfhost",
+    "note": "compile-only self-host smoke gate",
     "via": [
-      "tests/ir_tests/*.expect QEMU corpus"
+      "tests/selfhost/test_selfhost_compile.py"
     ]
   },
   "arm-thumb-asm.c": {
-    "kind": "ir_test",
-    "note": "no dedicated unit/golden/asm test yet",
+    "kind": "selfhost",
+    "note": "compile-only self-host smoke gate",
     "via": [
-      "tests/ir_tests/*.expect QEMU corpus"
+      "tests/selfhost/test_selfhost_compile.py"
     ]
   },
   "arm-thumb-callsite.c": {
-    "kind": "ir_test",
-    "note": "no dedicated unit/golden/asm test yet",
+    "kind": "selfhost",
+    "note": "compile-only self-host smoke gate",
     "via": [
-      "tests/ir_tests/*.expect QEMU corpus"
+      "tests/selfhost/test_selfhost_compile.py"
     ]
   },
   "arm-thumb-gen.c": {
-    "kind": "ir_test",
-    "note": "no dedicated unit/golden/asm test yet",
+    "kind": "selfhost",
+    "note": "compile-only self-host smoke gate",
     "via": [
-      "tests/ir_tests/*.expect QEMU corpus"
+      "tests/selfhost/test_selfhost_compile.py"
     ]
   },
   "arm-thumb-scratch.c": {
-    "kind": "ir_test",
-    "note": "no dedicated unit/golden/asm test yet",
+    "kind": "selfhost",
+    "note": "compile-only self-host smoke gate",
     "via": [
-      "tests/ir_tests/*.expect QEMU corpus"
+      "tests/selfhost/test_selfhost_compile.py"
     ]
   },
   "ir/cfg.c": {
-    "kind": "ir_test",
-    "note": "no dedicated unit/golden/asm test yet",
+    "kind": "selfhost",
+    "note": "compile-only self-host smoke gate",
     "via": [
-      "tests/ir_tests/*.expect QEMU corpus"
+      "tests/selfhost/test_selfhost_compile.py"
     ]
   },
   "ir/codegen.c": {
-    "kind": "ir_test",
-    "note": "no dedicated unit/golden/asm test yet",
+    "kind": "backend_unit",
+    "note": "",
     "via": [
-      "tests/ir_tests/*.expect QEMU corpus"
+      "tests/unit/arm/armv8m/test_codegen_arith.c",
+      "tests/unit/arm/armv8m/test_codegen_mem.c",
+      "tests/unit/arm/armv8m/test_codegen_control.c",
+      "tests/unit/arm/armv8m/test_codegen_call.c",
+      "tests/unit/arm/armv8m/test_codegen_fp.c"
     ]
   },
   "ir/core.c": {
@@ -301,24 +305,29 @@
     ]
   },
   "ir/machine_op.c": {
-    "kind": "ir_test",
-    "note": "no dedicated unit/golden/asm test yet",
+    "kind": "backend_unit",
+    "note": "",
     "via": [
-      "tests/ir_tests/*.expect QEMU corpus"
+      "tests/unit/arm/armv8m/test_codegen_arith.c",
+      "tests/unit/arm/armv8m/test_codegen_mem.c",
+      "tests/unit/arm/armv8m/test_codegen_control.c",
+      "tests/unit/arm/armv8m/test_codegen_call.c",
+      "tests/unit/arm/armv8m/test_codegen_fp.c",
+      "tests/unit/arm/armv8m/test_codegen_atomic.c"
     ]
   },
   "ir/opt.c": {
-    "kind": "ir_test",
-    "note": "no dedicated unit/golden/asm test yet",
+    "kind": "selfhost",
+    "note": "compile-only self-host smoke gate",
     "via": [
-      "tests/ir_tests/*.expect QEMU corpus"
+      "tests/selfhost/test_selfhost_compile.py"
     ]
   },
   "ir/opt_alias.c": {
-    "kind": "ir_test",
-    "note": "no dedicated unit/golden/asm test yet",
+    "kind": "selfhost",
+    "note": "compile-only self-host smoke gate",
     "via": [
-      "tests/ir_tests/*.expect QEMU corpus"
+      "tests/selfhost/test_selfhost_compile.py"
     ]
   },
   "ir/opt_bitfield.c": {
@@ -329,10 +338,10 @@
     ]
   },
   "ir/opt_branch.c": {
-    "kind": "ir_test",
-    "note": "no dedicated unit/golden/asm test yet",
+    "kind": "selfhost",
+    "note": "compile-only self-host smoke gate",
     "via": [
-      "tests/ir_tests/*.expect QEMU corpus"
+      "tests/selfhost/test_selfhost_compile.py"
     ]
   },
   "ir/opt_cmp_fuse.c": {
@@ -371,10 +380,10 @@
     ]
   },
   "ir/opt_dce.c": {
-    "kind": "ir_test",
-    "note": "no dedicated unit/golden/asm test yet",
+    "kind": "selfhost",
+    "note": "compile-only self-host smoke gate",
     "via": [
-      "tests/ir_tests/*.expect QEMU corpus"
+      "tests/selfhost/test_selfhost_compile.py"
     ]
   },
   "ir/opt_dead_lea_store.c": {
@@ -392,59 +401,59 @@
     ]
   },
   "ir/opt_du.c": {
-    "kind": "ir_test",
-    "note": "no dedicated unit/golden/asm test yet",
+    "kind": "selfhost",
+    "note": "compile-only self-host smoke gate",
     "via": [
-      "tests/ir_tests/*.expect QEMU corpus"
+      "tests/selfhost/test_selfhost_compile.py"
     ]
   },
   "ir/opt_engine.c": {
-    "kind": "ir_test",
-    "note": "no dedicated unit/golden/asm test yet",
+    "kind": "selfhost",
+    "note": "compile-only self-host smoke gate",
     "via": [
-      "tests/ir_tests/*.expect QEMU corpus"
+      "tests/selfhost/test_selfhost_compile.py"
     ]
   },
   "ir/opt_fusion.c": {
-    "kind": "ir_test",
-    "note": "no dedicated unit/golden/asm test yet",
+    "kind": "selfhost",
+    "note": "compile-only self-host smoke gate",
     "via": [
-      "tests/ir_tests/*.expect QEMU corpus"
+      "tests/selfhost/test_selfhost_compile.py"
     ]
   },
   "ir/opt_gens_bool.c": {
-    "kind": "ir_test",
-    "note": "no dedicated unit/golden/asm test yet",
+    "kind": "selfhost",
+    "note": "compile-only self-host smoke gate",
     "via": [
-      "tests/ir_tests/*.expect QEMU corpus"
+      "tests/selfhost/test_selfhost_compile.py"
     ]
   },
   "ir/opt_gens_branch.c": {
-    "kind": "ir_test",
-    "note": "no dedicated unit/golden/asm test yet",
+    "kind": "selfhost",
+    "note": "compile-only self-host smoke gate",
     "via": [
-      "tests/ir_tests/*.expect QEMU corpus"
+      "tests/selfhost/test_selfhost_compile.py"
     ]
   },
   "ir/opt_gens_call_result.c": {
-    "kind": "ir_test",
-    "note": "no dedicated unit/golden/asm test yet",
+    "kind": "selfhost",
+    "note": "compile-only self-host smoke gate",
     "via": [
-      "tests/ir_tests/*.expect QEMU corpus"
+      "tests/selfhost/test_selfhost_compile.py"
     ]
   },
   "ir/opt_gens_fusion.c": {
-    "kind": "ir_test",
-    "note": "no dedicated unit/golden/asm test yet",
+    "kind": "selfhost",
+    "note": "compile-only self-host smoke gate",
     "via": [
-      "tests/ir_tests/*.expect QEMU corpus"
+      "tests/selfhost/test_selfhost_compile.py"
     ]
   },
   "ir/opt_hash.c": {
-    "kind": "ir_test",
-    "note": "no dedicated unit/golden/asm test yet",
+    "kind": "selfhost",
+    "note": "compile-only self-host smoke gate",
     "via": [
-      "tests/ir_tests/*.expect QEMU corpus"
+      "tests/selfhost/test_selfhost_compile.py"
     ]
   },
   "ir/opt_jump_thread.c": {
@@ -462,17 +471,17 @@
     ]
   },
   "ir/opt_loop.c": {
-    "kind": "ir_test",
-    "note": "no dedicated unit/golden/asm test yet",
+    "kind": "selfhost",
+    "note": "compile-only self-host smoke gate",
     "via": [
-      "tests/ir_tests/*.expect QEMU corpus"
+      "tests/selfhost/test_selfhost_compile.py"
     ]
   },
   "ir/opt_loop_const_sim.c": {
-    "kind": "ir_test",
-    "note": "no dedicated unit/golden/asm test yet",
+    "kind": "selfhost",
+    "note": "compile-only self-host smoke gate",
     "via": [
-      "tests/ir_tests/*.expect QEMU corpus"
+      "tests/selfhost/test_selfhost_compile.py"
     ]
   },
   "ir/opt_loop_dead.c": {
@@ -483,17 +492,17 @@
     ]
   },
   "ir/opt_loop_utils.c": {
-    "kind": "ir_test",
-    "note": "no dedicated unit/golden/asm test yet",
+    "kind": "selfhost",
+    "note": "compile-only self-host smoke gate",
     "via": [
-      "tests/ir_tests/*.expect QEMU corpus"
+      "tests/selfhost/test_selfhost_compile.py"
     ]
   },
   "ir/opt_memory.c": {
-    "kind": "ir_test",
-    "note": "no dedicated unit/golden/asm test yet",
+    "kind": "selfhost",
+    "note": "compile-only self-host smoke gate",
     "via": [
-      "tests/ir_tests/*.expect QEMU corpus"
+      "tests/selfhost/test_selfhost_compile.py"
     ]
   },
   "ir/opt_neg_chain.c": {
@@ -504,24 +513,24 @@
     ]
   },
   "ir/opt_pack64.c": {
-    "kind": "ir_test",
-    "note": "no dedicated unit/golden/asm test yet",
+    "kind": "selfhost",
+    "note": "compile-only self-host smoke gate",
     "via": [
-      "tests/ir_tests/*.expect QEMU corpus"
+      "tests/selfhost/test_selfhost_compile.py"
     ]
   },
   "ir/opt_pipeline.c": {
-    "kind": "ir_test",
-    "note": "no dedicated unit/golden/asm test yet",
+    "kind": "selfhost",
+    "note": "compile-only self-host smoke gate",
     "via": [
-      "tests/ir_tests/*.expect QEMU corpus"
+      "tests/selfhost/test_selfhost_compile.py"
     ]
   },
   "ir/opt_promote.c": {
-    "kind": "ir_test",
-    "note": "no dedicated unit/golden/asm test yet",
+    "kind": "selfhost",
+    "note": "compile-only self-host smoke gate",
     "via": [
-      "tests/ir_tests/*.expect QEMU corpus"
+      "tests/selfhost/test_selfhost_compile.py"
     ]
   },
   "ir/opt_reroll.c": {
@@ -539,17 +548,17 @@
     ]
   },
   "ir/opt_switch_data.c": {
-    "kind": "ir_test",
-    "note": "no dedicated unit/golden/asm test yet",
+    "kind": "selfhost",
+    "note": "compile-only self-host smoke gate",
     "via": [
-      "tests/ir_tests/*.expect QEMU corpus"
+      "tests/selfhost/test_selfhost_compile.py"
     ]
   },
   "ir/opt_utils.c": {
-    "kind": "ir_test",
-    "note": "no dedicated unit/golden/asm test yet",
+    "kind": "selfhost",
+    "note": "compile-only self-host smoke gate",
     "via": [
-      "tests/ir_tests/*.expect QEMU corpus"
+      "tests/selfhost/test_selfhost_compile.py"
     ]
   },
   "ir/opt_xform.c": {
@@ -863,10 +872,10 @@
     ]
   },
   "libtcc.c": {
-    "kind": "ir_test",
-    "note": "no dedicated unit/golden/asm test yet",
+    "kind": "selfhost",
+    "note": "compile-only self-host smoke gate",
     "via": [
-      "tests/ir_tests/*.expect QEMU corpus"
+      "tests/selfhost/test_selfhost_compile.py"
     ]
   },
   "svalue.c": {
@@ -877,17 +886,17 @@
     ]
   },
   "tcc.c": {
-    "kind": "ir_test",
-    "note": "no dedicated unit/golden/asm test yet",
+    "kind": "selfhost",
+    "note": "compile-only self-host smoke gate",
     "via": [
-      "tests/ir_tests/*.expect QEMU corpus"
+      "tests/selfhost/test_selfhost_compile.py"
     ]
   },
   "tccasm.c": {
-    "kind": "ir_test",
-    "note": "no dedicated unit/golden/asm test yet",
+    "kind": "selfhost",
+    "note": "compile-only self-host smoke gate",
     "via": [
-      "tests/ir_tests/*.expect QEMU corpus"
+      "tests/selfhost/test_selfhost_compile.py"
     ]
   },
   "tccdbg.c": {
@@ -912,10 +921,10 @@
     ]
   },
   "tccgen.c": {
-    "kind": "ir_test",
-    "note": "no dedicated unit/golden/asm test yet",
+    "kind": "selfhost",
+    "note": "compile-only self-host smoke gate",
     "via": [
-      "tests/ir_tests/*.expect QEMU corpus"
+      "tests/selfhost/test_selfhost_compile.py"
     ]
   },
   "tccir_operand.c": {
@@ -940,31 +949,31 @@
     ]
   },
   "tccmachine.c": {
-    "kind": "ir_test",
-    "note": "no dedicated unit/golden/asm test yet",
+    "kind": "backend_unit",
+    "note": "",
     "via": [
-      "tests/ir_tests/*.expect QEMU corpus"
+      "tests/unit/arm/armv8m/test_codegen_atomic.c"
     ]
   },
   "tccopt.c": {
-    "kind": "ir_test",
-    "note": "no dedicated unit/golden/asm test yet",
+    "kind": "selfhost",
+    "note": "compile-only self-host smoke gate",
     "via": [
-      "tests/ir_tests/*.expect QEMU corpus"
+      "tests/selfhost/test_selfhost_compile.py"
     ]
   },
   "tccpp.c": {
-    "kind": "ir_test",
-    "note": "no dedicated unit/golden/asm test yet",
+    "kind": "selfhost",
+    "note": "compile-only self-host smoke gate",
     "via": [
-      "tests/ir_tests/*.expect QEMU corpus"
+      "tests/selfhost/test_selfhost_compile.py"
     ]
   },
   "tcctools.c": {
-    "kind": "ir_test",
-    "note": "no dedicated unit/golden/asm test yet",
+    "kind": "selfhost",
+    "note": "compile-only self-host smoke gate",
     "via": [
-      "tests/ir_tests/*.expect QEMU corpus"
+      "tests/selfhost/test_selfhost_compile.py"
     ]
   },
   "tccyaff.c": {

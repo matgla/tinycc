@@ -60,6 +60,20 @@ static int ssa_gen_cprop_assign(IRSSAOptCtx *ctx, int idx)
   if (vi && vi->def_count > 1)
     return 0;
 
+  /* Do not propagate a copy whose dest feeds a phi operand.  Such a copy
+   * `T_dest <- T_src` often resolves a phi (e.g. a loop back-edge value):
+   * folding T_dest away and naming T_src directly in the phi reintroduces the
+   * lost-copy problem at out-of-SSA phi resolution, since T_src stays live past
+   * the phi edge and its slot can be overwritten before the parallel copy runs
+   * (fuzz seed 2698: the loop-carried `cs` back-edge copy was dropped, yielding
+   * a wrong checksum).  Leaving the copy in place keeps phi resolution correct;
+   * DCE still removes genuinely dead copies. */
+  if (vi) {
+    for (int u = 0; u < vi->use_count; u++)
+      if (vi->uses[u].kind == SSA_USE_PHI)
+        return 0;
+  }
+
   int replaced = ssa_opt_replace_all_uses(ctx, dest_vr, src_vr);
   return replaced > 0 ? 1 : 0;
 }

@@ -2,7 +2,49 @@
 
 **Branch:** `heapOverflowBug`  ·  baseline commit `61233c33` ("checkpoint before hard-float VFP work")
 **Date:** 2026-06-27
-**Status:** 2 of 4 known bugs fixed & verified. 2 rotation-exposed bugs remain (seeds 49, 244). Temporary diagnostic scaffolding still in the tree (must be removed before finalizing).
+**Status:** ✅ COMPLETE. All known bugs fixed & verified; both passes enabled; all
+temporary scaffolding removed; full validation green (see "Final validation"
+below). Seeds 49 and 244 fixed, plus one extra pre-existing loop-elim wrong-code
+bug (`count()`) surfaced by the codegen_asm suite.
+
+---
+
+## Final resolution (the landed fixes)
+
+1. **Seed 244** (scratch clobbers a loop-carried reg) — `ir/regalloc.c`,
+   new `ra_refine_live_regs_accurate()`.  The interval-derived
+   `live_regs_by_instruction` bitmap models each value as one contiguous
+   `[def,last-use]` range, leaving a loop-carried value's loop-header prefix
+   uncovered → the scratch picker reused its register inside the loop.  Fix: a
+   real CFG backward-liveness dataflow does **loop-liveness completion** — for
+   each back-edge, every register live-in at the loop header is OR'd into the
+   bitmap across the whole loop body `[header, back-edge]`.  Scoped to loop
+   bodies on purpose (a blanket per-instruction live-out refinement over-marked
+   straight-line liveness and perturbed unrelated functions — seed 221).
+2. **Seed 49** (doubly-rotated nested loops miscompiled) — `ir/opt_loop_utils.c`,
+   `try_rotate_loop`.  Rotating BOTH an outer loop and an inner loop nested in it
+   produces a shape a later pass miscompiles (rotating EITHER alone is correct).
+   Fix: decline to rotate a loop nested inside an ALREADY-ROTATED loop (detected
+   via a backward-branching JUMPIF that strictly encloses `[hi, backedge]`).
+3. **`count()` zero-trip wrong-code** (pre-existing, surfaced by
+   `test_control_branch_conditional_and_loop`) — `ir/opt_loop_utils.c`,
+   `try_eliminate_loop_symbolic`.  Its fallback wrote unconditional closed forms
+   (`i = limit`) for a SYMBOLIC limit, ignoring the zero-trip case of a
+   top-tested `while` (`i=0; while(i<n) i++; return i` is `max(n,0)`, not `n`).
+   Fix: bail (leave the loop intact) for every non-SELECT-path case — only the
+   guarded SELECT path handles the zero-trip case.
+
+## Final validation (all green)
+
+- Fuzz olevels `0-299`: failing set ⊂ baseline; **50/183/211 now fixed**, zero new.
+- Fuzz vs-gcc `0-199`: only the pre-existing O0-vs-O1 seeds, zero new.
+- `test_qemu.py`: 1496 passed / 0 failed.  `test_codegen_asm.py`: 14 passed.
+- gcc-torture O1/O2: 7521 passed / 0 failed.  Unit: 1090 / 0.
+- ASAN build clean (no overflow/UAF) on the seed paths; `make cross fp-libs` builds.
+
+---
+
+### Historical notes (superseded by the resolution above)
 
 ---
 

@@ -12,6 +12,19 @@ def pytest_addoption(parser):
         default=False,
         help="Regenerate golden files from current compiler output",
     )
+    # --compiler is normally provided by the parent tests/conftest.py, but that
+    # conftest is not loaded when pytest is invoked from inside tests/frontend/
+    # (as `make test-frontend` does). Register it here too, tolerating the
+    # duplicate when both conftests are active (running from tests/).
+    try:
+        parser.addoption(
+            "--compiler",
+            action="store",
+            default=None,
+            help="Path to the armv8m-tcc cross compiler",
+        )
+    except ValueError:
+        pass
 
 
 def _find_compiler(compiler_override=None):
@@ -24,8 +37,8 @@ def _find_compiler(compiler_override=None):
 
     tinycc = Path(__file__).parent.parent.parent
     candidates = [
-        tinycc / "bin" / "armv8m-tcc",
         tinycc / "armv8m-tcc",
+        tinycc / "bin" / "armv8m-tcc",
     ]
     for cand in candidates:
         if cand.exists():

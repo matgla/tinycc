@@ -61,6 +61,10 @@ def _default_seeds():
 
 SEEDS = _default_seeds()
 
+# Generator feature profile (Axis 2 of docs/plan_fuzz_reach_expansion.md).
+# FUZZ_PROFILE=float sweeps the FP profile; "int" (default) is the historical stream.
+PROFILE = os.environ.get("FUZZ_PROFILE", "int")
+
 
 def _qemu_or_skip():
     usable, reason = H.qemu_available()
@@ -75,7 +79,7 @@ def test_olevel_self_consistency(seed, tmp_path):
         pytest.xfail(KNOWN_DIVERGENCES[seed])
 
     src = tmp_path / f"fuzz_{seed}.c"
-    src.write_text(generate_program(seed))
+    src.write_text(generate_program(seed, PROFILE))
 
     consistent, results = diff_olevels.check_one(src, OPT_LEVELS, tmp_path)
 

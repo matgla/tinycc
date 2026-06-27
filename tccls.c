@@ -270,8 +270,6 @@ int tcc_ls_find_free_scratch_reg(LSLiveIntervalState *ls, int instruction_idx, u
 {
   uint32_t live_regs = exclude_regs;
 
-  if (getenv("TCC_PARANOID_SCRATCH")) return PREG_NONE; /* TEMP: force push/pop for every scratch */
-
   LS_DBG("  Finding scratch register at instruction %d (is_leaf=%d)", instruction_idx, is_leaf);
   LS_DBG("    Exclude regs: 0x%x", exclude_regs);
 

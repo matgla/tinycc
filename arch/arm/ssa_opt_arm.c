@@ -857,6 +857,46 @@ int ssa_gen_arm_fuse_store_src_through_add_imm(IRSSAOptCtx *ctx, int instr_idx)
   if (abs_imm > 4095)
     return 0;
 
+  /* Unlike the LOAD variant (which rewrites the load op in place), this fuses
+   * the deref *source* of a STORE by turning the address-computing ADD into the
+   * LOAD_INDEXED — i.e. the load is RELOCATED upward from this STORE to the
+   * ADD's definition site.  That hoist is only sound when nothing between the
+   * two positions can write the loaded memory or divert control flow.  GVN can
+   * CSE the address so the defining ADD sits before a later store to the same
+   * slot (fuzz seed 2137: `arr[i]` read, `arr[i]=v`, then an unrolled re-read of
+   * arr[i] whose address was CSE'd back to the first read's LEA) — the hoisted
+   * load would then read the pre-store value.  Bail on any intervening memory
+   * clobber or control-flow op (the latter also restricts the hoist to a single
+   * straight-line basic block). */
+  {
+    int didx = vi->def_instr;
+    if (didx >= instr_idx)
+      return 0;
+    for (int j = didx + 1; j < instr_idx; j++) {
+      switch (ir->compact_instructions[j].op) {
+      case TCCIR_OP_STORE:
+      case TCCIR_OP_STORE_INDEXED:
+      case TCCIR_OP_STORE_POSTINC:
+      case TCCIR_OP_FUNCCALLVAL:
+      case TCCIR_OP_FUNCCALLVOID:
+      case TCCIR_OP_BLOCK_COPY:
+      case TCCIR_OP_INLINE_ASM:
+      case TCCIR_OP_VLA_ALLOC:
+      case TCCIR_OP_SETJMP:
+      case TCCIR_OP_LONGJMP:
+      case TCCIR_OP_NL_SETJMP:
+      case TCCIR_OP_NL_LONGJMP:
+      case TCCIR_OP_JUMP:
+      case TCCIR_OP_JUMPIF:
+      case TCCIR_OP_IJUMP:
+      case TCCIR_OP_SWITCH_TABLE:
+        return 0;
+      default:
+        break;
+      }
+    }
+  }
+
   IROperand lea_dest = tcc_ir_op_get_dest(ir, dq);
   /* Update btype to match the loaded value (the LEA dest was a pointer-typed
    * INT32; after fusion it holds the loaded value). */

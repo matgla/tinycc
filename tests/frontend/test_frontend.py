@@ -139,7 +139,14 @@ PP_CASE_IDS = [name for name, _, _ in PP_CASES]
 
 @pytest.fixture(scope="session")
 def debug_compiler(frontend_compiler):
-    return _find_debug_compiler(frontend_compiler)
+    # The types/ mode needs a compiler built with CONFIG_TCC_DEBUG so that
+    # -dump-ir actually emits IR. A plain `make cross` build does not enable
+    # it, so skip (rather than error) when no -dump-ir-capable compiler or
+    # nearby armv8m-tcc.debug binary is available.
+    try:
+        return _find_debug_compiler(frontend_compiler)
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
 
 
 @pytest.mark.parametrize("name,c_file,golden", PP_CASES, ids=PP_CASE_IDS)

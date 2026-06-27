@@ -17,8 +17,8 @@ def _find_compiler(compiler_override=None):
         return p
 
     candidates = [
-        TINYCC_DIR / "bin" / "armv8m-tcc",
         TINYCC_DIR / "armv8m-tcc",
+        TINYCC_DIR / "bin" / "armv8m-tcc",
     ]
     for cand in candidates:
         if cand.exists():

@@ -1,6 +1,6 @@
 # 05 — VAR/PARAM operands carry `tag=STACKOFF` for their spill slot
 
-**Status:** DOCUMENTED (footgun, not a bug per se)
+**Status:** FIXED (documented in `tccir_operand.h`)
 **Severity:** Low for existing code; High for new pass authors.
 
 ## What surprised me

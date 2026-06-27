@@ -9,10 +9,10 @@ def pytest_addoption(parser):
         help="Regenerate .expected files from current compiler output",
     )
     parser.addoption(
-        "--compiler",
-        action="store",
-        default=None,
-        help="Path to debug-enabled TCC binary",
+        "--require-dump-ir",
+        action="store_true",
+        default=False,
+        help="Fail instead of skipping when -dump-ir-passes support is unavailable",
     )
 
 

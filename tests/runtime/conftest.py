@@ -17,8 +17,8 @@ def _find_compiler(compiler_override=None):
         return p
 
     candidates = [
-        TINYCC_DIR / "bin" / "armv8m-tcc",
         TINYCC_DIR / "armv8m-tcc",
+        TINYCC_DIR / "bin" / "armv8m-tcc",
     ]
     for cand in candidates:
         if cand.exists():
@@ -27,6 +27,22 @@ def _find_compiler(compiler_override=None):
         "No armv8m-tcc cross compiler found. "
         "Build one with `make cross` in libs/tinycc, or pass --compiler."
     )
+
+
+def pytest_addoption(parser):
+    # --compiler is normally provided by the parent tests/conftest.py, but that
+    # conftest is not loaded when pytest is invoked from inside tests/runtime/
+    # (as `make test-runtime` does). Register it here too, tolerating the
+    # duplicate when both conftests are active (running from tests/).
+    try:
+        parser.addoption(
+            "--compiler",
+            action="store",
+            default=None,
+            help="Path to the armv8m-tcc cross compiler",
+        )
+    except ValueError:
+        pass
 
 
 def pytest_configure(config):

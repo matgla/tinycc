@@ -110,3 +110,4 @@ __pycache__/
 .pytest_cache/
 *.pyc
 tests/fuzz/results/*
+tests/fuzz/fuzz_triage_repros/

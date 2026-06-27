@@ -147,6 +147,32 @@ def test_host_soft_float_mul():
     assert "ALL TESTS PASSED" in stdout, f"test_dmul_host did not report pass:\n{stdout}\n{stderr}"
 
 
+@pytest.mark.runtime
+@pytest.mark.runtime_host
+def test_host_armeabi_helpers():
+    """Run host-native algorithmic tests for lib/armeabi.c EABI helpers."""
+    src = RUNTIME_DIR / "host" / "test_armeabi_host.c"
+    rc, stdout, stderr, cmd = _host_compile_and_run(src, defines=["-DHOST_TEST"])
+    if rc != 0:
+        pytest.fail(f"test_armeabi_host failed: {cmd}\nstdout:\n{stdout}\nstderr:\n{stderr}")
+    assert "ALL TESTS PASSED" in stdout, f"test_armeabi_host did not report pass:\n{stdout}\n{stderr}"
+
+
+@pytest.mark.runtime
+@pytest.mark.runtime_host
+def test_host_builtin_helpers():
+    """Run host-native algorithmic tests for lib/builtin.c bit/string helpers."""
+    src = RUNTIME_DIR / "host" / "test_builtin_host.c"
+    rc, stdout, stderr, cmd = _host_compile_and_run(
+        src,
+        defines=["-DHOST_TEST"],
+        cflags=["-fno-builtin", "-Wno-builtin-declaration-mismatch"],
+    )
+    if rc != 0:
+        pytest.fail(f"test_builtin_host failed: {cmd}\nstdout:\n{stdout}\nstderr:\n{stderr}")
+    assert "ALL TESTS PASSED" in stdout, f"test_builtin_host did not report pass:\n{stdout}\n{stderr}"
+
+
 # -----------------------------------------------------------------------------
 # Cross-compiled runtime helper references
 # -----------------------------------------------------------------------------
@@ -251,3 +277,78 @@ def test_cross_builtin_bitops(runtime_compiler):
     }
     missing = expected - set(syms)
     assert not missing, f"missing expected bitop runtime symbols: {missing}"
+
+
+@pytest.mark.runtime
+@pytest.mark.runtime_cross
+def test_cross_aeabi_idiv_uidiv(runtime_compiler):
+    obj = _cross_compile("aeabi_idiv_uidiv", runtime_compiler)
+    syms = _nm_symbols(obj)
+
+    # Direct calls to the 32-bit EABI division helpers resolve from lib/armeabi.c.
+    assert "__aeabi_idiv" in syms, "missing __aeabi_idiv reference"
+    assert "__aeabi_uidiv" in syms, "missing __aeabi_uidiv reference"
+
+
+@pytest.mark.runtime
+@pytest.mark.runtime_cross
+def test_cross_aeabi_memset_memcpy(runtime_compiler):
+    obj = _cross_compile("aeabi_memset_memcpy", runtime_compiler)
+    syms = _nm_symbols(obj)
+
+    # ARM EABI memory helpers from lib/armeabi.c.
+    assert "__aeabi_memcpy" in syms, "missing __aeabi_memcpy reference"
+    assert "__aeabi_memmove" in syms, "missing __aeabi_memmove reference"
+    assert "__aeabi_memset" in syms, "missing __aeabi_memset reference"
+
+
+@pytest.mark.runtime
+@pytest.mark.runtime_cross
+def test_cross_aeabi_llsr_llsl_lasr(runtime_compiler):
+    obj = _cross_compile("aeabi_llsr_llsl_lasr", runtime_compiler)
+    syms = _nm_symbols(obj)
+
+    # ARM EABI 64-bit shift helpers from lib/armeabi.c.
+    expected = {"__aeabi_llsr", "__aeabi_llsl", "__aeabi_lasr"}
+    missing = expected - set(syms)
+    assert not missing, f"missing expected 64-bit shift symbols: {missing}"
+
+
+@pytest.mark.runtime
+@pytest.mark.runtime_cross
+def test_cross_aeabi_lcmp_ulcmp(runtime_compiler):
+    obj = _cross_compile("aeabi_lcmp_ulcmp", runtime_compiler)
+    syms = _nm_symbols(obj)
+
+    # ARM EABI 64-bit comparison helpers from lib/armeabi.c.
+    assert "__aeabi_lcmp" in syms, "missing __aeabi_lcmp reference"
+    assert "__aeabi_ulcmp" in syms, "missing __aeabi_ulcmp reference"
+
+
+@pytest.mark.runtime
+@pytest.mark.runtime_cross
+def test_cross_memcpy_memset_nobuiltin(runtime_compiler):
+    obj = _cross_compile("memcpy_memset", runtime_compiler, extra_cflags=["-fno-builtin"])
+    syms = _nm_symbols(obj)
+
+    # With compiler builtins disabled, plain memcpy/memset calls are emitted
+    # and resolved from the runtime library.
+    assert "memcpy" in syms, "missing memcpy reference"
+    assert "memset" in syms, "missing memset reference"
+
+
+@pytest.mark.runtime
+@pytest.mark.runtime_cross
+def test_cross_muldi_divsi_notsymbols(runtime_compiler):
+    """Document that generic __muldi3 / __divsi3 are not used on ARMv8-M.
+
+    The ARMv8-M target has hardware MUL instructions for 64-bit products and
+    SDIV/UDIV for 32-bit division, so the compiler does not reference the
+    generic libgcc-style symbols.  The ARM EABI equivalents are tested above.
+    """
+    src_mul = RUNTIME_DIR / "cross" / "aeabi_divmod.c"  # 64-bit div/mod
+    obj = _cross_compile("aeabi_divmod", runtime_compiler)
+    syms = _nm_symbols(obj)
+
+    assert "__muldi3" not in syms
+    assert "__divsi3" not in syms

@@ -429,6 +429,78 @@ static int sccp_no_aliasing_between(SCCPState *s, int store_idx, int load_idx,
   return 1;
 }
 
+/* Recover the base stack offset of an indexed/postinc store's destination
+ * array, whether the base address is a direct STACKOFF operand
+ * (Addr[StackLoc[off]], emitted for `arr[i] = v` where `arr` is a local array)
+ * or a TEMP that LEA-resolves to a stack slot.  Returns INT_MIN when the base
+ * cannot be pinned to a local stack address.  Unlike
+ * sccp_store_indexed_base_off() this also accepts the direct-STACKOFF base
+ * (vreg == -1) so the entry-block alias check below can bound an indexed
+ * write whose index is not a known constant. */
+static int sccp_indexed_store_base_off(IRSSAOptCtx *ctx, IRQuadCompact *q)
+{
+  if (q->op != TCCIR_OP_STORE_INDEXED && q->op != TCCIR_OP_STORE_POSTINC)
+    return INT_MIN;
+  TCCIRState *ir = ctx->ir;
+  IROperand base = tcc_ir_op_get_dest(ir, q);
+  if (base.tag == IROP_TAG_STACKOFF && base.is_local && irop_get_vreg(base) == -1)
+    return irop_get_stack_offset(base);
+  if (base.tag == IROP_TAG_VREG && !base.is_local) {
+    int32_t bvr = irop_get_vreg(base);
+    if (bvr >= 0 && TCCIR_DECODE_VREG_TYPE(bvr) == TCCIR_VREG_TYPE_TEMP)
+      return ssa_opt_resolve_lea_stackloc(ctx, bvr);
+  }
+  return INT_MIN;
+}
+
+/* Entry-block initializers are usually allowed to forward broadly, but a later
+ * write whose stack byte range resolves exactly still clobbers that value.
+ * Keep this narrower than sccp_no_aliasing_between(): do not treat calls or
+ * unresolved pointer stores as barriers here, preserving the older permissive
+ * behavior for common aggregate-init shapes. */
+static int sccp_resolved_stack_write_between(SCCPState *s, int store_idx, int load_idx,
+                                             int soff, int load_btype)
+{
+  TCCIRState *ir = s->ctx->ir;
+  int load_size = sccp_btype_bytes(load_btype);
+  int load_lo = soff;
+  int load_hi = soff + load_size;
+  for (int i = store_idx + 1; i < load_idx; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_STORE && q->op != TCCIR_OP_STORE_INDEXED &&
+        q->op != TCCIR_OP_STORE_POSTINC)
+      continue;
+    int store_btype = 0;
+    int target = sccp_store_target_off(s->ctx, q, &store_btype);
+    if (target == INT_MIN) {
+      /* Unresolved concrete offset.  A STORE_INDEXED / STORE_POSTINC into a
+       * stack array still clobbers our load when the array's extent covers the
+       * load slot, even though the index is not a known constant during this
+       * scan.  The entry-block exemption must NOT skip such a write: seed 3691
+       * had a conditional `arr[i] = v` whose index was still a TEMP at SCCP
+       * time, so sccp_store_target_off() returned INT_MIN and the array-init
+       * LOAD wrongly folded back to the initializer.  Mirror the indexed-base
+       * extent check sccp_no_aliasing_between() applies for the non-entry path. */
+      if (q->op == TCCIR_OP_STORE_INDEXED || q->op == TCCIR_OP_STORE_POSTINC) {
+        const int LCS_INDEXED_MAX_ARRAY = 64;
+        int base_off = sccp_indexed_store_base_off(s->ctx, q);
+        if (base_off == INT_MIN)
+          return 1; /* indexed write to an unknown base — may alias the load */
+        int extent_lo = base_off;
+        int extent_hi = base_off + LCS_INDEXED_MAX_ARRAY;
+        if (extent_hi > load_lo && load_hi > extent_lo)
+          return 1; /* the array's plausible extent covers the load slot */
+      }
+      continue;
+    }
+    int store_lo = target;
+    int store_hi = target + sccp_btype_bytes(store_btype);
+    if (store_hi > load_lo && load_hi > store_lo)
+      return 1;
+  }
+  return 0;
+}
+
 /* Back-edge-aware clobber check.  sccp_no_aliasing_between only scans the
  * linear IR range between a dominating store and the load, on the assumption
  * that every path from store to load lies within that range.  That assumption
@@ -625,15 +697,12 @@ static int sccp_resolve_stack_load(SCCPState *s, int soff, int load_btype,
           break;
         }
       }
-      /* Only run the cross-block alias check when the matched STORE is NOT
-       * in the entry basic block.  Entry-block stores are direct array
-       * initializers that the broader pipeline has always treated as
-       * dominating subsequent code; tightening that here regresses common
-       * vector/struct-init patterns (e.g. scal-to-vec1) without catching
-       * any real aliasing bug.  Mid-function stores — including LCS's
-       * residual STOREs that replace a folded loop's memory writes — are
-       * the ones that need the alias check, because intervening loop
-       * bodies can contain STORE_INDEXED writes through the same array. */
+      /* Mid-function stores — including LCS's residual STOREs that replace a
+       * folded loop's memory writes — need the full alias check, because
+       * intervening blocks can contain unresolved pointer writes.  Entry-block
+       * stores stay more permissive for aggregate-init patterns, but a later
+       * STORE_INDEXED/direct STORE that resolves to the same concrete stack
+       * bytes still invalidates the initializer. */
       /* A loop between the (dominating) store and the load whose body writes
        * the slot makes the loaded value loop-carried, not the stored constant.
        * The linear alias scan below is skipped for entry-block stores, so this
@@ -647,9 +716,14 @@ static int sccp_resolve_stack_load(SCCPState *s, int soff, int load_btype,
       }
       int entry_block = (cfg->num_blocks > 0) ? 0 : -1;
       int store_block = cfg->instr_to_block[matched_idx];
-      int needs_alias_check = (matched_idx >= 0 && store_block != entry_block);
-      if (needs_alias_check &&
-          !sccp_no_aliasing_between(s, matched_idx, instr_idx, soff, load_btype)) {
+      int aliases_between = 0;
+      if (matched_idx >= 0) {
+        if (store_block == entry_block)
+          aliases_between = sccp_resolved_stack_write_between(s, matched_idx, instr_idx, soff, load_btype);
+        else
+          aliases_between = !sccp_no_aliasing_between(s, matched_idx, instr_idx, soff, load_btype);
+      }
+      if (aliases_between) {
         /* Aliasing write in between — restore state and treat as unknown. */
         *out = saved_out;
         if (dep_pos) *dep_pos = saved_dep;
@@ -1105,6 +1179,20 @@ static void sccp_visit_instr(SCCPState *s, int idx)
       goto handle_control_flow;
     }
 
+    /* A barrel-shift-fused ALU op (opt_fusion) carries a hidden shift applied to
+     * one operand, recorded in ir->barrel_shifts[] and invisible in the IR
+     * operands.  Lattice-evaluating it as a plain ALU op would compute the wrong
+     * constant (e.g. `x & (y<<7)` folded as `x & y`), so force it to BOTTOM — the
+     * same guard GVN already uses (ssa_opt_gvn.c).  Random-C O1 wrong-code,
+     * seed 215. */
+    if (ir->barrel_shifts && q->orig_index >= 0 &&
+        q->orig_index <= ir->max_orig_index &&
+        ir->barrel_shifts[q->orig_index]) {
+      if (sccp_set_bottom(dest_cell))
+        sccp_add_ssa(s, TCCIR_DECODE_VREG_POSITION(dest_vr));
+      goto handle_control_flow;
+    }
+
     int is_64 = (dest.btype == IROP_BTYPE_INT64);
 
     /* ASSIGN: propagate source value */
@@ -1267,6 +1355,17 @@ handle_control_flow:
         break;
       }
     }
+    /* Degenerate conditional branch: the taken target IS the fall-through
+     * block (a JUMPIF to the next instruction), so there is no successor
+     * distinct from target_block and the loop above leaves fall_block = -1.
+     * Both branch outcomes go to the same single successor — point the
+     * fall-through there too, otherwise resolving the branch "not taken"
+     * would add an edge to block -1 and leave the real successor (and any
+     * definition it carries into a downstream phi) wrongly unreachable.
+     * DCE collapsing the only instruction between a JUMPIF and its target
+     * produces exactly this shape (seed 1454). */
+    if (fall_block < 0)
+      fall_block = target_block;
 
     int resolved = 0;
     if (ci >= 0) {

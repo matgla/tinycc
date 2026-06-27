@@ -77,9 +77,11 @@ unreferenced frontend functions, so per-pass module deps stay tiny. Build/run: `
 | opt_jump_thread | test_opt_jump_thread.c | jump_threading, eliminate_fallthrough | 22 | ir/opt_jump_thread.c | **[x] integrated** |
 | opt_setif_or_taut | test_opt_setif_or_taut.c | setif_or_tautology | 21 | ir/opt_setif_or_taut.c | **[x] integrated** |
 | opt_dead_lea_store | test_opt_dead_lea_store.c | dead_lea_store_elim | 16 | ir/opt_dead_lea_store.c | **[x] integrated** |
+| opt_redundant_assign | test_opt_redundant_assign.c | redundant_assign | 6 | ir/opt_dce.c | **[~] written+verified-in-isolation, NOT yet registered in build** |
 
-### >>> Integration complete <<<
-All 11 verified suites are registered in `stubs.c`, the Makefile (`UT_MODULE_SRCS` / `UT_LOCAL_SRCS`), and `test_main.c`. `make ut` reports **780 tests, 0 failed**.
+### >>> Integration status <<<
+All 11 historically verified suites are registered in `stubs.c`, the Makefile (`UT_MODULE_SRCS` / `UT_LOCAL_SRCS`), and `test_main.c`. `make ut` reports **780 tests, 0 failed**.
+`opt_redundant_assign` is written and verified in isolation but is **not yet registered** in the build (pending Makefile + `test_main.c` wiring).
 
 Notes from the combined link:
 - The 4 frontend link stubs originally inside `test_opt_constfold.c` (`global_stack`, `sym_push2`, `external_global_sym`, `tok_alloc_const`) were moved to `stubs.c` so the union link has a single definition.
@@ -212,8 +214,19 @@ Run:
 Each found bug is **characterized, not fixed** (Phase BH rule). The bug-fix pass should root-cause Findings
 #14–#16 and flip the pinned `*_SUSPECTED_BUG` / `KNOWN_DIVERGENCES` characterizations to assert correct behavior.
 
-## Phase E — Ledger + CI gate — TODO
-- [ ] `check_pass_coverage.py` — enumerate `PASS`/`PASS_GATED` in `ir/opt_pipeline.c` vs `UT_COVERS` markers; wire into CI (soft-fail first)
+## Phase E — Ledger + CI gate — IMPLEMENTED (2026-06-28)
+- [x] `tests/unit/check_pass_coverage.py` — enumerates `PASS`/`PASS_GATED` names in `ir/opt_pipeline.c`
+  plus `SSA_RUN("ssa:<pass>")` names in `ir/opt/*.c`, diffs them against `UT_COVERS("...")` markers in
+  `tests/unit/arm/armv8m/*.c` and golden-IR directories under `tests/ir_tests/golden/`, and reports gaps.
+- [x] Alias map normalizes the common marker↔registered-name mismatches (e.g. `cmp_fold` →
+  `cmp_expr_fold`/`cmp_offset_fold`, `float_narrowing` → `float_narrow`, `jump_threading` → `jump_thread`).
+- [x] `make check-pass-coverage` target added to `libs/tinycc/Makefile`.
+- [x] CI step added in `.github/workflows/ci.yml` after the source-coverage check; it runs in soft-fail
+  mode (exit 0 while gaps remain) so the build stays green during the fan-out.
+- **Current snapshot:** 35/89 registered passes covered (39.3%) after alias resolution. The remaining 54
+  gaps are itemized by running `python3 tests/unit/check_pass_coverage.py`. The next coverage push should
+  close the highest-ROI gaps first: `sl_forward`, `dce`, `branch_fold`, the SSA passes not yet in golden-IR,
+  and the late-cleanup dead-store family.
 
 ## Phase F — Remaining registered passes — LARGELY LANDED (2026-06-26)
 The previously-uncovered registered passes now have unit suites. **191 new tests** were written in parallel
@@ -483,6 +496,23 @@ and assert the correct fold; `make ut` green. Finding **#15** (7 `-O1`/`-O2` ran
     cases instead). Re-enabling them requires first hardening the oracle: make the delta-reducer reject reductions
     that introduce read-before-def, and have `ire_eval` return `IRE_UNSUPPORTED`/skip on any operand it cannot model
     rather than computing a bogus value.
+
+19. **`redundant_var_assign` skips redundant assignments to VAR position 0 (SUSPECTED BUG).**
+    The pass computes `max_var` as the largest VAR position seen, then returns 0 immediately when
+    `max_var == 0`. Because VAR positions are 0-based (`next_local_variable` starts at 0), a function
+    whose only variable is VAR 0 — or whose highest VAR is 0 — silently bypasses the optimization even
+    when two consecutive writes to VAR 0 are provably redundant. `test_redundant_var_assign_var0_skipped`
+    pins the current behavior: the pass reports `changes == 0` and leaves both ASSIGNs intact.
+    The likely fix is to treat `max_var < 0` as the "no variables" case, or to allocate a one-element
+    pending table when only VAR 0 is present.
+
+20. **`dce` is not idempotent in its change count (SUSPECTED BUG).**
+    The legacy `tcc_ir_opt_dce` pass recomputes reachability from entry on every invocation and converts
+    every unreachable instruction to `NOP`, counting it regardless of whether it was already `NOP`.  On a
+    second invocation over the same IR it therefore returns the same positive count rather than 0, even
+    though no new instruction is transformed.  `test_dce_second_run_reports_same_count` pins the current
+    behavior: the second run returns the same count as the first and no additional non-`NOP` instruction
+    becomes `NOP`.  The likely fix is to only count instructions whose op was not already `NOP`.
 
 ## Deferred
 - **opt_switch_data** (`switch_to_data`, `switch_collapse`): needs ELF/section + frontend state
