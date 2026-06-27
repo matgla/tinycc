@@ -1092,18 +1092,24 @@ int tcc_ir_opt_symref_const_prop(TCCIRState *ir)
       changes++;
     }
 
-    /* Record new ASSIGN(symref) definitions for downstream substitution. */
-    if (q->op == TCCIR_OP_ASSIGN && irop_config[q->op].has_dest)
+    /* Record new ASSIGN(symref) definitions for downstream substitution, and
+     * invalidate any tracked tmp redefined by a write that does NOT record a
+     * fresh copy.  Both cases share the dest-decode prologue, so they live in
+     * one branch: an ASSIGN whose source is not a non-lval symref must still
+     * fall through to invalidation (it redefines the tmp), which an
+     * `if/else if` split would have skipped. */
+    if (irop_config[q->op].has_dest)
     {
       IROperand dest = tcc_ir_op_get_dest(ir, q);
       int32_t dvr = irop_get_vreg(dest);
       if (TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_TEMP)
       {
-        IROperand src1 = tcc_ir_op_get_src1(ir, q);
-        if (src1.is_sym && !src1.is_lval)
+        int pos = TCCIR_DECODE_VREG_POSITION(dvr);
+        int recorded = 0;
+        if (q->op == TCCIR_OP_ASSIGN)
         {
-          int pos = TCCIR_DECODE_VREG_POSITION(dvr);
-          if (pos <= max_tmp_pos)
+          IROperand src1 = tcc_ir_op_get_src1(ir, q);
+          if (src1.is_sym && !src1.is_lval && pos <= max_tmp_pos)
           {
             map[pos].gen = current_gen;
             map[pos].pool_idx = (uint32_t)src1.u.pool_idx;
@@ -1111,19 +1117,11 @@ int tcc_ir_opt_symref_const_prop(TCCIRState *ir)
             map[pos].is_local = src1.is_local;
             map[pos].is_const = src1.is_const;
             map[pos].is_unsigned = src1.is_unsigned;
+            recorded = 1;
           }
         }
-      }
-    }
-    /* Any other write that targets a tracked tmp invalidates it. */
-    else if (irop_config[q->op].has_dest)
-    {
-      IROperand dest = tcc_ir_op_get_dest(ir, q);
-      int32_t dvr = irop_get_vreg(dest);
-      if (TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_TEMP)
-      {
-        int pos = TCCIR_DECODE_VREG_POSITION(dvr);
-        if (pos <= max_tmp_pos && map[pos].gen == current_gen)
+        /* Not a fresh copy record → this write kills any tracked symref. */
+        if (!recorded && pos <= max_tmp_pos && map[pos].gen == current_gen)
           map[pos].gen = 0;
       }
     }

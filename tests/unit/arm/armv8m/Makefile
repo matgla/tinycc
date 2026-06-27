@@ -54,6 +54,10 @@ UT_MODULE_SRCS := \
 	$(TOP)/ir/pool.c \
 	$(TOP)/ir/type.c \
 	$(TOP)/ir/vreg.c \
+	$(TOP)/ir/dump.c \
+	$(TOP)/ir/stack.c \
+	$(TOP)/ir/ssa.c \
+	$(TOP)/svalue.c \
 	$(TOP)/arch/arm/arm.c \
 	$(TOP)/arch/arm/thumb/thumb.c \
 	$(TOP)/arch/arm/thumb/thop_adr.c \
@@ -64,6 +68,8 @@ UT_MODULE_SRCS := \
 	$(TOP)/arch/arm/thumb/thop_cmp.c \
 	$(TOP)/arch/arm/thumb/thop_extend.c \
 	$(TOP)/arch/arm/thumb/thop_alu_reg.c \
+	$(TOP)/arch/arm/thumb/thop_alu_imm.c \
+	$(TOP)/arch/arm/thumb/thop_dsp.c \
 	$(TOP)/arch/arm/thumb/thop_tbb.c \
 	$(TOP)/arch/arm/thumb/thop_shift_reg.c \
 	$(TOP)/arch/arm/thumb/thop_shift_imm.c \
@@ -107,7 +113,10 @@ UT_MODULE_SRCS := \
 	$(TOP)/ir/opt_bitfield.c \
 	$(TOP)/ir/opt_const_aggregate.c \
 	$(TOP)/ir/opt_dead_vla.c \
-	$(TOP)/ir/opt_xform.c
+	$(TOP)/ir/opt_xform.c \
+		$(TOP)/ir/regalloc.c \
+		$(TOP)/tccls.c \
+		$(TOP)/arch/arm/arm_regalloc.c
 
 UT_MODULE_OBJS := $(patsubst $(TOP)/%.c,$(BUILD_DIR)/%.o,$(UT_MODULE_SRCS))
 
@@ -125,6 +134,17 @@ UT_LOCAL_SRCS := \
 	test_ir_pool.c \
 	test_ir_type.c \
 	test_ir_vreg.c \
+	test_ir_core.c \
+	test_ir_dump.c \
+	test_ir_stack.c \
+	test_ir_ssa.c \
+	test_ir_operand.c \
+	test_svalue.c \
+	test_ra_live.c \
+	test_ra_linearscan.c \
+	test_ra_phi.c \
+	test_ra_arm.c \
+	ra_link_stubs.c \
 	test_opt_neg_chain.c \
 	test_opt_knownbits.c \
 	test_opt_copyprop.c \
@@ -146,6 +166,8 @@ UT_LOCAL_SRCS := \
 	test_metamorphic_ssa.c \
 	test_thop_adr.c \
 	test_thop_alu_reg.c \
+	test_thop_alu_imm.c \
+	test_thop_dsp.c \
 	test_thop_block.c \
 	test_thop_constraints.c \
 	test_thop_branch.c \
@@ -229,6 +251,11 @@ $(BUILD_DIR)/libtcc.o: $(TOP)/libtcc.c Makefile
 
 # tccir_operand.o — top-level source (pool getters for the opt-pass suites).
 $(BUILD_DIR)/tccir_operand.o: $(TOP)/tccir_operand.c Makefile
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(UT_CFLAGS) $(UT_DEPFLAGS) -c $< -o $@
+
+# Other top-level tinycc sources (e.g. svalue.c) compiled straight to build/*.o.
+$(BUILD_DIR)/%.o: $(TOP)/%.c Makefile
 	@mkdir -p $(dir $@)
 	$(HOSTCC) $(UT_CFLAGS) $(UT_DEPFLAGS) -c $< -o $@
 

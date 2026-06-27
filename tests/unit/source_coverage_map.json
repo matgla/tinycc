@@ -1,0 +1,830 @@
+{
+  "arch/arm/arm.c": {
+    "kind": "ir_test",
+    "note": "no dedicated unit/golden/asm test yet",
+    "via": [
+      "tests/ir_tests/*.expect QEMU corpus"
+    ]
+  },
+  "arch/arm/arm_aapcs.c": {
+    "kind": "ir_test",
+    "note": "no dedicated unit/golden/asm test yet",
+    "via": [
+      "tests/ir_tests/*.expect QEMU corpus"
+    ]
+  },
+  "arch/arm/arm_regalloc.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_ra_arm.c"
+    ]
+  },
+  "arch/arm/ssa_opt_arm.c": {
+    "kind": "ir_test",
+    "note": "no dedicated unit/golden/asm test yet",
+    "via": [
+      "tests/ir_tests/*.expect QEMU corpus"
+    ]
+  },
+  "arch/arm/thumb/thop_adr.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_thop_adr.c"
+    ]
+  },
+  "arch/arm/thumb/thop_alu_imm.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_thop_alu_imm.c"
+    ]
+  },
+  "arch/arm/thumb/thop_alu_reg.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_thop_alu_reg.c"
+    ]
+  },
+  "arch/arm/thumb/thop_bitfield.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_thop_bitfield.c"
+    ]
+  },
+  "arch/arm/thumb/thop_block.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_thop_block.c"
+    ]
+  },
+  "arch/arm/thumb/thop_branch.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_thop_branch.c"
+    ]
+  },
+  "arch/arm/thumb/thop_cmp.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_thop_cmp.c"
+    ]
+  },
+  "arch/arm/thumb/thop_dsp.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_thop_dsp.c"
+    ]
+  },
+  "arch/arm/thumb/thop_extend.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_thop_extend.c"
+    ]
+  },
+  "arch/arm/thumb/thop_ldaex.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_thop_ldaex.c"
+    ]
+  },
+  "arch/arm/thumb/thop_ldr_literal.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_thop_ldr_literal.c"
+    ]
+  },
+  "arch/arm/thumb/thop_ldrd.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_thop_ldrd.c"
+    ]
+  },
+  "arch/arm/thumb/thop_ldrex.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_thop_ldrex.c"
+    ]
+  },
+  "arch/arm/thumb/thop_mem_exclusive.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_thop_mem_exclusive.c"
+    ]
+  },
+  "arch/arm/thumb/thop_mem_imm.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_thop_mem_imm.c"
+    ]
+  },
+  "arch/arm/thumb/thop_mem_reg.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_thop_mem_reg.c"
+    ]
+  },
+  "arch/arm/thumb/thop_mem_unpriv.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_thop_mem_unpriv.c"
+    ]
+  },
+  "arch/arm/thumb/thop_mov.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_thop_mov.c"
+    ]
+  },
+  "arch/arm/thumb/thop_mrs.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_thop_mrs.c"
+    ]
+  },
+  "arch/arm/thumb/thop_mul.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_thop_mul.c"
+    ]
+  },
+  "arch/arm/thumb/thop_mvn.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_thop_mvn.c"
+    ]
+  },
+  "arch/arm/thumb/thop_pld.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_thop_pld.c"
+    ]
+  },
+  "arch/arm/thumb/thop_rev.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_thop_rev.c"
+    ]
+  },
+  "arch/arm/thumb/thop_shift_imm.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_thop_shift_imm.c"
+    ]
+  },
+  "arch/arm/thumb/thop_shift_reg.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_thop_shift_reg.c"
+    ]
+  },
+  "arch/arm/thumb/thop_system.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_thop_system.c"
+    ]
+  },
+  "arch/arm/thumb/thop_tbb.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_thop_tbb.c"
+    ]
+  },
+  "arch/arm/thumb/thop_vfp.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_thop_vfp.c"
+    ]
+  },
+  "arch/arm/thumb/thumb.c": {
+    "kind": "ir_test",
+    "note": "no dedicated unit/golden/asm test yet",
+    "via": [
+      "tests/ir_tests/*.expect QEMU corpus"
+    ]
+  },
+  "arm-link.c": {
+    "kind": "ir_test",
+    "note": "no dedicated unit/golden/asm test yet",
+    "via": [
+      "tests/ir_tests/*.expect QEMU corpus"
+    ]
+  },
+  "arm-thumb-asm.c": {
+    "kind": "ir_test",
+    "note": "no dedicated unit/golden/asm test yet",
+    "via": [
+      "tests/ir_tests/*.expect QEMU corpus"
+    ]
+  },
+  "arm-thumb-callsite.c": {
+    "kind": "ir_test",
+    "note": "no dedicated unit/golden/asm test yet",
+    "via": [
+      "tests/ir_tests/*.expect QEMU corpus"
+    ]
+  },
+  "arm-thumb-gen.c": {
+    "kind": "ir_test",
+    "note": "no dedicated unit/golden/asm test yet",
+    "via": [
+      "tests/ir_tests/*.expect QEMU corpus"
+    ]
+  },
+  "arm-thumb-scratch.c": {
+    "kind": "ir_test",
+    "note": "no dedicated unit/golden/asm test yet",
+    "via": [
+      "tests/ir_tests/*.expect QEMU corpus"
+    ]
+  },
+  "ir/cfg.c": {
+    "kind": "ir_test",
+    "note": "no dedicated unit/golden/asm test yet",
+    "via": [
+      "tests/ir_tests/*.expect QEMU corpus"
+    ]
+  },
+  "ir/codegen.c": {
+    "kind": "ir_test",
+    "note": "no dedicated unit/golden/asm test yet",
+    "via": [
+      "tests/ir_tests/*.expect QEMU corpus"
+    ]
+  },
+  "ir/core.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_ir_core.c"
+    ]
+  },
+  "ir/dump.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_ir_dump.c"
+    ]
+  },
+  "ir/licm.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_opt_licm.c"
+    ]
+  },
+  "ir/machine_op.c": {
+    "kind": "ir_test",
+    "note": "no dedicated unit/golden/asm test yet",
+    "via": [
+      "tests/ir_tests/*.expect QEMU corpus"
+    ]
+  },
+  "ir/opt.c": {
+    "kind": "ir_test",
+    "note": "no dedicated unit/golden/asm test yet",
+    "via": [
+      "tests/ir_tests/*.expect QEMU corpus"
+    ]
+  },
+  "ir/opt_alias.c": {
+    "kind": "ir_test",
+    "note": "no dedicated unit/golden/asm test yet",
+    "via": [
+      "tests/ir_tests/*.expect QEMU corpus"
+    ]
+  },
+  "ir/opt_bitfield.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_opt_bitfield.c"
+    ]
+  },
+  "ir/opt_branch.c": {
+    "kind": "ir_test",
+    "note": "no dedicated unit/golden/asm test yet",
+    "via": [
+      "tests/ir_tests/*.expect QEMU corpus"
+    ]
+  },
+  "ir/opt_cmp_fuse.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_opt_cmp_fuse.c"
+    ]
+  },
+  "ir/opt_const_aggregate.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_opt_const_aggregate.c"
+    ]
+  },
+  "ir/opt_constfold.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_opt_constfold.c"
+    ]
+  },
+  "ir/opt_constprop.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_opt_constprop.c"
+    ]
+  },
+  "ir/opt_copyprop.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_opt_copyprop.c"
+    ]
+  },
+  "ir/opt_dce.c": {
+    "kind": "ir_test",
+    "note": "no dedicated unit/golden/asm test yet",
+    "via": [
+      "tests/ir_tests/*.expect QEMU corpus"
+    ]
+  },
+  "ir/opt_dead_lea_store.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_opt_dead_lea_store.c"
+    ]
+  },
+  "ir/opt_dead_vla.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_opt_dead_vla.c"
+    ]
+  },
+  "ir/opt_du.c": {
+    "kind": "ir_test",
+    "note": "no dedicated unit/golden/asm test yet",
+    "via": [
+      "tests/ir_tests/*.expect QEMU corpus"
+    ]
+  },
+  "ir/opt_engine.c": {
+    "kind": "ir_test",
+    "note": "no dedicated unit/golden/asm test yet",
+    "via": [
+      "tests/ir_tests/*.expect QEMU corpus"
+    ]
+  },
+  "ir/opt_fusion.c": {
+    "kind": "ir_test",
+    "note": "no dedicated unit/golden/asm test yet",
+    "via": [
+      "tests/ir_tests/*.expect QEMU corpus"
+    ]
+  },
+  "ir/opt_gens_bool.c": {
+    "kind": "ir_test",
+    "note": "no dedicated unit/golden/asm test yet",
+    "via": [
+      "tests/ir_tests/*.expect QEMU corpus"
+    ]
+  },
+  "ir/opt_gens_branch.c": {
+    "kind": "ir_test",
+    "note": "no dedicated unit/golden/asm test yet",
+    "via": [
+      "tests/ir_tests/*.expect QEMU corpus"
+    ]
+  },
+  "ir/opt_gens_call_result.c": {
+    "kind": "ir_test",
+    "note": "no dedicated unit/golden/asm test yet",
+    "via": [
+      "tests/ir_tests/*.expect QEMU corpus"
+    ]
+  },
+  "ir/opt_gens_fusion.c": {
+    "kind": "ir_test",
+    "note": "no dedicated unit/golden/asm test yet",
+    "via": [
+      "tests/ir_tests/*.expect QEMU corpus"
+    ]
+  },
+  "ir/opt_hash.c": {
+    "kind": "ir_test",
+    "note": "no dedicated unit/golden/asm test yet",
+    "via": [
+      "tests/ir_tests/*.expect QEMU corpus"
+    ]
+  },
+  "ir/opt_jump_thread.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_opt_jump_thread.c"
+    ]
+  },
+  "ir/opt_knownbits.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_opt_knownbits.c"
+    ]
+  },
+  "ir/opt_loop.c": {
+    "kind": "ir_test",
+    "note": "no dedicated unit/golden/asm test yet",
+    "via": [
+      "tests/ir_tests/*.expect QEMU corpus"
+    ]
+  },
+  "ir/opt_loop_const_sim.c": {
+    "kind": "ir_test",
+    "note": "no dedicated unit/golden/asm test yet",
+    "via": [
+      "tests/ir_tests/*.expect QEMU corpus"
+    ]
+  },
+  "ir/opt_loop_dead.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_opt_loop_dead.c"
+    ]
+  },
+  "ir/opt_loop_utils.c": {
+    "kind": "ir_test",
+    "note": "no dedicated unit/golden/asm test yet",
+    "via": [
+      "tests/ir_tests/*.expect QEMU corpus"
+    ]
+  },
+  "ir/opt_memory.c": {
+    "kind": "ir_test",
+    "note": "no dedicated unit/golden/asm test yet",
+    "via": [
+      "tests/ir_tests/*.expect QEMU corpus"
+    ]
+  },
+  "ir/opt_neg_chain.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_opt_neg_chain.c"
+    ]
+  },
+  "ir/opt_pack64.c": {
+    "kind": "ir_test",
+    "note": "no dedicated unit/golden/asm test yet",
+    "via": [
+      "tests/ir_tests/*.expect QEMU corpus"
+    ]
+  },
+  "ir/opt_pipeline.c": {
+    "kind": "ir_test",
+    "note": "no dedicated unit/golden/asm test yet",
+    "via": [
+      "tests/ir_tests/*.expect QEMU corpus"
+    ]
+  },
+  "ir/opt_promote.c": {
+    "kind": "ir_test",
+    "note": "no dedicated unit/golden/asm test yet",
+    "via": [
+      "tests/ir_tests/*.expect QEMU corpus"
+    ]
+  },
+  "ir/opt_reroll.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_opt_reroll.c"
+    ]
+  },
+  "ir/opt_setif_or_taut.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_opt_setif_or_taut.c"
+    ]
+  },
+  "ir/opt_switch_data.c": {
+    "kind": "ir_test",
+    "note": "no dedicated unit/golden/asm test yet",
+    "via": [
+      "tests/ir_tests/*.expect QEMU corpus"
+    ]
+  },
+  "ir/opt_utils.c": {
+    "kind": "ir_test",
+    "note": "no dedicated unit/golden/asm test yet",
+    "via": [
+      "tests/ir_tests/*.expect QEMU corpus"
+    ]
+  },
+  "ir/opt_xform.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_opt_xform.c"
+    ]
+  },
+  "ir/pool.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_ir_pool.c"
+    ]
+  },
+  "ir/regalloc.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_ra_live.c",
+      "tests/unit/arm/armv8m/test_ra_linearscan.c",
+      "tests/unit/arm/armv8m/test_ra_phi.c"
+    ]
+  },
+  "ir/ssa.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_ir_ssa.c"
+    ]
+  },
+  "ir/stack.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_ir_stack.c"
+    ]
+  },
+  "ir/type.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_ir_type.c"
+    ]
+  },
+  "ir/vreg.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_ir_vreg.c"
+    ]
+  },
+  "lib/armeabi.c": {
+    "kind": "runtime_lib",
+    "note": "",
+    "via": [
+      "runtime tests (compiled programs)"
+    ]
+  },
+  "lib/armflush.c": {
+    "kind": "runtime_lib",
+    "note": "",
+    "via": [
+      "runtime tests (compiled programs)"
+    ]
+  },
+  "lib/armv8m_eabi.c": {
+    "kind": "runtime_lib",
+    "note": "",
+    "via": [
+      "runtime tests (compiled programs)"
+    ]
+  },
+  "lib/bcheck.c": {
+    "kind": "runtime_lib",
+    "note": "",
+    "via": [
+      "runtime tests (compiled programs)"
+    ]
+  },
+  "lib/bt-dll.c": {
+    "kind": "runtime_lib",
+    "note": "",
+    "via": [
+      "runtime tests (compiled programs)"
+    ]
+  },
+  "lib/bt-exe.c": {
+    "kind": "runtime_lib",
+    "note": "",
+    "via": [
+      "runtime tests (compiled programs)"
+    ]
+  },
+  "lib/bt-log.c": {
+    "kind": "runtime_lib",
+    "note": "",
+    "via": [
+      "runtime tests (compiled programs)"
+    ]
+  },
+  "lib/builtin.c": {
+    "kind": "runtime_lib",
+    "note": "",
+    "via": [
+      "runtime tests (compiled programs)"
+    ]
+  },
+  "lib/dsohandle.c": {
+    "kind": "runtime_lib",
+    "note": "",
+    "via": [
+      "runtime tests (compiled programs)"
+    ]
+  },
+  "lib/lib-arm64.c": {
+    "kind": "runtime_lib",
+    "note": "",
+    "via": [
+      "runtime tests (compiled programs)"
+    ]
+  },
+  "lib/libtcc1.c": {
+    "kind": "runtime_lib",
+    "note": "",
+    "via": [
+      "runtime tests (compiled programs)"
+    ]
+  },
+  "lib/runmain.c": {
+    "kind": "runtime_lib",
+    "note": "",
+    "via": [
+      "runtime tests (compiled programs)"
+    ]
+  },
+  "lib/stdatomic.c": {
+    "kind": "runtime_lib",
+    "note": "",
+    "via": [
+      "runtime tests (compiled programs)"
+    ]
+  },
+  "lib/tcov.c": {
+    "kind": "runtime_lib",
+    "note": "",
+    "via": [
+      "runtime tests (compiled programs)"
+    ]
+  },
+  "lib/thumbflush.c": {
+    "kind": "runtime_lib",
+    "note": "",
+    "via": [
+      "runtime tests (compiled programs)"
+    ]
+  },
+  "lib/va_list.c": {
+    "kind": "runtime_lib",
+    "note": "",
+    "via": [
+      "runtime tests (compiled programs)"
+    ]
+  },
+  "libtcc.c": {
+    "kind": "ir_test",
+    "note": "no dedicated unit/golden/asm test yet",
+    "via": [
+      "tests/ir_tests/*.expect QEMU corpus"
+    ]
+  },
+  "svalue.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_svalue.c"
+    ]
+  },
+  "tcc.c": {
+    "kind": "ir_test",
+    "note": "no dedicated unit/golden/asm test yet",
+    "via": [
+      "tests/ir_tests/*.expect QEMU corpus"
+    ]
+  },
+  "tccasm.c": {
+    "kind": "ir_test",
+    "note": "no dedicated unit/golden/asm test yet",
+    "via": [
+      "tests/ir_tests/*.expect QEMU corpus"
+    ]
+  },
+  "tccdbg.c": {
+    "kind": "ir_test",
+    "note": "no dedicated unit/golden/asm test yet",
+    "via": [
+      "tests/ir_tests/*.expect QEMU corpus"
+    ]
+  },
+  "tccdebug.c": {
+    "kind": "ir_test",
+    "note": "no dedicated unit/golden/asm test yet",
+    "via": [
+      "tests/ir_tests/*.expect QEMU corpus"
+    ]
+  },
+  "tccelf.c": {
+    "kind": "ir_test",
+    "note": "no dedicated unit/golden/asm test yet",
+    "via": [
+      "tests/ir_tests/*.expect QEMU corpus"
+    ]
+  },
+  "tccgen.c": {
+    "kind": "ir_test",
+    "note": "no dedicated unit/golden/asm test yet",
+    "via": [
+      "tests/ir_tests/*.expect QEMU corpus"
+    ]
+  },
+  "tccir_operand.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_ir_operand.c"
+    ]
+  },
+  "tccld.c": {
+    "kind": "ir_test",
+    "note": "no dedicated unit/golden/asm test yet",
+    "via": [
+      "tests/ir_tests/*.expect QEMU corpus"
+    ]
+  },
+  "tccls.c": {
+    "kind": "unit",
+    "note": "",
+    "via": [
+      "tests/unit/arm/armv8m/test_ra_linearscan.c"
+    ]
+  },
+  "tccmachine.c": {
+    "kind": "ir_test",
+    "note": "no dedicated unit/golden/asm test yet",
+    "via": [
+      "tests/ir_tests/*.expect QEMU corpus"
+    ]
+  },
+  "tccopt.c": {
+    "kind": "ir_test",
+    "note": "no dedicated unit/golden/asm test yet",
+    "via": [
+      "tests/ir_tests/*.expect QEMU corpus"
+    ]
+  },
+  "tccpp.c": {
+    "kind": "ir_test",
+    "note": "no dedicated unit/golden/asm test yet",
+    "via": [
+      "tests/ir_tests/*.expect QEMU corpus"
+    ]
+  },
+  "tcctools.c": {
+    "kind": "ir_test",
+    "note": "no dedicated unit/golden/asm test yet",
+    "via": [
+      "tests/ir_tests/*.expect QEMU corpus"
+    ]
+  },
+  "tccyaff.c": {
+    "kind": "ir_test",
+    "note": "no dedicated unit/golden/asm test yet",
+    "via": [
+      "tests/ir_tests/*.expect QEMU corpus"
+    ]
+  }
+}

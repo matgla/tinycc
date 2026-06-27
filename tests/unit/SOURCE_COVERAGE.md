@@ -6,8 +6,8 @@
 
 | Layer | Count | Fraction |
 |---|---|---|
-| Covered by unit suite | 48 | 40.7% |
-| Covered by QEMU ir_tests corpus | 54 | 45.8% |
+| Covered by unit suite | 56 | 47.5% |
+| Covered by QEMU ir_tests corpus | 46 | 39.0% |
 | Runtime library (exercised by compiled programs) | 16 | 13.6% |
 | **Total tracked files** | **118** | **100%** |
 
@@ -15,12 +15,15 @@
 
 | Source file | Covered via | Note |
 |---|---|---|
+| `arch/arm/arm_regalloc.c` | tests/unit/arm/armv8m/test_ra_arm.c | — |
 | `arch/arm/thumb/thop_adr.c` | tests/unit/arm/armv8m/test_thop_adr.c | — |
+| `arch/arm/thumb/thop_alu_imm.c` | tests/unit/arm/armv8m/test_thop_alu_imm.c | — |
 | `arch/arm/thumb/thop_alu_reg.c` | tests/unit/arm/armv8m/test_thop_alu_reg.c | — |
 | `arch/arm/thumb/thop_bitfield.c` | tests/unit/arm/armv8m/test_thop_bitfield.c | — |
 | `arch/arm/thumb/thop_block.c` | tests/unit/arm/armv8m/test_thop_block.c | — |
 | `arch/arm/thumb/thop_branch.c` | tests/unit/arm/armv8m/test_thop_branch.c | — |
 | `arch/arm/thumb/thop_cmp.c` | tests/unit/arm/armv8m/test_thop_cmp.c | — |
+| `arch/arm/thumb/thop_dsp.c` | tests/unit/arm/armv8m/test_thop_dsp.c | — |
 | `arch/arm/thumb/thop_extend.c` | tests/unit/arm/armv8m/test_thop_extend.c | — |
 | `arch/arm/thumb/thop_ldaex.c` | tests/unit/arm/armv8m/test_thop_ldaex.c | — |
 | `arch/arm/thumb/thop_ldr_literal.c` | tests/unit/arm/armv8m/test_thop_ldr_literal.c | — |
@@ -41,7 +44,8 @@
 | `arch/arm/thumb/thop_system.c` | tests/unit/arm/armv8m/test_thop_system.c | — |
 | `arch/arm/thumb/thop_tbb.c` | tests/unit/arm/armv8m/test_thop_tbb.c | — |
 | `arch/arm/thumb/thop_vfp.c` | tests/unit/arm/armv8m/test_thop_vfp.c | — |
-| `arch/arm/thumb/thumb.c` | tests/unit/arm/armv8m/test_thop_constraints.c | constraint-engine coverage via test_thop_constraints |
+| `ir/core.c` | tests/unit/arm/armv8m/test_ir_core.c | — |
+| `ir/dump.c` | tests/unit/arm/armv8m/test_ir_dump.c | — |
 | `ir/licm.c` | tests/unit/arm/armv8m/test_opt_licm.c | — |
 | `ir/opt_bitfield.c` | tests/unit/arm/armv8m/test_opt_bitfield.c | — |
 | `ir/opt_cmp_fuse.c` | tests/unit/arm/armv8m/test_opt_cmp_fuse.c | — |
@@ -49,10 +53,8 @@
 | `ir/opt_constfold.c` | tests/unit/arm/armv8m/test_opt_constfold.c | — |
 | `ir/opt_constprop.c` | tests/unit/arm/armv8m/test_opt_constprop.c | — |
 | `ir/opt_copyprop.c` | tests/unit/arm/armv8m/test_opt_copyprop.c | — |
-| `ir/opt_dce.c` | tests/unit/arm/armv8m/test_opt_cmpfold.c | exercised indirectly by the cmpfold suite |
 | `ir/opt_dead_lea_store.c` | tests/unit/arm/armv8m/test_opt_dead_lea_store.c | — |
 | `ir/opt_dead_vla.c` | tests/unit/arm/armv8m/test_opt_dead_vla.c | — |
-| `ir/opt_du.c` | tests/unit/arm/armv8m/test_opt_cmpfold.c | exercised indirectly by the cmpfold suite |
 | `ir/opt_jump_thread.c` | tests/unit/arm/armv8m/test_opt_jump_thread.c | — |
 | `ir/opt_knownbits.c` | tests/unit/arm/armv8m/test_opt_knownbits.c | — |
 | `ir/opt_loop_dead.c` | tests/unit/arm/armv8m/test_opt_loop_dead.c | — |
@@ -61,8 +63,14 @@
 | `ir/opt_setif_or_taut.c` | tests/unit/arm/armv8m/test_opt_setif_or_taut.c | — |
 | `ir/opt_xform.c` | tests/unit/arm/armv8m/test_opt_xform.c | — |
 | `ir/pool.c` | tests/unit/arm/armv8m/test_ir_pool.c | — |
+| `ir/regalloc.c` | tests/unit/arm/armv8m/test_ra_live.c, tests/unit/arm/armv8m/test_ra_linearscan.c, tests/unit/arm/armv8m/test_ra_phi.c | — |
+| `ir/ssa.c` | tests/unit/arm/armv8m/test_ir_ssa.c | — |
+| `ir/stack.c` | tests/unit/arm/armv8m/test_ir_stack.c | — |
 | `ir/type.c` | tests/unit/arm/armv8m/test_ir_type.c | — |
 | `ir/vreg.c` | tests/unit/arm/armv8m/test_ir_vreg.c | — |
+| `svalue.c` | tests/unit/arm/armv8m/test_svalue.c | — |
+| `tccir_operand.c` | tests/unit/arm/armv8m/test_ir_operand.c | — |
+| `tccls.c` | tests/unit/arm/armv8m/test_ra_linearscan.c | — |
 
 ## Covered by QEMU ir_tests corpus
 
@@ -70,23 +78,21 @@
 |---|---|---|
 | `arch/arm/arm.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
 | `arch/arm/arm_aapcs.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `arch/arm/arm_regalloc.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
 | `arch/arm/ssa_opt_arm.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `arch/arm/thumb/thop_alu_imm.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `arch/arm/thumb/thop_dsp.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
+| `arch/arm/thumb/thumb.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
 | `arm-link.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
 | `arm-thumb-asm.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
 | `arm-thumb-callsite.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
 | `arm-thumb-gen.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
 | `arm-thumb-scratch.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `ir/cfg.c` | tests/ir_tests/*.expect QEMU corpus | linked as base module; dominator helpers used by optimizer suites |
+| `ir/cfg.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
 | `ir/codegen.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `ir/core.c` | tests/ir_tests/*.expect QEMU corpus | linked as base module; exercised by all hand-built IR unit tests |
-| `ir/dump.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
 | `ir/machine_op.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `ir/opt.c` | tests/ir_tests/*.expect QEMU corpus | linked as base module; pass timing / helper functions used by optimizer suites |
-| `ir/opt_alias.c` | tests/ir_tests/*.expect QEMU corpus | linked as base module; used by optimizer suites |
+| `ir/opt.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
+| `ir/opt_alias.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
 | `ir/opt_branch.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
+| `ir/opt_dce.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
+| `ir/opt_du.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
 | `ir/opt_engine.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
 | `ir/opt_fusion.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
 | `ir/opt_gens_bool.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
@@ -103,20 +109,14 @@
 | `ir/opt_promote.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
 | `ir/opt_switch_data.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
 | `ir/opt_utils.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `ir/regalloc.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `ir/ssa.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `ir/stack.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
 | `libtcc.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `svalue.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
 | `tcc.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
 | `tccasm.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
 | `tccdbg.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
 | `tccdebug.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
 | `tccelf.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
 | `tccgen.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `tccir_operand.c` | tests/ir_tests/*.expect QEMU corpus | linked as base module; operand helpers used by IR builder and suites |
 | `tccld.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
-| `tccls.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
 | `tccmachine.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
 | `tccopt.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |
 | `tccpp.c` | tests/ir_tests/*.expect QEMU corpus | no dedicated unit/golden/asm test yet |

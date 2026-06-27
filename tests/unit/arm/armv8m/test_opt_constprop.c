@@ -1285,6 +1285,39 @@ UT_TEST(test_symrefconstprop_redef_invalidates)
   return 0;
 }
 
+/* GUARD (ASSIGN redefinition invalidates): a tracked T0 overwritten by a second
+ * ASSIGN whose source is NOT a non-lval symref must also clear map[T0].  This
+ * exercises the ASSIGN branch's fall-through to invalidation: the inner record
+ * does nothing (source is a tmp, not an address-by-value symref), so the write
+ * must still kill the stale tracking.
+ *   T0 <- &S            (records T0 -> &S)
+ *   T0 <- T9            (ASSIGN, source is a tmp: records nothing -> invalidate)
+ *   T1 = T0 ADD #4      -> NOT substituted (no stale symref survives)
+ * Before the fix the `else if` split skipped invalidation here and the final ADD
+ * was rewritten to the stale symref (changes==1). */
+UT_TEST(test_symrefconstprop_assign_redef_invalidates)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  static Sym s;
+  s.v = 0;
+  IROperand sref = utb_gsymref(ir, &s, 0, /*is_lval*/ 0, /*is_const*/ 1, I32);
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), sref, UTB_NONE);
+  /* Redefine T0 via a second ASSIGN from a plain tmp (T9): not a symref copy,
+   * so the record branch must fall through and invalidate the tracked T0. */
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_temp(9, I32), UTB_NONE);
+  int iuse = utb_emit(ir, TCCIR_OP_ADD, utb_temp(1, I32), utb_temp(0, I32), utb_imm(4, I32));
+
+  int changes = tcc_ir_opt_symref_const_prop(ir);
+  /* No use is rewritten: the only candidate (the ADD's T0) was invalidated. */
+  UT_ASSERT_EQ(changes, 0);
+  IROperand s1 = utb_src1(ir, iuse);
+  UT_ASSERT_EQ((int)s1.is_sym, 0);
+  UT_ASSERT_EQ(utb_vreg(s1), VR_TMP(0));
+  utb_free(ir);
+  return 0;
+}
+
 /* GUARD (block boundary clears tracking): a JUMPIF between the def and the use
  * ends the straight-line region, so the symref must not cross the merge.
  *   T0 <- &S
@@ -1845,6 +1878,7 @@ UT_SUITE(opt_constprop)
   UT_RUN(test_symrefconstprop_preserves_addend_and_lval);
   UT_RUN(test_symrefconstprop_lval_source_not_tracked);
   UT_RUN(test_symrefconstprop_redef_invalidates);
+  UT_RUN(test_symrefconstprop_assign_redef_invalidates);
   UT_RUN(test_symrefconstprop_block_boundary_clears);
   UT_RUN(test_symrefconstprop_idempotent);
 

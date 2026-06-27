@@ -562,10 +562,12 @@ int tcc_ir_opt_loop_bound_remat(TCCIRState *ir)
 static int tcc_ir_opt_loop_unroll__timed(TCCIRState *ir);
 int tcc_ir_opt_loop_unroll(TCCIRState *ir)
 {
-  /* Finding #15: random-C differential seed 18 still exposes O2-only
-   * wrong-code through the loop unroller. Keep the pass disabled until the
-   * relocation/live-range handling is repaired; correctness beats the small
-   * code-size/speed win here. */
+  /* Finding #15: O2 wrong-code (random-C differential seed 18).  Root-caused
+   * 2026-06-27 to the SAME backend register-allocation class as loop rotation
+   * below (a scratch register clobbering a loop-carried value) — the unroller's
+   * own output IR is not at fault.  Keep disabled until the regalloc scratch /
+   * per-instruction-liveness fix lands; correctness beats the code-size/speed
+   * win. */
   (void)ir;
   return 0;
   tcc_pass_timing_init();
@@ -740,9 +742,16 @@ static int tcc_ir_opt_loop_unroll__timed(TCCIRState *ir)
 static int tcc_ir_opt_loop_rotation__timed(TCCIRState *ir);
 int tcc_ir_opt_loop_rotation(TCCIRState *ir)
 {
-  /* Finding #15: loop rotation miscompiles O2 random-C checksum loops over
-   * local arrays (seeds 23 and 37). Disable the transform until its body
-   * relocation and downstream forwarding/coalescing invariants are fixed. */
+  /* Finding #15: O2 wrong-code on random-C checksum loops over local arrays
+   * (seeds 23, 37).  Root-caused 2026-06-27: rotation's output IR is CORRECT
+   * (verified via -dump-ir; the loop-carried accumulator phi is wired right).
+   * The miscompile is a BACKEND register-allocation bug that the rotated shape
+   * exposes — under the loop's register pressure, a scratch register allocated
+   * to materialise a stack array-base address INSIDE the loop body clobbers the
+   * loop-carried accumulator, whose register is (incorrectly) not reported in
+   * live_regs_by_instruction at that interior instruction, so the scratch
+   * allocator reuses it.  Keep disabled until the regalloc scratch / liveness
+   * fix lands. */
   (void)ir;
   return 0;
   tcc_pass_timing_init();

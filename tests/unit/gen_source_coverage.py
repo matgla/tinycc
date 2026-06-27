@@ -111,6 +111,18 @@ def unit_mapping() -> dict[str, str]:
             mapping["ir/type.c"] = name + ".c"
         elif name == "test_ir_vreg":
             mapping["ir/vreg.c"] = name + ".c"
+        elif name == "test_ir_core":
+            mapping["ir/core.c"] = name + ".c"
+        elif name == "test_ir_dump":
+            mapping["ir/dump.c"] = name + ".c"
+        elif name == "test_ir_stack":
+            mapping["ir/stack.c"] = name + ".c"
+        elif name == "test_ir_ssa":
+            mapping["ir/ssa.c"] = name + ".c"
+        elif name == "test_ir_operand":
+            mapping["tccir_operand.c"] = name + ".c"
+        elif name == "test_svalue":
+            mapping["svalue.c"] = name + ".c"
     return mapping
 
 

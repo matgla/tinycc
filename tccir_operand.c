@@ -808,27 +808,13 @@ int irop_compare_svalue(const TCCIRState *ir, const SValue *sv, IROperand op, co
     mismatch = 1;
   }
 
-  /* Compare CValue (c union) - compare multiple members for better diagnosis */
+  /* Compare CValue (c union).  Only compare c.i: union padding bytes in the
+   * unused portions of CValue can differ between two semantically-equal
+   * values, so a full memcmp would report false mismatches. */
   if (reconstructed.c.i != sv->c.i)
   {
     fprintf(stderr, "%s: c.i mismatch: reconstructed=0x%016llx, expected=0x%016llx\n", context,
             (unsigned long long)reconstructed.c.i, (unsigned long long)sv->c.i);
-    mismatch = 1;
-  }
-  else if (memcmp(&reconstructed.c, &sv->c, sizeof(CValue)) != 0)
-  {
-    /* Check string members if i matches but bytes differ (likely padding or str variant) */
-    if (reconstructed.c.str.data != sv->c.str.data || reconstructed.c.str.size != sv->c.str.size)
-    {
-      fprintf(stderr, "%s: c.str mismatch: data=%p/%p, size=%d/%d\n", context, (void *)reconstructed.c.str.data,
-              (void *)sv->c.str.data, reconstructed.c.str.size, sv->c.str.size);
-    }
-    else
-    {
-      fprintf(stderr, "%s: c mismatch: bytes differ (likely padding)\n", context);
-      fprintf(stderr, "  reconstructed.c.i = 0x%016llx\n", (unsigned long long)reconstructed.c.i);
-      fprintf(stderr, "  expected.c.i = 0x%016llx\n", (unsigned long long)sv->c.i);
-    }
     mismatch = 1;
   }
 

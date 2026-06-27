@@ -125,6 +125,88 @@ const char *get_tok_str(int v, void *cv)
   return "?";
 }
 
+/* ───── Frontend / IR link stubs pulled in by core, operand and opt modules ─────
+ *
+ * These symbols are referenced by functions that survive --gc-sections once
+ * the Phase 2 IR-core/data-structure suites exercise tcc_ir_alloc/put/etc.
+ * They are either unreachable at runtime for hand-built IR tests or have
+ * trivial semantics there, so opaque stubs are enough.
+ */
+struct Sym;
+struct TCCIRState;
+struct LSLiveIntervalState;
+struct BufferedFile;
+
+/* Minimal CType compatible with tcc.h (kept opaque here so we need not pull in
+ * tcc.h, which redefines malloc/free/realloc).  Must match the real layout. */
+typedef struct CType
+{
+  int t;
+  struct Sym *ref;
+} CType;
+
+/* From tccgen.c / tccpp.c — global state touched by tcc_ir_put(). */
+int nocode_wanted = 0;
+struct BufferedFile *file = NULL;
+CType func_old_type;
+
+/* From arm-thumb-gen.c — allocator init/shutdown. */
+int tcc_gen_machine_number_of_registers(void)
+{
+  return 16;
+}
+
+/* From tccelf.c — symbol registration; unit tests don't emit ELF. */
+typedef unsigned long addr_t;
+struct Section;
+
+int put_extern_sym2(struct Sym *sym, addr_t value, unsigned long size,
+                    int info, int other, int shndx, const char *name)
+{
+  (void)sym; (void)value; (void)size; (void)info;
+  (void)other; (void)shndx; (void)name;
+  return 0;
+}
+
+/* From arm-thumb-gen.c — soft-float helper names; unit tests don't lower calls. */
+struct SValue;
+
+const char *tcc_get_abi_softcall_name(struct SValue *src1, struct SValue *src2,
+                                       struct SValue *dest, int op)
+{
+  (void)src1; (void)src2; (void)dest; (void)op;
+  return NULL;
+}
+
+/* From tcc.c — operand width helper. */
+int tcc_is_64bit_operand(struct SValue *sv)
+{
+  (void)sv;
+  return 0;
+}
+
+/* From tccgen.c — type size/alignment. */
+int type_size(const struct CType *type, int *a)
+{
+  (void)type;
+  if (a)
+    *a = 4;
+  return 4;
+}
+
+/* From tccgen.c — float type predicate used by operand conversion. */
+int is_float(int t)
+{
+  (void)t;
+  return 0;
+}
+
+/* From tccopt.c — FP materialization cache teardown. */
+void tcc_opt_fp_mat_cache_free(struct TCCIRState *ir)
+{
+  (void)ir;
+}
+
 /* ───── Frontend link stubs pulled in by optimizer passes ─────
  *
  * opt_constfold.c/opt_utils.c reference the symbol-table helpers below.
@@ -132,8 +214,6 @@ const char *get_tok_str(int v, void *cv)
  * keeps them reachable from pass entry points, so the linker needs a
  * definition.  Keep them opaque (no tcc.h) — pointer args/returns are enough.
  */
-struct Sym;
-struct CType;
 
 struct Sym *global_stack = NULL;
 

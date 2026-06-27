@@ -454,19 +454,22 @@ and assert the correct fold; `make ut` green. Finding **#15** (7 `-O1`/`-O2` ran
     SHR / INT64-dest ZEXT). A generator false positive (sub-word ZEXT to I8 — not a real IR shape) was caught and
     removed during the original bring-up, per the plan's false-positive discipline.
 
-17. **`symref_const_prop` does not invalidate a tracked TMP redefined by a later ASSIGN (latent gap, UNFIXED).**
-    Found while writing the Phase F constprop suite. In `ir/opt_constprop.c:tcc_ir_opt_symref_const_prop`
-    (~lines 1096–1129), when an instruction is `ASSIGN Tn <- <src>`, control enters the
-    `if (q->op == TCCIR_OP_ASSIGN && has_dest)` branch; if the source is **not** a non-lval symref the inner
-    record does nothing, and the general dest-invalidation branch (`else if (has_dest) …`) is **not** reached
-    because it is an `else if`. So a tracked symref for `Tn` survives a redefinition of `Tn` by ASSIGN, and a
-    later use of `Tn` is rewritten to the stale symref. Empirically `ASSIGN T0<-&S; ASSIGN T0<-T9; ADD T1<-T0,#4`
-    yields `changes==1` with the symref substituted into the ADD (correct: 0). **Not a live miscompile**: the
-    pass's own header requires tmps be single-defined within a block (no later redef), which holds in canonical
-    IR, so the buggy path is unreachable in practice. Because of that precondition the suite does **not** pin an
-    assertion on this exact shape; `test_symrefconstprop_redef_invalidates` instead pins the genuinely-handled
-    invalidation path (redef via a non-ASSIGN op, which *does* hit the invalidation branch). Recorded here for a
-    future hardening pass (make the ASSIGN branch fall through to invalidation when it doesn't record a copy).
+17. **`symref_const_prop` did not invalidate a tracked TMP redefined by a later ASSIGN (latent gap, FIXED).**
+    Found while writing the Phase F constprop suite. In `ir/opt_constprop.c:tcc_ir_opt_symref_const_prop`,
+    when an instruction was `ASSIGN Tn <- <src>`, control entered the
+    `if (q->op == TCCIR_OP_ASSIGN && has_dest)` branch; if the source was **not** a non-lval symref the inner
+    record did nothing, and the general dest-invalidation branch (`else if (has_dest) …`) was **not** reached
+    because it was an `else if`. So a tracked symref for `Tn` survived a redefinition of `Tn` by ASSIGN, and a
+    later use of `Tn` was rewritten to the stale symref. Empirically `ASSIGN T0<-&S; ASSIGN T0<-T9; ADD T1<-T0,#4`
+    yielded `changes==1` with the symref substituted into the ADD (correct: 0). It was **not a live miscompile**:
+    the pass's own header requires tmps be single-defined within a block (no later redef), which holds in
+    canonical IR, so the buggy path was unreachable in practice.
+    **Fix:** the ASSIGN record branch and the general dest-invalidation branch were merged into one branch that
+    shares the dest-decode prologue. An ASSIGN now records a fresh copy only when the source is a non-lval
+    symref (`recorded = 1`); otherwise it falls through to invalidate the tracked tmp (`map[pos].gen = 0`), just
+    like any other write. `test_symrefconstprop_assign_redef_invalidates` pins exactly this shape (asserts
+    `changes==0` and the post-redef ADD's source stays a plain vreg); `test_symrefconstprop_redef_invalidates`
+    continues to cover the non-ASSIGN redef path.
 
 18. **Metamorphic oracle/reducer is RNG-fragile — produces an arithmetically-impossible value (harness bug, UNFIXED).**
     Surfaced while landing the #16 fix: re-enabling SHR / INT64-dest ZEXT in `ir_gen.h` (to give the now-fixed folds

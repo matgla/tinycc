@@ -1459,6 +1459,15 @@ struct TCCState
   } *vla_param_exprs;
   int nb_vla_param_exprs;
 
+  /* Inner (nested) VLA dimension token streams saved on a SYM_FIELD's
+     vla_array_str.  Materialization (func_vla_arg_code) frees and NULLs them at
+     a function definition's entry, but an inner VLA inside an abstract /
+     function-pointer declarator (e.g. a typedef `void(*)(int[][n()])`) is never
+     materialized, so its heap token stream would leak.  Tracked here so any
+     unconsumed buffer is reclaimed at end of translation unit. */
+  int **vla_inner_exprs;
+  int nb_vla_inner_exprs;
+
   /* linker script support */
   char *linker_script;        /* path to linker script file (-T option) */
   struct LDScript *ld_script; /* parsed linker script */

@@ -1140,6 +1140,39 @@ ST_FUNC void tccgen_finish(TCCState *s1)
   pending_aliases = NULL;
   nb_pending_aliases = 0;
 
+  /* Reclaim inner VLA dimension token streams that were never materialized
+     (abstract / function-pointer declarators, e.g. `typedef void(*)(int[][n()])`).
+     Consumed ones were already freed and NULLed in func_vla_arg_code. */
+  if (s1->vla_inner_exprs)
+  {
+    for (int i = 0; i < s1->nb_vla_inner_exprs; i++)
+      tcc_free(s1->vla_inner_exprs[i]);
+    tcc_free(s1->vla_inner_exprs);
+    s1->vla_inner_exprs = NULL;
+    s1->nb_vla_inner_exprs = 0;
+  }
+
+  /* Free any label-difference fixups left over from a symbol/label diff
+     (e.g. `int z = &"s"[1] - &"s"[0];`) that appeared in a GLOBAL initializer
+     with no enclosing function: gen_function's resolver only runs per function
+     body, so a global-only translation unit would leak the fixup node.  We only
+     RECLAIM them here, deliberately not re-applying the st_value-difference
+     patch: the slot already holds the addend difference written by init_putv,
+     and re-resolving at global scope changes that emitted value (the existing
+     resolver is meant for in-function computed-goto label diffs).  Leaving the
+     value untouched keeps codegen identical to before — this is purely a leak
+     fix. */
+  {
+    LabelDiffFixup *f = s1->label_diff_fixups;
+    while (f)
+    {
+      LabelDiffFixup *next = f->next;
+      tcc_free(f);
+      f = next;
+    }
+    s1->label_diff_fixups = NULL;
+  }
+
   /* If compilation aborted while generating a function, the per-function IR
      block allocated in gen_function() may not have been released (because we
      unwind via longjmp). Free it here to avoid leaks on compile errors. */
@@ -14300,7 +14333,20 @@ static int post_type(CType *type, AttributeDef *ad, int storage, int td)
     {
       /* for function args, the top dimension is converted to pointer */
       if ((t1 & VT_VLA) && ((td & TYPE_NEST) || (func_param_decl_depth && !(td & TYPE_PARAM))))
+      {
         s->vla_array_str = vla_array_str;
+        /* Track for end-of-TU reclamation.  func_vla_arg_code frees this at a
+           function definition's entry (and drops it from the list there), but
+           an inner VLA dimension inside an abstract / function-pointer
+           declarator is never materialized and would otherwise leak. */
+        if (vla_array_str_on_heap)
+        {
+          int vi = tcc_state->nb_vla_inner_exprs++;
+          tcc_state->vla_inner_exprs = tcc_realloc(tcc_state->vla_inner_exprs,
+                                                   tcc_state->nb_vla_inner_exprs * sizeof(*tcc_state->vla_inner_exprs));
+          tcc_state->vla_inner_exprs[vi] = vla_array_str;
+        }
+      }
       else if ((t1 & VT_VLA) && (td & TYPE_PARAM))
       {
         /* Outermost VLA dimension of a function param: save the token string
@@ -28138,7 +28184,14 @@ static void func_vla_arg_code(Sym *arg)
     vswap();
     vstore();
     vpop();
-    /* Free the VLA expression token buffer now that it's been evaluated */
+    /* Free the VLA expression token buffer now that it's been evaluated, and
+       drop it from the end-of-TU reclamation list so it is not double-freed. */
+    for (int i = 0; i < tcc_state->nb_vla_inner_exprs; i++)
+      if (tcc_state->vla_inner_exprs[i] == arg->type.ref->vla_array_str)
+      {
+        tcc_state->vla_inner_exprs[i] = NULL;
+        break;
+      }
     tcc_free(arg->type.ref->vla_array_str);
     arg->type.ref->vla_array_str = NULL;
   }

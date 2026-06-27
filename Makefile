@@ -164,13 +164,15 @@ CHECKSUM_CMD = $(shell command -v sha256sum 2>/dev/null || command -v md5sum 2>/
 # proceed while still keeping ASan instrumentation.
 ifeq ($(CONFIG_asan),yes)
 SAN_ENV = LSAN_OPTIONS=detect_leaks=0 ASAN_OPTIONS=detect_leaks=0
-# TinyCC (like most compilers) intentionally does not free everything on exit,
-# so LSan's at-exit leak check would make every compiler invocation — including
-# each test compile under `make test` — exit non-zero.  Default leak detection
-# off (ASan still catches buffer overflows / use-after-free); override by
-# exporting your own [AL]SAN_OPTIONS.
-export LSAN_OPTIONS ?= detect_leaks=0
-export ASAN_OPTIONS ?= detect_leaks=0
+# Leak detection (LSan) is enabled by default for `make test`: every compiler
+# invocation runs the at-exit leak check, so any leak in tcc surfaces as a
+# non-zero exit.  Note tcc (like most compilers) intentionally does not free
+# everything on exit, so known pre-existing leaks will fail here too; override
+# by exporting your own [AL]SAN_OPTIONS (e.g. detect_leaks=0) to opt out.
+# The nested fp-libs build (SAN_ENV above) keeps leak detection off so the
+# build can still complete.
+export LSAN_OPTIONS ?= detect_leaks=1
+export ASAN_OPTIONS ?= detect_leaks=1
 endif
 
 

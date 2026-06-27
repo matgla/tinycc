@@ -158,11 +158,15 @@ def test_forward_branch_conditional_still_wide():
     loop = funcs["loop"]
 
     wide_fwd = _count_mnem(loop, "bge.w")
-    narrow_back = _count_mnem(loop, "blt.n")
+    narrow_back = _count_mnem(loop, "b.n")
 
-    # Backward branches are already narrowed.
-    assert narrow_back >= 1, f"expected backward blt.n, got {narrow_back}"
-    # Forward conditional branches currently stay wide (Phase 2a not landed).
+    # Loop rotation is currently disabled (it had O2 wrong-code bugs — see the
+    # `return 0` guards in tcc_ir_opt_loop_rotation), so the loop keeps its
+    # top-tested form: the back-edge is an unconditional narrow `b.n` rather than
+    # the rotated tight `blt.n`.  When rotation is re-enabled this should become a
+    # backward conditional branch again.
+    assert narrow_back >= 1, f"expected narrow backward b.n, got {narrow_back}"
+    # Forward conditional branches still stay wide (Phase 2a not landed).
     assert wide_fwd >= 1, f"expected forward bge.w, got {wide_fwd}"
 
 
@@ -223,3 +227,193 @@ def test_wide_string_literals_not_merged():
     assert rodata, ".rodata is empty"
     # Current codegen emits two copies; once merging lands this should become 1.
     assert copies == 2, f"expected two unmerged wide-string copies, got {copies}"
+
+
+# -----------------------------------------------------------------------------
+# Phase 4: backend per-instruction-family correctness
+# -----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# Arithmetic: immediate and register operand shapes
+# -----------------------------------------------------------------------------
+def test_arith_imm_reg_shapes():
+    obj = _compile("arith_imm_reg")
+    funcs = _disassemble(obj)
+
+    # ADD/SUB immediate should use narrow ALU-immediate forms.
+    assert _count_mnem(funcs["add_imm"], "adds") >= 1, "add_imm missing adds"
+    assert _count_mnem(funcs["sub_imm"], "subs") >= 1, "sub_imm missing subs"
+    # MUL by constant 7 should lower to shift/sub, not a helper call.
+    assert _count_mnem(funcs["mul_imm"], "lsls") >= 1, "mul_imm missing shift"
+    assert _count_mnem(funcs["mul_imm"], "subs") >= 1, "mul_imm missing subtract"
+    assert not any("__aeabi" in ops for _, ops in funcs["mul_imm"]), "mul_imm unexpectedly calls runtime helper"
+
+    # Register forms.
+    assert _count_mnem(funcs["add_reg"], "adds") >= 1, "add_reg missing adds"
+    assert _count_mnem(funcs["sub_reg"], "subs") >= 1, "sub_reg missing subs"
+    assert _count_mnem(funcs["mul_reg"], "mul.w") >= 1, "mul_reg missing mul.w"
+
+
+# -----------------------------------------------------------------------------
+# Arithmetic: DIV/IMOD lowering
+# -----------------------------------------------------------------------------
+def test_arith_div_mod_lowering():
+    obj = _compile("arith_div_mod")
+    funcs = _disassemble(obj)
+
+    # Signed/unsigned division should use SDIV/UDIV on Cortex-M33.
+    assert _count_mnem(funcs["div_signed"], "sdiv") >= 1, "signed division missing sdiv"
+    assert _count_mnem(funcs["div_unsigned"], "udiv") >= 1, "unsigned division missing udiv"
+
+    # Modulo should lower to div + mul + sub, no runtime helper.
+    for name in ("mod_signed", "mod_unsigned"):
+        fn = funcs[name]
+        div_mnem = "sdiv" if name == "mod_signed" else "udiv"
+        assert _count_mnem(fn, div_mnem) >= 1, f"{name} missing {div_mnem}"
+        assert _count_mnem(fn, "mul.w") >= 1, f"{name} missing mul.w"
+        assert _count_mnem(fn, "subs") >= 1, f"{name} missing subs"
+        assert not any("__aeabi" in ops for _, ops in fn), f"{name} unexpectedly calls runtime helper"
+
+
+# -----------------------------------------------------------------------------
+# Memory: LOAD/STORE/LEA addressing modes
+# -----------------------------------------------------------------------------
+def test_mem_load_store_addressing():
+    obj = _compile("mem_load_store")
+    funcs = _disassemble(obj)
+
+    # PC-relative literal load for globals.
+    assert _count_mnem_regex(funcs["load_global"], r"^ldr.*\[pc,") >= 1, "load_global missing pc-relative load"
+    assert _count_mnem_regex(funcs["store_global"], r"^ldr.*\[pc,") >= 1, "store_global missing pc-relative base load"
+    assert _count_mnem(funcs["store_global"], "str") >= 1, "store_global missing store"
+
+    # Indexed array access: ldr.w/str.w [rn, rm, lsl #2].
+    assert _count_mnem_regex(funcs["load_array"], r"ldr\.w.*lsl #2") >= 1, "load_array missing scaled indexed load"
+    assert _count_mnem_regex(funcs["store_array"], r"str\.w.*lsl #2") >= 1, "store_array missing scaled indexed store"
+
+    # Struct offset uses immediate offset.
+    assert _count_mnem_regex(funcs["load_struct"], r"ldr.*#12") >= 1, "load_struct missing offset load"
+    assert _count_mnem_regex(funcs["store_struct"], r"str.*#12") >= 1, "store_struct missing offset store"
+
+    # LEA of a local is an SP-based add.
+    lea = funcs["lea_local"]
+    assert _count_mnem_regex(lea, r"^add\s+r0, sp") >= 1, "lea_local missing add r0, sp"
+
+
+# -----------------------------------------------------------------------------
+# Control: switch table and branch narrowing
+# -----------------------------------------------------------------------------
+def test_control_switch_uses_table():
+    obj = _compile("control_switch")
+    funcs = _disassemble(obj)
+    fn = funcs["switch_small"]
+
+    # A dense switch should emit a jump table (ADD PC) and a bounds check.
+    assert _count_mnem_regex(fn, r"^add.*pc") >= 1, "switch_small missing pc-indexed table lookup"
+    assert _count_mnem(fn, "cmp") >= 1, "switch_small missing bounds comparison"
+    assert _count_mnem_regex(fn, r"^ldr\.w.*\[ip,") >= 1, "switch_small missing table entry load"
+
+
+def test_control_branch_conditional_and_loop():
+    obj = _compile("control_branch")
+    funcs = _disassemble(obj)
+
+    count = funcs["count"]
+    # Loop should have a conditional forward test and a narrow back-edge.
+    assert _count_mnem(count, "cmp") >= 1, "count missing comparison"
+    assert _count_mnem_regex(count, r"^bge\.w") >= 1, "count missing forward conditional branch"
+    assert _count_mnem(count, "b.n") >= 1, "count missing narrow back-edge"
+
+    ifte = funcs["if_then_else"]
+    # Chained if/else should use conditional execution or branches, not UDF.
+    assert _count_mnem(ifte, "cmp") >= 1, "if_then_else missing comparison"
+    cond_branches = sum(_count_mnem(ifte, m) for m in ("bgt.w", "bge.w", "blt.w", "ble.w", "beq.w", "bne.w", "b.w", "b.n", "ite"))
+    assert cond_branches >= 1, "if_then_else missing any branch/conditional execution"
+    udf_count = _count_mnem(ifte, "udf") + _count_mnem(ifte, "bkpt")
+    assert udf_count == 0, f"if_then_else has unexpected undefined/breakpoint instructions ({udf_count})"
+
+
+# -----------------------------------------------------------------------------
+# Calls: AAPCS parameter marshalling and return values
+# -----------------------------------------------------------------------------
+def test_call_aapcs_register_args():
+    obj = _compile("call_args")
+    funcs = _disassemble(obj)
+
+    caller = funcs["caller_int"]
+    # First four int args go in r0-r3; the caller loads them from globals.
+    # Tail-call optimized to b.w (still a correct call transfer).
+    assert _count_mnem(caller, "b.w") >= 1, "caller_int missing branch to callee"
+    # Callee uses r0-r3 as its parameters.
+    callee = funcs["callee_int"]
+    assert _count_mnem_regex(callee, r"^add\.w\s+ip, r0, r1") >= 1, "callee_int missing r0+r1 add"
+    assert _count_mnem_regex(callee, r"^add\.w\s+r0, ip, r2") >= 1, "callee_int missing ip+r2 add"
+    assert _count_mnem_regex(callee, r"^adds\s+r0, r0, r3") >= 1, "callee_int missing r0+r3 add"
+
+
+def test_call_aapcs_long_long():
+    obj = _compile("call_args")
+    funcs = _disassemble(obj)
+
+    callee = funcs["callee_long"]
+    # 64-bit args arrive in r0:r1 and r2:r3; result leaves in r0:r1.
+    assert _count_mnem_regex(callee, r"^adds\s+r4, r0, r2") >= 1, "callee_long missing low-word add"
+    assert _count_mnem_regex(callee, r"^adc\.w\s+r5, r1, r3") >= 1, "callee_long missing high-word adc"
+
+    caller = funcs["caller_long"]
+    # Caller loads 64-bit args into r0:r1 and r2:r3 before the branch.
+    assert _count_mnem(caller, "b.w") >= 1, "caller_long missing branch to callee"
+
+
+def test_call_aapcs_stack_arg():
+    obj = _compile("call_args")
+    funcs = _disassemble(obj)
+
+    callee = funcs["callee_stack"]
+    # Fifth arg is passed on the stack and loaded from caller's frame.
+    assert _count_mnem_regex(callee, r"^ldr\s+r2, \[sp, #24\]") >= 1, "callee_stack missing stack-arg load"
+
+    caller = funcs["caller_stack"]
+    # Caller must store the fifth arg to its own stack before calling.
+    assert _count_mnem(caller, "push") >= 1, "caller_stack missing prolog"
+    assert _count_mnem(caller, "str") >= 1, "caller_stack missing stack-arg store"
+    assert _count_mnem(caller, "bl") >= 1, "caller_stack missing bl"
+
+
+# -----------------------------------------------------------------------------
+# Floating point: soft-float vs hard-float selection
+# -----------------------------------------------------------------------------
+def test_fp_soft_float_uses_runtime_helpers():
+    obj = _compile("fp_select", extra_cflags=["-mfloat-abi=soft"])
+    funcs = _disassemble(obj)
+
+    for name in ("addf", "addd", "mulf"):
+        fn = funcs[name]
+        assert any("__aeabi_fadd" in ops or "__aeabi_dadd" in ops or "__aeabi_fmul" in ops for _, ops in fn), \
+            f"{name} missing expected soft-float runtime helper"
+        vfp_count = sum(_count_mnem(fn, m) for m in ("vadd.f32", "vadd.f64", "vmul.f32", "vmul.f64"))
+        assert vfp_count == 0, f"{name} unexpectedly emitted VFP instruction under soft float"
+
+
+@pytest.mark.xfail(
+    reason="hard-float VFP lowering not implemented yet (Phase 4 gap): fp_select "
+    "still emits __aeabi_fadd/__aeabi_dadd/__aeabi_fmul under -mfloat-abi=hard. "
+    "Remove this marker once the hard-float codegen work lands.",
+    strict=True,
+)
+def test_fp_hard_float_uses_vfp():
+    """Hard-float ABI with VFP should select VFP instructions, not __aeabi_* helpers.
+
+    This test documents the current codegen gap: even with -mfloat-abi=hard
+    -mfpu=fpv5-sp-d16, fp_select lowers to __aeabi_fadd/__aeabi_dadd/__aeabi_fmul.
+    See Phase 4 findings in docs/plan_whole_tinycc_coverage.md.
+    """
+    obj = _compile("fp_select", extra_cflags=["-mfloat-abi=hard", "-mfpu=fpv5-sp-d16"])
+    funcs = _disassemble(obj)
+
+    vfp_count = sum(
+        _count_mnem(funcs[name], m)
+        for name in ("addf", "addd", "mulf")
+        for m in ("vadd.f32", "vadd.f64", "vmul.f32", "vmul.f64")
+    )
+    assert vfp_count >= 1, "hard-float ABI did not emit any VFP instructions (Phase 4 gap)"

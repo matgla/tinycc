@@ -1027,6 +1027,51 @@ static void sccp_visit_phi(SCCPState *s, IRPhiNode *phi, int block)
   }
 }
 
+/* Conservative fixpoint repair for the optimistic-propagation gap documented at
+ * the re-sweep loop: a phi (typically a loop-header phi in an un-rotated loop)
+ * can settle at CONST while one of its operands — arriving on an EXECUTABLE
+ * edge — is still TOP because its defining value was never lowered and the
+ * worklist never re-propagated it.  sccp_visit_phi SKIPS TOP operands, so even
+ * the re-sweep never widens such a phi.  At a true fixpoint no reachable value
+ * stays TOP, so a TOP source on an executable edge is an inconsistency: trust
+ * nothing and force the phi to BOTTOM rather than keep the partial constant
+ * (which would fold the loop-carried value to its latch constant — a
+ * miscompile, e.g. 990527-1's `for(...){j++; g(j); j=9;}` summing 9*10 instead
+ * of 1+8*10).  Monotone (only descends cells), so convergence is preserved.
+ * Returns the count of phis forced to BOTTOM. */
+static int sccp_force_stuck_phis_bottom(SCCPState *s)
+{
+  IRSSAState *ssa = s->ctx->ssa;
+  if (!ssa || !ssa->block_phis)
+    return 0;
+  int forced = 0;
+  for (int blk = 0; blk < s->num_blocks; blk++) {
+    if (!s->block_reachable[blk])
+      continue;
+    for (IRPhiNode *phi = ssa->block_phis[blk]; phi; phi = phi->next) {
+      SCCPCell *dest = sccp_cell(s, phi->dest_vreg);
+      if (!dest || dest->state != SCCP_CONST)
+        continue;
+      for (int i = 0; i < phi->num_operands; i++) {
+        int pred = phi->operands[i].pred_block;
+        if (pred < 0 || pred >= s->num_blocks)
+          continue;
+        if (!s->edge_exec[pred * s->num_blocks + blk])
+          continue;
+        SCCPCell *src = sccp_cell(s, phi->operands[i].vreg);
+        if (src && src->state == SCCP_TOP) {
+          if (sccp_set_bottom(dest)) {
+            sccp_add_ssa(s, TCCIR_DECODE_VREG_POSITION(phi->dest_vreg));
+            forced++;
+          }
+          break;
+        }
+      }
+    }
+  }
+  return forced;
+}
+
 static void sccp_visit_instr(SCCPState *s, int idx)
 {
   TCCIRState *ir = s->ctx->ir;
@@ -1713,6 +1758,10 @@ int ssa_opt_sccp(IRSSAOptCtx *ctx)
       for (int i = bb->start_idx; i < bb->end_idx; i++)
         sccp_visit_instr(&s, i);
     }
+    /* Repair optimistic-fold gaps: any phi left CONST with a TOP operand on an
+     * executable edge is widened to BOTTOM, re-seeding the worklists so its
+     * dependents re-evaluate before we accept the fixpoint. */
+    sccp_force_stuck_phis_bottom(&s);
     if (s.cfg_wl_count == 0 && s.ssa_wl_count == 0)
       break;
   }

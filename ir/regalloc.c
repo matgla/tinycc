@@ -46,6 +46,7 @@ typedef struct SSAInterval {
   uint8_t addrtaken : 1;
   uint8_t is_param : 1;
   uint8_t reg_shared : 1; /* cur shares hr with another active interval (return-block tail); skip expire-free and active push */
+  uint8_t loop_phi_locked : 1; /* absorbed a loop-phi partner (carries a loop-carried value across the whole loop body); must not be evicted — spilling it mid-loop would not reload the partner's uses and corrupts the IV */
   uint8_t reg_type;
   uint16_t use_count;
   int8_t precolored;
@@ -1273,6 +1274,7 @@ static void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
       iv->co_member = 0;
       iv->is_param = (type == TCCIR_VREG_TYPE_PARAM);
       iv->reg_shared = 0;
+      iv->loop_phi_locked = 0;
 
       IRLiveInterval *li = tcc_ir_vreg_live_interval(ir, vreg);
       iv->addrtaken = li->addrtaken;
@@ -2477,6 +2479,12 @@ static void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
               if (partner->end > cur->end)
                 cur->end = partner->end;
               cur->r0 = reg;
+              /* cur now carries partner's loop-carried value over the extended
+               * range; the partner is gone from active, so cur is the sole
+               * holder of hr that the partner's remaining uses depend on.
+               * Evicting cur mid-loop would spill it without reloading those
+               * partner uses → IV corruption.  Lock it against eviction. */
+              cur->loop_phi_locked = 1;
               active[partner_active_idx] = active[--active_count];
             }
           }
@@ -2618,6 +2626,10 @@ static void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
         if (a->precolored >= 0) continue;
         if (a->reg_type != LS_REG_TYPE_INT) continue;
         if (a->end <= cur->end) continue;
+        /* Never evict a loop-phi-locked interval: it holds a loop-carried value
+         * (its absorbed partner's uses still read this register across the loop
+         * body) and spilling it here would not reload those uses. */
+        if (a->loop_phi_locked) continue;
         if (a->use_count < victim_uses ||
             (a->use_count == victim_uses && victim && a->end > victim->end)) {
           victim_uses = a->use_count;
