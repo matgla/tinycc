@@ -884,6 +884,23 @@ static int tcc_ir_opt_known_bits__timed(TCCIRState *ir)
 
       if (have_off)
       {
+        /* A narrow store at stack_off also overwrites bytes belonging to any
+         * OTHER tracked slot whose range overlaps [stack_off, stack_off+width)
+         * — e.g. a sub-word bitfield write (INT16 at offset N) clobbers the
+         * high half of the enclosing word slot at N-2.  stack_kb_set only
+         * touches the exact-offset slot, so without invalidating the
+         * overlapping aliases a later wide load of one of them would fold to a
+         * stale value (the bitfield write silently lost).  Mirrors the overlap
+         * invalidation already done by the STORE_INDEXED and wide-store paths. */
+        int width = ir_opt_store_btype_size_bytes(dest_btype);
+        if (width <= 0)
+          width = 4;
+        for (int s = 0; s < n_stack_slots; s++)
+          if (stack_slots[s].off != stack_off &&
+              stack_slots[s].off < stack_off + width &&
+              stack_slots[s].off + 4 > stack_off)
+            stack_slots[s].gen = 0;
+
         uint32_t kz, ko;
         if (kb_operand(ir, src1, tmp_kb, max_tmp_pos, current_gen,
                        var_addr, max_var_pos,

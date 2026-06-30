@@ -52,7 +52,9 @@ val() { echo "$1" | grep -oE "[0-9a-f]{8}|HardFault|Lockup|COMPILE_FAIL" | head 
 # (self-contained; no pytest/xdist dependency).
 sweep_one() {
   local s="$1" src; src="$(mktemp --suffix=.c)"
-  python3 "$ROOT/tests/fuzz/gen_c.py" --seed "$s" --profile "$PROFILE" -o "$src" 2>/dev/null || { rm -f "$src"; return; }
+  # Emit exactly one status line per seed so the consumer's live counter always
+  # reaches TOTAL — a seed we can't generate prints SKIP (counted, not divergent).
+  python3 "$ROOT/tests/fuzz/gen_c.py" --seed "$s" --profile "$PROFILE" -o "$src" 2>/dev/null || { rm -f "$src"; echo "$s SKIP"; return; }
   local a b c d
   a="$(val "$(runseed "$src" -O0)")"; b="$(val "$(runseed "$src" -O1)")"
   c="$(val "$(runseed "$src" -O2)")"; d="$(val "$(runseed "$src" -Os)")"
@@ -67,7 +69,9 @@ sweep_one() {
 triage_one() {
   local s="$1"
   local src="$REPRO/${SEEDPFX}${s}.c"
-  python3 "$ROOT/tests/fuzz/gen_c.py" --seed "$s" --profile "$PROFILE" -o "$src" 2>/dev/null || return
+  # Emit one line per seed even when generation fails (SKIP sentinel) so the live
+  # "triaged N/NFAIL" counter completes; the consumer filters it from the table.
+  python3 "$ROOT/tests/fuzz/gen_c.py" --seed "$s" --profile "$PROFILE" -o "$src" 2>/dev/null || { echo "SKIP $s"; return; }
 
   local gref ref=""
   gref="$(mktemp)"
@@ -160,7 +164,7 @@ echo "$FAILS" | xargs -P "$JOBS" -I{} bash -c 'triage_one "$1"' _ {} \
       while IFS= read -r row; do
         done=$((done + 1))
         printf '\r  triaged %d/%d   ' "$done" "$NFAIL" >&2
-        echo "$row"
+        case "$row" in '|'*) echo "$row";; esac   # drop SKIP sentinels from the table
       done
       printf '\n' >&2
     } | sort -t'|' -k2 -n >> "$OUT"
